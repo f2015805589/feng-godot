@@ -21,6 +21,7 @@ if "RD_GLSL" in env["BUILDERS"]:
     for glsl_file in glsl_files:
         env.RD_GLSL(glsl_file)
 
+SConscript("deferred_clustered/SCsub")
 SConscript("effects/SCsub")
 SConscript("environment/SCsub")
 SConscript("forward_clustered/SCsub")
