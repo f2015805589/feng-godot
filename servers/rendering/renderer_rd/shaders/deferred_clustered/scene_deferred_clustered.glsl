@@ -1036,6 +1036,19 @@ layout(set = MATERIAL_UNIFORM_SET, binding = 0, std140) uniform MaterialUniforms
 
 #ifdef MODE_RENDER_DEPTH
 
+#ifdef MODE_RENDER_GBUFFER
+
+layout(location = 0) out vec4 normal_roughness_output_buffer;
+layout(location = 1) out vec4 albedo_output_buffer;
+layout(location = 2) out vec4 orm_output_buffer;
+layout(location = 3) out vec4 emission_output_buffer;
+
+#ifdef MODE_RENDER_VOXEL_GI
+layout(location = 4) out uvec2 voxel_gi_buffer;
+#endif
+
+#endif // MODE_RENDER_GBUFFER
+
 #ifdef MODE_RENDER_MATERIAL
 
 layout(location = 0) out vec4 albedo_output_buffer;
@@ -1163,6 +1176,9 @@ vec4 fog_process(vec3 vertex) {
 	return vec4(fog_color, fog_amount);
 }
 
+#endif // !MODE_RENDER_DEPTH
+
+#if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_GBUFFER)
 void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max, out uint item_from, out uint item_to) {
 	uint item_min_max = cluster_buffer.data[p_offset];
 	item_min = item_min_max & 0xFFFFu;
@@ -1180,7 +1196,7 @@ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
 
 #endif //!MODE_RENDER DEPTH
 
-#if defined(MODE_RENDER_NORMAL_ROUGHNESS) || defined(MODE_RENDER_MATERIAL)
+#if defined(MODE_RENDER_NORMAL_ROUGHNESS) || defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_GBUFFER)
 // https://advances.realtimerendering.com/s2010/Kaplanyan-CryEngine3(SIGGRAPH%202010%20Advanced%20RealTime%20Rendering%20Course).pdf
 vec3 encode24(vec3 v) {
 	// Unsigned normal (handles most symmetry)
@@ -1200,7 +1216,7 @@ vec3 encode24(vec3 v) {
 	result *= fFittingScale;
 	return result;
 }
-#endif // MODE_RENDER_NORMAL_ROUGHNESS
+#endif // MODE_RENDER_NORMAL_ROUGHNESS || MODE_RENDER_MATERIAL || MODE_RENDER_GBUFFER
 
 void fragment_shader(in SceneData scene_data) {
 	uint instance_index = instance_index_interp;
@@ -1381,7 +1397,7 @@ void fragment_shader(in SceneData scene_data) {
 #ifndef USE_SHADOW_TO_OPACITY
 
 #ifdef ALPHA_SCISSOR_USED
-#ifdef MODE_RENDER_MATERIAL
+#if defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_GBUFFER)
 	if (alpha < alpha_scissor_threshold) {
 		alpha = 0.0;
 	} else {
@@ -1391,13 +1407,13 @@ void fragment_shader(in SceneData scene_data) {
 	if (alpha < alpha_scissor_threshold) {
 		discard;
 	}
-#endif // MODE_RENDER_MATERIAL
+#endif // MODE_RENDER_MATERIAL || MODE_RENDER_GBUFFER
 #endif // ALPHA_SCISSOR_USED
 
 // alpha hash can be used in unison with alpha antialiasing
 #ifdef ALPHA_HASH_USED
 	vec3 object_pos = (inverse(read_model_matrix) * inv_view_matrix * vec4(vertex, 1.0)).xyz;
-#ifdef MODE_RENDER_MATERIAL
+#if defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_GBUFFER)
 	if (alpha < compute_alpha_hash_threshold(object_pos, alpha_hash_scale)) {
 		alpha = 0.0;
 	} else {
@@ -1407,11 +1423,11 @@ void fragment_shader(in SceneData scene_data) {
 	if (alpha < compute_alpha_hash_threshold(object_pos, alpha_hash_scale)) {
 		discard;
 	}
-#endif // MODE_RENDER_MATERIAL
+#endif // MODE_RENDER_MATERIAL || MODE_RENDER_GBUFFER
 #endif // ALPHA_HASH_USED
 
 // If we are not edge antialiasing, we need to remove the output alpha channel from scissor and hash
-#if (defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED)) && !defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(MODE_RENDER_MATERIAL)
+#if (defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED)) && !defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(MODE_RENDER_MATERIAL) && !defined(MODE_RENDER_GBUFFER)
 	alpha = 1.0;
 #endif
 
@@ -1463,7 +1479,7 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #ifdef ENABLE_CLIP_ALPHA
-#ifdef MODE_RENDER_MATERIAL
+#if defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_GBUFFER)
 	if (albedo.a < 0.99) {
 		// Used for doublepass and shadowmapping.
 		albedo.a = 0.0;
@@ -1477,7 +1493,7 @@ void fragment_shader(in SceneData scene_data) {
 		//used for doublepass and shadowmapping
 		discard;
 	}
-#endif // MODE_RENDER_MATERIAL
+#endif // MODE_RENDER_MATERIAL || MODE_RENDER_GBUFFER
 #endif
 
 	/////////////////////// FOG //////////////////////
@@ -1534,7 +1550,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	/////////////////////// DECALS ////////////////////////////////
 
-#ifndef MODE_RENDER_DEPTH
+#if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_GBUFFER)
 
 #ifdef USE_MULTIVIEW
 	uvec2 cluster_pos = uvec2(combined_uv.xy / scene_data.screen_pixel_size) >> implementation_data.cluster_shift;
@@ -1651,7 +1667,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	//pack albedo until needed again, saves 2 VGPRs in the meantime
 
-#endif //not render depth
+#endif //!MODE_RENDER_DEPTH || MODE_RENDER_GBUFFER
 	/////////////////////// LIGHTING //////////////////////////////
 
 #ifdef NORMAL_USED
@@ -2997,6 +3013,42 @@ void fragment_shader(in SceneData scene_data) {
 	}
 
 #endif
+
+#ifdef MODE_RENDER_GBUFFER
+
+	albedo_output_buffer.rgb = albedo;
+	albedo_output_buffer.a = alpha;
+
+	normal_roughness_output_buffer = vec4(encode24(normal) * 0.5 + 0.5, roughness);
+
+	// We encode the dynamic static into roughness.
+	// Values over 0.5 are dynamic, under 0.5 are static.
+	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w * (127.0 / 255.0);
+	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC)) {
+		normal_roughness_output_buffer.w = 1.0 - normal_roughness_output_buffer.w;
+	}
+
+	orm_output_buffer.r = ao;
+	orm_output_buffer.g = roughness;
+	orm_output_buffer.b = metallic;
+	orm_output_buffer.a = sss_strength;
+
+	emission_output_buffer.rgb = emission;
+	emission_output_buffer.a = 0.0;
+
+#ifdef MODE_RENDER_VOXEL_GI
+	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances
+		uint index1 = instances.data[instance_index].gi_offset & 0xFFFF;
+		uint index2 = instances.data[instance_index].gi_offset >> 16;
+		voxel_gi_buffer.x = index1 & 0xFFu;
+		voxel_gi_buffer.y = index2 & 0xFFu;
+	} else {
+		voxel_gi_buffer.x = 0xFF;
+		voxel_gi_buffer.y = 0xFF;
+	}
+#endif
+
+#endif //MODE_RENDER_GBUFFER
 
 #ifdef MODE_RENDER_MATERIAL
 

@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/effects/taa.h"
 #include "servers/rendering/renderer_rd/deferred_clustered/scene_shader_deferred_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+#include "servers/rendering/renderer_rd/shaders/deferred_clustered/deferred_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
 
@@ -54,6 +55,12 @@
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
 #define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
+#define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
+#define RB_TEX_GBUFFER_ALBEDO_MSAA SNAME("gbuffer_albedo_msaa")
+#define RB_TEX_GBUFFER_ORM SNAME("gbuffer_orm")
+#define RB_TEX_GBUFFER_ORM_MSAA SNAME("gbuffer_orm_msaa")
+#define RB_TEX_GBUFFER_EMISSION SNAME("gbuffer_emission")
+#define RB_TEX_GBUFFER_EMISSION_MSAA SNAME("gbuffer_emission_msaa")
 
 namespace RendererSceneRenderImplementation {
 
@@ -80,6 +87,7 @@ class RenderDeferredClustered : public RendererSceneRenderRD {
 		RENDER_LIST_MOTION, //used for opaque objects with motion
 		RENDER_LIST_ALPHA, //used for transparent objects
 		RENDER_LIST_SECONDARY, //used for shadows and other objects
+		RENDER_LIST_OPAQUE_FALLBACK, //used for opaque objects that must be rendered forward (deferred renderer)
 		RENDER_LIST_MAX
 	};
 
@@ -118,7 +126,8 @@ public:
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
-			DEPTH_FB_ROUGHNESS_VOXELGI
+			DEPTH_FB_ROUGHNESS_VOXELGI,
+			DEPTH_FB_GBUFFER
 		};
 
 		RID render_sdfgi_uniform_set;
@@ -141,6 +150,21 @@ public:
 		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI); }
 		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
 		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
+
+		void ensure_gbuffer();
+		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
+		RID get_gbuffer_albedo() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
+		RID get_gbuffer_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, p_layer, 0); }
+		RID get_gbuffer_albedo_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA); }
+		RID get_gbuffer_albedo_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, p_layer, 0); }
+		RID get_gbuffer_orm() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM); }
+		RID get_gbuffer_orm(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM, p_layer, 0); }
+		RID get_gbuffer_orm_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA); }
+		RID get_gbuffer_orm_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA, p_layer, 0); }
+		RID get_gbuffer_emission() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION); }
+		RID get_gbuffer_emission(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION, p_layer, 0); }
+		RID get_gbuffer_emission_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA); }
+		RID get_gbuffer_emission_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA, p_layer, 0); }
 
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
@@ -165,18 +189,25 @@ public:
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_gbuffer_albedo_format();
+		static uint32_t get_gbuffer_albedo_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_gbuffer_orm_format();
+		static uint32_t get_gbuffer_orm_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_gbuffer_emission_format();
+		static uint32_t get_gbuffer_emission_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 	};
 
 private:
 	virtual void setup_render_buffer_data(Ref<RenderSceneBuffersRD> p_render_buffers) override;
 
 	RID render_base_uniform_set;
+	LocalVector<RD::Uniform> render_base_uniforms;
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
 	void _update_render_base_uniform_set();
 	RID _setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index);
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false);
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID());
 
 	struct BestFitNormal {
 		BestFitNormalShaderRD shader;
@@ -197,6 +228,20 @@ private:
 		RID lut2_texture;
 	} ltc;
 
+	enum DeferredLightingMode {
+		DEFERRED_LIGHTING_MODE_BASE,
+		DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR,
+		DEFERRED_LIGHTING_MODE_MULTIVIEW,
+		DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW,
+		DEFERRED_LIGHTING_MODE_MAX
+	};
+
+	struct DeferredLighting {
+		DeferredLightingShaderRD shader;
+		RID shader_version;
+		PipelineCacheRD pipelines[DEFERRED_LIGHTING_MODE_MAX];
+	} deferred_lighting;
+
 	enum PassMode {
 		PASS_MODE_COLOR,
 		PASS_MODE_SHADOW,
@@ -205,6 +250,7 @@ private:
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
 		PASS_MODE_DEPTH_MATERIAL,
+		PASS_MODE_GBUFFER,
 		PASS_MODE_SDF,
 		PASS_MODE_MAX
 	};
@@ -230,6 +276,7 @@ private:
 		uint32_t view_count = 1;
 		RID render_pass_uniform_set;
 		bool force_wireframe = false;
+		bool opaque_fallback = false;
 		Vector2 uv_offset;
 		float lod_distance_multiplier = 0.0;
 		float screen_mesh_lod_threshold = 0.0;
@@ -406,7 +453,7 @@ private:
 		uint32_t max_lightmaps;
 		RID lightmap_buffer;
 
-		MultiUmaBuffer<1u> instance_buffer[RENDER_LIST_MAX] = { MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE"), MultiUmaBuffer<1u>("RENDER_LIST_MOTION"), MultiUmaBuffer<1u>("RENDER_LIST_ALPHA"), MultiUmaBuffer<1u>("RENDER_LIST_SECONDARY") };
+		MultiUmaBuffer<1u> instance_buffer[RENDER_LIST_MAX] = { MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE"), MultiUmaBuffer<1u>("RENDER_LIST_MOTION"), MultiUmaBuffer<1u>("RENDER_LIST_ALPHA"), MultiUmaBuffer<1u>("RENDER_LIST_SECONDARY"), MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE_FALLBACK") };
 		InstanceData *curr_gpu_ptr[RENDER_LIST_MAX] = {};
 
 		LightmapCaptureData *lightmap_captures = nullptr;

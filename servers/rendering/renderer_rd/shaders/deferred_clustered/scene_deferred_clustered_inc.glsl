@@ -480,6 +480,18 @@ layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
 
+#ifdef MODE_DEFERRED_LIGHTING
+#ifdef USE_MULTIVIEW
+layout(set = 1, binding = 37) uniform texture2DArray gbuffer_albedo_buffer;
+layout(set = 1, binding = 38) uniform texture2DArray gbuffer_orm_buffer;
+layout(set = 1, binding = 39) uniform texture2DArray gbuffer_emission_buffer;
+#else
+layout(set = 1, binding = 37) uniform texture2D gbuffer_albedo_buffer;
+layout(set = 1, binding = 38) uniform texture2D gbuffer_orm_buffer;
+layout(set = 1, binding = 39) uniform texture2D gbuffer_emission_buffer;
+#endif // USE_MULTIVIEW
+#endif // MODE_DEFERRED_LIGHTING
+
 #endif
 
 vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {
@@ -505,9 +517,11 @@ vec3 get_energy_compensation(vec3 f0, float env) {
 
 /* Set 2 Skeleton & Instancing (can change per item) */
 
+#ifndef MODE_DEFERRED_LIGHTING
 layout(set = 2, binding = 0, std430) restrict readonly buffer Transforms {
 	vec4 data[];
 }
 transforms;
+#endif
 
 /* Set 3 User Material */

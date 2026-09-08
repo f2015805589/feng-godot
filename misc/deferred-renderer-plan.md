@@ -2,7 +2,21 @@
 
 - **基线**：`feng-godot` @ `f6ab5db28b`（Godot 4.7.3-rc）
 - **日期**：2026-09-08
+- **状态**：M0-M4 已完成并合入 `feng-godot`（提交 `a8202449cf` 起，deferred-renderer 分支已删除）
 - **决策**：复制 Forward+（`RenderForwardClustered`）为独立渲染器 `deferred`，与 Forward+ 并存，通过 `rendering/renderer/rendering_method = "deferred"` 选择。不改 Forward+ 的任何行为。
+
+---
+
+## 0. 实施记录（2026-09-08）
+
+| 里程碑 | 提交 | 内容 |
+|--------|------|------|
+| M0 | `a51e8a20e4` | 克隆 forward_clustered → deferred_clustered（改名 + 接入点 13 处） |
+| M1 | `593b2b6694` | G-buffer 纹理/变体/强制 pass + 项目对话框 deferred 选项 |
+| M2 | `52ce732ee0` | `deferred_lighting.glsl` 全屏光照 pass（替换不透明前向 pass） |
+| M3+M4 | `21aa3542c0` | decal 进 G-buffer + 前向 fallback pass（`RENDER_LIST_OPAQUE_FALLBACK`） |
+
+**M5 遗留（后续迭代）**：性能 profile（光源数 1/8/32/128 × 1080p/4K 帧时间表）、MSAA 下 G-buffer resolve 的视觉验证、多视图（XR）明确降级、velocity 并入 G-buffer pass、`doc/` 使用文档。
 
 ---
 

@@ -84,6 +84,32 @@ void RenderDeferredClustered::RenderBufferDataDeferredClustered::ensure_voxelgi(
 	}
 }
 
+void RenderDeferredClustered::RenderBufferDataDeferredClustered::ensure_gbuffer() {
+	ERR_FAIL_NULL(render_buffers);
+
+	if (!render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, get_gbuffer_albedo_format(), get_gbuffer_albedo_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, get_gbuffer_albedo_format(), get_gbuffer_albedo_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM, get_gbuffer_orm_format(), get_gbuffer_orm_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA, get_gbuffer_orm_format(), get_gbuffer_orm_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION, get_gbuffer_emission_format(), get_gbuffer_emission_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA, get_gbuffer_emission_format(), get_gbuffer_emission_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
+}
+
 void RenderDeferredClustered::RenderBufferDataDeferredClustered::ensure_fsr2(RendererRD::FSR2Effect *p_effect) {
 	if (fsr2_context == nullptr) {
 		fsr2_context = p_effect->create_context(render_buffers->get_internal_size(), render_buffers->get_target_size());
@@ -230,6 +256,26 @@ RID RenderDeferredClustered::RenderBufferDataDeferredClustered::get_depth_fb(Dep
 
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, voxelgi_buffer);
 		} break;
+		case DEPTH_FB_GBUFFER: {
+			ensure_normal_roughness_texture();
+			ensure_gbuffer();
+			if (render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI)) {
+				RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+				RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
+				RID orm_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
+				RID emission_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
+				RID voxelgi_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_VOXEL_GI_MSAA : RB_TEX_VOXEL_GI);
+
+				return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer, voxelgi_buffer);
+			} else {
+				RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+				RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
+				RID orm_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
+				RID emission_buffer = render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
+
+				return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer);
+			}
+		} break;
 		default: {
 			ERR_FAIL_V(RID());
 		} break;
@@ -273,6 +319,30 @@ RD::DataFormat RenderDeferredClustered::RenderBufferDataDeferredClustered::get_v
 }
 
 uint32_t RenderDeferredClustered::RenderBufferDataDeferredClustered::get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+}
+
+RD::DataFormat RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_albedo_format() {
+	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
+}
+
+uint32_t RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_albedo_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+}
+
+RD::DataFormat RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_orm_format() {
+	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
+}
+
+uint32_t RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_orm_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+}
+
+RD::DataFormat RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_emission_format() {
+	return RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+uint32_t RenderDeferredClustered::RenderBufferDataDeferredClustered::get_gbuffer_emission_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
 	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
 }
 
@@ -329,7 +399,7 @@ void RenderDeferredClustered::_render_list_template(RenderingDevice::DrawListID 
 
 	SceneState::PushConstant push_constant;
 
-	if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
+	if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || p_pass_mode == PASS_MODE_GBUFFER) {
 		push_constant.uv_offset = Math::make_half_float(p_params->uv_offset.y) << 16;
 		push_constant.uv_offset |= Math::make_half_float(p_params->uv_offset.x);
 	} else {
@@ -395,7 +465,7 @@ void RenderDeferredClustered::_render_list_template(RenderingDevice::DrawListID 
 
 		// Determine the cull variant.
 		SceneShaderDeferredClustered::ShaderData::CullVariant cull_variant = SceneShaderDeferredClustered::ShaderData::CULL_VARIANT_MAX;
-		if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || p_pass_mode == PASS_MODE_SDF) {
+		if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || p_pass_mode == PASS_MODE_SDF || p_pass_mode == PASS_MODE_GBUFFER) {
 			cull_variant = SceneShaderDeferredClustered::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 		} else {
 			if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
@@ -476,6 +546,10 @@ void RenderDeferredClustered::_render_list_template(RenderingDevice::DrawListID 
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
 				pipeline_key.version = SceneShaderDeferredClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL;
 			} break;
+			case PASS_MODE_GBUFFER: {
+				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for G-buffer pass");
+				pipeline_key.version = SceneShaderDeferredClustered::PIPELINE_VERSION_GBUFFER_PASS;
+			} break;
 			case PASS_MODE_SDF: {
 				// Note, SDF is prepared in world space, this shouldn't be a multiview buffer even when stereoscopic rendering is used.
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for SDF pass");
@@ -485,6 +559,7 @@ void RenderDeferredClustered::_render_list_template(RenderingDevice::DrawListID 
 
 		pipeline_key.framebuffer_format_id = framebuffer_format;
 		pipeline_key.wireframe = p_params->force_wireframe;
+		pipeline_key.opaque_fallback = p_params->opaque_fallback;
 		pipeline_key.ubershader = 0;
 
 		bool emulate_point_size = shader->uses_point_size && scene_shader.emulate_point_size;
@@ -669,6 +744,9 @@ void RenderDeferredClustered::_render_list(RenderingDevice::DrawListID p_draw_li
 		} break;
 		case PASS_MODE_DEPTH_MATERIAL: {
 			_render_list_template<PASS_MODE_DEPTH_MATERIAL>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+		} break;
+		case PASS_MODE_GBUFFER: {
+			_render_list_template<PASS_MODE_GBUFFER>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
 		} break;
 		case PASS_MODE_SDF: {
 			_render_list_template<PASS_MODE_SDF>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
@@ -945,6 +1023,7 @@ void RenderDeferredClustered::_fill_render_list(RenderListType p_render_list, co
 			// Opaque fills motion and alpha lists.
 			render_list[RENDER_LIST_MOTION].clear();
 			render_list[RENDER_LIST_ALPHA].clear();
+			render_list[RENDER_LIST_OPAQUE_FALLBACK].clear();
 		}
 	}
 
@@ -1063,7 +1142,7 @@ void RenderDeferredClustered::_fill_render_list(RenderListType p_render_list, co
 					inst->gi_offset_cache = 0xFFFFFFFF;
 				}
 			}
-			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_COLOR) {
+			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_COLOR || p_pass_mode == PASS_MODE_GBUFFER) {
 				bool transform_changed = inst->transform_status == GeometryInstanceDeferredClustered::TransformStatus::MOVED;
 				bool has_mesh_instance = inst->mesh_instance.is_valid();
 				bool uses_particles = inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES;
@@ -1142,7 +1221,32 @@ void RenderDeferredClustered::_fill_render_list(RenderListType p_render_list, co
 				}
 
 				if (!force_alpha && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
-					rl->add_element(surf);
+					// In the deferred renderer, materials that cannot be expressed in the G-buffer
+					// (unshaded, vertex deformation, lightmap, SSS/transmittance, screen/depth/normal
+					// texture reads, point size, world coords, stencil, etc.) are rendered forward
+					// in a fallback pass. Everything else (roughness/normal map/tangent/alpha clip
+					// writes) is fully expressible in the G-buffer and goes through deferred lighting.
+					SceneShaderDeferredClustered::ShaderData *shader_data = surf->shader;
+					bool needs_forward_fallback = shader_data->unshaded ||
+							shader_data->uses_vertex ||
+							shader_data->uses_sss ||
+							shader_data->uses_transmittance ||
+							shader_data->uses_screen_texture ||
+							shader_data->uses_depth_texture ||
+							shader_data->uses_normal_texture ||
+							shader_data->uses_point_size ||
+							shader_data->uses_world_coordinates ||
+							shader_data->writes_modelview_or_projection ||
+							shader_data->uses_z_clip_scale ||
+							shader_data->stencil_enabled ||
+							uses_lightmap;
+
+					if (needs_forward_fallback) {
+						surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
+						render_list[RENDER_LIST_OPAQUE_FALLBACK].add_element(surf);
+					} else {
+						rl->add_element(surf);
+					}
 				}
 
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
@@ -1182,7 +1286,7 @@ void RenderDeferredClustered::_fill_render_list(RenderListType p_render_list, co
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
 					rl->add_element(surf);
 				}
-			} else if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
+			} else if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || p_pass_mode == PASS_MODE_GBUFFER) {
 				if (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					rl->add_element(surf);
 				}
@@ -1912,49 +2016,29 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 
 	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
+	render_list[RENDER_LIST_OPAQUE_FALLBACK].sort_by_key();
 	render_list[RENDER_LIST_MOTION].sort_by_key();
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
+	_fill_instance_data(RENDER_LIST_OPAQUE_FALLBACK, render_info);
 	_fill_instance_data(RENDER_LIST_MOTION, render_info);
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
 
 	RD::get_singleton()->draw_command_end_label();
 
 	if (!is_reflection_probe) {
-		if (using_voxelgi) {
-			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI;
-		} else if (p_render_data->environment.is_valid()) {
-			if (using_ssr ||
-					using_sdfgi ||
-					environment_get_ssao_enabled(p_render_data->environment) ||
-					using_ssil ||
-					ce_needs_normal_roughness ||
-					get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER ||
-					scene_state.used_normal_texture) {
-				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
-			}
-		} else if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
-			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
-		}
-
-		switch (depth_pass_mode) {
-			case PASS_MODE_DEPTH: {
-				depth_framebuffer = rb_data->get_depth_fb();
-			} break;
-			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
-				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataDeferredClustered::DEPTH_FB_ROUGHNESS);
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
-			} break;
-			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
-				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataDeferredClustered::DEPTH_FB_ROUGHNESS_VOXELGI);
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
-			} break;
-			default: {
-			};
-		}
+		// The G-buffer pass is mandatory in the deferred renderer and replaces the optional depth pre-pass.
+		depth_pass_mode = PASS_MODE_GBUFFER;
+		// The G-buffer shader always declares the voxel-GI output slot.
+		rb_data->ensure_voxelgi();
+		depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataDeferredClustered::DEPTH_FB_GBUFFER);
+		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // normal_roughness
+		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // albedo
+		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // orm
+		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // emission
+		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // voxel_gi
 	}
 
 	bool using_sss = rb_data.is_valid() && !is_reflection_probe && scene_state.used_sss && ss_effects->sss_get_quality() != RSE::SUB_SURFACE_SCATTERING_QUALITY_DISABLED;
@@ -1979,7 +2063,8 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		rb_data->ensure_normal_roughness_texture();
 	}
 
-	if (using_sss || using_separate_specular || scene_state.used_lightmap || using_voxelgi || global_surface_data.sss_used) {
+	// The mandatory G-buffer pass belongs to the advanced shader group.
+	if (!is_reflection_probe || using_sss || using_separate_specular || scene_state.used_lightmap || using_voxelgi || global_surface_data.sss_used) {
 		scene_shader.enable_advanced_shader_group(p_render_data->scene_data->view_count > 1);
 	}
 
@@ -2112,6 +2197,11 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 	bool force_depth_pre_pass = scene_state.used_opaque_stencil;
 	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
 
+	// In the deferred renderer the G-buffer pass is mandatory, regardless of the depth pre-pass setting.
+	if (!is_reflection_probe) {
+		depth_pre_pass = true;
+	}
+
 	SceneShaderDeferredClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
 	base_specialization.use_depth_fog = p_render_data->environment.is_valid() && environment_get_fog_mode(p_render_data->environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH;
 
@@ -2145,7 +2235,11 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		if (use_msaa) {
 			RENDER_TIMESTAMP("Resolve Depth Pre-Pass (MSAA)");
 			RD::get_singleton()->draw_command_begin_label("Resolve Depth Pre-Pass (MSAA)");
-			if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) {
+			if (depth_pass_mode == PASS_MODE_GBUFFER) {
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
+				}
+			} else if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
 				}
@@ -2185,9 +2279,10 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 	}
 
-	RENDER_TIMESTAMP("Render Opaque Pass");
+	// In the deferred renderer the opaque color pass is replaced by the deferred lighting pass.
+	RENDER_TIMESTAMP("Render Deferred Lighting Pass");
 
-	RD::get_singleton()->draw_command_begin_label("Render Opaque Pass");
+	RD::get_singleton()->draw_command_begin_label("Render Deferred Lighting Pass");
 
 	p_render_data->scene_data->directional_light_count = p_render_data->directional_light_count;
 	p_render_data->scene_data->opaque_prepass_threshold = 0.0f;
@@ -2200,31 +2295,75 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 	RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
 
 	{
-		bool render_motion_pass = !render_list[RENDER_LIST_MOTION].elements.is_empty();
-
-		{
-			Vector<Color> c;
-			if (!load_color) {
-				Color cc = clear_color.srgb_to_linear();
-				if (using_separate_specular || rb_data.is_valid()) {
-					// Effects that rely on separate specular, like subsurface scattering, must clear the alpha to zero.
-					cc.a = 0;
-				}
-				c.push_back(cc);
-
-				if (rb_data.is_valid()) {
-					c.push_back(Color(0, 0, 0, 0)); // Separate specular.
-					c.push_back(Color(0, 0, 0, 0)); // Motion vector. Pushed to the clear color vector even if the framebuffer isn't bound.
-				}
+		Vector<Color> c;
+		if (!load_color) {
+			Color cc = clear_color.srgb_to_linear();
+			if (using_separate_specular || rb_data.is_valid()) {
+				// Effects that rely on separate specular, like subsurface scattering, must clear the alpha to zero.
+				cc.a = 0;
 			}
+			c.push_back(cc);
 
-			uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
-			RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
-			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-			_render_list_with_draw_list(&render_list_params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
+			if (rb_data.is_valid()) {
+				c.push_back(Color(0, 0, 0, 0)); // Separate specular.
+				c.push_back(Color(0, 0, 0, 0)); // Motion vector. Pushed to the clear color vector even if the framebuffer isn't bound.
+			}
 		}
 
+		uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
+		RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
+
+		// Deferred lighting pass: full-screen triangle that reads the G-buffer and computes lighting.
+		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
+		uint32_t lighting_mode = 0;
+		if (using_separate_specular) {
+			lighting_mode |= 1;
+		}
+		if (p_render_data->scene_data->view_count > 1) {
+			lighting_mode |= 2;
+		}
+
+		RID shader = deferred_lighting.shader.version_get_shader(deferred_lighting.shader_version, lighting_mode);
+		// Descriptor layouts include shader-stage visibility, not just binding types.
+		RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
+		rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader);
+		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
+		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
+		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, deferred_lighting.pipelines[lighting_mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(opaque_framebuffer)));
+
+		// The scene shader inc declares a push constant block (DrawCall); the full-screen
+		// triangle doesn't use instance data, so a zeroed push constant is sufficient.
+		// Non-ubershader variants use the 16-byte DrawCall block (4 uints).
+		uint32_t zero_push_constant[4] = {};
+		RD::get_singleton()->draw_list_set_push_constant(draw_list, zero_push_constant, sizeof(zero_push_constant));
+
+		RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);
+		RD::get_singleton()->draw_list_end();
+	}
+
+	RD::get_singleton()->draw_command_end_label();
+
+	// Forward fallback pass: renders opaque materials that cannot be expressed in the G-buffer.
+	if (!render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.is_empty()) {
+		RENDER_TIMESTAMP("Render Opaque Fallback Pass");
+
+		RD::get_singleton()->draw_command_begin_label("Render Opaque Fallback Pass");
+
+		uint32_t fallback_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
+		RID fallback_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(fallback_color_pass_flags) : color_framebuffer;
+
+		rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
+
+		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].element_info.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.size(), reverse_cull, PASS_MODE_COLOR, fallback_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+		// Fallback geometry skipped the G-buffer depth pass and must write its own depth.
+		render_list_params.opaque_fallback = true;
+		_render_list_with_draw_list(&render_list_params, fallback_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+
 		RD::get_singleton()->draw_command_end_label();
+	}
+
+	{
+		bool render_motion_pass = !render_list[RENDER_LIST_MOTION].elements.is_empty();
 
 		if (using_motion_pass) {
 			if (scale_type == SCALE_MFX) {
@@ -3374,11 +3513,15 @@ void RenderDeferredClustered::_update_render_base_uniform_set() {
 			uniforms.push_back(u);
 		}
 
+		render_base_uniforms.clear();
+		for (const RD::Uniform &uniform : uniforms) {
+			render_base_uniforms.push_back(uniform);
+		}
 		render_base_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, scene_shader.default_shader_rd, SCENE_UNIFORM_SET);
 	}
 }
 
-RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas) {
+RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -3419,14 +3562,20 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		RD::Uniform u;
 		u.binding = 2;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
-		if (scene_state.instance_buffer[p_render_list].get_size(0u) == 0u) {
+		if (p_lighting_shader.is_valid()) {
+			// Full-screen lighting does not access per-instance data.
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(scene_shader.default_vec4_xform_buffer);
+		} else if (scene_state.instance_buffer[p_render_list].get_size(0u) == 0u) {
 			// Any buffer will do since it's not used, so just create one.
 			// We can't use scene_shader.default_vec4_xform_buffer because it's not dynamic.
 			scene_state.instance_buffer[p_render_list].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::InstanceData));
 			scene_state.instance_buffer[p_render_list].prepare_for_upload();
 		}
-		RID instance_buffer = scene_state.instance_buffer[p_render_list]._get(0u);
-		u.append_id(instance_buffer);
+		if (p_lighting_shader.is_null()) {
+			RID instance_buffer = scene_state.instance_buffer[p_render_list]._get(0u);
+			u.append_id(instance_buffer);
+		}
 		uniforms.push_back(u);
 	}
 	{
@@ -3762,7 +3911,38 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		uniforms.push_back(u);
 	}
 
-	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, RENDER_PASS_UNIFORM_SET, uniforms);
+	// Geometry passes do not declare the lighting-only G-buffer bindings.
+	if (p_lighting_shader.is_null()) {
+		return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, RENDER_PASS_UNIFORM_SET, uniforms);
+	}
+
+	// G-buffer textures, used by the deferred lighting pass.
+	{
+		RD::Uniform u;
+		u.binding = 37;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture = rb_data.is_valid() && rb_data->has_gbuffer() ? rb_data->get_gbuffer_albedo() : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture = rb_data.is_valid() && rb_data->has_gbuffer() ? rb_data->get_gbuffer_orm() : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture = rb_data.is_valid() && rb_data->has_gbuffer() ? rb_data->get_gbuffer_emission() : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	return UniformSetCacheRD::get_singleton()->get_cache_vec(p_lighting_shader, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
 RID RenderDeferredClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index) {
@@ -5233,6 +5413,38 @@ RenderDeferredClustered::RenderDeferredClustered() {
 		RD::get_singleton()->compute_list_end();
 	}
 
+	/* Deferred lighting pass */
+	{
+		String defines;
+		defines += "\n#define MAX_ROUGHNESS_LOD " + itos(get_roughness_layers() - 1) + ".0\n";
+		if (is_using_radiance_octmap_array()) {
+			defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
+		}
+		defines += "\n#define SDFGI_OCT_SIZE " + itos(gi.sdfgi_get_lightprobe_octahedron_size()) + "\n";
+		defines += "\n#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS " + itos(MAX_DIRECTIONAL_LIGHTS) + "\n";
+		defines += "\n#define MAX_LIGHTMAP_TEXTURES " + itos(scene_state.max_lightmaps) + "\n";
+		defines += "\n#define MAX_LIGHTMAPS " + itos(scene_state.max_lightmaps) + "\n";
+#ifdef REAL_T_IS_DOUBLE
+		defines += "\n#define USE_DOUBLE_PRECISION \n";
+#endif
+
+		Vector<String> modes;
+		modes.push_back(defines + "\n"); // DEFERRED_LIGHTING_MODE_BASE
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n"); // DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR
+		modes.push_back(defines + "\n#define USE_MULTIVIEW\n"); // DEFERRED_LIGHTING_MODE_MULTIVIEW
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n"); // DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW
+
+		deferred_lighting.shader.initialize(modes);
+		deferred_lighting.shader_version = deferred_lighting.shader.version_create();
+
+		for (int i = 0; i < DEFERRED_LIGHTING_MODE_MAX; i++) {
+			RID shader = deferred_lighting.shader.version_get_shader(deferred_lighting.shader_version, i);
+			ERR_FAIL_COND(shader.is_null());
+			// The lighting pass can render to color + separate specular + motion vectors (3 attachments).
+			deferred_lighting.pipelines[i].setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(3));
+		}
+	}
+
 	_update_shader_quality_settings();
 	_update_global_pipeline_data_requirements_from_project();
 
@@ -5283,6 +5495,8 @@ RenderDeferredClustered::~RenderDeferredClustered() {
 	RD::get_singleton()->free_rid(dfg_lut.pipeline);
 	RD::get_singleton()->free_rid(dfg_lut.texture);
 	dfg_lut.shader.version_free(dfg_lut.shader_version);
+
+	deferred_lighting.shader.version_free(deferred_lighting.shader_version);
 
 	if (ltc.lut1_texture.is_valid()) {
 		RS::get_singleton()->free_rid(ltc.lut1_texture);
