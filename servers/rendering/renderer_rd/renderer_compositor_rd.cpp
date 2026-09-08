@@ -35,6 +35,7 @@
 #include "core/io/dir_access.h"
 #include "core/os/os.h"
 #include "servers/display/display_server.h"
+#include "servers/rendering/renderer_rd/deferred_clustered/render_deferred_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -374,12 +375,14 @@ RendererCompositorRD::RendererCompositorRD() {
 	uint64_t textures_per_stage = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE);
 
 	if (rendering_method == "mobile" || textures_per_stage < 48) {
-		if (rendering_method == "forward_plus") {
+		if (rendering_method == "forward_plus" || rendering_method == "deferred") {
 			WARN_PRINT_ONCE("Platform supports less than 48 textures per stage which is less than required by the Clustered renderer. Defaulting to Mobile renderer.");
 		}
 		scene = memnew(RendererSceneRenderImplementation::RenderForwardMobile());
 	} else if (rendering_method == "forward_plus") {
 		scene = memnew(RendererSceneRenderImplementation::RenderForwardClustered());
+	} else if (rendering_method == "deferred") {
+		scene = memnew(RendererSceneRenderImplementation::RenderDeferredClustered());
 	} else {
 		// Fall back to our high end renderer.
 		ERR_PRINT(vformat("Cannot instantiate RenderingDevice-based renderer with renderer type '%s'. Defaulting to Forward+ renderer.", rendering_method));
