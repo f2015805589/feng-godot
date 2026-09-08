@@ -1,0 +1,35 @@
+[configuration]
+
+entry_symbol = "terrain_3d_init"
+compatibility_minimum = 4.5
+
+[icons]
+
+Terrain3D = "res://addons/feng-idweight-terrain/icons/terrain3d.svg"
+
+[libraries]
+
+windows.debug.x86_64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.windows.release.x86_64.dll"
+windows.debug.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.windows.debug.arm64.dll"
+windows.release.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.windows.release.arm64.dll"
+
+linux.debug.x86_64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.debug.x86_64.so"
+linux.release.x86_64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.release.x86_64.so"
+linux.debug.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.debug.arm64.so"
+linux.release.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.release.arm64.so"
+linux.debug.rv64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.debug.rv64.so"
+linux.release.rv64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.linux.release.rv64.so"
+
+macos.debug = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.macos.debug.framework"
+macos.release = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.macos.release.framework"
+
+android.debug.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.android.debug.arm64.so"
+android.release.arm64 = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.android.release.arm64.so"
+
+ios.debug = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.ios.debug.universal.dylib"
+ios.release = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.ios.release.universal.dylib"
+
+web.release.wasm32.nothreads = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.web.release.wasm32.nothreads.wasm"
+web.release.wasm32.threads = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.web.release.wasm32.threads.wasm"
+web.release.wasm64.threads = "res://addons/feng-idweight-terrain/bin/libfeng-idweight-terrain.web.release.wasm64.threads.wasm"
