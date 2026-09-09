@@ -1,0 +1,9 @@
+[configuration]
+
+entry_symbol = "renderdoc_capture_init"
+compatibility_minimum = 4.5
+
+[libraries]
+
+windows.debug.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.windows.release.x86_64.dll"

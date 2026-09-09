@@ -578,6 +578,7 @@ class ListContainer extends Container:
 		var res_id: int = p_resource.id if p_resource else entries.size()
 		entry.hovered.connect(_on_resource_hovered.bind(res_id))
 		entry.clicked.connect(clicked_id.bind(entries.size()))
+		entry.role_selected.connect(_on_role_selected)
 		entry.inspected.connect(_on_resource_inspected)
 		entry.changed.connect(_on_resource_changed.bind(res_id))
 		entry.type = type
@@ -587,6 +588,38 @@ class ListContainer extends Container:
 		if p_resource:
 			if not p_resource.id_changed.is_connected(set_selected_after_swap):
 				p_resource.id_changed.connect(set_selected_after_swap)
+
+
+	func _on_role_selected(p_role: int, p_entry: ListEntry) -> void:
+		# Hydra IdWeight pair painting: 0 = Overlay (left), 1 = Background (right).
+		# The clicked entry carries the role; the pair state lives in the UI.
+		if plugin.ui:
+			plugin.select_terrain()
+			plugin.ui.toolbar.change_tool("PaintTexture")
+			plugin.ui.set_visible(true)
+			plugin.ui.pair_active_role = p_role
+			if p_entry.resource:
+				EditorInterface.edit_resource(p_entry.resource)
+			var entry_index := entries.find(p_entry)
+			if entry_index >= 0:
+				set_selected_id(entry_index)
+			var res_id: int = p_entry.get_resource_id()
+			if p_role == 0:
+				plugin.ui.pair_overlay_id = res_id
+			else:
+				plugin.ui.pair_background_id = res_id
+		# Update role highlights on all texture entries
+		for e in entries:
+			e.role_flags = 0
+		for e in entries:
+			if not e.resource:
+				continue
+			var eid: int = e.get_resource_id()
+			if eid == plugin.ui.pair_overlay_id:
+				e.role_flags |= 1
+			if eid == plugin.ui.pair_background_id:
+				e.role_flags |= 2
+		redraw()
 
 
 	func _on_resource_hovered(p_id: int):
@@ -620,7 +653,25 @@ class ListContainer extends Container:
 		for i in entries.size():
 			var entry: ListEntry = entries[i]
 			entry.set_selected(i == selected_id)
+		_restore_role_highlights()
 		plugin.ui._on_setting_changed()
+
+
+	func _restore_role_highlights() -> void:
+		# Hydra IdWeight pair role highlights survive list rebuilds
+		if type != Terrain3DAssets.TYPE_TEXTURE or not plugin.ui:
+			return
+		for e in entries:
+			e.role_flags = 0
+		for e in entries:
+			if not e.resource:
+				continue
+			var res_id: int = e.get_resource_id()
+			if res_id == plugin.ui.pair_overlay_id:
+				e.role_flags |= 1
+			if res_id == plugin.ui.pair_background_id:
+				e.role_flags |= 2
+		redraw()
 
 
 	func get_selected_asset_id() -> int:
@@ -728,6 +779,7 @@ class ListContainer extends Container:
 class ListEntry extends MarginContainer:
 	signal hovered()
 	signal clicked()
+	signal role_selected(role: int, entry: ListEntry)
 	signal changed(resource: Resource)
 	signal inspected(resource: Resource)
 	
@@ -738,6 +790,9 @@ class ListEntry extends MarginContainer:
 	var is_hovered: bool = false
 	var is_selected: bool = false
 	var is_highlighted: bool = false
+	# Hydra IdWeight pair role flags: 0 = none, 1 = Overlay (white border),
+	# 2 = Background (blue border), 3 = both (white + blue borders).
+	var role_flags: int = 0
 	
 	var name_label: Label
 	var count_label: Label
@@ -790,7 +845,7 @@ class ListEntry extends MarginContainer:
 		
 		button_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		button_row.alignment = FlowContainer.ALIGNMENT_CENTER
-		button_row.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		add_child(button_row, true)
 
 		if type == Terrain3DAssets.TYPE_MESH:
@@ -873,6 +928,15 @@ class ListEntry extends MarginContainer:
 		return ""
 
 
+	func get_resource_id() -> int:
+		if resource:
+			if resource is Terrain3DMeshAsset:
+				return (resource as Terrain3DMeshAsset).id
+			elif resource is Terrain3DTextureAsset:
+				return (resource as Terrain3DTextureAsset).id
+		return -1
+
+
 	func setup_label() -> void:
 		name_label = Label.new()
 		name_label.name = "MeshLabel"
@@ -952,8 +1016,28 @@ class ListEntry extends MarginContainer:
 					draw_style_box(focus_style, rect)
 				if is_hovered:
 					draw_rect(rect, Color(1, 1, 1, 0.2))
-				if is_selected:
+				if is_selected and type != Terrain3DAssets.TYPE_TEXTURE:
 					draw_style_box(focus_style, rect)
+				# Hydra IdWeight pair role highlight: Overlay = white border,
+				# Background = blue border, both = white + blue borders.
+				if role_flags == 1:
+					draw_rect(rect, Color(1, 1, 1, 0.95), false, 3.0)
+				elif role_flags == 2:
+					draw_rect(rect, Color(0.35, 0.68, 1.0, 0.95), false, 3.0)
+				elif role_flags == 3:
+					var mid_x := rect.position.x + rect.size.x * 0.5
+					var left := rect.position.x
+					var right := rect.end.x
+					var top := rect.position.y
+					var bottom := rect.end.y
+					var white := Color(1, 1, 1, 0.95)
+					var blue := Color(0.35, 0.68, 1.0, 0.95)
+					draw_line(Vector2(left, top), Vector2(mid_x, top), white, 3.0)
+					draw_line(Vector2(left, bottom), Vector2(mid_x, bottom), white, 3.0)
+					draw_line(Vector2(left, top), Vector2(left, bottom), white, 3.0)
+					draw_line(Vector2(mid_x, top), Vector2(right, top), blue, 3.0)
+					draw_line(Vector2(mid_x, bottom), Vector2(right, bottom), blue, 3.0)
+					draw_line(Vector2(right, top), Vector2(right, bottom), blue, 3.0)
 			NOTIFICATION_MOUSE_ENTER:
 				if not resource:
 					name_label.visible = false
@@ -984,10 +1068,18 @@ class ListEntry extends MarginContainer:
 								set_edited_resource(Terrain3DMeshAsset.new(), false)
 							_on_edit()
 						else:
+							# Hydra: left click selects the Overlay role
+							if type == Terrain3DAssets.TYPE_TEXTURE:
+								role_selected.emit(0, self)
 							emit_signal("clicked")
 					MOUSE_BUTTON_RIGHT:
 						if resource:
-							_on_edit()
+							# Hydra: right click selects the Background role
+							if type == Terrain3DAssets.TYPE_TEXTURE:
+								role_selected.emit(1, self)
+								emit_signal("clicked")
+							else:
+								_on_edit()
 					MOUSE_BUTTON_MIDDLE:
 						if resource:
 							_on_clear()

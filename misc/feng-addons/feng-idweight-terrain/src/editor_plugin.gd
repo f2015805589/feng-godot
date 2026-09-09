@@ -146,8 +146,21 @@ func _make_visible(p_visible: bool, p_redraw: bool = false) -> void:
 	if p_visible and is_selected():
 		ui.set_visible(true)
 		asset_dock.update_dock()
+	elif p_visible and is_terrain_valid() and _is_editing_terrain_asset():
+		# Inspector is showing a Terrain3D asset (e.g. a texture clicked in
+		# the asset dock). Keep the terrain tool UI active so painting still
+		# works while the asset properties are editable.
+		ui.set_visible(true)
+		asset_dock.update_dock()
 	else:
 		ui.set_visible(false)
+
+
+func _is_editing_terrain_asset() -> bool:
+	var obj: Object = EditorInterface.get_inspector().get_edited_object()
+	if not obj:
+		return false
+	return obj is Terrain3DTextureAsset or obj is Terrain3DMeshAsset or obj is Terrain3DAssets
 
 
 func _clear() -> void:
@@ -247,8 +260,11 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 			if ui.operation_builder and ui.operation_builder.is_ready():
 				ui.operation_builder.apply_operation(editor, mouse_global_position, p_viewport_camera.rotation.y)
 				return AFTER_GUI_INPUT_STOP
-			
-			# Mouse clicked, start editing
+
+			# Mouse clicked, start editing. The overlay/background pair is
+			# chosen in the asset dock (left = overlay, right = background);
+			# the 3D viewport always paints the selected pair with the left
+			# button, while the right button keeps rotating the camera.
 			editor.start_operation(mouse_global_position)
 			editor.operate(mouse_global_position, p_viewport_camera.rotation.y)
 			return AFTER_GUI_INPUT_STOP
@@ -437,14 +453,19 @@ func is_selected() -> bool:
 
 
 func select_terrain() -> void:
-	if debug and is_selected():
-		print("Terrain3DEditorPlugin: Terrain is selected, skipping")
-	if is_instance_valid(_last_terrain) and is_terrain_valid(_last_terrain) and not is_selected():
-		var es: EditorSelection = EditorInterface.get_selection()
-		if debug:
-			print("Terrain3DEditorPlugin: Clearing and reselecting terrain")
-		es.clear()
-		es.add_node(_last_terrain)
+	if not is_instance_valid(_last_terrain) or not is_terrain_valid(_last_terrain):
+		return
+	# Do not touch the scene selection here: selecting the node would make the
+	# Inspector switch away from the clicked texture asset. Only restore the
+	# terrain tool UI, deferred so _make_visible() cannot hide it again.
+	call_deferred("_restore_terrain_editor")
+
+func _restore_terrain_editor() -> void:
+	if not is_instance_valid(_last_terrain) or not is_terrain_valid(_last_terrain):
+		return
+	ui.set_visible(true)
+	asset_dock.update_dock()
+	_read_input()
 
 
 ## Editor Settings

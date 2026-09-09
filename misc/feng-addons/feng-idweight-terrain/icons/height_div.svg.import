@@ -3,7 +3,7 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://danh7tb2v6rx7"
-path="res://.godot/imported/height_div.svg-449a465f9fdd11ab59f2f1c78815408c.ctex"
+path="res://.godot/imported/height_div.svg-7584b8037a018eeb98b1996b7132e614.ctex"
 metadata={
 "has_editor_variant": true,
 "vram_texture": false
@@ -12,7 +12,7 @@ metadata={
 [deps]
 
 source_file="res://addons/feng-idweight-terrain/icons/height_div.svg"
-dest_files=["res://.godot/imported/height_div.svg-449a465f9fdd11ab59f2f1c78815408c.ctex"]
+dest_files=["res://.godot/imported/height_div.svg-7584b8037a018eeb98b1996b7132e614.ctex"]
 
 [params]
 

@@ -94,6 +94,24 @@ func _ready() -> void:
 	add_setting({ "name":"texture_picker", "type":SettingType.PICKER, "list":main_list, "default":Terrain3DEditor.TEXTURE,
 							"flags":NO_LABEL, "tooltip":"Pick Texture from the terrain." })
 
+	# Hydra IdWeight pair painting controls
+	add_setting({ "name":"pair_mode", "label":"Pair Mode", "type":SettingType.OPTION, "list":main_list,
+							"default":0, "range":Vector3(0, 4, 1), "options":["Set", "Add", "Sub", "Mix"],
+							"flags":ADD_SEPARATOR, "tooltip":"0=Set, 1=Add, 2=Sub, 3=Mix (Hydra TerrainSurfacePairBlendMode)" })
+	add_setting({ "name":"pair_weight_level", "label":"Weight", "type":SettingType.SLIDER, "list":main_list,
+							"default":8, "range":Vector3(1, 8, 1),
+							"tooltip":"Discrete overlay contribution level 1..8 (Hydra WeightLevel)" })
+	# Hydra slope blending parameters, applied to the currently selected texture asset
+	add_setting({ "name":"slope_blend_sharpness", "label":"Slope Sharpness", "type":SettingType.SLIDER, "list":main_list,
+							"default":1000, "range":Vector3(0, 1000, 1), "flags":ADD_SEPARATOR,
+							"tooltip":"Hydra blendSharpness, raw 0..1000 (shader scales by 1/1000, floor 0.1)" })
+	add_setting({ "name":"slope_based_damp", "label":"Slope Damp", "type":SettingType.SLIDER, "list":main_list,
+							"default":0, "range":Vector3(0, 1000, 1),
+							"tooltip":"Hydra slopeBasedDamp, raw 0..1000" })
+	add_setting({ "name":"slope_based_normal_damp", "label":"Slope Normal Damp", "type":SettingType.SLIDER, "list":main_list,
+							"default":0, "range":Vector3(0, 1000, 1),
+							"tooltip":"Hydra slopeBasedNormalDamp, raw 0..1000" })
+
 	add_setting({ "name":"texture_filter", "label":"Texture Filter", "type":SettingType.CHECKBOX, 
 							"list":main_list, "default":false, "flags":ADD_SEPARATOR })
 
@@ -474,8 +492,14 @@ func add_setting(p_args: Dictionary) -> void:
 
 		SettingType.OPTION:
 			var option := OptionButton.new()
+			# Keep raw option labels (Set/Add/Sub/Mix) untranslated
+			option.auto_translate_mode = Node.AUTO_TRANSLATE_MODE_DISABLED
+			var option_labels: Array = p_args.get("options", [])
 			for i in int(p_maximum):
-				option.add_item("a", i)
+				if i < option_labels.size():
+					option.add_item(str(option_labels[i]), i)
+				else:
+					option.add_item("a", i)
 			option.selected = p_minimum
 			option.item_selected.connect(_on_setting_changed)
 			pending_children.push_back(option)
@@ -598,6 +622,8 @@ func get_setting(p_setting: String) -> Variant:
 		object.set_custom_minimum_size(Vector2(width, 0))
 	elif object is DoubleSlider:
 		value = object.get_value()
+	elif object is OptionButton:
+		value = object.get_selected()
 	elif object is ButtonGroup: # "brush"
 		value = selected_brush_imgs
 	elif object is CheckBox:
@@ -622,6 +648,8 @@ func set_setting(p_setting: String, p_value: Variant) -> void:
 			for button in object.get_buttons():
 				if button.name == p_value[0]:
 					button.button_pressed = p_value[1]
+	elif object is OptionButton:
+		object.selected = p_value
 	elif object is CheckBox:
 		object.button_pressed = p_value
 	elif object is ColorPickerButton:

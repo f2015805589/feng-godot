@@ -1,0 +1,9 @@
+/.sconsign*
+/src/gen/
+*.obj
+*.o
+*.pdb
+*.exp
+*.lib
+*.exe
+__pycache__/

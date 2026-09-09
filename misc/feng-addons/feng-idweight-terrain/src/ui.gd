@@ -61,6 +61,12 @@ var active_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var _selected_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var inverted_input: bool = false
 
+# Hydra IdWeight pair painting state: which role the next stroke paints.
+# 0 = Overlay (left mouse), 1 = Background (right mouse).
+var pair_active_role: int = 0
+var pair_overlay_id: int = 0
+var pair_background_id: int = 0
+
 # 3 Editor decals: 0 = cursor, 1 = slope point1, 2 = slope point2
 var mat_rid: RID
 var editor_brush_texture_rid: RID = RID()
@@ -208,6 +214,11 @@ func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor
 			if _selected_operation == Terrain3DEditor.ADD:
 				to_show.push_back("strength")
 				to_show.push_back("invert")
+			to_show.push_back("pair_mode")
+			to_show.push_back("pair_weight_level")
+			to_show.push_back("slope_blend_sharpness")
+			to_show.push_back("slope_based_damp")
+			to_show.push_back("slope_based_normal_damp")
 			to_show.push_back("slope")
 			to_show.push_back("enable_angle")
 			to_show.push_back("angle")
@@ -293,6 +304,26 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 		return
 	brush_data = tool_settings.get_settings()
 	brush_data["asset_id"] = plugin.asset_dock.current_list.get_selected_asset_id()
+	# Hydra IdWeight pair painting: keep the selected overlay/background roles
+	# stable across asset selection changes, and apply the current role's asset.
+	if plugin.editor and plugin.editor.get_tool() == Terrain3DEditor.TEXTURE:
+		if pair_active_role == 1:
+			pair_background_id = brush_data["asset_id"]
+			brush_data["pair_overlay_id"] = pair_overlay_id
+			brush_data["pair_background_id"] = pair_background_id
+		else:
+			pair_overlay_id = brush_data["asset_id"]
+			brush_data["pair_overlay_id"] = pair_overlay_id
+			brush_data["pair_background_id"] = pair_background_id
+		brush_data["pair_mode"] = tool_settings.get_setting("pair_mode")
+		brush_data["pair_weight_level"] = tool_settings.get_setting("pair_weight_level")
+		# Slope blending parameters are applied to the selected texture asset
+		# so the shader's per-material slope array stays in sync with the UI.
+		var tex: Terrain3DTextureAsset = plugin.terrain.assets.get_texture_asset(brush_data["asset_id"]) if plugin.terrain and plugin.terrain.assets else null
+		if tex:
+			tex.set_slope_blend_sharpness(tool_settings.get_setting("slope_blend_sharpness"))
+			tex.set_slope_based_damp(tool_settings.get_setting("slope_based_damp"))
+			tex.set_slope_based_normal_damp(tool_settings.get_setting("slope_based_normal_damp"))
 	if plugin.debug:
 		print("Terrain3DUI: _on_setting_changed: selected resource ID: ", brush_data["asset_id"])
 	if plugin.editor:

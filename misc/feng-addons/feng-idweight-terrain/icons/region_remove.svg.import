@@ -3,7 +3,7 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://cbpo5eamf3bx2"
-path="res://.godot/imported/region_remove.svg-5710e8aeb34f1eaa06e637634f4a7d16.ctex"
+path="res://.godot/imported/region_remove.svg-be6040e23837557089481a21a4bedbd3.ctex"
 metadata={
 "has_editor_variant": true,
 "vram_texture": false
@@ -12,7 +12,7 @@ metadata={
 [deps]
 
 source_file="res://addons/feng-idweight-terrain/icons/region_remove.svg"
-dest_files=["res://.godot/imported/region_remove.svg-5710e8aeb34f1eaa06e637634f4a7d16.ctex"]
+dest_files=["res://.godot/imported/region_remove.svg-be6040e23837557089481a21a4bedbd3.ctex"]
 
 [params]
 

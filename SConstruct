@@ -1252,7 +1252,11 @@ if not env.GetOption("clean") and not env.GetOption("help"):
     if addons_src.is_dir():
         if addons_dst.exists():
             shutil.rmtree(addons_dst)
-        shutil.copytree(addons_src, addons_dst)
+        shutil.copytree(
+            addons_src,
+            addons_dst,
+            ignore=shutil.ignore_patterns("native", ".git", "__pycache__", "*.obj", "*.exp", "*.lib", "*.pdb"),
+        )
         print("feng-godot: bundled addons copied to bin/addons/")
 
 # Microsoft Visual Studio Project Generation

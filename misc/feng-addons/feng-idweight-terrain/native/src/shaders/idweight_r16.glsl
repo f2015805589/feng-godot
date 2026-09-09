@@ -1,0 +1,320 @@
+R"(
+//INSERT: IDWEIGHT_R16
+// Hydra-compatible R16 IDWeight surface contract and evaluation.
+// Bit layout (MSB -> LSB): OverlayId:5 | BackgroundId:5 | Mode:2 | Weight:3 | UV:1
+// Weight stores levels 1..8 as raw values 0..7. Equal IDs encode a single
+// background material. Must stay bit-exact with TerrainSurfaceIdWeight::encode.
+#define HYDRA_IDWEIGHT_OVERLAY_MASK 0xF800u
+#define HYDRA_IDWEIGHT_BACKGROUND_MASK 0x07C0u
+#define HYDRA_IDWEIGHT_MODE_MASK 0x0030u
+#define HYDRA_IDWEIGHT_WEIGHT_MASK 0x000Eu
+#define HYDRA_IDWEIGHT_UV_MASK 0x0001u
+#define HYDRA_IDWEIGHT_MAX_LAYERS 3
+#define HYDRA_IDWEIGHT_MODE_SET 0u
+#define HYDRA_IDWEIGHT_MODE_ADD 1u
+#define HYDRA_IDWEIGHT_MODE_SUB 2u
+#define HYDRA_IDWEIGHT_MODE_MIX 3u
+// Slope distance fade: full blend inside 180m, disabled beyond 200m.
+#define HYDRA_IDWEIGHT_SLOPE_FULL_DISTANCE_SQ 32400.0
+#define HYDRA_IDWEIGHT_SLOPE_MAX_DISTANCE_SQ 40000.0
+// Random triplanar defaults matching TerrainRandomTriplanarSettings.Default.
+#define HYDRA_IDWEIGHT_DITHER_CELL_SIZE 0.005
+#define HYDRA_IDWEIGHT_TRIPLANAR_SEED 0u
+#define HYDRA_IDWEIGHT_TRIPLANAR_THRESHOLD 0.8660254037844386 // cos(30 deg)
+#define HYDRA_IDWEIGHT_TRIPLANAR_FEATHER 0.0402650422643367 // cos(25) - cos(30)
+#define HYDRA_IDWEIGHT_TRIPLANAR_SHARPNESS 4.0
+
+uint hydra_idweight_overlay(uint value) { return (value >> 11u) & 0x1Fu; }
+uint hydra_idweight_background(uint value) { return (value >> 6u) & 0x1Fu; }
+uint hydra_idweight_mode(uint value) { return (value >> 4u) & 0x3u; }
+uint hydra_idweight_weight_level(uint value) { return ((value >> 1u) & 0x7u) + 1u; }
+uint hydra_idweight_uv_variant(uint value) { return value & 0x1u; }
+float hydra_idweight_weight(uint value) {
+	// Equal IDs encode a single background material with zero overlay weight.
+	return hydra_idweight_overlay(value) == hydra_idweight_background(value)
+		? 0.0 : float(hydra_idweight_weight_level(value)) / 8.0;
+}
+
+float hydra_idweight_saturate(float v) { return clamp(v, 0.0, 1.0); }
+
+// ── Contribution aggregation (up to six candidates per triangle) ──
+
+struct IdWeightContributions {
+	uint id0, id1, id2, id3, id4, id5;
+	float w0, w1, w2, w3, w4, w5;
+	uint count;
+};
+
+float hydra_idweight_get_weight(IdWeightContributions values, int index) {
+	if (index == 0) return values.w0;
+	if (index == 1) return values.w1;
+	if (index == 2) return values.w2;
+	if (index == 3) return values.w3;
+	if (index == 4) return values.w4;
+	return values.w5;
+}
+
+uint hydra_idweight_get_id(IdWeightContributions values, int index) {
+	if (index == 0) return values.id0;
+	if (index == 1) return values.id1;
+	if (index == 2) return values.id2;
+	if (index == 3) return values.id3;
+	if (index == 4) return values.id4;
+	return values.id5;
+}
+
+void hydra_idweight_add_contribution(uint materialId, float contribution, inout IdWeightContributions values) {
+	if (contribution <= 0.0) return;
+	if (values.count > 0u && values.id0 == materialId) { values.w0 += contribution; return; }
+	if (values.count > 1u && values.id1 == materialId) { values.w1 += contribution; return; }
+	if (values.count > 2u && values.id2 == materialId) { values.w2 += contribution; return; }
+	if (values.count > 3u && values.id3 == materialId) { values.w3 += contribution; return; }
+	if (values.count > 4u && values.id4 == materialId) { values.w4 += contribution; return; }
+	if (values.count > 5u && values.id5 == materialId) { values.w5 += contribution; return; }
+	if (values.count == 0u) { values.id0 = materialId; values.w0 = contribution; }
+	else if (values.count == 1u) { values.id1 = materialId; values.w1 = contribution; }
+	else if (values.count == 2u) { values.id2 = materialId; values.w2 = contribution; }
+	else if (values.count == 3u) { values.id3 = materialId; values.w3 = contribution; }
+	else if (values.count == 4u) { values.id4 = materialId; values.w4 = contribution; }
+	else if (values.count == 5u) { values.id5 = materialId; values.w5 = contribution; }
+	else { return; }
+	values.count++;
+}
+
+void hydra_idweight_add_vertex(uint packed, float barycentric, inout IdWeightContributions values, inout float interpolatedOverlayWeight) {
+	uint baseId = hydra_idweight_background(packed);
+	uint overlayId = hydra_idweight_overlay(packed);
+	float overlayWeight = hydra_idweight_weight(packed);
+	hydra_idweight_add_contribution(baseId, barycentric * (1.0 - overlayWeight), values);
+	if (overlayId != baseId) {
+		hydra_idweight_add_contribution(overlayId, barycentric * overlayWeight, values);
+	}
+	interpolatedOverlayWeight += barycentric * overlayWeight;
+}
+
+// ── Budgeted three-layer selection with stochastic residual ──
+
+bool hydra_idweight_contribution_is_better(IdWeightContributions values, int candidate, int current) {
+	if (current < 0) return true;
+	float candidateWeight = hydra_idweight_get_weight(values, candidate);
+	float currentWeight = hydra_idweight_get_weight(values, current);
+	uint candidateId = hydra_idweight_get_id(values, candidate);
+	uint currentId = hydra_idweight_get_id(values, current);
+	return candidateWeight > currentWeight + 1e-6 ||
+		(abs(candidateWeight - currentWeight) <= 1e-6 && candidateId < currentId);
+}
+
+void hydra_idweight_select_budgeted_3(IdWeightContributions values, float residualSelector,
+		out uvec3 materialIds, out vec3 materialWeights, out uint materialCount) {
+	int selected0 = -1;
+	int selected1 = -1;
+	for (int selectionPass = 0; selectionPass < 2; selectionPass++) {
+		int best = -1;
+		for (int candidate = 0; candidate < 6; candidate++) {
+			if (uint(candidate) >= values.count) break;
+			if (candidate == selected0 || candidate == selected1) continue;
+			if (hydra_idweight_contribution_is_better(values, candidate, best)) best = candidate;
+		}
+		if (selectionPass == 0) selected0 = best;
+		else selected1 = best;
+	}
+	if (selected1 >= 0 && hydra_idweight_contribution_is_better(values, selected1, selected0)) {
+		int swap = selected0;
+		selected0 = selected1;
+		selected1 = swap;
+	}
+	materialIds = uvec3(0u, 0u, 0u);
+	materialWeights = vec3(0.0, 0.0, 0.0);
+	materialCount = 0u;
+	if (selected0 >= 0) {
+		materialIds.x = hydra_idweight_get_id(values, selected0);
+		materialWeights.x = hydra_idweight_get_weight(values, selected0);
+		materialCount = 1u;
+	}
+	if (selected1 >= 0) {
+		materialIds.y = hydra_idweight_get_id(values, selected1);
+		materialWeights.y = hydra_idweight_get_weight(values, selected1);
+		materialCount = 2u;
+	}
+	float residualWeight = 0.0;
+	for (int candidate = 0; candidate < 6; candidate++) {
+		if (uint(candidate) >= values.count) break;
+		if (candidate == selected0 || candidate == selected1) continue;
+		residualWeight += hydra_idweight_get_weight(values, candidate);
+	}
+	if (residualWeight > 0.0) {
+		float targetWeight = hydra_idweight_saturate(residualSelector) * residualWeight;
+		float accumulatedWeight = 0.0;
+		int residualCandidate = -1;
+		for (int candidate = 0; candidate < 6; candidate++) {
+			if (uint(candidate) >= values.count) break;
+			if (candidate == selected0 || candidate == selected1) continue;
+			residualCandidate = candidate;
+			accumulatedWeight += hydra_idweight_get_weight(values, candidate);
+			if (targetWeight < accumulatedWeight) break;
+		}
+		if (residualCandidate >= 0) {
+			materialIds.z = hydra_idweight_get_id(values, residualCandidate);
+			// The selected residual represents the complete discarded tail.
+			materialWeights.z = residualWeight;
+			materialCount = 3u;
+		}
+	}
+}
+
+// ── Deterministic stochastic coverage (Bayer 8x8 with per-macro-tile scramble) ──
+
+uint hydra_idweight_bayer8x8_index(uvec2 coord) {
+	uint x = coord.x & 7u;
+	uint y = coord.y & 7u;
+	uint index = 0u;
+	for (uint bit = 0u; bit < 3u; bit++) {
+		uint xBit = (x >> bit) & 1u;
+		uint yBit = (y >> bit) & 1u;
+		uint digit = ((xBit ^ yBit) << 1u) | yBit;
+		index |= digit << (2u * (2u - bit));
+	}
+	return index;
+}
+
+uint hydra_idweight_coverage_tile_hash(ivec2 tile, uint seed) {
+	uint value = uint(tile.x) * 0x9e3779b9u;
+	value ^= uint(tile.y) * 0x85ebca6bu;
+	value ^= seed * 0xc2b2ae35u;
+	value ^= value >> 16u;
+	value *= 0x7feb352du;
+	value ^= value >> 15u;
+	value *= 0x846ca68bu;
+	value ^= value >> 16u;
+	return value;
+}
+
+float hydra_idweight_stochastic_coverage01_with_salt(vec3 positionWS, uint salt) {
+	ivec2 orderedCell = ivec2(floor(positionWS.xz / HYDRA_IDWEIGHT_DITHER_CELL_SIZE));
+	uvec2 localCoord = uvec2(uint(orderedCell.x & 7), uint(orderedCell.y & 7));
+	ivec2 macroTile = ivec2(orderedCell.x >> 3, orderedCell.y >> 3);
+	uint seed = HYDRA_IDWEIGHT_TRIPLANAR_SEED ^ salt;
+	uint scramble = hydra_idweight_coverage_tile_hash(macroTile, seed);
+	if ((scramble & 1u) != 0u) localCoord.x = 7u - localCoord.x;
+	if ((scramble & 2u) != 0u) localCoord.y = 7u - localCoord.y;
+	if ((scramble & 4u) != 0u) localCoord = localCoord.yx;
+	uint index = hydra_idweight_bayer8x8_index(localCoord);
+	index = (index + ((scramble >> 3u) & 63u)) & 63u;
+	return (float(index) + 0.5) * (1.0 / 64.0);
+}
+
+float hydra_idweight_stochastic_coverage01(vec3 positionWS) {
+	return hydra_idweight_stochastic_coverage01_with_salt(positionWS, 0u);
+}
+
+// ── Random triplanar projection ──
+
+float hydra_idweight_get_triplanar_factor(vec3 geometricNormalWS) {
+	float upAlignment = abs(normalize(geometricNormalWS).y);
+	return 1.0 - smoothstep(
+		HYDRA_IDWEIGHT_TRIPLANAR_THRESHOLD,
+		hydra_idweight_saturate(HYDRA_IDWEIGHT_TRIPLANAR_THRESHOLD + HYDRA_IDWEIGHT_TRIPLANAR_FEATHER),
+		upAlignment);
+}
+
+vec3 hydra_idweight_get_triplanar_weights(vec3 geometricNormalWS) {
+	vec3 weights = pow(max(abs(normalize(geometricNormalWS)), vec3(0.0001)), vec3(HYDRA_IDWEIGHT_TRIPLANAR_SHARPNESS));
+	return weights / max(weights.x + weights.y + weights.z, 0.0001);
+}
+
+uint hydra_idweight_select_stochastic_coverage_axis(vec3 positionWS, vec3 blendWeights) {
+	float coverageThreshold = hydra_idweight_stochastic_coverage01(positionWS);
+	if (coverageThreshold < blendWeights.x) return 0u;
+	if (coverageThreshold < blendWeights.x + blendWeights.y) return 1u;
+	return 2u;
+}
+
+vec2 hydra_idweight_get_projection_position(vec3 positionWS, uint projectionAxis) {
+	// Match Unity's triplanar convention: uvZY, uvXZ, uvXY.
+	if (projectionAxis == 0u) return vec2(positionWS.z, positionWS.y);
+	if (projectionAxis == 1u) return vec2(positionWS.x, positionWS.z);
+	return vec2(positionWS.x, positionWS.y);
+}
+
+vec3 hydra_idweight_projection_normal_to_world(vec3 normalPS, uint projectionAxis, vec3 geometricNormalWS) {
+	// Whiteout-style projection: combine sampled tangent-space detail with
+	// the geometric normal in the selected projection plane. A neutral
+	// normal map (U off, height, V off) must reproduce the geometric normal
+	// for the dominant axis, otherwise flat terrain faces sideways and turns
+	// black under a top-down directional light.
+	//   normalPS = (nU, nH, nV): U tilt, height, V tilt
+	//   axis 0 = ZY plane: U -> world Z, height -> world X, V -> world Y
+	//   axis 1 = XZ plane: U -> world X, height -> world Y, V -> world Z
+	//   axis 2 = XY plane: U -> world X, height -> world Z, V -> world Y
+	vec3 g = normalize(geometricNormalWS);
+	vec3 n;
+	if (projectionAxis == 0u) {
+		n = normalize(vec3(normalPS.y + g.x, normalPS.z + g.y, normalPS.x + g.z));
+	} else if (projectionAxis == 1u) {
+		n = normalize(vec3(normalPS.x + g.x, normalPS.y + g.y, normalPS.z + g.z));
+	} else {
+		n = normalize(vec3(normalPS.x + g.x, normalPS.z + g.y, normalPS.y + g.z));
+	}
+	return n;
+}
+
+// ── Slope evaluation ──
+
+float hydra_idweight_slope_threshold(uint packed) {
+	uint rawWeight = (packed >> 1u) & 7u;
+	if (rawWeight == 0u) return 0.0;
+	if (rawWeight == 1u) return 0.125;
+	if (rawWeight == 2u) return 0.25;
+	if (rawWeight == 3u) return 0.375;
+	if (rawWeight == 4u) return 0.5;
+	if (rawWeight == 5u) return 0.625;
+	if (rawWeight == 6u) return 0.75;
+	return 0.98;
+}
+
+float hydra_idweight_compute_slope_tangent(vec3 normalWS, float lowThreshold, float blendSharpness) {
+	float nDotUp = hydra_idweight_saturate(dot(normalize(normalWS), vec3(0.0, 1.0, 0.0)));
+	float x = acos(nDotUp);
+	float x2 = x * x;
+	float x3 = x2 * x;
+	float x5 = x3 * x2;
+	float tangentApprox = hydra_idweight_saturate(x + x3 / 3.0 + 2.0 * x5 / 15.0);
+	float highThreshold = hydra_idweight_saturate(lowThreshold + blendSharpness);
+	return hydra_idweight_saturate((tangentApprox - lowThreshold) / max(highThreshold - lowThreshold, 1e-5));
+}
+
+float hydra_idweight_pair_corner_coverage(uint packed, uint targetBackgroundId, uint targetOverlayId) {
+	uint backgroundId = hydra_idweight_background(packed);
+	uint overlayId = hydra_idweight_overlay(packed);
+	float overlayWeight = hydra_idweight_weight(packed);
+	return targetBackgroundId != targetOverlayId &&
+		backgroundId == targetBackgroundId &&
+		overlayId == targetOverlayId
+		? overlayWeight : 0.0;
+}
+
+float hydra_idweight_bilinear_pair_coverage(uint packedBottomLeft, uint packedBottomRight,
+		uint packedTopLeft, uint packedTopRight, uint targetPair, vec2 local) {
+	uint targetBackgroundId = hydra_idweight_background(targetPair);
+	uint targetOverlayId = hydra_idweight_overlay(targetPair);
+	float bottomLeftCoverage = hydra_idweight_pair_corner_coverage(packedBottomLeft, targetBackgroundId, targetOverlayId);
+	float bottomRightCoverage = hydra_idweight_pair_corner_coverage(packedBottomRight, targetBackgroundId, targetOverlayId);
+	float topLeftCoverage = hydra_idweight_pair_corner_coverage(packedTopLeft, targetBackgroundId, targetOverlayId);
+	float topRightCoverage = hydra_idweight_pair_corner_coverage(packedTopRight, targetBackgroundId, targetOverlayId);
+	float bottomCoverage = mix(bottomLeftCoverage, bottomRightCoverage, local.x);
+	float topCoverage = mix(topLeftCoverage, topRightCoverage, local.x);
+	return mix(bottomCoverage, topCoverage, local.y);
+}
+
+float hydra_idweight_slope_interior_blend(float pairCoverage) {
+	return smoothstep(0.0, 0.2, hydra_idweight_saturate(pairCoverage));
+}
+
+float hydra_idweight_resolve_mode_target_weight(uint mode, float linearWeight, float slopeWeight) {
+	if (mode == HYDRA_IDWEIGHT_MODE_ADD) return hydra_idweight_saturate(linearWeight + slopeWeight * (1.0 - linearWeight));
+	if (mode == HYDRA_IDWEIGHT_MODE_SUB) return hydra_idweight_saturate(linearWeight * (1.0 - slopeWeight));
+	if (mode == HYDRA_IDWEIGHT_MODE_MIX) return slopeWeight;
+	return linearWeight;
+}
+//INSERT: END_IDWEIGHT_R16
+)"
