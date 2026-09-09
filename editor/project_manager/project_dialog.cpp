@@ -611,45 +611,6 @@ void ProjectDialog::ok_pressed() {
 			initial_settings[extra_setting.key] = extra_setting.value;
 		}
 
-		// feng-idweight-terrain: automatically link the bundled terrain plugin
-		// into every new project, so there is a single source of truth and no
-		// per-project copies to keep in sync. The plugin source is the
-		// build-time copy next to the engine binary (bin/addons/...), which
-		// SConstruct refreshes from misc/feng-addons on every engine build,
-		// so it works on any machine and any drive.
-		{
-			const String exe_dir = OS::get_singleton()->get_executable_path().get_base_dir();
-			const String plugin_src = exe_dir.path_join("addons/feng-idweight-terrain");
-			const String addons_dir = path.path_join("addons");
-			const String plugin_link = addons_dir.path_join("feng-idweight-terrain");
-
-			if (DirAccess::dir_exists_absolute(plugin_src)) {
-				Ref<DirAccess> da = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
-				if (!da->dir_exists(addons_dir)) {
-					da->make_dir_recursive(addons_dir);
-				}
-				if (!da->dir_exists(plugin_link)) {
-#ifdef WINDOWS_ENABLED
-					// Junction (no admin rights needed), unlike symbolic links.
-					List<String> args;
-					args.push_back(String("/c"));
-					args.push_back(String("mklink"));
-					args.push_back(String("/J"));
-					args.push_back(plugin_link);
-					args.push_back(plugin_src);
-					OS::get_singleton()->execute("cmd.exe", args);
-#else
-					da->create_link(plugin_src, plugin_link);
-#endif
-				}
-				if (da->dir_exists(plugin_link)) {
-					PackedStringArray enabled_plugins;
-					enabled_plugins.push_back(String("res://addons/feng-idweight-terrain/plugin.cfg"));
-					initial_settings["editor_plugins/enabled"] = enabled_plugins;
-				}
-			}
-		}
-
 		Error err = ProjectSettings::get_singleton()->save_custom(path.path_join("project.godot"), initial_settings, Vector<String>(), false);
 		if (err != OK) {
 			_set_message(TTRC("Couldn't create project.godot in project path."), MESSAGE_ERROR);

@@ -383,6 +383,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 						// tool). The legacy control bitfield below is only
 						// updated for non-material metadata (angle/scale stay
 						// legacy until their own tools migrate).
+						backup_region(region);
 						_paint_surface_pair(map, map_pixel_position, brush_alpha, strength,
 								pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
 								modifier_alt);
@@ -391,7 +392,6 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 						// operation. Without this the painted texels stay in
 						// CPU memory and the shader keeps sampling the old
 						// (all-zero) layer.
-						backup_region(region);
 						region->set_modified(true);
 						continue;
 					}

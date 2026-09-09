@@ -122,6 +122,7 @@
 #include "editor/doc/doc_tools.h"
 #include "editor/doc/editor_help.h"
 #include "editor/editor_node.h"
+#include "editor/feng_addons.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/gui/progress_dialog.h"
@@ -144,6 +145,10 @@
 #endif
 
 #include "modules/modules_enabled.gen.h" // For mono.
+
+#if defined(TOOLS_ENABLED) && defined(MODULE_FENG_RENDERDOC_ENABLED)
+#include "modules/feng_renderdoc/feng_renderdoc.h"
+#endif
 
 #if defined(MODULE_MONO_ENABLED) && defined(TOOLS_ENABLED)
 #include "modules/mono/editor/bindings_generator.h"
@@ -2279,6 +2284,12 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 
 	register_early_core_singletons();
 	initialize_modules(MODULE_INITIALIZATION_LEVEL_CORE);
+
+#ifdef TOOLS_ENABLED
+	if (editor && !Engine::get_singleton()->is_recovery_mode_hint()) {
+		setup_feng_addons();
+	}
+#endif
 	register_core_extensions(); // core extensions must be registered after globals setup and before display
 
 	if (!editor) {
@@ -3366,6 +3377,13 @@ Error Main::setup2(bool p_show_boot_logo) {
 		accessibility_server->set_mode(accessibility_mode);
 
 		String rendering_driver = OS::get_singleton()->get_current_rendering_driver_name();
+#if defined(TOOLS_ENABLED) && defined(MODULE_FENG_RENDERDOC_ENABLED)
+		// Headless selection is resolved here; parsed command-line arguments
+		// are no longer available to modules during their initialization.
+		if (String(DisplayServer::get_create_function_name(display_driver_idx)) != NULL_DISPLAY_DRIVER) {
+			FengRenderDoc::get_singleton()->probe_and_mount();
+		}
+#endif
 		display_server = DisplayServer::create(display_driver_idx, rendering_driver, window_mode, window_vsync_mode, window_flags, window_position, window_size, init_screen, context, init_embed_parent_window_id, err);
 		if (err != OK || display_server == nullptr) {
 			String last_name = DisplayServer::get_create_function_name(display_driver_idx);

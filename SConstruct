@@ -1241,24 +1241,6 @@ SConscript("main/SCsub")
 
 SConscript("platform/" + env["platform"] + "/SCsub")  # Build selected platform.
 
-# feng-godot: Copy bundled addons (misc/feng-addons/*) next to the engine binary
-# so the editor can install them into new projects automatically.
-if not env.GetOption("clean") and not env.GetOption("help"):
-    import shutil
-    from pathlib import Path
-
-    addons_src = Path("misc/feng-addons")
-    addons_dst = Path("bin/addons")
-    if addons_src.is_dir():
-        if addons_dst.exists():
-            shutil.rmtree(addons_dst)
-        shutil.copytree(
-            addons_src,
-            addons_dst,
-            ignore=shutil.ignore_patterns("native", ".git", "__pycache__", "*.obj", "*.exp", "*.lib", "*.pdb"),
-        )
-        print("feng-godot: bundled addons copied to bin/addons/")
-
 # Microsoft Visual Studio Project Generation
 if env["vsproj"]:
     methods.generate_cpp_hint_file("cpp.hint")

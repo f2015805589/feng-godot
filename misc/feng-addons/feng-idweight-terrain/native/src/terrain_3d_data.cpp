@@ -646,6 +646,7 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 						_generated_control_maps.update(region->get_control_map(), region_id);
 						_generated_color_maps.update(region->get_color_map(), region_id);
 						if (region->get_surface_map().is_valid()) {
+							_surface_maps[region_id] = region->get_surface_map();
 							_generated_surface_maps.update(region->get_surface_map(), region_id);
 						}
 						LOG(DEBUG, "Emitting height_maps_changed");
@@ -669,7 +670,10 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 }
 
 void Terrain3DData::update_surface_region(Image *p_surface_map, const int p_region_id) {
-	if (p_surface_map && p_region_id >= 0) {
+	if (p_surface_map && p_region_id >= 0 && p_region_id < _surface_maps.size()) {
+		// A first paint can replace the blank placeholder with a newly created
+		// region surface map. Keep CPU queries aligned with the uploaded layer.
+		_surface_maps[p_region_id] = Ref<Image>(p_surface_map);
 		_generated_surface_maps.update(Ref<Image>(p_surface_map), p_region_id);
 		LOG(DEBUG, "Emitting surface_maps_changed");
 		emit_signal("surface_maps_changed");

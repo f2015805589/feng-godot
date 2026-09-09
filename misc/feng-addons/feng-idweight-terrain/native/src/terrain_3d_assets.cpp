@@ -1,14 +1,17 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
+#include "terrain_3d_assets.h"
+
+#include "logger.h"
+#include "terrain_3d_util.h"
+
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/environment.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
 
-#include "logger.h"
-#include "terrain_3d_assets.h"
-#include "terrain_3d_util.h"
+#include <utility>
 
 ///////////////////////////
 // Private Functions
@@ -186,161 +189,107 @@ void Terrain3DAssets::_set_asset(const AssetType p_type, const int p_id, const R
 void Terrain3DAssets::_update_texture_files() {
 	IS_INIT(VOID);
 	LOG(DEBUG, "Received texture_changed signal");
-	_generated_albedo_textures.clear();
-	_generated_normal_textures.clear();
+	_terrain->set_warning(WARN_ALL, false);
 	if (_texture_list.is_empty()) {
-		LOG(DEBUG, "Emitting textures_changed");
+		_generated_albedo_textures.clear();
+		_generated_normal_textures.clear();
 		emit_signal("textures_changed");
 		return;
 	}
 
-	// Detect image sizes and formats
-	LOG(DEBUG, "Validating texture sizes");
-	Vector2i albedo_size = V2I_ZERO;
-	Vector2i normal_size = V2I_ZERO;
-	Image::Format albedo_format = Image::FORMAT_MAX;
-	Image::Format normal_format = Image::FORMAT_MAX;
-	bool albedo_mipmaps = true;
-	bool normal_mipmaps = true;
-	_terrain->set_warning(WARN_ALL, false);
-
-	for (const Ref<Terrain3DTextureAsset> &ta : _texture_list) {
-		if (ta.is_null()) {
-			continue;
+	// GPU array layers must match, but source assets do not have to. Prepare
+	// private images so RGB/RGBA, import settings, and empty slots can coexist.
+	// Never assign generated placeholders back to assets: their file_changed
+	// signal would recursively rebuild and free the arrays being constructed.
+	auto prepare_layers = [&](bool p_normal, TypedArray<Image> &r_layers) -> bool {
+		Vector2i size = V2I_ZERO;
+		Image::Format format = Image::FORMAT_MAX;
+		bool mipmaps = false;
+		bool normalize = false;
+		bool has_empty = false;
+		bool hdr = false;
+		for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
+			Ref<Texture2D> texture;
+			if (asset.is_valid()) {
+				texture = p_normal ? asset->_normal_texture : asset->_albedo_texture;
+			}
+			Ref<Image> image;
+			if (texture.is_valid()) {
+				image = texture->get_image();
+				if (image.is_null() || image->is_empty()) {
+					LOG(ERROR, "Cannot read texture image; keeping previous terrain arrays.");
+					return false;
+				}
+				const Image::Format image_format = image->get_format();
+				hdr = hdr || (image_format >= Image::FORMAT_RF && image_format <= Image::FORMAT_RGBE9995) || image_format == Image::FORMAT_BPTC_RGBF || image_format == Image::FORMAT_BPTC_RGBFU;
+				if (size == V2I_ZERO) {
+					size = image->get_size();
+					format = image_format;
+					mipmaps = image->has_mipmaps();
+				} else {
+					normalize = normalize || image->get_size() != size || image_format != format || image->has_mipmaps() != mipmaps;
+				}
+			} else {
+				has_empty = true;
+			}
+			r_layers.push_back(image);
 		}
-
-		Ref<Texture2D> albedo_tex = ta->_albedo_texture;
-		if (albedo_tex.is_valid()) {
-			Vector2i tex_size = albedo_tex->get_size();
-			Ref<Image> img = albedo_tex->get_image();
-			Image::Format format = img->get_format();
-			bool mipmaps = img->has_mipmaps();
-
-			// If this is the first valid texture, set expected size and format for the arrays
-			if (albedo_format == Image::FORMAT_MAX) {
-				albedo_size = tex_size;
-				albedo_format = format;
-				albedo_mipmaps = mipmaps;
-			} else { // else validate against first texture
-				if (tex_size != albedo_size) {
-					_terrain->set_warning(WARN_MISMATCHED_SIZE, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " albedo size: ", tex_size, " doesn't match size of first texture: ", albedo_size, ". They must be identical. Read Texture Prep in docs.");
+		if (size == V2I_ZERO) {
+			size = V2I(1024);
+			format = Image::FORMAT_RGBA8;
+			mipmaps = true;
+		}
+		// Empty layers need writable images too. Keep matching compressed arrays
+		// compressed; only mixed/placeholder arrays require decompression.
+		normalize = normalize || has_empty;
+		if (normalize) {
+			format = hdr ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
+		}
+		for (int i = 0; i < r_layers.size(); i++) {
+			Ref<Image> image = r_layers[i];
+			if (image.is_null()) {
+				image = Util::get_filled_image(size, p_normal ? COLOR_NORMAL : COLOR_CHECKED, mipmaps, format);
+			} else if (normalize) {
+				image = image->duplicate();
+				if (image->is_compressed() && image->decompress() != OK) {
+					LOG(ERROR, "Cannot decompress texture layer ", i, "; keeping previous terrain arrays.");
+					return false;
 				}
-				if (format != albedo_format) {
-					_terrain->set_warning(WARN_MISMATCHED_FORMAT, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " albedo format: ", format, " doesn't match format of first texture: ", albedo_format, ". They must be identical. Read Texture Prep in docs.");
+				image->clear_mipmaps();
+				image->convert(format);
+				if (image->get_size() != size) {
+					image->resize(size.x, size.y, Image::INTERPOLATE_LANCZOS);
 				}
-				if (mipmaps != albedo_mipmaps) {
-					_terrain->set_warning(WARN_MISMATCHED_MIPMAPS, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " albedo mipmap setting (", mipmaps, ") doesn't match first texture (", albedo_mipmaps, "). They must be identical. Read Texture Prep in docs.");
+				if (mipmaps && image->generate_mipmaps() != OK) {
+					LOG(ERROR, "Cannot generate texture mipmaps; keeping previous terrain arrays.");
+					return false;
 				}
 			}
+			r_layers[i] = image;
 		}
+		return true;
+	};
 
-		Ref<Texture2D> normal_tex = ta->_normal_texture;
-		if (normal_tex.is_valid()) {
-			Vector2i tex_size = normal_tex->get_size();
-			Ref<Image> img = normal_tex->get_image();
-			Image::Format format = img->get_format();
-			bool mipmaps = img->has_mipmaps();
-
-			// If this is the first valid texture, set expected size and format for the arrays
-			if (normal_format == Image::FORMAT_MAX) {
-				normal_size = tex_size;
-				normal_format = format;
-				normal_mipmaps = mipmaps;
-			} else { // else validate against first texture
-				if (tex_size != normal_size) {
-					_terrain->set_warning(WARN_MISMATCHED_SIZE, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " normal size: ", tex_size, " doesn't match size of first texture: ", normal_size, ". They must be identical. Read Texture Prep in docs.");
-				}
-				if (format != normal_format) {
-					_terrain->set_warning(WARN_MISMATCHED_FORMAT, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " normal format: ", format, " doesn't match format of first texture: ", normal_format, ". They must be identical. Read Texture Prep in docs.");
-				}
-				if (mipmaps != normal_mipmaps) {
-					_terrain->set_warning(WARN_MISMATCHED_MIPMAPS, true);
-					LOG(ERROR, "Texture ID ", ta->get_id(), " normal mipmap setting (", mipmaps, ") doesn't match first texture (", albedo_mipmaps, "). They must be identical. Read Texture Prep in docs.");
-				}
-			}
-		}
-	}
-	if (_terrain->get_warnings()) {
+	TypedArray<Image> albedo_layers;
+	TypedArray<Image> normal_layers;
+	if (!prepare_layers(false, albedo_layers) || !prepare_layers(true, normal_layers)) {
 		return;
 	}
-
-	// Setup defaults for generated texture
-	if (normal_size == V2I_ZERO) {
-		normal_size = albedo_size;
-	} else if (albedo_size == V2I_ZERO) {
-		albedo_size = normal_size;
+	GeneratedTexture albedo;
+	GeneratedTexture normal;
+	if (!albedo.create(albedo_layers).is_valid() || !normal.create(normal_layers).is_valid()) {
+		albedo.clear();
+		normal.clear();
+		LOG(ERROR, "Cannot create terrain texture arrays; keeping previous arrays.");
+		return;
 	}
-	if (albedo_size == V2I_ZERO) {
-		albedo_size = V2I(1024);
-		normal_size = albedo_size;
-	}
-
-	// Generate TextureArrays and replace nulls with a empty image
-
-	if (_generated_albedo_textures.is_dirty() && albedo_size != V2I_ZERO) {
-		LOG(INFO, "Regenerating albedo texture array");
-		Array albedo_texture_array;
-		for (const Ref<Terrain3DTextureAsset> &ta : _texture_list) {
-			if (ta.is_null()) {
-				continue;
-			}
-			Ref<Texture2D> tex = ta->_albedo_texture;
-			Ref<Image> img;
-
-			if (tex.is_null()) {
-				img = Util::get_filled_image(albedo_size, COLOR_CHECKED, albedo_mipmaps, albedo_format);
-				LOG(DEBUG, "Texture ID ", ta->get_id(), " albedo is null. Creating a new one. Format: ", img->get_format());
-				ta->set_albedo_texture(ImageTexture::create_from_image(img));
-			} else {
-				img = tex->get_image();
-				LOG(EXTREME, "Texture ID ", ta->get_id(), " albedo is valid. Format: ", img->get_format());
-				if (!IS_EDITOR && tex->get_path().contains("ImageTexture")) {
-					LOG(WARN, "Texture ID ", ta->get_id(), " albedo is saved in the scene. Save it as a file and link it.");
-				}
-			}
-			albedo_texture_array.push_back(img);
-		}
-		if (!albedo_texture_array.is_empty()) {
-			_generated_albedo_textures.create(albedo_texture_array);
-		}
-	}
-
-	if (_generated_normal_textures.is_dirty() && normal_size != V2I_ZERO) {
-		LOG(INFO, "Regenerating normal texture arrays");
-
-		Array normal_texture_array;
-
-		for (const Ref<Terrain3DTextureAsset> &ta : _texture_list) {
-			if (ta.is_null()) {
-				continue;
-			}
-			Ref<Texture2D> tex = ta->_normal_texture;
-			Ref<Image> img;
-
-			if (tex.is_null()) {
-				img = Util::get_filled_image(normal_size, COLOR_NORMAL, normal_mipmaps, normal_format);
-				LOG(DEBUG, "Texture ID ", ta->get_id(), " normal is null. Creating a new one. Format: ", img->get_format());
-				ta->_normal_texture = ImageTexture::create_from_image(img);
-			} else {
-				img = tex->get_image();
-				LOG(EXTREME, "Texture ID ", ta->get_id(), " normal is valid. Format: ", img->get_format());
-				if (!IS_EDITOR && tex->get_path().contains("ImageTexture")) {
-					LOG(WARN, "Texture ID ", ta->get_id(), " normal is saved in the scene. Save it as a file and link it.");
-				}
-			}
-			normal_texture_array.push_back(img);
-		}
-		if (!normal_texture_array.is_empty()) {
-			_generated_normal_textures.create(normal_texture_array);
-		}
-	}
-	LOG(DEBUG, "Emitting textures_changed");
+	// Commit both arrays together, then notify materials before freeing the old
+	// RIDs. A failed layer update must not destroy an already rendering terrain.
+	std::swap(_generated_albedo_textures, albedo);
+	std::swap(_generated_normal_textures, normal);
 	emit_signal("textures_changed");
+	albedo.clear();
+	normal.clear();
 }
 
 void Terrain3DAssets::_update_texture_settings() {
