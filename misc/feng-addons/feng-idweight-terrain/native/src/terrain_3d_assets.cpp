@@ -7,6 +7,7 @@
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/environment.hpp>
+#include <godot_cpp/classes/hashing_context.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
@@ -193,21 +194,19 @@ void Terrain3DAssets::_update_texture_files() {
 	if (_texture_list.is_empty()) {
 		_generated_albedo_textures.clear();
 		_generated_normal_textures.clear();
+		_texture_layer_cache.clear();
+		_texture_array_info.clear();
+		notify_property_list_changed();
 		emit_signal("textures_changed");
 		return;
 	}
 
-	// GPU array layers must match, but source assets do not have to. Prepare
-	// private images so RGB/RGBA, import settings, and empty slots can coexist.
-	// Never assign generated placeholders back to assets: their file_changed
-	// signal would recursively rebuild and free the arrays being constructed.
+	// A Terrain3DAssets resource manages this terrain's two channel arrays.
+	// All layers follow explicit authoring settings, independent of imports.
+	Dictionary next_cache;
 	auto prepare_layers = [&](bool p_normal, TypedArray<Image> &r_layers) -> bool {
-		Vector2i size = V2I_ZERO;
-		Image::Format format = Image::FORMAT_MAX;
-		bool mipmaps = false;
-		bool normalize = false;
-		bool has_empty = false;
-		bool hdr = false;
+		Image::Format working_format = Image::FORMAT_RGBA8;
+		Vector2i size = _texture_array_size > 0 ? V2I(_texture_array_size) : V2I_ZERO;
 		for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
 			Ref<Texture2D> texture;
 			if (asset.is_valid()) {
@@ -217,55 +216,73 @@ void Terrain3DAssets::_update_texture_files() {
 			if (texture.is_valid()) {
 				image = texture->get_image();
 				if (image.is_null() || image->is_empty()) {
-					LOG(ERROR, "Cannot read texture image; keeping previous terrain arrays.");
+					LOG(ERROR, "Cannot read texture image; retaining previous arrays.");
 					return false;
 				}
-				const Image::Format image_format = image->get_format();
-				hdr = hdr || (image_format >= Image::FORMAT_RF && image_format <= Image::FORMAT_RGBE9995) || image_format == Image::FORMAT_BPTC_RGBF || image_format == Image::FORMAT_BPTC_RGBFU;
+				Image::Format format = image->get_format();
+				if ((format >= Image::FORMAT_RF && format <= Image::FORMAT_RGBE9995) || format == Image::FORMAT_BPTC_RGBF || format == Image::FORMAT_BPTC_RGBFU) {
+					if (_texture_array_compression == ARRAY_BC7) {
+						LOG(ERROR, "HDR terrain textures require Texture Array > Compression = Uncompressed. Retaining previous arrays.");
+						return false;
+					}
+					working_format = Image::FORMAT_RGBAF;
+				}
 				if (size == V2I_ZERO) {
 					size = image->get_size();
-					format = image_format;
-					mipmaps = image->has_mipmaps();
-				} else {
-					normalize = normalize || image->get_size() != size || image_format != format || image->has_mipmaps() != mipmaps;
 				}
-			} else {
-				has_empty = true;
 			}
 			r_layers.push_back(image);
 		}
 		if (size == V2I_ZERO) {
 			size = V2I(1024);
-			format = Image::FORMAT_RGBA8;
-			mipmaps = true;
-		}
-		// Empty layers need writable images too. Keep matching compressed arrays
-		// compressed; only mixed/placeholder arrays require decompression.
-		normalize = normalize || has_empty;
-		if (normalize) {
-			format = hdr ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
 		}
 		for (int i = 0; i < r_layers.size(); i++) {
-			Ref<Image> image = r_layers[i];
-			if (image.is_null()) {
-				image = Util::get_filled_image(size, p_normal ? COLOR_NORMAL : COLOR_CHECKED, mipmaps, format);
-			} else if (normalize) {
-				image = image->duplicate();
+			Ref<Image> source = r_layers[i];
+			String key = String::num_int64(size.x) + ":" + String::num_int64(size.y) + ":" + String::num_int64(_texture_array_compression) + ":" + String::num_int64(_texture_array_mipmaps) + ":" + String::num_int64(p_normal) + ":" + String::num_int64(working_format);
+			if (source.is_valid()) {
+				Ref<HashingContext> hash;
+				hash.instantiate();
+				hash->start(HashingContext::HASH_SHA256);
+				hash->update(source->get_data());
+				key += ":" + String::num_int64(source->get_width()) + ":" + String::num_int64(source->get_height()) + ":" + String::num_int64(source->get_format()) + ":" + hash->finish().hex_encode();
+			} else {
+				key += ":placeholder";
+			}
+			if (_texture_layer_cache.has(key)) {
+				r_layers[i] = _texture_layer_cache[key];
+				next_cache[key] = r_layers[i];
+				continue;
+			}
+			Ref<Image> image;
+			if (source.is_valid()) {
+				image = source->duplicate();
 				if (image->is_compressed() && image->decompress() != OK) {
-					LOG(ERROR, "Cannot decompress texture layer ", i, "; keeping previous terrain arrays.");
+					LOG(ERROR, "Cannot decompress layer ", i, "; retaining previous arrays.");
 					return false;
 				}
 				image->clear_mipmaps();
-				image->convert(format);
+				// RGBA retains albedo height and normal roughness in alpha.
+				image->convert(working_format);
 				if (image->get_size() != size) {
 					image->resize(size.x, size.y, Image::INTERPOLATE_LANCZOS);
 				}
-				if (mipmaps && image->generate_mipmaps() != OK) {
-					LOG(ERROR, "Cannot generate texture mipmaps; keeping previous terrain arrays.");
+			} else {
+				image = Util::get_filled_image(size, p_normal ? COLOR_NORMAL : COLOR_CHECKED, false, working_format);
+			}
+			if (_texture_array_mipmaps && image->generate_mipmaps(p_normal) != OK) {
+				LOG(ERROR, "Cannot generate texture mipmaps; retaining previous arrays.");
+				return false;
+			}
+			if (_texture_array_compression == ARRAY_BC7) {
+				// Generic preserves all four authored channels, including packed
+				// height/roughness; normal-map compression may discard alpha.
+				if (image->compress(Image::COMPRESS_BPTC, Image::COMPRESS_SOURCE_GENERIC) != OK) {
+					LOG(ERROR, "BC7 encoder unavailable. Select Uncompressed in Terrain Assets > Texture Array.");
 					return false;
 				}
 			}
 			r_layers[i] = image;
+			next_cache[key] = image;
 		}
 		return true;
 	};
@@ -285,11 +302,52 @@ void Terrain3DAssets::_update_texture_files() {
 	}
 	// Commit both arrays together, then notify materials before freeing the old
 	// RIDs. A failed layer update must not destroy an already rendering terrain.
+	_texture_layer_cache = next_cache;
+	Ref<Image> albedo_first = albedo_layers[0];
+	Ref<Image> normal_first = normal_layers[0];
+	_texture_array_info["layers"] = albedo_layers.size();
+	_texture_array_info["albedo_size"] = albedo_first->get_size();
+	_texture_array_info["normal_size"] = normal_first->get_size();
+	_texture_array_info["format"] = albedo_first->get_format() == Image::FORMAT_BPTC_RGBA ? "BC7" : (albedo_first->get_format() == Image::FORMAT_RGBAF ? "RGBAF" : "RGBA8");
+	_texture_array_info["mipmaps"] = albedo_first->has_mipmaps();
+	_texture_array_info["gpu_bytes"] = (albedo_first->get_data().size() + normal_first->get_data().size()) * albedo_layers.size();
+	notify_property_list_changed();
 	std::swap(_generated_albedo_textures, albedo);
 	std::swap(_generated_normal_textures, normal);
 	emit_signal("textures_changed");
 	albedo.clear();
 	normal.clear();
+}
+
+void Terrain3DAssets::set_texture_array_size(int p_size) {
+	if (p_size != 0 && (p_size < 4 || p_size > 8192 || (p_size & (p_size - 1)) != 0)) {
+		LOG(ERROR, "Array size must be Auto (0) or a power of two between 4 and 8192.");
+		return;
+	}
+	if (_texture_array_size == p_size) {
+		return;
+	}
+	_texture_array_size = p_size;
+	_update_texture_files();
+	emit_changed();
+}
+
+void Terrain3DAssets::set_texture_array_mipmaps(bool p_enabled) {
+	if (_texture_array_mipmaps == p_enabled) {
+		return;
+	}
+	_texture_array_mipmaps = p_enabled;
+	_update_texture_files();
+	emit_changed();
+}
+
+void Terrain3DAssets::set_texture_array_compression(TextureArrayCompression p_compression) {
+	if (p_compression < ARRAY_UNCOMPRESSED || p_compression > ARRAY_BC7 || _texture_array_compression == p_compression) {
+		return;
+	}
+	_texture_array_compression = p_compression;
+	_update_texture_files();
+	emit_changed();
 }
 
 void Terrain3DAssets::_update_texture_settings() {
@@ -458,7 +516,31 @@ void Terrain3DAssets::set_texture_list(const TypedArray<Terrain3DTextureAsset> &
 	if (!differs(_texture_list, p_texture_list)) {
 		return;
 	}
-	_set_asset_list(TYPE_TEXTURE, p_texture_list);
+	// Inspector edits replace the list. Build from a snapshot before clearing
+	// occupied slots, otherwise a replacement is ignored as a duplicate ID.
+	TypedArray<Terrain3DTextureAsset> source = p_texture_list.duplicate();
+	for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
+		if (asset.is_null()) { continue; }
+		if (asset->is_connected("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids))) {
+			asset->disconnect("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids));
+		}
+		if (asset->is_connected("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files))) {
+			asset->disconnect("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files));
+		}
+		if (asset->is_connected("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings))) {
+			asset->disconnect("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings));
+		}
+	}
+	for (int i = 0; i < source.size(); i++) {
+		if (source[i].get_type() == Variant::NIL || Ref<Terrain3DTextureAsset>(source[i]).is_null()) {
+			Ref<Terrain3DTextureAsset> placeholder;
+			placeholder.instantiate();
+			placeholder->_id = i;
+			source[i] = placeholder;
+		}
+	}
+	_texture_list.clear();
+	_set_asset_list(TYPE_TEXTURE, source);
 	update_texture_list();
 }
 
@@ -669,6 +751,21 @@ Error Terrain3DAssets::save(const String &p_path) {
 ///////////////////////////
 
 void Terrain3DAssets::_bind_methods() {
+	BIND_ENUM_CONSTANT(ARRAY_UNCOMPRESSED);
+	BIND_ENUM_CONSTANT(ARRAY_BC7);
+	ClassDB::bind_method(D_METHOD("set_texture_array_size", "size"), &Terrain3DAssets::set_texture_array_size);
+	ClassDB::bind_method(D_METHOD("get_texture_array_size"), &Terrain3DAssets::get_texture_array_size);
+	ClassDB::bind_method(D_METHOD("set_texture_array_mipmaps", "enabled"), &Terrain3DAssets::set_texture_array_mipmaps);
+	ClassDB::bind_method(D_METHOD("get_texture_array_mipmaps"), &Terrain3DAssets::get_texture_array_mipmaps);
+	ClassDB::bind_method(D_METHOD("set_texture_array_compression", "compression"), &Terrain3DAssets::set_texture_array_compression);
+	ClassDB::bind_method(D_METHOD("get_texture_array_compression"), &Terrain3DAssets::get_texture_array_compression);
+	ClassDB::bind_method(D_METHOD("get_texture_array_info"), &Terrain3DAssets::get_texture_array_info);
+	ADD_GROUP("Texture Array", "texture_array_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_array_size", PROPERTY_HINT_ENUM, "Auto:0,64:64,128:128,256:256,512:512,1024:1024,2048:2048,4096:4096,8192:8192"), "set_texture_array_size", "get_texture_array_size");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "texture_array_mipmaps"), "set_texture_array_mipmaps", "get_texture_array_mipmaps");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_array_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7"), "set_texture_array_compression", "get_texture_array_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "texture_array_info", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY), "", "get_texture_array_info");
+	ADD_GROUP("", "");
 	BIND_ENUM_CONSTANT(TYPE_TEXTURE);
 	BIND_ENUM_CONSTANT(TYPE_MESH);
 	BIND_CONSTANT(MAX_TEXTURES);
@@ -705,7 +802,7 @@ void Terrain3DAssets::_bind_methods() {
 
 	int ro_flags = PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY;
 	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "mesh_list", PROPERTY_HINT_ARRAY_TYPE, "Terrain3DMeshAsset", ro_flags), "set_mesh_list", "get_mesh_list");
-	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "texture_list", PROPERTY_HINT_ARRAY_TYPE, "Terrain3DTextureAsset", ro_flags), "set_texture_list", "get_texture_list");
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "texture_list", PROPERTY_HINT_ARRAY_TYPE, "Terrain3DTextureAsset"), "set_texture_list", "get_texture_list");
 
 	ADD_SIGNAL(MethodInfo("meshes_changed"));
 	ADD_SIGNAL(MethodInfo("textures_changed"));

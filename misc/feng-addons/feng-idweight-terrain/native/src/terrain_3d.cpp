@@ -1,5 +1,10 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
+#include "terrain_3d.h"
+
+#include "logger.h"
+#include "terrain_3d_util.h"
+
 #include <godot_cpp/classes/compositor.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
@@ -15,10 +20,6 @@
 #include <godot_cpp/classes/surface_tool.hpp>
 #include <godot_cpp/classes/viewport_texture.hpp>
 #include <godot_cpp/classes/world3d.hpp>
-
-#include "logger.h"
-#include "terrain_3d.h"
-#include "terrain_3d_util.h"
 
 // Initialize static member variable
 Terrain3D::DebugLevel Terrain3D::debug_level{ ERROR };
@@ -41,6 +42,9 @@ void Terrain3D::_initialize() {
 	if (_assets.is_null()) {
 		LOG(DEBUG, "Creating blank texture list");
 		_assets.instantiate();
+	}
+	if (_assets->get_terrain() && _assets->get_terrain() != this) {
+		_assets = _assets->duplicate(true);
 	}
 	if (!_collision) {
 		LOG(DEBUG, "Creating collision manager");
@@ -1177,7 +1181,7 @@ void Terrain3D::_notification(const int p_what) {
 			_setup_mouse_picking();
 			_setup_displacement_buffer();
 			// Reload editor textures - Also see READY
-			if (_free_editor_textures && !IS_EDITOR && _assets.is_valid() && !_assets->get_path().contains("Terrain3DAssets")) {
+			if (_free_editor_textures && !IS_EDITOR && _assets.is_valid() && !_assets->get_path().is_empty() && !_assets->get_path().contains("Terrain3DAssets")) {
 				LOG(INFO, "free_editor_textures enabled, reloading Assets path: ", _assets->get_path());
 				_assets = ResourceLoader::get_singleton()->load(_assets->get_path(), "", ResourceLoader::CACHE_MODE_IGNORE);
 			}
@@ -1543,7 +1547,7 @@ void Terrain3D::_bind_methods() {
 	// Object references
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "material", PROPERTY_HINT_RESOURCE_TYPE, "Terrain3DMaterial"), "set_material", "get_material");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "assets", PROPERTY_HINT_RESOURCE_TYPE, "Terrain3DAssets"), "set_assets", "get_assets");
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "data", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DData"), "", "get_data");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "data", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY, "Terrain3DData"), "", "get_data");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "collision", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DCollision"), "", "get_collision");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "instancer", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DInstancer"), "", "get_instancer");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "light_target", PROPERTY_HINT_NODE_TYPE, "DirectionalLight3D", PROPERTY_USAGE_DEFAULT, "Node3D"), "set_light_target", "get_light_target");

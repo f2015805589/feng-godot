@@ -25,6 +25,15 @@ layout(rg8ui, set = 3, binding = 0) uniform restrict writeonly uimage2D dest_vox
 
 #endif
 
+#ifdef GBUFFER_RESOLVE
+layout(set = 4, binding = 0) uniform sampler2DMS source_albedo;
+layout(set = 4, binding = 1) uniform sampler2DMS source_orm;
+layout(set = 4, binding = 2) uniform sampler2DMS source_emission;
+layout(rgba8, set = 4, binding = 3) uniform restrict writeonly image2D dest_albedo;
+layout(rgba8, set = 4, binding = 4) uniform restrict writeonly image2D dest_orm;
+layout(rgba16f, set = 4, binding = 5) uniform restrict writeonly image2D dest_emission;
+#endif
+
 layout(push_constant, std430) uniform Params {
 	ivec2 screen_size;
 	int sample_count;
@@ -217,6 +226,12 @@ void main() {
 			depth_least = depth_amount[j];
 		}
 	}
+#endif
+#ifdef GBUFFER_RESOLVE
+	// Copy all material channels from the same sample as depth and normal.
+	imageStore(dest_albedo, pos, texelFetch(source_albedo, pos, best_index));
+	imageStore(dest_orm, pos, texelFetch(source_orm, pos, best_index));
+	imageStore(dest_emission, pos, texelFetch(source_emission, pos, best_index));
 #endif
 	best_depth = texelFetch(source_depth, pos, best_index).r;
 	best_normal_roughness = texelFetch(source_normal_roughness, pos, best_index);

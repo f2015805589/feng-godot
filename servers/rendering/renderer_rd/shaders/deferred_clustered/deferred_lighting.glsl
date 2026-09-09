@@ -42,19 +42,13 @@ void main() {
 #define OUTPUT_IS_MULTIVIEW false
 #endif
 
-/* Include half precision types. */
+// Include order is significant: scene declarations supply shared constants.
+/* clang-format off */
 #include "../half_inc.glsl"
-
 #include "scene_deferred_clustered_inc.glsl"
-
-#include "../scene_data_inc.glsl"
-#include "../light_data_inc.glsl"
-#include "../cluster_data_inc.glsl"
-#include "../decal_data_inc.glsl"
-#include "../oct_inc.glsl"
-
 #include "../scene_forward_lights_inc.glsl"
-#include "../scene_forward_gi_inc.glsl"
+/* clang-format on */
+// GI is evaluated before lighting and sampled from ambient/reflection buffers.
 
 // Cluster helpers (defined in the scene shader inside a MODE_RENDER_DEPTH guard, so redefined here).
 void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max, out uint item_from, out uint item_to) {
@@ -110,49 +104,49 @@ void main() {
 #else
 	float depth = textureLod(sampler2D(depth_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0).r;
 #endif
-	if (depth >= 1.0) {
+	if (depth <= 0.0) {
 		// Sky pixels are drawn by the sky pass afterwards.
 		discard;
 	}
 
-	vec4 ndc = vec4(screen_uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+	vec4 ndc = vec4(screen_uv * 2.0 - 1.0, depth, 1.0);
 	vec4 view_pos = inv_projection_matrix * ndc;
 	view_pos /= view_pos.w;
 	vec3 vertex = view_pos.xyz;
 
-	vec3 view = -normalize(vertex);
+	vec3 view = projection_matrix[3][3] == 1.0 ? vec3(0.0, 0.0, 1.0) : -normalize(vertex);
 
 	// Read the G-buffer.
 #ifdef USE_MULTIVIEW
-	vec4 normal_roughness = textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+	vec4 normal_roughness = textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
-	vec4 normal_roughness = textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+	vec4 normal_roughness = textureLod(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	normal_roughness = normal_roughness_compatibility(normal_roughness);
 	vec3 normal = normalize(normal_roughness.xyz * 2.0 - 1.0);
 	float roughness = normal_roughness.w;
 
 #ifdef USE_MULTIVIEW
-	vec4 albedo_alpha = textureLod(sampler2DArray(gbuffer_albedo_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+	vec4 albedo_alpha = textureLod(sampler2DArray(gbuffer_albedo_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
-	vec4 albedo_alpha = textureLod(sampler2D(gbuffer_albedo_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+	vec4 albedo_alpha = textureLod(sampler2D(gbuffer_albedo_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	vec3 albedo = albedo_alpha.rgb;
 	float alpha = albedo_alpha.a;
 
 #ifdef USE_MULTIVIEW
-	vec4 orm = textureLod(sampler2DArray(gbuffer_orm_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+	vec4 orm = textureLod(sampler2DArray(gbuffer_orm_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
-	vec4 orm = textureLod(sampler2D(gbuffer_orm_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+	vec4 orm = textureLod(sampler2D(gbuffer_orm_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	float ao = orm.r;
 	float metallic = orm.b;
 	float sss_strength = orm.a;
 
 #ifdef USE_MULTIVIEW
-	vec4 emission_alpha = textureLod(sampler2DArray(gbuffer_emission_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+	vec4 emission_alpha = textureLod(sampler2DArray(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
-	vec4 emission_alpha = textureLod(sampler2D(gbuffer_emission_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+	vec4 emission_alpha = textureLod(sampler2D(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	vec3 emission = emission_alpha.rgb;
 
@@ -200,16 +194,19 @@ void main() {
 			indirect_specular_light *= scene_data.ambient_light_color_energy.a;
 		}
 
-		// GI buffers (ambient/reflection) from gi.process_gi.
+		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_GI_BUFFERS)) {
+			// GI buffers (ambient/reflection) from gi.process_gi.
 #ifdef USE_MULTIVIEW
-		vec4 buffer_ambient = textureLod(sampler2DArray(ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
-		vec4 buffer_reflection = textureLod(sampler2DArray(reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+			vec4 buffer_ambient = textureLod(sampler2DArray(ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
+			vec4 buffer_reflection = textureLod(sampler2DArray(reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
-		vec4 buffer_ambient = textureLod(sampler2D(ambient_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
-		vec4 buffer_reflection = textureLod(sampler2D(reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+			vec4 buffer_ambient = textureLod(sampler2D(ambient_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
+			vec4 buffer_reflection = textureLod(sampler2D(reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
-		ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
-		indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
+			ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
+			indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
+
+		}
 
 		// SSAO.
 		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSAO)) {
@@ -326,8 +323,8 @@ void main() {
 
 		// Apply energy compensation and DFG to the indirect specular.
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);
-		vec2 envBRDF2 = prefiltered_dfg(roughness, NdotV).xy;
-		vec3 energy_compensation2 = get_energy_compensation(f0, envBRDF2.y);
+		vec2 envBRDF2 = envBRDF;
+		vec3 energy_compensation2 = energy_compensation;
 		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
 		indirect_specular_light *= energy_compensation2 * ((f90 - f0) * envBRDF2.x + f0 * envBRDF2.y);
 	}
@@ -350,10 +347,10 @@ void main() {
 				vec3 light_dir = directional_lights.data[i].direction;
 				vec3 base_normal_bias = normal * (1.0 - max(0.0, dot(light_dir, -normal)));
 
-#define BIAS_FUNC(m_var, m_idx)                                                                 \
-	m_var.xyz += light_dir * directional_lights.data[i].shadow_bias[m_idx];                     \
+#define BIAS_FUNC(m_var, m_idx) \
+	m_var.xyz += light_dir * directional_lights.data[i].shadow_bias[m_idx]; \
 	vec3 normal_bias = base_normal_bias * directional_lights.data[i].shadow_normal_bias[m_idx]; \
-	normal_bias -= light_dir * dot(light_dir, normal_bias);                                     \
+	normal_bias -= light_dir * dot(light_dir, normal_bias); \
 	m_var.xyz += normal_bias;
 
 				if (sc_use_directional_soft_shadows() && directional_lights.data[i].softshadow_angle > 0) {

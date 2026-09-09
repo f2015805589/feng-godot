@@ -1,14 +1,16 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
+#include "terrain_3d_data.h"
+
+#include "logger.h"
+#include "terrain_surface_idweight.h"
+
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/editor_file_system.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
-
-#include "logger.h"
-#include "terrain_3d_data.h"
 
 ///////////////////////////
 // Private Functions
@@ -870,6 +872,17 @@ Vector3 Terrain3DData::get_texture_id(const Vector3 &p_global_position) const {
 	float control = get_pixel_descaled(TYPE_CONTROL, vgrid).r;
 	if (std::isnan(control) || is_hole(control)) {
 		return V3_NAN;
+	}
+
+	// Material painting writes the R16 ID/weight map, not the legacy control
+	// map. Picking and live info must read the same data as the shader.
+	Ref<Terrain3DRegion> region = get_regionp(p_global_position);
+	if (region.is_valid() && region->get_surface_map().is_valid()) {
+		Vector2i pixel = vgrid - region->get_location() * region->get_region_size();
+		float value = region->get_surface_map()->get_pixelv(pixel).r;
+		uint16_t packed = uint16_t(CLAMP(Math::round(value * 65535.0f), 0.0f, 65535.0f));
+		TerrainSurfaceIdWeight::Pair pair = TerrainSurfaceIdWeight::decode(packed);
+		return Vector3(pair.background, pair.overlay, TerrainSurfaceIdWeight::contribution(packed));
 	}
 
 	// If material available, autoshader enabled, and pixel set to auto

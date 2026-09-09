@@ -1,0 +1,18 @@
+[gd_resource type="CompositorEffect" script_class="FengComputePass" load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/compute_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/pass_texture.gd" id="2"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/examples/tint.glsl" id="3"]
+
+[sub_resource type="Resource" id="Color"]
+script = ExtResource("2")
+binding = 0
+source = 0
+binding_type = 1
+
+[resource]
+script = ExtResource("1")
+effect_callback_type = 4
+shader_file = ExtResource("3")
+textures = Array[ExtResource("2")]([SubResource("Color")])
+parameters = Vector4(1, 0.7, 0.7, 1)

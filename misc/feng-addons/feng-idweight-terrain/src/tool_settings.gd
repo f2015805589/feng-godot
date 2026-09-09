@@ -512,7 +512,7 @@ func add_setting(p_args: Dictionary) -> void:
 				var spin_slider := EditorSpinSlider.new()
 				spin_slider.set_flat(false)
 				spin_slider.set_hide_slider(true)
-				spin_slider.value_changed.connect(_on_setting_changed)
+				spin_slider.value_changed.connect(func(_value): _on_setting_changed(spin_slider))
 				spin_slider.set_max(p_maximum)
 				spin_slider.set_min(p_minimum)
 				spin_slider.set_step(p_step)

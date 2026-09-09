@@ -317,13 +317,18 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 			brush_data["pair_background_id"] = pair_background_id
 		brush_data["pair_mode"] = tool_settings.get_setting("pair_mode")
 		brush_data["pair_weight_level"] = tool_settings.get_setting("pair_weight_level")
-		# Slope blending parameters are applied to the selected texture asset
-		# so the shader's per-material slope array stays in sync with the UI.
 		var tex: Terrain3DTextureAsset = plugin.terrain.assets.get_texture_asset(brush_data["asset_id"]) if plugin.terrain and plugin.terrain.assets else null
 		if tex:
-			tex.set_slope_blend_sharpness(tool_settings.get_setting("slope_blend_sharpness"))
-			tex.set_slope_based_damp(tool_settings.get_setting("slope_based_damp"))
-			tex.set_slope_based_normal_damp(tool_settings.get_setting("slope_based_normal_damp"))
+			# Selection or unrelated brush changes must never overwrite the
+			# selected material's saved slope settings with toolbar defaults.
+			for key in ["slope_blend_sharpness", "slope_based_damp", "slope_based_normal_damp"]:
+				var control = tool_settings.settings.get(key)
+				if control == p_setting:
+					tex.set(key, tool_settings.get_setting(key))
+					EditorInterface.mark_scene_as_unsaved()
+				elif control is Range:
+					control.set_value_no_signal(tex.get(key))
+
 	if plugin.debug:
 		print("Terrain3DUI: _on_setting_changed: selected resource ID: ", brush_data["asset_id"])
 	if plugin.editor:

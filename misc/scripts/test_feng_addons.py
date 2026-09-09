@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -130,5 +131,20 @@ check_links(full)
 classes = {c["name"] for c in json.loads((full / "extension_api.json").read_text(encoding="utf-8"))["classes"]}
 assert {"Terrain3D", "RenderDocCapture"} <= classes
 print("PASS: full editor import and native Terrain3D/RenderDocCapture classes")
+
+slider_plugin = full / "addons/slider-regression"
+slider_plugin.mkdir()
+shutil.copyfile(SOURCE / "feng-idweight-terrain/native/tests/editor_slider.gd", slider_plugin / "editor_slider.gd")
+(slider_plugin / "plugin.cfg").write_text(
+    '[plugin]\nname="Slider regression"\nscript="editor_slider.gd"\n', encoding="utf-8"
+)
+write_settings(full, [f"res://addons/{name}/plugin.cfg" for name in ADDONS] + ["res://addons/slider-regression/plugin.cfg"])
+result = subprocess.run([str(EDITOR), "--headless", "--editor", "--path", str(full)],
+                        cwd=full, env=TEST_ENV, capture_output=True, timeout=120)
+output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+(full / "slider.log").write_text(output, encoding="utf-8")
+assert result.returncode == 0 and "ERROR:" not in output, output
+assert "PASS real slope slider identity" in output, output
+print("PASS: actual editor slope slider and silent synchronization")
 
 print(f"Fixtures and logs: {FIXTURES}")

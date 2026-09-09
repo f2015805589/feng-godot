@@ -24,7 +24,17 @@ public: // Constants
 	static inline const int MAX_TEXTURES = 32;
 	static inline const int MAX_MESHES = 256;
 
+	enum TextureArrayCompression {
+		ARRAY_UNCOMPRESSED,
+		ARRAY_BC7,
+	};
+
 private:
+	int _texture_array_size = 0;
+	bool _texture_array_mipmaps = true;
+	TextureArrayCompression _texture_array_compression = ARRAY_BC7;
+	Dictionary _texture_array_info;
+	Dictionary _texture_layer_cache;
 	Terrain3D *_terrain = nullptr;
 
 	TypedArray<Terrain3DTextureAsset> _texture_list;
@@ -65,12 +75,21 @@ private:
 	void _setup_thumbnail_creation();
 
 public:
-	Terrain3DAssets() {}
+	Terrain3DAssets() { set_local_to_scene(true); }
 	~Terrain3DAssets() { destroy(); }
 	void initialize(Terrain3D *p_terrain);
 	bool is_initialized() { return _terrain != nullptr; }
 	void uninitialize();
 	void destroy();
+
+	Terrain3D *get_terrain() const { return _terrain; }
+	void set_texture_array_size(int p_size);
+	int get_texture_array_size() const { return _texture_array_size; }
+	void set_texture_array_mipmaps(bool p_enabled);
+	bool get_texture_array_mipmaps() const { return _texture_array_mipmaps; }
+	void set_texture_array_compression(TextureArrayCompression p_compression);
+	TextureArrayCompression get_texture_array_compression() const { return _texture_array_compression; }
+	Dictionary get_texture_array_info() const { return _texture_array_info; }
 
 	void set_texture_asset(const int p_id, const Ref<Terrain3DTextureAsset> &p_texture);
 	Ref<Terrain3DTextureAsset> get_texture_asset(const int p_id) const;
@@ -108,6 +127,7 @@ protected:
 };
 
 VARIANT_ENUM_CAST(Terrain3DAssets::AssetType);
+VARIANT_ENUM_CAST(Terrain3DAssets::TextureArrayCompression);
 
 inline Ref<Terrain3DTextureAsset> Terrain3DAssets::get_texture_asset(const int p_id) const {
 	if (p_id >= 0 && p_id < _texture_list.size()) {

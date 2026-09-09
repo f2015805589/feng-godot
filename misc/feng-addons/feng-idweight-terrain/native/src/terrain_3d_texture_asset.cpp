@@ -1,11 +1,12 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-#include <godot_cpp/classes/engine.hpp>
-#include <godot_cpp/classes/image.hpp>
+#include "terrain_3d_texture_asset.h"
 
 #include "logger.h"
 #include "terrain_3d.h"
-#include "terrain_3d_texture_asset.h"
+
+#include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/image.hpp>
 
 ///////////////////////////
 // Private Functions
@@ -107,9 +108,6 @@ void Terrain3DTextureAsset::set_albedo_texture(const Ref<Texture2D> &p_texture) 
 				LOG(INFO, "Setting name based on filename: ", _name);
 			}
 			Ref<Image> img = p_texture->get_image();
-			if (!img->has_mipmaps()) {
-				LOG(WARN, "Albedo texture '", filename, "' has no mipmaps. Change on the Import panel if desired.");
-			}
 			if (img->get_width() != img->get_height()) {
 				LOG(WARN, "Albedo texture '", filename, "' is not square. Mipmaps might have artifacts.");
 			}
@@ -138,9 +136,6 @@ void Terrain3DTextureAsset::set_normal_texture(const Ref<Texture2D> &p_texture) 
 		if (p_texture.is_valid()) {
 			String filename = p_texture->get_path().get_file().get_basename();
 			Ref<Image> img = p_texture->get_image();
-			if (!img->has_mipmaps()) {
-				LOG(WARN, "Normal texture '", filename, "' has no mipmaps. Change on the Import panel if desired.");
-			}
 			if (img->get_width() != img->get_height()) {
 				LOG(WARN, "Normal texture '", filename, "' is not square. Not recommended. Mipmaps might have artifacts.");
 			}

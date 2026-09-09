@@ -1,9 +1,5 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-#include <godot_cpp/classes/engine.hpp>
-#include <godot_cpp/classes/time.hpp>
-#include <godot_cpp/variant/callable.hpp>
-
 #include "constants.h"
 #include "logger.h"
 #include "terrain_3d.h"
@@ -11,6 +7,10 @@
 #include "terrain_3d_editor.h"
 #include "terrain_3d_util.h"
 #include "terrain_surface_idweight.h"
+
+#include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/variant/callable.hpp>
 
 ///////////////////////////
 // Private Functions
@@ -203,7 +203,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	// Rotate the decal to align with the brush
 	if (_terrain->get_plugin()) {
 		Node *node = cast_to<Node>(_terrain->get_plugin()->get("ui"));
-		if (node->has_method("set_decal_rotation")) {
+		if (node && node->has_method("set_decal_rotation")) {
 			node->call("set_decal_rotation", rot);
 		}
 	}

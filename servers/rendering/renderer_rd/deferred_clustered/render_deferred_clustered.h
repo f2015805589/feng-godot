@@ -33,11 +33,11 @@
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
+#include "servers/rendering/renderer_rd/deferred_clustered/scene_shader_deferred_clustered.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
-#include "servers/rendering/renderer_rd/deferred_clustered/scene_shader_deferred_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/deferred_clustered/deferred_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
@@ -240,6 +240,8 @@ private:
 		DeferredLightingShaderRD shader;
 		RID shader_version;
 		PipelineCacheRD pipelines[DEFERRED_LIGHTING_MODE_MAX];
+		SceneShaderDeferredClustered::ShaderSpecialization specialization = {};
+		bool specialization_initialized = false;
 	} deferred_lighting;
 
 	enum PassMode {

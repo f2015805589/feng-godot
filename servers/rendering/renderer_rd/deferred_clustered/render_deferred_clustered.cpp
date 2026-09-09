@@ -840,6 +840,8 @@ uint32_t RenderDeferredClustered::_setup_environment(const RenderDataRD *p_rende
 			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
 
 			if (rd.is_valid()) {
+				const bool using_gi = environment_get_sdfgi_enabled(p_render_data->environment) || p_render_data->voxel_gi_instances->size() > 0;
+				ss_flags |= (using_gi && rd->has_texture(RB_SCOPE_GI, RB_TEX_AMBIENT) && rd->has_texture(RB_SCOPE_GI, RB_TEX_REFLECTION)) ? (1 << 4) : 0;
 				Ref<RenderBufferDataDeferredClustered> rb_data;
 				if (rd->has_custom_data(RB_SCOPE_DEFERRED_CLUSTERED)) {
 					rb_data = rd->get_custom_data(RB_SCOPE_DEFERRED_CLUSTERED);
@@ -2207,7 +2209,10 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 
 	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
 
-	if (depth_pre_pass) { //depth pre pass
+	if (!is_reflection_probe) {
+		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_GBUFFER, p_render_data);
+	}
+	if (depth_pre_pass) { // G-buffer, or depth pre-pass for reflection probes.
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
 		if (needs_pre_resolve) {
 			RENDER_TIMESTAMP("GI + Render Depth Pre-Pass (Parallel)");
@@ -2222,7 +2227,11 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 			_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
 		}
 
-		RD::get_singleton()->draw_command_begin_label("Render Depth Pre-Pass");
+		if (is_reflection_probe) {
+			RD::get_singleton()->draw_command_begin_label("Render Depth Pre-Pass");
+		} else {
+			RD::get_singleton()->draw_command_begin_label("Render GBuffer");
+		}
 
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, RID(), samplers, depth_prepass_uniform_buffer_index);
 
@@ -2237,7 +2246,7 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 			RD::get_singleton()->draw_command_begin_label("Resolve Depth Pre-Pass (MSAA)");
 			if (depth_pass_mode == PASS_MODE_GBUFFER) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
+					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa], Vector<RID>({ rb_data->get_gbuffer_albedo_msaa(v), rb_data->get_gbuffer_orm_msaa(v), rb_data->get_gbuffer_emission_msaa(v) }), Vector<RID>({ rb_data->get_gbuffer_albedo(v), rb_data->get_gbuffer_orm(v), rb_data->get_gbuffer_emission(v) }));
 				}
 			} else if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
@@ -2250,6 +2259,10 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}
+	}
+
+	if (!is_reflection_probe) {
+		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_GBUFFER, p_render_data);
 	}
 
 	{
@@ -2279,6 +2292,10 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 	}
 
+	if (!is_reflection_probe) {
+		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_LIGHTING, p_render_data);
+	}
+
 	// In the deferred renderer the opaque color pass is replaced by the deferred lighting pass.
 	RENDER_TIMESTAMP("Render Deferred Lighting Pass");
 
@@ -2292,7 +2309,7 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 
 	uint32_t opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
 
-	RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
+	RID rp_uniform_set;
 
 	{
 		Vector<Color> c;
@@ -2313,35 +2330,71 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
 		RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
 
-		// Deferred lighting pass: full-screen triangle that reads the G-buffer and computes lighting.
-		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
-		uint32_t lighting_mode = 0;
-		if (using_separate_specular) {
-			lighting_mode |= 1;
+		if (is_reflection_probe) {
+			// Probe faces have no G-buffer; render their opaque geometry directly.
+			rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
+			RenderListParameters params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, true, p_render_data->directional_light_soft_shadows, rp_uniform_set, false, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, 1, 0, base_specialization);
+			_render_list_with_draw_list(&params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
+		} else {
+			// Lighting samples depth; it must not also attach that texture for
+			// drawing. Keep only color outputs, including optional specular/MV.
+			RID lighting_color = use_msaa ? rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA) : rb->get_internal_texture();
+			RID lighting_specular = (opaque_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) ? rb->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR) : RID();
+			RID lighting_velocity = (opaque_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) ? rb->get_velocity_buffer(use_msaa) : RID();
+			opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_velocity);
+			// Deferred lighting pass: full-screen triangle that reads the G-buffer and computes lighting.
+			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
+			uint32_t lighting_mode = 0;
+			if (using_separate_specular) {
+				lighting_mode |= 1;
+			}
+			if (p_render_data->scene_data->view_count > 1) {
+				lighting_mode |= 2;
+			}
+
+			SceneShaderDeferredClustered::ShaderSpecialization lighting_specialization = base_specialization;
+			lighting_specialization.use_light_projector = true;
+			lighting_specialization.use_light_soft_shadows = true;
+			lighting_specialization.use_directional_soft_shadows = p_render_data->directional_light_soft_shadows;
+			if (!deferred_lighting.specialization_initialized || deferred_lighting.specialization.packed_0 != lighting_specialization.packed_0 || deferred_lighting.specialization.packed_1 != lighting_specialization.packed_1) {
+				Vector<RD::PipelineSpecializationConstant> constants;
+				RD::PipelineSpecializationConstant constant;
+				constant.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_INT;
+				constant.constant_id = 0;
+				constant.int_value = lighting_specialization.packed_0;
+				constants.push_back(constant);
+				constant.constant_id = 1;
+				constant.int_value = lighting_specialization.packed_1;
+				constants.push_back(constant);
+				for (int i = 0; i < DEFERRED_LIGHTING_MODE_MAX; i++) {
+					deferred_lighting.pipelines[i].update_specialization_constants(constants);
+				}
+				deferred_lighting.specialization = lighting_specialization;
+				deferred_lighting.specialization_initialized = true;
+			}
+			RID shader = deferred_lighting.shader.version_get_shader(deferred_lighting.shader_version, lighting_mode);
+			// Descriptor layouts include shader-stage visibility, not just binding types.
+			RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
+			rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader);
+			RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
+			RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
+			RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, deferred_lighting.pipelines[lighting_mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(opaque_framebuffer)));
+
+			RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);
+			RD::get_singleton()->draw_list_end();
 		}
-		if (p_render_data->scene_data->view_count > 1) {
-			lighting_mode |= 2;
-		}
-
-		RID shader = deferred_lighting.shader.version_get_shader(deferred_lighting.shader_version, lighting_mode);
-		// Descriptor layouts include shader-stage visibility, not just binding types.
-		RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
-		rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader);
-		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
-		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
-		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, deferred_lighting.pipelines[lighting_mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(opaque_framebuffer)));
-
-		// The scene shader inc declares a push constant block (DrawCall); the full-screen
-		// triangle doesn't use instance data, so a zeroed push constant is sufficient.
-		// Non-ubershader variants use the 16-byte DrawCall block (4 uints).
-		uint32_t zero_push_constant[4] = {};
-		RD::get_singleton()->draw_list_set_push_constant(draw_list, zero_push_constant, sizeof(zero_push_constant));
-
-		RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);
-		RD::get_singleton()->draw_list_end();
 	}
 
 	RD::get_singleton()->draw_command_end_label();
+
+	if (!is_reflection_probe) {
+		if (use_msaa && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_COLOR, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_LIGHTING)) {
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			}
+		}
+		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_LIGHTING, p_render_data);
+	}
 
 	// Forward fallback pass: renders opaque materials that cannot be expressed in the G-buffer.
 	if (!render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.is_empty()) {
@@ -2547,25 +2600,28 @@ void RenderDeferredClustered::_render_scene(RenderDataRD *p_render_data, const C
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
-	RENDER_TIMESTAMP("Render 3D Transparent Pass");
+	if (!render_list[RENDER_LIST_ALPHA].elements.is_empty()) {
+		RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
-	RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
+		RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
-	uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+		uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
 
-	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+		rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
 
-	{
-		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
-		// Motion vectors should not be overwritten by transparent objects.
-		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
+		{
+			uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
+			// Motion vectors should not be overwritten by transparent objects.
+			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
-		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+			RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		}
+
+		RD::get_singleton()->draw_command_end_label();
+
 	}
-
-	RD::get_singleton()->draw_command_end_label();
 
 	RENDER_TIMESTAMP("Resolve");
 
@@ -3514,8 +3570,20 @@ void RenderDeferredClustered::_update_render_base_uniform_set() {
 		}
 
 		render_base_uniforms.clear();
+		// Cache the lighting subset only when base resources change.
 		for (const RD::Uniform &uniform : uniforms) {
-			render_base_uniforms.push_back(uniform);
+			switch (uniform.binding) {
+				case 8:
+				case 9:
+				case 10:
+				case 12:
+				case 13:
+				case 14:
+				case 16:
+					break; // Geometry-only resources; match MODE_DEFERRED_LIGHTING.
+				default:
+					render_base_uniforms.push_back(uniform);
+			}
 		}
 		render_base_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, scene_shader.default_shader_rd, SCENE_UNIFORM_SET);
 	}
@@ -3558,7 +3626,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(scene_state.implementation_uniform_buffers[p_uniform_buffer_index]);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 2;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
@@ -3628,7 +3696,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		}
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		Vector<RID> textures;
 		textures.resize(scene_state.max_lightmaps * 2);
 
@@ -3660,7 +3728,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 7, textures);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 8;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
@@ -3689,7 +3757,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		uniforms.push_back(u);
 	}
 
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 10;
 		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
@@ -3749,14 +3817,24 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		uniforms.push_back(u);
 	}
 
-	p_samplers.append_uniforms(uniforms, 12);
+	if (p_lighting_shader.is_null()) {
+		p_samplers.append_uniforms(uniforms, 12);
+	} else {
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 12, p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 13, p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 15, p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
+	}
 
 	{
 		RD::Uniform u;
 		u.binding = 24;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID texture;
-		if (rb.is_valid() && rb->has_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH)) {
+		if (p_lighting_shader.is_valid() && rb.is_valid()) {
+			// Lighting consumes this frame's G-buffer depth, not the optional
+			// screen-reading copy used by forward materials.
+			texture = rb->get_depth_texture();
+		} else if (rb.is_valid() && rb->has_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH)) {
 			texture = rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH);
 		} else {
 			texture = texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_DEPTH : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
@@ -3764,7 +3842,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 25;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
@@ -3810,7 +3888,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 30;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
@@ -3825,7 +3903,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(t);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 31;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
@@ -3840,7 +3918,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(t);
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 32;
 		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
@@ -3852,7 +3930,7 @@ RID RenderDeferredClustered::_setup_render_pass_uniform_set(RenderListType p_ren
 		u.append_id(voxel_gi.is_valid() ? voxel_gi : render_buffers_get_default_voxel_gi_buffer());
 		uniforms.push_back(u);
 	}
-	{
+	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 33;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;

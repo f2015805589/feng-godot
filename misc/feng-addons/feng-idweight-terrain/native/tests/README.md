@@ -22,7 +22,7 @@ asset preservation, adding an empty third layer and assigning its texture,
 brush CPU writes and GPU readback, red-to-green rendered output, and undo/redo.
 Before/after PNGs are saved in OUTPUT_DIRECTORY (default: `user://`).
 
-Matching texture arrays retain their original format, including compression.
-Mixed arrays use private RGBA8 images (RGBAF for HDR), the first populated
-layer's dimensions and mipmap setting. Source textures are never resized or
-converted in place. Failed preparation/allocation keeps the previous arrays.
+Each terrain manages its own array settings. Defaults are auto size, mipmaps
+and BC7. Tests also exercise uncompressed storage, fixed resolution, disabling
+mipmaps, owner isolation, slope mixing on a ramp, and height/ID/weight/slope views.
+HDR sources require uncompressed arrays. Originals are never modified.

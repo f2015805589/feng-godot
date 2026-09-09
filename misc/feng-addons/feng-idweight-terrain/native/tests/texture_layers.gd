@@ -91,6 +91,16 @@ func run() -> void:
 		var a = array_layer(normal, 0)
 		var b = array_layer(normal, 1)
 		require(a.get_format() == b.get_format() and a.get_size() == b.get_size(), "user texture layers differ")
+	require(array_layer(false, 0).get_format() == Image.FORMAT_BPTC_RGBA, "BC7 was not applied")
+	terrain.assets.texture_array_compression = Terrain3DAssets.ARRAY_UNCOMPRESSED
+	terrain.assets.texture_array_size = 64
+	terrain.assets.texture_array_mipmaps = false
+	require(array_layer(false, 0).get_format() == Image.FORMAT_RGBA8, "uncompressed option failed")
+	require(array_layer(false, 1).get_size() == Vector2i(64, 64) and not array_layer(false, 1).has_mipmaps(), "array settings ignored")
+	terrain.assets.texture_array_size = 0
+	terrain.assets.texture_array_mipmaps = true
+	terrain.assets.texture_array_compression = Terrain3DAssets.ARRAY_BC7
+	print("PASS array BC7/uncompressed, size and mipmap controls")
 	print("PASS RGB/RGBA textures uploaded as matching two-layer GPU arrays")
 	var first = terrain.assets.get_texture_asset(0)
 	var second = terrain.assets.get_texture_asset(1)
@@ -111,7 +121,10 @@ func run() -> void:
 	array_layer(true, 2)
 	require(empty.albedo_texture == null and empty.normal_texture == null, "placeholder was saved into source asset")
 	empty.albedo_texture = texture(16, Image.FORMAT_RGB8, Color.BLUE, false)
-	require(array_layer(false, 2).get_pixel(0,0).b > 0.9, "third layer could not be populated")
+	var blue = array_layer(false, 2)
+	if blue.is_compressed():
+		blue.decompress()
+	require(blue.get_pixel(0,0).b > 0.9, "third layer could not be populated")
 	print("PASS empty layer insertion and later texture assignment")
 	var before = await frame_image()
 	before.save_png(output_dir.path_join("before-paint.png"))
@@ -127,6 +140,8 @@ func run() -> void:
 	var cpu = terrain.data.get_surface_maps()[0]
 	var packed = roundi(cpu.get_pixel(32, 32).r * 65535.0)
 	require((packed >> 11) == 1, "brush did not write layer 1")
+	var picked = terrain.data.get_texture_id(Vector3(32, 0, 32))
+	require(picked.x == 0 and picked.y == 1 and picked.z > 0.99, "eyedropper did not read painted ID map")
 	var after = await frame_image()
 	var gpu = RenderingServer.texture_2d_layer_get(terrain.data.get_surface_maps_rid(), 0)
 	require(roundi(gpu.get_pixel(32, 32).r * 65535.0) == packed, "paint not uploaded to GPU")
@@ -141,6 +156,51 @@ func run() -> void:
 	redo_action.call()
 	require(roundi(terrain.data.get_surface_maps()[0].get_pixel(32,32).r*65535.0) == packed, "redo failed")
 	print("PASS texture brush undo/redo")
+	# A shared authoring resource must create a separate array owner per terrain.
+	var other = Terrain3D.new()
+	other.free_editor_textures = false
+	other.assets = terrain.assets
+	other.set_camera(camera)
+	scene.add_child(other)
+	require(other.assets != terrain.assets, "two terrains share array ownership")
+	other.assets.texture_array_size = 64
+	require(terrain.assets.texture_array_size == 0, "second terrain changed first array settings")
+	other.free()
+	print("PASS per-terrain array ownership")
+	var replacement = Terrain3DTextureAsset.new()
+	replacement.id = 0
+	replacement.albedo_texture = texture(32, Image.FORMAT_RGBA8, Color.RED, true)
+	var authored: Array[Terrain3DTextureAsset] = [replacement, second, null]
+	terrain.assets.texture_list = authored
+	require(terrain.assets.get_texture_asset(0) == replacement, "inspector array replacement ignored")
+	require(terrain.assets.get_texture_asset(2) != null, "empty inspector layer not initialized")
+	first = replacement
+	print("PASS inspector layer list replacement and empty slots")
+
+
+	# MIX mode uses geometric slope: the same painted pair is red on flat
+	# ground and green on a ramp, with neutral normal maps.
+	first.slope_blend_sharpness = 100.0
+	second.slope_based_damp = 0.0
+	painter.set_brush_data({"brush": [brush, ImageTexture.create_from_image(brush)], "size": 20.0, "strength": 100.0, "mouse_pressure": 1.0, "asset_id": 1, "pair_overlay_id": 1, "pair_background_id": 0, "pair_mode": 3, "pair_weight_level": 4})
+	painter.start_operation(Vector3(32, 0, 32))
+	painter.operate(Vector3(32, 0, 32), 0.0)
+	painter.stop_operation()
+	var flat = await frame_image()
+	for z in 64:
+		for x in 64:
+			terrain.data.set_height(Vector3(x, 0, z), float(x - 32))
+	terrain.data.update_maps(Terrain3DRegion.TYPE_HEIGHT)
+	var ramp = await frame_image()
+	print("SLOPE flat=", flat.get_pixelv(center), " ramp=", ramp.get_pixelv(center))
+	require(flat.get_pixelv(center).r > flat.get_pixelv(center).g, "flat MIX slope should retain background")
+	require(ramp.get_pixelv(center).g > ramp.get_pixelv(center).r, "ramp MIX slope should show overlay")
+	print("PASS actual rendered slope blend")
+	for view in ["show_heightmap", "show_control_texture", "show_control_blend", "show_slope"]:
+		terrain.set(view, true)
+		await frame_image()
+		terrain.set(view, false)
+	print("PASS height/ID/weight/slope debug shaders")
 	terrain.set_editor(null)
 	terrain.set_plugin(null)
 	painter.free()

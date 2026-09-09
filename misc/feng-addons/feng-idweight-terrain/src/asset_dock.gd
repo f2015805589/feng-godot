@@ -11,6 +11,7 @@ const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
 const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
 const ES_DOCK_TAB: String = "terrain3d/dock/tab"
 
+var management_bar: HFlowContainer
 var texture_list: ListContainer
 var mesh_list: ListContainer
 var current_list: ListContainer
@@ -88,6 +89,35 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	mesh_list.visible = false
 	asset_container.add_child(mesh_list, true)
 	current_list = texture_list
+	management_bar = HFlowContainer.new()
+	box.add_child(management_bar)
+	var array_button := Button.new()
+	array_button.text = "Texture Array"
+	array_button.tooltip_text = "Manage this terrain's layers, array resolution, mipmaps and BC7 compression."
+	array_button.pressed.connect(func():
+		var terrain = plugin.get_terrain()
+		if terrain:
+			EditorInterface.edit_resource(terrain.assets))
+	management_bar.add_child(array_button)
+	var maps_button := Button.new()
+	maps_button.text = "Terrain Maps"
+	maps_button.tooltip_text = "Inspect live height maps and R16 surface maps (material IDs, blend mode and weight)."
+	maps_button.pressed.connect(func():
+		var terrain = plugin.get_terrain()
+		if terrain:
+			EditorInterface.inspect_object(terrain.data))
+	management_bar.add_child(maps_button)
+	var map_view := OptionButton.new()
+	for label in ["Shaded", "Heightmap", "Material IDs", "Material Weight", "Slope"]:
+		map_view.add_item(label)
+	map_view.item_selected.connect(func(index):
+		var terrain = plugin.get_terrain()
+		if terrain:
+			terrain.set_show_heightmap(index == 1)
+			terrain.set_show_control_texture(index == 2)
+			terrain.set_show_control_blend(index == 3)
+			terrain.set_show_slope(index == 4))
+	management_bar.add_child(map_view)
 
 	load_editor_settings()
 
@@ -185,15 +215,18 @@ func update_layout() -> void:
 	if size.x < 700:
 		box.vertical = true
 		buttons.vertical = false
+		management_bar.reparent(box)
 		search_box.reparent(box)
 		box.move_child(search_box, 1)
 		size_slider.reparent(box)
 		box.move_child(size_slider, 2)
+		box.move_child(management_bar, 3)
 		pinned_btn.reparent(buttons)
 	else:
 	# Wide layout: buttons on left
 		box.vertical = false
 		buttons.vertical = true
+		management_bar.reparent(buttons)
 		search_box.reparent(buttons)
 		buttons.move_child(search_box, 0)
 		size_slider.reparent(buttons)

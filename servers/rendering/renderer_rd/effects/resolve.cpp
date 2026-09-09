@@ -50,12 +50,14 @@ Resolve::Resolve(bool p_prefer_raster_effects) {
 		resolve_modes.push_back("\n#define MODE_RESOLVE_GI\n");
 		resolve_modes.push_back("\n#define MODE_RESOLVE_GI\n#define VOXEL_GI_RESOLVE\n");
 		resolve_modes.push_back("\n#define MODE_RESOLVE_DEPTH\n");
+		resolve_modes.push_back("\n#define MODE_RESOLVE_GI\n#define GBUFFER_RESOLVE\n");
+		resolve_modes.push_back("\n#define MODE_RESOLVE_GI\n#define GBUFFER_RESOLVE\n#define VOXEL_GI_RESOLVE\n");
 
 		resolve.shader.initialize(resolve_modes);
 
 		resolve.shader_version = resolve.shader.version_create();
 
-		for (int i = 0; i < RESOLVE_MODE_MAX; i++) {
+		for (int i = 0; i < RESOLVE_MODE_GBUFFER; i++) {
 			resolve.pipelines[i] = RD::get_singleton()->compute_pipeline_create(resolve.shader.version_get_shader(resolve.shader_version, i));
 		}
 	}
@@ -69,7 +71,7 @@ Resolve::~Resolve() {
 	}
 }
 
-void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples) {
+void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples, const Vector<RID> &p_source_gbuffer, const Vector<RID> &p_dest_gbuffer) {
 	ERR_FAIL_COND_MSG(prefer_raster_effects, "Can't use the compute shader resolve with the mobile renderer.");
 
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -91,8 +93,15 @@ void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID 
 	RD::Uniform u_dest_normal_roughness(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ p_dest_normal_roughness }));
 
 	ResolveMode mode = p_source_voxel_gi.is_valid() ? RESOLVE_MODE_GI_VOXEL_GI : RESOLVE_MODE_GI;
+	if (!p_source_gbuffer.is_empty()) {
+		ERR_FAIL_COND(p_source_gbuffer.size() != 3 || p_dest_gbuffer.size() != 3);
+		mode = p_source_voxel_gi.is_valid() ? RESOLVE_MODE_GBUFFER_VOXEL_GI : RESOLVE_MODE_GBUFFER;
+	}
 	RID shader = resolve.shader.version_get_shader(resolve.shader_version, mode);
 	ERR_FAIL_COND(shader.is_null());
+	if (resolve.pipelines[mode].is_null()) {
+		resolve.pipelines[mode] = RD::get_singleton()->compute_pipeline_create(shader);
+	}
 
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, resolve.pipelines[mode]);
@@ -104,6 +113,16 @@ void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID 
 
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 2, u_source_voxel_gi), 2);
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 3, u_dest_voxel_gi), 3);
+	}
+
+	if (!p_source_gbuffer.is_empty()) {
+		RD::Uniform albedo(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_gbuffer[0] }));
+		RD::Uniform orm(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ default_sampler, p_source_gbuffer[1] }));
+		RD::Uniform emission(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ default_sampler, p_source_gbuffer[2] }));
+		RD::Uniform out_albedo(RD::UNIFORM_TYPE_IMAGE, 3, p_dest_gbuffer[0]);
+		RD::Uniform out_orm(RD::UNIFORM_TYPE_IMAGE, 4, p_dest_gbuffer[1]);
+		RD::Uniform out_emission(RD::UNIFORM_TYPE_IMAGE, 5, p_dest_gbuffer[2]);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 4, albedo, orm, emission, out_albedo, out_orm, out_emission), 4);
 	}
 
 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(ResolvePushConstant));

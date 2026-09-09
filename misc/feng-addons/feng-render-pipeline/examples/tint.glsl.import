@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dfxwccgi3h8yx"
+path="res://.godot/imported/tint.glsl-cf8153ba6d09df9bfce51e2bcb730e82.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/examples/tint.glsl"
+dest_files=["res://.godot/imported/tint.glsl-cf8153ba6d09df9bfce51e2bcb730e82.res"]
+
+[params]
+
