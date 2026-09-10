@@ -11,16 +11,25 @@ var _menu: PopupMenu
 var _library_paths: Array[String] = []
 
 func _enter_tree() -> void:
+	# add_tool_submenu_item() reparents the popup into the editor tool menu and
+	# requires it to be parentless; adding it as a child first trips the
+	# ERR_FAIL_COND in EditorNode::add_tool_submenu_item.
+	if _menu != null:
+		if _menu.get_parent() != null:
+			_menu.get_parent().remove_child(_menu)
+		_menu.free()
 	_menu = PopupMenu.new()
 	_menu.name = "FengRenderPipeline"
 	_menu.id_pressed.connect(_on_library_item)
-	add_child(_menu)
 	add_tool_submenu_item("Add Pass from Library", _menu)
 	_refresh_library()
 
 func _exit_tree() -> void:
 	if _menu != null:
-		_menu.queue_free()
+		# The menu is parented to the editor tool menu, not to this plugin.
+		# remove_tool_menu_item() detaches and deletes it; queue_free() alone
+		# would leave a dangling submenu entry behind.
+		remove_tool_menu_item("Add Pass from Library")
 		_menu = null
 
 func _refresh_library() -> void:
@@ -60,6 +69,9 @@ func _on_library_item(id: int) -> void:
 		return
 	var instance = template.duplicate()
 	renderer.passes.append(instance)
+	# Mark the library path as synced so the auto-sync does not add a second
+	# copy of the same pass.
+	renderer.mark_library_pass(_library_paths[id])
 	EditorInterface.get_inspector().refresh()
 
 func _find_selected_renderer():

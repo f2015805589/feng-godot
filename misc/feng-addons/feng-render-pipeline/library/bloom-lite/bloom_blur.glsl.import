@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ipen8hnfih2d"
+path="res://.godot/imported/bloom_blur.glsl-b398345002173d0bbfd22090a0e281c7.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/bloom-lite/bloom_blur.glsl"
+dest_files=["res://.godot/imported/bloom_blur.glsl-b398345002173d0bbfd22090a0e281c7.res"]
+
+[params]
+

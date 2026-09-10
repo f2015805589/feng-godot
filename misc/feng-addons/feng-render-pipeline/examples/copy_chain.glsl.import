@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://v3fggocc70pd"
+path="res://.godot/imported/copy_chain.glsl-b63dbfce9cdf38327311009a164c0f6e.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/examples/copy_chain.glsl"
+dest_files=["res://.godot/imported/copy_chain.glsl-b63dbfce9cdf38327311009a164c0f6e.res"]
+
+[params]
+

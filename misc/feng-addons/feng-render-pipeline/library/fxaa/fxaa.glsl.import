@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cw8htrbwtvrwh"
+path="res://.godot/imported/fxaa.glsl-8b230d19478f63ba3ec3a5c453614e89.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/fxaa/fxaa.glsl"
+dest_files=["res://.godot/imported/fxaa.glsl-8b230d19478f63ba3ec3a5c453614e89.res"]
+
+[params]
+

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bpeuoht6o1n3h"
+path="res://.godot/imported/bloom_composite.glsl-35006b2e5f336345ad9185d18ec61b0f.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/bloom-lite/bloom_composite.glsl"
+dest_files=["res://.godot/imported/bloom_composite.glsl-35006b2e5f336345ad9185d18ec61b0f.res"]
+
+[params]
+

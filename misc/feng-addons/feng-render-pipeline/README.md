@@ -16,10 +16,19 @@ FengCompositor (Compositor)      —— 绑定 renderer，改动自动同步 eff
 
 1. 项目设置 `rendering/renderer/rendering_method = "frp"`。
 2. 启用插件（Project → Project Settings → Plugins → Feng Render Pipeline）。
-3. 创建 `FengRenderer` 资源，在 Passes 里添加 pass（或使用编辑器菜单
-   **Add Pass from Library** 一键插入内置模板）。
+3. 创建 `FengRenderer` 资源——**新建时自动带上全部内置 pass（默认启用）**，
+   在 Passes 里关掉不需要的（取消 Enabled 或删除条目），拖动调整顺序。
 4. 创建 `FengCompositor` 资源，把 Renderer 指向它；赋给 Camera3D 或
    WorldEnvironment 的 Compositor。
+
+内置 pass 也可以随时通过编辑器菜单 **Add Pass from Library** 重新插入。
+
+## 内置库同步
+
+内置库新增 pass 后，**已存在的 FengRenderer 会自动同步**：把新 pass 的
+glsl + .tres 放进 `library/`，并在 `renderer.gd` 的 `DEFAULT_PASS_PATHS`
+里登记路径；下次 `apply()`（或 Inspector 刷新）时，新 pass 自动追加到
+Passes 列表末尾（默认启用）。你手动删除过的 pass 不会被重新加回。
 
 ## Pass 配置
 
@@ -50,7 +59,9 @@ FengCompositor (Compositor)      —— 绑定 renderer，改动自动同步 eff
 | `color-grade` | 饱和度/对比度/亮度/伽马 |
 | `bloom-lite` | 降采样提亮 + 模糊 + 合成 |
 
-每个库 pass = glsl + 预配参数的 .tres 模板，编辑器菜单一键实例化。
+每个库 pass = glsl + 预配参数的 .tres 模板。新建 `FengRenderer` 时自动
+实例化全部模板（默认启用），编辑器菜单 **Add Pass from Library** 可随时
+重新插入；库新增 pass 后已存在的 renderer 自动同步（见上节）。
 
 ## 校验
 

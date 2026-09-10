@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://b5wfnxk7urfkl"
+path="res://.godot/imported/bloom_downsample.glsl-5743faec41c99b5af0ad51f145a6456e.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/bloom-lite/bloom_downsample.glsl"
+dest_files=["res://.godot/imported/bloom_downsample.glsl-5743faec41c99b5af0ad51f145a6456e.res"]
+
+[params]
+

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cnijgvo2rvkar"
+path="res://.godot/imported/blur_h.glsl-180e53b65c1f560411f4a06710a0a947.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/blur/blur_h.glsl"
+dest_files=["res://.godot/imported/blur_h.glsl-180e53b65c1f560411f4a06710a0a947.res"]
+
+[params]
+
