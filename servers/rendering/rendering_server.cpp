@@ -3060,6 +3060,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("compositor_create"), &RenderingServer::compositor_create);
 
 	ClassDB::bind_method(D_METHOD("compositor_set_compositor_effects", "compositor", "effects"), &RenderingServer::compositor_set_compositor_effects);
+	ClassDB::bind_method(D_METHOD("compositor_set_frp_pipeline", "compositor", "pipeline", "names"), &RenderingServer::compositor_set_frp_pipeline, DEFVAL(PackedStringArray()));
 
 	/* ENVIRONMENT */
 

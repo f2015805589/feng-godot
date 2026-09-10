@@ -1121,6 +1121,9 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 					// Avoid compute after draw workaround. Refer to the comment that enables this in the Vulkan driver for more information.
 					workarounds_state.draw_list_found = false;
 
+					// Keep debug regions balanced within each command buffer so capture
+					// tools can reconstruct the hierarchy across submissions.
+					_run_label_command_change(r_command_buffer, -1, -1, false, false, nullptr, 0, r_current_label_index, r_current_label_level);
 					// Create or reuse a command buffer and finish recording the current one.
 					driver->command_buffer_end(r_command_buffer);
 
@@ -1135,6 +1138,7 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 					uint32_t command_buffer_index = r_command_buffer_pool.buffers_used++;
 					r_command_buffer = r_command_buffer_pool.buffers[command_buffer_index];
 					driver->command_buffer_begin(r_command_buffer);
+					_run_label_command_change(r_command_buffer, command->label_index, p_level, true, true, &p_sorted_commands[i], p_sorted_commands_count - i, r_current_label_index, r_current_label_level);
 				}
 
 				const RecordedComputeListCommand *compute_list_command = reinterpret_cast<const RecordedComputeListCommand *>(command);
@@ -1149,6 +1153,9 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedDrawListCommand *draw_list_command = reinterpret_cast<const RecordedDrawListCommand *>(command);
 
 				if (draw_list_command->split_cmd_buffer) {
+					// Keep debug regions balanced within each command buffer so capture
+					// tools can reconstruct the hierarchy across submissions.
+					_run_label_command_change(r_command_buffer, -1, -1, false, false, nullptr, 0, r_current_label_index, r_current_label_level);
 					// Create or reuse a command buffer and finish recording the current one.
 					driver->command_buffer_end(r_command_buffer);
 
@@ -1163,6 +1170,7 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 					uint32_t command_buffer_index = r_command_buffer_pool.buffers_used++;
 					r_command_buffer = r_command_buffer_pool.buffers[command_buffer_index];
 					driver->command_buffer_begin(r_command_buffer);
+					_run_label_command_change(r_command_buffer, command->label_index, p_level, true, true, &p_sorted_commands[i], p_sorted_commands_count - i, r_current_label_index, r_current_label_level);
 				}
 
 				const VectorView clear_values(draw_list_command->clear_values(), draw_list_command->clear_values_count);
@@ -1233,15 +1241,36 @@ void RenderingDeviceGraph::_run_label_command_change(RDD::CommandBufferID p_comm
 
 	if (p_ignore_previous_value || p_new_label_index != r_current_label_index || p_new_level != r_current_label_level) {
 		if (!p_ignore_previous_value && (p_use_label_for_empty || r_current_label_index >= 0 || r_current_label_level >= 0)) {
-			// End the current label.
+			// End the command group. Logical labels stay open across graph levels.
 			driver->command_end_label(p_command_buffer);
+		}
+
+		LocalVector<int32_t> previous_path;
+		LocalVector<int32_t> next_path;
+		if (!p_ignore_previous_value) {
+			for (int32_t index = r_current_label_index; index >= 0; index = command_label_parents[index]) {
+				previous_path.push_back(index);
+			}
+		}
+		for (int32_t index = p_new_label_index; index >= 0; index = command_label_parents[index]) {
+			next_path.push_back(index);
+		}
+		uint32_t common_count = 0;
+		while (common_count < previous_path.size() && common_count < next_path.size() && previous_path[previous_path.size() - common_count - 1] == next_path[next_path.size() - common_count - 1]) {
+			common_count++;
+		}
+		for (uint32_t i = common_count; i < previous_path.size(); i++) {
+			driver->command_end_label(p_command_buffer);
+		}
+		for (uint32_t i = next_path.size() - common_count; i > 0; i--) {
+			int32_t index = next_path[i - 1];
+			driver->command_begin_label(p_command_buffer, &command_label_chars[command_label_offsets[index]], command_label_colors[index]);
 		}
 
 		String label_name;
 		Color label_color;
 		if (p_new_label_index >= 0) {
-			const char *label_chars = &command_label_chars[command_label_offsets[p_new_label_index]];
-			label_name.append_utf8(label_chars);
+			label_name = "Commands";
 			label_color = command_label_colors[p_new_label_index];
 		} else if (p_use_label_for_empty) {
 			label_name = "Command Graph";
@@ -1764,6 +1793,7 @@ void RenderingDeviceGraph::begin() {
 	command_label_chars.clear();
 	command_label_colors.clear();
 	command_label_offsets.clear();
+	command_label_parents.clear();
 	command_list_nodes.clear();
 	read_slice_list_nodes.clear();
 	write_slice_list_nodes.clear();
@@ -2572,12 +2602,15 @@ void RenderingDeviceGraph::begin_label(const Span<char> &p_label_name, const Col
 	command_label_chars[command_label_offset + command_label_size] = '\0';
 	command_label_colors.push_back(p_color);
 	command_label_offsets.push_back(command_label_offset);
+	command_label_parents.push_back(command_label_index);
 	command_label_index = command_label_count;
 	command_label_count++;
 }
 
 void RenderingDeviceGraph::end_label() {
-	command_label_index = -1;
+	if (command_label_index >= 0) {
+		command_label_index = command_label_parents[command_label_index];
+	}
 }
 
 void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool) {

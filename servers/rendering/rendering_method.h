@@ -156,6 +156,7 @@ public:
 	virtual bool is_compositor(RID p_compositor) const = 0;
 
 	virtual void compositor_set_compositor_effects(RID p_env, const TypedArray<RID> &p_effects) = 0;
+	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) = 0;
 
 	/* ENVIRONMENT API */
 

@@ -1210,6 +1210,7 @@ public:
 	PASS1RC(bool, is_compositor, RID)
 
 	PASS2(compositor_set_compositor_effects, RID, const TypedArray<RID> &)
+	PASS3(compositor_set_frp_pipeline, RID, const PackedInt32Array &, const PackedStringArray &)
 
 	// Environment
 

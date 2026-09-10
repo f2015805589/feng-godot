@@ -12,11 +12,19 @@ const OutputDeclaration = preload("pass_output.gd")
 
 @export_enum("Pre Opaque", "Post Opaque", "Post Sky", "Pre Transparent", "Post Transparent", "Pre GBuffer", "Post GBuffer", "Pre Lighting", "Post Lighting") var stage: int = EFFECT_CALLBACK_TYPE_POST_TRANSPARENT:
 	set(value):
-		stage = clampi(value, 0, EFFECT_CALLBACK_TYPE_MAX - 1)
+		var next_stage := clampi(value, 0, EFFECT_CALLBACK_TYPE_MAX - 1)
+		if stage == next_stage and effect_callback_type == next_stage:
+			return
+		stage = next_stage
 		effect_callback_type = stage
+		emit_changed()
 
 @export var inputs: Array[TextureInput] = []
 @export var outputs: Array[OutputDeclaration] = []
+## Stable identity used by the renderer's persisted library and migration
+## bookkeeping.  It is storage-only because it is an implementation detail,
+## while Resource.resource_name is the readable name shown in the inspector.
+@export_storage var stable_id: StringName = &""
 
 var _setup_complete := false
 var _cleanup_scheduled := false
@@ -45,8 +53,6 @@ func _clear_report() -> void:
 func _render_callback(callback_stage: int, data: RenderData) -> void:
 	if callback_stage != effect_callback_type or data == null:
 		return
-	if stage != effect_callback_type:
-		stage = effect_callback_type
 	_refresh_resource_flags()
 	var buffers := data.get_render_scene_buffers() as RenderSceneBuffersRD
 	if buffers == null:
@@ -124,16 +130,10 @@ func get_configuration_warnings() -> PackedStringArray:
 		if names.has(declaration.name):
 			warnings.append("Output texture '%s' is declared more than once." % declaration.name)
 		names[declaration.name] = true
-	if stage == EFFECT_CALLBACK_TYPE_PRE_GBUFFER:
-		for declaration in inputs:
-			if declaration != null and declaration.source in [TextureInput.Source.COLOR, TextureInput.Source.DEPTH, TextureInput.Source.NORMAL_ROUGHNESS, TextureInput.Source.ALBEDO, TextureInput.Source.ORM, TextureInput.Source.EMISSION]:
-				warnings.append("Current-frame color, depth and G-buffer inputs are unavailable at Pre GBuffer.")
-				break
-	elif stage < EFFECT_CALLBACK_TYPE_POST_LIGHTING:
-		for declaration in inputs:
-			if declaration != null and declaration.source == TextureInput.Source.COLOR:
-				warnings.append("Current-frame color is unavailable before Post Lighting.")
-				break
+	# Stage is an advisory callback selector once a FengRenderer is used.  The
+	# renderer validates texture availability from the actual list position;
+	# doing numeric stage comparisons here used to report false positives for
+	# passes deliberately moved around native FRP operations.
 	return warnings
 
 func _notification(what: int) -> void:

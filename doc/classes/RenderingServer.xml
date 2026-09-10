@@ -1129,6 +1129,16 @@
 				Sets the compositor effects for the specified compositor RID. [param effects] should be an array containing RIDs created with [method compositor_effect_create].
 			</description>
 		</method>
+		<method name="compositor_set_frp_pipeline">
+			<return type="void" />
+			<param index="0" name="compositor" type="RID" />
+			<param index="1" name="pipeline" type="PackedInt32Array" />
+			<param index="2" name="names" type="PackedStringArray" default="PackedStringArray()" />
+			<description>
+				Sets the explicit FRP pipeline schedule for the specified compositor RID. Non-negative tokens select built-in FRP passes (0 through 15); negative tokens select entries in the compositor effects array using [code]-token - 1[/code]. An empty schedule restores the legacy stage-based behavior. The FRP renderer validates mandatory passes and their dependency order. Invalid schedules are rejected and leave the previous schedule unchanged.
+				The optional [param names] array provides GPU capture labels, one per token. Explicit pass boundaries preserve command order; commands within each pass may still be reordered by resource dependencies. Passes that record no GPU work do not appear in captures.
+			</description>
+		</method>
 		<method name="create_local_rendering_device" qualifiers="const">
 			<return type="RenderingDevice" />
 			<description>

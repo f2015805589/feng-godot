@@ -18,6 +18,7 @@ source = 0
 binding_type = 1
 
 [resource]
+resource_name = "Blur Vertical"
 script = ExtResource("1")
 stage = 4
 shader_file = ExtResource("3")

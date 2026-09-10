@@ -5646,16 +5646,23 @@ void RenderingDeviceDriverD3D12::command_timestamp_write(CommandBufferID p_cmd_b
 }
 
 void RenderingDeviceDriverD3D12::command_begin_label(CommandBufferID p_cmd_buffer, const char *p_label_name, const Color &p_color) {
-#ifdef PIX_ENABLED
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
-	PIXBeginEvent(cmd_buf_info->cmd_list.Get(), p_color.to_argb32(), p_label_name);
+#ifdef PIX_ENABLED
+	PIXBeginEvent(cmd_buf_info->cmd_list.Get(), p_color.to_argb32(), "%s", p_label_name);
+#else
+	// The standard Unicode event format (WINPIX_EVENT_UNICODE_VERSION = 0)
+	// is understood by RenderDoc without linking the optional PIX runtime.
+	const Char16String label = String::utf8(p_label_name).utf16();
+	cmd_buf_info->cmd_list->BeginEvent(0, label.get_data(), label.length() * sizeof(char16_t));
 #endif
 }
 
 void RenderingDeviceDriverD3D12::command_end_label(CommandBufferID p_cmd_buffer) {
-#ifdef PIX_ENABLED
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+#ifdef PIX_ENABLED
 	PIXEndEvent(cmd_buf_info->cmd_list.Get());
+#else
+	cmd_buf_info->cmd_list->EndEvent();
 #endif
 }
 

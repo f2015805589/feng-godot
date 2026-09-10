@@ -26,6 +26,7 @@ usage = 9
 scale = Vector2(0.5, 0.5)
 
 [resource]
+resource_name = "Blur Horizontal"
 script = ExtResource("1")
 stage = 4
 shader_file = ExtResource("4")

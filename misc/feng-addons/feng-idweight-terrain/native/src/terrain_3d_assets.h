@@ -26,7 +26,22 @@ public: // Constants
 
 	enum TextureArrayCompression {
 		ARRAY_UNCOMPRESSED,
-		ARRAY_BC7,
+		ARRAY_BC7, // Keep serialized value 1 for existing assets.
+		ARRAY_BC1,
+		ARRAY_BC3,
+		ARRAY_BC4,
+		ARRAY_BC5,
+		ARRAY_BC6H,
+		ARRAY_ETC1,
+		ARRAY_ETC2_RGB,
+		ARRAY_ETC2_RGBA,
+		ARRAY_EAC_R11,
+		ARRAY_EAC_RG11,
+		ARRAY_ASTC_4X4,
+		ARRAY_ASTC_8X8,
+		ARRAY_ASTC_4X4_HDR,
+		ARRAY_ASTC_8X8_HDR,
+		ARRAY_COMPRESSION_MAX,
 	};
 
 private:

@@ -348,7 +348,7 @@ void RenderingContextDriverD3D12::surface_destroy(SurfaceID p_surface) {
 }
 
 bool RenderingContextDriverD3D12::is_debug_utils_enabled() const {
-#ifdef PIX_ENABLED
+#if defined(PIX_ENABLED) || defined(DEBUG_ENABLED)
 	return true;
 #else
 	return false;

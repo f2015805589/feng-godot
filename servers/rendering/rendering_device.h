@@ -1940,6 +1940,9 @@ public:
 	void _draw_command_begin_label(String p_label_name, const Color &p_color = Color(1, 1, 1, 1));
 	void draw_command_begin_label(const Span<char> p_label_name, const Color &p_color = Color(1, 1, 1, 1));
 	void draw_command_end_label();
+	// Keep subsequent graph commands after all previously recorded commands.
+	// Internal renderer scheduling boundary; resource barriers remain automatic.
+	void draw_command_insert_ordering_barrier();
 
 	String get_device_vendor_name() const;
 	String get_device_name() const;

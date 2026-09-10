@@ -11,12 +11,14 @@ const ASSET_DOCK_45: String = "res://addons/feng-idweight-terrain/src/asset_dock
 
 # Editor Plugin
 var debug: int = 0 # Set in _edit()
+var terrain_setup: Node
 var editor: Terrain3DEditor
 var editor_settings: EditorSettings
 var ui: Node # Terrain3DUI see Godot #75388
 var asset_dock: PanelContainer
 var current_region_position: Vector2
 var mouse_global_position: Vector3 = Vector3.ZERO
+var mouse_viewport_position: Vector2 = Vector2.ZERO
 var godot_editor_window: Window # The Godot Editor window
 var viewport: SubViewport # Viewport the mouse was last in
 var mouse_in_main: bool = false # Helper to track when mouse is in the editor vp
@@ -65,6 +67,9 @@ func _enter_tree() -> void:
 	else:
 		asset_dock = load(ASSET_DOCK_45).instantiate()
 	asset_dock.initialize(self)
+	terrain_setup = preload("res://addons/feng-idweight-terrain/src/terrain_setup.gd").new()
+	terrain_setup.plugin = self
+	add_child(terrain_setup)
 
 
 func _exit_tree() -> void:
@@ -129,6 +134,8 @@ func _edit(p_object: Object) -> void:
 		if not terrain.assets_changed.is_connected(asset_dock.update_assets):
 			terrain.assets_changed.connect(asset_dock.update_assets)
 		asset_dock.update_assets()
+		if terrain_setup:
+			terrain_setup.call_deferred("request", terrain)
 	else:
 		_clear()
 
@@ -178,6 +185,13 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 		return AFTER_GUI_INPUT_PASS
 
 	var continue_input: AfterGUIInput = _read_input(p_event)
+	# A release may be delivered after the cursor has left the terrain.  End
+	# the native operation before trying to resolve a new hit point, otherwise
+	# an invalid ray would leave the stroke open and corrupt the next undo.
+	if p_event is InputEventMouseButton and p_event.is_released() and \
+		p_event.get_button_index() == MOUSE_BUTTON_LEFT and editor.is_operating():
+		editor.stop_operation()
+		return AFTER_GUI_INPUT_STOP
 	if continue_input != AFTER_GUI_INPUT_CUSTOM:
 		return continue_input
 	
@@ -191,26 +205,39 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 
 	# Detect if viewport is set to half_resolution
 	# Structure is: Node3DEditorViewportContainer/Node3DEditorViewport(4)/SubViewportContainer/SubViewport/Camera3D
-	viewport = p_viewport_camera.get_parent()
-	var full_resolution: bool = false if viewport.get_parent().stretch_shrink == 2 else true
-
-	## Get mouse location on terrain
-	# Project 2D mouse position to 3D position and direction
-	var vp_mouse_pos: Vector2 = viewport.get_mouse_position()
-	var mouse_pos: Vector2 = vp_mouse_pos if full_resolution else vp_mouse_pos / 2
-	var camera_pos: Vector3 = p_viewport_camera.project_ray_origin(mouse_pos)
-	var camera_dir: Vector3 = p_viewport_camera.project_ray_normal(mouse_pos)
+	var input_viewport: SubViewport = p_viewport_camera.get_parent()
+	var shrink: int = maxi(1, input_viewport.get_parent().stretch_shrink)
+	# Scene forwards mouse events in its overlay's local coordinates. Polling
+	# the SubViewport independently can return a different cursor position,
+	# especially across dock/focus changes. Use the event being processed.
+	if p_event is InputEventMouse:
+		mouse_viewport_position = p_event.position / float(shrink)
+	elif viewport != input_viewport:
+		mouse_viewport_position = input_viewport.get_mouse_position() / float(shrink)
+	viewport = input_viewport
+	var camera_pos: Vector3 = p_viewport_camera.project_ray_origin(mouse_viewport_position)
+	var camera_dir: Vector3 = p_viewport_camera.project_ray_normal(mouse_viewport_position)
 
 	ui.update_decal()
 
-	# DEPRECATED - Remove 1.2 - If region tool, grab mouse position without considering height
-	#if editor.get_tool() == Terrain3DEditor.REGION:
-		#var t = -Vector3(0, 1, 0).dot(camera_pos) / Vector3(0, 1, 0).dot(camera_dir)
-		#mouse_global_position = (camera_pos + t * camera_dir)
-	#else:
-	#Else look for intersection with terrain
-	var intersection_point: Vector3 = terrain.get_intersection(camera_pos, camera_dir, true)
-	if intersection_point.z > 3.4e38 or is_nan(intersection_point.y): # max double or nan
+	# Add Region must work outside the rendered terrain too. With background
+	# disabled there is no geometry to GPU-pick there, so use the ground plane.
+	var intersection_point: Vector3
+	if editor.get_tool() == Terrain3DEditor.REGION:
+		var plane_hit = Plane(Vector3.UP, 0.0).intersects_ray(camera_pos, camera_dir)
+		if plane_hit == null:
+			return AFTER_GUI_INPUT_PASS
+		intersection_point = plane_hit
+	else:
+		intersection_point = terrain.get_intersection(camera_pos, camera_dir, true)
+	var intersection_valid: bool = intersection_point.is_finite() and intersection_point.z < 3.4e38
+	if not intersection_valid and _input_mode > 0:
+		# The mouse viewport is rendered asynchronously.  Its first read after a
+		# camera/position update can still contain the clear value, so do the
+		# deterministic CPU raymarch for this event instead of dropping a click.
+		intersection_point = terrain.get_intersection(camera_pos, camera_dir, false)
+		intersection_valid = intersection_point.is_finite() and intersection_point.z < 3.4e38
+	if not intersection_valid: # max double or nan
 		return AFTER_GUI_INPUT_PASS
 	mouse_global_position = intersection_point
 	
@@ -234,7 +261,8 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 			
 		return AFTER_GUI_INPUT_PASS
 
-	if p_event is InputEventMouseButton and _input_mode > 0:
+	if p_event is InputEventMouseButton and _input_mode > 0 and \
+		p_event.get_button_index() == MOUSE_BUTTON_LEFT:
 		if p_event.is_pressed():
 			# If picking
 			if ui.is_picking():
@@ -279,9 +307,10 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 
 func _read_input(p_event: InputEvent = null) -> AfterGUIInput:
 	## Determine if user is moving camera or applying
+	var left_button_event: bool = p_event is InputEventMouseButton and \
+		p_event.get_button_index() == MOUSE_BUTTON_LEFT
 	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or \
-		p_event is InputEventMouseButton and p_event.is_released() and \
-		p_event.get_button_index() == MOUSE_BUTTON_LEFT:
+		left_button_event:
 			_input_mode = 1 
 	else:
 			_input_mode = 0
@@ -455,9 +484,14 @@ func is_selected() -> bool:
 func select_terrain() -> void:
 	if not is_instance_valid(_last_terrain) or not is_terrain_valid(_last_terrain):
 		return
-	# Do not touch the scene selection here: selecting the node would make the
-	# Inspector switch away from the clicked texture asset. Only restore the
-	# terrain tool UI, deferred so _make_visible() cannot hide it again.
+	# Showing the toolbar alone does not register this plugin for Scene input.
+	# Re-enter the actual node editor before the caller opens the asset in the
+	# Inspector; texture and mesh selection both use this path.
+	if not is_terrain_valid() or not is_selected():
+		var selection := EditorInterface.get_selection()
+		selection.clear()
+		selection.add_node(_last_terrain)
+		EditorInterface.edit_node(_last_terrain)
 	call_deferred("_restore_terrain_editor")
 
 func _restore_terrain_editor() -> void:

@@ -53,6 +53,9 @@ private:
 	struct Compositor {
 		// Compositor effects
 		Vector<RID> compositor_effects;
+		// FRP pipeline tokens. Empty means use the legacy stage-based path.
+		PackedInt32Array frp_pipeline;
+		PackedStringArray frp_pipeline_names;
 	};
 
 	mutable RID_Owner<Compositor, true> compositor_owner;
@@ -94,4 +97,8 @@ public:
 
 	void compositor_set_compositor_effects(RID p_compositor, const Vector<RID> &p_effects);
 	Vector<RID> compositor_get_compositor_effects(RID p_compositor, RSE::CompositorEffectCallbackType p_callback_type = RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY, bool p_enabled_only = true) const;
+
+	void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names);
+	PackedInt32Array compositor_get_frp_pipeline(RID p_compositor) const;
+	PackedStringArray compositor_get_frp_pipeline_names(RID p_compositor) const;
 };

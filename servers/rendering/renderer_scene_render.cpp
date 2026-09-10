@@ -32,6 +32,80 @@
 
 #include "core/variant/typed_array.h"
 
+static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline) {
+	if (p_pipeline.is_empty()) {
+		return true;
+	}
+
+	int native_positions[16];
+	for (int i = 0; i < 16; i++) {
+		native_positions[i] = -1;
+	}
+
+	for (int i = 0; i < p_pipeline.size(); i++) {
+		const int32_t token = p_pipeline[i];
+		if (token < 0) {
+			// INT32_MIN cannot be represented by the -(index + 1) encoding.
+			ERR_FAIL_COND_V_MSG(token < -INT32_MAX, false, "FRP pipeline custom effect tokens must be greater than INT32_MIN.");
+			continue;
+		}
+
+		ERR_FAIL_COND_V_MSG(token >= 16, false, "FRP pipeline built-in pass tokens must be in the range 0..15.");
+		ERR_FAIL_COND_V_MSG(native_positions[token] >= 0, false, "FRP pipeline cannot contain duplicate built-in pass tokens.");
+		native_positions[token] = i;
+	}
+
+	static const int mandatory_passes[] = { 0, 1, 2, 12, 15 };
+	for (int mandatory_pass : mandatory_passes) {
+		ERR_FAIL_COND_V_MSG(native_positions[mandatory_pass] < 0, false, "FRP pipeline is missing a mandatory built-in pass.");
+	}
+
+	static const int dependencies[][2] = {
+		{ 0, 1 },
+		{ 1, 2 },
+		{ 2, 3 },
+		{ 2, 4 },
+		{ 2, 5 },
+		{ 2, 6 },
+		{ 2, 7 },
+		{ 2, 8 },
+		{ 2, 9 },
+		{ 2, 10 },
+		{ 2, 11 },
+		{ 2, 12 },
+		{ 3, 5 },
+		{ 4, 5 },
+		{ 7, 8 },
+		{ 5, 9 },
+		{ 8, 9 },
+		{ 9, 10 },
+		{ 10, 11 },
+		{ 3, 12 },
+		{ 4, 12 },
+		{ 5, 12 },
+		{ 6, 12 },
+		{ 7, 12 },
+		{ 8, 12 },
+		{ 9, 12 },
+		{ 10, 12 },
+		{ 11, 12 },
+		{ 12, 13 },
+		{ 12, 14 },
+		{ 12, 15 },
+		{ 13, 14 },
+		{ 14, 15 },
+	};
+	for (const int *dependency : dependencies) {
+		const int before = dependency[0];
+		const int after = dependency[1];
+		if (native_positions[before] >= 0 && native_positions[after] >= 0) {
+			ERR_FAIL_COND_V_MSG(native_positions[before] >= native_positions[after], false, "FRP pipeline built-in pass order violates dependency constraints.");
+		}
+	}
+
+	return true;
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // CameraData
 
@@ -245,6 +319,14 @@ void RendererSceneRender::compositor_set_compositor_effects(RID p_compositor, co
 	}
 
 	compositor_storage.compositor_set_compositor_effects(p_compositor, rids);
+}
+
+void RendererSceneRender::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) {
+	ERR_FAIL_COND_MSG(!compositor_storage.is_compositor(p_compositor), "Invalid compositor RID.");
+	ERR_FAIL_COND_MSG(!_validate_frp_pipeline(p_pipeline), "Invalid FRP pipeline schedule.");
+	ERR_FAIL_COND_MSG(!p_names.is_empty() && p_names.size() != p_pipeline.size(), "FRP pipeline names must match the token count.");
+
+	compositor_storage.compositor_set_frp_pipeline(p_compositor, p_pipeline, p_names);
 }
 
 /* Environment API */

@@ -2,13 +2,16 @@
 
 ## 地形材质
 
-选中 Terrain3D，打开 **Assets → Texture Array**；地形材质面板的 **Texture Array** 按钮也能进入。
+选中 Terrain3D，在底部资产面板打开 **Terrain → Texture Array**。
 
 - 每个地形独立持有数组和设置。数组按 Layer ID 自动排列，最多 32 层。
 - Albedo/Height 与 Normal/Roughness 分别存为一张 Texture2DArray，共用层序号。它们是同一套地形材质的两个通道数组。
 - Size：Auto 使用第一个有效贴图的尺寸，也可指定统一尺寸。
 - Mipmaps：默认开启；法线 Mipmap 会重新归一化。
-- Compression：默认 BC7，也可选择 Uncompressed。保留 Alpha 中的高度与粗糙度；HDR 输入需选择 Uncompressed，使用 RGBAF，避免静默截断。
+- Compression：默认 BC7；可选 Uncompressed、BC1/3/4/5/6H/7、ETC1、ETC2 RGB/RGBA、EAC R11/RG11、ASTC 4×4/8×8（LDR/HDR）。覆盖当前 Image 编码接口能生成的格式；BC2、带符号 EAC、ETC2 Punchthrough 等仅可解码的格式不作为生成选项。
+- BC7、BC3、ETC2 RGBA、ASTC RGBA 保留 Alpha 中的高度与粗糙度；RGB/R/RG 选项会丢失相应通道，Info 的 channel_warning 会提示。BC4/BC5 并不适合直接保留完整地形材质。
+- HDR 输入可选择 Uncompressed（RGBAF）、BC6H 或 HDR ASTC。BC6H 不保存 Alpha，且数组内不能混用带负值与全非负的层；不兼容的输入会保留上一套数组并报告原因。
+- 显卡不支持选定格式时，插件解压后上传；Info 的 gpu_fallback/gpu_note 显示回退状态，encoded_bytes 与 gpu_bytes 分别显示编码数据大小和上传数据大小。压缩格式能生成不代表当前显卡能节省对应显存。
 - Info 显示层数、尺寸、实际格式、Mipmap 和两张数组的估算 GPU 数据字节数。
 
 新增 Layer、替换贴图、调整数组设置会自动更新。源贴图不被修改；缺失通道使用占位图。准备失败会保留上一套可用数组。准备好的层在内存中缓存，修改某层不会重新压缩其他未变化的层；第一次加载仍需处理源图，尚无磁盘烘焙缓存。
@@ -22,7 +25,7 @@
 - Mix：按坡度混合。阈值来自 Weight Level，过渡锐度使用 Background 的 Slope Blend Sharpness，坡度衰减使用 Overlay 的 Slope Based Damp。
 - 切换材质或修改笔刷尺寸不会覆盖材质保存的坡度参数。
 
-**Terrain Maps** 打开实际地图数据；面板视图菜单可直接显示 Heightmap、Material IDs、Material Weight、Slope。
+**Terrain → Terrain Maps** 打开实际地图数据；**Terrain → Debug Views** 可显示 Heightmap、Material IDs、Material Weight、Slope。管理入口收在单个菜单内，避免窄列换行抬高整个底部面板；仍可拖动面板边界调整高度。
 
 - Height Maps：地形几何高度图，RF。
 - Surface Maps：实际材质 ID 图，R16 UNORM。它同时编码两个 5 位材质 ID、2 位混合模式、3 位权重等级与 1 位 UV 标志。没有另一张独立的 Weightmap。
@@ -35,13 +38,15 @@
 
 ### 三层架构
 
-- **FengRenderer**（Resource）：声明式管线，`passes` 列表；`apply(compositor)` 把启用的 pass 按阶段分组写入 `Compositor.compositor_effects`，并自动挂载隐藏的 `FengTextureManager`。
+- **FengRenderer**（Resource）：`passes` 包含 16 个原生组合步骤与自定义效果；`apply(compositor)` 上传列表顺序及名称，自动挂载隐藏的 `FengTextureManager`。满足数据依赖的条目可跨原生步骤移动。
 - **FengPass**（CompositorEffect）：单个 pass，`stage` + `inputs` + `outputs`；子类实现 `_render()`。`FengShaderPass` 提供 compute 与全屏光栅两种模式。
 - **FengCompositor**（Compositor）：绑定 renderer 后自动同步 effects；pass 的 `enabled` 由引擎原生即时生效。
 
 中间纹理由 `FengTextureManager` 在 Pre GBuffer 阶段按 `FengPassOutput` 声明自动创建（scope `"frp_pipeline"`），分辨率切换自动重建；pass 通过 `Source.PIPELINE` 按名引用。
 
-在 Camera3D 或 WorldEnvironment 的 **Compositor → Compositor Effects** 添加 CompositorEffect 脚本资源。设置 Effect Callback Type 选择阶段，拖动数组元素可改变同阶段的执行顺序，Enabled 可单独关闭 Pass。沿用 Godot 的 RenderingDevice 回调和资源生命周期，无需另建一套渲染 API。
+把 FengCompositor 挂到 WorldEnvironment 或当前 Camera3D，并为其 Renderer 指定资源。仅在文件系统创建或选中 FengRenderer 不会应用到场景；编辑器自由视角使用自己的相机，WorldEnvironment 可让它也使用同一配置。完整列表、约束和自动同步规则见 [FRP 插件说明](../misc/feng-addons/feng-render-pipeline/README.md)。
+
+以下阶段表用于普通 Compositor 的兼容路径：在 Compositor Effects 添加脚本资源，Effect Callback Type 选择阶段，同阶段按数组顺序执行。FengRenderer 的显式列表以实际位置为准。
 
 | 实际执行顺序 | 可用数据 |
 | --- | --- |
@@ -58,7 +63,7 @@
 | Pre Transparent → Transparent → Post Transparent | 原有透明与后处理入口 |
 | 内建后处理与输出 | 引擎阶段 |
 
-阶段之间遵守数据依赖。拖动数组不会让 Pre Lighting 跑到 GBuffer 前；排序发生在同一个阶段内。这与 [Unity URP 的注入点](https://docs.unity.cn/Packages/com.unity.render-pipelines.universal%4017.0/manual/customize/custom-pass-injection-points.html)相同。新增阶段仅在 FRP 中调用；旧枚举数值不变，旧场景保持兼容。
+兼容路径的排序发生在同一阶段内；旧枚举数值不变。显式 FengRenderer 列表通过资源依赖检查约束排序，并在 Pass 边界建立底层命令依赖，避免 GPU 命令跨条目重排。
 
 在回调中通过 `render_data.get_render_scene_buffers()` 访问 RenderSceneBuffersRD：
 
@@ -71,7 +76,9 @@ var normal = buffers.get_texture("frp_clustered", "normal_roughness")
 var depth = buffers.get_depth_texture()
 ```
 
-不要把纹理 RID 跨分辨率切换、视口销毁保存。MSAA 开启时，Post GBuffer / Pre Lighting 读取解析后的单采样 GBuffer；Post Lighting 需要解析颜色时设置 Access Resolved Color。写解析颜色不会自动回写 MSAA 附件，后续 MSAA 解析可能覆盖它；输出颜色效果推荐放在 Post Transparent。回调运行在渲染线程，不能直接修改场景树。
+不要把纹理 RID 跨分辨率切换、视口销毁保存。MSAA 开启时，Post GBuffer / Pre Lighting 读取解析后的单采样 GBuffer；需要解析颜色时设置 Access Resolved Color。显式 FengRenderer 路径会在自定义 Pass 位置解析所需附件，并把颜色写回 MSAA 附件；普通 Compositor 的旧阶段路径不提供这项回写。回调运行在渲染线程，不能直接修改场景树。
+
+RenderDoc 中展开 **FRP Scene → 序号与 Pass 名称 → 内部操作**，即可找到 GBuffer 几何绘制和全屏延迟光照。当前地形 Shader 使用顶点变形，几何绘制归入 **Opaque Forward Fallback**。最终把 Scene 纹理合成到编辑器 UI 的绘制不是场景几何。D3D12 编辑器无需额外启用 PIX 即可输出标签；Vulkan 非开发构建需用 `--verbose` 启用 debug utils。关闭或本帧没有 GPU 工作的条目不会产生事件。
 
 ## 本轮修正与优化范围
 
@@ -100,3 +107,15 @@ var depth = buffers.get_depth_texture()
 Compute、透视/正交、MSAA 关闭/2×/4×的画面回归。D3D12 另验证点光源和面积光。
 地形通过数组设置、材质列表编辑、R16 笔刷 GPU 上传/撤销重做、坡度对比与地图视图测试。
 本轮未提供 FPS 百分比基准，也未覆盖所有 GI、XR、多视图与第三方自定义 Shader 组合。
+
+## 新建地形
+
+选择一个尚无区域的 Terrain3D 节点时，编辑器会要求选择项目内的地形数据目录。
+选择空目录会在当前 Scene 相机前方的地面网格中创建一个 64×64 区域，并立即写入
+`terrain3d*.res`。新地形关闭 World Background，仅渲染真实区域。场景会标记为已修改，
+按 Ctrl+S 保存节点的数据目录和材质设置；之后保存场景也会保存地形编辑。
+
+选择已有区域文件的目录会加载已有地形，不覆盖其区域大小或背景设置。取消选择不会
+创建区域；可以在 Terrain 菜单的 Initialize Terrain… 重试。已有区域的地形不会
+自动初始化。要扩大地形，选择 Add Region（E）并在空白地面上点击；该工具通过地面
+平面定位，因此不依赖无限背景或已有地形几何。

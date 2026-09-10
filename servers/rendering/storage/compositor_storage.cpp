@@ -174,6 +174,27 @@ void RendererCompositorStorage::compositor_set_compositor_effects(RID p_composit
 	}
 }
 
+void RendererCompositorStorage::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) {
+	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
+	ERR_FAIL_NULL(compositor);
+
+	compositor->frp_pipeline = p_pipeline;
+	compositor->frp_pipeline_names = p_names;
+}
+
+PackedStringArray RendererCompositorStorage::compositor_get_frp_pipeline_names(RID p_compositor) const {
+	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
+	ERR_FAIL_NULL_V(compositor, PackedStringArray());
+	return compositor->frp_pipeline_names;
+}
+
+PackedInt32Array RendererCompositorStorage::compositor_get_frp_pipeline(RID p_compositor) const {
+	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
+	ERR_FAIL_NULL_V(compositor, PackedInt32Array());
+
+	return compositor->frp_pipeline;
+}
+
 Vector<RID> RendererCompositorStorage::compositor_get_compositor_effects(RID p_compositor, RSE::CompositorEffectCallbackType p_callback_type, bool p_enabled_only) const {
 	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
 	ERR_FAIL_NULL_V(compositor, Vector<RID>());

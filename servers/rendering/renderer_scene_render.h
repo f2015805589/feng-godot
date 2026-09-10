@@ -102,6 +102,7 @@ public:
 	bool is_compositor(RID p_compositor) const;
 
 	void compositor_set_compositor_effects(RID p_compositor, const TypedArray<RID> &p_effects);
+	void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names);
 
 	/* ENVIRONMENT API */
 

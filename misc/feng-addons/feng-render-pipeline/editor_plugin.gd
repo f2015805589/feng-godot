@@ -1,17 +1,65 @@
 @tool
 extends EditorPlugin
-## Adds an "Add Pass from Library" menu that instantiates library pass
-## templates into the selected FengRenderer.
+## Adds an "Add Pass from Library" menu for FengRenderer resources.
+##
+## FengRenderer and FengCompositor are resources, so the inspector's edited
+## object is the source of truth. Scene selection is deliberately not used:
+## either resource can be nested in a scene or edited as a standalone .tres.
 
 const Renderer = preload("renderer.gd")
 const CompositorScript = preload("compositor.gd")
 const PassBase = preload("passes/pass_base.gd")
+const BuiltinPass = preload("passes/builtin_pass.gd")
+
+const LIBRARY_DIR := "res://addons/feng-render-pipeline/library"
+const TRACKED_RENDERER_METADATA := [
+	"_synced_library",
+	"_synced_library_ids",
+	"_deleted_library",
+	"_deleted_library_ids",
+	"_pipeline_schema_version",
+]
+
+
+class FengRendererInspectorPlugin extends EditorInspectorPlugin:
+	var _renderer_script: Script
+
+	func _init(renderer_script: Script) -> void:
+		_renderer_script = renderer_script
+
+	func _can_handle(object: Object) -> bool:
+		return object != null and object.get_script() == _renderer_script
+
+	func _parse_begin(object: Object) -> void:
+		if object == null or not object.has_method("get_configuration_warnings"):
+			return
+		var warnings: PackedStringArray = object.call("get_configuration_warnings")
+		if warnings.is_empty():
+			return
+
+		var panel := VBoxContainer.new()
+		panel.name = "FengRendererConfigurationWarnings"
+		var heading := Label.new()
+		heading.text = "FRP schedule warnings"
+		heading.add_theme_color_override("font_color", Color(1.0, 0.76, 0.34))
+		panel.add_child(heading)
+		for warning in warnings:
+			var label := Label.new()
+			label.text = "• " + warning
+			label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			panel.add_child(label)
+		add_custom_control(panel)
+
 
 var _menu: PopupMenu
-var _library_paths: Array[String] = []
+var _inspector_plugin
+var _library_entries: Array[Dictionary] = []
 
 func _enter_tree() -> void:
-	# add_tool_submenu_item() reparents the popup into the editor tool menu and
+	_inspector_plugin = FengRendererInspectorPlugin.new(Renderer)
+	add_inspector_plugin(_inspector_plugin)
+
+	# add_tool_submenu_item() reparents popup into the editor tool menu and
 	# requires it to be parentless; adding it as a child first trips the
 	# ERR_FAIL_COND in EditorNode::add_tool_submenu_item.
 	if _menu != null:
@@ -25,6 +73,9 @@ func _enter_tree() -> void:
 	_refresh_library()
 
 func _exit_tree() -> void:
+	if _inspector_plugin != null:
+		remove_inspector_plugin(_inspector_plugin)
+		_inspector_plugin = null
 	if _menu != null:
 		# The menu is parented to the editor tool menu, not to this plugin.
 		# remove_tool_menu_item() detaches and deletes it; queue_free() alone
@@ -33,55 +84,277 @@ func _exit_tree() -> void:
 		_menu = null
 
 func _refresh_library() -> void:
-	_menu.clear()
-	_library_paths.clear()
-	var dir := DirAccess.open("res://addons/feng-render-pipeline/library")
-	if dir == null:
+	if _menu == null:
 		return
-	dir.list_dir_begin()
-	var entry := dir.get_next()
-	while entry != "":
-		if dir.current_is_dir():
-			var sub := DirAccess.open("res://addons/feng-render-pipeline/library/" + entry)
-			if sub != null:
-				sub.list_dir_begin()
-				var file := sub.get_next()
-				while file != "":
-					if not sub.current_is_dir() and file.ends_with(".tres"):
-						var path := "res://addons/feng-render-pipeline/library/%s/%s" % [entry, file]
-						_menu.add_item(entry.capitalize(), _library_paths.size())
-						_library_paths.append(path)
-					file = sub.get_next()
-				sub.list_dir_end()
-		entry = dir.get_next()
-	dir.list_dir_end()
+	_menu.clear()
+	_library_entries.clear()
+
+	# The manifest is the canonical order and gives entries a stable identity.
+	# Scan afterward so a locally added template is still available before the
+	# next manifest update.
+	var manifest_paths := {}
+	for manifest in Renderer.DEFAULT_LIBRARY_ENTRIES:
+		var path := LIBRARY_DIR + "/" + String(manifest["path"])
+		manifest_paths[path] = true
+		if ResourceLoader.exists(path):
+			_add_library_entry(path, manifest)
+
+	var directories: Array[String] = []
+	var root := DirAccess.open(LIBRARY_DIR)
+	if root == null:
+		return
+	root.list_dir_begin()
+	var directory_name := root.get_next()
+	while directory_name != "":
+		if root.current_is_dir() and not directory_name.begins_with("."):
+			directories.append(directory_name)
+		directory_name = root.get_next()
+	root.list_dir_end()
+	directories.sort()
+
+	for directory in directories:
+		var sub := DirAccess.open(LIBRARY_DIR + "/" + directory)
+		if sub == null:
+			continue
+		var files: Array[String] = []
+		sub.list_dir_begin()
+		var file_name := sub.get_next()
+		while file_name != "":
+			if not sub.current_is_dir() and file_name.ends_with(".tres"):
+				files.append(file_name)
+			file_name = sub.get_next()
+		sub.list_dir_end()
+		files.sort()
+		for file in files:
+			var path := LIBRARY_DIR + "/%s/%s" % [directory, file]
+			if not manifest_paths.has(path):
+				_add_library_entry(path, {})
+
+func _add_library_entry(path: String, manifest: Dictionary) -> void:
+	var template = load(path)
+	if template == null or not template is PassBase:
+		return
+
+	var label := ""
+	if template is Resource:
+		label = String(template.resource_name).strip_edges()
+	if label == "" and not manifest.is_empty():
+		label = String(manifest.get("name", "")).strip_edges()
+	if label == "":
+		label = path.get_file().get_basename().replace("_", " ").capitalize()
+	label = _make_unique_library_label(label, path)
+
+	var menu_id := _library_entries.size()
+	_library_entries.append({"path": path, "manifest": manifest, "label": label})
+	_menu.add_item(label, menu_id)
+	_menu.set_item_tooltip(menu_id, path)
+
+func _make_unique_library_label(base: String, path: String) -> String:
+	var label := base
+	if not _library_label_exists(label):
+		return label
+	var directory := path.get_base_dir().get_file().replace("_", " ").capitalize()
+	var file_stem := path.get_file().get_basename().replace("_", " ").capitalize()
+	var suffix := directory if directory != "" else file_stem
+	label = "%s (%s)" % [base, suffix]
+	var ordinal := 2
+	while _library_label_exists(label):
+		label = "%s (%s %d)" % [base, file_stem, ordinal]
+		ordinal += 1
+	return label
+
+func _library_label_exists(label: String) -> bool:
+	for entry in _library_entries:
+		if entry.get("label", "") == label:
+			return true
+	return false
 
 func _on_library_item(id: int) -> void:
-	if id < 0 or id >= _library_paths.size():
-		return
-	var template = load(_library_paths[id])
-	if template == null:
-		push_error("FengRenderPipeline: cannot load library template %s" % _library_paths[id])
+	if id < 0 or id >= _library_entries.size():
 		return
 	var renderer = _find_selected_renderer()
 	if renderer == null:
-		push_error("FengRenderPipeline: select a FengRenderer resource in the inspector first.")
+		push_error("FengRenderPipeline: edit a FengRenderer or FengCompositor resource in the inspector first.")
 		return
-	var instance = template.duplicate()
-	renderer.passes.append(instance)
-	# Mark the library path as synced so the auto-sync does not add a second
-	# copy of the same pass.
-	renderer.mark_library_pass(_library_paths[id])
-	EditorInterface.get_inspector().refresh()
+
+	var path: String = _library_entries[id]["path"]
+	var template = load(path)
+	if template == null or not template is PassBase:
+		push_error("FengRenderPipeline: cannot load library template %s" % path)
+		return
+	var instance = template.duplicate(true) as PassBase
+	var manifest: Variant = _manifest_for_path(path)
+	if manifest != null:
+		instance.stable_id = String(manifest["id"])
+		instance.resource_name = String(manifest["name"])
+
+	var current: Array = renderer.passes.duplicate()
+	var next: Array = current.duplicate()
+	var insert_index := _library_insert_index(current, instance.stable_id)
+	next.insert(insert_index, instance)
+	var metadata := _metadata_after_library_add(renderer, path)
+	_record_renderer_change(renderer, next, "Add FRP Pass from Library", metadata)
+	_refresh_inspector()
+
+## Move an authored pass using the same whole-array transaction as the library
+## menu. This is used by editor controls and keeps reordering undoable even
+## when a renderer contains library metadata or tombstones.
+func move_pass(renderer, from_index: int, to_index: int) -> void:
+	if renderer == null:
+		return
+	var current: Array = renderer.passes.duplicate()
+	if from_index < 0 or from_index >= current.size() or to_index < 0 or to_index >= current.size() or from_index == to_index:
+		return
+	var next: Array = current.duplicate()
+	var moved = next.pop_at(from_index)
+	next.insert(to_index, moved)
+	_record_renderer_change(renderer, next, "Move FRP Pass", _snapshot_renderer_metadata(renderer))
+	_refresh_inspector()
+
+func _record_renderer_change(renderer, next_passes: Array, action_name: String, next_metadata: Dictionary) -> void:
+	var old_passes: Array = renderer.passes.duplicate()
+	var old_metadata := _snapshot_renderer_metadata(renderer)
+	var undo_redo = get_undo_redo()
+	if undo_redo == null:
+		renderer.passes = next_passes
+		_apply_renderer_metadata(renderer, next_metadata)
+		renderer.emit_changed()
+		return
+
+	# The renderer is the custom context, so the editor associates nested
+	# resource edits with the renderer rather than the selected scene object.
+	undo_redo.create_action(action_name, UndoRedo.MERGE_DISABLE, renderer)
+	undo_redo.add_do_property(renderer, "passes", next_passes)
+	undo_redo.add_undo_property(renderer, "passes", old_passes)
+	for property_name in TRACKED_RENDERER_METADATA:
+		undo_redo.add_do_property(renderer, property_name, next_metadata[property_name])
+		undo_redo.add_undo_property(renderer, property_name, old_metadata[property_name])
+	# Metadata is exported storage and its setter does not necessarily emit a
+	# Resource.changed notification. Explicit notifications keep inspector,
+	# compositor synchronization, and scene/resource save state current on both
+	# sides of the undo action.
+	undo_redo.add_do_method(renderer, "emit_changed")
+	undo_redo.add_undo_method(renderer, "emit_changed")
+	undo_redo.commit_action()
+
+func _snapshot_renderer_metadata(renderer) -> Dictionary:
+	var metadata := {}
+	for property_name in TRACKED_RENDERER_METADATA:
+		var value = renderer.get(property_name)
+		metadata[property_name] = value.duplicate() if value is Array else value
+	return metadata
+
+func _apply_renderer_metadata(renderer, metadata: Dictionary) -> void:
+	for property_name in TRACKED_RENDERER_METADATA:
+		renderer.set(property_name, metadata[property_name])
+
+func _metadata_after_library_add(renderer, path: String) -> Dictionary:
+	var metadata := _snapshot_renderer_metadata(renderer)
+	var normalized := _normalize_library_path(path)
+	var manifest: Variant = _manifest_for_path(path)
+	var synced_paths: Array = metadata["_synced_library"]
+	var synced_ids: Array = metadata["_synced_library_ids"]
+	var deleted_paths: Array = metadata["_deleted_library"]
+	var deleted_ids: Array = metadata["_deleted_library_ids"]
+	if manifest != null:
+		var manifest_path: String = manifest["path"]
+		var stable_id: String = manifest["id"]
+		_append_unique(synced_paths, manifest_path)
+		_append_unique(synced_ids, stable_id)
+		deleted_paths.erase(manifest_path)
+		deleted_paths.erase(stable_id)
+		deleted_ids.erase(stable_id)
+	else:
+		_append_unique(synced_paths, normalized)
+	metadata["_synced_library"] = synced_paths
+	metadata["_synced_library_ids"] = synced_ids
+	metadata["_deleted_library"] = deleted_paths
+	metadata["_deleted_library_ids"] = deleted_ids
+	return metadata
+
+func _append_unique(values: Array, value: String) -> void:
+	if value != "" and not values.has(value):
+		values.append(value)
+
+func _manifest_for_path(path: String):
+	var normalized := _normalize_library_path(path)
+	for manifest in Renderer.DEFAULT_LIBRARY_ENTRIES:
+		if normalized == String(manifest["path"]) or normalized == String(manifest["id"]):
+			return manifest
+	return null
+
+func _normalize_library_path(path: String) -> String:
+	var normalized := path.replace("\\", "/")
+	var prefix := LIBRARY_DIR + "/"
+	if normalized.begins_with(prefix):
+		return normalized.substr(prefix.length())
+	return normalized
+
+func _library_insert_index(passes: Array, stable_id: StringName) -> int:
+	var temporal_index := passes.size()
+	var history_index := -1
+	for i in passes.size():
+		var pass_entry = passes[i]
+		if pass_entry is BuiltinPass:
+			var native_id: int = pass_entry.native_id
+			if native_id == 14:
+				temporal_index = i
+				break
+			if native_id == 13:
+				history_index = i
+	if temporal_index == passes.size() and history_index >= 0:
+		temporal_index = history_index + 1
+
+	var new_order := _default_library_order(stable_id)
+	if new_order < 0:
+		return temporal_index
+	var next_default := -1
+	var next_order := 100000
+	var previous_default := -1
+	var previous_order := -1
+	for i in temporal_index:
+		var existing = passes[i]
+		if existing == null:
+			continue
+		var existing_order := _default_library_order(existing.stable_id)
+		if existing_order < 0:
+			continue
+		if existing_order > new_order and existing_order < next_order:
+			next_default = i
+			next_order = existing_order
+		if existing_order < new_order and existing_order > previous_order:
+			previous_default = i
+			previous_order = existing_order
+	if next_default >= 0:
+		return next_default
+	if previous_default >= 0:
+		return previous_default + 1
+	return temporal_index
+
+func _default_library_order(stable_id: StringName) -> int:
+	for i in Renderer.DEFAULT_LIBRARY_ENTRIES.size():
+		if String(Renderer.DEFAULT_LIBRARY_ENTRIES[i]["id"]) == String(stable_id):
+			return i
+	return -1
 
 func _find_selected_renderer():
-	var selection := EditorInterface.get_selection()
-	if selection == null:
+	var edited = _get_edited_object()
+	if edited == null:
 		return null
-	for node in selection.get_selected_nodes():
-		var script: Script = node.get_script()
-		if script == Renderer:
-			return node
-		if script == CompositorScript:
-			return node.renderer
+	var script = edited.get_script()
+	if script == Renderer:
+		return edited
+	if script == CompositorScript:
+		return edited.renderer
 	return null
+
+func _get_edited_object():
+	var inspector := EditorInterface.get_inspector()
+	return inspector.get_edited_object() if inspector != null else null
+
+func _refresh_inspector() -> void:
+	var inspector := EditorInterface.get_inspector()
+	if inspector != null:
+		var edited = inspector.get_edited_object()
+		if edited != null:
+			edited.notify_property_list_changed()

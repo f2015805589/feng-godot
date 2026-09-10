@@ -14,6 +14,35 @@
 
 #include <utility>
 
+namespace {
+struct ArrayCodec {
+	const char *name;
+	Image::CompressMode mode;
+	Image::UsedChannels channels;
+	bool hdr;
+	Image::ASTCFormat block;
+};
+const ArrayCodec ARRAY_CODECS[] = {
+	{"Uncompressed", Image::COMPRESS_MAX, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4},
+	{"BC7", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
+	{"BC1 RGB", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
+	{"BC3 RGBA", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
+	{"BC4 R", Image::COMPRESS_S3TC, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4},
+	{"BC5 RG", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4},
+	{"BC6H HDR RGB", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGB, true, Image::ASTC_FORMAT_4x4},
+	{"ETC1 RGB", Image::COMPRESS_ETC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
+	{"ETC2 RGB", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
+	{"ETC2 RGBA", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
+	{"EAC R11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4},
+	{"EAC RG11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4},
+	{"ASTC 4x4 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
+	{"ASTC 8x8 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_8x8},
+	{"ASTC 4x4 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4},
+	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8},
+};
+static_assert(sizeof(ARRAY_CODECS) / sizeof(ArrayCodec) == Terrain3DAssets::ARRAY_COMPRESSION_MAX);
+} // namespace
+
 ///////////////////////////
 // Private Functions
 ///////////////////////////
@@ -203,9 +232,10 @@ void Terrain3DAssets::_update_texture_files() {
 
 	// A Terrain3DAssets resource manages this terrain's two channel arrays.
 	// All layers follow explicit authoring settings, independent of imports.
+	const ArrayCodec &codec = ARRAY_CODECS[_texture_array_compression];
 	Dictionary next_cache;
 	auto prepare_layers = [&](bool p_normal, TypedArray<Image> &r_layers) -> bool {
-		Image::Format working_format = Image::FORMAT_RGBA8;
+		Image::Format working_format = (_texture_array_compression != ARRAY_UNCOMPRESSED && codec.hdr) ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
 		Vector2i size = _texture_array_size > 0 ? V2I(_texture_array_size) : V2I_ZERO;
 		for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
 			Ref<Texture2D> texture;
@@ -220,9 +250,9 @@ void Terrain3DAssets::_update_texture_files() {
 					return false;
 				}
 				Image::Format format = image->get_format();
-				if ((format >= Image::FORMAT_RF && format <= Image::FORMAT_RGBE9995) || format == Image::FORMAT_BPTC_RGBF || format == Image::FORMAT_BPTC_RGBFU) {
-					if (_texture_array_compression == ARRAY_BC7) {
-						LOG(ERROR, "HDR terrain textures require Texture Array > Compression = Uncompressed. Retaining previous arrays.");
+				if ((format >= Image::FORMAT_RF && format <= Image::FORMAT_RGBE9995) || format == Image::FORMAT_BPTC_RGBF || format == Image::FORMAT_BPTC_RGBFU || format == Image::FORMAT_ASTC_4x4_HDR || format == Image::FORMAT_ASTC_8x8_HDR) {
+					if (!codec.hdr) {
+						LOG(ERROR, "HDR terrain textures require Uncompressed, BC6H or HDR ASTC. Retaining previous arrays.");
 						return false;
 					}
 					working_format = Image::FORMAT_RGBAF;
@@ -273,16 +303,25 @@ void Terrain3DAssets::_update_texture_files() {
 				LOG(ERROR, "Cannot generate texture mipmaps; retaining previous arrays.");
 				return false;
 			}
-			if (_texture_array_compression == ARRAY_BC7) {
-				// Generic preserves all four authored channels, including packed
-				// height/roughness; normal-map compression may discard alpha.
-				if (image->compress(Image::COMPRESS_BPTC, Image::COMPRESS_SOURCE_GENERIC) != OK) {
-					LOG(ERROR, "BC7 encoder unavailable. Select Uncompressed in Terrain Assets > Texture Array.");
+			if (_texture_array_compression != ARRAY_UNCOMPRESSED) {
+				// Explicit channels keep every array layer in the same format even
+				// when one source happens to have opaque alpha or fewer used channels.
+				if (image->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !image->is_compressed()) {
+					LOG(ERROR, "Encoder unavailable for ", codec.name, "; retaining previous arrays.");
 					return false;
 				}
 			}
 			r_layers[i] = image;
 			next_cache[key] = image;
+		}
+		// Validate cache hits too (BC6H chooses signed or unsigned per layer).
+		Ref<Image> first = r_layers[0];
+		for (int i = 1; i < r_layers.size(); i++) {
+			Ref<Image> image = r_layers[i];
+			if (image->get_format() != first->get_format() || image->get_size() != first->get_size() || image->has_mipmaps() != first->has_mipmaps()) {
+				LOG(ERROR, "Array layers require matching formats and dimensions. For BC6H, do not mix signed and unsigned HDR layers. Retaining previous arrays.");
+				return false;
+			}
 		}
 		return true;
 	};
@@ -292,9 +331,38 @@ void Terrain3DAssets::_update_texture_files() {
 	if (!prepare_layers(false, albedo_layers) || !prepare_layers(true, normal_layers)) {
 		return;
 	}
+	// Decode unsupported formats before upload so array previews remain readable.
+	const char *feature = "";
+	switch (codec.mode) {
+		case Image::COMPRESS_S3TC: feature = (codec.channels == Image::USED_CHANNELS_R || codec.channels == Image::USED_CHANNELS_RG) ? "rgtc" : "s3tc"; break;
+		case Image::COMPRESS_BPTC: feature = "bptc"; break;
+		case Image::COMPRESS_ETC:
+		case Image::COMPRESS_ETC2: feature = "etc2"; break;
+		case Image::COMPRESS_ASTC: feature = codec.hdr ? "astc_hdr" : "astc"; break;
+		default: break;
+	}
+	const bool fallback = _texture_array_compression != ARRAY_UNCOMPRESSED && !RenderingServer::get_singleton()->has_os_feature(feature);
+	TypedArray<Image> albedo_upload = albedo_layers;
+	TypedArray<Image> normal_upload = normal_layers;
+	if (fallback) {
+		albedo_upload = albedo_layers.duplicate();
+		normal_upload = normal_layers.duplicate();
+		for (TypedArray<Image> *layers : { &albedo_upload, &normal_upload }) {
+			for (int i = 0; i < layers->size(); i++) {
+				Ref<Image> encoded = (*layers)[i];
+				Ref<Image> decoded = encoded->duplicate();
+				if (decoded->decompress() != OK) {
+					LOG(ERROR, "Cannot decode unsupported GPU format; retaining previous arrays.");
+					return;
+				}
+				decoded->convert(codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8);
+				(*layers)[i] = decoded;
+			}
+		}
+	}
 	GeneratedTexture albedo;
 	GeneratedTexture normal;
-	if (!albedo.create(albedo_layers).is_valid() || !normal.create(normal_layers).is_valid()) {
+	if (!albedo.create(albedo_upload).is_valid() || !normal.create(normal_upload).is_valid()) {
 		albedo.clear();
 		normal.clear();
 		LOG(ERROR, "Cannot create terrain texture arrays; keeping previous arrays.");
@@ -308,9 +376,19 @@ void Terrain3DAssets::_update_texture_files() {
 	_texture_array_info["layers"] = albedo_layers.size();
 	_texture_array_info["albedo_size"] = albedo_first->get_size();
 	_texture_array_info["normal_size"] = normal_first->get_size();
-	_texture_array_info["format"] = albedo_first->get_format() == Image::FORMAT_BPTC_RGBA ? "BC7" : (albedo_first->get_format() == Image::FORMAT_RGBAF ? "RGBAF" : "RGBA8");
+	_texture_array_info["format"] = _texture_array_compression == ARRAY_UNCOMPRESSED ? (albedo_first->get_format() == Image::FORMAT_RGBAF ? "RGBAF" : "RGBA8") : codec.name;
+	_texture_array_info["albedo_image_format"] = albedo_first->get_format();
+	_texture_array_info["normal_image_format"] = normal_first->get_format();
+	_texture_array_info["channel_warning"] = codec.channels == Image::USED_CHANNELS_RGBA ? "" : "This format drops channels, including packed height/roughness in alpha. RGBA formats preserve the complete terrain material.";
 	_texture_array_info["mipmaps"] = albedo_first->has_mipmaps();
-	_texture_array_info["gpu_bytes"] = (albedo_first->get_data().size() + normal_first->get_data().size()) * albedo_layers.size();
+	_texture_array_info["encoded_bytes"] = (albedo_first->get_data().size() + normal_first->get_data().size()) * albedo_layers.size();
+	Ref<Image> albedo_gpu = albedo_upload[0];
+	Ref<Image> normal_gpu = normal_upload[0];
+	_texture_array_info["gpu_bytes"] = (albedo_gpu->get_data().size() + normal_gpu->get_data().size()) * albedo_upload.size();
+	_texture_array_info["gpu_fallback"] = fallback;
+	_texture_array_info["albedo_upload_format"] = albedo_gpu->get_format();
+	_texture_array_info["normal_upload_format"] = normal_gpu->get_format();
+	_texture_array_info["gpu_note"] = fallback ? "GPU does not support this codec; decoded upload uses uncompressed memory." : "Native GPU format";
 	notify_property_list_changed();
 	std::swap(_generated_albedo_textures, albedo);
 	std::swap(_generated_normal_textures, normal);
@@ -342,7 +420,7 @@ void Terrain3DAssets::set_texture_array_mipmaps(bool p_enabled) {
 }
 
 void Terrain3DAssets::set_texture_array_compression(TextureArrayCompression p_compression) {
-	if (p_compression < ARRAY_UNCOMPRESSED || p_compression > ARRAY_BC7 || _texture_array_compression == p_compression) {
+	if (p_compression < ARRAY_UNCOMPRESSED || p_compression >= ARRAY_COMPRESSION_MAX || _texture_array_compression == p_compression) {
 		return;
 	}
 	_texture_array_compression = p_compression;
@@ -753,6 +831,21 @@ Error Terrain3DAssets::save(const String &p_path) {
 void Terrain3DAssets::_bind_methods() {
 	BIND_ENUM_CONSTANT(ARRAY_UNCOMPRESSED);
 	BIND_ENUM_CONSTANT(ARRAY_BC7);
+	BIND_ENUM_CONSTANT(ARRAY_BC1);
+	BIND_ENUM_CONSTANT(ARRAY_BC3);
+	BIND_ENUM_CONSTANT(ARRAY_BC4);
+	BIND_ENUM_CONSTANT(ARRAY_BC5);
+	BIND_ENUM_CONSTANT(ARRAY_BC6H);
+	BIND_ENUM_CONSTANT(ARRAY_ETC1);
+	BIND_ENUM_CONSTANT(ARRAY_ETC2_RGB);
+	BIND_ENUM_CONSTANT(ARRAY_ETC2_RGBA);
+	BIND_ENUM_CONSTANT(ARRAY_EAC_R11);
+	BIND_ENUM_CONSTANT(ARRAY_EAC_RG11);
+	BIND_ENUM_CONSTANT(ARRAY_ASTC_4X4);
+	BIND_ENUM_CONSTANT(ARRAY_ASTC_8X8);
+	BIND_ENUM_CONSTANT(ARRAY_ASTC_4X4_HDR);
+	BIND_ENUM_CONSTANT(ARRAY_ASTC_8X8_HDR);
+
 	ClassDB::bind_method(D_METHOD("set_texture_array_size", "size"), &Terrain3DAssets::set_texture_array_size);
 	ClassDB::bind_method(D_METHOD("get_texture_array_size"), &Terrain3DAssets::get_texture_array_size);
 	ClassDB::bind_method(D_METHOD("set_texture_array_mipmaps", "enabled"), &Terrain3DAssets::set_texture_array_mipmaps);
@@ -763,7 +856,7 @@ void Terrain3DAssets::_bind_methods() {
 	ADD_GROUP("Texture Array", "texture_array_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_array_size", PROPERTY_HINT_ENUM, "Auto:0,64:64,128:128,256:256,512:512,1024:1024,2048:2048,4096:4096,8192:8192"), "set_texture_array_size", "get_texture_array_size");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "texture_array_mipmaps"), "set_texture_array_mipmaps", "get_texture_array_mipmaps");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_array_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7"), "set_texture_array_compression", "get_texture_array_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_array_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_texture_array_compression", "get_texture_array_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "texture_array_info", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY), "", "get_texture_array_info");
 	ADD_GROUP("", "");
 	BIND_ENUM_CONSTANT(TYPE_TEXTURE);

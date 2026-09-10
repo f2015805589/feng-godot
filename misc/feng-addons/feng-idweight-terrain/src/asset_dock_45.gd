@@ -848,6 +848,8 @@ class ListEntry extends MarginContainer:
 		button_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		add_child(button_row, true)
 
+		# Icon clicks must not reach the tile selection handler: it refreshes
+		# the list on press, before these buttons receive their release.
 		if type == Terrain3DAssets.TYPE_MESH:
 			button_enabled.set_texture_normal(enabled_icon)
 			button_enabled.set_texture_pressed(disabled_icon)
@@ -856,7 +858,7 @@ class ListEntry extends MarginContainer:
 			button_enabled.set_visible(resource != null)
 			button_enabled.tooltip_text = "Enable Instances"
 			button_enabled.toggle_mode = true
-			button_enabled.mouse_filter = Control.MOUSE_FILTER_PASS
+			button_enabled.mouse_filter = Control.MOUSE_FILTER_STOP
 			button_enabled.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 			button_enabled.pressed.connect(_on_enable)
 			button_row.add_child(button_enabled, true)
@@ -867,7 +869,7 @@ class ListEntry extends MarginContainer:
 		button_highlight.set_visible(resource != null)
 		button_highlight.tooltip_text = "Highlight " + ( "Instances" if type == Terrain3DAssets.TYPE_MESH else "Texture" )
 		button_highlight.toggle_mode = true
-		button_highlight.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_highlight.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_highlight.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_highlight.set_pressed_no_signal(is_highlighted)
 		button_highlight.pressed.connect(_on_highlight)
@@ -878,7 +880,7 @@ class ListEntry extends MarginContainer:
 		button_edit.set_h_size_flags(Control.SIZE_SHRINK_END)
 		button_edit.set_visible(resource != null)
 		button_edit.tooltip_text = "Edit Asset"
-		button_edit.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_edit.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_edit.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_edit.pressed.connect(_on_edit)
 		button_row.add_child(button_edit, true)
@@ -892,7 +894,7 @@ class ListEntry extends MarginContainer:
 		button_clear.set_h_size_flags(Control.SIZE_SHRINK_END)
 		button_clear.set_visible(resource != null)
 		button_clear.tooltip_text = "Clear Asset"
-		button_clear.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_clear.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_clear.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_clear.pressed.connect(_on_clear)
 		button_row.add_child(button_clear, true)

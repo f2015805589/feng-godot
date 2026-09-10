@@ -5,6 +5,7 @@ const SETTING_EXE := "renderdoc/capture/executable_path"
 
 var button: Button
 var _busy := false
+var _capture_forced_viewports: Array = []
 
 
 func _enter_tree() -> void:
@@ -20,6 +21,10 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	# A plugin can be disabled or hot-reloaded while the capture wait is still
+	# suspended. Restore the editor's original update modes before the nodes are
+	# detached so an interrupted capture cannot leave a viewport running forever.
+	_restore_capture_viewports(_capture_forced_viewports)
 	EditorInterface.get_editor_settings().settings_changed.disconnect(_settings_changed)
 	if is_instance_valid(button):
 		remove_control_from_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_MENU, button)
@@ -66,7 +71,15 @@ func _on_capture_pressed() -> void:
 	_busy = true
 	button.disabled = true
 	var previous_count := FengRenderDoc.get_capture_count()
+	# The editor deliberately stops rendering unchanged viewports while it is
+	# idle.  A static scene can therefore miss the one Present that RenderDoc
+	# waits for, or leave the scene SubViewport stale while the editor chrome is
+	# redrawn.  Keep the visible 3D editor viewports alive for this one capture.
+	var forced_viewports: Array = _prepare_capture_viewports()
+	_capture_forced_viewports = forced_viewports
+	EditorInterface.get_base_control().queue_redraw()
 	if not FengRenderDoc.trigger_capture(button.get_window().get_window_id()):
+		_restore_capture_viewports(forced_viewports)
 		_busy = false
 		button.disabled = false
 		_warning("Could not trigger a capture in the current editor.")
@@ -76,12 +89,19 @@ func _on_capture_pressed() -> void:
 	EditorInterface.get_base_control().queue_redraw()
 	var deadline := Time.get_ticks_msec() + 30000
 	while is_inside_tree() and FengRenderDoc.get_capture_count() <= previous_count and Time.get_ticks_msec() < deadline:
+		# Keep a static editor scene producing Presents while RenderDoc waits for
+		# the capture boundary.  This also covers viewports that were already in
+		# UPDATE_ALWAYS but would otherwise go idle after one redraw.
+		EditorInterface.get_base_control().queue_redraw()
 		await get_tree().create_timer(0.1).timeout
 	if not is_inside_tree():
+		_restore_capture_viewports(forced_viewports)
 		return
+	var capture_count := FengRenderDoc.get_capture_count()
+	_restore_capture_viewports(forced_viewports)
 	_busy = false
 	button.disabled = false
-	if FengRenderDoc.get_capture_count() <= previous_count:
+	if capture_count <= previous_count:
 		_warning("RenderDoc did not capture a presented editor frame within 30 seconds.")
 		return
 	var capture := FengRenderDoc.get_capture_path(previous_count)
@@ -100,3 +120,32 @@ func _status(message: String) -> void:
 
 func _warning(message: String) -> void:
 	EditorInterface.get_editor_toaster().push_toast(message, EditorToaster.SEVERITY_WARNING)
+
+
+func _prepare_capture_viewports() -> Array:
+	var forced: Array = []
+	for index in range(4):
+		var viewport = EditorInterface.get_editor_viewport_3d(index)
+		if viewport == null or not is_instance_valid(viewport):
+			continue
+		# SubViewport is a Node rather than a CanvasItem, so visibility must be
+		# checked on its container when that container exposes CanvasItem's API.
+		var container = viewport.get_parent()
+		if container is CanvasItem and not container.is_visible_in_tree():
+			continue
+		var mode = viewport.get_update_mode()
+		if mode == SubViewport.UPDATE_ALWAYS:
+			continue
+		forced.append({"viewport": viewport, "mode": mode})
+		viewport.set_update_mode(SubViewport.UPDATE_ALWAYS)
+	return forced
+
+
+func _restore_capture_viewports(forced: Array) -> void:
+	for entry in forced:
+		var viewport = entry.get("viewport")
+		if viewport != null and is_instance_valid(viewport):
+			viewport.set_update_mode(entry.get("mode", SubViewport.UPDATE_WHEN_VISIBLE))
+	# Clearing the member makes restoration idempotent and releases stale node
+	# references after a completed or interrupted capture.
+	_capture_forced_viewports.clear()

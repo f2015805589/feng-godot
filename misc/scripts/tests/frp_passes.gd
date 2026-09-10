@@ -1,4 +1,4 @@
-﻿extends SceneTree
+extends SceneTree
 
 const FRP_PASS = preload("res://addons/feng-render-pipeline/passes/shader_pass.gd")
 const FRP_BASE = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
@@ -6,10 +6,11 @@ const FRP_TEXTURE = preload("res://addons/feng-render-pipeline/passes/pass_textu
 const FRP_OUTPUT = preload("res://addons/feng-render-pipeline/passes/pass_output.gd")
 const FRP_MANAGER = preload("res://addons/feng-render-pipeline/passes/texture_manager.gd")
 
-class PaintPass extends CompositorEffect:
+class PaintPass extends FRP_BASE:
 	var color := Color.GREEN
 	var calls := 0
 	func _init(stage: int, value: Color) -> void:
+		self.stage = stage
 		effect_callback_type = stage
 		color = value
 
@@ -57,11 +58,137 @@ class PaintPass extends CompositorEffect:
 			rd.draw_list_end()
 			rd.free_rid(fb)
 
+class ScreenPaintPass extends FRP_BASE:
+	var color := Color.GREEN
+	var calls := 0
+
+	func _init(stage: int, value: Color) -> void:
+		self.stage = stage
+		effect_callback_type = stage
+		color = value
+
+	func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
+		calls += 1
+		var target := buffers.get_color_layer(view)
+		if not target.is_valid():
+			return
+		var framebuffer := rd.framebuffer_create([target])
+		if not framebuffer.is_valid():
+			return
+		var list := rd.draw_list_begin(framebuffer, RenderingDevice.DRAW_CLEAR_COLOR_0, [color])
+		rd.draw_list_end()
+		rd.free_rid(framebuffer)
+
 func require(value: bool, message: String) -> void:
 	if not value:
 		push_error("REGRESSION: " + message)
 		quit(1)
 		assert(value, message)
+
+func _has_property(value: Object, property_name: String) -> bool:
+	if value == null:
+		return false
+	for info in value.get_property_list():
+		if str(info.get("name", "")) == property_name:
+			return true
+	return false
+
+func _read_property(value: Object, property_name: String, fallback = null):
+	if not _has_property(value, property_name):
+		return fallback
+	return value.get(property_name)
+
+func _write_property(value: Object, property_name: String, new_value) -> bool:
+	if not _has_property(value, property_name):
+		return false
+	value.set(property_name, new_value)
+	return true
+
+func _native_id(value: Object) -> int:
+	var raw = _read_property(value, "native_id", -1)
+	if raw is int:
+		return raw
+	return -1
+
+func _pass_label(value: Object) -> String:
+	# Keep this tolerant of the concrete resource implementation. Native pass
+	# resources expose display_name, while Resource.resource_name is a useful
+	# fallback for saved .tres versions of the same resource.
+	for property_name in ["display_name", "pass_name", "label", "resource_name", "name"]:
+		var raw = _read_property(value, property_name, "")
+		if raw is String or raw is StringName:
+			var label := str(raw)
+			if not label.is_empty():
+				return label
+	return ""
+
+func _library_key(value: Object) -> String:
+	for property_name in ["library_path", "manifest_path", "source_path"]:
+		var raw = _read_property(value, property_name, "")
+		if raw is String or raw is StringName:
+			if not str(raw).is_empty():
+				return str(raw)
+	var shader = _read_property(value, "shader_file", null)
+	if shader is Resource:
+		return shader.resource_path
+	return ""
+
+func _library_matches(value: Object, manifest_path: String) -> bool:
+	var key := _library_key(value)
+	if key.is_empty():
+		return false
+	var normalized_key := key.replace("\\", "/")
+	var normalized_manifest := manifest_path.replace("\\", "/")
+	if normalized_key.ends_with(normalized_manifest):
+		return true
+	# A shader-backed pass normally reports the .glsl path while the persisted
+	# manifest records the companion .tres path.
+	var shader_manifest := normalized_manifest
+	if shader_manifest.ends_with(".tres"):
+		shader_manifest = shader_manifest.trim_suffix(".tres") + ".glsl"
+	return normalized_key.ends_with(shader_manifest)
+
+func _native_passes(renderer: Object) -> Array[FRP_BASE]:
+	var result: Array[FRP_BASE] = []
+	for value in renderer.passes:
+		if _native_id(value) >= 0:
+			result.append(value)
+	return result
+
+func _native_schedule_base(renderer: Object) -> Array[FRP_BASE]:
+	# Keep the renderer's library resources in the authored list so sync does
+	# not treat them as user deletions. Disable them for tests whose output is
+	# meant to isolate native scheduling.
+	var result: Array[FRP_BASE] = []
+	for value in renderer.passes:
+		if _native_id(value) < 0:
+			value.enabled = false
+		result.append(value)
+	return result
+
+func _native_pass(renderer: Object, native_id: int):
+	for value in renderer.passes:
+		if _native_id(value) == native_id:
+			return value
+	return null
+
+func _set_renderer_passes(renderer: Object, native_values: Array[FRP_BASE], custom_values: Array[FRP_BASE] = []) -> Array[FRP_BASE]:
+	var values: Array[FRP_BASE] = []
+	for value in native_values:
+		# Custom effects need to run while the internal color buffer exists. The
+		# temporal and tonemap operations are native 14 and 15, so put them just
+		# before those operations by default.
+		if _native_id(value) == 14:
+			values.append_array(custom_values)
+		values.append(value)
+	if custom_values.size() > 0 and not values.has(custom_values[0]):
+		values.append_array(custom_values)
+	renderer.passes = values
+	return values
+
+func _clear_frp_pipeline(compositor: Compositor) -> void:
+	if RenderingServer.has_method("compositor_set_frp_pipeline"):
+		RenderingServer.call("compositor_set_frp_pipeline", compositor.get_rid(), PackedInt32Array())
 
 func frame() -> Image:
 	for i in 8:
@@ -268,18 +395,23 @@ func run() -> void:
 	var blit_inputs: Array[FRP_TEXTURE] = [blit_in, blit_out]
 	blit_pass.inputs = blit_inputs
 	var renderer = renderer_script.new()
-	var renderer_passes: Array[FRP_BASE] = [raster_pass, blit_pass]
-	renderer.passes = renderer_passes
+	# The renderer now owns the native FRP operations as resources too. Keep
+	# those entries in this legacy composition test while replacing only the
+	# library shader entries with the two purpose-built passes below.
+	var renderer_native_passes := _native_schedule_base(renderer)
+	var renderer_custom_passes: Array[FRP_BASE] = [raster_pass, blit_pass]
+	var renderer_passes: Array[FRP_BASE] = _set_renderer_passes(renderer, renderer_native_passes, renderer_custom_passes)
 	renderer.apply(compositor)
 	image = await frame()
 	var raster_pixel := image.get_pixelv(center)
 	require(raster_pixel.r > 0.6 and raster_pixel.r < 0.85, "raster pass did not apply 0.5 tint: %s" % raster_pixel)
-	# Reordering the renderer list must re-apply effects in the new order.
+	# Reordering the renderer list must re-apply effects in the new order while
+	# retaining the native operation resources.
 	var tint2 = load("res://addons/feng-render-pipeline/examples/tint.tres")
 	require(tint2 != null, "tint.tres did not load")
 	tint2.parameters = Vector4(0.5, 1, 1, 1)
-	var reordered: Array[FRP_BASE] = [tint2, raster_pass, blit_pass]
-	renderer.passes = reordered
+	var reordered_custom: Array[FRP_BASE] = [tint2, raster_pass, blit_pass]
+	_set_renderer_passes(renderer, renderer_native_passes, reordered_custom)
 	renderer.apply(compositor)
 	image = await frame()
 	raster_pixel = image.get_pixelv(center)
@@ -294,6 +426,9 @@ func run() -> void:
 	print("PASS renderer composition, raster mode, reorder and native enabled toggle")
 
 	# M3: built-in library passes.
+	# The following checks intentionally exercise the legacy explicit effect
+	# list. Clear the unified native schedule before replacing that list.
+	_clear_frp_pipeline(compositor)
 	compositor.compositor_effects = []
 	image = await frame()
 	var baseline_pixel := image.get_pixelv(center)
@@ -379,6 +514,309 @@ func run() -> void:
 	require(found_missing, "renderer validation did not flag a missing pipeline texture")
 	bad_renderer = null
 	print("PASS editor-time renderer validation warnings")
+
+	# M5: unified native + resource-authored schedule. The native operations
+	# are represented by FengBuiltinPass entries, while library and user shader
+	# passes remain CompositorEffect-backed entries in the same list.
+	var unified_renderer = renderer_script2.new()
+	require(RenderingServer.has_method("compositor_set_frp_pipeline"), "engine does not expose compositor_set_frp_pipeline")
+	var native_values: Array[FRP_BASE] = _native_passes(unified_renderer)
+	require(native_values.size() == 16, "renderer must expose all 16 native FRP passes, got %d" % native_values.size())
+	var expected_native_names := [
+		"gbuffer", "preparation", "lighting", "fallback", "motion", "resolve",
+		"debug", "sky", "resolve", "specular", "copy", "transparent",
+		"resolve", "history", "temporal", "tonemap",
+	]
+	var native_ids := {}
+	for value in native_values:
+		var id := _native_id(value)
+		require(id >= 0 and id < 16, "native pass id out of range: %s" % id)
+		require(not native_ids.has(id), "duplicate native pass id: %s" % id)
+		native_ids[id] = value
+	for id in 16:
+		require(native_ids.has(id), "missing native pass id %d" % id)
+		var label := _pass_label(native_ids[id]).to_lower()
+		require(not label.is_empty(), "native pass %d has no display name" % id)
+		require(label.contains(expected_native_names[id]), "native pass %d has wrong display name '%s'" % [id, label])
+	# Native entries must retain their canonical relative order even when custom
+	# entries are inserted between them.
+	for i in native_values.size():
+		require(_native_id(native_values[i]) == i, "default native order changed at index %d" % i)
+
+	var manifest_property := ""
+	for candidate in ["_synced_library", "library_manifest", "_library_manifest"]:
+		if _has_property(unified_renderer, candidate):
+			manifest_property = candidate
+			break
+	require(not manifest_property.is_empty(), "renderer has no persisted library manifest")
+	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
+	require(manifest.size() >= 8, "renderer library manifest lost built-in entries: %s" % [manifest])
+	var library_entries := []
+	for value in unified_renderer.passes:
+		if _native_id(value) < 0 and not _library_key(value).is_empty():
+			library_entries.append(value)
+	require(library_entries.size() >= 8, "renderer did not instantiate the eight library shader passes")
+
+	# Save and load a renderer, then simulate an older resource whose final
+	# library entry was absent. Applying it must insert the missing template
+	# exactly once and preserve all native resources.
+	var sync_path := "user://frp_unified_schedule_%s.tres" % Time.get_ticks_usec()
+	var save_error := ResourceSaver.save(unified_renderer, sync_path)
+	require(save_error == OK, "unified renderer resource did not save: %s" % save_error)
+	var loaded_renderer = ResourceLoader.load(sync_path)
+	require(loaded_renderer != null, "unified renderer resource did not load")
+	var loaded_manifest: Array = _read_property(loaded_renderer, manifest_property, [])
+	require(not loaded_manifest.is_empty(), "loaded renderer library manifest is empty")
+	var missing_library_path := "fxaa/fxaa.tres"
+	var loaded_values: Array[FRP_BASE] = []
+	var removed_library := false
+	var missing_library_id := ""
+	for value in loaded_renderer.passes:
+		if not removed_library and _native_id(value) < 0 and _library_matches(value, missing_library_path):
+			removed_library = true
+			missing_library_id = str(value.stable_id)
+			continue
+		loaded_values.append(value)
+	require(removed_library, "could not find persisted library pass '%s' to remove" % missing_library_path)
+	# Remove both generations of the identity marker before replacing the list.
+	# The new renderer uses the stable ID array to recognize a deliberate
+	# deletion; clearing it first models a library entry introduced after this
+	# resource was saved. Do this before touching `passes` again because the
+	# lazy getter/setter may synchronize the library immediately.
+	loaded_manifest.erase(missing_library_path)
+	require(_write_property(loaded_renderer, manifest_property, loaded_manifest), "could not edit loaded library manifest")
+	for identity_property in ["_synced_library_ids", "_deleted_library", "_deleted_library_ids"]:
+		if not _has_property(loaded_renderer, identity_property):
+			continue
+		var identities: Array = _read_property(loaded_renderer, identity_property, [])
+		identities.erase(missing_library_path)
+		if not missing_library_id.is_empty():
+			identities.erase(missing_library_id)
+		_write_property(loaded_renderer, identity_property, identities)
+	var before_sync_count := 0
+	for value in loaded_values:
+		if _library_matches(value, missing_library_path):
+			before_sync_count += 1
+	loaded_renderer.passes = loaded_values
+	loaded_renderer.apply(compositor)
+	var after_sync_count := 0
+	for value in loaded_renderer.passes:
+		if _library_matches(value, missing_library_path):
+			after_sync_count += 1
+	require(before_sync_count == 0 and after_sync_count == 1, "library sync did not insert one missing pass: %d -> %d" % [before_sync_count, after_sync_count])
+	var surviving: Array[FRP_BASE] = []
+	var inserted_index := -1
+	var following_index := -1
+	for i in loaded_renderer.passes.size():
+		var entry = loaded_renderer.passes[i]
+		if _library_matches(entry, missing_library_path):
+			inserted_index = i
+		else:
+			surviving.append(entry)
+		if _library_matches(entry, "color-grade/color_grade.tres"):
+			following_index = i
+	require(surviving == loaded_values, "library sync reordered existing entries")
+	require(inserted_index >= 0 and inserted_index < following_index, "new middle library entry was appended instead of anchored")
+	print("PASS unified native ids/names/order and saved library sync")
+
+	# A newly authored resource must persist native enabled state and the
+	# position of a custom library pass across a save/load boundary.
+	var persisted_renderer = renderer_script2.new()
+	var persisted_values: Array[FRP_BASE] = _native_schedule_base(persisted_renderer)
+	var persisted_tint = null
+	for value in persisted_values:
+		if _native_id(value) < 0 and _library_matches(value, "tint/tint.tres"):
+			persisted_tint = value
+			break
+	require(persisted_tint != null, "could not find library tint pass in new renderer")
+	persisted_tint.enabled = true
+	var persisted_lighting = _native_pass(persisted_renderer, 7)
+	require(persisted_lighting != null, "could not find native sky pass for persistence test")
+	persisted_lighting.enabled = false
+	persisted_renderer.passes = persisted_values
+	var persisted_path := "user://frp_persisted_schedule_%s.tres" % Time.get_ticks_usec()
+	require(ResourceSaver.save(persisted_renderer, persisted_path) == OK, "new renderer resource did not save state")
+	var reloaded_renderer = ResourceLoader.load(persisted_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	require(reloaded_renderer != null, "new renderer resource did not reload state")
+	var reloaded_sky = _native_pass(reloaded_renderer, 7)
+	require(reloaded_sky != null and not reloaded_sky.enabled, "native enabled state was not persisted")
+	var reloaded_tint_index := -1
+	var reloaded_temporal_index := -1
+	for i in reloaded_renderer.passes.size():
+		var value = reloaded_renderer.passes[i]
+		if _native_id(value) < 0 and _library_matches(value, "tint/tint.tres"):
+			reloaded_tint_index = i
+		if _native_id(value) == 14:
+			reloaded_temporal_index = i
+	require(reloaded_tint_index >= 0 and reloaded_temporal_index > reloaded_tint_index, "custom library pass position was not persisted")
+	print("PASS renderer save/load preserves native state and custom order")
+
+	# Load a hand-authored legacy .tres with no schema version, only one custom
+	# pass and the old path manifest. Loading must leave the serialized list
+	# untouched until apply() performs migration; apply then adds native entries,
+	# assigns names, syncs new library entries, and keeps a deleted entry gone.
+	var legacy_path := "user://frp_legacy_renderer_%s.tres" % Time.get_ticks_usec()
+	var legacy_text := """[gd_resource type="Resource" script_class="FengRenderer" load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/renderer.gd" id="1_renderer"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_base.gd" id="2_pass_base"]
+[ext_resource type="Resource" path="res://addons/feng-render-pipeline/library/tint/tint.tres" id="3_tint"]
+
+[resource]
+script = ExtResource("1_renderer")
+passes = Array[ExtResource("2_pass_base")]([ExtResource("3_tint")])
+_synced_library = Array[String](["fxaa/fxaa.tres"])
+"""
+	var legacy_file := FileAccess.open(legacy_path, FileAccess.WRITE)
+	require(legacy_file != null, "could not create hand-authored legacy renderer resource")
+	legacy_file.store_string(legacy_text)
+	legacy_file = null
+	var legacy_renderer = ResourceLoader.load(legacy_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	require(legacy_renderer != null, "hand-authored legacy renderer did not load")
+	legacy_renderer.apply(compositor)
+	var migrated_native: Array[FRP_BASE] = _native_passes(legacy_renderer)
+	require(migrated_native.size() == 16, "legacy renderer migration did not restore native passes")
+	for i in migrated_native.size():
+		require(_native_id(migrated_native[i]) == i, "legacy migration changed native order at %d" % i)
+		var migrated_label := _pass_label(migrated_native[i]).to_lower()
+		require(migrated_label.contains(expected_native_names[i]), "legacy native pass %d name was not restored: '%s'" % [i, migrated_label])
+	var migrated_tint = null
+	var migrated_blur_h := 0
+	for value in legacy_renderer.passes:
+		if _library_matches(value, "tint/tint.tres"):
+			migrated_tint = value
+		if _library_matches(value, "fxaa/fxaa.tres"):
+			migrated_blur_h += 1
+	require(migrated_tint != null and _pass_label(migrated_tint).to_lower().contains("tint"), "legacy library pass did not receive its display name")
+	require(migrated_blur_h == 0, "deleted legacy library pass was re-added during sync")
+	var deleted_manifest: Array = _read_property(legacy_renderer, "_deleted_library", [])
+	require(deleted_manifest.has("fxaa/fxaa.tres"), "legacy deleted library entry was not recorded")
+	print("PASS legacy renderer migration, names, library sync and deletion tombstone")
+
+	# A disabled custom pass remains in the compositor effect list on initial
+	# apply. Enabling its native CompositorEffect flag must make it run on the
+	# next frame without another renderer.apply() call.
+	var toggle_renderer = renderer_script2.new()
+	var toggle_native: Array[FRP_BASE] = _native_schedule_base(toggle_renderer)
+	var toggle_pass := ScreenPaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_LIGHTING, Color.MAGENTA)
+	toggle_pass.enabled = false
+	var toggle_custom: Array[FRP_BASE] = [toggle_pass]
+	_set_renderer_passes(toggle_renderer, toggle_native, toggle_custom)
+	toggle_renderer.apply(compositor)
+	await frame()
+	var disabled_calls := toggle_pass.calls
+	require(disabled_calls == 0, "custom pass disabled before initial apply still ran (%d calls)" % disabled_calls)
+	toggle_pass.enabled = true
+	await frame()
+	require(toggle_pass.calls > disabled_calls, "custom pass did not run after enabling without re-apply")
+	print("PASS disabled custom pass initial apply and native enable toggle")
+
+	# FengCompositor listens to the renderer resource. Replacing the pass list
+	# after binding it must update the compositor's native schedule and effect
+	# slots without an explicit apply call.
+	var feng_compositor_script = load("res://addons/feng-render-pipeline/compositor.gd")
+	require(feng_compositor_script != null, "FengCompositor script did not load")
+	var reactive_compositor = feng_compositor_script.new()
+	var reactive_renderer = renderer_script2.new()
+	var reactive_native: Array[FRP_BASE] = _native_schedule_base(reactive_renderer)
+	var reactive_first := ScreenPaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_LIGHTING, Color.YELLOW)
+	var reactive_initial: Array[FRP_BASE] = [reactive_first]
+	_set_renderer_passes(reactive_renderer, reactive_native, reactive_initial)
+	reactive_compositor.renderer = reactive_renderer
+	camera.compositor = reactive_compositor
+	await frame()
+	var reactive_second := ScreenPaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_LIGHTING, Color.CYAN)
+	var reactive_edited: Array[FRP_BASE] = [reactive_first, reactive_second]
+	_set_renderer_passes(reactive_renderer, reactive_native, reactive_edited)
+	await frame()
+	require(reactive_second.calls > 0, "FengCompositor did not react to renderer pass-list edit")
+	print("PASS compositor notification on renderer list edit")
+
+	# Native fallback is optional, and its resource switch changes real draws.
+	var native_toggle_renderer = renderer_script2.new()
+	_native_schedule_base(native_toggle_renderer)
+	reactive_compositor.renderer = native_toggle_renderer
+	camera.compositor = reactive_compositor
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var lit_image := await frame()
+	require(lit_image.get_pixelv(center).r > 0.8, "native fallback baseline missing")
+	var native_fallback = _native_pass(native_toggle_renderer, 3)
+	native_fallback.enabled = false
+	var unlit_image := await frame()
+	require(unlit_image.get_pixelv(center).r < 0.1, "disabled native fallback still draws")
+	native_fallback.enabled = true
+	var restored_image := await frame()
+	require(restored_image.get_pixelv(center).r > 0.8, "re-enabled native fallback did not draw")
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+	camera.compositor = compositor
+	print("PASS native fallback disable/enable changes GPU output")
+
+	# Two consecutive color passes must preserve both writes under MSAA.
+	var msaa_renderer = renderer_script2.new()
+	var msaa_native := _native_schedule_base(msaa_renderer)
+	var half_a = load("res://addons/feng-render-pipeline/examples/tint.tres").duplicate(true)
+	half_a.enabled = true
+	half_a.parameters = Vector4(0.5, 1, 1, 1)
+	var half_b = half_a.duplicate(true)
+	var half_passes: Array[FRP_BASE] = [half_a, half_b]
+	_set_renderer_passes(msaa_renderer, msaa_native, half_passes)
+	msaa_renderer.apply(compositor)
+	for samples in [Viewport.MSAA_DISABLED, Viewport.MSAA_2X, Viewport.MSAA_4X]:
+		root.msaa_3d = samples
+		image = await frame()
+		var pixel := image.get_pixelv(center)
+		require(pixel.r > 0.45 and pixel.r < 0.62, "MSAA custom chain lost a write: %s %s" % [samples, pixel])
+	root.msaa_3d = Viewport.MSAA_DISABLED
+	print("PASS unified custom color chain with MSAA disabled/2x/4x")
+	var valid_order = msaa_renderer.passes.duplicate()
+	var valid_tokens = msaa_renderer.get_last_valid_schedule()
+	var invalid_order = valid_order.duplicate()
+	var first_native = invalid_order[0]
+	invalid_order[0] = invalid_order[1]
+	invalid_order[1] = first_native
+	msaa_renderer.passes = invalid_order
+	msaa_renderer.apply(compositor)
+	image = await frame()
+	require(msaa_renderer.get_last_valid_schedule() == valid_tokens, "Invalid order replaced the native schedule")
+	require(image.get_pixelv(center).r > 0.8, "Invalid configuration did not suspend custom effects")
+	msaa_renderer.passes = valid_order
+	msaa_renderer.apply(compositor)
+	image = await frame()
+	require(image.get_pixelv(center).r > 0.45 and image.get_pixelv(center).r < 0.62, "Correcting the order did not restore custom effects")
+	print("PASS invalid dependency order is rejected and recovers")
+
+	# A custom color write before deferred lighting is overwritten by the
+	# lighting pass; the same write after it changes the final opaque color.
+	# This proves that custom resources move with their list position across a
+	# real native operation without claiming current-frame color data before it
+	# exists.
+	var order_renderer = renderer_script2.new()
+	var order_native: Array[FRP_BASE] = _native_schedule_base(order_renderer)
+	_set_renderer_passes(order_renderer, order_native)
+	order_renderer.apply(compositor)
+	var order_baseline := await frame()
+	var baseline_order_pixel := order_baseline.get_pixelv(center)
+	var order_paint := ScreenPaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_LIGHTING, Color.GREEN)
+	var paint_after: Array[FRP_BASE] = [order_paint]
+	_set_renderer_passes(order_renderer, order_native, paint_after)
+	order_renderer.apply(compositor)
+	var after_lighting_image := await frame()
+	var after_lighting_pixel := after_lighting_image.get_pixelv(center)
+	require(after_lighting_pixel.r < baseline_order_pixel.r - 0.05, "custom write after lighting did not change GPU output: %s -> %s" % [baseline_order_pixel, after_lighting_pixel])
+	var paint_before_lighting: Array[FRP_BASE] = []
+	for value in order_native:
+		if _native_id(value) == 2:
+			paint_before_lighting.append(order_paint)
+		paint_before_lighting.append(value)
+	order_renderer.passes = paint_before_lighting
+	order_renderer.apply(compositor)
+	var before_lighting_image := await frame()
+	var before_lighting_pixel := before_lighting_image.get_pixelv(center)
+	require(before_lighting_pixel.r > after_lighting_pixel.r + 0.05 or before_lighting_pixel.g > after_lighting_pixel.g + 0.05 or before_lighting_pixel.b > after_lighting_pixel.b + 0.05, "moving custom write before deferred lighting had no GPU scheduling effect: %s -> %s" % [after_lighting_pixel, before_lighting_pixel])
+	print("PASS custom reorder across native deferred lighting")
+
+	_clear_frp_pipeline(compositor)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(sync_path))
 	scene.queue_free()
 	await process_frame
 	quit()

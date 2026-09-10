@@ -100,12 +100,16 @@ void CompositorEffect::_call_render_callback(int p_effect_callback_type, const R
 }
 
 void CompositorEffect::set_enabled(bool p_enabled) {
+	if (enabled == p_enabled) {
+		return;
+	}
 	enabled = p_enabled;
 	if (rid.is_valid()) {
 		RenderingServer *rs = RenderingServer::get_singleton();
 		ERR_FAIL_NULL(rs);
 		rs->compositor_effect_set_enabled(rid, enabled);
 	}
+	emit_changed();
 }
 
 bool CompositorEffect::get_enabled() const {
@@ -113,6 +117,9 @@ bool CompositorEffect::get_enabled() const {
 }
 
 void CompositorEffect::set_effect_callback_type(EffectCallbackType p_callback_type) {
+	if (effect_callback_type == p_callback_type) {
+		return;
+	}
 	effect_callback_type = p_callback_type;
 	notify_property_list_changed();
 
@@ -121,6 +128,7 @@ void CompositorEffect::set_effect_callback_type(EffectCallbackType p_callback_ty
 		ERR_FAIL_NULL(rs);
 		rs->compositor_effect_set_callback(rid, RSE::CompositorEffectCallbackType(effect_callback_type), callable_mp(this, &CompositorEffect::_call_render_callback));
 	}
+	emit_changed();
 }
 
 CompositorEffect::EffectCallbackType CompositorEffect::get_effect_callback_type() const {

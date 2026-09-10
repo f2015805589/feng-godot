@@ -11,11 +11,41 @@ import time
 
 import psutil
 
+from validate_capture import validate_capture
+
 
 REPO = Path(__file__).resolve().parents[4]
 BASE = Path(tempfile.mkdtemp(prefix="renderdoc-smoke-", dir=REPO / "bin"))
 PROJECT = BASE / "ui-project"
 shutil.copytree(Path(__file__).resolve().parent / "fixture", PROJECT)
+
+
+def stage_addons() -> None:
+    """Copy only the fixture's runtime addons into the isolated project.
+
+    The custom engine normally creates junctions for every addon in the
+    checkout.  A concurrent native-addon rebuild can then expose a temporary
+    ``~lib...`` DLL or half-written editor script to this smoke process.  Keep
+    this test's addon inputs physically isolated and leave unrelated terrain
+    addon names occupied so the engine does not create those junctions.
+    """
+    source_root = REPO / "misc" / "feng-addons"
+    target_root = PROJECT / "addons"
+    ignore = shutil.ignore_patterns("native", "bin", "tests", ".godot", "__pycache__", "~*")
+    for name in ("feng-render-pipeline", "feng-renderdoc-capture"):
+        shutil.copytree(source_root / name, target_root / name, ignore=ignore)
+    extension_source = source_root / "feng-renderdoc-capture" / "bin" / "libfeng-renderdoc-capture.windows.debug.x86_64.dll"
+    extension_target = target_root / "feng-renderdoc-capture" / "bin" / extension_source.name
+    extension_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(extension_source, extension_target)
+    # The engine's addon linker sees this directory as user-owned and leaves
+    # the unrelated terrain addon out of the fixture entirely.
+    terrain_target = target_root / "feng-idweight-terrain"
+    terrain_target.mkdir(parents=True, exist_ok=True)
+    (terrain_target / ".gdignore").write_text("", encoding="utf-8")
+
+
+stage_addons()
 for name in ["config", "cache"]:
     (BASE / name).mkdir()
 ENV = dict(os.environ, APPDATA=str(BASE / "config"), LOCALAPPDATA=str(BASE / "cache"))
@@ -33,22 +63,34 @@ PSAPI.GetModuleFileNameExW.argtypes = [
 ]
 
 
-def assert_attached(pid):
-    handle = KERNEL.OpenProcess(0x410, False, pid)
-    assert handle, "Original editor must still be alive"
-    try:
-        modules = (wintypes.HMODULE * 4096)()
-        size = wintypes.DWORD()
-        assert PSAPI.EnumProcessModulesEx(handle, modules, ctypes.sizeof(modules), ctypes.byref(size), 3)
-        assert size.value <= ctypes.sizeof(modules)
-        found = False
-        for module in modules[:size.value // ctypes.sizeof(wintypes.HMODULE)]:
-            name = ctypes.create_unicode_buffer(32768)
-            assert PSAPI.GetModuleFileNameExW(handle, module, name, len(name))
-            found |= name.value.lower().endswith("renderdoc.dll")
-        assert found, "Current editor rendering device must have RenderDoc attached"
-    finally:
-        KERNEL.CloseHandle(handle)
+def assert_attached(pid, timeout=8):
+    """Wait for PSAPI to expose the injected RenderDoc module.
+
+    The editor can print its completion marker before Windows has finished
+    publishing the module list to a second process.  Retry that read-only
+    query instead of turning a valid capture into a timing failure.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        handle = KERNEL.OpenProcess(0x410, False, pid)
+        if handle:
+            try:
+                modules = (wintypes.HMODULE * 4096)()
+                size = wintypes.DWORD()
+                if PSAPI.EnumProcessModulesEx(handle, modules, ctypes.sizeof(modules), ctypes.byref(size), 3):
+                    found = False
+                    count = min(size.value, ctypes.sizeof(modules)) // ctypes.sizeof(wintypes.HMODULE)
+                    for module in modules[:count]:
+                        name = ctypes.create_unicode_buffer(32768)
+                        if PSAPI.GetModuleFileNameExW(handle, module, name, len(name)):
+                            found |= name.value.lower().endswith("renderdoc.dll")
+                    if found:
+                        return
+            finally:
+                KERNEL.CloseHandle(handle)
+        time.sleep(0.1)
+    assert psutil.pid_exists(pid), "Original editor must still be alive"
+    raise AssertionError("Current editor rendering device must have RenderDoc attached")
 
 
 def close_test_gui(pid):
@@ -69,6 +111,17 @@ def close_test_gui(pid):
         psutil.Process(pid).wait(timeout=5)
     except psutil.NoSuchProcess:
         pass
+    except psutil.TimeoutExpired:
+        # This is the analyzer process found from our capture path.  Give it
+        # a bounded cleanup fallback so a slow qrenderdoc shutdown cannot
+        # leave the smoke run holding the next build's executable.
+        process = psutil.Process(pid)
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except psutil.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 startup = subprocess.STARTUPINFO()
@@ -88,7 +141,7 @@ with (BASE / "ui.log").open("wb") as log:
             time.sleep(0.5)
             if editor.poll() is None:
                 assert not any(child.name().lower().startswith("godot.") for child in psutil.Process(editor.pid).children(recursive=True)), "Capture must not launch another Godot process"
-            output = (BASE / "ui.log").read_text(errors="replace")
+            output = (BASE / "ui.log").read_text(encoding="utf-8", errors="replace")
             if checked or "UI_TEST_AFTER" not in output:
                 continue
             assert_attached(editor.pid)
@@ -103,6 +156,7 @@ with (BASE / "ui.log").open("wb") as log:
                 assert all(path.is_file() and path.stat().st_size > 0 for path in captures)
                 gui_exe = Path(args[0])
                 subprocess.run([str(gui_exe.with_name("renderdoccmd.exe")), "thumb", "--out=" + str(BASE / "current_editor.png"), str(captures[0])], check=True, capture_output=True)
+                validate_capture(captures[0], gui_exe.with_name("renderdoccmd.exe"), BASE)
                 time.sleep(2)
                 close_test_gui(analyzer)
                 assert_attached(editor.pid)
@@ -115,10 +169,11 @@ with (BASE / "ui.log").open("wb") as log:
             editor.terminate()
             editor.wait(5)
 
-output = (BASE / "ui.log").read_text(errors="replace")
+output = (BASE / "ui.log").read_text(encoding="utf-8", errors="replace")
 assert checked and analyzer is not None, output
 assert "SCRIPT ERROR" not in output, output
-result = (PROJECT / "capture_result.cfg").read_text()
+assert "ERROR:" not in output, output
+result = (PROJECT / "capture_result.cfg").read_text(encoding="utf-8")
 assert "overlay=0" in result and "pid=" + str(editor.pid) in result, result
 assert not (PROJECT / ".godot/renderdoc/sessions").exists(), "No snapshot jobs should be created"
 print("PASS: EXE setting, original PID, disabled overlay, and no background captures")

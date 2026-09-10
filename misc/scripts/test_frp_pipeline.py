@@ -45,4 +45,16 @@ def run(name, extra, marker=None):
 run("import", ["--editor", "--recovery-mode", "--import"])
 run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_passes.gd")],
     "PASS configurable compute pass shader, bindings, parameters and enabled state")
+# Exercise actual inspector resource selection and editor undo/redo as well.
+editor_test = project / "addons/frp-editor-tests"
+editor_test.mkdir()
+shutil.copyfile(ROOT / "misc/scripts/tests/frp_editor.gd", editor_test / "test.gd")
+(editor_test / "plugin.cfg").write_text(
+    '[plugin]\nname="FRP Editor Tests"\ndescription="Isolated regression"\n'
+    'author="Feng"\nversion="1"\nscript="test.gd"\n', encoding="utf-8"
+)
+with (project / "project.godot").open("a", encoding="utf-8") as config:
+    config.write('\n[editor_plugins]\nenabled=PackedStringArray("res://addons/frp-editor-tests/plugin.cfg")\n')
+run("editor", ["--editor", "--quit-after", "120"],
+    "PASS FRP editor resource selection, names, add, move, undo and redo")
 print("Logs:", project)

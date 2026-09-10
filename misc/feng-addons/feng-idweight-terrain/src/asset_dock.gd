@@ -11,7 +11,17 @@ const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
 const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
 const ES_DOCK_TAB: String = "terrain3d/dock/tab"
 
-var management_bar: HFlowContainer
+const MENU_INITIALIZE: int = 3
+const MENU_TEXTURE_ARRAY: int = 1
+const MENU_TERRAIN_MAPS: int = 2
+const MENU_DEBUG_SHADED: int = 10
+const MENU_DEBUG_HEIGHTMAP: int = 11
+const MENU_DEBUG_CONTROL_IDS: int = 12
+const MENU_DEBUG_CONTROL_WEIGHT: int = 13
+const MENU_DEBUG_SLOPE: int = 14
+
+var management_menu: MenuButton
+var debug_menu: PopupMenu
 var texture_list: ListContainer
 var mesh_list: ListContainer
 var current_list: ListContainer
@@ -89,35 +99,36 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	mesh_list.visible = false
 	asset_container.add_child(mesh_list, true)
 	current_list = texture_list
-	management_bar = HFlowContainer.new()
-	box.add_child(management_bar)
-	var array_button := Button.new()
-	array_button.text = "Texture Array"
-	array_button.tooltip_text = "Manage this terrain's layers, array resolution, mipmaps and BC7 compression."
-	array_button.pressed.connect(func():
+	# Keep the management controls in one menu item. A row of buttons inside the
+	# narrow vertical Buttons column wraps and makes the bottom dock grow several
+	# rows tall before the asset list gets any space.
+	management_menu = MenuButton.new()
+	management_menu.name = "ManagementMenu"
+	management_menu.text = "Terrain"
+	management_menu.tooltip_text = "Open terrain asset, map, and debug view controls."
+	management_menu.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_child(management_menu)
+	var management_popup := management_menu.get_popup()
+	management_popup.add_item("Initialize Terrain…", MENU_INITIALIZE)
+	management_popup.add_item("Texture Array", MENU_TEXTURE_ARRAY)
+	management_popup.add_item("Terrain Maps", MENU_TERRAIN_MAPS)
+	management_popup.add_separator()
+	debug_menu = PopupMenu.new()
+	debug_menu.name = "DebugViews"
+	debug_menu.add_radio_check_item("Shaded", MENU_DEBUG_SHADED)
+	debug_menu.add_radio_check_item("Heightmap", MENU_DEBUG_HEIGHTMAP)
+	debug_menu.add_radio_check_item("Material IDs", MENU_DEBUG_CONTROL_IDS)
+	debug_menu.add_radio_check_item("Material Weight", MENU_DEBUG_CONTROL_WEIGHT)
+	debug_menu.add_radio_check_item("Slope", MENU_DEBUG_SLOPE)
+	debug_menu.set_item_checked(0, true)
+	debug_menu.id_pressed.connect(_on_debug_view_selected)
+	debug_menu.about_to_popup.connect(_sync_debug_view_menu)
+	management_popup.add_submenu_node_item("Debug Views", debug_menu)
+	management_popup.id_pressed.connect(_on_management_menu_selected)
+	management_popup.about_to_popup.connect(func():
 		var terrain = plugin.get_terrain()
-		if terrain:
-			EditorInterface.edit_resource(terrain.assets))
-	management_bar.add_child(array_button)
-	var maps_button := Button.new()
-	maps_button.text = "Terrain Maps"
-	maps_button.tooltip_text = "Inspect live height maps and R16 surface maps (material IDs, blend mode and weight)."
-	maps_button.pressed.connect(func():
-		var terrain = plugin.get_terrain()
-		if terrain:
-			EditorInterface.inspect_object(terrain.data))
-	management_bar.add_child(maps_button)
-	var map_view := OptionButton.new()
-	for label in ["Shaded", "Heightmap", "Material IDs", "Material Weight", "Slope"]:
-		map_view.add_item(label)
-	map_view.item_selected.connect(func(index):
-		var terrain = plugin.get_terrain()
-		if terrain:
-			terrain.set_show_heightmap(index == 1)
-			terrain.set_show_control_texture(index == 2)
-			terrain.set_show_control_blend(index == 3)
-			terrain.set_show_slope(index == 4))
-	management_bar.add_child(map_view)
+		management_popup.set_item_disabled(management_popup.get_item_index(MENU_INITIALIZE),
+			not terrain or terrain.data.get_region_count() > 0))
 
 	load_editor_settings()
 
@@ -157,6 +168,57 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	_initialized = true
 	update_dock()
 	update_layout()
+
+
+func _on_management_menu_selected(p_id: int) -> void:
+	var terrain = plugin.get_terrain()
+	if not terrain:
+		return
+	match p_id:
+		MENU_INITIALIZE:
+			plugin.terrain_setup.request(terrain, true)
+		MENU_TEXTURE_ARRAY:
+			EditorInterface.edit_resource(terrain.assets)
+		MENU_TERRAIN_MAPS:
+			EditorInterface.inspect_object(terrain.data)
+
+
+func _on_debug_view_selected(p_id: int) -> void:
+	var terrain = plugin.get_terrain()
+	if not terrain:
+		return
+	var view_index: int = p_id - MENU_DEBUG_SHADED
+	if view_index < 0 or view_index > 4:
+		return
+	_set_debug_view_checked(view_index)
+	terrain.set_show_heightmap(view_index == 1)
+	terrain.set_show_control_texture(view_index == 2)
+	terrain.set_show_control_blend(view_index == 3)
+	terrain.set_show_slope(view_index == 4)
+
+
+func _set_debug_view_checked(p_index: int) -> void:
+	if not debug_menu:
+		return
+	for item_index in debug_menu.item_count:
+		debug_menu.set_item_checked(item_index, item_index == p_index)
+
+
+func _sync_debug_view_menu() -> void:
+	var terrain = plugin.get_terrain()
+	if not terrain:
+		_set_debug_view_checked(0)
+		return
+	var view_index: int = 0
+	if terrain.get_show_heightmap():
+		view_index = 1
+	elif terrain.get_show_control_texture():
+		view_index = 2
+	elif terrain.get_show_control_blend():
+		view_index = 3
+	elif terrain.get_show_slope():
+		view_index = 4
+	_set_debug_view_checked(view_index)
 
 
 func _gui_input(p_event: InputEvent) -> void:
@@ -215,18 +277,18 @@ func update_layout() -> void:
 	if size.x < 700:
 		box.vertical = true
 		buttons.vertical = false
-		management_bar.reparent(box)
+		management_menu.reparent(box)
 		search_box.reparent(box)
 		box.move_child(search_box, 1)
 		size_slider.reparent(box)
 		box.move_child(size_slider, 2)
-		box.move_child(management_bar, 3)
+		box.move_child(management_menu, 3)
 		pinned_btn.reparent(buttons)
 	else:
 	# Wide layout: buttons on left
 		box.vertical = false
 		buttons.vertical = true
-		management_bar.reparent(buttons)
+		management_menu.reparent(buttons)
 		search_box.reparent(buttons)
 		buttons.move_child(search_box, 0)
 		size_slider.reparent(buttons)
@@ -751,6 +813,8 @@ class ListEntry extends MarginContainer:
 		button_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		add_child(button_row, true)
 
+		# Icon clicks must not reach the tile selection handler: it refreshes
+		# the list on press, before these buttons receive their release.
 		if type == Terrain3DAssets.TYPE_MESH:
 			button_enabled.set_texture_normal(enabled_icon)
 			button_enabled.set_texture_pressed(disabled_icon)
@@ -759,7 +823,7 @@ class ListEntry extends MarginContainer:
 			button_enabled.set_visible(resource != null)
 			button_enabled.tooltip_text = "Enable Instances"
 			button_enabled.toggle_mode = true
-			button_enabled.mouse_filter = Control.MOUSE_FILTER_PASS
+			button_enabled.mouse_filter = Control.MOUSE_FILTER_STOP
 			button_enabled.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 			button_enabled.pressed.connect(_on_enable)
 			button_row.add_child(button_enabled, true)
@@ -770,7 +834,7 @@ class ListEntry extends MarginContainer:
 		button_highlight.set_visible(resource != null)
 		button_highlight.tooltip_text = "Highlight " + ( "Instances" if type == Terrain3DAssets.TYPE_MESH else "Texture" )
 		button_highlight.toggle_mode = true
-		button_highlight.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_highlight.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_highlight.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_highlight.set_pressed_no_signal(is_highlighted)
 		button_highlight.pressed.connect(_on_highlight)
@@ -781,7 +845,7 @@ class ListEntry extends MarginContainer:
 		button_edit.set_h_size_flags(Control.SIZE_SHRINK_END)
 		button_edit.set_visible(resource != null)
 		button_edit.tooltip_text = "Edit Asset"
-		button_edit.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_edit.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_edit.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_edit.pressed.connect(_on_edit)
 		button_row.add_child(button_edit, true)
@@ -795,7 +859,7 @@ class ListEntry extends MarginContainer:
 		button_clear.set_h_size_flags(Control.SIZE_SHRINK_END)
 		button_clear.set_visible(resource != null)
 		button_clear.tooltip_text = "Clear Asset"
-		button_clear.mouse_filter = Control.MOUSE_FILTER_PASS
+		button_clear.mouse_filter = Control.MOUSE_FILTER_STOP
 		button_clear.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 		button_clear.pressed.connect(_on_clear)
 		button_row.add_child(button_clear, true)

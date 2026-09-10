@@ -7833,6 +7833,11 @@ void RenderingDevice::draw_command_end_label() {
 	draw_graph.end_label();
 }
 
+void RenderingDevice::draw_command_insert_ordering_barrier() {
+	ERR_RENDER_THREAD_GUARD();
+	draw_graph.add_synchronization();
+}
+
 String RenderingDevice::get_device_vendor_name() const {
 	return _get_device_vendor_name(device);
 }
