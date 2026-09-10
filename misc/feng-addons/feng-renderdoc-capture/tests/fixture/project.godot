@@ -2,7 +2,7 @@ config_version=5
 [application]
 config/name="RenderDoc UI test"
 [rendering]
-renderer/rendering_method="deferred"
+renderer/rendering_method="frp"
 rendering_device/driver.windows="d3d12"
 [editor_plugins]
 enabled=PackedStringArray("res://addons/feng-renderdoc-capture/plugin.cfg", "res://addons/test_driver/plugin.cfg")

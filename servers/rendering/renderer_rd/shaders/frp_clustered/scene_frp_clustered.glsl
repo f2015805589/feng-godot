@@ -7,7 +7,7 @@
 /* Include half precision types. */
 #include "../half_inc.glsl"
 
-#include "scene_deferred_clustered_inc.glsl"
+#include "scene_frp_clustered_inc.glsl"
 
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
@@ -878,7 +878,7 @@ void main() {
 /* Include half precision types. */
 #include "../half_inc.glsl"
 
-#include "scene_deferred_clustered_inc.glsl"
+#include "scene_frp_clustered_inc.glsl"
 
 /* Varyings */
 

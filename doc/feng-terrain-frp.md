@@ -1,4 +1,4 @@
-# 地形数组与 Deferred Pass
+# 地形数组与 FRP Pass
 
 ## 地形材质
 
@@ -29,37 +29,45 @@
 - Control Maps：保留洞、自动材质等旧控制元数据。材质笔刷与吸管使用 Surface Maps。
 - 贴图 Albedo Alpha 中的 Height 是材质微观高度，与地形几何 Height Maps 不同。
 
-## 自定义 Deferred Pass
+## 自定义 FRP Pass
 
-随引擎提供 **FengComputePass** 与 **FengPassTexture**，可在 Inspector 配置 Shader、纹理输入输出、参数和工作组。`addons/feng-render-pipeline/examples/tint.tres` 是可直接拖入的示例；复杂效果仍可继承 CompositorEffect。
+随引擎提供 **FengPass** 系列资源，可在 Inspector 配置 Shader、纹理输入输出、参数和工作组。`addons/feng-render-pipeline/library/` 提供 tint/blur/fxaa/color-grade/bloom-lite 内置模板；`examples/tint.tres` 是可直接拖入的示例；复杂效果仍可继承 CompositorEffect。
+
+### 三层架构
+
+- **FengRenderer**（Resource）：声明式管线，`passes` 列表；`apply(compositor)` 把启用的 pass 按阶段分组写入 `Compositor.compositor_effects`，并自动挂载隐藏的 `FengTextureManager`。
+- **FengPass**（CompositorEffect）：单个 pass，`stage` + `inputs` + `outputs`；子类实现 `_render()`。`FengShaderPass` 提供 compute 与全屏光栅两种模式。
+- **FengCompositor**（Compositor）：绑定 renderer 后自动同步 effects；pass 的 `enabled` 由引擎原生即时生效。
+
+中间纹理由 `FengTextureManager` 在 Pre GBuffer 阶段按 `FengPassOutput` 声明自动创建（scope `"frp_pipeline"`），分辨率切换自动重建；pass 通过 `Source.PIPELINE` 按名引用。
 
 在 Camera3D 或 WorldEnvironment 的 **Compositor → Compositor Effects** 添加 CompositorEffect 脚本资源。设置 Effect Callback Type 选择阶段，拖动数组元素可改变同阶段的执行顺序，Enabled 可单独关闭 Pass。沿用 Godot 的 RenderingDevice 回调和资源生命周期，无需另建一套渲染 API。
 
 | 实际执行顺序 | 可用数据 |
 | --- | --- |
-| Deferred: Pre GBuffer | 可准备自定义资源；当前帧的深度和颜色尚不可读 |
+| FRP: Pre GBuffer | 可准备自定义资源；当前帧的深度和颜色尚不可读 |
 | GBuffer + MSAA Resolve | 引擎必要阶段 |
-| Deferred: Post GBuffer | 深度、法线、材质数组 |
+| FRP: Post GBuffer | 深度、法线、材质数组 |
 | Pre Opaque | 保留原有回调，位于屏幕空间效果之前 |
 | SSAO / SSIL / GI 等 | 按启用状态运行 |
-| Deferred: Pre Lighting | 可修改 GBuffer；本帧光照颜色尚不可读 |
-| Deferred Lighting | 引擎必要阶段 |
-| Deferred: Post Lighting | 已有延迟光照颜色，还不包含 Forward Fallback 和天空 |
+| FRP: Pre Lighting | 可修改 GBuffer；本帧光照颜色尚不可读 |
+| FRP Lighting | 引擎必要阶段 |
+| FRP: Post Lighting | 已有延迟光照颜色，还不包含 Forward Fallback 和天空 |
 | Forward Fallback、Motion → Post Opaque | 包含不适合写入 GBuffer 的不透明材质 |
 | Sky → Post Sky | 天空完成 |
 | Pre Transparent → Transparent → Post Transparent | 原有透明与后处理入口 |
 | 内建后处理与输出 | 引擎阶段 |
 
-阶段之间遵守数据依赖。拖动数组不会让 Pre Lighting 跑到 GBuffer 前；排序发生在同一个阶段内。这与 [Unity URP 的注入点](https://docs.unity.cn/Packages/com.unity.render-pipelines.universal%4017.0/manual/customize/custom-pass-injection-points.html)相同。新增阶段仅在 Deferred 中调用；旧枚举数值不变，旧场景保持兼容。
+阶段之间遵守数据依赖。拖动数组不会让 Pre Lighting 跑到 GBuffer 前；排序发生在同一个阶段内。这与 [Unity URP 的注入点](https://docs.unity.cn/Packages/com.unity.render-pipelines.universal%4017.0/manual/customize/custom-pass-injection-points.html)相同。新增阶段仅在 FRP 中调用；旧枚举数值不变，旧场景保持兼容。
 
 在回调中通过 `render_data.get_render_scene_buffers()` 访问 RenderSceneBuffersRD：
 
 ```gdscript
 var buffers = render_data.get_render_scene_buffers()
-var albedo = buffers.get_texture("deferred_clustered", "gbuffer_albedo")
-var orm = buffers.get_texture("deferred_clustered", "gbuffer_orm")
-var emission = buffers.get_texture("deferred_clustered", "gbuffer_emission")
-var normal = buffers.get_texture("deferred_clustered", "normal_roughness")
+var albedo = buffers.get_texture("frp_clustered", "gbuffer_albedo")
+var orm = buffers.get_texture("frp_clustered", "gbuffer_orm")
+var emission = buffers.get_texture("frp_clustered", "gbuffer_emission")
+var normal = buffers.get_texture("frp_clustered", "normal_roughness")
 var depth = buffers.get_depth_texture()
 ```
 
@@ -84,7 +92,7 @@ var depth = buffers.get_depth_texture()
 
 - `misc/feng-addons/feng-idweight-terrain/native/tests/texture_layers.gd`：真实 GPU 数组读取、刷材质、撤销、独立数组、平地与坡度画面对比、地图视图。
 - `misc/feng-addons/feng-idweight-terrain/native/tests/idweight`：R16 编码与坡度算法契约。
-- `misc/scripts/tests/deferred_passes.gd`：阶段调用、交换 Pass 后的实际画面、禁用 Pass、透视/正交及 MSAA。
+- `misc/scripts/tests/frp_passes.gd`：阶段调用、交换 Pass 后的实际画面、禁用 Pass、透视/正交及 MSAA。
 
 图形测试需要实际 D3D12 / Vulkan 驱动，不能使用 `--headless` 验证 GPU 画面。
 

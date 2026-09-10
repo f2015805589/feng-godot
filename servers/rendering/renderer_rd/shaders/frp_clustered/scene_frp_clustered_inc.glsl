@@ -23,7 +23,7 @@
 #define TANGENT_USED
 #endif
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(push_constant, std430) uniform DrawCall {
 	uint instance_index;
 	uint uv_offset;
@@ -237,7 +237,7 @@ struct Lightmap {
 	uint flags;
 };
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 8, std140) restrict readonly buffer Lightmaps {
 	Lightmap data[];
 }
@@ -248,26 +248,26 @@ struct LightmapCapture {
 	vec4 sh[9];
 };
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 9, std140) restrict readonly buffer LightmapCaptures {
 	LightmapCapture data[];
 }
 lightmap_captures;
 #endif
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 10) uniform texture2D decal_atlas;
 #endif
 layout(set = 0, binding = 11) uniform texture2D decal_atlas_srgb;
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 12, std430) restrict readonly buffer Decals {
 	DecalData data[];
 }
 decals;
 #endif
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 13, std430) restrict readonly buffer GlobalShaderUniformData {
 	vec4 data[];
 }
@@ -283,7 +283,7 @@ struct SDFVoxelGICascadeData {
 	float exposure_normalization;
 };
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 14, std140) uniform SDFGI {
 	vec3 grid_size;
 	uint max_cascades;
@@ -315,7 +315,7 @@ sdfgi;
 
 layout(set = 0, binding = 15) uniform sampler DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP;
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 0, binding = 16) uniform texture2D best_fit_normal_texture;
 #endif
 
@@ -383,7 +383,7 @@ struct InstanceData {
 #endif
 };
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 2, std430) buffer restrict readonly InstanceDataBuffer {
 	InstanceData data[];
 }
@@ -406,11 +406,11 @@ layout(set = 1, binding = 5) uniform texture2D shadow_atlas;
 
 layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 7) uniform texture2DArray lightmap_textures[MAX_LIGHTMAP_TEXTURES * 2];
 #endif
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 8) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_INSTANCES];
 #endif
 
@@ -419,7 +419,7 @@ layout(set = 1, binding = 9, std430) buffer restrict readonly ClusterBuffer {
 }
 cluster_buffer;
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 10) uniform sampler decal_sampler;
 #endif
 
@@ -427,32 +427,32 @@ layout(set = 1, binding = 11) uniform sampler light_projector_sampler;
 
 layout(set = 1, binding = 12 + 0) uniform sampler SAMPLER_NEAREST_CLAMP;
 layout(set = 1, binding = 12 + 1) uniform sampler SAMPLER_LINEAR_CLAMP;
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 2) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_CLAMP;
 #endif
 layout(set = 1, binding = 12 + 3) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP;
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 4) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_CLAMP;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 5) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_CLAMP;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 6) uniform sampler SAMPLER_NEAREST_REPEAT;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 7) uniform sampler SAMPLER_LINEAR_REPEAT;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 8) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 9) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 10) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 12 + 11) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
 #endif
 
@@ -473,7 +473,7 @@ layout(r32ui, set = 1, binding = 27) uniform restrict uimage3D geom_facing_grid;
 
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 24) uniform texture2DArray depth_buffer;
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 25) uniform texture2DArray color_buffer;
 #endif
 layout(set = 1, binding = 26) uniform texture2DArray normal_roughness_buffer;
@@ -483,7 +483,7 @@ layout(set = 1, binding = 29) uniform texture2DArray reflection_buffer;
 #define multiviewSampler sampler2DArray
 #else // USE_MULTIVIEW
 layout(set = 1, binding = 24) uniform texture2D depth_buffer;
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 25) uniform texture2D color_buffer;
 #endif
 layout(set = 1, binding = 26) uniform texture2D normal_roughness_buffer;
@@ -492,10 +492,10 @@ layout(set = 1, binding = 28) uniform texture2D ambient_buffer;
 layout(set = 1, binding = 29) uniform texture2D reflection_buffer;
 #define multiviewSampler sampler2D
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 30) uniform texture2DArray sdfgi_lightprobe_texture;
 #endif
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 31) uniform texture3D sdfgi_occlusion_cascades;
 #endif
 
@@ -514,14 +514,14 @@ struct VoxelGIData {
 	float exposure_normalization; // 4 - 112
 };
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 32, std140) uniform VoxelGIs {
 	VoxelGIData data[MAX_VOXEL_GI_INSTANCES];
 }
 voxel_gi_instances;
 #endif
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
 #endif
 
@@ -535,7 +535,7 @@ layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
 
-#ifdef MODE_DEFERRED_LIGHTING
+#ifdef MODE_FRP_LIGHTING
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 37) uniform texture2DArray gbuffer_albedo_buffer;
 layout(set = 1, binding = 38) uniform texture2DArray gbuffer_orm_buffer;
@@ -545,7 +545,7 @@ layout(set = 1, binding = 37) uniform texture2D gbuffer_albedo_buffer;
 layout(set = 1, binding = 38) uniform texture2D gbuffer_orm_buffer;
 layout(set = 1, binding = 39) uniform texture2D gbuffer_emission_buffer;
 #endif // USE_MULTIVIEW
-#endif // MODE_DEFERRED_LIGHTING
+#endif // MODE_FRP_LIGHTING
 
 #endif
 
@@ -572,7 +572,7 @@ vec3 get_energy_compensation(vec3 f0, float env) {
 
 /* Set 2 Skeleton & Instancing (can change per item) */
 
-#ifndef MODE_DEFERRED_LIGHTING
+#ifndef MODE_FRP_LIGHTING
 layout(set = 2, binding = 0, std430) restrict readonly buffer Transforms {
 	vec4 data[];
 }

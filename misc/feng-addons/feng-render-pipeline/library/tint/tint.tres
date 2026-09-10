@@ -2,7 +2,7 @@
 
 [ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/shader_pass.gd" id="1"]
 [ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
-[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/examples/tint.glsl" id="3"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/tint/tint.glsl" id="3"]
 
 [sub_resource type="Resource" id="Color"]
 script = ExtResource("2")

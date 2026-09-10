@@ -505,11 +505,11 @@ void ProjectDialog::_renderer_selected() {
 				String::utf8("\n•  ") + TTR("Uses RenderingDevice backend.") +
 				String::utf8("\n•  ") + TTR("Slower rendering of simple scenes."));
 		rd_error = !rendering_device_supported;
-	} else if (renderer_type == "deferred") {
+	} else if (renderer_type == "frp") {
 		renderer_info->set_text(
 				String::utf8("•  ") + TTR("Supports desktop platforms only.") +
 				String::utf8("\n•  ") + TTR("Advanced 3D graphics available.") +
-				String::utf8("\n•  ") + TTR("Deferred lighting for opaque geometry.") +
+				String::utf8("\n•  ") + TTR("FRP lighting for opaque geometry.") +
 				String::utf8("\n•  ") + TTR("Uses RenderingDevice backend.") +
 				String::utf8("\n•  ") + TTR("Scales well with many lights."));
 		rd_error = !rendering_device_supported;
@@ -589,8 +589,8 @@ void ProjectDialog::ok_pressed() {
 
 		if (renderer_type == "forward_plus") {
 			project_features.push_back("Forward Plus");
-		} else if (renderer_type == "deferred") {
-			project_features.push_back("Deferred");
+		} else if (renderer_type == "frp") {
+			project_features.push_back("FRP");
 		} else if (renderer_type == "mobile") {
 			project_features.push_back("Mobile");
 		} else if (renderer_type == "gl_compatibility") {
@@ -1147,15 +1147,15 @@ ProjectDialog::ProjectDialog() {
 	}
 	rs_button = memnew(CheckBox);
 	rs_button->set_button_group(renderer_button_group);
-	rs_button->set_text(TTRC("Deferred"));
+	rs_button->set_text(TTRC("FRP"));
 	rs_button->set_accessibility_name(TTRC("Renderer:"));
 #ifndef RD_ENABLED
 	rs_button->set_disabled(true);
 #endif
-	rs_button->set_meta(SNAME("rendering_method"), "deferred");
+	rs_button->set_meta(SNAME("rendering_method"), "frp");
 	rs_button->connect(SceneStringName(pressed), callable_mp(this, &ProjectDialog::_renderer_selected));
 	rvb->add_child(rs_button);
-	if (default_renderer_type == "deferred") {
+	if (default_renderer_type == "frp") {
 		rs_button->set_pressed(true);
 	}
 	rs_button = memnew(CheckBox);

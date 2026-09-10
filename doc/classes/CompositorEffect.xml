@@ -93,16 +93,16 @@
 			Represents the size of the [enum EffectCallbackType] enum.
 		</constant>
 		<constant name="EFFECT_CALLBACK_TYPE_PRE_GBUFFER" value="5" enum="EffectCallbackType">
-			Deferred only: before G-buffer rendering. Current-frame depth, normals, material and color buffers are not available yet.
+			FRP only: before G-buffer rendering. Current-frame depth, normals, material and color buffers are not available yet.
 		</constant>
 		<constant name="EFFECT_CALLBACK_TYPE_POST_GBUFFER" value="6" enum="EffectCallbackType">
-			Deferred only: after G-buffer rendering and MSAA resolve, before screen-space effects. Access material textures through RenderSceneBuffersRD under the deferred_clustered scope.
+			FRP only: after G-buffer rendering and MSAA resolve, before screen-space effects. Access material textures through RenderSceneBuffersRD under the frp_clustered scope.
 		</constant>
 		<constant name="EFFECT_CALLBACK_TYPE_PRE_LIGHTING" value="7" enum="EffectCallbackType">
-			Deferred only: after screen-space effects and before lighting. Depth, normals and material buffers are available; current-frame lit color is not available yet.
+			FRP only: after screen-space effects and before lighting. Depth, normals and material buffers are available; current-frame lit color is not available yet.
 		</constant>
 		<constant name="EFFECT_CALLBACK_TYPE_POST_LIGHTING" value="8" enum="EffectCallbackType">
-			Deferred only: after lighting, before opaque forward fallback and sky. Effects in the same stage execute in their order in Compositor.compositor_effects.
+			FRP only: after lighting, before opaque forward fallback and sky. Effects in the same stage execute in their order in Compositor.compositor_effects.
 		</constant>
 	</constants>
 </class>

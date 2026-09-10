@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  scene_shader_deferred_clustered.cpp                                    */
+/*  scene_shader_frp_clustered.cpp                                    */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,17 +28,17 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "scene_shader_deferred_clustered.h"
+#include "scene_shader_frp_clustered.h"
 
 #include "core/config/project_settings.h"
 #include "core/math/math_defs.h"
-#include "servers/rendering/renderer_rd/deferred_clustered/render_deferred_clustered.h"
+#include "servers/rendering/renderer_rd/frp_clustered/render_frp_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 
 using namespace RendererSceneRenderImplementation;
 
-void SceneShaderDeferredClustered::ShaderData::set_code(const String &p_code) {
+void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 	//compile
 
 	code = p_code;
@@ -173,20 +173,20 @@ void SceneShaderDeferredClustered::ShaderData::set_code(const String &p_code) {
 
 	Error err = OK;
 	{
-		MutexLock lock(SceneShaderDeferredClustered::singleton_mutex);
-		err = SceneShaderDeferredClustered::singleton->compiler.compile(RSE::SHADER_SPATIAL, code, &actions, path, gen_code);
+		MutexLock lock(SceneShaderFRPClustered::singleton_mutex);
+		err = SceneShaderFRPClustered::singleton->compiler.compile(RSE::SHADER_SPATIAL, code, &actions, path, gen_code);
 	}
 
 	if (err != OK) {
 		if (version.is_valid()) {
-			SceneShaderDeferredClustered::singleton->shader.version_free(version);
+			SceneShaderFRPClustered::singleton->shader.version_free(version);
 			version = RID();
 		}
 		ERR_FAIL_MSG("Shader compilation failed.");
 	}
 
 	if (version.is_null()) {
-		version = SceneShaderDeferredClustered::singleton->shader.version_create(false);
+		version = SceneShaderFRPClustered::singleton->shader.version_create(false);
 	}
 
 	depth_draw = DepthDraw(depth_drawi);
@@ -231,7 +231,7 @@ void SceneShaderDeferredClustered::ShaderData::set_code(const String &p_code) {
 	print_line("\n**vertex_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX]);
 	print_line("\n**fragment_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 #endif
-	SceneShaderDeferredClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
+	SceneShaderFRPClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
 	ubo_size = gen_code.uniform_total_size;
 	ubo_offsets = gen_code.uniform_offsets;
@@ -247,11 +247,11 @@ void SceneShaderDeferredClustered::ShaderData::set_code(const String &p_code) {
 	uses_blend_alpha = blend_mode_uses_blend_alpha(BlendMode(blend_mode));
 }
 
-bool SceneShaderDeferredClustered::ShaderData::is_animated() const {
+bool SceneShaderFRPClustered::ShaderData::is_animated() const {
 	return (uses_fragment_time && uses_discard) || (uses_vertex_time && uses_vertex);
 }
 
-bool SceneShaderDeferredClustered::ShaderData::casts_shadows() const {
+bool SceneShaderFRPClustered::ShaderData::casts_shadows() const {
 	bool has_read_screen_alpha = uses_screen_texture || uses_depth_texture || uses_normal_texture;
 	bool has_base_alpha = (uses_alpha && (!uses_alpha_clip || uses_alpha_antialiasing)) || has_read_screen_alpha;
 	bool has_alpha = has_base_alpha || uses_blend_alpha;
@@ -259,23 +259,23 @@ bool SceneShaderDeferredClustered::ShaderData::casts_shadows() const {
 	return !has_alpha || (uses_depth_prepass_alpha && !(depth_draw == DEPTH_DRAW_DISABLED || depth_test != DEPTH_TEST_ENABLED));
 }
 
-RenderingServerTypes::ShaderNativeSourceCode SceneShaderDeferredClustered::ShaderData::get_native_source_code() const {
+RenderingServerTypes::ShaderNativeSourceCode SceneShaderFRPClustered::ShaderData::get_native_source_code() const {
 	if (version.is_valid()) {
-		return SceneShaderDeferredClustered::singleton->shader.version_get_native_source_code(version);
+		return SceneShaderFRPClustered::singleton->shader.version_get_native_source_code(version);
 	} else {
 		return RenderingServerTypes::ShaderNativeSourceCode();
 	}
 }
 
-Pair<ShaderRD *, RID> SceneShaderDeferredClustered::ShaderData::get_native_shader_and_version() const {
+Pair<ShaderRD *, RID> SceneShaderFRPClustered::ShaderData::get_native_shader_and_version() const {
 	if (version.is_valid()) {
-		return { &SceneShaderDeferredClustered::singleton->shader, version };
+		return { &SceneShaderFRPClustered::singleton->shader, version };
 	} else {
 		return {};
 	}
 }
 
-uint16_t SceneShaderDeferredClustered::ShaderData::_get_shader_version(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) const {
+uint16_t SceneShaderFRPClustered::ShaderData::_get_shader_version(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) const {
 	uint32_t ubershader_base = p_ubershader ? ShaderVersion::SHADER_VERSION_COLOR_PASS : 0;
 	switch (p_pipeline_version) {
 		case PIPELINE_VERSION_DEPTH_PASS:
@@ -330,7 +330,7 @@ uint16_t SceneShaderDeferredClustered::ShaderData::_get_shader_version(PipelineV
 	}
 }
 
-void SceneShaderDeferredClustered::ShaderData::_create_pipeline(PipelineKey p_pipeline_key) {
+void SceneShaderFRPClustered::ShaderData::_create_pipeline(PipelineKey p_pipeline_key) {
 #if PRINT_PIPELINE_COMPILATION_KEYS
 	print_line(
 			"HASH:", p_pipeline_key.hash(),
@@ -418,7 +418,7 @@ void SceneShaderDeferredClustered::ShaderData::_create_pipeline(PipelineKey p_pi
 		RD::RENDER_PRIMITIVE_TRIANGLE_STRIPS,
 	};
 
-	bool emulate_point_size_flag = uses_point_size && SceneShaderDeferredClustered::singleton->emulate_point_size;
+	bool emulate_point_size_flag = uses_point_size && SceneShaderFRPClustered::singleton->emulate_point_size;
 
 	RD::RenderPrimitive primitive_rd;
 	if (uses_point_size) {
@@ -515,7 +515,7 @@ void SceneShaderDeferredClustered::ShaderData::_create_pipeline(PipelineKey p_pi
 	pipeline_hash_map.add_compiled_pipeline(p_pipeline_key.hash(), pipeline);
 }
 
-RD::PolygonCullMode SceneShaderDeferredClustered::ShaderData::get_cull_mode_from_cull_variant(CullVariant p_cull_variant) {
+RD::PolygonCullMode SceneShaderFRPClustered::ShaderData::get_cull_mode_from_cull_variant(CullVariant p_cull_variant) {
 	const RD::PolygonCullMode cull_mode_rd_table[CULL_VARIANT_MAX][3] = {
 		{ RD::POLYGON_CULL_DISABLED, RD::POLYGON_CULL_FRONT, RD::POLYGON_CULL_BACK },
 		{ RD::POLYGON_CULL_DISABLED, RD::POLYGON_CULL_BACK, RD::POLYGON_CULL_FRONT },
@@ -525,26 +525,26 @@ RD::PolygonCullMode SceneShaderDeferredClustered::ShaderData::get_cull_mode_from
 	return cull_mode_rd_table[p_cull_variant][cull_mode];
 }
 
-RID SceneShaderDeferredClustered::ShaderData::_get_shader_variant(uint16_t p_shader_version) const {
+RID SceneShaderFRPClustered::ShaderData::_get_shader_variant(uint16_t p_shader_version) const {
 	if (version.is_valid()) {
-		ERR_FAIL_NULL_V(SceneShaderDeferredClustered::singleton, RID());
-		return SceneShaderDeferredClustered::singleton->shader.version_get_shader(version, p_shader_version);
+		ERR_FAIL_NULL_V(SceneShaderFRPClustered::singleton, RID());
+		return SceneShaderFRPClustered::singleton->shader.version_get_shader(version, p_shader_version);
 	} else {
 		return RID();
 	}
 }
 
-void SceneShaderDeferredClustered::ShaderData::_clear_vertex_input_mask_cache() {
+void SceneShaderFRPClustered::ShaderData::_clear_vertex_input_mask_cache() {
 	for (uint32_t i = 0; i < VERTEX_INPUT_MASKS_SIZE; i++) {
 		vertex_input_masks[i].store(0);
 	}
 }
 
-RID SceneShaderDeferredClustered::ShaderData::get_shader_variant(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) const {
+RID SceneShaderFRPClustered::ShaderData::get_shader_variant(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) const {
 	return _get_shader_variant(_get_shader_version(p_pipeline_version, p_color_pass_flags, p_ubershader));
 }
 
-uint64_t SceneShaderDeferredClustered::ShaderData::get_vertex_input_mask(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) {
+uint64_t SceneShaderFRPClustered::ShaderData::get_vertex_input_mask(PipelineVersion p_pipeline_version, uint32_t p_color_pass_flags, bool p_ubershader) {
 	// Vertex input masks require knowledge of the shader. Since querying the shader can be expensive due to high contention and the necessary mutex, we cache the result instead.
 	uint16_t shader_version = _get_shader_version(p_pipeline_version, p_color_pass_flags, p_ubershader);
 	uint64_t input_mask = vertex_input_masks[shader_version].load(std::memory_order_relaxed);
@@ -559,76 +559,76 @@ uint64_t SceneShaderDeferredClustered::ShaderData::get_vertex_input_mask(Pipelin
 	return input_mask;
 }
 
-bool SceneShaderDeferredClustered::ShaderData::is_valid() const {
+bool SceneShaderFRPClustered::ShaderData::is_valid() const {
 	if (version.is_valid()) {
-		ERR_FAIL_NULL_V(SceneShaderDeferredClustered::singleton, false);
-		return SceneShaderDeferredClustered::singleton->shader.version_is_valid(version);
+		ERR_FAIL_NULL_V(SceneShaderFRPClustered::singleton, false);
+		return SceneShaderFRPClustered::singleton->shader.version_is_valid(version);
 	} else {
 		return false;
 	}
 }
 
-SceneShaderDeferredClustered::ShaderData::ShaderData() :
+SceneShaderFRPClustered::ShaderData::ShaderData() :
 		shader_list_element(this) {
 	pipeline_hash_map.set_creation_object_and_function(this, &ShaderData::_create_pipeline);
-	pipeline_hash_map.set_compilations(SceneShaderDeferredClustered::singleton->pipeline_compilations, &SceneShaderDeferredClustered::singleton_mutex);
+	pipeline_hash_map.set_compilations(SceneShaderFRPClustered::singleton->pipeline_compilations, &SceneShaderFRPClustered::singleton_mutex);
 }
 
-SceneShaderDeferredClustered::ShaderData::~ShaderData() {
+SceneShaderFRPClustered::ShaderData::~ShaderData() {
 	pipeline_hash_map.clear_pipelines();
 
 	if (version.is_valid()) {
-		ERR_FAIL_NULL(SceneShaderDeferredClustered::singleton);
-		SceneShaderDeferredClustered::singleton->shader.version_free(version);
+		ERR_FAIL_NULL(SceneShaderFRPClustered::singleton);
+		SceneShaderFRPClustered::singleton->shader.version_free(version);
 	}
 }
 
-RendererRD::MaterialStorage::ShaderData *SceneShaderDeferredClustered::_create_shader_func() {
-	MutexLock lock(SceneShaderDeferredClustered::singleton_mutex);
+RendererRD::MaterialStorage::ShaderData *SceneShaderFRPClustered::_create_shader_func() {
+	MutexLock lock(SceneShaderFRPClustered::singleton_mutex);
 	ShaderData *shader_data = memnew(ShaderData);
 	singleton->shader_list.add(&shader_data->shader_list_element);
 	return shader_data;
 }
 
-void SceneShaderDeferredClustered::MaterialData::set_render_priority(int p_priority) {
+void SceneShaderFRPClustered::MaterialData::set_render_priority(int p_priority) {
 	priority = p_priority - RSE::MATERIAL_RENDER_PRIORITY_MIN; //8 bits
 }
 
-void SceneShaderDeferredClustered::MaterialData::set_next_pass(RID p_pass) {
+void SceneShaderFRPClustered::MaterialData::set_next_pass(RID p_pass) {
 	next_pass = p_pass;
 }
 
-bool SceneShaderDeferredClustered::MaterialData::update_parameters(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty) {
+bool SceneShaderFRPClustered::MaterialData::update_parameters(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty) {
 	if (shader_data->version.is_valid()) {
-		RID shader_rid = SceneShaderDeferredClustered::singleton->shader.version_get_shader(shader_data->version, 0);
+		RID shader_rid = SceneShaderFRPClustered::singleton->shader.version_get_shader(shader_data->version, 0);
 
-		MutexLock lock(SceneShaderDeferredClustered::singleton_mutex);
-		return update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, shader_rid, RenderDeferredClustered::MATERIAL_UNIFORM_SET, true, true);
+		MutexLock lock(SceneShaderFRPClustered::singleton_mutex);
+		return update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, shader_rid, RenderFRPClustered::MATERIAL_UNIFORM_SET, true, true);
 	} else {
 		return false;
 	}
 }
 
-SceneShaderDeferredClustered::MaterialData::~MaterialData() {
+SceneShaderFRPClustered::MaterialData::~MaterialData() {
 	free_parameters_uniform_set(uniform_set);
 }
 
-RendererRD::MaterialStorage::MaterialData *SceneShaderDeferredClustered::_create_material_func(ShaderData *p_shader) {
+RendererRD::MaterialStorage::MaterialData *SceneShaderFRPClustered::_create_material_func(ShaderData *p_shader) {
 	MaterialData *material_data = memnew(MaterialData);
 	material_data->shader_data = p_shader;
 	//update will happen later anyway so do nothing.
 	return material_data;
 }
 
-SceneShaderDeferredClustered *SceneShaderDeferredClustered::singleton = nullptr;
-Mutex SceneShaderDeferredClustered::singleton_mutex;
+SceneShaderFRPClustered *SceneShaderFRPClustered::singleton = nullptr;
+Mutex SceneShaderFRPClustered::singleton_mutex;
 
-SceneShaderDeferredClustered::SceneShaderDeferredClustered() {
+SceneShaderFRPClustered::SceneShaderFRPClustered() {
 	// there should be only one of these, contained within our RenderFM singleton.
 	singleton = this;
 }
 
-SceneShaderDeferredClustered::~SceneShaderDeferredClustered() {
+SceneShaderFRPClustered::~SceneShaderFRPClustered() {
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
 	RD::get_singleton()->free_rid(default_vec4_xform_buffer);
@@ -643,7 +643,7 @@ SceneShaderDeferredClustered::~SceneShaderDeferredClustered() {
 	material_storage->material_free(debug_shadow_splits_material);
 }
 
-void SceneShaderDeferredClustered::init(const String p_defines) {
+void SceneShaderFRPClustered::init(const String p_defines) {
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
 	emulate_point_size = !RD::get_singleton()->has_feature(RD::SUPPORTS_POINT_SIZE);
@@ -696,7 +696,7 @@ void SceneShaderDeferredClustered::init(const String p_defines) {
 		}
 
 		Vector<uint64_t> dynamic_buffers;
-		dynamic_buffers.push_back(ShaderRD::DynamicBuffer::encode(RenderDeferredClustered::RENDER_PASS_UNIFORM_SET, 2));
+		dynamic_buffers.push_back(ShaderRD::DynamicBuffer::encode(RenderFRPClustered::RENDER_PASS_UNIFORM_SET, 2));
 		shader.initialize(shader_versions, p_defines, Vector<RD::PipelineImmutableSampler>(), dynamic_buffers);
 
 		if (RendererCompositorRD::get_singleton()->is_xr_enabled()) {
@@ -907,7 +907,7 @@ void SceneShaderDeferredClustered::init(const String p_defines) {
 		actions.render_mode_defines["specular_occlusion_disabled"] = "#define SPECULAR_OCCLUSION_DISABLED\n";
 
 		actions.base_texture_binding_index = 1;
-		actions.texture_layout_set = RenderDeferredClustered::MATERIAL_UNIFORM_SET;
+		actions.texture_layout_set = RenderFRPClustered::MATERIAL_UNIFORM_SET;
 		actions.base_uniform_string = "material.";
 		actions.base_varying_index = 15;
 
@@ -1008,7 +1008,7 @@ void fragment() {
 		u.binding = 0;
 		uniforms.push_back(u);
 
-		default_vec4_xform_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, default_shader_rd, RenderDeferredClustered::TRANSFORMS_UNIFORM_SET);
+		default_vec4_xform_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, default_shader_rd, RenderFRPClustered::TRANSFORMS_UNIFORM_SET);
 	}
 	{
 		RD::SamplerState sampler;
@@ -1020,7 +1020,7 @@ void fragment() {
 	}
 }
 
-void SceneShaderDeferredClustered::set_default_specialization(const ShaderSpecialization &p_specialization) {
+void SceneShaderFRPClustered::set_default_specialization(const ShaderSpecialization &p_specialization) {
 	default_specialization = p_specialization;
 
 	for (SelfList<ShaderData> *E = shader_list.first(); E; E = E->next()) {
@@ -1028,22 +1028,22 @@ void SceneShaderDeferredClustered::set_default_specialization(const ShaderSpecia
 	}
 }
 
-void SceneShaderDeferredClustered::enable_multiview_shader_group() {
+void SceneShaderFRPClustered::enable_multiview_shader_group() {
 	shader.enable_group(SHADER_GROUP_MULTIVIEW);
 }
 
-void SceneShaderDeferredClustered::enable_advanced_shader_group(bool p_needs_multiview) {
+void SceneShaderFRPClustered::enable_advanced_shader_group(bool p_needs_multiview) {
 	if (p_needs_multiview || RendererCompositorRD::get_singleton()->is_xr_enabled()) {
 		shader.enable_group(SHADER_GROUP_ADVANCED_MULTIVIEW);
 	}
 	shader.enable_group(SHADER_GROUP_ADVANCED);
 }
 
-bool SceneShaderDeferredClustered::is_multiview_shader_group_enabled() const {
+bool SceneShaderFRPClustered::is_multiview_shader_group_enabled() const {
 	return shader.is_group_enabled(SHADER_GROUP_MULTIVIEW);
 }
 
-bool SceneShaderDeferredClustered::is_advanced_shader_group_enabled(bool p_multiview) const {
+bool SceneShaderFRPClustered::is_advanced_shader_group_enabled(bool p_multiview) const {
 	if (p_multiview) {
 		return shader.is_group_enabled(SHADER_GROUP_ADVANCED_MULTIVIEW);
 	} else {
@@ -1051,7 +1051,7 @@ bool SceneShaderDeferredClustered::is_advanced_shader_group_enabled(bool p_multi
 	}
 }
 
-uint32_t SceneShaderDeferredClustered::get_pipeline_compilations(RSE::PipelineSource p_source) {
-	MutexLock lock(SceneShaderDeferredClustered::singleton_mutex);
+uint32_t SceneShaderFRPClustered::get_pipeline_compilations(RSE::PipelineSource p_source) {
+	MutexLock lock(SceneShaderFRPClustered::singleton_mutex);
 	return pipeline_compilations[p_source];
 }

@@ -8,7 +8,7 @@ GPU uploads or the rendered result.
 For example, from the engine checkout on Windows (replace PROJECT):
 
 ```powershell
-.\bin\godot.windows.editor.x86_64.console.exe --path PROJECT --rendering-method deferred --rendering-driver d3d12 --resolution 320x240 --script F:/godot/feng-godot/misc/feng-addons/feng-idweight-terrain/native/tests/texture_layers.gd
+.\bin\godot.windows.editor.x86_64.console.exe --path PROJECT --rendering-method frp --rendering-driver d3d12 --resolution 320x240 --script F:/godot/feng-godot/misc/feng-addons/feng-idweight-terrain/native/tests/texture_layers.gd
 ```
 
 The default test constructs two RGB8/RGBA8 materials. Optional user arguments

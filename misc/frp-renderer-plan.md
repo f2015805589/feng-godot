@@ -1,9 +1,9 @@
-# feng-godot 延迟渲染器（deferred）实施计划
+# feng-godot 延迟渲染器（frp）实施计划
 
 - **基线**：`feng-godot` @ `f6ab5db28b`（Godot 4.7.3-rc）
 - **日期**：2026-09-08
-- **状态**：M0-M4 已完成并合入 `feng-godot`（提交 `a8202449cf` 起，deferred-renderer 分支已删除）
-- **决策**：复制 Forward+（`RenderForwardClustered`）为独立渲染器 `deferred`，与 Forward+ 并存，通过 `rendering/renderer/rendering_method = "deferred"` 选择。不改 Forward+ 的任何行为。
+- **状态**：M0-M4 已完成并合入 `feng-godot`（提交 `a8202449cf` 起，frp-renderer 分支已删除）
+- **决策**：复制 Forward+（`RenderForwardClustered`）为独立渲染器 `frp`，与 Forward+ 并存，通过 `rendering/renderer/rendering_method = "frp"` 选择。不改 Forward+ 的任何行为。
 
 ---
 
@@ -11,9 +11,9 @@
 
 | 里程碑 | 提交 | 内容 |
 |--------|------|------|
-| M0 | `a51e8a20e4` | 克隆 forward_clustered → deferred_clustered（改名 + 接入点 13 处） |
-| M1 | `593b2b6694` | G-buffer 纹理/变体/强制 pass + 项目对话框 deferred 选项 |
-| M2 | `52ce732ee0` | `deferred_lighting.glsl` 全屏光照 pass（替换不透明前向 pass） |
+| M0 | `a51e8a20e4` | 克隆 forward_clustered → frp_clustered（改名 + 接入点 13 处） |
+| M1 | `593b2b6694` | G-buffer 纹理/变体/强制 pass + 项目对话框 frp 选项 |
+| M2 | `52ce732ee0` | `frp_lighting.glsl` 全屏光照 pass（替换不透明前向 pass） |
 | M3+M4 | `21aa3542c0` | decal 进 G-buffer + 前向 fallback pass（`RENDER_LIST_OPAQUE_FALLBACK`） |
 
 **M5 遗留（后续迭代）**：性能 profile（光源数 1/8/32/128 × 1080p/4K 帧时间表）、MSAA 下 G-buffer resolve 的视觉验证、多视图（XR）明确降级、velocity 并入 G-buffer pass、`doc/` 使用文档。
@@ -24,10 +24,10 @@
 
 **目标**
 
-- 新增 RD 渲染器 `deferred`：不透明几何走 G-buffer + 全屏延迟光照；透明物体保持前向渲染。
+- 新增 RD 渲染器 `frp`：不透明几何走 G-buffer + 全屏延迟光照；透明物体保持前向渲染。
 - 视觉输出与 Forward+ 对齐（允许细微的混合顺序/浮点噪声差异）。
 - 保留 Forward+ 的既有能力：cluster 光照、阴影、SDFGI/VoxelGI、SSAO/SSIL/SSR、体积雾、天空、SSS、TAA/FSR2、tonemap、compositor effects。
-- 与 Forward+ 零耦合：deferred 的所有改动都在自己的目录里。
+- 与 Forward+ 零耦合：frp 的所有改动都在自己的目录里。
 
 **非目标（初期明确不做）**
 
@@ -46,7 +46,7 @@
 | 3 | cluster 数据（omni/spot/area/decal/reflection 按 cluster 分桶）在 opaque 前构建完成 | `forward_clustered/render_forward_clustered.cpp:1517`（`_pre_opaque_render`）→ `bake_cluster()`；shader 侧查找模式 `scene_forward_clustered.glsl:1166`、`:1544` | G-buffer pass 之后照常执行，光照 pass 按像素查 cluster |
 | 4 | GI 双路径：前向逐片元 GI（`sc_use_forward_gi`）与 **预渲染 GI 缓冲**（ambient/reflection buffer，binding 28/29）并存 | `scene_forward_clustered.glsl:1982-2036`（`USE_GI_BUFFERS` 路径）；`_pre_opaque_render` 里 `gi.process_gi` | 延迟光照 pass 走 **GI 缓冲路径**（`gi.process_gi` 已存在，照常调用） |
 | 5 | 渲染 pass uniform set（set 1）已绑定延迟光照所需全部纹理：depth(24)/color(25)/normal_roughness(26)/ao(27)/ambient(28)/reflection(29)/sdfgi(30/31)/voxelgi(32)/体积雾(33)/ssil(34)/ssr(35/36) | `shaders/forward_clustered/scene_forward_clustered_inc.glsl:420-479`；C++ 侧 `_setup_render_pass_uniform_set`（`render_forward_clustered.cpp:3381`） | 复制后直接复用，光照 pass 挂同一套 uniform set |
-| 6 | 全屏 pass 模板（全屏三角形 + 采样合并） | `shaders/effects/specular_merge.glsl`；C++ 调度 `effects/copy_effects.cpp:1441`（`merge_specular`） | `deferred_lighting.glsl` 照此模式写 |
+| 6 | 全屏 pass 模板（全屏三角形 + 采样合并） | `shaders/effects/specular_merge.glsl`；C++ 调度 `effects/copy_effects.cpp:1441`（`merge_specular`） | `frp_lighting.glsl` 照此模式写 |
 | 7 | 基类 `RendererSceneRenderRD`：后处理/tonemap、compositor effects 调度、screen/depth 拷贝、debug draw、SDFGI 调试、render buffers 管理 | `renderer_rd/renderer_scene_render_rd.cpp/.h` | **不复制**，直接继承 |
 | 8 | 复制式渲染器先例：`forward_mobile` 本身就是 `forward_clustered` 的复制改造（同文件布局、同类结构） | `renderer_rd/forward_mobile/`（161KB/31KB/47KB/13KB） | 证明该模式在此代码库可行 |
 
@@ -58,17 +58,17 @@
 
 ```
 servers/rendering/renderer_rd/
-├── deferred_clustered/                    [新建]
-│   ├── render_deferred_clustered.cpp      ← 复制 render_forward_clustered.cpp (238KB)
-│   ├── render_deferred_clustered.h        ← 复制 render_forward_clustered.h   (37KB)
-│   ├── scene_shader_deferred_clustered.cpp← 复制 scene_shader_forward_clustered.cpp (48KB)
-│   ├── scene_shader_deferred_clustered.h  ← 复制 scene_shader_forward_clustered.h   (15KB)
+├── frp_clustered/                    [新建]
+│   ├── render_frp_clustered.cpp      ← 复制 render_forward_clustered.cpp (238KB)
+│   ├── render_frp_clustered.h        ← 复制 render_forward_clustered.h   (37KB)
+│   ├── scene_shader_frp_clustered.cpp← 复制 scene_shader_forward_clustered.cpp (48KB)
+│   ├── scene_shader_frp_clustered.h  ← 复制 scene_shader_forward_clustered.h   (15KB)
 │   └── SCsub                              ← 抄 forward_clustered/SCsub
 └── shaders/
-    └── deferred_clustered/                [新建]
-        ├── scene_deferred_clustered.glsl  ← 复制 scene_forward_clustered.glsl (109KB)
-        ├── scene_deferred_clustered_inc.glsl ← 复制 scene_forward_clustered_inc.glsl (14KB)
-        ├── deferred_lighting.glsl         [新建] 延迟光照全屏 pass
+    └── frp_clustered/                [新建]
+        ├── scene_frp_clustered.glsl  ← 复制 scene_forward_clustered.glsl (109KB)
+        ├── scene_frp_clustered_inc.glsl ← 复制 scene_forward_clustered_inc.glsl (14KB)
+        ├── frp_lighting.glsl         [新建] 延迟光照全屏 pass
         └── SCsub                          ← 抄 shaders/forward_clustered/SCsub
 ```
 
@@ -76,15 +76,15 @@ servers/rendering/renderer_rd/
 
 | 原 | 新 |
 |----|----|
-| `RenderForwardClustered` | `RenderDeferredClustered` |
-| `SceneShaderForwardClustered` | `SceneShaderDeferredClustered` |
-| `RenderBufferDataForwardClustered` | `RenderBufferDataDeferredClustered` |
-| `GeometryInstanceForwardClustered` | `GeometryInstanceDeferredClustered` |
-| `RB_SCOPE_FORWARD_CLUSTERED` (`"forward_clustered"`，`render_forward_clustered.h:49`) | `RB_SCOPE_DEFERRED_CLUSTERED` (`"deferred_clustered"`) |
+| `RenderForwardClustered` | `RenderFRPClustered` |
+| `SceneShaderForwardClustered` | `SceneShaderFRPClustered` |
+| `RenderBufferDataForwardClustered` | `RenderBufferDataFRPClustered` |
+| `GeometryInstanceForwardClustered` | `GeometryInstanceFRPClustered` |
+| `RB_SCOPE_FORWARD_CLUSTERED` (`"forward_clustered"`，`render_forward_clustered.h:49`) | `RB_SCOPE_FRP_CLUSTERED` (`"frp_clustered"`) |
 | `RB_TEX_SPECULAR / NORMAL_ROUGHNESS / VOXEL_GI`（`:51-56`） | 同名保留，另加 `RB_TEX_GBUFFER_ALBEDO / GBUFFER_ORM / GBUFFER_EMISSION`（normal_roughness 沿用现名，兼容 SSAO 管线） |
-| 渲染方法 `"forward_plus"` | `"deferred"` |
+| 渲染方法 `"forward_plus"` | `"frp"` |
 
-注：`scene_deferred_clustered.glsl` 构建时自动生成 `SceneDeferredClusteredShaderRD` 类（gen.h 机制，`glsl_builders.py`），`scene_shader_deferred_clustered.h:34` 的 include 路径相应修改。
+注：`scene_frp_clustered.glsl` 构建时自动生成 `SceneFRPClusteredShaderRD` 类（gen.h 机制，`glsl_builders.py`），`scene_shader_frp_clustered.h:34` 的 include 路径相应修改。
 
 ### 3.3 共享层 vs 复制层
 
@@ -95,7 +95,7 @@ servers/rendering/renderer_rd/
 
 ## 4. 帧流程设计
 
-### 4.1 Forward+ 现状 → deferred 目标
+### 4.1 Forward+ 现状 → frp 目标
 
 ```
 Forward+（现状，render_forward_clustered.cpp:1704 _render_scene）:
@@ -104,7 +104,7 @@ Forward+（现状，render_forward_clustered.cpp:1704 _render_scene）:
   → 不透明颜色pass(逐片元前向光照, 所有不透明surface)           :2223
   → 天空 → MSAA resolve → SSS/specular合并 → 透明pass → TAA/FSR2 → tonemap
 
-deferred（目标）:
+frp（目标）:
   G-buffer pass(必选, = 深度预pass扩展: depth+normal_roughness+albedo+orm+emission[+voxelgi])
   → _pre_opaque_render(不变: 阴影/GI缓冲/SSAO/SSIL/SSR/cluster烘焙/体积雾)
   → 延迟光照pass(全屏三角形: 读G-buffer+cluster+阴影图+GI缓冲+AO/SSIL/SSR, 输出color[或diffuse+specular])
@@ -116,7 +116,7 @@ deferred（目标）:
 
 ### 4.2 G-buffer 布局
 
-| 附件 | 纹理名（RB scope `deferred_clustered`） | 格式 | 内容 | 兼容性说明 |
+| 附件 | 纹理名（RB scope `frp_clustered`） | 格式 | 内容 | 兼容性说明 |
 |------|------|------|------|-----------|
 | depth | （现有 RB 深度纹理，不新建） | `D32_SFLOAT` | 深度 | 复用现有 |
 | 0 | `normal_roughness` | `RGBA8_UNORM` | RGB: `encode24(normal)*0.5+0.5`；A: roughness（沿用现有 dynamic/static 反码编码，`scene_forward_clustered.glsl:3025-3037`） | **与现有 normal_roughness 缓冲逐字节同布局** → SSAO/SSIL/SSR/`gi.process_gi` 零改动（`scene_forward_clustered_inc.glsl:466` `normal_roughness_compatibility` 直接可用） |
@@ -128,7 +128,7 @@ deferred（目标）:
 - velocity 缓冲（RG16F）沿用现有独立纹理；M4 阶段把它挪进 G-buffer pass 一并写入（消除单独的 motion pass）。
 - 新增显存 @1080p：4+4+4+8 ≈ **20 B/px ≈ 41 MB**（+MSAA 翻倍）。可接受。
 
-### 4.3 延迟光照 pass（`deferred_lighting.glsl`）
+### 4.3 延迟光照 pass（`frp_lighting.glsl`）
 
 - **形式**：全屏三角形（照抄 `specular_merge.glsl` 的 vertex），fragment 每像素执行。
 - **输入**：set 0（base uniform set：光源 buffer、decal atlas、dfg/LTC LUT——`render_forward_clustered.cpp:3188` 的绑定直接复用）+ set 1（render pass uniform set：G-buffer 纹理、cluster buffer、阴影图、radiance、反射 atlas、GI 缓冲、AO/SSIL/SSR、体积雾——`:3381` 的绑定直接复用）。G-buffer 纹理追加为 set 1 的新 binding。
@@ -156,7 +156,7 @@ deferred（目标）:
 
 **机制**（全部复用现有设施）：
 
-- 检测：`SceneShaderDeferredClustered::ShaderData` 已通过 `actions.render_mode_flags` 等记录 `unshaded`、`uses_*` 标志（`scene_shader_forward_clustered.cpp:120-131`）；补少量检测（SPECULAR 写入、SCREEN_TEXTURE 已有 `uses_screen_texture`）。
+- 检测：`SceneShaderFRPClustered::ShaderData` 已通过 `actions.render_mode_flags` 等记录 `unshaded`、`uses_*` 标志（`scene_shader_forward_clustered.cpp:120-131`）；补少量检测（SPECULAR 写入、SCREEN_TEXTURE 已有 `uses_screen_texture`）。
 - 分流：`_fill_render_list`（`render_forward_clustered.cpp:921`）里给 surface 设置 `color_pass_inclusion_mask` / 新 render list（`RENDER_LIST_OPAQUE_FALLBACK`），G-buffer pass 排除、fallback pass 包含。
 - 执行：fallback pass = 现有 `PASS_MODE_COLOR` 前向 pass，插在延迟光照 pass 之后、天空之前（它需要读已光照的屏幕时也成立，因为 screen texture 拷贝在其后）。
 
@@ -170,19 +170,19 @@ deferred（目标）:
 
 1. 按 §3.1 复制 6 个文件并按 §3.2 改名（纯文本替换 + 手工核对，不改任何逻辑）。
 2. 接入渲染器选择与构建（见 §6 清单）。
-3. 新建分支 `deferred-renderer` 开发（`feng-godot` 分支保持与上游同步的干净基线）。
+3. 新建分支 `frp-renderer` 开发（`feng-godot` 分支保持与上游同步的干净基线）。
 
 **验收**
 
-- `scons` 编译通过；`shaders/deferred_clustered/` 的 gen.h 正常生成。
-- `godot --rendering-method deferred` 启动编辑器与测试项目，无报错。
-- 同一场景 `forward_plus` vs `deferred` 截图逐像素一致（此阶段 deferred 就是 Forward+ 的完整克隆）。
+- `scons` 编译通过；`shaders/frp_clustered/` 的 gen.h 正常生成。
+- `godot --rendering-method frp` 启动编辑器与测试项目，无报错。
+- 同一场景 `forward_plus` vs `frp` 截图逐像素一致（此阶段 frp 就是 Forward+ 的完整克隆）。
 
 ### M1 — G-buffer pass（3-5 天）
 
 **任务**
 
-1. `RenderBufferDataDeferredClustered`：新增 `gbuffer_albedo/orm/emission` 纹理（`create_texture` 模式照抄 `ensure_specular()`，`render_forward_clustered.cpp:54-88`）与 `get_gbuffer_fb()`（照抄 `get_depth_fb(DEPTH_FB_ROUGHNESS_VOXELGI)` 的多附件缓存模式，`:215-233`）。
+1. `RenderBufferDataFRPClustered`：新增 `gbuffer_albedo/orm/emission` 纹理（`create_texture` 模式照抄 `ensure_specular()`，`render_forward_clustered.cpp:54-88`）与 `get_gbuffer_fb()`（照抄 `get_depth_fb(DEPTH_FB_ROUGHNESS_VOXELGI)` 的多附件缓存模式，`:215-233`）。
 2. 复制版 glsl：新增 `MODE_RENDER_GBUFFER`（合并 `MODE_RENDER_NORMAL_ROUGHNESS` 的编码 + `MODE_RENDER_MATERIAL` 的材质输出，去掉冗余的 depth 颜色附件）；`PassMode` 加 `PASS_MODE_GBUFFER`；`_render_list_template` 两处 switch（`render_forward_clustered.cpp:435`、`:629`）加 case；shader 变体注册（`scene_shader_forward_clustered.cpp:655` 附近）加对应 version。
 3. `_render_scene`：延迟模式下强制走 G-buffer pass（替代可选深度预pass），深度预pass 三分支逻辑简化。
 
@@ -196,7 +196,7 @@ deferred（目标）:
 
 **任务**
 
-1. 写 `deferred_lighting.glsl`（§4.3）；C++ 侧光照 pass 调度（uniform set 复用 + 新 G-buffer binding + framebuffer 为 color[+specular]）。
+1. 写 `frp_lighting.glsl`（§4.3）；C++ 侧光照 pass 调度（uniform set 复用 + 新 G-buffer binding + framebuffer 为 color[+specular]）。
 2. `_render_scene`：不透明链路改为 G-buffer → `_pre_opaque_render` → 延迟光照；`RENDER_LIST_OPAQUE` 中「标准 PBR」surface 不再进前向颜色 pass。
 3. 反射探针烘焙、lightmap bake、SDFGI voxelization、材质预览（`_render_material`）**保持前向路径不动**（烘焙类渲染不需要延迟化）。
 
@@ -232,17 +232,17 @@ deferred（目标）:
 
 | 文件 | 位置 | 改动 |
 |------|------|------|
-| `servers/rendering/renderer_rd/renderer_compositor_rd.cpp` | `:373-386` | 渲染器选择加分支：`rendering_method == "deferred"` → `memnew(RendererSceneRenderImplementation::RenderDeferredClustered())`；文件头加 include（`:38-39` 一带） |
-| `main/main.cpp` | `:2491` | `renderer_hints = "forward_plus,mobile"` → `"forward_plus,mobile,deferred"`（`gl_compatibility` 追加逻辑不动） |
-| `main/main.cpp` | `:2513-2516` | 合法渲染方法校验名单加 `"deferred"` |
-| `main/main.cpp` | `:2600` | `if (rendering_method == "forward_plus" \|\| rendering_method == "mobile")`（RD 驱动 vulkan/d3d12/metal）加 `\|\| rendering_method == "deferred"` |
-| `servers/rendering/renderer_rd/SCsub` | 尾部 | 加 `SConscript("deferred_clustered/SCsub")` |
-| 新 `deferred_clustered/SCsub` | — | 抄 `forward_clustered/SCsub`（`env.add_source_files(env.servers_sources, "*.cpp")`） |
-| 新 `shaders/deferred_clustered/SCsub` | — | 抄 `shaders/forward_clustered/SCsub`（RD_GLSL builder 自动 glob 生成 gen.h；`*_inc.glsl` 视为 include 依赖） |
-| `servers/rendering/renderer_viewport.cpp` | `:1026`、`:1449` | FSR1 与 TAA 的 `!= "forward_plus"` 检查加 deferred（延迟渲染器同样支持） |
-| 可选：`editor/project_manager/project_dialog.cpp` | `:500`、`:1132` 一带 | 新建项目对话框加 deferred 选项按钮（不阻塞 M0，命令行 `--rendering-method deferred` 已可用） |
+| `servers/rendering/renderer_rd/renderer_compositor_rd.cpp` | `:373-386` | 渲染器选择加分支：`rendering_method == "frp"` → `memnew(RendererSceneRenderImplementation::RenderFRPClustered())`；文件头加 include（`:38-39` 一带） |
+| `main/main.cpp` | `:2491` | `renderer_hints = "forward_plus,mobile"` → `"forward_plus,mobile,frp"`（`gl_compatibility` 追加逻辑不动） |
+| `main/main.cpp` | `:2513-2516` | 合法渲染方法校验名单加 `"frp"` |
+| `main/main.cpp` | `:2600` | `if (rendering_method == "forward_plus" \|\| rendering_method == "mobile")`（RD 驱动 vulkan/d3d12/metal）加 `\|\| rendering_method == "frp"` |
+| `servers/rendering/renderer_rd/SCsub` | 尾部 | 加 `SConscript("frp_clustered/SCsub")` |
+| 新 `frp_clustered/SCsub` | — | 抄 `forward_clustered/SCsub`（`env.add_source_files(env.servers_sources, "*.cpp")`） |
+| 新 `shaders/frp_clustered/SCsub` | — | 抄 `shaders/forward_clustered/SCsub`（RD_GLSL builder 自动 glob 生成 gen.h；`*_inc.glsl` 视为 include 依赖） |
+| `servers/rendering/renderer_viewport.cpp` | `:1026`、`:1449` | FSR1 与 TAA 的 `!= "forward_plus"` 检查加 frp（延迟渲染器同样支持） |
+| 可选：`editor/project_manager/project_dialog.cpp` | `:500`、`:1132` 一带 | 新建项目对话框加 frp 选项按钮（不阻塞 M0，命令行 `--rendering-method frp` 已可用） |
 
-注：`scene/resources/environment.cpp`、`scene/3d/*.cpp`、export 插件里的 `"forward_plus"` 字符串是特性提示/平台校验，deferred 桌面专用，M5 统一复查。
+注：`scene/resources/environment.cpp`、`scene/3d/*.cpp`、export 插件里的 `"forward_plus"` 字符串是特性提示/平台校验，frp 桌面专用，M5 统一复查。
 
 ---
 
@@ -250,7 +250,7 @@ deferred（目标）:
 
 | # | 风险 | 等级 | 应对 |
 |---|------|------|------|
-| 1 | **上游同步税**（最大长期成本）：Godot 后续版本对 Forward+ 的修复/新特性需手动移植到复制文件 | 高 | 所有 defer 特有改动集中在 `_render_scene` 编排、`MODE_RENDER_GBUFFER`、`deferred_lighting.glsl` 三处，其余保持与上游逐字节接近；定期 `git diff upstream` 审计；大版本时可「重新复制 + 重放差异」 |
+| 1 | **上游同步税**（最大长期成本）：Godot 后续版本对 Forward+ 的修复/新特性需手动移植到复制文件 | 高 | 所有 defer 特有改动集中在 `_render_scene` 编排、`MODE_RENDER_GBUFFER`、`frp_lighting.glsl` 三处，其余保持与上游逐字节接近；定期 `git diff upstream` 审计；大版本时可「重新复制 + 重放差异」 |
 | 2 | 材质 shader 双份维护（109KB glsl 复制） | 中 | 共享的函数库 include（lights/gi/aa 等）不复制，实际分叉面只有主 glsl 与 `_inc`；材质变体列表与上游保持同名同序 |
 | 3 | 材质兼容面广：render_mode 组合 × G-buffer 输出的正确性 | 中 | M4 的 fallback 清单保守起步（宁可多回退前向，不冒视觉错误风险）；用 `editor_build_profile` + 测试矩阵逐项验证 |
 | 4 | MSAA 与 G-buffer | 中 | M2 先 resolve 方案；不行则延迟模式下告警禁用 MSAA（`_render_scene` 里 `use_msaa = false` + `WARN_PRINT_ONCE`） |
@@ -263,7 +263,7 @@ deferred（目标）:
 
 ## 8. 验证方法
 
-- **M0**：`--rendering-method deferred` 启动 + 截图逐像素 diff（与 forward_plus）。
+- **M0**：`--rendering-method frp` 启动 + 截图逐像素 diff（与 forward_plus）。
 - **M2/M3**：测试场景集——①单方向光空场景 ②8 omni/spot 室内 ③128 光源压力场 ④SDFGI 室外 ⑤VoxelGI + 体积雾 ⑥decal + SSS + projector + 软阴影——每个场景两渲染器并排截图对比。
 - **G-buffer 检查**：临时 debug draw（或截图工具）查看各通道；normal 通道应与 `VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER` 一致。
 - **性能**：固定场景下光源数 1/8/32/128 × 1080p/4K 帧时间表，验证「光源数扩展时光照成本与像素数而非几何复杂度成正比」的延迟收益。
@@ -272,6 +272,6 @@ deferred（目标）:
 
 ## 9. 开发顺序建议
 
-1. 全程在 `deferred-renderer` 分支进行，`feng-godot` 保持可随时 merge 上游。
+1. 全程在 `frp-renderer` 分支进行，`feng-godot` 保持可随时 merge 上游。
 2. M0 完成即提交一次（纯克隆，diff 清晰可审计）；每个里程碑独立提交，M1/M2 的中间态保证引擎始终可跑。
-3. 开发期 Forward+ 与 deferred 并存切换（改 project setting 即可）是最有效的对比调试手段——**复制代码里不要急着删前向路径**，M5 再清理。
+3. 开发期 Forward+ 与 frp 并存切换（改 project setting 即可）是最有效的对比调试手段——**复制代码里不要急着删前向路径**，M5 再清理。

@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  scene_shader_deferred_clustered.h                                      */
+/*  scene_shader_frp_clustered.h                                      */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -31,15 +31,15 @@
 #pragma once
 
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
-#include "servers/rendering/renderer_rd/shaders/deferred_clustered/scene_deferred_clustered.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/frp_clustered/scene_frp_clustered.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/rendering_server_types.h"
 
 namespace RendererSceneRenderImplementation {
 
-class SceneShaderDeferredClustered {
+class SceneShaderFRPClustered {
 private:
-	static SceneShaderDeferredClustered *singleton;
+	static SceneShaderFRPClustered *singleton;
 	static Mutex singleton_mutex;
 
 public:
@@ -327,7 +327,7 @@ public:
 
 	RendererRD::MaterialStorage::ShaderData *_create_shader_func();
 	static RendererRD::MaterialStorage::ShaderData *_create_shader_funcs() {
-		return static_cast<SceneShaderDeferredClustered *>(singleton)->_create_shader_func();
+		return static_cast<SceneShaderFRPClustered *>(singleton)->_create_shader_func();
 	}
 
 	struct MaterialData : public RendererRD::MaterialStorage::MaterialData {
@@ -345,10 +345,10 @@ public:
 
 	RendererRD::MaterialStorage::MaterialData *_create_material_func(ShaderData *p_shader);
 	static RendererRD::MaterialStorage::MaterialData *_create_material_funcs(RendererRD::MaterialStorage::ShaderData *p_shader) {
-		return static_cast<SceneShaderDeferredClustered *>(singleton)->_create_material_func(static_cast<ShaderData *>(p_shader));
+		return static_cast<SceneShaderFRPClustered *>(singleton)->_create_material_func(static_cast<ShaderData *>(p_shader));
 	}
 
-	SceneDeferredClusteredShaderRD shader;
+	SceneFrpClusteredShaderRD shader;
 	ShaderCompiler compiler;
 	bool emulate_point_size = false;
 
@@ -379,8 +379,8 @@ public:
 
 	uint32_t pipeline_compilations[RSE::PIPELINE_SOURCE_MAX] = {};
 
-	SceneShaderDeferredClustered();
-	~SceneShaderDeferredClustered();
+	SceneShaderFRPClustered();
+	~SceneShaderFRPClustered();
 
 	void init(const String p_defines);
 	void set_default_specialization(const ShaderSpecialization &p_specialization);

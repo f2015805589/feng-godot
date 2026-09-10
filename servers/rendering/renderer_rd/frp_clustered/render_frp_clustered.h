@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  render_deferred_clustered.h                                            */
+/*  render_frp_clustered.h                                            */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -33,13 +33,13 @@
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
-#include "servers/rendering/renderer_rd/deferred_clustered/scene_shader_deferred_clustered.h"
+#include "servers/rendering/renderer_rd/frp_clustered/scene_shader_frp_clustered.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
-#include "servers/rendering/renderer_rd/shaders/deferred_clustered/deferred_lighting.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
 
@@ -47,7 +47,7 @@
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
 #endif
 
-#define RB_SCOPE_DEFERRED_CLUSTERED SNAME("deferred_clustered")
+#define RB_SCOPE_FRP_CLUSTERED SNAME("frp_clustered")
 
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
@@ -64,8 +64,8 @@
 
 namespace RendererSceneRenderImplementation {
 
-class RenderDeferredClustered : public RendererSceneRenderRD {
-	friend SceneShaderDeferredClustered;
+class RenderFRPClustered : public RendererSceneRenderRD {
+	friend SceneShaderFRPClustered;
 
 	enum {
 		SCENE_UNIFORM_SET = 0,
@@ -87,19 +87,19 @@ class RenderDeferredClustered : public RendererSceneRenderRD {
 		RENDER_LIST_MOTION, //used for opaque objects with motion
 		RENDER_LIST_ALPHA, //used for transparent objects
 		RENDER_LIST_SECONDARY, //used for shadows and other objects
-		RENDER_LIST_OPAQUE_FALLBACK, //used for opaque objects that must be rendered forward (deferred renderer)
+		RENDER_LIST_OPAQUE_FALLBACK, //used for opaque objects that must be rendered forward (FRP renderer)
 		RENDER_LIST_MAX
 	};
 
 	/* Scene Shader */
 
-	SceneShaderDeferredClustered scene_shader;
+	SceneShaderFRPClustered scene_shader;
 
 public:
 	/* Framebuffer */
 
-	class RenderBufferDataDeferredClustered : public RenderBufferCustomDataRD {
-		GDCLASS(RenderBufferDataDeferredClustered, RenderBufferCustomDataRD)
+	class RenderBufferDataFRPClustered : public RenderBufferCustomDataRD {
+		GDCLASS(RenderBufferDataFRPClustered, RenderBufferCustomDataRD)
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
@@ -133,38 +133,38 @@ public:
 		RID render_sdfgi_uniform_set;
 
 		void ensure_specular();
-		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_SPECULAR); }
-		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_SPECULAR); }
-		RID get_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_SPECULAR, p_layer, 0); }
-		RID get_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_SPECULAR_MSAA, p_layer, 0); }
+		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR); }
+		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR); }
+		RID get_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR, p_layer, 0); }
+		RID get_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR_MSAA, p_layer, 0); }
 
 		void ensure_normal_roughness_texture();
-		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
-		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
-		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
-		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
-		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
+		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
+		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
+		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
+		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
+		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
 
 		void ensure_voxelgi();
-		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
-		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
+		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI); }
+		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI); }
+		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
+		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
 
 		void ensure_gbuffer();
-		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
-		RID get_gbuffer_albedo() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
-		RID get_gbuffer_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, p_layer, 0); }
-		RID get_gbuffer_albedo_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA); }
-		RID get_gbuffer_albedo_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, p_layer, 0); }
-		RID get_gbuffer_orm() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM); }
-		RID get_gbuffer_orm(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM, p_layer, 0); }
-		RID get_gbuffer_orm_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA); }
-		RID get_gbuffer_orm_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA, p_layer, 0); }
-		RID get_gbuffer_emission() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION); }
-		RID get_gbuffer_emission(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION, p_layer, 0); }
-		RID get_gbuffer_emission_msaa() const { return render_buffers->get_texture(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA); }
-		RID get_gbuffer_emission_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DEFERRED_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA, p_layer, 0); }
+		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
+		RID get_gbuffer_albedo() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
+		RID get_gbuffer_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, p_layer, 0); }
+		RID get_gbuffer_albedo_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA); }
+		RID get_gbuffer_albedo_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, p_layer, 0); }
+		RID get_gbuffer_orm() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM); }
+		RID get_gbuffer_orm(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM, p_layer, 0); }
+		RID get_gbuffer_orm_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA); }
+		RID get_gbuffer_orm_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA, p_layer, 0); }
+		RID get_gbuffer_emission() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION); }
+		RID get_gbuffer_emission(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION, p_layer, 0); }
+		RID get_gbuffer_emission_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA); }
+		RID get_gbuffer_emission_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION_MSAA, p_layer, 0); }
 
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
@@ -228,21 +228,21 @@ private:
 		RID lut2_texture;
 	} ltc;
 
-	enum DeferredLightingMode {
-		DEFERRED_LIGHTING_MODE_BASE,
-		DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR,
-		DEFERRED_LIGHTING_MODE_MULTIVIEW,
-		DEFERRED_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW,
-		DEFERRED_LIGHTING_MODE_MAX
+	enum FrpLightingMode {
+		FRP_LIGHTING_MODE_BASE,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR,
+		FRP_LIGHTING_MODE_MULTIVIEW,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW,
+		FRP_LIGHTING_MODE_MAX
 	};
 
-	struct DeferredLighting {
-		DeferredLightingShaderRD shader;
+	struct FrpLighting {
+		FrpLightingShaderRD shader;
 		RID shader_version;
-		PipelineCacheRD pipelines[DEFERRED_LIGHTING_MODE_MAX];
-		SceneShaderDeferredClustered::ShaderSpecialization specialization = {};
+		PipelineCacheRD pipelines[FRP_LIGHTING_MODE_MAX];
+		SceneShaderFRPClustered::ShaderSpecialization specialization = {};
 		bool specialization_initialized = false;
-	} deferred_lighting;
+	} frp_lighting;
 
 	enum PassMode {
 		PASS_MODE_COLOR,
@@ -285,9 +285,9 @@ private:
 		RD::FramebufferFormatID framebuffer_format = 0;
 		uint32_t element_offset = 0;
 		bool use_directional_soft_shadow = false;
-		SceneShaderDeferredClustered::ShaderSpecialization base_specialization = {};
+		SceneShaderFRPClustered::ShaderSpecialization base_specialization = {};
 
-		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderDeferredClustered::ShaderSpecialization p_base_specialization = {}) {
+		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderFRPClustered::ShaderSpecialization p_base_specialization = {}) {
 			elements = p_elements;
 			element_info = p_element_info;
 			element_count = p_element_count;
@@ -368,8 +368,8 @@ private:
 		};
 
 		struct PushConstantUbershader {
-			SceneShaderDeferredClustered::ShaderSpecialization specialization;
-			SceneShaderDeferredClustered::UbershaderConstants constants;
+			SceneShaderFRPClustered::ShaderSpecialization specialization;
+			SceneShaderFRPClustered::UbershaderConstants constants;
 		};
 
 		struct PushConstant {
@@ -494,7 +494,7 @@ private:
 		void grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append);
 	} scene_state;
 
-	static RenderDeferredClustered *singleton;
+	static RenderFRPClustered *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
@@ -529,7 +529,7 @@ private:
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
 	struct GeometryInstanceData;
-	class GeometryInstanceDeferredClustered;
+	class GeometryInstanceFRPClustered;
 
 	struct GeometryInstanceLightmapSH {
 		Color sh[9];
@@ -587,15 +587,15 @@ private:
 
 		void *surface = nullptr;
 		RID material_uniform_set;
-		SceneShaderDeferredClustered::ShaderData *shader = nullptr;
-		SceneShaderDeferredClustered::MaterialData *material = nullptr;
+		SceneShaderFRPClustered::ShaderData *shader = nullptr;
+		SceneShaderFRPClustered::MaterialData *material = nullptr;
 
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
-		SceneShaderDeferredClustered::ShaderData *shader_shadow = nullptr;
+		SceneShaderFRPClustered::ShaderData *shader_shadow = nullptr;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
-		GeometryInstanceDeferredClustered *owner = nullptr;
+		GeometryInstanceFRPClustered *owner = nullptr;
 		SelfList<GeometryInstanceSurfaceDataCache> compilation_dirty_element;
 		SelfList<GeometryInstanceSurfaceDataCache> compilation_all_element;
 
@@ -603,7 +603,7 @@ private:
 				compilation_dirty_element(this), compilation_all_element(this) {}
 	};
 
-	class GeometryInstanceDeferredClustered : public RenderGeometryInstanceBase {
+	class GeometryInstanceFRPClustered : public RenderGeometryInstanceBase {
 	public:
 		// lightmap
 		RID lightmap_instance;
@@ -632,9 +632,9 @@ private:
 		Transform3D prev_transform;
 		RID voxel_gi_instances[MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE];
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
-		SelfList<GeometryInstanceDeferredClustered> dirty_list_element;
+		SelfList<GeometryInstanceFRPClustered> dirty_list_element;
 
-		GeometryInstanceDeferredClustered() :
+		GeometryInstanceFRPClustered() :
 				dirty_list_element(this) {}
 
 		virtual void _mark_dirty() override;
@@ -660,19 +660,19 @@ private:
 	static void _geometry_instance_dependency_changed(Dependency::DependencyChangedNotification p_notification, DependencyTracker *p_tracker);
 	static void _geometry_instance_dependency_deleted(const RID &p_dependency, DependencyTracker *p_tracker);
 
-	SelfList<GeometryInstanceDeferredClustered>::List geometry_instance_dirty_list;
+	SelfList<GeometryInstanceFRPClustered>::List geometry_instance_dirty_list;
 	SelfList<GeometryInstanceSurfaceDataCache>::List geometry_surface_compilation_dirty_list;
 	SelfList<GeometryInstanceSurfaceDataCache>::List geometry_surface_compilation_all_list;
 
-	PagedAllocator<GeometryInstanceDeferredClustered> geometry_instance_alloc;
+	PagedAllocator<GeometryInstanceFRPClustered> geometry_instance_alloc;
 	PagedAllocator<GeometryInstanceSurfaceDataCache> geometry_instance_surface_alloc;
 	PagedAllocator<GeometryInstanceLightmapSH> geometry_instance_lightmap_sh;
 
 	struct SurfacePipelineData {
 		void *mesh_surface = nullptr;
 		void *mesh_surface_shadow = nullptr;
-		SceneShaderDeferredClustered::ShaderData *shader = nullptr;
-		SceneShaderDeferredClustered::ShaderData *shader_shadow = nullptr;
+		SceneShaderFRPClustered::ShaderData *shader = nullptr;
+		SceneShaderFRPClustered::ShaderData *shader_shadow = nullptr;
 		bool instanced = false;
 		bool uses_opaque = false;
 		bool uses_transparent = false;
@@ -705,15 +705,15 @@ private:
 	GlobalPipelineData global_pipeline_data_compiled = {};
 	GlobalPipelineData global_pipeline_data_required = {};
 
-	typedef Pair<SceneShaderDeferredClustered::ShaderData *, SceneShaderDeferredClustered::ShaderData::PipelineKey> ShaderPipelinePair;
+	typedef Pair<SceneShaderFRPClustered::ShaderData *, SceneShaderFRPClustered::ShaderData::PipelineKey> ShaderPipelinePair;
 
 	void _update_global_pipeline_data_requirements_from_project();
 	void _update_global_pipeline_data_requirements_from_light_storage();
-	void _geometry_instance_add_surface_with_material(GeometryInstanceDeferredClustered *ginstance, uint32_t p_surface, SceneShaderDeferredClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
-	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceDeferredClustered *ginstance, uint32_t p_surface, SceneShaderDeferredClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
-	void _geometry_instance_add_surface(GeometryInstanceDeferredClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
+	void _geometry_instance_add_surface_with_material(GeometryInstanceFRPClustered *ginstance, uint32_t p_surface, SceneShaderFRPClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
+	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceFRPClustered *ginstance, uint32_t p_surface, SceneShaderFRPClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
+	void _geometry_instance_add_surface(GeometryInstanceFRPClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
-	void _mesh_compile_pipeline_for_surface(SceneShaderDeferredClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderDeferredClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
+	void _mesh_compile_pipeline_for_surface(SceneShaderFRPClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderFRPClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global);
 	void _update_dirty_geometry_instances();
@@ -857,7 +857,7 @@ protected:
 	virtual void _render_particle_collider_heightfield(RID p_fb, const Transform3D &p_cam_transform, const Projection &p_cam_projection, const PagedArray<RenderGeometryInstance *> &p_instances) override;
 
 public:
-	static RenderDeferredClustered *get_singleton() { return singleton; }
+	static RenderFRPClustered *get_singleton() { return singleton; }
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }
@@ -898,7 +898,7 @@ public:
 
 	virtual void update() override;
 
-	RenderDeferredClustered();
-	~RenderDeferredClustered();
+	RenderFRPClustered();
+	~RenderFRPClustered();
 };
 } // namespace RendererSceneRenderImplementation

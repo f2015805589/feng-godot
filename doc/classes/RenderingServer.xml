@@ -6277,16 +6277,16 @@
 		<constant name="FEATURE_MULTITHREADED" value="1" enum="Features" deprecated="This constant has not been used since Godot 3.0.">
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_GBUFFER" value="5" enum="CompositorEffectCallbackType">
-			Deferred only: before G-buffer rendering. Current-frame depth, normals, material and color buffers are not available yet.
+			FRP only: before G-buffer rendering. Current-frame depth, normals, material and color buffers are not available yet.
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_GBUFFER" value="6" enum="CompositorEffectCallbackType">
-			Deferred only: after G-buffer rendering and MSAA resolve, before screen-space effects. Access material textures through RenderSceneBuffersRD under the deferred_clustered scope.
+			FRP only: after G-buffer rendering and MSAA resolve, before screen-space effects. Access material textures through RenderSceneBuffersRD under the frp_clustered scope.
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_LIGHTING" value="7" enum="CompositorEffectCallbackType">
-			Deferred only: after screen-space effects and before lighting. Depth, normals and material buffers are available; current-frame lit color is not available yet.
+			FRP only: after screen-space effects and before lighting. Depth, normals and material buffers are available; current-frame lit color is not available yet.
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_LIGHTING" value="8" enum="CompositorEffectCallbackType">
-			Deferred only: after lighting, before opaque forward fallback and sky. Effects in the same stage execute in their order in Compositor.compositor_effects.
+			FRP only: after lighting, before opaque forward fallback and sky. Effects in the same stage execute in their order in Compositor.compositor_effects.
 		</constant>
 	</constants>
 </class>

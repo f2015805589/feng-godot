@@ -1,0 +1,36 @@
+[gd_resource type="CompositorEffect" script_class="FengShaderPass" load_steps=7 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/shader_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_output.gd" id="3"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/bloom-lite/bloom_downsample.glsl" id="4"]
+
+[sub_resource type="Resource" id="Src"]
+script = ExtResource("2")
+binding = 0
+source = 0
+binding_type = 0
+
+[sub_resource type="Resource" id="Dst"]
+script = ExtResource("2")
+binding = 1
+source = 7
+custom_name = &"bloom_bright"
+binding_type = 1
+
+[sub_resource type="Resource" id="Out"]
+script = ExtResource("3")
+name = &"bloom_bright"
+data_format = 96
+usage = 9
+scale = Vector2(0.5, 0.5)
+
+[resource]
+script = ExtResource("1")
+stage = 4
+shader_file = ExtResource("4")
+mode = 0
+parameters = Vector4(0.8, 0, 0, 0)
+dispatch_target = &"bloom_bright"
+inputs = Array[ExtResource("2")]([SubResource("Src"), SubResource("Dst")])
+outputs = Array[ExtResource("3")]([SubResource("Out")])

@@ -5,7 +5,7 @@ Import("env")
 
 env.add_source_files(env.servers_sources, "*.cpp")
 
-SConscript("deferred_clustered/SCsub")
+SConscript("frp_clustered/SCsub")
 SConscript("effects/SCsub")
 SConscript("environment/SCsub")
 SConscript("forward_clustered/SCsub")

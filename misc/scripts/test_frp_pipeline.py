@@ -15,7 +15,7 @@ project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
 shutil.copytree(ROOT / "misc/feng-addons/feng-render-pipeline", project / "addons/feng-render-pipeline")
 (project / "project.godot").write_text(
     'config_version=5\n[application]\nconfig/name="Deferred tests"\n'
-    '[rendering]\nrenderer/rendering_method="deferred"\n', encoding="utf-8"
+    '[rendering]\nrenderer/rendering_method="frp"\n', encoding="utf-8"
 )
 env = dict(os.environ, APPDATA=str(project / "config"), LOCALAPPDATA=str(project / "cache"))
 startup = None
@@ -24,7 +24,7 @@ if os.name == "nt":
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
 base = [str(ROOT / "bin/godot.windows.editor.x86_64.exe"), "--path", str(project),
-        "--rendering-method", "deferred", "--rendering-driver", args.driver,
+        "--rendering-method", "frp", "--rendering-driver", args.driver,
         "--resolution", "320x240", "--position", "-10000,-10000"]
 
 
@@ -43,6 +43,6 @@ def run(name, extra, marker=None):
 # Recovery skips loading editor plugins, including capture injection. Import
 # still registers scripts and compiles the reusable compute pass shader.
 run("import", ["--editor", "--recovery-mode", "--import"])
-run("gpu", ["--script", str(ROOT / "misc/scripts/tests/deferred_passes.gd")],
+run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_passes.gd")],
     "PASS configurable compute pass shader, bindings, parameters and enabled state")
 print("Logs:", project)

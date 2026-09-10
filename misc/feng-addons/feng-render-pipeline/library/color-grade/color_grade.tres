@@ -1,0 +1,25 @@
+[gd_resource type="CompositorEffect" script_class="FengShaderPass" load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/shader_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/color-grade/color_grade.glsl" id="3"]
+
+[sub_resource type="Resource" id="Src"]
+script = ExtResource("2")
+binding = 0
+source = 0
+binding_type = 0
+
+[sub_resource type="Resource" id="Dst"]
+script = ExtResource("2")
+binding = 1
+source = 0
+binding_type = 1
+
+[resource]
+script = ExtResource("1")
+stage = 4
+shader_file = ExtResource("3")
+mode = 0
+parameters = Vector4(1.1, 1.05, 1.02, 1.0)
+inputs = Array[ExtResource("2")]([SubResource("Src"), SubResource("Dst")])

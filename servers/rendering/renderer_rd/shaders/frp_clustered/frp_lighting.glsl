@@ -33,8 +33,8 @@ void main() {
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
-// Enables the G-buffer texture declarations in scene_deferred_clustered_inc.glsl.
-#define MODE_DEFERRED_LIGHTING
+// Enables the G-buffer texture declarations in scene_frp_clustered_inc.glsl.
+#define MODE_FRP_LIGHTING
 
 #ifdef USE_MULTIVIEW
 #define OUTPUT_IS_MULTIVIEW true
@@ -45,7 +45,7 @@ void main() {
 // Include order is significant: scene declarations supply shared constants.
 /* clang-format off */
 #include "../half_inc.glsl"
-#include "scene_deferred_clustered_inc.glsl"
+#include "scene_frp_clustered_inc.glsl"
 #include "../scene_forward_lights_inc.glsl"
 /* clang-format on */
 // GI is evaluated before lighting and sampled from ambient/reflection buffers.
