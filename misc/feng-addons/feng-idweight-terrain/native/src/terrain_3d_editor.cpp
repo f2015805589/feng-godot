@@ -16,6 +16,30 @@
 // Private Functions
 ///////////////////////////
 
+// Bilinear brush mask sample, mirroring Hydra
+// TerrainSurfaceBrushStamp::SampleBilinear. The mask is the brush image's R
+// channel, cached in _brush_data["brush_mask"] by set_brush_data(). UVs outside
+// [0, 1] read as zero.
+static real_t _sample_brush_mask(const PackedFloat32Array &p_mask, const Vector2i &p_size, const Vector2 &p_uv) {
+	if (p_mask.is_empty() || p_size.x < 1 || p_size.y < 1) {
+		return 0.f;
+	}
+	if (p_uv.x < 0.f || p_uv.x > 1.f || p_uv.y < 0.f || p_uv.y > 1.f) {
+		return 0.f;
+	}
+	const real_t x = p_uv.x * real_t(p_size.x - 1);
+	const real_t y = p_uv.y * real_t(p_size.y - 1);
+	const int x0 = int(Math::floor(x));
+	const int y0 = int(Math::floor(y));
+	const int x1 = Math::min(x0 + 1, p_size.x - 1);
+	const int y1 = Math::min(y0 + 1, p_size.y - 1);
+	const real_t tx = x - real_t(x0);
+	const real_t ty = y - real_t(y0);
+	const real_t bottom = Math::lerp(p_mask[y0 * p_size.x + x0], p_mask[y0 * p_size.x + x1], tx);
+	const real_t top = Math::lerp(p_mask[y1 * p_size.x + x0], p_mask[y1 * p_size.x + x1], tx);
+	return Math::lerp(bottom, top, ty);
+}
+
 // Sends the whole region aabb to edited_area
 void Terrain3DEditor::_send_region_aabb(const Vector2i &p_region_loc, const Vector2 &p_height_range) {
 	Terrain3D::RegionSize region_size = _terrain->get_region_size();
@@ -34,17 +58,23 @@ void Terrain3DEditor::_send_region_aabb(const Vector2i &p_region_loc, const Vect
 //   - different-pair strokes start from target * influence
 //   - a non-zero brush mask always authors the selected pair, keeping at least
 //     the first discrete level instead of silently replacing with one material
-void Terrain3DEditor::_paint_surface_pair(Image *p_surface_map, const Vector2i &p_pixel, const real_t p_brush_alpha,
+//
+// p_texel points at the texel's two little-endian bytes inside the region's
+// surface map. The packed word is written bit-exactly: it must NOT go through
+// Image::set_pixelv(), which routes the value through a float and truncates.
+// That loses one LSB for 32895 of the 65536 possible words, and for the
+// level-1 word (2048) the borrow reaches into the BackgroundId field, turning
+// {overlay 1, level 1} into an invalid {overlay 0, background 31, mode 3,
+// level 8} at full weight. That is what used to leave a ring of garbage around
+// every soft brush stroke. Returns true when the texel changed.
+bool Terrain3DEditor::_paint_surface_pair(uint8_t *p_texel, const real_t p_brush_alpha,
 		const real_t p_strength, const int p_overlay_id, const int p_background_id,
 		const int p_pair_mode, const int p_weight_level, const bool p_modifier_alt) {
 	using namespace TerrainSurfaceIdWeight;
-	if (!p_surface_map || p_surface_map->get_format() != Image::Format(39)) {
-		LOG(ERROR, "Surface map must be R16 UNORM");
-		return;
+	if (!p_texel) {
+		return false;
 	}
-	// Read current packed value (R16 UNORM -> uint16)
-	real_t src_r = p_surface_map->get_pixelv(p_pixel).r;
-	uint16_t current = uint16_t(CLAMP(Math::round(src_r * 65535.0), 0.0, 65535.0));
+	uint16_t current = read_le(p_texel);
 	// Influence combines brush alpha and strength, matching Hydra's
 	// EvaluateInfluence * brush strength semantics.
 	real_t influence = CLAMP(p_brush_alpha * p_strength, 0.f, 1.f);
@@ -55,13 +85,13 @@ void Terrain3DEditor::_paint_surface_pair(Image *p_surface_map, const Vector2i &
 		next = single(uint8_t(p_background_id));
 	} else if (!paint(current, target, float(influence), next)) {
 		LOG(ERROR, "Invalid surface paint parameters");
-		return;
+		return false;
 	}
-	uint8_t bytes[2];
-	write_le(next, bytes);
-	// Write back as R16 UNORM: value / 65535
-	real_t dest_r = real_t(next) / 65535.0;
-	p_surface_map->set_pixelv(p_pixel, Color(dest_r, 0.f, 0.f, 1.f));
+	if (next == current) {
+		return false;
+	}
+	write_le(next, p_texel);
+	return true;
 }
 
 // Process location to add new region, mark as deleted, or just retrieve
@@ -150,7 +180,9 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 		LOG(ERROR, "Invalid brush image. Returning");
 		return;
 	}
-	Vector2i img_size = _brush_data["brush_image_size"];
+	// Brush mask cached as floats by set_brush_data(), sampled bilinearly below.
+	PackedFloat32Array brush_mask = _brush_data.get("brush_mask", PackedFloat32Array());
+	Vector2i brush_mask_size = _brush_data.get("brush_image_size", Vector2i());
 	real_t brush_size = CLAMP(real_t(_brush_data.get("size", 10.f)), 2.f, 4096.f); // Meters
 
 	// Typicall we multiply mouse pressure & strength setting, but
@@ -185,12 +217,10 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	int pair_weight_level = int(_brush_data.get("pair_weight_level", 8)); // 1..8
 
 	Vector2 slope_range = _brush_data["slope"];
-	bool enable_angle = _brush_data["enable_angle"];
-	bool dynamic_angle = _brush_data["dynamic_angle"];
-	real_t angle = _brush_data["angle"];
-
-	bool enable_scale = _brush_data["enable_scale"];
-	real_t scale = _brush_data["scale"];
+	// enable_angle / dynamic_angle / angle / enable_scale / scale are still
+	// sanitized by set_brush_data() for the decal and the pickers, but nothing in
+	// this function consumes them any more: the Hydra IdWeight R16 contract has
+	// no per-texel UV rotation or scale field (see _paint_surface_pair).
 
 	real_t gamma = _brush_data["gamma"];
 	PackedVector3Array gradient_points = _brush_data["gradient_points"];
@@ -227,6 +257,28 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	// rebuild at the end of the last _operate() call, but until painting is finished we only
 	// need to track if _added_removed_locations has changed between now and the end of the loop
 	int regions_added_removed = _added_removed_locations.size();
+
+	// R16 surface painting needs the region's raw bytes. Image::get_data() hands
+	// back a copy-on-write view, so the bytes are cached per region and flushed
+	// when the brush moves to another region (and once more after the loop).
+	// See _paint_surface_pair() for why the packed word must not go through
+	// Image::set_pixelv().
+	Image *surface_image = nullptr;
+	Terrain3DRegion *surface_region = nullptr;
+	PackedByteArray surface_bytes;
+	auto flush_surface = [&]() {
+		if (surface_image && surface_region) {
+			surface_image->set_data(surface_image->get_width(), surface_image->get_height(),
+					false, Image::Format(39), surface_bytes);
+			// Mark the region edited so the surface map layer is uploaded to the
+			// GPU texture array. Without this the painted texels stay in CPU
+			// memory and the shader keeps sampling the old (all-zero) layer.
+			surface_region->set_modified(true);
+		}
+		surface_image = nullptr;
+		surface_region = nullptr;
+		surface_bytes = PackedByteArray();
+	};
 
 	for (real_t x = 0.f; x < brush_size; x += vertex_spacing) {
 		for (real_t y = 0.f; y < brush_size; y += vertex_spacing) {
@@ -265,18 +317,24 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				continue;
 			}
 
-			Vector2 brush_uv = Vector2(x, y) / brush_size;
-			Vector2i brush_pixel_position = Vector2i(_get_rotated_uv(brush_uv, rot) * img_size);
-			if (!_is_in_bounds(brush_pixel_position, img_size)) {
-				continue;
-			}
+			// Hydra parity: the brush mask is evaluated at the world position of
+			// the vertex being written, never at the loop's sample coordinate.
+			// The loop samples are offset from the texel lattice by up to one
+			// vertex spacing, so using (x, y) / brush_size here would leave the
+			// mask up to a texel away from its target and slide the whole stamp
+			// with the cursor. See TerrainSurfaceBrushStamp::EvaluateInfluence().
+			Vector2 lattice_position = Vector2(
+					Math::floor(brush_global_position.x / vertex_spacing),
+					Math::floor(brush_global_position.z / vertex_spacing)) *
+					vertex_spacing;
+			Vector2 brush_uv = (lattice_position - Vector2(p_global_position.x, p_global_position.z)) / brush_size + V2(0.5f);
 
 			Vector3 edited_position = brush_global_position;
 			edited_position.y = data->get_height(edited_position);
 			edited_area = edited_area.expand(edited_position);
 
 			// Start brushing on the map
-			real_t brush_alpha = brush_image->get_pixelv(brush_pixel_position).r;
+			real_t brush_alpha = _sample_brush_mask(brush_mask, brush_mask_size, _get_rotated_uv(brush_uv, rot));
 			brush_alpha = real_t(Math::pow(double(brush_alpha), double(gamma)));
 			brush_alpha = std::isnan(brush_alpha) ? 0.f : brush_alpha;
 			Color src = map->get_pixelv(map_pixel_position);
@@ -360,6 +418,32 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				edited_area = edited_area.expand(edited_position);
 
 			} else if (map_type == TYPE_CONTROL) {
+				if (_tool == TEXTURE) {
+					// Hydra IdWeight material painting writes the region's R16
+					// surface map. The legacy RF control map is never authored by
+					// this tool and must not be decoded here: `src` holds the
+					// packed R16 word, not a control bitfield.
+					if (!data->is_in_slope(brush_global_position, slope_range)) {
+						continue;
+					}
+					backup_region(region);
+					if (surface_region != region.ptr()) {
+						flush_surface();
+						if (map->get_format() != Image::Format(39)) {
+							LOG(ERROR, "Surface map must be R16 UNORM");
+							continue;
+						}
+						surface_image = map;
+						surface_region = region.ptr();
+						surface_bytes = map->get_data();
+					}
+					uint8_t *surface_texel = surface_bytes.ptrw() +
+							(int64_t(map_pixel_position.y) * map->get_width() + map_pixel_position.x) * 2;
+					_paint_surface_pair(surface_texel, brush_alpha, strength,
+							pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
+							modifier_alt);
+					continue;
+				}
 				// Get current bit field from pixel
 				uint32_t base_id = get_base(src.r);
 				uint32_t overlay_id = get_overlay(src.r);
@@ -369,32 +453,8 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				bool hole = is_hole(src.r);
 				bool navigation = is_nav(src.r);
 				bool autoshader = is_auto(src.r);
-				// Lookup to shift values saved to control map so that 0 (default) is the first entry
-				// Shader scale array is aligned to match this.
-				std::array<uint32_t, 8> scale_align = { 5, 6, 7, 0, 1, 2, 3, 4 };
 
 				switch (_tool) {
-					case TEXTURE: {
-						if (!data->is_in_slope(brush_global_position, slope_range)) {
-							continue;
-						}
-						// Hydra IdWeight pair painting writes the R16 surface
-						// map (map points at the region surface map for this
-						// tool). The legacy control bitfield below is only
-						// updated for non-material metadata (angle/scale stay
-						// legacy until their own tools migrate).
-						backup_region(region);
-						_paint_surface_pair(map, map_pixel_position, brush_alpha, strength,
-								pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
-								modifier_alt);
-						// Mark the region edited so the surface map layer is
-						// uploaded to the GPU texture array at the end of the
-						// operation. Without this the painted texels stay in
-						// CPU memory and the shader keeps sampling the old
-						// (all-zero) layer.
-						region->set_modified(true);
-						continue;
-					}
 					case AUTOSHADER: {
 						if (brush_alpha > 0.5f) {
 							autoshader = (_operation == ADD);
@@ -503,14 +563,11 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				}
 			}
 			backup_region(region);
-			if (_tool == TEXTURE) {
-				// The surface map was already written by _paint_surface_pair.
-				region->set_modified(true);
-			} else {
-				map->set_pixelv(map_pixel_position, dest);
-			}
+			map->set_pixelv(map_pixel_position, dest);
 		}
 	}
+	// Write the cached R16 surface bytes back before the maps are uploaded.
+	flush_surface();
 	// Regenerate color mipmaps for edited regions
 	if (map_type == TYPE_COLOR) {
 		for (Ref<Terrain3DRegion> region : _edited_regions) {
@@ -808,6 +865,25 @@ void Terrain3DEditor::set_brush_data(const Dictionary &p_data) {
 		if (img.is_valid() && !img->is_empty()) {
 			_brush_data["brush_image"] = img;
 			_brush_data["brush_image_size"] = img->get_size();
+			// Cache the R channel as floats so the mask can be sampled bilinearly
+			// per vertex without repeated Image lookups. Hydra caches its mask the
+			// same way in TerrainSurfaceBrushMaskCache. Convert a copy so the
+			// caller's brush image (shared with the decal texture) is untouched.
+			Ref<Image> mask_image = img;
+			if (mask_image->get_format() != Image::FORMAT_RF) {
+				mask_image = img->duplicate();
+				mask_image->convert(Image::FORMAT_RF);
+			}
+			PackedByteArray mask_bytes = mask_image->get_data();
+			PackedFloat32Array mask;
+			const int64_t mask_count = int64_t(mask_image->get_width()) * mask_image->get_height();
+			mask.resize(mask_count);
+			const float *mask_src = reinterpret_cast<const float *>(mask_bytes.ptr());
+			real_t *mask_dst = mask.ptrw();
+			for (int64_t i = 0; i < mask_count; i++) {
+				mask_dst[i] = real_t(mask_src[i]);
+			}
+			_brush_data["brush_mask"] = mask;
 		} else {
 			LOG(ERROR, "Brush data doesn't contain a valid image");
 		}

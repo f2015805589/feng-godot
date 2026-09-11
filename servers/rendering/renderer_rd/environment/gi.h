@@ -825,7 +825,11 @@ public:
 	bool half_resolution = false;
 	GiShaderRD shader;
 	RID shader_version;
-	PipelineDeferredRD pipelines[SHADER_SPECIALIZATION_VARIATIONS][MODE_MAX];
+	// The middle index selects the normal_roughness roughness layout: 0 is the
+	// legacy packed layout (roughness folded into normal_roughness.w) used by
+	// forward_clustered, 1 is FRP's split layout where the 30-bit normal owns
+	// all of rgb and roughness lives in gbuffer_orm.g.
+	PipelineDeferredRD pipelines[SHADER_SPECIALIZATION_VARIATIONS][2][MODE_MAX];
 
 	GI();
 	~GI();

@@ -53,13 +53,32 @@ uniform float _vertex_spacing = 1.0;
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1./region_size
-uniform int _region_map_size = 32;
-uniform int _region_map[1024];
+uniform int _region_map_size = 128;
+// Chunk -> layer directory. This is a texture, not a uniform int array, so the
+// world grid is not capped by the uniform buffer size (32x32 was 4 KB, 64x64 would
+// already be 16 KB, 128x128 64 KB). R32F holding slot + 1, 0.0 = no region, so the
+// decode below reproduces the old int array values exactly.
+uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
 //INSERT: MAX_REGIONS_64
 //INSERT: MAX_REGIONS_128
 //INSERT: MAX_REGIONS_256
 //INSERT: MAX_REGIONS_512
 //INSERT: MAX_REGIONS_1024
+// Surface virtual texture. Off by default: the array path stays authoritative until a
+// region's surface source carries more detail than the array can afford to keep
+// resident, and enabling this costs an extra indirection lookup per corner.
+uniform bool _surface_vt_enabled = false;
+uniform int _surface_vt_region_size = 256;
+uniform int _surface_vt_page_size = 256;
+uniform int _surface_vt_page_border = 4;
+uniform int _surface_vt_pages_per_axis = 4;
+uniform int _surface_vt_max_local_mip = 2;
+uniform int _surface_vt_indirection_size = 256;
+uniform highp sampler2D _surface_vt_indirection : filter_nearest, repeat_disable;
+uniform highp sampler2DArray _surface_vt_atlas : repeat_disable;
+// Layer -> virtual page block origin inside the indirection, or (-1, -1) when that
+// sector has no block. Indexed by the layer slot the chunk directory returns.
+uniform vec2 _surface_vt_blocks[MAX_REGIONS];
 uniform float _texture_normal_depth_array[32];
 uniform float _texture_ao_strength_array[32];
 uniform float _texture_ao_affect_array[32];
@@ -87,12 +106,17 @@ group_uniforms general_uniforms;
 //INSERT: FLAT_UNIFORMS
 uniform bool flat_terrain_normals = false;
 uniform float distant_normal_scale : hint_range(1.0, 10.0, 0.1) = 2.0;
+// Legacy 2-texture blend sharpness. Retained so existing materials keep a valid
+// parameter; the Hydra IdWeight material path uses the per-texture-asset
+// slope_blend_sharpness instead.
 uniform float blend_sharpness : hint_range(0, 1) = 0.5;
 group_uniforms;
 
 //INSERT: AUTO_SHADER_UNIFORMS
 //INSERT: DISPLACEMENT_UNIFORMS
-//INSERT: DUAL_SCALING_UNIFORMS
+// Dual scaling was tied to the removed legacy control-map material path. Its
+// uniforms are no longer declared here; restore //INSERT: DUAL_SCALING_UNIFORMS
+// and sample the far scale inside accumulate_idweight_layer() to bring it back.
 //INSERT: MACRO_VARIATION_UNIFORMS
 
 group_uniforms mipmaps;
@@ -125,40 +149,105 @@ varying vec3 v_camera_pos;
 // Vertex
 ////////////////////////
 
-// Takes in world space XZ (UV) coordinates
-// Returns ivec3 with:
-// XY: (0 to _region_size - 1) coordinates within a region
-// Z: layer index used for texturearrays, -1 if not in a region
-ivec3 get_index_coord(const vec2 uv) {
-	vec2 r_uv = round(uv);
-	ivec2 pos = ivec2(floor(r_uv * _region_texel_size)) + (_region_map_size / 2);
+// Reads the chunk directory and returns the texture array layer for a chunk, or -1
+// when the chunk is outside the world grid, holds no region, or its layer is past
+// MAX_REGIONS. Kept identical in meaning to the old `_region_map[...] - 1` lookup.
+int get_region_layer(const ivec2 p_chunk) {
+	ivec2 pos = p_chunk + (_region_map_size / 2);
 	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
-	int map_val = _region_map[pos.y * _region_map_size + pos.x];
+	// Clamp before fetching: an out of range texelFetch is undefined, and `bounds`
+	// is what actually rejects the sample.
+	ivec2 clamped = clamp(pos, ivec2(0), ivec2(_region_map_size - 1));
+	int map_val = int(texelFetch(_region_map, clamped, 0).r + 0.5);
 	int raw_index = map_val - 1;
 	// Real regions limited by max_regions
 	int is_region = bounds * int(raw_index >= 0) * int(raw_index < MAX_REGIONS);
 	// Editor dummies are negative; keep them != -1 so the shader still sees a region
 	int is_dummy = bounds * int(map_val < 0);
 	int layer_index = is_region * raw_index
-	               + is_dummy * (map_val - 1)
-	               - (1 - is_region - is_dummy);
-	return ivec3(ivec2(mod(r_uv, _region_size)), layer_index);
+	                + is_dummy * (map_val - 1)
+	                - (1 - is_region - is_dummy);
+	return layer_index;
+}
+
+// Takes in world space XZ (UV) coordinates
+// Returns ivec3 with:
+// XY: (0 to _region_size - 1) coordinates within a region
+// Z: layer index used for texturearrays, -1 if not in a region
+ivec3 get_index_coord(const vec2 uv) {
+	vec2 r_uv = round(uv);
+	ivec2 chunk = ivec2(floor(r_uv * _region_texel_size));
+	return ivec3(ivec2(mod(r_uv, _region_size)), get_region_layer(chunk));
+}
+
+// Near-field surface id/weight through the virtual texture. Walks the indirection mip
+// chain from local mip 0 upward and takes the first resident page, exactly like the
+// CPU-side lookup, so a coarse page serves the finer texels it covers. Returns false
+// when the sector has no block or no page covers this texel, and the caller falls back
+// to the region texture array.
+//
+// The page grid mirrors Terrain3DData::produce_surface_pages: the sector block is
+// _surface_vt_pages_per_axis pages per axis at local mip 0, so mip m has
+// max(1, pages >> m) pages per axis covering region_size / pages_at_mip region texels.
+bool surface_vt_sample(const ivec2 p_chunk, const int p_layer, const ivec2 p_local_texel,
+		out uint r_value) {
+	if (!_surface_vt_enabled || p_layer < 0 || p_layer >= MAX_REGIONS) {
+		return false;
+	}
+	vec2 block = _surface_vt_blocks[p_layer];
+	if (block.x < 0.0) {
+		return false;
+	}
+	// Not `const`: Godot's shader language requires constant expressions there and
+	// these depend on uniforms.
+	int span0 = max(1, _surface_vt_region_size / _surface_vt_pages_per_axis);
+	// The chunk's own layer slot already identifies the sector, so the virtual page is
+	// the block origin plus the local page coordinate.
+	ivec2 virtual_page = ivec2(block) + p_local_texel / span0;
+	float stored = float(_surface_vt_page_size + 2 * _surface_vt_page_border);
+	for (int mip = 0; mip <= _surface_vt_max_local_mip; mip++) {
+		ivec2 coord = virtual_page >> mip;
+		int level_size = max(1, _surface_vt_indirection_size >> mip);
+		// textureLod rather than texelFetch: the mip level is dynamic here.
+		float slot_f = textureLod(_surface_vt_indirection,
+				(vec2(clamp(coord, ivec2(0), ivec2(level_size - 1))) + 0.5) / float(level_size),
+				float(mip)).r;
+		int slot = int(slot_f + 0.5);
+		if (slot == 65535 || slot < 0) {
+			continue;
+		}
+		// Region texel origin of the matched page, relative to the sector.
+		int span = span0 << mip;
+		ivec2 page_origin = ((coord << mip) - ivec2(block)) * span0;
+		ivec2 offset = p_local_texel - page_origin;
+		ivec2 page_texel = clamp(offset * _surface_vt_page_size / span + _surface_vt_page_border,
+				ivec2(0), ivec2(int(stored) - 1));
+		r_value = uint(texelFetch(_surface_vt_atlas, ivec3(page_texel, slot), 0).r * 65535.0 + 0.5);
+		return true;
+	}
+	return false;
+}
+
+// The surface id/weight for one corner, virtual texture first with the region array as
+// the fallback. `p_uv` is the world XZ that produced `p_index`.
+uint get_surface_value(const vec2 p_uv, const ivec3 p_index) {
+	if (p_index.z > -1 && _surface_vt_enabled) {
+		uint value;
+		vec2 r_uv = round(p_uv);
+		if (surface_vt_sample(ivec2(floor(r_uv * _region_texel_size)), p_index.z, p_index.xy, value)) {
+			return value;
+		}
+	}
+	return uint(texelFetch(_surface_maps, p_index, 0).r * 65535.0 + 0.5);
 }
 
 // Takes in descaled (world_space / region_size) world to region space XZ (UV2) coordinates, returns vec3 with:
 // XY: (0. to 1.) coordinates within a region
 // Z: layer index used for texturearrays, -1 if not in a region
 vec3 get_index_uv(const vec2 uv2) {
-	ivec2 pos = ivec2(floor(uv2)) + (_region_map_size / 2);
-	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
-	int map_val = _region_map[pos.y * _region_map_size + pos.x];
-	int raw_index = map_val - 1;
-	int is_region = bounds * int(raw_index >= 0) * int(raw_index < MAX_REGIONS);
-	int is_dummy = bounds * int(map_val < 0);
-	int layer_index = is_region * raw_index
-	               + is_dummy * (map_val - 1)
-	               - (1 - is_region - is_dummy);
-	return vec3(uv2 - _region_locations[layer_index], float(layer_index));
+	int layer_index = get_region_layer(ivec2(floor(uv2)));
+	// Clamp the table index; callers test z > -1 before using the result.
+	return vec3(uv2 - _region_locations[max(layer_index, 0)], float(layer_index));
 }
 
 float interpolated_height(vec2 pos) {
@@ -271,139 +360,12 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 	return vec2(fma(cs.x, v.x,  cs.y * v.y), fma(cs.x, v.y, -cs.y * v.x));
 }
 
-// 2-4 lookups ( 2-6 with dual scaling )
-void accumulate_material(vec3 base_ddx, vec3 base_ddy, const mat3 TNB, const float weight, const ivec3 index,
-			const uint control, const vec2 texture_weight, const ivec2 texture_id, const vec3 i_normal,
-			float h, inout material mat) {
-
-	// Applying scaling before projection reduces the number of multiplys ops required.
-	vec3 i_vertex = v_vertex;
-
-	// Control map scale
-	float control_scale = DECODE_SCALE(control);
-	base_ddx *= control_scale;
-	base_ddy *= control_scale;
-	i_vertex *= control_scale;
-	h *= control_scale;
-
-	// Index position for detiling.
-	vec2 i_pos = fma(_region_locations[index.z], vec2(_region_size), vec2(index.xy));
-	i_pos *= _vertex_spacing * control_scale;
-
-	// Projection
-	vec2 i_uv = i_vertex.xz;
-	vec4 i_dd = vec4(base_ddx.xz, base_ddy.xz);
-	mat2 p_align = mat2(1.);
-//INSERT: PROJECTION
-
-	// Control map rotation. Must be applied seperatley from detiling to maintain UV continuity.
-	float c_angle = DECODE_ANGLE(control);
-	vec2 c_cs_angle = vec2(cos(c_angle), sin(c_angle));
-	i_uv = rotate_vec2(i_uv, c_cs_angle);
-	i_pos = rotate_vec2(i_pos, c_cs_angle);
-
-	// Blend adjustment of Higher ID from Lower ID normal map in world space.
-	float world_normal = 1.;
-	// mat3 multiply, reduced to 2x fma and 1x mult.
-	#define FAST_WORLD_NORMAL(n) fma(TNB[0], vec3(n.x), fma(TNB[2], vec3(n.z), TNB[1] * vec3(n.y)))
-	
-	float blend = DECODE_BLEND(control); // only used for branching.
-	float sharpness = fma(60., blend_sharpness, 4.);
-
-//INSERT: DUAL_SCALING
-
-	// 1st Texture Asset ID
-	if (blend < 1.0 
-	//INSERT: DUAL_SCALING_CONDITION_0
-		) {
-		int id = texture_id[0];
-		float id_w = texture_weight[0];
-		float id_scale = _texture_uv_scale_array[id];
-		vec4 id_dd = i_dd * id_scale;
-
-		// Detiling and Control map rotation
-		vec2 uv_center = floor(fma(i_pos, vec2(id_scale), vec2(0.5)));
-		vec2 id_detile = fma(random(uv_center), 2.0, -1.0) * _texture_detile_array[id] * TAU;
-		vec2 id_cs_angle = vec2(cos(id_detile.x), sin(id_detile.x));
-		// Apply UV rotation and shift around pivot.
-		vec2 id_uv = rotate_vec2(fma(i_uv, vec2(id_scale), -uv_center), id_cs_angle) + uv_center + id_detile.y - 0.5;
-		// Manual transpose to rotate derivatives and normals counter to uv rotation whilst also
-		// including control map rotation. avoids extra matrix op, and sin/cos calls.
-		id_cs_angle = vec2(
-			fma(id_cs_angle.x, c_cs_angle.x, -id_cs_angle.y * c_cs_angle.y),
-			fma(id_cs_angle.y, c_cs_angle.x, id_cs_angle.x * c_cs_angle.y));
-		// Align derivatives for correct anisotropic filtering
-		id_dd.xy = rotate_vec2(id_dd.xy, id_cs_angle);
-		id_dd.zw = rotate_vec2(id_dd.zw, id_cs_angle);
-
-		vec4 alb = textureGrad(_texture_array_albedo, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
-		vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
-		alb.rgb *= _texture_color_array[id].rgb;
-		nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
-		// Unpack and rotate normal map.
-		nrm.xyz = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
-		float ao = length(nrm.xyz) * 2.0 - 1.0;
-		ao = mix(ao * ao * _texture_ao_strength_array[id] + 1.0 - _texture_ao_strength_array[id], 1.0, alb.a * alb.a);
-		nrm.xyz = normalize(nrm.xyz);
-		nrm.xz = rotate_vec2(nrm.xz, id_cs_angle) * p_align;
-
-//INSERT: DUAL_SCALING_MIX
-		world_normal = FAST_WORLD_NORMAL(nrm).y;
-
-		float id_weight = exp2(sharpness * log2(weight + id_w + alb.a)) * weight;
-		mat.albedo_height = fma(alb, vec4(id_weight), mat.albedo_height);
-		mat.normal_rough = fma(nrm, vec4(id_weight), mat.normal_rough);
-		mat.normal_map_depth = fma(_texture_normal_depth_array[id], id_weight, mat.normal_map_depth);
-		mat.ao = fma(ao, id_weight, mat.ao);
-		mat.ao_affect = fma(_texture_ao_affect_array[id], id_weight, mat.ao_affect);
-		mat.total_weight += id_weight;
-	}
-
-	// 2nd Texture Asset ID
-	if (blend > 0.0 && texture_id[1] != texture_id[0]
-//INSERT: DUAL_SCALING_CONDITION_1
-		) {
-		int id = texture_id[1];
-		float id_w = texture_weight[1];
-		float id_scale = _texture_uv_scale_array[id];
-		vec4 id_dd = i_dd * id_scale;
-
-		// Detiling and Control map rotation
-		vec2 uv_center = floor(fma(i_pos, vec2(id_scale), vec2(0.5)));
-		vec2 id_detile = fma(random(uv_center), 2.0, -1.0) * _texture_detile_array[id] * TAU;
-		vec2 id_cs_angle = vec2(cos(id_detile.x), sin(id_detile.x));
-		// Apply UV rotation and shift around pivot.
-		vec2 id_uv = rotate_vec2(fma(i_uv, vec2(id_scale), -uv_center), id_cs_angle) + uv_center + id_detile.y - 0.5;
-		// Manual transpose to rotate derivatives and normals counter to uv rotation whilst also
-		// including control map rotation. avoids extra matrix op, and sin/cos calls.
-		id_cs_angle = vec2(
-			fma(id_cs_angle.x, c_cs_angle.x, -id_cs_angle.y * c_cs_angle.y),
-			fma(id_cs_angle.y, c_cs_angle.x, id_cs_angle.x * c_cs_angle.y));
-		// Align derivatives for correct anisotropic filtering
-		id_dd.xy = rotate_vec2(id_dd.xy, id_cs_angle);
-		id_dd.zw = rotate_vec2(id_dd.zw, id_cs_angle);
-
-		vec4 alb = textureGrad(_texture_array_albedo, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
-		vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
-		alb.rgb *= _texture_color_array[id].rgb;
-		nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
-		// Unpack and rotate normal map.
-		nrm.xyz = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
-		float ao = length(nrm.xyz) * 2.0 - 1.0;
-		ao = mix(ao * ao * _texture_ao_strength_array[id] + 1.0 - _texture_ao_strength_array[id], 1.0, alb.a * alb.a);
-		nrm.xyz = normalize(nrm.xyz);
-		nrm.xz = rotate_vec2(nrm.xz, id_cs_angle) * p_align;
-
-//INSERT: DUAL_SCALING_MIX
-		float id_weight = exp2(sharpness * log2(weight + id_w + alb.a * clamp(world_normal, 0., 1.))) * weight;
-		mat.albedo_height = fma(alb, vec4(id_weight), mat.albedo_height);
-		mat.normal_rough = fma(nrm, vec4(id_weight), mat.normal_rough);
-		mat.normal_map_depth = fma(_texture_normal_depth_array[id], id_weight, mat.normal_map_depth);
-		mat.ao = fma(ao, id_weight, mat.ao);
-		mat.ao_affect = fma(_texture_ao_affect_array[id], id_weight, mat.ao_affect);
-		mat.total_weight += id_weight;
-	}
-}
+// The legacy control-map material path (accumulate_material) was removed when
+// the Hydra IdWeight surface evaluator replaced the 2-texture-per-texel
+// material model. Its dual scaling, auto-shader and control-map angle/scale
+// features were tied to that model and are superseded by the per-material
+// slope parameters and the R16 surface map. Materials are now sampled
+// exclusively by accumulate_idweight_layer() below.
 
 // Hydra IdWeight layer sampling. Samples one material layer with world-space
 // projection, detiling and normal reconstruction, accumulating into `mat`.
@@ -431,10 +393,9 @@ void accumulate_idweight_layer(const int id, const float weight, const vec3 base
 	vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(id)), i_dd_uv, i_dd_uv2);
 	alb.rgb *= _texture_color_array[id].rgb;
 	nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
-	// Unpack normal map (Godot normal maps are xzy swizzled, y-up)
-	vec3 normalPS = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
-	normalPS.xy *= _texture_normal_depth_array[id];
-	normalPS.z = sqrt(hydra_idweight_saturate(1.0 - dot(normalPS.xy, normalPS.xy)));
+	// Decode the Godot Y-up normal map into (nU, nH, nV) with the out-of-plane
+	// component re-derived after the material's normal depth is applied.
+	vec3 normalPS = hydra_idweight_decode_normal(nrm, _texture_normal_depth_array[id]);
 	float ao = length(nrm.xyz) * 2.0 - 1.0;
 	ao = mix(ao * ao * _texture_ao_strength_array[id] + 1.0 - _texture_ao_strength_array[id], 1.0, alb.a * alb.a);
 
@@ -481,9 +442,7 @@ float hydra_idweight_evaluate_slope_overlay_weight(uint packed, uint backgroundI
 	i_dd_uv = rotate_vec2(i_dd_uv, id_cs_angle);
 	i_dd_uv2 = rotate_vec2(i_dd_uv2, id_cs_angle);
 	vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(overlayId)), i_dd_uv, i_dd_uv2);
-	vec3 normalPS = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
-	normalPS.xy *= _texture_normal_depth_array[int(overlayId)];
-	normalPS.z = sqrt(hydra_idweight_saturate(1.0 - dot(normalPS.xy, normalPS.xy)));
+	vec3 normalPS = hydra_idweight_decode_normal(nrm, _texture_normal_depth_array[int(overlayId)]);
 	vec3 combinedVerticalNormalWS = hydra_idweight_projection_normal_to_world(normalPS, projectionAxis, geometricNormalWS);
 
 	vec3 normalizedGeometricNormalWS = normalize(geometricNormalWS);
@@ -649,40 +608,35 @@ void fragment() {
 	// R16 UNORM texelFetch returns a normalized float; scale back to the packed
 	// 16-bit integer exactly (65536 discrete values fit float precisely).
 	uvec4 surface = uvec4(0u);
-	surface[3] = uint(texelFetch(_surface_maps, index[3], 0).r * 65535.0 + 0.5);
+	surface[3] = get_surface_value(index_id + offsets.xx, index[3]);
 	if (bilerp) {
-		surface[0] = uint(texelFetch(_surface_maps, index[0], 0).r * 65535.0 + 0.5);
-		surface[1] = uint(texelFetch(_surface_maps, index[1], 0).r * 65535.0 + 0.5);
-		surface[2] = uint(texelFetch(_surface_maps, index[2], 0).r * 65535.0 + 0.5);
+		surface[0] = get_surface_value(index_id + offsets.xy, index[0]);
+		surface[1] = get_surface_value(index_id + offsets.yy, index[1]);
+		surface[2] = get_surface_value(index_id + offsets.yx, index[2]);
 	}
 
-	// Cell-local coordinates and triangle selection. The Godot clipmap uses
-	// alternating diagonals: even cells split BL-TR (Hydra convention), odd
-	// cells split BR-TL.
+	// Cell-local coordinates and triangle selection.
+	// Hydra uses ONE fixed mesh diagonal in every cell: LowerLeft (BL, BR, TR)
+	// when local.x > local.y, UpperLeft (BL, TL, TR) otherwise. Mirrors
+	// TerrainSurfaceTriangleMath::SelectTriangle / ComputeBarycentric and
+	// IdWeightSampleSurface (p0 = BL, p1 = isLowerLeft ? BR : TL, p2 = TR).
+	// The Godot clipmap must therefore keep that same diagonal on every LOD
+	// (see Terrain3DMesher::_generate_mesh); a per-cell alternating diagonal
+	// makes this interpolation disagree with the triangles actually rendered.
 	vec2 local = weight;
-	bool evenCell = ((int(index_id.x) + int(index_id.y)) & 1) == 0;
-	uint p0, p1, p2;
+	bool is_lower_left = local.x > local.y;
+	uint p0 = surface[3]; // BL
+	uint p1 = is_lower_left ? surface[2] : surface[0]; // BR or TL
+	uint p2 = surface[1]; // TR
 	float w0, w1, w2;
-	if (evenCell) {
-		if (local.x > local.y) {
-			w0 = 1.0 - local.x; p0 = surface[3]; // BL
-			w1 = local.x - local.y; p1 = surface[2]; // BR
-			w2 = local.y; p2 = surface[1]; // TR
-		} else {
-			w0 = 1.0 - local.y; p0 = surface[3]; // BL
-			w1 = local.y - local.x; p1 = surface[0]; // TL
-			w2 = local.x; p2 = surface[1]; // TR
-		}
+	if (is_lower_left) {
+		w0 = 1.0 - local.x; // BL
+		w1 = local.x - local.y; // BR
+		w2 = local.y; // TR
 	} else {
-		if (local.x + local.y < 1.0) {
-			w0 = 1.0 - local.x - local.y; p0 = surface[3]; // BL
-			w1 = local.x; p1 = surface[2]; // BR
-			w2 = local.y; p2 = surface[0]; // TL
-		} else {
-			w0 = 1.0 - local.y; p0 = surface[0]; // TL
-			w1 = 1.0 - local.x; p1 = surface[2]; // BR
-			w2 = local.x + local.y - 1.0; p2 = surface[1]; // TR
-		}
+		w0 = 1.0 - local.y; // BL
+		w1 = local.y - local.x; // TL
+		w2 = local.x; // TR
 	}
 
 	// Aggregate up to six candidates into a three-sample budget.

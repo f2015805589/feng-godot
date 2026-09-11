@@ -48,6 +48,12 @@ func texture(size: int, format: Image.Format, color: Color, mipmaps: bool) -> Im
 		image.generate_mipmaps()
 	return ImageTexture.create_from_image(image)
 
+func set_ramp(gradient: float) -> void:
+	for z in 64:
+		for x in 64:
+			terrain.data.set_height(Vector3(x, 0, z), float(x - 32) * gradient)
+	terrain.data.update_maps(Terrain3DRegion.TYPE_HEIGHT)
+
 func run() -> void:
 	ui = root
 	var args = OS.get_cmdline_user_args()
@@ -182,20 +188,69 @@ func run() -> void:
 	# ground and green on a ramp, with neutral normal maps.
 	first.slope_blend_sharpness = 100.0
 	second.slope_based_damp = 0.0
+	# The shader declares `uniform vec3 _texture_slope_params_array[32]` and the
+	# R16 map can name any MaterialId in 0..31, so the CPU side must always fill
+	# all 32 slots -- authored materials with their own values, the rest with
+	# Hydra's TerrainSurfaceSlopeSettings default.
+	var slope_params = terrain.assets.get_texture_slope_params()
+	require(slope_params.size() == 32, "slope constant buffer must expose all 32 material slots")
+	require(slope_params[0].x == 100.0, "slot 0 must carry the authored blend sharpness")
+	require(slope_params[31] == Vector3(1000.0, 0.0, 0.0), "unused slots must carry Hydra's default")
+	print("PASS 32-slot slope parameter constant buffer")
 	painter.set_brush_data({"brush": [brush, ImageTexture.create_from_image(brush)], "size": 20.0, "strength": 100.0, "mouse_pressure": 1.0, "asset_id": 1, "pair_overlay_id": 1, "pair_background_id": 0, "pair_mode": 3, "pair_weight_level": 4})
 	painter.start_operation(Vector3(32, 0, 32))
 	painter.operate(Vector3(32, 0, 32), 0.0)
 	painter.stop_operation()
 	var flat = await frame_image()
-	for z in 64:
-		for x in 64:
-			terrain.data.set_height(Vector3(x, 0, z), float(x - 32))
-	terrain.data.update_maps(Terrain3DRegion.TYPE_HEIGHT)
+	# normal_depth must not manufacture a tilt on a neutral normal map. The old
+	# decode scaled (nU, nH) and re-derived nV, so any depth != 1 tilted a FLAT
+	# surface: at depth 0 it produced (0, 0, 1), which the additive projection
+	# turned into nDotUp 0.707 and flipped the flat ground to a full overlay.
+	# Scaling the two sampled tilts instead leaves (0, 1, 0) untouched.
+	second.normal_depth = 0.0
+	var flat_scaled = await frame_image()
+	second.normal_depth = 1.0
+	require(flat_scaled.get_pixelv(center).r > flat_scaled.get_pixelv(center).g, "normal_depth must not tilt a neutral normal map")
+	print("SLOPE flat_scaled=", flat_scaled.get_pixelv(center))
+	# Two ramps pin the Hydra slope math end to end, not just "something changed".
+	# The 3 weight bits double as the slope-threshold index
+	# ({0,.125,.25,.375,.5,.625,.75,.98}[level-1]), so level 4 puts the low
+	# threshold at 0.375 and slope_blend_sharpness 100 (0.1) puts the high
+	# threshold at 0.475.
+	#   gradient 0.25 -> atan(0.25) = 0.2450 rad, tangent approx 0.2500 -> BELOW
+	#                    0.375, so MIX must keep the background.
+	#   gradient 1.00 -> atan(1) = 0.7854 rad, tangent approx 0.9786 -> far above
+	#                    0.475, so MIX must saturate to a full overlay.
+	# This only holds if the sampled normal is composed the way Hydra composes it:
+	# an additive `g + normalPS` (the previous code) biased both ramps toward
+	# straight up and measured the 45-degree ramp at nDotUp 0.92 instead of 0.707.
+	set_ramp(0.25)
+	var shallow = await frame_image()
+	set_ramp(1.0)
 	var ramp = await frame_image()
-	print("SLOPE flat=", flat.get_pixelv(center), " ramp=", ramp.get_pixelv(center))
+	print("SLOPE flat=", flat.get_pixelv(center), " shallow=", shallow.get_pixelv(center), " ramp=", ramp.get_pixelv(center))
 	require(flat.get_pixelv(center).r > flat.get_pixelv(center).g, "flat MIX slope should retain background")
-	require(ramp.get_pixelv(center).g > ramp.get_pixelv(center).r, "ramp MIX slope should show overlay")
-	print("PASS actual rendered slope blend")
+	require(shallow.get_pixelv(center).r > shallow.get_pixelv(center).g, "sub-threshold ramp must stay below the slope threshold")
+	require(ramp.get_pixelv(center).g > ramp.get_pixelv(center).r, "45-degree ramp MIX slope must engage the overlay")
+	print("PASS actual rendered slope blend (threshold + tangent)")
+	# The Weight level doubles as the slope-threshold index, so raising it also
+	# raises the angle where Add/Sub/Mix start to act: level 4 thresholds at 0.375,
+	# level 8 at 0.98 -- right at the 0.9786 tangent of this 45-degree ramp. On
+	# ground flatter than the level's threshold angle nothing engages, so Add and
+	# Sub render exactly like Set and Mix drops the overlay. That is Hydra's own
+	# conflation, not a port slip:
+	# TerrainSurfaceIdWeightEvaluator.EvaluateVerticalWeight thresholds on
+	# GetSlopeThreshold(DecodeSlopeThresholdIndex(packed)), the same 3 bits the
+	# brush writes as the overlay weight. This pins the threshold rise so the
+	# "Add/Sub/Mix look linear" report is answered by evidence.
+	painter.set_brush_data({"brush": [brush, ImageTexture.create_from_image(brush)], "size": 20.0, "strength": 100.0, "mouse_pressure": 1.0, "asset_id": 1, "pair_overlay_id": 1, "pair_background_id": 0, "pair_mode": 3, "pair_weight_level": 8})
+	painter.start_operation(Vector3(32, 0, 32))
+	painter.operate(Vector3(32, 0, 32), 0.0)
+	painter.stop_operation()
+	var level8_ramp = await frame_image()
+	print("SLOPE level8_ramp=", level8_ramp.get_pixelv(center))
+	require(level8_ramp.get_pixelv(center).g < ramp.get_pixelv(center).g, "raising the Weight level must raise the slope threshold and cut the overlay contribution on the same ramp")
+	print("PASS Weight level doubles as the slope threshold")
 	for view in ["show_heightmap", "show_control_texture", "show_control_blend", "show_slope"]:
 		terrain.set(view, true)
 		await frame_image()

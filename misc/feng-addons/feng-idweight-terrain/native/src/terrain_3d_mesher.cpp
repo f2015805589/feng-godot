@@ -15,6 +15,8 @@
 void Terrain3DMesher::_generate_mesh_types() {
 	_clear_mesh_types();
 	LOG(INFO, "Generating all Mesh segments for clipmap of size ", _mesh_size);
+	// Every segment uses the same fixed BL-TR diagonal on every LOD. See
+	// _generate_mesh() for why the Hydra IdWeight surface contract requires it.
 	// Create initial set of Mesh blocks to build the clipmap
 	// # 0 TILE - mesh_size x mesh_size tiles
 	_mesh_rids.push_back(_generate_mesh(V2I(_mesh_size)));
@@ -27,23 +29,37 @@ void Terrain3DMesher::_generate_mesh_types() {
 	// # 4 FILL_B - mesh_size by 4
 	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size, 4)));
 	// # 5 STANDARD_TRIM_A - 2 by (mesh_size * 4 + 2) strips for LOD0 +-Z axis edge
-	_mesh_rids.push_back(_generate_mesh(Vector2i(2, _mesh_size * 4 + 2), true));
+	_mesh_rids.push_back(_generate_mesh(Vector2i(2, _mesh_size * 4 + 2)));
 	// # 6 STANDARD_TRIM_B - (mesh_size * 4 + 2) by 2 strips for LOD0 +-X axis edge
-	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size * 4 + 2, 2), true));
+	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size * 4 + 2, 2)));
 	// # 7 STANDARD_TILE - mesh_size x mesh_size tiles
-	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size, _mesh_size), true));
+	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size, _mesh_size)));
 	// # 8 STANDARD_EDGE_A - 2 by (mesh_size * 4 + 8) strips to bridge LOD transitions along +-Z axis
-	_mesh_rids.push_back(_generate_mesh(Vector2i(2, _mesh_size * 4 + 8), true));
+	_mesh_rids.push_back(_generate_mesh(Vector2i(2, _mesh_size * 4 + 8)));
 	// # 9 STANDARD_EDGE_B - (mesh_size * 4 + 4) by 2 strips to bridge LOD transitions along +-X axis
-	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size * 4 + 4, 2), true));
+	_mesh_rids.push_back(_generate_mesh(Vector2i(_mesh_size * 4 + 4, 2)));
 	return;
 }
 
-RID Terrain3DMesher::_generate_mesh(const Vector2i &p_size, const bool p_standard_grid) {
+// Every clipmap segment splits each quad along the SAME diagonal, bottom-left to
+// top-right, on every LOD.
+//
+// Hydra's IdWeight surface evaluator assumes one fixed mesh diagonal.
+// TerrainSurfaceTriangleMath::SelectTriangle / ComputeBarycentric and
+// IdWeightSampleSurface pick LowerLeft (BL, BR, TR) when local.x > local.y and
+// UpperLeft (BL, TL, TR) otherwise, for EVERY cell -- there is no per-cell
+// alternation. If the mesh alternated its diagonals, the shader's barycentric
+// reconstruction would disagree with the triangles actually rendered, and the
+// painted material would break up into a herringbone of visible triangles.
+//
+// A uniform diagonal is also preserved under dyadic subdivision, so the
+// per-texel reconstruction used at LOD0 stays consistent with the coarser
+// LOD1+ segments.
+RID Terrain3DMesher::_generate_mesh(const Vector2i &p_size) {
 	PackedVector3Array vertices;
 	PackedInt32Array indices;
 	AABB aabb = AABB(V3_ZERO, Vector3(p_size.x, 0.1f, p_size.y));
-	LOG(DEBUG, "Generating verticies and indices for a", p_standard_grid ? " symmetric " : " standard ", "grid mesh of width: ", p_size.x, " and height: ", p_size.y);
+	LOG(DEBUG, "Generating verticies and indices for a grid mesh of width: ", p_size.x, " and height: ", p_size.y);
 
 	// Generate vertices
 	for (int y = 0; y <= p_size.y; ++y) {
@@ -53,7 +69,7 @@ RID Terrain3DMesher::_generate_mesh(const Vector2i &p_size, const bool p_standar
 		}
 	}
 
-	// Generate indices for quads with alternating diagonals
+	// Generate indices for quads, all split along the BL-TR diagonal
 	for (int y = 0; y < p_size.y; ++y) {
 		for (int x = 0; x < p_size.x; ++x) {
 			int bottomLeft = y * (p_size.x + 1) + x;
@@ -61,23 +77,13 @@ RID Terrain3DMesher::_generate_mesh(const Vector2i &p_size, const bool p_standar
 			int topLeft = (y + 1) * (p_size.x + 1) + x;
 			int topRight = topLeft + 1;
 
-			if ((x + y) % 2 == 0 || p_standard_grid) {
-				indices.push_back(bottomLeft);
-				indices.push_back(topRight);
-				indices.push_back(topLeft);
+			indices.push_back(bottomLeft);
+			indices.push_back(topRight);
+			indices.push_back(topLeft);
 
-				indices.push_back(bottomLeft);
-				indices.push_back(bottomRight);
-				indices.push_back(topRight);
-			} else {
-				indices.push_back(bottomLeft);
-				indices.push_back(bottomRight);
-				indices.push_back(topLeft);
-
-				indices.push_back(topLeft);
-				indices.push_back(bottomRight);
-				indices.push_back(topRight);
-			}
+			indices.push_back(bottomLeft);
+			indices.push_back(bottomRight);
+			indices.push_back(topRight);
 		}
 	}
 

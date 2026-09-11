@@ -62,8 +62,17 @@ var _selected_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var inverted_input: bool = false
 
 # Hydra IdWeight pair painting state: which role the next stroke paints.
-# 0 = Overlay (left mouse), 1 = Background (right mouse).
+# 0 = the left-mouse role, 1 = the right-mouse role. The dock displays them with
+# Hydra's naming ("Left click: Overlay    Right click: Background"), which Hydra
+# documents as deliberately reversed against its own chain
+# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick：UI显示反过来 ... 链路里面的所有
+# 计算全部反了"). The field mapping follows Hydra's chain, so the left-click role
+# writes pair_background_id (the base layer) and the right-click role writes
+# pair_overlay_id (the layer the Weight slider fades in). Border colours also
+# match Hydra: left = white, right = blue.
 var pair_active_role: int = 0
+# The packed R16 pair fields. pair_overlay_id is the layer the Weight slider
+# fades in; pair_background_id is the layer it fades over.
 var pair_overlay_id: int = 0
 var pair_background_id: int = 0
 
@@ -77,6 +86,11 @@ var editor_decal_color: Array[Color] = [Color(), Color(), Color()]
 var editor_decal_visible: Array[bool] = [false, false, false]
 var editor_decal_part: Array[bool] = [true, true] # Decal[0] cursor components: brush, reticle
 var editor_decal_timer: Timer
+# The shader samples the chunk -> layer directory as a texture, not a uniform int
+# array. The region tool preview writes a negative "dummy" slot for the hovered
+# chunk, which needs its own texture: the directory Terrain3DData owns must stay
+# pristine. Reused so a mouse move costs one 64 KB texel update, not an allocation.
+var region_preview_texture: ImageTexture
 var editor_decal_fade: float :
 	set(value):
 		editor_decal_fade = value
@@ -85,8 +99,31 @@ var editor_decal_fade: float :
 			if is_shader_valid():
 				RenderingServer.material_set_param(mat_rid, "_editor_decal_color", editor_decal_color)
 				if value < 0.001:
-					var r_map: PackedInt32Array = plugin.terrain.data.get_region_map()
-					RenderingServer.material_set_param(mat_rid, "_region_map", r_map)
+					restore_region_directory()
+
+
+# Points the material back at the live directory. Used whenever the preview stops.
+func restore_region_directory() -> void:
+	if is_shader_valid():
+		RenderingServer.material_set_param(mat_rid, "_region_map", plugin.terrain.data.get_region_directory_rid())
+
+
+# Binds a region map to the material. `p_preview` builds a separate texture for the
+# editor's dummy-slot preview; otherwise the live directory is bound directly.
+func set_region_directory(r_map: PackedInt32Array, p_preview: bool) -> void:
+	if not is_shader_valid():
+		return
+	if not p_preview:
+		restore_region_directory()
+		return
+	var image: Image = plugin.terrain.data.region_map_to_image(r_map)
+	if image == null:
+		return
+	if region_preview_texture == null:
+		region_preview_texture = ImageTexture.create_from_image(image)
+	else:
+		region_preview_texture.update(image)
+	RenderingServer.material_set_param(mat_rid, "_region_map", region_preview_texture.get_rid())
 
 
 func _enter_tree() -> void:
@@ -216,17 +253,17 @@ func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor
 				to_show.push_back("invert")
 			to_show.push_back("pair_mode")
 			to_show.push_back("pair_weight_level")
+			to_show.push_back("pair_roles")
+			to_show.push_back("pair_click_hint")
 			to_show.push_back("slope_blend_sharpness")
 			to_show.push_back("slope_based_damp")
 			to_show.push_back("slope_based_normal_damp")
 			to_show.push_back("slope")
-			to_show.push_back("enable_angle")
-			to_show.push_back("angle")
-			to_show.push_back("angle_picker")
-			to_show.push_back("dynamic_angle")
-			to_show.push_back("enable_scale")
-			to_show.push_back("scale")
-			to_show.push_back("scale_picker")
+			# The Hydra IdWeight R16 contract stores no per-texel UV rotation or
+			# scale (Overlay:5 | Background:5 | Mode:2 | Weight:3 | UV:1, and UV
+			# variant 0 is the only valid value), so the legacy Angle/Scale brush
+			# controls have nothing left to write. Per-material UV scale comes
+			# from the texture asset instead (edit it in the asset dock).
 
 		Terrain3DEditor.COLOR:
 			to_show.push_back("brush")
@@ -307,27 +344,30 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 	# Hydra IdWeight pair painting: keep the selected overlay/background roles
 	# stable across asset selection changes, and apply the current role's asset.
 	if plugin.editor and plugin.editor.get_tool() == Terrain3DEditor.TEXTURE:
+		# pair_active_role is the role of the last dock click: 0 = left mouse,
+		# 1 = right mouse. Hydra's chain writes the left-clicked layer into the
+		# Background pair field (the base) and the right-clicked layer into the
+		# Overlay field (the layer the Weight slider fades in), so the
+		# button-to-field mapping is the mirror of the role names the dock shows.
 		if pair_active_role == 1:
-			pair_background_id = brush_data["asset_id"]
-			brush_data["pair_overlay_id"] = pair_overlay_id
-			brush_data["pair_background_id"] = pair_background_id
-		else:
 			pair_overlay_id = brush_data["asset_id"]
-			brush_data["pair_overlay_id"] = pair_overlay_id
-			brush_data["pair_background_id"] = pair_background_id
+		else:
+			pair_background_id = brush_data["asset_id"]
+		brush_data["pair_overlay_id"] = pair_overlay_id
+		brush_data["pair_background_id"] = pair_background_id
 		brush_data["pair_mode"] = tool_settings.get_setting("pair_mode")
 		brush_data["pair_weight_level"] = tool_settings.get_setting("pair_weight_level")
-		var tex: Terrain3DTextureAsset = plugin.terrain.assets.get_texture_asset(brush_data["asset_id"]) if plugin.terrain and plugin.terrain.assets else null
-		if tex:
-			# Selection or unrelated brush changes must never overwrite the
-			# selected material's saved slope settings with toolbar defaults.
-			for key in ["slope_blend_sharpness", "slope_based_damp", "slope_based_normal_damp"]:
-				var control = tool_settings.settings.get(key)
-				if control == p_setting:
-					tex.set(key, tool_settings.get_setting(key))
-					EditorInterface.mark_scene_as_unsaved()
-				elif control is Range:
-					control.set_value_no_signal(tex.get(key))
+		_update_pair_role_readout()
+		# Hydra binds each slope parameter to a pair ROLE, not to whichever asset
+		# is selected: the shader reads blendSharpness from the Background
+		# (Horizontal) material and both damps from the Overlay (Vertical)
+		# material, and Hydra's TerrainToolEditorWindow edits exactly
+		# backgroundSettings.blendSharpness plus overlaySettings.slopeBasedDamp.
+		# Writing all three to the selected asset silently edited the parameter of
+		# whichever role was not selected, so the edit never reached the shader.
+		_sync_slope_setting("slope_blend_sharpness", pair_background_id, p_setting)
+		_sync_slope_setting("slope_based_damp", pair_overlay_id, p_setting)
+		_sync_slope_setting("slope_based_normal_damp", pair_overlay_id, p_setting)
 
 	if plugin.debug:
 		print("Terrain3DUI: _on_setting_changed: selected resource ID: ", brush_data["asset_id"])
@@ -338,6 +378,54 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 		plugin._read_input() # Revalidate keyboard input for modifier_ctrl
 	set_active_operation()
 	update_decal()
+
+
+# Hydra IdWeight pair role readout for the brush bar. Hydra names the active
+# role in its layer grid ("Current Pair Selection: <slot> · <id>: <name>",
+# TerrainSurfaceIdWeightLayerGrid.cs), but the port only drew role borders in
+# the asset dock, so which material was the overlay and which was the background
+# was invisible while painting. The slots name the packed pair fields: the
+# Overlay slot is the layer the Weight slider fades in and the Background slot is
+# the layer it fades over. Role ids index the texture asset list, and id 0 is a
+# valid material, so a slot only reports as missing when no asset exists.
+func _update_pair_role_readout() -> void:
+	if not tool_settings:
+		return
+	tool_settings.set_pair_roles_text(
+		_describe_pair_role(pair_overlay_id), _describe_pair_role(pair_background_id))
+
+
+func _describe_pair_role(p_asset_id: int) -> String:
+	var tex: Terrain3DTextureAsset = null
+	if plugin.terrain and plugin.terrain.assets:
+		tex = plugin.terrain.assets.get_texture_asset(p_asset_id)
+	if not tex:
+		return "%d: (no texture asset)" % p_asset_id
+	return "%d: %s" % [ tex.id, tex.get_name() ]
+
+
+# Keeps one slope slider bound to the pair role that owns it. The shader reads
+# blendSharpness from the Background material and slopeBasedDamp /
+# slopeBasedNormalDamp from the Overlay material, so a slider edit must land on
+# that role's asset and the slider must display that role's value. Editing the
+# selected asset instead let a change silently miss the shader whenever the
+# selected asset held the other role.
+func _sync_slope_setting(p_key: String, p_asset_id: int, p_changed: Variant) -> void:
+	var control: Object = tool_settings.settings.get(p_key)
+	if not control is Range:
+		return
+	var tex: Terrain3DTextureAsset = null
+	if plugin.terrain and plugin.terrain.assets:
+		tex = plugin.terrain.assets.get_texture_asset(p_asset_id)
+	if not tex:
+		return
+	if control == p_changed:
+		tex.set(p_key, tool_settings.get_setting(p_key))
+		EditorInterface.mark_scene_as_unsaved()
+	else:
+		# Selection or unrelated brush changes must never overwrite the owning
+		# material's saved slope settings with the toolbar defaults.
+		(control as Range).set_value_no_signal(tex.get(p_key))
 
 
 # Change tool/operation based on modifiers. Called from:
@@ -417,8 +505,14 @@ func update_decal() -> void:
 	editor_decal_timer.start()
 	
 	## Region Operations
-	var r_map: PackedInt32Array = plugin.terrain.data.get_region_map()
+	# Only the region tool needs the map, and get_region_map() copies the whole
+	# REGION_MAP_SIZE squared array (64 KB at 128x128), so keep it out of the
+	# mouse-motion path for every other tool.
+	var preview_r_map := PackedInt32Array()
+	var preview_dummy := false
 	if plugin.editor.get_tool() == Terrain3DEditor.REGION:
+		var r_map: PackedInt32Array = plugin.terrain.data.get_region_map()
+		preview_r_map = r_map
 		var r_size: float = float(plugin.terrain.get_region_size()) * plugin.terrain.get_vertex_spacing()
 		var map_size: int = plugin.terrain.data.REGION_MAP_SIZE
 		var half_r_size: float = r_size * 0.5
@@ -437,6 +531,7 @@ func update_decal() -> void:
 			if plugin.terrain.material.get_world_background() == Terrain3DMaterial.WorldBackground.NONE:
 				if r_map[index] == 0 and active_operation == Terrain3DEditor.ADD:
 					r_map[index] = -index - 1
+					preview_dummy = true
 
 			match active_operation:
 				Terrain3DEditor.ADD:
@@ -586,7 +681,7 @@ func update_decal() -> void:
 		RenderingServer.material_set_param(mat_rid, "_editor_decal_color", editor_decal_color)
 		RenderingServer.material_set_param(mat_rid, "_editor_decal_visible", editor_decal_visible)
 		RenderingServer.material_set_param(mat_rid, "_editor_decal_part", editor_decal_part)
-		RenderingServer.material_set_param(mat_rid, "_region_map", r_map)
+		set_region_directory(preview_r_map, preview_dummy)
 
 
 func is_shader_valid() -> bool:
@@ -604,9 +699,8 @@ func is_shader_valid() -> bool:
 func hide_decal() -> void:
 	editor_decal_visible = [false, false, false]
 	if is_shader_valid():
-		var r_map: PackedInt32Array = plugin.terrain.data.get_region_map()
 		RenderingServer.material_set_param(mat_rid, "_editor_decal_visible", editor_decal_visible)
-		RenderingServer.material_set_param(mat_rid, "_region_map", r_map)
+		restore_region_directory()
 
 
 # These array sizes are reset to 0 when closing scenes for some unknown reason, so check and reset

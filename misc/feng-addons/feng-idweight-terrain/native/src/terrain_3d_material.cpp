@@ -13,6 +13,7 @@
 #include "logger.h"
 #include "terrain_3d_material.h"
 #include "terrain_3d_util.h"
+#include "terrain_3d_virtual_texture.h"
 
 ///////////////////////////
 // Private Functions
@@ -709,30 +710,59 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	LOG(EXTREME, "Updating uniforms in shader");
 
 	Terrain3DData *data = _terrain->get_data();
-	PackedInt32Array region_map = data->get_region_map();
-	LOG(EXTREME, "region_map.size(): ", region_map.size());
-	if (region_map.size() != Terrain3DData::REGION_MAP_SIZE * Terrain3DData::REGION_MAP_SIZE) {
-		LOG(ERROR, "Expected region_map.size() of ", Terrain3DData::REGION_MAP_SIZE * Terrain3DData::REGION_MAP_SIZE);
-		return;
-	}
-	RS->material_set_param(p_material, "_region_map", region_map);
+	// The chunk -> layer map is a texture, not a uniform int array: a uniform array
+	// big enough for a world past 32x32 chunks runs into the uniform buffer limit
+	// (64x64 would be 16 KB, 128x128 64 KB). Reading it also avoids copying a
+	// REGION_MAP_SIZE squared PackedInt32Array on every uniform update.
+	RS->material_set_param(p_material, "_region_map", data->get_region_directory_rid());
 	RS->material_set_param(p_material, "_region_map_size", Terrain3DData::REGION_MAP_SIZE);
 	if (Terrain3D::debug_level >= EXTREME) {
-		LOG(EXTREME, "Region map");
-		for (int i = 0; i < region_map.size(); i++) {
-			if (region_map[i]) {
-				LOG(EXTREME, "Region id: ", region_map[i], " array index: ", i);
-			}
-		}
+		LOG(EXTREME, "Region directory: ", data->get_region_directory_rid(),
+				", size: ", Terrain3DData::REGION_MAP_SIZE, ", valid: ", data->is_region_directory_valid());
 	}
 
-	TypedArray<Vector2i> region_locations = data->get_region_locations();
+	// The shader indexes `_region_locations` by layer index, so this must be the
+	// slot table (slot -> region location), not the dense region list: a region's
+	// layer is now a stable slot that outlives unrelated add/remove. Free slots are
+	// never addressed by the region map and keep the padding value.
+	PackedVector2Array slot_locations = data->get_slot_locations();
 	PackedVector2Array padded_locations;
 	padded_locations.resize(_max_regions);
-	for (int i = 0; i < MIN(region_locations.size(), _max_regions); ++i) {
-		padded_locations[i] = region_locations[i];
+	for (int i = 0; i < MIN((int)slot_locations.size(), _max_regions); ++i) {
+		padded_locations[i] = slot_locations[i];
 	}
 	RS->material_set_param(p_material, "_region_locations", padded_locations);
+
+	// Surface virtual texture. The block table is layer indexed and padded to
+	// max_regions like _region_locations; (-1, -1) means "no block for this layer",
+	// which is also the state while the virtual texture is disabled.
+	const bool vt_on = _terrain->is_surface_vt_enabled() && _terrain->get_surface_vt() != nullptr &&
+			_terrain->get_surface_vt()->is_initialized();
+	Terrain3DVirtualTexture *vt = _terrain->get_surface_vt();
+	PackedVector2Array padded_blocks;
+	padded_blocks.resize(_max_regions);
+	if (vt_on) {
+		PackedVector2Array blocks = _terrain->get_surface_vt_blocks();
+		for (int i = 0; i < MIN((int)blocks.size(), _max_regions); ++i) {
+			padded_blocks[i] = blocks[i];
+		}
+	}
+	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
+	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
+	if (vt_on) {
+		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
+		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());
+		RS->material_set_param(p_material, "_surface_vt_page_border", vt->get_page_border());
+		RS->material_set_param(p_material, "_surface_vt_pages_per_axis", _terrain->get_surface_vt_pages_per_axis());
+		RS->material_set_param(p_material, "_surface_vt_max_local_mip",
+				TerrainVT::log2_power_of_two(_terrain->get_surface_vt_pages_per_axis()));
+		RS->material_set_param(p_material, "_surface_vt_indirection_size", vt->get_indirection_size());
+		RS->material_set_param(p_material, "_surface_vt_indirection", vt->get_indirection_rid());
+		RS->material_set_param(p_material, "_surface_vt_atlas", vt->get_atlas_rid());
+	} else {
+		RS->material_set_param(p_material, "_surface_vt_indirection", _generated_dummy_2d.get_rid());
+		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
+	}
 
 	real_t region_size = real_t(_terrain->get_region_size());
 	LOG(EXTREME, "Setting region size in material: ", region_size);
@@ -845,6 +875,9 @@ void Terrain3DMaterial::initialize(Terrain3D *p_terrain) {
 		TypedArray<Image> ia = { img };
 		_generated_dummy.create(ia);
 	}
+	if (!_generated_dummy_2d.get_rid().is_valid()) {
+		_generated_dummy_2d.create(Image::create(1, 1, false, Image::FORMAT_RF));
+	}
 
 	update(FULL_REBUILD);
 }
@@ -863,6 +896,7 @@ void Terrain3DMaterial::destroy() {
 	_active_params.clear();
 	_shader_params.clear();
 	_generated_dummy.clear();
+	_generated_dummy_2d.clear();
 	if (_material.is_valid()) {
 		RS->free_rid(_material);
 		_material = RID();

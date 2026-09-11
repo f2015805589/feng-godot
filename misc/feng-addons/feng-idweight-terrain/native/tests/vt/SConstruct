@@ -1,0 +1,7 @@
+# Standalone contract tests; does not build or replace the terrain plugin.
+env = Environment()
+if env['PLATFORM'] == 'win32':
+    env.Append(CXXFLAGS=['/std:c++17', '/EHsc', '/W4'])
+else:
+    env.Append(CXXFLAGS=['-std=c++17', '-Wall', '-Wextra', '-pedantic'])
+Default(env.Program('terrain_vt_contract_test', ['terrain_vt_contract_test.cpp']))

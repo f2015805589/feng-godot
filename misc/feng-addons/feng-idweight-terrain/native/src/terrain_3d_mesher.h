@@ -56,7 +56,7 @@ private:
 	uint32_t _render_layers = 1u; // Bit 1 only
 
 	void _generate_mesh_types();
-	RID _generate_mesh(const Vector2i &p_size, const bool p_standard_grid = false);
+	RID _generate_mesh(const Vector2i &p_size);
 	RID _instantiate_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, const AABB &p_aabb);
 	void _generate_clipmap();
 	void _generate_offset_data();

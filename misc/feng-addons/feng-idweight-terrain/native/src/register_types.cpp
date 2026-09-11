@@ -9,6 +9,9 @@
 #include "register_types.h"
 #include "terrain_3d.h"
 #include "terrain_3d_editor.h"
+#include "terrain_3d_streamer.h"
+#include "terrain_3d_virtual_texture.h"
+#include "terrain_3d_vt_feedback.h"
 
 void initialize_terrain_3d_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
@@ -23,8 +26,11 @@ void initialize_terrain_3d_module(ModuleInitializationLevel p_level) {
 	ClassDB::register_class<Terrain3DMaterial>();
 	ClassDB::register_class<Terrain3DMeshAsset>();
 	ClassDB::register_class<Terrain3DRegion>();
+	ClassDB::register_class<Terrain3DStreamer>();
 	ClassDB::register_class<Terrain3DTextureAsset>();
 	ClassDB::register_class<Terrain3DUtil>();
+	ClassDB::register_class<Terrain3DVirtualTexture>();
+	ClassDB::register_class<Terrain3DVTFeedback>();
 }
 
 void uninitialize_terrain_3d_module(ModuleInitializationLevel p_level) {

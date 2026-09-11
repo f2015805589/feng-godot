@@ -3019,14 +3019,12 @@ void fragment_shader(in SceneData scene_data) {
 	albedo_output_buffer.rgb = albedo;
 	albedo_output_buffer.a = alpha;
 
-	normal_roughness_output_buffer = vec4(encode24(normal) * 0.5 + 0.5, roughness);
-
-	// We encode the dynamic static into roughness.
-	// Values over 0.5 are dynamic, under 0.5 are static.
-	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w * (127.0 / 255.0);
-	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC)) {
-		normal_roughness_output_buffer.w = 1.0 - normal_roughness_output_buffer.w;
-	}
+	// Unreal-style direct 10:10:10 normal: 30 bits instead of the 24-bit
+	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g
+	// (already written there and previously never read); the 2-bit alpha is only
+	// wide enough for the dynamic/static flag, which GI still needs.
+	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
+	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
 
 	orm_output_buffer.r = ao;
 	orm_output_buffer.g = roughness;
@@ -3034,7 +3032,11 @@ void fragment_shader(in SceneData scene_data) {
 	orm_output_buffer.a = sss_strength;
 
 	emission_output_buffer.rgb = emission;
-	emission_output_buffer.a = 0.0;
+	// The alpha channel of the emission target is free (it was a constant 0 and
+	// nothing read it), so it carries the material specular instead of wasting
+	// 16 bits per pixel. This mirrors Unreal's GBufferB, which stores specular
+	// as its own 8-bit channel; storing it here costs no extra bandwidth.
+	emission_output_buffer.a = specular;
 
 #ifdef MODE_RENDER_VOXEL_GI
 	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances
@@ -3069,14 +3071,12 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
-	normal_roughness_output_buffer = vec4(encode24(normal) * 0.5 + 0.5, roughness);
-
-	// We encode the dynamic static into roughness.
-	// Values over 0.5 are dynamic, under 0.5 are static.
-	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w * (127.0 / 255.0);
-	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC)) {
-		normal_roughness_output_buffer.w = 1.0 - normal_roughness_output_buffer.w;
-	}
+	// Unreal-style direct 10:10:10 normal: 30 bits instead of the 24-bit
+	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g
+	// (already written there and previously never read); the 2-bit alpha is only
+	// wide enough for the dynamic/static flag, which GI still needs.
+	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
+	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
 	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w;
 
 #ifdef MODE_RENDER_VOXEL_GI

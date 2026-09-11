@@ -122,9 +122,13 @@ void main() {
 #else
 	vec4 normal_roughness = textureLod(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
-	normal_roughness = normal_roughness_compatibility(normal_roughness);
+	// The normal is the only thing the lighting pass needs from this target.
+	// Roughness is deliberately NOT read from .w here: that channel carries the
+	// folded roughness-plus-dynamic-flag encoding that the GI compute shader
+	// still decodes, which costs ~1 bit. The unfolded 8-bit copy that the
+	// geometry pass already writes into orm.g is read below instead, matching
+	// the 8-bit roughness channel of Unreal's GBufferB.
 	vec3 normal = normalize(normal_roughness.xyz * 2.0 - 1.0);
-	float roughness = normal_roughness.w;
 
 #ifdef USE_MULTIVIEW
 	vec4 albedo_alpha = textureLod(sampler2DArray(gbuffer_albedo_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
@@ -140,6 +144,7 @@ void main() {
 	vec4 orm = textureLod(sampler2D(gbuffer_orm_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	float ao = orm.r;
+	float roughness = orm.g;
 	float metallic = orm.b;
 	float sss_strength = orm.a;
 
@@ -149,6 +154,11 @@ void main() {
 	vec4 emission_alpha = textureLod(sampler2D(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	vec3 emission = emission_alpha.rgb;
+	// The G-buffer carries the material specular in the emission target's alpha
+	// (see the MODE_RENDER_GBUFFER branch in scene_frp_clustered.glsl). Feeding
+	// it to F0() replaces the hardcoded dielectric 0.5, matching Unreal's
+	// GBufferB, which keeps specular as its own channel.
+	float material_specular = emission_alpha.a;
 
 	// Cluster position for light lookups.
 	uvec2 cluster_pos = uvec2(gl_FragCoord.xy) >> implementation_data.cluster_shift;
@@ -159,7 +169,7 @@ void main() {
 	vec3 vertex_ddy = dFdy(vertex);
 
 	// Energy conservation.
-	vec3 f0 = F0(metallic, 0.5, albedo);
+	vec3 f0 = F0(metallic, material_specular, albedo);
 	vec2 envBRDF = prefiltered_dfg(roughness, clamp(dot(normal, view), 0.0001, 1.0)).xy;
 	vec3 energy_compensation = get_energy_compensation(f0, envBRDF.y);
 

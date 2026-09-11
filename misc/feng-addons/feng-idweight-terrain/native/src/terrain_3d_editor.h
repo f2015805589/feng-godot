@@ -98,7 +98,7 @@ private:
 	Vector2 _get_rotated_uv(const Vector2 &p_uv, const real_t p_angle) const;
 	void _store_undo();
 	// Hydra IdWeight pair painting helpers
-	void _paint_surface_pair(Image *p_surface_map, const Vector2i &p_pixel, const real_t p_brush_alpha,
+	bool _paint_surface_pair(uint8_t *p_texel, const real_t p_brush_alpha,
 			const real_t p_strength, const int p_overlay_id, const int p_background_id,
 			const int p_pair_mode, const int p_weight_level, const bool p_modifier_alt);
 	void _apply_undo(const Dictionary &p_data);

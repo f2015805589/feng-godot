@@ -130,6 +130,13 @@ func initialize(p_plugin: EditorPlugin) -> void:
 		management_popup.set_item_disabled(management_popup.get_item_index(MENU_INITIALIZE),
 			not terrain or terrain.data.get_region_count() > 0))
 
+	# The role legend lives in the brush settings bar
+	# (Terrain3DToolSettings "pair_roles" / "pair_click_hint") and on each tile's
+	# hover label, not as a fourth managed child of Box. update_layout() below
+	# reparents and reindexes Box children with hardcoded slots 1/2/3 for
+	# SearchBox, SizeSlider and ManagementMenu, so an extra row here would fight
+	# that layout in both the narrow and the wide dock arrangement.
+
 	load_editor_settings()
 
 	# Connect signals
@@ -551,8 +558,26 @@ class ListContainer extends Container:
 
 
 	func _on_role_selected(p_role: int, p_entry: ListEntry) -> void:
-		# Hydra IdWeight pair painting: 0 = Overlay (left), 1 = Background (right).
+		# Hydra IdWeight pair painting. p_role 0 is the left mouse button and 1 is
+		# the right one. Hydra's chain writes the left-clicked layer into the
+		# Background pair field (the base layer) and the right-clicked layer into
+		# the Overlay field (the layer the Weight slider fades in); see
+		# TerrainSurfaceIdWeightLayerGrid.GetRoleForMouseButton, pinned by
+		# LayerGrid_LeftClickSelectsBackground, and CreatePaintCommand passing
+		# pair.OverlayMaterialId into the packed overlay field. Hydra's own label
+		# names the two roles the other way round on purpose
+		# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick"), and this dock keeps that
+		# reversed naming for its markers, so assert the fields, not the labels.
 		# The clicked entry carries the role; the pair state lives in the UI.
+		if not is_instance_valid(p_entry):
+			return
+		# Read the clicked asset before change_tool(): that call reaches the dock's
+		# _on_textures_pressed() -> update_asset_list(), which frees every entry in
+		# this list. Looking p_entry up afterwards returns -1, and the old code then
+		# skipped set_selected_id() entirely, leaving the brush data on the previous
+		# pair while the dock displayed the new one.
+		var res_id: int = p_entry.get_resource_id()
+		var clicked_resource: Resource = p_entry.resource
 		if plugin.ui:
 			plugin.select_terrain()
 			plugin.ui.toolbar.change_tool("PaintTexture")
@@ -560,30 +585,53 @@ class ListContainer extends Container:
 			plugin.ui.pair_active_role = p_role
 			# Show the clicked texture asset in the Inspector so its properties
 			# (albedo, normal, UV scale, colors, slope params) are editable.
-			if p_entry.resource:
-				EditorInterface.edit_resource(p_entry.resource)
+			if clicked_resource:
+				EditorInterface.edit_resource(clicked_resource)
 			# Do not depend on the separate clicked signal: child controls can
-			# consume it. Select this exact entry and refresh brush data here.
-			var entry_index := entries.find(p_entry)
+			# consume it. Re-resolve the entry by asset id because the rebuild above
+			# may have replaced it.
+			var entry_index: int = _index_of_asset(res_id)
 			if entry_index >= 0:
 				set_selected_id(entry_index)
-			var res_id: int = p_entry.get_resource_id()
-			if p_role == 0:
+			if role_writes_overlay_field(p_role):
 				plugin.ui.pair_overlay_id = res_id
 			else:
 				plugin.ui.pair_background_id = res_id
-		# Update role highlights on all texture entries
-		for e in entries:
-			e.role_flags = 0
-		for e in entries:
-			if not e.resource:
-				continue
-			var eid: int = e.get_resource_id()
-			if eid == plugin.ui.pair_overlay_id:
-				e.role_flags |= 1
-			if eid == plugin.ui.pair_background_id:
-				e.role_flags |= 2
-		redraw()
+			if entry_index >= 0:
+				# set_selected_id() refreshed the brush data while the previous role
+				# was still assigned, so publish the final pair now. This is only
+				# safe while the dock selection is the clicked asset, because
+				# _on_setting_changed() re-derives the role from that selection.
+				plugin.ui._on_setting_changed()
+		# set_selected_id() refreshed the highlights with the previous pair, so
+		# re-apply them now that the pair ids are final.
+		_restore_role_highlights()
+
+
+	# Index of the entry showing p_res_id, or -1. Used instead of entries.find()
+	# because update_asset_list() frees and replaces every entry.
+	func _index_of_asset(p_res_id: int) -> int:
+		for i in entries.size():
+			var entry: Object = entries[i]
+			if is_instance_valid(entry) and entry.resource and entry.get_resource_id() == p_res_id:
+				return i
+		return -1
+
+
+	# Hydra IdWeight pair roles. p_role is 0 for the left mouse button and 1 for
+	# the right one (TerrainSurfaceIdWeightLayerGrid.GetRoleForMouseButton).
+	#
+	# Hydra's chain writes the left-clicked layer into the Background pair field
+	# (the base layer) and the right-clicked layer into the Overlay field (the
+	# layer the Weight slider fades in): GetRoleForMouseButton(0) returns
+	# Background, pinned by LayerGrid_LeftClickSelectsBackground, and
+	# CreatePaintCommand passes pair.OverlayMaterialId into the packed overlay
+	# field. Hydra's own layer-grid label names the two roles the other way round
+	# on purpose (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick：UI显示反过来 ...
+	# 链路里面的所有计算全部反了"), and this dock keeps that reversed naming for its
+	# markers and for the brush-bar readout. Assert the fields, not the labels.
+	static func role_writes_overlay_field(p_role: int) -> bool:
+		return p_role != 0
 
 
 	func _on_resource_hovered(p_id: int):
@@ -630,12 +678,23 @@ class ListContainer extends Container:
 		for e in entries:
 			if not e.resource:
 				continue
-			var res_id: int = e.get_resource_id()
-			if res_id == plugin.ui.pair_overlay_id:
-				e.role_flags |= 1
-			if res_id == plugin.ui.pair_background_id:
-				e.role_flags |= 2
+			e.role_flags = _role_flags_for(e.get_resource_id())
 		redraw()
+
+
+	# Hydra's layer grid marks the left-click role white and the right-click role
+	# blue (TerrainSurfaceIdWeightLayerGrid.DrawRoleBorder), and its chain writes
+	# those clicks into the Background and Overlay pair fields respectively. Bind
+	# the marker bits to the mouse button rather than to the field name so the
+	# dock keeps matching Hydra's rendered result. Bit 1 = white (left click),
+	# bit 2 = blue (right click).
+	func _role_flags_for(p_res_id: int) -> int:
+		var flags: int = 0
+		if p_res_id == plugin.ui.pair_background_id:
+			flags |= 1
+		if p_res_id == plugin.ui.pair_overlay_id:
+			flags |= 2
+		return flags
 
 
 	func get_selected_asset_id() -> int:
@@ -755,8 +814,10 @@ class ListEntry extends MarginContainer:
 	var is_hovered: bool = false
 	var is_selected: bool = false
 	var is_highlighted: bool = false
-	# Hydra IdWeight pair role flags: 0 = none, 1 = Overlay (white border),
-	# 2 = Background (blue border), 3 = both (white + blue borders).
+	# Hydra IdWeight pair role markers: 0 = none, 1 = white (the left-click role,
+	# displayed as Overlay), 2 = blue (the right-click role, displayed as
+	# Background), 3 = both. The colours match Hydra's DrawRoleBorder; see
+	# ListContainer._role_flags_for for which pair field each marker tracks.
 	var role_flags: int = 0
 	
 	var name_label: Label
@@ -904,6 +965,21 @@ class ListEntry extends MarginContainer:
 		return -1
 
 
+	# Names the pair roles held by this tile using Hydra's display naming, which
+	# is reversed against its own pair fields: the white left-click marker is
+	# shown as "Overlay" and the blue right-click marker as "Background"
+	# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick").
+	func get_role_label() -> String:
+		if type != Terrain3DAssets.TYPE_TEXTURE:
+			return ""
+		var roles: PackedStringArray = PackedStringArray()
+		if role_flags & 1:
+			roles.push_back("Overlay")
+		if role_flags & 2:
+			roles.push_back("Background")
+		return " + ".join(roles)
+
+
 	func setup_label() -> void:
 		name_label = Label.new()
 		name_label.name = "MeshLabel"
@@ -1011,8 +1087,14 @@ class ListEntry extends MarginContainer:
 				else:
 					name_label.visible = true
 				is_hovered = true
-				name_label.text = get_resource_name()
-				tooltip_text = get_resource_name()
+				# Name the role on the tile itself so the white/blue borders are
+				# readable without consulting the legend.
+				var display_name: String = get_resource_name()
+				var role_text: String = get_role_label()
+				if not role_text.is_empty():
+					display_name = "%s [%s]" % [ display_name, role_text ]
+				name_label.text = display_name
+				tooltip_text = display_name
 				emit_signal("hovered")
 				queue_redraw()
 			NOTIFICATION_MOUSE_EXIT:
@@ -1035,13 +1117,15 @@ class ListEntry extends MarginContainer:
 								set_edited_resource(Terrain3DMeshAsset.new(), false)
 							_on_edit()
 						else:
-							# Hydra: left click selects the Overlay role
+							# Hydra's label: left click is the Overlay role.
+							# Hydra's chain: left click is the Background field.
 							if type == Terrain3DAssets.TYPE_TEXTURE:
 								role_selected.emit(0, self)
 							emit_signal("clicked")
 					MOUSE_BUTTON_RIGHT:
 						if resource:
-							# Hydra: right click selects the Background role
+							# Hydra's label: right click is the Background role.
+							# Hydra's chain: right click is the Overlay field.
 							if type == Terrain3DAssets.TYPE_TEXTURE:
 								role_selected.emit(1, self)
 								emit_signal("clicked")

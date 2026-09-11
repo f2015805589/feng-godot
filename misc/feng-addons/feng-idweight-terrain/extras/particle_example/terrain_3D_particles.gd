@@ -228,9 +228,11 @@ func _update_process_parameters() -> void:
 			RenderingServer.material_set_param(process_rid, "_vertex_density", 1.0 / terrain.vertex_spacing)
 			RenderingServer.material_set_param(process_rid, "_region_size", terrain.region_size)
 			RenderingServer.material_set_param(process_rid, "_region_texel_size", 1.0 / terrain.region_size)
-			RenderingServer.material_set_param(process_rid, "_region_map_size", 32)
-			RenderingServer.material_set_param(process_rid, "_region_map", terrain.data.get_region_map())
-			RenderingServer.material_set_param(process_rid, "_region_locations", terrain.data.get_region_locations())
+			RenderingServer.material_set_param(process_rid, "_region_map_size", terrain.data.REGION_MAP_SIZE)
+			# The chunk -> layer directory is a texture now, and _region_locations is
+			# indexed by layer slot rather than by the dense region list.
+			RenderingServer.material_set_param(process_rid, "_region_map", terrain.data.get_region_directory_rid())
+			RenderingServer.material_set_param(process_rid, "_region_locations", terrain.data.get_slot_locations())
 			RenderingServer.material_set_param(process_rid, "_height_maps", terrain.data.get_height_maps_rid())
 			RenderingServer.material_set_param(process_rid, "_control_maps", terrain.data.get_control_maps_rid())
 			RenderingServer.material_set_param(process_rid, "_color_maps", terrain.data.get_color_maps_rid())

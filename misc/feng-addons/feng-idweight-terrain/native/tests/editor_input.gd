@@ -5,10 +5,19 @@ var probe_root: Node3D
 var probe_viewport: SubViewport
 var probe_camera: Camera3D
 var probe_terrain: Terrain3D
+var _finished: bool = false
 
 func _enter_tree() -> void:
 	super._enter_tree()
+	call_deferred("_watchdog")
 	call_deferred("_run_probe")
+
+# A script error inside the probe aborts the coroutine without reaching either
+# quit(), which used to burn the runner's full 180s timeout with no diagnosis.
+func _watchdog() -> void:
+	await get_tree().create_timer(120.0).timeout
+	if not _finished:
+		_fail("watchdog: probe did not finish within 120s")
 
 func _wait_frames(count: int) -> void:
 	for _i in count:
@@ -20,6 +29,9 @@ func _texture(color: Color) -> ImageTexture:
 	return ImageTexture.create_from_image(image)
 
 func _fail(message: String) -> void:
+	if _finished:
+		return
+	_finished = true
 	push_error("EDITOR_INPUT_REGRESSION: " + message)
 	get_tree().quit(1)
 
@@ -65,6 +77,13 @@ func _run_probe() -> void:
 	_edit(probe_terrain)
 	debug = 0
 	await _wait_frames(4)
+
+	# The button-to-pair-field mapping is asserted by
+	# editor_pairroles.gd (Terrain3DAssetDock.role_writes_overlay_field) and the
+	# packed encoding of the pair fields by the press below, so this probe does not
+	# also drive the dock: the dock rebuilds its entry list asynchronously and a
+	# captured entry can be freed before the handler is called.
+
 	# Aim the actual viewport mouse ray at the center of the test region while
 	# retaining an oblique direction, so this exercise does not use the
 	# get_height shortcut for a straight-down camera.
@@ -142,5 +161,6 @@ func _run_probe() -> void:
 		_fail("right press was consumed as a paint stroke: result=%s operating=%s" % [right_result, editor.is_operating()])
 		return
 
+	_finished = true
 	print("PASS editor brush first GPU miss -> CPU fallback -> R16 CPU/GPU ID 1 -> outside release -> right navigation")
 	get_tree().quit(0)

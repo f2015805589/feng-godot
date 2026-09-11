@@ -8,6 +8,8 @@
 shader_type particles;
 render_mode disable_velocity, disable_force;
 
+#define MAX_REGIONS 1024 // Match Terrain3DMaterial.max_regions. Set to 64-256 for mobile
+
 group_uniforms options;
 uniform sampler2D main_noise;
 uniform float main_noise_scale = 0.01;
@@ -51,12 +53,30 @@ uniform float _vertex_spacing = 1.0;
 uniform float _vertex_density = 1.0; // = 1/_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1/REGION_SIZE
-uniform int _region_map_size = 32;
-uniform int _region_map[1024];
-uniform vec2 _region_locations[1024];
+uniform int _region_map_size = 128;
+// Chunk -> layer directory, a texture rather than a uniform int array so the world
+// grid is not capped by the uniform buffer size. R32F holding slot + 1, 0 = none.
+uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
+// Layer -> region location. Indexed by layer slot, not by the dense region list.
+uniform vec2 _region_locations[MAX_REGIONS];
 uniform highp sampler2DArray _height_maps : repeat_disable;
 uniform highp sampler2DArray _control_maps : repeat_disable;
 uniform highp sampler2DArray _color_maps : repeat_disable;
+
+// Reads the chunk directory and returns the texture array layer for a chunk, or -1
+// when the chunk is outside the world grid or holds no region.
+int get_region_layer(const ivec2 p_chunk) {
+	ivec2 pos = p_chunk + (_region_map_size / 2);
+	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
+	ivec2 clamped = clamp(pos, ivec2(0), ivec2(_region_map_size - 1));
+	int map_val = int(texelFetch(_region_map, clamped, 0).r + 0.5);
+	int raw_index = map_val - 1;
+	int is_region = bounds * int(raw_index >= 0) * int(raw_index < MAX_REGIONS);
+	int is_dummy = bounds * int(map_val < 0);
+	return is_region * raw_index
+	     + is_dummy * (map_val - 1)
+	     - (1 - is_region - is_dummy);
+}
 
 // Takes in world space XZ (UV) coordinates
 // Returns ivec3 with:
@@ -64,10 +84,8 @@ uniform highp sampler2DArray _color_maps : repeat_disable;
 // Z: layer index used for texturearrays, -1 if not in a region
 ivec3 get_index_coord(const vec2 uv) {
 	vec2 r_uv = round(uv);
-	ivec2 pos = ivec2(floor(r_uv * _region_texel_size)) + (_region_map_size / 2);
-	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
-	int layer_index = _region_map[pos.y * _region_map_size + pos.x] * bounds - 1;
-	return ivec3(ivec2(mod(r_uv, _region_size)), layer_index);
+	ivec2 chunk = ivec2(floor(r_uv * _region_texel_size));
+	return ivec3(ivec2(mod(r_uv, _region_size)), get_region_layer(chunk));
 }
 
 #if CURRENT_RENDERER == RENDERER_COMPATIBILITY
@@ -76,12 +94,7 @@ ivec3 get_index_coord(const vec2 uv) {
 
 // Takes in UV2 region space coordinates, returns 1.0 or 0.0 if a region is present or not.
 float check_region(const vec2 uv2) {
-	ivec2 pos = ivec2(floor(uv2)) + (_region_map_size / 2);
-	int layer_index = 0;
-	if (uint(pos.x | pos.y) < uint(_region_map_size)) {
-		layer_index = clamp(_region_map[ pos.y * _region_map_size + pos.x ] - 1, -1, 0) + 1;
-	}
-	return float(layer_index);
+	return float(get_region_layer(ivec2(floor(uv2))) >= 0);
 }
 
 // Takes in UV2 region space coordinates, returns a blend value (0 - 1 range) between empty, and valid regions

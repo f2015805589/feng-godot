@@ -5,6 +5,8 @@
 #include "logger.h"
 #include "terrain_surface_idweight.h"
 
+#include <algorithm>
+
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/editor_file_system.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
@@ -19,15 +21,405 @@
 void Terrain3DData::_clear() {
 	LOG(INFO, "Clearing data");
 	_region_map_dirty = true;
+	_region_map_signal_dirty = true;
 	_region_map.clear();
 	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
 	_regions.clear();
 	_region_locations.clear();
 	_master_height_range = V2_ZERO;
+	_slot_capacity = 0;
+	_slot_locations.clear();
+	_slot_dirty.clear();
+	_free_slots.clear();
+	_region_slots.clear();
+	_height_maps.clear();
+	_control_maps.clear();
+	_color_maps.clear();
+	_surface_maps.clear();
+	for (int i = 0; i < SLOT_MAP_MAX; i++) {
+		_slot_map_full[i] = true;
+		_blank_slot_maps[i].unref();
+	}
 	_generated_height_maps.clear();
 	_generated_control_maps.clear();
 	_generated_color_maps.clear();
 	_generated_surface_maps.clear();
+	_region_directory.clear();
+	_region_directory_image.unref();
+	_region_directory_dirty = true;
+}
+
+///////////////////////////
+// Stable layer slots
+///////////////////////////
+
+// Grows the slot table by doubling. The capacity never shrinks: free slots are
+// reused first, and keeping the arrays sized for the peak resident count is what
+// stops steady streaming from reallocating the texture arrays every step.
+void Terrain3DData::_grow_slot_capacity(const int p_needed) {
+	if (p_needed <= _slot_capacity) {
+		return;
+	}
+	int capacity = MAX(_slot_capacity, 4);
+	while (capacity < p_needed) {
+		capacity *= 2;
+	}
+	// Bounded by MAX_REGIONS, not by the world grid: the shader drops layer indices
+	// at or above it, so a larger slot table would silently fail to render.
+	capacity = MIN(capacity, MAX_MAP_SLOTS);
+	if (capacity < p_needed) {
+		LOG(ERROR, "Slot capacity ", capacity, " cannot hold ", p_needed,
+				" resident regions. Raise the material's max_regions or lower the streamer radius.");
+		return;
+	}
+	LOG(DEBUG, "Growing map slot capacity from ", _slot_capacity, " to ", capacity);
+	const int previous = _slot_capacity;
+	_slot_locations.resize(capacity, V2I_MAX);
+	_slot_dirty.resize(capacity, 0);
+	// The new slots have to join the free list, otherwise every allocation would
+	// land above the old capacity and the table would double on every region.
+	for (int slot = capacity - 1; slot >= previous; slot--) {
+		_free_slots.push_back(slot);
+	}
+	// A resized array has blank layers, so every resident slot must be uploaded
+	// again for every map type.
+	for (int i = 0; i < SLOT_MAP_MAX; i++) {
+		_slot_map_full[i] = true;
+	}
+	_slot_capacity = capacity;
+	_slot_grow_count++;
+}
+
+void Terrain3DData::_mark_slot_dirty(const int p_slot, const int p_maps) {
+	if (p_slot >= 0 && p_slot < (int)_slot_dirty.size()) {
+		_slot_dirty[p_slot] |= uint8_t(p_maps);
+	}
+}
+
+///////////////////////////
+// Chunk directory texture
+///////////////////////////
+
+// The shader reads the chunk -> layer map from a texture instead of a uniform
+// array, so the world grid is no longer limited by the uniform buffer size.
+// Single-entry update: one region entering or leaving memory touches one texel.
+void Terrain3DData::_set_directory_entry(const int p_index, const int p_value) {
+	if (_region_directory_image.is_null()) {
+		return;
+	}
+	if (p_index < 0 || p_index >= REGION_MAP_SIZE * REGION_MAP_SIZE) {
+		return;
+	}
+	_region_directory_image->set_pixel(p_index % REGION_MAP_SIZE, p_index / REGION_MAP_SIZE,
+			Color(real_t(p_value), 0.f, 0.f, 1.f));
+	_region_directory_dirty = true;
+}
+
+// Bulk path: rebuilds the whole directory image from `_region_map`.
+void Terrain3DData::_rebuild_region_directory() {
+	_region_directory_image = region_map_to_image(_region_map);
+	_region_directory_dirty = true;
+}
+
+// The shader samples this as `_region_map`: R32F, slot + 1, 0.0 = no region. Negative
+// values are the editor's "dummy region" preview encoding and are preserved.
+Ref<Image> Terrain3DData::region_map_to_image(const PackedInt32Array &p_region_map) {
+	const int count = REGION_MAP_SIZE * REGION_MAP_SIZE;
+	if (p_region_map.size() != count) {
+		LOG(ERROR, "region_map_to_image expects ", count, " entries, got ", p_region_map.size());
+		return Ref<Image>();
+	}
+	PackedByteArray bytes;
+	bytes.resize(int64_t(count) * 4);
+	for (int i = 0; i < count; i++) {
+		bytes.encode_float(int64_t(i) * 4, real_t(p_region_map[i]));
+	}
+	return Image::create_from_data(REGION_MAP_SIZE, REGION_MAP_SIZE, false, Image::FORMAT_RF, bytes);
+}
+
+// Uploads the directory if it changed. Called once per update_maps().
+void Terrain3DData::_update_region_directory() {
+	if (_region_directory_image.is_null()) {
+		_rebuild_region_directory();
+	}
+	if (_region_directory_image.is_null() || !_region_directory_dirty) {
+		return;
+	}
+	// A texture is created once and then updated in place; only the first upload
+	// allocates, so a paint step costs one 64 KB texel upload.
+	if (_region_directory.get_rid().is_valid() &&
+			_region_directory.get_layer_size() == REGION_MAP_VSIZE) {
+		_region_directory.update(_region_directory_image, 0);
+	} else {
+		_region_directory.create(_region_directory_image);
+	}
+	_region_directory_dirty = false;
+}
+
+// Assigns a stable layer slot to a region location and publishes it in the region
+// map. Re-adding a region that is already resident keeps the slot it already had.
+int Terrain3DData::_acquire_slot(const Vector2i &p_region_loc) {
+	const int map_index = get_region_map_index(p_region_loc);
+	if (map_index < 0) {
+		LOG(ERROR, "Location ", p_region_loc, " is out of bounds for the region map");
+		return -1;
+	}
+	int slot = -1;
+	if (_region_slots.has(p_region_loc)) {
+		slot = int(_region_slots[p_region_loc]);
+	} else {
+		if (_free_slots.empty()) {
+			_grow_slot_capacity(_slot_capacity + 1);
+		}
+		if (_free_slots.empty()) {
+			LOG(ERROR, "No free map slot for ", p_region_loc, ", capacity: ", _slot_capacity);
+			return -1;
+		}
+		slot = _free_slots.back();
+		_free_slots.pop_back();
+	}
+	_slot_locations[slot] = p_region_loc;
+	_region_slots[p_region_loc] = slot;
+	// slot + 1 keeps 0 meaning "no region", the same encoding region_id used.
+	_region_map[map_index] = slot + 1;
+	_set_directory_entry(map_index, slot + 1);
+	_mark_slot_dirty(slot, 0xF);
+	return slot;
+}
+
+void Terrain3DData::_release_slot(const Vector2i &p_region_loc) {
+	if (!_region_slots.has(p_region_loc)) {
+		return;
+	}
+	const int slot = int(_region_slots[p_region_loc]);
+	_region_slots.erase(p_region_loc);
+	if (slot >= 0 && slot < _slot_capacity) {
+		_slot_locations[slot] = V2I_MAX;
+		_slot_dirty[slot] = 0;
+		_free_slots.push_back(slot);
+	}
+	const int map_index = get_region_map_index(p_region_loc);
+	if (map_index >= 0) {
+		_region_map[map_index] = 0;
+		_set_directory_entry(map_index, 0);
+	}
+}
+
+// Drops every slot assignment and frees the slots from the top down, so a fresh
+// assignment is dense and starts at 0.
+void Terrain3DData::_reset_slots() {
+	std::fill(_slot_locations.begin(), _slot_locations.end(), V2I_MAX);
+	std::fill(_slot_dirty.begin(), _slot_dirty.end(), uint8_t(0));
+	_free_slots.clear();
+	_region_slots.clear();
+	for (int slot = _slot_capacity - 1; slot >= 0; slot--) {
+		_free_slots.push_back(slot);
+	}
+}
+
+// Bulk path: recomputes the region map and the slot table from `_regions`. Used
+// when the whole region set is replaced (load_directory, change_region_size,
+// set_region_locations) rather than one region entering or leaving memory.
+void Terrain3DData::_rebuild_region_map() {
+	LOG(EXTREME, "Regenerating ", REGION_MAP_VSIZE, " region map array from active regions");
+	_region_map.clear();
+	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
+	_region_locations = TypedArray<Vector2i>(); // enforce new pointer
+	_reset_slots();
+	for (const Vector2i &region_loc : _regions.keys()) {
+		const Terrain3DRegion *region = get_region_ptr(region_loc);
+		if (region && !region->is_deleted()) {
+			if (_acquire_slot(region_loc) < 0) {
+				continue;
+			}
+			_region_locations.push_back(region_loc);
+		}
+	}
+	_region_map_dirty = false;
+	_region_map_signal_dirty = true;
+	_region_map_rebuild_count++;
+	_rebuild_region_directory();
+}
+
+// The blank layer is cached per slot map: it is only needed when an array is
+// (re)created and as the placeholder for a region without a surface map, but
+// building it is a full region-sized image fill, which must not happen on every
+// update_maps() call. The cache follows the region size.
+Ref<Image> Terrain3DData::_get_blank_slot_map(const int p_slot_map) {
+	if (_region_size <= 0 || p_slot_map < 0 || p_slot_map >= SLOT_MAP_MAX) {
+		return Ref<Image>();
+	}
+	Ref<Image> &blank = _blank_slot_maps[p_slot_map];
+	if (blank.is_valid() && blank->get_width() == _region_size) {
+		return blank;
+	}
+	switch (p_slot_map) {
+		case SLOT_MAP_HEIGHT:
+			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_HEIGHT], false,
+					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_HEIGHT]);
+			break;
+		case SLOT_MAP_CONTROL:
+			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_CONTROL], false,
+					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_CONTROL]);
+			break;
+		case SLOT_MAP_COLOR:
+			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_COLOR], true,
+					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_COLOR]);
+			break;
+		case SLOT_MAP_SURFACE: {
+			// A blank R16 layer is all-zero packed values = single material 0.
+			// FORMAT_R16 (39) is not named in this godot-cpp binding.
+			PackedByteArray zeros;
+			zeros.resize(int64_t(_region_size) * _region_size * 2);
+			blank = Image::create_from_data(_region_size, _region_size, false, Image::Format(39), zeros);
+			break;
+		}
+		default:
+			break;
+	}
+	return blank;
+}
+
+Ref<Image> Terrain3DData::_get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const {
+	if (!p_region) {
+		return Ref<Image>();
+	}
+	switch (p_slot_map) {
+		case SLOT_MAP_HEIGHT:
+			return p_region->get_height_map();
+		case SLOT_MAP_CONTROL:
+			return p_region->get_control_map();
+		case SLOT_MAP_COLOR:
+			return p_region->get_color_map();
+		case SLOT_MAP_SURFACE:
+			return p_region->get_surface_map();
+		default:
+			return Ref<Image>();
+	}
+}
+
+// Uploads one of the four slot maps. Only layers that are actually stale are
+// touched, unless the whole map was marked full (capacity change, bulk rebuild, or
+// an explicit update_maps(all_regions = true)). Returns true if anything changed.
+bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
+	GeneratedTexture *gen = nullptr;
+	TypedArray<Image> *images = nullptr;
+	const char *signal = nullptr;
+	switch (p_slot_map) {
+		case SLOT_MAP_HEIGHT:
+			gen = &_generated_height_maps;
+			images = &_height_maps;
+			signal = "height_maps_changed";
+			break;
+		case SLOT_MAP_CONTROL:
+			gen = &_generated_control_maps;
+			images = &_control_maps;
+			signal = "control_maps_changed";
+			break;
+		case SLOT_MAP_COLOR:
+			gen = &_generated_color_maps;
+			images = &_color_maps;
+			signal = "color_maps_changed";
+			break;
+		case SLOT_MAP_SURFACE:
+			gen = &_generated_surface_maps;
+			images = &_surface_maps;
+			signal = "surface_maps_changed";
+			break;
+		default:
+			return false;
+	}
+	if (_slot_capacity <= 0) {
+		gen->clear();
+		images->clear();
+		_slot_map_full[p_slot_map] = false;
+		return false;
+	}
+	const Ref<Image> blank = _get_blank_slot_map(p_slot_map);
+	if (blank.is_null()) {
+		return false;
+	}
+	// Keep the CPU side array slot indexed so get_surface_maps() and
+	// update_surface_region() agree with the uploaded layers. Free slots hold the
+	// blank layer rather than null, because callers iterate these arrays as images.
+	if (images->size() != _slot_capacity) {
+		const int64_t previous = images->size();
+		images->resize(_slot_capacity);
+		for (int64_t slot = previous; slot < _slot_capacity; slot++) {
+			(*images)[slot] = blank;
+		}
+	}
+	const bool created = gen->ensure_layers(blank, _slot_capacity);
+	const bool full = created || _slot_map_full[p_slot_map];
+	if (full) {
+		_slot_full_sync_count++;
+	}
+	const uint8_t bit = uint8_t(1 << p_slot_map);
+	bool changed = false;
+	for (int slot = 0; slot < _slot_capacity; slot++) {
+		if (_slot_locations[slot] == V2I_MAX) {
+			// Free slot: release the unloaded region's image so streaming actually
+			// frees CPU memory. The layer is never sampled through the region map,
+			// and the entry must stay a real image for callers that iterate it.
+			Ref<Image> current = (*images)[slot];
+			if (current != blank) {
+				(*images)[slot] = blank;
+			}
+			continue;
+		}
+		if (!full && !(_slot_dirty[slot] & bit)) {
+			continue;
+		}
+		Terrain3DRegion *region = get_region_ptr(_slot_locations[slot]);
+		Ref<Image> image = _get_slot_map_image(region, p_slot_map);
+		if (image.is_null()) {
+			// Regions without a surface map keep the blank layer.
+			image = blank;
+		}
+		(*images)[slot] = image;
+		gen->update(image, slot);
+		// Clear this map's bit. Without this the slot stays dirty and is uploaded
+		// again on every later sync, which is exactly the cost the slot table exists
+		// to avoid: a settled ring would re-upload every resident layer per step.
+		_slot_dirty[slot] &= uint8_t(~bit);
+		changed = true;
+	}
+	_slot_map_full[p_slot_map] = false;
+	if (changed) {
+		LOG(DEBUG, "Emitting ", signal);
+		emit_signal(signal);
+	}
+	return changed;
+}
+
+// Maps a public MapType request onto the internal slot maps. The surface map has no
+// MapType of its own and is only refreshed by a full TYPE_MAX pass, as before.
+bool Terrain3DData::_slot_map_requested(const MapType p_map_type, const int p_slot_map) {
+	switch (p_slot_map) {
+		case SLOT_MAP_HEIGHT:
+			return p_map_type == TYPE_HEIGHT || p_map_type == TYPE_MAX;
+		case SLOT_MAP_CONTROL:
+			return p_map_type == TYPE_CONTROL || p_map_type == TYPE_MAX;
+		case SLOT_MAP_COLOR:
+			return p_map_type == TYPE_COLOR || p_map_type == TYPE_MAX;
+		case SLOT_MAP_SURFACE:
+			return p_map_type == TYPE_MAX;
+		default:
+			return false;
+	}
+}
+
+int Terrain3DData::_slot_map_mask(const MapType p_map_type) {
+	switch (p_map_type) {
+		case TYPE_HEIGHT:
+			return 1 << SLOT_MAP_HEIGHT;
+		case TYPE_CONTROL:
+			return 1 << SLOT_MAP_CONTROL;
+		case TYPE_COLOR:
+			return 1 << SLOT_MAP_COLOR;
+		default:
+			return 0xF;
+	}
 }
 
 // Structured to work with do_for_regions. Should be renamed when copy_paste is expanded
@@ -99,11 +491,16 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 	_terrain = p_terrain;
 	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
 	_vertex_spacing = _terrain->get_vertex_spacing();
+	// _region_size must be known before load_directory(): add_region() and
+	// update_maps() size the region maps and the blank surface layer from it.
+	// Leaving it at 0 until after the load created zero-sized images and crashed.
+	// Terrain3D::set_region_size() cannot correct this later either, because it
+	// short circuits when the terrain's region size already matches the file.
+	_region_size = _terrain->get_region_size();
+	_region_sizev = V2I(_region_size);
 	if (!prev_initialized && !_terrain->get_data_directory().is_empty()) {
 		load_directory(_terrain->get_data_directory());
 	}
-	_region_size = _terrain->get_region_size();
-	_region_sizev = V2I(_region_size);
 }
 
 void Terrain3DData::set_region_locations(const TypedArray<Vector2i> &p_locations) {
@@ -297,10 +694,16 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 		LOG(INFO, "Overwriting ", (_regions.has(region_loc)) ? "deleted" : "existing", " region at ", region_loc);
 	}
 	_regions[region_loc] = p_region;
-	_region_map_dirty = true;
-	LOG(DEBUG, "Storing region ", region_loc, " version ", vformat("%.3f", p_region->get_version()), " id: ", _region_locations.size());
+	// Publish the region in the map immediately so get_region_id() and has_region()
+	// are correct before the next update_maps(), and give it a stable layer slot.
+	const int slot = _acquire_slot(region_loc);
+	if (slot < 0) {
+		LOG(ERROR, "No free map slot for region ", region_loc);
+		return FAILED;
+	}
+	LOG(DEBUG, "Storing region ", region_loc, " version ", vformat("%.3f", p_region->get_version()), " slot: ", slot);
 	if (p_update) {
-		update_maps(TYPE_MAX, true, false);
+		update_maps(TYPE_MAX, false, false);
 		_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
 	}
 	return OK;
@@ -325,20 +728,48 @@ void Terrain3DData::remove_region(const Ref<Terrain3DRegion> &p_region, const bo
 	}
 
 	Vector2i region_loc = p_region->get_location();
-	int region_id = _region_locations.find(region_loc);
+	// Index inside the dense _region_locations list, which is not the layer slot.
+	const int list_index = _region_locations.find(region_loc);
 	LOG(INFO, "Marking region ", region_loc, " for deletion. update_maps: ", p_update ? "yes" : "no");
-	if (region_id < 0) {
+	if (list_index < 0) {
 		LOG(ERROR, "Region ", region_loc, " not found in region_locations. Returning");
 		return;
 	}
 	p_region->set_deleted(true);
-	_region_locations.remove_at(region_id);
-	_region_map_dirty = true;
+	_region_locations.remove_at(list_index);
+	_release_slot(region_loc);
+	_region_map_signal_dirty = true;
 	LOG(DEBUG, "Removing from region_locations, new size: ", _region_locations.size());
 	if (p_update) {
 		LOG(DEBUG, "Updating generated maps");
-		update_maps(TYPE_MAX, true, false);
+		update_maps(TYPE_MAX, false, false);
 		_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
+	}
+}
+
+// Streaming support: drops a region from memory without touching its file.
+// Unlike remove_region() the region is not marked deleted and is erased from
+// _regions, so the file on disk stays the only copy. Any Ref held elsewhere
+// (undo, an editor panel) keeps the resource alive on its own.
+void Terrain3DData::unload_region(const Vector2i &p_region_loc, const bool p_update) {
+	Terrain3DRegion *region = get_region_ptr(p_region_loc);
+	if (!region) {
+		LOG(DEBUG, "unload_region: no region at ", p_region_loc);
+		return;
+	}
+	const int list_index = _region_locations.find(p_region_loc);
+	LOG(INFO, "Unloading region ", p_region_loc, " from memory, list index: ", list_index);
+	if (list_index >= 0) {
+		_region_locations.remove_at(list_index);
+	}
+	_regions.erase(p_region_loc);
+	_release_slot(p_region_loc);
+	_region_map_signal_dirty = true;
+	if (p_update) {
+		update_maps(TYPE_MAX, false, false);
+		if (_terrain->get_instancer()) {
+			_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
+		}
 	}
 }
 
@@ -462,6 +893,57 @@ void Terrain3DData::load_region(const Vector2i &p_region_loc, const String &p_di
 	add_region(region, p_update);
 }
 
+// The layer -> region location table the shader reads as `_region_locations`.
+// Free slots are V2I_MAX; the region map never points at them, so the shader never
+// indexes one. Padded to the material's max_regions by Terrain3DMaterial.
+PackedVector2Array Terrain3DData::get_slot_locations() const {
+	PackedVector2Array locations;
+	locations.resize(_slot_capacity);
+	for (int slot = 0; slot < _slot_capacity; slot++) {
+		locations[slot] = (_slot_locations[slot] == V2I_MAX) ? Vector2() : Vector2(_slot_locations[slot]);
+	}
+	return locations;
+}
+
+// Diagnostics for the slot table and the texture arrays. `map_create_count` counts
+// GPU array allocations, `map_update_count` counts single layer uploads: steady
+// streaming should grow the second and leave the first alone.
+Dictionary Terrain3DData::get_map_stats() const {
+	Dictionary stats;
+	stats["slot_capacity"] = _slot_capacity;
+	stats["slot_count"] = int(_region_slots.size());
+	stats["free_slots"] = int(_free_slots.size());
+	stats["region_count"] = _region_locations.size();
+	stats["map_create_count"] = _generated_height_maps.get_create_count() +
+			_generated_control_maps.get_create_count() +
+			_generated_color_maps.get_create_count() +
+			_generated_surface_maps.get_create_count();
+	stats["map_update_count"] = _generated_height_maps.get_update_count() +
+			_generated_control_maps.get_update_count() +
+			_generated_color_maps.get_update_count() +
+			_generated_surface_maps.get_update_count();
+	stats["height_layers"] = _generated_height_maps.get_layer_count();
+	stats["control_layers"] = _generated_control_maps.get_layer_count();
+	stats["color_layers"] = _generated_color_maps.get_layer_count();
+	stats["surface_layers"] = _generated_surface_maps.get_layer_count();
+	stats["slot_grow_count"] = _slot_grow_count;
+	stats["region_map_rebuild_count"] = _region_map_rebuild_count;
+	stats["slot_full_sync_count"] = _slot_full_sync_count;
+	stats["region_map_size"] = REGION_MAP_SIZE;
+	stats["directory_valid"] = _region_directory.get_rid().is_valid();
+	return stats;
+}
+
+void Terrain3DData::reset_map_stats() {
+	_generated_height_maps.reset_counters();
+	_generated_control_maps.reset_counters();
+	_generated_color_maps.reset_counters();
+	_generated_surface_maps.reset_counters();
+	_slot_grow_count = 0;
+	_region_map_rebuild_count = 0;
+	_slot_full_sync_count = 0;
+}
+
 TypedArray<Image> Terrain3DData::get_maps(const MapType p_map_type) const {
 	if (p_map_type < 0 || p_map_type >= TYPE_MAX) {
 		LOG(ERROR, "Specified map type out of range");
@@ -496,175 +978,84 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 		}
 	}
 
-	// Mark texture arrays dirty for rebuilding
+	// p_all_regions means "assume every region changed". It no longer throws the GPU
+	// arrays away: the layer layout belongs to the slot table, so the arrays are only
+	// recreated when the slot capacity changes.
 	if (p_all_regions) {
 		LOG(EXTREME, "Marking dirty maps of type: ", p_map_type);
 		switch (p_map_type) {
 			case TYPE_HEIGHT:
-				_generated_height_maps.clear();
+				_slot_map_full[SLOT_MAP_HEIGHT] = true;
 				break;
 			case TYPE_CONTROL:
-				_generated_control_maps.clear();
+				_slot_map_full[SLOT_MAP_CONTROL] = true;
 				break;
 			case TYPE_COLOR:
-				_generated_color_maps.clear();
+				_slot_map_full[SLOT_MAP_COLOR] = true;
 				break;
 			default:
-				_generated_height_maps.clear();
-				_generated_control_maps.clear();
-				_generated_color_maps.clear();
-				_generated_surface_maps.clear();
+				for (int i = 0; i < SLOT_MAP_MAX; i++) {
+					_slot_map_full[i] = true;
+				}
 				_region_map_dirty = true;
 				break;
 		}
 	}
 
-	bool any_changed = false;
+	// A structural change (a region entering or leaving memory, a bulk rebuild, or a
+	// capacity change) has to reach the material, because the array RIDs and the
+	// region/layer mapping it holds may have moved. Content edits do not, and the old
+	// code relied on a full rebuild to tell the two apart.
+	bool structural = _region_map_dirty || _region_map_signal_dirty;
+	for (int i = 0; i < SLOT_MAP_MAX && !structural; i++) {
+		structural = _slot_map_full[i];
+	}
+	for (int slot = 0; slot < (int)_slot_dirty.size() && !structural; slot++) {
+		structural = _slot_dirty[slot] != 0;
+	}
 
-	// Rebuild region map if dirty
 	if (_region_map_dirty) {
-		LOG(EXTREME, "Regenerating ", REGION_MAP_VSIZE, " region map array from active regions");
-		_region_map.clear();
-		_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
-		_region_map_dirty = false;
-		_region_locations = TypedArray<Vector2i>(); // enforce new pointer
-		int region_id = 0;
-		for (const Vector2i &region_loc : _regions.keys()) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region && !region->is_deleted()) {
-				region_id += 1; // Begin at 1 since 0 = no region
-				int map_index = get_region_map_index(region_loc);
-				if (map_index >= 0) {
-					_region_map[map_index] = region_id;
-					_region_locations.push_back(region_loc);
-				}
-			}
+		_rebuild_region_map();
+	}
+
+	// Fold content edits into the slot dirtiness so one upload pass covers both
+	// structural and edited changes: a region can be edited in the same call that
+	// adds or unloads another one.
+	const int edit_mask = _slot_map_mask(p_map_type);
+	for (const Vector2i &region_loc : _region_locations) {
+		const Terrain3DRegion *region = get_region_ptr(region_loc);
+		if (region && region->is_edited()) {
+			_mark_slot_dirty(get_region_id(region_loc), edit_mask);
 		}
-		any_changed = true;
+	}
+
+	bool any_changed = false;
+	for (int slot_map = 0; slot_map < SLOT_MAP_MAX; slot_map++) {
+		if (!_slot_map_requested(p_map_type, slot_map)) {
+			continue;
+		}
+		const bool changed = _sync_slot_map(slot_map);
+		any_changed = any_changed || changed;
+		if (changed && slot_map == SLOT_MAP_HEIGHT) {
+			calc_height_range();
+		}
+	}
+
+	// The directory has to reach the shader whenever it changed, not only when the
+	// region map signal fires: adding a region patches one texel without touching
+	// `_region_map_signal_dirty`.
+	const bool directory_changed = _region_directory_dirty;
+	if (directory_changed) {
+		_update_region_directory();
+	}
+
+	if (_region_map_signal_dirty) {
+		_region_map_signal_dirty = false;
 		LOG(DEBUG, "Emitting region_map_changed");
 		emit_signal("region_map_changed");
 	}
 
-	// Rebuild height maps if dirty
-	if (_generated_height_maps.is_dirty()) {
-		LOG(EXTREME, "Regenerating height texture array from regions");
-		_height_maps.clear();
-		for (const Vector2i &region_loc : _region_locations) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region) {
-				_height_maps.push_back(region->get_height_map());
-			} else {
-				LOG(ERROR, "Can't find region ", region_loc, ", _regions: ", _regions,
-						", locations: ", _region_locations, ". Please report this error.");
-				return;
-			}
-		}
-		_generated_height_maps.create(_height_maps);
-		calc_height_range();
-		any_changed = true;
-		LOG(DEBUG, "Emitting height_maps_changed");
-		emit_signal("height_maps_changed");
-	}
-
-	// Rebulid control maps if dirty
-	if (_generated_control_maps.is_dirty()) {
-		LOG(EXTREME, "Regenerating control texture array from regions");
-		_control_maps.clear();
-		for (const Vector2i &region_loc : _region_locations) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region) {
-				_control_maps.push_back(region->get_control_map());
-			}
-		}
-		_generated_control_maps.create(_control_maps);
-		any_changed = true;
-		LOG(DEBUG, "Emitting control_maps_changed");
-		emit_signal("control_maps_changed");
-	}
-
-	// Rebulid color maps if dirty
-	if (_generated_color_maps.is_dirty()) {
-		LOG(EXTREME, "Regenerating color texture array from regions");
-		_color_maps.clear();
-		for (const Vector2i &region_loc : _region_locations) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region) {
-				_color_maps.push_back(region->get_color_map());
-			}
-		}
-		_generated_color_maps.create(_color_maps);
-		any_changed = true;
-		LOG(DEBUG, "Emitting color_maps_changed");
-		emit_signal("color_maps_changed");
-	}
-
-	// Rebuild surface maps if dirty. Regions without a surface map contribute
-	// a blank R16 layer (all-zero packed values = single material 0) so the
-	// array stays aligned with region_id.
-	if (_generated_surface_maps.is_dirty()) {
-		LOG(EXTREME, "Regenerating surface texture array from regions");
-		_surface_maps.clear();
-		PackedByteArray zeros;
-		zeros.resize(int64_t(_region_size) * _region_size * 2);
-		for (const Vector2i &region_loc : _region_locations) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region && region->get_surface_map().is_valid()) {
-				_surface_maps.push_back(region->get_surface_map());
-			} else {
-				_surface_maps.push_back(Image::create_from_data(_region_size, _region_size, false, Image::Format(39), zeros));
-			}
-		}
-		_generated_surface_maps.create(_surface_maps);
-		any_changed = true;
-		LOG(DEBUG, "Emitting surface_maps_changed");
-		emit_signal("surface_maps_changed");
-	}
-
-	// If no maps have been rebuilt, update only individual regions in the array.
-	// Regions marked Edited have been changed by Terrain3DEditor::_operate_map or undo / redo processing.
-	if (!any_changed) {
-		for (const Vector2i &region_loc : _region_locations) {
-			const Terrain3DRegion *region = get_region_ptr(region_loc);
-			if (region && region->is_edited()) {
-				int region_id = get_region_id(region_loc);
-				switch (p_map_type) {
-					case TYPE_HEIGHT:
-						_generated_height_maps.update(region->get_height_map(), region_id);
-						LOG(DEBUG, "Emitting height_maps_changed");
-						emit_signal("height_maps_changed");
-						break;
-					case TYPE_CONTROL:
-						_generated_control_maps.update(region->get_control_map(), region_id);
-						LOG(DEBUG, "Emitting control_maps_changed");
-						emit_signal("control_maps_changed");
-						break;
-					case TYPE_COLOR:
-						_generated_color_maps.update(region->get_color_map(), region_id);
-						LOG(DEBUG, "Emitting color_maps_changed");
-						emit_signal("color_maps_changed");
-						break;
-					default:
-						_generated_height_maps.update(region->get_height_map(), region_id);
-						_generated_control_maps.update(region->get_control_map(), region_id);
-						_generated_color_maps.update(region->get_color_map(), region_id);
-						if (region->get_surface_map().is_valid()) {
-							_surface_maps[region_id] = region->get_surface_map();
-							_generated_surface_maps.update(region->get_surface_map(), region_id);
-						}
-						LOG(DEBUG, "Emitting height_maps_changed");
-						emit_signal("height_maps_changed");
-						LOG(DEBUG, "Emitting control_maps_changed");
-						emit_signal("control_maps_changed");
-						LOG(DEBUG, "Emitting color_maps_changed");
-						emit_signal("color_maps_changed");
-						LOG(DEBUG, "Emitting surface_maps_changed");
-						emit_signal("surface_maps_changed");
-						break;
-				}
-			}
-		}
-	}
-	if (any_changed) {
+	if (any_changed || structural || directory_changed) {
 		LOG(DEBUG, "Emitting maps_changed");
 		emit_signal("maps_changed");
 		_terrain->snap();
@@ -1372,8 +1763,103 @@ Ref<Image> Terrain3DData::layered_to_image(const MapType p_map_type, const Rect2
 	return img;
 }
 
+// Virtual texture page production. Reads the region's R16 surface map once and
+// resamples it into every page of one local mip.
+//
+// Layout: the sector block is `p_pages_per_axis` pages per axis at local mip 0, so
+// mip `m` has `max(1, pages >> m)` pages per axis and each page covers
+// `region_size / pages_at_mip` region texels. Sampling is nearest, which is exact
+// for a 1:1 crop and a plain point upsample otherwise. The border replicates the
+// edge texel so a bilinear tap at the page seam cannot pull in a neighbour's data.
+int Terrain3DData::produce_surface_pages(const Vector2i &p_region_loc, const int p_local_mip,
+		const int p_pages_per_axis, const int p_page_size, const int p_border,
+		std::vector<Ref<Image>> &r_pages) {
+	const int max_local_mip = TerrainVT::log2_power_of_two(MAX(1, p_pages_per_axis));
+	if (p_local_mip < 0 || p_local_mip > max_local_mip) {
+		r_pages.clear();
+		return -1;
+	}
+	const int pages_at_mip = MAX(1, p_pages_per_axis >> p_local_mip);
+	std::vector<Vector3i> requests;
+	requests.reserve(size_t(pages_at_mip) * pages_at_mip);
+	for (int page_y = 0; page_y < pages_at_mip; page_y++) {
+		for (int page_x = 0; page_x < pages_at_mip; page_x++) {
+			requests.push_back(Vector3i(page_x, page_y, p_local_mip));
+		}
+	}
+	return produce_surface_page_set(p_region_loc, p_pages_per_axis, p_page_size, p_border,
+			requests, r_pages);
+}
+
+int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const int p_pages_per_axis,
+		const int p_page_size, const int p_border, const std::vector<Vector3i> &p_requests,
+		std::vector<Ref<Image>> &r_pages) {
+	r_pages.clear();
+	if (_region_size <= 0 || p_page_size <= 0 || p_border < 0 || p_pages_per_axis <= 0) {
+		return -1;
+	}
+	Terrain3DRegion *region = get_region_ptr(p_region_loc);
+	if (!region) {
+		return -1;
+	}
+	const int max_local_mip = TerrainVT::log2_power_of_two(p_pages_per_axis);
+
+	// Regions without a surface map produce the blank page, which is what the array
+	// path shows too: all-zero packed values are single material 0.
+	Ref<Image> source = region->get_surface_map();
+	PackedByteArray source_bytes;
+	int source_size = _region_size;
+	if (source.is_valid() && source->get_format() == Image::Format(39) &&
+			source->get_width() == source->get_height()) {
+		source_size = source->get_width();
+		source_bytes = source->get_data();
+	}
+
+	const int stored = p_page_size + 2 * p_border;
+	PackedByteArray page_bytes;
+	page_bytes.resize(int64_t(stored) * stored * 2);
+
+	for (const Vector3i &request : p_requests) {
+		const int local_mip = request.z;
+		if (local_mip < 0 || local_mip > max_local_mip) {
+			return -1;
+		}
+		const int pages_at_mip = MAX(1, p_pages_per_axis >> local_mip);
+		const int span = MAX(1, _region_size / pages_at_mip);
+		if (request.x < 0 || request.y < 0 || request.x >= pages_at_mip || request.y >= pages_at_mip) {
+			return -1;
+		}
+		const int origin_x = request.x * span;
+		const int origin_y = request.y * span;
+		if (source_bytes.is_empty()) {
+			page_bytes.fill(0);
+		} else {
+			for (int y = 0; y < stored; y++) {
+				// Page texel -> region texel. The negative numerator of the border
+				// rows truncates toward zero, and the clamp turns that into the
+				// replicated edge.
+				const int region_y = origin_y + ((y - p_border) * span) / p_page_size;
+				const int clamped_y = CLAMP(region_y, 0, source_size - 1);
+				for (int x = 0; x < stored; x++) {
+					const int region_x = origin_x + ((x - p_border) * span) / p_page_size;
+					const int clamped_x = CLAMP(region_x, 0, source_size - 1);
+					page_bytes.encode_u16((int64_t(y) * stored + x) * 2,
+							source_bytes.decode_u16((int64_t(clamped_y) * source_size + clamped_x) * 2));
+				}
+			}
+		}
+		Ref<Image> page = Image::create_from_data(stored, stored, false, Image::Format(39), page_bytes);
+		if (page.is_null()) {
+			return -1;
+		}
+		r_pages.push_back(page);
+	}
+	return int(r_pages.size());
+}
+
 void Terrain3DData::dump(const bool verbose) const {
 	LOG(MESG, "_region_locations (", _region_locations.size(), "): ", _region_locations);
+	LOG(MESG, "Map slots: ", _slot_capacity, " capacity, ", _region_slots.size(), " used, ", _free_slots.size(), " free");
 	Array keys = _regions.keys();
 	LOG(MESG, "_regions (", keys.size(), "):");
 	for (const Vector2i &region_loc : keys) {
@@ -1385,9 +1871,14 @@ void Terrain3DData::dump(const bool verbose) const {
 		region->dump(verbose);
 	}
 	if (verbose) {
+		for (int slot = 0; slot < _slot_capacity; slot++) {
+			if (_slot_locations[slot] != V2I_MAX) {
+				LOG(MESG, "Slot ", slot, " / ", _slot_capacity - 1, " -> region ", _slot_locations[slot]);
+			}
+		}
 		for (int i = 0; i < _region_map.size(); i++) {
 			if (_region_map[i]) {
-				LOG(MESG, "Region map array index: ", i, " / ", _region_map.size() - 1, ", Region id: ", _region_map[i]);
+				LOG(MESG, "Region map array index: ", i, " / ", _region_map.size() - 1, ", Slot: ", _region_map[i] - 1);
 			}
 		}
 		Util::dump_maps(_height_maps, "Height maps");
@@ -1418,6 +1909,13 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_regions_active", "copy", "deep"), &Terrain3DData::get_regions_active, DEFVAL(false), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_regions_all"), &Terrain3DData::get_regions_all);
 	ClassDB::bind_method(D_METHOD("get_region_map"), &Terrain3DData::get_region_map);
+	ClassDB::bind_method(D_METHOD("get_region_directory_rid"), &Terrain3DData::get_region_directory_rid);
+	ClassDB::bind_method(D_METHOD("is_region_directory_valid"), &Terrain3DData::is_region_directory_valid);
+	ClassDB::bind_method(D_METHOD("region_map_to_image", "region_map"), &Terrain3DData::region_map_to_image);
+	ClassDB::bind_method(D_METHOD("get_map_capacity"), &Terrain3DData::get_map_capacity);
+	ClassDB::bind_method(D_METHOD("get_slot_locations"), &Terrain3DData::get_slot_locations);
+	ClassDB::bind_method(D_METHOD("get_map_stats"), &Terrain3DData::get_map_stats);
+	ClassDB::bind_method(D_METHOD("reset_map_stats"), &Terrain3DData::reset_map_stats);
 	ClassDB::bind_static_method("Terrain3DData", D_METHOD("get_region_map_index", "region_location"), &Terrain3DData::get_region_map_index);
 
 	ClassDB::bind_method(D_METHOD("do_for_regions", "area", "callback"), &Terrain3DData::do_for_regions);
@@ -1443,6 +1941,7 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("remove_regionp", "global_position", "update"), &Terrain3DData::remove_regionp, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("remove_regionl", "region_location", "update"), &Terrain3DData::remove_regionl, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("remove_region", "region", "update"), &Terrain3DData::remove_region, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("unload_region", "region_location", "update"), &Terrain3DData::unload_region, DEFVAL(true));
 
 	ClassDB::bind_method(D_METHOD("save_directory", "directory"), &Terrain3DData::save_directory);
 	ClassDB::bind_method(D_METHOD("save_region", "region_location", "directory", "save_16_bit"), &Terrain3DData::save_region, DEFVAL(false));

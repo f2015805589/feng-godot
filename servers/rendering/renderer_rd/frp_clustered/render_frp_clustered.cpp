@@ -308,7 +308,11 @@ uint32_t RenderFRPClustered::RenderBufferDataFRPClustered::get_specular_usage_bi
 }
 
 RD::DataFormat RenderFRPClustered::RenderBufferDataFRPClustered::get_normal_roughness_format() {
-	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	// Unreal's GBufferA is PF_A2B10G10R10: 10 bits per normal axis (30 bits)
+	// instead of this renderer's previous 24-bit best-fit normal in RGBA8. The
+	// 2-bit alpha holds the dynamic/static flag, and roughness lives in
+	// gbuffer_orm.g, so bytes per pixel are unchanged.
+	return RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
 }
 
 uint32_t RenderFRPClustered::RenderBufferDataFRPClustered::get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {

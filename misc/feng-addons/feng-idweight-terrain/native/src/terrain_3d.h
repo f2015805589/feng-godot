@@ -21,6 +21,9 @@
 #include "terrain_3d_instancer.h"
 #include "terrain_3d_material.h"
 #include "terrain_3d_mesher.h"
+#include "terrain_3d_streamer.h"
+#include "terrain_3d_virtual_texture.h"
+#include "terrain_3d_vt_feedback.h"
 
 class Terrain3D : public Node3D {
 	GDCLASS(Terrain3D, Node3D);
@@ -59,6 +62,36 @@ private:
 	Terrain3DInstancer *_instancer = nullptr;
 	Terrain3DEditor *_editor = nullptr;
 	Object *_editor_plugin = nullptr;
+	Terrain3DStreamer *_streamer = nullptr;
+	bool _streaming_enabled = false;
+
+	// Surface virtual texture: the near field's surface pages, produced from the
+	// region surface maps. Off by default; the array path stays authoritative until
+	// the source data carries more detail than the array can afford to keep resident.
+	Terrain3DVirtualTexture *_surface_vt = nullptr;
+	bool _surface_vt_enabled = false;
+	int _surface_vt_page_count = 64;
+	int _surface_vt_page_size = 256;
+	int _surface_vt_page_border = 4;
+	int _surface_vt_pages_per_axis = 4;
+	real_t _surface_vt_distance = 512.f;
+	bool _surface_vt_force_mip = false;
+	int _surface_vt_mip = 0;
+	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
+	// the chunk directory returns, so the shader needs no separate sector lookup.
+	PackedVector2Array _surface_vt_blocks;
+	bool _surface_vt_blocks_dirty = false;
+	// GPU page demand. When enabled it replaces the distance rule: the compute pass
+	// knows the field of view, the resolution and the view direction, and it culls.
+	Terrain3DVTFeedback *_surface_vt_feedback = nullptr;
+	bool _surface_vt_feedback_enabled = false;
+	int _surface_vt_feedback_interval = 4;
+	int _surface_vt_feedback_tick = 0;
+	int _surface_vt_feedback_grid_chunks = 8;
+	// A page whose screen extent falls below this is not requested at all: it would
+	// be a sub-pixel speck in the atlas.
+	real_t _surface_vt_feedback_min_extent = 8.f;
+	Vector2i _surface_vt_feedback_origin;
 
 	// Regions
 	RegionSize _region_size = SIZE_256;
@@ -124,6 +157,20 @@ private:
 	void _setup_ocean_mesher();
 	void _update_ocean_aabbs() { _ocean_mesher ? _ocean_mesher->update_aabbs() : void(); }
 	void _destroy_ocean_mesher(const bool p_final = false);
+	void _destroy_streamer();
+
+	void _setup_surface_vt();
+	void _destroy_surface_vt();
+	// One demand pass: registers sectors for the regions near the target, picks a mip
+	// per page (GPU feedback when enabled, otherwise the distance rule), produces the
+	// pages that are missing and commits.
+	int update_surface_vt();
+	// Refreshes the feedback pass and returns true when a usable result is available.
+	bool _update_surface_vt_feedback(const Vector3 &p_target);
+	// Local mip for one page of a sector, or -1 when the demand says "no page".
+	int _surface_vt_mip_for_page(const Vector2i &p_region_loc, const int p_page_x0,
+			const int p_page_y0, const real_t p_distance, const real_t p_page_world_size,
+			const int p_max_local_mip);
 
 	void _setup_displacement_buffer();
 	void _update_displacement_buffer();
@@ -166,6 +213,42 @@ public:
 	Terrain3DEditor *get_editor() const { return _editor; }
 	void set_plugin(Object *p_plugin);
 	Object *get_plugin() const { return _editor_plugin; }
+
+	// Region Streaming
+	Terrain3DStreamer *get_streamer() const { return _streamer; }
+	void set_streaming_enabled(const bool p_enabled);
+	bool is_streaming_enabled() const { return _streaming_enabled; }
+
+	Terrain3DVirtualTexture *get_surface_vt() const { return _surface_vt; }
+	void set_surface_vt_enabled(const bool p_enabled);
+	bool is_surface_vt_enabled() const { return _surface_vt_enabled; }
+	void set_surface_vt_page_count(const int p_count);
+	int get_surface_vt_page_count() const { return _surface_vt_page_count; }
+	void set_surface_vt_page_size(const int p_size);
+	int get_surface_vt_page_size() const { return _surface_vt_page_size; }
+	void set_surface_vt_page_border(const int p_border);
+	int get_surface_vt_page_border() const { return _surface_vt_page_border; }
+	void set_surface_vt_pages_per_axis(const int p_pages);
+	int get_surface_vt_pages_per_axis() const { return _surface_vt_pages_per_axis; }
+	void set_surface_vt_distance(const real_t p_distance);
+	real_t get_surface_vt_distance() const { return _surface_vt_distance; }
+	// Forces every sector to one mip, so a test can ask for a specific level instead
+	// of whatever the distance rule picks.
+	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
+	bool is_surface_vt_force_mip() const { return _surface_vt_force_mip; }
+	int get_surface_vt_mip() const { return _surface_vt_mip; }
+	void set_surface_vt_feedback_enabled(const bool p_enabled);
+	bool is_surface_vt_feedback_enabled() const { return _surface_vt_feedback_enabled; }
+	void set_surface_vt_feedback_interval(const int p_updates);
+	int get_surface_vt_feedback_interval() const { return _surface_vt_feedback_interval; }
+	void set_surface_vt_feedback_grid_chunks(const int p_chunks);
+	int get_surface_vt_feedback_grid_chunks() const { return _surface_vt_feedback_grid_chunks; }
+	void set_surface_vt_feedback_min_extent(const real_t p_extent);
+	real_t get_surface_vt_feedback_min_extent() const { return _surface_vt_feedback_min_extent; }
+	Terrain3DVTFeedback *get_surface_vt_feedback() const { return _surface_vt_feedback; }
+	PackedVector2Array get_surface_vt_blocks() const { return _surface_vt_blocks; }
+	bool is_surface_vt_blocks_dirty() const { return _surface_vt_blocks_dirty; }
+	void clear_surface_vt_blocks_dirty() { _surface_vt_blocks_dirty = false; }
 
 	// Regions
 	void set_region_size(const RegionSize p_size);

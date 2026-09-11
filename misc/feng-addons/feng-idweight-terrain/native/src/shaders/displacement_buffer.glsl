@@ -43,8 +43,9 @@ uniform float _vertex_spacing = 1.0;
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1./region_size
-uniform int _region_map_size = 32;
-uniform int _region_map[1024];
+uniform int _region_map_size = 128;
+// Chunk -> layer directory, same texture as the main shader (R32F, slot + 1).
+uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
 //INSERT: MAX_REGIONS_64
 //INSERT: MAX_REGIONS_128
 //INSERT: MAX_REGIONS_256
@@ -91,26 +92,37 @@ struct material {
 // Vertex
 ////////////////////////
 
+// Reads the chunk directory and returns the texture array layer for a chunk, or -1
+// when the chunk is outside the world grid or holds no region.
+int get_region_layer(const ivec2 p_chunk) {
+	ivec2 pos = p_chunk + (_region_map_size / 2);
+	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
+	ivec2 clamped = clamp(pos, ivec2(0), ivec2(_region_map_size - 1));
+	int map_val = int(texelFetch(_region_map, clamped, 0).r + 0.5);
+	int raw_index = map_val - 1;
+	int is_region = bounds * int(raw_index >= 0) * int(raw_index < MAX_REGIONS);
+	int is_dummy = bounds * int(map_val < 0);
+	return is_region * raw_index
+	     + is_dummy * (map_val - 1)
+	     - (1 - is_region - is_dummy);
+}
+
 // Takes in world space XZ (UV) coordinates
 // Returns ivec3 with:
 // XY: (0 to _region_size - 1) coordinates within a region
 // Z: layer index used for texturearrays, -1 if not in a region
 ivec3 get_index_coord(const vec2 uv) {
 	vec2 r_uv = round(uv);
-	ivec2 pos = ivec2(floor(r_uv * _region_texel_size)) + (_region_map_size / 2);
-	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
-	int layer_index = _region_map[pos.y * _region_map_size + pos.x] * bounds - 1;
-	return ivec3(ivec2(mod(r_uv, _region_size)), layer_index);
+	ivec2 chunk = ivec2(floor(r_uv * _region_texel_size));
+	return ivec3(ivec2(mod(r_uv, _region_size)), get_region_layer(chunk));
 }
 
 // Takes in descaled (world_space / region_size) world to region space XZ (UV2) coordinates, returns vec3 with:
 // XY: (0. to 1.) coordinates within a region
 // Z: layer index used for texturearrays, -1 if not in a region
 vec3 get_index_uv(const vec2 uv2) {
-	ivec2 pos = ivec2(floor(uv2)) + (_region_map_size / 2);
-	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
-	int layer_index = _region_map[ pos.y * _region_map_size + pos.x ] * bounds - 1;
-	return vec3(uv2 - _region_locations[layer_index], float(layer_index));
+	int layer_index = get_region_layer(ivec2(floor(uv2)));
+	return vec3(uv2 - _region_locations[max(layer_index, 0)], float(layer_index));
 }
 
 ////////////////////////
@@ -138,8 +150,8 @@ void accumulate_material(const mat3 TNB, const float weight, const ivec3 index,
 	i_vertex *= control_scale;
 	h *= control_scale;
 
-	// Index position for detiling.
-	vec2 i_pos = fma(_region_locations[index.z], vec2(_region_size), vec2(index.xy));
+	// Index position for detiling. Clamped: index.z is -1 outside the world grid.
+	vec2 i_pos = fma(_region_locations[max(index.z, 0)], vec2(_region_size), vec2(index.xy));
 	i_pos *= _vertex_spacing * control_scale;
 
 	// Projection

@@ -3,6 +3,8 @@
 #ifndef TERRAIN3D_DATA_CLASS_H
 #define TERRAIN3D_DATA_CLASS_H
 
+#include <vector>
+
 #include "constants.h"
 #include "generated_texture.h"
 #include "terrain_3d_region.h"
@@ -16,8 +18,20 @@ class Terrain3DData : public Object {
 
 public: // Constants
 	static inline const real_t CURRENT_DATA_VERSION = 0.93f; // Current Data format version
-	static inline const int REGION_MAP_SIZE = 32;
+	// The world grid. This used to be 32 because the shader read the chunk -> layer
+	// map from `uniform int _region_map[1024]`, and a bigger array runs into the
+	// uniform buffer limit (64x64 would already be 16 KB, 128x128 64 KB). The shader
+	// now reads a *texture* instead, so the grid is only bounded by that texture and
+	// the region files on disk.
+	// At the default region_size of 256 m this is a 32.8 km square world, and it
+	// comfortably covers the clipmap's outermost ring (2 * mesh_size 48 * 2^6 =
+	// 6144 m) which the old 32x32 grid could not even fill.
+	static inline const int REGION_MAP_SIZE = 128;
 	static inline const Vector2i REGION_MAP_VSIZE = V2I(REGION_MAP_SIZE);
+	// Hard ceiling on resident layer slots, matching the largest MAX_REGIONS the
+	// material can compile (`max_regions`, 64..1024). The shader drops any layer
+	// index at or above it, so the slot table must never hand one out.
+	static inline const int MAX_MAP_SLOTS = 1024;
 
 	enum HeightFilter {
 		HEIGHT_FILTER_NEAREST,
@@ -45,8 +59,10 @@ private:
 	// Regions are dual indexed:
 	// 1) By `region_location:Vector2i` as the primary key. This is the only stable index
 	// so should be the main index for users.
-	// 2) By `region_id:int`. This index changes on every add/remove, depends on load order,
-	// and is not stable. It should not be relied on by users and is primarily for internal use.
+	// 2) By `region_id:int`, which is now a *slot*: a stable index into the texture
+	// arrays that a region keeps for as long as it stays in memory. It is only reused
+	// after the region is unloaded, so unrelated add/remove no longer renumber it.
+	// See the slot table below.
 
 	// Private functions should be indexed by region_id or region_location
 	// Public functions by region_location or global_position
@@ -57,8 +73,9 @@ private:
 	Dictionary _regions; // Dict[region_location:Vector2i] -> Terrain3DRegion
 
 	// All _active_ region maps are maintained in these secondary indices.
-	// Regions are considered active if and only if they exist in `_region_locations`. The other
-	// arrays are built off of this index; its order defines region_id.
+	// Regions are considered active if and only if they exist in `_region_locations`.
+	// This list stays dense and is the user facing index; the *layer* index the shader
+	// and the image arrays use is the stable slot table below.
 	// The image arrays are converted to TextureArrays for the shader.
 
 	TypedArray<Vector2i> _region_locations;
@@ -67,12 +84,83 @@ private:
 	TypedArray<Image> _color_maps;
 	TypedArray<Image> _surface_maps;
 
+	/////////
+	// Stable layer slots.
+	//
+	// `region_id` used to be the index of a region inside `_region_locations`, so
+	// adding or removing any region renumbered every later one and forced all four
+	// Texture2DArrays to be recreated and re-uploaded. Instead each resident region
+	// now owns a slot: a stable layer index that is only reused after the region
+	// leaves memory. `_region_map` stores `slot + 1` exactly where it used to store
+	// `region_id + 1`, so the shader side is unchanged.
+	//
+	// `_slot_locations` is indexed by slot and holds V2I_MAX for free slots. The
+	// image arrays above are slot indexed too, so a single region change costs one
+	// layer upload instead of a full array rebuild.
+	//
+	// The capacity grows by doubling to fit the peak resident count and never
+	// shrinks, so steady streaming stops reallocating. It must stay within the
+	// material's `max_regions` (64..1024) because the shader rejects layer indices
+	// at or above MAX_REGIONS.
+
+	enum SlotMap {
+		SLOT_MAP_HEIGHT = 0,
+		SLOT_MAP_CONTROL,
+		SLOT_MAP_COLOR,
+		SLOT_MAP_SURFACE,
+		SLOT_MAP_MAX,
+	};
+
+	std::vector<Vector2i> _slot_locations; // slot -> region location, V2I_MAX when free
+	Dictionary _region_slots; // Dict[region_location:Vector2i] -> slot:int
+	std::vector<int> _free_slots; // LIFO free list so reuse is O(1)
+	// Bitmask per slot of SlotMap entries that still need a layer upload.
+	std::vector<uint8_t> _slot_dirty;
+	// Force a full re-upload of one slot map on the next update_maps() call.
+	bool _slot_map_full[SLOT_MAP_MAX] = { false, false, false, false };
+	int _slot_capacity = 0;
+	// Diagnostics for get_map_stats(): a steady streaming loop should show no
+	// growth, no region map rebuilds and no full slot map syncs.
+	int _slot_grow_count = 0;
+	int _region_map_rebuild_count = 0;
+	int _slot_full_sync_count = 0;
+
+	int _acquire_slot(const Vector2i &p_region_loc);
+	void _release_slot(const Vector2i &p_region_loc);
+	void _reset_slots();
+	void _grow_slot_capacity(const int p_needed);
+	void _mark_slot_dirty(const int p_slot, const int p_maps);
+	void _rebuild_region_map();
+	// Chunk directory texture: mirrors _region_map for the shader.
+	void _set_directory_entry(const int p_index, const int p_value);
+	void _rebuild_region_directory();
+	void _update_region_directory();
+	// Cached blank layer per SlotMap, rebuilt only when the region size changes.
+	// Every free layer and every region without a surface map shares it, so it must
+	// stay read-only.
+	Ref<Image> _blank_slot_maps[SLOT_MAP_MAX];
+	Ref<Image> _get_blank_slot_map(const int p_slot_map);
+	Ref<Image> _get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const;
+	bool _sync_slot_map(const int p_slot_map);
+	static bool _slot_map_requested(const MapType p_map_type, const int p_slot_map);
+	static int _slot_map_mask(const MapType p_map_type);
+
 	// Editing occurs on the Image arrays above, which are converted to Texture arrays
 	// below for the shader.
 
 	// 32x32 grid with region_id:int at its location, no region = 0, region_ids >= 1
 	PackedInt32Array _region_map;
+	// GPU side of `_region_map`: a REGION_MAP_SIZE square R32F texture the shader
+	// reads with texelFetch. Slot + 1 as a float, 0.0 = no region.
+	Ref<Image> _region_directory_image;
+	GeneratedTexture _region_directory;
+	bool _region_directory_dirty = true;
+	// _region_map_dirty means "recompute the whole map and the slot table".
+	// _region_map_signal_dirty means "the map changed, tell the listeners", which
+	// is now a separate concern because a single region add/remove patches
+	// _region_map in place instead of rebuilding it.
 	bool _region_map_dirty = true;
+	bool _region_map_signal_dirty = true;
 
 	// These contain the TextureArray RIDs from the RenderingServer
 	GeneratedTexture _generated_height_maps;
@@ -99,6 +187,21 @@ public:
 	Dictionary get_regions_all() const { return _regions; }
 	PackedInt32Array get_region_map() const { return _region_map; }
 	static int get_region_map_index(const Vector2i &p_region_loc);
+	// The chunk -> layer directory the shader samples as `_region_map`.
+	RID get_region_directory_rid() const { return _region_directory.get_rid(); }
+	bool is_region_directory_valid() const { return _region_directory.get_rid().is_valid(); }
+	// Builds the R32F directory image from a region map array. Bound so the editor
+	// preview, which writes a negative dummy entry for the hovered chunk, can build
+	// its own copy without disturbing the live directory.
+	Ref<Image> region_map_to_image(const PackedInt32Array &p_region_map);
+
+	// Slot table accessors. `get_slot_locations()` is the layer -> region location
+	// array the shader reads as `_region_locations`; free slots hold V2I_MAX and
+	// are never addressed by the region map.
+	int get_map_capacity() const { return _slot_capacity; }
+	PackedVector2Array get_slot_locations() const;
+	Dictionary get_map_stats() const;
+	void reset_map_stats();
 
 	void do_for_regions(const Rect2i &p_area, const Callable &p_callback);
 	void change_region_size(int region_size);
@@ -127,6 +230,9 @@ public:
 	void remove_regionp(const Vector3 &p_global_position, const bool p_update = true);
 	void remove_regionl(const Vector2i &p_region_loc, const bool p_update = true);
 	void remove_region(const Ref<Terrain3DRegion> &p_region, const bool p_update = true);
+	// Streaming: free a region from memory without deleting or rewriting its
+	// file. Unlike remove_region it does not mark the region deleted.
+	void unload_region(const Vector2i &p_region_loc, const bool p_update = true);
 
 	// File I/O
 	void save_directory(const String &p_dir);
@@ -145,6 +251,7 @@ public:
 	RID get_control_maps_rid() const { return _generated_control_maps.get_rid(); }
 	RID get_color_maps_rid() const { return _generated_color_maps.get_rid(); }
 	RID get_surface_maps_rid() const { return _generated_surface_maps.get_rid(); }
+	// p_region_id is a layer slot: the value get_region_id() returns.
 	void update_surface_region(Image *p_surface_map, const int p_region_id);
 
 	void set_pixel(const MapType p_map_type, const Vector3 &p_global_position, const Color &p_pixel);
@@ -207,6 +314,24 @@ public:
 	// Utility
 	void dump(const bool verbose = false) const;
 
+	// Virtual texture page production.
+	//
+	// Resamples a sector's surface map into the requested pages. Each request is
+	// (page_x, page_y, local_mip), and pages come back in request order. The page grid
+	// is derived from `p_pages_per_axis` at mip 0, so the sampling is correct whether a
+	// page carries the region's texels 1:1 or at a different density: today the source
+	// is region_size texels, so a page smaller than the region upsamples and a page
+	// larger than the region downsamples.
+	// Returns the number of pages written, or -1 when the region or the arguments are
+	// unusable.
+	int produce_surface_page_set(const Vector2i &p_region_loc, const int p_pages_per_axis,
+			const int p_page_size, const int p_border, const std::vector<Vector3i> &p_requests,
+			std::vector<Ref<Image>> &r_pages);
+	// Every page of one local mip, row-major with x fastest.
+	int produce_surface_pages(const Vector2i &p_region_loc, const int p_local_mip,
+			const int p_pages_per_axis, const int p_page_size, const int p_border,
+			std::vector<Ref<Image>> &r_pages);
+
 protected:
 	static void _bind_methods();
 };
@@ -217,14 +342,15 @@ VARIANT_ENUM_CAST(Terrain3DData::ExportMode);
 // Inline Region Functions
 
 // Verifies the location is within the bounds of the _region_map array and
-// the world, returning the _region_map index, which contains the region_id.
-// Valid region locations are -16, -16 to 15, 15, or when offset: 0, 0 to 31, 31
-// If any bits other than 0x1F are set, it's out of bounds and returns -1
+// the world, returning the _region_map index, which contains the layer slot.
+// Valid region locations are -REGION_MAP_SIZE/2 to REGION_MAP_SIZE/2 - 1, which
+// offsets to 0 .. REGION_MAP_SIZE - 1. Any bit above the grid's own bits set means
+// out of bounds and returns -1.
 inline int Terrain3DData::get_region_map_index(const Vector2i &p_region_loc) {
 	// Offset world to positive values only
 	Vector2i loc = p_region_loc + (REGION_MAP_VSIZE / 2);
-	// Catch values > 31
-	if ((uint32_t(loc.x | loc.y) & uint32_t(~0x1F)) > 0) {
+	// Catch values >= REGION_MAP_SIZE
+	if ((uint32_t(loc.x | loc.y) & uint32_t(~(REGION_MAP_SIZE - 1))) > 0) {
 		return -1;
 	}
 	return loc.y * REGION_MAP_SIZE + loc.x;
@@ -238,10 +364,14 @@ inline Vector2i Terrain3DData::get_region_location(const Vector3 &p_global_posit
 // Returns id of any active region. -1 if out of bounds or no region, or region id
 inline int Terrain3DData::get_region_id(const Vector2i &p_region_loc) const {
 	int map_index = get_region_map_index(p_region_loc);
-	if (map_index >= 0) {
-		int region_id = _region_map[map_index] - 1; // 0 = no region
-		if (region_id >= 0 && region_id < _region_locations.size()) {
-			return region_id;
+	if (map_index >= 0 && map_index < _region_map.size()) {
+		int slot = _region_map[map_index] - 1; // 0 = no region
+		// Validate against the slot table instead of trusting the region map, so a
+		// stale _region_map cannot report a slot that now belongs to another region
+		// or has been freed. That also makes has_region() correct immediately after
+		// add_region()/unload_region(), before the next update_maps().
+		if (slot >= 0 && slot < (int)_slot_locations.size() && _slot_locations[slot] == p_region_loc) {
+			return slot;
 		}
 	}
 	return -1;

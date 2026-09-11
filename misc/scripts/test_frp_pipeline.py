@@ -45,6 +45,10 @@ def run(name, extra, marker=None):
 run("import", ["--editor", "--recovery-mode", "--import"])
 run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_passes.gd")],
     "PASS configurable compute pass shader, bindings, parameters and enabled state")
+# GI is the only consumer that decodes roughness from a different G-buffer
+# target, and process_gi() only runs with SDFGI or VoxelGI enabled.
+run("gi", ["--script", str(ROOT / "misc/scripts/tests/frp_gi.gd")],
+    "PASS SDFGI runs with FRP split roughness and produces indirect light")
 # Exercise actual inspector resource selection and editor undo/redo as well.
 editor_test = project / "addons/frp-editor-tests"
 editor_test.mkdir()

@@ -236,26 +236,51 @@ vec2 hydra_idweight_get_projection_position(vec3 positionWS, uint projectionAxis
 	return vec2(positionWS.x, positionWS.y);
 }
 
+// ── Normal decode (BC5-style: scale the sampled tilts, derive out-of-plane) ──
+
+vec3 hydra_idweight_decode_normal(vec4 packedNormal, float scale) {
+	// This shader keeps Godot's Y-up tangent frame, so the internal vector is
+	// (nU, nH, nV): in-plane U tilt, out-of-plane height, in-plane V tilt.
+	// `packedNormal.xzy` maps Godot's RGB (x, y, z) to (x, z, y), which moves the
+	// encoded green channel (tangent Y, the out-of-plane axis) into the middle
+	// slot: a neutral Godot normal map (0.5, 0.5, 1.0) decodes to (0, 1, 0).
+	vec3 normalPS = fma(packedNormal.xzy, vec3(2.0), vec3(-1.0));
+	// Mirrors TerrainIdWeightFunctions.hlsl::IdWeightDecodeNormal: scale the two
+	// *sampled tilts* by the material's normal depth, then re-derive the third
+	// component. Scaling the tilts (x and z) rather than x and y is what keeps a
+	// neutral map exactly (0, 1, 0) at any normal_depth; scaling the height and
+	// re-deriving the V tilt instead invents a tilt that was never authored.
+	normalPS.xz *= scale;
+	normalPS.y = sqrt(hydra_idweight_saturate(1.0 - dot(normalPS.xz, normalPS.xz)));
+	return normalPS;
+}
+
 vec3 hydra_idweight_projection_normal_to_world(vec3 normalPS, uint projectionAxis, vec3 geometricNormalWS) {
-	// Whiteout-style projection: combine sampled tangent-space detail with
-	// the geometric normal in the selected projection plane. A neutral
-	// normal map (U off, height, V off) must reproduce the geometric normal
-	// for the dominant axis, otherwise flat terrain faces sideways and turns
-	// black under a top-down directional light.
-	//   normalPS = (nU, nH, nV): U tilt, height, V tilt
-	//   axis 0 = ZY plane: U -> world Z, height -> world X, V -> world Y
-	//   axis 1 = XZ plane: U -> world X, height -> world Y, V -> world Z
-	//   axis 2 = XY plane: U -> world X, height -> world Z, V -> world Y
+	// Faithful port of TerrainIdWeightFunctions.hlsl::IdWeightProjectionNormalToWorld,
+	// expressed in this shader's Y-up normal convention (normalPS = nU, nH, nV).
+	// Hydra composes the sampled detail in the *selected projection plane*: the
+	// in-plane tilts are ADDED to the geometric normal's in-plane projection,
+	// while the out-of-plane component MULTIPLIES it. The previous additive
+	// `g + normalPS` composition added the height too, which biased every slope
+	// normal toward straight up: a 45-degree ramp measured nDotUp = 0.92 instead
+	// of 0.707, so the slope blend under-reported the slope and barely engaged.
+	// Multiplying restores the invariant the slope evaluator depends on -- a
+	// neutral normal map (nU = nV = 0, nH = 1) reproduces the geometric normal
+	// exactly on every projection axis.
+	// Hydra also carries an `axisSign` through its swizzle; it multiplies the
+	// depth component on the way in and again on the way out, so it cancels and
+	// is omitted here.
 	vec3 g = normalize(geometricNormalWS);
-	vec3 n;
 	if (projectionAxis == 0u) {
-		n = normalize(vec3(normalPS.y + g.x, normalPS.z + g.y, normalPS.x + g.z));
-	} else if (projectionAxis == 1u) {
-		n = normalize(vec3(normalPS.x + g.x, normalPS.y + g.y, normalPS.z + g.z));
-	} else {
-		n = normalize(vec3(normalPS.x + g.x, normalPS.z + g.y, normalPS.y + g.z));
+		// ZY plane: U -> world Z, V -> world Y, height -> world X
+		return normalize(vec3(g.x * normalPS.y, g.y + normalPS.z, g.z + normalPS.x));
 	}
-	return n;
+	if (projectionAxis == 1u) {
+		// XZ plane: U -> world X, V -> world Z, height -> world Y
+		return normalize(vec3(g.x + normalPS.x, g.y * normalPS.y, g.z + normalPS.z));
+	}
+	// XY plane: U -> world X, V -> world Y, height -> world Z
+	return normalize(vec3(g.x + normalPS.x, g.y + normalPS.z, g.z * normalPS.y));
 }
 
 // ── Slope evaluation ──

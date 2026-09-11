@@ -62,6 +62,9 @@ private:
 	real_t _displacement_scale = 1.0f;
 	real_t _displacement_sharpness = 0.5f;
 	GeneratedTexture _generated_dummy;
+	// A 1x1 R32F texture so the surface virtual texture's sampler2D uniform always has
+	// something bound, even while the virtual texture is off or uninitialized.
+	GeneratedTexture _generated_dummy_2d;
 
 	// Material Features
 	WorldBackground _world_background = FLAT;
