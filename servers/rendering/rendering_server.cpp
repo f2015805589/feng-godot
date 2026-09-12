@@ -58,6 +58,48 @@ RenderingServer *RenderingServer::create() {
 	return nullptr;
 }
 
+void RenderingServer::virtual_texture_set_update_callback(uint64_t p_id, const Callable &p_callback) {
+	ERR_FAIL_COND_MSG(p_id == 0, "Virtual texture update callback ids must be non-zero.");
+
+	MutexLock lock(virtual_texture_update_callbacks_mutex);
+	if (p_callback.is_valid()) {
+		virtual_texture_update_callbacks.insert(p_id, p_callback);
+	} else {
+		virtual_texture_update_callbacks.erase(p_id);
+	}
+}
+
+void RenderingServer::virtual_texture_remove_update_callback(uint64_t p_id) {
+	ERR_FAIL_COND_MSG(p_id == 0, "Virtual texture update callback ids must be non-zero.");
+
+	MutexLock lock(virtual_texture_update_callbacks_mutex);
+	virtual_texture_update_callbacks.erase(p_id);
+}
+
+void RenderingServer::execute_virtual_texture_updates() {
+	ERR_FAIL_COND_MSG(!is_on_render_thread(), "Virtual texture updates must execute on the render thread.");
+
+	Vector<Callable> callbacks;
+	{
+		MutexLock lock(virtual_texture_update_callbacks_mutex);
+		callbacks.reserve(virtual_texture_update_callbacks.size());
+		for (const KeyValue<uint64_t, Callable> &entry : virtual_texture_update_callbacks) {
+			if (entry.value.is_valid()) {
+				callbacks.push_back(entry.value);
+			}
+		}
+	}
+
+	for (const Callable &callback : callbacks) {
+		Variant result;
+		Callable::CallError error;
+		callback.callp(nullptr, 0, result, error);
+		if (error.error != Callable::CallError::CALL_OK) {
+			ERR_PRINT(vformat("Virtual texture update callback failed: %s", Variant::get_callable_error_text(callback, nullptr, 0, error)));
+		}
+	}
+}
+
 Array RenderingServer::_texture_debug_usage_bind() {
 	List<RenderingServerTypes::TextureInfo> list;
 	texture_debug_usage(&list);
@@ -3061,6 +3103,9 @@ void RenderingServer::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("compositor_set_compositor_effects", "compositor", "effects"), &RenderingServer::compositor_set_compositor_effects);
 	ClassDB::bind_method(D_METHOD("compositor_set_frp_pipeline", "compositor", "pipeline", "names"), &RenderingServer::compositor_set_frp_pipeline, DEFVAL(PackedStringArray()));
+	ClassDB::bind_method(D_METHOD("virtual_texture_set_update_callback", "id", "callback"), &RenderingServer::virtual_texture_set_update_callback);
+	ClassDB::bind_method(D_METHOD("virtual_texture_remove_update_callback", "id"), &RenderingServer::virtual_texture_remove_update_callback);
+	ClassDB::bind_method(D_METHOD("execute_virtual_texture_updates"), &RenderingServer::execute_virtual_texture_updates);
 
 	/* ENVIRONMENT */
 
@@ -3829,5 +3874,9 @@ void RenderingServer::init() {
 }
 
 RenderingServer::~RenderingServer() {
+	{
+		MutexLock lock(virtual_texture_update_callbacks_mutex);
+		virtual_texture_update_callbacks.clear();
+	}
 	singleton = nullptr;
 }

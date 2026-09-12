@@ -16,9 +16,45 @@ def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc T
     stacks = {}
     scene_orders = []
     active_orders = {}
+    flattened_orders = {}
     draws = []
     labels = []
     present = False
+    configured_label = re.compile(r"^(\d+) (.+)$")
+    # The renderer no longer needs an outer "FRP Scene" marker. Keep the
+    # capture checks useful for both old captures and the flattened hierarchy,
+    # where these labels are the evidence that a draw belongs to the FRP frame.
+    scene_operation_labels = {
+        "GBuffer",
+        "Lighting Preparation",
+        "Deferred Lighting",
+        "Opaque Forward Fallback",
+        "Motion Vectors",
+        "Opaque Resolve",
+        "Debug Geometry",
+        "Sky",
+        "Sky Resolve",
+        "Subsurface + Specular Merge",
+        "Screen/Depth Copy",
+        "Transparent",
+        "Final Resolve",
+        "SSIL/SSR History Copy",
+        "Temporal AA / Upscale",
+        "Post Process / Tonemap",
+        "VT Pass",
+        "Render Depth Pre-Pass",
+        "Render GBuffer",
+        "Render FRP Lighting Pass",
+        "Render Opaque Fallback Pass",
+        "Render Motion Pass",
+        "Draw Sky",
+        "Render 3D Transparent Pass",
+    }
+
+    def is_scene_label(label):
+        return (label == "FRP Scene" or label in scene_operation_labels or
+                configured_label.match(label) is not None)
+
     for _, element in ET.iterparse(xml_path, events=("end",)):
         if element.tag != "chunk":
             continue
@@ -33,20 +69,35 @@ def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc T
         stack = stacks.setdefault(key, [])
         if name.endswith("::BeginEvent"):
             label = element.findtext("string[@name='MarkerText']", "")
+            if label == "Render Setup":
+                # The same D3D12 command list may carry more than one scene
+                # submission (for example, a viewport and a reflection
+                # probe). Do not merge their authored pass indices.
+                flattened_orders.pop(key, None)
             if label == "FRP Scene":
                 active_orders[key] = []
                 scene_orders.append(active_orders[key])
-            if stack and stack[-1] == "FRP Scene":
-                match = re.match(r"^(\d+) (.+)$", label)
-                if match:
-                    active_orders[key].append((int(match[1]), match[2]))
+            match = configured_label.match(label)
+            if match:
+                if "FRP Scene" in stack and key in active_orders:
+                    order = active_orders[key]
+                else:
+                    # A command list can contain a flattened FRP frame with
+                    # no wrapper marker. Track its configured labels as one
+                    # order, just as the legacy wrapper path did.
+                    order = flattened_orders.setdefault(key, [])
+                    if order not in scene_orders:
+                        scene_orders.append(order)
+                order.append((int(match[1]), match[2]))
             stack.append(label)
             labels.append(label)
         elif name.endswith("::EndEvent"):
             assert stack, "Unmatched D3D12 EndEvent in capture"
-            stack.pop()
+            ended = stack.pop()
+            if ended == "FRP Scene":
+                active_orders.pop(key, None)
         elif "::Draw" in name or "::Dispatch" in name:
-            if "FRP Scene" in stack:
+            if any(is_scene_label(label) for label in stack):
                 draws.append({"chunk": int(element.get("chunkIndex")),
                               "operation": name, "path": list(stack),
                               "indices": int(element.findtext("uint[@name='IndexCountPerInstance']", "0"))})
@@ -63,7 +114,17 @@ def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc T
         for order in orders:
             positions = [position for position, _ in order]
             assert positions == sorted(positions), f"GPU work crossed a configured pass boundary: {order}"
-        assert "03 Sky" in labels, "Moved Sky pass does not match its configured position"
+        assert any(label.endswith("VT Idle Marker") for label in labels), (
+            "Idle VT pass lost its configured RenderDoc label"
+        )
+        assert any(order and order[0] == (0, "VT Idle Marker") for order in orders), (
+            "Idle VT pass is not the configured first pass"
+        )
+        assert not any(
+            any(label.endswith("VT Idle Marker") for label in draw["path"])
+            for draw in draws
+        ), "Idle VT marker unexpectedly submitted draw/dispatch work"
+        assert "04 Sky" in labels, "Moved Sky pass does not match its configured position"
         assert any(label.endswith(custom_name) for label in labels), "Custom Unicode pass name is missing"
         assert any(any(label.endswith(custom_name) for label in draw["path"])
                    for draw in draws), "Named custom pass contains no draw/dispatch"

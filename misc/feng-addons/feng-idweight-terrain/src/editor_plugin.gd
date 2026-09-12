@@ -8,6 +8,7 @@ extends EditorPlugin
 const Terrain3DUI: Script = preload("res://addons/feng-idweight-terrain/src/ui.gd")
 const ASSET_DOCK: String = "res://addons/feng-idweight-terrain/src/asset_dock.tscn"
 const ASSET_DOCK_45: String = "res://addons/feng-idweight-terrain/src/asset_dock_45.tscn"
+const VT_INSPECTOR_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/terrain_vt_inspector.gd")
 
 # Editor Plugin
 var debug: int = 0 # Set in _edit()
@@ -16,6 +17,7 @@ var editor: Terrain3DEditor
 var editor_settings: EditorSettings
 var ui: Node # Terrain3DUI see Godot #75388
 var asset_dock: PanelContainer
+var vt_inspector_plugin: EditorInspectorPlugin
 var current_region_position: Vector2
 var mouse_global_position: Vector3 = Vector3.ZERO
 var mouse_viewport_position: Vector2 = Vector2.ZERO
@@ -67,6 +69,9 @@ func _enter_tree() -> void:
 	else:
 		asset_dock = load(ASSET_DOCK_45).instantiate()
 	asset_dock.initialize(self)
+	vt_inspector_plugin = VT_INSPECTOR_SCRIPT.new()
+	vt_inspector_plugin.editor_plugin = self
+	add_inspector_plugin(vt_inspector_plugin)
 	terrain_setup = preload("res://addons/feng-idweight-terrain/src/terrain_setup.gd").new()
 	terrain_setup.plugin = self
 	add_child(terrain_setup)
@@ -75,6 +80,9 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if debug:
 		print("Terrain3DEditorPlugin: _exit_tree")
+	if vt_inspector_plugin != null:
+		remove_inspector_plugin(vt_inspector_plugin)
+		vt_inspector_plugin = null
 	asset_dock.remove_dock(true)
 	asset_dock.queue_free()
 	ui.queue_free()
@@ -82,6 +90,29 @@ func _exit_tree() -> void:
 
 	scene_changed.disconnect(_on_scene_changed)
 	godot_editor_window.focus_entered.disconnect(_on_godot_focus_entered)
+
+
+## Open the shared Surface VT editor for an Inspector-selected terrain.
+## Keeping this as a public plugin action avoids reaching into the Inspector
+## plugin's private dock/window state from custom controls.
+func open_vt_editor(p_terrain: Object = null) -> void:
+	var target := p_terrain if p_terrain != null and is_instance_valid(p_terrain) else terrain
+	if target == null or not is_instance_valid(target):
+		return
+	if asset_dock == null or not is_instance_valid(asset_dock):
+		return
+	asset_dock.call("_open_vt_editor", target)
+
+
+## Open Surface VT and focus its top-level VT Page hierarchy entry. The window
+## refreshes its stitched baked overview explicitly; no GPU readback is queued.
+func open_vt_page_overview(p_terrain: Object = null) -> void:
+	open_vt_editor(p_terrain)
+	if asset_dock == null or not is_instance_valid(asset_dock):
+		return
+	var window := asset_dock.get("vt_editor") as Window
+	if window != null and is_instance_valid(window) and window.has_method("open_vt_page_view"):
+		window.call("open_vt_page_view")
 
 
 func _on_godot_focus_entered() -> void:
@@ -185,6 +216,10 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 		return AFTER_GUI_INPUT_PASS
 
 	var continue_input: AfterGUIInput = _read_input(p_event)
+	## Keep the terrain clipmap/residency target in sync even while the explicit
+	## None tool is selected or the viewport is handling camera navigation. The
+	## edit guard below only skips hit testing and painting.
+	terrain.set_camera(p_viewport_camera)
 	# A release may be delivered after the cursor has left the terrain.  End
 	# the native operation before trying to resolve a new hit point, otherwise
 	# an invalid ray would leave the stroke open and corrupt the next undo.
@@ -194,14 +229,16 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 		return AFTER_GUI_INPUT_STOP
 	if continue_input != AFTER_GUI_INPUT_CUSTOM:
 		return continue_input
+	# TOOL_MAX is the toolbar's explicit None state. Let camera/navigation input
+	# pass through, but never resolve a terrain hit or start an edit operation.
+	if editor.get_tool() == Terrain3DEditor.TOOL_MAX:
+		ui.hide_decal()
+		return AFTER_GUI_INPUT_PASS
 	
-	## Setup active camera & viewport
+	## Setup active viewport
 	# Always update this for all inputs, as the mouse position can move without
 	# necessarily being a InputEventMouseMotion object. get_intersection() also
 	# returns the last frame position, and should be updated more frequently.
-	
-	# Snap terrain to current camera 
-	terrain.set_camera(p_viewport_camera)
 
 	# Detect if viewport is set to half_resolution
 	# Structure is: Node3DEditorViewportContainer/Node3DEditorViewport(4)/SubViewportContainer/SubViewport/Camera3D

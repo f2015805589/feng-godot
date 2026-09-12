@@ -31,6 +31,8 @@
 #pragma once
 
 #include "core/io/image.h"
+#include "core/os/mutex.h"
+#include "core/templates/hash_map.h"
 #include "core/templates/rid.h"
 #include "core/variant/typed_array.h"
 #include "core/variant/variant.h"
@@ -68,6 +70,13 @@ class RenderingServer : public Object {
 
 	int mm_policy = 0;
 	bool render_loop_enabled = true;
+
+	// Virtual texture producers register a render-thread callback by stable
+	// instance id. The callback itself is copied before invocation so a
+	// concurrent teardown can remove the registry entry without invalidating an
+	// in-flight producer reference.
+	Mutex virtual_texture_update_callbacks_mutex;
+	HashMap<uint64_t, Callable> virtual_texture_update_callbacks;
 
 	Array _get_array_from_surface(uint64_t p_format, Vector<uint8_t> p_vertex_data, Vector<uint8_t> p_attrib_data, Vector<uint8_t> p_skin_data, int p_vertex_len, Vector<uint8_t> p_index_data, int p_index_len, const AABB &p_aabb, const Vector4 &p_uv_scale) const;
 
@@ -640,6 +649,14 @@ public:
 
 	virtual void compositor_set_compositor_effects(RID p_compositor, const TypedArray<RID> &p_effects) = 0;
 	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) = 0;
+
+	// Render-thread hook for producers that need to submit virtual texture page
+	// work before the FRP G-buffer. Registration is intentionally independent of
+	// cameras and Compositor resources so native terrain producers can service
+	// every viewport without mutating scene state.
+	void virtual_texture_set_update_callback(uint64_t p_id, const Callable &p_callback);
+	void virtual_texture_remove_update_callback(uint64_t p_id);
+	void execute_virtual_texture_updates();
 
 	/* ENVIRONMENT API */
 

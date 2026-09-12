@@ -10,10 +10,12 @@ signal confirmation_canceled
 const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
 const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
 const ES_DOCK_TAB: String = "terrain3d/dock/tab"
+const VT_EDITOR_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_editor.gd")
 
 const MENU_INITIALIZE: int = 3
 const MENU_TEXTURE_ARRAY: int = 1
 const MENU_TERRAIN_MAPS: int = 2
+const MENU_VT_EDITOR: int = 4
 const MENU_DEBUG_SHADED: int = 10
 const MENU_DEBUG_HEIGHTMAP: int = 11
 const MENU_DEBUG_CONTROL_IDS: int = 12
@@ -38,6 +40,7 @@ var confirm_dialog: ConfirmationDialog
 var _confirmed: bool = false
 var search_box: TextEdit
 var search_button: Button
+var vt_editor: Window
 
 #DEPRECATED 4.5
 #class EdDock extends EditorDock:
@@ -112,6 +115,7 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	management_popup.add_item("Initialize Terrain…", MENU_INITIALIZE)
 	management_popup.add_item("Texture Array", MENU_TEXTURE_ARRAY)
 	management_popup.add_item("Terrain Maps", MENU_TERRAIN_MAPS)
+	management_popup.add_item("Surface VT Editor…", MENU_VT_EDITOR)
 	management_popup.add_separator()
 	debug_menu = PopupMenu.new()
 	debug_menu.name = "DebugViews"
@@ -188,6 +192,18 @@ func _on_management_menu_selected(p_id: int) -> void:
 			EditorInterface.edit_resource(terrain.assets)
 		MENU_TERRAIN_MAPS:
 			EditorInterface.inspect_object(terrain.data)
+		MENU_VT_EDITOR:
+			_open_vt_editor(terrain)
+
+
+func _open_vt_editor(p_terrain: Object) -> void:
+	if not p_terrain:
+		return
+	if not vt_editor or not is_instance_valid(vt_editor):
+		vt_editor = VT_EDITOR_SCRIPT.new()
+		vt_editor.initialize(plugin)
+		plugin.add_child(vt_editor)
+	vt_editor.open_for_terrain(p_terrain)
 
 
 func _on_debug_view_selected(p_id: int) -> void:
@@ -240,6 +256,9 @@ func _gui_input(p_event: InputEvent) -> void:
 
 
 func remove_dock(p_force: bool = false) -> void:
+	if vt_editor and is_instance_valid(vt_editor):
+		vt_editor.queue_free()
+		vt_editor = null
 	plugin.remove_dock(_dock)
 	# plugin.remove_dock() only unregisters _dock; it was created here via
 	# ClassDB.instantiate() and is owned by this script, not the scene tree.

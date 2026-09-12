@@ -50,6 +50,7 @@ private:
 	TextureArrayCompression _texture_array_compression = ARRAY_BC7;
 	Dictionary _texture_array_info;
 	Dictionary _texture_layer_cache;
+	PackedStringArray _texture_cache_identity;
 	Terrain3D *_terrain = nullptr;
 
 	TypedArray<Terrain3DTextureAsset> _texture_list;
@@ -122,6 +123,7 @@ public:
 	PackedFloat32Array get_texture_uv_scales() const { return _texture_uv_scales; }
 	PackedVector2Array get_texture_detiles() const { return _texture_detiles; }
 	PackedVector2Array get_texture_displacements() const { return _texture_displacements; }
+	PackedStringArray get_texture_cache_identity() const { return _texture_cache_identity; }
 	PackedVector3Array get_texture_slope_params() const { return _texture_slope_params; }
 	void clear_textures(const bool p_update = false);
 	void update_texture_list();

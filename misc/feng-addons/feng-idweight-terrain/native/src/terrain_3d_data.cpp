@@ -6,6 +6,7 @@
 #include "terrain_surface_idweight.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/editor_file_system.hpp>
@@ -280,6 +281,35 @@ Ref<Image> Terrain3DData::_get_blank_slot_map(const int p_slot_map) {
 	return blank;
 }
 
+// Samples the payload of whichever region owns a world position, on that region's own
+// density grid. Returns 0 when no region covers it.
+uint16_t Terrain3DData::_sample_payload_world(const real_t p_world_x, const real_t p_world_z) const {
+	if (_region_size <= 0) {
+		return 0;
+	}
+	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
+	const real_t region_world = real_t(_region_size) * vertex_spacing;
+	const Vector2i region_loc(int(Math::floor(p_world_x / region_world)),
+			int(Math::floor(p_world_z / region_world)));
+	const Terrain3DRegion *region = get_region_ptr(region_loc);
+	if (!region || region->is_deleted() || region->get_surface_map().is_null()) {
+		return 0;
+	}
+	const int density = MAX(1, region->get_surface_density());
+	const real_t payload_texel = vertex_spacing / real_t(density);
+	const int size = region->get_surface_map()->get_width();
+	const int x = CLAMP(int(Math::floor((p_world_x - real_t(region_loc.x) * region_world) / payload_texel)), 0, size - 1);
+	const int y = CLAMP(int(Math::floor((p_world_z - real_t(region_loc.y) * region_world) / payload_texel)), 0, size - 1);
+	// `get_data()` shares the image's buffer rather than copying it, so reading the two
+	// bytes through a pointer costs one call instead of one per texel.
+	const PackedByteArray payload = region->get_surface_map()->get_data();
+	if (payload.size() < int64_t(size) * size * 2) {
+		return 0;
+	}
+	const uint8_t *texel = payload.ptr() + (int64_t(y) * size + x) * 2;
+	return uint16_t(texel[0]) | (uint16_t(texel[1]) << 8);
+}
+
 Ref<Image> Terrain3DData::_get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const {
 	if (!p_region) {
 		return Ref<Image>();
@@ -292,7 +322,9 @@ Ref<Image> Terrain3DData::_get_slot_map_image(const Terrain3DRegion *p_region, c
 		case SLOT_MAP_COLOR:
 			return p_region->get_color_map();
 		case SLOT_MAP_SURFACE:
-			return p_region->get_surface_map();
+			// The array layer stays at region_size even when the region's stored
+			// payload is denser; the virtual texture serves the extra detail.
+			return p_region->get_surface_map_array_image();
 		default:
 			return Ref<Image>();
 	}
@@ -372,8 +404,11 @@ bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
 		}
 		Terrain3DRegion *region = get_region_ptr(_slot_locations[slot]);
 		Ref<Image> image = _get_slot_map_image(region, p_slot_map);
-		if (image.is_null()) {
-			// Regions without a surface map keep the blank layer.
+		if (image.is_null() ||
+				(p_slot_map == SLOT_MAP_SURFACE && _terrain && !_terrain->is_surface_array_upload_needed())) {
+			// Regions without a surface map keep the blank layer, and so does the surface
+			// map itself once the virtual textures serve the channel: the array stays
+			// allocated for a valid binding, but no payload is uploaded.
 			image = blank;
 		}
 		(*images)[slot] = image;
@@ -615,6 +650,35 @@ void Terrain3DData::change_region_size(int p_new_size) {
 	_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
 }
 
+// Surface resolution is a terrain-wide setting: the region texture array is a single
+// texture whose layers must all be the same size, so regions cannot disagree. Every
+// resident payload is resampled to the new density; regions that have no payload yet
+// only adopt the setting, and build at it on their first paint.
+void Terrain3DData::change_surface_density(int p_density) {
+	LOG(INFO, "Changing surface density to: ", p_density);
+	if (p_density < Terrain3DRegion::SURFACE_DENSITY_MIN ||
+			p_density > Terrain3DRegion::SURFACE_DENSITY_MAX) {
+		LOG(ERROR, "Invalid surface density: ", p_density, ". Must be ",
+				Terrain3DRegion::SURFACE_DENSITY_MIN, "-", Terrain3DRegion::SURFACE_DENSITY_MAX);
+		return;
+	}
+	int resampled = 0;
+	const Array region_locations = _regions.keys();
+	for (const Vector2i &region_loc : region_locations) {
+		Terrain3DRegion *region = get_region_ptr(region_loc);
+		if (!region || region->is_deleted()) {
+			continue;
+		}
+		if (region->ensure_surface_density(p_density)) {
+			resampled++;
+		}
+		// Only the surface layer changed, so only that layer is re-uploaded.
+		_mark_slot_dirty(get_region_id(region_loc), 1 << SLOT_MAP_SURFACE);
+	}
+	update_maps(TYPE_MAX, false, false);
+	LOG(INFO, "Surface density ", p_density, ": resampled ", resampled, " region payloads");
+}
+
 void Terrain3DData::set_region_modified(const Vector2i &p_region_loc, const bool p_modified) {
 	Terrain3DRegion *region = get_region_ptr(p_region_loc);
 	if (!region) {
@@ -687,6 +751,12 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 		return FAILED;
 	}
 	p_region->sanitize_maps();
+	// Every region in memory carries the terrain's surface resolution. A region
+	// loaded from an older file, or one saved at another density, is resampled here
+	// rather than at first paint, so the shader's density uniform is always right.
+	if (_terrain) {
+		p_region->ensure_surface_density(_terrain->get_surface_density());
+	}
 	p_region->set_deleted(false);
 	if (!_region_locations.has(region_loc)) {
 		_region_locations.push_back(region_loc);
@@ -1063,6 +1133,11 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 }
 
 void Terrain3DData::update_surface_region(Image *p_surface_map, const int p_region_id) {
+	if (_terrain && !_terrain->is_surface_array_upload_needed()) {
+		// The array does not carry the surface channel in this configuration; the
+		// virtual textures are refreshed through invalidate_surface_pages() instead.
+		return;
+	}
 	if (p_surface_map && p_region_id >= 0 && p_region_id < _surface_maps.size()) {
 		// A first paint can replace the blank placeholder with a newly created
 		// region surface map. Keep CPU queries aligned with the uploaded layer.
@@ -1269,7 +1344,13 @@ Vector3 Terrain3DData::get_texture_id(const Vector3 &p_global_position) const {
 	// map. Picking and live info must read the same data as the shader.
 	Ref<Terrain3DRegion> region = get_regionp(p_global_position);
 	if (region.is_valid() && region->get_surface_map().is_valid()) {
-		Vector2i pixel = vgrid - region->get_location() * region->get_region_size();
+		// The stored payload is region_size * surface_density squared, while vgrid
+		// is in region texels.
+		const int density = MAX(1, region->get_surface_density());
+		Vector2i pixel = (vgrid - region->get_location() * region->get_region_size()) * density;
+		const int surface_size = region->get_surface_map()->get_width();
+		pixel.x = CLAMP(pixel.x, 0, surface_size - 1);
+		pixel.y = CLAMP(pixel.y, 0, surface_size - 1);
 		float value = region->get_surface_map()->get_pixelv(pixel).r;
 		uint16_t packed = uint16_t(CLAMP(Math::round(value * 65535.0f), 0.0f, 65535.0f));
 		TerrainSurfaceIdWeight::Pair pair = TerrainSurfaceIdWeight::decode(packed);
@@ -1346,6 +1427,15 @@ real_t Terrain3DData::get_mesh_vertex_height(const int32_t p_lod, const HeightFi
 }
 
 void Terrain3DData::add_edited_area(const AABB &p_area) {
+	if (_terrain && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled())) {
+		float world = _region_size * _vertex_spacing;
+		Vector3 end = p_area.position + p_area.size;
+		for (int z = int(Math::floor((p_area.position.z - _vertex_spacing) / world)); z <= int(Math::floor((end.z + _vertex_spacing) / world)); z++) {
+			for (int x = int(Math::floor((p_area.position.x - _vertex_spacing) / world)); x <= int(Math::floor((end.x + _vertex_spacing) / world)); x++) {
+				_terrain->invalidate_surface_pages(Vector2i(x, z));
+			}
+		}
+	}
 	if (_edited_area.has_surface()) {
 		_edited_area = _edited_area.merge(p_area);
 	} else {
@@ -1769,8 +1859,8 @@ Ref<Image> Terrain3DData::layered_to_image(const MapType p_map_type, const Rect2
 // Layout: the sector block is `p_pages_per_axis` pages per axis at local mip 0, so
 // mip `m` has `max(1, pages >> m)` pages per axis and each page covers
 // `region_size / pages_at_mip` region texels. Sampling is nearest, which is exact
-// for a 1:1 crop and a plain point upsample otherwise. The border replicates the
-// edge texel so a bilinear tap at the page seam cannot pull in a neighbour's data.
+// for a 1:1 crop and a plain point upsample otherwise. Border texels sample the
+// adjacent world location so filtering agrees on either side of a page seam.
 int Terrain3DData::produce_surface_pages(const Vector2i &p_region_loc, const int p_local_mip,
 		const int p_pages_per_axis, const int p_page_size, const int p_border,
 		std::vector<Ref<Image>> &r_pages) {
@@ -1816,8 +1906,9 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 	}
 
 	const int stored = p_page_size + 2 * p_border;
-	PackedByteArray page_bytes;
-	page_bytes.resize(int64_t(stored) * stored * 2);
+	const uint8_t *source_ptr = source_bytes.is_empty() ? nullptr : source_bytes.ptr();
+	std::vector<int> columns(size_t(stored), 0);
+	auto floor_divide = [](int n, int d) { return n >= 0 ? n / d : -((-n + d - 1) / d); };
 
 	for (const Vector3i &request : p_requests) {
 		const int local_mip = request.z;
@@ -1825,26 +1916,55 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 			return -1;
 		}
 		const int pages_at_mip = MAX(1, p_pages_per_axis >> local_mip);
-		const int span = MAX(1, _region_size / pages_at_mip);
+		// Span in *source* texels, which is region_size * surface_density. The page
+		// grid always covers the whole region, so a denser payload simply gives every
+		// page more texels to sample from.
+		const int span = MAX(1, source_size / pages_at_mip);
 		if (request.x < 0 || request.y < 0 || request.x >= pages_at_mip || request.y >= pages_at_mip) {
 			return -1;
 		}
 		const int origin_x = request.x * span;
 		const int origin_y = request.y * span;
-		if (source_bytes.is_empty()) {
-			page_bytes.fill(0);
+		PackedByteArray page_bytes;
+		page_bytes.resize(int64_t(stored) * stored * 2);
+		// This is a nearest-neighbour resample, so a page column's source column does
+		// not depend on the row. Resolving the columns once keeps the inner loop to a
+		// two-byte load and store: `PackedByteArray::decode_u16`/`encode_u16` are
+		// GDExtension builtin-method calls with Variant marshalling, and at 264x264
+		// texels per page they were the entire cost of a demand pass.
+		for (int x = 0; x < stored; x++) {
+			columns[size_t(x)] = origin_x + floor_divide((x - p_border) * span, p_page_size);
+		}
+		if (source_ptr == nullptr) {
+			// `resize` already zero-filled, which is single material 0.
 		} else {
+			uint8_t *page_ptr = page_bytes.ptrw();
+			const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
+			const real_t region_world = real_t(_region_size) * vertex_spacing;
+			const real_t region_origin_x = real_t(p_region_loc.x) * region_world;
+			const real_t region_origin_z = real_t(p_region_loc.y) * region_world;
+			const real_t payload_texel = vertex_spacing / real_t(MAX(1, region->get_surface_density()));
 			for (int y = 0; y < stored; y++) {
-				// Page texel -> region texel. The negative numerator of the border
-				// rows truncates toward zero, and the clamp turns that into the
-				// replicated edge.
-				const int region_y = origin_y + ((y - p_border) * span) / p_page_size;
-				const int clamped_y = CLAMP(region_y, 0, source_size - 1);
+				// Floor negative fractional border positions into the adjacent texel.
+				const int region_y = origin_y + floor_divide((y - p_border) * span, p_page_size);
+				const bool inside_y = region_y >= 0 && region_y < source_size;
+				const int64_t row = int64_t(region_y) * source_size;
+				uint8_t *out = page_ptr + int64_t(y) * stored * 2;
 				for (int x = 0; x < stored; x++) {
-					const int region_x = origin_x + ((x - p_border) * span) / p_page_size;
-					const int clamped_x = CLAMP(region_x, 0, source_size - 1);
-					page_bytes.encode_u16((int64_t(y) * stored + x) * 2,
-							source_bytes.decode_u16((int64_t(clamped_y) * source_size + clamped_x) * 2));
+					const int region_x = columns[size_t(x)];
+					uint16_t value = 0;
+					if (inside_y && region_x >= 0 && region_x < source_size) {
+						const uint8_t *texel = source_ptr + (row + region_x) * 2;
+						value = uint16_t(texel[0]) | (uint16_t(texel[1]) << 8);
+					} else {
+						// A border texel belongs to a neighbouring region, so sample it by
+						// world position rather than replicating this region's edge. The
+						// near and far fields then fill their borders the same way.
+						value = _sample_payload_world(region_origin_x + real_t(region_x) * payload_texel,
+								region_origin_z + real_t(region_y) * payload_texel);
+					}
+					out[x * 2] = uint8_t(value & 0xFF);
+					out[x * 2 + 1] = uint8_t(value >> 8);
 				}
 			}
 		}
@@ -1855,6 +1975,135 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 		r_pages.push_back(page);
 	}
 	return int(r_pages.size());
+}
+
+// World-aligned page production for the far field. The page's world rect can span
+// several regions, so the region behind every texel is resolved through a small grid of
+// region pointers built once per page, and each texel takes its owner's payload on the
+// density grid. Border texels map outside the page and therefore come from the
+// neighbouring region, which is exactly what a bilinear tap at a seam needs. A texel
+// with no region behind it stays material 0.
+int Terrain3DData::produce_sparse_surface_page(const int p_page_x, const int p_page_y,
+		const int p_local_mip, const real_t p_page_world_size, const int p_page_size,
+		const int p_border, Ref<Image> &r_page) {
+	r_page = Ref<Image>();
+	if (_region_size <= 0 || p_page_size <= 0 || p_border < 0 || p_local_mip < 0 ||
+			p_page_world_size <= 0.f) {
+		return -1;
+	}
+	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
+	const real_t region_world = real_t(_region_size) * vertex_spacing;
+	const int mip_pages = 1 << p_local_mip;
+	// `p_page_x/p_page_y` address the page at local mip 0, so the mip's own page origin
+	// is the enclosing aligned block. Arithmetic shift is floor division for negatives.
+	const int mip_page_x = p_page_x >> p_local_mip;
+	const int mip_page_y = p_page_y >> p_local_mip;
+	const real_t page_world = real_t(mip_pages) * p_page_world_size;
+	const real_t texel_world = page_world / real_t(p_page_size);
+	const real_t origin_x = real_t(mip_page_x * mip_pages) * p_page_world_size;
+	const real_t origin_z = real_t(mip_page_y * mip_pages) * p_page_world_size;
+	const int stored = p_page_size + 2 * p_border;
+
+	// Region grid covering the page and its border ring.
+	const real_t min_x = origin_x - real_t(p_border) * texel_world;
+	const real_t min_z = origin_z - real_t(p_border) * texel_world;
+	const real_t max_x = origin_x + real_t(p_page_size + p_border - 1) * texel_world;
+	const real_t max_z = origin_z + real_t(p_page_size + p_border - 1) * texel_world;
+	const int rx0 = int(Math::floor(min_x / region_world));
+	const int rz0 = int(Math::floor(min_z / region_world));
+	const int span_x = int(Math::floor(max_x / region_world)) - rx0 + 1;
+	const int span_z = int(Math::floor(max_z / region_world)) - rz0 + 1;
+	// One cell per region the page and its border ring touch. The payload pointer is
+	// resolved once here instead of once per texel: `decode_u16` is a GDExtension
+	// builtin-method call with Variant marshalling, and at 264x264 texels per page a
+	// pair of those per texel was the entire cost of a page (8.9 ms measured by
+	// vt_perf). The `Ref` keeps the image alive, so the pointer stays valid.
+	struct SourceCell {
+		Ref<Image> image;
+		PackedByteArray bytes;
+		const uint8_t *data = nullptr;
+		int size = 0;
+		real_t payload_texel = 1.f;
+		real_t origin_x = 0.f;
+		real_t origin_z = 0.f;
+	};
+	// A root page can cover hundreds of kilometres. Cache only resident sources,
+	// never a dense table proportional to the (mostly empty) world area.
+	std::unordered_map<int64_t, SourceCell> cells;
+	for (const Vector2i &location : get_region_locations()) {
+		const int rx = location.x - rx0;
+		const int rz = location.y - rz0;
+		if (rx >= 0 && rx < span_x && rz >= 0 && rz < span_z) {
+			Terrain3DRegion *region = get_region_ptr(location);
+			if (!region || region->is_deleted() || region->get_surface_map().is_null()) {
+				continue;
+			}
+			SourceCell &cell = cells[int64_t(rz) * span_x + rx];
+			cell.image = region->get_surface_map();
+			cell.size = cell.image->get_width();
+			cell.payload_texel = vertex_spacing / real_t(MAX(1, region->get_surface_density()));
+			cell.origin_x = real_t(rx0 + rx) * region_world;
+			cell.origin_z = real_t(rz0 + rz) * region_world;
+			cell.bytes = cell.image->get_data();
+			cell.data = cell.bytes.ptr();
+		}
+	}
+
+	PackedByteArray bytes;
+	bytes.resize(int64_t(stored) * stored * 2);
+	uint8_t *bytes_ptr = bytes.ptrw();
+	// The page column decides which region column a texel belongs to, independent of
+	// the row, so both the region index and the world position are resolved once.
+	std::vector<int> column_region(size_t(stored), 0);
+	std::vector<real_t> column_world_x(size_t(stored), 0.f);
+	for (int x = 0; x < stored; x++) {
+		column_world_x[size_t(x)] = origin_x + (real_t(x - p_border) + 0.5f) * texel_world;
+		column_region[size_t(x)] = int(Math::floor(column_world_x[size_t(x)] / region_world)) - rx0;
+	}
+	for (int y = 0; y < stored; y++) {
+		const real_t world_z = origin_z + (real_t(y - p_border) + 0.5f) * texel_world;
+		const int rz = int(Math::floor(world_z / region_world)) - rz0;
+		if (rz < 0 || rz >= span_z) {
+			continue;
+		}
+		uint8_t *out = bytes_ptr + int64_t(y) * stored * 2;
+		int previous_rx = -1;
+		const SourceCell *source_cell = nullptr;
+		for (int x = 0; x < stored; x++) {
+			const int rx = column_region[size_t(x)];
+			if (rx < 0 || rx >= span_x) {
+				continue;
+			}
+			if (rx != previous_rx) {
+				const auto entry = cells.find(int64_t(rz) * span_x + rx);
+				source_cell = entry == cells.end() ? nullptr : &entry->second;
+				previous_rx = rx;
+			}
+			if (!source_cell || source_cell->data == nullptr) {
+				continue;
+			}
+			const SourceCell &cell = *source_cell;
+			const int dx = CLAMP(int(Math::floor((column_world_x[size_t(x)] - cell.origin_x) / cell.payload_texel)), 0, cell.size - 1);
+			const int dy = CLAMP(int(Math::floor((world_z - cell.origin_z) / cell.payload_texel)), 0, cell.size - 1);
+			const uint8_t *texel = cell.data + (int64_t(dy) * cell.size + dx) * 2;
+			out[x * 2] = texel[0];
+			out[x * 2 + 1] = texel[1];
+		}
+	}
+	r_page = Image::create_from_data(stored, stored, false, Image::Format(39), bytes);
+	if (r_page.is_null()) {
+		return -1;
+	}
+	return stored;
+}
+
+Ref<Image> Terrain3DData::make_sparse_surface_page(const int p_page_x, const int p_page_y,
+		const int p_local_mip, const real_t p_page_world_size, const int p_page_size,
+		const int p_border) {
+	Ref<Image> page;
+	produce_sparse_surface_page(p_page_x, p_page_y, p_local_mip, p_page_world_size, p_page_size,
+			p_border, page);
+	return page;
 }
 
 void Terrain3DData::dump(const bool verbose) const {
@@ -1920,6 +2169,10 @@ void Terrain3DData::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("do_for_regions", "area", "callback"), &Terrain3DData::do_for_regions);
 	ClassDB::bind_method(D_METHOD("change_region_size", "region_size"), &Terrain3DData::change_region_size);
+	ClassDB::bind_method(D_METHOD("change_surface_density", "density"), &Terrain3DData::change_surface_density);
+	ClassDB::bind_method(D_METHOD("make_sparse_surface_page", "page_x", "page_y", "local_mip",
+								 "page_world_size", "page_size", "border"),
+			&Terrain3DData::make_sparse_surface_page);
 
 	ClassDB::bind_method(D_METHOD("get_region_location", "global_position"), &Terrain3DData::get_region_location);
 	ClassDB::bind_method(D_METHOD("get_region_id", "region_location"), &Terrain3DData::get_region_id);

@@ -37,8 +37,8 @@ static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline) {
 		return true;
 	}
 
-	int native_positions[16];
-	for (int i = 0; i < 16; i++) {
+	int native_positions[17];
+	for (int i = 0; i < 17; i++) {
 		native_positions[i] = -1;
 	}
 
@@ -50,17 +50,18 @@ static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline) {
 			continue;
 		}
 
-		ERR_FAIL_COND_V_MSG(token >= 16, false, "FRP pipeline built-in pass tokens must be in the range 0..15.");
+		ERR_FAIL_COND_V_MSG(token >= 17, false, "FRP pipeline built-in pass tokens must be in the range 0..16.");
 		ERR_FAIL_COND_V_MSG(native_positions[token] >= 0, false, "FRP pipeline cannot contain duplicate built-in pass tokens.");
 		native_positions[token] = i;
 	}
 
-	static const int mandatory_passes[] = { 0, 1, 2, 12, 15 };
+	static const int mandatory_passes[] = { 0, 1, 2, 12, 15, 16 };
 	for (int mandatory_pass : mandatory_passes) {
 		ERR_FAIL_COND_V_MSG(native_positions[mandatory_pass] < 0, false, "FRP pipeline is missing a mandatory built-in pass.");
 	}
 
 	static const int dependencies[][2] = {
+		{ 16, 0 },
 		{ 0, 1 },
 		{ 1, 2 },
 		{ 2, 3 },

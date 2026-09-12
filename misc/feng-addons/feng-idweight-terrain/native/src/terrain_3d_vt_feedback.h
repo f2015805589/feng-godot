@@ -23,9 +23,10 @@
  *
  * It uses its own local RenderingDevice (RenderingServer::create_local_rendering_device)
  * so it cannot disturb the main renderer's frame, and reads the result back
- * asynchronously with RenderingDevice::texture_get_data_async. The result of a dispatch
- * is therefore only available a few frames later, which is what the caller's
- * `is_readback_pending()` check is for.
+ * through RenderingDevice::texture_get_data_async. The local device has no automatic
+ * frame advance: sync() submits the dispatch and copy, waits for the GPU and delivers
+ * the callback. The current terrain caller does this in the same update, so this is
+ * a synchronous stall despite the readback API's name.
  *
  * The output grid is one texel per candidate page: `chunk_origin` plus
  * grid_width x grid_height chunks, `pages_per_axis` squared pages each. A texel holds

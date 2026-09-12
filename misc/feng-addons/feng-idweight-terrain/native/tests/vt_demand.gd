@@ -29,6 +29,8 @@ var terrain: Terrain3D
 var scene: Node3D
 var camera: Camera3D
 var failed := false
+# Regions the pattern was written to; a border texel outside all of them is material 0.
+var pattern_locs: Array = []
 # Read from the camera: the runtime measures extents in real viewport pixels, and the
 # window size is not fixed (the runner passes --resolution).
 var viewport_size := Vector2i(1280, 720)
@@ -84,10 +86,18 @@ func write_pattern(loc: Vector2i) -> void:
 	terrain.data.get_region(loc).set_surface_map(
 			Image.create_from_data(REGION_SIZE, REGION_SIZE, false, Image.FORMAT_R16, bytes))
 
-# The producer's rule, restated independently: page texel -> region texel, nearest,
-# with the border clamped to the region edge.
-func expected_region_texel(origin: int, page_texel: int, span: int) -> int:
-	return clampi(origin + ((page_texel - BORDER) * span) / PAGE, 0, REGION_SIZE - 1)
+# The producer's rule, restated independently: page texel -> region texel, nearest. A
+# texel whose region coordinate falls outside the region belongs to a neighbouring
+# region, so the expectation is that region's pattern at its own local texel.
+func expected_world(world_x: float, world_z: float) -> int:
+	var rx := int(floor(world_x / REGION_SIZE))
+	var rz := int(floor(world_z / REGION_SIZE))
+	var loc := Vector2i(rx, rz)
+	if not pattern_locs.has(loc):
+		return 0
+	var i := int(floor(world_x)) - rx * REGION_SIZE
+	var j := int(floor(world_z)) - rz * REGION_SIZE
+	return expected(loc, i, j)
 
 func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> void:
 	var page := terrain.get_surface_vt().read_page(slot)
@@ -99,18 +109,22 @@ func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> v
 	var span := REGION_SIZE / pages_at_mip
 	var origin_x := px * span
 	var origin_y := py * span
+	var base_x := loc.x * REGION_SIZE
+	var base_z := loc.y * REGION_SIZE
 	var bad := 0
 	var first := ""
 	for y in STORED:
-		var ry := expected_region_texel(origin_y, y, span)
+		var ry := origin_y + ((y - BORDER) * span) / PAGE
+		var world_z := float(base_z + ry)
 		for x in STORED:
-			var rx := expected_region_texel(origin_x, x, span)
-			var want := expected(loc, rx, ry)
+			var rx := origin_x + ((x - BORDER) * span) / PAGE
+			var world_x := float(base_x + rx)
+			var want := expected_world(world_x, world_z)
 			var got := bytes.decode_u16((y * STORED + x) * 2)
 			if got != want:
 				bad += 1
 				if first == "":
-					first = "texel (%d,%d) got %d want %d from region texel (%d,%d)" % [x, y, got, want, rx, ry]
+					first = "texel (%d,%d) got %d want %d from world (%.1f,%.1f)" % [x, y, got, want, world_x, world_z]
 	require(bad == 0, "%s mip %d page (%d,%d): %d bad texels, first %s" % [loc, local_mip, px, py, bad, first])
 
 # The exact level entry, not lookup_page: that one walks the mip chain, so it cannot
@@ -124,6 +138,8 @@ func resident(loc: Vector2i, local_mip: int, px: int, py: int) -> bool:
 func run() -> void:
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
+	# Verify the ID/weight residency contract separately from material baking.
+	terrain.set_vt_debug_direct_material(true)
 	terrain.free_editor_textures = false
 	scene.add_child(terrain)
 	root.add_child(scene)
@@ -165,6 +181,7 @@ func run() -> void:
 		for x in range(2, 7):
 			locs.append(Vector2i(x, y))
 	locs.append(Vector2i(4, -6))
+	pattern_locs = locs
 	for loc in locs:
 		terrain.data.add_region_blank(loc)
 		write_pattern(loc)

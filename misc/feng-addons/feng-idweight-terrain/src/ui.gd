@@ -59,6 +59,7 @@ var active_tool: Terrain3DEditor.Tool = Terrain3DEditor.TOOL_MAX
 var _selected_tool: Terrain3DEditor.Tool = Terrain3DEditor.TOOL_MAX
 var active_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var _selected_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
+var _tool_state_initialized: bool = false
 var inverted_input: bool = false
 
 # Hydra IdWeight pair painting state: which role the next stroke paints.
@@ -149,7 +150,7 @@ func _enter_tree() -> void:
 	plugin.add_control_to_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_BOTTOM, tool_settings)
 	plugin.add_control_to_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_MENU, terrain_menu)
 
-	_on_tool_changed(Terrain3DEditor.REGION, Terrain3DEditor.ADD)
+	_on_tool_changed(Terrain3DEditor.TOOL_MAX, Terrain3DEditor.OP_MAX)
 	
 	editor_decal_timer = Timer.new()
 	editor_decal_timer.wait_time = .5
@@ -204,12 +205,15 @@ func set_menu_visibility(p_list: Control, p_visible: bool) -> void:
 func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor.Operation) -> void:
 	if plugin.debug:
 		print("Terrain3DUI: _on_tool_changed: ", p_tool, ", ", p_operation)
-	if active_tool == p_tool and active_operation == p_operation:
+	if _tool_state_initialized and active_tool == p_tool and active_operation == p_operation:
 		return
+	_tool_state_initialized = true
 	_selected_tool = p_tool
 	_selected_operation = p_operation
+	if p_tool == Terrain3DEditor.TOOL_MAX and plugin.editor and plugin.editor.is_operating():
+		plugin.editor.stop_operation()
 	clear_picking()
-	set_menu_visibility(tool_settings.advanced_list, true)
+	set_menu_visibility(tool_settings.advanced_list, p_tool != Terrain3DEditor.TOOL_MAX)
 	set_menu_visibility(tool_settings.scale_list, false)
 	set_menu_visibility(tool_settings.rotation_list, false)
 	set_menu_visibility(tool_settings.height_list, false)
@@ -321,12 +325,14 @@ func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor
 		_:
 			pass
 
-	# Advanced menu settings
-	to_show.push_back("auto_regions")
-	to_show.push_back("align_to_view")
-	to_show.push_back("show_brush_texture")
-	to_show.push_back("gamma")
-	to_show.push_back("brush_spin_speed")
+	# Advanced menu settings are editing controls too. Keep them hidden while
+	# None is selected so no brush or add/remove-region action is armed.
+	if _selected_tool != Terrain3DEditor.TOOL_MAX:
+		to_show.push_back("auto_regions")
+		to_show.push_back("align_to_view")
+		to_show.push_back("show_brush_texture")
+		to_show.push_back("gamma")
+		to_show.push_back("brush_spin_speed")
 	tool_settings.show_settings(to_show)
 
 	if plugin.debug:
@@ -434,6 +440,15 @@ func _sync_slope_setting(p_key: String, p_asset_id: int, p_changed: Variant) -> 
 # * _on_setting_changed() eg. Touchscreen Invert
 func set_active_operation() -> void:
 	var inverted: bool = plugin.modifier_ctrl || inverted_input
+	if _selected_tool == Terrain3DEditor.TOOL_MAX:
+		active_tool = Terrain3DEditor.TOOL_MAX
+		active_operation = Terrain3DEditor.OP_MAX
+		operation_builder = null
+		toolbar.show_add_buttons(true)
+		if plugin.editor:
+			plugin.editor.set_tool(active_tool)
+			plugin.editor.set_operation(active_operation)
+		return
 
 	# Toggle toolbar buttons
 	toolbar.show_add_buttons(not inverted)
@@ -485,6 +500,9 @@ func update_decal() -> void:
 	
 	# If not a state that should show the decal, hide everything and return
 	mat_rid = plugin.terrain.material.get_material_rid() # Used in hide_decal() and below
+	if plugin.editor and plugin.editor.get_tool() == Terrain3DEditor.TOOL_MAX:
+		hide_decal()
+		return
 	if not visible or \
 		plugin._input_mode == -1 or \
 		# After moving camera, wait for mouse cursor to update before revealing
@@ -698,6 +716,8 @@ func is_shader_valid() -> bool:
 
 func hide_decal() -> void:
 	editor_decal_visible = [false, false, false]
+	if not mat_rid.is_valid():
+		return
 	if is_shader_valid():
 		RenderingServer.material_set_param(mat_rid, "_editor_decal_visible", editor_decal_visible)
 		restore_region_directory()

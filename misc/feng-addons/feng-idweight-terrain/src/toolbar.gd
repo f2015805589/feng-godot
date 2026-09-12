@@ -34,6 +34,8 @@ func _ready() -> void:
 	add_tool_group.pressed.connect(_on_tool_selected)
 	sub_tool_group.pressed.connect(_on_tool_selected)
 
+	add_none_button()
+
 	add_tool_button({ "tool":Terrain3DEditor.REGION, 
 		"add_text":"Add Region (E)", "add_op":Terrain3DEditor.ADD, "add_icon":ICON_REGION_ADD,
 		"sub_text":"Remove Region", "sub_op":Terrain3DEditor.SUBTRACT, "sub_icon":ICON_REGION_REMOVE })
@@ -90,10 +92,28 @@ func _ready() -> void:
 		"add_text":"Instance Meshes (I)", "add_op":Terrain3DEditor.ADD, "add_icon":ICON_INSTANCER,
 		"sub_text":"Remove Meshes (I)", "sub_op":Terrain3DEditor.SUBTRACT })
 
-	# Select first button
+	# Select first button. None is deliberately first so opening a scene cannot
+	# start with an editing operation armed.
 	var buttons: Array[BaseButton] = add_tool_group.get_buttons()
-	buttons[0].set_pressed(true)
+	if not buttons.is_empty():
+		buttons[0].set_pressed_no_signal(true)
 	show_add_buttons(true)
+
+
+func add_none_button() -> void:
+	var button := Button.new()
+	button.name = "None"
+	button.text = "None"
+	button.tooltip_text = "Disable terrain editing operations"
+	button.set_flat(true)
+	button.set_toggle_mode(true)
+	button.set_h_size_flags(SIZE_SHRINK_END)
+	button.set_button_group(add_tool_group)
+	button.set_meta("Tool", Terrain3DEditor.TOOL_MAX)
+	button.set_meta("Operation", Terrain3DEditor.OP_MAX)
+	button.set_meta("ID", 0)
+	add_child(button, true)
+	buttons[button.get_name()] = button
 
 
 func add_tool_button(p_params: Dictionary) -> void:

@@ -18,6 +18,8 @@ var terrain: Terrain3D
 var scene: Node3D
 var camera: Camera3D
 var failed := false
+# Regions the pattern was written to; a border texel outside all of them is material 0.
+var pattern_locs: Array = []
 
 func _initialize() -> void:
 	call_deferred("run")
@@ -45,10 +47,19 @@ func write_pattern(loc: Vector2i) -> void:
 	terrain.data.get_region(loc).set_surface_map(
 			Image.create_from_data(REGION_SIZE, REGION_SIZE, false, Image.FORMAT_R16, bytes))
 
-# The producer's rule, restated independently: page texel -> region texel, nearest,
-# with the border clamped to the region edge.
-func expected_region_texel(origin: int, page_texel: int, span: int) -> int:
-	return clampi(origin + ((page_texel - BORDER) * span) / PAGE, 0, REGION_SIZE - 1)
+# The producer's rule, restated independently: page texel -> region texel, nearest. A
+# texel whose region coordinate falls outside the region belongs to a neighbouring
+# region, so the expectation is that region's pattern at its own local texel -- the
+# border is no longer a clamped copy of this region's edge.
+func expected_world(world_x: float, world_z: float) -> int:
+	var rx := int(floor(world_x / REGION_SIZE))
+	var rz := int(floor(world_z / REGION_SIZE))
+	var loc := Vector2i(rx, rz)
+	if not pattern_locs.has(loc):
+		return 0
+	var i := int(floor(world_x)) - rx * REGION_SIZE
+	var j := int(floor(world_z)) - rz * REGION_SIZE
+	return expected(loc, i, j)
 
 func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> void:
 	var vt := terrain.get_surface_vt()
@@ -61,18 +72,22 @@ func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> v
 	var span := REGION_SIZE / pages_at_mip
 	var origin_x := px * span
 	var origin_y := py * span
+	var base_x := loc.x * REGION_SIZE
+	var base_z := loc.y * REGION_SIZE
 	var bad := 0
 	var first := ""
 	for y in STORED:
-		var ry := expected_region_texel(origin_y, y, span)
+		var ry := origin_y + ((y - BORDER) * span) / PAGE
+		var world_z := float(base_z + ry)
 		for x in STORED:
-			var rx := expected_region_texel(origin_x, x, span)
-			var want := expected(loc, rx, ry)
+			var rx := origin_x + ((x - BORDER) * span) / PAGE
+			var world_x := float(base_x + rx)
+			var want := expected_world(world_x, world_z)
 			var got := bytes.decode_u16((y * STORED + x) * 2)
 			if got != want:
 				bad += 1
 				if first == "":
-					first = "texel (%d,%d) got %d want %d from region texel (%d,%d)" % [x, y, got, want, rx, ry]
+					first = "texel (%d,%d) got %d want %d from world (%.1f,%.1f)" % [x, y, got, want, world_x, world_z]
 	require(bad == 0, "%s mip %d page (%d,%d): %d bad texels, first %s" % [loc, local_mip, px, py, bad, first])
 
 func check_sector(loc: Vector2i, local_mip: int) -> void:
@@ -88,6 +103,8 @@ func check_sector(loc: Vector2i, local_mip: int) -> void:
 func run() -> void:
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
+	# Verify the ID/weight residency contract separately from material baking.
+	terrain.set_vt_debug_direct_material(true)
 	terrain.free_editor_textures = false
 	scene.add_child(terrain)
 	root.add_child(scene)
@@ -115,6 +132,7 @@ func run() -> void:
 			"the atlas must hold every mip 0 page of every sector")
 
 	var locs := [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1)]
+	pattern_locs = locs
 	for loc in locs:
 		terrain.data.add_region_blank(loc)
 		write_pattern(loc)
@@ -188,6 +206,29 @@ func run() -> void:
 	require(int(vt.get_stats()["commit_count"]) == 0, "a settled pass should not re-upload the indirection")
 	if not failed:
 		print("PASS surface vt is idle once the demand set is satisfied")
+	vt.clear()
+	var batch := terrain.update_surface_vt(2)
+	require(batch > 0 and batch <= 2, "budgeted near-field update must produce at most two pages")
+	var total := batch
+	for step in 32:
+		batch = terrain.update_surface_vt(2)
+		require(batch <= 2, "each near-field update must respect its budget")
+		total += batch
+		if batch == 0:
+			break
+	require(total == 24, "budgeted demand must converge to the full working set")
+	# Upsampled border coordinates are fractional and negative. Truncating them
+	# to zero samples this region instead of the neighbour and creates VT seams.
+	terrain.surface_vt_page_size = 64
+	terrain.set_surface_vt_force_mip(true, 0)
+	terrain.update_surface_vt()
+	vt = terrain.get_surface_vt()
+	var left_page := vt.read_page(vt.lookup_page(Vector2i(1, 0), 0, 0, 0))
+	var top_page := vt.read_page(vt.lookup_page(Vector2i(0, 1), 0, 0, 0))
+	require(int(round(left_page.get_pixel(BORDER - 1, BORDER + 32).r * 65535.0)) == expected(Vector2i.ZERO, 63, 8),
+			"upsampled left border samples the adjacent region")
+	require(int(round(top_page.get_pixel(BORDER + 32, BORDER - 1).r * 65535.0)) == expected(Vector2i.ZERO, 8, 63),
+			"upsampled top border samples the adjacent region")
 
 	scene.queue_free()
 	await process_frame

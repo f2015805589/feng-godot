@@ -1,5 +1,22 @@
 # 地形数组与 FRP Pass
 
+## VT 检查
+
+底部地形面板的 **Terrain → Surface VT Editor…** 打开分页信息窗口。
+**Surface VT → VT Setting / AVT / SVT / VT Page** 可逐层折叠。
+VT Page 按世界坐标拼接已烘焙的 SVT 材质页；点击区块可定位 Terrain3DRegion 数据。
+驻留页显示 Ready、Pending bake、Pending upload、Missing bake 或 Stale/invalid bake。
+
+VT Setting 统一管理物理缓存和生产预算，AVT 与 SVT 使用独立寻址表、共享物理页池。
+AVT 在配置的可见地块网格内实时 GPU 烘焙；其他地块使用离线保存的 SVT 页。
+正常 VT 模式不会回退到原始地形材质，也不会在 AVT 缺页时改用 SVT；
+同一视图可以读取有效祖先页，仍无有效页时显示紫色棋盘诊断。
+SVT 默认开启 **Auto Bake**：地形修改停止 500 毫秒后增量更新受影响的页、边界与上级 mip；无变化时不持续烘焙。也可以用 **Bake All SVT Pages** 一键强制重烘全部页面。
+
+原生 **VT Pass** 位于 GBuffer 前；RenderDoc 保留配置的 Pass 名称和顺序，
+包括没有烘焙工作的空闲 VT Pass。空闲标记不执行 GPU 烘焙。
+详见 [VT 架构检查](../misc/feng-addons/feng-idweight-terrain/docs/vt_architecture_review.md)。
+
 ## 地形材质
 
 选中 Terrain3D，在底部资产面板打开 **Terrain → Texture Array**。
@@ -31,6 +48,14 @@
 - Surface Maps：实际材质 ID 图，R16 UNORM。它同时编码两个 5 位材质 ID、2 位混合模式、3 位权重等级与 1 位 UV 标志。没有另一张独立的 Weightmap。
 - Control Maps：保留洞、自动材质等旧控制元数据。材质笔刷与吸管使用 Surface Maps。
 - 贴图 Albedo Alpha 中的 Height 是材质微观高度，与地形几何 Height Maps 不同。
+
+Terrain3D 的 **Surface Density**（1/2/4/8 texel·m⁻¹，默认 1）决定 Surface Maps 的**存储**分辨率：每个 region 存 `region_size × density` 见方的 R16（region 256、density 4 时 2 MB）。它是地形级设置，因为材质数组是一张纹理、所有层必须同尺寸。数组层本身始终是 `region_size`（1 texel/m），只保存每个密度块的块首 texel，用于 VT 关闭时的原始材质计算及显式诊断模式；正常 VT 模式从 AVT 或 SVT 材质页读取结果，不使用此数组作为缺页回退。改密度会把内存里每个 region 的存档重采样（最近邻、按块，绝不重新从 Control Map 推导材质），旧档（无该字段、payload 为 `region_size²`）在进入内存时自动升采样。代价：撤销快照从 128 KB 涨到 2 MB/region（region 1024、density 4 时 32 MB），笔刷按 `density²` 整块写入。
+
+Surface 通道有两级虚拟纹理，对应 Hydra 的 AVT/SVT 拆分：
+
+- **近场（AVT）**：页网格切在 region 内部，`surface_vt_enabled` 打开；页 256 texel、每轴 4 页，density 4 时与源数据 1:1，mip 链到"一页 = 一个 region"为止。半径 `surface_vt_distance`（默认 512 m）。
+- **远场（SVT）**：页是**世界空间**的固定方块（`surface_svt_page_world` 默认 512 m / 256 texel），mip 层数由页相对世界的尺寸决定，一页可跨多个 region，页内容按世界坐标取所属 region 的 payload，页边框填邻居 texel。最粗的 `surface_svt_root_mips` 级**常驻且受保护**，任何世界坐标都能解析出粗略真实数据——它就是替代数组的兜底。
+- 着色器查找顺序：近场 → 远场 → 数组。`surface_array_enabled = false` 时 surface 数组层不再上传 payload（数组仍分配但为空），从而省掉 density² 的显存；编辑会通过 `invalidate_surface_pages()` 让相关页失效并重产。Debug Views 走同一条查找链，因此关掉数组也能用。两级虚拟纹理**都**关闭时数组会被强制继续承载 surface 通道（否则整片会渲染成 0 号材质）。默认仍为 `true`（翻转默认会改变所有既有项目的渲染结果，且尚未在真实场景测量显存/FPS）。
 
 ## 自定义 FRP Pass
 
@@ -78,7 +103,7 @@ var depth = buffers.get_depth_texture()
 
 不要把纹理 RID 跨分辨率切换、视口销毁保存。MSAA 开启时，Post GBuffer / Pre Lighting 读取解析后的单采样 GBuffer；需要解析颜色时设置 Access Resolved Color。显式 FengRenderer 路径会在自定义 Pass 位置解析所需附件，并把颜色写回 MSAA 附件；普通 Compositor 的旧阶段路径不提供这项回写。回调运行在渲染线程，不能直接修改场景树。
 
-RenderDoc 中展开 **FRP Scene → 序号与 Pass 名称 → 内部操作**，即可找到 GBuffer 几何绘制和全屏延迟光照。当前地形 Shader 使用顶点变形，几何绘制归入 **Opaque Forward Fallback**。最终把 Scene 纹理合成到编辑器 UI 的绘制不是场景几何。D3D12 编辑器无需额外启用 PIX 即可输出标签；Vulkan 非开发构建需用 `--verbose` 启用 debug utils。关闭或本帧没有 GPU 工作的条目不会产生事件。
+RenderDoc 场景事件按 **Pass 名称 → 内部操作** 展示。**VT Pass** 在 GBuffer 前执行材质页面更新；地形的自定义顶点变形已接入 GBuffer，深度和法线随变形输出。最终把 Scene 纹理合成到编辑器 UI 的绘制不是场景几何。D3D12 编辑器无需额外启用 PIX 即可输出标签；Vulkan 非开发构建需用 `--verbose` 启用 debug utils。关闭或本帧没有 GPU 工作的条目不会产生事件。
 
 ## 本轮修正与优化范围
 

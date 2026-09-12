@@ -144,6 +144,10 @@ private:
 	bool _sync_slot_map(const int p_slot_map);
 	static bool _slot_map_requested(const MapType p_map_type, const int p_slot_map);
 	static int _slot_map_mask(const MapType p_map_type);
+	// Samples whichever region owns a world position, on that region's density grid.
+	// Page border texels belong to the neighbouring regions, so this is what keeps a
+	// page seam reading real data instead of a copy of the page's own edge.
+	uint16_t _sample_payload_world(const real_t p_world_x, const real_t p_world_z) const;
 
 	// Editing occurs on the Image arrays above, which are converted to Texture arrays
 	// below for the shader.
@@ -205,6 +209,10 @@ public:
 
 	void do_for_regions(const Rect2i &p_area, const Callable &p_callback);
 	void change_region_size(int region_size);
+	// Adopts a new surface resolution for every resident region: each stored surface
+	// payload is resampled (never re-derived from the legacy control map), and only
+	// the surface array layers are re-uploaded.
+	void change_surface_density(int density);
 
 	Vector2i world_to_vgrid(const Vector3 &p_global_position) const;
 	Vector2i get_region_location(const Vector3 &p_global_position) const;
@@ -251,6 +259,9 @@ public:
 	RID get_control_maps_rid() const { return _generated_control_maps.get_rid(); }
 	RID get_color_maps_rid() const { return _generated_color_maps.get_rid(); }
 	RID get_surface_maps_rid() const { return _generated_surface_maps.get_rid(); }
+	// CPU source heights for a material page. The GPU writer uses these for world
+	// positions and geometric normals; this never reads the GPU height array back.
+	Ref<Image> make_vt_height_page(const Rect2 &p_world_rect, int p_page_size, int p_border) const;
 	// p_region_id is a layer slot: the value get_region_id() returns.
 	void update_surface_region(Image *p_surface_map, const int p_region_id);
 
@@ -331,6 +342,22 @@ public:
 	int produce_surface_pages(const Vector2i &p_region_loc, const int p_local_mip,
 			const int p_pages_per_axis, const int p_page_size, const int p_border,
 			std::vector<Ref<Image>> &r_pages);
+
+	// Far-field (sparse virtual texture) page production. Unlike the region-aligned
+	// producer above, this one is world aligned: every page texel maps to a world
+	// position and takes the payload of whichever region owns it. A page may therefore
+	// span several regions, and its border texels come from the neighbours instead of a
+	// clamped copy -- which is what keeps a bilinear tap at a page seam correct.
+	//
+	// `p_page_x/p_page_y` address the page at `p_local_mip`, where one page covers
+	// `p_page_world_size << p_local_mip` metres. Texels with no region behind them are
+	// material 0. Returns the stored page size, or -1 on unusable arguments.
+	int produce_sparse_surface_page(const int p_page_x, const int p_page_y, const int p_local_mip,
+			const real_t p_page_world_size, const int p_page_size, const int p_border,
+			Ref<Image> &r_page);
+	// Binding-friendly form of the above, for tests and tooling.
+	Ref<Image> make_sparse_surface_page(const int p_page_x, const int p_page_y, const int p_local_mip,
+			const real_t p_page_world_size, const int p_page_size, const int p_border);
 
 protected:
 	static void _bind_methods();

@@ -58,6 +58,74 @@ class PaintPass extends FRP_BASE:
 			rd.draw_list_end()
 			rd.free_rid(fb)
 
+class GBufferProbePass extends FRP_BASE:
+	var captures := 0
+	var sample := PackedFloat32Array()
+
+	func _init() -> void:
+		stage = CompositorEffect.EFFECT_CALLBACK_TYPE_POST_GBUFFER
+		effect_callback_type = stage
+
+	func reset() -> void:
+		captures = 0
+		sample = PackedFloat32Array()
+
+	func _render_callback(callback_stage: int, data: RenderData) -> void:
+		if callback_stage != effect_callback_type or data == null or captures > 0:
+			return
+		var buffers := data.get_render_scene_buffers() as RenderSceneBuffersRD
+		if buffers == null:
+			return
+		var rd := RenderingServer.get_rendering_device()
+		var albedo := buffers.get_texture("frp_clustered", "gbuffer_albedo")
+		var normal := buffers.get_texture("frp_clustered", "normal_roughness")
+		var depth := buffers.get_depth_texture()
+		if rd == null or not albedo.is_valid() or not normal.is_valid() or not depth.is_valid():
+			return
+
+		var source := RDShaderSource.new()
+		source.source_compute = "#version 450\nlayout(local_size_x=1) in; layout(set=0,binding=0) uniform sampler2D albedo_tex; layout(set=0,binding=1) uniform sampler2D normal_tex; layout(set=0,binding=2) uniform sampler2D depth_tex; layout(set=0,binding=3,std430) buffer Result {vec4 values[3];} result; void main(){ivec2 p=textureSize(albedo_tex,0)/2; result.values[0]=texelFetch(albedo_tex,p,0); result.values[1]=texelFetch(normal_tex,p,0); result.values[2]=texelFetch(depth_tex,p,0); }"
+		var shader := rd.shader_create_from_spirv(rd.shader_compile_spirv_from_source(source))
+		if not shader.is_valid():
+			return
+		var pipeline := rd.compute_pipeline_create(shader)
+		var sampler := rd.sampler_create(RDSamplerState.new())
+		var output := rd.storage_buffer_create(48)
+		var bindings: Array[RDUniform] = []
+		var inputs := [albedo, normal, depth]
+		for i in 3:
+			var input := RDUniform.new()
+			input.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+			input.binding = i
+			input.add_id(sampler)
+			input.add_id(inputs[i])
+			bindings.append(input)
+		var result_uniform := RDUniform.new()
+		result_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+		result_uniform.binding = 3
+		result_uniform.add_id(output)
+		bindings.append(result_uniform)
+		var uniform_set := rd.uniform_set_create(bindings, shader, 0)
+		if not pipeline.is_valid() or not uniform_set.is_valid():
+			rd.free_rid(uniform_set)
+			rd.free_rid(output)
+			rd.free_rid(sampler)
+			rd.free_rid(pipeline)
+			rd.free_rid(shader)
+			return
+		var list := rd.compute_list_begin()
+		rd.compute_list_bind_compute_pipeline(list, pipeline)
+		rd.compute_list_bind_uniform_set(list, uniform_set, 0)
+		rd.compute_list_dispatch(list, 1, 1, 1)
+		rd.compute_list_end()
+		sample = rd.buffer_get_data(output).to_float32_array()
+		captures = 1
+		rd.free_rid(uniform_set)
+		rd.free_rid(output)
+		rd.free_rid(sampler)
+		rd.free_rid(pipeline)
+		rd.free_rid(shader)
+
 class ScreenPaintPass extends FRP_BASE:
 	var color := Color.GREEN
 	var calls := 0
@@ -520,28 +588,32 @@ func run() -> void:
 	# passes remain CompositorEffect-backed entries in the same list.
 	var unified_renderer = renderer_script2.new()
 	require(RenderingServer.has_method("compositor_set_frp_pipeline"), "engine does not expose compositor_set_frp_pipeline")
+	require(RenderingServer.has_method("virtual_texture_set_update_callback"), "engine does not expose virtual texture callback registration")
+	require(RenderingServer.has_method("virtual_texture_remove_update_callback"), "engine does not expose virtual texture callback removal")
+	require(RenderingServer.has_method("execute_virtual_texture_updates"), "engine does not expose virtual texture callback execution")
 	var native_values: Array[FRP_BASE] = _native_passes(unified_renderer)
-	require(native_values.size() == 16, "renderer must expose all 16 native FRP passes, got %d" % native_values.size())
+	require(native_values.size() == 17, "renderer must expose all 17 native FRP passes, got %d" % native_values.size())
 	var expected_native_names := [
 		"gbuffer", "preparation", "lighting", "fallback", "motion", "resolve",
 		"debug", "sky", "resolve", "specular", "copy", "transparent",
-		"resolve", "history", "temporal", "tonemap",
+		"resolve", "history", "temporal", "tonemap", "vt pass",
 	]
 	var native_ids := {}
 	for value in native_values:
 		var id := _native_id(value)
-		require(id >= 0 and id < 16, "native pass id out of range: %s" % id)
+		require(id >= 0 and id < 17, "native pass id out of range: %s" % id)
 		require(not native_ids.has(id), "duplicate native pass id: %s" % id)
 		native_ids[id] = value
-	for id in 16:
+	for id in 17:
 		require(native_ids.has(id), "missing native pass id %d" % id)
 		var label := _pass_label(native_ids[id]).to_lower()
 		require(not label.is_empty(), "native pass %d has no display name" % id)
 		require(label.contains(expected_native_names[id]), "native pass %d has wrong display name '%s'" % [id, label])
-	# Native entries must retain their canonical relative order even when custom
-	# entries are inserted between them.
-	for i in native_values.size():
-		require(_native_id(native_values[i]) == i, "default native order changed at index %d" % i)
+	# VT Pass is the only new entry and is authored before the stable 0..15
+	# sequence. Existing native ids retain their relative order.
+	require(_native_id(native_values[0]) == 16, "VT Pass must precede GBuffer")
+	for i in range(1, native_values.size()):
+		require(_native_id(native_values[i]) == i - 1, "default native order changed at index %d" % i)
 
 	var manifest_property := ""
 	for candidate in ["_synced_library", "library_manifest", "_library_manifest"]:
@@ -675,11 +747,13 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	require(legacy_renderer != null, "hand-authored legacy renderer did not load")
 	legacy_renderer.apply(compositor)
 	var migrated_native: Array[FRP_BASE] = _native_passes(legacy_renderer)
-	require(migrated_native.size() == 16, "legacy renderer migration did not restore native passes")
-	for i in migrated_native.size():
-		require(_native_id(migrated_native[i]) == i, "legacy migration changed native order at %d" % i)
+	require(migrated_native.size() == 17, "legacy renderer migration did not restore native passes")
+	require(_native_id(migrated_native[0]) == 16, "legacy migration did not place VT Pass before GBuffer")
+	for i in range(1, migrated_native.size()):
+		var native_id := _native_id(migrated_native[i])
+		require(native_id == i - 1, "legacy migration changed native order at %d" % i)
 		var migrated_label := _pass_label(migrated_native[i]).to_lower()
-		require(migrated_label.contains(expected_native_names[i]), "legacy native pass %d name was not restored: '%s'" % [i, migrated_label])
+		require(migrated_label.contains(expected_native_names[native_id]), "legacy native pass %d name was not restored: '%s'" % [native_id, migrated_label])
 	var migrated_tint = null
 	var migrated_blur_h := 0
 	for value in legacy_renderer.passes:
@@ -814,6 +888,64 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	var before_lighting_pixel := before_lighting_image.get_pixelv(center)
 	require(before_lighting_pixel.r > after_lighting_pixel.r + 0.05 or before_lighting_pixel.g > after_lighting_pixel.g + 0.05 or before_lighting_pixel.b > after_lighting_pixel.b + 0.05, "moving custom write before deferred lighting had no GPU scheduling effect: %s -> %s" % [after_lighting_pixel, before_lighting_pixel])
 	print("PASS custom reorder across native deferred lighting")
+
+	# A custom CompositorEffect authored between VT Pass and GBuffer must run at
+	# that exact list position. Its stage selects the callback contract, while
+	# the renderer list controls execution order.
+	var schedule_renderer = renderer_script2.new()
+	var schedule_native: Array[FRP_BASE] = _native_schedule_base(schedule_renderer)
+	var pre_gbuffer_probe := PaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_GBUFFER, Color.WHITE)
+	var post_gbuffer_probe := GBufferProbePass.new()
+	var authored_schedule: Array[FRP_BASE] = []
+	var gbuffer_entry = _native_pass(schedule_renderer, 0)
+	for value in schedule_native:
+		if _native_id(value) == 0:
+			authored_schedule.append(pre_gbuffer_probe)
+		authored_schedule.append(value)
+		if _native_id(value) == 0:
+			authored_schedule.append(post_gbuffer_probe)
+	schedule_renderer.passes = authored_schedule
+	schedule_renderer.apply(compositor)
+	var pre_position := authored_schedule.find(pre_gbuffer_probe)
+	var gbuffer_position := authored_schedule.find(gbuffer_entry)
+	require(pre_position >= 0 and pre_position < gbuffer_position, "PRE_GBUFFER effect was not authored before GBuffer")
+	await frame()
+	require(pre_gbuffer_probe.calls > 0 and post_gbuffer_probe.captures == 1, "explicit PRE_GBUFFER effect was not executed around GBuffer")
+	print("PASS explicit CompositorEffect scheduling before GBuffer")
+
+	# A material that writes both VERTEX and NORMAL remains in the GBuffer. The
+	# probe reads the actual attachments so a forward fallback cannot satisfy
+	# this test merely by producing the expected final color.
+	_clear_frp_pipeline(compositor)
+	var vertex_probe := GBufferProbePass.new()
+	compositor.compositor_effects = [vertex_probe]
+	box.material_override = material
+	await frame()
+	require(vertex_probe.captures == 1 and vertex_probe.sample.size() >= 12, "GBuffer probe could not read the opaque baseline")
+	var baseline_gbuffer := vertex_probe.sample
+	vertex_probe.reset()
+	var displaced_shader := Shader.new()
+	displaced_shader.code = """
+shader_type spatial;
+render_mode cull_back;
+void vertex() {
+	VERTEX.z += 0.75;
+	NORMAL = vec3(0.0, 1.0, 0.0);
+}
+void fragment() {
+	ALBEDO = vec3(0.1, 0.8, 0.2);
+	ROUGHNESS = 0.5;
+}
+"""
+	var displaced_material := ShaderMaterial.new()
+	displaced_material.shader = displaced_shader
+	box.material_override = displaced_material
+	await frame()
+	require(vertex_probe.captures == 1 and vertex_probe.sample.size() >= 12, "custom vertex material did not reach GBuffer")
+	require(vertex_probe.sample[1] > 0.6 and vertex_probe.sample[3] > 0.5, "custom vertex material albedo is missing from GBuffer: %s" % vertex_probe.sample)
+	require(vertex_probe.sample[5] > 0.9, "custom vertex normal is missing from GBuffer: %s" % vertex_probe.sample)
+	require(abs(vertex_probe.sample[8] - baseline_gbuffer[8]) > 0.00001, "custom vertex displacement did not change GBuffer depth")
+	print("PASS custom vertex displacement and normal in GBuffer")
 
 	_clear_frp_pipeline(compositor)
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(sync_path))

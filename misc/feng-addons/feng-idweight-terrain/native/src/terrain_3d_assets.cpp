@@ -224,6 +224,7 @@ void Terrain3DAssets::_update_texture_files() {
 		_generated_albedo_textures.clear();
 		_generated_normal_textures.clear();
 		_texture_layer_cache.clear();
+		_texture_cache_identity.clear();
 		_texture_array_info.clear();
 		notify_property_list_changed();
 		emit_signal("textures_changed");
@@ -234,6 +235,7 @@ void Terrain3DAssets::_update_texture_files() {
 	// All layers follow explicit authoring settings, independent of imports.
 	const ArrayCodec &codec = ARRAY_CODECS[_texture_array_compression];
 	Dictionary next_cache;
+	PackedStringArray next_identity;
 	auto prepare_layers = [&](bool p_normal, TypedArray<Image> &r_layers) -> bool {
 		Image::Format working_format = (_texture_array_compression != ARRAY_UNCOMPRESSED && codec.hdr) ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
 		Vector2i size = _texture_array_size > 0 ? V2I(_texture_array_size) : V2I_ZERO;
@@ -278,6 +280,7 @@ void Terrain3DAssets::_update_texture_files() {
 			} else {
 				key += ":placeholder";
 			}
+			next_identity.push_back(key);
 			if (_texture_layer_cache.has(key)) {
 				r_layers[i] = _texture_layer_cache[key];
 				next_cache[key] = r_layers[i];
@@ -371,6 +374,8 @@ void Terrain3DAssets::_update_texture_files() {
 	// Commit both arrays together, then notify materials before freeing the old
 	// RIDs. A failed layer update must not destroy an already rendering terrain.
 	_texture_layer_cache = next_cache;
+	// Preserve source content identity after runtime releases editor texture assets.
+	_texture_cache_identity = next_identity;
 	Ref<Image> albedo_first = albedo_layers[0];
 	Ref<Image> normal_first = normal_layers[0];
 	_texture_array_info["layers"] = albedo_layers.size();

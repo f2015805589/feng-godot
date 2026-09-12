@@ -10,6 +10,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument("--driver", default="d3d12")
+parser.add_argument("--binary", default=None,
+                    help="editor binary to run (defaults to the in-tree Windows editor)")
 args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
 shutil.copytree(ROOT / "misc/feng-addons/feng-render-pipeline", project / "addons/feng-render-pipeline")
@@ -23,7 +25,8 @@ if os.name == "nt":
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
-base = [str(ROOT / "bin/godot.windows.editor.x86_64.exe"), "--path", str(project),
+binary = Path(args.binary) if args.binary else ROOT / "bin/godot.windows.editor.x86_64.exe"
+base = [str(binary), "--path", str(project),
         "--rendering-method", "frp", "--rendering-driver", args.driver,
         "--resolution", "320x240", "--position", "-10000,-10000"]
 

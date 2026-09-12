@@ -7,7 +7,7 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 ## 使用
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
-2. 创建 `FengRenderer`，默认包含下列 16 个原生操作和 8 个库 Pass。
+2. 创建 `FengRenderer`，默认包含下列 17 个原生操作和 8 个库 Pass。
 3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment。
 4. 在 Inspector 的 Passes 数组中拖动排序，编辑资源的 Enabled。条目显示具体名称，
    例如 `Deferred Lighting`、`Blur Horizontal`、`Bloom Composite`；`FengShaderPass`
@@ -35,13 +35,14 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | 13 | SSIL/SSR History Copy | 历史帧副本 |
 | 14 | Temporal AA / Upscale | TAA、FSR2、MetalFX Temporal |
 | 15 | Post Process / Tonemap | 引擎后处理和最终输出 |
+| 16 | VT Pass | 在 GBuffer 前运行已注册的虚拟纹理页面生产者和材质烘焙回调 |
 
 这些条目执行真实的原生操作，但粒度是上述组合步骤，不是逐个 GPU draw/dispatch。
 例如 Lighting Preparation 内部的阴影、GI 和 SSAO 尚未拆成可独立排序的条目。
 反射探针和普通 Compositor 保留原有阶段调度。
 
-排序受数据依赖约束：GBuffer 必须先于光照准备和延迟光照，最终 resolve 必须先于
-Tonemap；天空、前向补绘等可以在符合约束的范围内移动。当前 0、1、2、12、15 是
+排序受数据依赖约束：VT Pass 必须先于 GBuffer，GBuffer 必须先于光照准备和延迟光照，最终
+resolve 必须先于 Tonemap；天空、前向补绘等可以在符合约束的范围内移动。当前 0、1、2、12、15、16 是
 完整输出必需的操作，不能删除或禁用，也尚不支持用自定义 Pass 替换它们。
 
 其余条目可以关闭；部分条目还受视口/材质设置约束，例如开启 TAA/FSR2 时不能关闭
@@ -89,14 +90,17 @@ Renderer 资源需要通过 FengCompositor 挂到 WorldEnvironment 或正在使�
 仅创建、选中 Renderer 资源不会改变场景。编辑器自由视角使用编辑器自己的相机；
 需要自由视角也使用同一配置时，把 FengCompositor 挂在 WorldEnvironment 上。
 
-GPU 事件按 `FRP Scene → 列表序号 + Pass 名称 → 内部操作 → Commands (L…)`
+GPU 事件按 `列表序号 + Pass 名称 → 内部操作 → Commands (L…)`
 分组。自定义名称来自 `resource_name`，与 Inspector 列表一致。显式管线在 Pass
 边界建立命令依赖，防止渲染图把命令移到其他 Pass 前后；单个 Pass 内部仍按资源
 依赖优化。`L` 是底层命令图层级，不是列表序号。
 
-禁用的 Pass 和当前帧没有 GPU 工作的步骤不会产生事件，例如未开启 MSAA 时的
-Resolve、场景没有透明物体时的 Transparent。GBuffer 内含普通场景几何 draw；
-当前地形 Shader 使用顶点变形，归入 Opaque Forward Fallback，应在该组查看其几何。
+禁用的 Pass 不会运行。启用但当前帧没有 GPU 工作的 Pass 仍有一个轻量 RenderDoc
+事件，名称和列表位置保持与 Inspector 一致；事件中的空 driver callback 不提交
+dispatch、draw、clear 或资源上传。例如未开启 MSAA 时的 Resolve、场景没有透明物体时的
+Transparent 仍可通过配置名称定位。VT Pass 只在有注册的页面生产工作时提交 GPU
+工作，空闲时只保留这个 marker。GBuffer 内含普通场景几何 draw，也支持地形自定义 Shader 的
+`vertex()` 位移和法线输出；只有不适合 GBuffer 的材质才会归入 Opaque Forward Fallback。
 Deferred Lighting 的全屏 draw 消费 GBuffer，不代表所有物体只画了一次全屏三角形。
 编辑器最后把 Scene 纹理绘制到 UI 的步骤也不是场景几何绘制。
 

@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
+#include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_default.h"
 #include "servers/rendering/storage/compositor_storage.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
@@ -48,6 +49,13 @@ using namespace RendererSceneRenderImplementation;
 #define PRELOAD_PIPELINES_ON_SURFACE_CACHE_CONSTRUCTION 1
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
+
+// A pass label is only emitted by RenderingDeviceGraph when at least one graph
+// command belongs to it.  Keep configured FRP passes visible in captures even
+// when their actual operation has no work this frame.  This callback is
+// intentionally empty: it records no GPU command and has no resource usage.
+static void _frp_pass_debug_marker(RDD *, RDD::CommandBufferID, void *) {
+}
 
 void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_specular() {
 	ERR_FAIL_NULL(render_buffers);
@@ -1229,13 +1237,14 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 
 				if (!force_alpha && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
 					// In the FRP renderer, materials that cannot be expressed in the G-buffer
-					// (unshaded, vertex deformation, lightmap, SSS/transmittance, screen/depth/normal
-					// texture reads, point size, world coords, stencil, etc.) are rendered forward
-					// in a fallback pass. Everything else (roughness/normal map/tangent/alpha clip
-					// writes) is fully expressible in the G-buffer and goes through FRP lighting.
+					// (unshaded, lightmap, SSS/transmittance, screen/depth/normal texture reads,
+					// point size, world coords, stencil, etc.) are rendered forward in a fallback
+					// pass. Vertex() is part of every FRP depth/G-buffer shader variant, so vertex
+					// deformation can use the same generated code and remain in the G-buffer.
+					// Everything else (roughness/normal map/tangent/alpha clip writes) is fully
+					// expressible in the G-buffer and goes through FRP lighting.
 					SceneShaderFRPClustered::ShaderData *shader_data = surf->shader;
 					bool needs_forward_fallback = shader_data->unshaded ||
-							shader_data->uses_vertex ||
 							shader_data->uses_sss ||
 							shader_data->uses_transmittance ||
 							shader_data->uses_screen_texture ||
@@ -2012,7 +2021,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 	p_render_data->scene_data->emissive_exposure_normalization = -1.0;
 
-	RD::get_singleton()->draw_command_begin_label(String(is_reflection_probe ? "FRP Reflection Probe" : "FRP Scene").utf8().span());
+	// Every pass below opens its own debug label, and the FRP schedule names those
+	// labels after the authored passes. Wrapping the whole frame in one more label
+	// would make that wrapper the only top-level entry in a RenderDoc capture, so the
+	// pass names are deliberately the outermost markers here.
 	RD::get_singleton()->draw_command_begin_label("Render Setup");
 
 	_setup_lightmaps(p_render_data, *p_render_data->lightmaps, p_render_data->scene_data->cam_transform);
@@ -2251,11 +2263,17 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		"GBuffer", "Lighting Preparation", "Deferred Lighting", "Opaque Forward Fallback",
 		"Motion Vectors", "Opaque Resolve", "Debug Geometry", "Sky", "Sky Resolve",
 		"Subsurface + Specular Merge", "Screen/Depth Copy", "Transparent", "Final Resolve",
-		"SSIL/SSR History Copy", "Temporal AA / Upscale", "Post Process / Tonemap"
+		"SSIL/SSR History Copy", "Temporal AA / Upscale", "Post Process / Tonemap", "VT Pass"
 	};
 	auto run_builtin_pass = [&](int p_pass, const String &p_name) {
 		RD::get_singleton()->draw_command_begin_label(p_name.utf8().span());
+		RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
 		switch (p_pass) {
+			case 16: { // Virtual texture updates. Must run before the G-buffer.
+				if (!is_reflection_probe) {
+					RenderingServer::get_singleton()->execute_virtual_texture_updates();
+				}
+			} break;
 			case 0: { // GBuffer.
 				if (!is_reflection_probe) {
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_GBUFFER);
@@ -2829,6 +2847,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				continue;
 			}
 			RD::get_singleton()->draw_command_begin_label(pass_name.utf8().span());
+			RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
 			// Custom passes can move across built-in operations. Resolve requested
 			// attachments at their actual position, not their old stage anchor.
 			if (use_msaa) {
@@ -2855,6 +2874,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 		RD::get_singleton()->draw_command_insert_ordering_barrier();
 	} else {
+		// VT Pass is deliberately first so registered material-page producers
+		// finish their GPU work before any G-buffer draw can consume it.
+		run_builtin_pass(16, builtin_pass_names[16]);
 		for (int pass = 0; pass < 16; pass++) {
 			run_builtin_pass(pass, builtin_pass_names[pass]);
 		}
@@ -2877,7 +2899,6 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			sdfgi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
 		}
 	}
-	RD::get_singleton()->draw_command_end_label();
 }
 
 void RenderFRPClustered::_render_buffers_debug_draw(const RenderDataRD *p_render_data) {

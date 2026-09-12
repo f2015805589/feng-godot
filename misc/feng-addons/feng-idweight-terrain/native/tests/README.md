@@ -150,8 +150,10 @@ pages, and fills only the ones it actually allocated by resampling the region's 
 The region surface maps are filled with a pattern where every texel is distinguishable, so each
 page read back from the GPU atlas can be compared texel by texel against an independently
 restated version of the crop rule — at mip 0 (a 1:1 crop) and mip 1 (a 2x downsample), border
-included. It also pins the distance rule and that a settled pass writes no pages and does not
-re-upload the indirection.
+included. A border texel whose region coordinate falls outside the region belongs to a
+neighbouring region, so the expectation is that region's pattern (or material 0 when no region
+covers the position) rather than a clamped copy. It also pins the distance rule and that a
+settled pass writes no pages and does not re-upload the indirection.
 
 The atlas must be at least `sectors * pages_per_axis^2` pages or the LRU will evict pages the
 test is about to look for; the test asserts that sizing up front.
@@ -245,6 +247,75 @@ Two things to know before changing this code:
   region texture array when no page covers a texel, so a culled page simply renders through the
   array path.
 
+## Surface density
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_density_runner.py --driver d3d12
+```
+
+Build the debug extension first. `surface_density` (terrain-wide, 1..8 texels per region texel)
+makes the stored surface payload finer than the region texture array, which stays at
+`region_size` and only ever carries the block-origin reduction. The test pins:
+
+* the two sizes (`region_size * density` squared for the payload, `region_size` squared for the
+  array layer), and that the region adopts the terrain's density;
+* that the brush writes whole `density²` blocks and leaves blocks outside the brush untouched;
+* that a 4 → 1 → 4 density round trip is **byte exact** for block-uniform data, i.e. resampling
+  is a nearest block reduction and not a re-derivation from the legacy control map;
+* the `add_region()` migration: a `region_size` squared payload with no density (what a file
+  written before `surface_density` existed carries) is resampled to the terrain's density on
+  entry and keeps its painted material;
+* a real region file round trip at density 4: the payload bytes and the stored density both
+  survive save → unload → load;
+* that mip 0 pages are 1:1 crops of the dense payload at `page_size == span0`;
+* the render: with the array path the probe shows the block-origin material, with the virtual
+  texture on it shows the finer material, and the two frames differ. That last check is what
+  proves the shader evaluates the idweight cell on the payload's grid — before it did, a denser
+  payload rendered identically to density 1.
+
+## Far-field sparse virtual texture
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_sparse_runner.py --driver d3d12
+```
+
+Build the debug extension first. The far field is a **world-space** page grid that spans regions,
+which is the tier the region-aligned near field cannot express (its mip chain is capped at "one
+page = one region"). The test pins:
+
+* world addressing: a page is a fixed world square, and a page may span several regions;
+* page content texel by texel, border included: a border texel must read the **neighbouring**
+  region's payload, not a clamped copy of this page's own edge (a producer property — the shader
+  point-samples corners and never reads the border today);
+* the world-space mip chain: the page under the target is published at mip 0 while a page 181 m
+  away is published at mip 1, and that page holds no mip 0 entry;
+* the root pyramid: every texel of the coarsest `surface_svt_root_mips` levels is resident and
+  protected, and a page 6.4 km away (far outside the 256 m distance window) resolves through it;
+* invalidating a region's pages re-produces them from the payload and restores the frame;
+* array-free mode (`surface_array_enabled = false`): the frame stays **pixel identical** to the
+  array-backed one, the array layers hold no payload, and an edit still reaches the screen
+  because `invalidate_surface_pages()` drops the pages that carry it;
+* the safety gate: with both virtual texture tiers off the array must carry the channel again,
+  or every texel would render as material 0.
+
+Root pages are protected because they are the fallback of last resort: if one is evicted, a miss
+has nothing to show. Size `surface_svt_page_count` for the distance window **plus** the root
+pyramid, or the LRU will evict the near pages the test is about to look for.
+
+## AVT material pages and persisted SVT
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_material_runner.py --editor bin/godot.vt-test.exe
+```
+
+Runs the actual VT Pass on D3D12: verifies material-cache sampling independently
+of source texture bindings, terrain painting/rebaking, adaptive virtual image
+resizing, offline SVT mip generation, disk reload and SVT-only rendering.
+Use an engine containing the VT callback registry and rebuild the native addon.
+The older `vt_surface`, `vt_render`, `vt_sparse`, `vt_density`, `vt_demand` and
+`vt_perf` scripts explicitly select the diagnostic raw ID/weight mode to test
+that lower-level contract separately.
+
 ## Terrain virtual texture addressing contract
 
 ```powershell
@@ -271,3 +342,17 @@ It checks ASTC 8x8 HDR block sizing, source preservation, and uploaded format,
 and rejects engine errors even if the script prints PASS. Unsupported GPU
 formats use explicit decoded uploads; this does not test native mobile GPU
 support on a desktop adapter. Logs remain in the printed fixture directory.
+
+## Strict material VT and incremental SVT
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_fallback_runner.py
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_auto_bake_runner.py
+```
+
+The strict GPU test checks missing SVT with original materials still present,
+valid baked SVT output, and a selected AVT miss above otherwise valid SVT.
+The automatic bake test checks 500 ms stroke coalescing, affected region/parent
+updates, unchanged distant file hashes, zero idle bakes, and forced full regeneration.
+A second process then releases authoring texture resources and verifies that it
+uploads the saved SVT pages without generating replacements.

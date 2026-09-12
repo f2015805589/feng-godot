@@ -78,6 +78,39 @@ func _run_probe() -> void:
 	debug = 0
 	await _wait_frames(4)
 
+	# None is the first toolbar entry and the safe default. It must suppress
+	# brush settings and leave the native editor outside every editing tool.
+	var none_button: Button = ui.toolbar.get_button("None")
+	if none_button == null or not none_button.button_pressed or \
+		ui._selected_tool != Terrain3DEditor.TOOL_MAX or \
+		ui._selected_operation != Terrain3DEditor.OP_MAX or \
+		editor.get_tool() != Terrain3DEditor.TOOL_MAX or \
+		editor.get_operation() != Terrain3DEditor.OP_MAX or \
+		ui.tool_settings.select_brush_button.visible:
+		_fail("None toolbar entry was not the safe default: button=%s tool=%s op=%s brush_visible=%s" %
+			[none_button and none_button.button_pressed, editor.get_tool(), editor.get_operation(),
+			ui.tool_settings.select_brush_button.visible])
+		return
+	# Re-entering the node editor must preserve None rather than restoring a
+	# brush or region operation.
+	_edit(null)
+	await _wait_frames(2)
+	_edit(probe_terrain)
+	await _wait_frames(4)
+	if not _require_none_state("selection re-entry"):
+		return
+	var none_before: Color = probe_terrain.data.get_surface_maps()[0].get_pixel(32, 32)
+	var none_press := InputEventMouseButton.new()
+	none_press.button_index = MOUSE_BUTTON_LEFT
+	none_press.pressed = true
+	none_press.position = probe_viewport.get_mouse_position()
+	var none_result := _forward_3d_gui_input(probe_camera, none_press)
+	var none_after: Color = probe_terrain.data.get_surface_maps()[0].get_pixel(32, 32)
+	if none_result != AFTER_GUI_INPUT_PASS or editor.is_operating() or none_after != none_before:
+		_fail("None accepted a terrain edit input: result=%s operating=%s before=%s after=%s" %
+			[none_result, editor.is_operating(), none_before, none_after])
+		return
+
 	# The button-to-pair-field mapping is asserted by
 	# editor_pairroles.gd (Terrain3DAssetDock.role_writes_overlay_field) and the
 	# packed encoding of the pair fields by the press below, so this probe does not
@@ -164,3 +197,15 @@ func _run_probe() -> void:
 	_finished = true
 	print("PASS editor brush first GPU miss -> CPU fallback -> R16 CPU/GPU ID 1 -> outside release -> right navigation")
 	get_tree().quit(0)
+
+
+func _require_none_state(p_context: String) -> bool:
+	if ui._selected_tool == Terrain3DEditor.TOOL_MAX and \
+		ui._selected_operation == Terrain3DEditor.OP_MAX and \
+		editor.get_tool() == Terrain3DEditor.TOOL_MAX and \
+		editor.get_operation() == Terrain3DEditor.OP_MAX:
+		return true
+	_fail("None state was lost during %s: selected=%s/%s active=%s/%s" %
+		[ p_context, ui._selected_tool, ui._selected_operation,
+		editor.get_tool(), editor.get_operation() ])
+	return false

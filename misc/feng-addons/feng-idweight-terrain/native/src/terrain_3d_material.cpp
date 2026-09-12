@@ -30,21 +30,23 @@ void Terrain3DMaterial::_preload_shaders() {
 	_parse_shader(
 #include "shaders/editor_functions.glsl"
 			, "editor_functions");
+// Debug views are only needed by editor/debug extension builds. Keeping the include
+// behind DEBUG_ENABLED removes the raw GLSL (and its parsed snippets) from release
+// binaries; _apply_inserts still omits DEBUG_* markers from generated base shaders.
+#ifdef DEBUG_ENABLED
 	_parse_shader(
 #include "shaders/debug_views.glsl"
 			, "debug_views");
+#endif
 	_parse_shader(
 #include "shaders/displacement.glsl"
 			, "displacement");
-	_parse_shader(
-#include "shaders/dual_scaling.glsl"
-			, "dual_scaling");
 	_parse_shader(
 #include "shaders/macro_variation.glsl"
 			, "macro_variation");
 	_parse_shader(
 #include "shaders/max_regions.glsl"
-			, "macro_variation");
+			, "max_regions");
 	_parse_shader(
 #include "shaders/overlays.glsl"
 			, "overlays");
@@ -219,13 +221,6 @@ String Terrain3DMaterial::_generate_shader_code() const {
 	if (!_auto_shader_enabled) {
 		excludes.push_back("AUTO_SHADER_UNIFORMS");
 		excludes.push_back("AUTO_SHADER");
-	}
-	if (!_dual_scaling_enabled) {
-		excludes.push_back("DUAL_SCALING_UNIFORMS");
-		excludes.push_back("DUAL_SCALING");
-		excludes.push_back("DUAL_SCALING_CONDITION_0");
-		excludes.push_back("DUAL_SCALING_CONDITION_1");
-		excludes.push_back("DUAL_SCALING_MIX");
 	}
 	if (!_macro_variation_enabled) {
 		excludes.push_back("MACRO_VARIATION_UNIFORMS");
@@ -444,15 +439,6 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	}
 	Array insert_names;
 
-	// Whilst this currently does nothing, it can serve as placeholder for future refactor
-	// when useing pre-processor headers to control shader features.
-	//for (int i = 0; i < insert_names.size(); i++) {
-	//	String insert = _shader_code[insert_names[i]];
-	//	shader = shader.insert(idx, "\n\n" + insert);
-	//	idx += insert.length();
-	//}
-	//insert_names.clear();
-
 	// Insert before vertex()
 	regex->compile("void\\s+vertex\\s*\\(");
 	match = regex->search(shader);
@@ -464,9 +450,11 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	if (_terrain && _terrain->get_editor()) {
 		insert_names.push_back("EDITOR_DECAL_SETUP");
 	}
+#ifdef DEBUG_ENABLED
 	if (_debug_view_heightmap) {
 		insert_names.push_back("DEBUG_HEIGHTMAP_SETUP");
 	}
+#endif
 	if (_show_contours) {
 		insert_names.push_back("OVERLAY_CONTOURS_SETUP");
 	}
@@ -507,6 +495,7 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	}
 
 	// Debug Views
+#ifdef DEBUG_ENABLED
 	if (_debug_view_checkered) {
 		insert_names.push_back("DEBUG_CHECKERED");
 	}
@@ -559,6 +548,7 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	if (_debug_view_displacement_buffer) {
 		insert_names.push_back("DEBUG_DISPLACEMENT_BUFFER");
 	}
+#endif
 	// Overlays
 	if (_show_contours) {
 		insert_names.push_back("OVERLAY_CONTOURS_RENDER");
@@ -749,6 +739,19 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	}
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
+	PackedFloat32Array block_sizes = _terrain->get_surface_vt_block_sizes();
+	PackedFloat32Array padded_sizes;
+	padded_sizes.resize(_max_regions);
+	padded_sizes.fill(float(_terrain->get_surface_vt_pages_per_axis()));
+	for (int i = 0; i < MIN(block_sizes.size(), padded_sizes.size()); i++) { padded_sizes[i] = block_sizes[i]; }
+	RS->material_set_param(p_material, "_surface_vt_block_sizes", padded_sizes);
+	Dictionary material_pages = _terrain->get_vt_material_textures();
+	RID baked_albedo = material_pages.get("albedo_height", RID());
+	RS->material_set_param(p_material, "_surface_material_enabled", baked_albedo.is_valid());
+	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_debug_direct_material() && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
+	RS->material_set_param(p_material, "_surface_material_albedo", baked_albedo.is_valid() ? baked_albedo : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_normal", baked_albedo.is_valid() ? RID(material_pages["normal_roughness"]) : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_params", baked_albedo.is_valid() ? RID(material_pages["params"]) : _generated_dummy.get_rid());
 	if (vt_on) {
 		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
 		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());
@@ -764,10 +767,34 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
 	}
 
+	// Far field (sparse virtual texture). World-space page grid, no block table: the
+	// shader derives the page from the world position and the same centre offset the
+	// CPU uses.
+	const bool svt_on = _terrain->is_surface_svt_enabled() && _terrain->get_surface_svt() != nullptr &&
+			_terrain->get_surface_svt()->is_initialized();
+	Terrain3DVirtualTexture *svt = _terrain->get_surface_svt();
+	RS->material_set_param(p_material, "_surface_svt_enabled", svt_on);
+	if (svt_on) {
+		RS->material_set_param(p_material, "_surface_svt_page_world", _terrain->get_surface_svt_page_world());
+		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());
+		RS->material_set_param(p_material, "_surface_svt_page_border", svt->get_page_border());
+		RS->material_set_param(p_material, "_surface_svt_max_mip", svt->get_world_max_mip());
+		RS->material_set_param(p_material, "_surface_svt_indirection_size", svt->get_indirection_size());
+		RS->material_set_param(p_material, "_surface_svt_indirection", svt->get_indirection_rid());
+		RS->material_set_param(p_material, "_surface_svt_atlas", svt->get_atlas_rid());
+	} else {
+		RS->material_set_param(p_material, "_surface_svt_indirection", _generated_dummy_2d.get_rid());
+		RS->material_set_param(p_material, "_surface_svt_atlas", _generated_dummy.get_rid());
+	}
+
 	real_t region_size = real_t(_terrain->get_region_size());
 	LOG(EXTREME, "Setting region size in material: ", region_size);
 	RS->material_set_param(p_material, "_region_size", region_size);
 	RS->material_set_param(p_material, "_region_texel_size", 1.0f / region_size);
+	// The stored surface payload is region_size * surface_density squared, while the
+	// array fallback stays at region_size. The shader scales the virtual texture's
+	// texel lookups by this and leaves the array lookup in region texels.
+	RS->material_set_param(p_material, "_surface_density", _terrain->get_surface_density());
 
 	if (p_flags & REGION_ARRAYS) {
 		if (data->get_region_count() > 0) {
@@ -908,9 +935,10 @@ void Terrain3DMaterial::destroy() {
 }
 
 void Terrain3DMaterial::update(uint32_t p_flags) {
-	if (p_flags & FULL_REBUILD) {
+	if (p_flags & (FULL_REBUILD & ~UPDATE_ARRAYS)) {
 		_update_shader();
 	}
+	if (_terrain && (p_flags & TEXTURE_ARRAYS)) { _terrain->invalidate_vt_materials(); }
 	_update_uniforms(_material, p_flags);
 	IS_INIT(VOID);
 	if (_terrain->get_tessellation_level() > 0) {
@@ -955,8 +983,7 @@ void Terrain3DMaterial::set_auto_shader_enabled(const bool p_enabled) {
 
 void Terrain3DMaterial::set_dual_scaling_enabled(const bool p_enabled) {
 	SET_IF_DIFF(_dual_scaling_enabled, p_enabled);
-	LOG(INFO, "Enable dual scaling: ", _dual_scaling_enabled);
-	_update_shader();
+	// Serialized compatibility value; the removed material path has no runtime shader code.
 }
 
 void Terrain3DMaterial::set_macro_variation_enabled(const bool p_enabled) {
@@ -1561,7 +1588,7 @@ void Terrain3DMaterial::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "world_background", PROPERTY_HINT_ENUM, "None,Flat,Noise"), "set_world_background", "get_world_background");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_filtering", PROPERTY_HINT_ENUM, "Linear Anisotropic,Linear,Nearest Anisotropic,Nearest"), "set_texture_filtering", "get_texture_filtering");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_shader_enabled"), "set_auto_shader_enabled", "get_auto_shader_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dual_scaling_enabled"), "set_dual_scaling_enabled", "get_dual_scaling_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dual_scaling_enabled", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_dual_scaling_enabled", "get_dual_scaling_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "macro_variation_enabled"), "set_macro_variation_enabled", "get_macro_variation_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "projection_enabled"), "set_projection_enabled", "get_projection_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_regions", PROPERTY_HINT_ENUM, "64:64,128:128,256:256,512:512,1024:1024"), "set_max_regions", "get_max_regions");

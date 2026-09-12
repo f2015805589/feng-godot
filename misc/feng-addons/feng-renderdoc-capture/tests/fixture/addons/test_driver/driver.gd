@@ -28,10 +28,11 @@ func _run():
 	var renderer := compositor.renderer as FengRenderer
 	assert(renderer != null)
 	# Exercise the authored native/custom list that the RenderDoc validator
-	# expects. Sky is moved to list slot 03 (after Deferred Lighting's required
+	# expects. Sky is moved to list slot 04 (after VT and Deferred Lighting's required
 	# prerequisites), and Tint gets a UTF-8 resource name used for its GPU label.
 	var authored: Array[FengPass] = []
 	var sky: FengBuiltinPass = null
+	var vt: FengBuiltinPass = null
 	var tint: FengPass = null
 	for value in renderer.passes:
 		assert(value is FengPass)
@@ -39,17 +40,26 @@ func _run():
 		authored.append(pass_entry)
 		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 7:
 			sky = pass_entry as FengBuiltinPass
+		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 16:
+			vt = pass_entry as FengBuiltinPass
 		if String(pass_entry.stable_id) == "library:tint":
 			tint = pass_entry
 	assert(sky != null)
+	assert(vt != null)
 	assert(tint != null)
 	authored.erase(sky)
-	authored.insert(3, sky)
+	authored.insert(4, sky)
+	# There are no registered VT producers in this fixture. Keep this enabled
+	# and rename it so the capture proves an idle configured pass still emits its
+	# authored label without submitting page work.
+	vt.resource_name = "VT Idle Marker"
 	tint.resource_name = "RenderDoc Tint 中文"
 	renderer.passes = authored
 	renderer.apply(compositor)
 	await get_tree().process_frame
-	assert(renderer.passes.find(sky) == 3)
+	assert(renderer.passes.find(sky) == 4)
+	assert(renderer.passes.find(vt) == 0)
+	assert(vt.resource_name == "VT Idle Marker")
 	assert(tint.resource_name == "RenderDoc Tint 中文")
 	var pending: Array[Node] = [get_tree().root]
 	var plugin: Node

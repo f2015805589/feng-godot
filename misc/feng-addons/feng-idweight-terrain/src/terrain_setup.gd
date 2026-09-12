@@ -50,7 +50,9 @@ func initialize_directory(directory: String) -> void:
 	if terrain.data.get_region_count() > 0:
 		EditorInterface.mark_scene_as_unsaved()
 		return
-	terrain.region_size = 64
+	# New terrain uses the standard 512 m region. Existing terrain data returned
+	# above keeps its serialized region size and is never rewritten here.
+	terrain.region_size = 512
 	var position := Vector3.ZERO
 	var viewport := EditorInterface.get_editor_viewport_3d()
 	if is_instance_valid(plugin.viewport):

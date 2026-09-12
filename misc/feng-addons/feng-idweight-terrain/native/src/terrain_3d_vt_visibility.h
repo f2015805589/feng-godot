@@ -1,0 +1,80 @@
+// Shared camera-visible terrain footprint queries for AVT and SVT demand.
+#pragma once
+#include <godot_cpp/classes/camera3d.hpp>
+#include <godot_cpp/classes/viewport.hpp>
+#include <vector>
+#include <algorithm>
+
+namespace TerrainVT {
+using namespace godot;
+struct VisiblePatch {
+	Vector3 nearest;
+	float distance = 1e30f;
+	float density = 0.f;
+};
+struct VisibleView {
+	TypedArray<Plane> planes;
+	Vector3 eye;
+	Vector3 forward;
+	float focal = 1.f;
+	bool orthographic = false;
+	explicit VisibleView(Camera3D *camera) {
+		planes = camera->get_frustum();
+		eye = camera->get_global_position();
+		forward = -camera->get_global_basis().get_column(2).normalized();
+		orthographic = camera->get_projection() == Camera3D::PROJECTION_ORTHOGONAL;
+		const float height = camera->get_viewport() ? camera->get_viewport()->get_visible_rect().size.y : 720.f;
+		focal = MAX(1.f, height) * Math::abs(camera->get_camera_projection()[1].y) * 0.5f;
+	}
+	bool sample(const Rect2 &rect, const Vector2 &heights, VisiblePatch &result) const {
+		result = VisiblePatch();
+		// Clip terrain footprint planes, not just the region centre. This keeps a
+		// visible edge eligible when the centre or the point below the eye is off-screen.
+		for (float height : { heights.x, (heights.x + heights.y) * 0.5f, heights.y }) {
+			std::vector<Vector3> polygon = {
+				Vector3(rect.position.x, height, rect.position.y),
+				Vector3(rect.get_end().x, height, rect.position.y),
+				Vector3(rect.get_end().x, height, rect.get_end().y),
+				Vector3(rect.position.x, height, rect.get_end().y) };
+			for (int i = 0; i < planes.size() && !polygon.empty(); ++i) {
+				const Plane plane = planes[i];
+				std::vector<Vector3> clipped;
+				Vector3 previous = polygon.back();
+				float previous_distance = plane.distance_to(previous);
+				for (const Vector3 &point : polygon) {
+					const float distance = plane.distance_to(point);
+					if ((distance <= 0.f) != (previous_distance <= 0.f)) {
+						clipped.push_back(previous.lerp(point, previous_distance / (previous_distance - distance)));
+					}
+					if (distance <= 0.f) { clipped.push_back(point); }
+					previous = point;
+					previous_distance = distance;
+				}
+				polygon.swap(clipped);
+			}
+			if (polygon.size() < 3) { continue; }
+			const Vector3 ground(eye.x, height, eye.z);
+			bool positive = false, negative = false;
+			Vector3 nearest;
+			float best = 1e30f;
+			for (size_t i = 0; i < polygon.size(); ++i) {
+				const Vector3 a = polygon[i], b = polygon[(i + 1) % polygon.size()];
+				const Vector3 edge = b - a;
+				const float side = edge.cross(ground - a).y;
+				positive |= side > 0.0001f;
+				negative |= side < -0.0001f;
+				const Vector3 point = a + edge * CLAMP((ground - a).dot(edge) / MAX(0.000001f, edge.length_squared()), 0.f, 1.f);
+				const float distance = point.distance_squared_to(eye);
+				if (distance < best) { best = distance; nearest = point; }
+			}
+			if (!(positive && negative)) { nearest = ground; best = ground.distance_squared_to(eye); }
+			if (best < result.distance * result.distance) {
+				result.nearest = nearest;
+				result.distance = Math::sqrt(best);
+				result.density = orthographic ? focal : focal / MAX(0.01f, (nearest - eye).dot(forward));
+			}
+		}
+		return result.distance < 1e29f;
+	}
+};
+} // namespace TerrainVT

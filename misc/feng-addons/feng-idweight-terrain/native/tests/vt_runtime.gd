@@ -144,6 +144,10 @@ func test_mip_walk(vt: Terrain3DVirtualTexture) -> void:
 	# The fallback is real coverage, not a fabrication: the mip 2 page spans 4x4 mip 0
 	# pages, so a neighbouring mip 0 page resolves to the same coarse slot.
 	require(vt.lookup_page(sector, 0, 3, 3) == slot, "a mip 0 page inside the coarse page must resolve to it")
+	var fine := vt.request_page(sector, 0, 0, 0)
+	require(fine >= 0 and fine != slot, "requesting detail must allocate past an existing coarse fallback")
+	require(vt.get_indirection_slot(ox, oy, 0) == fine, "detail must be published at the requested mip")
+	require(vt.lookup_page(sector, 0, 3, 3) == slot, "refining one page must preserve its neighbours' fallback")
 	# Pages outside the sector block do not exist at all.
 	require(vt.lookup_page(sector, 0, 8, 0) == -1, "a page past the block edge must not resolve")
 	require(vt.lookup_page(sector, 3, 1, 0) == -1, "mip 3 of a block 8 has a single page")
@@ -190,6 +194,75 @@ func test_lru_and_protection() -> void:
 	require(not vt.is_initialized(), "clear should release the GPU resources")
 	vt.free()
 
+func test_shared_pool() -> void:
+	var near := make_vt(2)
+	require(near.initialize() == OK, "near view should initialize")
+	require(near.register_sector(Vector2i.ZERO, 8), "near view should register a sector")
+	var far := make_vt(2)
+	far.set_world_space(true)
+	far.share_physical_pool(near)
+	require(far.initialize() == OK, "far view should initialize against the shared pool")
+	require(near.get_atlas_rid() == far.get_atlas_rid(),
+			"near and far views must expose one physical atlas RID")
+	require(near.get_indirection_rid() != far.get_indirection_rid(),
+			"near and far views must retain separate indirection textures")
+	var near_slot: int = near.request_page(Vector2i.ZERO, 0, 0, 0)
+	var far_slot: int = far.request_world_page(0, 0, 0)
+	require(near_slot == 0 and far_slot == 1, "shared pool should assign global slot IDs")
+	var owners: Array = far.get_page_metadata(far_slot)
+	require(owners.size() == 1 and int(owners[0]["kind"]) == 1 and bool(owners[0]["world_space"]),
+			"slot metadata should expose the far owner type and world addressing")
+	# The next miss is serviced by the global LRU, even though the request arrives
+	# through the near view. Its reverse owner callback must invalidate near's table.
+	var recycled: int = near.request_page(Vector2i.ZERO, 0, 1, 0)
+	require(recycled == near_slot, "the shared LRU should recycle the near slot")
+	var near_origin_x: int = near.get_sector_block_origin_x(Vector2i.ZERO)
+	var near_origin_y: int = near.get_sector_block_origin_y(Vector2i.ZERO)
+	require(near.get_indirection_slot(near_origin_x, near_origin_y, 0) == INVALID,
+			"cross-view eviction must invalidate the old owner's indirection")
+	near.free()
+	far.free()
+	print("PASS shared physical page pool keeps global slots and cross-view eviction")
+
+func test_sector_resize_preserves_pages() -> void:
+	var vt := make_vt(8)
+	require(vt.initialize() == OK, "resize view should initialize")
+	var sector := Vector2i.ZERO
+	require(vt.register_sector(sector, 4), "resize sector should register")
+	var old_origin_x: int = vt.get_sector_block_origin_x(sector)
+	var old_origin_y: int = vt.get_sector_block_origin_y(sector)
+	var slot: int = vt.request_page(sector, 0, 1, 1)
+	require(slot >= 0, "resize fixture page should allocate")
+	require(vt.write_page(slot, make_page(12345)), "resize fixture has a distinctive payload")
+	require(vt.resize_sector(sector, 8), "registered sector should resize to a larger POT block")
+	var new_origin_x: int = vt.get_sector_block_origin_x(sector)
+	var new_origin_y: int = vt.get_sector_block_origin_y(sector)
+	require(vt.lookup_page(sector, 0, 2, 2) == slot,
+			"doubling resolution must keep the payload over the same world footprint through mip 1")
+	require(vt.lookup_page(sector, 0, 1, 1) == -1,
+			"old local coordinates must not display a payload from a different world footprint")
+	require(vt.get_indirection_slot((new_origin_x >> 1) + 1, (new_origin_y >> 1) + 1, 1) == slot,
+			"resizing must shift the cached page's mip as well as its virtual address")
+	var metadata: Array = vt.get_page_metadata(slot)
+	require(metadata.size() == 1 and int(metadata[0]["mip"]) == 1 and
+				int(metadata[0]["virtual_x"]) == (new_origin_x >> 1) + 1 and
+				int(metadata[0]["virtual_y"]) == (new_origin_y >> 1) + 1,
+			"resizing must update reverse owner metadata")
+	var fine_slot: int = vt.request_page(sector, 0, 6, 6)
+	require(vt.resize_sector(sector, 4), "registered sector should shrink back to a POT block")
+	require(vt.lookup_page(sector, 0, 1, 1) == slot,
+			"shrinking must restore the cached page's original world footprint")
+	require(vt.get_page_metadata(fine_slot).is_empty(),
+			"shrinking must discard fine pages that cannot represent a whole coarser footprint")
+	vt.commit()
+	require(int(round(vt.read_page(slot).get_pixel(2, 2).r * 65535.0)) == 12345,
+			"the remapped physical payload remains unchanged")
+	vt.protect_page(slot, true)
+	vt.release_page(sector, 0, 1, 1)
+	require(not vt.is_page_protected(slot), "released roots must not pin the next owner of their slot")
+	vt.free()
+	print("PASS sector resize remaps cached pages and reverse metadata")
+
 func run() -> void:
 	var vt := make_vt(8)
 	require(vt.initialize() == OK, "vt should initialize")
@@ -205,6 +278,10 @@ func run() -> void:
 		test_mip_walk(vt)
 	if not failed:
 		test_lru_and_protection()
+	if not failed:
+		test_shared_pool()
+	if not failed:
+		test_sector_resize_preserves_pages()
 	# Object is not reference counted, so the GPU resources have to be released by hand.
 	vt.free()
 	if failed:

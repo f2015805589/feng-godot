@@ -651,6 +651,54 @@ public:
 		return true;
 	}
 
+	// Reallocate one sector's POT virtual image while retaining the old owner
+	// information when allocation cannot satisfy the new size. The caller can
+	// remap cached indirection entries from old_info to new_info after this returns.
+	// Keeping this transaction in the address allocator avoids exposing its quadtree
+	// bookkeeping to the runtime page pool.
+	bool try_resize_avt_image(int sector_x, int sector_y, int virtual_image_size,
+			VirtualImageOwner &owner, ImageInfo &old_info, ImageInfo &new_info) {
+		auto sector_found = sector_to_image_.find({ sector_x, sector_y });
+		if (sector_found == sector_to_image_.end()) {
+			owner = VirtualImageOwner();
+			old_info = ImageInfo();
+			new_info = ImageInfo();
+			return false;
+		}
+		old_info = sector_found->second;
+		if (!is_valid_image_size(virtual_image_size)) {
+			owner = node_owners_[old_info.node_index];
+			new_info = old_info;
+			return false;
+		}
+		const VirtualImageOwner old_owner = node_owners_[old_info.node_index];
+		owner = old_owner;
+		if (old_info.size == virtual_image_size) {
+			new_info = old_info;
+			return true;
+		}
+		if (!remove_image(old_owner)) {
+			new_info = ImageInfo();
+			return false;
+		}
+
+		VirtualImageOwner resized_owner = create_owner(sector_x, sector_y, VirtualImageKind::AVT);
+		if (try_allocate_free(resized_owner, virtual_image_size,
+				AllocationOrder::LOW_COORDINATES_FIRST, new_info)) {
+			sector_to_image_[{ sector_x, sector_y }] = new_info;
+			owner = resized_owner;
+			return true;
+		}
+
+		// Roll back the exact old node and owner. No other allocation occurs while
+		// this method runs, so the node is still free and can be restored verbatim.
+		mark_allocated(old_info, old_owner);
+		sector_to_image_[{ sector_x, sector_y }] = old_info;
+		owner = old_owner;
+		new_info = old_info;
+		return false;
+	}
+
 	// Node index 0 is the root and has no parent; parent chain stops at root.
 	static int parent_of(int node_index) {
 		return (node_index - 1) >> 2;

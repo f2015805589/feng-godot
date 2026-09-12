@@ -79,6 +79,27 @@ uniform highp sampler2DArray _surface_vt_atlas : repeat_disable;
 // Layer -> virtual page block origin inside the indirection, or (-1, -1) when that
 // sector has no block. Indexed by the layer slot the chunk directory returns.
 uniform vec2 _surface_vt_blocks[MAX_REGIONS];
+uniform float _surface_vt_block_sizes[MAX_REGIONS];
+uniform bool _surface_material_enabled = false;
+uniform bool _surface_material_required = false;
+uniform highp sampler2DArray _surface_material_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_material_normal : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_material_params : filter_linear, repeat_disable;
+// Stored surface resolution in texels per region texel. The virtual texture's pages
+// are produced from the dense payload, so its page grid and texel lookups are in
+// source texels; the region texture array stays at region_size and is untouched.
+uniform int _surface_density = 1;
+// Far field: a world-space page grid at a coarser texel density. The page coordinate is
+// derived from the world position and the grid is centred on the origin, so no per-layer
+// block table is needed -- the CPU uses the same `(page + half) >> mip` formula.
+uniform bool _surface_svt_enabled = false;
+uniform float _surface_svt_page_world = 512.0;
+uniform int _surface_svt_page_size = 256;
+uniform int _surface_svt_page_border = 4;
+uniform int _surface_svt_max_mip = 4;
+uniform int _surface_svt_indirection_size = 1024;
+uniform highp sampler2D _surface_svt_indirection : filter_nearest, repeat_disable;
+uniform highp sampler2DArray _surface_svt_atlas : repeat_disable;
 uniform float _texture_normal_depth_array[32];
 uniform float _texture_ao_strength_array[32];
 uniform float _texture_ao_affect_array[32];
@@ -114,9 +135,6 @@ group_uniforms;
 
 //INSERT: AUTO_SHADER_UNIFORMS
 //INSERT: DISPLACEMENT_UNIFORMS
-// Dual scaling was tied to the removed legacy control-map material path. Its
-// uniforms are no longer declared here; restore //INSERT: DUAL_SCALING_UNIFORMS
-// and sample the far scale inside accumulate_idweight_layer() to bring it back.
 //INSERT: MACRO_VARIATION_UNIFORMS
 
 group_uniforms mipmaps;
@@ -186,11 +204,12 @@ ivec3 get_index_coord(const vec2 uv) {
 // when the sector has no block or no page covers this texel, and the caller falls back
 // to the region texture array.
 //
-// The page grid mirrors Terrain3DData::produce_surface_pages: the sector block is
-// _surface_vt_pages_per_axis pages per axis at local mip 0, so mip m has
-// max(1, pages >> m) pages per axis covering region_size / pages_at_mip region texels.
-bool surface_vt_sample(const ivec2 p_chunk, const int p_layer, const ivec2 p_local_texel,
-		out uint r_value) {
+// `p_surface_texel` is a texel of the *stored* payload, i.e. on the surface_density
+// grid, not a region texel. The page grid mirrors Terrain3DData::produce_surface_pages:
+// the sector block is _surface_vt_pages_per_axis pages per axis at local mip 0, so mip
+// m has max(1, pages >> m) pages per axis covering region_size * density /
+// pages_at_mip source texels each.
+bool surface_vt_sample(const int p_layer, const ivec2 p_surface_texel, out uint r_value) {
 	if (!_surface_vt_enabled || p_layer < 0 || p_layer >= MAX_REGIONS) {
 		return false;
 	}
@@ -200,12 +219,15 @@ bool surface_vt_sample(const ivec2 p_chunk, const int p_layer, const ivec2 p_loc
 	}
 	// Not `const`: Godot's shader language requires constant expressions there and
 	// these depend on uniforms.
-	int span0 = max(1, _surface_vt_region_size / _surface_vt_pages_per_axis);
+	int density = max(1, _surface_density);
+	int block_size = max(1, int(_surface_vt_block_sizes[p_layer]));
+	int span0 = max(1, _surface_vt_region_size * density / block_size);
 	// The chunk's own layer slot already identifies the sector, so the virtual page is
 	// the block origin plus the local page coordinate.
-	ivec2 virtual_page = ivec2(block) + p_local_texel / span0;
+	ivec2 virtual_page = ivec2(block) + p_surface_texel / span0;
 	float stored = float(_surface_vt_page_size + 2 * _surface_vt_page_border);
 	for (int mip = 0; mip <= _surface_vt_max_local_mip; mip++) {
+		if ((1 << mip) > block_size) { break; }
 		ivec2 coord = virtual_page >> mip;
 		int level_size = max(1, _surface_vt_indirection_size >> mip);
 		// textureLod rather than texelFetch: the mip level is dynamic here.
@@ -216,10 +238,10 @@ bool surface_vt_sample(const ivec2 p_chunk, const int p_layer, const ivec2 p_loc
 		if (slot == 65535 || slot < 0) {
 			continue;
 		}
-		// Region texel origin of the matched page, relative to the sector.
+		// Source texel origin of the matched page, relative to the sector.
 		int span = span0 << mip;
 		ivec2 page_origin = ((coord << mip) - ivec2(block)) * span0;
-		ivec2 offset = p_local_texel - page_origin;
+		ivec2 offset = p_surface_texel - page_origin;
 		ivec2 page_texel = clamp(offset * _surface_vt_page_size / span + _surface_vt_page_border,
 				ivec2(0), ivec2(int(stored) - 1));
 		r_value = uint(texelFetch(_surface_vt_atlas, ivec3(page_texel, slot), 0).r * 65535.0 + 0.5);
@@ -228,17 +250,139 @@ bool surface_vt_sample(const ivec2 p_chunk, const int p_layer, const ivec2 p_loc
 	return false;
 }
 
-// The surface id/weight for one corner, virtual texture first with the region array as
-// the fallback. `p_uv` is the world XZ that produced `p_index`.
-uint get_surface_value(const vec2 p_uv, const ivec3 p_index) {
+// The surface id/weight for one corner: virtual texture first, region texture array as
+// the fallback. `p_index` addresses the array layer (region texels, 1 texel/m) and
+// `p_surface_texel` addresses the stored payload (the surface_density grid). Both are
+// needed because the array deliberately stays at region_size while the payload is
+// density times finer.
+// Far field through the sparse virtual texture. `p_world` is world XZ in metres. The
+// page grid is world aligned and centred on the origin, so the page is `floor(world /
+// page_world)` and the indirection coordinate is `(page + half) >> mip`, which is the
+// same formula Terrain3DVirtualTexture::world_page_to_virtual publishes with. Walking
+// mips fine to coarse is what lets one coarse page serve a whole distant valley.
+bool surface_svt_sample(const vec2 p_world, out uint r_value) {
+	if (!_surface_svt_enabled) {
+		return false;
+	}
+	int half = _surface_svt_indirection_size >> 1;
+	int stored = _surface_svt_page_size + 2 * _surface_svt_page_border;
+	ivec2 page = ivec2(floor(p_world / _surface_svt_page_world));
+	if (any(lessThan(page + ivec2(half), ivec2(0))) || any(greaterThanEqual(page + ivec2(half), ivec2(_surface_svt_indirection_size)))) { return false; }
+	for (int mip = 0; mip <= _surface_svt_max_mip; mip++) {
+		ivec2 coord = (page + ivec2(half)) >> mip;
+		int level_size = max(1, _surface_svt_indirection_size >> mip);
+		float slot_f = textureLod(_surface_svt_indirection,
+				(vec2(clamp(coord, ivec2(0), ivec2(level_size - 1))) + 0.5) / float(level_size),
+				float(mip)).r;
+		int slot = int(slot_f + 0.5);
+		if (slot == 65535 || slot < 0) {
+			continue;
+		}
+		float mip_world = _surface_svt_page_world * float(1 << mip);
+		vec2 page_origin = vec2(page >> mip) * mip_world;
+		// Not clamped to [0, 1]: a position just outside the page core belongs to the
+		// page's border texels, which the producer filled from the neighbours.
+		vec2 offset = (p_world - page_origin) / mip_world;
+		ivec2 page_texel = clamp(ivec2(floor(offset * float(_surface_svt_page_size))) +
+						_surface_svt_page_border,
+				ivec2(0), ivec2(stored - 1));
+		r_value = uint(texelFetch(_surface_svt_atlas, ivec3(page_texel, slot), 0).r * 65535.0 + 0.5);
+		return true;
+	}
+	return false;
+}
+
+// Both virtual address spaces resolve into the same material arrays. A missing
+// or pending page tries ancestors in its selected view, then displays diagnostics.
+bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
+		out material r_mat, out vec3 r_normal) {
+	if (slot < 0 || slot == 65535) { return false; }
+	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
+	vec4 params = textureLod(_surface_material_params, coord, 0.0);
+	if (params.a < 0.99) { return false; }
+	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
+	vec4 normal_rough = textureLod(_surface_material_normal, coord, 0.0);
+	r_mat = material(albedo, normal_rough, params.x, params.y, params.z, 1.0);
+	r_normal = normal_rough.xyz;
+	return true;
+}
+
+bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
+	if (!_surface_material_enabled) { return false; }
+	float region_world = _region_size * _vertex_spacing;
+	ivec2 region = ivec2(floor(world / region_world));
+	int layer = get_region_layer(region);
+	if (_surface_vt_enabled && layer >= 0 && layer < MAX_REGIONS) {
+		ivec2 block = ivec2(_surface_vt_blocks[layer]);
+		int size = max(1, int(_surface_vt_block_sizes[layer]));
+		vec2 local = world / region_world - vec2(region);
+		ivec2 virtual_page = block + ivec2(floor(local * float(size)));
+		if (block.x >= 0) {
+			for (int mip = 0; mip <= _surface_vt_max_local_mip; mip++) {
+				if ((1 << mip) > size) { break; }
+				ivec2 coord = virtual_page >> mip;
+				int level_size = max(1, _surface_vt_indirection_size >> mip);
+				int slot = int(textureLod(_surface_vt_indirection, (vec2(coord) + 0.5) / float(level_size), float(mip)).r + 0.5);
+				vec2 offset = fract(local * float(max(1, size >> mip)));
+				if (surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, r_mat, r_normal)) { return true; }
+			}
+			return false; // This region is assigned to AVT; expose its missing pages.
+		}
+	}
+	if (_surface_svt_enabled) {
+		ivec2 page = ivec2(floor(world / _surface_svt_page_world));
+		ivec2 virtual_page = page + ivec2(_surface_svt_indirection_size >> 1);
+		if (all(greaterThanEqual(virtual_page, ivec2(0))) && all(lessThan(virtual_page, ivec2(_surface_svt_indirection_size)))) {
+			for (int mip = 0; mip <= _surface_svt_max_mip; mip++) {
+				ivec2 coord = virtual_page >> mip;
+				int level_size = max(1, _surface_svt_indirection_size >> mip);
+				int slot = int(textureLod(_surface_svt_indirection, (vec2(coord) + 0.5) / float(level_size), float(mip)).r + 0.5);
+				vec2 offset = fract(world / (_surface_svt_page_world * float(1 << mip)));
+				if (surface_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, r_mat, r_normal)) { return true; }
+			}
+		}
+	}
+	return false;
+}
+
+// The surface id/weight for one corner: near field first, then the far field, then the
+// region texture array. `p_index` addresses the array layer (region texels, 1 texel/m),
+// `p_surface_texel` addresses the stored payload (the surface_density grid) and
+// `p_world` is the corner's world XZ, which is what the far field is addressed by. All
+// three are needed because the array stays at region_size, the near field is region
+// aligned and the far field is world aligned.
+uint get_surface_value(const vec2 p_world, const ivec3 p_index, const ivec2 p_surface_texel) {
 	if (p_index.z > -1 && _surface_vt_enabled) {
 		uint value;
-		vec2 r_uv = round(p_uv);
-		if (surface_vt_sample(ivec2(floor(r_uv * _region_texel_size)), p_index.z, p_index.xy, value)) {
+		if (surface_vt_sample(p_index.z, p_surface_texel, value)) {
 			return value;
 		}
 	}
-	return uint(texelFetch(_surface_maps, p_index, 0).r * 65535.0 + 0.5);
+	if (_surface_svt_enabled) {
+		uint value;
+		if (surface_svt_sample(p_world, value)) {
+			return value;
+		}
+	}
+	return p_index.z >= 0 ? uint(texelFetch(_surface_maps, p_index, 0).r * 65535.0 + 0.5) : 0u;
+}
+
+// World XZ of one corner of the surface cell that contains p_uv. At density 1 this is
+// the integer metre corner the array and near field have always used.
+vec2 surface_corner(const vec2 p_uv, const ivec2 p_offset) {
+	float density = float(max(1, _surface_density));
+	return (floor(p_uv * density) + vec2(p_offset)) * (_vertex_spacing / density);
+}
+
+// Corner texel of the density cell that contains p_uv (world XZ in metres), on the
+// stored payload's grid. At density 1 this is the region texel the array fallback and
+// the pre-density shader used, bit for bit.
+ivec2 get_surface_texel(const vec2 p_uv, const ivec2 p_offset) {
+	// Not `const`: these derive from a uniform, which Godot's shader language does not
+	// accept in a constant expression.
+	float density = float(max(1, _surface_density));
+	vec2 size = vec2(_region_size) * density;
+	return ivec2(mod(floor(p_uv * density) + vec2(p_offset), size));
 }
 
 // Takes in descaled (world_space / region_size) world to region space XZ (UV2) coordinates, returns vec3 with:
@@ -603,16 +747,46 @@ void fragment() {
 		BINORMAL = mat3(VIEW_MATRIX) * w_binormal;
 	}
 
+	material mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
+	vec3 blendedNormalWS = vec3(0.0);
+	uint materialCount = 1u;
+	bool material_cached = surface_material_sample(v_vertex.xz, mat, blendedNormalWS);
+	bool material_missing = _surface_material_required && !material_cached;
+	if (material_missing) {
+		// VT mode is strict: missing/pending material pages are visible diagnostics,
+		// never silently replaced by the original terrain evaluator.
+		mat = material(vec4(1.0, 0.0, 1.0, 0.0), vec4(w_normal, 1.0), 0., 1., 0., 1.);
+		blendedNormalWS = w_normal;
+	} else if (!material_cached) {
+	// GLSL out parameters are undefined on a cache miss. Initialize the source
+	// accumulator after that call, rather than relying on values it overwrote.
+	mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
+	blendedNormalWS = vec3(0.0);
 	// ── Hydra IdWeight surface evaluation ──
 	// Precise corner reads from the R16 surface map (no sampler interpolation).
 	// R16 UNORM texelFetch returns a normalized float; scale back to the packed
 	// 16-bit integer exactly (65536 discrete values fit float precisely).
+	// The idweight cell is evaluated on the stored payload's own grid when the virtual
+	// texture serves it. At density 1 that is exactly Hydra's per-cell contract, and a
+	// denser payload is the same contract on a dyadically subdivided cell: the fixed
+	// BL-TR diagonal survives dyadic subdivision, so the triangle selection below stays
+	// consistent with the mesh. With the virtual texture off the region array is
+	// authoritative, so the cell keeps the mesh's 1 m grid and the array path renders
+	// exactly as it did before surface_density existed.
+	vec2 surface_weight = _surface_vt_enabled ? fract(uv * float(max(1, _surface_density))) : weight;
 	uvec4 surface = uvec4(0u);
-	surface[3] = get_surface_value(index_id + offsets.xx, index[3]);
+	surface[3] = get_surface_value(surface_corner(uv, ivec2(offsets.xx)), index[3],
+			get_surface_texel(uv, ivec2(offsets.xx)));
+	// At distant mips only one corner is fetched. All triangle vertices must use
+	// that sample; zero-filled corners would spuriously blend material ID 0.
+	surface = uvec4(surface[3]);
 	if (bilerp) {
-		surface[0] = get_surface_value(index_id + offsets.xy, index[0]);
-		surface[1] = get_surface_value(index_id + offsets.yy, index[1]);
-		surface[2] = get_surface_value(index_id + offsets.yx, index[2]);
+		surface[0] = get_surface_value(surface_corner(uv, ivec2(offsets.xy)), index[0],
+				get_surface_texel(uv, ivec2(offsets.xy)));
+		surface[1] = get_surface_value(surface_corner(uv, ivec2(offsets.yy)), index[1],
+				get_surface_texel(uv, ivec2(offsets.yy)));
+		surface[2] = get_surface_value(surface_corner(uv, ivec2(offsets.yx)), index[2],
+				get_surface_texel(uv, ivec2(offsets.yx)));
 	}
 
 	// Cell-local coordinates and triangle selection.
@@ -623,7 +797,7 @@ void fragment() {
 	// The Godot clipmap must therefore keep that same diagonal on every LOD
 	// (see Terrain3DMesher::_generate_mesh); a per-cell alternating diagonal
 	// makes this interpolation disagree with the triangles actually rendered.
-	vec2 local = weight;
+	vec2 local = surface_weight;
 	bool is_lower_left = local.x > local.y;
 	uint p0 = surface[3]; // BL
 	uint p1 = is_lower_left ? surface[2] : surface[0]; // BR or TL
@@ -648,7 +822,6 @@ void fragment() {
 	float materialResidualSelector = hydra_idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
 	uvec3 materialIds;
 	vec3 materialWeights;
-	uint materialCount;
 	hydra_idweight_select_budgeted_3(values, materialResidualSelector, materialIds, materialWeights, materialCount);
 
 	// Random triplanar projection (Hydra). The slope factor changes stochastic
@@ -668,23 +841,17 @@ void fragment() {
 		HYDRA_IDWEIGHT_SLOPE_FULL_DISTANCE_SQ,
 		HYDRA_IDWEIGHT_SLOPE_MAX_DISTANCE_SQ,
 		dot(v_vertex - v_camera_pos, v_vertex - v_camera_pos));
+	// Persistent material pages use a camera-independent slope policy. Cache
+	// misses use that same policy, avoiding a different material while refining.
+	if (_surface_material_enabled && (_surface_vt_enabled || _surface_svt_enabled)) {
+		slopeDistanceBlend = 1.0;
+	}
 	IdWeightContributions pairValues = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
 	overlayWeight = 0.0;
 	hydra_idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
 	hydra_idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
 	hydra_idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
 	hydra_idweight_select_budgeted_3(pairValues, materialResidualSelector, materialIds, materialWeights, materialCount);
-
-	if (materialCount == 0u) {
-		ALBEDO = vec3(1.0, 0.0, 1.0);
-		ROUGHNESS = 1.0;
-		SPECULAR = 0.0;
-		NORMAL_MAP = vec3(0.5, 0.5, 1.0);
-		AO = 1.0;
-	} else {
-	// Struct to accumulate all texture data.
-	material mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
-	vec3 blendedNormalWS = vec3(0.0);
 
 	// 3 texture lookups max (one per selected layer).
 	for (int layerIndex = 0; layerIndex < HYDRA_IDWEIGHT_MAX_LAYERS; layerIndex++) {
@@ -702,6 +869,14 @@ void fragment() {
 	mat.normal_map_depth *= weight_inv;
 	mat.ao *= weight_inv;
 	mat.ao_affect *= weight_inv;
+	} // Source evaluation on a cache miss.
+	if (materialCount == 0u) {
+		ALBEDO = vec3(1.0, 0.0, 1.0);
+		ROUGHNESS = 1.0;
+		SPECULAR = 0.0;
+		NORMAL_MAP = vec3(0.5, 0.5, 1.0);
+		AO = 1.0;
+	} else {
 
 	// Hydra normal: blended world-space layer normals converted to terrain
 	// tangent space (Hydra IdWeightWorldNormalToTerrain).
@@ -734,6 +909,15 @@ void fragment() {
 //INSERT: OUTPUT_SPECULAR_NONE
 //INSERT: OUTPUT_NORMAL_MAP
 //INSERT: OUTPUT_AMBIENT_OCCLUSION
+	if (material_missing) {
+		float checker = mod(floor(FRAGCOORD.x / 12.0) + floor(FRAGCOORD.y / 12.0), 2.0);
+		vec3 diagnostic = mix(vec3(1.0, 0.0, 1.0), vec3(0.1, 0.02, 0.1), checker);
+		ALBEDO = vec3(0.0);
+		EMISSION = diagnostic;
+		AO = 1.0;
+		SPECULAR = 0.0;
+		ROUGHNESS = 1.0;
+	}
 
 	} // else (materialCount > 0)
 }

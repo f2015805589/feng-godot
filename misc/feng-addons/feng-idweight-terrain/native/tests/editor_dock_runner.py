@@ -130,6 +130,7 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
         "input": "PASS editor brush first GPU miss -> CPU fallback -> R16 CPU/GPU ID 1 -> outside release -> right navigation",
         "setup": "PASS terrain setup, Scene texture/mesh painting, Add Region, and saved reload",
         "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches Hydra's pair fields",
+        "svt_inspector": "PASS native SVT Inspector full-bake action and progress",
     }[test]
     if marker not in output:
         return 1
@@ -145,7 +146,7 @@ def main() -> int:
         help="graphical Godot editor executable (the console build still creates a window)",
     )
     parser.add_argument("--driver", default="d3d12")
-    parser.add_argument("--test", choices=["dock", "input", "setup", "pairroles"], default="dock")
+    parser.add_argument("--test", choices=["dock", "input", "setup", "pairroles", "svt_inspector"], default="dock")
     args = parser.parse_args()
     editor = args.editor.resolve()
     if not editor.is_file():

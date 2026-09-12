@@ -11,6 +11,7 @@ extends EditorPlugin
 
 const MENU_TEXTURE_ARRAY: int = 1
 const MENU_TERRAIN_MAPS: int = 2
+const MENU_VT_EDITOR: int = 4
 const MENU_DEBUG_SHADED: int = 10
 const MENU_DEBUG_HEIGHTMAP: int = 11
 const MENU_DEBUG_CONTROL_IDS: int = 12
@@ -39,9 +40,32 @@ func _require(condition: bool, message: String) -> bool:
 	return false
 
 
+func _has_property(target: Object, property_name: StringName) -> bool:
+	for property_info: Dictionary in target.get_property_list():
+		if StringName(property_info.get("name", "")) == property_name:
+			return true
+	return false
+
+
 func _wait_frames(count: int = 1) -> void:
 	for _i in count:
 		await get_tree().process_frame
+
+
+func _wait_for_editor_progress_dialog() -> bool:
+	for _i in 360:
+		var progress_open := false
+		for candidate: Node in get_tree().root.find_children("*", "ProgressDialog", true, false):
+			if candidate is Window and candidate.visible:
+				progress_open = true
+				break
+			if candidate is Control and candidate.is_visible_in_tree():
+				progress_open = true
+				break
+		if not progress_open:
+			return true
+		await get_tree().process_frame
+	return false
 
 
 func _wait_for_management_menu() -> MenuButton:
@@ -117,18 +141,51 @@ func _run() -> void:
 	var scene_root := Node3D.new()
 	scene_root.name = "TerrainDockEditorTest"
 	var terrain := Terrain3D.new()
+	if not _require(_has_property(terrain, &"surface_svt_auto_bake"),
+			"Terrain3D did not expose the SVT Auto Bake setting"):
+		return
+	if not _require(bool(terrain.get(&"surface_svt_auto_bake")),
+			"SVT Auto Bake should default to enabled"):
+		return
+	# Keep fixture construction deterministic; the UI toggle below covers the
+	# enabled state without starting a bake while regions are being assembled.
+	terrain.set(&"surface_svt_auto_bake", false)
 	terrain.name = "Terrain3D"
+	terrain.region_size = 64
+	terrain.vt_page_size = 32
+	terrain.vt_page_border = 2
+	terrain.vt_page_count = 64
+	terrain.vt_pages_per_update = 4
+	terrain.surface_svt_page_world = 64
+	terrain.surface_svt_max_mip = 1
+	DirAccess.make_dir_recursive_absolute("user://editor-vt")
+	terrain.data_directory = "user://editor-vt"
 	terrain.assets = Terrain3DAssets.new()
 	for id in 2:
 		var asset := Terrain3DTextureAsset.new()
 		asset.id = id
+		asset.albedo_texture = _solid_texture(32, Color("e34b4b") if id == 0 else Color("4bd36a"))
+		asset.normal_texture = _solid_texture(32, Color(0.5, 0.5, 1.0, 1.0))
 		terrain.assets.set_texture_asset(id, asset)
 	var mesh_asset := Terrain3DMeshAsset.new()
 	terrain.assets.set_mesh_asset(0, mesh_asset)
 	scene_root.add_child(terrain)
 	terrain.owner = scene_root
+	var camera := Camera3D.new()
+	camera.name = "TerrainVTTestCamera"
+	camera.position = Vector3(64.0, 160.0, 32.0)
+	camera.rotation_degrees.x = -90.0
+	camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+	camera.size = 160.0
+	camera.current = true
+	scene_root.add_child(camera)
 	EditorInterface.add_root_node(scene_root)
 	await _wait_frames(40)
+	terrain.set_camera(camera)
+	# Apply the compact bake geometry after Terrain3DData has adopted its
+	# defaults. This keeps the fixture to two mip-0 tiles and one parent tile.
+	terrain.region_size = 64
+	terrain.surface_svt_page_world = 64
 
 	terrain.data.add_region_blank(Vector2i.ZERO)
 	# Selection drives the real feng-idweight-terrain EditorPlugin _edit path,
@@ -144,7 +201,96 @@ func _run() -> void:
 	if not _require(EditorInterface.get_inspector().get_edited_object() == terrain,
 			"selecting Terrain3D did not reach the production editor plugin"):
 		return
+	# The production Inspector owns the VT Page foldout under Surface VT. The
+	# custom control must be inside the native EditorInspectorSection so its
+	# visibility follows the real subgroup, rather than living in the asset dock.
+	await _wait_frames(4)
+	var inspector := EditorInterface.get_inspector()
+	var inspector_page_section := inspector.find_child("TerrainVTPageSection", true, false) as Control
+	if not _require(inspector_page_section != null,
+			"Terrain3D Inspector did not create the Surface VT VT Page content"):
+		return
+	if not _require(bool(inspector_page_section.get_meta("native_vt_page", false)),
+			"Inspector VT Page content did not come from the native Surface VT/VT Page subgroup"):
+		return
+	var inspector_open_button := inspector_page_section.find_child("TerrainVTPageOpenOverview", true, false) as Button
+	if not _require(inspector_open_button != null,
+			"Inspector VT Page section did not expose its overview action"):
+		return
+	var native_page_section := _find_ancestor_class(inspector_page_section, "EditorInspectorSection")
+	if not _require(native_page_section != null,
+			"Inspector VT Page content is not attached to the native VT Page subgroup"):
+		return
+	var inspector_svt_controls := inspector.find_child("TerrainSVTBakeControls", true, false) as Control
+	var inspector_svt_bake_button := inspector.find_child("TerrainSVTBakeAllButton", true, false) as Button
+	var inspector_svt_progress := inspector.find_child("TerrainSVTBakeProgress", true, false) as Label
+	if not _require(inspector_svt_controls != null and
+			bool(inspector_svt_controls.get_meta("native_svt_group", false)) and
+			inspector_svt_bake_button != null and inspector_svt_progress != null,
+			"native Surface VT/SVT subgroup did not add the Bake All button and progress"):
+		return
+	var native_svt_section := _find_ancestor_class(inspector_svt_controls, "EditorInspectorSection")
+	if not _require(native_svt_section != null,
+			"inspector Bake All controls are not nested under a native inspector foldout"):
+		return
+	var svt_inspector_sections: Array[Control] = []
+	section_node = inspector_svt_controls.get_parent()
+	while section_node:
+		if section_node.get_class() == "EditorInspectorSection":
+			svt_inspector_sections.push_front(section_node as Control)
+		section_node = section_node.get_parent()
+	for inspector_section: Control in svt_inspector_sections:
+		inspector_section.call("unfold")
+	await _wait_frames(2)
+	if not _require(inspector_svt_bake_button.is_visible_in_tree(),
+			"native SVT foldout did not expose Bake All SVT Pages"):
+		return
+	native_svt_section.call("fold")
+	await _wait_frames(2)
+	if not _require(not inspector_svt_bake_button.is_visible_in_tree(),
+			"SVT Bake All control did not follow its native foldout visibility"):
+		return
+	native_svt_section.call("unfold")
+	await _wait_frames(2)
+	# Surface VT is itself a foldable group, so open every native section on the
+	# path before checking the VT Page child. This exercises the actual nested
+	# inspector hierarchy instead of relying on a detached custom control.
+	var inspector_sections: Array[Control] = []
+	var section_node: Node = inspector_page_section.get_parent()
+	while section_node:
+		if section_node.get_class() == "EditorInspectorSection":
+			inspector_sections.push_front(section_node as Control)
+		section_node = section_node.get_parent()
+	for inspector_section: Control in inspector_sections:
+		inspector_section.call("unfold")
+	await _wait_frames(2)
+	await _wait_frames(2)
+	if not _require(inspector_open_button.is_visible_in_tree(),
+			"native VT Page subgroup did not expose its folded content when unfolded"):
+		return
+	native_page_section.call("fold")
+	await _wait_frames(2)
+	if not _require(not inspector_open_button.is_visible_in_tree(),
+			"native VT Page subgroup fold did not hide the custom content"):
+		return
+	native_page_section.call("unfold")
+	await _wait_frames(2)
+	inspector_open_button.pressed.emit()
+	await _wait_frames(4)
+	var inspector_vt_editor: Window = dock.vt_editor
+	if not _require(inspector_vt_editor != null and inspector_vt_editor.visible,
+			"Inspector VT Page overview action did not open Surface VT Editor"):
+		return
+	if not _require(inspector_vt_editor.hierarchy.get_selected() != null and
+			inspector_vt_editor.hierarchy.get_selected().get_metadata(0) == "pages",
+			"Inspector VT Page overview action did not select the VT Page view"):
+		return
+	inspector_vt_editor.hide()
 
+	var progress_dialog_closed := await _wait_for_editor_progress_dialog()
+	if not _require(progress_dialog_closed,
+			"editor ProgressDialog did not close before dock pointer regression"):
+		return
 	await _click(dock.meshes_btn)
 	if not _require(dock.current_list == dock.mesh_list, "routed click on Meshes failed"):
 		return
@@ -211,6 +357,236 @@ func _run() -> void:
 	if not _require(EditorInterface.get_inspector().get_edited_object() == terrain.data,
 			"Terrain Maps menu action did not inspect terrain.data"):
 		return
+	terrain.data.add_region_blank(Vector2i(1, 0))
+	management_popup.id_pressed.emit(MENU_VT_EDITOR)
+	await _wait_frames(4)
+	var vt_editor: Window = dock.vt_editor
+	if not _require(vt_editor != null and vt_editor.visible,
+			"Surface VT Editor menu action did not open the editor window"):
+		return
+	var surface_item: TreeItem = vt_editor.hierarchy.get_root().get_first_child()
+	if not _require(surface_item != null and surface_item.get_text(0) == "Surface VT",
+			"VT editor did not create the Surface VT hierarchy root"):
+		return
+	var settings_item: TreeItem = surface_item.get_first_child()
+	var avt_item: TreeItem = settings_item.get_next() if settings_item else null
+	var svt_item: TreeItem = avt_item.get_next() if avt_item else null
+	var pages_item: TreeItem = svt_item.get_next() if svt_item else null
+	if not _require(settings_item != null and settings_item.get_text(0) == "VT Setting" and
+			avt_item != null and avt_item.get_text(0) == "AVT" and
+			svt_item != null and svt_item.get_text(0) == "SVT" and
+			pages_item != null and pages_item.get_text(0) == "VT Page",
+			"VT editor hierarchy did not expose VT Setting, AVT, SVT, and VT Page groups"):
+		return
+	var avt_pages: TreeItem = avt_item.get_first_child()
+	var svt_pages: TreeItem = svt_item.get_first_child()
+	if not _require(avt_pages != null and avt_pages.get_text(0) == "VT Page" and
+			svt_pages != null and svt_pages.get_text(0) == "VT Page" and
+			avt_pages.get_metadata(0) == "avt_pages" and
+			svt_pages.get_metadata(0) == "svt_pages",
+			"VT editor hierarchy did not expose collapsible AVT/SVT VT Page groups"):
+		return
+	var surface_was_collapsed: bool = surface_item.collapsed
+	surface_item.collapsed = true
+	if not _require(surface_item.collapsed and not surface_was_collapsed,
+			"Surface VT hierarchy root did not collapse"):
+		return
+	surface_item.collapsed = false
+	var pages_was_collapsed: bool = pages_item.collapsed
+	pages_item.collapsed = true
+	if not _require(pages_item.collapsed and not pages_was_collapsed,
+			"VT Page hierarchy group did not collapse"):
+		return
+	pages_item.collapsed = false
+	settings_item.select(0)
+	await _wait_frames(2)
+	if not _require(vt_editor.settings_panel.visible and vt_editor.page_size_spin != null and
+			vt_editor.page_border_spin != null and vt_editor.page_count_spin != null and
+			vt_editor.pages_per_update_spin != null and vt_editor.adaptive_button != null,
+			"VT Setting group did not expose unified page controls"):
+		return
+	if not _require(vt_editor.baked_mip_selector != null,
+			"VT Page view did not expose a baked mip selector"):
+		return
+	svt_item.select(0)
+	await _wait_frames(2)
+	if not _require(vt_editor.svt_panel.visible and vt_editor.svt_auto_bake_button != null and
+			vt_editor.auto_bake_hint != null and vt_editor.bake_button != null and
+			vt_editor.bake_status != null,
+			"SVT section did not expose Auto Bake, full-bake, and progress controls"):
+		return
+	if not _require(not vt_editor.svt_auto_bake_button.button_pressed and
+			vt_editor.auto_bake_hint.text.find("500 ms") >= 0 and
+			vt_editor.bake_button.text == "Bake All SVT Pages",
+			"SVT controls did not reflect the disabled fixture setting and full-bake guidance"):
+		return
+	vt_editor.svt_auto_bake_button.set_pressed_no_signal(true)
+	vt_editor.svt_auto_bake_button.toggled.emit(true)
+	if not _require(bool(terrain.get(&"surface_svt_auto_bake")) and
+			vt_editor.auto_bake_hint.text.find("incrementally") >= 0 and
+			vt_editor.auto_bake_hint.text.find("500 ms") >= 0,
+			"Auto Bake did not update the native setting and 500 ms incremental guidance"):
+		return
+	vt_editor._refresh_bake_status({
+		"auto_bake": true,
+		"auto_pending_regions": 2,
+		"bake_incremental": true,
+		"bake_total": 4,
+		"bake_done": 1,
+		"bake_pending": 3,
+	})
+	if not _require(vt_editor.bake_status.text.find("Automatic incremental SVT bake") >= 0 and
+			vt_editor.bake_status.text.find("1/4") >= 0 and
+			vt_editor.bake_status.text.find("2 changed regions") >= 0,
+			"SVT status did not display automatic incremental progress"):
+		return
+	vt_editor.svt_auto_bake_button.set_pressed_no_signal(false)
+	vt_editor.svt_auto_bake_button.toggled.emit(false)
+	if not _require(not bool(terrain.get(&"surface_svt_auto_bake")) and
+			vt_editor.auto_bake_hint.text.find("Auto Bake is off") >= 0,
+			"Auto Bake did not disable through the SVT control"):
+		return
+	vt_editor._refresh_bake_status({
+		"auto_bake": false,
+		"auto_pending_regions": 2,
+		"bake_incremental": false,
+		"bake_total": 0,
+		"bake_done": 0,
+		"bake_pending": 0,
+	})
+	if not _require(vt_editor.bake_status.text.find("Auto Bake off") >= 0 and
+			vt_editor.bake_status.text.find("queued") < 0,
+			"disabled Auto Bake must not imply queued regions will be rebaked"):
+		return
+	vt_editor._refresh_bake_status({
+		"auto_bake": false,
+		"bake_incremental": false,
+		"bake_total": 4,
+		"bake_done": 2,
+		"bake_pending": 2,
+	})
+	if not _require(vt_editor.bake_status.text.find("Manual full SVT bake progress") >= 0 and
+			vt_editor.bake_status.text.find("2/4") >= 0,
+			"SVT status did not display manual full-bake progress"):
+		return
+	settings_item.select(0)
+	await _wait_frames(2)
+	vt_editor._refresh_overview()
+	await _wait_frames(2)
+	if not _require(vt_editor.overview.overview_texture != null,
+			"VT editor did not build the cached terrain height overview"):
+		return
+	var overview_size: Vector2 = vt_editor.overview.overview_texture.get_size()
+	if not _require(maxf(overview_size.x, overview_size.y) >= 256.0,
+			"VT overview must preserve detail within a region, not one pixel per region"):
+		return
+	if not _require(is_equal_approx(overview_size.x / overview_size.y, 2.0),
+			"stitched overview must preserve a two-region world's aspect ratio"):
+		return
+	if not _require(vt_editor.overview_label.text.find("overview") >= 0,
+			"VT overview must state whether it is a material stitch or height fallback"):
+		return
+	pages_item.select(0)
+	await _wait_frames(2)
+	vt_editor._refresh_all()
+	if not _require(vt_editor._selected_hierarchy_kind == "pages",
+			"VT Page view was not selected before the full bake"):
+		return
+	# Exercise the real offline SVT producer in the same editor fixture. Two 64 m
+	# regions produce two mip-0 tiles plus their shared parent mip, which keeps the
+	# assertion small while proving the overview consumes persisted material pages.
+	vt_editor.bake_button.pressed.emit()
+	var queued_bake := int(terrain.get_vt_settings().get("bake_total", 0))
+	if not _require(queued_bake >= 2, "SVT bake should queue geographical pages and their mip parent"):
+		return
+	if not _require(vt_editor.bake_status.text.find("Manual full SVT bake queued") >= 0,
+			"Bake All SVT Pages did not report that the manual full bake was queued"):
+		return
+	for _frame in 360:
+		await get_tree().process_frame
+		if int(terrain.get_vt_settings().get("bake_pending", 1)) == 0:
+			break
+	var completed_generation := int(terrain.get_vt_settings().get("bake_generation", 0))
+	for _frame in 120:
+		if vt_editor._last_bake_refresh_generation == completed_generation:
+			break
+		await get_tree().process_frame
+	var baked_pages: Array = terrain.get_svt_baked_pages()
+	print("EDITOR_SVT_BAKE queued=", queued_bake, " settings=", terrain.get_vt_settings(), " records=", baked_pages.size())
+	if not _require(baked_pages.size() >= 2,
+			"SVT bake should expose at least two persisted material page records"):
+		return
+	var baked_previews := 0
+	for baked_page: Dictionary in baked_pages:
+		if baked_page.get("preview", null) is Image and not baked_page.preview.is_empty():
+			baked_previews += 1
+	if not _require(baked_previews >= 2, "SVT records should contain material preview images"):
+		return
+	if not _require(completed_generation > 0 and
+			vt_editor._last_bake_refresh_generation == completed_generation and
+			vt_editor._selected_hierarchy_kind == "pages" and
+			vt_editor.overview_label.text.find("Baked") >= 0 and
+			vt_editor.overview.overview_texture != null,
+			"completed bake should refresh the VT Page list and stitched material overview once"):
+		return
+	var baked_overview_size: Vector2 = vt_editor.overview.overview_texture.get_size()
+	if not _require(maxf(baked_overview_size.x, baked_overview_size.y) >= 256.0,
+			"baked VT overview must retain detail within a region"):
+		return
+	vt_editor.get_texture().get_image().save_png("user://vt_editor_baked.png")
+	var click := InputEventMouseButton.new()
+	click.button_index = MOUSE_BUTTON_LEFT
+	click.pressed = true
+	var image_rect: Rect2 = vt_editor.overview._image_rect(Rect2(Vector2.ZERO, vt_editor.overview.size))
+	click.position = image_rect.position + image_rect.size * Vector2(0.25, 0.5)
+	if not _require(vt_editor.overview._location_at(click.position) == Vector2i.ZERO,
+			"VT overview hit testing must map the center to its terrain region"):
+		return
+	vt_editor.overview._gui_input(click)
+	await _wait_frames(4)
+	if not _require(EditorInterface.get_inspector().get_edited_object() == terrain.data.get_region(Vector2i.ZERO),
+			"clicking the VT overview did not inspect the corresponding terrain region"):
+		return
+	click.position = image_rect.position + image_rect.size * Vector2(0.75, 0.5)
+	vt_editor.overview._gui_input(click)
+	await _wait_frames(4)
+	if not _require(EditorInterface.get_inspector().get_edited_object() == terrain.data.get_region(Vector2i(1, 0)),
+			"clicking the second stitched region must inspect its own data"):
+		return
+	vt_editor.get_texture().get_image().save_png("user://vt_editor.png")
+	EditorInterface.inspect_object(terrain)
+	await _wait_frames(6)
+	var inspector_svt_button_after_bake := EditorInterface.get_inspector().find_child("TerrainSVTBakeAllButton", true, false) as Button
+	var inspector_svt_status_after_bake := EditorInterface.get_inspector().find_child("TerrainSVTBakeProgress", true, false) as Label
+	if not _require(inspector_svt_button_after_bake != null and inspector_svt_status_after_bake != null,
+			"SVT inspector Bake All controls disappeared after selecting Terrain3D again"):
+		return
+	var inspector_generation_before := int(terrain.get_vt_settings().get("bake_generation", 0))
+	inspector_svt_button_after_bake.pressed.emit()
+	var inspector_bake_settings: Dictionary = terrain.get_vt_settings()
+	if not _require(int(inspector_bake_settings.get("bake_generation", 0)) > inspector_generation_before and
+			int(inspector_bake_settings.get("bake_total", 0)) >= 2 and
+			inspector_svt_status_after_bake.text.find("Manual full SVT bake queued") >= 0,
+			"Inspector Bake All button did not call Terrain3D.bake_svt()"):
+		return
+	for _frame in 900:
+		await get_tree().process_frame
+		if int(terrain.get_vt_settings().get("bake_pending", 1)) == 0:
+			break
+	for _frame in 120:
+		if inspector_svt_status_after_bake.text.find("Manual full SVT bake complete") >= 0:
+			break
+		await get_tree().process_frame
+	var inspector_bake_finished: Dictionary = terrain.get_vt_settings()
+	if not _require(int(inspector_bake_finished.get("bake_pending", 1)) == 0 and
+			inspector_svt_status_after_bake.text.find("Manual full SVT bake complete") >= 0,
+			"Inspector SVT progress did not report the completed full bake"):
+		return
+	# Exercise the stale-object guard before closing the window. A closed or
+	# deselected terrain must not make refresh calls dereference old native data.
+	vt_editor.set_terrain(null)
+	vt_editor._refresh_overview()
+	vt_editor.hide()
 
 	var debug_menu := management_popup.find_child("DebugViews", true, false) as PopupMenu
 	if not _require(debug_menu != null, "Debug Views submenu was not created"):
@@ -244,3 +620,18 @@ func _click(control: Control) -> void:
 		event.pressed = pressed
 		viewport.push_input(event, true)
 		await _wait_frames(1)
+
+
+func _find_ancestor_class(p_control: Control, p_class: String) -> Control:
+	var node: Node = p_control.get_parent()
+	while node:
+		if node.get_class() == p_class:
+			return node as Control
+		node = node.get_parent()
+	return null
+
+
+func _solid_texture(p_size: int, p_color: Color) -> Texture2D:
+	var image := Image.create(p_size, p_size, false, Image.FORMAT_RGBA8)
+	image.fill(p_color)
+	return ImageTexture.create_from_image(image)

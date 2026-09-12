@@ -66,9 +66,10 @@ func run():
 	dock.plugin.terrain_setup.dialog.hide()
 	await frames(20)
 	print("INITIALIZED regions=",terrain.data.get_region_count()," size=",terrain.region_size," background=",terrain.material.world_background)
-	if terrain.data.get_region_count()!=1 or terrain.region_size!=64 or terrain.material.world_background!=0:
+	if terrain.data.get_region_count()!=1 or terrain.region_size!=512 or terrain.material.world_background!=0:
 		fail("initialization failed")
 		return
+	var region_world := float(terrain.region_size) * terrain.vertex_spacing
 	var entry=dock.texture_list.entries[1]
 	await click(entry.get_global_rect().position+entry.size*Vector2(0.5,0.65))
 	entry=dock.texture_list.entries[0]
@@ -79,8 +80,8 @@ func run():
 	var initial_cam = vp.get_camera_3d()
 	var center = Vector2(vp.size) * 0.5
 	var initial_hit = Plane(Vector3.UP,0).intersects_ray(initial_cam.project_ray_origin(center),initial_cam.project_ray_normal(center))
-	initial_hit.x = clampf(initial_hit.x, initial_loc.x * 64.0 + 0.5, initial_loc.x * 64.0 + 63.5)
-	initial_hit.z = clampf(initial_hit.z, initial_loc.y * 64.0 + 0.5, initial_loc.y * 64.0 + 63.5)
+	initial_hit.x = clampf(initial_hit.x, initial_loc.x * region_world + 0.5, initial_loc.x * region_world + region_world - 0.5)
+	initial_hit.z = clampf(initial_hit.z, initial_loc.y * region_world + 0.5, initial_loc.y * region_world + region_world - 0.5)
 	var point=container.get_global_rect().position + initial_cam.unproject_position(initial_hit)
 	await motion(point)
 	await click(point)
@@ -103,8 +104,8 @@ func run():
 	await frames(8)
 	var location = terrain.data.get_region_locations()[0]
 	var paint_hit = dock.plugin.mouse_global_position
-	paint_hit.x = clampf(paint_hit.x, location.x * 64.0 + 0.5, location.x * 64.0 + 63.5)
-	paint_hit.z = clampf(paint_hit.z, location.y * 64.0 + 0.5, location.y * 64.0 + 63.5)
+	paint_hit.x = clampf(paint_hit.x, location.x * region_world + 0.5, location.x * region_world + region_world - 0.5)
+	paint_hit.z = clampf(paint_hit.z, location.y * region_world + 0.5, location.y * region_world + region_world - 0.5)
 	paint_hit.y = 0.0
 	point = container.get_global_rect().position + vp.get_camera_3d().unproject_position(paint_hit)
 	for stroke in 3:

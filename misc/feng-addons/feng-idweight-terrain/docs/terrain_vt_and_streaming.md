@@ -1,5 +1,10 @@
 # Hydra terrain VT + chunk streaming → Godot port
 
+**Current implementation:** Surface VT has shared physical residency and settings,
+GPU material baking with adaptive AVT allocation, and persisted SVT material pages.
+The historical Hydra analysis below describes the reference architecture; see
+[current architecture](vt_architecture_review.md) for the Godot implementation.
+
 Read of Hydra's terrain stack (`D:\hydra\hydra-unity`, Unity 2022.3.59f1) and the plan for
 bringing the parts we need into `feng-idweight-terrain`. Written after reading the sources
 listed at the bottom; every Hydra number below has a `file:line` behind it.
@@ -341,14 +346,48 @@ clamped border. It also pins the distance rule (nearest sector publishes a mip 0
 64 m away publish mip 1 and no mip 0) and that a settled pass writes no pages and does not
 re-upload the indirection.
 
-**The honest limitation, and the next increment.** The source is `region_size²` R16, i.e. **1
-texel/m** at the default 256 m region. A page smaller than the region therefore *upsamples*: at
-Hydra's ratio (64 m pages, 256 texel pages) it is a 4× point upsample that adds no detail. The
-producer is resolution-agnostic, so raising the region's surface resolution (a new
-`surface_density` on `Terrain3DRegion`, 128 KB → 2 MB per region at 4 texels/m) is what turns
-this from "a correct paging layer" into "more detail than the array can afford to keep
-resident". Until then the array path stays authoritative and `surface_vt_enabled` defaults off,
-so nothing pays the extra lookup.
+**Resolution: `surface_density` — implemented.** The source used to be `region_size²` R16, i.e.
+**1 texel/m** at the default 256 m region, so a page smaller than the region only *upsampled*:
+at Hydra's ratio (64 m pages, 256 texel pages) a 4× point upsample that added no detail. The
+producer was resolution-agnostic, so raising the region's surface resolution is what turns this
+from "a correct paging layer" into "more detail than the array can afford to keep resident".
+
+`Terrain3D::surface_density` (1..8 texels per region texel, default 1) now sets it. It is a
+**terrain-wide** setting, and three rules keep it from becoming a regression:
+
+* **Terrain-wide, not per region.** The region texture array is one texture whose layers must
+  all be the same size, so regions cannot disagree. `Terrain3DData::change_surface_density()`
+  resamples every resident payload and re-uploads only the surface layers.
+* **The array stays at `region_size`.** `Terrain3DRegion::get_surface_map_array_image()` returns
+  a nearest `region_size²` reduction of the stored payload (block origin, never an average: the
+  payload is packed material IDs, not numbers). Growing the array with the density would
+  multiply resident VRAM by `density²` — 128 KB → 2 MB per region at density 4 — which is the
+  cost the virtual texture exists to avoid.
+* **Migration resamples; it never re-derives.** `ensure_surface_map()` resamples an existing
+  payload to the new size and only falls back to the legacy control map conversion when there is
+  no payload at all. A region file written before `surface_density` existed loads with density 1
+  and no key, and `add_region()` adopts the terrain's density through
+  `ensure_surface_density()`. Re-running the conversion there would wipe every painted material,
+  because after migration the control map no longer carries the material bits.
+
+Two costs to know about: `Terrain3DEditor::backup_region()` deep-copies the payload for undo, so
+a brush snapshot grows from 128 KB to 2 MB per region at density 4 (32 MB at region_size 1024);
+and the brush writes whole `density²` blocks, because it authors one region texel per step.
+
+**The shader had to move to the same grid.** The idweight cell used to be evaluated on the mesh's
+1 m grid (`floor(uv)`/`fract(uv)`), so a denser payload was unreachable: every corner read its
+block origin and the render was identical to density 1. With the virtual texture on, the cell is
+now evaluated on the payload's own grid (`fract(uv * density)` and `get_surface_texel()`). At
+density 1 that is bit-for-bit the old behaviour, and a denser payload is the same Hydra contract
+on a dyadically subdivided cell — the fixed BL-TR diagonal survives dyadic subdivision, so the
+triangle selection stays consistent with the clipmap mesh. With the virtual texture **off** the
+cell keeps the 1 m grid, so the array path renders exactly as it did before.
+
+Tests: `native/tests/vt_density.gd` + `vt_density_runner.py`. It pins the two sizes, the brush's
+block writes, a byte-exact 4 → 1 → 4 round trip, the `add_region()` migration of a legacy
+payload, a real region file round trip at density 4 (payload bytes and stored density both
+survive save → unload → load), mip 0 pages as 1:1 crops of the dense payload, and a render where
+the array path shows the block-origin material while the virtual texture shows the finer one.
 
 ### 4.7 Surface VT shader integration — implemented now
 
@@ -511,6 +550,65 @@ independently:
 * Height pages: 259×259 `R16` (257 core + 1 texel halo), page table carrying
   `resolvedLod` / `previousSlice` / `transition` for 12-render cross-fades.
 
+### 4.11 Far field: the AVT + SVT split — implemented now
+
+The near field above is region aligned, which caps its mip chain at "one page = one region"
+(`log2(pages_per_axis)` levels). A page bigger than a region cannot exist there, and a page that
+spans several regions cannot either. Hydra solves this with two address spaces — AVT near
+(global mips 0..8, per-sector virtual images) and SVT far (9+, a separate page format fed by
+baked cell textures). The port now has the same split, minus the baked-cell source:
+
+* **`Terrain3DVirtualTexture` gained a world-space mode** (`set_world_space(true)`). The page
+  grid is a regular world grid centred on the origin, so a page's block origin is a pure
+  function of its coordinate: no `VirtualImageAtlas`, no registration, no packing. CPU and
+  shader share one formula, `virtual = (page + half) >> mip`
+  (`world_page_to_virtual` / `get_world_page_virtual` / `surface_svt_sample`). `_request_virtual()`
+  is the shared core of both modes.
+* **`Terrain3DData::produce_sparse_surface_page()`** is world aligned: every page texel maps to a
+  world position and takes whichever region owns it, so a page may span regions and its border
+  texels come from the neighbours. The region-aligned producer now fills its border the same way
+  (`_sample_payload_world`), so a page seam reads real neighbouring data instead of a clamped
+  copy. Note this is a *producer* property: the shader point-samples (`texelFetch`) and resolves
+  each corner in its own page, so it never reads the border today. The border matters for a
+  future bilinear/`textureLod` sampler, not for the current one.
+* **The mip chain is world-space.** One mip 0 page covers `surface_svt_page_world` metres and
+  level `m` covers `2^m` times that, so a distant page is a handful of texels instead of a
+  distance-limited window. `_surface_svt_mip_for_page()` steps one level per doubling of the
+  distance, like the near field's rule.
+* **The root pyramid replaces the array as the fallback.** The coarsest
+  `surface_svt_root_mips` levels are always resident and **protected**, so a miss resolves to
+  coarse real data rather than nothing, and the near field's pages compete only among themselves
+  for the remaining slots. A root page that gets evicted would leave a miss with nothing to show,
+  which is why the protection exists.
+* **`surface_array_enabled`** turns the region texture array's surface upload off. The array
+  stays allocated (blank) so the material keeps a valid binding, but no payload is uploaded,
+  which is what removes the `density²` cost — 2 MB per resident region at density 4. The debug
+  views read the same lookup chain as the shaded path (`get_surface_value`), so they work with
+  the array disabled too. The gate is `is_surface_array_upload_needed()`: with **both** virtual
+  texture tiers off the array keeps carrying the channel regardless, because it is then the only
+  source and a blank array would render every texel as material 0. **Default is still `true`**:
+  the array-free path is implemented and verified (`vt_sparse.gd`), but flipping a default
+  changes what every existing project renders, and the VRAM/FPS difference has not been measured
+  on a real scene yet. Turning it off is the switch that completes the split.
+* **Edits invalidate pages.** Both tiers cache a region's payload, so
+  `Terrain3D::invalidate_surface_pages()` releases every page of every level that overlaps an
+  edited region (plus one page of margin, because a page's border is filled from its
+  neighbours). Without it an array-free configuration keeps rendering the material the page was
+  produced with until the LRU happens to evict it. `change_surface_density()` drops both atlases
+  outright, because page contents are resolution specific.
+
+Defaults: near field page 256 texels / 4 pages per axis (1:1 at density 4) with
+`surface_vt_page_count` 128 (the 512 m radius working set is roughly 50 pages, so 64 had no LRU
+headroom); far field page 512 m / 256 texels (0.5 texel/m at mip 0), `surface_svt_page_count`
+256, `surface_svt_root_mips` 2, `surface_svt_distance` 6144 m to the clipmap's reach.
+
+Tests: `native/tests/vt_sparse.gd` + `vt_sparse_runner.py`. It pins world addressing (a page is
+a fixed world square), the neighbour-filled borders texel by texel, the world-space mip chain (a
+page 181 m out is published at mip 1 while the page under the target stays at mip 0), the root
+pyramid covering every texel of the coarsest levels, a page 6.4 km away resolving through it,
+array-free rendering matching the array-backed frame pixel for pixel, and an edit with the array
+off being re-produced instead of served stale.
+
 ## 5. Traps found in Hydra — do not copy these
 
 1. **7×7 sector request grid vs 16-sector atlas capacity** at the default density (§2).
@@ -549,6 +647,9 @@ python misc/feng-addons/feng-idweight-terrain/native/tests/vt_surface_runner.py 
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_render_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_feedback_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_demand_runner.py --driver d3d12
+
+# Surface density: dense payload, coarse array, migration and the render grid
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_density_runner.py --driver d3d12
 
 # Existing terrain regressions
 python misc/feng-addons/feng-idweight-terrain/native/tests/texture_layers_runner.py --driver d3d12

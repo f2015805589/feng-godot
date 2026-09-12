@@ -122,6 +122,8 @@ func run() -> void:
 
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
+	# Verify the ID/weight residency contract separately from material baking.
+	terrain.set_vt_debug_direct_material(true)
 	terrain.free_editor_textures = false
 	scene.add_child(terrain)
 	root.add_child(scene)

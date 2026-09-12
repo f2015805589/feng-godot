@@ -10,6 +10,36 @@
 #include "terrain_surface_idweight.h"
 #include "terrain_3d_util.h"
 
+// Nearest resample of an R16 surface payload. The payload is packed material IDs,
+// not numbers, so averaging is meaningless: a coarser texel takes the block origin
+// and a finer one replicates its source texel over the whole block. Both directions
+// are `source = destination * src_size / dst_size`, the same rule the page producer
+// and the shader's array fallback use.
+static Ref<Image> _resample_surface_map(const Ref<Image> &p_source, const int p_dst_size) {
+	if (p_source.is_null() || p_dst_size <= 0 || p_source->get_format() != Image::Format(39)) {
+		return Ref<Image>();
+	}
+	const int src_size = p_source->get_width();
+	if (src_size <= 0 || p_source->get_height() != src_size) {
+		return Ref<Image>();
+	}
+	if (src_size == p_dst_size) {
+		return p_source;
+	}
+	const PackedByteArray source_bytes = p_source->get_data();
+	PackedByteArray destination;
+	destination.resize(int64_t(p_dst_size) * p_dst_size * 2);
+	for (int y = 0; y < p_dst_size; y++) {
+		const int src_y = int(int64_t(y) * src_size / p_dst_size);
+		for (int x = 0; x < p_dst_size; x++) {
+			const int src_x = int(int64_t(x) * src_size / p_dst_size);
+			destination.encode_u16((int64_t(y) * p_dst_size + x) * 2,
+					source_bytes.decode_u16((int64_t(src_y) * src_size + src_x) * 2));
+		}
+	}
+	return Image::create_from_data(p_dst_size, p_dst_size, false, Image::Format(39), destination);
+}
+
 /////////////////////
 // Public Functions
 /////////////////////
@@ -23,6 +53,7 @@ void Terrain3DRegion::clear() {
 	_color_map.unref();
 	_surface_map.unref();
 	_surface_version = 0;
+	_surface_density = SURFACE_DENSITY_MIN;
 	_instances.clear();
 	_vertex_spacing = 1.f;
 	_deleted = false;
@@ -176,7 +207,9 @@ void Terrain3DRegion::set_surface_map(const Ref<Image> &p_map) {
 		// packed 16-bit IDs bit-exactly.
 		ERR_FAIL_COND_MSG(p_map->get_format() != Image::Format(39) || p_map->has_mipmaps(),
 				"Surface data must be R16 UNORM without mipmaps; numeric format conversion corrupts packed IDs.");
-		ERR_FAIL_COND_MSG(!validate_map_size(p_map), "Surface map must match the region dimensions.");
+		ERR_FAIL_COND_MSG(p_map->get_width() != p_map->get_height() ||
+						p_map->get_width() != get_surface_map_size(),
+				"Surface map must be region_size * surface_density squared.");
 	}
 	if (_surface_map != p_map) {
 		_surface_map = p_map;
@@ -193,18 +226,98 @@ void Terrain3DRegion::set_surface_version(int p_version) {
 	}
 }
 
+void Terrain3DRegion::set_surface_density(const int p_density) {
+	int density = CLAMP(p_density, SURFACE_DENSITY_MIN, SURFACE_DENSITY_MAX);
+	if (_region_size > 0) {
+		density = MIN(density, MAX(SURFACE_DENSITY_MIN, SURFACE_MAP_MAX_SIZE / _region_size));
+	}
+	if (_surface_density == density) {
+		return;
+	}
+	_surface_density = density;
+	_modified = true;
+}
+
+int Terrain3DRegion::get_surface_map_size() const {
+	if (_region_size <= 0) {
+		return 0;
+	}
+	int density = CLAMP(_surface_density, SURFACE_DENSITY_MIN, SURFACE_DENSITY_MAX);
+	density = MIN(density, MAX(SURFACE_DENSITY_MIN, SURFACE_MAP_MAX_SIZE / _region_size));
+	return _region_size * density;
+}
+
+// The array layer stays at region_size: the texture array is the fallback and the
+// far field, and growing it with the density would multiply resident VRAM by
+// density squared, which is exactly the cost the virtual texture exists to avoid.
+Ref<Image> Terrain3DRegion::get_surface_map_array_image() const {
+	if (_surface_map.is_null()) {
+		return Ref<Image>();
+	}
+	if (_region_size <= 0 || _surface_map->get_width() == _region_size) {
+		return _surface_map;
+	}
+	return _resample_surface_map(_surface_map, _region_size);
+}
+
+// Adopts p_density and resamples an existing payload to it. A region without a
+// surface map stays without one: creating 2 MB images for every streamed region
+// that was never painted would be worse than the detail is worth.
+bool Terrain3DRegion::ensure_surface_density(const int p_density) {
+	const int previous_size = get_surface_map_size();
+	set_surface_density(p_density);
+	const int target = get_surface_map_size();
+	if (target <= 0 || _surface_map.is_null()) {
+		return false;
+	}
+	if (_surface_map->get_width() == target && _surface_map->get_height() == target) {
+		return false;
+	}
+	Ref<Image> resampled = _resample_surface_map(_surface_map, target);
+	if (resampled.is_null()) {
+		LOG(ERROR, "Region ", _location, ": cannot resample surface map from ", previous_size, " to ", target);
+		return false;
+	}
+	_surface_map = resampled;
+	_surface_version = TerrainSurfaceIdWeight::FORMAT_VERSION;
+	_modified = true;
+	LOG(INFO, "Region ", _location, ": surface map resampled ", previous_size, " -> ", target,
+			" (density ", _surface_density, ")");
+	return true;
+}
+
 // Lazily creates an R16 surface map for this region. If a legacy control map
 // exists, its material pair is converted; otherwise the map is blank (single
 // material 0). Non-material metadata (holes, navigation, UV, auto) stays in
 // the control map and is not migrated.
 bool Terrain3DRegion::ensure_surface_map() {
-	if (_surface_map.is_valid() && _surface_version == TerrainSurfaceIdWeight::FORMAT_VERSION) {
-		return true;
-	}
 	if (_region_size == 0) {
 		LOG(ERROR, "Set region_size before creating a surface map");
 		return false;
 	}
+	const int target = get_surface_map_size();
+	if (_surface_map.is_valid() && _surface_version == TerrainSurfaceIdWeight::FORMAT_VERSION &&
+			_surface_map->get_width() == target && _surface_map->get_height() == target) {
+		return true;
+	}
+	if (_surface_map.is_valid()) {
+		// An existing payload at the wrong size only needs a resample. It must NOT
+		// fall through to the legacy conversion below: after migration the control
+		// map no longer carries the painted materials, so re-converting would wipe
+		// the region back to material 0.
+		Ref<Image> resampled = _resample_surface_map(_surface_map, target);
+		if (resampled.is_null()) {
+			LOG(ERROR, "Region ", _location, ": cannot resample existing surface map to ", target);
+			return false;
+		}
+		_surface_map = resampled;
+		_surface_version = TerrainSurfaceIdWeight::FORMAT_VERSION;
+		_modified = true;
+		LOG(INFO, "Region ", _location, ": surface map resampled to ", target, " for density ", _surface_density);
+		return true;
+	}
+	// No payload yet: convert the legacy control map, or start blank, at the
+	// region's own resolution and replicate it up to the requested density.
 	PackedByteArray converted;
 	converted.resize(int64_t(_region_size) * _region_size * 2);
 	uint8_t *destination = converted.ptrw();
@@ -221,7 +334,16 @@ bool Terrain3DRegion::ensure_surface_map() {
 		// Blank: all-zero packed values encode single material 0.
 		memset(destination, 0, size_t(_region_size) * _region_size * 2);
 	}
-	_surface_map = Image::create_from_data(_region_size, _region_size, false, Image::Format(39), converted);
+	Ref<Image> base = Image::create_from_data(_region_size, _region_size, false, Image::Format(39), converted);
+	if (target == _region_size) {
+		_surface_map = base;
+	} else {
+		_surface_map = _resample_surface_map(base, target);
+		if (_surface_map.is_null()) {
+			LOG(ERROR, "Region ", _location, ": cannot create surface map at ", target);
+			return false;
+		}
+	}
 	_surface_version = TerrainSurfaceIdWeight::FORMAT_VERSION;
 	_modified = true;
 	return true;
@@ -267,7 +389,18 @@ Dictionary Terrain3DRegion::create_surface_conversion() const {
 	data["color_map"] = _color_map.is_valid() ? _color_map->duplicate() : Ref<Resource>();
 	data["instances"] = _instances.duplicate(true);
 	copy->set_data(data);
-	copy->set_surface_map(Image::create_from_data(_region_size, _region_size, false, Image::Format(39), converted));
+	// The converted payload is built at the region's own resolution and then
+	// replicated up to the copy's density, which set_data() carried over.
+	Ref<Image> surface = Image::create_from_data(_region_size, _region_size, false, Image::Format(39), converted);
+	const int target = copy->get_surface_map_size();
+	if (target > 0 && target != _region_size) {
+		surface = _resample_surface_map(surface, target);
+		if (surface.is_null()) {
+			report["error"] = "Cannot build a surface map at the region's density.";
+			return report;
+		}
+	}
+	copy->set_surface_map(surface);
 	copy->set_surface_version(TerrainSurfaceIdWeight::FORMAT_VERSION);
 	// The copied control map retains non-material metadata until the runtime split is complete.
 	report["region"] = copy;
@@ -463,6 +596,7 @@ void Terrain3DRegion::set_data(const Dictionary &p_data) {
 	SET_IF_HAS(_color_map, "color_map");
 	SET_IF_HAS(_surface_map, "surface_map");
 	SET_IF_HAS(_surface_version, "surface_version");
+	SET_IF_HAS(_surface_density, "surface_density");
 	SET_IF_HAS(_instances, "instances");
 }
 
@@ -481,6 +615,7 @@ Dictionary Terrain3DRegion::get_data() const {
 	dict["color_map"] = _color_map;
 	dict["surface_map"] = _surface_map;
 	dict["surface_version"] = _surface_version;
+	dict["surface_density"] = _surface_density;
 	dict["instances"] = _instances;
 	return dict;
 }
@@ -505,6 +640,7 @@ Ref<Terrain3DRegion> Terrain3DRegion::duplicate(const bool p_deep) {
 		dict["control_map"] = _control_map->duplicate();
 		dict["color_map"] = _color_map->duplicate();
 		dict["surface_version"] = _surface_version;
+		dict["surface_density"] = _surface_density;
 		if (_surface_map.is_valid()) {
 			dict["surface_map"] = _surface_map->duplicate();
 		}
@@ -579,7 +715,12 @@ void Terrain3DRegion::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_map"), &Terrain3DRegion::get_surface_map);
 	ClassDB::bind_method(D_METHOD("set_surface_version", "version"), &Terrain3DRegion::set_surface_version);
 	ClassDB::bind_method(D_METHOD("get_surface_version"), &Terrain3DRegion::get_surface_version);
+	ClassDB::bind_method(D_METHOD("set_surface_density", "density"), &Terrain3DRegion::set_surface_density);
+	ClassDB::bind_method(D_METHOD("get_surface_density"), &Terrain3DRegion::get_surface_density);
+	ClassDB::bind_method(D_METHOD("get_surface_map_size"), &Terrain3DRegion::get_surface_map_size);
+	ClassDB::bind_method(D_METHOD("get_surface_map_array_image"), &Terrain3DRegion::get_surface_map_array_image);
 	ClassDB::bind_method(D_METHOD("ensure_surface_map"), &Terrain3DRegion::ensure_surface_map);
+	ClassDB::bind_method(D_METHOD("ensure_surface_density", "density"), &Terrain3DRegion::ensure_surface_density);
 	ClassDB::bind_method(D_METHOD("create_surface_conversion"), &Terrain3DRegion::create_surface_conversion);
 	ClassDB::bind_method(D_METHOD("sanitize_maps"), &Terrain3DRegion::sanitize_maps);
 	ClassDB::bind_method(D_METHOD("sanitize_map", "map_type", "map"), &Terrain3DRegion::sanitize_map);
@@ -612,6 +753,7 @@ void Terrain3DRegion::_bind_methods() {
 
 	int ro_flags = PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY;
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_version", PROPERTY_HINT_NONE, "", ro_flags), "set_surface_version", "get_surface_version");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_density", PROPERTY_HINT_NONE, "", ro_flags), "set_surface_density", "get_surface_density");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "version", PROPERTY_HINT_NONE, "", ro_flags), "set_version", "get_version");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "region_size", PROPERTY_HINT_NONE, "", ro_flags), "set_region_size", "get_region_size");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vertex_spacing", PROPERTY_HINT_NONE, "", ro_flags), "set_vertex_spacing", "get_vertex_spacing");

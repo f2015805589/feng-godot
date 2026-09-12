@@ -17,8 +17,8 @@ func _init(p_native_id: int = -1, p_resource_name: String = "") -> void:
 
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()
-	if native_id < 0 or native_id > 15:
-		warnings.append("Native FRP pass id must be between 0 and 15.")
+	if native_id < 0 or native_id > 16:
+		warnings.append("Native FRP pass id must be between 0 and 16.")
 	return warnings
 
 func _validate_property(property: Dictionary) -> void:

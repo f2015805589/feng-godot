@@ -41,6 +41,14 @@ public: // Constants
 		COLOR_NAN, // TYPE_MAX, unused just in case someone indexes the array
 	};
 
+	// Surface source resolution, in texels per region texel (i.e. per metre at the
+	// default 1 m vertex spacing). 1 means the surface map is region_size squared.
+	static inline const int SURFACE_DENSITY_MIN = 1;
+	static inline const int SURFACE_DENSITY_MAX = 8;
+	// Hard cap on the stored surface map edge, so region_size 2048 cannot ask for a
+	// 16384 squared image (512 MB per region).
+	static inline const int SURFACE_MAP_MAX_SIZE = 8192;
+
 private:
 	// Saved data
 	real_t _version = 0.8f; // Set to first version to ensure we always upgrades this
@@ -53,6 +61,10 @@ private:
 	// Optional versioned surface payload. Legacy maps remain untouched during migration.
 	Ref<Image> _surface_map;
 	int _surface_version = 0;
+	// Resolution the stored surface payload was authored at. Absent in files written
+	// before surface_density existed, so it defaults to 1 there. The terrain's
+	// surface_density is the authority; this field only records what is on disk.
+	int _surface_density = SURFACE_DENSITY_MIN;
 	// Instancer
 	Dictionary _instances; // Meshes{int} -> Cells{v2i} -> [ Transform3D, Color, Modified ]
 	real_t _vertex_spacing = 1.f; // Spacing that instancer transforms are currently scaled by.
@@ -90,7 +102,19 @@ public:
 	Image *get_surface_map_ptr() const { return _surface_map.is_valid() ? _surface_map.ptr() : nullptr; }
 	void set_surface_version(int p_version);
 	int get_surface_version() const { return _surface_version; }
+	void set_surface_density(const int p_density);
+	int get_surface_density() const { return _surface_density; }
+	// Edge of the stored surface payload: region_size * surface_density.
+	int get_surface_map_size() const;
+	// The image the region texture array carries: the stored payload when the
+	// density is 1, otherwise a nearest region_size squared reduction of it. The
+	// array is the fallback and must not grow with the density.
+	Ref<Image> get_surface_map_array_image() const;
 	bool ensure_surface_map();
+	// Adopts p_density and resamples an existing surface map to it. Never re-derives
+	// the payload from the legacy control map: after migration its material bits are
+	// stale, so re-converting would wipe the painted materials.
+	bool ensure_surface_density(const int p_density);
 	Dictionary create_surface_conversion() const;
 	void sanitize_maps();
 	Ref<Image> sanitize_map(const MapType p_map_type, const Ref<Image> &p_map) const;

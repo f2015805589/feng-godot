@@ -125,7 +125,10 @@ group_uniforms;
 		__t_colors[30] = vec3(0.05);
 		__t_colors[31] = vec3(0.0125);
 		ivec3 __uv = get_index_coord(floor(uv));
-		uint __control = uint(texelFetch(_surface_maps, __uv, 0).r * 65535.0 + 0.5);
+		// Same lookup chain as the shaded path, so the view still works when the region
+		// texture array does not carry the surface channel.
+		uint __control = get_surface_value(surface_corner(uv, ivec2(0)), __uv,
+				get_surface_texel(uv, ivec2(0)));
 		vec3 __ctrl_base = __t_colors[int(__control >>6u & 0x1Fu)];
 		vec3 __ctrl_over = __t_colors[int(__control >>11u & 0x1Fu)];
 		float __blend = hydra_idweight_weight(__control);
@@ -141,7 +144,8 @@ group_uniforms;
 	// Show control map blend values
 	{
 		ivec3 __uv = get_index_coord(floor(uv));
-		uint __control = uint(texelFetch(_surface_maps, __uv, 0).r * 65535.0 + 0.5);
+		uint __control = get_surface_value(surface_corner(uv, ivec2(0)), __uv,
+				get_surface_texel(uv, ivec2(0)));
 		float __ctrl_blend = hydra_idweight_weight(__control);
 		ALBEDO = vec3(__ctrl_blend);
 		ROUGHNESS = 1.;

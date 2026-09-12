@@ -437,11 +437,33 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 						surface_region = region.ptr();
 						surface_bytes = map->get_data();
 					}
-					uint8_t *surface_texel = surface_bytes.ptrw() +
-							(int64_t(map_pixel_position.y) * map->get_width() + map_pixel_position.x) * 2;
-					_paint_surface_pair(surface_texel, brush_alpha, strength,
-							pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
-							modifier_alt);
+					// The stored payload is surface_density squared texels per region
+					// texel. The brush authors one region texel per step, so it writes
+					// the whole block. The block is uniform by construction: every write
+					// is a block write, and a density change replicates one source texel
+					// over its block.
+					const int density = MAX(1, region->get_surface_density());
+					const int surface_width = map->get_width();
+					const int block_x = map_pixel_position.x * density;
+					const int block_y = map_pixel_position.y * density;
+					uint8_t *surface_bytes_ptr = surface_bytes.ptrw();
+					uint8_t *surface_texel = surface_bytes_ptr +
+							(int64_t(block_y) * surface_width + block_x) * 2;
+					if (_paint_surface_pair(surface_texel, brush_alpha, strength,
+								pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
+								modifier_alt) &&
+							density > 1) {
+						const uint16_t painted = TerrainSurfaceIdWeight::read_le(surface_texel);
+						for (int by = 0; by < density; by++) {
+							for (int bx = 0; bx < density; bx++) {
+								if (bx == 0 && by == 0) {
+									continue;
+								}
+								TerrainSurfaceIdWeight::write_le(painted,
+										surface_bytes_ptr + (int64_t(block_y + by) * surface_width + block_x + bx) * 2);
+							}
+						}
+					}
 					continue;
 				}
 				// Get current bit field from pixel
@@ -590,10 +612,23 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 			Terrain3DRegion *edited = data->get_region_ptr(region_loc);
 			if (edited && edited->is_edited()) {
 				int region_id = data->get_region_id(region_loc);
-				Image *surface = edited->get_surface_map_ptr();
-				if (surface) {
-					data->update_surface_region(surface, region_id);
+				// The array layer is the region_size reduction, not the dense payload:
+				// the array is the fallback and must not grow with the density.
+				Ref<Image> surface = edited->get_surface_map_array_image();
+				if (surface.is_valid()) {
+					data->update_surface_region(surface.ptr(), region_id);
 				}
+			}
+		}
+	}
+	// Both virtual textures cache the same payload, so an edit has to drop the pages that
+	// carry it. Without this an array-free configuration keeps rendering the material the
+	// page was produced with until the LRU happens to evict it.
+	if (_tool == TEXTURE) {
+		for (const Vector2i &region_loc : data->get_region_locations()) {
+			Terrain3DRegion *edited = data->get_region_ptr(region_loc);
+			if (edited && edited->is_edited()) {
+				_terrain->invalidate_surface_pages(region_loc);
 			}
 		}
 	}

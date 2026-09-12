@@ -13,9 +13,9 @@ const BuiltinPass = preload("passes/builtin_pass.gd")
 const TextureManager = preload("passes/texture_manager.gd")
 
 const LIBRARY_DIR := "res://addons/feng-render-pipeline/library"
-const PIPELINE_SCHEMA_VERSION := 2
+const PIPELINE_SCHEMA_VERSION := 3
 const MANAGER_TOKEN := -1
-const NATIVE_PASS_COUNT := 16
+const NATIVE_PASS_COUNT := 17
 
 ## Native FRP operations. These are executable grouped renderer boundaries,
 ## rather than a list of every draw or GPU dispatch inside the renderer.
@@ -36,6 +36,7 @@ const NATIVE_PASS_DEFINITIONS := [
 	{"id": 13, "name": "SSIL/SSR History Copy"},
 	{"id": 14, "name": "Temporal AA / Upscale"},
 	{"id": 15, "name": "Post Process / Tonemap"},
+	{"id": 16, "name": "VT Pass"},
 ]
 
 ## A renderer's complete default list is native work with the library's
@@ -56,6 +57,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 ## prerequisite must occur first. This lets users disable fallback, motion,
 ## sky, history, or temporal work without silently adding it back.
 const NATIVE_ORDER_EDGES := [
+	[16, 0],
 	[0, 1], [1, 2],
 	[2, 3], [2, 4], [2, 5], [2, 6], [2, 7], [2, 8], [2, 9], [2, 10], [2, 11], [2, 12],
 	[3, 5], [4, 5],
@@ -69,7 +71,7 @@ const NATIVE_ORDER_EDGES := [
 	[14, 15],
 ]
 
-const MANDATORY_NATIVE_IDS := [0, 1, 2, 12, 15]
+const MANDATORY_NATIVE_IDS := [0, 1, 2, 12, 15, 16]
 
 ## Kept for source compatibility with scripts that used the old path-only
 ## manifest. New code should use DEFAULT_LIBRARY_ENTRIES so each entry has a
@@ -126,6 +128,7 @@ func _seed_default_passes() -> void:
 	if not _passes.is_empty():
 		return
 	var seeded: Array[PassBase] = []
+	seeded.append(_make_native_pass(16, "VT Pass"))
 	for definition in NATIVE_PASS_DEFINITIONS:
 		if definition["id"] <= 13:
 			seeded.append(_make_native_pass(definition["id"], definition["name"]))
@@ -137,7 +140,7 @@ func _seed_default_passes() -> void:
 		_configure_library_pass(instance, entry)
 		seeded.append(instance)
 	for definition in NATIVE_PASS_DEFINITIONS:
-		if definition["id"] >= 14:
+		if definition["id"] >= 14 and definition["id"] != 16:
 			seeded.append(_make_native_pass(definition["id"], definition["name"]))
 	_passes = seeded
 
@@ -218,10 +221,13 @@ func _has_native_entries() -> bool:
 
 func _normalize_native_entries() -> bool:
 	var changed := false
+	var has_vt_pass := false
 	for pass_entry in _passes:
 		if not pass_entry is BuiltinPass:
 			continue
 		var native := pass_entry as BuiltinPass
+		if native.native_id == 16:
+			has_vt_pass = true
 		if native.native_id >= 0 and native.native_id < NATIVE_PASS_COUNT:
 			if native.stable_id != "native:%d" % native.native_id:
 				native.stable_id = "native:%d" % native.native_id
@@ -232,6 +238,13 @@ func _normalize_native_entries() -> bool:
 				changed = true
 		# Do not silently repair an invalid or duplicate native ID. The warning
 		# and last-valid-schedule behavior makes the authored error reviewable.
+	if not has_vt_pass:
+		# Resources saved with the 16-pass schema already have stable native ids
+		# and user-authored custom entries. Add only the new id 16 entry at the
+		# GBuffer boundary so those ids and relative custom order remain intact.
+		var gbuffer_index := _find_native_index(0)
+		_passes.insert(gbuffer_index if gbuffer_index >= 0 else 0, _make_native_pass(16, "VT Pass"))
+		changed = true
 	return changed
 
 func _migrate_legacy_passes() -> bool:
@@ -249,8 +262,11 @@ func _migrate_legacy_passes() -> bool:
 	var migrated: Array[PassBase] = []
 	for pass_entry in buckets[-1]:
 		migrated.append(pass_entry)
+	migrated.append(_make_native_pass(16, "VT Pass"))
 	for definition in NATIVE_PASS_DEFINITIONS:
 		var native_id: int = definition["id"]
+		if native_id == 16:
+			continue
 		migrated.append(_make_native_pass(native_id, definition["name"]))
 		for pass_entry in buckets[native_id]:
 			migrated.append(pass_entry)

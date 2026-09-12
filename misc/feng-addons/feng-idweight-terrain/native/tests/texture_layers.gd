@@ -41,6 +41,12 @@ func array_layer(normal: bool, layer: int) -> Image:
 	require(image != null and not image.is_empty(), "missing GPU layer " + str(layer))
 	return image
 
+func shader_has_parameter(name: String) -> bool:
+	for parameter in RenderingServer.get_shader_parameter_list(terrain.material.get_shader_rid()):
+		if String(parameter.get("name", "")) == name:
+			return true
+	return false
+
 func texture(size: int, format: Image.Format, color: Color, mipmaps: bool) -> ImageTexture:
 	var image = Image.create(size, size, false, format)
 	image.fill(color)
@@ -93,6 +99,14 @@ func run() -> void:
 	painter.set_terrain(terrain)
 	terrain.set_editor(painter)
 	await frame_image()
+	require(not shader_has_parameter("heightmap_black_height"), "disabled debug view leaked heightmap uniforms into the base shader")
+	terrain.set_show_heightmap(true)
+	await frame_image()
+	require(shader_has_parameter("heightmap_black_height"), "heightmap debug insert was not generated when enabled")
+	terrain.set_show_heightmap(false)
+	await frame_image()
+	require(not shader_has_parameter("heightmap_black_height"), "heightmap debug insert remained after disabling")
+	print("PASS debug shader inserts toggle with their view")
 	for normal in [false, true]:
 		var a = array_layer(normal, 0)
 		var b = array_layer(normal, 1)
