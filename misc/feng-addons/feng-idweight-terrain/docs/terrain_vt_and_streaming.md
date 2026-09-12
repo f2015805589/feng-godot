@@ -573,8 +573,32 @@ baked cell textures). The port now has the same split, minus the baked-cell sour
   future bilinear/`textureLod` sampler, not for the current one.
 * **The mip chain is world-space.** One mip 0 page covers `surface_svt_page_world` metres and
   level `m` covers `2^m` times that, so a distant page is a handful of texels instead of a
-  distance-limited window. `_surface_svt_mip_for_page()` steps one level per doubling of the
-  distance, like the near field's rule.
+  distance-limited window.
+* **The level of a page is a distance, and both sides read the same table.**
+  `Terrain3D::get_surface_svt_mip_for_distance()` is the single rule: with
+  `surface_svt_mip_distances` set (one entry per level, in metres, the furthest camera distance
+  that level is sampled at) level `m` owns the band up to entry `m`; with an empty table level `m`
+  serves out to `2^(m+1) * surface_svt_page_world`, one level per doubling of the page size.
+  `surface_svt_mip_for_distance()` in `main.glsl` mirrors it exactly, and the shader **starts its
+  walk at that level and only walks coarser**. That is what makes the rendered level a pure
+  function of distance: a missing page degrades to the next level up instead of exposing whatever
+  finer page happens to still be resident, and the producer fills exactly the levels the shader
+  will sample. The demand pass derives a page's levels from the span of its visible footprint
+  (`level(nearest) .. level(farthest)`), so a page that straddles a band edge is published at
+  every level a fragment inside it can resolve to.
+* **Over-subscription raises a coarseness floor, it never rewrites a level.** When the
+  distance-selected set does not fit the pool, the demand pass finds the *smallest* level floor
+  that makes the visible set fit and coarsens only the pages finer than that floor: pages already
+  coarser than it keep exactly the level the rule gave them, every visible chunk still resolves
+  through some page, and the floor is a function of the visible set and the pool size alone
+  (the search always starts at the finest level), so a settled view selects the same floor,
+  levels and pages on every frame. The hierarchy is extended to cover whatever the rule and the
+  floor use, and says so once (`WARN_PRINT_ONCE` with the two page counts). The previous
+  selection derived every level from a screen-space density ratio and coarsened the whole set
+  until it fit, which changed a page's level from frame to frame while pages published at the
+  old level stayed resident — that is the far field's mip "jumping". An explicit table also
+  raises the effective level cap to the levels it names, so a saved `surface_svt_max_mip` cannot
+  silently truncate a table.
 * **The root pyramid replaces the array as the fallback.** The coarsest
   `surface_svt_root_mips` levels are always resident and **protected**, so a miss resolves to
   coarse real data rather than nothing, and the near field's pages compete only among themselves
@@ -600,14 +624,23 @@ baked cell textures). The port now has the same split, minus the baked-cell sour
 Defaults: near field page 256 texels / 4 pages per axis (1:1 at density 4) with
 `surface_vt_page_count` 128 (the 512 m radius working set is roughly 50 pages, so 64 had no LRU
 headroom); far field page 512 m / 256 texels (0.5 texel/m at mip 0), `surface_svt_page_count`
-256, `surface_svt_root_mips` 2, `surface_svt_distance` 6144 m to the clipmap's reach.
+256, `surface_svt_root_mips` 2, `surface_svt_distance` 6144 m to the clipmap's reach,
+`surface_svt_mip_distances` empty (automatic bands: 1024 m, 2048 m, 4096 m, … for a 512 m page).
+The dock's SVT panel edits the table one level per row and can pin the automatic bands as a
+starting point; the property also appears in the inspector's SVT group as a plain float array.
 
 Tests: `native/tests/vt_sparse.gd` + `vt_sparse_runner.py`. It pins world addressing (a page is
 a fixed world square), the neighbour-filled borders texel by texel, the world-space mip chain (a
-page 181 m out is published at mip 1 while the page under the target stays at mip 0), the root
+page about 185 m out is published at mip 1 while the page under the camera stays at mip 0), the root
 pyramid covering every texel of the coarsest levels, a page 6.4 km away resolving through it,
 array-free rendering matching the array-backed frame pixel for pixel, and an edit with the array
 off being re-produced instead of served stale.
+
+`native/tests/vt_mip_bands.gd` + `vt_mip_bands_runner.py` pins the distance table itself on the
+production path: the band edges, that the level the shader starts at is the level that was
+produced for every probe distance, that a settled view neither moves a level nor churns the pool,
+that a small camera move inside the bands moves no level, and that an over-subscribed pool keeps
+the nearest pages and still settles instead of rewriting levels.
 
 ## 5. Traps found in Hydra — do not copy these
 

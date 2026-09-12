@@ -99,6 +99,11 @@ func expected_world(world_x: float, world_z: float) -> int:
 	var j := int(floor(world_z)) - rz * REGION_SIZE
 	return expected(loc, i, j)
 
+# Floor division for the page-to-world mapping: GDScript's `/` truncates toward zero,
+# while the producer floors, and border texels sit at negative offsets from the origin.
+func floor_div(p_value: int, p_divisor: int) -> int:
+	return int(floor(float(p_value) / float(p_divisor)))
+
 func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> void:
 	var page := terrain.get_surface_vt().read_page(slot)
 	require(page != null and not page.is_empty(), "page slot %d should be readable" % slot)
@@ -114,10 +119,13 @@ func check_page(loc: Vector2i, slot: int, local_mip: int, px: int, py: int) -> v
 	var bad := 0
 	var first := ""
 	for y in STORED:
-		var ry := origin_y + ((y - BORDER) * span) / PAGE
+		# Border texels sit before the page origin, so the producer's floor division and
+		# GDScript's truncating `/` differ there. Floor explicitly, or every border row
+		# and column of every page is reported as a mismatch.
+		var ry := origin_y + floor_div((y - BORDER) * span, PAGE)
 		var world_z := float(base_z + ry)
 		for x in STORED:
-			var rx := origin_x + ((x - BORDER) * span) / PAGE
+			var rx := origin_x + floor_div((x - BORDER) * span, PAGE)
 			var world_x := float(base_x + rx)
 			var want := expected_world(world_x, world_z)
 			var got := bytes.decode_u16((y * STORED + x) * 2)

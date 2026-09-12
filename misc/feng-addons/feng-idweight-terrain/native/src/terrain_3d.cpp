@@ -171,15 +171,10 @@ void Terrain3D::__physics_process(const double p_delta) {
 	if (demand_pool) { demand_pool->begin_demand(); }
 	if (_surface_vt_enabled) {
 		vt_remaining -= update_surface_vt(_surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
-		if (_surface_vt_blocks_dirty && _material.is_valid()) {
-			// The shader's block table moved, so push the uniforms again.
-			_material->update(Terrain3DMaterial::REGION_ARRAYS);
-			_surface_vt_blocks_dirty = false;
-		}
 	}
 	// Refresh the far field: a world-space page grid that spans regions.
-	if (_surface_svt_enabled && vt_remaining > 0 && !svt_baking) {
-		update_surface_svt(vt_remaining);
+	if (_surface_svt_enabled && vt_remaining > 0) {
+		vt_remaining -= update_surface_svt(vt_remaining);
 	}
 	if (svt_baking) {
 		_surface_svt->set_allocation_budget(MAX(0, vt_remaining));
@@ -548,6 +543,31 @@ void Terrain3D::set_surface_svt_root_mips(const int p_mips) {
 	if (!_vt_debug_direct_material) { _reset_vt_configuration(); }
 }
 
+// Explicit far-field level bands. Entry m is the largest camera distance (metres) at
+// which world mip m is sampled; the last entry is the furthest distance the far field
+// keeps detail for, and everything beyond it uses that last level (the protected roots
+// still serve as the coarser fallback). No entry is ever required: an empty table keeps
+// the automatic page-size rule, so this is purely additive.
+void Terrain3D::set_surface_svt_mip_distances(const PackedFloat32Array &p_distances) {
+	PackedFloat32Array distances;
+	distances.resize(p_distances.size());
+	for (int i = 0; i < int(p_distances.size()); i++) {
+		// Strictly increasing with at least a metre per band. A table that is not
+		// monotonic has no meaning (level m would never be selected), and a zero-width
+		// band would make the level ambiguous.
+		const real_t previous = i > 0 ? distances[i - 1] : 0.f;
+		distances[i] = MAX(real_t(p_distances[i]), previous + 1.f);
+	}
+	if (_surface_svt_mip_distances == distances) { return; }
+	_surface_svt_mip_distances = distances;
+	// Pages are world aligned, so a page produced for a level stays valid whatever the
+	// table says; only the level the shader samples changes. That is a uniform update,
+	// not a rebake, so editing the table never throws away produced pages.
+	if (_initialized && _material.is_valid()) {
+		_material->update(Terrain3DMaterial::UNIFORMS_ONLY);
+	}
+}
+
 void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 	_surface_array_enabled = p_enabled;
 	LOG(INFO, "Surface region texture array ", p_enabled ? "enabled" : "disabled");
@@ -609,20 +629,43 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc) {
 	}
 }
 
-// A mip 0 page covers `page_world` metres; every doubling of that distance steps one
-// level coarser, so the far field's texel density tracks the distance the same way the
-// near field's distance rule does.
-int Terrain3D::_surface_svt_mip_for_page(const real_t p_distance) const {
-	if (!_surface_svt) {
-		return 0;
+// The far field's one distance -> level rule. Every consumer resolves a level through
+// this function: the demand pass (which level to produce), the legacy grid scan and the
+// shader uniform (which level to sample). An explicit table states the bands directly;
+// without one, a mip m page covers `page_world * 2^m` metres, so level m is the right
+// choice out to twice that distance and the bands follow the page size automatically.
+// `p_max_mip` -1 means the level the far field currently publishes; the demand pass
+// passes the indirection's absolute limit while it plans a frame, so a plan never depends
+// on the level cap it is about to change.
+int Terrain3D::get_surface_svt_mip_for_distance(const real_t p_distance, const int p_max_mip) const {
+	const int max_mip = p_max_mip >= 0
+			? p_max_mip
+			: (_surface_svt ? MAX(0, _surface_svt->get_world_max_mip()) : MAX(0, _surface_svt_max_mip));
+	if (_surface_svt_mip_distances.is_empty()) {
+		int mip = 0;
+		real_t threshold = MAX(1.f, _surface_svt_page_world * 2.f);
+		while (mip < max_mip && p_distance > threshold) {
+			threshold *= 2.f;
+			mip++;
+		}
+		return mip;
 	}
-	const int max_mip = _surface_svt->get_world_max_mip();
+	const int last = int(_surface_svt_mip_distances.size()) - 1;
 	int mip = 0;
-	const real_t threshold = MAX(1.f, _surface_svt_page_world * 2.f);
-	while (mip < max_mip && p_distance > threshold * real_t(1 << mip)) {
+	while (mip < last && p_distance > _surface_svt_mip_distances[mip]) {
 		mip++;
 	}
-	return mip;
+	return MIN(mip, max_mip);
+}
+
+// Furthest distance an explicit table still serves with a produced page; 0 means the
+// automatic rule, which coarsens without a limit of its own.
+real_t Terrain3D::get_surface_svt_mip_reach() const {
+	if (_surface_svt_mip_distances.is_empty()) {
+		return 0.f;
+	}
+	const int max_mip = _surface_svt ? MAX(0, _surface_svt->get_world_max_mip()) : MAX(0, _surface_svt_max_mip);
+	return _surface_svt_mip_distances[MIN(int(_surface_svt_mip_distances.size()) - 1, max_mip)];
 }
 
 // One far-field demand pass. Pages are world aligned, so the set is a plain grid walk
@@ -645,6 +688,15 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	const real_t page_world = MAX(1.f, _surface_svt_page_world);
 	const real_t reach = MAX(page_world, _surface_svt_distance);
 	const Vector3 target = get_clipmap_target_position();
+	// The level rule measures from the camera the shader renders with, so the diagnostic
+	// scan has to measure from the same point: otherwise it publishes pages at levels the
+	// shader does not start at, and the far field renders from whatever ancestor the walk
+	// finds instead of from the page that was produced. Without a camera (CPU
+	// diagnostics) the clipmap target stays the reference.
+	Camera3D *reference_camera = get_camera();
+	const Vector3 reference = (reference_camera && reference_camera->is_inside_tree())
+			? reference_camera->get_global_position()
+			: target;
 	// Keep the public world-page API's int coordinates in a range where adding the
 	// indirection half and multiplying by a mip scale cannot overflow. The old nested
 	// loops converted an arbitrary distance directly to int, so a large editor distance
@@ -673,10 +725,10 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		return -(((-p_value) + scale - 1) >> p_shift);
 	};
 
-	int64_t first_x = clamp_page_coordinate(Math::floor((double(target.x) - double(reach)) / double(page_world)));
-	int64_t last_x = clamp_page_coordinate(Math::floor((double(target.x) + double(reach)) / double(page_world)));
-	int64_t first_y = clamp_page_coordinate(Math::floor((double(target.z) - double(reach)) / double(page_world)));
-	int64_t last_y = clamp_page_coordinate(Math::floor((double(target.z) + double(reach)) / double(page_world)));
+	int64_t first_x = clamp_page_coordinate(Math::floor((double(reference.x) - double(reach)) / double(page_world)));
+	int64_t last_x = clamp_page_coordinate(Math::floor((double(reference.x) + double(reach)) / double(page_world)));
+	int64_t first_y = clamp_page_coordinate(Math::floor((double(reference.z) - double(reach)) / double(page_world)));
+	int64_t last_y = clamp_page_coordinate(Math::floor((double(reference.z) + double(reach)) / double(page_world)));
 
 	// Automatic mode only needs roots and detail pages for regions that are actually
 	// loaded. Besides avoiding empty-world work, this keeps a large distance setting
@@ -899,11 +951,17 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		const int page_y = int(page_y64);
 		const real_t center_x = (real_t(page_x) + 0.5f) * page_world;
 		const real_t center_z = (real_t(page_y) + 0.5f) * page_world;
-		const real_t distance = Vector2(center_x - target.x, center_z - target.z).length();
+		// Same measurement the shader makes for a fragment: the distance from the camera
+		// to the page, with the page sampled on the ground plane.
+		const real_t distance = Vector3(center_x, 0.f, center_z).distance_to(reference);
 		if (legacy_full_grid && distance > reach) {
 			continue;
 		}
-		const int mip = _surface_svt_mip_for_page(distance);
+		// Same distance -> level table the shader and the camera-visible pass use. This
+		// diagnostic grid measures from the clipmap target rather than the camera, so
+		// it stays usable without a rendering camera; production goes through
+		// _update_visible_svt(), which measures from the camera the shader reports.
+		const int mip = get_surface_svt_mip_for_distance(distance);
 		bool was_miss = false;
 		const int slot = _surface_svt->request_world_page_internal(page_x, page_y, mip, &was_miss);
 		if (slot < 0) {
@@ -1199,19 +1257,46 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 			}
 		}
 	}
-	if (_vt_adaptive_enabled && !_vt_debug_direct_material && !_surface_vt_force_mip) {
-		// Adapt to physical capacity as well as distance. A small saved cache must
-		// lower texel density instead of endlessly replacing equally needed pages.
-		int regions_in_reach = 0;
-		for (const Vector2i &location : _data->get_region_locations()) {
-			if (eligible_regions.has(location)) { ++regions_in_reach; }
+	Dictionary adaptive_sizes;
+	if (_vt_adaptive_enabled && !_vt_debug_direct_material && !_surface_vt_force_mip && get_camera()) {
+		TerrainVT::VisibleView view(get_camera());
+		struct SectorDemand { Vector2i location; int size; float distance; };
+		std::vector<SectorDemand> demands;
+		const float world = _region_size * _vertex_spacing;
+		const int capacity = _surface_svt_enabled ? MAX(1, _surface_vt->get_page_count() / 2) : _surface_vt->get_page_count();
+		auto cost = [](int size) { return (4 * size * size - 1) / 3; };
+		int total = 0;
+		for (const Variant &key : eligible_regions.keys()) {
+			Vector2i location = key;
+			TerrainVT::VisiblePatch visible;
+			if (!view.sample(Rect2(Vector2(location) * world, Vector2(world, world)), _data->get_region(location)->get_height_range(), visible)) {
+				// Explicit Target Grid can include off-screen sectors; retain a base page.
+				visible.density = 0.f;
+			}
+			const float wanted = world * visible.density * _surface_vt_texels_per_pixel / _surface_vt->get_page_size();
+			int size = 1;
+			while (size < max_pages_per_axis && size < wanted) { size <<= 1; }
+			// Separate grow/shrink thresholds avoid toggling at projection boundaries.
+			if (_surface_vt->has_sector(location)) {
+				int previous = _surface_vt->get_sector_block_size(location);
+				if (wanted >= previous * 0.4f && wanted <= previous * 1.1f) { size = MIN(previous, max_pages_per_axis); }
+			}
+			demands.push_back({ location, size, visible.distance });
+			total += cost(size);
 		}
-		const int capacity = _surface_vt->get_page_count();
-		const int avt_capacity = _surface_svt_enabled ? MAX(1, capacity / 2) : capacity;
-		const int pages_per_region = MAX(1, avt_capacity / MAX(1, regions_in_reach));
-		while (max_pages_per_axis > 1 && max_pages_per_axis * max_pages_per_axis > pages_per_region) {
-			max_pages_per_axis >>= 1;
+		// Reserve the complete mip hierarchy, including coverage while finer pages
+		// are produced. Reduce the least visible detail first, never discard sectors.
+		while (total > capacity) {
+			int reduce = -1;
+			for (int i = 0; i < int(demands.size()); ++i) {
+				if (demands[i].size > 1 && (reduce < 0 || demands[i].distance > demands[reduce].distance)) { reduce = i; }
+			}
+			if (reduce < 0) { break; }
+			total -= cost(demands[reduce].size);
+			demands[reduce].size >>= 1;
+			total += cost(demands[reduce].size);
 		}
+		for (const SectorDemand &demand : demands) { adaptive_sizes[demand.location] = demand.size; }
 	}
 	if (!_vt_debug_direct_material) {
 		// Return virtual address blocks when terrain streams out or leaves AVT
@@ -1233,7 +1318,7 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 		if (_vt_debug_direct_material ? distance_squared > reach_squared : !eligible_regions.has(region_loc)) {
 			continue;
 		}
-		int pages_per_axis = max_pages_per_axis;
+		int pages_per_axis = adaptive_sizes.get(region_loc, max_pages_per_axis);
 		const float region_world = _region_size * _vertex_spacing;
 		if (!_surface_vt->has_sector(region_loc)) {
 			if (!_surface_vt->register_sector(region_loc, pages_per_axis)) {
@@ -1304,6 +1389,17 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 				}
 			}
 		}
+		if (!_vt_debug_direct_material && _vt_adaptive_enabled && !_surface_vt_force_mip) {
+			// Keep an AVT mip chain resident. Growth remaps existing pages to their
+			// new mip addresses; the shader keeps sampling them during refinement.
+			requests.clear();
+			for (int mip = max_local_mip; mip >= 0; --mip) {
+				int at = MAX(1, pages_per_axis >> mip);
+				for (int y = 0; y < at; ++y) {
+					for (int x = 0; x < at; ++x) { requests.push_back(Vector3i(x, y, mip)); }
+				}
+			}
+		}
 		// Only produce the pages this pass actually allocated. A hit already holds
 		// content, and re-producing it every tick would swamp the atlas uploads.
 		std::vector<Vector3i> missing;
@@ -1345,6 +1441,12 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 	if (_surface_vt_block_sizes != next_sizes) {
 		_surface_vt_block_sizes = next_sizes;
 		_surface_vt_blocks_dirty = true;
+	}
+	// Publish block origins/sizes in the same update as the remapped page table.
+	// Direct callers must not expose a new table with yesterday's shader block.
+	if (_surface_vt_blocks_dirty && _material.is_valid()) {
+		_material->update(Terrain3DMaterial::REGION_ARRAYS);
+		_surface_vt_blocks_dirty = false;
 	}
 	_surface_vt->commit();
 	if (_surface_svt && _surface_svt->is_initialized()) { _surface_svt->commit(); }
@@ -2436,6 +2538,8 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_surface_vt_forward_regions", "regions"), &Terrain3D::set_surface_vt_forward_regions);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_forward_regions"), &Terrain3D::get_surface_vt_forward_regions);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_rect"), &Terrain3D::get_surface_vt_region_rect);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_texels_per_pixel", "value"), &Terrain3D::set_surface_vt_texels_per_pixel);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_texels_per_pixel"), &Terrain3D::get_surface_vt_texels_per_pixel);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_force_mip", "enabled", "mip"), &Terrain3D::set_surface_vt_force_mip, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("is_surface_vt_force_mip"), &Terrain3D::is_surface_vt_force_mip);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_mip"), &Terrain3D::get_surface_vt_mip);
@@ -2467,6 +2571,11 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_surface_svt", "max_pages"), &Terrain3D::update_surface_svt, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_surface_svt_root_mips", "mips"), &Terrain3D::set_surface_svt_root_mips);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_root_mips"), &Terrain3D::get_surface_svt_root_mips);
+	ClassDB::bind_method(D_METHOD("set_surface_svt_mip_distances", "distances"), &Terrain3D::set_surface_svt_mip_distances);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_distances"), &Terrain3D::get_surface_svt_mip_distances);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_distance_count"), &Terrain3D::get_surface_svt_mip_distance_count);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_for_distance", "distance", "max_mip"), &Terrain3D::get_surface_svt_mip_for_distance, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_reach"), &Terrain3D::get_surface_svt_mip_reach);
 	ClassDB::bind_method(D_METHOD("set_surface_array_enabled", "enabled"), &Terrain3D::set_surface_array_enabled);
 	ClassDB::bind_method(D_METHOD("is_surface_array_enabled"), &Terrain3D::is_surface_array_enabled);
 	ClassDB::bind_method(D_METHOD("invalidate_surface_pages", "region_location"), &Terrain3D::invalidate_surface_pages);
@@ -2658,6 +2767,7 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("AVT", "surface_vt_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_adaptive_enabled"), "set_vt_adaptive_enabled", "is_vt_adaptive_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "surface_vt", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DVirtualTexture"), "", "get_surface_vt");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64,0.25,or_greater"), "set_surface_vt_texels_per_pixel", "get_surface_vt_texels_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_enabled"), "set_surface_vt_enabled", "is_surface_vt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_count", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_count", "get_surface_vt_page_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_size", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_size", "get_surface_vt_page_size");
@@ -2682,6 +2792,9 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_max_mip"), "set_surface_svt_max_mip", "get_surface_svt_max_mip");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_distance", "get_surface_svt_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_root_mips", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_svt_root_mips", "get_surface_svt_root_mips");
+	// One entry per world mip level, in metres: the largest camera distance still
+	// sampled at that level. Empty = automatic (one level per doubling of the page).
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_svt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT, "float"), "set_surface_svt_mip_distances", "get_surface_svt_mip_distances");
 	ADD_SUBGROUP("VT Page", "vt_page_");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "vt_page_status", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY), "", "get_vt_settings");
 	ADD_GROUP("", "");

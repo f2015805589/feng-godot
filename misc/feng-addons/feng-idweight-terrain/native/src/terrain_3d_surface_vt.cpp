@@ -255,6 +255,18 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 			// Normal VT rendering exposes missing/stale tiles as diagnostics.
 			// A dirty-page automatic bake or manual full bake produces replacements.
 			record["state"] = exists ? "Stale/invalid bake" : "Missing bake";
+			if (_svt_auto_bake && !_data_directory.is_empty()) {
+				// Streaming can discover a missing file long after editing stopped
+				// (or after the coverage hierarchy expanded). Repair that demand;
+				// do not leave an allocated but permanently unproducible page.
+				if (_vt_svt_dirty_regions.is_empty()) { _vt_svt_edit_time = 0; }
+				const float region_world = _region_size * _vertex_spacing;
+				for (const Vector2i &location : _data->get_region_locations()) {
+					if (p_rect.intersects(Rect2(Vector2(location) * region_world, Vector2(region_world, region_world)))) {
+						_vt_svt_dirty_regions[location] = true;
+					}
+				}
+			}
 			producer->invalidate_slot(p_slot);
 			return;
 		}
@@ -317,6 +329,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["pages_per_update"] = _vt_pages_per_update;
 	result["shared_pool"] = _vt_shared_ready;
 	result["adaptive"] = _vt_adaptive_enabled;
+	result["avt_texels_per_pixel"] = _surface_vt_texels_per_pixel;
+	result["svt_effective_max_mip"] = _surface_svt ? _surface_svt->get_world_max_mip() : _surface_svt_max_mip;
 	result["avt_selection_mode"] = _surface_vt_selection_mode;
 	result["avt_region_grid"] = _surface_vt_region_grid;
 	result["avt_region_offset"] = _surface_vt_region_offset;

@@ -122,7 +122,11 @@ func run() -> void:
 
 	camera = Camera3D.new()
 	root.add_child(camera)
-	camera.position = Vector3(REGION_SIZE * 0.5, 200.0, REGION_SIZE * 0.5)
+	# The far field's level bands are measured from the camera, the same reference the
+	# shader uses. Keep it close to the ground so the region under it stays in the level 0
+	# band (mip 0 serves up to 2 x page_world = 128 m) and the frame compares 1:1 with the
+	# array path.
+	camera.position = Vector3(REGION_SIZE * 0.5, 40.0, REGION_SIZE * 0.5)
 	camera.rotation_degrees.x = -90
 	camera.projection = Camera3D.PROJECTION_ORTHOGONAL
 	camera.size = float(REGION_SIZE)
@@ -172,16 +176,16 @@ func run() -> void:
 	print("VTSVT produced=", produced, " max_mip=", vt.get_world_max_mip(),
 			" half=", vt.get_world_grid_half(), " stats=", vt.get_stats())
 
-	# Mip 0 pages near the target, and the page at (2,2) is 181 m away: its centre is past
-	# the 128 m mip 0 threshold, so it must be published one level coarser.
-	require(vt.lookup_world_page(0, 0, 0) >= 0, "the page under the target should be resident at mip 0")
+	# Mip 0 pages near the camera, and the page at (2,2) is about 185 m away: its centre
+	# is past the 128 m level 0 band, so it must be published one level coarser.
+	require(vt.lookup_world_page(0, 0, 0) >= 0, "the page under the camera should be resident at mip 0")
 	var near_slot: Vector2i = vt.get_world_page_virtual(0, 0, 0)
 	var far_slot: Vector2i = vt.get_world_page_virtual(2, 2, 1)
 	var far_mip0: Vector2i = vt.get_world_page_virtual(2, 2, 0)
 	require(vt.get_indirection_slot(near_slot.x, near_slot.y, 0) != INVALID,
-			"the page under the target must be published at mip 0")
+			"the page under the camera must be published at mip 0")
 	require(vt.get_indirection_slot(far_slot.x, far_slot.y, 1) != INVALID,
-			"a page 181 m away must be published at mip 1")
+			"a page about 185 m away must be published at mip 1")
 	require(vt.get_indirection_slot(far_mip0.x, far_mip0.y, 0) == INVALID,
 			"that page must not hold a mip 0 entry")
 	if not failed:

@@ -50,6 +50,11 @@ var svt_auto_bake_button: CheckButton
 var auto_bake_hint: Label
 var bake_button: Button
 var bake_status: Label
+var svt_band_hint: Label
+var svt_band_grid: GridContainer
+var svt_band_auto_button: Button
+var svt_band_spins: Array[SpinBox] = []
+var _svt_band_signature: String = ""
 
 var _overview_texture: Texture2D
 var _overview_dirty: bool = true
@@ -474,6 +479,38 @@ func _build_svt_panel() -> VBoxContainer:
 	bake_status.name = "BakeStatus"
 	bake_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	panel.add_child(bake_status)
+
+	# Distance -> mip level bands. One entry per level: the furthest camera distance at
+	# which the shader samples that level, and the level the page producer fills for it.
+	# Both read this one table, so the rendered detail is a function of distance rather
+	# than of whichever page happens to be resident.
+	var band_header := Label.new()
+	band_header.name = "SVTBandHeader"
+	band_header.text = "Mip distance bands"
+	panel.add_child(band_header)
+	svt_band_hint = Label.new()
+	svt_band_hint.name = "SVTBandHint"
+	svt_band_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	panel.add_child(svt_band_hint)
+	svt_band_grid = GridContainer.new()
+	svt_band_grid.name = "SVTBandGrid"
+	svt_band_grid.columns = 2
+	panel.add_child(svt_band_grid)
+	var band_buttons := HBoxContainer.new()
+	band_buttons.name = "SVTBandButtons"
+	svt_band_auto_button = Button.new()
+	svt_band_auto_button.name = "SVTBandAutomatic"
+	svt_band_auto_button.text = "Automatic"
+	svt_band_auto_button.tooltip_text = "Clear the table and derive one level per doubling of the far-field page size"
+	svt_band_auto_button.pressed.connect(_on_svt_band_auto_pressed)
+	band_buttons.add_child(svt_band_auto_button)
+	var band_fit_button := Button.new()
+	band_fit_button.name = "SVTBandFromPageSize"
+	band_fit_button.text = "From page size"
+	band_fit_button.tooltip_text = "Pin the bands explicitly to the automatic rule, as a starting point to edit"
+	band_fit_button.pressed.connect(_on_svt_band_fit_pressed)
+	band_buttons.add_child(band_fit_button)
+	panel.add_child(band_buttons)
 	return panel
 
 
@@ -560,7 +597,99 @@ func _refresh_settings_controls() -> void:
 	svt_auto_bake_button.disabled = not _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY)
 	svt_auto_bake_button.tooltip_text = "Automatically rebake changed SVT pages incrementally after editing has been idle for 500 ms" if not svt_auto_bake_button.disabled else "Auto Bake is unavailable in this Terrain3D build"
 	auto_bake_hint.text = "Changed regions are merged and rebaked incrementally 500 ms after editing stops." if auto_bake_enabled else "Auto Bake is off. When enabled, changed regions merge and rebake incrementally 500 ms after editing stops. Use Bake All SVT Pages to refresh all persisted tiles and mip levels."
+	_refresh_svt_bands()
 	_updating_settings = false
+
+
+# One spin box per world mip level: the furthest camera distance still sampled at that
+# level. Both the page producer and the shader resolve a level through this table, so a
+# value here is where the level boundary sits for the whole far field, not a hint.
+func _refresh_svt_bands() -> void:
+	if svt_band_grid == null or terrain == null or not is_instance_valid(terrain):
+		return
+	if not _has_object_property(terrain, &"surface_svt_mip_distances"):
+		return
+	var view := _call(terrain, "get_surface_svt")
+	var max_mip := int(_call(view, "get_world_max_mip"))
+	if max_mip < 0:
+		max_mip = int(_call(terrain, "get_surface_svt_max_mip"))
+	var levels := maxi(1, max_mip + 1)
+	var configured_value: Variant = _call(terrain, "get_surface_svt_mip_distances")
+	var configured: PackedFloat32Array = configured_value if configured_value is PackedFloat32Array else PackedFloat32Array()
+	var page_world := maxf(1.0, float(_call(terrain, "get_surface_svt_page_world")))
+	# Rebuilding a grid of spin boxes while the user types in one of them would drop the
+	# edit, so only rebuild when the level count or the stored table actually changed.
+	var signature := "%d|%s" % [levels, str(configured)]
+	if signature == _svt_band_signature:
+		return
+	_svt_band_signature = signature
+	var rebuilding := svt_band_spins.size() != levels
+	_updating_settings = true
+	if rebuilding:
+		for child in svt_band_grid.get_children():
+			child.queue_free()
+		svt_band_spins.clear()
+		for mip in levels:
+			svt_band_grid.add_child(_make_setting_label("mip %d ≤" % mip))
+			var spin := _make_spin(1.0, 100000000.0, 1.0)
+			spin.name = "SVTBandMip%d" % mip
+			spin.custom_minimum_size.x = 130
+			spin.tooltip_text = "Furthest camera distance in metres sampled at world mip %d" % mip
+			spin.value_changed.connect(_on_svt_band_value_changed.bind(mip))
+			svt_band_grid.add_child(spin)
+			svt_band_spins.append(spin)
+	for mip in svt_band_spins.size():
+		# An empty table is the automatic rule: show the edge that rule produces, so the
+		# boxes always read as real distances.
+		var automatic_edge := page_world * pow(2.0, float(mip + 1))
+		svt_band_spins[mip].set_value_no_signal(float(configured[mip]) if mip < configured.size() else automatic_edge)
+	_updating_settings = false
+	var parts: PackedStringArray = []
+	var previous := 0.0
+	for mip in svt_band_spins.size():
+		var edge := float(svt_band_spins[mip].value)
+		parts.append("%s–%s m → mip %d" % [_format_distance(previous), _format_distance(edge), mip])
+		previous = edge
+	var mode := "Explicit bands: every level named here is produced at exactly that distance." if not configured.is_empty() else "Automatic bands: one level per doubling of the %.0f m page. Editing a distance pins all bands explicitly." % page_world
+	svt_band_hint.text = "%s\n%s" % [mode, " · ".join(parts)]
+
+
+func _format_distance(p_metres: float) -> String:
+	if p_metres >= 1000.0:
+		return "%.1f km" % (p_metres / 1000.0)
+	return "%.0f" % p_metres
+
+
+func _on_svt_band_value_changed(_p_value: float, _p_mip: int) -> void:
+	if _updating_settings or terrain == null or not is_instance_valid(terrain):
+		return
+	var distances := PackedFloat32Array()
+	for spin in svt_band_spins:
+		distances.append(float(spin.value))
+	_call(terrain, "set_surface_svt_mip_distances", [distances])
+	# The setter normalises the table, so read back what it stored.
+	_svt_band_signature = ""
+	_refresh_svt_bands()
+
+
+func _on_svt_band_auto_pressed() -> void:
+	if terrain == null or not is_instance_valid(terrain):
+		return
+	_call(terrain, "set_surface_svt_mip_distances", [PackedFloat32Array()])
+	_svt_band_signature = ""
+	_refresh_svt_bands()
+
+
+func _on_svt_band_fit_pressed() -> void:
+	if terrain == null or not is_instance_valid(terrain):
+		return
+	var page_world := maxf(1.0, float(_call(terrain, "get_surface_svt_page_world")))
+	var distances := PackedFloat32Array()
+	for mip in maxi(1, svt_band_spins.size()):
+		distances.append(page_world * pow(2.0, float(mip + 1)))
+	_call(terrain, "set_surface_svt_mip_distances", [distances])
+	_svt_band_signature = ""
+	_refresh_svt_bands()
 
 
 func _refresh_bake_status(p_settings: Dictionary = {}) -> void:

@@ -99,6 +99,7 @@ func run() -> void:
 	var edited := await frame_image()
 	require(sample_area(edited, Vector2(32, 32)) == "g", "painting invalidates and rebakes AVT")
 	terrain.set_surface_vt_force_mip(false)
+	await settle() # Adaptive mode fills its coverage mip chain before measuring idle work.
 	var stable_bakes: int = terrain.get_vt_settings().producer.baked_pages
 	for x in [65.0, 95.0, 126.0, 66.0]:
 		camera.position.x = x

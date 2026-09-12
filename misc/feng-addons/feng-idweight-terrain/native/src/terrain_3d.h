@@ -48,6 +48,11 @@ public: // Constants
 		SIZE_2048 = 2048,
 	};
 
+	// Length of the shader's far-field distance table (main.glsl declares
+	// `_surface_svt_mip_distance[16]`). Levels above this are unreachable anyway: the
+	// indirection's mip chain caps the effective level well below it.
+	static constexpr int SVT_MIP_DISTANCE_COUNT = 16;
+
 private:
 	String _version = "1.1.0-dev";
 	String _data_directory;
@@ -116,6 +121,7 @@ private:
 	mutable Vector2i _vt_view_focus;
 	Vector2i _surface_vt_region_offset;
 	real_t _surface_vt_forward_regions = 0.f;
+	real_t _surface_vt_texels_per_pixel = 1.f;
 	bool _surface_vt_force_mip = false;
 	int _surface_vt_mip = 0;
 	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
@@ -154,6 +160,16 @@ private:
 	// what lets the shader resolve any world position without the region texture array,
 	// so it is the far field's fallback rather than a separate fallback page.
 	int _surface_svt_root_mips = 2;
+	// Distance -> level table for the far field, in metres. Entry m is the largest
+	// camera distance at which world mip m is sampled, so the table states the level
+	// bands explicitly instead of deriving them from the page size. Empty keeps the
+	// automatic rule (one level per doubling of _surface_svt_page_world).
+	//
+	// Both the page producer and the shader resolve a level through this one table, so
+	// a page is always produced at exactly the level the shader samples, and the
+	// rendered level is a pure function of distance: it cannot change when the working
+	// set, the pool pressure or the visible region set changes underneath it.
+	PackedFloat32Array _surface_svt_mip_distances;
 	Vector3i _surface_svt_scan_key = Vector3i(INT32_MAX, INT32_MAX, INT32_MAX);
 	int64_t _surface_svt_root_cursor = 0;
 	int64_t _surface_svt_detail_cursor = 0;
@@ -268,7 +284,12 @@ private:
 	// clipmap target, picks a mip per page from its distance, and produces the pages
 	// that are missing.
 	int update_surface_svt(int p_max_pages = 0);
-	int _surface_svt_mip_for_page(const real_t p_distance) const;
+	// The one far-field distance -> level rule, shared by the demand pass, the legacy
+	// grid scan and the shader uniform. p_distance is the camera distance in metres to
+	// the surface point being sampled or covered. p_max_mip overrides the level the far
+	// field currently publishes (the demand pass plans against the indirection's absolute
+	// limit); -1 uses the published level.
+	int get_surface_svt_mip_for_distance(const real_t p_distance, const int p_max_mip = -1) const;
 
 	void _setup_displacement_buffer();
 	void _update_displacement_buffer();
@@ -363,6 +384,8 @@ public:
 	Rect2i get_surface_vt_region_rect() const;
 	// Forces every sector to one mip, so a test can ask for a specific level instead
 	// of whatever the distance rule picks.
+	void set_surface_vt_texels_per_pixel(real_t p_value) { _surface_vt_texels_per_pixel = MAX(0.25f, p_value); }
+	real_t get_surface_vt_texels_per_pixel() const { return _surface_vt_texels_per_pixel; }
 	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
 	bool is_surface_vt_force_mip() const { return _surface_vt_force_mip; }
 	int get_surface_vt_mip() const { return _surface_vt_mip; }
@@ -397,6 +420,11 @@ public:
 	real_t get_surface_svt_distance() const { return _surface_svt_distance; }
 	void set_surface_svt_root_mips(const int p_mips);
 	int get_surface_svt_root_mips() const { return _surface_svt_root_mips; }
+	void set_surface_svt_mip_distances(const PackedFloat32Array &p_distances);
+	PackedFloat32Array get_surface_svt_mip_distances() const { return _surface_svt_mip_distances; }
+	int get_surface_svt_mip_distance_count() const { return int(_surface_svt_mip_distances.size()); }
+	// Largest distance the table (or the automatic rule) still serves with a page.
+	real_t get_surface_svt_mip_reach() const;
 	void set_surface_array_enabled(const bool p_enabled);
 	bool is_surface_array_enabled() const { return _surface_array_enabled; }
 	// Whether the array still has to carry the surface channel. It must, whenever no

@@ -40,7 +40,10 @@ Grid** follows the clipmap target (or camera) for character-centred workflows.
 Grid dimensions, world-grid offset and forward offset (in region units) are editable.
 Only eligible regions inside that grid publish AVT blocks; other terrain uses SVT. Metric distance does not select the AVT/SVT boundary.
 
-Adaptive allocation reduces virtual resolution to fit the shared physical capacity.
+Adaptive allocation chooses a power-of-two virtual image size independently for each
+sector from its projected texel demand (`surface_vt_texels_per_pixel`). Separate
+grow/shrink thresholds prevent boundary oscillation. It reserves the complete mip
+hierarchy and reduces far-sector resolution first to fit shared physical capacity.
 Resizing changes both virtual address and mip to preserve each cached page's world
 footprint. Fine pages that cannot cover a coarser footprint are discarded. Automatic
 demand retains pages used in the previous pass, so oversubscription retains valid ancestors or exposes missing pages
@@ -151,3 +154,47 @@ The native Inspector SVT subsection exposes **Bake All SVT Pages** alongside
 Clipmap trim, edge and fill meshes intentionally have thin rectangular shapes.
 The renderer instances identical meshes across LOD rings. VT material production
 uses compute dispatches and does not generate these terrain mesh shapes.
+
+AVT requests its mip hierarchy coarse-to-fine. Virtual-block growth remaps already
+baked pages to higher mip indices without changing their world footprint; those
+pages remain resident while finer pages are produced asynchronously. Shrink keeps
+compatible coarse pages. This is distinct from simply baking every sector at one
+fixed resolution. The selected AVT grid remains the boundary between producers;
+projection controls density within that grid, not an AVT/SVT distance switch.
+
+Visible SVT demand continues during offline generation, and exhausting the frame's
+production budget does not stop resident-page protection for the remaining working
+set. Missing persisted pages discovered by streaming schedule automatic repair when
+Auto Bake is enabled. With Auto Bake disabled, newly required but absent files remain
+explicit diagnostics until Bake.
+
+The level a far-field page is produced at comes from one distance table,
+`surface_svt_mip_distances` (one entry per level, in metres), and the shader resolves
+its sample level through the same table, then walks coarser only. A point's rendered
+level is therefore a pure function of its distance from the camera, and the sampled mip
+cannot follow page residency. When the pool cannot hold the selected set, the pass raises
+a coarseness floor: it finds the smallest level that makes the visible set fit and
+coarsens only the pages finer than that floor, so pages already coarser keep the level
+the table gives them, every visible chunk still resolves, and the choice depends on the
+visible set and the pool size rather than on eviction order. The earlier density-ratio
+selection coarsened every page until the whole set fit and extended the hierarchy to do
+it, which changed a page's level from frame to frame while pages published at the previous
+level stayed resident. `svt_effective_max_mip` reports the effective level cap.
+
+Both AVT and SVT page-table reads use `texelFetch` with an explicit integer mip.
+The material's `filter_nearest` sampler clamps sampled LOD to zero, so using
+`textureLod` here could miss resident ancestor pages and display the purple missing
+page diagnostic when the view selected coarser coverage. Integer page-table reads
+bypass that sampler clamp without changing physical material texture filtering.
+The adaptive GPU regression verifies that cached ancestors remain visible during
+block growth with a one-page production budget, including after the source
+material binding is replaced with a deliberately incorrect color.
+
+`vt_svt_coverage_runner.py` exercises persisted material SVT over 144 regions with
+an eight-slot shared pool and one-page update budget. It restores baked pages from disk
+with the source albedo deliberately poisoned, then moves and turns the camera. A turn
+that brings nearer terrain into view must produce the finer levels the distance table
+names and auto-bake the pages behind them before all 81 visible non-AVT samples match
+their authored materials. `vt_mip_bands_runner.py` pins the table itself: the band
+edges, that every probe's distance-selected level is published, that a settled view
+moves no level, and that a crowded pool keeps the nearest pages and still settles.

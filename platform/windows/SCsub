@@ -116,7 +116,7 @@ if env["library_type"] == "static_library":
 elif env["library_type"] == "shared_library":
     prog = env.add_shared_library("#bin/godot", sources, PROGSUFFIX=env["PROGSUFFIX"])
 else:
-    prog = env.add_program("#bin/godot_vt_shadow", sources, PROGSUFFIX=env["PROGSUFFIX"])
+    prog = env.add_program("#bin/godot", sources, PROGSUFFIX=env["PROGSUFFIX"])
 arrange_program_clean(prog)
 
 env.Depends(prog, "godot.manifest")

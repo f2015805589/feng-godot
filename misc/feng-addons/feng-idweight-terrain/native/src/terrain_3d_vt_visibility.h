@@ -10,6 +10,11 @@ using namespace godot;
 struct VisiblePatch {
 	Vector3 nearest;
 	float distance = 1e30f;
+	// Distance to the farthest visible point of the same footprint. The far-field
+	// demand needs both ends of the span: a page carries every level its visible
+	// footprint reaches into, from the level of its nearest point to the level of its
+	// farthest one.
+	float farthest = 0.f;
 	float density = 0.f;
 };
 struct VisibleView {
@@ -57,6 +62,7 @@ struct VisibleView {
 			bool positive = false, negative = false;
 			Vector3 nearest;
 			float best = 1e30f;
+			float worst = 0.f;
 			for (size_t i = 0; i < polygon.size(); ++i) {
 				const Vector3 a = polygon[i], b = polygon[(i + 1) % polygon.size()];
 				const Vector3 edge = b - a;
@@ -66,11 +72,15 @@ struct VisibleView {
 				const Vector3 point = a + edge * CLAMP((ground - a).dot(edge) / MAX(0.000001f, edge.length_squared()), 0.f, 1.f);
 				const float distance = point.distance_squared_to(eye);
 				if (distance < best) { best = distance; nearest = point; }
+				worst = MAX(worst, distance);
 			}
 			if (!(positive && negative)) { nearest = ground; best = ground.distance_squared_to(eye); }
 			if (best < result.distance * result.distance) {
 				result.nearest = nearest;
 				result.distance = Math::sqrt(best);
+				// Distance is convex over a convex polygon, so the vertices carry the
+				// farthest point; the frustum polygon is convex by construction.
+				result.farthest = Math::sqrt(worst);
 				result.density = orthographic ? focal : focal / MAX(0.01f, (nearest - eye).dot(forward));
 			}
 		}

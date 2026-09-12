@@ -141,6 +141,15 @@ func run() -> void:
 	# A fresh terrain and disabled physics make the manual SVT request deterministic.
 	# No persisted tile exists, so the request is expected to be recorded as Missing
 	# bake; page residency/order is the assertion, not material-channel readiness.
+	# Move several regions beyond storage order before checking SVT priority. The
+	# first request may use a coarser mip when the page budget requires it.
+	camera.position = Vector3(32.0, 40.0, 320.0)
+	camera.look_at(Vector3(32.0, 0.0, 700.0), Vector3.UP)
+	await frame_barrier()
+	var svt_focus: Rect2i = terrain.get_surface_vt_region_rect()
+	print("VT_VISIBILITY_SVT_FOCUS ", svt_focus)
+	require(svt_focus.size == Vector2i.ONE and svt_focus.position.y >= 3,
+			"SVT camera should select a region beyond the storage-first row, got " + str(svt_focus))
 	terrain.surface_vt_enabled = false
 	terrain.surface_svt_enabled = true
 	terrain.set_surface_vt_force_mip(false)
@@ -152,20 +161,32 @@ func run() -> void:
 	require(records.size() == 1, "one-page SVT budget should create one SVT record, got " + str(records.size()))
 	if records.size() == 1:
 		var first: Dictionary = records[0]
-		var address: Vector2i = first.get("address", Vector2i(-1, -1))
-		require(address == Vector2i(far_focus.position.x, far_focus.position.y),
-				"first SVT page should match the nearest visible region, expected " + str(far_focus.position) + " got " + str(address))
-		require(int(first.get("mip", -1)) == 0, "the 64m visible region should request its mip-0 page")
+		var page_rect: Rect2 = first.get("world_rect", Rect2())
+		var nearest_center := (Vector2(svt_focus.position) + Vector2(0.5, 0.5)) * REGION_SIZE
+		var storage_first_center := Vector2(0.5, 0.5) * REGION_SIZE
+		require(page_rect.has_point(nearest_center),
+				"first SVT page should cover nearest visible region center %s, got mip %d rect %s" %
+				[str(nearest_center), int(first.get("mip", -1)), str(page_rect)])
+		require(not page_rect.has_point(storage_first_center),
+				"first SVT page should follow nearest visible demand instead of covering storage-first region center %s; got mip %d rect %s" %
+				[str(storage_first_center), int(first.get("mip", -1)), str(page_rect)])
+		require(int(first.get("mip", -1)) >= 0,
+				"visible SVT page should report a valid mip, got " + str(first.get("mip", -1)))
 		require(first.get("state", "") == "Missing bake",
 				"an uncached SVT page should be reported as Missing bake, got " + str(first.get("state", "")))
 		require(not bool(first.get("ready", false)), "an uncached SVT page must not be treated as ready")
 
-	# Looking away from every loaded region must not add SVT requests.
-	camera.look_at(AWAY_LOOK_AT, Vector3.UP)
+	# Looking away from every loaded region must not add SVT requests. Look up and back:
+	# a shallow backward tilt still grazes distant terrain at the frustum's bottom edge,
+	# which is a legitimate page request rather than a failure to face away.
+	camera.look_at(Vector3(32.0, 4000.0, -400.0), Vector3.UP)
 	await frame_barrier()
 	var before_away := records.size()
 	var away_requested := terrain.update_surface_svt(1)
 	var after_away := svt_records()
+	for record: Dictionary in after_away:
+		print("VT_VISIBILITY_SVT_AWAY_RECORD ", record.get("address", Vector2i.ZERO),
+				" mip ", record.get("mip", -1), " rect ", record.get("world_rect", Rect2()))
 	print("VT_VISIBILITY_SVT_AWAY requested=", away_requested, " records=", after_away.size())
 	require(away_requested == 0, "camera facing away from loaded terrain should request no SVT pages")
 	require(after_away.size() == before_away,

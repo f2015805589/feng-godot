@@ -525,6 +525,9 @@ void main() {
 				}
 
 #undef BIAS_FUNC
+				// Cascades cover only the configured shadow range. Match Forward+
+				// beyond that range instead of sampling unrelated last-cascade texels.
+				shadow = mix(shadow, 1.0, smoothstep(directional_lights.data[i].fade_from, directional_lights.data[i].fade_to, vertex.z));
 			}
 
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);

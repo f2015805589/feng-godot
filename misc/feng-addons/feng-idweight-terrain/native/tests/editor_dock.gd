@@ -234,7 +234,7 @@ func _run() -> void:
 			"inspector Bake All controls are not nested under a native inspector foldout"):
 		return
 	var svt_inspector_sections: Array[Control] = []
-	section_node = inspector_svt_controls.get_parent()
+	var section_node: Node = inspector_svt_controls.get_parent()
 	while section_node:
 		if section_node.get_class() == "EditorInspectorSection":
 			svt_inspector_sections.push_front(section_node as Control)
@@ -256,7 +256,7 @@ func _run() -> void:
 	# path before checking the VT Page child. This exercises the actual nested
 	# inspector hierarchy instead of relying on a detached custom control.
 	var inspector_sections: Array[Control] = []
-	var section_node: Node = inspector_page_section.get_parent()
+	section_node = inspector_page_section.get_parent()
 	while section_node:
 		if section_node.get_class() == "EditorInspectorSection":
 			inspector_sections.push_front(section_node as Control)

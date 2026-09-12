@@ -98,6 +98,12 @@ uniform int _surface_svt_page_size = 256;
 uniform int _surface_svt_page_border = 4;
 uniform int _surface_svt_max_mip = 4;
 uniform int _surface_svt_indirection_size = 1024;
+// Distance -> level table, in metres: entry m is the largest camera distance sampled at
+// world mip m. `_surface_svt_mip_distance_count` 0 keeps the automatic rule (one level
+// per doubling of the page's world size). The CPU demand pass resolves a page's level
+// with the same table, so the level that was produced is the level sampled here.
+uniform int _surface_svt_mip_distance_count = 0;
+uniform float _surface_svt_mip_distance[16];
 uniform highp sampler2D _surface_svt_indirection : filter_nearest, repeat_disable;
 uniform highp sampler2DArray _surface_svt_atlas : repeat_disable;
 uniform float _texture_normal_depth_array[32];
@@ -230,10 +236,8 @@ bool surface_vt_sample(const int p_layer, const ivec2 p_surface_texel, out uint 
 		if ((1 << mip) > block_size) { break; }
 		ivec2 coord = virtual_page >> mip;
 		int level_size = max(1, _surface_vt_indirection_size >> mip);
-		// textureLod rather than texelFetch: the mip level is dynamic here.
-		float slot_f = textureLod(_surface_vt_indirection,
-				(vec2(clamp(coord, ivec2(0), ivec2(level_size - 1))) + 0.5) / float(level_size),
-				float(mip)).r;
+		// Page-table lookup must bypass sampler LOD clamps and filtering.
+		float slot_f = texelFetch(_surface_vt_indirection, clamp(coord, ivec2(0), ivec2(level_size - 1)), mip).r;
 		int slot = int(slot_f + 0.5);
 		if (slot == 65535 || slot < 0) {
 			continue;
@@ -255,11 +259,47 @@ bool surface_vt_sample(const int p_layer, const ivec2 p_surface_texel, out uint 
 // `p_surface_texel` addresses the stored payload (the surface_density grid). Both are
 // needed because the array deliberately stays at region_size while the payload is
 // density times finer.
+)"
+
+R"(
 // Far field through the sparse virtual texture. `p_world` is world XZ in metres. The
 // page grid is world aligned and centred on the origin, so the page is `floor(world /
 // page_world)` and the indirection coordinate is `(page + half) >> mip`, which is the
-// same formula Terrain3DVirtualTexture::world_page_to_virtual publishes with. Walking
-// mips fine to coarse is what lets one coarse page serve a whole distant valley.
+// same formula Terrain3DVirtualTexture::world_page_to_virtual publishes with.
+//
+// `p_world` carries the terrain height of the fragment so the distance matches the one
+// the demand pass measured for the page: a page is produced for a level by its distance
+// from the camera, and this is the distance of the fragment inside it.
+float surface_svt_distance(vec2 p_world) {
+	return length(vec3(p_world.x, v_vertex.y, p_world.y) - v_camera_pos);
+}
+
+// The far field's distance -> level rule. Mirrors
+// Terrain3D::get_surface_svt_mip_for_distance() exactly: with an explicit table, level m
+// covers distances up to entry m; without one, a mip m page covers page_world * 2^m
+// metres, so level m serves out to twice that.
+int surface_svt_mip_for_distance(float p_distance) {
+	if (_surface_svt_mip_distance_count > 0) {
+		int last = min(_surface_svt_mip_distance_count - 1, _surface_svt_max_mip);
+		int mip = 0;
+		while (mip < last && p_distance > _surface_svt_mip_distance[mip]) {
+			mip++;
+		}
+		return min(mip, _surface_svt_max_mip);
+	}
+	int mip = 0;
+	float threshold = max(1.0, _surface_svt_page_world * 2.0);
+	while (mip < _surface_svt_max_mip && p_distance > threshold) {
+		threshold *= 2.0;
+		mip++;
+	}
+	return mip;
+}
+
+// Sampling starts at the level the distance selects and only ever walks coarser, so the
+// renderer can never show a level finer than the distance allows: a missing page
+// degrades to the next level up (the protected roots guarantee one exists) instead of
+// picking whatever finer page happens to still be resident.
 bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	if (!_surface_svt_enabled) {
 		return false;
@@ -268,12 +308,11 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	int stored = _surface_svt_page_size + 2 * _surface_svt_page_border;
 	ivec2 page = ivec2(floor(p_world / _surface_svt_page_world));
 	if (any(lessThan(page + ivec2(half), ivec2(0))) || any(greaterThanEqual(page + ivec2(half), ivec2(_surface_svt_indirection_size)))) { return false; }
-	for (int mip = 0; mip <= _surface_svt_max_mip; mip++) {
+	int start_mip = surface_svt_mip_for_distance(surface_svt_distance(p_world));
+	for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
 		ivec2 coord = (page + ivec2(half)) >> mip;
 		int level_size = max(1, _surface_svt_indirection_size >> mip);
-		float slot_f = textureLod(_surface_svt_indirection,
-				(vec2(clamp(coord, ivec2(0), ivec2(level_size - 1))) + 0.5) / float(level_size),
-				float(mip)).r;
+		float slot_f = texelFetch(_surface_svt_indirection, clamp(coord, ivec2(0), ivec2(level_size - 1)), mip).r;
 		int slot = int(slot_f + 0.5);
 		if (slot == 65535 || slot < 0) {
 			continue;
@@ -322,7 +361,7 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 				if ((1 << mip) > size) { break; }
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_vt_indirection_size >> mip);
-				int slot = int(textureLod(_surface_vt_indirection, (vec2(coord) + 0.5) / float(level_size), float(mip)).r + 0.5);
+				int slot = int(texelFetch(_surface_vt_indirection, coord, mip).r + 0.5);
 				vec2 offset = fract(local * float(max(1, size >> mip)));
 				if (surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, r_mat, r_normal)) { return true; }
 			}
@@ -333,10 +372,11 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 		ivec2 page = ivec2(floor(world / _surface_svt_page_world));
 		ivec2 virtual_page = page + ivec2(_surface_svt_indirection_size >> 1);
 		if (all(greaterThanEqual(virtual_page, ivec2(0))) && all(lessThan(virtual_page, ivec2(_surface_svt_indirection_size)))) {
-			for (int mip = 0; mip <= _surface_svt_max_mip; mip++) {
+			int start_mip = surface_svt_mip_for_distance(surface_svt_distance(world));
+			for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
-				int slot = int(textureLod(_surface_svt_indirection, (vec2(coord) + 0.5) / float(level_size), float(mip)).r + 0.5);
+				int slot = int(texelFetch(_surface_svt_indirection, coord, mip).r + 0.5);
 				vec2 offset = fract(world / (_surface_svt_page_world * float(1 << mip)));
 				if (surface_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, r_mat, r_normal)) { return true; }
 			}

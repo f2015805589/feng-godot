@@ -779,10 +779,23 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());
 		RS->material_set_param(p_material, "_surface_svt_page_border", svt->get_page_border());
 		RS->material_set_param(p_material, "_surface_svt_max_mip", svt->get_world_max_mip());
+		// The distance -> level table, padded to the shader's fixed array size. The
+		// demand pass resolves a page's level with this same table, which is what keeps
+		// the produced level and the sampled level identical.
+		PackedFloat32Array mip_distances;
+		mip_distances.resize(Terrain3D::SVT_MIP_DISTANCE_COUNT);
+		PackedFloat32Array configured_distances = _terrain->get_surface_svt_mip_distances();
+		const int distance_count = MIN(int(configured_distances.size()), Terrain3D::SVT_MIP_DISTANCE_COUNT);
+		for (int i = 0; i < Terrain3D::SVT_MIP_DISTANCE_COUNT; i++) {
+			mip_distances[i] = distance_count > 0 ? configured_distances[MIN(i, distance_count - 1)] : 0.f;
+		}
+		RS->material_set_param(p_material, "_surface_svt_mip_distance", mip_distances);
+		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", distance_count);
 		RS->material_set_param(p_material, "_surface_svt_indirection_size", svt->get_indirection_size());
 		RS->material_set_param(p_material, "_surface_svt_indirection", svt->get_indirection_rid());
 		RS->material_set_param(p_material, "_surface_svt_atlas", svt->get_atlas_rid());
 	} else {
+		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", 0);
 		RS->material_set_param(p_material, "_surface_svt_indirection", _generated_dummy_2d.get_rid());
 		RS->material_set_param(p_material, "_surface_svt_atlas", _generated_dummy.get_rid());
 	}

@@ -287,8 +287,9 @@ page = one region"). The test pins:
 * page content texel by texel, border included: a border texel must read the **neighbouring**
   region's payload, not a clamped copy of this page's own edge (a producer property — the shader
   point-samples corners and never reads the border today);
-* the world-space mip chain: the page under the target is published at mip 0 while a page 181 m
-  away is published at mip 1, and that page holds no mip 0 entry;
+* the world-space mip chain: the page under the camera is published at mip 0 while a page about
+  185 m away is published at mip 1, and that page holds no mip 0 entry (the bands are measured
+  from the camera, which is the reference the shader uses);
 * the root pyramid: every texel of the coarsest `surface_svt_root_mips` levels is resident and
   protected, and a page 6.4 km away (far outside the 256 m distance window) resolves through it;
 * invalidating a region's pages re-produces them from the payload and restores the frame;
@@ -301,6 +302,33 @@ page = one region"). The test pins:
 Root pages are protected because they are the fallback of last resort: if one is evicted, a miss
 has nothing to show. Size `surface_svt_page_count` for the distance window **plus** the root
 pyramid, or the LRU will evict the near pages the test is about to look for.
+
+## Far-field distance -> mip bands
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_mip_bands_runner.py --driver d3d12
+```
+
+The production far field picks a page's level from its distance, through one table that the page
+producer (`Terrain3D::get_surface_svt_mip_for_distance`) and the shader
+(`surface_svt_mip_for_distance` in `main.glsl`) both read: `surface_svt_mip_distances` holds one
+entry per level, in metres, the furthest camera distance that level is sampled at, and an empty
+table reproduces the automatic rule exactly (one level per doubling of `surface_svt_page_world`).
+The shader starts its walk at that level and only walks coarser, which is what stops the rendered
+mip from following page residency — the regression this covers:
+
+* the band edges, including that a band edge belongs to its own level and that distances past the
+  last entry keep the coarsest listed level;
+* for probes spanning levels 0..3, that the level the shader starts at is the level that was
+  produced (the indirection publishes a slot there), so the shader never has to fall back;
+* a settled view moves no level and does not keep allocating/evicting, and a small camera move
+  that stays inside every band moves no level either;
+* an over-subscribed pool (8 slots) raises a coarseness floor rather than rewriting levels:
+  every probe still resolves (its own level or a coarser ancestor), the nearest ones first, and
+  the pool stops allocating/evicting once the view settles.
+
+`vt_svt_coverage_runner.py` keeps covering the persisted-material side (auto-bake repair of newly
+required levels over 144 regions with an eight-slot pool).
 
 ## AVT material pages and persisted SVT
 

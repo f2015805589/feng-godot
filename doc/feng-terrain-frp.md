@@ -54,7 +54,7 @@ Terrain3D 的 **Surface Density**（1/2/4/8 texel·m⁻¹，默认 1）决定 Su
 Surface 通道有两级虚拟纹理，对应 Hydra 的 AVT/SVT 拆分：
 
 - **近场（AVT）**：页网格切在 region 内部，`surface_vt_enabled` 打开；页 256 texel、每轴 4 页，density 4 时与源数据 1:1，mip 链到"一页 = 一个 region"为止。半径 `surface_vt_distance`（默认 512 m）。
-- **远场（SVT）**：页是**世界空间**的固定方块（`surface_svt_page_world` 默认 512 m / 256 texel），mip 层数由页相对世界的尺寸决定，一页可跨多个 region，页内容按世界坐标取所属 region 的 payload，页边框填邻居 texel。最粗的 `surface_svt_root_mips` 级**常驻且受保护**，任何世界坐标都能解析出粗略真实数据——它就是替代数组的兜底。
+- **远场（SVT）**：页是**世界空间**的固定方块（`surface_svt_page_world` 默认 512 m / 256 texel），一页可跨多个 region，页内容按世界坐标取所属 region 的 payload，页边框填邻居 texel。**每个点用哪一级 mip 由距离决定，产页端与着色器读同一张表**：`surface_svt_mip_distances`（每级一项、单位米，第 m 项是该级被采样的最远距离；留空则按页尺寸自动：第 m 级用到 `2^(m+1) × page_world` 米）。着色器从该级开始、**只往更粗走**，所以渲染出的 mip 只是距离的函数，不会跟着"哪个页恰好常驻"跳变；缺页时退回更粗一级而不是暴露更细的残留页。池子装不下时丢最远的页并报告一次，**不**改写保留页的级别。最粗的 `surface_svt_root_mips` 级**常驻且受保护**，任何世界坐标都能解析出粗略真实数据——它就是替代数组的兜底。Dock 的 SVT 面板按级列出这些距离可直接编辑。
 - 着色器查找顺序：近场 → 远场 → 数组。`surface_array_enabled = false` 时 surface 数组层不再上传 payload（数组仍分配但为空），从而省掉 density² 的显存；编辑会通过 `invalidate_surface_pages()` 让相关页失效并重产。Debug Views 走同一条查找链，因此关掉数组也能用。两级虚拟纹理**都**关闭时数组会被强制继续承载 surface 通道（否则整片会渲染成 0 号材质）。默认仍为 `true`（翻转默认会改变所有既有项目的渲染结果，且尚未在真实场景测量显存/FPS）。
 
 ## 自定义 FRP Pass
