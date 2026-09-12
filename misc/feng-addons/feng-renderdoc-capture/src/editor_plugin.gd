@@ -70,28 +70,33 @@ func _on_capture_pressed() -> void:
 		return
 	_busy = true
 	button.disabled = true
-	var previous_count := FengRenderDoc.get_capture_count()
-	# The editor deliberately stops rendering unchanged viewports while it is
-	# idle.  A static scene can therefore miss the one Present that RenderDoc
-	# waits for, or leave the scene SubViewport stale while the editor chrome is
-	# redrawn.  Keep the visible 3D editor viewports alive for this one capture.
+	# The editor deliberately stops rendering unchanged viewports while it is idle, so
+	# keep the visible 3D editor viewports alive for this one capture: the capture renders
+	# the frame itself, and a stale SubViewport would put a stale scene into it.
 	var forced_viewports: Array = _prepare_capture_viewports()
 	_capture_forced_viewports = forced_viewports
 	EditorInterface.get_base_control().queue_redraw()
+	# Render one frame and capture exactly that frame. Queuing "the next presented frame"
+	# instead can land on a UI-only update, which holds a handful of commands and none of
+	# the scene passes.
+	var capture := str(RenderDocCapture.capture_frame(button.get_window().get_window_id()))
+	_restore_capture_viewports(forced_viewports)
+	_busy = false
+	button.disabled = false
+	if not capture.is_empty() and FileAccess.file_exists(capture):
+		_open_capture(gui, capture)
+		return
+	# Nothing could be recorded explicitly: fall back to the queued trigger, which
+	# captures the next frame the editor presents.
+	var previous_count := FengRenderDoc.get_capture_count()
+	_prepare_capture_viewports()
 	if not FengRenderDoc.trigger_capture(button.get_window().get_window_id()):
 		_restore_capture_viewports(forced_viewports)
-		_busy = false
-		button.disabled = false
 		_warning("Could not trigger a capture in the current editor.")
 		return
-	# TriggerCapture queues the next presented frame of this process. Wait for
-	# the completed file before launching the analyzer, not a second engine.
 	EditorInterface.get_base_control().queue_redraw()
-	var deadline := Time.get_ticks_msec() + 30000
+	var deadline := Time.get_ticks_msec() + 10000
 	while is_inside_tree() and FengRenderDoc.get_capture_count() <= previous_count and Time.get_ticks_msec() < deadline:
-		# Keep a static editor scene producing Presents while RenderDoc waits for
-		# the capture boundary.  This also covers viewports that were already in
-		# UPDATE_ALWAYS but would otherwise go idle after one redraw.
 		EditorInterface.get_base_control().queue_redraw()
 		await get_tree().create_timer(0.1).timeout
 	if not is_inside_tree():
@@ -102,16 +107,20 @@ func _on_capture_pressed() -> void:
 	_busy = false
 	button.disabled = false
 	if capture_count <= previous_count:
-		_warning("RenderDoc did not capture a presented editor frame within 30 seconds.")
+		_warning("RenderDoc did not record a frame.")
 		return
-	var capture := FengRenderDoc.get_capture_path(previous_count)
-	if capture.is_empty() or not FileAccess.file_exists(capture):
+	var queued_capture := FengRenderDoc.get_capture_path(previous_count)
+	if queued_capture.is_empty() or not FileAccess.file_exists(queued_capture):
 		_warning("RenderDoc did not produce a capture file.")
 		return
-	if OS.create_process(gui, PackedStringArray([capture])) <= 0:
-		_warning("Could not launch RenderDoc. Capture saved to " + capture)
+	_open_capture(gui, queued_capture)
+
+
+func _open_capture(p_gui: String, p_capture: String) -> void:
+	if OS.create_process(p_gui, PackedStringArray([p_capture])) <= 0:
+		_warning("Could not launch RenderDoc. Capture saved to " + p_capture)
 		return
-	_status("Current editor frame opened in RenderDoc.")
+	_status("Rendered frame opened in RenderDoc.")
 
 
 func _status(message: String) -> void:

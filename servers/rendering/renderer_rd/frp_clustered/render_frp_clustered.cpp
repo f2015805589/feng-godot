@@ -44,6 +44,11 @@
 #include "servers/rendering/storage/compositor_storage.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
 
+#include "modules/modules_enabled.gen.h" // IWYU pragma: keep.
+#if defined(TOOLS_ENABLED) && defined(MODULE_FENG_RENDERDOC_ENABLED)
+#include "modules/feng_renderdoc/feng_renderdoc.h"
+#endif
+
 using namespace RendererSceneRenderImplementation;
 
 #define PRELOAD_PIPELINES_ON_SURFACE_CACHE_CONSTRUCTION 1
@@ -55,6 +60,20 @@ using namespace RendererSceneRenderImplementation;
 // when their actual operation has no work this frame.  This callback is
 // intentionally empty: it records no GPU command and has no resource usage.
 static void _frp_pass_debug_marker(RDD *, RDD::CommandBufferID, void *) {
+}
+
+// A GPU capture tool needs every pass label to own the work it names. The default pass
+// order has no user-authored boundaries, so the command graph is normally free to move
+// work between passes; in a capture that shows up as pass labels running empty while the
+// real draws land under a later scope of the same name, which makes the frame unreadable.
+// Pin the order only while a capture tool is attached, so a normal run keeps the
+// scheduling freedom the default order is there for.
+static bool _capture_tool_attached() {
+#if defined(TOOLS_ENABLED) && defined(MODULE_FENG_RENDERDOC_ENABLED)
+	return FengRenderDoc::is_hooked();
+#else
+	return false;
+#endif
 }
 
 void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_specular() {
@@ -2876,8 +2895,15 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	} else {
 		// VT Pass is deliberately first so registered material-page producers
 		// finish their GPU work before any G-buffer draw can consume it.
+		const bool pinned_pass_order = _capture_tool_attached();
+		if (pinned_pass_order) {
+			RD::get_singleton()->draw_command_insert_ordering_barrier();
+		}
 		run_builtin_pass(16, builtin_pass_names[16]);
 		for (int pass = 0; pass < 16; pass++) {
+			if (pinned_pass_order) {
+				RD::get_singleton()->draw_command_insert_ordering_barrier();
+			}
 			run_builtin_pass(pass, builtin_pass_names[pass]);
 		}
 	}
