@@ -50,6 +50,16 @@ uniform float _tessellation_level = 0.f;
 uniform uint _background_mode = 1u; // NONE = 0, FLAT = 1, NOISE = 2
 uniform uint _mouse_layer = 0x80000000u; // Layer 32
 uniform float _vertex_spacing = 1.0;
+uniform vec4 _avt_region_rect = vec4(0.0);
+uniform float _avt_base_block_size = 256.0;
+uniform float _avt_mip_distance[16];
+uniform int _avt_mip_distance_count = 0;
+uniform bool _avt_sectors_enabled = false;
+uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
+uniform int _avt_directory_mask = 0;
+uniform int _avt_root_level = 1;
+uniform bool _avt_fade_enabled = false;
+uniform vec4 _avt_slot_fade[256];
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1./region_size
@@ -346,28 +356,7 @@ bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 	return true;
 }
 
-bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
-	if (!_surface_material_enabled) { return false; }
-	float region_world = _region_size * _vertex_spacing;
-	ivec2 region = ivec2(floor(world / region_world));
-	int layer = get_region_layer(region);
-	if (_surface_vt_enabled && layer >= 0 && layer < MAX_REGIONS) {
-		ivec2 block = ivec2(_surface_vt_blocks[layer]);
-		int size = max(1, int(_surface_vt_block_sizes[layer]));
-		vec2 local = world / region_world - vec2(region);
-		ivec2 virtual_page = block + ivec2(floor(local * float(size)));
-		if (block.x >= 0) {
-			for (int mip = 0; mip <= _surface_vt_max_local_mip; mip++) {
-				if ((1 << mip) > size) { break; }
-				ivec2 coord = virtual_page >> mip;
-				int level_size = max(1, _surface_vt_indirection_size >> mip);
-				int slot = int(texelFetch(_surface_vt_indirection, coord, mip).r + 0.5);
-				vec2 offset = fract(local * float(max(1, size >> mip)));
-				if (surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, r_mat, r_normal)) { return true; }
-			}
-			return false; // This region is assigned to AVT; expose its missing pages.
-		}
-	}
+bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
 	if (_surface_svt_enabled) {
 		ivec2 page = ivec2(floor(world / _surface_svt_page_world));
 		ivec2 virtual_page = page + ivec2(_surface_svt_indirection_size >> 1);
@@ -383,6 +372,161 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 		}
 	}
 	return false;
+}
+
+vec4 avt_directory_texel(int index) {
+	int width = textureSize(_avt_sector_directory, 0).x;
+	return texelFetch(_avt_sector_directory, ivec2(index % width, index / width), 0);
+}
+
+bool avt_find_sector(ivec2 key, int level, out vec4 block) {
+	if (_avt_directory_mask == 0) { return false; }
+	uint hash = uint(key.x) * 73856093u ^ uint(key.y) * 19349663u ^ uint(level) * 83492791u;
+	int index = int(hash & uint(_avt_directory_mask));
+	for (int probe = 0; probe <= _avt_directory_mask; ++probe) {
+		vec4 entry = avt_directory_texel(index * 2);
+		if (entry.w == 0.0) { return false; }
+		if (all(equal(ivec2(entry.xy), key)) && int(entry.z) == level) {
+			block = avt_directory_texel(index * 2 + 1);
+			return true;
+		}
+		index = (index + 1) & _avt_directory_mask;
+	}
+	return false;
+}
+
+int avt_distance_mip(float distance_to_camera, int top) {
+	int mip = 0;
+	float edge = 8.0;
+	while (mip < top) {
+		if (mip < _avt_mip_distance_count) { edge = _avt_mip_distance[mip]; }
+		if (distance_to_camera <= edge) { break; }
+		mip++; edge *= 2.0;
+	}
+	return mip;
+}
+
+)"
+
+R"(
+// Resolve in world texel units across both local sector mips and the retained
+// world hierarchy. A sector without a ready fine page does not skip its parents.
+bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out material result, out vec3 result_normal,
+		out float texel_world, out vec4 footprint, out float arrival) {
+	for (int level = 0; level <= _avt_root_level; ++level) {
+		float span = 64.0 * float(1 << level);
+		// The first world parent has a fixed world footprint. Its texel size
+		// can be less than twice the last local mip for non-power-of-two density
+		// (e.g. 768 texels/m); switch at its actual size, not a rounded local LOD.
+		if (level == 0 && _avt_base_block_size > 1.0 && pixel_world >= 128.0 / float(_surface_vt_page_size)) { continue; }
+		if (level > 0 && level < _avt_root_level && pixel_world >= 2.0 * span / float(_surface_vt_page_size)) { continue; }
+		ivec2 sector = ivec2(floor(world / span));
+		vec4 entry;
+		if (!avt_find_sector(sector, level, entry)) { continue; }
+		float base_texel = span / (entry.w * float(_surface_vt_page_size));
+		int top = int(round(log2(entry.z)));
+		int start = int(floor(log2(max(1.0, pixel_world / base_texel))));
+		start = max(start, int(ceil(log2(max(1.0, minimum_texel / base_texel)))));
+		// A world parent is also the clamp for footprints larger than the tree root.
+		if (level == _avt_root_level && minimum_texel <= base_texel * float(1 << top)) { start = min(start, top); }
+		vec2 local = world / span - vec2(sector);
+		ivec2 page = ivec2(entry.xy) + ivec2(floor(local * entry.w));
+		for (int mip = max(0, start); mip <= top; ++mip) {
+			int slot = int(texelFetch(_surface_vt_indirection, page >> mip, mip).r + 0.5);
+			vec2 offset = fract(local * entry.w / float(1 << mip));
+			if (!surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, result, result_normal)) { continue; }
+			texel_world = base_texel * float(1 << mip);
+			arrival = _avt_fade_enabled ? _avt_slot_fade[slot >> 2][slot & 3] : 1.0;
+			float page_span = texel_world * float(_surface_vt_page_size);
+			vec2 origin = vec2(sector) * span + floor(local * entry.w / float(1 << mip)) * page_span;
+			footprint = vec4(max(origin, vec2(sector) * span), min(origin + page_span, vec2(sector + ivec2(1)) * span));
+			return true;
+		}
+	}
+	return false;
+}
+
+float avt_detail_availability(vec2 world, float texel_world) {
+	for (int level = 0; level <= _avt_root_level; ++level) {
+		float span = 64.0 * float(1 << level);
+		if (level > 0 && span / float(_surface_vt_page_size) > texel_world * 1.001) { break; }
+		ivec2 sector = ivec2(floor(world / span));
+		vec4 entry;
+		if (!avt_find_sector(sector, level, entry)) { continue; }
+		float base_texel = span / (entry.w * float(_surface_vt_page_size));
+		if (base_texel > texel_world * 1.001) { continue; }
+		int mip = clamp(int(floor(log2(texel_world / base_texel) + 0.001)), 0, int(round(log2(entry.z))));
+		vec2 local = world / span - vec2(sector);
+		ivec2 page = ivec2(entry.xy) + ivec2(floor(local * entry.w));
+		int slot = int(texelFetch(_surface_vt_indirection, page >> mip, mip).r + 0.5);
+		if (slot < 0 || slot == 65535) { continue; }
+		// AVT page readiness is uniform over its material payload.
+		if (texelFetch(_surface_material_params, ivec3(_surface_vt_page_border, _surface_vt_page_border, slot), 0).a >= 0.99) { return _avt_fade_enabled ? _avt_slot_fade[slot >> 2][slot & 3] : 1.0; }
+	}
+	return 0.0;
+}
+
+bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out vec3 r_normal) {
+	float fine_texel;
+	float arrival;
+	vec4 rect;
+	if (!avt_resolve(world, pixel_world, 0.0, r_mat, r_normal, fine_texel, rect, arrival)) { return false; }
+	float detail = arrival;
+	float width = min(min(rect.z - rect.x, rect.w - rect.y) * 0.25, max(fine_texel * 16.0, pixel_world * 8.0));
+	float epsilon = fine_texel * 0.01;
+	// Feather only where the neighbour is genuinely coarser or pending. Equally
+	// detailed neighbouring pages stay sharp right across their shared border.
+	if (world.x - rect.x < width) { detail = min(detail, mix(avt_detail_availability(vec2(rect.x - epsilon, world.y), fine_texel), 1.0, smoothstep(0.0, width, world.x - rect.x))); }
+	if (rect.z - world.x < width) { detail = min(detail, mix(avt_detail_availability(vec2(rect.z + epsilon, world.y), fine_texel), 1.0, smoothstep(0.0, width, rect.z - world.x))); }
+	if (world.y - rect.y < width) { detail = min(detail, mix(avt_detail_availability(vec2(world.x, rect.y - epsilon), fine_texel), 1.0, smoothstep(0.0, width, world.y - rect.y))); }
+	if (rect.w - world.y < width) { detail = min(detail, mix(avt_detail_availability(vec2(world.x, rect.w + epsilon), fine_texel), 1.0, smoothstep(0.0, width, rect.w - world.y))); }
+	material coarse;
+	vec3 coarse_normal;
+	float coarse_texel;
+	float coarse_arrival;
+	vec4 coarse_rect;
+	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, coarse, coarse_normal, coarse_texel, coarse_rect, coarse_arrival)) { return true; }
+	float mip_weight = clamp(log2(max(pixel_world / fine_texel, 1.0)) / log2(coarse_texel / fine_texel), 0.0, 1.0);
+	float weight = 1.0 - detail * (1.0 - mip_weight);
+	r_mat.albedo_height = mix(r_mat.albedo_height, coarse.albedo_height, weight);
+	r_mat.normal_rough = mix(r_mat.normal_rough, coarse.normal_rough, weight);
+	r_mat.normal_map_depth = mix(r_mat.normal_map_depth, coarse.normal_map_depth, weight);
+	r_mat.ao = mix(r_mat.ao, coarse.ao, weight);
+	r_mat.ao_affect = mix(r_mat.ao_affect, coarse.ao_affect, weight);
+	r_normal = mix(r_normal, coarse_normal, weight);
+	return true;
+}
+
+bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
+	if (!_surface_material_enabled) { return false; }
+	if (_surface_vt_enabled && _avt_sectors_enabled) {
+		float pixel_world = max(length(dFdx(world)), length(dFdy(world)));
+		vec2 region = floor(world / (_region_size * _vertex_spacing));
+		bool owned = !_surface_svt_enabled || (all(greaterThanEqual(region, _avt_region_rect.xy)) && all(lessThan(region, _avt_region_rect.xy + _avt_region_rect.zw)));
+		if (!owned) { return surface_svt_material_sample(world, r_mat, r_normal); }
+		return avt_filtered_sample(world, pixel_world, r_mat, r_normal);
+	}
+	float region_world = _region_size * _vertex_spacing;
+	ivec2 region = ivec2(floor(world / region_world));
+	int layer = get_region_layer(region);
+	if (_surface_vt_enabled && layer >= 0 && layer < MAX_REGIONS) {
+		ivec2 block = ivec2(_surface_vt_blocks[layer]);
+		int size = max(1, int(_surface_vt_block_sizes[layer]));
+		vec2 local = world / region_world - vec2(region);
+		ivec2 virtual_page = block + ivec2(floor(local * float(size)));
+		if (block.x >= 0) {
+			for (int mip = _avt_mip_distance_count > 0 ? avt_distance_mip(surface_svt_distance(world), int(round(log2(float(size))))) : 0; mip <= _surface_vt_max_local_mip; mip++) {
+				if ((1 << mip) > size) { break; }
+				ivec2 coord = virtual_page >> mip;
+				int level_size = max(1, _surface_vt_indirection_size >> mip);
+				int slot = int(texelFetch(_surface_vt_indirection, coord, mip).r + 0.5);
+				vec2 offset = fract(local * float(max(1, size >> mip)));
+				if (surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, r_mat, r_normal)) { return true; }
+			}
+			return false; // This region is assigned to AVT; expose its missing pages.
+		}
+	}
+	return surface_svt_material_sample(world, r_mat, r_normal);
 }
 
 // The surface id/weight for one corner: near field first, then the far field, then the

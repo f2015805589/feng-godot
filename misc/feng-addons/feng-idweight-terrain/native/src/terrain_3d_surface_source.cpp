@@ -57,18 +57,30 @@ Ref<Image> Terrain3DData::make_vt_height_page(const Rect2 &p_world_rect, int p_p
 	PackedByteArray bytes;
 	bytes.resize(int64_t(stored) * stored * sizeof(float));
 	uint8_t *output = bytes.ptrw();
+	// Sub-metre AVT pages often sample one or two terrain cells hundreds of
+	// times. Resolve the integer column once, and the four source heights once
+	// per cell/row rather than doing four hash lookups per output texel.
+	std::vector<int> columns(stored);
+	std::vector<float> weights(stored);
+	for (int x = 0; x < stored; ++x) {
+		const float px = (p_world_rect.position.x + (float(x - p_border) + 0.5f) * texel.x) / spacing;
+		columns[x] = int(std::floor(px));
+		weights[x] = px - columns[x];
+	}
 	for (int y = 0; y < stored; y++) {
 		const float z = (p_world_rect.position.y + (float(y - p_border) + 0.5f) * texel.y) / spacing;
 		const int iz = int(std::floor(z));
 		const float fz = z - iz;
+		int previous_column = 0;
+		float h00 = 0.f, h10 = 0.f, h01 = 0.f, h11 = 0.f;
 		for (int x = 0; x < stored; x++) {
-			const float px = (p_world_rect.position.x + (float(x - p_border) + 0.5f) * texel.x) / spacing;
-			const int ix = int(std::floor(px));
-			const float fx = px - ix;
-			const float h00 = height_at(ix, iz);
-			const float h10 = height_at(ix + 1, iz);
-			const float h01 = height_at(ix, iz + 1);
-			const float h11 = height_at(ix + 1, iz + 1);
+			const int ix = columns[x];
+			const float fx = weights[x];
+			if (x == 0 || ix != previous_column) {
+				h00 = height_at(ix, iz); h10 = height_at(ix + 1, iz);
+				h01 = height_at(ix, iz + 1); h11 = height_at(ix + 1, iz + 1);
+				previous_column = ix;
+			}
 			// Same BL-TR diagonal as terrain geometry and the ID/weight evaluator.
 			const float height = fx > fz ? h00 * (1.f - fx) + h10 * (fx - fz) + h11 * fz :
 					h00 * (1.f - fz) + h01 * (fz - fx) + h11 * fx;

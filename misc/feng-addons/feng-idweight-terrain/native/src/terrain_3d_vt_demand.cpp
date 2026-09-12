@@ -5,6 +5,7 @@
 #include "terrain_3d_vt_visibility.h"
 #include <map>
 #include <tuple>
+#include <functional>
 
 // Far-field demand. Two rules share this pass and they do not interfere:
 //
@@ -32,21 +33,15 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; };
 	struct Page { Vector2i address; int mip; float distance; };
 	std::vector<Region> regions;
+	const Rect2i avt_regions = _surface_vt_enabled && is_sector_avt() ? get_surface_vt_region_rect() : Rect2i();
 	const float region_world = _region_size * _vertex_spacing;
-	const float page_world = MAX(1.f, _surface_svt_page_world);
-	// A region never walks more than 16x16 pages per level. A page far smaller than the
-	// region caps how fine the far field can go there instead of turning one region into
-	// thousands of requests per frame.
-	int region_min_mip = 0;
-	while (region_min_mip < 30 && region_world / (page_world * float(1 << region_min_mip)) > 16.f) {
-		++region_min_mip;
-	}
+	const float page_world = MAX(0.001f, _surface_svt_page_world);
 	for (const Vector2i &location : _data->get_region_locations()) {
 		Ref<Terrain3DRegion> region = _data->get_region(location);
 		if (region.is_null() || region->is_deleted()) { continue; }
 		// AVT owns its selected regions. SVT should not spend the scarce detail
 		// budget duplicating material pages that this view will never sample.
-		if (_surface_vt_enabled && _vt_registered_sectors.has(location)) { continue; }
+		if (_surface_vt_enabled && (is_sector_avt() ? avt_regions.has_point(location) : _vt_registered_sectors.has(location))) { continue; }
 		Rect2 rect(Vector2(location) * region_world, Vector2(region_world, region_world));
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
@@ -68,45 +63,40 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	const int plan_limit = coverage_limit;
 
 	std::map<std::tuple<int, int, int>, Page> unique;
-	if (!regions.empty()) {
-		// Levels outside the span of the visible footprint cannot hold a needed page, so
-		// the walk is bounded by the levels of the nearest and the farthest visible point.
-		const int near_level = get_surface_svt_mip_for_distance(regions.front().distance, plan_limit);
-		const int far_level = get_surface_svt_mip_for_distance(farthest_distance, plan_limit);
-		for (int mip = near_level; mip <= far_level; ++mip) {
-			if (mip < region_min_mip) { continue; }
+	// Traverse visible footprints, not every mip-0 cell of an entire region.
+	// A high SVT texel density must not be silently capped to 16 pages/region.
+	// Bound pathological over-demand and retain a coarse ancestor when the CPU
+	// walk budget is exhausted; normal sparse close-ups can reach mip 0.
+	int walk_visited = 0;
+	const int visit_limit = MAX(4096, _surface_svt->get_page_count() * 128);
+	const float half_world = _surface_svt->get_indirection_size() * page_world * 0.5f;
+	const Rect2 domain(Vector2(-half_world, -half_world), Vector2(half_world * 2.f, half_world * 2.f));
+	for (const Region &region : regions) {
+		if (!region.rect.intersects(domain)) { continue; }
+		const Rect2 resident = region.rect.intersection(domain);
+		std::function<void(int, int, int)> visit = [&](int x, int y, int mip) {
 			const float span = page_world * float(1 << mip);
-			for (const Region &region : regions) {
-				const Vector2 end = region.rect.get_end();
-				const int x0 = int(Math::floor(region.rect.position.x / span));
-				const int y0 = int(Math::floor(region.rect.position.y / span));
-				const int x1 = int(Math::ceil(end.x / span));
-				const int y1 = int(Math::ceil(end.y / span));
-				for (int y = y0; y < y1; ++y) {
-					for (int x = x0; x < x1; ++x) {
-						const Rect2 footprint(Vector2(x * span, y * span), Vector2(span, span));
-						TerrainVT::VisiblePatch visible;
-						if (!view.sample(footprint.intersection(region.rect), region.heights, visible)) { continue; }
-						// The visible part of a page spans levels [level(near),
-						// level(farthest)]. A fragment anywhere inside it resolves to a
-						// level in that span, so the page has to exist at every level in
-						// it: publishing only the extreme would leave the shader's walk
-						// without the level it was told to sample.
-						if (mip < get_surface_svt_mip_for_distance(visible.distance, plan_limit) ||
-								mip > get_surface_svt_mip_for_distance(MAX(visible.farthest, visible.distance), plan_limit)) {
-							continue;
-						}
-						// Page coordinates are mip 0 pages of the world grid, aligned down
-						// to this level; the producer and the shader both expect that.
-						const Vector2i address(x * (1 << mip), y * (1 << mip));
-						const auto key = std::make_tuple(mip, address.x, address.y);
-						auto found = unique.find(key);
-						if (found == unique.end() || visible.distance < found->second.distance) {
-							unique[key] = { address, mip, visible.distance };
-						}
-					}
-				}
+			const Rect2 footprint(Vector2(x, y) * span, Vector2(span, span));
+			if (!footprint.intersects(resident)) { return; }
+			TerrainVT::VisiblePatch visible;
+			if (!view.sample(footprint.intersection(resident), region.heights, visible)) { return; }
+			++walk_visited;
+			const int near_mip = get_surface_svt_mip_for_distance(visible.distance, plan_limit);
+			const int far_mip = get_surface_svt_mip_for_distance(MAX(visible.distance, visible.farthest), plan_limit);
+			if (mip < near_mip) { return; }
+			if (mip <= far_mip || walk_visited >= visit_limit) {
+				const Vector2i address(x * (1 << mip), y * (1 << mip));
+				const auto key = std::make_tuple(mip, address.x, address.y);
+				auto found = unique.find(key);
+				if (found == unique.end() || visible.distance < found->second.distance) { unique[key] = { address, mip, visible.distance }; }
 			}
+			if (mip > near_mip && walk_visited < visit_limit) {
+				for (int dy = 0; dy < 2; ++dy) { for (int dx = 0; dx < 2; ++dx) { visit(x * 2 + dx, y * 2 + dy, mip - 1); } }
+			}
+		};
+		const float root_span = page_world * float(1 << plan_limit);
+		for (int y = int(Math::floor(resident.position.y / root_span)); y < int(Math::ceil(resident.get_end().y / root_span)); ++y) {
+			for (int x = int(Math::floor(resident.position.x / root_span)); x < int(Math::ceil(resident.get_end().x / root_span)); ++x) { visit(x, y, plan_limit); }
 		}
 	}
 	std::vector<Page> pages;

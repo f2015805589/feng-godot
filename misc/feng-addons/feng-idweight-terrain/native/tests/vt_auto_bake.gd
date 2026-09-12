@@ -94,17 +94,17 @@ func run() -> void:
 	require(initial.bake_total > 0 and initial.bake_done == initial.bake_total and initial.bake_failed == 0,
 			"initial missing SVT pages must bake automatically")
 	var original: Dictionary = file_hashes()
-	var baked_before: int = initial.producer.baked_pages
+	var baked_before: int = initial.cells_baked
 	await create_timer(0.8).timeout
 	await frame_image()
-	require(terrain.get_vt_settings().producer.baked_pages == baked_before, "idle SVT must not rebake")
+	require(terrain.get_vt_settings().cells_baked == baked_before, "idle SVT must not rebake")
 
 	paint_region(Vector2i(0, 0), 1)
 	await create_timer(0.1).timeout
 	paint_region(Vector2i(0, 0), 0)
 	await create_timer(0.1).timeout
 	paint_region(Vector2i(0, 0), 1)
-	require(terrain.get_vt_settings().producer.baked_pages == baked_before, "continuous strokes must debounce baking")
+	require(terrain.get_vt_settings().cells_baked == baked_before, "continuous strokes must debounce baking")
 	await automatic_settle()
 	var edited := terrain.get_vt_settings()
 	print("AUTO_EDITED ", edited)
@@ -122,13 +122,13 @@ func run() -> void:
 	require(changed > 0, "edited SVT files must contain new material data")
 
 	# The recovery action must regenerate every page even when cached files exist.
-	var before_full: int = terrain.get_vt_settings().producer.baked_pages
+	var before_full: int = terrain.get_vt_settings().cells_baked
 	var count := terrain.bake_svt()
 	for frame in 360:
 		await process_frame
 		if terrain.get_vt_settings().bake_pending == 0: break
 	require(terrain.get_vt_settings().bake_done == count, "manual full bake completes")
-	require(terrain.get_vt_settings().producer.baked_pages - before_full == count, "manual full bake must actually regenerate cached pages")
+	require(terrain.get_vt_settings().cells_baked - before_full == count, "manual full bake must actually regenerate cached pages")
 	# Offline SVT work shares a tiny cache with live AVT. Re-entering a viewed
 	# region during a bake must still produce AVT, and the bake must finish.
 	terrain.vt_page_count = 8

@@ -352,6 +352,7 @@ public:
 	// `p_page_x/p_page_y` address the page at `p_local_mip`, where one page covers
 	// `p_page_world_size << p_local_mip` metres. Texels with no region behind them are
 	// material 0. Returns the stored page size, or -1 on unusable arguments.
+	int produce_surface_rect_page(const Rect2 &p_rect, int p_page_size, int p_border, Ref<Image> &r_page);
 	int produce_sparse_surface_page(const int p_page_x, const int p_page_y, const int p_local_mip,
 			const real_t p_page_world_size, const int p_page_size, const int p_border,
 			Ref<Image> &r_page);

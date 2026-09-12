@@ -64,6 +64,11 @@ func run():
 	DirAccess.make_dir_recursive_absolute("res://terrain_data")
 	dock.plugin.terrain_setup.dialog.dir_selected.emit("res://terrain_data")
 	dock.plugin.terrain_setup.dialog.hide()
+	if not dock.plugin.terrain_setup.size_dialog.visible:
+		fail("new terrain did not offer grid dimensions")
+		return
+	dock.plugin.terrain_setup.size_dialog.confirmed.emit()
+	dock.plugin.terrain_setup.size_dialog.hide()
 	await frames(20)
 	print("INITIALIZED regions=",terrain.data.get_region_count()," size=",terrain.region_size," background=",terrain.material.world_background)
 	if terrain.data.get_region_count()!=1 or terrain.region_size!=512 or terrain.material.world_background!=0:

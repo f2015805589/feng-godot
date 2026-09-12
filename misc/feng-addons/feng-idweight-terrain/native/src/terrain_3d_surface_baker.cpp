@@ -2,9 +2,7 @@
 
 #include "terrain_3d_surface_baker.h"
 
-#include <algorithm>
-#include <cmath>
-#include <utility>
+#include "logger.h"
 
 #include <godot_cpp/classes/rd_sampler_state.hpp>
 #include <godot_cpp/classes/rd_shader_source.hpp>
@@ -15,13 +13,16 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 
-#include "logger.h"
+#include <algorithm>
+#include <cmath>
+#include <utility>
 
 namespace {
 // Keep diagnostic scopes balanced on upload failures and early returns.
 struct SurfaceVTLabel {
 	RenderingDevice *rd;
-	SurfaceVTLabel(RenderingDevice *p_rd, const String &p_name) : rd(p_rd) {
+	SurfaceVTLabel(RenderingDevice *p_rd, const String &p_name) :
+			rd(p_rd) {
 		rd->draw_command_begin_label(p_name, Color(0.3f, 0.7f, 0.9f));
 	}
 	~SurfaceVTLabel() { rd->draw_command_end_label(); }
@@ -32,7 +33,7 @@ struct SurfaceVTLabel {
 // Keeping idweight_r16.glsl as the single source of the packed-ID routines prevents
 // this offline/runtime evaluator from drifting from the material shader.
 static const char *SURFACE_BAKE_SHADER =
-R"(#version 450
+		R"(#version 450
 #define TAU 6.283185307179586476925286766559
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -74,7 +75,7 @@ layout(push_constant, std430) uniform BakePushConstants {
 )"
 #include "shaders/idweight_r16.glsl"
 #include "shaders/surface_bake.glsl"
-;
+		;
 
 namespace {
 
@@ -201,17 +202,18 @@ void Terrain3DSurfaceBaker::_free_bundle(RenderingDevice *p_rd, const ResourceBu
 	// RenderingDevice dependency tracker may invalidate a uniform set when one of its
 	// textures is freed; freeing the texture first would make the later explicit
 	// uniform-set free report an "invalid ID" during teardown.
-	const RID dependent_rids[] = { p_resources.uniform_set, p_resources.pipeline, p_resources.shader };
+	const RID dependent_rids[] = { p_resources.uniform_set, p_resources.cell_pipeline, p_resources.cell_shader, p_resources.pipeline, p_resources.shader };
 	for (const RID &rid : dependent_rids) {
 		if (rid.is_valid()) {
 			p_rd->free_rid(rid);
 		}
 	}
 	const RID rd_rids[] = {
-			p_resources.output_albedo_rd, p_resources.output_normal_rd, p_resources.output_params_rd,
-			p_resources.source_id_rd, p_resources.source_height_rd, p_resources.material_buffer,
-			p_resources.job_buffer, p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
-			p_resources.sampler_nearest, p_resources.sampler_linear};
+		p_resources.output_albedo_rd, p_resources.output_normal_rd, p_resources.output_params_rd,
+		p_resources.source_id_rd, p_resources.source_height_rd, p_resources.material_buffer,
+		p_resources.job_buffer, p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
+		p_resources.sampler_nearest, p_resources.sampler_linear
+	};
 	for (const RID &rid : rd_rids) {
 		if (rid.is_valid()) {
 			p_rd->free_rid(rid);
@@ -224,8 +226,10 @@ void Terrain3DSurfaceBaker::_free_deferred(const RID &p_output_albedo_rd, const 
 		const RID &p_output_params_rs, const RID &p_source_id_rd, const RID &p_source_height_rd,
 		const RID &p_material_buffer, const RID &p_job_buffer, const RID &p_dummy_albedo_rd,
 		const RID &p_dummy_normal_rd, const RID &p_uniform_set, const RID &p_pipeline,
-		const RID &p_shader, const RID &p_sampler_nearest, const RID &p_sampler_linear) {
+		const RID &p_shader, const RID &p_sampler_nearest, const RID &p_sampler_linear, const RID &p_cell_shader, const RID &p_cell_pipeline) {
 	ResourceBundle resources;
+	resources.cell_shader = p_cell_shader;
+	resources.cell_pipeline = p_cell_pipeline;
 	resources.output_albedo_rd = p_output_albedo_rd;
 	resources.output_normal_rd = p_output_normal_rd;
 	resources.output_params_rd = p_output_params_rd;
@@ -285,12 +289,12 @@ void Terrain3DSurfaceBaker::clear() {
 		return;
 	}
 	server->call_on_render_thread(callable_mp_static(&Terrain3DSurfaceBaker::_free_deferred)
-			.bind(resources.output_albedo_rd, resources.output_normal_rd, resources.output_params_rd,
-					resources.output_albedo_rs, resources.output_normal_rs, resources.output_params_rs,
-					resources.source_id_rd, resources.source_height_rd, resources.material_buffer,
-					resources.job_buffer, resources.dummy_albedo_rd, resources.dummy_normal_rd,
-					resources.uniform_set, resources.pipeline, resources.shader,
-					resources.sampler_nearest, resources.sampler_linear));
+										  .bind(resources.output_albedo_rd, resources.output_normal_rd, resources.output_params_rd,
+												  resources.output_albedo_rs, resources.output_normal_rs, resources.output_params_rs,
+												  resources.source_id_rd, resources.source_height_rd, resources.material_buffer,
+												  resources.job_buffer, resources.dummy_albedo_rd, resources.dummy_normal_rd,
+												  resources.uniform_set, resources.pipeline, resources.shader,
+												  resources.sampler_nearest, resources.sampler_linear, resources.cell_shader, resources.cell_pipeline));
 }
 
 ///////////////////////////
@@ -506,7 +510,7 @@ bool Terrain3DSurfaceBaker::_upload_materials(const PackedByteArray &p_material_
 		return false;
 	}
 	return _rd->buffer_update(_resources.material_buffer, 0, uint32_t(p_material_bytes.size()),
-			p_material_bytes) == OK;
+				   p_material_bytes) == OK;
 }
 
 ///////////////////////////
@@ -564,9 +568,7 @@ void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const R
 	_material_albedo_rs = p_albedo_array_rid;
 	_material_normal_rs = p_normal_array_rid;
 	_material_bytes = bytes;
-	_material_count = std::min(MATERIAL_COUNT, std::max<int>({int(p_colors.size()), int(p_normal_depths.size()),
-			int(p_ao_strengths.size()), int(p_ao_affects.size()), int(p_roughness_mods.size()), int(p_uv_scales.size()),
-			int(p_detiles.size()), int(p_slope_params.size())}));
+	_material_count = std::min(MATERIAL_COUNT, std::max<int>({ int(p_colors.size()), int(p_normal_depths.size()), int(p_ao_strengths.size()), int(p_ao_affects.size()), int(p_roughness_mods.size()), int(p_uv_scales.size()), int(p_detiles.size()), int(p_slope_params.size()) }));
 	_material_version++;
 	_materials_dirty = true;
 	_invalidate_all = true;
@@ -607,6 +609,23 @@ void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_ch
 	job.albedo_height = albedo;
 	job.normal_roughness = normal;
 	job.params = params;
+	job.generation = _generation;
+	job.sequence = ++_next_sequence;
+	_pending[p_slot] = job;
+	_slot_sequence[size_t(p_slot)] = job.sequence;
+	_ready[size_t(p_slot)] = 0;
+}
+
+void Terrain3DSurfaceBaker::queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (!_configured || p_slot < 0 || p_slot >= _page_count) {
+		return;
+	}
+	PendingJob job;
+	job.slot = p_slot;
+	job.kind = PENDING_CELL;
+	job.cells = p_cells;
+	job.world_rect = p_rect;
 	job.generation = _generation;
 	job.sequence = ++_next_sequence;
 	_pending[p_slot] = job;
@@ -703,6 +722,126 @@ bool Terrain3DSurfaceBaker::_upload_cached_page(const PendingJob &p_job) {
 			_rd->texture_update(_resources.output_params_rd, uint32_t(p_job.slot), params) != OK) {
 		LOG(WARN, "Could not upload cached surface page ", p_job.slot);
 		return false;
+	}
+	return true;
+}
+
+// Copy cropped offline mip regions into runtime pages, area-weighting cells
+// when a coarse pixel spans multiple source cells. No material rebake here.
+bool Terrain3DSurfaceBaker::_copy_cell_page(const PendingJob &p_job) {
+	if (!_resources.cell_pipeline.is_valid()) {
+		Ref<RDShaderSource> source;
+		source.instantiate();
+		source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
+		source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, R"(#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D src_a;
+layout(set=0,binding=1) uniform sampler2D src_n;
+layout(set=0,binding=2) uniform sampler2D src_p;
+layout(rgba16f,set=0,binding=3) uniform image2DArray dst_a;
+layout(rgba16f,set=0,binding=4) uniform image2DArray dst_n;
+layout(rgba16f,set=0,binding=5) uniform image2DArray dst_p;
+layout(push_constant,std430) uniform Push { vec4 page; vec4 cell; vec4 source; ivec4 config; } pc;
+void main() {
+ ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
+ int size=pc.config.x+2*pc.config.y;
+ if(any(greaterThanEqual(pixel,ivec2(size)))) return;
+ if(pc.config.w==1) {
+  ivec3 dst=ivec3(pixel,pc.config.z);
+  vec4 params=imageLoad(dst_p,dst);
+  if(params.a>0.000001) {
+   imageStore(dst_a,dst,imageLoad(dst_a,dst)/params.a);
+   imageStore(dst_n,dst,imageLoad(dst_n,dst)/params.a);
+   imageStore(dst_p,dst,vec4(params.rgb/params.a,1));
+  }
+  return;
+ }
+ float step=pc.page.z/float(pc.config.x);
+ vec2 lo=pc.page.xy+(vec2(pixel)-float(pc.config.y))*step;
+ vec2 first=max(lo,pc.cell.xy), last=min(lo+step,pc.cell.xy+pc.cell.zw);
+ vec2 extent=max(vec2(0),last-first);
+ float weight=extent.x*extent.y/(step*step);
+ if(weight<=0.0) return;
+ vec2 uv=((first+last)*0.5-pc.source.xy)/pc.source.zw;
+ vec2 inset=vec2(0.5)/vec2(textureSize(src_a,0));
+ uv=clamp(uv,inset,vec2(1)-inset);
+ ivec3 dst=ivec3(pixel,pc.config.z);
+ imageStore(dst_a,dst,imageLoad(dst_a,dst)+textureLod(src_a,uv,0)*weight);
+ imageStore(dst_n,dst,imageLoad(dst_n,dst)+textureLod(src_n,uv,0)*weight);
+ imageStore(dst_p,dst,imageLoad(dst_p,dst)+textureLod(src_p,uv,0)*weight);
+}
+)");
+		Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
+		if (spirv.is_null() || !spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE).is_empty()) {
+			return false;
+		}
+		_resources.cell_shader = _rd->shader_create_from_spirv(spirv, "svt_cell_copy");
+		_resources.cell_pipeline = _rd->compute_pipeline_create(_resources.cell_shader);
+		if (!_resources.cell_pipeline.is_valid()) {
+			return false;
+		}
+	}
+	for (RID target : { _resources.output_albedo_rd, _resources.output_normal_rd, _resources.output_params_rd }) {
+		_rd->texture_clear(target, Color(0, 0, 0, 0), 0, 1, p_job.slot, 1);
+	}
+	int piece_index = 0;
+	for (const Dictionary &piece : p_job.cells) {
+		std::vector<RID> textures;
+		for (const String &name : { String("albedo_height"), String("normal_roughness"), String("params") }) {
+			Ref<Image> image = piece[name];
+			Ref<RDTextureFormat> format;
+			format.instantiate();
+			format->set_format(RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT);
+			format->set_width(image->get_width());
+			format->set_height(image->get_height());
+			format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
+			format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT);
+			Ref<RDTextureView> view;
+			view.instantiate();
+			TypedArray<PackedByteArray> data;
+			data.push_back(image->get_data());
+			textures.push_back(_rd->texture_create(format, view, data));
+		}
+		TypedArray<Ref<RDUniform>> uniforms;
+		for (int i = 0; i < 3; ++i) {
+			append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, i, _resources.sampler_linear, textures[i]);
+		}
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 3, _resources.output_albedo_rd);
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 4, _resources.output_normal_rd);
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 5, _resources.output_params_rd);
+		RID uniform = _rd->uniform_set_create(uniforms, _resources.cell_shader, 0);
+		PackedByteArray push;
+		push.resize(64);
+		Rect2 rects[] = { p_job.world_rect, piece["cell_rect"], piece["source_rect"] };
+		for (int i = 0; i < 3; ++i) {
+			push.encode_float(i * 16, rects[i].position.x);
+			push.encode_float(i * 16 + 4, rects[i].position.y);
+			push.encode_float(i * 16 + 8, rects[i].size.x);
+			push.encode_float(i * 16 + 12, rects[i].size.y);
+		}
+		push.encode_s32(48, _page_size);
+		push.encode_s32(52, _border);
+		push.encode_s32(56, p_job.slot);
+		push.encode_s32(60, 0);
+		int64_t list = _rd->compute_list_begin();
+		_rd->compute_list_bind_compute_pipeline(list, _resources.cell_pipeline);
+		_rd->compute_list_bind_uniform_set(list, uniform, 0);
+		_rd->compute_list_set_push_constant(list, push, 64);
+		_rd->compute_list_dispatch(list, (_stored_size + 7) / 8, (_stored_size + 7) / 8, 1);
+		_rd->compute_list_end();
+		if (++piece_index == p_job.cells.size()) {
+			push.encode_s32(60, 1);
+			list = _rd->compute_list_begin();
+			_rd->compute_list_bind_compute_pipeline(list, _resources.cell_pipeline);
+			_rd->compute_list_bind_uniform_set(list, uniform, 0);
+			_rd->compute_list_set_push_constant(list, push, 64);
+			_rd->compute_list_dispatch(list, (_stored_size + 7) / 8, (_stored_size + 7) / 8, 1);
+			_rd->compute_list_end();
+		}
+		_rd->free_rid(uniform);
+		for (RID texture : textures) {
+			_rd->free_rid(texture);
+		}
 	}
 	return true;
 }
@@ -829,7 +968,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		return;
 	}
 	if (!_ensure_resources(generation, page_size, border, page_count, stored_size,
-			material_albedo, material_normal, material_bytes)) {
+				material_albedo, material_normal, material_bytes)) {
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (const auto &entry : pending) {
 			_pending.emplace(entry.first, entry.second);
@@ -882,8 +1021,8 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		if (job.generation != generation || job.slot < 0 || job.slot >= page_count) {
 			continue;
 		}
-		if (job.kind == PENDING_CACHED) {
-			if (_upload_cached_page(job)) {
+		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
+			if (job.kind == PENDING_CELL ? _copy_cell_page(job) : _upload_cached_page(job)) {
 				{
 					std::lock_guard<std::mutex> lock(_mutex);
 					_cached_uploads++;
@@ -1039,8 +1178,9 @@ void Terrain3DSurfaceBaker::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("configure", "page_size", "border", "page_count"),
 			&Terrain3DSurfaceBaker::configure);
 	ClassDB::bind_method(D_METHOD("set_materials", "albedo_array_rid", "normal_array_rid", "colors",
-			"normal_depths", "ao_strengths", "ao_affects", "roughness_mods", "uv_scales", "detiles",
-			"slope_params"), &Terrain3DSurfaceBaker::set_materials);
+								 "normal_depths", "ao_strengths", "ao_affects", "roughness_mods", "uv_scales", "detiles",
+								 "slope_params"),
+			&Terrain3DSurfaceBaker::set_materials);
 	ClassDB::bind_method(D_METHOD("queue_page", "slot", "idweights", "height", "world_rect", "slope_factor"),
 			&Terrain3DSurfaceBaker::queue_page, DEFVAL(1.0f));
 	ClassDB::bind_method(D_METHOD("queue_cached_page", "slot", "channels"),

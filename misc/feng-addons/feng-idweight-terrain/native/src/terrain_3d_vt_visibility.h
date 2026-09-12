@@ -18,13 +18,14 @@ struct VisiblePatch {
 	float density = 0.f;
 };
 struct VisibleView {
-	TypedArray<Plane> planes;
+	std::vector<Plane> planes;
 	Vector3 eye;
 	Vector3 forward;
 	float focal = 1.f;
 	bool orthographic = false;
 	explicit VisibleView(Camera3D *camera) {
-		planes = camera->get_frustum();
+		const TypedArray<Plane> frustum = camera->get_frustum();
+		for (int i = 0; i < frustum.size(); ++i) { planes.push_back(frustum[i]); }
 		eye = camera->get_global_position();
 		forward = -camera->get_global_basis().get_column(2).normalized();
 		orthographic = camera->get_projection() == Camera3D::PROJECTION_ORTHOGONAL;
@@ -33,9 +34,31 @@ struct VisibleView {
 	}
 	bool sample(const Rect2 &rect, const Vector2 &heights, VisiblePatch &result) const {
 		result = VisiblePatch();
+		// Most distant sectors lie entirely inside the frustum. Classify their
+		// height bounds without constructing/clipping three heap polygons.
+		const Vector3 center(rect.get_center().x, (heights.x + heights.y) * 0.5f, rect.get_center().y);
+		const Vector3 extent(rect.size.x * 0.5f, (heights.y - heights.x) * 0.5f, rect.size.y * 0.5f);
+		bool inside = true;
+		for (const Plane &plane : planes) {
+			const float radius = plane.normal.abs().dot(extent);
+			const float distance = plane.distance_to(center);
+			if (distance > radius) { return false; }
+			if (distance > -radius) { inside = false; }
+		}
+		if (inside && heights.x == heights.y) {
+			result.nearest = Vector3(CLAMP(eye.x, rect.position.x, rect.get_end().x), heights.x, CLAMP(eye.z, rect.position.y, rect.get_end().y));
+			result.distance = result.nearest.distance_to(eye);
+			for (const Vector3 &corner : {Vector3(rect.position.x, heights.x, rect.position.y), Vector3(rect.position.x, heights.x, rect.get_end().y), Vector3(rect.get_end().x, heights.x, rect.position.y), Vector3(rect.get_end().x, heights.x, rect.get_end().y)}) {
+				result.farthest = MAX(result.farthest, corner.distance_to(eye));
+			}
+			result.density = orthographic ? focal : focal / MAX(0.01f, (result.nearest - eye).dot(forward));
+			return true;
+		}
 		// Clip terrain footprint planes, not just the region centre. This keeps a
 		// visible edge eligible when the centre or the point below the eye is off-screen.
-		for (float height : { heights.x, (heights.x + heights.y) * 0.5f, heights.y }) {
+		const int height_count = heights.x == heights.y ? 1 : 3;
+		for (int height_index = 0; height_index < height_count; ++height_index) {
+			const float height = heights.x + (heights.y - heights.x) * (height_index * 0.5f);
 			std::vector<Vector3> polygon = {
 				Vector3(rect.position.x, height, rect.position.y),
 				Vector3(rect.get_end().x, height, rect.position.y),

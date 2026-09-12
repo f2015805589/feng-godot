@@ -141,7 +141,7 @@ func _run() -> void:
 	_unfold_ancestors(controls)
 	await _wait_frames(2)
 	if not _require(bake_button.is_visible_in_tree(),
-			"Bake All SVT Pages is hidden when the native SVT section is unfolded"):
+			"Bake All SVT Cells is hidden when the native SVT section is unfolded"):
 		return
 	if not _require(progress_label.text.find("Auto Bake off") >= 0,
 			"Inspector progress did not reflect the disabled Auto Bake setting"):

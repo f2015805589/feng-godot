@@ -3,6 +3,7 @@
 #ifndef TERRAIN3D_CLASS_H
 #define TERRAIN3D_CLASS_H
 
+#include <unordered_map>
 #include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/color_rect.hpp>
 #include <godot_cpp/classes/geometry_instance3d.hpp>
@@ -88,6 +89,12 @@ private:
 	RID _vt_bound_albedo;
 	uint64_t _vt_source_revision = 1;
 	Dictionary _vt_svt_tiles;
+	Dictionary _svt_cell_cache;
+	Ref<RefCounted> _svt_cell_baker;
+	Dictionary _svt_cell_job;
+	uint64_t _svt_cells_baked = 0;
+	uint32_t _svt_cell_signature(const Vector2i &p_cell) const;
+	Dictionary _load_svt_cell(const Vector2i &p_cell, int p_mip = -1);
 	bool _svt_auto_bake = true;
 	Dictionary _vt_svt_dirty_regions;
 	uint64_t _vt_svt_edit_time = 0;
@@ -116,12 +123,26 @@ private:
 	int _surface_vt_pages_per_axis = 4;
 	real_t _surface_vt_distance = 512.f;
 	Vector2i _surface_vt_region_grid = Vector2i(2, 2);
-	int _surface_vt_selection_mode = 0;
+	int _surface_vt_selection_mode = 2;
+	Ref<ImageTexture> _avt_sector_directory;
+	PackedByteArray _avt_directory_bytes;
+	int _avt_directory_mask = 0;
+	int _avt_root_level = 1;
+	Dictionary _avt_sector_stats;
+	struct AVTPageRequest { Vector2i owner; int mip, x, y; Rect2 rect; };
+	std::vector<AVTPageRequest> _avt_page_plan;
+	PackedByteArray _avt_plan_key;
+	std::vector<Vector2i> _avt_registered_owners;
+	std::unordered_map<uint64_t, int> _avt_allocated_sizes;
+	int _produce_sector_avt_pages(int p_max_pages);
+	int _update_sector_avt(int p_max_pages);
 	mutable bool _vt_view_focus_valid = false;
 	mutable Vector2i _vt_view_focus;
 	Vector2i _surface_vt_region_offset;
 	real_t _surface_vt_forward_regions = 0.f;
 	real_t _surface_vt_texels_per_pixel = 1.f;
+	real_t _surface_vt_texels_per_meter = 1024.f;
+	PackedFloat32Array _surface_vt_mip_distances;
 	bool _surface_vt_force_mip = false;
 	int _surface_vt_mip = 0;
 	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
@@ -148,7 +169,7 @@ private:
 	Terrain3DVirtualTexture *_surface_svt = nullptr;
 	bool _surface_svt_enabled = false;
 	// One mip 0 page covers this many metres.
-	real_t _surface_svt_page_world = 512.f;
+	real_t _surface_svt_page_world = 256.f;
 	int _surface_svt_page_size = 256;
 	int _surface_svt_page_border = 4;
 	int _surface_svt_page_count = 256;
@@ -372,12 +393,26 @@ public:
 	int get_surface_vt_page_border() const { return _surface_vt_page_border; }
 	void set_surface_vt_pages_per_axis(const int p_pages);
 	int get_surface_vt_pages_per_axis() const { return _surface_vt_pages_per_axis; }
+	void set_surface_vt_texels_per_meter(real_t p_value);
+	real_t get_surface_vt_texels_per_meter() const { return _surface_vt_texels_per_meter; }
+	void set_surface_svt_texels_per_meter(real_t p_value);
+	real_t get_surface_svt_texels_per_meter() const { return _vt_page_size / _surface_svt_page_world; }
+	void set_surface_vt_mip_distances(const PackedFloat32Array &p_distances);
+	PackedFloat32Array get_surface_vt_mip_distances() const { return _surface_vt_mip_distances; }
+	int get_surface_vt_mip_for_distance(real_t p_distance) const;
+	int get_avt_base_block_size() const;
+	void set_surface_vt_resolution(int p_resolution);
+	int get_surface_vt_resolution() const { return _vt_page_size * _surface_vt_pages_per_axis; }
 	void set_surface_vt_distance(const real_t p_distance);
 	real_t get_surface_vt_distance() const { return _surface_vt_distance; }
 	void set_surface_vt_region_grid(const Vector2i &p_grid) { _surface_vt_region_grid = Vector2i(CLAMP(p_grid.x, 1, 64), CLAMP(p_grid.y, 1, 64)); }
 	Vector2i get_surface_vt_region_grid() const { return _surface_vt_region_grid; }
-	void set_surface_vt_selection_mode(int p_mode) { _surface_vt_selection_mode = CLAMP(p_mode, 0, 1); _vt_view_focus_valid = false; }
+	void set_surface_vt_selection_mode(int p_mode);
 	int get_surface_vt_selection_mode() const { return _surface_vt_selection_mode; }
+	bool is_sector_avt() const { return _surface_vt_selection_mode == 2 && !_vt_debug_direct_material; }
+	RID get_avt_sector_directory() const { return _avt_sector_directory.is_valid() ? _avt_sector_directory->get_rid() : RID(); }
+	int get_avt_directory_mask() const { return _avt_directory_mask; }
+	int get_avt_root_level() const { return _avt_root_level; }
 	void set_surface_vt_region_offset(const Vector2i &p_offset) { _surface_vt_region_offset = p_offset; }
 	Vector2i get_surface_vt_region_offset() const { return _surface_vt_region_offset; }
 	void set_surface_vt_forward_regions(real_t p_forward) { _surface_vt_forward_regions = CLAMP(p_forward, -64.f, 64.f); }

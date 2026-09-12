@@ -433,7 +433,7 @@ void Terrain3D::_setup_surface_vt() {
 	// One page per axis per sector is legal (a 1x1 virtual image), which is what a
 	// region whose surface map is already page-sized wants.
 	_surface_vt->set_minimal_block(1);
-	_surface_vt->set_indirection_size(MAX(64, _surface_vt_page_count * 4));
+	_surface_vt->set_indirection_size(is_sector_avt() ? 2048 : MAX(64, _surface_vt_page_count * 4));
 	_surface_vt->set_format(Image::Format(39));
 	_surface_vt->initialize();
 }
@@ -479,7 +479,7 @@ void Terrain3D::set_surface_svt_enabled(const bool p_enabled) {
 }
 
 void Terrain3D::set_surface_svt_page_world(const real_t p_size) {
-	_surface_svt_page_world = CLAMP(p_size, 1.f, 65536.f);
+	_surface_svt_page_world = CLAMP(p_size, 0.001f, 65536.f);
 	if (!_vt_debug_direct_material) {
 		_reset_vt_configuration();
 		return;
@@ -592,7 +592,7 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc) {
 	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
 	const real_t region_world = real_t(_region_size) * vertex_spacing;
 	// Near field: the sector is the region, so every page of every level is stale.
-	if (_surface_vt && _surface_vt->is_initialized() && _surface_vt->has_sector(p_region_loc)) {
+	if (!is_sector_avt() && _surface_vt && _surface_vt->is_initialized() && _surface_vt->has_sector(p_region_loc)) {
 		const int block = _surface_vt->get_sector_block_size(p_region_loc);
 		const int max_mip = block > 0 ? TerrainVT::log2_power_of_two(block) : 0;
 		for (int mip = 0; mip <= max_mip; mip++) {
@@ -607,7 +607,7 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc) {
 	// Far field: every page of every level that overlaps the region, plus one page of
 	// margin because a page's border texels are filled from its neighbours.
 	if (_surface_svt && _surface_svt->is_initialized()) {
-		const real_t page_world = MAX(1.f, _surface_svt_page_world);
+		const real_t page_world = MAX(0.001f, _surface_svt_page_world);
 		const real_t x0 = real_t(p_region_loc.x) * region_world;
 		const real_t z0 = real_t(p_region_loc.y) * region_world;
 		const int max_mip = _surface_svt->get_world_max_mip();
@@ -685,7 +685,7 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	_surface_svt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
 	if (!_vt_debug_direct_material) { return _update_visible_svt(p_max_pages); }
 	const bool legacy_full_grid = _vt_debug_direct_material;
-	const real_t page_world = MAX(1.f, _surface_svt_page_world);
+	const real_t page_world = MAX(0.001f, _surface_svt_page_world);
 	const real_t reach = MAX(page_world, _surface_svt_distance);
 	const Vector3 target = get_clipmap_target_position();
 	// The level rule measures from the camera the shader renders with, so the diagnostic
@@ -1046,6 +1046,7 @@ void Terrain3D::set_surface_vt_pages_per_axis(const int p_pages) {
 
 void Terrain3D::set_surface_vt_distance(const real_t p_distance) {
 	_surface_vt_distance = MAX(0.f, p_distance);
+	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 }
 
 static bool terrain_region_in_frustum(Terrain3DData *p_data, const Vector2i &p_location,
@@ -1212,7 +1213,10 @@ int Terrain3D::_surface_vt_mip_for_page(const Vector2i &p_region_loc, const int 
 // One demand pass. The page contract is the same whichever rule picks the mips:
 // request -> produce -> write -> commit.
 int Terrain3D::update_surface_vt(int p_max_pages) {
-	if (!_vt_shared_ready || _vt_materials_dirty) { _update_vt_service(); }
+	// Explicit sector updates must also bind textures first created by the
+	// preceding render-thread bake, even when normal physics updates are paused.
+	if (is_sector_avt() || !_vt_shared_ready || _vt_materials_dirty) { _update_vt_service(); }
+	if (is_sector_avt()) { return _update_sector_avt(p_max_pages); }
 	if (!_surface_vt || !_data) {
 		return 0;
 	}
@@ -2527,6 +2531,8 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_vt_page_border"), &Terrain3D::get_surface_vt_page_border);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_pages_per_axis", "pages"), &Terrain3D::set_surface_vt_pages_per_axis);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_pages_per_axis"), &Terrain3D::get_surface_vt_pages_per_axis);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_resolution", "resolution"), &Terrain3D::set_surface_vt_resolution);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_resolution"), &Terrain3D::get_surface_vt_resolution);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_distance", "distance"), &Terrain3D::set_surface_vt_distance);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_distance"), &Terrain3D::get_surface_vt_distance);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_region_grid", "grid"), &Terrain3D::set_surface_vt_region_grid);
@@ -2556,6 +2562,13 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_svt"), &Terrain3D::get_surface_svt);
 	ClassDB::bind_method(D_METHOD("set_surface_svt_enabled", "enabled"), &Terrain3D::set_surface_svt_enabled);
 	ClassDB::bind_method(D_METHOD("is_surface_svt_enabled"), &Terrain3D::is_surface_svt_enabled);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_texels_per_meter", "value"), &Terrain3D::set_surface_vt_texels_per_meter);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_texels_per_meter"), &Terrain3D::get_surface_vt_texels_per_meter);
+	ClassDB::bind_method(D_METHOD("set_surface_svt_texels_per_meter", "value"), &Terrain3D::set_surface_svt_texels_per_meter);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_texels_per_meter"), &Terrain3D::get_surface_svt_texels_per_meter);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip_distances", "distances"), &Terrain3D::set_surface_vt_mip_distances);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip_distances"), &Terrain3D::get_surface_vt_mip_distances);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip_for_distance", "distance"), &Terrain3D::get_surface_vt_mip_for_distance);
 	ClassDB::bind_method(D_METHOD("set_surface_svt_page_world", "size"), &Terrain3D::set_surface_svt_page_world);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_page_world"), &Terrain3D::get_surface_svt_page_world);
 	ClassDB::bind_method(D_METHOD("set_surface_svt_page_size", "size"), &Terrain3D::set_surface_svt_page_size);
@@ -2765,6 +2778,9 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_adaptive_enabled"), "set_vt_adaptive_enabled", "is_vt_adaptive_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "surface_vt", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DVirtualTexture"), "", "get_surface_vt");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64,0.25,or_greater"), "set_surface_vt_texels_per_pixel", "get_surface_vt_texels_per_pixel");
@@ -2772,8 +2788,9 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_count", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_count", "get_surface_vt_page_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_size", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_size", "get_surface_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_border", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_border", "get_surface_vt_page_border");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis"), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Visible Terrain,Target Grid"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
+	// Derived from the stored page size/count: no competing serialized setting.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid"), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset"), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_RANGE, "-64,64,0.25"), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");
@@ -2785,7 +2802,8 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("SVT", "surface_svt_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_RANGE, "1.0,65536.0,1.0,or_greater"), "set_surface_svt_page_world", "get_surface_svt_page_world");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_texels_per_meter", PROPERTY_HINT_RANGE, "0.01,8192,0.01", PROPERTY_USAGE_EDITOR), "set_surface_svt_texels_per_meter", "get_surface_svt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_page_size", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_size", "get_surface_svt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_page_border", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_border", "get_surface_svt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_page_count", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_count", "get_surface_svt_page_count");

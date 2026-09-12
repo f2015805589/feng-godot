@@ -75,7 +75,7 @@ def write_fixture(fixture: Path, test: str = "dock") -> None:
         project.write_text(project.read_text(encoding="utf-8").replace(
             '"res://addons/feng-idweight-terrain/plugin.cfg", ', ''), encoding="utf-8")
 
-    if test == "setup":
+    if test in {"setup", "grid"}:
         (fixture / "render").mkdir()
         (fixture / "render/test.tscn").write_text(
             '[gd_scene format=3]\n\n[node name="TerrainSetup" type="Node3D"]\n'
@@ -89,6 +89,9 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
     env["LOCALAPPDATA"] = str(fixture / "cache")
     (fixture / "config").mkdir()
     (fixture / "cache").mkdir()
+    # Editor thumbnails are transient files, not project assets to reimport.
+    for folder in ("config", "cache"):
+        (fixture / folder / ".gdignore").write_text("", encoding="utf-8")
     command = [
         str(editor),
         "--editor",
@@ -129,6 +132,7 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
         "dock": "PASS graphical Terrain3D asset dock layout and management menu actions",
         "input": "PASS editor brush first GPU miss -> CPU fallback -> R16 CPU/GPU ID 1 -> outside release -> right navigation",
         "setup": "PASS terrain setup, Scene texture/mesh painting, Add Region, and saved reload",
+        "grid": "PASS 20x20 terrain grid creation, cancellation, limits and reload",
         "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches Hydra's pair fields",
         "svt_inspector": "PASS native SVT Inspector full-bake action and progress",
     }[test]
@@ -146,7 +150,7 @@ def main() -> int:
         help="graphical Godot editor executable (the console build still creates a window)",
     )
     parser.add_argument("--driver", default="d3d12")
-    parser.add_argument("--test", choices=["dock", "input", "setup", "pairroles", "svt_inspector"], default="dock")
+    parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector"], default="dock")
     args = parser.parse_args()
     editor = args.editor.resolve()
     if not editor.is_file():

@@ -1986,22 +1986,20 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 int Terrain3DData::produce_sparse_surface_page(const int p_page_x, const int p_page_y,
 		const int p_local_mip, const real_t p_page_world_size, const int p_page_size,
 		const int p_border, Ref<Image> &r_page) {
+	if (p_local_mip < 0 || p_local_mip > 30 || p_page_world_size <= 0.f) { return -1; }
+	const int scale = 1 << p_local_mip;
+	return produce_surface_rect_page(Rect2(Vector2((p_page_x >> p_local_mip) * scale, (p_page_y >> p_local_mip) * scale) * p_page_world_size,
+			Vector2(scale, scale) * p_page_world_size), p_page_size, p_border, r_page);
+}
+
+int Terrain3DData::produce_surface_rect_page(const Rect2 &p_rect, int p_page_size, int p_border, Ref<Image> &r_page) {
 	r_page = Ref<Image>();
-	if (_region_size <= 0 || p_page_size <= 0 || p_border < 0 || p_local_mip < 0 ||
-			p_page_world_size <= 0.f) {
-		return -1;
-	}
+	if (_region_size <= 0 || p_page_size <= 0 || p_border < 0 || p_rect.size.x <= 0.f) { return -1; }
 	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
 	const real_t region_world = real_t(_region_size) * vertex_spacing;
-	const int mip_pages = 1 << p_local_mip;
-	// `p_page_x/p_page_y` address the page at local mip 0, so the mip's own page origin
-	// is the enclosing aligned block. Arithmetic shift is floor division for negatives.
-	const int mip_page_x = p_page_x >> p_local_mip;
-	const int mip_page_y = p_page_y >> p_local_mip;
-	const real_t page_world = real_t(mip_pages) * p_page_world_size;
-	const real_t texel_world = page_world / real_t(p_page_size);
-	const real_t origin_x = real_t(mip_page_x * mip_pages) * p_page_world_size;
-	const real_t origin_z = real_t(mip_page_y * mip_pages) * p_page_world_size;
+	const real_t texel_world = p_rect.size.x / real_t(p_page_size);
+	const real_t origin_x = p_rect.position.x;
+	const real_t origin_z = p_rect.position.y;
 	const int stored = p_page_size + 2 * p_border;
 
 	// Region grid covering the page and its border ring.

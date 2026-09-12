@@ -3,10 +3,7 @@
 #ifndef TERRAIN3D_SURFACE_BAKER_CLASS_H
 #define TERRAIN3D_SURFACE_BAKER_CLASS_H
 
-#include <cstdint>
-#include <map>
-#include <mutex>
-#include <vector>
+#include "constants.h"
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
@@ -19,7 +16,10 @@
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/rid.hpp>
 
-#include "constants.h"
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <vector>
 
 /**
  * Asynchronous material-page producer for the surface virtual texture.
@@ -49,10 +49,12 @@ private:
 		PENDING_BAKE = 0,
 		PENDING_INVALIDATE = 1,
 		PENDING_CACHED = 2,
+		PENDING_CELL = 3,
 	};
 
 	struct PendingJob {
 		int slot = -1;
+		Array cells;
 		PendingKind kind = PENDING_INVALIDATE;
 		Ref<godot::Image> idweights;
 		Ref<godot::Image> height;
@@ -79,6 +81,8 @@ private:
 		RID dummy_albedo_rd;
 		RID dummy_normal_rd;
 		RID uniform_set;
+		RID cell_shader;
+		RID cell_pipeline;
 		RID pipeline;
 		RID shader;
 		RID sampler_nearest;
@@ -121,7 +125,7 @@ private:
 			const RID &p_output_params_rs, const RID &p_source_id_rd, const RID &p_source_height_rd,
 			const RID &p_material_buffer, const RID &p_job_buffer, const RID &p_dummy_albedo_rd,
 			const RID &p_dummy_normal_rd, const RID &p_uniform_set, const RID &p_pipeline,
-			const RID &p_shader, const RID &p_sampler_nearest, const RID &p_sampler_linear);
+			const RID &p_shader, const RID &p_sampler_nearest, const RID &p_sampler_linear, const RID &p_cell_shader, const RID &p_cell_pipeline);
 	static void _free_bundle(RenderingDevice *p_rd, const ResourceBundle &p_resources);
 	static RID _create_texture(RenderingDevice *p_rd, RenderingDevice::DataFormat p_format,
 			int p_size, int p_layers, uint64_t p_usage, const PackedByteArray &p_first_layer = PackedByteArray());
@@ -138,6 +142,7 @@ private:
 	bool _upload_materials(const PackedByteArray &p_material_bytes);
 	bool _upload_source_page(const PendingJob &p_job, int p_layer);
 	bool _upload_cached_page(const PendingJob &p_job);
+	bool _copy_cell_page(const PendingJob &p_job);
 	PackedByteArray _image_bytes(const Ref<godot::Image> &p_image, godot::Image::Format p_expected_format,
 			int p_bytes_per_pixel) const;
 	bool _record_jobs(std::vector<PendingJob> &p_jobs, uint64_t p_generation, int p_page_size,
@@ -160,6 +165,7 @@ public:
 	void queue_page(int p_slot, const Ref<godot::Image> &p_idweights, const Ref<godot::Image> &p_height,
 			const godot::Rect2 &p_world_rect, float p_slope_factor = 1.0f);
 	void queue_cached_page(int p_slot, const godot::Dictionary &p_channels);
+	void queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect);
 	void invalidate_slot(int p_slot);
 
 	// Called by the parent through RenderingServer::call_on_render_thread().  The

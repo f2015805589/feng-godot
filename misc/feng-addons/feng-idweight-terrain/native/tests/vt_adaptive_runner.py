@@ -13,6 +13,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--editor", type=Path, default=ROOT / "bin" / "godot.windows.editor.x86_64.exe")
     parser.add_argument("--driver", default="d3d12")
+    parser.add_argument("--sectors", action="store_true", help="Exercise full world-aligned 64 m AVT sectors")
+    parser.add_argument("--scale", action="store_true", help="Exercise a 10.24 km world with 25600 sectors")
+    parser.add_argument("--metric", action="store_true", help="Verify exact 768/1024 texels per metre, sparse residency and distance mips")
+    parser.add_argument("--ownership", action="store_true", help="Verify AVT region ownership, distance cutoffs and SVT result grouping")
+    parser.add_argument("--filtering", action="store_true", help="Verify parent retention and continuity at missing-page boundaries")
     args = parser.parse_args()
     editor = args.editor.resolve()
     if not editor.is_file():
@@ -21,6 +26,7 @@ def main() -> int:
 
     fixture = Path(tempfile.mkdtemp(prefix="terrain-vtadaptive-", dir=ROOT / "bin"))
     write_fixture(fixture)
+    (fixture / "vt_adaptive_base.gd").write_text(Path(__file__).with_name("vt_adaptive.gd").read_text(encoding="utf-8"), encoding="utf-8")
     (fixture / "project.godot").write_text(
         'config_version=5\n[application]\nconfig/name="VT adaptive tests"\n',
         encoding="utf-8",
@@ -56,7 +62,7 @@ def main() -> int:
                         "--position",
                         "-10000,-10000",
                         "--script",
-                        str(Path(__file__).with_name("vt_adaptive.gd").resolve()),
+                        str(Path(__file__).with_name("vt_filtering.gd" if args.filtering else "vt_region_ownership.gd" if args.ownership else "vt_metric_density.gd" if args.metric else "vt_sectors_scale.gd" if args.scale else "vt_sectors.gd" if args.sectors else "vt_adaptive.gd").resolve()),
                         "--",
                         "",
                         str(shots),
@@ -66,6 +72,14 @@ def main() -> int:
                     stderr=subprocess.STDOUT,
                     timeout=300,
                 )
+            if result.returncode == 0:
+                result = subprocess.run(
+                    base + ["--headless", "--script", str(Path(__file__).with_name("vt_resolution_controls.gd").resolve())],
+                    env=env,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
+                )
     except subprocess.TimeoutExpired:
         print(f"TIMEOUT LOG={log}")
         return 124
@@ -73,13 +87,14 @@ def main() -> int:
     output = log.read_text(encoding="utf-8", errors="replace")
     errors = [line for line in output.splitlines() if "ERROR:" in line]
     for line in output.splitlines():
-        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VT_ADAPT")):
+        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VT_ADAPT", "VT_SECTORS", "VT_METRIC", "VT_OWNERSHIP")):
             print(line)
     print(f"EXIT={result.returncode} ERRORS={len(errors)} LOG={log}")
     return int(
         result.returncode != 0
         or bool(errors)
-        or "PASS per-sector AVT density and ready-ancestor refinement" not in output
+        or ("PASS AVT retained parents, seamless page boundaries and arrival blending" if args.filtering else "PASS AVT region ownership, automatic mip filtering and grouped SVT results" if args.ownership else "PASS metric VT density, sparse entries and mip reuse" if args.metric else "PASS 10 km AVT visibility and bounded residency" if args.scale else "PASS full procedural AVT sectors, pressure coverage, refinement and edits" if args.sectors else "PASS per-sector AVT density and ready-ancestor refinement") not in output
+        or "PASS independent VT density and automatic mip controls" not in output
     )
 
 

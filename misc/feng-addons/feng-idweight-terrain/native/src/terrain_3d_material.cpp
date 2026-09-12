@@ -738,6 +738,18 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 		}
 	}
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
+	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
+	RID sector_directory = _terrain->get_avt_sector_directory();
+	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
+	const Rect2i avt_regions = _terrain->get_surface_vt_region_rect();
+	RS->material_set_param(p_material, "_avt_region_rect", Vector4(avt_regions.position.x, avt_regions.position.y, avt_regions.size.x, avt_regions.size.y));
+	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
+	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
+	RS->material_set_param(p_material, "_avt_mip_distance_count", int(avt_distances.size()));
+	avt_distances.resize(16);
+	RS->material_set_param(p_material, "_avt_mip_distance", avt_distances);
+	RS->material_set_param(p_material, "_avt_directory_mask", _terrain->get_avt_directory_mask());
+	RS->material_set_param(p_material, "_avt_root_level", _terrain->get_avt_root_level());
 	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
 	PackedFloat32Array block_sizes = _terrain->get_surface_vt_block_sizes();
 	PackedFloat32Array padded_sizes;

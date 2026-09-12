@@ -243,7 +243,7 @@ func _run() -> void:
 		inspector_section.call("unfold")
 	await _wait_frames(2)
 	if not _require(inspector_svt_bake_button.is_visible_in_tree(),
-			"native SVT foldout did not expose Bake All SVT Pages"):
+			"native SVT foldout did not expose Bake All SVT Cells"):
 		return
 	native_svt_section.call("fold")
 	await _wait_frames(2)
@@ -408,6 +408,22 @@ func _run() -> void:
 	if not _require(vt_editor.baked_mip_selector != null,
 			"VT Page view did not expose a baked mip selector"):
 		return
+	var resolution_option: OptionButton = vt_editor.avt_resolution_option
+	if not _require(resolution_option != null, "AVT resolution dropdown missing"):
+		return
+	var saved_page_size: int = terrain.vt_page_size
+	var saved_page_axis: int = terrain.surface_vt_pages_per_axis
+	for index in 4:
+		var resolution: int = 512 << index
+		resolution_option.select(index)
+		resolution_option.item_selected.emit(index)
+		if not _require(terrain.surface_vt_resolution == resolution and
+				resolution_option.get_selected_id() == resolution,
+				"AVT dropdown does not map exactly to native resolution"):
+			return
+	terrain.vt_page_size = saved_page_size
+	terrain.surface_vt_pages_per_axis = saved_page_axis
+	vt_editor._refresh_settings_controls()
 	svt_item.select(0)
 	await _wait_frames(2)
 	if not _require(vt_editor.svt_panel.visible and vt_editor.svt_auto_bake_button != null and
@@ -417,7 +433,7 @@ func _run() -> void:
 		return
 	if not _require(not vt_editor.svt_auto_bake_button.button_pressed and
 			vt_editor.auto_bake_hint.text.find("500 ms") >= 0 and
-			vt_editor.bake_button.text == "Bake All SVT Pages",
+			vt_editor.bake_button.text == "Bake All SVT Cells",
 			"SVT controls did not reflect the disabled fixture setting and full-bake guidance"):
 		return
 	vt_editor.svt_auto_bake_button.set_pressed_no_signal(true)
@@ -500,7 +516,7 @@ func _run() -> void:
 	if not _require(queued_bake >= 2, "SVT bake should queue geographical pages and their mip parent"):
 		return
 	if not _require(vt_editor.bake_status.text.find("Manual full SVT bake queued") >= 0,
-			"Bake All SVT Pages did not report that the manual full bake was queued"):
+			"Bake All SVT Cells did not report that the manual full bake was queued"):
 		return
 	for _frame in 360:
 		await get_tree().process_frame

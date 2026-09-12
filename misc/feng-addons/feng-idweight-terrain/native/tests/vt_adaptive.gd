@@ -147,6 +147,19 @@ func run() -> void:
 
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
+	require(terrain.region_size == 512 and is_equal_approx(terrain.vertex_spacing, 1.0), "new region covers 512 x 512 metres")
+	for page_size in [16, 48, 256, 1024]:
+		for resolution in [512, 1024, 2048, 4096]:
+			terrain.vt_page_size = page_size
+			terrain.surface_vt_resolution = resolution
+			require(terrain.surface_vt_resolution == resolution, "AVT resolution preset round trip")
+			require(terrain.vt_page_size * terrain.surface_vt_pages_per_axis == resolution, "AVT preset matches physical page mapping exactly")
+			require(terrain.surface_vt_pages_per_axis <= 64, "AVT preset respects block size limit")
+	var packed := PackedScene.new()
+	require(packed.pack(terrain) == OK, "pack AVT settings")
+	var restored := packed.instantiate() as Terrain3D
+	require(restored.surface_vt_resolution == 4096, "AVT resolution survives scene serialization")
+	restored.free()
 	terrain.vt_page_size = 32
 	terrain.vt_page_border = 2
 	terrain.vt_page_count = 128
@@ -231,6 +244,9 @@ func run() -> void:
 	cached_image.save_png(output_dir.path_join("cached-before-growth.png"))
 	require(sample_area(cached_image, near_world) == "red", "ready near AVT pages should bypass the poisoned source array")
 	require(sample_area(cached_image, far_world) == "green", "ready far AVT pages should bypass the poisoned source array")
+	var cached_pages_before_preset := sector_pages(NEAR_REGION)
+	terrain.surface_vt_resolution = 512
+	require(sector_pages(NEAR_REGION) == cached_pages_before_preset, "compatible resolution preset must retain resident pages")
 
 	terrain.surface_vt_texels_per_pixel = 0.5
 	var growth_produced := terrain.update_surface_vt(1)
