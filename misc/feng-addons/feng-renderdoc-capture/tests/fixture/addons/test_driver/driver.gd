@@ -1,5 +1,16 @@
 @tool
 extends EditorPlugin
+var vt_baker: RefCounted
+var vt_ids: Image
+var vt_height: Image
+
+func _render_vt_test_pages():
+	vt_baker.queue_page(0, vt_ids, vt_height, Rect2(0, 0, 64, 64), 1.0)
+	var cached := Image.create(36, 36, false, Image.FORMAT_RGBAH)
+	cached.fill(Color(0.25, 0.5, 0.75, 1))
+	vt_baker.queue_cached_page(1, {"albedo_height": cached, "normal_roughness": cached, "params": cached})
+	vt_baker.render_pending(vt_baker)
+
 func _enter_tree():
 	_run.call_deferred()
 func _run():
@@ -81,12 +92,31 @@ func _run():
 	marker.z_index = 4096
 	await get_tree().create_timer(0.3).timeout
 	var capture_count = FengRenderDoc.get_capture_count()
+	if OS.get_environment("FENG_TEST_VT_WORK") == "1":
+		vt_baker = ClassDB.instantiate("Terrain3DSurfaceBaker")
+		vt_baker.configure(32, 2, 8)
+		vt_baker.set_materials(RID(), RID(), PackedColorArray([Color.WHITE]),
+			PackedFloat32Array(), PackedFloat32Array(), PackedFloat32Array(),
+			PackedFloat32Array(), PackedFloat32Array(), PackedVector2Array(), PackedVector3Array())
+		vt_ids = Image.create(36, 36, false, 39)
+		vt_ids.fill(Color(0, 0, 0, 1))
+		vt_height = Image.create(36, 36, false, Image.FORMAT_RF)
+		vt_height.fill(Color(0, 0, 0, 1))
+		RenderingServer.virtual_texture_set_update_callback(get_instance_id(), _render_vt_test_pages)
+		# Capture ongoing updates after resource/pipeline creation, as in an
+		# already-open terrain scene. Keep the fixture viewport rendering here.
+		var warmup_mode := viewport_3d.get_update_mode()
+		viewport_3d.set_update_mode(SubViewport.UPDATE_ALWAYS)
+		await get_tree().create_timer(1.0).timeout
+		viewport_3d.set_update_mode(warmup_mode)
 	var original_update_mode := viewport_3d.get_update_mode()
 	plugin.button.pressed.emit()
 	await get_tree().create_timer(0.5).timeout
 	while plugin._busy:
 		await get_tree().create_timer(0.2).timeout
 	assert(viewport_3d.get_update_mode() == original_update_mode, "Capture must restore the editor viewport update mode")
+	if vt_baker:
+		RenderingServer.virtual_texture_remove_update_callback(get_instance_id())
 	assert(FengRenderDoc.is_hooked())
 	assert(FengRenderDoc.get_capture_count() == capture_count + 1)
 	assert(FengRenderDoc.get_overlay_bits() == 0)

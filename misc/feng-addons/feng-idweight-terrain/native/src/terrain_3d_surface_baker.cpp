@@ -17,6 +17,17 @@
 
 #include "logger.h"
 
+namespace {
+// Keep diagnostic scopes balanced on upload failures and early returns.
+struct SurfaceVTLabel {
+	RenderingDevice *rd;
+	SurfaceVTLabel(RenderingDevice *p_rd, const String &p_name) : rd(p_rd) {
+		rd->draw_command_begin_label(p_name, Color(0.3f, 0.7f, 0.9f));
+	}
+	~SurfaceVTLabel() { rd->draw_command_end_label(); }
+};
+} // namespace
+
 // The helper source is concatenated after this preamble and before the bake body.
 // Keeping idweight_r16.glsl as the single source of the packed-ID routines prevents
 // this offline/runtime evaluator from drifting from the material shader.
@@ -439,6 +450,11 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation, int p_page_
 		LOG(ERROR, "Could not allocate surface bake textures");
 		return false;
 	}
+	_rd->set_resource_name(next.source_id_rd, "Surface VT Source IDWeights (layer = physical slot)");
+	_rd->set_resource_name(next.source_height_rd, "Surface VT Source Height (layer = physical slot)");
+	_rd->set_resource_name(next.output_albedo_rd, "Surface VT Albedo Height (layer = physical slot)");
+	_rd->set_resource_name(next.output_normal_rd, "Surface VT Normal Roughness (layer = physical slot)");
+	_rd->set_resource_name(next.output_params_rd, "Surface VT Parameters (layer = physical slot)");
 	next.output_albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
 			next.output_albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
 	next.output_normal_rs = RenderingServer::get_singleton()->texture_rd_create(
@@ -466,6 +482,9 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation, int p_page_
 		LOG(ERROR, "Could not allocate surface bake buffers or pipeline");
 		return false;
 	}
+	_rd->set_resource_name(next.job_buffer, "Surface VT Jobs (64 bytes: world rect, texel size, slot, mode)");
+	_rd->set_resource_name(next.material_buffer, "Surface VT Material Parameters");
+	_rd->set_resource_name(next.shader, "Surface VT Page Baker");
 	// A fresh output has no valid pages.  Clearing all channels is recorded on the
 	// main device; no submit or sync is performed here.
 	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
@@ -646,6 +665,7 @@ bool Terrain3DSurfaceBaker::_upload_source_page(const PendingJob &p_job, int p_l
 	if (!_rd || !_resources.source_id_rd.is_valid() || !_resources.source_height_rd.is_valid()) {
 		return false;
 	}
+	SurfaceVTLabel label(_rd, "VT Source Upload - slot " + String::num_int64(p_job.slot));
 	PackedByteArray id_bytes = _image_bytes(p_job.idweights, Image::Format(IDWEIGHT_FORMAT_VALUE), 2);
 	PackedByteArray height_bytes = _image_bytes(p_job.height, Image::FORMAT_RF, 4);
 	if (id_bytes.is_empty() || height_bytes.is_empty()) {
@@ -677,6 +697,7 @@ bool Terrain3DSurfaceBaker::_upload_cached_page(const PendingJob &p_job) {
 		LOG(WARN, "Skipping invalid cached surface page ", p_job.slot);
 		return false;
 	}
+	SurfaceVTLabel label(_rd, "SVT Cached Page Upload - slot " + String::num_int64(p_job.slot));
 	if (_rd->texture_update(_resources.output_albedo_rd, uint32_t(p_job.slot), albedo) != OK ||
 			_rd->texture_update(_resources.output_normal_rd, uint32_t(p_job.slot), normal) != OK ||
 			_rd->texture_update(_resources.output_params_rd, uint32_t(p_job.slot), params) != OK) {
@@ -697,6 +718,7 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 		return false;
 	}
 	PackedByteArray job_bytes;
+	SurfaceVTLabel batch_label(_rd, "Surface VT Page Updates - " + String::num_int64(p_jobs.size()) + " pages");
 	job_bytes.resize(int64_t(p_jobs.size()) * JOB_STRIDE);
 	for (size_t index = 0; index < p_jobs.size(); index++) {
 		PendingJob &job = p_jobs[index];
@@ -728,6 +750,7 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 	push.encode_u32(4, uint32_t(p_jobs.size()));
 	push.encode_u32(8, uint32_t(std::max(0, p_material_count)));
 	push.encode_u32(12, uint32_t(p_generation & 0xFFFFFFFFu));
+	SurfaceVTLabel dispatch_label(_rd, "Bake / Invalidate Pages - Dispatch Z = job index");
 	const int64_t compute_list = _rd->compute_list_begin();
 	if (compute_list < 0) {
 		LOG(WARN, "Could not begin surface bake compute list");

@@ -154,6 +154,11 @@ func run() -> void:
 	require(sample_area(svt_proof, Vector2(32, 32)) == "g", "SVT material pages bypass direct source shading")
 	RenderingServer.material_set_param(shader_material, "_texture_array_albedo", source)
 	print("VT_FINAL_STATS ", terrain.get_vt_settings())
+	var capture_uploads := int(terrain.get_vt_settings().producer.cached_uploads)
+	require(terrain.prepare_vt_capture() > 0, "idle SVT capture must queue resident uploads")
+	await settle()
+	require(int(terrain.get_vt_settings().producer.cached_uploads) > capture_uploads, "capture replays SVT uploads")
+	require(sample_area(await frame_image(), Vector2(32, 32)) == "g", "SVT capture preserves material")
 	# Reconfigure live resources while another offline bake is queued. No stale
 	# output/page-table RID may survive and cancelled work must leave no hang.
 	terrain.bake_svt()
@@ -170,6 +175,11 @@ func run() -> void:
 	require(terrain.get_surface_vt().get_page_size() == 48 and terrain.get_surface_svt().get_page_size() == 48, "both views adopt new shared dimensions")
 	var resized := await frame_image()
 	require(sample_area(resized, Vector2(32, 32)) == "g", "terrain renders after live cache reconfiguration")
+	var capture_bakes := int(terrain.get_vt_settings().producer.baked_pages)
+	require(terrain.prepare_vt_capture() > 0, "idle AVT capture must queue resident bakes")
+	await settle()
+	require(int(terrain.get_vt_settings().producer.baked_pages) > capture_bakes, "capture replays AVT baking")
+	require(sample_area(await frame_image(), Vector2(32, 32)) == "g", "AVT capture preserves material")
 	terrain.set_editor(null)
 	painter.free()
 	scene.queue_free()

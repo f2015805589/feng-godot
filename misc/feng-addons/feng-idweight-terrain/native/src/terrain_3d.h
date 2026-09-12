@@ -322,6 +322,7 @@ public:
 	void set_vt_debug_direct_material(bool p_enabled);
 	bool is_vt_debug_direct_material() const { return _vt_debug_direct_material; }
 	Dictionary get_vt_settings() const;
+	int prepare_vt_capture();
 	Array get_vt_pages() const;
 	Dictionary get_vt_material_textures() const;
 	Ref<Image> get_vt_page_preview(int p_slot);

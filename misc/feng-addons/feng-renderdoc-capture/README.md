@@ -37,11 +37,30 @@ Captures remain under `.godot/renderdoc/captures/`.
 
 ## Validation
 
+The toolbar reissues updates for resident terrain VT pages immediately before
+its explicit frame capture: AVT is baked into the same physical slots and SVT
+reloads its persisted channels. This exposes the producer even in an idle scene;
+it does not edit the terrain or perform a full disk bake. VT timings in this
+diagnostic frame include this extra work and are not steady-state idle timings.
+
+Captures opened by the toolbar enable RenderDoc's empty-region display, so an
+idle VT Pass remains visible with the normal action filter. An idle pass has no
+page work to replay in that frame. Active terrain updates show `Surface VT Page
+Updates`, `VT Source Upload`, `SVT Cached Page Upload`, and the bake Dispatch.
+Select that Dispatch and inspect the named `Surface VT Albedo Height`,
+`Surface VT Normal Roughness`, and `Surface VT Parameters` texture arrays;
+the array layer is the physical slot. Dispatch Z selects a job, whose 64-byte
+record in `Surface VT Jobs` contains the world rectangle, slot, and operation.
+
 After building the engine and addons, run:
 
 ```powershell
 python misc/feng-addons/feng-renderdoc-capture/tests/run_capture.py
 ```
+
+Set `FENG_TEST_VT_WORK=1` to additionally capture the actual terrain page baker
+and a cached SVT upload. The default run verifies that an idle VT marker is
+visible in RenderDoc's UI, not just present in the capture file.
 
 This Windows/D3D12 GPU test requires `psutil` and RenderDoc. It uses a disposable
 project and isolated editor settings under `bin/renderdoc-smoke-*`. It presses the

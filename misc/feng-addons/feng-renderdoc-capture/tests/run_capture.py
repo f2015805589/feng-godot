@@ -42,10 +42,33 @@ def stage_addons() -> None:
     # the unrelated terrain addon out of the fixture entirely.
     terrain_target = target_root / "feng-idweight-terrain"
     terrain_target.mkdir(parents=True, exist_ok=True)
-    (terrain_target / ".gdignore").write_text("", encoding="utf-8")
+    if os.environ.get("FENG_TEST_VT_WORK") == "1":
+        for extension in (source_root / "feng-idweight-terrain").glob("*.gdextension"):
+            shutil.copy2(extension, terrain_target / extension.name)
+        (terrain_target / "bin").mkdir()
+        shutil.copy2(source_root / "feng-idweight-terrain/bin/libfeng-idweight-terrain.windows.debug.x86_64.dll",
+                     terrain_target / "bin/libfeng-idweight-terrain.windows.debug.x86_64.dll")
+    else:
+        (terrain_target / ".gdignore").write_text("", encoding="utf-8")
 
 
 stage_addons()
+
+# Verify the analyzer's actual UI filter, not only the markers in the RDC file.
+view_script = PROJECT / "addons/feng-renderdoc-capture/src/renderdoc_view.py"
+with view_script.open("a", encoding="utf-8") as script:
+    script.write("\n" + '''
+from pathlib import Path
+browser = pyrenderdoc.GetEventBrowser()
+pending = list(pyrenderdoc.CurRootActions())
+visible_vt = []
+while pending:
+    action = pending.pop()
+    pending.extend(action.children)
+    if "VT Idle Marker" in browser.GetEventName(action.eventId) or browser.GetEventName(action.eventId) == "VT Pass":
+        visible_vt.append(browser.IsAPIEventVisible(action.eventId))
+assert visible_vt and all(visible_vt), "Idle VT pass is hidden by the analyzer"
+''' + "Path(" + repr(str(BASE / "idle-vt-visible.txt")) + ").write_text('PASS visible idle VT marker', encoding='utf-8')\n")
 for name in ["config", "cache"]:
     (BASE / name).mkdir()
 ENV = dict(os.environ, APPDATA=str(BASE / "config"), LOCALAPPDATA=str(BASE / "cache"))
@@ -156,8 +179,17 @@ with (BASE / "ui.log").open("wb") as log:
                 assert all(path.is_file() and path.stat().st_size > 0 for path in captures)
                 gui_exe = Path(args[0])
                 subprocess.run([str(gui_exe.with_name("renderdoccmd.exe")), "thumb", "--out=" + str(BASE / "current_editor.png"), str(captures[0])], check=True, capture_output=True)
-                validate_capture(captures[0], gui_exe.with_name("renderdoccmd.exe"), BASE)
-                time.sleep(2)
+                events = validate_capture(captures[0], gui_exe.with_name("renderdoccmd.exe"), BASE,
+                                          explicit=ENV.get("FENG_TEST_VT_WORK") != "1")
+                if ENV.get("FENG_TEST_VT_WORK") == "1":
+                    assert any("::Dispatch" in draw["operation"]
+                               and any("Bake / Invalidate Pages" in label for label in draw["path"])
+                               and any("VT Idle Marker" in label for label in draw["path"])
+                               for draw in events["scene_draws"]), "VT page baker dispatch missing"
+                # Replay may compile the VT compute shader on first open.
+                ui_deadline = time.monotonic() + 25
+                while not (BASE / "idle-vt-visible.txt").is_file() and time.monotonic() < ui_deadline:
+                    time.sleep(0.1)
                 close_test_gui(analyzer)
                 assert_attached(editor.pid)
                 checked = True
@@ -171,6 +203,7 @@ with (BASE / "ui.log").open("wb") as log:
 
 output = (BASE / "ui.log").read_text(encoding="utf-8", errors="replace")
 assert checked and analyzer is not None, output
+assert (BASE / "idle-vt-visible.txt").is_file(), "Analyzer did not verify the idle VT marker is visible"
 assert "SCRIPT ERROR" not in output, output
 assert "ERROR:" not in output, output
 result = (PROJECT / "capture_result.cfg").read_text(encoding="utf-8")

@@ -202,6 +202,29 @@ String Terrain3D::_svt_page_path(const Vector2i &p_address, int p_mip) const {
 	return _data_directory.path_join("svt").path_join(tile_key(p_address, p_mip) + ".vtpage");
 }
 
+int Terrain3D::prepare_vt_capture() {
+	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
+	if (!producer || _vt_debug_direct_material || !_data) { return 0; }
+	// Reissue resident production into the same slots for a diagnostic capture.
+	// This does not evict pages, edit terrain, or run a persistent full bake.
+	const Array records = _vt_page_records.values();
+	const int stored_size = _vt_page_size + 2 * _vt_page_border;
+	int queued = 0;
+	for (const Dictionary &record : records) {
+		const int slot = record.get("slot", -1);
+		if (!producer->is_page_ready(slot)) { continue; }
+		PackedByteArray bytes = record.get("source", PackedByteArray());
+		if (bytes.size() != int64_t(stored_size) * stored_size * 2) { continue; }
+		Ref<Image> payload = Image::create_from_data(stored_size, stored_size, false,
+				Image::Format(39), bytes);
+		_queue_vt_material_page(slot, payload, record.get("world_rect", Rect2()),
+				record.get("kind", String()) == Variant("SVT"), record.get("mip", 0),
+				record.get("address", Vector2i()));
+		++queued;
+	}
+	return queued;
+}
+
 void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
 		bool p_svt, int p_mip, const Vector2i &p_address) {
 	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
@@ -595,6 +618,7 @@ void Terrain3D::_bind_vt_methods() {
 	ClassDB::bind_method(D_METHOD("set_vt_debug_direct_material", "enabled"), &Terrain3D::set_vt_debug_direct_material);
 	ClassDB::bind_method(D_METHOD("is_vt_debug_direct_material"), &Terrain3D::is_vt_debug_direct_material);
 	ClassDB::bind_method(D_METHOD("get_vt_settings"), &Terrain3D::get_vt_settings);
+	ClassDB::bind_method(D_METHOD("prepare_vt_capture"), &Terrain3D::prepare_vt_capture);
 	ClassDB::bind_method(D_METHOD("get_vt_pages"), &Terrain3D::get_vt_pages);
 	ClassDB::bind_method(D_METHOD("get_vt_material_textures"), &Terrain3D::get_vt_material_textures);
 	ClassDB::bind_method(D_METHOD("get_vt_page_preview", "slot"), &Terrain3D::get_vt_page_preview);

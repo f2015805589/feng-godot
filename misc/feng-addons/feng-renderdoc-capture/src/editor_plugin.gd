@@ -14,7 +14,7 @@ func _enter_tree() -> void:
 	button = Button.new()
 	button.icon = EditorInterface.get_base_control().get_theme_icon("Camera3D", "EditorIcons")
 	button.flat = true
-	button.tooltip_text = "Capture an actual frame rendered by this editor and open it in RenderDoc."
+	button.tooltip_text = "Capture this editor frame with resident VT page updates replayed for inspection, then open RenderDoc."
 	button.pressed.connect(_on_capture_pressed)
 	add_control_to_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_MENU, button)
 	button.get_parent().move_child(button, 0)
@@ -79,11 +79,14 @@ func _on_capture_pressed() -> void:
 	# Render one frame and capture exactly that frame. Queuing "the next presented frame"
 	# instead can land on a UI-only update, which holds a handful of commands and none of
 	# the scene passes.
+	var vt_pages := _prepare_vt_capture()
 	var capture := str(RenderDocCapture.capture_frame(button.get_window().get_window_id()))
 	_restore_capture_viewports(forced_viewports)
 	_busy = false
 	button.disabled = false
 	if not capture.is_empty() and FileAccess.file_exists(capture):
+		if vt_pages > 0:
+			_status("VT capture: replayed updates for %d resident pages." % vt_pages)
 		_open_capture(gui, capture)
 		return
 	# Nothing could be recorded explicitly: fall back to the queued trigger, which
@@ -116,8 +119,23 @@ func _on_capture_pressed() -> void:
 	_open_capture(gui, queued_capture)
 
 
+func _prepare_vt_capture() -> int:
+	var scene := EditorInterface.get_edited_scene_root()
+	if scene == null:
+		return 0
+	var pending: Array[Node] = [scene]
+	var pages := 0
+	while not pending.is_empty():
+		var node := pending.pop_back() as Node
+		pending.append_array(node.get_children())
+		if node.has_method("prepare_vt_capture"):
+			pages += int(node.call("prepare_vt_capture"))
+	return pages
+
+
 func _open_capture(p_gui: String, p_capture: String) -> void:
-	if OS.create_process(p_gui, PackedStringArray([p_capture])) <= 0:
+	var view_script := ProjectSettings.globalize_path(get_script().resource_path.get_base_dir().path_join("renderdoc_view.py"))
+	if OS.create_process(p_gui, PackedStringArray(["--ui-python", view_script, p_capture])) <= 0:
 		_warning("Could not launch RenderDoc. Capture saved to " + p_capture)
 		return
 	_status("Rendered frame opened in RenderDoc.")
