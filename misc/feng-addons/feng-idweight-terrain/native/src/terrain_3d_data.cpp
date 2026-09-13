@@ -2023,6 +2023,9 @@ int Terrain3DData::produce_surface_rect_page(const Rect2 &p_rect, int p_page_siz
 		PackedByteArray bytes;
 		const uint8_t *data = nullptr;
 		int size = 0;
+		std::vector<int> columns;
+		int previous_dy = -1;
+		int previous_y = -1;
 		real_t payload_texel = 1.f;
 		real_t origin_x = 0.f;
 		real_t origin_z = 0.f;
@@ -2046,6 +2049,11 @@ int Terrain3DData::produce_surface_rect_page(const Rect2 &p_rect, int p_page_siz
 			cell.origin_z = real_t(rz0 + rz) * region_world;
 			cell.bytes = cell.image->get_data();
 			cell.data = cell.bytes.ptr();
+			cell.columns.resize(stored);
+			for (int x = 0; x < stored; ++x) {
+				const real_t world_x = origin_x + (real_t(x - p_border) + 0.5f) * texel_world;
+				cell.columns[x] = CLAMP(int(Math::floor((world_x - cell.origin_x) / cell.payload_texel)), 0, cell.size - 1);
+			}
 		}
 	}
 
@@ -2067,27 +2075,26 @@ int Terrain3DData::produce_surface_rect_page(const Rect2 &p_rect, int p_page_siz
 			continue;
 		}
 		uint8_t *out = bytes_ptr + int64_t(y) * stored * 2;
-		int previous_rx = -1;
-		const SourceCell *source_cell = nullptr;
-		for (int x = 0; x < stored; x++) {
+		for (int x = 0; x < stored;) {
+			const int first = x;
 			const int rx = column_region[size_t(x)];
-			if (rx < 0 || rx >= span_x) {
-				continue;
-			}
-			if (rx != previous_rx) {
-				const auto entry = cells.find(int64_t(rz) * span_x + rx);
-				source_cell = entry == cells.end() ? nullptr : &entry->second;
-				previous_rx = rx;
-			}
-			if (!source_cell || source_cell->data == nullptr) {
-				continue;
-			}
-			const SourceCell &cell = *source_cell;
-			const int dx = CLAMP(int(Math::floor((column_world_x[size_t(x)] - cell.origin_x) / cell.payload_texel)), 0, cell.size - 1);
+			while (x < stored && column_region[size_t(x)] == rx) { ++x; }
+			const auto entry = cells.find(int64_t(rz) * span_x + rx);
+			if (rx < 0 || rx >= span_x || entry == cells.end()) { continue; }
+			SourceCell &cell = entry->second;
 			const int dy = CLAMP(int(Math::floor((world_z - cell.origin_z) / cell.payload_texel)), 0, cell.size - 1);
-			const uint8_t *texel = cell.data + (int64_t(dy) * cell.size + dx) * 2;
-			out[x * 2] = texel[0];
-			out[x * 2 + 1] = texel[1];
+			if (cell.previous_y == y - 1 && cell.previous_dy == dy) {
+				std::memcpy(out + first * 2, out - stored * 2 + first * 2, size_t(x - first) * 2);
+			} else {
+				const uint8_t *row = cell.data + int64_t(dy) * cell.size * 2;
+				for (int column = first; column < x; ++column) {
+					const uint8_t *texel = row + cell.columns[column] * 2;
+					out[column * 2] = texel[0];
+					out[column * 2 + 1] = texel[1];
+				}
+			}
+			cell.previous_dy = dy;
+			cell.previous_y = y;
 		}
 	}
 	r_page = Image::create_from_data(stored, stored, false, Image::Format(39), bytes);

@@ -7,15 +7,13 @@
 #include <tuple>
 #include <functional>
 
-// Select distance-based detail over visible terrain. If it exceeds the shared
-// pool allowance, raise a common minimum mip until the canonical page set fits.
-// Pages already coarser than that floor keep their distance-selected level.
-// The shader can resolve missing detail through these coarser ancestors.
+// Select exactly the shader distance bands. Shared capacity limits residency,
+// never changes the requested mip or substitutes an ancestor.
 int Terrain3D::_update_visible_svt(int p_max_pages) {
 	Camera3D *camera = get_camera();
 	if (!camera || !camera->is_inside_tree()) { return 0; }
-	TerrainVT::VisibleView view(camera);
-	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; };
+	TerrainVT::VisibleView view(camera, 48.f);
+	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; TerrainVT::VisiblePatch visible; };
 	struct Page { Vector2i address; int mip; float distance; };
 	std::vector<Region> regions;
 	const Vector3 camera_position = camera->get_global_position();
@@ -36,7 +34,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		Rect2 rect(Vector2(location) * region_world, Vector2(region_world, region_world));
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
-		regions.push_back({ rect, region->get_height_range(), visible.distance, visible.farthest });
+		regions.push_back({ rect, region->get_height_range(), visible.distance, visible.farthest, visible });
 	}
 	std::sort(regions.begin(), regions.end(), [](const Region &a, const Region &b) { return a.distance < b.distance; });
 	float farthest_distance = 0.f;
@@ -56,8 +54,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	std::map<std::tuple<int, int, int>, Page> unique;
 	// Traverse visible footprints, not every mip-0 cell of an entire region.
 	// A high SVT texel density must not be silently capped to 16 pages/region.
-	// Bound pathological over-demand and retain a coarse ancestor when the CPU
-	// walk budget is exhausted; normal sparse close-ups can reach mip 0.
+	// Bound pathological traversal without replacing requested levels with ancestors.
 	int walk_visited = 0;
 	const int visit_limit = MAX(4096, _surface_svt->get_page_count() * 128);
 	const float half_world = _surface_svt->get_indirection_size() * page_world * 0.5f;
@@ -68,14 +65,19 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		std::function<void(int, int, int)> visit = [&](int x, int y, int mip) {
 			const float span = page_world * float(1 << mip);
 			const Rect2 footprint(Vector2(x, y) * span, Vector2(span, span));
-			if (!footprint.intersects(resident) || avt_interior(footprint.intersection(resident))) { return; }
+			if (!footprint.intersects(resident)) { return; }
+			const Rect2 clipped = footprint.intersection(resident);
+			if (avt_interior(clipped)) { return; }
 			TerrainVT::VisiblePatch visible;
-			if (!view.sample(footprint.intersection(resident), region.heights, visible)) { return; }
+			// Coarse ancestors commonly clip to the same complete region. Reuse
+			// its exact query, including grazing-view density and distance bounds.
+			if (clipped == region.rect) { visible = region.visible; }
+			else if (!view.sample(clipped, region.heights, visible)) { return; }
 			++walk_visited;
-			const int near_mip = get_surface_svt_mip_for_distance(visible.distance, plan_limit);
-			const int far_mip = get_surface_svt_mip_for_distance(MAX(visible.distance, visible.farthest), plan_limit);
+			const int near_mip = get_surface_svt_mip_for_distance(MAX(0.f, visible.distance - MAX(2.f, visible.distance * 0.03f)), plan_limit);
+			const int far_mip = get_surface_svt_mip_for_distance(MAX(visible.distance, visible.farthest) * 1.03f + 2.f, plan_limit);
 			if (mip < near_mip) { return; }
-			if (mip <= far_mip || walk_visited >= visit_limit) {
+			if (mip <= far_mip) {
 				const Vector2i address(x * (1 << mip), y * (1 << mip));
 				const auto key = std::make_tuple(mip, address.x, address.y);
 				auto found = unique.find(key);
@@ -98,49 +100,17 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
 	});
 
+	if (_ensure_vt_capacity(int(pages.size()) + (_surface_vt_enabled ? int(_avt_page_plan.size()) : 0))) { return 0; }
+
 	// The physical pool is shared with the near field, so the far field only claims what
 	// the near field is not holding.
 	const int physical_page_count = MAX(1, _surface_svt->get_page_count());
-	const int capacity = MAX(1, physical_page_count - (_surface_vt_enabled ? physical_page_count / 2 : 0));
-	// Over-subscription policy: raise a *floor* on coarseness until the visible set fits
-	// the pool, and keep every page that is already coarser than that floor exactly where
-	// the distance rule put it. Only the pages finer than the floor coarsen, so the far
-	// field above that floor stays unchanged, every visible chunk still
-	// resolves, and the floor is a function of the visible set and the pool size alone:
-	// the search always starts at the finest level and walks up, so a settled view selects
-	// the same floor, the same levels and the same pages on every frame.
-	int floor_mip = 0;
-	std::map<std::tuple<int, int, int>, Page> selected;
-	for (;;) {
-		selected.clear();
-		for (const Page &page : pages) {
-			const int mip = MAX(page.mip, floor_mip);
-			const Vector2i address(TerrainVT::world_page_origin(page.address.x, mip),
-					TerrainVT::world_page_origin(page.address.y, mip));
-			const auto key = std::make_tuple(mip, address.x, address.y);
-			auto found = selected.find(key);
-			if (found == selected.end() || page.distance < found->second.distance) {
-				selected[key] = { address, mip, page.distance };
-			}
-		}
-		if (int(selected.size()) <= capacity || floor_mip >= plan_limit) { break; }
-		floor_mip++;
-	}
-	std::vector<Page> chosen;
-	chosen.reserve(selected.size());
-	for (const auto &entry : selected) { chosen.push_back(entry.second); }
-	std::sort(chosen.begin(), chosen.end(), [](const Page &a, const Page &b) {
-		if (a.distance != b.distance) { return a.distance < b.distance; }
-		return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
-	});
-	if (floor_mip > 0) {
-		WARN_PRINT_ONCE(vformat("Terrain3D: the far field needs %d pages for its current level bands but only %d of the pool are available to it; levels finer than %d are coarsened to level %d so every visible chunk still resolves. Raise the surface page count to keep the distance bands.",
-				int(pages.size()), capacity, floor_mip, floor_mip));
-	}
-	if (int(chosen.size()) > capacity) {
-		WARN_PRINT_ONCE(vformat("Terrain3D: the far field cannot cover its visible footprint: %d pages are needed even at level %d but only %d are available to it. Raise the surface page count, coarsen surface_svt_page_world, or set surface_svt_mip_distances so distant terrain uses coarser levels.",
-				int(chosen.size()), plan_limit, capacity));
-	}
+	_vt_svt_visible_pages = int(pages.size());
+	const int near_reserve = _surface_vt_enabled ? MIN(physical_page_count / 2, int(_avt_page_plan.size())) : 0;
+	const int capacity = MAX(1, physical_page_count - near_reserve);
+	// Preserve the shader's selected level. Coarsening only the CPU request
+	// produces a permanently missing page when strict residency is enabled.
+	const std::vector<Page> &chosen = pages;
 
 	// Publish the level this frame uses. A saved maximum detail level is only ever raised,
 	// never lowered, so a view that already extended the hierarchy keeps it.
@@ -171,12 +141,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		if (slot < 0) { continue; }
 		if (!miss) { continue; }
 		_invalidate_vt_slot(slot);
+		// Both disk reads and source-ID construction belong to the source worker.
 		Ref<Image> payload;
-		if (_data->produce_sparse_surface_page(request.address.x, request.address.y, request.mip, _surface_svt_page_world,
-					_vt_page_size, _vt_page_border, payload) < 0 || !_surface_svt->write_page(slot, payload)) {
-			_surface_svt->release_world_page(request.address.x, request.address.y, request.mip);
-			continue;
-		}
 		const float span = _surface_svt_page_world * float(1 << request.mip);
 		_queue_vt_material_page(slot, payload, Rect2(Vector2(request.address) * _surface_svt_page_world, Vector2(span, span)),
 				true, request.mip, request.address);

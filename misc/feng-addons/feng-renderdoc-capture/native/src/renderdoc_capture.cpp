@@ -103,16 +103,21 @@ String RenderDocCapture::capture_frame(int p_window_id) {
 		// Two overlapping captures are undefined; a capture that never ended would be one.
 		api->DiscardFrameCapture(nullptr, wnd);
 	}
+	const uint64_t capture_start = Time::get_singleton()->get_ticks_msec();
+	UtilityFunctions::print("[frd] capture: begin, RenderDoc=", get_renderdoc_module_path());
 	api->StartFrameCapture(nullptr, wnd);
+	UtilityFunctions::print("[frd] capture: drawing editor viewports");
 	// Draws the editor's viewport tree -- docked 3D viewports included -- and presents it,
 	// so the capture holds the scene passes, the backbuffer and a Present event.
 	rendering->force_draw(true, 0.0);
+	UtilityFunctions::print("[frd] capture: saving GPU resources and commands");
 	if (!api->EndFrameCapture(nullptr, wnd)) {
 		// Nothing was recorded: close the capture so RenderDoc is not left mid-frame.
 		api->DiscardFrameCapture(nullptr, wnd);
 		UtilityFunctions::printerr("[frd] RenderDoc recorded nothing for the rendered frame");
 		return String();
 	}
+	UtilityFunctions::print("[frd] capture: complete in ", Time::get_singleton()->get_ticks_msec() - capture_start, " ms");
 	const uint32_t capture_count = api->GetNumCaptures();
 	if (capture_count == 0) {
 		return String();

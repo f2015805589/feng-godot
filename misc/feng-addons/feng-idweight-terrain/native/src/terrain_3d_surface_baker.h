@@ -59,6 +59,7 @@ private:
 		Ref<godot::Image> params;
 		godot::Rect2 world_rect;
 		float slope_factor = 1.0f;
+		Vector3 source_grid;
 		uint64_t generation = 0;
 		uint64_t sequence = 0;
 	};
@@ -89,6 +90,8 @@ private:
 	int _page_size = 0;
 	int _border = 0;
 	int _page_count = 0;
+	int _requested_capacity = 0;
+	int _resource_page_count = 0;
 	int _stored_size = 0;
 	uint64_t _generation = 1;
 	uint64_t _material_version = 1;
@@ -108,11 +111,15 @@ private:
 	// These fields are touched by the render callback only, except for the output RS
 	// RIDs which are copied under _mutex by the getters and clear().
 	RenderingDevice *_rd = nullptr;
-	ResourceBundle _resources;
+	ResourceBundle _resources, _retired_resources;
+	bool _retire_ready = false;
 
+	uint64_t _render_frame = UINT64_MAX;
+	int _frame_page_updates = 0;
 	uint64_t _dispatch_count = 0;
 	uint64_t _baked_pages = 0;
 	uint64_t _cached_uploads = 0;
+	uint64_t _migrated_pages = 0;
 	uint64_t _invalidated_pages = 0;
 	uint64_t _source_uploads = 0;
 
@@ -153,13 +160,17 @@ public:
 	~Terrain3DSurfaceBaker() override;
 
 	void configure(int p_page_size, int p_border, int p_page_count);
+	void request_capacity(int p_count);
+	int get_capacity() const;
+	bool has_render_work() const;
+	void acknowledge_output(const RID &p_albedo);
 	void set_materials(const RID &p_albedo_array_rid, const RID &p_normal_array_rid,
 			const PackedColorArray &p_colors, const PackedFloat32Array &p_normal_depths,
 			const PackedFloat32Array &p_ao_strengths, const PackedFloat32Array &p_ao_affects,
 			const PackedFloat32Array &p_roughness_mods, const PackedFloat32Array &p_uv_scales,
 			const PackedVector2Array &p_detiles, const PackedVector3Array &p_slope_params);
 	void queue_page(int p_slot, const Ref<godot::Image> &p_idweights, const Ref<godot::Image> &p_height,
-			const godot::Rect2 &p_world_rect, float p_slope_factor = 1.0f);
+			const godot::Rect2 &p_world_rect, float p_slope_factor = 1.0f, Vector3 p_source_grid = Vector3());
 	void queue_cached_page(int p_slot, const godot::Dictionary &p_channels);
 	void queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect);
 	void invalidate_slot(int p_slot);

@@ -69,13 +69,13 @@ def write_fixture(fixture: Path, test: str = "dock") -> None:
         encoding="utf-8",
     )
 
-    if test == "input":
+    if test in {"input", "vt_idle"}:
         project = fixture / "project.godot"
         # The input fixture extends the production plugin itself.
         project.write_text(project.read_text(encoding="utf-8").replace(
             '"res://addons/feng-idweight-terrain/plugin.cfg", ', ''), encoding="utf-8")
 
-    if test in {"setup", "grid"}:
+    if test in {"setup", "grid", "vt_idle"}:
         (fixture / "render").mkdir()
         (fixture / "render/test.tscn").write_text(
             '[gd_scene format=3]\n\n[node name="TerrainSetup" type="Node3D"]\n'
@@ -135,6 +135,7 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
         "grid": "PASS 20x20 terrain grid creation, cancellation, limits and reload",
         "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches Hydra's pair fields",
         "svt_inspector": "PASS native SVT Inspector full-bake action and progress",
+        "vt_idle": "PASS editor stationary VT completion",
     }[test]
     if marker not in output:
         return 1
@@ -150,7 +151,7 @@ def main() -> int:
         help="graphical Godot editor executable (the console build still creates a window)",
     )
     parser.add_argument("--driver", default="d3d12")
-    parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector"], default="dock")
+    parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle"], default="dock")
     args = parser.parse_args()
     editor = args.editor.resolve()
     if not editor.is_file():

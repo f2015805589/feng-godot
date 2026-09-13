@@ -222,7 +222,17 @@ func _run() -> void:
 	# custom control must be inside the native EditorInspectorSection so its
 	# visibility follows the real subgroup, rather than living in the asset dock.
 	await _wait_frames(4)
+	var last_subgroup := ""
+	var cdlod_group_seen := false
+	for property in terrain.get_property_list():
+		if int(property.usage) & PROPERTY_USAGE_SUBGROUP:
+			if property.name == "CDLOD":
+				if not _require(last_subgroup == "SVT", "CDLOD foldout must follow SVT"): return
+				cdlod_group_seen = true
+			last_subgroup = property.name
+	if not _require(cdlod_group_seen, "native CDLOD foldout is missing"): return
 	var inspector := EditorInterface.get_inspector()
+	if not _require(inspector.find_child("TerrainCDLODDescription", true, false) == null, "CDLOD should not inject a description above the switch"): return
 	var inspector_page_section := inspector.find_child("TerrainVTPageSection", true, false) as Control
 	if not _require(inspector_page_section != null,
 			"Terrain3D Inspector did not create the Surface VT VT Page content"):
@@ -388,10 +398,12 @@ func _run() -> void:
 	var settings_item: TreeItem = surface_item.get_first_child()
 	var avt_item: TreeItem = settings_item.get_next() if settings_item else null
 	var svt_item: TreeItem = avt_item.get_next() if avt_item else null
-	var pages_item: TreeItem = svt_item.get_next() if svt_item else null
+	var cdlod_item: TreeItem = svt_item.get_next() if svt_item else null
+	var pages_item: TreeItem = cdlod_item.get_next() if cdlod_item else null
 	if not _require(settings_item != null and settings_item.get_text(0) == "VT Setting" and
 			avt_item != null and avt_item.get_text(0) == "AVT" and
 			svt_item != null and svt_item.get_text(0) == "SVT" and
+			cdlod_item != null and cdlod_item.get_text(0) == "CDLOD" and
 			pages_item != null and pages_item.get_text(0) == "VT Page",
 			"VT editor hierarchy did not expose VT Setting, AVT, SVT, and VT Page groups"):
 		return
@@ -415,6 +427,16 @@ func _run() -> void:
 			"VT Page hierarchy group did not collapse"):
 		return
 	pages_item.collapsed = false
+	cdlod_item.select(0)
+	vt_editor.hierarchy.item_selected.emit()
+	await _wait_frames(2)
+	var cdlod_toggle := vt_editor.find_child("CDLODEnabled", true, false) as CheckButton
+	if not _require(cdlod_toggle != null, "CDLOD settings panel was not created"): return
+	cdlod_toggle.set_pressed_no_signal(true)
+	cdlod_toggle.toggled.emit(true)
+	if not _require(terrain.cdlod_enabled, "CDLOD toggle did not update native setting"): return
+	cdlod_toggle.set_pressed_no_signal(false)
+	cdlod_toggle.toggled.emit(false)
 	settings_item.select(0)
 	await _wait_frames(2)
 	if not _require(vt_editor.settings_panel.visible and vt_editor.page_size_spin != null and

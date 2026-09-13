@@ -5,6 +5,9 @@ func _initialize() -> void:
 
 func run() -> void:
 	var terrain := Terrain3D.new()
+	assert(terrain.vt_pages_per_update == 16)
+	terrain.vt_pages_per_update = 64
+	assert(terrain.vt_pages_per_update == 16)
 	root.add_child(terrain)
 	terrain.set_process(false)
 	terrain.set_physics_process(false)

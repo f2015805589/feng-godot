@@ -1,6 +1,7 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #include "terrain_3d_surface_baker.h"
+#include <godot_cpp/classes/engine.hpp>
 
 #include "logger.h"
 
@@ -254,12 +255,15 @@ Terrain3DSurfaceBaker::~Terrain3DSurfaceBaker() {
 }
 
 void Terrain3DSurfaceBaker::clear() {
-	ResourceBundle resources;
+	ResourceBundle current, retired;
 	RenderingDevice *resource_rd = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		resource_rd = _rd;
-		resources = _resources;
+		current = _resources;
+		retired = _retired_resources;
+		_retired_resources = ResourceBundle();
+		_retire_ready = false;
 		_resources = ResourceBundle();
 		_resource_generation = 0;
 		_configured = false;
@@ -270,22 +274,24 @@ void Terrain3DSurfaceBaker::clear() {
 		++_generation;
 		_rd = nullptr;
 	}
-	if (!resources.shader.is_valid() && !resources.output_albedo_rd.is_valid() &&
-			!resources.output_albedo_rs.is_valid()) {
-		return;
+	for (const ResourceBundle &resources : {current, retired}) {
+		if (!resources.shader.is_valid() && !resources.output_albedo_rd.is_valid() &&
+				!resources.output_albedo_rs.is_valid()) {
+			continue;
+		}
+		RenderingServer *server = RenderingServer::get_singleton();
+		if (!server || server->is_on_render_thread()) {
+			_free_bundle(resource_rd, resources);
+			continue;
+		}
+		server->call_on_render_thread(callable_mp_static(&Terrain3DSurfaceBaker::_free_deferred)
+											  .bind(resources.output_albedo_rd, resources.output_normal_rd, resources.output_params_rd,
+													  resources.output_albedo_rs, resources.output_normal_rs, resources.output_params_rs,
+													  resources.source_id_rd, resources.source_height_rd, resources.material_buffer,
+													  resources.job_buffer, resources.dummy_albedo_rd, resources.dummy_normal_rd,
+													  resources.uniform_set, resources.pipeline, resources.shader,
+													  resources.sampler_nearest, resources.sampler_linear, resources.cell_shader, resources.cell_pipeline));
 	}
-	RenderingServer *server = RenderingServer::get_singleton();
-	if (!server || server->is_on_render_thread()) {
-		_free_bundle(resource_rd, resources);
-		return;
-	}
-	server->call_on_render_thread(callable_mp_static(&Terrain3DSurfaceBaker::_free_deferred)
-										  .bind(resources.output_albedo_rd, resources.output_normal_rd, resources.output_params_rd,
-												  resources.output_albedo_rs, resources.output_normal_rs, resources.output_params_rs,
-												  resources.source_id_rd, resources.source_height_rd, resources.material_buffer,
-												  resources.job_buffer, resources.dummy_albedo_rd, resources.dummy_normal_rd,
-												  resources.uniform_set, resources.pipeline, resources.shader,
-												  resources.sampler_nearest, resources.sampler_linear, resources.cell_shader, resources.cell_pipeline));
 }
 
 ///////////////////////////
@@ -388,16 +394,22 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		LOG(ERROR, "No main RenderingDevice available for surface bake");
 		return false;
 	}
+	bool growing = false;
+	int old_count = 0;
+	ResourceBundle old;
+	std::vector<uint8_t> ready;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		if (_resource_generation == p_generation && _resources.pipeline.is_valid()) {
-			return true;
+			if (_resource_page_count >= p_page_count || _retired_resources.output_albedo_rd.is_valid()) { return true; }
+			growing = true; old_count = _resource_page_count;
+			old = _resources; ready = _ready;
 		}
 	}
-
-	ResourceBundle old;
-	_take_resources(old);
-	_free_bundle(_rd, old);
+	if (!growing) {
+		_take_resources(old);
+		_free_bundle(_rd, old);
+	}
 	ResourceBundle next;
 	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
@@ -485,10 +497,34 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
 	_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
 	_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
+	if (growing) {
+		// Resource migration copies existing results; it does not rerun a page
+		// shader or restart source work. Keep the old output alive until the next
+		// material update has bound the new arrays, including already prepared draws.
+		uint64_t copied = 0;
+		for (int slot = 0; slot < old_count; ++slot) {
+			if (slot >= int(ready.size()) || !ready[slot]) { continue; }
+			const Vector3 extent(p_stored_size, p_stored_size, 1);
+			if (_rd->texture_copy(old.output_albedo_rd, next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+					_rd->texture_copy(old.output_normal_rd, next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+					_rd->texture_copy(old.output_params_rd, next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
+				_free_bundle(_rd, next); return false;
+			}
+			++copied;
+		}
+		std::lock_guard<std::mutex> lock(_mutex);
+		_retired_resources = old;
+		_retire_ready = false;
+		_migrated_pages += copied;
+	}
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_resources = next;
 		_resource_generation = p_generation;
+		_resource_page_count = p_page_count;
+		_page_count = p_page_count;
+		_ready.resize(size_t(p_page_count), 0);
+		_slot_sequence.resize(size_t(p_page_count), 0);
 	}
 	return true;
 }
@@ -511,6 +547,7 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 	_page_size = std::max(1, p_page_size);
 	_border = std::max(0, p_border);
 	_page_count = std::max(1, p_page_count);
+	_requested_capacity = _page_count;
 	_stored_size = _page_size + 2 * _border;
 	_configured = true;
 	++_generation;
@@ -520,6 +557,20 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 	_next_sequence = 1;
 	_invalidate_all = true;
 	_resource_generation = 0;
+}
+
+void Terrain3DSurfaceBaker::request_capacity(int p_count) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	_requested_capacity = std::max(_requested_capacity, p_count);
+}
+int Terrain3DSurfaceBaker::get_capacity() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _page_count;
+}
+
+void Terrain3DSurfaceBaker::acknowledge_output(const RID &p_albedo) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (p_albedo == _resources.output_albedo_rs) { _retire_ready = true; }
 }
 
 void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const RID &p_normal_array_rid,
@@ -565,7 +616,7 @@ void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const R
 }
 
 void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights,
-		const Ref<Image> &p_height, const Rect2 &p_world_rect, float p_slope_factor) {
+		const Ref<Image> &p_height, const Rect2 &p_world_rect, float p_slope_factor, Vector3 p_source_grid) {
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (!_configured || p_slot < 0 || p_slot >= _page_count || p_idweights.is_null() || p_height.is_null()) {
 		return;
@@ -576,6 +627,7 @@ void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights
 	job.idweights = p_idweights;
 	job.height = p_height;
 	job.world_rect = p_world_rect;
+	job.source_grid = p_source_grid;
 	job.slope_factor = std::clamp(p_slope_factor, 0.0f, 1.0f);
 	job.generation = _generation;
 	job.sequence = ++_next_sequence;
@@ -801,7 +853,7 @@ void main() {
 		RID uniform = _rd->uniform_set_create(uniforms, _resources.cell_shader, 0);
 		PackedByteArray push;
 		push.resize(64);
-		Rect2 rects[] = { p_job.world_rect, piece["cell_rect"], piece["source_rect"] };
+		Rect2 rects[] = { p_job.world_rect, piece.get("coverage_rect", piece["cell_rect"]), piece["source_rect"] };
 		for (int i = 0; i < 3; ++i) {
 			push.encode_float(i * 16, rects[i].position.x);
 			push.encode_float(i * 16 + 4, rects[i].position.y);
@@ -866,7 +918,7 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 		job_bytes.encode_u32(offset + 36, uint32_t(std::max(0, job.slot)));
 		job_bytes.encode_u32(offset + 40, mode);
 		job_bytes.encode_u32(offset + 44, 0);
-		encode_vec4(job_bytes, offset + 48, std::clamp(job.slope_factor, 0.0f, 1.0f), 0.0f, 0.0f, 0.0f);
+		encode_vec4(job_bytes, offset + 48, std::clamp(job.slope_factor, 0.0f, 1.0f), job.source_grid.x, job.source_grid.y, job.source_grid.z);
 	}
 	if (_rd->buffer_update(_resources.job_buffer, 0, uint32_t(job_bytes.size()), job_bytes) != OK) {
 		LOG(WARN, "Could not upload surface bake jobs");
@@ -921,6 +973,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	int page_size;
 	int border;
 	int page_count;
+	int requested_capacity;
 	int stored_size;
 	int material_count;
 	bool invalidate_all;
@@ -939,6 +992,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		page_size = _page_size;
 		border = _border;
 		page_count = _page_count;
+		requested_capacity = _requested_capacity;
 		stored_size = _stored_size;
 		invalidate_all = _invalidate_all;
 		materials_dirty = _materials_dirty;
@@ -956,6 +1010,12 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		_invalidate_all = _invalidate_all || invalidate_all;
 		return;
 	}
+	ResourceBundle retired;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_retire_ready) { retired = _retired_resources; _retired_resources = ResourceBundle(); _retire_ready = false; }
+	}
+	if (retired.output_albedo_rd.is_valid()) { _free_bundle(_rd, retired); }
 	if (!_ensure_resources(generation, page_count, stored_size,
 				material_albedo, material_normal, material_bytes)) {
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -1006,9 +1066,32 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 
 	std::vector<PendingJob> compute_jobs;
 	compute_jobs.reserve(jobs.size());
+	// Invalidation only needs to clear readiness, not shade every cache texel.
+	const bool cleared_all = invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, page_count) == OK;
+	const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
+	if (_render_frame != frame) { _render_frame = frame; _frame_page_updates = 0; }
 	for (const PendingJob &job : jobs) {
 		if (job.generation != generation || job.slot < 0 || job.slot >= page_count) {
 			continue;
+		}
+		if (job.kind == PENDING_INVALIDATE && (cleared_all ||
+				_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) == OK)) {
+			_set_ready(job.slot, false, generation, material_version, job.sequence);
+			{ std::lock_guard<std::mutex> lock(_mutex); ++_invalidated_pages; }
+			continue;
+		}
+		if (job.kind != PENDING_INVALIDATE) {
+			if (_frame_page_updates >= 16) {
+				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
+				// A reused slot must not expose its previous material while deferred.
+				PendingJob invalid = job;
+				invalid.kind = PENDING_INVALIDATE;
+				if (!cleared_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) != OK) {
+					compute_jobs.push_back(invalid);
+				}
+				continue;
+			}
+			++_frame_page_updates;
 		}
 		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
 			if (job.kind == PENDING_CELL ? _copy_cell_page(job) : _upload_cached_page(job)) {
@@ -1058,6 +1141,11 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 				_set_ready(job.slot, false, generation, material_version, job.sequence);
 			}
 		}
+	}
+	if (requested_capacity > page_count) {
+		// Migrate after this frame's writes so both the still-bound old arrays and
+		// the newly published arrays contain the same completed page contents.
+		_ensure_resources(generation, requested_capacity, stored_size, material_albedo, material_normal, material_bytes);
 	}
 }
 
@@ -1141,6 +1229,12 @@ Ref<Image> Terrain3DSurfaceBaker::get_page_preview(int p_slot) const {
 	return page.get("albedo_height", Ref<Image>());
 }
 
+bool Terrain3DSurfaceBaker::has_render_work() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _configured && (!_pending.empty() || _invalidate_all || _materials_dirty ||
+			_requested_capacity > _page_count || _retire_ready);
+}
+
 Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	std::lock_guard<std::mutex> lock(_mutex);
 	Dictionary stats;
@@ -1153,6 +1247,7 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["ready_pages"] = int64_t(std::count(_ready.begin(), _ready.end(), uint8_t(1)));
 	stats["baked_pages"] = int64_t(_baked_pages);
 	stats["cached_uploads"] = int64_t(_cached_uploads);
+	stats["migrated_pages"] = int64_t(_migrated_pages);
 	stats["invalidated_pages"] = int64_t(_invalidated_pages);
 	stats["source_uploads"] = int64_t(_source_uploads);
 	stats["dispatch_count"] = int64_t(_dispatch_count);
@@ -1170,8 +1265,8 @@ void Terrain3DSurfaceBaker::_bind_methods() {
 								 "normal_depths", "ao_strengths", "ao_affects", "roughness_mods", "uv_scales", "detiles",
 								 "slope_params"),
 			&Terrain3DSurfaceBaker::set_materials);
-	ClassDB::bind_method(D_METHOD("queue_page", "slot", "idweights", "height", "world_rect", "slope_factor"),
-			&Terrain3DSurfaceBaker::queue_page, DEFVAL(1.0f));
+	ClassDB::bind_method(D_METHOD("queue_page", "slot", "idweights", "height", "world_rect", "slope_factor", "source_grid"),
+			&Terrain3DSurfaceBaker::queue_page, DEFVAL(1.0f), DEFVAL(Vector3()));
 	ClassDB::bind_method(D_METHOD("queue_cached_page", "slot", "channels"),
 			&Terrain3DSurfaceBaker::queue_cached_page);
 	ClassDB::bind_method(D_METHOD("invalidate_slot", "slot"), &Terrain3DSurfaceBaker::invalidate_slot);

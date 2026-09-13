@@ -7,6 +7,7 @@
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_mesher.h"
+#include "terrain_3d_cdlod.h"
 
 ///////////////////////////
 // Private Functions
@@ -239,7 +240,7 @@ void Terrain3DMesher::_clear_mesh_types() {
 ///////////////////////////
 
 void Terrain3DMesher::initialize(Terrain3D *p_terrain, const int p_mesh_size, const int p_lods, const int p_tessellation_level,
-		const real_t p_vertex_spacing, const RID &p_material, const uint32_t p_render_layers) {
+		const real_t p_vertex_spacing, const RID &p_material, const uint32_t p_render_layers, bool p_allow_cdlod) {
 	if (p_terrain) {
 		_terrain = p_terrain;
 	} else {
@@ -258,7 +259,14 @@ void Terrain3DMesher::initialize(Terrain3D *p_terrain, const int p_mesh_size, co
 	_mesh_size = p_mesh_size;
 	_vertex_spacing = p_vertex_spacing;
 	_render_layers = p_render_layers;
-	_generate_clipmap();
+	_allow_cdlod = p_allow_cdlod;
+	delete _cdlod; _cdlod = nullptr;
+	_clear_clipmap(); _clear_mesh_types();
+	if (!_allow_cdlod ||
+		_terrain->get_material()->get_world_background() != Terrain3DMaterial::NONE ||
+		_terrain->get_material()->is_shader_override_enabled()) {
+		_generate_clipmap();
+	}
 	update();
 	update_aabbs();
 	reset_target_position();
@@ -266,6 +274,7 @@ void Terrain3DMesher::initialize(Terrain3D *p_terrain, const int p_mesh_size, co
 }
 
 void Terrain3DMesher::destroy() {
+	delete _cdlod; _cdlod = nullptr;
 	LOG(INFO, "Destroying clipmap");
 	_clear_clipmap();
 	_clear_mesh_types();
@@ -284,6 +293,27 @@ void Terrain3DMesher::snap() {
 	if (_material.is_valid()) {
 		RS->material_set_param(_material, "_target_pos", target_pos);
 	}
+	const Ref<Terrain3DMaterial> material = _terrain->get_material();
+	const bool use_cdlod = _allow_cdlod && material.is_valid() &&
+		material->get_world_background() == Terrain3DMaterial::NONE && !material->is_shader_override_enabled();
+	if (_allow_cdlod && _material.is_valid()) {
+		RS->material_set_param(_material, "_region_grid_enabled", use_cdlod);
+		RS->material_set_param(_material, "_cdlod_enabled", use_cdlod && _terrain->is_cdlod_enabled());
+	}
+	if (use_cdlod != (_cdlod != nullptr) ||
+		(_cdlod && (_cdlod->is_adaptive() != _terrain->is_cdlod_enabled() ||
+			_cdlod->get_grid_size() != (_terrain->is_cdlod_enabled() ? _terrain->get_cdlod_patch_size() : _terrain->get_region_size())))) {
+		if (use_cdlod) {
+			_clear_clipmap(); _clear_mesh_types();
+			delete _cdlod;
+			_cdlod = new Terrain3DCDLOD();
+			_cdlod->initialize(_terrain, _material);
+		} else {
+			delete _cdlod; _cdlod = nullptr;
+			_generate_clipmap(); update(); update_aabbs(); reset_target_position();
+		}
+	}
+	if (_cdlod) { _cdlod->snap(); return; }
 	// If clipmap target hasn't moved enough, skip
 	Vector2 target_pos_2d = v3v2(target_pos);
 	real_t tessellation_density = 1.f / pow(2.f, _tessellation_level);
@@ -374,6 +404,7 @@ void Terrain3DMesher::snap() {
 
 // Iterates over every instance of every mesh and updates all properties.
 void Terrain3DMesher::update() {
+	if (_cdlod) { _cdlod->update(); return; }
 	IS_INIT(VOID);
 	if (!_terrain->is_inside_world()) {
 		LOG(DEBUG, "Terrain3D's world3D is null");
@@ -443,4 +474,16 @@ void Terrain3DMesher::update_aabbs(const real_t p_cull_margin, const Vector2 &p_
 		RS->mesh_set_custom_aabb(rid, aabb);
 	}
 	return;
+}
+
+Dictionary Terrain3DMesher::get_cdlod_stats() const {
+	if (_cdlod) { return _cdlod->get_stats(); }
+	Dictionary result;
+	result["active"] = false;
+	result["reason"] = "Enable CDLOD with World Background=None and the built-in terrain shader.";
+	return result;
+}
+
+void Terrain3DMesher::invalidate_region_geometry() {
+	if (_cdlod) { _cdlod->invalidate_selection(); }
 }

@@ -39,14 +39,19 @@ Ref<Image> Terrain3DData::make_vt_height_page(const Rect2 &p_world_rect, int p_p
 		source.ptr = source.bytes.ptr();
 		source.size = heights->get_width();
 	}
-	auto height_at = [&](int x, int y) -> float {
-		const int rx = int(std::floor(double(x) / _region_size));
-		const int ry = int(std::floor(double(y) / _region_size));
-		auto found = sources.find(key(rx, ry));
-		if (found == sources.end()) {
-			return 0.f;
+	struct Lookup {
+		int rx = INT32_MAX, ry = INT32_MAX;
+		const Source *source = nullptr;
+	};
+	Lookup lookups[4];
+	auto height_at = [&](int x, int rx, int y, int ry, Lookup &cache) -> float {
+		if (cache.rx != rx || cache.ry != ry) {
+			cache.rx = rx; cache.ry = ry;
+			const auto found = sources.find(key(rx, ry));
+			cache.source = found == sources.end() ? nullptr : &found->second;
 		}
-		const Source &source = found->second;
+		if (!cache.source) { return 0.f; }
+		const Source &source = *cache.source;
 		const int sx = CLAMP(x - rx * _region_size, 0, source.size - 1);
 		const int sy = CLAMP(y - ry * _region_size, 0, source.size - 1);
 		float height;
@@ -60,25 +65,29 @@ Ref<Image> Terrain3DData::make_vt_height_page(const Rect2 &p_world_rect, int p_p
 	// Sub-metre AVT pages often sample one or two terrain cells hundreds of
 	// times. Resolve the integer column once, and the four source heights once
 	// per cell/row rather than doing four hash lookups per output texel.
-	std::vector<int> columns(stored);
+	std::vector<int> columns(stored), region_left(stored), region_right(stored);
 	std::vector<float> weights(stored);
 	for (int x = 0; x < stored; ++x) {
 		const float px = (p_world_rect.position.x + (float(x - p_border) + 0.5f) * texel.x) / spacing;
 		columns[x] = int(std::floor(px));
 		weights[x] = px - columns[x];
+		region_left[x] = int(std::floor(double(columns[x]) / _region_size));
+		region_right[x] = int(std::floor(double(columns[x] + 1) / _region_size));
 	}
 	for (int y = 0; y < stored; y++) {
 		const float z = (p_world_rect.position.y + (float(y - p_border) + 0.5f) * texel.y) / spacing;
 		const int iz = int(std::floor(z));
 		const float fz = z - iz;
+		const int rz0 = int(std::floor(double(iz) / _region_size));
+		const int rz1 = int(std::floor(double(iz + 1) / _region_size));
 		int previous_column = 0;
 		float h00 = 0.f, h10 = 0.f, h01 = 0.f, h11 = 0.f;
 		for (int x = 0; x < stored; x++) {
 			const int ix = columns[x];
 			const float fx = weights[x];
 			if (x == 0 || ix != previous_column) {
-				h00 = height_at(ix, iz); h10 = height_at(ix + 1, iz);
-				h01 = height_at(ix, iz + 1); h11 = height_at(ix + 1, iz + 1);
+				h00 = height_at(ix, region_left[x], iz, rz0, lookups[0]); h10 = height_at(ix + 1, region_right[x], iz, rz0, lookups[1]);
+				h01 = height_at(ix, region_left[x], iz + 1, rz1, lookups[2]); h11 = height_at(ix + 1, region_right[x], iz + 1, rz1, lookups[3]);
 				previous_column = ix;
 			}
 			// Same BL-TR diagonal as terrain geometry and the ID/weight evaluator.

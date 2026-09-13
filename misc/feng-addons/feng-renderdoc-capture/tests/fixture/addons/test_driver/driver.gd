@@ -3,6 +3,8 @@ extends EditorPlugin
 var vt_baker: RefCounted
 var vt_ids: Image
 var vt_height: Image
+var capture_terrain: Node
+var capture_production: Dictionary
 
 func _render_vt_test_pages():
 	vt_baker.queue_page(0, vt_ids, vt_height, Rect2(0, 0, 64, 64), 1.0)
@@ -109,12 +111,50 @@ func _run():
 		viewport_3d.set_update_mode(SubViewport.UPDATE_ALWAYS)
 		await get_tree().create_timer(1.0).timeout
 		viewport_3d.set_update_mode(warmup_mode)
+	if OS.get_environment("FENG_TEST_VT_TERRAIN") == "1":
+		var terrain: Node
+		if not OS.get_environment("FENG_TEST_TERRAIN_PROJECT").is_empty():
+			var authored_terrain: Node = load("res://render/test.tscn").instantiate()
+			terrain = authored_terrain.get_node("Terrain3D")
+			terrain.surface_svt_auto_bake = false
+			scene_root.add_child(authored_terrain)
+		else:
+			terrain = ClassDB.instantiate("Terrain3D")
+			scene_root.add_child(terrain)
+			terrain.data.add_region_blank(Vector2i.ZERO)
+		terrain.vt_editor_preview = false
+		terrain.surface_svt_auto_bake = false
+		terrain.vt_page_count = 256
+		terrain.material.world_background = 0
+		terrain.surface_vt_enabled = true
+		terrain.set_camera(camera)
+		camera.position = Vector3(256, 20, 256) if OS.get_environment("FENG_TEST_TERRAIN_PROJECT").is_empty() else Vector3(-849, 80, 64)
+		camera.rotation_degrees = Vector3(-35, 0, 0)
+		var mode := viewport_3d.get_update_mode()
+		viewport_3d.set_update_mode(SubViewport.UPDATE_ALWAYS)
+		for frame in 100:
+			terrain.update_surface_vt(4)
+			await get_tree().process_frame
+		viewport_3d.set_update_mode(mode)
+		terrain.set_physics_process(false)
+		for frame in 8: await get_tree().process_frame
+		capture_terrain = terrain
+		capture_production = terrain.get_vt_settings().producer.duplicate()
+		assert(terrain.get_vt_pages().size() > 0)
+		print("UI_TEST_TERRAIN ready pages=", terrain.get_vt_pages().size())
 	var original_update_mode := viewport_3d.get_update_mode()
+	var capture_start := Time.get_ticks_msec()
 	plugin.button.pressed.emit()
+	print("UI_TEST_CAPTURE duration_ms=", Time.get_ticks_msec() - capture_start)
 	await get_tree().create_timer(0.5).timeout
 	while plugin._busy:
 		await get_tree().create_timer(0.2).timeout
 	assert(viewport_3d.get_update_mode() == original_update_mode, "Capture must restore the editor viewport update mode")
+	if capture_terrain:
+		var after: Dictionary = capture_terrain.get_vt_settings().producer
+		assert(after.baked_pages == capture_production.baked_pages, "Capture must not rebake all resident AVT pages")
+		assert(after.cached_uploads == capture_production.cached_uploads, "Capture must not reupload all resident SVT pages")
+		print("UI_TEST_TERRAIN capture preserved resident production counters")
 	if vt_baker:
 		RenderingServer.virtual_texture_remove_update_callback(get_instance_id())
 	assert(FengRenderDoc.is_hooked())
@@ -129,6 +169,10 @@ func _run():
 	result.set_value("pipeline", "viewport_update_mode", viewport_3d.get_update_mode())
 	result.save("res://capture_result.cfg")
 	print("UI_TEST_AFTER actual editor captured, main PID=", OS.get_process_id())
-	await get_tree().create_timer(15).timeout
+	var close_deadline := Time.get_ticks_msec() + 60000
+	while not FileAccess.file_exists("res://capture_analyzer_closed") and Time.get_ticks_msec() < close_deadline:
+		await get_tree().create_timer(0.2).timeout
+	assert(FileAccess.file_exists("res://capture_analyzer_closed"), "Analyzer lifecycle check timed out")
+	await get_tree().create_timer(1).timeout
 	assert(FengRenderDoc.get_capture_count() == capture_count + 1, "No captures should continue after the click")
 	get_tree().quit()

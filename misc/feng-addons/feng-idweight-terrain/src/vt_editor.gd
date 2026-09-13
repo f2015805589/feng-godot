@@ -33,10 +33,12 @@ var mip_label: Label
 var baked_mip_selector: OptionButton
 
 var settings_panel: VBoxContainer
+var cdlod_panel: VBoxContainer
 var svt_panel: VBoxContainer
 var page_size_spin: SpinBox
 var page_border_spin: SpinBox
 var page_count_spin: SpinBox
+var auto_capacity_button: CheckButton
 var pages_per_update_spin: SpinBox
 var avt_distance_spin: SpinBox
 var editor_preview_button: CheckButton
@@ -90,6 +92,7 @@ func _process(p_delta: float) -> void:
 	_bake_status_elapsed = 0.0
 	var settings := _vt_settings()
 	_refresh_bake_status(settings)
+	_sync_cdlod_panel()
 	var generation := int(settings.get("bake_generation", 0))
 	if generation > 0 and int(settings.get("bake_pending", 0)) == 0 and generation != _last_bake_refresh_generation:
 		_last_bake_refresh_generation = generation
@@ -221,6 +224,13 @@ func _build_ui() -> void:
 	summary_label.name = "Summary"
 	summary_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	summary_label.custom_minimum_size.y = 34
+	var summary_toggle := Button.new()
+	summary_toggle.text = "统计信息"
+	summary_toggle.toggle_mode = true
+	summary_toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	summary_toggle.toggled.connect(func(expanded: bool): summary_label.visible = expanded)
+	background.add_child(summary_toggle)
+	summary_label.visible = false
 	background.add_child(summary_label)
 
 	var split := VSplitContainer.new()
@@ -230,8 +240,10 @@ func _build_ui() -> void:
 	var upper := HSplitContainer.new()
 	upper.name = "HierarchyAndDetails"
 	upper.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	upper.custom_minimum_size.y = 240
 	split.add_child(upper)
-	split.split_offset = 400
+	split.split_offset = 0
+	split.dragger_visibility = SplitContainer.DRAGGER_VISIBLE
 
 	var hierarchy_panel := PanelContainer.new()
 	hierarchy_panel.custom_minimum_size.x = 250
@@ -257,11 +269,16 @@ func _build_ui() -> void:
 	details_scroll.name = "DetailsScroll"
 	details_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	details_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	details_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	details_panel.add_child(details_scroll)
+	details_scroll.size_flags_vertical = Control.SIZE_FILL
+	details_scroll.custom_minimum_size.y = 72
+	var page_layout := VBoxContainer.new()
+	page_layout.name = "PageLayout"
+	details_panel.add_child(page_layout)
+	page_layout.add_child(details_scroll)
 	var details_box := VBoxContainer.new()
 	details_box.name = "DetailsBox"
 	details_box.add_theme_constant_override("separation", 4)
+	details_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	details_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	details_scroll.add_child(details_box)
 	details_label = Label.new()
@@ -273,6 +290,9 @@ func _build_ui() -> void:
 	details_box.add_child(settings_panel)
 	svt_panel = _build_svt_panel()
 	details_box.add_child(svt_panel)
+	cdlod_panel = VBoxContainer.new()
+	cdlod_panel.name = "CDLODSettings"
+	details_box.add_child(cdlod_panel)
 	page_tree = Tree.new()
 	page_tree.name = "PageDetails"
 	page_tree.columns = 4
@@ -283,21 +303,30 @@ func _build_ui() -> void:
 	page_tree.set_column_title(3, "Details")
 	page_tree.column_titles_visible = true
 	page_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	page_tree.custom_minimum_size.y = 170
+	page_tree.custom_minimum_size = Vector2(0, 120)
+	for column in range(4):
+		page_tree.set_column_custom_minimum_width(column, [180, 100, 160, 420][column])
+		page_tree.set_column_expand(column, column == 3)
 	page_tree.item_selected.connect(_on_page_item_selected)
-	details_box.add_child(page_tree)
+	page_layout.add_child(page_tree)
 
 	var preview_box := VBoxContainer.new()
 	preview_box.name = "PagePreview"
-	preview_box.custom_minimum_size.y = 148
+	preview_box.visible = false
 	preview_box.size_flags_vertical = Control.SIZE_SHRINK_END
-	details_box.add_child(preview_box)
+	var preview_toggle := Button.new()
+	preview_toggle.text = "单页预览"
+	preview_toggle.toggle_mode = true
+	preview_toggle.toggled.connect(func(expanded: bool): preview_box.visible = expanded)
+	page_layout.add_child(preview_toggle)
+	page_layout.add_child(preview_box)
 	preview_label = Label.new()
 	preview_label.text = "No physical page selected"
+	preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	preview_box.add_child(preview_label)
 	preview_texture = TextureRect.new()
 	preview_texture.name = "PagePreviewTexture"
-	preview_texture.custom_minimum_size = Vector2(128, 96)
+	preview_texture.custom_minimum_size = Vector2(256, 256)
 	preview_texture.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	preview_texture.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	preview_texture.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -313,13 +342,31 @@ func _build_ui() -> void:
 	overview_label = Label.new()
 	overview_label.text = "Terrain height overview (material VT bake unavailable)"
 	overview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	overview_box.add_child(overview_label)
+	var overview_toolbar := HBoxContainer.new()
+	overview_box.add_child(overview_toolbar)
+	overview_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	overview_toolbar.add_child(overview_label)
+	var overview_mode := OptionButton.new()
+	overview_mode.name = "OverviewMode"
+	overview_mode.add_item("全部平铺")
+	overview_mode.add_item("适应")
+	overview_toolbar.add_child(overview_mode)
 	overview = OVERVIEW_SCRIPT.new()
 	overview.name = "WorldOverview"
 	overview.custom_minimum_size.y = 180
 	overview.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	overview.region_clicked.connect(_on_overview_region_clicked)
-	overview_box.add_child(overview)
+	var overview_scroll := ScrollContainer.new()
+	overview_scroll.name = "OverviewScroll"
+	overview_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	overview_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	overview_box.add_child(overview_scroll)
+	overview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	overview_scroll.add_child(overview)
+	overview_mode.item_selected.connect(func(index: int):
+		overview.set_fit_mode(index == 1)
+		overview_scroll.scroll_vertical = 0
+	)
 
 	_refresh_baked_mip_selector()
 	_refresh_page_details()
@@ -367,6 +414,13 @@ func _build_hierarchy() -> void:
 	baked.set_text(0, "Baked cell sources")
 	baked.set_metadata(0, "baked_pages")
 
+	var cdlod := hierarchy.create_item(surface)
+	cdlod.set_text(0, "CDLOD")
+	cdlod.set_metadata(0, "cdlod")
+	var mesh_settings := hierarchy.create_item(cdlod)
+	mesh_settings.set_text(0, "Geometry batching")
+	mesh_settings.set_metadata(0, "cdlod")
+
 	var pages := hierarchy.create_item(surface)
 	pages.set_text(0, "VT Page")
 	pages.set_metadata(0, "pages")
@@ -404,8 +458,14 @@ func _build_settings_panel() -> VBoxContainer:
 	page_count_spin.name = "PageCount"
 	page_count_spin.value_changed.connect(_on_setting_value_changed.bind("page_count"))
 	grid.add_child(page_count_spin)
+	grid.add_child(_make_setting_label("Automatic cache capacity"))
+	auto_capacity_button = CheckButton.new()
+	auto_capacity_button.name = "AutoCapacity"
+	auto_capacity_button.tooltip_text = "Reserve Shared page count for visible demand and camera transitions, up to 1024 pages. Uses more video memory; texel density and the 16-page generation limit stay unchanged."
+	auto_capacity_button.toggled.connect(_on_auto_capacity_toggled)
+	grid.add_child(auto_capacity_button)
 	grid.add_child(_make_setting_label("Pages per update"))
-	pages_per_update_spin = _make_spin(1, 64, 1)
+	pages_per_update_spin = _make_spin(1, 16, 1)
 	pages_per_update_spin.name = "PagesPerUpdate"
 	pages_per_update_spin.value_changed.connect(_on_setting_value_changed.bind("pages_per_update"))
 	grid.add_child(pages_per_update_spin)
@@ -603,8 +663,9 @@ func _refresh_settings_controls() -> void:
 	avt_mode_option.select(avt_mode_option.get_item_index(mode))
 	page_size_spin.value = float(settings.get("page_size", 256))
 	page_border_spin.value = float(settings.get("border", 4))
-	page_count_spin.value = float(settings.get("page_count", 64))
-	pages_per_update_spin.value = float(settings.get("pages_per_update", 4))
+	page_count_spin.value = float(settings.get("page_count", 256))
+	auto_capacity_button.button_pressed = bool(settings.get("auto_capacity", true))
+	pages_per_update_spin.value = float(settings.get("pages_per_update", 16))
 	avt_density_spin.editable = mode == 2
 	avt_density_spin.tooltip_text = "Material texels per metre for sector AVT. Select Camera range / 64 m sectors to use this setting."
 	avt_density_spin.value = float(settings.get("avt_texels_per_meter", 1024.0))
@@ -748,6 +809,13 @@ func _refresh_bake_status(p_settings: Dictionary = {}) -> void:
 		bake_status.text = "Auto Bake on · changed SVT cells rebake incrementally 500 ms after editing stops."
 	else:
 		bake_status.text = "Auto Bake off · use Bake All SVT Cells for a full persisted bake."
+
+
+func _on_auto_capacity_toggled(p_enabled: bool) -> void:
+	if _updating_settings or terrain == null or not is_instance_valid(terrain):
+		return
+	_call(terrain, "set_vt_auto_capacity", [p_enabled])
+	_refresh_settings_controls()
 
 
 func _on_setting_value_changed(p_value: float, p_key: String) -> void:
@@ -926,12 +994,16 @@ func _refresh_page_details() -> void:
 	_clear_preview()
 	settings_panel.visible = false
 	svt_panel.visible = false
+	cdlod_panel.visible = false
 	var root := page_tree.create_item()
 	if terrain == null or not is_instance_valid(terrain):
 		details_label.text = "No Terrain3D selected"
 		_add_page_row(root, "Surface VT", "Unavailable", "", "Select a valid Terrain3D")
 		return
 	match _selected_hierarchy_kind:
+		"cdlod":
+			details_label.text = "CDLOD · terrain geometry"
+			_refresh_cdlod_panel()
 		"settings":
 			details_label.text = "VT Setting · shared Surface VT atlas"
 			settings_panel.visible = true
@@ -1140,6 +1212,7 @@ func _clear_preview() -> void:
 		preview_texture.texture = null
 	if preview_label:
 		preview_label.text = "No physical page selected"
+	preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 
 
 func _refresh_overview() -> void:
@@ -1456,3 +1529,51 @@ func _call(p_target: Object, p_method: StringName, p_args: Array = []) -> Varian
 	if p_target == null or not is_instance_valid(p_target) or not p_target.has_method(p_method):
 		return null
 	return p_target.callv(p_method, p_args)
+
+
+func _refresh_cdlod_panel() -> void:
+	for child in cdlod_panel.get_children():
+		cdlod_panel.remove_child(child)
+		child.queue_free()
+	cdlod_panel.show()
+	if not terrain.has_method("get_cdlod_stats"):
+		cdlod_panel.add_child(_make_setting_label("Rebuild the terrain extension to enable CDLOD."))
+		return
+	var enabled := CheckButton.new()
+	enabled.name = "CDLODEnabled"
+	enabled.text = "Enable CDLOD"
+	enabled.set_pressed_no_signal(bool(terrain.get("cdlod_enabled")))
+	enabled.toggled.connect(_on_cdlod_setting.bind("cdlod_enabled"))
+	cdlod_panel.add_child(enabled)
+	cdlod_panel.add_child(_make_setting_label("LOD distance scale"))
+	var scale := _make_spin(8, 32, 0.5)
+	scale.name = "CDLODLODScale"
+	scale.set_value_no_signal(float(terrain.get("cdlod_lod_scale")))
+	scale.value_changed.connect(_on_cdlod_setting.bind("cdlod_lod_scale"))
+	cdlod_panel.add_child(scale)
+	var status := Label.new()
+	status.name = "CDLODMode"
+	cdlod_panel.add_child(status)
+	_sync_cdlod_panel()
+
+
+func _sync_cdlod_panel() -> void:
+	if not is_instance_valid(cdlod_panel) or not cdlod_panel.visible:
+		return
+	var enabled := cdlod_panel.get_node_or_null("CDLODEnabled") as CheckButton
+	var status := cdlod_panel.get_node_or_null("CDLODMode") as Label
+	if enabled == null or status == null:
+		return
+	enabled.set_pressed_no_signal(bool(terrain.get("cdlod_enabled")))
+	var stats: Dictionary = terrain.get_cdlod_stats()
+	status.text = "Current mode: " + str(stats.get("backend", "Clipmap"))
+
+
+
+func _on_cdlod_setting(p_value: Variant, p_property: String) -> void:
+	if terrain == null or not is_instance_valid(terrain):
+		return
+	terrain.set(p_property, p_value)
+	_sync_cdlod_panel()
+	if Engine.is_editor_hint():
+		EditorInterface.mark_scene_as_unsaved()

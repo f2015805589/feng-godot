@@ -14,6 +14,7 @@ var selected_location: Vector2i = Vector2i(2147483647, 2147483647)
 var hovered_location: Vector2i = Vector2i(2147483647, 2147483647)
 
 var _region_lookup: Dictionary = {}
+var fit_mode: bool = false
 
 
 func _ready() -> void:
@@ -28,6 +29,7 @@ func set_overview(p_regions: Array, p_world_bounds: Rect2, p_region_size_world: 
 	world_bounds = p_world_bounds
 	region_size_world = p_region_size_world
 	overview_texture = p_texture
+	_update_canvas_height()
 	_region_lookup.clear()
 	for region in regions:
 		if typeof(region) != TYPE_DICTIONARY or not region.has("location"):
@@ -53,7 +55,22 @@ func set_selected_location(p_location: Vector2i) -> void:
 
 func _notification(p_what: int) -> void:
 	if p_what == NOTIFICATION_RESIZED:
+		_update_canvas_height()
 		queue_redraw()
+
+
+func set_fit_mode(enabled: bool) -> void:
+	fit_mode = enabled
+	_update_canvas_height()
+	queue_redraw()
+
+
+func _update_canvas_height() -> void:
+	# Fit the full width without squashing the map; the parent scrolls vertically.
+	if fit_mode:
+		custom_minimum_size.y = 0.0
+	elif world_bounds.has_area():
+		custom_minimum_size.y = maxf(180.0, size.x * world_bounds.size.y / world_bounds.size.x)
 
 
 func _draw() -> void:

@@ -516,7 +516,8 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	if (_show_vertex_grid) {
 		insert_names.push_back("OVERLAY_VERTEX_GRID");
 	}
-	if (_show_region_grid || (_terrain && _terrain->get_editor() && _terrain->get_editor()->get_tool() == Terrain3DEditor::REGION)) {
+	// Region-tool selection must not override the explicit grid visibility toggle.
+	if (_show_region_grid) {
 		insert_names.push_back("EDITOR_REGION_GRID");
 	}
 	if (_terrain && _terrain->get_editor()) {
@@ -672,6 +673,7 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	}
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
+	RS->material_set_param(p_material, "_avt_coarse_mip_fallback", _terrain->get_surface_vt_coarse_mip_fallback());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());

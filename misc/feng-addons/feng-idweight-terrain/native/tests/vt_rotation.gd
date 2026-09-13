@@ -19,7 +19,6 @@ func run() -> void:
 	terrain.set_camera(camera)
 	terrain.set_clipmap_target(camera)
 	await process_frame
-	terrain.set_physics_process(false)
 	add_assets()
 	var checker := Image.create(128, 128, false, Image.FORMAT_RGBA8)
 	for y in 128:
@@ -29,24 +28,33 @@ func run() -> void:
 	terrain.assets.get_texture_asset(0).albedo_texture = ImageTexture.create_from_image(checker)
 	terrain.data.add_region_blank(Vector2i.ZERO)
 	terrain.surface_vt_enabled = true
+	await frame_image(12)
+	terrain.set_physics_process(false)
+	terrain.snap()
+	print("VT_ROTATION geometry=", terrain.get_cdlod_stats())
 	RenderingServer.viewport_set_measure_render_time(root.get_viewport_rid(), true)
 	var gpu_times := []
 	var render_cpu_times := []
 	var draws := []
 	var totals := []
 	var times := []
+	var peaks := []
 	var image_errors := []
 	for angle in [0, 90, 0, 90, 0]:
 		camera.rotation_degrees.y = angle
+		terrain.snap()
 		var produced := 0
 		var usec := 0
+		var peak_usec := 0
 		var gpu_ms := 0.0
 		var render_cpu_ms := 0.0
 		var first: Image
 		for frame in 80:
 			var start := Time.get_ticks_usec()
 			produced += terrain.update_surface_vt(4)
-			usec += Time.get_ticks_usec() - start
+			var elapsed := Time.get_ticks_usec() - start
+			usec += elapsed
+			peak_usec = maxi(peak_usec, elapsed)
 			await process_frame
 			await RenderingServer.frame_post_draw
 			if frame >= 20:
@@ -57,6 +65,7 @@ func run() -> void:
 		render_cpu_times.append(render_cpu_ms / 60.0)
 		draws.append(root.get_render_info(Viewport.RENDER_INFO_TYPE_VISIBLE, Viewport.RENDER_INFO_DRAW_CALLS_IN_FRAME))
 		totals.append(produced)
+		peaks.append(peak_usec / 1000.0)
 		times.append(usec / 80000.0)
 		var image := await frame_image(2)
 		var error := 0.0
@@ -70,7 +79,7 @@ func run() -> void:
 		for turn in range(2, totals.size()):
 			require(totals[turn] == 0, "warm camera turn must reuse resident pages")
 			require(image_errors[turn] <= 1.0 / 255.0, "warm camera turn must not show material streaming")
-	print("VT_ROTATION pages=", totals, " cpu_ms=", times, " turn_image_max_error=", image_errors, " upload_bytes=", terrain.get_surface_vt().get_stats().get("indirection_uploaded_bytes", -1))
+	print("VT_ROTATION pages=", totals, " cpu_ms=", times, " cpu_peak_ms=", peaks, " turn_image_max_error=", image_errors, " upload_bytes=", terrain.get_surface_vt().get_stats().get("indirection_uploaded_bytes", -1))
 	print("VT_ROTATION viewport_gpu_ms=", gpu_times, " viewport_cpu_ms=", render_cpu_times, " visible_draw_calls=", draws)
 	terrain.surface_vt_enabled = false
 	var direct := await frame_image(12)

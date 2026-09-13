@@ -74,6 +74,7 @@ bool Terrain3DVTPagePool::initialize(const int p_page_size, const int p_page_bor
 
 	lru.clear();
 	slot_used.assign(page_count, 0);
+	authored_pages.resize(page_count);
 	slot_protected.assign(page_count, 0);
 	slot_demand_epoch.assign(page_count, 0);
 	slot_owners.assign(page_count, std::vector<Terrain3DVTPageOwner>());
@@ -88,7 +89,26 @@ bool Terrain3DVTPagePool::initialize(const int p_page_size, const int p_page_bor
 	return true;
 }
 
+bool Terrain3DVTPagePool::grow(int p_count) {
+	if (!is_initialized() || p_count <= page_count) { return p_count == page_count; }
+	// The material arrays carry rendering; raw IDs are uploaded on explicit
+	// inspection. Keep authored bytes, owners, addresses, LRU and demand epochs.
+	slot_used.resize(p_count, 0); authored_pages.resize(p_count);
+	slot_protected.resize(p_count, 0); slot_demand_epoch.resize(p_count, 0);
+	slot_owners.resize(p_count);
+	for (int slot = p_count - 1; slot >= page_count; --slot) { free_slots.push_back(uint32_t(slot)); }
+	page_count = p_count; ++residency_revision;
+	return true;
+}
+bool Terrain3DVirtualTexture::grow_capacity(int p_count) {
+	if (!_material_cache_mode || !_page_pool || p_count < _page_count) { return false; }
+	if (_page_pool->page_count < p_count && !_page_pool->grow(p_count)) { return false; }
+	_page_count = p_count;
+	return true;
+}
+
 void Terrain3DVTPagePool::clear() {
+	++residency_revision;
 	// Texture owners detach before the final shared_ptr release. Clearing the
 	// reverse index here still makes the destructor safe if a caller explicitly
 	// tears down a pool after all views have already gone away.
@@ -96,6 +116,7 @@ void Terrain3DVTPagePool::clear() {
 	atlas_template.unref();
 	lru.clear();
 	slot_used.clear();
+	authored_pages.clear();
 	slot_protected.clear();
 	slot_demand_epoch.clear();
 	demand_epoch = 0;
@@ -146,7 +167,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 			// An oversubscribed working set must not evict its own still-needed
 			// pages every tick. Allow one complete demand pass before considering
 			// a resident unused, independent of request order across AVT and SVT.
-			// Misses use shader fallback until capacity becomes available. Explicit
+			// Missing selected pages retain diagnostics until capacity is available. Explicit
 			// offline baking and standalone cache APIs retain ordinary LRU behavior.
 			if (demand_active && slot_demand_epoch[candidate] != 0 &&
 					demand_epoch - slot_demand_epoch[candidate] <= 1) {
@@ -171,6 +192,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 }
 
 void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {
+	++residency_revision;
 	if (p_slot >= uint32_t(page_count) || !slot_used[p_slot]) {
 		return;
 	}
@@ -181,12 +203,14 @@ void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {
 		}
 	}
 	slot_owners[p_slot].clear();
+	authored_pages[p_slot].unref();
 	slot_used[p_slot] = 0;
 	evict_count++;
 }
 
 void Terrain3DVTPagePool::publish_owner(const uint32_t p_slot,
 		const Terrain3DVTPageOwner &p_owner) {
+	++residency_revision;
 	if (p_slot >= uint32_t(page_count) || !slot_used[p_slot] || !p_owner.texture) {
 		return;
 	}
@@ -204,6 +228,7 @@ void Terrain3DVTPagePool::publish_owner(const uint32_t p_slot,
 bool Terrain3DVTPagePool::remove_owner(const uint32_t p_slot,
 		Terrain3DVirtualTexture *p_texture, const int p_virtual_x, const int p_virtual_y,
 		const int p_mip) {
+	++residency_revision;
 	if (p_slot >= uint32_t(page_count) || !p_texture) {
 		return false;
 	}
@@ -213,6 +238,7 @@ bool Terrain3DVTPagePool::remove_owner(const uint32_t p_slot,
 				it->virtual_y == p_virtual_y && it->mip == p_mip) {
 			owners.erase(it);
 			if (owners.empty() && slot_used[p_slot]) {
+				authored_pages[p_slot].unref();
 				slot_used[p_slot] = 0;
 				slot_protected[p_slot] = 0;
 				slot_demand_epoch[p_slot] = 0;
@@ -228,6 +254,7 @@ bool Terrain3DVTPagePool::move_owner(const uint32_t p_slot,
 		Terrain3DVirtualTexture *p_texture, const int p_old_virtual_x,
 		const int p_old_virtual_y, const int p_old_mip, const int p_new_virtual_x,
 		const int p_new_virtual_y, const int p_new_mip) {
+	++residency_revision;
 	if (p_slot >= uint32_t(page_count) || !p_texture) {
 		return false;
 	}
@@ -244,6 +271,7 @@ bool Terrain3DVTPagePool::move_owner(const uint32_t p_slot,
 }
 
 void Terrain3DVTPagePool::detach_texture(Terrain3DVirtualTexture *p_texture) {
+	++residency_revision;
 	if (!p_texture) {
 		return;
 	}
@@ -268,6 +296,7 @@ bool Terrain3DVTPagePool::write_page(const int p_slot, const Ref<Image> &p_page)
 			p_page->get_format() != format) {
 		return false;
 	}
+	if (atlas.get_layer_count() < page_count && !atlas.ensure_layers(atlas_template, page_count)) { return false; }
 	atlas.update(p_page, p_slot);
 	return true;
 }
@@ -776,6 +805,12 @@ int Terrain3DVirtualTexture::get_sector_block_origin_y(const Vector2i &p_sector)
 	return _virtual_atlas->try_get_avt_image_info(p_sector.x, p_sector.y, info) ? info.origin_y : -1;
 }
 
+int Terrain3DVirtualTexture::lookup_page_exact(const Vector2i &p_sector, int p_mip, int p_x, int p_y) const {
+	int x, y;
+	if (!_virtual_to_physical(p_sector.x, p_sector.y, p_mip, p_x, p_y, x, y)) { return -1; }
+	return lookup_virtual(x, y, p_mip, p_mip);
+}
+
 int Terrain3DVirtualTexture::lookup_virtual(const int p_virtual_x, const int p_virtual_y,
 		const int p_mip, const int p_max_mip) const {
 	if (p_virtual_x < 0 || p_virtual_y < 0 || p_mip < 0 || p_mip > p_max_mip) {
@@ -1003,18 +1038,30 @@ bool Terrain3DVirtualTexture::write_page(const int p_slot, const Ref<Image> &p_p
 		LOG(WARN, "Page format ", int(p_page->get_format()), " does not match the atlas ", int(_format));
 		return false;
 	}
-	if (!_page_pool->write_page(p_slot, p_page)) {
-		return false;
-	}
+	if (p_slot < 0 || p_slot >= _page_count) { return false; }
+	if (_material_cache_mode) {
+		// Material-cache rendering reads the baked channels, not this raw-ID atlas.
+		// Retain authored IDs for explicit diagnostics without uploading them twice.
+		_page_pool->authored_pages[p_slot] = p_page;
+	} else if (_indirection_gpu.is_valid()) {
+		_indirection_gpu->queue_layer(_page_pool->atlas.get_rid(), p_slot, p_page);
+	} else if (!_page_pool->write_page(p_slot, p_page)) { return false; }
 	_page_write_count++;
 	return true;
 }
 
 Ref<Image> Terrain3DVirtualTexture::read_page(const int p_slot) const {
+	if (_material_cache_mode && _page_pool && p_slot >= 0 && p_slot < int(_page_pool->authored_pages.size()) && _page_pool->authored_pages[p_slot].is_valid()) {
+		// Explicit GPU inspection still uploads and reads the real raw-ID layer.
+		_page_pool->write_page(p_slot, _page_pool->authored_pages[p_slot]);
+	}
+	if (_indirection_gpu.is_valid() && _indirection_gpu->has_pending_layers()) { const_cast<Terrain3DVirtualTexture *>(this)->commit(); }
 	return _page_pool ? _page_pool->read_page(p_slot) : Ref<Image>();
 }
 
 Ref<Image> Terrain3DVirtualTexture::get_atlas_image() const {
+	if (_material_cache_mode) { return read_page(0); }
+	if (_indirection_gpu.is_valid() && _indirection_gpu->has_pending_layers()) { const_cast<Terrain3DVirtualTexture *>(this)->commit(); }
 	return _page_pool ? _page_pool->get_atlas_image() : Ref<Image>();
 }
 
@@ -1052,12 +1099,12 @@ Array Terrain3DVirtualTexture::get_slot_owner_metadata(const int p_slot) const {
 
 void Terrain3DVirtualTexture::commit() {
 	if (!_indirection_dirty) {
-		if (_indirection_gpu.is_valid() && _indirection_gpu->needs_retry()) {
+		if (_indirection_gpu.is_valid() && (_indirection_gpu->needs_retry() || _indirection_gpu->has_pending_layers())) {
 			_indirection_gpu->submit({});
 		}
 		return;
 	}
-	if (RS->get_rendering_device()) {
+	if (_indirection_gpu.is_valid() || RS->get_rendering_device()) {
 		if (_indirection_gpu.is_null()) {
 			_indirection_gpu.instantiate();
 			_indirection_gpu->initialize(_indirection_size, _level_count, _bytes);

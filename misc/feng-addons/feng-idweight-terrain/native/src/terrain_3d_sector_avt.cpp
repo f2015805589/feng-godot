@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <queue>
 #include <tuple>
 #include <unordered_set>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -12,6 +13,9 @@
 
 namespace {
 constexpr float SECTOR_WORLD = 64.f;
+// Demand leads footprint changes so asynchronous production completes before
+// a normal mip transition. This does not alter the shader's mip selection.
+constexpr float DEMAND_DENSITY_MARGIN = 1.25f;
 using SectorKey = std::pair<int, int>;
 struct Sector {
 	Vector2i location;
@@ -95,33 +99,81 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		Vector2 nearest(CLAMP(focus.x, rect.position.x, rect.get_end().x), CLAMP(focus.y, rect.position.y, rect.get_end().y));
 		return nearest.distance_squared_to(focus) <= (reach + SECTOR_WORLD) * (reach + SECTOR_WORLD);
 	};
-	Array state;
-	state.push_back(get_camera()->get_global_transform());
-	state.push_back(get_camera()->get_camera_projection());
-	state.push_back(get_camera()->get_viewport()->get_visible_rect());
-	state.push_back(_region_size); state.push_back(_vertex_spacing);
-	state.push_back(_surface_vt_texels_per_meter); state.push_back(_surface_vt_texels_per_pixel);
-	state.push_back(_surface_vt_mip_distances); state.push_back(_vt_adaptive_enabled);
-	state.push_back(_surface_svt_enabled); state.push_back(_surface_vt_distance);
-	state.push_back(!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty());
-	state.push_back(_vt_page_count); state.push_back(_vt_page_size);
-	for (const Vector2i &location : _data->get_region_locations()) {
-		Ref<Terrain3DRegion> region = _data->get_region(location);
-		if (region.is_null() || region->is_deleted()) { continue; }
-		state.push_back(location); state.push_back(region->get_height_range());
+	if (!_vt_source_snapshot) { _vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
+	const bool bounds_ready = _vt_source_snapshot->bounds_ready.load(std::memory_order_acquire);
+	// Fixed camera/configuration key: no per-frame Variant arrays or region scan.
+	// All source edits invalidate this key together with the source snapshot.
+	std::array<double, 64> state{};
+	int component = 0;
+	auto append = [&](double value) { state[component++] = value; };
+	const Transform3D transform = get_camera()->get_global_transform();
+	for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col) { append(transform.basis[row][col]); }
+	for (int axis = 0; axis < 3; ++axis) { append(transform.origin[axis]); }
+	const Projection projection = get_camera()->get_camera_projection();
+	for (int col = 0; col < 4; ++col) for (int row = 0; row < 4; ++row) { append(projection[col][row]); }
+	const Rect2 viewport = get_camera()->get_viewport()->get_visible_rect();
+	append(viewport.position.x); append(viewport.position.y); append(viewport.size.x); append(viewport.size.y);
+	append(bounds_ready); append(_region_size); append(_vertex_spacing);
+	append(_surface_vt_texels_per_meter); append(_surface_vt_texels_per_pixel); append(_vt_adaptive_enabled);
+	append(_vt_svt_visible_pages); append(_surface_svt_enabled); append(_surface_vt_distance);
+	append(!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty());
+	append(_vt_page_count); append(_vt_page_size);
+	const bool same_plan = _avt_plan_key.size() == sizeof(state) && std::memcmp(_avt_plan_key.ptr(), state.data(), sizeof(state)) == 0;
+	bool installed = false;
+	if (_avt_refinement && _avt_refinement->ready.load(std::memory_order_acquire)) {
+		if (_avt_refinement->key == _avt_plan_key) {
+			if (_ensure_vt_capacity(int(_avt_refinement->pages.size()) + _vt_svt_visible_pages)) { return 0; }
+			// A grazing mip can disappear for one plan and reappear immediately.
+			// Let recently requested jobs finish instead of repeatedly cancelling
+			// their prepared source bytes. Current visibility always comes first.
+			const uint64_t epoch = ++_avt_plan_epoch;
+			std::map<std::array<int, 5>, bool> current;
+			for (AVTPageRequest &page : _avt_refinement->pages) {
+				page.last_visible_plan = epoch;
+				current[{page.owner.x, page.owner.y, page.mip, page.x, page.y}] = true;
+			}
+			int retained = 0;
+			for (const AVTPageRequest &page : _avt_page_plan) {
+				if (retained == 128) { break; }
+				if (page.last_visible_plan + 8 < epoch || current.count({page.owner.x, page.owner.y, page.mip, page.x, page.y})) { continue; }
+				_avt_refinement->pages.push_back(page);
+				++retained;
+			}
+			_avt_sector_stats["retained_requests"] = retained;
+			_avt_page_plan = std::move(_avt_refinement->pages);
+			_avt_prefetch_plan = std::move(_avt_refinement->warm);
+			_avt_prefetch_cursor = 0;
+			_avt_prefetch_cycle_pending = false;
+			_avt_sector_stats["refinement_requests_denied"] = _avt_refinement->denied;
+			_avt_sector_stats["finest_requested_texel_world"] = _avt_refinement->finest;
+			_avt_sector_stats["visible_root_pages"] = _avt_refinement->roots;
+			_avt_sector_stats["requested_physical_pages"] = int(_avt_page_plan.size());
+			_avt_sector_stats["prefetch_requests"] = int(_avt_prefetch_plan.size());
+			_avt_sector_stats["planning_ms"] = double(_avt_refinement->elapsed_us) / 1000.;
+			_avt_sector_stats["plan_age_ms"] = double(started - _avt_refinement->submitted_us) / 1000.;
+			installed = true;
+		}
+		_avt_refinement.reset();
 	}
-	const PackedByteArray plan_key = UtilityFunctions::var_to_bytes(state);
-	if (!_avt_plan_key.is_empty() && plan_key == _avt_plan_key) {
-		_avt_sector_stats["plan_reused"] = true;
+	_avt_sector_stats["planning_pending"] = bool(_avt_refinement);
+	// Finish an in-flight plan instead of replacing it on every camera tick.
+	// Installing a completed plan must not insert an idle planning frame. Its
+	// requests remain active while the next camera view is submitted below.
+	if (same_plan || _avt_refinement) {
+		_avt_sector_stats["plan_reused"] = !installed;
 		_avt_sector_stats["directory_rebuilt"] = false;
 		int produced = _produce_sector_avt_pages(p_max_pages);
 		_avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 		return produced;
 	}
+	PackedByteArray plan_key;
+	plan_key.resize(sizeof(state));
+	std::memcpy(plan_key.ptrw(), state.data(), sizeof(state));
 	_avt_sector_stats["plan_reused"] = false;
 	_avt_sector_stats["coverage_center"] = focus;
 	_avt_sector_stats["coverage_radius"] = _surface_svt_enabled ? reach : -1.f;
-	TerrainVT::VisibleView view(get_camera());
+	TerrainVT::VisibleView view(get_camera(), 192.f);
+
 	auto surrounding_sample = [&](const Rect2 &rect, const Vector2 &heights, TerrainVT::VisiblePatch &patch) {
 		if (!in_reach(rect)) { return false; }
 		patch.nearest = Vector3(CLAMP(camera_position.x, rect.position.x, rect.get_end().x),
@@ -160,17 +212,18 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 				if (_surface_svt_enabled && !in_reach(sector_rect)) { continue; }
 				// Clip against actual resident data, including regions smaller than a
 				// sector and non-unit vertex spacing. Deduplicate overlapping regions.
-				const bool on_screen = view.sample(sector_rect.intersection(rect), region->get_height_range(), patch);
-				if (!on_screen && !surrounding_sample(sector_rect.intersection(rect), region->get_height_range(), patch)) { continue; }
+				const Vector2 sector_heights = bounds_ready ? _vt_source_snapshot->bounds(sector_rect.intersection(rect), region->get_height_range()) : region->get_height_range();
+				const bool on_screen = view.sample(sector_rect.intersection(rect), sector_heights, patch);
+				if (!on_screen && !surrounding_sample(sector_rect.intersection(rect), sector_heights, patch)) { continue; }
 				const int base = get_avt_base_block_size();
 				// Screen density predicts the derivative-selected mip used by the shader.
-				const float required_density = MAX(0.001f, patch.density * _surface_vt_texels_per_pixel);
+				const float required_density = MAX(0.001f, patch.density * _surface_vt_texels_per_pixel * DEMAND_DENSITY_MARGIN);
 				const int screen_mip = MAX(0, int(std::floor(std::log2(MAX(1.f, float(_surface_vt_texels_per_meter) / required_density)))));
 				int wanted = MAX(1, base >> MIN(15, screen_mip));
 				if (!_vt_adaptive_enabled) { wanted = base; }
 				wanted = MIN(2048, wanted);
 				Vector2i key(x, y);
-				Sector sector = { key, key, 0, wanted, 1, on_screen, patch.distance, region->get_height_range() };
+				Sector sector = { key, key, 0, wanted, 1, on_screen, patch.distance, sector_heights };
 				if (aligned_regions) { visible.push_back(sector); }
 				else {
 					auto found = overlapping.find({x, y});
@@ -185,12 +238,13 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 			}
 		}
 	}
-	// Stable coarse procedural coverage is independent of camera distance and
-	// remains resident during sector refinement. Coarse pages can serve many
-	// logical sectors, so visibility is never capped by the physical slot count.
+	// The world hierarchy supplies the footprint-selected coarse mips. Its
+	// addresses remain stable during local refinement; residency is determined
+	// below by the actual visible mip range, not by reserving every ancestor.
 	const int pool_size = _surface_vt->get_page_count();
 	const bool offline_bake = !_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty();
-	const int budget = (offline_bake || _surface_svt_enabled) ? MAX(4, pool_size / 2) : pool_size;
+	const int reserved = offline_bake ? pool_size / 2 : (_surface_svt_enabled ? MIN(pool_size / 2, _vt_svt_visible_pages) : 0);
+	const int budget = MAX(4, pool_size - reserved);
 	const int root_budget = MAX(4, budget / 4);
 	int root_level = 1;
 	while (root_level < 24) {
@@ -200,6 +254,9 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		if (count <= root_budget) { break; }
 		++root_level;
 	}
+	// More physical capacity must not remove the old coarsest virtual level.
+	// That would change the shader's terminal mip and orphan ready root pages.
+	root_level = MAX(root_level, _avt_root_level);
 	std::map<SectorKey, Sector> roots;
 	std::vector<Sector> sectors;
 	for (const auto &item : visible) {
@@ -255,14 +312,10 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	working.insert(working.end(), sectors.begin(), sectors.end());
 	std::stable_sort(working.begin(), working.end(), [](const Sector &a, const Sector &b) { return a.produce > b.produce; });
 	auto owner_key = [](Vector2i key) { return (uint64_t(uint32_t(key.x)) << 32) | uint32_t(key.y); };
-	std::unordered_map<uint64_t, const Sector *> nodes;
-	nodes.reserve(working.size());
-	for (const Sector &sector : working) { nodes[owner_key(sector.owner)] = &sector; }
 	std::unordered_set<uint64_t> owners;
 	owners.reserve(working.size());
 	for (const Sector &sector : working) { if (sector.produce) { owners.insert(owner_key(sector.owner)); } }
 	bool directory_dirty = _avt_directory_bytes.is_empty();
-	bool remapped = false;
 	auto release_address = [&](const AVTCachedAddress &address) {
 		_surface_vt->unregister_sector(address.owner);
 		_vt_registered_sectors.erase(address.owner);
@@ -289,7 +342,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		for (const Sector &sector : working) {
 			auto allocated = _avt_allocated_sizes.find(owner_key(sector.owner));
 			if (allocated != _avt_allocated_sizes.end() && allocated->second > sector.size && _surface_vt->resize_sector(sector.owner, sector.size)) {
-				allocated->second = sector.size; remapped = true; directory_dirty = true;
+				allocated->second = sector.size; directory_dirty = true;
 			}
 		}
 	};
@@ -305,7 +358,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		} else if (previous_size < sector.size) {
 			bool resized = _surface_vt->resize_sector(sector.owner, sector.size);
 			if (!resized && sector.produce) { reclaim_addresses(); resized = _surface_vt->resize_sector(sector.owner, sector.size); }
-			remapped |= resized; directory_dirty |= resized;
+			directory_dirty |= resized;
 			if (resized) { _avt_allocated_sizes[owner_key(sector.owner)] = sector.size; }
 		}
 		if (_surface_vt->has_sector(sector.owner)) { _avt_cached_addresses[owner_key(sector.owner)] = {sector.location, sector.owner, sector.level}; }
@@ -313,97 +366,196 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	_avt_registered_owners.clear();
 	for (const auto &entry : _avt_cached_addresses) { _avt_registered_owners.push_back(entry.second.owner); }
 	_avt_sector_stats["retained_sector_addresses"] = int(_avt_cached_addresses.size());
-	if (remapped) {
-		for (const Variant &key : _vt_page_records.keys()) {
-			for (const Dictionary &owner : _surface_vt->get_slot_owner_metadata(int(key))) {
-				if (bool(owner["world_space"])) { continue; }
-				Vector2i sector = owner["sector"];
-				int mip = owner["mip"];
-				Dictionary record = _vt_page_records[key];
-				record["mip"] = mip;
-				record["address"] = Vector2i(owner["virtual"]) - Vector2i(
-						_surface_vt->get_sector_block_origin_x(sector) >> mip,
-						_surface_vt->get_sector_block_origin_y(sector) >> mip);
-			}
-		}
-	}
 
 	// Refine only visible page footprints. The refinement walk never enumerates a
 	// virtual image's full mip pyramid (256 squared entries need zero resident
-	// pages until requested). Coarse roots cover delayed and over-budget demand.
-	struct Page { const Sector *sector; int mip, x, y; Rect2 rect; float priority; };
-	std::vector<Page> chosen;
+	// pages until requested). Budget exhaustion must remain visible in diagnostics.
+	for (Sector &sector : working) { sector.size = _surface_vt->has_sector(sector.owner) ? _surface_vt->get_sector_block_size(sector.owner) : 0; }
 	const float logical_ratio = SECTOR_WORLD * _surface_vt_texels_per_meter / (_vt_page_size * get_avt_base_block_size());
-	auto make_page = [&](const Sector &sector, int mip, int x, int y, Page &page, bool prefetch = false) {
-		const int size = _surface_vt->get_sector_block_size(sector.owner);
-		const float logical = sector.level ? 1.f : size * logical_ratio;
-		const float span = SECTOR_WORLD * float(1 << sector.level) * float(1 << mip) / logical;
-		const Rect2 sector_rect(Vector2(sector.location) * (SECTOR_WORLD * float(1 << sector.level)), Vector2(1, 1) * (SECTOR_WORLD * float(1 << sector.level)));
-		const Rect2 rect(sector_rect.position + Vector2(x, y) * span, Vector2(span, span));
-		TerrainVT::VisiblePatch patch;
-		if (!rect.intersects(sector_rect)) { return false; }
-		if (prefetch ? !surrounding_sample(rect.intersection(sector_rect), sector.heights, patch) : !view.sample(rect.intersection(sector_rect), sector.heights, patch)) { return false; }
-		const float density = patch.density * _surface_vt_texels_per_pixel;
-		const float projected = span * density / _vt_page_size;
-		page = { &sector, mip, x, y, rect, (mip > 0 || sector.level > 0) && projected > 1.f ? MAX(1.f, projected) : 0.f };
-		return true;
-	};
-	for (const Sector &sector : working) {
-		if (sector.level != root_level || !_surface_vt->has_sector(sector.owner)) { continue; }
-		Page page;
-		if (make_page(sector, 0, 0, 0, page)) { chosen.push_back(page); }
-	}
-	const int root_count = int(chosen.size());
-	// Visible and idle plans share the same parent-preserving refinement rule.
-	auto refine_pages = [&](std::vector<Page> &pages, int page_budget, bool prefetch) {
-		for (;;) {
-			int best = -1;
-			for (int i = 0; i < int(pages.size()); ++i) {
-				if (pages[i].priority > 0.f && (best < 0 || pages[i].priority > pages[best].priority)) { best = i; }
-			}
-			if (best < 0) { break; }
-			Page parent = pages[best];
-			pages[best].priority = 0.f;
-			std::vector<Page> children;
-			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
-				Page child;
-				if (parent.sector->level > 0) {
-					int level = parent.sector->level - 1;
-					Vector2i child_owner(parent.sector->location.x * 2 + x, parent.sector->location.y * 2 + y + (level ? 0x40000000 + level * 0x100000 : 0));
-					auto node = nodes.find(owner_key(child_owner));
-					if (node == nodes.end() || !_surface_vt->has_sector(node->second->owner)) { continue; }
-					int mip = level ? 0 : TerrainVT::log2_power_of_two(_surface_vt->get_sector_block_size(node->second->owner));
-					if (make_page(*node->second, mip, 0, 0, child, prefetch)) { children.push_back(child); }
-				} else if (parent.mip > 0 && make_page(*parent.sector, parent.mip - 1, parent.x * 2 + x, parent.y * 2 + y, child, prefetch)) {
-					children.push_back(child);
-				}
-			}
-			if (pages.size() + children.size() <= size_t(page_budget)) { pages.insert(pages.end(), children.begin(), children.end()); }
+	auto job = std::make_shared<AVTRefinement>();
+	job->key = plan_key;
+	job->submitted_us = Time::get_singleton()->get_ticks_usec();
+	_avt_refinement = job;
+	// Keep producing the last completed view while its successor is being planned.
+	// A virtual block can grow without changing a physical page's world footprint.
+	auto remap_plan = [&](std::vector<AVTPageRequest> &plan) {
+		for (auto it = plan.begin(); it != plan.end();) {
+			auto address = _avt_cached_addresses.find(owner_key(it->owner));
+			if (address == _avt_cached_addresses.end() || !_surface_vt->has_sector(it->owner)) { it = plan.erase(it); continue; }
+			const auto &node = address->second;
+			const int size = _surface_vt->get_sector_block_size(it->owner);
+			const float world = SECTOR_WORLD * float(1 << node.level);
+			const float logical = node.level ? 1.f : size * logical_ratio;
+			const int mip = int(std::round(std::log2(it->rect.size.x * logical / world)));
+			if (mip < 0 || mip > TerrainVT::log2_power_of_two(size)) { it = plan.erase(it); continue; }
+			it->mip = mip;
+			++it;
 		}
 	};
-	refine_pages(chosen, budget, false);
-	_avt_page_plan.clear();
-	float finest_requested_texel = FLT_MAX;
-	for (const Page &page : chosen) {
-		_avt_page_plan.push_back({ page.sector->owner, page.mip, page.x, page.y, page.rect });
-		finest_requested_texel = MIN(finest_requested_texel, page.rect.size.x / _vt_page_size);
+	// Camera motion changes demand, not existing virtual addresses. Avoid
+	// re-deriving every page mip when the address directory and scale agree.
+	if (directory_dirty || logical_ratio != _avt_plan_logical_ratio) {
+		remap_plan(_avt_page_plan);
+		remap_plan(_avt_prefetch_plan);
+		_avt_plan_logical_ratio = logical_ratio;
 	}
-	_avt_sector_stats["finest_requested_texel_world"] = chosen.empty() ? 0.f : finest_requested_texel;
-	// Prepare surrounding detail after the visible plan is fixed. A separate idle
-	// queue may use free slots, but never evicts a resident page or steals demand.
-	std::vector<Page> warm;
-	for (const Sector &sector : working) {
-		if (sector.level != root_level || !_surface_vt->has_sector(sector.owner)) { continue; }
-		Page page;
-		if (make_page(sector, 0, 0, 0, page, true)) { warm.push_back(page); }
-	}
-	refine_pages(warm, pool_size, true);
-	_avt_prefetch_plan.clear();
-	for (const Page &page : warm) { _avt_prefetch_plan.push_back({page.sector->owner, page.mip, page.x, page.y, page.rect}); }
-	_avt_sector_stats["prefetch_requests"] = int(warm.size());
-	_avt_sector_stats["requested_physical_pages"] = int(chosen.size());
+	_avt_prefetch_cursor = 0;
+	_avt_prefetch_cycle_pending = false;
+	_avt_idle_revision = 0;
+	if (!_vt_page_pipeline) { _vt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(); }
+	_vt_page_pipeline->submit_task([job, working, source = _vt_source_snapshot, view, bounds_ready, camera_position, focus, reach, budget, root_level, logical_ratio, page_size = _vt_page_size, texels_per_pixel = _surface_vt_texels_per_pixel, exact_radius = float(_cdlod_enabled && _tessellation_level == 0 ? _cdlod_patch_size * _vertex_spacing * _cdlod_lod_scale * 0.7 / (1 << _tessellation_level) : 0)]() mutable {
+		const uint64_t plan_start = Time::get_singleton()->get_ticks_usec();
+		std::map<SectorKey, const Sector *> nodes;
+		for (const Sector &sector : working) { nodes[{sector.owner.x, sector.owner.y}] = &sector; }
+		auto owner_key = [](const Vector2i &owner) { return SectorKey(owner.x, owner.y); };
+		auto surrounding_sample = [&](const Rect2 &rect, const Vector2 &heights, TerrainVT::VisiblePatch &patch) {
+			const Vector2 nearest(CLAMP(focus.x, rect.position.x, rect.get_end().x), CLAMP(focus.y, rect.position.y, rect.get_end().y));
+			if (nearest.distance_squared_to(focus) > (reach + SECTOR_WORLD) * (reach + SECTOR_WORLD)) { return false; }
+			patch.nearest = Vector3(nearest.x, CLAMP(camera_position.y, heights.x, heights.y), nearest.y);
+			patch.distance = patch.nearest.distance_to(camera_position);
+			patch.density = view.orthographic ? view.focal : view.focal * 2.f / MAX(0.01f, patch.distance);
+			return true;
+		};
+		struct Page { const Sector *sector; int mip, x, y; Rect2 rect; float priority; float minimum_density; bool required; bool sampled; };
+		std::vector<Page> chosen;
+
+		auto make_page = [&](const Sector &sector, int mip, int x, int y, Page &page, bool prefetch = false) {
+			const int size = sector.size;
+			const float logical = sector.level ? 1.f : size * logical_ratio;
+			const float span = SECTOR_WORLD * float(1 << sector.level) * float(1 << mip) / logical;
+			const Rect2 sector_rect(Vector2(sector.location) * (SECTOR_WORLD * float(1 << sector.level)), Vector2(1, 1) * (SECTOR_WORLD * float(1 << sector.level)));
+			const Rect2 rect(sector_rect.position + Vector2(x, y) * span, Vector2(span, span));
+			TerrainVT::VisiblePatch patch;
+			if (!rect.intersects(sector_rect)) { return false; }
+			const Rect2 footprint = rect.intersection(sector_rect);
+			const Vector2 heights = bounds_ready ? source->bounds(footprint, sector.heights) : sector.heights;
+			if (prefetch ? !surrounding_sample(footprint, heights, patch) : !view.sample(footprint, heights, patch)) { return false; }
+			// Perspective derivatives on a slope need not match a horizontal plane.
+			// Sample the actual source triangles as well as the conservative bounds.
+			const Vector2 farthest(MAX(Math::abs(footprint.position.x - focus.x), Math::abs(footprint.get_end().x - focus.x)),
+				MAX(Math::abs(footprint.position.y - focus.y), Math::abs(footprint.get_end().y - focus.y)));
+			if (!prefetch && heights.x != heights.y && footprint.size.x <= 4.f * source->spacing && farthest.length() < exact_radius) {
+				// Clip the actual near-field mesh triangles. Height-box projection can
+				// request entire hidden/offscreen columns of mip 0 on a steep slope.
+				TerrainVT::VisiblePatch projected_surface;
+				if (!source->project_surface(footprint.grow(4.f * span / page_size + 0.0001f), view, projected_surface)) { return false; }
+				patch.density = projected_surface.density;
+				patch.minimum_density = projected_surface.minimum_density;
+			} else if (!prefetch && heights.x != heights.y) {
+				for (int z = 0; z < 3; ++z) for (int x = 0; x < 3; ++x) {
+					const Vector2 at = footprint.position + footprint.size * Vector2((x + 0.001f) / 2.002f, (z + 0.001f) / 2.002f);
+					Vector3 point, normal;
+					if (source->surface(at, point, normal)) {
+						patch.density = MAX(patch.density, view.surface_density(point, normal));
+					}
+				}
+			}
+			// Near slopes can expose a finer footprint abruptly as the eye crosses
+			// a source triangle. Keep a wider refinement apron there only.
+			const float density_margin = heights.x != heights.y && farthest.length() < exact_radius ? 3.f : DEMAND_DENSITY_MARGIN;
+			const float density = patch.density * texels_per_pixel * density_margin;
+			const float projected = span * density / page_size;
+			const float minimum_density = patch.minimum_density / density_margin;
+			page = { &sector, mip, x, y, rect, (mip > 0 || sector.level > 0) && projected > 1.f ? MAX(1.f, projected) : 0.f, minimum_density, prefetch || (mip == 0 && sector.level == 0) || minimum_density * span <= page_size * 2.f, page_size <= span * patch.density * texels_per_pixel * 2.01f };
+			return true;
+		};
+		for (const Sector &sector : working) {
+			if (sector.level != root_level || !(sector.size > 0)) { continue; }
+			Page page;
+			if (make_page(sector, 0, 0, 0, page)) { chosen.push_back(page); }
+		}
+		const int root_count = int(chosen.size());
+		// Retain the mip interval reached by the visible footprint, including its
+		// transition apron. A completed child family supplies tighter parent bounds.
+		auto refine_pages = [&](std::vector<Page> &pages, int page_budget) {
+			int denied = 0;
+			const int walk_budget = page_budget * 8;
+			struct Family { int parent; std::array<int, 4> children; int count = 0; };
+			std::vector<Family> families;
+			std::priority_queue<std::pair<float, int>> candidates;
+			for (int i = 0; i < int(pages.size()); ++i) {
+				if (pages[i].priority > 0.f) { candidates.emplace(pages[i].priority, -i); }
+			}
+			while (!candidates.empty()) {
+				const int best = -candidates.top().second;
+				candidates.pop();
+				const Page parent = pages[best];
+				pages[best].priority = 0.f;
+				std::array<Page, 4> children;
+				int child_count = 0;
+				bool complete = true;
+				for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+					Page child;
+					if (parent.sector->level > 0) {
+						const int level = parent.sector->level - 1;
+						const Vector2i child_owner(parent.sector->location.x * 2 + x, parent.sector->location.y * 2 + y + (level ? 0x40000000 + level * 0x100000 : 0));
+						const auto node = nodes.find(owner_key(child_owner));
+						if (node == nodes.end() || !(node->second->size > 0)) { complete = false; continue; }
+						const int mip = level ? 0 : TerrainVT::log2_power_of_two(node->second->size);
+						if (make_page(*node->second, mip, 0, 0, child)) { children[child_count++] = child; }
+					} else if (parent.mip > 0 && make_page(*parent.sector, parent.mip - 1, parent.x * 2 + x, parent.y * 2 + y, child)) {
+						children[child_count++] = child;
+					}
+				}
+				if (int(pages.size()) + child_count <= walk_budget) {
+					Family family{best, {}};
+					for (int i = 0; i < child_count; ++i) {
+						const Page &child = children[i];
+						family.children[family.count++] = int(pages.size());
+						if (child.priority > 0.f) { candidates.emplace(child.priority, -int(pages.size())); }
+						pages.push_back(child);
+					}
+					if (complete && child_count > 0) { families.push_back(family); }
+				} else { denied += child_count; }
+			}
+			for (auto family = families.rbegin(); family != families.rend(); ++family) {
+				Page &parent = pages[family->parent];
+				float minimum = 1e30f;
+				for (int i = 0; i < family->count; ++i) { minimum = MIN(minimum, pages[family->children[i]].minimum_density); }
+				parent.minimum_density = MAX(parent.minimum_density, minimum);
+				parent.required = parent.minimum_density * parent.rect.size.x <= page_size * 2.f;
+			}
+			return denied;
+		};
+		job->denied = refine_pages(chosen, budget);
+
+		job->pages.clear();
+		std::vector<AVTPageRequest> apron;
+		for (const Page &page : chosen) {
+			if (!page.required) { continue; }
+			(page.sampled ? job->pages : apron).push_back({ page.sector->owner, page.mip, page.x, page.y, page.rect });
+		}
+		// Speculative fine mips must never get ahead of pages the current image
+		// samples. Limit the apron to spare capacity so it cannot saturate a large
+		// world's cache or starve real requests in the 16-page generation budget.
+		job->denied += MAX(0, int(job->pages.size()) - budget);
+		const int ahead_count = MIN(int(apron.size()), MIN(256, MAX(0, budget - int(job->pages.size()))));
+		job->pages.insert(job->pages.end(), apron.begin(), apron.begin() + ahead_count);
+		float finest_requested_texel = FLT_MAX;
+		for (const AVTPageRequest &page : job->pages) { finest_requested_texel = MIN(finest_requested_texel, page.rect.size.x / page_size); }
+		job->finest = job->pages.empty() ? 0.f : finest_requested_texel;
+
+		// Prepare surrounding detail after the visible plan is fixed. A separate idle
+		// queue may use free slots, but never evicts a resident page or steals demand.
+		std::vector<Page> warm;
+		for (const Sector &sector : working) {
+			if (sector.level != root_level || !(sector.size > 0)) { continue; }
+			Page page;
+			if (make_page(sector, 0, 0, 0, page, true)) { warm.push_back(page); }
+		}
+		// Idle coverage needs only world roots. Refining a full spare-cache tree
+		// on every moving view delays visible planning and immediately becomes stale.
+		job->warm.clear();
+		for (const Page &page : warm) { job->warm.push_back({page.sector->owner, page.mip, page.x, page.y, page.rect}); }
+
+		job->roots = root_count;
+
+		job->elapsed_us = Time::get_singleton()->get_ticks_usec() - plan_start;
+		job->ready.store(true, std::memory_order_release);
+	});
+	_avt_sector_stats["height_bounds_ready"] = bounds_ready;
 	_avt_sector_stats["retained_hierarchy"] = true;
-	_avt_sector_stats["visible_root_pages"] = root_count;
+	_avt_sector_stats["planning_pending"] = true;
 	_avt_sector_stats["base_virtual_resolution"] = SECTOR_WORLD * _surface_vt_texels_per_meter;
 	_avt_sector_stats["base_page_entries"] = SECTOR_WORLD * _surface_vt_texels_per_meter / _vt_page_size;
 	_avt_sector_stats["indirection_size"] = 2048;
@@ -458,48 +610,124 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (p_max_pages == 0) { return 0; }
-	const uint64_t started = Time::get_singleton()->get_ticks_usec();
+	p_max_pages = p_max_pages < 0 ? 16 : MIN(p_max_pages, 16);
+	const auto pool = _surface_vt->get_page_pool();
+	if (bool(_avt_sector_stats.get("plan_reused", false)) && _avt_idle_revision == pool->residency_revision) {
+		for (int slot : _avt_resident_slots) { pool->mark_demanded(slot); }
+		_avt_sector_stats["produced"] = 0;
+		_avt_sector_stats["prefetched"] = 0;
+		return 0;
+	}
+	_avt_idle_revision = 0;
+	_avt_resident_slots.clear();
 	_surface_vt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
 	int produced = 0;
+	uint64_t allocation_us = 0, payload_us = 0, queue_us = 0;
 	std::vector<int> protected_slots;
-	auto produce_page = [&](const AVTPageRequest &page) {
+	protected_slots.reserve(_avt_page_plan.size() + p_max_pages);
+	std::vector<const AVTPageRequest *> missing_pages;
+	missing_pages.reserve(_avt_page_plan.size());
+	if (!_vt_page_pipeline) { _vt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(); }
+	if (!_vt_source_snapshot) { _vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
+	auto request_for = [&](const AVTPageRequest &page) {
+		return Terrain3DPagePipeline::Request{{page.owner.x, page.owner.y, page.mip, page.x, page.y}, page.rect, _vt_page_size, _vt_page_border};
+	};
+	bool prefetch_pending = false;
+	auto produce_page = [&](const AVTPageRequest &page, bool prefetch = false) {
+		if (_surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y) >= 0) { return false; }
+		if (prefetch) { prefetch_pending = true; }
+		const auto request = request_for(page);
+		Terrain3DPagePipeline::Result prepared;
+		if (!_vt_page_pipeline->poll(request, _vt_source_snapshot, prepared)) {
+			return false;
+		}
+		const uint64_t allocation_start = Time::get_singleton()->get_ticks_usec();
 		bool miss = false;
 		int slot = _surface_vt->request_page_internal(page.owner, page.mip, page.x, page.y, &miss);
 		if (slot < 0 || !miss) { return false; }
 		_invalidate_vt_slot(slot);
-		Ref<Image> payload;
-		if (_data->produce_surface_rect_page(page.rect, _vt_page_size, _vt_page_border, payload) < 0 || !_surface_vt->write_page(slot, payload)) {
+		const uint64_t payload_start = Time::get_singleton()->get_ticks_usec();
+		allocation_us += payload_start - allocation_start;
+		Ref<Image> payload = prepared.payload;
+		if (payload.is_null() || !_surface_vt->write_page(slot, payload)) {
 			_surface_vt->release_page(page.owner, page.mip, page.x, page.y);
 			return false;
 		}
-		_queue_vt_material_page(slot, payload, page.rect, false, page.mip, Vector2i(page.x, page.y));
+		const uint64_t queue_start = Time::get_singleton()->get_ticks_usec();
+		payload_us += queue_start - payload_start;
+		_queue_vt_material_page(slot, payload, page.rect, false, page.mip, Vector2i(page.x, page.y), &prepared);
+		queue_us += Time::get_singleton()->get_ticks_usec() - queue_start;
 		_surface_vt->protect_page(slot, true);
 		protected_slots.push_back(slot);
 		return true;
 	};
 	for (const AVTPageRequest &page : _avt_page_plan) {
-		int slot = _surface_vt->lookup_virtual((_surface_vt->get_sector_block_origin_x(page.owner) >> page.mip) + page.x, (_surface_vt->get_sector_block_origin_y(page.owner) >> page.mip) + page.y, page.mip, page.mip);
+		int slot = _surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
 		if (slot >= 0 && !_surface_vt->is_page_protected(slot)) { _surface_vt->protect_page(slot, true); protected_slots.push_back(slot); }
+		if (slot < 0) { missing_pages.push_back(&page); }
+		else { pool->mark_demanded(slot); _avt_resident_slots.push_back(slot); }
 	}
-	for (const AVTPageRequest &page : _avt_page_plan) {
-		// Bound CPU payload generation as well as page count. A single page is indivisible.
-		if (produced > 0 && Time::get_singleton()->get_ticks_usec() - started >= 3000) { _surface_vt->set_allocation_budget(0); }
-		produced += produce_page(page) ? 1 : 0;
-	}
-	int prefetched = 0;
-	if (produced == 0) {
-		const auto pool = _surface_vt->get_page_pool();
-		for (const AVTPageRequest &page : _avt_prefetch_plan) {
-			if (Time::get_singleton()->get_ticks_usec() - started >= 3000 ||
-					std::find(pool->slot_used.begin(), pool->slot_used.end(), uint8_t(0)) == pool->slot_used.end()) { break; }
-			prefetched += produce_page(page) ? 1 : 0;
+	// Queued idle work must not occupy every source-worker slot while visible
+	// requests wait for a free entry. Retain only visible jobs until they settle.
+	if (!missing_pages.empty() || !bool(_avt_sector_stats.get("plan_reused", false))) {
+		std::vector<Terrain3DPagePipeline::Request> wanted;
+		wanted.reserve(_avt_page_plan.size() + (missing_pages.empty() ? _avt_prefetch_plan.size() : 0));
+		for (const auto &page : _avt_page_plan) { wanted.push_back(request_for(page)); }
+		if (missing_pages.empty()) {
+			for (const auto &page : _avt_prefetch_plan) { wanted.push_back(request_for(page)); }
 		}
+		_vt_page_pipeline->retain(wanted);
 	}
+	auto prime_sources = [&]() {
+		std::vector<Terrain3DPagePipeline::Request> requests;
+		requests.reserve(32);
+		for (const AVTPageRequest *page : missing_pages) {
+			if (_surface_vt->lookup_page_exact(page->owner, page->mip, page->x, page->y) >= 0) { continue; }
+			requests.push_back(request_for(*page));
+			if (requests.size() == 32) { break; }
+		}
+		_vt_page_pipeline->prime(requests, _vt_source_snapshot);
+	};
+	prime_sources();
+	for (const AVTPageRequest *page : missing_pages) {
+		// Throughput is bounded by the real page budget, not a CPU timer that can
+		// collapse this pipeline to one page per frame while the camera is moving.
+		if (produced >= p_max_pages) { break; }
+		produced += produce_page(*page) ? 1 : 0;
+	}
+	// Refill after consuming ready results even when the render budget is spent.
+	// Otherwise two full batches drain the queue and every third frame is idle.
+	prime_sources();
+	int prefetched = 0;
+	if (missing_pages.empty() && !_avt_prefetch_plan.empty()) {
+		bool complete = pool->free_slots.empty();
+		for (size_t checked = 0; checked < _avt_prefetch_plan.size() && !complete; ++checked) {
+			if (prefetched >= p_max_pages) { break; }
+			prefetch_pending = false;
+			prefetched += produce_page(_avt_prefetch_plan[_avt_prefetch_cursor], true) ? 1 : 0;
+			_avt_prefetch_cycle_pending |= prefetch_pending;
+			if (++_avt_prefetch_cursor == _avt_prefetch_plan.size()) {
+				_avt_prefetch_cursor = 0;
+				complete = !_avt_prefetch_cycle_pending;
+				_avt_prefetch_cycle_pending = false;
+				break;
+			}
+			complete = pool->free_slots.empty();
+		}
+		prefetch_pending = !complete;
+	}
+
 	_avt_sector_stats["prefetched"] = prefetched;
 	produced += prefetched;
 	for (int slot : protected_slots) { _surface_vt->protect_page(slot, false); }
+	const uint64_t commit_start = Time::get_singleton()->get_ticks_usec();
 	_surface_vt->commit();
+	_avt_sector_stats["commit_ms"] = double(Time::get_singleton()->get_ticks_usec() - commit_start) / 1000.;
+	_avt_sector_stats["allocation_ms"] = double(allocation_us) / 1000.;
+	_avt_sector_stats["payload_ms"] = double(payload_us) / 1000.;
+	_avt_sector_stats["queue_ms"] = double(queue_us) / 1000.;
 	_surface_vt->set_allocation_budget(-1);
 	_avt_sector_stats["produced"] = produced;
+	if (missing_pages.empty() && produced == 0 && !prefetch_pending) { _avt_idle_revision = pool->residency_revision; }
 	return produced;
 }

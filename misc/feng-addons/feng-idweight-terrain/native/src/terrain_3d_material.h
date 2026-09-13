@@ -67,7 +67,7 @@ private:
 	GeneratedTexture _generated_dummy_2d;
 
 	// Material Features
-	WorldBackground _world_background = FLAT;
+	WorldBackground _world_background = NONE;
 	TextureFiltering _texture_filtering = LINEAR_ANISOTROPIC;
 	bool _dual_scaling_enabled = false;
 	bool _auto_shader_enabled = false;

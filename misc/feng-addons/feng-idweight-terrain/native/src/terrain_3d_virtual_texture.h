@@ -51,9 +51,11 @@ struct Terrain3DVTPagePool {
 
 	std::vector<uint32_t> lru;
 	std::vector<uint8_t> slot_used;
+	std::vector<Ref<Image>> authored_pages;
 	std::vector<uint8_t> slot_protected;
 	std::vector<uint64_t> slot_demand_epoch;
 	uint64_t demand_epoch = 0;
+	uint64_t residency_revision = 1;
 	bool demand_active = false;
 	std::vector<std::vector<Terrain3DVTPageOwner>> slot_owners;
 	std::vector<uint32_t> free_slots;
@@ -63,6 +65,7 @@ struct Terrain3DVTPagePool {
 	int protected_block_count = 0;
 	bool initialized = false;
 
+	bool grow(int p_page_count);
 	bool initialize(int p_page_size, int p_page_border, int p_page_count,
 			Image::Format p_format);
 	void clear();
@@ -70,6 +73,7 @@ struct Terrain3DVTPagePool {
 
 	int acquire_slot(Terrain3DVirtualTexture *p_requester);
 	void touch_slot(uint32_t p_slot);
+	void mark_demanded(uint32_t p_slot) { if (demand_active && p_slot < slot_demand_epoch.size()) { slot_demand_epoch[p_slot] = demand_epoch; } }
 	void evict_slot(uint32_t p_slot);
 	void publish_owner(uint32_t p_slot, const Terrain3DVTPageOwner &p_owner);
 	bool remove_owner(uint32_t p_slot, Terrain3DVirtualTexture *p_texture,
@@ -176,6 +180,7 @@ private:
 	int _miss_count = 0;
 	int _commit_count = 0;
 	int _page_write_count = 0;
+	bool _material_cache_mode = false;
 
 	uint32_t _read_level(int p_x, int p_y, int p_mip) const;
 	void _write_level(int p_x, int p_y, int p_mip, uint32_t p_slot);
@@ -203,6 +208,7 @@ public:
 	void set_page_border(const int p_border);
 	int get_page_border() const { return _page_border; }
 	void set_page_count(const int p_count);
+	bool grow_capacity(int p_count);
 	int get_page_count() const { return _page_count; }
 	void set_indirection_size(const int p_size);
 	int get_indirection_size() const { return _indirection_size; }
@@ -265,6 +271,7 @@ public:
 	int request_page_internal(const Vector2i &p_sector, const int p_local_mip,
 			const int p_page_x, const int p_page_y, bool *r_miss);
 	int lookup_page(const Vector2i &p_sector, const int p_local_mip, const int p_page_x, const int p_page_y) const;
+	int lookup_page_exact(const Vector2i &p_sector, int p_mip, int p_x, int p_y) const;
 	int lookup_virtual(const int p_virtual_x, const int p_virtual_y, const int p_mip, const int p_max_mip) const;
 	// Request by indirection coordinate, for a caller that already knows it (the root
 	// pyramid walks whole levels). Only valid in world-space mode.
@@ -279,6 +286,7 @@ public:
 	bool release_world_page(const int p_page_x, const int p_page_y, const int p_local_mip);
 
 	// Page content
+	void set_material_cache_mode(bool p_enabled) { _material_cache_mode = p_enabled; }
 	bool write_page(const int p_slot, const Ref<Image> &p_page);
 	Ref<Image> read_page(const int p_slot) const;
 	Ref<Image> get_atlas_image() const;

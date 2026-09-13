@@ -25,6 +25,7 @@
 #include "terrain_3d_streamer.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_3d_vt_feedback.h"
+#include "terrain_3d_page_pipeline.h"
 
 class Terrain3D : public Node3D {
 	GDCLASS(Terrain3D, Node3D);
@@ -76,8 +77,11 @@ private:
 	int _vt_page_size = 256;
 	int _vt_page_border = 4;
 	int _vt_page_count = 256;
-	int _vt_pages_per_update = 4;
+	bool _vt_auto_capacity = true;
+	bool _ensure_vt_capacity(int p_required);
+	int _vt_pages_per_update = 16;
 	bool _vt_adaptive_enabled = true;
+	bool _surface_vt_coarse_mip_fallback = false;
 	bool _vt_debug_direct_material = false;
 	bool _vt_editor_preview = true;
 	Dictionary _vt_editor_dirty_regions;
@@ -86,18 +90,21 @@ private:
 	bool _vt_materials_dirty = true;
 	bool _vt_callback_registered = false;
 	Ref<RefCounted> _vt_baker;
+	std::unique_ptr<Terrain3DPagePipeline> _vt_page_pipeline, _svt_page_pipeline;
+	std::map<int, Terrain3DPagePipeline::Request> _svt_pending_pages;
+	void _process_async_svt_pages();
+	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> _vt_source_snapshot;
 	Dictionary _vt_page_records;
 	Dictionary _vt_registered_sectors;
 	PackedFloat32Array _surface_vt_block_sizes;
 	RID _vt_bound_albedo;
 	uint64_t _vt_source_revision = 1;
 	Dictionary _vt_svt_tiles;
-	Dictionary _svt_cell_cache;
 	Ref<RefCounted> _svt_cell_baker;
 	Dictionary _svt_cell_job;
 	uint64_t _svt_cells_baked = 0;
 	uint32_t _svt_cell_signature(const Vector2i &p_cell) const;
-	Dictionary _load_svt_cell(const Vector2i &p_cell, int p_mip = -1);
+	Dictionary _load_svt_cell(const Vector2i &p_cell);
 	bool _svt_auto_bake = true;
 	Dictionary _vt_svt_dirty_regions;
 	uint64_t _vt_svt_edit_time = 0;
@@ -117,7 +124,7 @@ private:
 	// region surface maps. Off by default; the array path stays authoritative until
 	// the source data carries more detail than the array can afford to keep resident.
 	Terrain3DVirtualTexture *_surface_vt = nullptr;
-	bool _surface_vt_enabled = false;
+	bool _surface_vt_enabled = true;
 	// The near field's working set is roughly 50 pages at density 4 (a 512 m radius
 	// with the distance rule), so 64 left no headroom for the LRU.
 	int _surface_vt_page_count = 128;
@@ -132,10 +139,25 @@ private:
 	int _avt_directory_mask = 0;
 	int _avt_root_level = 1;
 	Dictionary _avt_sector_stats;
-	struct AVTPageRequest { Vector2i owner; int mip, x, y; Rect2 rect; };
+	struct AVTPageRequest { Vector2i owner; int mip, x, y; Rect2 rect; uint64_t last_visible_plan = 0; };
+	uint64_t _avt_plan_epoch = 0;
+	float _avt_plan_logical_ratio = 0.f;
+	struct AVTRefinement {
+		std::atomic<bool> ready{false};
+		PackedByteArray key;
+		std::vector<AVTPageRequest> pages, warm;
+		float finest = 0.f;
+		int denied = 0, roots = 0;
+		uint64_t submitted_us = 0, elapsed_us = 0;
+	};
+	std::shared_ptr<AVTRefinement> _avt_refinement;
 	std::vector<AVTPageRequest> _avt_page_plan;
 	std::vector<AVTPageRequest> _avt_prefetch_plan;
 	PackedByteArray _avt_plan_key;
+	uint64_t _avt_idle_revision = 0;
+	std::vector<int> _avt_resident_slots;
+	size_t _avt_prefetch_cursor = 0;
+	bool _avt_prefetch_cycle_pending = false;
 	std::vector<Vector2i> _avt_registered_owners;
 	std::unordered_map<uint64_t, int> _avt_allocated_sizes;
 	struct AVTCachedAddress { Vector2i location; Vector2i owner; int level; };
@@ -175,7 +197,7 @@ private:
 	// what the region-aligned near field above cannot express. Off by default; the
 	// region texture array still serves whenever no page covers a texel.
 	Terrain3DVirtualTexture *_surface_svt = nullptr;
-	bool _surface_svt_enabled = false;
+	bool _surface_svt_enabled = true;
 	// One mip 0 page covers this many metres.
 	real_t _surface_svt_page_world = 256.f;
 	int _surface_svt_page_size = 256;
@@ -189,6 +211,7 @@ private:
 	// what lets the shader resolve any world position without the region texture array,
 	// so it is the far field's fallback rather than a separate fallback page.
 	int _surface_svt_root_mips = 2;
+	int _vt_svt_visible_pages = 0;
 	// Distance -> level table for the far field, in metres. Entry m is the largest
 	// camera distance at which world mip m is sampled, so the table states the level
 	// bands explicitly instead of deriving them from the page size. Empty keeps the
@@ -226,6 +249,9 @@ private:
 	TargetNode3D _camera; // Fallback target for clipmap and collision
 
 	// Terrain Mesh
+	bool _cdlod_enabled = true;
+	int _cdlod_patch_size = 32;
+	real_t _cdlod_lod_scale = 8.f;
 	Terrain3DMesher *_terrain_mesher = nullptr;
 	Ref<Terrain3DMaterial> _material;
 	int _mesh_lods = 7;
@@ -267,6 +293,8 @@ private:
 
 	void _initialize();
 	void __physics_process(const double p_delta);
+	void _update_render_geometry();
+	void _invalidate_render_geometry();
 	void _grab_camera();
 
 	void _destroy_collision(const bool p_final = false);
@@ -284,7 +312,8 @@ private:
 	void _destroy_vt_service();
 	void _configure_vt_service();
 	void _queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
-			bool p_svt, int p_mip, const Vector2i &p_address);
+			bool p_svt, int p_mip, const Vector2i &p_address,
+			const Terrain3DPagePipeline::Result *p_prepared = nullptr);
 	static void _bind_vt_methods();
 	void _process_svt_bake(int p_page_budget = -1);
 	int _update_visible_svt(int p_max_pages);
@@ -342,10 +371,14 @@ public:
 	int get_vt_page_size() const { return _vt_page_size; }
 	void set_vt_page_border(int p_border);
 	int get_vt_page_border() const { return _vt_page_border; }
+	void set_vt_auto_capacity(bool p_enabled) { _vt_auto_capacity = p_enabled; _avt_plan_key.clear(); }
+	bool get_vt_auto_capacity() const { return _vt_auto_capacity; }
 	void set_vt_page_count(int p_count);
 	int get_vt_page_count() const { return _vt_page_count; }
 	void set_vt_pages_per_update(int p_pages);
 	int get_vt_pages_per_update() const { return _vt_pages_per_update; }
+	void set_surface_vt_coarse_mip_fallback(bool p_enabled);
+	bool get_surface_vt_coarse_mip_fallback() const { return _surface_vt_coarse_mip_fallback; }
 	void set_vt_adaptive_enabled(bool p_enabled);
 	bool is_vt_adaptive_enabled() const { return _vt_adaptive_enabled; }
 	void set_vt_editor_preview(bool p_enabled);
@@ -540,6 +573,13 @@ public:
 	Ref<PhysicsMaterial> get_physics_material() const { return _collision ? _collision->get_physics_material() : Ref<PhysicsMaterial>(); }
 
 	// Terrain Mesh
+	void set_cdlod_enabled(bool p_enabled);
+	bool is_cdlod_enabled() const { return _cdlod_enabled; }
+	void set_cdlod_patch_size(int p_size);
+	int get_cdlod_patch_size() const { return _cdlod_patch_size; }
+	void set_cdlod_lod_scale(real_t p_scale);
+	real_t get_cdlod_lod_scale() const { return _cdlod_lod_scale; }
+	Dictionary get_cdlod_stats() const { return _terrain_mesher ? _terrain_mesher->get_cdlod_stats() : Dictionary(); }
 	Terrain3DMesher *get_mesher() const { return _terrain_mesher; }
 	void set_material(const Ref<Terrain3DMaterial> &p_material);
 	Ref<Terrain3DMaterial> get_material() const { return _material; }

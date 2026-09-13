@@ -37,11 +37,16 @@ Captures remain under `.godot/renderdoc/captures/`.
 
 ## Validation
 
-The toolbar reissues updates for resident terrain VT pages immediately before
-its explicit frame capture: AVT is baked into the same physical slots and SVT
-reloads its persisted channels. This exposes the producer even in an idle scene;
-it does not edit the terrain or perform a full disk bake. VT timings in this
-diagnostic frame include this extra work and are not steady-state idle timings.
+The toolbar captures resident textures and naturally pending work. It does not
+call terrain `prepare_vt_capture()` or regenerate the entire resident cache.
+The previous forced replay bypassed normal page budgets and concentrated all
+resident AVT bakes/SVT uploads into one capture. The explicit native diagnostic
+API remains available to callers that deliberately want that extra workload.
+
+The native capture helper logs begin, viewport drawing, resource/command saving,
+and completion with elapsed milliseconds. If a driver or capture-library stall
+persists, the last `[frd] capture:` line identifies the blocked stage; this does
+not provide cancellation inside a blocked RenderDoc API call.
 
 Captures opened by the toolbar enable RenderDoc's empty-region display, so an
 idle VT Pass remains visible with the normal action filter. An idle pass has no
@@ -70,3 +75,11 @@ original editor survives with no additional captures. It places a live editor UI
 label containing its PID in the frame and extracts a thumbnail for inspection.
 The capture must include that label and the actual editor UI, not a reconstructed
 scene image. Test fixtures are excluded from addon imports.
+
+Set `FENG_TEST_VT_TERRAIN=1` to capture a default-capacity actual Terrain3D and
+verify capture does not increase resident bake/upload counters. Optionally set
+`FENG_TEST_TERRAIN_PROJECT` to a project with `render/test.tscn`, `texture/` and
+`terrain/`; the runner copies its scene, materials and current cell sources into
+an isolated fixture, excluding obsolete `.vtpage` files. It never saves into the
+source project. Analyzer shutdown uses a handshake so slow replay does not race
+an arbitrary editor quit timer.

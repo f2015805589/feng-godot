@@ -42,7 +42,7 @@ def stage_addons() -> None:
     # the unrelated terrain addon out of the fixture entirely.
     terrain_target = target_root / "feng-idweight-terrain"
     terrain_target.mkdir(parents=True, exist_ok=True)
-    if os.environ.get("FENG_TEST_VT_WORK") == "1":
+    if os.environ.get("FENG_TEST_VT_WORK") == "1" or os.environ.get("FENG_TEST_VT_TERRAIN") == "1":
         for extension in (source_root / "feng-idweight-terrain").glob("*.gdextension"):
             shutil.copy2(extension, terrain_target / extension.name)
         (terrain_target / "bin").mkdir()
@@ -53,6 +53,16 @@ def stage_addons() -> None:
 
 
 stage_addons()
+
+source_project = os.environ.get("FENG_TEST_TERRAIN_PROJECT")
+if source_project:
+    source = Path(source_project).resolve()
+    shutil.copytree(source / "texture", PROJECT / "texture")
+    # Obsolete per-page files are not read by current terrain. Preserve source
+    # resources and current cell caches in the fixture; never write the project.
+    shutil.copytree(source / "terrain", PROJECT / "terrain", ignore=shutil.ignore_patterns("*.vtpage"))
+    (PROJECT / "render").mkdir(exist_ok=True)
+    shutil.copy2(source / "render/test.tscn", PROJECT / "render/test.tscn")
 
 # Verify the analyzer's actual UI filter, not only the markers in the RDC file.
 view_script = PROJECT / "addons/feng-renderdoc-capture/src/renderdoc_view.py"
@@ -165,6 +175,7 @@ with (BASE / "ui.log").open("wb") as log:
             if editor.poll() is None:
                 assert not any(child.name().lower().startswith("godot.") for child in psutil.Process(editor.pid).children(recursive=True)), "Capture must not launch another Godot process"
             output = (BASE / "ui.log").read_text(encoding="utf-8", errors="replace")
+            assert "SCRIPT ERROR" not in output, output
             if checked or "UI_TEST_AFTER" not in output:
                 continue
             assert_attached(editor.pid)
@@ -192,10 +203,13 @@ with (BASE / "ui.log").open("wb") as log:
                     time.sleep(0.1)
                 close_test_gui(analyzer)
                 assert_attached(editor.pid)
+                (PROJECT / "capture_analyzer_closed").write_text("ok", encoding="utf-8")
                 checked = True
                 print("PASS: real editor frame captured without another Godot process; closing analyzer keeps original editor alive", flush=True)
                 break
-        assert editor.poll() == 0, "Editor did not exit cleanly"
+        if checked and editor.poll() is None:
+            editor.wait(timeout=25)
+        assert editor.poll() == 0, "Editor did not exit cleanly; log: " + str(BASE / "ui.log")
     finally:
         if editor.poll() is None:
             editor.terminate()

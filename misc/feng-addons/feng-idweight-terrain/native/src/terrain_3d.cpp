@@ -19,6 +19,7 @@
 #include <godot_cpp/classes/quad_mesh.hpp>
 #include <godot_cpp/classes/shader_material.hpp>
 #include <godot_cpp/classes/surface_tool.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/viewport_texture.hpp>
 #include <godot_cpp/classes/world3d.hpp>
 
@@ -77,6 +78,9 @@ void Terrain3D::_initialize() {
 		LOG(DEBUG, "Connecting _data::maps_changed signal to _material->_update()");
 		_data->connect("maps_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::REGION_ARRAYS));
 	}
+	if (!_data->is_connected("maps_changed", callable_mp(this, &Terrain3D::_invalidate_render_geometry))) {
+		_data->connect("maps_changed", callable_mp(this, &Terrain3D::_invalidate_render_geometry));
+	}
 	// Height map was regenerated, update aabbs
 	if (!_data->is_connected("height_maps_changed", callable_mp(this, &Terrain3D::_update_mesher_aabbs))) {
 		LOG(DEBUG, "Connecting _data::height_maps_changed signal to update_aabbs()");
@@ -110,6 +114,21 @@ void Terrain3D::_initialize() {
  * This is a proxy for _process(delta) called by _notification() due to
  * https://github.com/godotengine/godot-cpp/issues/1022
  */
+void Terrain3D::_invalidate_render_geometry() {
+	_vt_source_snapshot.reset();
+	_avt_refinement.reset();
+	_avt_plan_key.clear();
+	if (_vt_page_pipeline) { _vt_page_pipeline->reset(); }
+	if (_svt_page_pipeline) { _svt_page_pipeline->reset(); }
+	if (_terrain_mesher) { _terrain_mesher->invalidate_region_geometry(); }
+}
+
+void Terrain3D::_update_render_geometry() {
+	if (_initialized && _is_inside_world && is_inside_tree() && _camera.is_valid() && _terrain_mesher) {
+		_terrain_mesher->snap();
+	}
+}
+
 void Terrain3D::__physics_process(const double p_delta) {
 	if (!_initialized) {
 		return;
@@ -128,12 +147,8 @@ void Terrain3D::__physics_process(const double p_delta) {
 				_last_buffer_position = target_pos_2d;
 				RS->material_set_param(_material->get_buffer_material_rid(), "_target_pos", get_clipmap_target_position());
 				_d_buffer_vp->set_update_mode(SubViewport::UPDATE_ONCE);
-				// Only call snap on _mesher if the buffer has snapped, prevents stuttering.
-				_terrain_mesher->snap();
 			}
 		}
-	} else if (_terrain_mesher) {
-		_terrain_mesher->snap();
 	}
 	if (_ocean_enabled && _ocean_mesher) {
 		_ocean_mesher->snap();
@@ -177,12 +192,25 @@ void Terrain3D::__physics_process(const double p_delta) {
 	const bool svt_baking = !_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty();
 	const auto demand_pool = !_vt_debug_direct_material && _surface_vt ? _surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
+	int avt_produced = 0;
 	if (_surface_vt_enabled) {
-		vt_remaining -= update_surface_vt(_surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
+		avt_produced = update_surface_vt(_surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
+		vt_remaining -= avt_produced;
 	}
 	// Refresh the far field: a world-space page grid that spans regions.
 	if (_surface_svt_enabled && vt_remaining > 0) {
 		vt_remaining -= update_surface_svt(vt_remaining);
+	}
+	if (!svt_baking && vt_remaining > 0 && _surface_vt_enabled && is_sector_avt() &&
+			_vt_shared_ready && _surface_vt && _surface_vt->is_initialized()) {
+		// The initial split lets SVT make progress, but unused SVT budget belongs
+		// to AVT again. Do not cap near-page throughput at eight forever.
+		const uint64_t started = Time::get_singleton()->get_ticks_usec();
+		const int extra = _produce_sector_avt_pages(vt_remaining);
+		vt_remaining -= extra;
+		_avt_sector_stats["produced"] = avt_produced + extra;
+		_avt_sector_stats["cpu_update_ms"] = double(_avt_sector_stats.get("cpu_update_ms", 0.0)) +
+				double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	}
 	if (svt_baking) {
 		_surface_svt->set_allocation_budget(MAX(0, vt_remaining));
@@ -224,7 +252,7 @@ void Terrain3D::_setup_terrain_mesher() {
 		LOG(DEBUG, "Creating mesher");
 		_terrain_mesher = new Terrain3DMesher();
 	}
-	_terrain_mesher->initialize(this, _mesh_size, _mesh_lods, _tessellation_level, _vertex_spacing, _material->get_material_rid(), _render_layers);
+	_terrain_mesher->initialize(this, _mesh_size, _mesh_lods, _tessellation_level, _vertex_spacing, _material->get_material_rid(), _render_layers, true);
 }
 
 void Terrain3D::_destroy_terrain_mesher(const bool p_final) {
@@ -840,12 +868,6 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		const int half_at_mip = (_surface_svt->get_indirection_size() >> 1) >> mip;
 		const Vector2i address((virtual_x - half_at_mip) << mip, (virtual_y - half_at_mip) << mip);
 		Ref<Image> page;
-		if (_data->produce_sparse_surface_page(address.x, address.y, mip, page_world,
-				_surface_svt->get_page_size(), _surface_svt->get_page_border(), page) < 0 ||
-				!_surface_svt->write_page(slot, page)) {
-			_surface_svt->release_world_page(address.x, address.y, mip);
-			continue;
-		}
 		const float span = page_world * float(1 << mip);
 		_queue_vt_material_page(slot, page, Rect2(Vector2(address) * page_world, Vector2(span, span)), true, mip, address);
 		// A root page is the fallback of last resort. Protecting it leaves at least
@@ -908,12 +930,7 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		allocations++;
 		_invalidate_vt_slot(slot);
 		Ref<Image> page;
-		if (_data->produce_sparse_surface_page(page_x, page_y, mip, page_world,
-				_surface_svt->get_page_size(), _surface_svt->get_page_border(), page) < 0 ||
-				!_surface_svt->write_page(slot, page)) {
-			_surface_svt->release_world_page(page_x, page_y, mip);
-			continue;
-		}
+
 		const float span = page_world * float(1 << mip);
 		const Vector2i address((page_x >> mip) << mip, (page_y >> mip) << mip);
 		_queue_vt_material_page(slot, page, Rect2(Vector2(address) * page_world, Vector2(span, span)), true, mip, address);
@@ -1822,6 +1839,21 @@ void Terrain3D::set_material(const Ref<Terrain3DMaterial> &p_material) {
 	emit_signal("material_changed");
 }
 
+void Terrain3D::set_cdlod_enabled(bool p_enabled) {
+	SET_IF_DIFF(_cdlod_enabled, p_enabled);
+	if (_terrain_mesher) { _terrain_mesher->snap(); }
+}
+void Terrain3D::set_cdlod_patch_size(int p_size) {
+	const int size = int(next_power_of_2(uint32_t(CLAMP(p_size, 8, 128))));
+	SET_IF_DIFF(_cdlod_patch_size, size);
+	if (_terrain_mesher && _material.is_valid()) { _setup_terrain_mesher(); }
+}
+void Terrain3D::set_cdlod_lod_scale(real_t p_scale) {
+	if (!std::isfinite(p_scale)) { return; }
+	SET_IF_DIFF(_cdlod_lod_scale, CLAMP(p_scale, real_t(8), real_t(32)));
+	if (_terrain_mesher) { _terrain_mesher->snap(); }
+}
+
 void Terrain3D::set_mesh_lods(const int p_count) {
 	SET_IF_DIFF(_mesh_lods, CLAMP(p_count, 1, 10));
 	LOG(INFO, "Setting mesh levels: ", _mesh_lods);
@@ -2250,6 +2282,9 @@ void Terrain3D::_notification(const int p_what) {
 				LOG(INFO, "free_editor_textures enabled, reloading Assets path: ", _assets->get_path());
 				_assets = ResourceLoader::get_singleton()->load(_assets->get_path(), "", ResourceLoader::CACHE_MODE_IGNORE);
 			}
+			if (!RS->is_connected("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry))) {
+				RS->connect("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry));
+			}
 			_initialize(); // Rebuild anything freed: meshes, collision, instancer
 			set_physics_process(true);
 			break;
@@ -2353,6 +2388,9 @@ void Terrain3D::_notification(const int p_what) {
 			/// Shut down notifications
 
 		case NOTIFICATION_EXIT_TREE: {
+			if (RS->is_connected("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry))) {
+				RS->disconnect("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry));
+			}
 			_destroy_vt_service();
 			// Node is about to exit a SceneTree
 			// Sent on scene changes
@@ -2587,6 +2625,13 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_physics_material"), &Terrain3D::get_physics_material);
 
 	// Terrain Mesh
+	ClassDB::bind_method(D_METHOD("set_cdlod_enabled", "enabled"), &Terrain3D::set_cdlod_enabled);
+	ClassDB::bind_method(D_METHOD("is_cdlod_enabled"), &Terrain3D::is_cdlod_enabled);
+	ClassDB::bind_method(D_METHOD("set_cdlod_patch_size", "size"), &Terrain3D::set_cdlod_patch_size);
+	ClassDB::bind_method(D_METHOD("get_cdlod_patch_size"), &Terrain3D::get_cdlod_patch_size);
+	ClassDB::bind_method(D_METHOD("set_cdlod_lod_scale", "scale"), &Terrain3D::set_cdlod_lod_scale);
+	ClassDB::bind_method(D_METHOD("get_cdlod_lod_scale"), &Terrain3D::get_cdlod_lod_scale);
+	ClassDB::bind_method(D_METHOD("get_cdlod_stats"), &Terrain3D::get_cdlod_stats);
 	ClassDB::bind_method(D_METHOD("set_mesh_lods", "count"), &Terrain3D::set_mesh_lods);
 	ClassDB::bind_method(D_METHOD("get_mesh_lods"), &Terrain3D::get_mesh_lods);
 	ClassDB::bind_method(D_METHOD("set_mesh_size", "size"), &Terrain3D::set_mesh_size);
@@ -2720,12 +2765,14 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_coarse_mip_fallback"), "set_surface_vt_coarse_mip_fallback", "get_surface_vt_coarse_mip_fallback");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
@@ -2766,6 +2813,10 @@ void Terrain3D::_bind_methods() {
 	// One entry per world mip level, in metres: the largest camera distance still
 	// sampled at that level. Empty = automatic (one level per doubling of the page).
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_svt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT, "float"), "set_surface_svt_mip_distances", "get_surface_svt_mip_distances");
+	ADD_SUBGROUP("CDLOD", "cdlod_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "cdlod_enabled"), "set_cdlod_enabled", "is_cdlod_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "cdlod_patch_size", PROPERTY_HINT_ENUM, "8:8,16:16,32:32,64:64,128:128", PROPERTY_USAGE_STORAGE), "set_cdlod_patch_size", "get_cdlod_patch_size");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cdlod_lod_scale", PROPERTY_HINT_RANGE, "8,32,0.5"), "set_cdlod_lod_scale", "get_cdlod_lod_scale");
 	ADD_SUBGROUP("VT Page", "vt_page_");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "vt_page_status", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY), "", "get_vt_settings");
 	ADD_GROUP("", "");

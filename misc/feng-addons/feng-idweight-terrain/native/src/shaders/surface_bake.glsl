@@ -166,8 +166,11 @@ void main() {
 	uint source_layer = job.indices.x;
 	int border = int(job.page.w + 0.5);
 	vec2 local = vec2(gid.xy) - vec2(float(border)) + vec2(0.5);
-	ivec2 cell = ivec2(floor(local)) + ivec2(border);
-	vec2 cell_local = fract(local);
+	vec2 world_xz = job.world_rect.xy + local * job.page.xy;
+	bool source_grid = job.policy.w > 0.0;
+	vec2 source_position = source_grid ? (world_xz - job.policy.yz) / job.policy.w : local + vec2(border);
+	ivec2 cell = ivec2(floor(source_position));
+	vec2 cell_local = fract(source_position);
 	uint packed_bottom_left = surface_bake_read_id(cell, source_layer);
 	uint packed_bottom_right = surface_bake_read_id(cell + ivec2(1, 0), source_layer);
 	uint packed_top_left = surface_bake_read_id(cell + ivec2(0, 1), source_layer);
@@ -181,8 +184,8 @@ void main() {
 	float h02 = surface_bake_read_height(cell + ivec2(0, 2), source_layer);
 	float h21 = surface_bake_read_height(cell + ivec2(2, 1), source_layer);
 	float h12 = surface_bake_read_height(cell + ivec2(1, 2), source_layer);
-	float dx = max(abs(job.page.x), 1e-5);
-	float dz = max(abs(job.page.y), 1e-5);
+	float dx = max(source_grid ? job.policy.w : abs(job.page.x), 1e-5);
+	float dz = max(source_grid ? job.policy.w : abs(job.page.y), 1e-5);
 	vec3 normal_bottom_left = surface_bake_normal(h00, h10, h01, dx, dz);
 	vec3 normal_bottom_right = surface_bake_normal(h10, h20, h11, dx, dz);
 	vec3 normal_top_left = surface_bake_normal(h01, h11, h02, dx, dz);
@@ -195,8 +198,8 @@ void main() {
 	float height = mix(mix(h00, h10, cell_local.x), mix(h01, h11, cell_local.x), cell_local.y);
 	vec3 vertex = vec3(job.world_rect.x + local.x * job.page.x, height,
 			job.world_rect.y + local.y * job.page.y);
-	vec3 base_ddx = vec3(dx, 0.0, 0.0);
-	vec3 base_ddy = vec3(0.0, 0.0, dz);
+	vec3 base_ddx = vec3(job.page.x, 0.0, 0.0);
+	vec3 base_ddy = vec3(0.0, 0.0, job.page.y);
 
 	vec2 surface_local = cell_local;
 	bool is_lower_left = surface_local.x > surface_local.y;

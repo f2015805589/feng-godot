@@ -8,6 +8,7 @@
 #include <vector>
 
 class Terrain3D;
+class Terrain3DCDLOD;
 
 class Terrain3DMesher {
 	CLASS_NAME_STATIC("Terrain3DMesher");
@@ -26,6 +27,8 @@ public: // Constants
 private:
 	Terrain3D *_terrain = nullptr;
 	RID _scenario = RID();
+	Terrain3DCDLOD *_cdlod = nullptr;
+	bool _allow_cdlod = false;
 	Vector2 _last_target_position = V2_MAX;
 
 	std::vector<RID> _mesh_rids;
@@ -74,10 +77,12 @@ public:
 	~Terrain3DMesher() { destroy(); }
 
 	void initialize(Terrain3D *p_terrain, const int p_mesh_size, const int p_lods, const int p_tessellation_level,
-			const real_t p_vertex_spacing, const RID &p_material, const uint32_t p_render_layers);
+			const real_t p_vertex_spacing, const RID &p_material, const uint32_t p_render_layers, bool p_allow_cdlod = false);
 	void destroy();
 
 	void snap();
+	Dictionary get_cdlod_stats() const;
+	void invalidate_region_geometry();
 	void reset_target_position() { _last_target_position = V2_MAX; }
 	void update();
 	void update_aabbs(const real_t p_cull_margin = -1.f, const Vector2 &p_height_range = V2_MAX);
