@@ -206,7 +206,6 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	Color color = _brush_data["color"];
 	real_t roughness = _brush_data["roughness"];
 
-	bool enable_texture = _brush_data["enable_texture"];
 	bool texture_filter = _brush_data["texture_filter"];
 	int margin = _brush_data["margin"];
 	int asset_id = _brush_data["asset_id"];
@@ -377,7 +376,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 					}
 					case AVERAGE: {
 						real_t avg_default = _terrain->get_material()->get_world_background() == 0u ? srcf : 0.f;
-						real_t avg = _average(AVG_HEIGHT, brush_global_position, srcf, avg_default);
+						real_t avg = _average_scalar(TYPE_HEIGHT, brush_global_position, srcf, avg_default);
 						destf = Math::lerp(srcf, avg, CLAMP(brush_alpha * strength * 2.f, .02f, 1.f));
 						break;
 					}
@@ -571,7 +570,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 								break;
 							}
 							case AVERAGE: {
-								real_t avg = _average(AVG_ROUGHNESS, brush_global_position, src.a, 0.5f);
+								real_t avg = _average_scalar(TYPE_COLOR, brush_global_position, src.a, 0.5f);
 								dest.a = Math::lerp(real_t(dest.a), avg, CLAMP(brush_alpha * strength * 2.f, .0f, 1.f));
 								dest.a = float(int(dest.a * 255.f)) / 255.f;
 								break;
@@ -797,9 +796,9 @@ void Terrain3DEditor::_apply_undo(const Dictionary &p_data) {
 	_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
 }
 
-// Returns average of height, blend (as real_t(0-255)), or roughness. Overloaded version handles average color
-float Terrain3DEditor::_average(const AverageMode p_mode, const Vector3 &p_global_position, const float p_base,
-		const float p_nan_val, bool p_alt) const {
+// Height uses red; roughness uses the color map's alpha channel.
+float Terrain3DEditor::_average_scalar(const MapType p_map_type, const Vector3 &p_global_position, const float p_base,
+		const float p_nan_val) const {
 	IS_DATA_INIT(NAN);
 	Terrain3DData *data = _terrain->get_data();
 	real_t vertex_spacing = _terrain->get_vertex_spacing();
@@ -808,45 +807,20 @@ float Terrain3DEditor::_average(const AverageMode p_mode, const Vector3 &p_globa
 	Vector3 down_position = p_global_position - Vector3(0.f, 0.f, vertex_spacing);
 	Vector3 up_position = p_global_position + Vector3(0.f, 0.f, vertex_spacing);
 
-	MapType map_type;
-	int index;
-	switch (p_mode) {
-		case AVG_HEIGHT:
-			map_type = TYPE_HEIGHT;
-			index = 0; // Red
-			break;
-		case AVG_BLEND:
-			map_type = TYPE_CONTROL;
-			index = 0; // Red
-			break;
-		case AVG_ROUGHNESS:
-			map_type = TYPE_COLOR;
-			index = 3; // Alpha
-			break;
-		default:
-			break;
-	}
+	const int index = p_map_type == TYPE_COLOR ? 3 : 0;
 
 	Color pixel;
 	float left, right, up, down;
-	pixel = data->get_pixel(map_type, left_position);
+	pixel = data->get_pixel(p_map_type, left_position);
 	left = std::isnan(pixel.r) ? p_nan_val : pixel[index];
-	pixel = data->get_pixel(map_type, right_position);
+	pixel = data->get_pixel(p_map_type, right_position);
 	right = std::isnan(pixel.r) ? p_nan_val : pixel[index];
-	pixel = data->get_pixel(map_type, up_position);
+	pixel = data->get_pixel(p_map_type, up_position);
 	up = std::isnan(pixel.r) ? p_nan_val : pixel[index];
-	pixel = data->get_pixel(map_type, down_position);
+	pixel = data->get_pixel(p_map_type, down_position);
 	down = std::isnan(pixel.r) ? p_nan_val : pixel[index];
 
-	if (p_mode == AVG_BLEND) {
-		if (p_alt) {
-			return (get_blend(p_base) + get_blend(left) + get_blend(right) + get_blend(up) + get_blend(down)) * 0.2f;
-		} else {
-			return Math::lerp(float(get_blend(p_base)), 128.f, .1f);
-		}
-	} else {
-		return (p_base + left + right + up + down) * 0.2f;
-	}
+	return (p_base + left + right + up + down) * 0.2f;
 }
 
 Color Terrain3DEditor::_average(const Vector3 &p_global_position, const Color &p_base) const {

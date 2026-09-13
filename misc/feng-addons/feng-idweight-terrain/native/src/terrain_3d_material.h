@@ -113,14 +113,18 @@ private:
 	bool _pbr_view_tex_rough = false;
 
 	// Functions
+	bool _shader_uses_vt = true;
+	bool _needs_vt_shader() const;
 	void _preload_shaders();
 	void _parse_shader(const String &p_shader, const String &p_name);
 	String _apply_inserts(const String &p_shader, const Array &p_excludes = Array()) const;
+	void _append_layout_excludes(Array &excludes) const;
 	String _generate_shader_code() const;
 	String _generate_buffer_shader_code() const;
 	String _strip_comments(const String &p_shader) const;
 	String _inject_editor_code(const String &p_shader) const;
 	void _update_shader();
+	void _update_vt_uniforms(const RID &p_material);
 	void _update_uniforms(const RID &p_material, const uint32_t p_update = UNIFORMS_ONLY);
 	void _set_shader_parameters(const Dictionary &p_dict);
 	Dictionary _get_shader_parameters() const { return _shader_params; }

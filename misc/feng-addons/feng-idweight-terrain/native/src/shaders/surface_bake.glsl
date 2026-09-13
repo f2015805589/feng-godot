@@ -216,17 +216,10 @@ void main() {
 		w2 = surface_local.x;
 	}
 
-	IdWeightContributions values = IdWeightContributions(
-			0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
-	float overlay_weight = 0.0;
-	hydra_idweight_add_vertex(p0, w0, values, overlay_weight);
-	hydra_idweight_add_vertex(p1, w1, values, overlay_weight);
-	hydra_idweight_add_vertex(p2, w2, values, overlay_weight);
 	float residual_selector = hydra_idweight_stochastic_coverage01_with_salt(vertex, 0x68bc21ebu);
 	uvec3 material_ids;
 	vec3 material_weights;
 	uint material_count;
-	hydra_idweight_select_budgeted_3(values, residual_selector, material_ids, material_weights, material_count);
 
 	float triplanar_factor = hydra_idweight_get_triplanar_factor(normal_ws);
 	vec3 triplanar_weights = hydra_idweight_get_triplanar_weights(normal_ws);
@@ -239,7 +232,7 @@ void main() {
 	float slope_distance_blend = clamp(job.policy.x, 0.0, 1.0);
 	IdWeightContributions pair_values = IdWeightContributions(
 			0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
-	overlay_weight = 0.0;
+	float overlay_weight = 0.0;
 	surface_bake_add_pair_vertex(p0, w0, packed_bottom_left, packed_bottom_right,
 			packed_top_left, packed_top_right, surface_local, slope_distance_blend,
 			projection_axis, normal_ws, base_ddx, base_ddy, vertex, pair_values, overlay_weight);

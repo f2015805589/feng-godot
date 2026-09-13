@@ -324,7 +324,9 @@ uint32_t Terrain3DVirtualTexture::_read_level(const int p_x, const int p_y, cons
 		return INVALID_SLOT;
 	}
 	const int64_t offset = int64_t(_level_offsets[p_mip]) + (int64_t(p_y) * size + p_x) * 4;
-	return uint32_t(_bytes.decode_float(offset));
+	float value;
+	std::memcpy(&value, _bytes.ptr() + offset, sizeof(value));
+	return uint32_t(value);
 }
 
 void Terrain3DVirtualTexture::_write_level(const int p_x, const int p_y, const int p_mip, const uint32_t p_slot) {
@@ -336,7 +338,12 @@ void Terrain3DVirtualTexture::_write_level(const int p_x, const int p_y, const i
 		return;
 	}
 	const int64_t offset = int64_t(_level_offsets[p_mip]) + (int64_t(p_y) * size + p_x) * 4;
-	_bytes.encode_float(offset, real_t(p_slot));
+	float old_value;
+	std::memcpy(&old_value, _bytes.ptr() + offset, sizeof(old_value));
+	if (uint32_t(old_value) == p_slot) { return; }
+	const float value = float(p_slot);
+	std::memcpy(_bytes.ptrw() + offset, &value, sizeof(value));
+	_dirty_tiles.insert((uint64_t(p_mip) << 32) | (uint64_t(p_y >> 4) << 16) | uint64_t(p_x >> 4));
 	_indirection_dirty = true;
 }
 
@@ -407,22 +414,13 @@ void Terrain3DVirtualTexture::_release_sector_pages(const Vector2i &p_sector,
 	if (!_page_pool) {
 		return;
 	}
-	const int max_mip = log2_power_of_two(p_info.size);
-	for (int mip = 0; mip <= max_mip; mip++) {
-		const int pages = std::max(1, p_info.size >> mip);
-		const int origin_x = p_info.origin_x >> mip;
-		const int origin_y = p_info.origin_y >> mip;
-		for (int y = 0; y < pages; y++) {
-			for (int x = 0; x < pages; x++) {
-				const int virtual_x = origin_x + x;
-				const int virtual_y = origin_y + y;
-				const uint32_t slot = _read_level(virtual_x, virtual_y, mip);
-				if (slot == INVALID_SLOT) {
-					continue;
-				}
-				_write_level(virtual_x, virtual_y, mip, INVALID_SLOT);
-				_page_pool->remove_owner(slot, this, virtual_x, virtual_y, mip);
-			}
+	// Traverse resident owners, not the potentially millions of virtual addresses.
+	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
+		const auto owners = _page_pool->slot_owners[slot];
+		for (const Terrain3DVTPageOwner &owner : owners) {
+			if (owner.texture != this || owner.sector_x != p_sector.x || owner.sector_y != p_sector.y) { continue; }
+			_write_level(owner.virtual_x, owner.virtual_y, owner.mip, INVALID_SLOT);
+			_page_pool->remove_owner(slot, this, owner.virtual_x, owner.virtual_y, owner.mip);
 		}
 	}
 }
@@ -442,17 +440,11 @@ bool Terrain3DVirtualTexture::_remap_sector_pages(const Vector2i &p_sector,
 	};
 	std::vector<CachedPage> cached;
 	const int old_max_mip = log2_power_of_two(p_old_info.size);
-	for (int mip = 0; mip <= old_max_mip; mip++) {
-		const int pages = std::max(1, p_old_info.size >> mip);
-		const int origin_x = p_old_info.origin_x >> mip;
-		const int origin_y = p_old_info.origin_y >> mip;
-		for (int y = 0; y < pages; y++) {
-			for (int x = 0; x < pages; x++) {
-				const uint32_t slot = _read_level(origin_x + x, origin_y + y, mip);
-				if (slot != INVALID_SLOT) {
-					cached.push_back({ slot, origin_x + x, origin_y + y, mip, x, y });
-				}
-			}
+	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
+		for (const Terrain3DVTPageOwner &owner : _page_pool->slot_owners[slot]) {
+			if (owner.texture != this || owner.sector_x != p_sector.x || owner.sector_y != p_sector.y) { continue; }
+			cached.push_back({slot, owner.virtual_x, owner.virtual_y, owner.mip,
+					owner.virtual_x - (p_old_info.origin_x >> owner.mip), owner.virtual_y - (p_old_info.origin_y >> owner.mip)});
 		}
 	}
 
@@ -651,6 +643,9 @@ void Terrain3DVirtualTexture::clear() {
 		_page_pool->detach_texture(this);
 	}
 	_indirection.clear();
+	_indirection_gpu.unref();
+	_dirty_tiles.clear();
+	_indirection_uploaded_bytes = 0;
 	_indirection_image.unref();
 	_bytes.clear();
 	_level_offsets.clear();
@@ -1057,11 +1052,37 @@ Array Terrain3DVirtualTexture::get_slot_owner_metadata(const int p_slot) const {
 
 void Terrain3DVirtualTexture::commit() {
 	if (!_indirection_dirty) {
+		if (_indirection_gpu.is_valid() && _indirection_gpu->needs_retry()) {
+			_indirection_gpu->submit({});
+		}
 		return;
 	}
-	// The whole chain is re-created from `_bytes` and uploaded. A per-texel partial
-	// update would be the next optimisation; Hydra's budget is 64 indirection writes
-	// per frame, which is small enough that this is not the bottleneck yet.
+	if (RS->get_rendering_device()) {
+		if (_indirection_gpu.is_null()) {
+			_indirection_gpu.instantiate();
+			_indirection_gpu->initialize(_indirection_size, _level_count, _bytes);
+			_indirection_uploaded_bytes += _bytes.size();
+		} else {
+			std::vector<Terrain3DVTIndirection::Patch> patches;
+			for (uint64_t tile : _dirty_tiles) {
+				const int mip = int(tile >> 32), x = int(tile & 0xffff) * 16, y = int((tile >> 16) & 0xffff) * 16;
+				const int width = std::min(16, _level_sizes[mip] - x), height = std::min(16, _level_sizes[mip] - y);
+				Terrain3DVTIndirection::Patch patch = {mip, x, y, width, height};
+				patch.bytes.resize(width * height * 4);
+				uint8_t *output = patch.bytes.ptrw();
+				const uint8_t *source = _bytes.ptr() + _level_offsets[mip] + (int64_t(y) * _level_sizes[mip] + x) * 4;
+				for (int row = 0; row < height; ++row) { std::memcpy(output + row * width * 4, source + int64_t(row) * _level_sizes[mip] * 4, width * 4); }
+				_indirection_uploaded_bytes += patch.bytes.size();
+				patches.push_back(std::move(patch));
+			}
+			_indirection_gpu->submit(std::move(patches));
+		}
+		_dirty_tiles.clear();
+		_indirection_dirty = false;
+		_commit_count++;
+		return;
+	}
+	// Compatibility renderers without RenderingDevice use the full image path.
 	_indirection_image = Image::create_from_data(_indirection_size, _indirection_size, true,
 			Image::FORMAT_RF, _bytes);
 	if (_indirection_image.is_null()) {
@@ -1080,6 +1101,7 @@ void Terrain3DVirtualTexture::commit() {
 
 Dictionary Terrain3DVirtualTexture::get_stats() const {
 	Dictionary stats;
+	stats["indirection_uploaded_bytes"] = int64_t(_indirection_uploaded_bytes);
 	stats["page_size"] = _page_size;
 	stats["page_border"] = _page_border;
 	stats["stored_page_size"] = _stored_page_size;
@@ -1087,7 +1109,7 @@ Dictionary Terrain3DVirtualTexture::get_stats() const {
 	stats["indirection_size"] = _indirection_size;
 	stats["indirection_mips"] = _level_count;
 	stats["atlas_valid"] = _page_pool && _page_pool->atlas.get_rid().is_valid();
-	stats["indirection_valid"] = _indirection.get_rid().is_valid();
+	stats["indirection_valid"] = get_indirection_rid().is_valid();
 	stats["alloc_count"] = _page_pool ? _page_pool->alloc_count : 0;
 	stats["evict_count"] = _page_pool ? _page_pool->evict_count : 0;
 	stats["hit_count"] = _hit_count;

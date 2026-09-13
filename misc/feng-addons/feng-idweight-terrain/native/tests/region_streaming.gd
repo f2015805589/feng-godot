@@ -274,6 +274,47 @@ func test_directory_switch_keeps_working() -> void:
 	require(streamer.unload_region(Vector2i(1, 1)), "unload after a data rebuild")
 	require(not resident(Vector2i(1, 1)), "the region should be gone")
 
+func test_save_without_directory() -> void:
+	var unsaved := Terrain3D.new()
+	unsaved.region_size = REGION_SIZE
+	scene.add_child(unsaved)
+	unsaved.set_camera(camera)
+	unsaved.set_clipmap_target(camera)
+	unsaved.set_physics_process(false)
+	unsaved.data.add_region_blank(Vector2i.ZERO)
+	var loader := unsaved.get_streamer()
+	loader.load_region(Vector2i.ZERO)
+	loader.set_protect_modified(false)
+	loader.set_save_on_unload(true)
+	unsaved.data.get_region(Vector2i.ZERO).set_modified(true)
+	require(not loader.unload_region(Vector2i.ZERO), "save-on-unload without a directory must keep edits resident")
+	require(unsaved.data.get_region(Vector2i.ZERO) != null, "failed save preserves region data")
+	require(loader.get_streamed_count() == 1, "failed save preserves streaming ownership for retry")
+	require(loader.get_failed_total() == 1, "failed save is reported in telemetry")
+	unsaved.queue_free()
+
+func test_desired_order() -> void:
+	var previous_radius := streamer.get_load_radius()
+	var previous_unload := streamer.get_unload_radius()
+	for radius in [0, 1, 3, 16]:
+		streamer.set_load_radius(radius)
+		for center in [Vector2i.ZERO, Vector2i(-64, 63), Vector2i(63, -64)]:
+			var expected := []
+			for y in range(-radius, radius + 1):
+				for x in range(-radius, radius + 1):
+					var location: Vector2i = center + Vector2i(x, y)
+					if Terrain3DData.get_region_map_index(location) >= 0:
+						expected.append(location)
+			expected.sort_custom(func(a, b):
+				var da: int = maxi(absi(a.x - center.x), absi(a.y - center.y))
+				var db: int = maxi(absi(b.x - center.x), absi(b.y - center.y))
+				if da != db: return da < db
+				return a.y < b.y if a.y != b.y else a.x < b.x)
+			require(streamer.get_desired_locations(center_of(center)) == expected,
+				"desired region order matches distance/y/x priority at radius %d" % radius)
+	streamer.set_load_radius(previous_radius)
+	streamer.set_unload_radius(previous_unload)
+
 func run() -> void:
 	watchdog()
 	scene = Node3D.new()
@@ -306,6 +347,8 @@ func run() -> void:
 	streamer.set_max_resident(0)
 
 	build_fixture()
+	test_desired_order()
+	test_save_without_directory()
 
 	if not failed:
 		test_ring_and_budget()

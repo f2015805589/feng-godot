@@ -48,7 +48,6 @@ void Terrain3DInstancer::_process_updates() {
 				continue;
 			}
 			for (int mesh_id = 0; mesh_id < mesh_count; mesh_id++) {
-				auto pair = std::make_pair(region_loc, mesh_id);
 				if (region->get_instances().has(mesh_id)) {
 					_update_mmi_by_region(region, mesh_id);
 				}
@@ -494,12 +493,30 @@ RID Terrain3DInstancer::_create_multimesh(const int p_mesh_id, const int p_lod, 
 	mm = RS->multimesh_create();
 	RS->multimesh_allocate_data(mm, p_xforms.size(), RenderingServer::MULTIMESH_TRANSFORM_3D, true, false, false);
 	RS->multimesh_set_mesh(mm, mesh->get_rid());
+	// RenderingServer's 3D layout is three transform rows followed by RGBA.
+	// One buffer submission replaces two server calls for every instance.
+	PackedFloat32Array buffer;
+	buffer.resize(p_xforms.size() * 16);
+	float *output = buffer.ptrw();
 	for (int i = 0; i < p_xforms.size(); i++) {
-		RS->multimesh_instance_set_transform(mm, i, p_xforms[i]);
-		if (i < p_colors.size()) {
-			RS->multimesh_instance_set_color(mm, i, p_colors[i]);
+		const Transform3D transform = p_xforms[i];
+		float *instance = output + int64_t(i) * 16;
+		for (int row = 0; row < 3; row++) {
+			for (int column = 0; column < 3; column++) {
+				instance[row * 4 + column] = transform.basis[row][column];
+			}
+			instance[row * 4 + 3] = transform.origin[row];
 		}
+		if (i < p_colors.size()) {
+			const Color color = p_colors[i];
+			instance[12] = color.r;
+			instance[13] = color.g;
+			instance[14] = color.b;
+			instance[15] = color.a;
+		}
+		// Missing colors retain the engine's zero-filled allocation default.
 	}
+	RS->multimesh_set_buffer(mm, buffer);
 	return mm;
 }
 
@@ -831,6 +848,7 @@ void Terrain3DInstancer::remove_instances(const Vector3 &p_global_position, cons
 			}
 			Ref<Terrain3DMeshAsset> mesh_asset = _terrain->get_assets()->get_mesh_asset(m);
 			real_t mesh_height_offset = mesh_asset->get_height_offset();
+			bool removed_instances = false;
 			for (int c = 0; c < cell_queue.size(); c++) {
 				Vector2i cell = cell_queue[c];
 				Array triple = cell_inst_dict[cell];
@@ -843,7 +861,6 @@ void Terrain3DInstancer::remove_instances(const Vector3 &p_global_position, cons
 					Transform3D t = xforms[i];
 					// Use localised ring center
 					real_t radial_distance = localised_ring_center.distance_to(Vector2(t.origin.x, t.origin.z));
-					Vector3 height_offset = t.basis.get_column(1) * mesh_height_offset;
 					if (radial_distance >= radius || UtilityFunctions::randf() >= CLAMP(0.175f * strength, 0.005f, 10.f)) {
 						updated_xforms.push_back(t);
 						updated_colors.push_back(colors[i]);
@@ -858,6 +875,10 @@ void Terrain3DInstancer::remove_instances(const Vector3 &p_global_position, cons
 					}
 					_backup_region(region);
 				}
+				if (updated_xforms.size() == xforms.size()) {
+					continue;
+				}
+				removed_instances = true;
 				if (updated_xforms.size() > 0) {
 					triple[0] = updated_xforms;
 					triple[1] = updated_colors;
@@ -871,7 +892,9 @@ void Terrain3DInstancer::remove_instances(const Vector3 &p_global_position, cons
 			if (cell_inst_dict.is_empty()) {
 				mesh_inst_dict.erase(m);
 			}
-			update_mmis(m, region_loc);
+			if (removed_instances) {
+				update_mmis(m, region_loc);
+			}
 		}
 	}
 }
@@ -902,12 +925,17 @@ void Terrain3DInstancer::add_transforms(const int p_mesh_id, const TypedArray<Tr
 		return;
 	}
 
-	Dictionary xforms_dict;
-	Dictionary colors_dict;
+	struct RegionAppend {
+		Vector2i location;
+		TypedArray<Transform3D> transforms;
+		PackedColorArray colors;
+	};
+	std::vector<RegionAppend> regions;
+	std::unordered_map<Vector2i, size_t, Vector2iHash> region_indices;
 	Ref<Terrain3DMeshAsset> mesh_asset = _terrain->get_assets()->get_mesh_asset(p_mesh_id);
 	real_t height_offset = mesh_asset->get_height_offset();
 
-	// Separate incoming transforms/colors by region Dict{ region_loc => Array() }
+	// Group writable arrays without repeatedly detaching packed colors from a Dictionary.
 	LOG(INFO, "Separating ", p_xforms.size(), " transforms and ", p_colors.size(), " colors into regions");
 	for (int i = 0; i < p_xforms.size(); i++) {
 		// Get adjusted xform/color
@@ -920,24 +948,18 @@ void Terrain3DInstancer::add_transforms(const int p_mesh_id, const TypedArray<Tr
 
 		// Store by region offset
 		Vector2i region_loc = _terrain->get_data()->get_region_location(trns.origin);
-		if (!xforms_dict.has(region_loc)) {
-			xforms_dict[region_loc] = TypedArray<Transform3D>();
-			colors_dict[region_loc] = PackedColorArray();
+		auto [entry, inserted] = region_indices.emplace(region_loc, regions.size());
+		if (inserted) {
+			regions.push_back({region_loc, TypedArray<Transform3D>(), PackedColorArray()});
 		}
-		TypedArray<Transform3D> xforms = xforms_dict[region_loc];
-		PackedColorArray colors = colors_dict[region_loc];
-		xforms.push_back(trns);
-		colors.push_back(col);
-		colors_dict[region_loc] = colors; // Note similar bug as godot-cpp#1149 needs this for PCA
+		RegionAppend &pending = regions[entry->second];
+		pending.transforms.push_back(trns);
+		pending.colors.push_back(col);
 	}
 
 	// Merge incoming transforms with existing transforms
-	Array region_locations = xforms_dict.keys();
-	for (const Vector2i &region_loc : region_locations) {
-		TypedArray<Transform3D> xforms = xforms_dict[region_loc];
-		PackedColorArray colors = colors_dict[region_loc];
-		//LOG(MESG, "Appending ", xforms.size(), " xforms, ", colors, " colors to region location: ", region_loc);
-		append_location(region_loc, p_mesh_id, xforms, colors, p_update);
+	for (const RegionAppend &region : regions) {
+		append_location(region.location, p_mesh_id, region.transforms, region.colors, p_update);
 	}
 }
 
@@ -978,33 +1000,40 @@ void Terrain3DInstancer::append_region(const Ref<Terrain3DRegion> &p_region, con
 
 	Dictionary cell_locations = p_region->get_instances()[p_mesh_id];
 	int region_size = p_region->get_region_size();
+	struct CellAppend {
+		Vector2i location;
+		Array triple;
+		TypedArray<Transform3D> transforms;
+		PackedColorArray colors;
+	};
+	std::vector<CellAppend> cells;
+	std::unordered_map<Vector2i, size_t, Vector2iHash> cell_indices;
 
 	for (int i = 0; i < p_xforms.size(); i++) {
 		Transform3D xform = p_xforms[i];
-		Color col = p_colors[i];
 		Vector2i cell = _get_cell(xform.origin, region_size);
-
-		// Get current instance arrays or create if none
-		Array triple = cell_locations[cell];
-		bool modified = true;
-		if (triple.size() != 3) {
-			LOG(DEBUG, "No data at ", p_region->get_location(), ":", cell, ". Creating triple");
-			triple.resize(3);
-			triple[0] = TypedArray<Transform3D>();
-			triple[1] = PackedColorArray();
-			triple[2] = modified;
+		auto [entry, inserted] = cell_indices.emplace(cell, cells.size());
+		if (inserted) {
+			Array triple = cell_locations[cell];
+			if (triple.size() != 3) {
+				triple.resize(3);
+				triple[0] = TypedArray<Transform3D>();
+				triple[1] = PackedColorArray();
+			}
+			cells.push_back({cell, triple, triple[0], triple[1]});
 		}
-		TypedArray<Transform3D> xforms = triple[0];
-		PackedColorArray colors = triple[1];
-		xforms.push_back(xform);
-		colors.push_back(col);
-
-		// Must write back since there are copy constructors somewhere
-		// see godot-cpp#1149
-		triple[0] = xforms;
-		triple[1] = colors;
-		triple[2] = modified;
-		cell_locations[cell] = triple;
+		CellAppend &pending = cells[entry->second];
+		pending.transforms.push_back(xform);
+		pending.colors.push_back(p_colors[i]);
+	}
+	// Keep each packed array writable until the batch is complete. Re-reading it
+	// from the Dictionary per instance forced a copy of all preceding colors.
+	// First-seen cell order and within-cell instance order remain unchanged.
+	for (CellAppend &cell : cells) {
+		cell.triple[0] = cell.transforms;
+		cell.triple[1] = cell.colors;
+		cell.triple[2] = true;
+		cell_locations[cell.location] = cell.triple;
 	}
 
 	// Write back dictionary. See above comments

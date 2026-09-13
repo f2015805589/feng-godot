@@ -124,15 +124,6 @@ static void encode_vec4(PackedByteArray &r_data, int64_t p_offset, float p_x, fl
 	r_data.encode_float(p_offset + 12, p_w);
 }
 
-static bool image_matches(const Ref<Image> &p_image, int p_size, Image::Format p_format,
-		int p_bytes_per_pixel) {
-	if (p_image.is_null() || p_image->is_empty() || p_image->get_width() != p_size ||
-			p_image->get_height() != p_size || p_image->has_mipmaps() || p_image->get_format() != p_format) {
-		return false;
-	}
-	return p_image->get_data().size() == int64_t(p_size) * p_size * p_bytes_per_pixel;
-}
-
 } // namespace
 
 ///////////////////////////
@@ -379,7 +370,7 @@ bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 	return true;
 }
 
-bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation, int p_page_size, int p_border,
+bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		int p_page_count, int p_stored_size, const RID &p_albedo_array_rs, const RID &p_normal_array_rs,
 		const PackedByteArray &p_material_bytes) {
 	RenderingServer *server = RenderingServer::get_singleton();
@@ -499,8 +490,6 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation, int p_page_
 		_resources = next;
 		_resource_generation = p_generation;
 	}
-	(void)p_page_size;
-	(void)p_border;
 	return true;
 }
 
@@ -967,7 +956,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		_invalidate_all = _invalidate_all || invalidate_all;
 		return;
 	}
-	if (!_ensure_resources(generation, page_size, border, page_count, stored_size,
+	if (!_ensure_resources(generation, page_count, stored_size,
 				material_albedo, material_normal, material_bytes)) {
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (const auto &entry : pending) {

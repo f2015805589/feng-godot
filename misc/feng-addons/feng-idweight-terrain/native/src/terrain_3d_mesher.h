@@ -4,6 +4,8 @@
 #define TERRAIN3D_MESHER_CLASS_H
 
 #include "constants.h"
+#include <array>
+#include <vector>
 
 class Terrain3D;
 
@@ -19,9 +21,6 @@ public: // Constants
 		FILL_B,
 		STANDARD_TRIM_A,
 		STANDARD_TRIM_B,
-		STANDARD_TILE,
-		STANDARD_EDGE_A,
-		STANDARD_EDGE_B,
 	};
 
 private:
@@ -29,9 +28,15 @@ private:
 	RID _scenario = RID();
 	Vector2 _last_target_position = V2_MAX;
 
-	Array _mesh_rids;
-	// LODs -> MeshTypes -> Instances
-	Array _clipmap_rids;
+	std::vector<RID> _mesh_rids;
+	// Five ordered groups: tiles, two edges, two fills (trims at LOD0).
+	struct ClipmapInstance {
+		RID rid;
+		Transform3D transform;
+		bool positioned = false;
+	};
+	using ClipmapLevel = std::array<std::vector<ClipmapInstance>, 5>;
+	std::vector<ClipmapLevel> _clipmap_rids;
 
 	// Mesh offset data
 	// LOD0 only

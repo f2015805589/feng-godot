@@ -79,6 +79,9 @@ private:
 	int _vt_pages_per_update = 4;
 	bool _vt_adaptive_enabled = true;
 	bool _vt_debug_direct_material = false;
+	bool _vt_editor_preview = true;
+	Dictionary _vt_editor_dirty_regions;
+	uint64_t _vt_service_frame = UINT64_MAX;
 	bool _vt_shared_ready = false;
 	bool _vt_materials_dirty = true;
 	bool _vt_callback_registered = false;
@@ -131,9 +134,12 @@ private:
 	Dictionary _avt_sector_stats;
 	struct AVTPageRequest { Vector2i owner; int mip, x, y; Rect2 rect; };
 	std::vector<AVTPageRequest> _avt_page_plan;
+	std::vector<AVTPageRequest> _avt_prefetch_plan;
 	PackedByteArray _avt_plan_key;
 	std::vector<Vector2i> _avt_registered_owners;
 	std::unordered_map<uint64_t, int> _avt_allocated_sizes;
+	struct AVTCachedAddress { Vector2i location; Vector2i owner; int level; };
+	std::unordered_map<uint64_t, AVTCachedAddress> _avt_cached_addresses;
 	int _produce_sector_avt_pages(int p_max_pages);
 	int _update_sector_avt(int p_max_pages);
 	mutable bool _vt_view_focus_valid = false;
@@ -142,7 +148,9 @@ private:
 	real_t _surface_vt_forward_regions = 0.f;
 	real_t _surface_vt_texels_per_pixel = 1.f;
 	real_t _surface_vt_texels_per_meter = 1024.f;
-	PackedFloat32Array _surface_vt_mip_distances;
+	PackedFloat32Array _surface_vt_mip_distances; // Legacy serialized array.
+	bool _surface_vt_distance_mips = false;
+	Vector3 _surface_vt_mip_ranges = Vector3(8, 16, 32);
 	bool _surface_vt_force_mip = false;
 	int _surface_vt_mip = 0;
 	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
@@ -340,6 +348,9 @@ public:
 	int get_vt_pages_per_update() const { return _vt_pages_per_update; }
 	void set_vt_adaptive_enabled(bool p_enabled);
 	bool is_vt_adaptive_enabled() const { return _vt_adaptive_enabled; }
+	void set_vt_editor_preview(bool p_enabled);
+	bool is_vt_editor_preview() const { return _vt_editor_preview; }
+	bool is_vt_editor_preview_active() const;
 	void set_vt_debug_direct_material(bool p_enabled);
 	bool is_vt_debug_direct_material() const { return _vt_debug_direct_material; }
 	Dictionary get_vt_settings() const;
@@ -397,6 +408,17 @@ public:
 	real_t get_surface_vt_texels_per_meter() const { return _surface_vt_texels_per_meter; }
 	void set_surface_svt_texels_per_meter(real_t p_value);
 	real_t get_surface_svt_texels_per_meter() const { return _vt_page_size / _surface_svt_page_world; }
+	void set_surface_vt_distance_mips(bool p_enabled);
+	bool is_surface_vt_distance_mips() const { return _surface_vt_distance_mips; }
+	void set_surface_vt_mip_ranges(const Vector3 &p_ranges);
+	Vector3 get_surface_vt_mip_ranges() const { return _surface_vt_mip_ranges; }
+	float get_surface_vt_distance_lod(float p_distance) const;
+	void set_surface_vt_mip0_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.x = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip0_distance() const { return _surface_vt_mip_ranges.x; }
+	void set_surface_vt_mip1_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.y = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip1_distance() const { return _surface_vt_mip_ranges.y; }
+	void set_surface_vt_mip2_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.z = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip2_distance() const { return _surface_vt_mip_ranges.z; }
 	void set_surface_vt_mip_distances(const PackedFloat32Array &p_distances);
 	PackedFloat32Array get_surface_vt_mip_distances() const { return _surface_vt_mip_distances; }
 	int get_surface_vt_mip_for_distance(real_t p_distance) const;
@@ -467,7 +489,7 @@ public:
 	// virtual texture tier is enabled: with both off the array is the only source, and a
 	// blank array would render every texel as material 0.
 	bool is_surface_array_upload_needed() const {
-		return _surface_array_enabled || (!_surface_vt_enabled && !_surface_svt_enabled);
+		return is_vt_editor_preview_active() || _surface_array_enabled || (!_surface_vt_enabled && !_surface_svt_enabled);
 	}
 	// Drops the pages that carry a region's surface, so an edit is re-produced instead
 	// of being served stale from either virtual texture.

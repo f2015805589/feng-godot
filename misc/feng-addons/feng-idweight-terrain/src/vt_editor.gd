@@ -38,11 +38,8 @@ var page_size_spin: SpinBox
 var page_border_spin: SpinBox
 var page_count_spin: SpinBox
 var pages_per_update_spin: SpinBox
-var avt_grid_x_spin: SpinBox
-var avt_grid_z_spin: SpinBox
-var avt_offset_x_spin: SpinBox
-var avt_offset_z_spin: SpinBox
-var avt_forward_regions_spin: SpinBox
+var avt_distance_spin: SpinBox
+var editor_preview_button: CheckButton
 var adaptive_button: CheckButton
 var avt_density_spin: SpinBox
 var svt_density_spin: SpinBox
@@ -415,7 +412,7 @@ func _build_settings_panel() -> VBoxContainer:
 	grid.add_child(_make_setting_label("AVT coverage"))
 	avt_mode_option = OptionButton.new()
 	avt_mode_option.name = "AVTCoverage"
-	avt_mode_option.add_item("AVT region grid / 64 m sectors", 2)
+	avt_mode_option.add_item("Camera range / 64 m sectors", 2)
 	avt_mode_option.add_item("Legacy region view", 0)
 	avt_mode_option.add_item("Legacy target grid", 1)
 	avt_mode_option.item_selected.connect(_on_avt_mode_selected)
@@ -437,36 +434,18 @@ func _build_settings_panel() -> VBoxContainer:
 	avt_band_grid = GridContainer.new()
 	avt_band_grid.columns = 2
 	panel.add_child(avt_band_grid)
-	grid.add_child(_make_setting_label("AVT grid X (terrain blocks)"))
-	avt_grid_x_spin = _make_spin(1, 64, 1)
-	avt_grid_x_spin.name = "AVTRegionGridX"
-	avt_grid_x_spin.tooltip_text = "Visible AVT region grid width in terrain tiles"
-	avt_grid_x_spin.value_changed.connect(_on_avt_region_value_changed.bind("grid_x"))
-	grid.add_child(avt_grid_x_spin)
-	grid.add_child(_make_setting_label("AVT grid Z (terrain blocks)"))
-	avt_grid_z_spin = _make_spin(1, 64, 1)
-	avt_grid_z_spin.name = "AVTRegionGridZ"
-	avt_grid_z_spin.tooltip_text = "Visible AVT region grid depth in terrain tiles"
-	avt_grid_z_spin.value_changed.connect(_on_avt_region_value_changed.bind("grid_z"))
-	grid.add_child(avt_grid_z_spin)
-	grid.add_child(_make_setting_label("AVT region offset X"))
-	avt_offset_x_spin = _make_spin(-512, 512, 1)
-	avt_offset_x_spin.name = "AVTRegionOffsetX"
-	avt_offset_x_spin.tooltip_text = "AVT grid origin offset in terrain tiles"
-	avt_offset_x_spin.value_changed.connect(_on_avt_region_value_changed.bind("offset_x"))
-	grid.add_child(avt_offset_x_spin)
-	grid.add_child(_make_setting_label("AVT region offset Z"))
-	avt_offset_z_spin = _make_spin(-512, 512, 1)
-	avt_offset_z_spin.name = "AVTRegionOffsetZ"
-	avt_offset_z_spin.tooltip_text = "AVT grid origin offset in terrain tiles"
-	avt_offset_z_spin.value_changed.connect(_on_avt_region_value_changed.bind("offset_z"))
-	grid.add_child(avt_offset_z_spin)
-	grid.add_child(_make_setting_label("AVT forward regions"))
-	avt_forward_regions_spin = _make_spin(-64, 64, 0.25)
-	avt_forward_regions_spin.name = "AVTForwardRegions"
-	avt_forward_regions_spin.tooltip_text = "Move the AVT grid along the target forward direction in terrain tiles"
-	avt_forward_regions_spin.value_changed.connect(_on_avt_region_value_changed.bind("forward_regions"))
-	grid.add_child(avt_forward_regions_spin)
+	grid.add_child(_make_setting_label("AVT range (metres)"))
+	avt_distance_spin = _make_spin(64, 65536, 64)
+	avt_distance_spin.name = "AVTRange"
+	avt_distance_spin.tooltip_text = "Camera-centred near field across terrain blocks. The outer 25% blends into SVT; page count stays bounded."
+	avt_distance_spin.value_changed.connect(_on_avt_range_changed)
+	grid.add_child(avt_distance_spin)
+	editor_preview_button = CheckButton.new()
+	editor_preview_button.name = "VTEditorPreview"
+	editor_preview_button.text = "Editor live material preview"
+	editor_preview_button.tooltip_text = "Editor only: show brush edits directly and pause VT streaming and automatic baking. Disable to inspect runtime VT. Explicit Bake remains available."
+	editor_preview_button.toggled.connect(_on_editor_preview_toggled)
+	panel.add_child(editor_preview_button)
 	adaptive_button = CheckButton.new()
 	adaptive_button.name = "AdaptiveAVT"
 	adaptive_button.text = "Adaptive AVT allocation"
@@ -610,6 +589,8 @@ func _refresh_header() -> void:
 		summary_label.text += "\nFull AVT · 64 m sectors: %d visible, %d independent · %d shared coarse pages · max allocated %d texels" % [
 			int(sectors.get("visible_sectors", 0)), int(sectors.get("independent_sectors", 0)),
 			int(sectors.get("coarse_pages", 0)), int(sectors.get("max_allocated_resolution", 0))]
+	if bool(settings.get("editor_preview_active", false)):
+		summary_label.text += "\nEditor live preview: VT streaming and automatic baking paused."
 	_refresh_bake_status(settings)
 
 
@@ -620,28 +601,21 @@ func _refresh_settings_controls() -> void:
 	_updating_settings = true
 	var mode := int(settings.get("avt_selection_mode", 2))
 	avt_mode_option.select(avt_mode_option.get_item_index(mode))
-	for control in [avt_grid_x_spin, avt_grid_z_spin, avt_offset_x_spin, avt_offset_z_spin, avt_forward_regions_spin]:
-		control.editable = true
 	page_size_spin.value = float(settings.get("page_size", 256))
 	page_border_spin.value = float(settings.get("border", 4))
 	page_count_spin.value = float(settings.get("page_count", 64))
 	pages_per_update_spin.value = float(settings.get("pages_per_update", 4))
 	avt_density_spin.editable = mode == 2
-	avt_density_spin.tooltip_text = "Material texels per metre for sector AVT. Select AVT region grid / 64 m sectors to use this setting."
+	avt_density_spin.tooltip_text = "Material texels per metre for sector AVT. Select Camera range / 64 m sectors to use this setting."
 	avt_density_spin.value = float(settings.get("avt_texels_per_meter", 1024.0))
 	svt_density_spin.value = float(settings.get("svt_texels_per_meter", 1.0))
 	avt_density_hint.text = "64 m sector: %.0f x %.0f virtual texels; %d x %d page-table allocation. Physical pages load on demand. Source material detail still limits sharpness." % [64.0 * avt_density_spin.value, 64.0 * avt_density_spin.value, int(settings.get("avt_base_block_size", 256)), int(settings.get("avt_base_block_size", 256))]
 	avt_density_hint.text += "\nSVT addressable extent: %.2f x %.2f m, centred on world origin." % [float(settings.get("svt_world_extent", 0.0)), float(settings.get("svt_world_extent", 0.0))]
 	_refresh_avt_bands(settings)
-	var grid_value: Variant = settings.get("avt_region_grid", Vector2i(2, 2))
-	var avt_grid := Vector2i(grid_value) if grid_value is Vector2i else Vector2i(2, 2)
-	var offset_value: Variant = settings.get("avt_region_offset", Vector2i.ZERO)
-	var avt_offset := Vector2i(offset_value) if offset_value is Vector2i else Vector2i.ZERO
-	avt_grid_x_spin.value = avt_grid.x
-	avt_grid_z_spin.value = avt_grid.y
-	avt_offset_x_spin.value = avt_offset.x
-	avt_offset_z_spin.value = avt_offset.y
-	avt_forward_regions_spin.value = float(settings.get("avt_forward_regions", 0.0))
+	avt_distance_spin.value = float(settings.get("avt_distance", 512.0))
+	editor_preview_button.set_pressed_no_signal(bool(settings.get("editor_preview", true)))
+
+
 	adaptive_button.button_pressed = bool(settings.get("adaptive", false))
 	avt_enabled_button.button_pressed = bool(_call(terrain, "is_surface_vt_enabled"))
 	svt_enabled_button.button_pressed = bool(_call(terrain, "is_surface_svt_enabled"))
@@ -650,6 +624,8 @@ func _refresh_settings_controls() -> void:
 	svt_auto_bake_button.disabled = not _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY)
 	svt_auto_bake_button.tooltip_text = "Automatically rebake changed SVT cells incrementally after editing has been idle for 500 ms" if not svt_auto_bake_button.disabled else "Auto Bake is unavailable in this Terrain3D build"
 	auto_bake_hint.text = "Changed regions are merged and rebaked incrementally 500 ms after editing stops." if auto_bake_enabled else "Auto Bake is off. When enabled, changed regions merge and rebake incrementally 500 ms after editing stops. Use Bake All SVT Cells to refresh all cell sources and their mip chains."
+	if bool(settings.get("editor_preview_active", false)):
+		auto_bake_hint.text = "Automatic baking is paused during editor live preview. Close preview to resume, or use Bake All SVT Cells."
 	_refresh_svt_bands()
 	_updating_settings = false
 
@@ -812,8 +788,7 @@ func _on_density_changed(p_value: float, p_view: String) -> void:
 
 
 func _refresh_avt_bands(settings: Dictionary) -> void:
-	var block := int(settings.get("avt_base_block_size", 256))
-	var levels := maxi(3, 1 + int(round(log(float(maxi(1, block))) / log(2.0))))
+	var levels := 3
 	if avt_band_spins.size() != levels:
 		for child in avt_band_grid.get_children():
 			avt_band_grid.remove_child(child)
@@ -844,26 +819,17 @@ func _on_adaptive_toggled(p_enabled: bool) -> void:
 	_refresh_header()
 
 
-func _on_avt_region_value_changed(p_value: float, p_key: String) -> void:
-	if _updating_settings or terrain == null or not is_instance_valid(terrain):
-		return
-	var settings := _vt_settings()
-	var grid_value: Variant = settings.get("avt_region_grid", Vector2i(2, 2))
-	var offset_value: Variant = settings.get("avt_region_offset", Vector2i.ZERO)
-	var avt_grid := Vector2i(grid_value) if grid_value is Vector2i else Vector2i(2, 2)
-	var avt_offset := Vector2i(offset_value) if offset_value is Vector2i else Vector2i.ZERO
-	match p_key:
-		"grid_x": avt_grid.x = int(round(p_value))
-		"grid_z": avt_grid.y = int(round(p_value))
-		"offset_x": avt_offset.x = int(round(p_value))
-		"offset_z": avt_offset.y = int(round(p_value))
-		"forward_regions":
-			_call(terrain, "set_surface_vt_forward_regions", [p_value])
-			_refresh_header()
-			return
-	_call(terrain, "set_surface_vt_region_grid", [avt_grid])
-	_call(terrain, "set_surface_vt_region_offset", [avt_offset])
+func _on_avt_range_changed(value: float) -> void:
+	if _updating_settings: return
+	_call(terrain, "set_surface_vt_distance", [value])
 	_refresh_header()
+
+
+func _on_editor_preview_toggled(enabled: bool) -> void:
+	if _updating_settings: return
+	_call(terrain, "set_vt_editor_preview", [enabled])
+	_refresh_header()
+	_refresh_settings_controls()
 
 
 func _on_view_enabled_toggled(p_enabled: bool, p_kind: String) -> void:

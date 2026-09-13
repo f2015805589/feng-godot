@@ -582,7 +582,58 @@ static void test_feedback_math() {
 	}
 }
 
+static void test_atlas_full_leaf_capacity() {
+	VirtualImageAtlas atlas = VirtualImageAtlas::create_default();
+	constexpr int EDGE = 256;
+	std::vector<VirtualImageOwner> owners(EDGE * EDGE);
+	std::vector<bool> occupied(EDGE * EDGE, false);
+	ImageInfo info;
+	for (int i = 0; i < EDGE * EDGE; ++i) {
+		CHECK(atlas.try_insert_avt_image(i, 0, 4, owners[i], info));
+		const int cell = (info.origin_y / 4) * EDGE + info.origin_x / 4;
+		CHECK(!occupied[cell]);
+		occupied[cell] = true;
+	}
+	CHECK_EQ(atlas.allocated_node_count(), EDGE * EDGE);
+	VirtualImageOwner owner;
+	// A wrapped descendant count used to make the full root look empty.
+	CHECK(!atlas.try_insert_avt_image(-1, 0, 1024, owner, info));
+	CHECK(!atlas.try_insert_svt_image(4, owner, info));
+	ImageInfo before, after;
+	CHECK(!atlas.try_resize_avt_image(0, 0, 8, owner, before, after));
+	CHECK(before == after);
+	CHECK(atlas.has_owner(owners[0]));
+	CHECK_EQ(atlas.allocated_node_count(), EDGE * EDGE);
+	// Releasing and refilling a leaf must propagate occupancy through every parent.
+	CHECK(atlas.remove_image(owners[12345]));
+	CHECK(atlas.try_insert_svt_image(4, owner, info));
+	CHECK_EQ(atlas.allocated_node_count(), EDGE * EDGE);
+	CHECK(!atlas.try_insert_avt_image(-2, 0, 4, owner, info));
+	std::cout << "PASS: full 65,536-leaf atlas, non-overlap, resize rollback and refill\n";
+}
+
+static void test_world_page_origin() {
+	// Siblings already at mip 2 must merge into one mip-3 parent. Alignment by
+	// the mip difference incorrectly leaves the second sibling at address 4.
+	CHECK_EQ(world_page_origin(0, 3), world_page_origin(4, 3));
+	CHECK_EQ(world_page_origin(-8, 3), world_page_origin(-4, 3));
+	CHECK_EQ(world_page_origin(-1, 3), -8);
+	CHECK_EQ(world_page_origin(8, 3), 8);
+	for (int mip = 0; mip <= 10; ++mip) {
+		const int span = 1 << mip;
+		for (int address = -4096; address <= 4096; ++address) {
+			const int origin = world_page_origin(address, mip);
+			CHECK(origin <= address && address < origin + span);
+			CHECK_EQ(origin % span, 0);
+			CHECK_EQ(world_page_origin(origin, mip), origin);
+			CHECK_EQ(world_page_origin(origin, mip + 1), world_page_origin(address, mip + 1));
+		}
+	}
+	std::cout << "PASS: signed world-page containment and parent canonicalization\n";
+}
+
 int main() {
+	test_world_page_origin();
 	test_constants();
 	test_profiles();
 	test_page_id();
@@ -592,6 +643,7 @@ int main() {
 	test_target_size_index();
 	test_physical_page_math();
 	test_virtual_image_atlas();
+	test_atlas_full_leaf_capacity();
 	test_feedback_math();
 	std::cout << "PASS: 2 address profiles x 7 AVT descriptors, PageID 12/12/4/4 bit layout, "
 				 "AVT page resolution, indirection mip chain, LRU keys, sector LOD selection, "

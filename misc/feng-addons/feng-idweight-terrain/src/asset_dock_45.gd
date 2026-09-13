@@ -573,6 +573,7 @@ class ListContainer extends Container:
 		entry.focus_style = focus_style
 		entry.set_edited_resource(p_resource)
 		if not entry.get_resource_name().containsn(search_text) and not search_text == "":
+			entry.free()
 			return
 
 		var res_id: int = p_resource.id if p_resource else entries.size()

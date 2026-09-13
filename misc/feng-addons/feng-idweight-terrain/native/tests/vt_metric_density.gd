@@ -65,17 +65,20 @@ func run() -> void:
 		require(fine, "ready physical page must have exact target texels/metre")
 		require(terrain.get_vt_pages().size() <= 64, "sparse physical residency")
 		print("VT_METRIC density=", density, " block=", block, " resident=", terrain.get_vt_pages().size(), " page_metres=", 256.0 / density)
-	# Widen the orthographic footprint: screen-space demand discards fine
-	# entries while preserving ready world pages.
+	# Widen the orthographic footprint: demand coarsens while reusable
+	# virtual addresses and ready world pages remain cached.
 	terrain.surface_vt_texels_per_meter = 1024
 	await settle()
 	var previous_block := terrain.get_surface_vt().get_sector_block_size(Vector2i.ZERO)
+	var previous_texel: float = terrain.get_vt_settings().avt_sector_stats.finest_requested_texel_world
 	for footprint in [2.0, 4.0]:
 		camera.size = footprint
 		await settle()
 		var block := terrain.get_surface_vt().get_sector_block_size(Vector2i.ZERO)
-		require(block < previous_block, "larger screen footprint discards finest virtual entries")
-		previous_block = block
+		require(block == previous_block, "widening the view retains reusable virtual addresses")
+		var requested_texel: float = terrain.get_vt_settings().avt_sector_stats.finest_requested_texel_world
+		require(requested_texel > previous_texel, "larger screen footprint requests coarser physical detail")
+		previous_texel = requested_texel
 	var cached := sector_pages(Vector2i.ZERO)
 	camera.size = 0.2
 	require(await tick() <= 1, "refinement obeys one-page production budget")

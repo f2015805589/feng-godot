@@ -68,6 +68,22 @@ func run() -> void:
 	for z in [-3000.0, -1000.0, 1000.0, 3000.0]:
 		for x in [-3000.0, -1000.0, 1000.0, 3000.0]:
 			require(sample_area(image, Vector2(x, z), 1) == "red", "10 km runtime coarse coverage")
+	# With SVT enabled, near work must depend on metric camera range, not world size.
+	terrain.surface_svt_enabled = true
+	terrain.surface_vt_distance = 512
+	for i in 40:
+		terrain.update_surface_vt(1)
+		await process_frame
+	var bounded: Dictionary = terrain.get_vt_settings().avt_sector_stats
+	require(int(bounded.visible_sectors) < 400, "camera range bounds AVT sectors in a 10 km world")
+	var bounded_elapsed := 0
+	for i in 20:
+		camera.position.x += 0.01
+		var start := Time.get_ticks_usec()
+		terrain.update_surface_vt(1)
+		bounded_elapsed += Time.get_ticks_usec() - start
+		await process_frame
+	print("VT_SECTORS_PERF camera_range_sectors=", bounded.visible_sectors, " camera_range_moving_ms=", float(bounded_elapsed) / 20000.0)
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

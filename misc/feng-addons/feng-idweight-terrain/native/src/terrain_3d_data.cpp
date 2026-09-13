@@ -387,6 +387,8 @@ bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
 		_slot_full_sync_count++;
 	}
 	const uint8_t bit = uint8_t(1 << p_slot_map);
+	const bool use_surface_payload = p_slot_map != SLOT_MAP_SURFACE || !_terrain ||
+			_terrain->is_surface_array_upload_needed();
 	bool changed = false;
 	for (int slot = 0; slot < _slot_capacity; slot++) {
 		if (_slot_locations[slot] == V2I_MAX) {
@@ -402,10 +404,10 @@ bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
 		if (!full && !(_slot_dirty[slot] & bit)) {
 			continue;
 		}
-		Terrain3DRegion *region = get_region_ptr(_slot_locations[slot]);
-		Ref<Image> image = _get_slot_map_image(region, p_slot_map);
-		if (image.is_null() ||
-				(p_slot_map == SLOT_MAP_SURFACE && _terrain && !_terrain->is_surface_array_upload_needed())) {
+		// Avoid resampling dense surface payloads when VT only needs a blank binding.
+		Ref<Image> image = use_surface_payload ?
+				_get_slot_map_image(get_region_ptr(_slot_locations[slot]), p_slot_map) : Ref<Image>();
+		if (image.is_null()) {
 			// Regions without a surface map keep the blank layer, and so does the surface
 			// map itself once the virtual textures serve the channel: the array stays
 			// allocated for a valid binding, but no payload is uploaded.

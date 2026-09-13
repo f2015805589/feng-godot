@@ -14,6 +14,14 @@
 namespace TerrainVT {
 constexpr int FORMAT_VERSION = 1;
 
+// World addresses use mip-0 page units at every level. Floor to the destination
+// footprint, including negative coordinates; mip is in the table's valid range.
+inline int world_page_origin(int address, int mip) {
+	const int scale = 1 << mip;
+	const int remainder = address % scale;
+	return address - remainder - (remainder < 0 ? scale : 0);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TerrainAVTConstants parity
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,7 +559,7 @@ public:
 			current_node_size >>= 1;
 			current_size_node_count <<= 2;
 		}
-		mark_child_as_used_.assign(node_count, 0);
+		occupied_area_.assign(node_count, 0);
 		mark_as_used_.assign(node_count + current_size_node_count, false);
 		node_owners_.assign(mark_as_used_.size(), VirtualImageOwner());
 	}
@@ -566,20 +574,14 @@ public:
 	// Hydra markAsUsed_.Length: internal nodes plus the leaf ring.
 	int node_capacity() const { return int(mark_as_used_.size()); }
 	// Hydra markChildAsUsed_.Length: nodes that can own children.
-	int internal_node_count() const { return int(mark_child_as_used_.size()); }
+	int internal_node_count() const { return int(occupied_area_.size()); }
 	int allocated_node_count() const {
-		int count = 0;
-		for (bool used : mark_as_used_) {
-			if (used) {
-				count++;
-			}
-		}
-		return count;
+		return int(owner_to_image_.size());
 	}
 
 	void clear() {
 		std::fill(mark_as_used_.begin(), mark_as_used_.end(), false);
-		std::fill(mark_child_as_used_.begin(), mark_child_as_used_.end(), int16_t(0));
+		std::fill(occupied_area_.begin(), occupied_area_.end(), uint64_t(0));
 		std::fill(node_owners_.begin(), node_owners_.end(), VirtualImageOwner());
 		sector_to_image_.clear();
 		owner_to_image_.clear();
@@ -734,12 +736,17 @@ private:
 				continue;
 			}
 			if (current.size > virtual_image_size) {
+				// A fully occupied subtree cannot satisfy any allocation. Skipping it
+				// preserves traversal order among all nodes that can still succeed.
+				if (occupied_area_[current.node_index] == uint64_t(current.size) * current.size) {
+					continue;
+				}
 				push_children(travel_stack, current, allocation_order);
 				continue;
 			}
 			if (current.size == virtual_image_size &&
 					(virtual_image_size == minimal_virtual_image_size_ ||
-							mark_child_as_used_[current.node_index] == 0)) {
+							occupied_area_[current.node_index] == 0)) {
 				mark_allocated(current, owner);
 				image_info = current;
 				return true;
@@ -754,7 +761,7 @@ private:
 		owner_to_image_[owner] = node;
 		int parent = parent_of(node.node_index);
 		while (parent >= 0) {
-			mark_child_as_used_[parent]++;
+			occupied_area_[parent] += uint64_t(node.size) * node.size;
 			if (parent == 0) {
 				break;
 			}
@@ -767,7 +774,7 @@ private:
 		node_owners_[node.node_index] = VirtualImageOwner();
 		int parent = parent_of(node.node_index);
 		while (parent >= 0) {
-			mark_child_as_used_[parent]--;
+			occupied_area_[parent] -= uint64_t(node.size) * node.size;
 			if (parent == 0) {
 				break;
 			}
@@ -802,7 +809,9 @@ private:
 	int atlas_size_ = 0;
 	int minimal_virtual_image_size_ = 0;
 	std::vector<bool> mark_as_used_;
-	std::vector<int16_t> mark_child_as_used_;
+	// Occupied descendant area, in page-table texels. Unlike a 16-bit node
+	// count, this remains valid when all 65,536 default leaf blocks are allocated.
+	std::vector<uint64_t> occupied_area_;
 	std::vector<VirtualImageOwner> node_owners_;
 	std::unordered_map<std::pair<int, int>, ImageInfo, SectorHash> sector_to_image_;
 	std::unordered_map<VirtualImageOwner, ImageInfo, VirtualImageOwnerHash> owner_to_image_;

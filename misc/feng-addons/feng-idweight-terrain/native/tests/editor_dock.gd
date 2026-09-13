@@ -137,6 +137,23 @@ func _run() -> void:
 	await _wait_frames(40)
 	while EditorInterface.get_resource_filesystem().is_scanning():
 		await get_tree().process_frame
+	# A rejected search result never enters the tree. It must release both its
+	# node and the resource signal connections created during initialization.
+	for script_name in ["asset_dock.gd", "asset_dock_45.gd"]:
+		var dock_script = load("res://addons/feng-idweight-terrain/src/" + script_name)
+		var filtered_list = dock_script.ListContainer.new()
+		filtered_list.search_text = "__no_matching_terrain_asset__"
+		var asset := Terrain3DTextureAsset.new()
+		var before := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
+		for i in 100:
+			filtered_list.add_item(asset)
+		var after := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
+		var connections := asset.get_signal_connection_list("setting_changed").size()
+		filtered_list.free()
+		if not _require(after == before and connections == 0,
+				"%s filtered results leaked nodes (%d -> %d) or callbacks (%d)" % [script_name, before, after, connections]):
+			return
+	print("PASS repeated asset filtering releases rejected nodes and callbacks in both dock versions")
 
 	var scene_root := Node3D.new()
 	scene_root.name = "TerrainDockEditorTest"
@@ -408,24 +425,34 @@ func _run() -> void:
 	if not _require(vt_editor.baked_mip_selector != null,
 			"VT Page view did not expose a baked mip selector"):
 		return
-	var resolution_option: OptionButton = vt_editor.avt_resolution_option
-	if not _require(resolution_option != null, "AVT resolution dropdown missing"):
+	var avt_density: SpinBox = vt_editor.avt_density_spin
+	var svt_density: SpinBox = vt_editor.svt_density_spin
+	if not _require(avt_density != null and svt_density != null, "independent VT density controls missing"):
 		return
-	var saved_page_size: int = terrain.vt_page_size
-	var saved_page_axis: int = terrain.surface_vt_pages_per_axis
-	for index in 4:
-		var resolution: int = 512 << index
-		resolution_option.select(index)
-		resolution_option.item_selected.emit(index)
-		if not _require(terrain.surface_vt_resolution == resolution and
-				resolution_option.get_selected_id() == resolution,
-				"AVT dropdown does not map exactly to native resolution"):
+	var saved_avt: float = terrain.surface_vt_texels_per_meter
+	var saved_svt: float = terrain.surface_svt_texels_per_meter
+	for density in [128.0, 256.0, 512.0, 1024.0]:
+		avt_density.value = density
+		if not _require(is_equal_approx(terrain.surface_vt_texels_per_meter, density) and
+				is_equal_approx(terrain.surface_svt_texels_per_meter, saved_svt),
+				"AVT density control must update AVT independently"):
 			return
-	terrain.vt_page_size = saved_page_size
-	terrain.surface_vt_pages_per_axis = saved_page_axis
+	for density in [0.25, 0.5, 1.0, 2.0]:
+		svt_density.value = density
+		if not _require(is_equal_approx(terrain.surface_svt_texels_per_meter, density) and
+				is_equal_approx(terrain.surface_vt_texels_per_meter, 1024.0),
+				"SVT density control must update SVT independently"):
+			return
+	terrain.surface_vt_texels_per_meter = saved_avt
+	terrain.surface_svt_texels_per_meter = saved_svt
 	vt_editor._refresh_settings_controls()
 	svt_item.select(0)
 	await _wait_frames(2)
+	if not _require(vt_editor.auto_bake_hint.text.contains("paused during editor live preview"),
+			"live preview must explain why automatic baking is paused"):
+		return
+	terrain.vt_editor_preview = false
+	vt_editor._refresh_settings_controls()
 	if not _require(vt_editor.svt_panel.visible and vt_editor.svt_auto_bake_button != null and
 			vt_editor.auto_bake_hint != null and vt_editor.bake_button != null and
 			vt_editor.bake_status != null,
@@ -508,12 +535,11 @@ func _run() -> void:
 	if not _require(vt_editor._selected_hierarchy_kind == "pages",
 			"VT Page view was not selected before the full bake"):
 		return
-	# Exercise the real offline SVT producer in the same editor fixture. Two 64 m
-	# regions produce two mip-0 tiles plus their shared parent mip, which keeps the
-	# assertion small while proving the overview consumes persisted material pages.
+	# Exercise the offline SVT producer: two 64 m regions each persist a cell
+	# source with its mip chain, which the overview then stitches.
 	vt_editor.bake_button.pressed.emit()
 	var queued_bake := int(terrain.get_vt_settings().get("bake_total", 0))
-	if not _require(queued_bake >= 2, "SVT bake should queue geographical pages and their mip parent"):
+	if not _require(queued_bake == 2, "SVT bake should queue one source per terrain cell"):
 		return
 	if not _require(vt_editor.bake_status.text.find("Manual full SVT bake queued") >= 0,
 			"Bake All SVT Cells did not report that the manual full bake was queued"):
@@ -541,7 +567,7 @@ func _run() -> void:
 	if not _require(completed_generation > 0 and
 			vt_editor._last_bake_refresh_generation == completed_generation and
 			vt_editor._selected_hierarchy_kind == "pages" and
-			vt_editor.overview_label.text.find("Baked") >= 0 and
+			vt_editor.overview_label.text.to_lower().contains("baked cell") and
 			vt_editor.overview.overview_texture != null,
 			"completed bake should refresh the VT Page list and stitched material overview once"):
 		return
@@ -614,6 +640,11 @@ func _run() -> void:
 		if not _assert_debug_state(terrain, debug_id):
 			return
 
+	# Let pending inspector and shader updates finish before the editor tears
+	# down the scene tree; the last menu action schedules deferred UI work.
+	EditorInterface.get_selection().clear()
+	EditorInterface.inspect_object(null)
+	await _wait_frames(8)
 	print("PASS graphical Terrain3D asset dock layout and management menu actions")
 	_finished = true
 	get_tree().quit(0)

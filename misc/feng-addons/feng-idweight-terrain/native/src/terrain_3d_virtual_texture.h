@@ -14,6 +14,8 @@
 
 #include "constants.h"
 #include "generated_texture.h"
+#include "terrain_3d_vt_indirection.h"
+#include <set>
 #include "terrain_vt.h"
 
 class Terrain3DVirtualTexture;
@@ -148,7 +150,10 @@ private:
 	// Indirection. `_bytes` is the single source of truth for the whole mip chain,
 	// laid out exactly as Image::create_from_data expects it; `_levels[m]` starts at
 	// the mip's byte offset and holds `_level_sizes[m]` texels.
-	GeneratedTexture _indirection;
+	GeneratedTexture _indirection; // Compatibility renderer fallback.
+	Ref<Terrain3DVTIndirection> _indirection_gpu;
+	std::set<uint64_t> _dirty_tiles;
+	uint64_t _indirection_uploaded_bytes = 0;
 	Ref<Image> _indirection_image;
 	PackedByteArray _bytes;
 	std::vector<int> _level_offsets;
@@ -210,7 +215,7 @@ public:
 	Error initialize();
 	void clear();
 	bool is_initialized() const {
-		return _page_pool && _page_pool->is_initialized() && _indirection.get_rid().is_valid();
+		return _page_pool && _page_pool->is_initialized() && (_indirection_gpu.is_valid() || _indirection.get_rid().is_valid());
 	}
 
 	// Native-only sharing hook used by Terrain3D to give both compatibility views
@@ -292,9 +297,9 @@ public:
 	void commit();
 
 	RID get_atlas_rid() const { return _page_pool ? _page_pool->atlas.get_rid() : RID(); }
-	RID get_indirection_rid() const { return _indirection.get_rid(); }
+	RID get_indirection_rid() const { return _indirection_gpu.is_valid() ? _indirection_gpu->get_rid() : _indirection.get_rid(); }
 	// CPU copy of the full mip chain, laid out as Image::create_from_data expects.
-	Ref<Image> get_indirection_image() const { return _indirection_image; }
+	Ref<Image> get_indirection_image() const { return Image::create_from_data(_indirection_size, _indirection_size, true, Image::FORMAT_RF, _bytes); }
 	int get_level_count() const { return _level_count; }
 	int get_level_size(const int p_mip) const;
 	// Slot published at an exact mip, with no mip-chain walk. For tests and diagnostics.

@@ -112,36 +112,49 @@ func run() -> void:
 	terrain.material.update()
 	terrain.surface_vt_adaptive_enabled = true
 	terrain.set_physics_process(true)
-	# Both entire blocks are visible; selected block 0 remains AVT even though
-	# its far edge is hundreds of metres away. Block 1 uses persisted SVT.
+	# A camera on the 512 m terrain boundary owns near sectors on BOTH sides,
+	# regardless of a saved 1x1 or offset legacy grid.
+	terrain.surface_vt_region_offset = Vector2i(30, -30)
 	camera.size = 1100
 	camera.position = Vector3(512, 800, 256)
 	await create_timer(1.0).timeout
 	await settle_views()
 	terrain.set_physics_process(false)
 	var shot := await frame_image()
-	require(sample_area(shot, Vector2(128, 256), 1) == "red", "selected block is AVT beyond previous distance boundary")
-	require(sample_area(shot, Vector2(480, 256), 1) == "red", "entire selected block remains AVT")
-	require(sample_area(shot, Vector2(768, 256), 1) == "green", "unselected block uses SVT")
-	var green_slot := -1
+	require(sample_area(shot, Vector2(480, 256), 1) == "red", "left neighbour renders")
+	require(sample_area(shot, Vector2(544, 256), 1) == "green", "right neighbour renders")
+	var left_avt := false
+	var right_avt := false
+	var slot_colours := {}
 	for page: Dictionary in terrain.get_vt_pages():
-		if page.kind == "SVT" and page.ready and int(page.mip) == 0 and page.world_rect.has_point(Vector2(768, 256)):
-			green_slot = page.slot
-	require(green_slot >= 0, "outside block has a ready SVT page")
-	# Make SVT resolve to green everywhere, then hide AVT lookup. An AVT miss
-	# must show its missing-page diagnostic, never silently turn into SVT.
-	var fake := Image.create(2, 2, true, Image.FORMAT_RF)
-	fake.fill(Color(float(green_slot), 0, 0))
-	var fake_texture := ImageTexture.create_from_image(fake)
+		if not page.ready: continue
+		slot_colours[page.slot] = Color.RED if page.kind == "AVT" else Color.GREEN
+		if page.kind == "AVT":
+			left_avt = left_avt or page.world_rect.has_point(Vector2(480, 256))
+			right_avt = right_avt or page.world_rect.has_point(Vector2(544, 256))
+	require(left_avt and right_avt, "camera range retains AVT across terrain block boundary")
+	# Distinguish tiers by colour, independent of the terrain's source material.
+	for slot in terrain.vt_page_count:
+		albedo_images[slot].fill(slot_colours.get(slot, Color.MAGENTA))
+	colour_array = Texture2DArray.new()
+	colour_array.create_from_images(albedo_images)
 	var rid := terrain.material.get_material_rid()
-	RenderingServer.material_set_param(rid, "_surface_svt_indirection", fake_texture.get_rid())
-	RenderingServer.material_set_param(rid, "_surface_svt_indirection_size", 2)
-	RenderingServer.material_set_param(rid, "_surface_svt_page_world", 2048.0)
-	RenderingServer.material_set_param(rid, "_surface_svt_max_mip", 0)
-	RenderingServer.material_set_param(rid, "_avt_directory_mask", 0)
-	shot = await frame_image(2)
-	require(sample_area(shot, Vector2(128, 256), 1) != "green", "AVT missing page cannot fall through to SVT")
-	require(sample_area(shot, Vector2(768, 256), 1) == "green", "synthetic SVT fallback is valid outside selected block")
+	RenderingServer.material_set_param(rid, "_surface_material_albedo", colour_array.get_rid())
+	RenderingServer.material_set_param(rid, "_surface_material_normal", normal_array.get_rid())
+	RenderingServer.material_set_param(rid, "_surface_material_params", param_array.get_rid())
+	RenderingServer.material_set_param(rid, "_avt_fade_enabled", false)
+	shot = await frame_image(3)
+	require(sample_area(shot, Vector2(480, 256), 0) == "red", "left side uses AVT")
+	require(sample_area(shot, Vector2(544, 256), 0) == "red", "right side also uses AVT, despite legacy offset")
+	var blend := shot.get_pixelv(Vector2i(camera.unproject_position(Vector3(960, 0, 256))))
+	require(blend.r > 0.1 and blend.g > 0.1 and blend.b < 0.1, "outer camera range blends AVT with SVT")
+	require(sample_area(shot, Vector2(1016, 256), 0) == "green", "far edge approaches SVT smoothly")
+	# After moving across a block, the same nearby geometry remains AVT.
+	terrain.material.update()
+	terrain.set_physics_process(true)
+	camera.position.x = 540
+	await settle_views()
+	require(terrain.get_surface_vt().get_sector_block_size(Vector2i(8, 4)) > 0, "camera movement retains automatic coverage")
 	# Artist-facing SVT result summary is one row per terrain block, with pages
 	# nested underneath. The texture resolution is not the physical page count.
 	var window = load("res://addons/feng-idweight-terrain/src/vt_editor.gd").new()
@@ -160,6 +173,25 @@ func run() -> void:
 		row = row.get_next()
 	require(grouped, "SVT results are grouped by terrain block")
 	window.free()
+	# Demand starts at mip 2 but exceeds the physical pool. Its coarser parents
+	# must be aligned in mip-0 world units, not by the difference between mips.
+	terrain.surface_vt_enabled = false
+	terrain.surface_svt_texels_per_meter = 2
+	terrain.surface_svt_mip_distances = PackedFloat32Array([10, 20, 10000])
+	await create_timer(1.0).timeout
+	await settle_views()
+	var coarse_pages := 0
+	for page: Dictionary in terrain.get_vt_pages():
+		if page.kind != "SVT": continue
+		var span := 1 << int(page.mip)
+		var address: Vector2i = page.address
+		require(posmod(address.x, span) == 0 and posmod(address.y, span) == 0,
+				"SVT pressure parent must have canonical world origin: %s" % str(page))
+		if int(page.mip) > 2: coarse_pages += 1
+	require(coarse_pages > 0, "SVT pressure probe must produce parents coarser than requested mip 2")
+	shot = await frame_image()
+	require(sample_area(shot, Vector2(256, 256), 1) == "red", "SVT pressure preserves left block material")
+	require(sample_area(shot, Vector2(768, 256), 1) == "green", "SVT pressure preserves right block material")
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

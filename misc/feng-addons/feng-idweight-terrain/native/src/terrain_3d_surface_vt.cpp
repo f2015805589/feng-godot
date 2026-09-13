@@ -4,6 +4,7 @@
 #include "terrain_3d_virtual_texture.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
@@ -113,6 +114,22 @@ void Terrain3D::_reset_vt_configuration() {
 void Terrain3D::set_vt_adaptive_enabled(bool p_enabled) {
 	_vt_adaptive_enabled = p_enabled;
 }
+bool Terrain3D::is_vt_editor_preview_active() const {
+	return IS_EDITOR && _vt_editor_preview;
+}
+
+void Terrain3D::set_vt_editor_preview(bool p_enabled) {
+	if (_vt_editor_preview == p_enabled) { return; }
+	_vt_editor_preview = p_enabled;
+	if (!is_vt_editor_preview_active()) {
+		Dictionary dirty = _vt_editor_dirty_regions.duplicate();
+		_vt_editor_dirty_regions.clear();
+		for (const Variant &location : dirty.keys()) { invalidate_surface_pages(location); }
+	}
+	if (_data && _initialized) { _data->update_maps(TYPE_MAX, true, false); }
+	if (_material.is_valid() && _initialized) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+}
+
 void Terrain3D::set_vt_debug_direct_material(bool p_enabled) {
 	if (_vt_debug_direct_material == p_enabled) {
 		return;
@@ -156,8 +173,10 @@ void Terrain3D::_configure_vt_service() {
 	_avt_directory_bytes.clear();
 	_avt_plan_key.clear();
 	_avt_page_plan.clear();
+	_avt_prefetch_plan.clear();
 	_avt_registered_owners.clear();
 	_avt_allocated_sizes.clear();
+	_avt_cached_addresses.clear();
 	_avt_sector_directory.unref();
 	_avt_directory_mask = 0;
 	_avt_sector_stats.clear();
@@ -189,6 +208,9 @@ void Terrain3D::_update_vt_service() {
 	if (_vt_debug_direct_material || !_data || _assets.is_null()) {
 		return;
 	}
+	const uint64_t frame = Engine::get_singleton()->get_process_frames();
+	if (_vt_shared_ready && !_vt_materials_dirty && _vt_service_frame == frame) { return; }
+	_vt_service_frame = frame;
 	_configure_vt_service();
 	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
 	if (!producer) {
@@ -323,9 +345,12 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (_vt_debug_direct_material || !producer || p_slot < 0 || p_payload.is_null()) {
 		return;
 	}
-	Ref<Image> height = _data->make_vt_height_page(p_rect, _vt_page_size, _vt_page_border);
-	if (height.is_null()) {
-		return;
+	Ref<Image> height;
+	if (!p_svt) {
+		height = _data->make_vt_height_page(p_rect, _vt_page_size, _vt_page_border);
+		if (height.is_null()) {
+			return;
+		}
 	}
 	Dictionary record;
 	record["slot"] = p_slot;
@@ -336,7 +361,6 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	record["address"] = p_address;
 	record["revision"] = int64_t(_vt_source_revision);
 	record["source"] = p_payload->get_data();
-	record["height"] = height->get_data();
 	_vt_page_records[p_slot] = record;
 	if (p_svt) {
 		const float world = _region_size * _vertex_spacing;
@@ -451,6 +475,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["adaptive"] = _vt_adaptive_enabled;
 	result["avt_texels_per_pixel"] = _surface_vt_texels_per_pixel;
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
+	result["avt_distance_mips"] = _surface_vt_distance_mips;
+	result["avt_mip_ranges"] = _surface_vt_mip_ranges;
 	result["avt_distance"] = _surface_vt_distance;
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
 	result["svt_texels_per_meter"] = get_surface_svt_texels_per_meter();
@@ -461,6 +487,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["avt_sector_stats"] = _avt_sector_stats;
 	result["svt_effective_max_mip"] = _surface_svt ? _surface_svt->get_world_max_mip() : _surface_svt_max_mip;
 	result["avt_selection_mode"] = _surface_vt_selection_mode;
+	result["editor_preview"] = _vt_editor_preview;
+	result["editor_preview_active"] = is_vt_editor_preview_active();
 	result["avt_region_grid"] = _surface_vt_region_grid;
 	result["avt_region_offset"] = _surface_vt_region_offset;
 	result["avt_forward_regions"] = _surface_vt_forward_regions;
@@ -493,7 +521,6 @@ Array Terrain3D::get_vt_pages() const {
 		}
 		Dictionary record = Dictionary(_vt_page_records[key]).duplicate();
 		record.erase("source");
-		record.erase("height");
 		record["ready"] = _vt_baker.is_valid() && baker(_vt_baker)->is_page_ready(int(key));
 		if (bool(record["ready"])) {
 			record["state"] = "Ready";
@@ -653,7 +680,7 @@ void Terrain3D::set_svt_auto_bake(bool p_enabled) {
 }
 
 void Terrain3D::_process_svt_auto_bake() {
-	if (!_svt_auto_bake || !_surface_svt_enabled || _data_directory.is_empty() || _vt_svt_dirty_regions.is_empty() ||
+	if (is_vt_editor_preview_active() || !_svt_auto_bake || !_surface_svt_enabled || _data_directory.is_empty() || _vt_svt_dirty_regions.is_empty() ||
 			!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty() ||
 			Time::get_singleton()->get_ticks_msec() - _vt_svt_edit_time < 500) {
 		return;
@@ -843,6 +870,9 @@ void Terrain3D::_bind_vt_methods() {
 #undef VT_BIND_SETTING
 	ClassDB::bind_method(D_METHOD("set_vt_adaptive_enabled", "enabled"), &Terrain3D::set_vt_adaptive_enabled);
 	ClassDB::bind_method(D_METHOD("is_vt_adaptive_enabled"), &Terrain3D::is_vt_adaptive_enabled);
+	ClassDB::bind_method(D_METHOD("set_vt_editor_preview", "enabled"), &Terrain3D::set_vt_editor_preview);
+	ClassDB::bind_method(D_METHOD("is_vt_editor_preview"), &Terrain3D::is_vt_editor_preview);
+	ClassDB::bind_method(D_METHOD("is_vt_editor_preview_active"), &Terrain3D::is_vt_editor_preview_active);
 	ClassDB::bind_method(D_METHOD("set_vt_debug_direct_material", "enabled"), &Terrain3D::set_vt_debug_direct_material);
 	ClassDB::bind_method(D_METHOD("is_vt_debug_direct_material"), &Terrain3D::is_vt_debug_direct_material);
 	ClassDB::bind_method(D_METHOD("get_vt_settings"), &Terrain3D::get_vt_settings);

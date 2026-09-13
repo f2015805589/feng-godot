@@ -29,12 +29,14 @@ static Ref<Image> _resample_surface_map(const Ref<Image> &p_source, const int p_
 	const PackedByteArray source_bytes = p_source->get_data();
 	PackedByteArray destination;
 	destination.resize(int64_t(p_dst_size) * p_dst_size * 2);
+	const uint8_t *source = source_bytes.ptr();
+	uint8_t *output = destination.ptrw();
 	for (int y = 0; y < p_dst_size; y++) {
 		const int src_y = int(int64_t(y) * src_size / p_dst_size);
 		for (int x = 0; x < p_dst_size; x++) {
 			const int src_x = int(int64_t(x) * src_size / p_dst_size);
-			destination.encode_u16((int64_t(y) * p_dst_size + x) * 2,
-					source_bytes.decode_u16((int64_t(src_y) * src_size + src_x) * 2));
+			std::memcpy(output + (int64_t(y) * p_dst_size + x) * 2,
+					source + (int64_t(src_y) * src_size + src_x) * 2, 2);
 		}
 	}
 	return Image::create_from_data(p_dst_size, p_dst_size, false, Image::Format(39), destination);

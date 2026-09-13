@@ -7,25 +7,10 @@
 #include <tuple>
 #include <functional>
 
-// Far-field demand. Two rules share this pass and they do not interfere:
-//
-//  1. Detail. A page's level comes from one rule,
-//     Terrain3D::get_surface_svt_mip_for_distance(), applied to the distance from the
-//     camera the shader reports. A page is produced at exactly the level the shader
-//     samples, so the level a point renders at is a pure function of its distance and
-//     cannot follow page residency. The nearest pages keep their own level.
-//
-//  2. Coverage. A visible chunk must always resolve to something, so when the detail set
-//     does not fit the pool the remainder is coarsened *together*, by whole levels, to the
-//     finest level that fits the slots held back for it. Coarsening only moves a page to a
-//     coarser level (the shader walks coarse-ward, so a coarser ancestor still serves its
-//     texels), it is derived from the visible set rather than from pool pressure, and it
-//     never rewrites the level of a page that did fit.
-//
-// The previous selection had neither property: it derived every level from a screen-space
-// density ratio and then coarsened the whole set until it fit, so a page's level changed
-// whenever the visible set or the pool pressure changed while the pages it had published
-// at the old level stayed resident, and the sampled mip flapped between them.
+// Select distance-based detail over visible terrain. If it exceeds the shared
+// pool allowance, raise a common minimum mip until the canonical page set fits.
+// Pages already coarser than that floor keep their distance-selected level.
+// The shader can resolve missing detail through these coarser ancestors.
 int Terrain3D::_update_visible_svt(int p_max_pages) {
 	Camera3D *camera = get_camera();
 	if (!camera || !camera->is_inside_tree()) { return 0; }
@@ -33,15 +18,21 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; };
 	struct Page { Vector2i address; int mip; float distance; };
 	std::vector<Region> regions;
-	const Rect2i avt_regions = _surface_vt_enabled && is_sector_avt() ? get_surface_vt_region_rect() : Rect2i();
+	const Vector3 camera_position = camera->get_global_position();
+	const Vector2 focus(camera_position.x, camera_position.z);
+	auto avt_interior = [&](const Rect2 &rect) {
+		Vector2 farthest(MAX(Math::abs(rect.position.x - focus.x), Math::abs(rect.get_end().x - focus.x)),
+				MAX(Math::abs(rect.position.y - focus.y), Math::abs(rect.get_end().y - focus.y)));
+		return _surface_vt_enabled && is_sector_avt() && farthest.length() < MAX(64.f, float(_surface_vt_distance)) * 0.75f;
+	};
 	const float region_world = _region_size * _vertex_spacing;
 	const float page_world = MAX(0.001f, _surface_svt_page_world);
 	for (const Vector2i &location : _data->get_region_locations()) {
 		Ref<Terrain3DRegion> region = _data->get_region(location);
 		if (region.is_null() || region->is_deleted()) { continue; }
-		// AVT owns its selected regions. SVT should not spend the scarce detail
-		// budget duplicating material pages that this view will never sample.
-		if (_surface_vt_enabled && (is_sector_avt() ? avt_regions.has_point(location) : _vt_registered_sectors.has(location))) { continue; }
+		// Legacy region AVT owns whole regions; sector AVT excludes only the
+		// metric near interior during footprint traversal below.
+		if (_surface_vt_enabled && !is_sector_avt() && _vt_registered_sectors.has(location)) { continue; }
 		Rect2 rect(Vector2(location) * region_world, Vector2(region_world, region_world));
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
@@ -77,7 +68,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		std::function<void(int, int, int)> visit = [&](int x, int y, int mip) {
 			const float span = page_world * float(1 << mip);
 			const Rect2 footprint(Vector2(x, y) * span, Vector2(span, span));
-			if (!footprint.intersects(resident)) { return; }
+			if (!footprint.intersects(resident) || avt_interior(footprint.intersection(resident))) { return; }
 			TerrainVT::VisiblePatch visible;
 			if (!view.sample(footprint.intersection(resident), region.heights, visible)) { return; }
 			++walk_visited;
@@ -114,7 +105,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// Over-subscription policy: raise a *floor* on coarseness until the visible set fits
 	// the pool, and keep every page that is already coarser than that floor exactly where
 	// the distance rule put it. Only the pages finer than the floor coarsen, so the far
-	// field never becomes coarser than the rule asks for, every visible chunk still
+	// field above that floor stays unchanged, every visible chunk still
 	// resolves, and the floor is a function of the visible set and the pool size alone:
 	// the search always starts at the finest level and walks up, so a settled view selects
 	// the same floor, the same levels and the same pages on every frame.
@@ -124,8 +115,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		selected.clear();
 		for (const Page &page : pages) {
 			const int mip = MAX(page.mip, floor_mip);
-			const int shift = mip - page.mip;
-			const Vector2i address((page.address.x >> shift) << shift, (page.address.y >> shift) << shift);
+			const Vector2i address(TerrainVT::world_page_origin(page.address.x, mip),
+					TerrainVT::world_page_origin(page.address.y, mip));
 			const auto key = std::make_tuple(mip, address.x, address.y);
 			auto found = selected.find(key);
 			if (found == selected.end() || page.distance < found->second.distance) {

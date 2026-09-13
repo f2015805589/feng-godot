@@ -80,7 +80,6 @@ func start_import() -> void:
 
 	var imported_images: Array[Image]
 	imported_images.resize(Terrain3DRegion.TYPE_MAX)
-	var min_max := Vector2(0, 1)
 	var img: Image
 	if height_file_name:
 		if height_file_name.get_extension() == "png":
@@ -88,7 +87,6 @@ func start_import() -> void:
 		if  height_file_name.get_extension() in [ "png", "jpg" ]:
 			push_warning("Terrain3DImporter: 8-bit height map detected. Heights will be terraced. Use a 16-bit data source and file type for smooth heights.")			
 		img = Terrain3DUtil.load_image(height_file_name, ResourceLoader.CACHE_MODE_IGNORE, r16_range, r16_size)
-		min_max = Terrain3DUtil.get_min_max(img)
 		imported_images[Terrain3DRegion.TYPE_HEIGHT] = img
 	if control_file_name:
 		img = Terrain3DUtil.load_image(control_file_name, ResourceLoader.CACHE_MODE_IGNORE)

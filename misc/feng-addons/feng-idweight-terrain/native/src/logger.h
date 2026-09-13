@@ -22,6 +22,7 @@
  */
 
 #ifdef DEBUG_ENABLED
+#define LOG_ENABLED(level) ((level) == ERROR || (level) == WARN || (level) <= Terrain3D::debug_level)
 #define LOG(level, ...) \
 	do { \
 		if (level == ERROR) \
@@ -32,6 +33,7 @@
 			UtilityFunctions::print(__class__, ":", __func__, ":", __LINE__, ": ", __VA_ARGS__); \
 	} while (false); // Macro safety
 #else
+#define LOG_ENABLED(level) false
 #define LOG(...)
 #endif
 

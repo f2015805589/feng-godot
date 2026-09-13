@@ -35,6 +35,16 @@ func _fail(message: String) -> void:
 	push_error("EDITOR_INPUT_REGRESSION: " + message)
 	get_tree().quit(1)
 
+func _vt_sampler_count() -> int:
+	const SAMPLERS := ["_avt_sector_directory", "_surface_vt_indirection", "_surface_vt_atlas",
+		"_surface_svt_indirection", "_surface_svt_atlas", "_surface_material_albedo",
+		"_surface_material_normal", "_surface_material_params"]
+	var count := 0
+	for parameter in RenderingServer.get_shader_parameter_list(probe_terrain.material.get_shader_rid()):
+		if parameter.name in SAMPLERS:
+			count += 1
+	return count
+
 func _run_probe() -> void:
 	await _wait_frames(4)
 
@@ -54,6 +64,15 @@ func _run_probe() -> void:
 	probe_terrain = Terrain3D.new()
 	probe_terrain.region_size = 64
 	probe_terrain.free_editor_textures = false
+	probe_terrain.vt_page_size = 32
+	probe_terrain.vt_page_count = 32
+	probe_terrain.surface_array_enabled = false
+	probe_terrain.surface_vt_enabled = true
+	probe_terrain.surface_svt_enabled = true
+	probe_terrain.surface_svt_auto_bake = true
+	probe_terrain.surface_vt_texels_per_meter = 8
+	DirAccess.make_dir_recursive_absolute("user://editor_preview")
+	probe_terrain.data_directory = "user://editor_preview"
 	probe_terrain.assets = Terrain3DAssets.new()
 	for id in 2:
 		var asset := Terrain3DTextureAsset.new()
@@ -74,6 +93,15 @@ func _run_probe() -> void:
 	probe_terrain.set_camera(probe_camera)
 
 	await _wait_frames(8)
+	if not probe_terrain.is_vt_editor_preview_active() or not probe_terrain.get_vt_pages().is_empty():
+		_fail("editor preview must pause VT residency with both tiers enabled")
+		return
+	if _vt_sampler_count() != 0:
+		_fail("editor preview shader still declares VT sampling resources")
+		return
+	if bool(RenderingServer.material_get_param(probe_terrain.material.get_material_rid(), "_surface_material_required")):
+		_fail("editor preview still requires cached material")
+		return
 	_edit(probe_terrain)
 	debug = 0
 	await _wait_frames(4)
@@ -170,6 +198,28 @@ func _run_probe() -> void:
 	if ((gpu_packed >> 11) & 31) != 1 or ((gpu_packed >> 6) & 31) != 0:
 		_fail("first press R16 map was not uploaded to GPU: cpu=0x%04x gpu=0x%04x pos=(%s,%s)" % [packed, gpu_packed, paint_x, paint_z])
 		return
+
+	if not probe_terrain.get_vt_pages().is_empty() or not probe_terrain.get_svt_baked_pages().is_empty():
+		_fail("painting in preview triggered VT requests or automatic baking")
+		return
+	# Closing preview flushes accumulated edits once and resumes runtime rendering.
+	probe_terrain.vt_editor_preview = false
+	await _wait_frames(90)
+	if probe_terrain.is_vt_editor_preview_active() or probe_terrain.get_vt_pages().is_empty():
+		_fail("closing editor preview did not resume VT")
+		return
+	if _vt_sampler_count() != 8:
+		_fail("closing preview did not restore the complete VT shader interface")
+		return
+	probe_terrain.vt_editor_preview = true
+	await _wait_frames(2)
+	if _vt_sampler_count() != 0:
+		_fail("reopening preview did not remove VT sampling resources")
+		return
+	if bool(RenderingServer.material_get_param(probe_terrain.material.get_material_rid(), "_surface_material_required")):
+		_fail("reopening editor preview retained strict VT material")
+		return
+	print("PASS editor VT preview, live array painting and resume")
 
 	# Release outside the terrain. It must close the operation without needing a
 	# valid hit, so an undo snapshot cannot leak into the next stroke.

@@ -7,12 +7,14 @@
 
 #include "logger.h"
 #include "terrain_3d_util.h"
+#include <cstring>
 
 ///////////////////////////
 // Public Functions
 ///////////////////////////
 
 void Terrain3DUtil::print_arr(const String &p_name, const Array &p_arr, const int p_level) {
+	if (!LOG_ENABLED(p_level)) { return; }
 	LOG(p_level, "Array[", p_arr.size(), "]: ", p_name);
 	for (int i = 0; i < p_arr.size(); i++) {
 		Variant var = p_arr[i];
@@ -40,6 +42,7 @@ void Terrain3DUtil::print_arr(const String &p_name, const Array &p_arr, const in
 }
 
 void Terrain3DUtil::print_dict(const String &p_name, const Dictionary &p_dict, const int p_level) {
+	if (!LOG_ENABLED(p_level)) { return; }
 	LOG(p_level, "Dictionary: ", p_name);
 	Array keys = p_dict.keys();
 	for (const StringName &key : keys) {
@@ -162,15 +165,26 @@ Vector2 Terrain3DUtil::get_min_max(const Ref<Image> &p_image) {
 	}
 
 	Vector2 min_max = Vector2(FLT_MAX, -FLT_MAX);
-
-	for (int y = 0; y < p_image->get_height(); y++) {
-		for (int x = 0; x < p_image->get_width(); x++) {
-			Color col = p_image->get_pixel(x, y);
-			if (col.r < min_max.x) {
-				min_max.x = col.r;
-			}
-			if (col.r > min_max.y) {
-				min_max.y = col.r;
+	auto include_height = [&](float height) {
+		if (height < min_max.x) { min_max.x = height; }
+		if (height > min_max.y) { min_max.y = height; }
+	};
+	const int width = p_image->get_width();
+	const int height = p_image->get_height();
+	if (p_image->get_format() == Image::FORMAT_RF) {
+		// Terrain height maps are RF. Read their base level directly rather than
+		// crossing the extension API for every pixel; ignore stored mip levels.
+		const PackedByteArray bytes = p_image->get_data();
+		const uint8_t *source = bytes.ptr();
+		for (int64_t i = 0, count = int64_t(width) * height; i < count; ++i) {
+			float value;
+			std::memcpy(&value, source + i * sizeof(float), sizeof(float));
+			include_height(value);
+		}
+	} else {
+		for (int y = 0; y < height; y++) {
+			for (int x = 0; x < width; x++) {
+				include_height(p_image->get_pixel(x, y).r);
 			}
 		}
 	}

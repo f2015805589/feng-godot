@@ -64,12 +64,6 @@ public: // Constants
 		"OP_MAX",
 	};
 
-	enum AverageMode {
-		AVG_HEIGHT,
-		AVG_BLEND,
-		AVG_ROUGHNESS,
-	};
-
 private:
 	Terrain3D *_terrain = nullptr;
 
@@ -85,7 +79,6 @@ private:
 	TypedArray<Terrain3DRegion> _original_regions; // Queue for undo
 	TypedArray<Terrain3DRegion> _edited_regions; // Queue for redo
 	TypedArray<Vector2i> _added_removed_locations; // Queue for added/removed locations
-	AABB _modified_area;
 	Dictionary _undo_data; // See _get_undo_data for definition
 	uint64_t _last_pen_tick = 0;
 
@@ -102,7 +95,7 @@ private:
 			const real_t p_strength, const int p_overlay_id, const int p_background_id,
 			const int p_pair_mode, const int p_weight_level, const bool p_modifier_alt);
 	void _apply_undo(const Dictionary &p_data);
-	float _average(const AverageMode p_mode, const Vector3 &p_global_position, const float p_base, const float p_nan_val = 0.f, bool p_alt = false) const;
+	float _average_scalar(const MapType p_map_type, const Vector3 &p_global_position, const float p_base, const float p_nan_val) const;
 	Color _average(const Vector3 &p_global_position, const Color &p_base) const;
 
 public:

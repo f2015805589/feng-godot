@@ -163,6 +163,14 @@ void Terrain3D::__physics_process(const double p_delta) {
 	if (_streaming_enabled && _streamer && _streamer->is_enabled()) {
 		_streamer->update(get_clipmap_target_position());
 	}
+	if (is_vt_editor_preview_active()) {
+		// Explicit offline baking remains available; navigation and painting do not stream VT.
+		if (!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty()) {
+			_update_vt_service();
+			_process_svt_bake(1);
+		}
+		return;
+	}
 	_update_vt_service();
 	// VT Setting supplies one production budget for both addressing views.
 	int vt_remaining = _vt_debug_direct_material ? 4 : _vt_pages_per_update;
@@ -588,6 +596,11 @@ void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 // carry it. Without this, an array-free configuration would keep rendering the material
 // the page was produced with until the LRU happened to evict it.
 void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc) {
+	if (is_vt_editor_preview_active()) {
+		_vt_editor_dirty_regions[p_region_loc] = true;
+		_vt_svt_dirty_regions[p_region_loc] = true;
+		return;
+	}
 	_invalidate_vt_region(p_region_loc);
 	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
 	const real_t region_world = real_t(_region_size) * vertex_spacing;
@@ -672,6 +685,7 @@ real_t Terrain3D::get_surface_svt_mip_reach() const {
 // around the clipmap target; the mip comes from the page's distance, and only the pages
 // this pass actually allocated are produced.
 int Terrain3D::update_surface_svt(int p_max_pages) {
+	if (is_vt_editor_preview_active()) { return 0; }
 	if (!_vt_shared_ready || _vt_materials_dirty) { _update_vt_service(); }
 	if (!_surface_svt || !_data) {
 		return 0;
@@ -684,7 +698,6 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	}
 	_surface_svt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
 	if (!_vt_debug_direct_material) { return _update_visible_svt(p_max_pages); }
-	const bool legacy_full_grid = _vt_debug_direct_material;
 	const real_t page_world = MAX(0.001f, _surface_svt_page_world);
 	const real_t reach = MAX(page_world, _surface_svt_distance);
 	const Vector3 target = get_clipmap_target_position();
@@ -711,68 +724,12 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		}
 		return int64_t(p_value);
 	};
-	// Match the arithmetic right shift used by world_page_to_virtual(), including for
-	// negative world pages. This is used only for the auto root candidates; detail pages
-	// still go through Terrain3DVirtualTexture's canonical conversion.
-	auto floor_shift = [](const int64_t p_value, const int p_shift) -> int64_t {
-		if (p_shift <= 0) {
-			return p_value;
-		}
-		const int64_t scale = int64_t(1) << p_shift;
-		if (p_value >= 0) {
-			return p_value >> p_shift;
-		}
-		return -(((-p_value) + scale - 1) >> p_shift);
-	};
 
 	int64_t first_x = clamp_page_coordinate(Math::floor((double(reference.x) - double(reach)) / double(page_world)));
 	int64_t last_x = clamp_page_coordinate(Math::floor((double(reference.x) + double(reach)) / double(page_world)));
 	int64_t first_y = clamp_page_coordinate(Math::floor((double(reference.z) - double(reach)) / double(page_world)));
 	int64_t last_y = clamp_page_coordinate(Math::floor((double(reference.z) + double(reach)) / double(page_world)));
 
-	// Automatic mode only needs roots and detail pages for regions that are actually
-	// loaded. Besides avoiding empty-world work, this keeps a large distance setting
-	// from turning into an unbounded page-grid walk. The direct-material mode retains
-	// the historical whole-grid root semantics used by the sparse CPU tests.
-	TypedArray<Vector2i> region_locations = _data->get_region_locations();
-	const real_t region_world = MAX(0.0001f, real_t(_region_size) * _vertex_spacing);
-	bool has_loaded_bounds = false;
-	int64_t loaded_first_x = coordinate_limit;
-	int64_t loaded_last_x = -coordinate_limit;
-	int64_t loaded_first_y = coordinate_limit;
-	int64_t loaded_last_y = -coordinate_limit;
-	if (!legacy_full_grid) {
-		for (int i = 0; i < region_locations.size(); i++) {
-			const Vector2i location = region_locations[i];
-			const double min_world_x = double(location.x) * double(region_world);
-			const double min_world_y = double(location.y) * double(region_world);
-			const double max_world_x = (double(location.x) + 1.0) * double(region_world);
-			const double max_world_y = (double(location.y) + 1.0) * double(region_world);
-			const int64_t region_first_x = clamp_page_coordinate(Math::floor(min_world_x / double(page_world)));
-			const int64_t region_last_x = clamp_page_coordinate(Math::ceil(max_world_x / double(page_world)) - 1.0);
-			const int64_t region_first_y = clamp_page_coordinate(Math::floor(min_world_y / double(page_world)));
-			const int64_t region_last_y = clamp_page_coordinate(Math::ceil(max_world_y / double(page_world)) - 1.0);
-			if (region_first_x > region_last_x || region_first_y > region_last_y) {
-				continue;
-			}
-			has_loaded_bounds = true;
-			loaded_first_x = MIN(loaded_first_x, region_first_x);
-			loaded_last_x = MAX(loaded_last_x, region_last_x);
-			loaded_first_y = MIN(loaded_first_y, region_first_y);
-			loaded_last_y = MAX(loaded_last_y, region_last_y);
-		}
-		if (has_loaded_bounds) {
-			first_x = loaded_first_x;
-			last_x = loaded_last_x;
-			first_y = loaded_first_y;
-			last_y = loaded_last_y;
-		} else {
-			first_x = 1;
-			last_x = 0;
-			first_y = 1;
-			last_y = 0;
-		}
-	}
 
 	// A target/configuration key invalidates both cursors. Include the effective detail
 	// bounds and loaded-region count so adding/removing streamed regions starts a fresh
@@ -792,12 +749,12 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	scan_hash = mix_i64(scan_hash, _surface_svt->get_page_count());
 	scan_hash = mix_i64(scan_hash, int64_t(Math::floor(double(page_world))));
 	scan_hash = mix_i64(scan_hash, int64_t(Math::floor(double(reach))));
-	scan_hash = mix_i64(scan_hash, region_locations.size());
+	scan_hash = mix_i64(scan_hash, _data->get_region_locations().size());
 	scan_hash = mix_i64(scan_hash, first_x);
 	scan_hash = mix_i64(scan_hash, last_x);
 	scan_hash = mix_i64(scan_hash, first_y);
 	scan_hash = mix_i64(scan_hash, last_y);
-	scan_hash = mix_i64(scan_hash, legacy_full_grid ? 1 : 0);
+	scan_hash = mix_i64(scan_hash, 1);
 	const Vector3i scan_key(int(clamp_page_coordinate(Math::floor(double(target.x) / double(page_world)))),
 			int(clamp_page_coordinate(Math::floor(double(target.z) / double(page_world)))),
 			int(scan_hash & 0x7fffffffu));
@@ -819,22 +776,14 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	const int root_mip_count = CLAMP(_surface_svt_root_mips, 0, root_max_mip + 1);
 	const int first_root = root_mip_count > 0 ? root_max_mip - root_mip_count + 1 : root_max_mip + 1;
 	int64_t root_total = 0;
-	if (root_mip_count > 0) {
-		if (legacy_full_grid) {
-			for (int mip = root_max_mip; mip >= first_root; mip--) {
-				const int64_t level_size = MAX(1, _surface_svt->get_indirection_size() >> mip);
-				root_total += level_size * level_size;
-			}
-		} else {
-			root_total = int64_t(region_locations.size()) * root_mip_count;
-		}
+	for (int mip = root_max_mip; mip >= first_root; mip--) {
+		const int64_t level_size = MAX(1, _surface_svt->get_indirection_size() >> mip);
+		root_total += level_size * level_size;
 	}
+
 	// A finite CPU budget is separate from the allocation budget. It bounds an extreme
 	// root_mips=16/full-grid or distance=huge frame even when most candidates are hits.
-	const int root_scan_budget = legacy_full_grid ? MAX(256, MIN(4096, physical_page_count * 4)) :
-			MAX(64, MIN(1024, physical_page_count * 2));
-	const int detail_scan_budget = legacy_full_grid ? MAX(256, MIN(4096, physical_page_count * 4)) :
-			MAX(64, MIN(1024, physical_page_count * 2));
+	const int scan_budget = MAX(256, MIN(4096, physical_page_count * 4));
 
 	// A completed cursor is normally left at the end while the pool is full. If an
 	// invalidation removes a protected root, the reduced protected count opens budget
@@ -846,37 +795,23 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	}
 
 	int root_scanned = 0;
-	while (_surface_svt_root_cursor < root_total && root_scanned < root_scan_budget &&
+	while (_surface_svt_root_cursor < root_total && root_scanned < scan_budget &&
 			root_protection_budget > 0 && (p_max_pages <= 0 || allocations < p_max_pages)) {
 		const int64_t root_index = _surface_svt_root_cursor++;
 		root_scanned++;
 		int mip = first_root;
 		int virtual_x = 0;
 		int virtual_y = 0;
-		if (legacy_full_grid) {
-			int64_t level_index = root_index;
-			for (mip = root_max_mip; mip >= first_root; mip--) {
-				const int level_size = MAX(1, _surface_svt->get_indirection_size() >> mip);
-				const int64_t level_cells = int64_t(level_size) * level_size;
-				if (level_index < level_cells) {
-					virtual_x = int(level_index % level_size);
-					virtual_y = int(level_index / level_size);
-					break;
-				}
-				level_index -= level_cells;
+		int64_t level_index = root_index;
+		for (mip = root_max_mip; mip >= first_root; mip--) {
+			const int level_size = MAX(1, _surface_svt->get_indirection_size() >> mip);
+			const int64_t level_cells = int64_t(level_size) * level_size;
+			if (level_index < level_cells) {
+				virtual_x = int(level_index % level_size);
+				virtual_y = int(level_index / level_size);
+				break;
 			}
-		} else {
-			const int64_t region_index = root_index / root_mip_count;
-			const int root_level = int(root_index % root_mip_count);
-			mip = root_max_mip - root_level;
-			if (region_index < 0 || region_index >= region_locations.size()) {
-				continue;
-			}
-			const Vector2i location = region_locations[int(region_index)];
-			const int64_t base_x = clamp_page_coordinate(Math::floor((double(location.x) + 0.5) * double(region_world) / double(page_world)));
-			const int64_t base_y = clamp_page_coordinate(Math::floor((double(location.y) + 0.5) * double(region_world) / double(page_world)));
-			virtual_x = int(floor_shift(base_x + (int64_t(_surface_svt->get_indirection_size()) >> 1), mip));
-			virtual_y = int(floor_shift(base_y + (int64_t(_surface_svt->get_indirection_size()) >> 1), mip));
+			level_index -= level_cells;
 		}
 		const int level_size = MAX(1, _surface_svt->get_indirection_size() >> mip);
 		if (virtual_x < 0 || virtual_y < 0 || virtual_x >= level_size || virtual_y >= level_size) {
@@ -937,7 +872,7 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		}
 	}
 	int detail_scanned = 0;
-	while (_surface_svt_detail_cursor < detail_total && detail_scanned < detail_scan_budget &&
+	while (_surface_svt_detail_cursor < detail_total && detail_scanned < scan_budget &&
 			(p_max_pages <= 0 || allocations < p_max_pages)) {
 		const int64_t detail_index = _surface_svt_detail_cursor++;
 		detail_scanned++;
@@ -954,7 +889,7 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		// Same measurement the shader makes for a fragment: the distance from the camera
 		// to the page, with the page sampled on the ground plane.
 		const real_t distance = Vector3(center_x, 0.f, center_z).distance_to(reference);
-		if (legacy_full_grid && distance > reach) {
+		if (distance > reach) {
 			continue;
 		}
 		// Same distance -> level table the shader and the camera-visible pass use. This
@@ -1213,6 +1148,7 @@ int Terrain3D::_surface_vt_mip_for_page(const Vector2i &p_region_loc, const int 
 // One demand pass. The page contract is the same whichever rule picks the mips:
 // request -> produce -> write -> commit.
 int Terrain3D::update_surface_vt(int p_max_pages) {
+	if (is_vt_editor_preview_active()) { return 0; }
 	// Explicit sector updates must also bind textures first created by the
 	// preceding render-thread bake, even when normal physics updates are paused.
 	if (is_sector_avt() || !_vt_shared_ready || _vt_materials_dirty) { _update_vt_service(); }
@@ -2535,6 +2471,17 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_vt_resolution"), &Terrain3D::get_surface_vt_resolution);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_distance", "distance"), &Terrain3D::set_surface_vt_distance);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_distance"), &Terrain3D::get_surface_vt_distance);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_distance_mips", "enabled"), &Terrain3D::set_surface_vt_distance_mips);
+	ClassDB::bind_method(D_METHOD("is_surface_vt_distance_mips"), &Terrain3D::is_surface_vt_distance_mips);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip0_distance", "distance"), &Terrain3D::set_surface_vt_mip0_distance);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip0_distance"), &Terrain3D::get_surface_vt_mip0_distance);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip1_distance", "distance"), &Terrain3D::set_surface_vt_mip1_distance);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip1_distance"), &Terrain3D::get_surface_vt_mip1_distance);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip2_distance", "distance"), &Terrain3D::set_surface_vt_mip2_distance);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip2_distance"), &Terrain3D::get_surface_vt_mip2_distance);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip_ranges", "ranges"), &Terrain3D::set_surface_vt_mip_ranges);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip_ranges"), &Terrain3D::get_surface_vt_mip_ranges);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_distance_lod", "distance"), &Terrain3D::get_surface_vt_distance_lod);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_region_grid", "grid"), &Terrain3D::set_surface_vt_region_grid);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_grid"), &Terrain3D::get_surface_vt_region_grid);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_selection_mode", "mode"), &Terrain3D::set_surface_vt_selection_mode);
@@ -2774,6 +2721,7 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
@@ -2781,6 +2729,11 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_distance_mips", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_distance_mips", "is_surface_vt_distance_mips");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "surface_vt_mip_ranges", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip_ranges", "get_surface_vt_mip_ranges");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip0_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip0_distance", "get_surface_vt_mip0_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip1_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip1_distance", "get_surface_vt_mip1_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip2_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip2_distance", "get_surface_vt_mip2_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_adaptive_enabled"), "set_vt_adaptive_enabled", "is_vt_adaptive_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "surface_vt", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DVirtualTexture"), "", "get_surface_vt");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64,0.25,or_greater"), "set_surface_vt_texels_per_pixel", "get_surface_vt_texels_per_pixel");
@@ -2791,10 +2744,10 @@ void Terrain3D::_bind_methods() {
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
-	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid"), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
-	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset"), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_RANGE, "-64,64,0.25"), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_distance", "get_surface_vt_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_distance", PROPERTY_HINT_RANGE, "64,4096,64,or_greater"), "set_surface_vt_distance", "get_surface_vt_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_feedback_enabled", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_feedback_enabled", "is_surface_vt_feedback_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_feedback_interval", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_feedback_interval", "get_surface_vt_feedback_interval");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_feedback_grid_chunks", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_feedback_grid_chunks", "get_surface_vt_feedback_grid_chunks");

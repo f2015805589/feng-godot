@@ -41,10 +41,6 @@ class Terrain3DSurfaceBaker : public godot::RefCounted {
 	CLASS_NAME();
 
 private:
-	static constexpr int MAX_MATERIALS = 32;
-	static constexpr int MATERIAL_STRIDE = 64;
-	static constexpr int JOB_STRIDE = 64;
-
 	enum PendingKind {
 		PENDING_BAKE = 0,
 		PENDING_INVALIDATE = 1,
@@ -133,7 +129,7 @@ private:
 			RenderingDevice::SamplerRepeatMode p_repeat, float p_max_lod);
 
 	void _take_resources(ResourceBundle &r_resources);
-	bool _ensure_resources(uint64_t p_generation, int p_page_size, int p_border, int p_page_count,
+	bool _ensure_resources(uint64_t p_generation, int p_page_count,
 			int p_stored_size, const RID &p_albedo_array_rs, const RID &p_normal_array_rs,
 			const PackedByteArray &p_material_bytes);
 	bool _rebuild_uniform_set(ResourceBundle &r_resources, const RID &p_albedo_array_rs,

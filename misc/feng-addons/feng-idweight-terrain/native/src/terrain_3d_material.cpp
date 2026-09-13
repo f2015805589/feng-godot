@@ -145,9 +145,7 @@ String Terrain3DMaterial::_apply_inserts(const String &p_shader, const Array &p_
 	return shader;
 }
 
-String Terrain3DMaterial::_generate_shader_code() const {
-	LOG(INFO, "Generating default shader code");
-	Array excludes;
+void Terrain3DMaterial::_append_layout_excludes(Array &excludes) const {
 	switch (_max_regions) {
 		case MAX_REGIONS_64:
 			excludes.push_back("MAX_REGIONS_128");
@@ -180,22 +178,6 @@ String Terrain3DMaterial::_generate_shader_code() const {
 			excludes.push_back("MAX_REGIONS_512");
 			break;
 	}
-	if (_world_background != NONE) {
-		excludes.push_back("NONE_FUNCTIONS");
-		excludes.push_back("NONE_CHECK");
-	}
-	if (_world_background == NONE) {
-		excludes.push_back("FLAT_UNIFORMS");
-		excludes.push_back("FLAT_FUNCTIONS");
-		excludes.push_back("FLAT_VERTEX");
-		excludes.push_back("FLAT_FRAGMENT");
-	}
-	if (_world_background != NOISE) {
-		excludes.push_back("WORLD_NOISE_UNIFORMS");
-		excludes.push_back("WORLD_NOISE_FUNCTIONS");
-		excludes.push_back("WORLD_NOISE_VERTEX");
-		excludes.push_back("WORLD_NOISE_FRAGMENT");
-	}
 	switch (_texture_filtering) {
 		case LINEAR_ANISOTROPIC:
 			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
@@ -217,6 +199,28 @@ String Terrain3DMaterial::_generate_shader_code() const {
 			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
 			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
 			break;
+	}
+}
+
+String Terrain3DMaterial::_generate_shader_code() const {
+	LOG(INFO, "Generating default shader code");
+	Array excludes;
+	_append_layout_excludes(excludes);
+	if (_world_background != NONE) {
+		excludes.push_back("NONE_FUNCTIONS");
+		excludes.push_back("NONE_CHECK");
+	}
+	if (_world_background == NONE) {
+		excludes.push_back("FLAT_UNIFORMS");
+		excludes.push_back("FLAT_FUNCTIONS");
+		excludes.push_back("FLAT_VERTEX");
+		excludes.push_back("FLAT_FRAGMENT");
+	}
+	if (_world_background != NOISE) {
+		excludes.push_back("WORLD_NOISE_UNIFORMS");
+		excludes.push_back("WORLD_NOISE_FUNCTIONS");
+		excludes.push_back("WORLD_NOISE_VERTEX");
+		excludes.push_back("WORLD_NOISE_FRAGMENT");
 	}
 	if (!_auto_shader_enabled) {
 		excludes.push_back("AUTO_SHADER_UNIFORMS");
@@ -350,38 +354,7 @@ String Terrain3DMaterial::_strip_comments(const String &p_shader) const {
 String Terrain3DMaterial::_generate_buffer_shader_code() const {
 	LOG(INFO, "Generating default displacement buffer shader code");
 	Array excludes;
-	switch (_max_regions) {
-		case MAX_REGIONS_64:
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_128:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_256:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_512:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_1024:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			break;
-	}
+	_append_layout_excludes(excludes);
 	if (_world_background != NONE) {
 		excludes.push_back("NONE_FUNCTIONS");
 		excludes.push_back("NONE_CHECK");
@@ -390,28 +363,6 @@ String Terrain3DMaterial::_generate_buffer_shader_code() const {
 		excludes.push_back("FLAT_UNIFORMS");
 		excludes.push_back("FLAT_FUNCTIONS");
 		excludes.push_back("FLAT_FRAGMENT");
-	}
-	switch (_texture_filtering) {
-		case LINEAR_ANISOTROPIC:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			break;
-		case LINEAR:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
-		case NEAREST_ANISOTROPIC:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
-		case NEAREST:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
 	}
 	if (!_auto_shader_enabled) {
 		excludes.push_back("AUTO_SHADER_UNIFORMS");
@@ -580,13 +531,18 @@ String Terrain3DMaterial::_inject_editor_code(const String &p_shader) const {
 	return shader;
 }
 
+bool Terrain3DMaterial::_needs_vt_shader() const {
+	// Overrides retain the full interface, including when first populated from
+	// the default shader. Their source must not freeze an editor-preview variant.
+	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
+			(!_terrain->is_vt_editor_preview_active() &&
+					(_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
+}
+
 void Terrain3DMaterial::_update_shader() {
 	IS_INIT(VOID);
 	LOG(INFO, "Updating shader");
 	String code;
-	Ref<RegEx> regex;
-	Ref<RegExMatch> match;
-	regex.instantiate();
 	// Terrain Material
 	if (_shader_override_enabled && _shader_override.is_valid()) {
 		if (_shader_override->get_code().is_empty()) {
@@ -599,7 +555,11 @@ void Terrain3DMaterial::_update_shader() {
 		}
 	} else {
 		code = _generate_shader_code();
+		if (!_needs_vt_shader()) {
+			code = "#define TERRAIN_NO_VT\n" + code;
+		}
 	}
+	_shader_uses_vt = _needs_vt_shader();
 	_shader->set_code(_inject_editor_code(code));
 	RS->material_set_shader(_material, get_shader_rid());
 	LOG(DEBUG, "Material rid: ", _material, ", shader rid: ", get_shader_rid());
@@ -695,6 +655,97 @@ void Terrain3DMaterial::_update_shader() {
 	notify_property_list_changed();
 }
 
+void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
+	// Surface virtual texture. The block table is layer indexed and padded to
+	// max_regions like _region_locations; (-1, -1) means "no block for this layer",
+	// which is also the state while the virtual texture is disabled.
+	const bool vt_on = !_terrain->is_vt_editor_preview_active() && _terrain->is_surface_vt_enabled() && _terrain->get_surface_vt() != nullptr &&
+			_terrain->get_surface_vt()->is_initialized();
+	Terrain3DVirtualTexture *vt = _terrain->get_surface_vt();
+	PackedVector2Array padded_blocks;
+	padded_blocks.resize(_max_regions);
+	if (vt_on) {
+		PackedVector2Array blocks = _terrain->get_surface_vt_blocks();
+		for (int i = 0; i < MIN((int)blocks.size(), _max_regions); ++i) {
+			padded_blocks[i] = blocks[i];
+		}
+	}
+	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
+	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
+	RID sector_directory = _terrain->get_avt_sector_directory();
+	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
+	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
+	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
+	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
+	RS->material_set_param(p_material, "_avt_mip_distance_count", int(avt_distances.size()));
+	avt_distances.resize(16);
+	RS->material_set_param(p_material, "_avt_mip_distance", avt_distances);
+	RS->material_set_param(p_material, "_avt_directory_mask", _terrain->get_avt_directory_mask());
+	RS->material_set_param(p_material, "_avt_root_level", _terrain->get_avt_root_level());
+	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
+	PackedFloat32Array block_sizes = _terrain->get_surface_vt_block_sizes();
+	PackedFloat32Array padded_sizes;
+	padded_sizes.resize(_max_regions);
+	padded_sizes.fill(float(_terrain->get_surface_vt_pages_per_axis()));
+	for (int i = 0; i < MIN(block_sizes.size(), padded_sizes.size()); i++) { padded_sizes[i] = block_sizes[i]; }
+	RS->material_set_param(p_material, "_surface_vt_block_sizes", padded_sizes);
+	Dictionary material_pages = _terrain->get_vt_material_textures();
+	RID baked_albedo = material_pages.get("albedo_height", RID());
+	RS->material_set_param(p_material, "_surface_material_enabled", baked_albedo.is_valid() && !_terrain->is_vt_editor_preview_active());
+	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_editor_preview_active() && !_terrain->is_vt_debug_direct_material() && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
+	RS->material_set_param(p_material, "_surface_material_albedo", baked_albedo.is_valid() ? baked_albedo : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_normal", baked_albedo.is_valid() ? RID(material_pages["normal_roughness"]) : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_params", baked_albedo.is_valid() ? RID(material_pages["params"]) : _generated_dummy.get_rid());
+	if (vt_on) {
+		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
+		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());
+		RS->material_set_param(p_material, "_surface_vt_page_border", vt->get_page_border());
+		RS->material_set_param(p_material, "_surface_vt_pages_per_axis", _terrain->get_surface_vt_pages_per_axis());
+		RS->material_set_param(p_material, "_surface_vt_max_local_mip",
+				TerrainVT::log2_power_of_two(_terrain->get_surface_vt_pages_per_axis()));
+		RS->material_set_param(p_material, "_surface_vt_indirection_size", vt->get_indirection_size());
+		RS->material_set_param(p_material, "_surface_vt_indirection", vt->get_indirection_rid());
+		RS->material_set_param(p_material, "_surface_vt_atlas", vt->get_atlas_rid());
+	} else {
+		RS->material_set_param(p_material, "_surface_vt_indirection", _generated_dummy_2d.get_rid());
+		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
+	}
+
+	// Far field (sparse virtual texture). World-space page grid, no block table: the
+	// shader derives the page from the world position and the same centre offset the
+	// CPU uses.
+	const bool svt_on = !_terrain->is_vt_editor_preview_active() && _terrain->is_surface_svt_enabled() && _terrain->get_surface_svt() != nullptr &&
+			_terrain->get_surface_svt()->is_initialized();
+	Terrain3DVirtualTexture *svt = _terrain->get_surface_svt();
+	RS->material_set_param(p_material, "_surface_svt_enabled", svt_on);
+	if (svt_on) {
+		RS->material_set_param(p_material, "_surface_svt_page_world", _terrain->get_surface_svt_page_world());
+		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());
+		RS->material_set_param(p_material, "_surface_svt_page_border", svt->get_page_border());
+		RS->material_set_param(p_material, "_surface_svt_max_mip", svt->get_world_max_mip());
+		// The distance -> level table, padded to the shader's fixed array size. The
+		// demand pass resolves a page's level with this same table, which is what keeps
+		// the produced level and the sampled level identical.
+		PackedFloat32Array mip_distances;
+		mip_distances.resize(Terrain3D::SVT_MIP_DISTANCE_COUNT);
+		PackedFloat32Array configured_distances = _terrain->get_surface_svt_mip_distances();
+		const int distance_count = MIN(int(configured_distances.size()), Terrain3D::SVT_MIP_DISTANCE_COUNT);
+		for (int i = 0; i < Terrain3D::SVT_MIP_DISTANCE_COUNT; i++) {
+			mip_distances[i] = distance_count > 0 ? configured_distances[MIN(i, distance_count - 1)] : 0.f;
+		}
+		RS->material_set_param(p_material, "_surface_svt_mip_distance", mip_distances);
+		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", distance_count);
+		RS->material_set_param(p_material, "_surface_svt_indirection_size", svt->get_indirection_size());
+		RS->material_set_param(p_material, "_surface_svt_indirection", svt->get_indirection_rid());
+		RS->material_set_param(p_material, "_surface_svt_atlas", svt->get_atlas_rid());
+	} else {
+		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", 0);
+		RS->material_set_param(p_material, "_surface_svt_indirection", _generated_dummy_2d.get_rid());
+		RS->material_set_param(p_material, "_surface_svt_atlas", _generated_dummy.get_rid());
+	}
+
+}
+
 void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p_flags) {
 	IS_DATA_INIT(VOID);
 	LOG(EXTREME, "Updating uniforms in shader");
@@ -723,93 +774,15 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	}
 	RS->material_set_param(p_material, "_region_locations", padded_locations);
 
-	// Surface virtual texture. The block table is layer indexed and padded to
-	// max_regions like _region_locations; (-1, -1) means "no block for this layer",
-	// which is also the state while the virtual texture is disabled.
-	const bool vt_on = _terrain->is_surface_vt_enabled() && _terrain->get_surface_vt() != nullptr &&
-			_terrain->get_surface_vt()->is_initialized();
-	Terrain3DVirtualTexture *vt = _terrain->get_surface_vt();
-	PackedVector2Array padded_blocks;
-	padded_blocks.resize(_max_regions);
-	if (vt_on) {
-		PackedVector2Array blocks = _terrain->get_surface_vt_blocks();
-		for (int i = 0; i < MIN((int)blocks.size(), _max_regions); ++i) {
-			padded_blocks[i] = blocks[i];
-		}
-	}
-	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
-	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
-	RID sector_directory = _terrain->get_avt_sector_directory();
-	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
-	const Rect2i avt_regions = _terrain->get_surface_vt_region_rect();
-	RS->material_set_param(p_material, "_avt_region_rect", Vector4(avt_regions.position.x, avt_regions.position.y, avt_regions.size.x, avt_regions.size.y));
-	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
-	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
-	RS->material_set_param(p_material, "_avt_mip_distance_count", int(avt_distances.size()));
-	avt_distances.resize(16);
-	RS->material_set_param(p_material, "_avt_mip_distance", avt_distances);
-	RS->material_set_param(p_material, "_avt_directory_mask", _terrain->get_avt_directory_mask());
-	RS->material_set_param(p_material, "_avt_root_level", _terrain->get_avt_root_level());
-	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
-	PackedFloat32Array block_sizes = _terrain->get_surface_vt_block_sizes();
-	PackedFloat32Array padded_sizes;
-	padded_sizes.resize(_max_regions);
-	padded_sizes.fill(float(_terrain->get_surface_vt_pages_per_axis()));
-	for (int i = 0; i < MIN(block_sizes.size(), padded_sizes.size()); i++) { padded_sizes[i] = block_sizes[i]; }
-	RS->material_set_param(p_material, "_surface_vt_block_sizes", padded_sizes);
-	Dictionary material_pages = _terrain->get_vt_material_textures();
-	RID baked_albedo = material_pages.get("albedo_height", RID());
-	RS->material_set_param(p_material, "_surface_material_enabled", baked_albedo.is_valid());
-	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_debug_direct_material() && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
-	RS->material_set_param(p_material, "_surface_material_albedo", baked_albedo.is_valid() ? baked_albedo : _generated_dummy.get_rid());
-	RS->material_set_param(p_material, "_surface_material_normal", baked_albedo.is_valid() ? RID(material_pages["normal_roughness"]) : _generated_dummy.get_rid());
-	RS->material_set_param(p_material, "_surface_material_params", baked_albedo.is_valid() ? RID(material_pages["params"]) : _generated_dummy.get_rid());
-	if (vt_on) {
-		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
-		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());
-		RS->material_set_param(p_material, "_surface_vt_page_border", vt->get_page_border());
-		RS->material_set_param(p_material, "_surface_vt_pages_per_axis", _terrain->get_surface_vt_pages_per_axis());
-		RS->material_set_param(p_material, "_surface_vt_max_local_mip",
-				TerrainVT::log2_power_of_two(_terrain->get_surface_vt_pages_per_axis()));
-		RS->material_set_param(p_material, "_surface_vt_indirection_size", vt->get_indirection_size());
-		RS->material_set_param(p_material, "_surface_vt_indirection", vt->get_indirection_rid());
-		RS->material_set_param(p_material, "_surface_vt_atlas", vt->get_atlas_rid());
+	if (p_material != _material || _shader_uses_vt) {
+		_update_vt_uniforms(p_material);
 	} else {
-		RS->material_set_param(p_material, "_surface_vt_indirection", _generated_dummy_2d.get_rid());
-		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
-	}
-
-	// Far field (sparse virtual texture). World-space page grid, no block table: the
-	// shader derives the page from the world position and the same centre offset the
-	// CPU uses.
-	const bool svt_on = _terrain->is_surface_svt_enabled() && _terrain->get_surface_svt() != nullptr &&
-			_terrain->get_surface_svt()->is_initialized();
-	Terrain3DVirtualTexture *svt = _terrain->get_surface_svt();
-	RS->material_set_param(p_material, "_surface_svt_enabled", svt_on);
-	if (svt_on) {
-		RS->material_set_param(p_material, "_surface_svt_page_world", _terrain->get_surface_svt_page_world());
-		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());
-		RS->material_set_param(p_material, "_surface_svt_page_border", svt->get_page_border());
-		RS->material_set_param(p_material, "_surface_svt_max_mip", svt->get_world_max_mip());
-		// The distance -> level table, padded to the shader's fixed array size. The
-		// demand pass resolves a page's level with this same table, which is what keeps
-		// the produced level and the sampled level identical.
-		PackedFloat32Array mip_distances;
-		mip_distances.resize(Terrain3D::SVT_MIP_DISTANCE_COUNT);
-		PackedFloat32Array configured_distances = _terrain->get_surface_svt_mip_distances();
-		const int distance_count = MIN(int(configured_distances.size()), Terrain3D::SVT_MIP_DISTANCE_COUNT);
-		for (int i = 0; i < Terrain3D::SVT_MIP_DISTANCE_COUNT; i++) {
-			mip_distances[i] = distance_count > 0 ? configured_distances[MIN(i, distance_count - 1)] : 0.f;
-		}
-		RS->material_set_param(p_material, "_surface_svt_mip_distance", mip_distances);
-		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", distance_count);
-		RS->material_set_param(p_material, "_surface_svt_indirection_size", svt->get_indirection_size());
-		RS->material_set_param(p_material, "_surface_svt_indirection", svt->get_indirection_rid());
-		RS->material_set_param(p_material, "_surface_svt_atlas", svt->get_atlas_rid());
-	} else {
-		RS->material_set_param(p_material, "_surface_svt_mip_distance_count", 0);
-		RS->material_set_param(p_material, "_surface_svt_indirection", _generated_dummy_2d.get_rid());
-		RS->material_set_param(p_material, "_surface_svt_atlas", _generated_dummy.get_rid());
+		// Preserve observable enable flags while avoiding page-table arrays and
+		// bindings for the built-in shader variant that has no VT resources.
+		RS->material_set_param(p_material, "_surface_vt_enabled", false);
+		RS->material_set_param(p_material, "_surface_svt_enabled", false);
+		RS->material_set_param(p_material, "_surface_material_enabled", false);
+		RS->material_set_param(p_material, "_surface_material_required", false);
 	}
 
 	real_t region_size = real_t(_terrain->get_region_size());
@@ -960,7 +933,7 @@ void Terrain3DMaterial::destroy() {
 }
 
 void Terrain3DMaterial::update(uint32_t p_flags) {
-	if (p_flags & (FULL_REBUILD & ~UPDATE_ARRAYS)) {
+	if ((p_flags & (FULL_REBUILD & ~UPDATE_ARRAYS)) || _shader_uses_vt != _needs_vt_shader()) {
 		_update_shader();
 	}
 	if (_terrain && (p_flags & TEXTURE_ARRAYS)) { _terrain->invalidate_vt_materials(); }

@@ -100,7 +100,32 @@ func paint_region(loc: Vector2i, asset_id: int) -> void:
 	painter.operate(center, 0.0)
 	painter.stop_operation()
 
+func check_height_extrema() -> void:
+	for format in [Image.FORMAT_RF, Image.FORMAT_RGBAF, Image.FORMAT_RGBA8]:
+		var heights := Image.create(8, 4, false, format)
+		heights.fill(Color(0.5, 0, 0))
+		heights.set_pixel(2, 1, Color(-12.25, 0, 0))
+		heights.set_pixel(7, 3, Color(200.75, 0, 0))
+		var expected := Vector2(INF, -INF)
+		for y in heights.get_height():
+			for x in heights.get_width():
+				var value := heights.get_pixel(x, y).r
+				expected.x = minf(expected.x, value)
+				expected.y = maxf(expected.y, value)
+		heights.generate_mipmaps()
+		require(Terrain3DUtil.get_min_max(heights) == expected, "height bounds preserve format decoding and base-level extrema")
+	var special := Image.create(2, 2, false, Image.FORMAT_RF)
+	special.fill(Color(NAN, 0, 0))
+	special.set_pixel(0, 0, Color(-17.5, 0, 0))
+	require(Terrain3DUtil.get_min_max(special) == Vector2(-17.5, -17.5), "NaN height holes do not affect bounds")
+	special.set_pixel(1, 0, Color(INF, 0, 0))
+	special.set_pixel(1, 1, Color(-INF, 0, 0))
+	require(Terrain3DUtil.get_min_max(special) == Vector2(-INF, INF), "infinite height bounds retain existing semantics")
+	if not failed:
+		print("PASS height-map extrema across formats, mipmaps, holes and infinities")
+
 func run() -> void:
+	check_height_extrema()
 	var args := OS.get_cmdline_user_args()
 	if args.size() > 1:
 		output_dir = args[1]

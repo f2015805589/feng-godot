@@ -59,27 +59,17 @@ int Terrain3DStreamer::chebyshev_distance(const Vector2i &p_a, const Vector2i &p
 void Terrain3DStreamer::_collect_desired(const Vector2i &p_center, std::vector<Vector2i> &r_desired) const {
 	r_desired.clear();
 	const int radius = MAX(0, _load_radius);
-	for (int dz = -radius; dz <= radius; dz++) {
-		for (int dx = -radius; dx <= radius; dx++) {
-			const Vector2i loc = p_center + Vector2i(dx, dz);
-			if (_is_inside_world(loc)) {
-				r_desired.push_back(loc);
+	// Enumerate Chebyshev rings directly in the existing distance,y,x order.
+	// Interior rows contain only the two sides; no sort or duplicate cells.
+	for (int ring = 0; ring <= radius; ++ring) {
+		for (int dz = -ring; dz <= ring; ++dz) {
+			const int step = std::abs(dz) == ring ? 1 : ring * 2;
+			for (int dx = -ring; dx <= ring; dx += step) {
+				const Vector2i loc = p_center + Vector2i(dx, dz);
+				if (_is_inside_world(loc)) { r_desired.push_back(loc); }
 			}
 		}
 	}
-	// Nearest first, then deterministic in x/y, so a small budget still fills
-	// the ring from the center outwards.
-	std::sort(r_desired.begin(), r_desired.end(), [p_center](const Vector2i &p_a, const Vector2i &p_b) {
-		const int distance_a = chebyshev_distance(p_a, p_center);
-		const int distance_b = chebyshev_distance(p_b, p_center);
-		if (distance_a != distance_b) {
-			return distance_a < distance_b;
-		}
-		if (p_a.y != p_b.y) {
-			return p_a.y < p_b.y;
-		}
-		return p_a.x < p_b.x;
-	});
 }
 
 void Terrain3DStreamer::_collect_unload_candidates(const Vector2i &p_center, std::vector<Vector2i> &r_candidates) const {
@@ -159,15 +149,19 @@ bool Terrain3DStreamer::_try_unload(const Vector2i &p_region_loc) {
 	}
 	if (_save_on_unload && region->is_modified()) {
 		const String directory = _resolve_directory();
-		if (!directory.is_empty()) {
-			const Error err = region->save(directory + String("/") + Util::location_to_filename(p_region_loc),
-					_terrain->get_save_16_bit());
-			if (err == OK || err == ERR_SKIP) {
-				_saved_total++;
-			} else {
-				LOG(ERROR, "Streamer could not save region ", p_region_loc, " before unload: ", err);
-			}
+		if (directory.is_empty()) {
+			_failed_total++;
+			LOG(WARN, "Keeping modified region ", p_region_loc, ": no save directory");
+			return false;
 		}
+		const Error err = region->save(directory + String("/") + Util::location_to_filename(p_region_loc),
+				_terrain->get_save_16_bit());
+		if (err != OK && err != ERR_SKIP) {
+			_failed_total++;
+			LOG(WARN, "Keeping modified region ", p_region_loc, ": save failed: ", err);
+			return false;
+		}
+		_saved_total++;
 	}
 	_data->unload_region(p_region_loc, false);
 	_streamed.erase(p_region_loc);

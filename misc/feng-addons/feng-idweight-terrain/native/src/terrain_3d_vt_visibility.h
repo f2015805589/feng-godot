@@ -64,9 +64,14 @@ struct VisibleView {
 				Vector3(rect.get_end().x, height, rect.position.y),
 				Vector3(rect.get_end().x, height, rect.get_end().y),
 				Vector3(rect.position.x, height, rect.get_end().y) };
+			// A convex polygon gains at most one vertex per clipping plane.
+			// Reuse the two buffers instead of allocating once for every plane.
+			polygon.reserve(4 + planes.size());
+			std::vector<Vector3> clipped;
+			clipped.reserve(4 + planes.size());
 			for (int i = 0; i < planes.size() && !polygon.empty(); ++i) {
 				const Plane plane = planes[i];
-				std::vector<Vector3> clipped;
+				clipped.clear();
 				Vector3 previous = polygon.back();
 				float previous_distance = plane.distance_to(previous);
 				for (const Vector3 &point : polygon) {

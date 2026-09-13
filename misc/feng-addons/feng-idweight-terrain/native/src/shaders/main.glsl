@@ -50,7 +50,8 @@ uniform float _tessellation_level = 0.f;
 uniform uint _background_mode = 1u; // NONE = 0, FLAT = 1, NOISE = 2
 uniform uint _mouse_layer = 0x80000000u; // Layer 32
 uniform float _vertex_spacing = 1.0;
-uniform vec4 _avt_region_rect = vec4(0.0);
+#ifndef TERRAIN_NO_VT
+uniform float _avt_coverage_distance = 512.0;
 uniform float _avt_base_block_size = 256.0;
 uniform float _avt_mip_distance[16];
 uniform int _avt_mip_distance_count = 0;
@@ -60,6 +61,7 @@ uniform int _avt_directory_mask = 0;
 uniform int _avt_root_level = 1;
 uniform bool _avt_fade_enabled = false;
 uniform vec4 _avt_slot_fade[256];
+#endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1./region_size
@@ -77,6 +79,12 @@ uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
 // Surface virtual texture. Off by default: the array path stays authoritative until a
 // region's surface source carries more detail than the array can afford to keep
 // resident, and enabling this costs an extra indirection lookup per corner.
+#ifdef TERRAIN_NO_VT
+const bool _surface_vt_enabled = false;
+const bool _surface_svt_enabled = false;
+const bool _surface_material_enabled = false;
+const bool _surface_material_required = false;
+#else
 uniform bool _surface_vt_enabled = false;
 uniform int _surface_vt_region_size = 256;
 uniform int _surface_vt_page_size = 256;
@@ -95,10 +103,12 @@ uniform bool _surface_material_required = false;
 uniform highp sampler2DArray _surface_material_albedo : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_normal : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_params : filter_linear, repeat_disable;
+#endif
 // Stored surface resolution in texels per region texel. The virtual texture's pages
 // are produced from the dense payload, so its page grid and texel lookups are in
 // source texels; the region texture array stays at region_size and is untouched.
 uniform int _surface_density = 1;
+#ifndef TERRAIN_NO_VT
 // Far field: a world-space page grid at a coarser texel density. The page coordinate is
 // derived from the world position and the grid is centred on the origin, so no per-layer
 // block table is needed -- the CPU uses the same `(page + half) >> mip` formula.
@@ -116,6 +126,7 @@ uniform int _surface_svt_mip_distance_count = 0;
 uniform float _surface_svt_mip_distance[16];
 uniform highp sampler2D _surface_svt_indirection : filter_nearest, repeat_disable;
 uniform highp sampler2DArray _surface_svt_atlas : repeat_disable;
+#endif
 uniform float _texture_normal_depth_array[32];
 uniform float _texture_ao_strength_array[32];
 uniform float _texture_ao_affect_array[32];
@@ -225,6 +236,7 @@ ivec3 get_index_coord(const vec2 uv) {
 // the sector block is _surface_vt_pages_per_axis pages per axis at local mip 0, so mip
 // m has max(1, pages >> m) pages per axis covering region_size * density /
 // pages_at_mip source texels each.
+#ifndef TERRAIN_NO_VT
 bool surface_vt_sample(const int p_layer, const ivec2 p_surface_texel, out uint r_value) {
 	if (!_surface_vt_enabled || p_layer < 0 || p_layer >= MAX_REGIONS) {
 		return false;
@@ -480,6 +492,8 @@ bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out 
 	if (rect.z - world.x < width) { detail = min(detail, mix(avt_detail_availability(vec2(rect.z + epsilon, world.y), fine_texel), 1.0, smoothstep(0.0, width, rect.z - world.x))); }
 	if (world.y - rect.y < width) { detail = min(detail, mix(avt_detail_availability(vec2(world.x, rect.y - epsilon), fine_texel), 1.0, smoothstep(0.0, width, world.y - rect.y))); }
 	if (rect.w - world.y < width) { detail = min(detail, mix(avt_detail_availability(vec2(world.x, rect.w + epsilon), fine_texel), 1.0, smoothstep(0.0, width, rect.w - world.y))); }
+	// A fully arrived page coarser than the pixel footprint needs no second material lookup.
+	if (detail >= 1.0 && pixel_world <= fine_texel) { return true; }
 	material coarse;
 	vec3 coarse_normal;
 	float coarse_texel;
@@ -501,10 +515,22 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 	if (!_surface_material_enabled) { return false; }
 	if (_surface_vt_enabled && _avt_sectors_enabled) {
 		float pixel_world = max(length(dFdx(world)), length(dFdy(world)));
-		vec2 region = floor(world / (_region_size * _vertex_spacing));
-		bool owned = !_surface_svt_enabled || (all(greaterThanEqual(region, _avt_region_rect.xy)) && all(lessThan(region, _avt_region_rect.xy + _avt_region_rect.zw)));
-		if (!owned) { return surface_svt_material_sample(world, r_mat, r_normal); }
-		return avt_filtered_sample(world, pixel_world, r_mat, r_normal);
+		float reach = max(64.0, _avt_coverage_distance);
+		float far_weight = _surface_svt_enabled ? smoothstep(reach * 0.75, reach, distance(world, v_camera_pos.xz)) : 0.0;
+		if (far_weight >= 1.0) { return surface_svt_material_sample(world, r_mat, r_normal); }
+		bool ready = avt_filtered_sample(world, pixel_world, r_mat, r_normal);
+		if (far_weight <= 0.0) { return ready; }
+		material far_mat;
+		vec3 far_normal;
+		if (!surface_svt_material_sample(world, far_mat, far_normal)) { return ready; }
+		if (!ready) { r_mat = far_mat; r_normal = far_normal; return true; }
+		r_mat.albedo_height = mix(r_mat.albedo_height, far_mat.albedo_height, far_weight);
+		r_mat.normal_rough = mix(r_mat.normal_rough, far_mat.normal_rough, far_weight);
+		r_mat.normal_map_depth = mix(r_mat.normal_map_depth, far_mat.normal_map_depth, far_weight);
+		r_mat.ao = mix(r_mat.ao, far_mat.ao, far_weight);
+		r_mat.ao_affect = mix(r_mat.ao_affect, far_mat.ao_affect, far_weight);
+		r_normal = mix(r_normal, far_normal, far_weight);
+		return true;
 	}
 	float region_world = _region_size * _vertex_spacing;
 	ivec2 region = ivec2(floor(world / region_world));
@@ -528,6 +554,11 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 	}
 	return surface_svt_material_sample(world, r_mat, r_normal);
 }
+#else
+bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
+	return false;
+}
+#endif
 
 // The surface id/weight for one corner: near field first, then the far field, then the
 // region texture array. `p_index` addresses the array layer (region texels, 1 texel/m),
@@ -536,6 +567,7 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 // three are needed because the array stays at region_size, the near field is region
 // aligned and the far field is world aligned.
 uint get_surface_value(const vec2 p_world, const ivec3 p_index, const ivec2 p_surface_texel) {
+#ifndef TERRAIN_NO_VT
 	if (p_index.z > -1 && _surface_vt_enabled) {
 		uint value;
 		if (surface_vt_sample(p_index.z, p_surface_texel, value)) {
@@ -548,6 +580,7 @@ uint get_surface_value(const vec2 p_world, const ivec3 p_index, const ivec2 p_su
 			return value;
 		}
 	}
+#endif
 	return p_index.z >= 0 ? uint(texelFetch(_surface_maps, p_index, 0).r * 65535.0 + 0.5) : 0u;
 }
 
@@ -997,16 +1030,10 @@ void fragment() {
 		w2 = local.x; // TR
 	}
 
-	// Aggregate up to six candidates into a three-sample budget.
-	IdWeightContributions values = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
-	float overlayWeight = 0.0;
-	hydra_idweight_add_vertex(p0, w0, values, overlayWeight);
-	hydra_idweight_add_vertex(p1, w1, values, overlayWeight);
-	hydra_idweight_add_vertex(p2, w2, values, overlayWeight);
+	// Select material candidates once, after pair-aware slope evaluation.
 	float materialResidualSelector = hydra_idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
 	uvec3 materialIds;
 	vec3 materialWeights;
-	hydra_idweight_select_budgeted_3(values, materialResidualSelector, materialIds, materialWeights, materialCount);
 
 	// Random triplanar projection (Hydra). The slope factor changes stochastic
 	// coverage probability, not the number of texture samples.
@@ -1031,7 +1058,7 @@ void fragment() {
 		slopeDistanceBlend = 1.0;
 	}
 	IdWeightContributions pairValues = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
-	overlayWeight = 0.0;
+	float overlayWeight = 0.0;
 	hydra_idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
 	hydra_idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
 	hydra_idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
