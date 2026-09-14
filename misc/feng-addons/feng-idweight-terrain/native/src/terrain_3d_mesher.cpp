@@ -17,7 +17,7 @@ void Terrain3DMesher::_generate_mesh_types() {
 	_clear_mesh_types();
 	LOG(INFO, "Generating all Mesh segments for clipmap of size ", _mesh_size);
 	// Every segment uses the same fixed BL-TR diagonal on every LOD. See
-	// _generate_mesh() for why the Hydra IdWeight surface contract requires it.
+	// _generate_mesh() for why the IdWeight surface contract requires it.
 	// Create initial set of Mesh blocks to build the clipmap
 	// # 0 TILE - mesh_size x mesh_size tiles
 	_mesh_rids.push_back(_generate_mesh(V2I(_mesh_size)));
@@ -39,13 +39,12 @@ void Terrain3DMesher::_generate_mesh_types() {
 // Every clipmap segment splits each quad along the SAME diagonal, bottom-left to
 // top-right, on every LOD.
 //
-// Hydra's IdWeight surface evaluator assumes one fixed mesh diagonal.
-// TerrainSurfaceTriangleMath::SelectTriangle / ComputeBarycentric and
-// IdWeightSampleSurface pick LowerLeft (BL, BR, TR) when local.x > local.y and
-// UpperLeft (BL, TL, TR) otherwise, for EVERY cell -- there is no per-cell
-// alternation. If the mesh alternated its diagonals, the shader's barycentric
-// reconstruction would disagree with the triangles actually rendered, and the
-// painted material would break up into a herringbone of visible triangles.
+// The IdWeight surface evaluator assumes one fixed mesh diagonal: it picks
+// LowerLeft (BL, BR, TR) when local.x > local.y and UpperLeft (BL, TL, TR)
+// otherwise, for EVERY cell -- there is no per-cell alternation. If the mesh
+// alternated its diagonals, the shader's barycentric reconstruction would
+// disagree with the triangles actually rendered, and the painted material would
+// break up into a herringbone of visible triangles.
 //
 // A uniform diagonal is also preserved under dyadic subdivision, so the
 // per-texel reconstruction used at LOD0 stays consistent with the coarser

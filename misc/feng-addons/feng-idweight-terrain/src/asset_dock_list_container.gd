@@ -90,16 +90,13 @@ func add_item(p_resource: Resource = null) -> void:
 
 
 func _on_role_selected(p_role: int, p_entry: ListEntry) -> void:
-	# Hydra IdWeight pair painting. p_role 0 is the left mouse button and 1 is
-	# the right one. Hydra's chain writes the left-clicked layer into the
+	# IdWeight pair painting. p_role 0 is the left mouse button and 1 is
+	# the right one. The packed chain writes the left-clicked layer into the
 	# Background pair field (the base layer) and the right-clicked layer into
-	# the Overlay field (the layer the Weight slider fades in); see
-	# TerrainSurfaceIdWeightLayerGrid.GetRoleForMouseButton, pinned by
-	# LayerGrid_LeftClickSelectsBackground, and CreatePaintCommand passing
-	# pair.OverlayMaterialId into the packed overlay field. Hydra's own label
-	# names the two roles the other way round on purpose
-	# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick"), and this dock keeps that
-	# reversed naming for its markers, so assert the fields, not the labels.
+	# the Overlay field (the layer the Weight slider fades in), so a left click
+	# carries background_id and a right click overlay_id. The displayed naming
+	# is the other way round on purpose, and this dock keeps that reversed
+	# naming for its markers, so assert the fields, not the labels.
 	# The clicked entry carries the role; the pair state lives in the UI.
 	if not is_instance_valid(p_entry):
 		return
@@ -150,18 +147,15 @@ func _index_of_asset(p_res_id: int) -> int:
 	return -1
 
 
-# Hydra IdWeight pair roles. p_role is 0 for the left mouse button and 1 for
-# the right one (TerrainSurfaceIdWeightLayerGrid.GetRoleForMouseButton).
+# IdWeight pair roles. p_role is 0 for the left mouse button and 1 for the right
+# one.
 #
-# Hydra's chain writes the left-clicked layer into the Background pair field
-# (the base layer) and the right-clicked layer into the Overlay field (the
-# layer the Weight slider fades in): GetRoleForMouseButton(0) returns
-# Background, pinned by LayerGrid_LeftClickSelectsBackground, and
-# CreatePaintCommand passes pair.OverlayMaterialId into the packed overlay
-# field. Hydra's own layer-grid label names the two roles the other way round
-# on purpose (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick：UI显示反过来 ...
-# 链路里面的所有计算全部反了"), and this dock keeps that reversed naming for its
-# markers and for the brush-bar readout. Assert the fields, not the labels.
+# The packed chain writes the left-clicked layer into the Background pair field
+# (the base layer) and the right-clicked layer into the Overlay field (the layer
+# the Weight slider fades in), so role 0 writes the background field and role 1
+# writes the overlay field. The displayed layer-grid label names the two roles
+# the other way round on purpose, and this dock keeps that reversed naming for
+# its markers and for the brush-bar readout. Assert the fields, not the labels.
 static func role_writes_overlay_field(p_role: int) -> bool:
 	return p_role != 0
 
@@ -202,7 +196,7 @@ func set_selected_id(p_id: int) -> void:
 
 
 func _restore_role_highlights() -> void:
-	# Hydra IdWeight pair role highlights survive list rebuilds
+	# IdWeight pair role highlights survive list rebuilds
 	if type != Terrain3DAssets.TYPE_TEXTURE or not plugin.ui:
 		return
 	for e in entries:
@@ -214,12 +208,11 @@ func _restore_role_highlights() -> void:
 	redraw()
 
 
-# Hydra's layer grid marks the left-click role white and the right-click role
-# blue (TerrainSurfaceIdWeightLayerGrid.DrawRoleBorder), and its chain writes
-# those clicks into the Background and Overlay pair fields respectively. Bind
-# the marker bits to the mouse button rather than to the field name so the
-# dock keeps matching Hydra's rendered result. Bit 1 = white (left click),
-# bit 2 = blue (right click).
+# The layer grid marks the left-click role white and the right-click role blue,
+# and the packed chain writes those clicks into the Background and Overlay pair
+# fields respectively. Bind the marker bits to the mouse button rather than to
+# the field name so the dock keeps matching the rendered result.
+# Bit 1 = white (left click), bit 2 = blue (right click).
 func _role_flags_for(p_res_id: int) -> int:
 	var flags: int = 0
 	if p_res_id == plugin.ui.pair_background_id:

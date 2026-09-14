@@ -469,7 +469,7 @@ void Terrain3DAssets::_update_texture_settings() {
 		// the R16 surface map can decode any MaterialId in 0..31, so all 32 slots
 		// must be written. A short array leaves the tail of the uniform buffer
 		// undefined (or stale from a previous, longer list). Unused slots get
-		// Hydra's TerrainSurfaceSlopeSettings default: blendSharpness 1000
+		// Slope default: blendSharpness 1000
 		// (-> 1.0 after the 0.001 shader scale) and both damps 0.
 		while (_texture_slope_params.size() < MAX_TEXTURES) {
 			_texture_slope_params.push_back(Vector3(1000.0f, 0.0f, 0.0f));

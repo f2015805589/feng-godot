@@ -1,6 +1,6 @@
 // Virtual texture addressing contract: the page-id payload, the indirection mip
-// walk and the POT quadtree allocator over the virtual page space. Port of ZRP
-// TerrainVirtualImageAtlas. No Godot or Unity dependencies, no runtime state.
+// walk and the POT quadtree allocator over the virtual page space. No engine
+// dependencies, no runtime state.
 #ifndef TERRAIN_VT_H
 #define TERRAIN_VT_H
 
@@ -26,10 +26,10 @@ constexpr uint32_t INVALID_PHYSICAL_PAGE_SLOT = 65535u;
 // Address profile
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Hydra sizes a sector's virtual image from a descriptor table (resolution,
-// global mip range and allocatable block per size index). This port sizes them
-// from the live settings instead, so only the power-of-two rule it validates
-// against is kept.
+// A sector's virtual image could be sized from a descriptor table (resolution,
+// global mip range and allocatable block per size index). This implementation
+// sizes them from the live settings instead, so only the power-of-two rule is
+// kept.
 struct AddressProfile {
 	static bool is_power_of_two(int value) {
 		return value > 0 && (value & (value - 1)) == 0;
@@ -41,7 +41,7 @@ struct AddressProfile {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Local page coordinate inside one sector's VirtualImage, plus local mip and
-// descriptor slot. Matches Hydra's uint4 pageId.
+// descriptor slot.
 struct PageId {
 	uint32_t x = 0;
 	uint32_t y = 0;

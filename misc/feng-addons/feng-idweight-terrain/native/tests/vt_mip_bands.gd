@@ -253,6 +253,29 @@ func run() -> void:
 				"the nearest probe must still resolve when the pool is crowded: z=%d level %d" %
 				[PROBE_Z[index], level])
 
+	# 5. The far field keeps a protected root pyramid over the visible world, so a detail
+	# miss has real coarse data to fall back on, and an over-subscribed pool raises a
+	# coarseness floor instead of dropping the far end of the working set. Phase 4 above
+	# runs with roots disabled, so this phase restores them.
+	terrain.surface_svt_root_mips = 2
+	terrain.vt_page_count = 4
+	await frame_barrier()
+	await settle(12)
+	var root_settings: Dictionary = terrain.get_vt_settings()
+	print("VT_MIP_BANDS roots root_pages=%d floor=%d visible=%d protected=%d" % [
+			int(root_settings.get("svt_root_pages", 0)), int(root_settings.get("svt_floor_level", 0)),
+			int(root_settings.get("svt_visible_pages", 0)),
+			int(terrain.get_surface_svt().get_stats().get("protected_count", 0))])
+	require(int(root_settings.get("svt_root_pages", 0)) > 0,
+			"the far field must pin a root pyramid covering the visible world")
+	require(int(terrain.get_surface_svt().get_stats().get("protected_count", 0)) > 0,
+			"root pages must stay protected so a detail miss resolves coarsely")
+	# Only pressure can raise the floor, so assert it exactly when the distance-selected
+	# set does not fit the pool that is left after the roots.
+	if int(root_settings.get("svt_visible_pages", 0)) > 2:
+		require(int(root_settings.get("svt_floor_level", 0)) > 0,
+				"an over-subscribed pool must raise a coarseness floor instead of dropping pages")
+
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

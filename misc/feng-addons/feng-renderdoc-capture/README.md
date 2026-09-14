@@ -35,6 +35,30 @@ unload operation. This is the accepted tradeoff for capturing the live editor
 without restarting it. No claim of zero instrumentation overhead is made.
 Captures remain under `.godot/renderdoc/captures/`.
 
+## Building
+
+The plugin script calls native statics (`RenderDocCapture.capture_frame()`), so a source
+change is only live once this addon's DLL is rebuilt. An editor started against a stale
+`bin/libfeng-renderdoc-capture.windows.debug.x86_64.dll` fails at plugin load with
+
+```
+ERROR: res://addons/feng-renderdoc-capture/src/editor_plugin.gd:84 - Parse Error:
+Static function "capture_frame()" not found in base "GDScriptNativeClass".
+ERROR: Failed to load script "res://addons/feng-renderdoc-capture/src/editor_plugin.gd"
+with error "Parse error".
+```
+
+and the whole plugin (button, capture, analyzer launch) is unavailable for that session.
+
+```powershell
+cd misc/feng-addons/feng-renderdoc-capture/native
+scons platform=windows target=template_debug arch=x86_64 -j8
+```
+
+The DLL is a build artifact and is not tracked by git, so a fresh checkout has to build it
+before the plugin loads. Projects that link this addon (the junctions under `bin/`) resolve
+the library relative to the addon directory, so one rebuild fixes every one of them.
+
 ## Validation
 
 The toolbar captures resident textures and naturally pending work. It does not

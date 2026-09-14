@@ -58,15 +58,15 @@ int main() {
 		CHECK(decode(converted.packed).background == 3);
 	}
 
-	// ── Hydra cross-checks: parity with TerrainSurfaceIdWeightPackedFormat ──
-	// Bit layout parity with Hydra Encode (overlay<<11 | background<<6 | mode<<4 | (level-1)<<1)
+	// ── Bit-layout cross-checks: parity with the packed format contract ──
+	// Layout parity with the reference encoder (overlay<<11 | background<<6 | mode<<4 | (level-1)<<1)
 	{
 		Pair p = { 21, 7, Mode::SUB, 5, 0 };
 		CHECK(encode(p, packed));
 		CHECK(packed == ((21u << 11) | (7u << 6) | (2u << 4) | (4u << 1)));
 	}
 
-	// Brush parity with ApplyToVertex: same-pair lerp, different-pair restart,
+	// Brush parity: same-pair lerp, different-pair restart,
 	// level floor, quantization ties-to-even.
 	{
 		Pair pair = { 10, 3, Mode::SET, 4, 0 };
@@ -124,6 +124,6 @@ int main() {
 		CHECK(convert_legacy(flat).packed == single(7));
 	}
 
-	std::cout << "PASS: 32768 R16 pairs, byte order, quantization, brush, slope, barycentric, 256 legacy weights and Hydra parity checks\n";
+	std::cout << "PASS: 32768 R16 pairs, byte order, quantization, brush, slope, barycentric, 256 legacy weights and bit-layout parity checks\n";
 	return 0;
 }

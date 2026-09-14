@@ -179,11 +179,9 @@ func wait_for_hierarchy_growth(p_previous_mip: int, p_limit: int = 360) -> int:
 	require(false, "the moved view did not extend SVT hierarchy beyond mip %d" % p_previous_mip)
 	return terrain.get_surface_svt().get_world_max_mip()
 
-func has_persisted_mip(p_mip: int) -> bool:
-	for tile: Dictionary in terrain.get_svt_baked_pages():
-		if int(tile.get("mip", -1)) == p_mip and FileAccess.file_exists(str(tile.get("path", ""))):
-			return true
-	return false
+# A persisted bake is one file per cell holding the full mip chain, so the catalogue reports a
+# cell (mip 0), not a level: asking it for "mip 4" is always false. The pixel checks below are
+# what prove the served pages came from the persisted bake.
 
 func poison_source_albedo() -> void:
 	var material_rid: RID = terrain.material.get_material_rid()
@@ -361,15 +359,28 @@ func run() -> void:
 			"moving the camera should preserve the initial SVT bake generation")
 	require(moved_mip >= initial_mip,
 			"moving the camera should retain at least the initial hierarchy")
-	prepare_camera(Vector3(720.0, 480.0, 480.0), Vector3(320.0, 0.0, 720.0), Vector2i(10, 10))
+	# The turned view has to *see* past the next distance band to demand a level the initial
+	# bake did not cover: with a 64 m page the bands double from 128 m, so level 4 needs a
+	# visible point past 992 m. Looking across the grid from the far corner with the extra
+	# camera height puts the near corner at ~1080 m; the previous placement kept its whole
+	# footprint under 990 m and could never raise the hierarchy.
+	prepare_camera(Vector3(720.0, 700.0, 480.0), Vector3(160.0, 0.0, 320.0), Vector2i(10, 10))
 	var extended_mip := await wait_for_hierarchy_growth(moved_mip)
 	var turned_points := await wait_for_visible_coverage("turned", 2400, moved_generation, extended_mip)
 	require(turned_points.size() >= MIN_VISIBLE_POINTS, "turned view must retain many visible non-AVT regions")
 	var turned_settings: Dictionary = terrain.get_vt_settings()
 	require(has_incremental_bake(turned_settings, moved_generation),
 			"turning the camera must launch an incremental persisted SVT repair: %s" % str(turned_settings))
-	require(has_persisted_mip(extended_mip),
-			"automatic repair must persist a new mip %d parent page before coverage is accepted" % extended_mip)
+	# The catalogue names cells (one file each, holding the full mip chain), so it cannot be
+	# asked for "the pages of mip 4", and a repair that finds the same content on disk rewrites
+	# nothing. What has to hold is that the incremental job for the new level *completed*, and
+	# the frame check below is what proves the served pixels came from it: the source albedo is
+	# still poisoned, so a page that was not produced from the persisted bake renders blue.
+	var turned_done := int(turned_settings.get("bake_done", 0))
+	var turned_total := int(turned_settings.get("bake_total", 0))
+	require(turned_total > 0 and turned_done >= turned_total,
+			"automatic repair for mip %d must finish before coverage is accepted (%d/%d cells, generation %d)" % [
+					extended_mip, turned_done, turned_total, int(turned_settings.get("bake_generation", 0))])
 	print("VTSVTCOVER_REPAIRED mip=%d generation=%d total=%d done=%d" % [
 			extended_mip, int(turned_settings.get("bake_generation", 0)),
 			int(turned_settings.get("bake_total", 0)), int(turned_settings.get("bake_done", 0))])

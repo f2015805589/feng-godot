@@ -16,13 +16,85 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, TextIO
 
 ROOT = Path(__file__).resolve().parents[5]
 ADDON_SOURCE = ROOT / "misc" / "feng-addons"
 TERRAIN_SOURCE = ADDON_SOURCE / "feng-idweight-terrain"
 DEFAULT_EDITOR = ROOT / "bin" / "godot.windows.editor.x86_64.exe"
+
+# Off-desktop position for every engine window. The editor restores its own layout, so
+# `--position -10000,-10000` alone still leaves a maximized window covering the screen.
+OFFSCREEN_POSITION = -32000
+
+
+def move_windows_offscreen(pid: int) -> int:
+    """Moves every visible top-level window of `pid` off the desktop.
+
+    Windows are moved rather than minimized: a minimized D3D12 window can stop presenting,
+    which would stall the test that is reading rendered frames. Returns how many moved.
+    """
+    if os.name != "nt":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    moved = 0
+    swp_nosize, swp_nozorder, swp_noactivate = 0x0001, 0x0004, 0x0010
+    visit_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd, _lparam):
+        nonlocal moved
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value != pid or not user32.IsWindowVisible(hwnd):
+            return True
+        # Move once: moving the window again while the test drives synthetic input makes
+        # Windows send a mouse-leave, which clears the hover the test is checking for.
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            if rect.left <= OFFSCREEN_POSITION + 100 and rect.top <= OFFSCREEN_POSITION + 100:
+                return True
+        user32.SetWindowPos(hwnd, None, OFFSCREEN_POSITION, OFFSCREEN_POSITION, 0, 0,
+                            swp_nosize | swp_nozorder | swp_noactivate)
+        moved += 1
+        return True
+
+    try:
+        user32.EnumWindows(visit_type(visit), 0)
+    except OSError:
+        return 0
+    return moved
+
+
+def run_with_offscreen_window(command: Sequence[str], *, env: dict, stream: TextIO,
+                              cwd: Path | None = None, timeout: float) -> int | None:
+    """Runs `command` while keeping its windows off the desktop. None means it timed out.
+
+    A watcher re-applies the move because the editor positions its window after startup,
+    once its layout has loaded.
+    """
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream, stderr=subprocess.STDOUT)
+    stop = threading.Event()
+
+    def keep_away() -> None:
+        while not stop.is_set():
+            move_windows_offscreen(process.pid)
+            stop.wait(0.5)
+
+    watcher = threading.Thread(target=keep_away, daemon=True)
+    watcher.start()
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return None
+    finally:
+        stop.set()
 
 
 def copy_terrain_addon(target: Path) -> None:
@@ -92,11 +164,20 @@ def write_fixture(fixture: Path, test: str = "dock") -> None:
 
 def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: str, marker: str,
                     project_name: str, log_name: str, prefixes: Sequence[str] = (),
+                    forbidden: Sequence[str] = (), extra_scripts: Sequence[tuple[str, str]] = (),
                     resolution: str = "320x240", shots: bool = False,
                     timeout_import: float = 180, timeout_run: float = 300) -> int:
-    """Runs one test script in a fresh project. Returns the process exit status."""
+    """Runs one test script in a fresh project. Returns the process exit status.
+
+    `extra_scripts` copies further test scripts into the fixture root under a chosen name,
+    which is what a test extending another test (`res://vt_render_base.gd`) needs: the
+    engine resolves that path inside the throwaway project, not in the tests directory.
+    """
     fixture = Path(tempfile.mkdtemp(prefix=fixture_prefix, dir=ROOT / "bin"))
     write_fixture(fixture)
+    for source_name, target_name in extra_scripts:
+        (fixture / target_name).write_text(
+            (Path(__file__).parent / source_name).read_text(encoding="utf-8"), encoding="utf-8")
     (fixture / "project.godot").write_text(
         f'config_version=5\n[application]\nconfig/name="{project_name}"\n', encoding="utf-8")
     shots_directory = None
@@ -118,20 +199,30 @@ def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: s
         run += ["--", "", str(shots_directory)]
     try:
         with log.open("w", encoding="utf-8") as out:
-            result = subprocess.run(base + ["--headless", "--editor", "--import"], env=env,
-                                    stdout=out, stderr=subprocess.STDOUT, timeout=timeout_import)
-            if result.returncode == 0:
-                result = subprocess.run(run, env=env, stdout=out, stderr=subprocess.STDOUT,
-                                        timeout=timeout_run)
-    except subprocess.TimeoutExpired:
-        print(f"TIMEOUT LOG={log}")
-        return 124
+            status = run_with_offscreen_window(
+                base + ["--headless", "--editor", "--import"], env=env, stream=out,
+                timeout=timeout_import)
+            if status is None:
+                print(f"TIMEOUT LOG={log}")
+                return 124
+            if status == 0:
+                status = run_with_offscreen_window(run, env=env, stream=out, timeout=timeout_run)
+                if status is None:
+                    print(f"TIMEOUT LOG={log}")
+                    return 124
+        result_code = status
+    except OSError as error:
+        print(f"LAUNCH FAILED: {error}")
+        return 127
 
     output = log.read_text(encoding="utf-8", errors="replace")
     errors = [line for line in output.splitlines() if "ERROR:" in line]
+    banned = [text for text in forbidden if text in output]
     wanted: Iterable[str] = ("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", *prefixes)
     for line in output.splitlines():
         if line.startswith(tuple(wanted)):
             print(line)
-    print(f"EXIT={result.returncode} ERRORS={len(errors)} LOG={log}")
-    return int(result.returncode != 0 or bool(errors) or marker not in output)
+    for text in banned:
+        print(f"FORBIDDEN: {text}")
+    print(f"EXIT={result_code} ERRORS={len(errors)} LOG={log}")
+    return int(result_code != 0 or bool(errors) or bool(banned) or marker not in output)

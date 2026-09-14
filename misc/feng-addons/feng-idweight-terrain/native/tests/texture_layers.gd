@@ -59,6 +59,11 @@ func set_ramp(gradient: float) -> void:
 		for x in 64:
 			terrain.data.set_height(Vector3(x, 0, z), float(x - 32) * gradient)
 	terrain.data.update_maps(Terrain3DRegion.TYPE_HEIGHT)
+	# A raw data write bypasses the editor's edit path (add_edited_area() ->
+	# invalidate_surface_pages()), so the cached material pages still hold the height-derived
+	# slope term of the previous ramp and the MIX overlay never engages. The editor is the
+	# documented owner of that invalidation, so a direct data write has to ask for it.
+	terrain.invalidate_surface_pages(Vector2i.ZERO)
 
 func run() -> void:
 	ui = root
@@ -205,11 +210,11 @@ func run() -> void:
 	# The shader declares `uniform vec3 _texture_slope_params_array[32]` and the
 	# R16 map can name any MaterialId in 0..31, so the CPU side must always fill
 	# all 32 slots -- authored materials with their own values, the rest with
-	# Hydra's TerrainSurfaceSlopeSettings default.
+	# Slope default (blendSharpness 1000, both damps 0).
 	var slope_params = terrain.assets.get_texture_slope_params()
 	require(slope_params.size() == 32, "slope constant buffer must expose all 32 material slots")
 	require(slope_params[0].x == 100.0, "slot 0 must carry the authored blend sharpness")
-	require(slope_params[31] == Vector3(1000.0, 0.0, 0.0), "unused slots must carry Hydra's default")
+	require(slope_params[31] == Vector3(1000.0, 0.0, 0.0), "unused slots must carry the slope default")
 	print("PASS 32-slot slope parameter constant buffer")
 	painter.set_brush_data({"brush": [brush, ImageTexture.create_from_image(brush)], "size": 20.0, "strength": 100.0, "mouse_pressure": 1.0, "asset_id": 1, "pair_overlay_id": 1, "pair_background_id": 0, "pair_mode": 3, "pair_weight_level": 4})
 	painter.start_operation(Vector3(32, 0, 32))
@@ -226,7 +231,7 @@ func run() -> void:
 	second.normal_depth = 1.0
 	require(flat_scaled.get_pixelv(center).r > flat_scaled.get_pixelv(center).g, "normal_depth must not tilt a neutral normal map")
 	print("SLOPE flat_scaled=", flat_scaled.get_pixelv(center))
-	# Two ramps pin the Hydra slope math end to end, not just "something changed".
+	# Two ramps pin the slope math end to end, not just "something changed".
 	# The 3 weight bits double as the slope-threshold index
 	# ({0,.125,.25,.375,.5,.625,.75,.98}[level-1]), so level 4 puts the low
 	# threshold at 0.375 and slope_blend_sharpness 100 (0.1) puts the high
@@ -235,7 +240,7 @@ func run() -> void:
 	#                    0.375, so MIX must keep the background.
 	#   gradient 1.00 -> atan(1) = 0.7854 rad, tangent approx 0.9786 -> far above
 	#                    0.475, so MIX must saturate to a full overlay.
-	# This only holds if the sampled normal is composed the way Hydra composes it:
+	# This only holds if the sampled normal is composed the way the evaluator does:
 	# an additive `g + normalPS` (the previous code) biased both ramps toward
 	# straight up and measured the 45-degree ramp at nDotUp 0.92 instead of 0.707.
 	set_ramp(0.25)
@@ -251,12 +256,12 @@ func run() -> void:
 	# raises the angle where Add/Sub/Mix start to act: level 4 thresholds at 0.375,
 	# level 8 at 0.98 -- right at the 0.9786 tangent of this 45-degree ramp. On
 	# ground flatter than the level's threshold angle nothing engages, so Add and
-	# Sub render exactly like Set and Mix drops the overlay. That is Hydra's own
-	# conflation, not a port slip:
-	# TerrainSurfaceIdWeightEvaluator.EvaluateVerticalWeight thresholds on
-	# GetSlopeThreshold(DecodeSlopeThresholdIndex(packed)), the same 3 bits the
-	# brush writes as the overlay weight. This pins the threshold rise so the
-	# "Add/Sub/Mix look linear" report is answered by evidence.
+	# Sub render exactly like Set and Mix drops the overlay. That conflation of
+	# the weight level with the slope threshold index is part of the packed
+	# format, not a port slip: the vertical weight thresholds on the slope
+	# threshold decoded from the same 3 bits the brush writes as the overlay
+	# weight. This pins the threshold rise so the "Add/Sub/Mix look linear"
+	# report is answered by evidence.
 	painter.set_brush_data({"brush": [brush, ImageTexture.create_from_image(brush)], "size": 20.0, "strength": 100.0, "mouse_pressure": 1.0, "asset_id": 1, "pair_overlay_id": 1, "pair_background_id": 0, "pair_mode": 3, "pair_weight_level": 8})
 	painter.start_operation(Vector3(32, 0, 32))
 	painter.operate(Vector3(32, 0, 32), 0.0)

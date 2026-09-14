@@ -167,7 +167,7 @@ AVT 按屏幕像素覆盖的世界面积自动选择 mip，相邻已就绪 mip �
 界面固定显示三档纹素/米，默认 1024、512、256；编辑任一层联动整条标准减半链。
 缩放页表复用已有兼容 mip，细节按每帧预算异步补充。
 SVT 密度独立设置，但其固定世界页表的可覆盖范围随密度提高而缩小，面板显示该范围。
-当前 sector AVT 使用 CPU 可见范围需求，并非 Hydra GPU PageID feedback 的移植。
+当前 sector AVT 使用 CPU 可见范围需求，而非 GPU PageID feedback。
 
 AVT/SVT 同时开启时，AVT 使用相机周围的水平距离范围（默认 512 米）并按视锥请求，跨地块连续覆盖。
 最外侧 25% 范围渐变到 SVT；近景内部缺页仍使用 AVT 父 mip。Region Grid、Offset、Forward 控件已移除，旧值不再影响 sector AVT。

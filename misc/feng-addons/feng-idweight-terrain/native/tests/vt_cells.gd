@@ -54,7 +54,17 @@ func run() -> void:
 			require(bytes.size() == 8, "coarse source mip can be read independently")
 		file.close()
 	var settings := terrain.get_vt_settings()
-	require(settings.producer.baked_pages == 0 and settings.producer.cached_uploads > 0, "runtime copies cells without material rebaking")
+	print("VT_CELLS producer=", settings.producer, " cells=", settings.get("svt_cells", {}))
+	# The bake published this cell into the resident store, so the pages that sample it were
+	# requeued and copied on the GPU instead of being re-evaluated per page.
+	require(int(settings.producer.cached_uploads) > 0, "runtime copies cells without material rebaking")
+	if not reload_mode:
+		require(int(settings.get("svt_cells", {}).get("cells", 0)) == 1, "the baked cell must stay resident on the GPU")
+	# And a settled far field does no further work: every page it samples is already resident.
+	var baked_before := int(settings.producer.baked_pages)
+	shot = await frame_image(80)
+	require(int(terrain.get_vt_settings().producer.baked_pages) == baked_before,
+			"a settled far field must not rebake materials")
 	# Runtime page geometry must not invalidate the offline source image.
 	terrain.vt_page_size = 128
 	shot = await frame_image(80)

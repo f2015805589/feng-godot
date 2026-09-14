@@ -1,4 +1,4 @@
-"""Real AVT GPU material baking and SVT persistence integration."""
+"""Atlas compression resolution regression for the material page arrays."""
 import argparse
 from pathlib import Path
 
@@ -13,16 +13,14 @@ def main() -> int:
     return run_script_test(
         editor=args.editor,
         driver=args.driver,
-        fixture_prefix="terrain-vtmaterial-",
-        project_name="VT material tests",
-        log_name="vtmaterial.log",
-        script="vt_material.gd",
-        marker="PASS AVT material and SVT persistence integration",
+        fixture_prefix="terrain-vtcomp-",
+        project_name="VT compression tests",
+        log_name="vtcomp.log",
+        script="vt_compression.gd",
+        marker="PASS virtual texture atlas compression resolution",
         resolution="320x240",
-        shots=True,
-        prefixes=("VT_FINAL_STATS", "VTSVT"),
-        # vt_material.gd extends the shared base, which has to exist inside the fixture.
-        extra_scripts=(("vt_render.gd", "vt_render_base.gd"),),
+        shots=False,
+        prefixes=('VTCOMPRESSION',),
     )
 
 

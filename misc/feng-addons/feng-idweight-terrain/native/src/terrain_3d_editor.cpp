@@ -16,10 +16,9 @@
 // Private Functions
 ///////////////////////////
 
-// Bilinear brush mask sample, mirroring Hydra
-// TerrainSurfaceBrushStamp::SampleBilinear. The mask is the brush image's R
-// channel, cached in _brush_data["brush_mask"] by set_brush_data(). UVs outside
-// [0, 1] read as zero.
+// Bilinear brush mask sample. The mask is the brush image's R channel, cached in
+// _brush_data["brush_mask"] by set_brush_data(). UVs outside [0, 1] read as
+// zero.
 static real_t _sample_brush_mask(const PackedFloat32Array &p_mask, const Vector2i &p_size, const Vector2 &p_uv) {
 	if (p_mask.is_empty() || p_size.x < 1 || p_size.y < 1) {
 		return 0.f;
@@ -51,8 +50,8 @@ void Terrain3DEditor::_send_region_aabb(const Vector2i &p_region_loc, const Vect
 	_terrain->get_data()->add_edited_area(edited_area);
 }
 
-// Hydra IdWeight pair painting. Writes one R16 texel of the surface map using
-// the same ordered-pair semantics as TerrainSurfaceIdWeightMapEditor:
+// IdWeight pair painting. Writes one R16 texel of the surface map with the
+// ordered-pair semantics the packed format defines:
 //   - same overlay/background id encodes a single background material
 //   - same-pair strokes lerp the existing contribution toward the target level
 //   - different-pair strokes start from target * influence
@@ -75,8 +74,8 @@ bool Terrain3DEditor::_paint_surface_pair(uint8_t *p_texel, const real_t p_brush
 		return false;
 	}
 	uint16_t current = read_le(p_texel);
-	// Influence combines brush alpha and strength, matching Hydra's
-	// EvaluateInfluence * brush strength semantics.
+	// Influence combines brush alpha and strength: the brush's own influence
+	// curve multiplied by its strength.
 	real_t influence = CLAMP(p_brush_alpha * p_strength, 0.f, 1.f);
 	Pair target = { uint8_t(p_overlay_id), uint8_t(p_background_id), Mode(p_pair_mode), uint8_t(p_weight_level), 0 };
 	uint16_t next = current;
@@ -209,7 +208,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	bool texture_filter = _brush_data["texture_filter"];
 	int margin = _brush_data["margin"];
 	int asset_id = _brush_data["asset_id"];
-	// Hydra IdWeight pair painting parameters (defaults keep legacy behavior)
+	// IdWeight pair painting parameters (defaults keep legacy behavior)
 	int pair_overlay_id = int(_brush_data.get("pair_overlay_id", asset_id));
 	int pair_background_id = int(_brush_data.get("pair_background_id", asset_id));
 	int pair_mode = int(_brush_data.get("pair_mode", 0)); // 0=Set, 1=Add, 2=Sub, 3=Mix
@@ -218,7 +217,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	Vector2 slope_range = _brush_data["slope"];
 	// enable_angle / dynamic_angle / angle / enable_scale / scale are still
 	// sanitized by set_brush_data() for the decal and the pickers, but nothing in
-	// this function consumes them any more: the Hydra IdWeight R16 contract has
+	// this function consumes them any more: the IdWeight R16 contract has
 	// no per-texel UV rotation or scale field (see _paint_surface_pair).
 
 	real_t gamma = _brush_data["gamma"];
@@ -295,7 +294,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 			}
 
 			// Get map for this region and tool. The TEXTURE tool paints the
-			// Hydra R16 surface map; other tools use legacy maps.
+			// R16 IdWeight surface map; other tools use legacy maps.
 			Image *map = nullptr;
 			if (_tool == TEXTURE) {
 				if (!region->ensure_surface_map()) {
@@ -316,12 +315,12 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				continue;
 			}
 
-			// Hydra parity: the brush mask is evaluated at the world position of
-			// the vertex being written, never at the loop's sample coordinate.
-			// The loop samples are offset from the texel lattice by up to one
-			// vertex spacing, so using (x, y) / brush_size here would leave the
-			// mask up to a texel away from its target and slide the whole stamp
-			// with the cursor. See TerrainSurfaceBrushStamp::EvaluateInfluence().
+			// The brush mask is evaluated at the world position of the vertex
+			// being written, never at the loop's sample coordinate. The loop
+			// samples are offset from the texel lattice by up to one vertex
+			// spacing, so using (x, y) / brush_size here would leave the mask up
+			// to a texel away from its target and slide the whole stamp with the
+			// cursor.
 			Vector2 lattice_position = Vector2(
 					Math::floor(brush_global_position.x / vertex_spacing),
 					Math::floor(brush_global_position.z / vertex_spacing)) *
@@ -418,8 +417,8 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 
 			} else if (map_type == TYPE_CONTROL) {
 				if (_tool == TEXTURE) {
-					// Hydra IdWeight material painting writes the region's R16
-					// surface map. The legacy RF control map is never authored by
+					// IdWeight material painting writes the region's R16 surface
+					// map. The legacy RF control map is never authored by
 					// this tool and must not be decoded here: `src` holds the
 					// packed R16 word, not a control bitfield.
 					if (!data->is_in_slope(brush_global_position, slope_range)) {
@@ -875,8 +874,7 @@ void Terrain3DEditor::set_brush_data(const Dictionary &p_data) {
 			_brush_data["brush_image"] = img;
 			_brush_data["brush_image_size"] = img->get_size();
 			// Cache the R channel as floats so the mask can be sampled bilinearly
-			// per vertex without repeated Image lookups. Hydra caches its mask the
-			// same way in TerrainSurfaceBrushMaskCache. Convert a copy so the
+			// per vertex without repeated Image lookups. Convert a copy so the
 			// caller's brush image (shared with the decal texture) is untouched.
 			Ref<Image> mask_image = img;
 			if (mask_image->get_format() != Image::FORMAT_RF) {
@@ -928,7 +926,7 @@ void Terrain3DEditor::set_brush_data(const Dictionary &p_data) {
 	_brush_data["texture_filter"] = p_data.get("texture_filter", false);
 	_brush_data["asset_id"] = CLAMP(int(p_data.get("asset_id", 0)), 0, ((_tool == INSTANCER) ? Terrain3DAssets::MAX_MESHES : Terrain3DAssets::MAX_TEXTURES) - 1);
 	_brush_data["margin"] = CLAMP(int(p_data.get("margin", 0)), -100, 100);
-	// Hydra IdWeight pair painting parameters. Weight level 0 means the brush
+	// IdWeight pair painting parameters. Weight level 0 means the brush
 	// uses its default of 8 (full contribution); modes are 0..3 = Set/Add/Sub/Mix.
 	_brush_data["pair_overlay_id"] = CLAMP(int(p_data.get("pair_overlay_id", int(_brush_data["asset_id"]))), 0, Terrain3DAssets::MAX_TEXTURES - 1);
 	_brush_data["pair_background_id"] = CLAMP(int(p_data.get("pair_background_id", int(_brush_data["asset_id"]))), 0, Terrain3DAssets::MAX_TEXTURES - 1);

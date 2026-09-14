@@ -48,9 +48,9 @@ void surface_bake_accumulate_layer(uint id, float weight, vec3 base_ddx, vec3 ba
 	}
 	MaterialParams params = bake_materials.materials[id];
 	float id_scale = params.uv_detile.x;
-	vec2 i_uv = hydra_idweight_get_projection_position(vertex, projection_axis) * id_scale;
-	vec2 i_dd_uv = hydra_idweight_get_projection_position(base_ddx, projection_axis) * id_scale;
-	vec2 i_dd_uv2 = hydra_idweight_get_projection_position(base_ddy, projection_axis) * id_scale;
+	vec2 i_uv = idweight_get_projection_position(vertex, projection_axis) * id_scale;
+	vec2 i_dd_uv = idweight_get_projection_position(base_ddx, projection_axis) * id_scale;
+	vec2 i_dd_uv2 = idweight_get_projection_position(base_ddy, projection_axis) * id_scale;
 
 	vec2 uv_center = floor(i_uv + 0.5);
 	vec2 id_detile = fma(surface_bake_random(uv_center), 2.0, -1.0) * params.uv_detile.yz * TAU;
@@ -65,14 +65,14 @@ void surface_bake_accumulate_layer(uint id, float weight, vec3 base_ddx, vec3 ba
 	vec4 normal_sample = textureGrad(bake_normal, vec3(id_uv, float(id)), i_dd_uv, i_dd_uv2);
 	albedo.rgb *= params.color.rgb;
 	normal_sample.a = clamp(normal_sample.a + params.normal_ao_rough.w, 0.0, 1.0);
-	vec3 normal_ps = hydra_idweight_decode_normal(normal_sample, params.normal_ao_rough.x);
+	vec3 normal_ps = idweight_decode_normal(normal_sample, params.normal_ao_rough.x);
 	float ao = length(normal_sample.xyz) * 2.0 - 1.0;
 	ao = mix(ao * ao * params.normal_ao_rough.y + 1.0 - params.normal_ao_rough.y,
 			1.0, albedo.a * albedo.a);
 
-	vec3 layer_normal_ws = hydra_idweight_projection_normal_to_world(
+	vec3 layer_normal_ws = idweight_projection_normal_to_world(
 			normal_ps, projection_axis, geometric_normal_ws);
-	float normal_damp = hydra_idweight_saturate(params.slope.z * 0.001);
+	float normal_damp = idweight_saturate(params.slope.z * 0.001);
 	layer_normal_ws = normalize(mix(layer_normal_ws, normalize(geometric_normal_ws), normal_damp));
 
 	material.albedo_height = fma(albedo, vec4(weight), material.albedo_height);
@@ -92,12 +92,12 @@ float surface_bake_slope_overlay_weight(uint packed, uint background_id, uint ov
 	}
 	MaterialParams background = bake_materials.materials[background_id];
 	MaterialParams overlay = bake_materials.materials[overlay_id];
-	float blend_sharpness = hydra_idweight_saturate(clamp(background.slope.x, 0.1, 1000.0) * 0.001);
-	float slope_based_damp = hydra_idweight_saturate(overlay.slope.y * 0.001);
+	float blend_sharpness = idweight_saturate(clamp(background.slope.x, 0.1, 1000.0) * 0.001);
+	float slope_based_damp = idweight_saturate(overlay.slope.y * 0.001);
 	float id_scale = overlay.uv_detile.x;
-	vec2 i_uv = hydra_idweight_get_projection_position(vertex, projection_axis) * id_scale;
-	vec2 i_dd_uv = hydra_idweight_get_projection_position(base_ddx, projection_axis) * id_scale;
-	vec2 i_dd_uv2 = hydra_idweight_get_projection_position(base_ddy, projection_axis) * id_scale;
+	vec2 i_uv = idweight_get_projection_position(vertex, projection_axis) * id_scale;
+	vec2 i_dd_uv = idweight_get_projection_position(base_ddx, projection_axis) * id_scale;
+	vec2 i_dd_uv2 = idweight_get_projection_position(base_ddy, projection_axis) * id_scale;
 	vec2 uv_center = floor(i_uv + 0.5);
 	vec2 id_detile = fma(surface_bake_random(uv_center), 2.0, -1.0) * overlay.uv_detile.yz * TAU;
 	vec2 id_cs_angle = vec2(cos(id_detile.x), sin(id_detile.x));
@@ -106,15 +106,15 @@ float surface_bake_slope_overlay_weight(uint packed, uint background_id, uint ov
 	i_dd_uv = surface_bake_rotate(i_dd_uv, id_cs_angle);
 	i_dd_uv2 = surface_bake_rotate(i_dd_uv2, id_cs_angle);
 	vec4 normal_sample = textureGrad(bake_normal, vec3(id_uv, float(overlay_id)), i_dd_uv, i_dd_uv2);
-	vec3 normal_ps = hydra_idweight_decode_normal(normal_sample, overlay.normal_ao_rough.x);
-	vec3 combined_normal_ws = hydra_idweight_projection_normal_to_world(
+	vec3 normal_ps = idweight_decode_normal(normal_sample, overlay.normal_ao_rough.x);
+	vec3 combined_normal_ws = idweight_projection_normal_to_world(
 			normal_ps, projection_axis, geometric_normal_ws);
 	vec3 normalized_geometric_normal_ws = normalize(geometric_normal_ws);
-	float vertex_up = hydra_idweight_saturate(dot(normalized_geometric_normal_ws, vec3(0.0, 1.0, 0.0)));
+	float vertex_up = idweight_saturate(dot(normalized_geometric_normal_ws, vec3(0.0, 1.0, 0.0)));
 	vec3 flattened_vertical_normal = normalize(mix(combined_normal_ws, vec3(0.0, 1.0, 0.0), vertex_up));
 	vec3 slope_normal = normalize(mix(combined_normal_ws, flattened_vertical_normal, slope_based_damp));
-	return hydra_idweight_compute_slope_tangent(slope_normal,
-			hydra_idweight_slope_threshold(packed), blend_sharpness);
+	return idweight_compute_slope_tangent(slope_normal,
+			idweight_slope_threshold(packed), blend_sharpness);
 }
 
 void surface_bake_add_pair_vertex(uint packed, float barycentric,
@@ -122,25 +122,25 @@ void surface_bake_add_pair_vertex(uint packed, float barycentric,
 		vec2 local, float slope_distance_blend, uint projection_axis, vec3 geometric_normal_ws,
 		vec3 base_ddx, vec3 base_ddy, vec3 vertex,
 		inout IdWeightContributions values, inout float interpolated_overlay_weight) {
-	uint background_id = hydra_idweight_background(packed);
-	uint overlay_id = hydra_idweight_overlay(packed);
-	uint mode = hydra_idweight_mode(packed);
-	float linear_weight = hydra_idweight_weight(packed);
+	uint background_id = idweight_background(packed);
+	uint overlay_id = idweight_overlay(packed);
+	uint mode = idweight_mode(packed);
+	float linear_weight = idweight_weight(packed);
 	float slope_blend = 0.0;
 	float slope_weight = linear_weight;
-	if (mode != HYDRA_IDWEIGHT_MODE_SET && slope_distance_blend > 0.0) {
-		float pair_coverage = hydra_idweight_bilinear_pair_coverage(
+	if (mode != IDWEIGHT_MODE_SET && slope_distance_blend > 0.0) {
+		float pair_coverage = idweight_bilinear_pair_coverage(
 			packed_bottom_left, packed_bottom_right, packed_top_left, packed_top_right, packed, local);
-		slope_blend = hydra_idweight_slope_interior_blend(pair_coverage) * slope_distance_blend;
+		slope_blend = idweight_slope_interior_blend(pair_coverage) * slope_distance_blend;
 		slope_weight = surface_bake_slope_overlay_weight(packed, background_id, overlay_id,
 			slope_distance_blend, projection_axis, geometric_normal_ws, base_ddx, base_ddy, vertex);
 	}
-	float mode_target_weight = hydra_idweight_resolve_mode_target_weight(mode, linear_weight, slope_weight);
-	float overlay_weight = mix(linear_weight, mode_target_weight, hydra_idweight_saturate(slope_blend));
+	float mode_target_weight = idweight_resolve_mode_target_weight(mode, linear_weight, slope_weight);
+	float overlay_weight = mix(linear_weight, mode_target_weight, idweight_saturate(slope_blend));
 	float background_weight = 1.0 - overlay_weight;
-	hydra_idweight_add_contribution(background_id, barycentric * background_weight, values);
+	idweight_add_contribution(background_id, barycentric * background_weight, values);
 	if (overlay_id != background_id) {
-		hydra_idweight_add_contribution(overlay_id, barycentric * overlay_weight, values);
+		idweight_add_contribution(overlay_id, barycentric * overlay_weight, values);
 	}
 	interpolated_overlay_weight += barycentric * overlay_weight;
 }
@@ -219,17 +219,17 @@ void main() {
 		w2 = surface_local.x;
 	}
 
-	float residual_selector = hydra_idweight_stochastic_coverage01_with_salt(vertex, 0x68bc21ebu);
+	float residual_selector = idweight_stochastic_coverage01_with_salt(vertex, 0x68bc21ebu);
 	uvec3 material_ids;
 	vec3 material_weights;
 	uint material_count;
 
-	float triplanar_factor = hydra_idweight_get_triplanar_factor(normal_ws);
-	vec3 triplanar_weights = hydra_idweight_get_triplanar_weights(normal_ws);
+	float triplanar_factor = idweight_get_triplanar_factor(normal_ws);
+	vec3 triplanar_weights = idweight_get_triplanar_weights(normal_ws);
 	uint projection_axis = 1u;
 	if (triplanar_factor > 0.0) {
 		vec3 projection_weights = mix(vec3(0.0, 1.0, 0.0), triplanar_weights, triplanar_factor);
-		projection_axis = hydra_idweight_select_stochastic_coverage_axis(vertex, projection_weights);
+		projection_axis = idweight_select_stochastic_coverage_axis(vertex, projection_weights);
 	}
 
 	float slope_distance_blend = clamp(job.policy.x, 0.0, 1.0);
@@ -245,11 +245,11 @@ void main() {
 	surface_bake_add_pair_vertex(p2, w2, packed_bottom_left, packed_bottom_right,
 			packed_top_left, packed_top_right, surface_local, slope_distance_blend,
 			projection_axis, normal_ws, base_ddx, base_ddy, vertex, pair_values, overlay_weight);
-	hydra_idweight_select_budgeted_3(pair_values, residual_selector, material_ids, material_weights, material_count);
+	idweight_select_budgeted_3(pair_values, residual_selector, material_ids, material_weights, material_count);
 
 	SurfaceBakeMaterial material = SurfaceBakeMaterial(vec4(0.0), vec4(0.0), 0.0, 0.0, 0.0, 0.0);
 	vec3 blended_normal_ws = vec3(0.0);
-	for (int layer = 0; layer < HYDRA_IDWEIGHT_MAX_LAYERS; layer++) {
+	for (int layer = 0; layer < IDWEIGHT_MAX_LAYERS; layer++) {
 		if (uint(layer) >= material_count) {
 			break;
 		}

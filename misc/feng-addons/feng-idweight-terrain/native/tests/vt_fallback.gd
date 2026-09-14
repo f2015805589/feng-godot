@@ -205,22 +205,30 @@ func run() -> void:
 	var far_base_stats := patch_stats(baseline_far, FAR_WORLD, 14)
 	require(float(far_base_stats["mean"]) > 0.03, "far baseline material is unexpectedly black")
 
-	# Cache the far page through SVT. The source array is blanked, so a green/orange
-	# result here proves that the physical material page and its mip texture are used.
+	# The far field is produced from the resident region payloads, so a page with no bake on
+	# disk and none resident still renders real material: the tier must never depend on a
+	# bake file to draw. The strict-diagnostic contract is checked on the near field below,
+	# where a page genuinely cannot be produced.
 	terrain.surface_vt_enabled = false
 	terrain.surface_svt_root_mips = 0
 	terrain.surface_svt_enabled = true
 	var cache_resources := await wait_material_resources()
 	require(cache_resources, "SVT material arrays were not created")
 	terrain.update_surface_svt(64)
-	var missing_svt := await frame_image()
-	missing_svt.save_png(output_dir.path_join("missing-svt.png"))
-	require(float(patch_stats(missing_svt, FAR_WORLD)["magenta"]) > 0.20,
-			"missing SVT must show diagnostics even with original materials available")
-	var missing_records := 0
+	var produced_svt := await frame_image()
+	produced_svt.save_png(output_dir.path_join("missing-svt.png"))
+	require(float(patch_stats(produced_svt, FAR_WORLD)["magenta"]) < 0.02,
+			"a far page must be produced from the resident payloads when no bake exists")
+	require(float(patch_stats(produced_svt, FAR_WORLD)["mean"]) > 0.03,
+			"the produced far page must carry material, not a blank page")
+	var pending_records := 0
 	for record: Dictionary in terrain.get_vt_pages():
-		if record.get("state", "") == "Missing bake": missing_records += 1
-	require(missing_records > 0, "VT Page must identify missing offline bakes")
+		if String(record.get("kind", "")) != "SVT":
+			continue
+		var state := String(record.get("state", ""))
+		if state.begins_with("Pending") or state.begins_with("Missing") or state == "Ready":
+			pending_records += 1
+	require(pending_records > 0, "VT Page must report the far field's production state")
 	var bake_count := terrain.bake_svt()
 	require(bake_count > 0, "SVT bake must queue terrain material pages")
 	for frame in 360:

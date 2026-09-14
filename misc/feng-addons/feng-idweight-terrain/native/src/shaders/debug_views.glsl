@@ -131,7 +131,7 @@ group_uniforms;
 				get_surface_texel(uv, ivec2(0)));
 		vec3 __ctrl_base = __t_colors[int(__control >>6u & 0x1Fu)];
 		vec3 __ctrl_over = __t_colors[int(__control >>11u & 0x1Fu)];
-		float __blend = hydra_idweight_weight(__control);
+		float __blend = idweight_weight(__control);
 		float base_over = (length(fract(uv) - 0.5) < fma(__blend, 0.45, 0.1) ? 1.0 : 0.0);
 		ALBEDO = mix(__ctrl_base, __ctrl_over, base_over);	
 		ROUGHNESS = 1.0;
@@ -146,7 +146,7 @@ group_uniforms;
 		ivec3 __uv = get_index_coord(floor(uv));
 		uint __control = get_surface_value(surface_corner(uv, ivec2(0)), __uv,
 				get_surface_texel(uv, ivec2(0)));
-		float __ctrl_blend = hydra_idweight_weight(__control);
+		float __ctrl_blend = idweight_weight(__control);
 		ALBEDO = vec3(__ctrl_blend);
 		ROUGHNESS = 1.;
 		SPECULAR = 0.;

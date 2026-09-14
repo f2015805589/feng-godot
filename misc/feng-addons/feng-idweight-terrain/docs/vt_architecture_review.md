@@ -28,6 +28,7 @@ lives in these files, and each one owns one thing:
 | `terrain_3d_vt_demand.cpp` | The far field's demand pass over the world page grid, with the shared capacity floor. |
 | `terrain_3d_page_pipeline.{h,cpp}` | The worker and planner threads, the immutable region snapshot they read, raw-ID page payload production, and `.vtcell` reads. |
 | `terrain_vt_cell.h` | The `.vtcell` on-disk contract: format version, file name and the source signature. Shared by the baker that writes the files and the runtime reader that consumes them, because the two must agree exactly. |
+| `terrain_3d_vt_cells.{h,cpp}` | The resident far-field cell sources: three GPU arrays (one layer per cell, full mip chain), the cell registry, the memory budget with its LRU eviction, and the per-(channel, layer, mip) views the page copy shader binds. A cell published here is what makes far-field page assembly a device-to-device copy with no file and no CPU work. |
 | `terrain_3d_surface_vt.cpp` | VT service lifecycle and configuration, capacity growth, invalidation, the `.vtcell` bake/read path, the single page-production choke point and VT telemetry. No demand planning. |
 | `terrain_3d_data_surface.cpp` | The region payload -> page resampler both tiers call: `produce_surface_page_set` for a sector block at one local mip, `produce_surface_rect_page` for a world-space page rectangle. One of three files defining `Terrain3DData`; `terrain_3d_data.cpp` owns the slots, maps and queries and `terrain_3d_data_io.cpp` the region files and map import/export. |
 | `terrain_3d_vt_indirection.{h,cpp}` | Render-thread upload of the CPU-authored page table, coalesced into 16x16 tile patches. |
@@ -91,7 +92,7 @@ With both tiers enabled, AVT covers a camera-centred XZ radius of 512 m by defau
 
 The planner retains compatible nearby sector address blocks and ready pages across turns. Visible requests have priority. Idle surrounding prefetch uses only free physical slots and cannot evict visible work. Offscreen blocks can be reclaimed under pressure; terrain beyond the active range is released when SVT provides the far field. This avoids repeatedly rebuilding warmed headings without lowering foreground target density or enlarging the default pool.
 
-CPU refinement uses projected pixel density; the shader uses world-position derivatives and fractional mip blending. Parents remain resident during refinement, including the world hierarchy above 64 m sectors. Missing/coarser neighbours feather into a ready parent, while equal-detail neighbours stay sharp. New ready pages fade from their parent over 200 ms. Non-power-of-two densities use actual world texel sizes across sector/world transitions. Filtering is isotropic virtual trilinear filtering, not Hydra anisotropic GPU feedback.
+CPU refinement uses projected pixel density; the shader uses world-position derivatives and fractional mip blending. Parents remain resident during refinement, including the world hierarchy above 64 m sectors. Missing/coarser neighbours feather into a ready parent, while equal-detail neighbours stay sharp. New ready pages fade from their parent over 200 ms. Non-power-of-two densities use actual world texel sizes across sector/world transitions. Filtering is isotropic virtual trilinear filtering; it does not use anisotropic GPU page demand.
 
 AVT page production obeys the shared page budget and an approximately 3 ms CPU soft limit checked between pages. A single page can exceed that limit. Cold starts, newly visited regions, edits and insufficient cache capacity still need generation and can expose refinement. Prefetch exchanges idle warm-up work for later reuse; it is not a zero-cost guarantee for arbitrary turns.
 
@@ -101,7 +102,7 @@ SVT defaults to **1 texel/metre**. A 512 m cell bakes three 512 x 512 RGBA16F ma
 
 `svt_cells/<x>_<z>_0.vtcell` stores metadata, a preview and indexed, independently Zstandard-compressed channel/mip chunks. Distant requests seek directly to a coarse mip. Writes use temporary files and rename. Source signatures include density, materials, spacing, surface/control maps and neighbouring height data; physical page size/border changes do not invalidate sources. Old `.vtpage` files are not read or generated and remain untouched; old projects need a rebake.
 
-Runtime caches selected source mips (256 MiB / 64 entries, allowing one oversized mip), extracts required rectangles, and queues GPU copy/composition into physical slots. One runtime page may combine several cells. Baking by cell does not imply one physical slot per cell. Runtime SVT assembly does not generate unused height inputs or retain height-byte copies in page records.
+Runtime caches selected source mips (256 MiB / 64 entries, allowing one oversized mip), extracts required rectangles, and queues GPU copy/composition into physical slots. One runtime page may combine several cells. Baking by cell does not imply one physical slot per cell. Runtime SVT assembly does not generate unused height inputs or retain height-byte copies in page records. A cell that was baked in the running session (or imported) is also published into the resident cell store, and page assembly for it reads no file at all; a page whose cell is neither resident nor persisted is produced from the resident region payloads, so the far field never depends on a bake file to render.
 
 SVT's fixed centred world address grid has a smaller world extent at higher density; the window displays its bounds. Distance selection supplies requested mips. If they exceed capacity, a shared coarseness floor merges pages canonically in mip-0 coordinates using the destination mip, including negative coordinates. Shader page-table fetches use integer mip `texelFetch`, avoiding sampler LOD clamping.
 
@@ -129,7 +130,9 @@ In the fixed D3D12 camera-turn fixture, warmed CPU AVT updates fell from about 3
 
 Draw calls and overdraw were measured, not reduced by deleting required seam geometry or tightening unsafe bounds. The hilly-scene diagnostic preserves terrain vertex deformation and measures potential front-face overlap, not actual early-Z fragment cost. Built-in FRP overdraw substitutes a vertex shader and cannot validate displaced terrain. Arbitrary custom shaders, all shadow configurations, GPU allocation failure injection and complete Godot 4.5 docking are outside the demonstrated regression scope. Whole-world moving demand and synchronous SVT source I/O remain performance limits.
 
-Hydra reference notes are in `terrain_vt_and_streaming.md`; the referenced D:/hydra/hydra-unity checkout was unavailable. This implementation uses CPU footprint demand and is not a claim of an exact Hydra GPU feedback port.
+Demand is CPU footprint based; see `terrain_vt_and_streaming.md` for the addressing contract and
+`terrain_3d_vt_feedback.cpp` for the optional GPU projection pass. This is not a claim of exact
+per-fragment GPU page feedback.
 
 
 ## Optional geometry backend and capture

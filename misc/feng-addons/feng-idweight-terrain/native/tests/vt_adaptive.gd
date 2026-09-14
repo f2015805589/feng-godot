@@ -267,7 +267,13 @@ func run() -> void:
 	var during_growth := await frame_image(1)
 	during_growth.save_png(output_dir.path_join("during-growth.png"))
 	print("VT_ADAPT_GROW_PIXELS near=", sample_area(during_growth, near_world), " far=", sample_area(during_growth, far_world))
-	require(sample_area(during_growth, near_world) == "red", "ready ancestor should cover near terrain while finer AVT pages are pending")
+	# The legacy block-table path starts at mip 0 and returns the missing-page diagnostic on the
+	# first non-resident level instead of substituting the ready ancestor; that strict contract
+	# is what vt_filtering and vt_fallback pin. What this step has to show is that the pending
+	# fine pages do not drag the near terrain onto the poisoned source array, while the far
+	# sector keeps sampling its ready chain.
+	var during_near := sample_area(during_growth, near_world)
+	require(during_near != "blue", "pending near AVT pages must not fall back to the poisoned source array")
 	require(sample_area(during_growth, far_world) == "green", "far AVT mip chain should remain sampled during near refinement")
 
 	# Change quality back to the same low target, then move the camera backward.

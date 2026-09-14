@@ -28,6 +28,7 @@
 
 #include "terrain_3d_avt.h"
 #include "terrain_3d_page_pipeline.h"
+#include "terrain_3d_vt_cells.h"
 
 class Terrain3DVirtualTexture;
 class Terrain3DVTFeedback;
@@ -38,17 +39,39 @@ struct Terrain3DVTState {
 	int vt_page_size = 256;
 	int vt_page_border = 4;
 	int vt_page_count = 256;
+	// Physical capacity already published to both views. Auto capacity raises it above the
+	// setting, and a later reconfiguration (page size, border, resolution) starts from this
+	// value instead of the setting, so a rebuild cannot shrink the pool and then ask the
+	// demand pass to grow it straight back, which would release every resident page twice.
+	int vt_effective_page_count = 256;
+	// Frame the demand pass first skipped production to wait for a requested capacity. The
+	// wait is bounded: the pool cannot be resized in place, so growing it releases whatever
+	// is resident, and producing pages against the old count only spends the bake budget on
+	// content the growth throws away. UINT64_MAX means no wait is in flight.
+	uint64_t vt_capacity_wait_start = UINT64_MAX;
 	bool vt_auto_capacity = true;
 	int vt_pages_per_update = 16;
 	bool vt_adaptive_enabled = true;
+	// Atlas compression for the three material page arrays, as a
+	// Terrain3DAssets::TextureArrayCompression value. Resolved and validated by the
+	// surface baker, which reports what was applied and why a request was refused.
+	int vt_atlas_compression = 0;
 	bool surface_vt_coarse_mip_fallback = false;
 	bool vt_debug_direct_material = false;
 	bool vt_editor_preview = true;
 	Dictionary vt_editor_dirty_regions;
 	uint64_t vt_service_frame = UINT64_MAX;
 	bool vt_shared_ready = false;
+	// Bumped every time the service builds a new page pool. The pool cannot be resized in
+	// place, so a rebuild releases every resident page: a change that does not invalidate
+	// page content must leave this counter alone, and a test asserts exactly that.
+	int vt_pool_generation = 0;
 	bool vt_materials_dirty = true;
 	bool vt_callback_registered = false;
+	// Warn once when the engine build has no virtual texture update callback: without it the
+	// material page producer never runs, and every page-dependent test would fail with no
+	// explanation.
+	bool vt_callback_missing_warned = false;
 	Ref<RefCounted> vt_baker;
 	std::unique_ptr<Terrain3DPagePipeline> vt_page_pipeline, svt_page_pipeline;
 	std::map<int, Terrain3DPagePipeline::Request> svt_pending_pages;
@@ -60,6 +83,18 @@ struct Terrain3DVTState {
 	uint64_t vt_source_revision = 1;
 	Dictionary vt_svt_tiles;
 	Ref<RefCounted> svt_cell_baker;
+	// Resident cell sources of the far field. A cell baked in this session (or imported)
+	// lives here, and page assembly then copies it on the GPU instead of re-reading a bake
+	// file or re-evaluating the material per page. See terrain_3d_vt_cells.h.
+	Ref<Terrain3DCellStore> svt_cells;
+	// Per-cell probe of the persisted bake, remembered so the render path never stats the
+	// same file twice (1 = present, 2 = absent).
+	std::unordered_map<int64_t, uint8_t> svt_cell_file_probe;
+	// Edit stamp per far-field cell. A resident cell is only reused while its stamp is at
+	// least the newest edit that touched it or one of its eight neighbours, because a page
+	// border reads them.
+	std::unordered_map<int64_t, uint64_t> svt_cell_edit_stamp;
+	uint64_t svt_edit_counter = 0;
 	Dictionary svt_cell_job;
 	uint64_t svt_cells_baked = 0;
 	bool svt_auto_bake = true;
@@ -69,6 +104,10 @@ struct Terrain3DVTState {
 	uint64_t vt_svt_bake_generation = 0;
 	Array vt_svt_bake_queue;
 	Dictionary vt_svt_bake_waiting;
+	// An explicit bake_svt() job is queued or still baking its last cell. Automatic jobs wait
+	// for it: one that starts a frame earlier replaces the job-scoped progress counters the
+	// dock and the tests read as "this bake completed".
+	bool vt_svt_explicit_bake = false;
 	int vt_svt_bake_total = 0;
 	int vt_svt_bake_done = 0;
 	uint32_t vt_material_signature = 0;
@@ -77,8 +116,8 @@ struct Terrain3DVTState {
 	String vt_svt_bake_error;
 
 	// Surface virtual texture: the near field's surface pages, produced from the
-	// region surface maps. Off by default; the array path stays authoritative until
-	// the source data carries more detail than the array can afford to keep resident.
+	// region surface maps. On by default since AVT, SVT and CDLOD became the shipped
+	// defaults; the array path still serves every texel no page covers.
 	Terrain3DVirtualTexture *surface_vt = nullptr;
 	bool surface_vt_enabled = true;
 	// The near field's working set is roughly 50 pages at density 4 (a 512 m radius
@@ -138,7 +177,7 @@ struct Terrain3DVTState {
 	// Far field (sparse virtual texture). A world-space page grid at a coarser texel
 	// density, so the surface channel does not have to keep every region's payload
 	// resident: a page spans several regions and its mip chain is world-space, which is
-	// what the region-aligned near field above cannot express. Off by default; the
+	// what the region-aligned near field above cannot express. On by default; the
 	// region texture array still serves whenever no page covers a texel.
 	Terrain3DVirtualTexture *surface_svt = nullptr;
 	bool surface_svt_enabled = true;
@@ -156,6 +195,13 @@ struct Terrain3DVTState {
 	// so it is the far field's fallback rather than a separate fallback page.
 	int surface_svt_root_mips = 2;
 	int vt_svt_visible_pages = 0;
+	// Far-field roots this pass keeps resident and protected: the coarsest levels that
+	// cover the visible world, as (mip 0 page x, mip 0 page y, level). Rebuilt every
+	// demand pass, because a root that leaves the visible set must lose its pin.
+	std::vector<Vector3i> svt_root_pages;
+	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
+	// 0 when the distance-selected set fit. Diagnostics and tests only.
+	int svt_floor_level = 0;
 	// Distance -> level table for the far field, in metres. Entry m is the largest
 	// camera distance at which world mip m is sampled, so the table states the level
 	// bands explicitly instead of deriving them from the page size. Empty keeps the

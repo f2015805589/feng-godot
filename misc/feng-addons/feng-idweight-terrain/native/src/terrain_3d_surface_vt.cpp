@@ -84,6 +84,12 @@ void Terrain3D::set_vt_page_border(int p_border) {
 	_vt.vt_page_border = p_border;
 	_reset_vt_configuration();
 }
+// How long the demand pass may skip production while the producer rebuilds its arrays for a
+// larger capacity. Long enough for the producer's render pass and the pool's own growth (two
+// or three frames), short enough that a device which cannot grow the arrays loses only a
+// fraction of one page budget.
+static const uint64_t MAX_CAPACITY_WAIT_FRAMES = 8;
+
 bool Terrain3D::_ensure_vt_capacity(int p_required) {
 	Terrain3DSurfaceBaker *producer = _vt.vt_baker.is_valid() ? baker(_vt.vt_baker) : nullptr;
 	if (_vt.vt_shared_ready && producer && !_vt.vt_debug_direct_material) {
@@ -92,7 +98,8 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 			// Publish higher slot IDs only after the GPU cache was copied. Keep
 			// addresses, owners and source jobs, including an already completed plan.
 			if (!_vt.surface_vt->grow_capacity(ready_capacity) || !_vt.surface_svt->grow_capacity(ready_capacity)) { return false; }
-			_vt.vt_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
+			_vt.vt_page_count = _vt.vt_effective_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
+			_vt.vt_capacity_wait_start = UINT64_MAX;
 			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 			notify_property_list_changed();
 			return true;
@@ -106,6 +113,20 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 	while (capacity < transition_capacity && capacity < 1024) { capacity *= 2; }
 	if (_vt.vt_shared_ready && producer && !_vt.vt_debug_direct_material) {
 		producer->request_capacity(capacity);
+		// Wait, briefly, for the producer to publish the larger arrays: the pool follows them
+		// on the next frame or two, and a page produced against the old count is released by
+		// that growth. The wait is bounded, so a state that cannot grow the arrays - no
+		// material arrays to build, a failed allocation - never stops page production.
+		const uint64_t frame = Engine::get_singleton()->get_process_frames();
+		if (producer->has_pending_capacity()) {
+			if (_vt.vt_capacity_wait_start == UINT64_MAX) {
+				_vt.vt_capacity_wait_start = frame;
+			}
+			if (frame < _vt.vt_capacity_wait_start + MAX_CAPACITY_WAIT_FRAMES) {
+				return true;
+			}
+		}
+		_vt.vt_capacity_wait_start = UINT64_MAX;
 		return false;
 	}
 	set_vt_page_count(capacity);
@@ -119,6 +140,8 @@ void Terrain3D::set_vt_page_count(int p_count) {
 		return;
 	}
 	_vt.vt_page_count = p_count;
+	// An explicit capacity is a request, not a floor: it replaces the auto-grown value.
+	_vt.vt_effective_page_count = p_count;
 	_reset_vt_configuration();
 }
 void Terrain3D::set_vt_pages_per_update(int p_pages) {
@@ -141,6 +164,46 @@ void Terrain3D::_cancel_svt_bake(const String &p_reason) {
 	}
 	_vt.vt_svt_bake_queue.clear();
 	_vt.vt_svt_bake_waiting.clear();
+}
+
+// Compresses and decodes one image through the atlas codec, so a test can verify the codec
+// path where page production has nothing to bake from.
+Dictionary Terrain3D::probe_vt_atlas_compression(const Ref<Image> &p_image) const {
+	if (!_vt.vt_baker.is_valid()) {
+		return Dictionary();
+	}
+	return baker(_vt.vt_baker)->probe_atlas_compression(p_image);
+}
+
+void Terrain3D::set_vt_atlas_compression(const int p_compression) {
+	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
+	if (_vt.vt_atlas_compression == mode) {
+		return;
+	}
+	_vt.vt_atlas_compression = mode;
+	// Only the three material page arrays carry the format. The pool, the world addresses,
+	// the owners and the demand plan are format independent, and the producer rebuilds the
+	// arrays in place - it bumps its own generation, which makes its next render pass
+	// replace the bundle in the new format. Reconfiguring the service here instead would
+	// detach both views, release every resident page and grow the pool back to the
+	// capacity it had already published.
+	if (_vt.vt_baker.is_valid()) {
+		baker(_vt.vt_baker)->set_atlas_compression(mode);
+		// The rebuilt arrays start blank, so the pages that were produced in the previous
+		// format have to be produced again. This is forced: a plain edit is deferred while
+		// the editor preview is active, but a format change leaves nothing to fall back on.
+		if (_data) {
+			for (const Vector2i &location : _data->get_region_locations()) {
+				invalidate_surface_pages(location, true);
+			}
+		}
+		_vt.vt_materials_dirty = true;
+		return;
+	}
+	_reset_vt_configuration();
+}
+int Terrain3D::get_vt_atlas_compression() const {
+	return _vt.vt_atlas_compression;
 }
 
 void Terrain3D::_reset_vt_configuration() {
@@ -205,10 +268,15 @@ void Terrain3D::_configure_vt_service() {
 	// never destroy a pool that another view is still sampling.
 	auto pool = Terrain3DVirtualTexture::create_page_pool();
 	// Both views adopt the shared dimensions before they are configured, so the one
-	// configuration helper describes the view that is actually built.
+	// configuration helper describes the view that is actually built. A reconfiguration
+	// keeps the capacity that is already published: auto capacity only ever grows, and
+	// starting again from the setting would make the demand pass re-grow the pool - which
+	// releases every page it had just rebuilt - for no reason.
+	const int capacity = CLAMP(MAX(_vt.vt_page_count, _vt.vt_effective_page_count), 8, 1024);
+	_vt.vt_page_count = capacity;
 	_vt.surface_vt_page_size = _vt.surface_svt_page_size = _vt.vt_page_size;
 	_vt.surface_vt_page_border = _vt.surface_svt_page_border = _vt.vt_page_border;
-	_vt.surface_vt_page_count = _vt.surface_svt_page_count = _vt.vt_page_count;
+	_vt.surface_vt_page_count = _vt.surface_svt_page_count = capacity;
 	for (Terrain3DVirtualTexture *view : { _vt.surface_vt, _vt.surface_svt }) {
 		view->clear();
 		view->set_page_pool(pool);
@@ -237,13 +305,18 @@ void Terrain3D::_configure_vt_service() {
 		instance.instantiate();
 		_vt.vt_baker = instance;
 	}
-	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, _vt.vt_page_count);
+	baker(_vt.vt_baker)->set_atlas_compression(_vt.vt_atlas_compression);
+	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, capacity);
+	_configure_svt_cell_store();
 	_vt.vt_bound_albedo = RID();
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 	}
 	_vt.vt_materials_dirty = true;
 	_vt.vt_shared_ready = true;
+	// A new pool has no resident page: everything has to be produced again. Callers that
+	// only change how a page is stored must not reach this point.
+	_vt.vt_pool_generation++;
 }
 
 bool Terrain3D::_vt_has_pending_upload() const {
@@ -279,8 +352,18 @@ void Terrain3D::_update_vt_service() {
 		RS->call("virtual_texture_set_update_callback", int64_t(get_instance_id()),
 				Callable(producer, "render_pending").bind(_vt.vt_baker));
 		_vt.vt_callback_registered = true;
+	} else if (!_vt.vt_callback_registered && !_vt.vt_callback_missing_warned) {
+		// Without this API the engine never invokes the material page producer, so no page
+		// is ever baked and the near and far fields render from the region texture array.
+		// Say so once, instead of leaving page-dependent tests failing for no visible reason.
+		_vt.vt_callback_missing_warned = true;
+		WARN_PRINT("This engine build has no virtual_texture_set_update_callback; surface material pages cannot be produced. Rebuild the engine from this source tree.");
 	}
-	if (_vt.vt_materials_dirty) {
+	producer->set_page_budget(_vt.vt_pages_per_update);
+	if (_vt.vt_materials_dirty || producer->materials_stale()) {
+		// Also re-publish when the producer reports its snapshot unbound: the arrays it named
+		// were freed by a newer asset edit, and publishing the current pair is what recovers,
+		// instead of retrying a dead pair every frame.
 		producer->set_materials(_assets->get_albedo_array_rid(), _assets->get_normal_array_rid(),
 				_assets->get_texture_colors(), _assets->get_texture_normal_depths(),
 				_assets->get_texture_ao_strengths(), _assets->get_texture_ao_light_affects(),
@@ -308,13 +391,23 @@ void Terrain3D::_update_vt_service() {
 		}
 	}
 	RID albedo = producer->get_albedo_rid();
-	if (albedo != _vt.vt_bound_albedo && _material.is_valid()) {
+	if (albedo != _vt.vt_bound_albedo) {
 		_vt.vt_bound_albedo = albedo;
-		_material->update(Terrain3DMaterial::REGION_ARRAYS);
+		if (_material.is_valid()) {
+			_material->update(Terrain3DMaterial::REGION_ARRAYS);
+		}
+		// Acknowledged even without a material: the producer releases the arrays it
+		// replaced, and none of them is referenced once nothing binds them.
 		producer->acknowledge_output(albedo);
 	}
 
 	_process_async_svt_pages();
+	// The explicit job is done once its queue, its waiting set and the cell it was baking are
+	// all empty; only then may an automatic job take over the progress counters.
+	if (_vt.vt_svt_explicit_bake && _vt.vt_svt_bake_queue.is_empty() &&
+			_vt.vt_svt_bake_waiting.is_empty() && _vt.svt_cell_job.is_empty()) {
+		_vt.vt_svt_explicit_bake = false;
+	}
 	_process_svt_auto_bake();
 	// RD writes and worker completion do not mark RenderingServer as changed.
 	// In the editor's low-processor mode that otherwise leaves queued GPU pages
@@ -339,20 +432,45 @@ void Terrain3D::_process_async_svt_pages() {
 		}
 		if (_vt.vt_page_records.has(slot)) {
 			Dictionary record = _vt.vt_page_records[slot];
-			if (result.payload.is_valid() && _vt.surface_svt->write_page(slot, result.payload)) {
+			const bool written = result.payload.is_valid() &&
+					_vt.surface_svt->write_page(slot, result.payload);
+			if (written) {
 				record["source"] = result.payload->get_data();
 			}
+			bool cell_copy_queued = false;
 			if (result.missing.empty() && !result.sources.is_empty()) {
 				record["state"] = "Pending cell copy";
 				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect);
+				cell_copy_queued = true;
 			} else {
 				record["state"] = "Missing/stale cell bake";
-				if (_vt.svt_auto_bake && !_data_directory.is_empty()) {
+				// A running explicit job already covers these cells: a full bake covers every
+				// region. Arming the automatic job here makes it start the frame the explicit
+				// job drains and replace its job-scoped progress counters, which the dock and
+				// the tests read as "the bake completed".
+				const bool explicit_job = _vt.vt_svt_explicit_bake ||
+						!_vt.vt_svt_bake_queue.is_empty() ||
+						!_vt.vt_svt_bake_waiting.is_empty();
+				if (_vt.svt_auto_bake && !_data_directory.is_empty() && !explicit_job) {
 					for (const Vector2i &cell : result.missing) {
 						if (_vt.vt_svt_dirty_regions.is_empty()) { _vt.vt_svt_edit_time = 0; }
 						_vt.vt_svt_dirty_regions[cell] = true;
 					}
 				}
+			}
+			if (!written && !cell_copy_queued) {
+				// The slot is allocated and published, but neither the raw-ID payload nor
+				// a GPU cell copy will ever fill it. Release both so a later demand pass
+				// requests the page again instead of sampling an unwritten layer for the
+				// rest of the session.
+				WARN_PRINT("Releasing SVT slot " + String::num_int64(slot) + " after failed page production");
+				const Vector2i address = record.get("address", Vector2i());
+				const int mip = record.get("mip", 0);
+				// Advance the iterator first: _invalidate_vt_slot() erases this entry by key.
+				it = _vt.svt_pending_pages.erase(it);
+				_invalidate_vt_slot(slot);
+				_vt.surface_svt->release_world_page(address.x, address.y, mip);
+				continue;
 			}
 		}
 		it = _vt.svt_pending_pages.erase(it);
@@ -360,9 +478,39 @@ void Terrain3D::_process_async_svt_pages() {
 	}
 }
 
+// Physical memory the resident far-field cells may occupy, across all three channels.
+// Cells are an accelerator: one that does not fit is evicted and the pages it served are
+// rebuilt from the resident payloads, which is why this is a budget and not a requirement.
+static const int64_t SVT_CELL_STORE_BUDGET_BYTES = 192 * 1024 * 1024;
+
+void Terrain3D::_configure_svt_cell_store() {
+	if (_vt.vt_baker.is_null()) {
+		return;
+	}
+	if (_vt.svt_cells.is_null()) {
+		Ref<Terrain3DCellStore> store;
+		store.instantiate();
+		_vt.svt_cells = store;
+	}
+	const int resolution = MAX(1, int(Math::ceil(double(_region_size) * double(_vertex_spacing) *
+			MAX(0.001, get_surface_svt_texels_per_meter()))));
+	int64_t level_bytes = 0;
+	for (int size = resolution; size > 0; size >>= 1) {
+		level_bytes += int64_t(MAX(1, size)) * MAX(1, size) * 8;
+	}
+	const int64_t per_layer = MAX(1, level_bytes) * 3;
+	const int capacity = int(CLAMP(SVT_CELL_STORE_BUDGET_BYTES / per_layer, 1, 64));
+	_vt.svt_cells->initialize(RS->get_rendering_device(), capacity, resolution);
+	_vt.svt_cell_file_probe.clear();
+	baker(_vt.vt_baker)->set_cell_store(_vt.svt_cells);
+}
+
 void Terrain3D::_destroy_vt_service() {
 	if (_vt.surface_vt) { _vt.surface_vt->set_material_cache_mode(false); }
 	if (_vt.surface_svt) { _vt.surface_svt->set_material_cache_mode(false); }
+	if (_vt.vt_baker.is_valid()) { baker(_vt.vt_baker)->set_cell_store(Ref<Terrain3DCellStore>()); }
+	if (_vt.svt_cells.is_valid()) { _vt.svt_cells->clear(); }
+	_vt.svt_cell_file_probe.clear();
 	_vt.vt_page_pipeline.reset();
 	_vt.svt_page_pipeline.reset();
 	_vt.svt_pending_pages.clear();
@@ -434,6 +582,138 @@ int Terrain3D::prepare_vt_capture() {
 	return queued;
 }
 
+// A resident cell is reused while this key matches the one it was published with. It is
+// deliberately cheap - the material signature, the far-field density and a per-cell edit
+// stamp - because it is evaluated for every cell of every page; the exact content
+// signature stays on the bake path, which is the only place a mismatch must be proven.
+uint64_t Terrain3D::_svt_cell_state_key(const Vector2i &p_cell) const {
+	uint64_t key = uint64_t(_vt.vt_material_signature) * 1099511628211ull;
+	key ^= uint64_t(int64_t(Math::round(double(get_surface_svt_texels_per_meter()) * 1000.0))) * 1315423911ull;
+	const int64_t cell_id = (int64_t(p_cell.x) << 32) ^ uint32_t(p_cell.y);
+	const auto found = _vt.svt_cell_edit_stamp.find(cell_id);
+	key ^= (found != _vt.svt_cell_edit_stamp.end() ? found->second : uint64_t(0)) * 2654435761ull;
+	return key;
+}
+
+// The cells a page samples, resolved against the resident store. The geometry is the same
+// world crop the file-backed path builds: every cell the page and its border ring touch
+// contributes one piece, weighted by how much of the page pixel it covers, and the border
+// reads the neighbouring cells. A piece names the store layer and the level whose texel is
+// closest to one page pixel, so the copy shader samples the whole cell level and the
+// accumulate pass is what crops it.
+bool Terrain3D::_resolve_svt_cell_pieces(const Rect2 &p_rect, Array &r_pieces,
+		std::vector<Vector2i> &r_missing) {
+	if (!_data || !_vt.svt_cells.is_valid() || !_vt.svt_cells->is_initialized() ||
+			_vt.vt_page_size <= 0 || p_rect.size.x <= 0.f) {
+		return false;
+	}
+	const float world = float(_region_size) * _vertex_spacing;
+	if (world <= 0.f) {
+		return false;
+	}
+	const float pixel = p_rect.size.x / float(_vt.vt_page_size);
+	const Rect2 footprint = p_rect.grow(pixel * _vt.vt_page_border);
+	// The store bakes at the far field's density, so the level is the one whose texel is
+	// nearest a page pixel; the same choice the file-backed reader makes.
+	const int resolution = _vt.svt_cells->get_resolution();
+	const int level = CLAMP(int(Math::floor(Math::log(MAX(1.f, pixel * float(get_surface_svt_texels_per_meter()))) /
+											Math::log(2.f))),
+			0, MAX(0, _vt.svt_cells->get_level_count() - 1));
+	const int level_size = MAX(1, resolution >> level);
+	const Vector2i first(int(Math::floor(footprint.position.x / world)), int(Math::floor(footprint.position.y / world)));
+	const Vector2i last(int(Math::floor(footprint.get_end().x / world)), int(Math::floor(footprint.get_end().y / world)));
+	// A root page can span a continent. Above this many cells the store cannot serve the
+	// page usefully anyway (it holds a handful), and the caller falls back to cropping the
+	// resident payloads, which costs one pass over the regions instead of one per cell.
+	const int64_t span_x = int64_t(last.x) - int64_t(first.x) + 1;
+	const int64_t span_z = int64_t(last.y) - int64_t(first.y) + 1;
+	if (span_x <= 0 || span_z <= 0 || span_x * span_z > 4096) {
+		return false;
+	}
+	for (int z = first.y; z <= last.y; ++z) {
+		for (int x = first.x; x <= last.x; ++x) {
+			const Vector2i cell(x, z);
+			const Rect2 cell_rect(Vector2(cell) * world, Vector2(world, world));
+			const Terrain3DCellStore::Cell *entry = _vt.svt_cells->find_cell(cell, _svt_cell_state_key(cell));
+			if (!entry) {
+				r_missing.push_back(cell);
+				continue;
+			}
+			_vt.svt_cells->touch_cell(cell);
+			float left = 0.f, right = 0.f, top = 0.f, bottom = 0.f;
+			// A page that reaches past the resident world needs edge texels in its border
+			// too, and only there: a cell that exists but has no bake still blocks the page.
+			const float padding = pixel * (_vt.vt_page_border + 1);
+			bool open_x = true, open_z = true;
+			for (int dz = -1; dz <= 1 && open_x; ++dz) {
+				for (int dx = -1; dx <= 1; ++dx) {
+					if (_data->has_region(cell + Vector2i(dx, dz))) { open_x = false; break; }
+				}
+			}
+			for (int dx = -1; dx <= 1 && open_z; ++dx) {
+				for (int dz = -1; dz <= 1; ++dz) {
+					if (_data->has_region(cell + Vector2i(dx, dz))) { open_z = false; break; }
+				}
+			}
+			if (open_x) { left = x == first.x ? padding : 0.f; right = x == last.x ? padding : 0.f; }
+			if (open_z) { top = z == first.y ? padding : 0.f; bottom = z == last.y ? padding : 0.f; }
+			Dictionary piece;
+			piece["layer"] = entry->layer;
+			piece["level"] = level;
+			piece["cell_rect"] = cell_rect;
+			piece["coverage_rect"] = Rect2(cell_rect.position - Vector2(left, top),
+					cell_rect.size + Vector2(left + right, top + bottom));
+			// The store view covers the whole cell level, so the source rect is the cell.
+			piece["source_rect"] = cell_rect;
+			piece["level_size"] = level_size;
+			r_pieces.push_back(piece);
+		}
+	}
+	return true;
+}
+
+// Whether any cell this page touches has a persisted bake. The answer is remembered per
+// cell, so the render path never stats the same file twice.
+bool Terrain3D::_svt_cells_have_persisted_bake(const Rect2 &p_rect) {
+	if (_data_directory.is_empty() || !_data) {
+		return false;
+	}
+	const float world = float(_region_size) * _vertex_spacing;
+	if (world <= 0.f) {
+		return false;
+	}
+	const float pixel = p_rect.size.x / float(MAX(1, _vt.vt_page_size));
+	const Rect2 footprint = p_rect.grow(pixel * _vt.vt_page_border);
+	const Vector2i first(int(Math::floor(footprint.position.x / world)), int(Math::floor(footprint.position.y / world)));
+	const Vector2i last(int(Math::floor(footprint.get_end().x / world)), int(Math::floor(footprint.get_end().y / world)));
+	const int resolution = MAX(1, int(Math::ceil(double(world) * MAX(0.001, get_surface_svt_texels_per_meter()))));
+	const int64_t span_x = int64_t(last.x) - int64_t(first.x) + 1;
+	const int64_t span_z = int64_t(last.y) - int64_t(first.y) + 1;
+	if (span_x <= 0 || span_z <= 0 || span_x * span_z > 4096) {
+		return false;
+	}
+	for (int z = first.y; z <= last.y; ++z) {
+		for (int x = first.x; x <= last.x; ++x) {
+			const Vector2i cell(x, z);
+			const int64_t key = (int64_t(x) << 32) ^ uint32_t(z);
+			auto probe = _vt.svt_cell_file_probe.find(key);
+			if (probe == _vt.svt_cell_file_probe.end()) {
+				probe = _vt.svt_cell_file_probe.emplace(key, uint8_t(2)).first;
+				const Dictionary saved = _load_svt_cell(cell);
+				// A bake at another resolution would have to be resampled into the store's
+				// shape, so only a matching one counts as usable here.
+				if (!saved.is_empty() && int(saved.get("resolution", 0)) == resolution) {
+					probe->second = 1;
+				}
+			}
+			if (probe->second == 1) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
 		bool p_svt, int p_mip, const Vector2i &p_address, const Terrain3DPagePipeline::Result *p_prepared) {
 	Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
@@ -444,7 +724,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	Dictionary record;
 	record["slot"] = p_slot;
 	record["kind"] = p_svt ? "SVT" : "AVT";
-	record["state"] = p_svt ? "Pending cell read" : "Pending bake";
+	record["state"] = "Pending bake";
 	record["world_rect"] = p_rect;
 	record["mip"] = p_mip;
 	record["address"] = p_address;
@@ -452,11 +732,45 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	record["source"] = p_payload.is_valid() ? p_payload->get_data() : PackedByteArray();
 	_vt.vt_page_records[p_slot] = record;
 	if (p_svt) {
-		if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
-		Terrain3DPagePipeline::Request request{{p_slot, 0, 0, 0, 0}, p_rect, _vt.vt_page_size, _vt.vt_page_border};
-		request.svt = true; request.directory = _data_directory;
-		request.materials = _vt.vt_material_signature; request.density = get_surface_svt_texels_per_meter();
-		_vt.svt_pending_pages[p_slot] = std::move(request);
+		// The far field has three sources, in this order of preference:
+		//   1. a resident baked cell (this store) - a GPU copy, no CPU work and no file;
+		//   2. a persisted bake on disk - assembled by the source worker, one read per page;
+		//   3. the resident region payloads - cropped and baked here, so a page is produced
+		//      whether or not any bake exists.
+		// Only the first is free, but none of them makes rendering depend on a file.
+		if (_vt.svt_cells.is_valid() && _vt.svt_cells->is_initialized()) {
+			Array pieces;
+			std::vector<Vector2i> missing;
+			if (_resolve_svt_cell_pieces(p_rect, pieces, missing) && missing.empty() && !pieces.is_empty()) {
+				record["state"] = "Pending cell copy";
+				record["cells"] = pieces.size();
+				_vt.vt_page_records[p_slot] = record;
+				producer->queue_cell_page(p_slot, pieces, p_rect);
+				return;
+			}
+		}
+		if (_svt_cells_have_persisted_bake(p_rect)) {
+			if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
+			Terrain3DPagePipeline::Request request{{p_slot, 0, 0, 0, 0}, p_rect, _vt.vt_page_size, _vt.vt_page_border};
+			request.svt = true; request.directory = _data_directory;
+			request.materials = _vt.vt_material_signature; request.density = get_surface_svt_texels_per_meter();
+			record["state"] = "Missing bake";
+			_vt.vt_page_records[p_slot] = record;
+			_vt.svt_pending_pages[p_slot] = std::move(request);
+			return;
+		}
+		// The raw ID/weight and height source is cropped from the resident region payloads
+		// and the GPU bake turns it into material channels, exactly like the near field.
+		Ref<Image> ids;
+		if (_data->produce_surface_rect_page(p_rect, _vt.vt_page_size, _vt.vt_page_border, ids) < 0) {
+			record["state"] = "No resident payload";
+			_vt.vt_page_records[p_slot] = record;
+			return;
+		}
+		const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt.vt_page_size, _vt.vt_page_border,
+				_vertex_spacing / _surface_density, ids, height);
+		if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
+		producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid);
 		return;
 	}
 	if (p_prepared) {
@@ -476,6 +790,15 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 	_vt.avt_plan_key.clear();
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
+	// A resident far-field cell is stale from the moment a region in it - or beside it, since
+	// a page border reads the neighbours - is edited, and the persisted bake with it.
+	for (int dz = -1; dz <= 1; ++dz) {
+		for (int dx = -1; dx <= 1; ++dx) {
+			const Vector2i cell = p_region + Vector2i(dx, dz);
+			_vt.svt_cell_edit_stamp[(int64_t(cell.x) << 32) ^ uint32_t(cell.y)] = ++_vt.svt_edit_counter;
+			_vt.svt_cell_file_probe.erase((int64_t(cell.x) << 32) ^ uint32_t(cell.y));
+		}
+	}
 	_vt.vt_svt_dirty_regions[p_region] = true;
 	_vt.vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
 	if (_vt.vt_baker.is_null()) {
@@ -532,6 +855,10 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["page_size"] = _vt.vt_page_size;
 	result["border"] = _vt.vt_page_border;
 	result["page_count"] = _vt.vt_page_count;
+	result["effective_page_count"] = _vt.vt_effective_page_count;
+	// How many times the service built a page pool. Building one releases every resident
+	// page, because the atlas cannot be resized in place.
+	result["pool_generation"] = _vt.vt_pool_generation;
 	result["auto_capacity"] = _vt.vt_auto_capacity;
 	// Three RGBA16F outputs, R16 IDs, and R16+R32F bake staging per slot.
 	result["physical_cache_bytes"] = int64_t(_vt.vt_page_size + 2 * _vt.vt_page_border) * (_vt.vt_page_size + 2 * _vt.vt_page_border) * _vt.vt_page_count * 32;
@@ -552,6 +879,26 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
 	result["avt_sector_stats"] = _vt.avt_sector_stats;
 	result["svt_effective_max_mip"] = _vt.surface_svt ? _vt.surface_svt->get_world_max_mip() : _vt.surface_svt_max_mip;
+	// Far-field residency diagnostics: the root pyramid the last pass pinned, and the
+	// coarseness floor it raised its detail pages to (0 when the set fit).
+	result["svt_root_pages"] = int(_vt.svt_root_pages.size());
+	result["svt_floor_level"] = _vt.svt_floor_level;
+	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
+	// Resident far-field cell sources: what the runtime copies pages from without touching
+	// a file or re-baking, and how close that cache is to its memory budget.
+	if (_vt.svt_cells.is_valid()) {
+		result["svt_cells"] = _vt.svt_cells->get_stats();
+	}
+	// Atlas compression: the request, what the baker resolved it to, and the reason a
+	// request was refused (unsupported codec, no compressor, or an unloadable format).
+	result["vt_atlas_compression"] = _vt.vt_atlas_compression;
+	if (_vt.vt_baker.is_valid()) {
+		const Dictionary compression = baker(_vt.vt_baker)->get_atlas_compression_info();
+		result["vt_atlas_compression_available"] = compression.get("available", 0);
+		result["vt_atlas_compression_applied"] = compression.get("applied", 0);
+		result["vt_atlas_compression_name"] = compression.get("name", String());
+		result["vt_atlas_compression_reason"] = compression.get("reason", String());
+	}
 	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
 	result["editor_preview"] = _vt.vt_editor_preview;
 	result["editor_preview_active"] = is_vt_editor_preview_active();
@@ -638,9 +985,17 @@ Dictionary Terrain3D::_load_svt_cell(const Vector2i &p_cell) {
 }
 
 Array Terrain3D::get_svt_baked_pages() {
+	// Two kinds of source can serve a far page: a persisted bake on disk, which the runtime
+	// will read once, and a cell that is already resident on the GPU (baked in this session,
+	// or imported). The browser lists both. A persisted bake keeps its tile - it is the
+	// artifact a caller tracks by path - and a resident cell only adds a tile when no bake
+	// file describes that address.
 	if (!_vt.vt_svt_catalog_loaded && !_data_directory.is_empty()) {
 		_vt.vt_svt_catalog_loaded = true;
 		for (const Vector2i &cell : _data->get_region_locations()) {
+			if (_vt.vt_svt_tiles.has(tile_key(cell, 0))) {
+				continue;
+			}
 			String path = _svt_page_path(cell, 0);
 			if (!FileAccess::file_exists(path)) {
 				continue;
@@ -669,6 +1024,18 @@ Array Terrain3D::get_svt_baked_pages() {
 			_vt.vt_svt_tiles[tile_key(cell, 0)] = tile;
 		}
 	}
+	// Resident cells whose address no bake file describes: listed with an empty path, since
+	// what the runtime serves them from is device memory and not a file.
+	if (_vt.svt_cells.is_valid() && _vt.svt_cells->is_initialized()) {
+		for (const Variant &entry : _vt.svt_cells->get_catalog()) {
+			Dictionary tile = entry;
+			const Vector2i address = tile.get("address", Vector2i());
+			if (_vt.vt_svt_tiles.has(tile_key(address, 0))) {
+				continue;
+			}
+			_vt.vt_svt_tiles[tile_key(address, 0)] = tile;
+		}
+	}
 	return _vt.vt_svt_tiles.values();
 }
 
@@ -688,6 +1055,9 @@ int Terrain3D::bake_svt() {
 	}
 	_vt.vt_svt_bake_waiting.clear();
 	_vt.vt_svt_dirty_regions.clear();
+	// The explicit job owns the progress counters until it has fully drained, including the
+	// cell it happens to be baking when its queue empties.
+	_vt.vt_svt_explicit_bake = true;
 	return _queue_svt_bake(Dictionary());
 }
 
@@ -703,7 +1073,7 @@ void Terrain3D::set_svt_auto_bake(bool p_enabled) {
 
 void Terrain3D::_process_svt_auto_bake() {
 	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !_vt.surface_svt_enabled || _data_directory.is_empty() || _vt.vt_svt_dirty_regions.is_empty() ||
-			!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty() ||
+			!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty() || _vt.vt_svt_explicit_bake ||
 			Time::get_singleton()->get_ticks_msec() - _vt.vt_svt_edit_time < 500) {
 		return;
 	}
@@ -767,6 +1137,17 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 				}
 			}
 			String path = _svt_page_path(cell, 0);
+			// The resident copy is published first and independently of the file: it is what
+			// the runtime reads, and a read-only or full disk must not stop the far field
+			// from being served from device memory.
+			Vector2i evicted(INT32_MAX, INT32_MAX);
+			bool resident = false;
+			if (valid && _vt.svt_cells.is_valid() && _vt.svt_cells->is_initialized()) {
+				const Ref<Image> cell_channels[3] = { images["albedo_height"], images["normal_roughness"], images["params"] };
+				resident = _vt.svt_cells->publish_cell(cell, _svt_cell_state_key(cell),
+						_vt.svt_cell_job["world_rect"], cell_channels, resolution, &evicted);
+				if (resident) { _vt.svt_cell_file_probe[(int64_t(cell.x) << 32) ^ uint32_t(cell.y)] = 1; }
+			}
 			if (valid) {
 				Dictionary saved;
 				saved["version"] = TerrainVTCell::FORMAT_VERSION;
@@ -811,21 +1192,31 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 					valid = DirAccess::rename_absolute(temporary, path) == OK;
 				}
 			}
-			if (valid) {
+			if (valid || resident) {
 				_vt.vt_svt_bake_done++;
 				_vt.svt_cells_baked++;
 				_vt.vt_svt_catalog_loaded = false;
 				_vt.vt_svt_tiles.clear();
-				// Requeue resident runtime pages from the newly persisted source.
-				const Rect2 cell_rect = _vt.svt_cell_job["world_rect"];
-				for (const Variant &key : _vt.vt_page_records.keys()) {
-					Dictionary record = _vt.vt_page_records[key];
-					Rect2 rect = record["world_rect"];
-					if (record.get("kind", String()) != Variant("SVT") || !rect.grow(rect.size.x * _vt.vt_page_border / _vt.vt_page_size).intersects(cell_rect)) {
+				// Requeue the pages that sample this cell, so they are assembled from the
+				// bake that just landed instead of the payloads they were baked from. A cell
+				// that was evicted to make room has to be requeued the same way: its pages
+				// now name a layer that holds another cell.
+				const Rect2 requeue_rects[] = { Rect2(_vt.svt_cell_job["world_rect"]),
+					evicted.x == INT32_MAX ? Rect2() : Rect2(Vector2(evicted) * float(_region_size) * _vertex_spacing,
+															Vector2(float(_region_size) * _vertex_spacing, float(_region_size) * _vertex_spacing)) };
+				for (const Rect2 &cell_rect : requeue_rects) {
+					if (cell_rect.size.x <= 0.f) {
 						continue;
 					}
-					Ref<Image> payload;
-					_queue_vt_material_page(int(key), payload, rect, true, int(record["mip"]), record["address"]);
+					for (const Variant &key : _vt.vt_page_records.keys()) {
+						Dictionary record = _vt.vt_page_records[key];
+						Rect2 rect = record["world_rect"];
+						if (record.get("kind", String()) != Variant("SVT") || !rect.grow(rect.size.x * _vt.vt_page_border / _vt.vt_page_size).intersects(cell_rect)) {
+							continue;
+						}
+						Ref<Image> payload;
+						_queue_vt_material_page(int(key), payload, rect, true, int(record["mip"]), record["address"]);
+					}
 				}
 			} else {
 				_vt.vt_svt_bake_failed++;

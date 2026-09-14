@@ -74,6 +74,10 @@ func run() -> void:
 	terrain.vt_page_size = PAGE_SIZE
 	terrain.vt_page_border = PAGE_BORDER
 	terrain.vt_page_count = 8
+	# The manual passes below are one-shot and authoritative, so the pool they budget against
+	# has to be the pool they get: with auto capacity on, the first pass requests a larger pool
+	# and (deliberately) produces nothing while that request is in flight.
+	terrain.vt_auto_capacity = false
 	terrain.surface_vt_pages_per_axis = 1
 	terrain.surface_vt_region_grid = Vector2i(1, 1)
 	terrain.surface_vt_region_offset = Vector2i.ZERO
@@ -143,8 +147,10 @@ func run() -> void:
 	# bake; page residency/order is the assertion, not material-channel readiness.
 	# Move several regions beyond storage order before checking SVT priority. The
 	# first request may use a coarser mip when the page budget requires it.
-	camera.position = Vector3(32.0, 40.0, 320.0)
-	camera.look_at(Vector3(32.0, 0.0, 700.0), Vector3.UP)
+	# Look straight down: a tilted view puts the AVT visible-region rect and the
+	# distance-picked SVT page in different regions, which the assertion below is not about.
+	camera.position = Vector3(32.0, 40.0, 352.0)
+	camera.rotation_degrees = Vector3(-90.0, 0.0, 0.0)
 	await frame_barrier()
 	var svt_focus: Rect2i = terrain.get_surface_vt_region_rect()
 	print("VT_VISIBILITY_SVT_FOCUS ", svt_focus)
@@ -172,8 +178,11 @@ func run() -> void:
 				[str(storage_first_center), int(first.get("mip", -1)), str(page_rect)])
 		require(int(first.get("mip", -1)) >= 0,
 				"visible SVT page should report a valid mip, got " + str(first.get("mip", -1)))
-		require(first.get("state", "") == "Missing bake",
-				"an uncached SVT page should be reported as Missing bake, got " + str(first.get("state", "")))
+		# No persisted bake exists for this cell, so the page is produced from the resident
+		# region payloads. The record has to say it is still pending rather than claim a
+		# page that does not exist yet.
+		require(String(first.get("state", "")).begins_with("Pending"),
+				"an uncached SVT page should report a pending production state, got " + str(first.get("state", "")))
 		require(not bool(first.get("ready", false)), "an uncached SVT page must not be treated as ready")
 
 	# Looking away from every loaded region must not add SVT requests. Look up and back:

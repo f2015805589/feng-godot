@@ -66,7 +66,7 @@ private:
 	PackedFloat32Array _texture_uv_scales;
 	PackedVector2Array _texture_detiles;
 	PackedVector2Array _texture_displacements;
-	// Hydra slope params per material: x=blend_sharpness, y=slope_based_damp,
+	// Slope params per material: x=blend_sharpness, y=slope_based_damp,
 	// z=slope_based_normal_damp (raw 0..1000 authoring space).
 	PackedVector3Array _texture_slope_params;
 

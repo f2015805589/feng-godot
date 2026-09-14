@@ -91,6 +91,9 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_offset"), &Terrain3D::get_surface_vt_region_offset);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_forward_regions", "regions"), &Terrain3D::set_surface_vt_forward_regions);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_forward_regions"), &Terrain3D::get_surface_vt_forward_regions);
+	ClassDB::bind_method(D_METHOD("set_vt_atlas_compression", "compression"), &Terrain3D::set_vt_atlas_compression);
+	ClassDB::bind_method(D_METHOD("get_vt_atlas_compression"), &Terrain3D::get_vt_atlas_compression);
+	ClassDB::bind_method(D_METHOD("probe_vt_atlas_compression", "image"), &Terrain3D::probe_vt_atlas_compression);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_rect"), &Terrain3D::get_surface_vt_region_rect);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_texels_per_pixel", "value"), &Terrain3D::set_surface_vt_texels_per_pixel);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_texels_per_pixel"), &Terrain3D::get_surface_vt_texels_per_pixel);
@@ -139,7 +142,7 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_reach"), &Terrain3D::get_surface_svt_mip_reach);
 	ClassDB::bind_method(D_METHOD("set_surface_array_enabled", "enabled"), &Terrain3D::set_surface_array_enabled);
 	ClassDB::bind_method(D_METHOD("is_surface_array_enabled"), &Terrain3D::is_surface_array_enabled);
-	ClassDB::bind_method(D_METHOD("invalidate_surface_pages", "region_location"), &Terrain3D::invalidate_surface_pages);
+	ClassDB::bind_method(D_METHOD("invalidate_surface_pages", "region_location", "force"), &Terrain3D::invalidate_surface_pages, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("set_editor", "editor"), &Terrain3D::set_editor);
 	ClassDB::bind_method(D_METHOD("get_editor"), &Terrain3D::get_editor);
 	ClassDB::bind_method(D_METHOD("set_plugin", "plugin"), &Terrain3D::set_plugin);
@@ -354,6 +357,7 @@ void Terrain3D::_bind_methods() {
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");

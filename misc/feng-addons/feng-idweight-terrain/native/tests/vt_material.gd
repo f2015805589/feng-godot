@@ -99,9 +99,29 @@ func run() -> void:
 	var edited := await frame_image()
 	require(sample_area(edited, Vector2(32, 32)) == "g", "painting invalidates and rebakes AVT")
 	terrain.set_surface_vt_force_mip(false)
+	# Enter region (0,0) before measuring. The sweep below stays inside one AVT grid cell, and
+	# x=64 is that cell's edge: measuring from there would hand region (1,0) to the far field on
+	# the first step and let this cell claim the capacity it frees, which is a density re-plan
+	# and a legitimate production burst, not same-grid movement.
+	camera.position.x = 32.0
 	await settle() # Adaptive mode fills its coverage mip chain before measuring idle work.
+	require(terrain.get_surface_vt().get_sector_block_size(Vector2i.ZERO) == 4,
+			"one target-grid cell keeps the whole 4-page AVT block")
+	# The page budget fills that chain a couple of pages per physics tick, and `producer.pending`
+	# is already zero between ticks, so idle means the bake counter standing still.
+	var idle_frames := 0
+	var last_bakes := int(terrain.get_vt_settings().producer.baked_pages)
+	for frame in 600:
+		await physics_frame
+		var bakes_now := int(terrain.get_vt_settings().producer.baked_pages)
+		if bakes_now == last_bakes: idle_frames += 1
+		else: idle_frames = 0
+		last_bakes = bakes_now
+		if idle_frames >= 10: break
 	var stable_bakes: int = terrain.get_vt_settings().producer.baked_pages
-	for x in [65.0, 95.0, 126.0, 66.0]:
+	# A region is the AVT grid cell at this region_size (64 m), so these positions all stay
+	# inside region (0,0): moving within one grid cell must not re-plan the density or rebake.
+	for x in [8.0, 16.0, 48.0, 60.0]:
 		camera.position.x = x
 		for frame in 3: await physics_frame
 		require(terrain.get_surface_vt().get_sector_block_size(Vector2i.ZERO) == 4,

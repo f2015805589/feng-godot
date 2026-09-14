@@ -94,38 +94,36 @@ func _ready() -> void:
 	add_setting({ "name":"texture_picker", "type":SettingType.PICKER, "list":main_list, "default":Terrain3DEditor.TEXTURE,
 							"flags":NO_LABEL, "tooltip":"Pick Texture from the terrain." })
 
-	# Hydra IdWeight pair painting controls
+	# IdWeight pair painting controls
 	add_setting({ "name":"pair_mode", "label":"Pair Mode", "type":SettingType.OPTION, "list":main_list,
 							"default":0, "range":Vector3(0, 4, 1), "options":["Set", "Add", "Sub", "Mix"],
-							"flags":ADD_SEPARATOR, "tooltip":"0=Set, 1=Add, 2=Sub, 3=Mix (Hydra TerrainSurfacePairBlendMode)" })
+							"flags":ADD_SEPARATOR, "tooltip":"0=Set, 1=Add, 2=Sub, 3=Mix (TerrainSurfacePairBlendMode)" })
 	add_setting({ "name":"pair_weight_level", "label":"Weight", "type":SettingType.SLIDER, "list":main_list,
 							"default":8, "range":Vector3(1, 8, 1),
-							"tooltip":"Discrete overlay contribution level 1..8 (Hydra WeightLevel). Hydra reuses the same 3 bits as the slope-threshold index, so the level also sets the angle where Add/Sub/Mix start to act: 1=0deg, 2=7, 3=14, 4=21, 5=27, 6=32, 7=37, 8=44. On ground flatter than that angle nothing engages, so Add and Sub render exactly like Set and Mix drops the overlay. Lower the level to bring the slope blend onto gentler terrain." })
-	# Hydra IdWeight pair role readout. The port drew role borders in the asset
-	# dock but never named the two layers, so an artist could not tell which
-	# material was the overlay and which was the background before a stroke.
-	# Role ids index the texture asset list; the text is filled in by
-	# Terrain3DUI._update_pair_role_readout().
+							"tooltip":"Discrete overlay contribution level 1..8 (WeightLevel). The level reuses the same 3 bits as the slope-threshold index, so it also sets the angle where Add/Sub/Mix start to act: 1=0deg, 2=7, 3=14, 4=21, 5=27, 6=32, 7=37, 8=44. On ground flatter than that angle nothing engages, so Add and Sub render exactly like Set and Mix drops the overlay. Lower the level to bring the slope blend onto gentler terrain." })
+	# IdWeight pair role readout. The asset dock drew role borders but never named
+	# the two layers, so an artist could not tell which material was the overlay
+	# and which was the background before a stroke. Role ids index the texture
+	# asset list; the text is filled in by Terrain3DUI._update_pair_role_readout().
 	add_setting({ "name":"pair_roles", "label":"Overlay: -    Background: -",
 							"type":SettingType.LABEL, "list":main_list, "flags":NO_LABEL|NO_SAVE })
 	add_setting({ "name":"pair_click_hint", "label":"Left click: Overlay (white)    Right click: Background (blue)",
 							"type":SettingType.LABEL, "list":main_list, "flags":NO_LABEL|NO_SAVE })
-	# Hydra slope blending parameters. Each one belongs to a pair ROLE, not to
-	# whichever asset happens to be selected: the shader reads blendSharpness from
-	# the Background material and both damps from the Overlay material
-	# (main.glsl hydra_idweight_evaluate_slope_overlay_weight), and Hydra's
-	# TerrainToolEditorWindow edits backgroundSettings.blendSharpness plus
-	# overlaySettings.slopeBasedDamp. Terrain3DUI._sync_slope_setting keeps the
-	# sliders bound to those roles.
+	# Slope blending parameters. Each one belongs to a pair ROLE, not to whichever
+	# asset happens to be selected: the shader reads blendSharpness from the
+	# Background material and both damps from the Overlay material
+	# (main.glsl idweight_evaluate_slope_overlay_weight), so the brush edits
+	# backgroundSettings.blendSharpness plus overlaySettings.slopeBasedDamp.
+	# Terrain3DUI._sync_slope_setting keeps the sliders bound to those roles.
 	add_setting({ "name":"slope_blend_sharpness", "label":"Slope Sharpness", "type":SettingType.SLIDER, "list":main_list,
 							"default":1000, "range":Vector3(0.1, 1000, 1), "flags":ADD_SEPARATOR,
-							"tooltip":"Hydra blendSharpness, raw 0.1..1000 (shader scales by 1/1000). Owned by the BACKGROUND layer (the left-click role); the shader reads slot [backgroundId].x. Width of the slope ramp above the Weight threshold - 1000 gives the full ramp, near 0 collapses it to a hard step." })
+							"tooltip":"blendSharpness, raw 0.1..1000 (shader scales by 1/1000). Owned by the BACKGROUND layer (the left-click role); the shader reads slot [backgroundId].x. Width of the slope ramp above the Weight threshold - 1000 gives the full ramp, near 0 collapses it to a hard step." })
 	add_setting({ "name":"slope_based_damp", "label":"Slope Damp", "type":SettingType.SLIDER, "list":main_list,
 							"default":0, "range":Vector3(0, 1000, 1),
-							"tooltip":"Hydra slopeBasedDamp, raw 0..1000. Owned by the OVERLAY layer (the right-click role); the shader reads slot [overlayId].y." })
+							"tooltip":"slopeBasedDamp, raw 0..1000. Owned by the OVERLAY layer (the right-click role); the shader reads slot [overlayId].y." })
 	add_setting({ "name":"slope_based_normal_damp", "label":"Slope Normal Damp", "type":SettingType.SLIDER, "list":main_list,
 							"default":0, "range":Vector3(0, 1000, 1),
-							"tooltip":"Hydra slopeBasedNormalDamp, raw 0..1000. Owned by the OVERLAY layer (the right-click role)." })
+							"tooltip":"slopeBasedNormalDamp, raw 0..1000. Owned by the OVERLAY layer (the right-click role)." })
 
 	add_setting({ "name":"texture_filter", "label":"Texture Filter", "type":SettingType.CHECKBOX, 
 							"list":main_list, "default":false, "flags":ADD_SEPARATOR })
@@ -692,7 +690,7 @@ func set_setting(p_setting: String, p_value: Variant) -> void:
 
 
 # Fills the IdWeight pair role readout. Overlay and Background are the two roles
-# of the Hydra ordered pair; the Overlay is the layer the Weight slider fades in
+# of the IdWeight ordered pair; the Overlay is the layer the Weight slider fades in
 # and the Background is the layer it fades over.
 func set_pair_roles_text(p_overlay: String, p_background: String) -> void:
 	var label: Object = settings.get("pair_roles")

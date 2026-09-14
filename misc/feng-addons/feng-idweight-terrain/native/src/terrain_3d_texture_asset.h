@@ -26,7 +26,7 @@ class Terrain3DTextureAsset : public Terrain3DAssetResource {
 	real_t _uv_scale = 0.1f;
 	real_t _detiling_rotation = 0.0f;
 	real_t _detiling_shift = 0.0f;
-	// Hydra-compatible slope parameters, raw authoring space 0..1000.
+	// Slope parameters, raw authoring space 0..1000.
 	// Shader consumers apply the 1/1000 scale and the 0.1 blend sharpness floor.
 	real_t _slope_blend_sharpness = 1000.0f;
 	real_t _slope_based_damp = 0.0f;

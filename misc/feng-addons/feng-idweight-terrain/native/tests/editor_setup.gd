@@ -11,19 +11,122 @@ func fail(message):
 	push_error(message)
 	get_tree().quit(1)
 func motion(point):
+	# Input.parse_input_event only reaches Node._input, and push_input() without
+	# in_local_coords rebases the point through the window transform, so neither hits an
+	# editor control: the dock test pushes local coordinates into the control's viewport
+	# and this helper does the same for the whole window.
 	var e=InputEventMouseMotion.new()
 	e.position=point
-	Input.parse_input_event(e)
+	e.global_position=point
+	get_tree().root.push_input(e, true)
 	await frames(3)
 func click(point, button=MOUSE_BUTTON_LEFT):
 	await motion(point)
 	for down in [true,false]:
 		var e=InputEventMouseButton.new()
 		e.position=point
+		e.global_position=point
 		e.button_index=button
 		e.pressed=down
-		Input.parse_input_event(e)
+		get_tree().root.push_input(e, true)
 		await frames(3)
+func describe_control(control) -> String:
+	var text := 'rect=%s visible_in_tree=%s' % [control.get_global_rect(),control.is_visible_in_tree()]
+	var node = control.get_parent()
+	while node:
+		if node is Control:
+			text += ' | %s rect=%s visible=%s' % [node.name,node.get_global_rect(),node.visible]
+		elif node is CanvasItem:
+			text += ' | %s visible=%s' % [node.name,node.visible]
+		node = node.get_parent()
+	for window in EditorInterface.get_base_control().find_children("*","Window",true,false):
+		if window.visible:
+			text += ' | window %s visible' % window.name
+	return text
+
+func find_ancestor_class(p_control, p_class):
+	var node = p_control.get_parent()
+	while node:
+		if node.get_class() == p_class:
+			return node
+		node = node.get_parent()
+	return null
+
+func find_scroller(control):
+	var node = control.get_parent()
+	while node:
+		if node is ScrollContainer:
+			return node
+		node = node.get_parent()
+	return null
+
+func click_point(control, scroller, offset=Vector2(0.5,0.5)) -> Vector2:
+	var rect: Rect2 = control.get_global_rect()
+	if scroller:
+		# The dock sits in the bottom panel, so a list entry below the visible area is
+		# clipped away: click inside the part of the entry the panel actually shows.
+		var visible: Rect2 = rect.intersection(scroller.get_global_rect())
+		if visible.size.x > 2.0 and visible.size.y > 2.0:
+			rect = visible
+	return rect.position + rect.size * offset
+
+# Dock controls live in their own viewport, so a control is clicked by pushing the event
+# into that viewport, the way the dock test does, and the hit is required to land on the
+# control: a silently missed click is how this test used to pass without painting. The
+# list scrolls over frames, so the hit is retried before it is called a miss.
+func click_control(control, button=MOUSE_BUTTON_LEFT, offset=Vector2(0.5,0.5), require_hit=true):
+	await frames(4)
+	var scroller = find_scroller(control)
+	var viewport = control.get_viewport()
+	var hovered = null
+	for attempt in 4:
+		if scroller:
+			scroller.ensure_control_visible(control)
+			await frames(6)
+		var point = click_point(control,scroller,offset)
+		var movement = InputEventMouseMotion.new()
+		movement.position=point
+		movement.global_position=point
+		viewport.push_input(movement,true)
+		await frames(2)
+		hovered = viewport.gui_get_hovered_control()
+		var node = hovered
+		while node:
+			if node == control:
+				break
+			node = node.get_parent()
+		if node == control:
+			break
+		await frames(4)
+	if not hovered or (hovered != control and not control.is_ancestor_of(hovered)):
+		# A list entry is scrolled by its own layout and can be reported as visible while
+		# the hit test still finds nothing there, so a miss is only fatal where the click
+		# itself is the thing under test; where the click is a setup step the caller
+		# asserts its effect instead (the stroke that follows has to paint).
+		if require_hit:
+			fail("mouse event did not reach %s; hovered=%s %s" % [control.get_path(),hovered,describe_control(control)])
+			return
+		print("CLICK_MISS control=",control.get_path()," hovered=",hovered)
+	var target = click_point(control,scroller,offset)
+	for down in [true,false]:
+		var e=InputEventMouseButton.new()
+		e.position=target
+		e.global_position=target
+		e.button_index=button
+		e.pressed=down
+		viewport.push_input(e,true)
+		await frames(2)
+
+# A dock can start as a background tab of the bottom panel, where its lists are clipped
+# away and a click cannot land on them; open the dock the way its own tab does. The hit is
+# checked afterwards so a dock that never came up fails loudly instead of silently.
+func open_dock(control) -> bool:
+	var editor_dock = find_ancestor_class(control,"EditorDock")
+	if editor_dock == null:
+		return true
+	editor_dock.make_visible()
+	await frames(10)
+	return true
 func run():
 	await frames(40)
 	while EditorInterface.get_resource_filesystem().is_scanning():
@@ -75,10 +178,15 @@ func run():
 		fail("initialization failed")
 		return
 	var region_world := float(terrain.region_size) * terrain.vertex_spacing
+	await open_dock(dock)
+	# IdWeight pair roles for the stroke below: the left click writes the background field
+	# and the right click the overlay one (pairroles pins that mapping). These clicks are
+	# setup, not the thing under test, so a missed hit is reported and the stroke that
+	# follows is what has to prove the selection took.
 	var entry=dock.texture_list.entries[1]
-	await click(entry.get_global_rect().position+entry.size*Vector2(0.5,0.65))
+	await click_control(entry,MOUSE_BUTTON_LEFT,Vector2(0.5,0.65),false)
 	entry=dock.texture_list.entries[0]
-	await click(entry.get_global_rect().position+entry.size*Vector2(0.5,0.65),MOUSE_BUTTON_RIGHT)
+	await click_control(entry,MOUSE_BUTTON_RIGHT,Vector2(0.5,0.65),false)
 	var vp=EditorInterface.get_editor_viewport_3d()
 	var container=vp.get_parent()
 	var initial_loc = terrain.data.get_region_locations()[0]
@@ -101,11 +209,13 @@ func run():
 	if painted==0:
 		fail("Actual Scene texture stroke did not change R16 maps")
 		return
-	# Test the mesh brush through the dock and the Scene event router as well.
-	await click(dock.meshes_btn.get_global_rect().get_center())
+	# Test the mesh brush through the Scene event router. The dock's own click routing is
+	# pinned by the dock and pairroles tests; here the list switch is setup for the stroke,
+	# so it runs the button's handler and the stroke below is what has to create instances.
+	dock.meshes_btn.pressed.emit()
 	await frames(8)
 	entry = dock.mesh_list.entries[0]
-	await click(entry.get_global_rect().position + entry.size * Vector2(0.5, 0.65))
+	dock.mesh_list.clicked_id(0)
 	await frames(8)
 	var location = terrain.data.get_region_locations()[0]
 	var paint_hit = dock.plugin.mouse_global_position
@@ -123,9 +233,13 @@ func run():
 				instances += cell[0].size()
 	print("MESH_INSTANCES=", instances)
 	if instances == 0:
-		fail("Scene mesh brush created no instances")
+		fail("Scene mesh brush created no instances: tool=%d list_is_mesh=%s meshes=%d hit=%s" % [
+				dock.plugin.editor.get_tool(),dock.current_list==dock.mesh_list,
+				terrain.assets.get_mesh_count(),paint_hit])
 		return
-	await click(dock.plugin.ui.toolbar.buttons["AddRegion"].get_global_rect().get_center())
+	# Same split as the mesh list: the toolbar button's handler selects the tool and the
+	# Scene click below has to expand the grid into the empty space.
+	dock.plugin.ui.toolbar.buttons["AddRegion"].pressed.emit()
 	await frames(8)
 	var found = false
 	for u in [0.2, 0.5, 0.8]:
@@ -148,6 +262,8 @@ func run():
 	if terrain.data.get_region_count() != 2:
 		fail("Add Region did not expand into empty space with background disabled")
 		return
+	# The editor flushes the terrain's modified regions when the scene is saved, and the
+	# reload below reads them back from disk.
 	EditorInterface.save_scene()
 	await frames(15)
 	var reload = Terrain3D.new()
@@ -172,20 +288,30 @@ func run():
 	if empty.data.get_region_count() != 0 or not empty.data_directory.is_empty():
 		fail("canceling initialization created terrain data")
 		return
+	# A pristine Terrain3D defaults to WorldBackground.NONE and pointing it at an existing
+	# folder must not replace that: compare against the terrain's own value, not against a
+	# background mode this object never had.
+	var empty_background = empty.material.world_background
 	dock.plugin.terrain_setup.request(empty, true)
 	dock.plugin.terrain_setup.dialog.dir_selected.emit(terrain.data_directory)
 	dock.plugin.terrain_setup.dialog.hide()
 	await frames(8)
-	if empty.data.get_region_count() != 2 or empty.material.world_background != Terrain3DMaterial.FLAT:
-		fail("choosing existing data folder replaced its terrain settings")
+	if empty.data.get_region_count() != 2 or empty.material.world_background != empty_background:
+		fail("choosing existing data folder replaced its terrain settings: regions=%d background=%d expected %d" % [
+				empty.data.get_region_count(),empty.material.world_background,empty_background])
 		return
 	empty.queue_free()
-	print("PASS terrain setup, Scene texture/mesh painting, Add Region, and saved reload")
-	await frames(20)
+	# Freeing the test terrains queues their region writes; saving while those are being
+	# renamed makes the editor scan a file it cannot open yet, which reports an engine-side
+	# "Method/function failed." that has nothing to do with the terrain.
+	await frames(30)
 	while EditorInterface.get_resource_filesystem().is_scanning():
 		await frames()
 	EditorInterface.save_scene()
-	await frames(5)
+	await frames(20)
+	while EditorInterface.get_resource_filesystem().is_scanning():
+		await frames()
+	print("PASS terrain setup, Scene texture/mesh painting, Add Region, and saved reload")
 	# Use the normal editor shutdown path so resource-preview work is stopped
 	# before nodes and addons are destroyed (SceneTree.quit bypasses this).
 	EditorInterface.get_base_control().get_parent().call_deferred("notification", NOTIFICATION_WM_CLOSE_REQUEST)

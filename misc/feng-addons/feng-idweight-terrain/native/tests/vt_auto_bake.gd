@@ -72,6 +72,11 @@ func run() -> void:
 	if reload_mode:
 		# Runtime may discard authoring assets; persistent identity must survive it.
 		terrain.assets.clear_textures(false)
+		# The far field has to own the visible region: the near field is on by default and its
+		# Target Grid claims every region it covers, after which the far field demands nothing
+		# and can never serve a page from the persisted bake. This fixture is about the far
+		# field, so its own settings name the view under test.
+		terrain.surface_vt_enabled = false
 		terrain.surface_svt_enabled = true
 		for frame in 60: await process_frame
 		var reloaded := terrain.get_vt_settings()
@@ -113,7 +118,9 @@ func run() -> void:
 	require(edited.bake_done == edited.bake_total and edited.bake_failed == 0, "incremental job must complete")
 	var changed := 0
 	for tile: Dictionary in terrain.get_svt_baked_pages():
-		var path: String = tile.path
+		var path := String(tile.get("path", ""))
+		if path.is_empty():
+			continue
 		var rect: Rect2 = tile.world_rect
 		var hash_now := FileAccess.get_sha256(path)
 		if rect.position.x >= 512.0:
@@ -136,12 +143,18 @@ func run() -> void:
 	terrain.surface_vt_enabled = true
 	camera.position.x = 32
 	await settle()
+	# `bake_pending` counts the queue and the waiting set, not the cell being baked, so it can
+	# reach zero a frame before the job's last cell lands. Count the cells instead: the counter
+	# is monotonic, so a later automatic job taking over the job-scoped progress numbers cannot
+	# hide that this one finished every cell it queued (same idiom as the full bake above).
+	var cells_before_pressure: int = terrain.get_vt_settings().cells_baked
 	var pressure_count := terrain.bake_svt()
 	terrain.invalidate_surface_pages(Vector2i.ZERO)
 	for frame in 480:
 		await process_frame
-		if frame > 30 and terrain.get_vt_settings().bake_pending == 0: break
-	require(terrain.get_vt_settings().bake_done == pressure_count, "SVT bake completes with live AVT in an eight-page cache")
+		if frame > 30 and terrain.get_vt_settings().cells_baked - cells_before_pressure >= pressure_count: break
+	require(terrain.get_vt_settings().cells_baked - cells_before_pressure >= pressure_count,
+			"SVT bake completes with live AVT in an eight-page cache")
 	await settle()
 	var avt_ready := false
 	for page: Dictionary in terrain.get_vt_pages():
@@ -167,5 +180,10 @@ func automatic_settle() -> void:
 func file_hashes() -> Dictionary:
 	var result := {}
 	for tile: Dictionary in terrain.get_svt_baked_pages():
-		result[tile.path] = FileAccess.get_sha256(tile.path)
+		var path := String(tile.get("path", ""))
+		if path.is_empty():
+			# A resident cell with no file behind it: the browser lists it, this test is
+			# about the persisted bakes only.
+			continue
+		result[path] = FileAccess.get_sha256(path)
 	return result

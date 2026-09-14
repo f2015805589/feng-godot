@@ -53,16 +53,27 @@ struct Terrain3DVTPagePool {
 	std::vector<uint8_t> slot_used;
 	std::vector<Ref<Image>> authored_pages;
 	std::vector<uint8_t> slot_protected;
+	// Independent pins per slot. A slot is protected while this is non-zero, so the
+	// AVT pass's transient pins and the far field's long-lived root pins compose
+	// instead of one caller's unprotect clearing the other's.
+	std::vector<uint8_t> slot_protect_refs;
 	std::vector<uint64_t> slot_demand_epoch;
 	uint64_t demand_epoch = 0;
 	uint64_t residency_revision = 1;
 	bool demand_active = false;
 	std::vector<std::vector<Terrain3DVTPageOwner>> slot_owners;
 	std::vector<uint32_t> free_slots;
+	// Acquire transaction. acquire_slot() reserves a slot and remembers whether it took a
+	// free one or merely *chose* an LRU victim; the victim keeps its content and its owners'
+	// indirection entries until commit_slot() makes the eviction final. A caller that fails
+	// between the two calls abort_slot()s and no resident page was destroyed for nothing.
+	std::vector<uint8_t> slot_reserved;
+	std::vector<uint8_t> slot_evict_on_commit;
 	int allocation_budget = -1;
 	int alloc_count = 0;
 	int evict_count = 0;
 	int protected_block_count = 0;
+	int aborted_acquires = 0;
 	bool initialized = false;
 
 	bool grow(int p_page_count);
@@ -72,6 +83,15 @@ struct Terrain3DVTPagePool {
 	bool is_initialized() const { return initialized && atlas.get_rid().is_valid(); }
 
 	int acquire_slot(Terrain3DVirtualTexture *p_requester);
+	// Finalizes a reservation: an LRU victim chosen by acquire_slot() is evicted now, once
+	// the replacement page exists and its indirection entry has been published.
+	void commit_slot(uint32_t p_slot);
+	// Drops a reservation without producing anything. The victim (if any) is untouched, so
+	// the page it still serves stays resident and its table entries stay valid.
+	void abort_slot(uint32_t p_slot);
+	bool is_slot_reserved(uint32_t p_slot) const {
+		return p_slot < slot_reserved.size() && slot_reserved[p_slot] != 0;
+	}
 	void touch_slot(uint32_t p_slot);
 	void mark_demanded(uint32_t p_slot) { if (demand_active && p_slot < slot_demand_epoch.size()) { slot_demand_epoch[p_slot] = demand_epoch; } }
 	void evict_slot(uint32_t p_slot);
@@ -94,9 +114,9 @@ struct Terrain3DVTPagePool {
 
 /**
  * Virtual texture runtime: the physical page atlas, the indirection texture and the
- * page slot allocator, built on the Hydra-derived addressing core in `terrain_vt.h`.
+ * page slot allocator, built on the addressing core in `terrain_vt.h`.
  *
- * Layout, following Hydra's AVT:
+ * Layout:
  *   - A sector (one terrain region) owns a power-of-two block of *virtual* pages,
  *     handed out by `TerrainVT::VirtualImageAtlas` so blocks never overlap.
  *   - A virtual page is 2^mip pages wide at local mip `mip`, so the mip chain halves
@@ -116,8 +136,8 @@ class Terrain3DVirtualTexture : public Object {
 	CLASS_NAME();
 
 public:
-	// Hydra AVT defaults. Every one of these can be changed before initialize(), which
-	// is what the GPU readback test does to keep the atlas small.
+	// Defaults. Every one of these can be changed before initialize(), which is
+	// what the GPU readback test does to keep the atlas small.
 	static inline const int DEFAULT_PAGE_SIZE = 256;
 	static inline const int DEFAULT_PAGE_BORDER = 4;
 	static inline const int DEFAULT_PAGE_COUNT = 64;

@@ -224,6 +224,11 @@ void Terrain3D::__physics_process(const double p_delta) {
 	if (svt_baking) {
 		_vt.surface_svt->set_allocation_budget(MAX(0, vt_remaining));
 		_process_svt_bake(MAX(0, vt_remaining));
+		// The bake pass borrows the shared pool budget for this tick only. The pool is
+		// shared by both views, and a finite budget left behind blocks the next tick's
+		// acquisition - including its free-slot path - whenever the demand passes
+		// early-return before resetting it.
+		_vt.surface_svt->set_allocation_budget(-1);
 	}
 	if (demand_pool) { demand_pool->end_demand(); }
 }

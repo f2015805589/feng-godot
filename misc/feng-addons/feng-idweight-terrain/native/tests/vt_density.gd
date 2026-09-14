@@ -60,29 +60,38 @@ func texture(size: int, color: Color) -> ImageTexture:
 	image.generate_mipmaps()
 	return ImageTexture.create_from_image(image)
 
-func classify(color: Color) -> String:
-	var peak := maxf(color.r, maxf(color.g, color.b))
-	if peak <= 0.001:
-		return "black"
-	var result := ""
-	if color.r / peak > 0.4:
-		result += "r"
-	if color.g / peak > 0.4:
-		result += "g"
-	if color.b / peak > 0.4:
-		result += "b"
-	return result
+# Red dominance rather than a pure-red test. A block origin is one dense texel wide
+# (0.25 m at density 4), so at the 1:1 mip a pixel lands on a texel edge more often
+# than not and the rendered pixel is a red/green blend whose red side still dominates.
+# What the array path cannot do is show anything but the origin, and what the near
+# field has to do is keep the origins on the payload grid; both are measured below.
+func is_red_dominant(color: Color) -> bool:
+	return color.r > color.g and color.r > 0.05
 
-# Fraction of the frame dominated by one material. A window average cannot decide this
-# at a 0.25 m pattern: a block origin covers 1 of every 4 dense cells per axis, so the
-# fine path is a mix whose local majority depends on where the window lands.
-func color_fraction(image: Image, wanted: String) -> float:
+func red_dominant_fraction(image: Image) -> float:
 	var count := 0
 	for y in image.get_height():
 		for x in image.get_width():
-			if classify(image.get_pixel(x, y)) == wanted:
+			if is_red_dominant(image.get_pixel(x, y)):
 				count += 1
 	return float(count) / float(image.get_width() * image.get_height())
+
+func world_x_at(point: Vector2) -> float:
+	var hit = Plane(Vector3.UP, 0.0).intersects_ray(
+			camera.project_ray_origin(point), camera.project_ray_normal(point))
+	return hit.x if hit != null else INF
+
+# World x of the start of every red-dominant run on one row. The block pattern drew one
+# origin every four dense texels, so the runs have to land one metre apart.
+func origin_columns(image: Image, row: int) -> PackedFloat32Array:
+	var columns := PackedFloat32Array()
+	var inside := false
+	for x in image.get_width():
+		var dominant := is_red_dominant(image.get_pixel(x, row))
+		if dominant and not inside:
+			columns.append(world_x_at(Vector2(x, row)))
+		inside = dominant
+	return columns
 
 func write_dense(loc: Vector2i, value: int, size: int = SURFACE_SIZE) -> void:
 	var bytes := PackedByteArray()
@@ -309,6 +318,10 @@ func run() -> void:
 	terrain.surface_vt_page_count = PAGES_PER_AXIS * PAGES_PER_AXIS
 	terrain.surface_vt_pages_per_axis = PAGES_PER_AXIS
 	terrain.surface_vt_distance = 512.0
+	# The 4x4 page grid asserted below is the legacy region view. Full AVT addresses 64 m
+	# sectors and publishes through the asynchronous source pipeline, so one
+	# update_surface_vt() call has no prepared page to publish yet.
+	terrain.surface_vt_selection_mode = 1
 	write_pattern(loc)
 	push_pattern(loc)
 	terrain.set_surface_vt_force_mip(true, 0)
@@ -330,12 +343,22 @@ func run() -> void:
 	# payload and only a quarter of the frame is still the block-origin material.
 	write_block_pattern(loc)
 	push_pattern(loc)
+	# Keep the frame inside the region: Godot's orthographic size is the frame height, so
+	# at size = region_size the 4:3 frame is a third wider than the 64 m region and that
+	# third would be background rather than terrain. One page spans PAGE / DENSITY metres.
+	camera.size = float(PAGE) / float(DENSITY)
+	# Both tiers have to be off for the region array to be what renders: the far field is on by
+	# default and keeps serving the visible region from its own pages, which is a different image.
 	terrain.surface_vt_enabled = false
+	terrain.surface_svt_enabled = false
 	var off_image := await frame_image()
-	var off_red := color_fraction(off_image, "r")
-	require(off_red > 0.85, "the array path should render the block origin material, red fraction %.3f" % off_red)
+	var off_red := red_dominant_fraction(off_image)
+	require(off_red > 0.85, "the array path should render the block origin material, red-dominant fraction %.3f" % off_red)
 
+	# Only the near field comes back: this phase measures the dense payload the *near* field
+	# reads, and a far-field page over the same region would answer with its own level.
 	terrain.surface_vt_enabled = true
+	terrain.surface_svt_enabled = false
 	# The atlas still holds the phase 5 pattern and a resident page is never rewritten,
 	# so the atlas has to be dropped for the pages to come from the new payload.
 	terrain.get_surface_vt().clear()
@@ -344,9 +367,20 @@ func run() -> void:
 	require(reproduced == PAGES_PER_AXIS * PAGES_PER_AXIS,
 			"a fresh atlas should re-produce %d pages, got %d" % [PAGES_PER_AXIS * PAGES_PER_AXIS, reproduced])
 	var on_image := await frame_image()
-	var on_red := color_fraction(on_image, "r")
-	require(on_red < 0.7, "the virtual texture should show the finer material, red fraction %.3f" % on_red)
-	require(on_red > 0.05, "the block origins must still be visible, red fraction %.3f" % on_red)
+	var on_red := red_dominant_fraction(on_image)
+	require(on_red < 0.7, "the virtual texture should show the finer material, red-dominant fraction %.3f" % on_red)
+	# The origins stay visible where the array path has nothing but origins: one
+	# red-dominant column per metre, because the pattern drew one every four texels.
+	var origins := origin_columns(on_image, on_image.get_height() / 2)
+	require(origins.size() >= 15,
+			"the block origins must still be visible, %d red-dominant columns on the centre row" % origins.size())
+	var spacing := 0.0
+	if origins.size() > 1:
+		for i in range(1, origins.size()):
+			spacing += origins[i] - origins[i - 1]
+		spacing /= float(origins.size() - 1)
+	require(absf(spacing - 1.0) < 0.15,
+			"the block origins must sit on the payload grid, mean spacing %.3f m" % spacing)
 	var differing := 0
 	for y in on_image.get_height():
 		for x in on_image.get_width():
@@ -354,7 +388,7 @@ func run() -> void:
 				differing += 1
 	require(differing > 500, "surface density must be visible in the render, %d pixels differ" % differing)
 	if not failed:
-		print("PASS surface density changes the render, array coarse (red %.3f) and virtual texture fine (red %.3f)" % [off_red, on_red])
+		print("PASS surface density changes the render, array coarse (red %.3f) and virtual texture fine (red %.3f, origins %.3f m apart)" % [off_red, on_red, spacing])
 
 	terrain.set_editor(null)
 	terrain.set_plugin(null)

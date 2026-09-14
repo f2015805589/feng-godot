@@ -9,7 +9,7 @@ extends EditorPlugin
 ## background was invisible while painting. This drives the real
 ## tool_settings.gd through its own _ready() (so the assertions cover the
 ## production registration, not a hand-built copy of it) and checks that the
-## readout exists, states Hydra's click mapping, carries the role names, and is
+## readout exists, states the click mapping, carries the role names, and is
 ## actually shown for the texture tool.
 
 const Settings = preload("res://addons/feng-idweight-terrain/src/tool_settings.gd")
@@ -82,22 +82,21 @@ func _run() -> void:
 	if not _require(hint is Label, "tool_settings did not register a 'pair_click_hint' Label"):
 		return
 
-	# Hydra prints exactly this mapping above its layer tiles. Its label names the
-	# roles the other way round than its own pair fields on purpose, so this text
-	# is expected to disagree with the field mapping asserted below.
+	# The layer grid prints exactly this mapping above its tiles. The label names
+	# the roles the other way round than the packed pair fields on purpose, so
+	# this text is expected to disagree with the field mapping asserted below.
 	var hint_text: String = (hint as Label).text
 	if not _require(hint_text.contains("Left click: Overlay") and
 			hint_text.contains("Right click: Background"),
-			"click hint does not state Hydra's left=Overlay / right=Background mapping: %s" %
+			"click hint does not state the left=Overlay / right=Background mapping: %s" %
 			hint_text):
 		return
 
-	# Hydra's chain writes the left-clicked layer into the Background pair field
-	# (the base) and the right-clicked layer into the Overlay field (the layer the
-	# Weight slider fades in): GetRoleForMouseButton(0) returns Background, pinned
-	# by LayerGrid_LeftClickSelectsBackground. The packed encoding of those two
-	# fields is covered by editor_input.gd's press, so this pins the
-	# button-to-field half of the contract.
+	# The packed chain writes the left-clicked layer into the Background pair
+	# field (the base) and the right-clicked layer into the Overlay field (the
+	# layer the Weight slider fades in). The packed encoding of those two fields
+	# is covered by editor_input.gd's press, so this pins the button-to-field half
+	# of the contract.
 	var list_class: Object = Dock.ListContainer
 	if not _require(list_class != null and list_class.has_method("role_writes_overlay_field"),
 			"asset dock does not expose ListContainer.role_writes_overlay_field"):
@@ -124,6 +123,6 @@ func _run() -> void:
 			"ui.gd does not show the pair readout for the texture tool"):
 		return
 
-	print("PASS IdWeight pair role readout shown for the texture tool and the click mapping matches Hydra's pair fields")
+	print("PASS IdWeight pair role readout shown for the texture tool and the click mapping matches the pair fields")
 	_finished = true
 	get_tree().quit(0)

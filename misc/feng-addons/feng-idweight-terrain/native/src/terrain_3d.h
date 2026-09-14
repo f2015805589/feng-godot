@@ -207,6 +207,21 @@ private:
 	void _process_svt_auto_bake();
 	int _queue_svt_bake(const Dictionary &p_dirty_regions);
 	void _invalidate_vt_slot(int p_slot);
+	// Raw-ID diagnostics read the atlas directly, so a page they allocate has to carry
+	// content before it is published: this crops the resident region payloads into one
+	// world-aligned page. It is a no-op outside the diagnostic mode.
+	bool _write_diagnostic_sparse_page(int p_slot, int p_page_x, int p_page_y, int p_local_mip,
+			real_t p_page_world);
+	// Creates or resizes the resident far-field cell store to the current far-field density.
+	void _configure_svt_cell_store();
+	// Cheap staleness key of one resident far-field cell: the material signature, the
+	// far-field density and the newest edit that touched the cell or one of its neighbours.
+	uint64_t _svt_cell_state_key(const Vector2i &p_cell) const;
+	// Resolves the resident cells a far page samples into copy pieces. A cell that is not
+	// resident is reported instead, so no page is ever assembled from another cell's layer.
+	bool _resolve_svt_cell_pieces(const Rect2 &p_rect, Array &r_pieces, std::vector<Vector2i> &r_missing);
+	// Whether any cell a far page touches has a persisted bake the source worker can read.
+	bool _svt_cells_have_persisted_bake(const Rect2 &p_rect);
 	void _reset_vt_configuration();
 	void _cancel_svt_bake(const String &p_reason);
 	void _destroy_surface_vt();
@@ -377,6 +392,12 @@ public:
 	real_t get_surface_vt_texels_per_pixel() const { return _vt.surface_vt_texels_per_pixel; }
 	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
 	bool is_surface_vt_force_mip() const { return _vt.surface_vt_force_mip; }
+	// Atlas compression for the three material page arrays, one format for all three.
+	// The baker resolves the request against this build's compressors and this device's
+	// sampling support; see get_vt_settings() for what was applied and why.
+	void set_vt_atlas_compression(const int p_compression);
+	int get_vt_atlas_compression() const;
+	Dictionary probe_vt_atlas_compression(const Ref<Image> &p_image) const;
 	int get_surface_vt_mip() const { return _vt.surface_vt_mip; }
 	void set_surface_vt_feedback_enabled(const bool p_enabled);
 	bool is_surface_vt_feedback_enabled() const { return _vt.surface_vt_feedback_enabled; }
@@ -421,8 +442,10 @@ public:
 		return is_vt_editor_preview_active() || _vt.surface_array_enabled || (!_vt.surface_vt_enabled && !_vt.surface_svt_enabled);
 	}
 	// Drops the pages that carry a region's surface, so an edit is re-produced instead
-	// of being served stale from either virtual texture.
-	void invalidate_surface_pages(const Vector2i &p_region_loc);
+	// of being served stale from either virtual texture. While the editor preview is active
+	// an edit is only recorded and the refresh is deferred; p_force skips that, which a
+	// change that invalidates every cached page - such as the atlas format - has to do.
+	void invalidate_surface_pages(const Vector2i &p_region_loc, bool p_force = false);
 
 	// Regions
 	void set_region_size(const RegionSize p_size);

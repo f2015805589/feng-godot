@@ -1,4 +1,4 @@
-// Hydra-compatible surface data contract. No Godot or Unity dependencies.
+// Packed surface (id/weight) data contract. No engine dependencies.
 #ifndef TERRAIN_SURFACE_IDWEIGHT_H
 #define TERRAIN_SURFACE_IDWEIGHT_H
 
@@ -46,7 +46,7 @@ inline float contribution(uint16_t value) {
 
 inline float saturate(float value) { return std::max(0.f, std::min(1.f, value)); }
 
-// Unity Mathf.RoundToInt uses ties-to-even; std::round would change brush edges.
+// Round half to even, not away from zero: std::round would change brush edges.
 inline bool quantize(float value, int &level) {
 	if (!std::isfinite(value)) {
 		return false;

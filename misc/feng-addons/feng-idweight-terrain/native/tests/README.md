@@ -37,10 +37,14 @@ a run can print every assertion as passing and still be reported as a failure:
 read the `ERROR:` lines under it.
 
 Comparing runs: keep the `--json` output of the run before your change and diff
-the statuses. Several tests are red in this checkout (missing-page diagnostics,
-surface-baker uniform sets, and the setup dock's paint timing), so the useful
-signal is a *change* in status or in the `REGRESSION` text, not the pass count
-alone.
+the statuses. Several tests are red in this checkout (legacy region-AVT page
+production, the setup dock's paint timing, and the far-field page ordering the
+`vt_visibility` fixture pins), so the useful signal is a *change* in status or in
+the `REGRESSION` text, not the pass count alone. A/B it against `HEAD` before
+calling any of them a regression: `git stash push -- misc/feng-addons`, rebuild,
+run the same runner, then `git stash pop`. Every red test listed in
+`docs/terrain_vt_and_streaming.md` §6 was confirmed to fail identically with the
+addon reverted.
 
 ## Running one test
 
@@ -71,7 +75,24 @@ Two rules the harness enforces, both learned the hard way: a test only passes
 when the log has **no `ERROR:` line at all** (an engine error fails the run even
 if every assertion printed PASS), and a `.gd` that other tests extend must stay a
 `SceneTree` script, because the runner writes it into the fixture as
-`res://vt_adaptive_base.gd` or `res://vt_render_base.gd`.
+`res://vt_adaptive_base.gd` or `res://vt_render_base.gd` (pass
+`extra_scripts=(("vt_render.gd", "vt_render_base.gd"),)` to `run_script_test()`
+so the base exists inside the fixture).
+
+Three optional arguments cover the rest of what a runner needs to say:
+
+* `prefixes=("VTSVT",)` prints extra log lines that start with those strings.
+* `forbidden=("resident pages were released",)` fails the run when that text
+  appears anywhere in the log. This is for a warning that must never be emitted,
+  which an assertion inside the script cannot see: the engine writes
+  `WARNING:`/`ERROR:` to the process output, not to the script.
+* `extra_scripts` copies further test scripts into the fixture, see above.
+
+A runner whose marker never matches the script's `PASS` line can never pass.
+`vt_material_runner.py` did that for a while (it ran `vt_render.gd` while
+requiring `vt_material.gd`'s marker), which hid four real failures; if a test
+fails with "marker missing" but every assertion printed PASS, check that pairing
+first.
 
 For example, from the engine checkout on Windows (replace PROJECT):
 
@@ -419,7 +440,7 @@ cd misc/feng-addons/feng-idweight-terrain/native/tests/vt
 scons && ./terrain_vt_contract_test.exe
 ```
 
-Standalone C++ test for `src/terrain_vt.h`, the Hydra-compatible AVT/SVT addressing core.
+Standalone C++ test for `src/terrain_vt.h`, the shared AVT/SVT addressing core.
 No engine and no GPU. It pins the indirection mip-chain walk (which level and local
 coordinate a request resolves to) and the POT `VirtualImageAtlas` allocator: block
 alignment, the full 65,536-leaf capacity, non-overlap, and resize rollback with refill.

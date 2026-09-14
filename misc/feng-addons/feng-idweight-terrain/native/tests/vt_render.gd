@@ -154,12 +154,6 @@ func run() -> void:
 	brush = Image.create(16, 16, false, Image.FORMAT_RF)
 	brush.fill(Color.WHITE)
 
-	terrain.surface_vt_page_size = PAGE
-	terrain.surface_vt_page_border = BORDER
-	terrain.surface_vt_page_count = PAGES_PER_AXIS * PAGES_PER_AXIS
-	terrain.surface_vt_pages_per_axis = PAGES_PER_AXIS
-	terrain.surface_vt_distance = 512.0
-
 	var loc := Vector2i.ZERO
 	terrain.data.add_region_blank(loc)
 	paint_region(loc, 1)
@@ -175,7 +169,21 @@ func run() -> void:
 		return
 	print("PASS surface vt baseline: the array path renders the painted material")
 
-	# Turn the virtual texture on and force mip 0 so the page grid is deterministic.
+	# The near-field settings are applied after the baseline image on purpose. These set a
+	# page size and a page count, which rebuilds the atlas, and the frames awaited above run
+	# the engine's own demand pass on every physics tick: a 16-page atlas armed before them is
+	# already full when the deterministic mip 0 pass below asks for its pages, and a pass that
+	# only sees hits correctly produces nothing.
+	terrain.surface_vt_page_size = PAGE
+	terrain.surface_vt_page_border = BORDER
+	terrain.surface_vt_page_count = PAGES_PER_AXIS * PAGES_PER_AXIS
+	terrain.surface_vt_pages_per_axis = PAGES_PER_AXIS
+	terrain.surface_vt_distance = 512.0
+	# The 4x4 page grid this test asserts is the legacy region view. Full AVT addresses
+	# 64 m sectors and produces its pages through the asynchronous source pipeline.
+	terrain.surface_vt_selection_mode = 1
+	# Turn the virtual texture on and force mip 0 so the page grid is deterministic. Both and
+	# the pass below run in this same frame, so the atlas is cold and every page is a miss.
 	terrain.surface_vt_enabled = true
 	terrain.set_surface_vt_force_mip(true, 0)
 	var produced := terrain.update_surface_vt()

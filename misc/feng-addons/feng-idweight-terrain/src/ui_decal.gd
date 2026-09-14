@@ -13,7 +13,7 @@ extends Node
 ## `set_decal_rotation()`, because the editor plugin and `Terrain3DEditor` reach the
 ## decal through the UI node.
 
-# Cursor colours per tool and operation. Hydra-derived, see docs/.
+# Cursor colours per tool and operation. See docs/ for the role colours.
 const COLOR_RAISE := Color(1., 1., 1.) # White
 const COLOR_LOWER := Color(0.2, 0.2, 0.2) # Dark gray
 const COLOR_SMOOTH := Color(0.5, 0.0, 0.2) # Dark Red

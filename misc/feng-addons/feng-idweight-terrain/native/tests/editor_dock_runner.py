@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 
 # The fixture and the two-phase invocation live in fixture.py, shared with every
 # script runner. This file owns the graphical-editor tests only.
-from fixture import ROOT, write_fixture
+from fixture import ROOT, run_with_offscreen_window, write_fixture
 
 
 def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
@@ -44,30 +43,28 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
     ]
     try:
         with log.open("w", encoding="utf-8") as stream:
-            result = subprocess.run(
-                command,
-                cwd=fixture,
-                env=env,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
-                timeout=180,
-            )
-    except subprocess.TimeoutExpired:
+            status = run_with_offscreen_window(command, cwd=fixture, env=env, stream=stream,
+                                               timeout=180)
+    except OSError as error:
+        print(f"LAUNCH FAILED: {error}")
+        return 127
+    if status is None:
         print(f"TIMEOUT=180 LOG={log}")
         return 124
+    result_code = status
 
     output = log.read_text(encoding="utf-8", errors="replace")
     error_lines = [line for line in output.splitlines() if "ERROR:" in line]
-    print(f"EXIT={result.returncode} ERROR_LINES={len(error_lines)} LOG={log}")
+    print(f"EXIT={result_code} ERROR_LINES={len(error_lines)} LOG={log}")
     print(output, end="")
-    if result.returncode != 0 or error_lines:
+    if result_code != 0 or error_lines:
         return 1
     marker = {
         "dock": "PASS graphical Terrain3D asset dock layout and management menu actions",
         "input": "PASS editor brush first GPU miss -> CPU fallback -> R16 CPU/GPU ID 1 -> outside release -> right navigation",
         "setup": "PASS terrain setup, Scene texture/mesh painting, Add Region, and saved reload",
         "grid": "PASS 20x20 terrain grid creation, cancellation, limits and reload",
-        "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches Hydra's pair fields",
+        "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches the pair fields",
         "svt_inspector": "PASS native SVT Inspector full-bake action and progress",
         "vt_idle": "PASS editor stationary VT completion",
     }[test]

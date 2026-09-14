@@ -13,6 +13,7 @@
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_3d_vt_feedback.h"
 #include "terrain_3d_surface_baker.h"
+#include "terrain_3d_vt_cells.h"
 #include "terrain_3d_vt_indirection.h"
 
 void initialize_terrain_3d_module(ModuleInitializationLevel p_level) {
@@ -34,6 +35,7 @@ void initialize_terrain_3d_module(ModuleInitializationLevel p_level) {
 	ClassDB::register_class<Terrain3DVirtualTexture>();
 	ClassDB::register_class<Terrain3DVTFeedback>();
 	ClassDB::register_class<Terrain3DSurfaceBaker>();
+	ClassDB::register_class<Terrain3DCellStore>();
 	ClassDB::register_class<Terrain3DVTIndirection>();
 }
 

@@ -156,7 +156,7 @@ group_uniforms general_uniforms;
 uniform bool flat_terrain_normals = false;
 uniform float distant_normal_scale : hint_range(1.0, 10.0, 0.1) = 2.0;
 // Legacy 2-texture blend sharpness. Retained so existing materials keep a valid
-// parameter; the Hydra IdWeight material path uses the per-texture-asset
+// parameter; the IdWeight material path uses the per-texture-asset
 // slope_blend_sharpness instead.
 uniform float blend_sharpness : hint_range(0, 1) = 0.5;
 group_uniforms;
@@ -332,7 +332,7 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	ivec2 page = ivec2(floor(p_world / _surface_svt_page_world));
 	if (any(lessThan(page + ivec2(half), ivec2(0))) || any(greaterThanEqual(page + ivec2(half), ivec2(_surface_svt_indirection_size)))) { return false; }
 	int start_mip = surface_svt_mip_for_distance(surface_svt_distance(p_world));
-	for (int mip = start_mip; mip == start_mip && mip <= _surface_svt_max_mip; mip++) {
+	for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
 		ivec2 coord = (page + ivec2(half)) >> mip;
 		int level_size = max(1, _surface_svt_indirection_size >> mip);
 		float slot_f = texelFetch(_surface_svt_indirection, clamp(coord, ivec2(0), ivec2(level_size - 1)), mip).r;
@@ -375,7 +375,7 @@ bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_norm
 		ivec2 virtual_page = page + ivec2(_surface_svt_indirection_size >> 1);
 		if (all(greaterThanEqual(virtual_page, ivec2(0))) && all(lessThan(virtual_page, ivec2(_surface_svt_indirection_size)))) {
 			int start_mip = surface_svt_mip_for_distance(surface_svt_distance(world));
-			for (int mip = start_mip; mip == start_mip && mip <= _surface_svt_max_mip; mip++) {
+			for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
 				int slot = int(texelFetch(_surface_svt_indirection, coord, mip).r + 0.5);
@@ -706,13 +706,13 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 }
 
 // The legacy control-map material path (accumulate_material) was removed when
-// the Hydra IdWeight surface evaluator replaced the 2-texture-per-texel
+// the IdWeight surface evaluator replaced the 2-texture-per-texel
 // material model. Its dual scaling, auto-shader and control-map angle/scale
 // features were tied to that model and are superseded by the per-material
 // slope parameters and the R16 surface map. Materials are now sampled
 // exclusively by accumulate_idweight_layer() below.
 
-// Hydra IdWeight layer sampling. Samples one material layer with world-space
+// IdWeight layer sampling. Samples one material layer with world-space
 // projection, detiling and normal reconstruction, accumulating into `mat`.
 // `projectionAxis` selects the triplanar projection plane (0=ZY, 1=XZ, 2=XY).
 void accumulate_idweight_layer(const int id, const float weight, const vec3 base_ddx, const vec3 base_ddy,
@@ -720,9 +720,9 @@ void accumulate_idweight_layer(const int id, const float weight, const vec3 base
 		inout material mat, inout vec3 blendedNormalWS) {
 	float id_scale = _texture_uv_scale_array[id];
 	vec3 i_vertex = v_vertex;
-	vec2 i_uv = hydra_idweight_get_projection_position(i_vertex, projectionAxis) * id_scale;
-	vec2 i_dd_uv = hydra_idweight_get_projection_position(base_ddx, projectionAxis) * id_scale;
-	vec2 i_dd_uv2 = hydra_idweight_get_projection_position(base_ddy, projectionAxis) * id_scale;
+	vec2 i_uv = idweight_get_projection_position(i_vertex, projectionAxis) * id_scale;
+	vec2 i_dd_uv = idweight_get_projection_position(base_ddx, projectionAxis) * id_scale;
+	vec2 i_dd_uv2 = idweight_get_projection_position(base_ddy, projectionAxis) * id_scale;
 
 	// Detiling
 	vec2 uv_center = floor(i_uv + 0.5);
@@ -740,13 +740,13 @@ void accumulate_idweight_layer(const int id, const float weight, const vec3 base
 	nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
 	// Decode the Godot Y-up normal map into (nU, nH, nV) with the out-of-plane
 	// component re-derived after the material's normal depth is applied.
-	vec3 normalPS = hydra_idweight_decode_normal(nrm, _texture_normal_depth_array[id]);
+	vec3 normalPS = idweight_decode_normal(nrm, _texture_normal_depth_array[id]);
 	float ao = length(nrm.xyz) * 2.0 - 1.0;
 	ao = mix(ao * ao * _texture_ao_strength_array[id] + 1.0 - _texture_ao_strength_array[id], 1.0, alb.a * alb.a);
 
 	// Slope-based normal damp: blend sampled normal toward the geometric normal.
-	vec3 layerNormalWS = hydra_idweight_projection_normal_to_world(normalPS, projectionAxis, geometricNormalWS);
-	float normalDamp = hydra_idweight_saturate(_texture_slope_params_array[id].z * 0.001);
+	vec3 layerNormalWS = idweight_projection_normal_to_world(normalPS, projectionAxis, geometricNormalWS);
+	float normalDamp = idweight_saturate(_texture_slope_params_array[id].z * 0.001);
 	layerNormalWS = normalize(mix(layerNormalWS, normalize(geometricNormalWS), normalDamp));
 
 	mat.albedo_height = fma(alb, vec4(weight), mat.albedo_height);
@@ -763,7 +763,7 @@ void accumulate_idweight_layer(const int id, const float weight, const vec3 base
 // normal is sampled from the overlay material's normal texture and flattened
 // toward up by the vertex alignment, then damped by the overlay's
 // slope_based_damp before the tangent test.
-float hydra_idweight_evaluate_slope_overlay_weight(uint packed, uint backgroundId, uint overlayId,
+float idweight_evaluate_slope_overlay_weight(uint packed, uint backgroundId, uint overlayId,
 		float slopeDistanceBlend, uint projectionAxis, vec3 geometricNormalWS,
 		vec3 base_ddx, vec3 base_ddy) {
 	if (overlayId == backgroundId) {
@@ -771,14 +771,14 @@ float hydra_idweight_evaluate_slope_overlay_weight(uint packed, uint backgroundI
 	}
 	// blendSharpness protection: clamp to [0.1, 1000] then /1000, so legacy 0
 	// still produces a valid slope blend and never degrades to linear weight.
-	float blendSharpness = hydra_idweight_saturate(clamp(_texture_slope_params_array[int(backgroundId)].x, 0.1, 1000.0) * 0.001);
-	float slopeBasedDamp = hydra_idweight_saturate(_texture_slope_params_array[int(overlayId)].y * 0.001);
+	float blendSharpness = idweight_saturate(clamp(_texture_slope_params_array[int(backgroundId)].x, 0.1, 1000.0) * 0.001);
+	float slopeBasedDamp = idweight_saturate(_texture_slope_params_array[int(overlayId)].y * 0.001);
 
 	// Sample the overlay normal in the active projection plane.
 	float id_scale = _texture_uv_scale_array[int(overlayId)];
-	vec2 i_uv = hydra_idweight_get_projection_position(v_vertex, projectionAxis) * id_scale;
-	vec2 i_dd_uv = hydra_idweight_get_projection_position(base_ddx, projectionAxis) * id_scale;
-	vec2 i_dd_uv2 = hydra_idweight_get_projection_position(base_ddy, projectionAxis) * id_scale;
+	vec2 i_uv = idweight_get_projection_position(v_vertex, projectionAxis) * id_scale;
+	vec2 i_dd_uv = idweight_get_projection_position(base_ddx, projectionAxis) * id_scale;
+	vec2 i_dd_uv2 = idweight_get_projection_position(base_ddy, projectionAxis) * id_scale;
 	vec2 uv_center = floor(i_uv + 0.5);
 	vec2 id_detile = fma(random(uv_center), 2.0, -1.0) * _texture_detile_array[int(overlayId)] * TAU;
 	vec2 id_cs_angle = vec2(cos(id_detile.x), sin(id_detile.x));
@@ -787,41 +787,41 @@ float hydra_idweight_evaluate_slope_overlay_weight(uint packed, uint backgroundI
 	i_dd_uv = rotate_vec2(i_dd_uv, id_cs_angle);
 	i_dd_uv2 = rotate_vec2(i_dd_uv2, id_cs_angle);
 	vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(overlayId)), i_dd_uv, i_dd_uv2);
-	vec3 normalPS = hydra_idweight_decode_normal(nrm, _texture_normal_depth_array[int(overlayId)]);
-	vec3 combinedVerticalNormalWS = hydra_idweight_projection_normal_to_world(normalPS, projectionAxis, geometricNormalWS);
+	vec3 normalPS = idweight_decode_normal(nrm, _texture_normal_depth_array[int(overlayId)]);
+	vec3 combinedVerticalNormalWS = idweight_projection_normal_to_world(normalPS, projectionAxis, geometricNormalWS);
 
 	vec3 normalizedGeometricNormalWS = normalize(geometricNormalWS);
-	float vertexUp = hydra_idweight_saturate(dot(normalizedGeometricNormalWS, vec3(0.0, 1.0, 0.0)));
+	float vertexUp = idweight_saturate(dot(normalizedGeometricNormalWS, vec3(0.0, 1.0, 0.0)));
 	vec3 flattenedVerticalNormal = normalize(mix(combinedVerticalNormalWS, vec3(0.0, 1.0, 0.0), vertexUp));
 	vec3 slopeNormal = normalize(mix(combinedVerticalNormalWS, flattenedVerticalNormal, slopeBasedDamp));
-	return hydra_idweight_compute_slope_tangent(slopeNormal, hydra_idweight_slope_threshold(packed), blendSharpness);
+	return idweight_compute_slope_tangent(slopeNormal, idweight_slope_threshold(packed), blendSharpness);
 }
 
-void hydra_idweight_add_pair_vertex(uint packed, float barycentric,
+void idweight_add_pair_vertex(uint packed, float barycentric,
 		uint packedBottomLeft, uint packedBottomRight, uint packedTopLeft, uint packedTopRight,
 		vec2 local, float slopeDistanceBlend, uint projectionAxis, vec3 geometricNormalWS,
 		vec3 base_ddx, vec3 base_ddy,
 		inout IdWeightContributions values, inout float interpolatedOverlayWeight) {
-	uint backgroundId = hydra_idweight_background(packed);
-	uint overlayId = hydra_idweight_overlay(packed);
-	uint mode = hydra_idweight_mode(packed);
-	float linearWeight = hydra_idweight_weight(packed);
+	uint backgroundId = idweight_background(packed);
+	uint overlayId = idweight_overlay(packed);
+	uint mode = idweight_mode(packed);
+	float linearWeight = idweight_weight(packed);
 	float slopeBlend = 0.0;
 	float slopeWeight = linearWeight;
-	if (mode != HYDRA_IDWEIGHT_MODE_SET && slopeDistanceBlend > 0.0) {
-		float pairCoverage = hydra_idweight_bilinear_pair_coverage(
+	if (mode != IDWEIGHT_MODE_SET && slopeDistanceBlend > 0.0) {
+		float pairCoverage = idweight_bilinear_pair_coverage(
 			packedBottomLeft, packedBottomRight, packedTopLeft, packedTopRight, packed, local);
-		slopeBlend = hydra_idweight_slope_interior_blend(pairCoverage) * slopeDistanceBlend;
-		slopeWeight = hydra_idweight_evaluate_slope_overlay_weight(
+		slopeBlend = idweight_slope_interior_blend(pairCoverage) * slopeDistanceBlend;
+		slopeWeight = idweight_evaluate_slope_overlay_weight(
 			packed, backgroundId, overlayId, slopeDistanceBlend,
 			projectionAxis, geometricNormalWS, base_ddx, base_ddy);
 	}
-	float modeTargetWeight = hydra_idweight_resolve_mode_target_weight(mode, linearWeight, slopeWeight);
-	float overlayWeight = mix(linearWeight, modeTargetWeight, hydra_idweight_saturate(slopeBlend));
+	float modeTargetWeight = idweight_resolve_mode_target_weight(mode, linearWeight, slopeWeight);
+	float overlayWeight = mix(linearWeight, modeTargetWeight, idweight_saturate(slopeBlend));
 	float backgroundWeight = 1.0 - overlayWeight;
-	hydra_idweight_add_contribution(backgroundId, barycentric * backgroundWeight, values);
+	idweight_add_contribution(backgroundId, barycentric * backgroundWeight, values);
 	if (overlayId != backgroundId) {
-		hydra_idweight_add_contribution(overlayId, barycentric * overlayWeight, values);
+		idweight_add_contribution(overlayId, barycentric * overlayWeight, values);
 	}
 	interpolatedOverlayWeight += barycentric * overlayWeight;
 }
@@ -963,12 +963,12 @@ void fragment() {
 	// accumulator after that call, rather than relying on values it overwrote.
 	mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
 	blendedNormalWS = vec3(0.0);
-	// ── Hydra IdWeight surface evaluation ──
+	// ── IdWeight surface evaluation ──
 	// Precise corner reads from the R16 surface map (no sampler interpolation).
 	// R16 UNORM texelFetch returns a normalized float; scale back to the packed
 	// 16-bit integer exactly (65536 discrete values fit float precisely).
 	// The idweight cell is evaluated on the stored payload's own grid when the virtual
-	// texture serves it. At density 1 that is exactly Hydra's per-cell contract, and a
+	// texture serves it. At density 1 that is exactly the per-cell contract, and a
 	// denser payload is the same contract on a dyadically subdivided cell: the fixed
 	// BL-TR diagonal survives dyadic subdivision, so the triangle selection below stays
 	// consistent with the mesh. With the virtual texture off the region array is
@@ -991,11 +991,10 @@ void fragment() {
 	}
 
 	// Cell-local coordinates and triangle selection.
-	// Hydra uses ONE fixed mesh diagonal in every cell: LowerLeft (BL, BR, TR)
-	// when local.x > local.y, UpperLeft (BL, TL, TR) otherwise. Mirrors
-	// TerrainSurfaceTriangleMath::SelectTriangle / ComputeBarycentric and
-	// IdWeightSampleSurface (p0 = BL, p1 = isLowerLeft ? BR : TL, p2 = TR).
-	// The Godot clipmap must therefore keep that same diagonal on every LOD
+	// ONE fixed mesh diagonal in every cell: LowerLeft (BL, BR, TR)
+	// when local.x > local.y, UpperLeft (BL, TL, TR) otherwise, with p0 = BL,
+	// p1 = isLowerLeft ? BR : TL and p2 = TR. The clipmap must therefore keep
+	// that same diagonal on every LOD
 	// (see Terrain3DMesher::_generate_mesh); a per-cell alternating diagonal
 	// makes this interpolation disagree with the triangles actually rendered.
 	vec2 local = surface_weight;
@@ -1015,26 +1014,26 @@ void fragment() {
 	}
 
 	// Select material candidates once, after pair-aware slope evaluation.
-	float materialResidualSelector = hydra_idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
+	float materialResidualSelector = idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
 	uvec3 materialIds;
 	vec3 materialWeights;
 
-	// Random triplanar projection (Hydra). The slope factor changes stochastic
+	// Random triplanar projection. The slope factor changes stochastic
 	// coverage probability, not the number of texture samples.
-	float triplanarFactor = hydra_idweight_get_triplanar_factor(w_normal);
-	vec3 triplanarWeights = hydra_idweight_get_triplanar_weights(w_normal);
+	float triplanarFactor = idweight_get_triplanar_factor(w_normal);
+	vec3 triplanarWeights = idweight_get_triplanar_weights(w_normal);
 	uint projectionAxis = 1u; // XZ
 	if (triplanarFactor > 0.0) {
 		vec3 projectionWeights = mix(vec3(0.0, 1.0, 0.0), triplanarWeights, triplanarFactor);
-		projectionAxis = hydra_idweight_select_stochastic_coverage_axis(v_vertex, projectionWeights);
+		projectionAxis = idweight_select_stochastic_coverage_axis(v_vertex, projectionWeights);
 	}
 
 	// Pair-aware slope modification. Set and distant pixels stay linear; active
 	// slope Pairs use four-corner coverage so the transition remains smooth
 	// across the fixed mesh diagonal.
 	float slopeDistanceBlend = 1.0 - smoothstep(
-		HYDRA_IDWEIGHT_SLOPE_FULL_DISTANCE_SQ,
-		HYDRA_IDWEIGHT_SLOPE_MAX_DISTANCE_SQ,
+		IDWEIGHT_SLOPE_FULL_DISTANCE_SQ,
+		IDWEIGHT_SLOPE_MAX_DISTANCE_SQ,
 		dot(v_vertex - v_camera_pos, v_vertex - v_camera_pos));
 	// Persistent material pages use a camera-independent slope policy. Cache
 	// misses use that same policy, avoiding a different material while refining.
@@ -1043,13 +1042,13 @@ void fragment() {
 	}
 	IdWeightContributions pairValues = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
 	float overlayWeight = 0.0;
-	hydra_idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	hydra_idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	hydra_idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	hydra_idweight_select_budgeted_3(pairValues, materialResidualSelector, materialIds, materialWeights, materialCount);
+	idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
+	idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
+	idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
+	idweight_select_budgeted_3(pairValues, materialResidualSelector, materialIds, materialWeights, materialCount);
 
 	// 3 texture lookups max (one per selected layer).
-	for (int layerIndex = 0; layerIndex < HYDRA_IDWEIGHT_MAX_LAYERS; layerIndex++) {
+	for (int layerIndex = 0; layerIndex < IDWEIGHT_MAX_LAYERS; layerIndex++) {
 		if (uint(layerIndex) >= materialCount) {
 			break;
 		}
@@ -1073,8 +1072,8 @@ void fragment() {
 		AO = 1.0;
 	} else {
 
-	// Hydra normal: blended world-space layer normals converted to terrain
-	// tangent space (Hydra IdWeightWorldNormalToTerrain).
+	// Blended world-space layer normals converted to terrain
+	// tangent space.
 	vec3 blendedNormal = normalize(blendedNormalWS + vec3(0.0, 0.0001, 0.0));
 	vec3 normalTS = vec3(
 		dot(blendedNormal, w_tangent),

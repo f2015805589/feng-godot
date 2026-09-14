@@ -1,6 +1,6 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Asset Dock tile: one resource tile, its buttons, its hover/selection state and
-# the Hydra IdWeight pair-role markers.
+# the IdWeight pair-role markers.
 @tool
 class_name Terrain3DAssetDockEntry
 extends MarginContainer
@@ -19,9 +19,9 @@ var drop_data: bool = false
 var is_hovered: bool = false
 var is_selected: bool = false
 var is_highlighted: bool = false
-# Hydra IdWeight pair role markers: 0 = none, 1 = white (the left-click role,
+# IdWeight pair role markers: 0 = none, 1 = white (the left-click role,
 # displayed as Overlay), 2 = blue (the right-click role, displayed as
-# Background), 3 = both. The colours match Hydra's DrawRoleBorder; see
+# Background), 3 = both. The colours match the layer grid's role borders; see
 # ListContainer._role_flags_for for which pair field each marker tracks.
 var role_flags: int = 0
 
@@ -170,10 +170,9 @@ func get_resource_id() -> int:
 	return -1
 
 
-# Names the pair roles held by this tile using Hydra's display naming, which
-# is reversed against its own pair fields: the white left-click marker is
-# shown as "Overlay" and the blue right-click marker as "Background"
-# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick").
+# Names the pair roles held by this tile using the displayed naming, which is
+# reversed against the packed pair fields: the white left-click marker is
+# shown as "Overlay" and the blue right-click marker as "Background".
 func get_role_label() -> String:
 	if type != Terrain3DAssets.TYPE_TEXTURE:
 		return ""
@@ -322,15 +321,15 @@ func _gui_input(p_event: InputEvent) -> void:
 							set_edited_resource(Terrain3DMeshAsset.new(), false)
 						_on_edit()
 					else:
-						# Hydra's label: left click is the Overlay role.
-						# Hydra's chain: left click is the Background field.
+						# Displayed label: left click is the Overlay role.
+						# Packed field: left click is the Background field.
 						if type == Terrain3DAssets.TYPE_TEXTURE:
 							role_selected.emit(0, self)
 						emit_signal("clicked")
 				MOUSE_BUTTON_RIGHT:
 					if resource:
-						# Hydra's label: right click is the Background role.
-						# Hydra's chain: right click is the Overlay field.
+						# Displayed label: right click is the Background role.
+						# Packed field: right click is the Overlay field.
 						if type == Terrain3DAssets.TYPE_TEXTURE:
 							role_selected.emit(1, self)
 							emit_signal("clicked")

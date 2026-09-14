@@ -207,8 +207,8 @@ void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 // Both virtual textures cache a region's surface, so an edit has to drop the pages that
 // carry it. Without this, an array-free configuration would keep rendering the material
 // the page was produced with until the LRU happened to evict it.
-void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc) {
-	if (is_vt_editor_preview_active()) {
+void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_force) {
+	if (!p_force && is_vt_editor_preview_active()) {
 		_vt.vt_editor_dirty_regions[p_region_loc] = true;
 		_vt.vt_svt_dirty_regions[p_region_loc] = true;
 		return;
@@ -291,6 +291,20 @@ real_t Terrain3D::get_surface_svt_mip_reach() const {
 	}
 	const int max_mip = _vt.surface_svt ? MAX(0, _vt.surface_svt->get_world_max_mip()) : MAX(0, _vt.surface_svt_max_mip);
 	return _vt.surface_svt_mip_distances[MIN(int(_vt.surface_svt_mip_distances.size()) - 1, max_mip)];
+}
+
+// A page the raw-ID diagnostic mode allocates carries the packed id/weight payload the
+// shader reads, cropped from the resident region maps at the page's own world rect. The
+// crop is world aligned, so a page that spans several regions (or covers none) resolves
+// every texel through its owning region, and the border ring reads the neighbours.
+bool Terrain3D::_write_diagnostic_sparse_page(int p_slot, int p_page_x, int p_page_y, int p_local_mip,
+		real_t p_page_world) {
+	if (!_vt.vt_debug_direct_material || !_data || !_vt.surface_svt || p_slot < 0) {
+		return false;
+	}
+	Ref<Image> page = _data->make_sparse_surface_page(p_page_x, p_page_y, p_local_mip, p_page_world,
+			_vt.surface_svt->get_page_size(), _vt.surface_svt->get_page_border());
+	return page.is_valid() && _vt.surface_svt->write_page(p_slot, page);
 }
 
 // One far-field demand pass. Pages are world aligned, so the set is a plain grid walk
@@ -453,6 +467,13 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		const Vector2i address((virtual_x - half_at_mip) << mip, (virtual_y - half_at_mip) << mip);
 		Ref<Image> page;
 		const float span = page_world * float(1 << mip);
+		if (_vt.vt_debug_direct_material &&
+				!_write_diagnostic_sparse_page(slot, address.x, address.y, mip, page_world)) {
+			// The diagnostic mode has no material pipeline to fall back on, so a page
+			// without content must not be published and pinned as if it were a root.
+			_vt.surface_svt->release_world_page(address.x, address.y, mip);
+			continue;
+		}
 		_queue_vt_material_page(slot, page, Rect2(Vector2(address) * page_world, Vector2(span, span)), true, mip, address);
 		// A root page is the fallback of last resort. Protecting it leaves at least
 		// half of the shared pool available to AVT, detail SVT, and offline baking.
@@ -517,6 +538,13 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 
 		const float span = page_world * float(1 << mip);
 		const Vector2i address((page_x >> mip) << mip, (page_y >> mip) << mip);
+		if (_vt.vt_debug_direct_material &&
+				!_write_diagnostic_sparse_page(slot, page_x, page_y, mip, page_world)) {
+			// Nothing else can fill this slot in the diagnostic mode, so drop it again
+			// instead of serving an unwritten layer until the next LRU pass recycles it.
+			_vt.surface_svt->release_world_page(page_x, page_y, mip);
+			continue;
+		}
 		_queue_vt_material_page(slot, page, Rect2(Vector2(address) * page_world, Vector2(span, span)), true, mip, address);
 		produced++;
 	}

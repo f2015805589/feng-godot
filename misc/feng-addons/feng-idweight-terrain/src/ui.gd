@@ -34,15 +34,14 @@ var _selected_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var _tool_state_initialized: bool = false
 var inverted_input: bool = false
 
-# Hydra IdWeight pair painting state: which role the next stroke paints.
-# 0 = the left-mouse role, 1 = the right-mouse role. The dock displays them with
-# Hydra's naming ("Left click: Overlay    Right click: Background"), which Hydra
-# documents as deliberately reversed against its own chain
-# (TerrainSurfaceIdWeightLayerGrid.cs:99 "trick：UI显示反过来 ... 链路里面的所有
-# 计算全部反了"). The field mapping follows Hydra's chain, so the left-click role
-# writes pair_background_id (the base layer) and the right-click role writes
-# pair_overlay_id (the layer the Weight slider fades in). Border colours also
-# match Hydra: left = white, right = blue.
+# IdWeight pair painting state: which role the next stroke paints.
+# 0 = the left-mouse role, 1 = the right-mouse role. The dock labels them the
+# opposite way round from the packed fields ("Left click: Overlay    Right
+# click: Background"), because that on-screen naming is deliberately reversed
+# against the field order, so the left-click role writes pair_background_id (the
+# base layer) and the right-click role writes pair_overlay_id (the layer the
+# Weight slider fades in). Border colours follow the same convention:
+# left = white, right = blue.
 var pair_active_role: int = 0
 # The packed R16 pair fields. pair_overlay_id is the layer the Weight slider
 # fades in; pair_background_id is the layer it fades over.
@@ -191,7 +190,7 @@ func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor
 			to_show.push_back("slope_based_damp")
 			to_show.push_back("slope_based_normal_damp")
 			to_show.push_back("slope")
-			# The Hydra IdWeight R16 contract stores no per-texel UV rotation or
+			# The IdWeight R16 contract stores no per-texel UV rotation or
 			# scale (Overlay:5 | Background:5 | Mode:2 | Weight:3 | UV:1, and UV
 			# variant 0 is the only valid value), so the legacy Angle/Scale brush
 			# controls have nothing left to write. Per-material UV scale comes
@@ -275,11 +274,11 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 		return
 	brush_data = tool_settings.get_settings()
 	brush_data["asset_id"] = plugin.asset_dock.current_list.get_selected_asset_id()
-	# Hydra IdWeight pair painting: keep the selected overlay/background roles
+	# IdWeight pair painting: keep the selected overlay/background roles
 	# stable across asset selection changes, and apply the current role's asset.
 	if plugin.editor and plugin.editor.get_tool() == Terrain3DEditor.TEXTURE:
 		# pair_active_role is the role of the last dock click: 0 = left mouse,
-		# 1 = right mouse. Hydra's chain writes the left-clicked layer into the
+		# 1 = right mouse. The packed chain writes the left-clicked layer into the
 		# Background pair field (the base) and the right-clicked layer into the
 		# Overlay field (the layer the Weight slider fades in), so the
 		# button-to-field mapping is the mirror of the role names the dock shows.
@@ -292,11 +291,11 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 		brush_data["pair_mode"] = tool_settings.get_setting("pair_mode")
 		brush_data["pair_weight_level"] = tool_settings.get_setting("pair_weight_level")
 		_update_pair_role_readout()
-		# Hydra binds each slope parameter to a pair ROLE, not to whichever asset
+		# Each slope parameter belongs to a pair ROLE, not to whichever asset
 		# is selected: the shader reads blendSharpness from the Background
 		# (Horizontal) material and both damps from the Overlay (Vertical)
-		# material, and Hydra's TerrainToolEditorWindow edits exactly
-		# backgroundSettings.blendSharpness plus overlaySettings.slopeBasedDamp.
+		# material, so the brush edits exactly backgroundSettings.blendSharpness
+		# plus overlaySettings.slopeBasedDamp.
 		# Writing all three to the selected asset silently edited the parameter of
 		# whichever role was not selected, so the edit never reached the shader.
 		_sync_slope_setting("slope_blend_sharpness", pair_background_id, p_setting)
@@ -314,11 +313,11 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 	update_decal()
 
 
-# Hydra IdWeight pair role readout for the brush bar. Hydra names the active
-# role in its layer grid ("Current Pair Selection: <slot> · <id>: <name>",
-# TerrainSurfaceIdWeightLayerGrid.cs), but the port only drew role borders in
-# the asset dock, so which material was the overlay and which was the background
-# was invisible while painting. The slots name the packed pair fields: the
+# IdWeight pair role readout for the brush bar. The layer grid names the active
+# role ("Current Pair Selection: <slot> · <id>: <name>"), but the asset dock
+# only draws role borders, so which material was the overlay and which was the
+# background was invisible while painting. The slots name the packed pair
+# fields: the
 # Overlay slot is the layer the Weight slider fades in and the Background slot is
 # the layer it fades over. Role ids index the texture asset list, and id 0 is a
 # valid material, so a slot only reports as missing when no asset exists.

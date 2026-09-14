@@ -16,6 +16,10 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; TerrainVT::VisiblePatch visible; };
 	struct Page { Vector2i address; int mip; float distance; };
 	std::vector<Region> regions;
+	// Union of the visible region rects. The far field's root pyramid has to cover what
+	// this pass can render, not just the detail pages it manages to produce.
+	Rect2 visible_bounds;
+	bool has_visible_bounds = false;
 	const Vector3 camera_position = camera->get_global_position();
 	const Vector2 focus(camera_position.x, camera_position.z);
 	auto avt_interior = [&](const Rect2 &rect) {
@@ -35,6 +39,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
 		regions.push_back({ rect, region->get_height_range(), visible.distance, visible.farthest, visible });
+		visible_bounds = has_visible_bounds ? visible_bounds.merge(rect) : rect;
+		has_visible_bounds = true;
 	}
 	std::sort(regions.begin(), regions.end(), [](const Region &a, const Region &b) { return a.distance < b.distance; });
 	float farthest_distance = 0.f;
@@ -108,14 +114,11 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	_vt.vt_svt_visible_pages = int(pages.size());
 	const int near_reserve = _vt.surface_vt_enabled ? MIN(physical_page_count / 2, int(_vt.avt_page_plan.size())) : 0;
 	const int capacity = MAX(1, physical_page_count - near_reserve);
-	// Preserve the shader's selected level. Coarsening only the CPU request
-	// produces a permanently missing page when strict residency is enabled.
-	const std::vector<Page> &chosen = pages;
 
 	// Publish the level this frame uses. A saved maximum detail level is only ever raised,
 	// never lowered, so a view that already extended the hierarchy keeps it.
 	int used_mip = configured_mip;
-	for (const Page &page : chosen) { used_mip = MAX(used_mip, page.mip); }
+	for (const Page &page : pages) { used_mip = MAX(used_mip, page.mip); }
 	if (!regions.empty() && _vt.surface_svt_mip_distances.is_empty()) {
 		// With the automatic rule a saved cap must not hide terrain the view can see, so
 		// the hierarchy extends to the level the farthest visible point selects. The
@@ -131,10 +134,113 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 	}
 
+	// Far-field roots: the coarsest levels covering the visible world stay resident and
+	// protected, so a miss on a detail page resolves to real coarse data instead of the
+	// diagnostic material. They are acquired before the detail set because under pressure
+	// the detail pass drops the far end of the working set, which is exactly where the
+	// coarse levels live. Capped at half the pool, so the near field and the detail pages
+	// keep room to work in.
+	const int protected_limit = MAX(1, physical_page_count / 2);
+	const int root_levels = CLAMP(_vt.surface_svt_root_mips, 0, maximum_mip + 1);
+	std::vector<Vector3i> next_roots;
+	if (root_levels > 0 && has_visible_bounds) {
+		const Rect2 covered = visible_bounds.intersection(domain);
+		for (int mip = maximum_mip; mip > maximum_mip - root_levels && int(next_roots.size()) < protected_limit; --mip) {
+			const float span = page_world * float(1 << mip);
+			const int x0 = int(Math::floor(covered.position.x / span));
+			const int x1 = int(Math::floor(covered.get_end().x / span));
+			const int y0 = int(Math::floor(covered.position.y / span));
+			const int y1 = int(Math::floor(covered.get_end().y / span));
+			for (int y = y0; y <= y1 && int(next_roots.size()) < protected_limit; ++y) {
+				for (int x = x0; x <= x1 && int(next_roots.size()) < protected_limit; ++x) {
+					// Page requests and releases take a mip 0 page coordinate.
+					next_roots.push_back(Vector3i(x << mip, y << mip, mip));
+				}
+			}
+		}
+	}
+	// A root that left the visible set loses its pin, so a world that scrolls away does not
+	// keep half the pool reserved for the rest of the session.
+	for (const Vector3i &previous : _vt.svt_root_pages) {
+		bool retained = false;
+		for (const Vector3i &next : next_roots) {
+			if (next == previous) { retained = true; break; }
+		}
+		if (retained) { continue; }
+		// Drop the pin only. Releasing the page would also remove the owner entry that a
+		// detail page may share with this root - publish_owner() dedups by virtual
+		// coordinate and level - and an unpinned page is reclaimed by the LRU anyway.
+		int virtual_x = 0;
+		int virtual_y = 0;
+		_vt.surface_svt->world_page_to_virtual(previous.x, previous.y, previous.z, virtual_x, virtual_y);
+		const int slot = _vt.surface_svt->get_indirection_slot(virtual_x, virtual_y, previous.z);
+		if (slot != int(Terrain3DVirtualTexture::INVALID_SLOT)) { _vt.surface_svt->protect_page(slot, false); }
+	}
+	_vt.svt_root_pages = next_roots;
+
 	int produced = 0;
+	for (const Vector3i &root : next_roots) {
+		bool miss = false;
+		const int slot = _vt.surface_svt->request_world_page_internal(root.x, root.y, root.z, &miss);
+		if (slot < 0) { continue; }
+		// A root that gets evicted leaves a miss with nothing coarser to show, which is
+		// the whole reason the pyramid exists.
+		_vt.surface_svt->protect_page(slot, true);
+		if (!miss) { continue; }
+		_invalidate_vt_slot(slot);
+		Ref<Image> payload;
+		const float span = _vt.surface_svt_page_world * float(1 << root.z);
+		_queue_vt_material_page(slot, payload, Rect2(Vector2(root.x, root.y) * _vt.surface_svt_page_world, Vector2(span, span)),
+				true, root.z, Vector2i(root.x, root.y));
+		produced++;
+	}
+
+	// Over-subscription raises a shared coarseness floor instead of dropping the far end of
+	// the working set: a page finer than the floor is published at the floor, while a page
+	// already coarser than it keeps the level the distance rule gave it. Every visible
+	// footprint therefore still resolves through a page of some real level, and the floor is
+	// the smallest one that fits - a function of the visible set and the remaining capacity
+	// alone - so a settled view selects the same floor, levels and pages on every pass.
+	const int detail_capacity = MAX(1, capacity - int(next_roots.size()));
+	std::vector<Page> chosen;
+	_vt.svt_floor_level = 0;
+	if (int(pages.size()) <= detail_capacity) {
+		chosen = pages;
+	} else {
+		for (int candidate = 0; candidate <= maximum_mip && chosen.empty(); ++candidate) {
+			std::map<std::tuple<int, int, int>, float> merged;
+			for (const Page &page : pages) {
+				const int level = MAX(page.mip, candidate);
+				const auto key = std::make_tuple(level, page.address.x, page.address.y);
+				const auto found = merged.find(key);
+				if (found == merged.end() || page.distance < found->second) { merged[key] = page.distance; }
+			}
+			if (int(merged.size()) > detail_capacity) { continue; }
+			_vt.svt_floor_level = candidate;
+			chosen.reserve(merged.size());
+			for (const auto &entry : merged) {
+				Page page;
+				page.mip = std::get<0>(entry.first);
+				page.address = Vector2i(std::get<1>(entry.first), std::get<2>(entry.first));
+				page.distance = entry.second;
+				chosen.push_back(page);
+			}
+		}
+		if (chosen.empty()) {
+			// Even the coarsest floor does not fit. Keep the nearest pages and let the
+			// shader's coarse walk and the root pyramid cover the rest.
+			_vt.svt_floor_level = maximum_mip;
+			chosen.assign(pages.begin(), pages.begin() + MIN(int(pages.size()), detail_capacity));
+		}
+		std::sort(chosen.begin(), chosen.end(), [](const Page &a, const Page &b) {
+			if (a.distance != b.distance) { return a.distance < b.distance; }
+			return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
+		});
+	}
+
 	int visited = 0;
 	for (const Page &request : chosen) {
-		if (visited >= capacity) { break; }
+		if (visited >= detail_capacity) { break; }
 		visited++;
 		bool miss = false;
 		const int slot = _vt.surface_svt->request_world_page_internal(request.address.x, request.address.y, request.mip, &miss);

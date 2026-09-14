@@ -1,125 +1,117 @@
-# Hydra terrain VT + chunk streaming → Godot port
+# Terrain virtual texturing and chunk streaming
 
-**Current implementation:** Surface VT has shared physical residency and settings,
-GPU material baking with adaptive AVT allocation, and persisted SVT material pages.
-The historical Hydra analysis below describes the reference architecture; see
-[current architecture](vt_architecture_review.md) for the Godot implementation.
+How the terrain surface channel is stored, addressed, produced and streamed in this
+addon, why each piece is built the way it is, and how to verify it.
 
-Read of Hydra's terrain stack (`D:\hydra\hydra-unity`, Unity 2022.3.59f1) and the plan for
-bringing the parts we need into `feng-idweight-terrain`. Written after reading the sources
-listed at the bottom; every Hydra number below has a `file:line` behind it.
+**Current implementation:** both virtual texture tiers share one physical residency
+pool and one set of settings; the near field allocates adaptive per-sector blocks, the
+far field persists baked material pages; geometry can run as a CDLOD quadtree. See
+[current architecture](vt_architecture_review.md) for the subsystem map.
 
-## 1. Hydra has three separate systems, not one
+## 1. Three subsystems, three jobs
 
-| System | Job | Key files |
+| System | Job | Entry points |
 |---|---|---|
-| **CDLOD** | Geometry quadtree + height-page streaming + GPU vertex morphing | `ZRP/Runtime/TerrainCdlod/*`, `ZTerrain/Runtime/Height/TerrainCdlodHeightStore.cs`, `Terrain/Shaders/Terrain/TerrainCdlod.hlsl` |
-| **AVT** | Near-field adaptive virtual texture, pages baked on the GPU per 64 m sector | `ZRP/Runtime/TerrainVT/TerrainAVT*`, `TerrainVT/AVT/TerrainAVTFunctions.hlsl` |
-| **SVT** | Far-field sparse virtual texture, pages composited from per-cell baked sector textures | `ZRP/Runtime/TerrainVT/TerrainSvtAddressing.cs`, `ZTerrain/Runtime/Asset/TerrainSvtPageManifestAsset.cs` |
+| **CDLOD** | Geometry quadtree, instanced patch meshes, GPU vertex morphing | `native/src/terrain_3d_cdlod.{h,cpp}`, `shaders/main.glsl` |
+| **AVT** | Near-field adaptive virtual texture over 64 m world sectors | `native/src/terrain_3d_sector_avt.cpp`, `terrain_3d_vt_service.cpp`, `terrain_3d_avt.h` |
+| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_surface_vt.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
 
-They share the world cell grid but have **separate LOD trackers and separate streaming
-centres**. Don't port them as one thing.
+They share the world cell grid and the physical page pool, but they have **separate
+address spaces, separate demand passes and separate level rules**. They are not one
+system and should not be folded into one.
 
-Two negative findings worth stating up front, because they change the shape of a port:
+Two properties shape everything below, so they are worth stating up front:
 
-* **There is no disk page store for AVT pages.** `TerrainAVTPageStorage.cs` is GPU storage.
-  AVT pages are baked on demand from already-loaded cell data; SVT dynamic pages are GPU
-  copies of per-cell baked sector textures. The only thing resembling "streaming" is the
-  async cell/pack load in `ZTerrain`, plus `TerrainSvtFallbackPageBaker` which is
-  **editor-only** and bakes 5 fallback pages into a manifest asset.
-* **`TerrainVTLodTracker` is not the AVT mip selector.** It drives the height/hole clipmap
-  only; for AVT it is called with `centerSize: 0` and its color output is ignored
-  (`TerrainVTPass.cs:913-935`). AVT mip selection is screen-space anisotropic LOD computed
-  in the shader (`TerrainAVTFunctions.hlsl:217-226`).
+* **There is no disk page store for near-field pages.** They are baked on demand from
+  the loaded regions by a worker that owns an immutable snapshot of the source bytes.
+  The far field can serve a page from a persisted bake (`.vtcell`, section 4.11), but it
+  never *needs* one: a page with no bake is produced from the resident region payloads, and
+  a bake that is resident on the GPU (this session's cell store) is copied without touching
+  the disk at all.
+* **Near-field level selection is not a distance rule in the shader.** The fragment
+  picks its level from the pixel footprint, and the CPU planner predicts that choice
+  from projected screen density, so producer and sampler agree on the level without
+  either one owning the other.
 
-## 2. Constants that define the addressing contract
+## 2. The addressing contract
 
-Ported verbatim into `native/src/terrain_vt.h` (`TerrainVT` namespace).
+`native/src/terrain_vt.h` holds the engine-independent half of it: the page record, the
+indirection mip walk and the POT quadtree allocator. Everything else lives with the
+runtime.
 
-| Constant | Value | Hydra source |
+| Constant | Value | Where |
 |---|---|---|
-| Sector size | 64 m | `TerrainAVTConstants.cs:5` |
-| Page content / border / stored | 256 / 4 / **264** | `:7-9` |
-| PageID texture downscale | 8 | `:12` |
-| Indirection texture | 1024×1024, **R16_UInt**, 11 mips, autoGen off | `:16`, `:25`; `TerrainAVTIndirectionTexture.cs:135-144` |
-| Invalid physical slot | 65535 | `:18` |
-| AVT global mips | 0..8 | `:19` |
-| SVT start global mip | 9 | `:20` |
-| Indirection writes / frame | 64 | `:23` |
-| Indirection writes / page | 4 | `:24` |
-| Fallback pages | 5 (4 + 1) | `:26` |
-| Sector preload distance | 6 → 7×7 = 49 sectors | `:30`; `TerrainAVTRuntime.cs:998-1014` |
-| Camera move threshold | 2 m (squared 4) | `:31` |
-| `SwitchDistance` | 64·64·1.5 = **6144** | `:38` |
-| Descriptor slots | 16 (0 invalid, 1–7 AVT, 15 SVT) | `TerrainAVTAddressProfile.cs:131-139` |
+| Sector size | 64 m | `SECTOR_WORLD`, `terrain_3d_sector_avt.cpp` |
+| Page content / border / stored | 256 / 4 / **264** | `Terrain3DVTState`, `Terrain3DVirtualTexture` |
+| Physical slot bits | 11 (`slot & 0x7FF`) | `terrain_vt.h` |
+| Invalid slot | 65535 | `terrain_vt.h` |
+| Near-field page table | 2048×2048 entries, `R32F` | `_configure_surface_view()` |
+| Far-field page table | `max(64, page_count · 4)` entries, `R32F` | `_configure_surface_view()` |
+| Minimal virtual block | 1 page near field, 4 by default | `set_minimal_block()` |
 
-### Packed PageID (feedback texel, `R32_UInt`)
+### Indirection texel (`R32F`)
 
-```
-packed = ((x & 0xFFF) << 20) | ((y & 0xFFF) << 8) | ((mip & 0xF) << 4) | (sizeIndex & 0xF)
-```
-`TerrainAVTUtility.cs:144-159`, mirrored bit-for-bit in `TerrainAVTFunctions.hlsl:82-99`.
-`0` is the canonical "no request".
+One float per virtual page per level, holding the physical slot or `65535`. The mip
+chain is built by hand: averaging slot indices would be meaningless, so a coarser texel
+either carries a real slot or the invalid marker. A lookup walks from the requested
+level toward the coarsest, halving the page coordinate each step
+(`TerrainVT::try_match_indirection_slot`), and *the level it succeeded at is the level
+that was sampled*. `R32F` rather than an integer format keeps the texel readable with
+`texelFetch` on every backend this addon targets.
 
-### Indirection texel (`R16_UInt`)
+### Sector directory (near field, `RGBA32F`)
 
-Low **11 bits** = physical page slot; `65535` = invalid. No mip field, no valid flag — the
-matched mip is *which indirection mip the lookup succeeded at*.
+Two texels per sector: `[key.x, key.y, level, 1]` and
+`[block_origin_x, block_origin_y, block_size, logical]`. The shader hashes
+`(key, level)` and probes linearly (`avt_find_sector()` in `main.glsl`), so finding a
+block never depends on the region layer IDs the chunk directory hands out. That
+decoupling is deliberate: the address space is the virtual texture's own, not a
+side effect of which array layer a region happens to occupy.
 
-### Sector image info (packed `uint32`, different layout)
+### World page grid (far field)
 
-```
-packed = ((offsetX & 0xFFF) << 20) | ((offsetY & 0xFFF) << 8) | (sizeIndex & 0xFF)
-```
-Note the **full low byte** for `sizeIndex`, unlike PageID's nibble.
+`virtual = (page + half) >> mip`, with `page = floor(world / page_world)` and
+`half = indirection_size / 2`. CPU (`world_page_to_virtual`) and shader
+(`surface_svt_sample`) use that one formula, so the far field needs no per-sector table,
+no registration and no packing — a page's block origin is a pure function of its
+coordinate.
 
-### Address profile descriptor formula
+### Virtual page blocks (near field)
 
-```
-minGlobalMip        = sizeIndex - 1
-resolutionTexels    = (64 * baseTexelsPerMeter) >> minGlobalMip
-mip0PageCount       = ceil(resolutionTexels / 256)
-allocationBlockSize = nextPow2(mip0PageCount)
-maxLocalMip         = 8 - minGlobalMip
-```
+A sector's virtual image is a POT block of pages handed out by
+`TerrainVT::VirtualImageAtlas`, a 4-ary tree over the page space. The block size is
+chosen per sector from the resolution its screen footprint needs
+(`wanted = base >> screen_mip`), and allocation is independent of physical residency, so
+the address space is budgeted separately from the page pool. Blocks are released when
+the camera leaves, and a resize that cannot be satisfied rolls the old node back
+verbatim instead of leaving a hole.
 
-| Base800 (8/4/2 texel·cm⁻¹ | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-|---|---|---|---|---|---|---|---|
-| resolutionTexels | 51200 | 25600 | 12800 | 6400 | 3200 | 1600 | 800 |
-| mip0PageCount | 200 | 100 | 50 | 25 | 13 | 7 | 4 |
-| allocationBlockSize | 256 | 128 | 64 | 32 | 16 | 8 | 4 |
-| maxLocalMip | 8 | 7 | 6 | 5 | 4 | 3 | 2 |
+### Address-space budgeting
 
-Base1024 (10.24 texel·cm⁻¹ is the clean power-of-two chain: 65536/256/256 — 1024/4/4.
+The directory has to cover the visible set, so the planner budgets the page space
+explicitly: the sum of the visible blocks must fit `2048² · 3/4` entries, and when it
+does not, every sector's requested size is halved together (`virtual_bias` in
+`_avt_build_hierarchy()`) until it does. Coarsening the request is always preferable to
+failing an allocation, because a sector without a block has no pages at all. The bias is
+reported in `avt_sector_stats`.
 
-Density preset → `(profile, finestSizeIndex)`: 2 → (Base800, 3), 4 → (Base800, 2),
-8 → (Base800, 1), 10.24 → (Base1024, 1).
+### The capacity question
 
-### The capacity cliff (important, and Hydra has it too)
+Physical residency is the real limit, and it is a *pool* limit, not an addressing one:
+`vt_page_count` slots are shared by both tiers, the near field reserves up to half of
+them for the far field, and the far field protects its root pyramid. A configuration
+whose working set does not fit therefore degrades in a defined order — demand is served
+nearest-first, roots stay resident, and the coarsest levels keep real data — rather than
+failing an allocation. Size the pool from the working set (the near field's 512 m radius
+at density 4 is roughly 50 pages) and leave headroom for the LRU.
 
-`TerrainVirtualImageAtlas` is a POT quadtree over the 1024×1024 **page space**, minimum
-block 4 pages. A `B×B` block therefore admits only `(1024/B)²` resident sectors:
+## 3. What the addon started from
 
-| density | block | resident sectors |
-|---|---|---|
-| 10.24 texel/cm | 256 | **16** |
-| 8 texel/cm | 256 | 16 |
-| 4 texel/cm | 64 | 256 |
-| 2 texel/cm | 64 | 256 |
-
-Hydra requests a 7×7 = 49 sector grid regardless, so at the default density most
-`TryInsertAvtImage` calls fail (`TerrainAVTRuntime.cs:1345-1354`). This looks like a real
-capacity cliff, not an intentional design. A Godot port must either pick a density whose
-block fits the preload radius, or add an LRU over virtual-image allocations. **Decide this
-deliberately; don't inherit it.**
-
-## 3. What the Godot addon already has
-
-Written as of the state *before* this work; see section 4 for what changed.
+Kept because the constraints it created explain the design in section 4.
 
 | Concern | Status |
 |---|---|
-| Chunking | `Terrain3D::region_size` (64–2048, default 256) on a fixed **32×32 region grid** (`REGION_MAP_SIZE`, valid −16..15). Regions are the storage chunk *and* the texture-array layer. |
+| Chunking | `Terrain3D::region_size` (64–2048, default 256) on a fixed **128×128 region grid** (`REGION_MAP_SIZE`, valid −64..63). Regions are the storage chunk *and* the texture-array layer. |
 | Mesh LOD | Clipmap ring (`Terrain3DMesher`, `mesh_size` 48 + `mesh_lods` 7), snapped to the clipmap target. **Not** a CDLOD quadtree. Geometry is shader vertex displacement over instanced tiles, so there is **no per-chunk draw call** — chunking only affects data residency. |
 | Region files | `terrain3d_{x}_{y}.res` in the data directory; `save_directory` / `load_directory` / `load_region` are synchronous. |
 | GPU maps | Per-region `Image` → 4 `Texture2DArray`s (height, control/idweight R16, color, surface) rebuilt wholesale by `update_maps()` whenever the region set changes. |
@@ -128,13 +120,15 @@ Written as of the state *before* this work; see section 4 for what changed.
 
 Two numbers make the chunking limits concrete at the default `region_size` 256:
 
-* The clipmap's outermost ring reaches `2 × mesh_size 48 × 2⁶ = 6144 m`, but the 32×32 grid
-  only reaches ±16 × 256 = **±4096 m**. The world could not fill its own clipmap.
+* The clipmap's outermost ring reaches `2 × mesh_size 48 × 2⁶ = 6144 m`; the chunk
+  directory reaches ±64 × 256 = **±16384 m**, so geometry is no longer the tighter of the
+  two. (Before the directory grew from 32×32 it was: ±4096 m could not fill the clipmap.)
 * A region's maps are `region_size²`, so the surface/control maps are **1 texel/m**.
   Detail density is welded to chunk size: going finer means bigger chunks, which costs
-  memory per region *and* coarsens streaming granularity.
+  memory per region *and* coarsens streaming granularity. This is the constraint the
+  virtual texture exists to break.
 
-## 4. Gap analysis → what to build
+## 4. Subsystem design and rationale
 
 ### 4.1 Region streaming — implemented now
 
@@ -265,12 +259,12 @@ Tests: the far-chunk phase of `native/tests/region_slots.gd` places a region at 
 
 ### 4.4 VT addressing core — implemented now
 
-`native/src/terrain_vt.h` is a dependency-free port of the addressing contract. It was
-originally a near-complete port of Hydra's constant and descriptor tables; the parts
-production never used — the `AddressProfile` descriptor tables and their
-`TexelDensityPreset` selection, the `PackPageId`/`UnpackPageId`/`TryResolveAvtPageAddress`
-helpers, the LRU key encoding, the physical-page UV/world-rect math and the feedback
-sizing/Bayer dither — have been deleted. What is left is what the runtime actually calls:
+`native/src/terrain_vt.h` is the dependency-free half of the addressing contract. It once
+carried a full descriptor-table design; the parts production never used — the
+`AddressProfile` descriptor tables and their `TexelDensityPreset` selection, the
+`PackPageId`/`UnpackPageId`/`TryResolveAvtPageAddress` helpers, the LRU key encoding, the
+physical-page UV/world-rect math and the feedback sizing/Bayer dither — have been deleted.
+What is left is what the runtime actually calls:
 
 * the indirection payload constants (`SLOT_MASK`, `INVALID_PHYSICAL_PAGE_SLOT`) and the
   power-of-two rule (`AddressProfile::is_power_of_two`);
@@ -310,9 +304,28 @@ testable on its own.
   `page_size + 2 * page_border` texels, defaulting to R16 because that is what the packed
   id/weight surface map uses. `write_page()`/`read_page()` are the page producer's interface.
 * **Slot allocator.** LRU with a protected set. Eviction invalidates exactly the indirection
-  entries that still publish the slot, using a per-slot reverse index — Hydra's rule, and it
-  is what stops a stale reverse entry from clobbering an entry a later allocation already
+  entries that still publish the slot, using a per-slot reverse index — that check is what
+  stops a stale reverse entry from clobbering an entry a later allocation already
   republished. A fully protected atlas fails the allocation instead of stealing a page.
+  Recency is a real order, not a counter: `touch_slot()` moves the slot to the front of
+  `lru`, and the two demand epochs (`begin_demand()`/`end_demand()` plus
+  `slot_demand_epoch`) keep a pass from evicting a page another part of the same pass still
+  needs. Protection is reference counted (`slot_protect_refs`), because several owners pin
+  the same slot (the AVT visible plan and the far field's root pyramid).
+* **The acquire path is a transaction.** `acquire_slot()` reserves a slot and only *chooses*
+  an LRU victim (free-list slot, or `slot_evict_on_commit`); the victim keeps its content and
+  its owners' indirection entries. `commit_slot()` — called by `_request_virtual()` once the
+  new entry that names the slot has been written — evicts the victim and takes the slot for
+  the new page in one step. `abort_slot()` drops the reservation: a free-list slot goes back
+  to the list, a chosen victim is left exactly as it was, and the allocation counters are
+  rolled back (`aborted_acquires` reports how often). Before this split the victim was
+  destroyed at acquisition, so any caller that failed between acquiring and publishing had
+  already thrown away a resident page for nothing. Recency is a real order, not a counter:
+  `touch_slot()` moves the slot to the front of `lru`, and the two demand epochs
+  (`begin_demand()`/`end_demand()` plus `slot_demand_epoch`) keep a pass from evicting a page
+  another part of the same pass still needs, and a reserved slot is never picked as a second
+  victim. Protection is reference counted (`slot_protect_refs`), because several owners pin
+  the same slot (the AVT visible plan and the far field's root pyramid).
 * **Batching.** `request_page()` only marks the chain dirty; `commit()` uploads it. The test
   asserts `commit()` is a no-op when nothing changed.
 
@@ -333,7 +346,8 @@ Two things bit here and are worth remembering:
 ### 4.6 Surface page production — implemented now
 
 `Terrain3D::update_surface_vt()` is the demand pass, and `Terrain3DData::produce_surface_page_set()`
-is the producer. It owns a `Terrain3DVirtualTexture` (`terrain.surface_vt`, off by default):
+is the producer. It owns a `Terrain3DVirtualTexture` (`terrain.surface_vt`, on by default with
+`surface_svt_enabled` and `cdlod_enabled`):
 
 * **Demand.** For every resident region within `surface_vt_distance` of the clipmap target, the
   sector is registered with a `surface_vt_pages_per_axis` block and a local mip is chosen per mip 0
@@ -359,10 +373,10 @@ clamped border. It also pins the distance rule (nearest sector publishes a mip 0
 re-upload the indirection.
 
 **Resolution: `surface_density` — implemented.** The source used to be `region_size²` R16, i.e.
-**1 texel/m** at the default 256 m region, so a page smaller than the region only *upsampled*:
-at Hydra's ratio (64 m pages, 256 texel pages) a 4× point upsample that added no detail. The
-producer was resolution-agnostic, so raising the region's surface resolution is what turns this
-from "a correct paging layer" into "more detail than the array can afford to keep resident".
+**1 texel/m** at the default 256 m region, so a page smaller than the region only *upsampled* —
+at 64 m pages a 4× point upsample that added no detail. The producer was resolution-agnostic, so
+raising the region's surface resolution is what turns this from "a correct paging layer" into
+"more detail than the array can afford to keep resident".
 
 `Terrain3D::surface_density` (1..8 texels per region texel, default 1) now sets it. It is a
 **terrain-wide** setting, and three rules keep it from becoming a regression:
@@ -390,8 +404,8 @@ and the brush writes whole `density²` blocks, because it authors one region tex
 1 m grid (`floor(uv)`/`fract(uv)`), so a denser payload was unreachable: every corner read its
 block origin and the render was identical to density 1. With the virtual texture on, the cell is
 now evaluated on the payload's own grid (`fract(uv * density)` and `get_surface_texel()`). At
-density 1 that is bit-for-bit the old behaviour, and a denser payload is the same Hydra contract
-on a dyadically subdivided cell — the fixed BL-TR diagonal survives dyadic subdivision, so the
+density 1 that is bit-for-bit the old behaviour, and a denser payload follows the same per-cell
+contract on a dyadically subdivided cell — the fixed BL-TR diagonal survives dyadic subdivision, so the
 triangle selection stays consistent with the clipmap mesh. With the virtual texture **off** the
 cell keeps the 1 m grid, so the array path renders exactly as it did before.
 
@@ -403,7 +417,7 @@ the array path shows the block-origin material while the virtual texture shows t
 
 ### 4.7 Surface VT shader integration — implemented now
 
-`surface_vt_enabled` (off by default) switches the terrain fragment shader's surface id/weight
+`surface_vt_enabled` (on by default) switches the terrain fragment shader's surface id/weight
 reads from the region texture array to the virtual texture, with the array as the fallback.
 
 * The shader resolves the sector from the chunk it already computed, and gets its virtual page
@@ -477,7 +491,7 @@ Four things bit here, and the first two are the reason this took a whole round:
   "mip -4". The check has to be against `REJECT_TOO_SMALL`.
 
 **Not done, and why.** The objective for this step also named Bayer sub-pixel selection, which
-is a property of *fragment* feedback: Hydra's terrain pass writes one packed PageID for one
+is a property of *fragment* feedback: the terrain pass would write one packed PageID for one
 sub-pixel per 8x8 block into an `R32_UInt` target. Godot's `RenderingServer` exposes no MRT hook
 for a scene shader and no integer viewport format, so a faithful fragment pass needs a **second
 terrain draw** (a second `Terrain3DMesher` on its own render layer, a `SubViewport`, and a
@@ -518,57 +532,55 @@ indirection texture, including a sector behind the camera that a distance rule w
 `vt_feedback.gd` remains the shader-only test: it passes the viewport size as a *parameter*, so it
 is independent of the real window size, while the runtime reads the camera's real viewport.
 
-### 4.9 VT GPU pipeline — what is left
+### 4.9 What is not implemented
 
-Hydra's own pipeline, for reference — the port took a different route on every item, and the
-difference is what the addon is:
+* **Fragment-level page demand.** The projection pass (4.8) knows the field of view, the
+  resolution and the view direction, but not occlusion and not the exact rendered
+  coverage. Both need a per-fragment signal: the terrain fragment shader would write one
+  packed page id per small screen tile into an integer target, which the CPU reads back.
+  Godot's `RenderingServer` exposes no MRT hook for a scene shader and no integer viewport
+  format, so a faithful version needs a second terrain draw into a `SubViewport` with the
+  id packed into RGBA8. For a clipmap whose visible set is analytic, projected demand is
+  nearly identical to rendered demand, so this is a deliberate omission rather than a
+  pending task; `surface_vt_feedback_grid_chunks` and `_min_extent` already give the
+  projection pass the same culling decisions.
+* **GPU page production.** Pages are produced on a CPU worker from an immutable source
+  snapshot, which keeps the producer free of renderer calls and thread-safe and keeps the
+  cache signature on one side. A compute bake becomes worthwhile at higher
+  `surface_density`, where resampling the payload per page starts to compete with the
+  render thread.
 
-1. **Feedback.** Hydra: `R32_UInt` target at `(refW/8+1) × (refH/8+1)`; the terrain fragment
-   shader writes `PackPageId` for the one sub-pixel per 8×8 block selected by the rotating Bayer
-   index, and `0` elsewhere. Port: **the projection pass** (4.8), consumed by the demand pass.
-   The fragment version is the remaining gap and only buys occlusion and exact coverage.
-2. **Indirection.** Hydra: 1024×1024 `R16_UInt`, 11 mips, written per-mip with a compute scatter
-   (sorted by `(mip, y, x)`, one dispatch per contiguous mip run) or a 1×1-quad raster fallback.
-   Port: `R32F` with a **hand-built** mip chain on the CPU, written per page as it is allocated
-   (4.5) — no compute scatter, because the demand pass already knows every page it wants.
-3. **Physical page atlas.** Hydra: `264×264` pages, compressed `Texture2DArray` (BC3 on Windows,
-   ASTC on mobile) with an `R32G32B32A32_UInt` block-RT encoder, RGBA8 fallback. Port: an
-   uncompressed `Texture2DArray` of `page_size + 2·border`, LRU with a protected set and
-   reserve/commit/rollback (4.5); eviction invalidates the indirection texel only if the
-   published slot still matches.
-4. **Page production.** Hydra: compute bake from the loaded cell's surface data, or the raster
-   MRT fallback, budgeted at `renderingPagePerFrame` = 4 pages per cycle. Port:
-   `Terrain3DData::produce_surface_page_set()` on the CPU (4.6), filling only the pages that were
-   newly allocated. A compute bake is what a higher `surface_density` would need.
-5. **SVT.** Not started, and only worth it once the world is bigger than the AVT address space.
-   The manifest is an *existence + hierarchy* record set plus 5 baked fallback slices — there is
-   no page→byte-offset table to port.
+### 4.10 CDLOD geometry — implemented
 
-Godot mapping notes: `RenderingDevice` compute + `Texture2DArrayRD` cover 1–5;
-`MultiMesh`/instance custom data + a vertex shader cover the CDLOD morph if we later replace
-the clipmap; `Image.FORMAT_RH` / `R16` blobs cover height pages.
+`Terrain3DCDLOD` (`native/src/terrain_3d_cdlod.{h,cpp}`) replaces the clipmap when
+`cdlod_enabled` is on (default true):
 
-### 4.10 CDLOD geometry — not implemented, and maybe not needed
+* **Selection.** One quadtree per resident region, rooted at the region's world square and
+  subdivided down to `cdlod_patch_size` (default 32) texels. A node splits while the
+  camera's *horizontal* distance to its box is under `size · 0.5 · cdlod_lod_scale`
+  (default 8). Horizontal rather than per-node centre distance, so neighbouring vertices
+  cannot pick different morph levels and a shared edge cannot disagree with itself.
+* **Geometry.** One regular `(patch_size+1)²` grid mesh, instanced, in two MultiMesh
+  batches: visible patches, and off-screen shadow casters. No per-node mesh, no index
+  stitching, no skirts — the vertex shader collapses a patch toward its parent's level
+  over the last quarter of its range, which removes T-junctions and preserves the fixed
+  BL-TR diagonal the IdWeight evaluator depends on.
+* **Caching.** The quadtree rebuilds only when the camera position or a configuration
+  value in the selection key changes; view rotation re-runs only the frustum
+  classification, and an unchanged visibility set uploads nothing.
+* **Heights.** There is no height page texture: displaced vertices read the region height
+  array through the material, so height residency stays the region-streaming problem
+  instead of becoming a second cache with its own eviction policy.
 
-The existing clipmap already gives distance LOD. Hydra's CDLOD buys (a) a fixed 16×16 grid
-with odd-vertex collapse + quadrant degenerate collapse instead of per-LOD index buffers,
-(b) T-junction removal by splitting coarse patches, (c) height *pages* instead of resident
-region height maps. Porting it means replacing `Terrain3DMesher`. The parts worth stealing
-independently:
+`docs/cdlod_and_capture.md` covers the geometry path and the capture tooling; the driver
+is `native/tests/vt_adaptive_runner.py --cdlod`.
 
-* The range/morph formulas (`visibilityRanges[lod] = V · ratio^lod / ratio^(n-1)`, LOD0 ×0.9;
-  `morphStarts[lod] = prev + (end − prev) · 0.7`).
-* The morph constant packing `(start, 1/(end−start), end/(end−start), 1/(end−start))`.
-* Height pages: 259×259 `R16` (257 core + 1 texel halo), page table carrying
-  `resolvedLod` / `previousSlice` / `transition` for 12-render cross-fades.
-
-### 4.11 Far field: the AVT + SVT split — implemented now
+### 4.11 Far field: the two-tier split — implemented now
 
 The near field above is region aligned, which caps its mip chain at "one page = one region"
 (`log2(pages_per_axis)` levels). A page bigger than a region cannot exist there, and a page that
-spans several regions cannot either. Hydra solves this with two address spaces — AVT near
-(global mips 0..8, per-sector virtual images) and SVT far (9+, a separate page format fed by
-baked cell textures). The port now has the same split, minus the baked-cell source:
+spans several regions cannot either. The far field is a second address space that fixes exactly
+that — a world-aligned page grid with its own page format, fed by baked cell sources:
 
 * **`Terrain3DVirtualTexture` gained a world-space mode** (`set_world_space(true)`). The page
   grid is a regular world grid centred on the origin, so a page's block origin is a pure
@@ -598,24 +610,26 @@ baked cell textures). The port now has the same split, minus the baked-cell sour
   will sample. The demand pass derives a page's levels from the span of its visible footprint
   (`level(nearest) .. level(farthest)`), so a page that straddles a band edge is published at
   every level a fragment inside it can resolve to.
-* **Over-subscription raises a coarseness floor, it never rewrites a level.** When the
-  distance-selected set does not fit the pool, the demand pass finds the *smallest* level floor
-  that makes the visible set fit and coarsens only the pages finer than that floor: pages already
-  coarser than it keep exactly the level the rule gave them, every visible chunk still resolves
-  through some page, and the floor is a function of the visible set and the pool size alone
-  (the search always starts at the finest level), so a settled view selects the same floor,
-  levels and pages on every frame. The hierarchy is extended to cover whatever the rule and the
+* **Over-subscription raises a coarseness floor; it never drops a page.** When the
+  distance-selected set does not fit what the pool has left, the pass searches for the
+  *smallest* level floor whose merged set fits, then publishes every page finer than that
+  floor at the floor while pages already coarser keep the level the distance rule gave
+  them. Every visible footprint still resolves through a page of some real level, and the
+  floor depends only on the visible set and the remaining capacity (the search starts at
+  the finest level), so a settled view selects the same floor, levels and pages on every
+  pass. `svt_floor_level` in `get_vt_settings()` reports it. The hierarchy is extended to cover whatever the rule and the
   floor use, and says so once (`WARN_PRINT_ONCE` with the two page counts). The previous
   selection derived every level from a screen-space density ratio and coarsened the whole set
   until it fit, which changed a page's level from frame to frame while pages published at the
   old level stayed resident — that is the far field's mip "jumping". An explicit table also
   raises the effective level cap to the levels it names, so a saved `surface_svt_max_mip` cannot
   silently truncate a table.
-* **The root pyramid replaces the array as the fallback.** The coarsest
-  `surface_svt_root_mips` levels are always resident and **protected**, so a miss resolves to
-  coarse real data rather than nothing, and the near field's pages compete only among themselves
-  for the remaining slots. A root page that gets evicted would leave a miss with nothing to show,
-  which is why the protection exists.
+* **The root pyramid is the fallback of last resort.** The coarsest
+  `surface_svt_root_mips` levels covering the visible world are acquired *before* the detail
+  set and **protected**, so a miss on a detail page resolves to real coarse data instead of
+  the diagnostic material. They are capped at half the pool, and a root that leaves the
+  visible set loses its pin — the page itself is left to the LRU, because a detail page can
+  share its owner entry. `svt_root_pages` reports how many are pinned.
 * **`surface_array_enabled`** turns the region texture array's surface upload off. The array
   stays allocated (blank) so the material keeps a valid binding, but no payload is uploaded,
   which is what removes the `density²` cost — 2 MB per resident region at density 4. The debug
@@ -648,30 +662,188 @@ pyramid covering every texel of the coarsest levels, a page 6.4 km away resolvin
 array-free rendering matching the array-backed frame pixel for pixel, and an edit with the array
 off being re-produced instead of served stale.
 
+#### A far page has three sources, and none of them is required
+
+Producing a far page used to mean reading its cells from the `.vtcell` bake files on a worker
+thread, so a page existed only if an offline bake existed, and the record for it said
+`Missing bake` until one did. The runtime no longer depends on that file at all. `_queue_vt_material_page()`
+resolves a far page against, in order:
+
+1. **The resident cell store** (`Terrain3DCellStore`, `terrain_3d_vt_cells.{h,cpp}`). A cell baked
+   in this session (or imported) lives in three GPU arrays — one layer per cell, one array per
+   channel, full mip chain — so `_resolve_svt_cell_pieces()` returns copy pieces that name a layer
+   and a level, `_copy_cell_page()` binds that layer's mip view
+   (`RenderingDevice::texture_create_shared_from_slice`) and the page is assembled entirely on the
+   device. This is the only source that costs neither CPU time nor I/O, and it is why an offline
+   bake is worth having: `bake_svt()` publishes into it.
+2. **A persisted bake**, when one exists for a cell the store does not hold. The source worker
+   reads the mip the page needs (not mip 0) and the page is copied from those channels.
+   `_svt_cells_have_persisted_bake()` probes each cell once per session, so the frame path never
+   stats the same file twice.
+3. **The resident region payloads.** `produce_surface_rect_page()` crops the ID/weight payload and
+   `make_vt_height_page()` the height, and the GPU bake turns them into material channels — the
+   same production the near field uses. A far page is therefore produced on the frame it is
+   requested, whether or not any bake exists anywhere.
+
+A cell is reused only while its state key matches: the material signature, the far-field density
+and a per-cell edit stamp that `_invalidate_vt_region()` bumps for the cell and its eight
+neighbours (a page border reads them). The store is sized from a memory budget (192 MB across the
+three channels, at least one layer) and evicts the least recently used cell when full, requeueing
+the pages that sampled it. Every published page reports its state: `Pending cell copy` (store),
+`Missing bake` (persisted bake being read), `Pending bake` (cropped from the payloads),
+`No resident payload`, `Ready` (validity bit set).
+
+
 `native/tests/vt_mip_bands.gd` + `vt_mip_bands_runner.py` pins the distance table itself on the
 production path: the band edges, that the level the shader starts at is the level that was
 produced for every probe distance, that a settled view neither moves a level nor churns the pool,
 that a small camera move inside the bands moves no level, and that an over-subscribed pool keeps
 the nearest pages and still settles instead of rewriting levels.
 
-## 5. Traps found in Hydra — do not copy these
+### 4.12 Atlas compression — selectable, probe-verified and actually applied
 
-1. **7×7 sector request grid vs 16-sector atlas capacity** at the default density (§2).
-2. **`DemandRetentionFrames` is dead code** — `demandedPages_` is cleared at the top of
-   `SubmitPatchDemand` and only read by `AcquireSlot` in the same call, so the "retained
-   pages" step protects nothing.
-3. **Height decode uses `half`** (`TerrainCdlod.hlsl:150`) while the exporter stores 16-bit
-   UNorm, so effective vertical precision is ~`range/2048`, not `/65535`. Use float.
-4. **A page miss silently samples physical slot 0 at LOD0 raster** (`transition = 0` selects
-   "previous"), which only works because slot 0 happens to hold a root fallback page. Make
-   the fallback explicit.
-5. **Exceeding `maxPatchCount` drops the whole frame's terrain**, not a graceful degradation.
-6. **`HYDRA_TERRAIN_AVT_MAX_PHYSICAL_PAGE_COUNT 1200`** is declared in the shader and never
-   read; the runtime capacity with default settings is 1405.
-7. **`g_TerrainAVTPhysicalPageStorageLayout`** is written by C# and read by no shader.
-8. `physicsLoadLevel` / `physicsLoadBudgetPerFrame` / `visualLoadBudgetPerFrame` are
-   serialized, clamped and unit-tested, and consumed by nothing.
-9. `TerrainVTLodTracker`'s color channel is vestigial at its only call site.
+`vt_atlas_compression` selects the storage format for the three material page arrays
+(`albedo_height`, `normal_roughness`, `params`). The list is the same one the layer texture
+arrays use (`Terrain3DAssets::TextureArrayCompression`), so the inspector shows one vocabulary
+for every terrain array. Two rules bound what can be selected, and a request is resolved —
+not trusted — when it is set:
+
+* **Alpha.** All three arrays carry an alpha value the shader reads: material height in
+  `albedo_height.a`, roughness in `normal_roughness.a`, and the page validity bit in
+  `params.a` (the sampler rejects a page whose `params.a` is not 1). A codec whose channel set
+  drops alpha — BC1, BC4, BC5, BC6H, ETC1, ETC2 RGB, EAC R11/RG11 — would silently corrupt
+  it, so those are refused with that reason. Making them usable means moving the alpha channels
+  into their own array, which changes the material bindings.
+* **Build and device.** Godot registers its image compressors as function pointers from
+  whichever modules the engine binary enabled: etcpak (BC1/BC3/BC4/BC5, ETC, EAC) and astcenc
+  (ASTC) ship in every build, while cvtt (BC7, BC6H) and betsy (GPU BC1/BC4/BC6H) are
+  editor-only unless the export template sets `cvtt_export_templates` /
+  `betsy_export_templates`. The resolver therefore compresses a real 4×4 block instead of
+  assuming a codec exists, and then asks the rendering device whether the resulting format can
+  be sampled *and* updated in place — which is what rules ETC2 and ASTC out on a desktop BC
+  device.
+
+`get_vt_settings()` reports the outcome: `vt_atlas_compression` (the request),
+`vt_atlas_compression_available` (the codec this build and device can produce and sample, 0
+when refused), `vt_atlas_compression_applied` (what the arrays are stored in **today**),
+`vt_atlas_compression_name`, and `vt_atlas_compression_reason`.
+
+**The encode.** Page production writes RGBA16F into staging arrays with `imageStore`, and a
+compressed format cannot be a storage image, so the compressed arrays are separate sampling
+targets and an encode step copies between them:
+
+* The **cached path** already holds the channel images on the CPU, so it compresses them
+  directly.
+* The **bake and cell paths** only exist on the GPU, so the baker requests one
+  `texture_get_data_async` per channel — a synchronous readback is not safe from inside the
+  render callback — and the callback compresses and `texture_update`s the sampled layer.
+* A page therefore becomes compressed a frame or two after it was produced. Readiness is
+  deliberately unchanged: until the encode lands, the sampled layer holds zeros, which the
+  sampler reads as "not written" (`params.a` is not 1) and resolves through a coarser page
+  instead of showing a half-written one.
+* Compressing costs a readback and a codec pass per page, so the per-frame page budget drops
+  from 16 to 4 while compression is on.
+
+Tests: `native/tests/vt_compression.gd` + `vt_compression_runner.py`. It walks every enum entry
+and asserts the resolution invariants: an accepted request must equal `available` and carry no
+reason, a refused one must fall back to 0 with a non-empty reason (naming alpha where that is
+the cause), and at least one alpha-capable codec must be usable in the build under test. It then
+compresses and decodes a probe image through the resolved codec and requires the error to be
+non-zero but bounded (BC7 on the probe: max 0.0078, mean 0.00097), that the uncompressed round
+trip is exact, and that a fixture which produced pages reports
+`vt_atlas_compression_applied == available` — the arrays are actually built in the accepted
+format. On this machine that is BC7 (`applied=1`) with BC3 RGBA accepted as well.
+
+**Two traps this cost.** The compressed arrays are created with `SAMPLING | CAN_UPDATE` and
+nothing else. `CAN_COPY_TO` also looks harmless, but on D3D12 it sets
+`D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`, which a block-compressed resource cannot carry, so
+`texture_create` returns `CreateResource failed with error 0x80070057` — while
+`texture_is_format_supported_for_usage()` (the capability probe) says the format is fine, because
+it answers for the pair it was asked about. A device that refuses the real allocation now resets
+`available` to 0 with a reason instead of claiming a format the pages are not stored in.
+
+**A format change is not a reconfiguration.** The three arrays are rebuilt in place by the
+producer (its own generation bump), so `set_vt_atlas_compression()` must not call
+`_reset_vt_configuration()`. Doing that detached both views from the shared pool, released
+every resident page and then let the demand pass grow the pool back to the capacity it had
+already published — which is what produced a user-visible
+`WARNING: Virtual texture pool grew to N pages; resident pages were released ...` on a plain
+property change in the inspector. The pages do have to be produced again, because the
+rebuilt arrays start blank: the setter forces `invalidate_surface_pages(location, true)` for
+every loaded region, which also skips the editor-preview deferral (a deferred refresh would
+leave the material sampling arrays that no longer hold its content).
+
+**A reconfiguration reuses the published capacity.** `Terrain3DVTState::vt_effective_page_count`
+records what the views were actually configured with, is raised by the auto-capacity
+publication and replaced by an explicit `vt_page_count`, and `_configure_vt_service()` configures
+the views and the producer with `MAX(vt_page_count, vt_effective_page_count)`. Starting again
+from the setting would make the demand pass re-grow the pool right after the rebuild, releasing
+every page a second time. `get_vt_settings()` exposes `effective_page_count` and
+`pool_generation` (bumped once per pool build) so this is directly assertable, and the pool's
+growth warning is emitted only when slots were actually released, with the count.
+
+**The demand pass waits (briefly) for a capacity change to land.** Auto capacity requests the
+larger arrays from the producer and the pool follows them a frame or two later; a page produced
+in between is released by that growth. `_ensure_vt_capacity()` therefore skips production for at
+most `MAX_CAPACITY_WAIT_FRAMES` (8) frames while the request is in flight: at 512 pages the editor
+went from "grew to 512 pages; 16 resident pages were released" to growing while nothing was
+resident, which removes both the wasted bakes and the warning. The wait is bounded on purpose — a
+state that cannot build the larger arrays (no material arrays yet, a failed allocation) must
+never stop page production for the session. Note this is *allocation*, not demand: the previous
+residency keeps serving the renderer for those frames.
+
+Tests: `native/tests/vt_format.gd` + `vt_format_runner.py`. It toggles between uncompressed and
+the first codec this device accepts, and requires the pool generation and the capacity to be
+unchanged, the requested codec to be applied, and the runner additionally rejects the pool
+growth warning anywhere in the log. `editor_dock_runner.py --test vt_idle` does the same through
+a real editor session (a live terrain, the editor's own viewport and its low-processor idle
+mode), which is the path the user report came from:
+`EDITOR_VT_FORMAT codec=1 pool=1 (was 1) capacity=512 (was 512) applied=1`.
+
+**Replaced arrays are not freed on replacement.** Every format change, capacity change and
+reconfiguration rebuilds the three arrays, and the virtual texture pass runs *before* the draws of
+the frame that rebuilds them: a draw in that same frame still samples the previous RIDs. `free`ing
+on replacement therefore produced `Uniforms were never supplied for set (3)` once per rebuild, and
+left the material sampling freed textures. The baker retires each replaced bundle with its
+generation and frees it only once `acknowledge_output()` has reported the material bound to a
+newer published pair, which also had to compare against the *compressed* sampling RIDs once a
+codec is applied. `retired_bundles` in the producer stats reports the pending set; the compression
+test fails if it has not drained.
+
+
+## 5. Rules this design is built around
+
+Each of these is a pitfall that is easy to fall into and expensive to debug afterwards, so
+they are stated as rules the implementation enforces:
+
+1. **Residency pressure must never choose the sampled level.** The level is a pure
+   function of the view (pixel footprint near, distance far) and the producer fills
+   exactly that level. When the working set does not fit, the far field coarsens through
+   an explicit floor applied to the whole set (4.11), and it never substitutes a page's
+   level per page, because that is what makes levels jump between frames.
+2. **A page-table entry must not outlive its slot.** Every eviction walks the reverse
+   owner index and invalidates exactly the entries that publish that slot (4.5). A stale
+   entry does not read "nothing" — it reads whatever page took the slot next.
+3. **A miss must resolve to real coarse data.** Root levels are protected, the near field
+   falls back to the region texture array, and the far field's shader walk starts at the
+   distance-selected level and only goes coarser. "Nothing resident" is never answered by
+   whatever finer page happens to be left.
+4. **Everything the plan touches is pinned until the pass commits.** Pages already
+   resident are pinned while missing ones are produced, so the pool cannot evict a page
+   whose payload was just written (4.5, `protected_slots`).
+5. **Demand is re-marked even when nothing is produced.** A stationary camera re-marks
+   its resident slots on a repeated plan; without that the pool would evict the working
+   set it is currently rendering (`_produce_sector_avt_pages()`).
+6. **Budget exhaustion degrades; it does not drop a frame.** Page acquisition is
+   best-effort per candidate, the previous residency keeps serving, and capacity growth is
+   attempted once per change instead of per allocation.
+7. **Height stays 32-bit float end to end** (`Image::FORMAT_RF`). Displacement and normals
+   both differentiate height, so a 16-bit path would quantize the derivative, not just the
+   value.
+8. **Addressing constants have one definition and a test that pins the copies.**
+   `SLOT_BIT_COUNT`, `INVALID_PHYSICAL_PAGE_SLOT` and the page layout live in
+   `terrain_vt.h`; the shader carries its own literals, so `vt_runtime` reads the
+   indirection back and `vt_render` compares the two paths pixel for pixel.
 
 ## 6. Verification
 
@@ -680,33 +852,119 @@ the nearest pages and still settles instead of rewriting levels.
 cd misc/feng-addons/feng-idweight-terrain/native/tests/vt
 scons && ./terrain_vt_contract_test.exe
 
-# Region streaming (graphical driver required)
+# Region streaming and layer slots (graphical driver required)
 python misc/feng-addons/feng-idweight-terrain/native/tests/region_streaming_runner.py --driver d3d12
-
-# Region layer slots: rendered multi-region layers + zero array reallocation
 python misc/feng-addons/feng-idweight-terrain/native/tests/region_slots_runner.py --driver d3d12
 
-# Surface VT runtime, page production, shader integration and per-page demand
+# Near field: runtime, page production, shader integration and per-page demand
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_runtime_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_surface_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_render_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_feedback_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_demand_runner.py --driver d3d12
 
+# Far field: world grid, distance bands, root pyramid, array-free rendering
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_sparse_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_mip_bands_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_root_budget_runner.py --driver d3d12
+
+# Atlas compression: codec resolution, refusal reasons and the applied format
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_compression_runner.py --driver d3d12
+
 # Surface density: dense payload, coarse array, migration and the render grid
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_density_runner.py --driver d3d12
+
+# Geometry, adaptive allocation and pool pressure
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_adaptive_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_adaptive_runner.py --cdlod --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_pressure_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_visibility_runner.py --driver d3d12
 
 # Existing terrain regressions
 python misc/feng-addons/feng-idweight-terrain/native/tests/texture_layers_runner.py --driver d3d12
 python misc/feng-addons/feng-idweight-terrain/native/tests/editor_dock_runner.py --test pairroles --driver d3d12
 ```
 
+`native/tests/run_all.py` drives the whole set; `native/tests/README.md` documents what
+each script pins and the flags that select a scenario.
+
+### Known failing suites — they target the legacy region mode
+
+`vt_render`, `vt_material` and the first phases of `vt_adaptive`/`vt_density` exercise the
+**legacy region-AVT mode** and fail under the current default
+`surface_vt_selection_mode = 2` ("Full AVT (64 m sectors)"):
+
+* `vt_render`/`vt_material` call `terrain.update_surface_vt()` once and expect 16 pages
+  synchronously, then resolve pages through the per-region API
+  (`lookup_page(region_loc, mip, px, py)`). In sector mode `update_surface_vt()` returns
+  `_update_sector_avt()`, which plans on a worker and legitimately returns 0 on the first call,
+  and the per-region block table is not published at all — the shader reads the sector directory
+  instead.
+* `vt_adaptive` asserts that a ready *ancestor* covers the near terrain while finer pages are
+  pending, which is the legacy block-table hierarchy, not the sector directory's.
+
+`vt_render`, `vt_material`, `vt_svt_coverage` and `texture_compression` used to be listed here.
+All four pass now, and none of them was a stale assertion:
+
+* `vt_render` expected `update_surface_vt()` to produce its 4x4 mip 0 grid, but the fixture
+  configured a 16-page atlas and then awaited frames before the call: the engine's own demand
+  pass runs every physics tick, so the atlas was already full and an all-hit pass correctly
+  produces nothing. It now applies the near-field settings after the baseline image, so the
+  pass runs against a cold atlas in the same frame.
+* `vt_material`'s runner ran `vt_render.gd` while requiring `vt_material.gd`'s marker, so the
+  real test had never run. With that fixed, its sweep also had to stay inside one AVT grid cell
+  (a region at `region_size` 64) and wait for the bake counter to go idle rather than for
+  `producer.pending`, which is already zero between physics ticks.
+* `vt_svt_coverage` had one product bug and two unreachable assertions: an automatic bake armed
+  from inside an explicit one reset the job-scoped `bake_total`/`bake_done` counters (fixed in
+  `_process_async_svt_pages`, which no longer marks cells dirty while an explicit job is queued
+  or in flight), the turned camera could never see past the 992 m band edge that level 4 needs
+  (`farthest == 989 m` at the old placement, so the hierarchy could not grow), and
+  `has_persisted_mip()` asked the catalogue for a level when it reports cells (one file per cell,
+  full mip chain). The turned view now looks across the grid from the far corner.
+* `texture_compression` measured 67 engine errors per run, all from one addon defect: the bake
+  uniform set bound a *cached* asset array RID, and an asset edit frees the previous pair before
+  the render thread binds the snapshot, so the device rejected the binding and the same dead
+  snapshot was retried every frame. The producer now validates the resolved RID against the
+  device, forgets a pair it could not bind, and reports `materials_stale` so the terrain
+  publishes the current pair (`producer.materials_stale` in the stats must return to false). The
+  eager `free_rid` of the previous uniform set is also guarded, because freeing its arrays makes
+  the device drop the set itself.
+
+`vt_auto_bake`, `vt_density` and `texture_layers` are the remaining red tests. `vt_auto_bake`'s
+first process now passes (the pressure phase waited on `bake_pending`, which excludes the cell
+being baked, so it could break a frame before the job's last cell landed; it counts cells now),
+which exposed its reload phase for the first time in a long while: the second process finds no
+far-field demand at all. `vt_density`'s dense-payload render fractions and `texture_layers`'s
+45-degree ramp slope overlay are still open.
+
+`vt_sparse` and `vt_fallback` used to be listed here as well. They pass now: `vt_sparse` needed
+the diagnostic far field to actually fill the pages it publishes (it read
+`page_write_count: 0` with all-zero pages), and `vt_fallback` needed the far field to produce a
+page without a bake file. Both are covered above.
+
+`vt_visibility` and `vt_adaptive` are green now as well. `vt_visibility` was fixture drift: it
+pins an eight-page pool but left auto capacity on, and a single manual pass that requests a
+larger pool deliberately produces nothing while that request is in flight, so the pass returned
+0 pages and 0 records. It now pins `vt_auto_capacity = false` and looks straight down in the SVT
+phase, because a tilted view puts the AVT visible-region rect and the distance-picked page in
+different regions. `vt_adaptive` asserted that a ready ancestor covers the near terrain while
+finer pages are pending, which is the opposite of the strict-miss contract the legacy block-table
+path implements and `vt_filtering`/`vt_fallback` pin; it now asserts that the pending pages do
+not fall back to the poisoned source array while the far block keeps sampling its ready chain.
+
+`texture_layers` (the 45-degree ramp slope overlay, plus the paint-timing flake below) and
+`editor_dock:dock`/`editor_dock:setup` also
+fail identically with the addon reverted to `HEAD`, so they are outside this document's contract
+and were left alone rather than fixed blind.
+
 ### Known flaky results — do not chase these as regressions
 
 * `editor_dock_runner.py --test setup` fails roughly half the time at the Scene mesh brush
   step (`MESH_INSTANCES=0`, `PAINTED` between 95 and 108). Re-running it usually passes on the
   same binary. It is a camera/mouse-ray timing issue, the same class as the paint step in
-  `--test input` and `--test dock`.
+  `--test input` and `--test dock`, and the same class as `texture_layers.gd`'s "painted second
+  layer was not rendered green" step.
 * The runners' `--headless --editor --import` step intermittently dies with `0xC0000005`
   (`EXIT=3221225477`), which makes a batch of runners look like a total failure while each
   runner passes on its own. Windows Application Error events put the fault in
@@ -714,22 +972,19 @@ python misc/feng-addons/feng-idweight-terrain/native/tests/editor_dock_runner.py
   crashing before the slot allocator existed. If a runner reports `EXIT=3221225477` with no
   script output in its log, re-run it alone before investigating.
 
-## 7. Sources read
+## 7. Where the contract lives
 
-Hydra AVT runtime: `TerrainAVTConstants`, `TerrainAVTAddressProfile`, `TerrainAVTUtility`,
-`TerrainVirtualImageAtlas`, `TerrainAVTFeedbackTexture`, `TerrainAVTFeedbackWriter`,
-`TerrainAVTIndirectionTexture`, `TerrainAVTIndirectionWriter`, `TerrainAVTIndirectionProjection`,
-`TerrainAVTPhysicalPageFormat`, `TerrainAVTPhysicalPageSlotAllocator`, `TerrainAVTPageStorage`,
-`TerrainAVTPageScheduler`, `TerrainAVTPageContracts`, `TerrainAVTRuntime` (+`.PlanPageWork`,
-`.RenderPageWork`, `.Feedback`, `.Readback`), `TerrainVTMgr`, `TerrainVTPass`,
-`TerrainAVTRequestCulling`, `TerrainAVTWriteModeSelection`, `AVTReadbackRequestProvider`,
-`ComputeTerrainAVTPageWriter`, `RasterTerrainAVTPageWriter`, `TerrainVTShaderPropertyIds`,
-`TerrainVTKeywords`, `TerrainVTLodTracker`, `TerrainVTGenerator`, `TerrainSvtAddressing`.
-Hydra ZTerrain: `TerrainHeightPageManifestAsset`, `TerrainHeightPagePackAsset`,
-`TerrainSvtPageManifestAsset`, `TerrainCdlodHeightStore`, `TerrainChannel`,
-`TerrainRuntimeSettings`, `TerrainIndexFile`, `TerrainIndexStructures`, `ZTerrainService`,
-`TerrainSceneProcessor`, `ITerrainTextureSource`, the export builders.
-Hydra ZRP CDLOD: `TerrainCdlodPatchPass`, `TerrainHeightPageCache`, `TerrainCdlodHeightData`,
-`TerrainCdlodDrawPass`, `TerrainCdlodDrawUtility`.
-Shaders: `TerrainVT/AVT/*`, `Terrain/TerrainCdlod.hlsl`, `TerrainVT/TerrainVTSurfaceSample.hlsl`,
-`TerrainVT/TerrainVTSurfaceCodecFunctions.hlsl`.
+| Concern | File |
+|---|---|
+| Page record, indirection walk, POT block allocator | `native/src/terrain_vt.h` |
+| Per-frame VT state and settings | `native/src/terrain_3d_vt_state.h` |
+| Near-field planner, directory, production pass | `native/src/terrain_3d_sector_avt.cpp` |
+| Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_vt_service.cpp`, `terrain_3d_vt_demand.cpp` |
+| Page table, physical pool, page read/write | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
+| Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_surface_vt.cpp` |
+| Resident far-field cell sources (GPU arrays, budget, eviction) | `native/src/terrain_3d_vt_cells.{h,cpp}` |
+| GPU page demand | `native/src/terrain_3d_vt_feedback.{h,cpp}` |
+| Shader-side addressing and sampling | `native/src/shaders/main.glsl` |
+| Geometry backend | `native/src/terrain_3d_cdlod.{h,cpp}` |
+
+The per-test index, including what each script pins, is `native/tests/README.md`.
