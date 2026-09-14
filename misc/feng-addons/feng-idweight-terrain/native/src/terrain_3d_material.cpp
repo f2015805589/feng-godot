@@ -208,6 +208,10 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 			_terrain->get_surface_svt()->is_initialized();
 	Terrain3DVirtualTexture *svt = _terrain->get_surface_svt();
 	RS->material_set_param(p_material, "_surface_svt_enabled", svt_on);
+	// Published outside the `svt_on` branch: a uniform that is only written while the
+	// view is up would keep whatever was bound last, and the shader reads it on every
+	// fragment of every variant.
+	RS->material_set_param(p_material, "_surface_svt_root_fallback", _terrain->get_surface_svt_root_fallback());
 	if (svt_on) {
 		RS->material_set_param(p_material, "_surface_svt_page_world", _terrain->get_surface_svt_page_world());
 		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());

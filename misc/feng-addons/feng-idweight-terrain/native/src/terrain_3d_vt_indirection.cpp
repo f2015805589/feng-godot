@@ -1,4 +1,5 @@
 #include "terrain_3d_vt_indirection.h"
+#include "terrain_vt.h"
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rd_texture_format.hpp>
@@ -137,12 +138,36 @@ void Terrain3DVTIndirection::_upload(const Ref<Terrain3DVTIndirection> &p_keep_a
 	for (const auto &layer : layers) { server->texture_2d_update(atlas, layer.second, layer.first); }
 	Ref<RDTextureView> view; view.instantiate();
 	if (!_texture_rd.is_valid()) {
+		// A view that was cleared before it was configured has no page table to publish.
+		// Creating one for zero levels is what produced an empty initial slice, an invalid
+		// texture RID, and a permanently broken page table that every later commit retried.
+		if (_size <= 0 || _levels <= 0) {
+			_restore(std::move(patches), initial);
+			return;
+		}
+		// The RD binding rejects an empty data slice and returns an invalid RID, so a
+		// texture created before its first CPU commit gets an explicitly cleared page
+		// table: every slot invalid, which is the state a table with no published page
+		// is in anyway. Passing no data at all would leave the format uninitialized and
+		// let the sampler read garbage slot indices.
+		PackedByteArray cleared;
+		if (initial.is_empty()) {
+			int64_t texels = 0;
+			for (int mip = 0; mip < _levels; ++mip) {
+				const int64_t level = MAX(1, _size >> mip);
+				texels += level * level;
+			}
+			cleared.resize(texels * 4);
+			cleared.encode_float(0, real_t(TerrainVT::INVALID_PHYSICAL_PAGE_SLOT));
+			uint8_t *cleared_bytes = cleared.ptrw();
+			for (int64_t i = 1; i < texels; ++i) { std::memcpy(cleared_bytes + i * 4, cleared_bytes, 4); }
+		}
 		Ref<RDTextureFormat> format; format.instantiate();
 		format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
 		format->set_format(RenderingDevice::DATA_FORMAT_R32_SFLOAT);
 		format->set_width(_size); format->set_height(_size); format->set_mipmaps(_levels);
 		format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
-		TypedArray<PackedByteArray> data; data.push_back(initial);
+		TypedArray<PackedByteArray> data; data.push_back(initial.is_empty() ? cleared : initial);
 		_texture_rd = rd->texture_create(format, view, data);
 		if (!_texture_rd.is_valid()) {
 			_restore(std::move(patches), initial);

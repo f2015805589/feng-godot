@@ -43,6 +43,14 @@ int Terrain3D::get_avt_base_block_size() const {
 	while (size < 64.f * _vt.surface_vt_texels_per_meter / _vt.vt_page_size) { size <<= 1; }
 	return size;
 }
+// The number of texels a level 0 sector block carries per page, as a multiple of its page
+// count: `size * logical_ratio` is the block's virtual resolution for `SECTOR_WORLD`
+// metres. Derived here rather than read from the plan, because the staged planner
+// publishes the directory one phase before it submits the plan that would store it: the
+// first publish of a configuration is exactly the one that must not see a stale default.
+float Terrain3D::_avt_logical_ratio() const {
+	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * get_avt_base_block_size());
+}
 // Compatibility with saved experimental distance controls; automatic LOD is authoritative.
 void Terrain3D::set_surface_vt_distance_mips(bool p_enabled) { _vt.surface_vt_distance_mips = false; }
 void Terrain3D::set_surface_vt_mip_ranges(const Vector3 &p_ranges) { }
@@ -285,16 +293,48 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 
 	const PackedByteArray plan_key = _avt_plan_state(bounds_ready);
 	const int finished = _avt_install_or_reuse_plan(started, p_max_pages, _vt.avt_plan_key == plan_key);
-	if (finished >= 0) { return finished; }
+	if (finished >= 0) {
+		_vt.avt_plan_staging = false;
+		_vt.avt_plan_stage = 0;
+		return finished;
+	}
 
 	_vt.avt_sector_stats["plan_reused"] = false;
 	_vt.avt_sector_stats["coverage_center"] = focus;
 	_vt.avt_sector_stats["coverage_radius"] = _vt.surface_svt_enabled ? reach : -1.f;
+	// Phase timings for the uncached path, which is the one a moving camera takes on
+	// every tick: the visible scan, the sector hierarchy, the address directory, the
+	// hand-off to the refinement worker, the directory upload and the page production.
+	auto avt_ms = [](const uint64_t p_from) { return double(Time::get_singleton()->get_ticks_usec() - p_from) / 1000.0; };
 	TerrainVT::VisibleView view(get_camera(), 192.f);
-	Terrain3DAVTHierarchy hierarchy = _avt_build_hierarchy(_avt_scan_sectors(view, camera_position, bounds_ready, focus, reach));
-	_avt_sync_address_directory(hierarchy, focus, reach);
-	const bool directory_dirty = hierarchy.directory_dirty;
-	_avt_submit_plan(hierarchy, plan_key, view, camera_position, bounds_ready, focus, reach);
+	uint64_t phase_start = Time::get_singleton()->get_ticks_usec();
+	// The chain runs in one pass. Staging it across ticks was tried and reverted: the
+	// install/reuse path above resets the stage cursor, so a chain that was interrupted
+	// between phases could be discarded before it published, which left the directory
+	// stale and the view rendering the missing-page diagnostic for whole sectors. The
+	// phases are cheap enough as a group (a few milliseconds on a moving camera) that
+	// spreading them out costs more than it saves.
+	phase_start = Time::get_singleton()->get_ticks_usec();
+	_vt.avt_pending_scan = _avt_scan_sectors(view, camera_position, bounds_ready, focus, reach);
+	_vt.avt_sector_stats["scan_ms"] = avt_ms(phase_start);
+	phase_start = Time::get_singleton()->get_ticks_usec();
+	_vt.avt_pending_hierarchy = _avt_build_hierarchy(_vt.avt_pending_scan);
+	_vt.avt_pending_scan = Terrain3DAVTSectorScan();
+	_vt.avt_sector_stats["hierarchy_ms"] = avt_ms(phase_start);
+	phase_start = Time::get_singleton()->get_ticks_usec();
+	_avt_sync_address_directory(_vt.avt_pending_hierarchy, focus, reach);
+	_vt.avt_sector_stats["sync_ms"] = avt_ms(phase_start);
+	phase_start = Time::get_singleton()->get_ticks_usec();
+	_publish_avt_directory(_vt.avt_pending_hierarchy);
+	_vt.avt_sector_stats["publish_ms"] = avt_ms(phase_start);
+	phase_start = Time::get_singleton()->get_ticks_usec();
+	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, camera_position, bounds_ready, focus, reach);
+	_vt.avt_sector_stats["submit_ms"] = avt_ms(phase_start);
+	_vt.avt_plan_key = plan_key;
+	_vt.avt_pending_hierarchy = Terrain3DAVTHierarchy();
+	_vt.avt_plan_stage = 0;
+	_vt.avt_plan_staging = false;
+	_vt.avt_sector_stats["plan_stage"] = _vt.avt_plan_stage;
 
 	_vt.avt_sector_stats["height_bounds_ready"] = bounds_ready;
 	_vt.avt_sector_stats["retained_hierarchy"] = true;
@@ -302,17 +342,29 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	_vt.avt_sector_stats["base_virtual_resolution"] = SECTOR_WORLD * _vt.surface_vt_texels_per_meter;
 	_vt.avt_sector_stats["base_page_entries"] = SECTOR_WORLD * _vt.surface_vt_texels_per_meter / _vt.vt_page_size;
 	_vt.avt_sector_stats["indirection_size"] = 2048;
-	_vt.avt_sector_stats["directory_rebuilt"] = directory_dirty || hierarchy.root_level != _vt.avt_root_level;
-	const bool directory_changed = _avt_publish_directory(hierarchy, directory_dirty);
-
-	_vt.avt_sector_stats["visible_sectors"] = int(std::count_if(hierarchy.leaves.begin(), hierarchy.leaves.end(), [](const Sector &sector) { return sector.produce; }));
-	_vt.avt_sector_stats["coarse_pages"] = hierarchy.coarse_roots;
-	_vt.avt_sector_stats["coarse_world_size"] = SECTOR_WORLD * float(1 << hierarchy.root_level);
-	if (directory_changed && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
-	_vt.avt_plan_key = plan_key;
+	phase_start = Time::get_singleton()->get_ticks_usec();
 	const int produced = _produce_sector_avt_pages(p_max_pages);
+	_vt.avt_sector_stats["produce_ms"] = avt_ms(phase_start);
 	_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	return produced;
+}
+
+// Publishes the address directory of a finished hierarchy. The material is republished
+// only when a uniform it reads changed: the directory texture is updated in place, so its
+// new content is already visible to the shader, and republishing every uniform costs more
+// than the whole tick budget.
+void Terrain3D::_publish_avt_directory(const Terrain3DAVTHierarchy &p_hierarchy) {
+	_vt.avt_sector_stats["directory_rebuilt"] = p_hierarchy.directory_dirty || p_hierarchy.root_level != _vt.avt_root_level;
+	const bool rebind = _avt_publish_directory(p_hierarchy, p_hierarchy.directory_dirty);
+	_vt.avt_sector_stats["visible_sectors"] = int(std::count_if(p_hierarchy.leaves.begin(), p_hierarchy.leaves.end(), [](const Sector &sector) { return sector.produce; }));
+	_vt.avt_sector_stats["coarse_pages"] = p_hierarchy.coarse_roots;
+	_vt.avt_sector_stats["coarse_world_size"] = SECTOR_WORLD * float(1 << p_hierarchy.root_level);
+	_vt.avt_sector_stats["material_ms"] = 0.0;
+	if (rebind && _material.is_valid()) {
+		const uint64_t material_start = Time::get_singleton()->get_ticks_usec();
+		_material->update(Terrain3DMaterial::REGION_ARRAYS);
+		_vt.avt_sector_stats["material_ms"] = double(Time::get_singleton()->get_ticks_usec() - material_start) / 1000.0;
+	}
 }
 
 // Fixed camera/configuration key: no per-frame Variant arrays or region scan.
@@ -351,15 +403,24 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// Let recently requested jobs finish instead of repeatedly cancelling
 			// their prepared source bytes. Current visibility always comes first.
 			const uint64_t epoch = ++_vt.avt_plan_epoch;
-			std::map<std::array<int, 5>, bool> current;
+			// The retained scan compares every address in the plan against every address
+			// still requested. A tree node per address costs more than one tick's whole
+			// budget, so the current set is a sorted array searched in place.
+			std::vector<std::array<int, 5>> current;
+			current.reserve(_vt.avt_refinement->pages.size());
 			for (Terrain3DAVTPageRequest &page : _vt.avt_refinement->pages) {
 				page.last_visible_plan = epoch;
-				current[{ page.owner.x, page.owner.y, page.mip, page.x, page.y }] = true;
+				current.push_back({ page.owner.x, page.owner.y, page.mip, page.x, page.y });
 			}
+			std::sort(current.begin(), current.end());
 			int retained = 0;
 			for (const Terrain3DAVTPageRequest &page : _vt.avt_page_plan) {
 				if (retained == 128) { break; }
-				if (page.last_visible_plan + 8 < epoch || current.count({ page.owner.x, page.owner.y, page.mip, page.x, page.y })) { continue; }
+				if (page.last_visible_plan + 8 < epoch ||
+						std::binary_search(current.begin(), current.end(),
+								std::array<int, 5>{ page.owner.x, page.owner.y, page.mip, page.x, page.y })) {
+					continue;
+				}
 				_vt.avt_refinement->pages.push_back(page);
 				++retained;
 			}
@@ -622,7 +683,7 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Packe
 	// virtual image's full mip pyramid (256 squared entries need zero resident
 	// pages until requested). Budget exhaustion must remain visible in diagnostics.
 	for (Sector &sector : r_hierarchy.working) { sector.size = _vt.surface_vt->has_sector(sector.owner) ? _vt.surface_vt->get_sector_block_size(sector.owner) : 0; }
-	const float logical_ratio = SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * get_avt_base_block_size());
+	const float logical_ratio = _avt_logical_ratio();
 	auto job = std::make_shared<Terrain3DAVTRefinement>();
 	// The plan carries the key it was planned for, which is the key this tick
 	// publishes at its end. The install step compares it against the member, so it
@@ -690,7 +751,12 @@ bool Terrain3D::_avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy,
 	uint8_t *output = bytes.ptrw();
 	std::vector<bool> occupied(entries, false);
 	int detailed = 0, max_size = 0;
-	const float logical_ratio = _vt.avt_plan_logical_ratio;
+	// The block size the shader reads is this ratio, and the planner only records it in the
+	// plan it submits after publishing, so derive the live value instead of reading
+	// `_vt.avt_plan_logical_ratio`: on the first publish of a configuration that member is
+	// still its default of zero, and a zero block size collapses every fragment of the
+	// sector onto the block's first page.
+	const float logical_ratio = _avt_logical_ratio();
 	for (const auto &cached : _vt.avt_cached_addresses) {
 		const Terrain3DAVTCachedAddress &sector = cached.second;
 		if (!_vt.surface_vt->has_sector(sector.owner)) { continue; }
@@ -704,17 +770,23 @@ bool Terrain3D::_avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy,
 		if (sector.level == 0 && p_hierarchy.owners.count(cached.first)) { ++detailed; max_size = MAX(max_size, size); }
 	}
 	directory_changed = bytes != _vt.avt_directory_bytes || p_hierarchy.root_level != _vt.avt_root_level;
+	bool uniform_changed = false;
 	if (directory_changed) {
+		const bool recreated = !(_vt.avt_sector_directory.is_valid() &&
+				_vt.avt_sector_directory->get_width() == width && _vt.avt_sector_directory->get_height() == height);
 		Ref<Image> image = Image::create_from_data(width, height, false, Image::FORMAT_RGBAF, bytes);
 		if (_vt.avt_sector_directory.is_valid() && _vt.avt_sector_directory->get_width() == width && _vt.avt_sector_directory->get_height() == height) { _vt.avt_sector_directory->update(image); }
 		else { _vt.avt_sector_directory = ImageTexture::create_from_image(image); }
+		// Only a uniform the shader reads needs a material republish: the texture update
+		// in place is already visible to it, and the republish is not free.
+		uniform_changed = recreated || (entries - 1) != _vt.avt_directory_mask || p_hierarchy.root_level != _vt.avt_root_level;
 		_vt.avt_directory_bytes = bytes;
 		_vt.avt_directory_mask = entries - 1;
 		_vt.avt_root_level = p_hierarchy.root_level;
 	}
 	_vt.avt_sector_stats["independent_sectors"] = detailed;
 	_vt.avt_sector_stats["max_allocated_resolution"] = max_size * _vt.vt_page_size;
-	return directory_changed;
+	return uniform_changed;
 }
 
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
@@ -736,15 +808,26 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
 
 	Terrain3DAVTProducePass pass;
+	uint64_t produce_start = Time::get_singleton()->get_ticks_usec();
+	auto produce_ms = [](const uint64_t p_from) { return double(Time::get_singleton()->get_ticks_usec() - p_from) / 1000.0; };
 	_avt_classify_plan(pass);
+	_vt.avt_sector_stats["classify_ms"] = produce_ms(produce_start);
+	produce_start = Time::get_singleton()->get_ticks_usec();
 	_avt_retain_visible(pass);
+	_vt.avt_sector_stats["retain_ms"] = produce_ms(produce_start);
+	produce_start = Time::get_singleton()->get_ticks_usec();
 	_avt_prime_sources(pass);
+	_vt.avt_sector_stats["prime_ms"] = produce_ms(produce_start);
+	produce_start = Time::get_singleton()->get_ticks_usec();
 	_avt_produce_visible(pass, p_max_pages);
+	_vt.avt_sector_stats["upload_ms"] = produce_ms(produce_start);
 	// Refill after consuming ready results even when the render budget is spent.
 	// Otherwise two full batches drain the queue and every third frame is idle.
+	produce_start = Time::get_singleton()->get_ticks_usec();
 	_avt_prime_sources(pass);
 	_avt_produce_prefetch(pass, p_max_pages);
 	_avt_finish_produce(pass);
+	_vt.avt_sector_stats["finish_ms"] = produce_ms(produce_start);
 	return pass.produced;
 }
 
@@ -828,6 +911,10 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 		// Throughput is bounded by the real page budget, not a CPU timer that can
 		// collapse this pipeline to one page per frame while the camera is moving.
 		if (r_pass.produced >= p_max_pages) { break; }
+		// ... but an automatic tick also stops on its own deadline: the remaining pages
+		// are produced by the ticks that follow, and the view they are missing from is
+		// shaded from the source in the meantime.
+		if (_vt_tick_expired()) { break; }
 		r_pass.produced += _avt_produce_page(r_pass, *page) ? 1 : 0;
 	}
 }
@@ -839,7 +926,7 @@ void Terrain3D::_avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max
 	const auto pool = _vt.surface_vt->get_page_pool();
 	bool complete = pool->free_slots.empty();
 	for (size_t checked = 0; checked < _vt.avt_prefetch_plan.size() && !complete; ++checked) {
-		if (r_pass.prefetched >= p_max_pages) { break; }
+		if (r_pass.prefetched >= p_max_pages || _vt_tick_expired()) { break; }
 		r_pass.prefetch_pending = false;
 		r_pass.prefetched += _avt_produce_page(r_pass, _vt.avt_prefetch_plan[_vt.avt_prefetch_cursor], true) ? 1 : 0;
 		_vt.avt_prefetch_cycle_pending |= r_pass.prefetch_pending;

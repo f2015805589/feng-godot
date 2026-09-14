@@ -1212,6 +1212,12 @@ void Terrain3DVirtualTexture::commit() {
 		}
 		return;
 	}
+	// A cleared view has no page table and no levels. Publishing it would build a GPU
+	// table for zero levels, which the device rejects, and the failed table would then be
+	// mistaken for an initialized one for the rest of the session.
+	if (_bytes.is_empty() || _level_count <= 0) {
+		return;
+	}
 	if (_indirection_gpu.is_valid() || RS->get_rendering_device()) {
 		if (_indirection_gpu.is_null()) {
 			_indirection_gpu.instantiate();

@@ -56,6 +56,7 @@ void Terrain3DCDLOD::initialize(Terrain3D *p_terrain, RID p_material) {
 }
 
 void Terrain3DCDLOD::_upload(Batch &p_batch, PackedFloat32Array &p_data, const AABB &p_bounds) {
+	const uint64_t upload_started = Time::get_singleton()->get_ticks_usec();
 	const int count = int(p_data.size() / 16);
 	if (!_adaptive) {
 		while (int(p_batch.region_instances.size()) > count) {
@@ -108,6 +109,7 @@ void Terrain3DCDLOD::_upload(Batch &p_batch, PackedFloat32Array &p_data, const A
 		RS->multimesh_set_custom_aabb(p_batch.multimesh, p_bounds);
 		p_batch.bounds = p_bounds;
 	}
+	_upload_ms += double(Time::get_singleton()->get_ticks_usec() - upload_started) / 1000.0;
 }
 
 void Terrain3DCDLOD::snap() {
@@ -134,10 +136,15 @@ void Terrain3DCDLOD::snap() {
 	}
 	const bool rebuild = !_selection_valid || key != _selection_key;
 	if (!rebuild && view_key == _view_key) {
+		_rebuild_ms = 0.0;
+		_cull_ms = 0.0;
+		_pack_ms = 0.0;
+		_upload_ms = 0.0;
 		_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 		return;
 	}
 	_view_key = std::move(view_key);
+	_rebuild_ms = 0.0;
 	if (rebuild) {
 		_selection_valid = true;
 		const TypedArray<Vector2i> locations = _terrain->get_data()->get_region_locations();
@@ -190,6 +197,8 @@ void Terrain3DCDLOD::snap() {
 			visit(location.x * region_world, location.y * region_world, region_world, heights, true);
 		}
 	}
+	_rebuild_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+	const uint64_t cull_started = Time::get_singleton()->get_ticks_usec();
 	// Rotation changes visibility, not the distance-selected quadtree.
 	const auto frustum = projection.get_projection_planes(camera->get_camera_transform());
 	std::array<Plane, 6> planes;
@@ -213,9 +222,15 @@ void Terrain3DCDLOD::snap() {
 		_visibility[index] = classification;
 	}
 	if (!visibility_changed) {
+		_cull_ms = double(Time::get_singleton()->get_ticks_usec() - cull_started) / 1000.0;
+		_pack_ms = 0.0;
+		_upload_ms = 0.0;
 		_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 		return;
 	}
+	_cull_ms = double(Time::get_singleton()->get_ticks_usec() - cull_started) / 1000.0;
+	const uint64_t pack_started = Time::get_singleton()->get_ticks_usec();
+	_upload_ms = 0.0;
 	auto &lists = _instance_lists;
 	for (auto &list : lists) { list.clear(); list.reserve(_patches.size() * 16); }
 	std::array<AABB, 2> bounds;
@@ -238,6 +253,7 @@ void Terrain3DCDLOD::snap() {
 		_upload(_batches[i], data, bounds[i]);
 	}
 	if (!_adaptive) { update(); }
+	_pack_ms = double(Time::get_singleton()->get_ticks_usec() - pack_started) / 1000.0;
 	_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 }
 
@@ -261,6 +277,10 @@ Dictionary Terrain3DCDLOD::get_stats() const {
 	stats["active"] = _adaptive;
 	stats["selection_builds"] = int64_t(_selection_builds);
 	stats["cpu_update_ms"] = _cpu_update_ms;
+	stats["rebuild_ms"] = _rebuild_ms;
+	stats["cull_ms"] = _cull_ms;
+	stats["pack_ms"] = _pack_ms;
+	stats["upload_ms"] = _upload_ms;
 	stats["backend"] = _adaptive ? "CDLOD" : "Region grid";
 	stats["selected_patches"] = _selected;
 	stats["visible_patches"] = _visible;

@@ -41,6 +41,15 @@ class Terrain3DCDLOD {
 	std::array<real_t, 26> _view_key = {};
 	uint64_t _selection_builds = 0;
 	double _cpu_update_ms = 0.0;
+	// Where the last snap() spent its time: quadtree selection (only when the eye
+	// moved), the frustum classification pass, and the instance packing/uploads that
+	// follow a visibility change.
+	double _rebuild_ms = 0.0;
+	double _cull_ms = 0.0;
+	double _pack_ms = 0.0;
+	// The RenderingServer calls inside the packing phase (buffer upload, visible count,
+	// bounds) and the CPU packing loop before them.
+	double _upload_ms = 0.0;
 	void _upload(Batch &p_batch, PackedFloat32Array &p_data, const AABB &p_bounds);
 
 public:

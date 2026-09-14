@@ -195,7 +195,27 @@ void Terrain3D::__physics_process(const double p_delta) {
 		}
 		return;
 	}
+	// VT streaming cost: everything the near field and the far field do on the main
+	// thread for this tick, from reconfiguring the shared service to the baker budget.
+	// Region streaming, collision and the mesher are outside this window.
+	const uint64_t vt_started = Time::get_singleton()->get_ticks_usec();
+	// The tick's budget for everything below. A phase that can stop between two units of
+	// work reads this deadline, so streaming cannot put an unbounded amount of planning or
+	// page production into one frame; what it did not finish runs on the next tick.
+	_vt.vt_tick_deadline_us = _vt.vt_frame_budget_ms > 0.f
+			? vt_started + uint64_t(double(_vt.vt_frame_budget_ms) * 1000.0)
+			: 0;
+	// Phase attribution for the tick: the service check, each view's demand pass, the
+	// near-field production top-up, and the far-field bake. Without it a peak can only be
+	// read as "VT was slow".
+	uint64_t vt_mark = vt_started;
+	auto vt_phase = [&vt_mark](double &r_phase) {
+		const uint64_t now = Time::get_singleton()->get_ticks_usec();
+		r_phase = double(now - vt_mark) / 1000.0;
+		vt_mark = now;
+	};
 	_update_vt_service();
+	vt_phase(_vt.vt_service_ms);
 	// VT Setting supplies one production budget for both addressing views.
 	int vt_remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
 	const bool svt_baking = !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty();
@@ -206,10 +226,12 @@ void Terrain3D::__physics_process(const double p_delta) {
 		avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
 		vt_remaining -= avt_produced;
 	}
+	vt_phase(_vt.vt_avt_ms);
 	// Refresh the far field: a world-space page grid that spans regions.
 	if (_vt.surface_svt_enabled && vt_remaining > 0) {
 		vt_remaining -= update_surface_svt(vt_remaining);
 	}
+	vt_phase(_vt.vt_svt_ms);
 	if (!svt_baking && vt_remaining > 0 && _vt.surface_vt_enabled && is_sector_avt() &&
 			_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
 		// The initial split lets SVT make progress, but unused SVT budget belongs
@@ -221,6 +243,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 		_vt.avt_sector_stats["cpu_update_ms"] = double(_vt.avt_sector_stats.get("cpu_update_ms", 0.0)) +
 				double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	}
+	vt_phase(_vt.vt_topup_ms);
 	if (svt_baking) {
 		_vt.surface_svt->set_allocation_budget(MAX(0, vt_remaining));
 		_process_svt_bake(MAX(0, vt_remaining));
@@ -231,6 +254,14 @@ void Terrain3D::__physics_process(const double p_delta) {
 		_vt.surface_svt->set_allocation_budget(-1);
 	}
 	if (demand_pool) { demand_pool->end_demand(); }
+	vt_phase(_vt.vt_bake_ms);
+	_vt.vt_tick_deadline_us = 0;
+	_vt.vt_cpu_ms = double(Time::get_singleton()->get_ticks_usec() - vt_started) / 1000.0;
+	if (_vt.vt_cpu_ms > _vt.vt_cpu_peak_ms) { _vt.vt_cpu_peak_ms = _vt.vt_cpu_ms; }
+}
+
+bool Terrain3D::_vt_tick_expired() const {
+	return _vt.vt_tick_deadline_us != 0 && Time::get_singleton()->get_ticks_usec() >= _vt.vt_tick_deadline_us;
 }
 
 /**

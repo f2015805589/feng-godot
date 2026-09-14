@@ -241,7 +241,8 @@ public:
 	Error initialize();
 	void clear();
 	bool is_initialized() const {
-		return _page_pool && _page_pool->is_initialized() && (_indirection_gpu.is_valid() || _indirection.get_rid().is_valid());
+		return _page_pool && _page_pool->is_initialized() &&
+				((_indirection_gpu.is_valid() && _indirection_gpu->is_ready()) || _indirection.get_rid().is_valid());
 	}
 
 	// Native-only sharing hook used by Terrain3D to give both compatibility views

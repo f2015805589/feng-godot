@@ -101,6 +101,10 @@ private:
 	int _avt_install_or_reuse_plan(uint64_t p_started, int p_max_pages, bool p_same_plan);
 	Terrain3DAVTSectorScan _avt_scan_sectors(const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position,
 			bool p_bounds_ready, const Vector2 &p_focus, float p_reach) const;
+	// World/texel scale of one AVT world level's logical image. A pure function of the live
+	// VT configuration, so the plan that stores it and the directory that publishes it read
+	// it independently instead of one planner phase reading what another wrote.
+	float _avt_logical_ratio() const;
 	Terrain3DAVTHierarchy _avt_build_hierarchy(const Terrain3DAVTSectorScan &p_scan);
 	void _avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, const Vector2 &p_focus, float p_reach);
 	void _avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const PackedByteArray &p_plan_key,
@@ -190,12 +194,21 @@ private:
 	// setup and the shared-pool rebuild so neither depends on stored state.
 	void _configure_surface_view(Terrain3DVirtualTexture *p_view, bool p_world_space);
 	void _update_vt_service();
+	// Rebuilds the shared service when a view was cleared out from under it, so a
+	// demand pass never runs against a view without a page table.
+	void _ensure_vt_views_ready();
+	// True once the automatic tick's VT budget is spent. Only an automatic tick sets a
+	// deadline, so an explicit demand call always returns false here.
+	bool _vt_tick_expired() const;
 	// True while any view still owes the render thread a page-table upload. Used by
 	// the editor's own redraw request, since render-thread work only progresses
 	// while frames are drawn.
 	bool _vt_has_pending_upload() const;
 	void _destroy_vt_service();
 	void _configure_vt_service();
+	// Publishes the address directory of a finished hierarchy, and republishes the
+	// material only when a uniform it reads changed.
+	void _publish_avt_directory(const Terrain3DAVTHierarchy &p_hierarchy);
 	void _queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
 			bool p_svt, int p_mip, const Vector2i &p_address,
 			const Terrain3DPagePipeline::Result *p_prepared = nullptr);
@@ -292,6 +305,8 @@ public:
 	int get_vt_pages_per_update() const { return _vt.vt_pages_per_update; }
 	void set_surface_vt_coarse_mip_fallback(bool p_enabled);
 	bool get_surface_vt_coarse_mip_fallback() const { return _vt.surface_vt_coarse_mip_fallback; }
+	void set_surface_svt_root_fallback(bool p_enabled);
+	bool get_surface_svt_root_fallback() const { return _vt.surface_svt_root_fallback; }
 	void set_vt_adaptive_enabled(bool p_enabled);
 	bool is_vt_adaptive_enabled() const { return _vt.vt_adaptive_enabled; }
 	void set_vt_editor_preview(bool p_enabled);
@@ -499,6 +514,9 @@ public:
 	void set_cdlod_lod_scale(real_t p_scale);
 	real_t get_cdlod_lod_scale() const { return _cdlod_lod_scale; }
 	Dictionary get_cdlod_stats() const { return _terrain_mesher ? _terrain_mesher->get_cdlod_stats() : Dictionary(); }
+	// Main-thread CPU the VT section of one physics tick may spend, in milliseconds.
+	void set_vt_frame_budget_ms(real_t p_budget) { _vt.vt_frame_budget_ms = CLAMP(p_budget, 0.f, 16.f); }
+	real_t get_vt_frame_budget_ms() const { return _vt.vt_frame_budget_ms; }
 	Terrain3DMesher *get_mesher() const { return _terrain_mesher; }
 	void set_material(const Ref<Terrain3DMaterial> &p_material);
 	Ref<Terrain3DMaterial> get_material() const { return _material; }

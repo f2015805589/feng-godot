@@ -56,4 +56,11 @@ public:
 				(_retry_needed.load(std::memory_order_relaxed) && !_pending.empty());
 	}
 	RID get_rid() const;
+	// True once the GPU page table exists. A view whose table failed to build is not
+	// initialized: treating the failed attempt as success is what left the virtual
+	// textures addressing a table that never existed.
+	bool is_ready() const {
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _texture_rd.is_valid() && _texture_rs.is_valid();
+	}
 };

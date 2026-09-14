@@ -218,6 +218,15 @@ void Terrain3D::set_surface_vt_coarse_mip_fallback(bool p_enabled) {
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
+// The far field's sibling of the switch above. It only changes what the shader does with
+// a miss; residency, demand and production are untouched, so no pool or page has to be
+// rebuilt - a uniform update is the whole effect.
+void Terrain3D::set_surface_svt_root_fallback(bool p_enabled) {
+	if (_vt.surface_svt_root_fallback == p_enabled) { return; }
+	_vt.surface_svt_root_fallback = p_enabled;
+	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+}
+
 void Terrain3D::set_vt_adaptive_enabled(bool p_enabled) {
 	_vt.vt_adaptive_enabled = p_enabled;
 }
@@ -866,6 +875,7 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["shared_pool"] = _vt.vt_shared_ready;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_coarse_mip_fallback"] = _vt.surface_vt_coarse_mip_fallback;
+	result["svt_root_fallback"] = _vt.surface_svt_root_fallback;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
 	result["avt_distance_mips"] = _vt.surface_vt_distance_mips;
@@ -884,6 +894,18 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["svt_root_pages"] = int(_vt.svt_root_pages.size());
 	result["svt_floor_level"] = _vt.svt_floor_level;
 	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
+	// Main-thread cost of the VT section of the last physics tick, its worst frame so
+	// far, and the far-field demand pass inside it.
+	result["vt_cpu_ms"] = _vt.vt_cpu_ms;
+	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
+	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
+	Dictionary phases;
+	phases["service"] = _vt.vt_service_ms;
+	phases["avt"] = _vt.vt_avt_ms;
+	phases["svt"] = _vt.vt_svt_ms;
+	phases["topup"] = _vt.vt_topup_ms;
+	phases["bake"] = _vt.vt_bake_ms;
+	result["vt_phases"] = phases;
 	// Resident far-field cell sources: what the runtime copies pages from without touching
 	// a file or re-baking, and how close that cache is to its memory budget.
 	if (_vt.svt_cells.is_valid()) {
@@ -1281,6 +1303,8 @@ void Terrain3D::_bind_vt_methods() {
 	VT_BIND_SETTING(vt_page_count);
 	VT_BIND_SETTING(vt_auto_capacity);
 	VT_BIND_SETTING(vt_pages_per_update);
+	VT_BIND_SETTING(vt_frame_budget_ms);
+	VT_BIND_SETTING(surface_svt_root_fallback);
 #undef VT_BIND_SETTING
 	ClassDB::bind_method(D_METHOD("set_surface_vt_coarse_mip_fallback", "enabled"), &Terrain3D::set_surface_vt_coarse_mip_fallback);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_coarse_mip_fallback"), &Terrain3D::get_surface_vt_coarse_mip_fallback);

@@ -56,7 +56,16 @@ struct Terrain3DVTState {
 	// Terrain3DAssets::TextureArrayCompression value. Resolved and validated by the
 	// surface baker, which reports what was applied and why a request was refused.
 	int vt_atlas_compression = 0;
-	bool surface_vt_coarse_mip_fallback = false;
+	// Substitutions for a page that is missing or still in production. Both default on: a
+	// miss recovers from a resident coarser level instead of rendering the diagnostic,
+	// which is what a shipped view wants while pages are still arriving. Turning one off
+	// restores the strict residency contract for that field, where a missing page stays
+	// visible as the diagnostic - the only rendering a caller can tell apart from real
+	// material.
+	bool surface_vt_coarse_mip_fallback = true;
+	// Far field: allow a miss at the level the distance rule selected to be served by a
+	// coarser resident level instead of the diagnostic. Off restores the strict walk.
+	bool surface_svt_root_fallback = true;
 	bool vt_debug_direct_material = false;
 	bool vt_editor_preview = true;
 	Dictionary vt_editor_dirty_regions;
@@ -219,6 +228,41 @@ struct Terrain3DVTState {
 	// the virtual textures serve every surface read, which is what removes the
 	// density-squared array cost; the array stays allocated but blank.
 	bool surface_array_enabled = true;
+	// Main-thread cost of one VT section of the physics tick, in milliseconds, and the
+	// worst frame since the terrain was created. `svt_cpu_ms` is the far-field demand
+	// pass inside that section, so a peak can be attributed to one of the two views.
+	double vt_cpu_ms = 0.0;
+	double vt_cpu_peak_ms = 0.0;
+	double svt_cpu_ms = 0.0;
+	// Phase breakdown of the same section: the shared-service check, the near-field
+	// demand pass, the far-field demand pass, the near-field production top-up, and the
+	// far-field bake.
+	double vt_service_ms = 0.0;
+	double vt_avt_ms = 0.0;
+	double vt_svt_ms = 0.0;
+	double vt_topup_ms = 0.0;
+	double vt_bake_ms = 0.0;
+	// Automatic-tick CPU budget for the whole VT section, in milliseconds. 0 disables it.
+	// An explicit update_surface_vt()/update_surface_svt() call is never budgeted: the page
+	// count it passes is the caller's own bound.
+	// Default 0: the per-frame deadline is off, so a tick runs to completion. A deadline
+	// starves the AVT planner rather than smoothing it - one full plan costs several
+	// milliseconds, so a 0.1 ms budget spreads a single plan over dozens of frames, which
+	// delays the first pages by seconds and leaves a moving view rendering the
+	// missing-page diagnostic the whole time. Raise it to opt into the spread-out tick.
+	real_t vt_frame_budget_ms = 0.0f;
+	// Absolute deadline of the tick that is running, or 0 when the caller is not the
+	// physics tick. Every phase that can stop between two units of work reads it.
+	uint64_t vt_tick_deadline_us = 0;
+	// Staged near-field planner: which phase of the scan -> plan chain runs next, and the
+	// intermediate data the later phases need. One automatic tick runs at most the phases
+	// that fit in its budget, so a camera that changes its view every tick cannot put the
+	// whole chain into one frame.
+	int avt_plan_stage = 0;
+	Terrain3DAVTSectorScan avt_pending_scan;
+	Terrain3DAVTHierarchy avt_pending_hierarchy;
+	// Set while a plan is being assembled for a key the standing plan does not cover.
+	bool avt_plan_staging = false;
 };
 
 #endif // TERRAIN3D_VT_STATE_H

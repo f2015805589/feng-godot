@@ -313,6 +313,7 @@ bool Terrain3D::_write_diagnostic_sparse_page(int p_slot, int p_page_x, int p_pa
 int Terrain3D::update_surface_svt(int p_max_pages) {
 	if (is_vt_editor_preview_active()) { return 0; }
 	if (!_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
+	_ensure_vt_views_ready();
 	if (!_vt.surface_svt || !_data) {
 		return 0;
 	}
@@ -323,7 +324,12 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 		}
 	}
 	_vt.surface_svt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
-	if (!_vt.vt_debug_direct_material) { return _update_visible_svt(p_max_pages); }
+	if (!_vt.vt_debug_direct_material) {
+		const uint64_t svt_started = Time::get_singleton()->get_ticks_usec();
+		const int produced = _update_visible_svt(p_max_pages);
+		_vt.svt_cpu_ms = double(Time::get_singleton()->get_ticks_usec() - svt_started) / 1000.0;
+		return produced;
+	}
 	const real_t page_world = MAX(0.001f, _vt.surface_svt_page_world);
 	const real_t reach = MAX(page_world, _vt.surface_svt_distance);
 	const Vector3 target = get_clipmap_target_position();
@@ -774,6 +780,23 @@ int Terrain3D::_surface_vt_mip_for_page(const Vector2i &p_region_loc, const int 
 	return mip;
 }
 
+// Both views are bound to the material by RID, so a view that was cleared by hand (the
+// public clear() is bound) leaves the service claiming to be configured while the view has
+// no page table, no allocator and no published texture. The near-field sector planner
+// cannot work without them: it retries a failed sector registration for every visible
+// sector on every tick, which costs hundreds of milliseconds per frame. Rebuild the shared
+// service instead, which re-initializes both views and republishes the material.
+void Terrain3D::_ensure_vt_views_ready() {
+	if (!_vt.vt_shared_ready || _vt.vt_debug_direct_material) {
+		return;
+	}
+	if ((_vt.surface_vt && !_vt.surface_vt->is_initialized()) ||
+			(_vt.surface_svt && !_vt.surface_svt->is_initialized())) {
+		_reset_vt_configuration();
+		_update_vt_service();
+	}
+}
+
 // One demand pass. The page contract is the same whichever rule picks the mips:
 // The near-field AVT is the one VT path that owns its own planner; the far-field
 // update is a straight sequence: request -> produce -> write -> commit.
@@ -782,6 +805,7 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 	// Explicit sector updates must also bind textures first created by the
 	// preceding render-thread bake, even when normal physics updates are paused.
 	if (is_sector_avt() || !_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
+	_ensure_vt_views_ready();
 	if (is_sector_avt()) { return _update_sector_avt(p_max_pages); }
 	if (!_vt.surface_vt || !_data) {
 		return 0;

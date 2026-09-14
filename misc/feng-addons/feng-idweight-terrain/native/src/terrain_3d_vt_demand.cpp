@@ -134,17 +134,21 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 	}
 
-	// Far-field roots: the coarsest levels covering the visible world stay resident and
+	// Far-field roots: the coarsest levels covering the whole SVT domain stay resident and
 	// protected, so a miss on a detail page resolves to real coarse data instead of the
-	// diagnostic material. They are acquired before the detail set because under pressure
-	// the detail pass drops the far end of the working set, which is exactly where the
-	// coarse levels live. Capped at half the pool, so the near field and the detail pages
-	// keep room to work in.
+	// diagnostic material. The set is the domain rather than the visible bounds, because a
+	// root that is pinned only while visible is unpinned exactly when the camera turns away
+	// and the coarser level is the one that would have answered. They are acquired before
+	// the detail set because under pressure the detail pass drops the far end of the working
+	// set, which is exactly where the coarse levels live. The cap stays, so the near field
+	// and the detail pages keep room to work in; levels are walked coarsest first, so a cap
+	// that bites drops the finest roots and never the coarsest one. `svt_root_pages` in the
+	// stats reports how many were actually pinned, which is how a truncated set is spotted.
 	const int protected_limit = MAX(1, physical_page_count / 2);
 	const int root_levels = CLAMP(_vt.surface_svt_root_mips, 0, maximum_mip + 1);
 	std::vector<Vector3i> next_roots;
-	if (root_levels > 0 && has_visible_bounds) {
-		const Rect2 covered = visible_bounds.intersection(domain);
+	if (root_levels > 0) {
+		const Rect2 covered = domain;
 		for (int mip = maximum_mip; mip > maximum_mip - root_levels && int(next_roots.size()) < protected_limit; --mip) {
 			const float span = page_world * float(1 << mip);
 			const int x0 = int(Math::floor(covered.position.x / span));
@@ -159,8 +163,9 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 			}
 		}
 	}
-	// A root that left the visible set loses its pin, so a world that scrolls away does not
-	// keep half the pool reserved for the rest of the session.
+	// A root outside the domain loses its pin, so a re-configured extent does not keep half
+	// the pool reserved for the rest of the session. Leaving the visible bounds is no longer
+	// a reason to unpin: that is what left the coarser level missing when it was needed.
 	for (const Vector3i &previous : _vt.svt_root_pages) {
 		bool retained = false;
 		for (const Vector3i &next : next_roots) {

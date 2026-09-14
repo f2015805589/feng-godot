@@ -83,6 +83,7 @@ uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
 #ifdef TERRAIN_NO_VT
 const bool _surface_vt_enabled = false;
 const bool _surface_svt_enabled = false;
+const bool _surface_svt_root_fallback = false;
 const bool _surface_material_enabled = false;
 const bool _surface_material_required = false;
 #else
@@ -114,6 +115,10 @@ uniform int _surface_density = 1;
 // derived from the world position and the grid is centred on the origin, so no per-layer
 // block table is needed -- the CPU uses the same `(page + half) >> mip` formula.
 uniform bool _surface_svt_enabled = false;
+// Whether a fragment whose selected far-field level has no ready page may be served by a
+// coarser resident level. Off by default: the level the distance rule selected is the
+// one that must render, and a miss is the diagnostic. On restores the coarse walk.
+uniform bool _surface_svt_root_fallback = false;
 uniform float _surface_svt_page_world = 512.0;
 uniform int _surface_svt_page_size = 256;
 uniform int _surface_svt_page_border = 4;
@@ -319,10 +324,11 @@ int surface_svt_mip_for_distance(float p_distance) {
 	return mip;
 }
 
-// Sampling starts at the level the distance selects and only ever walks coarser, so the
-// renderer can never show a level finer than the distance allows: a missing page
-// degrades to the next level up (the protected roots guarantee one exists) instead of
-// picking whatever finer page happens to still be resident.
+// Sampling starts at the level the distance selects. With `_surface_svt_root_fallback` off
+// that is the only level tried: a page that is missing or still in production stays a miss
+// and the caller renders the diagnostic, so the level that was selected is the level that
+// was drawn. With the switch on the walk continues coarser, which recovers a fragment from
+// a resident ancestor instead of diagnosing it.
 bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	if (!_surface_svt_enabled) {
 		return false;
@@ -332,7 +338,13 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	ivec2 page = ivec2(floor(p_world / _surface_svt_page_world));
 	if (any(lessThan(page + ivec2(half), ivec2(0))) || any(greaterThanEqual(page + ivec2(half), ivec2(_surface_svt_indirection_size)))) { return false; }
 	int start_mip = surface_svt_mip_for_distance(surface_svt_distance(p_world));
-	for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
+	// The loop bound is the whole switch: with the fallback off it equals start_mip, so
+	// the body runs once and a `continue` ends the search instead of moving to a coarser
+	// level. Nothing else in the body changes, which keeps the enabled path identical to
+	// the walk this shader had before the switch existed.
+	int last_mip = start_mip;
+	if (_surface_svt_root_fallback) { last_mip = _surface_svt_max_mip; }
+	for (int mip = start_mip; mip <= last_mip; mip++) {
 		ivec2 coord = (page + ivec2(half)) >> mip;
 		int level_size = max(1, _surface_svt_indirection_size >> mip);
 		float slot_f = texelFetch(_surface_svt_indirection, clamp(coord, ivec2(0), ivec2(level_size - 1)), mip).r;
@@ -356,6 +368,8 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 
 // Both virtual address spaces resolve into the same material arrays. A missing
 // or pending selected page displays diagnostics; residency never selects a substitute mip.
+// The one exception is the far field's opt-in `_surface_svt_root_fallback` below, which is
+// a request to trade that diagnostic for a coarser resident level.
 bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
 	if (slot < 0 || slot == 65535) { return false; }
@@ -369,13 +383,19 @@ bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 	return true;
 }
 
+// Same contract as surface_svt_sample(): the selected level alone is tried unless the
+// fallback switch asks for the coarser walk. A page whose material is still in production
+// (`params.a < 0.99`) is a miss in both modes, because the walk would otherwise render an
+// arbitrary younger level for a page that is simply late.
 bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
 	if (_surface_svt_enabled) {
 		ivec2 page = ivec2(floor(world / _surface_svt_page_world));
 		ivec2 virtual_page = page + ivec2(_surface_svt_indirection_size >> 1);
 		if (all(greaterThanEqual(virtual_page, ivec2(0))) && all(lessThan(virtual_page, ivec2(_surface_svt_indirection_size)))) {
 			int start_mip = surface_svt_mip_for_distance(surface_svt_distance(world));
-			for (int mip = start_mip; mip <= _surface_svt_max_mip; mip++) {
+			int last_mip = start_mip;
+			if (_surface_svt_root_fallback) { last_mip = _surface_svt_max_mip; }
+			for (int mip = start_mip; mip <= last_mip; mip++) {
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
 				int slot = int(texelFetch(_surface_svt_indirection, coord, mip).r + 0.5);
