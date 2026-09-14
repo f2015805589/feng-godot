@@ -308,13 +308,6 @@ Ref<Image> Terrain3DVTPagePool::read_page(const int p_slot) const {
 	return RS->texture_2d_layer_get(atlas.get_rid(), p_slot);
 }
 
-Ref<Image> Terrain3DVTPagePool::get_atlas_image() const {
-	if (!is_initialized()) {
-		return Ref<Image>();
-	}
-	return RS->texture_2d_layer_get(atlas.get_rid(), 0);
-}
-
 Array Terrain3DVTPagePool::get_slot_owner_metadata(const int p_slot) const {
 	Array result;
 	if (!is_initialized() || p_slot < 0 || p_slot >= page_count) {
@@ -1062,7 +1055,7 @@ Ref<Image> Terrain3DVirtualTexture::read_page(const int p_slot) const {
 Ref<Image> Terrain3DVirtualTexture::get_atlas_image() const {
 	if (_material_cache_mode) { return read_page(0); }
 	if (_indirection_gpu.is_valid() && _indirection_gpu->has_pending_layers()) { const_cast<Terrain3DVirtualTexture *>(this)->commit(); }
-	return _page_pool ? _page_pool->get_atlas_image() : Ref<Image>();
+	return _page_pool ? _page_pool->read_page(0) : Ref<Image>();
 }
 
 void Terrain3DVirtualTexture::protect_page(const int p_slot, const bool p_protected) {

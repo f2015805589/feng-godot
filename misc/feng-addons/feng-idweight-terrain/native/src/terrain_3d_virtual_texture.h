@@ -303,6 +303,8 @@ public:
 
 	// Uploads the indirection if it changed.
 	void commit();
+	// True while a committed indirection change has not reached the render thread yet.
+	bool has_pending_indirection() const { return _indirection_gpu.is_valid() && _indirection_gpu->has_pending_upload(); }
 
 	RID get_atlas_rid() const { return _page_pool ? _page_pool->atlas.get_rid() : RID(); }
 	RID get_indirection_rid() const { return _indirection_gpu.is_valid() ? _indirection_gpu->get_rid() : _indirection.get_rid(); }

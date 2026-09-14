@@ -86,8 +86,6 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_vt_visibility.h
 - [x] native/src/terrain_surface_idweight.h
 - [x] native/src/terrain_vt.h
-- [x] native/src/unit_testing.cpp
-- [x] native/src/unit_testing.h
 - [x] src/asset_dock.gd
 - [x] src/asset_dock_45.gd
 - [x] src/double_slider.gd
@@ -316,3 +314,153 @@ The requested implementation audit/refactor is complete for the recorded scope. 
 Remaining boundaries: cold streaming is not eliminated; all-visible 10.24 km moving demand remains expensive; SVT I/O/extraction/export remain synchronous; page-level CPU budget is soft and is not a GPU frame budget. Conservative culling bounds and required seam geometry remain unchanged. No reduction of actual early-Z overdraw, broad GPU/FPS multiplier, arbitrary third-party shader equivalence or all shadow/displacement configurations is claimed. GPU resource-failure recovery is implemented but not failure-injected. Optional legacy example/tool issues and further service/editor caching opportunities remain separate follow-up work.
 
 The current architecture is summarized in `vt_architecture_review.md`; old contradictory distance-control and page-file descriptions there and in `doc/feng-terrain-frp.md` were replaced with the shipped behavior.
+
+
+## Architecture pass: structure and deletion
+
+A later pass attacked readability and maintainability directly rather than cost. It is
+recorded here because the deletions above are listed as "read", not as "used".
+
+- **AVT demand is no longer one 520-line function.** `_update_sector_avt` is now 42 lines
+  that call seven named phases (`_avt_plan_state`, `_avt_install_or_reuse_plan`,
+  `_avt_scan_sectors`, `_avt_build_hierarchy`, `_avt_sync_address_directory`,
+  `_avt_submit_plan`, `_avt_publish_directory`) plus a file-local worker function
+  `avt_plan_pages`. The records those phases pass around moved out of `Terrain3D`'s private
+  nesting into `native/src/terrain_3d_avt.h`, so a phase can be a function with a signature
+  instead of a closure over the caller's locals. No algorithm changed in the move; the one
+  behavioural slip it introduced (the background plan was stamped with the key being
+  replaced instead of the new one, which stopped plans from ever installing) was caught by
+  the before/after regression diff and fixed.
+- **`terrain_vt.h` lost the half production never called** (863 -> 384 lines): the
+  `AddressProfile` descriptor tables and preset selection, the page-id packing helpers, the
+  LRU key encoding, the physical-page UV/world-rect math, the feedback sizing and Bayer
+  dither, and the high-coordinate allocation order SVT never used. The standalone contract
+  test dropped the checks for the deleted API with it (653 -> 215 lines) and still passes.
+- **Deleted outright:** `unit_testing.{h,cpp}` (only reachable through a commented-out call,
+  yet compiled into every build), `Terrain3DData::produce_surface_pages` (a duplicate of
+  `produce_surface_page_set`'s request enumeration with no callers),
+  `Terrain3DVTPagePool::get_atlas_image`, `_vt_offline_producing`,
+  `is_surface_vt_blocks_dirty`/`clear_surface_vt_blocks_dirty`, and a directory scan in
+  `menu/directory_setup.gd` whose result was never read.
+- **The two asset docks share one list.** `asset_dock.gd` and `asset_dock_45.gd` each
+  carried the same ~740 line `ListContainer` + `ListEntry` pair; they differed in six
+  places (editor-scale-aware tile metrics, the pair-role hover label, a `set_selected` tree
+  guard, and comments). The Godot 4.6 copy -- the richer one -- now lives in
+  `src/asset_dock_list_container.gd` and `src/asset_dock_list_entry.gd`, and each dock
+  aliases them with `preload`, so `Dock.ListContainer` still resolves for the editor
+  regression. 2508 lines became 1800, and the pre-4.6 dock inherits three cosmetic
+  differences it cannot be tested for here: scaled tile metrics, a 16 point font cap
+  instead of 18, and the role label on hover. Both dock editor tests pass; the pre-4.6
+  path has no engine to run on in this checkout.
+- **Two cross-file contracts became one definition each.** `terrain_vt_cell.h` now holds the
+  `.vtcell` version, path and source signature that the baker and the runtime reader each
+  used to spell out separately -- a reader that computes a different value reports every
+  baked cell as missing. `Terrain3D::_configure_surface_view()` now applies one view's page
+  dimensions, format and mode-specific addressing; the initial setup and the shared-pool
+  rebuild both call it, where the rebuild previously relied on settings that happened to
+  persist on the object.
+- **The test runners no longer each carry their own harness.** Twelve runners were the same
+  fifty lines with six values changed. `native/tests/fixture.py` owns the fixture and the
+  two-phase engine invocation, `run_script_test()` takes those six values, and each runner
+  is now a ~28 line wrapper that names its script, log and PASS marker.
+- **`terrain_3d.cpp` is six files.** At 2900 lines it held the node's lifecycle, the VT
+  service, the property setters, the queries, the warnings and every ClassDB binding. The
+  definitions moved -- no logic changed -- into `terrain_3d_vt_service.cpp`,
+  `terrain_3d_geometry.cpp`, `terrain_3d_properties.cpp`, `terrain_3d_queries.cpp` and
+  `terrain_3d_bindings.cpp`, leaving 683 lines of node lifecycle and a comment that maps
+  the rest. The compiler and the same 29 test regression check a move like this.
+- **The node's VT fields are one struct.** `terrain_3d.h` declared 103 virtual texture fields
+  interleaved with the mesher, ocean, CDLOD and rendering fields. They are now
+  `terrain_3d_vt_state.h`'s `Terrain3DVTState _vt` -- 178 lines out of the header, which went
+  from 754 to 619 -- and a reference reads `_vt.vt_page_size`, `_vt.surface_svt_page_world`
+  or `_vt.avt_plan_key`: the subsystem prefix stays (it says which tier the field belongs to)
+  while the leading underscore of the original member names goes, because the struct is no
+  longer a class member. The move is verbatim declarations in their original order with the
+  same initializers; 1030 references were rewritten across seven files, scoped to
+  `Terrain3D`'s own definitions so `Terrain3DVirtualTexture::_page_size` and every other
+  same-named member of another class was left alone, and never inside a string literal. The
+  compiler and the full regression check a move like that.
+- **The stall that made that move fail the first time got fixed, so it could land.** The first
+  attempt was reverted: it flipped `editor_dock --test vt_idle` deterministically
+  (`missing_pixels=1681252`, byte-identical across three runs) although the struct was
+  field-for-field equivalent to the field list it replaced. The cause was a real pre-existing
+  stall in the editor wakeup, not the move: `_update_vt_service()` asked for a redraw only
+  while the surface baker reported render work, so an indirection upload that was already
+  queued for the render thread had nothing to run it once the baker went idle, and the
+  refactor's timing was enough to land in that window.
+  `Terrain3DVTIndirection::has_pending_upload()` now keeps that request alive while an upload
+  is outstanding (see [`history/vt_tuning_log.md`](history/vt_tuning_log.md)), and with the fix
+  in place the same extraction passes: `missing_pixels=0`, and the full 29-test differential is
+  29/29 unchanged (`bin/terrain-after14.json`). Frame count was incidental rather than the
+  mechanism -- the passing pre-fix run made 78 indirection commits and the failing one 58, but
+  the post-fix run passes at 60; what matters is that a queued upload always drains.
+- **The VT window's bridge and image maths moved out of it.** `vt_editor.gd` (1579 lines)
+  kept the widgets and the selection state; `vt_terrain_bridge.gd` owns the duck-typed
+  native calls and `vt_overview_image.gd` owns the world/image maths and the per-pixel
+  stitch as pure functions. Call sites were left alone -- the window keeps one-line
+  delegations -- so the move could not change behaviour.
+- **The two remaining long C++ functions became named phases.** `_produce_sector_avt_pages`
+  (123 lines of locals, two lambdas and three interleaved loops) is now a 15-line pass over
+  `_avt_classify_plan`, `_avt_retain_visible`, `_avt_prime_sources`, `_avt_produce_visible`,
+  `_avt_produce_prefetch` and `_avt_finish_produce`, with the per-pass state in
+  `Terrain3DAVTProducePass` (`terrain_3d_avt.h`) so each stage has a signature instead of a
+  capture. `update_surface_vt` (246 lines) became a 60-line loop over
+  `_prepare_vt_block_tables`, `_collect_eligible_vt_regions`,
+  `_compute_adaptive_sector_sizes`, `_retire_stale_vt_sectors`, `_prepare_vt_sector`,
+  `_vt_page_requests_for_sector`, `_produce_missing_vt_pages` and
+  `_publish_vt_block_tables`. Its `requested` counter was incremented for every planned page
+  and never read; it is gone. Stage order, side-effect order and every value are otherwise
+  unchanged.
+- **The editor's cursor decal is its own module.** `ui.gd` (839 lines) mixed the tool/menu
+  wiring with ~300 lines of cursor rendering: 19 colour constants, the three decal arrays,
+  the brush/reticle texture, the fade tween, the region-directory preview and a 200-line
+  per-tool colour decision tree. `src/ui_decal.gd` owns all of it and `ui.gd` keeps three
+  one-line forwarders, because `Terrain3DEditor` and the editor plugin reach the decal
+  through the UI node (`ui.update_decal()`, `ui.hide_decal()`,
+  `ui.set_decal_rotation()`). Tool, brush and pointer state stay on the UI node and the
+  decal reads them, so no state was duplicated. `ui.gd` is 532 lines.
+- **`tool_settings.gd`'s 180-line `add_setting` became three functions.** The parse and
+  validation stayed in `add_setting`, the widget construction for every `SettingType` moved
+  to `_create_setting_control` (which appends a row's companion widgets to an out array),
+  and the label/separator/spacer assembly moved to `_add_setting_decorations`. The setting
+  registry that `_ready` declares is untouched, and the file is a widget factory plus a
+  list of settings rather than one function doing both.
+- **`terrain_3d_data.cpp` is three files.** At 2263 lines it held three unrelated jobs:
+  the slot allocator, region maps and every data query; the on-disk path (region files,
+  map export, map import, `layered_to_image` and the `_save_export_image` helper); and the
+  resampler that turns a region's R16 payload into VT pages. The on-disk path is now
+  `terrain_3d_data_io.cpp` (571 lines) and the payload resampler
+  `terrain_3d_data_surface.cpp` (260 lines), leaving 1475 lines of storage, lifecycle,
+  painting and queries in `terrain_3d_data.cpp`, each of the three headed by a comment that
+  names the other two. Definitions were counted across the three files before and after the
+  move: 68 before, 67 after, the one difference being the `produce_surface_pages` duplicate
+  deleted earlier in this pass, and no definition appears twice.
+- **`terrain_3d_material.cpp` is two files.** The first 520 lines were the GLSL pipeline --
+  loading the shader inserts (including the `shaders/*.glsl` files behind `DEBUG_ENABLED`),
+  insert selection and exclusion, debug/editor code injection, comment stripping and the
+  decision whether the generated shader needs VT samplers -- and the rest was the material
+  resource: uniforms, noise/gradient textures, ~70 property setters, save and bindings. The
+  pipeline is now `terrain_3d_material_shader.cpp` (546 lines) and the resource
+  `terrain_3d_material.cpp` (1132), each headed by a comment naming the other. The 67
+  definitions were counted before and after: identical sets, none duplicated.
+- **Verification infrastructure.** `native/tests/run_all.py` runs every runner in one
+  command, prints one `PASS`/`FAIL` line per test with its failing markers, cleans up the
+  fixtures it creates (537 leaked ones, about 13 GB, were also reclaimed) and can write a
+  JSON result; `native/tests/compare_runs.py` diffs two of those results and flags only the
+  tests whose status changed. That diff is how the pass was verified: every intermediate
+  run was compared against the pre-change baseline, and the last two report
+  `29/29 unchanged` (`bin/terrain-after14.json`, the VT-state extraction as landed) and
+  `28/29` (`bin/terrain-after15.json`, after the field-name cleanup). `vt_pressure` is the
+  known flake: it asserts `settings.shared_pool` and flips status on the unmodified binary
+  too (pass in after9, fail in after10, pass in after15).
+- **What was left alone, and why.** The legacy AVT selection modes and the GPU feedback
+  pass look like delete candidates from the inside, but they are the tested contract:
+  ten test scripts set `surface_vt_selection_mode` (0 visible-terrain, 1 target grid,
+  2 sector AVT) and four drive `surface_vt_feedback_enabled`, among them tests that are
+  green in the baseline. They are diagnostic and compatibility surface, not dead code, so
+  deleting them would break the regression suite and the "existing behaviour stays
+  working" requirement of this pass. `tools/region_mover.gd` is likewise a manual utility
+  whose issues are recorded in the tool inventory above; its references were rechecked and
+  it has none, but removing a script a user may attach by hand is the owner's call, not
+  this pass's.
+

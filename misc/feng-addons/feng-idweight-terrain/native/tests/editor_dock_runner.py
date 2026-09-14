@@ -5,81 +5,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[5]
-ADDON_SOURCE = ROOT / "misc" / "feng-addons"
-TERRAIN_SOURCE = ADDON_SOURCE / "feng-idweight-terrain"
-
-
-def copy_terrain_addon(target: Path) -> None:
-    excluded_directories = {"native", ".godot"}
-    for source_path in TERRAIN_SOURCE.rglob("*"):
-        relative_path = source_path.relative_to(TERRAIN_SOURCE)
-        if any(part in excluded_directories for part in relative_path.parts):
-            continue
-        if source_path.name.startswith("~"):
-            continue
-        target_path = target / relative_path
-        if source_path.is_dir():
-            target_path.mkdir(parents=True, exist_ok=True)
-        else:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, target_path)
-
-
-def write_fixture(fixture: Path, test: str = "dock") -> None:
-    addons = fixture / "addons"
-    addons.mkdir(parents=True)
-    copy_terrain_addon(addons / "feng-idweight-terrain")
-
-    # feng_addons.cpp links every source addon that is absent. Keep ordinary
-    # placeholder directories for the other source addons so this test never
-    # shares a junction with a concurrently running editor or its temp DLL.
-    for source in sorted(ADDON_SOURCE.iterdir()):
-        if source.name == "feng-idweight-terrain" or not (source / "plugin.cfg").is_file():
-            continue
-        placeholder = addons / source.name
-        placeholder.mkdir()
-        (placeholder / ".gdignore").write_text("", encoding="utf-8")
-
-    test_addon = addons / "editor-dock-test"
-    test_addon.mkdir()
-    shutil.copy2(Path(__file__).with_name(f"editor_{test}.gd"), test_addon / "editor_dock.gd")
-    (test_addon / "plugin.cfg").write_text(
-        "[plugin]\n"
-        "name=\"Editor dock regression\"\n"
-        "script=\"editor_dock.gd\"\n",
-        encoding="utf-8",
-    )
-    (fixture / "project.godot").write_text(
-        "; Engine configuration file.\n"
-        "config_version=5\n\n"
-        "[application]\n"
-        "config/name=\"Terrain editor dock test\"\n"
-        "config/features=PackedStringArray(\"4.7\")\n\n"
-        "[editor_plugins]\n"
-        "enabled=PackedStringArray(\"res://addons/feng-idweight-terrain/plugin.cfg\", "
-        "\"res://addons/editor-dock-test/plugin.cfg\")\n",
-        encoding="utf-8",
-    )
-
-    if test in {"input", "vt_idle"}:
-        project = fixture / "project.godot"
-        # The input fixture extends the production plugin itself.
-        project.write_text(project.read_text(encoding="utf-8").replace(
-            '"res://addons/feng-idweight-terrain/plugin.cfg", ', ''), encoding="utf-8")
-
-    if test in {"setup", "grid", "vt_idle"}:
-        (fixture / "render").mkdir()
-        (fixture / "render/test.tscn").write_text(
-            '[gd_scene format=3]\n\n[node name="TerrainSetup" type="Node3D"]\n'
-            '[node name="Terrain3D" type="Terrain3D" parent="."]\n', encoding="utf-8")
+# The fixture and the two-phase invocation live in fixture.py, shared with every
+# script runner. This file owns the graphical-editor tests only.
+from fixture import ROOT, write_fixture
 
 
 def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:

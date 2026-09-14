@@ -265,14 +265,26 @@ Tests: the far-chunk phase of `native/tests/region_slots.gd` places a region at 
 
 ### 4.4 VT addressing core — implemented now
 
-`native/src/terrain_vt.h` is a dependency-free port of the addressing contract:
-constants, `AddressProfile` + both descriptor tables, `PackPageId`/`UnpackPageId`,
-`TryResolveAvtPageAddress`, the indirection mip-chain walk, LRU keys, sector LOD selection,
-physical-page UV / world rect, `VirtualImageAtlas` (the POT quadtree allocator with AVT
-low-coordinate-first and SVT high-coordinate-first), and feedback sizing + the 8×8 Bayer
-dither.
+`native/src/terrain_vt.h` is a dependency-free port of the addressing contract. It was
+originally a near-complete port of Hydra's constant and descriptor tables; the parts
+production never used — the `AddressProfile` descriptor tables and their
+`TexelDensityPreset` selection, the `PackPageId`/`UnpackPageId`/`TryResolveAvtPageAddress`
+helpers, the LRU key encoding, the physical-page UV/world-rect math and the feedback
+sizing/Bayer dither — have been deleted. What is left is what the runtime actually calls:
 
-Tests: `native/tests/vt/terrain_vt_contract_test.cpp` (`scons` in that directory).
+* the indirection payload constants (`SLOT_MASK`, `INVALID_PHYSICAL_PAGE_SLOT`) and the
+  power-of-two rule (`AddressProfile::is_power_of_two`);
+* `PageId`, the local page coordinate + local mip + descriptor slot tuple;
+* `try_match_indirection_slot`, the indirection mip-chain walk;
+* `VirtualImageKind` / `VirtualImageOwner` / `ImageInfo` and `VirtualImageAtlas`, the POT
+  quadtree allocator over the indirection page space.
+
+The allocator only ever allocates AVT blocks in low coordinates: SVT addresses a fixed
+world grid and never asks for a block, so the high-coordinate-first allocation order and
+its traversal branch are gone too.
+
+Tests: `native/tests/vt/terrain_vt_contract_test.cpp` (`scons` in that directory) covers the
+mip-chain walk, POT allocation/non-overlap/resize-rollback and the full 65,536-leaf atlas.
 
 ### 4.5 VT runtime skeleton — implemented now
 

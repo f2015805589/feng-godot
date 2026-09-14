@@ -21,16 +21,16 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	auto avt_interior = [&](const Rect2 &rect) {
 		Vector2 farthest(MAX(Math::abs(rect.position.x - focus.x), Math::abs(rect.get_end().x - focus.x)),
 				MAX(Math::abs(rect.position.y - focus.y), Math::abs(rect.get_end().y - focus.y)));
-		return _surface_vt_enabled && is_sector_avt() && farthest.length() < MAX(64.f, float(_surface_vt_distance)) * 0.75f;
+		return _vt.surface_vt_enabled && is_sector_avt() && farthest.length() < MAX(64.f, float(_vt.surface_vt_distance)) * 0.75f;
 	};
 	const float region_world = _region_size * _vertex_spacing;
-	const float page_world = MAX(0.001f, _surface_svt_page_world);
+	const float page_world = MAX(0.001f, _vt.surface_svt_page_world);
 	for (const Vector2i &location : _data->get_region_locations()) {
 		Ref<Terrain3DRegion> region = _data->get_region(location);
 		if (region.is_null() || region->is_deleted()) { continue; }
 		// Legacy region AVT owns whole regions; sector AVT excludes only the
 		// metric near interior during footprint traversal below.
-		if (_surface_vt_enabled && !is_sector_avt() && _vt_registered_sectors.has(location)) { continue; }
+		if (_vt.surface_vt_enabled && !is_sector_avt() && _vt.vt_registered_sectors.has(location)) { continue; }
 		Rect2 rect(Vector2(location) * region_world, Vector2(region_world, region_world));
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
@@ -44,8 +44,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// and a page has to stay inside the table it is published in. That is the absolute
 	// level limit for this frame; the effective limit is raised below to whatever the
 	// detail and coverage sets actually use.
-	const int configured_mip = _surface_svt->get_world_max_mip();
-	const int coverage_limit = MAX(0, TerrainVT::log2_power_of_two(_surface_svt->get_indirection_size()) - 1);
+	const int configured_mip = _vt.surface_svt->get_world_max_mip();
+	const int coverage_limit = MAX(0, TerrainVT::log2_power_of_two(_vt.surface_svt->get_indirection_size()) - 1);
 	// Levels are planned against the absolute limit, not against the currently published
 	// one, so a raise never has to be recomputed: the plan states the levels this frame
 	// wants and the raise below publishes exactly those.
@@ -56,8 +56,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// A high SVT texel density must not be silently capped to 16 pages/region.
 	// Bound pathological traversal without replacing requested levels with ancestors.
 	int walk_visited = 0;
-	const int visit_limit = MAX(4096, _surface_svt->get_page_count() * 128);
-	const float half_world = _surface_svt->get_indirection_size() * page_world * 0.5f;
+	const int visit_limit = MAX(4096, _vt.surface_svt->get_page_count() * 128);
+	const float half_world = _vt.surface_svt->get_indirection_size() * page_world * 0.5f;
 	const Rect2 domain(Vector2(-half_world, -half_world), Vector2(half_world * 2.f, half_world * 2.f));
 	for (const Region &region : regions) {
 		if (!region.rect.intersects(domain)) { continue; }
@@ -100,13 +100,13 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
 	});
 
-	if (_ensure_vt_capacity(int(pages.size()) + (_surface_vt_enabled ? int(_avt_page_plan.size()) : 0))) { return 0; }
+	if (_ensure_vt_capacity(int(pages.size()) + (_vt.surface_vt_enabled ? int(_vt.avt_page_plan.size()) : 0))) { return 0; }
 
 	// The physical pool is shared with the near field, so the far field only claims what
 	// the near field is not holding.
-	const int physical_page_count = MAX(1, _surface_svt->get_page_count());
-	_vt_svt_visible_pages = int(pages.size());
-	const int near_reserve = _surface_vt_enabled ? MIN(physical_page_count / 2, int(_avt_page_plan.size())) : 0;
+	const int physical_page_count = MAX(1, _vt.surface_svt->get_page_count());
+	_vt.vt_svt_visible_pages = int(pages.size());
+	const int near_reserve = _vt.surface_vt_enabled ? MIN(physical_page_count / 2, int(_vt.avt_page_plan.size())) : 0;
 	const int capacity = MAX(1, physical_page_count - near_reserve);
 	// Preserve the shader's selected level. Coarsening only the CPU request
 	// produces a permanently missing page when strict residency is enabled.
@@ -116,7 +116,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// never lowered, so a view that already extended the hierarchy keeps it.
 	int used_mip = configured_mip;
 	for (const Page &page : chosen) { used_mip = MAX(used_mip, page.mip); }
-	if (!regions.empty() && _surface_svt_mip_distances.is_empty()) {
+	if (!regions.empty() && _vt.surface_svt_mip_distances.is_empty()) {
 		// With the automatic rule a saved cap must not hide terrain the view can see, so
 		// the hierarchy extends to the level the farthest visible point selects. The
 		// raise is a function of the visible set rather than of pool pressure, and it
@@ -125,9 +125,9 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	}
 	const int maximum_mip = MIN(used_mip, plan_limit);
 	if (maximum_mip != configured_mip) {
-		_surface_svt->set_world_max_mip(maximum_mip);
-		for (const Vector2i &location : _data->get_region_locations()) { _vt_svt_dirty_regions[location] = true; }
-		_vt_svt_edit_time = 0;
+		_vt.surface_svt->set_world_max_mip(maximum_mip);
+		for (const Vector2i &location : _data->get_region_locations()) { _vt.vt_svt_dirty_regions[location] = true; }
+		_vt.vt_svt_edit_time = 0;
 		if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 	}
 
@@ -137,21 +137,21 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		if (visited >= capacity) { break; }
 		visited++;
 		bool miss = false;
-		const int slot = _surface_svt->request_world_page_internal(request.address.x, request.address.y, request.mip, &miss);
+		const int slot = _vt.surface_svt->request_world_page_internal(request.address.x, request.address.y, request.mip, &miss);
 		if (slot < 0) { continue; }
 		if (!miss) { continue; }
 		_invalidate_vt_slot(slot);
 		// Both disk reads and source-ID construction belong to the source worker.
 		Ref<Image> payload;
-		const float span = _surface_svt_page_world * float(1 << request.mip);
-		_queue_vt_material_page(slot, payload, Rect2(Vector2(request.address) * _surface_svt_page_world, Vector2(span, span)),
+		const float span = _vt.surface_svt_page_world * float(1 << request.mip);
+		_queue_vt_material_page(slot, payload, Rect2(Vector2(request.address) * _vt.surface_svt_page_world, Vector2(span, span)),
 				true, request.mip, request.address);
 		produced++;
 		// The allocator enforces the production budget. Keep visiting the rest of the
 		// working set so resident pages remain protected this frame.
 	}
-	_surface_svt->commit();
-	if (_surface_vt && _surface_vt->is_initialized()) { _surface_vt->commit(); }
-	_surface_svt->set_allocation_budget(-1);
+	_vt.surface_svt->commit();
+	if (_vt.surface_vt && _vt.surface_vt->is_initialized()) { _vt.surface_vt->commit(); }
+	_vt.surface_svt->set_allocation_budget(-1);
 	return produced;
 }

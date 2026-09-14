@@ -45,5 +45,15 @@ public:
 	void queue_layer(RID p_atlas, int p_slot, const Ref<Image> &p_image);
 	bool has_pending_layers() const { return _layers_pending.load(std::memory_order_relaxed); }
 	bool needs_retry() const { return _retry_needed.load(std::memory_order_relaxed); }
+	// True while an upload still has to reach the render thread: it was submitted and
+	// not consumed, or it failed and its patches are waiting for the next submit. The
+	// editor polls this to keep drawing frames, because a queued render-thread callable
+	// only runs while frames are drawn. Deliberately false once a failed upload has no
+	// patches left, so a permanently broken upload cannot spin the editor.
+	bool has_pending_upload() const {
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _queued || _layers_pending.load(std::memory_order_relaxed) ||
+				(_retry_needed.load(std::memory_order_relaxed) && !_pending.empty());
+	}
 	RID get_rid() const;
 };

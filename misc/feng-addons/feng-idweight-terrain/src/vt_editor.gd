@@ -1,7 +1,15 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+
+
 # Surface VT editor. The editor intentionally keeps all expensive work behind
+
+
 # explicit buttons: page previews are GPU readbacks only when requested, and the
+
+
 # world thumbnail is stitched only when Refresh overview is pressed.
+
+
 @tool
 extends Window
 class_name TerrainVTEditor
@@ -115,8 +123,14 @@ func open_for_terrain(p_terrain: Object) -> void:
 
 
 ## Entry point used by the Terrain3D Inspector's VT Page foldout. Selecting
+
+
 ## the hierarchy row keeps the window useful even when no baked pages exist;
+
+
 ## the overview then shows the explicit height fallback or stitched SVT data.
+
+
 func open_vt_page_view() -> void:
 	if not _built:
 		_build_ui()
@@ -692,8 +706,14 @@ func _refresh_settings_controls() -> void:
 
 
 # One spin box per world mip level: the furthest camera distance still sampled at that
+
+
 # level. Both the page producer and the shader resolve a level through this table, so a
+
+
 # value here is where the level boundary sits for the whole far field, not a hint.
+
+
 func _refresh_svt_bands() -> void:
 	if svt_band_grid == null or terrain == null or not is_instance_valid(terrain):
 		return
@@ -1255,152 +1275,39 @@ func _refresh_overview() -> void:
 
 
 func _overview_material_pages(p_pages: Array) -> Array:
-	if p_pages.is_empty():
-		return []
-	var selected_mip := _selected_baked_mip
-	var result: Array = []
-	for record in p_pages:
-		if typeof(record) == TYPE_DICTIONARY and int(record.get("mip", 0)) == selected_mip and _is_valid_image(record.get("preview", null)):
-			result.append(record)
-	return result
+	return TerrainVTOverviewImage.material_pages(p_pages, _selected_baked_mip)
 
 
 func _make_height_thumbnail(p_bounds: Rect2, p_size: Vector2i) -> Image:
-	var image := Image.create(p_size.x, p_size.y, false, Image.FORMAT_RGBA8)
-	image.fill(Color("202a31"))
-	# Read each region's CPU height image once and downsample it in memory. The
-	# previous implementation called Terrain3DData.get_height() for every
-	# thumbnail pixel, which made an explicit 768px overview issue hundreds of
-	# thousands of native calls. Sampling is capped at 128x128 per region and the
-	# small image is then enlarged into the stitched overview.
-	var locations := _region_locations(_data)
-	var region_world := _region_world_size()
 	var global_range: Vector2 = _call(_data, "get_height_range")
-	for location in locations:
-		var region := _call(_data, "get_region", [location])
-		var height_image = _call(region, "get_height_map")
-		if not _is_valid_image(height_image):
-			continue
-		var world_rect := _region_rect_world(location, region_world)
-		var dst_position := _world_to_image(world_rect.position, p_bounds, p_size)
-		var dst_end := _world_to_image(world_rect.end, p_bounds, p_size)
-		var dst_size := Vector2i(max(1, dst_end.x - dst_position.x), max(1, dst_end.y - dst_position.y))
-		var sample_size := mini(128, maxi(8, maxi(dst_size.x, dst_size.y)))
-		var sample := Image.create(sample_size, sample_size, false, Image.FORMAT_RGBA8)
-		var region_range: Vector2 = _call(region, "get_height_range")
-		if region_range.y <= region_range.x:
-			region_range = global_range
-		var low := region_range.x
-		var span := maxf(region_range.y - region_range.x, 0.001)
-		for y in sample_size:
-			var source_y := mini(height_image.get_height() - 1, floori(float(y) * height_image.get_height() / sample_size))
-			for x in sample_size:
-				var source_x := mini(height_image.get_width() - 1, floori(float(x) * height_image.get_width() / sample_size))
-				var value: float = height_image.get_pixel(source_x, source_y).r
-				var normalized := clampf((value - low) / span, 0.0, 1.0)
-				sample.set_pixel(x, y, Color(normalized * 0.65 + 0.12, normalized * 0.8 + 0.12, normalized * 0.95 + 0.12, 1.0))
-		sample.resize(dst_size.x, dst_size.y, Image.INTERPOLATE_BILINEAR)
-		image.blit_rect(sample, Rect2i(Vector2i.ZERO, sample.get_size()), dst_position)
-	return image
+	return TerrainVTOverviewImage.height_thumbnail(p_bounds, p_size, _region_locations(_data),
+			_region_world_size(), global_range,
+			func(p_location: Vector2i) -> Object: return _call(_data, "get_region", [p_location]))
 
 
 func _blit_material_preview(p_image: Image, p_record: Dictionary, p_bounds: Rect2) -> void:
-	var preview = p_record.get("preview", null)
-	if not _is_valid_image(preview):
-		return
-	var tile: Image = preview.duplicate()
-	var border := int(p_record.get("border", _vt_settings().get("border", 4)))
-	var crop := Rect2i(border, border, tile.get_width() - 2 * border, tile.get_height() - 2 * border)
-	if crop.size.x > 0 and crop.size.y > 0:
-		tile = tile.get_region(crop)
-	var rect: Rect2 = p_record.get("world_rect", Rect2())
-	if not rect.has_area() or not p_bounds.has_area():
-		return
-	# A coarse SVT tile can cover more world space than the loaded terrain. Clip
-	# in world coordinates before resizing so an enormous page never allocates a
-	# giant intermediate image and only the visible source UVs are copied.
-	var visible_rect := rect.intersection(p_bounds)
-	if not visible_rect.has_area():
-		return
-	var source_uv := Rect2(
-		(visible_rect.position - rect.position) / rect.size,
-		visible_rect.size / rect.size)
-	var source_rect := Rect2i(
-		floori(source_uv.position.x * tile.get_width()),
-		floori(source_uv.position.y * tile.get_height()),
-		ceili(source_uv.size.x * tile.get_width()),
-		ceili(source_uv.size.y * tile.get_height()))
-	source_rect = source_rect.intersection(Rect2i(Vector2i.ZERO, tile.get_size()))
-	if source_rect.size.x <= 0 or source_rect.size.y <= 0:
-		return
-	tile = tile.get_region(source_rect)
-	var position := _world_to_image(visible_rect.position, p_bounds, p_image.get_size())
-	var end := _world_to_image(visible_rect.end, p_bounds, p_image.get_size())
-	var size := Vector2i(max(1, end.x - position.x), max(1, end.y - position.y))
-	# Resize before colour conversion so a large baked page never incurs a full
-	# native-resolution per-pixel display pass in the editor.
-	tile.resize(size.x, size.y, Image.INTERPOLATE_BILINEAR)
-	if tile.get_format() != Image.FORMAT_RGBA8:
-		tile.convert(Image.FORMAT_RGBA8)
-	# Baker previews carry height in alpha, not opacity, and GPU output is in
-	# linear RGB. Work on this duplicate only: the serialized channel image must
-	# remain untouched for later page inspection/export.
-	for y in tile.get_height():
-		for x in tile.get_width():
-			var color := tile.get_pixel(x, y).linear_to_srgb()
-			color.a = 1.0
-			tile.set_pixel(x, y, color)
-	p_image.blit_rect(tile, Rect2i(Vector2i.ZERO, tile.get_size()), position)
+	var border := int(_vt_settings().get("border", 4))
+	TerrainVTOverviewImage.blit_material_preview(p_image, p_record, p_bounds, border)
 
 
 func _display_preview_texture(p_value: Variant) -> Texture2D:
-	if not _is_valid_image(p_value):
-		return null
-	var image: Image = p_value.duplicate()
-	# Keep the inspector responsive when a full page is larger than the preview
-	# panel. The baked image's alpha stores height, so it must be made opaque for
-	# display; its RGB values are linear GPU output and need sRGB conversion.
-	var edge := 512
-	var longest := maxi(image.get_width(), image.get_height())
-	if longest > edge:
-		var scale := float(edge) / longest
-		image.resize(maxi(1, roundi(image.get_width() * scale)), maxi(1, roundi(image.get_height() * scale)), Image.INTERPOLATE_BILINEAR)
-	if image.get_format() != Image.FORMAT_RGBA8:
-		image.convert(Image.FORMAT_RGBA8)
-	for y in image.get_height():
-		for x in image.get_width():
-			var color := image.get_pixel(x, y).linear_to_srgb()
-			color.a = 1.0
-			image.set_pixel(x, y, color)
-	return ImageTexture.create_from_image(image)
+	return TerrainVTOverviewImage.display_texture(p_value)
 
 
 func _overview_image_size(p_bounds: Rect2) -> Vector2i:
-	var longest := maxf(p_bounds.size.x, p_bounds.size.y)
-	var scale := float(OVERVIEW_EDGE) / maxf(longest, 1.0)
-	return Vector2i(max(1, roundi(p_bounds.size.x * scale)), max(1, roundi(p_bounds.size.y * scale)))
+	return TerrainVTOverviewImage.overview_size(p_bounds, OVERVIEW_EDGE)
 
 
 func _world_to_image(p_world: Vector2, p_bounds: Rect2, p_size: Vector2i) -> Vector2i:
-	var uv := (p_world - p_bounds.position) / Vector2(maxf(p_bounds.size.x, 0.001), maxf(p_bounds.size.y, 0.001))
-	return Vector2i(floori(uv.x * p_size.x), floori(uv.y * p_size.y))
+	return TerrainVTOverviewImage.world_to_image(p_world, p_bounds, p_size)
 
 
 func _region_world_bounds(p_locations: Array, p_region_world: Vector2) -> Rect2:
-	var result := Rect2()
-	var first := true
-	for location in p_locations:
-		var rect := _region_rect_world(location, p_region_world)
-		if first:
-			result = rect
-			first = false
-		else:
-			result = result.merge(rect)
-	return result
+	return TerrainVTOverviewImage.region_world_bounds(p_locations, p_region_world)
 
 
 func _region_rect_world(p_location: Vector2i, p_region_world: Vector2) -> Rect2:
-	return Rect2(Vector2(p_location) * p_region_world, p_region_world)
+	return TerrainVTOverviewImage.region_rect_world(p_location, p_region_world)
 
 
 func _region_world_size() -> Vector2:
@@ -1444,91 +1351,51 @@ func _on_close_requested() -> void:
 
 
 func _get_data(p_terrain: Object) -> Object:
-	var value := _call(p_terrain, "get_data")
-	return value as Object
+	return TerrainVTBridge.data_of(p_terrain)
 
 
 func _vt_settings() -> Dictionary:
-	var value := _call(terrain, "get_vt_settings")
-	return value if typeof(value) == TYPE_DICTIONARY else {}
+	return TerrainVTBridge.vt_settings(terrain)
 
 
 func _get_svt_auto_bake() -> bool:
-	if terrain == null or not is_instance_valid(terrain):
-		return true
-	if _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY):
-		return bool(terrain.get(SVT_AUTO_BAKE_PROPERTY))
-	var getter_value := _call(terrain, "is_svt_auto_bake")
-	return bool(getter_value) if getter_value != null else true
+	return TerrainVTBridge.svt_auto_bake(terrain, SVT_AUTO_BAKE_PROPERTY)
 
 
 func _has_object_property(p_target: Object, p_property: StringName) -> bool:
-	if p_target == null or not is_instance_valid(p_target):
-		return false
-	for property_info: Dictionary in p_target.get_property_list():
-		if StringName(property_info.get("name", "")) == p_property:
-			return true
-	return false
+	return TerrainVTBridge.has_property(p_target, p_property)
 
 
 func _resident_pages(p_kind: String = "") -> Array:
-	var value := _call(terrain, "get_vt_pages")
-	var result: Array = []
-	if typeof(value) != TYPE_ARRAY:
-		return result
-	for record in value:
-		if typeof(record) != TYPE_DICTIONARY:
-			continue
-		if p_kind.is_empty() or _record_kind(record) == p_kind:
-			result.append(record)
-	return result
+	return TerrainVTBridge.resident_pages(terrain, p_kind)
 
 
 func _baked_pages() -> Array:
-	var value := _call(terrain, "get_svt_baked_pages")
-	return value if typeof(value) == TYPE_ARRAY else []
+	return TerrainVTBridge.baked_pages(terrain)
 
 
 func _record_kind(p_record: Dictionary) -> String:
-	var value = p_record.get("kind", "")
-	if typeof(value) == TYPE_STRING:
-		return str(value).to_upper()
-	if int(value) == 1:
-		return "SVT"
-	return "AVT"
+	return TerrainVTBridge.record_kind(p_record)
 
 
 func _view_stats(p_kind: String) -> Dictionary:
-	var method := "get_surface_vt" if p_kind == "AVT" else "get_surface_svt"
-	var view := _call(terrain, method)
-	var value := _call(view, "get_stats")
-	return value if typeof(value) == TYPE_DICTIONARY else {}
+	return TerrainVTBridge.view_stats(terrain, p_kind)
 
 
 func _stats_text(p_stats: Dictionary) -> String:
-	if p_stats.is_empty():
-		return "stats unavailable"
-	return "hits %d · misses %d · evictions %d · free %d" % [int(p_stats.get("hit_count", 0)), int(p_stats.get("miss_count", 0)), int(p_stats.get("evict_count", 0)), int(p_stats.get("free_count", 0))]
+	return TerrainVTBridge.stats_text(p_stats)
 
 
 func _region_locations(p_data: Object) -> Array:
-	var value := _call(p_data, "get_region_locations")
-	if typeof(value) != TYPE_ARRAY:
-		return []
-	var result: Array = []
-	for location in value:
-		result.append(Vector2i(location))
-	return result
+	return TerrainVTBridge.region_locations(p_data)
 
 
 func _is_valid_image(p_value: Variant) -> bool:
-	return p_value is Image and not p_value.is_empty() and p_value.get_width() > 0 and p_value.get_height() > 0
+	return TerrainVTBridge.is_valid_image(p_value)
 
 
 func _call(p_target: Object, p_method: StringName, p_args: Array = []) -> Variant:
-	if p_target == null or not is_instance_valid(p_target) or not p_target.has_method(p_method):
-		return null
-	return p_target.callv(p_method, p_args)
+	return TerrainVTBridge.call_method(p_target, p_method, p_args)
 
 
 func _refresh_cdlod_panel() -> void:

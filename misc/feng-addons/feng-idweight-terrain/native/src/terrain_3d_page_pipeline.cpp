@@ -1,5 +1,6 @@
 #include "terrain_3d_page_pipeline.h"
 #include "terrain_3d_vt_visibility.h"
+#include "terrain_vt_cell.h"
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
 #include <cmath>
@@ -329,28 +330,22 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
         if (!rect.intersects(footprint)) { continue; }
         auto cached_signature = _signatures.find(entry.first);
         if (cached_signature == _signatures.end()) {
-            Dictionary signature;
-            signature["materials"] = int64_t(request.materials);
-            signature["density"] = request.density;
-            signature["source_corner_interpolation"] = 1;
-            signature["spacing"] = source.spacing;
-            signature["region_size"] = source.region_size;
-            for (int y = -1; y <= 1; ++y) {
-                for (int x = -1; x <= 1; ++x) {
-                    auto neighbor = source.cells.find({location.x + x, location.y + y});
-                    if (neighbor == source.cells.end()) { continue; }
-                    const Cell &cell = neighbor->second;
-                    Array hashes;
-                    hashes.push_back(cell.controls.is_empty() ? 0 : Variant(cell.controls).hash());
-                    hashes.push_back(cell.ids.is_empty() ? 0 : Variant(cell.ids).hash());
-                    hashes.push_back(cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
-                    signature[Vector2i(x, y)] = hashes;
-                }
-            }
-            cached_signature = _signatures.emplace(entry.first, uint32_t(signature.hash())).first;
+            // The same signature the baker wrote; see terrain_vt_cell.h.
+            const uint32_t hash = TerrainVTCell::signature(int64_t(request.materials), request.density,
+                    source.spacing, source.region_size, [&](int x, int y) {
+                        auto neighbor = source.cells.find({location.x + x, location.y + y});
+                        if (neighbor == source.cells.end()) { return Array(); }
+                        const Cell &cell = neighbor->second;
+                        Array hashes;
+                        hashes.push_back(cell.controls.is_empty() ? 0 : Variant(cell.controls).hash());
+                        hashes.push_back(cell.ids.is_empty() ? 0 : Variant(cell.ids).hash());
+                        hashes.push_back(cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
+                        return hashes;
+                    });
+            cached_signature = _signatures.emplace(entry.first, hash).first;
         }
         const uint32_t hash = cached_signature->second;
-        const String path = request.directory.path_join("svt_cells").path_join(String::num_int64(location.x) + String("_") + String::num_int64(location.y) + String("_0.vtcell"));
+        const String path = TerrainVTCell::path(request.directory, location, 0);
         const String cache_key = path + String(":") + String::num_int64(hash) + String(":") + String::num_int64(requested_mip);
         Dictionary channels;
         if (_cell_cache.has(cache_key)) { channels = _cell_cache[cache_key]; }
@@ -362,7 +357,7 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
             const Dictionary saved = header;
             const int resolution = saved.get("resolution", 0), levels = saved.get("levels", 0);
             const PackedInt64Array index = saved.get("index", PackedInt64Array());
-            if (int(saved.get("version", 0)) != 3 || uint32_t(int64_t(saved.get("signature", 0))) != hash || resolution < 1 || resolution > 8192 || levels < 1 || levels > 14 || index.size() != levels * 6) { result.missing.push_back(location); continue; }
+            if (int(saved.get("version", 0)) != TerrainVTCell::FORMAT_VERSION || uint32_t(int64_t(saved.get("signature", 0))) != hash || resolution < 1 || resolution > 8192 || levels < 1 || levels > 14 || index.size() != levels * 6) { result.missing.push_back(location); continue; }
             const int mip = MIN(requested_mip, levels - 1), size = MAX(1, resolution >> mip);
             const String names[] = {"albedo_height", "normal_roughness", "params"};
             bool valid = true;

@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from editor_dock_runner import ROOT, write_fixture
+from fixture import ROOT, write_fixture
 
 
 def main() -> int:

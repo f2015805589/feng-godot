@@ -27,6 +27,8 @@ struct VisibleView {
 	Vector3 forward, right, up;
 	float focal = 1.f;
 	bool orthographic = false;
+	// A view can also be built later, e.g. as a member of a plan input struct.
+	VisibleView() = default;
 	explicit VisibleView(Camera3D *camera, float guard_pixels = 0.f) {
 		const Transform3D camera_transform = camera->get_camera_transform();
 		const auto frustum = camera->get_camera_projection().get_projection_planes(camera_transform);

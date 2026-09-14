@@ -15,6 +15,7 @@
 
 #include "constants.h"
 #include "target_node_3d.h"
+#include "terrain_3d_avt.h"
 #include "terrain_3d_assets.h"
 #include "terrain_3d_collision.h"
 #include "terrain_3d_data.h"
@@ -25,6 +26,8 @@
 #include "terrain_3d_streamer.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_3d_vt_feedback.h"
+#include "terrain_3d_vt_visibility.h"
+#include "terrain_3d_vt_state.h"
 #include "terrain_3d_page_pipeline.h"
 
 class Terrain3D : public Node3D {
@@ -72,164 +75,38 @@ private:
 	Terrain3DStreamer *_streamer = nullptr;
 	bool _streaming_enabled = false;
 
-	// One surface service owns the settings and GPU material cache. AVT and SVT
-	// below are addressing/producer views over its shared physical residency pool.
-	int _vt_page_size = 256;
-	int _vt_page_border = 4;
-	int _vt_page_count = 256;
-	bool _vt_auto_capacity = true;
+	// Virtual texture state: the shared service, the near-field AVT and the far-field
+	// SVT in one struct, so the node's own fields stay readable. See
+	// terrain_3d_vt_state.h for the field groups.
+	Terrain3DVTState _vt;
+
+
 	bool _ensure_vt_capacity(int p_required);
-	int _vt_pages_per_update = 16;
-	bool _vt_adaptive_enabled = true;
-	bool _surface_vt_coarse_mip_fallback = false;
-	bool _vt_debug_direct_material = false;
-	bool _vt_editor_preview = true;
-	Dictionary _vt_editor_dirty_regions;
-	uint64_t _vt_service_frame = UINT64_MAX;
-	bool _vt_shared_ready = false;
-	bool _vt_materials_dirty = true;
-	bool _vt_callback_registered = false;
-	Ref<RefCounted> _vt_baker;
-	std::unique_ptr<Terrain3DPagePipeline> _vt_page_pipeline, _svt_page_pipeline;
-	std::map<int, Terrain3DPagePipeline::Request> _svt_pending_pages;
 	void _process_async_svt_pages();
-	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> _vt_source_snapshot;
-	Dictionary _vt_page_records;
-	Dictionary _vt_registered_sectors;
-	PackedFloat32Array _surface_vt_block_sizes;
-	RID _vt_bound_albedo;
-	uint64_t _vt_source_revision = 1;
-	Dictionary _vt_svt_tiles;
-	Ref<RefCounted> _svt_cell_baker;
-	Dictionary _svt_cell_job;
-	uint64_t _svt_cells_baked = 0;
 	uint32_t _svt_cell_signature(const Vector2i &p_cell) const;
 	Dictionary _load_svt_cell(const Vector2i &p_cell);
-	bool _svt_auto_bake = true;
-	Dictionary _vt_svt_dirty_regions;
-	uint64_t _vt_svt_edit_time = 0;
-	bool _vt_svt_bake_incremental = false;
-	uint64_t _vt_svt_bake_generation = 0;
-	Array _vt_svt_bake_queue;
-	Dictionary _vt_svt_bake_waiting;
-	int _vt_svt_bake_total = 0;
-	int _vt_svt_bake_done = 0;
-	uint32_t _vt_material_signature = 0;
-	bool _vt_svt_catalog_loaded = false;
-	bool _vt_offline_producing = false;
-	int _vt_svt_bake_failed = 0;
-	String _vt_svt_bake_error;
-
-	// Surface virtual texture: the near field's surface pages, produced from the
-	// region surface maps. Off by default; the array path stays authoritative until
-	// the source data carries more detail than the array can afford to keep resident.
-	Terrain3DVirtualTexture *_surface_vt = nullptr;
-	bool _surface_vt_enabled = true;
-	// The near field's working set is roughly 50 pages at density 4 (a 512 m radius
-	// with the distance rule), so 64 left no headroom for the LRU.
-	int _surface_vt_page_count = 128;
-	int _surface_vt_page_size = 256;
-	int _surface_vt_page_border = 4;
-	int _surface_vt_pages_per_axis = 4;
-	real_t _surface_vt_distance = 512.f;
-	Vector2i _surface_vt_region_grid = Vector2i(2, 2);
-	int _surface_vt_selection_mode = 2;
-	Ref<ImageTexture> _avt_sector_directory;
-	PackedByteArray _avt_directory_bytes;
-	int _avt_directory_mask = 0;
-	int _avt_root_level = 1;
-	Dictionary _avt_sector_stats;
-	struct AVTPageRequest { Vector2i owner; int mip, x, y; Rect2 rect; uint64_t last_visible_plan = 0; };
-	uint64_t _avt_plan_epoch = 0;
-	float _avt_plan_logical_ratio = 0.f;
-	struct AVTRefinement {
-		std::atomic<bool> ready{false};
-		PackedByteArray key;
-		std::vector<AVTPageRequest> pages, warm;
-		float finest = 0.f;
-		int denied = 0, roots = 0;
-		uint64_t submitted_us = 0, elapsed_us = 0;
-	};
-	std::shared_ptr<AVTRefinement> _avt_refinement;
-	std::vector<AVTPageRequest> _avt_page_plan;
-	std::vector<AVTPageRequest> _avt_prefetch_plan;
-	PackedByteArray _avt_plan_key;
-	uint64_t _avt_idle_revision = 0;
-	std::vector<int> _avt_resident_slots;
-	size_t _avt_prefetch_cursor = 0;
-	bool _avt_prefetch_cycle_pending = false;
-	std::vector<Vector2i> _avt_registered_owners;
-	std::unordered_map<uint64_t, int> _avt_allocated_sizes;
-	struct AVTCachedAddress { Vector2i location; Vector2i owner; int level; };
-	std::unordered_map<uint64_t, AVTCachedAddress> _avt_cached_addresses;
-	int _produce_sector_avt_pages(int p_max_pages);
 	int _update_sector_avt(int p_max_pages);
-	mutable bool _vt_view_focus_valid = false;
-	mutable Vector2i _vt_view_focus;
-	Vector2i _surface_vt_region_offset;
-	real_t _surface_vt_forward_regions = 0.f;
-	real_t _surface_vt_texels_per_pixel = 1.f;
-	real_t _surface_vt_texels_per_meter = 1024.f;
-	PackedFloat32Array _surface_vt_mip_distances; // Legacy serialized array.
-	bool _surface_vt_distance_mips = false;
-	Vector3 _surface_vt_mip_ranges = Vector3(8, 16, 32);
-	bool _surface_vt_force_mip = false;
-	int _surface_vt_mip = 0;
-	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
-	// the chunk directory returns, so the shader needs no separate sector lookup.
-	PackedVector2Array _surface_vt_blocks;
-	bool _surface_vt_blocks_dirty = false;
-	// GPU page demand. When enabled it replaces the distance rule: the compute pass
-	// knows the field of view, the resolution and the view direction, and it culls.
-	Terrain3DVTFeedback *_surface_vt_feedback = nullptr;
-	bool _surface_vt_feedback_enabled = false;
-	int _surface_vt_feedback_interval = 4;
-	int _surface_vt_feedback_tick = 0;
-	int _surface_vt_feedback_grid_chunks = 8;
-	// A page whose screen extent falls below this is not requested at all: it would
-	// be a sub-pixel speck in the atlas.
-	real_t _surface_vt_feedback_min_extent = 8.f;
-	Vector2i _surface_vt_feedback_origin;
-
-	// Far field (sparse virtual texture). A world-space page grid at a coarser texel
-	// density, so the surface channel does not have to keep every region's payload
-	// resident: a page spans several regions and its mip chain is world-space, which is
-	// what the region-aligned near field above cannot express. Off by default; the
-	// region texture array still serves whenever no page covers a texel.
-	Terrain3DVirtualTexture *_surface_svt = nullptr;
-	bool _surface_svt_enabled = true;
-	// One mip 0 page covers this many metres.
-	real_t _surface_svt_page_world = 256.f;
-	int _surface_svt_page_size = 256;
-	int _surface_svt_page_border = 4;
-	int _surface_svt_page_count = 256;
-	// -1 means auto: the coarsest level the world grid can publish.
-	int _surface_svt_max_mip = -1;
-	// How far from the clipmap target the far field is kept resident, in metres.
-	real_t _surface_svt_distance = 6144.f;
-	// Coarsest levels of the world grid that are always resident. This root pyramid is
-	// what lets the shader resolve any world position without the region texture array,
-	// so it is the far field's fallback rather than a separate fallback page.
-	int _surface_svt_root_mips = 2;
-	int _vt_svt_visible_pages = 0;
-	// Distance -> level table for the far field, in metres. Entry m is the largest
-	// camera distance at which world mip m is sampled, so the table states the level
-	// bands explicitly instead of deriving them from the page size. Empty keeps the
-	// automatic rule (one level per doubling of _surface_svt_page_world).
-	//
-	// Both the page producer and the shader resolve a level through this one table, so
-	// a page is always produced at exactly the level the shader samples, and the
-	// rendered level is a pure function of distance: it cannot change when the working
-	// set, the pool pressure or the visible region set changes underneath it.
-	PackedFloat32Array _surface_svt_mip_distances;
-	Vector3i _surface_svt_scan_key = Vector3i(INT32_MAX, INT32_MAX, INT32_MAX);
-	int64_t _surface_svt_root_cursor = 0;
-	int64_t _surface_svt_detail_cursor = 0;
-	// Whether the surface channel is uploaded to the region texture array. Off means
-	// the virtual textures serve every surface read, which is what removes the
-	// density-squared array cost; the array stays allocated but blank.
-	bool _surface_array_enabled = true;
-
+	int _produce_sector_avt_pages(int p_max_pages);
+	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
+	// struct in terrain_3d_avt.h for what each stage owns.
+	void _avt_classify_plan(Terrain3DAVTProducePass &r_pass);
+	void _avt_retain_visible(const Terrain3DAVTProducePass &p_pass);
+	Terrain3DPagePipeline::Request _avt_page_request(const Terrain3DAVTPageRequest &p_page) const;
+	bool _avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page, bool p_prefetch = false);
+	void _avt_prime_sources(const Terrain3DAVTProducePass &p_pass);
+	void _avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_pages);
+	void _avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max_pages);
+	void _avt_finish_produce(Terrain3DAVTProducePass &r_pass);
+	PackedByteArray _avt_plan_state(bool p_bounds_ready) const;
+	int _avt_install_or_reuse_plan(uint64_t p_started, int p_max_pages, bool p_same_plan);
+	Terrain3DAVTSectorScan _avt_scan_sectors(const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position,
+			bool p_bounds_ready, const Vector2 &p_focus, float p_reach) const;
+	Terrain3DAVTHierarchy _avt_build_hierarchy(const Terrain3DAVTSectorScan &p_scan);
+	void _avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, const Vector2 &p_focus, float p_reach);
+	void _avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const PackedByteArray &p_plan_key,
+			const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position, bool p_bounds_ready,
+			const Vector2 &p_focus, float p_reach);
+	bool _avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy, bool p_directory_dirty);
 	// Regions
 	RegionSize _region_size = SIZE_512;
 	// Stored surface resolution, in texels per region texel. 1 keeps the region
@@ -308,7 +185,15 @@ private:
 	void _destroy_streamer();
 
 	void _setup_surface_vt();
+	// Applies one view's configuration apart from its physical pool: page
+	// dimensions, format and the mode-specific addressing. Shared by the initial
+	// setup and the shared-pool rebuild so neither depends on stored state.
+	void _configure_surface_view(Terrain3DVirtualTexture *p_view, bool p_world_space);
 	void _update_vt_service();
+	// True while any view still owes the render thread a page-table upload. Used by
+	// the editor's own redraw request, since render-thread work only progresses
+	// while frames are drawn.
+	bool _vt_has_pending_upload() const;
 	void _destroy_vt_service();
 	void _configure_vt_service();
 	void _queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
@@ -335,6 +220,19 @@ private:
 	int _surface_vt_mip_for_page(const Vector2i &p_region_loc, const int p_page_x0,
 			const int p_page_y0, const real_t p_distance, const real_t p_page_world_size,
 			const int p_max_local_mip);
+	// Phases of one update_surface_vt() pass, in call order. The pass rebuilds the
+	// shader's block tables from the resident set, decides how many pages each
+	// sector may use, then fills only the pages this pass allocated.
+	void _prepare_vt_block_tables(PackedVector2Array &r_blocks, PackedFloat32Array &r_sizes);
+	Dictionary _collect_eligible_vt_regions();
+	Dictionary _compute_adaptive_sector_sizes(const Dictionary &p_eligible, int p_max_pages_per_axis);
+	void _retire_stale_vt_sectors(const Dictionary &p_eligible);
+	bool _prepare_vt_sector(const Vector2i &p_region_loc, int p_pages_per_axis);
+	std::vector<Vector3i> _vt_page_requests_for_sector(const Vector2i &p_region_loc, int p_pages_per_axis,
+			real_t p_distance, real_t p_page_world_size, int p_max_local_mip);
+	int _produce_missing_vt_pages(const Vector2i &p_region_loc, int p_pages_per_axis, real_t p_region_world,
+			const std::vector<Vector3i> &p_missing);
+	void _publish_vt_block_tables(const PackedVector2Array &p_blocks, const PackedFloat32Array &p_sizes);
 
 	void _setup_surface_svt();
 	void _destroy_surface_svt();
@@ -368,24 +266,24 @@ private:
 
 public:
 	void set_vt_page_size(int p_size);
-	int get_vt_page_size() const { return _vt_page_size; }
+	int get_vt_page_size() const { return _vt.vt_page_size; }
 	void set_vt_page_border(int p_border);
-	int get_vt_page_border() const { return _vt_page_border; }
-	void set_vt_auto_capacity(bool p_enabled) { _vt_auto_capacity = p_enabled; _avt_plan_key.clear(); }
-	bool get_vt_auto_capacity() const { return _vt_auto_capacity; }
+	int get_vt_page_border() const { return _vt.vt_page_border; }
+	void set_vt_auto_capacity(bool p_enabled) { _vt.vt_auto_capacity = p_enabled; _vt.avt_plan_key.clear(); }
+	bool get_vt_auto_capacity() const { return _vt.vt_auto_capacity; }
 	void set_vt_page_count(int p_count);
-	int get_vt_page_count() const { return _vt_page_count; }
+	int get_vt_page_count() const { return _vt.vt_page_count; }
 	void set_vt_pages_per_update(int p_pages);
-	int get_vt_pages_per_update() const { return _vt_pages_per_update; }
+	int get_vt_pages_per_update() const { return _vt.vt_pages_per_update; }
 	void set_surface_vt_coarse_mip_fallback(bool p_enabled);
-	bool get_surface_vt_coarse_mip_fallback() const { return _surface_vt_coarse_mip_fallback; }
+	bool get_surface_vt_coarse_mip_fallback() const { return _vt.surface_vt_coarse_mip_fallback; }
 	void set_vt_adaptive_enabled(bool p_enabled);
-	bool is_vt_adaptive_enabled() const { return _vt_adaptive_enabled; }
+	bool is_vt_adaptive_enabled() const { return _vt.vt_adaptive_enabled; }
 	void set_vt_editor_preview(bool p_enabled);
-	bool is_vt_editor_preview() const { return _vt_editor_preview; }
+	bool is_vt_editor_preview() const { return _vt.vt_editor_preview; }
 	bool is_vt_editor_preview_active() const;
 	void set_vt_debug_direct_material(bool p_enabled);
-	bool is_vt_debug_direct_material() const { return _vt_debug_direct_material; }
+	bool is_vt_debug_direct_material() const { return _vt.vt_debug_direct_material; }
 	Dictionary get_vt_settings() const;
 	int prepare_vt_capture();
 	Array get_vt_pages() const;
@@ -394,9 +292,9 @@ public:
 	void invalidate_vt_materials();
 	int bake_svt();
 	void set_svt_auto_bake(bool p_enabled);
-	bool is_svt_auto_bake() const { return _svt_auto_bake; }
+	bool is_svt_auto_bake() const { return _vt.svt_auto_bake; }
 	Array get_svt_baked_pages();
-	PackedFloat32Array get_surface_vt_block_sizes() const { return _surface_vt_block_sizes; }
+	PackedFloat32Array get_surface_vt_block_sizes() const { return _vt.surface_vt_block_sizes; }
 	static DebugLevel debug_level; // Initialized in terrain_3d.cpp
 
 	Terrain3D();
@@ -426,103 +324,101 @@ public:
 	void set_streaming_enabled(const bool p_enabled);
 	bool is_streaming_enabled() const { return _streaming_enabled; }
 
-	Terrain3DVirtualTexture *get_surface_vt() const { return _surface_vt; }
+	Terrain3DVirtualTexture *get_surface_vt() const { return _vt.surface_vt; }
 	void set_surface_vt_enabled(const bool p_enabled);
-	bool is_surface_vt_enabled() const { return _surface_vt_enabled; }
+	bool is_surface_vt_enabled() const { return _vt.surface_vt_enabled; }
 	void set_surface_vt_page_count(const int p_count);
-	int get_surface_vt_page_count() const { return _surface_vt_page_count; }
+	int get_surface_vt_page_count() const { return _vt.surface_vt_page_count; }
 	void set_surface_vt_page_size(const int p_size);
-	int get_surface_vt_page_size() const { return _surface_vt_page_size; }
+	int get_surface_vt_page_size() const { return _vt.surface_vt_page_size; }
 	void set_surface_vt_page_border(const int p_border);
-	int get_surface_vt_page_border() const { return _surface_vt_page_border; }
+	int get_surface_vt_page_border() const { return _vt.surface_vt_page_border; }
 	void set_surface_vt_pages_per_axis(const int p_pages);
-	int get_surface_vt_pages_per_axis() const { return _surface_vt_pages_per_axis; }
+	int get_surface_vt_pages_per_axis() const { return _vt.surface_vt_pages_per_axis; }
 	void set_surface_vt_texels_per_meter(real_t p_value);
-	real_t get_surface_vt_texels_per_meter() const { return _surface_vt_texels_per_meter; }
+	real_t get_surface_vt_texels_per_meter() const { return _vt.surface_vt_texels_per_meter; }
 	void set_surface_svt_texels_per_meter(real_t p_value);
-	real_t get_surface_svt_texels_per_meter() const { return _vt_page_size / _surface_svt_page_world; }
+	real_t get_surface_svt_texels_per_meter() const { return _vt.vt_page_size / _vt.surface_svt_page_world; }
 	void set_surface_vt_distance_mips(bool p_enabled);
-	bool is_surface_vt_distance_mips() const { return _surface_vt_distance_mips; }
+	bool is_surface_vt_distance_mips() const { return _vt.surface_vt_distance_mips; }
 	void set_surface_vt_mip_ranges(const Vector3 &p_ranges);
-	Vector3 get_surface_vt_mip_ranges() const { return _surface_vt_mip_ranges; }
+	Vector3 get_surface_vt_mip_ranges() const { return _vt.surface_vt_mip_ranges; }
 	float get_surface_vt_distance_lod(float p_distance) const;
-	void set_surface_vt_mip0_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.x = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip0_distance() const { return _surface_vt_mip_ranges.x; }
-	void set_surface_vt_mip1_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.y = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip1_distance() const { return _surface_vt_mip_ranges.y; }
-	void set_surface_vt_mip2_distance(real_t p_distance) { Vector3 ranges = _surface_vt_mip_ranges; ranges.z = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip2_distance() const { return _surface_vt_mip_ranges.z; }
+	void set_surface_vt_mip0_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.x = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip0_distance() const { return _vt.surface_vt_mip_ranges.x; }
+	void set_surface_vt_mip1_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.y = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip1_distance() const { return _vt.surface_vt_mip_ranges.y; }
+	void set_surface_vt_mip2_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.z = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
+	real_t get_surface_vt_mip2_distance() const { return _vt.surface_vt_mip_ranges.z; }
 	void set_surface_vt_mip_distances(const PackedFloat32Array &p_distances);
-	PackedFloat32Array get_surface_vt_mip_distances() const { return _surface_vt_mip_distances; }
+	PackedFloat32Array get_surface_vt_mip_distances() const { return _vt.surface_vt_mip_distances; }
 	int get_surface_vt_mip_for_distance(real_t p_distance) const;
 	int get_avt_base_block_size() const;
 	void set_surface_vt_resolution(int p_resolution);
-	int get_surface_vt_resolution() const { return _vt_page_size * _surface_vt_pages_per_axis; }
+	int get_surface_vt_resolution() const { return _vt.vt_page_size * _vt.surface_vt_pages_per_axis; }
 	void set_surface_vt_distance(const real_t p_distance);
-	real_t get_surface_vt_distance() const { return _surface_vt_distance; }
-	void set_surface_vt_region_grid(const Vector2i &p_grid) { _surface_vt_region_grid = Vector2i(CLAMP(p_grid.x, 1, 64), CLAMP(p_grid.y, 1, 64)); }
-	Vector2i get_surface_vt_region_grid() const { return _surface_vt_region_grid; }
+	real_t get_surface_vt_distance() const { return _vt.surface_vt_distance; }
+	void set_surface_vt_region_grid(const Vector2i &p_grid) { _vt.surface_vt_region_grid = Vector2i(CLAMP(p_grid.x, 1, 64), CLAMP(p_grid.y, 1, 64)); }
+	Vector2i get_surface_vt_region_grid() const { return _vt.surface_vt_region_grid; }
 	void set_surface_vt_selection_mode(int p_mode);
-	int get_surface_vt_selection_mode() const { return _surface_vt_selection_mode; }
-	bool is_sector_avt() const { return _surface_vt_selection_mode == 2 && !_vt_debug_direct_material; }
-	RID get_avt_sector_directory() const { return _avt_sector_directory.is_valid() ? _avt_sector_directory->get_rid() : RID(); }
-	int get_avt_directory_mask() const { return _avt_directory_mask; }
-	int get_avt_root_level() const { return _avt_root_level; }
-	void set_surface_vt_region_offset(const Vector2i &p_offset) { _surface_vt_region_offset = p_offset; }
-	Vector2i get_surface_vt_region_offset() const { return _surface_vt_region_offset; }
-	void set_surface_vt_forward_regions(real_t p_forward) { _surface_vt_forward_regions = CLAMP(p_forward, -64.f, 64.f); }
-	real_t get_surface_vt_forward_regions() const { return _surface_vt_forward_regions; }
+	int get_surface_vt_selection_mode() const { return _vt.surface_vt_selection_mode; }
+	bool is_sector_avt() const { return _vt.surface_vt_selection_mode == 2 && !_vt.vt_debug_direct_material; }
+	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }
+	int get_avt_directory_mask() const { return _vt.avt_directory_mask; }
+	int get_avt_root_level() const { return _vt.avt_root_level; }
+	void set_surface_vt_region_offset(const Vector2i &p_offset) { _vt.surface_vt_region_offset = p_offset; }
+	Vector2i get_surface_vt_region_offset() const { return _vt.surface_vt_region_offset; }
+	void set_surface_vt_forward_regions(real_t p_forward) { _vt.surface_vt_forward_regions = CLAMP(p_forward, -64.f, 64.f); }
+	real_t get_surface_vt_forward_regions() const { return _vt.surface_vt_forward_regions; }
 	Rect2i get_surface_vt_region_rect() const;
 	// Forces every sector to one mip, so a test can ask for a specific level instead
 	// of whatever the distance rule picks.
-	void set_surface_vt_texels_per_pixel(real_t p_value) { _surface_vt_texels_per_pixel = MAX(0.25f, p_value); }
-	real_t get_surface_vt_texels_per_pixel() const { return _surface_vt_texels_per_pixel; }
+	void set_surface_vt_texels_per_pixel(real_t p_value) { _vt.surface_vt_texels_per_pixel = MAX(0.25f, p_value); }
+	real_t get_surface_vt_texels_per_pixel() const { return _vt.surface_vt_texels_per_pixel; }
 	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
-	bool is_surface_vt_force_mip() const { return _surface_vt_force_mip; }
-	int get_surface_vt_mip() const { return _surface_vt_mip; }
+	bool is_surface_vt_force_mip() const { return _vt.surface_vt_force_mip; }
+	int get_surface_vt_mip() const { return _vt.surface_vt_mip; }
 	void set_surface_vt_feedback_enabled(const bool p_enabled);
-	bool is_surface_vt_feedback_enabled() const { return _surface_vt_feedback_enabled; }
+	bool is_surface_vt_feedback_enabled() const { return _vt.surface_vt_feedback_enabled; }
 	void set_surface_vt_feedback_interval(const int p_updates);
-	int get_surface_vt_feedback_interval() const { return _surface_vt_feedback_interval; }
+	int get_surface_vt_feedback_interval() const { return _vt.surface_vt_feedback_interval; }
 	void set_surface_vt_feedback_grid_chunks(const int p_chunks);
-	int get_surface_vt_feedback_grid_chunks() const { return _surface_vt_feedback_grid_chunks; }
+	int get_surface_vt_feedback_grid_chunks() const { return _vt.surface_vt_feedback_grid_chunks; }
 	void set_surface_vt_feedback_min_extent(const real_t p_extent);
-	real_t get_surface_vt_feedback_min_extent() const { return _surface_vt_feedback_min_extent; }
-	Terrain3DVTFeedback *get_surface_vt_feedback() const { return _surface_vt_feedback; }
-	PackedVector2Array get_surface_vt_blocks() const { return _surface_vt_blocks; }
-	bool is_surface_vt_blocks_dirty() const { return _surface_vt_blocks_dirty; }
-	void clear_surface_vt_blocks_dirty() { _surface_vt_blocks_dirty = false; }
+	real_t get_surface_vt_feedback_min_extent() const { return _vt.surface_vt_feedback_min_extent; }
+	Terrain3DVTFeedback *get_surface_vt_feedback() const { return _vt.surface_vt_feedback; }
+	PackedVector2Array get_surface_vt_blocks() const { return _vt.surface_vt_blocks; }
 
 	// Far field
-	Terrain3DVirtualTexture *get_surface_svt() const { return _surface_svt; }
+	Terrain3DVirtualTexture *get_surface_svt() const { return _vt.surface_svt; }
 	void set_surface_svt_enabled(const bool p_enabled);
-	bool is_surface_svt_enabled() const { return _surface_svt_enabled; }
+	bool is_surface_svt_enabled() const { return _vt.surface_svt_enabled; }
 	void set_surface_svt_page_world(const real_t p_size);
-	real_t get_surface_svt_page_world() const { return _surface_svt_page_world; }
+	real_t get_surface_svt_page_world() const { return _vt.surface_svt_page_world; }
 	void set_surface_svt_page_size(const int p_size);
-	int get_surface_svt_page_size() const { return _surface_svt_page_size; }
+	int get_surface_svt_page_size() const { return _vt.surface_svt_page_size; }
 	void set_surface_svt_page_border(const int p_border);
-	int get_surface_svt_page_border() const { return _surface_svt_page_border; }
+	int get_surface_svt_page_border() const { return _vt.surface_svt_page_border; }
 	void set_surface_svt_page_count(const int p_count);
-	int get_surface_svt_page_count() const { return _surface_svt_page_count; }
+	int get_surface_svt_page_count() const { return _vt.surface_svt_page_count; }
 	void set_surface_svt_max_mip(const int p_mip);
-	int get_surface_svt_max_mip() const { return _surface_svt_max_mip; }
+	int get_surface_svt_max_mip() const { return _vt.surface_svt_max_mip; }
 	void set_surface_svt_distance(const real_t p_distance);
-	real_t get_surface_svt_distance() const { return _surface_svt_distance; }
+	real_t get_surface_svt_distance() const { return _vt.surface_svt_distance; }
 	void set_surface_svt_root_mips(const int p_mips);
-	int get_surface_svt_root_mips() const { return _surface_svt_root_mips; }
+	int get_surface_svt_root_mips() const { return _vt.surface_svt_root_mips; }
 	void set_surface_svt_mip_distances(const PackedFloat32Array &p_distances);
-	PackedFloat32Array get_surface_svt_mip_distances() const { return _surface_svt_mip_distances; }
-	int get_surface_svt_mip_distance_count() const { return int(_surface_svt_mip_distances.size()); }
+	PackedFloat32Array get_surface_svt_mip_distances() const { return _vt.surface_svt_mip_distances; }
+	int get_surface_svt_mip_distance_count() const { return int(_vt.surface_svt_mip_distances.size()); }
 	// Largest distance the table (or the automatic rule) still serves with a page.
 	real_t get_surface_svt_mip_reach() const;
 	void set_surface_array_enabled(const bool p_enabled);
-	bool is_surface_array_enabled() const { return _surface_array_enabled; }
+	bool is_surface_array_enabled() const { return _vt.surface_array_enabled; }
 	// Whether the array still has to carry the surface channel. It must, whenever no
 	// virtual texture tier is enabled: with both off the array is the only source, and a
 	// blank array would render every texel as material 0.
 	bool is_surface_array_upload_needed() const {
-		return is_vt_editor_preview_active() || _surface_array_enabled || (!_surface_vt_enabled && !_surface_svt_enabled);
+		return is_vt_editor_preview_active() || _vt.surface_array_enabled || (!_vt.surface_vt_enabled && !_vt.surface_svt_enabled);
 	}
 	// Drops the pages that carry a region's surface, so an edit is re-produced instead
 	// of being served stale from either virtual texture.

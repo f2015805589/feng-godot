@@ -338,10 +338,6 @@ public:
 	int produce_surface_page_set(const Vector2i &p_region_loc, const int p_pages_per_axis,
 			const int p_page_size, const int p_border, const std::vector<Vector3i> &p_requests,
 			std::vector<Ref<Image>> &r_pages);
-	// Every page of one local mip, row-major with x fastest.
-	int produce_surface_pages(const Vector2i &p_region_loc, const int p_local_mip,
-			const int p_pages_per_axis, const int p_page_size, const int p_border,
-			std::vector<Ref<Image>> &r_pages);
 
 	// Far-field (sparse virtual texture) page production. Unlike the region-aligned
 	// producer above, this one is world aligned: every page texel maps to a world

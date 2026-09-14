@@ -435,11 +435,6 @@ func add_setting(p_args: Dictionary) -> void:
 	var p_type: SettingType = p_args.get("type", SettingType.TYPE_MAX)
 	var p_list: Control = p_args.get("list")
 	var p_default: Variant = p_args.get("default")
-	var p_suffix: String = p_args.get("unit", "")
-	var p_range: Vector3 = p_args.get("range", Vector3(0, 0, 1))
-	var p_minimum: float = p_range.x
-	var p_maximum: float = p_range.y
-	var p_step: float = p_range.z
 	var p_flags: int = p_args.get("flags", NONE)
 	var p_tooltip: String = p_args.get("tooltip", "")
 	
@@ -449,14 +444,41 @@ func add_setting(p_args: Dictionary) -> void:
 	var container: HBoxContainer = HBoxContainer.new()
 	container.custom_minimum_size.y = 36
 	container.set_v_size_flags(SIZE_EXPAND_FILL)
+	var r_children: Array[Control]
+	var control: Control = _create_setting_control(p_args, r_children)
+	control.name = p_name.to_pascal_case()
+	if not p_tooltip.is_empty():
+		control.tooltip_text = p_tooltip
+	settings[p_name] = control
+	_add_setting_decorations(p_name, p_label, p_default, p_flags, r_children)
+
+	# Add all children to container and list
+	for child in r_children:
+		container.add_child(child, true)
+	p_list.add_child(container, true)
+
+
+# Builds the control that owns one setting's value. A setting that needs a companion
+# widget - a slider linked to its value box, a value readout - appends it to
+# `r_children`, so add_setting() can place every widget of the row in order.
+func _create_setting_control(p_args: Dictionary, r_children: Array[Control]) -> Control:
+	var p_name: StringName = p_args.get("name", "")
+	var p_label: String = p_args.get("label", "") # Optional replacement for name
+	var p_type: SettingType = p_args.get("type", SettingType.TYPE_MAX)
+	var p_default: Variant = p_args.get("default")
+	var p_suffix: String = p_args.get("unit", "")
+	var p_range: Vector3 = p_args.get("range", Vector3(0, 0, 1))
+	var p_minimum: float = p_range.x
+	var p_maximum: float = p_range.y
+	var p_step: float = p_range.z
+	var p_flags: int = p_args.get("flags", NONE)
 	var control: Control	# Houses the setting to be saved
-	var pending_children: Array[Control]
 	
 	match p_type:
 		SettingType.LABEL:
 			var label := Label.new()
 			label.set_text(p_label)
-			pending_children.push_back(label)
+			r_children.push_back(label)
 			control = label
 
 		SettingType.CHECKBOX:
@@ -470,7 +492,7 @@ func add_setting(p_args: Dictionary) -> void:
 			else:
 				checkbox.set_pressed_no_signal(p_default)				
 			checkbox.pressed.connect(_on_setting_changed)
-			pending_children.push_back(checkbox)
+			r_children.push_back(checkbox)
 			control = checkbox
 			
 		SettingType.COLOR_SELECT:
@@ -487,7 +509,7 @@ func add_setting(p_args: Dictionary) -> void:
 			else:
 				picker.set_pick_color(p_default)
 			picker.color_changed.connect(_on_setting_changed)
-			pending_children.push_back(picker)
+			r_children.push_back(picker)
 			control = picker
 
 		SettingType.PICKER:
@@ -495,14 +517,14 @@ func add_setting(p_args: Dictionary) -> void:
 			button.set_v_size_flags(SIZE_SHRINK_CENTER)
 			button.icon = get_theme_icon("ColorPick", "EditorIcons")
 			button.pressed.connect(_on_pick.bind(p_default))
-			pending_children.push_back(button)
+			r_children.push_back(button)
 			control = button
 
 		SettingType.MULTI_PICKER:
 			var multi_picker: HBoxContainer = MultiPicker.new()
 			multi_picker.pressed.connect(_on_point_pick.bind(p_default, p_name))
 			multi_picker.value_changed.connect(_on_setting_changed)
-			pending_children.push_back(multi_picker)
+			r_children.push_back(multi_picker)
 			control = multi_picker
 
 		SettingType.OPTION:
@@ -517,7 +539,7 @@ func add_setting(p_args: Dictionary) -> void:
 					option.add_item("a", i)
 			option.selected = p_minimum
 			option.item_selected.connect(_on_setting_changed)
-			pending_children.push_back(option)
+			r_children.push_back(option)
 			control = option
 
 		SettingType.SLIDER, SettingType.DOUBLE_SLIDER:
@@ -543,8 +565,8 @@ func add_setting(p_args: Dictionary) -> void:
 				if p_flags & ALLOW_SMALLER:
 					slider.set_allow_lesser(true)
 				
-				pending_children.push_back(slider)
-				pending_children.push_back(spin_slider)
+				r_children.push_back(slider)
+				r_children.push_back(spin_slider)
 				control = spin_slider
 						
 			else: # DOUBLE_SLIDER
@@ -555,8 +577,8 @@ func add_setting(p_args: Dictionary) -> void:
 				slider.label = label
 				slider.suffix = p_suffix
 				slider.value_changed.connect(_on_setting_changed)
-				pending_children.push_back(slider)
-				pending_children.push_back(label)
+				r_children.push_back(slider)
+				r_children.push_back(label)
 				control = slider
 			
 			slider.set_min(p_minimum)
@@ -574,15 +596,14 @@ func add_setting(p_args: Dictionary) -> void:
 				).bind(ES_TOOL_SETTINGS + p_name) )
 			else:
 				slider.set_value(p_default)
+	return control
 
-	control.name = p_name.to_pascal_case()
-	if not p_tooltip.is_empty():
-		control.tooltip_text = p_tooltip
-	settings[p_name] = control
 
+# Places the label, separator and spacer in front of the control. Labels are buttons
+# styled to look like labels, so pressing one resets the setting to its default.
+func _add_setting_decorations(p_name: StringName, p_label: String, p_default: Variant, p_flags: int, r_children: Array[Control]) -> void:
 	# Setup button labels
 	if not (p_flags & NO_LABEL):
-		# Labels are actually buttons styled to look like labels
 		var label := Button.new()
 		label.set("theme_override_styles/normal", get_theme_stylebox("normal", "Label"))
 		label.set("theme_override_styles/hover", get_theme_stylebox("normal", "Label"))
@@ -593,20 +614,15 @@ func add_setting(p_args: Dictionary) -> void:
 			label.set_text(p_name.capitalize() + ": ")
 		else:
 			label.set_text(p_label.capitalize() + ": ")
-		pending_children.push_front(label)
+		r_children.push_front(label)
 
 	# Add separators to front
 	if p_flags & ADD_SEPARATOR:
-		pending_children.push_front(VSeparator.new())
+		r_children.push_front(VSeparator.new())
 	if p_flags & ADD_SPACER:
 		var spacer := Control.new()
 		spacer.set_custom_minimum_size(Vector2(5, 0))
-		pending_children.push_front(spacer)
-
-	# Add all children to container and list
-	for child in pending_children:
-		container.add_child(child, true)
-	p_list.add_child(container, true)
+		r_children.push_front(spacer)
 
 
 # If label button is pressed, reset value to default or toggle checkbox

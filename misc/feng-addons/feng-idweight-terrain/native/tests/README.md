@@ -1,9 +1,77 @@
 # Terrain integration tests
 
+## Full regression
+
+Every runner, one command:
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/run_all.py
+```
+
+It builds each test's isolated fixture, prints one `PASS`/`FAIL` line per test
+with the runner's own `PASS`/`REGRESSION`/`ERROR:` lines under it, deletes the
+fixture afterwards, and ends with a summary table plus
+`n/29 passed (driver ...)`. Add `--json bin/out.json` to keep the result for a
+before/after comparison, `--only vt_` to run a subset, `--keep` to keep the
+fixtures for inspection, and `--prune-only` to delete fixtures leaked by earlier
+runs (they are full addon copies, about 27 MB each).
+
+To compare two runs:
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/compare_runs.py bin/before.json bin/after.json
+```
+
+It prints one line per test with both statuses and the failing markers, and
+flags the ones whose status changed.
+
+`--driver` defaults to **vulkan**. Use it on any machine where the D3D12 device
+is unstable: `CreateResource failed with error 0x887a0005`
+(`DXGI_ERROR_DEVICE_REMOVED`) reproduces at the `--headless --editor --import`
+step, before any terrain code runs, so it is an environment fault rather than a
+regression.
+
+A test only passes when its process exits 0, its required `PASS` marker is
+present **and** its log contains no `ERROR:` line at all. That last rule is why
+a run can print every assertion as passing and still be reported as a failure:
+read the `ERROR:` lines under it.
+
+Comparing runs: keep the `--json` output of the run before your change and diff
+the statuses. Several tests are red in this checkout (missing-page diagnostics,
+surface-baker uniform sets, and the setup dock's paint timing), so the useful
+signal is a *change* in status or in the `REGRESSION` text, not the pass count
+alone.
+
+## Running one test
+
 Build the debug terrain extension, then run `texture_layers.gd` with this
 engine from a project that has the terrain extension installed and imported.
 Use a real rendering driver; `--headless` uses dummy textures and cannot test
 GPU uploads or the rendered result.
+
+## Adding a test
+
+`fixture.py` owns the shared harness: it copies the addon into a throwaway
+project under `bin/`, redirects `APPDATA`/`LOCALAPPDATA` there, and runs the
+engine twice (headless import, then a real-driver run of one script). A script
+test is a thin wrapper around `fixture.run_script_test()`; only the script, the
+log name, the project name and the required `PASS` marker differ:
+
+```python
+from fixture import ROOT, run_script_test
+
+def main() -> int:
+    ...
+    return run_script_test(editor=args.editor, driver=args.driver,
+        fixture_prefix="terrain-vtnew-", project_name="VT new tests", log_name="vtnew.log",
+        script="vt_new.gd", marker="PASS virtual texture new behaviour")
+```
+
+Two rules the harness enforces, both learned the hard way: a test only passes
+when the log has **no `ERROR:` line at all** (an engine error fails the run even
+if every assertion printed PASS), and a `.gd` that other tests extend must stay a
+`SceneTree` script, because the runner writes it into the fixture as
+`res://vt_adaptive_base.gd` or `res://vt_render_base.gd`.
 
 For example, from the engine checkout on Windows (replace PROJECT):
 
@@ -352,10 +420,12 @@ scons && ./terrain_vt_contract_test.exe
 ```
 
 Standalone C++ test for `src/terrain_vt.h`, the Hydra-compatible AVT/SVT addressing core.
-No engine and no GPU. It pins both address profiles descriptor by descriptor, the 12/12/4/4
-bit PageID layout, AVT page resolution, the indirection mip-chain walk, LRU keys, sector LOD
-selection, physical page UV/world rect, POT `VirtualImageAtlas` allocation, and the 8x8
-feedback dither. See `docs/terrain_vt_and_streaming.md` for the design.
+No engine and no GPU. It pins the indirection mip-chain walk (which level and local
+coordinate a request resolves to) and the POT `VirtualImageAtlas` allocator: block
+alignment, the full 65,536-leaf capacity, non-overlap, and resize rollback with refill.
+The address-profile descriptor tables, page-id packing, LRU key encoding and feedback
+dither it used to cover were deleted from the header as unused production code, and
+their checks went with them. See `docs/terrain_vt_and_streaming.md` for the design.
 
 ## Texture array codecs
 

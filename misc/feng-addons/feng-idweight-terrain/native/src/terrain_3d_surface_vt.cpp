@@ -2,6 +2,7 @@
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_virtual_texture.h"
+#include "terrain_vt_cell.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/engine.hpp>
@@ -55,7 +56,7 @@ void Terrain3D::set_surface_vt_resolution(int p_resolution) {
 	// A block has a power-of-two page count (at most 64). Normalize legacy
 	// non-power-of-two page sizes so the displayed virtual resolution is exact.
 	int page_size = MAX(16, p_resolution / 64);
-	while (page_size * 2 <= MIN(_vt_page_size, p_resolution)) {
+	while (page_size * 2 <= MIN(_vt.vt_page_size, p_resolution)) {
 		page_size *= 2;
 	}
 	set_vt_page_size(page_size);
@@ -67,43 +68,43 @@ void Terrain3D::set_surface_vt_resolution(int p_resolution) {
 
 void Terrain3D::set_vt_page_size(int p_size) {
 	p_size = CLAMP(p_size, 16, 1024);
-	if (_vt_page_size == p_size) {
+	if (_vt.vt_page_size == p_size) {
 		return;
 	}
 	const real_t svt_density = get_surface_svt_texels_per_meter();
-	_vt_page_size = p_size;
-	_surface_svt_page_world = _vt_page_size / svt_density;
+	_vt.vt_page_size = p_size;
+	_vt.surface_svt_page_world = _vt.vt_page_size / svt_density;
 	_reset_vt_configuration();
 }
 void Terrain3D::set_vt_page_border(int p_border) {
 	p_border = CLAMP(p_border, 1, 16);
-	if (_vt_page_border == p_border) {
+	if (_vt.vt_page_border == p_border) {
 		return;
 	}
-	_vt_page_border = p_border;
+	_vt.vt_page_border = p_border;
 	_reset_vt_configuration();
 }
 bool Terrain3D::_ensure_vt_capacity(int p_required) {
-	Terrain3DSurfaceBaker *producer = _vt_baker.is_valid() ? baker(_vt_baker) : nullptr;
-	if (_vt_shared_ready && producer && !_vt_debug_direct_material) {
+	Terrain3DSurfaceBaker *producer = _vt.vt_baker.is_valid() ? baker(_vt.vt_baker) : nullptr;
+	if (_vt.vt_shared_ready && producer && !_vt.vt_debug_direct_material) {
 		const int ready_capacity = producer->get_capacity();
-		if (ready_capacity > _vt_page_count) {
+		if (ready_capacity > _vt.vt_page_count) {
 			// Publish higher slot IDs only after the GPU cache was copied. Keep
 			// addresses, owners and source jobs, including an already completed plan.
-			if (!_surface_vt->grow_capacity(ready_capacity) || !_surface_svt->grow_capacity(ready_capacity)) { return false; }
-			_vt_page_count = _surface_vt_page_count = _surface_svt_page_count = ready_capacity;
+			if (!_vt.surface_vt->grow_capacity(ready_capacity) || !_vt.surface_svt->grow_capacity(ready_capacity)) { return false; }
+			_vt.vt_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
 			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 			notify_property_list_changed();
 			return true;
 		}
 	}
 	const int transition_capacity = p_required + MAX(8, p_required / 2);
-	if (!_vt_auto_capacity || transition_capacity <= _vt_page_count || _vt_page_count >= 1024 ||
-		!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty()) { return false; }
+	if (!_vt.vt_auto_capacity || transition_capacity <= _vt.vt_page_count || _vt.vt_page_count >= 1024 ||
+		!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) { return false; }
 	int capacity = 8;
 	// Leave room for old/new view overlap; capacity never oscillates or shrinks.
 	while (capacity < transition_capacity && capacity < 1024) { capacity *= 2; }
-	if (_vt_shared_ready && producer && !_vt_debug_direct_material) {
+	if (_vt.vt_shared_ready && producer && !_vt.vt_debug_direct_material) {
 		producer->request_capacity(capacity);
 		return false;
 	}
@@ -114,59 +115,59 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 
 void Terrain3D::set_vt_page_count(int p_count) {
 	p_count = CLAMP(p_count, 8, 1024);
-	if (_vt_page_count == p_count) {
+	if (_vt.vt_page_count == p_count) {
 		return;
 	}
-	_vt_page_count = p_count;
+	_vt.vt_page_count = p_count;
 	_reset_vt_configuration();
 }
 void Terrain3D::set_vt_pages_per_update(int p_pages) {
-	_vt_pages_per_update = CLAMP(p_pages, 1, 16);
+	_vt.vt_pages_per_update = CLAMP(p_pages, 1, 16);
 }
 
 void Terrain3D::_cancel_svt_bake(const String &p_reason) {
-	_svt_cell_job.clear();
-	_svt_cell_baker.unref();
-	if (!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty()) {
-		_vt_svt_bake_failed += _vt_svt_bake_queue.size() + _vt_svt_bake_waiting.size();
-		_vt_svt_bake_error = p_reason;
+	_vt.svt_cell_job.clear();
+	_vt.svt_cell_baker.unref();
+	if (!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) {
+		_vt.vt_svt_bake_failed += _vt.vt_svt_bake_queue.size() + _vt.vt_svt_bake_waiting.size();
+		_vt.vt_svt_bake_error = p_reason;
 	}
-	if (_surface_svt && _surface_svt->is_initialized()) {
-		for (const Variant &slot : _vt_svt_bake_waiting.keys()) {
+	if (_vt.surface_svt && _vt.surface_svt->is_initialized()) {
+		for (const Variant &slot : _vt.vt_svt_bake_waiting.keys()) {
 			if (int(slot) >= 0) {
-				_surface_svt->protect_page(int(slot), false);
+				_vt.surface_svt->protect_page(int(slot), false);
 			}
 		}
 	}
-	_vt_svt_bake_queue.clear();
-	_vt_svt_bake_waiting.clear();
+	_vt.vt_svt_bake_queue.clear();
+	_vt.vt_svt_bake_waiting.clear();
 }
 
 void Terrain3D::_reset_vt_configuration() {
 	// Old world addresses and channel dimensions cannot survive reconfiguration.
 	_cancel_svt_bake("VT configuration changed; run Bake SVT again.");
-	_vt_shared_ready = false;
+	_vt.vt_shared_ready = false;
 	invalidate_vt_materials();
 }
 void Terrain3D::set_surface_vt_coarse_mip_fallback(bool p_enabled) {
-	if (_surface_vt_coarse_mip_fallback == p_enabled) { return; }
-	_surface_vt_coarse_mip_fallback = p_enabled;
+	if (_vt.surface_vt_coarse_mip_fallback == p_enabled) { return; }
+	_vt.surface_vt_coarse_mip_fallback = p_enabled;
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
 void Terrain3D::set_vt_adaptive_enabled(bool p_enabled) {
-	_vt_adaptive_enabled = p_enabled;
+	_vt.vt_adaptive_enabled = p_enabled;
 }
 bool Terrain3D::is_vt_editor_preview_active() const {
-	return IS_EDITOR && _vt_editor_preview;
+	return IS_EDITOR && _vt.vt_editor_preview;
 }
 
 void Terrain3D::set_vt_editor_preview(bool p_enabled) {
-	if (_vt_editor_preview == p_enabled) { return; }
-	_vt_editor_preview = p_enabled;
+	if (_vt.vt_editor_preview == p_enabled) { return; }
+	_vt.vt_editor_preview = p_enabled;
 	if (!is_vt_editor_preview_active()) {
-		Dictionary dirty = _vt_editor_dirty_regions.duplicate();
-		_vt_editor_dirty_regions.clear();
+		Dictionary dirty = _vt.vt_editor_dirty_regions.duplicate();
+		_vt.vt_editor_dirty_regions.clear();
 		for (const Variant &location : dirty.keys()) { invalidate_surface_pages(location); }
 	}
 	if (_data && _initialized) { _data->update_maps(TYPE_MAX, true, false); }
@@ -174,108 +175,112 @@ void Terrain3D::set_vt_editor_preview(bool p_enabled) {
 }
 
 void Terrain3D::set_vt_debug_direct_material(bool p_enabled) {
-	if (_vt_debug_direct_material == p_enabled) {
+	if (_vt.vt_debug_direct_material == p_enabled) {
 		return;
 	}
-	_vt_debug_direct_material = p_enabled;
+	_vt.vt_debug_direct_material = p_enabled;
 	_destroy_vt_service();
 	// Raw-ID diagnostics and material-cache rendering have different residency
 	// contracts. Rebuild addresses rather than reusing unuploaded diagnostic IDs.
-	if (_surface_vt) { _surface_vt->clear(); }
-	if (_surface_svt) { _surface_svt->clear(); }
+	if (_vt.surface_vt) { _vt.surface_vt->clear(); }
+	if (_vt.surface_svt) { _vt.surface_svt->clear(); }
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 	}
 }
 
 void Terrain3D::_configure_vt_service() {
-	if (_vt_debug_direct_material || !_surface_vt || !_surface_svt) {
+	if (_vt.vt_debug_direct_material || !_vt.surface_vt || !_vt.surface_svt) {
 		return;
 	}
-	if (_vt_shared_ready) {
+	if (_vt.vt_shared_ready) {
 		return;
 	}
-	_vt_source_snapshot.reset();
-	_avt_refinement.reset();
-	_avt_plan_key.clear();
-	if (_vt_page_pipeline) { _vt_page_pipeline->reset(); }
-	if (_svt_page_pipeline) { _svt_page_pipeline->reset(); }
+	_vt.vt_source_snapshot.reset();
+	_vt.avt_refinement.reset();
+	_vt.avt_plan_key.clear();
+	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
+	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// Detach both views before replacing their common pool. Clearing one view must
 	// never destroy a pool that another view is still sampling.
 	auto pool = Terrain3DVirtualTexture::create_page_pool();
-	for (Terrain3DVirtualTexture *view : { _surface_vt, _surface_svt }) {
+	// Both views adopt the shared dimensions before they are configured, so the one
+	// configuration helper describes the view that is actually built.
+	_vt.surface_vt_page_size = _vt.surface_svt_page_size = _vt.vt_page_size;
+	_vt.surface_vt_page_border = _vt.surface_svt_page_border = _vt.vt_page_border;
+	_vt.surface_vt_page_count = _vt.surface_svt_page_count = _vt.vt_page_count;
+	for (Terrain3DVirtualTexture *view : { _vt.surface_vt, _vt.surface_svt }) {
 		view->clear();
-		view->set_page_size(_vt_page_size);
-		view->set_page_border(_vt_page_border);
-		view->set_page_count(_vt_page_count);
 		view->set_page_pool(pool);
-		view->set_material_cache_mode(!_vt_debug_direct_material);
-		if (view == _surface_vt) {
-			view->set_indirection_size(is_sector_avt() ? 2048 : MAX(64, _surface_vt_page_count * 4));
-		}
+		view->set_material_cache_mode(!_vt.vt_debug_direct_material);
+		_configure_surface_view(view, view == _vt.surface_svt);
 		view->initialize();
 	}
-	_surface_vt_page_size = _surface_svt_page_size = _vt_page_size;
-	_surface_vt_page_border = _surface_svt_page_border = _vt_page_border;
-	_surface_vt_page_count = _surface_svt_page_count = _vt_page_count;
-	_surface_vt_blocks.clear();
-	_surface_vt_block_sizes.clear();
-	_surface_vt_blocks_dirty = true;
-	_vt_page_records.clear();
-	_svt_pending_pages.clear();
-	_vt_registered_sectors.clear();
-	_avt_directory_bytes.clear();
-	_avt_plan_key.clear();
-	_avt_page_plan.clear();
-	_avt_prefetch_plan.clear();
-	_avt_registered_owners.clear();
-	_avt_allocated_sizes.clear();
-	_avt_cached_addresses.clear();
-	_avt_sector_directory.unref();
-	_avt_directory_mask = 0;
-	_avt_sector_stats.clear();
-	if (_vt_baker.is_null()) {
+	_vt.surface_vt_blocks.clear();
+	_vt.surface_vt_block_sizes.clear();
+	_vt.surface_vt_blocks_dirty = true;
+	_vt.vt_page_records.clear();
+	_vt.svt_pending_pages.clear();
+	_vt.vt_registered_sectors.clear();
+	_vt.avt_directory_bytes.clear();
+	_vt.avt_plan_key.clear();
+	_vt.avt_page_plan.clear();
+	_vt.avt_prefetch_plan.clear();
+	_vt.avt_registered_owners.clear();
+	_vt.avt_allocated_sizes.clear();
+	_vt.avt_cached_addresses.clear();
+	_vt.avt_sector_directory.unref();
+	_vt.avt_directory_mask = 0;
+	_vt.avt_sector_stats.clear();
+	if (_vt.vt_baker.is_null()) {
 		Ref<Terrain3DSurfaceBaker> instance;
 		instance.instantiate();
-		_vt_baker = instance;
+		_vt.vt_baker = instance;
 	}
-	baker(_vt_baker)->configure(_vt_page_size, _vt_page_border, _vt_page_count);
-	_vt_bound_albedo = RID();
+	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, _vt.vt_page_count);
+	_vt.vt_bound_albedo = RID();
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 	}
-	_vt_materials_dirty = true;
-	_vt_shared_ready = true;
+	_vt.vt_materials_dirty = true;
+	_vt.vt_shared_ready = true;
+}
+
+bool Terrain3D::_vt_has_pending_upload() const {
+	// Either view can own the shared pool, and a commit on one of them is what puts
+	// render-thread work in flight.
+	return (_vt.surface_vt && _vt.surface_vt->has_pending_indirection()) ||
+			(_vt.surface_svt && _vt.surface_svt->has_pending_indirection());
 }
 
 void Terrain3D::_update_vt_service() {
-	if (!_surface_svt_enabled) {
+	if (!_vt.surface_svt_enabled) {
 		_cancel_svt_bake("SVT was disabled; the offline bake was cancelled.");
 	}
-	if (!_surface_vt_enabled && !_surface_svt_enabled) {
-		if (_vt_callback_registered && RS->has_method("virtual_texture_remove_update_callback")) {
+	if (!_vt.surface_vt_enabled && !_vt.surface_svt_enabled) {
+		if (_vt.vt_callback_registered && RS->has_method("virtual_texture_remove_update_callback")) {
 			RS->call("virtual_texture_remove_update_callback", int64_t(get_instance_id()));
-			_vt_callback_registered = false;
+			_vt.vt_callback_registered = false;
 		}
 		return;
 	}
-	if (_vt_debug_direct_material || !_data || _assets.is_null()) {
+	if (_vt.vt_debug_direct_material || !_data || _assets.is_null()) {
 		return;
 	}
 	const uint64_t frame = Engine::get_singleton()->get_process_frames();
-	if (_vt_shared_ready && !_vt_materials_dirty && _vt_service_frame == frame) { return; }
-	_vt_service_frame = frame;
+	if (_vt.vt_shared_ready && !_vt.vt_materials_dirty && _vt.vt_service_frame == frame) { return; }
+	_vt.vt_service_frame = frame;
 	_configure_vt_service();
-	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
+	Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
 	if (!producer) {
 		return;
 	}
-	if (!_vt_callback_registered && RS->has_method("virtual_texture_set_update_callback")) {
+	if (!_vt.vt_callback_registered && RS->has_method("virtual_texture_set_update_callback")) {
 		RS->call("virtual_texture_set_update_callback", int64_t(get_instance_id()),
-				Callable(producer, "render_pending").bind(_vt_baker));
-		_vt_callback_registered = true;
+				Callable(producer, "render_pending").bind(_vt.vt_baker));
+		_vt.vt_callback_registered = true;
 	}
-	if (_vt_materials_dirty) {
+	if (_vt.vt_materials_dirty) {
 		producer->set_materials(_assets->get_albedo_array_rid(), _assets->get_normal_array_rid(),
 				_assets->get_texture_colors(), _assets->get_texture_normal_depths(),
 				_assets->get_texture_ao_strengths(), _assets->get_texture_ao_light_affects(),
@@ -294,8 +299,8 @@ void Terrain3D::_update_vt_service() {
 		// resource instance IDs or paths. The asset system retains these existing
 		// content hashes even after free_editor_textures releases its source list.
 		signature["textures"] = _assets->get_texture_cache_identity();
-		_vt_material_signature = signature.hash();
-		_vt_materials_dirty = false;
+		_vt.vt_material_signature = signature.hash();
+		_vt.vt_materials_dirty = false;
 		// Re-request old addresses using the current materials; stale pages remain
 		// hidden until their producer has completed again.
 		for (const Vector2i &location : _data->get_region_locations()) {
@@ -303,8 +308,8 @@ void Terrain3D::_update_vt_service() {
 		}
 	}
 	RID albedo = producer->get_albedo_rid();
-	if (albedo != _vt_bound_albedo && _material.is_valid()) {
-		_vt_bound_albedo = albedo;
+	if (albedo != _vt.vt_bound_albedo && _material.is_valid()) {
+		_vt.vt_bound_albedo = albedo;
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 		producer->acknowledge_output(albedo);
 	}
@@ -314,101 +319,101 @@ void Terrain3D::_update_vt_service() {
 	// RD writes and worker completion do not mark RenderingServer as changed.
 	// In the editor's low-processor mode that otherwise leaves queued GPU pages
 	// waiting forever for camera input. Request a normal (non-blocking) redraw
-	// only while the producer needs a render callback; never force_draw here.
-	if (IS_EDITOR && producer->has_render_work()) {
+	// only while work is actually outstanding; never force_draw here.
+	if (IS_EDITOR && (producer->has_render_work() || _vt_has_pending_upload())) {
 		Control *editor = EditorInterface::get_singleton()->get_base_control();
 		if (editor) { editor->queue_redraw(); }
 	}
 }
 
 void Terrain3D::_process_async_svt_pages() {
-	if (_svt_pending_pages.empty() || !_data || _vt_baker.is_null()) { return; }
-	if (!_svt_page_pipeline) { _svt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(); }
-	if (!_vt_source_snapshot) { _vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
+	if (_vt.svt_pending_pages.empty() || !_data || _vt.vt_baker.is_null()) { return; }
+	if (!_vt.svt_page_pipeline) { _vt.svt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(); }
+	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
 	int submitted = 0;
-	for (auto it = _svt_pending_pages.begin(); it != _svt_pending_pages.end();) {
+	for (auto it = _vt.svt_pending_pages.begin(); it != _vt.svt_pending_pages.end();) {
 		const int slot = it->first;
 		Terrain3DPagePipeline::Result result;
-		if (!_svt_page_pipeline->poll(it->second, _vt_source_snapshot, result)) {
+		if (!_vt.svt_page_pipeline->poll(it->second, _vt.vt_source_snapshot, result)) {
 			++it; continue;
 		}
-		if (_vt_page_records.has(slot)) {
-			Dictionary record = _vt_page_records[slot];
-			if (result.payload.is_valid() && _surface_svt->write_page(slot, result.payload)) {
+		if (_vt.vt_page_records.has(slot)) {
+			Dictionary record = _vt.vt_page_records[slot];
+			if (result.payload.is_valid() && _vt.surface_svt->write_page(slot, result.payload)) {
 				record["source"] = result.payload->get_data();
 			}
 			if (result.missing.empty() && !result.sources.is_empty()) {
 				record["state"] = "Pending cell copy";
-				baker(_vt_baker)->queue_cell_page(slot, result.sources, it->second.rect);
+				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect);
 			} else {
 				record["state"] = "Missing/stale cell bake";
-				if (_svt_auto_bake && !_data_directory.is_empty()) {
+				if (_vt.svt_auto_bake && !_data_directory.is_empty()) {
 					for (const Vector2i &cell : result.missing) {
-						if (_vt_svt_dirty_regions.is_empty()) { _vt_svt_edit_time = 0; }
-						_vt_svt_dirty_regions[cell] = true;
+						if (_vt.vt_svt_dirty_regions.is_empty()) { _vt.vt_svt_edit_time = 0; }
+						_vt.vt_svt_dirty_regions[cell] = true;
 					}
 				}
 			}
 		}
-		it = _svt_pending_pages.erase(it);
-		if (++submitted >= _vt_pages_per_update) { break; }
+		it = _vt.svt_pending_pages.erase(it);
+		if (++submitted >= _vt.vt_pages_per_update) { break; }
 	}
 }
 
 void Terrain3D::_destroy_vt_service() {
-	if (_surface_vt) { _surface_vt->set_material_cache_mode(false); }
-	if (_surface_svt) { _surface_svt->set_material_cache_mode(false); }
-	_vt_page_pipeline.reset();
-	_svt_page_pipeline.reset();
-	_svt_pending_pages.clear();
-	_vt_source_snapshot.reset();
-	_avt_refinement.reset();
-	_avt_plan_key.clear();
-	_svt_cell_baker.unref();
-	if (_vt_callback_registered && RS && RS->has_method("virtual_texture_remove_update_callback")) {
+	if (_vt.surface_vt) { _vt.surface_vt->set_material_cache_mode(false); }
+	if (_vt.surface_svt) { _vt.surface_svt->set_material_cache_mode(false); }
+	_vt.vt_page_pipeline.reset();
+	_vt.svt_page_pipeline.reset();
+	_vt.svt_pending_pages.clear();
+	_vt.vt_source_snapshot.reset();
+	_vt.avt_refinement.reset();
+	_vt.avt_plan_key.clear();
+	_vt.svt_cell_baker.unref();
+	if (_vt.vt_callback_registered && RS && RS->has_method("virtual_texture_remove_update_callback")) {
 		RS->call("virtual_texture_remove_update_callback", int64_t(get_instance_id()));
 	}
-	_vt_callback_registered = false;
-	_vt_baker.unref();
-	_vt_bound_albedo = RID();
-	_vt_shared_ready = false;
-	_vt_page_records.clear();
-	_svt_pending_pages.clear();
-	_vt_registered_sectors.clear();
-	_vt_svt_bake_queue.clear();
-	_vt_svt_bake_waiting.clear();
+	_vt.vt_callback_registered = false;
+	_vt.vt_baker.unref();
+	_vt.vt_bound_albedo = RID();
+	_vt.vt_shared_ready = false;
+	_vt.vt_page_records.clear();
+	_vt.svt_pending_pages.clear();
+	_vt.vt_registered_sectors.clear();
+	_vt.vt_svt_bake_queue.clear();
+	_vt.vt_svt_bake_waiting.clear();
 }
 
 void Terrain3D::invalidate_vt_materials() {
-	_vt_materials_dirty = true;
-	_vt_source_revision++;
+	_vt.vt_materials_dirty = true;
+	_vt.vt_source_revision++;
 }
 
 void Terrain3D::_invalidate_vt_slot(int p_slot) {
-	_svt_pending_pages.erase(p_slot);
-	if (_svt_page_pipeline) { _svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
-	if (_vt_baker.is_valid() && p_slot >= 0) {
-		baker(_vt_baker)->invalidate_slot(p_slot);
+	_vt.svt_pending_pages.erase(p_slot);
+	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
+	if (_vt.vt_baker.is_valid() && p_slot >= 0) {
+		baker(_vt.vt_baker)->invalidate_slot(p_slot);
 	}
-	_vt_page_records.erase(p_slot);
+	_vt.vt_page_records.erase(p_slot);
 }
 
 String Terrain3D::_svt_page_path(const Vector2i &p_address, int p_mip) const {
 	if (_data_directory.is_empty()) {
 		return String();
 	}
-	return _data_directory.path_join("svt_cells").path_join(tile_key(p_address, 0) + ".vtcell");
+	return TerrainVTCell::path(_data_directory, p_address, 0);
 }
 
 int Terrain3D::prepare_vt_capture() {
-	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
-	if (!producer || _vt_debug_direct_material || !_data) {
+	Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
+	if (!producer || _vt.vt_debug_direct_material || !_data) {
 		return 0;
 	}
 	// Reissue resident production into the same slots for a diagnostic capture.
 	// This does not evict pages, edit terrain, or run a persistent full bake.
-	const Array records = _vt_page_records.values();
-	const int stored_size = _vt_page_size + 2 * _vt_page_border;
+	const Array records = _vt.vt_page_records.values();
+	const int stored_size = _vt.vt_page_size + 2 * _vt.vt_page_border;
 	int queued = 0;
 	for (const Dictionary &record : records) {
 		const int slot = record.get("slot", -1);
@@ -431,8 +436,8 @@ int Terrain3D::prepare_vt_capture() {
 
 void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload, const Rect2 &p_rect,
 		bool p_svt, int p_mip, const Vector2i &p_address, const Terrain3DPagePipeline::Result *p_prepared) {
-	Terrain3DSurfaceBaker *producer = baker(_vt_baker);
-	if (_vt_debug_direct_material || !producer || p_slot < 0 || (!p_svt && p_payload.is_null())) {
+	Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
+	if (_vt.vt_debug_direct_material || !producer || p_slot < 0 || (!p_svt && p_payload.is_null())) {
 		return;
 	}
 	Ref<Image> height;
@@ -443,15 +448,15 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	record["world_rect"] = p_rect;
 	record["mip"] = p_mip;
 	record["address"] = p_address;
-	record["revision"] = int64_t(_vt_source_revision);
+	record["revision"] = int64_t(_vt.vt_source_revision);
 	record["source"] = p_payload.is_valid() ? p_payload->get_data() : PackedByteArray();
-	_vt_page_records[p_slot] = record;
+	_vt.vt_page_records[p_slot] = record;
 	if (p_svt) {
-		if (_svt_page_pipeline) { _svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
-		Terrain3DPagePipeline::Request request{{p_slot, 0, 0, 0, 0}, p_rect, _vt_page_size, _vt_page_border};
+		if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
+		Terrain3DPagePipeline::Request request{{p_slot, 0, 0, 0, 0}, p_rect, _vt.vt_page_size, _vt.vt_page_border};
 		request.svt = true; request.directory = _data_directory;
-		request.materials = _vt_material_signature; request.density = get_surface_svt_texels_per_meter();
-		_svt_pending_pages[p_slot] = std::move(request);
+		request.materials = _vt.vt_material_signature; request.density = get_surface_svt_texels_per_meter();
+		_vt.svt_pending_pages[p_slot] = std::move(request);
 		return;
 	}
 	if (p_prepared) {
@@ -459,172 +464,165 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 		return;
 	}
 	Ref<Image> ids = p_payload;
-	const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt_page_size, _vt_page_border,
+	const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt.vt_page_size, _vt.vt_page_border,
 			_vertex_spacing / _surface_density, ids, height);
-	if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt_page_size, _vt_page_border); }
+	if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
 	producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid);
 }
 
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
-	_vt_source_snapshot.reset();
-	_avt_refinement.reset();
-	_avt_plan_key.clear();
-	if (_vt_page_pipeline) { _vt_page_pipeline->reset(); }
-	if (_svt_page_pipeline) { _svt_page_pipeline->reset(); }
-	_vt_svt_dirty_regions[p_region] = true;
-	_vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
-	if (_vt_baker.is_null()) {
+	_vt.vt_source_snapshot.reset();
+	_vt.avt_refinement.reset();
+	_vt.avt_plan_key.clear();
+	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
+	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
+	_vt.vt_svt_dirty_regions[p_region] = true;
+	_vt.vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
+	if (_vt.vt_baker.is_null()) {
 		return;
 	}
 	float world = float(_region_size) * _vertex_spacing;
 	Rect2 affected(Vector2(p_region) * world, Vector2(world, world));
-	Array keys = _vt_page_records.keys();
+	Array keys = _vt.vt_page_records.keys();
 	for (int i = 0; i < keys.size(); i++) {
-		Dictionary record = _vt_page_records[keys[i]];
+		Dictionary record = _vt.vt_page_records[keys[i]];
 		Rect2 rect = record["world_rect"];
-		if (rect.grow(MAX(_vertex_spacing, rect.size.x * float(_vt_page_border + 1) / _vt_page_size)).intersects(affected)) {
-			if (_vt_svt_bake_waiting.has(keys[i])) {
+		if (rect.grow(MAX(_vertex_spacing, rect.size.x * float(_vt.vt_page_border + 1) / _vt.vt_page_size)).intersects(affected)) {
+			if (_vt.vt_svt_bake_waiting.has(keys[i])) {
 				Vector2i address = record["address"];
-				_vt_svt_bake_queue.push_back(Vector3i(address.x, address.y, int(record["mip"])));
-				_vt_svt_bake_waiting.erase(keys[i]);
+				_vt.vt_svt_bake_queue.push_back(Vector3i(address.x, address.y, int(record["mip"])));
+				_vt.vt_svt_bake_waiting.erase(keys[i]);
 			}
-			baker(_vt_baker)->invalidate_slot(int(keys[i]));
+			baker(_vt.vt_baker)->invalidate_slot(int(keys[i]));
 			// Border edits can affect a neighbour's page. Remove its address too,
 			// otherwise the scheduler would keep treating an invalid payload as a hit.
-			for (const Dictionary &owner : _surface_vt->get_slot_owner_metadata(int(keys[i]))) {
+			for (const Dictionary &owner : _vt.surface_vt->get_slot_owner_metadata(int(keys[i]))) {
 				int mip = owner["mip"];
 				Vector2i address = owner["virtual"];
 				if (bool(owner["world_space"])) {
-					int half = _surface_svt->get_indirection_size() >> 1;
-					_surface_svt->release_world_page((address.x << mip) - half, (address.y << mip) - half, mip);
+					int half = _vt.surface_svt->get_indirection_size() >> 1;
+					_vt.surface_svt->release_world_page((address.x << mip) - half, (address.y << mip) - half, mip);
 				} else {
 					Vector2i sector = owner["sector"];
-					int x = address.x - (_surface_vt->get_sector_block_origin_x(sector) >> mip);
-					int y = address.y - (_surface_vt->get_sector_block_origin_y(sector) >> mip);
-					_surface_vt->release_page(sector, mip, x, y);
+					int x = address.x - (_vt.surface_vt->get_sector_block_origin_x(sector) >> mip);
+					int y = address.y - (_vt.surface_vt->get_sector_block_origin_y(sector) >> mip);
+					_vt.surface_vt->release_page(sector, mip, x, y);
 				}
 			}
 			const int slot = keys[i];
-			_svt_pending_pages.erase(slot);
-			if (_svt_page_pipeline) { _svt_page_pipeline->cancel({slot, 0, 0, 0, 0}); }
-			_vt_page_records.erase(keys[i]);
+			_vt.svt_pending_pages.erase(slot);
+			if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({slot, 0, 0, 0, 0}); }
+			_vt.vt_page_records.erase(keys[i]);
 		}
 	}
 }
 
 Dictionary Terrain3D::get_vt_material_textures() const {
 	Dictionary result;
-	if (_vt_debug_direct_material || _vt_baker.is_null()) {
+	if (_vt.vt_debug_direct_material || _vt.vt_baker.is_null()) {
 		return result;
 	}
-	result["albedo_height"] = baker(_vt_baker)->get_albedo_rid();
-	result["normal_roughness"] = baker(_vt_baker)->get_normal_rid();
-	result["params"] = baker(_vt_baker)->get_params_rid();
+	result["albedo_height"] = baker(_vt.vt_baker)->get_albedo_rid();
+	result["normal_roughness"] = baker(_vt.vt_baker)->get_normal_rid();
+	result["params"] = baker(_vt.vt_baker)->get_params_rid();
 	return result;
 }
 Dictionary Terrain3D::get_vt_settings() const {
 	Dictionary result;
-	result["page_size"] = _vt_page_size;
-	result["border"] = _vt_page_border;
-	result["page_count"] = _vt_page_count;
-	result["auto_capacity"] = _vt_auto_capacity;
+	result["page_size"] = _vt.vt_page_size;
+	result["border"] = _vt.vt_page_border;
+	result["page_count"] = _vt.vt_page_count;
+	result["auto_capacity"] = _vt.vt_auto_capacity;
 	// Three RGBA16F outputs, R16 IDs, and R16+R32F bake staging per slot.
-	result["physical_cache_bytes"] = int64_t(_vt_page_size + 2 * _vt_page_border) * (_vt_page_size + 2 * _vt_page_border) * _vt_page_count * 32;
-	result["pages_per_update"] = _vt_pages_per_update;
-	result["shared_pool"] = _vt_shared_ready;
-	result["adaptive"] = _vt_adaptive_enabled;
-	result["avt_coarse_mip_fallback"] = _surface_vt_coarse_mip_fallback;
-	result["avt_texels_per_pixel"] = _surface_vt_texels_per_pixel;
+	result["physical_cache_bytes"] = int64_t(_vt.vt_page_size + 2 * _vt.vt_page_border) * (_vt.vt_page_size + 2 * _vt.vt_page_border) * _vt.vt_page_count * 32;
+	result["pages_per_update"] = _vt.vt_pages_per_update;
+	result["shared_pool"] = _vt.vt_shared_ready;
+	result["adaptive"] = _vt.vt_adaptive_enabled;
+	result["avt_coarse_mip_fallback"] = _vt.surface_vt_coarse_mip_fallback;
+	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
-	result["avt_distance_mips"] = _surface_vt_distance_mips;
-	result["avt_mip_ranges"] = _surface_vt_mip_ranges;
-	result["avt_distance"] = _surface_vt_distance;
+	result["avt_distance_mips"] = _vt.surface_vt_distance_mips;
+	result["avt_mip_ranges"] = _vt.surface_vt_mip_ranges;
+	result["avt_distance"] = _vt.surface_vt_distance;
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
 	result["svt_texels_per_meter"] = get_surface_svt_texels_per_meter();
-	result["svt_world_extent"] = (_surface_svt ? _surface_svt->get_indirection_size() : MAX(64, _surface_svt_page_count * 4)) * _surface_svt_page_world;
+	result["svt_world_extent"] = (_vt.surface_svt ? _vt.surface_svt->get_indirection_size() : MAX(64, _vt.surface_svt_page_count * 4)) * _vt.surface_svt_page_world;
 	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
 	result["avt_base_block_size"] = get_avt_base_block_size();
 	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
-	result["avt_sector_stats"] = _avt_sector_stats;
-	result["svt_effective_max_mip"] = _surface_svt ? _surface_svt->get_world_max_mip() : _surface_svt_max_mip;
-	result["avt_selection_mode"] = _surface_vt_selection_mode;
-	result["editor_preview"] = _vt_editor_preview;
+	result["avt_sector_stats"] = _vt.avt_sector_stats;
+	result["svt_effective_max_mip"] = _vt.surface_svt ? _vt.surface_svt->get_world_max_mip() : _vt.surface_svt_max_mip;
+	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
+	result["editor_preview"] = _vt.vt_editor_preview;
 	result["editor_preview_active"] = is_vt_editor_preview_active();
-	result["avt_region_grid"] = _surface_vt_region_grid;
-	result["avt_region_offset"] = _surface_vt_region_offset;
-	result["avt_forward_regions"] = _surface_vt_forward_regions;
+	result["avt_region_grid"] = _vt.surface_vt_region_grid;
+	result["avt_region_offset"] = _vt.surface_vt_region_offset;
+	result["avt_forward_regions"] = _vt.surface_vt_forward_regions;
 	result["avt_region_rect"] = get_surface_vt_region_rect();
-	result["callback_registered"] = _vt_callback_registered;
-	result["material_signature"] = int64_t(_vt_material_signature);
-	result["auto_bake"] = _svt_auto_bake;
-	result["auto_pending_regions"] = _vt_svt_dirty_regions.size();
-	result["bake_generation"] = int64_t(_vt_svt_bake_generation);
-	result["bake_incremental"] = _vt_svt_bake_incremental;
-	result["bake_total"] = _vt_svt_bake_total;
-	result["cells_baked"] = int64_t(_svt_cells_baked);
-	result["bake_done"] = _vt_svt_bake_done;
-	result["svt_source_pending"] = int64_t(_svt_pending_pages.size());
-	result["bake_pending"] = _vt_svt_bake_queue.size() + _vt_svt_bake_waiting.size();
-	result["bake_failed"] = _vt_svt_bake_failed;
-	result["bake_error"] = _vt_svt_bake_error;
-	if (_vt_baker.is_valid()) {
-		result["producer"] = baker(_vt_baker)->get_stats();
+	result["callback_registered"] = _vt.vt_callback_registered;
+	result["material_signature"] = int64_t(_vt.vt_material_signature);
+	result["auto_bake"] = _vt.svt_auto_bake;
+	result["auto_pending_regions"] = _vt.vt_svt_dirty_regions.size();
+	result["bake_generation"] = int64_t(_vt.vt_svt_bake_generation);
+	result["bake_incremental"] = _vt.vt_svt_bake_incremental;
+	result["bake_total"] = _vt.vt_svt_bake_total;
+	result["cells_baked"] = int64_t(_vt.svt_cells_baked);
+	result["bake_done"] = _vt.vt_svt_bake_done;
+	result["svt_source_pending"] = int64_t(_vt.svt_pending_pages.size());
+	result["bake_pending"] = _vt.vt_svt_bake_queue.size() + _vt.vt_svt_bake_waiting.size();
+	result["bake_failed"] = _vt.vt_svt_bake_failed;
+	result["bake_error"] = _vt.vt_svt_bake_error;
+	if (_vt.vt_baker.is_valid()) {
+		result["producer"] = baker(_vt.vt_baker)->get_stats();
 	}
-	if (_surface_vt) {
-		result["residency"] = _surface_vt->get_stats();
+	if (_vt.surface_vt) {
+		result["residency"] = _vt.surface_vt->get_stats();
 	}
 	return result;
 }
 Array Terrain3D::get_vt_pages() const {
 	Array result;
-	for (const Variant &key : _vt_page_records.keys()) {
-		if (!_surface_vt || _surface_vt->get_slot_owner_count(int(key)) == 0) {
+	for (const Variant &key : _vt.vt_page_records.keys()) {
+		if (!_vt.surface_vt || _vt.surface_vt->get_slot_owner_count(int(key)) == 0) {
 			continue;
 		}
-		Dictionary record = Dictionary(_vt_page_records[key]).duplicate();
+		Dictionary record = Dictionary(_vt.vt_page_records[key]).duplicate();
 		record.erase("source");
-		record["ready"] = _vt_baker.is_valid() && baker(_vt_baker)->is_page_ready(int(key));
+		record["ready"] = _vt.vt_baker.is_valid() && baker(_vt.vt_baker)->is_page_ready(int(key));
 		if (bool(record["ready"])) {
 			record["state"] = "Ready";
 		}
-		const Array owners = _surface_vt ? _surface_vt->get_slot_owner_metadata(int(key)) : Array();
+		const Array owners = _vt.surface_vt ? _vt.surface_vt->get_slot_owner_metadata(int(key)) : Array();
 		record["owners"] = owners;
 		for (const Dictionary &owner : owners) {
 			if (bool(owner["world_space"])) { continue; }
 			const Vector2i sector = owner["sector"];
 			const int mip = owner["mip"];
 			record["mip"] = mip;
-			record["address"] = Vector2i(owner["virtual"]) - Vector2i(_surface_vt->get_sector_block_origin_x(sector) >> mip, _surface_vt->get_sector_block_origin_y(sector) >> mip);
+			record["address"] = Vector2i(owner["virtual"]) - Vector2i(_vt.surface_vt->get_sector_block_origin_x(sector) >> mip, _vt.surface_vt->get_sector_block_origin_y(sector) >> mip);
 		}
 		result.push_back(record);
 	}
 	return result;
 }
 Ref<Image> Terrain3D::get_vt_page_preview(int p_slot) {
-	return _vt_baker.is_valid() ? baker(_vt_baker)->get_page_preview(p_slot) : Ref<Image>();
+	return _vt.vt_baker.is_valid() ? baker(_vt.vt_baker)->get_page_preview(p_slot) : Ref<Image>();
 }
 uint32_t Terrain3D::_svt_cell_signature(const Vector2i &p_cell) const {
-	Dictionary signature;
-	signature["materials"] = int64_t(_vt_material_signature);
-	signature["density"] = get_surface_svt_texels_per_meter();
-	signature["source_corner_interpolation"] = 1;
-	signature["spacing"] = _vertex_spacing;
-	signature["region_size"] = _region_size;
-	// Neighbour heights affect normals at the cell edge.
-	for (int y = -1; y <= 1; ++y) {
-		for (int x = -1; x <= 1; ++x) {
-			Ref<Terrain3DRegion> region = _data->get_region(p_cell + Vector2i(x, y));
-			if (region.is_null() || region->is_deleted()) {
-				continue;
-			}
-			Array hashes;
-			hashes.push_back(region->get_control_map().is_valid() ? Variant(region->get_control_map()->get_data()).hash() : 0);
-			hashes.push_back(region->get_surface_map().is_valid() ? Variant(region->get_surface_map()->get_data()).hash() : 0);
-			hashes.push_back(region->get_height_map().is_valid() ? Variant(region->get_height_map()->get_data()).hash() : 0);
-			signature[Vector2i(x, y)] = hashes;
-		}
-	}
-	return signature.hash();
+	// The signature shape lives in terrain_vt_cell.h because the runtime reader has
+	// to reproduce it exactly.
+	return TerrainVTCell::signature(int64_t(_vt.vt_material_signature), get_surface_svt_texels_per_meter(),
+			_vertex_spacing, int(_region_size), [&](int p_x, int p_y) {
+				Ref<Terrain3DRegion> region = _data->get_region(p_cell + Vector2i(p_x, p_y));
+				if (region.is_null() || region->is_deleted()) {
+					return Array();
+				}
+				Array hashes;
+				hashes.push_back(region->get_control_map().is_valid() ? Variant(region->get_control_map()->get_data()).hash() : 0);
+				hashes.push_back(region->get_surface_map().is_valid() ? Variant(region->get_surface_map()->get_data()).hash() : 0);
+				hashes.push_back(region->get_height_map().is_valid() ? Variant(region->get_height_map()->get_data()).hash() : 0);
+				return hashes;
+			});
 }
 
 Dictionary Terrain3D::_load_svt_cell(const Vector2i &p_cell) {
@@ -635,13 +633,13 @@ Dictionary Terrain3D::_load_svt_cell(const Vector2i &p_cell) {
 	Variant value = file.is_valid() ? file->get_var(false) : Variant();
 	if (value.get_type() != Variant::DICTIONARY) { return Dictionary(); }
 	Dictionary saved = value;
-	if (int(saved.get("version", 0)) != 3 || uint32_t(int64_t(saved.get("signature", 0))) != _svt_cell_signature(p_cell)) { return Dictionary(); }
+	if (int(saved.get("version", 0)) != TerrainVTCell::FORMAT_VERSION || uint32_t(int64_t(saved.get("signature", 0))) != _svt_cell_signature(p_cell)) { return Dictionary(); }
 	return saved;
 }
 
 Array Terrain3D::get_svt_baked_pages() {
-	if (!_vt_svt_catalog_loaded && !_data_directory.is_empty()) {
-		_vt_svt_catalog_loaded = true;
+	if (!_vt.vt_svt_catalog_loaded && !_data_directory.is_empty()) {
+		_vt.vt_svt_catalog_loaded = true;
 		for (const Vector2i &cell : _data->get_region_locations()) {
 			String path = _svt_page_path(cell, 0);
 			if (!FileAccess::file_exists(path)) {
@@ -653,7 +651,7 @@ Array Terrain3D::get_svt_baked_pages() {
 				continue;
 			}
 			Dictionary source = value;
-			if (int(source.get("version", 0)) != 3) {
+			if (int(source.get("version", 0)) != TerrainVTCell::FORMAT_VERSION) {
 				continue;
 			}
 			Dictionary tile;
@@ -668,55 +666,55 @@ Array Terrain3D::get_svt_baked_pages() {
 			tile["border"] = 0;
 			tile["resolution"] = source["resolution"];
 			tile["storage"] = "Baked cell mip chain";
-			_vt_svt_tiles[tile_key(cell, 0)] = tile;
+			_vt.vt_svt_tiles[tile_key(cell, 0)] = tile;
 		}
 	}
-	return _vt_svt_tiles.values();
+	return _vt.vt_svt_tiles.values();
 }
 
 int Terrain3D::bake_svt() {
-	_svt_cell_baker.unref();
-	_svt_cell_job.clear();
-	if (!_data || _vt_debug_direct_material) {
+	_vt.svt_cell_baker.unref();
+	_vt.svt_cell_job.clear();
+	if (!_data || _vt.vt_debug_direct_material) {
 		return 0;
 	}
 	set_surface_svt_enabled(true);
 	_update_vt_service();
-	_vt_svt_bake_queue.clear();
-	for (const Variant &slot : _vt_svt_bake_waiting.keys()) {
+	_vt.vt_svt_bake_queue.clear();
+	for (const Variant &slot : _vt.vt_svt_bake_waiting.keys()) {
 		if (int(slot) >= 0) {
-			_surface_svt->protect_page(int(slot), false);
+			_vt.surface_svt->protect_page(int(slot), false);
 		}
 	}
-	_vt_svt_bake_waiting.clear();
-	_vt_svt_dirty_regions.clear();
+	_vt.vt_svt_bake_waiting.clear();
+	_vt.vt_svt_dirty_regions.clear();
 	return _queue_svt_bake(Dictionary());
 }
 
 void Terrain3D::set_svt_auto_bake(bool p_enabled) {
-	_svt_auto_bake = p_enabled;
+	_vt.svt_auto_bake = p_enabled;
 	if (p_enabled && _data) {
 		for (const Vector2i &location : _data->get_region_locations()) {
-			_vt_svt_dirty_regions[location] = true;
+			_vt.vt_svt_dirty_regions[location] = true;
 		}
-		_vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
+		_vt.vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
 	}
 }
 
 void Terrain3D::_process_svt_auto_bake() {
-	if (is_vt_editor_preview_active() || !_svt_auto_bake || !_surface_svt_enabled || _data_directory.is_empty() || _vt_svt_dirty_regions.is_empty() ||
-			!_vt_svt_bake_queue.is_empty() || !_vt_svt_bake_waiting.is_empty() ||
-			Time::get_singleton()->get_ticks_msec() - _vt_svt_edit_time < 500) {
+	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !_vt.surface_svt_enabled || _data_directory.is_empty() || _vt.vt_svt_dirty_regions.is_empty() ||
+			!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty() ||
+			Time::get_singleton()->get_ticks_msec() - _vt.vt_svt_edit_time < 500) {
 		return;
 	}
-	Dictionary dirty = _vt_svt_dirty_regions.duplicate();
-	_vt_svt_dirty_regions.clear();
+	Dictionary dirty = _vt.vt_svt_dirty_regions.duplicate();
+	_vt.vt_svt_dirty_regions.clear();
 	_queue_svt_bake(dirty);
 }
 
 int Terrain3D::_queue_svt_bake(const Dictionary &p_dirty_regions) {
-	_vt_svt_bake_generation++;
-	_vt_svt_bake_incremental = !p_dirty_regions.is_empty();
+	_vt.vt_svt_bake_generation++;
+	_vt.vt_svt_bake_incremental = !p_dirty_regions.is_empty();
 	for (const Vector2i &cell : _data->get_region_locations()) {
 		bool affected = p_dirty_regions.is_empty();
 		for (const Variant &key : p_dirty_regions.keys()) {
@@ -727,39 +725,39 @@ int Terrain3D::_queue_svt_bake(const Dictionary &p_dirty_regions) {
 			}
 		}
 		if (affected) {
-			_vt_svt_bake_queue.push_back(Vector3i(cell.x, cell.y, 0));
+			_vt.vt_svt_bake_queue.push_back(Vector3i(cell.x, cell.y, 0));
 		}
 	}
-	_vt_svt_bake_total = _vt_svt_bake_queue.size();
-	_vt_svt_bake_done = 0;
-	_vt_svt_bake_failed = 0;
-	_vt_svt_bake_error = String();
-	return _vt_svt_bake_total;
+	_vt.vt_svt_bake_total = _vt.vt_svt_bake_queue.size();
+	_vt.vt_svt_bake_done = 0;
+	_vt.vt_svt_bake_failed = 0;
+	_vt.vt_svt_bake_error = String();
+	return _vt.vt_svt_bake_total;
 }
 
 void Terrain3D::_process_svt_bake(int p_page_budget) {
 	if (!_data || _data_directory.is_empty()) {
 		return;
 	}
-	if (!_svt_cell_job.is_empty()) {
-		Terrain3DSurfaceBaker *producer = baker(_svt_cell_baker);
+	if (!_vt.svt_cell_job.is_empty()) {
+		Terrain3DSurfaceBaker *producer = baker(_vt.svt_cell_baker);
 		if (!producer) {
 			return;
 		}
 		if (!producer->is_page_ready(0)) {
-			int ticks = int(_svt_cell_job.get("ticks", 0)) + 1;
-			_svt_cell_job["ticks"] = ticks;
+			int ticks = int(_vt.svt_cell_job.get("ticks", 0)) + 1;
+			_vt.svt_cell_job["ticks"] = ticks;
 			if (ticks < 600) {
 				return;
 			}
-			_vt_svt_bake_failed++;
-			_vt_svt_bake_error = "Cell bake timed out.";
+			_vt.vt_svt_bake_failed++;
+			_vt.vt_svt_bake_error = "Cell bake timed out.";
 		} else {
 			Dictionary channels = producer->export_page(0);
-			Vector2i cell = _svt_cell_job["cell"];
-			bool valid = bool(channels.get("valid", false)) && uint32_t(int64_t(_svt_cell_job["signature"])) == _svt_cell_signature(cell);
+			Vector2i cell = _vt.svt_cell_job["cell"];
+			bool valid = bool(channels.get("valid", false)) && uint32_t(int64_t(_vt.svt_cell_job["signature"])) == _svt_cell_signature(cell);
 			Dictionary images;
-			int resolution = _svt_cell_job["resolution"];
+			int resolution = _vt.svt_cell_job["resolution"];
 			if (valid) {
 				for (const String &name : { String("albedo_height"), String("normal_roughness"), String("params") }) {
 					Ref<Image> image = channels[name];
@@ -771,9 +769,9 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 			String path = _svt_page_path(cell, 0);
 			if (valid) {
 				Dictionary saved;
-				saved["version"] = 3;
-				saved["signature"] = _svt_cell_job["signature"];
-				saved["world_rect"] = _svt_cell_job["world_rect"];
+				saved["version"] = TerrainVTCell::FORMAT_VERSION;
+				saved["signature"] = _vt.svt_cell_job["signature"];
+				saved["world_rect"] = _vt.svt_cell_job["world_rect"];
 				saved["density"] = get_surface_svt_texels_per_meter();
 				Ref<Image> albedo = images["albedo_height"];
 				Ref<Image> preview = cell_mip(albedo, MAX(0, albedo->get_mipmap_count() - 7));
@@ -814,52 +812,52 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 				}
 			}
 			if (valid) {
-				_vt_svt_bake_done++;
-				_svt_cells_baked++;
-				_vt_svt_catalog_loaded = false;
-				_vt_svt_tiles.clear();
+				_vt.vt_svt_bake_done++;
+				_vt.svt_cells_baked++;
+				_vt.vt_svt_catalog_loaded = false;
+				_vt.vt_svt_tiles.clear();
 				// Requeue resident runtime pages from the newly persisted source.
-				const Rect2 cell_rect = _svt_cell_job["world_rect"];
-				for (const Variant &key : _vt_page_records.keys()) {
-					Dictionary record = _vt_page_records[key];
+				const Rect2 cell_rect = _vt.svt_cell_job["world_rect"];
+				for (const Variant &key : _vt.vt_page_records.keys()) {
+					Dictionary record = _vt.vt_page_records[key];
 					Rect2 rect = record["world_rect"];
-					if (record.get("kind", String()) != Variant("SVT") || !rect.grow(rect.size.x * _vt_page_border / _vt_page_size).intersects(cell_rect)) {
+					if (record.get("kind", String()) != Variant("SVT") || !rect.grow(rect.size.x * _vt.vt_page_border / _vt.vt_page_size).intersects(cell_rect)) {
 						continue;
 					}
 					Ref<Image> payload;
 					_queue_vt_material_page(int(key), payload, rect, true, int(record["mip"]), record["address"]);
 				}
 			} else {
-				_vt_svt_bake_failed++;
-				_vt_svt_bake_error = "Cell changed during baking or could not be saved: " + path;
+				_vt.vt_svt_bake_failed++;
+				_vt.vt_svt_bake_error = "Cell changed during baking or could not be saved: " + path;
 			}
 		}
-		_svt_cell_job.clear();
-		_vt_svt_bake_waiting.clear();
-		_svt_cell_baker.unref();
+		_vt.svt_cell_job.clear();
+		_vt.vt_svt_bake_waiting.clear();
+		_vt.svt_cell_baker.unref();
 		return;
 	}
-	if (_vt_svt_bake_queue.is_empty() || p_page_budget == 0) {
+	if (_vt.vt_svt_bake_queue.is_empty() || p_page_budget == 0) {
 		return;
 	}
-	Vector3i request = _vt_svt_bake_queue[0];
-	_vt_svt_bake_queue.remove_at(0);
+	Vector3i request = _vt.vt_svt_bake_queue[0];
+	_vt.vt_svt_bake_queue.remove_at(0);
 	Vector2i cell(request.x, request.y);
-	if (_vt_svt_bake_incremental && !_load_svt_cell(cell).is_empty()) {
-		_vt_svt_bake_done++;
+	if (_vt.vt_svt_bake_incremental && !_load_svt_cell(cell).is_empty()) {
+		_vt.vt_svt_bake_done++;
 		return;
 	}
 	float world = _region_size * _vertex_spacing;
 	int resolution = int(Math::ceil(world * get_surface_svt_texels_per_meter()));
 	if (resolution < 1 || resolution > 8192) {
-		_vt_svt_bake_failed++;
-		_vt_svt_bake_error = "Cell source resolution exceeds the supported 8192 texels; lower SVT density.";
+		_vt.vt_svt_bake_failed++;
+		_vt.vt_svt_bake_error = "Cell source resolution exceeds the supported 8192 texels; lower SVT density.";
 		return;
 	}
 	Rect2 rect(Vector2(cell) * world, Vector2(world, world));
 	Ref<Image> ids;
 	if (_data->produce_surface_rect_page(rect, resolution, 1, ids) < 0) {
-		_vt_svt_bake_failed++;
+		_vt.vt_svt_bake_failed++;
 		return;
 	}
 	Ref<Image> height;
@@ -870,17 +868,17 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 			_assets->get_texture_colors(), _assets->get_texture_normal_depths(), _assets->get_texture_ao_strengths(),
 			_assets->get_texture_ao_light_affects(), _assets->get_texture_roughness_mods(), _assets->get_texture_uv_scales(),
 			_assets->get_texture_detiles(), _assets->get_texture_slope_params());
-	_svt_cell_baker = producer;
-	_svt_cell_job["cell"] = cell;
-	_svt_cell_job["world_rect"] = rect;
-	_svt_cell_job["resolution"] = resolution;
-	_svt_cell_job["signature"] = int64_t(_svt_cell_signature(cell));
-	_vt_svt_bake_waiting[-1] = 0;
+	_vt.svt_cell_baker = producer;
+	_vt.svt_cell_job["cell"] = cell;
+	_vt.svt_cell_job["world_rect"] = rect;
+	_vt.svt_cell_job["resolution"] = resolution;
+	_vt.svt_cell_job["signature"] = int64_t(_svt_cell_signature(cell));
+	_vt.vt_svt_bake_waiting[-1] = 0;
 	const Vector3 source_grid = bake_source_grid(_data, rect, resolution, 1,
 			_vertex_spacing / _surface_density, ids, height);
 	if (height.is_null()) { height = _data->make_vt_height_page(rect, resolution, 1); }
 	producer->queue_page(0, ids, height, rect, 1.f, source_grid);
-	RS->call_on_render_thread(Callable(producer.ptr(), "render_pending").bind(_svt_cell_baker));
+	RS->call_on_render_thread(Callable(producer.ptr(), "render_pending").bind(_vt.svt_cell_baker));
 }
 
 void Terrain3D::_bind_vt_methods() {
