@@ -108,7 +108,12 @@ private:
 	ID id = UNASSIGNED_ID;
 
 	static inline SafeFlag is_main_thread_assigned{ false };
-	static SafeNumeric<uint64_t> id_counter;
+	// Hands out thread IDs from a counter that is initialized on first use. A
+	// plain static counter is initialized dynamically, which is too late: any
+	// library that starts a thread from its own static initializer (a profiler,
+	// an allocator, ...) would then be handed the IDs, including MAIN_ID,
+	// before this translation unit has run its initialization.
+	static ID next_id();
 	static thread_local ID caller_id;
 	THREADING_NAMESPACE::thread thread;
 

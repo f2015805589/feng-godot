@@ -1,0 +1,2 @@
+# Keep the driver script out of the project's resource scan; only the fixture
+# created by misc/scripts/test_feng_godottracy.py enables it.

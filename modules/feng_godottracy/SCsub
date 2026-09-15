@@ -1,0 +1,12 @@
+#!/usr/bin/env python
+
+Import("env")
+Import("env_modules")
+
+env_feng_godottracy = env_modules.Clone()
+
+# The Tracy client itself is compiled by core/profiling/SCsub from the
+# `profiler_path` this module's config.py points at thirdparty/tracy, so exactly
+# one translation unit provides the client to the whole engine.
+env_feng_godottracy.add_source_files(env.modules_sources, "register_types.cpp")
+env_feng_godottracy.add_source_files(env.modules_sources, "feng_godottracy.cpp")

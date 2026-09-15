@@ -37,8 +37,16 @@
 #ifdef THREADS_ENABLED
 #include "core/object/script_language.h"
 
-SafeNumeric<uint64_t> Thread::id_counter(1); // The first value after .increment() is 2, hence by default the main thread ID should be 1.
-thread_local Thread::ID Thread::caller_id = Thread::id_counter.increment();
+Thread::ID Thread::next_id() {
+	// Function-local, so it is initialized on first use instead of at an
+	// unspecified point of the static initialization of this translation unit.
+	// The first value after .increment() is 2, hence by default the main thread
+	// ID should be 1.
+	static SafeNumeric<uint64_t> counter(1);
+	return counter.increment();
+}
+
+thread_local Thread::ID Thread::caller_id = Thread::next_id();
 
 #endif
 
@@ -71,7 +79,7 @@ void Thread::callback(ID p_caller_id, const Settings &p_settings, Callback p_cal
 
 Thread::ID Thread::start(Thread::Callback p_callback, void *p_user, const Settings &p_settings) {
 	ERR_FAIL_COND_V_MSG(id != UNASSIGNED_ID, UNASSIGNED_ID, "A Thread object has been re-started without wait_to_finish() having been called on it.");
-	id = id_counter.increment();
+	id = next_id();
 	thread = THREADING_NAMESPACE::thread(&Thread::callback, id, p_settings, p_callback, p_user);
 	return id;
 }
@@ -99,7 +107,7 @@ void Thread::make_main_thread() {
 void Thread::release_main_thread() {
 	CRASH_COND_MSG(caller_id != MAIN_ID, "Trying to release main thread from a thread that isn't main.");
 	CRASH_COND(!is_main_thread_assigned.clear_if_set());
-	caller_id = id_counter.increment();
+	caller_id = next_id();
 }
 
 Error Thread::set_name(const String &p_name) {
