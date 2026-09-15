@@ -92,6 +92,8 @@ void Terrain3D::_destroy_surface_svt() {
 
 void Terrain3D::set_surface_svt_enabled(const bool p_enabled) {
 	_vt.surface_svt_enabled = p_enabled;
+	if (p_enabled) { _vt.svt_startup_ready = false; }
+	if (p_enabled && _initialized) { set_physics_process(true); }
 	LOG(INFO, "Far-field surface virtual texture ", p_enabled ? "enabled" : "disabled");
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
@@ -570,6 +572,7 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 
 void Terrain3D::set_surface_vt_enabled(const bool p_enabled) {
 	_vt.surface_vt_enabled = p_enabled;
+	if (p_enabled && _initialized) { set_physics_process(true); }
 	LOG(INFO, "Surface virtual texture ", p_enabled ? "enabled" : "disabled");
 	if (_initialized && _material.is_valid()) {
 		// The shader's `_vt.surface_vt_enabled` uniform and its block table have to follow
@@ -682,6 +685,15 @@ void Terrain3D::set_surface_vt_force_mip(const bool p_enabled, const int p_mip) 
 
 void Terrain3D::set_surface_vt_feedback_enabled(const bool p_enabled) {
 	_vt.surface_vt_feedback_enabled = p_enabled;
+	// Feedback is optional legacy/debug mip refinement. Toggling it must not leave a stale
+	// result, nor be required to wake the CPU visibility demand that owns normal AVT/SVT.
+	_vt.surface_vt_feedback_tick = 0;
+	if (!p_enabled && _vt.surface_vt_feedback) {
+		memdelete_safely(_vt.surface_vt_feedback);
+	}
+	if (_initialized && (_vt.surface_vt_enabled || _vt.surface_svt_enabled)) {
+		set_physics_process(true);
+	}
 	LOG(INFO, "Surface virtual texture GPU feedback ", p_enabled ? "enabled" : "disabled");
 }
 

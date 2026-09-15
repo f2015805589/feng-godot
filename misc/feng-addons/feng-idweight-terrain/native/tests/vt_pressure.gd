@@ -153,7 +153,9 @@ func setup_case(adaptive: bool) -> void:
 	terrain.set_vt_adaptive_enabled(adaptive)
 	terrain.surface_vt_pages_per_axis = PAGES_PER_AXIS
 	terrain.surface_vt_distance = SVT_DISTANCE
-	terrain.surface_vt_feedback_enabled = true
+	# Runtime sector/target-grid demand and SVT roots must be self-sufficient. GPU feedback is
+	# a legacy diagnostic refinement, never the switch that makes either tier start loading.
+	terrain.surface_vt_feedback_enabled = false
 	terrain.surface_vt_feedback_interval = 1
 	terrain.surface_vt_feedback_grid_chunks = 8
 	terrain.surface_vt_feedback_min_extent = 1.0

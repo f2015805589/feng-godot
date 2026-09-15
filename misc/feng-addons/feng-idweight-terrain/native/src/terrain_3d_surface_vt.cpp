@@ -210,20 +210,21 @@ void Terrain3D::_reset_vt_configuration() {
 	// Old world addresses and channel dimensions cannot survive reconfiguration.
 	_cancel_svt_bake("VT configuration changed; run Bake SVT again.");
 	_vt.vt_shared_ready = false;
+	_vt.svt_startup_ready = false;
 	invalidate_vt_materials();
 }
-void Terrain3D::set_surface_vt_coarse_mip_fallback(bool p_enabled) {
-	if (_vt.surface_vt_coarse_mip_fallback == p_enabled) { return; }
-	_vt.surface_vt_coarse_mip_fallback = p_enabled;
+void Terrain3D::set_avt_feedback(bool p_enabled) {
+	if (_vt.avt_feedback == p_enabled) { return; }
+	_vt.avt_feedback = p_enabled;
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
 // The far field's sibling of the switch above. It only changes what the shader does with
 // a miss; residency, demand and production are untouched, so no pool or page has to be
 // rebuilt - a uniform update is the whole effect.
-void Terrain3D::set_surface_svt_root_fallback(bool p_enabled) {
-	if (_vt.surface_svt_root_fallback == p_enabled) { return; }
-	_vt.surface_svt_root_fallback = p_enabled;
+void Terrain3D::set_svt_feedback(bool p_enabled) {
+	if (_vt.svt_feedback == p_enabled) { return; }
+	_vt.svt_feedback = p_enabled;
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
@@ -268,6 +269,7 @@ void Terrain3D::_configure_vt_service() {
 	if (_vt.vt_shared_ready) {
 		return;
 	}
+	_vt.svt_startup_ready = false;
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
 	_vt.avt_plan_key.clear();
@@ -452,11 +454,33 @@ void Terrain3D::_process_async_svt_pages() {
 				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect);
 				cell_copy_queued = true;
 			} else {
-				record["state"] = "Missing/stale cell bake";
+				// A partially available persisted page must not strand the published slot with
+				// raw IDs but no material params. Fall back to the resident terrain payload for
+				// this page immediately; disk cells remain an accelerator, not a requirement.
+				Ref<Image> ids;
+				Ref<Image> height;
+				if (_data->produce_surface_rect_page(it->second.rect, _vt.vt_page_size,
+						_vt.vt_page_border, ids) >= 0) {
+					const Vector3 source_grid = bake_source_grid(_data, it->second.rect,
+							_vt.vt_page_size, _vt.vt_page_border,
+							_vertex_spacing / _surface_density, ids, height);
+					if (height.is_null()) {
+						height = _data->make_vt_height_page(it->second.rect,
+								_vt.vt_page_size, _vt.vt_page_border);
+					}
+					if (ids.is_valid() && height.is_valid()) {
+						record["state"] = "Pending resident fallback";
+						baker(_vt.vt_baker)->queue_page(slot, ids, height,
+								it->second.rect, 1.f, source_grid);
+						cell_copy_queued = true;
+					}
+				}
+				if (!cell_copy_queued) {
+					record["state"] = "Missing/stale cell bake";
+				}
 				// A running explicit job already covers these cells: a full bake covers every
 				// region. Arming the automatic job here makes it start the frame the explicit
-				// job drains and replace its job-scoped progress counters, which the dock and
-				// the tests read as "the bake completed".
+				// job drains and replace its job-scoped progress counters.
 				const bool explicit_job = _vt.vt_svt_explicit_bake ||
 						!_vt.vt_svt_bake_queue.is_empty() ||
 						!_vt.vt_svt_bake_waiting.is_empty();
@@ -877,8 +901,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["pages_per_update"] = _vt.vt_pages_per_update;
 	result["shared_pool"] = _vt.vt_shared_ready;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
-	result["avt_coarse_mip_fallback"] = _vt.surface_vt_coarse_mip_fallback;
-	result["svt_root_fallback"] = _vt.surface_svt_root_fallback;
+	result["avt_feedback"] = _vt.avt_feedback;
+	result["svt_feedback"] = _vt.svt_feedback;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
 	result["avt_distance_mips"] = _vt.surface_vt_distance_mips;
@@ -1321,10 +1345,10 @@ void Terrain3D::_bind_vt_methods() {
 	VT_BIND_SETTING(vt_auto_capacity);
 	VT_BIND_SETTING(vt_pages_per_update);
 	VT_BIND_SETTING(vt_frame_budget_ms);
-	VT_BIND_SETTING(surface_svt_root_fallback);
+	VT_BIND_SETTING(svt_feedback);
 #undef VT_BIND_SETTING
-	ClassDB::bind_method(D_METHOD("set_surface_vt_coarse_mip_fallback", "enabled"), &Terrain3D::set_surface_vt_coarse_mip_fallback);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_coarse_mip_fallback"), &Terrain3D::get_surface_vt_coarse_mip_fallback);
+	ClassDB::bind_method(D_METHOD("set_avt_feedback", "enabled"), &Terrain3D::set_avt_feedback);
+	ClassDB::bind_method(D_METHOD("get_avt_feedback"), &Terrain3D::get_avt_feedback);
 	ClassDB::bind_method(D_METHOD("set_vt_adaptive_enabled", "enabled"), &Terrain3D::set_vt_adaptive_enabled);
 	ClassDB::bind_method(D_METHOD("is_vt_adaptive_enabled"), &Terrain3D::is_vt_adaptive_enabled);
 	ClassDB::bind_method(D_METHOD("set_vt_editor_preview", "enabled"), &Terrain3D::set_vt_editor_preview);

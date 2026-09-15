@@ -75,8 +75,8 @@ func run() -> void:
 	var transition := shot.get_pixelv(screen_of(Vector2(32.5,34)))
 	require(classify(transition) == "red", "missing neighbours do not change ready-page shading")
 	# Optional recovery uses resident AVT parents without changing page demand.
-	require(not terrain.surface_vt_coarse_mip_fallback, "coarse recovery defaults off")
-	terrain.surface_vt_coarse_mip_fallback = true
+	require(not terrain.surface_vt_feedback, "coarse recovery defaults off")
+	terrain.surface_vt_feedback = true
 	# The public setter refreshes material uniforms; restore our synthetic cache.
 	RenderingServer.material_set_param(rid, "_surface_material_albedo", albedo_array.get_rid())
 	RenderingServer.material_set_param(rid, "_surface_material_normal", normal_array.get_rid())
@@ -100,7 +100,7 @@ func run() -> void:
 	vt.commit()
 	shot = await frame_image(3)
 	require(sample_area(shot, Vector2(34,34),0) == "red", "fine arrival restores full detail with recovery enabled")
-	terrain.surface_vt_coarse_mip_fallback = false
+	terrain.surface_vt_feedback = false
 	RenderingServer.material_set_param(rid, "_surface_material_albedo", albedo_array.get_rid())
 	RenderingServer.material_set_param(rid, "_surface_material_normal", normal_array.get_rid())
 	RenderingServer.material_set_param(rid, "_surface_material_params", param_array.get_rid())

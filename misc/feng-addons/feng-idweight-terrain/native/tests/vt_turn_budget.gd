@@ -280,7 +280,7 @@ func run() -> void:
 	terrain.surface_vt_distance = NEAR_DISTANCE
 	# The near field recovers a miss from a resident coarse page instead of diagnosing it,
 	# which is the setting a session that navigates a world runs.
-	terrain.surface_vt_coarse_mip_fallback = true
+	terrain.surface_vt_feedback = true
 	terrain.cdlod_enabled = true
 	# The budget the VT section of one tick may spend. Set explicitly so the measurement
 	# states the value it was taken at.
@@ -330,12 +330,20 @@ func run() -> void:
 			"far-field-only turn VT streaming peaked at %.4f ms, over the %.2f ms budget" % [peak_vt_ms, VT_BUDGET_MS])
 	terrain.surface_vt_enabled = true
 
-	# Cold sweep: a VT settings change rebuilds the shared pool, which releases every
-	# resident page, so the whole visible world is produced again while the camera keeps
-	# moving. This is the worst case a turn can present.
+	# Isolate AVT and sample an abrupt opposite view while its cache is settled. This is the
+	# real camera-turn contract: every direction inside reach already has an AVT terminal root.
+	terrain.surface_svt_enabled = false
+	turn(180.0)
+	await tick(false)
+	var jump_seen := scan_magenta()
+	var jump_total := int(jump_seen["bands"].x) + int(jump_seen["bands"].y) + int(jump_seen["bands"].z)
+	print("VT_TURNBUDGET warm_jump_avt=", jump_seen)
+	require(jump_total == 0, "isolated AVT exposed polygons on a settled 180-degree turn: " + str(jump_seen))
+	terrain.surface_svt_enabled = true
+
+	# Cold sweep: a VT settings change deliberately destroys the shared pool. Its first frame
+	# is allowed to diagnose while new physical content is produced; it must still settle.
 	terrain.vt_page_border = 5
-	for frame in 8:
-		await tick(false)
 	var cold_paint := await sweep("cold", 180.0, false, true)
 	var cold_settings := terrain.get_vt_settings()
 	print("VT_TURNBUDGET cold producer=", cold_settings.get("producer", {}),

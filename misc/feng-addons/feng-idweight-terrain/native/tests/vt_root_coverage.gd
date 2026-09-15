@@ -175,7 +175,7 @@ func run() -> void:
 	terrain.surface_svt_distance = REACH
 	terrain.surface_svt_max_mip = MAX_MIP
 	terrain.surface_svt_root_mips = 2
-	terrain.surface_svt_root_fallback = true
+	terrain.surface_svt_feedback = true
 	for z in GRID:
 		for x in GRID:
 			var location := Vector2i(x, z)
@@ -186,6 +186,14 @@ func run() -> void:
 	await set_view(CENTER_WORLD, 400.0, float(GRID * REGION_SIZE))
 	terrain.surface_vt_enabled = false
 	terrain.surface_svt_enabled = true
+	# Startup must render the live source material while protected roots are still pending,
+	# never the full-screen missing-page checker.
+	terrain.update_surface_svt(PAGE_COUNT)
+	var startup := await frame_image(1)
+	var startup_stats := patch_stats(startup, CENTER_WORLD)
+	print("VTROOTCOVER startup=", startup_stats)
+	require(float(startup_stats["magenta"]) < 0.02,
+			"SVT startup must not expose the missing-page checker")
 	for _frame in 150:
 		terrain.update_surface_svt(PAGE_COUNT)
 		await process_frame

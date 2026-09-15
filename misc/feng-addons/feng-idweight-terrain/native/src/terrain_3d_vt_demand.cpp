@@ -244,6 +244,10 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	}
 	if (roots_cached) {
 		_vt.svt_root_skips++;
+		if (!_vt.svt_startup_ready) {
+			_vt.svt_startup_ready = true;
+			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+		}
 	} else {
 		_vt.svt_root_passes++;
 		std::vector<Vector3i> next_roots;
@@ -321,6 +325,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		}
 		_vt.svt_root_key = root_key;
 		_vt.svt_roots_settled = settled;
+		// `settled` means every address was allocated. Content readiness is verified by the
+		// cached pass above on the next tick; do not expose strict SVT before that verification.
 	}
 
 	// Over-subscription raises a shared coarseness floor instead of dropping the far end of

@@ -307,10 +307,11 @@ public:
 	int get_vt_page_count() const { return _vt.vt_page_count; }
 	void set_vt_pages_per_update(int p_pages);
 	int get_vt_pages_per_update() const { return _vt.vt_pages_per_update; }
-	void set_surface_vt_coarse_mip_fallback(bool p_enabled);
-	bool get_surface_vt_coarse_mip_fallback() const { return _vt.surface_vt_coarse_mip_fallback; }
-	void set_surface_svt_root_fallback(bool p_enabled);
-	bool get_surface_svt_root_fallback() const { return _vt.surface_svt_root_fallback; }
+	void set_avt_feedback(bool p_enabled);
+	bool get_avt_feedback() const { return _vt.avt_feedback; }
+	void set_svt_feedback(bool p_enabled);
+	bool get_svt_feedback() const { return _vt.svt_feedback; }
+	bool is_svt_startup_ready() const { return !_vt.svt_feedback || _vt.surface_svt_root_mips <= 0 || _vt.svt_startup_ready; }
 	void set_vt_adaptive_enabled(bool p_enabled);
 	bool is_vt_adaptive_enabled() const { return _vt.vt_adaptive_enabled; }
 	void set_vt_editor_preview(bool p_enabled);

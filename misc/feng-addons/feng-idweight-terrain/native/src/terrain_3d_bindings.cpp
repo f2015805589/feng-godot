@@ -344,7 +344,8 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_coarse_mip_fallback"), "set_surface_vt_coarse_mip_fallback", "get_surface_vt_coarse_mip_fallback");
+	// The subgroup strips `surface_vt_`, so the Inspector shows exactly `Feedback`.
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_feedback"), "set_avt_feedback", "get_avt_feedback");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
@@ -376,7 +377,8 @@ void Terrain3D::_bind_methods() {
 	// fallback switch. On, a miss at the level the distance rule selected is served by a
 	// coarser resident level (the baked root pyramid) instead of the diagnostic material.
 	// Off restores the strict walk, where a missing page stays visible as the diagnostic.
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_root_fallback"), "set_surface_svt_root_fallback", "get_surface_svt_root_fallback");
+	// The subgroup strips `surface_svt_`, so this independently also shows `Feedback`.
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_feedback"), "set_svt_feedback", "get_svt_feedback");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");

@@ -271,8 +271,8 @@ func run() -> void:
 	require(float(partial_stats["black"]) < 0.10,
 			"partial AVT/SVT residency must not turn far terrain black")
 
-	# Keep real SVT ready, but make the selected AVT table invalid. The fragment
-	# must diagnose the AVT miss rather than silently using the SVT underneath.
+	# Keep real SVT ready, but make the selected AVT table invalid. AVT feedback is its own
+	# hierarchy and must never silently substitute an SVT page for an AVT miss.
 	await frame_image(20)
 	terrain.set_physics_process(false)
 	var invalid_page_table := Image.create(512, 512, false, Image.FORMAT_RF)
@@ -284,7 +284,7 @@ func run() -> void:
 	var avt_missing_with_svt := await frame_image()
 	avt_missing_with_svt.save_png(output_dir.path_join("missing-avt-with-valid-svt.png"))
 	require(float(patch_stats(avt_missing_with_svt, FAR_WORLD)["magenta"]) > 0.20,
-			"selected AVT miss must not fall through to ready SVT")
+			"selected AVT miss must not cross into the independent SVT feedback hierarchy")
 
 	print("VT_FALLBACK_FINAL_STATS ", terrain.get_vt_settings())
 	scene.queue_free()

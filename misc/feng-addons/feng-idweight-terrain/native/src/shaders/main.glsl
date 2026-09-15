@@ -58,7 +58,7 @@ uniform float _avt_base_block_size = 256.0;
 uniform float _avt_mip_distance[16];
 uniform int _avt_mip_distance_count = 0;
 uniform bool _avt_sectors_enabled = false;
-uniform bool _avt_coarse_mip_fallback = false;
+uniform bool _avt_feedback = false;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
 uniform int _avt_directory_mask = 0;
 uniform int _avt_root_level = 1;
@@ -83,7 +83,7 @@ uniform highp sampler2D _region_map : filter_nearest, repeat_disable;
 #ifdef TERRAIN_NO_VT
 const bool _surface_vt_enabled = false;
 const bool _surface_svt_enabled = false;
-const bool _surface_svt_root_fallback = false;
+const bool _svt_feedback = false;
 const bool _surface_material_enabled = false;
 const bool _surface_material_required = false;
 #else
@@ -118,7 +118,7 @@ uniform bool _surface_svt_enabled = false;
 // Whether a fragment whose selected far-field level has no ready page may be served by a
 // coarser resident level. Off by default: the level the distance rule selected is the
 // one that must render, and a miss is the diagnostic. On restores the coarse walk.
-uniform bool _surface_svt_root_fallback = false;
+uniform bool _svt_feedback = false;
 uniform float _surface_svt_page_world = 512.0;
 uniform int _surface_svt_page_size = 256;
 uniform int _surface_svt_page_border = 4;
@@ -324,7 +324,7 @@ int surface_svt_mip_for_distance(float p_distance) {
 	return mip;
 }
 
-// Sampling starts at the level the distance selects. With `_surface_svt_root_fallback` off
+// Sampling starts at the level the distance selects. With `_svt_feedback` off
 // that is the only level tried: a page that is missing or still in production stays a miss
 // and the caller renders the diagnostic, so the level that was selected is the level that
 // was drawn. With the switch on the walk continues coarser, which recovers a fragment from
@@ -343,7 +343,7 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	// level. Nothing else in the body changes, which keeps the enabled path identical to
 	// the walk this shader had before the switch existed.
 	int last_mip = start_mip;
-	if (_surface_svt_root_fallback) { last_mip = _surface_svt_max_mip; }
+	if (_svt_feedback) { last_mip = _surface_svt_max_mip; }
 	for (int mip = start_mip; mip <= last_mip; mip++) {
 		ivec2 coord = (page + ivec2(half)) >> mip;
 		int level_size = max(1, _surface_svt_indirection_size >> mip);
@@ -368,7 +368,7 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 
 // Both virtual address spaces resolve into the same material arrays. A missing
 // or pending selected page displays diagnostics; residency never selects a substitute mip.
-// The one exception is the far field's opt-in `_surface_svt_root_fallback` below, which is
+// The one exception is the far field's opt-in `_svt_feedback` below, which is
 // a request to trade that diagnostic for a coarser resident level.
 bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
@@ -394,7 +394,7 @@ bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_norm
 		if (all(greaterThanEqual(virtual_page, ivec2(0))) && all(lessThan(virtual_page, ivec2(_surface_svt_indirection_size)))) {
 			int start_mip = surface_svt_mip_for_distance(surface_svt_distance(world));
 			int last_mip = start_mip;
-			if (_surface_svt_root_fallback) { last_mip = _surface_svt_max_mip; }
+			if (_svt_feedback) { last_mip = _surface_svt_max_mip; }
 			for (int mip = start_mip; mip <= last_mip; mip++) {
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
@@ -456,7 +456,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 		ivec2 sector = ivec2(floor(world / span));
 		vec4 entry;
 		if (!avt_find_sector(sector, level, entry)) {
-			if (_avt_coarse_mip_fallback) { continue; }
+			if (_avt_feedback) { continue; }
 			return false;
 		}
 		float base_texel = span / (entry.w * float(_surface_vt_page_size));
@@ -474,7 +474,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 			int slot = int(texelFetch(_surface_vt_indirection, page >> mip, mip).r + 0.5);
 			vec2 offset = fract(local * entry.w / float(1 << mip));
 			if (!surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, result, result_normal)) {
-				if (_avt_coarse_mip_fallback) { continue; }
+				if (_avt_feedback) { continue; }
 				return false;
 			}
 			texel_world = base_texel * float(1 << mip);
@@ -515,11 +515,23 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 		float reach = max(64.0, _avt_coverage_distance);
 		float far_weight = _surface_svt_enabled ? smoothstep(reach * 0.75, reach, distance(world, v_camera_pos.xz)) : 0.0;
 		if (far_weight >= 1.0) { return surface_svt_material_sample(world, r_mat, r_normal); }
-		bool ready = avt_filtered_sample(world, pixel_world, r_mat, r_normal);
-		if (far_weight <= 0.0) { return ready; }
+		bool avt_ready = avt_filtered_sample(world, pixel_world, r_mat, r_normal);
+		if (far_weight <= 0.0) { return avt_ready; }
 		material far_mat;
 		vec3 far_normal;
-		if (!ready || !surface_svt_material_sample(world, far_mat, far_normal)) { return false; }
+		bool svt_ready = surface_svt_material_sample(world, far_mat, far_normal);
+		// Each tier resolves only through its own feedback hierarchy. The transition itself is
+		// availability tolerant: while one side is still arriving, keep the independently
+		// resolved side instead of turning individual terrain triangles into diagnostics.
+		// This is not feedback chaining; outside this 25% transition band AVT and SVT remain
+		// strict owners of their respective ranges.
+		if (!avt_ready && !svt_ready) { return false; }
+		if (!avt_ready) {
+			r_mat = far_mat;
+			r_normal = far_normal;
+			return true;
+		}
+		if (!svt_ready) { return true; }
 		r_mat.albedo_height = mix(r_mat.albedo_height, far_mat.albedo_height, far_weight);
 		r_mat.normal_rough = mix(r_mat.normal_rough, far_mat.normal_rough, far_weight);
 		r_mat.normal_map_depth = mix(r_mat.normal_map_depth, far_mat.normal_map_depth, far_weight);
@@ -546,7 +558,7 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 				if (surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, r_mat, r_normal)) { return true; }
 				return false;
 			}
-			return false; // This region is assigned to AVT; expose its missing pages.
+			return false; // AVT owns this region and resolves misses only through AVT feedback.
 		}
 	}
 	return surface_svt_material_sample(world, r_mat, r_normal);

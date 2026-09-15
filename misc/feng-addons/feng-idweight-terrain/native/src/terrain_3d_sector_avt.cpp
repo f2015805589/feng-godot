@@ -1,5 +1,6 @@
 // World-aligned procedural AVT. Geometry regions are deliberately not sectors.
 #include "terrain_3d.h"
+#include "terrain_3d_surface_baker.h"
 #include "terrain_3d_vt_visibility.h"
 #include <algorithm>
 #include <array>
@@ -185,7 +186,15 @@ static void avt_plan_pages(Terrain3DAVTRefinement &r_job, const AVTPlanInput &p_
 	for (const Sector &sector : working) {
 		if (sector.level != root_level || !(sector.size > 0)) { continue; }
 		Page page;
-		if (make_page(sector, 0, 0, 0, page)) { chosen.push_back(page); }
+		// Terminal AVT roots are the feedback guarantee, not view-dependent detail. Select
+		// every root inside the CPU reach with the conservative surrounding sample so a yaw
+		// change keeps resolving within AVT. Treat it as sampled/required so it is produced
+		// before refinement instead of waiting in the idle-prefetch queue.
+		if (make_page(sector, 0, 0, 0, page, true)) {
+			page.sampled = true;
+			page.required = true;
+			chosen.push_back(page);
+		}
 	}
 	const int root_count = int(chosen.size());
 	// Retain the mip interval reached by the visible footprint, including its
@@ -837,11 +846,14 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 	const auto pool = _vt.surface_vt->get_page_pool();
 	r_pass.protected_slots.reserve(_vt.avt_page_plan.size() + 16);
 	r_pass.missing.reserve(_vt.avt_page_plan.size());
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
 	for (const Terrain3DAVTPageRequest &page : _vt.avt_page_plan) {
 		int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
 		if (slot >= 0 && !_vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, true); r_pass.protected_slots.push_back(slot); }
-		if (slot < 0) { r_pass.missing.push_back(&page); }
-		else { pool->mark_demanded(slot); _vt.avt_resident_slots.push_back(slot); }
+		const bool sampled_ready = slot >= 0 && (!producer || producer->is_page_ready(slot));
+		const bool stale = slot >= 0 && !sampled_ready && _vt_page_production_stale(slot);
+		if (slot < 0 || stale) { r_pass.missing.push_back(&page); }
+		if (slot >= 0) { pool->mark_demanded(slot); _vt.avt_resident_slots.push_back(slot); }
 	}
 }
 
@@ -868,7 +880,6 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass) {
 	std::vector<Terrain3DPagePipeline::Request> requests;
 	requests.reserve(32);
 	for (const Terrain3DAVTPageRequest *page : p_pass.missing) {
-		if (_vt.surface_vt->lookup_page_exact(page->owner, page->mip, page->x, page->y) >= 0) { continue; }
 		requests.push_back(_avt_page_request(*page));
 		if (requests.size() == 32) { break; }
 	}
@@ -879,16 +890,23 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass) {
 // material copy and pins the slot for the rest of the pass. Returns whether a page
 // was produced.
 bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page, bool p_prefetch) {
-	if (_vt.surface_vt->lookup_page_exact(p_page.owner, p_page.mip, p_page.x, p_page.y) >= 0) { return false; }
+	int slot = _vt.surface_vt->lookup_page_exact(p_page.owner, p_page.mip, p_page.x, p_page.y);
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	if (slot >= 0 && (!producer || producer->is_page_ready(slot))) { return false; }
+	// A recent exact entry is production already in flight. Re-queueing it would advance the
+	// slot sequence every frame and make every async encode completion stale before arrival.
+	if (slot >= 0 && !_vt_page_production_stale(slot)) { return false; }
 	if (p_prefetch) { r_pass.prefetch_pending = true; }
 	Terrain3DPagePipeline::Result prepared;
 	if (!_vt.vt_page_pipeline->poll(_avt_page_request(p_page), _vt.vt_source_snapshot, prepared)) {
 		return false;
 	}
 	const uint64_t allocation_start = Time::get_singleton()->get_ticks_usec();
-	bool miss = false;
-	int slot = _vt.surface_vt->request_page_internal(p_page.owner, p_page.mip, p_page.x, p_page.y, &miss);
-	if (slot < 0 || !miss) { return false; }
+	if (slot < 0) {
+		bool miss = false;
+		slot = _vt.surface_vt->request_page_internal(p_page.owner, p_page.mip, p_page.x, p_page.y, &miss);
+		if (slot < 0 || !miss) { return false; }
+	}
 	_invalidate_vt_slot(slot);
 	const uint64_t payload_start = Time::get_singleton()->get_ticks_usec();
 	r_pass.allocation_us += payload_start - allocation_start;

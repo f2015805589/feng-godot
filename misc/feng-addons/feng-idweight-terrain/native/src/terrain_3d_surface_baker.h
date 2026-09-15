@@ -119,7 +119,10 @@ private:
 	PackedByteArray _material_bytes;
 	int _material_count = 0;
 	std::map<int, PendingJob> _pending;
+	// Consumer-visible readiness. With compression this becomes true only after all three
+	// sampled layers were uploaded, not merely after the writable staging page finished.
 	std::vector<uint8_t> _ready;
+	std::vector<uint8_t> _sampled_channel_mask;
 	std::vector<uint64_t> _slot_sequence;
 
 	// These fields are touched by the render callback only, except for the output RS
@@ -175,8 +178,12 @@ private:
 		int channel = 0;
 		int slot = 0;
 		uint64_t generation = 0;
+		uint64_t sequence = 0;
 		godot::PackedByteArray data;
 	};
+	// Async readback completion may not share the render callback's execution context.
+	// Protect both the completion queue and its generation/slot tokens explicitly.
+	std::mutex _encode_mutex;
 	std::vector<EncodedLayer> _encoded_layers;
 	// Counters for the compressed-page pipeline, reported by get_stats() so a page that
 	// is ready in the staging arrays but never reaches the sampled ones is visible
@@ -187,9 +194,14 @@ private:
 	uint64_t _encode_failures = 0;
 	void _request_encodes();
 	void _flush_encodes(uint64_t p_generation);
-	void _on_encode_readback(const PackedByteArray &p_data, int p_slot, int p_channel);
-	bool _encode_image(int p_channel, int p_slot, const Ref<godot::Image> &p_image);
-	bool _upload_encoded_layer(int p_channel, int p_slot, const godot::PackedByteArray &p_data);
+	void _on_encode_readback(const PackedByteArray &p_data, int p_slot, int p_channel,
+			uint64_t p_generation, uint64_t p_sequence);
+	bool _encode_image(int p_channel, int p_slot, uint64_t p_generation, uint64_t p_sequence,
+			const Ref<godot::Image> &p_image);
+	bool _upload_encoded_layer(int p_channel, int p_slot, uint64_t p_generation,
+			uint64_t p_sequence, const godot::PackedByteArray &p_data);
+	void _mark_sampled_channel_ready(int p_slot, int p_channel, uint64_t p_generation,
+			uint64_t p_sequence);
 	uint64_t _dispatch_count = 0;
 	uint64_t _baked_pages = 0;
 	uint64_t _cached_uploads = 0;

@@ -161,7 +161,7 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	}
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
-	RS->material_set_param(p_material, "_avt_coarse_mip_fallback", _terrain->get_surface_vt_coarse_mip_fallback());
+	RS->material_set_param(p_material, "_avt_feedback", _terrain->get_avt_feedback());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
@@ -191,7 +191,18 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	// treated as no pages at all and the dummy array serves every channel.
 	const bool pages_valid = baked_albedo.is_valid() && baked_normal.is_valid() && baked_params.is_valid();
 	RS->material_set_param(p_material, "_surface_material_enabled", pages_valid && !_terrain->is_vt_editor_preview_active());
-	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_editor_preview_active() && !_terrain->is_vt_debug_direct_material() && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
+	// A fresh SVT has published addresses before its protected roots have material content.
+	// Keep the live source evaluator visible during that short startup window instead of
+	// presenting the diagnostic checker over the entire world. Once roots are verified ready,
+	// strict VT misses become diagnostic again. AVT-only scenes retain their strict contract.
+	// Only a SVT-owned startup may relax the global diagnostic. In a combined AVT/SVT
+	// scene doing this globally would send pending near AVT pixels through the source array
+	// and violate AVT's independent feedback contract.
+	const bool svt_starting = _terrain->is_surface_svt_enabled() && !_terrain->is_surface_vt_enabled() &&
+			!_terrain->is_svt_startup_ready();
+	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_editor_preview_active() &&
+			!_terrain->is_vt_debug_direct_material() && !svt_starting &&
+			(_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
 	RS->material_set_param(p_material, "_surface_material_albedo", pages_valid ? baked_albedo : _generated_dummy.get_rid());
 	RS->material_set_param(p_material, "_surface_material_normal", pages_valid ? baked_normal : _generated_dummy.get_rid());
 	RS->material_set_param(p_material, "_surface_material_params", pages_valid ? baked_params : _generated_dummy.get_rid());
@@ -220,7 +231,7 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	// Published outside the `svt_on` branch: a uniform that is only written while the
 	// view is up would keep whatever was bound last, and the shader reads it on every
 	// fragment of every variant.
-	RS->material_set_param(p_material, "_surface_svt_root_fallback", _terrain->get_surface_svt_root_fallback());
+	RS->material_set_param(p_material, "_svt_feedback", _terrain->get_svt_feedback());
 	if (svt_on) {
 		RS->material_set_param(p_material, "_surface_svt_page_world", _terrain->get_surface_svt_page_world());
 		RS->material_set_param(p_material, "_surface_svt_page_size", svt->get_page_size());

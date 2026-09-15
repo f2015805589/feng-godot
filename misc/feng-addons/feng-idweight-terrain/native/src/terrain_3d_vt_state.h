@@ -64,10 +64,10 @@ struct Terrain3DVTState {
 	// restores the strict residency contract for that field, where a missing page stays
 	// visible as the diagnostic - the only rendering a caller can tell apart from real
 	// material.
-	bool surface_vt_coarse_mip_fallback = true;
+	bool avt_feedback = true;
 	// Far field: allow a miss at the level the distance rule selected to be served by a
 	// coarser resident level instead of the diagnostic. Off restores the strict walk.
-	bool surface_svt_root_fallback = true;
+	bool svt_feedback = true;
 	bool vt_debug_direct_material = false;
 	bool vt_editor_preview = true;
 	Dictionary vt_editor_dirty_regions;
@@ -218,6 +218,9 @@ struct Terrain3DVTState {
 	// a baked far field at zero main-thread cost while the view is still.
 	uint64_t svt_root_key = 0;
 	bool svt_roots_settled = false;
+	// Startup gate for the diagnostic shader. The far field uses the live source material
+	// until every protected root has sampled content, then switches atomically to strict SVT.
+	bool svt_startup_ready = false;
 	// Root walks that ran, and passes that reused the plan instead. Diagnostics and tests.
 	uint64_t svt_root_passes = 0;
 	uint64_t svt_root_skips = 0;

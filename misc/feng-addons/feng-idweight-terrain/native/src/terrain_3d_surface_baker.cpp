@@ -362,6 +362,7 @@ void Terrain3DSurfaceBaker::clear() {
 		_configured = false;
 		_pending.clear();
 		_ready.clear();
+		_sampled_channel_mask.clear();
 		_slot_sequence.clear();
 		_invalidate_all = false;
 		++_generation;
@@ -685,6 +686,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		_resource_page_count = p_page_count;
 		_page_count = p_page_count;
 		_ready.resize(size_t(p_page_count), 0);
+		_sampled_channel_mask.resize(size_t(p_page_count), 0);
 		_slot_sequence.resize(size_t(p_page_count), 0);
 		// A rebuilt bundle starts with empty compressed arrays. A grown bundle migrated the
 		// staging content of every ready page, so read those back and encode them again; the
@@ -732,6 +734,7 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 	++_generation;
 	_pending.clear();
 	_ready.assign(size_t(_page_count), 0);
+	_sampled_channel_mask.assign(size_t(_page_count), 0);
 	_slot_sequence.assign(size_t(_page_count), 0);
 	_next_sequence = 1;
 	_invalidate_all = true;
@@ -755,6 +758,8 @@ void Terrain3DSurfaceBaker::set_atlas_compression(const int p_mode) {
 		_materials_dirty = true;
 		_invalidate_all = true;
 		_resource_generation = 0;
+		std::fill(_ready.begin(), _ready.end(), uint8_t(0));
+		std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
 	}
 }
 
@@ -852,7 +857,8 @@ RID Terrain3DSurfaceBaker::_sampled_rd(const int p_channel) const {
 // against this build and device when the setting was applied, so a failure here is a
 // runtime problem (a rejected update), not an unsupported request. Only a recording point
 // may call this: an upload recorded outside one is dropped by the render graph.
-bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot, const Ref<Image> &p_image) {
+bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot,
+		const uint64_t p_generation, const uint64_t p_sequence, const Ref<Image> &p_image) {
 	if (!_rd || p_image.is_null() || _atlas_compression_applied == 0) {
 		return false;
 	}
@@ -871,15 +877,36 @@ bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot,
 		_encode_failures++;
 		return false;
 	}
-	return _upload_encoded_layer(p_channel, p_slot, source->get_data());
+	return _upload_encoded_layer(p_channel, p_slot, p_generation, p_sequence, source->get_data());
+}
+
+void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_slot, const int p_channel,
+		const uint64_t p_generation, const uint64_t p_sequence) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (_generation != p_generation || p_slot < 0 || p_slot >= int(_ready.size()) ||
+			p_slot >= int(_sampled_channel_mask.size()) || p_slot >= int(_slot_sequence.size()) ||
+			_slot_sequence[size_t(p_slot)] != p_sequence) {
+		return;
+	}
+	_sampled_channel_mask[size_t(p_slot)] |= uint8_t(1u << uint32_t(p_channel));
+	if (_sampled_channel_mask[size_t(p_slot)] == 0x7u) {
+		_ready[size_t(p_slot)] = 1;
+	}
 }
 
 // The recording-time half of the encode. Both the inline cached-page path and the deferred
 // readback path end here, and both run while the frame's draw graph is recording.
-bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int p_slot, const PackedByteArray &p_data) {
+bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int p_slot,
+		const uint64_t p_generation, const uint64_t p_sequence, const PackedByteArray &p_data) {
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_generation != p_generation || p_slot < 0 || p_slot >= _page_count ||
+				p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence) {
+			return false;
+		}
+	}
 	const RID target = _sampled_rd(p_channel);
-	if (!_rd || _atlas_compression_applied == 0 || !target.is_valid() || p_data.is_empty() ||
-			p_slot < 0 || p_slot >= _page_count) {
+	if (!_rd || _atlas_compression_applied == 0 || !target.is_valid() || p_data.is_empty()) {
 		return false;
 	}
 	if (_rd->texture_update(target, uint32_t(p_slot), p_data) != OK) {
@@ -891,6 +918,7 @@ bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int
 		return false;
 	}
 	_encode_updates++;
+	_mark_sampled_channel_ready(p_slot, p_channel, p_generation, p_sequence);
 	return true;
 }
 
@@ -898,16 +926,19 @@ bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int
 // while its draw graph is recording; a layer encoded against an array bundle that has since
 // been replaced is dropped, because a rebuild invalidates every page and re-encodes it.
 void Terrain3DSurfaceBaker::_flush_encodes(uint64_t p_generation) {
-	if (_encoded_layers.empty()) {
-		return;
-	}
 	std::vector<EncodedLayer> layers;
-	layers.swap(_encoded_layers);
+	{
+		std::lock_guard<std::mutex> lock(_encode_mutex);
+		if (_encoded_layers.empty()) {
+			return;
+		}
+		layers.swap(_encoded_layers);
+	}
 	for (const EncodedLayer &layer : layers) {
 		if (layer.generation != p_generation) {
 			continue;
 		}
-		_upload_encoded_layer(layer.channel, layer.slot, layer.data);
+		_upload_encoded_layer(layer.channel, layer.slot, layer.generation, layer.sequence, layer.data);
 	}
 }
 
@@ -922,12 +953,29 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		if (!_encode_pending[slot]) {
 			continue;
 		}
+		uint64_t generation = 0;
+		uint64_t sequence = 0;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (slot >= _slot_sequence.size()) {
+				continue;
+			}
+			generation = _generation;
+			sequence = _slot_sequence[slot];
+			if (slot < _sampled_channel_mask.size()) {
+				_sampled_channel_mask[slot] = 0;
+			}
+			if (slot < _ready.size()) {
+				_ready[slot] = 0;
+			}
+		}
 		bool requested = true;
 		for (int channel = 0; channel < 3 && requested; ++channel) {
 			const RID staging = _staging_rd(channel);
 			requested = staging.is_valid() &&
 					_rd->texture_get_data_async(staging, uint32_t(slot),
-							   callable_mp(this, &Terrain3DSurfaceBaker::_on_encode_readback).bind(int(slot), channel)) == OK;
+							   callable_mp(this, &Terrain3DSurfaceBaker::_on_encode_readback)
+									   .bind(int(slot), channel, generation, sequence)) == OK;
 		}
 		// Keep the flag set when the request failed, so a later frame retries it.
 		_encode_pending[slot] = requested ? 0 : 1;
@@ -941,9 +989,14 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 	}
 }
 
-void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, const int p_slot, const int p_channel) {
-	if (_atlas_compression_applied == 0) {
-		return;
+void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, const int p_slot,
+		const int p_channel, const uint64_t p_generation, const uint64_t p_sequence) {
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_atlas_compression_applied == 0 || _generation != p_generation || p_slot < 0 ||
+				p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence) {
+			return;
+		}
 	}
 	if (p_data.size() != int64_t(_stored_size) * _stored_size * 8) {
 		if (!_encode_warned) {
@@ -975,16 +1028,20 @@ void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, c
 	}
 	// This callback runs inside the frame stall, where the draw graph has already been
 	// ended: queue the bytes and let the next render callback, which records, upload them.
-	if (_encoded_layers.size() >= size_t(MAX(4, _page_count) * 3)) {
-		_encode_failures++;
-		return;
-	}
 	EncodedLayer layer;
 	layer.channel = p_channel;
 	layer.slot = p_slot;
-	layer.generation = _generation;
+	layer.generation = p_generation;
+	layer.sequence = p_sequence;
 	layer.data = source->get_data();
-	_encoded_layers.push_back(layer);
+	{
+		std::lock_guard<std::mutex> lock(_encode_mutex);
+		if (_encoded_layers.size() >= size_t(MAX(4, _page_count) * 3)) {
+			_encode_failures++;
+			return;
+		}
+		_encoded_layers.push_back(std::move(layer));
+	}
 }
 
 // Compresses and decodes one image through the codec the atlas resolved to, reporting the
@@ -1131,6 +1188,7 @@ void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const R
 	_materials_stale = false;
 	_invalidate_all = true;
 	std::fill(_ready.begin(), _ready.end(), uint8_t(0));
+	std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
 }
 
 void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights,
@@ -1152,6 +1210,7 @@ void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
 	_ready[size_t(p_slot)] = 0;
+	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
 void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_channels) {
@@ -1173,6 +1232,7 @@ void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_ch
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
 	_ready[size_t(p_slot)] = 0;
+	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
 void Terrain3DSurfaceBaker::queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect) {
@@ -1190,6 +1250,7 @@ void Terrain3DSurfaceBaker::queue_cell_page(int p_slot, const Array &p_cells, co
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
 	_ready[size_t(p_slot)] = 0;
+	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
 void Terrain3DSurfaceBaker::invalidate_slot(int p_slot) {
@@ -1205,6 +1266,7 @@ void Terrain3DSurfaceBaker::invalidate_slot(int p_slot) {
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
 	_ready[size_t(p_slot)] = 0;
+	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
 PackedByteArray Terrain3DSurfaceBaker::_image_bytes(const Ref<Image> &p_image,
@@ -1510,7 +1572,17 @@ void Terrain3DSurfaceBaker::_set_ready(int p_slot, bool p_ready, uint64_t p_gene
 			(p_sequence == 0 && _slot_sequence[size_t(p_slot)] != 0)) {
 		return;
 	}
-	_ready[size_t(p_slot)] = p_ready ? 1 : 0;
+	if (!p_ready) {
+		_ready[size_t(p_slot)] = 0;
+		if (p_slot < int(_sampled_channel_mask.size())) {
+			_sampled_channel_mask[size_t(p_slot)] = 0;
+		}
+		return;
+	}
+	// Uncompressed output is the staging output, so recording its successful write makes
+	// the consumer-visible page ready. Compressed output is a different sampled array and
+	// becomes ready only after all three encoded layers have uploaded.
+	_ready[size_t(p_slot)] = _atlas_compression_applied.load() == 0 ? 1 : 0;
 }
 
 void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) {
@@ -1699,9 +1771,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 					if (job.kind == PENDING_CACHED) {
 						// The cached path already holds the channel images on the CPU, so it
 						// compresses them directly instead of reading staging back.
-						_encode_image(0, job.slot, job.albedo_height);
-						_encode_image(1, job.slot, job.normal_roughness);
-						_encode_image(2, job.slot, job.params);
+						_encode_image(0, job.slot, job.generation, job.sequence, job.albedo_height);
+						_encode_image(1, job.slot, job.generation, job.sequence, job.normal_roughness);
+						_encode_image(2, job.slot, job.generation, job.sequence, job.params);
 					} else {
 						// The cell pass accumulated in the staging arrays, which only the GPU
 						// has; queue the readback.
