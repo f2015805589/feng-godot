@@ -227,11 +227,13 @@ void Terrain3D::__physics_process(const double p_delta) {
 		vt_remaining -= avt_produced;
 	}
 	vt_phase(_vt.vt_avt_ms);
+	if (_vt.vt_avt_ms > _vt.vt_avt_peak_ms) { _vt.vt_avt_peak_ms = _vt.vt_avt_ms; }
 	// Refresh the far field: a world-space page grid that spans regions.
 	if (_vt.surface_svt_enabled && vt_remaining > 0) {
 		vt_remaining -= update_surface_svt(vt_remaining);
 	}
 	vt_phase(_vt.vt_svt_ms);
+	if (_vt.vt_svt_ms > _vt.vt_svt_peak_ms) { _vt.vt_svt_peak_ms = _vt.vt_svt_ms; }
 	if (!svt_baking && vt_remaining > 0 && _vt.surface_vt_enabled && is_sector_avt() &&
 			_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
 		// The initial split lets SVT make progress, but unused SVT budget belongs
@@ -240,8 +242,10 @@ void Terrain3D::__physics_process(const double p_delta) {
 		const int extra = _produce_sector_avt_pages(vt_remaining);
 		vt_remaining -= extra;
 		_vt.avt_sector_stats["produced"] = avt_produced + extra;
-		_vt.avt_sector_stats["cpu_update_ms"] = double(_vt.avt_sector_stats.get("cpu_update_ms", 0.0)) +
-				double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+		// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
+		// planner itself took, and adding the top-up into it turned a per-tick duration
+		// into a counter that only ever grew, which is not a cost anyone can act on.
+		_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	}
 	vt_phase(_vt.vt_topup_ms);
 	if (svt_baking) {

@@ -138,6 +138,12 @@ private:
 	std::vector<std::pair<uint64_t, ResourceBundle>> _retired;
 	// Generation of the bundle the material was last bound to. 0 means none yet.
 	uint64_t _acknowledged_generation = 0;
+	// Frame the acknowledgment above arrived on. The material's new RIDs are published to
+	// the renderer on the main thread and reach the drawn material a frame or more later, so
+	// the release waits RETIRE_FRAME_MARGIN frames after this before it honours the
+	// acknowledgment. Freeing sooner can still catch a draw prepared with the old pair, which
+	// the renderer reports as a missing material uniform set.
+	uint64_t _acknowledged_frame = 0;
 	bool _retire_ready = false;
 
 	uint64_t _render_frame = UINT64_MAX;
@@ -158,9 +164,32 @@ private:
 	// Pages whose staging content changed and whose compressed copy is stale.
 	std::vector<uint8_t> _encode_pending;
 	bool _encode_warned = false;
+	// Encoded layers waiting for a recording point. A readback callback runs inside the
+	// frame stall, which is after the frame's draw graph was ended and immediately before
+	// the next one is begun, so a texture_update() issued from there is recorded into the
+	// finished graph and discarded when the new one starts: the compressed arrays stayed
+	// empty while every upload reported success. The callback therefore only compresses and
+	// queues, and the render callback - which runs inside the recording - performs the
+	// uploads.
+	struct EncodedLayer {
+		int channel = 0;
+		int slot = 0;
+		uint64_t generation = 0;
+		godot::PackedByteArray data;
+	};
+	std::vector<EncodedLayer> _encoded_layers;
+	// Counters for the compressed-page pipeline, reported by get_stats() so a page that
+	// is ready in the staging arrays but never reaches the sampled ones is visible
+	// instead of only showing up as blank material in the viewport.
+	uint64_t _encode_requests = 0;
+	uint64_t _encode_readbacks = 0;
+	uint64_t _encode_updates = 0;
+	uint64_t _encode_failures = 0;
 	void _request_encodes();
+	void _flush_encodes(uint64_t p_generation);
 	void _on_encode_readback(const PackedByteArray &p_data, int p_slot, int p_channel);
 	bool _encode_image(int p_channel, int p_slot, const Ref<godot::Image> &p_image);
+	bool _upload_encoded_layer(int p_channel, int p_slot, const godot::PackedByteArray &p_data);
 	uint64_t _dispatch_count = 0;
 	uint64_t _baked_pages = 0;
 	uint64_t _cached_uploads = 0;
@@ -258,6 +287,9 @@ public:
 	RID get_albedo_rid() const;
 	RID get_normal_rid() const;
 	RID get_params_rid() const;
+	// All three sampled arrays of the current bundle at once, with the generation they
+	// belong to. Bind the material from this, never from the three getters above.
+	godot::Dictionary get_published_arrays() const;
 	bool is_page_ready(int p_slot) const;
 	Dictionary export_page(int p_slot) const;
 	// Compress and decode one image through the same codec the atlas uses, and report the

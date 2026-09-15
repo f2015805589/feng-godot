@@ -215,6 +215,10 @@ private:
 	static void _bind_vt_methods();
 	void _process_svt_bake(int p_page_budget = -1);
 	int _update_visible_svt(int p_max_pages);
+	// Whether a published far-field page still has no content: true when the producer does
+	// not hold it ready and no production for it is in flight. Demand re-produces such a page
+	// instead of treating its indirection entry as a hit.
+	bool _vt_page_production_stale(int p_slot);
 	String _svt_page_path(const Vector2i &p_address, int p_mip) const;
 	void _invalidate_vt_region(const Vector2i &p_region);
 	void _process_svt_auto_bake();

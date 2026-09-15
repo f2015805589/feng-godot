@@ -635,7 +635,6 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			LOG(WARN, "Could not allocate the compressed surface arrays; keeping uncompressed pages");
 		}
 	}
-	_encode_pending.assign(size_t(p_page_count), 0);
 	PackedByteArray initial_materials = p_material_bytes;
 	if (initial_materials.size() != MATERIAL_COUNT * MATERIAL_STRIDE) {
 		initial_materials.resize(MATERIAL_COUNT * MATERIAL_STRIDE);
@@ -687,6 +686,17 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		_page_count = p_page_count;
 		_ready.resize(size_t(p_page_count), 0);
 		_slot_sequence.resize(size_t(p_page_count), 0);
+		// A rebuilt bundle starts with empty compressed arrays. A grown bundle migrated the
+		// staging content of every ready page, so read those back and encode them again; the
+		// compressed copies are not migrated because the codec cannot be copied between
+		// formats. Without this every page that was ready before a capacity change would
+		// sample a zeroed compressed layer for the rest of the session.
+		_encode_pending.assign(size_t(p_page_count), 0);
+		if (_atlas_compression_applied.load() != 0) {
+			for (size_t slot = 0; slot < _ready.size(); ++slot) {
+				if (_ready[slot]) { _encode_pending[slot] = 1; }
+			}
+		}
 	}
 	return true;
 }
@@ -703,6 +713,13 @@ bool Terrain3DSurfaceBaker::_upload_materials(const PackedByteArray &p_material_
 ///////////////////////////
 // CPU queue and uploads
 ///////////////////////////
+
+// Frames a replaced page-array bundle is kept after the material acknowledged its successor.
+// The renderer builds the draws of a frame before the material's new pair has necessarily
+// reached them, so releasing on the acknowledgment itself - or on the very next frame - is
+// reported once per draw as a missing material uniform set. Three frames matches the depth
+// the device keeps in flight; the cost is a transient extra bundle during a format change.
+static const uint64_t RETIRE_FRAME_MARGIN = 3;
 
 void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_count) {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -833,10 +850,10 @@ RID Terrain3DSurfaceBaker::_sampled_rd(const int p_channel) const {
 
 // Compresses one channel image into the sampled array. The codec was already resolved
 // against this build and device when the setting was applied, so a failure here is a
-// runtime problem (a rejected update), not an unsupported request.
+// runtime problem (a rejected update), not an unsupported request. Only a recording point
+// may call this: an upload recorded outside one is dropped by the render graph.
 bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot, const Ref<Image> &p_image) {
-	const RID target = _sampled_rd(p_channel);
-	if (!_rd || p_image.is_null() || _atlas_compression_applied == 0 || !target.is_valid()) {
+	if (!_rd || p_image.is_null() || _atlas_compression_applied == 0) {
 		return false;
 	}
 	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression_applied];
@@ -851,9 +868,47 @@ bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot,
 			_encode_warned = true;
 			LOG(WARN, "Atlas encode failed for ", codec.name, "; compressed pages will stay blank");
 		}
+		_encode_failures++;
 		return false;
 	}
-	return _rd->texture_update(target, uint32_t(p_slot), source->get_data()) == OK;
+	return _upload_encoded_layer(p_channel, p_slot, source->get_data());
+}
+
+// The recording-time half of the encode. Both the inline cached-page path and the deferred
+// readback path end here, and both run while the frame's draw graph is recording.
+bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int p_slot, const PackedByteArray &p_data) {
+	const RID target = _sampled_rd(p_channel);
+	if (!_rd || _atlas_compression_applied == 0 || !target.is_valid() || p_data.is_empty() ||
+			p_slot < 0 || p_slot >= _page_count) {
+		return false;
+	}
+	if (_rd->texture_update(target, uint32_t(p_slot), p_data) != OK) {
+		if (!_encode_warned) {
+			_encode_warned = true;
+			LOG(WARN, "Could not upload a compressed material page; compressed pages will stay blank");
+		}
+		_encode_failures++;
+		return false;
+	}
+	_encode_updates++;
+	return true;
+}
+
+// Uploads the layers the readback callbacks compressed. Called from the render callback
+// while its draw graph is recording; a layer encoded against an array bundle that has since
+// been replaced is dropped, because a rebuild invalidates every page and re-encodes it.
+void Terrain3DSurfaceBaker::_flush_encodes(uint64_t p_generation) {
+	if (_encoded_layers.empty()) {
+		return;
+	}
+	std::vector<EncodedLayer> layers;
+	layers.swap(_encoded_layers);
+	for (const EncodedLayer &layer : layers) {
+		if (layer.generation != p_generation) {
+			continue;
+		}
+		_upload_encoded_layer(layer.channel, layer.slot, layer.data);
+	}
 }
 
 // Requests one async readback per channel for every page whose staging content changed.
@@ -876,6 +931,9 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		}
 		// Keep the flag set when the request failed, so a later frame retries it.
 		_encode_pending[slot] = requested ? 0 : 1;
+		if (requested) {
+			_encode_requests++;
+		}
 		if (!requested && !_encode_warned) {
 			_encode_warned = true;
 			LOG(WARN, "Could not request an atlas encode readback; compressed pages will stay blank");
@@ -884,13 +942,49 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 }
 
 void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, const int p_slot, const int p_channel) {
-	if (_atlas_compression_applied == 0 || p_data.size() != int64_t(_stored_size) * _stored_size * 8) {
+	if (_atlas_compression_applied == 0) {
 		return;
 	}
-	Ref<Image> image = Image::create_from_data(_stored_size, _stored_size, false, Image::FORMAT_RGBAH, p_data);
-	if (image.is_valid()) {
-		_encode_image(p_channel, p_slot, image);
+	if (p_data.size() != int64_t(_stored_size) * _stored_size * 8) {
+		if (!_encode_warned) {
+			_encode_warned = true;
+			LOG(WARN, "Atlas encode readback size ", int64_t(p_data.size()), " does not match ", int64_t(_stored_size) * _stored_size * 8);
+		}
+		_encode_failures++;
+		return;
 	}
+	_encode_readbacks++;
+	Ref<Image> image = Image::create_from_data(_stored_size, _stored_size, false, Image::FORMAT_RGBAH, p_data);
+	if (image.is_null()) {
+		_encode_failures++;
+		return;
+	}
+	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression_applied.load()];
+	Ref<Image> source = image;
+	if (source->get_format() != (codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8)) {
+		source = source->duplicate();
+		source->convert(codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8);
+	}
+	if (source->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !source->is_compressed()) {
+		if (!_encode_warned) {
+			_encode_warned = true;
+			LOG(WARN, "Atlas encode failed for ", codec.name, "; compressed pages will stay blank");
+		}
+		_encode_failures++;
+		return;
+	}
+	// This callback runs inside the frame stall, where the draw graph has already been
+	// ended: queue the bytes and let the next render callback, which records, upload them.
+	if (_encoded_layers.size() >= size_t(MAX(4, _page_count) * 3)) {
+		_encode_failures++;
+		return;
+	}
+	EncodedLayer layer;
+	layer.channel = p_channel;
+	layer.slot = p_slot;
+	layer.generation = _generation;
+	layer.data = source->get_data();
+	_encoded_layers.push_back(layer);
 }
 
 // Compresses and decodes one image through the codec the atlas resolved to, reporting the
@@ -964,15 +1058,35 @@ bool Terrain3DSurfaceBaker::materials_stale() const {
 
 void Terrain3DSurfaceBaker::acknowledge_output(const RID &p_albedo) {
 	std::lock_guard<std::mutex> lock(_mutex);
-	// Compare against the RID the getters publish, which is the compressed sampling
-	// array whenever a codec is applied - not only the uncompressed staging pair.
-	const RID published = (_atlas_compression_applied.load() != 0 && _resources.sampled_albedo_rs.is_valid())
-			? _resources.sampled_albedo_rs
-			: _resources.output_albedo_rs;
-	if (p_albedo == published && published.is_valid()) {
-		_acknowledged_generation = _resource_generation;
-		_retire_ready = true;
+	if (!p_albedo.is_valid()) {
+		return;
 	}
+	// Which bundle the material bound, not which bundle exists now. The render thread can
+	// rebuild between the caller reading the RID and this call, and acknowledging the newer
+	// generation would let the release below free the arrays the material is actually
+	// sampling - the renderer then reports a missing material uniform set for one frame.
+	// Both RIDs a bundle can publish are matched, because a bundle built before a format
+	// change carries no compressed pair while the current setting says there is one.
+	auto bundle_generation = [](const ResourceBundle &p_bundle, const RID &p_rid) -> bool {
+		return p_bundle.output_albedo_rs == p_rid || p_bundle.sampled_albedo_rs == p_rid;
+	};
+	uint64_t generation = 0;
+	if (bundle_generation(_resources, p_albedo)) {
+		generation = _resource_generation;
+	} else {
+		for (const std::pair<uint64_t, ResourceBundle> &entry : _retired) {
+			if (bundle_generation(entry.second, p_albedo)) {
+				generation = entry.first;
+				break;
+			}
+		}
+	}
+	if (generation == 0) {
+		return;
+	}
+	_acknowledged_generation = MAX(_acknowledged_generation, generation);
+	_acknowledged_frame = Engine::get_singleton()->get_frames_drawn();
+	_retire_ready = true;
 }
 
 void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const RID &p_normal_array_rid,
@@ -1466,8 +1580,12 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 			// Everything older than the bundle the material currently samples is
 			// unreferenced and can go. Nothing is freed while the material has not
 			// acknowledged a published pair yet, because these are exactly the arrays
-			// its already prepared draws may still bind.
-			const uint64_t acknowledged = _acknowledged_generation;
+			// its already prepared draws may still bind. The acknowledgment is only
+			// honoured from the frame after it arrived: the material's new pair is
+			// published on the main thread and reaches the drawn material during that
+			// frame's render, in which this pass runs.
+			const uint64_t frames_drawn = Engine::get_singleton()->get_frames_drawn();
+			const uint64_t acknowledged = frames_drawn > _acknowledged_frame + RETIRE_FRAME_MARGIN ? _acknowledged_generation : 0;
 			if (acknowledged != 0) {
 				for (size_t index = 0; index < _retired.size();) {
 					if (_retired[index].first < acknowledged) {
@@ -1542,15 +1660,12 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	const bool cleared_all = invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, page_count) == OK;
 	const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
 	if (_render_frame != frame) { _render_frame = frame; _frame_page_updates = 0; }
-	// Encode the pages whose staging content changed in an earlier frame. The readbacks are
-	// async, so a page is compressed a frame or two after it was produced; until then the
-	// sampled array holds zeros, which the shader reads as "not written" and resolves
-	// through a coarser page instead of showing a half-written one.
-	_request_encodes();
-	// Compressing a page costs a readback and a codec pass, so the budget the caller asked
-	// for is capped lower while compression is on. Hydra renders four pages per frame for
-	// the same reason.
-	const int page_budget = _atlas_compression_applied != 0 ? MIN(_page_budget.load(), 4) : _page_budget.load();
+	// Compressed page production happens here, inside the recording, in two halves: the
+	// layers a readback callback compressed since the last callback are uploaded first, so
+	// the frames this callback's own production does not cover already sample real data;
+	// the readbacks for the pages produced below are then requested from this same
+	// recording, which is what makes a page compressed by the frame that produced it.
+	_flush_encodes(generation);
 	for (const PendingJob &job : jobs) {
 		if (job.generation != generation || job.slot < 0 || job.slot >= page_count) {
 			continue;
@@ -1562,7 +1677,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 			continue;
 		}
 		if (job.kind != PENDING_INVALIDATE) {
-			if (_frame_page_updates >= page_budget) {
+			if (_frame_page_updates >= _page_budget.load()) {
 				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
 				// A reused slot must not expose its previous material while deferred.
 				PendingJob invalid = job;
@@ -1626,8 +1741,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 					std::lock_guard<std::mutex> lock(_mutex);
 					_baked_pages++;
 				}
-				// The bake dispatch is only recorded here; its staging content arrives when
-				// the frame executes, so the encode is requested on the next callback.
+				// The bake dispatch is recorded just above, so the readback requested below
+				// sits after it in this same recording and the frame that produces the page
+				// is the frame that compresses it.
 				if (_atlas_compression_applied != 0 && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
 					_encode_pending[size_t(job.slot)] = 1;
 				}
@@ -1641,6 +1757,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 			}
 		}
 	}
+	// Every page produced by this callback (bake or cell copy) is read back here, in the
+	// same recording that wrote it.
+	_request_encodes();
 	if (requested_capacity > page_count) {
 		// Migrate after this frame's writes so both the still-bound old arrays and
 		// the newly published arrays contain the same completed page contents.
@@ -1661,6 +1780,31 @@ RID Terrain3DSurfaceBaker::get_albedo_rid() const {
 		return _resources.sampled_albedo_rs;
 	}
 	return _resources.output_albedo_rs;
+}
+
+// The three sampled arrays of one bundle, read under a single lock. The three getters above
+// take the mutex separately, and the render thread replaces the whole bundle between two of
+// them, so a caller that used them one by one could bind the albedo of one generation beside
+// the normal of the next. That mix is the material sampling an array the release below is
+// about to free, which the renderer reports once per draw as a missing material uniform set.
+Dictionary Terrain3DSurfaceBaker::get_published_arrays() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	Dictionary result;
+	if (_resource_generation != _generation) {
+		return result;
+	}
+	const bool compressed = _atlas_compression_applied.load() != 0;
+	result["albedo_height"] = (compressed && _resources.sampled_albedo_rs.is_valid())
+			? _resources.sampled_albedo_rs
+			: _resources.output_albedo_rs;
+	result["normal_roughness"] = (compressed && _resources.sampled_normal_rs.is_valid())
+			? _resources.sampled_normal_rs
+			: _resources.output_normal_rs;
+	result["params"] = (compressed && _resources.sampled_params_rs.is_valid())
+			? _resources.sampled_params_rs
+			: _resources.output_params_rs;
+	result["generation"] = int64_t(_resource_generation);
+	return result;
 }
 
 RID Terrain3DSurfaceBaker::get_normal_rid() const {
@@ -1779,6 +1923,11 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 		}
 		stats["atlas_compression_reason"] = reason;
 	}
+	stats["encode_pending"] = int64_t(std::count(_encode_pending.begin(), _encode_pending.end(), uint8_t(1)));
+	stats["encode_requests"] = int64_t(_encode_requests);
+	stats["encode_readbacks"] = int64_t(_encode_readbacks);
+	stats["encode_updates"] = int64_t(_encode_updates);
+	stats["encode_failures"] = int64_t(_encode_failures);
 	return stats;
 }
 

@@ -392,6 +392,58 @@ Root pages are protected because they are the fallback of last resort: if one is
 has nothing to show. Size `surface_svt_page_count` for the distance window **plus** the root
 pyramid, or the LRU will evict the near pages the test is about to look for.
 
+## Far-field root pyramid coverage
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_root_coverage_runner.py --driver vulkan
+```
+
+The pyramid has to answer *any* world position the shader can address, so its candidate set is the
+whole SVT domain, not the visible part of it. At the level the view selects that set is thousands
+of pages, and the protection cap used to truncate it in row-major order — every pinned root then
+sat in one corner of the map and the fallback answered nowhere near the camera. The level window
+now slides coarser until the whole domain fits the budget, and the coarsest level it reaches is
+published as the world mip cap so the shader's walk can reach it. The test pins:
+
+* `svt_root_coverage` covers the camera, the visible far field, and both far corners of the domain
+  (`surface_svt_page_world * indirection_size`), with the pinned count inside the protection budget;
+* the window slide itself: with `surface_svt_max_mip = 3` the planned window starts at 4 and the
+  pinned levels are coarser than that;
+* every pinned root is reported `ready` by the producer, so the fallback has content and not just
+  an indirection entry;
+* a settled view stops producing: `svt_requeues` does not grow over 60 further passes, and
+  `svt_root_skips` stays far ahead of `svt_root_passes`.
+
+Demand treats a published page with no content as a miss (`Terrain3D::_vt_page_production_stale`):
+the indirection entry survives an invalidation, so a production that was dropped, refused, or lost
+to a failed cell copy used to be sampled as an empty layer for the rest of the session — the far
+field that loads on one run and not the next. A page is re-produced at most once every
+`SVT_PAGE_RETRY_FRAMES` (30) frames while it stays empty.
+
+## Compressed material page arrays
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_compressed_render_runner.py --driver vulkan
+```
+
+`vt_atlas_compression` decides the format of the three material page arrays. A compressed format
+cannot be a storage image, so a page is produced in the RGBA16F staging arrays, read back, encoded
+on the CPU and uploaded into the sampled arrays. The upload has to happen from a recording point:
+the readback callback runs inside the frame stall, after the frame's draw graph was ended and
+immediately before the next one begins, so an upload issued from there was recorded into the
+finished graph and discarded — every upload reported success while the arrays stayed empty and the
+whole viewport showed the missing-page diagnostic. The test renders real material through BC7 and
+BC3 (patch means within 0.01 of the uncompressed frame, no magenta), and measures that one demand
+pass hands the producer the same number of pages with and without compression.
+
+Root pages and detail pages are still assembled on the GPU: a baked cell is a device-to-device
+copy. The encode path adds a readback and a codec pass per produced page, and the compressed
+arrays currently sit **beside** the staging pool rather than replacing it, so enabling compression
+adds roughly a tenth to the page-pool footprint instead of cutting it. `get_stats()` reports
+`encode_requests` / `encode_readbacks` / `encode_updates` / `encode_failures`, which is how a page
+that is ready in staging but never reaches the sampled arrays is told apart from one that was never
+produced.
+
 ## Far-field distance -> mip bands
 
 ```powershell

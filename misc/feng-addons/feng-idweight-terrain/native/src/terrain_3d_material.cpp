@@ -181,11 +181,20 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_block_sizes", padded_sizes);
 	Dictionary material_pages = _terrain->get_vt_material_textures();
 	RID baked_albedo = material_pages.get("albedo_height", RID());
-	RS->material_set_param(p_material, "_surface_material_enabled", baked_albedo.is_valid() && !_terrain->is_vt_editor_preview_active());
+	RID baked_normal = material_pages.get("normal_roughness", RID());
+	RID baked_params = material_pages.get("params", RID());
+	// The three channels are one set. The producer replaces all of them at once, but each
+	// getter reads the published bundle under its own lock, so a rebuild between two of them
+	// can hand back a valid albedo beside an empty normal or params. Binding that pair leaves
+	// the material with a texture uniform that names no texture, which the renderer reports
+	// once per draw as a missing material uniform set - so a set that is not complete is
+	// treated as no pages at all and the dummy array serves every channel.
+	const bool pages_valid = baked_albedo.is_valid() && baked_normal.is_valid() && baked_params.is_valid();
+	RS->material_set_param(p_material, "_surface_material_enabled", pages_valid && !_terrain->is_vt_editor_preview_active());
 	RS->material_set_param(p_material, "_surface_material_required", !_terrain->is_vt_editor_preview_active() && !_terrain->is_vt_debug_direct_material() && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
-	RS->material_set_param(p_material, "_surface_material_albedo", baked_albedo.is_valid() ? baked_albedo : _generated_dummy.get_rid());
-	RS->material_set_param(p_material, "_surface_material_normal", baked_albedo.is_valid() ? RID(material_pages["normal_roughness"]) : _generated_dummy.get_rid());
-	RS->material_set_param(p_material, "_surface_material_params", baked_albedo.is_valid() ? RID(material_pages["params"]) : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_albedo", pages_valid ? baked_albedo : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_normal", pages_valid ? baked_normal : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_material_params", pages_valid ? baked_params : _generated_dummy.get_rid());
 	if (vt_on) {
 		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
 		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());

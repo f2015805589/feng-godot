@@ -53,8 +53,10 @@ struct Terrain3DVTState {
 	int vt_pages_per_update = 16;
 	bool vt_adaptive_enabled = true;
 	// Atlas compression for the three material page arrays, as a
-	// Terrain3DAssets::TextureArrayCompression value. Resolved and validated by the
-	// surface baker, which reports what was applied and why a request was refused.
+	// Terrain3DAssets::TextureArrayCompression value (1 = BC7). Resolved and validated by
+	// the surface baker, which reports what was applied and why a request was refused.
+	// Default BC7: the physical page atlas is the terrain's largest allocation, and the
+	// page arrays carry an alpha channel the shader reads, which BC7 keeps.
 	int vt_atlas_compression = 0;
 	// Substitutions for a page that is missing or still in production. Both default on: a
 	// miss recovers from a resident coarser level instead of rendering the diagnostic,
@@ -205,9 +207,30 @@ struct Terrain3DVTState {
 	int surface_svt_root_mips = 2;
 	int vt_svt_visible_pages = 0;
 	// Far-field roots this pass keeps resident and protected: the coarsest levels that
-	// cover the visible world, as (mip 0 page x, mip 0 page y, level). Rebuilt every
-	// demand pass, because a root that leaves the visible set must lose its pin.
+	// cover the visible far field, as (mip 0 page x, mip 0 page y, level). The set is a
+	// function of the covered rect, the level window and the pool, so it is planned once
+	// per identity and then reused: the pyramid is baked static content, and re-requesting
+	// a page that is already pinned and protected buys nothing.
 	std::vector<Vector3i> svt_root_pages;
+	// Identity of the plan above (domain, level window, pool, pool generation, source
+	// revision), and whether the last walk pinned every root it planned. A matching key on
+	// a settled plan lets the demand pass skip the root walk entirely, which is what keeps
+	// a baked far field at zero main-thread cost while the view is still.
+	uint64_t svt_root_key = 0;
+	bool svt_roots_settled = false;
+	// Root walks that ran, and passes that reused the plan instead. Diagnostics and tests.
+	uint64_t svt_root_passes = 0;
+	uint64_t svt_root_skips = 0;
+	// World rect the last planned root set covers, and the level window it used. The
+	// fallback is only useful where its roots are, so coverage is what a test asserts:
+	// a world-sized candidate set truncated by the pin budget used to leave every root in
+	// one corner of the map.
+	Rect2 svt_root_coverage;
+	int svt_root_level_min = -1;
+	int svt_root_level_max = -1;
+	// Pages re-produced because the table named them but the producer had no content for
+	// them. A value that keeps growing in a settled view is a production that never lands.
+	uint64_t svt_requeues = 0;
 	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
 	// 0 when the distance-selected set fit. Diagnostics and tests only.
 	int svt_floor_level = 0;
@@ -242,6 +265,10 @@ struct Terrain3DVTState {
 	double vt_svt_ms = 0.0;
 	double vt_topup_ms = 0.0;
 	double vt_bake_ms = 0.0;
+	// Worst frame for each demand pass since the terrain was created, so a peak in
+	// `vt_cpu_peak_ms` can be attributed to one view without a profiler.
+	double vt_avt_peak_ms = 0.0;
+	double vt_svt_peak_ms = 0.0;
 	// Automatic-tick CPU budget for the whole VT section, in milliseconds. 0 disables it.
 	// An explicit update_surface_vt()/update_surface_svt() call is never budgeted: the page
 	// count it passes is the caller's own bound.

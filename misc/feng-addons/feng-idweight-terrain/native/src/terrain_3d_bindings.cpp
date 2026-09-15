@@ -331,6 +331,11 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
+	// The one compression setting: it covers every array the terrain uploads for the virtual
+	// textures (the three material page arrays of the shared physical atlas), so VRAM is
+	// managed here instead of per tier. BC7 by default - the atlas is the largest allocation
+	// and every page carries an alpha channel the shader reads, which BC7 keeps.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_frame_budget_ms", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_vt_frame_budget_ms", "get_vt_frame_budget_ms");
@@ -358,7 +363,6 @@ void Terrain3D::_bind_methods() {
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");
@@ -368,6 +372,11 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_feedback_grid_chunks", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_feedback_grid_chunks", "get_surface_vt_feedback_grid_chunks");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_feedback_min_extent", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_feedback_min_extent", "get_surface_vt_feedback_min_extent");
 	ADD_SUBGROUP("SVT", "surface_svt_");
+	// First in the group on purpose, mirroring the AVT group: this is the far field's
+	// fallback switch. On, a miss at the level the distance rule selected is served by a
+	// coarser resident level (the baked root pyramid) instead of the diagnostic material.
+	// Off restores the strict walk, where a missing page stays visible as the diagnostic.
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_root_fallback"), "set_surface_svt_root_fallback", "get_surface_svt_root_fallback");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");
@@ -378,9 +387,6 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_max_mip"), "set_surface_svt_max_mip", "get_surface_svt_max_mip");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_distance", "get_surface_svt_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_root_mips", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_svt_root_mips", "get_surface_svt_root_mips");
-	// Off by default: a page that is missing or still in production stays the visible
-	// diagnostic. Only an explicit request may substitute a coarser level for it.
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_root_fallback"), "set_surface_svt_root_fallback", "get_surface_svt_root_fallback");
 	// One entry per world mip level, in metres: the largest camera distance still
 	// sampled at that level. Empty = automatic (one level per doubling of the page).
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_svt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT, "float"), "set_surface_svt_mip_distances", "get_surface_svt_mip_distances");

@@ -738,6 +738,10 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	record["mip"] = p_mip;
 	record["address"] = p_address;
 	record["revision"] = int64_t(_vt.vt_source_revision);
+	// When this production was queued. Demand retries a page whose content never arrived
+	// once this stamp is older than SVT_PAGE_RETRY_FRAMES, which is what recovers from a
+	// production that was dropped, refused, or lost to a failed cell copy.
+	record["queued_frame"] = int64_t(Engine::get_singleton()->get_process_frames());
 	record["source"] = p_payload.is_valid() ? p_payload->get_data() : PackedByteArray();
 	_vt.vt_page_records[p_slot] = record;
 	if (p_svt) {
@@ -854,10 +858,9 @@ Dictionary Terrain3D::get_vt_material_textures() const {
 	if (_vt.vt_debug_direct_material || _vt.vt_baker.is_null()) {
 		return result;
 	}
-	result["albedo_height"] = baker(_vt.vt_baker)->get_albedo_rid();
-	result["normal_roughness"] = baker(_vt.vt_baker)->get_normal_rid();
-	result["params"] = baker(_vt.vt_baker)->get_params_rid();
-	return result;
+	// One locked read of the whole bundle: three separate getters can straddle a rebuild and
+	// hand back arrays from two generations, which the material then binds as one set.
+	return baker(_vt.vt_baker)->get_published_arrays();
 }
 Dictionary Terrain3D::get_vt_settings() const {
 	Dictionary result;
@@ -892,6 +895,18 @@ Dictionary Terrain3D::get_vt_settings() const {
 	// Far-field residency diagnostics: the root pyramid the last pass pinned, and the
 	// coarseness floor it raised its detail pages to (0 when the set fit).
 	result["svt_root_pages"] = int(_vt.svt_root_pages.size());
+	// What the pinned set covers and which levels it used. The fallback can only answer
+	// inside this rect, so it is the property a test checks.
+	result["svt_root_coverage"] = _vt.svt_root_coverage;
+	result["svt_root_level_min"] = _vt.svt_root_level_min;
+	result["svt_root_level_max"] = _vt.svt_root_level_max;
+	// Pages demand produced again because the table named them and the producer had no
+	// content. A settled view must stop growing this.
+	result["svt_requeues"] = int64_t(_vt.svt_requeues);
+	// Root walks that ran and passes that reused the plan. A baked far field settles after
+	// one walk, so the skip count is what proves the fallback costs nothing per frame.
+	result["svt_root_passes"] = int64_t(_vt.svt_root_passes);
+	result["svt_root_skips"] = int64_t(_vt.svt_root_skips);
 	result["svt_floor_level"] = _vt.svt_floor_level;
 	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
 	// Main-thread cost of the VT section of the last physics tick, its worst frame so
@@ -903,6 +918,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
 	phases["svt"] = _vt.vt_svt_ms;
+	phases["avt_peak"] = _vt.vt_avt_peak_ms;
+	phases["svt_peak"] = _vt.vt_svt_peak_ms;
 	phases["topup"] = _vt.vt_topup_ms;
 	phases["bake"] = _vt.vt_bake_ms;
 	result["vt_phases"] = phases;
