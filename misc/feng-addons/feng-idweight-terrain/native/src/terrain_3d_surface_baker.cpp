@@ -34,72 +34,43 @@ struct SurfaceVTLabel {
 // whose channels are RGBA are usable for material pages: each of the three arrays carries
 // an alpha value the shader reads (material height, roughness, and the params validity
 // bit), and a codec without alpha would silently drop it.
+//
+// `gpu_codec` is the block encoder's own id for the entry and `block_words` the words it
+// writes per 4x4 block, or GPU_CODEC_NONE when shaders/bc_encode.glsl implements no encoder
+// for it. Page compression runs on the GPU - that is what keeps a produced page at CPU cost
+// of a small buffer copy - so a codec without an encoder here has no producer at all and is
+// refused by the resolver rather than silently left blank.
+static constexpr uint32_t GPU_CODEC_NONE = 0xffffffffu;
+
 struct AtlasCodec {
 	const char *name;
 	Image::CompressMode mode;
 	Image::UsedChannels channels;
 	bool hdr;
 	Image::ASTCFormat block;
+	uint32_t gpu_codec;
+	int block_words;
+	RenderingDevice::DataFormat rd_format;
 };
 const AtlasCodec ATLAS_CODECS[] = {
-	{"Uncompressed", Image::COMPRESS_MAX, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4},
-	{"BC7", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
-	{"BC1 RGB", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
-	{"BC3 RGBA", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
-	{"BC4 R", Image::COMPRESS_S3TC, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4},
-	{"BC5 RG", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4},
-	{"BC6H HDR RGB", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGB, true, Image::ASTC_FORMAT_4x4},
-	{"ETC1 RGB", Image::COMPRESS_ETC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
-	{"ETC2 RGB", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4},
-	{"ETC2 RGBA", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
-	{"EAC R11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4},
-	{"EAC RG11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4},
-	{"ASTC 4x4 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4},
-	{"ASTC 8x8 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_8x8},
-	{"ASTC 4x4 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4},
-	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8},
+	{"Uncompressed", Image::COMPRESS_MAX, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"BC7", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 4u, 4, RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK},
+	{"BC1 RGB", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, 0u, 2, RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK},
+	{"BC3 RGBA", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 1u, 4, RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK},
+	{"BC4 R", Image::COMPRESS_S3TC, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, 2u, 2, RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK},
+	{"BC5 RG", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, 3u, 4, RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK},
+	{"BC6H HDR RGB", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGB, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC1 RGB", Image::COMPRESS_ETC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC2 RGB", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC2 RGBA", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"EAC R11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"EAC RG11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 4x4 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 8x8 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 4x4 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
 };
 constexpr int ATLAS_CODEC_COUNT = int(sizeof(ATLAS_CODECS) / sizeof(AtlasCodec));
-
-// The renderer format a compressed image lands in, or DATA_FORMAT_MAX when nothing maps.
-RenderingDevice::DataFormat _compressed_rd_format(const Image::Format p_format) {
-	switch (p_format) {
-		case Image::FORMAT_DXT1:
-			return RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK;
-		case Image::FORMAT_DXT3:
-			return RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK;
-		case Image::FORMAT_DXT5:
-			return RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK;
-		case Image::FORMAT_RGTC_R:
-			return RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK;
-		case Image::FORMAT_RGTC_RG:
-			return RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK;
-		case Image::FORMAT_BPTC_RGBF:
-			return RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK;
-		case Image::FORMAT_BPTC_RGBFU:
-			return RenderingDevice::DATA_FORMAT_BC6H_UFLOAT_BLOCK;
-		case Image::FORMAT_BPTC_RGBA:
-			return RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK;
-		case Image::FORMAT_ETC2_RGB8:
-			return RenderingDevice::DATA_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
-		case Image::FORMAT_ETC2_RGBA8:
-			return RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
-		case Image::FORMAT_ETC2_R11:
-			return RenderingDevice::DATA_FORMAT_EAC_R11_UNORM_BLOCK;
-		case Image::FORMAT_ETC2_RG11:
-			return RenderingDevice::DATA_FORMAT_EAC_R11G11_UNORM_BLOCK;
-		case Image::FORMAT_ASTC_4x4:
-			return RenderingDevice::DATA_FORMAT_ASTC_4x4_UNORM_BLOCK;
-		case Image::FORMAT_ASTC_4x4_HDR:
-			return RenderingDevice::DATA_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
-		case Image::FORMAT_ASTC_8x8:
-			return RenderingDevice::DATA_FORMAT_ASTC_8x8_UNORM_BLOCK;
-		case Image::FORMAT_ASTC_8x8_HDR:
-			return RenderingDevice::DATA_FORMAT_ASTC_8x8_SFLOAT_BLOCK;
-		default:
-			return RenderingDevice::DATA_FORMAT_MAX;
-	}
-}
 } // namespace
 
 // The helper source is concatenated after this preamble and before the bake body.
@@ -148,6 +119,15 @@ layout(push_constant, std430) uniform BakePushConstants {
 )"
 #include "shaders/idweight_r16.glsl"
 #include "shaders/surface_bake.glsl"
+		;
+
+// The block encoder, compiled into its own pipeline. It is the reason page compression costs
+// the CPU nothing: the staging page stays on the GPU, the encoder reads it through a sampler
+// and writes the codec's own block words into a storage buffer, and only those words - a
+// sixteenth of the half-float page at BC7 - travel back to be uploaded into the sampling
+// array. See shaders/bc_encode.glsl for the codecs and their layouts.
+static const char *SURFACE_ENCODE_SHADER =
+#include "shaders/bc_encode.glsl"
 		;
 
 namespace {
@@ -246,87 +226,92 @@ RID Terrain3DSurfaceBaker::_create_sampler(RenderingDevice *p_rd,
 	return p_rd->sampler_create(state);
 }
 
-void Terrain3DSurfaceBaker::_free_bundle(RenderingDevice *p_rd, const ResourceBundle &p_resources) {
+void Terrain3DSurfaceBaker::_collect_bundle_rids(const ResourceBundle &p_resources,
+		Array &r_rs_rids, Array &r_rd_rids) {
+	for (const RID &wrapper : { p_resources.output_albedo_rs, p_resources.output_normal_rs,
+				 p_resources.output_params_rs }) {
+		if (wrapper.is_valid()) {
+			r_rs_rids.push_back(wrapper);
+		}
+	}
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		for (const RID &wrapper : { p_resources.sampled[tier].albedo_rs,
+					 p_resources.sampled[tier].normal_rs, p_resources.sampled[tier].params_rs }) {
+			if (wrapper.is_valid()) {
+				r_rs_rids.push_back(wrapper);
+			}
+		}
+	}
+	// Drop descriptor and pipeline objects before the resources they reference. The
+	// RenderingDevice dependency tracker may invalidate a uniform set when one of its
+	// textures is freed; freeing the texture first would make the later explicit
+	// uniform-set free report an "invalid ID" during teardown.
+	for (const RID &rid : { p_resources.uniform_set, p_resources.cell_pipeline, p_resources.cell_shader,
+				 p_resources.pipeline, p_resources.shader }) {
+		if (rid.is_valid()) {
+			r_rd_rids.push_back(rid);
+		}
+	}
+	for (int channel = 0; channel < ENCODE_CHANNELS; ++channel) {
+		if (p_resources.encode_uniform[channel].is_valid()) {
+			r_rd_rids.push_back(p_resources.encode_uniform[channel]);
+		}
+	}
+	for (const RID &rid : { p_resources.encode_pipeline, p_resources.encode_shader }) {
+		if (rid.is_valid()) {
+			r_rd_rids.push_back(rid);
+		}
+	}
+	for (const RID &rid : { p_resources.output_albedo_rd, p_resources.output_normal_rd, p_resources.output_params_rd,
+				 p_resources.source_id_rd, p_resources.source_height_rd, p_resources.material_buffer,
+				 p_resources.job_buffer, p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
+				 p_resources.sampler_nearest, p_resources.sampler_linear, p_resources.encode_buffer }) {
+		if (rid.is_valid()) {
+			r_rd_rids.push_back(rid);
+		}
+	}
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		for (const RID &rid : { p_resources.sampled[tier].albedo_rd, p_resources.sampled[tier].normal_rd,
+					 p_resources.sampled[tier].params_rd }) {
+			if (rid.is_valid()) {
+				r_rd_rids.push_back(rid);
+			}
+		}
+	}
+}
+
+void Terrain3DSurfaceBaker::_free_rids(RenderingDevice *p_rd, const Array &p_rs_rids,
+		const Array &p_rd_rids) {
 	RenderingServer *server = RenderingServer::get_singleton();
 	if (server) {
-		if (p_resources.output_albedo_rs.is_valid()) {
-			server->free_rid(p_resources.output_albedo_rs);
-		}
-		if (p_resources.output_normal_rs.is_valid()) {
-			server->free_rid(p_resources.output_normal_rs);
-		}
-		if (p_resources.output_params_rs.is_valid()) {
-			server->free_rid(p_resources.output_params_rs);
-		}
-		for (const RID &sampled : { p_resources.sampled_albedo_rs, p_resources.sampled_normal_rs, p_resources.sampled_params_rs }) {
-			if (sampled.is_valid()) {
-				server->free_rid(sampled);
+		for (int i = 0; i < p_rs_rids.size(); ++i) {
+			const RID rid = p_rs_rids[i];
+			if (rid.is_valid()) {
+				server->free_rid(rid);
 			}
 		}
 	}
 	if (!p_rd) {
 		return;
 	}
-	// Drop descriptor/pipeline objects before the resources they reference.  The
-	// RenderingDevice dependency tracker may invalidate a uniform set when one of its
-	// textures is freed; freeing the texture first would make the later explicit
-	// uniform-set free report an "invalid ID" during teardown.
-	const RID dependent_rids[] = { p_resources.uniform_set, p_resources.cell_pipeline, p_resources.cell_shader, p_resources.pipeline, p_resources.shader };
-	for (const RID &rid : dependent_rids) {
-		if (rid.is_valid()) {
-			p_rd->free_rid(rid);
-		}
-	}
-	const RID rd_rids[] = {
-		p_resources.output_albedo_rd, p_resources.output_normal_rd, p_resources.output_params_rd,
-		p_resources.sampled_albedo_rd, p_resources.sampled_normal_rd, p_resources.sampled_params_rd,
-		p_resources.source_id_rd, p_resources.source_height_rd, p_resources.material_buffer,
-		p_resources.job_buffer, p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
-		p_resources.sampler_nearest, p_resources.sampler_linear
-	};
-	for (const RID &rid : rd_rids) {
+	for (int i = 0; i < p_rd_rids.size(); ++i) {
+		const RID rid = p_rd_rids[i];
 		if (rid.is_valid()) {
 			p_rd->free_rid(rid);
 		}
 	}
 }
 
-void Terrain3DSurfaceBaker::_free_deferred(const RID &p_output_albedo_rd, const RID &p_output_normal_rd,
-		const RID &p_output_params_rd, const RID &p_output_albedo_rs, const RID &p_output_normal_rs,
-		const RID &p_output_params_rs, const RID &p_source_id_rd, const RID &p_source_height_rd,
-		const RID &p_material_buffer, const RID &p_job_buffer, const RID &p_dummy_albedo_rd,
-		const RID &p_dummy_normal_rd, const RID &p_uniform_set, const RID &p_pipeline,
-		const RID &p_shader, const RID &p_sampler_nearest, const RID &p_sampler_linear, const RID &p_cell_shader, const RID &p_cell_pipeline,
-		const RID &p_sampled_albedo_rd, const RID &p_sampled_normal_rd, const RID &p_sampled_params_rd,
-		const RID &p_sampled_albedo_rs, const RID &p_sampled_normal_rs, const RID &p_sampled_params_rs) {
-	ResourceBundle resources;
-	resources.sampled_albedo_rd = p_sampled_albedo_rd;
-	resources.sampled_normal_rd = p_sampled_normal_rd;
-	resources.sampled_params_rd = p_sampled_params_rd;
-	resources.sampled_albedo_rs = p_sampled_albedo_rs;
-	resources.sampled_normal_rs = p_sampled_normal_rs;
-	resources.sampled_params_rs = p_sampled_params_rs;
-	resources.cell_shader = p_cell_shader;
-	resources.cell_pipeline = p_cell_pipeline;
-	resources.output_albedo_rd = p_output_albedo_rd;
-	resources.output_normal_rd = p_output_normal_rd;
-	resources.output_params_rd = p_output_params_rd;
-	resources.output_albedo_rs = p_output_albedo_rs;
-	resources.output_normal_rs = p_output_normal_rs;
-	resources.output_params_rs = p_output_params_rs;
-	resources.source_id_rd = p_source_id_rd;
-	resources.source_height_rd = p_source_height_rd;
-	resources.material_buffer = p_material_buffer;
-	resources.job_buffer = p_job_buffer;
-	resources.dummy_albedo_rd = p_dummy_albedo_rd;
-	resources.dummy_normal_rd = p_dummy_normal_rd;
-	resources.uniform_set = p_uniform_set;
-	resources.pipeline = p_pipeline;
-	resources.shader = p_shader;
-	resources.sampler_nearest = p_sampler_nearest;
-	resources.sampler_linear = p_sampler_linear;
+void Terrain3DSurfaceBaker::_free_bundle(RenderingDevice *p_rd, const ResourceBundle &p_resources) {
+	Array rs_rids;
+	Array rd_rids;
+	_collect_bundle_rids(p_resources, rs_rids, rd_rids);
+	_free_rids(p_rd, rs_rids, rd_rids);
+}
+
+void Terrain3DSurfaceBaker::_free_deferred(const Array &p_rs_rids, const Array &p_rd_rids) {
 	RenderingServer *server = RenderingServer::get_singleton();
-	_free_bundle(server ? server->get_rendering_device() : nullptr, resources);
+	_free_rids(server ? server->get_rendering_device() : nullptr, p_rs_rids, p_rd_rids);
 }
 
 uint64_t Terrain3DSurfaceBaker::_take_resources(ResourceBundle &r_resources) {
@@ -364,6 +349,17 @@ void Terrain3DSurfaceBaker::clear() {
 		_ready.clear();
 		_sampled_channel_mask.clear();
 		_slot_sequence.clear();
+		_slot_tier.clear();
+		_slot_scratch.clear();
+		_staging_layers = 0;
+		_encode_pending.clear();
+		{
+			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
+			_encoded_layers.clear();
+			_encode_ring_held.assign(ENCODE_PAGES, 0);
+		}
+		_encode_region_bytes = 0;
+		_encode_region_words = 0;
 		_invalidate_all = false;
 		++_generation;
 		_rd = nullptr;
@@ -378,15 +374,11 @@ void Terrain3DSurfaceBaker::clear() {
 			_free_bundle(resource_rd, resources);
 			continue;
 		}
+		Array rs_rids;
+		Array rd_rids;
+		_collect_bundle_rids(resources, rs_rids, rd_rids);
 		server->call_on_render_thread(callable_mp_static(&Terrain3DSurfaceBaker::_free_deferred)
-											  .bind(resources.output_albedo_rd, resources.output_normal_rd, resources.output_params_rd,
-													  resources.output_albedo_rs, resources.output_normal_rs, resources.output_params_rs,
-													  resources.source_id_rd, resources.source_height_rd, resources.material_buffer,
-													  resources.job_buffer, resources.dummy_albedo_rd, resources.dummy_normal_rd,
-													  resources.uniform_set, resources.pipeline, resources.shader,
-													  resources.sampler_nearest, resources.sampler_linear, resources.cell_shader, resources.cell_pipeline,
-													  resources.sampled_albedo_rd, resources.sampled_normal_rd, resources.sampled_params_rd,
-													  resources.sampled_albedo_rs, resources.sampled_normal_rs, resources.sampled_params_rs));
+											  .bind(rs_rids, rd_rids));
 	}
 }
 
@@ -421,6 +413,61 @@ bool Terrain3DSurfaceBaker::_compile_pipeline(ResourceBundle &r_resources) {
 	if (!r_resources.pipeline.is_valid()) {
 		LOG(ERROR, "Could not create the surface bake compute pipeline");
 		return false;
+	}
+	return true;
+}
+
+// Compiles the block encoder into its own pipeline. It is only needed when at least one tier
+// resolved to a compressed format, and a build whose encoder cannot compile has to say so
+// once: without it a compressed tier would produce pages no encoder ever fills.
+bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources) {
+	if (!_rd) {
+		return false;
+	}
+	Ref<RDShaderSource> source;
+	source.instantiate();
+	source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
+	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, SURFACE_ENCODE_SHADER);
+	Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
+	if (spirv.is_null()) {
+		LOG(ERROR, "Surface block encoder shader did not compile");
+		return false;
+	}
+	const String compile_error = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
+	if (!compile_error.is_empty()) {
+		LOG(ERROR, "Surface block encoder compile error: ", compile_error);
+		return false;
+	}
+	r_resources.encode_shader = _rd->shader_create_from_spirv(spirv, "terrain3d_surface_encode");
+	if (!r_resources.encode_shader.is_valid()) {
+		LOG(ERROR, "Could not create the surface block encoder shader");
+		return false;
+	}
+	r_resources.encode_pipeline = _rd->compute_pipeline_create(r_resources.encode_shader);
+	if (!r_resources.encode_pipeline.is_valid()) {
+		LOG(ERROR, "Could not create the surface block encoder compute pipeline");
+		return false;
+	}
+	// One region per channel of every page that may be in flight at once. The buffer is a
+	// few hundred kilobytes at the widest codec, which is what lets a compressed tier cost
+	// one small allocation instead of a second page-sized array beside the staging pool.
+	const uint32_t ring_bytes = uint32_t(ENCODE_PAGES * ENCODE_CHANNELS * _encode_region_bytes);
+	r_resources.encode_buffer = _rd->storage_buffer_create(ring_bytes);
+	if (!r_resources.encode_buffer.is_valid() || _encode_region_words <= 0) {
+		LOG(ERROR, "Could not allocate the surface block encoder output buffer");
+		return false;
+	}
+	_rd->set_resource_name(r_resources.encode_buffer, "Surface VT Block Encoder Output (ring of page layers)");
+	for (int channel = 0; channel < ENCODE_CHANNELS; ++channel) {
+		TypedArray<Ref<RDUniform>> uniforms;
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
+				r_resources.sampler_nearest, _staging_rd_of(r_resources, channel));
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 1, r_resources.encode_buffer);
+		r_resources.encode_uniform[channel] = _rd->uniform_set_create(uniforms, r_resources.encode_shader, 0);
+		if (!r_resources.encode_uniform[channel].is_valid()) {
+			LOG(ERROR, "Could not create the surface block encoder uniform set");
+			return false;
+		}
 	}
 	return true;
 }
@@ -555,16 +602,80 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			RenderingDevice::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE, 0.0f);
 	next.sampler_linear = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_LINEAR,
 			RenderingDevice::SAMPLER_REPEAT_MODE_REPEAT, 1000.0f);
+	// Compressed copies of the three channels, one set per tier whose codec resolved. These
+	// are the sampling targets of the block encoder, and the material samples them in place
+	// of the staging arrays for the tier that owns them. A tier left uncompressed keeps an
+	// empty set and samples the staging arrays directly, so an uncompressed tier costs
+	// nothing at all - and it is also what keeps the staging arrays page sized.
+	//
+	// The encoder's output region is a function of the stored page size, and every codec it
+	// implements writes at most four words per block.
+	_encode_region_bytes = ((p_stored_size + 3) / 4) * ((p_stored_size + 3) / 4) * 4 * int(sizeof(uint32_t));
+	_encode_region_words = _encode_region_bytes / int(sizeof(uint32_t));
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		_tiers[tier].applied.store(0);
+		SampledSet &set = next.sampled[tier];
+		const int mode = _tiers[tier].effective.load();
+		const RenderingDevice::DataFormat format = _tiers[tier].format.load();
+		if (mode == 0 || format == RenderingDevice::DATA_FORMAT_MAX) {
+			continue;
+		}
+		// Sampling, update, and readback. Copy-from is what lets a resident page be exported
+		// (the dock preview, the offline bake) once the scratch pool has reused the layer it
+		// was produced in: the page's content is then its block words. On D3D12 copy-from sets
+		// no resource flag at all; copy-*to* would, and it is the one that has to stay off.
+		const uint64_t compressed_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+				RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+				RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		set.albedo_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
+		set.normal_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
+		set.params_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
+		const String tier_name = tier == TIER_SVT ? String("SVT") : String("AVT");
+		if (set.albedo_rd.is_valid() && set.normal_rd.is_valid() && set.params_rd.is_valid()) {
+			_rd->set_resource_name(set.albedo_rd, "Surface VT " + tier_name + " Albedo Height (compressed)");
+			_rd->set_resource_name(set.normal_rd, "Surface VT " + tier_name + " Normal Roughness (compressed)");
+			_rd->set_resource_name(set.params_rd, "Surface VT " + tier_name + " Parameters (compressed)");
+			set.albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
+					set.albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+			set.normal_rs = RenderingServer::get_singleton()->texture_rd_create(
+					set.normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+			set.params_rs = RenderingServer::get_singleton()->texture_rd_create(
+					set.params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+			if (set.albedo_rs.is_valid() && set.normal_rs.is_valid() && set.params_rs.is_valid()) {
+				_tiers[tier].applied.store(mode);
+				continue;
+			}
+			// Fall back rather than render from an unwritable pair: drop the RS wrappers
+			// and let _free_bundle release the RD textures with the bundle.
+			set = SampledSet();
+			_tiers[tier].effective.store(0);
+			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			LOG(WARN, "Could not wrap the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
+		} else {
+			// The capability probe only answers for a usage pair, not for this allocation
+			// size and layer count, so a device can still refuse the real array. Report the
+			// codec as unavailable instead of claiming a format the pages are not stored in.
+			_tiers[tier].effective.store(0);
+			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			LOG(WARN, "Could not allocate the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
+		}
+	}
+	// The half-float staging arrays are page sized only while something samples them by slot.
+	// With every tier compressed they exist to be encoded and nothing else, so they come down
+	// to the encoder ring and the resident pool loses its largest allocation. A tier that
+	// failed to build its arrays above keeps `applied` at 0 and samples staging by slot, which
+	// is why the count is decided here and not from the request.
+	_staging_layers = _staging_is_scratch() ? ENCODE_PAGES : p_page_count;
 	next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
-			p_page_count, sampled_usage);
+			_staging_layers, sampled_usage);
 	next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
-			p_page_count, sampled_usage);
+			_staging_layers, sampled_usage);
 	next.output_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, p_page_count, output_usage);
+			p_stored_size, _staging_layers, output_usage);
 	next.output_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, p_page_count, output_usage);
+			p_stored_size, _staging_layers, output_usage);
 	next.output_params_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, p_page_count, output_usage);
+			p_stored_size, _staging_layers, output_usage);
 	if (!next.dummy_albedo_rd.is_valid() || !next.dummy_normal_rd.is_valid() ||
 			!next.sampler_nearest.is_valid() || !next.sampler_linear.is_valid() ||
 			!next.source_id_rd.is_valid() || !next.source_height_rd.is_valid() ||
@@ -574,11 +685,14 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		LOG(ERROR, "Could not allocate surface bake textures");
 		return false;
 	}
-	_rd->set_resource_name(next.source_id_rd, "Surface VT Source IDWeights (layer = physical slot)");
-	_rd->set_resource_name(next.source_height_rd, "Surface VT Source Height (layer = physical slot)");
-	_rd->set_resource_name(next.output_albedo_rd, "Surface VT Albedo Height (layer = physical slot)");
-	_rd->set_resource_name(next.output_normal_rd, "Surface VT Normal Roughness (layer = physical slot)");
-	_rd->set_resource_name(next.output_params_rd, "Surface VT Parameters (layer = physical slot)");
+	const String layer_note = _staging_is_scratch()
+			? String(" (scratch layer = encoder ring page)")
+			: String(" (layer = physical slot)");
+	_rd->set_resource_name(next.source_id_rd, "Surface VT Source IDWeights" + layer_note);
+	_rd->set_resource_name(next.source_height_rd, "Surface VT Source Height" + layer_note);
+	_rd->set_resource_name(next.output_albedo_rd, "Surface VT Albedo Height" + layer_note);
+	_rd->set_resource_name(next.output_normal_rd, "Surface VT Normal Roughness" + layer_note);
+	_rd->set_resource_name(next.output_params_rd, "Surface VT Parameters" + layer_note);
 	next.output_albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
 			next.output_albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
 	next.output_normal_rs = RenderingServer::get_singleton()->texture_rd_create(
@@ -590,51 +704,6 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		_free_bundle(_rd, next);
 		LOG(ERROR, "Could not wrap surface bake arrays as RS textures");
 		return false;
-	}
-	// Compressed copies of the three channels, when a codec resolved. The staging arrays
-	// stay RGBA16F and writable by imageStore; these are sampling-only targets of the
-	// encode step, and the material samples them instead of the staging arrays.
-	_atlas_compression_applied = 0;
-	if (_atlas_compression_effective != 0 && _atlas_rd_format != RenderingDevice::DATA_FORMAT_MAX) {
-		// Sampling plus update, exactly the pair the capability probe asked the device
-		// about and the pair the engine's own compressed texture storage uses. Copy-to
-		// is deliberately absent: on D3D12 it adds ALLOW_UNORDERED_ACCESS, which a block
-		// compressed resource cannot carry, so the texture would be refused outright.
-		const uint64_t compressed_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
-				RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
-		next.sampled_albedo_rd = _create_texture(_rd, _atlas_rd_format, p_stored_size, p_page_count, compressed_usage);
-		next.sampled_normal_rd = _create_texture(_rd, _atlas_rd_format, p_stored_size, p_page_count, compressed_usage);
-		next.sampled_params_rd = _create_texture(_rd, _atlas_rd_format, p_stored_size, p_page_count, compressed_usage);
-		if (next.sampled_albedo_rd.is_valid() && next.sampled_normal_rd.is_valid() && next.sampled_params_rd.is_valid()) {
-			_rd->set_resource_name(next.sampled_albedo_rd, "Surface VT Albedo Height (compressed)");
-			_rd->set_resource_name(next.sampled_normal_rd, "Surface VT Normal Roughness (compressed)");
-			_rd->set_resource_name(next.sampled_params_rd, "Surface VT Parameters (compressed)");
-			next.sampled_albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
-					next.sampled_albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			next.sampled_normal_rs = RenderingServer::get_singleton()->texture_rd_create(
-					next.sampled_normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			next.sampled_params_rs = RenderingServer::get_singleton()->texture_rd_create(
-					next.sampled_params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			if (next.sampled_albedo_rs.is_valid() && next.sampled_normal_rs.is_valid() && next.sampled_params_rs.is_valid()) {
-				_atlas_compression_applied.store(_atlas_compression_effective.load());
-			} else {
-				// Fall back rather than render from an unwritable pair: drop the RS wrappers
-				// and let _free_bundle release the RD textures with the bundle.
-				next.sampled_albedo_rs = RID();
-				next.sampled_normal_rs = RID();
-				next.sampled_params_rs = RID();
-				_atlas_compression_effective.store(0);
-				_atlas_rd_format.store(RenderingDevice::DATA_FORMAT_MAX);
-				LOG(WARN, "Could not wrap the compressed surface arrays; keeping uncompressed pages");
-			}
-		} else {
-			// The capability probe only answers for a usage pair, not for this allocation
-			// size and layer count, so a device can still refuse the real array. Report the
-			// codec as unavailable instead of claiming a format the pages are not stored in.
-			_atlas_compression_effective.store(0);
-			_atlas_rd_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			LOG(WARN, "Could not allocate the compressed surface arrays; keeping uncompressed pages");
-		}
 	}
 	PackedByteArray initial_materials = p_material_bytes;
 	if (initial_materials.size() != MATERIAL_COUNT * MATERIAL_STRIDE) {
@@ -651,28 +720,50 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		LOG(ERROR, "Could not allocate surface bake buffers or pipeline");
 		return false;
 	}
+	// The block encoder is only built when a tier actually resolved to a compressed format.
+	// A build whose encoder cannot compile drops both tiers back to uncompressed: a page
+	// that samples an array nothing ever fills renders as the missing-page diagnostic, which
+	// is worse than the memory the codec would have saved.
+	if ((_tiers[TIER_AVT].applied.load() != 0 || _tiers[TIER_SVT].applied.load() != 0) && !_compile_encode_pipeline(next)) {
+		for (int tier = 0; tier < TIER_COUNT; ++tier) {
+			_tiers[tier].applied.store(0);
+			_tiers[tier].effective.store(0);
+			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			next.sampled[tier] = SampledSet();
+		}
+		_free_bundle(_rd, next);
+		LOG(WARN, "Could not build the surface block encoder; keeping every page uncompressed");
+		return false;
+	}
 	_rd->set_resource_name(next.job_buffer, "Surface VT Jobs (64 bytes: world rect, texel size, slot, mode)");
 	_rd->set_resource_name(next.material_buffer, "Surface VT Material Parameters");
 	_rd->set_resource_name(next.shader, "Surface VT Page Baker");
 	// A fresh output has no valid pages.  Clearing all channels is recorded on the
 	// main device; no submit or sync is performed here.
-	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
-	_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
-	_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(p_page_count));
+	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
+	_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
+	_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
 	if (growing) {
 		// Resource migration copies existing results; it does not rerun a page
 		// shader or restart source work. Keep the old output alive until the next
 		// material update has bound the new arrays, including already prepared draws.
+		//
+		// Under the scratch regime there is nothing to copy: a page's half-float content only
+		// ever lives in the ring, and the compressed layers cannot be copied (a block format
+		// cannot carry the unordered-access flag `texture_copy` needs on D3D12). Every page is
+		// re-produced instead, which is what the block above already marked not ready.
 		uint64_t copied = 0;
-		for (int slot = 0; slot < old_count; ++slot) {
-			if (slot >= int(ready.size()) || !ready[slot]) { continue; }
-			const Vector3 extent(p_stored_size, p_stored_size, 1);
-			if (_rd->texture_copy(old.output_albedo_rd, next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
-					_rd->texture_copy(old.output_normal_rd, next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
-					_rd->texture_copy(old.output_params_rd, next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
-				_free_bundle(_rd, next); return false;
+		if (!_staging_is_scratch()) {
+			for (int slot = 0; slot < old_count; ++slot) {
+				if (slot >= int(ready.size()) || !ready[slot]) { continue; }
+				const Vector3 extent(p_stored_size, p_stored_size, 1);
+				if (_rd->texture_copy(old.output_albedo_rd, next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+						_rd->texture_copy(old.output_normal_rd, next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+						_rd->texture_copy(old.output_params_rd, next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
+					_free_bundle(_rd, next); return false;
+				}
+				++copied;
 			}
-			++copied;
 		}
 		std::lock_guard<std::mutex> lock(_mutex);
 		_retire_ready = false;
@@ -688,15 +779,33 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		_ready.resize(size_t(p_page_count), 0);
 		_sampled_channel_mask.resize(size_t(p_page_count), 0);
 		_slot_sequence.resize(size_t(p_page_count), 0);
+		_slot_tier.resize(size_t(p_page_count), uint8_t(TIER_AVT));
+		_slot_scratch.assign(size_t(p_page_count), uint8_t(ENCODE_RING_NONE));
 		// A rebuilt bundle starts with empty compressed arrays. A grown bundle migrated the
-		// staging content of every ready page, so read those back and encode them again; the
-		// compressed copies are not migrated because the codec cannot be copied between
-		// formats. Without this every page that was ready before a capacity change would
-		// sample a zeroed compressed layer for the rest of the session.
+		// staging content of every ready page, so encode it again into the new arrays; a
+		// block-compressed layer cannot be copied between formats, and the staging copy is
+		// what carries the content across the resize. Without this every page that was ready
+		// before a capacity change would sample a zeroed compressed layer for the session.
+		//
+		// Under the scratch regime there is nothing to migrate: a page's half-float content
+		// only ever lives in the ring, and the ring belongs to the bundle that was just
+		// replaced. Every page is therefore re-produced, exactly as the compressed arrays
+		// require anyway.
 		_encode_pending.assign(size_t(p_page_count), 0);
-		if (_atlas_compression_applied.load() != 0) {
-			for (size_t slot = 0; slot < _ready.size(); ++slot) {
-				if (_ready[slot]) { _encode_pending[slot] = 1; }
+		{
+			// The ring is the encoder's own state, so it is guarded by the encode mutex.
+			// Lock order is _mutex then _encode_mutex everywhere; the readback callback
+			// takes them in separate scopes and never holds one while taking the other.
+			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
+			_encode_ring_held.assign(ENCODE_PAGES, 0);
+		}
+		if (_staging_is_scratch()) {
+			std::fill(_ready.begin(), _ready.end(), uint8_t(0));
+			std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
+		}
+		for (size_t slot = 0; slot < _ready.size(); ++slot) {
+			if (_ready[slot] && _slot_tier[slot] < TIER_COUNT && _tiers[_slot_tier[slot]].applied.load() != 0) {
+				_encode_pending[slot] = 1;
 			}
 		}
 	}
@@ -736,23 +845,31 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 	_ready.assign(size_t(_page_count), 0);
 	_sampled_channel_mask.assign(size_t(_page_count), 0);
 	_slot_sequence.assign(size_t(_page_count), 0);
+	_slot_tier.assign(size_t(_page_count), uint8_t(TIER_AVT));
+	_slot_scratch.assign(size_t(_page_count), ENCODE_RING_NONE);
+	_encode_pending.assign(size_t(_page_count), 0);
 	_next_sequence = 1;
 	_invalidate_all = true;
 	_resource_generation = 0;
 }
 
-void Terrain3DSurfaceBaker::set_atlas_compression(const int p_mode) {
+void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_mode) {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	const int mode = CLAMP(p_mode, 0, ATLAS_CODEC_COUNT - 1);
-	if (mode == _atlas_compression && _configured) {
+	if (mode == _tiers[tier].requested && _configured) {
 		return;
 	}
-	_atlas_compression = mode;
-	_resolve_atlas_compression();
-	LOG(INFO, "Surface atlas compression requested: ", ATLAS_CODECS[_atlas_compression].name,
-			"; effective: ", ATLAS_CODECS[_atlas_compression_effective].name,
-			_atlas_compression_reason.is_empty() ? String() : String(" (") + _atlas_compression_reason + ")");
+	_tiers[tier].requested = mode;
+	_resolve_tier_compression(tier);
+	LOG(INFO, "Surface page compression requested for ", tier == TIER_SVT ? "SVT" : "AVT", ": ",
+			ATLAS_CODECS[_tiers[tier].requested].name,
+			"; effective: ", ATLAS_CODECS[_tiers[tier].effective.load()].name,
+			_tiers[tier].reason.is_empty() ? String() : String(" (") + _tiers[tier].reason + ")");
 	if (_configured) {
-		// The page contents live in the previous format, so every page is stale.
+		// The pages of that tier live in the previous format, so every page of the tier is
+		// stale. Both tiers share the pool, and the bundle is rebuilt as one, so the whole
+		// pool is re-produced rather than trying to keep the other tier's pages alive across
+		// the rebuild.
 		std::lock_guard<std::mutex> lock(_mutex);
 		++_generation;
 		_materials_dirty = true;
@@ -763,129 +880,146 @@ void Terrain3DSurfaceBaker::set_atlas_compression(const int p_mode) {
 	}
 }
 
-// Resolves the requested codec against this build's compressors and this device's
-// sampling support. The compressors are registered as function pointers by whichever
-// modules the engine binary enabled (etcpak and astcenc ship in every build, cvtt and
-// betsy are editor-only unless the export template opts in), so the probe compresses a
-// real block instead of assuming: an unregistered codec returns ERR_UNAVAILABLE.
-void Terrain3DSurfaceBaker::_resolve_atlas_compression() {
-	_atlas_compression_effective = 0;
-	_atlas_rd_format = RenderingDevice::DATA_FORMAT_MAX;
-	_atlas_compression_reason = String();
-	if (_atlas_compression == 0) {
+// Resolves one tier's request against the block encoder this build ships and this device's
+// sampling support. The encoder is a compute shader, so the codecs it implements decide what
+// a page array can be stored in; a codec it does not implement has no producer and is
+// reported as unavailable instead of leaving pages that no encoder ever fills. The device
+// then has to be able to sample and update the resulting format, exactly as the engine's own
+// compressed texture storage does.
+void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
+	TierState &tier = _tiers[p_tier];
+	const String tier_name = p_tier == TIER_SVT ? String("SVT") : String("AVT");
+	tier.effective = 0;
+	tier.format = RenderingDevice::DATA_FORMAT_MAX;
+	tier.reason = String();
+	if (tier.requested == 0) {
 		return;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression];
+	const AtlasCodec &codec = ATLAS_CODECS[tier.requested];
 	if (codec.channels != Image::USED_CHANNELS_RGBA) {
-		_atlas_compression_reason = String(codec.name) +
+		tier.reason = String(codec.name) +
 				" keeps no alpha channel, and the material pages store height, roughness and the validity bit in alpha";
 		return;
 	}
-	Ref<Image> probe = Image::create_empty(4, 4, false, codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8);
-	if (probe.is_null()) {
-		_atlas_compression_reason = "Could not allocate a probe image";
+	if (codec.gpu_codec == GPU_CODEC_NONE) {
+		// The pages are encoded by shaders/bc_encode.glsl on the GPU. A codec it has no
+		// encoder for would need a CPU block encoder per page, which is the cost this path
+		// exists to remove, so it is refused rather than silently paid.
+		tier.reason = String(codec.name) + " has no GPU block encoder, and page compression never runs a CPU codec";
 		return;
 	}
-	probe->fill(Color(0.5, 0.5, 0.5, 1.0));
-	if (probe->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !probe->is_compressed()) {
-		_atlas_compression_reason = String(codec.name) + " has no compressor in this build";
-		return;
-	}
-	const RenderingDevice::DataFormat format = _compressed_rd_format(probe->get_format());
+	// The renderer format comes from the codec table, so the table stays the single
+	// vocabulary for every terrain texture array.
+	const RenderingDevice::DataFormat format = codec.rd_format;
 	if (format == RenderingDevice::DATA_FORMAT_MAX) {
-		_atlas_compression_reason = String(codec.name) + " produced image format " +
-				String::num_int64(int(probe->get_format())) + ", which has no renderer format";
+		tier.reason = String(codec.name) + " has no renderer format";
 		return;
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
 	RenderingDevice *rd = server ? server->get_rendering_device() : nullptr;
 	if (rd && !rd->texture_is_format_supported_for_usage(format,
 					  RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT)) {
-		_atlas_compression_reason = String(codec.name) + " cannot be sampled and updated on this rendering device";
+		tier.reason = String(codec.name) + " cannot be sampled and updated on this rendering device";
 		return;
 	}
-	_atlas_compression_effective = _atlas_compression;
-	_atlas_rd_format = format;
+	tier.effective = tier.requested;
+	tier.format = format;
+	LOG(DEBUG, "Surface page compression for ", tier_name, " resolved to ", codec.name);
 }
 
-Dictionary Terrain3DSurfaceBaker::get_atlas_compression_info() const {
+Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	const TierState &state = _tiers[tier];
 	Dictionary info;
-	info["requested"] = _atlas_compression;
-	// `available` is what this build's compressors and this device could store and
-	// sample; `applied` is what the page arrays are actually kept in. The two differ
-	// while the encode stage that fills compressed pages is still pending, and they
-	// also differ when the device refused the real allocation after accepting the
-	// capability query, so the reported state never claims a format the pages are
-	// not stored in.
-	const int available = _atlas_compression_effective.load();
+	info["tier"] = tier;
+	info["requested"] = state.requested;
+	// `available` is what the block encoder and this device can store and sample; `applied`
+	// is what the tier's page arrays are actually kept in. The two differ while the arrays
+	// have not been built yet, and they also differ when the device refused the real
+	// allocation after accepting the capability query, so the reported state never claims a
+	// format the pages are not stored in.
+	const int available = state.effective.load();
 	info["available"] = available;
-	info["applied"] = _atlas_compression_applied.load();
+	info["applied"] = state.applied.load();
 	info["name"] = String(ATLAS_CODECS[available].name);
-	String reason = _atlas_compression_reason;
-	if (reason.is_empty() && available == 0 && _atlas_compression != 0) {
-		reason = String(ATLAS_CODECS[_atlas_compression].name) +
-				" was resolved for this device, but the compressed page arrays could not be created";
+	String reason = state.reason;
+	if (reason.is_empty() && available == 0 && state.requested != 0) {
+		reason = String(ATLAS_CODECS[state.requested].name) +
+				String(" was resolved for this device, but the compressed page arrays could not be created");
 	}
 	info["reason"] = reason;
-	info["rd_format"] = int(_atlas_rd_format.load());
+	info["rd_format"] = int(state.format.load());
 	return info;
 }
 
+RID Terrain3DSurfaceBaker::_staging_rd_of(const ResourceBundle &p_resources, const int p_channel) {
+	switch (p_channel) {
+		case 0:
+			return p_resources.output_albedo_rd;
+		case 1:
+			return p_resources.output_normal_rd;
+		default:
+			return p_resources.output_params_rd;
+	}
+}
+
 RID Terrain3DSurfaceBaker::_staging_rd(const int p_channel) const {
+	return _staging_rd_of(_resources, p_channel);
+}
+
+RID Terrain3DSurfaceBaker::_sampled_rd(const int p_tier, const int p_channel) const {
+	const SampledSet &set = _resources.sampled[CLAMP(p_tier, 0, TIER_COUNT - 1)];
 	switch (p_channel) {
 		case 0:
-			return _resources.output_albedo_rd;
+			return set.albedo_rd;
 		case 1:
-			return _resources.output_normal_rd;
+			return set.normal_rd;
 		default:
-			return _resources.output_params_rd;
+			return set.params_rd;
 	}
 }
 
-RID Terrain3DSurfaceBaker::_sampled_rd(const int p_channel) const {
+RID Terrain3DSurfaceBaker::_sampled_rs(const int p_tier, const int p_channel) const {
+	const SampledSet &set = _resources.sampled[CLAMP(p_tier, 0, TIER_COUNT - 1)];
 	switch (p_channel) {
 		case 0:
-			return _resources.sampled_albedo_rd;
+			return set.albedo_rs;
 		case 1:
-			return _resources.sampled_normal_rd;
+			return set.normal_rs;
 		default:
-			return _resources.sampled_params_rd;
+			return set.params_rs;
 	}
 }
 
-// Compresses one channel image into the sampled array. The codec was already resolved
-// against this build and device when the setting was applied, so a failure here is a
-// runtime problem (a rejected update), not an unsupported request. Only a recording point
-// may call this: an upload recorded outside one is dropped by the render graph.
-bool Terrain3DSurfaceBaker::_encode_image(const int p_channel, const int p_slot,
-		const uint64_t p_generation, const uint64_t p_sequence, const Ref<Image> &p_image) {
-	if (!_rd || p_image.is_null() || _atlas_compression_applied == 0) {
-		return false;
-	}
-	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression_applied];
-	Ref<Image> source = p_image;
-	if (source->get_format() != (codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8)) {
-		// Every material channel is LDR, so an 8-bit source is what the LDR codecs take.
-		source = source->duplicate();
-		source->convert(codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8);
-	}
-	if (source->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !source->is_compressed()) {
-		if (!_encode_warned) {
-			_encode_warned = true;
-			LOG(WARN, "Atlas encode failed for ", codec.name, "; compressed pages will stay blank");
+// True when this tier's pages are stored in its own compressed set and not in the staging
+// arrays. A tier that did not resolve to a codec samples the staging arrays, which is why
+// an uncompressed tier costs no memory at all beyond the pool it already has.
+bool Terrain3DSurfaceBaker::_tier_uses_sampled(const int p_tier) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	return _tiers[tier].applied.load() != 0 && _resources.sampled[tier].albedo_rs.is_valid();
+}
+
+// True when every tier resolved to a compressed format, so no consumer samples the RGBA16F
+// staging arrays by slot and they can shrink to the encoder ring. Decided from the resolved
+// state, not from `applied`: the arrays are allocated before a bundle becomes the current one,
+// and the answer has to be the same for the arrays and for the code that indexes them.
+bool Terrain3DSurfaceBaker::_staging_is_scratch() const {
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		if (_tiers[tier].effective.load() == 0 ||
+				_tiers[tier].format.load() == RenderingDevice::DATA_FORMAT_MAX) {
+			return false;
 		}
-		_encode_failures++;
-		return false;
 	}
-	return _upload_encoded_layer(p_channel, p_slot, p_generation, p_sequence, source->get_data());
+	return true;
 }
 
-void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_slot, const int p_channel,
-		const uint64_t p_generation, const uint64_t p_sequence) {
+void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const int p_slot,
+		const int p_channel, const uint64_t p_generation, const uint64_t p_sequence) {
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (_generation != p_generation || p_slot < 0 || p_slot >= int(_ready.size()) ||
 			p_slot >= int(_sampled_channel_mask.size()) || p_slot >= int(_slot_sequence.size()) ||
-			_slot_sequence[size_t(p_slot)] != p_sequence) {
+			_slot_sequence[size_t(p_slot)] != p_sequence ||
+			_slot_tier[size_t(p_slot)] != uint8_t(CLAMP(p_tier, 0, TIER_COUNT - 1))) {
 		return;
 	}
 	_sampled_channel_mask[size_t(p_slot)] |= uint8_t(1u << uint32_t(p_channel));
@@ -894,19 +1028,40 @@ void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_slot, const 
 	}
 }
 
-// The recording-time half of the encode. Both the inline cached-page path and the deferred
-// readback path end here, and both run while the frame's draw graph is recording.
-bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int p_slot,
-		const uint64_t p_generation, const uint64_t p_sequence, const PackedByteArray &p_data) {
+// A page whose encode did not land is reported as not ready, so the tier that owns it
+// produces it again instead of sampling a layer nothing ever filled. The flag was cleared
+// when the page was produced (a compressed page is only ready once its blocks arrive), so
+// this is what restores the retry the demand passes rely on.
+void Terrain3DSurfaceBaker::_mark_encode_failed(const int p_slot, const uint64_t p_generation,
+		const uint64_t p_sequence) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (_generation != p_generation || p_slot < 0 || p_slot >= int(_ready.size()) ||
+			p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence) {
+		return;
+	}
+	_ready[size_t(p_slot)] = 0;
+	if (p_slot < int(_sampled_channel_mask.size())) {
+		_sampled_channel_mask[size_t(p_slot)] = 0;
+	}
+}
+
+// The recording-time half of the encode. The readback callback only queues the blocks it
+// received; this uploads them into the tier's sampling array while the frame's draw graph is
+// recording, because an update recorded outside one is dropped by the render graph.
+bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_tier, const int p_channel,
+		const int p_slot, const uint64_t p_generation, const uint64_t p_sequence,
+		const PackedByteArray &p_data) {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		if (_generation != p_generation || p_slot < 0 || p_slot >= _page_count ||
-				p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence) {
+				p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence ||
+				_slot_tier[size_t(p_slot)] != uint8_t(tier)) {
 			return false;
 		}
 	}
-	const RID target = _sampled_rd(p_channel);
-	if (!_rd || _atlas_compression_applied == 0 || !target.is_valid() || p_data.is_empty()) {
+	const RID target = _sampled_rd(tier, p_channel);
+	if (!_rd || _tiers[tier].applied.load() == 0 || !target.is_valid() || p_data.is_empty()) {
 		return false;
 	}
 	if (_rd->texture_update(target, uint32_t(p_slot), p_data) != OK) {
@@ -918,7 +1073,7 @@ bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_channel, const int
 		return false;
 	}
 	_encode_updates++;
-	_mark_sampled_channel_ready(p_slot, p_channel, p_generation, p_sequence);
+	_mark_sampled_channel_ready(tier, p_slot, p_channel, p_generation, p_sequence);
 	return true;
 }
 
@@ -938,126 +1093,261 @@ void Terrain3DSurfaceBaker::_flush_encodes(uint64_t p_generation) {
 		if (layer.generation != p_generation) {
 			continue;
 		}
-		_upload_encoded_layer(layer.channel, layer.slot, layer.generation, layer.sequence, layer.data);
+		_upload_encoded_layer(layer.tier, layer.channel, layer.slot, layer.generation, layer.sequence, layer.data);
 	}
 }
 
-// Requests one async readback per channel for every page whose staging content changed.
-// A synchronous readback is not safe from inside the render callback, and this is the only
-// route for pages the compute shaders write: a compressed format cannot be a storage image.
+// Records the block-encoder dispatches for every pending page that can be given an output
+// region, and requests one buffer readback per channel. A synchronous readback is not safe
+// from inside the render callback, and a block-compressed texture cannot be a storage image,
+// so the words have to travel through a buffer - a few tens of kilobytes per layer instead of
+// the whole half-float page.
 void Terrain3DSurfaceBaker::_request_encodes() {
-	if (_atlas_compression_applied == 0 || !_rd) {
+	if (!_rd || !_resources.encode_pipeline.is_valid() || _encode_region_words <= 0) {
 		return;
 	}
+	bool any_sampled = false;
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		any_sampled = any_sampled || _tier_uses_sampled(tier);
+	}
+	if (!any_sampled) {
+		return;
+	}
+	int64_t compute_list = -1;
 	for (size_t slot = 0; slot < _encode_pending.size(); ++slot) {
 		if (!_encode_pending[slot]) {
 			continue;
 		}
 		uint64_t generation = 0;
 		uint64_t sequence = 0;
+		int tier = 0;
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
-			if (slot >= _slot_sequence.size()) {
+			if (slot >= _slot_sequence.size() || slot >= _slot_tier.size()) {
+				continue;
+			}
+			tier = _slot_tier[slot];
+			if (tier >= TIER_COUNT) {
 				continue;
 			}
 			generation = _generation;
 			sequence = _slot_sequence[slot];
-			if (slot < _sampled_channel_mask.size()) {
-				_sampled_channel_mask[slot] = 0;
-			}
-			if (slot < _ready.size()) {
-				_ready[slot] = 0;
+		}
+		if (!_tier_uses_sampled(tier)) {
+			// The tier is stored uncompressed, so its pages already sample the staging
+			// arrays and there is nothing to encode.
+			_encode_pending[slot] = 0;
+			continue;
+		}
+		const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].applied.load()];
+		const int blocks = (_stored_size + 3) / 4;
+		// Under the scratch regime the page already owns a ring page: it was taken when the
+		// page was produced, it is the layer the production wrote into, and it is what holds
+		// that layer until the readbacks below have been delivered. Otherwise only the
+		// encoder's output region has to be reserved, and the staging layer is the slot.
+		int ring_page = -1;
+		int source_layer = int(slot);
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (slot < _slot_scratch.size() && _slot_scratch[slot] != ENCODE_RING_NONE) {
+				ring_page = int(_slot_scratch[slot]);
+				source_layer = ring_page;
 			}
 		}
+		if (ring_page < 0) {
+			// Reserve one ring page per pending page. Without a free page the page waits for
+			// a later frame: its readbacks have not been delivered, so reusing the regions
+			// would let a readback observe a later page's blocks.
+			std::lock_guard<std::mutex> lock(_encode_mutex);
+			for (int page_index = 0; page_index < ENCODE_PAGES; ++page_index) {
+				if (_encode_ring_held[size_t(page_index)] != 0) {
+					continue;
+				}
+				ring_page = page_index;
+				_encode_ring_held[size_t(page_index)] = uint8_t(ENCODE_CHANNELS);
+				break;
+			}
+		}
+		if (ring_page < 0) {
+			// Keep the flag set so a later frame encodes this page.
+			continue;
+		}
+		if (compute_list < 0) {
+			compute_list = _rd->compute_list_begin();
+			if (compute_list < 0) {
+				_hold_encode_page(ring_page, 0);
+				return;
+			}
+			_rd->compute_list_bind_compute_pipeline(compute_list, _resources.encode_pipeline);
+		}
+		SurfaceVTLabel label(_rd, "Surface Block Encode - slot " + String::num_int64(int(slot)));
+		PackedByteArray push;
+		push.resize(32);
+		push.encode_u32(0, uint32_t(_stored_size));
+		push.encode_u32(4, uint32_t(source_layer));
+		push.encode_u32(8, codec.gpu_codec);
+		push.encode_u32(12, uint32_t(blocks));
+		int outstanding = 0;
 		bool requested = true;
-		for (int channel = 0; channel < 3 && requested; ++channel) {
-			const RID staging = _staging_rd(channel);
-			requested = staging.is_valid() &&
-					_rd->texture_get_data_async(staging, uint32_t(slot),
+		for (int channel = 0; channel < ENCODE_CHANNELS && requested; ++channel) {
+			const int region = ring_page * ENCODE_CHANNELS + channel;
+			push.encode_u32(16, uint32_t(region * _encode_region_words));
+			push.encode_u32(20, 0u);
+			push.encode_u32(24, 0u);
+			push.encode_u32(28, 0u);
+			if (!_resources.encode_uniform[channel].is_valid()) {
+				requested = false;
+				break;
+			}
+			_rd->compute_list_bind_uniform_set(compute_list, _resources.encode_uniform[channel], 0);
+			_rd->compute_list_set_push_constant(compute_list, push, uint32_t(push.size()));
+			_rd->compute_list_dispatch(compute_list, uint32_t((blocks * blocks + 63) / 64), 1, 1);
+			// The encoder reads the staging layer this frame's bake or cell copy wrote, so
+			// this dispatch has to be ordered after that write, not merely recorded after it.
+			_rd->compute_list_add_barrier(compute_list);
+			const uint32_t offset = uint32_t(region * _encode_region_bytes);
+			const uint32_t layer_bytes = uint32_t(blocks * blocks * codec.block_words * int(sizeof(uint32_t)));
+			requested = _rd->buffer_get_data_async(_resources.encode_buffer,
 							   callable_mp(this, &Terrain3DSurfaceBaker::_on_encode_readback)
-									   .bind(int(slot), channel, generation, sequence)) == OK;
+									   .bind(int(slot), channel, tier, ring_page, generation, sequence),
+							   offset, layer_bytes) == OK;
+			if (requested) {
+				++outstanding;
+			}
 		}
-		// Keep the flag set when the request failed, so a later frame retries it.
-		_encode_pending[slot] = requested ? 0 : 1;
 		if (requested) {
+			_encode_pending[slot] = 0;
 			_encode_requests++;
+			continue;
 		}
-		if (!requested && !_encode_warned) {
+		// The readback was refused (or a uniform set is missing): the page keeps its pending
+		// flag so a later frame retries it, and the ring page drops back to the readbacks that
+		// really are in flight - releasing all three here would leave the callbacks of the
+		// ones that were issued with nothing to decrement, and the page would never free.
+		_hold_encode_page(ring_page, outstanding);
+		if (!_encode_warned) {
 			_encode_warned = true;
-			LOG(WARN, "Could not request an atlas encode readback; compressed pages will stay blank");
+			LOG(WARN, "Could not request a block encoder readback; compressed pages will stay blank");
 		}
+	}
+	if (compute_list >= 0) {
+		_rd->compute_list_end();
 	}
 }
 
+// Takes the scratch layer a page about to be produced writes its half-float channels into.
+// Under the page-sized staging arrays that is the slot itself and nothing has to be held;
+// under the scratch regime it is a ring page, held until that page's block readbacks have
+// been delivered, because the half-float content only exists for as long as the encode needs
+// it. Returns -1 when every ring page is held, which defers the production to a later frame.
+int Terrain3DSurfaceBaker::_take_staging_layer(const int p_slot) {
+	if (!_staging_is_scratch()) {
+		if (p_slot >= 0 && p_slot < int(_slot_scratch.size())) {
+			_slot_scratch[size_t(p_slot)] = ENCODE_RING_NONE;
+		}
+		return p_slot;
+	}
+	std::lock_guard<std::mutex> lock(_encode_mutex);
+	for (int page = 0; page < ENCODE_PAGES; ++page) {
+		if (_encode_ring_held[size_t(page)] != 0) {
+			continue;
+		}
+		_encode_ring_held[size_t(page)] = uint8_t(ENCODE_CHANNELS);
+		if (p_slot >= 0 && p_slot < int(_slot_scratch.size())) {
+			_slot_scratch[size_t(p_slot)] = uint8_t(page);
+		}
+		return page;
+	}
+	return -1;
+}
+
+// Sets one ring page's outstanding readback count. Takes the encode mutex alone.
+void Terrain3DSurfaceBaker::_hold_encode_page(const int p_page, const int p_outstanding) {
+	std::lock_guard<std::mutex> lock(_encode_mutex);
+	if (p_page < 0 || p_page >= int(_encode_ring_held.size())) {
+		return;
+	}
+	_encode_ring_held[size_t(p_page)] = uint8_t(CLAMP(p_outstanding, 0, ENCODE_CHANNELS));
+}
+
+// Releases one ring page's regions. Only the completion callback calls this, and it never
+// holds the world mutex, so the ring is released under the encode mutex alone.
+void Terrain3DSurfaceBaker::_release_encode_page(const int p_page) {
+	std::lock_guard<std::mutex> lock(_encode_mutex);
+	if (p_page < 0 || p_page >= int(_encode_ring_held.size()) || _encode_ring_held[size_t(p_page)] == 0) {
+		// The ring was rebuilt under this callback, so the count belongs to a bundle that no
+		// longer exists.
+		return;
+	}
+	_encode_ring_held[size_t(p_page)]--;
+}
+
 void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, const int p_slot,
-		const int p_channel, const uint64_t p_generation, const uint64_t p_sequence) {
+		const int p_channel, const int p_tier, const int p_page, const uint64_t p_generation,
+		const uint64_t p_sequence) {
+	_release_encode_page(p_page);
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	bool stale = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		if (_atlas_compression_applied == 0 || _generation != p_generation || p_slot < 0 ||
-				p_slot >= int(_slot_sequence.size()) || _slot_sequence[size_t(p_slot)] != p_sequence) {
-			return;
-		}
+		stale = _generation != p_generation || p_slot < 0 || p_slot >= int(_slot_sequence.size()) ||
+				_slot_sequence[size_t(p_slot)] != p_sequence;
 	}
-	if (p_data.size() != int64_t(_stored_size) * _stored_size * 8) {
+	if (stale) {
+		return;
+	}
+	const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].applied.load()];
+	const int blocks = (_stored_size + 3) / 4;
+	const int64_t expected = int64_t(blocks) * blocks * codec.block_words * int64_t(sizeof(uint32_t));
+	if (codec.block_words == 0 || p_data.size() != expected) {
 		if (!_encode_warned) {
 			_encode_warned = true;
-			LOG(WARN, "Atlas encode readback size ", int64_t(p_data.size()), " does not match ", int64_t(_stored_size) * _stored_size * 8);
+			LOG(WARN, "Block encoder readback size ", int64_t(p_data.size()), " does not match ", expected);
 		}
 		_encode_failures++;
+		_mark_encode_failed(p_slot, p_generation, p_sequence);
 		return;
 	}
 	_encode_readbacks++;
-	Ref<Image> image = Image::create_from_data(_stored_size, _stored_size, false, Image::FORMAT_RGBAH, p_data);
-	if (image.is_null()) {
-		_encode_failures++;
-		return;
-	}
-	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression_applied.load()];
-	Ref<Image> source = image;
-	if (source->get_format() != (codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8)) {
-		source = source->duplicate();
-		source->convert(codec.hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8);
-	}
-	if (source->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !source->is_compressed()) {
-		if (!_encode_warned) {
-			_encode_warned = true;
-			LOG(WARN, "Atlas encode failed for ", codec.name, "; compressed pages will stay blank");
-		}
-		_encode_failures++;
-		return;
-	}
 	// This callback runs inside the frame stall, where the draw graph has already been
-	// ended: queue the bytes and let the next render callback, which records, upload them.
+	// ended: queue the blocks and let the next render callback, which records, upload them.
 	EncodedLayer layer;
 	layer.channel = p_channel;
 	layer.slot = p_slot;
+	layer.tier = tier;
 	layer.generation = p_generation;
 	layer.sequence = p_sequence;
-	layer.data = source->get_data();
+	layer.data = p_data;
 	{
 		std::lock_guard<std::mutex> lock(_encode_mutex);
 		if (_encoded_layers.size() >= size_t(MAX(4, _page_count) * 3)) {
 			_encode_failures++;
+			_mark_encode_failed(p_slot, p_generation, p_sequence);
 			return;
 		}
 		_encoded_layers.push_back(std::move(layer));
 	}
 }
 
-// Compresses and decodes one image through the codec the atlas resolved to, reporting the
-// error it introduced. Uncompressed (and every refused request) must round trip exactly.
-Dictionary Terrain3DSurfaceBaker::probe_atlas_compression(const Ref<Image> &p_image) const {
+// Compresses and decodes one image through the codec a tier resolved to, reporting the error
+// it introduced. This is the CPU reference for the codec's error bound: the page pipeline
+// itself never runs a CPU codec (the block encoder does that on the GPU), so the probe is
+// what a test can call to state how lossy a codec is. Uncompressed - and every refused
+// request - must round trip exactly.
+Dictionary Terrain3DSurfaceBaker::probe_tier_compression(const int p_tier, const Ref<Image> &p_image) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	Dictionary result;
-	result["mode"] = _atlas_compression_effective.load();
-	result["applied"] = _atlas_compression_applied.load();
-	result["name"] = String(ATLAS_CODECS[_atlas_compression_effective.load()].name);
+	result["tier"] = tier;
+	result["mode"] = _tiers[tier].effective.load();
+	result["applied"] = _tiers[tier].applied.load();
+	result["name"] = String(ATLAS_CODECS[_tiers[tier].effective.load()].name);
 	result["valid"] = false;
 	result["max_error"] = 0.0;
 	result["mean_error"] = 0.0;
 	if (p_image.is_null()) {
 		return result;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[_atlas_compression_effective];
+	const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].effective.load()];
 	if (codec.mode == Image::COMPRESS_MAX || codec.channels != Image::USED_CHANNELS_RGBA) {
 		result["valid"] = true;
 		return result;
@@ -1125,7 +1415,15 @@ void Terrain3DSurfaceBaker::acknowledge_output(const RID &p_albedo) {
 	// Both RIDs a bundle can publish are matched, because a bundle built before a format
 	// change carries no compressed pair while the current setting says there is one.
 	auto bundle_generation = [](const ResourceBundle &p_bundle, const RID &p_rid) -> bool {
-		return p_bundle.output_albedo_rs == p_rid || p_bundle.sampled_albedo_rs == p_rid;
+		if (p_bundle.output_albedo_rs == p_rid) {
+			return true;
+		}
+		for (int tier = 0; tier < TIER_COUNT; ++tier) {
+			if (p_bundle.sampled[tier].albedo_rs == p_rid) {
+				return true;
+			}
+		}
+		return false;
 	};
 	uint64_t generation = 0;
 	if (bundle_generation(_resources, p_albedo)) {
@@ -1192,14 +1490,17 @@ void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const R
 }
 
 void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights,
-		const Ref<Image> &p_height, const Rect2 &p_world_rect, float p_slope_factor, Vector3 p_source_grid) {
+		const Ref<Image> &p_height, const Rect2 &p_world_rect, float p_slope_factor, Vector3 p_source_grid,
+		int p_tier) {
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (!_configured || p_slot < 0 || p_slot >= _page_count || p_idweights.is_null() || p_height.is_null()) {
 		return;
 	}
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	PendingJob job;
 	job.slot = p_slot;
 	job.kind = PENDING_BAKE;
+	job.tier = tier;
 	job.idweights = p_idweights;
 	job.height = p_height;
 	job.world_rect = p_world_rect;
@@ -1209,11 +1510,12 @@ void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights
 	job.sequence = ++_next_sequence;
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
+	_slot_tier[size_t(p_slot)] = uint8_t(tier);
 	_ready[size_t(p_slot)] = 0;
 	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
-void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_channels) {
+void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_channels, int p_tier) {
 	Ref<Image> albedo = p_channels.get("albedo_height", Variant());
 	Ref<Image> normal = p_channels.get("normal_roughness", Variant());
 	Ref<Image> params = p_channels.get("params", Variant());
@@ -1221,9 +1523,11 @@ void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_ch
 	if (!_configured || p_slot < 0 || p_slot >= _page_count || albedo.is_null() || normal.is_null() || params.is_null()) {
 		return;
 	}
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	PendingJob job;
 	job.slot = p_slot;
 	job.kind = PENDING_CACHED;
+	job.tier = tier;
 	job.albedo_height = albedo;
 	job.normal_roughness = normal;
 	job.params = params;
@@ -1231,24 +1535,28 @@ void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_ch
 	job.sequence = ++_next_sequence;
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
+	_slot_tier[size_t(p_slot)] = uint8_t(tier);
 	_ready[size_t(p_slot)] = 0;
 	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
 
-void Terrain3DSurfaceBaker::queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect) {
+void Terrain3DSurfaceBaker::queue_cell_page(int p_slot, const Array &p_cells, const Rect2 &p_rect, int p_tier) {
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (!_configured || p_slot < 0 || p_slot >= _page_count) {
 		return;
 	}
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	PendingJob job;
 	job.slot = p_slot;
 	job.kind = PENDING_CELL;
+	job.tier = tier;
 	job.cells = p_cells;
 	job.world_rect = p_rect;
 	job.generation = _generation;
 	job.sequence = ++_next_sequence;
 	_pending[p_slot] = job;
 	_slot_sequence[size_t(p_slot)] = job.sequence;
+	_slot_tier[size_t(p_slot)] = uint8_t(tier);
 	_ready[size_t(p_slot)] = 0;
 	_sampled_channel_mask[size_t(p_slot)] = 0;
 }
@@ -1261,6 +1569,9 @@ void Terrain3DSurfaceBaker::invalidate_slot(int p_slot) {
 	PendingJob job;
 	job.slot = p_slot;
 	job.kind = PENDING_INVALIDATE;
+	// An invalidation clears a slot's content, it does not hand the slot to the other view:
+	// the tier stays whatever last filled it until the next queue call names a producer.
+	job.tier = p_slot < int(_slot_tier.size()) ? int(_slot_tier[size_t(p_slot)]) : int(TIER_AVT);
 	job.generation = _generation;
 	job.sequence = ++_next_sequence;
 	_pending[p_slot] = job;
@@ -1338,9 +1649,10 @@ bool Terrain3DSurfaceBaker::_upload_cached_page(const PendingJob &p_job) {
 		return false;
 	}
 	SurfaceVTLabel label(_rd, "SVT Cached Page Upload - slot " + String::num_int64(p_job.slot));
-	if (_rd->texture_update(_resources.output_albedo_rd, uint32_t(p_job.slot), albedo) != OK ||
-			_rd->texture_update(_resources.output_normal_rd, uint32_t(p_job.slot), normal) != OK ||
-			_rd->texture_update(_resources.output_params_rd, uint32_t(p_job.slot), params) != OK) {
+	const int layer = p_job.staging_layer >= 0 ? p_job.staging_layer : p_job.slot;
+	if (_rd->texture_update(_resources.output_albedo_rd, uint32_t(layer), albedo) != OK ||
+			_rd->texture_update(_resources.output_normal_rd, uint32_t(layer), normal) != OK ||
+			_rd->texture_update(_resources.output_params_rd, uint32_t(layer), params) != OK) {
 		LOG(WARN, "Could not upload cached surface page ", p_job.slot);
 		return false;
 	}
@@ -1406,7 +1718,7 @@ void main() {
 		}
 	}
 	for (RID target : { _resources.output_albedo_rd, _resources.output_normal_rd, _resources.output_params_rd }) {
-		_rd->texture_clear(target, Color(0, 0, 0, 0), 0, 1, p_job.slot, 1);
+		_rd->texture_clear(target, Color(0, 0, 0, 0), 0, 1, p_job.staging_layer >= 0 ? p_job.staging_layer : p_job.slot, 1);
 	}
 	int piece_index = 0;
 	for (const Dictionary &piece : p_job.cells) {
@@ -1470,7 +1782,7 @@ void main() {
 		}
 		push.encode_s32(48, _page_size);
 		push.encode_s32(52, _border);
-		push.encode_s32(56, p_job.slot);
+		push.encode_s32(56, p_job.staging_layer >= 0 ? p_job.staging_layer : p_job.slot);
 		push.encode_s32(60, 0);
 		int64_t list = _rd->compute_list_begin();
 		_rd->compute_list_bind_compute_pipeline(list, _resources.cell_pipeline);
@@ -1516,8 +1828,9 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 	for (size_t index = 0; index < p_jobs.size(); index++) {
 		PendingJob &job = p_jobs[index];
 		const int64_t offset = int64_t(index) * JOB_STRIDE;
+		const int layer = job.staging_layer >= 0 ? job.staging_layer : job.slot;
 		uint32_t mode = 0u;
-		if (job.kind == PENDING_BAKE && p_material_count > 0 && _upload_source_page(job, job.slot)) {
+		if (job.kind == PENDING_BAKE && p_material_count > 0 && _upload_source_page(job, layer)) {
 			mode = 1u;
 		} else if (job.kind == PENDING_BAKE) {
 			job.kind = PENDING_INVALIDATE;
@@ -1527,8 +1840,8 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 		encode_vec4(job_bytes, offset, job.world_rect.position.x, job.world_rect.position.y,
 				job.world_rect.size.x, job.world_rect.size.y);
 		encode_vec4(job_bytes, offset + 16, texel_x, texel_z, float(p_page_size), float(p_border));
-		job_bytes.encode_u32(offset + 32, uint32_t(std::max(0, job.slot)));
-		job_bytes.encode_u32(offset + 36, uint32_t(std::max(0, job.slot)));
+		job_bytes.encode_u32(offset + 32, uint32_t(std::max(0, layer)));
+		job_bytes.encode_u32(offset + 36, uint32_t(std::max(0, layer)));
 		job_bytes.encode_u32(offset + 40, mode);
 		job_bytes.encode_u32(offset + 44, 0);
 		encode_vec4(job_bytes, offset + 48, std::clamp(job.slope_factor, 0.0f, 1.0f), job.source_grid.x, job.source_grid.y, job.source_grid.z);
@@ -1579,10 +1892,14 @@ void Terrain3DSurfaceBaker::_set_ready(int p_slot, bool p_ready, uint64_t p_gene
 		}
 		return;
 	}
-	// Uncompressed output is the staging output, so recording its successful write makes
-	// the consumer-visible page ready. Compressed output is a different sampled array and
-	// becomes ready only after all three encoded layers have uploaded.
-	_ready[size_t(p_slot)] = _atlas_compression_applied.load() == 0 ? 1 : 0;
+	// A tier stored uncompressed produces straight into the staging arrays the material
+	// samples, so recording its successful write makes the page ready. A tier stored
+	// compressed produces into a different array set and becomes ready only once all three
+	// encoded layers have uploaded - and the flag is *not* cleared while an encode is in
+	// flight, because a demand pass that reads it as "not ready" produces the page again and
+	// the page then never settles.
+	const int tier = p_slot < int(_slot_tier.size()) ? int(_slot_tier[size_t(p_slot)]) : int(TIER_AVT);
+	_ready[size_t(p_slot)] = _tier_uses_sampled(tier) ? 0 : 1;
 }
 
 void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) {
@@ -1728,8 +2045,14 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 
 	std::vector<PendingJob> compute_jobs;
 	compute_jobs.reserve(jobs.size());
-	// Invalidation only needs to clear readiness, not shade every cache texel.
-	const bool cleared_all = invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, page_count) == OK;
+	// Invalidation only needs to clear readiness, not shade every cache texel. Under the
+	// scratch regime nothing samples the staging arrays at all - the compressed layer of a
+	// re-assigned slot keeps the previous page's material for the frame or two until its own
+	// encode lands, exactly as it does with page-sized staging - so an invalidation never has
+	// to touch a layer, and the layers it could name are not the slot's anyway.
+	const bool scratch = _staging_is_scratch();
+	const int cleared_layers = scratch ? _staging_layers : page_count;
+	const bool cleared_all = invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, uint32_t(cleared_layers)) == OK;
 	const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
 	if (_render_frame != frame) { _render_frame = frame; _frame_page_updates = 0; }
 	// Compressed page production happens here, inside the recording, in two halves: the
@@ -1738,11 +2061,11 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	// the readbacks for the pages produced below are then requested from this same
 	// recording, which is what makes a page compressed by the frame that produced it.
 	_flush_encodes(generation);
-	for (const PendingJob &job : jobs) {
+	for (PendingJob &job : jobs) {
 		if (job.generation != generation || job.slot < 0 || job.slot >= page_count) {
 			continue;
 		}
-		if (job.kind == PENDING_INVALIDATE && (cleared_all ||
+		if (job.kind == PENDING_INVALIDATE && (cleared_all || scratch ||
 				_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) == OK)) {
 			_set_ready(job.slot, false, generation, material_version, job.sequence);
 			{ std::lock_guard<std::mutex> lock(_mutex); ++_invalidated_pages; }
@@ -1754,11 +2077,23 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 				// A reused slot must not expose its previous material while deferred.
 				PendingJob invalid = job;
 				invalid.kind = PENDING_INVALIDATE;
-				if (!cleared_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) != OK) {
+				if (!cleared_all && !scratch &&
+						_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) != OK) {
 					compute_jobs.push_back(invalid);
 				}
 				continue;
 			}
+			// The layer this page is shaded into: the slot under page-sized staging, a ring
+			// page under the scratch regime - and a ring page that is held until this page's
+			// block readbacks arrive, because the half-float content only exists that long.
+			const int layer = _take_staging_layer(job.slot);
+			if (layer < 0) {
+				// Every ring page is waiting on readbacks. Defer the page exactly as the
+				// budget does, so a later frame produces it with a layer of its own.
+				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
+				continue;
+			}
+			job.staging_layer = layer;
 			++_frame_page_updates;
 		}
 		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
@@ -1767,18 +2102,13 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 					std::lock_guard<std::mutex> lock(_mutex);
 					_cached_uploads++;
 				}
-				if (_atlas_compression_applied != 0 && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
-					if (job.kind == PENDING_CACHED) {
-						// The cached path already holds the channel images on the CPU, so it
-						// compresses them directly instead of reading staging back.
-						_encode_image(0, job.slot, job.generation, job.sequence, job.albedo_height);
-						_encode_image(1, job.slot, job.generation, job.sequence, job.normal_roughness);
-						_encode_image(2, job.slot, job.generation, job.sequence, job.params);
-					} else {
-						// The cell pass accumulated in the staging arrays, which only the GPU
-						// has; queue the readback.
-						_encode_pending[size_t(job.slot)] = 1;
-					}
+				// Both far-field paths end with the three channels in the staging arrays -
+				// the cached path uploads them, the cell path accumulated them there - so the
+				// block encoder is the only thing that turns them into the SVT page. This is
+				// where a far-field page is compressed, once per production: an SVT page's
+				// content is final, so nothing re-encodes it while the slot keeps its page.
+				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
+					_encode_pending[size_t(job.slot)] = 1;
 				}
 				_set_ready(job.slot, true, generation, material_version, job.sequence);
 			} else {
@@ -1794,6 +2124,14 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		} else {
 			compute_jobs.push_back(job);
 		}
+	}
+	// A pure invalidation has nothing to shade under the scratch regime: its only effect is
+	// the readiness clear above, and dispatching it would write zeros into whichever scratch
+	// layer the shader named, which may belong to a page whose encode is still in flight.
+	if (scratch) {
+		compute_jobs.erase(std::remove_if(compute_jobs.begin(), compute_jobs.end(),
+								   [](const PendingJob &p_job) { return p_job.kind == PENDING_INVALIDATE; }),
+				compute_jobs.end());
 	}
 	if (!compute_jobs.empty()) {
 		std::vector<PendingJob> original_jobs = compute_jobs;
@@ -1813,10 +2151,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 					std::lock_guard<std::mutex> lock(_mutex);
 					_baked_pages++;
 				}
-				// The bake dispatch is recorded just above, so the readback requested below
-				// sits after it in this same recording and the frame that produces the page
-				// is the frame that compresses it.
-				if (_atlas_compression_applied != 0 && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
+				// The bake dispatch is recorded just above, so the encoder dispatch requested
+				// below reads the staging layer this same recording wrote.
+				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
 					_encode_pending[size_t(job.slot)] = 1;
 				}
 				_set_ready(job.slot, true, generation, material_version, job.sequence);
@@ -1843,13 +2180,16 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 // Read-only state and explicit export
 ///////////////////////////
 
+// Single-channel getters kept for callers that predate the bundle read. They report the AVT
+// tier, which is the tier the legacy single compression setting addresses; anything that has
+// to bind both tiers at once reads get_published_arrays() instead.
 RID Terrain3DSurfaceBaker::get_albedo_rid() const {
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_atlas_compression_applied != 0 && _resources.sampled_albedo_rs.is_valid()) {
-		return _resources.sampled_albedo_rs;
+	if (_tier_uses_sampled(TIER_AVT)) {
+		return _resources.sampled[TIER_AVT].albedo_rs;
 	}
 	return _resources.output_albedo_rs;
 }
@@ -1859,24 +2199,40 @@ RID Terrain3DSurfaceBaker::get_albedo_rid() const {
 // them, so a caller that used them one by one could bind the albedo of one generation beside
 // the normal of the next. That mix is the material sampling an array the release below is
 // about to free, which the renderer reports once per draw as a missing material uniform set.
+//
+// Both tiers are published at once: the AVT arrays under the legacy keys, the SVT arrays
+// under an `svt_` prefix. A tier that is stored uncompressed resolves to the staging arrays,
+// which is what makes one setting able to be compressed while the other is not.
 Dictionary Terrain3DSurfaceBaker::get_published_arrays() const {
 	std::lock_guard<std::mutex> lock(_mutex);
 	Dictionary result;
 	if (_resource_generation != _generation) {
 		return result;
 	}
-	const bool compressed = _atlas_compression_applied.load() != 0;
-	result["albedo_height"] = (compressed && _resources.sampled_albedo_rs.is_valid())
-			? _resources.sampled_albedo_rs
-			: _resources.output_albedo_rs;
-	result["normal_roughness"] = (compressed && _resources.sampled_normal_rs.is_valid())
-			? _resources.sampled_normal_rs
-			: _resources.output_normal_rs;
-	result["params"] = (compressed && _resources.sampled_params_rs.is_valid())
-			? _resources.sampled_params_rs
-			: _resources.output_params_rs;
+	auto publish = [this](Dictionary &r_result, int p_tier, const String &p_prefix) {
+		const bool compressed = _tiers[p_tier].applied.load() != 0;
+		r_result[p_prefix + String("albedo_height")] = (compressed && _resources.sampled[p_tier].albedo_rs.is_valid())
+				? _resources.sampled[p_tier].albedo_rs
+				: _resources.output_albedo_rs;
+		r_result[p_prefix + String("normal_roughness")] = (compressed && _resources.sampled[p_tier].normal_rs.is_valid())
+				? _resources.sampled[p_tier].normal_rs
+				: _resources.output_normal_rs;
+		r_result[p_prefix + String("params")] = (compressed && _resources.sampled[p_tier].params_rs.is_valid())
+				? _resources.sampled[p_tier].params_rs
+				: _resources.output_params_rs;
+	};
+	publish(result, TIER_AVT, String());
+	publish(result, TIER_SVT, String("svt_"));
 	result["generation"] = int64_t(_resource_generation);
 	return result;
+}
+
+// Generation of the arrays get_published_arrays() hands out. A material has to rebind whenever
+// this changes, not only when the near field's albedo does: both tiers' sets are replaced as a
+// bundle, and a far-field-only change would otherwise leave the material sampling freed arrays.
+uint64_t Terrain3DSurfaceBaker::get_published_generation() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _resource_generation == _generation ? _resource_generation : 0;
 }
 
 RID Terrain3DSurfaceBaker::get_normal_rid() const {
@@ -1884,8 +2240,8 @@ RID Terrain3DSurfaceBaker::get_normal_rid() const {
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_atlas_compression_applied != 0 && _resources.sampled_normal_rs.is_valid()) {
-		return _resources.sampled_normal_rs;
+	if (_tier_uses_sampled(TIER_AVT)) {
+		return _resources.sampled[TIER_AVT].normal_rs;
 	}
 	return _resources.output_normal_rs;
 }
@@ -1895,8 +2251,8 @@ RID Terrain3DSurfaceBaker::get_params_rid() const {
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_atlas_compression_applied != 0 && _resources.sampled_params_rs.is_valid()) {
-		return _resources.sampled_params_rs;
+	if (_tier_uses_sampled(TIER_AVT)) {
+		return _resources.sampled[TIER_AVT].params_rs;
 	}
 	return _resources.output_params_rs;
 }
@@ -1917,14 +2273,27 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	RID normal;
 	RID params;
 	uint64_t generation;
+	int tier = TIER_AVT;
+	bool scratch = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		if (p_slot < 0 || p_slot >= int(_ready.size()) || !_ready[size_t(p_slot)]) {
 			return result;
 		}
-		albedo = _resources.output_albedo_rs;
-		normal = _resources.output_normal_rs;
-		params = _resources.output_params_rs;
+		tier = p_slot < int(_slot_tier.size()) ? int(_slot_tier[size_t(p_slot)]) : int(TIER_AVT);
+		scratch = _staging_is_scratch();
+		if (scratch && _tier_uses_sampled(tier)) {
+			// Under the scratch regime a slot's half-float layer is long gone: it was reused
+			// by the next page the frame produced. The page's content is its block words, so
+			// the export reads those and decodes them.
+			albedo = _sampled_rs(tier, 0);
+			normal = _sampled_rs(tier, 1);
+			params = _sampled_rs(tier, 2);
+		} else {
+			albedo = _resources.output_albedo_rs;
+			normal = _resources.output_normal_rs;
+			params = _resources.output_params_rs;
+		}
 		generation = _generation;
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
@@ -1939,6 +2308,13 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	Ref<Image> params_image = server->texture_2d_layer_get(params, p_slot);
 	if (albedo_image.is_null() || normal_image.is_null() || params_image.is_null()) {
 		return result;
+	}
+	// A block-compressed layer comes back compressed, and every caller wants texels: the
+	// offline SVT bake crops the border off and generates mipmaps from them.
+	for (Ref<Image> *image : { &albedo_image, &normal_image, &params_image }) {
+		if ((*image)->is_compressed() && (*image)->decompress() != OK) {
+			return result;
+		}
 	}
 	result["albedo_height"] = albedo_image;
 	result["normal_roughness"] = normal_image;
@@ -1982,24 +2358,36 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	// to false on the following publish; a stuck true means the bake is using the fallback
 	// array and the material pages it produces are not the artist's material.
 	stats["materials_stale"] = _materials_stale;
-	stats["atlas_compression"] = _atlas_compression;
-	stats["atlas_compression_available"] = _atlas_compression_effective.load();
-	stats["atlas_compression_applied"] = _atlas_compression_applied.load();
-	{
-		const int available = _atlas_compression_effective.load();
-		stats["atlas_compression_name"] = String(ATLAS_CODECS[available].name);
-		String reason = _atlas_compression_reason;
-		if (reason.is_empty() && available == 0 && _atlas_compression != 0) {
-			reason = String(ATLAS_CODECS[_atlas_compression].name) +
-					" was resolved for this device, but the compressed page arrays could not be created";
-		}
-		stats["atlas_compression_reason"] = reason;
+	// The AVT tier under the legacy keys, both tiers under their own. `applied` is what the
+	// tier's pages are actually stored in, which is what a test checks against the request.
+	stats["atlas_compression"] = _tiers[TIER_AVT].requested;
+	stats["atlas_compression_available"] = _tiers[TIER_AVT].effective.load();
+	stats["atlas_compression_applied"] = _tiers[TIER_AVT].applied.load();
+	stats["atlas_compression_name"] = String(ATLAS_CODECS[_tiers[TIER_AVT].effective.load()].name);
+	stats["atlas_compression_reason"] = get_tier_compression_info(TIER_AVT).get("reason", String());
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		const String prefix = tier == TIER_SVT ? String("svt_compression") : String("avt_compression");
+		const Dictionary info = get_tier_compression_info(tier);
+		stats[prefix + String("_requested")] = info.get("requested", 0);
+		stats[prefix + String("_available")] = info.get("available", 0);
+		stats[prefix + String("_applied")] = info.get("applied", 0);
+		stats[prefix + String("_name")] = info.get("name", String());
+		stats[prefix + String("_reason")] = info.get("reason", String());
 	}
 	stats["encode_pending"] = int64_t(std::count(_encode_pending.begin(), _encode_pending.end(), uint8_t(1)));
+	// The half-float pool's shape: page sized while a tier samples it by slot, the encoder
+	// ring once every tier is compressed. `staging_bytes` is what the whole pool costs - the
+	// three RGBA16F outputs at 8 bytes per texel plus the R16/R32F sources at 6 - which is
+	// the number the compression settings are supposed to move.
+	stats["staging_layers"] = _staging_layers;
+	stats["staging_scratch"] = _staging_is_scratch();
+	stats["staging_bytes"] = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
 	stats["encode_requests"] = int64_t(_encode_requests);
 	stats["encode_readbacks"] = int64_t(_encode_readbacks);
 	stats["encode_updates"] = int64_t(_encode_updates);
 	stats["encode_failures"] = int64_t(_encode_failures);
+	stats["encode_ring_pages"] = int64_t(std::count_if(_encode_ring_held.begin(), _encode_ring_held.end(),
+			[](uint8_t p_held) { return p_held != 0; }));
 	return stats;
 }
 
@@ -2014,10 +2402,10 @@ void Terrain3DSurfaceBaker::_bind_methods() {
 								 "normal_depths", "ao_strengths", "ao_affects", "roughness_mods", "uv_scales", "detiles",
 								 "slope_params"),
 			&Terrain3DSurfaceBaker::set_materials);
-	ClassDB::bind_method(D_METHOD("queue_page", "slot", "idweights", "height", "world_rect", "slope_factor", "source_grid"),
-			&Terrain3DSurfaceBaker::queue_page, DEFVAL(1.0f), DEFVAL(Vector3()));
-	ClassDB::bind_method(D_METHOD("queue_cached_page", "slot", "channels"),
-			&Terrain3DSurfaceBaker::queue_cached_page);
+	ClassDB::bind_method(D_METHOD("queue_page", "slot", "idweights", "height", "world_rect", "slope_factor", "source_grid", "tier"),
+			&Terrain3DSurfaceBaker::queue_page, DEFVAL(1.0f), DEFVAL(Vector3()), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("queue_cached_page", "slot", "channels", "tier"),
+			&Terrain3DSurfaceBaker::queue_cached_page, DEFVAL(1));
 	ClassDB::bind_method(D_METHOD("invalidate_slot", "slot"), &Terrain3DSurfaceBaker::invalidate_slot);
 	ClassDB::bind_method(D_METHOD("render_pending", "keep_alive"), &Terrain3DSurfaceBaker::render_pending,
 			DEFVAL(Ref<RefCounted>()));

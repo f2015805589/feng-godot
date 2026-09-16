@@ -105,6 +105,13 @@ uniform bool _surface_material_required = false;
 uniform highp sampler2DArray _surface_material_albedo : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_normal : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_params : filter_linear, repeat_disable;
+// The far field's own set. AVT and SVT store the same shared page pool in independent
+// formats - an AVT page is rewritten by every edit, an SVT page is assembled once - so each
+// tier samples the arrays it was produced into. A tier left uncompressed is bound the
+// staging arrays, so these name the same textures as the three above in that case.
+uniform highp sampler2DArray _surface_svt_material_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_svt_material_normal : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_svt_material_params : filter_linear, repeat_disable;
 #endif
 // Stored surface resolution in texels per region texel. The virtual texture's pages
 // are produced from the dense payload, so its page grid and texel lookups are in
@@ -366,7 +373,8 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 	return false;
 }
 
-// Both virtual address spaces resolve into the same material arrays. A missing
+// Both virtual address spaces resolve into the material arrays of their own tier: the near
+// field into the AVT set above, the far field into the SVT set below. A missing
 // or pending selected page displays diagnostics; residency never selects a substitute mip.
 // The one exception is the far field's opt-in `_svt_feedback` below, which is
 // a request to trade that diagnostic for a coarser resident level.
@@ -378,6 +386,20 @@ bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 	if (params.a < 0.99) { return false; }
 	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
 	vec4 normal_rough = textureLod(_surface_material_normal, coord, 0.0);
+	r_mat = material(albedo, normal_rough, params.x, params.y, params.z, 1.0);
+	r_normal = normal_rough.xyz;
+	return true;
+}
+
+// The far field's resolve. Identical to the near field's, against the SVT tier's arrays.
+bool surface_svt_material_slot(int slot, vec2 offset, int page_size, int border,
+		out material r_mat, out vec3 r_normal) {
+	if (slot < 0 || slot == 65535) { return false; }
+	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
+	vec4 params = textureLod(_surface_svt_material_params, coord, 0.0);
+	if (params.a < 0.99) { return false; }
+	vec4 albedo = textureLod(_surface_svt_material_albedo, coord, 0.0);
+	vec4 normal_rough = textureLod(_surface_svt_material_normal, coord, 0.0);
 	r_mat = material(albedo, normal_rough, params.x, params.y, params.z, 1.0);
 	r_normal = normal_rough.xyz;
 	return true;
@@ -400,7 +422,7 @@ bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_norm
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
 				int slot = int(texelFetch(_surface_svt_indirection, coord, mip).r + 0.5);
 				vec2 offset = fract(world / (_surface_svt_page_world * float(1 << mip)));
-				if (surface_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, r_mat, r_normal)) { return true; }
+				if (surface_svt_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, r_mat, r_normal)) { return true; }
 			}
 		}
 	}

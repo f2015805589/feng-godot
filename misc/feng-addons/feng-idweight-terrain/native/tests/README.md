@@ -426,23 +426,47 @@ field that loads on one run and not the next. A page is re-produced at most once
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_compressed_render_runner.py --driver vulkan
 ```
 
-`vt_atlas_compression` decides the format of the three material page arrays. A compressed format
-cannot be a storage image, so a page is produced in the RGBA16F staging arrays, read back, encoded
-on the CPU and uploaded into the sampled arrays. The upload has to happen from a recording point:
-the readback callback runs inside the frame stall, after the frame's draw graph was ended and
-immediately before the next one begins, so an upload issued from there was recorded into the
-finished graph and discarded — every upload reported success while the arrays stayed empty and the
-whole viewport showed the missing-page diagnostic. The test renders real material through BC7 and
-BC3 (patch means within 0.01 of the uncompressed frame, no magenta), and measures that one demand
-pass hands the producer the same number of pages with and without compression.
+`surface_vt_compression` (AVT) and `surface_svt_compression` (SVT) decide the storage format of the
+material page arrays, one setting per tier, over the one shared physical pool. They are separate
+because the two tiers produce at very different rates: an AVT page is rewritten by every edit that
+invalidates it, while an SVT page is assembled once from a baked cell and then never rewritten, so
+compressing the far field is paid once and the memory is saved for the rest of the session. The
+inspector shows both as `Compression` inside their `AVT` / `SVT` groups; `vt_atlas_compression`
+remains as the near field's pre-split name.
+
+Compression runs on the GPU. A compressed format cannot be a storage image and no texture copy
+converts formats, so a produced page is encoded by the compute pass in `shaders/bc_encode.glsl`:
+it reads the RGBA16F staging layer through a sampler and writes that layer's block words into one
+region of a small ring buffer (8 pages in flight, a few hundred kilobytes at BC7), which is read
+back and uploaded into the tier's sampling array. The CPU cost of a compressed page is therefore
+the buffer copy of its block words — a sixteenth of the half-float page at BC7 — and never a block
+encoder pass. Only the codecs that shader implements can be selected (BC7 and BC3 RGBA carry the
+alpha the shader reads); every other request is refused with a reason instead of leaving pages no
+encoder ever fills.
+
+The upload has to happen from a recording point: the readback callback runs inside the frame stall,
+after the frame's draw graph was ended and immediately before the next one begins, so an upload
+issued from there was recorded into the finished graph and discarded — every upload reported
+success while the arrays stayed empty and the whole viewport showed the missing-page diagnostic.
+The test renders real material through BC7 and BC3 in both tiers (patch means within 0.01 of the
+uncompressed frame, no magenta), measures that one demand pass hands the producer the same number
+of pages with and without compression, and asserts that a settled far field stops encoding: with
+the view still, `encode_requests`, `ready_pages` and `svt_requeues` must not move, so a produced
+far-field page is compressed exactly once.
 
 Root pages and detail pages are still assembled on the GPU: a baked cell is a device-to-device
-copy. The encode path adds a readback and a codec pass per produced page, and the compressed
-arrays currently sit **beside** the staging pool rather than replacing it, so enabling compression
-adds roughly a tenth to the page-pool footprint instead of cutting it. `get_stats()` reports
-`encode_requests` / `encode_readbacks` / `encode_updates` / `encode_failures`, which is how a page
-that is ready in staging but never reaches the sampled arrays is told apart from one that was never
-produced.
+copy. A tier left uncompressed samples the staging arrays directly and costs nothing extra; a
+compressed tier adds its own `page_count` layers beside the pool. Once **both** tiers are
+compressed nothing samples the staging arrays by slot, so the half-float pool shrinks to the
+encoder ring (`staging_layers` = 8): a produced page writes into a ring layer, the encoder reads
+that same layer, and the layer is held until the page's block readbacks arrive. At 256 pages and a
+264² stored page that is ~535 MB of resident staging becoming ~17 MB. A capacity growth then
+re-produces the resident pages instead of migrating them, and `export_page()` / the dock preview
+read a page's block words and decode them, because the layer it was produced in has been reused.
+`get_stats()` reports `staging_layers` / `staging_scratch` / `staging_bytes`,
+`encode_requests` / `encode_readbacks` / `encode_updates` / `encode_failures` and
+`encode_ring_pages`, which is how a page that is ready in staging but never reaches the sampled
+arrays is told apart from one that was never produced.
 
 ## Far-field distance -> mip bands
 

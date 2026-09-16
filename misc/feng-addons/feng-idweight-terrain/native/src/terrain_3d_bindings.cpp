@@ -94,6 +94,10 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_vt_atlas_compression", "compression"), &Terrain3D::set_vt_atlas_compression);
 	ClassDB::bind_method(D_METHOD("get_vt_atlas_compression"), &Terrain3D::get_vt_atlas_compression);
 	ClassDB::bind_method(D_METHOD("probe_vt_atlas_compression", "image"), &Terrain3D::probe_vt_atlas_compression);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_compression", "compression"), &Terrain3D::set_surface_vt_compression);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_compression"), &Terrain3D::get_surface_vt_compression);
+	ClassDB::bind_method(D_METHOD("set_surface_svt_compression", "compression"), &Terrain3D::set_surface_svt_compression);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_compression"), &Terrain3D::get_surface_svt_compression);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_rect"), &Terrain3D::get_surface_vt_region_rect);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_texels_per_pixel", "value"), &Terrain3D::set_surface_vt_texels_per_pixel);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_texels_per_pixel"), &Terrain3D::get_surface_vt_texels_per_pixel);
@@ -331,11 +335,21 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
-	// The one compression setting: it covers every array the terrain uploads for the virtual
-	// textures (the three material page arrays of the shared physical atlas), so VRAM is
-	// managed here instead of per tier. BC7 by default - the atlas is the largest allocation
-	// and every page carries an alpha channel the shader reads, which BC7 keeps.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_vt_atlas_compression", "get_vt_atlas_compression");
+	// Storage format of the three material page arrays, per tier; the live settings are
+	// `surface_vt_compression` (near field) and `surface_svt_compression` (far field) inside
+	// their own groups below. Each tier's arrays carry an alpha channel the shader reads, so
+	// only codecs that keep alpha are usable, and a codec is only accepted when the GPU block
+	// encoder implements it: page compression never runs a CPU block encoder, which is what
+	// makes it cost this thread nothing.
+	//
+	// They are separate settings because the tiers produce at very different rates. An AVT
+	// page is rewritten by every edit that invalidates it; an SVT page is assembled once from
+	// a baked cell and then never rewritten, so compressing it is paid once and the memory is
+	// saved for the rest of the session.
+	//
+	// The pre-split name stays a script-visible alias for the near field and is hidden from
+	// the inspector, so a scene saved against it keeps working.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA", PROPERTY_USAGE_NONE), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_frame_budget_ms", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_vt_frame_budget_ms", "get_vt_frame_budget_ms");
@@ -346,6 +360,9 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("AVT", "surface_vt_");
 	// The subgroup strips `surface_vt_`, so the Inspector shows exactly `Feedback`.
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_feedback"), "set_avt_feedback", "get_avt_feedback");
+	// Near-field page storage. AVT pages are rewritten by every edit that invalidates them,
+	// so this codec is paid per production; the GPU block encoder keeps that cost off the CPU.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_surface_vt_compression", "get_surface_vt_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
@@ -379,6 +396,10 @@ void Terrain3D::_bind_methods() {
 	// Off restores the strict walk, where a missing page stays visible as the diagnostic.
 	// The subgroup strips `surface_svt_`, so this independently also shows `Feedback`.
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_feedback"), "set_svt_feedback", "get_svt_feedback");
+	// Far-field page storage. A far-field page is assembled once from a baked cell and then
+	// never rewritten, so its compressed copy is final: this is the tier where a codec buys
+	// the most memory for the least work.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_surface_svt_compression", "get_surface_svt_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");

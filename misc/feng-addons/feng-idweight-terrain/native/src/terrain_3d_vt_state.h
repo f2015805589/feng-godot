@@ -52,12 +52,18 @@ struct Terrain3DVTState {
 	bool vt_auto_capacity = true;
 	int vt_pages_per_update = 16;
 	bool vt_adaptive_enabled = true;
-	// Atlas compression for the three material page arrays, as a
-	// Terrain3DAssets::TextureArrayCompression value (1 = BC7). Resolved and validated by
-	// the surface baker, which reports what was applied and why a request was refused.
-	// Default BC7: the physical page atlas is the terrain's largest allocation, and the
-	// page arrays carry an alpha channel the shader reads, which BC7 keeps.
-	int vt_atlas_compression = 0;
+	// Storage format of the near field's material page arrays, as a
+	// Terrain3DAssets::TextureArrayCompression value (1 = BC7). Resolved and validated by the
+	// surface baker, which reports what was applied and why a request was refused, and
+	// encoded on the GPU by the block encoder, so compressing a page costs this thread
+	// nothing. The far field has its own setting below: the two tiers produce the same pool
+	// but at very different rates, and a codec worth its encode for a page that is written
+	// once is not necessarily worth it for a page every edit rewrites.
+	int surface_vt_compression = 0;
+	// Storage format of the far field's material page arrays. A far-field page is assembled
+	// once from a baked cell and never rewritten, so its compressed copy is final: this is
+	// the tier where a codec buys the most memory for the least work.
+	int surface_svt_compression = 0;
 	// Substitutions for a page that is missing or still in production. Both default on: a
 	// miss recovers from a resident coarser level instead of rendering the diagnostic,
 	// which is what a shipped view wants while pages are still arriving. Turning one off
@@ -91,6 +97,10 @@ struct Terrain3DVTState {
 	Dictionary vt_registered_sectors;
 	PackedFloat32Array surface_vt_block_sizes;
 	RID vt_bound_albedo;
+	// Generation of the page-array bundle the material is currently bound to. Both tiers'
+	// arrays are replaced together, so the near field's albedo alone does not identify the
+	// set: a change to the far field's arrays has to rebound the material too.
+	uint64_t vt_bound_generation = 0;
 	uint64_t vt_source_revision = 1;
 	Dictionary vt_svt_tiles;
 	Ref<RefCounted> svt_cell_baker;

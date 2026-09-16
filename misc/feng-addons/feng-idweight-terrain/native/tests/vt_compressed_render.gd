@@ -132,6 +132,16 @@ func wait_pending_empty(max_frames: int = 240) -> bool:
 			return true
 	return false
 
+## Waits until every replaced page array has been released. A format change rebuilds all six
+## arrays and the material only rebinds them once the producer publishes the new bundle, so a
+## second change stacked on top of an undrained retire is a race the test does not need to take
+## part in - it is about the codecs, not about how fast the material can follow a rebuild.
+func settle_bundles(max_frames: int = 120) -> void:
+	for _i in max_frames:
+		await process_frame
+		if int(producer_stats().get("retired_bundles", -1)) == 0:
+			return
+
 func add_materials() -> void:
 	terrain.assets = Terrain3DAssets.new()
 	var dark := Terrain3DTextureAsset.new()
@@ -230,9 +240,11 @@ func run() -> void:
 
 	# Both alpha-capable codecs, because the failure is about the storage path and not
 	# about which of the two was chosen.
+	await settle_bundles()
 	for codec in [BC7, BC3]:
 		terrain.vt_atlas_compression = codec
 		await process_frame
+		await settle_bundles()
 		var resolved: Dictionary = terrain.get_vt_settings()
 		var available := int(resolved.get("vt_atlas_compression_available", -1))
 		var reason := String(resolved.get("vt_atlas_compression_reason", ""))
@@ -259,11 +271,131 @@ func run() -> void:
 		print("VTCOMPRESS_RENDER codec=%d ready=%d stats=%s" % [
 				codec, int(producer_stats().get("ready_pages", 0)), str(producer_stats())])
 
+	# The far field's own setting. An SVT page is assembled once from a baked cell and then
+	# never rewritten, so this is the tier where compression is paid once and the memory is
+	# saved for the rest of the session.
+	#
+	# The near field is switched off for this section on purpose: the AVT grid follows the
+	# target, so with AVT enabled the far view is resolved by the near field and the far
+	# patch would prove nothing about the far-field setting. With AVT off, every texel of the
+	# patch can only come from the SVT arrays.
+	terrain.surface_vt_enabled = false
+	terrain.vt_atlas_compression = 0
+	terrain.surface_svt_compression = 0
+	await settle_bundles()
+	await set_view(FAR_WORLD, 220.0, 144.0)
+	await produce(120)
+	await wait_pending_empty()
+	var svt_baseline := await frame_image()
+	svt_baseline.save_png(output_dir.path_join("compressed-svt-baseline-far.png"))
+	require(float(patch_stats(svt_baseline, FAR_WORLD, 14)["mean"]) > 0.03,
+			"the far field's uncompressed baseline is unexpectedly black")
+	for svt_codec in [BC7, BC3]:
+		terrain.surface_svt_compression = svt_codec
+		await process_frame
+		await settle_bundles()
+		var svt_resolved: Dictionary = terrain.get_vt_settings()
+		var svt_available := int(svt_resolved.get("surface_svt_compression_available", -1))
+		var svt_reason := String(svt_resolved.get("surface_svt_compression_reason", ""))
+		print("VTCOMPRESS_RENDER svt_codec=%d available=%d reason='%s'" % [svt_codec, svt_available, svt_reason])
+		if svt_available != svt_codec:
+			print("VTCOMPRESS_RENDER skipped SVT codec %d: %s" % [svt_codec, svt_reason])
+			continue
+		require(int(svt_resolved.get("surface_vt_compression_available", -1)) == 0,
+				"the two tier settings must be independent: an SVT request changed the AVT resolution")
+		await set_view(FAR_WORLD, 220.0, 144.0)
+		await produce(120)
+		await wait_pending_empty()
+		await produce(40)
+		var svt_image := await frame_image()
+		svt_image.save_png(output_dir.path_join("compressed-svt-codec%d-far.png" % svt_codec))
+		compare_patch(svt_baseline, svt_image, FAR_WORLD, "far SVT codec %d" % svt_codec)
+		# Compressed once. The demand pass keeps visiting its working set every frame, so the
+		# property that has to hold is not "nothing is produced" but "a page is compressed at
+		# most once per production": with the view still and the pool settled, the encode
+		# count, the ready count and the re-production count must all stop moving.
+		await produce(30)
+		var settled := producer_stats()
+		var settled_requests := int(settled.get("encode_requests", -1))
+		var settled_ready := int(settled.get("ready_pages", -1))
+		var settled_requeues := int(terrain.get_vt_settings().get("svt_requeues", -1))
+		await produce(30)
+		var later := producer_stats()
+		var later_requests := int(later.get("encode_requests", -1))
+		var later_ready := int(later.get("ready_pages", -1))
+		var later_requeues := int(terrain.get_vt_settings().get("svt_requeues", -1))
+		print("VTCOMPRESS_RENDER svt_once codec=%d requests %d->%d ready %d->%d requeues %d->%d produced=%d" % [
+				svt_codec, settled_requests, later_requests, settled_ready, later_ready,
+				settled_requeues, later_requeues,
+				int(later.get("baked_pages", 0)) + int(later.get("cached_uploads", 0))])
+		require(later_ready == settled_ready,
+				"a settled far field changed its ready page count (%d -> %d)" % [settled_ready, later_ready])
+		require(later_requeues == settled_requeues,
+				"a settled far field re-produced a ready page (%d -> %d)" % [settled_requeues, later_requeues])
+		require(later_requests == settled_requests,
+				"a settled far field compressed a page again (%d -> %d encodes)" % [settled_requests, later_requests])
+		require(int(later.get("encode_failures", -1)) == 0,
+				"the far field's block encodes must not fail (%d)" % int(later.get("encode_failures", -1)))
+		require(int(later.get("encode_requests", 0)) <= int(later.get("baked_pages", 0)) + int(later.get("cached_uploads", 0)),
+				"a far-field page must be compressed at most once per production")
+	terrain.surface_svt_compression = 0
+	await process_frame
+
+	# Both tiers compressed at once. This is the case that releases the half-float pool: with
+	# nothing sampling the staging arrays by slot they shrink to the encoder ring, so the
+	# resident pool stops carrying a page-sized RGBA16F allocation per slot.
+	terrain.surface_vt_enabled = true
+	terrain.vt_atlas_compression = BC7
+	terrain.surface_svt_compression = BC7
+	await settle_bundles()
+	var pool := producer_stats()
+	var layers := int(pool.get("staging_layers", -1))
+	var page_count := int(terrain.get_vt_settings().get("page_count", -1))
+	print("VTCOMPRESS_RENDER scratch layers=%d scratch=%s bytes=%d page_count=%d" % [
+			layers, str(pool.get("staging_scratch", false)), int(pool.get("staging_bytes", -1)), page_count])
+	require(bool(pool.get("staging_scratch", false)),
+			"both tiers compressed must put the staging pool in scratch mode")
+	require(layers > 0 and layers < page_count,
+			"the staging pool must shrink below the slot count (%d layers for %d pages)" % [layers, page_count])
+	require(int(pool.get("staging_bytes", 1 << 40)) < 64 * 1024 * 1024,
+			"the staging pool must stop being page sized, got %d bytes" % int(pool.get("staging_bytes", -1)))
+	# Both tiers still render their own material out of the ring, near and far.
+	await set_view(NEAR_WORLD, 180.0, 96.0)
+	await produce(120)
+	await wait_pending_empty()
+	await produce(40)
+	var scratch_near := await frame_image()
+	scratch_near.save_png(output_dir.path_join("compressed-scratch-near.png"))
+	compare_patch(baseline_near, scratch_near, NEAR_WORLD, "scratch near")
+	await set_view(FAR_WORLD, 220.0, 144.0)
+	await produce(40)
+	var scratch_far := await frame_image()
+	scratch_far.save_png(output_dir.path_join("compressed-scratch-far.png"))
+	compare_patch(baseline_far, scratch_far, FAR_WORLD, "scratch far")
+	# A resident page is still exportable: its half-float layer is long reused, so the export
+	# reads the block words and decodes them. The dock's preview is the same path.
+	var exported := 0
+	for slot in page_count:
+		var preview: Image = terrain.get_vt_page_preview(slot)
+		if preview != null and preview.get_width() == PAGE_SIZE + 2 * PAGE_BORDER:
+			exported += 1
+	print("VTCOMPRESS_RENDER scratch export pages=%d failures=%d" % [
+			exported, int(producer_stats().get("encode_failures", -1))])
+	require(exported > 0, "a resident page must still export under the scratch pool")
+	require(int(producer_stats().get("encode_failures", -1)) == 0, "the scratch pool must not fail an encode")
+	terrain.vt_atlas_compression = 0
+	terrain.surface_svt_compression = 0
+	await process_frame
+
 	# Production must keep the caller's rate: the budget is a setting, not a codec
 	# property. The pool is emptied by a format change, then the camera is stepped across a
 	# world that demands many more pages than the budget, and the largest production of a
 	# single frame is measured. That is the callback's budget: with the old four-page cap
 	# the compressed format could not exceed 4 while the uncompressed one reached 16.
+	#
+	# The far field is the only producer in this section, so the setting it toggles is the far
+	# field's own: the two tiers are separate, and an AVT codec would no longer change what
+	# these pages are stored in.
 	var budget := 16
 	terrain.surface_vt_enabled = false
 	terrain.vt_auto_capacity = false
@@ -273,7 +405,7 @@ func run() -> void:
 	terrain.surface_svt_distance = 1024.0
 	var peak := {}
 	for mode in [BC7, 0]:
-		terrain.vt_atlas_compression = mode
+		terrain.surface_svt_compression = mode
 		await set_view(Vector2(256.0, 256.0), 60.0, 512.0)
 		for _frame in 8:
 			terrain.update_surface_svt(64)
@@ -298,7 +430,7 @@ func run() -> void:
 			"a demand pass must not be capped below the demand (%d pages of a %d page budget)" % [
 				int(peak.get(0, 0)), budget])
 
-	terrain.vt_atlas_compression = 0
+	terrain.surface_svt_compression = 0
 	await process_frame
 	scene.queue_free()
 	await process_frame

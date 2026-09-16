@@ -23,6 +23,10 @@ layout(set = 0, binding = 1, std430) writeonly buffer EncodeOutput {
 
 layout(push_constant, std430) uniform EncodePush {
 	uvec4 params; // x: stored size, y: source layer, z: codec, w: blocks per axis
+	// First word of this layer inside the bound output buffer. The buffer holds several
+	// layers of one page in flight at once, so the encoder is told where its own blocks go
+	// instead of being bound a buffer per layer.
+	uvec4 region; // x: first output word, yzw: reserved
 } encode_push;
 
 // Interpolation weights of the four-bit BC7 index, in sixty-fourths.
@@ -375,7 +379,7 @@ void main() {
 	}
 	const uint base = block * word_count;
 	for (uint i = 0u; i < word_count; ++i) {
-		encode_output.words[base + i] = words[i];
+		encode_output.words[encode_push.region.x + base + i] = words[i];
 	}
 }
 )"

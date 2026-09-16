@@ -166,35 +166,30 @@ void Terrain3D::_cancel_svt_bake(const String &p_reason) {
 	_vt.vt_svt_bake_waiting.clear();
 }
 
-// Compresses and decodes one image through the atlas codec, so a test can verify the codec
-// path where page production has nothing to bake from.
+// Compresses and decodes one image through the near field's codec, so a test can verify the
+// codec path where page production has nothing to bake from. The page pipeline itself never
+// runs a CPU codec; this is the reference for how lossy the requested codec is.
 Dictionary Terrain3D::probe_vt_atlas_compression(const Ref<Image> &p_image) const {
 	if (!_vt.vt_baker.is_valid()) {
 		return Dictionary();
 	}
-	return baker(_vt.vt_baker)->probe_atlas_compression(p_image);
+	return baker(_vt.vt_baker)->probe_tier_compression(Terrain3DSurfaceBaker::TIER_AVT, p_image);
 }
 
-void Terrain3D::set_vt_atlas_compression(const int p_compression) {
-	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
-	if (_vt.vt_atlas_compression == mode) {
-		return;
-	}
-	_vt.vt_atlas_compression = mode;
-	// Only the three material page arrays carry the format. The pool, the world addresses,
-	// the owners and the demand plan are format independent, and the producer rebuilds the
-	// arrays in place - it bumps its own generation, which makes its next render pass
-	// replace the bundle in the new format. Reconfiguring the service here instead would
-	// detach both views, release every resident page and grow the pool back to the
-	// capacity it had already published.
+// Both tiers store the same shared pool, so both settings take the same path: the producer
+// rebuilds the arrays in place and bumps its own generation, which makes its next render
+// pass replace the bundle in the new format. Reconfiguring the service instead would detach
+// both views, release every resident page and grow the pool back to a capacity it had
+// already published, which is why a storage decision must not go through it.
+void Terrain3D::_apply_vt_tier_compression(const int p_tier, const int p_mode) {
 	if (_vt.vt_baker.is_valid()) {
-		baker(_vt.vt_baker)->set_atlas_compression(mode);
-		// The rebuilt arrays start blank, so the pages that were produced in the previous
-		// format have to be produced again. This is forced: a plain edit is deferred while
-		// the editor preview is active, but a format change leaves nothing to fall back on.
+		baker(_vt.vt_baker)->set_tier_compression(p_tier, p_mode);
+		// The rebuilt arrays start blank, so the pages produced in the previous format have
+		// to be produced again. This is forced: a plain edit is deferred while the editor
+		// preview is active, but a format change leaves nothing to fall back on.
 		if (_data) {
-			for (const Vector2i &location : _data->get_region_locations()) {
-				invalidate_surface_pages(location, true);
+			for (const Vector2i &region_location : _data->get_region_locations()) {
+				invalidate_surface_pages(region_location, true);
 			}
 		}
 		_vt.vt_materials_dirty = true;
@@ -202,8 +197,40 @@ void Terrain3D::set_vt_atlas_compression(const int p_compression) {
 	}
 	_reset_vt_configuration();
 }
+
+void Terrain3D::set_surface_vt_compression(const int p_compression) {
+	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
+	if (_vt.surface_vt_compression == mode) {
+		return;
+	}
+	_vt.surface_vt_compression = mode;
+	_apply_vt_tier_compression(Terrain3DSurfaceBaker::TIER_AVT, mode);
+}
+int Terrain3D::get_surface_vt_compression() const {
+	return _vt.surface_vt_compression;
+}
+
+// The far field's sibling. Same contract, and the tier where a codec is worth the most: a
+// far-field page is assembled once from a baked cell and never rewritten, so its compressed
+// copy is final.
+void Terrain3D::set_surface_svt_compression(const int p_compression) {
+	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
+	if (_vt.surface_svt_compression == mode) {
+		return;
+	}
+	_vt.surface_svt_compression = mode;
+	_apply_vt_tier_compression(Terrain3DSurfaceBaker::TIER_SVT, mode);
+}
+int Terrain3D::get_surface_svt_compression() const {
+	return _vt.surface_svt_compression;
+}
+
+// The near field's setting under its pre-split name.
+void Terrain3D::set_vt_atlas_compression(const int p_compression) {
+	set_surface_vt_compression(p_compression);
+}
 int Terrain3D::get_vt_atlas_compression() const {
-	return _vt.vt_atlas_compression;
+	return get_surface_vt_compression();
 }
 
 void Terrain3D::_reset_vt_configuration() {
@@ -316,7 +343,8 @@ void Terrain3D::_configure_vt_service() {
 		instance.instantiate();
 		_vt.vt_baker = instance;
 	}
-	baker(_vt.vt_baker)->set_atlas_compression(_vt.vt_atlas_compression);
+	baker(_vt.vt_baker)->set_tier_compression(Terrain3DSurfaceBaker::TIER_AVT, _vt.surface_vt_compression);
+	baker(_vt.vt_baker)->set_tier_compression(Terrain3DSurfaceBaker::TIER_SVT, _vt.surface_svt_compression);
 	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, capacity);
 	_configure_svt_cell_store();
 	_vt.vt_bound_albedo = RID();
@@ -401,8 +429,14 @@ void Terrain3D::_update_vt_service() {
 			invalidate_surface_pages(location);
 		}
 	}
+	// Rebind on the bundle generation, not on the near field's albedo: the two tiers' arrays
+	// are replaced together, so a change that only rebuilt the far field's set - a far-field
+	// codec, or a pool resize on a far-field-only scene - must republish as well, or the
+	// material keeps sampling arrays the retire below has already released.
+	const uint64_t published_generation = producer->get_published_generation();
 	RID albedo = producer->get_albedo_rid();
-	if (albedo != _vt.vt_bound_albedo) {
+	if (published_generation != _vt.vt_bound_generation || albedo != _vt.vt_bound_albedo) {
+		_vt.vt_bound_generation = published_generation;
 		_vt.vt_bound_albedo = albedo;
 		if (_material.is_valid()) {
 			_material->update(Terrain3DMaterial::REGION_ARRAYS);
@@ -451,7 +485,8 @@ void Terrain3D::_process_async_svt_pages() {
 			bool cell_copy_queued = false;
 			if (result.missing.empty() && !result.sources.is_empty()) {
 				record["state"] = "Pending cell copy";
-				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect);
+				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect,
+						Terrain3DSurfaceBaker::TIER_SVT);
 				cell_copy_queued = true;
 			} else {
 				// A partially available persisted page must not strand the published slot with
@@ -471,7 +506,7 @@ void Terrain3D::_process_async_svt_pages() {
 					if (ids.is_valid() && height.is_valid()) {
 						record["state"] = "Pending resident fallback";
 						baker(_vt.vt_baker)->queue_page(slot, ids, height,
-								it->second.rect, 1.f, source_grid);
+								it->second.rect, 1.f, source_grid, Terrain3DSurfaceBaker::TIER_SVT);
 						cell_copy_queued = true;
 					}
 				}
@@ -782,7 +817,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 				record["state"] = "Pending cell copy";
 				record["cells"] = pieces.size();
 				_vt.vt_page_records[p_slot] = record;
-				producer->queue_cell_page(p_slot, pieces, p_rect);
+				producer->queue_cell_page(p_slot, pieces, p_rect, Terrain3DSurfaceBaker::TIER_SVT);
 				return;
 			}
 		}
@@ -807,18 +842,20 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 		const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt.vt_page_size, _vt.vt_page_border,
 				_vertex_spacing / _surface_density, ids, height);
 		if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
-		producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid);
+		producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid, Terrain3DSurfaceBaker::TIER_SVT);
 		return;
 	}
 	if (p_prepared) {
-		producer->queue_page(p_slot, p_prepared->ids, p_prepared->height, p_rect, 1.f, p_prepared->grid);
+		producer->queue_page(p_slot, p_prepared->ids, p_prepared->height, p_rect, 1.f, p_prepared->grid,
+				p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
 		return;
 	}
 	Ref<Image> ids = p_payload;
 	const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt.vt_page_size, _vt.vt_page_border,
 			_vertex_spacing / _surface_density, ids, height);
 	if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
-	producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid);
+	producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid,
+			p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
 }
 
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
@@ -953,14 +990,27 @@ Dictionary Terrain3D::get_vt_settings() const {
 		result["svt_cells"] = _vt.svt_cells->get_stats();
 	}
 	// Atlas compression: the request, what the baker resolved it to, and the reason a
-	// request was refused (unsupported codec, no compressor, or an unloadable format).
-	result["vt_atlas_compression"] = _vt.vt_atlas_compression;
+	// request was refused (unsupported codec, no encoder, or an unloadable format). The
+	// legacy keys report the near field, which is what a single compression switch used to
+	// control; both tiers carry their own keys as well.
+	result["vt_atlas_compression"] = _vt.surface_vt_compression;
+	result["surface_vt_compression"] = _vt.surface_vt_compression;
+	result["surface_svt_compression"] = _vt.surface_svt_compression;
 	if (_vt.vt_baker.is_valid()) {
-		const Dictionary compression = baker(_vt.vt_baker)->get_atlas_compression_info();
-		result["vt_atlas_compression_available"] = compression.get("available", 0);
-		result["vt_atlas_compression_applied"] = compression.get("applied", 0);
-		result["vt_atlas_compression_name"] = compression.get("name", String());
-		result["vt_atlas_compression_reason"] = compression.get("reason", String());
+		const Dictionary avt_compression = baker(_vt.vt_baker)->get_tier_compression_info(Terrain3DSurfaceBaker::TIER_AVT);
+		result["vt_atlas_compression_available"] = avt_compression.get("available", 0);
+		result["vt_atlas_compression_applied"] = avt_compression.get("applied", 0);
+		result["vt_atlas_compression_name"] = avt_compression.get("name", String());
+		result["vt_atlas_compression_reason"] = avt_compression.get("reason", String());
+		const Dictionary svt_compression = baker(_vt.vt_baker)->get_tier_compression_info(Terrain3DSurfaceBaker::TIER_SVT);
+		result["surface_vt_compression_available"] = avt_compression.get("available", 0);
+		result["surface_vt_compression_applied"] = avt_compression.get("applied", 0);
+		result["surface_vt_compression_name"] = avt_compression.get("name", String());
+		result["surface_vt_compression_reason"] = avt_compression.get("reason", String());
+		result["surface_svt_compression_available"] = svt_compression.get("available", 0);
+		result["surface_svt_compression_applied"] = svt_compression.get("applied", 0);
+		result["surface_svt_compression_name"] = svt_compression.get("name", String());
+		result["surface_svt_compression_reason"] = svt_compression.get("reason", String());
 	}
 	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
 	result["editor_preview"] = _vt.vt_editor_preview;

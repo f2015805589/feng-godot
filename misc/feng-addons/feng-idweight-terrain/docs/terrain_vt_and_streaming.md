@@ -700,13 +700,22 @@ produced for every probe distance, that a settled view neither moves a level nor
 that a small camera move inside the bands moves no level, and that an over-subscribed pool keeps
 the nearest pages and still settles instead of rewriting levels.
 
-### 4.12 Atlas compression — selectable, probe-verified and actually applied
+### 4.12 Page-array compression — per tier, encoded on the GPU, compressed once for SVT
 
-`vt_atlas_compression` selects the storage format for the three material page arrays
-(`albedo_height`, `normal_roughness`, `params`). The list is the same one the layer texture
-arrays use (`Terrain3DAssets::TextureArrayCompression`), so the inspector shows one vocabulary
-for every terrain array. Two rules bound what can be selected, and a request is resolved —
-not trusted — when it is set:
+`surface_vt_compression` (near field / AVT) and `surface_svt_compression` (far field / SVT)
+select the storage format of the three material page arrays (`albedo_height`,
+`normal_roughness`, `params`) over the one shared physical pool. The list is the same one the
+layer texture arrays use (`Terrain3DAssets::TextureArrayCompression`), so the inspector shows one
+vocabulary for every terrain array; the inspector shows both entries as `Compression` inside the
+`AVT` and `SVT` groups, and `vt_atlas_compression` remains as the near field's pre-split name.
+
+They are separate settings because the tiers produce at very different rates. An AVT page is
+rewritten by every edit that invalidates it; an SVT page is assembled once from a baked cell and
+then never rewritten, so compressing the far field is paid once and the memory is saved for the
+rest of the session. A tier left uncompressed samples the staging arrays directly and costs
+nothing extra.
+
+Three rules bound what can be selected, and a request is resolved — not trusted — when it is set:
 
 * **Alpha.** All three arrays carry an alpha value the shader reads: material height in
   `albedo_height.a`, roughness in `normal_roughness.a`, and the page validity bit in
@@ -714,35 +723,68 @@ not trusted — when it is set:
   drops alpha — BC1, BC4, BC5, BC6H, ETC1, ETC2 RGB, EAC R11/RG11 — would silently corrupt
   it, so those are refused with that reason. Making them usable means moving the alpha channels
   into their own array, which changes the material bindings.
-* **Build and device.** Godot registers its image compressors as function pointers from
-  whichever modules the engine binary enabled: etcpak (BC1/BC3/BC4/BC5, ETC, EAC) and astcenc
-  (ASTC) ship in every build, while cvtt (BC7, BC6H) and betsy (GPU BC1/BC4/BC6H) are
-  editor-only unless the export template sets `cvtt_export_templates` /
-  `betsy_export_templates`. The resolver therefore compresses a real 4×4 block instead of
-  assuming a codec exists, and then asks the rendering device whether the resulting format can
-  be sampled *and* updated in place — which is what rules ETC2 and ASTC out on a desktop BC
+* **A GPU encoder.** Page compression never runs a CPU block encoder — that is the whole point
+  of the design, because a codec pass per page is what made the compressed path both slow and
+  visibly late. `shaders/bc_encode.glsl` implements BC1/BC3/BC4/BC5/BC7, so any other codec
+  (ETC2, ASTC, BC6H) is refused with "has no GPU block encoder" instead of leaving pages that
+  no encoder ever fills. Combined with the alpha rule, the usable set is BC7 and BC3 RGBA.
+* **Device.** The resolver asks the rendering device whether the resulting format can be sampled
+  *and* updated in place, which is what rules the remaining candidates out on a desktop BC
   device.
 
-`get_vt_settings()` reports the outcome: `vt_atlas_compression` (the request),
-`vt_atlas_compression_available` (the codec this build and device can produce and sample, 0
-when refused), `vt_atlas_compression_applied` (what the arrays are stored in **today**),
-`vt_atlas_compression_name`, and `vt_atlas_compression_reason`.
+`get_vt_settings()` reports the outcome per tier: `surface_vt_compression*` /
+`surface_svt_compression*` and, under the legacy keys, the near field as
+`vt_atlas_compression`, `vt_atlas_compression_available` (the codec this device can store and
+sample, 0 when refused), `vt_atlas_compression_applied` (what the arrays are stored in
+**today**), `vt_atlas_compression_name` and `vt_atlas_compression_reason`.
 
-**The encode.** Page production writes RGBA16F into staging arrays with `imageStore`, and a
-compressed format cannot be a storage image, so the compressed arrays are separate sampling
-targets and an encode step copies between them:
+**The encode runs on the GPU.** Page production writes RGBA16F into the staging arrays with
+`imageStore`; a compressed format cannot be a storage image and no texture copy converts formats,
+so the compressed arrays are separate sampling targets and a compute pass copies between them:
 
-* The **cached path** already holds the channel images on the CPU, so it compresses them
-  directly.
-* The **bake and cell paths** only exist on the GPU, so the baker requests one
-  `texture_get_data_async` per channel — a synchronous readback is not safe from inside the
-  render callback — and the callback compresses and `texture_update`s the sampled layer.
-* A page therefore becomes compressed a frame or two after it was produced. Readiness is
-  deliberately unchanged: until the encode lands, the sampled layer holds zeros, which the
-  sampler reads as "not written" (`params.a` is not 1) and resolves through a coarser page
-  instead of showing a half-written one.
-* Compressing costs a readback and a codec pass per page, so the per-frame page budget drops
-  from 16 to 4 while compression is on.
+* The encoder reads the staging layer through a sampler and writes that layer's block words into
+  one region of a small ring buffer (`ENCODE_PAGES` = 8 pages in flight, each with one region per
+  channel — a few hundred kilobytes at BC7, not another page-sized array per slot).
+* `buffer_get_data_async` returns those words, and the render callback `texture_update`s them into
+  the tier's sampling array. The CPU cost of a compressed page is therefore the buffer copy of its
+  block words — a sixteenth of the half-float page at BC7 — and never a block-encoder pass, so the
+  per-frame page budget stays at the caller's setting and compression does not change how many
+  pages a demand pass produces.
+* A region is only handed out again once every readback of the page it held has been delivered, so
+  a readback can never observe a later page's blocks. The request is refused rather than reused
+  when the ring is full, and the page keeps its pending flag for a later frame.
+* The completion callback runs inside the frame stall, after the frame's draw graph was ended, so
+  an upload issued from there was recorded into the finished graph and discarded — every upload
+  reported success while the arrays stayed empty and the whole viewport showed the missing-page
+  diagnostic. The callback therefore only queues the words, and the render callback uploads them.
+
+**Readiness is not cleared while an encode is in flight.** That was the bug behind the stutter and
+the far field that loaded on one run and not the next: clearing `is_page_ready()` for the duration
+of a multi-frame CPU encode made `SVT_PAGE_RETRY_FRAMES` (30) elapse on a page whose encode was
+still running, so the demand pass produced it again, and again — an endless re-production and
+re-compression loop. A compressed page is now ready when its blocks arrive, and a failed encode is
+the only thing that clears the flag, which restores the retry as a safety net instead of a loop.
+A settled far field therefore stops encoding: `encode_requests`, `ready_pages` and `svt_requeues`
+do not move while the view is still.
+
+**The staging pool becomes a scratch ring when nothing samples it.** The three RGBA16F outputs
+and the R16/R32F sources are page sized only while a tier samples them by slot. Once *both* tiers
+are compressed nothing does, so the pool shrinks to `ENCODE_PAGES` (8) layers: a produced page
+takes a ring page, writes its half-float channels into that layer, and the encoder reads that same
+layer and stores the blocks into the page's own slot of the tier's array. The ring page is held
+until the page's three block readbacks have been delivered, which is what makes the reuse safe.
+The resident pool therefore drops from 30 bytes per stored texel per slot (three RGBA16F outputs
+plus the R16/R32F sources) to `8 / page_count` of that — at 256 pages and a 264² stored page,
+~535 MB becomes ~17 MB, and each compressed tier's own arrays add ~53 MB. Leaving one tier
+uncompressed restores the page-sized pool, because that tier samples it by slot. `get_stats()`
+reports `staging_layers`, `staging_scratch` and `staging_bytes`.
+
+Two consequences of the ring, both deliberate: a capacity growth re-produces every resident page
+instead of migrating it (there is no per-slot half-float layer left to copy, and a block format
+cannot be copied between arrays on D3D12), and `export_page()` / the dock preview read a page's
+block words from its tier's array and decode them, because the layer it was produced in has long
+been reused. An invalidation no longer clears a staging layer under the ring — nothing samples it,
+and the layer it could name may belong to a page whose encode is still in flight.
 
 Tests: `native/tests/vt_compression.gd` + `vt_compression_runner.py`. It walks every enum entry
 and asserts the resolution invariants: an accepted request must equal `available` and carry no
@@ -754,16 +796,29 @@ trip is exact, and that a fixture which produced pages reports
 `vt_atlas_compression_applied == available` — the arrays are actually built in the accepted
 format. On this machine that is BC7 (`applied=1`) with BC3 RGBA accepted as well.
 
-**Two traps this cost.** The compressed arrays are created with `SAMPLING | CAN_UPDATE` and
-nothing else. `CAN_COPY_TO` also looks harmless, but on D3D12 it sets
+`native/tests/vt_compressed_render.gd` drives the real renderer through both tiers: BC7 and BC3
+on the near field (patch means within 0.01 of the uncompressed frame, no magenta), the same two
+codecs on the far field with the near field switched off so the patch can only come from the SVT
+arrays, and the encode-once property above. It then compresses *both* tiers, which is the case
+that puts the staging pool in scratch mode: it requires the pool to fall below the slot count
+(`staging_layers < page_count`, `staging_scratch`), renders both tiers out of the ring, and
+exports a resident page through the decode path the dock preview uses. It also measures that one
+demand pass hands the producer the same number of pages with and without compression.
+
+**Two traps this cost.** The compressed arrays are created with `SAMPLING | CAN_UPDATE |
+CAN_COPY_FROM` and nothing else. `CAN_COPY_TO` also looks harmless, but on D3D12 it sets
 `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`, which a block-compressed resource cannot carry, so
 `texture_create` returns `CreateResource failed with error 0x80070057` — while
 `texture_is_format_supported_for_usage()` (the capability probe) says the format is fine, because
 it answers for the pair it was asked about. A device that refuses the real allocation now resets
 `available` to 0 with a reason instead of claiming a format the pages are not stored in.
+`CAN_COPY_FROM` is the opposite kind of flag: it needs no D3D12 resource flag at all, and it is
+what lets a resident page be read back once the scratch pool has reused the layer it was decoded
+from.
 
 **A format change is not a reconfiguration.** The three arrays are rebuilt in place by the
-producer (its own generation bump), so `set_vt_atlas_compression()` must not call
+producer (its own generation bump), so `set_surface_vt_compression()` /
+`set_surface_svt_compression()` (and the legacy `set_vt_atlas_compression()`) must not call
 `_reset_vt_configuration()`. Doing that detached both views from the shared pool, released
 every resident page and then let the demand pass grow the pool back to the capacity it had
 already published — which is what produced a user-visible

@@ -240,6 +240,8 @@ private:
 	// Whether any cell a far page touches has a persisted bake the source worker can read.
 	bool _svt_cells_have_persisted_bake(const Rect2 &p_rect);
 	void _reset_vt_configuration();
+	// Applies one tier's storage format to the producer and re-produces the pages it stored.
+	void _apply_vt_tier_compression(const int p_tier, const int p_mode);
 	void _cancel_svt_bake(const String &p_reason);
 	void _destroy_surface_vt();
 	// One demand pass: registers sectors for the regions near the target, picks a mip
@@ -412,9 +414,15 @@ public:
 	real_t get_surface_vt_texels_per_pixel() const { return _vt.surface_vt_texels_per_pixel; }
 	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
 	bool is_surface_vt_force_mip() const { return _vt.surface_vt_force_mip; }
-	// Atlas compression for the three material page arrays, one format for all three.
-	// The baker resolves the request against this build's compressors and this device's
-	// sampling support; see get_vt_settings() for what was applied and why.
+	// Storage format of the material page arrays, per tier, one format for each tier's three
+	// channels. The baker resolves a request against the GPU block encoder and this device's
+	// sampling support; see get_vt_settings() for what was applied and why a request was
+	// refused.
+	void set_surface_vt_compression(const int p_compression);
+	int get_surface_vt_compression() const;
+	void set_surface_svt_compression(const int p_compression);
+	int get_surface_svt_compression() const;
+	// The near field's setting, under the name it had while compression was one switch.
 	void set_vt_atlas_compression(const int p_compression);
 	int get_vt_atlas_compression() const;
 	Dictionary probe_vt_atlas_compression(const Ref<Image> &p_image) const;

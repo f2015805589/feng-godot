@@ -183,6 +183,12 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RID baked_albedo = material_pages.get("albedo_height", RID());
 	RID baked_normal = material_pages.get("normal_roughness", RID());
 	RID baked_params = material_pages.get("params", RID());
+	// The far field's own set. AVT and SVT store the same page pool in independent formats,
+	// so each tier samples the arrays it was produced into; a tier left uncompressed resolves
+	// to the staging arrays, which is what lets one tier be compressed while the other is not.
+	RID svt_albedo = material_pages.get("svt_albedo_height", RID());
+	RID svt_normal = material_pages.get("svt_normal_roughness", RID());
+	RID svt_params = material_pages.get("svt_params", RID());
 	// The three channels are one set. The producer replaces all of them at once, but each
 	// getter reads the published bundle under its own lock, so a rebuild between two of them
 	// can hand back a valid albedo beside an empty normal or params. Binding that pair leaves
@@ -190,6 +196,7 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	// once per draw as a missing material uniform set - so a set that is not complete is
 	// treated as no pages at all and the dummy array serves every channel.
 	const bool pages_valid = baked_albedo.is_valid() && baked_normal.is_valid() && baked_params.is_valid();
+	const bool svt_pages_valid = pages_valid && svt_albedo.is_valid() && svt_normal.is_valid() && svt_params.is_valid();
 	RS->material_set_param(p_material, "_surface_material_enabled", pages_valid && !_terrain->is_vt_editor_preview_active());
 	// A fresh SVT has published addresses before its protected roots have material content.
 	// Keep the live source evaluator visible during that short startup window instead of
@@ -206,6 +213,9 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_material_albedo", pages_valid ? baked_albedo : _generated_dummy.get_rid());
 	RS->material_set_param(p_material, "_surface_material_normal", pages_valid ? baked_normal : _generated_dummy.get_rid());
 	RS->material_set_param(p_material, "_surface_material_params", pages_valid ? baked_params : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_svt_material_albedo", svt_pages_valid ? svt_albedo : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_svt_material_normal", svt_pages_valid ? svt_normal : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_surface_svt_material_params", svt_pages_valid ? svt_params : _generated_dummy.get_rid());
 	if (vt_on) {
 		RS->material_set_param(p_material, "_surface_vt_region_size", _terrain->get_region_size());
 		RS->material_set_param(p_material, "_surface_vt_page_size", vt->get_page_size());
