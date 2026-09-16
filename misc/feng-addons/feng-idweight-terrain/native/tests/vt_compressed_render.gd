@@ -351,14 +351,20 @@ func run() -> void:
 	var pool := producer_stats()
 	var layers := int(pool.get("staging_layers", -1))
 	var page_count := int(terrain.get_vt_settings().get("page_count", -1))
-	print("VTCOMPRESS_RENDER scratch layers=%d scratch=%s bytes=%d page_count=%d" % [
-			layers, str(pool.get("staging_scratch", false)), int(pool.get("staging_bytes", -1)), page_count])
+	var page_sized_bytes := int(terrain.get_vt_settings().get("physical_cache_bytes_uncompressed", 0))
+	print("VTCOMPRESS_RENDER scratch layers=%d scratch=%s bytes=%d page_count=%d ring_capacity=%d" % [
+			layers, str(pool.get("staging_scratch", false)), int(pool.get("staging_bytes", -1)), page_count,
+			int(pool.get("encode_ring_capacity", -1))])
 	require(bool(pool.get("staging_scratch", false)),
 			"both tiers compressed must put the staging pool in scratch mode")
-	require(layers > 0 and layers < page_count,
-			"the staging pool must shrink below the slot count (%d layers for %d pages)" % [layers, page_count])
-	require(int(pool.get("staging_bytes", 1 << 40)) < 64 * 1024 * 1024,
-			"the staging pool must stop being page sized, got %d bytes" % int(pool.get("staging_bytes", -1)))
+	require(layers > 0 and layers * 2 <= page_count,
+			"the staging pool must be at most half the slot count (%d layers for %d pages)" % [layers, page_count])
+	# The ring is as deep as the page budget needs it to be, which is deeper than the slot
+	# count only for a pool smaller than two budgets; what has to hold is that the scratch pool
+	# costs at most half of what the page sized pool would.
+	require(int(pool.get("staging_bytes", 1 << 40)) * 2 <= page_sized_bytes,
+			"the staging pool must be at most half the page sized pool (%d of %d bytes)" % [
+				int(pool.get("staging_bytes", -1)), page_sized_bytes])
 	# Both tiers still render their own material out of the ring, near and far.
 	await set_view(NEAR_WORLD, 180.0, 96.0)
 	await produce(120)
@@ -404,6 +410,8 @@ func run() -> void:
 	terrain.surface_svt_page_world = 32.0
 	terrain.surface_svt_distance = 1024.0
 	var peak := {}
+	var ring_depth := {}
+	var ring_held := {}
 	for mode in [BC7, 0]:
 		terrain.surface_svt_compression = mode
 		await set_view(Vector2(256.0, 256.0), 60.0, 512.0)
@@ -411,15 +419,19 @@ func run() -> void:
 			terrain.update_surface_svt(64)
 			await process_frame
 		var best := 0
+		var deepest := 0
 		for step in 10:
 			await set_view(Vector2(256.0 + step * 48.0, 256.0 + step * 32.0), 60.0, 512.0)
 			var before := produced_pages()
 			terrain.update_surface_svt(64)
 			await process_frame
 			best = maxi(best, produced_pages() - before)
+			deepest = maxi(deepest, int(producer_stats().get("encode_ring_pages", 0)))
 		peak[mode] = best
-		print("VTCOMPRESS_RENDER rate mode=%d pages_per_frame=%d ready=%d visible=%s" % [
-				mode, best, int(producer_stats().get("ready_pages", 0)),
+		ring_depth[mode] = int(producer_stats().get("encode_ring_capacity", 0))
+		ring_held[mode] = deepest
+		print("VTCOMPRESS_RENDER rate mode=%d pages_per_frame=%d ready=%d ring_capacity=%d ring_peak=%d visible=%s" % [
+				mode, best, int(producer_stats().get("ready_pages", 0)), int(ring_depth[mode]), deepest,
 				str(terrain.get_vt_settings().get("svt_visible_pages"))])
 	require(int(peak.get(BC7, 0)) == int(peak.get(0, 0)),
 			"compression must not lower the production rate (BC7 %d vs uncompressed %d pages per frame)" % [
@@ -429,6 +441,15 @@ func run() -> void:
 	require(int(peak.get(0, 0)) > 4,
 			"a demand pass must not be capped below the demand (%d pages of a %d page budget)" % [
 				int(peak.get(0, 0)), budget])
+	# A page keeps its ring regions until its readbacks land, about two frames later, so the
+	# ring has to admit a whole budget in flight or it - not the budget - is the page rate: at
+	# the previous fixed depth of eight a compressed tier became ready at four pages per frame.
+	require(int(ring_depth.get(BC7, 0)) >= budget,
+			"the compressed ring must admit a whole page budget (%d regions for a %d page budget)" % [
+				int(ring_depth.get(BC7, 0)), budget])
+	require(int(ring_held.get(BC7, 0)) > 8,
+			"a compressed demand burst must hold more than the old eight regions in flight (peak %d)" % [
+				int(ring_held.get(BC7, 0))])
 
 	terrain.surface_svt_compression = 0
 	await process_frame

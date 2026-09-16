@@ -358,9 +358,13 @@ func run() -> void:
 
 	print("VT_TURNBUDGET summary budget_ms=%.2f near_distance=%d regions=%d turn_step=%.1f" % [
 			VT_BUDGET_MS, int(NEAR_DISTANCE), GRID * GRID, TURN_STEP])
-	scene.queue_free()
+	# Tear down in the order the node expects: a terrain still in the tree finds a camera
+	# whenever it ticks, so freeing the camera first makes it report a missing target on the
+	# way out - an engine error the harness reads as a failure of the code under test.
+	scene.remove_child(terrain)
+	terrain.queue_free()
 	camera.queue_free()
-	await process_frame
+	scene.queue_free()
 	if failed:
 		quit(1)
 		return

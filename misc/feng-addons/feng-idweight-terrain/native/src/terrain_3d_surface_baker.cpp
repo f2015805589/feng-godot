@@ -356,7 +356,9 @@ void Terrain3DSurfaceBaker::clear() {
 		{
 			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
 			_encoded_layers.clear();
-			_encode_ring_held.assign(ENCODE_PAGES, 0);
+			// Sized to the deepest ring any budget can ask for; the admitted depth is
+			// `_encode_ring_capacity`, which a bundle derives from the page budget.
+			_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
 		}
 		_encode_region_bytes = 0;
 		_encode_region_words = 0;
@@ -449,9 +451,10 @@ bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources
 		return false;
 	}
 	// One region per channel of every page that may be in flight at once. The buffer is a
-	// few hundred kilobytes at the widest codec, which is what lets a compressed tier cost
-	// one small allocation instead of a second page-sized array beside the staging pool.
-	const uint32_t ring_bytes = uint32_t(ENCODE_PAGES * ENCODE_CHANNELS * _encode_region_bytes);
+	// few hundred kilobytes per page at the widest codec, which is what lets a compressed
+	// tier cost one small allocation instead of a second page-sized array beside the staging
+	// pool. Its depth is derived from the caller's page budget (see ENCODE_PAGES_MIN).
+	const uint32_t ring_bytes = uint32_t(_encode_ring_allocated.load() * ENCODE_CHANNELS * _encode_region_bytes);
 	r_resources.encode_buffer = _rd->storage_buffer_create(ring_bytes);
 	if (!r_resources.encode_buffer.is_valid() || _encode_region_words <= 0) {
 		LOG(ERROR, "Could not allocate the surface block encoder output buffer");
@@ -665,7 +668,16 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 	// to the encoder ring and the resident pool loses its largest allocation. A tier that
 	// failed to build its arrays above keeps `applied` at 0 and samples staging by slot, which
 	// is why the count is decided here and not from the request.
-	_staging_layers = _staging_is_scratch() ? ENCODE_PAGES : p_page_count;
+	//
+	// The ring depth is derived from the page budget so that the budget, not the ring, decides
+	// the page rate, and it is capped by bytes because under the scratch regime these layers
+	// are the largest allocation in the design. It is also kept to half the slot count, so a
+	// compressed pool always costs at most half of what the page sized pool would - a small
+	// pool with a large budget is the one case where those two rules meet.
+	_encode_ring_allocated.store(CLAMP(MIN(_derive_encode_ring_pages(), MAX(p_page_count / 2, ENCODE_PAGES_MIN)),
+			ENCODE_PAGES_MIN, ENCODE_PAGES_MAX));
+	_staging_layers = _staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count;
+	_refresh_encode_ring_capacity();
 	next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
 			_staging_layers, sampled_usage);
 	next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
@@ -797,7 +809,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			// Lock order is _mutex then _encode_mutex everywhere; the readback callback
 			// takes them in separate scopes and never holds one while taking the other.
 			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
-			_encode_ring_held.assign(ENCODE_PAGES, 0);
+			_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
 		}
 		if (_staging_is_scratch()) {
 			std::fill(_ready.begin(), _ready.end(), uint8_t(0));
@@ -1013,6 +1025,59 @@ bool Terrain3DSurfaceBaker::_staging_is_scratch() const {
 	return true;
 }
 
+// Bytes one ring position costs. The encoder writes three channel regions per page, and
+// under the scratch regime the same position also owns the half-float staging layer the page
+// is produced into, which is the larger of the two and the one that decides the ceiling.
+int64_t Terrain3DSurfaceBaker::_encode_page_bytes() const {
+	const int64_t regions = int64_t(_encode_region_bytes) * ENCODE_CHANNELS;
+	if (!_staging_is_scratch()) {
+		return regions;
+	}
+	return regions + int64_t(_stored_size) * _stored_size * 30;
+}
+
+// Depth the ring needs so that the caller's page budget, not the ring, decides how many
+// pages a frame finishes: a page's regions are held for about two frames, so the ring has to
+// hold two budgets' worth. Bounded by bytes, because the same positions are the staging pool
+// under the scratch regime.
+int Terrain3DSurfaceBaker::_derive_encode_ring_pages() const {
+	const int64_t page_bytes = _encode_page_bytes();
+	const int64_t affordable = page_bytes > 0 ? ENCODE_RING_BUDGET_BYTES / page_bytes
+											  : int64_t(ENCODE_PAGES_MAX);
+	const int ceiling = int(CLAMP(affordable, int64_t(ENCODE_PAGES_MIN), int64_t(ENCODE_PAGES_MAX)));
+	const int wanted = _page_budget.load() * ENCODE_READBACK_FRAMES;
+	return CLAMP(MIN(wanted, ceiling), ENCODE_PAGES_MIN, ENCODE_PAGES_MAX);
+}
+
+void Terrain3DSurfaceBaker::_refresh_encode_ring_capacity() {
+	int capacity = CLAMP(MIN(_derive_encode_ring_pages(), _encode_ring_allocated.load()),
+			ENCODE_PAGES_MIN, ENCODE_PAGES_MAX);
+	// The scratch regime indexes the staging layers that were allocated with the bundle, so
+	// the admitted depth can never exceed them.
+	const int layers = _staging_layers;
+	if (layers > 0) {
+		capacity = MIN(capacity, layers);
+	}
+	_encode_ring_capacity.store(capacity);
+}
+
+// Bytes the three compressed arrays of one tier cost in the current bundle's slot count.
+// Only the tiers that resolved contribute; a tier left uncompressed samples the staging pool.
+int64_t Terrain3DSurfaceBaker::_tier_sampled_bytes(const int p_tier) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	const int mode = _tiers[tier].applied.load();
+	if (mode == 0 || !_resources.sampled[tier].albedo_rd.is_valid()) {
+		return 0;
+	}
+	const AtlasCodec &codec = ATLAS_CODECS[mode];
+	if (codec.block_words == 0) {
+		return 0;
+	}
+	// `block_words` is words per 4x4 block, so bytes per texel is block_words / 4.
+	const int64_t blocks = (int64_t(_stored_size) + 3) / 4;
+	return blocks * blocks * codec.block_words * int64_t(sizeof(uint32_t)) * ENCODE_CHANNELS * _page_count;
+}
+
 void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const int p_slot,
 		const int p_channel, const uint64_t p_generation, const uint64_t p_sequence) {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -1157,9 +1222,12 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		if (ring_page < 0) {
 			// Reserve one ring page per pending page. Without a free page the page waits for
 			// a later frame: its readbacks have not been delivered, so reusing the regions
-			// would let a readback observe a later page's blocks.
+			// would let a readback observe a later page's blocks. The ring is as deep as the
+			// page budget needs it to be, so this is a frame's worth of readback latency
+			// rather than the production rate.
+			const int ring_depth = _encode_ring_capacity.load();
 			std::lock_guard<std::mutex> lock(_encode_mutex);
-			for (int page_index = 0; page_index < ENCODE_PAGES; ++page_index) {
+			for (int page_index = 0; page_index < ring_depth; ++page_index) {
 				if (_encode_ring_held[size_t(page_index)] != 0) {
 					continue;
 				}
@@ -1248,7 +1316,7 @@ int Terrain3DSurfaceBaker::_take_staging_layer(const int p_slot) {
 		return p_slot;
 	}
 	std::lock_guard<std::mutex> lock(_encode_mutex);
-	for (int page = 0; page < ENCODE_PAGES; ++page) {
+	for (int page = 0; page < _encode_ring_capacity.load(); ++page) {
 		if (_encode_ring_held[size_t(page)] != 0) {
 			continue;
 		}
@@ -1382,6 +1450,10 @@ Dictionary Terrain3DSurfaceBaker::probe_tier_compression(const int p_tier, const
 
 void Terrain3DSurfaceBaker::set_page_budget(const int p_pages) {
 	_page_budget.store(CLAMP(p_pages, 1, 16));
+	// A budget change moves the depth the ring has to hold for that budget to be the rate
+	// that decides page production. It never exceeds what the bundle allocated, so this only
+	// ever re-admits positions the allocation already has.
+	_refresh_encode_ring_capacity();
 }
 
 void Terrain3DSurfaceBaker::request_capacity(int p_count) {
@@ -2376,12 +2448,45 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	}
 	stats["encode_pending"] = int64_t(std::count(_encode_pending.begin(), _encode_pending.end(), uint8_t(1)));
 	// The half-float pool's shape: page sized while a tier samples it by slot, the encoder
-	// ring once every tier is compressed. `staging_bytes` is what the whole pool costs - the
-	// three RGBA16F outputs at 8 bytes per texel plus the R16/R32F sources at 6 - which is
-	// the number the compression settings are supposed to move.
+	// ring once every tier is compressed. `staging_bytes` is what the pool costs - the
+	// three RGBA16F outputs at 8 bytes per texel plus the R16/R32F sources at 6 - and
+	// `material_bytes` is what the page arrays cost in total, which is the number the
+	// compression settings move: the pool plus one compressed copy per tier that resolved.
 	stats["staging_layers"] = _staging_layers;
 	stats["staging_scratch"] = _staging_is_scratch();
-	stats["staging_bytes"] = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
+	const int64_t staging_bytes = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
+	stats["staging_bytes"] = staging_bytes;
+	int64_t compressed_bytes = 0;
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		const int64_t tier_bytes = _tier_sampled_bytes(tier);
+		compressed_bytes += tier_bytes;
+		const String tier_key = tier == TIER_SVT ? String("svt_") : String("avt_");
+		stats[tier_key + String("bytes")] = tier_bytes;
+	}
+	stats["compressed_bytes"] = compressed_bytes;
+	stats["material_bytes"] = staging_bytes + compressed_bytes;
+	// Pool occupancy per tier: the slots whose content was produced for that tier, and how
+	// many of those hold a page the material can sample. With the pool shared, a setting is
+	// only worth its memory if the pages that use it are the ones resident.
+	int64_t tier_slots[TIER_COUNT] = { 0, 0 };
+	int64_t tier_ready[TIER_COUNT] = { 0, 0 };
+	for (size_t slot = 0; slot < _slot_sequence.size(); ++slot) {
+		if (_slot_sequence[slot] == 0) {
+			continue;
+		}
+		const int tier = slot < _slot_tier.size() && _slot_tier[slot] < TIER_COUNT ? _slot_tier[slot] : TIER_AVT;
+		tier_slots[tier]++;
+		if (slot < _ready.size() && _ready[slot]) {
+			tier_ready[tier]++;
+		}
+	}
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		const String tier_key = tier == TIER_SVT ? String("svt_") : String("avt_");
+		stats[tier_key + String("slots")] = tier_slots[tier];
+		stats[tier_key + String("ready_slots")] = tier_ready[tier];
+	}
+	stats["encode_ring_capacity"] = _encode_ring_capacity.load();
+	stats["encode_ring_allocated"] = _encode_ring_allocated.load();
 	stats["encode_requests"] = int64_t(_encode_requests);
 	stats["encode_readbacks"] = int64_t(_encode_readbacks);
 	stats["encode_updates"] = int64_t(_encode_updates);
@@ -2389,6 +2494,25 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["encode_ring_pages"] = int64_t(std::count_if(_encode_ring_held.begin(), _encode_ring_held.end(),
 			[](uint8_t p_held) { return p_held != 0; }));
 	return stats;
+}
+
+int64_t Terrain3DSurfaceBaker::get_material_bytes() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	int64_t total = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		total += _tier_sampled_bytes(tier);
+	}
+	return total;
+}
+
+int Terrain3DSurfaceBaker::get_ready_page_count() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return int(std::count(_ready.begin(), _ready.end(), uint8_t(1)));
+}
+
+int Terrain3DSurfaceBaker::get_pending_page_count() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return int(_pending.size());
 }
 
 ///////////////////////////

@@ -3,6 +3,7 @@
 #include "terrain_3d.h"
 
 #include "logger.h"
+#include "terrain_3d_surface_baker.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_vt_visibility.h"
 
@@ -13,6 +14,7 @@
 #include <godot_cpp/classes/environment.hpp>
 #include <godot_cpp/classes/label3d.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/performance.hpp>
 #include <godot_cpp/classes/physics_direct_space_state3d.hpp>
 #include <godot_cpp/classes/physics_ray_query_parameters3d.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -34,6 +36,75 @@ Terrain3D::DebugLevel Terrain3D::debug_level{ ERROR };
 //   terrain_3d_properties.cpp  configuration setters
 //   terrain_3d_queries.cpp     raycasts, baked meshes, nav source geometry, warnings
 //   terrain_3d_bindings.cpp    ClassDB bindings and property registration
+
+namespace {
+// The terrain's CPU work is invisible to the engine's own profiler, because the node runs as
+// a GDExtension method rather than an instrumented engine function. It is published instead
+// through the profiler singleton the engine exposes, under names that all start with
+// `terrain/` so a timeline can tell the terrain apart from everything else.
+//
+// Nothing is emitted while no profiler client is attached, and the singleton is looked up
+// once per frame rather than once per zone, so a shipping build pays a frame check.
+class TerrainProfileZone {
+public:
+	explicit TerrainProfileZone(const char *p_name) {
+		_profiler = profiler();
+		if (_profiler) {
+			_profiler->call("begin_zone", String("terrain/") + p_name);
+		}
+	}
+	~TerrainProfileZone() {
+		if (_profiler) {
+			_profiler->call("end_zone");
+		}
+	}
+	TerrainProfileZone(const TerrainProfileZone &) = delete;
+	TerrainProfileZone &operator=(const TerrainProfileZone &) = delete;
+
+	// The profiler object while a client is connected, otherwise nullptr.
+	static Object *profiler() {
+		static Object *cached = nullptr;
+		static uint64_t checked_frame = UINT64_MAX;
+		Engine *engine = Engine::get_singleton();
+		const uint64_t frame = engine ? engine->get_process_frames() : 0;
+		if (frame == checked_frame) {
+			return cached;
+		}
+		checked_frame = frame;
+		cached = nullptr;
+		const StringName singleton_name("FengGodotTracy");
+		if (!engine || !engine->has_singleton(singleton_name)) {
+			return cached;
+		}
+		Object *profiler_object = engine->get_singleton(singleton_name);
+		if (!profiler_object || !profiler_object->has_method("is_started") ||
+				!profiler_object->has_method("begin_zone") || !profiler_object->has_method("end_zone")) {
+			return cached;
+		}
+		if (!bool(profiler_object->call("is_started"))) {
+			return cached;
+		}
+		// A profiler can be started in on-demand mode with nobody connected yet; emitting
+		// then would cost the game for an empty timeline.
+		if (profiler_object->has_method("is_profiler_connected") &&
+				!bool(profiler_object->call("is_profiler_connected"))) {
+			return cached;
+		}
+		cached = profiler_object;
+		return cached;
+	}
+
+	static void plot(const char *p_name, double p_value) {
+		Object *profiler_object = profiler();
+		if (profiler_object && profiler_object->has_method("plot")) {
+			profiler_object->call("plot", String("terrain/") + p_name, p_value);
+		}
+	}
+
+private:
+	Object *_profiler = nullptr;
+};
+} // namespace
 
 ///////////////////////////
 // Private Functions
@@ -123,6 +194,96 @@ void Terrain3D::_initialize() {
  * This is a proxy for _process(delta) called by _notification() due to
  * https://github.com/godotengine/godot-cpp/issues/1022
  */
+// Publishes this node's cost as custom monitors. Every id starts with `terrain/`, which the
+// editor's monitor graph uses as the group name, so a graph can show the terrain's own CPU
+// and memory beside the engine's numbers instead of an unattributed spike. Units are the ones
+// the editor formats: seconds for MONITOR_TYPE_TIME, bytes for MONITOR_TYPE_MEMORY.
+void Terrain3D::_register_debug_monitors() {
+	if (_monitors_registered) {
+		return;
+	}
+	Performance *performance = Performance::get_singleton();
+	if (!performance) {
+		return;
+	}
+	// A second terrain in the same scene would collide on the plain names, so everything after
+	// the first publishes under its instance id - still inside the `terrain` group.
+	_monitor_prefix = performance->has_custom_monitor(StringName("terrain/vt_cpu"))
+			? "terrain/" + String::num_int64(get_instance_id()) + "/"
+			: "terrain/";
+	// `Performance::MONITOR_TYPE_*` is not in the generated binding, so the ids the engine
+	// binds are spelled out here; they decide how the editor formats a value.
+	constexpr int MONITOR_TYPE_QUANTITY = 0;
+	constexpr int MONITOR_TYPE_MEMORY = 1;
+	constexpr int MONITOR_TYPE_TIME = 2;
+	struct MonitorEntry {
+		const char *name;
+		Callable callable;
+		int type;
+	};
+	const MonitorEntry entries[] = {
+		{ "vt_cpu", callable_mp(this, &Terrain3D::_monitor_vt_cpu_ms), MONITOR_TYPE_TIME },
+		{ "vt_cpu_peak", callable_mp(this, &Terrain3D::_monitor_vt_peak_ms), MONITOR_TYPE_TIME },
+		{ "avt_cpu", callable_mp(this, &Terrain3D::_monitor_avt_cpu_ms), MONITOR_TYPE_TIME },
+		{ "svt_cpu", callable_mp(this, &Terrain3D::_monitor_svt_cpu_ms), MONITOR_TYPE_TIME },
+		{ "material_bytes", callable_mp(this, &Terrain3D::_monitor_material_bytes), MONITOR_TYPE_MEMORY },
+		{ "pages_ready", callable_mp(this, &Terrain3D::_monitor_pages_ready), MONITOR_TYPE_QUANTITY },
+		{ "pages_pending", callable_mp(this, &Terrain3D::_monitor_pages_pending), MONITOR_TYPE_QUANTITY },
+	};
+	for (const MonitorEntry &entry : entries) {
+		// The generated binding exposes three arguments, so the monitor type is passed through
+		// a dynamic call; without it the editor shows every value as a bare number.
+		const StringName id(_monitor_prefix + entry.name);
+		if (performance->has_custom_monitor(id)) {
+			continue;
+		}
+		const Variant arguments[4] = { id, entry.callable, Array(), entry.type };
+		const Variant *argv[4] = { &arguments[0], &arguments[1], &arguments[2], &arguments[3] };
+		Variant target(performance);
+		Variant result;
+		GDExtensionCallError error;
+		target.callp("add_custom_monitor", argv, 4, result, error);
+		if (error.error != GDEXTENSION_CALL_OK) {
+			LOG(WARN, "Could not publish the ", String(entry.name), " terrain monitor");
+		}
+	}
+	_monitors_registered = true;
+}
+
+void Terrain3D::_unregister_debug_monitors() {
+	if (!_monitors_registered) {
+		return;
+	}
+	_monitors_registered = false;
+	Performance *performance = Performance::get_singleton();
+	if (!performance) {
+		return;
+	}
+	// The monitors call back into this node, so they have to be gone before it is freed.
+	for (const char *name : { "vt_cpu", "vt_cpu_peak", "avt_cpu", "svt_cpu", "material_bytes",
+				 "pages_ready", "pages_pending" }) {
+		const StringName id(_monitor_prefix + name);
+		if (performance->has_custom_monitor(id)) {
+			performance->remove_custom_monitor(id);
+		}
+	}
+}
+
+int64_t Terrain3D::_monitor_material_bytes() const {
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	return producer ? producer->get_material_bytes() : 0;
+}
+
+int64_t Terrain3D::_monitor_pages_ready() const {
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	return producer ? producer->get_ready_page_count() : 0;
+}
+
+int64_t Terrain3D::_monitor_pages_pending() const {
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	return producer ? producer->get_pending_page_count() : 0;
+}
+
 void Terrain3D::_invalidate_render_geometry() {
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
@@ -199,6 +360,11 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// thread for this tick, from reconfiguring the shared service to the baker budget.
 	// Region streaming, collision and the mesher are outside this window.
 	const uint64_t vt_started = Time::get_singleton()->get_ticks_usec();
+	// The whole VT section as one zone, with one zone per phase inside it. A profiler
+	// timeline then shows the terrain's cost under `terrain/...` instead of an unattributed
+	// block between two engine frames.
+	TerrainProfileZone vt_total_zone("vt");
+	_register_debug_monitors();
 	// The tick's budget for everything below. A phase that can stop between two units of
 	// work reads this deadline, so streaming cannot put an unbounded amount of planning or
 	// page production into one frame; what it did not finish runs on the next tick.
@@ -214,7 +380,11 @@ void Terrain3D::__physics_process(const double p_delta) {
 		r_phase = double(now - vt_mark) / 1000.0;
 		vt_mark = now;
 	};
-	_update_vt_service();
+	auto traced = [](const char *p_name, auto &&p_body) {
+		TerrainProfileZone zone(p_name);
+		p_body();
+	};
+	traced("vt_service", [&] { _update_vt_service(); });
 	vt_phase(_vt.vt_service_ms);
 	// VT Setting supplies one production budget for both addressing views.
 	int vt_remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
@@ -222,46 +392,66 @@ void Terrain3D::__physics_process(const double p_delta) {
 	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
 	int avt_produced = 0;
-	if (_vt.surface_vt_enabled) {
-		avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
-		vt_remaining -= avt_produced;
-	}
+	traced("vt_avt", [&] {
+		if (_vt.surface_vt_enabled) {
+			avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
+			vt_remaining -= avt_produced;
+		}
+	});
 	vt_phase(_vt.vt_avt_ms);
 	if (_vt.vt_avt_ms > _vt.vt_avt_peak_ms) { _vt.vt_avt_peak_ms = _vt.vt_avt_ms; }
 	// Refresh the far field: a world-space page grid that spans regions.
-	if (_vt.surface_svt_enabled && vt_remaining > 0) {
-		vt_remaining -= update_surface_svt(vt_remaining);
-	}
+	traced("vt_svt", [&] {
+		if (_vt.surface_svt_enabled && vt_remaining > 0) {
+			vt_remaining -= update_surface_svt(vt_remaining);
+		}
+	});
 	vt_phase(_vt.vt_svt_ms);
 	if (_vt.vt_svt_ms > _vt.vt_svt_peak_ms) { _vt.vt_svt_peak_ms = _vt.vt_svt_ms; }
-	if (!svt_baking && vt_remaining > 0 && _vt.surface_vt_enabled && is_sector_avt() &&
-			_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
-		// The initial split lets SVT make progress, but unused SVT budget belongs
-		// to AVT again. Do not cap near-page throughput at eight forever.
-		const uint64_t started = Time::get_singleton()->get_ticks_usec();
-		const int extra = _produce_sector_avt_pages(vt_remaining);
-		vt_remaining -= extra;
-		_vt.avt_sector_stats["produced"] = avt_produced + extra;
-		// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
-		// planner itself took, and adding the top-up into it turned a per-tick duration
-		// into a counter that only ever grew, which is not a cost anyone can act on.
-		_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
-	}
+	traced("vt_topup", [&] {
+		if (!svt_baking && vt_remaining > 0 && _vt.surface_vt_enabled && is_sector_avt() &&
+				_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
+			// The initial split lets SVT make progress, but unused SVT budget belongs
+			// to AVT again. Do not cap near-page throughput at eight forever.
+			const uint64_t started = Time::get_singleton()->get_ticks_usec();
+			const int extra = _produce_sector_avt_pages(vt_remaining);
+			vt_remaining -= extra;
+			_vt.avt_sector_stats["produced"] = avt_produced + extra;
+			// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
+			// planner itself took, and adding the top-up into it turned a per-tick duration
+			// into a counter that only ever grew, which is not a cost anyone can act on.
+			_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+		}
+	});
 	vt_phase(_vt.vt_topup_ms);
-	if (svt_baking) {
-		_vt.surface_svt->set_allocation_budget(MAX(0, vt_remaining));
-		_process_svt_bake(MAX(0, vt_remaining));
-		// The bake pass borrows the shared pool budget for this tick only. The pool is
-		// shared by both views, and a finite budget left behind blocks the next tick's
-		// acquisition - including its free-slot path - whenever the demand passes
-		// early-return before resetting it.
-		_vt.surface_svt->set_allocation_budget(-1);
-	}
+	traced("vt_bake", [&] {
+		if (svt_baking) {
+			_vt.surface_svt->set_allocation_budget(MAX(0, vt_remaining));
+			_process_svt_bake(MAX(0, vt_remaining));
+			// The bake pass borrows the shared pool budget for this tick only. The pool is
+			// shared by both views, and a finite budget left behind blocks the next tick's
+			// acquisition - including its free-slot path - whenever the demand passes
+			// early-return before resetting it.
+			_vt.surface_svt->set_allocation_budget(-1);
+		}
+	});
 	if (demand_pool) { demand_pool->end_demand(); }
 	vt_phase(_vt.vt_bake_ms);
 	_vt.vt_tick_deadline_us = 0;
 	_vt.vt_cpu_ms = double(Time::get_singleton()->get_ticks_usec() - vt_started) / 1000.0;
 	if (_vt.vt_cpu_ms > _vt.vt_cpu_peak_ms) { _vt.vt_cpu_peak_ms = _vt.vt_cpu_ms; }
+	// The same numbers as plots, so a profiler graph shows the terrain's cost over time with
+	// the same `terrain/` keyword the zones and the editor monitors use.
+	const Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	TerrainProfileZone::plot("vt_cpu_ms", _vt.vt_cpu_ms);
+	TerrainProfileZone::plot("avt_cpu_ms", _vt.vt_avt_ms);
+	TerrainProfileZone::plot("svt_cpu_ms", _vt.vt_svt_ms);
+	TerrainProfileZone::plot("vt_peak_ms", _vt.vt_cpu_peak_ms);
+	if (producer) {
+		TerrainProfileZone::plot("material_mb", double(producer->get_material_bytes()) / (1024.0 * 1024.0));
+		TerrainProfileZone::plot("pages_ready", double(producer->get_ready_page_count()));
+		TerrainProfileZone::plot("pages_pending", double(producer->get_pending_page_count()));
+	}
 }
 
 bool Terrain3D::_vt_tick_expired() const {
@@ -649,6 +839,9 @@ void Terrain3D::_notification(const int p_what) {
 			if (RS->is_connected("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry))) {
 				RS->disconnect("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry));
 			}
+			// A tree that is gone is not being watched: the next tick that runs publishes them
+			// again, and a node that never re-enters does not leave a callable into itself.
+			_unregister_debug_monitors();
 			_destroy_vt_service();
 			// Node is about to exit a SceneTree
 			// Sent on scene changes
@@ -681,6 +874,8 @@ void Terrain3D::_notification(const int p_what) {
 		}
 
 		case NOTIFICATION_PREDELETE: {
+			// The monitors call back into this node, so they go before anything else does.
+			_unregister_debug_monitors();
 			_destroy_vt_service();
 			// Object is about to be deleted
 			LOG(INFO, "NOTIFICATION_PREDELETE");

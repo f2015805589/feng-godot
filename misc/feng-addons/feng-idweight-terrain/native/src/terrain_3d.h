@@ -64,6 +64,11 @@ private:
 	bool _is_inside_world = false;
 	bool _initialized = false;
 	uint8_t _warnings = 0u;
+	// Whether this node's `terrain/...` monitors are published, and the prefix they use.
+	// A second terrain in one scene would collide on the plain names, so it publishes under
+	// its instance id instead.
+	bool _monitors_registered = false;
+	String _monitor_prefix = "terrain/";
 
 	// Object references
 	Terrain3DData *_data = nullptr;
@@ -242,6 +247,20 @@ private:
 	void _reset_vt_configuration();
 	// Applies one tier's storage format to the producer and re-produces the pages it stored.
 	void _apply_vt_tier_compression(const int p_tier, const int p_mode);
+	// The terrain's own cost, published under a `terrain/` keyword so it can be told apart
+	// from the engine's numbers: custom monitors for the editor's monitor graph, and profiler
+	// zones and plots for a profiler timeline. Registered on the first tick the VT scheduler
+	// actually runs and removed before the node is deleted, because the monitors hold callables
+	// onto this object.
+	void _register_debug_monitors();
+	void _unregister_debug_monitors();
+	double _monitor_vt_cpu_ms() const { return _vt.vt_cpu_ms; }
+	double _monitor_vt_peak_ms() const { return _vt.vt_cpu_peak_ms; }
+	double _monitor_avt_cpu_ms() const { return _vt.vt_avt_ms; }
+	double _monitor_svt_cpu_ms() const { return _vt.vt_svt_ms; }
+	int64_t _monitor_material_bytes() const;
+	int64_t _monitor_pages_ready() const;
+	int64_t _monitor_pages_pending() const;
 	void _cancel_svt_bake(const String &p_reason);
 	void _destroy_surface_vt();
 	// One demand pass: registers sectors for the regions near the target, picks a mip

@@ -933,8 +933,31 @@ Dictionary Terrain3D::get_vt_settings() const {
 	// page, because the atlas cannot be resized in place.
 	result["pool_generation"] = _vt.vt_pool_generation;
 	result["auto_capacity"] = _vt.vt_auto_capacity;
-	// Three RGBA16F outputs, R16 IDs, and R16+R32F bake staging per slot.
-	result["physical_cache_bytes"] = int64_t(_vt.vt_page_size + 2 * _vt.vt_page_border) * (_vt.vt_page_size + 2 * _vt.vt_page_border) * _vt.vt_page_count * 32;
+	// Material page arrays, in bytes. The uncompressed figure is the formula over the slot
+	// count (three RGBA16F outputs plus the R16/R32F bake sources, 32 bytes per stored texel)
+	// and it is what the pool costs with no codec applied; `physical_cache_bytes` is what the
+	// arrays actually cost today, which is the staging pool - the encoder ring once every tier
+	// is compressed - plus one compressed copy per tier that resolved. Reporting only the
+	// formula made a compressed pool look unchanged, and the per-tier numbers are what a
+	// comparison between an AVT codec, an SVT codec and both has to read.
+	const int64_t uncompressed_cache_bytes = int64_t(_vt.vt_page_size + 2 * _vt.vt_page_border) *
+			(_vt.vt_page_size + 2 * _vt.vt_page_border) * _vt.vt_page_count * 32;
+	Dictionary producer_stats;
+	if (_vt.vt_baker.is_valid()) {
+		producer_stats = baker(_vt.vt_baker)->get_stats();
+	}
+	result["physical_cache_bytes_uncompressed"] = uncompressed_cache_bytes;
+	result["physical_cache_bytes"] = producer_stats.is_empty()
+			? uncompressed_cache_bytes
+			: int64_t(producer_stats.get("material_bytes", uncompressed_cache_bytes));
+	result["material_staging_bytes"] = int64_t(producer_stats.get("staging_bytes", uncompressed_cache_bytes));
+	result["material_compressed_bytes"] = int64_t(producer_stats.get("compressed_bytes", 0));
+	result["surface_vt_compression_bytes"] = int64_t(producer_stats.get("avt_bytes", 0));
+	result["surface_svt_compression_bytes"] = int64_t(producer_stats.get("svt_bytes", 0));
+	result["surface_vt_compression_slots"] = int64_t(producer_stats.get("avt_slots", 0));
+	result["surface_svt_compression_slots"] = int64_t(producer_stats.get("svt_slots", 0));
+	result["surface_vt_compression_ready_slots"] = int64_t(producer_stats.get("avt_ready_slots", 0));
+	result["surface_svt_compression_ready_slots"] = int64_t(producer_stats.get("svt_ready_slots", 0));
 	result["pages_per_update"] = _vt.vt_pages_per_update;
 	result["shared_pool"] = _vt.vt_shared_ready;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
@@ -1033,7 +1056,7 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["bake_failed"] = _vt.vt_svt_bake_failed;
 	result["bake_error"] = _vt.vt_svt_bake_error;
 	if (_vt.vt_baker.is_valid()) {
-		result["producer"] = baker(_vt.vt_baker)->get_stats();
+		result["producer"] = producer_stats;
 	}
 	if (_vt.surface_vt) {
 		result["residency"] = _vt.surface_vt->get_stats();

@@ -743,13 +743,23 @@ sample, 0 when refused), `vt_atlas_compression_applied` (what the arrays are sto
 so the compressed arrays are separate sampling targets and a compute pass copies between them:
 
 * The encoder reads the staging layer through a sampler and writes that layer's block words into
-  one region of a small ring buffer (`ENCODE_PAGES` = 8 pages in flight, each with one region per
-  channel — a few hundred kilobytes at BC7, not another page-sized array per slot).
-* `buffer_get_data_async` returns those words, and the render callback `texture_update`s them into
+  one region of a small ring buffer, one region per channel per page in flight — a few hundred
+  kilobytes per page at BC7, not another page-sized array per slot.
+* `.buffer_get_data_async` returns those words, and the render callback `texture_update`s them into
   the tier's sampling array. The CPU cost of a compressed page is therefore the buffer copy of its
   block words — a sixteenth of the half-float page at BC7 — and never a block-encoder pass, so the
   per-frame page budget stays at the caller's setting and compression does not change how many
   pages a demand pass produces.
+* **The ring depth is derived, not fixed.** A page holds its regions until its readbacks land, and
+  the render graph delivers them about two frames after the recording that requested them, so the
+  ring has to admit the caller's whole page budget times that latency. With the previous fixed
+  depth of eight under a sixteen page budget the ring, not the budget, was the page rate: a
+  compressed tier became ready at four pages per frame — eight pages every two frames — however
+  much the demand asked for, and the surplus queued up in `pending`. The depth is now
+  `clamp(page_budget × 2, 8, 64)` bounded by `ENCODE_RING_BUDGET_BYTES` (96 MB) and by half the
+  slot count, so a compressed pool always costs at most half of what the page sized pool would.
+  `get_stats()` reports the admitted depth as `encode_ring_capacity`, the depth the bundle
+  allocated as `encode_ring_allocated`, and the regions in use as `encode_ring_pages`.
 * A region is only handed out again once every readback of the page it held has been delivered, so
   a readback can never observe a later page's blocks. The request is refused rather than reused
   when the ring is full, and the page keeps its pending flag for a later frame.
@@ -769,15 +779,40 @@ do not move while the view is still.
 
 **The staging pool becomes a scratch ring when nothing samples it.** The three RGBA16F outputs
 and the R16/R32F sources are page sized only while a tier samples them by slot. Once *both* tiers
-are compressed nothing does, so the pool shrinks to `ENCODE_PAGES` (8) layers: a produced page
+are compressed nothing does, so the pool shrinks to the encoder ring's depth: a produced page
 takes a ring page, writes its half-float channels into that layer, and the encoder reads that same
 layer and stores the blocks into the page's own slot of the tier's array. The ring page is held
 until the page's three block readbacks have been delivered, which is what makes the reuse safe.
 The resident pool therefore drops from 30 bytes per stored texel per slot (three RGBA16F outputs
-plus the R16/R32F sources) to `8 / page_count` of that — at 256 pages and a 264² stored page,
-~535 MB becomes ~17 MB, and each compressed tier's own arrays add ~53 MB. Leaving one tier
-uncompressed restores the page-sized pool, because that tier samples it by slot. `get_stats()`
-reports `staging_layers`, `staging_scratch` and `staging_bytes`.
+plus the R16/R32F sources) to `ring_depth / page_count` of that — at 256 pages and a 264² stored
+page with the default 16 page budget, ~535 MB becomes ~67 MB (32 ring layers), and each compressed
+tier's own arrays add ~53 MB. Leaving one tier uncompressed restores the page-sized pool, because
+that tier samples it by slot. `get_stats()` reports `staging_layers`, `staging_scratch` and
+`staging_bytes`.
+
+**What the pool costs is reported, per tier.** `get_vt_settings()` used to answer
+`physical_cache_bytes` with `(page + 2·border)² × page_count × 32`, a formula over the slot count
+that ignores compression: a compressed pool looked exactly as expensive as an uncompressed one, and
+a single compressed tier — which really does cost *more*, because the other tier still samples the
+page-sized pool and the compressed copy is pure addition — looked free. `physical_cache_bytes` is
+now the real layout (staging pool plus one compressed copy per tier that resolved), the old formula
+stays as `physical_cache_bytes_uncompressed` for comparison, and the per-tier numbers are
+`surface_vt_compression_bytes` / `surface_svt_compression_bytes` with the pool occupancy each tier
+holds as `surface_vt_compression_slots` / `surface_svt_compression_ready_slots`. The producer
+reports the same figures as `staging_bytes`, `compressed_bytes`, `material_bytes`, `avt_bytes`,
+`svt_bytes` and the matching `*_slots` / `*_ready_slots`.
+
+**The terrain's cost carries a `terrain/` keyword.** The node runs as a GDExtension method, so the
+engine's profiler cannot attribute its time. It publishes custom monitors named
+`terrain/vt_cpu`, `terrain/vt_cpu_peak`, `terrain/avt_cpu`, `terrain/svt_cpu`,
+`terrain/material_bytes`, `terrain/pages_ready` and `terrain/pages_pending` (seconds, bytes and
+counts, with the monitor types that make the editor format them), which the editor's monitor graph
+groups under `terrain`. The same phases are emitted as profiler zones and plots — `terrain/vt`,
+`terrain/vt_service`, `terrain/vt_avt`, `terrain/vt_svt`, `terrain/vt_topup`, `terrain/vt_bake`,
+and plots `terrain/vt_cpu_ms`, `terrain/avt_cpu_ms`, `terrain/svt_cpu_ms`, `terrain/material_mb`,
+`terrain/pages_ready`, `terrain/pages_pending` — through the profiler singleton the engine exposes,
+and only while a profiler client is connected. A second terrain in one scene publishes under its
+instance id (`terrain/<id>/...`) so the plain names never collide.
 
 Two consequences of the ring, both deliberate: a capacity growth re-produces every resident page
 instead of migrating it (there is no per-slot half-float layer left to copy, and a block format

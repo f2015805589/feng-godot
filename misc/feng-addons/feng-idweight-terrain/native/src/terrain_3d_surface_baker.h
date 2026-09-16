@@ -238,7 +238,19 @@ private:
 	// This bounds the encoder at a few hundred kilobytes instead of one region per physical
 	// slot, which is what keeps compression a storage decision rather than another page-sized
 	// allocation per slot.
-	static constexpr int ENCODE_PAGES = 8;
+	//
+	// The depth is not a constant. A page holds its regions until its readbacks arrive, and
+	// the render graph delivers them about two frames after the recording that asked for
+	// them, so the ring has to hold the caller's whole page budget times that latency.
+	// Measured with the previous fixed depth of eight and a sixteen page budget, a compressed
+	// tier became ready at four pages per frame - eight pages every two frames - however much
+	// the demand asked for, because the ring, not the budget, decided the rate.
+	static constexpr int ENCODE_PAGES_MIN = 8;
+	static constexpr int ENCODE_PAGES_MAX = 64;
+	static constexpr int ENCODE_READBACK_FRAMES = 2;
+	// The same ring is the staging pool under the scratch regime, so its depth is bounded by
+	// bytes rather than by pages: this is the ceiling a derived depth may cost.
+	static constexpr int64_t ENCODE_RING_BUDGET_BYTES = 96 * 1024 * 1024;
 	static constexpr int ENCODE_CHANNELS = 3;
 	// `_slot_scratch` entry of a slot that has no ring page: either the page is not produced
 	// yet, or the arrays are page sized and the slot names its own layer.
@@ -247,6 +259,22 @@ private:
 	// Both are a function of the stored page size, so they are set with the resources.
 	int _encode_region_bytes = 0;
 	int _encode_region_words = 0;
+	// Ring depth. `allocated` is what the vectors and the encoder's output buffer were sized
+	// for, `capacity` is what the ring admits right now; the admitted depth never exceeds the
+	// allocated one, so a page budget the caller raises later is served by the headroom the
+	// allocation already has instead of indexing past it. The render thread writes both while
+	// the caller's `set_page_budget()` reads them, so they are atomic.
+	std::atomic<int> _encode_ring_allocated{ ENCODE_PAGES_MIN };
+	std::atomic<int> _encode_ring_capacity{ ENCODE_PAGES_MIN };
+	// Bytes one ring position costs - the encoder's three regions plus the half-float staging
+	// layer the same position owns under the scratch regime - and the depth that covers the
+	// caller's budget for the frames a readback takes without exceeding the byte ceiling.
+	int64_t _encode_page_bytes() const;
+	int _derive_encode_ring_pages() const;
+	// Re-derives the admitted depth from the current page budget.
+	void _refresh_encode_ring_capacity();
+	// Bytes the three sampled arrays of one tier cost, or 0 when it has none.
+	int64_t _tier_sampled_bytes(int p_tier) const;
 	// Channel readbacks still outstanding for each in-flight page in the ring; 0 is free.
 	// Guarded by _encode_mutex with _encoded_layers: the completion callback runs in the
 	// frame stall, not in the render callback.
@@ -427,6 +455,12 @@ public:
 	Dictionary probe_tier_compression(int p_tier, const Ref<godot::Image> &p_image) const;
 	Ref<godot::Image> get_page_preview(int p_slot) const;
 	Dictionary get_stats() const;
+	// Single readings for a monitor that polls every frame: the bytes the page arrays cost,
+	// and the slots a sampler can use against the jobs still waiting for one. Same numbers as
+	// the matching `get_stats()` keys, without building the dictionary.
+	int64_t get_material_bytes() const;
+	int get_ready_page_count() const;
+	int get_pending_page_count() const;
 	void clear();
 };
 

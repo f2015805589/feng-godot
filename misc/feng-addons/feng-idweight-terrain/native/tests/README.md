@@ -437,12 +437,19 @@ remains as the near field's pre-split name.
 Compression runs on the GPU. A compressed format cannot be a storage image and no texture copy
 converts formats, so a produced page is encoded by the compute pass in `shaders/bc_encode.glsl`:
 it reads the RGBA16F staging layer through a sampler and writes that layer's block words into one
-region of a small ring buffer (8 pages in flight, a few hundred kilobytes at BC7), which is read
-back and uploaded into the tier's sampling array. The CPU cost of a compressed page is therefore
-the buffer copy of its block words — a sixteenth of the half-float page at BC7 — and never a block
-encoder pass. Only the codecs that shader implements can be selected (BC7 and BC3 RGBA carry the
-alpha the shader reads); every other request is refused with a reason instead of leaving pages no
-encoder ever fills.
+region per channel of a ring buffer, which is read back and uploaded into the tier's sampling
+array. The CPU cost of a compressed page is therefore the buffer copy of its block words — a
+sixteenth of the half-float page at BC7 — and never a block encoder pass. Only the codecs that
+shader implements can be selected (BC7 and BC3 RGBA carry the alpha the shader reads); every other
+request is refused with a reason instead of leaving pages no encoder ever fills.
+
+The ring depth is derived from the page budget, not fixed: a page holds its regions until its
+readbacks land, about two frames later, so the ring admits `page_budget × 2` (8 to 64, bounded by
+a byte ceiling and by half the slot count). With the earlier fixed depth of eight under a sixteen
+page budget the ring was the page rate — four ready pages per frame, eight every two frames — and
+the surplus queued in `pending`. `encode_ring_capacity` / `encode_ring_allocated` / `encode_ring_pages`
+report the admitted depth, the allocated depth and the regions in flight, and the test asserts the
+admitted depth covers the whole budget and that a burst really holds more than the old eight.
 
 The upload has to happen from a recording point: the readback callback runs inside the frame stall,
 after the frame's draw graph was ended and immediately before the next one begins, so an upload
@@ -458,15 +465,39 @@ Root pages and detail pages are still assembled on the GPU: a baked cell is a de
 copy. A tier left uncompressed samples the staging arrays directly and costs nothing extra; a
 compressed tier adds its own `page_count` layers beside the pool. Once **both** tiers are
 compressed nothing samples the staging arrays by slot, so the half-float pool shrinks to the
-encoder ring (`staging_layers` = 8): a produced page writes into a ring layer, the encoder reads
-that same layer, and the layer is held until the page's block readbacks arrive. At 256 pages and a
-264² stored page that is ~535 MB of resident staging becoming ~17 MB. A capacity growth then
-re-produces the resident pages instead of migrating them, and `export_page()` / the dock preview
-read a page's block words and decode them, because the layer it was produced in has been reused.
-`get_stats()` reports `staging_layers` / `staging_scratch` / `staging_bytes`,
+encoder ring: a produced page writes into a ring layer, the encoder reads that same layer, and the
+layer is held until the page's block readbacks arrive. At 256 pages and a 264² stored page that is
+~535 MB of resident staging becoming ~67 MB (32 ring layers). A capacity growth then re-produces
+the resident pages instead of migrating them, and `export_page()` / the dock preview read a page's
+block words and decode them, because the layer it was produced in has been reused.
+
+What the arrays cost is reported, and the per-tier figures are what a codec comparison reads:
+`get_vt_settings()` answers `physical_cache_bytes` with the real layout (staging pool plus one
+compressed copy per tier that resolved), keeps the old slot-count formula as
+`physical_cache_bytes_uncompressed`, and adds `material_staging_bytes` / `material_compressed_bytes`
+and `surface_vt_compression_bytes` / `surface_svt_compression_bytes` with each tier's pool
+occupancy (`*_slots`, `*_ready_slots`). `get_stats()` reports `staging_layers` / `staging_scratch` /
+`staging_bytes` / `compressed_bytes` / `material_bytes` / `avt_bytes` / `svt_bytes`,
 `encode_requests` / `encode_readbacks` / `encode_updates` / `encode_failures` and
 `encode_ring_pages`, which is how a page that is ready in staging but never reaches the sampled
 arrays is told apart from one that was never produced.
+
+## Terrain monitors and profiler zones
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_monitors_runner.py --driver d3d12
+```
+
+The node's own cost is published under a `terrain/` keyword, because a GDExtension method is
+invisible to the engine's profiler and an unattributed spike cannot be told apart from engine work.
+`get_vt_settings()`-style readings become custom monitors — `terrain/vt_cpu`, `terrain/vt_cpu_peak`,
+`terrain/avt_cpu`, `terrain/svt_cpu`, `terrain/material_bytes`, `terrain/pages_ready`,
+`terrain/pages_pending` — with the monitor types the editor formats as milliseconds, bytes and
+counts, and the same phases are emitted as profiler zones and plots while a profiler client is
+connected. A second terrain in one scene publishes under `terrain/<instance id>/...` so the plain
+names never collide, and the monitors are withdrawn when the node exits the tree and again before
+it is deleted, because they hold callables into it. The test checks the names, the types, a live
+reading, the two-terrain split and the withdrawal.
 
 ## Far-field distance -> mip bands
 
