@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/engine.hpp>
 
 #include "logger.h"
+#include "rd_gpu_copy.h"
 
 #include <godot_cpp/classes/rd_sampler_state.hpp>
 #include <godot_cpp/classes/rd_shader_source.hpp>
@@ -13,6 +14,7 @@
 #include <godot_cpp/classes/rd_uniform.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/rect2i.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -789,6 +791,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		_resource_page_count = p_page_count;
 		_page_count = p_page_count;
 		_ready.resize(size_t(p_page_count), 0);
+		_produced_frame.resize(size_t(p_page_count), 0);
 		_sampled_channel_mask.resize(size_t(p_page_count), 0);
 		_slot_sequence.resize(size_t(p_page_count), 0);
 		_slot_tier.resize(size_t(p_page_count), uint8_t(TIER_AVT));
@@ -855,6 +858,7 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 	++_generation;
 	_pending.clear();
 	_ready.assign(size_t(_page_count), 0);
+	_produced_frame.assign(size_t(_page_count), 0);
 	_sampled_channel_mask.assign(size_t(_page_count), 0);
 	_slot_sequence.assign(size_t(_page_count), 0);
 	_slot_tier.assign(size_t(_page_count), uint8_t(TIER_AVT));
@@ -1090,6 +1094,15 @@ void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const 
 	_sampled_channel_mask[size_t(p_slot)] |= uint8_t(1u << uint32_t(p_channel));
 	if (_sampled_channel_mask[size_t(p_slot)] == 0x7u) {
 		_ready[size_t(p_slot)] = 1;
+		if (p_slot < int(_produced_frame.size()) && _produced_frame[size_t(p_slot)] != 0) {
+			Engine *engine = Engine::get_singleton();
+			const uint64_t now = engine ? uint64_t(engine->get_process_frames()) : 0;
+			const uint64_t produced = _produced_frame[size_t(p_slot)];
+			const uint64_t waited = now >= produced ? now - produced : 0;
+			_ready_latency_sum += waited;
+			_ready_latency_max = MAX(_ready_latency_max, waited);
+			_ready_latency_samples++;
+		}
 	}
 }
 
@@ -1179,6 +1192,22 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		return;
 	}
 	int64_t compute_list = -1;
+	// With the engine's buffer to texture copy available, an encoded page is stored by a copy
+	// recorded after the dispatches, and the page is ready on this frame. Without it the blocks
+	// have to travel back through the CPU, which is what costs the frames until they are
+	// uploaded; the readback below stays as that path.
+	const bool direct_store = FengRDGpuCopy::available(_rd);
+	struct PendingStore {
+		int tier = 0;
+		int channel = 0;
+		int slot = 0;
+		int ring_page = ENCODE_RING_NONE;
+		uint32_t offset = 0;
+		uint32_t row_pitch = 0;
+		uint64_t generation = 0;
+		uint64_t sequence = 0;
+	};
+	std::vector<PendingStore> pending_stores;
 	for (size_t slot = 0; slot < _encode_pending.size(); ++slot) {
 		if (!_encode_pending[slot]) {
 			continue;
@@ -1274,6 +1303,21 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 			// this dispatch has to be ordered after that write, not merely recorded after it.
 			_rd->compute_list_add_barrier(compute_list);
 			const uint32_t offset = uint32_t(region * _encode_region_bytes);
+			if (direct_store) {
+				// The blocks stay on the GPU: the copy into the sampling array is recorded
+				// once the compute list is closed, which is why no readback is requested here.
+				PendingStore store;
+				store.tier = tier;
+				store.channel = channel;
+				store.slot = int(slot);
+				store.ring_page = ring_page;
+				store.offset = offset;
+				store.row_pitch = uint32_t(blocks * codec.block_words * int(sizeof(uint32_t)));
+				store.generation = generation;
+				store.sequence = sequence;
+				pending_stores.push_back(store);
+				continue;
+			}
 			const uint32_t layer_bytes = uint32_t(blocks * blocks * codec.block_words * int(sizeof(uint32_t)));
 			requested = _rd->buffer_get_data_async(_resources.encode_buffer,
 							   callable_mp(this, &Terrain3DSurfaceBaker::_on_encode_readback)
@@ -1300,6 +1344,37 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 	}
 	if (compute_list >= 0) {
 		_rd->compute_list_end();
+	}
+	if (direct_store && !pending_stores.empty()) {
+		// A block compressed texture cannot be a storage image, so a page used to be read back
+		// and uploaded again a few frames later. Recording the copy in the same submission as
+		// the dispatch that produced the blocks is what makes the page resident on this frame:
+		// the material that samples it is drawn after this, and the render graph orders the two
+		// through the encoder buffer's tracker.
+		const Rect2i store_region(0, 0, _stored_size, _stored_size);
+		for (const PendingStore &store : pending_stores) {
+			bool stored = _tiers[store.tier].applied.load() != 0;
+			const RID target = stored ? _sampled_rd(store.tier, store.channel) : RID();
+			if (target.is_valid()) {
+				stored = FengRDGpuCopy::copy(_rd, target, _resources.encode_buffer, store.offset,
+								 store.row_pitch, uint32_t(store.slot), 0, store_region) == OK;
+			} else {
+				stored = false;
+			}
+			if (stored) {
+				_encode_updates++;
+				_mark_sampled_channel_ready(store.tier, store.slot, store.channel, store.generation, store.sequence);
+			} else {
+				// Same contract as a readback that never arrived: the page is not ready, so the
+				// tier produces it again rather than sampling a layer nothing filled.
+				_mark_encode_failed(store.slot, store.generation, store.sequence);
+			}
+			// The ring page was the staging layer the dispatch read, and the copy that consumes
+			// its blocks is recorded in this submission as well, so nothing waits on it any
+			// more: a later frame may take it, which is one ring page per page in flight rather
+			// than one per page awaiting a readback.
+			_hold_encode_page(store.ring_page, 0);
+		}
 	}
 }
 
@@ -1964,6 +2039,14 @@ void Terrain3DSurfaceBaker::_set_ready(int p_slot, bool p_ready, uint64_t p_gene
 		}
 		return;
 	}
+	// Stamp the frame the content was produced in. A compressed page is only ready once its
+	// encoded layers have landed in the sampling arrays, and this is where that wait starts, so
+	// measuring from here is what separates an encode stored in the frame it was produced in
+	// from one that arrives a few frames later.
+	if (p_slot < int(_produced_frame.size())) {
+		Engine *engine = Engine::get_singleton();
+		_produced_frame[size_t(p_slot)] = engine ? uint64_t(engine->get_process_frames()) : 0;
+	}
 	// A tier stored uncompressed produces straight into the staging arrays the material
 	// samples, so recording its successful write makes the page ready. A tier stored
 	// compressed produces into a different array set and becomes ready only once all three
@@ -2490,6 +2573,11 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["encode_requests"] = int64_t(_encode_requests);
 	stats["encode_readbacks"] = int64_t(_encode_readbacks);
 	stats["encode_updates"] = int64_t(_encode_updates);
+	stats["ready_latency_samples"] = int64_t(_ready_latency_samples);
+	stats["ready_latency_frames_mean"] = _ready_latency_samples
+			? double(_ready_latency_sum) / double(_ready_latency_samples)
+			: 0.0;
+	stats["ready_latency_frames_max"] = int64_t(_ready_latency_max);
 	stats["encode_failures"] = int64_t(_encode_failures);
 	stats["encode_ring_pages"] = int64_t(std::count_if(_encode_ring_held.begin(), _encode_ring_held.end(),
 			[](uint8_t p_held) { return p_held != 0; }));

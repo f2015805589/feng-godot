@@ -9063,6 +9063,7 @@ void RenderingDevice::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("texture_create_from_extension", "type", "format", "samples", "usage_flags", "image", "width", "height", "depth", "layers", "mipmaps"), &RenderingDevice::texture_create_from_extension, DEFVAL(1));
 
 	ClassDB::bind_method(D_METHOD("texture_update", "texture", "layer", "data"), &RenderingDevice::texture_update);
+	ClassDB::bind_method(D_METHOD("texture_copy_from_buffer", "texture", "buffer", "buffer_offset", "row_pitch", "layer", "mipmap", "region"), &RenderingDevice::texture_copy_from_buffer);
 	ClassDB::bind_method(D_METHOD("texture_get_data", "texture", "layer"), &RenderingDevice::texture_get_data);
 	ClassDB::bind_method(D_METHOD("texture_get_data_async", "texture", "layer", "callback"), &RenderingDevice::texture_get_data_async);
 

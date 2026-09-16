@@ -352,6 +352,11 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA", PROPERTY_USAGE_NONE), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
+	// Source threads that assemble pages: 0 = auto (half the machine, 1..4).
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_workers", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_page_workers", "get_vt_page_workers");
+	// Motion look-ahead in milliseconds: the demand plans for where the camera will be,
+	// so a page is produced before the view reaches it. 0 disables the prediction.
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_motion_lead_ms", PROPERTY_HINT_RANGE, "0,1000,1"), "set_vt_motion_lead_ms", "get_vt_motion_lead_ms");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_frame_budget_ms", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_vt_frame_budget_ms", "get_vt_frame_budget_ms");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");

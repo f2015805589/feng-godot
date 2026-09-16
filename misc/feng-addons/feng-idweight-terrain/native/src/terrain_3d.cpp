@@ -229,6 +229,7 @@ void Terrain3D::_register_debug_monitors() {
 		{ "material_bytes", callable_mp(this, &Terrain3D::_monitor_material_bytes), MONITOR_TYPE_MEMORY },
 		{ "pages_ready", callable_mp(this, &Terrain3D::_monitor_pages_ready), MONITOR_TYPE_QUANTITY },
 		{ "pages_pending", callable_mp(this, &Terrain3D::_monitor_pages_pending), MONITOR_TYPE_QUANTITY },
+		{ "pages_late", callable_mp(this, &Terrain3D::_monitor_pages_late), MONITOR_TYPE_QUANTITY },
 	};
 	for (const MonitorEntry &entry : entries) {
 		// The generated binding exposes three arguments, so the monitor type is passed through
@@ -261,7 +262,7 @@ void Terrain3D::_unregister_debug_monitors() {
 	}
 	// The monitors call back into this node, so they have to be gone before it is freed.
 	for (const char *name : { "vt_cpu", "vt_cpu_peak", "avt_cpu", "svt_cpu", "material_bytes",
-				 "pages_ready", "pages_pending" }) {
+				 "pages_ready", "pages_pending", "pages_late" }) {
 		const StringName id(_monitor_prefix + name);
 		if (performance->has_custom_monitor(id)) {
 			performance->remove_custom_monitor(id);
@@ -365,6 +366,10 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// block between two engine frames.
 	TerrainProfileZone vt_total_zone("vt");
 	_register_debug_monitors();
+	// The camera's motion is sampled once per tick, before anything plans from it: the
+	// lead is what both views plan for, and a value updated per demand pass would differ
+	// between them.
+	_vt_update_motion_lead();
 	// The tick's budget for everything below. A phase that can stop between two units of
 	// work reads this deadline, so streaming cannot put an unbounded amount of planning or
 	// page production into one frame; what it did not finish runs on the next tick.
@@ -452,6 +457,8 @@ void Terrain3D::__physics_process(const double p_delta) {
 		TerrainProfileZone::plot("pages_ready", double(producer->get_ready_page_count()));
 		TerrainProfileZone::plot("pages_pending", double(producer->get_pending_page_count()));
 	}
+	TerrainProfileZone::plot("pages_late", double(_vt.avt_late_pages));
+	TerrainProfileZone::plot("motion_speed", double(_vt.avt_motion_velocity.length()));
 }
 
 bool Terrain3D::_vt_tick_expired() const {

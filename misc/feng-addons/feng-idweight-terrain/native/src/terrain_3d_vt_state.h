@@ -160,6 +160,46 @@ struct Terrain3DVTState {
 	std::shared_ptr<Terrain3DAVTRefinement> avt_refinement;
 	std::vector<Terrain3DAVTPageRequest> avt_page_plan;
 	std::vector<Terrain3DAVTPageRequest> avt_prefetch_plan;
+	// Length of the sampled prefix of `avt_page_plan`. Everything after it is the
+	// speculative apron, which is allowed to lag without the view showing a miss.
+	int avt_sampled_pages = 0;
+	// Source threads that assemble pages. 0 selects a machine derived default; see
+	// Terrain3DPagePipeline. One thread cannot feed a moving view.
+	int vt_page_workers = 0;
+	// Motion look-ahead: the planner plans for where the camera will be in
+	// `vt_motion_lead_ms`, not for where it is. A page takes several frames to
+	// assemble and a compressed page several more to encode and read back, so demand
+	// issued at the moment a page becomes visible can only ever be late. The velocity
+	// is exponentially smoothed and the lead is clamped by the near field's reach, so
+	// a stop or a reversal does not leave the plan pointing at a stale position.
+	real_t vt_motion_lead_ms = 250.f;
+	Vector2 avt_motion_velocity;
+	uint64_t avt_motion_stamp_us = 0;
+	Vector2 avt_motion_last_focus;
+	bool avt_motion_valid = false;
+	// Lead actually applied to the last submitted plan, for diagnostics and tests.
+	Vector2 avt_motion_lead;
+	// How long a page has been demanded without content, keyed by its address. With a
+	// lead the plan is predictive, so a page it names is not late yet - only a page that
+	// has been demanded for at least one lead and still has no content is what the image
+	// being rendered shows as a miss. Entries are dropped as pages become ready, so this
+	// only ever holds the pages currently in flight.
+	std::unordered_map<uint64_t, uint64_t> avt_demand_age;
+	int avt_late_pages = 0;
+	int avt_late_worst_us = 0;
+	// Pages of the sampled prefix that have no content this pass, and of those, the ones
+	// whose production is still inside its window. Kept as state and not only as a stat:
+	// the editor has to keep rendering while a page is still owed, and a demand waiting on
+	// a source job or a free slot has no render work of its own to report.
+	int avt_missing_pages = 0;
+	int avt_pending_pages = 0;
+	// Plans kept while the lead is applied, so retention does not drop the view being
+	// rendered before the plan that replaces it has been produced.
+	int avt_retain_epochs = 8;
+	// Requests kept from the previous plan because they are still on screen behind the
+	// lead. The pool capacity request counts them, so a look-ahead plan cannot grow the
+	// pool exactly large enough to evict the view it is leading.
+	int avt_retained_pages = 0;
 	PackedByteArray avt_plan_key;
 	uint64_t avt_idle_revision = 0;
 	std::vector<int> avt_resident_slots;

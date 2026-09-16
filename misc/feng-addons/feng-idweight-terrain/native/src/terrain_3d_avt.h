@@ -44,6 +44,10 @@ struct Terrain3DAVTRefinement {
 	std::vector<Terrain3DAVTPageRequest> pages, warm;
 	float finest = 0.f;
 	int denied = 0, roots = 0;
+	// Leading entries of `pages` that the current image actually samples, as opposed
+	// to the speculative apron appended after them. Production diagnostics count a
+	// missing page among these as a page the view is shading without content.
+	int sampled = 0;
 	uint64_t submitted_us = 0, elapsed_us = 0;
 };
 
@@ -100,6 +104,18 @@ struct Terrain3DAVTProducePass {
 	uint64_t allocation_us = 0, payload_us = 0, queue_us = 0;
 	int produced = 0, prefetched = 0;
 	bool prefetch_pending = false;
+	// Diagnostics over the sampled prefix of the plan: pages the current image
+	// samples, how many of them have no content yet, and how many are already being
+	// produced. A visible miss is what the shader draws as the missing-page material.
+	int sampled_plan = 0, sampled_missing = 0, sampled_pending = 0;
+	// Sampled pages that have been demanded for at least one motion lead without
+	// content, and the age of the oldest one. With a lead the plan is predictive, so
+	// only these are what the image being rendered actually shows as a miss.
+	int sampled_late = 0;
+	int late_worst_us = 0;
+	// Why a planned page was not produced this pass: its source job was not ready yet
+	// (the workers are behind) or the pool handed out no slot (residency is saturated).
+	int source_wait = 0, slot_wait = 0;
 };
 
 #endif // TERRAIN3D_AVT_TYPES_H

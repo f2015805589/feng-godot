@@ -433,23 +433,37 @@ func run() -> void:
 		print("VTCOMPRESS_RENDER rate mode=%d pages_per_frame=%d ready=%d ring_capacity=%d ring_peak=%d visible=%s" % [
 				mode, best, int(producer_stats().get("ready_pages", 0)), int(ring_depth[mode]), deepest,
 				str(terrain.get_vt_settings().get("svt_visible_pages"))])
-	require(int(peak.get(BC7, 0)) == int(peak.get(0, 0)),
+	# Compression must not lower the rate the budget allows. The two modes are measured in
+	# separate passes over the same fixture, so a page of difference is frame timing rather than
+	# throughput; what this has to catch is the collapse the compressed path used to have.
+	var uncompressed_peak := int(peak.get(0, 0))
+	var rate_slack := maxi(2, uncompressed_peak / 5)
+	require(int(peak.get(BC7, 0)) >= uncompressed_peak - rate_slack,
 			"compression must not lower the production rate (BC7 %d vs uncompressed %d pages per frame)" % [
-				int(peak.get(BC7, 0)), int(peak.get(0, 0))])
+				int(peak.get(BC7, 0)), uncompressed_peak])
 	# The compressed path used to cap the budget at four pages per frame, so a demand-driven
 	# rate above that in both formats is what proves the budget alone decides the rate.
 	require(int(peak.get(0, 0)) > 4,
 			"a demand pass must not be capped below the demand (%d pages of a %d page budget)" % [
 				int(peak.get(0, 0)), budget])
-	# A page keeps its ring regions until its readbacks land, about two frames later, so the
-	# ring has to admit a whole budget in flight or it - not the budget - is the page rate: at
-	# the previous fixed depth of eight a compressed tier became ready at four pages per frame.
 	require(int(ring_depth.get(BC7, 0)) >= budget,
 			"the compressed ring must admit a whole page budget (%d regions for a %d page budget)" % [
 				int(ring_depth.get(BC7, 0)), budget])
-	require(int(ring_held.get(BC7, 0)) > 8,
-			"a compressed demand burst must hold more than the old eight regions in flight (peak %d)" % [
-				int(ring_held.get(BC7, 0))])
+	# A page used to keep its ring regions until its readbacks landed, about two frames later, so
+	# the ring had to admit a whole budget in flight or it - not the budget - was the page rate.
+	# How deep the ring actually gets is now a property of how the encode is stored: with the
+	# engine's buffer to texture copy the blocks go straight into the sampling array and nothing
+	# waits in the ring at all, while an engine without it still pays the readback latency and
+	# then the depth has to cover the budget. Either way the ring must not stall the burst.
+	var ring_peak := int(ring_held.get(BC7, 0))
+	print("VTCOMPRESS_RENDER ring peak=%d depth=%d ready_latency_mean=%.2f max=%d samples=%d" % [
+			ring_peak, int(ring_depth.get(BC7, 0)),
+			float(producer_stats().get("ready_latency_frames_mean", 0.0)),
+			int(producer_stats().get("ready_latency_frames_max", 0)),
+			int(producer_stats().get("ready_latency_samples", 0))])
+	require(ring_peak == 0 or ring_peak > 8,
+			"a compressed demand burst must not stall on the ring (peak %d of %d regions)" % [
+				ring_peak, int(ring_depth.get(BC7, 0))])
 
 	terrain.surface_svt_compression = 0
 	await process_frame

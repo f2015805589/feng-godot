@@ -2,6 +2,7 @@
 #include "terrain_3d_vt_visibility.h"
 #include "terrain_vt_cell.h"
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
 #include <cmath>
 #include <cstring>
@@ -97,10 +98,28 @@ Vector2 Terrain3DPagePipeline::Snapshot::bounds(const Rect2 &rect, Vector2 fallb
     }
     return result.x <= result.y ? result : fallback;
 }
-Terrain3DPagePipeline::Terrain3DPagePipeline() : _worker(&Terrain3DPagePipeline::run, this) {}
+// Pages are assembled on more than one thread because one thread cannot feed a moving
+// view: a page costs a source scan plus an id/height payload, and the demand of a camera
+// crossing a sector is an order of magnitude above what a single worker can prepare per
+// frame. The default keeps half the machine's threads (at least one, at most four) so the
+// renderer, the planner and the game keep their cores.
+static int default_page_workers() {
+    const unsigned int hardware = std::thread::hardware_concurrency();
+    const int threads = hardware > 0 ? int(hardware) : 4;
+    return CLAMP(threads / 2, 1, 4);
+}
+
+int Terrain3DPagePipeline::default_worker_count() { return default_page_workers(); }
+
+Terrain3DPagePipeline::Terrain3DPagePipeline(const int p_workers) {
+    const int workers = p_workers > 0 ? CLAMP(p_workers, 1, 16) : default_page_workers();
+    _workers.reserve(size_t(workers));
+    for (int i = 0; i < workers; ++i) { _workers.emplace_back(&Terrain3DPagePipeline::run, this); }
+}
 Terrain3DPagePipeline::~Terrain3DPagePipeline() {
     { std::lock_guard<std::mutex> lock(_mutex); _stop = true; _entries.clear(); _task = {}; }
-    _wake.notify_one(); _task_wake.notify_one(); _worker.join();
+    _wake.notify_all(); _task_wake.notify_one();
+    for (std::thread &worker : _workers) { if (worker.joinable()) { worker.join(); } }
     if (_planner.joinable()) { _planner.join(); }
 }
 void Terrain3DPagePipeline::reset() { std::lock_guard<std::mutex> lock(_mutex); _entries.clear(); _task = {}; }
@@ -127,6 +146,24 @@ void Terrain3DPagePipeline::plan() {
     }
 }
 void Terrain3DPagePipeline::cancel(const Key &key) { std::lock_guard<std::mutex> lock(_mutex); _entries.erase(key); }
+void Terrain3DPagePipeline::discard(const Key &key) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _entries.find(key);
+    if (it != _entries.end() && it->second.ready) { _entries.erase(it); _stat_discarded.fetch_add(1, std::memory_order_relaxed); }
+}
+// One queue slot is a prepared payload of a few hundred kilobytes, so the window stays at
+// 32 entries - but a slot must never be held by a result nobody is going to poll. Every
+// page whose slot the producer is already filling leaves its entry behind, and without
+// this the window fills with dead results and the workers run out of work to do.
+void Terrain3DPagePipeline::_make_room() {
+    if (_entries.size() < 32) { return; }
+    auto oldest = _entries.end();
+    for (auto it = _entries.begin(); it != _entries.end(); ++it) {
+        if (!it->second.ready) { continue; }
+        if (oldest == _entries.end() || it->second.token < oldest->second.token) { oldest = it; }
+    }
+    if (oldest != _entries.end()) { _entries.erase(oldest); _stat_evicted.fetch_add(1, std::memory_order_relaxed); }
+}
 void Terrain3DPagePipeline::retain(const std::vector<Request> &requests) {
     std::lock_guard<std::mutex> lock(_mutex);
     for (auto &entry : _entries) { entry.second.retained = false; }
@@ -142,24 +179,32 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
     {
         std::lock_guard<std::mutex> lock(_mutex);
         for (const Request &request : requests) {
+            if (_entries.find(request.key) != _entries.end()) { continue; }
+            _make_room();
             if (_entries.size() >= 32) { break; }
-            if (_entries.find(request.key) == _entries.end()) {
-                _entries.emplace(request.key, Entry{request, source, {}, ++_token});
-            }
+            _entries.emplace(request.key, Entry{request, source, {}, ++_token});
         }
     }
-    _wake.notify_one();
+    // Every worker has to be woken: one notify leaves the others asleep while entries
+    // that only they can pick up sit in the queue.
+    _wake.notify_all();
 }
 bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const Snapshot> source, Result &result) {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _entries.find(request.key);
     if (it != _entries.end()) {
-        if (!it->second.ready || it->second.request.rect != request.rect) { return false; }
-        result = std::move(it->second.result); _entries.erase(it); return true;
+        if (!it->second.ready) { return false; }
+        if (it->second.request.rect != request.rect) { _stat_rect_mismatch.fetch_add(1, std::memory_order_relaxed); return false; }
+        result = std::move(it->second.result); _entries.erase(it);
+        _stat_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
+    // A poll that finds nothing submits the request, but it never evicts: the caller walks
+    // its whole demand list, so evicting here would replace the work in flight with the far
+    // end of that list and throw away every result the workers had just finished.
     if (_entries.size() < 32) {
         _entries.emplace(request.key, Entry{request, std::move(source), {}, ++_token});
-        _wake.notify_one();
+        _wake.notify_all();
     }
     return false;
 }
@@ -182,6 +227,7 @@ void Terrain3DPagePipeline::run() {
             next->running = true; job = *next;
         }
         if (job.request.svt && (_signature_source != job.source || _signature_materials != job.request.materials || _signature_density != job.request.density)) {
+            std::lock_guard<std::mutex> cache_lock(_cache_mutex);
             _signature_source = job.source; _signature_materials = job.request.materials; _signature_density = job.request.density; _signatures.clear();
         }
         std::call_once(job.source->bounds_once, [&]() {
@@ -209,12 +255,19 @@ void Terrain3DPagePipeline::run() {
             }
             job.source->bounds_ready.store(true, std::memory_order_release);
         });
+        const uint64_t produce_start = Time::get_singleton()->get_ticks_usec();
         Result result = produce(job.request, *job.source);
+        _produced_usec.fetch_add(Time::get_singleton()->get_ticks_usec() - produce_start, std::memory_order_relaxed);
+        _produced_pages.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(_mutex);
             auto it = _entries.find(job.request.key);
             if (it != _entries.end() && it->second.token == job.token) { it->second.result = std::move(result); it->second.ready = true; }
         }
+        // Waking the other workers here is what keeps them busy: the notify below is
+        // cheap, and without it a page that finished while another worker slept would
+        // wait for the next demand pass to be picked up.
+        _wake.notify_all();
     }
 }
 Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &request, const Snapshot &source) {
@@ -328,28 +381,37 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
         const Vector2i location(entry.first.first, entry.first.second);
         const Rect2 rect(Vector2(location) * world, Vector2(world, world));
         if (!rect.intersects(footprint)) { continue; }
-        auto cached_signature = _signatures.find(entry.first);
-        if (cached_signature == _signatures.end()) {
-            // The same signature the baker wrote; see terrain_vt_cell.h.
-            const uint32_t hash = TerrainVTCell::signature(int64_t(request.materials), request.density,
-                    source.spacing, source.region_size, [&](int x, int y) {
-                        auto neighbor = source.cells.find({location.x + x, location.y + y});
-                        if (neighbor == source.cells.end()) { return Array(); }
-                        const Cell &cell = neighbor->second;
-                        Array hashes;
-                        hashes.push_back(cell.controls.is_empty() ? 0 : Variant(cell.controls).hash());
-                        hashes.push_back(cell.ids.is_empty() ? 0 : Variant(cell.ids).hash());
-                        hashes.push_back(cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
-                        return hashes;
-                    });
-            cached_signature = _signatures.emplace(entry.first, hash).first;
+        uint32_t hash = 0;
+        {
+            std::lock_guard<std::mutex> cache_lock(_cache_mutex);
+            auto cached_signature = _signatures.find(entry.first);
+            if (cached_signature == _signatures.end()) {
+                // The same signature the baker wrote; see terrain_vt_cell.h. Computed
+                // under the lock: it reads the shared signature map, not source bytes.
+                const uint32_t computed = TerrainVTCell::signature(int64_t(request.materials), request.density,
+                        source.spacing, source.region_size, [&](int x, int y) {
+                            auto neighbor = source.cells.find({location.x + x, location.y + y});
+                            if (neighbor == source.cells.end()) { return Array(); }
+                            const Cell &cell = neighbor->second;
+                            Array hashes;
+                            hashes.push_back(cell.controls.is_empty() ? 0 : Variant(cell.controls).hash());
+                            hashes.push_back(cell.ids.is_empty() ? 0 : Variant(cell.ids).hash());
+                            hashes.push_back(cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
+                            return hashes;
+                        });
+                cached_signature = _signatures.emplace(entry.first, computed).first;
+            }
+            hash = cached_signature->second;
         }
-        const uint32_t hash = cached_signature->second;
         const String path = TerrainVTCell::path(request.directory, location, 0);
         const String cache_key = path + String(":") + String::num_int64(hash) + String(":") + String::num_int64(requested_mip);
         Dictionary channels;
-        if (_cell_cache.has(cache_key)) { channels = _cell_cache[cache_key]; }
-        else {
+        bool cached = false;
+        {
+            std::lock_guard<std::mutex> cache_lock(_cache_mutex);
+            if (_cell_cache.has(cache_key)) { channels = _cell_cache[cache_key]; cached = true; }
+        }
+        if (!cached) {
             Ref<FileAccess> file;
             if (FileAccess::file_exists(path)) { file = FileAccess::open(path, FileAccess::READ); }
             const Variant header = file.is_valid() ? file->get_var(false) : Variant();
@@ -370,9 +432,14 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
                 channels[names[c]] = Image::create_from_data(size, size, false, Image::FORMAT_RGBAH, bytes);
             }
             if (!valid) { result.missing.push_back(location); continue; }
+            // The decode above deliberately runs outside the lock: it is file I/O and a
+            // zstd decompress, which would serialize every worker behind one page.
             const uint64_t bytes = uint64_t(size) * size * 24;
-            if (_cache_bytes + bytes > 256 * 1024 * 1024 || _cell_cache.size() >= 64) { _cell_cache.clear(); _cache_bytes = 0; }
-            _cell_cache[cache_key] = channels; _cache_bytes += bytes;
+            std::lock_guard<std::mutex> cache_lock(_cache_mutex);
+            if (!_cell_cache.has(cache_key)) {
+                if (_cache_bytes + bytes > 256 * 1024 * 1024 || _cell_cache.size() >= 64) { _cell_cache.clear(); _cache_bytes = 0; }
+                _cell_cache[cache_key] = channels; _cache_bytes += bytes;
+            }
         }
         Dictionary piece; piece["cell_rect"] = rect;
         // Texture filtering at the outer terrain boundary needs edge texels in

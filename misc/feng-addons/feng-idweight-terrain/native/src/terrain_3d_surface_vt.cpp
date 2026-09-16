@@ -147,6 +147,33 @@ void Terrain3D::set_vt_page_count(int p_count) {
 void Terrain3D::set_vt_pages_per_update(int p_pages) {
 	_vt.vt_pages_per_update = CLAMP(p_pages, 1, 16);
 }
+// A pipeline owns its threads, so a changed worker count is applied by dropping the
+// pipelines: every entry in them is in flight work the demand pass re-requests anyway,
+// and the alternative - resizing a pool of threads under a running page job - is worse.
+void Terrain3D::set_vt_page_workers(int p_workers) {
+	p_workers = CLAMP(p_workers, 0, 16);
+	if (_vt.vt_page_workers == p_workers) {
+		return;
+	}
+	_vt.vt_page_workers = p_workers;
+	_vt.vt_page_pipeline.reset();
+	_vt.svt_page_pipeline.reset();
+	_vt.svt_pending_pages.clear();
+	_vt.avt_plan_key.clear();
+	_vt.avt_refinement.reset();
+}
+void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
+	if (!std::isfinite(p_lead)) {
+		return;
+	}
+	_vt.vt_motion_lead_ms = CLAMP(real_t(p_lead), real_t(0), real_t(1000));
+	if (_vt.vt_motion_lead_ms <= 0.f) {
+		_vt.avt_motion_velocity = Vector2();
+		_vt.avt_motion_lead = Vector2();
+	}
+	// A lead is part of the plan key, so a change has to be planned again.
+	_vt.avt_plan_key.clear();
+}
 
 void Terrain3D::_cancel_svt_bake(const String &p_reason) {
 	_vt.svt_cell_job.clear();
@@ -365,6 +392,39 @@ bool Terrain3D::_vt_has_pending_upload() const {
 			(_vt.surface_svt && _vt.surface_svt->has_pending_indirection());
 }
 
+// A frame is what runs page production: the producers are called from the render pass, and the
+// editor only renders when something has changed. Render work queued in the baker marks that
+// change by itself, but a demand that is waiting on a source job, on a free slot, or on the
+// page budget has nothing to show for itself - so the editor used to sleep with the miss still
+// on screen and only wake for camera input, which is exactly the report that pages do not fill
+// in again until the view is moved. Any page a view still owes keeps the editor drawing.
+bool Terrain3D::_vt_has_streaming_work() const {
+	if (_vt_has_pending_upload()) {
+		return true;
+	}
+	if (_vt.vt_baker.is_valid()) {
+		const Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
+		if (producer && (producer->has_render_work() || producer->materials_stale())) {
+			return true;
+		}
+	}
+	if (!_vt.avt_page_plan.empty() && (_vt.avt_missing_pages > 0 || _vt.avt_pending_pages > 0)) {
+		return true;
+	}
+	if (!_vt.svt_pending_pages.empty() || !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) {
+		return true;
+	}
+	if (_vt.vt_page_pipeline) {
+		int pages = 0, queued = 0;
+		int64_t usec = 0;
+		_vt.vt_page_pipeline->get_production_stats(pages, usec, queued);
+		if (queued > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void Terrain3D::_update_vt_service() {
 	if (!_vt.surface_svt_enabled) {
 		_cancel_svt_bake("SVT was disabled; the offline bake was cancelled.");
@@ -458,7 +518,7 @@ void Terrain3D::_update_vt_service() {
 	// In the editor's low-processor mode that otherwise leaves queued GPU pages
 	// waiting forever for camera input. Request a normal (non-blocking) redraw
 	// only while work is actually outstanding; never force_draw here.
-	if (IS_EDITOR && (producer->has_render_work() || _vt_has_pending_upload())) {
+	if (IS_EDITOR && _vt_has_streaming_work()) {
 		Control *editor = EditorInterface::get_singleton()->get_base_control();
 		if (editor) { editor->queue_redraw(); }
 	}
@@ -466,7 +526,7 @@ void Terrain3D::_update_vt_service() {
 
 void Terrain3D::_process_async_svt_pages() {
 	if (_vt.svt_pending_pages.empty() || !_data || _vt.vt_baker.is_null()) { return; }
-	if (!_vt.svt_page_pipeline) { _vt.svt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(); }
+	if (!_vt.svt_page_pipeline) { _vt.svt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(_vt.vt_page_workers); }
 	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
 	int submitted = 0;
 	for (auto it = _vt.svt_pending_pages.begin(); it != _vt.svt_pending_pages.end();) {
@@ -959,6 +1019,18 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["surface_vt_compression_ready_slots"] = int64_t(producer_stats.get("avt_ready_slots", 0));
 	result["surface_svt_compression_ready_slots"] = int64_t(producer_stats.get("svt_ready_slots", 0));
 	result["pages_per_update"] = _vt.vt_pages_per_update;
+	// Page production and look-ahead: how many source threads assemble pages, what the
+	// last plan was aimed at, and the two readings that tell a page still inside its
+	// production window from one the image being rendered is missing.
+	result["page_workers"] = _vt.vt_page_workers > 0
+			? _vt.vt_page_workers
+			: (_vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count() : Terrain3DPagePipeline::default_worker_count());
+	result["motion_lead_ms"] = _vt.vt_motion_lead_ms;
+	result["motion_lead_m"] = _vt.avt_motion_lead.length();
+	result["motion_speed"] = _vt.avt_motion_velocity.length();
+	result["visible_late_pages"] = _vt.avt_late_pages;
+	result["visible_late_worst_ms"] = double(_vt.avt_late_worst_us) / 1000.0;
+	result["visible_retained_pages"] = _vt.avt_retained_pages;
 	result["shared_pool"] = _vt.vt_shared_ready;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
@@ -1418,6 +1490,8 @@ void Terrain3D::_bind_vt_methods() {
 	VT_BIND_SETTING(vt_auto_capacity);
 	VT_BIND_SETTING(vt_pages_per_update);
 	VT_BIND_SETTING(vt_frame_budget_ms);
+	VT_BIND_SETTING(vt_page_workers);
+	VT_BIND_SETTING(vt_motion_lead_ms);
 	VT_BIND_SETTING(svt_feedback);
 #undef VT_BIND_SETTING
 	ClassDB::bind_method(D_METHOD("set_avt_feedback", "enabled"), &Terrain3D::set_avt_feedback);

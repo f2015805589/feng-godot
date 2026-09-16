@@ -209,6 +209,9 @@ private:
 	// the editor's own redraw request, since render-thread work only progresses
 	// while frames are drawn.
 	bool _vt_has_pending_upload() const;
+	// Whether a view still owes a page: render work queued, demand waiting on a source job
+	// or a free slot, or a far-field job outstanding.
+	bool _vt_has_streaming_work() const;
 	void _destroy_vt_service();
 	void _configure_vt_service();
 	// Publishes the address directory of a finished hierarchy, and republishes the
@@ -261,6 +264,9 @@ private:
 	int64_t _monitor_material_bytes() const;
 	int64_t _monitor_pages_ready() const;
 	int64_t _monitor_pages_pending() const;
+	// Pages the image being rendered samples with no content. With the motion lead on
+	// this is the reading that says whether the view is streaming in.
+	int64_t _monitor_pages_late() const { return _vt.avt_late_pages; }
 	void _cancel_svt_bake(const String &p_reason);
 	void _destroy_surface_vt();
 	// One demand pass: registers sectors for the regions near the target, picks a mip
@@ -328,6 +334,10 @@ public:
 	int get_vt_page_count() const { return _vt.vt_page_count; }
 	void set_vt_pages_per_update(int p_pages);
 	int get_vt_pages_per_update() const { return _vt.vt_pages_per_update; }
+	void set_vt_page_workers(int p_workers);
+	int get_vt_page_workers() const { return _vt.vt_page_workers; }
+	void set_vt_motion_lead_ms(real_t p_lead);
+	real_t get_vt_motion_lead_ms() const { return _vt.vt_motion_lead_ms; }
 	void set_avt_feedback(bool p_enabled);
 	bool get_avt_feedback() const { return _vt.avt_feedback; }
 	void set_svt_feedback(bool p_enabled);
@@ -419,6 +429,11 @@ public:
 	void set_surface_vt_selection_mode(int p_mode);
 	int get_surface_vt_selection_mode() const { return _vt.surface_vt_selection_mode; }
 	bool is_sector_avt() const { return _vt.surface_vt_selection_mode == 2 && !_vt.vt_debug_direct_material; }
+	// Motion look-ahead: smooths the camera's velocity and returns the transform the demand
+	// pass plans for. See Terrain3DVTState::vt_motion_lead_ms.
+	void _vt_update_motion_lead();
+	Transform3D _vt_lead_camera_transform(const Transform3D &p_camera_transform) const;
+	Transform3D _vt_plan_key_transform(const Transform3D &p_camera_transform) const;
 	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }
 	int get_avt_directory_mask() const { return _vt.avt_directory_mask; }
 	int get_avt_root_level() const { return _vt.avt_root_level; }

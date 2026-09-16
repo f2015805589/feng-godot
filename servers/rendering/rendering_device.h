@@ -465,6 +465,17 @@ public:
 	RID texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps = 1);
 	RID texture_create_shared_from_slice(const TextureView &p_view, RID p_with_texture, uint32_t p_layer, uint32_t p_mipmap, uint32_t p_mipmaps = 1, TextureSliceType p_slice_type = TEXTURE_SLICE_2D, uint32_t p_layers = 0);
 	Error texture_update(RID p_texture, uint32_t p_layer, const Vector<uint8_t> &p_data);
+	// Fork-local, see docs/engine_patch_surface.md. Copies a texture region straight from a
+	// device buffer, so content a compute pass produced reaches the texture it is sampled from
+	// without travelling through the CPU. `p_row_pitch` is the byte pitch of one source row and
+	// `p_region` is in texels (block aligned for block compressed destinations); the source
+	// buffer has to satisfy the driver's copy alignment (256 byte rows, 512 byte offsets on
+	// D3D12). The copy is recorded in the submission the writes before it were recorded in, so
+	// the destination is readable on the frame the copy is recorded - which is what lets a
+	// producer publish a page as resident the moment it stores it. The destination texture
+	// needs TEXTURE_USAGE_CAN_COPY_TO_BIT or TEXTURE_USAGE_CAN_UPDATE_BIT (on Vulkan both map to
+	// VK_IMAGE_USAGE_TRANSFER_DST_BIT, and D3D12 needs no resource flag to be a copy target).
+	Error texture_copy_from_buffer(RID p_texture, RID p_buffer, uint64_t p_buffer_offset, uint32_t p_row_pitch, uint32_t p_layer, uint32_t p_mipmap, const Rect2i &p_region);
 	Vector<uint8_t> texture_get_data(RID p_texture, uint32_t p_layer); // CPU textures will return immediately, while GPU textures will most likely force a flush
 	Error texture_get_data_async(RID p_texture, uint32_t p_layer, const Callable &p_callback);
 

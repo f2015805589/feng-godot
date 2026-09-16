@@ -44,11 +44,17 @@ bool Terrain3D::_vt_page_production_stale(int p_slot) {
 int Terrain3D::_update_visible_svt(int p_max_pages) {
 	Camera3D *camera = get_camera();
 	if (!camera || !camera->is_inside_tree()) { return 0; }
-	TerrainVT::VisibleView view(camera, 48.f);
+	// The far field plans for the predicted camera as well: its pages are assembled from
+	// cells, so a page demanded the moment its footprint enters the frustum is late by a
+	// bake plus a read as well.
+	const Transform3D lead_transform = _vt_lead_camera_transform(camera->get_camera_transform());
+	const float viewport_height = camera->get_viewport() ? camera->get_viewport()->get_visible_rect().size.y : 720.f;
+	TerrainVT::VisibleView view(lead_transform, camera->get_camera_projection(), viewport_height,
+			camera->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, 48.f);
 	struct Region { Rect2 rect; Vector2 heights; float distance; float farthest; TerrainVT::VisiblePatch visible; };
 	struct Page { Vector2i address; int mip; float distance; };
 	std::vector<Region> regions;
-	const Vector3 camera_position = camera->get_global_position();
+	const Vector3 camera_position = lead_transform.origin;
 	const Vector2 focus(camera_position.x, camera_position.z);
 	auto avt_interior = [&](const Rect2 &rect) {
 		Vector2 farthest(MAX(Math::abs(rect.position.x - focus.x), Math::abs(rect.get_end().x - focus.x)),
@@ -132,6 +138,10 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
 	});
 
+	// The near field's share of the request is its *sampled* pages: the apron is sized by the
+	// leftover budget, so counting it would make the capacity follow the budget that the
+	// capacity itself allows. No floor of one either - a request of zero pages must not ask for
+	// a minimum block of slots on every empty plan.
 	if (_ensure_vt_capacity(int(pages.size()) + (_vt.surface_vt_enabled ? int(_vt.avt_page_plan.size()) : 0))) { return 0; }
 
 	// The physical pool is shared with the near field, so the far field only claims what

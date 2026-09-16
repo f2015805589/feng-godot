@@ -29,17 +29,22 @@ struct VisibleView {
 	bool orthographic = false;
 	// A view can also be built later, e.g. as a member of a plan input struct.
 	VisibleView() = default;
-	explicit VisibleView(Camera3D *camera, float guard_pixels = 0.f) {
-		const Transform3D camera_transform = camera->get_camera_transform();
-		const auto frustum = camera->get_camera_projection().get_projection_planes(camera_transform);
+	explicit VisibleView(Camera3D *camera, float guard_pixels = 0.f) :
+			VisibleView(camera->get_camera_transform(), camera->get_camera_projection(),
+					camera->get_viewport() ? camera->get_viewport()->get_visible_rect().size.y : 720.f,
+					camera->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, guard_pixels) {}
+	// The same view at a predicted transform. Demand plans for where the camera is
+	// going, so it needs a frustum that is not the one the engine is rendering with.
+	VisibleView(const Transform3D &p_camera_transform, const Projection &p_projection,
+			float p_viewport_height, bool p_orthographic, float guard_pixels = 0.f) {
+		const auto frustum = p_projection.get_projection_planes(p_camera_transform);
 		for (int i = 0; i < frustum.size(); ++i) { planes.push_back(frustum[i]); }
-		eye = camera_transform.origin;
-		forward = -camera_transform.basis.get_column(2).normalized();
-		right = camera_transform.basis.get_column(0).normalized();
-		up = camera_transform.basis.get_column(1).normalized();
-		orthographic = camera->get_projection() == Camera3D::PROJECTION_ORTHOGONAL;
-		const float height = camera->get_viewport() ? camera->get_viewport()->get_visible_rect().size.y : 720.f;
-		focal = MAX(1.f, height) * Math::abs(camera->get_camera_projection()[1].y) * 0.5f;
+		eye = p_camera_transform.origin;
+		forward = -p_camera_transform.basis.get_column(2).normalized();
+		right = p_camera_transform.basis.get_column(0).normalized();
+		up = p_camera_transform.basis.get_column(1).normalized();
+		orthographic = p_orthographic;
+		focal = MAX(1.f, p_viewport_height) * Math::abs(p_projection[1].y) * 0.5f;
 		// Request just outside the rendered frustum so a moving edge does not
 		// expose pages before asynchronous production can complete.
 		if (guard_pixels > 0.f) {

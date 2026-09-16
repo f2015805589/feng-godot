@@ -165,6 +165,13 @@ private:
 	// sampled layers were uploaded, not merely after the writable staging page finished.
 	std::vector<uint8_t> _ready;
 	std::vector<uint8_t> _sampled_channel_mask;
+	// Frame each page's content was produced in, and how long the compressed ones then waited
+	// for their encoded layers. This is the number that says whether an encode is stored in the
+	// frame it was produced in or a few frames later, so it stays a permanent statistic.
+	std::vector<uint64_t> _produced_frame;
+	uint64_t _ready_latency_sum = 0;
+	uint64_t _ready_latency_max = 0;
+	uint64_t _ready_latency_samples = 0;
 	std::vector<uint64_t> _slot_sequence;
 
 	// These fields are touched by the render callback only, except for the output RS
