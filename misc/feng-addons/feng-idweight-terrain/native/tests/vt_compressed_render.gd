@@ -91,6 +91,10 @@ func patch_stats(image: Image, world: Vector2, radius: int = 18) -> Dictionary:
 	var magenta := 0
 	var total := 0
 	var luminance := 0.0
+	# Per channel as well as luminance: a luminance-only comparison cannot see a colour
+	# cast, which is exactly how a block codec that writes the wrong channel order, or a
+	# 565 endpoint pair that lands in the three-colour mode, can pass unnoticed.
+	var sums := Vector3.ZERO
 	for y in range(center.y - radius, center.y + radius + 1):
 		for x in range(center.x - radius, center.x + radius + 1):
 			var pixel := image.get_pixel(clampi(x, 0, image.get_width() - 1), clampi(y, 0, image.get_height() - 1))
@@ -100,11 +104,13 @@ func patch_stats(image: Image, world: Vector2, radius: int = 18) -> Dictionary:
 			if pixel.r > 0.42 and pixel.b > 0.42 and pixel.g < 0.28:
 				magenta += 1
 			luminance += pixel.r * 0.2126 + pixel.g * 0.7152 + pixel.b * 0.0722
+			sums += Vector3(pixel.r, pixel.g, pixel.b)
 			total += 1
 	return {
 		"black": float(black) / float(total),
 		"magenta": float(magenta) / float(total),
 		"mean": luminance / float(total),
+		"rgb": sums / float(total),
 	}
 
 func producer_stats() -> Dictionary:
@@ -186,10 +192,20 @@ func compare_patch(baseline: Image, candidate: Image, world: Vector2, label: Str
 	var got := patch_stats(candidate, world)
 	var black_limit := maxf(0.04, float(expected["black"]) + 0.04)
 	var delta := absf(float(expected["mean"]) - float(got["mean"]))
-	print("VTCOMPRESS_RENDER_PATCH ", label, " baseline=", expected, " candidate=", got, " delta=%.4f" % delta)
+	var cast: Vector3 = got["rgb"] - expected["rgb"]
+	print("VTCOMPRESS_RENDER_PATCH ", label, " baseline=", expected, " candidate=", got, " delta=%.4f" % delta,
+			" cast=%.4f,%.4f,%.4f" % [cast.x, cast.y, cast.z])
 	require(float(got["black"]) <= black_limit, label + " became black with compression on")
 	require(float(got["magenta"]) < 0.02, label + " displayed missing-page diagnostics with compression on")
 	require(delta < 0.10, label + " changed too far from the array baseline (delta %.4f)" % delta)
+	# Per channel, so a codec that shifts the hue instead of the brightness cannot pass.
+	# The measured cast is a few thousandths - the codec's own error - so the limit is tight
+	# enough to catch the failure this exists for: a colour channel that the codec could not
+	# represent at all used to land forty-seven thousandths away, and a luminance-only
+	# comparison of the same frames saw a tenth of that.
+	var cast_limit := 0.02
+	require(absf(cast.x) < cast_limit and absf(cast.y) < cast_limit and absf(cast.z) < cast_limit,
+			"%s shifted colour by %.4f,%.4f,%.4f with compression on" % [label, cast.x, cast.y, cast.z])
 
 func run() -> void:
 	var args := OS.get_cmdline_user_args()

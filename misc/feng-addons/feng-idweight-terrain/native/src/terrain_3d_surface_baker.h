@@ -234,7 +234,14 @@ private:
 		int requested = 0;
 		std::atomic<int> effective{ 0 };
 		std::atomic<int> applied{ 0 };
+		// The codec's linear renderer format. The normal and parameter pages hold linear
+		// data - a direction, a ratio, a height - so they are stored in it.
 		std::atomic<RenderingDevice::DataFormat> format{ RenderingDevice::DATA_FORMAT_MAX };
+		// The codec's sRGB renderer format, used by the albedo page alone, which is a colour:
+		// the encoder writes the sRGB encoding of the linear staging value and the hardware
+		// decodes it back on sampling, so the codec's quantisation is spent in the space it
+		// was designed for instead of on linear values whose darks fall below its first step.
+		std::atomic<RenderingDevice::DataFormat> format_srgb{ RenderingDevice::DATA_FORMAT_MAX };
 		godot::String reason;
 	};
 	TierState _tiers[TIER_COUNT];
@@ -478,6 +485,11 @@ public:
 	// belong to. Bind the material from this, never from the three getters above.
 	godot::Dictionary get_published_arrays() const;
 	bool is_page_ready(int p_slot) const;
+	// How many of these slots hold no content, read under one lock so a resident set can be
+	// verified without a lock per slot.
+	int count_unready_pages(const std::vector<int> &p_slots) const;
+	// One readiness flag per slot, in the order given, under the same single lock.
+	void query_page_readiness(const std::vector<int> &p_slots, std::vector<uint8_t> &r_ready) const;
 	// Diagnostic and test hook: drops one page's readiness and nothing else. The slot keeps
 	// its sequence, its tier and whatever its published indirection entry names, which is
 	// exactly the state a failed encode or a production dropped by a bundle rebuild leaves

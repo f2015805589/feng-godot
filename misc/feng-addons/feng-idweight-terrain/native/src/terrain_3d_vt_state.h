@@ -202,6 +202,19 @@ struct Terrain3DVTState {
 	int avt_retained_pages = 0;
 	PackedByteArray avt_plan_key;
 	uint64_t avt_idle_revision = 0;
+	// Set by the near field when this tick's demand pass found its plan settled and every
+	// resident page still holding content. The tick's top-up then has nothing to ask that the
+	// pass did not already answer, so it is skipped while the residency is still the one the
+	// answer was given against.
+	bool avt_idle_tick = false;
+	// Whether the last plan was installed from cache. A plain member rather than a lookup in
+	// the statistics dictionary, which the settled path reads every tick.
+	bool avt_plan_reused = false;
+	// True while the statistics dictionary already describes the current idle run. The
+	// values an idle pass publishes are constants of the settled state, so a run of idle
+	// ticks writes them once - the dictionary is String keyed, and republishing the same
+	// numbers is the largest thing left on a settled tick.
+	bool avt_idle_stats_current = false;
 	std::vector<int> avt_resident_slots;
 	size_t avt_prefetch_cursor = 0;
 	bool avt_prefetch_cycle_pending = false;
@@ -268,6 +281,11 @@ struct Terrain3DVTState {
 	// a baked far field at zero main-thread cost while the view is still.
 	uint64_t svt_root_key = 0;
 	bool svt_roots_settled = false;
+	// Scratch for the demand pass's verification, kept here so a settled tick does not
+	// allocate: the slots it has to ask the producer about, and the readiness the producer
+	// answers for all of them at once.
+	std::vector<int> svt_verify_slots;
+	std::vector<uint8_t> svt_verify_ready;
 	// Startup gate for the diagnostic shader. The far field uses the live source material
 	// until every protected root has sampled content, then switches atomically to strict SVT.
 	bool svt_startup_ready = false;

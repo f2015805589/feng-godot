@@ -477,6 +477,23 @@ uncompressed, which is what it resolved to while the settings still listed it.
 `vt_compression.gd` pins that list and the translation; a page codec this device refuses is
 reported with its reason.
 
+**A page's colour is stored in sRGB.** The albedo array is the codec's sRGB format and the encoder
+writes the sRGB encoding of the staging texel for that channel (the normal and parameter pages stay
+linear — they are not colours). Both colour channels of a BC1/BC3 endpoint are five bits wide, so in
+linear space they step by `8/255` and a channel below that has no representation other than zero:
+the linear value of an authored dark colour is its sRGB value raised to roughly 2.2, so a blue
+authored at `0.04` is `0.003` linear and collapsed to black. BC3 pages therefore changed hue — the
+blue channel of the test's patch moved by `0.047`, the whole of it — while BC7 only lost `0.013`.
+The renderer samples an array through its sRGB view only when the shader uniform carries the
+`source_color` hint, so `_surface_material_albedo` and `_surface_svt_material_albedo` are declared
+with it; a tier left uncompressed is bound the RGBA16F staging array, which has no sRGB twin, so the
+hint costs nothing there. `vt_compressed_render.gd` now compares the rendered patch **per channel**
+and fails above `0.02` — a luminance-only comparison saw a seventh of the blue error and passed it.
+
+`vt_codec_colors.gd` is the storage-level companion: it reads a page back out of the arrays and
+decodes it, so a codec that writes the wrong channel order is visible per texel without a renderer
+in the way. It runs in seconds and needs no screenshots.
+
 The ring depth is derived from the page budget, not fixed: a page holds its regions until its
 readbacks land, about two frames later, so the ring admits `page_budget × 2` (8 to 64, bounded by
 a byte ceiling and by half the slot count). With the earlier fixed depth of eight under a sixteen
@@ -490,10 +507,48 @@ after the frame's draw graph was ended and immediately before the next one begin
 issued from there was recorded into the finished graph and discarded — every upload reported
 success while the arrays stayed empty and the whole viewport showed the missing-page diagnostic.
 The test renders real material through BC7 and BC3 in both tiers (patch means within 0.01 of the
-uncompressed frame, no magenta), measures that one demand pass hands the producer the same number
-of pages with and without compression, and asserts that a settled far field stops encoding: with
-the view still, `encode_requests`, `ready_pages` and `svt_requeues` must not move, so a produced
-far-field page is compressed exactly once.
+uncompressed frame and every channel within 0.02, no magenta), measures that one demand pass hands
+the producer the same number of pages with and without compression, and asserts that a settled far
+field stops encoding: with the view still, `encode_requests`, `ready_pages` and `svt_requeues` must
+not move, so a produced far-field page is compressed exactly once.
+
+## What a settled view costs
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_idle_cost_runner.py --driver vulkan
+```
+
+Every other VT test measures a moving camera, so the cost it reports is production. This one holds
+the camera still for 400 ticks until both tiers have produced everything in view, then measures the
+next 150 and asserts the phases: the near field, the far field, the top-up and the whole section. It
+requires that a settled tick produces nothing (`produced == 0`), that all 150 are recognised as
+idle, and that each phase stays under a stated mean budget.
+
+The three costs it exists for, all of which were paid per page on every still tick:
+
+* **The top-up repeated the near field's whole idle pass.** `_produce_sector_avt_pages()` runs twice
+  per tick — the near field's share, then the top-up with the budget the far field did not use — and
+  its idle gate does not read the budget, so the second call re-walked every resident slot, wrote
+  the same statistics and took its own `Time` call to reach the same "nothing to do". The near field
+  now records that verdict and the top-up skips while the pool's residency is still the one behind
+  it. Measured: 0.0004 ms per settled tick, against 0.021 ms for the near field that produced it.
+* **Readiness was asked one page at a time.** The near field verifies every resident page before it
+  calls itself settled, and the far field verifies its protected roots and its chosen detail set;
+  each of those asked the producer per slot, which is a mutex per page. Both now ask once for the
+  whole set (`count_unready_pages()` / `query_page_readiness()`). The far field's detail loop keeps
+  requesting and acting page by page — batching its verification was tried and reverted, because the
+  allocator can hand out the slot an earlier request evicted.
+* **An idle pass republished constant statistics.** The values a settled pass publishes (nothing
+  produced, nothing missing, nothing late) are constants of the settled state, and a String-keyed
+  dictionary write per value per frame is the largest thing a still view had left. A run of idle
+  ticks now publishes them once.
+
+Measured with 99 resident near pages and 20 protected far roots: near field 0.021 ms, far field
+0.038 ms, top-up 0.0004 ms, service 0.008 ms, whole section 0.069 ms per tick. The budgets are
+means (`0.05` / `0.08` / `0.005` / `0.15` ms) rather than peaks, because a peak on this machine
+carries engine noise. The per-slot form of the near-field loop was measured against the batched one
+at 0.0233 against 0.0214 ms, so on a small resident set that batch is a shape fix rather than a
+large win — the top-up and the far field are what move the number.
 
 Root pages and detail pages are still assembled on the GPU: a baked cell is a device-to-device
 copy. A tier left uncompressed samples the staging arrays directly and costs nothing extra; a

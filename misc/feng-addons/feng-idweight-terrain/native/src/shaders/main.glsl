@@ -102,14 +102,21 @@ uniform vec2 _surface_vt_blocks[MAX_REGIONS];
 uniform float _surface_vt_block_sizes[MAX_REGIONS];
 uniform bool _surface_material_enabled = false;
 uniform bool _surface_material_required = false;
-uniform highp sampler2DArray _surface_material_albedo : filter_linear, repeat_disable;
+// The albedo arrays are colour textures: a block codec cannot hold the darks of a linear
+// colour in five bits per channel, so the encoder stores the sRGB encoding of the page and
+// the array is the codec's sRGB format. `source_color` is what makes the renderer sample the
+// sRGB view of it, which is what turns those texels back into the linear colour the page was
+// produced from. Without it the same array is sampled through its linear view and every
+// compressed page renders brighter than the uncompressed one. The normal and parameter pages
+// stay linear - a direction and a ratio are not colours - so they carry no such hint.
+uniform highp sampler2DArray _surface_material_albedo : source_color, filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_normal : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_material_params : filter_linear, repeat_disable;
 // The far field's own set. AVT and SVT store the same shared page pool in independent
 // formats - an AVT page is rewritten by every edit, an SVT page is assembled once - so each
 // tier samples the arrays it was produced into. A tier left uncompressed is bound the
 // staging arrays, so these name the same textures as the three above in that case.
-uniform highp sampler2DArray _surface_svt_material_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_svt_material_albedo : source_color, filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_svt_material_normal : filter_linear, repeat_disable;
 uniform highp sampler2DArray _surface_svt_material_params : filter_linear, repeat_disable;
 #endif

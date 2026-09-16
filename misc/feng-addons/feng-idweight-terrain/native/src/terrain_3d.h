@@ -227,6 +227,9 @@ private:
 	// not hold it ready and no production for it is in flight. Demand re-produces such a page
 	// instead of treating its indirection entry as a hit.
 	bool _vt_page_production_stale(int p_slot);
+	// The same question with the producer's answer already known (-1 asks it here), so a
+	// verification pass over a whole resident set takes one lock instead of one per page.
+	bool _vt_page_production_stale(int p_slot, int p_ready);
 	String _svt_page_path(const Vector2i &p_address, int p_mip) const;
 	void _invalidate_vt_region(const Vector2i &p_region);
 	void _process_svt_auto_bake();

@@ -23,11 +23,21 @@ static const uint64_t SVT_PAGE_RETRY_FRAMES = 30;
 // retried it: that is the far field that loads on one run and not on the next. Demand asks
 // the producer, and only a page with content or with a recent production in flight is a hit.
 bool Terrain3D::_vt_page_production_stale(int p_slot) {
+	return _vt_page_production_stale(p_slot, -1);
+}
+
+bool Terrain3D::_vt_page_production_stale(int p_slot, int p_ready) {
 	if (p_slot < 0) {
 		return true;
 	}
-	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
-	if (producer && producer->is_page_ready(p_slot)) {
+	// A caller that has already asked the producer about a whole set passes that answer in,
+	// so a verification pass costs one lock instead of one per page. The retry window below
+	// is read from this side's records and needs no lock either way.
+	if (p_ready < 0) {
+		Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+		p_ready = (producer && producer->is_page_ready(p_slot)) ? 1 : 0;
+	}
+	if (p_ready != 0) {
 		return false;
 	}
 	if (_vt.vt_page_records.has(p_slot)) {
@@ -241,14 +251,34 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// same roots.
 	bool roots_cached = _vt.svt_roots_settled && _vt.svt_root_key == root_key;
 	if (roots_cached) {
+		// The roots are resolved first and verified in one batch: this loop runs on every
+		// settled tick, and asking the producer about each root individually is a lock per
+		// root.
+		std::vector<int> &slots = _vt.svt_verify_slots;
+		slots.clear();
 		for (const Vector3i &root : _vt.svt_root_pages) {
 			int virtual_x = 0;
 			int virtual_y = 0;
 			_vt.surface_svt->world_page_to_virtual(root.x, root.y, root.z, virtual_x, virtual_y);
 			const int slot = _vt.surface_svt->get_indirection_slot(virtual_x, virtual_y, root.z);
-			if (slot == int(Terrain3DVirtualTexture::INVALID_SLOT) || _vt_page_production_stale(slot)) {
+			if (slot == int(Terrain3DVirtualTexture::INVALID_SLOT)) {
 				roots_cached = false;
 				break;
+			}
+			slots.push_back(slot);
+		}
+		if (roots_cached) {
+			Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+			if (producer) {
+				producer->query_page_readiness(slots, _vt.svt_verify_ready);
+			} else {
+				_vt.svt_verify_ready.assign(slots.size(), uint8_t(0));
+			}
+			for (size_t i = 0; i < slots.size(); ++i) {
+				if (_vt_page_production_stale(slots[i], _vt.svt_verify_ready[i] != 0 ? 1 : 0)) {
+					roots_cached = false;
+					break;
+				}
 			}
 		}
 	}
@@ -382,6 +412,9 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		});
 	}
 
+	// Each page is requested and acted on before the next one is: `request_world_page_internal`
+	// can hand out the slot an earlier request just evicted, so a slot collected for a later
+	// batch would no longer be the page it was collected for.
 	int visited = 0;
 	for (const Page &request : chosen) {
 		if (visited >= detail_capacity) { break; }

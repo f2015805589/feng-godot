@@ -335,6 +335,9 @@ void Terrain3D::__physics_process(const double p_delta) {
 	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
 	int avt_produced = 0;
+	// Cleared per tick, so a top-up below can only be skipped on a tick whose own near-field
+	// pass reached the settled verdict.
+	_vt.avt_idle_tick = false;
 	traced("vt_avt", [&] {
 		if (_vt.surface_vt_enabled) {
 			avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
@@ -356,14 +359,26 @@ void Terrain3D::__physics_process(const double p_delta) {
 				_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
 			// The initial split lets SVT make progress, but unused SVT budget belongs
 			// to AVT again. Do not cap near-page throughput at eight forever.
-			const uint64_t started = Time::get_singleton()->get_ticks_usec();
-			const int extra = _produce_sector_avt_pages(vt_remaining);
-			vt_remaining -= extra;
-			_vt.avt_sector_stats["produced"] = avt_produced + extra;
-			// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
-			// planner itself took, and adding the top-up into it turned a per-tick duration
-			// into a counter that only ever grew, which is not a cost anyone can act on.
-			_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+			//
+			// The near field just answered this same question, and its answer was "settled":
+			// its plan was reused, every resident page was verified to still hold content,
+			// and the pool residency was the one it verified. The only thing that can have
+			// changed in between is the far field taking or releasing a slot, which is what
+			// the residency revision still matching rules out - so the walk, the per-page
+			// readiness checks and the statistics of a second empty pass are skipped.
+			const auto topup_pool = _vt.surface_vt->get_page_pool();
+			const bool settled = _vt.avt_idle_tick && topup_pool &&
+					_vt.avt_idle_revision == topup_pool->residency_revision;
+			if (!settled) {
+				const uint64_t started = Time::get_singleton()->get_ticks_usec();
+				const int extra = _produce_sector_avt_pages(vt_remaining);
+				vt_remaining -= extra;
+				_vt.avt_sector_stats["produced"] = avt_produced + extra;
+				// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
+				// planner itself took, and adding the top-up into it turned a per-tick duration
+				// into a counter that only ever grew, which is not a cost anyone can act on.
+				_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+			}
 		}
 	});
 	vt_phase(_vt.vt_topup_ms);

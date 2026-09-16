@@ -729,6 +729,17 @@ Uncompressed, BC7 and BC3 RGBA — which is the whole list the page settings off
   visibly late. `shaders/bc_encode.glsl` implements BC1/BC3/BC4/BC5/BC7, so a codec it has no
   encoder for (ETC2, EAC, ASTC, BC6H) has no producer at all. Combined with the alpha rule, the
   only codecs left are BC7 and BC3 RGBA.
+* **An sRGB colour format.** The albedo page is a colour and is stored in the codec's *sRGB*
+  format (`BC7_SRGB_BLOCK` / `BC3_SRGB_BLOCK`), while the normal and parameter pages — a
+  direction, a ratio, a height — stay in the codec's linear one. A two-endpoint block codec
+  spends its bits in whatever space it is handed, and its two colour channels are five bits wide,
+  so they step by `8/255`: a **linear** channel below `8/255` has no representation other than
+  zero. That is every dark but saturated colour, because the linear value of an authored colour is
+  its sRGB value raised to roughly 2.2 — a blue of `0.04` authored is `0.003` linear. Encoding
+  the linear value collapsed that channel to black and the page changed hue; the encoder therefore
+  writes the sRGB encoding of the staging texel and the array is an sRGB format, which the hardware
+  turns back into exactly the linear colour the uncompressed path samples. A codec with no sRGB
+  renderer format is refused with that reason, in the same place as the other two rules.
 
 The two lists are therefore separate, and deliberately so: the asset inspector's
 `texture_array_compression` covers everything the engine's *CPU* encoders apply to an authored
@@ -786,8 +797,21 @@ so the compressed arrays are separate sampling targets and a compute pass copies
   missing-page diagnostic. That path therefore only queues the words, and the render callback
   uploads them.
 
-**Readiness is not cleared while an encode is in flight.** That was the bug behind the stutter and
-the far field that loaded on one run and not the next: clearing `is_page_ready()` for the duration
+**The block words hold the sRGB encoding of a colour page.** `bc_load()` converts a texel with a
+`srgb = 1` flag in the dispatch's push constant — set for the albedo channel only, because the
+normal and parameter pages are not colours — and the albedo array is the codec's sRGB renderer
+format. The hardware's sRGB decode then hands the material the same linear value the uncompressed
+staging array holds, which is what makes a compressed page match its baseline instead of rendering
+brighter or shifting hue. The renderer only samples the sRGB *view* of an array when the shader
+uniform carries the `source_color` hint (`material_storage.cpp`: the sRGB view is selected per
+uniform, not per texture), so `_surface_material_albedo` and `_surface_svt_material_albedo` are
+declared with it. A tier left uncompressed is bound the RGBA16F staging array, which has no sRGB
+twin, so the hint changes nothing there. `native/tests/vt_compressed_render.gd` compares the
+rendered patch **per channel** and fails above 0.02: the failure this replaced moved the blue
+channel by 0.047 — the whole of it — while the luminance-only comparison the test used before saw
+0.007 and passed.
+
+**Readiness is not cleared while an encode is in flight.** That was the bug behind the stutter and the far field that loaded on one run and not the next: clearing `is_page_ready()` for the duration
 of a multi-frame CPU encode made `SVT_PAGE_RETRY_FRAMES` (30) elapse on a page whose encode was
 still running, so the demand pass produced it again, and again — an endless re-production and
 re-compression loop. A compressed page is now ready when its blocks arrive, and a failed encode is
@@ -815,6 +839,33 @@ per resident slot, on a loop that already touches every one of them.
 `native/tests/vt_recovery.gd` drives it: with the camera still it drops one produced page's
 readiness and requires the demand pass to bring it back (`debug_lose_vt_page_readiness()`, which
 leaves the address, the slot and the demand record untouched, exactly as a failed encode does).
+
+**A settled tick asks each producer once, not once per page.** Three things used to be paid per
+page on every tick of a still camera, and all three are now one read of the same state:
+
+* The near field's readiness verification is a single `count_unready_pages()` call that takes the
+  bake mutex once for the whole resident set, instead of `is_page_ready(slot)` per slot.
+* The far field verifies its protected roots and its chosen detail set the same way, through
+  `query_page_readiness()`: the addresses are resolved first, the producer answers for the whole set
+  under one lock, and only the pages that are actually stale are re-produced. The detail loop was
+  split into a request pass and an act pass so the verification can be batched without changing what
+  the allocator is asked for.
+* **The top-up is skipped when the near field already settled the tick.** `_produce_sector_avt_pages()`
+  runs twice per tick — once with the near field's share of the budget, once from the top-up with
+  whatever the far field did not use — and its idle gate does not depend on the budget it was given,
+  so the second call used to repeat the resident walk, the statistics and its `Time` call to reach
+  the same conclusion. The near field records that verdict (`avt_idle_tick`) and the top-up skips
+  while the pool's residency is still the one the verdict was given against; the far field taking or
+  releasing a slot in between bumps `residency_revision`, which reopens the top-up.
+* The statistics an idle pass publishes are constants of the settled state, so a run of idle ticks
+  writes them once (`avt_idle_stats_current`) instead of re-hashing the same String keys every frame.
+
+Measured on a settled view with 99 resident near pages and 20 protected far roots
+(`native/tests/vt_idle_cost.gd`, which asserts these): near field 0.021 ms, far field 0.038 ms,
+top-up 0.0004 ms, service 0.008 ms — 0.069 ms for the whole section per tick, against the
+per-phase budget the test states. The top-up is now three orders of magnitude below the phase that
+produced it, because it does nothing at all while the near field is settled; the phase is a
+`Time::get_singleton()` call around an empty branch.
 
 **The staging pool becomes a scratch ring when nothing samples it.** The three RGBA16F outputs
 and the R16/R32F sources are page sized only while a tier samples them by slot. Once *both* tiers

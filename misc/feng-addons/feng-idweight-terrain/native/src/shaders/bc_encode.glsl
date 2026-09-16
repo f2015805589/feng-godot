@@ -26,7 +26,7 @@ layout(push_constant, std430) uniform EncodePush {
 	// First word of this layer inside the bound output buffer. The buffer holds several
 	// layers of one page in flight at once, so the encoder is told where its own blocks go
 	// instead of being bound a buffer per layer.
-	uvec4 region; // x: first output word, yzw: reserved
+	uvec4 region; // x: first output word, y: 1 when the source is a colour and has to be encoded as sRGB
 } encode_push;
 
 // Interpolation weights of the four-bit BC7 index, in sixty-fourths.
@@ -45,13 +45,34 @@ int bc_error4(ivec4 p_left, ivec4 p_right) {
 			difference.z * difference.z + difference.w * difference.w;
 }
 
+// The sRGB transfer function, applied to a colour page before its blocks are fitted. The
+// albedo page is stored in the codec's sRGB format, so the hardware turns these texels back
+// into the linear values the staging array held and the material samples the same colour it
+// sampled before compression.
+//
+// Encoding the linear value directly is what a two-endpoint block cannot do: both colour
+// channels of a BC1 or BC3 endpoint are five bits wide, so they step by 8/255, and a linear
+// channel below 8/255 - which is every dark but saturated colour, because the linear value of
+// an authored colour is its sRGB value squared-ish - has no representation other than zero.
+// The channel then collapsed to black and the page changed hue. In sRGB space the same five
+// bits are spread perceptually, which is the space block codecs are designed around.
+vec3 bc_linear_to_srgb(vec3 p_color) {
+	const vec3 low = p_color * 12.92;
+	const vec3 high = 1.055 * pow(max(p_color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+	return mix(high, low, lessThan(p_color, vec3(0.0031308)));
+}
+
 // A page that is not a multiple of the block size still stores a whole number of blocks,
 // so the tail texels read the last real texel instead of out of bounds.
 ivec4 bc_load(ivec2 p_texel) {
 	const ivec2 size = ivec2(int(encode_push.params.x));
 	const ivec2 clamped = clamp(p_texel, ivec2(0), size - ivec2(1));
 	const vec4 value = texelFetch(encode_source, ivec3(clamped, int(encode_push.params.y)), 0);
-	return ivec4(round(clamp(value, vec4(0.0), vec4(1.0)) * 255.0));
+	vec3 color = clamp(value.rgb, vec3(0.0), vec3(1.0));
+	if (encode_push.region.y != 0u) {
+		color = bc_linear_to_srgb(color);
+	}
+	return ivec4(round(vec4(color, clamp(value.a, 0.0, 1.0)) * 255.0));
 }
 
 // Writes a field of up to thirty-two bits at a bit offset inside the four-word block.
@@ -74,7 +95,13 @@ ivec3 bc_unpack_565(uint p_value) {
 
 uint bc_pack_565(ivec3 p_color) {
 	const ivec3 clamped = clamp(p_color, ivec3(0), ivec3(255));
-	return (uint(clamped.x >> 3) << 11) | (uint(clamped.y >> 2) << 5) | uint(clamped.z >> 3);
+	// Round to the nearest endpoint rather than truncating: the five bit channels step by
+	// eight, so `>> 3` pulls every endpoint down by up to seven levels, which darkens and
+	// tints the whole block before its fit error is even considered.
+	const uint red = uint((clamped.x * 31 + 127) / 255);
+	const uint green = uint((clamped.y * 63 + 127) / 255);
+	const uint blue = uint((clamped.z * 31 + 127) / 255);
+	return (red << 11) | (green << 5) | blue;
 }
 
 // The eight-bit endpoints of a two-colour block: the block's own extremes, then one

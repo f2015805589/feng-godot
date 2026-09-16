@@ -51,25 +51,31 @@ struct AtlasCodec {
 	Image::ASTCFormat block;
 	uint32_t gpu_codec;
 	int block_words;
+	// The linear renderer format, used by the normal and parameter pages, and the sRGB one,
+	// used by the albedo page. DATA_FORMAT_MAX means the codec has no format of that kind;
+	// a codec that cannot store a colour in sRGB is refused as a page codec, because a
+	// block codec spends its bits in whatever space it is handed and linear darks fall below
+	// its first step.
 	RenderingDevice::DataFormat rd_format;
+	RenderingDevice::DataFormat rd_format_srgb;
 };
 const AtlasCodec ATLAS_CODECS[] = {
-	{"Uncompressed", Image::COMPRESS_MAX, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"BC7", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 4u, 4, RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK},
-	{"BC1 RGB", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, 0u, 2, RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK},
-	{"BC3 RGBA", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 1u, 4, RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK},
-	{"BC4 R", Image::COMPRESS_S3TC, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, 2u, 2, RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK},
-	{"BC5 RG", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, 3u, 4, RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK},
-	{"BC6H HDR RGB", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGB, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ETC1 RGB", Image::COMPRESS_ETC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ETC2 RGB", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ETC2 RGBA", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"EAC R11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"EAC RG11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ASTC 4x4 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ASTC 8x8 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ASTC 4x4 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
-	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
+	{"Uncompressed", Image::COMPRESS_MAX, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"BC7", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 4u, 4, RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK, RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK},
+	{"BC1 RGB", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, 0u, 2, RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK, RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK},
+	{"BC3 RGBA", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, 1u, 4, RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK, RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK},
+	{"BC4 R", Image::COMPRESS_S3TC, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, 2u, 2, RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK, RenderingDevice::DATA_FORMAT_MAX},
+	{"BC5 RG", Image::COMPRESS_S3TC, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, 3u, 4, RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK, RenderingDevice::DATA_FORMAT_MAX},
+	{"BC6H HDR RGB", Image::COMPRESS_BPTC, Image::USED_CHANNELS_RGB, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC1 RGB", Image::COMPRESS_ETC, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC2 RGB", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGB, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ETC2 RGBA", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"EAC R11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_R, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"EAC RG11", Image::COMPRESS_ETC2, Image::USED_CHANNELS_RG, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 4x4 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 8x8 RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, false, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 4x4 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_4x4, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
+	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX, RenderingDevice::DATA_FORMAT_MAX},
 };
 constexpr int ATLAS_CODEC_COUNT = int(sizeof(ATLAS_CODECS) / sizeof(AtlasCodec));
 
@@ -643,7 +649,9 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		SampledSet &set = next.sampled[tier];
 		const int mode = _tiers[tier].effective.load();
 		const RenderingDevice::DataFormat format = _tiers[tier].format.load();
-		if (mode == 0 || format == RenderingDevice::DATA_FORMAT_MAX) {
+		const RenderingDevice::DataFormat format_srgb = _tiers[tier].format_srgb.load();
+		if (mode == 0 || format == RenderingDevice::DATA_FORMAT_MAX ||
+				format_srgb == RenderingDevice::DATA_FORMAT_MAX) {
 			continue;
 		}
 		// Sampling, update, and readback. Copy-from is what lets a resident page be exported
@@ -653,7 +661,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		const uint64_t compressed_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 				RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
 				RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
-		set.albedo_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
+		set.albedo_rd = _create_texture(_rd, format_srgb, p_stored_size, p_page_count, compressed_usage);
 		set.normal_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
 		set.params_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
 		const String tier_name = tier == TIER_SVT ? String("SVT") : String("AVT");
@@ -676,6 +684,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			set = SampledSet();
 			_tiers[tier].effective.store(0);
 			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
 			LOG(WARN, "Could not wrap the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
 		} else {
 			// The capability probe only answers for a usage pair, not for this allocation
@@ -683,6 +692,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			// codec as unavailable instead of claiming a format the pages are not stored in.
 			_tiers[tier].effective.store(0);
 			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
 			LOG(WARN, "Could not allocate the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
 		}
 	}
@@ -764,6 +774,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			_tiers[tier].applied.store(0);
 			_tiers[tier].effective.store(0);
 			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
 			next.sampled[tier] = SampledSet();
 		}
 		_free_bundle(_rd, next);
@@ -926,6 +937,7 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 	const String tier_name = p_tier == TIER_SVT ? String("SVT") : String("AVT");
 	tier.effective = 0;
 	tier.format = RenderingDevice::DATA_FORMAT_MAX;
+	tier.format_srgb = RenderingDevice::DATA_FORMAT_MAX;
 	tier.reason = String();
 	if (tier.requested == 0) {
 		return;
@@ -950,15 +962,27 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 		tier.reason = String(codec.name) + " has no renderer format";
 		return;
 	}
+	const RenderingDevice::DataFormat format_srgb = codec.rd_format_srgb;
+	if (format_srgb == RenderingDevice::DATA_FORMAT_MAX) {
+		// A page's albedo is a colour and has to be stored in the codec's sRGB format: the
+		// encoder writes sRGB texels and the hardware decodes them, which is the only way a
+		// block codec's handful of bits per channel can hold the darks of a linear colour.
+		// Refusing here keeps that from silently degrading into a hue shift.
+		tier.reason = String(codec.name) + " has no sRGB renderer format for the albedo page";
+		return;
+	}
 	RenderingServer *server = RenderingServer::get_singleton();
 	RenderingDevice *rd = server ? server->get_rendering_device() : nullptr;
-	if (rd && !rd->texture_is_format_supported_for_usage(format,
-					  RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT)) {
+	if (rd && (!rd->texture_is_format_supported_for_usage(format,
+					   RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT) ||
+					 !rd->texture_is_format_supported_for_usage(format_srgb,
+							 RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT))) {
 		tier.reason = String(codec.name) + " cannot be sampled and updated on this rendering device";
 		return;
 	}
 	tier.effective = tier.requested;
 	tier.format = format;
+	tier.format_srgb = format_srgb;
 	LOG(DEBUG, "Surface page compression for ", tier_name, " resolved to ", codec.name);
 }
 
@@ -984,6 +1008,7 @@ Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) co
 	}
 	info["reason"] = reason;
 	info["rd_format"] = int(state.format.load());
+	info["rd_format_albedo"] = int(state.format_srgb.load());
 	return info;
 }
 
@@ -1319,7 +1344,10 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		for (int channel = 0; channel < ENCODE_CHANNELS && requested; ++channel) {
 			const int region = ring_page * ENCODE_CHANNELS + channel;
 			push.encode_u32(16, uint32_t(region * _encode_region_words));
-			push.encode_u32(20, 0u);
+			// The albedo array is the tier's sRGB one, so its words hold the sRGB encoding of
+			// the linear staging texels; the normal and parameter pages stay linear, and the
+			// alpha channel is linear in every codec.
+			push.encode_u32(20, channel == 0 ? 1u : 0u);
 			push.encode_u32(24, 0u);
 			push.encode_u32(28, 0u);
 			if (!_resources.encode_uniform[channel].is_valid()) {
@@ -2447,6 +2475,36 @@ bool Terrain3DSurfaceBaker::is_page_ready(int p_slot) const {
 	return p_slot >= 0 && p_slot < int(_ready.size()) && _ready[size_t(p_slot)] != 0;
 }
 
+// The idle gate of the near field asks about every resident slot on every tick, which is the
+// same question `is_page_ready` answers one slot at a time - and one lock per slot turns that
+// loop into the most expensive thing a settled view does. Answering the whole set under one
+// lock is the same read of the same array.
+int Terrain3DSurfaceBaker::count_unready_pages(const std::vector<int> &p_slots) const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	const int count = int(_ready.size());
+	int unready = 0;
+	for (const int slot : p_slots) {
+		if (slot < 0 || slot >= count || !_ready[size_t(slot)]) {
+			++unready;
+		}
+	}
+	return unready;
+}
+
+// The far field's version of the same read: it needs to know *which* slots are short of
+// content, not how many, and it verifies both its protected roots and its detail set on
+// every tick.
+void Terrain3DSurfaceBaker::query_page_readiness(const std::vector<int> &p_slots,
+		std::vector<uint8_t> &r_ready) const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	const int count = int(_ready.size());
+	r_ready.resize(p_slots.size());
+	for (size_t i = 0; i < p_slots.size(); ++i) {
+		const int slot = p_slots[i];
+		r_ready[i] = (slot >= 0 && slot < count && _ready[size_t(slot)]) ? uint8_t(1) : uint8_t(0);
+	}
+}
+
 Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	Dictionary result;
 	result["valid"] = false;
@@ -2460,6 +2518,7 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	uint64_t generation;
 	int tier = TIER_AVT;
 	bool scratch = false;
+	bool albedo_srgb = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		if (p_slot < 0 || p_slot >= int(_ready.size()) || !_ready[size_t(p_slot)]) {
@@ -2474,6 +2533,10 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 			albedo = _sampled_rs(tier, 0);
 			normal = _sampled_rs(tier, 1);
 			params = _sampled_rs(tier, 2);
+			// The albedo array is the tier's sRGB one, so the decode below has to undo the
+			// encoding the block words hold to hand back the linear texels the uncompressed
+			// staging array would have.
+			albedo_srgb = _tiers[tier].format_srgb.load() != RenderingDevice::DATA_FORMAT_MAX;
 		} else {
 			albedo = _resources.output_albedo_rs;
 			normal = _resources.output_normal_rs;
@@ -2499,6 +2562,16 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	for (Ref<Image> *image : { &albedo_image, &normal_image, &params_image }) {
 		if ((*image)->is_compressed() && (*image)->decompress() != OK) {
 			return result;
+		}
+	}
+	if (albedo_srgb) {
+		// The albedo array is an sRGB codec, so the bytes just decoded are the sRGB encoding
+		// of the page's colour. Undoing it here is the same conversion the hardware's sRGB
+		// decode applies when the material samples the array, which is what makes an exported
+		// page match both the rendered one and the uncompressed staging array it came from.
+		const Image::Format decoded_format = albedo_image->get_format();
+		if (decoded_format == Image::FORMAT_RGBA8 || decoded_format == Image::FORMAT_RGB8) {
+			albedo_image->srgb_to_linear();
 		}
 	}
 	result["albedo_height"] = albedo_image;

@@ -630,12 +630,17 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 	// Installing a completed plan must not insert an idle planning frame. Its
 	// requests remain active while the next camera view is submitted below.
 	if (p_same_plan || _vt.avt_refinement) {
-		_vt.avt_sector_stats["plan_reused"] = !installed;
+		_vt.avt_plan_reused = !installed;
+		_vt.avt_sector_stats["plan_reused"] = _vt.avt_plan_reused;
 		_vt.avt_sector_stats["directory_rebuilt"] = false;
 		const int produced = _produce_sector_avt_pages(p_max_pages);
 		_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - p_started) / 1000.0;
 		return produced;
 	}
+	// A plan that is not being reused leaves the settled verdict false, so a production pass
+	// reached from the caller's top-up cannot read this tick's absence of an install as an
+	// idle plan and skip work the new view needs.
+	_vt.avt_plan_reused = false;
 	return -1;
 }
 
@@ -992,22 +997,33 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	const Terrain3DSurfaceBaker *idle_producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
 	int idle_lost = 0;
 	if (idle_producer) {
-		for (int slot : _vt.avt_resident_slots) {
-			if (!idle_producer->is_page_ready(slot)) { ++idle_lost; }
-		}
+		// One lock for the whole resident set: the per-slot query is the same read, and this
+		// loop is the one a settled view runs on every tick.
+		idle_lost = idle_producer->count_unready_pages(_vt.avt_resident_slots);
 	}
-	if (bool(_vt.avt_sector_stats.get("plan_reused", false)) && _vt.avt_idle_revision == pool->residency_revision &&
+	if (_vt.avt_plan_reused && _vt.avt_idle_revision == pool->residency_revision &&
 			idle_lost == 0) {
 		for (int slot : _vt.avt_resident_slots) { pool->mark_demanded(slot); }
-		_vt.avt_sector_stats["produced"] = 0;
-		_vt.avt_sector_stats["prefetched"] = 0;
-		// An idle pass is only reached once the previous one produced nothing, the residency
-		// did not change, and every page above was verified to still have its content.
-		_vt.avt_sector_stats["visible_plan_pages"] = _vt.avt_sampled_pages;
-		_vt.avt_sector_stats["visible_missing_pages"] = 0;
-		_vt.avt_sector_stats["visible_pending_pages"] = 0;
-		_vt.avt_sector_stats["visible_late_pages"] = 0;
-		_vt.avt_sector_stats["idle_ready_lost"] = 0;
+		// The tick's top-up asks the near field the same question a second time, with the
+		// budget the far field did not use. Recording that this pass already answered it lets
+		// the top-up skip its own copy of the walk; the revision it was answered against is
+		// the condition under which that answer is still the right one.
+		_vt.avt_idle_tick = true;
+		// Only the first tick of an idle run publishes: every value below is a constant of
+		// the settled state, and rewriting the same numbers into a String-keyed dictionary
+		// every frame is the largest cost a settled view has left.
+		if (!_vt.avt_idle_stats_current) {
+			_vt.avt_idle_stats_current = true;
+			_vt.avt_sector_stats["produced"] = 0;
+			_vt.avt_sector_stats["prefetched"] = 0;
+			// An idle pass is only reached once the previous one produced nothing, the residency
+			// did not change, and every page above was verified to still have its content.
+			_vt.avt_sector_stats["visible_plan_pages"] = _vt.avt_sampled_pages;
+			_vt.avt_sector_stats["visible_missing_pages"] = 0;
+			_vt.avt_sector_stats["visible_pending_pages"] = 0;
+			_vt.avt_sector_stats["visible_late_pages"] = 0;
+			_vt.avt_sector_stats["idle_ready_lost"] = 0;
+		}
 		_vt.avt_late_pages = 0;
 		_vt.avt_missing_pages = 0;
 		_vt.avt_pending_pages = 0;
@@ -1017,7 +1033,9 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// A page the cached state would have called resident is not ready, so this pass runs the
 	// real classification and reports what it finds instead of claiming a complete plan. The
 	// reading is what tells a lost page under a still camera from a settled view.
+	_vt.avt_idle_stats_current = false;
 	_vt.avt_sector_stats["idle_ready_lost"] = idle_lost;
+	_vt.avt_idle_tick = false;
 	_vt.avt_idle_revision = 0;
 	_vt.avt_resident_slots.clear();
 	_vt.surface_vt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
@@ -1092,6 +1110,17 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 	// whenever the view settles, and by a hard cap if a pathological plan keeps churning.
 	if (r_pass.sampled_missing == 0 && r_pass.sampled_pending == 0) { _vt.avt_demand_age.clear(); }
 	else if (_vt.avt_demand_age.size() > 8192) { _vt.avt_demand_age.clear(); }
+	// Coarse pages first, which is what makes a moving view refine instead of jump. A page's
+	// level is what the fragment falls back to while its finer replacement is produced, so
+	// producing the coarsest missing page of a region before the pages that refine it turns a
+	// view's appearance into a progression: the budget buys the levels in order, and the last
+	// thing to arrive is the detail, not a sharp patch beside a blurred one. Within a level the
+	// plan's own order (nearer first) is kept, and a pass that produces nothing new is not
+	// affected at all.
+	std::stable_sort(r_pass.missing.begin(), r_pass.missing.end(),
+			[](const Terrain3DAVTPageRequest *p_left, const Terrain3DAVTPageRequest *p_right) {
+				return p_left->mip > p_right->mip;
+			});
 }
 
 // Queued idle work must not occupy every source-worker slot while visible requests
