@@ -715,22 +715,33 @@ then never rewritten, so compressing the far field is paid once and the memory i
 rest of the session. A tier left uncompressed samples the staging arrays directly and costs
 nothing extra.
 
-Three rules bound what can be selected, and a request is resolved — not trusted — when it is set:
+Two rules bound what a page can be stored in, and together they leave exactly three settings —
+Uncompressed, BC7 and BC3 RGBA — which is the whole list the page settings offer:
 
 * **Alpha.** All three arrays carry an alpha value the shader reads: material height in
   `albedo_height.a`, roughness in `normal_roughness.a`, and the page validity bit in
   `params.a` (the sampler rejects a page whose `params.a` is not 1). A codec whose channel set
-  drops alpha — BC1, BC4, BC5, BC6H, ETC1, ETC2 RGB, EAC R11/RG11 — would silently corrupt
-  it, so those are refused with that reason. Making them usable means moving the alpha channels
-  into their own array, which changes the material bindings.
+  drops alpha — BC1, BC4, BC5, BC6H, ETC1, ETC2 RGB, EAC R11/RG11 — cannot store a page at all.
+  Making them usable means moving the alpha channels into their own array, which changes the
+  material bindings.
 * **A GPU encoder.** Page compression never runs a CPU block encoder — that is the whole point
   of the design, because a codec pass per page is what made the compressed path both slow and
-  visibly late. `shaders/bc_encode.glsl` implements BC1/BC3/BC4/BC5/BC7, so any other codec
-  (ETC2, ASTC, BC6H) is refused with "has no GPU block encoder" instead of leaving pages that
-  no encoder ever fills. Combined with the alpha rule, the usable set is BC7 and BC3 RGBA.
-* **Device.** The resolver asks the rendering device whether the resulting format can be sampled
-  *and* updated in place, which is what rules the remaining candidates out on a desktop BC
-  device.
+  visibly late. `shaders/bc_encode.glsl` implements BC1/BC3/BC4/BC5/BC7, so a codec it has no
+  encoder for (ETC2, EAC, ASTC, BC6H) has no producer at all. Combined with the alpha rule, the
+  only codecs left are BC7 and BC3 RGBA.
+
+The two lists are therefore separate, and deliberately so: the asset inspector's
+`texture_array_compression` covers everything the engine's *CPU* encoders apply to an authored
+texture array (BC1, BC4, BC5, BC6H, ETC2, EAC, ASTC included), while a page setting names only
+what this build's GPU block encoder can produce. A value is translated rather than reinterpreted
+by position: 1 is BC7 in both lists, 2 is BC3 here and BC1 RGB there while 3 is BC3 there — both
+values mean BC3, because a page cannot be stored in BC1 at all — and every other entry resolves
+to uncompressed, which is what it resolved to while the settings still listed it.
+
+What remains after those two rules is a device question, and it is the only reason a page codec
+can still be refused: the resolver asks the rendering device whether the resulting format can be
+sampled *and* updated in place. A refusal is reported with its reason, and `available` falls back
+to 0, so a tier never claims a format it is not stored in.
 
 `get_vt_settings()` reports the outcome per tier: `surface_vt_compression*` /
 `surface_svt_compression*` and, under the legacy keys, the near field as
@@ -745,28 +756,35 @@ so the compressed arrays are separate sampling targets and a compute pass copies
 * The encoder reads the staging layer through a sampler and writes that layer's block words into
   one region of a small ring buffer, one region per channel per page in flight — a few hundred
   kilobytes per page at BC7, not another page-sized array per slot.
-* `.buffer_get_data_async` returns those words, and the render callback `texture_update`s them into
-  the tier's sampling array. The CPU cost of a compressed page is therefore the buffer copy of its
-  block words — a sixteenth of the half-float page at BC7 — and never a block-encoder pass, so the
-  per-frame page budget stays at the caller's setting and compression does not change how many
-  pages a demand pass produces.
-* **The ring depth is derived, not fixed.** A page holds its regions until its readbacks land, and
-  the render graph delivers them about two frames after the recording that requested them, so the
-  ring has to admit the caller's whole page budget times that latency. With the previous fixed
-  depth of eight under a sixteen page budget the ring, not the budget, was the page rate: a
-  compressed tier became ready at four pages per frame — eight pages every two frames — however
-  much the demand asked for, and the surplus queued up in `pending`. The depth is now
+* The blocks then go straight into the tier's sampling array: an engine-side
+  `RenderingDevice.texture_copy_from_buffer` (see `engine_patch_surface.md`) records a
+  buffer→texture copy in the *same* submission as the dispatch that produced the blocks, with the
+  encoder buffer's resource tracker, so the render graph orders it after the write and barriers it
+  before the material that samples the page. A page is therefore resident in the frame it was
+  produced in: `encode_readbacks=0` and a readiness latency of 0 frames, measured.
+* Without that engine method — a stock engine, or a build whose signature changed — the extension
+  falls back to `.buffer_get_data_async` and `texture_update`s the words from the render callback
+  a couple of frames later. Nothing errors; the CPU cost of a compressed page is then the buffer
+  copy of its block words (a sixteenth of the half-float page at BC7) instead of nothing, and the
+  page becomes ready when its blocks arrive. Page production itself is unchanged either way.
+* **The ring depth is derived, not fixed.** A page holds its regions until whatever consumes its
+  blocks has consumed them: with the direct copy that is the submission that recorded it, so a
+  burst holds one ring page per page in flight; with the readback fallback it is the frame that
+  delivers them, about two frames after the recording that requested them. The depth is therefore
   `clamp(page_budget × 2, 8, 64)` bounded by `ENCODE_RING_BUDGET_BYTES` (96 MB) and by half the
-  slot count, so a compressed pool always costs at most half of what the page sized pool would.
-  `get_stats()` reports the admitted depth as `encode_ring_capacity`, the depth the bundle
-  allocated as `encode_ring_allocated`, and the regions in use as `encode_ring_pages`.
-* A region is only handed out again once every readback of the page it held has been delivered, so
-  a readback can never observe a later page's blocks. The request is refused rather than reused
-  when the ring is full, and the page keeps its pending flag for a later frame.
-* The completion callback runs inside the frame stall, after the frame's draw graph was ended, so
-  an upload issued from there was recorded into the finished graph and discarded — every upload
-  reported success while the arrays stayed empty and the whole viewport showed the missing-page
-  diagnostic. The callback therefore only queues the words, and the render callback uploads them.
+  slot count, which is what an engine without the copy needs — the earlier fixed depth of eight
+  under a sixteen page budget made the ring, not the budget, the page rate: a compressed tier
+  became ready at four pages per frame however much the demand asked for. `get_stats()` reports the
+  admitted depth as `encode_ring_capacity`, the depth the bundle allocated as
+  `encode_ring_allocated`, and the regions in use as `encode_ring_pages`.
+* A region is only handed out again once the page it held has consumed it, so a readback can never
+  observe a later page's blocks. The request is refused rather than reused when the ring is full,
+  and the page keeps its pending flag for a later frame.
+* The completion callback of the fallback runs inside the frame stall, after the frame's draw graph
+  was ended, so an upload issued from there was recorded into the finished graph and discarded —
+  every upload reported success while the arrays stayed empty and the whole viewport showed the
+  missing-page diagnostic. That path therefore only queues the words, and the render callback
+  uploads them.
 
 **Readiness is not cleared while an encode is in flight.** That was the bug behind the stutter and
 the far field that loaded on one run and not the next: clearing `is_page_ready()` for the duration
@@ -776,6 +794,27 @@ re-compression loop. A compressed page is now ready when its blocks arrive, and 
 the only thing that clears the flag, which restores the retry as a safety net instead of a loop.
 A settled far field therefore stops encoding: `encode_requests`, `ready_pages` and `svt_requeues`
 do not move while the view is still.
+
+**The cached near-field plan verifies readiness before it calls itself idle.** The near field reuses
+its last plan while the camera does not move and the pool's residency is unchanged, which is what
+keeps a settled view at zero main-thread cost. That shortcut used to *infer* completeness: a pass
+that produced nothing while nothing was listed as missing latched the pool's residency as idle, and
+the passes after it re-marked their resident pages as demanded without classifying again. A page
+whose content is lost *after* that point — an encode that failed, a production dropped by the bundle
+rebuild that changes the producer's generation — keeps its indirection entry and its demand record,
+so the shader samples an empty layer, the demand pass keeps reporting a complete plan, and nothing
+repairs the page until the camera moves or the pool's residency changes for an unrelated reason.
+That is exactly the "the hole filled in when I stood still / it never filled in" difference.
+
+The shortcut now asks the producer whether every page it is about to call resident is still ready,
+and falls through to the real classification when one is not: the page is inside its retry window,
+so it is produced again, and the pass reports it instead of claiming a settled view.
+`avt_sector_stats["idle_ready_lost"]` is the reading — 0 while a still view really is complete, and
+the number of lost pages on any pass that had to classify because of them. The cost is one lookup
+per resident slot, on a loop that already touches every one of them.
+`native/tests/vt_recovery.gd` drives it: with the camera still it drops one produced page's
+readiness and requires the demand pass to bring it back (`debug_lose_vt_page_readiness()`, which
+leaves the address, the slot and the demand record untouched, exactly as a failed encode does).
 
 **The staging pool becomes a scratch ring when nothing samples it.** The three RGBA16F outputs
 and the R16/R32F sources are page sized only while a tier samples them by slot. Once *both* tiers
@@ -804,7 +843,7 @@ reports the same figures as `staging_bytes`, `compressed_bytes`, `material_bytes
 
 **The terrain's cost carries a `terrain/` keyword.** The node runs as a GDExtension method, so the
 engine's profiler cannot attribute its time. It publishes custom monitors named
-`terrain/vt_cpu`, `terrain/vt_cpu_peak`, `terrain/avt_cpu`, `terrain/svt_cpu`,
+`terrain/vt_cpu`, `terrain/vt_cpu_peak`, `terrain/avt_cpu`, `terrain/svt_cpu`, `terrain/cdlod_cpu`,
 `terrain/material_bytes`, `terrain/pages_ready` and `terrain/pages_pending` (seconds, bytes and
 counts, with the monitor types that make the editor format them), which the editor's monitor graph
 groups under `terrain`. The same phases are emitted as profiler zones and plots — `terrain/vt`,
@@ -813,6 +852,18 @@ and plots `terrain/vt_cpu_ms`, `terrain/avt_cpu_ms`, `terrain/svt_cpu_ms`, `terr
 `terrain/pages_ready`, `terrain/pages_pending` — through the profiler singleton the engine exposes,
 and only while a profiler client is connected. A second terrain in one scene publishes under its
 instance id (`terrain/<id>/...`) so the plain names never collide.
+
+**The geometry backend is named too, from where it actually runs.** AVT and SVT are tick phases, so
+their zones sit inside the tick's `terrain/vt`. CDLOD is not a tick phase: the rendering server
+calls it through `frame_pre_draw`, in the pass that draws the frame, so it opens its own zones from
+there — `terrain/cdlod` for the pass, `terrain/cdlod_select` (quadtree selection, only when the eye
+moved), `terrain/cdlod_cull` (the frustum classification pass), `terrain/cdlod_pack` (instance
+packing) and `terrain/cdlod_upload` inside it (the RenderingServer buffer calls) — and plots
+`terrain/cdlod_ms`, `terrain/cdlod_patches` and `terrain/cdlod_visible`. `terrain/cdlod_cpu` is the
+same pass's cost for the editor's monitor graph. The profiler's zone stack is per thread, so a
+backend that runs on the rendering thread publishes on the rendering thread's timeline rather than
+beside `terrain/vt_*`; the names still group together in the profiler's own zone list, and the
+profiler singleton lookup is cached per thread so two threads never share one cache entry.
 
 Two consequences of the ring, both deliberate: a capacity growth re-produces every resident page
 instead of migrating it (there is no per-slot half-float layer left to copy, and a block format

@@ -85,7 +85,7 @@ func run() -> void:
 	var names := monitor_names()
 	print("VTMONITORS names=", str(names))
 	require(names.size() > 0, "a running terrain must publish terrain/ monitors")
-	for expected in ["terrain/vt_cpu", "terrain/avt_cpu", "terrain/material_bytes", "terrain/pages_ready"]:
+	for expected in ["terrain/vt_cpu", "terrain/avt_cpu", "terrain/material_bytes", "terrain/pages_ready", "terrain/cdlod_cpu"]:
 		require(names.has(expected), "the terrain must publish %s, got %s" % [expected, str(names)])
 	# The types are what make the editor format a value as milliseconds or as a size; the
 	# engine binds quantity 0, memory 1, time 2, percentage 3.
@@ -97,6 +97,7 @@ func run() -> void:
 	require(int(types.get("terrain/vt_cpu", -1)) == 2, "the VT cost must be a time monitor")
 	require(int(types.get("terrain/material_bytes", -1)) == 1, "the pool size must be a memory monitor")
 	require(int(types.get("terrain/pages_ready", -1)) == 0, "the ready count must be a quantity monitor")
+	require(int(types.get("terrain/cdlod_cpu", -1)) == 2, "the geometry cost must be a time monitor")
 
 	# A live reading: the VT section ran, so the tick it measures is above zero, and the pool
 	# the terrain built is above zero too.
@@ -106,6 +107,20 @@ func run() -> void:
 	print("VTMONITORS readings vt_cpu=%.6f material_bytes=%.0f pages_ready=%.0f" % [vt_cpu, material, ready])
 	require(vt_cpu >= 0.0, "the VT cost monitor must return a duration")
 	require(material > 0.0, "the pool monitor must return the arrays' size (%f)" % material)
+
+	# The geometry backend runs from `frame_pre_draw` rather than from the tick, so its
+	# monitor reports the last pass, and the same pass is what `get_cdlod_stats()` exposes.
+	var geometry: Dictionary = terrain.get_cdlod_stats()
+	var cdlod_cpu := float(Performance.get_custom_monitor("terrain/cdlod_cpu"))
+	print("VTMONITORS cdlod_cpu=%.6f backend=%s patches=%d cpu_update_ms=%.6f" % [cdlod_cpu,
+			str(geometry.get("backend", "")), int(geometry.get("selected_patches", 0)),
+			float(geometry.get("cpu_update_ms", -1.0))])
+	require(cdlod_cpu >= 0.0, "the geometry cost monitor must return a duration")
+	require(is_equal_approx(cdlod_cpu, float(geometry.get("cpu_update_ms", -1.0))),
+			"the geometry monitor must report the backend's own reading, got %f vs %f" % [cdlod_cpu,
+					float(geometry.get("cpu_update_ms", -1.0))])
+	require(int(geometry.get("selected_patches", 0)) > 0,
+			"the geometry backend must have selected patches to time")
 
 	# A second terrain must not fight the first for the same ids.
 	var second := make_terrain(scene, Vector3(300.0, 0.0, 300.0))

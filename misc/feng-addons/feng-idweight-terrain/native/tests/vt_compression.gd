@@ -1,12 +1,14 @@
 # Run with a graphical rendering driver; see README.md in this directory.
 #
-# The three material page arrays must all share one format, and each of them carries an
-# alpha value the shader reads (material height, roughness, and the params validity bit).
-# This pins the resolver, not a codec: which requests are refused because the codec keeps
-# no alpha, which are refused because this build has no compressor or the device cannot
-# sample the result, and that an accepted request is exactly the effective format with no
-# reason attached. The accepted set is build dependent (etcpak and astcenc ship in every
-# build, cvtt and betsy are editor-only, and a desktop device can only sample BC formats),
+# The page codec list. A material page is stored in one of the codecs the GPU block encoder
+# implements, and every one of its three arrays carries an alpha value the shader reads
+# (material height, roughness, and the params validity bit). Those two facts leave exactly
+# BC7, BC3 and uncompressed, so the settings offer exactly those: an entry that resolves to
+# nothing is a dropdown entry that lies.
+#
+# This pins the list and the translation of a scene saved while the settings still offered
+# the whole texture-array vocabulary. The accepted set stays device dependent - a desktop
+# device can only sample BC formats, and the BC formats are the only ones with an encoder -
 # so the test asserts the invariants and prints what it found.
 extends SceneTree
 
@@ -38,8 +40,14 @@ func make_terrain() -> Terrain3D:
 	await process_frame
 	return terrain
 
-# Property enum order: which entries keep an alpha channel.
-const NO_ALPHA_CODECS := [2, 4, 5, 6, 7, 8, 10, 11]
+# Values a scene can hold, and what each one means. 1 is BC7 in both vocabularies; 2 is BC3 here
+# and BC1 RGB in the array enum, 3 is BC3 there, and both mean BC3 - a page cannot be stored in
+# BC1 (it keeps no alpha), so a BC1 request lands on the codec that does keep it. Everything else -
+# BC4, BC5 and BC6H keep no alpha, ETC1, ETC2, EAC and ASTC have no shader encoder - resolved to
+# uncompressed then and must still resolve to uncompressed.
+const LEGACY_MODES := {
+	0: 0, 1: 1, 2: 2, 3: 2, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, 13: 0, 14: 0, 15: 0,
+}
 
 # A gradient plus hard block edges: the edges are what make a block codec show any error at
 # all, and the gradient keeps the mean meaningful.
@@ -79,7 +87,8 @@ func run() -> void:
 		quit(1)
 		return
 
-	require(terrain.vt_atlas_compression == 0, "atlas compression must default to uncompressed")
+	require(terrain.vt_atlas_compression == Terrain3D.SURFACE_PAGE_UNCOMPRESSED,
+			"pages must default to uncompressed")
 	var initial: Dictionary = terrain.get_vt_settings()
 	require(int(initial.get("vt_atlas_compression_available", -1)) == 0,
 			"uncompressed must resolve to itself")
@@ -89,7 +98,7 @@ func run() -> void:
 	var accepted := PackedStringArray()
 	var refused := PackedStringArray()
 	var first_accepted := -1
-	for mode in range(16):
+	for mode in range(1, Terrain3D.SURFACE_PAGE_COUNT):
 		terrain.vt_atlas_compression = mode
 		await process_frame
 		require(terrain.vt_atlas_compression == mode, "the property must round trip mode %d" % mode)
@@ -97,25 +106,34 @@ func run() -> void:
 		var name := String(settings.get("vt_atlas_compression_name", "?"))
 		var available := int(settings.get("vt_atlas_compression_available", -1))
 		var reason := String(settings.get("vt_atlas_compression_reason", ""))
-		if mode in NO_ALPHA_CODECS:
-			require(available == 0, "%s keeps no alpha and must be refused" % name)
-			require(reason.contains("alpha"),
-					"mode %d must be refused for the alpha reason, got '%s'" % [mode, reason])
-			refused.append("mode %d [%s]" % [mode, reason])
-			continue
 		if available == mode:
 			require(reason.is_empty(), "%s was accepted but carries reason '%s'" % [name, reason])
-			accepted.append(name)
-			# Only a lossy codec is interesting for the round trip below.
-			if mode != 0 and first_accepted < 0:
+			accepted.append("mode %d [%s]" % [mode, name])
+			if first_accepted < 0:
 				first_accepted = mode
 		else:
 			require(available == 0, "%s must fall back to uncompressed, got %d" % [name, available])
 			require(not reason.is_empty(), "%s was refused without a reason" % name)
-			refused.append("%s [%s]" % [name, reason])
+			refused.append("mode %d [%s] %s" % [mode, name, reason])
 	print("VTCOMPRESSION accepted=%s refused=%s" % [", ".join(accepted), "; ".join(refused)])
+	# The list is the block encoder's codec list, and this device can sample what it produces,
+	# so nothing the settings offer may be refused here. A refusal means an entry that cannot
+	# be stored, which is what trimming the list was for.
+	require(refused.is_empty(), "every offered page codec must be storable on this device: %s" % "; ".join(refused))
 	# etcpak ships in every build and every desktop device samples BC, so BC3 must work.
 	require(accepted.size() > 0, "at least one alpha-capable codec must be usable in this build")
+	require(accepted.size() == Terrain3D.SURFACE_PAGE_COUNT - 1,
+			"both compressed page codecs must be usable in this build, got %d" % accepted.size())
+
+	# A scene saved while the setting listed the whole array vocabulary still means what it
+	# meant then. Nothing about the stored value may silently change a codec.
+	for requested in LEGACY_MODES:
+		terrain.vt_atlas_compression = requested
+		await process_frame
+		require(terrain.vt_atlas_compression == LEGACY_MODES[requested],
+				"legacy mode %d must translate to %d, got %d" % [
+					requested, LEGACY_MODES[requested], terrain.vt_atlas_compression])
+	print("VTCOMPRESSION legacy=%s" % str(LEGACY_MODES))
 
 	# The codec path itself: compress and decode a real image through the same codec, which
 	# is where the loss shows up. A lossy codec must change the image (that is the proof the

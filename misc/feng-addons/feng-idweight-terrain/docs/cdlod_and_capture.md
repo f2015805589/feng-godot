@@ -10,6 +10,11 @@ and background settings are respected when loading existing scenes.
 - `cdlod_patch_size`: internal grid size, hidden from both editor panels; the stored property remains readable for existing scenes. It does not control batching.
 - `cdlod_lod_scale`: default 8, range 8–32. A leaf's morph ends at its world width times this scale; the last quarter is its morph band. Larger values keep fine geometry farther away.
 - `get_cdlod_stats()`: active state, visible/selected/shadow-only patch counts and main batch count.
+- Profiling: the pass runs from the rendering server's `frame_pre_draw` rather than from the node's
+  tick, so it publishes its own `terrain/cdlod` zone with `terrain/cdlod_select`, `terrain/cdlod_cull`,
+  `terrain/cdlod_pack` and `terrain/cdlod_upload` inside it, the plots `terrain/cdlod_ms`,
+  `terrain/cdlod_patches` and `terrain/cdlod_visible`, and the `terrain/cdlod_cpu` monitor that the
+  editor's monitor graph groups with `terrain/vt_cpu`, `terrain/avt_cpu` and `terrain/svt_cpu`.
 
 The backend selects nonoverlapping quadtree leaves for loaded terrain regions,
 continuously collapses odd grid vertices onto the next dyadic grid, and submits

@@ -1,4 +1,5 @@
 // Copyright © 2026 Terrain3D contributors.
+#include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_virtual_texture.h"
@@ -225,10 +226,38 @@ void Terrain3D::_apply_vt_tier_compression(const int p_tier, const int p_mode) {
 	_reset_vt_configuration();
 }
 
+// Page storage, written in the page codec list the inspector offers: the two RGBA block codecs
+// the GPU encoder implements, plus the uncompressed staging arrays. That list is shorter than the
+// shared texture-array enum, so a value is translated rather than reinterpreted by position:
+//
+//   * 1 is BC7 in both lists.
+//   * 2 is BC3 here and BC1 RGB in the array list, and 3 is BC3 in the array list. Both mean
+//     BC3: the page list is the vocabulary this setting is offered in, and a scene that asked
+//     for BC1 - which a page cannot be stored in, because BC1 keeps no alpha - lands on a codec
+//     that does keep alpha rather than on the uncompressed pages it was given before.
+//   * everything else is uncompressed, which is what every other array-list entry resolved to
+//     while the page settings still listed it: BC4, BC5 and BC6H keep no alpha, and ETC1, ETC2,
+//     EAC and ASTC have no shader encoder.
+static int page_codec_from_request(const int p_requested) {
+	switch (p_requested) {
+		case SURFACE_PAGE_BC7:
+			return SURFACE_PAGE_BC7;
+		case SURFACE_PAGE_BC3:
+		case Terrain3DAssets::ARRAY_BC3:
+			return SURFACE_PAGE_BC3;
+		default:
+			return SURFACE_PAGE_UNCOMPRESSED;
+	}
+}
+
 void Terrain3D::set_surface_vt_compression(const int p_compression) {
-	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
+	const int mode = page_codec_from_request(p_compression);
 	if (_vt.surface_vt_compression == mode) {
 		return;
+	}
+	if (p_compression != SURFACE_PAGE_UNCOMPRESSED && mode == SURFACE_PAGE_UNCOMPRESSED) {
+		LOG(INFO, "Page compression request ", p_compression,
+				" has no page codec in this build; pages stay uncompressed");
 	}
 	_vt.surface_vt_compression = mode;
 	_apply_vt_tier_compression(Terrain3DSurfaceBaker::TIER_AVT, mode);
@@ -241,9 +270,13 @@ int Terrain3D::get_surface_vt_compression() const {
 // far-field page is assembled once from a baked cell and never rewritten, so its compressed
 // copy is final.
 void Terrain3D::set_surface_svt_compression(const int p_compression) {
-	const int mode = CLAMP(p_compression, 0, Terrain3DAssets::ARRAY_COMPRESSION_MAX - 1);
+	const int mode = page_codec_from_request(p_compression);
 	if (_vt.surface_svt_compression == mode) {
 		return;
+	}
+	if (p_compression != SURFACE_PAGE_UNCOMPRESSED && mode == SURFACE_PAGE_UNCOMPRESSED) {
+		LOG(INFO, "Page compression request ", p_compression,
+				" has no page codec in this build; pages stay uncompressed");
 	}
 	_vt.surface_svt_compression = mode;
 	_apply_vt_tier_compression(Terrain3DSurfaceBaker::TIER_SVT, mode);
@@ -708,6 +741,15 @@ int Terrain3D::prepare_vt_capture() {
 		++queued;
 	}
 	return queued;
+}
+
+bool Terrain3D::debug_lose_vt_page_readiness(int p_slot) {
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	if (!producer || p_slot < 0 || !producer->is_page_ready(p_slot)) {
+		return false;
+	}
+	producer->debug_clear_readiness(p_slot);
+	return true;
 }
 
 // A resident cell is reused while this key matches the one it was published with. It is
@@ -1506,6 +1548,7 @@ void Terrain3D::_bind_vt_methods() {
 	ClassDB::bind_method(D_METHOD("get_vt_settings"), &Terrain3D::get_vt_settings);
 	ClassDB::bind_method(D_METHOD("prepare_vt_capture"), &Terrain3D::prepare_vt_capture);
 	ClassDB::bind_method(D_METHOD("get_vt_pages"), &Terrain3D::get_vt_pages);
+	ClassDB::bind_method(D_METHOD("debug_lose_vt_page_readiness", "slot"), &Terrain3D::debug_lose_vt_page_readiness);
 	ClassDB::bind_method(D_METHOD("get_vt_material_textures"), &Terrain3D::get_vt_material_textures);
 	ClassDB::bind_method(D_METHOD("get_vt_page_preview", "slot"), &Terrain3D::get_vt_page_preview);
 	ClassDB::bind_method(D_METHOD("get_svt_baked_pages"), &Terrain3D::get_svt_baked_pages);

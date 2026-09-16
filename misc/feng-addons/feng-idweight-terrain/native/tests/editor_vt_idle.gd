@@ -54,7 +54,7 @@ func run() -> void:
 	var pooled := int(settings.get("pool_generation", -1))
 	var capacity := int(settings.get("page_count", 0))
 	var codec := -1
-	for mode in range(1, 16):
+	for mode in range(1, Terrain3D.SURFACE_PAGE_COUNT):
 		terrain.vt_atlas_compression = mode
 		await get_tree().create_timer(0.2).timeout
 		if int(terrain.get_vt_settings().get("vt_atlas_compression_available", -1)) == mode:

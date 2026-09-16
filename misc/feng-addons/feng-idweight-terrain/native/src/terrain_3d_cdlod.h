@@ -51,6 +51,9 @@ class Terrain3DCDLOD {
 	// bounds) and the CPU packing loop before them.
 	double _upload_ms = 0.0;
 	void _upload(Batch &p_batch, PackedFloat32Array &p_data, const AABB &p_bounds);
+	// The pass itself: selection, classification and packing. `snap()` is the scope that
+	// publishes it, so the body can keep the early returns it uses to skip unchanged work.
+	void _snap_impl();
 
 public:
 	~Terrain3DCDLOD();
@@ -61,4 +64,10 @@ public:
 	void invalidate_selection() { _selection_valid = false; }
 	void update();
 	Dictionary get_stats() const;
+	// The last pass's cost and the patch counts it selected, for the node's own monitor. A
+	// cost near zero means the pass reused its previous result - nothing moved and nothing
+	// changed - rather than a missing reading.
+	double get_cpu_update_ms() const { return _cpu_update_ms; }
+	int get_selected_patches() const { return _selected; }
+	int get_visible_patches() const { return _visible; }
 };

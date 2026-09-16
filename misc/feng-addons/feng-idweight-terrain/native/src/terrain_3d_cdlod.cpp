@@ -1,4 +1,5 @@
 #include "terrain_3d_cdlod.h"
+#include "terrain_3d_profile.h"
 #include "terrain_3d.h"
 #include <godot_cpp/classes/world3d.hpp>
 #include <godot_cpp/classes/time.hpp>
@@ -56,6 +57,7 @@ void Terrain3DCDLOD::initialize(Terrain3D *p_terrain, RID p_material) {
 }
 
 void Terrain3DCDLOD::_upload(Batch &p_batch, PackedFloat32Array &p_data, const AABB &p_bounds) {
+	TerrainProfileZone upload_zone("cdlod_upload");
 	const uint64_t upload_started = Time::get_singleton()->get_ticks_usec();
 	const int count = int(p_data.size() / 16);
 	if (!_adaptive) {
@@ -112,8 +114,20 @@ void Terrain3DCDLOD::_upload(Batch &p_batch, PackedFloat32Array &p_data, const A
 	_upload_ms += double(Time::get_singleton()->get_ticks_usec() - upload_started) / 1000.0;
 }
 
+// The geometry backend is driven by the rendering server, through the `frame_pre_draw`
+// signal, rather than by the node's own tick. It therefore publishes its own zones and
+// plots under the same `terrain/` keyword instead of disappearing into the engine's frame.
 void Terrain3DCDLOD::snap() {
 	if (!_terrain || !_terrain->get_data() || !_terrain->get_camera()) { return; }
+	// The zone closes on every path out of the pass, including the early returns.
+	TerrainProfileZone cdlod_zone("cdlod");
+	_snap_impl();
+	TerrainProfileZone::plot("cdlod_ms", _cpu_update_ms);
+	TerrainProfileZone::plot("cdlod_patches", double(_selected));
+	TerrainProfileZone::plot("cdlod_visible", double(_visible));
+}
+
+void Terrain3DCDLOD::_snap_impl() {
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	Camera3D *camera = _terrain->get_camera();
 	const Vector3 eye = camera->get_global_position();
@@ -146,6 +160,7 @@ void Terrain3DCDLOD::snap() {
 	_view_key = std::move(view_key);
 	_rebuild_ms = 0.0;
 	if (rebuild) {
+		TerrainProfileZone select_zone("cdlod_select");
 		_selection_valid = true;
 		const TypedArray<Vector2i> locations = _terrain->get_data()->get_region_locations();
 		_selection_key = std::move(key);
@@ -198,62 +213,68 @@ void Terrain3DCDLOD::snap() {
 		}
 	}
 	_rebuild_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
-	const uint64_t cull_started = Time::get_singleton()->get_ticks_usec();
-	// Rotation changes visibility, not the distance-selected quadtree.
-	const auto frustum = projection.get_projection_planes(camera->get_camera_transform());
-	std::array<Plane, 6> planes;
-	std::array<Vector3, 6> absolute_normals;
-	for (int i = 0; i < 6; ++i) {
-		planes[i] = frustum[i];
-		absolute_normals[i] = planes[i].normal.abs();
-	}
-	bool visibility_changed = rebuild || _visibility.size() != _patches.size();
-	_visibility.resize(_patches.size());
-	for (size_t index = 0; index < _patches.size(); ++index) {
-		const Patch &patch = _patches[index];
-		const Vector3 extent = patch.bounds.size * .5f;
-		const Vector3 center = patch.bounds.position + extent;
-		bool visible = true;
+	{
+		TerrainProfileZone cull_zone("cdlod_cull");
+		const uint64_t cull_started = Time::get_singleton()->get_ticks_usec();
+		// Rotation changes visibility, not the distance-selected quadtree.
+		const auto frustum = projection.get_projection_planes(camera->get_camera_transform());
+		std::array<Plane, 6> planes;
+		std::array<Vector3, 6> absolute_normals;
 		for (int i = 0; i < 6; ++i) {
-			if (planes[i].distance_to(center) > absolute_normals[i].dot(extent)) { visible = false; break; }
+			planes[i] = frustum[i];
+			absolute_normals[i] = planes[i].normal.abs();
 		}
-		const uint8_t classification = visible ? 0 : (shadows ? 1 : 2);
-		visibility_changed |= _visibility[index] != classification;
-		_visibility[index] = classification;
-	}
-	if (!visibility_changed) {
+		bool visibility_changed = rebuild || _visibility.size() != _patches.size();
+		_visibility.resize(_patches.size());
+		for (size_t index = 0; index < _patches.size(); ++index) {
+			const Patch &patch = _patches[index];
+			const Vector3 extent = patch.bounds.size * .5f;
+			const Vector3 center = patch.bounds.position + extent;
+			bool visible = true;
+			for (int i = 0; i < 6; ++i) {
+				if (planes[i].distance_to(center) > absolute_normals[i].dot(extent)) { visible = false; break; }
+			}
+			const uint8_t classification = visible ? 0 : (shadows ? 1 : 2);
+			visibility_changed |= _visibility[index] != classification;
+			_visibility[index] = classification;
+		}
+		if (!visibility_changed) {
+			_cull_ms = double(Time::get_singleton()->get_ticks_usec() - cull_started) / 1000.0;
+			_pack_ms = 0.0;
+			_upload_ms = 0.0;
+			_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+			return;
+		}
 		_cull_ms = double(Time::get_singleton()->get_ticks_usec() - cull_started) / 1000.0;
-		_pack_ms = 0.0;
+	}
+	{
+		TerrainProfileZone pack_zone("cdlod_pack");
+		const uint64_t pack_started = Time::get_singleton()->get_ticks_usec();
 		_upload_ms = 0.0;
-		_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
-		return;
+		auto &lists = _instance_lists;
+		for (auto &list : lists) { list.clear(); list.reserve(_patches.size() * 16); }
+		std::array<AABB, 2> bounds;
+		std::array<bool, 2> has_bounds = {false, false};
+		_selected = _visible = 0;
+		for (size_t index = 0; index < _patches.size(); ++index) {
+			const Patch &patch = _patches[index];
+			const bool visible = _visibility[index] == 0;
+			if (!visible && !shadows) { continue; }
+			const int list = visible ? 0 : 1;
+			lists[list].insert(lists[list].end(), patch.transform.begin(), patch.transform.end());
+			bounds[list] = has_bounds[list] ? bounds[list].merge(patch.bounds) : patch.bounds;
+			has_bounds[list] = true;
+			++_selected;
+			if (visible) { ++_visible; }
+		}
+		for (int i = 0; i < 2; ++i) {
+			PackedFloat32Array data; data.resize(lists[i].size());
+			if (!lists[i].empty()) { std::memcpy(data.ptrw(), lists[i].data(), lists[i].size() * sizeof(float)); }
+			_upload(_batches[i], data, bounds[i]);
+		}
+		if (!_adaptive) { update(); }
+		_pack_ms = double(Time::get_singleton()->get_ticks_usec() - pack_started) / 1000.0;
 	}
-	_cull_ms = double(Time::get_singleton()->get_ticks_usec() - cull_started) / 1000.0;
-	const uint64_t pack_started = Time::get_singleton()->get_ticks_usec();
-	_upload_ms = 0.0;
-	auto &lists = _instance_lists;
-	for (auto &list : lists) { list.clear(); list.reserve(_patches.size() * 16); }
-	std::array<AABB, 2> bounds;
-	std::array<bool, 2> has_bounds = {false, false};
-	_selected = _visible = 0;
-	for (size_t index = 0; index < _patches.size(); ++index) {
-		const Patch &patch = _patches[index];
-		const bool visible = _visibility[index] == 0;
-		if (!visible && !shadows) { continue; }
-		const int list = visible ? 0 : 1;
-		lists[list].insert(lists[list].end(), patch.transform.begin(), patch.transform.end());
-		bounds[list] = has_bounds[list] ? bounds[list].merge(patch.bounds) : patch.bounds;
-		has_bounds[list] = true;
-		++_selected;
-		if (visible) { ++_visible; }
-	}
-	for (int i = 0; i < 2; ++i) {
-		PackedFloat32Array data; data.resize(lists[i].size());
-		if (!lists[i].empty()) { std::memcpy(data.ptrw(), lists[i].data(), lists[i].size() * sizeof(float)); }
-		_upload(_batches[i], data, bounds[i]);
-	}
-	if (!_adaptive) { update(); }
-	_pack_ms = double(Time::get_singleton()->get_ticks_usec() - pack_started) / 1000.0;
 	_cpu_update_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 }
 

@@ -420,6 +420,30 @@ to a failed cell copy used to be sampled as an empty layer for the rest of the s
 field that loads on one run and not the next. A page is re-produced at most once every
 `SVT_PAGE_RETRY_FRAMES` (30) frames while it stays empty.
 
+## A lost page under a still view
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_recovery_runner.py --driver d3d12
+```
+
+The near field reuses its last plan while the camera does not move and the pool's residency is
+unchanged, which is what keeps a settled view free of main-thread work. That shortcut used to infer
+completeness from "the last pass produced nothing and listed nothing as missing", so a page whose
+content was lost after that point kept its indirection entry over an empty layer *and* kept being
+reported as part of a complete plan: the retry window was never reached, and the hole stayed until
+the camera moved or the pool's residency changed for an unrelated reason. That is the difference
+between "the hole filled in while I stood still" and "it never filled in".
+
+The shortcut now verifies with the producer that every page it is about to call resident is still
+ready, and classifies for real when one is not; `avt_sector_stats["idle_ready_lost"]` reports how
+many pages that was. The test drives the sector planner with a camera that never moves, waits for
+the view to settle (`plan_reused`, `visible_missing_pages == 0`, something resident), then calls
+`debug_lose_vt_page_readiness(slot)` — which clears one ready page's content and nothing else, the
+state a failed encode leaves behind — and requires the page to be ready again within a bounded
+number of ticks, once per codec (BC7 and uncompressed). Before the fix the page never came back
+(`recovered_ticks = -1` over 240 ticks) and the pass kept reporting `missing=0`; it now recovers in
+~23 ticks in both.
+
 ## Compressed material page arrays
 
 ```powershell
@@ -434,14 +458,24 @@ compressing the far field is paid once and the memory is saved for the rest of t
 inspector shows both as `Compression` inside their `AVT` / `SVT` groups; `vt_atlas_compression`
 remains as the near field's pre-split name.
 
-Compression runs on the GPU. A compressed format cannot be a storage image and no texture copy
-converts formats, so a produced page is encoded by the compute pass in `shaders/bc_encode.glsl`:
-it reads the RGBA16F staging layer through a sampler and writes that layer's block words into one
-region per channel of a ring buffer, which is read back and uploaded into the tier's sampling
-array. The CPU cost of a compressed page is therefore the buffer copy of its block words — a
-sixteenth of the half-float page at BC7 — and never a block encoder pass. Only the codecs that
-shader implements can be selected (BC7 and BC3 RGBA carry the alpha the shader reads); every other
-request is refused with a reason instead of leaving pages no encoder ever fills.
+Compression runs on the GPU. A compressed format cannot be a storage image, so a produced page is
+encoded by the compute pass in `shaders/bc_encode.glsl`: it reads the RGBA16F staging layer through
+a sampler and writes that layer's block words into one region per channel of a ring buffer, and
+those blocks are copied into the tier's sampling array — by the engine-side
+`texture_copy_from_buffer` in the same submission, so the page is resident in the frame it was
+produced in, or by the `.buffer_get_data_async` + `texture_update` fallback on an engine without
+that method. Either way the CPU never runs a block encoder, so the per-frame page budget stays at
+the caller's setting.
+
+Only the codecs that shader implements *and* that keep the alpha the shader reads can store a page,
+which leaves three settings and no more: Uncompressed, BC7 and BC3 RGBA. The asset inspector's
+`texture_array_compression` is the longer, CPU-encoder list — BC1, BC4, BC5, BC6H, ETC2, EAC and
+ASTC included — and the two are deliberately separate lists. A value is translated rather than
+reinterpreted by position: 1 is BC7 in both, 2 is BC3 here and BC1 RGB there while 3 is BC3 there
+(both mean BC3, since a page cannot be stored in BC1 at all), and every other entry resolves to
+uncompressed, which is what it resolved to while the settings still listed it.
+`vt_compression.gd` pins that list and the translation; a page codec this device refuses is
+reported with its reason.
 
 The ring depth is derived from the page budget, not fixed: a page holds its regions until its
 readbacks land, about two frames later, so the ring admits `page_budget × 2` (8 to 64, bounded by
@@ -491,13 +525,18 @@ python misc/feng-addons/feng-idweight-terrain/native/tests/vt_monitors_runner.py
 The node's own cost is published under a `terrain/` keyword, because a GDExtension method is
 invisible to the engine's profiler and an unattributed spike cannot be told apart from engine work.
 `get_vt_settings()`-style readings become custom monitors — `terrain/vt_cpu`, `terrain/vt_cpu_peak`,
-`terrain/avt_cpu`, `terrain/svt_cpu`, `terrain/material_bytes`, `terrain/pages_ready`,
-`terrain/pages_pending` — with the monitor types the editor formats as milliseconds, bytes and
-counts, and the same phases are emitted as profiler zones and plots while a profiler client is
-connected. A second terrain in one scene publishes under `terrain/<instance id>/...` so the plain
-names never collide, and the monitors are withdrawn when the node exits the tree and again before
-it is deleted, because they hold callables into it. The test checks the names, the types, a live
-reading, the two-terrain split and the withdrawal.
+`terrain/avt_cpu`, `terrain/svt_cpu`, `terrain/cdlod_cpu`, `terrain/material_bytes`,
+`terrain/pages_ready`, `terrain/pages_pending` — with the monitor types the editor formats as
+milliseconds, bytes and counts, and the same phases are emitted as profiler zones and plots while a
+profiler client is connected. The zones cover the tick's phases (`terrain/vt`, `terrain/vt_service`,
+`terrain/vt_avt`, `terrain/vt_svt`, `terrain/vt_topup`, `terrain/vt_bake`) and the geometry backend,
+which the rendering server drives from `frame_pre_draw` instead of from the tick: `terrain/cdlod`,
+`terrain/cdlod_select`, `terrain/cdlod_cull`, `terrain/cdlod_pack` and `terrain/cdlod_upload`, with
+plots `terrain/cdlod_ms` / `terrain/cdlod_patches` / `terrain/cdlod_visible`. A second terrain in
+one scene publishes under `terrain/<instance id>/...` so the plain names never collide, and the
+monitors are withdrawn when the node exits the tree and again before it is deleted, because they
+hold callables into it. The test checks the names, the types, a live reading — including that
+`terrain/cdlod_cpu` is the backend's own `cpu_update_ms` — the two-terrain split and the withdrawal.
 
 ## Far-field distance -> mip bands
 

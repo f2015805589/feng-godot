@@ -483,6 +483,10 @@ Dictionary Terrain3DMesher::get_cdlod_stats() const {
 	return result;
 }
 
+double Terrain3DMesher::get_cdlod_cpu_ms() const {
+	return _cdlod ? _cdlod->get_cpu_update_ms() : 0.0;
+}
+
 void Terrain3DMesher::invalidate_region_geometry() {
 	if (_cdlod) { _cdlod->invalidate_selection(); }
 }

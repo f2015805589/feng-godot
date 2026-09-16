@@ -31,17 +31,16 @@ struct SurfaceVTLabel {
 	~SurfaceVTLabel() { rd->draw_command_end_label(); }
 };
 
-// Atlas codecs, in the same order and naming as Terrain3DAssets::TextureArrayCompression,
-// so the inspector shows one vocabulary for every terrain texture array. Only the entries
-// whose channels are RGBA are usable for material pages: each of the three arrays carries
-// an alpha value the shader reads (material height, roughness, and the params validity
-// bit), and a codec without alpha would silently drop it.
+// The codec vocabulary of the terrain texture arrays, in the same order and naming as
+// Terrain3DAssets::TextureArrayCompression, so a page setting and the asset inspector cannot
+// drift apart. It is the *shared* list: it covers every codec the engine's own CPU encoders
+// can apply to an authored array, which is a different question from what a material page can
+// be stored in - see SurfacePageCompression and PAGE_CODEC_ATLAS below for that.
 //
 // `gpu_codec` is the block encoder's own id for the entry and `block_words` the words it
 // writes per 4x4 block, or GPU_CODEC_NONE when shaders/bc_encode.glsl implements no encoder
-// for it. Page compression runs on the GPU - that is what keeps a produced page at CPU cost
-// of a small buffer copy - so a codec without an encoder here has no producer at all and is
-// refused by the resolver rather than silently left blank.
+// for it. Only the entries a page codec maps to have a GPU encoder at all; an entry without
+// one can still be a valid setting for an authored texture array, where the CPU compresses it.
 static constexpr uint32_t GPU_CODEC_NONE = 0xffffffffu;
 
 struct AtlasCodec {
@@ -73,6 +72,28 @@ const AtlasCodec ATLAS_CODECS[] = {
 	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8, GPU_CODEC_NONE, 0, RenderingDevice::DATA_FORMAT_MAX},
 };
 constexpr int ATLAS_CODEC_COUNT = int(sizeof(ATLAS_CODECS) / sizeof(AtlasCodec));
+
+// The page codecs, in the order the page settings offer them, mapped to their entry in the
+// shared vocabulary above. The two lists differ on purpose: the array vocabulary is the asset
+// inspector's and covers everything the engine's CPU encoders apply to a texture array, while
+// a page is produced by this build's GPU block encoder and stored in one of its RGBA codecs.
+// Keeping the mapping explicit is what lets a page setting name only codecs that have a
+// producer, instead of offering an entry that the resolver then has to refuse.
+constexpr int PAGE_CODEC_ATLAS[SURFACE_PAGE_COUNT] = {
+	0, // SURFACE_PAGE_UNCOMPRESSED - samples the staging arrays, no codec involved.
+	1, // SURFACE_PAGE_BC7 - 16 bytes per 4x4 block, the higher quality of the two.
+	3, // SURFACE_PAGE_BC3 - 8 bytes per 4x4 block, half the memory of BC7.
+};
+static_assert(PAGE_CODEC_ATLAS[SURFACE_PAGE_UNCOMPRESSED] < ATLAS_CODEC_COUNT &&
+				PAGE_CODEC_ATLAS[SURFACE_PAGE_BC7] < ATLAS_CODEC_COUNT &&
+				PAGE_CODEC_ATLAS[SURFACE_PAGE_BC3] < ATLAS_CODEC_COUNT,
+		"every page codec must name an entry of the shared codec table");
+static_assert(ATLAS_CODECS[PAGE_CODEC_ATLAS[SURFACE_PAGE_BC7]].gpu_codec != GPU_CODEC_NONE &&
+				ATLAS_CODECS[PAGE_CODEC_ATLAS[SURFACE_PAGE_BC3]].gpu_codec != GPU_CODEC_NONE,
+		"every page codec must have a GPU block encoder, or no page could ever be stored in it");
+const AtlasCodec &page_codec(const int p_codec) {
+	return ATLAS_CODECS[PAGE_CODEC_ATLAS[CLAMP(p_codec, 0, int(SURFACE_PAGE_COUNT) - 1)]];
+}
 } // namespace
 
 // The helper source is concatenated after this preamble and before the bake body.
@@ -871,15 +892,15 @@ void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_
 
 void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_mode) {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
-	const int mode = CLAMP(p_mode, 0, ATLAS_CODEC_COUNT - 1);
+	const int mode = CLAMP(p_mode, 0, int(SURFACE_PAGE_COUNT) - 1);
 	if (mode == _tiers[tier].requested && _configured) {
 		return;
 	}
 	_tiers[tier].requested = mode;
 	_resolve_tier_compression(tier);
 	LOG(INFO, "Surface page compression requested for ", tier == TIER_SVT ? "SVT" : "AVT", ": ",
-			ATLAS_CODECS[_tiers[tier].requested].name,
-			"; effective: ", ATLAS_CODECS[_tiers[tier].effective.load()].name,
+			page_codec(_tiers[tier].requested).name,
+			"; effective: ", page_codec(_tiers[tier].effective.load()).name,
 			_tiers[tier].reason.is_empty() ? String() : String(" (") + _tiers[tier].reason + ")");
 	if (_configured) {
 		// The pages of that tier live in the previous format, so every page of the tier is
@@ -896,12 +917,10 @@ void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_m
 	}
 }
 
-// Resolves one tier's request against the block encoder this build ships and this device's
-// sampling support. The encoder is a compute shader, so the codecs it implements decide what
-// a page array can be stored in; a codec it does not implement has no producer and is
-// reported as unavailable instead of leaving pages that no encoder ever fills. The device
-// then has to be able to sample and update the resulting format, exactly as the engine's own
-// compressed texture storage does.
+// Resolves one tier's request against this device's sampling support. Which codecs a page can
+// be stored in at all is decided by the page codec list and its mapping to the block encoder's
+// table; the two invariants that list exists for are checked here as well, so a table edit
+// that broke one of them would be refused rather than stored as a page nothing can encode.
 void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 	TierState &tier = _tiers[p_tier];
 	const String tier_name = p_tier == TIER_SVT ? String("SVT") : String("AVT");
@@ -911,7 +930,7 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 	if (tier.requested == 0) {
 		return;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[tier.requested];
+	const AtlasCodec &codec = page_codec(tier.requested);
 	if (codec.channels != Image::USED_CHANNELS_RGBA) {
 		tier.reason = String(codec.name) +
 				" keeps no alpha channel, and the material pages store height, roughness and the validity bit in alpha";
@@ -957,10 +976,10 @@ Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) co
 	const int available = state.effective.load();
 	info["available"] = available;
 	info["applied"] = state.applied.load();
-	info["name"] = String(ATLAS_CODECS[available].name);
+	info["name"] = String(page_codec(available).name);
 	String reason = state.reason;
 	if (reason.is_empty() && available == 0 && state.requested != 0) {
-		reason = String(ATLAS_CODECS[state.requested].name) +
+		reason = String(page_codec(state.requested).name) +
 				String(" was resolved for this device, but the compressed page arrays could not be created");
 	}
 	info["reason"] = reason;
@@ -1073,7 +1092,7 @@ int64_t Terrain3DSurfaceBaker::_tier_sampled_bytes(const int p_tier) const {
 	if (mode == 0 || !_resources.sampled[tier].albedo_rd.is_valid()) {
 		return 0;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[mode];
+	const AtlasCodec &codec = page_codec(mode);
 	if (codec.block_words == 0) {
 		return 0;
 	}
@@ -1103,6 +1122,17 @@ void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const 
 			_ready_latency_max = MAX(_ready_latency_max, waited);
 			_ready_latency_samples++;
 		}
+	}
+}
+
+void Terrain3DSurfaceBaker::debug_clear_readiness(const int p_slot) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (p_slot < 0 || p_slot >= int(_ready.size())) {
+		return;
+	}
+	_ready[size_t(p_slot)] = 0;
+	if (p_slot < int(_sampled_channel_mask.size())) {
+		_sampled_channel_mask[size_t(p_slot)] = 0;
 	}
 }
 
@@ -1233,7 +1263,7 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 			_encode_pending[slot] = 0;
 			continue;
 		}
-		const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].applied.load()];
+		const AtlasCodec &codec = page_codec(_tiers[tier].applied.load());
 		const int blocks = (_stored_size + 3) / 4;
 		// Under the scratch regime the page already owns a ring page: it was taken when the
 		// page was produced, it is the layer the production wrote into, and it is what holds
@@ -1439,7 +1469,7 @@ void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, c
 	if (stale) {
 		return;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].applied.load()];
+	const AtlasCodec &codec = page_codec(_tiers[tier].applied.load());
 	const int blocks = (_stored_size + 3) / 4;
 	const int64_t expected = int64_t(blocks) * blocks * codec.block_words * int64_t(sizeof(uint32_t));
 	if (codec.block_words == 0 || p_data.size() != expected) {
@@ -1483,14 +1513,14 @@ Dictionary Terrain3DSurfaceBaker::probe_tier_compression(const int p_tier, const
 	result["tier"] = tier;
 	result["mode"] = _tiers[tier].effective.load();
 	result["applied"] = _tiers[tier].applied.load();
-	result["name"] = String(ATLAS_CODECS[_tiers[tier].effective.load()].name);
+	result["name"] = String(page_codec(_tiers[tier].effective.load()).name);
 	result["valid"] = false;
 	result["max_error"] = 0.0;
 	result["mean_error"] = 0.0;
 	if (p_image.is_null()) {
 		return result;
 	}
-	const AtlasCodec &codec = ATLAS_CODECS[_tiers[tier].effective.load()];
+	const AtlasCodec &codec = page_codec(_tiers[tier].effective.load());
 	if (codec.mode == Image::COMPRESS_MAX || codec.channels != Image::USED_CHANNELS_RGBA) {
 		result["valid"] = true;
 		return result;
@@ -2518,7 +2548,7 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["atlas_compression"] = _tiers[TIER_AVT].requested;
 	stats["atlas_compression_available"] = _tiers[TIER_AVT].effective.load();
 	stats["atlas_compression_applied"] = _tiers[TIER_AVT].applied.load();
-	stats["atlas_compression_name"] = String(ATLAS_CODECS[_tiers[TIER_AVT].effective.load()].name);
+	stats["atlas_compression_name"] = String(page_codec(_tiers[TIER_AVT].effective.load()).name);
 	stats["atlas_compression_reason"] = get_tier_compression_info(TIER_AVT).get("reason", String());
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		const String prefix = tier == TIER_SVT ? String("svt_compression") : String("avt_compression");

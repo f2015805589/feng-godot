@@ -261,6 +261,9 @@ private:
 	double _monitor_vt_peak_ms() const { return _vt.vt_cpu_peak_ms; }
 	double _monitor_avt_cpu_ms() const { return _vt.vt_avt_ms; }
 	double _monitor_svt_cpu_ms() const { return _vt.vt_svt_ms; }
+	// The geometry backend's pass, which the rendering server drives rather than the tick,
+	// so it is read from the mesher instead of from the VT state.
+	double _monitor_cdlod_cpu_ms() const;
 	int64_t _monitor_material_bytes() const;
 	int64_t _monitor_pages_ready() const;
 	int64_t _monitor_pages_pending() const;
@@ -353,6 +356,11 @@ public:
 	Dictionary get_vt_settings() const;
 	int prepare_vt_capture();
 	Array get_vt_pages() const;
+	// Diagnostic and test hook: makes one produced page read as not ready, without touching
+	// its indirection entry or its demand record. That is what a lost encode leaves behind,
+	// and only a demand pass noticing the missing content repairs it. Returns false when the
+	// slot is not currently ready, so a caller cannot mistake a no-op for a loss.
+	bool debug_lose_vt_page_readiness(int p_slot);
 	Dictionary get_vt_material_textures() const;
 	Ref<Image> get_vt_page_preview(int p_slot);
 	void invalidate_vt_materials();

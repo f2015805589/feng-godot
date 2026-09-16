@@ -980,22 +980,44 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	const auto pool = _vt.surface_vt->get_page_pool();
 	// A repeated plan with nothing left to upload still has to re-mark its resident
 	// pages as demanded, or the pool evicts them while the camera is stationary.
-	if (bool(_vt.avt_sector_stats.get("plan_reused", false)) && _vt.avt_idle_revision == pool->residency_revision) {
+	//
+	// The cached state is only idle while every page it holds still has content. A page
+	// whose production was lost after this state was reached - an encode that failed, a job
+	// dropped by the bundle rebuild that changed the producer's generation - keeps its
+	// indirection entry and its demand record, so the shader samples an empty layer and no
+	// other part of the pipeline would ever look at it again: the plan is reused and the
+	// pool's residency did not move, which is exactly the condition this shortcut tests.
+	// Readiness is therefore verified here and not assumed. The cost is one lookup per
+	// resident slot, on the loop that already touches every one of them.
+	const Terrain3DSurfaceBaker *idle_producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	int idle_lost = 0;
+	if (idle_producer) {
+		for (int slot : _vt.avt_resident_slots) {
+			if (!idle_producer->is_page_ready(slot)) { ++idle_lost; }
+		}
+	}
+	if (bool(_vt.avt_sector_stats.get("plan_reused", false)) && _vt.avt_idle_revision == pool->residency_revision &&
+			idle_lost == 0) {
 		for (int slot : _vt.avt_resident_slots) { pool->mark_demanded(slot); }
 		_vt.avt_sector_stats["produced"] = 0;
 		_vt.avt_sector_stats["prefetched"] = 0;
-		// An idle pass is only reached when the previous one produced nothing and the
-		// residency did not change, which means every planned page is resident and ready.
+		// An idle pass is only reached once the previous one produced nothing, the residency
+		// did not change, and every page above was verified to still have its content.
 		_vt.avt_sector_stats["visible_plan_pages"] = _vt.avt_sampled_pages;
 		_vt.avt_sector_stats["visible_missing_pages"] = 0;
 		_vt.avt_sector_stats["visible_pending_pages"] = 0;
 		_vt.avt_sector_stats["visible_late_pages"] = 0;
+		_vt.avt_sector_stats["idle_ready_lost"] = 0;
 		_vt.avt_late_pages = 0;
 		_vt.avt_missing_pages = 0;
 		_vt.avt_pending_pages = 0;
 		_vt.avt_demand_age.clear();
 		return 0;
 	}
+	// A page the cached state would have called resident is not ready, so this pass runs the
+	// real classification and reports what it finds instead of claiming a complete plan. The
+	// reading is what tells a lost page under a still camera from a settled view.
+	_vt.avt_sector_stats["idle_ready_lost"] = idle_lost;
 	_vt.avt_idle_revision = 0;
 	_vt.avt_resident_slots.clear();
 	_vt.surface_vt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);

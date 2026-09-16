@@ -6,6 +6,7 @@
 #include "terrain_3d.h"
 
 #include "logger.h"
+#include "terrain_3d_surface_baker.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_vt_visibility.h"
 
@@ -39,6 +40,14 @@ void Terrain3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(SIZE_512);
 	BIND_ENUM_CONSTANT(SIZE_1024);
 	BIND_ENUM_CONSTANT(SIZE_2048);
+
+	// The vocabulary the two page compression settings are written in, so a script reads
+	// `Terrain3D.SURFACE_PAGE_BC7` instead of a bare 1. It is not the asset array enum: see
+	// SurfacePageCompression for why a page has three options and an authored array has more.
+	BIND_ENUM_CONSTANT(SURFACE_PAGE_UNCOMPRESSED);
+	BIND_ENUM_CONSTANT(SURFACE_PAGE_BC7);
+	BIND_ENUM_CONSTANT(SURFACE_PAGE_BC3);
+	BIND_ENUM_CONSTANT(SURFACE_PAGE_COUNT);
 
 	ClassDB::bind_method(D_METHOD("get_version"), &Terrain3D::get_version);
 	ClassDB::bind_method(D_METHOD("set_debug_level", "level"), &Terrain3D::set_debug_level);
@@ -337,10 +346,13 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
 	// Storage format of the three material page arrays, per tier; the live settings are
 	// `surface_vt_compression` (near field) and `surface_svt_compression` (far field) inside
-	// their own groups below. Each tier's arrays carry an alpha channel the shader reads, so
-	// only codecs that keep alpha are usable, and a codec is only accepted when the GPU block
-	// encoder implements it: page compression never runs a CPU block encoder, which is what
-	// makes it cost this thread nothing.
+	// their own groups below. The list is short on purpose and names exactly what can store a
+	// page: BC7 and BC3 (the two RGBA codecs this build's GPU block encoder implements) plus
+	// uncompressed, which samples the staging arrays directly. A page carries height,
+	// roughness and its validity bit in alpha, so a codec that keeps no alpha cannot hold one,
+	// and page compression never runs a CPU block encoder - a codec that no shader here
+	// encodes has no producer at all. Both of those used to be inspector entries that resolved
+	// to uncompressed; they are not offered any more.
 	//
 	// They are separate settings because the tiers produce at very different rates. An AVT
 	// page is rewritten by every edit that invalidates it; an SVT page is assembled once from
@@ -349,7 +361,7 @@ void Terrain3D::_bind_methods() {
 	//
 	// The pre-split name stays a script-visible alias for the near field and is hidden from
 	// the inspector, so a scene saved against it keeps working.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA", PROPERTY_USAGE_NONE), "set_vt_atlas_compression", "get_vt_atlas_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA", PROPERTY_USAGE_NONE), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
 	// Source threads that assemble pages: 0 = auto (half the machine, 1..4).
@@ -367,7 +379,8 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_feedback"), "set_avt_feedback", "get_avt_feedback");
 	// Near-field page storage. AVT pages are rewritten by every edit that invalidates them,
 	// so this codec is paid per production; the GPU block encoder keeps that cost off the CPU.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_surface_vt_compression", "get_surface_vt_compression");
+	// See the shared comment on `vt_atlas_compression` for why the list has three entries.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA"), "set_surface_vt_compression", "get_surface_vt_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
@@ -404,7 +417,7 @@ void Terrain3D::_bind_methods() {
 	// Far-field page storage. A far-field page is assembled once from a baked cell and then
 	// never rewritten, so its compressed copy is final: this is the tier where a codec buys
 	// the most memory for the least work.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC1 RGB,BC3 RGBA,BC4 R,BC5 RG,BC6H HDR RGB,ETC1 RGB,ETC2 RGB,ETC2 RGBA,EAC R11,EAC RG11,ASTC 4x4 RGBA,ASTC 8x8 RGBA,ASTC 4x4 HDR RGBA,ASTC 8x8 HDR RGBA"), "set_surface_svt_compression", "get_surface_svt_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA"), "set_surface_svt_compression", "get_surface_svt_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");

@@ -24,6 +24,31 @@
 #include <vector>
 
 /**
+ * What a material page array can be stored in. This is deliberately a shorter list than the
+ * shared texture-array vocabulary the asset inspector offers, and the two must not be
+ * confused: an array of authored textures is compressed once on the CPU by the engine's own
+ * encoders, while a page is produced and stored on the GPU every time an edit invalidates it.
+ *
+ * Two properties decide a page's codec, and together they leave exactly these three:
+ *   - every one of the three page arrays carries an alpha value the shader reads (material
+ *     height, roughness, and the params validity bit), so a codec that keeps no alpha cannot
+ *     store a page at all - that rules out BC1, BC4, BC5 and BC6H;
+ *   - a page is only ever produced by this build's GPU block encoder (shaders/bc_encode.glsl),
+ *     because the cost that makes page compression worth having is that it never runs a CPU
+ *     codec per page - that rules out ETC2, EAC and ASTC, which no shader here encodes.
+ *
+ * Uncompressed is not a codec: the tier samples the staging arrays directly, exactly as it
+ * would with no page compression at all.
+ */
+enum SurfacePageCompression {
+	SURFACE_PAGE_UNCOMPRESSED = 0,
+	SURFACE_PAGE_BC7,
+	SURFACE_PAGE_BC3,
+	SURFACE_PAGE_COUNT,
+};
+VARIANT_ENUM_CAST(SurfacePageCompression);
+
+/**
  * Asynchronous material-page producer for the surface virtual texture.
  *
  * The object owns the compute resources and three main-rendering-device texture
@@ -382,12 +407,11 @@ public:
 	~Terrain3DSurfaceBaker() override;
 
 	void configure(int p_page_size, int p_border, int p_page_count);
-	// Storage format of the material page arrays, per tier. Each tier's three arrays share
-	// one format, and every one of them carries an alpha value the shader reads (material
-	// height, roughness, and the params validity bit), so only codecs that keep alpha are
-	// usable. A request is resolved once against the GPU block encoder this build ships and
-	// this device's sampling support; get_tier_compression_info() reports what was actually
-	// applied and why a request was refused.
+	// Storage format of the material page arrays, per tier, written in SurfacePageCompression.
+	// Each tier's three arrays share one format. Which codecs a page can be stored in at all
+	// is decided by that enum; what remains is a device question, so a request is resolved
+	// once against this device's sampling and update support, and
+	// get_tier_compression_info() reports what was applied and why a request was refused.
 	//
 	// The tiers are independent because their content is: an AVT page is rewritten whenever
 	// an edit invalidates it, while an SVT page is assembled once from a baked cell and then
@@ -454,6 +478,11 @@ public:
 	// belong to. Bind the material from this, never from the three getters above.
 	godot::Dictionary get_published_arrays() const;
 	bool is_page_ready(int p_slot) const;
+	// Diagnostic and test hook: drops one page's readiness and nothing else. The slot keeps
+	// its sequence, its tier and whatever its published indirection entry names, which is
+	// exactly the state a failed encode or a production dropped by a bundle rebuild leaves
+	// behind, so a test can check that a demand pass notices and produces the page again.
+	void debug_clear_readiness(int p_slot);
 	Dictionary export_page(int p_slot) const;
 	// Compress and decode one image through the codec a tier resolved to, and report the
 	// error it introduced. Deterministic and independent of the page pipeline, so a test can

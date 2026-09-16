@@ -82,6 +82,9 @@ public:
 
 	void snap();
 	Dictionary get_cdlod_stats() const;
+	// The last geometry pass's cost, for the node's own `terrain/cdlod_cpu` monitor. Zero
+	// while the compatible clipmap path is in use: that path has no CDLOD pass to report.
+	double get_cdlod_cpu_ms() const;
 	void invalidate_region_geometry();
 	void reset_target_position() { _last_target_position = V2_MAX; }
 	void update();

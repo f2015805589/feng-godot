@@ -78,10 +78,11 @@ func run() -> void:
 		quit(1)
 		return
 
-	# A codec that keeps alpha and that this build can actually store and sample. The
-	# producer resolves the request itself, so this asks it which modes it accepts.
+	# A codec this build can actually store and sample. The list a page setting offers is the
+	# producer's own codec list, so this walks exactly that and asks the producer which of them
+	# this device accepted.
 	var codec := -1
-	for mode in range(1, 16):
+	for mode in range(1, Terrain3D.SURFACE_PAGE_COUNT):
 		terrain.vt_atlas_compression = mode
 		await process_frame
 		require(terrain.vt_atlas_compression == mode, "the property must round trip mode %d" % mode)

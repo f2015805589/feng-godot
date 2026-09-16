@@ -3,6 +3,7 @@
 #include "terrain_3d.h"
 
 #include "logger.h"
+#include "terrain_3d_profile.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_vt_visibility.h"
@@ -36,75 +37,7 @@ Terrain3D::DebugLevel Terrain3D::debug_level{ ERROR };
 //   terrain_3d_properties.cpp  configuration setters
 //   terrain_3d_queries.cpp     raycasts, baked meshes, nav source geometry, warnings
 //   terrain_3d_bindings.cpp    ClassDB bindings and property registration
-
-namespace {
-// The terrain's CPU work is invisible to the engine's own profiler, because the node runs as
-// a GDExtension method rather than an instrumented engine function. It is published instead
-// through the profiler singleton the engine exposes, under names that all start with
-// `terrain/` so a timeline can tell the terrain apart from everything else.
-//
-// Nothing is emitted while no profiler client is attached, and the singleton is looked up
-// once per frame rather than once per zone, so a shipping build pays a frame check.
-class TerrainProfileZone {
-public:
-	explicit TerrainProfileZone(const char *p_name) {
-		_profiler = profiler();
-		if (_profiler) {
-			_profiler->call("begin_zone", String("terrain/") + p_name);
-		}
-	}
-	~TerrainProfileZone() {
-		if (_profiler) {
-			_profiler->call("end_zone");
-		}
-	}
-	TerrainProfileZone(const TerrainProfileZone &) = delete;
-	TerrainProfileZone &operator=(const TerrainProfileZone &) = delete;
-
-	// The profiler object while a client is connected, otherwise nullptr.
-	static Object *profiler() {
-		static Object *cached = nullptr;
-		static uint64_t checked_frame = UINT64_MAX;
-		Engine *engine = Engine::get_singleton();
-		const uint64_t frame = engine ? engine->get_process_frames() : 0;
-		if (frame == checked_frame) {
-			return cached;
-		}
-		checked_frame = frame;
-		cached = nullptr;
-		const StringName singleton_name("FengGodotTracy");
-		if (!engine || !engine->has_singleton(singleton_name)) {
-			return cached;
-		}
-		Object *profiler_object = engine->get_singleton(singleton_name);
-		if (!profiler_object || !profiler_object->has_method("is_started") ||
-				!profiler_object->has_method("begin_zone") || !profiler_object->has_method("end_zone")) {
-			return cached;
-		}
-		if (!bool(profiler_object->call("is_started"))) {
-			return cached;
-		}
-		// A profiler can be started in on-demand mode with nobody connected yet; emitting
-		// then would cost the game for an empty timeline.
-		if (profiler_object->has_method("is_profiler_connected") &&
-				!bool(profiler_object->call("is_profiler_connected"))) {
-			return cached;
-		}
-		cached = profiler_object;
-		return cached;
-	}
-
-	static void plot(const char *p_name, double p_value) {
-		Object *profiler_object = profiler();
-		if (profiler_object && profiler_object->has_method("plot")) {
-			profiler_object->call("plot", String("terrain/") + p_name, p_value);
-		}
-	}
-
-private:
-	Object *_profiler = nullptr;
-};
-} // namespace
+//   terrain_3d_profile.h       the `terrain/...` profiler zone and plot helper
 
 ///////////////////////////
 // Private Functions
@@ -226,6 +159,7 @@ void Terrain3D::_register_debug_monitors() {
 		{ "vt_cpu_peak", callable_mp(this, &Terrain3D::_monitor_vt_peak_ms), MONITOR_TYPE_TIME },
 		{ "avt_cpu", callable_mp(this, &Terrain3D::_monitor_avt_cpu_ms), MONITOR_TYPE_TIME },
 		{ "svt_cpu", callable_mp(this, &Terrain3D::_monitor_svt_cpu_ms), MONITOR_TYPE_TIME },
+		{ "cdlod_cpu", callable_mp(this, &Terrain3D::_monitor_cdlod_cpu_ms), MONITOR_TYPE_TIME },
 		{ "material_bytes", callable_mp(this, &Terrain3D::_monitor_material_bytes), MONITOR_TYPE_MEMORY },
 		{ "pages_ready", callable_mp(this, &Terrain3D::_monitor_pages_ready), MONITOR_TYPE_QUANTITY },
 		{ "pages_pending", callable_mp(this, &Terrain3D::_monitor_pages_pending), MONITOR_TYPE_QUANTITY },
@@ -261,13 +195,17 @@ void Terrain3D::_unregister_debug_monitors() {
 		return;
 	}
 	// The monitors call back into this node, so they have to be gone before it is freed.
-	for (const char *name : { "vt_cpu", "vt_cpu_peak", "avt_cpu", "svt_cpu", "material_bytes",
-				 "pages_ready", "pages_pending", "pages_late" }) {
+	for (const char *name : { "vt_cpu", "vt_cpu_peak", "avt_cpu", "svt_cpu", "cdlod_cpu",
+				 "material_bytes", "pages_ready", "pages_pending", "pages_late" }) {
 		const StringName id(_monitor_prefix + name);
 		if (performance->has_custom_monitor(id)) {
 			performance->remove_custom_monitor(id);
 		}
 	}
+}
+
+double Terrain3D::_monitor_cdlod_cpu_ms() const {
+	return _terrain_mesher ? _terrain_mesher->get_cdlod_cpu_ms() : 0.0;
 }
 
 int64_t Terrain3D::_monitor_material_bytes() const {

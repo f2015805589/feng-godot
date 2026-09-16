@@ -869,12 +869,24 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 				distance, page_world_size, max_local_mip);
 		// Only produce the pages this pass actually allocated. A hit already holds
 		// content, and re-producing it every tick would swamp the atlas uploads.
+		//
+		// A hit is only a hit while the producer still has the page's content, though: an
+		// encode that failed or a production dropped by a bundle rebuild leaves the table
+		// naming a slot nothing ever filled, and treating that as resident kept sampling an
+		// empty layer for the rest of the session. The retry only applies to a page the demand
+		// path produced, which is what its demand record says: a page written straight into
+		// the atlas - an explicit capture, or the direct-material diagnostic - is the caller's
+		// content, and producing over it would erase what that caller just wrote.
 		std::vector<Vector3i> missing;
 		for (const Vector3i &request : requests) {
 			bool was_miss = false;
 			const int request_slot = _vt.surface_vt->request_page_internal(region_loc, request.z, request.x,
 					request.y, &was_miss);
-			if (request_slot >= 0 && was_miss) {
+			if (request_slot < 0) {
+				continue;
+			}
+			const bool tracked = _vt.vt_page_records.has(request_slot);
+			if (was_miss || (tracked && _vt_page_production_stale(request_slot))) {
 				_invalidate_vt_slot(request_slot);
 				missing.push_back(request);
 			}

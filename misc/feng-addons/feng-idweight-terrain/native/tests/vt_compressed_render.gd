@@ -14,8 +14,9 @@ const PAGE_BORDER := 2
 const NEAR_WORLD := Vector2(96.0, 96.0) # region (1, 1), material 1
 const FAR_WORLD := Vector2(224.0, 224.0) # region (3, 3), material 1
 
+# The two page codecs the block encoder implements, in the order the settings offer them.
 const BC7 := 1
-const BC3 := 3
+const BC3 := 2
 
 var terrain: Terrain3D
 var scene: Node3D
