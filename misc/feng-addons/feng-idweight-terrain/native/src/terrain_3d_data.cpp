@@ -75,8 +75,10 @@ void Terrain3DData::_grow_slot_capacity(const int p_needed) {
 	while (capacity < p_needed) {
 		capacity *= 2;
 	}
-	// Bounded by MAX_REGIONS, not by the world grid: the shader drops layer indices
-	// at or above it, so a larger slot table would silently fail to render.
+	// Bounded by MAX_MAP_SLOTS, the CPU ceiling that matches the material's largest
+	// selectable `max_regions` - not by the world grid. The shader drops any layer
+	// index at or above the MAX_REGIONS it was compiled with, so a table that grew
+	// past the ceiling could never render that layer.
 	capacity = MIN(capacity, MAX_MAP_SLOTS);
 	if (capacity < p_needed) {
 		LOG(ERROR, "Slot capacity ", capacity, " cannot hold ", p_needed,
@@ -194,7 +196,7 @@ int Terrain3DData::_acquire_slot(const Vector2i &p_region_loc) {
 	// slot + 1 keeps 0 meaning "no region", the same encoding region_id used.
 	_region_map[map_index] = slot + 1;
 	_set_directory_entry(map_index, slot + 1);
-	_mark_slot_dirty(slot, 0xF);
+	_mark_slot_dirty(slot, SLOT_MAP_ALL);
 	return slot;
 }
 
@@ -465,7 +467,7 @@ int Terrain3DData::_slot_map_mask(const MapType p_map_type) {
 		case TYPE_COLOR:
 			return 1 << SLOT_MAP_COLOR;
 		default:
-			return 0xF;
+			return SLOT_MAP_ALL;
 	}
 }
 
@@ -689,7 +691,7 @@ bool Terrain3DData::is_region_deleted(const Vector2i &p_region_loc) const {
 }
 
 Ref<Terrain3DRegion> Terrain3DData::add_region_blankp(const Vector3 &p_global_position, const bool p_update) {
-	return add_region_blank(get_region_location(p_global_position));
+	return add_region_blank(get_region_location(p_global_position), p_update);
 }
 
 Ref<Terrain3DRegion> Terrain3DData::add_region_blank(const Vector2i &p_region_loc, const bool p_update) {

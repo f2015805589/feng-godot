@@ -266,7 +266,7 @@ vec3 idweight_projection_normal_to_world(vec3 normalPS, uint projectionAxis, vec
 	// Multiplying restores the invariant the slope evaluator depends on -- a
 	// neutral normal map (nU = nV = 0, nH = 1) reproduces the geometric normal
 	// exactly on every projection axis.
-	// An `axisSign` carried through the swizzle would multiply the depth
+	// An axis sign factor carried through the swizzle would multiply the depth
 	// component on the way in and again on the way out, so it cancels; it is
 	// omitted here.
 	vec3 g = normalize(geometricNormalWS);

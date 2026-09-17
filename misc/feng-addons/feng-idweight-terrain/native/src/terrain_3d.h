@@ -88,7 +88,6 @@ private:
 	// terrain_3d_vt_state.h for the field groups.
 	Terrain3DVTState _vt;
 
-
 	bool _ensure_vt_capacity(int p_required);
 	void _process_async_svt_pages();
 	uint32_t _svt_cell_signature(const Vector2i &p_cell) const;
@@ -108,7 +107,7 @@ private:
 	void _avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_pages);
 	void _avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max_pages);
 	void _avt_finish_produce(Terrain3DAVTProducePass &r_pass);
-	PackedByteArray _avt_plan_state(bool p_bounds_ready) const;
+	Terrain3DAVTPlanKey _avt_plan_state(bool p_bounds_ready) const;
 	int _avt_install_or_reuse_plan(uint64_t p_started, int p_max_pages, bool p_same_plan);
 	Terrain3DAVTSectorScan _avt_scan_sectors(const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position,
 			bool p_bounds_ready, const Vector2 &p_focus, float p_reach) const;
@@ -118,7 +117,7 @@ private:
 	float _avt_logical_ratio() const;
 	Terrain3DAVTHierarchy _avt_build_hierarchy(const Terrain3DAVTSectorScan &p_scan);
 	void _avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, const Vector2 &p_focus, float p_reach);
-	void _avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const PackedByteArray &p_plan_key,
+	void _avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terrain3DAVTPlanKey &p_plan_key,
 			const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position, bool p_bounds_ready,
 			const Vector2 &p_focus, float p_reach);
 	bool _avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy, bool p_directory_dirty);
@@ -242,14 +241,18 @@ private:
 	// as the stages it runs - see the definition for what the pyramid is for.
 	std::array<double, 4> _svt_plan_roots(const Rect2 &p_domain, int p_maximum_mip, int p_coverage_limit,
 			int p_physical_page_count, int &r_produced, bool &r_cached);
-	// Whether a published far-field page still has no content: true when the producer does
+	// Whether a published page still has no content: true when the producer does
 	// not hold it ready and no production for it is in flight. Demand re-produces such a page
-	// instead of treating its indirection entry as a hit.
+	// instead of treating its indirection entry as a hit. Both views and the service ask this,
+	// so it is declared here and defined in the far field's demand file.
 	bool _vt_page_production_stale(int p_slot);
 	// The same question with the producer's answer already known (-1 asks it here), so a
 	// verification pass over a whole resident set takes one lock instead of one per page.
 	bool _vt_page_production_stale(int p_slot, int p_ready);
-	String _svt_page_path(const Vector2i &p_address, int p_mip) const;
+	// The persisted far-field cell file for one address. A cell file carries its whole mip
+	// chain, so there is no per-mip path: mip 0 names the cell. This took a mip parameter it
+	// hard-coded to 0, which is a trap for the next caller rather than information.
+	String _svt_page_path(const Vector2i &p_address) const;
 	void _invalidate_vt_region(const Vector2i &p_region);
 	void _process_svt_auto_bake();
 	int _queue_svt_bake(const Dictionary &p_dirty_regions);
@@ -353,7 +356,7 @@ public:
 	int get_vt_page_size() const { return _vt.vt_page_size; }
 	void set_vt_page_border(int p_border);
 	int get_vt_page_border() const { return _vt.vt_page_border; }
-	void set_vt_auto_capacity(bool p_enabled) { _vt.vt_auto_capacity = p_enabled; _vt.avt_plan_key.clear(); }
+	void set_vt_auto_capacity(bool p_enabled) { _vt.vt_auto_capacity = p_enabled; invalidate_avt_plan_key(_vt.avt_plan_key); }
 	bool get_vt_auto_capacity() const { return _vt.vt_auto_capacity; }
 	void set_vt_page_count(int p_count);
 	int get_vt_page_count() const { return _vt.vt_page_count; }
@@ -465,29 +468,35 @@ public:
 	// Page-arrival fade: the per-slot ramp a page comes in over, so a page arriving is a
 	// sharpen instead of a rectangular step in the image. The texture is one texel per
 	// physical slot, which is what lets the shader index it by the slot the indirection
-	// lookup already decoded. See Terrain3D::_update_vt_page_fade().
+	// lookup already decoded. The pass that fills it, and the arrival decision it makes, are
+	// in terrain_3d_vt_fade.cpp.
 	RID get_vt_page_fade_rid() const { return _vt.vt_page_fade_texture.is_valid() ? _vt.vt_page_fade_texture->get_rid() : RID(); }
 	int get_vt_page_fade_frames() const { return _vt.vt_page_fade_frames; }
 	void set_vt_page_fade_frames(int p_frames);
-	// Records whether a page's content is there yet, so the tick a page stops being pending
-	// is the tick its fade starts. Called by both tiers' demand passes, which are what ask
-	// the producer for readiness.
+	// Records that a slot's content is missing or still being produced, so the tick it stops
+	// waiting - which `_update_vt_page_fade()` decides against the producer - is the tick its
+	// fade starts. Set where content is removed or queued, never by a demand pass.
+	void _vt_mark_page_waiting(int p_slot);
+	// Turns those records and the producer's readiness into the per-slot ramp the shader reads,
+	// on every tick whether or not a demand pass ran. See terrain_3d_vt_fade.cpp.
+	void _update_vt_page_fade();
 	// Wakes both source pipelines' workers for the work the pass that just ended submitted.
 	void _flush_source_wakes();
 	// As above, but a no-op while the physics tick is running: the tick releases them itself, after
 	// its phases have been measured.
 	void _flush_source_wakes_unless_ticking();
-	void _vt_note_page_readiness(int p_slot, bool p_ready);
-	void _update_vt_page_fade();
 	void set_surface_vt_region_offset(const Vector2i &p_offset) { _vt.surface_vt_region_offset = p_offset; }
 	Vector2i get_surface_vt_region_offset() const { return _vt.surface_vt_region_offset; }
 	void set_surface_vt_forward_regions(real_t p_forward) { _vt.surface_vt_forward_regions = CLAMP(p_forward, -64.f, 64.f); }
 	real_t get_surface_vt_forward_regions() const { return _vt.surface_vt_forward_regions; }
 	Rect2i get_surface_vt_region_rect() const;
-	// Forces every sector to one mip, so a test can ask for a specific level instead
-	// of whatever the distance rule picks.
+	// Screen texels per pixel of world surface, i.e. how much finer than the pixel footprint the
+	// demand asks the near field to be. It scales the density the scan turns into a wanted page
+	// size, so raising it buys sharpness at the cost of pages.
 	void set_surface_vt_texels_per_pixel(real_t p_value) { _vt.surface_vt_texels_per_pixel = MAX(0.25f, p_value); }
 	real_t get_surface_vt_texels_per_pixel() const { return _vt.surface_vt_texels_per_pixel; }
+	// Forces every sector to one mip, so a test can ask for a specific level instead
+	// of whatever the distance rule picks.
 	void set_surface_vt_force_mip(const bool p_enabled, const int p_mip = 0);
 	bool is_surface_vt_force_mip() const { return _vt.surface_vt_force_mip; }
 	// Storage format of the material page arrays, per tier, one format for each tier's three

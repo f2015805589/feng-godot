@@ -1,4 +1,4 @@
-// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef CONSTANTS_CLASS_H
 #define CONSTANTS_CLASS_H

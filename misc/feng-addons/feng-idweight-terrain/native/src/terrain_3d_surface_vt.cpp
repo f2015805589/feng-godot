@@ -1,4 +1,28 @@
 // Copyright © 2026 Terrain3D contributors.
+//
+// The virtual texture service itself: everything that owns the page pool, the page records and the
+// two views' lifetime, plus the far field's bake. It is the oldest of the VT files and the largest,
+// so what is in it is worth stating - the settings, the service check, the page plumbing and the
+// diagnostics, in that order:
+//
+//   * the settings the dock and scripts write: page size, border, count, source workers, the motion
+//     lead, the resolution preset, and both tiers' storage format. `terrain_3d_vt_service.cpp` holds
+//     the two *enable* setters and the per-view page settings; these are the ones that size the
+//     shared service under them.
+//   * `_configure_vt_service()` / `_update_vt_service()` / `_destroy_vt_service()`: the shared
+//     service's setup, its per-tick health check, and teardown. A demand pass never runs without a
+//     page table because this is what guarantees it.
+//   * page plumbing: invalidation, the material page queue, the far-field cell store and the two
+//     helpers that decide whether a far page can be assembled from resident cells.
+//   * the far field's bake: `bake_svt()`, the automatic bake pass and the queue that serializes
+//     them. A bake writes cells to disk, which is a different job from producing pages.
+//   * the diagnostics the dock, the editor inspector and the tests read: `get_vt_settings()`,
+//     `get_vt_pages()`, the previews and the compression probe.
+//
+// The addressing lives in terrain_3d_virtual_texture.cpp, the producer in
+// terrain_3d_surface_baker.cpp, the source jobs in terrain_3d_page_pipeline.cpp, the near field in
+// terrain_3d_sector_avt.cpp with terrain_3d_avt_plan.cpp / terrain_3d_avt_produce.cpp, and the far
+// field's demand pass with the page-arrival fade in terrain_3d_vt_demand.cpp / terrain_3d_vt_fade.cpp.
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
@@ -160,7 +184,7 @@ void Terrain3D::set_vt_page_workers(int p_workers) {
 	_vt.vt_page_pipeline.reset();
 	_vt.svt_page_pipeline.reset();
 	_vt.svt_pending_pages.clear();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	_vt.avt_refinement.reset();
 }
 void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
@@ -173,7 +197,7 @@ void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
 		_vt.avt_motion_lead = Vector2();
 	}
 	// A lead is part of the plan key, so a change has to be planned again.
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 }
 
 void Terrain3D::_cancel_svt_bake(const String &p_reason) {
@@ -359,7 +383,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.svt_startup_ready = false;
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// Detach both views before replacing their common pool. Clearing one view must
@@ -389,7 +413,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.svt_pending_pages.clear();
 	_vt.vt_registered_sectors.clear();
 	_vt.avt_directory_bytes.clear();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	_vt.avt_page_plan.clear();
 	_vt.avt_prefetch_plan.clear();
 	_vt.avt_registered_owners.clear();
@@ -677,7 +701,7 @@ void Terrain3D::_destroy_vt_service() {
 	_vt.svt_pending_pages.clear();
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	_vt.svt_cell_baker.unref();
 	if (_vt.vt_callback_registered && RS && RS->has_method("virtual_texture_remove_update_callback")) {
 		RS->call("virtual_texture_remove_update_callback", int64_t(get_instance_id()));
@@ -711,6 +735,13 @@ void Terrain3D::_flush_source_wakes_unless_ticking() {
 }
 
 void Terrain3D::_invalidate_vt_slot(int p_slot) {
+	// The slot's content is gone, so whatever it holds next is an arrival. The fade has to be
+	// told here and not only by the demand pass's readiness check: a page dropped and produced
+	// again between two passes is an arrival no pass ever saw as empty, so it landed as a step -
+	// the rectangular pop the fade exists to prevent. A page whose production is lost is
+	// invalidated through this function, and so is the slot a page is about to be written into,
+	// which is what makes every produced page an arrival the fade can see.
+	_vt_mark_page_waiting(p_slot);
 	_vt.svt_pending_pages.erase(p_slot);
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
 	if (_vt.vt_baker.is_valid() && p_slot >= 0) {
@@ -719,10 +750,11 @@ void Terrain3D::_invalidate_vt_slot(int p_slot) {
 	_vt.vt_page_records.erase(p_slot);
 }
 
-String Terrain3D::_svt_page_path(const Vector2i &p_address, int p_mip) const {
+String Terrain3D::_svt_page_path(const Vector2i &p_address) const {
 	if (_data_directory.is_empty()) {
 		return String();
 	}
+	// Mip 0 names the cell; the cell's own mip chain lives inside the file.
 	return TerrainVTCell::path(_data_directory, p_address, 0);
 }
 
@@ -912,12 +944,11 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (_vt.vt_debug_direct_material || !producer || p_slot < 0 || (!p_svt && p_payload.is_null())) {
 		return;
 	}
-	// The slot's content is being (re)written from here, so it is not ready by definition until a
-	// demand pass observes it again. Every production funnels through this call, which is what
-	// makes the fade's start robust: a page re-produced into a *fresh* slot has no earlier
-	// unready reading, so keying only on the demand pass's own observations would miss exactly the
-	// case of a page that moved slots - and never fade it.
-	_vt_note_page_readiness(p_slot, false);
+	// The slot's content is being (re)written from here, so it is waiting for content until the
+	// fade pass finds it ready. Every production funnels through this call, which is what makes
+	// the arrival decision complete: a page re-produced into a *fresh* slot has no earlier
+	// unready reading anywhere else.
+	_vt_mark_page_waiting(p_slot);
 	Ref<Image> height;
 	Dictionary record;
 	record["slot"] = p_slot;
@@ -995,7 +1026,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// A resident far-field cell is stale from the moment a region in it - or beside it, since
@@ -1150,6 +1181,9 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
 	result["vt_page_fade_frames"] = _vt.vt_page_fade_frames;
 	result["vt_page_fade_active_slots"] = _vt.vt_page_fade_active;
+	result["vt_page_fade_starts"] = int64_t(_vt.vt_page_fade_starts);
+	result["vt_page_fade_pending_slots"] = _vt.vt_page_fade_pending;
+	result["vt_page_fade_ticks_max"] = _vt.vt_page_fade_ticks_max;
 	Dictionary phases;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
@@ -1263,7 +1297,7 @@ uint32_t Terrain3D::_svt_cell_signature(const Vector2i &p_cell) const {
 
 Dictionary Terrain3D::_load_svt_cell(const Vector2i &p_cell) {
 	// Explicit/incremental bake validation only. Runtime reads use the worker.
-	String path = _svt_page_path(p_cell, 0);
+	String path = _svt_page_path(p_cell);
 	if (path.is_empty() || !FileAccess::file_exists(path)) { return Dictionary(); }
 	Ref<FileAccess> file = FileAccess::open(path, FileAccess::READ);
 	Variant value = file.is_valid() ? file->get_var(false) : Variant();
@@ -1285,7 +1319,7 @@ Array Terrain3D::get_svt_baked_pages() {
 			if (_vt.vt_svt_tiles.has(tile_key(cell, 0))) {
 				continue;
 			}
-			String path = _svt_page_path(cell, 0);
+			String path = _svt_page_path(cell);
 			if (!FileAccess::file_exists(path)) {
 				continue;
 			}
@@ -1425,7 +1459,7 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 					images[name] = image;
 				}
 			}
-			String path = _svt_page_path(cell, 0);
+			String path = _svt_page_path(cell);
 			// The resident copy is published first and independently of the file: it is what
 			// the runtime reads, and a read-only or full disk must not stop the far field
 			// from being served from device memory.

@@ -548,4 +548,3 @@ bool Terrain3DMaterial::_needs_vt_shader() const {
 			(!_terrain->is_vt_editor_preview_active() &&
 					(_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
 }
-

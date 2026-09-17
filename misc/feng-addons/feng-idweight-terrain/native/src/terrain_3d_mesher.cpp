@@ -136,7 +136,7 @@ void Terrain3DMesher::_generate_clipmap() {
 			}
 		}
 
-		// Append LOD to _lod_rids array
+		// Append the LOD RID to _clipmap_rids
 		_clipmap_rids.push_back(std::move(lod));
 	}
 }

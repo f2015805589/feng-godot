@@ -49,12 +49,20 @@ space with background disabled` — is recorded as `fail` in `terrain-regression
 `terrain-regression-final.json` and `terrain-avt-after.json`, and as `pass` in
 `terrain-avt-final-suite.json` and `terrain-avt-targeted-reruns.json`. Neither is a signal about
 a library change; both are worth re-reading from the recorded runs before they are believed.
-t_pressure asserts settings.shared_pool and flips on the unmodified binary, and editor_dock:setup (\Add Region did not expand into empty space with background disabled\) is recorded as \\ail\\ in \	errain-regression.json\, \	errain-regression-final.json\ and \	errain-avt-after.json\ and as \\pass\\ in \	errain-avt-final-suite.json\ and \	errain-avt-targeted-reruns.json\. Neither is a signal about a library change; both are worth re-reading from the recorded runs before they are believed.
+`vt_compression` joined them once, on 09-17: `a replaced page array must be released once the material
+rebinds, got 8` fired on one run and passed on the next run of the same binary (11.5 s, matching its
+recorded time), whose only change was the deletion of two unreferenced header aliases. It reads a
+refcount one frame early, so a failure of it is worth a re-run before it is believed.
 
 **`vt_turn_budget` is a pre-existing, deterministic failure — and its cost is one phase, not three.**
 It has failed in *every* recorded run in `bin/`, from `terrain-regression.json` (09-15 02:51) through
 `vt-suite-srgb-idle.json` (09-17 00:49), including runs taken before this pass touched anything. It is
 not a flake and not a regression; it is an unmet budget that has been unmet the whole time.
+*(Its verdict is superseded in part by "the noise is the scheduler, and the work counters prove it"
+below: runs of the same binary with byte-identical work counters measure the near field inside the
+budget, so the failure is machine state and not a constant. The history above is what the file
+recorded before those counters were read, and its reading that the cold sweep is the real failure
+still holds.)*
 
 Read from one run, the four sweeps separate cleanly:
 
@@ -77,7 +85,12 @@ All figures are milliseconds, from the debug template, which runs about 1.5x the
   420–901, i.e. the 8 ms pass happened during the settle phase, hundreds of frames before the sweep
   being reported. `report()` now prints that age; without it the number reads as the sweep's cost.
 * **`topup` is a reported zero.** The phase was removed and its key kept so consumers do not break, so
-  `phases["topup"]` is always 0. It cannot be over any budget.
+  `phases["topup"]` is always 0. It cannot be over any budget. The test prints the column as
+  `topup_or_bake = max(topup, bake)` because both phases used to be one number a reader compares against
+  the same budget — so a **non-zero value in that column is the far-field bake, never a top-up**: the
+  measured column reads 0.0001–0.0003 ms mean and 0.001–0.003 ms peak, and the bake is what holds the
+  value up. `vt_topup_ms` is the residual between the far-field pass and the bake, i.e. the cost of the
+  phase bookkeeping itself, and it is why the column is a few microseconds and not exactly zero.
 
 Where the cold-turn near-field cost goes, from the same run's `avt_sector_stats`: `produce_ms` 0.637,
 `cpu_update_ms` 0.916, `retain_ms` 0.512, against 0.001 for `retain_ms` warm. `_avt_retain_visible()`
@@ -887,6 +900,35 @@ workers, the engine and a shell shared the CPU. Closing it needs a quieter measu
 release template rather than the debug one, or a pinned process — and the two structural candidates
 are recorded above the noise floor rather than chased through it: stop sharing one mutex between the
 demand pass and the workers' claim/complete path, and stage the planning chain.
+
+**The noise is the scheduler, and the work counters prove it.** `vt_turn_budget` was run nine times
+across five revisions of the near field, and *every one* of those runs reports byte-identical work at
+the warm report — `sector_ticks` 421, `reuse_ticks` 402, `chain_ticks` 19, `plan_refresh_skips` 108,
+`plan_refresh_frames` 7, `requested_physical_pages` 157, `retained_requests` 93, `visible_plan_pages`
+64, `refinement_requests_denied` 116 — while the phase means are:
+
+| run | `avt` mean (warm) | `avt` mean (slow) | `avt` mean (cold) | `svt` mean (warm) | `service` mean (warm) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.1299 | 0.1056 | 0.0873 | 0.0453 | 0.0137 |
+| 2 | 0.1142 | 0.0799 | 0.0611 | 0.0450 | 0.0126 |
+| 3 | 0.0863 | 0.0774 | 0.0657 | 0.0379 | 0.0098 |
+| 4 | 0.0874 | 0.0801 | 0.0619 | 0.0372 | 0.0096 |
+| 5 | 0.1432 | 0.0833 | 0.0691 | 0.0517 | 0.0150 |
+| 6 | 0.1068 | 0.0871 | 0.0808 | 0.0440 | 0.0110 |
+| 7 | 0.1189 | 0.0938 | 0.0702 | 0.0436 | 0.0128 |
+| 8 | 0.1213 | 0.1275 | 0.0785 | 0.0494 | 0.0143 |
+| 9 | 0.0912 | 0.1098 | 0.0739 | 0.0423 | 0.0127 |
+
+The same sweep on the same binary spans 0.0863–0.1432 ms, and the `service` mean — whose entire work
+is a few microseconds of cache checks — moves by 46% with it. One 3 ms deschedule inside a 60 frame
+sweep is worth 0.05 ms of its mean, which is the whole of the spread. The drift is also monotone
+within a session (runs 3–4 were taken an hour before 5–9, and every phase moved up together while
+the counters did not), so a run is only comparable to another taken under the same machine state. The
+warm and slow sweeps even swap sides: run 8 has the slow one over budget and the warm one at 0.1213,
+run 9 the reverse (warm 0.0912, slow 0.1098), with `chain_ticks` 19 and `sector_ticks` 421 in both. A
+threshold on either mean is a coin flip on a loaded machine, in both directions, and a red
+`vt_turn_budget` is not by itself evidence about the code: read the counters and the stage sums
+first.
 
 **The phase's cost was mostly the main thread being descheduled, not work.** `prime` inserts seven
 requests and measured 0.14–0.25 ms for it — 20–35 µs per insert — while the same seven inserts cost

@@ -282,10 +282,11 @@ mip-chain walk, POT allocation/non-overlap/resize-rollback and the full 65,536-l
 
 ### 4.5 VT runtime skeleton — implemented now
 
-`Terrain3DVirtualTexture` (`native/src/terrain_3d_virtual_texture.{h,cpp}`) is the physical
-page atlas, the indirection texture and the slot allocator, built directly on the
-contract-tested core in `terrain_vt.h`. It owns no terrain data, so it is constructible and
-testable on its own.
+`Terrain3DVirtualTexture` (`native/src/terrain_3d_virtual_texture.{h,cpp}`) is one view's
+indirection texture and addressing, and `Terrain3DVTPagePool`
+(`native/src/terrain_3d_vt_page_pool.{h,cpp}`) is the physical page atlas and slot allocator the
+two views share, both built directly on the contract-tested core in `terrain_vt.h`. Neither owns
+terrain data, so both are constructible and testable on their own.
 
 * **Sectors.** `register_sector(loc, block_size)` hands a region a power-of-two block of
   virtual pages through `TerrainVT::VirtualImageAtlas`, so blocks never overlap and AVT
@@ -1336,7 +1337,8 @@ and were left alone rather than fixed blind.
 | Per-frame VT state and settings | `native/src/terrain_3d_vt_state.h` |
 | Near-field planner, directory, production pass | `native/src/terrain_3d_sector_avt.cpp` |
 | Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_vt_service.cpp`, `terrain_3d_vt_demand.cpp` |
-| Page table, physical pool, page read/write | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
+| Page table (indirection), per-view addressing | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
+| Shared physical pool: atlas, slots, LRU, ownership | `native/src/terrain_3d_vt_page_pool.{h,cpp}` |
 | Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_surface_vt.cpp` |
 | Resident far-field cell sources (GPU arrays, budget, eviction) | `native/src/terrain_3d_vt_cells.{h,cpp}` |
 | GPU page demand | `native/src/terrain_3d_vt_feedback.{h,cpp}` |

@@ -72,7 +72,7 @@ private:
 	// by the Undo system.
 	Dictionary _regions; // Dict[region_location:Vector2i] -> Terrain3DRegion
 
-	// All _active_ region maps are maintained in these secondary indices.
+	// All active region maps are maintained in these secondary indices.
 	// Regions are considered active if and only if they exist in `_region_locations`.
 	// This list stays dense and is the user facing index; the *layer* index the shader
 	// and the image arrays use is the stable slot table below.
@@ -110,6 +110,10 @@ private:
 		SLOT_MAP_SURFACE,
 		SLOT_MAP_MAX,
 	};
+	// One bit per SlotMap entry: the "every map is stale" mask _slot_dirty uses when a
+	// slot is assigned, and the mask a request for TYPE_MAX resolves to. Both were the
+	// literal 0xF, which would have gone on meaning four maps after a fifth was added.
+	static inline const int SLOT_MAP_ALL = (1 << SLOT_MAP_MAX) - 1;
 
 	std::vector<Vector2i> _slot_locations; // slot -> region location, V2I_MAX when free
 	Dictionary _region_slots; // Dict[region_location:Vector2i] -> slot:int

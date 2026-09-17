@@ -1,4 +1,12 @@
 // Camera-visible SVT demand. Legacy raw-ID diagnostics retain their original scan.
+//
+// The three page helpers this file used to open with - the arrival flag, the fade pass and
+// the fade setting - now live in terrain_3d_vt_fade.cpp: they run on every tick and belong
+// to both views, while everything here is the far field. What stays is the root pyramid
+// plan, the visible walk, the demand pass that spends the page budget on them, and
+// `_vt_page_production_stale()` above them, which the near field's production pass and the
+// service call as well - a published page that has lost its content is the same question
+// for both views, so it is not the far field's helper.
 #include "terrain_3d_svt.h"
 #include "terrain_3d.h"
 #include "terrain_3d_material.h"
@@ -51,80 +59,6 @@ bool Terrain3D::_vt_page_production_stale(int p_slot, int p_ready) {
 		return now > queued + SVT_PAGE_RETRY_FRAMES;
 	}
 	return true;
-}
-
-// A page can only be faded in once its content is there. Both tiers' demand passes already ask
-// the producer for readiness, so the transition is recorded here rather than by hooking the
-// producer: a slot a pass found resident without content, and that has content now, is a page
-// that just arrived, and that is the tick its fade starts.
-void Terrain3D::_vt_note_page_readiness(int p_slot, bool p_ready) {
-	if (_vt.vt_page_fade_frames <= 0 || p_slot < 0) { return; }
-	const size_t slot = size_t(p_slot);
-	if (slot >= _vt.vt_slot_pending.size()) { return; }
-	if (p_ready) {
-		if (_vt.vt_slot_pending[slot] != 0) {
-			_vt.vt_slot_pending[slot] = 0;
-			_vt.vt_slot_fade_ticks[slot] = uint8_t(MIN(255, _vt.vt_page_fade_frames));
-		}
-	} else {
-		_vt.vt_slot_pending[slot] = 1;
-	}
-}
-
-// Publishes the per-slot arrival fade the shader blends with. The texture is one byte per
-// physical slot, indexed by the slot the indirection lookup already decoded, so the fade costs
-// the shader one extra fetch and no address arithmetic. A settled slot reads 255 (fade 1, the
-// page itself), which is what the whole texture holds when nothing is arriving - so a settled
-// view uploads nothing at all.
-void Terrain3D::_update_vt_page_fade() {
-	_vt.vt_page_fade_active = 0;
-	if (_vt.vt_page_fade_frames <= 0 || !_vt.surface_vt || !_vt.vt_shared_ready) { return; }
-	const int slots = MAX(1, _vt.surface_vt->get_page_count());
-	if (_vt.vt_page_fade_texture.is_null() || int(_vt.vt_slot_fade_ticks.size()) != slots) {
-		_vt.vt_slot_fade_ticks.assign(size_t(slots), 0);
-		_vt.vt_slot_pending.assign(size_t(slots), 0);
-		PackedByteArray settled;
-		settled.resize(slots);
-		settled.fill(255);
-		Ref<Image> image = Image::create_from_data(slots, 1, false, Image::FORMAT_R8, settled);
-		if (image.is_null()) { return; }
-		_vt.vt_page_fade_image = image;
-		_vt.vt_page_fade_texture = ImageTexture::create_from_image(image);
-		// The material has to be told about a texture it has not been bound to before.
-		if (_material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
-		if (_vt.vt_page_fade_texture.is_null()) { return; }
-	}
-	// A fade steps down once per tick, so a run of ticks with nothing arriving is a loop over
-	// the active slots and no upload.
-	bool any_active = false;
-	for (int slot = 0; slot < slots; ++slot) {
-		uint8_t &ticks = _vt.vt_slot_fade_ticks[size_t(slot)];
-		if (ticks == 0) { continue; }
-		--ticks;
-		any_active = true;
-	}
-	if (!any_active) { return; }
-	PackedByteArray bytes;
-	bytes.resize(slots);
-	uint8_t *output = bytes.ptrw();
-	const int frames = MAX(1, _vt.vt_page_fade_frames);
-	for (int slot = 0; slot < slots; ++slot) {
-		const int ticks = _vt.vt_slot_fade_ticks[size_t(slot)];
-		output[slot] = ticks <= 0 ? 255 : uint8_t(255 - (ticks * 255) / frames);
-	}
-	_vt.vt_page_fade_image->set_data(slots, 1, false, Image::FORMAT_R8, bytes);
-	_vt.vt_page_fade_texture->update(_vt.vt_page_fade_image);
-	_vt.vt_page_fade_active = slots;
-}
-
-void Terrain3D::set_vt_page_fade_frames(int p_frames) {
-	p_frames = CLAMP(p_frames, 0, 60);
-	if (_vt.vt_page_fade_frames == p_frames) { return; }
-	_vt.vt_page_fade_frames = p_frames;
-	// A disabled fade is the shader's own early out, and the settled texture already reads as
-	// "no fade", so switching it off needs no texture work.
-	if (p_frames == 0) { _vt.vt_slot_fade_ticks.clear(); _vt.vt_slot_pending.clear(); }
-	if (_material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 }
 
 // Pins the far field's root pyramid over `p_domain`.
@@ -316,7 +250,6 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 			// A published root without content is produced again; only the allocator failing
 			// to hand out a slot leaves the plan unsettled.
 			const bool root_stale = _vt_page_production_stale(slot);
-			_vt_note_page_readiness(slot, !miss && !root_stale);
 			if (!miss && !root_stale) { continue; }
 			// Queueing is what costs. A root page with no baked cell crops its payload from the
 			// density-scaled region data on this thread - about two milliseconds for a page this
@@ -372,61 +305,61 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 // and so the root key - oscillate, which throws the root pyramid away and rebuilds it every tick. It
 // is also cheap, so there is nothing to gain by cutting it.
 std::vector<Terrain3DSVTPage> Terrain3D::_svt_walk_visible_pages(
-        const std::vector<Terrain3DSVTRegion> &p_regions, const TerrainVT::VisibleView &p_view,
-        const std::function<bool(const Rect2 &)> &p_avt_interior, const Rect2 &p_domain,
+		const std::vector<Terrain3DSVTRegion> &p_regions, const TerrainVT::VisibleView &p_view,
+		const std::function<bool(const Rect2 &)> &p_avt_interior, const Rect2 &p_domain,
 		const float p_page_world,
-        const int p_plan_limit, int &r_visited) {
-		std::map<std::tuple<int, int, int>, Terrain3DSVTPage> unique;
-		// Traverse visible footprints, not every mip-0 cell of an entire region.
-		// A high SVT texel density must not be silently capped to 16 pages/region.
-		// Bound pathological traversal without replacing requested levels with ancestors.
-		const int visit_limit = MAX(4096, _vt.surface_svt->get_page_count() * 128);
-		for (const Terrain3DSVTRegion &region : p_regions) {
-			if (!region.rect.intersects(p_domain)) { continue; }
-			const Rect2 resident = region.rect.intersection(p_domain);
-			std::function<void(int, int, int)> visit = [&](int x, int y, int mip) {
-				// Deliberately not cut on the deadline. The walk feeds `maximum_mip`, which is
-				// part of the root plan's identity: a walk that stops in a different place on
-				// every tick makes the selected level - and so the root key - oscillate, which
-				// throws the root pyramid away and rebuilds it every tick. It is also cheap
-				// (0.02 ms for the visible set below), so there is nothing to gain by cutting it.
-				const float span = p_page_world * float(1 << mip);
-				const Rect2 footprint(Vector2(x, y) * span, Vector2(span, span));
-				if (!footprint.intersects(resident)) { return; }
-				const Rect2 clipped = footprint.intersection(resident);
-				if (p_avt_interior(clipped)) { return; }
-				TerrainVT::VisiblePatch visible;
-				// Coarse ancestors commonly clip to the same complete region. Reuse
-				// its exact query, including grazing-p_view density and distance bounds.
-				if (clipped == region.rect) { visible = region.visible; }
-				else if (!p_view.sample(clipped, region.heights, visible)) { return; }
-				++r_visited;
-				const int near_mip = get_surface_svt_mip_for_distance(MAX(0.f, visible.distance - MAX(2.f, visible.distance * 0.03f)), p_plan_limit);
-				const int far_mip = get_surface_svt_mip_for_distance(MAX(visible.distance, visible.farthest) * 1.03f + 2.f, p_plan_limit);
-				if (mip < near_mip) { return; }
-				if (mip <= far_mip) {
-					const Vector2i address(x * (1 << mip), y * (1 << mip));
-					const auto key = std::make_tuple(mip, address.x, address.y);
-					auto found = unique.find(key);
-					if (found == unique.end() || visible.distance < found->second.distance) { unique[key] = { address, mip, visible.distance }; }
-				}
-				if (mip > near_mip && r_visited < visit_limit) {
-					for (int dy = 0; dy < 2; ++dy) { for (int dx = 0; dx < 2; ++dx) { visit(x * 2 + dx, y * 2 + dy, mip - 1); } }
-				}
-			};
-			const float root_span = p_page_world * float(1 << p_plan_limit);
-			for (int y = int(Math::floor(resident.position.y / root_span)); y < int(Math::ceil(resident.get_end().y / root_span)); ++y) {
-				for (int x = int(Math::floor(resident.position.x / root_span)); x < int(Math::ceil(resident.get_end().x / root_span)); ++x) { visit(x, y, p_plan_limit); }
+		const int p_plan_limit, int &r_visited) {
+	std::map<std::tuple<int, int, int>, Terrain3DSVTPage> unique;
+	// Traverse visible footprints, not every mip-0 cell of an entire region.
+	// A high SVT texel density must not be silently capped to 16 pages/region.
+	// Bound pathological traversal without replacing requested levels with ancestors.
+	const int visit_limit = MAX(4096, _vt.surface_svt->get_page_count() * 128);
+	for (const Terrain3DSVTRegion &region : p_regions) {
+		if (!region.rect.intersects(p_domain)) { continue; }
+		const Rect2 resident = region.rect.intersection(p_domain);
+		std::function<void(int, int, int)> visit = [&](int x, int y, int mip) {
+			// Deliberately not cut on the deadline. The walk feeds `maximum_mip`, which is
+			// part of the root plan's identity: a walk that stops in a different place on
+			// every tick makes the selected level - and so the root key - oscillate, which
+			// throws the root pyramid away and rebuilds it every tick. It is also cheap
+			// (0.02 ms for the visible set below), so there is nothing to gain by cutting it.
+			const float span = p_page_world * float(1 << mip);
+			const Rect2 footprint(Vector2(x, y) * span, Vector2(span, span));
+			if (!footprint.intersects(resident)) { return; }
+			const Rect2 clipped = footprint.intersection(resident);
+			if (p_avt_interior(clipped)) { return; }
+			TerrainVT::VisiblePatch visible;
+			// Coarse ancestors commonly clip to the same complete region. Reuse
+			// its exact query, including grazing-p_view density and distance bounds.
+			if (clipped == region.rect) { visible = region.visible; }
+			else if (!p_view.sample(clipped, region.heights, visible)) { return; }
+			++r_visited;
+			const int near_mip = get_surface_svt_mip_for_distance(MAX(0.f, visible.distance - MAX(2.f, visible.distance * 0.03f)), p_plan_limit);
+			const int far_mip = get_surface_svt_mip_for_distance(MAX(visible.distance, visible.farthest) * 1.03f + 2.f, p_plan_limit);
+			if (mip < near_mip) { return; }
+			if (mip <= far_mip) {
+				const Vector2i address(x * (1 << mip), y * (1 << mip));
+				const auto key = std::make_tuple(mip, address.x, address.y);
+				auto found = unique.find(key);
+				if (found == unique.end() || visible.distance < found->second.distance) { unique[key] = { address, mip, visible.distance }; }
 			}
+			if (mip > near_mip && r_visited < visit_limit) {
+				for (int dy = 0; dy < 2; ++dy) { for (int dx = 0; dx < 2; ++dx) { visit(x * 2 + dx, y * 2 + dy, mip - 1); } }
+			}
+		};
+		const float root_span = p_page_world * float(1 << p_plan_limit);
+		for (int y = int(Math::floor(resident.position.y / root_span)); y < int(Math::ceil(resident.get_end().y / root_span)); ++y) {
+			for (int x = int(Math::floor(resident.position.x / root_span)); x < int(Math::ceil(resident.get_end().x / root_span)); ++x) { visit(x, y, p_plan_limit); }
 		}
-		std::vector<Terrain3DSVTPage> pages;
-		pages.reserve(unique.size());
-		for (const auto &entry : unique) { pages.push_back(entry.second); }
-		std::sort(pages.begin(), pages.end(), [](const Terrain3DSVTPage &a, const Terrain3DSVTPage &b) {
-			if (a.distance != b.distance) { return a.distance < b.distance; }
-			return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
-		});
-		return pages;
+	}
+	std::vector<Terrain3DSVTPage> pages;
+	pages.reserve(unique.size());
+	for (const auto &entry : unique) { pages.push_back(entry.second); }
+	std::sort(pages.begin(), pages.end(), [](const Terrain3DSVTPage &a, const Terrain3DSVTPage &b) {
+		if (a.distance != b.distance) { return a.distance < b.distance; }
+		return std::make_tuple(a.mip, a.address.y, a.address.x) < std::make_tuple(b.mip, b.address.y, b.address.x);
+	});
+	return pages;
 }
 
 int Terrain3D::_update_visible_svt(int p_max_pages) {
@@ -549,9 +482,6 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	const int root_count = int(_vt.svt_root_pages.size());
 
 	// Over-subscription raises a shared coarseness floor instead of dropping the far end of
-
-
-	// Over-subscription raises a shared coarseness floor instead of dropping the far end of
 	// the working set: a page finer than the floor is published at the floor, while a page
 	// already coarser than it keeps the level the distance rule gave it. Every visible
 	// footprint therefore still resolves through a page of some real level, and the floor is
@@ -616,7 +546,6 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		// there. A detail page that never landed is produced again here instead of being
 		// sampled as an empty layer for the rest of the session.
 		const bool detail_stale = _vt_page_production_stale(slot);
-		_vt_note_page_readiness(slot, !miss && !detail_stale);
 		if (!miss && !detail_stale) { continue; }
 		_vt.svt_requeues++;
 		_invalidate_vt_slot(slot);

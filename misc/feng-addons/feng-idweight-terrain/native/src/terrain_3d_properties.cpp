@@ -82,6 +82,14 @@ void Terrain3D::set_plugin(Object *p_plugin) {
 	LOG(INFO, "Setting Editor Plugin: ", _editor_plugin);
 }
 
+void Terrain3D::set_streaming_enabled(const bool p_enabled) {
+	_streaming_enabled = p_enabled;
+	if (_streamer) {
+		_streamer->set_enabled(p_enabled);
+	}
+	LOG(INFO, "Region streaming ", p_enabled ? "enabled" : "disabled");
+}
+
 void Terrain3D::set_region_size(const RegionSize p_size) {
 	if (!is_valid_region_size(p_size)) {
 		LOG(ERROR, "Invalid region size: ", p_size, ". Must be power of 2, 64-2048");

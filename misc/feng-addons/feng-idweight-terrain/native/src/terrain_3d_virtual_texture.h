@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include <godot_cpp/core/object.hpp>
@@ -15,106 +16,17 @@
 #include "constants.h"
 #include "generated_texture.h"
 #include "terrain_3d_vt_indirection.h"
-#include <set>
+#include "terrain_3d_vt_page_pool.h"
 #include "terrain_vt.h"
 
-class Terrain3DVirtualTexture;
-
-// A page can be published by either the near-field AVT indirection or the
-// world-space SVT indirection. The physical slot is global, while each owner
-// retains enough addressing information for eviction and editor inspection.
-struct Terrain3DVTPageOwner {
-	Terrain3DVirtualTexture *texture = nullptr;
-	TerrainVT::VirtualImageKind kind = TerrainVT::VirtualImageKind::AVT;
-	int sector_x = 0;
-	int sector_y = 0;
-	int virtual_x = 0;
-	int virtual_y = 0;
-	int mip = 0;
-	bool world_space = false;
-};
-
-// Shared physical residency state for the near and far virtual texture views.
-// Addressing remains per Terrain3DVirtualTexture; this object only owns the
-// Texture2DArray, global slot IDs, LRU/protection state, budget, and reverse
-// owner index used to invalidate the correct indirection on eviction.
-struct Terrain3DVTPagePool {
-	~Terrain3DVTPagePool() { clear(); }
-
-	GeneratedTexture atlas;
-	Ref<Image> atlas_template;
-	int page_size = 0;
-	int page_border = 0;
-	int stored_page_size = 0;
-	int page_count = 0;
-	Image::Format format = Image::FORMAT_MAX;
-
-	std::vector<uint32_t> lru;
-	std::vector<uint8_t> slot_used;
-	std::vector<Ref<Image>> authored_pages;
-	std::vector<uint8_t> slot_protected;
-	// Independent pins per slot. A slot is protected while this is non-zero, so the
-	// AVT pass's transient pins and the far field's long-lived root pins compose
-	// instead of one caller's unprotect clearing the other's.
-	std::vector<uint8_t> slot_protect_refs;
-	std::vector<uint64_t> slot_demand_epoch;
-	uint64_t demand_epoch = 0;
-	uint64_t residency_revision = 1;
-	bool demand_active = false;
-	std::vector<std::vector<Terrain3DVTPageOwner>> slot_owners;
-	std::vector<uint32_t> free_slots;
-	// Acquire transaction. acquire_slot() reserves a slot and remembers whether it took a
-	// free one or merely *chose* an LRU victim; the victim keeps its content and its owners'
-	// indirection entries until commit_slot() makes the eviction final. A caller that fails
-	// between the two calls abort_slot()s and no resident page was destroyed for nothing.
-	std::vector<uint8_t> slot_reserved;
-	std::vector<uint8_t> slot_evict_on_commit;
-	int allocation_budget = -1;
-	int alloc_count = 0;
-	int evict_count = 0;
-	int protected_block_count = 0;
-	int aborted_acquires = 0;
-	bool initialized = false;
-
-	bool grow(int p_page_count);
-	bool initialize(int p_page_size, int p_page_border, int p_page_count,
-			Image::Format p_format);
-	void clear();
-	bool is_initialized() const { return initialized && atlas.get_rid().is_valid(); }
-
-	int acquire_slot(Terrain3DVirtualTexture *p_requester);
-	// Finalizes a reservation: an LRU victim chosen by acquire_slot() is evicted now, once
-	// the replacement page exists and its indirection entry has been published.
-	void commit_slot(uint32_t p_slot);
-	// Drops a reservation without producing anything. The victim (if any) is untouched, so
-	// the page it still serves stays resident and its table entries stay valid.
-	void abort_slot(uint32_t p_slot);
-	bool is_slot_reserved(uint32_t p_slot) const {
-		return p_slot < slot_reserved.size() && slot_reserved[p_slot] != 0;
-	}
-	void touch_slot(uint32_t p_slot);
-	void mark_demanded(uint32_t p_slot) { if (demand_active && p_slot < slot_demand_epoch.size()) { slot_demand_epoch[p_slot] = demand_epoch; } }
-	void evict_slot(uint32_t p_slot);
-	void publish_owner(uint32_t p_slot, const Terrain3DVTPageOwner &p_owner);
-	bool remove_owner(uint32_t p_slot, Terrain3DVirtualTexture *p_texture,
-			int p_virtual_x, int p_virtual_y, int p_mip);
-	bool move_owner(uint32_t p_slot, Terrain3DVirtualTexture *p_texture,
-			int p_old_virtual_x, int p_old_virtual_y, int p_old_mip,
-			int p_new_virtual_x, int p_new_virtual_y, int p_new_mip);
-	void detach_texture(Terrain3DVirtualTexture *p_texture);
-
-	bool write_page(int p_slot, const Ref<Image> &p_page);
-	Ref<Image> read_page(int p_slot) const;
-	Ref<Image> get_atlas_image() const;
-	void set_allocation_budget(int p_pages) { allocation_budget = p_pages; }
-	void begin_demand() { ++demand_epoch; demand_active = true; }
-	void end_demand() { demand_active = false; }
-	Array get_slot_owner_metadata(int p_slot) const;
-};
+// The shared physical page pool and the per-owner record it indexes are declared in
+// terrain_3d_vt_page_pool.h: one pool serves both views, so it is not either view's state.
+// This file is the per-view half - the indirection texture, the mip-chain walk and the sector
+// block allocation - and it reaches the pool through the include above.
 
 /**
- * Virtual texture runtime: the physical page atlas, the indirection texture and the
- * page slot allocator, built on the addressing core in `terrain_vt.h`.
+ * Virtual texture runtime, per view: the indirection texture and the addressing that fills it,
+ * over the page pool both views share (`Terrain3DVTPagePool`, in terrain_3d_vt_page_pool.h).
  *
  * Layout:
  *   - A sector (one terrain region) owns a power-of-two block of *virtual* pages,
@@ -127,6 +39,9 @@ struct Terrain3DVTPagePool {
  *     a coarser texel has to hold a real slot or the invalid marker.
  *   - The physical atlas is a Texture2DArray of `page_count` pages, each
  *     `page_size + 2 * page_border` texels square, allocated LRU with a protected set.
+ *     Slot IDs are global because the pool owns that atlas: a slot published here can be
+ *     evicted on the other view's behalf, and the pool then calls `_invalidate_pool_owner()`
+ *     so the indirection entry that named it is cleared in the same step.
  *
  * This class owns no terrain data. Step 3 (page production) fills pages from the
  * region surface maps and the shader samples through the indirection.
@@ -166,8 +81,9 @@ private:
 	// means "auto": resolved to the cap on initialize().
 	int _world_max_local_mip = -1;
 
-	// The physical atlas and allocator are shared by the near/far views. This
-	// object retains only the derived size for page validation.
+	// The pool both views allocate from (declared in terrain_3d_vt_page_pool.h). This
+	// object keeps the derived page size for validation, and the indirection that
+	// addresses the slots that pool hands out.
 	std::shared_ptr<Terrain3DVTPagePool> _page_pool;
 	int _stored_page_size = 0;
 
@@ -237,7 +153,8 @@ public:
 	void set_format(const Image::Format p_format);
 	Image::Format get_format() const { return _format; }
 
-	// Builds the atlas and the indirection. Safe to call again after a settings change.
+	// Builds the indirection, and initializes or adopts the shared atlas. Safe to call
+	// again after a settings change.
 	Error initialize();
 	void clear();
 	bool is_initialized() const {
@@ -343,6 +260,8 @@ public:
 
 protected:
 	static void _bind_methods();
+	// The pool evicts slots, not views: when it drops a page this view published it calls
+	// _invalidate_pool_owner() and reads the reverse owner index through this friendship.
 	friend struct Terrain3DVTPagePool;
 };
 

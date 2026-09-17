@@ -122,6 +122,18 @@ void Terrain3DCDLOD::snap() {
 	// The zone closes on every path out of the pass, including the early returns.
 	TerrainProfileZone cdlod_zone("cdlod");
 	_snap_impl();
+	// The worst pass's own breakdown, taken where the pass is over: the live fields describe the
+	// pass that just ran, and the peak is not that pass. A peak read from the live fields would
+	// describe whatever ran last, which is never the peak.
+	if (_cpu_update_ms > _peak_ms) {
+		_peak_ms = _cpu_update_ms;
+		_peak_rebuild_ms = _rebuild_ms;
+		_peak_cull_ms = _cull_ms;
+		_peak_pack_ms = _pack_ms;
+		_peak_upload_ms = _upload_ms;
+		_peak_selected = _selected;
+		_peak_visible = _visible;
+	}
 	TerrainProfileZone::plot("cdlod_ms", _cpu_update_ms);
 	TerrainProfileZone::plot("cdlod_patches", double(_selected));
 	TerrainProfileZone::plot("cdlod_visible", double(_visible));
@@ -268,9 +280,20 @@ void Terrain3DCDLOD::_snap_impl() {
 			if (visible) { ++_visible; }
 		}
 		for (int i = 0; i < 2; ++i) {
-			PackedFloat32Array data; data.resize(lists[i].size());
+			Batch &batch = _batches[i];
+			// A batch whose instances did not change needs neither a packed copy nor an upload. The
+			// comparison is against the list this pass just built, so the work it skips is the whole
+			// of the batch's packing - not only the RenderingServer calls `_upload` would skip on
+			// its own. A classification can flip and flip back, and a flip in one batch does not
+			// move the other.
+			const bool unchanged = batch.previous_instances.size() == lists[i].size() &&
+					(lists[i].empty() ||
+							std::equal(batch.previous_instances.begin(), batch.previous_instances.end(), lists[i].begin()));
+			if (unchanged) { continue; }
+			PackedFloat32Array &data = batch.staging;
+			data.resize(int64_t(lists[i].size()));
 			if (!lists[i].empty()) { std::memcpy(data.ptrw(), lists[i].data(), lists[i].size() * sizeof(float)); }
-			_upload(_batches[i], data, bounds[i]);
+			_upload(batch, data, bounds[i]);
 		}
 		if (!_adaptive) { update(); }
 		_pack_ms = double(Time::get_singleton()->get_ticks_usec() - pack_started) / 1000.0;
@@ -308,5 +331,15 @@ Dictionary Terrain3DCDLOD::get_stats() const {
 	stats["shadow_only_patches"] = _selected - _visible;
 	stats["main_batches"] = _adaptive ? (_visible > 0 ? 1 : 0) : _visible;
 	stats["patch_size"] = _grid;
+	// The worst pass's breakdown, so a peak can be attributed to a stage instead of read from four
+	// independent maxima. `peak_ms - peak_pack_ms - peak_cull_ms - peak_rebuild_ms` is the rest of
+	// that frame's pass.
+	stats["peak_ms"] = _peak_ms;
+	stats["peak_rebuild_ms"] = _peak_rebuild_ms;
+	stats["peak_cull_ms"] = _peak_cull_ms;
+	stats["peak_pack_ms"] = _peak_pack_ms;
+	stats["peak_upload_ms"] = _peak_upload_ms;
+	stats["peak_selected_patches"] = _peak_selected;
+	stats["peak_visible_patches"] = _peak_visible;
 	return stats;
 }

@@ -402,37 +402,6 @@ void Terrain3DAssets::_update_texture_files() {
 	normal.clear();
 }
 
-void Terrain3DAssets::set_texture_array_size(int p_size) {
-	if (p_size != 0 && (p_size < 4 || p_size > 8192 || (p_size & (p_size - 1)) != 0)) {
-		LOG(ERROR, "Array size must be Auto (0) or a power of two between 4 and 8192.");
-		return;
-	}
-	if (_texture_array_size == p_size) {
-		return;
-	}
-	_texture_array_size = p_size;
-	_update_texture_files();
-	emit_changed();
-}
-
-void Terrain3DAssets::set_texture_array_mipmaps(bool p_enabled) {
-	if (_texture_array_mipmaps == p_enabled) {
-		return;
-	}
-	_texture_array_mipmaps = p_enabled;
-	_update_texture_files();
-	emit_changed();
-}
-
-void Terrain3DAssets::set_texture_array_compression(TextureArrayCompression p_compression) {
-	if (p_compression < ARRAY_UNCOMPRESSED || p_compression >= ARRAY_COMPRESSION_MAX || _texture_array_compression == p_compression) {
-		return;
-	}
-	_texture_array_compression = p_compression;
-	_update_texture_files();
-	emit_changed();
-}
-
 void Terrain3DAssets::_update_texture_settings() {
 	LOG(DEBUG, "Received setting_changed signal");
 	if (!_texture_list.is_empty()) {
@@ -586,6 +555,37 @@ void Terrain3DAssets::destroy() {
 		_viewport = RID();
 		_scenario = RID();
 	}
+}
+
+void Terrain3DAssets::set_texture_array_size(int p_size) {
+	if (p_size != 0 && (p_size < 4 || p_size > 8192 || (p_size & (p_size - 1)) != 0)) {
+		LOG(ERROR, "Array size must be Auto (0) or a power of two between 4 and 8192.");
+		return;
+	}
+	if (_texture_array_size == p_size) {
+		return;
+	}
+	_texture_array_size = p_size;
+	_update_texture_files();
+	emit_changed();
+}
+
+void Terrain3DAssets::set_texture_array_mipmaps(bool p_enabled) {
+	if (_texture_array_mipmaps == p_enabled) {
+		return;
+	}
+	_texture_array_mipmaps = p_enabled;
+	_update_texture_files();
+	emit_changed();
+}
+
+void Terrain3DAssets::set_texture_array_compression(TextureArrayCompression p_compression) {
+	if (p_compression < ARRAY_UNCOMPRESSED || p_compression >= ARRAY_COMPRESSION_MAX || _texture_array_compression == p_compression) {
+		return;
+	}
+	_texture_array_compression = p_compression;
+	_update_texture_files();
+	emit_changed();
 }
 
 // Called when creating a new asset

@@ -49,6 +49,9 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_asset_resource.h
 - [x] native/src/terrain_3d_assets.cpp
 - [x] native/src/terrain_3d_assets.h
+- [x] native/src/terrain_3d_avt_plan.cpp
+- [x] native/src/terrain_3d_avt_plan.h
+- [x] native/src/terrain_3d_avt_produce.cpp
 - [x] native/src/terrain_3d_collision.cpp
 - [x] native/src/terrain_3d_collision.h
 - [x] native/src/terrain_3d_data.cpp
@@ -79,10 +82,13 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_virtual_texture.cpp
 - [x] native/src/terrain_3d_virtual_texture.h
 - [x] native/src/terrain_3d_vt_demand.cpp
+- [x] native/src/terrain_3d_vt_fade.cpp
 - [x] native/src/terrain_3d_vt_feedback.cpp
 - [x] native/src/terrain_3d_vt_feedback.h
 - [x] native/src/terrain_3d_vt_indirection.cpp
 - [x] native/src/terrain_3d_vt_indirection.h
+- [x] native/src/terrain_3d_vt_page_pool.cpp
+- [x] native/src/terrain_3d_vt_page_pool.h
 - [x] native/src/terrain_3d_vt_visibility.h
 - [x] native/src/terrain_surface_idweight.h
 - [x] native/src/terrain_vt.h
@@ -587,6 +593,28 @@ these files quote braces in comments and raw strings). The lesson is the uncomfo
 class of defect in the code is not the same as not writing it, and the only reason this was caught is
 that the *next* thing that pass did was read the same function again for an unrelated reason.
 
+**It happened a third time, in the extraction this pass is proudest of.** `_svt_walk_visible_pages()`
+was lifted out of `_update_visible_svt()` and kept the depth its body had inside the old function: all
+fifty-one lines sat one tab too deep, and the run-based indentation check cannot see that, because a
+uniformly over-indented body puts every line at `expected + 1` — exactly where a wrapped continuation
+belongs. Narrowing the check to the one line with a unique expected depth, the *first* statement of a
+body, is what finds it (`body_indent.py`): one case in the whole tree, this one. The same pass also
+left four wrapped signatures in `terrain_3d_surface_baker.cpp` indented with eight spaces rather than
+two tabs; the run check skips anything inside an unclosed parenthesis, which is why an earlier
+space-versus-tab sweep did not see them either. Both are fixed, and the check's continuation rule now
+covers a line ending on `|` or `&` as well as `+` — without that it reported the two legitimate
+bitfield wraps in `terrain_3d_editor.cpp` and the baker as wrong.
+
+The lesson generalises past this file: a tolerant check has to be paired with a strict one on the few
+lines where the tolerance cannot legitimately apply, or the defect it tolerates hides behind it.
+
+One cosmetic inconsistency is recorded and deliberately **not** fixed: the shader files are
+tab-indented (main.glsl is 776 tab-indented lines against 14 space-indented ones, all of them inside
+its header comment), but `backgrounds.glsl` carries a vendored noise block of about thirty 4-space
+lines, and `editor_functions.glsl` four more. Whitespace in GLSL changes nothing at runtime and those
+files are upstream text, so restyling them would be churn with no reader benefit beyond consistency;
+it is listed here so the next pass can decide rather than rediscover it.
+
 The three largest functions left all need the same thing before they can be split, and it is a design
 step rather than a move:
 
@@ -618,12 +646,15 @@ first in `terrain_3d_vt_demand.cpp`, so it needed `godot::Rect2`. Two builds wer
 the same two on including `terrain_vt.h`, which does not declare `VisiblePatch` at all — that is in
 `terrain_3d_vt_visibility.h`.
 
-### Two audit helpers, kept as one tool
+### Audit helpers, kept as one tool
 
-`native/audit_code.py dead` and `native/audit_code.py shape` are what answered "what is dead" and
-"what has outgrown its file" without reading the source by eye. `dead` is what found `get_warnings()`
-(nothing outside its own declaration, and no binding) and confirmed the distance-mip cluster above;
-it reported **no unused `Terrain3DVTState` field**, of 169 declared. `shape` is what found
+`native/audit_code.py dead`, `undefined`, `sections`, `comments`, `params`, `shape` and `dupes` are
+what answered "what is dead", "what is declared but never written", "does the file's own banner still
+describe it", "does the prose still name something that exists", "does every parameter mean something"
+and "what has outgrown its file" without reading the source by eye. `dead` is what found
+`get_warnings()` (nothing outside its own declaration, and no binding) and confirmed the distance-mip
+cluster above; re-run over the tree as it stands it reports **no unused `Terrain3DVTState` field**, of
+197 declared, and nothing else but the generated doc data's registration hook. `shape` is what found
 `_update_visible_svt()`. They are reported as candidates rather than verdicts, and say so: a property
 getter named only from its `ADD_PROPERTY` binding string is live, and the report names the sixteen
 that look dead for exactly that reason.
@@ -659,9 +690,105 @@ code written twice. Bodies are compared as line sequences with comments and inde
 reformatted copy still matches while one whose identifiers were renamed does not; it under-reports
 rather than producing pairs a reader has to reject one by one.
 
-It compared **532 definitions and found none written more than once**. That is a result, not a
+It compared **541 definitions and found none written more than once**. That is a result, not a
 non-event: the deletion half of this pass has no copy-paste to collect, so what is left there is
 removal of things nothing calls (which `dead` answers) rather than merging.
+
+### `undefined`: the promise no file keeps
+
+`native/audit_code.py undefined` is the check neither the compiler nor `dead` can make. It
+attributes every declaration in a header to the class that encloses it and asks for that
+*qualified* definition, which is the only way to see the case it was written for:
+`Terrain3DVTPagePool::get_atlas_image()` was declared beside the live
+`Terrain3DVirtualTexture::get_atlas_image()`, defined nowhere and called nowhere. The compiler is
+silent because nothing calls it, and `dead` counts the name as used because the other class declares
+a method with it — so the entry in **Deleted outright** above was wrong until this pass, and the
+declaration was still sitting in the header it names.
+
+Two corrections were needed before the report was worth reading, and both are the same mistake: a
+declaration is neither a *local variable* nor a *call*. The first version matched
+`std::lock_guard<std::mutex> lock(_mutex);` and `const Vector3 center(...)` inside inline bodies and
+reported a dozen methods that do not exist; gating every match on "this line's brace depth is the
+enclosing class's body depth" removed all of them. The second reported free functions that are
+defined in a header rather than a `.cpp`, which is most of `terrain_3d_util.h` and
+`terrain_surface_idweight.h`.
+
+Run over the tree as it stands it reports none of either kind, which is what makes the one deleted
+declaration a fix rather than a coincidence.
+
+### The section banners that were lying
+
+`sections` is the only check here about a *file* rather than about code, and it is the one that found
+a defect class nothing else can see: a definition under a "Private Functions" banner whose declaration
+in the header says `public:`. The compiler does not care where in a translation unit a definition
+sits, so the banner is the only place that claim is made — and thirteen of them had accumulated:
+
+* `terrain_3d_streamer.cpp` had all nine of its private helpers (`_sync_data`, `_resolve_directory`,
+  `_is_inside_world`, `_is_resident`, `_collect_desired`, `_collect_unload_candidates`, `_try_load`,
+  `_try_unload`, `_notify_region_set_changed`) under "Public Functions", interleaved with the public
+  ones. The file now groups them the way its header already did: private first.
+* `terrain_3d_assets.cpp` defined three public property setters (`set_texture_array_size`,
+  `set_texture_array_mipmaps`, `set_texture_array_compression`) inside the private block; they moved
+  in beside the asset setters the header declares them with.
+* `terrain_3d_vt_feedback.cpp` had `get_raw()` — the accessor the feedback test reads — under the
+  private banner.
+* `terrain_3d.cpp` had its only public definition, `set_streaming_enabled()`, at the end of the
+  private block. It is now in `terrain_3d_properties.cpp` with every other public setter, which is
+  what makes "terrain_3d.cpp is private helpers and the Node overrides" true rather than nearly true.
+
+All thirteen were moves with no text changed. Moving the pre-fix files back in is the proof: fed
+`HEAD`'s copies of the three files that were clean before this pass, `sections` reports exactly those
+twelve and none on the tree as it stands. The compiler never objected to any of them, and
+`region_streaming` and `vt_feedback` pass unchanged.
+
+The check has one trap of its own, recorded because it produced eight false reports before it was
+read: it first reused `undefined`'s declaration matcher, which requires the `;` to end the line, and
+so could not see declarations that are inline bodies in the header (`bool is_ready() const { ... }`)
+or whose default arguments push the `;` past the name. The header matcher is deliberately looser.
+
+### Stale references in the prose
+
+`comments` reads the comments instead of the code, which is the only way to find a name a comment
+promises and the code no longer has. It collects three shapes that look like code — backticked names,
+empty parameter lists, leading underscores — and reports the ones that appear nowhere in the addon's
+sources, scripts, shaders or resources. Four were real:
+
+* `terrain_3d_mesher.cpp` said "Append LOD to `_lod_rids`" directly above a
+  `_clipmap_rids.push_back()`.
+* `terrain_3d_vt_state.h` sent the reader to `Terrain3D::_process_physics()` for why the top-up phase
+  went; the tick is `Terrain3D::__physics_process()`.
+* `terrain_3d_editor.cpp` described the array rebuild "at the end of the last `_operate()` call" — the
+  function is `_operate_map()`.
+* `terrain_3d_editor.h` said "See `_get_undo_data` for definition" of a dictionary that
+  `_store_undo()` writes and `_apply_undo()` reads.
+
+The other twenty-five candidates were right, and naming them is part of the result: engine internals
+(`Node::_process()`, `RenderingDeviceGraph::_execute_frame()`, `std::mutex::try_lock()`,
+`Image::get_format_pixel_size()`), GDScript reached through `call()`, test script names, and prose
+that happens to carry underscores. Two lessons are recorded in the check because each cost a pass:
+
+* **Not masking raw string literals is the point.** Masking them the way every other mode does made
+  the shaders invisible, and the report filled with shader parameters (`p_world`, `p_surface_texel`,
+  `projectionAxis`, `surface_svt_sample`) that exist — sixteen of the first twenty-nine candidates.
+  This check's corpus is "text with comments blanked", not "text with literals blanked".
+* **The corpus has to be rooted at the addon, not at `native/`.** Rooted where the tool lives, it
+  never read `src/tool_settings.gd`, so a comment pointing at `tool_settings.gd:_on_picked()` looked
+  stale — and a check that reports a correct comment teaches its reader to ignore the check.
+
+Run over the tree as it stands it reports nothing, which is the state worth keeping: the next line it
+prints is either a new stale reference or a new class of legitimate one for the engine list.
+
+One check was written for the *misattached* comment — a comment block above one declaration that names
+a different declaration of the same file — and dropped rather than kept. Two versions were tried:
+"the comment names any member of the file" fired on forty-odd legitimate cross-references ("see
+`get_x()`", "split out of `_update_visible_svt()`"), and "only backticked names, and only when the
+comment never names the declaration it sits above" still fired on twenty-three, every one of them
+inspected and legitimate (the `get_prime_stats()`/`prime()` pair, the `_claim_head`/`_claim_order`
+pair, a group comment introducing three stage declarations). The two real cases this pass fixed — the
+fade comment that sat above `_flush_source_wakes()` and the force-mip comment above
+`set_surface_vt_texels_per_pixel()` — were found by reading, while moving the members they describe,
+and no mechanical rule separated them from the legitimate mentions. Recorded so the next pass does not
+rebuild it.
 
 The addon's *tests* are a different story and were left alone. `settle()` — the "wait until production
 stops and nothing is pending" helper — appears in nine test files, and the first reading of that is
@@ -699,6 +826,44 @@ is exact. The duplication is recorded here as *deliberate* rather than as debt.
   where it was a `std::map` plus a `std::set` of `(token, key)` pairs kept in step by hand. Measured
   neutral on every phase: it is a simplification, not an optimisation, and it is recorded as such
   rather than as a win.
+* `Terrain3DVirtualTexture::_request_virtual()` is declared private, but sat between
+  `request_page()` and `request_page_internal()` in the `.cpp`, so the "Public Functions" banner was
+  wrong about one of the three. Moved, with no text changed.
+* `terrain_3d_vt_demand.cpp` carried an exact duplicate of the first line of a comment block as a
+  stray line two blanks above the block it copies, and six other files plus that one separated two
+  definitions with two blank lines. Both are gone, and the tree now contains no double blank line.
+* `Terrain3DData::_grow_slot_capacity()`'s ceiling comment named `MAX_REGIONS`, which is a GLSL macro
+  the material shader is compiled with — not a C++ identifier, and not what the line bounds against.
+  The code clamps to `MAX_MAP_SLOTS`, the CPU ceiling that matches the *largest selectable*
+  `max_regions`; the comment now says that, and says why a table past the ceiling could never render.
+* Two literal `0xF` masks meant "every slot map" — the one `_acquire_slot()` sets on a fresh slot and
+  the one a `TYPE_MAX` request resolves to. Both are now `SLOT_MAP_ALL`, derived from `SLOT_MAP_MAX`,
+  because a fifth slot map would otherwise have silently kept meaning four.
+* `Terrain3DData::add_region_blankp()` took `p_update`, exposed it to Godot as `update` in its
+  binding, and then called the location overload **without** it: `add_region_blankp(pos, false)` — the
+  bulk path that is supposed to skip the map rebuild per region — rebuilt every map anyway. This is
+  the one defect here that changed behaviour rather than wording, found by reading the function while
+  walking the file.
+* `Terrain3D::_svt_page_path()` took a `p_mip` and hard-coded `0` into `TerrainVTCell::path()`. All
+  three callers pass 0 and the cell file carries its whole mip chain, so the parameter could only ever
+  mislead a future caller: it is gone, and the reason mip 0 names the cell is now on the declaration.
+
+### The page pool left the view that shared it
+
+`Terrain3DVTPagePool` was declared and implemented inside `terrain_3d_virtual_texture.{h,cpp}`, which
+is the file of *one* view — and two views use it, because there is one physical atlas. It is now
+`terrain_3d_vt_page_pool.{h,cpp}`: the atlas, the global slot allocator, LRU and protection, the
+reverse owner index, and page read/write, with the three contracts a caller has to keep stated on the
+header instead of implied by the code. `terrain_3d_virtual_texture.cpp` went **1375 -> 983 lines**
+(and its header 349 -> 264), and what is left there is per-view: the indirection texture, the
+mip-chain walk and the sector block bookkeeping.
+
+The move is mechanical, and the two files still reach each other in exactly one place: an eviction
+calls back into `Terrain3DVirtualTexture::_invalidate_pool_owner()`, through the friendship the class
+already declared. Two things did not survive it unchanged, and both were errors the split exposed:
+`Terrain3DVTPagePool::get_atlas_image()` (see `undefined` below), and the pixel-size helper, which was
+a file-local `static` in the view and is now `vt_format_pixel_size()`, declared beside the pool
+because the atlas layers and the indirection chain are both sized by it.
 
 ### `Terrain3DEditor::_operate_map()`: 490 lines to 198
 

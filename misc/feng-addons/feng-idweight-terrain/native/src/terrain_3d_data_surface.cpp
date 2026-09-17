@@ -260,4 +260,3 @@ Ref<Image> Terrain3DData::make_sparse_surface_page(const int p_page_x, const int
 			p_border, page);
 	return page;
 }
-

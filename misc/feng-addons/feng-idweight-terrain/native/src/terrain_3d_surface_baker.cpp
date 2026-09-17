@@ -646,7 +646,7 @@ void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t
 // page sized or only as deep as the encoder ring depends on which of them resolved - see the
 // comment on `_staging_layers` below.
 bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, const int p_stored_size,
-        const int p_page_count) {
+		const int p_page_count) {
 	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
 	const uint64_t output_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
@@ -2211,9 +2211,9 @@ std::vector<Terrain3DSurfaceBaker::PendingJob> Terrain3DSurfaceBaker::_build_fra
 // fails - false, which means the frame did nothing and the caller must return with every job back
 // in the queue and the whole atlas marked for invalidation.
 bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs,
-        const uint64_t p_generation, const uint64_t p_material_version, const int p_page_count,
-        const int p_page_size, const int p_border, const int p_stored_size, const int p_material_count,
-        const bool p_invalidate_all, Terrain3DCellStore *p_cell_store) {
+		const uint64_t p_generation, const uint64_t p_material_version, const int p_page_count,
+		const int p_page_size, const int p_border, const int p_stored_size, const int p_material_count,
+		const bool p_invalidate_all, Terrain3DCellStore *p_cell_store) {
 	std::vector<PendingJob> compute_jobs;
 	compute_jobs.reserve(p_jobs.size());
 	// Invalidation only needs to clear readiness, not shade every cache texel. Under the

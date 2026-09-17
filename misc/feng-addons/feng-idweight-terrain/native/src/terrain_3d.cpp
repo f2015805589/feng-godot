@@ -226,7 +226,7 @@ int64_t Terrain3D::_monitor_pages_pending() const {
 void Terrain3D::_invalidate_render_geometry() {
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	_vt.avt_plan_key.clear();
+	invalidate_avt_plan_key(_vt.avt_plan_key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	if (_terrain_mesher) { _terrain_mesher->invalidate_region_geometry(); }
@@ -679,14 +679,6 @@ void Terrain3D::_destroy_streamer() {
 	_streaming_enabled = false;
 }
 
-void Terrain3D::set_streaming_enabled(const bool p_enabled) {
-	_streaming_enabled = p_enabled;
-	if (_streamer) {
-		_streamer->set_enabled(p_enabled);
-	}
-	LOG(INFO, "Region streaming ", p_enabled ? "enabled" : "disabled");
-}
-
 ///////////////////////////
 // Protected Functions
 ///////////////////////////
@@ -910,4 +902,3 @@ void Terrain3D::_validate_property(PropertyInfo &p_property) const {
 		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 	}
 }
-

@@ -21,6 +21,11 @@ class Terrain3DCDLOD {
 		PackedFloat32Array previous;
 		std::vector<float> previous_instances;
 		AABB bounds;
+		// The packed buffer, kept between passes: a fresh one per pass is an allocation and two
+		// copies of up to 32 KB on the very frame this path's peak is measured against. The upload
+		// resizes it to the batch capacity and this pass shrinks it back to the instance count, so
+		// the allocation is reached once and then only re-used.
+		PackedFloat32Array staging;
 	};
 	Terrain3D *_terrain = nullptr;
 	RID _mesh;
@@ -50,6 +55,18 @@ class Terrain3DCDLOD {
 	// The RenderingServer calls inside the packing phase (buffer upload, visible count,
 	// bounds) and the CPU packing loop before them.
 	double _upload_ms = 0.0;
+	// The parts of the pass that produced `_peak_ms`, which is the worst `cpu_update_ms` since the
+	// backend was created. The live fields above describe the last pass, and the peak is by
+	// definition not the last pass - so without this the worst frame's cost can only be read as
+	// four independent maxima, which need not come from the same frame and do not say which stage
+	// the peak was.
+	double _peak_ms = 0.0;
+	double _peak_rebuild_ms = 0.0;
+	double _peak_cull_ms = 0.0;
+	double _peak_pack_ms = 0.0;
+	double _peak_upload_ms = 0.0;
+	int _peak_selected = 0;
+	int _peak_visible = 0;
 	void _upload(Batch &p_batch, PackedFloat32Array &p_data, const AABB &p_bounds);
 	// The pass itself: selection, classification and packing. `snap()` is the scope that
 	// publishes it, so the body can keep the early returns it uses to skip unchanged work.

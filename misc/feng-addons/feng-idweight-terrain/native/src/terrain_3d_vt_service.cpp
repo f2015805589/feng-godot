@@ -3,6 +3,29 @@
 // Surface virtual texture service: view setup and teardown, the settings the editor
 // and scripts write, and the near/far demand passes. Split out of terrain_3d.cpp;
 // the addressing itself lives in terrain_3d_virtual_texture.cpp.
+//
+// The service *machinery* is not here: the page pool and page records, the per-tick service check
+// (`_update_vt_service()`), the material page queue, the page capture and invalidation entry points
+// and the far field's bake are in terrain_3d_surface_vt.cpp. This file is what is written and read
+// around that machinery - the two views' enable setters and their page settings, the two demand
+// passes with all their stages, and the feedback pass.
+//
+// The settings below are the ones the dock, the inspector and scripts write, so a setter here owns
+// its side effects rather than only storing a value, and the one to know about is the *toggle*:
+// enabling either field (`set_surface_vt_enabled`, `set_surface_svt_enabled`) puts a field that is
+// about to be demanded into a world that may have switched this node's own tick off, so both turn
+// `set_physics_process` on when the node is initialized. A caller that drives the section itself -
+// an editor preview, a test harness that sends `NOTIFICATION_PHYSICS_PROCESS` by hand, a paused
+// world - therefore has to disable processing again *after* the enable and not before it: measured,
+// a test that disabled first ran every page-arrival ramp at twice the rate it asked for, because
+// the node ticked once for its notification and once for its own physics frame. Disabling a field
+// does not stop the tick, because the other field may still be enabled.
+//
+// The setters that must rebuild rather than adjust call `_reset_vt_configuration()`: it cancels a
+// bake in flight, marks the shared setup and the far field's startup gate as unproven and rebinds
+// the material. The pool is rebuilt by the service on the following tick rather than here, and that
+// rebuild is what releases what is resident - the pool cannot be resized in place, so any change to
+// one of its dimensions has to go through it.
 
 #include "terrain_3d.h"
 
@@ -92,7 +115,12 @@ void Terrain3D::_destroy_surface_svt() {
 
 void Terrain3D::set_surface_svt_enabled(const bool p_enabled) {
 	_vt.surface_svt_enabled = p_enabled;
+	// A far field that has just been switched on has to prove its root pyramid before the shader
+	// may sample it strictly - it renders from the live source material until then - so the gate has
+	// to be reopened here and not only in setup, which is the only reason a re-enable differs from
+	// a first enable.
 	if (p_enabled) { _vt.svt_startup_ready = false; }
+	// The tick side effect both toggles have; see the contract at the top of this file.
 	if (p_enabled && _initialized) { set_physics_process(true); }
 	LOG(INFO, "Far-field surface virtual texture ", p_enabled ? "enabled" : "disabled");
 	if (_initialized && _material.is_valid()) {
@@ -367,7 +395,6 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	int64_t first_y = clamp_page_coordinate(Math::floor((double(reference.z) - double(reach)) / double(page_world)));
 	int64_t last_y = clamp_page_coordinate(Math::floor((double(reference.z) + double(reach)) / double(page_world)));
 
-
 	// A target/configuration key invalidates both cursors. Include the effective detail
 	// bounds and loaded-region count so adding/removing streamed regions starts a fresh
 	// pass without storing another lifetime-sensitive observer in Terrain3D.
@@ -575,6 +602,8 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 
 void Terrain3D::set_surface_vt_enabled(const bool p_enabled) {
 	_vt.surface_vt_enabled = p_enabled;
+	// The tick side effect both toggles have; see the contract at the top of this file. It is what a
+	// harness that drives the section itself has to undo *after* this setter, not before it.
 	if (p_enabled && _initialized) { set_physics_process(true); }
 	LOG(INFO, "Surface virtual texture ", p_enabled ? "enabled" : "disabled");
 	if (_initialized && _material.is_valid()) {
@@ -822,13 +851,21 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 	if (is_vt_editor_preview_active()) { return 0; }
 	// Explicit sector updates must also bind textures first created by the
 	// preceding render-thread bake, even when normal physics updates are paused.
-	if (is_sector_avt() || !_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
+	//
+	// The physics tick runs this as its own phase immediately before the near-field pass, so on
+	// the tick path it would be the same check twice per tick - and the second one costs the same
+	// as the first, inside the phase the budget is measured on. `vt_tick_active` is what tells the
+	// two callers apart: an explicit `update_surface_vt()` call - a test driving the pass directly,
+	// or an editor preview - has no such phase and still gets its own check.
+	if (!_vt.vt_tick_active || !_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
 	_ensure_vt_views_ready();
 	if (is_sector_avt()) {
 		// What this wrapper costs around the sector planner, which reports its own total as
 		// `cpu_update_ms`. The difference between the phase a profiler shows and that figure had no
 		// attribution at all.
-		_vt.avt_sector_stats["wrapper_ms"] = double(Time::get_singleton()->get_ticks_usec() - entered) / 1000.0;
+		const double wrapper_ms = double(Time::get_singleton()->get_ticks_usec() - entered) / 1000.0;
+		_vt.avt_sector_stats["wrapper_ms"] = wrapper_ms;
+		_vt.avt_wrapper_sum_ms += wrapper_ms;
 		return _update_sector_avt(p_max_pages);
 	}
 	if (!_vt.surface_vt || !_data) {

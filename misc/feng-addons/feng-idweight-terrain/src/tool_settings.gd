@@ -1,4 +1,4 @@
-# Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+# Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Tool settings bar for Terrain3D
 extends PanelContainer
 
@@ -133,7 +133,7 @@ func _ready() -> void:
 
 	# Slope painting filter
 	add_setting({ "name":"slope", "type":SettingType.DOUBLE_SLIDER, "list":main_list, "default":Vector2(0, 90),
-							"unit":"掳", "range":Vector3(0, 90, 1), "flags":ADD_SEPARATOR })
+							"unit":"°", "range":Vector3(0, 90, 1), "flags":ADD_SEPARATOR })
 	
 	add_setting({ "name":"enable_angle", "label":"Angle", "type":SettingType.CHECKBOX, 
 							"list":main_list, "default":true, "flags":ADD_SEPARATOR })
@@ -146,7 +146,7 @@ func _ready() -> void:
 	
 	add_setting({ "name":"enable_scale", "label":"Scale", "type":SettingType.CHECKBOX, 
 							"list":main_list, "default":true, "flags":ADD_SEPARATOR })
-	add_setting({ "name":"scale", "label":"卤", "type":SettingType.SLIDER, "list":main_list, "default":0,
+	add_setting({ "name":"scale", "label":"±", "type":SettingType.SLIDER, "list":main_list, "default":0,
 							"unit":"%", "range":Vector3(-60, 80, 20), "flags":NO_LABEL })
 	add_setting({ "name":"scale_picker", "type":SettingType.PICKER, "list":main_list, "default":Terrain3DEditor.SCALE,
 							"flags":NO_LABEL, "tooltip":"Pick Scale from the terrain." })
@@ -166,31 +166,31 @@ func _ready() -> void:
 	height_list = create_submenu(main_list, "Height", Layout.VERTICAL)
 	add_setting({ "name":"height_offset", "type":SettingType.SLIDER, "list":height_list, "default":0, 
 							"unit":"m", "range":Vector3(-10, 10, 0.05), "flags":ALLOW_OUT_OF_BOUNDS })
-	add_setting({ "name":"random_height", "label":"Random Height 卤", "type":SettingType.SLIDER, "list":height_list,
+	add_setting({ "name":"random_height", "label":"Random Height ±", "type":SettingType.SLIDER, "list":height_list,
 							"default":0, "unit":"m", "range":Vector3(0, 10, 0.05), "flags":ALLOW_OUT_OF_BOUNDS })
 
 	scale_list = create_submenu(main_list, "Scale", Layout.VERTICAL)
 	add_setting({ "name":"fixed_scale", "type":SettingType.SLIDER, "list":scale_list, "default":100, 
 							"unit":"%", "range":Vector3(1, 1000, 1), "flags":ALLOW_OUT_OF_BOUNDS })
-	add_setting({ "name":"random_scale", "label":"Random Scale 卤", "type":SettingType.SLIDER, "list":scale_list, 
+	add_setting({ "name":"random_scale", "label":"Random Scale ±", "type":SettingType.SLIDER, "list":scale_list, 
 							"default":20, "unit":"%", "range":Vector3(0, 99, 1), "flags":ALLOW_OUT_OF_BOUNDS })
 
 	rotation_list = create_submenu(main_list, "Rotation", Layout.VERTICAL)
 	add_setting({ "name":"fixed_spin", "label":"Fixed Spin (Around Y)", "type":SettingType.SLIDER, "list":rotation_list, 
-							"default":0, "unit":"掳", "range":Vector3(0, 360, 1) })
+							"default":0, "unit":"°", "range":Vector3(0, 360, 1) })
 	add_setting({ "name":"random_spin", "type":SettingType.SLIDER, "list":rotation_list, "default":360, 
-							"unit":"掳", "range":Vector3(0, 360, 1) })
+							"unit":"°", "range":Vector3(0, 360, 1) })
 	add_setting({ "name":"fixed_tilt", "label":"Fixed Tilt", "type":SettingType.SLIDER, "list":rotation_list, 
-							"default":0, "unit":"掳", "range":Vector3(-85, 85, 1), "flags":ALLOW_OUT_OF_BOUNDS })
-	add_setting({ "name":"random_tilt", "label":"Random Tilt 卤", "type":SettingType.SLIDER, "list":rotation_list, 
-							"default":10, "unit":"掳", "range":Vector3(0, 85, 1), "flags":ALLOW_OUT_OF_BOUNDS })
+							"default":0, "unit":"°", "range":Vector3(-85, 85, 1), "flags":ALLOW_OUT_OF_BOUNDS })
+	add_setting({ "name":"random_tilt", "label":"Random Tilt ±", "type":SettingType.SLIDER, "list":rotation_list, 
+							"default":10, "unit":"°", "range":Vector3(0, 85, 1), "flags":ALLOW_OUT_OF_BOUNDS })
 	add_setting({ "name":"align_to_normal", "type":SettingType.CHECKBOX, "list":rotation_list, "default":false })
 	
 	color_list = create_submenu(main_list, "Color", Layout.VERTICAL)
 	add_setting({ "name":"vertex_color", "type":SettingType.COLOR_SELECT, "list":color_list, 
 							"default":Color.WHITE })
-	add_setting({ "name":"random_hue", "label":"Random Hue Shift 卤", "type":SettingType.SLIDER, 
-							"list":color_list, "default":0, "unit":"掳", "range":Vector3(0, 360, 1) })
+	add_setting({ "name":"random_hue", "label":"Random Hue Shift ±", "type":SettingType.SLIDER, 
+							"list":color_list, "default":0, "unit":"°", "range":Vector3(0, 360, 1) })
 	add_setting({ "name":"random_darken", "type":SettingType.SLIDER, "list":color_list, "default":50, 
 							"unit":"%", "range":Vector3(0, 100, 1) })
 	collision_list = create_submenu(main_list, "Collision", Layout.VERTICAL)
@@ -216,7 +216,7 @@ func _ready() -> void:
 	add_setting({ "name":"brush_spin_speed", "type":SettingType.SLIDER, "list":advanced_list, "default":50, 
 							"unit":"%", "range":Vector3(0, 100, 1) })
 	add_setting({ "name":"gamma", "type":SettingType.SLIDER, "list":advanced_list, "default":1.0, 
-							"unit":"纬", "range":Vector3(0.1, 2.0, 0.01) })
+							"unit":"×", "range":Vector3(0.1, 2.0, 0.01) })
 
 
 func create_submenu(p_parent: Control, p_button_name: String, p_layout: Layout, p_hover_pop: bool = true) -> Container:

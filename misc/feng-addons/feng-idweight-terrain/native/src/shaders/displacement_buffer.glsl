@@ -364,7 +364,6 @@ void fragment() {
 		t_weights[3] += fma(w_0, vec2(equal(texture_ids[3], id_0)), w_1 * vec2(equal(texture_ids[3], id_1)));
 	}
 
-
 	// Struct to accumulate all texture data.
 	material mat = material(0., 0.);
 	accumulate_material(TNB, weights[3], index[3], control[3], t_weights[3],

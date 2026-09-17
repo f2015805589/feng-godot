@@ -161,17 +161,6 @@ void Terrain3DVTFeedback::_decode() {
 	}
 }
 
-uint32_t Terrain3DVTFeedback::get_raw(const int p_grid_x, const int p_grid_y) const {
-	if (p_grid_x < 0 || p_grid_y < 0 || p_grid_x >= _grid_width || p_grid_y >= _grid_height) {
-		return NO_REQUEST;
-	}
-	const size_t index = size_t(p_grid_y) * _grid_width + p_grid_x;
-	if (index >= _mips.size() || _result.size() < int64_t(index + 1) * 4) {
-		return NO_REQUEST;
-	}
-	return _result.decode_u32(int64_t(index) * 4);
-}
-
 ///////////////////////////
 // Public Functions
 ///////////////////////////
@@ -398,6 +387,17 @@ int Terrain3DVTFeedback::get_mip(const int p_grid_x, const int p_grid_y) const {
 		return -1;
 	}
 	return _mips[index];
+}
+
+uint32_t Terrain3DVTFeedback::get_raw(const int p_grid_x, const int p_grid_y) const {
+	if (p_grid_x < 0 || p_grid_y < 0 || p_grid_x >= _grid_width || p_grid_y >= _grid_height) {
+		return NO_REQUEST;
+	}
+	const size_t index = size_t(p_grid_y) * _grid_width + p_grid_x;
+	if (index >= _mips.size() || _result.size() < int64_t(index + 1) * 4) {
+		return NO_REQUEST;
+	}
+	return _result.decode_u32(int64_t(index) * 4);
 }
 
 int Terrain3DVTFeedback::get_mip_for_page(const Vector2i &p_chunk, const int p_pages_per_axis,

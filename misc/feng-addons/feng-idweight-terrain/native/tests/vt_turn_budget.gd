@@ -12,7 +12,23 @@
 # view needs is already resident), then cold (both atlases cleared, so every page in
 # view is produced while the camera is still moving). The near-field radius is 256 m, so
 # most of the frame is the far field and a far-field miss cannot hide behind the near one.
-extends SceneTree
+#
+# What the wall-clock phase means can and cannot say, measured. Nine runs of this test on one
+# machine, *every one* with byte-identical work counters at the warm report - `sector_ticks` 421,
+# `reuse_ticks` 402, `chain_ticks` 19, `plan_refresh_skips` 108, `requested_physical_pages` 157,
+# `retained_requests` 93 - reported these warm near-field means: 0.1299, 0.1142, 0.0863, 0.0874,
+# 0.1432, 0.1068, 0.1189, 0.1213, 0.0912 ms, and these slow ones: 0.1056, 0.0799, 0.0774, 0.0801,
+# 0.0833, 0.0871, 0.0938, 0.1275, 0.1098 ms. The two sweeps swap sides between runs - the last one
+# has the warm sweep inside the budget and the slow one over it, the one before the reverse - with
+# the counters unmoved in both. The same sweep on the same binary moves by 66%, and the mean of the
+# *service* phase, whose whole work is a few microseconds of cache checks, moves with it (0.0096 to
+# 0.0150 ms) while its counters also do not change. The variable is the main thread being descheduled
+# inside a phase, not the code: a phase is wall time on one thread, and one 3 ms stall in a 60 frame
+# sweep is worth 0.05 ms of its mean. So `VT_BUDGET_MS` is a *shape* check - a change that alters the
+# work moves every number together - and a single threshold on a 60 frame mean will sit on the wrong
+# side of it on a loaded machine about as often as not. Read the counters and the stage sums before
+# believing a red or a green, and see README.md for the same table and for the session drift that
+# makes a run comparable only to one taken under the same machine state.
 
 const REGION_SIZE := 256
 const GRID := 3 # Regions -1..1, a 768 m world.
@@ -260,6 +276,7 @@ func report(label: String) -> void:
 			" cdlod_rebuild_peak_ms=%.4f cull_peak_ms=%.4f pack_peak_ms=%.4f upload_peak_ms=%.4f" % [peak_cdlod_parts.x, peak_cdlod_parts.y, peak_cdlod_parts.z, peak_upload_ms],
 			" tick_peak_ms=%.4f tick_mean_ms=%.4f" % [peak_tick_ms, total_tick_ms / float(frames)])
 	print("VT_TURNBUDGET ", label, " avt=", avt)
+	print("VT_TURNBUDGET ", label, " cdlod_peak_parts=", terrain.get_cdlod_stats())
 	print("VT_TURNBUDGET ", label, " avt_peak_stats=", settings.get("avt_peak_stats", {}),
 			" age_ms=", settings.get("avt_peak_age_ms", -1.0))
 	# `svt_stats` is the far field's worst pass *since startup*, not this sweep's: it is only

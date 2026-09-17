@@ -252,6 +252,12 @@ func measure(fade_frames: int) -> Dictionary:
 	build_scene()
 	terrain.vt_page_fade_frames = fade_frames
 	terrain.surface_vt_enabled = true
+	# Enabling the surface virtual texture re-enables the node's own physics processing - the setter
+	# does it so a surface that was just switched on starts being updated - so the disable in
+	# `build_scene()` is undone here. Left enabled, the engine runs a second VT section per awaited
+	# frame and every ramp is spent at twice the rate the test asks for: measured 11 published ticks
+	# for a 20 frame ramp, 21 for a 40 frame one. Disable it after the settings, not before them.
+	terrain.set_physics_process(false)
 	for _frame in WARMUP:
 		await tick()
 	var producer := producer_stats()
@@ -282,9 +288,25 @@ func measure(fade_frames: int) -> Dictionary:
 	if dropped:
 		# Let the fallback settle: the shader resolves the level behind the page from the frame the
 		# page's content is gone, and that level is the ramp's other end.
+		#
+		# The ramp is measured from the tick the page arrives, not from the frame this wait ends.
+		# The page is re-produced within a tick or two, so the ramp is already running by then: a
+		# window opened afterwards measures the tail of the ramp, and the arrival it is meant to
+		# check has been counted as if the engine had not faded it at all. `vt_page_fade_starts` is
+		# what says which tick that is - it counts the ramps the engine published, so an increase is
+		# an arrival.
+		var starts_at_drop := int(terrain.get_vt_settings().get("vt_page_fade_starts", -1))
+		var ramp_rows: Array = []
+		var arrived := false
 		var coarse_row := before_row
 		for _frame in 8:
 			await tick()
+			if arrived:
+				ramp_rows.append(sample_row())
+			if int(terrain.get_vt_settings().get("vt_page_fade_starts", -1)) > starts_at_drop:
+				arrived = true
+			if fade_frames > 0 and int(terrain.get_vt_settings().get("vt_page_fade_active_slots", 0)) > 0:
+				active_ticks += 1
 			coarse = sample_center()
 			coarse_row = sample_row()
 		# Measure on the sample the drop actually moved. Which one that is depends on where the
@@ -294,12 +316,13 @@ func measure(fade_frames: int) -> Dictionary:
 		sample_at = differing_sample(before_row, coarse_row)
 		if sample_at >= 0:
 			sample_from = coarse_row[sample_at]
-		var frames: Array = []
 		for _frame in OBSERVE:
 			await tick()
 			last = sample_center()
-			if sample_at >= 0:
-				frames.append(sample_row()[sample_at])
+			if arrived:
+				ramp_rows.append(sample_row())
+			if int(terrain.get_vt_settings().get("vt_page_fade_starts", -1)) > starts_at_drop:
+				arrived = true
 			if is_diagnostic(last):
 				worst = last
 			var active := int(terrain.get_vt_settings().get("vt_page_fade_active_slots", 0))
@@ -312,8 +335,8 @@ func measure(fade_frames: int) -> Dictionary:
 		# page that arrived. A step has none; a ramp has one per fading tick.
 		if sample_at >= 0:
 			var target: Color = before_row[sample_at]
-			for frame in frames:
-				var at := position_of(frame, sample_from, target)
+			for row in ramp_rows:
+				var at := position_of(row[sample_at], sample_from, target)
 				ramp.append(at)
 				if at > BETWEEN_LOW and at < BETWEEN_HIGH:
 					between += 1

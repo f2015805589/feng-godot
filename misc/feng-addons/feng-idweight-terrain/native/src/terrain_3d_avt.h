@@ -11,8 +11,11 @@
 #ifndef TERRAIN3D_AVT_TYPES_H
 #define TERRAIN3D_AVT_TYPES_H
 
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <unordered_set>
 #include <vector>
 
@@ -20,6 +23,42 @@
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
+
+// What a page plan is a function of: the predicted camera transform, the projection, the viewport
+// and the settings that size the plan. A fixed-size value rather than a byte array, because it is
+// built, copied and compared on every tick of a moving view and an allocation per tick was the
+// largest single thing that build cost. `_avt_plan_state()` fills it in the order the component
+// diagnostic numbers (9 basis, 3 origin, 16 projection, 4 viewport, then the scalars).
+using Terrain3DAVTPlanKey = std::array<double, 64>;
+
+// A key that matches nothing, for a view that has no plan key yet or whose key was invalidated.
+// NaN is its own inequality, which is the semantics wanted: an invalidated key never compares
+// equal to the key that replaces it, so the next tick plans. `is_valid_avt_plan_key()` is its
+// reader; the value form exists so a member can be initialized with it, and the in-place form is
+// what a settings change uses.
+inline Terrain3DAVTPlanKey invalid_avt_plan_key() {
+	Terrain3DAVTPlanKey key;
+	key.fill(std::numeric_limits<double>::quiet_NaN());
+	return key;
+}
+inline void invalidate_avt_plan_key(Terrain3DAVTPlanKey &r_key) {
+	r_key = invalid_avt_plan_key();
+}
+inline bool is_valid_avt_plan_key(const Terrain3DAVTPlanKey &p_key) {
+	return !std::isnan(p_key[0]);
+}
+
+// The world size of one demand cell. The scan that fills cells, the planner that walks them and the
+// shader's sector arithmetic all have to agree on this number, and they are in three files, so it
+// lives beside the record it describes instead of in one of its readers.
+constexpr float AVT_SECTOR_WORLD = 64.f;
+
+// How far demand leads the footprint that asks for it. It is a factor on a density, not a distance:
+// 1.25 asks for the level a quarter finer than the one the footprint selects, which is what makes an
+// asynchronous production land before a normal mip transition needs it. The scan applies it when it
+// picks a cell's wanted size and the planner applies it when it picks a page's density, so it is
+// shared for the same reason the cell size is.
+constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 
 // One page the planner wants resident: the virtual block that owns it, the mip
 // inside that block, the page coordinate and the world rectangle it covers.
@@ -40,7 +79,7 @@ struct Terrain3DAVTPageRequest {
 // before it is published and read after it is observed.
 struct Terrain3DAVTRefinement {
 	std::atomic<bool> ready{ false };
-	PackedByteArray key;
+	Terrain3DAVTPlanKey key = {};
 	std::vector<Terrain3DAVTPageRequest> pages, warm;
 	float finest = 0.f;
 	int denied = 0, roots = 0;
@@ -48,6 +87,9 @@ struct Terrain3DAVTRefinement {
 	// to the speculative apron appended after them. Production diagnostics count a
 	// missing page among these as a page the view is shading without content.
 	int sampled = 0;
+	// The residency the plan was budgeted against. The retention window is appended to the
+	// completed plan, so the installer needs the budget to keep the total inside it.
+	int budget = 0;
 	uint64_t submitted_us = 0, elapsed_us = 0;
 };
 

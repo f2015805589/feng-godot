@@ -13,24 +13,11 @@
 #include "terrain_3d_util.h"
 
 ///////////////////////////
-// Public Functions
+// Private Functions
 ///////////////////////////
-
-void Terrain3DStreamer::initialize(Terrain3D *p_terrain) {
-	_terrain = p_terrain;
-	_sync_data();
-	LOG(INFO, "Terrain3DStreamer initialized, terrain: ", p_terrain);
-}
 
 void Terrain3DStreamer::_sync_data() const {
 	_data = _terrain ? _terrain->get_data() : nullptr;
-}
-
-void Terrain3DStreamer::clear_tracking() {
-	_streamed.clear();
-	_missing.clear();
-	_has_last_center = false;
-	_last_center = V2I_MAX;
 }
 
 String Terrain3DStreamer::_resolve_directory() const {
@@ -50,10 +37,6 @@ bool Terrain3DStreamer::_is_resident(const Vector2i &p_region_loc) const {
 	// unload paths need anyway.
 	_sync_data();
 	return _data && _data->get_region_ptr(p_region_loc) != nullptr;
-}
-
-int Terrain3DStreamer::chebyshev_distance(const Vector2i &p_a, const Vector2i &p_b) {
-	return MAX(std::abs(p_a.x - p_b.x), std::abs(p_a.y - p_b.y));
 }
 
 void Terrain3DStreamer::_collect_desired(const Vector2i &p_center, std::vector<Vector2i> &r_desired) const {
@@ -181,6 +164,27 @@ void Terrain3DStreamer::_notify_region_set_changed() {
 	if (_terrain && _terrain->get_instancer()) {
 		_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
 	}
+}
+
+///////////////////////////
+// Public Functions
+///////////////////////////
+
+void Terrain3DStreamer::initialize(Terrain3D *p_terrain) {
+	_terrain = p_terrain;
+	_sync_data();
+	LOG(INFO, "Terrain3DStreamer initialized, terrain: ", p_terrain);
+}
+
+void Terrain3DStreamer::clear_tracking() {
+	_streamed.clear();
+	_missing.clear();
+	_has_last_center = false;
+	_last_center = V2I_MAX;
+}
+
+int Terrain3DStreamer::chebyshev_distance(const Vector2i &p_a, const Vector2i &p_b) {
+	return MAX(std::abs(p_a.x - p_b.x), std::abs(p_a.y - p_b.y));
 }
 
 bool Terrain3DStreamer::update(const Vector3 &p_center) {

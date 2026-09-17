@@ -252,7 +252,7 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 
 	// MAP Operations
 	// save region count before brush pixel loop. Any regions added will have caused an Array
-	// rebuild at the end of the last _operate() call, but until painting is finished we only
+	// rebuild at the end of the last _operate_map() call, but until painting is finished we only
 	// need to track if _added_removed_locations has changed between now and the end of the loop
 	int regions_added_removed = _added_removed_locations.size();
 
@@ -693,7 +693,6 @@ uint8_t *Terrain3DEditor::SurfaceByteCache::texel(const int p_width, const Vecto
 	const int y = p_pixel.y * p_density + p_block.y;
 	return bytes.ptrw() + (int64_t(y) * p_width + x) * 2;
 }
-
 
 void Terrain3DEditor::_store_undo() {
 	IS_INIT_COND_MESG(!_terrain->get_plugin(), "_terrain isn't initialized, returning", VOID);

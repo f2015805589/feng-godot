@@ -454,9 +454,6 @@ public:
 	// cost for one tier and not necessarily for the other.
 	void set_tier_compression(int p_tier, int p_mode);
 	Dictionary get_tier_compression_info(int p_tier) const;
-	// The AVT tier, which the legacy single setting and the compression tests address.
-	void set_atlas_compression(int p_mode) { set_tier_compression(TIER_AVT, p_mode); }
-	Dictionary get_atlas_compression_info() const { return get_tier_compression_info(TIER_AVT); }
 	void request_capacity(int p_count);
 	// True while a larger capacity has been requested but the arrays are still the old size.
 	// A caller that would produce pages into the old size can wait a frame or two instead:
@@ -527,7 +524,7 @@ public:
 	// Compress and decode one image through the codec a tier resolved to, and report the
 	// error it introduced. Deterministic and independent of the page pipeline, so a test can
 	// verify the codec's error bound even where page production has nothing to bake from.
-	Dictionary probe_atlas_compression(const Ref<godot::Image> &p_image) const { return probe_tier_compression(TIER_AVT, p_image); }
+	// `Terrain3D::probe_vt_atlas_compression()` is the script-facing entry point.
 	Dictionary probe_tier_compression(int p_tier, const Ref<godot::Image> &p_image) const;
 	Ref<godot::Image> get_page_preview(int p_slot) const;
 	Dictionary get_stats() const;

@@ -22,7 +22,8 @@ lives in these files, and each one owns one thing:
 | --- | --- |
 | `terrain_vt.h` | The addressing contract only: page IDs, virtual-image kinds, the block allocator. Header-only, no Godot dependency, no runtime state. |
 | `terrain_3d_vt_state.h` | Every VT field `Terrain3D` owns, in one struct: the shared service, the near-field AVT and the far-field SVT, grouped in the same order as the passes that use them. No algorithms, no cross-field initializers. The node's own fields stay in `terrain_3d.h`. |
-| `terrain_3d_virtual_texture.{h,cpp}` | One view's indirection texture and its virtual blocks, plus `Terrain3DVTPagePool`: the physical `Texture2DArray`, slot free list, LRU, protection and the reverse owner index. No terrain data, no demand. |
+| `terrain_3d_virtual_texture.{h,cpp}` | One view's indirection texture, the mip-chain walk and its virtual blocks. No terrain data, no demand, and no residency: the atlas it publishes into belongs to the pool below. |
+| `terrain_3d_vt_page_pool.{h,cpp}` | The physical side both views share: the `Texture2DArray` atlas, the global slot allocator (reserve / commit / abort), LRU and protection, the reverse owner index, and page read/write. |
 | `terrain_3d_avt.h` | Plain records of the near-field demand: page requests, the asynchronous plan result, cached addresses, sectors and the working set. No algorithms. |
 | `terrain_3d_sector_avt.cpp` | The near field end to end: the camera/config plan key, the 64 m sector scan, the coarse hierarchy and address directory, the asynchronous page selection, and page production from the region payload. |
 | `terrain_3d_vt_demand.cpp` | The far field's demand pass over the world page grid, with the shared capacity floor. |
@@ -78,7 +79,7 @@ Allocator padding does not change logical density. These virtual images are not 
 
 ## Ownership and frame flow
 
-- `terrain_3d_surface_vt.cpp` configures shared services, invalidation and source lifetime. `Terrain3DVTPagePool` owns physical allocation, LRU, protection and reverse ownership.
+- `terrain_3d_surface_vt.cpp` configures shared services, invalidation and source lifetime. `Terrain3DVTPagePool` (`terrain_3d_vt_page_pool.{h,cpp}`) owns physical allocation, LRU, protection and reverse ownership; the view that published an evicted slot is called back so its indirection entry goes with it.
 - `terrain_3d_sector_avt.cpp` builds visible and idle sector demand and retains address blocks. `terrain_3d_vt_demand.cpp` schedules visible SVT footprints with a common capacity floor. Both tiers point into the shared physical arrays.
 - `terrain_3d_vt_indirection.cpp` owns RD indirection initialization and dirty-tile uploads. CPU updates coalesce by mip/tile; the render thread copies 16 x 16 tiles. Failed initial/patch submissions remain available for retry. Encoded page IDs remain exact R32F values. The upload is queued into the render thread, so it only runs while frames are drawn: while a view still owes one, `Terrain3D::_update_vt_service()` keeps asking the editor for a redraw even when the baker has nothing pending.
 - The native **VT Pass** (id 16) runs the registered main-RenderingDevice baker before GBuffer. AVT evaluates material pages; SVT copies/composites baked cell source regions. Runtime production does not use a local-device submit/sync or material readback.
