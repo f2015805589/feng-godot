@@ -464,3 +464,311 @@ recorded here because the deletions above are listed as "read", not as "used".
   it has none, but removing a script a user may attach by hand is the owner's call, not
   this pass's.
 
+### Removed: the experimental distance-mip controls
+
+The one cluster that was genuinely dead, and has now been deleted:
+`set_surface_vt_distance_mips()` (which forced the member it set back to `false`),
+`set_surface_vt_mip_ranges()` (an empty function), `get_surface_vt_distance_lod()` (which
+returned `0`), the `surface_vt_mip0/1/2_distance` accessors built on `mip_ranges`, the two
+members behind them, their six `ClassDB` bindings, their five properties and the
+`avt_distance_mips` / `avt_mip_ranges` keys of `get_vt_settings()`. Nothing was serialized:
+every property was declared `PROPERTY_USAGE_NONE`, so no saved scene ever carried them, and
+the editor dock had already dropped the `AVTMipDistance*` controls that
+`vt_resolution_controls.gd` asserts are absent. The test asserted their no-op behaviour —
+`terrain.surface_vt_distance_mips = true` must leave it `false` — which was the only thing
+keeping them; those three assertions are gone with the surface.
+
+The distinguishing test was the suite, not a judgement call: `vt_debug_direct_material` is
+set by nine scripts, `surface_vt_selection_mode` by thirteen, `surface_vt_force_mip` by six.
+Only the distance-mip cluster had no reader outside the test that pinned its no-op.
+
+### The far field now reads in the same shape as the near field
+
+The near field's production pass has had a named stage record since the budget work:
+`Terrain3DAVTProducePass` is filled in order by `_classify_plan` → `_retain_visible` →
+`_prime_sources` → `_produce_visible` → `_prefetch` → `_finish_produce`, so a reader can find one
+stage without reading the pass. The far field had no such structure: `_update_visible_svt()` had
+grown to **484 lines** holding six stages — the visible-region scan, the recursive footprint walk,
+the shared-capacity request, the level-window publish, the root pyramid, the over-subscription floor
+search — plus the detail loop and the worst-pass statistics. Every one of them was reachable only by
+reading the whole function.
+
+`_svt_plan_roots()` now owns the root pyramid (283 lines left in the pass, 213 in the new method),
+with its inputs and its two outputs named instead of being locals in the middle of the pass:
+
+```cpp
+std::array<double, 4> _svt_plan_roots(const Rect2 &p_domain, int p_maximum_mip,
+        int p_coverage_limit, int p_physical_page_count, int &r_produced, bool &r_cached);
+```
+
+It returns its four stage timings rather than writing them, which is what let the extraction keep the
+existing `ST_ROOTLIST`..`ST_ROOTCOV` attribution: the pass fills those four slots from the array, so
+`svt_stats` reports `rootlist_ms` / `rootunpin_ms` / `rootreq_ms` / `rootcov_ms` exactly as before.
+The first attempt dropped the `rootreq` stamp and moved 1.5 ms of a root walk into `rootcov_ms` —
+which is the whole reason the stages are reported at all, and it is why the extraction was verified
+against `svt_stats` rather than only against the suite.
+
+Verified behaviour-neutral: `vt_recovery`, `vt_pressure`, `vt_svt_coverage` and `vt_demand` pass
+standalone, `vt_turn_budget`'s paint readings are unchanged (172 leftover diagnostic pixels after a
+warm turn, 627 / 0 in the isolated turn's bands), and the reported `svt_stats` for the worst pass is
+the same breakdown of the same pass.
+
+### The surface baker's render callback, in its stages
+
+`Terrain3DSurfaceBaker::render_pending()` is the render-thread callback that turns the demand queue
+into a compute dispatch, and it was 272 lines of stages with nothing naming them: the lock-scoped
+snapshot, the retiring of old resource bundles, the resource rebuild, the material refresh, the job
+list, the per-slot invalidation and production loop under the page budget, and the dispatch. Two of
+those stages are now methods, which is what the callback reads as:
+
+* **`_retire_acknowledged_bundles()`** — frees the bundles the material has stopped sampling, from the
+  frame after it acknowledged the pair it is drawn with. It needed no parameters at all: it reads
+  `_retired`, `_acknowledged_frame` / `_acknowledged_generation` and writes `_retire_ready`. It was
+  also indented one level too deep in the callback, a leftover from an earlier edit that the compiler
+  is happy with and a reader is not — extracting it is what puts it back at the right depth.
+* **`_build_frame_jobs()`** — the frame's job list: one job per slot with an invalidation standing in
+  where nothing is queued, when the whole atlas is invalidated; otherwise exactly what was queued. A
+  pure function of its four arguments, which is why it is `const`.
+
+* **`_dispatch_frame_jobs()`** — the stage worth the most: the encode halves, the per-slot loop and the
+  compute dispatch, 133 lines. It takes the frame's job list and reports one thing back, a `bool`:
+  false when the job recording failed, which means the frame did nothing, every job is back in
+  `_pending` and the whole atlas is marked for invalidation, so the caller returns. Everything else it
+  works through — `compute_jobs`, the `scratch` regime test, the `cleared_all` / `cleared_layers`
+  invalidation shortcut, `_frame_page_updates` — is local to it.
+
+`render_pending()` is 116 lines, down from 272. The extraction was a scripted move rather than a
+hand-paste — 126 lines relocated and ten caller-locals renamed to parameters — because renaming ten
+identifiers across a hundred lines by hand is where a silent miss lives. The script asserted every
+rename's occurrence count and refused to write on a mismatch, which is how it caught three
+`_set_ready(..., generation, ...)` call sites where two were expected; the renames it did *not* cover
+are exactly the ones the compiler then found (`cleared_layers`'s `page_count`, the three `_record_jobs`
+arguments, and that the job list has to be passed by non-const reference because the loop stores the
+staging layer into each job).
+
+Two of `_ensure_resources()`'s six stages are now methods, taking it from 296 lines to 233:
+
+* **`_adopt_grown_pages()`** — carries a grown pool's finished pages into the bundle replacing it, and
+  queues the old bundle for retirement. Its doc comment is where the two reasons live: the old output
+  has to stay alive until the material has bound the new arrays (so it goes through `_retired` rather
+  than being freed), and under the scratch regime there is nothing to copy at all, because a page's
+  half-float content only ever lives in the encoder ring and a block-compressed layer cannot carry the
+  unordered-access flag `texture_copy` needs on D3D12.
+* **`_adopt_bundle()`** — adopts a finished bundle and resizes everything indexed by the page count
+  together, so no slot can be read at a size the arrays do not have. It is also where a grown pool's
+  ready pages are marked to be encoded again: a block-compressed layer cannot be copied between
+  formats, and the staging copy is what carries the content across the resize.
+
+The stage that was worth the most is **`_create_bundle_resources()`** — every texture and sampler of a
+bundle, the per-tier compressed arrays, the staging and output textures, and the validation of all of
+them, 128 lines. It takes the bundle to fill plus the stored page size and the page count, and nothing
+else: the per-tier loop and the ring sizing write members, so they need no plumbing. `_ensure_resources()`
+is 113 lines, down from 296.
+
+Two stages are left and are named for the next pass: the guards, and the previous bundle's capture with
+the growing decision.
+
+`vt_format` is the test that covers this path directly — it changes the page format and asserts the
+page pool survives — and its `PASS virtual texture format change keeps the page pool` holds with
+`ERRORS=0` after the extraction, as do `texture_layers`, `vt_compression` and `vt_codec_colors`.
+
+The move was scripted again, and the script's own limits are worth recording: it asserted all twenty
+`next` → `r_next` renames by count and refused to write on a mismatch, but it did *not* know that the
+span's last line closes the moved block rather than the function, so the extracted function came out
+without a closing brace, and it left the caller's own `ResourceBundle next;` in place beside the one
+the call site needs. The compiler found both immediately (C2601, "local function definitions are
+illegal"); a boundary is not something a rename count can check.
+
+**And it indented the moved code one level too deep, which is the same defect this pass had already
+found and fixed in someone else's edit.** Both scripted moves did it — `_dispatch_frame_jobs()` too —
+because the script added a tab to code that was already inside a function body. It was fixed by
+de-indenting each body by exactly one tab, over the range the brace match gives (on masked text, since
+these files quote braces in comments and raw strings). The lesson is the uncomfortable one: finding a
+class of defect in the code is not the same as not writing it, and the only reason this was caught is
+that the *next* thing that pass did was read the same function again for an unrelated reason.
+
+The three largest functions left all need the same thing before they can be split, and it is a design
+step rather than a move:
+
+* `_update_visible_svt()` (283) — **split**: the footprint walk is now `_svt_walk_visible_pages()`, and
+  the pass is 235 lines. This needed the design step first, twice over: the two records it hands the
+  walk (`Terrain3DSVTRegion`, `Terrain3DSVTPage`) had to leave the function for `terrain_3d_svt.h`,
+  declared the way `terrain_3d_avt.h` declares the near field's plan types and for the reason that
+  header's own comment gives — so a stage can be a function with a readable signature instead of a
+  lambda closing over a large function's locals. The `avt_interior` predicate stays in the pass and is
+  passed in, and the addressable `domain` moved *up* to the caller, because the root plan below the
+  walk is bounded by it too.
+* `_request_encodes()` (199) — its 137-line per-page loop carries a locally-declared `PendingStore`.
+* `_operate_map()` (492) — 95 lines of brush-parameter gathering feeding a 308-line paint loop that
+  caches a region image across iterations. This one wants a context struct for the loop, and it is the
+  only one where the split changes how the code reads rather than only where it lives.
+
+The scripted move produced three faults this time, and the pattern in them is worth more than the
+move: the moved range *included* its end marker, so the walk came back carrying the caller's
+`stamp(ST_WALK)` and its own `visible_page_count`; a local it renamed collided with the out-parameter
+of the same name; and `domain`, declared inside the range, was needed on both sides. Ranges want to be
+half-open and to hold only what moves — a rule both of this pass's scripted moves broke, in different
+ways, and the compiler caught each one within a build.
+
+The new header also has a gotcha worth more than the header itself: **a Godot type has to be
+qualified in a header that can be included first.** `Rect2` and `Vector2` are in `namespace godot`, and
+the `using namespace godot;` that makes them writable unqualified lives in `terrain_3d_vt_visibility.h`
+and `constants.h` — which every other header in the addon happens to be included after. This one is
+first in `terrain_3d_vt_demand.cpp`, so it needed `godot::Rect2`. Two builds were spent on that, and
+the same two on including `terrain_vt.h`, which does not declare `VisiblePatch` at all — that is in
+`terrain_3d_vt_visibility.h`.
+
+### Two audit helpers, kept as one tool
+
+`native/audit_code.py dead` and `native/audit_code.py shape` are what answered "what is dead" and
+"what has outgrown its file" without reading the source by eye. `dead` is what found `get_warnings()`
+(nothing outside its own declaration, and no binding) and confirmed the distance-mip cluster above;
+it reported **no unused `Terrain3DVTState` field**, of 169 declared. `shape` is what found
+`_update_visible_svt()`. They are reported as candidates rather than verdicts, and say so: a property
+getter named only from its `ADD_PROPERTY` binding string is live, and the report names the sixteen
+that look dead for exactly that reason.
+
+**`shape` was measuring wrong, and that is worth recording because its numbers were acted on.**
+A span is the distance from one definition to the next, so anything the detector misses is not
+reported as missing — it is silently added to its predecessor. It missed two whole kinds of
+definition:
+
+* **Namespace-scope functions.** The detector matched `Terrain3D::name(` only, so the 194-line
+  `avt_plan_pages()` in `terrain_3d_sector_avt.cpp` was attributed to whatever member function
+  preceded it. That made `set_surface_vt_selection_mode()` read as **229 lines**; it is **nine**.
+  Splitting a nine-line setter was the next thing on the list, and checking the number by hand first
+  is the only reason it did not happen.
+* **The embedded shaders.** They are raw string literals, `R"(#version 450 … )"`, and the GLSL inside
+  them sits at column 0 and looks exactly like a definition — `vec4 encode_vec4(…) {`, `void main() {`.
+  A first attempt at the fix reported `encode_vec4` at 1699 lines and a `main` at 877.
+
+The detector now masks comments and raw string literals (keeping every offset, so line numbers still
+mean something) and matches a column-0 line that is not a comment, a preprocessor line or one of the
+scope keywords, whose name may be qualified — the initial fix failed because `[\s*&]` before the name
+does not match the `:` of `Class::method(`. It reports member and namespace-scope definitions alike,
+and its numbers now agree with the ones checked by hand: `_update_visible_svt` 283,
+`_ensure_resources` 233, `_svt_plan_roots` 214, `render_pending` 116.
+
+The lesson generalises past this file: a metric that is off by an attribution error looks exactly like
+a metric that is right, and the only cheap defence is to check one known value by hand before acting.
+
+### `dupes`: what is *not* there
+
+`native/audit_code.py dupes` is the complement of `dead` — that finds code nothing reads, this finds
+code written twice. Bodies are compared as line sequences with comments and indentation dropped, so a
+reformatted copy still matches while one whose identifiers were renamed does not; it under-reports
+rather than producing pairs a reader has to reject one by one.
+
+It compared **532 definitions and found none written more than once**. That is a result, not a
+non-event: the deletion half of this pass has no copy-paste to collect, so what is left there is
+removal of things nothing calls (which `dead` answers) rather than merging.
+
+The addon's *tests* are a different story and were left alone. `settle()` — the "wait until production
+stops and nothing is pending" helper — appears in nine test files, and the first reading of that is
+"nine copies, unify them". Checking each one first changed the answer twice:
+
+* they are not one family. Two of the nine extend `vt_adaptive_base.gd`, two extend
+  `vt_render_base.gd`, and five extend `SceneTree` directly with their own names and shapes
+  (`settle_sectors`, `settle_views`, `settle_bundles`, `settle(max_ticks)`). One of them,
+  `vt_region_ownership.settle_views()`, is not a settle predicate at all — it waits a fixed 140 frames.
+  So the largest possible unification within one family is two files.
+* and that unification does not work. A helper on `vt_adaptive_base.gd` cannot drive `tick()`, because
+  GDScript resolves the call statically against the base and the base has no `tick()` — each scenario
+  defines its own, one driving the demand pass directly and another through the physics notification.
+  Passing the tick as a `Callable` would make it compile, and it was reverted rather than done: a
+  `Callable` parameter plus nine rewritten call sites to delete eleven lines of predicate is not a
+  trade worth making on the suite that verifies everything else.
+
+Reverted, and the scenarios re-run to their previous state — which for `vt_metric_density` and
+`vt_sectors` is the pair of engine-side failures recorded earlier, with no parse errors, so the revert
+is exact. The duplication is recorded here as *deliberate* rather than as debt.
+
+### Smaller cleanups in the same pass
+
+* `get_warnings()` removed: a public accessor with one reference outside its declaration and no
+  binding.
+* The pass-timing idiom — `uint64_t start = ...; run stage; stats[key] = ms(start); start = ...`
+  repeated seven times in one method and six in another — is now one `mark(key)` lambda per pass, so
+  `_produce_sector_avt_pages()` and the planning chain read as the stages they run.
+* Comments that described code that no longer exists: the phase list still named a "near-field
+  production top-up" as a phase (removed two passes ago, kept as a reported zero), and
+  `_avt_logical_ratio()` justified itself by "the staged planner publishes the directory one phase
+  before it submits the plan" (there is no staged planner; the real reason is that the publish
+  precedes the submit in the chain).
+* `Terrain3DPagePipeline`'s queue is two flat `std::vector`s (an entry array and a FIFO of keys)
+  where it was a `std::map` plus a `std::set` of `(token, key)` pairs kept in step by hand. Measured
+  neutral on every phase: it is a simplification, not an optimisation, and it is recorded as such
+  rather than as a win.
+
+### `Terrain3DEditor::_operate_map()`: 490 lines to 198
+
+`_operate_map()` was the largest definition in the addon — two and a half times the next one — and it
+was one function doing six jobs: gather the brush, dispatch on map type, run four different per-texel
+representations, then finish the edit. The brush loop alone was a 308-line nested body whose four
+branches each ended differently: the height branch fell through to a shared `set_pixelv()`, the
+surface branch `continue`d after writing bytes of its own, the colour branch could `continue` from two
+places before its switch, and the gradient case `return`ed out of the whole function.
+
+The split names those differences instead of leaving them implicit:
+
+* `MapBrushOp` — the twenty-odd values `_operate_map()` reads out of the brush dictionary once, so the
+  per-texel work can be a function. It also documents what a brush *is*: an operation is a map type, a
+  shape, a strength and a payload, and nothing per-texel.
+* `TexelResult { TEXEL_WRITE, TEXEL_SKIP, TEXEL_ABORT }` — the three endings the branches actually had.
+  The loop now acts on the result in one place: abort, skip, or `backup_region()` + `set_pixelv()`.
+  `TEXEL_ABORT` is only reachable from the gradient case, which is why it is named for the operation
+  rather than for the texel.
+* `_paint_height_texel()`, `_paint_control_texel()`, `_paint_color_texel()` — one per map type, chosen
+  by the map type. Adding a representation is adding a handler rather than editing a loop.
+* `_finish_map_operation()` — the 56 lines after the loop: mipmap regeneration, the partial-vs-full
+  `update_maps()` decision, the surface array refresh, VT page invalidation, collision and `snap()`.
+* `SurfaceByteCache` — the R16 payload cache that used to be four loop locals and a `[&]` lambda
+  defined inline in `_operate_map()`, including the `Image::Format(39)` re-decode on write-back and the
+  region-change test. It gets a type because it has an invariant worth stating: the bytes are a
+  copy-on-write view, so exactly one region may be cached at a time.
+
+Two behaviour notes, both deliberate:
+
+* The gradient `TEXEL_ABORT` path now flushes the surface cache before returning. This is a no-op by
+  construction — the surface cache is only ever populated for the `TEXTURE` tool, and `TEXEL_ABORT`
+  requires `_operation == GRADIENT`, which cannot run with `TEXTURE` — but it removes a latent
+  drop of pending writes if those conditions ever change.
+* The block-replication `continue` in the `TEXTURE` path had to stay a `continue`: it skips the `(0,0)`
+  texel, which the handler has already painted through `_paint_surface_pair()`. It is the one
+  `continue` in the extracted code that is *not* a loop-level skip.
+
+#### How it was verified
+
+The refactor was gated on a new test, `native/tests/editor_paint.gd`, written *before* the move.
+`region_slots.gd`, `texture_layers.gd`, `vt_density.gd` and `vt_render.gd` all drive
+`start_operation() → operate() → stop_operation()`, but every one of them paints with the `TEXTURE`
+tool only, so the height, colour and legacy-control branches had no headless coverage at all. The new
+test drives all twelve tool/operation pairs the toolbar can emit — sculpt add/subtract/average, the
+alt-drag trough, gradient, height, colour, roughness, holes, navigation, autoshader, texture — each on
+its own region, asserts the visible effect of each (an exact height, the set/cleared control bit, the
+written material pair), and pins the region's height + control + colour + surface bytes with an MD5
+digest.
+
+Every digest is byte-identical across the split, which is a much stronger statement than "the suite
+still passes": it says the extracted handlers write the same bytes as the 490-line original in all
+twelve branches, including the surface-cache flush points and the `edited_area` accumulation.
+
+Three things the test found on the way:
+
+* A blank region's control map is `COLOR_CONTROL`, so the autoshader bit starts *set*. `AUTOSHADER +
+  ADD` therefore writes nothing at all, and a test that asserts the bit is set after painting passes
+  vacuously. The phase had to become `AUTOSHADER + SUBTRACT`.
+* `gradient_points` are world space, not brush-relative. The first version put the ramp in region 0 and
+  painted in region 4, which clamps the projection weight to 1.0 and makes the phase assert nothing.
+* The alt-drag trough clamps to the cursor height, so it is indistinguishable from a plain raise while
+  the cursor sits at or above the surface. The phase moves the cursor 0.5 m below the surface, and the
+  assertion is the clamped height.
+
+And one thing it did *not* find. The `continue` → `TEXEL_SKIP` rewrite was applied by pattern, and the
+pattern wrongly matched a `continue` inside the density-replication double loop. At the default
+`surface_density` of 1 that loop is skipped entirely (it is guarded by `density > 1`), so all twelve
+digests still matched. A second phase was added at `surface_density = 2` which reads the block back and
+requires all four texels to equal the painted one — a check that cannot pass vacuously, because it also
+requires the base texel to be non-zero. Both the fix and the coverage came from this: the test is only
+as good as the configurations it drives, and a digest gate over one density is a gate over one path.
+

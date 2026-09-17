@@ -347,6 +347,22 @@ private:
 	// region, and requests one buffer readback per channel.
 	void _request_encodes();
 	void _flush_encodes(uint64_t p_generation);
+	// Frees the resource bundles the material has stopped sampling, from the frame after it
+	// acknowledged the pair it is drawn with. Called from `render_pending()`, on the render thread,
+	// before the frame's own resources are ensured. See the definition for why the acknowledgment is
+	// only honoured from the following frame.
+	void _retire_acknowledged_bundles();
+	// One frame's job list, drained from the pending queue. With `p_invalidate_all` the list is one
+	// job per slot - the queued job where there is one, an invalidation where there is not - and
+	// otherwise it is exactly what was queued.
+	std::vector<PendingJob> _build_frame_jobs(const std::map<int, PendingJob> &p_pending,
+			bool p_invalidate_all, uint64_t p_generation, int p_page_count) const;
+	// One frame's page production and dispatch. Returns false when the job recording failed, in
+	// which case the frame did nothing and the caller must return. See the definition.
+	bool _dispatch_frame_jobs(std::vector<PendingJob> &p_jobs, uint64_t p_generation,
+			uint64_t p_material_version, int p_page_count, int p_page_size, int p_border,
+			int p_stored_size, int p_material_count, bool p_invalidate_all,
+			Terrain3DCellStore *p_cell_store);
 	// Decrements the outstanding readback count of one ring page. Called from the completion
 	// callback, which takes the encode mutex alone; the caller checks the page's generation
 	// and sequence against the world state in its own scope.
@@ -389,6 +405,18 @@ private:
 	// Moves the current bundle out and returns the generation it belonged to, so the
 	// caller can retire it against the material's acknowledgment.
 	uint64_t _take_resources(ResourceBundle &r_resources);
+	// Takes the main device the first time a bundle is needed. False when there is no device.
+	bool _acquire_device();
+	// Creates every texture and sampler of one bundle and validates them. Returns false - with the
+	// bundle freed in place - when the device could not allocate them.
+	bool _create_bundle_resources(ResourceBundle &r_next, int p_stored_size, int p_page_count);
+	// Carries a grown pool's finished pages into the bundle replacing it, and queues the old bundle for
+	// retirement. Returns false - with `p_next` freed - when a copy fails.
+	bool _adopt_grown_pages(const ResourceBundle &p_old, ResourceBundle &p_next, int p_old_count,
+			const std::vector<uint8_t> &p_ready, uint64_t p_old_generation, int p_stored_size);
+	// Adopts a finished bundle as the one this baker produces into, resizing everything indexed by the
+	// page count together.
+	void _adopt_bundle(ResourceBundle &p_next, uint64_t p_generation, int p_page_count);
 	bool _ensure_resources(uint64_t p_generation, int p_page_count,
 			int p_stored_size, const RID &p_albedo_array_rs, const RID &p_normal_array_rs,
 			const PackedByteArray &p_material_bytes);

@@ -3,6 +3,8 @@
 #ifndef TERRAIN3D_CLASS_H
 #define TERRAIN3D_CLASS_H
 
+#include <array>
+#include <functional>
 #include <unordered_map>
 #include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/color_rect.hpp>
@@ -24,6 +26,7 @@
 #include "terrain_3d_material.h"
 #include "terrain_3d_mesher.h"
 #include "terrain_3d_streamer.h"
+#include "terrain_3d_svt.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_3d_vt_feedback.h"
 #include "terrain_3d_vt_visibility.h"
@@ -98,7 +101,10 @@ private:
 	void _avt_retain_visible(const Terrain3DAVTProducePass &p_pass);
 	Terrain3DPagePipeline::Request _avt_page_request(const Terrain3DAVTPageRequest &p_page) const;
 	bool _avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page, bool p_prefetch = false);
-	void _avt_prime_sources(const Terrain3DAVTProducePass &p_pass);
+	// `p_refill_above` > 0 skips the call when the source queue already holds that many claimable
+	// requests; the second call of a tick passes it. `p_refill` names which of the two the
+	// statistics describe. See the definition.
+	void _avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const int p_refill_above = 0, const bool p_refill = false);
 	void _avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_pages);
 	void _avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max_pages);
 	void _avt_finish_produce(Terrain3DAVTProducePass &r_pass);
@@ -221,8 +227,21 @@ private:
 			bool p_svt, int p_mip, const Vector2i &p_address,
 			const Terrain3DPagePipeline::Result *p_prepared = nullptr);
 	static void _bind_vt_methods();
+	// The far field's demand pass stages. See the definitions.
+	std::vector<Terrain3DSVTPage> _svt_walk_visible_pages(const std::vector<Terrain3DSVTRegion> &p_regions,
+			const TerrainVT::VisibleView &p_view, const std::function<bool(const Rect2 &)> &p_avt_interior,
+			const Rect2 &p_domain, float p_page_world, int p_plan_limit, int &r_visited);
 	void _process_svt_bake(int p_page_budget = -1);
 	int _update_visible_svt(int p_max_pages);
+	// Pins the far field's root pyramid over `p_domain` and reports the four stages it spent its
+	// time in: building the root list, releasing the previous plan's pins, requesting and pinning
+	// the new roots (and queueing the ones with no content), and recording what the pinned set
+	// covers. `r_produced` is the pass's production count, which the root walk adds its queued
+	// pages to; `r_cached` reports whether the previous plan was still valid, which is the case
+	// that makes a settled far field free. Split out of `_update_visible_svt()` so that pass reads
+	// as the stages it runs - see the definition for what the pyramid is for.
+	std::array<double, 4> _svt_plan_roots(const Rect2 &p_domain, int p_maximum_mip, int p_coverage_limit,
+			int p_physical_page_count, int &r_produced, bool &r_cached);
 	// Whether a published far-field page still has no content: true when the producer does
 	// not hold it ready and no production for it is in flight. Demand re-produces such a page
 	// instead of treating its indirection entry as a hit.
@@ -364,6 +383,12 @@ public:
 	// and only a demand pass noticing the missing content repairs it. Returns false when the
 	// slot is not currently ready, so a caller cannot mistake a no-op for a loss.
 	bool debug_lose_vt_page_readiness(int p_slot);
+	// The render-side counterpart of the above: drop one resident page's *content*, so the
+	// shader stops resolving it and draws the level behind it, and the demand pass then
+	// produces it again. `debug_lose_vt_page_readiness()` only clears the CPU-side readiness,
+	// which the demand pass acts on but the shader never sees; this is what a test needs to
+	// watch a page actually arrive.
+	bool debug_invalidate_vt_page(int p_slot);
 	Dictionary get_vt_material_textures() const;
 	Ref<Image> get_vt_page_preview(int p_slot);
 	void invalidate_vt_materials();
@@ -416,17 +441,6 @@ public:
 	real_t get_surface_vt_texels_per_meter() const { return _vt.surface_vt_texels_per_meter; }
 	void set_surface_svt_texels_per_meter(real_t p_value);
 	real_t get_surface_svt_texels_per_meter() const { return _vt.vt_page_size / _vt.surface_svt_page_world; }
-	void set_surface_vt_distance_mips(bool p_enabled);
-	bool is_surface_vt_distance_mips() const { return _vt.surface_vt_distance_mips; }
-	void set_surface_vt_mip_ranges(const Vector3 &p_ranges);
-	Vector3 get_surface_vt_mip_ranges() const { return _vt.surface_vt_mip_ranges; }
-	float get_surface_vt_distance_lod(float p_distance) const;
-	void set_surface_vt_mip0_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.x = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip0_distance() const { return _vt.surface_vt_mip_ranges.x; }
-	void set_surface_vt_mip1_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.y = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip1_distance() const { return _vt.surface_vt_mip_ranges.y; }
-	void set_surface_vt_mip2_distance(real_t p_distance) { Vector3 ranges = _vt.surface_vt_mip_ranges; ranges.z = p_distance; set_surface_vt_mip_ranges(ranges); set_surface_vt_distance_mips(true); }
-	real_t get_surface_vt_mip2_distance() const { return _vt.surface_vt_mip_ranges.z; }
 	void set_surface_vt_mip_distances(const PackedFloat32Array &p_distances);
 	PackedFloat32Array get_surface_vt_mip_distances() const { return _vt.surface_vt_mip_distances; }
 	int get_surface_vt_mip_for_distance(real_t p_distance) const;
@@ -448,6 +462,23 @@ public:
 	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }
 	int get_avt_directory_mask() const { return _vt.avt_directory_mask; }
 	int get_avt_root_level() const { return _vt.avt_root_level; }
+	// Page-arrival fade: the per-slot ramp a page comes in over, so a page arriving is a
+	// sharpen instead of a rectangular step in the image. The texture is one texel per
+	// physical slot, which is what lets the shader index it by the slot the indirection
+	// lookup already decoded. See Terrain3D::_update_vt_page_fade().
+	RID get_vt_page_fade_rid() const { return _vt.vt_page_fade_texture.is_valid() ? _vt.vt_page_fade_texture->get_rid() : RID(); }
+	int get_vt_page_fade_frames() const { return _vt.vt_page_fade_frames; }
+	void set_vt_page_fade_frames(int p_frames);
+	// Records whether a page's content is there yet, so the tick a page stops being pending
+	// is the tick its fade starts. Called by both tiers' demand passes, which are what ask
+	// the producer for readiness.
+	// Wakes both source pipelines' workers for the work the pass that just ended submitted.
+	void _flush_source_wakes();
+	// As above, but a no-op while the physics tick is running: the tick releases them itself, after
+	// its phases have been measured.
+	void _flush_source_wakes_unless_ticking();
+	void _vt_note_page_readiness(int p_slot, bool p_ready);
+	void _update_vt_page_fade();
 	void set_surface_vt_region_offset(const Vector2i &p_offset) { _vt.surface_vt_region_offset = p_offset; }
 	Vector2i get_surface_vt_region_offset() const { return _vt.surface_vt_region_offset; }
 	void set_surface_vt_forward_regions(real_t p_forward) { _vt.surface_vt_forward_regions = CLAMP(p_forward, -64.f, 64.f); }
@@ -644,7 +675,6 @@ public:
 
 	// Warnings
 	void set_warning(const uint8_t p_warning, const bool p_enabled);
-	uint8_t get_warnings() const { return _warnings; }
 	PackedStringArray _get_configuration_warnings() const override;
 
 	// Overlay Aliases

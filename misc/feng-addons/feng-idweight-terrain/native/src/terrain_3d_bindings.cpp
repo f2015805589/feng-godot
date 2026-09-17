@@ -81,17 +81,6 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_vt_resolution"), &Terrain3D::get_surface_vt_resolution);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_distance", "distance"), &Terrain3D::set_surface_vt_distance);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_distance"), &Terrain3D::get_surface_vt_distance);
-	ClassDB::bind_method(D_METHOD("set_surface_vt_distance_mips", "enabled"), &Terrain3D::set_surface_vt_distance_mips);
-	ClassDB::bind_method(D_METHOD("is_surface_vt_distance_mips"), &Terrain3D::is_surface_vt_distance_mips);
-	ClassDB::bind_method(D_METHOD("set_surface_vt_mip0_distance", "distance"), &Terrain3D::set_surface_vt_mip0_distance);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_mip0_distance"), &Terrain3D::get_surface_vt_mip0_distance);
-	ClassDB::bind_method(D_METHOD("set_surface_vt_mip1_distance", "distance"), &Terrain3D::set_surface_vt_mip1_distance);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_mip1_distance"), &Terrain3D::get_surface_vt_mip1_distance);
-	ClassDB::bind_method(D_METHOD("set_surface_vt_mip2_distance", "distance"), &Terrain3D::set_surface_vt_mip2_distance);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_mip2_distance"), &Terrain3D::get_surface_vt_mip2_distance);
-	ClassDB::bind_method(D_METHOD("set_surface_vt_mip_ranges", "ranges"), &Terrain3D::set_surface_vt_mip_ranges);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_mip_ranges"), &Terrain3D::get_surface_vt_mip_ranges);
-	ClassDB::bind_method(D_METHOD("get_surface_vt_distance_lod", "distance"), &Terrain3D::get_surface_vt_distance_lod);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_region_grid", "grid"), &Terrain3D::set_surface_vt_region_grid);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_grid"), &Terrain3D::get_surface_vt_region_grid);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_selection_mode", "mode"), &Terrain3D::set_surface_vt_selection_mode);
@@ -369,7 +358,14 @@ void Terrain3D::_bind_methods() {
 	// Motion look-ahead in milliseconds: the demand plans for where the camera will be,
 	// so a page is produced before the view reaches it. 0 disables the prediction.
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_motion_lead_ms", PROPERTY_HINT_RANGE, "0,1000,1"), "set_vt_motion_lead_ms", "get_vt_motion_lead_ms");
+	ClassDB::bind_method(D_METHOD("set_vt_page_fade_frames", "frames"), &Terrain3D::set_vt_page_fade_frames);
+	ClassDB::bind_method(D_METHOD("get_vt_page_fade_frames"), &Terrain3D::get_vt_page_fade_frames);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_frame_budget_ms", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_vt_frame_budget_ms", "get_vt_frame_budget_ms");
+	// How long a page takes to come in, in ticks. A page that has just arrived is blended
+	// against the level it replaced, so a page arrival is a sharpen rather than a
+	// rectangular step. 0 disables it, which is what a caller who wants the strict
+	// "the page that is published is the page that is drawn" contract sets.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_fade_frames", PROPERTY_HINT_RANGE, "0,60,1"), "set_vt_page_fade_frames", "get_vt_page_fade_frames");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
 	ADD_SUBGROUP("", "");
@@ -384,11 +380,6 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_distance_mips", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_distance_mips", "is_surface_vt_distance_mips");
-	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "surface_vt_mip_ranges", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip_ranges", "get_surface_vt_mip_ranges");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip0_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip0_distance", "get_surface_vt_mip0_distance");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip1_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip1_distance", "get_surface_vt_mip1_distance");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_mip2_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_mip2_distance", "get_surface_vt_mip2_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_adaptive_enabled"), "set_vt_adaptive_enabled", "is_vt_adaptive_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "surface_vt", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DVirtualTexture"), "", "get_surface_vt");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64,0.25,or_greater"), "set_surface_vt_texels_per_pixel", "get_surface_vt_texels_per_pixel");

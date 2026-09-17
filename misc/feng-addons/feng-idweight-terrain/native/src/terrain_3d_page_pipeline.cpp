@@ -117,12 +117,12 @@ Terrain3DPagePipeline::Terrain3DPagePipeline(const int p_workers) {
     for (int i = 0; i < workers; ++i) { _workers.emplace_back(&Terrain3DPagePipeline::run, this); }
 }
 Terrain3DPagePipeline::~Terrain3DPagePipeline() {
-    { std::lock_guard<std::mutex> lock(_mutex); _stop = true; _entries.clear(); _task = {}; }
+    { std::lock_guard<std::mutex> lock(_mutex); _stop = true; _entries.clear(); _claim_order.clear(); _claim_head = 0; _claimable_count.store(0, std::memory_order_relaxed); _task = {}; }
     _wake.notify_all(); _task_wake.notify_one();
     for (std::thread &worker : _workers) { if (worker.joinable()) { worker.join(); } }
     if (_planner.joinable()) { _planner.join(); }
 }
-void Terrain3DPagePipeline::reset() { std::lock_guard<std::mutex> lock(_mutex); _entries.clear(); _task = {}; }
+void Terrain3DPagePipeline::reset() { std::lock_guard<std::mutex> lock(_mutex); _entries.clear(); _claim_order.clear(); _claim_head = 0; _claimable_count.store(0, std::memory_order_relaxed); _task = {}; }
 void Terrain3DPagePipeline::submit_task(std::function<void()> task) {
     {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -145,11 +145,42 @@ void Terrain3DPagePipeline::plan() {
         task();
     }
 }
-void Terrain3DPagePipeline::cancel(const Key &key) { std::lock_guard<std::mutex> lock(_mutex); _entries.erase(key); }
+int Terrain3DPagePipeline::_index_of(const Key &p_key) const {
+    for (size_t i = 0; i < _entries.size(); ++i) {
+        if (_entries[i].request.key == p_key) { return int(i); }
+    }
+    return -1;
+}
+int Terrain3DPagePipeline::_count_claimable() const {
+    int count = 0;
+    for (const Entry &entry : _entries) {
+        if (!entry.running && !entry.ready) { ++count; }
+    }
+    return count;
+}
+void Terrain3DPagePipeline::_erase_at(int p_index) {
+    _entries[size_t(p_index)] = std::move(_entries.back());
+    _entries.pop_back();
+    _claimable_count.store(_count_claimable(), std::memory_order_relaxed);
+}
+void Terrain3DPagePipeline::cancel(const Key &key) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const int index = _index_of(key);
+    if (index >= 0) { _erase_at(index); }
+}
 void Terrain3DPagePipeline::discard(const Key &key) {
     std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _entries.find(key);
-    if (it != _entries.end() && it->second.ready) { _entries.erase(it); _stat_discarded.fetch_add(1, std::memory_order_relaxed); }
+    const int index = _index_of(key);
+    if (index >= 0 && _entries[size_t(index)].ready) { _erase_at(index); _stat_discarded.fetch_add(1, std::memory_order_relaxed); }
+}
+void Terrain3DPagePipeline::_lock_queue(std::unique_lock<std::mutex> &r_lock) {
+    // Deliberately a plain lock. Spinning for the queue before blocking was tried against the
+    // measurement that motivated it - `prime` reading 0.13 ms for a dozen inserts - and it made the
+    // reading no better: the spin does not shorten the wait, it *is* the wait, with the same
+    // magnitude as the wake latency it was meant to avoid (2000 `try_lock` calls is ~40 us). The
+    // queue is taken once per batch and the critical sections are microseconds; blocking on it is
+    // what the operating system already does well.
+    r_lock.lock();
 }
 // One queue slot is a prepared payload of a few hundred kilobytes, so the window stays at
 // 32 entries - but a slot must never be held by a result nobody is going to poll. Every
@@ -157,45 +188,75 @@ void Terrain3DPagePipeline::discard(const Key &key) {
 // this the window fills with dead results and the workers run out of work to do.
 void Terrain3DPagePipeline::_make_room() {
     if (_entries.size() < 32) { return; }
-    auto oldest = _entries.end();
-    for (auto it = _entries.begin(); it != _entries.end(); ++it) {
-        if (!it->second.ready) { continue; }
-        if (oldest == _entries.end() || it->second.token < oldest->second.token) { oldest = it; }
+    int oldest = -1;
+    for (size_t i = 0; i < _entries.size(); ++i) {
+        if (!_entries[i].ready) { continue; }
+        if (oldest < 0 || _entries[i].token < _entries[size_t(oldest)].token) { oldest = int(i); }
     }
-    if (oldest != _entries.end()) { _entries.erase(oldest); _stat_evicted.fetch_add(1, std::memory_order_relaxed); }
+    // Only a finished result is ever evicted, and a finished result is not claimable, so the
+    // claimable count does not move here.
+    if (oldest >= 0) {
+        _entries[size_t(oldest)] = std::move(_entries.back());
+        _entries.pop_back();
+        _stat_evicted.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 void Terrain3DPagePipeline::retain(const std::vector<Request> &requests) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto &entry : _entries) { entry.second.retained = false; }
+    std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
+    _lock_queue(lock);
+    for (Entry &entry : _entries) { entry.retained = false; }
     for (const Request &request : requests) {
-        auto it = _entries.find(request.key);
-        if (it != _entries.end() && request.rect == it->second.request.rect && request.size == it->second.request.size && request.border == it->second.request.border) { it->second.retained = true; }
+        const int index = _index_of(request.key);
+        if (index >= 0 && request.rect == _entries[size_t(index)].request.rect &&
+                request.size == _entries[size_t(index)].request.size && request.border == _entries[size_t(index)].request.border) {
+            _entries[size_t(index)].retained = true;
+        }
     }
-    for (auto it = _entries.begin(); it != _entries.end();) {
-        if (!it->second.retained) { it = _entries.erase(it); } else { ++it; }
+    for (int i = int(_entries.size()) - 1; i >= 0; --i) {
+        if (!_entries[size_t(i)].retained) { _erase_at(i); }
     }
 }
 void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::shared_ptr<const Snapshot> source) {
+    int inserted = 0;
+    int wakes = 0;
+    const uint64_t started = Time::get_singleton()->get_ticks_usec();
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
+        _lock_queue(lock);
         for (const Request &request : requests) {
-            if (_entries.find(request.key) != _entries.end()) { continue; }
+            if (_index_of(request.key) >= 0) { continue; }
             _make_room();
             if (_entries.size() >= 32) { break; }
-            _entries.emplace(request.key, Entry{request, source, {}, ++_token});
+            const uint64_t token = ++_token;
+            _entries.push_back(Entry{request, source, {}, token});
+            _claim_order.push_back(request.key);
+            ++inserted;
         }
+        if (inserted > 0) { _claimable_count.store(_count_claimable(), std::memory_order_relaxed); }
+        // A wake is a syscall and it is only useful for a worker that is parked. Waking one
+        // worker per entry added cost thirty-two of them on every demand pass, and the pass
+        // refills the queue on every tick whether or not anybody is asleep.
+        wakes = MIN(inserted, _waiters);
     }
-    // Every worker has to be woken: one notify leaves the others asleep while entries
-    // that only they can pick up sit in the queue.
-    _wake.notify_all();
+    const uint64_t inserted_at = Time::get_singleton()->get_ticks_usec();
+    // Owed, not sent: `flush_wakes()` sends them when the pass that submitted this work is over.
+    if (wakes > 0) { _pending_wakes.fetch_add(wakes, std::memory_order_relaxed); }
+    const uint64_t woken_at = inserted_at;
+    _prime_insert_us.store(inserted_at - started, std::memory_order_relaxed);
+    _prime_wake_us.store(woken_at - inserted_at, std::memory_order_relaxed);
+    _prime_inserted.store(inserted, std::memory_order_relaxed);
+    _prime_wakes.store(wakes, std::memory_order_relaxed);
 }
 bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const Snapshot> source, Result &result) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _entries.find(request.key);
-    if (it != _entries.end()) {
-        if (!it->second.ready) { return false; }
-        if (it->second.request.rect != request.rect) { _stat_rect_mismatch.fetch_add(1, std::memory_order_relaxed); return false; }
-        result = std::move(it->second.result); _entries.erase(it);
+    std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
+    _lock_queue(lock);
+    const int index = _index_of(request.key);
+    if (index >= 0) {
+        Entry &entry = _entries[size_t(index)];
+        if (!entry.ready) { return false; }
+        if (entry.request.rect != request.rect) { _stat_rect_mismatch.fetch_add(1, std::memory_order_relaxed); return false; }
+        result = std::move(entry.result);
+        _erase_at(index);
         _stat_hits.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -203,28 +264,48 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
     // its whole demand list, so evicting here would replace the work in flight with the far
     // end of that list and throw away every result the workers had just finished.
     if (_entries.size() < 32) {
-        _entries.emplace(request.key, Entry{request, std::move(source), {}, ++_token});
-        _wake.notify_all();
+        const uint64_t token = ++_token;
+        _entries.push_back(Entry{request, std::move(source), {}, token});
+        _claim_order.push_back(request.key);
+        _claimable_count.store(_count_claimable(), std::memory_order_relaxed);
+        if (_waiters > 0) { _pending_wakes.fetch_add(1, std::memory_order_relaxed); }
     }
     return false;
 }
 void Terrain3DPagePipeline::run() {
     for (;;) {
         Entry job;
+        bool claimed = false;
         {
             std::unique_lock<std::mutex> lock(_mutex);
-            _wake.wait(lock, [&]() {
-                if (_stop) { return true; }
-                for (const auto &entry : _entries) { if (!entry.second.running && !entry.second.ready) { return true; } }
-                return false;
-            });
+            ++_waiters;
+            _wake.wait(lock, [&]() { return _stop || _claimable_count.load(std::memory_order_relaxed) > 0; });
+            --_waiters;
             if (_stop) { return; }
-            // Submission token preserves demand priority, independent of virtual address.
-            Entry *next = nullptr;
-            for (auto &entry : _entries) {
-                if (!entry.second.running && !entry.second.ready && (!next || entry.second.token < next->token)) { next = &entry.second; }
+            // Submission priority, independent of virtual address: the tokens ascend with
+            // insertion, so the unclaimed keys are in submission order. A key whose entry was
+            // erased before it was claimed, or whose entry a worker already has, is skipped. Once
+            // the finished prefix is long enough to be worth moving, it is dropped.
+            while (_claim_head < _claim_order.size()) {
+                const Key key = _claim_order[_claim_head++];
+                const int index = _index_of(key);
+                if (index < 0 || _entries[size_t(index)].running || _entries[size_t(index)].ready) { continue; }
+                _entries[size_t(index)].running = true;
+                job = _entries[size_t(index)];
+                _claimable_count.fetch_sub(1, std::memory_order_relaxed);
+                claimed = true;
+                break;
             }
-            next->running = true; job = *next;
+            if (_claim_head >= 64) {
+                _claim_order.erase(_claim_order.begin(), _claim_order.begin() + int64_t(_claim_head));
+                _claim_head = 0;
+            }
+            if (!claimed) {
+                // Nothing was claimable after all: repair the count from the queue so the wait
+                // cannot spin on a number that does not match it.
+                _claimable_count.store(_count_claimable(), std::memory_order_relaxed);
+                continue;
+            }
         }
         if (job.request.svt && (_signature_source != job.source || _signature_materials != job.request.materials || _signature_density != job.request.density)) {
             std::lock_guard<std::mutex> cache_lock(_cache_mutex);
@@ -261,13 +342,16 @@ void Terrain3DPagePipeline::run() {
         _produced_pages.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(_mutex);
-            auto it = _entries.find(job.request.key);
-            if (it != _entries.end() && it->second.token == job.token) { it->second.result = std::move(result); it->second.ready = true; }
+            const int index = _index_of(job.request.key);
+            if (index >= 0 && _entries[size_t(index)].token == job.token) {
+                _entries[size_t(index)].result = std::move(result);
+                _entries[size_t(index)].ready = true;
+            }
         }
-        // Waking the other workers here is what keeps them busy: the notify below is
-        // cheap, and without it a page that finished while another worker slept would
-        // wait for the next demand pass to be picked up.
-        _wake.notify_all();
+        // Finishing does not add work, so it does not wake anybody. The worker that wakes on
+        // a new entry claims it, and the entries a batch added are woken one per entry by the
+        // submitter; notifying the whole pool here as well only put every worker back in the
+        // queue for a lock the demand pass needed, once per finished page.
     }
 }
 Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &request, const Snapshot &source) {

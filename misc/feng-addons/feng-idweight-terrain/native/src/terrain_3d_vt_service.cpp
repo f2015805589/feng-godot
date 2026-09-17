@@ -313,6 +313,9 @@ bool Terrain3D::_write_diagnostic_sparse_page(int p_slot, int p_page_x, int p_pa
 // around the clipmap target; the mip comes from the page's distance, and only the pages
 // this pass actually allocated are produced.
 int Terrain3D::update_surface_svt(int p_max_pages) {
+	// The workers this pass submits to are woken when it is over, not in the middle of it: see
+	// Terrain3DPagePipeline::flush_wakes(). The guard covers every return below.
+	struct FlushWakes { Terrain3D *terrain; ~FlushWakes() { terrain->_flush_source_wakes_unless_ticking(); } } flush_wakes{ this };
 	if (is_vt_editor_preview_active()) { return 0; }
 	if (!_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
 	_ensure_vt_views_ready();
@@ -813,12 +816,21 @@ void Terrain3D::_ensure_vt_views_ready() {
 // The near-field AVT is the one VT path that owns its own planner; the far-field
 // update is a straight sequence: request -> produce -> write -> commit.
 int Terrain3D::update_surface_vt(int p_max_pages) {
+	// As above: the source workers are woken once this pass is over.
+	struct FlushWakes { Terrain3D *terrain; ~FlushWakes() { terrain->_flush_source_wakes_unless_ticking(); } } flush_wakes{ this };
+	const uint64_t entered = Time::get_singleton()->get_ticks_usec();
 	if (is_vt_editor_preview_active()) { return 0; }
 	// Explicit sector updates must also bind textures first created by the
 	// preceding render-thread bake, even when normal physics updates are paused.
 	if (is_sector_avt() || !_vt.vt_shared_ready || _vt.vt_materials_dirty) { _update_vt_service(); }
 	_ensure_vt_views_ready();
-	if (is_sector_avt()) { return _update_sector_avt(p_max_pages); }
+	if (is_sector_avt()) {
+		// What this wrapper costs around the sector planner, which reports its own total as
+		// `cpu_update_ms`. The difference between the phase a profiler shows and that figure had no
+		// attribution at all.
+		_vt.avt_sector_stats["wrapper_ms"] = double(Time::get_singleton()->get_ticks_usec() - entered) / 1000.0;
+		return _update_sector_avt(p_max_pages);
+	}
 	if (!_vt.surface_vt || !_data) {
 		return 0;
 	}

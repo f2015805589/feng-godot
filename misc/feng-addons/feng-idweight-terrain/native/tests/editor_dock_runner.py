@@ -67,6 +67,7 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
         "pairroles": "PASS IdWeight pair role readout shown for the texture tool and the click mapping matches the pair fields",
         "svt_inspector": "PASS native SVT Inspector full-bake action and progress",
         "vt_idle": "PASS editor stationary VT completion",
+        "slider": "PASS real slope slider identity and silent selection synchronization",
     }[test]
     if marker not in output:
         return 1
@@ -82,7 +83,7 @@ def main() -> int:
         help="graphical Godot editor executable (the console build still creates a window)",
     )
     parser.add_argument("--driver", default="d3d12")
-    parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle"], default="dock")
+    parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle", "slider"], default="dock")
     args = parser.parse_args()
     editor = args.editor.resolve()
     if not editor.is_file():

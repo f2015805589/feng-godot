@@ -155,14 +155,15 @@ Ref<Terrain3DRegion> Terrain3DEditor::_operate_region(const Vector2i &p_region_l
 void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_t p_camera_direction) {
 	LOG(EXTREME, "Operating at ", p_global_position, " tool type ", _tool, " op ", _operation);
 
-	MapType map_type = _get_map_type();
-	if (map_type == TYPE_MAX) {
+	MapBrushOp op;
+	op.map_type = _get_map_type();
+	if (op.map_type == TYPE_MAX) {
 		LOG(ERROR, "Invalid tool selected");
 		return;
 	}
 
-	int region_size = _terrain->get_region_size();
-	Vector2i region_vsize = V2I(region_size);
+	op.region_size = _terrain->get_region_size();
+	op.region_size_v = V2I(op.region_size);
 
 	// If no region and can't add one, skip whole function. Checked again later
 	Terrain3DData *data = _terrain->get_data();
@@ -172,7 +173,6 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 
 	bool modifier_alt = _brush_data["modifier_alt"];
 	bool modifier_ctrl = _brush_data["modifier_ctrl"];
-	//bool modifier_shift = _brush_data["modifier_shift"];
 
 	Image *brush_image = cast_to<Image>(_brush_data["brush_image"]);
 	if (!brush_image) {
@@ -180,13 +180,14 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 		return;
 	}
 	// Brush mask cached as floats by set_brush_data(), sampled bilinearly below.
-	PackedFloat32Array brush_mask = _brush_data.get("brush_mask", PackedFloat32Array());
-	Vector2i brush_mask_size = _brush_data.get("brush_image_size", Vector2i());
-	real_t brush_size = CLAMP(real_t(_brush_data.get("size", 10.f)), 2.f, 4096.f); // Meters
+	op.brush_mask = _brush_data.get("brush_mask", PackedFloat32Array());
+	op.brush_mask_size = _brush_data.get("brush_image_size", Vector2i());
+	op.brush_size = CLAMP(real_t(_brush_data.get("size", 10.f)), 2.f, 4096.f); // Meters
+	op.vertex_spacing = _terrain->get_vertex_spacing();
 
 	// Typicall we multiply mouse pressure & strength setting, but
 	// * Mouse movement w/ button down has a pressure of 1
-	// * Mouse clicks always have pressure of 0
+	// * Mouse clicks always have a pressure of 0
 	// * Pen movement pressure varies, sometimes lifting or clicking has a pressure of 0
 	// If we're operating with a pressure of 0.001-.999 it's a pen
 	// So if there's a 0 pressure operation >100ms after a pen operation, we assume it's
@@ -199,45 +200,46 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	if (mouse_pressure < CMP_EPSILON && ticks - _last_pen_tick >= 100) {
 		mouse_pressure = 1.f;
 	}
-	real_t strength = mouse_pressure * (real_t)_brush_data["strength"];
+	op.strength = mouse_pressure * (real_t)_brush_data["strength"];
 
-	real_t height = _brush_data["height"];
-	Color color = _brush_data["color"];
-	real_t roughness = _brush_data["roughness"];
+	op.height = _brush_data["height"];
+	op.color = _brush_data["color"];
+	op.roughness = _brush_data["roughness"];
 
-	bool texture_filter = _brush_data["texture_filter"];
-	int margin = _brush_data["margin"];
-	int asset_id = _brush_data["asset_id"];
+	op.texture_filter = _brush_data["texture_filter"];
+	op.margin = _brush_data["margin"];
+	op.asset_id = _brush_data["asset_id"];
 	// IdWeight pair painting parameters (defaults keep legacy behavior)
-	int pair_overlay_id = int(_brush_data.get("pair_overlay_id", asset_id));
-	int pair_background_id = int(_brush_data.get("pair_background_id", asset_id));
-	int pair_mode = int(_brush_data.get("pair_mode", 0)); // 0=Set, 1=Add, 2=Sub, 3=Mix
-	int pair_weight_level = int(_brush_data.get("pair_weight_level", 8)); // 1..8
+	op.pair_overlay_id = int(_brush_data.get("pair_overlay_id", op.asset_id));
+	op.pair_background_id = int(_brush_data.get("pair_background_id", op.asset_id));
+	op.pair_mode = int(_brush_data.get("pair_mode", 0)); // 0=Set, 1=Add, 2=Sub, 3=Mix
+	op.pair_weight_level = int(_brush_data.get("pair_weight_level", 8)); // 1..8
 
-	Vector2 slope_range = _brush_data["slope"];
+	op.slope_range = _brush_data["slope"];
 	// enable_angle / dynamic_angle / angle / enable_scale / scale are still
 	// sanitized by set_brush_data() for the decal and the pickers, but nothing in
 	// this function consumes them any more: the IdWeight R16 contract has
 	// no per-texel UV rotation or scale field (see _paint_surface_pair).
 
-	real_t gamma = _brush_data["gamma"];
-	PackedVector3Array gradient_points = _brush_data["gradient_points"];
+	op.gamma = _brush_data["gamma"];
+	op.gradient_points = _brush_data["gradient_points"];
+	op.modifier_alt = modifier_alt;
 
 	real_t randf = UtilityFunctions::randf();
-	real_t rot = randf * Math_PI * real_t(_brush_data["brush_spin_speed"]);
+	op.rotation = randf * Math_PI * real_t(_brush_data["brush_spin_speed"]);
 	if (_brush_data["align_to_view"]) {
-		rot += p_camera_direction;
+		op.rotation += p_camera_direction;
 	}
 	// Rotate the decal to align with the brush
 	if (_terrain->get_plugin()) {
 		Node *node = cast_to<Node>(_terrain->get_plugin()->get("ui"));
 		if (node && node->has_method("set_decal_rotation")) {
-			node->call("set_decal_rotation", rot);
+			node->call("set_decal_rotation", op.rotation);
 		}
 	}
 	AABB edited_area;
-	edited_area.position = p_global_position - Vector3(brush_size, 0.f, brush_size) * .5f;
-	edited_area.size = Vector3(brush_size, 0.f, brush_size);
+	edited_area.position = p_global_position - Vector3(op.brush_size, 0.f, op.brush_size) * .5f;
+	edited_area.size = Vector3(op.brush_size, 0.f, op.brush_size);
 
 	if (_tool == INSTANCER) {
 		if (modifier_ctrl) {
@@ -249,38 +251,18 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	}
 
 	// MAP Operations
-	real_t vertex_spacing = _terrain->get_vertex_spacing();
-
 	// save region count before brush pixel loop. Any regions added will have caused an Array
 	// rebuild at the end of the last _operate() call, but until painting is finished we only
 	// need to track if _added_removed_locations has changed between now and the end of the loop
 	int regions_added_removed = _added_removed_locations.size();
 
-	// R16 surface painting needs the region's raw bytes. Image::get_data() hands
-	// back a copy-on-write view, so the bytes are cached per region and flushed
-	// when the brush moves to another region (and once more after the loop).
-	// See _paint_surface_pair() for why the packed word must not go through
-	// Image::set_pixelv().
-	Image *surface_image = nullptr;
-	Terrain3DRegion *surface_region = nullptr;
-	PackedByteArray surface_bytes;
-	auto flush_surface = [&]() {
-		if (surface_image && surface_region) {
-			surface_image->set_data(surface_image->get_width(), surface_image->get_height(),
-					false, Image::Format(39), surface_bytes);
-			// Mark the region edited so the surface map layer is uploaded to the
-			// GPU texture array. Without this the painted texels stay in CPU
-			// memory and the shader keeps sampling the old (all-zero) layer.
-			surface_region->set_modified(true);
-		}
-		surface_image = nullptr;
-		surface_region = nullptr;
-		surface_bytes = PackedByteArray();
-	};
+	// The R16 surface payload is cached per region while the brush stays inside it and
+	// written back before the maps are uploaded. See SurfaceByteCache.
+	SurfaceByteCache surface;
 
-	for (real_t x = 0.f; x < brush_size; x += vertex_spacing) {
-		for (real_t y = 0.f; y < brush_size; y += vertex_spacing) {
-			Vector2 brush_offset = Vector2(x, y) - (V2(brush_size) * .5f);
+	for (real_t x = 0.f; x < op.brush_size; x += op.vertex_spacing) {
+		for (real_t y = 0.f; y < op.brush_size; y += op.vertex_spacing) {
+			Vector2 brush_offset = Vector2(x, y) - (V2(op.brush_size) * .5f);
 			Vector3 brush_global_position =
 					Vector3(p_global_position.x + brush_offset.x + .5f, p_global_position.y,
 							p_global_position.z + brush_offset.y + .5f);
@@ -302,16 +284,16 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 				}
 				map = region->get_surface_map_ptr();
 			} else {
-				map = region->get_map_ptr(map_type);
+				map = region->get_map_ptr(op.map_type);
 			}
 			if (!map) {
 				continue;
 			}
 
 			// Identify position on map image
-			Vector2 uv_position = _get_uv_position(brush_global_position, region_size, vertex_spacing);
-			Vector2i map_pixel_position = Vector2i(uv_position * region_size);
-			if (!_is_in_bounds(map_pixel_position, region_vsize)) {
+			Vector2 uv_position = _get_uv_position(brush_global_position, op.region_size, op.vertex_spacing);
+			Vector2i map_pixel_position = Vector2i(uv_position * op.region_size);
+			if (!_is_in_bounds(map_pixel_position, op.region_size_v)) {
 				continue;
 			}
 
@@ -322,299 +304,333 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 			// to a texel away from its target and slide the whole stamp with the
 			// cursor.
 			Vector2 lattice_position = Vector2(
-					Math::floor(brush_global_position.x / vertex_spacing),
-					Math::floor(brush_global_position.z / vertex_spacing)) *
-					vertex_spacing;
-			Vector2 brush_uv = (lattice_position - Vector2(p_global_position.x, p_global_position.z)) / brush_size + V2(0.5f);
+					Math::floor(brush_global_position.x / op.vertex_spacing),
+					Math::floor(brush_global_position.z / op.vertex_spacing)) *
+					op.vertex_spacing;
+			Vector2 brush_uv = (lattice_position - Vector2(p_global_position.x, p_global_position.z)) / op.brush_size + V2(0.5f);
 
 			Vector3 edited_position = brush_global_position;
 			edited_position.y = data->get_height(edited_position);
 			edited_area = edited_area.expand(edited_position);
 
 			// Start brushing on the map
-			real_t brush_alpha = _sample_brush_mask(brush_mask, brush_mask_size, _get_rotated_uv(brush_uv, rot));
-			brush_alpha = real_t(Math::pow(double(brush_alpha), double(gamma)));
+			real_t brush_alpha = _sample_brush_mask(op.brush_mask, op.brush_mask_size, _get_rotated_uv(brush_uv, op.rotation));
+			brush_alpha = real_t(Math::pow(double(brush_alpha), double(op.gamma)));
 			brush_alpha = std::isnan(brush_alpha) ? 0.f : brush_alpha;
 			Color src = map->get_pixelv(map_pixel_position);
 			Color dest = src;
-
-			if (map_type == TYPE_HEIGHT) {
-				real_t srcf = src.r;
-				// In case data in existing map has nan or inf saved, check, and reset to real number if required.
-				srcf = std::isnan(srcf) ? 0.f : srcf;
-				real_t destf = srcf;
-
-				switch (_operation) {
-					case ADD: {
-						if (_tool == HEIGHT) {
-							// Height
-							destf = Math::lerp(srcf, height, CLAMP(brush_alpha * strength, 0.f, 1.f));
-						} else if (modifier_alt && !std::isnan(p_global_position.y)) {
-							// Lift troughs
-							real_t brush_center_y = p_global_position.y + brush_alpha * strength;
-							destf = Math::clamp(brush_center_y, srcf, srcf + brush_alpha * strength);
-						} else {
-							// Raise
-							destf = srcf + (brush_alpha * strength);
-						}
-						break;
-					}
-					case SUBTRACT: {
-						if (_tool == HEIGHT) {
-							// Height, but GDScript has already picked height at cursor
-							destf = Math::lerp(srcf, height, CLAMP(brush_alpha * strength, 0.f, 1.f));
-						} else if (modifier_alt && !std::isnan(p_global_position.y)) {
-							// Flatten peaks
-							real_t brush_center_y = p_global_position.y - brush_alpha * strength;
-							destf = Math::clamp(brush_center_y, srcf - brush_alpha * strength, srcf);
-						} else {
-							// Lower
-							destf = srcf - (brush_alpha * strength);
-						}
-						break;
-					}
-					case AVERAGE: {
-						real_t avg_default = _terrain->get_material()->get_world_background() == 0u ? srcf : 0.f;
-						real_t avg = _average_scalar(TYPE_HEIGHT, brush_global_position, srcf, avg_default);
-						destf = Math::lerp(srcf, avg, CLAMP(brush_alpha * strength * 2.f, .02f, 1.f));
-						break;
-					}
-					case GRADIENT: {
-						if (gradient_points.size() == 2) {
-							Vector3 point_1 = gradient_points[0];
-							Vector3 point_2 = gradient_points[1];
-							Vector2 point_1_xz = Vector2(point_1.x, point_1.z);
-							Vector2 point_2_xz = Vector2(point_2.x, point_2.z);
-							Vector2 dir = point_2_xz - point_1_xz;
-							if (dir.length_squared() < 0.01f) {
-								return;
-							}
-							Vector2 brush_xz = Vector2(brush_global_position.x, brush_global_position.z);
-
-							if (_operation_movement.length_squared() > 0.f) {
-								// Ramp up/down only in the direction of movement, to avoid giving winding
-								// paths one edge higher than the other.
-								Vector2 movement_xz = Vector2(_operation_movement.x, _operation_movement.z).normalized();
-								Vector2 offset = movement_xz * Vector2(brush_offset).dot(movement_xz);
-								brush_xz = Vector2(p_global_position.x + offset.x, p_global_position.z + offset.y);
-							}
-
-							real_t weight = dir.normalized().dot(brush_xz - point_1_xz) / dir.length();
-							weight = Math::clamp(weight, (real_t)0.0f, (real_t)1.0f);
-							real_t height = Math::lerp(point_1.y, point_2.y, weight);
-							destf = Math::lerp(srcf, height, CLAMP(brush_alpha * strength, 0.f, 1.f));
-						}
-						break;
-					}
-					default:
-						break;
+			TexelResult result;
+			if (op.map_type == TYPE_HEIGHT) {
+				result = _paint_height_texel(op, p_global_position, brush_global_position, brush_offset,
+						brush_alpha, src.r, region.ptr(), data, edited_position, dest);
+				if (result == TEXEL_WRITE) {
+					// The height map decides the Y the edited area has to cover.
+					edited_area = edited_area.expand(edited_position);
 				}
-				dest = Color(destf, 0.f, 0.f, 1.f);
-				region->update_height(destf);
-				data->update_master_height(destf);
-				edited_position.y = destf;
-				edited_area = edited_area.expand(edited_position);
-
-			} else if (map_type == TYPE_CONTROL) {
-				if (_tool == TEXTURE) {
-					// IdWeight material painting writes the region's R16 surface
-					// map. The legacy RF control map is never authored by
-					// this tool and must not be decoded here: `src` holds the
-					// packed R16 word, not a control bitfield.
-					if (!data->is_in_slope(brush_global_position, slope_range)) {
-						continue;
-					}
-					backup_region(region);
-					if (surface_region != region.ptr()) {
-						flush_surface();
-						if (map->get_format() != Image::Format(39)) {
-							LOG(ERROR, "Surface map must be R16 UNORM");
-							continue;
-						}
-						surface_image = map;
-						surface_region = region.ptr();
-						surface_bytes = map->get_data();
-					}
-					// The stored payload is surface_density squared texels per region
-					// texel. The brush authors one region texel per step, so it writes
-					// the whole block. The block is uniform by construction: every write
-					// is a block write, and a density change replicates one source texel
-					// over its block.
-					const int density = MAX(1, region->get_surface_density());
-					const int surface_width = map->get_width();
-					const int block_x = map_pixel_position.x * density;
-					const int block_y = map_pixel_position.y * density;
-					uint8_t *surface_bytes_ptr = surface_bytes.ptrw();
-					uint8_t *surface_texel = surface_bytes_ptr +
-							(int64_t(block_y) * surface_width + block_x) * 2;
-					if (_paint_surface_pair(surface_texel, brush_alpha, strength,
-								pair_overlay_id, pair_background_id, pair_mode, pair_weight_level,
-								modifier_alt) &&
-							density > 1) {
-						const uint16_t painted = TerrainSurfaceIdWeight::read_le(surface_texel);
-						for (int by = 0; by < density; by++) {
-							for (int bx = 0; bx < density; bx++) {
-								if (bx == 0 && by == 0) {
-									continue;
-								}
-								TerrainSurfaceIdWeight::write_le(painted,
-										surface_bytes_ptr + (int64_t(block_y + by) * surface_width + block_x + bx) * 2);
-							}
-						}
-					}
-					continue;
-				}
-				// Get current bit field from pixel
-				uint32_t base_id = get_base(src.r);
-				uint32_t overlay_id = get_overlay(src.r);
-				real_t blend = real_t(get_blend(src.r)) / 255.f;
-				uint32_t uvrotation = get_uv_rotation(src.r);
-				uint32_t uvscale = get_uv_scale(src.r);
-				bool hole = is_hole(src.r);
-				bool navigation = is_nav(src.r);
-				bool autoshader = is_auto(src.r);
-
-				switch (_tool) {
-					case AUTOSHADER: {
-						if (brush_alpha > 0.5f) {
-							autoshader = (_operation == ADD);
-							uvscale = 0.f;
-							uvrotation = 0.f;
-						}
-						break;
-					}
-					case HOLES: {
-						if (brush_alpha > 0.5f) {
-							hole = (_operation == ADD);
-						}
-						break;
-					}
-					case NAVIGATION: {
-						if (brush_alpha > 0.5f) {
-							navigation = (_operation == ADD);
-						}
-						break;
-					}
-					default: {
-						break;
-					}
-				}
-
-				// Convert back to bitfield
-				uint32_t blend_int = uint32_t(CLAMP(Math::round(blend * 255.f), 0.f, 255.f));
-				uint32_t bits = enc_base(base_id) | enc_overlay(overlay_id) |
-						enc_blend(blend_int) | enc_uv_rotation(uvrotation) |
-						enc_uv_scale(uvscale) | enc_hole(hole) |
-						enc_nav(navigation) | enc_auto(autoshader);
-
-				// Write back to pixel in FORMAT_RF. Must be a 32-bit float
-				dest = Color(as_float(bits), 0.f, 0.f, 1.f);
-
-			} else if (map_type == TYPE_COLOR) {
-				// Filter by visible texture
-				if (texture_filter) {
-					Image *cmap = region->get_map_ptr(TYPE_CONTROL);
-					if (!cmap) {
-						continue;
-					}
-					float src_ctrl = cmap->get_pixelv(map_pixel_position).r; // Must be float
-					int tex_id = (get_blend(src_ctrl) > 110 - margin) ? get_overlay(src_ctrl) : get_base(src_ctrl);
-					if (tex_id != asset_id) {
-						continue;
-					}
-				}
-				if (!data->is_in_slope(brush_global_position, slope_range)) {
-					continue;
-				}
-				switch (_tool) {
-					case COLOR:
-						switch (_operation) {
-							case ADD: {
-								dest = src.lerp(color, CLAMP(brush_alpha * strength, 0.f, 1.f));
-								dest.a = src.a;
-								break;
-							}
-							case SUBTRACT: {
-								dest = src.lerp(COLOR_WHITE, CLAMP(brush_alpha * strength, 0.f, 1.f));
-								dest.a = src.a;
-								break;
-							}
-							case AVERAGE: {
-								Color avg_col = _average(brush_global_position, src);
-								dest = src.lerp(avg_col, CLAMP(brush_alpha * strength * 2.f, .02f, 1.f));
-								dest.a = src.a;
-								break;
-							}
-							default:
-								break;
-						}
-						break;
-					case ROUGHNESS:
-						/* Roughness received from UI is -100 to 100. Changed to 0,1 before storing.
-						 * To convert 0,1 back to -100,100 use: 200 * (color.a - 0.5)
-						 * However Godot stores values as 8-bit ints. Roundtrip is = int(a*255)/255.0
-						 * Roughness 0 is saved as 0.5, but retreived is 0.498, or -0.4 roughness
-						 * We round the final amount in tool_settings.gd:_on_picked().
-						 */
-						switch (_operation) {
-							case ADD: {
-								real_t target = .5f + .5f * roughness;
-								dest.a = Math::lerp(real_t(src.a), target, CLAMP(brush_alpha * strength, 0.f, 1.f));
-								dest.a = float(int(dest.a * 255.f)) / 255.f; // Quantize explicitly so picked values match painted values
-								break;
-							}
-							case SUBTRACT: {
-								dest.a = Math::lerp(real_t(src.a), real_t(.5f), CLAMP(brush_alpha * strength, 0.f, 1.f));
-								dest.a = float(int(dest.a * 255.f)) / 255.f;
-								break;
-							}
-							case AVERAGE: {
-								real_t avg = _average_scalar(TYPE_COLOR, brush_global_position, src.a, 0.5f);
-								dest.a = Math::lerp(real_t(dest.a), avg, CLAMP(brush_alpha * strength * 2.f, .0f, 1.f));
-								dest.a = float(int(dest.a * 255.f)) / 255.f;
-								break;
-							}
-							default:
-								break;
-						}
-						break;
-					default:
-						break;
-				}
+			} else if (op.map_type == TYPE_CONTROL) {
+				result = _paint_control_texel(op, data, brush_global_position, brush_alpha, region, map,
+						map_pixel_position, src, surface, dest);
+			} else {
+				result = _paint_color_texel(op, data, brush_global_position, brush_alpha, region,
+						map_pixel_position, src, dest);
+			}
+			if (result == TEXEL_ABORT) {
+				// Two gradient points closer than 0.1 m cancel the whole operation.
+				// The surface cache is only ever populated for the TEXTURE tool, so
+				// this flush is a no-op here; it keeps the cache self-consistent.
+				surface.flush();
+				return;
+			}
+			if (result == TEXEL_SKIP) {
+				continue;
 			}
 			backup_region(region);
 			map->set_pixelv(map_pixel_position, dest);
 		}
 	}
+	_finish_map_operation(op, data, regions_added_removed, edited_area, surface);
+}
+Terrain3DEditor::TexelResult Terrain3DEditor::_paint_height_texel(const MapBrushOp &p_op,
+		const Vector3 &p_cursor, const Vector3 &p_brush_position, const Vector2 &p_brush_offset,
+		const real_t p_brush_alpha, const real_t p_src, Terrain3DRegion *p_region, Terrain3DData *p_data,
+		Vector3 &r_edited_position, Color &r_dest) {
+	real_t srcf = p_src;
+	// In case data in existing map has nan or inf saved, check, and reset to real number if required.
+	srcf = std::isnan(srcf) ? 0.f : srcf;
+	real_t destf = srcf;
+
+	switch (_operation) {
+		case ADD: {
+			if (_tool == HEIGHT) {
+				// Height
+				destf = Math::lerp(srcf, p_op.height, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+			} else if (p_op.modifier_alt && !std::isnan(p_cursor.y)) {
+				// Lift troughs
+				real_t brush_center_y = p_cursor.y + p_brush_alpha * p_op.strength;
+				destf = Math::clamp(brush_center_y, srcf, srcf + p_brush_alpha * p_op.strength);
+			} else {
+				// Raise
+				destf = srcf + (p_brush_alpha * p_op.strength);
+			}
+			break;
+		}
+		case SUBTRACT: {
+			if (_tool == HEIGHT) {
+				// Height, but GDScript has already picked height at cursor
+				destf = Math::lerp(srcf, p_op.height, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+			} else if (p_op.modifier_alt && !std::isnan(p_cursor.y)) {
+				// Flatten peaks
+				real_t brush_center_y = p_cursor.y - p_brush_alpha * p_op.strength;
+				destf = Math::clamp(brush_center_y, srcf - p_brush_alpha * p_op.strength, srcf);
+			} else {
+				// Lower
+				destf = srcf - (p_brush_alpha * p_op.strength);
+			}
+			break;
+		}
+		case AVERAGE: {
+			real_t avg_default = _terrain->get_material()->get_world_background() == 0u ? srcf : 0.f;
+			real_t avg = _average_scalar(TYPE_HEIGHT, p_brush_position, srcf, avg_default);
+			destf = Math::lerp(srcf, avg, CLAMP(p_brush_alpha * p_op.strength * 2.f, .02f, 1.f));
+			break;
+		}
+		case GRADIENT: {
+			if (p_op.gradient_points.size() == 2) {
+				Vector3 point_1 = p_op.gradient_points[0];
+				Vector3 point_2 = p_op.gradient_points[1];
+				Vector2 point_1_xz = Vector2(point_1.x, point_1.z);
+				Vector2 point_2_xz = Vector2(point_2.x, point_2.z);
+				Vector2 dir = point_2_xz - point_1_xz;
+				if (dir.length_squared() < 0.01f) {
+					return TEXEL_ABORT;
+				}
+				Vector2 brush_xz = Vector2(p_brush_position.x, p_brush_position.z);
+
+				if (_operation_movement.length_squared() > 0.f) {
+					// Ramp up/down only in the direction of movement, to avoid giving winding
+					// paths one edge higher than the other.
+					Vector2 movement_xz = Vector2(_operation_movement.x, _operation_movement.z).normalized();
+					Vector2 offset = movement_xz * Vector2(p_brush_offset).dot(movement_xz);
+					brush_xz = Vector2(p_cursor.x + offset.x, p_cursor.z + offset.y);
+				}
+
+				real_t weight = dir.normalized().dot(brush_xz - point_1_xz) / dir.length();
+				weight = Math::clamp(weight, (real_t)0.0f, (real_t)1.0f);
+				real_t gradient_height = Math::lerp(point_1.y, point_2.y, weight);
+				destf = Math::lerp(srcf, gradient_height, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+			}
+			break;
+		}
+		default:
+			break;
+	}
+	r_dest = Color(destf, 0.f, 0.f, 1.f);
+	p_region->update_height(destf);
+	p_data->update_master_height(destf);
+	r_edited_position.y = destf;
+
+	return TEXEL_WRITE;
+}
+
+Terrain3DEditor::TexelResult Terrain3DEditor::_paint_control_texel(const MapBrushOp &p_op,
+		Terrain3DData *p_data, const Vector3 &p_brush_position, const real_t p_brush_alpha,
+		const Ref<Terrain3DRegion> &p_region, Image *p_map, const Vector2i &p_map_pixel,
+		const Color &p_src, SurfaceByteCache &r_surface, Color &r_dest) {
+	if (_tool == TEXTURE) {
+		// IdWeight material painting writes the region's R16 surface
+		// map. The legacy RF control map is never authored by
+		// this tool and must not be decoded here: `p_src` holds the
+		// packed R16 word, not a control bitfield.
+		if (!p_data->is_in_slope(p_brush_position, p_op.slope_range)) {
+			return TEXEL_SKIP;
+		}
+		backup_region(p_region);
+		if (!r_surface.adopt(p_region, p_map)) {
+			LOG(ERROR, "Surface map must be R16 UNORM");
+			return TEXEL_SKIP;
+		}
+		// The stored payload is surface_density squared texels per region
+		// texel. The brush authors one region texel per step, so it writes
+		// the whole block. The block is uniform by construction: every write
+		// is a block write, and a density change replicates one source texel
+		// over its block.
+		const int density = MAX(1, p_region->get_surface_density());
+		const int surface_width = p_map->get_width();
+		uint8_t *surface_texel = r_surface.texel(surface_width, p_map_pixel, density);
+		if (_paint_surface_pair(surface_texel, p_brush_alpha, p_op.strength,
+					p_op.pair_overlay_id, p_op.pair_background_id, p_op.pair_mode, p_op.pair_weight_level,
+					p_op.modifier_alt) &&
+				density > 1) {
+			const uint16_t painted = TerrainSurfaceIdWeight::read_le(surface_texel);
+			for (int by = 0; by < density; by++) {
+				for (int bx = 0; bx < density; bx++) {
+					if (bx == 0 && by == 0) {
+						// The base texel already holds the painted value.
+						continue;
+					}
+					TerrainSurfaceIdWeight::write_le(painted,
+							r_surface.texel(surface_width, p_map_pixel, density, Vector2i(bx, by)));
+				}
+			}
+		}
+		return TEXEL_SKIP;
+	}
+	// Get current bit field from pixel
+	uint32_t base_id = get_base(p_src.r);
+	uint32_t overlay_id = get_overlay(p_src.r);
+	real_t blend = real_t(get_blend(p_src.r)) / 255.f;
+	uint32_t uvrotation = get_uv_rotation(p_src.r);
+	uint32_t uvscale = get_uv_scale(p_src.r);
+	bool hole = is_hole(p_src.r);
+	bool navigation = is_nav(p_src.r);
+	bool autoshader = is_auto(p_src.r);
+
+	switch (_tool) {
+		case AUTOSHADER: {
+			if (p_brush_alpha > 0.5f) {
+				autoshader = (_operation == ADD);
+				uvscale = 0.f;
+				uvrotation = 0.f;
+			}
+			break;
+		}
+		case HOLES: {
+			if (p_brush_alpha > 0.5f) {
+				hole = (_operation == ADD);
+			}
+			break;
+		}
+		case NAVIGATION: {
+			if (p_brush_alpha > 0.5f) {
+				navigation = (_operation == ADD);
+			}
+			break;
+		}
+		default: {
+			break;
+		}
+	}
+
+	// Convert back to bitfield
+	uint32_t blend_int = uint32_t(CLAMP(Math::round(blend * 255.f), 0.f, 255.f));
+	uint32_t bits = enc_base(base_id) | enc_overlay(overlay_id) |
+			enc_blend(blend_int) | enc_uv_rotation(uvrotation) |
+			enc_uv_scale(uvscale) | enc_hole(hole) |
+			enc_nav(navigation) | enc_auto(autoshader);
+
+	// Write back to pixel in FORMAT_RF. Must be a 32-bit float
+	r_dest = Color(as_float(bits), 0.f, 0.f, 1.f);
+	return TEXEL_WRITE;
+}
+
+Terrain3DEditor::TexelResult Terrain3DEditor::_paint_color_texel(const MapBrushOp &p_op,
+		Terrain3DData *p_data, const Vector3 &p_brush_position, const real_t p_brush_alpha,
+		const Ref<Terrain3DRegion> &p_region, const Vector2i &p_map_pixel, const Color &p_src,
+		Color &r_dest) {
+	// Filter by visible texture
+	if (p_op.texture_filter) {
+		Image *cmap = p_region->get_map_ptr(TYPE_CONTROL);
+		if (!cmap) {
+			return TEXEL_SKIP;
+		}
+		float src_ctrl = cmap->get_pixelv(p_map_pixel).r; // Must be float
+		int tex_id = (get_blend(src_ctrl) > 110 - p_op.margin) ? get_overlay(src_ctrl) : get_base(src_ctrl);
+		if (tex_id != p_op.asset_id) {
+			return TEXEL_SKIP;
+		}
+	}
+	if (!p_data->is_in_slope(p_brush_position, p_op.slope_range)) {
+		return TEXEL_SKIP;
+	}
+	switch (_tool) {
+		case COLOR:
+			switch (_operation) {
+				case ADD: {
+					r_dest = p_src.lerp(p_op.color, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+					r_dest.a = p_src.a;
+					break;
+				}
+				case SUBTRACT: {
+					r_dest = p_src.lerp(COLOR_WHITE, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+					r_dest.a = p_src.a;
+					break;
+				}
+				case AVERAGE: {
+					Color avg_col = _average(p_brush_position, p_src);
+					r_dest = p_src.lerp(avg_col, CLAMP(p_brush_alpha * p_op.strength * 2.f, .02f, 1.f));
+					r_dest.a = p_src.a;
+					break;
+				}
+				default:
+					break;
+			}
+			break;
+		case ROUGHNESS:
+			/* Roughness received from UI is -100 to 100. Changed to 0,1 before storing.
+			 * To convert 0,1 back to -100,100 use: 200 * (color.a - 0.5)
+			 * However Godot stores values as 8-bit ints. Roundtrip is = int(a*255)/255.0
+			 * Roughness 0 is saved as 0.5, but retreived is 0.498, or -0.4 roughness
+			 * We round the final amount in tool_settings.gd:_on_picked().
+			 */
+			switch (_operation) {
+				case ADD: {
+					real_t target = .5f + .5f * p_op.roughness;
+					r_dest.a = Math::lerp(real_t(p_src.a), target, CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+					r_dest.a = float(int(r_dest.a * 255.f)) / 255.f; // Quantize explicitly so picked values match painted values
+					break;
+				}
+				case SUBTRACT: {
+					r_dest.a = Math::lerp(real_t(p_src.a), real_t(.5f), CLAMP(p_brush_alpha * p_op.strength, 0.f, 1.f));
+					r_dest.a = float(int(r_dest.a * 255.f)) / 255.f;
+					break;
+				}
+				case AVERAGE: {
+					real_t avg = _average_scalar(TYPE_COLOR, p_brush_position, p_src.a, 0.5f);
+					r_dest.a = Math::lerp(real_t(r_dest.a), avg, CLAMP(p_brush_alpha * p_op.strength * 2.f, .0f, 1.f));
+					r_dest.a = float(int(r_dest.a * 255.f)) / 255.f;
+					break;
+				}
+				default:
+					break;
+			}
+			break;
+		default:
+			break;
+	}
+	return TEXEL_WRITE;
+}
+
+void Terrain3DEditor::_finish_map_operation(const MapBrushOp &p_op, Terrain3DData *p_data,
+		const int p_regions_added_removed, const AABB &p_edited_area, SurfaceByteCache &r_surface) {
 	// Write the cached R16 surface bytes back before the maps are uploaded.
-	flush_surface();
+	r_surface.flush();
 	// Regenerate color mipmaps for edited regions
-	if (map_type == TYPE_COLOR) {
+	if (p_op.map_type == TYPE_COLOR) {
 		for (Ref<Terrain3DRegion> region : _edited_regions) {
 			if (region.is_valid()) {
-				region->get_map(map_type)->generate_mipmaps();
+				region->get_map(p_op.map_type)->generate_mipmaps();
 			}
 		}
 	}
 	// If no added or removed regions, update only changed texture array layers from the edited regions in the rendering server
-	if (_added_removed_locations.size() == regions_added_removed) {
-		data->update_maps(map_type, false, false);
+	if (_added_removed_locations.size() == p_regions_added_removed) {
+		p_data->update_maps(p_op.map_type, false, false);
 	} else {
 		// If region qty was changed, must fully rebuild the maps
-		data->update_maps(map_type, true, map_type == TYPE_COLOR);
+		p_data->update_maps(p_op.map_type, true, p_op.map_type == TYPE_COLOR);
 	}
 	// Surface map edits need their own array refresh (both paths rebuild when
 	// regions were added, so only the partial-update path needs the call).
-	if (_tool == TEXTURE && _added_removed_locations.size() == regions_added_removed) {
-		for (const Vector2i &region_loc : data->get_region_locations()) {
-			Terrain3DRegion *edited = data->get_region_ptr(region_loc);
+	if (_tool == TEXTURE && _added_removed_locations.size() == p_regions_added_removed) {
+		for (const Vector2i &region_loc : p_data->get_region_locations()) {
+			Terrain3DRegion *edited = p_data->get_region_ptr(region_loc);
 			if (edited && edited->is_edited()) {
-				int region_id = data->get_region_id(region_loc);
+				int region_id = p_data->get_region_id(region_loc);
 				// The array layer is the region_size reduction, not the dense payload:
 				// the array is the fallback and must not grow with the density.
 				Ref<Image> surface = edited->get_surface_map_array_image();
 				if (surface.is_valid()) {
-					data->update_surface_region(surface.ptr(), region_id);
+					p_data->update_surface_region(surface.ptr(), region_id);
 				}
 			}
 		}
@@ -623,17 +639,17 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	// carry it. Without this an array-free configuration keeps rendering the material the
 	// page was produced with until the LRU happens to evict it.
 	if (_tool == TEXTURE) {
-		for (const Vector2i &region_loc : data->get_region_locations()) {
-			Terrain3DRegion *edited = data->get_region_ptr(region_loc);
+		for (const Vector2i &region_loc : p_data->get_region_locations()) {
+			Terrain3DRegion *edited = p_data->get_region_ptr(region_loc);
 			if (edited && edited->is_edited()) {
 				_terrain->invalidate_surface_pages(region_loc);
 			}
 		}
 	}
-	data->add_edited_area(edited_area);
+	p_data->add_edited_area(p_edited_area);
 
 	if (_tool == HOLES || _tool == HEIGHT || _tool == SCULPT) {
-		_terrain->get_instancer()->update_transforms(edited_area);
+		_terrain->get_instancer()->update_transforms(p_edited_area);
 	}
 	// Update Dynamic / Editor collision
 	if (_terrain->get_collision_mode() == Terrain3DCollision::DYNAMIC_EDITOR) {
@@ -643,6 +659,41 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 		_terrain->snap();
 	}
 }
+
+void Terrain3DEditor::SurfaceByteCache::flush() {
+	if (image && region) {
+		image->set_data(image->get_width(), image->get_height(), false, Image::Format(39), bytes);
+		// Mark the region edited so the surface map layer is uploaded to the GPU
+		// texture array. Without this the painted texels stay in CPU memory and the
+		// shader keeps sampling the old (all-zero) layer.
+		region->set_modified(true);
+	}
+	image = nullptr;
+	region = nullptr;
+	bytes = PackedByteArray();
+}
+
+bool Terrain3DEditor::SurfaceByteCache::adopt(const Ref<Terrain3DRegion> &p_region, Image *p_map) {
+	if (region == p_region.ptr()) {
+		return true;
+	}
+	flush();
+	if (p_map->get_format() != Image::Format(39)) {
+		return false;
+	}
+	image = p_map;
+	region = p_region.ptr();
+	bytes = p_map->get_data();
+	return true;
+}
+
+uint8_t *Terrain3DEditor::SurfaceByteCache::texel(const int p_width, const Vector2i &p_pixel,
+		const int p_density, const Vector2i &p_block) {
+	const int x = p_pixel.x * p_density + p_block.x;
+	const int y = p_pixel.y * p_density + p_block.y;
+	return bytes.ptrw() + (int64_t(y) * p_width + x) * 2;
+}
+
 
 void Terrain3DEditor::_store_undo() {
 	IS_INIT_COND_MESG(!_terrain->get_plugin(), "_terrain isn't initialized, returning", VOID);

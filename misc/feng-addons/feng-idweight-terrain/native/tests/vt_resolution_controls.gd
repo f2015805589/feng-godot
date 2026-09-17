@@ -38,8 +38,6 @@ func run() -> void:
 	assert(window.find_child("AVTRegionOffsetX", true, false) == null)
 	assert(window.avt_band_spins.size() == 3)
 	assert(window.find_child("AVTMipDistance0", true, false) == null)
-	terrain.surface_vt_distance_mips = true
-	assert(not terrain.surface_vt_distance_mips)
 	window.avt_distance_spin.value = 768
 	assert(terrain.surface_vt_distance == 768)
 	# Preview preference must never suppress runtime VT.
@@ -50,7 +48,6 @@ func run() -> void:
 	assert(restored.surface_vt_texels_per_meter == 1024)
 	assert(restored.surface_svt_texels_per_meter == 2)
 	assert(restored.surface_vt_mip_distances.is_empty())
-	assert(not restored.surface_vt_distance_mips)
 	assert(restored.surface_vt_distance == 768)
 	restored.free()
 	window.free()

@@ -573,7 +573,7 @@ void Terrain3D::_process_async_svt_pages() {
 			const bool written = result.payload.is_valid() &&
 					_vt.surface_svt->write_page(slot, result.payload);
 			if (written) {
-				record["source"] = result.payload->get_data();
+				record["source"] = result.payload;
 			}
 			bool cell_copy_queued = false;
 			if (result.missing.empty() && !result.sources.is_empty()) {
@@ -698,6 +698,18 @@ void Terrain3D::invalidate_vt_materials() {
 	_vt.vt_source_revision++;
 }
 
+void Terrain3D::_flush_source_wakes() {
+	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->flush_wakes(); }
+	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->flush_wakes(); }
+}
+
+// The wakes a demand pass owes, released unless the tick will release them itself. A pass driven
+// directly has no tick to wait for.
+void Terrain3D::_flush_source_wakes_unless_ticking() {
+	if (_vt.vt_tick_active) { return; }
+	_flush_source_wakes();
+}
+
 void Terrain3D::_invalidate_vt_slot(int p_slot) {
 	_vt.svt_pending_pages.erase(p_slot);
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
@@ -712,6 +724,18 @@ String Terrain3D::_svt_page_path(const Vector2i &p_address, int p_mip) const {
 		return String();
 	}
 	return TerrainVTCell::path(_data_directory, p_address, 0);
+}
+
+bool Terrain3D::debug_invalidate_vt_page(int p_slot) {
+	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	if (!producer || p_slot < 0 || !producer->is_page_ready(p_slot)) {
+		return false;
+	}
+	// This clears the page's compiled parameter page, which is the flag the shader reads to
+	// decide whether a page is samplable. The demand pass then finds the address published over
+	// empty content and produces it again, which is the arrival a fade is for.
+	_invalidate_vt_slot(p_slot);
+	return true;
 }
 
 int Terrain3D::prepare_vt_capture() {
@@ -729,13 +753,11 @@ int Terrain3D::prepare_vt_capture() {
 		if (!producer->is_page_ready(slot)) {
 			continue;
 		}
-		PackedByteArray bytes = record.get("source", PackedByteArray());
-		if (bytes.size() != int64_t(stored_size) * stored_size * 2) {
+		Ref<Image> source = record.get("source", Ref<Image>());
+		if (source.is_null() || source->get_width() != stored_size || source->get_height() != stored_size) {
 			continue;
 		}
-		Ref<Image> payload = Image::create_from_data(stored_size, stored_size, false,
-				Image::Format(39), bytes);
-		_queue_vt_material_page(slot, payload, record.get("world_rect", Rect2()),
+		_queue_vt_material_page(slot, source, record.get("world_rect", Rect2()),
 				record.get("kind", String()) == Variant("SVT"), record.get("mip", 0),
 				record.get("address", Vector2i()));
 		++queued;
@@ -890,6 +912,12 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (_vt.vt_debug_direct_material || !producer || p_slot < 0 || (!p_svt && p_payload.is_null())) {
 		return;
 	}
+	// The slot's content is being (re)written from here, so it is not ready by definition until a
+	// demand pass observes it again. Every production funnels through this call, which is what
+	// makes the fade's start robust: a page re-produced into a *fresh* slot has no earlier
+	// unready reading, so keying only on the demand pass's own observations would miss exactly the
+	// case of a page that moved slots - and never fade it.
+	_vt_note_page_readiness(p_slot, false);
 	Ref<Image> height;
 	Dictionary record;
 	record["slot"] = p_slot;
@@ -903,7 +931,11 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	// once this stamp is older than SVT_PAGE_RETRY_FRAMES, which is what recovers from a
 	// production that was dropped, refused, or lost to a failed cell copy.
 	record["queued_frame"] = int64_t(Engine::get_singleton()->get_process_frames());
-	record["source"] = p_payload.is_valid() ? p_payload->get_data() : PackedByteArray();
+	// The record holds the source image, not its bytes. A page's payload is a few hundred
+	// kilobytes, and copying it into a String-keyed dictionary on every production put that
+	// copy on the page-production path - and kept a second full copy of every resident page
+	// alive for the rest of the session. A Ref is a refcount.
+	record["source"] = p_payload;
 	_vt.vt_page_records[p_slot] = record;
 	if (p_svt) {
 		// The far field has three sources, in this order of preference:
@@ -1079,8 +1111,6 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["svt_feedback"] = _vt.svt_feedback;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
-	result["avt_distance_mips"] = _vt.surface_vt_distance_mips;
-	result["avt_mip_ranges"] = _vt.surface_vt_mip_ranges;
 	result["avt_distance"] = _vt.surface_vt_distance;
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
 	result["svt_texels_per_meter"] = get_surface_svt_texels_per_meter();
@@ -1089,6 +1119,9 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["avt_base_block_size"] = get_avt_base_block_size();
 	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
 	result["avt_sector_stats"] = _vt.avt_sector_stats;
+	result["avt_peak_stats"] = _vt.avt_peak_stats;
+	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0
+			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_peak_stamp_us) / 1000.0;
 	result["svt_effective_max_mip"] = _vt.surface_svt ? _vt.surface_svt->get_world_max_mip() : _vt.surface_svt_max_mip;
 	// Far-field residency diagnostics: the root pyramid the last pass pinned, and the
 	// coarseness floor it raised its detail pages to (0 when the set fit).
@@ -1107,11 +1140,16 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["svt_root_skips"] = int64_t(_vt.svt_root_skips);
 	result["svt_floor_level"] = _vt.svt_floor_level;
 	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
+	result["svt_stats"] = _vt.svt_stats;
+	result["svt_worst_ms"] = _vt.svt_worst_ms;
+	result["svt_worst_frames_ago"] = double(Engine::get_singleton()->get_process_frames() - _vt.svt_worst_frame);
 	// Main-thread cost of the VT section of the last physics tick, its worst frame so
 	// far, and the far-field demand pass inside it.
 	result["vt_cpu_ms"] = _vt.vt_cpu_ms;
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
 	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
+	result["vt_page_fade_frames"] = _vt.vt_page_fade_frames;
+	result["vt_page_fade_active_slots"] = _vt.vt_page_fade_active;
 	Dictionary phases;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
@@ -1119,6 +1157,7 @@ Dictionary Terrain3D::get_vt_settings() const {
 	phases["avt_peak"] = _vt.vt_avt_peak_ms;
 	phases["svt_peak"] = _vt.vt_svt_peak_ms;
 	phases["topup"] = _vt.vt_topup_ms;
+	phases["fade"] = _vt.vt_fade_ms;
 	phases["bake"] = _vt.vt_bake_ms;
 	result["vt_phases"] = phases;
 	// Resident far-field cell sources: what the runtime copies pages from without touching
@@ -1549,6 +1588,7 @@ void Terrain3D::_bind_vt_methods() {
 	ClassDB::bind_method(D_METHOD("prepare_vt_capture"), &Terrain3D::prepare_vt_capture);
 	ClassDB::bind_method(D_METHOD("get_vt_pages"), &Terrain3D::get_vt_pages);
 	ClassDB::bind_method(D_METHOD("debug_lose_vt_page_readiness", "slot"), &Terrain3D::debug_lose_vt_page_readiness);
+	ClassDB::bind_method(D_METHOD("debug_invalidate_vt_page", "slot"), &Terrain3D::debug_invalidate_vt_page);
 	ClassDB::bind_method(D_METHOD("get_vt_material_textures"), &Terrain3D::get_vt_material_textures);
 	ClassDB::bind_method(D_METHOD("get_vt_page_preview", "slot"), &Terrain3D::get_vt_page_preview);
 	ClassDB::bind_method(D_METHOD("get_svt_baked_pages"), &Terrain3D::get_svt_baked_pages);

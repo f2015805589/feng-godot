@@ -43,6 +43,22 @@ constexpr float MOTION_PLAN_QUANTUM = 4.f;
 // error would move a mip boundary; the height is snapped only far enough to stop the plan
 // key from changing on every frame of a smooth slope.
 constexpr float MOTION_HEIGHT_QUANTUM = 2.f;
+// The orientation is snapped for exactly the reason the position is, and it is the one that
+// matters for a camera that turns: an exact basis changes the key on every frame of a pan,
+// so every tick submits a plan and the next tick replaces it before the worker has finished
+// - which throws the worker's time away, keeps the working set churning instead of
+// converging, and is what makes a turn refine in visible blocks. Two degrees of yaw is
+// under a third of a frame at a fast 6 degrees per frame, and the pages are still selected
+// from the exact predicted transform: the key only decides when a selection is re-derived.
+constexpr float MOTION_YAW_QUANTUM = 0.034906585f; // 2 degrees
+constexpr float MOTION_PITCH_QUANTUM = 0.026179939f; // 1.5 degrees
+constexpr float MOTION_ROLL_QUANTUM = 0.052359878f; // 3 degrees
+// The source queue's window is 32 entries. A prime leaves the queue alone while this many are still
+// claimable, because those are requests the workers have not reached yet: adding to a half-full
+// queue re-scans it and inserts nothing, at the cost of the queue mutex, behind the workers that
+// are holding it. `_avt_retain_visible()` has already dropped everything the current plan does not
+// name, so a queue this deep is current-plan work either way.
+constexpr int SOURCE_QUEUE_REFILL_ABOVE = 16;
 using SectorKey = std::pair<int, int>;
 uint32_t sector_hash(int x, int y, int level) {
 	return uint32_t(x) * 73856093u ^ uint32_t(y) * 19349663u ^ uint32_t(level) * 83492791u;
@@ -81,17 +97,12 @@ int Terrain3D::get_avt_base_block_size() const {
 }
 // The number of texels a level 0 sector block carries per page, as a multiple of its page
 // count: `size * logical_ratio` is the block's virtual resolution for `SECTOR_WORLD`
-// metres. Derived here rather than read from the plan, because the staged planner
-// publishes the directory one phase before it submits the plan that would store it: the
-// first publish of a configuration is exactly the one that must not see a stale default.
+// metres. Derived here rather than read from the plan, because the chain that re-configures a
+// view publishes its directory before it submits the plan: the first publish of a configuration
+// would otherwise read the previous configuration's ratio.
 float Terrain3D::_avt_logical_ratio() const {
 	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * get_avt_base_block_size());
 }
-// Compatibility with saved experimental distance controls; automatic LOD is authoritative.
-void Terrain3D::set_surface_vt_distance_mips(bool p_enabled) { _vt.surface_vt_distance_mips = false; }
-void Terrain3D::set_surface_vt_mip_ranges(const Vector3 &p_ranges) { }
-float Terrain3D::get_surface_vt_distance_lod(float p_distance) const { return 0.f; }
-
 // Motion look-ahead. A page costs several frames to assemble and a compressed page
 // several more to encode and read back, so demand issued at the moment a page becomes
 // visible can only ever be late: the view streams in. The plan therefore describes the
@@ -163,6 +174,14 @@ Transform3D Terrain3D::_vt_plan_key_transform(const Transform3D &p_camera_transf
 	keyed.origin.x = Math::round(keyed.origin.x / MOTION_PLAN_QUANTUM) * MOTION_PLAN_QUANTUM;
 	keyed.origin.z = Math::round(keyed.origin.z / MOTION_PLAN_QUANTUM) * MOTION_PLAN_QUANTUM;
 	keyed.origin.y = Math::round(keyed.origin.y / MOTION_HEIGHT_QUANTUM) * MOTION_HEIGHT_QUANTUM;
+	// The orientation is snapped on the same grid idea. Yaw gets the finest step because it
+	// is what a camera turn changes; pitch and roll get coarser ones, since a degree of
+	// either moves the plan's frustum far less than a degree of yaw.
+	const Vector3 euler = keyed.basis.get_euler();
+	keyed.basis = Basis::from_euler(Vector3(
+			Math::round(euler.x / MOTION_PITCH_QUANTUM) * MOTION_PITCH_QUANTUM,
+			Math::round(euler.y / MOTION_YAW_QUANTUM) * MOTION_YAW_QUANTUM,
+			Math::round(euler.z / MOTION_ROLL_QUANTUM) * MOTION_ROLL_QUANTUM));
 	return keyed;
 }
 
@@ -451,11 +470,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		_vt.avt_sector_stats["plan_key_unchanged"] = first < 0;
 	}
 	const int finished = _avt_install_or_reuse_plan(started, p_max_pages, _vt.avt_plan_key == plan_key);
-	if (finished >= 0) {
-		_vt.avt_plan_staging = false;
-		_vt.avt_plan_stage = 0;
-		return finished;
-	}
+	if (finished >= 0) { return finished; }
 
 	_vt.avt_sector_stats["plan_reused"] = false;
 	_vt.avt_sector_stats["coverage_center"] = focus;
@@ -463,40 +478,37 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// Phase timings for the uncached path, which is the one a moving camera takes on
 	// every tick: the visible scan, the sector hierarchy, the address directory, the
 	// hand-off to the refinement worker, the directory upload and the page production.
-	auto avt_ms = [](const uint64_t p_from) { return double(Time::get_singleton()->get_ticks_usec() - p_from) / 1000.0; };
 	// The predicted frustum, not the rendered one. `camera_transform` is the real one the
 	// engine is using; only the plan moves ahead of it.
 	TerrainVT::VisibleView view(lead_transform, get_camera()->get_camera_projection(),
 			get_camera()->get_viewport() ? get_camera()->get_viewport()->get_visible_rect().size.y : 720.f,
 			get_camera()->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, 192.f);
-	uint64_t phase_start = Time::get_singleton()->get_ticks_usec();
 	// The chain runs in one pass. Staging it across ticks was tried and reverted: the
 	// install/reuse path above resets the stage cursor, so a chain that was interrupted
 	// between phases could be discarded before it published, which left the directory
-	// stale and the view rendering the missing-page diagnostic for whole sectors. The
-	// phases are cheap enough as a group (a few milliseconds on a moving camera) that
-	// spreading them out costs more than it saves.
-	phase_start = Time::get_singleton()->get_ticks_usec();
+	// stale and the view rendering the missing-page diagnostic for whole sectors.
+	//
+	// The scratch members the phases hand each other are reused rather than rebuilt, so a
+	// plan tick does not reallocate the scan and the hierarchy it is about to discard.
+	uint64_t phase_start = Time::get_singleton()->get_ticks_usec();
+	auto mark_phase = [this, &phase_start](const char *p_key) {
+		const uint64_t now = Time::get_singleton()->get_ticks_usec();
+		_vt.avt_sector_stats[p_key] = double(now - phase_start) / 1000.0;
+		phase_start = now;
+	};
 	_vt.avt_pending_scan = _avt_scan_sectors(view, camera_position, bounds_ready, focus, reach);
-	_vt.avt_sector_stats["scan_ms"] = avt_ms(phase_start);
-	phase_start = Time::get_singleton()->get_ticks_usec();
+	mark_phase("scan_ms");
 	_vt.avt_pending_hierarchy = _avt_build_hierarchy(_vt.avt_pending_scan);
 	_vt.avt_pending_scan = Terrain3DAVTSectorScan();
-	_vt.avt_sector_stats["hierarchy_ms"] = avt_ms(phase_start);
-	phase_start = Time::get_singleton()->get_ticks_usec();
+	mark_phase("hierarchy_ms");
 	_avt_sync_address_directory(_vt.avt_pending_hierarchy, focus, reach);
-	_vt.avt_sector_stats["sync_ms"] = avt_ms(phase_start);
-	phase_start = Time::get_singleton()->get_ticks_usec();
+	mark_phase("sync_ms");
 	_publish_avt_directory(_vt.avt_pending_hierarchy);
-	_vt.avt_sector_stats["publish_ms"] = avt_ms(phase_start);
-	phase_start = Time::get_singleton()->get_ticks_usec();
+	mark_phase("publish_ms");
 	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, camera_position, bounds_ready, focus, reach);
-	_vt.avt_sector_stats["submit_ms"] = avt_ms(phase_start);
+	mark_phase("submit_ms");
 	_vt.avt_plan_key = plan_key;
 	_vt.avt_pending_hierarchy = Terrain3DAVTHierarchy();
-	_vt.avt_plan_stage = 0;
-	_vt.avt_plan_staging = false;
-	_vt.avt_sector_stats["plan_stage"] = _vt.avt_plan_stage;
 
 	_vt.avt_sector_stats["height_bounds_ready"] = bounds_ready;
 	_vt.avt_sector_stats["retained_hierarchy"] = true;
@@ -504,9 +516,8 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	_vt.avt_sector_stats["base_virtual_resolution"] = SECTOR_WORLD * _vt.surface_vt_texels_per_meter;
 	_vt.avt_sector_stats["base_page_entries"] = SECTOR_WORLD * _vt.surface_vt_texels_per_meter / _vt.vt_page_size;
 	_vt.avt_sector_stats["indirection_size"] = 2048;
-	phase_start = Time::get_singleton()->get_ticks_usec();
 	const int produced = _produce_sector_avt_pages(p_max_pages);
-	_vt.avt_sector_stats["produce_ms"] = avt_ms(phase_start);
+	mark_phase("produce_ms");
 	_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	return produced;
 }
@@ -614,6 +625,8 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			_vt.avt_prefetch_plan = std::move(_vt.avt_refinement->warm);
 			_vt.avt_prefetch_cursor = 0;
 			_vt.avt_prefetch_cycle_pending = false;
+			// A new plan is a new wanted set, so the source queue has to be retained again.
+			_vt.avt_retain_applied = false;
 			_vt.avt_sector_stats["refinement_requests_denied"] = _vt.avt_refinement->denied;
 			_vt.avt_sector_stats["finest_requested_texel_world"] = _vt.avt_refinement->finest;
 			_vt.avt_sector_stats["visible_root_pages"] = _vt.avt_refinement->roots;
@@ -637,9 +650,9 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 		_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - p_started) / 1000.0;
 		return produced;
 	}
-	// A plan that is not being reused leaves the settled verdict false, so a production pass
-	// reached from the caller's top-up cannot read this tick's absence of an install as an
-	// idle plan and skip work the new view needs.
+	// A plan that is not being reused leaves the settled verdict false: the caller goes on to run
+	// this tick's production pass, and it must not read the absence of an install as an idle plan
+	// and skip the work the new view needs.
 	_vt.avt_plan_reused = false;
 	return -1;
 }
@@ -903,6 +916,8 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Packe
 		remap_plan(_vt.avt_page_plan);
 		remap_plan(_vt.avt_prefetch_plan);
 		_vt.avt_plan_logical_ratio = logical_ratio;
+		// The addresses the source queue is retained against just changed.
+		_vt.avt_retain_applied = false;
 	}
 	_vt.avt_prefetch_cursor = 0;
 	_vt.avt_prefetch_cycle_pending = false;
@@ -979,6 +994,10 @@ bool Terrain3D::_avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy,
 	return uniform_changed;
 }
 
+// The near field's one production pass per tick: verify the standing plan, classify it into
+// resident and missing pages, retain the source queue, prime the workers, publish what fits
+// the budget, and commit. The tick calls it exactly once, so every stage above is paid once
+// per tick rather than once per caller.
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (p_max_pages == 0) { return 0; }
 	p_max_pages = p_max_pages < 0 ? 16 : MIN(p_max_pages, 16);
@@ -1004,11 +1023,6 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (_vt.avt_plan_reused && _vt.avt_idle_revision == pool->residency_revision &&
 			idle_lost == 0) {
 		for (int slot : _vt.avt_resident_slots) { pool->mark_demanded(slot); }
-		// The tick's top-up asks the near field the same question a second time, with the
-		// budget the far field did not use. Recording that this pass already answered it lets
-		// the top-up skip its own copy of the walk; the revision it was answered against is
-		// the condition under which that answer is still the right one.
-		_vt.avt_idle_tick = true;
 		// Only the first tick of an idle run publishes: every value below is a constant of
 		// the settled state, and rewriting the same numbers into a String-keyed dictionary
 		// every frame is the largest cost a settled view has left.
@@ -1035,7 +1049,6 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// reading is what tells a lost page under a still camera from a settled view.
 	_vt.avt_idle_stats_current = false;
 	_vt.avt_sector_stats["idle_ready_lost"] = idle_lost;
-	_vt.avt_idle_tick = false;
 	_vt.avt_idle_revision = 0;
 	_vt.avt_resident_slots.clear();
 	_vt.surface_vt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
@@ -1043,26 +1056,31 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
 
 	Terrain3DAVTProducePass pass;
-	uint64_t produce_start = Time::get_singleton()->get_ticks_usec();
-	auto produce_ms = [](const uint64_t p_from) { return double(Time::get_singleton()->get_ticks_usec() - p_from) / 1000.0; };
+	// One place to record a stage's cost, so the pass reads as the stages it runs instead of as a
+	// sequence of timestamp reassignments. Each stage is named by the key its cost lands under.
+	uint64_t stage_started = Time::get_singleton()->get_ticks_usec();
+	auto mark = [this, &stage_started](const char *p_key) {
+		const uint64_t now = Time::get_singleton()->get_ticks_usec();
+		_vt.avt_sector_stats[p_key] = double(now - stage_started) / 1000.0;
+		stage_started = now;
+	};
 	_avt_classify_plan(pass);
-	_vt.avt_sector_stats["classify_ms"] = produce_ms(produce_start);
-	produce_start = Time::get_singleton()->get_ticks_usec();
+	mark("classify_ms");
 	_avt_retain_visible(pass);
-	_vt.avt_sector_stats["retain_ms"] = produce_ms(produce_start);
-	produce_start = Time::get_singleton()->get_ticks_usec();
-	_avt_prime_sources(pass);
-	_vt.avt_sector_stats["prime_ms"] = produce_ms(produce_start);
-	produce_start = Time::get_singleton()->get_ticks_usec();
+	mark("retain_ms");
+	_avt_prime_sources(pass, SOURCE_QUEUE_REFILL_ABOVE);
+	mark("prime_ms");
 	_avt_produce_visible(pass, p_max_pages);
-	_vt.avt_sector_stats["upload_ms"] = produce_ms(produce_start);
-	// Refill after consuming ready results even when the render budget is spent.
-	// Otherwise two full batches drain the queue and every third frame is idle.
-	produce_start = Time::get_singleton()->get_ticks_usec();
-	_avt_prime_sources(pass);
+	mark("upload_ms");
+	// Refill after consuming ready results even when the render budget is spent, so the workers
+	// are not left idle between ticks - but only when the queue is actually running low. A queue
+	// that is still half full is work the workers have not reached yet, and re-scanning and
+	// re-inserting into it buys nothing.
+	_avt_prime_sources(pass, SOURCE_QUEUE_REFILL_ABOVE, true);
+	mark("refill_ms");
 	_avt_produce_prefetch(pass, p_max_pages);
 	_avt_finish_produce(pass);
-	_vt.avt_sector_stats["finish_ms"] = produce_ms(produce_start);
+	mark("finish_ms");
 	return pass.produced;
 }
 
@@ -1081,6 +1099,8 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 		int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
 		if (slot >= 0 && !_vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, true); r_pass.protected_slots.push_back(slot); }
 		const bool sampled_ready = slot >= 0 && (!producer || producer->is_page_ready(slot));
+		// A page whose content landed since the last pass is the one a fade starts on.
+		if (slot >= 0) { _vt_note_page_readiness(slot, sampled_ready); }
 		const bool stale = slot >= 0 && !sampled_ready && _vt_page_production_stale(slot);
 		if (index++ < sampled) {
 			// A page the image samples without content is shaded as the missing-page
@@ -1126,30 +1146,52 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 // Queued idle work must not occupy every source-worker slot while visible requests
 // wait for a free entry. Retain only visible jobs until they settle.
 void Terrain3D::_avt_retain_visible(const Terrain3DAVTProducePass &p_pass) {
-	if (p_pass.missing.empty() && bool(_vt.avt_sector_stats.get("plan_reused", false))) { return; }
+	// What the source queue should keep is the plan, plus the prefetch plan once nothing
+	// visible is missing. That set only changes when a plan is installed or the prefetch
+	// switch flips, and a retention is only ever undone by a later one, so repeating it is
+	// 250 map lookups that reach the state the last retention already reached.
+	const bool with_prefetch = p_pass.missing.empty();
+	if (_vt.avt_retain_applied && _vt.avt_retain_with_prefetch == with_prefetch) { return; }
 	std::vector<Terrain3DPagePipeline::Request> wanted;
-	wanted.reserve(_vt.avt_page_plan.size() + (p_pass.missing.empty() ? _vt.avt_prefetch_plan.size() : 0));
+	wanted.reserve(_vt.avt_page_plan.size() + (with_prefetch ? _vt.avt_prefetch_plan.size() : 0));
 	for (const auto &page : _vt.avt_page_plan) { wanted.push_back(_avt_page_request(page)); }
-	if (p_pass.missing.empty()) {
+	if (with_prefetch) {
 		for (const auto &page : _vt.avt_prefetch_plan) { wanted.push_back(_avt_page_request(page)); }
 	}
 	_vt.vt_page_pipeline->retain(wanted);
+	_vt.avt_retain_applied = true;
+	_vt.avt_retain_with_prefetch = with_prefetch;
 }
 
 Terrain3DPagePipeline::Request Terrain3D::_avt_page_request(const Terrain3DAVTPageRequest &p_page) const {
 	return Terrain3DPagePipeline::Request{{ p_page.owner.x, p_page.owner.y, p_page.mip, p_page.x, p_page.y }, p_page.rect, _vt.vt_page_size, _vt.vt_page_border };
 }
 
-// Gives the source workers the first pages of the missing list, so results are ready
-// when the next stage polls them.
-void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass) {
+// Gives the source workers the first pages of the missing list that the pass has not attempted, so
+// results are ready when the next stage polls them. `p_refill_above` is the point at which the
+// queue is already deep enough that there is nothing to do: the second call of a tick passes it, so
+// a queue the workers are still working through is not re-scanned and re-inserted into - which
+// measured as ~0.15 ms of a peak tick, almost all of it waiting for the queue's mutex.
+void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const int p_refill_above, const bool p_refill) {
+	if (p_refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= p_refill_above) { return; }
 	std::vector<Terrain3DPagePipeline::Request> requests;
 	requests.reserve(32);
-	for (const Terrain3DAVTPageRequest *page : p_pass.missing) {
-		requests.push_back(_avt_page_request(*page));
+	for (size_t i = p_pass.missing_next; i < p_pass.missing.size(); ++i) {
+		requests.push_back(_avt_page_request(*p_pass.missing[i]));
 		if (requests.size() == 32) { break; }
 	}
+	if (requests.empty()) { return; }
 	_vt.vt_page_pipeline->prime(requests, _vt.vt_source_snapshot);
+	int64_t insert_us = 0;
+	int64_t wake_us = 0;
+	int inserted = 0;
+	int wakes = 0;
+	_vt.vt_page_pipeline->get_prime_stats(insert_us, wake_us);
+	_vt.vt_page_pipeline->get_prime_counts(inserted, wakes);
+	_vt.avt_sector_stats[p_refill ? "refill_insert_ms" : "prime_insert_ms"] = double(insert_us) / 1000.0;
+	_vt.avt_sector_stats[p_refill ? "refill_wake_ms" : "prime_wake_ms"] = double(wake_us) / 1000.0;
+	_vt.avt_sector_stats[p_refill ? "refill_inserted" : "prime_inserted"] = inserted;
+	_vt.avt_sector_stats[p_refill ? "refill_wakes" : "prime_wakes"] = wakes;
 }
 
 // Publishes one prepared page: allocates the slot, writes the payload, queues the
@@ -1183,9 +1225,12 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 			return false;
 		}
 	}
+	const uint64_t request_done = Time::get_singleton()->get_ticks_usec();
 	_invalidate_vt_slot(slot);
 	const uint64_t payload_start = Time::get_singleton()->get_ticks_usec();
 	r_pass.allocation_us += payload_start - allocation_start;
+	r_pass.request_us += request_done - allocation_start;
+	r_pass.invalidate_us += payload_start - request_done;
 	Ref<Image> payload = prepared.payload;
 	if (payload.is_null() || !_vt.surface_vt->write_page(slot, payload)) {
 		_vt.surface_vt->release_page(p_page.owner, p_page.mip, p_page.x, p_page.y);
@@ -1209,7 +1254,10 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 	// residency a pooled view is allowed to hold, so sharing pressure still evicts down to the
 	// last page.
 	const int floor = MIN(1, p_max_pages);
-	for (const Terrain3DAVTPageRequest *page : r_pass.missing) {
+	// The walk resumes where the last one stopped rather than restarting: a page already
+	// attempted is already in the source queue or already resident, so re-attempting it only
+	// re-polls the answer it gave, and the pages behind it are the ones still owed.
+	for (; r_pass.missing_next < r_pass.missing.size(); ++r_pass.missing_next) {
 		// Throughput is bounded by the real page budget, not a CPU timer that can
 		// collapse this pipeline to one page per frame while the camera is moving.
 		if (r_pass.produced >= p_max_pages) { break; }
@@ -1217,7 +1265,7 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 		// the remaining pages are produced by the ticks that follow, and the view they are
 		// missing from is shaded from the source in the meantime.
 		if (r_pass.produced >= floor && _vt_tick_expired()) { break; }
-		r_pass.produced += _avt_produce_page(r_pass, *page) ? 1 : 0;
+		r_pass.produced += _avt_produce_page(r_pass, *r_pass.missing[r_pass.missing_next]) ? 1 : 0;
 	}
 }
 
@@ -1248,6 +1296,7 @@ void Terrain3D::_avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max
 // so the next plan with the same residency can be reused.
 void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	const auto pool = _vt.surface_vt->get_page_pool();
+	const uint64_t finish_start = Time::get_singleton()->get_ticks_usec();
 	_vt.avt_sector_stats["prefetched"] = r_pass.prefetched;
 	// Visible-miss diagnostics: pages the current image samples, of which how many are
 	// waiting on production and how many have already been retried past their window.
@@ -1264,6 +1313,12 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	_vt.avt_sector_stats["sampled_pages"] = _vt.avt_sampled_pages;
 	_vt.avt_sector_stats["produce_source_wait"] = r_pass.source_wait;
 	_vt.avt_sector_stats["produce_slot_wait"] = r_pass.slot_wait;
+	// This function is the largest stage of a peak pass, and it is all bookkeeping. The three
+	// timings below are what tells which half of it - the String-keyed writes of the statistics,
+	// the producer queries under their lock, or releasing the pass's pins.
+	auto since = [](const uint64_t p_from) { return double(Time::get_singleton()->get_ticks_usec() - p_from) / 1000.0; };
+	_vt.avt_sector_stats["stats_ms"] = since(finish_start);
+	const uint64_t worker_start = Time::get_singleton()->get_ticks_usec();
 	{
 		// Worker throughput: pages the source threads assembled and the worker time they
 		// spent, which is what separates "the workers cannot keep up" from "the pool will
@@ -1284,12 +1339,18 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 		_vt.avt_sector_stats["worker_ms"] = double(usec) / 1000.0;
 		_vt.avt_sector_stats["worker_queue"] = queued;
 	}
+	_vt.avt_sector_stats["worker_stats_ms"] = since(worker_start);
 	r_pass.produced += r_pass.prefetched;
+	const uint64_t protect_start = Time::get_singleton()->get_ticks_usec();
 	for (int slot : r_pass.protected_slots) { _vt.surface_vt->protect_page(slot, false); }
+	_vt.avt_sector_stats["protect_ms"] = since(protect_start);
+	_vt.avt_sector_stats["pins_released"] = int(r_pass.protected_slots.size());
 	const uint64_t commit_start = Time::get_singleton()->get_ticks_usec();
 	_vt.surface_vt->commit();
-	_vt.avt_sector_stats["commit_ms"] = double(Time::get_singleton()->get_ticks_usec() - commit_start) / 1000.;
+	_vt.avt_sector_stats["commit_ms"] = since(commit_start);
 	_vt.avt_sector_stats["allocation_ms"] = double(r_pass.allocation_us) / 1000.;
+	_vt.avt_sector_stats["request_ms"] = double(r_pass.request_us) / 1000.;
+	_vt.avt_sector_stats["invalidate_ms"] = double(r_pass.invalidate_us) / 1000.;
 	_vt.avt_sector_stats["payload_ms"] = double(r_pass.payload_us) / 1000.;
 	_vt.avt_sector_stats["queue_ms"] = double(r_pass.queue_us) / 1000.;
 	_vt.surface_vt->set_allocation_budget(-1);

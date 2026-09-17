@@ -86,6 +86,7 @@ const bool _surface_svt_enabled = false;
 const bool _svt_feedback = false;
 const bool _surface_material_enabled = false;
 const bool _surface_material_required = false;
+const int _surface_vt_page_fade_frames = 0;
 #else
 uniform bool _surface_vt_enabled = false;
 uniform int _surface_vt_region_size = 256;
@@ -95,6 +96,14 @@ uniform int _surface_vt_pages_per_axis = 4;
 uniform int _surface_vt_max_local_mip = 2;
 uniform int _surface_vt_indirection_size = 256;
 uniform highp sampler2D _surface_vt_indirection : filter_nearest, repeat_disable;
+// Page-arrival fade: one byte per physical slot, holding how far a page has come in since its
+// content landed (0 = only the level it replaced, 1 = the page itself). Indexed by the slot the
+// indirection lookup already decoded, so it costs one extra fetch and no address arithmetic. A
+// page that snaps in is a rectangular step in the image - which is what a fast turn makes
+// obvious, because the view then refines in the page grid it is built from.
+uniform highp sampler2D _surface_vt_page_fade : filter_nearest, repeat_disable;
+// How long that ramp lasts, in ticks. 0 disables the fade and every page is settled at once.
+uniform int _surface_vt_page_fade_frames = 0;
 uniform highp sampler2DArray _surface_vt_atlas : repeat_disable;
 // Layer -> virtual page block origin inside the indirection, or (-1, -1) when that
 // sector has no block. Indexed by the layer slot the chunk directory returns.
@@ -312,6 +321,15 @@ R"(
 // `p_world` carries the terrain height of the fragment so the distance matches the one
 // the demand pass measured for the page: a page is produced for a level by its distance
 // from the camera, and this is the distance of the fragment inside it.
+// How far a page has come in since its content landed: 0 while it is only the level it
+// replaced, 1 once it is itself. The value is per physical slot, so a page that has settled
+// costs one fetch and answers 1, and the whole mechanism disappears when the frame count is 0.
+float surface_vt_page_fade(int p_slot) {
+	if (_surface_vt_page_fade_frames <= 0 || p_slot < 0 || p_slot == 65535) { return 1.0; }
+	if (p_slot >= textureSize(_surface_vt_page_fade, 0).x) { return 1.0; }
+	return texelFetch(_surface_vt_page_fade, ivec2(p_slot, 0), 0).r;
+}
+
 float surface_svt_distance(vec2 p_world) {
 	return length(vec3(p_world.x, v_vertex.y, p_world.y) - v_camera_pos);
 }
@@ -416,6 +434,11 @@ bool surface_svt_material_slot(int slot, vec2 offset, int page_size, int border,
 // fallback switch asks for the coarser walk. A page whose material is still in production
 // (`params.a < 0.99`) is a miss in both modes, because the walk would otherwise render an
 // arbitrary younger level for a page that is simply late.
+//
+// A level whose page is still coming in is crossfaded against the next resident level, which
+// is the level it is replacing: the first resident level is the fine one, and the walk only
+// continues past it while that page's fade is incomplete. With the fade off, the first
+// resident level is returned directly, exactly as before.
 bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
 	if (_surface_svt_enabled) {
 		ivec2 page = ivec2(floor(world / _surface_svt_page_world));
@@ -424,12 +447,45 @@ bool surface_svt_material_sample(vec2 world, out material r_mat, out vec3 r_norm
 			int start_mip = surface_svt_mip_for_distance(surface_svt_distance(world));
 			int last_mip = start_mip;
 			if (_svt_feedback) { last_mip = _surface_svt_max_mip; }
-			for (int mip = start_mip; mip <= last_mip; mip++) {
+			// One level past the window, so a fade has something to blend against even when the
+			// distance rule's level is the coarsest the walk would otherwise try.
+			int walk_end = last_mip;
+			if (_surface_vt_page_fade_frames > 0 && last_mip < _surface_svt_max_mip) { walk_end = last_mip + 1; }
+			bool have = false;
+			float blend = 0.0;
+			material blended;
+			vec3 blended_normal;
+			for (int mip = start_mip; mip <= walk_end; mip++) {
 				ivec2 coord = virtual_page >> mip;
 				int level_size = max(1, _surface_svt_indirection_size >> mip);
 				int slot = int(texelFetch(_surface_svt_indirection, coord, mip).r + 0.5);
 				vec2 offset = fract(world / (_surface_svt_page_world * float(1 << mip)));
-				if (surface_svt_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, r_mat, r_normal)) { return true; }
+				material sample_mat;
+				vec3 sample_normal;
+				if (!surface_svt_material_slot(slot, offset, _surface_svt_page_size, _surface_svt_page_border, sample_mat, sample_normal)) { continue; }
+				if (!have) {
+					// The first resident level is the one being faded in.
+					blended = sample_mat;
+					blended_normal = sample_normal;
+					have = true;
+					blend = 1.0 - surface_vt_page_fade(slot);
+					if (blend <= 0.001) { break; }
+					continue;
+				}
+				// The next resident level is what it replaces.
+				blended.albedo_height = mix(blended.albedo_height, sample_mat.albedo_height, blend);
+				blended.normal_rough = mix(blended.normal_rough, sample_mat.normal_rough, blend);
+				blended.normal_map_depth = mix(blended.normal_map_depth, sample_mat.normal_map_depth, blend);
+				blended.ao = mix(blended.ao, sample_mat.ao, blend);
+				blended.ao_affect = mix(blended.ao_affect, sample_mat.ao_affect, blend);
+				blended_normal = mix(blended_normal, sample_normal, blend);
+				blend = 0.0;
+				break;
+			}
+			if (have) {
+				r_mat = blended;
+				r_normal = blended_normal;
+				return true;
 			}
 		}
 	}
@@ -474,7 +530,8 @@ R"(
 // Select by pixel footprint across local mips and the world hierarchy.
 // Strict by default; optional coarse recovery stays within the AVT hierarchy.
 bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out material result, out vec3 result_normal,
-		out float texel_world, out bool last_mip) {
+		out float texel_world, out float fade, out bool last_mip) {
+	fade = 1.0;
 	for (int level = 0; level <= _avt_root_level; ++level) {
 		float span = 64.0 * float(1 << level);
 		// The first world parent has a fixed world footprint. Its texel size
@@ -507,6 +564,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 				return false;
 			}
 			texel_world = base_texel * float(1 << mip);
+			fade = surface_vt_page_fade(slot);
 			last_mip = level == _avt_root_level && mip == top;
 
 			return true;
@@ -517,17 +575,30 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 
 bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out vec3 r_normal) {
 	float fine_texel;
+	float fine_fade;
 	bool last_mip;
-	if (!avt_resolve(world, pixel_world, 0.0, r_mat, r_normal, fine_texel, last_mip)) { return false; }
-	// Normal mip interpolation only: no arrival or missing-neighbour blending.
+	if (!avt_resolve(world, pixel_world, 0.0, r_mat, r_normal, fine_texel, fine_fade, last_mip)) { return false; }
+	// The blend is the pixel footprint's mip interpolation, and - while a page is still coming in
+	// - the level that page replaced. A page that has just arrived is resolved at full weight for
+	// its own texels, so without the second term it appears as a rectangular step in the image;
+	// with it the view sharpens. The coarser level is resolved for this even when the footprint
+	// alone would not ask for it, and the arrival never outweighs the footprint blend.
 	// Clamp the mip range at its actual end, independently of page residency.
-	if (last_mip || pixel_world <= fine_texel) { return true; }
+	float arrival = 1.0 - fine_fade;
+	if (last_mip || (pixel_world <= fine_texel && arrival <= 0.001)) { return true; }
 	material coarse;
 	vec3 coarse_normal;
 	float coarse_texel;
-	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, coarse, coarse_normal, coarse_texel, last_mip)) { return false; }
-	float mip_weight = clamp(log2(max(pixel_world / fine_texel, 1.0)) / log2(coarse_texel / fine_texel), 0.0, 1.0);
-	float weight = mip_weight;
+	float coarse_fade;
+	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, coarse, coarse_normal, coarse_texel, coarse_fade, last_mip)) { return true; }
+	// The coarser resolve can land on the same page when nothing coarser is resident; there is
+	// then nothing to fade against and the sharp page stands.
+	if (coarse_texel <= fine_texel) { return true; }
+	float weight = arrival;
+	if (pixel_world > fine_texel) {
+		float mip_weight = clamp(log2(max(pixel_world / fine_texel, 1.0)) / log2(coarse_texel / fine_texel), 0.0, 1.0);
+		weight = max(mip_weight, arrival);
+	}
 	r_mat.albedo_height = mix(r_mat.albedo_height, coarse.albedo_height, weight);
 	r_mat.normal_rough = mix(r_mat.normal_rough, coarse.normal_rough, weight);
 	r_mat.normal_map_depth = mix(r_mat.normal_map_depth, coarse.normal_map_depth, weight);

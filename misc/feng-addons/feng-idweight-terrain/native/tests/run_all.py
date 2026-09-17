@@ -33,7 +33,18 @@ FIXTURE_PATTERN = re.compile(r"^FIXTURE=(.+)$", re.MULTILINE)
 
 # name -> (runner script, extra arguments). Every *_runner.py is picked up
 # automatically; this table only documents the extra argument sets.
-EDITOR_DOCK_TESTS = ("dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle")
+EDITOR_DOCK_TESTS = ("dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle", "slider")
+
+# Modes of a multi-mode runner. Discovery without extra arguments runs only a runner's *default*
+# mode, and `vt_adaptive_runner.py` is one entry point for fourteen scenarios: it takes a flag per
+# scenario and otherwise always runs `vt_adaptive.gd`. Every scenario it can select is a test script
+# of its own, so a full regression that skipped the flags left thirteen scripts - camera rotation,
+# source blending, 10 km sectors, metric density, region ownership, strict filtering, async pages,
+# navigation, residency, instancer, CDLOD, profile and full sectors - with no way to be run at all,
+# and a fourth (`vt_resolution_controls.gd`, which the runner executes after a successful scenario)
+# with it.
+ADAPTIVE_TESTS = ("scale", "metric", "ownership", "filtering", "async-pages", "navigation",
+                  "residency", "rotation", "instancer", "blend", "cdlod", "profile", "sectors")
 
 
 def discover() -> list[tuple[str, list[str]]]:
@@ -41,6 +52,8 @@ def discover() -> list[tuple[str, list[str]]]:
     tests: list[tuple[str, list[str]]] = []
     for test in EDITOR_DOCK_TESTS:
         tests.append((f"editor_dock:{test}", ["editor_dock_runner.py", "--test", test]))
+    for mode in ADAPTIVE_TESTS:
+        tests.append((f"vt_adaptive:{mode}", ["vt_adaptive_runner.py", f"--{mode}"]))
     for runner in sorted(HERE.glob("*_runner.py")):
         if runner.name in {"editor_dock_runner.py", "run_all.py"}:
             continue

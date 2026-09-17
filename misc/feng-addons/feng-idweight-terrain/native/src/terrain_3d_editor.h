@@ -82,9 +82,78 @@ private:
 	Dictionary _undo_data; // See _get_undo_data for definition
 	uint64_t _last_pen_tick = 0;
 
+	// The IdWeight R16 surface map is authored as raw bytes rather than through
+	// Image::set_pixelv(): one region texel is a whole density x density block, and
+	// set_pixelv() would decode and re-encode the packed word one component at a
+	// time. Image::get_data() hands back a copy-on-write view, so the bytes are
+	// cached while the brush stays inside one region and written back when it
+	// leaves. See _paint_control_texel().
+	struct SurfaceByteCache {
+		Image *image = nullptr;
+		Terrain3DRegion *region = nullptr;
+		PackedByteArray bytes;
+
+		void flush();
+		// Adopts p_map's bytes, flushing the previous region first. False when the
+		// map is not the R16 UNORM format the IdWeight contract requires.
+		bool adopt(const Ref<Terrain3DRegion> &p_region, Image *p_map);
+		// Writable first texel of the density x density block at p_pixel + p_block.
+		uint8_t *texel(const int p_width, const Vector2i &p_pixel, const int p_density,
+				const Vector2i &p_block = Vector2i());
+	};
+
+	// Everything _operate_map() reads out of the brush dictionary once, so the
+	// per-texel handlers can be plain functions instead of a 300 line double loop.
+	struct MapBrushOp {
+		MapType map_type = TYPE_MAX;
+		Vector2i region_size_v;
+		real_t region_size = 0.f;
+		real_t vertex_spacing = 1.f;
+		real_t brush_size = 0.f;
+		real_t strength = 0.f;
+		real_t height = 0.f;
+		real_t roughness = 0.f;
+		real_t gamma = 1.f;
+		real_t rotation = 0.f;
+		Color color;
+		Vector2 slope_range;
+		PackedVector3Array gradient_points;
+		PackedFloat32Array brush_mask;
+		Vector2i brush_mask_size;
+		bool texture_filter = false;
+		bool modifier_alt = false;
+		int margin = 0;
+		int asset_id = 0;
+		int pair_overlay_id = 0;
+		int pair_background_id = 0;
+		int pair_mode = 0;
+		int pair_weight_level = 8;
+	};
+
+	// What one brush texel decided, so the loop can act on it.
+	enum TexelResult {
+		TEXEL_WRITE, // r_dest holds the pixel to store
+		TEXEL_SKIP, // this texel is done, or was written by the handler itself
+		TEXEL_ABORT, // the whole operation cannot continue
+	};
+
 	void _send_region_aabb(const Vector2i &p_region_loc, const Vector2 &p_height_range = V2_ZERO);
 	Ref<Terrain3DRegion> _operate_region(const Vector2i &p_region_loc);
 	void _operate_map(const Vector3 &p_global_position, const real_t p_camera_direction);
+	TexelResult _paint_height_texel(const MapBrushOp &p_op, const Vector3 &p_cursor,
+			const Vector3 &p_brush_position, const Vector2 &p_brush_offset, const real_t p_brush_alpha,
+			const real_t p_src, Terrain3DRegion *p_region, Terrain3DData *p_data,
+			Vector3 &r_edited_position, Color &r_dest);
+	TexelResult _paint_control_texel(const MapBrushOp &p_op, Terrain3DData *p_data,
+			const Vector3 &p_brush_position, const real_t p_brush_alpha,
+			const Ref<Terrain3DRegion> &p_region, Image *p_map, const Vector2i &p_map_pixel,
+			const Color &p_src, SurfaceByteCache &r_surface, Color &r_dest);
+	TexelResult _paint_color_texel(const MapBrushOp &p_op, Terrain3DData *p_data,
+			const Vector3 &p_brush_position, const real_t p_brush_alpha,
+			const Ref<Terrain3DRegion> &p_region, const Vector2i &p_map_pixel, const Color &p_src,
+			Color &r_dest);
+	void _finish_map_operation(const MapBrushOp &p_op, Terrain3DData *p_data,
+			const int p_regions_added_removed, const AABB &p_edited_area, SurfaceByteCache &r_surface);
 	MapType _get_map_type() const;
 	bool _is_in_bounds(const Point2i &p_pixel, const Point2i &p_size) const;
 	Vector2 _get_uv_position(const Vector3 &p_global_position, const int p_region_size, const real_t p_vertex_spacing) const;

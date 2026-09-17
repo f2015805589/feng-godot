@@ -164,6 +164,12 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_avt_feedback", _terrain->get_avt_feedback());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
+	// Page-arrival fade: one texel per physical slot, indexed by the slot the indirection
+	// already decoded. A frame count of 0 is the shader's own early out, so an unbound texture
+	// is still correct - but it must be a real one, or the sampler reads nothing.
+	RID page_fade = _terrain->get_vt_page_fade_rid();
+	RS->material_set_param(p_material, "_surface_vt_page_fade", page_fade.is_valid() ? page_fade : _generated_dummy_2d.get_rid());
+	RS->material_set_param(p_material, "_surface_vt_page_fade_frames", _terrain->get_vt_page_fade_frames());
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
 	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
 	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();

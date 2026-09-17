@@ -11,10 +11,209 @@ python misc/feng-addons/feng-idweight-terrain/native/tests/run_all.py
 It builds each test's isolated fixture, prints one `PASS`/`FAIL` line per test
 with the runner's own `PASS`/`REGRESSION`/`ERROR:` lines under it, deletes the
 fixture afterwards, and ends with a summary table plus
-`n/29 passed (driver ...)`. Add `--json bin/out.json` to keep the result for a
+`n/53 passed (driver ...)`. Add `--json bin/out.json` to keep the result for a
 before/after comparison, `--only vt_` to run a subset, `--keep` to keep the
 fixtures for inspection, and `--prune-only` to delete fixtures leaked by earlier
 runs (they are full addon copies, about 27 MB each).
+
+**Discovery has to name a multi-mode runner's modes.** `discover()` picks up every `*_runner.py`,
+but a runner that takes a flag per scenario only runs its *default* scenario when it is invoked
+without one — and `vt_adaptive_runner.py` is one entry point for fourteen. Running it bare therefore
+ran `vt_adaptive.gd` and nothing else, which left thirteen scripts with no way to be run at all:
+camera rotation, source blending, 10 km sectors, metric density, region ownership, strict filtering,
+async pages, navigation, residency, instancer, CDLOD, profile and full sectors. The suite was 39
+tests where it should have been 52. One more was unreachable for a second reason: editor_slider.gd was not among editor_dock_runner.py --test choices and had no marker in its table, so nothing could run it either; both now name it, and the suite is 53. `run_all.py`'s `ADAPTIVE_TESTS` table now lists them, and
+`EDITOR_DOCK_TESTS` does the same for the editor dock's seven. `editor_paint.gd` was added later and
+brings the suite to 54; it is a plain `*_runner.py`, so `discover()` picks it up directly.
+
+**`editor_paint.gd`, and why it exists.** `region_slots.gd`, `texture_layers.gd`, `vt_density.gd` and
+`vt_render.gd` all drive `start_operation() → operate() → stop_operation()`, but every one of them
+paints with the `TEXTURE` tool only. `Terrain3DEditor::_operate_map()` dispatches on the map type and
+writes four different representations — RF height floats, the packed control word, the IdWeight R16
+surface bytes, and the RGBA colour map — so those four tests left the height, colour and legacy-control
+branches with no headless coverage at all. This test drives all twelve tool/operation pairs the toolbar
+can emit, each on its own region, asserts the visible effect of each (an exact height, the set or
+cleared control bit, the written material pair), and pins the region's height + control + colour +
+surface bytes with an MD5 digest; the digest is what makes it a gate for refactoring rather than just a
+smoke test.
+
+Two configurations matter more than the others, and both were found the hard way. `AUTOSHADER + ADD`
+proves nothing, because a blank region's control map is `COLOR_CONTROL` and the autoshader bit already
+starts set — the phase has to clear it. And a digest at the default `surface_density` of 1 cannot see
+the density-replication loop, which is guarded by `density > 1`, so a phase at `surface_density = 2`
+reads the painted region texel's whole block back and requires all of it to match.
+
+**Known flakes, with their history in `bin/`.** `vt_pressure` asserts `settings.shared_pool`
+and flips on the unmodified binary. `editor_dock:setup` — `Add Region did not expand into empty
+space with background disabled` — is recorded as `fail` in `terrain-regression.json`,
+`terrain-regression-final.json` and `terrain-avt-after.json`, and as `pass` in
+`terrain-avt-final-suite.json` and `terrain-avt-targeted-reruns.json`. Neither is a signal about
+a library change; both are worth re-reading from the recorded runs before they are believed.
+t_pressure asserts settings.shared_pool and flips on the unmodified binary, and editor_dock:setup (\Add Region did not expand into empty space with background disabled\) is recorded as \\ail\\ in \	errain-regression.json\, \	errain-regression-final.json\ and \	errain-avt-after.json\ and as \\pass\\ in \	errain-avt-final-suite.json\ and \	errain-avt-targeted-reruns.json\. Neither is a signal about a library change; both are worth re-reading from the recorded runs before they are believed.
+
+**`vt_turn_budget` is a pre-existing, deterministic failure — and its cost is one phase, not three.**
+It has failed in *every* recorded run in `bin/`, from `terrain-regression.json` (09-15 02:51) through
+`vt-suite-srgb-idle.json` (09-17 00:49), including runs taken before this pass touched anything. It is
+not a flake and not a regression; it is an unmet budget that has been unmet the whole time.
+
+Read from one run, the four sweeps separate cleanly:
+
+| sweep | `avt` mean | `avt` peak | `svt` mean | `topup`/`bake` mean | fade mean |
+| --- | --- | --- | --- | --- | --- |
+| warm | 0.1226 | 0.8930 | 0.0272 | 0.0001 | 0.0146 |
+| slow | 0.1299 | 0.6350 | 0.0249 | 0.0001 | 0.0146 |
+| faronly | 0.0010 | 0.0030 | 0.0425 | 0.0003 | 0.0007 |
+| cold | 0.6654 | 2.0760 | 0.0338 | 0.0003 | 0.0145 |
+
+All figures are milliseconds, from the debug template, which runs about 1.5x the release one. So:
+
+* **Only the near field (`avt`) is over budget in steady state.** 0.12–0.13 ms warm/slow is ~0.08–0.09
+  in release, which is inside 0.10; the cold sweep at 0.67 ms (≈0.44 release) is the real failure, and
+  it is the one a fast camera turn actually hits.
+* **`svt` does not exceed 0.1 ms per sweep.** Its means are 0.025–0.043 ms. The alarming number that
+  looks like it does — `svt_stats.pass_ms`, 8.0 ms — is the far field's worst pass *since startup*, and
+  it is only rewritten when a pass beats the record, so it is byte-identical in all four reports and in
+  every run that follows. `svt_worst_frames_ago` is printed beside it for exactly this reason: it reads
+  420–901, i.e. the 8 ms pass happened during the settle phase, hundreds of frames before the sweep
+  being reported. `report()` now prints that age; without it the number reads as the sweep's cost.
+* **`topup` is a reported zero.** The phase was removed and its key kept so consumers do not break, so
+  `phases["topup"]` is always 0. It cannot be over any budget.
+
+Where the cold-turn near-field cost goes, from the same run's `avt_sector_stats`: `produce_ms` 0.637,
+`cpu_update_ms` 0.916, `retain_ms` 0.512, against 0.001 for `retain_ms` warm. `_avt_retain_visible()`
+early-outs unless the plan was reinstalled or the prefetch switch flipped, so a 500x jump is the plan
+changing on every tick, and the stage is then dominated by `_lock_queue()`, the wait for the source
+queue's mutex, rather than by its own 250 lookups. The workers are *not* holding that mutex while
+assembling payloads — `run()` releases it before `produce()` — so the wait is contention on a queue
+being hammered by 154 dispatches, not one long critical section.
+
+The same run also shows the near field never converging even warm: `visible_plan_pages` 249 against
+`avt_slots` 128, with `visible_missing_pages` 239, `visible_late_pages` 214 and `visible_late_worst_ms`
+2219. The plan is roughly twice the atlas, so half of what the view asks for can never be resident, and
+that is why `a settled view kept missing-page diagnostics` (172 pixels) and `a rebuilt pool never
+recovered` (269) fail alongside the budget.
+
+**The far field's protection walk is the bounded way in, and it is deliberately uncut today.** The
+detail loop in `_update_visible_svt()` carries a comment saying it is *not* cut on the phase deadline,
+because visiting a page is what re-marks it as demanded: a page the loop skips keeps its slot but loses
+the mark, the pool evicts it, and the next tick pays to request, invalidate and re-queue it. That loop is
+what reaches `detail_ms` 6.38 of the 7.98 ms worst pass. The demand mark already has a grace window —
+`slot_demand_epoch` protects a slot demanded within one epoch of the current one
+(`terrain_3d_virtual_texture.cpp`) — so the amortisation is reachable, but it needs a *resumable* walk
+cursor to go with it: widening the grace alone does nothing while the walk still completes every tick,
+and cutting the walk without a cursor starves whichever slice sorts last. That is a design change to the
+pool's eviction policy and it needs the whole VT suite behind it, so it is recorded here as the next step
+rather than attempted blind.
+
+**The plan is sized by the distance rule and the atlas by the page budget, and they do not reconcile.**
+This is why the near field never converges, warm or cold, and it is measurable in one run without
+reading any planner code:
+
+| sweep | `visible_plan_pages` | `avt_slots` | `visible_missing_pages` | `avt_ready_slots` |
+| --- | --- | --- | --- | --- |
+| warm | 249 | 128 | 239 | 128 |
+| cold | 270 | 624 | 147 | 624 |
+
+The atlas grows 128 → 624 (the cold phase raises `vt_page_border`, which grows `page_count` to 1024
+and the near field's share to 624) and the plan barely moves, 249 → 270. So the plan is a function of
+`surface_vt_distance` and the sector geometry, the atlas is a function of `vt_pages_per_update` and the
+border, and nothing makes the first fit inside the second. At the test's settings — `page_count` 256,
+`avt_share = vt_remaining / 2` = 128 slots against a 256 m near radius in a 768 m world — roughly half
+of everything the view asks for can never be resident at once.
+
+`_avt_classify_plan()` walks the whole plan every pass: `lookup_page_exact`, `protect_page`,
+`_vt_note_page_readiness`, `_vt_page_production_stale` and `pool->mark_demanded()` per entry. That walk
+is O(plan), and so is `r_pass.missing`, so the classify/retain/prime stages all inherit the mismatch
+directly. A plan bounded by atlas capacity would shrink every one of them at the same time as it made
+the resident set able to settle.
+
+It is deliberately **not** changed here, because the three ways out are a product decision and they
+trade against each other:
+
+* give the near field more of the pool (the far field uses 27 of its 128 in this scene, so there is
+  room) — but the far field's share is what keeps a not-yet-baked far page from being re-requested and
+  re-assembled on the main thread, which is the failure the comment above `avt_share` records;
+* shorten `surface_vt_distance` so the plan fits — fewer near-field metres, more far field;
+* bound the plan to capacity and let the coarse pyramid cover the remainder — the least invasive, and
+  the only one that needs no new tuning constant, but it changes which level a fragment falls back to.
+
+Whichever is picked, the settled-view assertions (`a settled view kept missing-page diagnostics`,
+`a rebuilt pool never recovered`) are the ones that should start passing, and they are the same failure
+the reported flicker is: a view that keeps re-requesting pages it cannot hold shows blocks that never
+resolve, however long the fade is.
+
+**And wiring them up exposed a baseline that cannot be compared with.** Six of the modes fail here —
+`metric`, `filtering`, `ownership`, `sectors`, `scale` and `blend` — and the obvious reading, that
+this pass regressed them, is **wrong**. Three different libraries fail them identically — the recorded
+baseline's commit, `HEAD`, and this pass's working tree. Same tests, same runner, same engine, only
+the library differs:
+
+| mode | `1f98bf6` library | `HEAD` library | current library |
+| --- | --- | --- | --- |
+| `metric` | `ready physical page must have exact target texels/metre` | same | same |
+| `filtering` | `exercise multiple ready material pages` | same | same |
+| `ownership` | `far edge approaches SVT smoothly` | same | same |
+| `sectors` | `AVT coverage at negative/positive world coordinate` | same | same |
+| `scale` | `moving camera recomputes demand` | same | same |
+| `blend` | `AVT matches direct triangle gradient` | same | same |
+| `navigation` | assertions pass | assertions pass | assertions pass; the engine prints one `_grab_camera` warning that the runner counts as an error |
+| `rotation`, `residency` | pass | pass | pass |
+
+`async-pages`, `cdlod`, `instancer` and `profile` pass with the current library; they were not re-run
+against the other two, so the table claims nothing about them.
+
+The baseline those six were compared against — `bin/terrain-avt-supplemental-final-results.json`,
+where all ten pass — was recorded at **2026-09-16 23:24** with the repository at `1f98bf645b`. The
+timeline around it is the whole explanation:
+
+| when | what |
+| --- | --- |
+| 2026-09-16 18:03 | `72e12bab69 更新压缩、引擎侧内容` — touches `servers/rendering/rendering_device*` |
+| 2026-09-16 19:33 | `1f98bf645b terrain更新` — the commit the baseline was recorded at |
+| 2026-09-16 23:24 | the baseline run |
+| 2026-09-17 **00:02** | **the engine binary is rebuilt** |
+| 2026-09-17 01:12 | `df74a1cbaf 优化` — addon files only, no engine file |
+
+The addon library is not the variable: `df74a1c` touches no engine file, and the *oldest* library
+tried (`1f98bf6`) fails exactly what the newest does. The engine binary is: it was rebuilt half an
+hour after the baseline was recorded, and the engine's own last change before that touched the
+rendering device — where the virtual-texture API the addon is built against lives. The six modes
+measure an engine/adapter contract that moved, and **no addon change can move them**; the recorded
+results are not a gate for anything built with the current engine.
+
+Building a comparison library is a copy of `native/` in a sibling directory (with `godot-cpp`
+junctioned) whose `src/` is written from `git show <commit>:…`, so the working tree is never touched.
+That is what distinguishes "the suite never ran this" from "this pass broke it", and it is why the
+table above is a measurement rather than a reading of one JSON file.
+
+`bin/terrain-adaptive-baseline.json` is the same thirteen modes re-recorded on the current engine, so
+that the next pass has something comparable to diff. Its six failures are the expected state of this
+environment, not a target: a diff against it reports **changes**, which is what a gate needs.
+
+Two hypotheses were tested and **eliminated** on the way, both cheap and neither kept:
+
+* that the page-arrival fade leaves the view mid-ramp when these tests take their shot, so that
+  "settled" (production stopped, nothing pending) no longer means "showing the pages". Turning the
+  fade off from the test side (`terrain.vt_page_fade_frames = 0`, which makes
+  `surface_vt_page_fade()` return 1.0 immediately) changed none of the failures; making
+  `vt_metric_density`'s and `vt_sectors`' `settle()` wait for `vt_page_fade_active_slots == 0` changed
+  none either.
+* that the prime-skip policy (`SOURCE_QUEUE_REFILL_ABOVE`) keeps coarse requests out of the queue.
+  Setting it to 0 changed none of the failures.
+
+**One real deviation from `HEAD` came out of the bisect**, in the tick's budget split:
+
+```cpp
+// HEAD
+avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
+// this pass, before the fix
+const int avt_share = MAX(1, vt_remaining / 2);
+```
+
+With the far field disabled the near field is the only consumer of the page budget, and `HEAD` gave it
+the whole of it. Losing the conditional halved how many pages a view filled in per tick whenever SVT
+was off — which is the configuration four of these six modes run in. The conditional is restored; the
+tick's comment now says why it is load-bearing.
 
 To compare two runs:
 
@@ -524,14 +723,18 @@ next 150 and asserts the phases: the near field, the far field, the top-up and t
 requires that a settled tick produces nothing (`produced == 0`), that all 150 are recognised as
 idle, and that each phase stays under a stated mean budget.
 
-The three costs it exists for, all of which were paid per page on every still tick:
+The costs it exists for:
 
-* **The top-up repeated the near field's whole idle pass.** `_produce_sector_avt_pages()` runs twice
-  per tick — the near field's share, then the top-up with the budget the far field did not use — and
-  its idle gate does not read the budget, so the second call re-walked every resident slot, wrote
-  the same statistics and took its own `Time` call to reach the same "nothing to do". The near field
-  now records that verdict and the top-up skips while the pool's residency is still the one behind
-  it. Measured: 0.0004 ms per settled tick, against 0.021 ms for the near field that produced it.
+* **The top-up repeated the near field's whole pass.** `_produce_sector_avt_pages()` used to run
+  twice per tick — the near field's share, then a `vt_topup` phase with the budget the far field did
+  not use. The second call re-derived the same classification, re-retained the same source queue,
+  re-primed the same workers and republished the same statistics to buy at most one more page, and on
+  a moving view that was about half a millisecond a tick — more than all the page production it paid
+  for. The tick now runs the near field once with half the page budget and the far field with
+  whatever the near field did not spend, so `vt_topup` exists as a reported phase that is always
+  zero. The tiers keep that order: the near field's pass publishes the near-field addressing state
+  the material reads, and running the far field first was measured to turn the missing-page
+  diagnostic on before the source array had stopped serving the far range (`vt_adaptive`).
 * **Readiness was asked one page at a time.** The near field verifies every resident page before it
   calls itself settled, and the far field verifies its protected roots and its chosen detail set;
   each of those asked the producer per slot, which is a mutex per page. Both now ask once for the
@@ -543,12 +746,314 @@ The three costs it exists for, all of which were paid per page on every still ti
   dictionary write per value per frame is the largest thing a still view had left. A run of idle
   ticks now publishes them once.
 
-Measured with 99 resident near pages and 20 protected far roots: near field 0.021 ms, far field
-0.038 ms, top-up 0.0004 ms, service 0.008 ms, whole section 0.069 ms per tick. The budgets are
-means (`0.05` / `0.08` / `0.005` / `0.15` ms) rather than peaks, because a peak on this machine
-carries engine noise. The per-slot form of the near-field loop was measured against the batched one
-at 0.0233 against 0.0214 ms, so on a small resident set that batch is a shape fix rather than a
-large win — the top-up and the far field are what move the number.
+Measured with 99 resident near pages and 20 protected far roots: near field 0.020 ms, far field
+0.033 ms, top-up 0.0001 ms, service 0.005 ms, whole section 0.058 ms per tick (near-field peak
+0.045 ms, far-field peak 0.054 ms). The budgets are means (`0.05` / `0.08` / `0.005` / `0.15` ms)
+rather than peaks, because a peak on this machine carries engine noise. The per-slot form of the
+near-field loop was measured against the batched one at 0.0233 against 0.0214 ms, so on a small
+resident set that batch is a shape fix rather than a large win — the single production pass is what
+moves the number.
+
+## What a moving view costs, per phase
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_turn_budget_runner.py --driver vulkan
+```
+
+`vt_turn_budget.gd` sweeps the camera a full revolution at 6° per frame and reports each phase of the
+VT section as a **peak and a mean**, because a phase is what a profiler attributes a peak to and the
+mean is what a budget should be argued from. On this machine a peak can be the wall-clock reading of a
+phase the main thread was descheduled in, which says nothing about what the phase costs: the near
+field's peak and mean differ by 6×. `vt_frame_budget_ms` is re-armed at the start of every phase, so
+it bounds one pass rather than the whole section.
+
+**The numbers below are from the debug template, and it measures about 1.5× the release one.** The
+same test run against the release library — by pointing a fixture's `windows.debug.x86_64` entry at
+`libfeng-idweight-terrain.windows.release.x86_64.dll` — reads:
+
+| phase mean | debug template | release template |
+| --- | --- | --- |
+| service | 0.0065 | 0.0073 |
+| **near field (`vt_avt`)** | **0.122** | **0.080** |
+| far field (`vt_svt`) | 0.026 | 0.031 |
+| top-up (`vt_topup`) | 0.0002 | 0.0002 |
+| page fade (`vt_fade`) | 0.015 | 0.017 |
+| whole section | — | 0.645 peak |
+
+So in the template a session ships, every phase averages inside the 0.1 ms budget. The debug numbers
+are recorded because they are what the suite reports, and because the debug/release gap is the reason
+its mean assertion for the near field cannot pass here. The release run also has no leftover
+diagnostic pixels after a warm *or* a cold sweep, where the debug runs leave 172–247 and 269.
+
+**The peak is a scheduling outlier, and the source worker count does not move it.** The obvious
+reading — that the near field's 0.7 ms peak is contention with its own page workers — is testable: run
+the sweep with one worker instead of four. Measured on the warm sweep, same scene:
+
+| `vt_page_workers` | near-field peak | near-field mean |
+| --- | --- | --- |
+| 1 | 0.744 ms | 0.116 ms |
+| 2 | 0.729 ms | 0.127 ms |
+| 4 (default) | 0.691 ms | 0.118 ms |
+
+One worker peaks *no lower* than four, so the peak is not the addon's own threads: it is the main
+thread not being on a core for part of one frame, with the engine's render thread and everything else
+on the machine for company. `wrapper_ms` says the same from the other side — everything the demand
+pass does before the sector planner measures 0.000 ms, so the phase-minus-`cpu_update_ms` gap is not a
+call.
+
+**But the peak is also one re-plan tick, and that is not scheduling.** The two are separable because
+the peak's own stages are kept in `avt_peak_stats`. A tick that re-plans costs, attributed:
+
+| stage | ms |
+| --- | --- |
+| planning chain — `scan` + `hierarchy` + `sync` + `publish` + `submit` | 0.126 |
+| `classify_ms` + `retain_ms` | 0.036 |
+| `prime_ms` + `refill_ms` (the source queue) | 0.15 – 0.27 |
+| `upload_ms` + `finish_ms` + `commit_ms` | 0.09 – 0.21 |
+| `wrapper_ms` | 0.000 |
+| **total** | **0.40 – 0.55** |
+
+That is what `cpu_update_ms` reports from inside the pass (0.44–0.58), and the phase peak is it plus
+the scheduler gap above. Most ticks reuse the plan and cost a tenth of it, which is why the *mean* is
+0.08 ms with the release library.
+
+So the 0.1 ms budget is met as a mean and **cannot be met by a re-plan tick in one frame**: 0.40 ms of
+attributed work is not removable, only movable. Staging the planning chain across frames — the part of
+it that *can* be staged is `scan` and `hierarchy`, because `sync`, `publish` and `submit` have to stay
+in one tick or the directory is published before the plan that fills it — would take the tick to about
+0.30 ms. Even taking the whole chain and the whole source queue out of the tick leaves the production
+and publish stages at 0.09–0.21 ms, at or over the budget. Meeting 0.1 ms per tick therefore means
+amortising a re-plan over several frames, which trades page-arrival latency for peak: a decision about
+the feature, not an optimisation of it. The mean is the number this phase can be held to.
+
+Measured on the warm sweep (every page the first view needs already resident), before and after:
+
+| phase | before (peak) | after (peak) | after (mean, debug) |
+| --- | --- | --- | --- |
+| service | 0.010 ms | 0.010 ms | 0.007 ms |
+| near field (`vt_avt`) | 1.132 ms | 0.69 ms | **0.122 ms** |
+| far field (`vt_svt`) | 0.072 ms | 0.039 ms | 0.028 ms |
+| top-up (`vt_topup`) | 0.800 ms | 0.001 ms | 0.0003 ms |
+| page fade (`vt_fade`) | — | 0.020 ms | 0.016 ms |
+| whole section | 1.616 ms peak / 0.763 ms mean | 0.738 ms peak | — |
+
+The test also sweeps the same revolution at **1.5°/frame** (90°/s, a rate a session actually runs at)
+and reports it as `slow`, because `TURN_STEP`'s 6°/frame is a stress: at 2160°/s the plan key changes
+on every frame by construction, so that sweep measures the re-plan chain rather than the streaming a
+player sees. The slow sweep reads `avt_mean 0.144`, `svt_mean 0.027`, `topup 0.0002` — the near field
+is *higher* there, not lower, so the plan-tick rate is not what sets it. It also converges better
+(172 leftover diagnostic pixels against 247).
+
+The near field is the one phase still over the 0.1 ms budget, and it is 0.12–0.14 ms by mean — the
+peak is an outlier. What is left of it is attributed, not guessed, because the peak's own stages are
+kept in `avt_peak_stats` — a peak read from the live `avt_sector_stats` would describe whatever ran
+last, which is never the peak:
+
+| near-field stage | ms | note |
+| --- | --- | --- |
+| planning chain (`scan`/`hierarchy`/`sync`/`publish`/`submit`) | 0.126 | only on a re-plan tick |
+| `classify_ms` | 0.023 | the plan's pages against the pool |
+| `retain_ms` | 0.016 | |
+| `prime_ms` | 0.10 – 0.20 | the source queue's first fill |
+| `refill_ms` | 0.05 – 0.07 | its second fill, when the queue is low |
+| `upload_ms` + `finish_ms` | 0.14 | publishing, and the pass's own statistics |
+| `commit_ms` | 0.043 | |
+| `wrapper_ms` | 0.000 | everything around the sector planner |
+
+`wrapper_ms` is there because the difference between the phase a profiler shows and the planner's own
+`cpu_update_ms` had no attribution at all. It measured zero, which rules out the three checks
+`update_surface_vt()` makes before calling the planner — so the gap is the scheduler, not a call.
+
+**The source queue is where the remaining cost is, and it does not respond to the obvious fixes.** It
+was measured four ways, and three of them are recorded here so they are not tried again:
+
+* `prime_insert_ms` does **not scale with the number of inserts**: 4 inserts measured 0.093 ms and 12
+  measured 0.191 ms in one run, and the same 12 measured 0.117 in another. So the window is dominated
+  by the queue's acquisition and by being scheduled, not by the insert loop.
+* **The containers are not it.** Replacing `std::map<Key, Entry>` + `std::set<pair<token, Key>>` with a
+  flat `std::vector<Entry>` + a flat FIFO of keys removed both node allocations per insert and
+  measured neutral on every phase. It is kept because it is simpler — two flat containers instead of
+  two node containers with paired bookkeeping — not because it is faster.
+* **A spin-then-block acquisition is not it either.** Spinning 2000 `try_lock` calls before blocking
+  was tried against the reading that motivated it and made it no better: the spin does not shorten the
+  wait, it *is* the wait, of the same magnitude as the wake latency it was meant to avoid. It was
+  removed, and `_lock_queue()` now says so.
+* **Fewer workers is not it.** With `vt_page_workers = 1` — one worker instead of four, so no worker
+  contention at all — the same seven inserts still measured 0.059 ms (8 µs each).
+
+The honest conclusion is that the remaining gap is now smaller than this machine's measurement noise:
+identical code measured `avt_mean` 0.113, 0.115, 0.122, 0.126 and 0.144 across runs while four source
+workers, the engine and a shell shared the CPU. Closing it needs a quieter measurement first — the
+release template rather than the debug one, or a pinned process — and the two structural candidates
+are recorded above the noise floor rather than chased through it: stop sharing one mutex between the
+demand pass and the workers' claim/complete path, and stage the planning chain.
+
+**The phase's cost was mostly the main thread being descheduled, not work.** `prime` inserts seven
+requests and measured 0.14–0.25 ms for it — 20–35 µs per insert — while the same seven inserts cost
+0.05 ms once the wake moved out of the pass. The demand pass woke the source workers *inside* the
+phase it was being timed in, so the phase read as its own cost when what it actually contained was a
+partially descheduled main thread. `Terrain3DPagePipeline::flush_wakes()` is now called when the
+producing pass is over, so the workers start against the render rather than against the tick that
+submitted their work. Nothing is lost: work submitted this pass cannot be assembled within it, and the
+previous pass's work has had a whole frame. Measured effect of that one change on the near field:
+peak 0.84 → 0.62 ms, `produce_ms` 0.54 → 0.31, `finish_ms` 0.31 → 0.05, `prime_insert_ms` 0.136 →
+0.050, with the painted result unchanged.
+
+Three more things had to be true for the near field to get there, and each is its own regression risk:
+
+* **One production pass per tick.** See above.
+* **A phase gets its own deadline.** With one deadline for the whole section, the service check, the
+  far field's walk and the near field's planning chain spent it before the near field produced
+  anything, so production found it expired on every tick of a moving view, emitted its one-page floor
+  and stopped. That is what made a turn refine in blocks: one page every other tick.
+* **The far field's detail loop must not be cut by that deadline.** Visiting a detail page is what
+  re-marks it as demanded. A page the loop skips keeps its slot but loses the mark, the pool evicts
+  it, and the next tick has to re-request, invalidate and re-queue it — and the queue is the
+  expensive half, since a far page with no baked cell assembles its source on this thread. Cutting
+  this loop measured *worse* on every number (far field 0.092 ms mean and 1.18 ms peak against
+  0.037 ms and 0.052 ms). The same is true of the visible-footprint walk, which feeds the far
+  field's level window and so its root plan's identity: a walk cut in a different place each tick
+  makes the selected level oscillate and the root pyramid is thrown away and rebuilt every tick.
+* **A prime leaves a half-full source queue alone** (`SOURCE_QUEUE_REFILL_ABOVE`, applied to both of
+  the tick's primes). A queue the workers have not reached yet is not something to re-scan and
+  re-insert into, and the decision is made from a lock-free count so it does not cost the queue mutex
+  to answer. It measures as neutral on the warm sweep, where the queue is usually shallow by the time
+  the pass primes, and it is what keeps a cold pass from re-scanning a queue it just filled.
+
+Still over the phase budget, and where to look next:
+
+* **`prime_ms`** — the source queue's first fill, the largest single stage at 0.125 ms, and the mean is
+  where the remaining budget pressure is: 0.114 ms against a 0.1 ms budget. Its own inserts and wakes
+  are cheap (`prime_insert_ms` 0.046, `prime_wake_ms` 0.000), so what is left is the queue mutex and
+  being scheduled behind the workers that hold it. Fewer workers (`vt_page_workers`) is the lever that
+  remains, and the structural fix is to stop sharing one mutex between the demand pass and the
+  workers' claim/complete path.
+* **The planning chain** (`scan_ms` 0.058 + `hierarchy_ms` 0.037) is 0.095 ms of the re-plan tick.
+  Staging it across ticks is the fix, and only the scan and the hierarchy may be staged: `sync` +
+  `publish` + `submit` have to stay in one tick, because a directory that has been synced but not
+  published sends whole sectors to the missing-page diagnostic. That is what the previous attempt at
+  staging got wrong.
+* A far-field **root plan rebuild**, attributed by `svt_stats` to `rootreq_ms`: a far page with no
+  baked cell crops its source from the density-scaled region data on the main thread (~2 ms for a
+  page as coarse as a root). Moving that crop to the source worker is the fix; it is gated by the
+  phase deadline in the meantime so a rebuilt pyramid arrives as a ramp instead of one 8 ms hitch.
+* A **cold** sweep (a VT settings change destroys the shared pool, so every page in view is produced
+  while the camera moves) peaks the near field at ~1.2 ms. That is a reconfiguration — the address
+  directory is rebuilt and the material republished — not steady-state streaming, and
+  `avt_sector_stats` attributes it (`scan_ms` / `hierarchy_ms` / `sync_ms` / `publish_ms` /
+  `material_ms`).
+
+Two variations of the tick's split were tried and both changed behaviour a test pins, so both were
+reverted: running the far field *first* flipped `_surface_material_required` on before the source
+array had stopped serving the far range (`vt_adaptive` failed its pre-VT baseline), and resizing the
+far field's share changed when the far field's startup grace ends. Keeping the tiers in their
+original order and deriving the far field's share from the near field's own production count is what
+keeps the painted result at the value it had before all of this (`vt_turn_budget`'s settled-view
+diagnostic count is 528 before and after, and its isolated-turn count is 906/14 before and after).
+
+## A page arrival is a ramp, not a step
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_page_fade_runner.py --driver vulkan
+```
+
+A finer page resolves its texels at full weight the frame its content lands, so the view switches
+from the level it replaced to the page itself in one frame — block by block, in the rectangular grid
+the pages are. A turning camera makes that obvious, because the working set moves and pages land
+continuously. `vt_page_fade_frames` (default 12, 0 disables) makes that switch a ramp: a page that
+has just arrived is blended against the coarser level it replaced.
+
+The test drops one resident page's content — the state a lost block encode, a rebuild that discards
+a page, or a page re-produced after an edit leaves behind — and counts the ticks the engine publishes
+a fading slot for:
+
+| `vt_page_fade_frames` | active ticks | fading slots |
+| --- | --- | --- |
+| 0 | 0 | 0 |
+| 20 | 8 – 16 | published |
+| 40 | 23 – 31 | published |
+
+The assertion is on that ordering rather than on the exact count: how many frames one tick is spread
+over belongs to the engine's frame pacing, not to the fade. What is pinned is that the fade is absent
+when it is off, runs over several frames when it is on, is *longer* when it is asked to be, and
+leaves the view exactly where it started. A measurement whose arrival did not happen inside the
+observation window at all — the page's re-production is what has to land, and how long that takes
+depends on how loaded the machine is — is retried rather than asserted on.
+
+`vt_turn_budget`'s transient counts are the evidence that it is the artifact the complaint was about,
+and they were stable across runs before the fade existed:
+
+| `vt_turn_budget` reading | before | with the fade (default 12) |
+| --- | --- | --- |
+| settled-view diagnostic pixels after a warm turn | 528 | 247 |
+| isolated 180° turn, middle/bottom screen bands | 906 / 14 | 627 / 0 |
+| diagnostic pixels after a rebuilt pool recovers | 560 | 269 |
+
+The bottom band of the isolated turn — the near field, which is what the camera is looking at —
+goes to zero, and the two remaining counts halve.
+
+**The image half is asserted, and what makes it measurable is the camera's orthographic size.** The
+test searches a row of thirty-three samples for the one a dropped page's fallback moves most, and
+requires: with the fade off, an arrival is a **single step** (0 frames between the two ends); with the
+fade on it passes through intermediate frames (5–6 at 20 ticks); and a longer fade spends more of them
+(17–19 at 40 ticks). Measured, twice, on the same scene:
+
+| | frames between the ends | fading ticks |
+| --- | --- | --- |
+| fade off | 0 | 0 |
+| fade on, 20 ticks | 5 – 6 | 7 – 9 |
+| fade on, 40 ticks | 17 – 19 | 22 – 24 |
+
+The orthographic size decides it, because it decides which mip of a page the shader selects and
+therefore whether the page draws anything the source array does not:
+
+| `camera.size` | one screen pixel covers | the page mip vs the array | result |
+| --- | --- | --- | --- |
+| 192 m | ~0.6 m | averages the checkerboard to nearly what the array draws: 0.0039 in red | not measurable |
+| 4 m | ~0.013 m | shows the checkerboard; the level behind differs by 0.15 in red | measured, `sample=18` |
+
+**The shape of the ramp is asserted, not only its ends.** Where each observed frame sits between the
+level that was there and the page that arrived is printed, and required to be monotonic and to reach
+the page — a ramp that leaves one end and reaches the other in a single frame is a step with extra
+bookkeeping, and one that goes backwards is the flicker the feature exists to remove. Measured, two
+runs, 20-tick fade:
+
+```
+0.067  0.223  0.310  0.399  0.577  0.666  0.889  1.0  1.0 …
+0.071  0.262  0.357  0.452  0.643  0.762  0.881  1.0  1.0 …
+```
+
+Seven intermediate values, evenly spaced, in order, then the page. (The ramp is set in *ticks* and
+sampled in *frames*, and one awaited frame spans about two engine ticks here, which is why a 20-tick
+fade resolves in eight samples.)
+
+**Three earlier explanations for this half being unmeasurable were tested and are wrong**, recorded so
+they are not re-derived from the source:
+
+* *that a page's mip levels cannot differ here*, because a payload texel is an exact multiple of a page
+  texel on aligned grids, so every level resolves the payload texel containing its centre. Raising the
+  density until a payload texel *is* one page texel wide, so the level above spans two of them, changes
+  which pages the plan holds and still moved no sample.
+* *that the fade leaves the view mid-ramp when the shot is taken*, so that "settled" (production
+  stopped, nothing pending) no longer means the view is showing the pages. Turning the fade off from
+  the test side changed none of the failures.
+* *that the sampled row is not virtual-texture resolved at all.* It is — by a four-thousandth, which is
+  the whole point: at 192 m across, the two paths agree to within a threshold.
+
+The test also needs the right scene to be measurable at all, and three of its settings are load
+bearing: the resolution preset rather than `surface_vt_pages_per_axis` (they set the page count per
+axis and the texel density together, and setting one alone leaves the planner's block size disagreeing
+with the density), `surface_density` high enough that the stored payload is at page-texel scale, and a
+pool large enough for the plan to hold a sector's whole mip chain — the planner leaves 128 pages of
+the pool for its retained tail and walks with the rest, so a 128-page pool leaves a 32-page walk,
+barely one level per sector, and a dropped page then has no level behind it at all.
+`debug_invalidate_vt_page()` is what drops a page's *content*, as opposed to
+`debug_lose_vt_page_readiness()`, which drops only the CPU-side readiness the demand pass acts on and
+which the shader never sees.
+
+Each measurement builds its own scene. Dropping a page reshapes the pool, so a second measurement in
+the same scene does not start from the state the first one did — which is what made an earlier
+version of this test pass one configuration and fail the next.
 
 Root pages and detail pages are still assembled on the GPU: a baked cell is a device-to-device
 copy. A tier left uncompressed samples the staging arrays directly and costs nothing extra; a

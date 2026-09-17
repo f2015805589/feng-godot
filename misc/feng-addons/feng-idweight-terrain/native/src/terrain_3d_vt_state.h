@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -155,6 +156,11 @@ struct Terrain3DVTState {
 	int avt_directory_mask = 0;
 	int avt_root_level = 1;
 	Dictionary avt_sector_stats;
+	// The near field's stage timings as of the pass that produced `vt_avt_peak_ms`, and when that
+	// was. The live dictionary is overwritten by every pass, so without this the stages of a peak
+	// could not be read at all - and the peak is by definition not the last pass.
+	Dictionary avt_peak_stats;
+	uint64_t avt_peak_stamp_us = 0;
 	uint64_t avt_plan_epoch = 0;
 	float avt_plan_logical_ratio = 0.f;
 	std::shared_ptr<Terrain3DAVTRefinement> avt_refinement;
@@ -201,12 +207,10 @@ struct Terrain3DVTState {
 	// pool exactly large enough to evict the view it is leading.
 	int avt_retained_pages = 0;
 	PackedByteArray avt_plan_key;
+	// Set while the pool's residency revision is the one an idle pass verified. An idle pass
+	// keeps its verified resident set instead of re-deriving it, so this is what tells the
+	// next tick whether that set can still be trusted.
 	uint64_t avt_idle_revision = 0;
-	// Set by the near field when this tick's demand pass found its plan settled and every
-	// resident page still holding content. The tick's top-up then has nothing to ask that the
-	// pass did not already answer, so it is skipped while the residency is still the one the
-	// answer was given against.
-	bool avt_idle_tick = false;
 	// Whether the last plan was installed from cache. A plain member rather than a lookup in
 	// the statistics dictionary, which the settled path reads every tick.
 	bool avt_plan_reused = false;
@@ -215,6 +219,26 @@ struct Terrain3DVTState {
 	// ticks writes them once - the dictionary is String keyed, and republishing the same
 	// numbers is the largest thing left on a settled tick.
 	bool avt_idle_stats_current = false;
+	// Whether the source queue was already retained against the current plan, and whether
+	// that retention included the prefetch plan. Retention is a set operation over the
+	// whole plan, so a pass that would repeat the previous wanted set repeats 250 map
+	// lookups to reach the state the last pass already reached.
+	bool avt_retain_applied = false;
+	bool avt_retain_with_prefetch = false;
+	// Page-arrival fade, in ticks. A page that has just arrived is blended against the level
+	// it replaced, so a page arrival is a ramp rather than a step - which is what a fast turn
+	// makes obvious, because the view then refines in the rectangular grid its pages are.
+	// 0 disables it and costs nothing: the shader then reads a settled page on every fetch.
+	int vt_page_fade_frames = 12;
+	// Remaining fade ticks per physical slot; 0 means settled. `vt_slot_pending` records the
+	// slots a demand pass found resident without content, so a slot that leaves it is one
+	// whose content landed on this tick - which is when its fade starts.
+	std::vector<uint8_t> vt_slot_fade_ticks;
+	std::vector<uint8_t> vt_slot_pending;
+	Ref<Image> vt_page_fade_image;
+	Ref<ImageTexture> vt_page_fade_texture;
+	// Ticks reported by the last fade update, so a settled view reports that it did nothing.
+	int vt_page_fade_active = 0;
 	std::vector<int> avt_resident_slots;
 	size_t avt_prefetch_cursor = 0;
 	bool avt_prefetch_cycle_pending = false;
@@ -228,8 +252,6 @@ struct Terrain3DVTState {
 	real_t surface_vt_texels_per_pixel = 1.f;
 	real_t surface_vt_texels_per_meter = 1024.f;
 	PackedFloat32Array surface_vt_mip_distances; // Legacy serialized array.
-	bool surface_vt_distance_mips = false;
-	Vector3 surface_vt_mip_ranges = Vector3(8, 16, 32);
 	bool surface_vt_force_mip = false;
 	int surface_vt_mip = 0;
 	// Layer slot -> virtual page block origin, or (-1, -1). Indexed by the same slot
@@ -305,6 +327,17 @@ struct Terrain3DVTState {
 	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
 	// 0 when the distance-selected set fit. Diagnostics and tests only.
 	int svt_floor_level = 0;
+	// Breakdown of the far field's worst pass, published as `svt_stats` and attributed to
+	// `svt_worst_ms`. The near field has `avt_sector_stats`; without the same for the far
+	// field a peak in `svt_cpu_ms` could not be told apart between the visible-footprint
+	// walk, the root pyramid plan and the detail set, which are three different fixes. A
+	// pass records its stages in locals and only the pass that becomes the new worst writes
+	// the dictionary, so the instrumentation is not a per-tick dictionary cost.
+	Dictionary svt_stats;
+	double svt_worst_ms = 0.0;
+	// Frame the worst pass above was taken on, so the breakdown can be read as "this is what
+	// the peak cost" rather than as a value of the current tick.
+	uint64_t svt_worst_frame = 0;
 	// Distance -> level table for the far field, in metres. Entry m is the largest
 	// camera distance at which world mip m is sampled, so the table states the level
 	// bands explicitly instead of deriving them from the page size. Empty keeps the
@@ -328,39 +361,49 @@ struct Terrain3DVTState {
 	double vt_cpu_ms = 0.0;
 	double vt_cpu_peak_ms = 0.0;
 	double svt_cpu_ms = 0.0;
-	// Phase breakdown of the same section: the shared-service check, the near-field
-	// demand pass, the far-field demand pass, the near-field production top-up, and the
-	// far-field bake.
+	// Phase breakdown of the same section: the shared-service check, the near field's demand pass,
+	// the far field's demand pass, the page-arrival fade, and the far-field bake. `vt_topup_ms` is
+	// kept as a reported phase and is always zero: the near field used to be run a second time in a
+	// "top-up" phase with the budget the far field did not spend, and that pass is gone. See
+	// Terrain3D::_process_physics() for why it went.
 	double vt_service_ms = 0.0;
 	double vt_avt_ms = 0.0;
 	double vt_svt_ms = 0.0;
 	double vt_topup_ms = 0.0;
+	double vt_fade_ms = 0.0;
 	double vt_bake_ms = 0.0;
 	// Worst frame for each demand pass since the terrain was created, so a peak in
 	// `vt_cpu_peak_ms` can be attributed to one view without a profiler.
 	double vt_avt_peak_ms = 0.0;
 	double vt_svt_peak_ms = 0.0;
-	// Automatic-tick CPU budget for the whole VT section, in milliseconds. 0 disables it.
-	// An explicit update_surface_vt()/update_surface_svt() call is never budgeted: the page
-	// count it passes is the caller's own bound.
-	// Default 0: the per-frame deadline is off, so a tick runs to completion. A deadline
-	// starves the AVT planner rather than smoothing it - one full plan costs several
-	// milliseconds, so a 0.1 ms budget spreads a single plan over dozens of frames, which
-	// delays the first pages by seconds and leaves a moving view rendering the
-	// missing-page diagnostic the whole time. Raise it to opt into the spread-out tick.
+	// CPU budget for one phase of the VT section, in milliseconds. 0 disables it, which is the
+	// default: the phases have no fixed cost left to cap, and a page a phase is not given time
+	// to publish is a page the view keeps missing. An explicit update_surface_vt() /
+	// update_surface_svt() call is never budgeted - the page count it passes is the caller's
+	// own bound.
+	//
+	// Re-armed at the start of every phase, so the setting bounds what one pass may spend
+	// rather than what the whole section may spend, which is the number a profiler attributes
+	// a peak to. A deadline shared by the section was consumed by the service check and the
+	// far field before the near field ran, so the near field found it already expired on every
+	// tick of a moving view, emitted its one-page floor and stopped - the shape that makes a
+	// turning view refine in visible blocks. Set it (0.1 is a reasonable cap) when a hard
+	// per-phase bound matters more than the pages it costs.
 	real_t vt_frame_budget_ms = 0.0f;
 	// Absolute deadline of the tick that is running, or 0 when the caller is not the
 	// physics tick. Every phase that can stop between two units of work reads it.
 	uint64_t vt_tick_deadline_us = 0;
-	// Staged near-field planner: which phase of the scan -> plan chain runs next, and the
-	// intermediate data the later phases need. One automatic tick runs at most the phases
-	// that fit in its budget, so a camera that changes its view every tick cannot put the
-	// whole chain into one frame.
-	int avt_plan_stage = 0;
+	// Set while the physics tick's VT section is running. The source workers are woken at the end of
+	// the tick rather than at the end of each demand pass, because a worker woken inside a phase
+	// starts competing for this thread's cores and the phases are measured as wall time on this
+	// thread. A caller that drives `update_surface_vt()` directly has no tick to wait for, so the
+	// pass flushes its own wakes in that case - see `_flush_source_wakes()`.
+	bool vt_tick_active = false;
+	// Staged near-field planner scratch: the scan and the hierarchy the chain's phases hand
+	// each other, kept here so a plan tick reuses their capacity instead of reallocating
+	// them. The chain itself runs in one pass; see _update_sector_avt.
 	Terrain3DAVTSectorScan avt_pending_scan;
 	Terrain3DAVTHierarchy avt_pending_hierarchy;
-	// Set while a plan is being assembled for a key the standing plan does not cover.
-	bool avt_plan_staging = false;
 };
 
 #endif // TERRAIN3D_VT_STATE_H

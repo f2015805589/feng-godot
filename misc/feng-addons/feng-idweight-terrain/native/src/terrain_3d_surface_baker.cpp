@@ -563,50 +563,90 @@ bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 	return true;
 }
 
-bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
-		int p_page_count, int p_stored_size, const RID &p_albedo_array_rs, const RID &p_normal_array_rs,
-		const PackedByteArray &p_material_bytes) {
-	RenderingServer *server = RenderingServer::get_singleton();
-	if (!server) {
-		return false;
-	}
-	if (!_rd) {
-		RenderingDevice *main_rd = server->get_rendering_device();
-		std::lock_guard<std::mutex> lock(_mutex);
-		if (!_rd) {
-			_rd = main_rd;
+// Carries a grown pool's finished pages into the bundle that replaces it, and queues the old bundle
+// for retirement once the material has moved to the new one.
+//
+// Resource migration copies existing results; it does not rerun a page shader or restart source work.
+// The old output has to stay alive until the next material update has bound the new arrays, including
+// already prepared draws, which is why it goes through `_retired` rather than being freed here.
+//
+// Under the scratch regime there is nothing to copy: a page's half-float content only ever lives in
+// the ring, and the compressed layers cannot be copied at all (a block format cannot carry the
+// unordered-access flag `texture_copy` needs on D3D12). Every page is re-produced instead, which is
+// what the caller already marked not ready. Returns false - with `p_next` freed - when a copy fails,
+// in which case the caller has nothing to adopt.
+bool Terrain3DSurfaceBaker::_adopt_grown_pages(const ResourceBundle &p_old, ResourceBundle &p_next,
+		const int p_old_count, const std::vector<uint8_t> &p_ready, const uint64_t p_old_generation,
+		const int p_stored_size) {
+	uint64_t copied = 0;
+	if (!_staging_is_scratch()) {
+		for (int slot = 0; slot < p_old_count; ++slot) {
+			if (slot >= int(p_ready.size()) || !p_ready[slot]) { continue; }
+			const Vector3 extent(p_stored_size, p_stored_size, 1);
+			if (_rd->texture_copy(p_old.output_albedo_rd, p_next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+					_rd->texture_copy(p_old.output_normal_rd, p_next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
+					_rd->texture_copy(p_old.output_params_rd, p_next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
+				_free_bundle(_rd, p_next); return false;
+			}
+			++copied;
 		}
 	}
-	if (!_rd) {
-		LOG(ERROR, "No main RenderingDevice available for surface bake");
-		return false;
-	}
-	bool growing = false;
-	int old_count = 0;
-	uint64_t old_generation = 0;
-	ResourceBundle old;
-	std::vector<uint8_t> ready;
+	std::lock_guard<std::mutex> lock(_mutex);
+	_retire_ready = false;
+	_retired.push_back({ p_old_generation, p_old });
+	_migrated_pages += copied;
+	return true;
+}
+
+// Adopts a finished bundle as the one this baker produces into: everything indexed by the page count
+// is resized together, so no slot can be read at a size the arrays do not have.
+//
+// A rebuilt bundle starts with empty compressed arrays. A grown bundle migrated the staging content
+// of every ready page, so that content is encoded again into the new arrays; a block-compressed layer
+// cannot be copied between formats, and the staging copy is what carries it across the resize.
+// Without this every page that was ready before a capacity change would sample a zeroed compressed
+// layer for the rest of the session. Under the scratch regime there is nothing to migrate - a page's
+// half-float content only ever lives in the ring, and the ring belongs to the bundle just replaced -
+// so every page is re-produced, exactly as the compressed arrays require anyway.
+void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t p_generation,
+		const int p_page_count) {
+	std::lock_guard<std::mutex> lock(_mutex);
+	_resources = p_next;
+	_resource_generation = p_generation;
+	_resource_page_count = p_page_count;
+	_page_count = p_page_count;
+	_ready.resize(size_t(p_page_count), 0);
+	_produced_frame.resize(size_t(p_page_count), 0);
+	_sampled_channel_mask.resize(size_t(p_page_count), 0);
+	_slot_sequence.resize(size_t(p_page_count), 0);
+	_slot_tier.resize(size_t(p_page_count), uint8_t(TIER_AVT));
+	_slot_scratch.assign(size_t(p_page_count), uint8_t(ENCODE_RING_NONE));
+	_encode_pending.assign(size_t(p_page_count), 0);
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		if (_resource_generation == p_generation && _resources.pipeline.is_valid()) {
-			if (_resource_page_count >= p_page_count || !_retired.empty()) { return true; }
-			growing = true; old_count = _resource_page_count;
-			old = _resources; old_generation = _resource_generation; ready = _ready;
+		// The ring is the encoder's own state, so it is guarded by the encode mutex. Lock order is
+		// _mutex then _encode_mutex everywhere; the readback callback takes them in separate scopes
+		// and never holds one while taking the other.
+		std::lock_guard<std::mutex> encode_lock(_encode_mutex);
+		_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
+	}
+	if (_staging_is_scratch()) {
+		std::fill(_ready.begin(), _ready.end(), uint8_t(0));
+		std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
+	}
+	for (size_t slot = 0; slot < _ready.size(); ++slot) {
+		if (_ready[slot] && _slot_tier[slot] < TIER_COUNT && _tiers[_slot_tier[slot]].applied.load() != 0) {
+			_encode_pending[slot] = 1;
 		}
 	}
-	if (!growing) {
-		old_generation = _take_resources(old);
-		if (old.output_albedo_rd.is_valid()) {
-			// Keep the previous pair alive: the published RIDs are still what the
-			// material samples until the main thread rebinds it after this rebuild.
-			std::lock_guard<std::mutex> lock(_mutex);
-			_retire_ready = false;
-			_retired.push_back({ old_generation, old });
-		} else {
-			_free_bundle(_rd, old);
-		}
-	}
-	ResourceBundle next;
+}
+
+// Creates every texture and sampler of one bundle, and validates them. The bundle is passed in
+// rather than returned so a failure frees it in place: the caller has nothing to adopt either way.
+// The three compressed tiers are built first, because whether the half-float staging arrays are
+// page sized or only as deep as the encoder ring depends on which of them resolved - see the
+// comment on `_staging_layers` below.
+bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, const int p_stored_size,
+        const int p_page_count) {
 	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
 	const uint64_t output_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
@@ -626,13 +666,13 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 	dummy_normal[1] = 128;
 	dummy_normal[2] = 255;
 	dummy_normal[3] = 255;
-	next.dummy_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM, 1, 1,
+	r_next.dummy_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM, 1, 1,
 			sampled_usage, dummy_albedo);
-	next.dummy_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM, 1, 1,
+	r_next.dummy_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM, 1, 1,
 			sampled_usage, dummy_normal);
-	next.sampler_nearest = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_NEAREST,
+	r_next.sampler_nearest = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_NEAREST,
 			RenderingDevice::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE, 0.0f);
-	next.sampler_linear = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_LINEAR,
+	r_next.sampler_linear = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_LINEAR,
 			RenderingDevice::SAMPLER_REPEAT_MODE_REPEAT, 1000.0f);
 	// Compressed copies of the three channels, one set per tier whose codec resolved. These
 	// are the sampling targets of the block encoder, and the material samples them in place
@@ -646,7 +686,7 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 	_encode_region_words = _encode_region_bytes / int(sizeof(uint32_t));
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		_tiers[tier].applied.store(0);
-		SampledSet &set = next.sampled[tier];
+		SampledSet &set = r_next.sampled[tier];
 		const int mode = _tiers[tier].effective.load();
 		const RenderingDevice::DataFormat format = _tiers[tier].format.load();
 		const RenderingDevice::DataFormat format_srgb = _tiers[tier].format_srgb.load();
@@ -711,23 +751,82 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			ENCODE_PAGES_MIN, ENCODE_PAGES_MAX));
 	_staging_layers = _staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count;
 	_refresh_encode_ring_capacity();
-	next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
+	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
 			_staging_layers, sampled_usage);
-	next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
+	r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
 			_staging_layers, sampled_usage);
-	next.output_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
+	r_next.output_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
 			p_stored_size, _staging_layers, output_usage);
-	next.output_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
+	r_next.output_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
 			p_stored_size, _staging_layers, output_usage);
-	next.output_params_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
+	r_next.output_params_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
 			p_stored_size, _staging_layers, output_usage);
-	if (!next.dummy_albedo_rd.is_valid() || !next.dummy_normal_rd.is_valid() ||
-			!next.sampler_nearest.is_valid() || !next.sampler_linear.is_valid() ||
-			!next.source_id_rd.is_valid() || !next.source_height_rd.is_valid() ||
-			!next.output_albedo_rd.is_valid() || !next.output_normal_rd.is_valid() ||
-			!next.output_params_rd.is_valid()) {
-		_free_bundle(_rd, next);
+	if (!r_next.dummy_albedo_rd.is_valid() || !r_next.dummy_normal_rd.is_valid() ||
+			!r_next.sampler_nearest.is_valid() || !r_next.sampler_linear.is_valid() ||
+			!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid() ||
+			!r_next.output_albedo_rd.is_valid() || !r_next.output_normal_rd.is_valid() ||
+			!r_next.output_params_rd.is_valid()) {
+		_free_bundle(_rd, r_next);
 		LOG(ERROR, "Could not allocate surface bake textures");
+		return false;
+	}
+	return true;
+}
+
+// Takes the main device the first time a bundle is needed, and reports whether there is one at all.
+// Split out because every stage below assumes `_rd` and none of them is about acquiring it.
+bool Terrain3DSurfaceBaker::_acquire_device() {
+	RenderingServer *server = RenderingServer::get_singleton();
+	if (!server) {
+		return false;
+	}
+	if (!_rd) {
+		RenderingDevice *main_rd = server->get_rendering_device();
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (!_rd) {
+			_rd = main_rd;
+		}
+	}
+	if (!_rd) {
+		LOG(ERROR, "No main RenderingDevice available for surface bake");
+		return false;
+	}
+	return true;
+}
+
+bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
+		int p_page_count, int p_stored_size, const RID &p_albedo_array_rs, const RID &p_normal_array_rs,
+		const PackedByteArray &p_material_bytes) {
+	if (!_acquire_device()) {
+		return false;
+	}
+	bool growing = false;
+	int old_count = 0;
+	uint64_t old_generation = 0;
+	ResourceBundle old;
+	std::vector<uint8_t> ready;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_resource_generation == p_generation && _resources.pipeline.is_valid()) {
+			if (_resource_page_count >= p_page_count || !_retired.empty()) { return true; }
+			growing = true; old_count = _resource_page_count;
+			old = _resources; old_generation = _resource_generation; ready = _ready;
+		}
+	}
+	if (!growing) {
+		old_generation = _take_resources(old);
+		if (old.output_albedo_rd.is_valid()) {
+			// Keep the previous pair alive: the published RIDs are still what the
+			// material samples until the main thread rebinds it after this rebuild.
+			std::lock_guard<std::mutex> lock(_mutex);
+			_retire_ready = false;
+			_retired.push_back({ old_generation, old });
+		} else {
+			_free_bundle(_rd, old);
+		}
+	}
+	ResourceBundle next;
+	if (!_create_bundle_resources(next, p_stored_size, p_page_count)) {
 		return false;
 	}
 	const String layer_note = _staging_is_scratch()
@@ -789,73 +888,10 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
 	_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
 	_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
-	if (growing) {
-		// Resource migration copies existing results; it does not rerun a page
-		// shader or restart source work. Keep the old output alive until the next
-		// material update has bound the new arrays, including already prepared draws.
-		//
-		// Under the scratch regime there is nothing to copy: a page's half-float content only
-		// ever lives in the ring, and the compressed layers cannot be copied (a block format
-		// cannot carry the unordered-access flag `texture_copy` needs on D3D12). Every page is
-		// re-produced instead, which is what the block above already marked not ready.
-		uint64_t copied = 0;
-		if (!_staging_is_scratch()) {
-			for (int slot = 0; slot < old_count; ++slot) {
-				if (slot >= int(ready.size()) || !ready[slot]) { continue; }
-				const Vector3 extent(p_stored_size, p_stored_size, 1);
-				if (_rd->texture_copy(old.output_albedo_rd, next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
-						_rd->texture_copy(old.output_normal_rd, next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
-						_rd->texture_copy(old.output_params_rd, next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
-					_free_bundle(_rd, next); return false;
-				}
-				++copied;
-			}
-		}
-		std::lock_guard<std::mutex> lock(_mutex);
-		_retire_ready = false;
-		_retired.push_back({ old_generation, old });
-		_migrated_pages += copied;
+	if (growing && !_adopt_grown_pages(old, next, old_count, ready, old_generation, p_stored_size)) {
+		return false;
 	}
-	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		_resources = next;
-		_resource_generation = p_generation;
-		_resource_page_count = p_page_count;
-		_page_count = p_page_count;
-		_ready.resize(size_t(p_page_count), 0);
-		_produced_frame.resize(size_t(p_page_count), 0);
-		_sampled_channel_mask.resize(size_t(p_page_count), 0);
-		_slot_sequence.resize(size_t(p_page_count), 0);
-		_slot_tier.resize(size_t(p_page_count), uint8_t(TIER_AVT));
-		_slot_scratch.assign(size_t(p_page_count), uint8_t(ENCODE_RING_NONE));
-		// A rebuilt bundle starts with empty compressed arrays. A grown bundle migrated the
-		// staging content of every ready page, so encode it again into the new arrays; a
-		// block-compressed layer cannot be copied between formats, and the staging copy is
-		// what carries the content across the resize. Without this every page that was ready
-		// before a capacity change would sample a zeroed compressed layer for the session.
-		//
-		// Under the scratch regime there is nothing to migrate: a page's half-float content
-		// only ever lives in the ring, and the ring belongs to the bundle that was just
-		// replaced. Every page is therefore re-produced, exactly as the compressed arrays
-		// require anyway.
-		_encode_pending.assign(size_t(p_page_count), 0);
-		{
-			// The ring is the encoder's own state, so it is guarded by the encode mutex.
-			// Lock order is _mutex then _encode_mutex everywhere; the readback callback
-			// takes them in separate scopes and never holds one while taking the other.
-			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
-			_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
-		}
-		if (_staging_is_scratch()) {
-			std::fill(_ready.begin(), _ready.end(), uint8_t(0));
-			std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
-		}
-		for (size_t slot = 0; slot < _ready.size(); ++slot) {
-			if (_ready[slot] && _slot_tier[slot] < TIER_COUNT && _tiers[_slot_tier[slot]].applied.load() != 0) {
-				_encode_pending[slot] = 1;
-			}
-		}
-	}
+	_adopt_bundle(next, p_generation, p_page_count);
 	return true;
 }
 
@@ -2115,6 +2151,198 @@ void Terrain3DSurfaceBaker::_set_ready(int p_slot, bool p_ready, uint64_t p_gene
 	_ready[size_t(p_slot)] = _tier_uses_sampled(tier) ? 0 : 1;
 }
 
+void Terrain3DSurfaceBaker::_retire_acknowledged_bundles() {
+	std::vector<ResourceBundle> retiring;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		// Everything older than the bundle the material currently samples is unreferenced and can
+		// go. Nothing is freed while the material has not acknowledged a published pair yet,
+		// because these are exactly the arrays its already prepared draws may still bind. The
+		// acknowledgment is only honoured from the frame after it arrived: the material's new pair
+		// is published on the main thread and reaches the drawn material during that frame's
+		// render, in which this pass runs.
+		const uint64_t frames_drawn = Engine::get_singleton()->get_frames_drawn();
+		const uint64_t acknowledged = frames_drawn > _acknowledged_frame + RETIRE_FRAME_MARGIN ? _acknowledged_generation : 0;
+		if (acknowledged != 0) {
+			for (size_t index = 0; index < _retired.size();) {
+				if (_retired[index].first < acknowledged) {
+					retiring.push_back(_retired[index].second);
+					_retired.erase(_retired.begin() + index);
+					continue;
+				}
+				++index;
+			}
+		}
+		if (!retiring.empty()) { _retire_ready = false; }
+	}
+	for (const ResourceBundle &bundle : retiring) { _free_bundle(_rd, bundle); }
+}
+
+std::vector<Terrain3DSurfaceBaker::PendingJob> Terrain3DSurfaceBaker::_build_frame_jobs(const std::map<int, PendingJob> &p_pending,
+		const bool p_invalidate_all, const uint64_t p_generation, const int p_page_count) const {
+	std::vector<PendingJob> jobs;
+	jobs.reserve(size_t(p_invalidate_all ? p_page_count : p_pending.size()));
+	if (p_invalidate_all) {
+		for (int slot = 0; slot < p_page_count; slot++) {
+			auto found = p_pending.find(slot);
+			if (found != p_pending.end()) {
+				jobs.push_back(found->second);
+			} else {
+				PendingJob invalid;
+				invalid.slot = slot;
+				invalid.kind = PENDING_INVALIDATE;
+				invalid.generation = p_generation;
+				jobs.push_back(invalid);
+			}
+		}
+	} else {
+		for (const auto &entry : p_pending) {
+			jobs.push_back(entry.second);
+		}
+	}
+	return jobs;
+}
+
+// One frame's page production and dispatch, from the staging buffers to the compute list: the
+// layers a readback callback compressed since the last callback, then per slot the invalidation,
+// the budget deferral, the staging layer and the bake or cell copy that fills it, and finally the
+// dispatch for the pages that still need shading. Every one of those is local to it; what crosses
+// back out is `_frame_page_updates`, the deferred jobs in `_pending`, and - when the job recording
+// fails - false, which means the frame did nothing and the caller must return with every job back
+// in the queue and the whole atlas marked for invalidation.
+bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs,
+        const uint64_t p_generation, const uint64_t p_material_version, const int p_page_count,
+        const int p_page_size, const int p_border, const int p_stored_size, const int p_material_count,
+        const bool p_invalidate_all, Terrain3DCellStore *p_cell_store) {
+	std::vector<PendingJob> compute_jobs;
+	compute_jobs.reserve(p_jobs.size());
+	// Invalidation only needs to clear readiness, not shade every cache texel. Under the
+	// scratch regime nothing samples the staging arrays at all - the compressed layer of a
+	// re-assigned slot keeps the previous page's material for the frame or two until its own
+	// encode lands, exactly as it does with page-sized staging - so an invalidation never has
+	// to touch a layer, and the layers it could name are not the slot's anyway.
+	const bool scratch = _staging_is_scratch();
+	const int cleared_layers = scratch ? _staging_layers : p_page_count;
+	const bool cleared_all = p_invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, uint32_t(cleared_layers)) == OK;
+	const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
+	if (_render_frame != frame) { _render_frame = frame; _frame_page_updates = 0; }
+	// Compressed page production happens here, inside the recording, in two halves: the
+	// layers a readback callback compressed since the last callback are uploaded first, so
+	// the frames this callback's own production does not cover already sample real data;
+	// the readbacks for the pages produced below are then requested from this same
+	// recording, which is what makes a page compressed by the frame that produced it.
+	_flush_encodes(p_generation);
+	for (PendingJob &job : p_jobs) {
+		if (job.generation != p_generation || job.slot < 0 || job.slot >= p_page_count) {
+			continue;
+		}
+		if (job.kind == PENDING_INVALIDATE && (cleared_all || scratch ||
+				_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) == OK)) {
+			_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
+			{ std::lock_guard<std::mutex> lock(_mutex); ++_invalidated_pages; }
+			continue;
+		}
+		if (job.kind != PENDING_INVALIDATE) {
+			if (_frame_page_updates >= _page_budget.load()) {
+				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
+				// A reused slot must not expose its previous material while deferred.
+				PendingJob invalid = job;
+				invalid.kind = PENDING_INVALIDATE;
+				if (!cleared_all && !scratch &&
+						_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) != OK) {
+					compute_jobs.push_back(invalid);
+				}
+				continue;
+			}
+			// The layer this page is shaded into: the slot under page-sized staging, a ring
+			// page under the scratch regime - and a ring page that is held until this page's
+			// block readbacks arrive, because the half-float content only exists that long.
+			const int layer = _take_staging_layer(job.slot);
+			if (layer < 0) {
+				// Every ring page is waiting on readbacks. Defer the page exactly as the
+				// budget does, so a later frame produces it with a layer of its own.
+				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
+				continue;
+			}
+			job.staging_layer = layer;
+			++_frame_page_updates;
+		}
+		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
+			if (job.kind == PENDING_CELL ? _copy_cell_page(job, p_cell_store) : _upload_cached_page(job)) {
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					_cached_uploads++;
+				}
+				// Both far-field paths end with the three channels in the staging arrays -
+				// the cached path uploads them, the cell path accumulated them there - so the
+				// block encoder is the only thing that turns them into the SVT page. This is
+				// where a far-field page is compressed, once per production: an SVT page's
+				// content is final, so nothing re-encodes it while the slot keeps its page.
+				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
+					_encode_pending[size_t(job.slot)] = 1;
+				}
+				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
+			} else {
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					_invalidated_pages++;
+				}
+				PendingJob invalid = job;
+				invalid.kind = PENDING_INVALIDATE;
+				compute_jobs.push_back(invalid);
+				_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
+			}
+		} else {
+			compute_jobs.push_back(job);
+		}
+	}
+	// A pure invalidation has nothing to shade under the scratch regime: its only effect is
+	// the readiness clear above, and dispatching it would write zeros into whichever scratch
+	// layer the shader named, which may belong to a page whose encode is still in flight.
+	if (scratch) {
+		compute_jobs.erase(std::remove_if(compute_jobs.begin(), compute_jobs.end(),
+								   [](const PendingJob &p_job) { return p_job.kind == PENDING_INVALIDATE; }),
+				compute_jobs.end());
+	}
+	if (!compute_jobs.empty()) {
+		std::vector<PendingJob> original_jobs = compute_jobs;
+		if (!_record_jobs(compute_jobs, p_generation, p_page_size, p_border, p_stored_size, p_material_count)) {
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (_generation == p_generation) {
+				for (const PendingJob &job : original_jobs) {
+					_pending.emplace(job.slot, job);
+				}
+				_invalidate_all = _invalidate_all || p_invalidate_all;
+			}
+			return false;
+		}
+		for (const PendingJob &job : compute_jobs) {
+			if (job.kind == PENDING_BAKE) {
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					_baked_pages++;
+				}
+				// The bake dispatch is recorded just above, so the encoder dispatch requested
+				// below reads the staging layer this same recording wrote.
+				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
+					_encode_pending[size_t(job.slot)] = 1;
+				}
+				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
+			} else {
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					_invalidated_pages++;
+				}
+				_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
+			}
+		}
+	}
+	// Every page produced by this callback (bake or cell copy) is read back here, in the
+	// same recording that wrote it.
+	_request_encodes();
+	return true;
+}
+
 void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) {
 	(void)p_keep_alive;
 	std::map<int, PendingJob> pending;
@@ -2176,31 +2404,7 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		_invalidate_all = _invalidate_all || invalidate_all;
 		return;
 	}
-		std::vector<ResourceBundle> retiring;
-		{
-			std::lock_guard<std::mutex> lock(_mutex);
-			// Everything older than the bundle the material currently samples is
-			// unreferenced and can go. Nothing is freed while the material has not
-			// acknowledged a published pair yet, because these are exactly the arrays
-			// its already prepared draws may still bind. The acknowledgment is only
-			// honoured from the frame after it arrived: the material's new pair is
-			// published on the main thread and reaches the drawn material during that
-			// frame's render, in which this pass runs.
-			const uint64_t frames_drawn = Engine::get_singleton()->get_frames_drawn();
-			const uint64_t acknowledged = frames_drawn > _acknowledged_frame + RETIRE_FRAME_MARGIN ? _acknowledged_generation : 0;
-			if (acknowledged != 0) {
-				for (size_t index = 0; index < _retired.size();) {
-					if (_retired[index].first < acknowledged) {
-						retiring.push_back(_retired[index].second);
-						_retired.erase(_retired.begin() + index);
-						continue;
-					}
-					++index;
-				}
-			}
-			if (!retiring.empty()) { _retire_ready = false; }
-		}
-		for (const ResourceBundle &bundle : retiring) { _free_bundle(_rd, bundle); }
+	_retire_acknowledged_bundles();
 	if (!_ensure_resources(generation, page_count, stored_size,
 				material_albedo, material_normal, material_bytes)) {
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -2235,153 +2439,12 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	// Material updates invalidate every old result, but a newer operation for a slot
 	// supersedes that invalidation.  Keeping one operation per slot also avoids races
 	// between two z slices of the compute dispatch.
-	std::vector<PendingJob> jobs;
-	jobs.reserve(size_t(page_count));
-	if (invalidate_all) {
-		for (int slot = 0; slot < page_count; slot++) {
-			auto found = pending.find(slot);
-			if (found != pending.end()) {
-				jobs.push_back(found->second);
-			} else {
-				PendingJob invalid;
-				invalid.slot = slot;
-				invalid.kind = PENDING_INVALIDATE;
-				invalid.generation = generation;
-				jobs.push_back(invalid);
-			}
-		}
-	} else {
-		for (const auto &entry : pending) {
-			jobs.push_back(entry.second);
-		}
-	}
+	std::vector<PendingJob> jobs = _build_frame_jobs(pending, invalidate_all, generation, page_count);
 
-	std::vector<PendingJob> compute_jobs;
-	compute_jobs.reserve(jobs.size());
-	// Invalidation only needs to clear readiness, not shade every cache texel. Under the
-	// scratch regime nothing samples the staging arrays at all - the compressed layer of a
-	// re-assigned slot keeps the previous page's material for the frame or two until its own
-	// encode lands, exactly as it does with page-sized staging - so an invalidation never has
-	// to touch a layer, and the layers it could name are not the slot's anyway.
-	const bool scratch = _staging_is_scratch();
-	const int cleared_layers = scratch ? _staging_layers : page_count;
-	const bool cleared_all = invalidate_all && _rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, 0, uint32_t(cleared_layers)) == OK;
-	const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
-	if (_render_frame != frame) { _render_frame = frame; _frame_page_updates = 0; }
-	// Compressed page production happens here, inside the recording, in two halves: the
-	// layers a readback callback compressed since the last callback are uploaded first, so
-	// the frames this callback's own production does not cover already sample real data;
-	// the readbacks for the pages produced below are then requested from this same
-	// recording, which is what makes a page compressed by the frame that produced it.
-	_flush_encodes(generation);
-	for (PendingJob &job : jobs) {
-		if (job.generation != generation || job.slot < 0 || job.slot >= page_count) {
-			continue;
-		}
-		if (job.kind == PENDING_INVALIDATE && (cleared_all || scratch ||
-				_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) == OK)) {
-			_set_ready(job.slot, false, generation, material_version, job.sequence);
-			{ std::lock_guard<std::mutex> lock(_mutex); ++_invalidated_pages; }
-			continue;
-		}
-		if (job.kind != PENDING_INVALIDATE) {
-			if (_frame_page_updates >= _page_budget.load()) {
-				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
-				// A reused slot must not expose its previous material while deferred.
-				PendingJob invalid = job;
-				invalid.kind = PENDING_INVALIDATE;
-				if (!cleared_all && !scratch &&
-						_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) != OK) {
-					compute_jobs.push_back(invalid);
-				}
-				continue;
-			}
-			// The layer this page is shaded into: the slot under page-sized staging, a ring
-			// page under the scratch regime - and a ring page that is held until this page's
-			// block readbacks arrive, because the half-float content only exists that long.
-			const int layer = _take_staging_layer(job.slot);
-			if (layer < 0) {
-				// Every ring page is waiting on readbacks. Defer the page exactly as the
-				// budget does, so a later frame produces it with a layer of its own.
-				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
-				continue;
-			}
-			job.staging_layer = layer;
-			++_frame_page_updates;
-		}
-		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
-			if (job.kind == PENDING_CELL ? _copy_cell_page(job, cell_store.ptr()) : _upload_cached_page(job)) {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_cached_uploads++;
-				}
-				// Both far-field paths end with the three channels in the staging arrays -
-				// the cached path uploads them, the cell path accumulated them there - so the
-				// block encoder is the only thing that turns them into the SVT page. This is
-				// where a far-field page is compressed, once per production: an SVT page's
-				// content is final, so nothing re-encodes it while the slot keeps its page.
-				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
-					_encode_pending[size_t(job.slot)] = 1;
-				}
-				_set_ready(job.slot, true, generation, material_version, job.sequence);
-			} else {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_invalidated_pages++;
-				}
-				PendingJob invalid = job;
-				invalid.kind = PENDING_INVALIDATE;
-				compute_jobs.push_back(invalid);
-				_set_ready(job.slot, false, generation, material_version, job.sequence);
-			}
-		} else {
-			compute_jobs.push_back(job);
-		}
+	if (!_dispatch_frame_jobs(jobs, generation, material_version, page_count, page_size, border,
+				stored_size, material_count, invalidate_all, cell_store.ptr())) {
+		return;
 	}
-	// A pure invalidation has nothing to shade under the scratch regime: its only effect is
-	// the readiness clear above, and dispatching it would write zeros into whichever scratch
-	// layer the shader named, which may belong to a page whose encode is still in flight.
-	if (scratch) {
-		compute_jobs.erase(std::remove_if(compute_jobs.begin(), compute_jobs.end(),
-								   [](const PendingJob &p_job) { return p_job.kind == PENDING_INVALIDATE; }),
-				compute_jobs.end());
-	}
-	if (!compute_jobs.empty()) {
-		std::vector<PendingJob> original_jobs = compute_jobs;
-		if (!_record_jobs(compute_jobs, generation, page_size, border, stored_size, material_count)) {
-			std::lock_guard<std::mutex> lock(_mutex);
-			if (_generation == generation) {
-				for (const PendingJob &job : original_jobs) {
-					_pending.emplace(job.slot, job);
-				}
-				_invalidate_all = _invalidate_all || invalidate_all;
-			}
-			return;
-		}
-		for (const PendingJob &job : compute_jobs) {
-			if (job.kind == PENDING_BAKE) {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_baked_pages++;
-				}
-				// The bake dispatch is recorded just above, so the encoder dispatch requested
-				// below reads the staging layer this same recording wrote.
-				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
-					_encode_pending[size_t(job.slot)] = 1;
-				}
-				_set_ready(job.slot, true, generation, material_version, job.sequence);
-			} else {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_invalidated_pages++;
-				}
-				_set_ready(job.slot, false, generation, material_version, job.sequence);
-			}
-		}
-	}
-	// Every page produced by this callback (bake or cell copy) is read back here, in the
-	// same recording that wrote it.
-	_request_encodes();
 	if (requested_capacity > page_count) {
 		// Migrate after this frame's writes so both the still-bound old arrays and
 		// the newly published arrays contain the same completed page contents.

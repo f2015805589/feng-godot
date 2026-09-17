@@ -308,15 +308,23 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// lead is what both views plan for, and a value updated per demand pass would differ
 	// between them.
 	_vt_update_motion_lead();
-	// The tick's budget for everything below. A phase that can stop between two units of
-	// work reads this deadline, so streaming cannot put an unbounded amount of planning or
-	// page production into one frame; what it did not finish runs on the next tick.
-	_vt.vt_tick_deadline_us = _vt.vt_frame_budget_ms > 0.f
-			? vt_started + uint64_t(double(_vt.vt_frame_budget_ms) * 1000.0)
-			: 0;
-	// Phase attribution for the tick: the service check, each view's demand pass, the
-	// near-field production top-up, and the far-field bake. Without it a peak can only be
-	// read as "VT was slow".
+	// The budget a phase that can stop between two units of work reads before continuing.
+	//
+	// It is re-armed at the start of every phase, so `vt_frame_budget_ms` bounds what one
+	// phase may spend rather than what the whole section may spend. A deadline shared by the
+	// section was consumed by the service check and the far field before the near field ran,
+	// so the near field found it already expired on every tick of a moving view, produced its
+	// one-page floor and stopped - which is the shape that leaves a turning view refining in
+	// visible blocks and a page arriving every other tick. Per phase, each of the three passes
+	// is bounded by the number a profiler attributes the peak to.
+	auto arm_phase_deadline = [&]() {
+		_vt.vt_tick_deadline_us = _vt.vt_frame_budget_ms > 0.f
+				? Time::get_singleton()->get_ticks_usec() + uint64_t(double(_vt.vt_frame_budget_ms) * 1000.0)
+				: 0;
+	};
+	// Phase attribution for the tick: the service check, the near field's demand pass, the far
+	// field's demand pass, the page-arrival fade, and the far-field bake. Without it a peak can
+	// only be read as "VT was slow".
 	uint64_t vt_mark = vt_started;
 	auto vt_phase = [&vt_mark](double &r_phase) {
 		const uint64_t now = Time::get_singleton()->get_ticks_usec();
@@ -329,59 +337,78 @@ void Terrain3D::__physics_process(const double p_delta) {
 	};
 	traced("vt_service", [&] { _update_vt_service(); });
 	vt_phase(_vt.vt_service_ms);
-	// VT Setting supplies one production budget for both addressing views.
+	// The demand passes below do not release the source workers they prime; the tick does, once every
+	// phase has been measured. A worker woken inside a phase starts assembling on this thread's cores,
+	// and a phase is wall time on this thread, so it would read as its own cost. See
+	// Terrain3DPagePipeline::flush_wakes().
+	_vt.vt_tick_active = true;
+	// VT Setting supplies one production budget for both addressing views. The near field runs
+	// first with its share and the far field runs second with the rest.
+	//
+	// The near field used to run first with half the budget and again in a "top-up" phase with
+	// the remainder. The second call re-derived the same classification, re-retained the same
+	// source queue, re-primed the same workers and republished the same statistics - about half
+	// a millisecond of bookkeeping on a moving view - to buy at most one more page. One pass
+	// buys the same pages for the cost of one; what the top-up gave the near field, its share
+	// reserves instead.
 	int vt_remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
 	const bool svt_baking = !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty();
 	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
+	// How much of this tick's page budget the near field may take, and what the far field gets
+	// of it: the near field's half, then whatever the near field did not spend. The near field's
+	// own report is what moves the remainder, and it is bounded by the share it was given, so
+	// the remainder is a real budget rather than a count of re-queues.
+	//
+	// The far field cannot be treated as a small consumer on the strength of its page count
+	// alone: a far page with no baked cell assembles its source on this thread, so a far page
+	// that is not given a slot this tick is re-requested - and re-assembled - on the next one.
+	// Too small a share is therefore more total work, not less, and it also changes when the
+	// far field's startup grace ends - the frames in which a scene renders from the source
+	// array instead of the missing-page diagnostic.
+	// With no far field to share with, the near field takes the whole budget: it is then the only
+	// consumer of it, and halving it halves how many pages a view fills in per tick. That case is
+	// the whole of `vt_sectors`, `vt_metric_density`, `vt_region_ownership` and `vt_filtering`, and
+	// four recorded-good scenarios failed when this line lost the conditional.
+	const int avt_share = _vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining;
 	int avt_produced = 0;
-	// Cleared per tick, so a top-up below can only be skipped on a tick whose own near-field
-	// pass reached the settled verdict.
-	_vt.avt_idle_tick = false;
+	// The tiers run in the order they are built in: the near field's pass publishes the
+	// near-field addressing state the material reads and the far field's publishes the
+	// far-field one, and a scene that only uses the near field must not have its first frame
+	// decided by the far field's.
+	//
+	// The near field always gets a pass: even with nothing left to produce it re-marks its
+	// resident pages as demanded, and a tick skipped here would let the pool evict the view.
+	arm_phase_deadline();
 	traced("vt_avt", [&] {
-		if (_vt.surface_vt_enabled) {
-			avt_produced = update_surface_vt(_vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining);
-			vt_remaining -= avt_produced;
-		}
+		if (_vt.surface_vt_enabled) { avt_produced = update_surface_vt(avt_share); }
 	});
 	vt_phase(_vt.vt_avt_ms);
-	if (_vt.vt_avt_ms > _vt.vt_avt_peak_ms) { _vt.vt_avt_peak_ms = _vt.vt_avt_ms; }
+	if (_vt.vt_avt_ms > _vt.vt_avt_peak_ms) {
+		_vt.vt_avt_peak_ms = _vt.vt_avt_ms;
+		// The stages of the pass that produced the peak, kept in their own dictionary. The live
+		// one is overwritten by every pass, so a peak read from it describes whatever ran last -
+		// which is never the peak, because the peak is by definition the pass that took longest.
+		_vt.avt_peak_stats = _vt.avt_sector_stats.duplicate();
+		_vt.avt_peak_stamp_us = Time::get_singleton()->get_ticks_usec();
+	}
 	// Refresh the far field: a world-space page grid that spans regions.
+	const int svt_share = MAX(0, vt_remaining - MIN(vt_remaining, avt_produced));
+	arm_phase_deadline();
 	traced("vt_svt", [&] {
-		if (_vt.surface_svt_enabled && vt_remaining > 0) {
-			vt_remaining -= update_surface_svt(vt_remaining);
-		}
+		if (_vt.surface_svt_enabled && svt_share > 0) { update_surface_svt(svt_share); }
 	});
 	vt_phase(_vt.vt_svt_ms);
 	if (_vt.vt_svt_ms > _vt.vt_svt_peak_ms) { _vt.vt_svt_peak_ms = _vt.vt_svt_ms; }
-	traced("vt_topup", [&] {
-		if (!svt_baking && vt_remaining > 0 && _vt.surface_vt_enabled && is_sector_avt() &&
-				_vt.vt_shared_ready && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
-			// The initial split lets SVT make progress, but unused SVT budget belongs
-			// to AVT again. Do not cap near-page throughput at eight forever.
-			//
-			// The near field just answered this same question, and its answer was "settled":
-			// its plan was reused, every resident page was verified to still hold content,
-			// and the pool residency was the one it verified. The only thing that can have
-			// changed in between is the far field taking or releasing a slot, which is what
-			// the residency revision still matching rules out - so the walk, the per-page
-			// readiness checks and the statistics of a second empty pass are skipped.
-			const auto topup_pool = _vt.surface_vt->get_page_pool();
-			const bool settled = _vt.avt_idle_tick && topup_pool &&
-					_vt.avt_idle_revision == topup_pool->residency_revision;
-			if (!settled) {
-				const uint64_t started = Time::get_singleton()->get_ticks_usec();
-				const int extra = _produce_sector_avt_pages(vt_remaining);
-				vt_remaining -= extra;
-				_vt.avt_sector_stats["produced"] = avt_produced + extra;
-				// The top-up is reported on its own. `cpu_update_ms` is the reading the sector
-				// planner itself took, and adding the top-up into it turned a per-tick duration
-				// into a counter that only ever grew, which is not a cost anyone can act on.
-				_vt.avt_sector_stats["topup_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
-			}
-		}
-	});
+	// Nothing runs between the near field and the far-field bake any more. The phase is still
+	// reported so a profiler timeline keeps its shape and the tests keep their key.
 	vt_phase(_vt.vt_topup_ms);
+	// Page-arrival fades are published after both demand passes, because it is their readiness
+	// checks that say a page arrived. The work is a per-slot countdown and, only while a page
+	// is arriving, a one-texel-per-slot upload.
+	traced("vt_fade", [&] { _update_vt_page_fade(); });
+	vt_phase(_vt.vt_fade_ms);
+	arm_phase_deadline();
 	traced("vt_bake", [&] {
 		if (svt_baking) {
 			_vt.surface_svt->set_allocation_budget(MAX(0, vt_remaining));
@@ -395,6 +422,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	});
 	if (demand_pool) { demand_pool->end_demand(); }
 	vt_phase(_vt.vt_bake_ms);
+	_vt.vt_tick_active = false;
 	_vt.vt_tick_deadline_us = 0;
 	_vt.vt_cpu_ms = double(Time::get_singleton()->get_ticks_usec() - vt_started) / 1000.0;
 	if (_vt.vt_cpu_ms > _vt.vt_cpu_peak_ms) { _vt.vt_cpu_peak_ms = _vt.vt_cpu_ms; }
@@ -412,6 +440,13 @@ void Terrain3D::__physics_process(const double p_delta) {
 	}
 	TerrainProfileZone::plot("pages_late", double(_vt.avt_late_pages));
 	TerrainProfileZone::plot("motion_speed", double(_vt.avt_motion_velocity.length()));
+	// Last, and outside both the phases and the section: the source workers for everything the
+	// phases just submitted start here, against the render rather than against the tick that
+	// submitted their work. A worker started inside a phase competes for this thread's cores and
+	// makes that phase read as its own cost; the section is this thread's own work, and starting
+	// workers is not. Nothing is lost by waiting: work submitted by a phase cannot be assembled
+	// within it, and the previous tick's work has had a whole frame to be assembled in.
+	_flush_source_wakes();
 }
 
 bool Terrain3D::_vt_tick_expired() const {

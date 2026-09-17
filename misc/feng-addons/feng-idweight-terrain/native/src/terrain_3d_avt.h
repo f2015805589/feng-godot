@@ -101,7 +101,15 @@ struct Terrain3DAVTHierarchy {
 struct Terrain3DAVTProducePass {
 	std::vector<const Terrain3DAVTPageRequest *> missing; // Planned pages with no physical slot yet.
 	std::vector<int> protected_slots;
+	// Index of the first entry of `missing` this pass has not attempted. The source queue is
+	// primed from here, so the refill after a production submits the pages *behind* the ones
+	// just produced instead of re-submitting those.
+	size_t missing_next = 0;
 	uint64_t allocation_us = 0, payload_us = 0, queue_us = 0;
+	// `allocation_us` split into the two things it covers, because they have different
+	// fixes: asking the pool for a slot (the allocator's own cost) and clearing the slot's
+	// content before the new page is written (the producer's).
+	uint64_t request_us = 0, invalidate_us = 0;
 	int produced = 0, prefetched = 0;
 	bool prefetch_pending = false;
 	// Diagnostics over the sampled prefix of the plan: pages the current image
