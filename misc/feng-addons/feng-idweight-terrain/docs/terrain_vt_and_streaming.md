@@ -13,8 +13,8 @@ far field persists baked material pages; geometry can run as a CDLOD quadtree. S
 | System | Job | Entry points |
 |---|---|---|
 | **CDLOD** | Geometry quadtree, instanced patch meshes, GPU vertex morphing | `native/src/terrain_3d_cdlod.{h,cpp}`, `shaders/main.glsl` |
-| **AVT** | Near-field adaptive virtual texture over 64 m world sectors | `native/src/terrain_3d_sector_avt.cpp`, `terrain_3d_vt_service.cpp`, `terrain_3d_avt.h` |
-| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_surface_vt*.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
+| **AVT** | Near-field adaptive virtual texture over 64 m world sectors | `native/src/terrain_3d_sector_avt.cpp`, `terrain_3d_surface_views.cpp`, `terrain_3d_avt.h` |
+| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_vt_service*.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
 
 They share the world cell grid and the physical page pool, but they have **separate
 address spaces, separate demand passes and separate level rules**. They are not one
@@ -465,9 +465,21 @@ deliberately not packed into the indirection texel:
 * **The ramp is a countdown per slot**, decremented once per tick in the tick's `vt_fade` phase. A
   slot whose content is queued is marked pending from that moment (`_queue_vt_material_page()`, the
   one funnel every production goes through), and the tick a demand pass observes it ready is the tick
-  its fade starts. Marking at queue time rather than only from the demand pass's own observations is
-  what makes a page re-produced into a *fresh* slot fade at all: that slot has no earlier unready
+  its fade is *armed*. Marking at queue time rather than only from the demand pass's own observations
+  is what makes a page re-produced into a *fresh* slot fade at all: that slot has no earlier unready
   reading to compare against.
+* **Armed is not started.** An arrival is published at zero first — the level it replaces — and its
+  countdown does not begin until the pass releases it, a few slots per tick, oldest first. This is the
+  other half of the anti-flicker measure, and the half a turning camera needs: a turn makes arrivals
+  *burst*, and a burst that started every ramp on the same tick sharpened a whole block on one tick
+  however smooth each page's own ramp was. The release rate is at least two ramps a tick, and a
+  backlog larger than the ramp's own length is spread over it, so a burst sharpens in about the time
+  one ramp takes — an isolated arrival still starts the tick it lands. A held slot is neither blurry
+  nor late: it shows the level its page replaces, which is what the shader resolves at `fade = 0`, and
+  the hierarchy's terminal root never fades at all (`avt_filtered_sample()` returns it directly), so
+  base coverage still arrives as fast as it is produced. `vt_page_fade_held_slots` is the blur this
+  trades for smoothness and `vt_page_fade_starts_peak` is the flicker it removes — the second is the
+  number to read when a view still refines in visible blocks.
 * **The blend is against the level the page replaced.** The near field's `avt_filtered_sample()` and
   the far field's `surface_svt_material_sample()` both take the first resident level and then —
   only while that level's fade is incomplete — continue to the next resident level and mix by
@@ -940,6 +952,20 @@ page on every tick of a still camera, and all three are now one read of the same
   churned instead of converging. Yaw is snapped to 2°, pitch to 1.5° and roll to 3° — under a third
   of a frame of yaw at a fast 6°/frame pan — and the pages are still selected from the exact
   predicted transform, so only the moment a selection is re-derived moves.
+* **The lead turns the gaze, not only moves the eye.** The prediction used to be a translation
+  only, which is why a straight run streamed less than a turn: a turn brings new world into the
+  frustum at every distance at once — 20° is 70 m of terrain at 200 m — and a plan that keeps
+  looking where the camera looks now names none of it, so those pages were demanded after they
+  were already on screen. The rate is estimated from consecutive forward vectors (roll sweeps no
+  new world into the frustum, so it is deliberately not predicted), smoothed and clamped like the
+  linear velocity, and applied as the angle `rate × vt_motion_lead_ms` about the axis the camera is
+  turning around. A rotation over 25° in one interval is a snap and not a turn — `snap()`, a
+  teleport, a cut — and drops the estimate instead of aiming the plan at it. The angle is capped at
+  15°, which is what a 60°/s turn covers in one default lead: the cap is the cost, because the
+  pages a turn sweeps in are pages the pool must then hold, and `vt_turn_budget` reads 15° as the
+  same near-field mean as no turn lead (0.101 ms, against a baseline that sits on the 0.1 ms budget
+  on this machine) while 45° reads 2.7× it. The readings are published as `motion_turn_deg_s` and
+  `motion_turn_lead_deg` beside `motion_speed`/`motion_lead_m`.
 * **The source queue is retained once per plan, not once per pass.** What the queue should keep is
   the plan plus the prefetch plan, and that only changes when a plan is installed or the prefetch
   switch flips. A repeated retention is 250 map lookups that reach the state the previous one
@@ -1336,11 +1362,11 @@ and were left alone rather than fixed blind.
 | Page record, indirection walk, POT block allocator | `native/src/terrain_vt.h` |
 | Per-frame VT state and settings | `native/src/terrain_3d_vt_state.h` |
 | Near-field planner, directory, production pass | `native/src/terrain_3d_sector_avt.cpp` |
-| Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_vt_service.cpp`, `terrain_3d_vt_demand.cpp` |
+| Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_surface_views.cpp`, `terrain_3d_vt_demand.cpp` |
 | Page table (indirection), per-view addressing | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
 | Shared physical pool: atlas, slots, LRU, ownership | `native/src/terrain_3d_vt_page_pool.{h,cpp}` |
-| Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_surface_vt_bake.cpp` |
-| Service settings, lifecycle, page plumbing, diagnostics | `native/src/terrain_3d_surface_vt.cpp`, `terrain_3d_surface_vt_pages.cpp`, `terrain_3d_surface_vt_report.cpp` |
+| Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_vt_service_bake.cpp` |
+| Service settings, lifecycle, page plumbing, diagnostics | `native/src/terrain_3d_vt_service.cpp`, `terrain_3d_vt_service_pages.cpp`, `terrain_3d_vt_service_report.cpp` |
 | Resident far-field cell sources (GPU arrays, budget, eviction) | `native/src/terrain_3d_vt_cells.{h,cpp}` |
 | GPU page demand | `native/src/terrain_3d_vt_feedback.{h,cpp}` |
 | Shader-side addressing and sampling | `native/src/shaders/main.glsl` |

@@ -4,11 +4,13 @@
 
 // One of three files that own the near field's planning. A page costs several frames to assemble
 // and a compressed one several more to encode and read back, so demand issued at the moment a page
-// becomes visible can only ever be late. The plan therefore describes the camera's position one
-// lead ahead: `_vt_update_motion_lead()` smooths the velocity and slews the lead so that a noisy
-// frame time cannot swing the working set, and `_vt_plan_key_transform()` quantizes the predicted
-// transform so the key only changes when the camera leaves a cell - a key that changed every frame
-// would re-derive every page address and throw away the worker's time on each tick.
+// becomes visible can only ever be late. The plan therefore describes the camera one lead ahead -
+// both where it will be and where it will be looking, because a turn brings new world into the
+// frustum exactly as a step does: `_vt_update_motion_lead()` smooths the velocity and the turn rate
+// and slews both leads so that a noisy frame time cannot swing the working set, and
+// `_vt_plan_key_transform()` quantizes the predicted transform so the key only changes when the
+// camera leaves a cell - a key that changed every frame would re-derive every page address and
+// throw away the worker's time on each tick.
 //
 // The other two: `terrain_3d_sector_avt.cpp` (the entry point and its configuration) and
 // `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy and the address directory).
@@ -55,27 +57,57 @@ constexpr float MOTION_HEIGHT_QUANTUM = 2.f;
 constexpr float MOTION_YAW_QUANTUM = 0.034906585f; // 2 degrees
 constexpr float MOTION_PITCH_QUANTUM = 0.026179939f; // 1.5 degrees
 constexpr float MOTION_ROLL_QUANTUM = 0.052359878f; // 3 degrees
+// Turn look-ahead shaping. A camera that turns sweeps new world into the frustum at every distance
+// at once - twenty degrees is seventy metres of terrain at 200 m - so the angle needs the same
+// treatment the linear speed gets, and the two clamps below are the ones a turn can abuse.
+//
+// A rotation larger than this in one interval is a snap and not a turn: `snap()`, a teleport, a
+// cut. The camera did not travel through that angle and no interval of it predicts the next one,
+// so it must not aim the plan.
+constexpr float MOTION_MAX_TURN_STEP = 0.4363323f; // 25 degrees per interval
+// The rate is clamped as the linear speed is, so a burst of intervals arriving together cannot
+// turn one frame into a whole revolution of lead.
+constexpr float MOTION_MAX_TURN_RATE = 8.f; // radians per second
+// The lead is an angle for the same reason the sweep is one: a single angle moves the frustum by
+// the same amount at every distance. It is derived - the turn rate times the lead - and capped
+// here, because the cap is what the plan's cost is a function of: the pages a turn brings into the
+// frustum are pages the pool then has to hold, and the near field's phase mean follows the working
+// set the plan names. 15 degrees is the angle a 60 degrees per second turn covers in one default
+// lead of 250 ms, so a realistic swipe gets the lead it asks for and only a stress-rate turn is
+// held back. Measured on `native/tests/vt_turn_budget.gd`: 15 degrees reads the same near-field
+// mean as no turn lead at all (0.101 ms, at the budget's edge on this machine, where the baseline
+// is the same coin flip), while 45 degrees reads 2.7x it (0.27-0.30 ms). The cap is where that
+// trade lives, and it is the one number to raise for a view that turns harder than it serves.
+constexpr float MOTION_MAX_TURN_LEAD = 0.2617994f; // 15 degrees
+// And slew limited like the linear lead, in radians per second of lead change: the start of a real
+// turn is followed within a few frames, a single noisy interval is not followed at all.
+constexpr float MOTION_TURN_SLEW_RATE = 6.f;
 }
 
 // Motion look-ahead. A page costs several frames to assemble and a compressed page
 // several more to encode and read back, so demand issued at the moment a page becomes
 // visible can only ever be late: the view streams in. The plan therefore describes the
-// camera's position one lead ahead, which turns the production latency into latency that
-// the camera has not reached yet. The velocity is exponentially smoothed, so a stop
-// decays the lead instead of leaving the plan aimed at a position the camera left, and
-// an edit or a teleport is bounded by the clamps below.
+// camera one lead ahead - its position and its gaze, for the reason the two clamps exist:
+// a turn is a way of moving the frustum, and it is the one the position alone cannot
+// express. The velocity and the turn rate are exponentially smoothed, so a stop or a turn
+// that ends decays the lead instead of leaving the plan aimed where the camera no longer
+// is, and an edit, a teleport or a snap is bounded by the clamps below.
 void Terrain3D::_vt_update_motion_lead() {
 	Camera3D *camera = get_camera();
 	if (!camera || !camera->is_inside_tree() || _vt.vt_motion_lead_ms <= 0.f) {
 		_vt.avt_motion_lead = Vector2();
 		_vt.avt_motion_valid = false;
 		_vt.avt_motion_velocity = Vector2();
+		_vt.avt_motion_turn = Vector3();
+		_vt.avt_motion_turn_lead = Vector3();
+		_vt.avt_motion_last_forward = Vector3();
 		_vt.avt_retain_epochs = 8;
 		_vt.avt_plan_refresh_frames = 1;
 		return;
 	}
 	const Transform3D transform = camera->get_camera_transform();
 	const Vector2 focus(transform.origin.x, transform.origin.z);
+	const Vector3 forward = -transform.basis.get_column(2);
 	const uint64_t now = Time::get_singleton()->get_ticks_usec();
 	if (_vt.avt_motion_valid && now <= _vt.avt_motion_stamp_us + MOTION_MIN_INTERVAL_US) {
 		return;
@@ -87,9 +119,23 @@ void Terrain3D::_vt_update_motion_lead() {
 			Vector2 velocity = (focus - _vt.avt_motion_last_focus) / delta;
 			if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
 			_vt.avt_motion_velocity = _vt.avt_motion_velocity.lerp(velocity, MOTION_SMOOTHING);
+			// The gaze's rotation over the interval, as an axis and an angle. Two forward
+			// vectors cannot see roll, which is the point: see the state's note.
+			const Vector3 cross = _vt.avt_motion_last_forward.cross(forward);
+			const float step = std::asin(CLAMP(cross.length(), 0.f, 1.f));
+			if (step > MOTION_MAX_TURN_STEP) {
+				// A snap. The interval holds no turn rate to smooth, and the lead the previous
+				// turn built up slews back down rather than being replaced by the snap's.
+				_vt.avt_motion_turn = Vector3();
+			} else {
+				Vector3 turn = cross.length() > 1e-6f ? cross.normalized() * (step / delta) : Vector3();
+				if (turn.length() > MOTION_MAX_TURN_RATE) { turn = turn.normalized() * MOTION_MAX_TURN_RATE; }
+				_vt.avt_motion_turn = _vt.avt_motion_turn.lerp(turn, MOTION_SMOOTHING);
+			}
 		}
 	}
 	_vt.avt_motion_last_focus = focus;
+	_vt.avt_motion_last_forward = forward;
 	_vt.avt_motion_stamp_us = now;
 	_vt.avt_motion_valid = true;
 	const float lead_seconds = float(_vt.vt_motion_lead_ms) / 1000.f;
@@ -99,10 +145,23 @@ void Terrain3D::_vt_update_motion_lead() {
 	Vector2 target = _vt.avt_motion_velocity * lead_seconds;
 	if (target.length() > max_lead) { target = target.normalized() * max_lead; }
 	// Slew limit: a real acceleration is followed within a few frames, a noisy frame time
-	// is not followed at all.
-	const float max_step = MOTION_LEAD_SLEW_RATE * MAX(delta, 0.001f);
+	// is not followed at all. The turn lead is slewed on the same interval, at its own rate.
+	const float interval = MAX(delta, 0.001f);
+	const float max_step = MOTION_LEAD_SLEW_RATE * interval;
 	const Vector2 change = target - _vt.avt_motion_lead;
 	_vt.avt_motion_lead = change.length() > max_step ? _vt.avt_motion_lead + change.normalized() * max_step : target;
+	// The turn lead, shaped exactly like the linear one: a target, a cap and the same slew limit.
+	// It is what a turn actually needs, and the reason the plan describes a frustum and not a point.
+	const Vector3 turn_target_unslewed = _vt.avt_motion_turn * lead_seconds;
+	const float turn_reach = turn_target_unslewed.length();
+	const Vector3 turn_target = turn_reach > MOTION_MAX_TURN_LEAD
+			? turn_target_unslewed * (MOTION_MAX_TURN_LEAD / turn_reach)
+			: turn_target_unslewed;
+	const float max_turn_step = MOTION_TURN_SLEW_RATE * interval;
+	const Vector3 turn_change = turn_target - _vt.avt_motion_turn_lead;
+	_vt.avt_motion_turn_lead = turn_change.length() > max_turn_step
+			? _vt.avt_motion_turn_lead + turn_change.normalized() * max_turn_step
+			: turn_target;
 	// Retention is measured in plan epochs, which are one install apart. The window is at least
 	// one lead wide: the plan describes the view *ahead* of the camera, so the view being
 	// rendered is covered by requests retained from the plans that preceded it.
@@ -119,11 +178,18 @@ void Terrain3D::_vt_update_motion_lead() {
 }
 
 Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_transform) const {
-	if (_vt.avt_motion_lead == Vector2()) {
-		return p_camera_transform;
-	}
 	Transform3D lead = p_camera_transform;
-	lead.origin += Vector3(_vt.avt_motion_lead.x, 0.f, _vt.avt_motion_lead.y);
+	if (_vt.avt_motion_lead != Vector2()) {
+		lead.origin += Vector3(_vt.avt_motion_lead.x, 0.f, _vt.avt_motion_lead.y);
+	}
+	// The gaze is turned as well, about the axis the camera is turning around. Moving the eye
+	// alone describes the frustum the camera will have while looking where it looks now, which is
+	// what a turn makes wrong: the new world a turn brings in is off to the side of that frustum,
+	// so the plan named none of it and the pages for it arrived after it was already on screen.
+	const float turn = _vt.avt_motion_turn_lead.length();
+	if (turn > 0.f) {
+		lead.basis = Basis(_vt.avt_motion_turn_lead / turn, turn) * p_camera_transform.basis;
+	}
 	return lead;
 }
 

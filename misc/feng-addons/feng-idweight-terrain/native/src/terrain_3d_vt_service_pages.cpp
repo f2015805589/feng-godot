@@ -7,14 +7,14 @@
 // from, and the two helpers that decide whether such a page can be assembled at all. None of it
 // plans demand; the demand passes are in terrain_3d_vt_demand.cpp and terrain_3d_sector_avt.cpp.
 //
-// The other halves: terrain_3d_surface_vt.cpp (settings and lifetime),
-// terrain_3d_surface_vt_report.cpp (the diagnostics) and terrain_3d_surface_vt_bake.cpp (the far
+// The other halves: terrain_3d_vt_service.cpp (settings and lifetime),
+// terrain_3d_vt_service_report.cpp (the diagnostics) and terrain_3d_vt_service_bake.cpp (the far
 // field's bake and its cell files).
 
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
-#include "terrain_3d_surface_vt_internal.h"
+#include "terrain_3d_vt_service_internal.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_vt_cell.h"
 
@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-// The two helpers the four halves share; see terrain_3d_surface_vt_internal.h for what it holds
+// The two helpers the four halves share; see terrain_3d_vt_service_internal.h for what it holds
 // and why it is a header.
 using namespace terrain_surface_vt;
 

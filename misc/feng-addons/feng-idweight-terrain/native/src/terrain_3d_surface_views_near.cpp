@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Surface virtual texture service, part 3 of 3: the near field's demand pass and its sectors.
+// The two surface views, part 3 of 3: the near field's demand pass and its sectors.
 
-// One of three files that define the service's entry points. `update_surface_vt()` is the AVT pass:
+// One of three files that define the two views and their demand passes. `update_surface_vt()` is the AVT pass:
 // it reads the camera-visible regions through `terrain_region_in_frustum()`, a file-scope static,
 // which is why that helper is here and not with the settings, and bounds them with
 // `get_surface_vt_region_rect()`, which calls it. It gives each visible region a virtual block
@@ -12,11 +12,11 @@
 // that tells it which pages the shader actually sampled, and `_publish_vt_block_tables()` is what the
 // material binds afterwards.
 //
-// The other halves: `terrain_3d_vt_service.cpp` (the views and the settings) and
-// `terrain_3d_vt_svt.cpp` (the far field's demand pass).
+// The other halves: `terrain_3d_surface_views.cpp` (the views and the settings) and
+// `terrain_3d_surface_views_far.cpp` (the far field's demand pass).
 
 #include "terrain_3d.h"
-#include "terrain_3d_vt_service_internal.h"
+#include "terrain_3d_surface_views_internal.h"
 
 #include "logger.h"
 

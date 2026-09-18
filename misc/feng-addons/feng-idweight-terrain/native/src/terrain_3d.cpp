@@ -8,14 +8,15 @@
 // for, and `_notification()` / `_validate_property()` under the protected banner.
 //
 // The rest of the class is defined in the file that owns that concern:
-//   terrain_3d_wiring.cpp     the subsystem nodes and GPU objects this node creates and releases
-//   terrain_3d_monitors.cpp   this node's custom Performance monitors
-//   terrain_3d_vt_service.cpp surface virtual texture service and demand
-//   terrain_3d_geometry.cpp   region-grid triangle generation
-//   terrain_3d_properties.cpp configuration setters
-//   terrain_3d_queries.cpp    raycasts, baked meshes, nav source geometry, warnings
-//   terrain_3d_bindings.cpp   ClassDB bindings and property registration
-//   terrain_3d_profile.h      the `terrain/...` profiler zone and plot helper
+//   terrain_3d_wiring.cpp            the subsystem nodes and GPU objects this node creates and releases
+//   terrain_3d_monitors.cpp          this node's custom Performance monitors
+//   terrain_3d_vt_service*.cpp       the virtual texture service: settings, lifetime, pages, bake
+//   terrain_3d_surface_views*.cpp    the two surface views and their demand passes
+//   terrain_3d_geometry.cpp          region-grid triangle generation
+//   terrain_3d_properties.cpp        configuration setters
+//   terrain_3d_queries.cpp           raycasts, baked meshes, nav source geometry, warnings
+//   terrain_3d_bindings.cpp          ClassDB bindings and property registration
+//   terrain_3d_profile.h             the `terrain/...` profiler zone and plot helper
 
 #include "terrain_3d.h"
 
@@ -340,6 +341,9 @@ void Terrain3D::__physics_process(const double p_delta) {
 	}
 	TerrainProfileZone::plot("pages_late", double(_vt.avt_late_pages));
 	TerrainProfileZone::plot("motion_speed", double(_vt.avt_motion_velocity.length()));
+	// The turn's own reading, beside the speed it is the counterpart of: a view that streams while
+	// turning shows as a rate with no lead to match it.
+	TerrainProfileZone::plot("motion_turn_deg_s", Math::rad_to_deg(double(_vt.avt_motion_turn.length())));
 	// Last, and outside both the phases and the section: the source workers for everything the
 	// phases just submitted start here, against the render rather than against the tick that
 	// submitted their work. A worker started inside a phase competes for this thread's cores and

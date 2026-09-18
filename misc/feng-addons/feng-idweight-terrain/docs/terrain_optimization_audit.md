@@ -99,11 +99,11 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_surface_baker_queue.cpp
 - [x] native/src/terrain_3d_surface_baker_storage.cpp
 - [x] native/src/terrain_3d_surface_source.cpp
-- [x] native/src/terrain_3d_surface_vt.cpp
-- [x] native/src/terrain_3d_surface_vt_bake.cpp
-- [x] native/src/terrain_3d_surface_vt_internal.h
-- [x] native/src/terrain_3d_surface_vt_pages.cpp
-- [x] native/src/terrain_3d_surface_vt_report.cpp
+- [x] native/src/terrain_3d_vt_service.cpp
+- [x] native/src/terrain_3d_vt_service_bake.cpp
+- [x] native/src/terrain_3d_vt_service_internal.h
+- [x] native/src/terrain_3d_vt_service_pages.cpp
+- [x] native/src/terrain_3d_vt_service_report.cpp
 - [x] native/src/terrain_3d_texture_asset.cpp
 - [x] native/src/terrain_3d_texture_asset.h
 - [x] native/src/terrain_3d_util.cpp
@@ -112,7 +112,7 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_virtual_texture.h
 - [x] native/src/terrain_3d_virtual_texture_lookup.cpp
 - [x] native/src/terrain_3d_virtual_texture_sector.cpp
-- [x] native/src/terrain_3d_vt_avt.cpp
+- [x] native/src/terrain_3d_surface_views_near.cpp
 - [x] native/src/terrain_3d_vt_demand.cpp
 - [x] native/src/terrain_3d_vt_fade.cpp
 - [x] native/src/terrain_3d_vt_feedback.cpp
@@ -121,9 +121,9 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_vt_indirection.h
 - [x] native/src/terrain_3d_vt_page_pool.cpp
 - [x] native/src/terrain_3d_vt_page_pool.h
-- [x] native/src/terrain_3d_vt_service.cpp
-- [x] native/src/terrain_3d_vt_service_internal.h
-- [x] native/src/terrain_3d_vt_svt.cpp
+- [x] native/src/terrain_3d_surface_views.cpp
+- [x] native/src/terrain_3d_surface_views_internal.h
+- [x] native/src/terrain_3d_surface_views_far.cpp
 - [x] native/src/terrain_3d_vt_visibility.h
 - [x] native/src/terrain_3d_wiring.cpp
 - [x] native/src/terrain_surface_idweight.h
@@ -428,7 +428,7 @@ recorded here because the deletions above are listed as "read", not as "used".
   is now a ~28 line wrapper that names its script, log and PASS marker.
 - **`terrain_3d.cpp` is six files.** At 2900 lines it held the node's lifecycle, the VT
   service, the property setters, the queries, the warnings and every ClassDB binding. The
-  definitions moved -- no logic changed -- into `terrain_3d_vt_service.cpp`,
+  definitions moved -- no logic changed -- into `terrain_3d_surface_views.cpp`,
   `terrain_3d_geometry.cpp`, `terrain_3d_properties.cpp`, `terrain_3d_queries.cpp` and
   `terrain_3d_bindings.cpp`, leaving 683 lines of node lifecycle and a comment that maps
   the rest. The compiler and the same 29 test regression check a move like this.
@@ -1136,7 +1136,7 @@ hopes so.
 ## Fixes the file audits produced
 
 Three files were read line by line by separate auditors with no shared context — `terrain_3d_material.cpp`,
-`terrain_3d_vt_service.cpp` and `terrain_3d_instancer.cpp` — and every finding below was re-verified
+`terrain_3d_surface_views.cpp` and `terrain_3d_instancer.cpp` — and every finding below was re-verified
 here before it was applied. Two were rejected at that step.
 
 * `terrain_3d_material.cpp`, `save()`: the failure log passed `ERROR` — the *log level* — where the
@@ -1155,11 +1155,11 @@ here before it was applied. Two were rejected at that step.
 * `terrain_3d_material.cpp` header: "the ~70 property setters". The file defines 42 `set_*` methods and
   42 `ADD_PROPERTY` entries. The count is gone; a number in a header comment is a number that will be
   wrong.
-* `terrain_3d_vt_service.cpp`, `_prepare_vt_block_tables()`: "Sectors are never unregistered" — the
+* `terrain_3d_surface_views.cpp`, `_prepare_vt_block_tables()`: "Sectors are never unregistered" — the
   same file's `_retire_stale_vt_sectors()` calls `unregister_sector()`.
-* `terrain_3d_vt_service.cpp`, `_collect_eligible_vt_regions()`: "Regions the far field may publish" —
+* `terrain_3d_surface_views.cpp`, `_collect_eligible_vt_regions()`: "Regions the far field may publish" —
   its only caller is `update_surface_vt()`, the near-field pass.
-* `terrain_3d_vt_service.cpp`, the diagnostic far-field scan: "measures from the clipmap target rather
+* `terrain_3d_surface_views.cpp`, the diagnostic far-field scan: "measures from the clipmap target rather
   than the camera" — it measures from `reference`, which *is* the camera whenever one is inside the
   tree, and the comment fourteen lines above says that measuring from the target is the bug being
   avoided.
@@ -1266,17 +1266,17 @@ asserted.
 
 ## The service file: 1,634 lines and five jobs in one translation unit
 
-`terrain_3d_surface_vt.cpp` was, by its own admission in its header, "the oldest of the VT files and
+`terrain_3d_vt_service.cpp` was, by its own admission in its header, "the oldest of the VT files and
 the largest" — and it listed its five groups in that header: the settings, the service's setup and
 teardown, the page plumbing, the far field's bake and the diagnostics. That list is the cut:
 
 | file | lines | owns |
 | --- | --- | --- |
-| `terrain_3d_surface_vt.cpp` | 573 | The settings and the service's lifetime: page size, border, count, workers, the motion lead, the resolution preset, both tiers' storage format, the feedback toggles, the editor preview; `_configure_vt_service()` / `_vt_has_pending_upload()` / `_vt_has_streaming_work()` / `_update_vt_service()` / `_destroy_vt_service()`; and the bindings. |
-| `terrain_3d_surface_vt_pages.cpp` | 501 | Page plumbing: invalidation of a slot, a region or every material, the material page queue, the resident far-field cell store, and the two helpers that decide whether a far page can be assembled from cells. |
-| `terrain_3d_surface_vt_report.cpp` | 237 | The diagnostics: `get_vt_settings()`, `get_vt_pages()`, the page and material previews, and the compression probe. Read-only. |
-| `terrain_3d_surface_vt_bake.cpp` | 376 | The far field's bake and its cell files: `bake_svt()`, the automatic pass, the bake queue, the `.vtcell` signature and reader, and the browser of what is baked. |
-| `terrain_3d_surface_vt_internal.h` | 61 | The two helpers the four share. |
+| `terrain_3d_vt_service.cpp` | 573 | The settings and the service's lifetime: page size, border, count, workers, the motion lead, the resolution preset, both tiers' storage format, the feedback toggles, the editor preview; `_configure_vt_service()` / `_vt_has_pending_upload()` / `_vt_has_streaming_work()` / `_update_vt_service()` / `_destroy_vt_service()`; and the bindings. |
+| `terrain_3d_vt_service_pages.cpp` | 501 | Page plumbing: invalidation of a slot, a region or every material, the material page queue, the resident far-field cell store, and the two helpers that decide whether a far page can be assembled from cells. |
+| `terrain_3d_vt_service_report.cpp` | 237 | The diagnostics: `get_vt_settings()`, `get_vt_pages()`, the page and material previews, and the compression probe. Read-only. |
+| `terrain_3d_vt_service_bake.cpp` | 376 | The far field's bake and its cell files: `bake_svt()`, the automatic pass, the bake queue, the `.vtcell` signature and reader, and the browser of what is baked. |
+| `terrain_3d_vt_service_internal.h` | 61 | The two helpers the four share. |
 
 Unlike the surface baker's split, this one is **not** four contiguous slices. `_destroy_vt_service()`
 was filed between the cell store and the invalidation helpers and belongs with the service's lifetime;
@@ -1516,16 +1516,16 @@ list: one declaration, six reads and two writes, every one of them in the file t
 
 ## The service file: three entry points, and code for a state nothing produces
 
-`terrain_3d_vt_service.cpp` was the second-largest file left, and its own header said what was in it:
+`terrain_3d_surface_views.cpp` was the second-largest file left, and its own header said what was in it:
 "the two views' enable setters and their page settings, the two demand passes with all their stages,
 and the feedback pass". Three jobs:
 
 | file | lines | owns |
 | --- | --- | --- |
-| `terrain_3d_vt_service.cpp` | 351 | Both views' setup and teardown, and every setting the dock, the inspector and scripts write, plus `invalidate_surface_pages()`. |
-| `terrain_3d_vt_svt.cpp` | 331 | The far field's demand pass, in both of its modes, with the distance -> level rule it walks. |
-| `terrain_3d_vt_avt.cpp` | 512 | The near field's pass, its GPU projection feedback pass, the camera-visible region query and the whole sector machinery. |
-| `terrain_3d_vt_service_internal.h` | 30 | `SourceWakeFlush`, the one prologue symbol two halves need. |
+| `terrain_3d_surface_views.cpp` | 351 | Both views' setup and teardown, and every setting the dock, the inspector and scripts write, plus `invalidate_surface_pages()`. |
+| `terrain_3d_surface_views_far.cpp` | 331 | The far field's demand pass, in both of its modes, with the distance -> level rule it walks. |
+| `terrain_3d_surface_views_near.cpp` | 512 | The near field's pass, its GPU projection feedback pass, the camera-visible region query and the whole sector machinery. |
+| `terrain_3d_surface_views_internal.h` | 30 | `SourceWakeFlush`, the one prologue symbol two halves need. |
 
 The first layout put `get_surface_vt_region_rect()` with the settings, and the link failed: it calls
 `terrain_region_in_frustum()`, which is a file-scope `static` and therefore belongs to the one
@@ -1536,7 +1536,7 @@ and the third time an internal header was needed for exactly one symbol.
 ### Seventeen includes that outlived their code
 
 The file carried twenty includes. Each half now starts with three — `terrain_3d.h`, `logger.h` and
-`terrain_3d_vt_service_internal.h` — and the build added nothing back, which is the proof that the
+`terrain_3d_surface_views_internal.h` — and the build added nothing back, which is the proof that the
 other seventeen were dispensable. Fifteen of them were engine headers:
 
     compositor  directional_light3d  editor_interface  engine  environment  label3d  os
@@ -1733,7 +1733,7 @@ value 39. That one format was spelled three ways across ten files.
 
 | spelling | where | sites |
 | --- | --- | --- |
-| `Image::Format(39)`, four of them with a comment beside them saying what 39 meant | `terrain_3d_data.cpp`, `terrain_3d_data_surface.cpp`, `terrain_3d_editor_texel.cpp`, `terrain_3d_page_pipeline.cpp`, `terrain_3d_region.cpp`, `terrain_3d_vt_page_pool.cpp`, `terrain_3d_vt_service.cpp`, `terrain_3d_virtual_texture.h` | 16 |
+| `Image::Format(39)`, four of them with a comment beside them saying what 39 meant | `terrain_3d_data.cpp`, `terrain_3d_data_surface.cpp`, `terrain_3d_editor_texel.cpp`, `terrain_3d_page_pipeline.cpp`, `terrain_3d_region.cpp`, `terrain_3d_vt_page_pool.cpp`, `terrain_3d_surface_views.cpp`, `terrain_3d_virtual_texture.h` | 16 |
 | `inline constexpr int IDWEIGHT_FORMAT_VALUE = 39;` "Godot's extension R16_UNORM surface format" | the surface baker's internal header, used once in `terrain_3d_surface_baker_queue.cpp` | 1 definition, 1 use |
 | `static constexpr Image::Format FORMAT_R16_UNORM = Image::Format(39);` | `terrain_3d_vt_page_pool.cpp` | 1 definition, 1 use |
 
@@ -2295,7 +2295,7 @@ says where they divide, because `_update_sector_avt()` is a driver over named st
 | --- | --- | --- |
 | `terrain_3d_sector_avt.cpp` | 432 | The demand entry point and its configuration: the tier settings the sector size is derived from, `_avt_logical_ratio()` and `get_avt_base_block_size()`, the driver `_update_sector_avt()`, `_avt_plan_state()`, the install-or-reuse decision and `_avt_submit_plan()`. |
 | `terrain_3d_sector_avt_hierarchy.cpp` | 365 | The world model's build: `_avt_scan_sectors()`, `_avt_build_hierarchy()`, `_avt_sync_address_directory()`, and the two functions that publish the directory texture the shader reads. |
-| `terrain_3d_sector_avt_motion.cpp` | 150 | Motion prediction: the smoothed velocity and slewed lead a plan is aimed at, and the quantization that keeps the plan key stable while the camera moves inside a cell. |
+| `terrain_3d_sector_avt_motion.cpp` | 207 | Motion prediction: the smoothed velocity and turn rate and the slewed leads a plan is aimed at — where the camera will be and where it will be looking — and the quantization that keeps the plan key stable while the camera moves inside a cell. |
 | `terrain_3d_sector_avt_internal.h` | 38 | The three prologue names two of the halves read: the sector's world size, the `Sector` alias and `avt_owner_key()`. |
 
 ### The prologue is the interesting part

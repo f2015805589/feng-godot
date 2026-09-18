@@ -1,5 +1,5 @@
 // The .vtcell on-disk contract, shared by the baker that writes the files
-// (terrain_3d_surface_vt.cpp) and the runtime reader that consumes them
+// (terrain_3d_vt_service.cpp) and the runtime reader that consumes them
 // (terrain_3d_page_pipeline.cpp).
 //
 // The version, the file name and the source signature must agree exactly between

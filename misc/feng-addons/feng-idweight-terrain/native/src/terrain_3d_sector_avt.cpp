@@ -105,6 +105,11 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// and not the last one that ran the whole planning chain.
 	_vt.avt_sector_stats["motion_lead_m"] = _vt.avt_motion_lead.length();
 	_vt.avt_sector_stats["motion_speed"] = _vt.avt_motion_velocity.length();
+	// The turn half of the reading: the estimated rate and the lead actually aimed with. A turn
+	// whose lead is zero is a turn the plan is not ahead of, which is the one thing to look at
+	// when a view streams while turning and not while running.
+	_vt.avt_sector_stats["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
+	_vt.avt_sector_stats["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
 	_vt.avt_sector_stats["plan_origin"] = Vector2(lead_transform.origin.x, lead_transform.origin.z);
 	_vt.avt_sector_stats["camera_origin"] = Vector2(camera_transform.origin.x, camera_transform.origin.z);
 	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }

@@ -457,8 +457,10 @@ public:
 	void set_surface_vt_selection_mode(int p_mode);
 	int get_surface_vt_selection_mode() const { return _vt.surface_vt_selection_mode; }
 	bool is_sector_avt() const { return _vt.surface_vt_selection_mode == 2 && !_vt.vt_debug_direct_material; }
-	// Motion look-ahead: smooths the camera's velocity and returns the transform the demand
-	// pass plans for. See Terrain3DVTState::vt_motion_lead_ms.
+	// Motion look-ahead: smooths the camera's velocity and its turn rate, and returns the transform
+	// both demand passes plan for - where the camera will be and where it will be looking, because a
+	// turn brings new world into the frustum the way a step does. See
+	// Terrain3DVTState::vt_motion_lead_ms and the note on the turn half of the state.
 	void _vt_update_motion_lead();
 	Transform3D _vt_lead_camera_transform(const Transform3D &p_camera_transform) const;
 	Transform3D _vt_plan_key_transform(const Transform3D &p_camera_transform) const;
@@ -474,8 +476,10 @@ public:
 	int get_vt_page_fade_frames() const { return _vt.vt_page_fade_frames; }
 	void set_vt_page_fade_frames(int p_frames);
 	// Records that a slot's content is missing or still being produced, so the tick it stops
-	// waiting - which `_update_vt_page_fade()` decides against the producer - is the tick its
-	// fade starts. Set where content is removed or queued, never by a demand pass.
+	// waiting - which `_update_vt_page_fade()` decides against the producer - is the tick its fade
+	// is *armed*. The ramp does not start there: the pass releases armed slots a few per tick, so
+	// that a burst of arrivals sharpens as a wash. Set where content is removed or queued, never by
+	// a demand pass.
 	void _vt_mark_page_waiting(int p_slot);
 	// Turns those records and the producer's readiness into the per-slot ramp the shader reads,
 	// on every tick whether or not a demand pass ran. See terrain_3d_vt_fade.cpp.

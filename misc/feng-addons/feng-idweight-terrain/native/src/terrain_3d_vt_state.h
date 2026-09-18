@@ -85,6 +85,16 @@
 class Terrain3DVirtualTexture;
 class Terrain3DVTFeedback;
 
+// What a physical slot's arrival state is, per slot, in `vt_slot_pending`. Three states rather than
+// a bool because the pass holds an arrival back between the tick its content lands and the tick its
+// ramp is released, and a slot in between is neither waiting nor settled: it is showing the level
+// its page replaces. See that field's note and terrain_3d_vt_fade.cpp.
+enum class PageArrival : uint8_t {
+	SETTLED = 0,
+	WAITING = 1,
+	ARMED = 2,
+};
+
 struct Terrain3DVTState {
 	// ---- 1. the shared service: one surface service owns the settings and the GPU material cache;
 	// AVT and SVT below are addressing/producer views over its shared physical residency pool. ----
@@ -280,6 +290,17 @@ struct Terrain3DVTState {
 	bool avt_motion_valid = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
+	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum
+	// at every distance at once, so a plan that only moves the eye describes the frustum the camera
+	// will *have* while looking where it looks now - which is the one thing a turn makes wrong, and
+	// is why a turn streams while a straight run does not. What is predicted is the gaze direction,
+	// estimated from consecutive forward vectors: roll spins the frustum about the direction it is
+	// already looking along and sweeps no new world into it, so it is deliberately not predicted.
+	Vector3 avt_motion_turn;
+	Vector3 avt_motion_last_forward;
+	// Turn lead actually applied to the last submitted plan: an axis and an angle in radians,
+	// which is what `_vt_lead_camera_transform()` rotates the predicted basis by.
+	Vector3 avt_motion_turn_lead;
 	// How long a page has been demanded without content, keyed by its address. With a
 	// lead the plan is predictive, so a page it names is not late yet - only a page that
 	// has been demanded for at least one lead and still has no content is what the image
@@ -325,19 +346,32 @@ struct Terrain3DVTState {
 	// makes obvious, because the view then refines in the rectangular grid its pages are.
 	// 0 disables it and costs nothing: the shader then reads a settled page on every fetch.
 	int vt_page_fade_frames = 12;
-	// Remaining fade ticks per physical slot; 0 means settled. `vt_slot_pending` records the
-	// slots whose content is missing or still being produced, so a slot that leaves it is one
-	// whose content landed - which is when its fade starts. The fade pass decides that on every
-	// tick from these two vectors, so an arrival is seen whether or not a demand pass ran.
+	// Remaining fade ticks per physical slot; 0 means settled. `vt_slot_pending` is that slot's
+	// arrival state: `PageArrival::SETTLED`, `WAITING` for content, or `ARMED` once the content has
+	// landed and before its ramp is released. A slot that leaves `WAITING` is one whose content
+	// landed, which is when its fade is armed; an armed slot is one the pass has deliberately not
+	// started yet, so that a burst of arrivals sharpens as a wash instead of all on one tick - which
+	// is what a whole block refining at once looks like. An armed slot reads zero in the published
+	// texture, so what it shows meanwhile is the level its page replaces, not a hole. The pass
+	// decides all of this on every tick from these two vectors, so an arrival is seen whether or not
+	// a demand pass ran.
 	std::vector<uint8_t> vt_slot_fade_ticks;
-	std::vector<uint8_t> vt_slot_pending;
+	std::vector<PageArrival> vt_slot_pending;
+	// The armed slots in the order they landed, and the cursor the pass releases from. Kept as an
+	// order rather than re-scanned so a burst is released oldest first: the page a pass asked for
+	// first is the one the view has been waiting on longest. Entries can go stale - a slot re-armed
+	// after it was queued appears twice - so the release drops what it no longer finds at 2.
+	std::vector<int> vt_page_fade_queue;
+	size_t vt_page_fade_queue_at = 0;
 	// Scratch for that decision: the slots waiting for content this tick, and the producer's
 	// answer for all of them at once.
 	std::vector<int> vt_page_fade_waiting;
 	std::vector<uint8_t> vt_page_fade_ready;
 	Ref<Image> vt_page_fade_image;
 	Ref<ImageTexture> vt_page_fade_texture;
-	// Ticks reported by the last fade update, so a settled view reports that it did nothing.
+	// Ramps the last fade update actually advanced: what a view that is fading reports, and zero
+	// from a settled one. An armed slot is deliberately not counted - its countdown has not started -
+	// so a view that is only holding the level behind an arrival reads as settled.
 	int vt_page_fade_active = 0;
 	// Ramps started since startup, and how many slots are waiting for content right now. The
 	// active count above only shows a ramp while it runs, so a page that arrived without one
@@ -345,6 +379,11 @@ struct Terrain3DVTState {
 	// the pending count is what a start is decided from.
 	uint64_t vt_page_fade_starts = 0;
 	int vt_page_fade_pending = 0;
+	// Slots whose content landed and whose ramp is still owed, and the most ramps one tick has
+	// started. The first is the blur the stagger trades for smoothness; the second is the flicker
+	// it removes, which without a number to read is a matter of opinion.
+	int vt_page_fade_held = 0;
+	int vt_page_fade_starts_peak = 0;
 	// The longest ramp still running, so how fast a ramp is spent can be read from one number:
 	// the requested length and the number of ticks it was published for are not the same thing
 	// while something else advances it.

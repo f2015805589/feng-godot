@@ -7,14 +7,14 @@
 // what is baked. A bake writes cells to disk, which is a different job from producing pages - and
 // it is the only half of the service that touches the filesystem.
 //
-// The other halves: terrain_3d_surface_vt.cpp (settings and lifetime),
-// terrain_3d_surface_vt_pages.cpp (page plumbing and the cell store) and
-// terrain_3d_surface_vt_report.cpp (the diagnostics).
+// The other halves: terrain_3d_vt_service.cpp (settings and lifetime),
+// terrain_3d_vt_service_pages.cpp (page plumbing and the cell store) and
+// terrain_3d_vt_service_report.cpp (the diagnostics).
 
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
-#include "terrain_3d_surface_vt_internal.h"
+#include "terrain_3d_vt_service_internal.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_vt_cell.h"
 
@@ -25,7 +25,7 @@
 
 #include <utility>
 
-// The two helpers the four halves share; see terrain_3d_surface_vt_internal.h for what it holds
+// The two helpers the four halves share; see terrain_3d_vt_service_internal.h for what it holds
 // and why it is a header.
 using namespace terrain_surface_vt;
 

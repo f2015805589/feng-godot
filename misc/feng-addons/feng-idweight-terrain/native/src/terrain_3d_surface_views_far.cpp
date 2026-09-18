@@ -1,19 +1,19 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Surface virtual texture service, part 2 of 3: the far field's demand pass.
+// The two surface views, part 2 of 3: the far field's demand pass.
 
-// One of three files that define the service's entry points. `update_surface_svt()` is one
+// One of three files that define the two views and their demand passes. `update_surface_svt()` is one
 // world-page grid walk around the reference the shader's level rule uses, in two modes: with the
 // material pipeline on it hands the pages it allocates to `_update_visible_svt()` (in
 // `terrain_3d_vt_demand.cpp`), and in `vt_debug_direct_material` it is the scan that fills each page
 // itself through `_write_diagnostic_sparse_page()`. The level rule it walks -
 // `get_surface_svt_mip_for_distance()` and `get_surface_svt_mip_reach()` - is here with it.
 //
-// The other halves: `terrain_3d_vt_service.cpp` (the views and the settings) and
-// `terrain_3d_vt_avt.cpp` (the near field's pass, its feedback pass and the sector machinery).
+// The other halves: `terrain_3d_surface_views.cpp` (the views and the settings) and
+// `terrain_3d_surface_views_near.cpp` (the near field's pass, its feedback pass and the sector machinery).
 
 #include "terrain_3d.h"
-#include "terrain_3d_vt_service_internal.h"
+#include "terrain_3d_surface_views_internal.h"
 
 #include "logger.h"
 

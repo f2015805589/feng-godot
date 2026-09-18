@@ -8,21 +8,21 @@
 // the compression probe a codec test uses as its reference. Read-only: nothing here changes the
 // service.
 //
-// The other halves: terrain_3d_surface_vt.cpp (settings and lifetime),
-// terrain_3d_surface_vt_pages.cpp (page plumbing and the cell store) and
-// terrain_3d_surface_vt_bake.cpp (the far field's bake and its cell files).
+// The other halves: terrain_3d_vt_service.cpp (settings and lifetime),
+// terrain_3d_vt_service_pages.cpp (page plumbing and the cell store) and
+// terrain_3d_vt_service_bake.cpp (the far field's bake and its cell files).
 
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
-#include "terrain_3d_surface_vt_internal.h"
+#include "terrain_3d_vt_service_internal.h"
 #include "terrain_3d_virtual_texture.h"
 
 #include <godot_cpp/classes/control.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/time.hpp>
 
-// The two helpers the four halves share; see terrain_3d_surface_vt_internal.h for what it holds
+// The two helpers the four halves share; see terrain_3d_vt_service_internal.h for what it holds
 // and why it is a header.
 using namespace terrain_surface_vt;
 
@@ -90,6 +90,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["motion_lead_ms"] = _vt.vt_motion_lead_ms;
 	result["motion_lead_m"] = _vt.avt_motion_lead.length();
 	result["motion_speed"] = _vt.avt_motion_velocity.length();
+	result["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
+	result["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
 	result["visible_late_pages"] = _vt.avt_late_pages;
 	result["visible_late_worst_ms"] = double(_vt.avt_late_worst_us) / 1000.0;
 	result["visible_retained_pages"] = _vt.avt_retained_pages;
@@ -136,10 +138,17 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["vt_cpu_ms"] = _vt.vt_cpu_ms;
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
 	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
+	// The page-arrival fade, in the order a reader asks about it: the requested ramp length, the
+	// ramps the last tick advanced, the arrivals still waiting for content, the ones armed and
+	// waiting their turn, the ramps started, the most one tick has started - which is what says
+	// whether a burst is being spread or is still arriving as one step - and the longest ramp still
+	// running.
 	result["vt_page_fade_frames"] = _vt.vt_page_fade_frames;
 	result["vt_page_fade_active_slots"] = _vt.vt_page_fade_active;
-	result["vt_page_fade_starts"] = int64_t(_vt.vt_page_fade_starts);
 	result["vt_page_fade_pending_slots"] = _vt.vt_page_fade_pending;
+	result["vt_page_fade_held_slots"] = _vt.vt_page_fade_held;
+	result["vt_page_fade_starts"] = int64_t(_vt.vt_page_fade_starts);
+	result["vt_page_fade_starts_peak"] = _vt.vt_page_fade_starts_peak;
 	result["vt_page_fade_ticks_max"] = _vt.vt_page_fade_ticks_max;
 	Dictionary phases;
 	phases["service"] = _vt.vt_service_ms;
