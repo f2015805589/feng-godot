@@ -48,10 +48,19 @@ static func material_pages(p_pages: Array, p_mip: int) -> Array:
 	return result
 
 
-# A texture for the page inspector. The baked image's alpha stores height, so it
-# must be made opaque for display; its RGB values are linear GPU output and need
-# sRGB conversion. `p_edge` keeps the inspector responsive when a full page is
-# larger than the preview panel.
+# A display copy of a baked payload: its alpha stores height, so the copy has to
+# be made opaque, and its RGB values are linear GPU output and need sRGB
+# conversion. Both display paths below want exactly this.
+static func to_display_image(p_image: Image) -> void:
+	for y in p_image.get_height():
+		for x in p_image.get_width():
+			var color := p_image.get_pixel(x, y).linear_to_srgb()
+			color.a = 1.0
+			p_image.set_pixel(x, y, color)
+
+
+# A texture for the page inspector. `p_edge` keeps the inspector responsive when a
+# full page is larger than the preview panel.
 static func display_texture(p_value: Variant, p_edge: int = 512) -> Texture2D:
 	if not TerrainVTBridge.is_valid_image(p_value):
 		return null
@@ -62,11 +71,7 @@ static func display_texture(p_value: Variant, p_edge: int = 512) -> Texture2D:
 		image.resize(maxi(1, roundi(image.get_width() * scale)), maxi(1, roundi(image.get_height() * scale)), Image.INTERPOLATE_BILINEAR)
 	if image.get_format() != Image.FORMAT_RGBA8:
 		image.convert(Image.FORMAT_RGBA8)
-	for y in image.get_height():
-		for x in image.get_width():
-			var color := image.get_pixel(x, y).linear_to_srgb()
-			color.a = 1.0
-			image.set_pixel(x, y, color)
+	to_display_image(image)
 	return ImageTexture.create_from_image(image)
 
 
@@ -111,11 +116,7 @@ static func blit_material_preview(p_image: Image, p_record: Dictionary, p_bounds
 		tile.convert(Image.FORMAT_RGBA8)
 	# Work on this duplicate only: the serialized channel image must remain
 	# untouched for later page inspection/export.
-	for y in tile.get_height():
-		for x in tile.get_width():
-			var color := tile.get_pixel(x, y).linear_to_srgb()
-			color.a = 1.0
-			tile.set_pixel(x, y, color)
+	to_display_image(tile)
 	p_image.blit_rect(tile, Rect2i(Vector2i.ZERO, tile.get_size()), position)
 
 

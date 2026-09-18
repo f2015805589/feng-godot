@@ -5,6 +5,7 @@
 
 #include <functional>
 
+#include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
@@ -31,6 +32,13 @@ static const Color COLOR_WHITE{ 1.0f, 1.0f, 1.0f, 1.0f };
 #define COLOR_CHECKED Color(1.f, 1.f, 1.0f, -1.0f)
 #define COLOR_NORMAL Color(0.5f, 0.5f, 1.0f, 1.0f)
 #define COLOR_CONTROL Color(as_float(enc_auto(true)), 0.f, 0.f, 1.0f)
+
+// The IdWeight surface payload's storage format. Godot's `Image::FORMAT_R16` is 39, and 39 is that
+// format wherever the payload is held: a region's surface map, a page payload, a cell channel. The
+// godot-cpp binding this addon builds against stops at FORMAT_ASTC_8x8_HDR = 38 - its own FORMAT_MAX
+// is 39 - so the engine's name for the format is not available here. Spelled once, so a call site
+// does not have to be read with a comment beside it to know what the number means.
+inline constexpr Image::Format IDWEIGHT_IMAGE_FORMAT = Image::Format(39);
 
 // For consistency between MSVC, gcc, clang
 #ifndef FLT_MAX

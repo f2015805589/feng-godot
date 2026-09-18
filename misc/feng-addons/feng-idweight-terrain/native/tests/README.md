@@ -25,6 +25,40 @@ async pages, navigation, residency, instancer, CDLOD, profile and full sectors. 
 tests where it should have been 52. One more was unreachable for a second reason: editor_slider.gd was not among editor_dock_runner.py --test choices and had no marker in its table, so nothing could run it either; both now name it, and the suite is 53. `run_all.py`'s `ADAPTIVE_TESTS` table now lists them, and
 `EDITOR_DOCK_TESTS` does the same for the editor dock's seven. `editor_paint.gd` was added later and
 brings the suite to 54; it is a plain `*_runner.py`, so `discover()` picks it up directly.
+`terrain_instancer_release.gd` was added after that, bringing the suite to 55, and it is also a plain
+`*_runner.py`. It is the test for a defect the architecture pass found by reading and could not otherwise
+prove: a region that leaves the data keeps its MMIs, so `remove_region(region, true)` and
+`unload_region(location, true)` each used to leave a leaked instance and multimesh RID behind. Before the
+fix the run reported both `REGRESSION:` lines and the engine reported `1 RID allocations of type
+'...MultiMesh' ... leaked at exit`; after it, neither. See "An instance that outlives its region" in
+`docs/terrain_optimization_audit.md`.
+
+`terrain_instancer_master_lod.gd` brings the suite to 56 and is the same shape. It packs a three-LOD
+scene, because `set_scene_file()` needs `*LOD?` meshes and a generated asset is a single card, and it
+asserts the instance counter follows the master LOD across `cast_shadows` ON -> SHADOWS_ONLY -> ON. That
+count used to double (4 placed instances read as 8). See "The count that described the wrong LOD".
+
+**A test that asserts "nothing broke" cannot see "nothing ran".** `terrain_instancer.gd` drives
+`update_mmis(-1, Vector2i(2147483647, 2147483647), true)` and then requires the rendered output to be
+unchanged - which holds when the call does nothing at all. That is how a deleted sentinel arm
+(`(V2I_MAX, -1)`, the pair `initialize()` queues to materialise instances after a load) survived a green
+suite while logging `Errant null region found at: (2147483647, 2147483647)` once per mesh id in a live
+session. `terrain_instancer_refresh.gd` is the missing direction: it edits a region's stored transforms
+directly and requires the *instance count* to follow, which is derived state that only a refresh
+corrects. See "A regression this pass introduced, and the report that found it" in
+`docs/terrain_optimization_audit.md`.
+
+`terrain_instancer_refresh.gd` brings the suite to 58.
+
+**One class of defect cannot be a test here**: the harness fails any run whose log contains `ERROR:`, so a
+test cannot drive a path the library itself logs as an error - the null `mesh_list` slot that
+`update_mesh_list()` reports at ERROR level is the example, and it stays recorded rather than tested.
+
+`vt_svt_root_mips.gd` brings the suite to 57. It is a *differential* test: it asserts that a demand-side
+setting (`surface_svt_root_mips`) leaves `get_vt_settings()["shared_pool"]` alone while a page-footprint
+setting (`vt_page_size`) clears it, read immediately after each setter. Its fixture needs two things the
+instancer tests deliberately turn off - a camera, and the physics tick that drives `_update_vt_service()`
+and thereby configures the pool. See "A demand setting that rebuilt the pool".
 
 **`editor_paint.gd`, and why it exists.** `region_slots.gd`, `texture_layers.gd`, `vt_density.gd` and
 `vt_render.gd` all drive `start_operation() → operate() → stop_operation()`, but every one of them

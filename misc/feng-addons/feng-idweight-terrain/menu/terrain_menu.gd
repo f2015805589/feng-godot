@@ -1,5 +1,13 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Menu for Terrain3D
+# Menu for Terrain3D: the editor's Terrain3D menu bar.
+
+# The menu owns the three tools it opens. `directory_setup` and `baker` are Nodes and are added as
+# children; `packer` is a RefCounted helper that adds its own window to the plugin, so it is created
+# and given the plugin without being parented.
+#
+# The enum below is this menu's item IDs, including the separators: the order has to stay in step with
+# the `add_item()` and `add_separator()` calls in `_enter_tree()` and the `set_item_disabled()` calls in
+# `_on_menu_about_to_popup()`.
 extends HBoxContainer
 
 

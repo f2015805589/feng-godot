@@ -22,15 +22,11 @@
 
 using namespace TerrainVT;
 
-// FORMAT_R16 (39) is not named in this godot-cpp binding, the same numeric form the surface map
-// already uses.
-static constexpr Image::Format FORMAT_R16_UNORM = Image::Format(39);
-
 int vt_format_pixel_size(Image::Format p_format) {
 	switch (p_format) {
 		case Image::FORMAT_R8:
 			return 1;
-		case FORMAT_R16_UNORM:
+		case IDWEIGHT_IMAGE_FORMAT:
 		case Image::FORMAT_RH:
 			return 2;
 		case Image::FORMAT_RF:

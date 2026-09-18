@@ -1,6 +1,16 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Objects parent for Terrain3D
 # Children nodes get transform updates on sculpting
+#
+# Add this node above the props you want glued to the terrain: every Node3D child
+# gets a hidden `TransformChangedSignaller`, and moving one re-derives its offset
+# from the terrain height so an edit that raises the ground carries the child with
+# it (through an undo action). `_offsets` is that state: node instance id ->
+# Vector3(X, height above the terrain, Z).
+#
+# Editor only. `editor_setup()` hands the plugin's undo/redo manager in, and
+# `get_terrain()` finds the edited scene's first Terrain3D when the cached one has
+# gone away - both assume the editor has an edited scene root.
 @tool
 extends Node3D
 class_name Terrain3DObjects
@@ -38,10 +48,14 @@ func _exit_tree() -> void:
 		_on_child_exiting_tree(child)
 
 
+# Called by the plugin once, with itself: transform tracking registers its changes
+# as undo actions, so without it `_on_child_transform_changed()` cannot run.
 func editor_setup(p_plugin) -> void:
 	_undo_redo = p_plugin.get_undo_redo()
 
 
+# The terrain this parent follows: the cached one if it is still valid and in the
+# tree, otherwise the first Terrain3D in the edited scene, which is then cached.
 func get_terrain() -> Terrain3D:
 	var terrain := instance_from_id(_terrain_id) as Terrain3D
 	if not terrain or terrain.is_queued_for_deletion() or not terrain.is_inside_tree():

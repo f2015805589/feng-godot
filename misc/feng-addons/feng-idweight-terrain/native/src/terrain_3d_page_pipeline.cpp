@@ -484,7 +484,7 @@ Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &requ
 		previous_rows.swap(rows);
 	}
 	Result result;
-	result.payload = Image::create_from_data(stored, stored, false, Image::Format(39), payload);
+	result.payload = Image::create_from_data(stored, stored, false, IDWEIGHT_IMAGE_FORMAT, payload);
 	if (request.svt) { load_cells(request, source, result); return result; }
 	PackedByteArray ids, heights; heights.resize(int64_t(stored) * stored * 4);
 	uint8_t *height_out = heights.ptrw();
@@ -507,7 +507,7 @@ Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &requ
 			if (id_out) { uint16_t id = ids_at(wx, wz); std::memcpy(id_out + (int64_t(y) * stored + x) * 2, &id, 2); }
 		}
 	}
-	result.ids = id_out ? Image::create_from_data(stored, stored, false, Image::Format(39), ids) : result.payload;
+	result.ids = id_out ? Image::create_from_data(stored, stored, false, IDWEIGHT_IMAGE_FORMAT, ids) : result.payload;
 	result.height = Image::create_from_data(stored, stored, false, Image::FORMAT_RF, heights);
 	return result;
 }

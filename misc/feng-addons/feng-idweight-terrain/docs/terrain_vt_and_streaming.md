@@ -14,7 +14,7 @@ far field persists baked material pages; geometry can run as a CDLOD quadtree. S
 |---|---|---|
 | **CDLOD** | Geometry quadtree, instanced patch meshes, GPU vertex morphing | `native/src/terrain_3d_cdlod.{h,cpp}`, `shaders/main.glsl` |
 | **AVT** | Near-field adaptive virtual texture over 64 m world sectors | `native/src/terrain_3d_sector_avt.cpp`, `terrain_3d_vt_service.cpp`, `terrain_3d_avt.h` |
-| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_surface_vt.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
+| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_surface_vt*.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
 
 They share the world cell grid and the physical page pool, but they have **separate
 address spaces, separate demand passes and separate level rules**. They are not one
@@ -1339,7 +1339,8 @@ and were left alone rather than fixed blind.
 | Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_vt_service.cpp`, `terrain_3d_vt_demand.cpp` |
 | Page table (indirection), per-view addressing | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
 | Shared physical pool: atlas, slots, LRU, ownership | `native/src/terrain_3d_vt_page_pool.{h,cpp}` |
-| Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_surface_vt.cpp` |
+| Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_surface_vt_bake.cpp` |
+| Service settings, lifecycle, page plumbing, diagnostics | `native/src/terrain_3d_surface_vt.cpp`, `terrain_3d_surface_vt_pages.cpp`, `terrain_3d_surface_vt_report.cpp` |
 | Resident far-field cell sources (GPU arrays, budget, eviction) | `native/src/terrain_3d_vt_cells.{h,cpp}` |
 | GPU page demand | `native/src/terrain_3d_vt_feedback.{h,cpp}` |
 | Shader-side addressing and sampling | `native/src/shaders/main.glsl` |

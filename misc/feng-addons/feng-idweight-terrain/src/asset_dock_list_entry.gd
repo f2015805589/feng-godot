@@ -131,25 +131,19 @@ func setup_buttons() -> void:
 	button_row.add_child(button_clear, true)
 	
 
+# The row owns the controls: every button below is added to `button_row`, so freeing the row frees
+# them, and a freed child reads as false in the guards that used to be here. Those five guarded
+# `free()` calls could never run - the only state with a live control also has a live row - and they
+# left the member references dangling instead of clearing them.
 func destroy_buttons() -> void:
 	if button_row:
 		button_row.free()
-		button_row = null
-	if button_enabled:
-		button_enabled.free()
-		button_enabled = null
-	if button_highlight:
-		button_highlight.free()
-		button_highlight = null
-	if button_edit:
-		button_edit.free()
-		button_edit = null
-	if spacer:
-		spacer.free()
-		spacer = null
-	if button_clear:
-		button_clear.free()
-		button_clear = null
+	button_row = null
+	button_enabled = null
+	button_highlight = null
+	button_edit = null
+	spacer = null
+	button_clear = null
 
 
 func get_resource_name() -> StringName:
@@ -184,38 +178,36 @@ func get_role_label() -> String:
 	return " + ".join(roles)
 
 
+# The two labels differ in alignment and content, and share their metrics and colours: both are
+# transparent-white text with a shadow, at the editor's scale.
+func _make_label(p_name: String) -> Label:
+	var label := Label.new()
+	label.name = p_name
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	label.add_theme_font_size_override("font_size", int(14. * EditorInterface.get_editor_scale()))
+	label.add_theme_color_override("font_color", Color.WHITE)
+	label.add_theme_color_override("font_shadow_color", Color.BLACK)
+	label.add_theme_constant_override("shadow_offset_x", 1)
+	label.add_theme_constant_override("shadow_offset_y", 1)
+	add_child(label, true)
+	return label
+
+
 func setup_label() -> void:
-	name_label = Label.new()
-	name_label.name = "MeshLabel"
+	name_label = _make_label("NameLabel")
 	name_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	name_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	name_label.add_theme_font_size_override("font_size", int(14. * EditorInterface.get_editor_scale()))
-	name_label.add_theme_color_override("font_color", Color.WHITE)
-	name_label.add_theme_color_override("font_shadow_color", Color.BLACK)
-	name_label.add_theme_constant_override("shadow_offset_x", 1)
-	name_label.add_theme_constant_override("shadow_offset_y", 1)
 	name_label.visible = false
 	name_label.autowrap_mode = TextServer.AUTOWRAP_OFF
-	name_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS	
-	add_child(name_label, true)
+	name_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 
 
 func setup_count_label() -> void:
-	count_label = Label.new()
-	count_label.name = "CountLabel"
+	count_label = _make_label("CountLabel")
 	count_label.text = ""
 	count_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	count_label.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
-	count_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	count_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	count_label.add_theme_font_size_override("font_size", int(14. * EditorInterface.get_editor_scale()))
-	count_label.add_theme_color_override("font_color", Color.WHITE)
-	count_label.add_theme_color_override("font_shadow_color", Color.BLACK)
-	count_label.add_theme_constant_override("shadow_offset_x", 1)
-	count_label.add_theme_constant_override("shadow_offset_y", 1)
-	add_child(count_label, true)
 	var mesh_resource: Terrain3DMeshAsset = resource as Terrain3DMeshAsset
 	if not mesh_resource: 
 		return
@@ -224,7 +216,7 @@ func setup_count_label() -> void:
 
 
 func update_count_label() -> void:
-	if not type == Terrain3DAssets.AssetType.TYPE_MESH or \
+	if not type == Terrain3DAssets.TYPE_MESH or \
 			( resource and not resource.is_enabled() ):
 		count_label.text = ""
 		return
@@ -407,7 +399,8 @@ func set_selected(value: bool) -> void:
 		return
 	is_selected = value
 	if is_selected:
-		# Handle scrolling to show the selected item
+		# Handle scrolling to show the selected item. The scroll container is the entry's
+		# grandparent: entry -> the list container -> ScrollContainer.
 		await get_tree().process_frame
 		if is_inside_tree():
 			get_parent().get_parent().get_v_scroll_bar().ratio = position.y / get_parent().size.y

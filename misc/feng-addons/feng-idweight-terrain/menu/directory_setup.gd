@@ -1,5 +1,10 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Directory Setup for Terrain3D
+# Directory Setup for Terrain3D: the editor's data-directory wizard.
+
+# `_init()` builds the file dialog once and keeps it as a child; `directory_setup_popup()` builds the
+# confirmation dialog each time it is opened and frees it when it closes. The wizard itself is a Node
+# because the menu adds it as a child; the file dialog it drives is only ever opened in directory mode,
+# which is why the filter set below (a file-mode setting) is inert here.
 extends Node
 
 const DIRECTORY_SETUP: String = "res://addons/feng-idweight-terrain/menu/directory_setup.tscn"

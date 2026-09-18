@@ -21,8 +21,11 @@
 
 // The shared physical page pool and the per-owner record it indexes are declared in
 // terrain_3d_vt_page_pool.h: one pool serves both views, so it is not either view's state.
-// This file is the per-view half - the indirection texture, the mip-chain walk and the sector
-// block allocation - and it reaches the pool through the include above.
+// This class is the per-view half - the indirection texture, the mip-chain walk and the sector
+// block allocation - and it reaches the pool through the include above. Those three jobs are three
+// files: the view object, its indirection table and its settings in terrain_3d_virtual_texture.cpp,
+// the near field's sector blocks in terrain_3d_virtual_texture_sector.cpp, and addressing with the
+// request entry points in terrain_3d_virtual_texture_lookup.cpp.
 
 /**
  * Virtual texture runtime, per view: the indirection texture and the addressing that fills it,
@@ -70,7 +73,7 @@ private:
 	int _indirection_size = DEFAULT_INDIRECTION_SIZE;
 	int _minimal_block = DEFAULT_MINIMAL_BLOCK;
 	// R16 by default: this carries the packed id/weight surface map.
-	Image::Format _format = Image::Format(39);
+	Image::Format _format = IDWEIGHT_IMAGE_FORMAT;
 	// World-space mode. The page grid is a regular world grid centred on the origin
 	// instead of one allocated block per sector, which is what the far field (SVT)
 	// needs: a page's block origin is a pure function of its coordinate, so there is

@@ -21,7 +21,6 @@ var toolbar: TerrainToolbar
 var tool_settings: TerrainToolSettings
 var terrain_menu: TerrainMenu
 var live_info_panel: Terrain3DLiveInfoPanel
-var setting_has_changed: bool = false
 var visible: bool = false
 var picking: int = Terrain3DEditor.TOOL_MAX
 var picking_callback: Callable
@@ -438,7 +437,7 @@ func set_decal_rotation(p_rot: float) -> void:
 func _on_picking(p_type: Terrain3DEditor.Tool, p_callback: Callable) -> void:
 	picking = p_type
 	picking_callback = p_callback
-	if picking == Terrain3DEditor.Tool.INSTANCER:
+	if picking == Terrain3DEditor.INSTANCER:
 		if not get_tree().process_frame.is_connected(_update_picker_highlight):
 			get_tree().process_frame.connect(_update_picker_highlight)
 	else:

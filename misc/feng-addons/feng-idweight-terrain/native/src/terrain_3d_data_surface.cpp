@@ -2,26 +2,25 @@
 
 // Terrain3DData's virtual texture page production.
 //
-// One of three files that define Terrain3DData: `terrain_3d_data.cpp` owns the slots,
-// the region maps and the data queries, `terrain_3d_data_io.cpp` moves regions and
-// images in and out of the project on disk, and this file turns a region's R16 surface
-// payload into the pages both VT tiers upload. Every file carries the same include block
-// so each one compiles and reads on its own; no logic lives outside the definitions.
+// One of five files that define Terrain3DData. This one turns a region's R16 surface payload into
+// the pages both VT tiers upload. The others: `terrain_3d_data.cpp` (slots, the chunk directory and
+// the slot maps), `terrain_3d_data_regions.cpp` (region lifecycle and the region table),
+// `terrain_3d_data_maps.cpp` (the map arrays, their upload and the queries) and
+// `terrain_3d_data_edit.cpp` (edit bookkeeping, the height range and the bindings), with the
+// on-disk path in `terrain_3d_data_io.cpp`.
+//
+// This file includes what it uses, not the family's old shared block: that block named
+// terrain_surface_idweight.h, logger.h, DirAccess, EditorFileSystem, EditorInterface, FileAccess,
+// ResourceSaver and <algorithm>, none of which appears in these 262 lines. `terrain_vt.h` is here
+// for `TerrainVT::log2_power_of_two()`, the level arithmetic this half shares with the addressing
+// contract.
 
 #include "terrain_3d_data.h"
+#include "terrain_vt.h"
 
-#include "logger.h"
-#include "terrain_surface_idweight.h"
-
-#include <algorithm>
+#include <cstring>
 #include <unordered_map>
-
-#include <godot_cpp/classes/dir_access.hpp>
-#include <godot_cpp/classes/editor_file_system.hpp>
-#include <godot_cpp/classes/editor_interface.hpp>
-#include <godot_cpp/classes/engine.hpp>
-#include <godot_cpp/classes/file_access.hpp>
-#include <godot_cpp/classes/resource_saver.hpp>
+#include <vector>
 
 // Virtual texture page production. Reads the region's R16 surface map once and
 // resamples it into every page of one local mip.
@@ -49,7 +48,7 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 	Ref<Image> source = region->get_surface_map();
 	PackedByteArray source_bytes;
 	int source_size = _region_size;
-	if (source.is_valid() && source->get_format() == Image::Format(39) &&
+	if (source.is_valid() && source->get_format() == IDWEIGHT_IMAGE_FORMAT &&
 			source->get_width() == source->get_height()) {
 		source_size = source->get_width();
 		source_bytes = source->get_data();
@@ -118,7 +117,7 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 				}
 			}
 		}
-		Ref<Image> page = Image::create_from_data(stored, stored, false, Image::Format(39), page_bytes);
+		Ref<Image> page = Image::create_from_data(stored, stored, false, IDWEIGHT_IMAGE_FORMAT, page_bytes);
 		if (page.is_null()) {
 			return -1;
 		}
@@ -245,7 +244,7 @@ int Terrain3DData::produce_surface_rect_page(const Rect2 &p_rect, int p_page_siz
 			cell.previous_y = y;
 		}
 	}
-	r_page = Image::create_from_data(stored, stored, false, Image::Format(39), bytes);
+	r_page = Image::create_from_data(stored, stored, false, IDWEIGHT_IMAGE_FORMAT, bytes);
 	if (r_page.is_null()) {
 		return -1;
 	}

@@ -86,7 +86,9 @@ static func view_stats(p_terrain: Object, p_kind: String) -> Dictionary:
 static func stats_text(p_stats: Dictionary) -> String:
 	if p_stats.is_empty():
 		return "stats unavailable"
-	return "hits %d · misses %d · evictions %d · free %d" % [int(p_stats.get("hit_count", 0)), int(p_stats.get("miss_count", 0)), int(p_stats.get("evict_count", 0)), int(p_stats.get("free_count", 0))]
+	return "hits %d · misses %d · evictions %d · free %d" % [
+		int(p_stats.get("hit_count", 0)), int(p_stats.get("miss_count", 0)),
+		int(p_stats.get("evict_count", 0)), int(p_stats.get("free_count", 0))]
 
 
 static func region_locations(p_data: Object) -> Array:

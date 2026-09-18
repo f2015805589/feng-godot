@@ -2,19 +2,22 @@
 
 // Terrain3DData's on-disk path: region files, map export and map import.
 //
-// One of three files that define Terrain3DData: `terrain_3d_data.cpp` owns the slots,
-// the region maps and the data queries, `terrain_3d_data_surface.cpp` turns a region's
-// R16 surface payload into virtual texture pages, and this file moves regions and images
-// in and out of the project on disk. Every file carries the same include block so each
-// one compiles and reads on its own; no logic lives outside the definitions below.
+// One of five files that define Terrain3DData. This one moves regions and images in and out of the
+// project on disk. The others: `terrain_3d_data.cpp` (slots, the chunk directory and the slot maps),
+// `terrain_3d_data_regions.cpp` (region lifecycle and the region table), `terrain_3d_data_maps.cpp`
+// (the map arrays, their upload and the queries) and `terrain_3d_data_edit.cpp` (edit bookkeeping,
+// the height range and the bindings), with page production in `terrain_3d_data_surface.cpp`.
+//
+// This file includes what it uses, not the family's old shared block: that block named
+// terrain_surface_idweight.h, <algorithm> and <unordered_map>, none of which appears here.
+// `engine.hpp` is not dead weight either, and a grep for `Engine` will not say so: the file writes
+// the addon's `IS_EDITOR` macro (constants.h), which expands to `Engine::get_singleton()`.
+// `editor_file_system.hpp` is here for the complete type behind
+// `EditorInterface::get_resource_filesystem()`, which the code calls `is_scanning()` and `scan()` on.
 
 #include "terrain_3d_data.h"
 
 #include "logger.h"
-#include "terrain_surface_idweight.h"
-
-#include <algorithm>
-#include <unordered_map>
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/editor_file_system.hpp>
@@ -22,6 +25,8 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
+
+#include <cmath>
 
 Error Terrain3DData::_save_export_image(const MapType p_map_type, const Ref<Image> &p_img, const String &p_path,
 		const String &p_ext) const {

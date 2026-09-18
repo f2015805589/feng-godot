@@ -3,6 +3,13 @@
 # This is an example of using a particle shader with Terrain3D.
 # To use it, add `Terrain3DParticles.tscn` to your scene and connect terrain to your Terrain3D node.
 # This is a limited example for you to build on and make it your own.
+#
+# Two of the exported properties below are *read-outs*, not settings: `calculated_distance` and
+# `particle_count` are marked read-only in the inspector, their setters recompute them from the inputs
+# that decide them, and the value assigned to them is deliberately ignored - writing `1.0` to either one
+# is how the code below asks for that recomputation. Their parameter is named `_value` to say so.
+# `_update_custom_aabb()` is shared by the two places that have to keep each particle node's AABB in step
+# with the height range.
 
 @tool
 extends Node3D
@@ -11,13 +18,13 @@ extends Node3D
 ## The maximum distance that particles will be drawn, which equals: cell_width * grid_width * 0.5.
 ## If using fade out effects like pixel alpha, use this value as the limit.
 @export_custom(PROPERTY_HINT_NONE, "suffix:m", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY) var calculated_distance: float = 1.0:
-	set(value):
+	set(_value):
 		calculated_distance = float(cell_width * grid_width) * 0.5
 
 
 ## Displays current total particle count based on Cell Width and Instance Spacing
 @export_custom(PROPERTY_HINT_NONE, "suffix:particles", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY)  var particle_count: int = 1:
-	set(value):
+	set(_value):
 		particle_count = amount * grid_width * grid_width
 
 
@@ -56,16 +63,7 @@ extends Node3D
 		rows = maxi(int(cell_width / instance_spacing), 1)
 		amount = rows * rows
 		calculated_distance = 1.0
-		# Have to update aabb
-		if terrain and terrain.data:
-			var height_range: Vector2 = terrain.data.get_height_range()
-			var height: float = height_range[0] - height_range[1]
-			var aabb: AABB = AABB()
-			aabb.size = Vector3(cell_width, height, cell_width)
-			aabb.position = aabb.size * -0.5
-			aabb.position.y = height_range[1]
-			for p in particle_nodes:
-				p.custom_aabb = aabb
+		_update_custom_aabb()
 		_set_offsets()
 
 
@@ -144,18 +142,39 @@ func _physics_process(delta: float) -> void:
 		set_physics_process(false)
 
 
+# The particle nodes carry their own AABB because they are positioned in code: the engine cannot derive
+# one from a fixed transform, and a wrong AABB culls the whole grid. The height is the terrain's range
+# negated, so the box reaches from the lowest terrain height to the highest.
+# The particle nodes carry their own AABB because they are positioned in code: the engine cannot derive
+# one from a fixed transform, and a wrong AABB culls the whole grid. The height is the terrain's range
+# negated, so the box reaches from the lowest terrain height to the highest. An empty AABB comes back
+# when there is no terrain data to measure yet; the caller decides what to do with that.
+func _custom_aabb() -> AABB:
+	var aabb: AABB = AABB()
+	if not terrain or not terrain.data:
+		return aabb
+	var height_range: Vector2 = terrain.data.get_height_range()
+	aabb.size = Vector3(cell_width, height_range.x - height_range.y, cell_width)
+	aabb.position = aabb.size * -0.5
+	aabb.position.y = height_range.y
+	return aabb
+
+
+# Applies it to the nodes that already exist; `_create_grid()` uses `_custom_aabb()` directly for the
+# ones it is about to create.
+func _update_custom_aabb() -> void:
+	var aabb: AABB = _custom_aabb()
+	for p in particle_nodes:
+		p.custom_aabb = aabb
+
+
 func _create_grid() -> void:
 	_destroy_grid()
 	if not terrain:
 		return
 	set_physics_process(true)
 	_set_offsets()
-	var hr: Vector2 = terrain.data.get_height_range()
-	var height: float = hr.x - hr.y
-	var aabb: AABB = AABB()
-	aabb.size = Vector3(cell_width, height, cell_width)
-	aabb.position = aabb.size * -0.5
-	aabb.position.y = hr.y
+	var aabb: AABB = _custom_aabb()
 	var half_grid: int = grid_width / 2
 	# Iterating the array like this allows identifying grid position, in case setting
 	# different mesh or materials is desired for LODs etc.

@@ -182,9 +182,16 @@ func clicked_id(p_id: int) -> void:
 	set_selected_id(p_id)
 
 
+# The last entry that can hold an asset. The "Add new" tile is the final entry, and it only exists
+# while the search box is blank - so a filtered list has no selectable slot at its end, and an
+# unfiltered one has exactly one. `set_selected_id()` and `get_selected_asset_id()` have to agree on
+# this bound: the first clamps the selection to it, the second reads the selection back through it.
+func _max_selectable_id() -> int:
+	return max(0, entries.size() - (1 if search_text else 2))
+
+
 func set_selected_id(p_id: int) -> void:
-	# "Add new" is the final entry only when search box is blank
-	var max_id: int = max(0, entries.size() - (1 if search_text else 2))
+	var max_id: int = _max_selectable_id()
 	if plugin.debug:
 		print("Terrain3DListContainer ", name, ": set_selected_id: ", selected_id, " to ", clamp(p_id, 0, max_id))
 	selected_id = clamp(p_id, 0, max_id)
@@ -223,8 +230,7 @@ func _role_flags_for(p_res_id: int) -> int:
 
 
 func get_selected_asset_id() -> int:
-	# "Add new" is the final entry only when search box is blank
-	var max_id: int = max(0, entries.size() - (1 if search_text else 2))
+	var max_id: int = _max_selectable_id()
 	var id: int = clamp(selected_id, 0, max_id)
 	if plugin.debug:
 		print("Terrain3DListContainer ", name, ": get_selected_asset_id: selected_id: ", selected_id, ", clamped: ", id, ", entries: ", entries.size())
@@ -233,7 +239,7 @@ func get_selected_asset_id() -> int:
 	var res: Resource = entries[id].resource
 	if not res:
 		return 0
-	if type == Terrain3DAssets.AssetType.TYPE_MESH:
+	if type == Terrain3DAssets.TYPE_MESH:
 		return (res as Terrain3DMeshAsset).id
 	else:
 		return (res as Terrain3DTextureAsset).id
@@ -251,6 +257,9 @@ func _on_resource_changed(p_resource: Resource, p_id: int) -> void:
 		if plugin.debug:
 			print("Terrain3DListContainer ", name, ": _on_resource_changed: removing asset ID: ", p_id)
 		_clearing_resource = true
+		# The dock is this widget's host and owns the confirmation dialog: asset list -> ScrollContainer
+		# -> Box -> dock. The chain is the contract between the two files; `plugin.asset_dock` names the
+		# same node, and neither is checked, so the host has to keep that shape.
 		var asset_dock: Control = get_parent().get_parent().get_parent()
 		if type == Terrain3DAssets.TYPE_TEXTURE:
 			asset_dock.confirm_dialog.dialog_text = "Are you sure you want to clear this texture?"

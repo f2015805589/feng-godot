@@ -1,5 +1,19 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Channel Packer for Terrain3D
+# Channel Packer for Terrain3D: the editor's Pack Textures tool.
+
+# Five jobs, in the order a session meets them: build the window and wire its controls
+# (`pack_textures_popup`), give each of the five texture slots a picker (`_init_texture_picker`), run
+# the two file dialogs (`_init_file_dialogs`), orthogonalize and pack the selected images
+# (`_set_normal_vector`, `_align_normals`, `_pack_textures`), and write the `.import` sidecar that makes
+# Godot re-import the packed PNG with the quality and mipmap choices the user made
+# (`_create_import_file`).
+#
+# The accepted image extensions are a contract with two other places: the open dialog's filter list in
+# `_init_file_dialogs()` and `_can_drop_data()` in `channel_packer_dragdrop.gd`, which decides whether
+# a drag is accepted. All three have to name the same set.
+#
+# This is a RefCounted helper, not a node: the menu creates it and it adds its own window to the
+# plugin (see `pack_textures_popup`).
 extends RefCounted
 
 const WINDOW_SCENE: String = "res://addons/feng-idweight-terrain/menu/channel_packer.tscn"
@@ -128,7 +142,7 @@ func pack_textures_popup() -> void:
 	plugin.add_child(window)
 	_init_file_dialogs()
 	
-	# the dialog disables the parent window "on top" so, restore it after 1 frame to alow the dialog to clear.
+	# the dialog disables the parent window "on top" so, restore it after 1 frame to allow the dialog to clear.
 	var set_on_top_fn: Callable = func(_file: String = "") -> void:
 		await RenderingServer.frame_post_draw
 		window.always_on_top = true
@@ -159,9 +173,6 @@ func _init_file_dialogs() -> void:
 	save_file_dialog.file_selected.connect(_on_save_file_selected)
 	save_file_dialog.ok_button_text = "Save"
 	save_file_dialog.size = Vector2i(550, 550)
-	#save_file_dialog.transient = false
-	#save_file_dialog.exclusive = false
-	#save_file_dialog.popup_window = true
 	
 	open_file_dialog = EditorFileDialog.new()
 	open_file_dialog.set_filters(PackedStringArray(
@@ -170,9 +181,6 @@ func _init_file_dialogs() -> void:
 	open_file_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
 	open_file_dialog.ok_button_text = "Open"
 	open_file_dialog.size = Vector2i(550, 550)
-	#open_file_dialog.transient = false
-	#open_file_dialog.exclusive = false
-	#open_file_dialog.popup_window = true
 	
 	window.add_child(save_file_dialog)
 	window.add_child(open_file_dialog)
@@ -302,7 +310,7 @@ func _init_texture_picker(p_parent: Node, p_image_index: int) -> void:
 				texture_rect.texture = ImageTexture.create_from_image(images[IMAGE_HEIGHT])
 				_set_wh_labels(IMAGE_HEIGHT, height_texture.get_width(), height_texture.get_height())
 				set_channel_fn.call(Image.USED_CHANNELS_R)
-				_show_message(INFO, "Height Texture generated sucsessfully")
+				_show_message(INFO, "Height Texture generated successfully")
 		lumin_height_button.pressed.connect(lumin_fn)
 	plugin.ui.set_button_editor_icon(file_pick_button, "Folder")
 	plugin.ui.set_button_editor_icon(clear_button, "Remove")
@@ -339,14 +347,13 @@ func _show_message(p_level: int, p_text: String) -> void:
 func _create_import_file(png_path: String) -> void:
 	var dst_import_path: String = png_path + ".import"
 	var file: FileAccess = FileAccess.open(TEMPLATE_PATH, FileAccess.READ)
-	var template_content: String = file.get_as_text()
+	var import_content: String = file.get_as_text()
 	file.close()
-	template_content = template_content.replace(
+	import_content = import_content.replace(
 		"$SOURCE_FILE", png_path).replace(
 		"$HIGH_QUALITY", str(high_quality_checkbox.button_pressed)).replace(
 		"$GENERATE_MIPMAPS", str(generate_mipmaps_checkbox.button_pressed)
 	)
-	var import_content: String = template_content
 	file = FileAccess.open(dst_import_path, FileAccess.WRITE)
 	file.store_string(import_content)
 	file.close()
@@ -402,6 +409,8 @@ func _on_save_file_selected(p_dst_path) -> void:
 		save_file_dialog.call_deferred("grab_focus")
 
 
+## Rodrigues' rotation taking `normal` onto +Z, as a Basis. `_align_normals()` uses it to re-aim a
+## normal map whose average direction is off the UV plane.
 func _alignment_basis(normal: Vector3) -> Basis:
 	var up: Vector3 = Vector3(0, 0, 1)
 	var v: Vector3 = normal.cross(up)
@@ -431,7 +440,7 @@ func _set_normal_vector(source: Image, quiet: bool = false) -> void:
 	sum -= Color(1.0, 1.0, 1.0)
 	normal_vector = Vector3(sum.r, sum.g, sum.b).normalized()
 	if normal_vector.dot(Vector3(0.0, 0.0, 1.0)) < 0.999 && !quiet:
-		_show_message(WARN, "Normal Texture Not Orthoganol to UV plane.\nFor Compatability with Detiling and Rotation, Select Orthoganolize Normals")
+		_show_message(WARN, "Normal Texture Not Orthogonal to UV plane.\nFor Compatibility with Detiling and Rotation, Select Orthogonalize Normals")
 
 
 func _align_normals(source: Image, iteration: int = 0) -> void:
@@ -456,6 +465,15 @@ func _align_normals(source: Image, iteration: int = 0) -> void:
 		_align_normals(source, iteration)
 
 
+## Packs two or three source images into the Terrain3D material layout, writes the PNG and writes the
+## `.import` sidecar beside it.
+##
+## Every parameter is positional and six of them are bools at the two call sites, so their order is part
+## of the interface: (rgb, a, ao, dst_path, invert_green, invert_smooth, align_normals,
+## normalize_height, alpha_channel, occlusion_channel). The albedo/height call passes
+## (albedo, height, null, path, false, invert_height, false, normalize_height, height_channel) and the
+## normal/roughness call passes (normal, roughness, ao, path, invert_green, invert_smooth,
+## align_normals, false, roughness_channel, occlusion_channel).
 func _pack_textures(p_rgb_image: Image, p_a_image: Image, p_ao_image: Image, p_dst_path: String, p_invert_green: bool,
 	p_invert_smooth: bool, p_align_normals: bool, p_normalize_height: bool, p_alpha_channel: int, p_occlusion_channel: int = 0) -> Error:
 	if p_rgb_image and p_a_image:

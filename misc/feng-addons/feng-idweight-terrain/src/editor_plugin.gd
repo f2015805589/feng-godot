@@ -18,7 +18,6 @@ var editor_settings: EditorSettings
 var ui: Node # Terrain3DUI see Godot #75388
 var asset_dock: PanelContainer
 var vt_inspector_plugin: EditorInspectorPlugin
-var current_region_position: Vector2
 var mouse_global_position: Vector3 = Vector3.ZERO
 var mouse_viewport_position: Vector2 = Vector2.ZERO
 var godot_editor_window: Window # The Godot Editor window
@@ -334,7 +333,7 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 			editor.operate(mouse_global_position, p_viewport_camera.rotation.y)
 			return AFTER_GUI_INPUT_STOP
 		
-		# _input_apply released, save undo data
+		# Left button released: close the stroke, which stores the undo data
 		elif editor.is_operating():
 			editor.stop_operation()
 			return AFTER_GUI_INPUT_STOP

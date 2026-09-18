@@ -58,6 +58,10 @@ var region_texture: ImageTexture
 var region_preview_texture: ImageTexture
 var editor_decal_fade: float :
 	set(value):
+		# This assignment is the property's storage, not a re-entry: in Godot 4 an assignment to the
+		# property inside its own setter writes the backing field directly, so `update_decal()` setting
+		# the fade from the cursor colour, and the timer's tween fading it to 0, both run this body
+		# exactly once. A separate backer variable is not needed.
 		editor_decal_fade = value
 		if editor_decal_color.size() > 0:
 			editor_decal_color[0].a = value
@@ -157,7 +161,7 @@ func update_decal() -> void:
 		loc += Vector2i(map_size / 2, map_size / 2)
 		if !(loc.x < 0 or loc.x > map_size - 1 or loc.y < 0 or loc.y > map_size - 1):
 			var index: int = clampi(loc.y * map_size + loc.x, 0, map_size * map_size - 1)
-			if plugin.terrain.material.get_world_background() == Terrain3DMaterial.WorldBackground.NONE:
+			if plugin.terrain.material.get_world_background() == Terrain3DMaterial.NONE:
 				if r_map[index] == 0 and host.active_operation == Terrain3DEditor.ADD:
 					r_map[index] = -index - 1
 					preview_dummy = true

@@ -5,9 +5,13 @@
 The native side is a `Terrain3D` node plus the subsystems it owns. `Terrain3D`
 itself is the façade: the properties the editor and scripts see, region
 streaming, geometry, collision, instancing and the physics-tick scheduler. Its
-definitions live in six files, one per concern -- `terrain_3d.cpp` (lifecycle,
-notifications, containers, mesh/collision/instancer wiring, the tick scheduler),
-`terrain_3d_vt_service.cpp` (the virtual texture service and both demand passes),
+definitions live in eight files, one per concern -- `terrain_3d.cpp` (lifecycle,
+the physics tick, the render-geometry invalidation and the notifications),
+`terrain_3d_wiring.cpp` (the subsystem nodes and GPU objects the node creates and
+releases), `terrain_3d_monitors.cpp` (its custom `Performance` monitors),
+`terrain_3d_vt_service.cpp` with `terrain_3d_vt_svt.cpp` and `terrain_3d_vt_avt.cpp`
+(the virtual texture service: its views and settings, the far field's demand pass,
+and the near field's demand pass with its sector machinery),
 `terrain_3d_properties.cpp`, `terrain_3d_queries.cpp` and
 `terrain_3d_bindings.cpp` -- so a concern can be read without the others. Its two
 longest passes are written as named phases rather than locals: `update_surface_vt`
@@ -22,21 +26,50 @@ lives in these files, and each one owns one thing:
 | --- | --- |
 | `terrain_vt.h` | The addressing contract only: page IDs, virtual-image kinds, the block allocator. Header-only, no Godot dependency, no runtime state. |
 | `terrain_3d_vt_state.h` | Every VT field `Terrain3D` owns, in one struct: the shared service, the near-field AVT and the far-field SVT, grouped in the same order as the passes that use them. No algorithms, no cross-field initializers. The node's own fields stay in `terrain_3d.h`. |
-| `terrain_3d_virtual_texture.{h,cpp}` | One view's indirection texture, the mip-chain walk and its virtual blocks. No terrain data, no demand, and no residency: the atlas it publishes into belongs to the pool below. |
+| `terrain_3d_virtual_texture.{h,cpp}` | One view's indirection texture, the mip-chain walk and its virtual blocks. No terrain data, no demand, and no residency: the atlas it publishes into belongs to the pool below. One of three files defining the view; `terrain_3d_virtual_texture_sector.cpp` owns the near field's `VirtualImageAtlas` blocks (register / resize / unregister, the block origin, and moving resident pages a whole mip per doubling so a page keeps its world footprint), and `terrain_3d_virtual_texture_lookup.cpp` owns addressing (`_request_virtual()`, the sector-local and world-grid entry points, the walk, and the releases). |
 | `terrain_3d_vt_page_pool.{h,cpp}` | The physical side both views share: the `Texture2DArray` atlas, the global slot allocator (reserve / commit / abort), LRU and protection, the reverse owner index, and page read/write. |
 | `terrain_3d_avt.h` | Plain records of the near-field demand: page requests, the asynchronous plan result, cached addresses, sectors and the working set. No algorithms. |
-| `terrain_3d_sector_avt.cpp` | The near field end to end: the camera/config plan key, the 64 m sector scan, the coarse hierarchy and address directory, the asynchronous page selection, and page production from the region payload. |
+| `terrain_3d_sector_avt.cpp` | The near field's demand entry point and its configuration: `_update_sector_avt()` (the driver: predict, key, reuse-or-rebuild, submit), the plan key and the install-or-reuse decision, and the tier settings the sector size is derived from. One of three files owning the near field's planning; `terrain_3d_sector_avt_motion.cpp` owns the lead and the quantized plan key, `terrain_3d_sector_avt_hierarchy.cpp` the 64 m sector scan, the coarse hierarchy, the address directory and its publication, and `terrain_3d_sector_avt_internal.h` the three prologue names two of them read. |
 | `terrain_3d_vt_demand.cpp` | The far field's demand pass over the world page grid, with the shared capacity floor. |
 | `terrain_3d_page_pipeline.{h,cpp}` | The worker and planner threads, the immutable region snapshot they read, raw-ID page payload production, and `.vtcell` reads. |
 | `terrain_vt_cell.h` | The `.vtcell` on-disk contract: format version, file name and the source signature. Shared by the baker that writes the files and the runtime reader that consumes them, because the two must agree exactly. |
 | `terrain_3d_vt_cells.{h,cpp}` | The resident far-field cell sources: three GPU arrays (one layer per cell, full mip chain), the cell registry, the memory budget with its LRU eviction, and the per-(channel, layer, mip) views the page copy shader binds. A cell published here is what makes far-field page assembly a device-to-device copy with no file and no CPU work. |
-| `terrain_3d_surface_vt.cpp` | VT service lifecycle and configuration, capacity growth, invalidation, the `.vtcell` bake/read path, the single page-production choke point and VT telemetry. No demand planning. |
-| `terrain_3d_data_surface.cpp` | The region payload -> page resampler both tiers call: `produce_surface_page_set` for a sector block at one local mip, `produce_surface_rect_page` for a world-space page rectangle. One of three files defining `Terrain3DData`; `terrain_3d_data.cpp` owns the slots, maps and queries and `terrain_3d_data_io.cpp` the region files and map import/export. |
+| `terrain_3d_surface_vt.cpp` | The VT service's settings and lifetime: page size, border, count, workers, the motion lead, the resolution preset, both tiers' storage format, the feedback toggles and the editor preview, plus `_configure_vt_service()` / `_update_vt_service()` / `_destroy_vt_service()`. One of four files defining the service. |
+| `terrain_3d_surface_vt_pages.cpp` | Page plumbing: invalidation of one slot, one region or every material; the queue that turns a produced payload into a material page; the resident far-field cell store; and the two helpers that decide whether a far page can be assembled from cells at all. |
+| `terrain_3d_surface_vt_report.cpp` | The diagnostics the dock, the inspector and the tests read: `get_vt_settings()` (the telemetry every performance test in `native/tests` is written against), `get_vt_pages()`, the page and material previews, and the compression probe. Read-only. |
+| `terrain_3d_surface_vt_bake.cpp` | The far field's bake and its cell files: `bake_svt()`, the automatic pass behind it, the queue that serializes the two, the `.vtcell` signature and reader, and the browser of what is baked. The only half of the service that touches the filesystem. |
+| `terrain_3d_surface_vt_internal.h` | The prologue the four service halves share: `baker()`, the one way the stored `Ref` becomes the producer, and `bake_source_grid()`, so a bake and a runtime page built from the same payload agree on where its corners are. |
+| `terrain_3d_vt_service.cpp` | Both views' setup and teardown and every setting the dock, the inspector and scripts write, plus `invalidate_surface_pages()`. One of three files defining the service's entry points. |
+| `terrain_3d_vt_svt.cpp` | The far field's demand pass: `update_surface_svt()` in both of its modes, with the distance -> level rule it walks (`get_surface_svt_mip_for_distance()`, `get_surface_svt_mip_reach()`) and the diagnostic page writer. |
+| `terrain_3d_vt_avt.cpp` | The near field's demand pass: `update_surface_vt()`, the GPU projection feedback pass, the camera-visible region query and the sector machinery (`_prepare_vt_sector()`, `_compute_adaptive_sector_sizes()`, `_vt_page_requests_for_sector()`, `_produce_missing_vt_pages()`, `_publish_vt_block_tables()`). |
+| `terrain_3d_vt_service_internal.h` | The one prologue symbol the service's halves share: `SourceWakeFlush`, the guard that wakes the page pipeline's workers once a demand pass is over rather than in the middle of it. |
+| `terrain_3d_surface_baker.cpp` | The device and the objects on it: the RenderingDevice lookup, texture and sampler creation, the resident-resource check and the material table upload. One of six files defining `Terrain3DSurfaceBaker`. |
+| `terrain_3d_surface_baker_bundle.cpp` | The `ResourceBundle`'s lifetime: the inventory `_collect_bundle_rids()` every path uses, creation, growth, adoption as the live bundle, and the free (at once, or deferred until the renderer has stopped drawing the old one). |
+| `terrain_3d_surface_baker_pipelines.cpp` | The two GPU programs: the bake pipeline and the block encoder, the GLSL both are compiled from, and the uniform sets they read. |
+| `terrain_3d_surface_baker_storage.cpp` | What a page is stored in and the block encoder: the per-tier codec resolver and the formats it applies, the ring of in-flight encode pages, the encoder dispatches, and the readbacks that publish them as sampled layers. |
+| `terrain_3d_surface_baker_queue.cpp` | The caller-facing queue: capacity, budget and the material snapshot, `queue_page()` / `queue_cached_page()` / `queue_cell_page()`, and the uploads that drain them. None of it runs on the render thread. |
+| `terrain_3d_surface_baker_frame.cpp` | One frame of production: `render_pending()`, the job list it builds, dispatch, the retirement of bundles the material stopped sampling, and the read-only state and bindings the caller and the editor read. |
+| `terrain_3d_surface_baker_internal.h` | The prologue the six halves share — the codec vocabulary, the shared constants and the small helpers — because each is read by two or three of them and a second copy would be a second vocabulary. No class member lives here. |
+| `terrain_3d_data_surface.cpp` | The region payload -> page resampler both tiers call: `produce_surface_page_set` for a sector block at one local mip, `produce_surface_rect_page` for a world-space page rectangle. One of five files defining `Terrain3DData`. |
+| `terrain_3d_data.cpp` | The stable layer slots, the chunk -> layer directory texture, the per-map-type blank layers and the slot-map upload. One of five files defining `Terrain3DData`. |
+| `terrain_3d_data_regions.cpp` | Region lifecycle and the region table: `add_region*()` / `remove_region*()` / `unload_region()`, `change_region_size()`, `change_surface_density()`, the modified and deleted flags, and `do_for_regions()`. It never touches a slot index directly; it goes through `_acquire_slot()` / `_release_slot()`. |
+| `terrain_3d_data_maps.cpp` | The map arrays, their GPU upload and their read side: `get_maps()`, `update_maps()`, `update_surface_region()`, `set_pixel()` and the height / normal / blend / slope / texture-id queries. |
+| `terrain_3d_data_edit.cpp` | `add_edited_area()` (what an edit tells the data so the virtual texture republishes the regions it touched), `calc_height_range()` and the master height range the mesher reads, `dump()`, and `_bind_methods()` — the whole script-facing surface of the class. |
 | `terrain_3d_vt_indirection.{h,cpp}` | Render-thread upload of the CPU-authored page table, coalesced into 16x16 tile patches. |
 | `terrain_3d_vt_visibility.h` | Camera-visible terrain footprint queries shared by both fields. Header-only, camera-only dependency. |
 | `main.glsl` | Sampling: the shader resolves a fragment's payload texel to a virtual page and walks up the mip chain. Address arithmetic here must match the C++ side exactly. |
 
-Two rules keep the split honest, and both are load-bearing:
+The same one-file-one-job convention now covers two classes outside the VT machinery.
+`Terrain3DEditor` is four files: `terrain_3d_editor.cpp` (the object's state and public API, and the
+region tool), `terrain_3d_editor_paint.cpp` (the map brush loop and what runs after it),
+`terrain_3d_editor_texel.cpp` (one brush texel: the three map handlers, the two neighbourhood samples
+and the R16 surface path) and `terrain_3d_editor_undo.cpp` (the undo and redo snapshots).
+`Terrain3DMaterial` is four as well: `terrain_3d_material_shader.cpp` (the GLSL assembly),
+`terrain_3d_material.cpp` (the shader and its uniforms), `terrain_3d_material_resource.cpp` (the
+lifecycle, the setters and `save()`) and `terrain_3d_material_reflect.cpp` (the property list and the
+ClassDB bindings).
+
+Three rules keep the split honest, and all three are load-bearing:
 
 1. **`Terrain3D` owns configuration and the frame schedule; the VT files own the
    algorithms.** A change to how pages are chosen belongs in the demand file for
@@ -49,14 +82,34 @@ Two rules keep the split honest, and both are load-bearing:
    page dimensions, format and the mode-specific addressing; both the initial
    setup and a shared-pool rebuild call it, so neither path depends on settings a
    previous configuration happened to leave on the object.
+4. **A class split across files shares its prologue through one header, never by
+   copying it.** `terrain_3d_surface_baker_internal.h` holds the codec vocabulary,
+   the shared constants and the small helpers of the surface baker's four halves;
+   `terrain_3d_surface_vt_internal.h` holds the two helpers the VT service's four
+   halves share. A helper that two halves need becomes an `inline` one there —
+   including one that used to sit in an anonymous namespace, which carries internal
+   linkage with no keyword to convert, so leaving it as it was makes the linker
+   report one definition per half. A second definition of the page-codec list would
+   be a second vocabulary, and the two `static_assert`s that keep the page list
+   inside the array list would stop constraining anything.
 
 On the GDScript side the same rule applies to the VT window: `vt_editor.gd` owns
-the widgets and the selection state, `vt_terrain_bridge.gd` owns every duck-typed
-call into the extension (a missing native method must read as "unavailable", not
-break the editor), and `vt_overview_image.gd` owns the world/image maths and the
-per-pixel stitching, as pure functions over data passed in. The asset dock's list
-and tile widgets are shared by both dock versions in `asset_dock_list_*.gd`, and
-the editor cursor decal is `ui_decal.gd`: the tool bar (`ui.gd`) keeps tool, brush
+the widgets and the selection state, `vt_terrain_bridge.gd` owns the VT window's
+duck-typed calls into the extension (a missing native method must read as
+"unavailable", not break the editor - `vt_editor.gd` keeps one-line delegations to it
+so the window's data layer is the only place that knows the native API), and
+`vt_overview_image.gd` owns the world/image maths and the per-pixel stitching, as pure
+functions over data passed in. Two other scripts guard their own native calls rather
+than going through the bridge: `terrain_vt_inspector.gd` (`has_method` + `call` around
+`get_vt_settings` and `bake_svt`) and `editor_plugin.gd` (around the VT window's
+`open_vt_page_view` and the dock's `_open_vt_editor`); the bridge is where the *VT
+window* talks to the extension, not the only place in the addon that duck-types. The asset dock's list
+and tile widgets are shared by both dock versions in `asset_dock_list_*.gd`, and the
+dock's own half - signals, controls, search, list switching, pin, highlight and
+window-focus handling - is `asset_dock_common.gd`, which `asset_dock.gd` (4.6+, hosted
+in an `EditorDock`) and `asset_dock_45.gd` (pre-4.6, its own slot and window) both
+extend; each keeps only its hosting, its editor-settings keys and its own extras. The
+editor cursor decal is `ui_decal.gd`: the tool bar (`ui.gd`) keeps tool, brush
 and pointer state and forwards `update_decal()`, while the decal module owns the
 shader parameters, the decal arrays, the fade tween and the region-directory
 preview.
@@ -79,8 +132,8 @@ Allocator padding does not change logical density. These virtual images are not 
 
 ## Ownership and frame flow
 
-- `terrain_3d_surface_vt.cpp` configures shared services, invalidation and source lifetime. `Terrain3DVTPagePool` (`terrain_3d_vt_page_pool.{h,cpp}`) owns physical allocation, LRU, protection and reverse ownership; the view that published an evicted slot is called back so its indirection entry goes with it.
-- `terrain_3d_sector_avt.cpp` builds visible and idle sector demand and retains address blocks. `terrain_3d_vt_demand.cpp` schedules visible SVT footprints with a common capacity floor. Both tiers point into the shared physical arrays.
+- `terrain_3d_surface_vt.cpp` (settings and lifetime), `terrain_3d_surface_vt_pages.cpp` (invalidation, the material page queue and the cell store), `terrain_3d_surface_vt_report.cpp` (the diagnostics) and `terrain_3d_surface_vt_bake.cpp` (the `.vtcell` bake) configure the shared services, invalidate them and own their source lifetime. `Terrain3DVTPagePool` (`terrain_3d_vt_page_pool.{h,cpp}`) owns physical allocation, LRU, protection and reverse ownership; the view that published an evicted slot is called back so its indirection entry goes with it.
+- `terrain_3d_sector_avt.cpp` (the driver), `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key) and `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy and the address directory) build visible and idle sector demand and retain address blocks. `terrain_3d_vt_demand.cpp` schedules visible SVT footprints with a common capacity floor. Both tiers point into the shared physical arrays.
 - `terrain_3d_vt_indirection.cpp` owns RD indirection initialization and dirty-tile uploads. CPU updates coalesce by mip/tile; the render thread copies 16 x 16 tiles. Failed initial/patch submissions remain available for retry. Encoded page IDs remain exact R32F values. The upload is queued into the render thread, so it only runs while frames are drawn: while a view still owes one, `Terrain3D::_update_vt_service()` keeps asking the editor for a redraw even when the baker has nothing pending.
 - The native **VT Pass** (id 16) runs the registered main-RenderingDevice baker before GBuffer. AVT evaluates material pages; SVT copies/composites baked cell source regions. Runtime production does not use a local-device submit/sync or material readback.
 - Terrain shading resolves albedo/height, world-normal/roughness and normal-depth/AO/AO-affect/valid outputs. Lighting, color-map wetness and macro variation remain in the draw. Custom terrain vertex displacement remains in GBuffer.
@@ -113,7 +166,7 @@ Auto Bake is enabled by default for saved terrain, with a 500 ms edit debounce. 
 
 `vt_editor_preview` defaults on and is editor-only. It shows live material evaluation and the surface array, pauses runtime VT requests and automatic SVT baking, and combines dirty invalidation until preview closes. Manual Bake remains available. Saving terrain does not update its offline SVT sources; bake explicitly or let auto-bake finish with preview off. Direct preview may differ from coarse cached output.
 
-For the built-in material, preview or both VT tiers disabled generates a shader without VT samplers/uniform resources and lookup/filter functions. Eight VT samplers disappear in preview and return on resume. A dedicated uniform helper also skips constructing VT state for this variant. Custom shader overrides retain the full interface; generated overrides are not frozen into preview mode. Displacement still uses its required material snippets. The assembly that decides this lives in `terrain_3d_material_shader.cpp` (insert loading, editor/debug injection, comment stripping, `_needs_vt_shader`), while `terrain_3d_material.cpp` owns the material resource and its uniforms.
+For the built-in material, preview or both VT tiers disabled generates a shader without VT samplers/uniform resources and lookup/filter functions. Eight VT samplers disappear in preview and return on resume. A dedicated uniform helper also skips constructing VT state for this variant. Custom shader overrides retain the full interface; generated overrides are not frozen into preview mode. Displacement still uses its required material snippets. The assembly that decides this lives in `terrain_3d_material_shader.cpp` (insert loading, editor/debug injection, comment stripping, `_needs_vt_shader`), while `terrain_3d_material.cpp` owns the shader and its uniforms and `terrain_3d_material_resource.cpp` / `terrain_3d_material_reflect.cpp` the resource's properties, save, property list and bindings.
 
 The main and bake shaders no longer calculate the initial linear material selection that pair-aware slope selection overwrote. Shared layout exclusions avoid duplicated shader-generation rules. Debug/editor builds include only selected debug views; Release excludes debug-view source.
 

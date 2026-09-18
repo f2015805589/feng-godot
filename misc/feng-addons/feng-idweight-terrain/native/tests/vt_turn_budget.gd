@@ -29,6 +29,7 @@
 # side of it on a loaded machine about as often as not. Read the counters and the stage sums before
 # believing a red or a green, and see README.md for the same table and for the session drift that
 # makes a run comparable only to one taken under the same machine state.
+extends SceneTree
 
 const REGION_SIZE := 256
 const GRID := 3 # Regions -1..1, a 768 m world.

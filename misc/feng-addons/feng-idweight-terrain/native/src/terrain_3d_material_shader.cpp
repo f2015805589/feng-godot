@@ -2,27 +2,25 @@
 
 // Terrain3DMaterial's shader source pipeline.
 //
-// One of two files that define Terrain3DMaterial: this one turns the shader inserts
+// One of four files that define Terrain3DMaterial: this one turns the shader inserts
 // (auto_shader, backgrounds, editor_functions, debug views), the material's own snippets
 // and the editor/debug view selection into the final GLSL the material compiles, including
-// the comment stripper and the VT-sampler decision. `terrain_3d_material.cpp` owns the
-// resource: its properties, uniforms, noise/gradient setup, save and ClassDB bindings.
-// Both carry the same include block so each compiles and reads on its own.
+// the comment stripper and the VT-sampler decision. The resource itself is the other three:
+// `terrain_3d_material.cpp` (the shader and its uniforms), `terrain_3d_material_resource.cpp`
+// (the lifecycle, the property setters and save) and `terrain_3d_material_reflect.cpp` (the
+// property list and the ClassDB bindings).
+//
+// This file includes what it uses, not the family's old shared block: that block named Engine,
+// FastNoiseLite, Gradient, ImageTexture, NoiseTexture2D, RenderingServer, ResourceSaver,
+// terrain_3d_util.h and terrain_3d_virtual_texture.h, none of which appears in its 550 lines.
+// The two RegEx headers are the reason they were ever in the block at all - the comment stripper
+// is the only RegEx user in the family.
 
-#include <godot_cpp/classes/engine.hpp>
-#include <godot_cpp/classes/fast_noise_lite.hpp>
-#include <godot_cpp/classes/gradient.hpp>
-#include <godot_cpp/classes/image_texture.hpp>
-#include <godot_cpp/classes/noise_texture2d.hpp>
 #include <godot_cpp/classes/reg_ex.hpp>
 #include <godot_cpp/classes/reg_ex_match.hpp>
-#include <godot_cpp/classes/rendering_server.hpp>
-#include <godot_cpp/classes/resource_saver.hpp>
 
 #include "logger.h"
 #include "terrain_3d_material.h"
-#include "terrain_3d_util.h"
-#include "terrain_3d_virtual_texture.h"
 
 ///////////////////////////
 // Private Functions

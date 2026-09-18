@@ -1,15 +1,14 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Asset Dock for Terrain3D
+# Asset Dock for Terrain3D: the Godot 4.6+ half.
+
+# This half hosts itself in an EditorDock and adds the Terrain management menu and the debug-view
+# menu. The dock itself - signals, controls, search, list switching, pin, highlight and
+# window-focus handling - is asset_dock_common.gd, which this script extends; so is the pre-4.6
+# variant.
 @tool
-extends PanelContainer
+extends "res://addons/feng-idweight-terrain/src/asset_dock_common.gd"
 
-signal confirmation_closed
-signal confirmation_confirmed
-signal confirmation_canceled
 
-const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
-const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
-const ES_DOCK_TAB: String = "terrain3d/dock/tab"
 const VT_EDITOR_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_editor.gd")
 
 const MENU_INITIALIZE: int = 3
@@ -23,41 +22,15 @@ const MENU_DEBUG_CONTROL_WEIGHT: int = 13
 const MENU_DEBUG_SLOPE: int = 14
 
 
-# The list and the tile live in their own scripts, shared with the other dock
-# version. They stay addressable as this script's ListContainer / ListEntry.
-const ListContainer := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_container.gd")
-const ListEntry := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_entry.gd")
-
 var management_menu: MenuButton
 var debug_menu: PopupMenu
-var texture_list: ListContainer
-var mesh_list: ListContainer
-var current_list: ListContainer
-var _updating_list: bool
 
-var pinned_btn: Button
-var size_slider: HSlider
-var box: BoxContainer
-var buttons: BoxContainer
-var textures_btn: Button
-var meshes_btn: Button
-var asset_container: ScrollContainer
-var confirm_dialog: ConfirmationDialog
-var _confirmed: bool = false
-var search_box: TextEdit
-var search_button: Button
 var vt_editor: Window
 
-#DEPRECATED 4.5
-#class EdDock extends EditorDock:
-	#func _update_layout(layout: int) -> void:
-		#layout 1 vertical, 2 horizontal, 4 window
-		#print("Terrain3DAssetDock: _update_layout called with: ", layout)
-
+# The pre-4.6 dock class reported a layout change through an engine callback carrying 1 vertical,
+# 2 horizontal, 4 window. Nothing here implements it: this dock calls update_layout() from `resized`
+# and from NOTIFICATION_ENTER_TREE instead. The class it belonged to is named at each call site below.
 var _dock: MarginContainer #DEPRECATED 4.5 - Use EdDock
-var _initialized: bool = false
-var plugin: EditorPlugin
-var window: Window
 
 
 func _notification(what: int) -> void:
@@ -250,14 +223,6 @@ func _sync_debug_view_menu() -> void:
 	_set_debug_view_checked(view_index)
 
 
-func _gui_input(p_event: InputEvent) -> void:
-	if p_event is InputEventMouseButton:
-		if search_box.has_focus():
-			if plugin.debug:
-				print("Terrain3DAssetDock: _on_box_gui_input: search_box releasing focus")
-			search_box.release_focus()
-
-
 ## Dock placement
 
 
@@ -331,146 +296,8 @@ func update_layout() -> void:
 	save_editor_settings()
 
 
-# When a floating asset dock has focus and the mouse returns, grab focus so cursor decal works
-func _on_godot_window_entered() -> void:
-	if plugin.debug > 1:
-		print("Terrain3DAssetDock: _on_godot_window_entered")
-	if is_instance_valid(window) and window.has_focus():
-		plugin.godot_editor_window.grab_focus()
-
-
-func set_selected_by_asset_id(p_id: int) -> void:
-	search_box.text = ""
-	_on_search_text_changed()
-	current_list.set_selected_id(p_id)
 	
 	
-func _on_search_text_changed() -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: _on_search_text_changed: ", search_box.text)
-	search_box.text = search_box.text.strip_escapes()
-	var len: int = search_box.text.length()
-	if len > 0:
-		search_box.set_caret_column(len)
-		search_button.icon = get_theme_icon("Close", "EditorIcons")
-	else:
-		search_button.icon = get_theme_icon("Search", "EditorIcons")
-		
-	mesh_list.search_text = search_box.text
-	texture_list.search_text = search_box.text
-	current_list.update_asset_list()
-	current_list.set_selected_id(0)
-
-
-func _on_search_button_pressed() -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: _on_search_button_pressed")
-	if search_box.text.length() > 0:
-		search_box.text = ""
-		_on_search_text_changed()
-	else:
-		if plugin.debug:
-			print("Terrain3DAssetDock: _on_search_button_pressed: Search box grabbing focus")
-		search_box.grab_focus()
-
-
-## Dock Button handlers
-
-
-func _on_pin_changed(toggled: bool) -> void:
-	if window:
-		window.always_on_top = pinned_btn.button_pressed
-	save_editor_settings()
-
-
-func _on_slider_changed(value: float) -> void:
-	# Set both lists so they match
-	if texture_list:
-		texture_list.set_entry_width(value)
-	if mesh_list:
-		mesh_list.set_entry_width(value)
-	save_editor_settings()
-	# Hack to trigger ScrollContainer::_reposition_children() to update size of scroll bar handle
-	asset_container.layout_direction = Control.LAYOUT_DIRECTION_LTR
-	asset_container.layout_direction = Control.LAYOUT_DIRECTION_INHERITED
-
-
-func _on_textures_pressed() -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: _on_textures_pressed")
-	if _updating_list or current_list == texture_list:
-		return
-	_updating_list = true
-	current_list = texture_list
-	texture_list.visible = true
-	mesh_list.visible = false
-	textures_btn.set_pressed_no_signal(true)
-	meshes_btn.set_pressed_no_signal(false)
-	texture_list.update_asset_list()
-	if plugin.is_terrain_valid():
-		EditorInterface.edit_node(plugin.terrain)
-	save_editor_settings()
-	_updating_list = false
-
-
-func _on_meshes_pressed() -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: _on_meshes_pressed")
-	if _updating_list or current_list == mesh_list:
-		return
-	_updating_list = true
-	current_list = mesh_list
-	mesh_list.visible = true
-	texture_list.visible = false
-	meshes_btn.set_pressed_no_signal(true)
-	textures_btn.set_pressed_no_signal(false)
-	mesh_list.update_asset_list()
-	if plugin.is_terrain_valid():
-		EditorInterface.edit_node(plugin.terrain)
-	save_editor_settings()
-	_updating_list = false
-
-
-func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor.Operation) -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: _on_tool_changed: ", p_tool, ", ", p_operation)
-	remove_all_highlights()
-	if p_tool == Terrain3DEditor.INSTANCER:
-		_on_meshes_pressed()
-	elif p_tool in [ Terrain3DEditor.TEXTURE, Terrain3DEditor.COLOR, Terrain3DEditor.ROUGHNESS ]:
-		_on_textures_pressed()
-
-
-## Update Dock Contents
-
-
-func update_assets() -> void:
-	if plugin.debug:
-		print("Terrain3DAssetDock: update_assets: ", plugin.terrain.assets if plugin.terrain else "")
-	if not _initialized:
-		return
-	
-	# Verify signals to individual lists
-	if plugin.is_terrain_valid() and plugin.terrain.assets:
-		if not plugin.terrain.assets.textures_changed.is_connected(texture_list.update_asset_list):
-			plugin.terrain.assets.textures_changed.connect(texture_list.update_asset_list)
-		if not plugin.terrain.assets.meshes_changed.is_connected(mesh_list.update_asset_list):
-			plugin.terrain.assets.meshes_changed.connect(mesh_list.update_asset_list)
-
-	current_list.update_asset_list()
-
-
-func remove_all_highlights():
-	if not plugin.terrain:
-		return
-	for i: int in texture_list.entries.size():
-		var resource: Terrain3DTextureAsset = texture_list.entries[i].resource
-		if resource and resource.is_highlighted():
-			resource.set_highlighted(false)
-	for i: int in mesh_list.entries.size():
-		var resource: Terrain3DMeshAsset = mesh_list.entries[i].resource
-		if resource and resource.is_highlighted():
-			resource.set_highlighted(false)
 
 
 ## Manage Editor Settings

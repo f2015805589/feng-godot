@@ -1,5 +1,15 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Baker for Terrain3D
+# Baker for Terrain3D: the editor's Bake and Navigation menu actions.
+
+# Four jobs: bake the terrain into a child `MeshInstance3D` or `OccluderInstance3D` through a full undo
+# action (`bake_mesh_popup` / `_bake_mesh`, and the occluder pair); find which navigation regions a
+# terrain belongs to, and which terrains a navigation region covers (`find_terrain_nav_regions`,
+# `find_nav_region_terrains`); bake one or many nav meshes (`bake_nav_mesh`); and post-process the
+# result to work around Godot issue #85548 (`_postprocess_nav_mesh` and its three stages).
+#
+# The two dialogs are created here and handed to `EditorInterface.popup_dialog_centered()`, which
+# parents a window that has no parent and unparents it again on hide, so neither is added to the tree
+# explicitly.
 extends Node
 
 const BakeLodDialog: PackedScene = preload("res://addons/feng-idweight-terrain/menu/bake_lod_dialog.tscn")

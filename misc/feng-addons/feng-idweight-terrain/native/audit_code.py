@@ -400,6 +400,11 @@ def sections() -> None:
     public setter were internal. Only files carrying both banners are checked - a file with no banner
     makes no claim - and a definition under "Public Functions" that no header declares is listed
     separately, because one free function there is legal but a pattern of them is not.
+
+    A split half has no header of its own, so the header it is checked against is the one it includes
+    that declares the class its definitions belong to. That resolution was added after the asset
+    library split made the gap visible: eight halves from earlier splits were being skipped, so their
+    banners had never been checked at all.
     """
     disagreement = []
     undeclared = []
@@ -408,6 +413,18 @@ def sections() -> None:
         if path.suffix != ".cpp":
             continue
         header = FILES.get(path.with_suffix(".h"))
+        if header is None:
+            # A split half has no header of its own: it includes the class header it belongs to, and
+            # that is the header whose access specifiers its banners have to agree with. Without this
+            # the halves of every class split in this pass were silently skipped. The class header is
+            # the include that declares the class the definitions belong to - not simply the first
+            # include, which is `logger.h` in most of these files.
+            classes = set(re.findall(r"\b(\w+)::\w+\s*\(", text))
+            for candidate in re.findall(r'^#include "([^"]+\.h)"', text, re.M):
+                candidate_text = FILES.get(SRC / candidate)
+                if candidate_text and any(re.search(r"\bclass %s\b" % name, candidate_text) for name in classes):
+                    header = candidate_text
+                    break
         if header is None:
             continue
         access = header_access(header)
@@ -642,19 +659,54 @@ BODY_HEAD = re.compile(r"^[A-Za-z_][\w:<>,*&\s]*?(?:\w+::)?([A-Za-z_]\w*)\s*\(")
 
 
 def indent() -> None:
-    """Mis-indented runs, and bodies whose first statement is a level too deep.
+    """Mis-indented runs, bodies whose first statement is a level too deep, and misplaced comments.
 
-    Two checks in one pass, because one cannot see what the other does. The run check tolerates a
+    Three checks in one pass, because each cannot see what the others do. The run check tolerates a
     line at `expected + 1` when it continues the previous one - which is right, and is exactly why it
     cannot see a body indented one level too deep: every one of its lines sits at `expected + 1`, and
     the defect reads as a wrap. `_svt_walk_visible_pages()` was written that way for fifty-one lines
     after being extracted from `_update_visible_svt()`, and the compiler has no opinion about it.
 
     So the second check looks at the one line with a unique expected depth, the first statement of a
-    body, and the first check keeps looking everywhere else. Both are reported in file order.
+    body, and the first check keeps looking everywhere else.
+
+    The third exists because comments are invisible to both: they read `code_only()`, where every
+    comment is blank. A comment left at column 0 inside an indented body is not a cosmetic detail -
+    it reads as if it belonged to the file rather than to the function around it - and one was
+    introduced by this pass's own comment rewrite in `terrain_3d_region.cpp`: three lines became two,
+    and the first lost its indentation. A column-0 `//` line whose nearest neighbour above *and* below
+    is indented is reported. Requiring both sides is what keeps the embedded-shader files clean, where
+    a column-0 comment sits between a column-0 `#include` and a column-0 `static const char *`.
+
+    A body written entirely on its opening line (`{ return x; }`) is skipped: it has no line of its
+    own to measure, and walking past it reported the *next* definition's column-0 signature instead.
+    An empty body's closing brace is skipped for the same reason.
     """
     runs = []
     deep = []
+    misplaced = []
+    # Comments are invisible to the two checks below by construction - both read `code_only()`, where
+    # every comment is blank - so a comment left at column 0 inside an indented body was unmeasurable.
+    # terrain_3d_region.cpp had one after a comment rewrite: three lines of explanation became two, and
+    # the first landed at column 0 while the code around it stayed two tabs in. The rule here is
+    # positional rather than syntactic: a comment at column 0 whose nearest neighbour above *and* below
+    # is indented is inside a body while written as if it were outside one. Requiring both sides is what
+    # keeps the embedded-shader files out of the report: there a column-0 comment sits between a
+    # column-0 `#include` line and a column-0 `static const char *`, which is where the preprocessor
+    # makes it belong. A namespace's members are flush with the keyword, so their comments follow a
+    # column-0 line too.
+    for path, text in sorted(FILES.items()):
+        if path.suffix not in (".cpp", ".h"):
+            continue
+        lines = text.split("\n")
+        meaningful = [index for index, line in enumerate(lines) if line.strip()]
+        for position, index in enumerate(meaningful):
+            if position == 0 or position + 1 == len(meaningful) or not lines[index].startswith("//"):
+                continue
+            above = lines[meaningful[position - 1]]
+            below = lines[meaningful[position + 1]]
+            if above[:1] in ("\t", " ") and below[:1] in ("\t", " "):
+                misplaced.append((path.name, index + 1))
     for path, text in sorted(FILES.items()):
         if path.suffix not in (".cpp", ".h"):
             continue
@@ -704,11 +756,20 @@ def indent() -> None:
                 body_at = window.find("{", close_at) if close_at >= 0 else -1
                 if body_at < 0 or ";" in window[close_at:body_at]:
                     continue
+                # The first statement may share the opening brace's line (`{ return x; }`). There is
+                # no separate line to measure, and continuing past it read the *next* definition's
+                # signature - a column-0 line - as this body's first statement.
+                tail_at = window.find("\n", body_at)
+                tail = window[body_at + 1:tail_at if tail_at >= 0 else len(window)]
+                if tail.strip():
+                    continue
                 body_line = index + window[:body_at].count("\n") + 1
                 body_expected = expected + 1
                 while body_line < len(code_lines):
                     body_stripped = code_lines[body_line].strip()
                     if body_stripped and not body_stripped.startswith(("//", "#")):
+                        if body_stripped.startswith("}"):
+                            break  # An empty body: its closing brace is not a statement.
                         body_tabs = len(raw_lines[body_line]) - len(raw_lines[body_line].lstrip("\t"))
                         if body_tabs != body_expected:
                             deep.append((path.name, body_line + 1, body_tabs, body_expected,
@@ -729,6 +790,11 @@ def indent() -> None:
         print("   (none)")
     for name, line, tabs, expected, text_of_line in deep:
         print("   %-30s line %-5d tabs=%d expected=%d  %s" % (name, line, tabs, expected, text_of_line))
+    print("== comments written as if they were outside the body they are in")
+    if not misplaced:
+        print("   (none)")
+    for name, line in misplaced:
+        print("   %-30s line %-5d" % (name, line))
 
 
 if __name__ == "__main__":

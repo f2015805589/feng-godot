@@ -1,5 +1,11 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Importer for Terrain3D
+#
+# A manual tool: attach this script to a Terrain3D node, and its groups and
+# buttons appear in the inspector. Nothing in the addon creates it or calls it
+# during normal operation - every action here runs when the user presses a
+# button, in the editor, with no undo support (`reset_terrain()` removes regions
+# for real). `tools/region_mover.gd` is the same kind of script.
 @tool
 extends Terrain3D
 

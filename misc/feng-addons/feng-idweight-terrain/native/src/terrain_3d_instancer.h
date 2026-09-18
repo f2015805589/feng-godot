@@ -34,8 +34,13 @@ private:
 	// MM Resources stored in Terrain3DRegion::_instances as
 	// Region::_instances{mesh_id:int} -> cell{v2i} -> [ TypedArray<Transform3D>, PackedColorArray, modified:bool ]
 
-	// A pair of MMI and MM RIDs, freed in destructor, stored as
-	// _mmi_rids{region_loc} -> mesh{v2i(mesh_id,lod)} -> cell{v2i} -> std::pair<mmi_RID, mm_RID>
+	// The pair of MMI and multimesh RIDs for one cell of one mesh and LOD, owned by this instancer:
+	// _mmi_rids{region_loc} -> mesh{v2i(mesh_id,lod)} -> cell{v2i} -> std::pair<mmi_RID, mm_RID>.
+	//
+	// This map is the only place an MMI or a multimesh RID lives, so every teardown path has to walk
+	// *it* rather than the data's regions: a region that has been unloaded or removed is gone from the
+	// data while its entries are still here. `_mesh_ids_at()` copies the ids at a location, because
+	// freeing one erases entries from the map being walked.
 
 	using CellMMIDict = std::unordered_map<Vector2i, std::pair<RID, RID>, Vector2iHash>;
 	using MeshMMIDict = std::unordered_map<Vector2i, CellMMIDict, Vector2iHash>;
@@ -43,9 +48,17 @@ private:
 
 	// MMI Updates tracked in a unique Set of <region_location, mesh_id>
 	// <V2I_MAX, -2> means destroy first, then update everything
-	// <V2I_MAX, -1> means update everything
+	// <V2I_MAX, -1> means update everything without destroying first
 	// <reg_loc, -1> means update all meshes in that region
 	// <V2I_MAX, N> means update mesh ID N in all regions
+	//
+	// `<V2I_MAX, -1>` is not hypothetical: it is what `update_mmis()` queues with its default arguments,
+	// and `initialize()` calls it that way. A pass of this repository deleted the arm that read it, the
+	// guard that skipped it in the pair loop and the check for it below, on the reading that only a
+	// rebuild ever queued a sentinel. The refresh then did nothing and treated V2I_MAX as a region,
+	// logging "Errant null region found at: (2147483647, 2147483647)" once per mesh id - so instances
+	// never appeared after a scene load. Both pieces are back; native/tests/terrain_instancer_refresh.gd
+	// is the test that would have caught it.
 	using V2IIntPair = std::unordered_set<std::pair<Vector2i, int>, PairVector2iIntHash>;
 	V2IIntPair _queued_updates;
 
@@ -58,7 +71,9 @@ private:
 	void _update_mmi_by_region(const Terrain3DRegion *p_region, const int p_mesh_id);
 	void _set_mmi_lod_ranges(RID p_mmi, const Ref<Terrain3DMeshAsset> &p_ma, const int p_lod);
 	void _update_vertex_spacing(const real_t p_vertex_spacing);
-	void _destroy_mmi_by_mesh(const int p_mesh_id);
+	void _release_orphaned_regions();
+	void _recount_master_lods(const std::unordered_set<int> &p_meshes);
+	std::vector<int> _mesh_ids_at(const Vector2i &p_region_loc);
 	void _destroy_mmi_by_location(const Vector2i &p_region_loc, const int p_mesh_id);
 	void _destroy_mmi_by_cell(const Vector2i &p_region_loc, const int p_mesh_id, const Vector2i p_cell, const int p_lod = INT32_MAX);
 	void _backup_region(const Ref<Terrain3DRegion> &p_region);
