@@ -156,7 +156,7 @@ public:
 	virtual bool is_compositor(RID p_compositor) const = 0;
 
 	virtual void compositor_set_compositor_effects(RID p_env, const TypedArray<RID> &p_effects) = 0;
-	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) = 0;
+	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names, const PackedInt32Array &p_provided = PackedInt32Array(), const Dictionary &p_parameters = Dictionary()) = 0;
 
 	/* ENVIRONMENT API */
 
@@ -352,6 +352,10 @@ public:
 	virtual void render_empty_scene(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_scenario, RID p_shadow_atlas, float p_window_output_max_value) = 0;
 
 	virtual void render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
+
+	// Compositor that will render this camera: the camera's own, else the scenario's.
+	// Renderers that do not track compositors return an invalid RID.
+	virtual RID render_get_compositor(RID p_camera, RID p_scenario) { return RID(); }
 
 	virtual void update() = 0;
 	virtual void render_probes() = 0;

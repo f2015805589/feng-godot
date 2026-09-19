@@ -452,7 +452,7 @@ void RendererSceneRenderRD::_render_buffers_copy_depth_texture(const RenderDataR
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const RenderDataRD *p_render_data, bool p_use_msaa) {
+void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
@@ -671,6 +671,55 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 			}
 		}
 	}
+}
+
+void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const RenderDataRD *p_render_data, bool p_use_msaa) {
+	_render_buffers_post_process(p_render_data, p_use_msaa);
+	_render_buffers_tonemap(p_render_data);
+}
+
+void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present) {
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+
+	ERR_FAIL_NULL(p_render_data);
+
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+
+	Size2i target_size = rb->get_target_size();
+	bool can_use_effects = target_size.x >= 8 && target_size.y >= 8;
+	can_use_effects &= _debug_draw_can_use_effects(debug_draw);
+	bool can_use_storage = _render_buffers_can_be_storage();
+
+	RSE::ViewportScaling3DMode scale_mode = rb->get_scaling_3d_mode();
+	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
+	SpatialUpscaler *spatial_upscaler = nullptr;
+	if (can_use_effects) {
+		if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
+			spatial_upscaler = fsr;
+		} else if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
+#ifdef METAL_ENABLED
+			spatial_upscaler = mfx_spatial;
+#endif
+		}
+	}
+
+	bool use_fxaa = rb->get_screen_space_aa() == RSE::VIEWPORT_SCREEN_SPACE_AA_FXAA;
+	bool use_smaa = smaa && rb->get_screen_space_aa() == RSE::VIEWPORT_SCREEN_SPACE_AA_SMAA;
+	bool using_scaling_pass = spatial_upscaler || ((use_fxaa || use_smaa) && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_NEAREST));
+
+	RID render_target = rb->get_render_target();
+	RID color_texture = use_upscaled_texture ? rb->get_upscaled_texture() : rb->get_internal_texture();
+	Size2i color_size = use_upscaled_texture ? target_size : rb->get_internal_size();
+
+	bool dest_is_msaa_2d = rb->get_view_count() == 1 && texture_storage->render_target_get_msaa(render_target) != RSE::VIEWPORT_MSAA_DISABLED;
+
+	// The exposure reduction itself happens in the post-process step; tone mapping only
+	// needs the scale to apply.
+	float auto_exposure_scale = 1.0;
+	if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+	}
 
 	{
 		RENDER_TIMESTAMP("Tonemap");
@@ -768,7 +817,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 
 		RID dest_fb;
 		RD::DataFormat dest_fb_format;
-		if (using_scaling_pass || use_smaa) {
+		if (p_defer_present || using_scaling_pass || use_smaa) {
 			// If we use a spatial upscaler to upscale or SMAA to antialias we need to write our result into an intermediate buffer.
 			// Note that this is cached so we only create the texture the first time.
 			dest_fb_format = rb->get_base_data_format();
@@ -793,7 +842,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 
 		tonemap.debanding_mode = RendererRD::ToneMapper::TonemapSettings::DebandingMode::DEBANDING_MODE_DISABLED;
 		if (rb->get_use_debanding() && !using_hdr) {
-			if (use_smaa) {
+			if (use_smaa && !p_defer_present) {
 				// SMAA will apply 8-bit debanding.
 				if (!can_use_storage) {
 					// When can_use_storage is false, the intermediate destination buffer will be 10 bit, so
@@ -861,7 +910,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		RD::get_singleton()->draw_command_end_label();
 	}
 
-	if (rb.is_valid() && using_scaling_pass) {
+	if (rb.is_valid() && using_scaling_pass && !p_defer_present) {
 		RD::get_singleton()->draw_command_begin_label(spatial_upscaler ? spatial_upscaler->get_label() : "3D Viewport Scaling");
 
 		if (spatial_upscaler) {

@@ -2,7 +2,6 @@
 #define M_TAU 6.28318530718
 #define ROUGHNESS_MAX_LOD 5
 
-#define MAX_VOXEL_GI_INSTANCES 8
 #define MAX_VIEWS 2
 
 #extension GL_KHR_shader_subgroup_ballot : enable
@@ -13,7 +12,9 @@
 #include "../oct_inc.glsl"
 #include "../scene_data_inc.glsl"
 
-#if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_SDF) || defined(MODE_RENDER_NORMAL_ROUGHNESS) || defined(MODE_RENDER_VOXEL_GI) || defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(BENT_NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED)
+// The G-buffer pass writes the surface normal and applies decals, so it always needs
+// the normal inputs (this is FRP's own pass mode, not an upstream one).
+#if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_GBUFFER) || defined(MODE_RENDER_SDF) || defined(MODE_RENDER_NORMAL_ROUGHNESS) || defined(MODE_RENDER_VOXEL_GI) || defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(BENT_NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED)
 #ifndef NORMAL_USED
 #define NORMAL_USED
 #endif
@@ -75,10 +76,6 @@ uint sc_packed_1() {
 }
 
 #endif
-
-bool sc_use_forward_gi() {
-	return ((sc_packed_0() >> 0) & 1U) != 0;
-}
 
 bool sc_use_light_projector() {
 	return ((sc_packed_0() >> 1) & 1U) != 0;
@@ -169,8 +166,6 @@ layout(constant_id = 2) const bool sc_emulate_point_size = false;
 
 #define REFLECTION_MULTIPLIER 1.0
 
-#define SDFGI_MAX_CASCADES 8
-
 /* Set 0: Base Pass (never changes) */
 
 #include "../light_data_inc.glsl"
@@ -179,23 +174,14 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 
 #define INSTANCE_FLAGS_DYNAMIC (1 << 3)
 #define INSTANCE_FLAGS_NON_UNIFORM_SCALE (1 << 4)
-#define INSTANCE_FLAGS_USE_GI_BUFFERS (1 << 5)
-#define INSTANCE_FLAGS_USE_SDFGI (1 << 6)
 #define INSTANCE_FLAGS_USE_LIGHTMAP_CAPTURE (1 << 7)
 #define INSTANCE_FLAGS_USE_LIGHTMAP (1 << 8)
 #define INSTANCE_FLAGS_USE_SH_LIGHTMAP (1 << 9)
-#define INSTANCE_FLAGS_USE_VOXEL_GI (1 << 10)
 #define INSTANCE_FLAGS_PARTICLES (1 << 11)
 #define INSTANCE_FLAGS_PARTICLE_TRAIL_SHIFT 16
 #define INSTANCE_FLAGS_FADE_SHIFT 24
 //3 bits of stride
 #define INSTANCE_FLAGS_PARTICLE_TRAIL_MASK 0xFF
-
-#define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSAO (1 << 0)
-#define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL (1 << 1)
-#define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR (1 << 2)
-#define SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR (1 << 3)
-#define SCREEN_SPACE_EFFECTS_FLAGS_USE_GI_BUFFERS (1 << 4)
 
 layout(set = 0, binding = 3, std430) restrict readonly buffer OmniLights {
 	LightData data[];
@@ -272,45 +258,6 @@ layout(set = 0, binding = 13, std430) restrict readonly buffer GlobalShaderUnifo
 	vec4 data[];
 }
 global_shader_uniforms;
-#endif
-
-struct SDFVoxelGICascadeData {
-	vec3 position;
-	float to_probe;
-	ivec3 probe_world_offset;
-	float to_cell; // 1/bounds * grid_size
-	vec3 pad;
-	float exposure_normalization;
-};
-
-#ifndef MODE_FRP_LIGHTING
-layout(set = 0, binding = 14, std140) uniform SDFGI {
-	vec3 grid_size;
-	uint max_cascades;
-
-	bool use_occlusion;
-	int probe_axis_size;
-	float probe_to_uvw;
-	float normal_bias;
-
-	vec3 lightprobe_tex_pixel_size;
-	float energy;
-
-	vec3 lightprobe_uv_offset;
-	float y_mult;
-
-	vec3 occlusion_clamp;
-	uint pad3;
-
-	vec3 occlusion_renormalize;
-	uint pad4;
-
-	vec3 cascade_probe_size;
-	uint pad5;
-
-	SDFVoxelGICascadeData cascades[SDFGI_MAX_CASCADES];
-}
-sdfgi;
 #endif
 
 layout(set = 0, binding = 15) uniform sampler DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP;
@@ -410,10 +357,6 @@ layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 layout(set = 1, binding = 7) uniform texture2DArray lightmap_textures[MAX_LIGHTMAP_TEXTURES * 2];
 #endif
 
-#ifndef MODE_FRP_LIGHTING
-layout(set = 1, binding = 8) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_INSTANCES];
-#endif
-
 layout(set = 1, binding = 9, std430) buffer restrict readonly ClusterBuffer {
 	uint data[];
 }
@@ -477,9 +420,6 @@ layout(set = 1, binding = 24) uniform texture2DArray depth_buffer;
 layout(set = 1, binding = 25) uniform texture2DArray color_buffer;
 #endif
 layout(set = 1, binding = 26) uniform texture2DArray normal_roughness_buffer;
-layout(set = 1, binding = 27) uniform texture2DArray ao_buffer;
-layout(set = 1, binding = 28) uniform texture2DArray ambient_buffer;
-layout(set = 1, binding = 29) uniform texture2DArray reflection_buffer;
 #define multiviewSampler sampler2DArray
 #else // USE_MULTIVIEW
 layout(set = 1, binding = 24) uniform texture2D depth_buffer;
@@ -487,54 +427,12 @@ layout(set = 1, binding = 24) uniform texture2D depth_buffer;
 layout(set = 1, binding = 25) uniform texture2D color_buffer;
 #endif
 layout(set = 1, binding = 26) uniform texture2D normal_roughness_buffer;
-layout(set = 1, binding = 27) uniform texture2D ao_buffer;
-layout(set = 1, binding = 28) uniform texture2D ambient_buffer;
-layout(set = 1, binding = 29) uniform texture2D reflection_buffer;
 #define multiviewSampler sampler2D
-#endif
-#ifndef MODE_FRP_LIGHTING
-layout(set = 1, binding = 30) uniform texture2DArray sdfgi_lightprobe_texture;
-#endif
-#ifndef MODE_FRP_LIGHTING
-layout(set = 1, binding = 31) uniform texture3D sdfgi_occlusion_cascades;
-#endif
-
-struct VoxelGIData {
-	mat4 xform; // 64 - 64
-
-	vec3 bounds; // 12 - 76
-	float dynamic_range; // 4 - 80
-
-	float bias; // 4 - 84
-	float normal_bias; // 4 - 88
-	bool blend_ambient; // 4 - 92
-	uint mipmaps; // 4 - 96
-
-	vec3 pad; // 12 - 108
-	float exposure_normalization; // 4 - 112
-};
-
-#ifndef MODE_FRP_LIGHTING
-layout(set = 1, binding = 32, std140) uniform VoxelGIs {
-	VoxelGIData data[MAX_VOXEL_GI_INSTANCES];
-}
-voxel_gi_instances;
 #endif
 
 #ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
 #endif
-
-#ifdef USE_MULTIVIEW
-layout(set = 1, binding = 34) uniform texture2DArray ssil_buffer;
-layout(set = 1, binding = 35) uniform texture2DArray ssr_buffer;
-layout(set = 1, binding = 36) uniform texture2DArray ssr_mip_level_buffer;
-#else
-layout(set = 1, binding = 34) uniform texture2D ssil_buffer;
-layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
-layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
-#endif // USE_MULTIVIEW
-
 #ifdef MODE_FRP_LIGHTING
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 37) uniform texture2DArray gbuffer_albedo_buffer;

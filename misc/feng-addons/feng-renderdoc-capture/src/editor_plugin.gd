@@ -66,7 +66,13 @@ func _on_capture_pressed() -> void:
 		_warning("Set RenderDoc > Capture > Executable Path to qrenderdoc.exe in Editor Settings.")
 		return
 	if not FengRenderDoc.is_hooked():
-		_warning("This editor's rendering device is not connected to RenderDoc. Capturing an existing device requires RenderDoc to be initialized when the editor starts.")
+		# RenderDoc attaches while the editor starts, so a stale or missing installation
+		# cannot be fixed from inside the running editor. Report what went wrong at
+		# startup instead of only saying that the device is not attached.
+		var reason := str(FengRenderDoc.get_mount_status())
+		if reason.is_empty():
+			reason = "RenderDoc was not mounted when this editor started."
+		_warning(reason + " Editing the path takes effect the next time the editor starts.")
 		return
 	_busy = true
 	button.disabled = true

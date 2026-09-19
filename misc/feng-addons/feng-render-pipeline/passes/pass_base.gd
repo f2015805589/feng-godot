@@ -21,6 +21,13 @@ const OutputDeclaration = preload("pass_output.gd")
 
 @export var inputs: Array[TextureInput] = []
 @export var outputs: Array[OutputDeclaration] = []
+## Native FRP passes this pass takes over, by id. Declaring an id tells the
+## renderer that a schedule without the matching built-in entry is complete: the
+## pass runs that entry's work itself through the FRPPassContext primitives, so
+## the entry is neither re-added during normalization nor reported as missing.
+## Declare only what the pass actually does - a declaration without the work
+## produces an incomplete frame rather than a validation error.
+@export var provides_native_ids: Array[int] = []
 ## Stable identity used by the renderer's persisted library and migration
 ## bookkeeping.  It is storage-only because it is an implementation detail,
 ## while Resource.resource_name is the readable name shown in the inspector.
@@ -50,6 +57,33 @@ func _report(message: String) -> void:
 func _clear_report() -> void:
 	_last_error = ""
 
+## Parameters this pass exposes, in the sense URP gives a render pass its settings.
+##
+## A pass script chooses what it exposes by overriding this and listing typed
+## `@export` properties, so the pipeline resource shows exactly those fields for that
+## pass and nothing else. The values are read by the engine for the few it consumes
+## itself (the Temporal AA entry's `jitter_phases` sizes the viewport jitter) and by
+## other passes through `FRPPassContext.get_pass_parameters(pass_id)`.
+##
+## The entry's own `pass_parameters` dictionary overrides these values, which is how a
+## pipeline overrides a pass without editing the pass resource.
+func get_frp_parameters() -> Dictionary:
+	return {}
+
+## Values for the parameters above, authored in the pipeline resource. They override
+## what the pass exposes, so a project can change one value without editing the pass
+## resource, and a volume (see FengVolume) overrides them at runtime. The keys are
+## pass parameter names for the passes this pass provides; a native entry uses the
+## dictionary for its own pass.
+@export var pass_parameters: Dictionary = {}
+
+## The object that owns this pass's resource contract: the inputs it reads, the
+## outputs it produces and the resolved-attachment flags the engine needs before it
+## runs. A plain pass owns its own; a native pass forwards to its overlay, because
+## the overlay is the part that reads or writes textures.
+func get_contract_source() -> FengPass:
+	return self
+
 func _render_callback(callback_stage: int, data: RenderData) -> void:
 	if callback_stage != effect_callback_type or data == null:
 		return
@@ -68,6 +102,20 @@ func _render_callback(callback_stage: int, data: RenderData) -> void:
 			continue
 		_render(buffers, view, rd)
 	_clear_report()
+
+## FRP Core entry point. When the pass is part of an FRP pipeline the renderer calls
+## this instead of `_render_callback`, so a pass can drive the frame through the
+## engine's Core primitives (draw the G-buffer, run deferred lighting, resolve, tone
+## map, ...) instead of reimplementing them. The default forwards to the usual
+## CompositorEffect path, which is what every shader/texture pass wants; override it
+## when the pass needs the Core primitives.
+func _frp_execute(ctx: FRPPassContext) -> void:
+	if ctx == null:
+		return
+	var data := ctx.get_render_data()
+	if data == null:
+		return
+	_render_callback(effect_callback_type, data)
 
 func _validate_runtime_inputs(buffers: RenderSceneBuffersRD, view: int) -> bool:
 	var bindings := {}

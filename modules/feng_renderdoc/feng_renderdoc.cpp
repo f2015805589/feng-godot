@@ -19,6 +19,7 @@
 FengRenderDoc *FengRenderDoc::singleton = nullptr;
 bool FengRenderDoc::hooked = false;
 String FengRenderDoc::dll_path;
+String FengRenderDoc::mount_status = "RenderDoc was not mounted when this editor started.";
 void *FengRenderDoc::api_ptr = nullptr;
 
 static String get_editor_config_path() {
@@ -40,13 +41,16 @@ void FengRenderDoc::probe_and_mount() {
 	// Capture the editor's existing rendering device, never a reconstructed
 	// scene in another engine process. Attach before graphics initialization.
 	if (!Engine::get_singleton()->is_editor_hint() || Engine::get_singleton()->is_recovery_mode_hint()) {
+		mount_status = "RenderDoc only attaches to a normal editor session (not to games, headless tools or recovery mode).";
 		return;
 	}
 	if (!ProjectSettings::get_singleton()->has_setting("editor_plugins/enabled")) {
+		mount_status = "The RenderDoc Capture plugin is not enabled for this project.";
 		return;
 	}
 	const PackedStringArray plugins = ProjectSettings::get_singleton()->get("editor_plugins/enabled");
 	if (!plugins.has("res://addons/feng-renderdoc-capture/plugin.cfg")) {
+		mount_status = "The RenderDoc Capture plugin is not enabled for this project.";
 		return;
 	}
 	String configured_path;
@@ -59,6 +63,7 @@ void FengRenderDoc::probe_and_mount() {
 	}
 	const String gui_path = get_gui_path(configured_path);
 	if (gui_path.is_empty()) {
+		mount_status = "qrenderdoc.exe was not found. Install RenderDoc, or set RenderDoc > Capture > Executable Path, then restart the editor.";
 		print_verbose("[f_renderdoc] qrenderdoc.exe was not found; editor capture unavailable.");
 		return;
 	}
@@ -72,13 +77,24 @@ void FengRenderDoc::probe_and_mount() {
 		"win32_x64/renderdoc.dll",
 		nullptr,
 	};
+	// The DLL has to come from a real installation, so every known root is searched
+	// instead of trusting one path: a configured executable that sits in a folder
+	// without a usable renderdoc.dll must not hide the installed copy.
 	Vector<String> roots;
-	roots.append(gui_path.get_base_dir());
-	roots.append(OS::get_singleton()->get_executable_path().get_base_dir());
-	const String exe_env = OS::get_singleton()->get_environment("FENG_RENDERDOC_PATH");
-	if (!exe_env.is_empty()) {
-		roots.append(exe_env);
+	const String exe_dir = OS::get_singleton()->get_executable_path().get_base_dir();
+	Vector<String> candidate_roots;
+	candidate_roots.append(gui_path.get_base_dir());
+	candidate_roots.append(OS::get_singleton()->get_environment("FENG_RENDERDOC_PATH"));
+	candidate_roots.append(exe_dir);
+	candidate_roots.append(exe_dir.path_join("tools/RenderDoc"));
+	candidate_roots.append(OS::get_singleton()->get_environment("ProgramFiles").path_join("RenderDoc"));
+	candidate_roots.append("C:/Program Files/RenderDoc");
+	for (const String &root : candidate_roots) {
+		if (!root.is_empty() && !roots.has(root)) {
+			roots.append(root);
+		}
 	}
+	String probe_error;
 
 	for (const String &root : roots) {
 		for (int i = 0; dll_candidates[i] != nullptr; i++) {
@@ -89,12 +105,14 @@ void FengRenderDoc::probe_and_mount() {
 			Char16String path_utf16 = path.utf16();
 			HMODULE mod = LoadLibraryW(reinterpret_cast<const wchar_t *>(path_utf16.get_data()));
 			if (!mod) {
+				probe_error = vformat("renderdoc.dll at %s could not be loaded (error %d).", path, (int)GetLastError());
 				ERR_PRINT(vformat("[f_renderdoc] Failed to load %s (error %d)", path, (int)GetLastError()));
 				continue;
 			}
 			typedef int(RENDERDOC_CC * PFN_GetAPI)(RENDERDOC_Version, void **);
 			PFN_GetAPI get_api = (PFN_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
 			if (!get_api) {
+				probe_error = vformat("renderdoc.dll at %s has no RENDERDOC_GetAPI export.", path);
 				ERR_PRINT(vformat("[f_renderdoc] %s has no RENDERDOC_GetAPI export", path));
 				continue;
 			}
@@ -104,6 +122,13 @@ void FengRenderDoc::probe_and_mount() {
 			}
 			dll_path = path;
 			hooked = true;
+			// The DLL can come from another installation than the configured GUI.
+			// Name both so a version mismatch between capture and analyzer is visible.
+			const String gui_dir = gui_path.get_base_dir();
+			const bool same_install = path.get_base_dir() == gui_dir;
+			mount_status = same_install
+					? vformat("RenderDoc mounted from %s.", path)
+					: vformat("RenderDoc mounted from %s, but the configured executable is %s. Keep both from the same RenderDoc version.", path, gui_path);
 			// Keep the editor silent outside explicitly requested captures.
 			// Clear the F12 capture hotkey and hide the corner overlay so the
 			// only capture path is the editor toolbar camera button.
@@ -113,17 +138,26 @@ void FengRenderDoc::probe_and_mount() {
 			rdoc->SetFocusToggleKeys(nullptr, 0);
 			rdoc->MaskOverlayBits(0, 0);
 			print_line(vformat("[f_renderdoc] RenderDoc mounted from %s (capture keys and overlay disabled)", path));
+			if (!same_install) {
+				WARN_PRINT(vformat("[f_renderdoc] the configured qrenderdoc.exe is %s, which is a different RenderDoc installation", gui_path));
+			}
 			return;
 		}
 	}
-	print_line("[f_renderdoc] renderdoc.dll not found; capture requests will be no-ops");
+	print_line(vformat("[f_renderdoc] renderdoc.dll not found next to %s, below %s or in a Windows RenderDoc install; capture requests will be no-ops", gui_path, exe_dir));
+	mount_status = probe_error.is_empty() ? vformat("renderdoc.dll was not found next to %s. The executable path has to point at the qrenderdoc.exe whose folder also holds renderdoc.dll.", gui_path) : probe_error;
 #else
 	print_verbose("[f_renderdoc] mounting only available on Windows");
+	mount_status = "RenderDoc capture is only available on Windows in this build.";
 #endif
 }
 
 bool FengRenderDoc::is_hooked() {
 	return hooked;
+}
+
+String FengRenderDoc::get_mount_status() {
+	return mount_status;
 }
 
 String FengRenderDoc::get_dll_path() {
@@ -132,7 +166,13 @@ String FengRenderDoc::get_dll_path() {
 
 String FengRenderDoc::get_gui_path(const String &p_configured_path) {
 	if (!p_configured_path.is_empty()) {
-		return FileAccess::exists(p_configured_path) ? p_configured_path : String();
+		if (FileAccess::exists(p_configured_path)) {
+			return p_configured_path;
+		}
+		// The cached path outlives the installation it pointed at when RenderDoc is
+		// moved, upgraded or removed. Never let a stale cache entry disable the
+		// search: fall through to auto-detection instead of reporting "not found".
+		print_line(vformat("[f_renderdoc] cached RenderDoc path %s no longer exists; searching again", p_configured_path));
 	}
 	Vector<String> roots;
 	if (!dll_path.is_empty()) {
@@ -226,6 +266,7 @@ Error FengRenderDoc::set_editor_gui_path(const String &p_gui_path) {
 
 void FengRenderDoc::_bind_methods() {
 	ClassDB::bind_static_method("FengRenderDoc", D_METHOD("is_hooked"), &FengRenderDoc::is_hooked);
+	ClassDB::bind_static_method("FengRenderDoc", D_METHOD("get_mount_status"), &FengRenderDoc::get_mount_status);
 	ClassDB::bind_static_method("FengRenderDoc", D_METHOD("get_dll_path"), &FengRenderDoc::get_dll_path);
 	ClassDB::bind_static_method("FengRenderDoc", D_METHOD("get_gui_path", "configured_path"), &FengRenderDoc::get_gui_path, DEFVAL(String()));
 	ClassDB::bind_static_method("FengRenderDoc", D_METHOD("trigger_capture", "window_id"), &FengRenderDoc::trigger_capture, DEFVAL(0));

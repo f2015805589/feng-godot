@@ -1184,8 +1184,8 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 		}
 	}
 
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus") {
-		// Hide SSAO properties that only work in Forward+.
+	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && OS::get_singleton()->get_current_rendering_method() != "frp") {
+		// Hide SSAO properties that only work in Forward+ and FRP.
 		if (p_property.name.begins_with("ssao_")) {
 			if ((p_property.name != "ssao_enabled") && (p_property.name != "ssao_radius") && (p_property.name != "ssao_intensity")) {
 				p_property.usage = PROPERTY_USAGE_NO_EDITOR;

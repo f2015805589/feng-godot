@@ -3519,10 +3519,8 @@ GI::GI() {
 
 GI::~GI() {
 	for (int v = 0; v < SHADER_SPECIALIZATION_VARIATIONS; v++) {
-		for (int s = 0; s < 2; s++) {
-			for (int i = 0; i < MODE_MAX; i++) {
-				pipelines[v][s][i].free();
-			}
+		for (int i = 0; i < MODE_MAX; i++) {
+			pipelines[v][i].free();
 		}
 	}
 
@@ -3754,11 +3752,6 @@ void GI::init(SkyRD *p_sky) {
 			sc.constant_id = 2; // SHADER_SPECIALIZATION_USE_VRS
 			sc.bool_value = false;
 			specialization_constants.push_back(sc);
-
-			sc.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_BOOL;
-			sc.constant_id = 3; // SHADER_SPECIALIZATION_SPLIT_ROUGHNESS
-			sc.bool_value = false;
-			specialization_constants.push_back(sc);
 		}
 
 		for (int v = 0; v < SHADER_SPECIALIZATION_VARIATIONS; v++) {
@@ -3767,13 +3760,8 @@ void GI::init(SkyRD *p_sky) {
 			specialization_constants.ptrw()[2].bool_value = (v & SHADER_SPECIALIZATION_USE_VRS) ? true : false;
 
 			int variant_base = vrs_supported ? MODE_MAX : 0;
-			// Both roughness layouts are compiled once; process_gi() picks the
-			// one matching the render buffers it was handed.
-			for (int s = 0; s < 2; s++) {
-				specialization_constants.ptrw()[3].bool_value = s == 1;
-				for (int i = 0; i < MODE_MAX; i++) {
-					pipelines[v][s][i].create_compute_pipeline(shader.version_get_shader(shader_version, variant_base + i), specialization_constants);
-				}
+			for (int i = 0; i < MODE_MAX; i++) {
+				pipelines[v][i].create_compute_pipeline(shader.version_get_shader(shader_version, variant_base + i), specialization_constants);
 			}
 		}
 
@@ -4222,23 +4210,6 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 			{
 				RD::Uniform u;
 				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-				u.binding = 20;
-				// FRP spends all 30 bits of normal_roughness.rgb on the normal and
-				// keeps roughness in its own G-buffer target. forward_clustered has
-				// no such target, so a default texture is bound there and the legacy
-				// packed decode is selected by the pipeline specialization constant.
-				RID orm_slice;
-				if (p_render_buffers->has_texture(SNAME("frp_clustered"), SNAME("gbuffer_orm"))) {
-					orm_slice = p_render_buffers->get_texture_slice(SNAME("frp_clustered"), SNAME("gbuffer_orm"), v, 0);
-				} else {
-					orm_slice = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
-				}
-				u.append_id(orm_slice);
-				uniforms.push_back(u);
-			}
-			{
-				RD::Uniform u;
-				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 				u.binding = 14;
 				RID buffer = p_voxel_gi_buffer.is_valid() ? p_voxel_gi_buffer : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 				u.append_id(buffer);
@@ -4288,10 +4259,7 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 			rbgi->uniform_set[v] = RD::get_singleton()->uniform_set_create(uniforms, shader.version_get_shader(shader_version, variant_base), 0);
 		}
 
-		// FRP exposes its ORM G-buffer target; its presence selects the split
-		// roughness decode (see the layout note in gi.glsl).
-		const bool split_roughness = p_render_buffers->has_texture(SNAME("frp_clustered"), SNAME("gbuffer_orm"));
-		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, pipelines[pipeline_specialization][split_roughness ? 1 : 0][mode].get_rid());
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, pipelines[pipeline_specialization][mode].get_rid());
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, rbgi->uniform_set[v], 0);
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 

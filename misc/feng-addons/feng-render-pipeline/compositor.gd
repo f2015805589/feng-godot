@@ -37,3 +37,11 @@ func _on_renderer_changed() -> void:
 	if not _apply_pending:
 		_apply_pending = true
 		_apply.call_deferred()
+
+## Pass parameter overrides a volume resolved for the camera using this compositor,
+## plus the pass states it switches on or off (see FengVolume). The renderer layers
+## them over the authored values.
+func set_volume_parameters(parameters: Dictionary, pass_states: Dictionary = {}) -> void:
+	if _renderer == null:
+		return
+	_renderer.set_volume_parameters(parameters, pass_states)

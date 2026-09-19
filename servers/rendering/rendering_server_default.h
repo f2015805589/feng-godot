@@ -825,7 +825,7 @@ public:
 	/* COMPOSITOR */
 
 	FUNC2(compositor_set_compositor_effects, RID, const TypedArray<RID> &)
-	FUNC3(compositor_set_frp_pipeline, RID, const PackedInt32Array &, const PackedStringArray &)
+	FUNC5(compositor_set_frp_pipeline, RID, const PackedInt32Array &, const PackedStringArray &, const PackedInt32Array &, const Dictionary &)
 
 	FUNCRIDSPLIT(compositor)
 

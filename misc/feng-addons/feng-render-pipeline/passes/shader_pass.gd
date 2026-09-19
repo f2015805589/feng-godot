@@ -15,6 +15,16 @@ const PIPELINE_SCOPE: StringName = &"frp_pipeline"
 @export var parameters := Vector4(1.0, 1.0, 1.0, 1.0)
 @export var workgroup_size := Vector2i(8, 8)
 
+## Shader keywords: specialization constants, keyed by the `constant_id` the shader
+## declares. A shader that starts with
+##
+##     layout(constant_id = 0) const bool POST_AFTER_TONEMAP = false;
+##
+## is given that keyword by `shader_keywords = { 0: true }`, or at runtime by
+## `set_shader_keyword(0, true)`. Changing a keyword recreates the pipeline, so the
+## shader really is re-specialized (the branch the keyword guards is compiled away).
+@export var shader_keywords: Dictionary = {}
+
 ## Empty targets mean the viewport's internal color texture for raster and the
 ## internal render size for compute. Named targets refer to frp_pipeline.
 @export var raster_target: StringName = &""
@@ -28,8 +38,39 @@ var _sampler := RID()
 var _spirv: RDShaderSPIRV
 var _shader_resource: RDShaderFile
 var _shader_mode := -1
+var _keyword_signature := ""
 var _raster_pipelines := {}
 var _binding_error := false
+
+## Sets one shader keyword (a specialization constant) and re-specializes the shader
+## when its value actually changed.
+func set_shader_keyword(constant_id: int, value) -> void:
+	if shader_keywords.has(constant_id) and shader_keywords[constant_id] == value:
+		return
+	shader_keywords[constant_id] = value
+	_keyword_signature = ""
+
+func get_shader_keyword(constant_id: int, default_value = false):
+	return shader_keywords.get(constant_id, default_value)
+
+func _keyword_signature_now() -> String:
+	var ids := shader_keywords.keys()
+	ids.sort()
+	var parts := PackedStringArray()
+	for constant_id in ids:
+		parts.append("%s=%s" % [str(constant_id), str(shader_keywords[constant_id])])
+	return ",".join(parts)
+
+func _specialization() -> Array:
+	var constants: Array = []
+	var ids := shader_keywords.keys()
+	ids.sort()
+	for constant_id in ids:
+		var constant := RDPipelineSpecializationConstant.new()
+		constant.constant_id = int(constant_id)
+		constant.value = shader_keywords[constant_id]
+		constants.append(constant)
+	return constants
 
 func _render(_buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	if shader_file == null:
@@ -50,7 +91,7 @@ func _ensure_shader(rd: RenderingDevice) -> bool:
 	if shader_file.base_error != "":
 		_report("Shader compilation failed: " + shader_file.base_error)
 		return false
-	if _shader.is_valid() and _shader_resource == shader_file and _spirv == spirv and _shader_mode == mode:
+	if _shader.is_valid() and _shader_resource == shader_file and _spirv == spirv and _shader_mode == mode and _keyword_signature == _keyword_signature_now():
 		return true
 	_destroy_shader_objects(rd)
 	if mode == Mode.COMPUTE:
@@ -74,8 +115,9 @@ func _ensure_shader(rd: RenderingDevice) -> bool:
 	_shader_resource = shader_file
 	_spirv = spirv
 	_shader_mode = mode
+	_keyword_signature = _keyword_signature_now()
 	if mode == Mode.COMPUTE:
-		_compute_pipeline = rd.compute_pipeline_create(_shader)
+		_compute_pipeline = rd.compute_pipeline_create(_shader, _specialization())
 		if not _compute_pipeline.is_valid():
 			_report("Cannot create compute pipeline.")
 			_destroy_shader_objects(rd)
@@ -224,7 +266,7 @@ func _get_raster_pipeline(rd: RenderingDevice, framebuffer: RID) -> RID:
 	# Pipelines depend on the framebuffer format, not on the per-frame
 	# framebuffer instance. Keeping the attachment RID out of this key avoids a
 	# pipeline leak when a raster pass runs every frame.
-	var key := str(framebuffer_format)
+	var key := str(framebuffer_format) + "|" + _keyword_signature_now()
 	if _raster_pipelines.has(key):
 		return _raster_pipelines[key]
 	var raster_state := RDPipelineRasterizationState.new()
@@ -243,7 +285,10 @@ func _get_raster_pipeline(rd: RenderingDevice, framebuffer: RID) -> RID:
 			raster_state,
 			multisample_state,
 			depth_stencil_state,
-			blend_state
+			blend_state,
+			0,
+			0,
+			_specialization()
 	)
 	if not pipeline.is_valid():
 		_report("Cannot create raster pipeline.")
@@ -267,6 +312,7 @@ func _destroy_shader_objects(rd: RenderingDevice) -> void:
 	_shader_resource = null
 	_spirv = null
 	_shader_mode = -1
+	_keyword_signature = ""
 
 func _cleanup(rd: RenderingDevice) -> void:
 	_destroy_shader_objects(rd)

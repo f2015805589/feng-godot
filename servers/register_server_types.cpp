@@ -63,6 +63,7 @@
 #include "servers/movie_writer/movie_writer.h"
 #include "servers/movie_writer/movie_writer_pngwav.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
+#include "servers/rendering/renderer_rd/frp_clustered/frp_pass_context.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_data_rd.h"
@@ -253,6 +254,8 @@ void register_server_types() {
 	GDREGISTER_ABSTRACT_CLASS(RenderData);
 	GDREGISTER_CLASS(RenderDataExtension);
 	GDREGISTER_CLASS(RenderDataRD);
+
+	GDREGISTER_CLASS(FRPPassContext);
 
 	GDREGISTER_ABSTRACT_CLASS(RenderSceneData);
 	GDREGISTER_CLASS(RenderSceneDataExtension);

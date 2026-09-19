@@ -178,7 +178,8 @@ void main() {
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 
-	// Indirect lighting: GI buffers (SDFGI/VoxelGI processed by gi.process_gi).
+	// Indirect lighting: ambient light and the reflection probes that the cluster
+	// light list carries. FRP has no GI or screen space effect buffers to blend in.
 	if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
 		ambient_light = scene_data.ambient_light_color_energy.rgb;
 
@@ -202,30 +203,6 @@ void main() {
 			indirect_specular_light *= scene_data.IBL_exposure_normalization;
 			indirect_specular_light *= horizon * horizon;
 			indirect_specular_light *= scene_data.ambient_light_color_energy.a;
-		}
-
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_GI_BUFFERS)) {
-			// GI buffers (ambient/reflection) from gi.process_gi.
-#ifdef USE_MULTIVIEW
-			vec4 buffer_ambient = textureLod(sampler2DArray(ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
-			vec4 buffer_reflection = textureLod(sampler2DArray(reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
-#else
-			vec4 buffer_ambient = textureLod(sampler2D(ambient_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
-			vec4 buffer_reflection = textureLod(sampler2D(reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
-#endif
-			ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
-			indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
-
-		}
-
-		// SSAO.
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSAO)) {
-#ifdef USE_MULTIVIEW
-			float ssao = texture(sampler2DArray(ao_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r;
-#else
-			float ssao = texture(sampler2D(ao_buffer, SAMPLER_LINEAR_CLAMP), screen_uv).r;
-#endif
-			ao = min(ao, ssao);
 		}
 
 		// Reflection probes.
@@ -289,47 +266,6 @@ void main() {
 		// Finalize ambient.
 		ambient_light *= ao;
 		ambient_light *= albedo.rgb;
-
-		// SSIL.
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL)) {
-#ifdef USE_MULTIVIEW
-			vec4 ssil = textureLod(sampler2DArray(ssil_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
-#else
-			vec4 ssil = textureLod(sampler2D(ssil_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
-#endif
-			ambient_light *= 1.0 - ssil.a;
-			ambient_light += ssil.rgb * albedo.rgb;
-		}
-
-		// SSR.
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR)) {
-			bool resolve_ssr = bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR);
-
-			float ssr_mip_level = 0.0;
-			if (resolve_ssr) {
-#ifdef USE_MULTIVIEW
-				ssr_mip_level = textureLod(sampler2DArray(ssr_mip_level_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0).x;
-#else
-				ssr_mip_level = textureLod(sampler2D(ssr_mip_level_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0).x;
-#endif
-				ssr_mip_level *= 14.0;
-			}
-
-#ifdef USE_MULTIVIEW
-			vec4 ssr = textureLod(sampler2DArray(ssr_buffer, SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(screen_uv, ViewIndex), ssr_mip_level);
-#else
-			vec4 ssr = textureLod(sampler2D(ssr_buffer, SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), screen_uv, ssr_mip_level);
-#endif
-
-			if (resolve_ssr) {
-				const vec3 rec709_luminance_weights = vec3(0.2126, 0.7152, 0.0722);
-				ssr.rgb /= 1.0 - dot(ssr.rgb, rec709_luminance_weights);
-			}
-
-			ssr *= smoothstep(0.0, 1.0, 1.0 - clamp((roughness - 0.6) / (0.7 - 0.6), 0.0, 1.0));
-
-			indirect_specular_light = indirect_specular_light * (1.0 - ssr.a) + ssr.rgb;
-		}
 
 		// Apply energy compensation and DFG to the indirect specular.
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);

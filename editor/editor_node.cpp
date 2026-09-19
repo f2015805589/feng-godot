@@ -6069,6 +6069,8 @@ String EditorNode::_get_system_info() const {
 	// Prettify
 	if (rendering_method == "forward_plus") {
 		rendering_method = "Forward+";
+	} else if (rendering_method == "frp") {
+		rendering_method = "FRP";
 	} else if (rendering_method == "mobile") {
 		rendering_method = "Mobile";
 	} else if (rendering_method == "gl_compatibility") {
@@ -7801,6 +7803,9 @@ void EditorNode::_renderer_selected(int p_index) {
 String EditorNode::_to_rendering_method_display_name(const String &p_rendering_method) const {
 	if (p_rendering_method == "forward_plus") {
 		return TTR("Forward+");
+	}
+	if (p_rendering_method == "frp") {
+		return TTR("FRP");
 	}
 	if (p_rendering_method == "mobile") {
 		return TTR("Mobile");

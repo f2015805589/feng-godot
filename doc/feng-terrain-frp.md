@@ -73,9 +73,17 @@ Surface 材质使用 AVT 与 SVT 两级缓存。AVT 以 64 米 sector 动态分�
 
 ### 三层架构
 
-- **FengRenderer**（Resource）：`passes` 包含 16 个原生组合步骤与自定义效果；`apply(compositor)` 上传列表顺序及名称，自动挂载隐藏的 `FengTextureManager`。满足数据依赖的条目可跨原生步骤移动。
+- **FengRenderer**（Resource）：`passes` 包含 8 个默认引擎 Pass（FRP 的全部条目就是这些 + 库里的 Color Grade，整条管线 9 条）与自定义效果；`apply(compositor)` 上传列表顺序及名称，自动挂载隐藏的 `FengTextureManager`。**pass id 连续且就是执行顺序，资源里的条目顺序就是引擎的执行顺序**（和 URP 的 RendererFeature 列表一样，拖动条目即改顺序；依赖约束只做校验）。FRP 没有 SSAO / SSIL / SSR / 全局光照与调试几何条目：Environment 里打开这些特性不会改变 FRP 的画面。
 - **FengPass**（CompositorEffect）：单个 pass，`stage` + `inputs` + `outputs`；子类实现 `_render()`。`FengShaderPass` 提供 compute 与全屏光栅两种模式。
 - **FengCompositor**（Compositor）：绑定 renderer 后自动同步 effects；pass 的 `enabled` 由引擎原生即时生效。
+
+**一个 Pass 可以展开成多个内部 Operation**（resolve、屏幕/深度副本、高光合并、
+运动矢量），所以这些记账步骤不再作为可独立开关的条目出现，但仍然照常执行。
+
+运动矢量由 **GBuffer Pass 在同一遍几何里写出**：该 Pass 的 framebuffer 带上速度附件，shader 使用
+带 `MOTION_VECTORS` 的 G-buffer 变体，速度写在 voxel-GI 槽之后的位置 5。TAA、3D 上采样与运动矢量
+调试视图因此不再需要第二遍不透明几何，GBuffer 仍是唯一遍历不透明几何的 pass。旧资源（schema < 5）
+里独立的 Motion Vectors 条目在加载迁移时折叠进 GBuffer。
 
 中间纹理由 `FengTextureManager` 在 Pre GBuffer 阶段按 `FengPassOutput` 声明自动创建（scope `"frp_pipeline"`），分辨率切换自动重建；pass 通过 `Source.PIPELINE` 按名引用。
 
@@ -89,7 +97,7 @@ Surface 材质使用 AVT 与 SVT 两级缓存。AVT 以 64 米 sector 动态分�
 | GBuffer + MSAA Resolve | 引擎必要阶段 |
 | FRP: Post GBuffer | 深度、法线、材质数组 |
 | Pre Opaque | 保留原有回调，位于屏幕空间效果之前 |
-| SSAO / SSIL / GI 等 | 按启用状态运行 |
+| SSAO / SSIL / GI 等（FRP 不运行） | FRP 没有这些 pass，开关它们不改变画面 |
 | FRP: Pre Lighting | 可修改 GBuffer；本帧光照颜色尚不可读 |
 | FRP Lighting | 引擎必要阶段 |
 | FRP: Post Lighting | 已有延迟光照颜色，还不包含 Forward Fallback 和天空 |

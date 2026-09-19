@@ -38,11 +38,14 @@
 #include "core/profiling/profiling.h"
 #include "servers/display/display_server.h"
 #include "servers/rendering/renderer_canvas_cull.h"
+#include "servers/rendering/frp_pipeline_spec.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_scene_occlusion_cull.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_method.h"
+#include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/storage/compositor_storage.h"
 #include "servers/rendering/storage/texture_storage.h"
 
 #ifndef XR_DISABLED
@@ -278,6 +281,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 
 			p_viewport->internal_size = Size2(render_width, render_height);
 			p_viewport->jitter_phase_count = jitter_phase_count;
+			p_viewport->jitter_owned_by_upscaler = scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL;
 
 			// At resolution scales lower than 1.0, use negative texture mipmap bias
 			// to compensate for the loss of sharpness.
@@ -329,7 +333,40 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 	}
 
 	float screen_mesh_lod_threshold = p_viewport->mesh_lod_threshold / float(p_viewport->size.width);
-	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, p_viewport->jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, xr_interface, p_viewport->window_output_max_value, &p_viewport->render_info);
+	// When an FRP pipeline is authored on this viewport's camera compositor, its
+	// Temporal AA entry is the switch and the jitter follows it: TAA must not run
+	// without a jitter (blur) and a TAA-less frame must not be jittered (shimmer).
+	// The entry's `jitter_phases` parameter sets how many phases the jitter cycles
+	// through (1 freezes the sampling pattern while TAA still resolves). A temporal
+	// upscaler owns its own jitter and is never overridden, and the rule only applies
+	// while the FRP renderer is the active one: a compositor left over from an FRP
+	// project must not change how forward_plus jitters its frames.
+	uint32_t jitter_phase_count = p_viewport->jitter_phase_count;
+	if (!p_viewport->jitter_owned_by_upscaler && RenderingServer::get_singleton()->get_current_rendering_method() == "frp") {
+		const RID frp_compositor = RSG::scene->render_get_compositor(p_viewport->camera, p_viewport->scenario);
+		if (frp_compositor.is_valid()) {
+			RendererCompositorStorage *compositor_storage = RendererCompositorStorage::get_singleton();
+			const PackedInt32Array frp_pipeline = compositor_storage->compositor_get_frp_pipeline(frp_compositor);
+			if (!frp_pipeline.is_empty()) {
+				// A plugin pass that runs Temporal AA itself counts as the entry.
+				const bool temporal_aa = frp_pipeline.has(FRPPipelineSpec::PASS_TEMPORAL_AA) || compositor_storage->compositor_get_frp_pipeline_provided(frp_compositor).has(FRPPipelineSpec::PASS_TEMPORAL_AA);
+				jitter_phase_count = temporal_aa ? 16 : 0;
+				if (temporal_aa) {
+					const Dictionary all_parameters = compositor_storage->compositor_get_frp_pipeline_parameters(frp_compositor);
+					const Variant pass_parameters = all_parameters.get(FRPPipelineSpec::PASS_TEMPORAL_AA, Variant());
+					if (pass_parameters.get_type() == Variant::DICTIONARY) {
+						const Dictionary aa_parameters = pass_parameters;
+						const Variant phases = aa_parameters.get("jitter_phases", Variant());
+						if (phases.is_num()) {
+							jitter_phase_count = CLAMP(int(phases), 1, 64);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, xr_interface, p_viewport->window_output_max_value, &p_viewport->render_info);
 
 	RENDER_TIMESTAMP("< Render 3D Scene");
 #endif // _3D_DISABLED

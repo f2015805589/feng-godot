@@ -51,19 +51,23 @@ public:
 	};
 
 	// Not an enum because these values are constants that are processed as numbers
-	// to arrive at a unique version for a particular shader.
+	// to arrive at a unique version for a particular shader. The indices follow the
+	// order in which the variants are pushed in SceneShaderFRPClustered::initialize().
 	struct ShaderVersion {
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS = 0;
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_DP = 1;
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS = 2;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI = 3;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_MULTIVIEW = 4;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW = 5;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW = 6;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL = 7;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_SDF = 8;
-		constexpr static uint16_t SHADER_VERSION_GBUFFER_PASS = 9;
-		constexpr static uint16_t SHADER_VERSION_COLOR_PASS = 10;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_MULTIVIEW = 3;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW = 4;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL = 5;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_SDF = 6;
+		constexpr static uint16_t SHADER_VERSION_GBUFFER_PASS = 7;
+		constexpr static uint16_t SHADER_VERSION_COLOR_PASS = 8;
+		// Appended after the colour pass variants (SHADER_VERSION_COLOR_PASS * 2 +
+		// SHADER_COLOR_PASS_FLAG_COUNT) so every pre-existing version index keeps its
+		// value. This variant is the G-buffer pass that also writes motion vectors to
+		// the velocity attachment, which lets opaque geometry be drawn exactly once.
+		constexpr static uint16_t SHADER_VERSION_GBUFFER_PASS_MOTION_VECTORS = 48;
 	};
 
 	enum ShaderColorPassFlags {
@@ -79,13 +83,12 @@ public:
 		PIPELINE_VERSION_DEPTH_PASS,
 		PIPELINE_VERSION_DEPTH_PASS_DP,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS,
-		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_SDF,
 		PIPELINE_VERSION_GBUFFER_PASS,
+		PIPELINE_VERSION_GBUFFER_PASS_MOTION_VECTORS,
 		PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW,
-		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW,
 		PIPELINE_VERSION_COLOR_PASS,
 		PIPELINE_VERSION_MAX
 	};
@@ -224,7 +227,7 @@ public:
 
 		RID version;
 
-		static const uint32_t VERTEX_INPUT_MASKS_SIZE = ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT;
+		static const uint32_t VERTEX_INPUT_MASKS_SIZE = ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT + 2; // + the two G-buffer motion vector variants.
 		std::atomic<uint64_t> vertex_input_masks[VERTEX_INPUT_MASKS_SIZE] = {};
 
 		Vector<ShaderCompiler::GeneratedCode::Texture> texture_uniforms;
@@ -359,7 +362,6 @@ public:
 	RID debug_shadow_splits_material_shader;
 	RID debug_shadow_splits_material;
 	RID default_shader_rd;
-	RID default_shader_sdfgi_rd;
 
 	RID default_vec4_xform_buffer;
 	RID default_vec4_xform_uniform_set;

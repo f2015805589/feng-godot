@@ -174,18 +174,32 @@ void RendererCompositorStorage::compositor_set_compositor_effects(RID p_composit
 	}
 }
 
-void RendererCompositorStorage::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) {
+void RendererCompositorStorage::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names, const PackedInt32Array &p_provided, const Dictionary &p_parameters) {
 	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
 	ERR_FAIL_NULL(compositor);
 
 	compositor->frp_pipeline = p_pipeline;
 	compositor->frp_pipeline_names = p_names;
+	compositor->frp_pipeline_provided = p_provided;
+	compositor->frp_pipeline_parameters = p_parameters;
+}
+
+Dictionary RendererCompositorStorage::compositor_get_frp_pipeline_parameters(RID p_compositor) const {
+	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
+	ERR_FAIL_NULL_V(compositor, Dictionary());
+	return compositor->frp_pipeline_parameters;
 }
 
 PackedStringArray RendererCompositorStorage::compositor_get_frp_pipeline_names(RID p_compositor) const {
 	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
 	ERR_FAIL_NULL_V(compositor, PackedStringArray());
 	return compositor->frp_pipeline_names;
+}
+
+PackedInt32Array RendererCompositorStorage::compositor_get_frp_pipeline_provided(RID p_compositor) const {
+	Compositor *compositor = compositor_owner.get_or_null(p_compositor);
+	ERR_FAIL_NULL_V(compositor, PackedInt32Array());
+	return compositor->frp_pipeline_provided;
 }
 
 PackedInt32Array RendererCompositorStorage::compositor_get_frp_pipeline(RID p_compositor) const {

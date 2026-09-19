@@ -31,14 +31,15 @@
 #include "renderer_scene_render.h"
 
 #include "core/variant/typed_array.h"
+#include "servers/rendering/frp_pipeline_spec.h"
 
-static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline) {
+static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline, const PackedInt32Array &p_provided = PackedInt32Array()) {
 	if (p_pipeline.is_empty()) {
 		return true;
 	}
 
-	int native_positions[17];
-	for (int i = 0; i < 17; i++) {
+	int native_positions[FRPPipelineSpec::PASS_COUNT];
+	for (int i = 0; i < FRPPipelineSpec::PASS_COUNT; i++) {
 		native_positions[i] = -1;
 	}
 
@@ -50,55 +51,26 @@ static bool _validate_frp_pipeline(const PackedInt32Array &p_pipeline) {
 			continue;
 		}
 
-		ERR_FAIL_COND_V_MSG(token >= 17, false, "FRP pipeline built-in pass tokens must be in the range 0..16.");
+		ERR_FAIL_COND_V_MSG(!FRPPipelineSpec::is_valid_pass_id(token), false, "FRP pipeline built-in pass token is out of range.");
 		ERR_FAIL_COND_V_MSG(native_positions[token] >= 0, false, "FRP pipeline cannot contain duplicate built-in pass tokens.");
 		native_positions[token] = i;
 	}
 
-	static const int mandatory_passes[] = { 0, 1, 2, 12, 15, 16 };
-	for (int mandatory_pass : mandatory_passes) {
-		ERR_FAIL_COND_V_MSG(native_positions[mandatory_pass] < 0, false, "FRP pipeline is missing a mandatory built-in pass.");
+	// A schedule may replace mandatory work with pass scripts: the engine cannot know
+	// what a pass does, so a missing mandatory entry is reported instead of rejecting
+	// the whole schedule. A pass the schedule reports as provided counts as present -
+	// the default pipeline is implemented that way - and the addon surfaces the same
+	// condition in the Inspector; the frame stays the author's responsibility.
+	for (int i = 0; i < FRPPipelineSpec::MANDATORY_PASS_COUNT; i++) {
+		const int mandatory = FRPPipelineSpec::MANDATORY_PASSES[i];
+		if (native_positions[mandatory] < 0 && !p_provided.has(mandatory)) {
+			WARN_PRINT_ONCE(vformat("FRP pipeline has no '%s' entry; a custom pass has to provide it.", FRPPipelineSpec::native_pass_name(mandatory)));
+		}
 	}
 
-	static const int dependencies[][2] = {
-		{ 16, 0 },
-		{ 0, 1 },
-		{ 1, 2 },
-		{ 2, 3 },
-		{ 2, 4 },
-		{ 2, 5 },
-		{ 2, 6 },
-		{ 2, 7 },
-		{ 2, 8 },
-		{ 2, 9 },
-		{ 2, 10 },
-		{ 2, 11 },
-		{ 2, 12 },
-		{ 3, 5 },
-		{ 4, 5 },
-		{ 7, 8 },
-		{ 5, 9 },
-		{ 8, 9 },
-		{ 9, 10 },
-		{ 10, 11 },
-		{ 3, 12 },
-		{ 4, 12 },
-		{ 5, 12 },
-		{ 6, 12 },
-		{ 7, 12 },
-		{ 8, 12 },
-		{ 9, 12 },
-		{ 10, 12 },
-		{ 11, 12 },
-		{ 12, 13 },
-		{ 12, 14 },
-		{ 12, 15 },
-		{ 13, 14 },
-		{ 14, 15 },
-	};
-	for (const int *dependency : dependencies) {
-		const int before = dependency[0];
-		const int after = dependency[1];
+	for (int i = 0; i < FRPPipelineSpec::PASS_DEPENDENCY_COUNT; i++) {
+		const int before = FRPPipelineSpec::PASS_DEPENDENCIES[i][0];
+		const int after = FRPPipelineSpec::PASS_DEPENDENCIES[i][1];
 		if (native_positions[before] >= 0 && native_positions[after] >= 0) {
 			ERR_FAIL_COND_V_MSG(native_positions[before] >= native_positions[after], false, "FRP pipeline built-in pass order violates dependency constraints.");
 		}
@@ -322,12 +294,19 @@ void RendererSceneRender::compositor_set_compositor_effects(RID p_compositor, co
 	compositor_storage.compositor_set_compositor_effects(p_compositor, rids);
 }
 
-void RendererSceneRender::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) {
+void RendererSceneRender::compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names, const PackedInt32Array &p_provided, const Dictionary &p_parameters) {
 	ERR_FAIL_COND_MSG(!compositor_storage.is_compositor(p_compositor), "Invalid compositor RID.");
-	ERR_FAIL_COND_MSG(!_validate_frp_pipeline(p_pipeline), "Invalid FRP pipeline schedule.");
+	ERR_FAIL_COND_MSG(!_validate_frp_pipeline(p_pipeline, p_provided), "Invalid FRP pipeline schedule.");
 	ERR_FAIL_COND_MSG(!p_names.is_empty() && p_names.size() != p_pipeline.size(), "FRP pipeline names must match the token count.");
+	for (int i = 0; i < p_provided.size(); i++) {
+		ERR_FAIL_COND_MSG(!FRPPipelineSpec::is_valid_pass_id(p_provided[i]), "Invalid FRP provided pass id.");
+	}
+	for (const KeyValue<Variant, Variant> &kv : p_parameters) {
+		ERR_FAIL_COND_MSG(kv.key.get_type() != Variant::INT || !FRPPipelineSpec::is_valid_pass_id(kv.key), "FRP pass parameters must be keyed by a native pass id.");
+		ERR_FAIL_COND_MSG(kv.value.get_type() != Variant::DICTIONARY, "FRP pass parameters must be a dictionary per pass.");
+	}
 
-	compositor_storage.compositor_set_frp_pipeline(p_compositor, p_pipeline, p_names);
+	compositor_storage.compositor_set_frp_pipeline(p_compositor, p_pipeline, p_names, p_provided, p_parameters);
 }
 
 /* Environment API */

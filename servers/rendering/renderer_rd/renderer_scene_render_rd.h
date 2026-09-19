@@ -113,6 +113,11 @@ protected:
 	void _render_buffers_ensure_depth_texture(const RenderDataRD *p_render_data);
 	void _render_buffers_copy_depth_texture(const RenderDataRD *p_render_data, bool p_use_msaa = false);
 	void _render_buffers_post_process_and_tonemap(const RenderDataRD *p_render_data, bool p_use_msaa = false);
+	// The two halves of the entry point above. A pass can run effects on the HDR image
+	// between them, or after the tone mapping when p_defer_present left the present
+	// step to the caller.
+	void _render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa = false);
+	void _render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present = false);
 	void _post_process_subpass(RID p_source_texture, RID p_framebuffer, const RenderDataRD *p_render_data);
 	void _disable_clear_request(const RenderDataRD *p_render_data);
 

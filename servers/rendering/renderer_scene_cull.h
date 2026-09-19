@@ -1161,6 +1161,8 @@ public:
 	void render_empty_scene(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_scenario, RID p_shadow_atlas, float p_window_output_max_value);
 
 	void render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+	// Compositor that will render this camera: the camera's own, else the scenario's.
+	virtual RID render_get_compositor(RID p_camera, RID p_scenario) override { return _render_get_compositor(p_camera, p_scenario); }
 	void update_dirty_instances() const;
 
 	void render_particle_colliders();
@@ -1210,7 +1212,7 @@ public:
 	PASS1RC(bool, is_compositor, RID)
 
 	PASS2(compositor_set_compositor_effects, RID, const TypedArray<RID> &)
-	PASS3(compositor_set_frp_pipeline, RID, const PackedInt32Array &, const PackedStringArray &)
+	PASS5(compositor_set_frp_pipeline, RID, const PackedInt32Array &, const PackedStringArray &, const PackedInt32Array &, const Dictionary &)
 
 	// Environment
 

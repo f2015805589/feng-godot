@@ -17,14 +17,6 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(constant_id = 0) const bool sc_half_res = false;
 layout(constant_id = 1) const bool sc_use_full_projection_matrix = false;
 layout(constant_id = 2) const bool sc_use_vrs = false;
-// FRP spends all 30 bits of normal_roughness.rgb on the normal and uses the
-// remaining 2-bit alpha only as a dynamic/static flag, so its roughness lives
-// in a separate G-buffer target (gbuffer_orm.g). forward_clustered keeps the
-// legacy layout, where roughness is folded into normal_roughness.w together
-// with that flag. A specialization constant selects the decode instead of
-// compiling a second shader variant.
-layout(constant_id = 3) const bool sc_split_roughness = false;
-
 #define SDFGI_MAX_CASCADES 8
 
 //set 0 for SDFGI and render buffers
@@ -55,11 +47,6 @@ layout(set = 0, binding = 11) uniform texture2DArray lightprobe_texture;
 layout(set = 0, binding = 12) uniform texture2D depth_buffer;
 layout(set = 0, binding = 13) uniform texture2D normal_roughness_buffer;
 layout(set = 0, binding = 14) uniform utexture2D voxel_gi_buffer;
-// Only sampled when sc_split_roughness is set; a default texture is bound
-// otherwise so the descriptor set stays valid. Binding 20 is past every other
-// declaration in this shader (the highest is the conditional VRS image at 19).
-layout(set = 0, binding = 20) uniform texture2D gbuffer_orm_buffer;
-
 layout(set = 0, binding = 15, std140) uniform SDFGI {
 	vec3 grid_size;
 	uint max_cascades;
@@ -630,20 +617,13 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 
 	if (normal.length() > 0.5) {
 		//valid normal, can do GI
-		// The dynamic/static test is identical for both layouts: the legacy one
-		// folds the flag above 0.5 of the packed roughness, and the split one
-		// stores a 2-bit alpha that is exactly 0.0 or 1.0.
+		// The dynamic/static flag is folded above 0.5 of the packed roughness.
 		bool dynamic_object = normal_roughness.w > 0.5;
-		float roughness;
-		if (sc_split_roughness) {
-			roughness = texelFetch(sampler2D(gbuffer_orm_buffer, linear_sampler), pos, 0).g;
-		} else {
-			roughness = normal_roughness.w;
-			if (dynamic_object) {
-				roughness = 1.0 - roughness;
-			}
-			roughness /= (127.0 / 255.0);
+		float roughness = normal_roughness.w;
+		if (dynamic_object) {
+			roughness = 1.0 - roughness;
 		}
+		roughness /= (127.0 / 255.0);
 		vec3 view = -normalize(mat3(scene_data.cam_transform) * (vertex - scene_data.eye_offset[gl_GlobalInvocationID.z].xyz));
 		vertex = mat3(scene_data.cam_transform) * vertex;
 		normal = normalize(mat3(scene_data.cam_transform) * normal);

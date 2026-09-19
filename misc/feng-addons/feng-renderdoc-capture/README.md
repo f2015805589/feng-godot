@@ -20,12 +20,30 @@ The path is cached in `.godot/renderdoc/editor.cfg` for early device initializat
 changing the installation takes effect the next time this editor is started.
 It does not force an editor restart.
 
-The engine searches `FENG_RENDERDOC_PATH`, `bin/tools/RenderDoc/qrenderdoc.exe`
-alongside this build, then the normal Windows Program Files installation.
-This checkout has portable RenderDoc 1.46 under `bin/tools/RenderDoc/`, an ignored
-local dependency. The system RenderDoc installation is unchanged. Portable builds
-are available at https://renderdoc.org/builds. Version 1.39 crashed during D3D12
-capture with this checkout's Agility 1.618.5 runtime; 1.46 is used for verification.
+A cached path only wins while it still exists: if RenderDoc is moved, upgraded or
+removed, that cache entry is ignored, the search below runs again, and the stale
+path is reported on the console. The capture button also shows the reason the last
+startup probe failed (`FengRenderDoc.get_mount_status()`) instead of only reporting
+that the device is not attached.
+
+The engine searches, in order: the configured executable's folder, `FENG_RENDERDOC_PATH`,
+this build's folder and `bin/tools/RenderDoc/` next to it, then the normal Windows
+Program Files installation. `bin/tools/RenderDoc/` is not part of this checkout; it
+exists only if a portable build was unpacked there (that path is ignored by git).
+Portable builds are available at https://renderdoc.org/builds.
+
+The matching `renderdoc.dll` is searched through that same list, not only inside the
+configured folder: an executable that points at a folder without a usable DLL no longer
+hides the installed copy. If the DLL and the configured executable come from different
+folders, the mount reports both, so a version mismatch between capture and analyzer is
+visible instead of silent.
+
+On this machine the capture itself then hit a RenderDoc/runtime incompatibility that is
+unrelated to the renderer: with `bin/D3D12Core.dll` (the Agility D3D12 runtime installed
+in this checkout) present, RenderDoc 1.39 killed the editor inside the forced draw for
+both the FRP and the `forward_plus` renderer. Renaming that one file away made the exact
+same capture succeed. See "D3D12 capture and the Agility runtime" below. This checkout
+pins no RenderDoc version and ships no RenderDoc.
 
 Each click requests one frame. F12 and the RenderDoc corner overlay are disabled.
 Closing the analyzer does not start further captures or restart the editor.
@@ -34,6 +52,40 @@ safely remove them after graphics initialization; closing its window is not an
 unload operation. This is the accepted tradeoff for capturing the live editor
 without restarting it. No claim of zero instrumentation overhead is made.
 Captures remain under `.godot/renderdoc/captures/`.
+
+## D3D12 capture and the Agility runtime
+
+The editor loads `D3D12Core.dll` from its own directory whenever that file exists (the
+D3D12 Agility SDK layout). RenderDoc 1.39 does not record that combination on this
+machine: the editor dies inside `rendering->force_draw()` while the capture is open, so
+the toolbar never returns and no `.rdc` is written. Measured with an empty probe project,
+one mesh, `--rendering-driver d3d12`:
+
+| D3D12 runtime the editor uses | renderer | result |
+| --- | --- | --- |
+| Agility `D3D12Core.dll` (default) | `forward_plus` | editor killed inside `force_draw` |
+| Agility `D3D12Core.dll` (default) | `frp` | editor killed inside `force_draw` |
+| Windows runtime, `agility_sdk_version=0` | `forward_plus` | `capture: complete in 515 ms`, 47 MB `.rdc` |
+| Windows runtime, `D3D12Core.dll` renamed away | `forward_plus` | `capture: complete in 639 ms`, 47 MB `.rdc` |
+
+The failure therefore follows the Agility runtime, not the renderer and not this addon.
+Any frame RenderDoc records from that runtime kills the editor, including a capture that
+only arms the queued trigger and lets the editor present normally. Ways out, best first:
+
+- **Per project, no files touched:** set
+  `rendering/rendering_device/d3d12/agility_sdk_version = 0` (Project Settings >
+  Rendering > Device > D3D12, Advanced). The engine then creates its device through the
+  Windows D3D12 runtime instead of the Agility factory and the capture succeeds with
+  `bin/D3D12Core.dll` still in place. Setting it back to `618` restores Agility for that
+  project.
+- Use a RenderDoc build that records this Agility runtime. Portable builds live at
+  https://renderdoc.org/builds; unpack one under `bin/tools/RenderDoc/` (ignored by git)
+  or point the executable path at it.
+- Move `bin/D3D12Core.dll` aside (whole editor, every project) and put it back afterwards.
+  Do not delete it permanently: this checkout installs that runtime on purpose
+  (`misc/scripts/install_d3d12_sdk_windows.py`).
+
+`tests/run_capture.py` needs one of the last two states to pass on this machine.
 
 ## Building
 
@@ -91,7 +143,9 @@ Set `FENG_TEST_VT_WORK=1` to additionally capture the actual terrain page baker
 and a cached SVT upload. The default run verifies that an idle VT marker is
 visible in RenderDoc's UI, not just present in the capture file.
 
-This Windows/D3D12 GPU test requires `psutil` and RenderDoc. It uses a disposable
+This Windows/D3D12 GPU test requires `psutil` and RenderDoc, and a RenderDoc build that
+can record the Agility runtime the editor loads (see "D3D12 capture and the Agility
+runtime" above). It uses a disposable
 project and isolated editor settings under `bin/renderdoc-smoke-*`. It presses the
 real camera button, checks the EXE file picker, verifies no second Godot process
 is created, opens an actual capture, closes only that analyzer, and confirms the

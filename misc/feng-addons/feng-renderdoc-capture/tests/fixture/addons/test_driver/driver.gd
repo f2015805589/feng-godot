@@ -41,8 +41,9 @@ func _run():
 	var renderer := compositor.renderer as FengRenderer
 	assert(renderer != null)
 	# Exercise the authored native/custom list that the RenderDoc validator
-	# expects. Sky is moved to list slot 04 (after VT and Deferred Lighting's required
-	# prerequisites), and Tint gets a UTF-8 resource name used for its GPU label.
+	# expects: the VT pass is moved to slot 0 and renamed, Sky stays in slot 4, and
+	# the Tint library effect is inserted after Sky so it reads a colour that a
+	# producer already wrote (a custom pass before GBuffer is rejected).
 	var authored: Array[FengPass] = []
 	var sky: FengBuiltinPass = null
 	var vt: FengBuiltinPass = null
@@ -51,17 +52,28 @@ func _run():
 		assert(value is FengPass)
 		var pass_entry := value as FengPass
 		authored.append(pass_entry)
-		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 7:
+		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 4:
 			sky = pass_entry as FengBuiltinPass
-		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 16:
+		if pass_entry is FengBuiltinPass and (pass_entry as FengBuiltinPass).native_id == 1:
 			vt = pass_entry as FengBuiltinPass
 		if String(pass_entry.stable_id) == "library:tint":
 			tint = pass_entry
+	if tint == null:
+		# The default pipeline seeds the pass set itself; the extra library effects
+		# such as Tint are added explicitly by whoever wants them.
+		var tint_template = load("res://addons/feng-render-pipeline/library/tint/tint.tres")
+		assert(tint_template != null)
+		tint = tint_template.duplicate(true) as FengPass
 	assert(sky != null)
 	assert(vt != null)
 	assert(tint != null)
+	# The VT pass only has to precede GBuffer, so it can be the first configured
+	# pass; the validator requires the idle VT label at position 0.
+	authored.erase(vt)
+	authored.insert(0, vt)
 	authored.erase(sky)
 	authored.insert(4, sky)
+	authored.insert(5, tint)
 	# There are no registered VT producers in this fixture. Keep this enabled
 	# and rename it so the capture proves an idle configured pass still emits its
 	# authored label without submitting page work.
@@ -72,6 +84,7 @@ func _run():
 	await get_tree().process_frame
 	assert(renderer.passes.find(sky) == 4)
 	assert(renderer.passes.find(vt) == 0)
+	assert(renderer.passes.find(tint) == 5)
 	assert(vt.resource_name == "VT Idle Marker")
 	assert(tint.resource_name == "RenderDoc Tint 中文")
 	var pending: Array[Node] = [get_tree().root]

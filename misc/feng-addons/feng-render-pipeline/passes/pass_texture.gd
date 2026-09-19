@@ -15,7 +15,13 @@ enum Source {
 	EMISSION,
 	CUSTOM,
 	PIPELINE,
+	# The engine's tone mapped image: what the deferred tone mapping step produced.
+	# Reading it is what makes an "after tonemap" effect a post-process effect.
+	TONEMAPPED,
 }
+
+const TONEMAPPER_SCOPE: StringName = &"Tonemapper"
+const TONEMAPPER_TEXTURE: StringName = &"destination"
 
 enum BindingType {
 	SAMPLED_TEXTURE,
@@ -54,6 +60,8 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 			return _get_named_texture(buffers, FRP_SCOPE, &"gbuffer_emission", view)
 		Source.PIPELINE:
 			return _get_named_texture(buffers, PIPELINE_SCOPE, custom_name, view)
+		Source.TONEMAPPED:
+			return _get_named_texture(buffers, TONEMAPPER_SCOPE, TONEMAPPER_TEXTURE, view)
 		Source.CUSTOM:
 			return _get_named_texture(buffers, custom_scope, custom_name, view)
 	return RID()

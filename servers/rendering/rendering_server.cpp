@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/variant/typed_array.h"
+#include "servers/rendering/frp_pipeline_spec.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/shader_language.h"
@@ -56,6 +57,46 @@ RenderingServer *RenderingServer::create() {
 	}
 
 	return nullptr;
+}
+
+Dictionary RenderingServer::get_frp_pipeline_spec() const {
+	Dictionary spec;
+
+	Array passes;
+	for (const FRPPipelineSpec::NativePass &pass : FRPPipelineSpec::NATIVE_PASSES) {
+		Dictionary entry;
+		entry["id"] = pass.id;
+		entry["name"] = String(pass.name);
+		// An optional pass is one a fresh pipeline seeds disabled: Temporal AA is
+		// the only one, and enabling its entry is what turns TAA on.
+		entry["optional"] = pass.optional;
+		passes.push_back(entry);
+	}
+	spec["passes"] = passes;
+	spec["pass_count"] = FRPPipelineSpec::PASS_COUNT;
+
+	Array mandatory;
+	for (int i = 0; i < FRPPipelineSpec::MANDATORY_PASS_COUNT; i++) {
+		mandatory.push_back(FRPPipelineSpec::MANDATORY_PASSES[i]);
+	}
+	spec["mandatory"] = mandatory;
+
+	Array edges;
+	for (int i = 0; i < FRPPipelineSpec::PASS_DEPENDENCY_COUNT; i++) {
+		Array edge;
+		edge.push_back(FRPPipelineSpec::PASS_DEPENDENCIES[i][0]);
+		edge.push_back(FRPPipelineSpec::PASS_DEPENDENCIES[i][1]);
+		edges.push_back(edge);
+	}
+	spec["edges"] = edges;
+
+	Array order;
+	for (int i = 0; i < FRPPipelineSpec::DEFAULT_PASS_ORDER_COUNT; i++) {
+		order.push_back(FRPPipelineSpec::DEFAULT_PASS_ORDER[i]);
+	}
+	spec["default_order"] = order;
+
+	return spec;
 }
 
 void RenderingServer::virtual_texture_set_update_callback(uint64_t p_id, const Callable &p_callback) {
@@ -3102,7 +3143,8 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("compositor_create"), &RenderingServer::compositor_create);
 
 	ClassDB::bind_method(D_METHOD("compositor_set_compositor_effects", "compositor", "effects"), &RenderingServer::compositor_set_compositor_effects);
-	ClassDB::bind_method(D_METHOD("compositor_set_frp_pipeline", "compositor", "pipeline", "names"), &RenderingServer::compositor_set_frp_pipeline, DEFVAL(PackedStringArray()));
+	ClassDB::bind_method(D_METHOD("compositor_set_frp_pipeline", "compositor", "pipeline", "names", "provided", "parameters"), &RenderingServer::compositor_set_frp_pipeline, DEFVAL(PackedStringArray()), DEFVAL(PackedInt32Array()), DEFVAL(Dictionary()));
+	ClassDB::bind_method(D_METHOD("get_frp_pipeline_spec"), &RenderingServer::get_frp_pipeline_spec);
 	ClassDB::bind_method(D_METHOD("virtual_texture_set_update_callback", "id", "callback"), &RenderingServer::virtual_texture_set_update_callback);
 	ClassDB::bind_method(D_METHOD("virtual_texture_remove_update_callback", "id"), &RenderingServer::virtual_texture_remove_update_callback);
 	ClassDB::bind_method(D_METHOD("execute_virtual_texture_updates"), &RenderingServer::execute_virtual_texture_updates);

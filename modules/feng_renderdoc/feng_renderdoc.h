@@ -10,6 +10,7 @@ class FengRenderDoc : public Object {
 
 	static bool hooked;
 	static String dll_path;
+	static String mount_status; // Why the last probe ended the way it did, for the UI.
 	static void *api_ptr; // RENDERDOC_API_1_6_0 *
 
 protected:
@@ -28,6 +29,10 @@ public:
 
 	static bool is_hooked();
 	static String get_dll_path();
+	// Human-readable outcome of the startup probe. The capture UI shows it when the
+	// button cannot capture, so a failed mount explains itself instead of only
+	// reporting that the device is not attached.
+	static String get_mount_status();
 	static String get_gui_path(const String &p_configured_path = String());
 	static bool trigger_capture(int p_window_id = 0);
 	static int get_capture_count();

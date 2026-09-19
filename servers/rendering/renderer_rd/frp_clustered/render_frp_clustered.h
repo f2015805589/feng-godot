@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
+#include "servers/rendering/frp_pipeline_spec.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/frp_clustered/scene_shader_frp_clustered.h"
@@ -39,9 +40,10 @@
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+#include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_best_fit_normal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_integrate_dfg.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_lighting.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_velocity_fill.glsl.gen.h"
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
@@ -53,8 +55,6 @@
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
-#define RB_TEX_VOXEL_GI SNAME("voxel_gi")
-#define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
 #define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
 #define RB_TEX_GBUFFER_ALBEDO_MSAA SNAME("gbuffer_albedo_msaa")
 #define RB_TEX_GBUFFER_ORM SNAME("gbuffer_orm")
@@ -75,10 +75,8 @@ class RenderFRPClustered : public RendererSceneRenderRD {
 	};
 
 	enum {
-		SDFGI_MAX_CASCADES = 8,
-		MAX_VOXEL_GI_INSTANCESS = 8,
 		MAX_LIGHTMAPS = 8,
-		MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE = 2,
+
 		INSTANCE_DATA_BUFFER_MIN_SIZE = 4096
 	};
 
@@ -111,27 +109,16 @@ public:
 	public:
 		ClusterBuilderRD *cluster_builder = nullptr;
 
-		struct SSEffectsData {
-			Projection ssil_last_frame_projections[RendererSceneRender::MAX_RENDER_VIEWS];
-			Transform3D ssil_last_frame_transform;
-
-			Projection ssr_last_frame_projections[RendererSceneRender::MAX_RENDER_VIEWS];
-			Transform3D ssr_last_frame_transform;
-
-			RendererRD::SSEffects::SSILRenderBuffers ssil;
-			RendererRD::SSEffects::SSAORenderBuffers ssao;
-			RendererRD::SSEffects::SSRRenderBuffers ssr;
-		} ss_effects_data;
-
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
-			DEPTH_FB_ROUGHNESS_VOXELGI,
-			DEPTH_FB_GBUFFER
+			DEPTH_FB_GBUFFER,
+			// Same attachments as DEPTH_FB_GBUFFER plus the motion vector attachment,
+			// used when the frame needs velocity (TAA, 3D upscaling, motion debug view).
+			DEPTH_FB_GBUFFER_MOTION
 		};
 
-		RID render_sdfgi_uniform_set;
-
+	
 		void ensure_specular();
 		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR); }
 		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR); }
@@ -144,12 +131,6 @@ public:
 		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
 		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
 		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
-
-		void ensure_voxelgi();
-		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
-		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
 
 		void ensure_gbuffer();
 		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
@@ -187,8 +168,6 @@ public:
 		static uint32_t get_specular_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_normal_roughness_format();
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
-		static RD::DataFormat get_voxelgi_format();
-		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_gbuffer_albedo_format();
 		static uint32_t get_gbuffer_albedo_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_gbuffer_orm_format();
@@ -206,18 +185,17 @@ private:
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
 	void _update_render_base_uniform_set();
-	RID _setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index);
 	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID());
 
 	struct BestFitNormal {
-		BestFitNormalShaderRD shader;
+		FrpBestFitNormalShaderRD shader;
 		RID shader_version;
 		RID pipeline;
 		RID texture;
 	} best_fit_normal;
 
 	struct IntegrateDFG {
-		IntegrateDfgShaderRD shader;
+		FrpIntegrateDfgShaderRD shader;
 		RID shader_version;
 		RID pipeline;
 		RID texture;
@@ -250,7 +228,6 @@ private:
 		PASS_MODE_SHADOW_DP,
 		PASS_MODE_DEPTH,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS,
-		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_GBUFFER,
 		PASS_MODE_SDF,
@@ -319,16 +296,16 @@ private:
 	};
 
 	// When changing any of these enums, remember to change the corresponding enums in the shader files as well.
+	// FRP has no global illumination, so the shader's SDFGI and voxel GI instance flags (1 << 6 and 1 << 10)
+	// are deliberately absent here: no instance can ever carry them and their shader paths stay unreachable.
 	enum {
 		INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT = 1 << 2,
 		INSTANCE_DATA_FLAGS_DYNAMIC = 1 << 3,
 		INSTANCE_DATA_FLAGS_NON_UNIFORM_SCALE = 1 << 4,
 		INSTANCE_DATA_FLAG_USE_GI_BUFFERS = 1 << 5,
-		INSTANCE_DATA_FLAG_USE_SDFGI = 1 << 6,
 		INSTANCE_DATA_FLAG_USE_LIGHTMAP_CAPTURE = 1 << 7,
 		INSTANCE_DATA_FLAG_USE_LIGHTMAP = 1 << 8,
 		INSTANCE_DATA_FLAG_USE_SH_LIGHTMAP = 1 << 9,
-		INSTANCE_DATA_FLAG_USE_VOXEL_GI = 1 << 10,
 		INSTANCE_DATA_FLAG_PARTICLES = 1 << 11,
 		INSTANCE_DATA_FLAG_MULTIMESH = 1 << 12,
 		INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D = 1 << 13,
@@ -462,9 +439,6 @@ private:
 		uint32_t max_lightmap_captures;
 		RID lightmap_capture_buffer;
 
-		RID voxelgi_ids[MAX_VOXEL_GI_INSTANCESS];
-		uint32_t voxelgis_used = 0;
-
 		bool used_screen_texture = false;
 		bool used_normal_texture = false;
 		bool used_depth_texture = false;
@@ -497,7 +471,6 @@ private:
 	static RenderFRPClustered *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
-	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
 
 	struct RenderElementInfo {
@@ -524,9 +497,8 @@ private:
 	void _render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags = RD::DRAW_DEFAULT_ALL, const Vector<Color> &p_clear_color_values = Vector<Color>(), float p_clear_depth_value = 0.0, uint32_t p_clear_stencil_value = 0, const Rect2 &p_region = Rect2());
 
 	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
-	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
+	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
 
-	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
 	struct GeometryInstanceData;
 	class GeometryInstanceFRPClustered;
@@ -618,8 +590,7 @@ private:
 		RID transforms_uniform_set;
 		uint32_t instance_count = 0;
 		uint32_t trail_steps = 1;
-		bool can_sdfgi = false;
-		bool using_projectors = false;
+			bool using_projectors = false;
 		bool using_softshadows = false;
 
 		//used during setup
@@ -630,7 +601,6 @@ private:
 			TELEPORTED,
 		} transform_status = TransformStatus::MOVED;
 		Transform3D prev_transform;
-		RID voxel_gi_instances[MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE];
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
 		SelfList<GeometryInstanceFRPClustered> dirty_list_element;
 
@@ -648,7 +618,9 @@ private:
 		virtual void pair_light_instance(const RID p_light_instance, RSE::LightType light_type, uint32_t placement_idx) override {}
 		virtual void pair_reflection_probe_instances(const RID *p_reflection_probe_instances, uint32_t p_reflection_probe_instance_count) override {}
 		virtual void pair_decal_instances(const RID *p_decal_instances, uint32_t p_decal_instance_count) override {}
-		virtual void pair_voxel_gi_instances(const RID *p_voxel_gi_instances, uint32_t p_voxel_gi_instance_count) override;
+		// FRP has no VoxelGI: nothing is ever paired, and no instance can carry the
+		// voxel GI flag, so the renderer's GI path stays off.
+		virtual void pair_voxel_gi_instances(const RID *p_voxel_gi_instances, uint32_t p_voxel_gi_instance_count) override {}
 
 		virtual void set_softshadow_projector_pairing(bool p_softshadow, bool p_projector) override;
 	};
@@ -691,8 +663,6 @@ private:
 				uint32_t use_motion_vectors : 1;
 				uint32_t use_normal_and_roughness : 1;
 				uint32_t use_lightmaps : 1;
-				uint32_t use_voxelgi : 1;
-				uint32_t use_sdfgi : 1;
 				uint32_t use_multiview : 1;
 				uint32_t use_16_bit_shadows : 1;
 				uint32_t use_32_bit_shadows : 1;
@@ -791,6 +761,22 @@ private:
 
 	/* Effects */
 
+	// Gives the velocity attachment's background pixels - the ones no geometry pass
+	// wrote a motion vector for, and which therefore still hold the engine's "no data"
+	// marker - the motion their depth implies, right before the temporal resolve
+	// reprojects them. See frp_velocity_fill.glsl.
+	struct VelocityFill {
+		struct PushConstant {
+			float reprojection_matrix[16];
+			float resolution[2];
+			uint32_t pad[2];
+		};
+
+		FrpVelocityFillShaderRD shader;
+		RID shader_version;
+		RID pipeline;
+	} velocity_fill;
+
 	RendererRD::TAA *taa = nullptr;
 	RendererRD::FSR2Effect *fsr2_effect = nullptr;
 	RendererRD::SSEffects *ss_effects = nullptr;
@@ -806,7 +792,6 @@ private:
 	ClusterBuilderRD *current_cluster_builder = nullptr;
 
 	/* SDFGI */
-	void _update_sdfgi(RenderDataRD *p_render_data);
 
 	/* Volumetric fog */
 	RID shadow_sampler;
@@ -822,12 +807,15 @@ private:
 	void _render_shadow_end();
 
 	/* Render Scene */
-	void _process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections);
-	void _process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform);
-	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform);
-	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
-	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
+	void _precompute_shadows(RenderDataRD *p_render_data);
+	void _prepare_lighting(RenderDataRD *p_render_data);
+	// Presents a texture to the viewport's render target: the pipeline texture named by
+	// p_texture, or the engine's tone mapped image when the name is empty.
+	void _present_frame(RenderDataRD *p_render_data, const StringName &p_texture);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
+	// Fills in the motion vectors of the pixels the G-buffer pass did not draw, so the
+	// temporal resolve reprojects the background instead of replacing it.
+	void _fill_missing_velocity(Ref<RenderSceneBuffersRD> p_render_buffers, const RenderDataRD *p_render_data);
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);
@@ -875,7 +863,6 @@ public:
 	virtual int sdfgi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const override;
 	virtual AABB sdfgi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const override;
 	virtual uint32_t sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const override;
-	RID sdfgi_get_ubo() const { return gi.sdfgi_ubo; }
 
 	/* GEOMETRY INSTANCE */
 

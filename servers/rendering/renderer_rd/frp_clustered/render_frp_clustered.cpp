@@ -31,6 +31,7 @@
 #include "render_frp_clustered.h"
 
 #include "core/config/project_settings.h"
+#include "frp_pass_context.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -100,18 +101,6 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_normal_roughness_t
 	}
 }
 
-void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_voxelgi() {
-	ERR_FAIL_NULL(render_buffers);
-
-	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI)) {
-		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
-		render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI, get_voxelgi_format(), get_voxelgi_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
-		if (msaa) {
-			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, get_voxelgi_format(), get_voxelgi_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
-		}
-	}
-}
-
 void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_gbuffer() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -129,6 +118,9 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_gbuffer() {
 			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM_MSAA, get_gbuffer_orm_format(), get_gbuffer_orm_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
 		}
 	}
+	// Roughness lives in orm.g rather than folded into normal_roughness.a. FRP is the
+	// only renderer that lays its G-buffer out this way, and it runs no shared code
+	// that decodes roughness (no GI), so nothing else has to be told about it.
 	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION)) {
 		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
 		render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_EMISSION, get_gbuffer_emission_format(), get_gbuffer_emission_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
@@ -168,9 +160,6 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::free_data() {
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_FRP_CLUSTERED);
 		render_buffers->clear_context(RB_SCOPE_SSDS);
-		render_buffers->clear_context(RB_SCOPE_SSIL);
-		render_buffers->clear_context(RB_SCOPE_SSAO);
-		render_buffers->clear_context(RB_SCOPE_SSR);
 	}
 
 	if (cluster_builder) {
@@ -190,9 +179,6 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::free_data() {
 	}
 #endif
 
-	if (!render_sdfgi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_sdfgi_uniform_set)) {
-		RD::get_singleton()->free_rid(render_sdfgi_uniform_set);
-	}
 }
 
 void RenderFRPClustered::RenderBufferDataFRPClustered::configure(RenderSceneBuffersRD *p_render_buffers) {
@@ -275,34 +261,33 @@ RID RenderFRPClustered::RenderBufferDataFRPClustered::get_depth_fb(DepthFrameBuf
 
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer);
 		} break;
-		case DEPTH_FB_ROUGHNESS_VOXELGI: {
-			ensure_normal_roughness_texture();
-			ensure_voxelgi();
-
-			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
-			RID voxelgi_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_VOXEL_GI_MSAA : RB_TEX_VOXEL_GI);
-
-			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, voxelgi_buffer);
-		} break;
 		case DEPTH_FB_GBUFFER: {
+			// Attachment order has to match the shader's output locations: normal and
+			// roughness, albedo, orm, emission.
 			ensure_normal_roughness_texture();
 			ensure_gbuffer();
-			if (render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_VOXEL_GI)) {
-				RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
-				RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
-				RID orm_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
-				RID emission_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
-				RID voxelgi_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_VOXEL_GI_MSAA : RB_TEX_VOXEL_GI);
 
-				return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer, voxelgi_buffer);
-			} else {
-				RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
-				RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
-				RID orm_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
-				RID emission_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
+			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
+			RID orm_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
+			RID emission_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
 
-				return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer);
-			}
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer);
+		} break;
+		case DEPTH_FB_GBUFFER_MOTION: {
+			// Attachment order has to match the shader's output locations: normal and
+			// roughness, albedo, orm, emission, then motion vectors.
+			ensure_normal_roughness_texture();
+			ensure_gbuffer();
+			render_buffers->ensure_velocity();
+
+			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
+			RID orm_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
+			RID emission_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
+			RID velocity_buffer = render_buffers->get_velocity_buffer(use_msaa);
+
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer, velocity_buffer);
 		} break;
 		default: {
 			ERR_FAIL_V(RID());
@@ -346,14 +331,6 @@ uint32_t RenderFRPClustered::RenderBufferDataFRPClustered::get_normal_roughness_
 	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
 }
 
-RD::DataFormat RenderFRPClustered::RenderBufferDataFRPClustered::get_voxelgi_format() {
-	return RD::DATA_FORMAT_R8G8_UINT;
-}
-
-uint32_t RenderFRPClustered::RenderBufferDataFRPClustered::get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
-	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
-}
-
 RD::DataFormat RenderFRPClustered::RenderBufferDataFRPClustered::get_gbuffer_albedo_format() {
 	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
 }
@@ -383,6 +360,10 @@ void RenderFRPClustered::setup_render_buffer_data(Ref<RenderSceneBuffersRD> p_re
 	data.instantiate();
 	p_render_buffers->set_custom_data(RB_SCOPE_FRP_CLUSTERED, data);
 
+	// The engine's volumetric fog binds a voxel GI instance buffer and a voxel GI
+	// texture array in its compute uniform set even when GI injection is disabled, so
+	// the render buffers have to own that storage object. FRP never fills or reads it:
+	// the frame's voxel GI count is zero, which keeps the fog's GI path off.
 	Ref<RendererRD::GI::RenderBuffersGI> rbgi;
 	rbgi.instantiate();
 	p_render_buffers->set_custom_data(RB_SCOPE_GI, rbgi);
@@ -571,16 +552,20 @@ void RenderFRPClustered::_render_list_template(RenderingDevice::DrawListID p_dra
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
 				pipeline_key.version = p_params->view_count > 1 ? SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW : SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
 			} break;
-			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
-				pipeline_key.version = p_params->view_count > 1 ? SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW : SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
-			} break;
 			case PASS_MODE_DEPTH_MATERIAL: {
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
 				pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL;
 			} break;
 			case PASS_MODE_GBUFFER: {
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for G-buffer pass");
-				pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_GBUFFER_PASS;
+				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) != 0) {
+					// The G-buffer pass writes motion vectors in the same geometry draw
+					// when the velocity attachment is present.
+					pipeline_key.color_pass_flags |= SceneShaderFRPClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+					pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_GBUFFER_PASS_MOTION_VECTORS;
+				} else {
+					pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_GBUFFER_PASS;
+				}
 			} break;
 			case PASS_MODE_SDF: {
 				// Note, SDF is prepared in world space, this shouldn't be a multiview buffer even when stereoscopic rendering is used.
@@ -771,14 +756,23 @@ void RenderFRPClustered::_render_list(RenderingDevice::DrawListID p_draw_list, R
 		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
 			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
 		} break;
-		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
-			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
-		} break;
 		case PASS_MODE_DEPTH_MATERIAL: {
 			_render_list_template<PASS_MODE_DEPTH_MATERIAL>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
 		} break;
 		case PASS_MODE_GBUFFER: {
-			_render_list_template<PASS_MODE_GBUFFER>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			// The G-buffer pass is instantiated twice: writing only the G-buffer, or
+			// writing the G-buffer plus the motion vector attachment in the same draw.
+			switch (p_params->color_pass_flags) {
+				case 0: {
+					_render_list_template<PASS_MODE_GBUFFER>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+				} break;
+				case COLOR_PASS_FLAG_MOTION_VECTORS: {
+					_render_list_template<PASS_MODE_GBUFFER, COLOR_PASS_FLAG_MOTION_VECTORS>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+				} break;
+				default: {
+					ERR_FAIL_MSG("Invalid G-buffer pass flag combination " + itos(p_params->color_pass_flags));
+				} break;
+			}
 		} break;
 		case PASS_MODE_SDF: {
 			_render_list_template<PASS_MODE_SDF>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
@@ -860,31 +854,10 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 		}
 	}
 
-	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
-		scene_state.ubo.ss_effects_flags = 0;
-	} else if (p_render_data->reflection_probe.is_null() && is_environment(p_render_data->environment)) {
-		scene_state.ubo.ssao_ao_affect = environment_get_ssao_ao_channel_affect(p_render_data->environment);
-		scene_state.ubo.ssao_light_affect = environment_get_ssao_direct_light_affect(p_render_data->environment);
-		uint32_t ss_flags = 0;
-		if (p_opaque_render_buffers) {
-			ss_flags |= environment_get_ssao_enabled(p_render_data->environment) ? (1 << 0) : 0;
-			ss_flags |= environment_get_ssil_enabled(p_render_data->environment) ? (1 << 1) : 0;
-			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
-
-			if (rd.is_valid()) {
-				const bool using_gi = environment_get_sdfgi_enabled(p_render_data->environment) || p_render_data->voxel_gi_instances->size() > 0;
-				ss_flags |= (using_gi && rd->has_texture(RB_SCOPE_GI, RB_TEX_AMBIENT) && rd->has_texture(RB_SCOPE_GI, RB_TEX_REFLECTION)) ? (1 << 4) : 0;
-				Ref<RenderBufferDataFRPClustered> rb_data;
-				if (rd->has_custom_data(RB_SCOPE_FRP_CLUSTERED)) {
-					rb_data = rd->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
-					ss_flags |= (rb_data.is_valid() && !rb_data->ss_effects_data.ssr.half_size) ? (1 << 3) : 0;
-				}
-			}
-		}
-		scene_state.ubo.ss_effects_flags = ss_flags;
-	} else {
-		scene_state.ubo.ss_effects_flags = 0;
-	}
+	// FRP has no screen space effects and no global illumination: the lighting shader
+	// never samples an SSAO / SSIL / SSR / GI attachment, so the flags stay zero and
+	// every such sampler binds the engine's default black texture.
+	scene_state.ubo.ss_effects_flags = 0;
 
 	if (uniform_buffer_index >= scene_state.implementation_uniform_buffers.size()) {
 		uint32_t from = scene_state.implementation_uniform_buffers.size();
@@ -1030,7 +1003,7 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
-void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
+void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 
@@ -1086,7 +1059,6 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 			flags |= INSTANCE_DATA_FLAGS_NON_UNIFORM_SCALE;
 		}
 		bool uses_lightmap = false;
-		bool uses_gi = false;
 		bool uses_motion = false;
 		float fade_alpha = 1.0;
 
@@ -1148,35 +1120,11 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 					flags |= INSTANCE_DATA_FLAG_USE_GI_BUFFERS;
 				}
 
-				if (inst->voxel_gi_instances[0].is_valid()) {
-					uint32_t probe0_index = 0xFFFF;
-					uint32_t probe1_index = 0xFFFF;
-
-					for (uint32_t j = 0; j < scene_state.voxelgis_used; j++) {
-						if (scene_state.voxelgi_ids[j] == inst->voxel_gi_instances[0]) {
-							probe0_index = j;
-						} else if (scene_state.voxelgi_ids[j] == inst->voxel_gi_instances[1]) {
-							probe1_index = j;
-						}
-					}
-
-					if (probe0_index == 0xFFFF && probe1_index != 0xFFFF) {
-						//0 must always exist if a probe exists
-						SWAP(probe0_index, probe1_index);
-					}
-
-					inst->gi_offset_cache = probe0_index | (probe1_index << 16);
-					flags |= INSTANCE_DATA_FLAG_USE_VOXEL_GI;
-					uses_gi = true;
-				} else {
-					if (p_using_sdfgi && inst->can_sdfgi) {
-						flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
-						uses_gi = true;
-					}
-					inst->gi_offset_cache = 0xFFFFFFFF;
-				}
+				// FRP has no VoxelGI: an instance without a lightmap never gets a probe
+				// index, so the shader's voxel GI path stays unused.
+				inst->gi_offset_cache = 0xFFFFFFFF;
 			}
-			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_COLOR || p_pass_mode == PASS_MODE_GBUFFER) {
+			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_COLOR || p_pass_mode == PASS_MODE_GBUFFER) {
 				bool transform_changed = inst->transform_status == GeometryInstanceFRPClustered::TransformStatus::MOVED;
 				bool has_mesh_instance = inst->mesh_instance.is_valid();
 				bool uses_particles = inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES;
@@ -1287,12 +1235,12 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
 					render_list[RENDER_LIST_ALPHA].add_element(surf);
-					if (uses_gi) {
-						surf->sort.uses_forward_gi = 1;
-					}
 				} else if (p_using_motion_pass && (uses_motion || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR))) {
+					// Motion vectors are written by the G-buffer pass itself (the velocity
+					// attachment is part of its framebuffer), so these surfaces stay in the
+					// opaque list and no second geometry pass over them is needed. The mask
+					// still excludes them from colour passes that do not want velocity.
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_MOTION_VECTORS;
-					render_list[RENDER_LIST_MOTION].add_element(surf);
 				} else {
 					surf->color_pass_inclusion_mask = 0;
 				}
@@ -1342,13 +1290,6 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 	}
 }
 
-void RenderFRPClustered::_setup_voxelgis(const PagedArray<RID> &p_voxelgis) {
-	scene_state.voxelgis_used = MIN(p_voxelgis.size(), uint32_t(MAX_VOXEL_GI_INSTANCESS));
-	for (uint32_t i = 0; i < scene_state.voxelgis_used; i++) {
-		scene_state.voxelgi_ids[i] = p_voxelgis[i];
-	}
-}
-
 void RenderFRPClustered::_setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -1391,32 +1332,6 @@ void RenderFRPClustered::_setup_lightmaps(const RenderDataRD *p_render_data, con
 
 /* SDFGI */
 
-void RenderFRPClustered::_update_sdfgi(RenderDataRD *p_render_data) {
-	if (p_render_data->sdfgi_update_data == nullptr) {
-		return;
-	}
-
-	Ref<RenderSceneBuffersRD> rb;
-	if (p_render_data && p_render_data->render_buffers.is_valid()) {
-		rb = p_render_data->render_buffers;
-	}
-
-	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		RENDER_TIMESTAMP("Render SDFGI");
-		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-		float exposure_normalization = 1.0;
-
-		if (p_render_data->camera_attributes.is_valid()) {
-			exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
-		}
-		for (int i = 0; i < p_render_data->render_sdfgi_region_count; i++) {
-			sdfgi->render_region(rb, p_render_data->render_sdfgi_regions[i].region, p_render_data->render_sdfgi_regions[i].instances, exposure_normalization);
-		}
-		if (p_render_data->sdfgi_update_data->update_static) {
-			sdfgi->render_static_lights(p_render_data, rb, p_render_data->sdfgi_update_data->static_cascade_count, p_render_data->sdfgi_update_data->static_cascade_indices, p_render_data->sdfgi_update_data->static_positional_lights);
-		}
-	}
-}
 
 /* Debug */
 
@@ -1462,11 +1377,8 @@ void RenderFRPClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_rend
 	ERR_FAIL_COND(!p_render_buffers->has_custom_data(RB_SCOPE_GI));
 	Ref<RendererRD::GI::RenderBuffersGI> rbgi = p_render_buffers->get_custom_data(RB_SCOPE_GI);
 
-	Ref<RendererRD::GI::SDFGI> sdfgi;
-	if (p_render_buffers->has_custom_data(RB_SCOPE_SDFGI)) {
-		sdfgi = p_render_buffers->get_custom_data(RB_SCOPE_SDFGI);
-	}
-
+	// FRP has no SDFGI, so volumetric fog gets no SDFGI input: its own buffers and
+	// the voxel GI buffer are what remains.
 	Size2i size = p_render_buffers->get_internal_size();
 	float ratio = float(size.x) / float((size.x + size.y) / 2);
 	uint32_t target_width = uint32_t(float(get_volumetric_fog_size()) * ratio);
@@ -1518,10 +1430,12 @@ void RenderFRPClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_rend
 		settings.vfog = fog;
 		settings.cluster_builder = rb_data->cluster_builder;
 		settings.rbgi = rbgi;
-		settings.sdfgi = sdfgi;
 		settings.env = p_environment;
 		settings.sky = &sky;
-		settings.gi = &gi;
+		// FRP has no global illumination, so the fog's SDFGI/GI injection stays off:
+		// `settings.sdfgi` is left invalid and the voxel GI count is zero, which means
+		// the fog never dereferences `settings.gi`.
+		settings.gi = nullptr;
 
 		RendererRD::Fog::get_singleton()->volumetric_fog_update(settings, p_cam_projection, p_cam_transform, p_prev_cam_inv_transform, p_shadow_atlas, p_directional_light_count, p_use_directional_shadows, p_positional_light_count, p_voxel_gi_count, p_fog_volumes);
 	}
@@ -1558,120 +1472,18 @@ void RenderFRPClustered::setup_added_decal(const Transform3D &p_transform, const
 
 /* Render scene */
 
-void RenderFRPClustered::_process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_render_buffers.is_null());
-	ERR_FAIL_COND(p_environment.is_null());
-
-	Ref<RenderBufferDataFRPClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
-	ERR_FAIL_COND(rb_data.is_null());
-
-	RENDER_TIMESTAMP("Process SSAO");
-
-	RendererRD::SSEffects::SSAOSettings settings;
-	settings.radius = environment_get_ssao_radius(p_environment);
-	settings.intensity = environment_get_ssao_intensity(p_environment);
-	settings.power = environment_get_ssao_power(p_environment);
-	settings.detail = environment_get_ssao_detail(p_environment);
-	settings.horizon = environment_get_ssao_horizon(p_environment);
-	settings.sharpness = environment_get_ssao_sharpness(p_environment);
-	settings.full_screen_size = p_render_buffers->get_internal_size();
-
-	ss_effects->ssao_allocate_buffers(p_render_buffers, rb_data->ss_effects_data.ssao, settings);
-
-	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
-		ss_effects->generate_ssao(p_render_buffers, rb_data->ss_effects_data.ssao, v, p_normal_buffers[v], p_projections[v], settings);
-	}
-}
-
-void RenderFRPClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_render_buffers.is_null());
-	ERR_FAIL_COND(p_environment.is_null());
-
-	Ref<RenderBufferDataFRPClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
-	ERR_FAIL_COND(rb_data.is_null());
-
-	RENDER_TIMESTAMP("Process SSIL");
-
-	RendererRD::SSEffects::SSILSettings settings;
-	settings.radius = environment_get_ssil_radius(p_environment);
-	settings.intensity = environment_get_ssil_intensity(p_environment);
-	settings.sharpness = environment_get_ssil_sharpness(p_environment);
-	settings.normal_rejection = environment_get_ssil_normal_rejection(p_environment);
-	settings.full_screen_size = p_render_buffers->get_internal_size();
-
-	ss_effects->ssil_allocate_buffers(p_render_buffers, rb_data->ss_effects_data.ssil, settings);
-
-	Transform3D transform = p_transform;
-	transform.set_origin(Vector3(0.0, 0.0, 0.0));
-
-	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
-		Projection correction;
-		correction.set_depth_correction(true);
-		Projection projection = correction * p_projections[v];
-		Projection last_frame_projection = rb_data->ss_effects_data.ssil_last_frame_projections[v] * Projection(rb_data->ss_effects_data.ssil_last_frame_transform.affine_inverse()) * Projection(transform) * projection.inverse();
-
-		ss_effects->screen_space_indirect_lighting(p_render_buffers, rb_data->ss_effects_data.ssil, v, p_normal_buffers[v], p_projections[v], last_frame_projection, settings);
-
-		rb_data->ss_effects_data.ssil_last_frame_projections[v] = projection;
-	}
-	rb_data->ss_effects_data.ssil_last_frame_transform = transform;
-}
-
-void RenderFRPClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_render_buffers.is_null());
-
-	Ref<RenderBufferDataFRPClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
-	ERR_FAIL_COND(rb_data.is_null());
-
-	RENDER_TIMESTAMP("Process SSR");
-
-	ss_effects->ssr_allocate_buffers(p_render_buffers, rb_data->ss_effects_data.ssr, p_render_buffers->get_base_data_format());
-
-	Projection reprojections[RendererSceneRender::MAX_RENDER_VIEWS];
-
-	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
-		Projection correction;
-		correction.set_depth_correction(true);
-
-		Projection projection = correction * p_projections[v];
-		reprojections[v] = rb_data->ss_effects_data.ssr_last_frame_projections[v] * Projection(rb_data->ss_effects_data.ssr_last_frame_transform.affine_inverse()) * Projection(p_transform) * projection.inverse();
-
-		rb_data->ss_effects_data.ssr_last_frame_projections[v] = projection;
-	}
-	rb_data->ss_effects_data.ssr_last_frame_transform = p_transform;
-
-	ss_effects->screen_space_reflection(p_render_buffers, rb_data->ss_effects_data.ssr, p_normal_slices, environment_get_ssr_max_steps(p_environment), environment_get_ssr_fade_in(p_environment), environment_get_ssr_fade_out(p_environment), environment_get_ssr_depth_tolerance(p_environment), p_projections, reprojections, p_eye_offsets, *copy_effects);
-}
-
-void RenderFRPClustered::_copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_render_buffers.is_null());
-
-	ss_effects->copy_internal_texture_to_last_frame(p_render_buffers, *copy_effects);
-}
-
-void RenderFRPClustered::_pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer) {
-	// Render shadows while GI is rendering, due to how barriers are handled, this should happen at the same time
+void RenderFRPClustered::_precompute_shadows(RenderDataRD *p_render_data) {
+	// Pass 0. Drawing the shadow maps is the one piece of frame preparation that
+	// depends on nothing else: it renders from each light's point of view, so it reads
+	// no scene depth, no G-buffer and no material page. That is why it runs before the
+	// virtual texture pass and the G-buffer.
+	//
+	// The rest of the preparation (light and cluster buffers, decal buffer, volumetric
+	// fog) stays in the Lighting pass: it is consumed there, so it belongs there.
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
-	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
-	Ref<RenderBufferDataFRPClustered> rb_data;
-	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_FRP_CLUSTERED)) {
-		// Our forward clustered custom data buffer will only be available when we're rendering our normal view.
-		// This will not be available when rendering reflection probes.
-		rb_data = rb->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
-	}
-
 	RENDER_TIMESTAMP("Setup Shadows");
-
-	if (rb.is_valid() && p_use_gi && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-		sdfgi->store_probes();
-	}
 
 	Size2i viewport_size = Size2i(1, 1);
 	if (rb.is_valid()) {
@@ -1713,21 +1525,11 @@ void RenderFRPClustered::_pre_opaque_render(RenderDataRD *p_render_data, bool p_
 		}
 	}
 
-	// Render GI
-
 	bool render_shadows = p_render_data->directional_shadows.size() || p_render_data->shadows.size();
-	bool render_gi = rb.is_valid() && p_use_gi;
 
-	if (render_shadows && render_gi) {
-		RENDER_TIMESTAMP("Render GI + Render Directional/SpotLight Shadows (Parallel)");
-	} else if (render_shadows) {
-		RENDER_TIMESTAMP("Render Directional/SpotLight Shadows");
-	} else if (render_gi) {
-		RENDER_TIMESTAMP("Render GI");
-	}
-
-	//prepare shadow rendering
 	if (render_shadows) {
+		RENDER_TIMESTAMP("Render Directional/SpotLight Shadows");
+
 		_render_shadow_begin();
 
 		//render directional shadows
@@ -1740,47 +1542,26 @@ void RenderFRPClustered::_pre_opaque_render(RenderDataRD *p_render_data, bool p_
 		}
 
 		_render_shadow_process();
-	}
-
-	if (render_gi) {
-		gi.process_gi(rb, p_normal_roughness_slices, p_voxel_gi_buffer, p_render_data->environment, p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances);
-	}
-
-	if (render_shadows) {
 		_render_shadow_end();
 	}
+}
 
-	if (rb_data.is_valid() && ss_effects) {
-		// Note, in multiview we're allocating buffers for each eye/view we're rendering.
-		// This should allow most of the processing to happen in parallel even if we're doing
-		// drawcalls per eye/view. It will all sync up at the barrier.
+void RenderFRPClustered::_prepare_lighting(RenderDataRD *p_render_data) {
+	// First step of the Lighting pass: everything the lighting shader consumes, plus
+	// the PRE_LIGHTING compositor stage that may still edit the G-buffer the previous
+	// pass wrote.
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
-		if (p_use_ssil || p_use_ssr) {
-			ss_effects->allocate_last_frame_buffer(rb, p_use_ssil, p_use_ssr);
-		}
-
-		if (p_use_ssao || p_use_ssil) {
-			RENDER_TIMESTAMP("Prepare Depth for SSAO/SSIL");
-			// Convert our depth buffer data to linear data in
-			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-				ss_effects->downsample_depth(rb, v, p_render_data->scene_data->view_projection[v]);
-			}
-
-			if (p_use_ssao) {
-				_process_ssao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection);
-			}
-
-			if (p_use_ssil) {
-				_process_ssil(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform);
-			}
-		}
-
-		if (p_use_ssr) {
-			_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform);
-		}
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	Ref<RenderBufferDataFRPClustered> rb_data;
+	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_FRP_CLUSTERED)) {
+		// Our forward clustered custom data buffer will only be available when we're rendering our normal view.
+		// This will not be available when rendering reflection probes.
+		rb_data = rb->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
 	}
 
-	RENDER_TIMESTAMP("Pre Opaque Render");
+	RENDER_TIMESTAMP("Prepare Lighting");
 
 	if (current_cluster_builder) {
 		// Note: when rendering stereoscopic (multiview) we are using our combined frustum projection to create
@@ -1820,6 +1601,28 @@ void RenderFRPClustered::_pre_opaque_render(RenderDataRD *p_render_data, bool p_
 	}
 }
 
+// FRP has no global illumination. SDFGI is never created, so the engine's SDFGI
+// queries report "nothing pending" and its render entry point is never reached.
+// The overrides have to exist: RendererSceneRender declares them pure virtual, and
+// the scene culling side keeps asking whether a region needs an update.
+void RenderFRPClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, const RID &p_albedo_texture, const RID &p_emission_texture, const RID &p_emission_aniso_texture, const RID &p_geom_facing_texture, float p_exposure_normalization) {
+}
+
+void RenderFRPClustered::sdfgi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) {
+}
+
+int RenderFRPClustered::sdfgi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const {
+	return 0;
+}
+
+AABB RenderFRPClustered::sdfgi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
+	return AABB();
+}
+
+uint32_t RenderFRPClustered::sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
+	return 0;
+}
+
 void RenderFRPClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera) {
 	ERR_FAIL_COND(p_render_buffers.is_null());
 
@@ -1838,6 +1641,70 @@ void RenderFRPClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buffers
 		RID depth_texture = p_render_buffers->get_depth_texture(v);
 		ss_effects->sub_surface_scattering(p_render_buffers, internal_texture, depth_texture, p_camera, internal_size);
 	}
+}
+
+void RenderFRPClustered::_present_frame(RenderDataRD *p_render_data, const StringName &p_texture) {
+	ERR_FAIL_NULL(p_render_data);
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+
+	RID source;
+	if (p_texture == StringName()) {
+		// The engine's tone mapped image, produced by the deferred tone mapping step.
+		ERR_FAIL_COND_MSG(!rb->has_texture(SNAME("Tonemapper"), SNAME("destination")), "present() without a texture needs a deferred tone mapping step first.");
+		source = rb->get_texture(SNAME("Tonemapper"), SNAME("destination"));
+	} else {
+		ERR_FAIL_COND_MSG(!rb->has_texture(SNAME("frp_pipeline"), p_texture), vformat("present(): the pipeline texture '%s' does not exist.", p_texture));
+		source = rb->get_texture(SNAME("frp_pipeline"), p_texture);
+	}
+
+	RID render_target = rb->get_render_target();
+	RID dest_fb = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_framebuffer(render_target);
+	// A viewport-sized blit with bilinear filtering: the tone mapped image is at the
+	// internal size, the render target at the target size.
+	copy_effects->copy_to_fb_rect(source, dest_fb, Rect2i(Point2i(), rb->get_target_size()), false, false, false, false, RID(), rb->get_view_count() > 1, false, false, false, Rect2(), 1.0, true);
+}
+
+void RenderFRPClustered::_fill_missing_velocity(Ref<RenderSceneBuffersRD> p_render_buffers, const RenderDataRD *p_render_data) {
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(uniform_set_cache);
+
+	Size2i internal_size = p_render_buffers->get_internal_size();
+	// The depth is read per texel and only used to reconstruct the position, so a
+	// nearest, non-repeating sampler is what this pass wants.
+	RID depth_sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+
+	VelocityFill::PushConstant push_constant;
+	push_constant.resolution[0] = internal_size.width;
+	push_constant.resolution[1] = internal_size.height;
+	{
+		Projection correction;
+		correction.set_depth_correction(true, true, false);
+		Projection reprojection = (correction * p_render_data->scene_data->prev_cam_projection) * p_render_data->scene_data->prev_cam_transform.affine_inverse() * p_render_data->scene_data->cam_transform * (correction * p_render_data->scene_data->cam_projection).inverse();
+		RendererRD::MaterialStorage::store_camera(reprojection, push_constant.reprojection_matrix);
+	}
+
+	RID shader = velocity_fill.shader.version_get_shader(velocity_fill.shader_version, 0);
+	ERR_FAIL_COND(shader.is_null());
+
+	RD::get_singleton()->draw_command_begin_label("Fill Missing Motion Vectors");
+
+	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, velocity_fill.pipeline);
+
+	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
+		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ depth_sampler, p_render_buffers->get_depth_texture(v) }));
+		RD::Uniform u_velocity(RD::UNIFORM_TYPE_IMAGE, 1, p_render_buffers->get_velocity_buffer(false, v));
+
+		RID uniform_set = uniform_set_cache->get_cache(shader, 0, u_depth, u_velocity);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(VelocityFill::PushConstant));
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list, internal_size.width, internal_size.height, 1);
+	}
+
+	RD::get_singleton()->compute_list_end();
+
+	RD::get_singleton()->draw_command_end_label();
 }
 
 void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
@@ -1869,14 +1736,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
-	// sdfgi first
-	_update_sdfgi(p_render_data);
-
-	// assign render indices to voxel_gi_instances
-	for (uint32_t i = 0; i < (uint32_t)p_render_data->voxel_gi_instances->size(); i++) {
-		RID voxel_gi_instance = (*p_render_data->voxel_gi_instances)[i];
-		gi.voxel_gi_instance_set_render_index(voxel_gi_instance, i);
-	}
+	// FRP has no VoxelGI, so no probe instance ever needs a render index and the
+	// frame's voxel GI count stays zero.
 
 	// obtain cluster builder
 	if (light_storage->owns_reflection_probe_instance(p_render_data->reflection_probe)) {
@@ -1887,19 +1748,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 	} else if (rb_data.is_valid()) {
 		current_cluster_builder = rb_data->cluster_builder;
-
 		p_render_data->voxel_gi_count = 0;
-
-		if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			if (sdfgi.is_valid()) {
-				sdfgi->update_cascades();
-				sdfgi->pre_process_gi(p_render_data->scene_data->cam_transform, p_render_data);
-				sdfgi->update_light();
-			}
-		}
-
-		gi.setup_voxel_gi_instances(p_render_data, p_render_data->render_buffers, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances, p_render_data->voxel_gi_count);
 	} else {
 		ERR_PRINT("No render buffer nor reflection atlas, bug"); // Should never happen!
 		current_cluster_builder = nullptr;
@@ -1915,6 +1764,33 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	_update_vrs(rb);
 
 	RENDER_TIMESTAMP("Setup 3D Scene");
+
+	// FRP's resource-authored schedule executes these real render operations.
+	// Reflection probes and ordinary Compositors retain the legacy stage path.
+	// The schedule is read here, before the frame's feature flags are derived,
+	// because a disabled optional entry has to switch its consumer off as well:
+	// the lighting shader must not sample an attachment whose producer was
+	// removed from the schedule.
+	RendererCompositorStorage *pipeline_storage = RendererCompositorStorage::get_singleton();
+	PackedInt32Array pipeline;
+	PackedStringArray pipeline_names;
+	PackedInt32Array pipeline_provided;
+	Dictionary pipeline_parameters;
+	Vector<RID> pipeline_effects;
+	if (!is_reflection_probe && p_render_data->compositor.is_valid()) {
+		pipeline = pipeline_storage->compositor_get_frp_pipeline(p_render_data->compositor);
+		pipeline_names = pipeline_storage->compositor_get_frp_pipeline_names(p_render_data->compositor);
+		pipeline_provided = pipeline_storage->compositor_get_frp_pipeline_provided(p_render_data->compositor);
+		pipeline_parameters = pipeline_storage->compositor_get_frp_pipeline_parameters(p_render_data->compositor);
+		pipeline_effects = pipeline_storage->compositor_get_compositor_effects(p_render_data->compositor, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY, false);
+	}
+	// An empty schedule means the default order, which contains every operation. A
+	// pass a plugin runs itself (declared through the provided pass ids) counts as
+	// present: the schedule dropped its engine entry, so feature setup would
+	// otherwise switch the effect off even though a pass is there to draw it.
+	auto schedule_has = [&](int p_pass_id) -> bool {
+		return pipeline.is_empty() || pipeline.has(p_pass_id) || pipeline_provided.has(p_pass_id);
+	};
 
 	bool using_debug_mvs = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_MOTION_VECTORS;
 	bool using_taa = rb->get_use_taa();
@@ -1942,6 +1818,17 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 	bool using_upscaling = scale_type != SCALE_NONE;
 
+	// The Temporal AA entry is the switch when a schedule is authored: the viewport
+	// jitter follows it (see RendererSceneCull::render_camera), so enabling the entry
+	// turns TAA on and disabling the entry turns it off. The viewport's own use_taa is
+	// deliberately not consulted while a schedule exists: the jitter rule drops it to
+	// zero phases for a missing entry, and resolving a frame that is never jittered is
+	// the blur the entry is supposed to avoid. A plugin pass that runs the pass itself
+	// counts the same way. A viewport temporal upscaler brings its own jitter and keeps
+	// TAA off, exactly as the viewport decided.
+	using_taa = scale_type != SCALE_FSR2 && scale_type != SCALE_MFX &&
+			(pipeline.is_empty() ? rb->get_use_taa() : schedule_has(FRPPipelineSpec::PASS_TEMPORAL_AA));
+
 	// check if we need motion vectors
 	bool motion_vectors_required;
 	if (using_debug_mvs) {
@@ -1965,17 +1852,24 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	RID color_framebuffer;
 	RID color_only_framebuffer;
 	RID depth_framebuffer;
+	// True when the G-buffer pass has to write the velocity attachment as well.
+	bool gbuffer_motion_vectors = false;
 	RendererRD::MaterialStorage::Samplers samplers;
+
+	// FRP's schedule was read above, before the frame's feature flags were derived.
 
 	PassMode depth_pass_mode = PASS_MODE_DEPTH;
 	uint32_t color_pass_flags = 0;
 	Vector<Color> depth_pass_clear;
 	bool using_separate_specular = false;
+	// FRP has no screen space effects (SSAO / SSIL / SSR) and no global illumination
+	// (SDFGI / VoxelGI) - neither exists in this renderer at all - and no debug
+	// geometry: those are not FRP passes, so the frame never allocates, generates or
+	// composites their attachments. The flags the engine copies expect stay false,
+	// which is what keeps the lighting shader on its default (black) samplers.
 	bool using_ssr = false;
-	bool using_sdfgi = false;
-	bool using_voxelgi = false;
+	bool using_ssil = false;
 	bool reverse_cull = p_render_data->scene_data->cam_transform.basis.determinant() < 0;
-	bool using_ssil = !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
 	bool using_motion_pass = rb_data.is_valid() && using_upscaling;
 
 	if (is_reflection_probe) {
@@ -2007,23 +1901,6 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			global_pipeline_data_required.use_motion_vectors = true;
 		}
 
-		if (p_render_data->voxel_gi_instances->size() > 0) {
-			using_voxelgi = true;
-		}
-
-		if (p_render_data->environment.is_valid()) {
-			if (environment_get_sdfgi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
-				using_sdfgi = true;
-			}
-			if (environment_get_ssr_enabled(p_render_data->environment)) {
-				if (!p_render_data->transparent_bg) {
-					using_ssr = true;
-				} else {
-					WARN_PRINT_ONCE("Screen-space reflections are not supported in viewports with a transparent background. Disabling SSR in transparent viewport.");
-				}
-			}
-		}
-
 		if (p_render_data->scene_data->view_count > 1) {
 			color_pass_flags |= COLOR_PASS_FLAG_MULTIVIEW;
 			// Try enabling here in case is_xr_enabled() returns false.
@@ -2047,22 +1924,24 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	RD::get_singleton()->draw_command_begin_label("Render Setup");
 
 	_setup_lightmaps(p_render_data, *p_render_data->lightmaps, p_render_data->scene_data->cam_transform);
-	_setup_voxelgis(*p_render_data->voxel_gi_instances);
 	uint32_t depth_prepass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
 
 	// May have changed due to the above (light buffer enlarged, as an example).
 	_update_render_base_uniform_set();
 
-	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
+	// The FRP G-buffer pass is the only geometry pass over opaque surfaces, so it
+	// cannot write per-object motion vectors the way upstream's forward colour
+	// pass does. Whenever the frame needs motion vectors (TAA, 3D upscaling, the
+	// motion debug view, or a compositor effect that asks for them) the dedicated
+	// motion list has to be populated instead of only being filled for upscaling.
+	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, false, motion_vectors_required);
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
 	render_list[RENDER_LIST_OPAQUE_FALLBACK].sort_by_key();
-	render_list[RENDER_LIST_MOTION].sort_by_key();
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
 	_fill_instance_data(RENDER_LIST_OPAQUE_FALLBACK, render_info);
-	_fill_instance_data(RENDER_LIST_MOTION, render_info);
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2070,14 +1949,20 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	if (!is_reflection_probe) {
 		// The G-buffer pass is mandatory in the FRP renderer and replaces the optional depth pre-pass.
 		depth_pass_mode = PASS_MODE_GBUFFER;
-		// The G-buffer shader always declares the voxel-GI output slot.
-		rb_data->ensure_voxelgi();
-		depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataFRPClustered::DEPTH_FB_GBUFFER);
+		// Frames that need velocity (TAA, 3D upscaling, motion debug view) get the
+		// G-buffer framebuffer that also carries the motion vector attachment, so the
+		// opacity geometry is still drawn exactly once.
+		gbuffer_motion_vectors = using_motion_pass || motion_vectors_required;
+		depth_framebuffer = rb_data->get_depth_fb(gbuffer_motion_vectors ? RenderBufferDataFRPClustered::DEPTH_FB_GBUFFER_MOTION : RenderBufferDataFRPClustered::DEPTH_FB_GBUFFER);
 		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // normal_roughness
 		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // albedo
 		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // orm
 		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // emission
-		depth_pass_clear.push_back(Color(0, 0, 0, 0)); // voxel_gi
+		if (gbuffer_motion_vectors) {
+			// (0, 0) would mean "moved to this pixel from everywhere"; -1 marks the
+			// attachment as having no motion, which is what the velocity buffer needs.
+			depth_pass_clear.push_back(Color(-1, -1, 0, 0)); // motion vectors
+		}
 	}
 
 	bool using_sss = rb_data.is_valid() && !is_reflection_probe && scene_state.used_sss && ss_effects->sss_get_quality() != RSE::SUB_SURFACE_SCATTERING_QUALITY_DISABLED;
@@ -2103,7 +1988,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	}
 
 	// The mandatory G-buffer pass belongs to the advanced shader group.
-	if (!is_reflection_probe || using_sss || using_separate_specular || scene_state.used_lightmap || using_voxelgi || global_surface_data.sss_used) {
+	if (!is_reflection_probe || using_sss || using_separate_specular || scene_state.used_lightmap || global_surface_data.sss_used) {
 		scene_shader.enable_advanced_shader_group(p_render_data->scene_data->view_count > 1);
 	}
 
@@ -2114,10 +1999,6 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 	if (scene_state.used_lightmap || scene_state.lightmaps_used > 0) {
 		global_pipeline_data_required.use_lightmaps = true;
-	}
-
-	if (using_voxelgi) {
-		global_pipeline_data_required.use_voxelgi = true;
 	}
 
 	if (using_separate_specular || global_surface_data.sss_used) {
@@ -2231,8 +2112,6 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	bool ce_post_opaque_resolved_depth = use_msaa && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_DEPTH, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE);
 	bool ce_pre_transparent_resolved_depth = use_msaa && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_DEPTH, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
 
-	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
-	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
 	bool force_depth_pre_pass = scene_state.used_opaque_stencil;
 	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
 
@@ -2244,32 +2123,15 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	SceneShaderFRPClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
 	base_specialization.use_depth_fog = p_render_data->environment.is_valid() && environment_get_fog_mode(p_render_data->environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH;
 
-	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
+	bool using_ssao = false;
 
-	// FRP's resource-authored schedule executes these real render operations.
-	// Reflection probes and ordinary Compositors retain the legacy stage path.
-	RendererCompositorStorage *pipeline_storage = RendererCompositorStorage::get_singleton();
-	PackedInt32Array pipeline;
-	PackedStringArray pipeline_names;
-	Vector<RID> pipeline_effects;
-	if (!is_reflection_probe && p_render_data->compositor.is_valid()) {
-		pipeline = pipeline_storage->compositor_get_frp_pipeline(p_render_data->compositor);
-		pipeline_names = pipeline_storage->compositor_get_frp_pipeline_names(p_render_data->compositor);
-		pipeline_effects = pipeline_storage->compositor_get_compositor_effects(p_render_data->compositor, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY, false);
-	}
-	if (!pipeline.is_empty()) {
-		// Some dependencies are viewport/material dependent and cannot be
-		// checked when the resource is edited. Never sample an uninitialized
-		// temporal output or leave the separate specular attachment unmerged.
-		const bool missing_motion = (using_motion_pass || motion_vectors_required) && !pipeline.has(4);
-		const bool missing_specular = using_separate_specular && !pipeline.has(9);
-		const bool missing_temporal = (using_upscaling || using_taa) && !pipeline.has(14);
-		const bool missing_history = (using_ssil || using_ssr) && !pipeline.has(13);
-		if (missing_motion || missing_specular || missing_temporal || missing_history) {
-			WARN_PRINT_ONCE("FRP: the configured pipeline disables a pass required by the active viewport/material (motion vectors, specular merge, temporal AA/upscale, or history). Using the default stage pipeline until the configuration is corrected.");
-			pipeline.clear();
-		}
-	}
+	// FRP runs no screen-space effect and no global illumination, so the frame
+	// state's per-frame flags for them stay zero (see _setup_environment()).
+
+	// Every entry owns the internal operations it needs (MSAA resolve, screen and
+	// depth copies, SSIL/SSR history, specular merge, motion vectors), and the
+	// Temporal AA entry is the TAA switch with the viewport jitter following it, so a
+	// schedule never has to be repaired for a viewport or material setting.
 	const bool explicit_pipeline = !pipeline.is_empty();
 	auto stage_effects = [&](RSE::CompositorEffectCallbackType p_stage) {
 		if (!explicit_pipeline) {
@@ -2277,40 +2139,58 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 	};
 	uint32_t opaque_pass_uniform_buffer_index = 0;
+	bool opaque_pass_uniforms_ready = false;
 	RID rp_uniform_set;
-	static const char *builtin_pass_names[] = {
-		"GBuffer", "Lighting Preparation", "Deferred Lighting", "Opaque Forward Fallback",
-		"Motion Vectors", "Opaque Resolve", "Debug Geometry", "Sky", "Sky Resolve",
-		"Subsurface + Specular Merge", "Screen/Depth Copy", "Transparent", "Final Resolve",
-		"SSIL/SSR History Copy", "Temporal AA / Upscale", "Post Process / Tonemap", "VT Pass"
+	// Resolves the frame's colour, depth and velocity once per frame. Both the
+	// temporal AA operation and the tone mapping operation need resolved inputs, and
+	// either of them can be the first to run.
+	bool frame_color_resolved = false;
+	auto resolve_frame_buffers = [&]() {
+		if (frame_color_resolved || !(rb_data.is_valid() && use_msaa)) {
+			return;
+		}
+		frame_color_resolved = true;
+
+		RENDER_TIMESTAMP("Resolve");
+
+		RD::get_singleton()->draw_command_begin_label("Resolve");
+
+		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+
+			if (resolve_velocity_buffer) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
+			}
+		}
+
+		RD::get_singleton()->draw_command_end_label();
 	};
-	auto run_builtin_pass = [&](int p_pass, const String &p_name) {
-		RD::get_singleton()->draw_command_begin_label(p_name.utf8().span());
-		RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
-		switch (p_pass) {
-			case 16: { // Virtual texture updates. Must run before the G-buffer.
+
+	// One internal renderer operation. A user-facing pass expands to one or more of
+	// these; operations are implementation units and are not separately switchable
+	// (see FRPPipelineSpec).
+	auto run_builtin_operation = [&](int p_operation) {
+		switch (p_operation) {
+			case FRPPipelineSpec::OP_SHADOW_PRECOMPUTE: { // Shadow maps. Runs before everything else.
+				if (!is_reflection_probe) {
+					_precompute_shadows(p_render_data);
+				}
+			} break;
+			case FRPPipelineSpec::OP_VIRTUAL_TEXTURE: { // Virtual texture updates. Must run before the G-buffer.
 				if (!is_reflection_probe) {
 					RenderingServer::get_singleton()->execute_virtual_texture_updates();
 				}
 			} break;
-			case 0: { // GBuffer.
+			case FRPPipelineSpec::OP_GBUFFER: { // GBuffer.
 				if (!is_reflection_probe) {
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_GBUFFER);
 				}
 				if (depth_pre_pass) { // G-buffer, or depth pre-pass for reflection probes.
-					bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
-					if (needs_pre_resolve) {
-						RENDER_TIMESTAMP("GI + Render Depth Pre-Pass (Parallel)");
-					} else {
-						RENDER_TIMESTAMP("Render Depth Pre-Pass");
-					}
-					if (needs_pre_resolve) {
-						//pre clear the depth framebuffer, as AMD (and maybe others?) use compute for it, and barrier other compute shaders.
-						RD::get_singleton()->draw_list_begin(depth_framebuffer, RD::DRAW_CLEAR_ALL, depth_pass_clear, 0.0f);
-						RD::get_singleton()->draw_list_end();
-						//start compute processes here, so they run at the same time as depth pre-pass
-						_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
-					}
+					// No GI work runs beside the depth pre-pass any more, so it always
+					// clears instead of pre-resolving into a running compute pass.
+					RENDER_TIMESTAMP("Render Depth Pre-Pass");
 
 					if (is_reflection_probe) {
 						RD::get_singleton()->draw_command_begin_label("Render Depth Pre-Pass");
@@ -2320,9 +2200,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 					RID depth_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, RID(), samplers, depth_prepass_uniform_buffer_index);
 
-					bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
-					RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, depth_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-					_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+					bool finish_depth = using_ssao || using_ssil || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
+					// Motion vectors ride along in this same geometry draw when the
+					// framebuffer carries the velocity attachment.
+					const uint32_t gbuffer_color_pass_flags = gbuffer_motion_vectors ? uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS) : 0u;
+					RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, gbuffer_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, depth_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+					_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DRAW_CLEAR_ALL, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
 					RD::get_singleton()->draw_command_end_label();
 
@@ -2331,11 +2214,11 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RD::get_singleton()->draw_command_begin_label("Resolve Depth Pre-Pass (MSAA)");
 						if (depth_pass_mode == PASS_MODE_GBUFFER) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa], Vector<RID>({ rb_data->get_gbuffer_albedo_msaa(v), rb_data->get_gbuffer_orm_msaa(v), rb_data->get_gbuffer_emission_msaa(v) }), Vector<RID>({ rb_data->get_gbuffer_albedo(v), rb_data->get_gbuffer_orm(v), rb_data->get_gbuffer_emission(v) }));
+								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), RID(), rb->get_internal_size(), texture_multisamples[msaa], Vector<RID>({ rb_data->get_gbuffer_albedo_msaa(v), rb_data->get_gbuffer_orm_msaa(v), rb_data->get_gbuffer_emission_msaa(v) }), Vector<RID>({ rb_data->get_gbuffer_albedo(v), rb_data->get_gbuffer_orm(v), rb_data->get_gbuffer_emission(v) }));
 							}
-						} else if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) {
+						} else if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
+								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), RID(), rb->get_internal_size(), texture_multisamples[msaa]);
 							}
 						} else if (finish_depth) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
@@ -2365,15 +2248,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE);
 				}
 			} break;
-			case 1: { // Lighting preparation.
-				RID normal_roughness_views[RendererSceneRender::MAX_RENDER_VIEWS];
-				if (rb_data.is_valid() && rb_data->has_normal_roughness()) {
-					for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-						normal_roughness_views[v] = rb_data->get_normal_roughness(v);
-					}
-				}
-				_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
-
+			case FRPPipelineSpec::OP_LIGHTING_PREPARE: { // Light/cluster data, decals, volumetric fog.
+				_prepare_lighting(p_render_data);
+			} break;
+			case FRPPipelineSpec::OP_PRE_LIGHTING_STAGE: { // PRE_LIGHTING compositor stage.
 				if (current_cluster_builder) {
 					base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 				}
@@ -2382,7 +2260,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_LIGHTING);
 				}
 			} break;
-			case 2: { // Deferred lighting.
+			case FRPPipelineSpec::OP_DEFERRED_LIGHTING: { // Deferred lighting.
 				// In the FRP renderer the opaque color pass is replaced by the FRP lighting pass.
 				RENDER_TIMESTAMP("Render FRP Lighting Pass");
 
@@ -2395,6 +2273,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				_update_render_base_uniform_set();
 
 				opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+				opaque_pass_uniforms_ready = true;
 
 				{
 					Vector<Color> c;
@@ -2425,8 +2304,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						// drawing. Keep only color outputs, including optional specular/MV.
 						RID lighting_color = use_msaa ? rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA) : rb->get_internal_texture();
 						RID lighting_specular = (opaque_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR) : RID();
-						RID lighting_velocity = (opaque_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) ? rb->get_velocity_buffer(use_msaa) : RID();
-						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_velocity);
+						// The full-screen lighting shader writes colour and, optionally,
+						// separate specular. The velocity texture must not be attached:
+						// it would give this framebuffer a colour output mask the shader
+						// does not declare, which fails pipeline creation. Motion vectors
+						// are produced by the Motion Vectors pass instead.
+						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular);
 						// FRP lighting pass: full-screen triangle that reads the G-buffer and computes lighting.
 						RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 						uint32_t lighting_mode = 0;
@@ -2481,7 +2364,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_LIGHTING);
 				}
 			} break;
-			case 3: { // Opaque forward fallback.
+			case FRPPipelineSpec::OP_OPAQUE_FORWARD_FALLBACK: { // Opaque forward fallback.
 				// Forward fallback pass: renders opaque materials that cannot be expressed in the G-buffer.
 				if (!render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.is_empty()) {
 					RENDER_TIMESTAMP("Render Opaque Fallback Pass");
@@ -2501,38 +2384,23 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_end_label();
 				}
 			} break;
-			case 4: { // Motion vectors.
+			case FRPPipelineSpec::OP_MOTION_VECTORS: { // Motion vectors.
 				{
-					bool render_motion_pass = !render_list[RENDER_LIST_MOTION].elements.is_empty();
-
-					if (using_motion_pass) {
+					if (using_motion_pass || motion_vectors_required) {
 						if (scale_type == SCALE_MFX) {
+							// MetalFX consumes its own velocity layout, so the buffer has to
+							// be converted after the G-buffer pass wrote it.
 							motion_vectors_store->process(rb,
 									p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform,
 									p_render_data->scene_data->prev_cam_projection, p_render_data->scene_data->prev_cam_transform);
-						} else {
-							Vector<Color> motion_vector_clear_colors;
-							motion_vector_clear_colors.push_back(Color(-1, -1, 0, 0));
-							RD::get_singleton()->draw_list_begin(rb_data->get_velocity_only_fb(), RD::DRAW_CLEAR_ALL, motion_vector_clear_colors);
-							RD::get_singleton()->draw_list_end();
 						}
-					}
-
-					if (render_motion_pass) {
-						RD::get_singleton()->draw_command_begin_label("Render Motion Pass");
-
-						RENDER_TIMESTAMP("Render Motion Pass");
-
-						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_MOTION, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
-
-						RenderListParameters render_list_params(render_list[RENDER_LIST_MOTION].elements.ptr(), render_list[RENDER_LIST_MOTION].element_info.ptr(), render_list[RENDER_LIST_MOTION].elements.size(), reverse_cull, PASS_MODE_COLOR, color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-						_render_list_with_draw_list(&render_list_params, color_framebuffer);
-
-						RD::get_singleton()->draw_command_end_label();
+						// The velocity attachment itself is cleared by the G-buffer pass:
+						// its framebuffer carries the motion vector attachment and the
+						// clear colour marks "no motion".
 					}
 				}
 			} break;
-			case 5: { // Opaque resolve.
+			case FRPPipelineSpec::OP_OPAQUE_RESOLVE: { // Opaque resolve.
 				{
 					if (ce_post_opaque_resolved_color) {
 						for (uint32_t v = 0; v < rb->get_view_count(); v++) {
@@ -2550,31 +2418,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE);
 				}
 			} break;
-			case 6: { // Debug geometry.
-				if (debug_voxelgis) {
-					Projection dc;
-					dc.set_depth_correction(true);
-					Projection cm = (dc * p_render_data->scene_data->cam_projection) * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
-					RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer);
-					RD::get_singleton()->draw_command_begin_label("Debug VoxelGIs");
-					for (int i = 0; i < (int)p_render_data->voxel_gi_instances->size(); i++) {
-						gi.debug_voxel_gi((*p_render_data->voxel_gi_instances)[i], draw_list, color_only_framebuffer, cm, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION, 1.0);
-					}
-					RD::get_singleton()->draw_command_end_label();
-					RD::get_singleton()->draw_list_end();
-				}
-
-				if (debug_sdfgi_probes) {
-					Projection dc;
-					dc.set_depth_correction(true);
-					Projection cms[RendererSceneRender::MAX_RENDER_VIEWS];
-					for (uint32_t v = 0; v < p_render_data->scene_data->view_count; v++) {
-						cms[v] = (dc * p_render_data->scene_data->view_projection[v]) * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
-					}
-					_debug_sdfgi_probes(rb, color_only_framebuffer, p_render_data->scene_data->view_count, cms);
-				}
-			} break;
-			case 7: { // Sky.
+			case FRPPipelineSpec::OP_SKY: { // Sky.
 				if (draw_sky || draw_sky_fog_only) {
 					RENDER_TIMESTAMP("Render Sky");
 
@@ -2587,7 +2431,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_end_label();
 				}
 			} break;
-			case 8: { // Sky resolve.
+			case FRPPipelineSpec::OP_SKY_RESOLVE: { // Sky resolve.
 				if (use_msaa) {
 					RENDER_TIMESTAMP("Resolve MSAA");
 
@@ -2615,7 +2459,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_SKY);
 				}
 			} break;
-			case 9: { // Subsurface and specular.
+			case FRPPipelineSpec::OP_SUBSURFACE_AND_SPECULAR: { // Subsurface and specular.
 				if (using_separate_specular) {
 					if (using_sss) {
 						RENDER_TIMESTAMP("Sub-Surface Scattering");
@@ -2641,7 +2485,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_list_end();
 				}
 			} break;
-			case 10: { // Screen and depth copies.
+			case FRPPipelineSpec::OP_SCREEN_AND_DEPTH_COPY: { // Screen and depth copies.
 				if (rb_data.is_valid() && using_upscaling) {
 					// Make sure the upscaled texture is initialized, but not necessarily filled, before running screen copies
 					// so it properly detect if a dedicated copy texture should be used.
@@ -2693,7 +2537,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
 				}
 			} break;
-			case 11: { // Transparent.
+			case FRPPipelineSpec::OP_TRANSPARENT: { // Transparent.
 				if (!render_list[RENDER_LIST_ALPHA].elements.is_empty()) {
 					RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
@@ -2716,39 +2560,20 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_end_label();
 				}
 			} break;
-			case 12: { // Final resolve.
-				RENDER_TIMESTAMP("Resolve");
-
-				RD::get_singleton()->draw_command_begin_label("Resolve");
-
-				if (rb_data.is_valid() && use_msaa) {
-					bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
-					for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-						RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
-						resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
-
-						if (resolve_velocity_buffer) {
-							RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
-						}
-					}
-				}
-
-				RD::get_singleton()->draw_command_end_label();
+			case FRPPipelineSpec::OP_FINAL_RESOLVE: { // Final resolve.
+				resolve_frame_buffers();
 			} break;
-			case 13: { // History copy.
-				RD::get_singleton()->draw_command_begin_label("Copy Framebuffer for SSIL/SSR");
-				if (using_ssil || using_ssr) {
-					RENDER_TIMESTAMP("Copy Final Framebuffer (SSIL/SSR)");
-					_copy_framebuffer_to_ss_effects(rb, using_ssil, using_ssr);
-				}
-				RD::get_singleton()->draw_command_end_label();
-
+			case FRPPipelineSpec::OP_HISTORY_COPY: { // Post-transparent compositor effects.
 				{
 					RENDER_TIMESTAMP("Process Post Transparent Compositor Effects");
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT);
 				}
 			} break;
-			case 14: { // Temporal AA and upscale.
+			case FRPPipelineSpec::OP_TEMPORAL_AA: { // Temporal AA and upscale.
+				// TAA and the temporal upscalers read resolved colour, depth and
+				// velocity, and this entry can run before the tone mapping entry.
+				resolve_frame_buffers();
+
 				if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 					if (scale_type == SCALE_FSR2) {
 						rb_data->ensure_fsr2(fsr2_effect);
@@ -2826,6 +2651,13 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RD::get_singleton()->draw_command_end_label();
 #endif
 					} else if (using_taa) {
+						// The temporal resolve reprojects every pixel, including the sky
+						// and the clear colour behind a silhouette, which the velocity
+						// attachment only has the engine's "no data" marker for. Filling
+						// those in first is what makes the background accumulate instead
+						// of being replaced every frame.
+						_fill_missing_velocity(rb, p_render_data);
+
 						RD::get_singleton()->draw_command_begin_label("TAA");
 						RENDER_TIMESTAMP("TAA");
 						taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
@@ -2833,22 +2665,61 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					}
 				}
 			} break;
-			case 15: { // Post process and tonemap.
+			case FRPPipelineSpec::OP_POST_PROCESS: { // Post-process stages: glow, DoF, auto exposure, AA prep.
 				if (rb_data.is_valid()) {
 					_debug_draw_cluster(rb);
 
+					RENDER_TIMESTAMP("Post Process");
+
+					_render_buffers_post_process(p_render_data);
+				}
+			} break;
+			case FRPPipelineSpec::OP_TONEMAP: { // Tone mapping, post AA and scaling, presented by the engine.
+				if (rb_data.is_valid()) {
 					RENDER_TIMESTAMP("Tonemap");
 
-					_render_buffers_post_process_and_tonemap(p_render_data);
+					_render_buffers_tonemap(p_render_data);
+				}
+			} break;
+			case FRPPipelineSpec::OP_TONEMAP_DEFERRED: { // Tone mapping into the engine's intermediate texture.
+				if (rb_data.is_valid()) {
+					RENDER_TIMESTAMP("Tonemap (deferred present)");
+
+					// The engine's own present steps are skipped: the caller runs its
+					// post-tonemap effects on the toned image and presents it itself
+					// with present().
+					_render_buffers_tonemap(p_render_data, true);
 				}
 			} break;
 		}
+	};
+	// A pass is what the pipeline resource orders, enables and disables. It runs the
+	// operations its spec entry declares, in that order.
+	auto run_builtin_pass = [&](int p_pass, const String &p_name) {
+		RD::get_singleton()->draw_command_begin_label(p_name.utf8().span());
+		RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
+		const FRPPipelineSpec::NativePass &definition = FRPPipelineSpec::native_pass(p_pass);
+		for (int i = 0; i < definition.operation_count; i++) {
+			run_builtin_operation(definition.operations[i]);
+		}
 		RD::get_singleton()->draw_command_end_label();
 	};
+	// The Core surface a scripted pass runs on. It forwards every primitive to the
+	// same operations the built-in passes call, so a plugin pass and the engine's own
+	// pass execute identical code.
+	Ref<FRPPassContext> pass_context;
+	pass_context.instantiate();
+	pass_context->setup(
+			const_cast<RenderDataRD *>(p_render_data),
+			[&](int p_operation) { run_builtin_operation(p_operation); },
+			[&](int p_stage) { stage_effects(RSE::CompositorEffectCallbackType(p_stage)); },
+			pipeline_parameters,
+			[&](const StringName &p_texture) { _present_frame(p_render_data, p_texture); });
+
 	if (explicit_pipeline) {
 		for (int slot = 0; slot < pipeline.size(); slot++) {
 			const int token = pipeline[slot];
-			const String pass_name = pipeline_names.size() == pipeline.size() && !pipeline_names[slot].is_empty() ? pipeline_names[slot] : (token >= 0 ? String(builtin_pass_names[token]) : "Custom Pass " + itos(-int64_t(token) - 1));
+			const String pass_name = pipeline_names.size() == pipeline.size() && !pipeline_names[slot].is_empty() ? pipeline_names[slot] : (token >= 0 ? String(FRPPipelineSpec::native_pass_name(token)) : "Custom Pass " + itos(-int64_t(token) - 1));
 			// A user-authored pass boundary is an execution dependency, even if
 			// adjacent passes touch unrelated resources. Keep graph optimizations
 			// inside each pass without moving work across the configured order.
@@ -2880,10 +2751,19 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 			}
 			Callable callback = pipeline_storage->compositor_effect_get_callback(effect);
-			Array arguments;
-			arguments.push_back(pipeline_storage->compositor_effect_get_callback_type(effect));
-			arguments.push_back(p_render_data);
-			callback.callv(arguments);
+			Object *callback_object = callback.get_object();
+			if (callback_object != nullptr && callback_object->has_method("_frp_execute")) {
+				// A pass that knows the FRP Core drives the frame itself. Everything
+				// else keeps using the CompositorEffect callback contract.
+				Array arguments;
+				arguments.push_back(pass_context);
+				callback_object->callv("_frp_execute", arguments);
+			} else {
+				Array arguments;
+				arguments.push_back(pipeline_storage->compositor_effect_get_callback_type(effect));
+				arguments.push_back(p_render_data);
+				callback.callv(arguments);
+			}
 			if (use_msaa && pipeline_storage->compositor_effect_get_flag(effect, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_COLOR)) {
 				// Keep later geometry and resolves from overwriting custom color
 				// writes with an older multisample attachment.
@@ -2893,37 +2773,25 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 		RD::get_singleton()->draw_command_insert_ordering_barrier();
 	} else {
-		// VT Pass is deliberately first so registered material-page producers
-		// finish their GPU work before any G-buffer draw can consume it.
+		// Default order used when no explicit schedule is configured. The order,
+		// names and dependency constraints all come from FRPPipelineSpec, so the
+		// renderer, the validator and FengRenderer cannot disagree.
 		const bool pinned_pass_order = _capture_tool_attached();
 		if (pinned_pass_order) {
 			RD::get_singleton()->draw_command_insert_ordering_barrier();
 		}
-		run_builtin_pass(16, builtin_pass_names[16]);
-		for (int pass = 0; pass < 16; pass++) {
+		for (int i = 0; i < FRPPipelineSpec::DEFAULT_PASS_ORDER_COUNT; i++) {
+			const int pass = FRPPipelineSpec::DEFAULT_PASS_ORDER[i];
 			if (pinned_pass_order) {
 				RD::get_singleton()->draw_command_insert_ordering_barrier();
 			}
-			run_builtin_pass(pass, builtin_pass_names[pass]);
+			run_builtin_pass(pass, FRPPipelineSpec::native_pass_name(pass));
 		}
 	}
 
 	if (rb_data.is_valid()) {
 		_render_buffers_debug_draw(p_render_data);
 
-		if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			Vector<RID> view_rids;
-
-			// SDFGI renders at internal resolution, need to check if our debug correctly supports outputting upscaled.
-			Size2i size = rb->get_internal_size();
-			RID source_texture = rb->get_internal_texture();
-			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-				view_rids.push_back(rb->get_internal_texture(v));
-			}
-
-			sdfgi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
-		}
 	}
 }
 
@@ -2939,18 +2807,6 @@ void RenderFRPClustered::_render_buffers_debug_draw(const RenderDataRD *p_render
 	RendererSceneRenderRD::_render_buffers_debug_draw(p_render_data);
 
 	RID render_target = rb->get_render_target();
-
-	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SSAO && rb->has_texture(RB_SCOPE_SSAO, RB_FINAL)) {
-		RID final = rb->get_texture_slice(RB_SCOPE_SSAO, RB_FINAL, 0, 0);
-		Size2i rtsize = texture_storage->render_target_get_size(render_target);
-		copy_effects->copy_to_fb_rect(final, texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, true);
-	}
-
-	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SSIL && rb->has_texture(RB_SCOPE_SSIL, RB_FINAL)) {
-		RID final = rb->get_texture_slice(RB_SCOPE_SSIL, RB_FINAL, 0, 0);
-		Size2i rtsize = texture_storage->render_target_get_size(render_target);
-		copy_effects->copy_to_fb_rect(final, texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, false);
-	}
 
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_GI_BUFFER && rb->has_texture(RB_SCOPE_GI, RB_TEX_AMBIENT)) {
 		Size2i rtsize = texture_storage->render_target_get_size(render_target);
@@ -3202,7 +3058,7 @@ void RenderFRPClustered::_render_shadow_append(RID p_framebuffer, const PagedArr
 	PassMode pass_mode = p_use_dp ? PASS_MODE_SHADOW_DP : PASS_MODE_SHADOW;
 
 	uint32_t render_list_from = render_list[RENDER_LIST_SECONDARY].elements.size();
-	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode, false, false, false, true);
+	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode, false, false, true);
 	uint32_t render_list_size = render_list[RENDER_LIST_SECONDARY].elements.size() - render_list_from;
 	render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
 	_fill_instance_data(RENDER_LIST_SECONDARY, p_render_info ? p_render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW] : (int *)nullptr, render_list_from, render_list_size, false);
@@ -3454,87 +3310,6 @@ void RenderFRPClustered::_render_uv2(const PagedArray<RenderGeometryInstance *> 
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderFRPClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, const RID &p_albedo_texture, const RID &p_emission_texture, const RID &p_emission_aniso_texture, const RID &p_geom_facing_texture, float p_exposure_normalization) {
-	RENDER_TIMESTAMP("Render SDFGI");
-
-	RD::get_singleton()->draw_command_begin_label("Render SDFGI Voxel");
-
-	RenderSceneDataRD scene_data;
-
-	RenderDataRD render_data;
-	render_data.scene_data = &scene_data;
-	render_data.cluster_size = 1;
-	render_data.cluster_max_elements = 32;
-	render_data.instances = &p_instances;
-
-	_update_render_base_uniform_set();
-
-	// Indicate pipelines for SDFGI are required.
-	global_pipeline_data_required.use_sdfgi = true;
-
-	PassMode pass_mode = PASS_MODE_SDF;
-	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode);
-	render_list[RENDER_LIST_SECONDARY].sort_by_key();
-	_fill_instance_data(RENDER_LIST_SECONDARY);
-
-	Vector3 half_size = p_bounds.size * 0.5;
-	Vector3 center = p_bounds.position + half_size;
-
-	//print_line("re-render " + p_from + " - " + p_size + " bounds " + p_bounds);
-	for (int i = 0; i < 3; i++) {
-		scene_state.ubo.sdf_offset[i] = p_from[i];
-		scene_state.ubo.sdf_size[i] = p_size[i];
-	}
-
-	for (int i = 0; i < 3; i++) {
-		Vector3 axis;
-		axis[i] = 1.0;
-		Vector3 up, right;
-		int right_axis = (i + 1) % 3;
-		int up_axis = (i + 2) % 3;
-		up[up_axis] = 1.0;
-		right[right_axis] = 1.0;
-
-		Size2i fb_size;
-		fb_size.x = p_size[right_axis];
-		fb_size.y = p_size[up_axis];
-
-		scene_data.cam_transform.origin = center + axis * half_size;
-		scene_data.cam_transform.basis.set_column(0, right);
-		scene_data.cam_transform.basis.set_column(1, up);
-		scene_data.cam_transform.basis.set_column(2, axis);
-
-		//print_line("pass: " + itos(i) + " xform " + scene_data.cam_transform);
-
-		float h_size = half_size[right_axis];
-		float v_size = half_size[up_axis];
-		float d_size = half_size[i] * 2.0;
-		scene_data.cam_projection.set_orthogonal(-h_size, h_size, -v_size, v_size, 0, d_size);
-		//print_line("pass: " + itos(i) + " cam hsize: " + rtos(h_size) + " vsize: " + rtos(v_size) + " dsize " + rtos(d_size));
-
-		Transform3D to_bounds;
-		to_bounds.origin = p_bounds.position;
-		to_bounds.basis.scale(p_bounds.size);
-
-		RendererRD::MaterialStorage::store_transform(to_bounds.affine_inverse() * scene_data.cam_transform, scene_state.ubo.sdf_to_bounds);
-
-		scene_data.emissive_exposure_normalization = p_exposure_normalization;
-		uint32_t uniform_buffer_index = _setup_environment(&render_data, true, fb_size, fb_size, Color());
-
-		RID rp_uniform_set = _setup_sdfgi_render_pass_uniform_set(p_albedo_texture, p_emission_texture, p_emission_aniso_texture, p_geom_facing_texture, RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default(), uniform_buffer_index);
-
-		HashMap<Size2i, RID>::Iterator E = sdfgi_framebuffer_size_cache.find(fb_size);
-		if (!E) {
-			RID fb = RD::get_singleton()->framebuffer_create_empty(fb_size);
-			E = sdfgi_framebuffer_size_cache.insert(fb_size, fb);
-		}
-
-		RenderListParameters render_list_params(render_list[RENDER_LIST_SECONDARY].elements.ptr(), render_list[RENDER_LIST_SECONDARY].element_info.ptr(), render_list[RENDER_LIST_SECONDARY].elements.size(), true, pass_mode, 0, true, false, rp_uniform_set, false);
-		_render_list_with_draw_list(&render_list_params, E->value);
-	}
-
-	RD::get_singleton()->draw_command_end_label();
-}
 
 void RenderFRPClustered::base_uniforms_changed() {
 	if (!render_base_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_base_uniform_set)) {
@@ -3645,13 +3420,8 @@ void RenderFRPClustered::_update_render_base_uniform_set() {
 			uniforms.push_back(u);
 		}
 
-		{
-			RD::Uniform u;
-			u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
-			u.binding = 14;
-			u.append_id(sdfgi_get_ubo());
-			uniforms.push_back(u);
-		}
+		// Binding 14 (the SDFGI data buffer) is gone: FRP has no global illumination
+		// and its shaders no longer declare that uniform block.
 
 		{
 			RD::Uniform u;
@@ -3891,26 +3661,6 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 		RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 7, textures);
 		uniforms.push_back(u);
 	}
-	if (p_lighting_shader.is_null()) {
-		RD::Uniform u;
-		u.binding = 8;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID default_tex = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
-		for (int i = 0; i < MAX_VOXEL_GI_INSTANCESS; i++) {
-			if (p_render_data && i < (int)p_render_data->voxel_gi_instances->size()) {
-				RID tex = gi.voxel_gi_instance_get_texture((*p_render_data->voxel_gi_instances)[i]);
-				if (!tex.is_valid()) {
-					tex = default_tex;
-				}
-				u.append_id(tex);
-			} else {
-				u.append_id(default_tex);
-			}
-		}
-
-		uniforms.push_back(u);
-	}
-
 	{
 		RD::Uniform u;
 		u.binding = 9;
@@ -4025,74 +3775,12 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 	}
 
 	{
-		RD::Uniform u;
-		u.binding = 27;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID aot = rb.is_valid() && rb->has_texture(RB_SCOPE_SSAO, RB_FINAL) ? rb->get_texture(RB_SCOPE_SSAO, RB_FINAL) : RID();
-		RID texture = aot.is_valid() ? aot : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
-		uniforms.push_back(u);
+		// Binding 27 (ambient occlusion), 28/29 (GI ambient/reflection), 30/31 (SDFGI
+		// lightprobe/occlusion), 32 (VoxelGI instances) and 34/35/36 (SSIL/SSR) are
+		// intentionally absent: FRP has no screen space effects and no global
+		// illumination, and its shaders no longer declare those bindings.
 	}
 
-	{
-		RD::Uniform u;
-		u.binding = 28;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID texture = rb_data.is_valid() && rb->has_texture(RB_SCOPE_GI, RB_TEX_AMBIENT) ? rb->get_texture(RB_SCOPE_GI, RB_TEX_AMBIENT) : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-
-	{
-		RD::Uniform u;
-		u.binding = 29;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID texture = rb_data.is_valid() && rb->has_texture(RB_SCOPE_GI, RB_TEX_REFLECTION) ? rb->get_texture(RB_SCOPE_GI, RB_TEX_REFLECTION) : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-	if (p_lighting_shader.is_null()) {
-		RD::Uniform u;
-		u.binding = 30;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID t;
-		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			t = sdfgi->lightprobe_texture;
-		}
-		if (t.is_null()) {
-			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE);
-		}
-		u.append_id(t);
-		uniforms.push_back(u);
-	}
-	if (p_lighting_shader.is_null()) {
-		RD::Uniform u;
-		u.binding = 31;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID t;
-		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			t = sdfgi->occlusion_texture;
-		}
-		if (t.is_null()) {
-			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
-		}
-		u.append_id(t);
-		uniforms.push_back(u);
-	}
-	if (p_lighting_shader.is_null()) {
-		RD::Uniform u;
-		u.binding = 32;
-		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
-		RID voxel_gi;
-		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_GI)) {
-			Ref<RendererRD::GI::RenderBuffersGI> rbgi = rb->get_custom_data(RB_SCOPE_GI);
-			voxel_gi = rbgi->get_voxel_gi_buffer();
-		}
-		u.append_id(voxel_gi.is_valid() ? voxel_gi : render_buffers_get_default_voxel_gi_buffer());
-		uniforms.push_back(u);
-	}
 	if (p_lighting_shader.is_null()) {
 		RD::Uniform u;
 		u.binding = 33;
@@ -4108,47 +3796,6 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 			vfog = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 		}
 		u.append_id(vfog);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.binding = 34;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID ssil = rb.is_valid() && rb->has_texture(RB_SCOPE_SSIL, RB_FINAL) ? rb->get_texture(RB_SCOPE_SSIL, RB_FINAL) : RID();
-		RID texture = ssil.is_valid() ? ssil : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.binding = 35;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-
-		RID ssr;
-		if (rb_data.is_valid()) {
-			if (rb_data->ss_effects_data.ssr.half_size) {
-				if (rb->has_texture(RB_SCOPE_SSR, RB_FINAL)) {
-					ssr = rb->get_texture(RB_SCOPE_SSR, RB_FINAL);
-				}
-			} else {
-				if (rb->has_texture(RB_SCOPE_SSR, RB_SSR)) {
-					ssr = rb->get_texture(RB_SCOPE_SSR, RB_SSR);
-				}
-			}
-		}
-
-		RID texture = ssr.is_valid() ? ssr : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.binding = 36;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-
-		RID ssr_mip_level = (rb_data.is_valid() && !rb_data->ss_effects_data.ssr.half_size && rb->has_texture(RB_SCOPE_SSR, RB_MIP_LEVEL)) ? rb->get_texture(RB_SCOPE_SSR, RB_MIP_LEVEL) : RID();
-		RID texture = ssr_mip_level.is_valid() ? ssr_mip_level : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		u.append_id(texture);
 		uniforms.push_back(u);
 	}
 
@@ -4186,219 +3833,6 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(p_lighting_shader, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
-RID RenderFRPClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index) {
-	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
-	thread_local LocalVector<RD::Uniform> uniforms;
-	uniforms.clear();
-
-	{
-		RD::Uniform u;
-		u.binding = 0;
-		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
-		u.append_id(scene_state.uniform_buffers[p_uniform_buffer_index]);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.binding = 1;
-		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
-		u.append_id(scene_state.implementation_uniform_buffers[p_uniform_buffer_index]);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.binding = 2;
-		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
-		if (scene_state.instance_buffer[RENDER_LIST_SECONDARY].get_size(0u) == 0u) {
-			// Any buffer will do since it's not used, so just create one.
-			// We can't use scene_shader.default_vec4_xform_buffer because it's not dynamic.
-			scene_state.instance_buffer[RENDER_LIST_SECONDARY].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::InstanceData));
-			scene_state.instance_buffer[RENDER_LIST_SECONDARY].prepare_for_upload();
-		}
-		RID instance_buffer = scene_state.instance_buffer[RENDER_LIST_SECONDARY]._get(0u);
-		u.append_id(instance_buffer);
-		uniforms.push_back(u);
-	}
-	{
-		// No radiance texture.
-		RID radiance_texture = texture_storage->texture_rd_get_default(is_using_radiance_octmap_array() ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-		RD::Uniform u;
-		u.binding = 3;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		u.append_id(radiance_texture);
-		uniforms.push_back(u);
-	}
-
-	{
-		// No reflection atlas.
-		RID ref_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
-		RD::Uniform u;
-		u.binding = 4;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		u.append_id(ref_texture);
-		uniforms.push_back(u);
-	}
-
-	{
-		// No shadow atlas.
-		RD::Uniform u;
-		u.binding = 5;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-
-	{
-		// No directional shadow atlas.
-		RD::Uniform u;
-		u.binding = 6;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
-		u.append_id(texture);
-		uniforms.push_back(u);
-	}
-
-	{
-		// No Lightmaps
-		RD::Uniform u;
-		u.binding = 7;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-
-		RID default_tex = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE);
-		for (uint32_t i = 0; i < scene_state.max_lightmaps * 2; i++) {
-			u.append_id(default_tex);
-		}
-
-		uniforms.push_back(u);
-	}
-
-	{
-		// No VoxelGIs
-		RD::Uniform u;
-		u.binding = 8;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-
-		RID default_tex = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
-		for (int i = 0; i < MAX_VOXEL_GI_INSTANCESS; i++) {
-			u.append_id(default_tex);
-		}
-
-		uniforms.push_back(u);
-	}
-
-	{
-		RD::Uniform u;
-		u.binding = 9;
-		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-		RID cb = scene_shader.default_vec4_xform_buffer;
-		u.append_id(cb);
-		uniforms.push_back(u);
-	}
-
-	{
-		RD::Uniform u;
-		u.binding = 10;
-		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
-		RID sampler;
-		switch (decals_get_filter()) {
-			case RSE::DECAL_FILTER_NEAREST: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::DECAL_FILTER_LINEAR: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::DECAL_FILTER_NEAREST_MIPMAPS: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::DECAL_FILTER_LINEAR_MIPMAPS: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::DECAL_FILTER_NEAREST_MIPMAPS_ANISOTROPIC: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::DECAL_FILTER_LINEAR_MIPMAPS_ANISOTROPIC: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-		}
-
-		u.append_id(sampler);
-		uniforms.push_back(u);
-	}
-
-	{
-		RD::Uniform u;
-		u.binding = 11;
-		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
-		RID sampler;
-		switch (light_projectors_get_filter()) {
-			case RSE::LIGHT_PROJECTOR_FILTER_NEAREST: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::LIGHT_PROJECTOR_FILTER_LINEAR: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::LIGHT_PROJECTOR_FILTER_NEAREST_MIPMAPS: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::LIGHT_PROJECTOR_FILTER_LINEAR_MIPMAPS: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::LIGHT_PROJECTOR_FILTER_NEAREST_MIPMAPS_ANISOTROPIC: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-			case RSE::LIGHT_PROJECTOR_FILTER_LINEAR_MIPMAPS_ANISOTROPIC: {
-				sampler = p_samplers.get_sampler(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
-			} break;
-		}
-
-		u.append_id(sampler);
-		uniforms.push_back(u);
-	}
-
-	p_samplers.append_uniforms(uniforms, 12);
-
-	// actual sdfgi stuff
-
-	{
-		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
-		u.binding = 24;
-		u.append_id(p_albedo_texture);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
-		u.binding = 25;
-		u.append_id(p_emission_texture);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
-		u.binding = 26;
-		u.append_id(p_emission_aniso_texture);
-		uniforms.push_back(u);
-	}
-	{
-		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
-		u.binding = 27;
-		u.append_id(p_geom_facing_texture);
-		uniforms.push_back(u);
-	}
-
-	if (scene_shader.default_shader_sdfgi_rd.is_null()) {
-		// The variant for SDF from the default material should only be retrieved when SDFGI is required.
-		ERR_FAIL_NULL_V(scene_shader.default_material_shader_ptr, RID());
-		scene_shader.enable_advanced_shader_group();
-		scene_shader.default_shader_sdfgi_rd = scene_shader.default_material_shader_ptr->get_shader_variant(SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF, 0, true);
-		ERR_FAIL_COND_V(scene_shader.default_shader_sdfgi_rd.is_null(), RID());
-	}
-
-	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_sdfgi_rd, RENDER_PASS_UNIFORM_SET, uniforms);
-}
 
 RID RenderFRPClustered::_render_buffers_get_normal_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
 	Ref<RenderBufferDataFRPClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
@@ -4410,21 +3844,19 @@ RID RenderFRPClustered::_render_buffers_get_velocity_texture(Ref<RenderSceneBuff
 	return p_render_buffers->get_velocity_buffer(false);
 }
 
+// FRP has no screen space effects, so the quality knobs the engine forwards from the
+// Environment are accepted and ignored - the same thing RenderForwardMobile does. The
+// overrides have to exist (RendererSceneRender declares them pure virtual); doing
+// nothing is what keeps a project's SSAO / SSIL / SSR settings from changing an FRP
+// frame. Subsurface scattering keeps its own settings below, because that one is part
+// of the Lighting pass.
 void RenderFRPClustered::environment_set_ssao_quality(RSE::EnvironmentSSAOQuality p_quality, bool p_half_size, float p_adaptive_target, int p_blur_passes, float p_fadeout_from, float p_fadeout_to) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_quality < RSE::EnvironmentSSAOQuality::ENV_SSAO_QUALITY_VERY_LOW || p_quality > RSE::EnvironmentSSAOQuality::ENV_SSAO_QUALITY_ULTRA);
-	ss_effects->ssao_set_quality(p_quality, p_half_size, p_adaptive_target, p_blur_passes, p_fadeout_from, p_fadeout_to);
 }
 
 void RenderFRPClustered::environment_set_ssil_quality(RSE::EnvironmentSSILQuality p_quality, bool p_half_size, float p_adaptive_target, int p_blur_passes, float p_fadeout_from, float p_fadeout_to) {
-	ERR_FAIL_NULL(ss_effects);
-	ERR_FAIL_COND(p_quality < RSE::EnvironmentSSILQuality::ENV_SSIL_QUALITY_VERY_LOW || p_quality > RSE::EnvironmentSSILQuality::ENV_SSIL_QUALITY_ULTRA);
-	ss_effects->ssil_set_quality(p_quality, p_half_size, p_adaptive_target, p_blur_passes, p_fadeout_from, p_fadeout_to);
 }
 
 void RenderFRPClustered::environment_set_ssr_half_size(bool p_half_size) {
-	ERR_FAIL_NULL(ss_effects);
-	ss_effects->ssr_set_half_size(p_half_size);
 }
 
 void RenderFRPClustered::environment_set_ssr_roughness_quality(RSE::EnvironmentSSRRoughnessQuality p_quality) {
@@ -4444,104 +3876,9 @@ void RenderFRPClustered::sub_surface_scattering_set_scale(float p_scale, float p
 
 RenderFRPClustered *RenderFRPClustered::singleton = nullptr;
 
-void RenderFRPClustered::sdfgi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) {
-	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
-	ERR_FAIL_COND(rb.is_null());
-	Ref<RendererRD::GI::SDFGI> sdfgi;
-	if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-	}
 
-	bool needs_sdfgi = p_environment.is_valid() && environment_get_sdfgi_enabled(p_environment);
-	bool needs_reset = sdfgi.is_valid() ? sdfgi->version != gi.sdfgi_current_version : false;
 
-	if (!needs_sdfgi || needs_reset) {
-		if (sdfgi.is_valid()) {
-			// delete it
-			sdfgi.unref();
-			rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
-		}
 
-		if (!needs_sdfgi) {
-			return;
-		}
-	}
-
-	// Ensure advanced shaders are available if SDFGI is used.
-	// Call here as this is the first entry point for SDFGI.
-	scene_shader.enable_advanced_shader_group();
-
-	static const uint32_t history_frames_to_converge[RSE::ENV_SDFGI_CONVERGE_MAX] = { 5, 10, 15, 20, 25, 30 };
-	uint32_t requested_history_size = history_frames_to_converge[gi.sdfgi_frames_to_converge];
-
-	if (sdfgi.is_valid() && (sdfgi->num_cascades != environment_get_sdfgi_cascades(p_environment) || sdfgi->min_cell_size != environment_get_sdfgi_min_cell_size(p_environment) || requested_history_size != sdfgi->history_size || sdfgi->uses_occlusion != environment_get_sdfgi_use_occlusion(p_environment) || sdfgi->y_scale_mode != environment_get_sdfgi_y_scale(p_environment))) {
-		//configuration changed, erase
-		sdfgi.unref();
-		rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
-	}
-
-	if (sdfgi.is_null()) {
-		// re-create
-		sdfgi = gi.create_sdfgi(p_environment, p_world_position, requested_history_size);
-		rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
-	} else {
-		//check for updates
-		sdfgi->update(p_environment, p_world_position);
-	}
-}
-
-int RenderFRPClustered::sdfgi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const {
-	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
-	ERR_FAIL_COND_V(rb.is_null(), 0);
-
-	if (!rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		return 0;
-	}
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-
-	int dirty_count = 0;
-	for (const RendererRD::GI::SDFGI::Cascade &c : sdfgi->cascades) {
-		if (c.dirty_regions == RendererRD::GI::SDFGI::Cascade::DIRTY_ALL) {
-			dirty_count++;
-		} else {
-			for (int j = 0; j < 3; j++) {
-				if (c.dirty_regions[j] != 0) {
-					dirty_count++;
-				}
-			}
-		}
-	}
-
-	return dirty_count;
-}
-
-AABB RenderFRPClustered::sdfgi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
-	AABB bounds;
-	Vector3i from;
-	Vector3i size;
-
-	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
-	ERR_FAIL_COND_V(rb.is_null(), AABB());
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-	ERR_FAIL_COND_V(sdfgi.is_null(), AABB());
-
-	int c = sdfgi->get_pending_region_data(p_region, from, size, bounds);
-	ERR_FAIL_COND_V(c == -1, AABB());
-	return bounds;
-}
-
-uint32_t RenderFRPClustered::sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
-	AABB bounds;
-	Vector3i from;
-	Vector3i size;
-
-	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
-	ERR_FAIL_COND_V(rb.is_null(), -1);
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-	ERR_FAIL_COND_V(sdfgi.is_null(), -1);
-
-	return sdfgi->get_pending_region_data(p_region, from, size, bounds);
-}
 
 void RenderFRPClustered::GeometryInstanceFRPClustered::_mark_dirty() {
 	if (dirty_list_element.in_list()) {
@@ -4690,7 +4027,8 @@ void RenderFRPClustered::_geometry_instance_add_surface_with_material(GeometryIn
 	sdcache->sort.material_id_lo = (p_material_id & 0x00FFFFFF);
 	sdcache->sort.shader_id = p_shader_id;
 	sdcache->sort.geometry_id = p_mesh.get_local_index(); //only meshes can repeat anyway
-	sdcache->sort.uses_forward_gi = ginstance->can_sdfgi;
+	// FRP has no global illumination, so no surface is ever a forward GI surface.
+	sdcache->sort.uses_forward_gi = 0;
 	sdcache->sort.priority = p_material->priority;
 	sdcache->sort.uses_projector = ginstance->using_projectors;
 	sdcache->sort.uses_softshadow = ginstance->using_softshadows;
@@ -4918,14 +4256,6 @@ void RenderFRPClustered::_geometry_instance_update(RenderGeometryInstance *p_geo
 	}
 
 	ginstance->store_transform_cache = store_transform;
-	ginstance->can_sdfgi = false;
-
-	if (!RendererRD::LightStorage::get_singleton()->lightmap_instance_is_valid(ginstance->lightmap_instance)) {
-		if (ginstance->voxel_gi_instances[0].is_null() && (ginstance->data->use_baked_light || ginstance->data->use_dynamic_gi)) {
-			ginstance->can_sdfgi = true;
-		}
-	}
-
 	if (ginstance->data->dirty_dependencies) {
 		ginstance->data->dependency_tracker.update_end();
 		ginstance->data->dirty_dependencies = false;
@@ -5001,7 +4331,7 @@ static RD::FramebufferFormatID _get_reflection_probe_color_framebuffer_format_fo
 	return RD::get_singleton()->framebuffer_format_create(attachments);
 }
 
-static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p_can_be_storage, RD::TextureSamples p_samples, bool p_normal_roughness, bool p_voxelgi) {
+static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p_can_be_storage, RD::TextureSamples p_samples, bool p_normal_roughness) {
 	const bool multisampling = p_samples > RD::TEXTURE_SAMPLES_1;
 	RD::AttachmentFormat attachment;
 	attachment.samples = p_samples;
@@ -5016,12 +4346,6 @@ static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p
 	if (p_normal_roughness) {
 		attachment.format = RenderFRPClustered::RenderBufferDataFRPClustered::get_normal_roughness_format();
 		attachment.usage_flags = RenderFRPClustered::RenderBufferDataFRPClustered::get_normal_roughness_usage_bits(false, multisampling, p_can_be_storage);
-		attachments.push_back(attachment);
-	}
-
-	if (p_voxelgi) {
-		attachment.format = RenderFRPClustered::RenderBufferDataFRPClustered::get_voxelgi_format();
-		attachment.usage_flags = RenderFRPClustered::RenderBufferDataFRPClustered::get_voxelgi_usage_bits(false, multisampling, p_can_be_storage);
 		attachments.push_back(attachment);
 	}
 
@@ -5176,32 +4500,14 @@ void RenderFRPClustered::_mesh_compile_pipelines_for_surface(const SurfacePipeli
 	if (p_global.use_normal_and_roughness) {
 		// A lot of different effects rely on normal and roughness being written to during the depth pass.
 		pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, false);
-		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
-	}
-
-	if (p_global.use_voxelgi) {
-		// Depth pass with VoxelGI support.
-		pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, true);
-		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
-	}
-
-	if (p_global.use_sdfgi) {
-		// Depth pass with SDFGI support.
-		pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false);
-		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
-
-		// Depth pass with SDFGI support for an empty framebuffer.
-		pipeline_key.framebuffer_format_id = RD::get_singleton()->framebuffer_format_create_empty();
+		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
 	// The dedicated depth passes use a different version of the surface and the shader.
 	pipeline_key.primitive_type = mesh_storage->mesh_surface_get_primitive(p_surface.mesh_surface_shadow);
 	pipeline_key.version = SceneShaderFRPClustered::PIPELINE_VERSION_DEPTH_PASS;
-	pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false);
+	pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false);
 	_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
 	if (p_global.use_shadow_dual_paraboloid) {
@@ -5470,26 +4776,13 @@ void RenderFRPClustered::enable_features(BitField<FeatureBits> p_feature_bits) {
 	}
 
 	if (p_feature_bits.has_flag(FEATURE_VRS_BIT)) {
-		gi.enable_vrs_shader_group();
+		// FRP has no VRS-dependent GI shader to enable here; the scene shader group is
+		// the only one FRP compiles.
 	}
 }
 
 String RenderFRPClustered::get_name() const {
 	return "frp_clustered";
-}
-
-void RenderFRPClustered::GeometryInstanceFRPClustered::pair_voxel_gi_instances(const RID *p_voxel_gi_instances, uint32_t p_voxel_gi_instance_count) {
-	if (p_voxel_gi_instance_count > 0) {
-		voxel_gi_instances[0] = p_voxel_gi_instances[0];
-	} else {
-		voxel_gi_instances[0] = RID();
-	}
-
-	if (p_voxel_gi_instance_count > 1) {
-		voxel_gi_instances[1] = p_voxel_gi_instances[1];
-	} else {
-		voxel_gi_instances[1] = RID();
-	}
 }
 
 void RenderFRPClustered::GeometryInstanceFRPClustered::set_softshadow_projector_pairing(bool p_softshadow, bool p_projector) {
@@ -5532,7 +4825,6 @@ RenderFRPClustered::RenderFRPClustered() {
 		if (is_using_radiance_octmap_array()) {
 			defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
-		defines += "\n#define SDFGI_OCT_SIZE " + itos(gi.sdfgi_get_lightprobe_octahedron_size()) + "\n";
 		defines += "\n#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS " + itos(MAX_DIRECTIONAL_LIGHTS) + "\n";
 
 		bool force_vertex_shading = GLOBAL_GET("rendering/shading/overrides/force_vertex_shading");
@@ -5661,7 +4953,6 @@ RenderFRPClustered::RenderFRPClustered() {
 		if (is_using_radiance_octmap_array()) {
 			defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
-		defines += "\n#define SDFGI_OCT_SIZE " + itos(gi.sdfgi_get_lightprobe_octahedron_size()) + "\n";
 		defines += "\n#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS " + itos(MAX_DIRECTIONAL_LIGHTS) + "\n";
 		defines += "\n#define MAX_LIGHTMAP_TEXTURES " + itos(scene_state.max_lightmaps) + "\n";
 		defines += "\n#define MAX_LIGHTMAPS " + itos(scene_state.max_lightmaps) + "\n";
@@ -5692,6 +4983,13 @@ RenderFRPClustered::RenderFRPClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
+	{
+		Vector<String> modes;
+		modes.push_back("\n");
+		velocity_fill.shader.initialize(modes);
+		velocity_fill.shader_version = velocity_fill.shader.version_create();
+		velocity_fill.pipeline = RD::get_singleton()->compute_pipeline_create(velocity_fill.shader.version_get_shader(velocity_fill.shader_version, 0));
+	}
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
@@ -5729,6 +5027,9 @@ RenderFRPClustered::~RenderFRPClustered() {
 	RD::get_singleton()->free_rid(shadow_sampler);
 	RSG::light_storage->directional_shadow_atlas_set_size(0);
 
+	RD::get_singleton()->free_rid(velocity_fill.pipeline);
+	velocity_fill.shader.version_free(velocity_fill.shader_version);
+
 	RD::get_singleton()->free_rid(best_fit_normal.pipeline);
 	RD::get_singleton()->free_rid(best_fit_normal.texture);
 	best_fit_normal.shader.version_free(best_fit_normal.shader_version);
@@ -5761,8 +5062,4 @@ RenderFRPClustered::~RenderFRPClustered() {
 		memdelete_arr(scene_state.lightmap_captures);
 	}
 
-	while (sdfgi_framebuffer_size_cache.begin()) {
-		RD::get_singleton()->free_rid(sdfgi_framebuffer_size_cache.begin()->value);
-		sdfgi_framebuffer_size_cache.remove(sdfgi_framebuffer_size_cache.begin());
-	}
 }

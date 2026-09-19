@@ -147,6 +147,12 @@ class ScreenPaintPass extends FRP_BASE:
 		rd.draw_list_end()
 		rd.free_rid(framebuffer)
 
+## Default native execution order. It is the engine's pass id order: shadow maps
+## first (drawing them reads no scene depth and no material page), then the virtual
+## textures, the G-buffer, lighting, sky, transparent, temporal AA and post.
+const EXPECTED_NATIVE_ORDER := [0, 1, 2, 3, 4, 5, 6, 7]
+const EXPECTED_NATIVE_COUNT := 8
+
 func require(value: bool, message: String) -> void:
 	if not value:
 		push_error("REGRESSION: " + message)
@@ -244,9 +250,9 @@ func _set_renderer_passes(renderer: Object, native_values: Array[FRP_BASE], cust
 	var values: Array[FRP_BASE] = []
 	for value in native_values:
 		# Custom effects need to run while the internal color buffer exists. The
-		# temporal and tonemap operations are native 14 and 15, so put them just
+		# temporal and tonemap operations are native 6 and 7, so put them just
 		# before those operations by default.
-		if _native_id(value) == 14:
+		if _native_id(value) == 6:
 			values.append_array(custom_values)
 		values.append(value)
 	if custom_values.size() > 0 and not values.has(custom_values[0]):
@@ -588,32 +594,50 @@ func run() -> void:
 	# passes remain CompositorEffect-backed entries in the same list.
 	var unified_renderer = renderer_script2.new()
 	require(RenderingServer.has_method("compositor_set_frp_pipeline"), "engine does not expose compositor_set_frp_pipeline")
+	require(RenderingServer.has_method("get_frp_pipeline_spec"), "engine does not expose get_frp_pipeline_spec")
+	var spec: Dictionary = RenderingServer.call("get_frp_pipeline_spec")
+	require(spec.get("passes", []).size() == EXPECTED_NATIVE_COUNT, "engine native pass spec does not list %d passes" % EXPECTED_NATIVE_COUNT)
+	require(int(spec.get("pass_count", 0)) == EXPECTED_NATIVE_COUNT, "engine native pass spec reports the wrong pass count")
+	require(spec.get("mandatory", []) == [0, 1, 2, 3, 7], "engine native pass spec does not list the five mandatory passes: %s" % [spec.get("mandatory", [])])
+	require(not spec.get("edges", []).is_empty(), "engine native pass spec has no dependency edges")
+	require(spec.get("default_order", []).size() == EXPECTED_NATIVE_COUNT, "engine native pass spec default order is incomplete")
 	require(RenderingServer.has_method("virtual_texture_set_update_callback"), "engine does not expose virtual texture callback registration")
 	require(RenderingServer.has_method("virtual_texture_remove_update_callback"), "engine does not expose virtual texture callback removal")
 	require(RenderingServer.has_method("execute_virtual_texture_updates"), "engine does not expose virtual texture callback execution")
 	var native_values: Array[FRP_BASE] = _native_passes(unified_renderer)
-	require(native_values.size() == 17, "renderer must expose all 17 native FRP passes, got %d" % native_values.size())
+	require(native_values.size() == EXPECTED_NATIVE_COUNT, "renderer must expose all %d native FRP passes, got %d" % [EXPECTED_NATIVE_COUNT, native_values.size()])
 	var expected_native_names := [
-		"gbuffer", "preparation", "lighting", "fallback", "motion", "resolve",
-		"debug", "sky", "resolve", "specular", "copy", "transparent",
-		"resolve", "history", "temporal", "tonemap", "vt pass",
+		"precompute", "vt pass", "gbuffer", "lighting", "sky", "transparent",
+		"temporal", "tonemap",
 	]
 	var native_ids := {}
 	for value in native_values:
 		var id := _native_id(value)
-		require(id >= 0 and id < 17, "native pass id out of range: %s" % id)
+		require(id >= 0 and id < EXPECTED_NATIVE_COUNT, "native pass id out of range: %s" % id)
 		require(not native_ids.has(id), "duplicate native pass id: %s" % id)
 		native_ids[id] = value
-	for id in 17:
+	for id in EXPECTED_NATIVE_COUNT:
 		require(native_ids.has(id), "missing native pass id %d" % id)
 		var label := _pass_label(native_ids[id]).to_lower()
 		require(not label.is_empty(), "native pass %d has no display name" % id)
 		require(label.contains(expected_native_names[id]), "native pass %d has wrong display name '%s'" % [id, label])
-	# VT Pass is the only new entry and is authored before the stable 0..15
-	# sequence. Existing native ids retain their relative order.
-	require(_native_id(native_values[0]) == 16, "VT Pass must precede GBuffer")
-	for i in range(1, native_values.size()):
-		require(_native_id(native_values[i]) == i - 1, "default native order changed at index %d" % i)
+	# Id order is execution order: the shadow maps first, then virtual textures, the
+	# G-buffer, lighting, sky, transparent, temporal AA and post.
+	require(native_values.size() == EXPECTED_NATIVE_ORDER.size(), "unexpected native pass count: %d" % native_values.size())
+	for i in native_values.size():
+		require(_native_id(native_values[i]) == EXPECTED_NATIVE_ORDER[i], "default native order changed at index %d: got %d, expected %d" % [i, _native_id(native_values[i]), EXPECTED_NATIVE_ORDER[i]])
+	# The engine's default order (used when no pipeline resource is configured) is the
+	# same list, so a project with and without the addon runs the same frame.
+	var spec_default_order: Array = spec.get("default_order", [])
+	require(spec_default_order == EXPECTED_NATIVE_ORDER, "the engine's default pass order is not the id order: %s" % [spec_default_order])
+	# The default enabled set is the default pass set: every non optional entry is
+	# enabled and the one optional entry (Temporal AA) ships disabled, so a fresh
+	# pipeline runs the default passes and the user opts into TAA by enabling it.
+	var enabled_native_ids := []
+	for value in native_values:
+		if value.enabled:
+			enabled_native_ids.append(_native_id(value))
+	require(enabled_native_ids == [0, 1, 2, 3, 4, 5, 7], "default enabled pass set changed: %s" % [enabled_native_ids])
 
 	var manifest_property := ""
 	for candidate in ["_synced_library", "library_manifest", "_library_manifest"]:
@@ -622,12 +646,17 @@ func run() -> void:
 			break
 	require(not manifest_property.is_empty(), "renderer has no persisted library manifest")
 	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
-	require(manifest.size() >= 8, "renderer library manifest lost built-in entries: %s" % [manifest])
+	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
+		"renderer library manifest lost Color Grade: %s" % [manifest])
+	# The seeded library set is Color Grade only: the default pipeline is the engine's
+	# eight entries plus that ninth pass, and the other templates are opt-in.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
 			library_entries.append(value)
-	require(library_entries.size() >= 8, "renderer did not instantiate the eight library shader passes")
+	require(library_entries.size() == 1, "the default pipeline must seed only Color Grade, got %d library entries" % library_entries.size())
+	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 1,
+		"the default pipeline must be the engine's passes plus Color Grade, got %d entries" % unified_renderer.passes.size())
 
 	# Save and load a renderer, then simulate an older resource whose final
 	# library entry was absent. Applying it must insert the missing template
@@ -639,7 +668,7 @@ func run() -> void:
 	require(loaded_renderer != null, "unified renderer resource did not load")
 	var loaded_manifest: Array = _read_property(loaded_renderer, manifest_property, [])
 	require(not loaded_manifest.is_empty(), "loaded renderer library manifest is empty")
-	var missing_library_path := "fxaa/fxaa.tres"
+	var missing_library_path := "color-grade/color_grade.tres"
 	var loaded_values: Array[FRP_BASE] = []
 	var removed_library := false
 	var missing_library_id := ""
@@ -678,31 +707,37 @@ func run() -> void:
 	require(before_sync_count == 0 and after_sync_count == 1, "library sync did not insert one missing pass: %d -> %d" % [before_sync_count, after_sync_count])
 	var surviving: Array[FRP_BASE] = []
 	var inserted_index := -1
-	var following_index := -1
+	var temporal_index := -1
+	var post_index := -1
 	for i in loaded_renderer.passes.size():
 		var entry = loaded_renderer.passes[i]
 		if _library_matches(entry, missing_library_path):
 			inserted_index = i
 		else:
 			surviving.append(entry)
-		if _library_matches(entry, "color-grade/color_grade.tres"):
-			following_index = i
+		if _native_id(entry) == 6:
+			temporal_index = i
+		if _native_id(entry) == 7:
+			post_index = i
 	require(surviving == loaded_values, "library sync reordered existing entries")
-	require(inserted_index >= 0 and inserted_index < following_index, "new middle library entry was appended instead of anchored")
+	# Color Grade is the pipeline's ninth pass: sync has to put it back between
+	# Temporal AA and Post Process, not at the end of the list.
+	require(inserted_index >= 0 and temporal_index < inserted_index and inserted_index < post_index,
+		"the re-synced Color Grade pass was not anchored between Temporal AA and Post Process (temporal %d, color grade %d, post %d)" % [temporal_index, inserted_index, post_index])
 	print("PASS unified native ids/names/order and saved library sync")
 
 	# A newly authored resource must persist native enabled state and the
-	# position of a custom library pass across a save/load boundary.
+	# position of the seeded library pass across a save/load boundary.
 	var persisted_renderer = renderer_script2.new()
 	var persisted_values: Array[FRP_BASE] = _native_schedule_base(persisted_renderer)
-	var persisted_tint = null
+	var persisted_grade = null
 	for value in persisted_values:
-		if _native_id(value) < 0 and _library_matches(value, "tint/tint.tres"):
-			persisted_tint = value
+		if _native_id(value) < 0 and _library_matches(value, "color-grade/color_grade.tres"):
+			persisted_grade = value
 			break
-	require(persisted_tint != null, "could not find library tint pass in new renderer")
-	persisted_tint.enabled = true
-	var persisted_lighting = _native_pass(persisted_renderer, 7)
+	require(persisted_grade != null, "could not find the library Color Grade pass in a new renderer")
+	persisted_grade.enabled = true
+	var persisted_lighting = _native_pass(persisted_renderer, 4)
 	require(persisted_lighting != null, "could not find native sky pass for persistence test")
 	persisted_lighting.enabled = false
 	persisted_renderer.passes = persisted_values
@@ -710,17 +745,21 @@ func run() -> void:
 	require(ResourceSaver.save(persisted_renderer, persisted_path) == OK, "new renderer resource did not save state")
 	var reloaded_renderer = ResourceLoader.load(persisted_path, "", ResourceLoader.CACHE_MODE_IGNORE)
 	require(reloaded_renderer != null, "new renderer resource did not reload state")
-	var reloaded_sky = _native_pass(reloaded_renderer, 7)
+	var reloaded_sky = _native_pass(reloaded_renderer, 4)
 	require(reloaded_sky != null and not reloaded_sky.enabled, "native enabled state was not persisted")
-	var reloaded_tint_index := -1
+	var reloaded_grade_index := -1
 	var reloaded_temporal_index := -1
+	var reloaded_post_index := -1
 	for i in reloaded_renderer.passes.size():
 		var value = reloaded_renderer.passes[i]
-		if _native_id(value) < 0 and _library_matches(value, "tint/tint.tres"):
-			reloaded_tint_index = i
-		if _native_id(value) == 14:
+		if _native_id(value) < 0 and _library_matches(value, "color-grade/color_grade.tres"):
+			reloaded_grade_index = i
+		if _native_id(value) == 6:
 			reloaded_temporal_index = i
-	require(reloaded_tint_index >= 0 and reloaded_temporal_index > reloaded_tint_index, "custom library pass position was not persisted")
+		if _native_id(value) == 7:
+			reloaded_post_index = i
+	require(reloaded_grade_index >= 0 and reloaded_temporal_index >= 0 and reloaded_post_index >= 0, "could not locate the library pass or the temporal/post entries")
+	require(reloaded_temporal_index < reloaded_grade_index and reloaded_grade_index < reloaded_post_index, "the library pass position was not persisted between temporal AA and post")
 	print("PASS renderer save/load preserves native state and custom order")
 
 	# Load a hand-authored legacy .tres with no schema version, only one custom
@@ -747,11 +786,11 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	require(legacy_renderer != null, "hand-authored legacy renderer did not load")
 	legacy_renderer.apply(compositor)
 	var migrated_native: Array[FRP_BASE] = _native_passes(legacy_renderer)
-	require(migrated_native.size() == 17, "legacy renderer migration did not restore native passes")
-	require(_native_id(migrated_native[0]) == 16, "legacy migration did not place VT Pass before GBuffer")
-	for i in range(1, migrated_native.size()):
+	require(migrated_native.size() == EXPECTED_NATIVE_COUNT, "legacy renderer migration did not restore native passes")
+	require(_native_id(migrated_native[0]) == 0, "legacy migration did not place Shadow Precompute first")
+	for i in migrated_native.size():
 		var native_id := _native_id(migrated_native[i])
-		require(native_id == i - 1, "legacy migration changed native order at %d" % i)
+		require(native_id == EXPECTED_NATIVE_ORDER[i], "legacy migration changed native order at %d: got %d, expected %d" % [i, native_id, EXPECTED_NATIVE_ORDER[i]])
 		var migrated_label := _pass_label(migrated_native[i]).to_lower()
 		require(migrated_label.contains(expected_native_names[native_id]), "legacy native pass %d name was not restored: '%s'" % [native_id, migrated_label])
 	var migrated_tint = null
@@ -806,7 +845,8 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	require(reactive_second.calls > 0, "FengCompositor did not react to renderer pass-list edit")
 	print("PASS compositor notification on renderer list edit")
 
-	# Native fallback is optional, and its resource switch changes real draws.
+	# The forward fallback is an internal operation of the Transparent entry now, and
+	# that entry's resource switch still changes real draws.
 	var native_toggle_renderer = renderer_script2.new()
 	_native_schedule_base(native_toggle_renderer)
 	reactive_compositor.renderer = native_toggle_renderer
@@ -814,16 +854,17 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	var lit_image := await frame()
 	require(lit_image.get_pixelv(center).r > 0.8, "native fallback baseline missing")
-	var native_fallback = _native_pass(native_toggle_renderer, 3)
-	native_fallback.enabled = false
+	var fallback_entry = _native_pass(native_toggle_renderer, 5)
+	require(fallback_entry != null, "renderer does not expose the Transparent entry")
+	fallback_entry.enabled = false
 	var unlit_image := await frame()
-	require(unlit_image.get_pixelv(center).r < 0.1, "disabled native fallback still draws")
-	native_fallback.enabled = true
+	require(unlit_image.get_pixelv(center).r < 0.1, "disabled native transparent entry still draws the fallback")
+	fallback_entry.enabled = true
 	var restored_image := await frame()
 	require(restored_image.get_pixelv(center).r > 0.8, "re-enabled native fallback did not draw")
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
 	camera.compositor = compositor
-	print("PASS native fallback disable/enable changes GPU output")
+	print("PASS native transparent/forward fallback entry disable/enable changes GPU output")
 
 	# Two consecutive color passes must preserve both writes under MSAA.
 	var msaa_renderer = renderer_script2.new()
@@ -844,15 +885,27 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	print("PASS unified custom color chain with MSAA disabled/2x/4x")
 	var valid_order = msaa_renderer.passes.duplicate()
 	var valid_tokens = msaa_renderer.get_last_valid_schedule()
+	# Moving the lighting pass in front of the G-buffer it reads is a dependency
+	# violation, whatever the surrounding entries are: the schedule has to be
+	# rejected and the custom effects suspended.
 	var invalid_order = valid_order.duplicate()
-	var first_native = invalid_order[0]
-	invalid_order[0] = invalid_order[1]
-	invalid_order[1] = first_native
+	var gbuffer_index := -1
+	var lighting_index := -1
+	for i in invalid_order.size():
+		var entry_native_id := _native_id(invalid_order[i])
+		if entry_native_id == 2:
+			gbuffer_index = i
+		elif entry_native_id == 3:
+			lighting_index = i
+	require(gbuffer_index >= 0 and lighting_index >= 0, "could not find the GBuffer and Lighting entries to reorder")
+	var swapped_native = invalid_order[gbuffer_index]
+	invalid_order[gbuffer_index] = invalid_order[lighting_index]
+	invalid_order[lighting_index] = swapped_native
 	msaa_renderer.passes = invalid_order
 	msaa_renderer.apply(compositor)
 	image = await frame()
 	require(msaa_renderer.get_last_valid_schedule() == valid_tokens, "Invalid order replaced the native schedule")
-	require(image.get_pixelv(center).r > 0.8, "Invalid configuration did not suspend custom effects")
+	require(image.get_pixelv(center).r > 0.8, "Invalid configuration did not suspend custom effects: %s warnings=%s" % [image.get_pixelv(center), msaa_renderer.get_validation_warnings()])
 	msaa_renderer.passes = valid_order
 	msaa_renderer.apply(compositor)
 	image = await frame()
@@ -879,7 +932,7 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	require(after_lighting_pixel.r < baseline_order_pixel.r - 0.05, "custom write after lighting did not change GPU output: %s -> %s" % [baseline_order_pixel, after_lighting_pixel])
 	var paint_before_lighting: Array[FRP_BASE] = []
 	for value in order_native:
-		if _native_id(value) == 2:
+		if _native_id(value) == 3:
 			paint_before_lighting.append(order_paint)
 		paint_before_lighting.append(value)
 	order_renderer.passes = paint_before_lighting
@@ -897,12 +950,12 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	var pre_gbuffer_probe := PaintPass.new(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_GBUFFER, Color.WHITE)
 	var post_gbuffer_probe := GBufferProbePass.new()
 	var authored_schedule: Array[FRP_BASE] = []
-	var gbuffer_entry = _native_pass(schedule_renderer, 0)
+	var gbuffer_entry = _native_pass(schedule_renderer, 2)
 	for value in schedule_native:
-		if _native_id(value) == 0:
+		if _native_id(value) == 2:
 			authored_schedule.append(pre_gbuffer_probe)
 		authored_schedule.append(value)
-		if _native_id(value) == 0:
+		if _native_id(value) == 2:
 			authored_schedule.append(post_gbuffer_probe)
 	schedule_renderer.passes = authored_schedule
 	schedule_renderer.apply(compositor)

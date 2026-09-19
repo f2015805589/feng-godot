@@ -62,6 +62,10 @@ public:
 		RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
 		bool fsr_enabled = false;
 		uint32_t jitter_phase_count = 0;
+		// True when the jitter above belongs to a temporal upscaler (FSR 2, MetalFX)
+		// rather than to TAA. A pipeline can switch TAA on or off, but it never owns
+		// the upscaler's jitter.
+		bool jitter_owned_by_upscaler = false;
 		RSE::ViewportUpdateMode update_mode = RSE::VIEWPORT_UPDATE_WHEN_VISIBLE;
 		RID render_target;
 		RID render_target_texture;

@@ -56,6 +56,16 @@ private:
 		// FRP pipeline tokens. Empty means use the legacy stage-based path.
 		PackedInt32Array frp_pipeline;
 		PackedStringArray frp_pipeline_names;
+		// Native FRP pass ids this schedule provides through plugin passes instead
+		// of engine entries (see FRPPipelineSpec). A plugin pass that runs a pass's
+		// work itself declares it, which lets the schedule drop the entry while the
+		// renderer's per-frame feature queries still see the pass as present.
+		PackedInt32Array frp_pipeline_provided;
+		// Per-pass parameters, keyed by native FRP pass id. The pipeline resource
+		// authors them next to the pass it orders, and both the engine (for the few
+		// values it consumes, such as the Temporal AA jitter phases) and the pass
+		// scripts (through FRPPassContext::get_pass_parameters) read them.
+		Dictionary frp_pipeline_parameters;
 	};
 
 	mutable RID_Owner<Compositor, true> compositor_owner;
@@ -98,7 +108,9 @@ public:
 	void compositor_set_compositor_effects(RID p_compositor, const Vector<RID> &p_effects);
 	Vector<RID> compositor_get_compositor_effects(RID p_compositor, RSE::CompositorEffectCallbackType p_callback_type = RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY, bool p_enabled_only = true) const;
 
-	void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names);
+	void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names, const PackedInt32Array &p_provided = PackedInt32Array(), const Dictionary &p_parameters = Dictionary());
 	PackedInt32Array compositor_get_frp_pipeline(RID p_compositor) const;
 	PackedStringArray compositor_get_frp_pipeline_names(RID p_compositor) const;
+	PackedInt32Array compositor_get_frp_pipeline_provided(RID p_compositor) const;
+	Dictionary compositor_get_frp_pipeline_parameters(RID p_compositor) const;
 };

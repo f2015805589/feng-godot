@@ -1043,10 +1043,6 @@ layout(location = 1) out vec4 albedo_output_buffer;
 layout(location = 2) out vec4 orm_output_buffer;
 layout(location = 3) out vec4 emission_output_buffer;
 
-#ifdef MODE_RENDER_VOXEL_GI
-layout(location = 4) out uvec2 voxel_gi_buffer;
-#endif
-
 #endif // MODE_RENDER_GBUFFER
 
 #ifdef MODE_RENDER_MATERIAL
@@ -1061,10 +1057,6 @@ layout(location = 4) out float depth_output_buffer;
 
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 layout(location = 0) out vec4 normal_roughness_output_buffer;
-
-#ifdef MODE_RENDER_VOXEL_GI
-layout(location = 1) out uvec2 voxel_gi_buffer;
-#endif
 
 #endif //MODE_RENDER_NORMAL
 #else // RENDER DEPTH
@@ -1081,7 +1073,16 @@ layout(location = 0) out vec4 frag_color;
 #endif // RENDER DEPTH
 
 #ifdef MOTION_VECTORS
+#if defined(MODE_RENDER_GBUFFER)
+// The four G-buffer attachments occupy locations 0..3, and FRP never renders voxel
+// GI, so the motion vector attachment directly follows them at location 4.
+layout(location = 4) out vec2 motion_vector;
+#elif defined(MODE_RENDER_MATERIAL)
+// The material pass owns location 4 for depth, so motion vectors move up one slot.
+layout(location = 5) out vec2 motion_vector;
+#else
 layout(location = 2) out vec2 motion_vector;
+#endif
 #endif
 
 #include "../scene_forward_aa_inc.glsl"
@@ -1094,8 +1095,6 @@ layout(location = 2) out vec2 motion_vector;
 #endif
 
 #include "../scene_forward_lights_inc.glsl"
-
-#include "../scene_forward_gi_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
@@ -1694,7 +1693,6 @@ void fragment_shader(in SceneData scene_data) {
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 #ifndef MODE_UNSHADED
-	// Used in regular draw pass and when drawing SDFs for SDFGI and materials for VoxelGI.
 	emission *= scene_data.emissive_exposure_normalization;
 #endif
 
@@ -1888,168 +1886,11 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #else
 
-	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_SDFGI)) { //has lightmap capture
-
-		//make vertex orientation the world one, but still align to camera
-		vec3 cam_pos = mat3(inv_view_matrix) * vertex;
-		vec3 cam_normal = mat3(inv_view_matrix) * indirect_normal;
-		vec3 cam_reflection = mat3(inv_view_matrix) * reflect(-view, indirect_normal);
-
-		//apply y-mult
-		cam_pos.y *= sdfgi.y_mult;
-		cam_normal.y *= sdfgi.y_mult;
-		cam_normal = normalize(cam_normal);
-		cam_reflection.y *= sdfgi.y_mult;
-		cam_normal = normalize(cam_normal);
-		cam_reflection = normalize(cam_reflection);
-
-		vec4 light_accum = vec4(0.0);
-		float weight_accum = 0.0;
-
-		vec4 light_blend_accum = vec4(0.0);
-		float weight_blend_accum = 0.0;
-
-		float blend = -1.0;
-
-		// helper constants, compute once
-
-		uint cascade = 0xFFFFFFFF;
-		vec3 cascade_pos;
-		vec3 cascade_normal;
-
-		for (uint i = 0; i < sdfgi.max_cascades; i++) {
-			cascade_pos = (cam_pos - sdfgi.cascades[i].position) * sdfgi.cascades[i].to_probe;
-
-			if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, sdfgi.cascade_probe_size))) {
-				continue; //skip cascade
-			}
-
-			cascade = i;
-			break;
-		}
-
-		if (cascade < SDFGI_MAX_CASCADES) {
-			bool use_specular = true;
-			float blend;
-			vec3 diffuse, specular;
-			sdfgi_process(cascade, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse, specular, blend);
-
-			if (blend > 0.0) {
-				//blend
-				if (cascade == sdfgi.max_cascades - 1) {
-					diffuse = mix(diffuse, ambient_light, blend);
-					if (use_specular) {
-						indirect_specular_light = mix(specular, indirect_specular_light, blend);
-					}
-				} else {
-					vec3 diffuse2, specular2;
-					float blend2;
-					cascade_pos = (cam_pos - sdfgi.cascades[cascade + 1].position) * sdfgi.cascades[cascade + 1].to_probe;
-					sdfgi_process(cascade + 1, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse2, specular2, blend2);
-					diffuse = mix(diffuse, diffuse2, blend);
-					if (use_specular) {
-						specular = mix(specular, specular2, blend);
-					}
-				}
-			}
-
-			ambient_light = diffuse;
-			if (use_specular) {
-				indirect_specular_light = specular;
-			}
-		}
-	}
-
-	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances
-		uint index1 = instances.data[instance_index].gi_offset & 0xFFFF;
-		// Make vertex orientation the world one, but still align to camera.
-		vec3 cam_pos = mat3(inv_view_matrix) * vertex;
-		vec3 cam_normal = mat3(inv_view_matrix) * indirect_normal;
-		vec3 ref_vec = mat3(inv_view_matrix) * normalize(reflect(-view, indirect_normal));
-
-		//find arbitrary tangent and bitangent, then build a matrix
-		vec3 v0 = abs(cam_normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
-		vec3 tangent = normalize(cross(v0, cam_normal));
-		vec3 bitangent = normalize(cross(tangent, cam_normal));
-		mat3 normal_mat = mat3(tangent, bitangent, cam_normal);
-
-		vec4 amb_accum = vec4(0.0);
-		vec4 spec_accum = vec4(0.0);
-		voxel_gi_compute(index1, cam_pos, cam_normal, ref_vec, normal_mat, roughness * roughness, ambient_light, indirect_specular_light, spec_accum, amb_accum);
-
-		uint index2 = instances.data[instance_index].gi_offset >> 16;
-
-		if (index2 != 0xFFFF) {
-			voxel_gi_compute(index2, cam_pos, cam_normal, ref_vec, normal_mat, roughness * roughness, ambient_light, indirect_specular_light, spec_accum, amb_accum);
-		}
-
-		if (amb_accum.a > 0.0) {
-			amb_accum.rgb /= amb_accum.a;
-		}
-
-		if (spec_accum.a > 0.0) {
-			spec_accum.rgb /= spec_accum.a;
-		}
-
-		indirect_specular_light = spec_accum.rgb;
-		ambient_light = amb_accum.rgb;
-	}
-
-	if (!sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_GI_BUFFERS)) { //use GI buffers
-
-		vec2 coord;
-
-		if (implementation_data.gi_upscale_for_msaa) {
-			vec2 base_coord = screen_uv;
-			vec2 closest_coord = base_coord;
-#ifdef USE_MULTIVIEW
-			float closest_ang = dot(indirect_normal, normalize(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(base_coord, ViewIndex), 0.0).xyz * 2.0 - 1.0));
-#else // USE_MULTIVIEW
-			float closest_ang = dot(indirect_normal, normalize(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), base_coord, 0.0).xyz * 2.0 - 1.0));
-#endif // USE_MULTIVIEW
-
-			for (int i = 0; i < 4; i++) {
-				const vec2 neighbors[4] = vec2[](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
-				vec2 neighbour_coord = base_coord + neighbors[i] * scene_data.screen_pixel_size;
-#ifdef USE_MULTIVIEW
-				float neighbour_ang = dot(indirect_normal, normalize(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(neighbour_coord, ViewIndex), 0.0).xyz * 2.0 - 1.0));
-#else // USE_MULTIVIEW
-				float neighbour_ang = dot(indirect_normal, normalize(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), neighbour_coord, 0.0).xyz * 2.0 - 1.0));
-#endif // USE_MULTIVIEW
-				if (neighbour_ang > closest_ang) {
-					closest_ang = neighbour_ang;
-					closest_coord = neighbour_coord;
-				}
-			}
-
-			coord = closest_coord;
-
-		} else {
-			coord = screen_uv;
-		}
-
-#ifdef USE_MULTIVIEW
-		vec4 buffer_ambient = textureLod(sampler2DArray(ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(coord, ViewIndex), 0.0);
-		vec4 buffer_reflection = textureLod(sampler2DArray(reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(coord, ViewIndex), 0.0);
-#else // USE_MULTIVIEW
-		vec4 buffer_ambient = textureLod(sampler2D(ambient_buffer, SAMPLER_LINEAR_CLAMP), coord, 0.0);
-		vec4 buffer_reflection = textureLod(sampler2D(reflection_buffer, SAMPLER_LINEAR_CLAMP), coord, 0.0);
-#endif // USE_MULTIVIEW
-
-		ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
-		indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
-	}
+	// FRP has no global illumination and no screen space effects: there is no SDFGI,
+	// no VoxelGI and no GI/SSAO/SSIL/SSR buffer in this renderer, so indirect lighting is
+	// the ambient light and the reflection probes only.
 #endif // !USE_LIGHTMAP
 
-	if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSAO)) {
-#ifdef USE_MULTIVIEW
-		float ssao = texture(sampler2DArray(ao_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r;
-#else
-		float ssao = texture(sampler2D(ao_buffer, SAMPLER_LINEAR_CLAMP), screen_uv).r;
-#endif
-		ao = min(ao, ssao);
-		ao_light_affect = mix(ao_light_affect, max(ao_light_affect, implementation_data.ssao_light_affect), implementation_data.ssao_ao_affect);
-	}
 
 	{ // process reflections
 
@@ -2200,48 +2041,6 @@ void fragment_shader(in SceneData scene_data) {
 #endif // SPECULAR_OCCLUSION_DISABLED
 		ambient_light *= albedo.rgb;
 
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL)) {
-#ifdef USE_MULTIVIEW
-			vec4 ssil = textureLod(sampler2DArray(ssil_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
-#else
-			vec4 ssil = textureLod(sampler2D(ssil_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
-#endif // USE_MULTIVIEW
-			ambient_light *= 1.0 - ssil.a;
-			ambient_light += ssil.rgb * albedo.rgb;
-		}
-
-		//process ssr
-		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR)) {
-			bool resolve_ssr = bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR);
-
-			float ssr_mip_level = 0.0;
-			if (resolve_ssr) {
-#ifdef USE_MULTIVIEW
-				ssr_mip_level = textureLod(sampler2DArray(ssr_mip_level_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0).x;
-#else
-				ssr_mip_level = textureLod(sampler2D(ssr_mip_level_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0).x;
-#endif // USE_MULTIVIEW
-
-				ssr_mip_level *= 14.0;
-			}
-
-#ifdef USE_MULTIVIEW
-			vec4 ssr = textureLod(sampler2DArray(ssr_buffer, SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(screen_uv, ViewIndex), ssr_mip_level);
-#else
-			vec4 ssr = textureLod(sampler2D(ssr_buffer, SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), screen_uv, ssr_mip_level);
-#endif // USE_MULTIVIEW
-
-			if (resolve_ssr) {
-				const vec3 rec709_luminance_weights = vec3(0.2126, 0.7152, 0.0722);
-				ssr.rgb /= 1.0 - dot(ssr.rgb, rec709_luminance_weights);
-			}
-
-			// Apply fade when approaching 0.7 roughness to smoothen the harsh cutoff in the main SSR trace pass.
-			ssr *= smoothstep(0.0, 1.0, 1.0 - clamp((roughness - 0.6) / (0.7 - 0.6), 0.0, 1.0));
-
-			// Alpha is premultiplied.
-			indirect_specular_light = indirect_specular_light * (1.0 - ssr.a) + ssr.rgb;
-		}
 	}
 #endif // AMBIENT_LIGHT_DISABLED
 
@@ -3038,18 +2837,6 @@ void fragment_shader(in SceneData scene_data) {
 	// as its own 8-bit channel; storing it here costs no extra bandwidth.
 	emission_output_buffer.a = specular;
 
-#ifdef MODE_RENDER_VOXEL_GI
-	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances
-		uint index1 = instances.data[instance_index].gi_offset & 0xFFFF;
-		uint index2 = instances.data[instance_index].gi_offset >> 16;
-		voxel_gi_buffer.x = index1 & 0xFFu;
-		voxel_gi_buffer.y = index2 & 0xFFu;
-	} else {
-		voxel_gi_buffer.x = 0xFF;
-		voxel_gi_buffer.y = 0xFF;
-	}
-#endif
-
 #endif //MODE_RENDER_GBUFFER
 
 #ifdef MODE_RENDER_MATERIAL
@@ -3078,18 +2865,6 @@ void fragment_shader(in SceneData scene_data) {
 	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
 	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
 	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w;
-
-#ifdef MODE_RENDER_VOXEL_GI
-	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances
-		uint index1 = instances.data[instance_index].gi_offset & 0xFFFF;
-		uint index2 = instances.data[instance_index].gi_offset >> 16;
-		voxel_gi_buffer.x = index1 & 0xFFu;
-		voxel_gi_buffer.y = index2 & 0xFFu;
-	} else {
-		voxel_gi_buffer.x = 0xFF;
-		voxel_gi_buffer.y = 0xFF;
-	}
-#endif
 
 #endif //MODE_RENDER_NORMAL_ROUGHNESS
 

@@ -10,8 +10,11 @@ const Renderer = preload("renderer.gd")
 const CompositorScript = preload("compositor.gd")
 const PassBase = preload("passes/pass_base.gd")
 const BuiltinPass = preload("passes/builtin_pass.gd")
+const ProjectPipeline = preload("project_pipeline.gd")
 
 const LIBRARY_DIR := "res://addons/feng-render-pipeline/library"
+const PIPELINE_AUTOLOAD := "FengProjectPipeline"
+const PIPELINE_AUTOLOAD_PATH := "res://addons/feng-render-pipeline/project_pipeline.gd"
 const TRACKED_RENDERER_METADATA := [
 	"_synced_library",
 	"_synced_library_ids",
@@ -54,6 +57,7 @@ class FengRendererInspectorPlugin extends EditorInspectorPlugin:
 var _menu: PopupMenu
 var _inspector_plugin
 var _library_entries: Array[Dictionary] = []
+var _project_pipeline: WorldEnvironment = null
 
 func _enter_tree() -> void:
 	_inspector_plugin = FengRendererInspectorPlugin.new(Renderer)
@@ -72,6 +76,20 @@ func _enter_tree() -> void:
 	add_tool_submenu_item("Add Pass from Library", _menu)
 	_refresh_library()
 
+	_register_project_pipeline_setting()
+	_ensure_pipeline_autoload()
+	ProjectSettings.settings_changed.connect(_on_project_settings_changed)
+	if get_tree() != null:
+		# A scene brings its own WorldEnvironment later than this plugin loads, and
+		# removing it has to hand the world back, so watch for both. Not deferred:
+		# node_removed hands over the node being freed, so its type has to be read while
+		# it still exists; the work is deferred instead, which also keeps this plugin out
+		# of another node's tree notification.
+		get_tree().node_added.connect(_on_editor_node_added)
+		get_tree().node_removed.connect(_on_editor_node_removed)
+	# Deferred: the editor tree may not resolve this plugin's world yet.
+	_sync_project_pipeline.call_deferred()
+
 func _exit_tree() -> void:
 	if _inspector_plugin != null:
 		remove_inspector_plugin(_inspector_plugin)
@@ -82,6 +100,83 @@ func _exit_tree() -> void:
 		# would leave a dangling submenu entry behind.
 		remove_tool_menu_item("Add Pass from Library")
 		_menu = null
+	_detach_project_pipeline()
+	# The autoload is deliberately left in place: _exit_tree also runs when the editor
+	# shuts down, and rewriting project.godot on every exit would be churn for a node that
+	# does nothing while the setting is empty. Removing it is one line in project.godot.
+
+## The project's pipeline is a project setting that sits next to the renderer it belongs to
+## (Rendering > Renderer > Compositor) rather than a node per scene, because only a
+## world-level compositor reaches both the Scene view and the running game: they use
+## different cameras, and the game's camera is not the one the editor renders with.
+##
+## The row is basic, so it is visible without "Advanced Settings", and it is only offered
+## while FRP is the project's rendering method: an internal setting is stored but not
+## shown, so the value survives a switch to another renderer without leaving a dead row in
+## the dialog.
+func _register_project_pipeline_setting() -> void:
+	if not ProjectSettings.has_setting(ProjectPipeline.SETTING):
+		ProjectSettings.set_setting(ProjectPipeline.SETTING, "")
+		ProjectSettings.set_initial_value(ProjectPipeline.SETTING, "")
+	ProjectSettings.set_as_basic(ProjectPipeline.SETTING, true)
+	ProjectSettings.add_property_info({
+		"name": ProjectPipeline.SETTING,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_FILE,
+		"hint_string": "*.tres,*.res",
+	})
+	_sync_project_pipeline_setting()
+
+## Whether the project renders with FRP. The project setting is read, not the running
+## renderer: this decides what the dialog offers, and the project setting is both what the
+## user edits there and what the next start uses.
+func _project_renders_with_frp() -> bool:
+	return String(ProjectSettings.get_setting("rendering/renderer/rendering_method", "forward_plus")) == "frp"
+
+## Offers the compositor row only for the renderer that reads it.
+func _sync_project_pipeline_setting() -> void:
+	ProjectSettings.set_as_internal(ProjectPipeline.SETTING, not _project_renders_with_frp())
+
+## The editor half of the project pipeline runs here; a running game needs a node of its
+## own, which is what the autoload is. Enabling the plugin adds it, disabling removes it,
+## and the value is only written when it does not already point at this script - the
+## editor stores autoloads as "*" + a UID, while a hand-written project.godot names the
+## path, so both forms are resolved before they are compared.
+func _ensure_pipeline_autoload() -> void:
+	var existing := String(ProjectSettings.get_setting("autoload/" + PIPELINE_AUTOLOAD, ""))
+	if existing.begins_with("*") and ProjectPipeline.names(existing, PIPELINE_AUTOLOAD_PATH):
+		return
+	add_autoload_singleton(PIPELINE_AUTOLOAD, PIPELINE_AUTOLOAD_PATH)
+
+func _on_project_settings_changed() -> void:
+	# The rendering method is one of the settings that can change here, and it decides
+	# whether the compositor row is offered at all.
+	_sync_project_pipeline_setting()
+	_sync_project_pipeline()
+
+func _on_editor_node_added(p_node) -> void:
+	if p_node is WorldEnvironment:
+		_sync_project_pipeline.call_deferred()
+
+func _on_editor_node_removed(p_node) -> void:
+	if is_instance_valid(p_node) and p_node is WorldEnvironment:
+		_sync_project_pipeline.call_deferred()
+
+## Keeps the editor's own world in sync with the setting, so the Scene view renders the
+## same pipeline the game does.
+func _sync_project_pipeline() -> void:
+	_project_pipeline = ProjectPipeline.install(self, _project_pipeline)
+
+func _detach_project_pipeline() -> void:
+	if ProjectSettings.settings_changed.is_connected(_on_project_settings_changed):
+		ProjectSettings.settings_changed.disconnect(_on_project_settings_changed)
+	if get_tree() != null:
+		if get_tree().node_added.is_connected(_on_editor_node_added):
+			get_tree().node_added.disconnect(_on_editor_node_added)
+		if get_tree().node_removed.is_connected(_on_editor_node_removed):
+			get_tree().node_removed.disconnect(_on_editor_node_removed)
+	ProjectPipeline.clear(_project_pipeline)
+	_project_pipeline = null
 
 func _refresh_library() -> void:
 	if _menu == null:
@@ -292,18 +387,11 @@ func _normalize_library_path(path: String) -> String:
 
 func _library_insert_index(passes: Array, stable_id: StringName) -> int:
 	var temporal_index := passes.size()
-	var history_index := -1
 	for i in passes.size():
 		var pass_entry = passes[i]
-		if pass_entry is BuiltinPass:
-			var native_id: int = pass_entry.native_id
-			if native_id == 14:
-				temporal_index = i
-				break
-			if native_id == 13:
-				history_index = i
-	if temporal_index == passes.size() and history_index >= 0:
-		temporal_index = history_index + 1
+		if pass_entry is BuiltinPass and pass_entry.native_id == Renderer.TEMPORAL_AA_NATIVE_ID:
+			temporal_index = i
+			break
 
 	var new_order := _default_library_order(stable_id)
 	if new_order < 0:

@@ -648,7 +648,13 @@ public:
 	virtual RID compositor_create() = 0;
 
 	virtual void compositor_set_compositor_effects(RID p_compositor, const TypedArray<RID> &p_effects) = 0;
-	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names) = 0;
+	virtual void compositor_set_frp_pipeline(RID p_compositor, const PackedInt32Array &p_pipeline, const PackedStringArray &p_names, const PackedInt32Array &p_provided = PackedInt32Array(), const Dictionary &p_parameters = Dictionary()) = 0;
+
+	// The FRP native pass set (ids, display names, mandatory entries, order
+	// constraints and the default execution order). FengRenderer reads this so the
+	// addon and the renderer share one definition instead of keeping copies that
+	// can drift apart.
+	Dictionary get_frp_pipeline_spec() const;
 
 	// Render-thread hook for producers that need to submit virtual texture page
 	// work before the FRP G-buffer. Registration is intentionally independent of

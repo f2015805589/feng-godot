@@ -31,9 +31,15 @@ def stage_addons() -> None:
     """
     source_root = REPO / "misc" / "feng-addons"
     target_root = PROJECT / "addons"
-    ignore = shutil.ignore_patterns("native", "bin", "tests", ".godot", "__pycache__", "~*")
+    # Only real native extension build directories are dropped, and only for the
+    # addons that have one. feng-render-pipeline keeps pure GDScript pass scripts
+    # under passes/native/, which the fixture needs to load the addon at all.
+    native_build_addons = {"feng-renderdoc-capture", "feng-idweight-terrain"}
     for name in ("feng-render-pipeline", "feng-renderdoc-capture"):
-        shutil.copytree(source_root / name, target_root / name, ignore=ignore)
+        patterns = ["bin", "tests", ".godot", "__pycache__", "~*"]
+        if name in native_build_addons:
+            patterns.append("native")
+        shutil.copytree(source_root / name, target_root / name, ignore=shutil.ignore_patterns(*patterns))
     extension_source = source_root / "feng-renderdoc-capture" / "bin" / "libfeng-renderdoc-capture.windows.debug.x86_64.dll"
     extension_target = target_root / "feng-renderdoc-capture" / "bin" / extension_source.name
     extension_target.parent.mkdir(parents=True, exist_ok=True)
