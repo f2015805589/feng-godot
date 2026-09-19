@@ -302,7 +302,9 @@ void RendererSceneRender::compositor_set_frp_pipeline(RID p_compositor, const Pa
 		ERR_FAIL_COND_MSG(!FRPPipelineSpec::is_valid_pass_id(p_provided[i]), "Invalid FRP provided pass id.");
 	}
 	for (const KeyValue<Variant, Variant> &kv : p_parameters) {
-		ERR_FAIL_COND_MSG(kv.key.get_type() != Variant::INT || !FRPPipelineSpec::is_valid_pass_id(kv.key), "FRP pass parameters must be keyed by a native pass id.");
+		const Variant::Type key_type = kv.key.get_type();
+		ERR_FAIL_COND_MSG(key_type != Variant::INT && key_type != Variant::STRING && key_type != Variant::STRING_NAME, "FRP pass parameters must be keyed by a native pass id or a custom pass name.");
+		ERR_FAIL_COND_MSG(key_type == Variant::INT && !FRPPipelineSpec::is_valid_pass_id(kv.key), "Invalid native FRP pass parameter id.");
 		ERR_FAIL_COND_MSG(kv.value.get_type() != Variant::DICTIONARY, "FRP pass parameters must be a dictionary per pass.");
 	}
 

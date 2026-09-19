@@ -3,6 +3,15 @@
 本文回答一个问题：**把 FRP 搬到新版本 Godot 上，需要动哪些地方？**
 它列出引擎侧必须保留的 Core 表面、FRP 在共享文件里的全部触点、以及双方的数据契约。
 
+## 硬边界：优先与引擎解耦
+
+能在插件侧完成就必须放在插件侧，保持低耦合、高内聚。参数声明、Volume 模块及字段权限、混合、检查器和范围
+Gizmo 都属于插件。仅在现有 Core 无法提供必要的底层能力，或确认缺陷位于引擎时，才做最小引擎改动；
+不为添加效果、模块或编辑器界面扩大引擎策略层。
+
+参数快照的键支持原生整数 id 和自定义稳定字符串 id；`FRPPassContext.get_pass_parameters(key)` 接受 Variant。
+这只扩展现有数据通道和入口键校验，不把 Volume 注册表或混合逻辑放进引擎。原生整数键保持兼容。
+
 ## 1. Core 表面（脚本可见，尽量不改）
 
 `FRPPassContext`（`servers/rendering/renderer_rd/frp_clustered/frp_pass_context.{h,cpp}`）是插件

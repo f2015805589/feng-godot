@@ -26,10 +26,21 @@ extends "native_pass.gd"
 ## `layout(constant_id = 0) const bool POST_AFTER_TONEMAP = false;`
 const POST_AFTER_TONEMAP_KEYWORD := 0
 
-@export var overlay_after_tonemap := false
+## Which side of the tone mapping this pass runs its overlay on. It is an exposed
+## parameter, so the setter notifies (an `@export` member does not emit on its own) and
+## the overlay's shader keyword follows the authored value.
+@export var overlay_after_tonemap := false:
+	set(value):
+		if overlay_after_tonemap == value:
+			return
+		overlay_after_tonemap = value
+		emit_changed()
 
 func get_frp_parameters() -> Dictionary:
 	return {"overlay_after_tonemap": overlay_after_tonemap}
+
+func get_volume_parameter_names() -> PackedStringArray:
+	return PackedStringArray(["overlay_after_tonemap"])
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
@@ -39,29 +50,32 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	ctx.copy_history()
 	ctx.post_process()
 
-	if overlay == null:
+	# An overlay that is switched off is simply not there (see
+	# FengNativePass.active_overlay): the pass still resolves, post-processes and tone
+	# maps the frame.
+	if active_overlay() == null:
 		ctx.tonemap()
 		return
 
 	var ldr_target := _overlay_ldr_target()
-	if overlay_after_tonemap:
+	if bool(get_resolved_parameters(ctx).get("overlay_after_tonemap", overlay_after_tonemap)):
 		if ldr_target == &"":
 			# An after-tonemap overlay has to own its output: the pass presents what it
 			# wrote, so it cannot write into the frame's colour buffer.
 			ctx.tonemap()
-			overlay._frp_execute(ctx)
+			run_overlay(ctx)
 			return
 		# The toned image lands in the engine's intermediate texture; the overlay works
 		# on it and writes its own texture, which the pass then presents.
 		_configure_overlay(ldr_target, true)
 		ctx.tonemap_deferred()
-		overlay._frp_execute(ctx)
+		run_overlay(ctx)
 		ctx.present(ldr_target)
 	else:
 		# The overlay writes into the frame's HDR colour buffer, which the tone mapper
 		# then reads.
 		_configure_overlay(&"", false)
-		overlay._frp_execute(ctx)
+		run_overlay(ctx)
 		ctx.tonemap()
 
 ## Tells the overlay which side of the tone mapping it is on, and where it writes:

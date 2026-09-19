@@ -2,6 +2,7 @@
 """Real GPU regression; isolated projects and logs are kept under bin/."""
 import argparse
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,6 +16,13 @@ parser.add_argument("--binary", default=None,
 args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
 shutil.copytree(ROOT / "misc/feng-addons/feng-render-pipeline", project / "addons/feng-render-pipeline")
+# The editor auto-links sibling addons. Keep this regression isolated from their
+# native DLL reloads, capture injection and editor tools, including concurrent runs.
+for addon in (ROOT / "misc/feng-addons").iterdir():
+    if addon.name != "feng-render-pipeline" and (addon / "plugin.cfg").is_file():
+        placeholder = project / "addons" / addon.name
+        placeholder.mkdir()
+        (placeholder / ".gdignore").touch()
 (project / "project.godot").write_text(
     'config_version=5\n[application]\nconfig/name="Deferred tests"\n'
     '[rendering]\nrenderer/rendering_method="frp"\n', encoding="utf-8"
@@ -69,6 +77,8 @@ def run(name, extra, marker=None, method=None):
 run("import", ["--editor", "--recovery-mode", "--import"])
 run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_passes.gd")],
     "PASS configurable compute pass shader, bindings, parameters and enabled state")
+run("volume", ["--script", str(ROOT / "misc/scripts/tests/frp_volume.gd")],
+    "PASS FRP author-defined Volume modules, typed fields, priority, persistence, custom frame parameters and compositor isolation")
 # Every frame that needs motion vectors without 3D upscaling: TAA, the motion
 # debug view and upscaling itself. FRP produces motion vectors in the G-buffer
 # pass. The Temporal AA entry is the TAA switch, and the viewport jitter follows it.
@@ -115,6 +125,23 @@ with (project / "project.godot").open("a", encoding="utf-8") as config:
     config.write('\n[editor_plugins]\nenabled=PackedStringArray("res://addons/frp-editor-tests/plugin.cfg")\n')
 run("editor", ["--editor", "--quit-after", "120"],
     "PASS FRP editor resource selection, names, add, move, undo and redo")
+for name, marker in (
+    ("volume_editor", "PASS FRP editor viewport Volume preview, live parameter changes, disable and leaving restore authored values"),
+    ("volume_gizmo", "PASS FRP Volume gizmo boxes, corresponding corner connectors and boundary semantics"),
+):
+    plugin = project / "addons" / ("frp-" + name + "-tests")
+    plugin.mkdir()
+    shutil.copyfile(ROOT / "misc/scripts/tests" / ("frp_" + name + ".gd"), plugin / "test.gd")
+    (plugin / "plugin.cfg").write_text(
+        '[plugin]\nname="FRP Volume Tests"\ndescription="Isolated regression"\n'
+        'author="Feng"\nversion="1"\nscript="test.gd"\n', encoding="utf-8"
+    )
+    config_path = project / "project.godot"
+    config = config_path.read_text(encoding="utf-8")
+    config = re.sub(r'enabled=PackedStringArray\([^\n]*\)',
+                    'enabled=PackedStringArray("res://addons/' + plugin.name + '/plugin.cfg")', config)
+    config_path.write_text(config, encoding="utf-8")
+    run(name, ["--editor", "--quit-after", "600" if name == "volume_editor" else "180"], marker)
 # The other direction: forward_plus must be unaffected by FRP. The probe attaches a
 # compositor carrying an FRP schedule while forward_plus renders and requires
 # forward_plus to keep its own jitter (the FRP jitter rule stays behind its

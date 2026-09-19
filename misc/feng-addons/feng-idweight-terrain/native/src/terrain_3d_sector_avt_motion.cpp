@@ -187,7 +187,11 @@ Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_tra
 	// what a turn makes wrong: the new world a turn brings in is off to the side of that frustum,
 	// so the plan named none of it and the pages for it arrived after it was already on screen.
 	const float turn = _vt.avt_motion_turn_lead.length();
-	if (turn > 0.f) {
+	// A stopped camera's smoothed turn decays into float subnormals while TAA
+	// keeps the editor drawing. Squaring those components in length() underflows:
+	// dividing by that inaccurate length no longer yields a unit axis. Treat an
+	// imperceptible turn as identity before entering the axis-angle constructor.
+	if (turn > 1e-6f) {
 		lead.basis = Basis(_vt.avt_motion_turn_lead / turn, turn) * p_camera_transform.basis;
 	}
 	return lead;

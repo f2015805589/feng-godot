@@ -56,7 +56,7 @@ class FRPPassContext : public RefCounted {
 	// Presents a texture to the viewport's render target. Only the renderer can reach
 	// the render target, so the primitive goes through this callback.
 	std::function<void(const StringName &)> present_runner;
-	// Per-pass parameters the pipeline resource authored, keyed by native pass id.
+	// Resolved frame parameters, keyed by native pass id or custom pass name.
 	Dictionary pass_parameters;
 
 	void _run_operation(int p_operation);
@@ -77,7 +77,7 @@ public:
 	// Parameters the pipeline resource authored for a pass. A pass script reads its
 	// own settings this way, so the pipeline resource is the single place a project
 	// configures a pass.
-	Dictionary get_pass_parameters(int p_pass_id) const;
+	Dictionary get_pass_parameters(const Variant &p_pass_id) const;
 
 	// Core primitives. One per engine operation, in execution order.
 	void precompute_shadows();

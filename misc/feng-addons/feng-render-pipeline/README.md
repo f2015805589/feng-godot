@@ -7,29 +7,37 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 ## 使用
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
-2. 创建 `FengRenderer`，默认包含下列 8 个引擎 Pass（外加可选的 5 个效果条目，默认关闭）
-   和 8 个库 Pass。
+2. 创建 `FengRenderer`，默认包含下列 8 个引擎 Pass 和一个 `Color Grade` 库 Pass，
+   共 9 个条目；TAA 与 Color Grade 默认关闭，其余库效果按需添加。
+3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment（或者用项目设置，
+   见下文"项目级管线"）。
+4. 在 Inspector 的 Passes 数组中拖动排序，编辑条目的 Enabled。条目显示具体名称，
+   例如 `Lighting`、`Blur Horizontal`、`Bloom Composite`。
+5. 在 Inspector 选中 Renderer 或 FengCompositor 后，使用工具菜单
+   **Add Pass from Library** 添加库效果。添加和排序支持编辑器撤销、重做。
 
 ## 插件结构
 
 | 位置 | 内容 |
 |---|---|
-| `renderer.gd` | `FengRenderer`：管线资源本身（条目列表、库同步、旧资源迁移、调度构建） |
+| `renderer.gd` | `FengRenderer`：管线资源、条目变更观察、库同步和旧资源迁移入口 |
 | `compositor.gd`、`project_pipeline.gd` | 把 Renderer 接到 Camera3D / WorldEnvironment / 项目设置 |
 | `world_compositor.gd` | 引擎"世界用哪个 compositor"的规则（WorldEnvironment 分组）的唯一落点 |
 | `editor_plugin.gd` + `editor/` | 编辑器那一半：工具菜单、检查器告警、项目设置行、autoload 注册 |
-| `pipeline/` | 调度的模型：`native_spec`（引擎 pass 表）、`library_manager`（内置库与同步）、`pipeline_migrator`（旧资源迁移）、`pipeline_validator`（校验）、`addon_layout`（插件自身路径） |
+| `pipeline/` | `execution_plan`（纯调度计划）、`compositor_binding`（引擎绑定）、`parameter_resolver`（参数协议），以及`native_spec`（引擎 pass 表）、`library_manager`（内置库与同步）、`pipeline_migrator`（旧资源迁移）、`pipeline_validator`（校验）、`addon_layout`（插件自身路径） |
 | `passes/` | Pass 的类：`pass_base`（`FengPass`）、`builtin_pass`、`shader_pass`、`pass_texture`、`pass_output`、`texture_manager`（输出纹理分配） |
 | `passes/native/` | 8 个引擎 Pass 的默认实现脚本 |
-| `volume/` | `FengVolume` / `FengVolumeProfile`：运行时逐 pass 覆盖 |
+| `volume/` | 空间节点与模块资源、`volume_runtime`（注册和相机生命周期）、`volume_resolver`（混合） |
 | `library/` | 内置效果模板（`*.tres` + `*.glsl`），从 **Add Pass from Library** 添加 |
 | `examples/` | 示例与测试用 shader / 资源 |
 
 与引擎的耦合只有三处，而且每一处都只写在插件的一个地方：`RenderingServer.get_frp_pipeline_spec()`
 （Pass 表 → `pipeline/native_spec.gd`）、`RenderingServer.compositor_set_frp_pipeline()`
-（调度 + provided + 逐 pass 参数 → `renderer.gd`）、`FRPPassContext`（Pass 脚本的 Core 原语）。
+（调度 + provided + 逐 pass 参数 → `pipeline/compositor_binding.gd`）、`FRPPassContext`（Pass 脚本的 Core 原语）。
 `world_compositor.gd` 是唯一例外：WorldEnvironment 的 `_world_compositor_<scenario>` 分组名在引擎里
 没有脚本接口，只能在插件里写一次，再由项目管线与 Volume 共用。
+
+职责边界、依赖和新增功能的落点见 [FRP 插件架构](../../../doc/frp-addon-architecture.md)。
 
 ## 引擎 Pass
 
@@ -74,6 +82,19 @@ SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP
 pass（无插件项目的默认路径）。整条默认调度与引擎自带 pass **逐像素一致**（实测 changed=0）。
 要改某个 pass 的实现，复制/继承对应的 `passes/native/*.gd` 并覆盖 `_frp_execute()` 即可：
 可以只调其中几个 Core 原语，也可以加上自己的 `@export` 参数（检查器会显示）。
+
+**挂上去的 pass 也有 `enabled`，但两个位置含义不同**：
+
+* `FengBuiltinPass.implementation` 是这条 pass 的**实现脚本**——条目的活就是它干的。它的 `enabled`
+  和条目的 `enabled` 因此是同一个开关：关掉任一个，这条 pass 就不跑（不再出现在交给引擎的 provided
+  集合里，Temporal AA 就不会再开 jitter，也照常触发"必需条目被禁用"的校验）。想**换**成引擎自带的
+  pass 则清空 `implementation`——那是换实现，不是关掉。
+* `FengNativePass.overlay` 是这条 pass 的**额外工作**（自己的 shader、参数与纹理，例如 Post 的
+  overlay）。它的 `enabled` 只关掉这份额外工作：pass 自己的 operation 照跑，overlay 声明的纹理也不再
+  创建。overlay 不是调度里的 pass，所以它不影响条目的开关。
+
+这些嵌套的 pass 资源由 renderer 直接监听（`FengPass.carried_passes()`），所以在检查器里改它们的参数
+（例如 `jitter_phases`）或勾选框会**立刻**生效，不需要别的操作去"顺带"触发一次应用。
 
 FRP 不做屏幕空间效果，也不做全局光照：`_setup_environment` 里的 `ss_effects_flags`
 永远是 0，光照 shader 因此不会采样 SSAO / SSIL / SSR / GI 附件。在 Environment 里打开
@@ -142,50 +163,76 @@ Renderer 可以只含这一个 pass——校验零告警，规范化也不会把
 不声明则该条目的位置由引擎条目自己跑。声明通过 `compositor_set_frp_pipeline` 的第四个参数
 （provided pass ids）交给引擎。
 
-## 逐 pass 参数（URP 风格）
+## Pass 参数与 Volume 模块
 
-Pass 脚本自己决定暴露哪些参数：覆盖 `get_frp_parameters()`，列出带类型的 `@export` 属性，管线资源里
-该条目就会显示这几个字段——而不是一个自由字典（这也就是"可以选择暴露出来的"）。目前的一个实例是
-Temporal AA 的 `jitter_phases`（1 = 冻结抖动采样，TAA 仍然 resolve；16 是引擎默认值，视口 jitter 跟着它）。
+**硬规则：能在插件侧完成的工作必须留在插件侧；只有现有 Core 接口无法表达的必要能力或已确认的引擎缺陷才修改引擎。**
+参数声明、Volume 模块、混合策略、检查器和范围线框均不进入引擎。引擎只传递帧参数快照并提供渲染原语。
 
-优先级从低到高：
+Pass 可以自由添加带类型的 `@export` 属性，基类自动收集自定义导出参数；需要不同名称或计算值时也可重写
+`get_frp_parameters()`。**哪些参数可进入 Volume 由 Pass 作者在代码中通过 `get_volume_parameter_names()` 规定**。
+默认空列表表示不提供 Volume 模块；Volume 使用者只能选择模块和修改已声明的字段，没有逐字段暴露权限或覆盖勾选。
 
-1. pass 脚本声明的值（`get_frp_parameters()`，资源字段）；
-2. 条目上的 `pass_parameters` 字典（管线资源里的覆盖层，不用改 pass 资源）；
-3. 运行时的 Volume（见下）。
+管线全局参数与 Volume 字段是两份独立声明：只出现在 `get_frp_parameters()` 中的字段不会进入 Volume。
+例如 TAA 的代码明确将 `enabled` 与 `jitter_phases` 开放给 Volume；其他 Pass 不会自动得到这些字段。
+Volume 中的 `enabled = false` 是该 Pass 参数的关闭覆盖，仍高于管线的 `true`，不是取消覆盖。
+取消覆盖请移除模块或关闭整个 Volume。旧模块存储的关闭状态会按 TAA 的新声明兼容读取。
 
-参数随调度（`compositor_set_frp_pipeline` 的第 5 个参数）交给引擎；pass 脚本用
-`ctx.get_pass_parameters(pass_id)` 读自己这一条 pass 的参数，不管当前是引擎条目还是别的 pass 在跑它。
+```gdscript
+@tool
+extends FengPass
 
-## Volume（FRP 自己定义的后处理体积，类似虚幻的 Post Process Volume）
+@export_range(0.0, 4.0, 0.01) var strength := 1.0:
+    set(value):
+        strength = value
+        emit_changed()
+@export var pipeline_only_setting := 8
 
-`FengVolume` 就是虚幻那种后处理体积：
+func get_volume_parameter_names() -> PackedStringArray:
+    return PackedStringArray(["strength"]) # 由 Pass 代码固定，Volume 不显示另一个字段
 
-* 一个 `Node3D` 盒子，`size` 是局部空间的尺寸，可以平移/旋转/缩放；
-* `unbound`（虚幻的 **Unbound**）勾上就影响所有相机，用来放全局默认值；
-* `priority` 越大越后应用（同优先级按场景顺序）；
-* `weight` 是混合强度；`blend_distance`（虚幻的 **Blend Radius**）让权重从盒子边缘 0 平滑升到
-  中心的 `weight`；
-* `enabled` 关掉就停止影响，但节点留在场景里。
-
-体积每帧解析一次（取当前相机所在的体积，按 priority 从小到大混合），结果推给相机上的
-`FengCompositor`。**只有 profile 里列出的参数会覆盖**——没列出的继承上一层，这就是虚幻每个属性
-旁边的 override 勾选（在这里体现为"字典里有没有这个 key"，以后可以做成逐字段的勾选控件）。
-
-体积还可以**开关整条 pass**（`enabled_passes` / `disabled_passes`，按 native pass id）：条目的作者态
-不动，体积在相机进入时覆盖它，调度和交给引擎的 provided 集合一起跟着变——所以默认关闭的
-Temporal AA 可以在某个房间里打开，出了房间自动关掉。布尔状态不插值：影响权重 ≥ 0.5
-时生效，同优先级下 `enabled_passes` 覆盖 `disabled_passes`。必需条目（0/1/2/3/7）不能在体积里关掉：
-那会产生不完整帧，校验会照常报出来。
-
-```
-FengVolume (profile = FengVolumeProfile)
-    pass_parameters = { 6: {"jitter_phases": 1} }
-    enabled_passes  = [6]        # 这个房间里开 TAA
+func _frp_execute(ctx: FRPPassContext) -> void:
+    var settings := get_resolved_parameters(ctx)
+    # 自己的渲染代码使用 settings["strength"]，不要再直接读取作者态字段。
 ```
 
-引擎的 Environment 不动：这些参数属于 FRP 的 pass，所以体积和参数都在 FRP 里定义。这是第一版；
-逐参数的混合模式（URP 那种 min/max/add）以后再加。
+在 `FengVolume` 或 `FengVolumeProfile` 检查器中选择当前管线的模块并添加，随后在 `modules` 中编辑字段。
+字段类型、范围、枚举沿用 Pass 导出定义。模块可整体禁用；增加模块不会自动把管线中关闭的 Pass 打开。
+独立 Profile 可以在编辑器的 Renderer 选择器中指定模块来源。
+
+优先级从低到高是 **Pass 资源值 → 管线条目 `pass_parameters` → Volume 混合结果**。
+Volume 按 priority 从低到高应用，同优先级保持注册顺序；数值、颜色和浮点向量连续混合，布尔、枚举及资源等离散值
+在权重达到 0.5 时切换。`get_resolved_parameters(ctx)` 同时支持原生 Pass、自定义 Pass 和 overlay。
+即使旧 Profile 字典中塞入未允许的字段，运行时也会按当前 Pass 的声明过滤。
+
+普通自定义 Pass 加入 Renderer 时获得持久化 `stable_id`，原生槽位保持整数 id。
+需要由脚本控制模块身份时可重写 `get_parameter_key()`；同一管线内独立模块的 key 必须唯一。
+不要用可变的列表位置作为模块身份。导出属性修改仍需在 setter 调用 `emit_changed()`，通知管线更新帧快照。
+
+## Volume 范围和运行时边界
+
+`FengVolume` 是局部空间盒子，`size` 定义外边界，支持平移、旋转和缩放。
+`blend_distance` 是**向盒子内部**的过渡距离：外边界影响为 0，内盒尺寸为 `size - 2 * blend_distance`，
+内盒影响为 `weight`（weight 为 1 时是完整覆盖）。过渡太宽导致不存在完整影响区时，不画虚假的内盒。
+`blend_distance = 0` 表示盒内直接应用；`unbound` 表示该视口中的全局 Volume，没有有限盒子边界。
+
+启用插件后，**仅编辑器 3D 视图**通过 `EditorNode3DGizmoPlugin` 绘制内外线框和对应八个角的连线；
+运行游戏不创建范围网格，也不显示线框。Gizmo 与运行时使用同一个范围定义。
+
+编辑器预览由 `editor/volume_preview.gd` 将当前编辑场景的 Volume 应用于各个 3D 视图相机，
+按每个视图相机的位置独立混合。修改模块字段会更新预览；切换场景或禁用插件会恢复原相机管线。
+有限 Volume 要求观察相机进入盒内才生效，仅看到盒内物体不等于相机处于影响范围；`unbound` 可用于全局预览。
+
+静止时只做轻量变更检查；参数、范围或管线变化才重新解析。隐藏视图和范围外相机跳过预览计算，
+进出范围复用已创建的运行时效果，避免重复编译着色器。Pass 作者的参数 setter 仍需调用 `emit_changed()`。
+
+每个相机的结果保存在其 `FengCompositor` 的运行时管线副本中，不改共享 Renderer 作者态；退出范围或关闭 Volume
+会恢复全局设置。不同相机若需要不同结果，应使用不同 `FengCompositor`，它们可以共享同一个 Renderer 资源。
+`volume_resolver.gd` 只负责混合，`pipeline/parameter_resolver.gd` 负责参数收集、模块身份关联和暴露权限，
+编辑器插件负责模块选择与 UndoRedo。新增模块无需修改这些服务或引擎。
+
+旧 Profile 的 `pass_parameters` 数据仍可加载；新界面使用 `FengVolumeModule`。
+旧 `enabled_passes` / `disabled_passes` 仅保留为兼容存储，不在新界面显示；运行时也要求当前 Pass
+明确向 Volume 声明布尔 `enabled` 字段，影响权重达到 0.5 时应用。必需 Pass 仍受调度校验约束。
 
 ## Pass 自带 shader（overlay）
 
@@ -193,13 +240,9 @@ FengVolume (profile = FengVolumeProfile)
 在这一条 pass 下面，运行位置由脚本自己决定——比如 Post 的实现先 `resolve_final()`、`copy_history()`，
 再跑 overlay，最后 `post_process_and_tonemap()`，这样自己的 shader 作用于 HDR 颜色并被呈现。
 overlay 的 `inputs`/`outputs`/附件标志会被当作这条 pass 的资源契约交给引擎和纹理管理器，
-所以 overlay 声明的纹理会照常创建。
-3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment。
-4. 在 Inspector 的 Passes 数组中拖动排序，编辑资源的 Enabled。条目显示具体名称，
-   例如 `Deferred Lighting`、`Blur Horizontal`、`Bloom Composite`；`FengShaderPass`
-   是它们共用的资源类型，不是效果名称。
-5. 在 Inspector 选中 Renderer 或 FengCompositor 后，使用工具菜单
-   **Add Pass from Library** 添加库效果。添加和排序支持编辑器撤销、重做。
+所以 overlay 声明的纹理会照常创建；overlay 自己的 `enabled` 关掉时它既不跑、也不声明纹理
+（契约退回实现脚本本身），而 pass 自己的 operation 照常执行——见上文"挂上去的 pass 也有
+`enabled`"。
 
 ## 后处理在 tonemap 前还是后（shader 关键字）
 
@@ -257,6 +300,12 @@ Operation 承担，开关状态和自定义条目的相对位置都会被保留�
   （vec4 push constant）、`inputs`、`outputs` 和目标纹理。
 - `FengPassTexture` 支持 Color、Depth、GBuffer、管线中间纹理及自定义 scope。
   `FengPassOutput` 声明名称、格式、用途和尺寸比例，隐藏的 Texture Manager 管理分配。
+  字段就叫 `custom_name`（管线/自定义纹理的名字）、`data_format`、`usage`、`scale`
+  （相对内部尺寸的比例）；早期版本用的 `pipeline_name` / `format` / `usage_bits` /
+  `size_divisor` 是同一批字段的旧拼法，已经删掉——**重命名之后被保存过的资源不受影响**
+  （`.tres` 里同时带着新名字），只有重命名之前保存、且从未被重新保存过的资源会留下无效的旧行
+  （Godot 对不存在的属性名是**静默忽略**的，看 `scene/resources/resource_format_text.cpp`），
+  在检查器里按新名字重设一次即可。
 - 在 FengRenderer 中，自定义效果按列表位置运行。`stage` 仅保留为回调参数及旧资源
   迁移提示；在普通 Compositor 中仍按原 Stage 调度。
 - 当前 `Color` 指内部 HDR 颜色；依赖它的效果应位于 Deferred Lighting 后、Tonemap 前

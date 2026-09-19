@@ -24,10 +24,11 @@ func collect_enabled_outputs() -> Array[Output]:
 	var result: Array[Output] = []
 	var seen := {}
 	for effect in passes:
-		if effect == null or not effect.enabled or not effect is PassBase:
+		if effect == null or not effect is PassBase or not effect.is_enabled():
 			continue
 		# A pass delegates its contract to the script that implements it and to that
-		# script's overlay: the object that declares the textures owns them.
+		# script's overlay: the object that declares the textures owns them, and only
+		# while it runs.
 		var source = effect.get_contract_source()
 		if source == null:
 			source = effect

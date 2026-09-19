@@ -42,7 +42,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	pass_parameters = p_pass_parameters;
 }
 
-Dictionary FRPPassContext::get_pass_parameters(int p_pass_id) const {
+Dictionary FRPPassContext::get_pass_parameters(const Variant &p_pass_id) const {
 	const Variant parameters = pass_parameters.get(p_pass_id, Variant());
 	if (parameters.get_type() == Variant::DICTIONARY) {
 		return parameters;

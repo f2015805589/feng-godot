@@ -30,7 +30,13 @@ const PassBase = preload("../pass_base.gd")
 ## shader_file and parameters are then shown on this pass in the pipeline resource,
 ## the URP way) and its work runs as part of this entry instead of as a separate
 ## entry that has to be kept in the right place.
-@export var overlay: PassBase
+##
+## Setting or clearing it changes the pass's resource contract, so it notifies (an
+## `@export` member does not do that on its own).
+@export var overlay: PassBase:
+	set(value):
+		overlay = value
+		emit_changed()
 
 func _init() -> void:
 	native_id = _native_pass_id()
@@ -45,17 +51,39 @@ func _init() -> void:
 func _native_pass_id() -> int:
 	return -1
 
+func get_parameter_key() -> Variant:
+	return native_id
+
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
 		return
 	ctx.run_pass(native_id)
-	if overlay != null:
-		overlay._frp_execute(ctx)
+	run_overlay(ctx)
+
+## The overlay this pass carries and runs, or null when it carries none or it is
+## switched off. An overlay is the *extra* work of a pass - its own shader, parameters
+## and textures - so switching it off stops that work and its declarations without
+## stopping the pass. Which is why is_enabled() is not derived from it: an overlay is
+## not a pass in the schedule, the pass script itself is (see FengBuiltinPass).
+func active_overlay() -> PassBase:
+	return overlay if overlay != null and overlay.enabled else null
+
+## Runs this pass's overlay when it has one that is switched on. A pass script that
+## overrides _frp_execute() and calls its overlay itself uses this, so "is the overlay
+## on" is answered in one place.
+func run_overlay(ctx: FRPPassContext) -> void:
+	var active := active_overlay()
+	if active != null:
+		active._frp_execute(ctx)
 
 ## The overlay is what reads and writes textures, so it owns the resource contract of
-## this pass (inputs, outputs, attachment flags) when one is set.
+## this pass (inputs, outputs, attachment flags) while it runs; a switched-off overlay
+## declares nothing.
 func get_contract_source() -> PassBase:
-	return overlay if overlay != null else self
+	return active_overlay() if active_overlay() != null else self
+
+func carried_passes() -> Array[PassBase]:
+	return [overlay] if overlay != null else []
 
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()

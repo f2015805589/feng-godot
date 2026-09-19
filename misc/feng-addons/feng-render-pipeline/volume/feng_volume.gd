@@ -13,18 +13,29 @@ extends Node3D
 ## rotating or scaling the node moves the region with it.
 
 const Profile = preload("feng_volume_profile.gd")
+const Resolver = preload("volume_resolver.gd")
+const Runtime = preload("volume_runtime.gd")
 
 ## The parameters this volume applies. Without one the volume does nothing.
 @export var profile: Profile
 ## Box extents around the node's origin, in local space.
-@export var size := Vector3(10.0, 10.0, 10.0)
+@export var size := Vector3(10.0, 10.0, 10.0):
+	set(value):
+		size = value
+		_queue_gizmo_redraw()
 ## Ignore `size`: an unbound volume affects every camera, like an Unreal post process
 ## volume with "Unbound" ticked. Use it for a global default.
-@export var unbound := false
+@export var unbound := false:
+	set(value):
+		unbound = value
+		_queue_gizmo_redraw()
 ## Fade the volume in over this distance inside its edges: 0 applies it at full weight
 ## everywhere inside, otherwise the weight ramps from nothing at the edge to `weight`
 ## `blend_distance` in. This is Unreal's blend radius.
-@export var blend_distance := 0.0
+@export var blend_distance := 0.0:
+	set(value):
+		blend_distance = value
+		_queue_gizmo_redraw()
 ## Volumes are applied in ascending priority, so the highest one wins where they
 ## overlap. Equal priorities keep scene order.
 @export var priority := 0
@@ -34,29 +45,19 @@ const Profile = preload("feng_volume_profile.gd")
 ## Off volumes stay in the scene and stop affecting cameras.
 @export var enabled := true
 
-static var _volumes: Array[FengVolume] = []
-static var _last_frame := -1
-## Compositors this system has pushed overrides to, as weak references, so a volume
-## that disappears can clear what it applied to the frames it affected.
-static var _pushed: Array = []
-
 func _enter_tree() -> void:
-	if not _volumes.has(self):
-		_volumes.append(self)
+	Runtime.register(self)
 
 func _exit_tree() -> void:
-	_volumes.erase(self)
-	# The last volume may just have left: clear whatever it was overriding without
-	# waiting for another volume's _process.
-	evaluate_all()
+	Runtime.unregister(self)
 
 func _process(_delta: float) -> void:
-	# One evaluation per frame, whichever volume ticks first.
-	var frame := Engine.get_process_frames()
-	if _last_frame == frame:
-		return
-	_last_frame = frame
-	evaluate_all()
+	Runtime.tick()
+
+## Cheap spatial/profile key; schema reflection stays out of stationary frames.
+func evaluation_key() -> Array:
+	return [get_instance_id(), global_transform, size, unbound, blend_distance, priority,
+			weight, enabled, profile.evaluation_key() if profile != null else null]
 
 ## True when p_point (world space) is inside this volume's box.
 func contains_point(p_point: Vector3) -> bool:
@@ -66,6 +67,30 @@ func contains_point(p_point: Vector3) -> bool:
 		return false
 	var local := global_transform.affine_inverse() * p_point
 	return absf(local.x) <= size.x * 0.5 and absf(local.y) <= size.y * 0.5 and absf(local.z) <= size.z * 0.5
+
+## Local-space size of the finite box's influence-0 boundary. The runtime influence
+## reaches zero at these faces and is zero outside them.
+func get_influence_zero_size() -> Vector3:
+	return size if size.x > 0.0 and size.y > 0.0 and size.z > 0.0 else Vector3.ZERO
+
+## Local-space size of the box where the normalized influence reaches 1. The runtime
+## fade is measured inward from the influence-0 faces, so each axis is inset by twice
+## `blend_distance`. If the fade is wider than an axis, no influence-1 box exists on
+## that axis and the corresponding extent collapses to zero.
+func get_influence_one_size() -> Vector3:
+	var zero_size := get_influence_zero_size()
+	if zero_size == Vector3.ZERO:
+		return Vector3.ZERO
+	var inset := maxf(blend_distance, 0.0) * 2.0
+	return Vector3(
+		maxf(zero_size.x - inset, 0.0),
+		maxf(zero_size.y - inset, 0.0),
+		maxf(zero_size.z - inset, 0.0)
+	)
+
+func _queue_gizmo_redraw() -> void:
+	if Engine.is_editor_hint() and is_inside_tree():
+		update_gizmos()
 
 ## How strongly this volume affects a camera at p_point: 0 outside, `weight` deep
 ## inside, and a ramp over `blend_distance` near the edges.
@@ -90,96 +115,19 @@ func influence_at(p_point: Vector3) -> float:
 ## order. `p_base` is what the renderer authored, used as the starting value for
 ## numeric blending, and only the resulting overrides are returned so the renderer can
 ## tell volume values apart from authored ones.
-static func resolve_overrides(p_volumes: Array, p_base: Dictionary, p_point: Vector3) -> Dictionary:
-	var ordered := p_volumes.duplicate()
-	ordered.sort_custom(func(a, b): return a.priority < b.priority)
-	var overrides := {}
-	for volume in ordered:
-		var blend: float = volume.influence_at(p_point)
-		if blend <= 0.0:
-			continue
-		for pass_id in volume.profile.pass_parameters:
-			var values: Variant = volume.profile.pass_parameters[pass_id]
-			if values == null or not values is Dictionary:
-				continue
-			var target: Dictionary = overrides.get(int(pass_id), {})
-			for key in values:
-				var new_value: Variant = values[key]
-				var previous: Variant = target.get(key, null)
-				if previous == null:
-					var base_values: Variant = p_base.get(int(pass_id), {})
-					if base_values is Dictionary:
-						previous = base_values.get(key, null)
-				if previous != null and _is_number(previous) and _is_number(new_value) and blend < 1.0:
-					target[key] = lerpf(float(previous), float(new_value), blend)
-				elif blend >= 0.5 or previous == null:
-					target[key] = new_value
-			overrides[int(pass_id)] = target
-	return overrides
+static func resolve_overrides(p_volumes: Array, p_base: Dictionary, p_point: Vector3, p_schema: Dictionary = {}, p_aliases: Dictionary = {}) -> Dictionary:
+	return Resolver.parameters(p_volumes, p_base, p_point, p_schema, p_aliases)
 
-static func _is_number(value: Variant) -> bool:
-	return value is int or value is float
-
-## Resolves the pass states a camera's volumes switch on or off, in the same order and
-## with the same weights as resolve_overrides. A state cannot be interpolated, so a
-## volume applies it from half influence up.
 static func resolve_pass_states(p_volumes: Array, p_point: Vector3) -> Dictionary:
-	var ordered := p_volumes.duplicate()
-	ordered.sort_custom(func(a, b): return a.priority < b.priority)
-	var states := {}
-	for volume in ordered:
-		if volume.influence_at(p_point) < 0.5:
-			continue
-		for pass_id in volume.profile.disabled_passes:
-			states[int(pass_id)] = false
-		for pass_id in volume.profile.enabled_passes:
-			states[int(pass_id)] = true
-	return states
+	return Resolver.pass_states(p_volumes, p_point)
 
-## Pushes the resolved overrides of every viewport that has volumes and a camera
-## using a FengCompositor, and clears the compositors whose volumes are gone.
+## Compatibility entry points. Registration and camera lifecycle belong to the
+## runtime service; the node owns only its authored region and spatial influence.
 static func evaluate_all() -> void:
-	if _volumes.is_empty() and _pushed.is_empty():
-		return
-	var viewports := {}
-	for volume in _volumes:
-		if not volume.enabled or volume.profile == null or not volume.is_inside_tree() or volume.weight <= 0.0:
-			continue
-		var viewport := volume.get_viewport()
-		if viewport == null:
-			continue
-		if not viewports.has(viewport):
-			viewports[viewport] = []
-		viewports[viewport].append(volume)
+	Runtime.evaluate_all()
 
-	var current: Array = []
-	for viewport in viewports:
-		var camera: Camera3D = viewport.get_camera_3d()
-		if camera == null:
-			continue
-		var compositor := _active_compositor(viewport, camera)
-		if compositor == null:
-			continue
-		current.append(weakref(compositor))
-		var renderer := compositor.renderer
-		var base := renderer.get_authored_pass_parameters() if renderer != null else {}
-		compositor.set_volume_parameters(resolve_overrides(viewports[viewport], base, camera.global_position), resolve_pass_states(viewports[viewport], camera.global_position))
+static func evaluate_camera(p_volumes: Array, p_camera: Camera3D, p_compositor: FengCompositor) -> void:
+	Runtime.evaluate_camera(p_volumes, p_camera, p_compositor)
 
-	for reference in _pushed:
-		var compositor = reference.get_ref() if reference is WeakRef else reference
-		if not compositor is FengCompositor:
-			continue
-		var still_used := false
-		for active in current:
-			if active.get_ref() == compositor:
-				still_used = true
-				break
-		if not still_used:
-			compositor.set_volume_parameters({}, {})
-	_pushed = current
-
-## The FRP compositor a camera renders with, or null when it renders with something else
-## (no compositor at all, or one that is not FRP's).
-static func _active_compositor(p_viewport: Viewport, p_camera: Camera3D) -> FengCompositor:
-	var compositor := FengWorldCompositor.active_compositor(p_viewport, p_camera)
-	return compositor if compositor is FengCompositor else null
+static func get_scene_volumes(p_root: Node) -> Array:
+	return Runtime.get_scene_volumes(p_root)

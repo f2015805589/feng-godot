@@ -197,6 +197,23 @@ func run() -> void:
 	require(mean_luma(entry_on_image) > off_luma * 0.5, "enabling the Temporal AA entry voided the frame")
 	require(changed_pixels(entry_off_no_taa, entry_on_image) > 0, "enabling the Temporal AA entry with Viewport.use_taa off did not turn TAA on")
 
+	# The switch also has to work on the pass script the entry carries - the object the
+	# pass's exposed parameters live on - because that is a checkbox the inspector shows
+	# next to them. Unchecking it switches the pass off while the entry stays enabled,
+	# and nothing here calls apply(): the edit has to reach the engine through the
+	# resource's own change notification, which is what makes an edited parameter live
+	# instead of taking effect on the next unrelated change.
+	var carried = temporal.get("implementation")
+	require(carried != null, "the Temporal AA entry carries no pass script")
+	carried.enabled = false
+	var carried_off_a: Image = await frame()
+	var carried_off_b: Image = await frame()
+	require(not renderer.get_provided_native_ids().has(6), "switching off the carried pass script kept Temporal AA in the schedule")
+	require(changed_pixels(carried_off_a, carried_off_b) == 0, "the frame was still jittered while the carried pass script was switched off")
+	carried.enabled = true
+	var carried_on: Image = await frame()
+	require(changed_pixels(carried_off_b, carried_on) > 0, "switching the carried pass script back on did not turn Temporal AA on")
+
 	# The entry's parameters come from the pipeline resource. `jitter_phases` sizes the
 	# jitter cycle the viewport uses, and one phase freezes the sampling pattern while
 	# Temporal AA still resolves, which makes the parameter observable from the frames
@@ -219,7 +236,9 @@ func run() -> void:
 	require(mean_luma(frozen_a) > off_luma * 0.5, "jitter_phases=1 voided the frame")
 
 	aa_implementation.jitter_phases = 16
-	renderer.apply(feng_compositor)
+	# Deliberately no apply() here: the parameter lives on the pass script the entry
+	# carries, so editing it has to reach the engine through that resource's change
+	# notification. An engine still holding 16->1 would leave the frames frozen.
 	var authored_a: Image = await frame()
 	var authored_b: Image = await frame()
 	var authored_motion := changed_pixels(authored_a, authored_b)
@@ -267,13 +286,13 @@ func run() -> void:
 	var in_volume_a: Image = await frame()
 	var in_volume_b: Image = await frame()
 	var volume_frozen := changed_pixels(in_volume_a, in_volume_b)
-	require(renderer.get_volume_parameters().has(6), "the volume overrides did not reach the renderer: %s" % [renderer.get_volume_parameters()])
+	require(feng_compositor.get_volume_parameters().has(6), "the volume overrides did not reach the renderer: %s" % [feng_compositor.get_volume_parameters()])
 	volume.global_position = camera.global_position + Vector3(100.0, 0.0, 0.0)
 	var out_of_volume_a: Image = await frame()
 	var out_of_volume_b: Image = await frame()
 	var volume_jittered := changed_pixels(out_of_volume_a, out_of_volume_b)
 	require(volume_frozen * 4 < volume_jittered, "a volume inside the camera did not override the Temporal AA jitter (%d vs %d pixels)" % [volume_frozen, volume_jittered])
-	require(renderer.get_volume_parameters().is_empty(), "the volume overrides were not cleared: %s" % [renderer.get_volume_parameters()])
+	require(feng_compositor.get_volume_parameters().is_empty(), "the volume overrides were not cleared: %s" % [feng_compositor.get_volume_parameters()])
 	print("PASS a FengVolume overrides pass parameters while the camera is inside it (%d vs %d pixels of movement)" % [volume_frozen, volume_jittered])
 
 	# Unreal-style volume controls. An unbound volume (Unreal ticks "Unbound") applies
@@ -293,21 +312,117 @@ func run() -> void:
 	var blended_influence: float = volume.influence_at(camera.global_position)
 	require(blended_influence > 0.1 and blended_influence < 0.4, "the blend distance did not ramp the volume in: %.2f" % blended_influence)
 	await frame()
-	var blended_phases: Variant = renderer.get_volume_parameters().get(6, {}).get("jitter_phases", null)
+	var blended_phases: Variant = feng_compositor.get_volume_parameters().get(6, {}).get("jitter_phases", null)
 	require(blended_phases != null and blended_phases > 1 and blended_phases < 16, "the blended override is not between the authored and the volume value: %s" % [blended_phases])
 	volume.enabled = false
 	await frame()
-	require(renderer.get_volume_parameters().is_empty(), "disabling the volume did not clear its override: %s" % [renderer.get_volume_parameters()])
+	require(feng_compositor.get_volume_parameters().is_empty(), "disabling the volume did not clear its override: %s" % [feng_compositor.get_volume_parameters()])
 	volume.queue_free()
 	print("PASS unbound and blend distance behave like an Unreal post process volume (blended jitter_phases=%.1f)" % [blended_phases])
+
+	# A typed Volume module owns the pass's declared `enabled` field. Keep the
+	# authored resources enabled while the module turns the effect off in this
+	# volume; the frame is the assertion that the schedule and viewport jitter
+	# followed that field instead of falling back to the global TAA switch.
+	root.use_taa = true
+	temporal.enabled = true
+	aa_implementation.enabled = true
+	aa_implementation.jitter_phases = 16
+	temporal.pass_parameters = {}
+	temporal.implementation = aa_implementation
+	renderer.apply(feng_compositor)
+	for i in 8:
+		await frame()
+	var global_taa_a: Image = await frame()
+	var global_taa_b: Image = await frame()
+	var global_taa_motion := changed_pixels(global_taa_a, global_taa_b)
+	require(global_taa_motion > 0, "global TAA baseline has no jitter to exercise the Volume module")
+
+	var volume_module_script = load("res://addons/feng-render-pipeline/volume/feng_volume_module.gd")
+	require(volume_module_script != null, "FRP Volume module resource did not load")
+	var taa_module = volume_module_script.new()
+	taa_module.pass_source = aa_implementation
+	taa_module.set("parameters/enabled", false)
+	var module_profile = volume_profile_script.new()
+	var taa_modules: Array[FengVolumeModule] = [taa_module]
+	module_profile.modules = taa_modules
+	var module_volume = volume_script.new()
+	module_volume.profile = module_profile
+	module_volume.size = Vector3(20.0, 20.0, 20.0)
+	scene.add_child(module_volume)
+	module_volume.global_position = camera.global_position
+	for i in 8:
+		await frame()
+	var module_off_a: Image = await frame()
+	var module_off_b: Image = await frame()
+	var module_off_motion := changed_pixels(module_off_a, module_off_b)
+	require(module_off_motion == 0, "Volume module parameters/enabled=false left global TAA jittering (%d pixels)" % module_off_motion)
+	require(taa_module.enabled, "editing parameters/enabled rewrote the legacy module enabled flag")
+	require(taa_module.values.get("enabled", null) == false, "parameters/enabled=false was not stored on the Volume module")
+	require(temporal.enabled and aa_implementation.enabled, "the Volume module changed the authored TAA enabled state")
+
+	taa_module.set("parameters/enabled", true)
+	for i in 8:
+		await frame()
+	var module_on_a: Image = await frame()
+	var module_on_b: Image = await frame()
+	var module_on_motion := changed_pixels(module_on_a, module_on_b)
+	require(module_on_motion > 0, "Volume module parameters/enabled=true did not restore TAA jitter")
+	require(temporal.enabled and aa_implementation.enabled, "enabling the Volume module changed the authored TAA enabled state")
+
+	module_volume.enabled = false
+	for i in 8:
+		await frame()
+	var whole_volume_off_a: Image = await frame()
+	var whole_volume_off_b: Image = await frame()
+	var whole_volume_off_motion := changed_pixels(whole_volume_off_a, whole_volume_off_b)
+	require(whole_volume_off_motion > 0, "disabling the whole Volume did not restore global TAA jitter")
+	require(temporal.enabled and aa_implementation.enabled, "disabling the Volume changed the authored TAA enabled state")
+
+	# Profiles saved before the typed `parameters/enabled` field used the module's
+	# storage flag. Recreate that shape explicitly: no enabled value in `values`,
+	# with the legacy module flag false, and make sure it still disables the effect.
+	taa_module.enabled = false
+	taa_module.values.erase("enabled")
+	module_volume.enabled = true
+	for i in 8:
+		await frame()
+	var legacy_module_off_a: Image = await frame()
+	var legacy_module_off_b: Image = await frame()
+	var legacy_module_off_motion := changed_pixels(legacy_module_off_a, legacy_module_off_b)
+	require(legacy_module_off_motion == 0, "legacy module.enabled=false without values/enabled did not disable TAA (%d pixels)" % legacy_module_off_motion)
+	require(not taa_module.values.has("enabled") and not taa_module.enabled, "legacy module compatibility test did not preserve the old storage shape")
+	require(temporal.enabled and aa_implementation.enabled, "legacy Volume compatibility changed the authored TAA enabled state")
+	# It is the same enabled parameter at all three layers, including the
+	# pipeline's parameter dictionary rather than only the resource checkbox.
+	taa_module.set("parameters/enabled", true)
+	temporal.pass_parameters = {"enabled": false}
+	for i in 4:
+		await frame()
+	var layered_on_a: Image = await frame()
+	var layered_on_b: Image = await frame()
+	require(changed_pixels(layered_on_a, layered_on_b) > 0, "pipeline parameters won over the Volume enabled parameter")
+	module_volume.enabled = false
+	for i in 4:
+		await frame()
+	var layered_off_a: Image = await frame()
+	var layered_off_b: Image = await frame()
+	require(changed_pixels(layered_off_a, layered_off_b) == 0, "leaving Volume did not restore pipeline parameters/enabled=false")
+	require(temporal.pass_parameters.get("enabled") == false and temporal.enabled and aa_implementation.enabled,
+			"Volume overwrote authored pipeline parameters or resource flags")
+	temporal.pass_parameters = {}
+	module_volume.queue_free()
+	await frame()
+	print("PASS a declared TAA Volume module disables jitter, restores it, restores global TAA when the Volume is off, and reads legacy module.enabled storage")
 
 	# A volume switches whole passes on and off without touching the pass resources: the
 	# entry keeps its authored state and the schedule (and the engine's provided pass
 	# set) follows the volume while the camera is inside it.
 	root.use_taa = false
 	temporal.pass_parameters = {}
-	temporal.implementation = null
+	temporal.implementation = aa_implementation
 	temporal.enabled = true
+	aa_implementation.enabled = true
 	renderer.apply(feng_compositor)
 	for i in 4:
 		await frame()
@@ -327,7 +442,8 @@ func run() -> void:
 		await frame()
 	var switched_off: Image = await frame()
 	require(temporal.enabled, "the volume override changed the authored entry instead of layering over it")
-	require(renderer.get_volume_pass_states().get(6, true) == false, "the volume did not report the pass state: %s" % [renderer.get_volume_pass_states()])
+	require(aa_implementation.enabled, "the legacy volume switch changed the authored TAA implementation")
+	require(feng_compositor.get_volume_pass_states().get(6, true) == false, "the volume did not report the pass state: %s" % [feng_compositor.get_volume_pass_states()])
 	require(changed_pixels(entry_off_no_taa, switched_off) == 0, "the volume did not switch the Temporal AA pass off")
 
 	# The other direction: the entry is authored off and the volume switches it on,
@@ -342,6 +458,7 @@ func run() -> void:
 		await frame()
 	var switched_on: Image = await frame()
 	require(not temporal.enabled, "the volume override changed the authored entry instead of layering over it")
+	require(aa_implementation.enabled, "the legacy volume switch changed the authored TAA implementation")
 	require(changed_pixels(entry_off_no_taa, switched_on) > 0, "the volume did not switch the Temporal AA pass on")
 	toggle_volume.queue_free()
 	await frame()

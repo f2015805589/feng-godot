@@ -13,7 +13,10 @@ const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 
 @export var shader_file: RDShaderFile
 @export var mode: Mode = Mode.COMPUTE
-@export var parameters := Vector4(1.0, 1.0, 1.0, 1.0)
+@export var parameters := Vector4(1.0, 1.0, 1.0, 1.0):
+	set(value):
+		parameters = value
+		emit_changed()
 @export var workgroup_size := Vector2i(8, 8)
 
 ## Shader keywords: specialization constants, keyed by the `constant_id` the shader
@@ -42,6 +45,22 @@ var _shader_mode := -1
 var _keyword_signature := ""
 var _raster_pipelines := {}
 var _binding_error := false
+var _frame_parameters: Variant = null
+
+func get_frp_parameters() -> Dictionary:
+	return {"parameters": parameters}
+
+func get_volume_parameter_names() -> PackedStringArray:
+	return PackedStringArray(["parameters"])
+
+func _frp_execute(ctx: FRPPassContext) -> void:
+	_frame_parameters = get_resolved_parameters(ctx).get("parameters", parameters)
+	super._frp_execute(ctx)
+	_frame_parameters = null
+
+func _parameter_bytes() -> PackedByteArray:
+	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
+	return PackedFloat32Array([value.x, value.y, value.z, value.w]).to_byte_array()
 
 ## Sets one shader keyword (a specialization constant) and re-specializes the shader
 ## when its value actually changed.
@@ -204,7 +223,7 @@ func _render_compute(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevi
 		dispatch_size = buffers.get_texture_slice_size(PIPELINE_SCOPE, target, 0)
 	if dispatch_size.x <= 0 or dispatch_size.y <= 0:
 		return
-	var push := PackedFloat32Array([parameters.x, parameters.y, parameters.z, parameters.w]).to_byte_array()
+	var push := _parameter_bytes()
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, _compute_pipeline)
 	if uniform_set.is_valid():
@@ -238,7 +257,7 @@ func _render_raster(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevic
 	if not pipeline.is_valid():
 		rd.free_rid(framebuffer)
 		return
-	var push := PackedFloat32Array([parameters.x, parameters.y, parameters.z, parameters.w]).to_byte_array()
+	var push := _parameter_bytes()
 	var list := rd.draw_list_begin(framebuffer)
 	rd.draw_list_bind_render_pipeline(list, pipeline)
 	if uniform_set.is_valid():

@@ -1,5 +1,16 @@
 # Terrain integration tests
 
+## Stopped TAA camera regression
+
+`python misc/feng-addons/feng-idweight-terrain/native/tests/vt_motion_decay_runner.py`
+turns a real terrain camera with TAA enabled, then renders 400 stationary frames.
+The native VT turn predictor used to decay into float subnormals: its squared length
+lost precision, so dividing the vector by that length supplied a non-unit axis to
+`Basis`. The baseline produced 33 axis-normalization errors. Ignoring predicted
+turns below 1e-6 radians removes the invalid rotation; the same regression reports
+zero errors and verifies that an ordinary turn still produces a nonzero lead.
+This is an addon-side numerical fix; the engine's axis validation remains intact.
+
 ## Full regression
 
 Every runner, one command:

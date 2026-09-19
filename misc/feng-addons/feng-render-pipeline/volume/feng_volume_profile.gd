@@ -1,25 +1,44 @@
 @tool
 class_name FengVolumeProfile
 extends Resource
-## FRP pass parameters a FengVolume applies while a camera is inside it.
-##
-## URP drives its render passes from a Volume system. FRP defines its own here, on
-## the addon side, because these parameters belong to FRP passes rather than to the
-## engine's Environment: a project can therefore turn a pass's settings up or down
-## per area (or per camera) without an engine change and without touching the pass
-## resources themselves.
-##
-## The values are keyed by native FRP pass id, exactly like the parameters a pass
-## script exposes (see FengPass.get_frp_parameters()):
-##
-##     pass_parameters = {
-##         6: {"jitter_phases": 1},          # Temporal AA
-##     }
-##
-## Numeric values are blended in by the volume's weight; other values are taken from
-## the volume once its weight is at least half. This is the first cut: per-parameter
-## blend modes (like URP's min/max/add) and pass enable/disable overrides come later.
-@export var pass_parameters: Dictionary = {}
+## Selected FRP modules. A pass author defines the Volume field list in code;
+## this resource stores only values for those fields, never exposure permissions.
+## Runtime filtering uses the current renderer's declarations, including for legacy
+## dictionary profiles, so stale or hidden fields cannot bypass the pass contract.
+## Add modules from the pipeline in the Inspector. The pass code owns their fields.
+@export var modules: Array[FengVolumeModule] = []:
+	set(value):
+		for module in modules:
+			if module != null and module.changed.is_connected(_on_module_changed):
+				module.changed.disconnect(_on_module_changed)
+		modules = value
+		for module in modules:
+			if module != null and not module.changed.is_connected(_on_module_changed):
+				module.changed.connect(_on_module_changed)
+		emit_changed()
+
+func _on_module_changed() -> void:
+	emit_changed()
+
+func evaluation_key() -> Array:
+	var key: Array = [get_instance_id(), pass_parameters.hash(), enabled_passes.hash(), disabled_passes.hash()]
+	for module in modules:
+		key.append(module.evaluation_key() if module != null else null)
+	return key
+
+## Compatibility storage for existing profiles. New profiles use typed modules.
+@export_storage var pass_parameters: Dictionary = {}
+
+func get_parameters() -> Dictionary:
+	var result := pass_parameters.duplicate(true)
+	for module in modules:
+		if module == null or module.pass_source == null:
+			continue
+		var key: Variant = module.get_parameter_key()
+		var parameters: Dictionary = result.get(key, {})
+		parameters.merge(module.get_parameters(), true)
+		result[key] = parameters
+	return result
 
 ## Passes this volume switches on, and passes it switches off, by native pass id.
 ##
@@ -33,5 +52,5 @@ extends Resource
 ## least half, and `enabled_passes` wins over `disabled_passes` at the same priority.
 ## A mandatory pass (see the pipeline spec) cannot be switched off this way; the
 ## renderer reports the incomplete schedule instead.
-@export var enabled_passes: Array[int] = []
-@export var disabled_passes: Array[int] = []
+@export_storage var enabled_passes: Array[int] = []
+@export_storage var disabled_passes: Array[int] = []

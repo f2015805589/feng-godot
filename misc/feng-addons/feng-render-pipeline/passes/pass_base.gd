@@ -19,15 +19,31 @@ const OutputDeclaration = preload("pass_output.gd")
 		effect_callback_type = stage
 		emit_changed()
 
-@export var inputs: Array[TextureInput] = []
-@export var outputs: Array[OutputDeclaration] = []
+## The declarations the renderer and the engine read at apply time are authored
+## properties, and an `@export` member of a GDScript does not emit Resource.changed on
+## its own: the inspector and UndoRedo set it through Object.set(), which for a script
+## member is a plain assignment. So the state the schedule collects - the texture
+## contract, the provided ids, the parameters - notifies from its own setter, which is
+## what makes an edit in the inspector reach the engine instead of waiting for the next
+## unrelated change.
+@export var inputs: Array[TextureInput] = []:
+	set(value):
+		inputs = value
+		emit_changed()
+@export var outputs: Array[OutputDeclaration] = []:
+	set(value):
+		outputs = value
+		emit_changed()
 ## Native FRP passes this pass takes over, by id. Declaring an id tells the
 ## renderer that a schedule without the matching built-in entry is complete: the
 ## pass runs that entry's work itself through the FRPPassContext primitives, so
 ## the entry is neither re-added during normalization nor reported as missing.
 ## Declare only what the pass actually does - a declaration without the work
 ## produces an incomplete frame rather than a validation error.
-@export var provides_native_ids: Array[int] = []
+@export var provides_native_ids: Array[int] = []:
+	set(value):
+		provides_native_ids = value
+		emit_changed()
 ## Stable identity used by the renderer's persisted library and migration
 ## bookkeeping.  It is storage-only because it is an implementation detail,
 ## while Resource.resource_name is the readable name shown in the inspector.
@@ -59,23 +75,82 @@ func _clear_report() -> void:
 
 ## Parameters this pass exposes, in the sense URP gives a render pass its settings.
 ##
-## A pass script chooses what it exposes by overriding this and listing typed
-## `@export` properties, so the pipeline resource shows exactly those fields for that
-## pass and nothing else. The values are read by the engine for the few it consumes
+## Custom typed `@export` properties are collected automatically. Override this
+## for computed values or a narrower global schema. Volume permission is a separate
+## author-owned declaration: get_volume_parameter_names(). The values are read by the engine for the few it consumes
 ## itself (the Temporal AA entry's `jitter_phases` sizes the viewport jitter) and by
 ## other passes through `FRPPassContext.get_pass_parameters(pass_id)`.
 ##
 ## The entry's own `pass_parameters` dictionary overrides these values, which is how a
 ## pipeline overrides a pass without editing the pass resource.
+##
+## The pipeline collects what this returns when it hands its schedule to the engine, so
+## an exposed property has to notify when it changes: declare its setter with
+## `emit_changed()`, as the pass scripts this addon ships do. An `@export` member does
+## not emit on its own, so without the setter an edit in the inspector would only reach
+## the engine on the next unrelated change.
 func get_frp_parameters() -> Dictionary:
-	return {}
+	var parameters := {}
+	# Script exports are settings; the base protocol's exports are infrastructure.
+	for property in get_property_list():
+		var usage := int(property.get("usage", 0))
+		if (usage & PROPERTY_USAGE_SCRIPT_VARIABLE) == 0 or (usage & PROPERTY_USAGE_EDITOR) == 0:
+			continue
+		var key := String(property.name)
+		if key in ["stage", "inputs", "outputs", "provides_native_ids", "pass_parameters", "overlay", "implementation"]:
+			continue
+		parameters[key] = get(key)
+	return parameters
+
+## Stable parameter address, independent of list order and native capabilities.
+## Override this in a custom pass when several instances of one script need separate
+## settings. Library passes already carry a persisted stable_id.
+func get_parameter_key() -> Variant:
+	if stable_id != &"":
+		return String(stable_id)
+	var script: Script = get_script()
+	return script.resource_path if script != null else ""
+
+func get_parameter_source() -> FengPass:
+	return self
+
+## Only the PASS AUTHOR decides which of its settings a Volume may control.
+## Empty means no Volume module. This is code, never an Inspector permission list.
+func get_volume_parameter_names() -> PackedStringArray:
+	return PackedStringArray()
+
+## Reuses export types/ranges for the Volume UI; dictionary-only settings work too.
+func get_volume_parameter_list() -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var defaults := get_frp_parameters()
+	var properties := {}
+	for property in get_property_list():
+		properties[String(property.name)] = property
+	for key in get_volume_parameter_names():
+		if not defaults.has(key):
+			continue
+		var info: Dictionary = properties.get(key, {"name": key, "type": typeof(defaults[key])}).duplicate()
+		info.usage = PROPERTY_USAGE_DEFAULT
+		result.append(info)
+	return result
+
+## Runtime settings belong to the frame, never written back into authored exports.
+func get_resolved_parameters(ctx: FRPPassContext) -> Dictionary:
+	var result := get_frp_parameters().duplicate()
+	result.merge(pass_parameters, true)
+	if ctx != null:
+		result.merge(ctx.get_pass_parameters(get_parameter_key()), true)
+	return result
 
 ## Values for the parameters above, authored in the pipeline resource. They override
 ## what the pass exposes, so a project can change one value without editing the pass
 ## resource, and a volume (see FengVolume) overrides them at runtime. The keys are
 ## pass parameter names for the passes this pass provides; a native entry uses the
 ## dictionary for its own pass.
-@export var pass_parameters: Dictionary = {}
+@export var pass_parameters: Dictionary = {}:
+	set(value):
+		pass_parameters = value
+		emit_changed()
 
 ## The object that owns this pass's resource contract: the inputs it reads, the
 ## outputs it produces and the resolved-attachment flags the engine needs before it
@@ -83,6 +158,22 @@ func get_frp_parameters() -> Dictionary:
 ## the overlay is the part that reads or writes textures.
 func get_contract_source() -> FengPass:
 	return self
+
+## Whether the work of this pass runs this frame. Its own `enabled` is the authored
+## switch; a pass that carries another pass (see carried_passes) is only running when
+## that one runs too, so unchecking a carried pass turns its work off instead of
+## leaving a flag nothing reads. A volume's pass state overrides the entry this pass
+## belongs to (see FengVolume).
+func is_enabled() -> bool:
+	return enabled
+
+## The passes this pass runs as part of itself, if any: the script that implements an
+## entry's native work, or a pass's overlay. They are resources of their own, so the
+## renderer observes them directly (an edit to a nested resource does not travel to the
+## one holding it) and an entry's effective enabled state is the conjunction of the
+## chain.
+func carried_passes() -> Array[FengPass]:
+	return []
 
 func _render_callback(callback_stage: int, data: RenderData) -> void:
 	if callback_stage != effect_callback_type or data == null:

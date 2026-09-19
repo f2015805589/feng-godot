@@ -15,6 +15,9 @@ const PipelineValidator = preload("pipeline/pipeline_validator.gd")
 const PipelineMigrator = preload("pipeline/pipeline_migrator.gd")
 const LibraryManager = preload("pipeline/library_manager.gd")
 const NativeSpec = preload("pipeline/native_spec.gd")
+const ParameterResolver = preload("pipeline/parameter_resolver.gd")
+const ExecutionPlan = preload("pipeline/execution_plan.gd")
+const CompositorBinding = preload("pipeline/compositor_binding.gd")
 
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
@@ -91,8 +94,11 @@ var _last_validation_warnings := PackedStringArray()
 var _volume_parameters := {}
 var _volume_pass_states := {}
 var _normalizing := false
+var _volume_context_cache := {}
+var _parameter_revision := 0
 
 func _init() -> void:
+	changed.connect(_invalidate_volume_context)
 	_manager = TextureManager.new()
 	# Seed a new resource for a useful inspector experience. If this object is
 	# loaded from disk, Godot restores serialized passes after _init(); migration
@@ -195,11 +201,32 @@ func _set_passes(value: Array, emit: bool) -> void:
 func _connect_passes() -> void:
 	_disconnect_passes()
 	for pass_entry in _passes:
-		if pass_entry == null:
-			continue
-		_observed_passes.append(pass_entry)
-		if pass_entry.has_signal("changed") and not pass_entry.changed.is_connected(_on_pass_changed):
-			pass_entry.changed.connect(_on_pass_changed)
+		_observe_pass(pass_entry)
+
+## Watches one authored pass and everything it carries. A carried pass (an entry's
+## implementation, a native pass's overlay) is a resource of its own, so the inspector
+## edits it directly and Godot does not forward its `changed` to the resource holding
+## it. Without observing them, editing an exposed parameter or switching the carried
+## pass off would only reach the engine on the next unrelated change - and the entry's
+## enabled state, which follows the chain, would look stale.
+func _observe_pass(pass_entry) -> void:
+	if pass_entry == null or _observed_passes.has(pass_entry):
+		return
+	if pass_entry.stable_id == &"":
+		# Persist an instance identity; a script path cannot distinguish two copies.
+		pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
+	for observed in _observed_passes:
+		if observed.stable_id == pass_entry.stable_id:
+			# Duplicating a resource duplicates its stored ID too. A second resource
+			# in this pipeline is a new instance; runtime pipeline copies retain IDs.
+			pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
+			break
+	_observed_passes.append(pass_entry)
+	if pass_entry.has_signal("changed") and not pass_entry.changed.is_connected(_on_pass_changed):
+		pass_entry.changed.connect(_on_pass_changed)
+	if pass_entry.has_method("carried_passes"):
+		for carried in pass_entry.carried_passes():
+			_observe_pass(carried)
 
 func _disconnect_passes() -> void:
 	for pass_entry in _observed_passes:
@@ -210,8 +237,11 @@ func _disconnect_passes() -> void:
 func _on_pass_changed() -> void:
 	if _normalizing:
 		return
-	# Resource.changed bridges nested pass edits to a Compositor. Native enabled
-	# changes also need a new token list, so they are included.
+	# The edited pass may have gained or lost a carried pass (an implementation or an
+	# overlay was set or cleared), so what is observed is refreshed before the change is
+	# forwarded: Resource.changed bridges nested pass edits to a Compositor, and native
+	# enabled changes also need a new token list.
+	_connect_passes()
 	emit_changed()
 	notify_property_list_changed()
 
@@ -257,11 +287,7 @@ func _contract_source(pass_entry):
 ## A pass the addon runs: a custom pass, or a native entry whose implementation is a
 ## pass script. Everything else is executed by the engine's own token.
 func _is_scripted(pass_entry) -> bool:
-	if pass_entry == null:
-		return false
-	if pass_entry is BuiltinPass:
-		return (pass_entry as BuiltinPass).implementation != null
-	return true
+	return ExecutionPlan.is_scripted(pass_entry)
 
 ## Native passes the authored list provides through pass scripts, i.e. the passes the
 ## engine has no token for. A pass that runs an engine entry's work itself declares
@@ -269,41 +295,15 @@ func _is_scripted(pass_entry) -> bool:
 ## provides its own id); the renderer then accepts a schedule where that entry is
 ## absent, and normalization does not re-add it.
 func _provided_native_ids() -> Dictionary:
-	var provided := {}
-	for pass_entry in _passes:
-		if pass_entry == null or not _is_entry_enabled(pass_entry):
-			continue
-		if pass_entry is BuiltinPass:
-			var native := pass_entry as BuiltinPass
-			if native.implementation == null:
-				# The engine token runs this one.
-				continue
-			if NativeSpec.is_valid_id(native.native_id):
-				provided[native.native_id] = true
-			for native_id in _declared_provides(native.implementation):
-				provided[int(native_id)] = true
-		for native_id in _declared_provides(pass_entry):
-			provided[int(native_id)] = true
-	return provided
+	return ExecutionPlan.provided_native_ids(_passes, _is_entry_enabled)
 
 ## Native ids custom passes declare they run. Declaring an id whose engine entry is
 ## also enabled would run the same work twice.
 func _declared_provided_ids() -> Dictionary:
-	var declared := {}
-	for pass_entry in _passes:
-		if pass_entry == null or pass_entry is BuiltinPass or not _is_entry_enabled(pass_entry):
-			continue
-		for native_id in _declared_provides(pass_entry):
-			declared[int(native_id)] = true
-	return declared
+	return ExecutionPlan.declared_provided_ids(_passes, _is_entry_enabled)
 
 func _declared_provides(pass_entry) -> Array:
-	if pass_entry == null:
-		return []
-	var declared = pass_entry.get("provides_native_ids")
-	if declared == null:
-		return []
-	return declared
+	return ExecutionPlan.declared_provides(pass_entry)
 
 ## True when custom passes declare every mandatory entry, so the list is a complete
 ## schedule without any engine entry. Such a list must not be treated as a legacy
@@ -332,84 +332,67 @@ func get_provided_native_ids() -> PackedInt32Array:
 ## the authored state, without the runtime volume layer.
 func get_authored_pass_parameters() -> Dictionary:
 	_ensure_pipeline_initialized(false)
-	var parameters := {}
-	for pass_entry in _passes:
-		if pass_entry == null:
-			continue
-		if pass_entry is BuiltinPass:
-			var native := pass_entry as BuiltinPass
-			if not NativeSpec.is_valid_id(native.native_id):
-				continue
-			var declared := _declared_parameters(native.implementation)
-			declared.merge(native.pass_parameters, true)
-			if not declared.is_empty():
-				parameters[native.native_id] = declared
-			continue
-		# A custom pass exposes parameters for the passes it provides itself.
-		var own := _declared_parameters(pass_entry)
-		own.merge(pass_entry.pass_parameters, true)
-		if own.is_empty():
-			continue
-		for native_id in _declared_provides(pass_entry):
-			if not NativeSpec.is_valid_id(int(native_id)):
-				continue
-			var target: Dictionary = parameters.get(int(native_id), {})
-			target.merge(own, true)
-			parameters[int(native_id)] = target
-	return parameters
+	return ParameterResolver.authored(_passes)
 
-## The parameters the schedule carries, with the volume overrides on top (see
-## FengVolume): a volume is the runtime override and therefore wins.
+func get_volume_modules() -> Array[FengPass]:
+	_ensure_pipeline_initialized(false)
+	return ParameterResolver.volume_modules(_passes)
+
+func get_volume_parameter_schema() -> Dictionary:
+	_ensure_pipeline_initialized(false)
+	return ParameterResolver.volume_schema(_passes)
+
+func get_volume_parameter_aliases() -> Dictionary:
+	_ensure_pipeline_initialized(false)
+	return ParameterResolver.volume_aliases(_passes)
+
 func get_pass_parameters() -> Dictionary:
-	var parameters := get_authored_pass_parameters()
-	return _with_volume_parameters(parameters)
+	_ensure_pipeline_initialized(false)
+	return ParameterResolver.resolve(_passes, _volume_parameters)
 
-func _with_volume_parameters(parameters: Dictionary) -> Dictionary:
-	for native_id in _volume_parameters:
-		var volume_values: Dictionary = _volume_parameters[native_id]
-		var merged: Dictionary = parameters.get(native_id, {})
-		merged.merge(volume_values, true)
-		parameters[native_id] = merged
-	return parameters
+## Revision-cached authored snapshot for per-camera evaluation. Resource changes
+## invalidate it; callers receive isolated dictionaries. Stationary Volume frames
+## check get_parameter_revision() and need not ask for another snapshot at all.
+func get_volume_context() -> Dictionary:
+	if _volume_context_cache.is_empty():
+		_ensure_pipeline_initialized(false)
+		_volume_context_cache = {
+			"base": ParameterResolver.authored(_passes),
+			"schema": ParameterResolver.volume_schema(_passes),
+			"aliases": ParameterResolver.volume_aliases(_passes),
+		}
+	return _volume_context_cache.duplicate(true)
 
-func _declared_parameters(pass_entry) -> Dictionary:
-	if pass_entry == null:
-		return {}
-	var declared = pass_entry.get_frp_parameters()
-	if declared == null or not declared is Dictionary:
-		return {}
-	return (declared as Dictionary).duplicate()
+func get_parameter_revision() -> int:
+	return _parameter_revision
+
+func _invalidate_volume_context() -> void:
+	_volume_context_cache = {}
+	_parameter_revision += 1
 
 ## Pass parameters and pass states a volume resolved for this camera. The compositor
 ## pushes them before the frame, and they override the authored values (see FengVolume).
 func set_volume_parameters(parameters: Dictionary, pass_states: Dictionary = {}) -> void:
-	if parameters == _volume_parameters and pass_states == _volume_pass_states:
+	var next_parameters := parameters.duplicate(true)
+	var next_pass_states := pass_states.duplicate(true)
+	if next_parameters == _volume_parameters and next_pass_states == _volume_pass_states:
 		return
-	_volume_parameters = parameters
-	_volume_pass_states = pass_states
+	_volume_parameters = next_parameters
+	_volume_pass_states = next_pass_states
 	emit_changed()
 
 func get_volume_parameters() -> Dictionary:
-	return _volume_parameters
+	return _volume_parameters.duplicate(true)
 
 func get_volume_pass_states() -> Dictionary:
-	return _volume_pass_states
+	return _volume_pass_states.duplicate(true)
 
-## Whether a pass runs in this frame: the entry's authored `enabled`, overridden by a
-## volume. A custom pass follows the states of the passes it provides, so a volume can
-## switch an effect on or off wherever the pass lives.
+## Whether a pass runs in this frame: its own enabled state (which includes the passes
+## it carries, see FengPass.is_enabled), overridden by a volume. A custom pass follows
+## the states of the passes it provides, so a volume can switch an effect on or off
+## wherever the pass lives.
 func _is_entry_enabled(pass_entry) -> bool:
-	if pass_entry == null:
-		return false
-	if pass_entry is BuiltinPass:
-		var native := pass_entry as BuiltinPass
-		if _volume_pass_states.has(native.native_id):
-			return bool(_volume_pass_states[native.native_id])
-		return pass_entry.enabled
-	for native_id in _declared_provides(pass_entry):
-		if _volume_pass_states.has(int(native_id)):
-			return bool(_volume_pass_states[int(native_id)])
-	return pass_entry.enabled
+	return ExecutionPlan.is_entry_enabled(pass_entry, _volume_pass_states)
 
 ## Resources authored before schema 5 carry the pre-collapse native ids. Every entry
 ## that still exists keeps its enabled state, entries that became internal
@@ -509,94 +492,40 @@ func apply(compositor: Compositor) -> void:
 	_ensure_pipeline_initialized(true)
 	var candidate_warnings := _validate_schedule()
 	_last_validation_warnings = candidate_warnings
-	if not candidate_warnings.is_empty():
-		# Enabled is a live native property. A producer may already have been
-		# disabled when validation finds that another effect still needs it.
-		# Keep the last valid schedule, but stop the project's own effects until the
-		# authored resource contracts are valid again. The native entries keep running:
-		# they are the schedule the frame is built from, and they are also pass scripts
-		# now, so suspending them would void the frame instead of the authoring.
-		if compositor.compositor_effects.has(_manager):
-			for effect in compositor.compositor_effects:
-				if effect == _manager or effect is BuiltinPass:
-					continue
-				RenderingServer.compositor_effect_set_enabled(effect.get_rid(), false)
-			_manager.passes.clear()
-		for warning in candidate_warnings:
-			push_warning("FengRenderer: " + warning)
-		return
-
-	for pass_entry in _passes:
-		if pass_entry != null:
-			# This must happen before compositor effects are uploaded so the native
-			# renderer sees accurate attachment requirements immediately. The contract
-			# lives in the pass script that implements the entry (and in its overlay),
-			# while the engine reads the flags from the effect, so they are copied over.
-			var contract = _contract_source(pass_entry)
-			contract.refresh_resource_flags()
-			if contract != pass_entry:
-				pass_entry.access_resolved_color = contract.access_resolved_color
-				pass_entry.access_resolved_depth = contract.access_resolved_depth
-				pass_entry.needs_motion_vectors = contract.needs_motion_vectors
-				pass_entry.needs_normal_roughness = contract.needs_normal_roughness
-				pass_entry.needs_separate_specular = contract.needs_separate_specular
-			RenderingServer.compositor_effect_set_enabled(pass_entry.get_rid(), _is_entry_enabled(pass_entry))
-
-	var effects: Array[CompositorEffect] = []
-	effects.append(_manager)
-	var scripted_effects: Array[CompositorEffect] = []
-	for pass_entry in _passes:
-		if pass_entry == null or not _is_scripted(pass_entry):
-			continue
-		scripted_effects.append(pass_entry)
-		effects.append(pass_entry)
-	# Keep disabled scripted passes in both arrays. The native scheduler checks
-	# enabled at token execution time, while stable effect indices remain valid.
-	_manager.passes = scripted_effects
-	compositor.compositor_effects = effects
-	var schedule := _build_schedule()
-	_set_native_schedule(compositor, schedule["tokens"], schedule["names"])
-	_last_valid_schedule = schedule["tokens"]
+	# Do not even derive a candidate effect list for an invalid schedule: binding's
+	# fallback intentionally leaves the engine's previous valid schedule untouched.
+	var schedule: Dictionary = {}
+	if candidate_warnings.is_empty():
+		schedule = _build_schedule()
+	var result := CompositorBinding.apply(
+		compositor,
+		_manager,
+		_passes,
+		schedule,
+		candidate_warnings,
+		_contract_source,
+		_is_entry_enabled,
+		get_provided_native_ids,
+		get_pass_parameters
+	)
+	if result.get("applied", false):
+		_last_valid_schedule = result["tokens"]
 
 func _set_native_schedule(compositor: Compositor, tokens: PackedInt32Array, names: PackedStringArray) -> void:
 	# Passes a plugin runs itself are reported to the engine: the schedule dropped
 	# their engine entries, and the renderer's per-frame feature setup reads this list
 	# to know the pass is still part of the frame (it is what keeps the Temporal AA
 	# jitter running when a plugin pass owns that entry).
-	var provided := get_provided_native_ids()
-	var parameters := get_pass_parameters()
-	RenderingServer.compositor_set_frp_pipeline(compositor.get_rid(), tokens, names, provided, parameters)
+	CompositorBinding.upload(compositor, tokens, names, get_provided_native_ids(), get_pass_parameters())
 
 ## The authored schedule exactly as the engine receives it: one token and one readable
 ## name per executed entry, in order, with the texture manager first. Both lists come
 ## from the same walk, so they cannot drift apart.
 func _build_schedule() -> Dictionary:
-	var tokens: Array[int] = [MANAGER_TOKEN]
-	var names := PackedStringArray(["Texture Preparation"])
-	var effect_index := 1 # compositor_effects[0] is the manager.
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry == null:
-			continue
-		if _is_scripted(pass_entry):
-			# Every scripted pass occupies an effect slot, including disabled entries:
-			# the engine checks enabled at token execution time.
-			tokens.append(-(effect_index + 1))
-			effect_index += 1
-			names.append(_schedule_name(pass_entry, i))
-			continue
-		# A native entry without an implementation is the engine's own pass.
-		var native := pass_entry as BuiltinPass
-		if _is_entry_enabled(native):
-			tokens.append(native.native_id)
-			names.append(_schedule_name(pass_entry, i))
-	return {"tokens": PackedInt32Array(tokens), "names": names}
+	return ExecutionPlan.build(_passes, _manager, _is_scripted, _is_entry_enabled)
 
 func _schedule_name(pass_entry, index: int) -> String:
-	var display_name: String = pass_entry.resource_name
-	if display_name.is_empty():
-		display_name = str(pass_entry.stable_id) if not pass_entry.stable_id.is_empty() else "Custom Pass"
-	return "%02d %s" % [index, display_name]
+	return ExecutionPlan.schedule_name(pass_entry, index)
 
 func get_execution_tokens() -> PackedInt32Array:
 	_ensure_pipeline_initialized(false)
@@ -609,7 +538,7 @@ func get_validation_warnings() -> PackedStringArray:
 	return _last_validation_warnings
 
 func _validate_schedule() -> PackedStringArray:
-	return PipelineValidator.validate_schedule(
+	return ExecutionPlan.validation_warnings(
 		_passes,
 		_provided_native_ids(),
 		_declared_provided_ids(),

@@ -131,7 +131,21 @@ func run() -> void:
 	# 3. The keyword follows the parameter, so the same shader serves both positions.
 	require(after_pixel.g - before_pixel.g > 0.3, "the position keyword did not change the overlay shader: %s vs %s" % [before_pixel, after_pixel])
 
-	# 4. Removing the overlay restores the engine's own frame: the lit sphere again,
+	# 4. The overlay carries its own enabled flag, next to the shader and parameters the
+	#    inspector shows for it: switching it off stops the overlay's work and its
+	#    declared textures without touching the pass, and nothing here calls apply().
+	overlay.enabled = false
+	var disabled := await frame()
+	var disabled_pixel := disabled.get_pixelv(CENTER)
+	print("Post pass with the overlay switched off: %s" % [disabled_pixel])
+	require(disabled_pixel.g < 0.9 and absf(disabled_pixel.r - disabled_pixel.g) < 0.05 and disabled_pixel.r > 0.2,
+		"switching the overlay off did not restore the engine's frame: %s" % [disabled_pixel])
+	overlay.enabled = true
+	var restored := await frame()
+	var restored_pixel := restored.get_pixelv(CENTER)
+	require(restored_pixel.r > 0.3 and restored_pixel.r > restored_pixel.g + 0.15, "switching the overlay back on did not restore its effect: %s" % [restored_pixel])
+
+	# 5. Removing the overlay restores the engine's own frame: the lit sphere again,
 	#    neither the toned red nor the presented green.
 	post_script.overlay = null
 	renderer.apply(compositor)
