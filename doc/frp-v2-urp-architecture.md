@@ -8,7 +8,7 @@
 | URP / SRP | FRP v2 |
 | --- | --- |
 | SRP Core（原生：CullingResults、ScriptableRenderContext.DrawRenderers、材质/着色器绑定、CommandBuffer） | 引擎侧 `FRPCore`：几何提交（DrawRenderList）、环境/uniform 绑定、缓冲 ensure/get、shadow 预计算与灯光/Cluster 准备、deferred lighting、sky、透明、TAA、post/tonemap、resolve、VT 更新 |
-| URP 包里的内置 pass（DrawObjectsPass、DepthOnlyPass、MainLightShadowCasterPass、ForwardPass、TransparentPass、CopyColorPass、FinalBlitPass…） | 插件 `passes/builtin/*.gd`：VT、LightingPrep、GBuffer、Lighting、Sky、Transparent、ColorGrade、TAA、Tonemap |
+| URP 包里的内置 pass（DrawObjectsPass、DepthOnlyPass、MainLightShadowCasterPass、ForwardPass、TransparentPass、CopyColorPass、FinalBlitPass…） | 插件 `passes/native/*.gd`：Shadow Precompute、VT、GBuffer、Lighting、Sky、Transparent、TAA、Post |
 | `ScriptableRenderPass` / `ScriptableRendererFeature` | `FengPass`（同基类）+ `FengRenderer` 管线资源里的条目 |
 | `UniversalRenderData`（管线资源，含每条 feature 的设置） | `FengRenderer` 资源：条目顺序、`enabled`、逐 pass `params` |
 | `RenderingData` / `LightingData` 上下文 | `FRPPassContext`（脚本可见，持有当帧 RenderDataRD + 缓冲 RID） |

@@ -3,8 +3,10 @@ class_name FengPassTexture
 extends Resource
 ## One declared set=0 texture binding for a Feng pass.
 
-const PIPELINE_SCOPE: StringName = &"frp_pipeline"
-const FRP_SCOPE: StringName = &"frp_clustered"
+const NativeSpec = preload("../pipeline/native_spec.gd")
+
+const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
+const FRP_SCOPE: StringName = NativeSpec.SCOPE_FRP_CLUSTERED
 
 enum Source {
 	COLOR,
@@ -20,27 +22,34 @@ enum Source {
 	TONEMAPPED,
 }
 
-const TONEMAPPER_SCOPE: StringName = &"Tonemapper"
-const TONEMAPPER_TEXTURE: StringName = &"destination"
+const TONEMAPPER_SCOPE: StringName = NativeSpec.SCOPE_TONEMAPPER
+const TONEMAPPER_TEXTURE: StringName = NativeSpec.TEX_TONEMAPPER_DESTINATION
 
 enum BindingType {
 	SAMPLED_TEXTURE,
 	STORAGE_IMAGE,
 }
 
+## The native pass that produces a source, or -1 for one no native pass owns (a pipeline
+## texture or a custom scope). Color is the lit frame the Lighting pass resolves, the
+## G-buffer attributes and the depth come from the G-buffer pass and the tone mapped
+## image comes from Post Process / Tonemap. It lives next to the enum it maps, so a new
+## source is added in one place.
+static func required_native_pass(source: Source) -> int:
+	match source:
+		Source.COLOR:
+			return NativeSpec.PASS_LIGHTING
+		Source.DEPTH, Source.NORMAL_ROUGHNESS, Source.ALBEDO, Source.ORM, Source.EMISSION:
+			return NativeSpec.PASS_GBUFFER
+		Source.TONEMAPPED:
+			return NativeSpec.PASS_POST_PROCESS
+	return -1
+
 @export_range(0, 31) var binding: int = 0
 @export var source: Source = Source.COLOR
 @export var binding_type: BindingType = BindingType.SAMPLED_TEXTURE
 @export var custom_scope: StringName = &""
 @export var custom_name: StringName = &""
-
-## Compatibility alias for early library templates. PIPELINE resolves through
-## custom_name internally.
-@export var pipeline_name: StringName:
-	get:
-		return custom_name
-	set(value):
-		custom_name = value
 
 func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 	if buffers == null:
@@ -51,13 +60,13 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 		Source.DEPTH:
 			return buffers.get_depth_layer(view)
 		Source.NORMAL_ROUGHNESS:
-			return _get_named_texture(buffers, FRP_SCOPE, &"normal_roughness", view)
+			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_NORMAL_ROUGHNESS, view)
 		Source.ALBEDO:
-			return _get_named_texture(buffers, FRP_SCOPE, &"gbuffer_albedo", view)
+			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_ALBEDO, view)
 		Source.ORM:
-			return _get_named_texture(buffers, FRP_SCOPE, &"gbuffer_orm", view)
+			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_ORM, view)
 		Source.EMISSION:
-			return _get_named_texture(buffers, FRP_SCOPE, &"gbuffer_emission", view)
+			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_EMISSION, view)
 		Source.PIPELINE:
 			return _get_named_texture(buffers, PIPELINE_SCOPE, custom_name, view)
 		Source.TONEMAPPED:

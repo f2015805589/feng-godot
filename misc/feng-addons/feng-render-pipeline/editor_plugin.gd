@@ -9,49 +9,13 @@ extends EditorPlugin
 const Renderer = preload("renderer.gd")
 const CompositorScript = preload("compositor.gd")
 const PassBase = preload("passes/pass_base.gd")
-const BuiltinPass = preload("passes/builtin_pass.gd")
 const ProjectPipeline = preload("project_pipeline.gd")
+const LibraryManager = preload("pipeline/library_manager.gd")
 
-const LIBRARY_DIR := "res://addons/feng-render-pipeline/library"
 const PIPELINE_AUTOLOAD := "FengProjectPipeline"
-const PIPELINE_AUTOLOAD_PATH := "res://addons/feng-render-pipeline/project_pipeline.gd"
-const TRACKED_RENDERER_METADATA := [
-	"_synced_library",
-	"_synced_library_ids",
-	"_deleted_library",
-	"_deleted_library_ids",
-	"_pipeline_schema_version",
-]
 
 
-class FengRendererInspectorPlugin extends EditorInspectorPlugin:
-	var _renderer_script: Script
-
-	func _init(renderer_script: Script) -> void:
-		_renderer_script = renderer_script
-
-	func _can_handle(object: Object) -> bool:
-		return object != null and object.get_script() == _renderer_script
-
-	func _parse_begin(object: Object) -> void:
-		if object == null or not object.has_method("get_configuration_warnings"):
-			return
-		var warnings: PackedStringArray = object.call("get_configuration_warnings")
-		if warnings.is_empty():
-			return
-
-		var panel := VBoxContainer.new()
-		panel.name = "FengRendererConfigurationWarnings"
-		var heading := Label.new()
-		heading.text = "FRP schedule warnings"
-		heading.add_theme_color_override("font_color", Color(1.0, 0.76, 0.34))
-		panel.add_child(heading)
-		for warning in warnings:
-			var label := Label.new()
-			label.text = "• " + warning
-			label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-			panel.add_child(label)
-		add_custom_control(panel)
+const FengRendererInspectorPlugin = preload("editor/renderer_inspector_plugin.gd")
 
 
 var _menu: PopupMenu
@@ -143,10 +107,11 @@ func _sync_project_pipeline_setting() -> void:
 ## editor stores autoloads as "*" + a UID, while a hand-written project.godot names the
 ## path, so both forms are resolved before they are compared.
 func _ensure_pipeline_autoload() -> void:
+	var path := FengAddonLayout.pipeline_autoload_path()
 	var existing := String(ProjectSettings.get_setting("autoload/" + PIPELINE_AUTOLOAD, ""))
-	if existing.begins_with("*") and ProjectPipeline.names(existing, PIPELINE_AUTOLOAD_PATH):
+	if existing.begins_with("*") and ProjectPipeline.names(existing, path):
 		return
-	add_autoload_singleton(PIPELINE_AUTOLOAD, PIPELINE_AUTOLOAD_PATH)
+	add_autoload_singleton(PIPELINE_AUTOLOAD, path)
 
 func _on_project_settings_changed() -> void:
 	# The rendering method is one of the settings that can change here, and it decides
@@ -183,19 +148,20 @@ func _refresh_library() -> void:
 		return
 	_menu.clear()
 	_library_entries.clear()
+	var lib_dir := FengAddonLayout.library_dir()
 
 	# The manifest is the canonical order and gives entries a stable identity.
 	# Scan afterward so a locally added template is still available before the
 	# next manifest update.
 	var manifest_paths := {}
-	for manifest in Renderer.DEFAULT_LIBRARY_ENTRIES:
-		var path := LIBRARY_DIR + "/" + String(manifest["path"])
+	for manifest in LibraryManager.DEFAULT_LIBRARY_ENTRIES:
+		var path := lib_dir + "/" + String(manifest["path"])
 		manifest_paths[path] = true
 		if ResourceLoader.exists(path):
 			_add_library_entry(path, manifest)
 
 	var directories: Array[String] = []
-	var root := DirAccess.open(LIBRARY_DIR)
+	var root := DirAccess.open(lib_dir)
 	if root == null:
 		return
 	root.list_dir_begin()
@@ -208,7 +174,7 @@ func _refresh_library() -> void:
 	directories.sort()
 
 	for directory in directories:
-		var sub := DirAccess.open(LIBRARY_DIR + "/" + directory)
+		var sub := DirAccess.open(lib_dir + "/" + directory)
 		if sub == null:
 			continue
 		var files: Array[String] = []
@@ -221,7 +187,7 @@ func _refresh_library() -> void:
 		sub.list_dir_end()
 		files.sort()
 		for file in files:
-			var path := LIBRARY_DIR + "/%s/%s" % [directory, file]
+			var path := lib_dir + "/%s/%s" % [directory, file]
 			if not manifest_paths.has(path):
 				_add_library_entry(path, {})
 
@@ -278,15 +244,13 @@ func _on_library_item(id: int) -> void:
 		push_error("FengRenderPipeline: cannot load library template %s" % path)
 		return
 	var instance = template.duplicate(true) as PassBase
-	var manifest: Variant = _manifest_for_path(path)
+	var manifest: Variant = LibraryManager.manifest_for_path(path)
 	if manifest != null:
-		instance.stable_id = String(manifest["id"])
-		instance.resource_name = String(manifest["name"])
+		LibraryManager.configure_library_pass(instance, manifest)
 
 	var current: Array = renderer.passes.duplicate()
 	var next: Array = current.duplicate()
-	var insert_index := _library_insert_index(current, instance.stable_id)
-	next.insert(insert_index, instance)
+	next.insert(LibraryManager.calculate_insert_index(current, instance.stable_id), instance)
 	var metadata := _metadata_after_library_add(renderer, path)
 	_record_renderer_change(renderer, next, "Add FRP Pass from Library", metadata)
 	_refresh_inspector()
@@ -321,7 +285,7 @@ func _record_renderer_change(renderer, next_passes: Array, action_name: String, 
 	undo_redo.create_action(action_name, UndoRedo.MERGE_DISABLE, renderer)
 	undo_redo.add_do_property(renderer, "passes", next_passes)
 	undo_redo.add_undo_property(renderer, "passes", old_passes)
-	for property_name in TRACKED_RENDERER_METADATA:
+	for property_name in Renderer.PERSISTED_STATE_FIELDS:
 		undo_redo.add_do_property(renderer, property_name, next_metadata[property_name])
 		undo_redo.add_undo_property(renderer, property_name, old_metadata[property_name])
 	# Metadata is exported storage and its setter does not necessarily emit a
@@ -334,33 +298,30 @@ func _record_renderer_change(renderer, next_passes: Array, action_name: String, 
 
 func _snapshot_renderer_metadata(renderer) -> Dictionary:
 	var metadata := {}
-	for property_name in TRACKED_RENDERER_METADATA:
+	for property_name in Renderer.PERSISTED_STATE_FIELDS:
 		var value = renderer.get(property_name)
 		metadata[property_name] = value.duplicate() if value is Array else value
 	return metadata
 
 func _apply_renderer_metadata(renderer, metadata: Dictionary) -> void:
-	for property_name in TRACKED_RENDERER_METADATA:
+	for property_name in Renderer.PERSISTED_STATE_FIELDS:
 		renderer.set(property_name, metadata[property_name])
 
+## The state the pipeline has to carry once a library entry was inserted: the entry is
+## recorded as present and its tombstone, if it had one, is lifted. It is computed on the
+## snapshot rather than on the renderer, because the same values have to be written by
+## the undo action.
 func _metadata_after_library_add(renderer, path: String) -> Dictionary:
 	var metadata := _snapshot_renderer_metadata(renderer)
-	var normalized := _normalize_library_path(path)
-	var manifest: Variant = _manifest_for_path(path)
+	var manifest: Variant = LibraryManager.manifest_for_path(path)
 	var synced_paths: Array = metadata["_synced_library"]
 	var synced_ids: Array = metadata["_synced_library_ids"]
 	var deleted_paths: Array = metadata["_deleted_library"]
 	var deleted_ids: Array = metadata["_deleted_library_ids"]
 	if manifest != null:
-		var manifest_path: String = manifest["path"]
-		var stable_id: String = manifest["id"]
-		_append_unique(synced_paths, manifest_path)
-		_append_unique(synced_ids, stable_id)
-		deleted_paths.erase(manifest_path)
-		deleted_paths.erase(stable_id)
-		deleted_ids.erase(stable_id)
+		LibraryManager.mark_synced(manifest, synced_paths, synced_ids, deleted_paths, deleted_ids)
 	else:
-		_append_unique(synced_paths, normalized)
+		_append_unique(synced_paths, LibraryManager.normalize_library_path(path))
 	metadata["_synced_library"] = synced_paths
 	metadata["_synced_library_ids"] = synced_ids
 	metadata["_deleted_library"] = deleted_paths
@@ -370,60 +331,6 @@ func _metadata_after_library_add(renderer, path: String) -> Dictionary:
 func _append_unique(values: Array, value: String) -> void:
 	if value != "" and not values.has(value):
 		values.append(value)
-
-func _manifest_for_path(path: String):
-	var normalized := _normalize_library_path(path)
-	for manifest in Renderer.DEFAULT_LIBRARY_ENTRIES:
-		if normalized == String(manifest["path"]) or normalized == String(manifest["id"]):
-			return manifest
-	return null
-
-func _normalize_library_path(path: String) -> String:
-	var normalized := path.replace("\\", "/")
-	var prefix := LIBRARY_DIR + "/"
-	if normalized.begins_with(prefix):
-		return normalized.substr(prefix.length())
-	return normalized
-
-func _library_insert_index(passes: Array, stable_id: StringName) -> int:
-	var temporal_index := passes.size()
-	for i in passes.size():
-		var pass_entry = passes[i]
-		if pass_entry is BuiltinPass and pass_entry.native_id == Renderer.TEMPORAL_AA_NATIVE_ID:
-			temporal_index = i
-			break
-
-	var new_order := _default_library_order(stable_id)
-	if new_order < 0:
-		return temporal_index
-	var next_default := -1
-	var next_order := 100000
-	var previous_default := -1
-	var previous_order := -1
-	for i in temporal_index:
-		var existing = passes[i]
-		if existing == null:
-			continue
-		var existing_order := _default_library_order(existing.stable_id)
-		if existing_order < 0:
-			continue
-		if existing_order > new_order and existing_order < next_order:
-			next_default = i
-			next_order = existing_order
-		if existing_order < new_order and existing_order > previous_order:
-			previous_default = i
-			previous_order = existing_order
-	if next_default >= 0:
-		return next_default
-	if previous_default >= 0:
-		return previous_default + 1
-	return temporal_index
-
-func _default_library_order(stable_id: StringName) -> int:
-	for i in Renderer.DEFAULT_LIBRARY_ENTRIES.size():
-		if String(Renderer.DEFAULT_LIBRARY_ENTRIES[i]["id"]) == String(stable_id):
-			return i
-	return -1
 
 func _find_selected_renderer():
 	var edited = _get_edited_object()

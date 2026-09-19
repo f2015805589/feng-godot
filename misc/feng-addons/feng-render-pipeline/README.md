@@ -10,6 +10,27 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 2. 创建 `FengRenderer`，默认包含下列 8 个引擎 Pass（外加可选的 5 个效果条目，默认关闭）
    和 8 个库 Pass。
 
+## 插件结构
+
+| 位置 | 内容 |
+|---|---|
+| `renderer.gd` | `FengRenderer`：管线资源本身（条目列表、库同步、旧资源迁移、调度构建） |
+| `compositor.gd`、`project_pipeline.gd` | 把 Renderer 接到 Camera3D / WorldEnvironment / 项目设置 |
+| `world_compositor.gd` | 引擎"世界用哪个 compositor"的规则（WorldEnvironment 分组）的唯一落点 |
+| `editor_plugin.gd` + `editor/` | 编辑器那一半：工具菜单、检查器告警、项目设置行、autoload 注册 |
+| `pipeline/` | 调度的模型：`native_spec`（引擎 pass 表）、`library_manager`（内置库与同步）、`pipeline_migrator`（旧资源迁移）、`pipeline_validator`（校验）、`addon_layout`（插件自身路径） |
+| `passes/` | Pass 的类：`pass_base`（`FengPass`）、`builtin_pass`、`shader_pass`、`pass_texture`、`pass_output`、`texture_manager`（输出纹理分配） |
+| `passes/native/` | 8 个引擎 Pass 的默认实现脚本 |
+| `volume/` | `FengVolume` / `FengVolumeProfile`：运行时逐 pass 覆盖 |
+| `library/` | 内置效果模板（`*.tres` + `*.glsl`），从 **Add Pass from Library** 添加 |
+| `examples/` | 示例与测试用 shader / 资源 |
+
+与引擎的耦合只有三处，而且每一处都只写在插件的一个地方：`RenderingServer.get_frp_pipeline_spec()`
+（Pass 表 → `pipeline/native_spec.gd`）、`RenderingServer.compositor_set_frp_pipeline()`
+（调度 + provided + 逐 pass 参数 → `renderer.gd`）、`FRPPassContext`（Pass 脚本的 Core 原语）。
+`world_compositor.gd` 是唯一例外：WorldEnvironment 的 `_world_compositor_<scenario>` 分组名在引擎里
+没有脚本接口，只能在插件里写一次，再由项目管线与 Volume 共用。
+
 ## 引擎 Pass
 
 一个 **Pass** 是你在管线资源里看到、可以开关和排序的条目；一个 **Operation** 是渲染器内部

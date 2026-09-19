@@ -14,6 +14,7 @@ extends SceneTree
 # leaves the takeover frame different from the baseline.
 
 const FRP_BASE = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
+const FRP_SPEC = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 const SKY_PASS_ID := 4
 const TRANSPARENT_PASS_ID := 5
 const POST_PASS_ID := 7
@@ -329,8 +330,8 @@ func run() -> void:
 	# known so removing them is an explicit authoring decision (a tombstone) rather
 	# than an entry the next sync adds back; a saved resource carries the same
 	# bookkeeping from the editor.
-	for library_path in renderer_script.DEFAULT_PASS_PATHS:
-		frame_renderer.mark_library_pass(library_path)
+	for entry in renderer_script.DEFAULT_LIBRARY_ENTRIES:
+		frame_renderer.mark_library_pass(entry["id"])
 	var frame_pass := ScriptedFramePass.new()
 	var authored: Array[FRP_BASE] = [frame_pass]
 	frame_renderer.passes = authored
@@ -359,10 +360,10 @@ func run() -> void:
 	var undeclared_list: Array[FRP_BASE] = [undeclared_pass]
 	undeclared_renderer.passes = undeclared_list
 	var repaired_list: Array = undeclared_renderer.passes
-	var mandatory_count: int = renderer_script.mandatory_native_ids().size()
+	var mandatory_count: int = FRP_SPEC.mandatory_ids().size()
 	var restored_mandatory := 0
 	for pass_entry in repaired_list:
-		if pass_entry is FRP_BASE and pass_entry.get("native_id") != null and renderer_script.mandatory_native_ids().has(int(pass_entry.native_id)):
+		if pass_entry is FRP_BASE and pass_entry.get("native_id") != null and FRP_SPEC.mandatory_ids().has(int(pass_entry.native_id)):
 			restored_mandatory += 1
 	require(restored_mandatory == mandatory_count, "an undeclared schedule must get its mandatory entries back, got %d of %d" % [restored_mandatory, mandatory_count])
 	require(repaired_list.has(undeclared_pass), "the undeclared pass was dropped while repairing the schedule")
@@ -389,8 +390,8 @@ func run() -> void:
 	# the engine's own passes, which is what makes the scripts a faithful
 	# implementation of the default pass set instead of a second renderer.
 	var default_renderer = renderer_script.new()
-	for library_path in renderer_script.DEFAULT_PASS_PATHS:
-		default_renderer.mark_library_pass(library_path)
+	for entry in renderer_script.DEFAULT_LIBRARY_ENTRIES:
+		default_renderer.mark_library_pass(entry["id"])
 	# The library's authoring chain is deliberately not part of this comparison: it is
 	# a look the project adds, and with it enabled consecutive frames differ slightly
 	# (the engine-token fallback below is not frame-stable either), which would hide
@@ -436,8 +437,8 @@ func run() -> void:
 	# the shader as one entry, and the overlay's resource contract (its inputs and the
 	# resolved-attachment flags the engine needs) is what the entry reports.
 	var overlay_renderer = renderer_script.new()
-	for library_path in renderer_script.DEFAULT_PASS_PATHS:
-		overlay_renderer.mark_library_pass(library_path)
+	for entry in renderer_script.DEFAULT_LIBRARY_ENTRIES:
+		overlay_renderer.mark_library_pass(entry["id"])
 	_disable_library(overlay_renderer)
 	var overlay_compositor = compositor_script.new()
 	overlay_compositor.renderer = overlay_renderer

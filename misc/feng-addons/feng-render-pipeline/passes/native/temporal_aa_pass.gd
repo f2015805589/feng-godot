@@ -11,9 +11,8 @@ extends "native_pass.gd"
 ## stable image or to compare frames; 16 is the engine's own value.
 @export_range(1, 64, 1) var jitter_phases: int = 16
 
-func _init() -> void:
-	native_id = 6
-	resource_name = "Temporal AA"
+func _native_pass_id() -> int:
+	return NativeSpec.PASS_TEMPORAL_AA
 
 func get_frp_parameters() -> Dictionary:
 	# This pass chooses what it exposes: one typed field, shown in the pipeline

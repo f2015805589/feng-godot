@@ -8,7 +8,8 @@ enum Mode {
 	RASTER,
 }
 
-const PIPELINE_SCOPE: StringName = &"frp_pipeline"
+const NativeSpec = preload("../pipeline/native_spec.gd")
+const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 
 @export var shader_file: RDShaderFile
 @export var mode: Mode = Mode.COMPUTE

@@ -87,7 +87,7 @@ func get_contract_source() -> FengPass:
 func _render_callback(callback_stage: int, data: RenderData) -> void:
 	if callback_stage != effect_callback_type or data == null:
 		return
-	_refresh_resource_flags()
+	refresh_resource_flags()
 	var buffers := data.get_render_scene_buffers() as RenderSceneBuffersRD
 	if buffers == null:
 		return
@@ -132,7 +132,10 @@ func _validate_runtime_inputs(buffers: RenderSceneBuffersRD, view: int) -> bool:
 			return false
 	return true
 
-func _refresh_resource_flags() -> void:
+## Turns the declared inputs into the attachment requirements the engine reads off the
+## effect before it runs. The pipeline calls this on whichever object owns the contract
+## (see get_contract_source), so it is part of the pass protocol rather than private.
+func refresh_resource_flags() -> void:
 	var color_required := false
 	var depth_required := false
 	var normal_required := false

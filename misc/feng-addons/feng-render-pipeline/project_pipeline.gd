@@ -186,17 +186,9 @@ static func names(p_value: String, p_path: String) -> bool:
 
 ## Whether another WorldEnvironment provides a compositor for the world `p_host` renders.
 ##
-## The engine decides a world's compositor through the `_world_compositor_<scenario>`
-## group: whichever member is first in it provides the compositor for the whole world, so
-## any other member with a compositor is an author's compositor for that world.
+## The step-aside rule is deliberately wider than the engine's own "first member wins":
+## a scene that brings its own compositor keeps it even when the plugin's node was added
+## first, which is what makes a per-scene pipeline possible. The world's group is read
+## through FengWorldCompositor, the one place that knows the engine's group convention.
 static func _world_has_another_compositor(p_host: Node, p_current: WorldEnvironment) -> bool:
-	var world := p_host.get_viewport().find_world_3d()
-	if world == null:
-		return false
-	var group := "_world_compositor_" + str(world.get_scenario().get_id())
-	for node in p_host.get_tree().get_nodes_in_group(group):
-		if node == p_current:
-			continue
-		if node is WorldEnvironment and (node as WorldEnvironment).compositor != null:
-			return true
-	return false
+	return FengWorldCompositor.other_world_compositor(p_host.get_viewport(), p_current) != null

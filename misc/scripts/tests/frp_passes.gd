@@ -586,6 +586,28 @@ func run() -> void:
 		if w.contains("does_not_exist"):
 			found_missing = true
 	require(found_missing, "renderer validation did not flag a missing pipeline texture")
+
+	var post_color_pass = FRP_PASS.new()
+	post_color_pass.shader_file = chain_shader
+	var color_in = FRP_TEXTURE.new()
+	color_in.binding = 0
+	color_in.source = FRP_TEXTURE.Source.COLOR
+	var color_inputs: Array[FRP_TEXTURE] = [color_in]
+	post_color_pass.inputs = color_inputs
+	var test_renderer = renderer_script2.new()
+	var test_passes: Array[FRP_BASE] = []
+	for p in test_renderer.passes:
+		test_passes.append(p)
+	test_passes.append(post_color_pass)
+	test_renderer.passes = test_passes
+	var test_warnings = test_renderer.get_configuration_warnings()
+	var found_post_color := false
+	for w in test_warnings:
+		if w.contains("reads Color after Post Process / Tonemap"):
+			found_post_color = true
+	require(found_post_color, "renderer validation did not flag reading Color after Post Process / Tonemap")
+	test_renderer = null
+
 	bad_renderer = null
 	print("PASS editor-time renderer validation warnings")
 

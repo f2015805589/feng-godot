@@ -98,7 +98,7 @@ func run() -> void:
 	var shader_pass_script = load("res://addons/feng-render-pipeline/passes/shader_pass.gd")
 	var overlay = shader_pass_script.new()
 	overlay.mode = FengShaderPass.Mode.RASTER
-	overlay.shader_file = load("res://addons/feng-render-pipeline/tests/post_overlay.glsl")
+	overlay.shader_file = load("res://addons/feng-render-pipeline/examples/post_overlay.glsl")
 	require(overlay.shader_file != null, "the post overlay shader did not load")
 	overlay.resource_name = "Post Overlay"
 	var output := FengPassOutput.new()

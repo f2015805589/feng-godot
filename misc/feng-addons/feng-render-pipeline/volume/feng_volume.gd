@@ -157,19 +157,17 @@ static func evaluate_all() -> void:
 		var camera: Camera3D = viewport.get_camera_3d()
 		if camera == null:
 			continue
-		var compositor = camera.get("compositor")
-		if compositor == null or not compositor.has_method("set_volume_parameters"):
+		var compositor := _active_compositor(viewport, camera)
+		if compositor == null:
 			continue
 		current.append(weakref(compositor))
-		var base := {}
-		var renderer = compositor.get("renderer")
-		if renderer != null and renderer.has_method("get_authored_pass_parameters"):
-			base = renderer.call("get_authored_pass_parameters")
-		compositor.call("set_volume_parameters", resolve_overrides(viewports[viewport], base, camera.global_position), resolve_pass_states(viewports[viewport], camera.global_position))
+		var renderer := compositor.renderer
+		var base := renderer.get_authored_pass_parameters() if renderer != null else {}
+		compositor.set_volume_parameters(resolve_overrides(viewports[viewport], base, camera.global_position), resolve_pass_states(viewports[viewport], camera.global_position))
 
 	for reference in _pushed:
 		var compositor = reference.get_ref() if reference is WeakRef else reference
-		if compositor == null:
+		if not compositor is FengCompositor:
 			continue
 		var still_used := false
 		for active in current:
@@ -177,5 +175,11 @@ static func evaluate_all() -> void:
 				still_used = true
 				break
 		if not still_used:
-			compositor.call("set_volume_parameters", {}, {})
+			compositor.set_volume_parameters({}, {})
 	_pushed = current
+
+## The FRP compositor a camera renders with, or null when it renders with something else
+## (no compositor at all, or one that is not FRP's).
+static func _active_compositor(p_viewport: Viewport, p_camera: Camera3D) -> FengCompositor:
+	var compositor := FengWorldCompositor.active_compositor(p_viewport, p_camera)
+	return compositor if compositor is FengCompositor else null

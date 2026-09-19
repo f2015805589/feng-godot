@@ -85,6 +85,5 @@ func _overlay_ldr_target() -> StringName:
 				return declaration.name
 	return &""
 
-func _init() -> void:
-	native_id = 7
-	resource_name = "Post Process / Tonemap"
+func _native_pass_id() -> int:
+	return NativeSpec.PASS_POST_PROCESS

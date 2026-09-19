@@ -9,6 +9,7 @@ extends "pass_base.gd"
 ## without one it stays a pure schedule token and the engine runs its own pass.
 
 const PassBase = preload("pass_base.gd")
+const NativeSpec = preload("../pipeline/native_spec.gd")
 
 @export_storage var native_id: int = -1
 ## The pass script that implements this entry (see FengNativePass). When set, the
@@ -18,8 +19,6 @@ const PassBase = preload("pass_base.gd")
 ## entry emits the engine's own token, which is the fallback for a project that does
 ## not use the pipeline.
 @export var implementation: PassBase
-
-const NativeSpec = preload("native_spec.gd")
 
 func _init(p_native_id: int = -1, p_resource_name: String = "") -> void:
 	native_id = p_native_id

@@ -14,13 +14,14 @@ extends "../pass_base.gd"
 ## Override _frp_execute() to take the pass over: call the granular primitives in the
 ## order the effect needs, or skip work a project does not want.
 ##
-## A concrete subclass sets native_id and its display name in _init(). The renderer
-## attaches it to the matching schedule entry (FengBuiltinPass.implementation); the
-## entry is then driven by this script and reports the pass as provided to the engine
-## (see FengPass.provides_native_ids), while an entry without one still emits the
-## engine's own token.
+## A concrete subclass answers _native_pass_id() with the engine pass it implements, and
+## its display name is read back from the engine's spec, so the two cannot drift apart.
+## The renderer attaches it to the matching schedule entry
+## (FengBuiltinPass.implementation); the entry is then driven by this script and reports
+## the pass as provided to the engine (see FengPass.provides_native_ids), while an entry
+## without one still emits the engine's own token.
 
-const NativeSpec = preload("../native_spec.gd")
+const NativeSpec = preload("../../pipeline/native_spec.gd")
 const PassBase = preload("../pass_base.gd")
 
 @export_storage var native_id: int = -1
@@ -30,6 +31,19 @@ const PassBase = preload("../pass_base.gd")
 ## the URP way) and its work runs as part of this entry instead of as a separate
 ## entry that has to be kept in the right place.
 @export var overlay: PassBase
+
+func _init() -> void:
+	native_id = _native_pass_id()
+	if native_id >= 0:
+		# The engine's spec owns the display name, so it cannot drift from the pass this
+		# script runs.
+		resource_name = NativeSpec.pass_name(native_id)
+
+## The engine pass this script implements. A concrete subclass returns its id; the
+## default means "not one of the engine's passes", which is what a bare FengNativePass
+## attached to an entry an author filled in by hand needs.
+func _native_pass_id() -> int:
+	return -1
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:

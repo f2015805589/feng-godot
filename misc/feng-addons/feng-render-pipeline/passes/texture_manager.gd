@@ -9,7 +9,8 @@ extends CompositorEffect
 
 const PassBase = preload("pass_base.gd")
 const Output = preload("pass_output.gd")
-const PIPELINE_SCOPE: StringName = &"frp_pipeline"
+const NativeSpec = preload("../pipeline/native_spec.gd")
+const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 
 @export var passes: Array[CompositorEffect] = []
 

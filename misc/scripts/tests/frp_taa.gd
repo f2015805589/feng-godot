@@ -355,8 +355,8 @@ func run() -> void:
 	# from the same pass, so the only difference between them is the declaration.
 	root.use_taa = false
 	var scripted_renderer = renderer_script.new()
-	for library_path in renderer_script.DEFAULT_PASS_PATHS:
-		scripted_renderer.mark_library_pass(library_path)
+	for entry in renderer_script.DEFAULT_LIBRARY_ENTRIES:
+		scripted_renderer.mark_library_pass(entry["id"])
 	var scripted_frame := ScriptedTaaPass.new()
 	scripted_frame.provides_native_ids = [0, 1, 2, 3, 7]
 	var scripted_list: Array[PASS_BASE] = [scripted_frame]

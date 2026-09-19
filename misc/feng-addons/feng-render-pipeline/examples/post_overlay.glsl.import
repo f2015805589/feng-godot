@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://crpewrd2kv5ax"
+path="res://.godot/imported/post_overlay.glsl-5b21496c260662307682c153ccff9ba1.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/examples/post_overlay.glsl"
+dest_files=["res://.godot/imported/post_overlay.glsl-5b21496c260662307682c153ccff9ba1.res"]
+
+[params]
+
