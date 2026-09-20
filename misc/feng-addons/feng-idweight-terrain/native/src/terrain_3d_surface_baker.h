@@ -29,13 +29,11 @@
  * confused: an array of authored textures is compressed once on the CPU by the engine's own
  * encoders, while a page is produced and stored on the GPU every time an edit invalidates it.
  *
- * Two properties decide a page's codec, and together they leave exactly these three:
- *   - every one of the three page arrays carries an alpha value the shader reads (material
- *     height, roughness, and the params validity bit), so a codec that keeps no alpha cannot
- *     store a page at all - that rules out BC1, BC4, BC5 and BC6H;
- *   - a page is only ever produced by this build's GPU block encoder (shaders/bc_encode.glsl),
- *     because the cost that makes page compression worth having is that it never runs a CPU
- *     codec per page - that rules out ETC2, EAC and ASTC, which no shader here encodes.
+ * The albedo and parameter arrays use the RGBA codecs produced by the GPU block encoder. The
+ * normal array is independent: its signed world normal is octahedrally packed into BC5 RG (or
+ * the BC3N A/G compatibility layout), while roughness lives in the parameter array. This keeps
+ * a normal's negative components out of a colour codec and leaves the persistent staging/SVT
+ * representation canonical.
  *
  * Uncompressed is not a codec: the tier samples the staging arrays directly, exactly as it
  * would with no page compression at all.
@@ -47,6 +45,17 @@ enum SurfacePageCompression {
 	SURFACE_PAGE_COUNT,
 };
 VARIANT_ENUM_CAST(SurfacePageCompression);
+
+/** Storage requested for the signed world-normal page. -1 follows the diffuse request. */
+enum SurfaceNormalCompression {
+	SURFACE_NORMAL_AUTO = -1,
+	SURFACE_NORMAL_UNCOMPRESSED = 0,
+	SURFACE_NORMAL_BC5 = 1,
+	SURFACE_NORMAL_BC3N = 2,
+	SURFACE_NORMAL_BC7 = 3,
+	SURFACE_NORMAL_COUNT = 4,
+};
+VARIANT_ENUM_CAST(SurfaceNormalCompression);
 
 /**
  * Asynchronous material-page producer for the surface virtual texture.
@@ -110,9 +119,8 @@ private:
 		uint64_t sequence = 0;
 	};
 
-	// One tier's sampling arrays: the copies the material actually samples when that tier
-	// is compressed. A tier that resolved to uncompressed samples the staging arrays
-	// directly and leaves its set empty.
+	// One tier's sampling arrays: each channel is optional. A raw channel samples the canonical
+	// staging array while a compressed channel samples its matching target here.
 	struct SampledSet {
 		RID albedo_rd;
 		RID normal_rd;
@@ -234,6 +242,9 @@ private:
 		int requested = 0;
 		std::atomic<int> effective{ 0 };
 		std::atomic<int> applied{ 0 };
+		int normal_requested = SURFACE_NORMAL_AUTO;
+		std::atomic<int> normal_effective{ SURFACE_NORMAL_UNCOMPRESSED };
+		std::atomic<int> normal_applied{ SURFACE_NORMAL_UNCOMPRESSED };
 		// The codec's linear renderer format. The normal and parameter pages hold linear
 		// data - a direction, a ratio, a height - so they are stored in it.
 		std::atomic<RenderingDevice::DataFormat> format{ RenderingDevice::DATA_FORMAT_MAX };
@@ -242,10 +253,17 @@ private:
 		// decodes it back on sampling, so the codec's quantisation is spent in the space it
 		// was designed for instead of on linear values whose darks fall below its first step.
 		std::atomic<RenderingDevice::DataFormat> format_srgb{ RenderingDevice::DATA_FORMAT_MAX };
+		// Linear channel formats are derived by the shared codec mapping. The public tier
+		// setting unifies them; backend compatibility overrides may still select them separately.
+		std::atomic<RenderingDevice::DataFormat> normal_format{ RenderingDevice::DATA_FORMAT_MAX };
+		std::atomic<RenderingDevice::DataFormat> params_format{ RenderingDevice::DATA_FORMAT_MAX };
+		std::atomic<bool> params_encoded{ false };
 		godot::String reason;
+		godot::String normal_reason;
 	};
 	TierState _tiers[TIER_COUNT];
 	void _resolve_tier_compression(int p_tier);
+	void _resolve_tier_normal_compression(int p_tier);
 	// Which tier last produced each slot's content, so the encoder knows where to store it
 	// and the material binding knows which array set serves it.
 	std::vector<uint8_t> _slot_tier;
@@ -254,7 +272,13 @@ private:
 	RID _staging_rd(int p_channel) const;
 	RID _sampled_rd(int p_tier, int p_channel) const;
 	RID _sampled_rs(int p_tier, int p_channel) const;
+	// Bit 0/1/2 are albedo, normal and params. The resolved mask is used while a bundle is
+	// being allocated; the applied mask is what the current bundle actually owns.
+	uint8_t _tier_channel_mask(int p_tier, bool p_applied) const;
+	int _tier_channel_codec(int p_tier, int p_channel, bool p_applied) const;
+	bool _tier_channel_uses_sampled(int p_tier, int p_channel) const;
 	bool _tier_uses_sampled(int p_tier) const;
+	bool _any_tier_uses_sampled(bool p_applied) const;
 	// The scratch regime: every tier is stored compressed, so nothing samples the RGBA16F
 	// staging arrays and they do not have to be page sized at all. Production then writes
 	// into one scratch layer per page - the same ring page the block encoder reads from and
@@ -453,6 +477,7 @@ public:
 	// never rewritten. A codec that costs an encode per production is therefore worth its
 	// cost for one tier and not necessarily for the other.
 	void set_tier_compression(int p_tier, int p_mode);
+	void set_tier_normal_compression(int p_tier, int p_mode);
 	Dictionary get_tier_compression_info(int p_tier) const;
 	void request_capacity(int p_count);
 	// True while a larger capacity has been requested but the arrays are still the old size.

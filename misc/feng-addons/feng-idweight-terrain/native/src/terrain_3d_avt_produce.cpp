@@ -5,6 +5,7 @@
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_vt_visibility.h"
+#include "terrain_vt_request_priority.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -53,17 +54,18 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// indirection entry and its demand record, so the shader samples an empty layer and no
 	// other part of the pipeline would ever look at it again: the plan is reused and the
 	// pool's residency did not move, which is exactly the condition this shortcut tests.
-	// Readiness is therefore verified here and not assumed. The cost is one lookup per
-	// resident slot, on the loop that already touches every one of them.
+	// When the cached state is a candidate for the settled shortcut, readiness is verified here
+	// and not assumed. The cost is one lookup per resident slot, on the loop that already touches
+	// every one of them.
 	const Terrain3DSurfaceBaker *idle_producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+	const bool idle_candidate = _vt.avt_plan_reused && _vt.avt_idle_revision == pool->residency_revision;
 	int idle_lost = 0;
-	if (idle_producer) {
+	if (idle_candidate && idle_producer) {
 		// One lock for the whole resident set: the per-slot query is the same read, and this
 		// loop is the one a settled view runs on every tick.
 		idle_lost = idle_producer->count_unready_pages(_vt.avt_resident_slots);
 	}
-	if (_vt.avt_plan_reused && _vt.avt_idle_revision == pool->residency_revision &&
-			idle_lost == 0) {
+	if (idle_candidate && idle_lost == 0) {
 		for (int slot : _vt.avt_resident_slots) { pool->mark_demanded(slot); }
 		// Only the first tick of an idle run publishes: every value below is a constant of
 		// the settled state, and rewriting the same numbers into a String-keyed dictionary
@@ -90,7 +92,9 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// real classification and reports what it finds instead of claiming a complete plan. The
 	// reading is what tells a lost page under a still camera from a settled view.
 	_vt.avt_idle_stats_current = false;
-	_vt.avt_sector_stats["idle_ready_lost"] = idle_lost;
+	// A moving/non-candidate pass did not perform the idle readiness check, so it reports no
+	// lost idle pages rather than carrying a result from an earlier settled pass.
+	_vt.avt_sector_stats["idle_ready_lost"] = idle_candidate ? idle_lost : 0;
 	_vt.avt_idle_revision = 0;
 	_vt.avt_resident_slots.clear();
 	_vt.surface_vt->set_allocation_budget(p_max_pages > 0 ? p_max_pages : -1);
@@ -214,33 +218,36 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 	// whenever the view settles, and by a hard cap if a pathological plan keeps churning.
 	if (r_pass.sampled_missing == 0 && r_pass.sampled_pending == 0) { _vt.avt_demand_age.clear(); }
 	else if (_vt.avt_demand_age.size() > 8192) { _vt.avt_demand_age.clear(); }
-	// Coarse pages first, which is what makes a moving view refine instead of jump. A page's
-	// level is what the fragment falls back to while its finer replacement is produced, so
-	// producing the coarsest missing page of a region before the pages that refine it turns a
-	// view's appearance into a progression: the budget buys the levels in order, and the last
-	// thing to arrive is the detail, not a sharp patch beside a blurred one. Within a level the
-	// plan's own order (nearer first) is kept, and a pass that produces nothing new is not
-	// affected at all.
+	// Roots must establish coverage first, then the current sampled prefix is ordered by
+	// distance bands. This lets a nearby fine page beat a distant coarse page while keeping
+	// the parent before its child inside one band; the optional apron and retained requests
+	// are last. The plan and the source queue use this same typed order, so a 16-page pass
+	// cannot spend its whole budget on speculative coarse work ahead of the rendered view.
 	std::stable_sort(r_pass.missing.begin(), r_pass.missing.end(),
 			[](const Terrain3DAVTPageRequest *p_left, const Terrain3DAVTPageRequest *p_right) {
-				return p_left->mip > p_right->mip;
+				return TerrainVT::page_request_priority_before(p_left->priority, p_right->priority);
 			});
 }
 
 // Queued idle work must not occupy every source-worker slot while visible requests
-// wait for a free entry. Retain only visible jobs until they settle.
+// wait for a free entry. Retain only source jobs needed by visible misses until they settle.
 void Terrain3D::_avt_retain_visible(const Terrain3DAVTProducePass &p_pass) {
-	// What the source queue should keep is the plan, plus the prefetch plan once nothing
-	// visible is missing. That set only changes when a plan is installed or the prefetch
-	// switch flips, and a retention is only ever undone by a later one, so repeating it is
-	// 250 map lookups that reach the state the last retention already reached.
+	// A source payload is needed only for a page with no slot, or for a stale slot whose
+	// replacement can be polled this pass. Ready resident pages are consumed by the GPU and
+	// never polled here; an in-flight, non-stale slot explicitly discards its source result in
+	// _avt_produce_page(). Keeping either kind in the queue only occupies one of its 32 entries
+	// and makes prime scan more work. Once the visible set has no missing page, retain the warm
+	// prefetch set instead. This set only changes when a plan is installed or the prefetch switch
+	// flips, so the operation remains off the per-tick hot path after it has been applied.
 	const bool with_prefetch = p_pass.missing.empty();
 	if (_vt.avt_retain_applied && _vt.avt_retain_with_prefetch == with_prefetch) { return; }
 	std::vector<Terrain3DPagePipeline::Request> wanted;
-	wanted.reserve(_vt.avt_page_plan.size() + (with_prefetch ? _vt.avt_prefetch_plan.size() : 0));
-	for (const auto &page : _vt.avt_page_plan) { wanted.push_back(_avt_page_request(page)); }
 	if (with_prefetch) {
+		wanted.reserve(_vt.avt_prefetch_plan.size());
 		for (const auto &page : _vt.avt_prefetch_plan) { wanted.push_back(_avt_page_request(page)); }
+	} else {
+		wanted.reserve(p_pass.missing.size());
+		for (const Terrain3DAVTPageRequest *page : p_pass.missing) { wanted.push_back(_avt_page_request(*page)); }
 	}
 	_vt.vt_page_pipeline->retain(wanted);
 	_vt.avt_retain_applied = true;
@@ -260,7 +267,10 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const 
 	if (p_refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= p_refill_above) { return; }
 	std::vector<Terrain3DPagePipeline::Request> requests;
 	requests.reserve(32);
-	for (size_t i = p_pass.missing_next; i < p_pass.missing.size(); ++i) {
+	// The readiness snapshot may skip unfinished pages before reaching the end.
+	// Refill those holes too; successfully consumed requests are cleared below.
+	for (size_t i = p_refill ? 0 : p_pass.missing_next; i < p_pass.missing.size(); ++i) {
+		if (!p_pass.missing[i]) { continue; }
 		requests.push_back(_avt_page_request(*p_pass.missing[i]));
 		if (requests.size() == 32) { break; }
 	}
@@ -330,6 +340,12 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 }
 
 void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_pages) {
+	if (r_pass.missing_next >= r_pass.missing.size()) { return; }
+	// One bounded readiness snapshot replaces a lock and empty poll for every
+	// unprepared page. Preserve the plan's priority; later completions stay queued
+	// for the next tick, and prime/refill still feed the asynchronous workers.
+	const auto ready = _vt.vt_page_pipeline->ready_keys();
+	if (ready.count == 0) { return; }
 	// The tick deadline bounds what this pass adds, but a pass that produces nothing because
 	// the planning already spent the budget stalls the pipeline for the whole session: pages
 	// whose demand was recorded are never produced, and a settled view keeps showing the
@@ -349,7 +365,12 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 		// the remaining pages are produced by the ticks that follow, and the view they are
 		// missing from is shaded from the source in the meantime.
 		if (r_pass.produced >= floor && _vt_tick_expired()) { break; }
-		r_pass.produced += _avt_produce_page(r_pass, *r_pass.missing[r_pass.missing_next]) ? 1 : 0;
+		const auto &page = *r_pass.missing[r_pass.missing_next];
+		if (!ready.contains({ page.owner.x, page.owner.y, page.mip, page.x, page.y })) { continue; }
+		if (_avt_produce_page(r_pass, page)) {
+			++r_pass.produced;
+			r_pass.missing[r_pass.missing_next] = nullptr;
+		}
 	}
 }
 

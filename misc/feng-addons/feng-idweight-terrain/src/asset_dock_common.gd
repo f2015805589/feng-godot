@@ -53,6 +53,16 @@ var search_button: Button
 var _initialized: bool = false
 var plugin: EditorPlugin
 var window: Window
+var _observed_assets: Terrain3DAssets
+
+
+func _enter_tree() -> void:
+	# 4.5 reparents this dock when its slot changes. Reparenting emits
+	# exit/enter notifications, so restore the source binding after the dock
+	# returns to the tree instead of relying on the next asset mutation.
+	if not _initialized or not is_instance_valid(plugin) or not plugin.is_terrain_valid():
+		return
+	_bind_assets_signals(plugin.terrain.assets if plugin.terrain.assets else null)
 
 
 ## Dock button handlers
@@ -129,14 +139,48 @@ func update_assets() -> void:
 	if not _initialized:
 		return
 	
-	# Verify signals to individual lists
+	# Keep the list callbacks attached to one assets resource at a time. A terrain
+	# switch replaces the resource, but the old resource can remain alive in the
+	# editor's scene/undo state and would otherwise keep calling these lists.
+	var assets: Terrain3DAssets = null
 	if plugin.is_terrain_valid() and plugin.terrain.assets:
-		if not plugin.terrain.assets.textures_changed.is_connected(texture_list.update_asset_list):
-			plugin.terrain.assets.textures_changed.connect(texture_list.update_asset_list)
-		if not plugin.terrain.assets.meshes_changed.is_connected(mesh_list.update_asset_list):
-			plugin.terrain.assets.meshes_changed.connect(mesh_list.update_asset_list)
+		assets = plugin.terrain.assets
+	_bind_assets_signals(assets)
 
 	current_list.update_asset_list()
+
+
+func _bind_assets_signals(p_assets: Terrain3DAssets) -> void:
+	if p_assets == _observed_assets:
+		return
+	_disconnect_assets_signals()
+	if not is_instance_valid(p_assets):
+		return
+	if not is_instance_valid(texture_list) or not is_instance_valid(mesh_list):
+		return
+	if not p_assets.textures_changed.is_connected(texture_list.update_asset_list):
+		p_assets.textures_changed.connect(texture_list.update_asset_list)
+	if not p_assets.meshes_changed.is_connected(mesh_list.update_asset_list):
+		p_assets.meshes_changed.connect(mesh_list.update_asset_list)
+	_observed_assets = p_assets
+
+
+## Releases the asset source when the editor selection or scene is cleared.
+func unbind_assets() -> void:
+	_disconnect_assets_signals()
+
+
+func _disconnect_assets_signals() -> void:
+	if is_instance_valid(_observed_assets):
+		if is_instance_valid(texture_list) and _observed_assets.textures_changed.is_connected(texture_list.update_asset_list):
+			_observed_assets.textures_changed.disconnect(texture_list.update_asset_list)
+		if is_instance_valid(mesh_list) and _observed_assets.meshes_changed.is_connected(mesh_list.update_asset_list):
+			_observed_assets.meshes_changed.disconnect(mesh_list.update_asset_list)
+	_observed_assets = null
+
+
+func _exit_tree() -> void:
+	_disconnect_assets_signals()
 
 
 func remove_all_highlights():

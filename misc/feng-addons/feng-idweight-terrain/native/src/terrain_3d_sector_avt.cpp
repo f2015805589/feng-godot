@@ -24,6 +24,57 @@
 
 using namespace TerrainAVT;
 
+namespace {
+constexpr float MOTION_PLAN_DEVIATION_COSINE = 0.9612617f; // cos(16 degrees), including 2-degree key quantization.
+
+// The material and the CPU footprint must use the same hardware-supported
+// anisotropy. The gutter is the hard upper bound: asking the planner for a
+// wider singular footprint than the page can sample only adds work outside the
+// shader's supported footprint.
+float avt_view_anisotropy(const Terrain3D *p_terrain, const Camera3D *p_camera) {
+	int level = 2;
+	if (p_camera && p_camera->get_viewport()) {
+		level = int(p_camera->get_viewport()->get_anisotropic_filtering_level());
+	}
+	level = CLAMP(level, 0, 4);
+	return MIN(float(1 << level), MAX(1.f, float(p_terrain->get_vt_page_border()) - 0.5f));
+}
+
+// The standing key stores each basis row in groups of three. The rendered
+// forward axis is the third column, so its entries are 2, 5 and 8. The
+// camera can move through a normal debounce interval, but once it is more than
+// about one turn lead away from the standing plan, waiting for the interval
+// makes the rendered frustum catch the plan from behind. Compare the cosine
+// directly so this stays a cheap hot-path dot product; the small margin over
+// 15 degrees absorbs the key's 2-degree yaw quantization.
+bool avt_plan_angular_deviation_exceeded(const Transform3D &p_camera_transform, const Terrain3DAVTPlanKey &p_plan_key) {
+	if (!is_valid_avt_plan_key(p_plan_key)) { return false; }
+	const Vector3 camera_forward = -p_camera_transform.basis.get_column(2);
+	const Vector3 plan_forward = avt_plan_key_forward(p_plan_key);
+	const float camera_length = camera_forward.length();
+	const float plan_length = plan_forward.length();
+	if (camera_length <= 1e-6f || plan_length <= 1e-6f) { return false; }
+	const float cosine = CLAMP(camera_forward.dot(plan_forward) / (camera_length * plan_length), -1.f, 1.f);
+	return cosine < MOTION_PLAN_DEVIATION_COSINE;
+}
+
+// The key is for the lead transform, so compare the standing key with the camera position after
+// removing the lead that is current this tick. A steady camera and a steady lead therefore do not
+// force a plan every frame; an actual position error accumulates until it crosses the same bounded
+// near-field fraction used by the discontinuity path.
+bool avt_plan_spatial_deviation_exceeded(const Transform3D &p_camera_transform,
+		const Terrain3DAVTPlanKey &p_plan_key, const Vector2 &p_motion_lead, const float p_reach) {
+	if (!is_valid_avt_plan_key(p_plan_key)) { return false; }
+	const Vector2 standing_origin = avt_plan_key_origin_xz(p_plan_key);
+	const Vector2 standing_camera = standing_origin - p_motion_lead;
+	const Vector2 camera_origin(p_camera_transform.origin.x, p_camera_transform.origin.z);
+	const Vector2 deviation = camera_origin - standing_camera;
+	const float threshold = avt_motion_spatial_discontinuity_distance(p_reach);
+	return deviation.length_squared() > threshold * threshold;
+}
+
+}
+
 void Terrain3D::set_surface_vt_texels_per_meter(real_t p_value) {
 	if (!std::isfinite(p_value)) { return; }
 	p_value = CLAMP(p_value, 1.f, 8192.f);
@@ -149,10 +200,19 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	const uint64_t frame_now = Engine::get_singleton()->get_process_frames();
 	const bool key_same = _vt.avt_plan_key == plan_key;
 	const bool key_valid = is_valid_avt_plan_key(_vt.avt_plan_key);
+	const bool angular_refresh = !key_same && avt_plan_angular_deviation_exceeded(camera_transform, _vt.avt_plan_key);
+	const bool spatial_refresh = avt_plan_spatial_deviation_exceeded(camera_transform,
+			_vt.avt_plan_key, _vt.avt_motion_lead, reach);
 	const bool refresh_due = !key_valid || _vt.avt_last_chain_frame == UINT64_MAX ||
-			frame_now >= _vt.avt_last_chain_frame + _vt.avt_plan_refresh_frames;
+			frame_now >= _vt.avt_last_chain_frame + _vt.avt_plan_refresh_frames || angular_refresh || spatial_refresh;
+	_vt.avt_sector_stats["plan_spatial_refresh"] = spatial_refresh;
+	_vt.avt_sector_stats["discard_retained_pending"] = _vt.avt_discard_retained;
 	if (!key_same && !refresh_due) { _vt.avt_plan_refresh_skips++; }
-	const int finished = _avt_install_or_reuse_plan(started, p_max_pages, key_same || !refresh_due);
+	// A spatial deviation can be large even while quantization leaves the key unchanged. Let it
+	// enter the existing chain path; otherwise `key_same` would turn the guard into a diagnostic
+	// with no effect.
+	const bool reuse_plan = (key_same && !spatial_refresh) || !refresh_due;
+	const int finished = _avt_install_or_reuse_plan(started, p_max_pages, reuse_plan);
 	_vt.avt_install_sum_ms += double(Time::get_singleton()->get_ticks_usec() - install_started) / 1000.0;
 	// Where a tick's cost goes, summed over the session: the plan key, the install or reuse
 	// decision - which includes a production pass on every path, so it is not the tick's total -
@@ -199,6 +259,10 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	TerrainVT::VisibleView view(lead_transform, get_camera()->get_camera_projection(),
 			get_camera()->get_viewport() ? get_camera()->get_viewport()->get_visible_rect().size.y : 720.f,
 			get_camera()->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, 192.f);
+	view.anisotropy = avt_view_anisotropy(this, get_camera());
+	if (_material.is_valid()) {
+		RS->material_set_param(_material->get_material_rid(), "_surface_vt_anisotropy", view.anisotropy);
+	}
 	// The chain runs in one pass. Staging it across ticks was tried and reverted: the
 	// install/reuse path above resets the stage cursor, so a chain that was interrupted
 	// between phases could be discarded before it published, which left the directory
@@ -249,18 +313,22 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	// Filled in place and returned by value: this runs on every tick of a moving view, and the
 	// byte array it used to be built into was a 512 byte allocation and a copy per tick.
 	Terrain3DAVTPlanKey state = {};
-	int component = 0;
-	auto append = [&](double value) { state[component++] = value; };
 	// The key describes what the plan is a function of, which is the predicted transform the
 	// page set was derived from - not the rendered one, or a moving camera would re-plan every
 	// frame while the predicted view had not changed at all.
 	const Transform3D transform = _vt_plan_key_transform(camera->get_camera_transform());
+	int component = TERRAIN_AVT_PLAN_BASIS_OFFSET;
+	auto append = [&](double value) { state[component++] = value; };
 	for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col) { append(transform.basis[row][col]); }
+	component = TERRAIN_AVT_PLAN_ORIGIN_OFFSET;
 	for (int axis = 0; axis < 3; ++axis) { append(transform.origin[axis]); }
 	const Projection projection = camera->get_camera_projection();
+	component = TERRAIN_AVT_PLAN_PROJECTION_OFFSET;
 	for (int col = 0; col < 4; ++col) for (int row = 0; row < 4; ++row) { append(projection[col][row]); }
 	const Rect2 viewport = camera->get_viewport()->get_visible_rect();
+	component = TERRAIN_AVT_PLAN_VIEWPORT_OFFSET;
 	append(viewport.position.x); append(viewport.position.y); append(viewport.size.x); append(viewport.size.y);
+	component = TERRAIN_AVT_PLAN_SCALARS_OFFSET;
 	append(p_bounds_ready); append(_region_size); append(_vertex_spacing);
 	append(_vt.surface_vt_texels_per_meter); append(_vt.surface_vt_texels_per_pixel); append(_vt.vt_adaptive_enabled);
 	// The far field's visible count is what reserves part of the pool, but it moves by a page
@@ -270,6 +338,9 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	append((_vt.vt_svt_visible_pages / 16) * 16); append(_vt.surface_svt_enabled); append(_vt.surface_vt_distance);
 	append(!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty());
 	append(_vt.vt_page_count); append(_vt.vt_page_size);
+	append(avt_view_anisotropy(this, camera));
+	// Protected far roots consume physical slots independently of visible detail.
+	append(_vt.svt_root_pages.size());
 	return state;
 }
 
@@ -320,7 +391,9 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// and capped again by the room the completed plan left in its budget, so what this
 			// installs is never larger than the residency it is served from. The planner
 			// reserves that room; this is the same invariant, held where the append happens.
-			const int retain_cap = MIN(128, MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
+			const bool discard_retained = _vt.avt_discard_retained;
+			const int retain_cap = discard_retained ? 0 :
+				MIN(128, MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
 			int retained = 0;
 			for (const Terrain3DAVTPageRequest &page : _vt.avt_page_plan) {
 				if (retained == retain_cap) { break; }
@@ -329,14 +402,30 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 								std::array<int, 5>{ page.owner.x, page.owner.y, page.mip, page.x, page.y })) {
 					continue;
 				}
-				_vt.avt_refinement->pages.push_back(page);
+				Terrain3DAVTPageRequest retained_page = page;
+				// A retained request belongs to the previous view. Keep it available
+				// for residency, but never let it outrank pages the current image
+				// samples when the producer refills its queue.
+				retained_page.priority.kind = TerrainVT::PageRequestKind::OPTIONAL;
+				_vt.avt_refinement->pages.push_back(retained_page);
 				++retained;
 			}
 			_vt.avt_retained_pages = retained;
+			if (discard_retained) {
+				// The old plan remains resident and drawable until normal demand classification
+				// evicts it; only its retained source requests are omitted from this wanted set.
+				_vt.avt_discard_retained = false;
+			}
 			_vt.avt_sector_stats["retained_requests"] = retained;
 			_vt.avt_sector_stats["retain_epochs"] = _vt.avt_retain_epochs;
 			_vt.avt_page_plan = std::move(_vt.avt_refinement->pages);
 			_vt.avt_sampled_pages = _vt.avt_refinement->sampled;
+			_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel) * std::exp2(-float(_vt.avt_refinement->mip_bias));
+			if (_material.is_valid()) {
+				RS->material_set_param(_material->get_material_rid(), "_avt_density_scale", _vt.avt_density_scale);
+			}
+			_vt.avt_sector_stats["capacity_mip_bias"] = _vt.avt_refinement->mip_bias;
+			_vt.avt_sector_stats["sampling_density_scale"] = _vt.avt_density_scale;
 			_vt.avt_prefetch_plan = std::move(_vt.avt_refinement->warm);
 			_vt.avt_prefetch_cursor = 0;
 			_vt.avt_prefetch_cycle_pending = false;
@@ -425,6 +514,7 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	input.view = p_view;
 	input.bounds_ready = p_bounds_ready;
 	input.camera_position = p_camera_position;
+	input.priority_camera_position = get_camera()->get_camera_transform().origin;
 	input.focus = p_focus;
 	input.reach = p_reach;
 	input.exact_radius = float(_cdlod_enabled && _tessellation_level == 0 ? _cdlod_patch_size * _vertex_spacing * _cdlod_lod_scale * 0.7 / (1 << _tessellation_level) : 0);

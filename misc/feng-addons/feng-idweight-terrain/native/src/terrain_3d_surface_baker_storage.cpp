@@ -70,6 +70,11 @@ void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_m
 	}
 	_tiers[tier].requested = mode;
 	_resolve_tier_compression(tier);
+	// Auto normal compression follows the diffuse request, so a diffuse setting change is
+	// itself enough to change the resolved channel mask.
+	if (_tiers[tier].normal_requested == SURFACE_NORMAL_AUTO) {
+		_resolve_tier_normal_compression(tier);
+	}
 	LOG(INFO, "Surface page compression requested for ", tier == TIER_SVT ? "SVT" : "AVT", ": ",
 			page_codec(_tiers[tier].requested).name,
 			"; effective: ", page_codec(_tiers[tier].effective.load()).name,
@@ -79,6 +84,29 @@ void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_m
 		// stale. Both tiers share the pool, and the bundle is rebuilt as one, so the whole
 		// pool is re-produced rather than trying to keep the other tier's pages alive across
 		// the rebuild.
+		std::lock_guard<std::mutex> lock(_mutex);
+		++_generation;
+		_materials_dirty = true;
+		_invalidate_all = true;
+		_resource_generation = 0;
+		std::fill(_ready.begin(), _ready.end(), uint8_t(0));
+		std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
+	}
+}
+
+void Terrain3DSurfaceBaker::set_tier_normal_compression(const int p_tier, const int p_mode) {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	const int mode = CLAMP(p_mode, int(SURFACE_NORMAL_AUTO), int(SURFACE_NORMAL_COUNT) - 1);
+	if (mode == _tiers[tier].normal_requested && _configured) {
+		return;
+	}
+	_tiers[tier].normal_requested = mode;
+	_resolve_tier_normal_compression(tier);
+	LOG(INFO, "Surface normal compression requested for ", tier == TIER_SVT ? "SVT" : "AVT", ": ",
+			mode == SURFACE_NORMAL_AUTO ? String("Auto") : String(normal_codec_name(_tiers[tier].normal_effective.load())),
+			"; effective: ", normal_codec_name(_tiers[tier].normal_effective.load()),
+			_tiers[tier].normal_reason.is_empty() ? String() : String(" (") + _tiers[tier].normal_reason + ")");
+	if (_configured) {
 		std::lock_guard<std::mutex> lock(_mutex);
 		++_generation;
 		_materials_dirty = true;
@@ -147,6 +175,37 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 	LOG(DEBUG, "Surface page compression for ", tier_name, " resolved to ", codec.name);
 }
 
+void Terrain3DSurfaceBaker::_resolve_tier_normal_compression(const int p_tier) {
+	TierState &tier = _tiers[p_tier];
+	const String tier_name = p_tier == TIER_SVT ? String("SVT") : String("AVT");
+	tier.normal_effective = SURFACE_NORMAL_UNCOMPRESSED;
+	tier.normal_format = RenderingDevice::DATA_FORMAT_MAX;
+	tier.normal_reason = String();
+	int mode = tier.normal_requested;
+	if (mode == SURFACE_NORMAL_AUTO) {
+		// The public tier setting selects the same block format for every page channel.
+		mode = normal_mode_for_page_codec(tier.requested);
+	}
+	if (mode == SURFACE_NORMAL_UNCOMPRESSED) {
+		return;
+	}
+	const AtlasCodec &codec = normal_codec(mode);
+	if (codec.gpu_codec == GPU_CODEC_NONE || codec.rd_format == RenderingDevice::DATA_FORMAT_MAX) {
+		tier.normal_reason = String(codec.name) + " has no GPU block encoder or renderer format";
+		return;
+	}
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server ? server->get_rendering_device() : nullptr;
+	if (rd && !rd->texture_is_format_supported_for_usage(codec.rd_format,
+			RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT)) {
+		tier.normal_reason = String(codec.name) + " cannot be sampled and updated on this rendering device";
+		return;
+	}
+	tier.normal_effective = mode;
+	tier.normal_format = codec.rd_format;
+	LOG(DEBUG, "Surface normal compression for ", tier_name, " resolved to ", codec.name);
+}
+
 Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) const {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	const TierState &state = _tiers[tier];
@@ -170,6 +229,21 @@ Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) co
 	info["reason"] = reason;
 	info["rd_format"] = int(state.format.load());
 	info["rd_format_albedo"] = int(state.format_srgb.load());
+	const int normal_available = state.normal_effective.load();
+	info["normal_requested"] = state.normal_requested;
+	info["normal_available"] = normal_available;
+	info["normal_applied"] = state.normal_applied.load();
+	info["normal_name"] = String(normal_codec_name(state.normal_applied.load()));
+	String normal_reason = state.normal_reason;
+	if (normal_reason.is_empty() && normal_available == SURFACE_NORMAL_UNCOMPRESSED &&
+			state.normal_requested != SURFACE_NORMAL_AUTO && state.normal_requested != SURFACE_NORMAL_UNCOMPRESSED) {
+		normal_reason = String(normal_codec_name(state.normal_requested)) +
+				String(" was resolved for this device, but the compressed normal array could not be created");
+	}
+	info["normal_reason"] = normal_reason;
+	info["normal_rd_format"] = int(state.normal_format.load());
+	info["params_encoded"] = state.params_encoded.load();
+	info["params_rd_format"] = int(state.params_format.load());
 	return info;
 }
 
@@ -216,8 +290,54 @@ RID Terrain3DSurfaceBaker::_sampled_rs(const int p_tier, const int p_channel) co
 // arrays. A tier that did not resolve to a codec samples the staging arrays, which is why
 // an uncompressed tier costs no memory at all beyond the pool it already has.
 bool Terrain3DSurfaceBaker::_tier_uses_sampled(const int p_tier) const {
+	return _tier_channel_mask(p_tier, true) != 0;
+}
+
+uint8_t Terrain3DSurfaceBaker::_tier_channel_mask(const int p_tier, const bool p_applied) const {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
-	return _tiers[tier].applied.load() != 0 && _resources.sampled[tier].albedo_rs.is_valid();
+	const TierState &state = _tiers[tier];
+	const int diffuse = p_applied ? state.applied.load() : state.effective.load();
+	const int normal = p_applied ? state.normal_applied.load() : state.normal_effective.load();
+	const bool params = p_applied ? state.params_encoded.load() : (diffuse != 0 || normal != 0);
+	uint8_t mask = 0;
+	if (diffuse != 0) { mask |= uint8_t(1u << 0); }
+	if (normal != SURFACE_NORMAL_UNCOMPRESSED) { mask |= uint8_t(1u << 1); }
+	if (params) { mask |= uint8_t(1u << 2); }
+	return mask;
+}
+
+int Terrain3DSurfaceBaker::_tier_channel_codec(const int p_tier, const int p_channel,
+		const bool p_applied) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	const TierState &state = _tiers[tier];
+	if (p_channel == 0) {
+		const int mode = p_applied ? state.applied.load() : state.effective.load();
+		return page_codec_atlas(mode);
+	}
+	if (p_channel == 1) {
+		const int mode = p_applied ? state.normal_applied.load() : state.normal_effective.load();
+		return normal_codec_atlas(mode);
+	}
+	const int diffuse = p_applied ? state.applied.load() : state.effective.load();
+	const int normal = p_applied ? state.normal_applied.load() : state.normal_effective.load();
+	return _tier_channel_mask(tier, p_applied) & uint8_t(1u << 2)
+			? params_codec_for_channels(diffuse, normal) : 0;
+}
+
+bool Terrain3DSurfaceBaker::_tier_channel_uses_sampled(const int p_tier, const int p_channel) const {
+	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	const int channel = CLAMP(p_channel, 0, ENCODE_CHANNELS - 1);
+	return (_tier_channel_mask(tier, true) & uint8_t(1u << uint32_t(channel))) != 0 &&
+			_sampled_rd(tier, channel).is_valid();
+}
+
+bool Terrain3DSurfaceBaker::_any_tier_uses_sampled(const bool p_applied) const {
+	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		if (_tier_channel_mask(tier, p_applied) != 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // True when every tier resolved to a compressed format, so no consumer samples the RGBA16F
@@ -226,8 +346,7 @@ bool Terrain3DSurfaceBaker::_tier_uses_sampled(const int p_tier) const {
 // and the answer has to be the same for the arrays and for the code that indexes them.
 bool Terrain3DSurfaceBaker::_staging_is_scratch() const {
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
-		if (_tiers[tier].effective.load() == 0 ||
-				_tiers[tier].format.load() == RenderingDevice::DATA_FORMAT_MAX) {
+		if (_tier_channel_mask(tier, false) != 0x7u) {
 			return false;
 		}
 	}
@@ -270,21 +389,21 @@ void Terrain3DSurfaceBaker::_refresh_encode_ring_capacity() {
 	_encode_ring_capacity.store(capacity);
 }
 
-// Bytes the three compressed arrays of one tier cost in the current bundle's slot count.
-// Only the tiers that resolved contribute; a tier left uncompressed samples the staging pool.
+// Bytes the independently compressed arrays of one tier cost in the current bundle's slot count.
 int64_t Terrain3DSurfaceBaker::_tier_sampled_bytes(const int p_tier) const {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
-	const int mode = _tiers[tier].applied.load();
-	if (mode == 0 || !_resources.sampled[tier].albedo_rd.is_valid()) {
-		return 0;
-	}
-	const AtlasCodec &codec = page_codec(mode);
-	if (codec.block_words == 0) {
-		return 0;
-	}
-	// `block_words` is words per 4x4 block, so bytes per texel is block_words / 4.
 	const int64_t blocks = (int64_t(_stored_size) + 3) / 4;
-	return blocks * blocks * codec.block_words * int64_t(sizeof(uint32_t)) * ENCODE_CHANNELS * _page_count;
+	int64_t total = 0;
+	for (int channel = 0; channel < ENCODE_CHANNELS; ++channel) {
+		if (!_tier_channel_uses_sampled(tier, channel)) {
+			continue;
+		}
+		const AtlasCodec &codec = ATLAS_CODECS[_tier_channel_codec(tier, channel, true)];
+		if (codec.block_words != 0) {
+			total += blocks * blocks * codec.block_words * int64_t(sizeof(uint32_t)) * _page_count;
+		}
+	}
+	return total;
 }
 
 void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const int p_slot,
@@ -297,7 +416,8 @@ void Terrain3DSurfaceBaker::_mark_sampled_channel_ready(const int p_tier, const 
 		return;
 	}
 	_sampled_channel_mask[size_t(p_slot)] |= uint8_t(1u << uint32_t(p_channel));
-	if (_sampled_channel_mask[size_t(p_slot)] == 0x7u) {
+	if ((_sampled_channel_mask[size_t(p_slot)] & _tier_channel_mask(p_tier, true)) ==
+			_tier_channel_mask(p_tier, true)) {
 		_ready[size_t(p_slot)] = 1;
 		if (p_slot < int(_produced_frame.size()) && _produced_frame[size_t(p_slot)] != 0) {
 			Engine *engine = Engine::get_singleton();
@@ -355,7 +475,7 @@ bool Terrain3DSurfaceBaker::_upload_encoded_layer(const int p_tier, const int p_
 		}
 	}
 	const RID target = _sampled_rd(tier, p_channel);
-	if (!_rd || _tiers[tier].applied.load() == 0 || !target.is_valid() || p_data.is_empty()) {
+	if (!_rd || !_tier_channel_uses_sampled(tier, p_channel) || !target.is_valid() || p_data.is_empty()) {
 		return false;
 	}
 	if (_rd->texture_update(target, uint32_t(p_slot), p_data) != OK) {
@@ -449,7 +569,6 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 			_encode_pending[slot] = 0;
 			continue;
 		}
-		const AtlasCodec &codec = page_codec(_tiers[tier].applied.load());
 		const int blocks = (_stored_size + 3) / 4;
 		// Under the scratch regime the page already owns a ring page: it was taken when the
 		// page was produced, it is the layer the production wrote into, and it is what holds
@@ -498,19 +617,23 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		push.resize(32);
 		push.encode_u32(0, uint32_t(_stored_size));
 		push.encode_u32(4, uint32_t(source_layer));
-		push.encode_u32(8, codec.gpu_codec);
 		push.encode_u32(12, uint32_t(blocks));
 		int outstanding = 0;
 		bool requested = true;
 		for (int channel = 0; channel < ENCODE_CHANNELS && requested; ++channel) {
+			if (!_tier_channel_uses_sampled(tier, channel)) {
+				continue;
+			}
+			const AtlasCodec &codec = ATLAS_CODECS[_tier_channel_codec(tier, channel, true)];
+			push.encode_u32(8, codec.gpu_codec);
 			const int region = ring_page * ENCODE_CHANNELS + channel;
 			push.encode_u32(16, uint32_t(region * _encode_region_words));
 			// The albedo array is the tier's sRGB one, so its words hold the sRGB encoding of
 			// the linear staging texels; the normal and parameter pages stay linear, and the
 			// alpha channel is linear in every codec.
 			push.encode_u32(20, channel == 0 ? 1u : 0u);
-			push.encode_u32(24, 0u);
-			push.encode_u32(28, 0u);
+			push.encode_u32(24, uint32_t(channel));
+			push.encode_u32(28, channel == 1 ? uint32_t(_tiers[tier].normal_applied.load()) : 0u);
 			if (!_resources.encode_uniform[channel].is_valid()) {
 				requested = false;
 				break;
@@ -572,7 +695,7 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 		// through the encoder buffer's tracker.
 		const Rect2i store_region(0, 0, _stored_size, _stored_size);
 		for (const PendingStore &store : pending_stores) {
-			bool stored = _tiers[store.tier].applied.load() != 0;
+			bool stored = _tier_channel_uses_sampled(store.tier, store.channel);
 			const RID target = stored ? _sampled_rd(store.tier, store.channel) : RID();
 			if (target.is_valid()) {
 				stored = FengRDGpuCopy::copy(_rd, target, _resources.encode_buffer, store.offset,
@@ -658,7 +781,10 @@ void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, c
 	if (stale) {
 		return;
 	}
-	const AtlasCodec &codec = page_codec(_tiers[tier].applied.load());
+	if (p_channel < 0 || p_channel >= ENCODE_CHANNELS || !_tier_channel_uses_sampled(tier, p_channel)) {
+		return;
+	}
+	const AtlasCodec &codec = ATLAS_CODECS[_tier_channel_codec(tier, p_channel, true)];
 	const int blocks = (_stored_size + 3) / 4;
 	const int64_t expected = int64_t(blocks) * blocks * codec.block_words * int64_t(sizeof(uint32_t));
 	if (codec.block_words == 0 || p_data.size() != expected) {
@@ -741,4 +867,3 @@ Dictionary Terrain3DSurfaceBaker::probe_tier_compression(const int p_tier, const
 	result["mean_error"] = total / double(width * height * 4);
 	return result;
 }
-

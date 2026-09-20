@@ -237,6 +237,17 @@ int Terrain3D::get_surface_svt_compression() const {
 	return _vt.surface_svt_compression;
 }
 
+// Legacy normal overrides no longer select a separate format. Loading them keeps
+// the tier codec authoritative, regardless of serialized property order.
+void Terrain3D::set_surface_vt_normal_compression(int p_mode) {
+	(void)p_mode; // Compatibility input only; the unified tier setting owns storage.
+}
+int Terrain3D::get_surface_vt_normal_compression() const { return SURFACE_NORMAL_AUTO; }
+void Terrain3D::set_surface_svt_normal_compression(int p_mode) {
+	(void)p_mode;
+}
+int Terrain3D::get_surface_svt_normal_compression() const { return SURFACE_NORMAL_AUTO; }
+
 // The near field's setting under its pre-split name.
 void Terrain3D::set_vt_atlas_compression(const int p_compression) {
 	set_surface_vt_compression(p_compression);
@@ -316,6 +327,7 @@ void Terrain3D::_configure_vt_service() {
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// Detach both views before replacing their common pool. Clearing one view must
 	// never destroy a pool that another view is still sampling.
+	_reset_vt_page_fade();
 	auto pool = Terrain3DVirtualTexture::create_page_pool();
 	// Both views adopt the shared dimensions before they are configured, so the one
 	// configuration helper describes the view that is actually built. A reconfiguration
@@ -343,6 +355,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.avt_directory_bytes.clear();
 	invalidate_avt_plan_key(_vt.avt_plan_key);
 	_vt.avt_page_plan.clear();
+	_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);
 	_vt.avt_prefetch_plan.clear();
 	_vt.avt_registered_owners.clear();
 	_vt.avt_allocated_sizes.clear();
@@ -510,6 +523,7 @@ void Terrain3D::_update_vt_service() {
 }
 
 void Terrain3D::_destroy_vt_service() {
+	_reset_vt_page_fade();
 	if (_vt.surface_vt) { _vt.surface_vt->set_material_cache_mode(false); }
 	if (_vt.surface_svt) { _vt.surface_svt->set_material_cache_mode(false); }
 	if (_vt.vt_baker.is_valid()) { baker(_vt.vt_baker)->set_cell_store(Ref<Terrain3DCellStore>()); }

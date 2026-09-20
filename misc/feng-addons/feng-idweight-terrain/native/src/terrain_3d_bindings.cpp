@@ -94,8 +94,12 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("probe_vt_atlas_compression", "image"), &Terrain3D::probe_vt_atlas_compression);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_compression", "compression"), &Terrain3D::set_surface_vt_compression);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_compression"), &Terrain3D::get_surface_vt_compression);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_normal_compression", "mode"), &Terrain3D::set_surface_vt_normal_compression);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_normal_compression"), &Terrain3D::get_surface_vt_normal_compression);
 	ClassDB::bind_method(D_METHOD("set_surface_svt_compression", "compression"), &Terrain3D::set_surface_svt_compression);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_compression"), &Terrain3D::get_surface_svt_compression);
+	ClassDB::bind_method(D_METHOD("set_surface_svt_normal_compression", "mode"), &Terrain3D::set_surface_svt_normal_compression);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_normal_compression"), &Terrain3D::get_surface_svt_normal_compression);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_region_rect"), &Terrain3D::get_surface_vt_region_rect);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_texels_per_pixel", "value"), &Terrain3D::set_surface_vt_texels_per_pixel);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_texels_per_pixel"), &Terrain3D::get_surface_vt_texels_per_pixel);
@@ -376,7 +380,10 @@ void Terrain3D::_bind_methods() {
 	// Near-field page storage. AVT pages are rewritten by every edit that invalidates them,
 	// so this codec is paid per production; the GPU block encoder keeps that cost off the CPU.
 	// See the shared comment on `vt_atlas_compression` for why the list has three entries.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA"), "set_surface_vt_compression", "get_surface_vt_compression");
+	// One tier codec is serialized; historical channel properties remain loadable aliases.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3"), "set_surface_vt_compression", "get_surface_vt_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_diffuse_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3", PROPERTY_USAGE_NONE), "set_surface_vt_compression", "get_surface_vt_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_normal_compression", PROPERTY_HINT_ENUM, "Auto:-1,Uncompressed:0,BC5:1,BC3N:2", PROPERTY_USAGE_NONE), "set_surface_vt_normal_compression", "get_surface_vt_normal_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_resolution", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_surface_vt_resolution", "get_surface_vt_resolution");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_texels_per_meter", PROPERTY_HINT_RANGE, "1,8192,1"), "set_surface_vt_texels_per_meter", "get_surface_vt_texels_per_meter");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_vt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_mip_distances", "get_surface_vt_mip_distances");
@@ -408,7 +415,10 @@ void Terrain3D::_bind_methods() {
 	// Far-field page storage. A far-field page is assembled once from a baked cell and then
 	// never rewritten, so its compressed copy is final: this is the tier where a codec buys
 	// the most memory for the least work.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA"), "set_surface_svt_compression", "get_surface_svt_compression");
+	// One tier codec is serialized; historical channel properties remain loadable aliases.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3"), "set_surface_svt_compression", "get_surface_svt_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_diffuse_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3", PROPERTY_USAGE_NONE), "set_surface_svt_compression", "get_surface_svt_compression");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_normal_compression", PROPERTY_HINT_ENUM, "Auto:-1,Uncompressed:0,BC5:1,BC3N:2", PROPERTY_USAGE_NONE), "set_surface_svt_normal_compression", "get_surface_svt_normal_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_auto_bake"), "set_svt_auto_bake", "is_svt_auto_bake");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_svt_enabled"), "set_surface_svt_enabled", "is_surface_svt_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_page_world", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_page_world", "get_surface_svt_page_world");

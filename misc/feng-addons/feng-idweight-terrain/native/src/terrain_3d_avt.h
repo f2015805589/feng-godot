@@ -11,25 +11,55 @@
 #ifndef TERRAIN3D_AVT_TYPES_H
 #define TERRAIN3D_AVT_TYPES_H
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <unordered_set>
 #include <vector>
 
+#include "terrain_vt_request_priority.h"
+
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
+#include <godot_cpp/variant/vector3.hpp>
 
 // What a page plan is a function of: the predicted camera transform, the projection, the viewport
 // and the settings that size the plan. A fixed-size value rather than a byte array, because it is
 // built, copied and compared on every tick of a moving view and an allocation per tick was the
 // largest single thing that build cost. `_avt_plan_state()` fills it in the order the component
 // diagnostic numbers (9 basis, 3 origin, 16 projection, 4 viewport, then the scalars).
-using Terrain3DAVTPlanKey = std::array<double, 64>;
+constexpr std::size_t TERRAIN_AVT_PLAN_BASIS_OFFSET = 0;
+constexpr std::size_t TERRAIN_AVT_PLAN_ORIGIN_OFFSET = 9;
+constexpr std::size_t TERRAIN_AVT_PLAN_PROJECTION_OFFSET = 12;
+constexpr std::size_t TERRAIN_AVT_PLAN_VIEWPORT_OFFSET = 28;
+constexpr std::size_t TERRAIN_AVT_PLAN_SCALARS_OFFSET = 32;
+constexpr std::size_t TERRAIN_AVT_PLAN_KEY_SIZE = 64;
+using Terrain3DAVTPlanKey = std::array<double, TERRAIN_AVT_PLAN_KEY_SIZE>;
+
+static_assert(TERRAIN_AVT_PLAN_ORIGIN_OFFSET == TERRAIN_AVT_PLAN_BASIS_OFFSET + 9);
+static_assert(TERRAIN_AVT_PLAN_PROJECTION_OFFSET == TERRAIN_AVT_PLAN_ORIGIN_OFFSET + 3);
+static_assert(TERRAIN_AVT_PLAN_VIEWPORT_OFFSET == TERRAIN_AVT_PLAN_PROJECTION_OFFSET + 16);
+static_assert(TERRAIN_AVT_PLAN_SCALARS_OFFSET == TERRAIN_AVT_PLAN_VIEWPORT_OFFSET + 4);
+static_assert(TERRAIN_AVT_PLAN_SCALARS_OFFSET < TERRAIN_AVT_PLAN_KEY_SIZE);
+
+inline Vector3 avt_plan_key_forward(const Terrain3DAVTPlanKey &p_key) {
+	return Vector3(
+			-float(p_key[TERRAIN_AVT_PLAN_BASIS_OFFSET + 2]),
+			-float(p_key[TERRAIN_AVT_PLAN_BASIS_OFFSET + 5]),
+			-float(p_key[TERRAIN_AVT_PLAN_BASIS_OFFSET + 8]));
+}
+
+inline Vector2 avt_plan_key_origin_xz(const Terrain3DAVTPlanKey &p_key) {
+	return Vector2(
+			float(p_key[TERRAIN_AVT_PLAN_ORIGIN_OFFSET]),
+			float(p_key[TERRAIN_AVT_PLAN_ORIGIN_OFFSET + 2]));
+}
 
 // A key that matches nothing, for a view that has no plan key yet or whose key was invalidated.
 // NaN is its own inequality, which is the semantics wanted: an invalidated key never compares
@@ -60,6 +90,17 @@ constexpr float AVT_SECTOR_WORLD = 64.f;
 // shared for the same reason the cell size is.
 constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 
+// A position that crosses this fraction of the near field no longer belongs to the old
+// retention window. Both motion sampling and plan refresh use this one contract.
+constexpr float AVT_MOTION_SPATIAL_DISCONTINUITY_REACH_FRACTION = 0.125f;
+constexpr float AVT_MOTION_SPATIAL_DISCONTINUITY_MIN_METRES = 8.f;
+
+inline float avt_motion_spatial_discontinuity_distance(const float p_reach) {
+	const float near_reach = std::max(64.f, p_reach);
+	return std::max(AVT_MOTION_SPATIAL_DISCONTINUITY_MIN_METRES,
+			near_reach * AVT_MOTION_SPATIAL_DISCONTINUITY_REACH_FRACTION);
+}
+
 // One page the planner wants resident: the virtual block that owns it, the mip
 // inside that block, the page coordinate and the world rectangle it covers.
 struct Terrain3DAVTPageRequest {
@@ -68,6 +109,9 @@ struct Terrain3DAVTPageRequest {
 	int x = 0;
 	int y = 0;
 	Rect2 rect;
+	// The worker and producer consume one shared order: roots, current visible
+	// bands, then optional apron/retained work.
+	TerrainVT::PageRequestPriority priority;
 	// Plan epoch this request was last visible in. A grazing page can disappear
 	// for one plan and reappear immediately; the epoch lets the next plan keep
 	// recently requested work instead of cancelling and re-preparing it.
@@ -83,6 +127,11 @@ struct Terrain3DAVTRefinement {
 	std::vector<Terrain3DAVTPageRequest> pages, warm;
 	float finest = 0.f;
 	int denied = 0, roots = 0;
+	// Integer quality coarsening selected by the worker when the visible hierarchy
+	// cannot fit the current near-field budget. The material applies the same bias to
+	// its derivative footprint, so a page kept by this plan is the page the shader
+	// selects while the pool is under pressure.
+	int mip_bias = 0;
 	// Leading entries of `pages` that the current image actually samples, as opposed
 	// to the speculative apron appended after them. Production diagnostics count a
 	// missing page among these as a page the view is shading without content.

@@ -153,8 +153,20 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 	// as often, the phase mean went from 0.13 to 0.7-1.0 ms, and the view still never converged.
 	// The far field's own share is the other half of the same number, so the larger of the two is
 	// what is held back.
+	// The far field's visible-page count is only its detail set. Its protected root
+	// pyramid lives in the same physical pool, so reserving `vt_svt_visible_pages`
+	// alone lets the near plan name roots' slots as well. That is the oversubscription
+	// seen at a high-resolution view: the plan fits its 768-page budget, while the
+	// far field already owns 320 roots plus its detail pages. Use the last published
+	// far set as the near budget's floor; the demand passes run near first, so an empty
+	// initial far set needs a conservative half-pool hold until that set is known.
+	const int svt_root_pages = CLAMP(int(_vt.svt_root_pages.size()), 0, pool_size);
+	const int svt_detail_pages = CLAMP(_vt.vt_svt_visible_pages, 0, pool_size);
+	const int svt_reserved = svt_root_pages > 0 || _vt.svt_roots_settled
+			? MIN(pool_size, svt_root_pages + svt_detail_pages)
+			: pool_size / 2;
 	const int reserved = offline_bake ? pool_size / 2
-			: (_vt.surface_svt_enabled ? MAX(pool_size / 4, MIN(pool_size / 2, _vt.vt_svt_visible_pages)) : 0);
+			: (_vt.surface_svt_enabled ? MAX(pool_size / 4, svt_reserved) : 0);
 	const int budget = MAX(4, pool_size - reserved);
 	const int root_budget = MAX(4, budget / 4);
 	int root_level = 1;

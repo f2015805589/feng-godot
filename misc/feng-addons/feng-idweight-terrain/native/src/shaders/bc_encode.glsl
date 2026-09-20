@@ -4,8 +4,8 @@ R"(
 // block of one page layer into the words the compressed atlas stores, so compressing a
 // page never runs a block encoder on the CPU and never reads the uncompressed staging
 // array back through a texture readback. BC1, BC3, BC4, BC5 and BC7 are produced here.
-// BC7 uses mode 6: one subset with per-endpoint parity bits, which carries alpha at the
-// same precision as colour and keeps the block layout free of partition tables.
+// BC7 compares modes 5 and 6: independent alpha when needed, a shared higher-resolution
+// index stream otherwise. Both avoid partition search and retain bounded GPU work.
 
 #define BC_CODEC_BC1 0u
 #define BC_CODEC_BC3 1u
@@ -16,6 +16,8 @@ R"(
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2DArray encode_source;
+// Parameters borrow roughness from canonical normal.a without an extra page pass.
+layout(set = 0, binding = 2) uniform sampler2DArray encode_normal_source;
 
 layout(set = 0, binding = 1, std430) writeonly buffer EncodeOutput {
 	uint words[];
@@ -64,10 +66,34 @@ vec3 bc_linear_to_srgb(vec3 p_color) {
 
 // A page that is not a multiple of the block size still stores a whole number of blocks,
 // so the tail texels read the last real texel instead of out of bounds.
+vec2 bc_encode_octahedral(vec3 world_normal) {
+	// Y-up keeps the common upper terrain hemisphere away from the fold seam.
+	vec3 n = world_normal.xzy;
+	n /= max(abs(n.x) + abs(n.y) + abs(n.z), 0.000001);
+	vec2 oct = n.xy;
+	if (n.z < 0.0) {
+		oct = (1.0 - abs(oct.yx)) * mix(vec2(-1.0), vec2(1.0), greaterThanEqual(oct, vec2(0.0)));
+	}
+	return oct * 0.5 + 0.5;
+}
+
 ivec4 bc_load(ivec2 p_texel) {
 	const ivec2 size = ivec2(int(encode_push.params.x));
 	const ivec2 clamped = clamp(p_texel, ivec2(0), size - ivec2(1));
-	const vec4 value = texelFetch(encode_source, ivec3(clamped, int(encode_push.params.y)), 0);
+	const ivec3 coord = ivec3(clamped, int(encode_push.params.y));
+	vec4 value = texelFetch(encode_source, coord, 0);
+	// Role and normal layout are separate from codec ID: BC3 can carry either
+	// colour RGBA or the independent alpha/green components of a BC3N normal.
+	if (encode_push.region.z == 1u) {
+		const vec2 oct = bc_encode_octahedral(value.xyz);
+		value = encode_push.region.w == 2u ? vec4(0.0, oct.y, 0.0, oct.x) : vec4(oct, 0.0, 1.0);
+	} else if (encode_push.region.z == 2u) {
+		const float roughness = texelFetch(encode_normal_source, coord, 0).a;
+		// Preserve depth [0,2], AO and AO light influence. Alpha retains a validity
+		// sentinel below 0.5 and roughness above it. Raw/cache images stay canonical.
+		value.r *= 0.5;
+		value.a = value.a < 0.99 ? 0.0 : 0.5 + 0.5 * clamp(roughness, 0.0, 1.0);
+	}
 	vec3 color = clamp(value.rgb, vec3(0.0), vec3(1.0));
 	if (encode_push.region.y != 0u) {
 		color = bc_linear_to_srgb(color);
@@ -109,10 +135,16 @@ uint bc_pack_565(ivec3 p_color) {
 // block whose texels cluster away from its bounds is not stretched across them.
 void bc_color_endpoints(ivec3 p_color[16], out ivec3 r_low, out ivec3 r_high) {
 	ivec3 low = p_color[0];
-	ivec3 high = p_color[0];
-	for (int i = 1; i < 16; ++i) {
-		low = min(low, p_color[i]);
-		high = max(high, p_color[i]);
+	ivec3 high = low;
+	int farthest = -1;
+	for (int i = 0; i < 16; ++i) {
+		const int error = bc_error3(p_color[i], low);
+		if (error > farthest) { farthest = error; high = p_color[i]; }
+	}
+	farthest = -1;
+	for (int i = 0; i < 16; ++i) {
+		const int error = bc_error3(p_color[i], high);
+		if (error > farthest) { farthest = error; low = p_color[i]; }
 	}
 	for (int pass = 0; pass < 2; ++pass) {
 		const vec3 axis = vec3(high - low);
@@ -151,8 +183,10 @@ uvec2 bc_encode_color(ivec3 p_color[16]) {
 	ivec3 low = ivec3(0);
 	ivec3 high = ivec3(0);
 	bc_color_endpoints(p_color, low, high);
-	const uint endpoint0 = bc_pack_565(high);
-	const uint endpoint1 = bc_pack_565(low);
+	const uint packed_high = bc_pack_565(high);
+	const uint packed_low = bc_pack_565(low);
+	const uint endpoint0 = max(packed_high, packed_low);
+	const uint endpoint1 = min(packed_high, packed_low);
 	if (endpoint0 == endpoint1) {
 		return uvec2(endpoint0 | (endpoint1 << 16), 0u);
 	}
@@ -193,7 +227,7 @@ uvec2 bc_encode_alpha(int p_value[16]) {
 		low = min(low, p_value[i]);
 		high = max(high, p_value[i]);
 	}
-	uint indexes = 0u;
+	int index_values[16];
 	if (low != high) {
 		for (int i = 0; i < 16; ++i) {
 			int best = 0;
@@ -207,14 +241,23 @@ uvec2 bc_encode_alpha(int p_value[16]) {
 					best = level;
 				}
 			}
-			indexes |= uint(best) << uint(3 * i);
+			index_values[i] = best;
+		}
+	} else {
+		for (int i = 0; i < 16; ++i) {
+			index_values[i] = 0;
 		}
 	}
-	// The first eight bytes hold the endpoints and the low half of the index stream; the
-	// stream's last index crosses into the second word.
-	const uint first = uint(high) | (uint(low) << 8) | ((indexes & 0xffffu) << 16);
-	const uint second = indexes >> 16;
-	return uvec2(first, second);
+	// The endpoints occupy the first sixteen bits and all sixteen three-bit indices occupy
+	// the remaining 48 bits.  Keep the index stream in the same little-endian bit layout as
+	// the BC3/BC4 block; a single uint cannot represent the indices at i >= 11.
+	uint words[4] = uint[4](0u, 0u, 0u, 0u);
+	bc_put(words, 0, uint(high), 8);
+	bc_put(words, 8, uint(low), 8);
+	for (int i = 0; i < 16; ++i) {
+		bc_put(words, 16 + 3 * i, uint(index_values[i]), 3);
+	}
+	return uvec2(words[0], words[1]);
 }
 
 // The parity bit an eight-bit endpoint carries in its four-bit field. The bit is shared by
@@ -241,13 +284,22 @@ ivec4 bc7_quantize_endpoint(vec4 p_value, out uint r_parity) {
 // BC7 mode six: one subset, four-bit indices, seven-bit endpoints carrying a parity bit.
 // The endpoints are fitted along the block's principal axis, then refitted against the
 // indices that axis produced, so a smooth page is not quantised to its bounding box.
-uvec4 bc_encode_bc7(ivec4 p_color[16]) {
-	vec4 low = vec4(p_color[0]);
-	vec4 high = vec4(p_color[0]);
-	for (int i = 1; i < 16; ++i) {
-		low = min(low, vec4(p_color[i]));
-		high = max(high, vec4(p_color[i]));
+uvec4 bc_encode_bc7_mode6(ivec4 p_color[16], out int r_error) {
+	r_error = 0;
+	ivec4 low_color = p_color[0];
+	ivec4 high_color = low_color;
+	int farthest = -1;
+	for (int i = 0; i < 16; ++i) {
+		const int error = bc_error4(p_color[i], low_color);
+		if (error > farthest) { farthest = error; high_color = p_color[i]; }
 	}
+	farthest = -1;
+	for (int i = 0; i < 16; ++i) {
+		const int error = bc_error4(p_color[i], high_color);
+		if (error > farthest) { farthest = error; low_color = p_color[i]; }
+	}
+	vec4 low = vec4(low_color);
+	vec4 high = vec4(high_color);
 	vec4 endpoint0 = high;
 	vec4 endpoint1 = low;
 	int indexes[16];
@@ -304,6 +356,7 @@ uvec4 bc_encode_bc7(ivec4 p_color[16]) {
 			}
 		}
 		indexes[i] = best;
+		r_error += best_error;
 	}
 	// The anchor of the block stores one bit less than the other texels, so a block whose
 	// anchor landed on the top half of the index range is written the other way round.
@@ -337,6 +390,80 @@ uvec4 bc_encode_bc7(ivec4 p_color[16]) {
 		offset += bits;
 	}
 	return uvec4(words[0], words[1], words[2], words[3]);
+}
+
+)"
+R"(
+// Mode 5 gives alpha its own index stream. Height and roughness are independent
+// of colour/AO; forcing them onto mode 6's shared line destroys that distinction.
+// Compare the actual quantized errors, retaining mode 6 for smooth correlated data.
+uvec4 bc_encode_bc7_mode5(ivec4 p_color[16], out int r_error) {
+	ivec3 rgb[16];
+	int alpha0 = 0;
+	int alpha1 = 255;
+	for (int i = 0; i < 16; ++i) {
+		rgb[i] = p_color[i].rgb;
+		alpha0 = max(alpha0, p_color[i].a);
+		alpha1 = min(alpha1, p_color[i].a);
+	}
+	ivec3 low;
+	ivec3 high;
+	bc_color_endpoints(rgb, low, high);
+	ivec3 q0 = clamp((high * 127 + 127) / 255, ivec3(0), ivec3(127));
+	ivec3 q1 = clamp((low * 127 + 127) / 255, ivec3(0), ivec3(127));
+	ivec3 c0 = (q0 << 1) | (q0 >> 6);
+	ivec3 c1 = (q1 << 1) | (q1 >> 6);
+	int color_indexes[16];
+	int alpha_indexes[16];
+	r_error = 0;
+	for (int i = 0; i < 16; ++i) {
+		int color_error = 1 << 30;
+		int alpha_error = 1 << 30;
+		for (int level = 0; level < 4; ++level) {
+			const int w = (level == 0) ? 0 : ((level == 1) ? 21 : ((level == 2) ? 43 : 64));
+			const ivec3 c = (c0 * (64 - w) + c1 * w + ivec3(32)) >> 6;
+			const int a = (alpha0 * (64 - w) + alpha1 * w + 32) >> 6;
+			const int ce = bc_error3(c, rgb[i]);
+			const int ae = (a - p_color[i].a) * (a - p_color[i].a);
+			if (ce < color_error) { color_error = ce; color_indexes[i] = level; }
+			if (ae < alpha_error) { alpha_error = ae; alpha_indexes[i] = level; }
+		}
+		r_error += color_error + alpha_error;
+	}
+	if (color_indexes[0] >= 2) {
+		ivec3 swap_endpoint = q0; q0 = q1; q1 = swap_endpoint;
+		for (int i = 0; i < 16; ++i) { color_indexes[i] = 3 - color_indexes[i]; }
+	}
+	if (alpha_indexes[0] >= 2) {
+		int swap_endpoint = alpha0; alpha0 = alpha1; alpha1 = swap_endpoint;
+		for (int i = 0; i < 16; ++i) { alpha_indexes[i] = 3 - alpha_indexes[i]; }
+	}
+	uint words[4] = uint[4](0u, 0u, 0u, 0u);
+	bc_put(words, 0, 32u, 6); // mode 5, rotation 0 (RGB + independent A)
+	bc_put(words, 8, uint(q0.r), 7); bc_put(words, 15, uint(q1.r), 7);
+	bc_put(words, 22, uint(q0.g), 7); bc_put(words, 29, uint(q1.g), 7);
+	bc_put(words, 36, uint(q0.b), 7); bc_put(words, 43, uint(q1.b), 7);
+	bc_put(words, 50, uint(alpha0), 8); bc_put(words, 58, uint(alpha1), 8);
+	int offset = 66;
+	for (int i = 0; i < 16; ++i) {
+		int bits = i == 0 ? 1 : 2;
+		bc_put(words, offset, uint(color_indexes[i]), bits); offset += bits;
+	}
+	for (int i = 0; i < 16; ++i) {
+		int bits = i == 0 ? 1 : 2;
+		bc_put(words, offset, uint(alpha_indexes[i]), bits); offset += bits;
+	}
+	return uvec4(words[0], words[1], words[2], words[3]);
+}
+
+uvec4 bc_encode_bc7(ivec4 p_color[16]) {
+	int error6;
+	const uvec4 mode6 = bc_encode_bc7_mode6(p_color, error6);
+	// A near-exact fit cannot benefit materially from another candidate.
+	if (error6 <= 16) { return mode6; }
+	int error5;
+	const uvec4 mode5 = bc_encode_bc7_mode5(p_color, error5);
+	return error5 < error6 ? mode5 : mode6;
 }
 
 void main() {

@@ -88,6 +88,9 @@ func tick() -> void:
 	# tick, because it is the demand passes' readiness checks that say a page arrived.
 	terrain.notification(Node.NOTIFICATION_PHYSICS_PROCESS)
 	await process_frame
+	var fade_settings: Dictionary = terrain.get_vt_settings()
+	require(int(fade_settings.get("vt_page_fade_held_slots", 0)) == 0,
+			"ready material pages must start their fade without a second publication queue")
 	await RenderingServer.frame_post_draw
 
 func material_word(id: int) -> int:

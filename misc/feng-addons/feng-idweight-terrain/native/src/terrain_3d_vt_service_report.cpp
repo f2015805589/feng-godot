@@ -150,6 +150,10 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["vt_page_fade_starts"] = int64_t(_vt.vt_page_fade_starts);
 	result["vt_page_fade_starts_peak"] = _vt.vt_page_fade_starts_peak;
 	result["vt_page_fade_ticks_max"] = _vt.vt_page_fade_ticks_max;
+	// The FIFO has one node per physical slot. Its live length describes the armed arrivals, while
+	// capacity proves that historical arrivals do not leave a consumed prefix behind.
+	result["vt_page_fade_queue_size"] = int64_t(_vt.vt_page_fade_queue.size());
+	result["vt_page_fade_queue_capacity"] = int64_t(_vt.vt_page_fade_queue.capacity());
 	Dictionary phases;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
@@ -172,6 +176,10 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["vt_atlas_compression"] = _vt.surface_vt_compression;
 	result["surface_vt_compression"] = _vt.surface_vt_compression;
 	result["surface_svt_compression"] = _vt.surface_svt_compression;
+	result["surface_vt_diffuse_compression"] = _vt.surface_vt_compression;
+	result["surface_svt_diffuse_compression"] = _vt.surface_svt_compression;
+	result["surface_vt_normal_compression"] = get_surface_vt_normal_compression();
+	result["surface_svt_normal_compression"] = get_surface_svt_normal_compression();
 	if (_vt.vt_baker.is_valid()) {
 		const Dictionary avt_compression = baker(_vt.vt_baker)->get_tier_compression_info(Terrain3DSurfaceBaker::TIER_AVT);
 		result["vt_atlas_compression_available"] = avt_compression.get("available", 0);
@@ -187,6 +195,8 @@ Dictionary Terrain3D::get_vt_settings() const {
 		result["surface_svt_compression_applied"] = svt_compression.get("applied", 0);
 		result["surface_svt_compression_name"] = svt_compression.get("name", String());
 		result["surface_svt_compression_reason"] = svt_compression.get("reason", String());
+		result["avt_storage"] = avt_compression;
+		result["svt_storage"] = svt_compression;
 	}
 	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
 	result["editor_preview"] = _vt.vt_editor_preview;

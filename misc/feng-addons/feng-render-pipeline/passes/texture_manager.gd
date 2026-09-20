@@ -11,10 +11,10 @@ const PassBase = preload("pass_base.gd")
 const Output = preload("pass_output.gd")
 const NativeSpec = preload("../pipeline/native_spec.gd")
 const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
+const BUFFER_SIGNATURE_META: StringName = &"_feng_pipeline_texture_signature"
 
 @export var passes: Array[CompositorEffect] = []
 
-var _buffer_signatures := {}
 var _last_error := ""
 
 func _init() -> void:
@@ -50,8 +50,14 @@ func _render_callback(_stage: int, data: RenderData) -> void:
 		return
 	var outputs := collect_enabled_outputs()
 	var signature := _make_signature(outputs)
-	var buffer_key := buffers.get_instance_id()
-	var needs_rebuild: bool = _buffer_signatures.get(buffer_key, "") != signature
+	# The signature belongs to the named scope on this buffer, not to this manager.
+	# RenderSceneBuffersRD is RefCounted, so metadata disappears with the buffer and
+	# cannot accumulate dead instance IDs in this effect resource. A fixed key also
+	# lets managers that target the same scope observe the same declaration state.
+	var previous_signature: Variant = null
+	if buffers.has_meta(BUFFER_SIGNATURE_META):
+		previous_signature = buffers.get_meta(BUFFER_SIGNATURE_META)
+	var needs_rebuild: bool = previous_signature != signature
 	if not needs_rebuild:
 		# RenderSceneBuffersRD clears named contexts when a viewport is resized or
 		# reconfigured. The manager persists, so the signature can remain unchanged
@@ -65,7 +71,7 @@ func _render_callback(_stage: int, data: RenderData) -> void:
 		# Clearing the scope lets RenderSceneBuffersRD release old RIDs before the
 		# declarations are created again for this viewport.
 		buffers.clear_context(PIPELINE_SCOPE)
-		_buffer_signatures[buffer_key] = signature
+		buffers.set_meta(BUFFER_SIGNATURE_META, signature)
 		for output in outputs:
 			var size: Vector2i = output.get_scaled_size(buffers.get_internal_size())
 			var usage: int = output.usage

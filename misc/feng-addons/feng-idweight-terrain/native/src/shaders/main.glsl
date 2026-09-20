@@ -59,6 +59,7 @@ uniform float _avt_mip_distance[16];
 uniform int _avt_mip_distance_count = 0;
 uniform bool _avt_sectors_enabled = false;
 uniform bool _avt_feedback = false;
+uniform float _avt_density_scale = 1.0;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
 uniform int _avt_directory_mask = 0;
 uniform int _avt_root_level = 1;
@@ -118,9 +119,14 @@ uniform bool _surface_material_required = false;
 // produced from. Without it the same array is sampled through its linear view and every
 // compressed page renders brighter than the uncompressed one. The normal and parameter pages
 // stay linear - a direction and a ratio are not colours - so they carry no such hint.
-uniform highp sampler2DArray _surface_material_albedo : source_color, filter_linear, repeat_disable;
-uniform highp sampler2DArray _surface_material_normal : filter_linear, repeat_disable;
-uniform highp sampler2DArray _surface_material_params : filter_linear, repeat_disable;
+uniform highp sampler2DArray _surface_material_albedo : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
+uniform highp sampler2DArray _surface_material_normal : filter_linear_mipmap_anisotropic, repeat_disable;
+uniform int _surface_normal_encoding = 0;
+uniform bool _surface_params_encoded = false;
+uniform int _surface_svt_normal_encoding = 0;
+uniform bool _surface_svt_params_encoded = false;
+uniform highp sampler2DArray _surface_material_params : filter_linear_mipmap_anisotropic, repeat_disable;
+uniform float _surface_vt_anisotropy = 4.0;
 // The far field's own set. AVT and SVT store the same shared page pool in independent
 // formats - an AVT page is rewritten by every edit, an SVT page is assembled once - so each
 // tier samples the arrays it was produced into. A tier left uncompressed is bound the
@@ -403,31 +409,85 @@ bool surface_svt_sample(const vec2 p_world, out uint r_value) {
 // or pending selected page displays diagnostics; residency never selects a substitute mip.
 // The one exception is the far field's opt-in `_svt_feedback` below, which is
 // a request to trade that diagnostic for a coarser resident level.
-bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
-		out material r_mat, out vec3 r_normal) {
-	if (slot < 0 || slot == 65535) { return false; }
-	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
-	vec4 params = textureLod(_surface_material_params, coord, 0.0);
-	if (params.a < 0.99) { return false; }
-	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
-	vec4 normal_rough = textureLod(_surface_material_normal, coord, 0.0);
+// Storage decoding is shared by AVT and SVT. Staging/cache images remain in
+// canonical signed world-normal form; only compressed sampled arrays use octahedra.
+vec3 surface_decode_octahedral(vec2 encoded) {
+	vec2 f = encoded * 2.0 - 1.0;
+	vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+	float t = clamp(-n.z, 0.0, 1.0);
+	n.xy += mix(vec2(t), vec2(-t), greaterThanEqual(n.xy, vec2(0.0)));
+	return normalize(n).xzy;
+}
+
+bool surface_decode_page(vec4 albedo, vec4 normal_rough, vec4 params,
+		int normal_encoding, bool params_encoded, out material r_mat, out vec3 r_normal) {
+	if (params.a < (params_encoded ? 0.49 : 0.99)) { return false; }
+	if (normal_encoding != 0) {
+		vec2 oct = normal_encoding == 2 ? normal_rough.ag : normal_rough.rg;
+		normal_rough.xyz = surface_decode_octahedral(oct);
+	}
+	if (params_encoded) {
+		normal_rough.a = clamp(params.a * 2.0 - 1.0, 0.0, 1.0);
+		params.r *= 2.0;
+	}
 	r_mat = material(albedo, normal_rough, params.x, params.y, params.z, 1.0);
 	r_normal = normal_rough.xyz;
 	return true;
 }
 
-// The far field's resolve. Identical to the near field's, against the SVT tier's arrays.
+bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
+		out material r_mat, out vec3 r_normal) {
+	if (slot < 0 || slot == 65535) { return false; }
+	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
+	vec4 params = textureLod(_surface_material_params, coord, 0.0);
+	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
+	vec4 normal_rough = textureLod(_surface_material_normal, coord, 0.0);
+	return surface_decode_page(albedo, normal_rough, params, _surface_normal_encoding,
+			_surface_params_encoded, r_mat, r_normal);
+}
+
+// AVT pages store one physical mip; virtual mips are separate pages. Keep the
+// world-space derivatives explicit so page/fract discontinuities never enter
+// the hardware anisotropic footprint. Padding is budgeted by avt_pixel_footprint.
+bool avt_material_slot(int slot, vec2 offset, float texel_world, vec2 world_dx, vec2 world_dy,
+		out material r_mat, out vec3 r_normal) {
+	if (slot < 0 || slot == 65535) { return false; }
+	float stored = float(_surface_vt_page_size + 2 * _surface_vt_page_border);
+	vec3 coord = vec3((offset * float(_surface_vt_page_size) + float(_surface_vt_page_border)) / stored, float(slot));
+	vec2 dx = world_dx / (texel_world * stored);
+	vec2 dy = world_dy / (texel_world * stored);
+	vec4 params = textureGrad(_surface_material_params, coord, dx, dy);
+	vec4 albedo = textureGrad(_surface_material_albedo, coord, dx, dy);
+	vec4 normal_rough = textureGrad(_surface_material_normal, coord, dx, dy);
+	return surface_decode_page(albedo, normal_rough, params, _surface_normal_encoding,
+			_surface_params_encoded, r_mat, r_normal);
+}
+
+float avt_pixel_footprint(vec2 dx, vec2 dy) {
+	// Singular values of the world-XZ pixel Jacobian, including rotated views
+	// whose two screen derivatives can both point mostly along the long axis.
+	float a = dot(dx, dx);
+	float b = dot(dx, dy);
+	float c = dot(dy, dy);
+	float major = sqrt(max(0.5 * (a + c + sqrt(max((a-c)*(a-c) + 4.0*b*b, 0.0))), 1e-16));
+	float minor = abs(dx.x * dy.y - dx.y * dy.x) / major;
+	// The fine virtual mip is floor(LOD), so its texel can be half the desired
+	// footprint. Leave half a texel for bilinear support within the page gutter.
+	float supported = max(1.0, float(_surface_vt_page_border) - 0.5);
+	float anisotropy = max(1.0, min(_surface_vt_anisotropy, supported));
+	return max(minor, major / anisotropy);
+}
+
+// The far field's resolve, against the SVT tier's arrays.
 bool surface_svt_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
 	if (slot < 0 || slot == 65535) { return false; }
 	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
 	vec4 params = textureLod(_surface_svt_material_params, coord, 0.0);
-	if (params.a < 0.99) { return false; }
 	vec4 albedo = textureLod(_surface_svt_material_albedo, coord, 0.0);
 	vec4 normal_rough = textureLod(_surface_svt_material_normal, coord, 0.0);
-	r_mat = material(albedo, normal_rough, params.x, params.y, params.z, 1.0);
-	r_normal = normal_rough.xyz;
-	return true;
+	return surface_decode_page(albedo, normal_rough, params, _surface_svt_normal_encoding,
+			_surface_svt_params_encoded, r_mat, r_normal);
 }
 
 // Same contract as surface_svt_sample(): the selected level alone is tried unless the
@@ -529,7 +589,7 @@ int avt_distance_mip(float distance_to_camera, int top) {
 R"(
 // Select by pixel footprint across local mips and the world hierarchy.
 // Strict by default; optional coarse recovery stays within the AVT hierarchy.
-bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out material result, out vec3 result_normal,
+bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_coarse, vec2 world_dx, vec2 world_dy, out material result, out vec3 result_normal,
 		out float texel_world, out float fade, out bool last_mip) {
 	fade = 1.0;
 	for (int level = 0; level <= _avt_root_level; ++level) {
@@ -542,7 +602,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 		ivec2 sector = ivec2(floor(world / span));
 		vec4 entry;
 		if (!avt_find_sector(sector, level, entry)) {
-			if (_avt_feedback) { continue; }
+			if (allow_coarse) { continue; }
 			return false;
 		}
 		float base_texel = span / (entry.w * float(_surface_vt_page_size));
@@ -559,11 +619,11 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 		for (int mip = max(0, start); mip <= top; ++mip) {
 			int slot = int(texelFetch(_surface_vt_indirection, page >> mip, mip).r + 0.5);
 			vec2 offset = fract(local * entry.w / float(1 << mip));
-			if (!surface_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, result, result_normal)) {
-				if (_avt_feedback) { continue; }
+			texel_world = base_texel * float(1 << mip);
+			if (!avt_material_slot(slot, offset, texel_world, world_dx, world_dy, result, result_normal)) {
+				if (allow_coarse) { continue; }
 				return false;
 			}
-			texel_world = base_texel * float(1 << mip);
 			fade = surface_vt_page_fade(slot);
 			last_mip = level == _avt_root_level && mip == top;
 
@@ -573,11 +633,11 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, out materia
 	return false;
 }
 
-bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out vec3 r_normal) {
+bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 world_dy, out material r_mat, out vec3 r_normal) {
 	float fine_texel;
 	float fine_fade;
 	bool last_mip;
-	if (!avt_resolve(world, pixel_world, 0.0, r_mat, r_normal, fine_texel, fine_fade, last_mip)) { return false; }
+	if (!avt_resolve(world, pixel_world, 0.0, _avt_feedback, world_dx, world_dy, r_mat, r_normal, fine_texel, fine_fade, last_mip)) { return false; }
 	// The blend is the pixel footprint's mip interpolation, and - while a page is still coming in
 	// - the level that page replaced. A page that has just arrived is resolved at full weight for
 	// its own texels, so without the second term it appears as a rectangular step in the image;
@@ -590,7 +650,10 @@ bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out 
 	vec3 coarse_normal;
 	float coarse_texel;
 	float coarse_fade;
-	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, coarse, coarse_normal, coarse_texel, coarse_fade, last_mip)) { return true; }
+	// Strict mode checks the requested fine page above. Its transition parent is
+	// an availability query: skipping an unfinished intermediate parent must not
+	// bypass the fade while a valid world ancestor is already resident.
+	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, true, world_dx, world_dy, coarse, coarse_normal, coarse_texel, coarse_fade, last_mip)) { return true; }
 	// The coarser resolve can land on the same page when nothing coarser is resident; there is
 	// then nothing to fade against and the sharp page stands.
 	if (coarse_texel <= fine_texel) { return true; }
@@ -605,17 +668,46 @@ bool avt_filtered_sample(vec2 world, float pixel_world, out material r_mat, out 
 	r_mat.ao = mix(r_mat.ao, coarse.ao, weight);
 	r_mat.ao_affect = mix(r_mat.ao_affect, coarse.ao_affect, weight);
 	r_normal = mix(r_normal, coarse_normal, weight);
+	// A parent can be arriving in the same burst as its child. Blending straight
+	// to that parent's full-detail sample bypasses its fade and exposes the page
+	// grid. Carry only its remaining contribution up the hierarchy until a
+	// settled ancestor is found. The normal settled path still samples two pages.
+	float remaining = weight;
+	for (int ancestor = 0; ancestor < 32; ++ancestor) {
+		if (last_mip || coarse_fade >= 0.999 || remaining <= 0.001) { break; }
+		material parent;
+		vec3 parent_normal;
+		float parent_texel;
+		float parent_fade;
+		if (!avt_resolve(world, pixel_world, coarse_texel * 1.001, true, world_dx, world_dy, parent, parent_normal,
+				parent_texel, parent_fade, last_mip) || parent_texel <= coarse_texel) { break; }
+		remaining *= 1.0 - coarse_fade;
+		r_mat.albedo_height += (parent.albedo_height - coarse.albedo_height) * remaining;
+		r_mat.normal_rough += (parent.normal_rough - coarse.normal_rough) * remaining;
+		r_mat.normal_map_depth += (parent.normal_map_depth - coarse.normal_map_depth) * remaining;
+		r_mat.ao += (parent.ao - coarse.ao) * remaining;
+		r_mat.ao_affect += (parent.ao_affect - coarse.ao_affect) * remaining;
+		r_normal += (parent_normal - coarse_normal) * remaining;
+		coarse = parent;
+		coarse_normal = parent_normal;
+		coarse_texel = parent_texel;
+		coarse_fade = parent_fade;
+	}
 	return true;
 }
 
 bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
 	if (!_surface_material_enabled) { return false; }
 	if (_surface_vt_enabled && _avt_sectors_enabled) {
-		float pixel_world = max(length(dFdx(world)), length(dFdy(world)));
+		vec2 world_dx = dFdx(world);
+		vec2 world_dy = dFdy(world);
+		// Match the installed CPU plan's explicit quality/capacity LOD. A denied
+		// fine page is not an asynchronous miss and must never be sampled forever.
+		float pixel_world = avt_pixel_footprint(world_dx, world_dy) / max(_avt_density_scale, 0.000001);
 		float reach = max(64.0, _avt_coverage_distance);
 		float far_weight = _surface_svt_enabled ? smoothstep(reach * 0.75, reach, distance(world, v_camera_pos.xz)) : 0.0;
 		if (far_weight >= 1.0) { return surface_svt_material_sample(world, r_mat, r_normal); }
-		bool avt_ready = avt_filtered_sample(world, pixel_world, r_mat, r_normal);
+		bool avt_ready = avt_filtered_sample(world, pixel_world, world_dx, world_dy, r_mat, r_normal);
 		if (far_weight <= 0.0) { return avt_ready; }
 		material far_mat;
 		vec3 far_normal;
@@ -1213,7 +1305,10 @@ void fragment() {
 		dot(blendedNormal, w_normal));
 	vec3 normal_map = fma(normalize(normalTS), vec3(0.5), vec3(0.5));
 	float distant_normal_amplifier = clamp(max(length(base_ddx.xz), length(base_ddy.xz)), 1., distant_normal_scale);
-	mat.normal_map_depth *= distant_normal_amplifier;
+	// Each layer's depth was already applied before projection and blending by
+	// idweight_decode_normal(), in both source evaluation and the VT baker.
+	// Applying their weighted depth again here scales the finished direction twice.
+	mat.normal_map_depth = distant_normal_amplifier;
 
 	//INSERT: MACRO_VARIATION
 

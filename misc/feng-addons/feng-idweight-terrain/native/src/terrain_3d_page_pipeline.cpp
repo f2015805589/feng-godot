@@ -205,7 +205,7 @@ void Terrain3DPagePipeline::_lock_queue(std::unique_lock<std::mutex> &r_lock) {
 // page whose slot the producer is already filling leaves its entry behind, and without
 // this the window fills with dead results and the workers run out of work to do.
 void Terrain3DPagePipeline::_make_room() {
-	if (_entries.size() < 32) { return; }
+	if (_entries.size() < QUEUE_CAPACITY) { return; }
 	int oldest = -1;
 	for (size_t i = 0; i < _entries.size(); ++i) {
 		if (!_entries[i].ready) { continue; }
@@ -281,8 +281,12 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 		_lock_queue(lock);
 		for (const Request &request : requests) {
 			if (_index_of(request.key) >= 0) { continue; }
-			_make_room();
-			if (_entries.size() >= 32) { break; }
+			// Retain already removed obsolete demand. A full batch contains work
+			// the consumer still needs, including completed payloads it will poll
+			// immediately after prime. Evicting those here repeatedly prepares the
+			// same pages and delays nearby detail. Consumption opens the slots for
+			// the bounded refill later in this pass.
+			if (_entries.size() >= QUEUE_CAPACITY) { break; }
 			const uint64_t token = ++_token;
 			_entries.push_back(Entry{request, source, {}, token});
 			_claim_order.push_back(request.key);
@@ -303,6 +307,18 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 	_prime_inserted.store(inserted, std::memory_order_relaxed);
 	_prime_wakes.store(wakes, std::memory_order_relaxed);
 }
+Terrain3DPagePipeline::ReadyKeys Terrain3DPagePipeline::ready_keys() {
+	ReadyKeys result{};
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const Entry &entry : _entries) {
+			if (entry.ready) { result.keys[result.count++] = entry.request.key; }
+		}
+	}
+	std::sort(result.keys.begin(), result.keys.begin() + result.count);
+	return result;
+}
+
 bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const Snapshot> source, Result &result) {
 	std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
 	_lock_queue(lock);
@@ -319,7 +335,7 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 	// A poll that finds nothing submits the request, but it never evicts: the caller walks
 	// its whole demand list, so evicting here would replace the work in flight with the far
 	// end of that list and throw away every result the workers had just finished.
-	if (_entries.size() < 32) {
+	if (_entries.size() < QUEUE_CAPACITY) {
 		const uint64_t token = ++_token;
 		_entries.push_back(Entry{request, std::move(source), {}, token});
 		_claim_order.push_back(request.key);

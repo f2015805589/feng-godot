@@ -19,6 +19,16 @@ var width: float = 90.
 var focus_style: StyleBox
 var _clearing_resource: bool = false
 var search_text: String = ""
+var _observed_resources: Array[Resource] = []
+
+
+func _enter_tree() -> void:
+	# The pre-4.6 dock reparents this container while changing slots. Restore
+	# callbacks for entries that survived the reparent after _exit_tree cleared
+	# the old source connections.
+	for entry in entries:
+		if is_instance_valid(entry) and entry.resource:
+			_observe_resource(entry.resource)
 
 
 func _ready() -> void:
@@ -31,10 +41,33 @@ func _ready() -> void:
 
 
 func clear() -> void:
+	_disconnect_resource_signals()
 	for e in entries:
 		e.get_parent().remove_child(e)
 		e.queue_free()
 	entries.clear()
+
+
+func _exit_tree() -> void:
+	_disconnect_resource_signals()
+
+
+func _observe_resource(p_resource: Resource) -> void:
+	if not is_instance_valid(p_resource) or not p_resource.has_signal(&"id_changed"):
+		return
+	if _observed_resources.has(p_resource):
+		return
+	if not p_resource.id_changed.is_connected(set_selected_after_swap):
+		p_resource.id_changed.connect(set_selected_after_swap)
+	_observed_resources.append(p_resource)
+
+
+func _disconnect_resource_signals() -> void:
+	for p_resource in _observed_resources:
+		if is_instance_valid(p_resource) and p_resource.has_signal(&"id_changed") and \
+				p_resource.id_changed.is_connected(set_selected_after_swap):
+			p_resource.id_changed.disconnect(set_selected_after_swap)
+	_observed_resources.clear()
 
 
 func update_asset_list() -> void:
@@ -85,8 +118,7 @@ func add_item(p_resource: Resource = null) -> void:
 	entries.push_back(entry)
 	
 	if p_resource:
-		if not p_resource.id_changed.is_connected(set_selected_after_swap):
-			p_resource.id_changed.connect(set_selected_after_swap)
+		_observe_resource(p_resource)
 
 
 func _on_role_selected(p_role: int, p_entry: ListEntry) -> void:

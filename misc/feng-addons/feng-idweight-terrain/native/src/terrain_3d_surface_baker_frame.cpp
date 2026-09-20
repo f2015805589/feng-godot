@@ -23,11 +23,70 @@
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 // The codec vocabulary, the shared constants and the small helpers of the four halves; see
 // terrain_3d_surface_baker_internal.h for what it holds and why it is a header.
 using namespace terrain_surface_baker;
+
+namespace {
+
+Vector3 surface_decode_normal_oct(const float p_x, const float p_y) {
+	float x = p_x * 2.0f - 1.0f;
+	float y = p_y * 2.0f - 1.0f;
+	float z = 1.0f - std::abs(x) - std::abs(y);
+	const float fold = std::clamp(-z, 0.0f, 1.0f);
+	x += x >= 0.0f ? -fold : fold;
+	y += y >= 0.0f ? -fold : fold;
+	const float length = std::sqrt(std::max(x * x + y * y + z * z, 1.0e-12f));
+	// The bake's canonical normal is world XYZ, while the octahedral basis is XZY so Y-up
+	// terrain does not put its flat normal on the standard Z-up octahedron boundary.
+	return Vector3(x / length, z / length, y / length);
+}
+
+Ref<Image> surface_decode_normal_page(const Ref<Image> &p_encoded, const Ref<Image> &p_params,
+		const int p_encoding, const bool p_params_encoded) {
+	if (p_encoded.is_null()) {
+		return p_encoded;
+	}
+	const int width = p_encoded->get_width();
+	const int height = p_encoded->get_height();
+	Ref<Image> decoded = Image::create_empty(width, height, false, Image::FORMAT_RGBAH);
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const Color encoded = p_encoded->get_pixel(x, y);
+			const Color packed_params = p_params.is_valid() ? p_params->get_pixel(x, y) : Color(0, 0, 0, 1);
+			const float roughness = p_params_encoded ? std::clamp(packed_params.a * 2.0f - 1.0f, 0.0f, 1.0f) : encoded.a;
+			const Vector3 normal = p_encoding == SURFACE_NORMAL_UNCOMPRESSED
+					? Vector3(encoded.r, encoded.g, encoded.b)
+					: (p_encoding == SURFACE_NORMAL_BC3N
+							? surface_decode_normal_oct(encoded.a, encoded.g)
+							: surface_decode_normal_oct(encoded.r, encoded.g));
+			decoded->set_pixel(x, y, Color(normal.x, normal.y, normal.z, roughness));
+		}
+	}
+	return decoded;
+}
+
+Ref<Image> surface_decode_params_page(const Ref<Image> &p_encoded) {
+	if (p_encoded.is_null()) {
+		return p_encoded;
+	}
+	const int width = p_encoded->get_width();
+	const int height = p_encoded->get_height();
+	Ref<Image> decoded = Image::create_empty(width, height, false, Image::FORMAT_RGBAH);
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const Color packed = p_encoded->get_pixel(x, y);
+			const bool valid = packed.a >= 0.49f;
+			decoded->set_pixel(x, y, Color(packed.r * 2.0f, packed.g, packed.b, valid ? 1.0f : 0.0f));
+		}
+	}
+	return decoded;
+}
+
+} // namespace
 
 ///////////////////////////
 // Render callback
@@ -117,14 +176,13 @@ void Terrain3DSurfaceBaker::_set_ready(int p_slot, bool p_ready, uint64_t p_gene
 		Engine *engine = Engine::get_singleton();
 		_produced_frame[size_t(p_slot)] = engine ? uint64_t(engine->get_process_frames()) : 0;
 	}
-	// A tier stored uncompressed produces straight into the staging arrays the material
-	// samples, so recording its successful write makes the page ready. A tier stored
-	// compressed produces into a different array set and becomes ready only once all three
-	// encoded layers have uploaded - and the flag is *not* cleared while an encode is in
-	// flight, because a demand pass that reads it as "not ready" produces the page again and
-	// the page then never settles.
+	// Raw channels are ready as soon as staging was written. Only the compressed channel bits
+	// wait for their own block uploads; this is what lets a mixed raw/BC page settle without
+	// scheduling a fake encode for a raw channel.
 	const int tier = p_slot < int(_slot_tier.size()) ? int(_slot_tier[size_t(p_slot)]) : int(TIER_AVT);
-	_ready[size_t(p_slot)] = _tier_uses_sampled(tier) ? 0 : 1;
+	const uint8_t compressed_mask = _tier_channel_mask(tier, true);
+	_sampled_channel_mask[size_t(p_slot)] = uint8_t(0x7u & ~compressed_mask);
+	_ready[size_t(p_slot)] = compressed_mask == 0 ? 1 : 0;
 }
 
 void Terrain3DSurfaceBaker::_retire_acknowledged_bundles() {
@@ -440,7 +498,7 @@ RID Terrain3DSurfaceBaker::get_albedo_rid() const {
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_tier_uses_sampled(TIER_AVT)) {
+	if (_tier_channel_uses_sampled(TIER_AVT, 0)) {
 		return _resources.sampled[TIER_AVT].albedo_rs;
 	}
 	return _resources.output_albedo_rs;
@@ -462,16 +520,21 @@ Dictionary Terrain3DSurfaceBaker::get_published_arrays() const {
 		return result;
 	}
 	auto publish = [this](Dictionary &r_result, int p_tier, const String &p_prefix) {
-		const bool compressed = _tiers[p_tier].applied.load() != 0;
-		r_result[p_prefix + String("albedo_height")] = (compressed && _resources.sampled[p_tier].albedo_rs.is_valid())
+		const bool albedo_compressed = _tier_channel_uses_sampled(p_tier, 0);
+		const bool normal_compressed = _tier_channel_uses_sampled(p_tier, 1);
+		const bool params_compressed = _tier_channel_uses_sampled(p_tier, 2);
+		r_result[p_prefix + String("albedo_height")] = albedo_compressed
 				? _resources.sampled[p_tier].albedo_rs
 				: _resources.output_albedo_rs;
-		r_result[p_prefix + String("normal_roughness")] = (compressed && _resources.sampled[p_tier].normal_rs.is_valid())
+		r_result[p_prefix + String("normal_roughness")] = normal_compressed
 				? _resources.sampled[p_tier].normal_rs
 				: _resources.output_normal_rs;
-		r_result[p_prefix + String("params")] = (compressed && _resources.sampled[p_tier].params_rs.is_valid())
+		r_result[p_prefix + String("params")] = params_compressed
 				? _resources.sampled[p_tier].params_rs
 				: _resources.output_params_rs;
+		r_result[p_prefix + String("normal_encoding")] = normal_compressed
+				? _tiers[p_tier].normal_applied.load() : int(SURFACE_NORMAL_UNCOMPRESSED);
+		r_result[p_prefix + String("params_encoded")] = params_compressed;
 	};
 	publish(result, TIER_AVT, String());
 	publish(result, TIER_SVT, String("svt_"));
@@ -492,7 +555,7 @@ RID Terrain3DSurfaceBaker::get_normal_rid() const {
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_tier_uses_sampled(TIER_AVT)) {
+	if (_tier_channel_uses_sampled(TIER_AVT, 1)) {
 		return _resources.sampled[TIER_AVT].normal_rs;
 	}
 	return _resources.output_normal_rs;
@@ -503,7 +566,7 @@ RID Terrain3DSurfaceBaker::get_params_rid() const {
 	if (_resource_generation != _generation) {
 		return RID();
 	}
-	if (_tier_uses_sampled(TIER_AVT)) {
+	if (_tier_channel_uses_sampled(TIER_AVT, 2)) {
 		return _resources.sampled[TIER_AVT].params_rs;
 	}
 	return _resources.output_params_rs;
@@ -556,31 +619,26 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 	RID params;
 	uint64_t generation;
 	int tier = TIER_AVT;
-	bool scratch = false;
 	bool albedo_srgb = false;
+	int normal_encoding = SURFACE_NORMAL_UNCOMPRESSED;
+	bool params_encoded = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		if (p_slot < 0 || p_slot >= int(_ready.size()) || !_ready[size_t(p_slot)]) {
 			return result;
 		}
 		tier = p_slot < int(_slot_tier.size()) ? int(_slot_tier[size_t(p_slot)]) : int(TIER_AVT);
-		scratch = _staging_is_scratch();
-		if (scratch && _tier_uses_sampled(tier)) {
-			// Under the scratch regime a slot's half-float layer is long gone: it was reused
-			// by the next page the frame produced. The page's content is its block words, so
-			// the export reads those and decodes them.
-			albedo = _sampled_rs(tier, 0);
-			normal = _sampled_rs(tier, 1);
-			params = _sampled_rs(tier, 2);
-			// The albedo array is the tier's sRGB one, so the decode below has to undo the
-			// encoding the block words hold to hand back the linear texels the uncompressed
-			// staging array would have.
-			albedo_srgb = _tiers[tier].format_srgb.load() != RenderingDevice::DATA_FORMAT_MAX;
-		} else {
-			albedo = _resources.output_albedo_rs;
-			normal = _resources.output_normal_rs;
-			params = _resources.output_params_rs;
-		}
+		const bool sampled_albedo = _tier_channel_uses_sampled(tier, 0);
+		const bool sampled_normal = _tier_channel_uses_sampled(tier, 1);
+		const bool sampled_params = _tier_channel_uses_sampled(tier, 2);
+		// A mixed tier may keep canonical staging for one channel while the other channels
+		// have already been recycled into block arrays. Select each source independently.
+		albedo = sampled_albedo ? _sampled_rs(tier, 0) : _resources.output_albedo_rs;
+		normal = sampled_normal ? _sampled_rs(tier, 1) : _resources.output_normal_rs;
+		params = sampled_params ? _sampled_rs(tier, 2) : _resources.output_params_rs;
+		albedo_srgb = sampled_albedo;
+		normal_encoding = sampled_normal ? _tiers[tier].normal_applied.load() : SURFACE_NORMAL_UNCOMPRESSED;
+		params_encoded = sampled_params;
 		generation = _generation;
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
@@ -611,6 +669,20 @@ Dictionary Terrain3DSurfaceBaker::export_page(int p_slot) const {
 		const Image::Format decoded_format = albedo_image->get_format();
 		if (decoded_format == Image::FORMAT_RGBA8 || decoded_format == Image::FORMAT_RGB8) {
 			albedo_image->srgb_to_linear();
+		}
+	}
+	const Ref<Image> packed_params = params_image;
+	if (normal_encoding != SURFACE_NORMAL_UNCOMPRESSED || params_encoded) {
+		normal_image = surface_decode_normal_page(normal_image, packed_params, normal_encoding, params_encoded);
+	}
+	if (params_encoded) {
+		params_image = surface_decode_params_page(packed_params);
+	}
+	// Cached SVT pages have a fixed RGBAH canonical contract. A RenderingDevice readback of a
+	// compressed UNORM target is commonly RGBA8, so normalize every export after decoding.
+	for (Ref<Image> *image : { &albedo_image, &normal_image, &params_image }) {
+		if ((*image)->get_format() != Image::FORMAT_RGBAH) {
+			(*image)->convert(Image::FORMAT_RGBAH);
 		}
 	}
 	result["albedo_height"] = albedo_image;
@@ -670,6 +742,10 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 		stats[prefix + String("_applied")] = info.get("applied", 0);
 		stats[prefix + String("_name")] = info.get("name", String());
 		stats[prefix + String("_reason")] = info.get("reason", String());
+		stats[prefix + String("_normal_requested")] = info.get("normal_requested", SURFACE_NORMAL_AUTO);
+		stats[prefix + String("_normal_applied")] = info.get("normal_applied", SURFACE_NORMAL_UNCOMPRESSED);
+		stats[prefix + String("_normal_name")] = info.get("normal_name", String("Uncompressed"));
+		stats[prefix + String("_params_encoded")] = info.get("params_encoded", false);
 	}
 	stats["encode_pending"] = int64_t(std::count(_encode_pending.begin(), _encode_pending.end(), uint8_t(1)));
 	// The half-float pool's shape: page sized while a tier samples it by slot, the encoder
@@ -752,6 +828,12 @@ int Terrain3DSurfaceBaker::get_pending_page_count() const {
 void Terrain3DSurfaceBaker::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("configure", "page_size", "border", "page_count"),
 			&Terrain3DSurfaceBaker::configure);
+	ClassDB::bind_method(D_METHOD("set_tier_compression", "tier", "mode"),
+			&Terrain3DSurfaceBaker::set_tier_compression);
+	ClassDB::bind_method(D_METHOD("set_tier_normal_compression", "tier", "mode"),
+			&Terrain3DSurfaceBaker::set_tier_normal_compression);
+	ClassDB::bind_method(D_METHOD("get_tier_compression_info", "tier"),
+			&Terrain3DSurfaceBaker::get_tier_compression_info);
 	ClassDB::bind_method(D_METHOD("set_materials", "albedo_array_rid", "normal_array_rid", "colors",
 								 "normal_depths", "ao_strengths", "ao_affects", "roughness_mods", "uv_scales", "detiles",
 								 "slope_params"),

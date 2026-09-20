@@ -35,6 +35,8 @@ struct PlanInput {
 	TerrainVT::VisibleView view;
 	bool bounds_ready = false;
 	Vector3 camera_position;
+	// Demand can lead the view; submission priority belongs to the eye being drawn.
+	Vector3 priority_camera_position;
 	Vector2 focus;
 	float reach = 0.f;
 	float exact_radius = 0.f;

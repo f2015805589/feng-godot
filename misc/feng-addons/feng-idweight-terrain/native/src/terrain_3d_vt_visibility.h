@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "terrain_vt_sampling.h"
+
 namespace TerrainVT {
 using namespace godot;
 struct VisiblePatch {
@@ -27,6 +29,9 @@ struct VisibleView {
 	Vector3 forward, right, up;
 	float focal = 1.f;
 	bool orthographic = false;
+	// Zero keeps the historical max-row footprint used by the legacy view. The
+	// sector AVT path supplies the effective hardware anisotropy explicitly.
+	float anisotropy = 0.f;
 	// A view can also be built later, e.g. as a member of a plan input struct.
 	VisibleView() = default;
 	explicit VisibleView(Camera3D *camera, float guard_pixels = 0.f) :
@@ -66,7 +71,15 @@ struct VisibleView {
 		if (Math::abs(denominator) < 0.000001f) { return 0.f; }
 		const Vector3 dx = right - ray * (normal.dot(right) / denominator);
 		const Vector3 dy = up - ray * (normal.dot(up) / denominator);
-		const float footprint = MAX(Vector2(dx.x, dx.z).length(), Vector2(dy.x, dy.z).length());
+		const Vector2 dx_xz(dx.x, dx.z), dy_xz(dy.x, dy.z);
+		float footprint;
+		if (anisotropy > 0.f) {
+			const TerrainVT::Sampling::Footprint singular = TerrainVT::Sampling::singular_footprint(
+					{ { dx.x, dx.z }, { dy.x, dy.z } }, anisotropy);
+			footprint = singular.effective;
+		} else {
+			footprint = MAX(dx_xz.length(), dy_xz.length());
+		}
 		return focal / MAX(0.000001f, footprint * (orthographic ? 1.f : depth));
 	}
 	// A conservative lower density bound for a horizontal source patch. The
@@ -84,7 +97,9 @@ struct VisibleView {
 			const Vector3 direction = orthographic ? forward : delta;
 			const Vector3 dx = right - direction * (normal.dot(right) / divisor);
 			const Vector3 dy = up - direction * (normal.dot(up) / divisor);
-			max_gradient = MAX(max_gradient, MAX(Vector2(dx.x, dx.z).length(), Vector2(dy.x, dy.z).length()));
+			if (anisotropy <= 0.f) {
+				max_gradient = MAX(max_gradient, MAX(Vector2(dx.x, dx.z).length(), Vector2(dy.x, dy.z).length()));
+			}
 			const Vector2 gx(dx.x, dx.z), gy(dy.x, dy.z);
 			dx_min = dx_min.min(gx); dx_max = dx_max.max(gx);
 			dy_min = dy_min.min(gy); dy_max = dy_max.max(gy);
@@ -102,10 +117,21 @@ struct VisibleView {
 		// their representational error so isolated pixels at a mip boundary cannot
 		// select a neighbouring mip which exact CPU arithmetic omitted.
 		const float roundoff = max_world * std::numeric_limits<float>::epsilon() * 4.f;
-		const float largest = max_gradient * (orthographic ? 1.f : max_depth) / focal;
-		const float smallest = min_gradient * (orthographic ? 1.f : min_depth) / focal;
-		return Vector2(1.f / MAX(0.000001f, largest * 1.01f + roundoff),
-				1.f / MAX(0.000001f, smallest * 0.99f - roundoff));
+		if (anisotropy <= 0.f) {
+			const float largest = max_gradient * (orthographic ? 1.f : max_depth) / focal;
+			const float smallest = min_gradient * (orthographic ? 1.f : min_depth) / focal;
+			return Vector2(1.f / MAX(0.000001f, largest * 1.01f + roundoff),
+					1.f / MAX(0.000001f, smallest * 0.99f - roundoff));
+		}
+		const TerrainVT::Sampling::FootprintBounds bounds = TerrainVT::Sampling::singular_footprint_bounds(
+				{ dx_min.x, dx_min.y }, { dx_max.x, dx_max.y },
+				{ dy_min.x, dy_min.y }, { dy_max.x, dy_max.y }, anisotropy, min_gradient);
+		const float depth_min = orthographic ? 1.f : min_depth;
+		const float depth_max = orthographic ? 1.f : max_depth;
+		const float effective_min = bounds.effective_min * depth_min / focal;
+		const float effective_max = bounds.effective_max * depth_max / focal;
+		return Vector2(1.f / MAX(0.000001f, effective_max * 1.01f + roundoff),
+				1.f / MAX(0.000001f, effective_min * 0.99f - roundoff));
 	}
 	bool sample_triangle(const Vector3 &a, const Vector3 &b, const Vector3 &c, const Rect2 &rect, VisiblePatch &result) const {
 		std::array<Vector3, 16> polygon = {a, b, c}, clipped;

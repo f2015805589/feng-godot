@@ -4,9 +4,9 @@
 // It is its own file because it is the one part of the VT tick that runs on *every* tick whether or
 // not a demand pass had anything to do, and because it is what makes a page arrival a ramp instead
 // of a step - which is exactly what a fast turn makes visible, since the view then refines in the
-// rectangular grid its pages are. A burst of arrivals is *held* and released a few ramps per tick
-// for the same reason one arrival is ramped: a whole block sharpening on one tick reads as a
-// flicker however smooth each page's own ramp is. Everything it needs is a per-slot flag, set where
+// rectangular grid its pages are. Pages that finish together start their ramps together:
+// staggering already-ready pages adds latency and exposes a moving page grid. Everything it
+// needs is a per-slot flag, set where
 // content is removed or queued (terrain_3d_vt_service.cpp), and the producer's readiness for the
 // slots that flag names, which it reads once for the whole waiting set.
 //
@@ -24,14 +24,6 @@
 #include "terrain_3d_virtual_texture.h"
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
-
-namespace {
-// Ramps that may start on one tick when there is nothing to spread out: an isolated arrival, or a
-// backlog no larger than this. It is a floor rather than the whole rate because a page that landed
-// alone must not wait for company - and it is more than one because a pair landing together is the
-// smallest thing a wash is worth spreading.
-constexpr int FADE_STARTS_FLOOR = 2;
-} // namespace
 
 // A slot whose content is missing, dropped, or still being produced. Whatever it holds next is
 // an arrival, and that is the only thing the fade needs to know about it: `_update_vt_page_fade()`
@@ -56,8 +48,19 @@ void Terrain3D::_vt_mark_page_waiting(int p_slot) {
 		const size_t needed = MAX(slot + 1, _vt.vt_slot_pending.size());
 		_vt.vt_slot_pending.resize(needed, PageArrival::SETTLED);
 		_vt.vt_slot_fade_ticks.resize(needed, 0);
+		_vt.vt_slot_fade_just_started.resize(needed, 0);
 	}
+	if (slot >= _vt.vt_slot_fade_just_started.size()) {
+		_vt.vt_slot_fade_just_started.resize(slot + 1, 0);
+	}
+	// A slot may be invalidated again while an older arrival is still in the FIFO. Remove that
+	// older record before marking the new content as waiting; one physical slot has one current
+	// arrival, so no generation number or stale queue scan is needed.
+	_vt.vt_page_fade_queue.remove(p_slot);
 	_vt.vt_slot_pending[slot] = PageArrival::WAITING;
+	_vt.vt_slot_fade_ticks[slot] = uint8_t(MIN(255, MAX(1, _vt.vt_page_fade_frames)));
+	_vt.vt_slot_fade_just_started[slot] = 0;
+	_vt.vt_page_fade_dirty = true;
 }
 
 // Publishes the per-slot arrival fade the shader blends with. The texture is one byte per
@@ -76,6 +79,9 @@ void Terrain3D::_update_vt_page_fade() {
 	if (_vt.vt_page_fade_frames <= 0 || !_vt.surface_vt || !_vt.vt_shared_ready) { return; }
 	const int slots = MAX(1, _vt.surface_vt->get_page_count());
 	const int frames = MAX(1, _vt.vt_page_fade_frames);
+	if (_vt.vt_page_fade_queue.capacity() != size_t(slots)) {
+		_vt.vt_page_fade_queue.resize(size_t(slots));
+	}
 	if (_vt.vt_page_fade_texture.is_null() || int(_vt.vt_slot_fade_ticks.size()) != slots) {
 		// Keep the ramps that are already running: a slot keeps its index when the pool's page
 		// count changes, so the counters are still that slot's, and reinitializing them would end
@@ -83,6 +89,7 @@ void Terrain3D::_update_vt_page_fade() {
 		// The texture is seeded from the counters rather than from settled for the same reason.
 		_vt.vt_slot_fade_ticks.resize(size_t(slots), 0);
 		_vt.vt_slot_pending.resize(size_t(slots), PageArrival::SETTLED);
+		_vt.vt_slot_fade_just_started.resize(size_t(slots), 0);
 		PackedByteArray settled;
 		settled.resize(slots);
 		uint8_t *output = settled.ptrw();
@@ -97,6 +104,9 @@ void Terrain3D::_update_vt_page_fade() {
 		// The material has to be told about a texture it has not been bound to before.
 		if (_material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 		if (_vt.vt_page_fade_texture.is_null()) { return; }
+	}
+	if (int(_vt.vt_slot_fade_just_started.size()) != slots) {
+		_vt.vt_slot_fade_just_started.resize(size_t(slots), 0);
 	}
 	// Which slots are waiting for content now, and how many are already armed: one read of the
 	// producer's array. The waiting set is a handful of slots even on a moving view, so this is one
@@ -123,42 +133,33 @@ void Terrain3D::_update_vt_page_fade() {
 		for (size_t i = 0; i < _vt.vt_page_fade_waiting.size(); ++i) {
 			const bool ready = i < _vt.vt_page_fade_ready.size() && _vt.vt_page_fade_ready[i] != 0;
 			if (!ready) { continue; }
-			// The content landed, so the slot is armed at zero - what the shader reads meanwhile
-			// is the level this page replaces - and it joins the order below rather than starting
-			// its ramp here. That is what lets a burst be spread over the ticks that follow.
+			// Arm at zero, then publish every completed page in this batch together.
+			// The first displayed sample remains its parent; only the ramp changes it.
 			const size_t slot = size_t(_vt.vt_page_fade_waiting[i]);
 			_vt.vt_slot_pending[slot] = PageArrival::ARMED;
 			_vt.vt_slot_fade_ticks[slot] = uint8_t(MIN(255, frames));
-			_vt.vt_page_fade_queue.push_back(int(slot));
+			_vt.vt_page_fade_queue.enqueue(int(slot));
 			landed = true;
 			++armed;
 		}
 	}
-	// Release a few armed slots per tick, oldest first. This is the whole of the anti-flicker
-	// measure: a burst that lands together would otherwise start every ramp on the same tick, and
-	// the block would sharpen as one step - which is what a view that is turning shows, because a
-	// turn is what makes a burst. At least two ramps start per tick, and a backlog larger than the
-	// ramp's own length is spread over it, so a burst sharpens in about the time one ramp takes.
-	// An armed slot is not blurry and not late: it is showing the level its page is replacing, at
-	// the weight that level would have had on its own.
+	// Production already has a bounded per-tick budget. Do not impose a second
+	// throughput limit on content that is ready: that keeps nearby detail blurry
+	// and starts neighbouring pages on visibly different clocks.
 	held += armed;
-	_vt.vt_page_fade_held = held;
-	const int per_tick = MAX(FADE_STARTS_FLOOR, (held + frames - 1) / frames);
 	int released = 0;
-	while (released < per_tick && _vt.vt_page_fade_queue_at < _vt.vt_page_fade_queue.size()) {
-		const int slot = _vt.vt_page_fade_queue[_vt.vt_page_fade_queue_at++];
-		// A stale entry is dropped rather than trusted: a slot re-armed since it was queued, or
-		// one the pool no longer has, is not the arrival this entry describes.
+	int slot = -1;
+	while (_vt.vt_page_fade_queue.pop(slot)) {
+		// The slot is normally still armed. Keep the state check as a cheap defensive guard for a
+		// service reset that raced a queued result; the queue itself has no stale historical entries.
 		if (slot < 0 || slot >= slots || _vt.vt_slot_pending[size_t(slot)] != PageArrival::ARMED) { continue; }
 		_vt.vt_slot_pending[size_t(slot)] = PageArrival::SETTLED;
+		_vt.vt_slot_fade_just_started[size_t(slot)] = 1;
 		++_vt.vt_page_fade_starts;
 		++released;
 	}
+	_vt.vt_page_fade_held = MAX(0, held - released);
 	if (released > _vt.vt_page_fade_starts_peak) { _vt.vt_page_fade_starts_peak = released; }
-	if (_vt.vt_page_fade_queue_at >= _vt.vt_page_fade_queue.size()) {
-		_vt.vt_page_fade_queue.clear();
-		_vt.vt_page_fade_queue_at = 0;
-	}
 	// A fade steps down once per tick, so a run of ticks with nothing arriving is a loop over
 	// the active slots and no upload. An armed slot is skipped: its countdown has not started, and
 	// the level it shows is what its own arrival is being blended against.
@@ -166,18 +167,30 @@ void Terrain3D::_update_vt_page_fade() {
 	int ramping = 0;
 	_vt.vt_page_fade_ticks_max = 0;
 	for (int slot = 0; slot < slots; ++slot) {
-		if (_vt.vt_slot_pending[size_t(slot)] == PageArrival::WAITING) { ++_vt.vt_page_fade_pending; }
-		if (_vt.vt_slot_pending[size_t(slot)] == PageArrival::ARMED) { continue; }
-		uint8_t &ticks = _vt.vt_slot_fade_ticks[size_t(slot)];
+		const size_t index = size_t(slot);
+		if (_vt.vt_slot_pending[index] == PageArrival::WAITING) {
+			++_vt.vt_page_fade_pending;
+			// Waiting content must keep the replacement-level byte at zero. It is not a ramp and
+			// must not count down while the producer is still working.
+			continue;
+		}
+		if (_vt.vt_slot_pending[index] == PageArrival::ARMED) { continue; }
+		uint8_t &ticks = _vt.vt_slot_fade_ticks[index];
 		if (ticks == 0) { continue; }
 		_vt.vt_page_fade_ticks_max = MAX(_vt.vt_page_fade_ticks_max, int(ticks));
+		if (_vt.vt_slot_fade_just_started[index] != 0) {
+			// The release tick publishes the first zero-weight frame. Countdown starts on the
+			// following tick, so the first visible step is never 1/frames.
+			_vt.vt_slot_fade_just_started[index] = 0;
+			continue;
+		}
 		--ticks;
 		++ramping;
 		any_active = true;
 	}
 	// A tick that armed a slot has a byte to publish even when no ramp is running: an armed slot
 	// reads zero until its ramp starts, and that zero is what holds its replacement's level there.
-	if (!any_active && !landed && released == 0) { return; }
+	if (!any_active && !landed && released == 0 && !_vt.vt_page_fade_dirty) { return; }
 	PackedByteArray bytes;
 	bytes.resize(slots);
 	uint8_t *output = bytes.ptrw();
@@ -187,25 +200,66 @@ void Terrain3D::_update_vt_page_fade() {
 	}
 	_vt.vt_page_fade_image->set_data(slots, 1, false, Image::FORMAT_R8, bytes);
 	_vt.vt_page_fade_texture->update(_vt.vt_page_fade_image);
+	_vt.vt_page_fade_dirty = false;
 	// The ramps actually running, not the slots the texture was published for: a tick that only
 	// armed an arrival publishes a byte without a ramp behind it, and a count that included those
 	// would read as a view that is fading when it is only holding.
 	_vt.vt_page_fade_active = ramping;
 }
 
+// A page pool rebuild invalidates every physical slot index. Drop the fade texture and all
+// per-slot arrival state with it, so a slot number reused by the new pool cannot inherit an old
+// arrival or an armed FIFO node. Cumulative start diagnostics intentionally remain cumulative;
+// the live counters describe the new pool from this point onward.
+void Terrain3D::_reset_vt_page_fade() {
+	_vt.vt_slot_fade_ticks.clear();
+	_vt.vt_slot_pending.clear();
+	_vt.vt_slot_fade_just_started.clear();
+	_vt.vt_page_fade_queue.reset();
+	_vt.vt_page_fade_waiting.clear();
+	_vt.vt_page_fade_ready.clear();
+	_vt.vt_page_fade_image.unref();
+	_vt.vt_page_fade_texture.unref();
+	_vt.vt_page_fade_dirty = false;
+	_vt.vt_page_fade_active = 0;
+	_vt.vt_page_fade_pending = 0;
+	_vt.vt_page_fade_held = 0;
+	_vt.vt_page_fade_ticks_max = 0;
+}
+
 void Terrain3D::set_vt_page_fade_frames(int p_frames) {
 	p_frames = CLAMP(p_frames, 0, 60);
 	if (_vt.vt_page_fade_frames == p_frames) { return; }
+	const int old_frames = _vt.vt_page_fade_frames;
 	_vt.vt_page_fade_frames = p_frames;
+	if (old_frames > 0 && p_frames > 0) {
+		// Preserve the current normalized blend when the ramp length changes. Waiting and armed
+		// slots have not started their ramp, so they are simply prepared at the new length. This
+		// keeps the setter from publishing an out-of-range byte or wrapping uint8_t when a live
+		// ramp is shortened.
+		const size_t count = MIN(_vt.vt_slot_fade_ticks.size(), _vt.vt_slot_pending.size());
+		bool changed = false;
+		for (size_t slot = 0; slot < count; ++slot) {
+			if (_vt.vt_slot_pending[slot] == PageArrival::WAITING ||
+					_vt.vt_slot_pending[slot] == PageArrival::ARMED) {
+				_vt.vt_slot_fade_ticks[slot] = uint8_t(p_frames);
+				changed = true;
+				continue;
+			}
+			const int old_ticks = MIN(old_frames, int(_vt.vt_slot_fade_ticks[slot]));
+			if (old_ticks <= 0) { continue; }
+			_vt.vt_slot_fade_ticks[slot] = uint8_t(
+					MIN(p_frames, (old_ticks * p_frames + old_frames - 1) / old_frames));
+			changed = true;
+		}
+		if (changed) { _vt.vt_page_fade_dirty = true; }
+	}
 	// A disabled fade is the shader's own early out, and the settled texture already reads as
 	// "no fade", so switching it off needs no texture work.
 	if (p_frames == 0) {
 		// Nothing is fading and nothing is owed once the feature is off, so the armed slots and the
 		// order they were waiting in go with the counters.
-		_vt.vt_slot_fade_ticks.clear();
-		_vt.vt_slot_pending.clear();
-		_vt.vt_page_fade_queue.clear();
-		_vt.vt_page_fade_queue_at = 0;
+		_reset_vt_page_fade();
 	}
 	if (_material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 }

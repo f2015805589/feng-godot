@@ -282,13 +282,13 @@ private:
 	// onto this object.
 	void _register_debug_monitors();
 	void _unregister_debug_monitors();
-	double _monitor_vt_cpu_ms() const { return _vt.vt_cpu_ms; }
-	double _monitor_vt_peak_ms() const { return _vt.vt_cpu_peak_ms; }
-	double _monitor_avt_cpu_ms() const { return _vt.vt_avt_ms; }
-	double _monitor_svt_cpu_ms() const { return _vt.vt_svt_ms; }
+	double _monitor_vt_cpu_seconds() const { return _vt.vt_cpu_ms / 1000.0; }
+	double _monitor_vt_peak_seconds() const { return _vt.vt_cpu_peak_ms / 1000.0; }
+	double _monitor_avt_cpu_seconds() const { return _vt.vt_avt_ms / 1000.0; }
+	double _monitor_svt_cpu_seconds() const { return _vt.vt_svt_ms / 1000.0; }
 	// The geometry backend's pass, which the rendering server drives rather than the tick,
 	// so it is read from the mesher instead of from the VT state.
-	double _monitor_cdlod_cpu_ms() const;
+	double _monitor_cdlod_cpu_seconds() const;
 	int64_t _monitor_material_bytes() const;
 	int64_t _monitor_pages_ready() const;
 	int64_t _monitor_pages_pending() const;
@@ -368,6 +368,7 @@ public:
 	real_t get_vt_motion_lead_ms() const { return _vt.vt_motion_lead_ms; }
 	void set_avt_feedback(bool p_enabled);
 	bool get_avt_feedback() const { return _vt.avt_feedback; }
+	float get_avt_density_scale() const { return _vt.avt_density_scale; }
 	void set_svt_feedback(bool p_enabled);
 	bool get_svt_feedback() const { return _vt.svt_feedback; }
 	bool is_svt_startup_ready() const { return !_vt.svt_feedback || _vt.surface_svt_root_mips <= 0 || _vt.svt_startup_ready; }
@@ -484,6 +485,7 @@ public:
 	// Turns those records and the producer's readiness into the per-slot ramp the shader reads,
 	// on every tick whether or not a demand pass ran. See terrain_3d_vt_fade.cpp.
 	void _update_vt_page_fade();
+	void _reset_vt_page_fade();
 	// Wakes both source pipelines' workers for the work the pass that just ended submitted.
 	void _flush_source_wakes();
 	// As above, but a no-op while the physics tick is running: the tick releases them itself, after
@@ -511,6 +513,10 @@ public:
 	int get_surface_vt_compression() const;
 	void set_surface_svt_compression(const int p_compression);
 	int get_surface_svt_compression() const;
+	void set_surface_vt_normal_compression(int p_mode);
+	int get_surface_vt_normal_compression() const;
+	void set_surface_svt_normal_compression(int p_mode);
+	int get_surface_svt_normal_compression() const;
 	// The near field's setting, under the name it had while compression was one switch.
 	void set_vt_atlas_compression(const int p_compression);
 	int get_vt_atlas_compression() const;

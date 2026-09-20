@@ -54,11 +54,11 @@ void Terrain3D::_register_debug_monitors() {
 		int type;
 	};
 	const MonitorEntry entries[] = {
-		{ "vt_cpu", callable_mp(this, &Terrain3D::_monitor_vt_cpu_ms), MONITOR_TYPE_TIME },
-		{ "vt_cpu_peak", callable_mp(this, &Terrain3D::_monitor_vt_peak_ms), MONITOR_TYPE_TIME },
-		{ "avt_cpu", callable_mp(this, &Terrain3D::_monitor_avt_cpu_ms), MONITOR_TYPE_TIME },
-		{ "svt_cpu", callable_mp(this, &Terrain3D::_monitor_svt_cpu_ms), MONITOR_TYPE_TIME },
-		{ "cdlod_cpu", callable_mp(this, &Terrain3D::_monitor_cdlod_cpu_ms), MONITOR_TYPE_TIME },
+		{ "vt_cpu", callable_mp(this, &Terrain3D::_monitor_vt_cpu_seconds), MONITOR_TYPE_TIME },
+		{ "vt_cpu_peak", callable_mp(this, &Terrain3D::_monitor_vt_peak_seconds), MONITOR_TYPE_TIME },
+		{ "avt_cpu", callable_mp(this, &Terrain3D::_monitor_avt_cpu_seconds), MONITOR_TYPE_TIME },
+		{ "svt_cpu", callable_mp(this, &Terrain3D::_monitor_svt_cpu_seconds), MONITOR_TYPE_TIME },
+		{ "cdlod_cpu", callable_mp(this, &Terrain3D::_monitor_cdlod_cpu_seconds), MONITOR_TYPE_TIME },
 		{ "material_bytes", callable_mp(this, &Terrain3D::_monitor_material_bytes), MONITOR_TYPE_MEMORY },
 		{ "pages_ready", callable_mp(this, &Terrain3D::_monitor_pages_ready), MONITOR_TYPE_QUANTITY },
 		{ "pages_pending", callable_mp(this, &Terrain3D::_monitor_pages_pending), MONITOR_TYPE_QUANTITY },
@@ -103,8 +103,8 @@ void Terrain3D::_unregister_debug_monitors() {
 	}
 }
 
-double Terrain3D::_monitor_cdlod_cpu_ms() const {
-	return _terrain_mesher ? _terrain_mesher->get_cdlod_cpu_ms() : 0.0;
+double Terrain3D::_monitor_cdlod_cpu_seconds() const {
+	return _terrain_mesher ? _terrain_mesher->get_cdlod_cpu_ms() / 1000.0 : 0.0;
 }
 
 int64_t Terrain3D::_monitor_material_bytes() const {

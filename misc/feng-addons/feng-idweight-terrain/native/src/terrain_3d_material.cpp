@@ -22,6 +22,7 @@
 #include <godot_cpp/classes/gradient.hpp>
 #include <godot_cpp/classes/noise_texture2d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/viewport.hpp>
 
 ///////////////////////////
 // Private Functions
@@ -170,6 +171,7 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
 	RS->material_set_param(p_material, "_avt_feedback", _terrain->get_avt_feedback());
+	RS->material_set_param(p_material, "_avt_density_scale", _terrain->get_avt_density_scale());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
 	// Page-arrival fade: one texel per physical slot, indexed by the slot the indirection
@@ -178,6 +180,12 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RID page_fade = _terrain->get_vt_page_fade_rid();
 	RS->material_set_param(p_material, "_surface_vt_page_fade", page_fade.is_valid() ? page_fade : _generated_dummy_2d.get_rid());
 	RS->material_set_param(p_material, "_surface_vt_page_fade_frames", _terrain->get_vt_page_fade_frames());
+	// Match the rendering view's hardware sampler without polling project settings
+	// or rebuilding the page plan. The shader also limits support to the page gutter.
+	Camera3D *camera = _terrain->get_camera();
+	Viewport *view = camera ? camera->get_viewport() : _terrain->get_viewport();
+	const int anisotropy = view ? int(view->get_anisotropic_filtering_level()) : 2;
+	RS->material_set_param(p_material, "_surface_vt_anisotropy", float(1 << CLAMP(anisotropy, 0, 4)));
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
 	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
 	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
@@ -197,6 +205,11 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RID baked_albedo = material_pages.get("albedo_height", RID());
 	RID baked_normal = material_pages.get("normal_roughness", RID());
 	RID baked_params = material_pages.get("params", RID());
+	// Encoding metadata is published in the same locked snapshot as these RIDs.
+	RS->material_set_param(p_material, "_surface_normal_encoding", material_pages.get("normal_encoding", 0));
+	RS->material_set_param(p_material, "_surface_params_encoded", material_pages.get("params_encoded", false));
+	RS->material_set_param(p_material, "_surface_svt_normal_encoding", material_pages.get("svt_normal_encoding", 0));
+	RS->material_set_param(p_material, "_surface_svt_params_encoded", material_pages.get("svt_params_encoded", false));
 	// The far field's own set. AVT and SVT store the same page pool in independent formats,
 	// so each tier samples the arrays it was produced into; a tier left uncompressed resolves
 	// to the staging arrays, which is what lets one tier be compressed while the other is not.

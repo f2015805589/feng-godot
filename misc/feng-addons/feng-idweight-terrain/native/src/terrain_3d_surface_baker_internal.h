@@ -105,7 +105,7 @@ inline constexpr int ATLAS_CODEC_COUNT = int(sizeof(ATLAS_CODECS) / sizeof(Atlas
 inline constexpr int PAGE_CODEC_ATLAS[SURFACE_PAGE_COUNT] = {
 	0, // SURFACE_PAGE_UNCOMPRESSED - samples the staging arrays, no codec involved.
 	1, // SURFACE_PAGE_BC7 - 16 bytes per 4x4 block, the higher quality of the two.
-	3, // SURFACE_PAGE_BC3 - 8 bytes per 4x4 block, half the memory of BC7.
+	3, // SURFACE_PAGE_BC3 - 16 bytes per 4x4 block, the same storage size as BC7.
 };
 static_assert(PAGE_CODEC_ATLAS[SURFACE_PAGE_UNCOMPRESSED] < ATLAS_CODEC_COUNT &&
 				PAGE_CODEC_ATLAS[SURFACE_PAGE_BC7] < ATLAS_CODEC_COUNT &&
@@ -114,8 +114,59 @@ static_assert(PAGE_CODEC_ATLAS[SURFACE_PAGE_UNCOMPRESSED] < ATLAS_CODEC_COUNT &&
 static_assert(ATLAS_CODECS[PAGE_CODEC_ATLAS[SURFACE_PAGE_BC7]].gpu_codec != GPU_CODEC_NONE &&
 				ATLAS_CODECS[PAGE_CODEC_ATLAS[SURFACE_PAGE_BC3]].gpu_codec != GPU_CODEC_NONE,
 		"every page codec must have a GPU block encoder, or no page could ever be stored in it");
+
+inline int page_codec_atlas(const int p_codec) {
+	return PAGE_CODEC_ATLAS[CLAMP(p_codec, 0, int(SURFACE_PAGE_COUNT) - 1)];
+}
+
 inline const AtlasCodec &page_codec(const int p_codec) {
-	return ATLAS_CODECS[PAGE_CODEC_ATLAS[CLAMP(p_codec, 0, int(SURFACE_PAGE_COUNT) - 1)]];
+	return ATLAS_CODECS[page_codec_atlas(p_codec)];
+}
+
+// Normal pages use the same GPU block encoder with a different source transform. BC5 stores
+// oct.x/y in its two alpha-style channels; BC3N uses BC3's A/G channels for devices that do not
+// expose BC5. The normal setting is intentionally separate from page_codec(), whose ids are the
+// diffuse request vocabulary.
+inline int normal_codec_atlas(const int p_codec) {
+	static constexpr int NORMAL_CODEC_ATLAS[SURFACE_NORMAL_COUNT] = {
+		0, // uncompressed
+		5, // BC5 RG
+		3, // BC3N uses the BC3 block layout
+		1, // BC7 RG octahedral normal
+	};
+	return NORMAL_CODEC_ATLAS[CLAMP(p_codec, 0, int(SURFACE_NORMAL_COUNT) - 1)];
+}
+
+inline const AtlasCodec &normal_codec(const int p_codec) {
+	return ATLAS_CODECS[normal_codec_atlas(p_codec)];
+}
+
+inline int normal_mode_for_page_codec(const int p_page_codec) {
+	switch (p_page_codec) {
+		case SURFACE_PAGE_BC7:
+			return SURFACE_NORMAL_BC7;
+		case SURFACE_PAGE_BC3:
+			return SURFACE_NORMAL_BC3N;
+		default:
+			return SURFACE_NORMAL_UNCOMPRESSED;
+	}
+}
+
+// Parameter pages use the selected diffuse codec when it is compressed. When only the normal
+// channel is compressed, BC7 is the fallback parameter codec because the diffuse channel has no
+// page codec to select. A raw tier samples canonical parameters without a compressed array.
+inline int params_codec_for_channels(const int p_diffuse_mode, const int p_normal_mode) {
+	const int diffuse = CLAMP(p_diffuse_mode, 0, int(SURFACE_PAGE_COUNT) - 1);
+	const int normal = CLAMP(p_normal_mode, 0, int(SURFACE_NORMAL_COUNT) - 1);
+	if (diffuse == SURFACE_PAGE_UNCOMPRESSED && normal == SURFACE_NORMAL_UNCOMPRESSED) {
+		return PAGE_CODEC_ATLAS[SURFACE_PAGE_UNCOMPRESSED];
+	}
+	const int selected = diffuse == SURFACE_PAGE_UNCOMPRESSED ? SURFACE_PAGE_BC7 : diffuse;
+	return page_codec_atlas(selected);
+}
+
+inline const char *normal_codec_name(const int p_codec) {
+	return p_codec == SURFACE_NORMAL_BC3N ? "BC3N" : normal_codec(p_codec).name;
 }
 
 

@@ -1231,15 +1231,33 @@ that lower-level contract separately.
 ```powershell
 cd misc/feng-addons/feng-idweight-terrain/native/tests/vt
 scons && ./terrain_vt_contract_test.exe
+./terrain_vt_request_priority_test.exe
 ```
 
-Standalone C++ test for `src/terrain_vt.h`, the shared AVT/SVT addressing core.
+Standalone C++ test for `src/terrain_vt.h`, the shared AVT/SVT addressing core,
+and `src/terrain_vt_arrival_queue.h`, the bounded per-slot arrival FIFO. The FIFO
+checks include duplicate-slot replacement, pool resizing and 100,000 churn operations.
 No engine and no GPU. It pins the indirection mip-chain walk (which level and local
 coordinate a request resolves to) and the POT `VirtualImageAtlas` allocator: block
 alignment, the full 65,536-leaf capacity, non-overlap, and resize rollback with refill.
 The address-profile descriptor tables, page-id packing, LRU key encoding and feedback
 dither it used to cover were deleted from the header as unused production code, and
 their checks went with them. See `docs/terrain_vt_and_streaming.md` for the design.
+
+## Grazing views and camera cuts
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_anisotropy_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_snap_turn_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_project_lifetime_probe.py --project F:/godot/project/test-1 --motion snap
+```
+
+The anisotropy test checks native fine-page demand and distinct rendered mip
+colors at grazing, diagonal and rolled angles. The snap test checks exact forward
+reversal, obsolete-lead removal, immediate planning and ordinary-turn reuse.
+The project probe copies the source project and records sparse post-cut images;
+orbit mode also records full-viewport GPU time alongside the terrain CPU phases.
+See `docs/vt_sampling_review.md` for the sampling and scheduling contracts.
 
 ## Texture array codecs
 
@@ -1257,6 +1275,20 @@ support on a desktop adapter. Logs remain in the printed fixture directory.
 
 ## Strict material VT and incremental SVT
 
+For the real-project feedback-off coverage regression:
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_strict_coverage_runner.py --project F:/godot/project/test-1
+```
+
+This copies the project and uses the current addon build. At 1920x1080 it checks
+a static view and four yaw/position changes, then requires zero missing, pending
+and sampled magenta pixels after settling. JSON traces and PNGs stay in the
+temporary fixture. Per-frame readback is diagnostic; use the separate project
+lifetime probe for timing comparisons.
+Add `--pages 64` to disable automatic capacity in the copied runtime and exercise
+the explicit capacity LOD under pressure; the default preserves the scene's pool.
+
 ```powershell
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_fallback_runner.py
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_auto_bake_runner.py
@@ -1268,3 +1300,17 @@ The automatic bake test checks 500 ms stroke coalescing, affected region/parent
 updates, unchanged distant file hashes, zero idle bakes, and forced full regeneration.
 A second process then releases authoring texture resources and verifies that it
 uploads the saved SVT pages without generating replacements.
+
+Unified page compression and camera-cut regressions:
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_block_codec_runner.py
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_bc3_alpha_runner.py
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_normal_compression_runner.py
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_snap_turn_runner.py
+```
+
+Run GPU tests serially. The block test dispatches the real encoder and uses the engine's
+independent decompressor to check negative normals, BC3 alpha tail indices, independent
+color/alpha, roughness and validity. The rendering matrix compares AVT/SVT raw baselines with unified BC7/BC3 compression,
+asserts all three physical formats match, and includes normal strength above one.

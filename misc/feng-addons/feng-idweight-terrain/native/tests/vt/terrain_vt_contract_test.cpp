@@ -1,10 +1,15 @@
-// Contract test for the terrain virtual texture addressing core in
-// src/terrain_vt.h: the indirection mip-chain walk and the POT quadtree
-// allocator. Standalone: no Godot, no GPU.
+// Contract test for the terrain virtual texture addressing, arrival-queue and
+// screen-footprint helpers. Standalone: no Godot, no GPU.
 #include "../../src/terrain_vt.h"
+#include "../../src/terrain_vt_arrival_queue.h"
+#include "../../src/terrain_vt_request_priority.h"
+#include "../../src/terrain_vt_sampling.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <vector>
 
 using namespace TerrainVT;
@@ -26,6 +31,17 @@ using namespace TerrainVT;
 					  << " expected " << e_ << '\n';                                      \
 			std::exit(1);                                                                 \
 		}                                                                                 \
+	} while (false)
+
+#define CHECK_NEAR(actual, expected, tolerance)                                           \
+	do {                                                                                   \
+		const float a_ = float(actual);                                                      \
+		const float e_ = float(expected);                                                    \
+		if (std::fabs(a_ - e_) > float(tolerance)) {                                        \
+			std::cerr << "FAIL line " << __LINE__ << ": " #actual " ~= " << e_              \
+					  << " actual " << a_ << " tolerance " << tolerance << '\n';                  \
+			std::exit(1);                                                                      \
+		}                                                                                    \
 	} while (false)
 
 static void test_indirection_lookup() {
@@ -208,10 +224,206 @@ static void test_atlas_full_leaf_capacity() {
 	std::cout << "PASS: full 65,536-leaf atlas, non-overlap, resize rollback and refill\n";
 }
 
+static void test_page_arrival_queue() {
+	PageArrivalQueue queue(8);
+	CHECK_EQ(queue.capacity(), size_t(8));
+	CHECK(queue.empty());
+	CHECK(!queue.enqueue(-1));
+	CHECK(!queue.enqueue(8));
+
+	// Re-enqueueing moves the one live node for a slot to the tail instead of
+	// leaving an old record that could release a later reuse of that slot.
+	CHECK(queue.enqueue(0));
+	CHECK(queue.enqueue(1));
+	CHECK(queue.enqueue(2));
+	CHECK(queue.enqueue(3));
+	CHECK(queue.enqueue(1));
+	CHECK_EQ(queue.size(), size_t(4));
+	CHECK(queue.contains(1));
+	CHECK(queue.remove(2));
+	CHECK(!queue.contains(2));
+	CHECK_EQ(queue.size(), size_t(3));
+	int slot = -1;
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 0);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 3);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 1);
+	CHECK(!queue.pop(slot));
+
+	// Pool growth preserves FIFO order. Shrinking drops only slots outside the
+	// new pool and keeps all retained slots in their old order.
+	queue.reset(8);
+	CHECK(queue.enqueue(1));
+	CHECK(queue.enqueue(7));
+	CHECK(queue.enqueue(3));
+	CHECK(queue.enqueue(2));
+	queue.resize(16);
+	CHECK_EQ(queue.capacity(), size_t(16));
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 1);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 7);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 3);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 2);
+	CHECK(queue.empty());
+	CHECK(queue.enqueue(1));
+	CHECK(queue.enqueue(7));
+	CHECK(queue.enqueue(3));
+	CHECK(queue.enqueue(2));
+	queue.resize(4);
+	CHECK_EQ(queue.capacity(), size_t(4));
+	CHECK_EQ(queue.size(), size_t(3));
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 1);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 3);
+	CHECK(queue.pop(slot));
+	CHECK_EQ(slot, 2);
+	CHECK(!queue.contains(7));
+
+	// Sustained churn never grows beyond physical slot capacity. This is the
+	// regression that catches a vector-plus-cursor consumed-prefix leak.
+	queue.reset(8);
+	for (int iteration = 0; iteration < 100000; ++iteration) {
+		CHECK(queue.enqueue(iteration % 8));
+		if ((iteration % 3) == 0) {
+			CHECK(queue.pop(slot));
+		}
+		CHECK(queue.size() <= queue.capacity());
+	}
+	CHECK(queue.size() <= size_t(8));
+	queue.clear();
+	CHECK(queue.empty());
+	CHECK_EQ(queue.capacity(), size_t(8));
+	std::cout << "PASS: bounded page-arrival FIFO duplicate-slot, resize and 100k churn\n";
+}
+
+static void test_sampling_footprint() {
+	using TerrainVT::Sampling::Footprint;
+	constexpr float ANISOTROPY = 4.f;
+	const float diagonal = std::sqrt(0.5f);
+
+	// A front-facing unit footprint remains one texel in both directions.
+	Footprint front = TerrainVT::Sampling::singular_footprint({ { 1.f, 0.f }, { 0.f, 1.f } }, ANISOTROPY);
+	CHECK_NEAR(front.major, 1.f, 1e-6f);
+	CHECK_NEAR(front.minor, 1.f, 1e-6f);
+	CHECK_NEAR(front.effective, 1.f, 1e-6f);
+
+	// A grazing footprint keeps short-axis detail up to the effective cap.
+	Footprint grazing = TerrainVT::Sampling::singular_footprint({ { 8.f, 0.f }, { 0.f, 0.25f } }, ANISOTROPY);
+	CHECK_NEAR(grazing.major, 8.f, 1e-5f);
+	CHECK_NEAR(grazing.minor, 0.25f, 1e-5f);
+	CHECK_NEAR(grazing.effective, 2.f, 1e-5f);
+
+	// Singular values are invariant under a 45 degree roll of the screen axes.
+	Footprint rolled = TerrainVT::Sampling::singular_footprint(
+			{ { 6.f * diagonal, 2.f * diagonal }, { -6.f * diagonal, 2.f * diagonal } }, ANISOTROPY);
+	CHECK_NEAR(rolled.major, 6.f, 1e-5f);
+	CHECK_NEAR(rolled.minor, 2.f, 1e-5f);
+	CHECK_NEAR(rolled.effective, 2.f, 1e-5f);
+	CHECK_NEAR(TerrainVT::Sampling::singular_footprint({ { 8.f, 0.f }, { 0.f, 0.25f } }, 0.f).effective,
+			8.f, 1e-5f);
+	std::cout << "PASS: front, grazing and 45-degree rolled Jacobian footprints\n";
+}
+
+static void test_sampling_bounds() {
+	using TerrainVT::Sampling::Footprint;
+	using TerrainVT::Sampling::FootprintBounds;
+	using TerrainVT::Sampling::Vec2;
+	constexpr float ANISOTROPY = 3.5f;
+	std::mt19937 random(0x5EEDu);
+	std::uniform_real_distribution<float> unit(0.f, 1.f);
+	for (int sample = 0; sample < 20000; ++sample) {
+		// Vary the interval too. A single wide interval crossing zero only tests
+		// a trivial zero lower bound, missing regressions in narrow sloped patches.
+		auto interval = [&]() {
+			const float center = unit(random) * 20.f - 10.f;
+			const float radius = unit(random) * 2.f;
+			return Vec2{ center - radius, center + radius };
+		};
+		const Vec2 xx = interval(), xz = interval(), yx = interval(), yz = interval();
+		const Vec2 dx_min{ xx.x, xz.x }, dx_max{ xx.y, xz.y };
+		const Vec2 dy_min{ yx.x, yz.x }, dy_max{ yx.y, yz.y };
+		const Vec2 near_dx{ std::clamp(0.f, xx.x, xx.y), std::clamp(0.f, xz.x, xz.y) };
+		const Vec2 near_dy{ std::clamp(0.f, yx.x, yx.y), std::clamp(0.f, yz.x, yz.y) };
+		const float lower_hint = std::max(TerrainVT::Sampling::length(near_dx), TerrainVT::Sampling::length(near_dy));
+		const FootprintBounds bounds = TerrainVT::Sampling::singular_footprint_bounds(
+				dx_min, dx_max, dy_min, dy_max, ANISOTROPY, lower_hint);
+		CHECK(bounds.major_min <= bounds.major_max);
+		CHECK(bounds.minor_min <= bounds.minor_max);
+		CHECK(bounds.effective_min <= bounds.effective_max);
+		const Vec2 dx = { dx_min.x + (dx_max.x - dx_min.x) * unit(random),
+				dx_min.y + (dx_max.y - dx_min.y) * unit(random) };
+		const Vec2 dy = { dy_min.x + (dy_max.x - dy_min.x) * unit(random),
+				dy_min.y + (dy_max.y - dy_min.y) * unit(random) };
+		const Footprint actual = TerrainVT::Sampling::singular_footprint({ dx, dy }, ANISOTROPY);
+		CHECK(actual.major + 2e-5f >= bounds.major_min);
+		CHECK(actual.major <= bounds.major_max + 2e-5f);
+		CHECK(actual.minor + 2e-5f >= bounds.minor_min);
+		CHECK(actual.minor <= bounds.minor_max + 2e-5f);
+		CHECK(actual.effective + 2e-5f >= bounds.effective_min);
+		CHECK(actual.effective <= bounds.effective_max + 2e-5f);
+	}
+	std::cout << "PASS: Weyl/Frobenius Jacobian bounds over 20,000 random matrices\n";
+}
+
+static void test_request_priority() {
+	// Roots establish coverage before any current detail, regardless of their
+	// larger distance or span.
+	std::vector<PageRequestPriority> priorities = {
+		make_page_request_priority(PageRequestKind::OPTIONAL, 1.f, 16.f),
+		make_page_request_priority(PageRequestKind::CURRENT, 2.f, 32.f),
+		make_page_request_priority(PageRequestKind::ROOT, 1000.f, 1024.f),
+	};
+	std::stable_sort(priorities.begin(), priorities.end(), page_request_priority_before);
+	CHECK(priorities[0].kind == PageRequestKind::ROOT);
+	CHECK(priorities[1].kind == PageRequestKind::CURRENT);
+	CHECK(priorities[2].kind == PageRequestKind::OPTIONAL);
+
+	// A near fine page beats a far coarse page because distance bands precede
+	// the span tie-break.
+	const PageRequestPriority near_fine = make_page_request_priority(PageRequestKind::CURRENT, 4.f, 64.f);
+	const PageRequestPriority far_coarse = make_page_request_priority(PageRequestKind::CURRENT, 64.f, 256.f);
+	CHECK(page_request_priority_before(near_fine, far_coarse));
+	CHECK(!page_request_priority_before(far_coarse, near_fine));
+
+	// Within one visibility band the covering parent precedes its child.
+	const PageRequestPriority parent = make_page_request_priority(PageRequestKind::CURRENT, 8.f, 128.f);
+	const PageRequestPriority child = make_page_request_priority(PageRequestKind::CURRENT, 8.f, 64.f);
+	priorities = { child, parent };
+	std::stable_sort(priorities.begin(), priorities.end(), page_request_priority_before);
+	CHECK(priorities[0].span == 128.f);
+	CHECK(priorities[1].span == 64.f);
+
+	// Optional apron/prefetch work never outranks a current page, even when its
+	// own geometric footprint is closer and larger.
+	const PageRequestPriority current = make_page_request_priority(PageRequestKind::CURRENT, 128.f, 32.f);
+	const PageRequestPriority optional = make_page_request_priority(PageRequestKind::OPTIONAL, 1.f, 1024.f);
+	CHECK(page_request_priority_before(current, optional));
+
+	for (const float distance : { std::numeric_limits<float>::quiet_NaN(),
+				std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -1.f }) {
+		const PageRequestPriority invalid = make_page_request_priority(
+				PageRequestKind::CURRENT, distance, std::numeric_limits<float>::quiet_NaN());
+		CHECK(std::isfinite(invalid.distance));
+		CHECK(invalid.distance_band >= 0);
+		CHECK(!page_request_priority_before(invalid, invalid));
+	}
+	std::cout << "PASS: AVT request priority root/current/optional, distance bands and invalid input\n";
+}
+
 int main() {
 	test_indirection_lookup();
 	test_virtual_image_atlas();
 	test_atlas_full_leaf_capacity();
+	test_page_arrival_queue();
+	test_sampling_footprint();
+	test_sampling_bounds();
+	test_request_priority();
 	std::cout << "PASS: indirection mip chain walk, POT VirtualImageAtlas allocation and "
 				 "full leaf capacity\n";
 	return 0;

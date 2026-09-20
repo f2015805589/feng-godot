@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef TERRAIN3D_VT_STATE_H
 #define TERRAIN3D_VT_STATE_H
@@ -80,6 +80,7 @@
 
 #include "terrain_3d_avt.h"
 #include "terrain_3d_page_pipeline.h"
+#include "terrain_vt_arrival_queue.h"
 #include "terrain_3d_vt_cells.h"
 
 class Terrain3DVirtualTexture;
@@ -118,7 +119,7 @@ struct Terrain3DVTState {
 	int vt_page_workers = 0;
 	bool vt_adaptive_enabled = true;
 	// Storage format of the near field's material page arrays, as a
-	// Terrain3DAssets::TextureArrayCompression value (1 = BC7). Resolved and validated by the
+	// SurfacePageCompression value (0 = raw, 1 = BC7, 2 = BC3). Resolved and validated by the
 	// surface baker, which reports what was applied and why a request was refused, and
 	// encoded on the GPU by the block encoder, so compressing a page costs this thread
 	// nothing. The far field has its own setting below: the two tiers produce the same pool
@@ -288,6 +289,8 @@ struct Terrain3DVTState {
 	uint64_t avt_motion_stamp_us = 0;
 	Vector2 avt_motion_last_focus;
 	bool avt_motion_valid = false;
+	// A camera cut invalidates the old-view retention tail at the next plan install.
+	bool avt_discard_retained = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
 	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum
@@ -323,6 +326,8 @@ struct Terrain3DVTState {
 	// pool exactly large enough to evict the view it is leading.
 	int avt_retained_pages = 0;
 	Terrain3DAVTPlanKey avt_plan_key = invalid_avt_plan_key();
+	// Sampling density belongs to the installed plan, including its capacity LOD.
+	float avt_density_scale = 1.f;
 	// Set while the pool's residency revision is the one an idle pass verified. An idle pass
 	// keeps its verified resident set instead of re-deriving it, so this is what tells the
 	// next tick whether that set can still be trusted.
@@ -349,20 +354,25 @@ struct Terrain3DVTState {
 	// Remaining fade ticks per physical slot; 0 means settled. `vt_slot_pending` is that slot's
 	// arrival state: `PageArrival::SETTLED`, `WAITING` for content, or `ARMED` once the content has
 	// landed and before its ramp is released. A slot that leaves `WAITING` is one whose content
-	// landed, which is when its fade is armed; an armed slot is one the pass has deliberately not
-	// started yet, so that a burst of arrivals sharpens as a wash instead of all on one tick - which
-	// is what a whole block refining at once looks like. An armed slot reads zero in the published
-	// texture, so what it shows meanwhile is the level its page replaces, not a hole. The pass
+	// landed. The pass releases all armed slots in the same tick, keeping a completed
+	// batch on one fade clock instead of delaying ready neighbouring pages. The first
+	// published fade is zero, so it still shows the parent rather than a detail step. The pass
 	// decides all of this on every tick from these two vectors, so an arrival is seen whether or not
 	// a demand pass ran.
 	std::vector<uint8_t> vt_slot_fade_ticks;
 	std::vector<PageArrival> vt_slot_pending;
-	// The armed slots in the order they landed, and the cursor the pass releases from. Kept as an
-	// order rather than re-scanned so a burst is released oldest first: the page a pass asked for
-	// first is the one the view has been waiting on longest. Entries can go stale - a slot re-armed
-	// after it was queued appears twice - so the release drops what it no longer finds at 2.
-	std::vector<int> vt_page_fade_queue;
-	size_t vt_page_fade_queue_at = 0;
+	// The armed slots in the order they landed. The queue owns one node per physical slot, removes
+	// a previous node when a slot is re-used, and is therefore bounded by the pool rather than by
+	// the number of historical arrivals. A release pops from its head, so there is no consumed
+	// prefix or per-tick cursor to retain.
+	TerrainVT::PageArrivalQueue vt_page_fade_queue;
+	// Set by a waiting mark so a newly unavailable slot publishes fade zero immediately, even if
+	// no producer result landed during this tick. Cleared after the dirty texture is uploaded.
+	bool vt_page_fade_dirty = false;
+	// A slot released this tick holds its replacement level for one published frame before the
+	// countdown begins. This scratch vector is the per-slot equivalent of a short-lived release
+	// set and is resized with the two fade vectors.
+	std::vector<uint8_t> vt_slot_fade_just_started;
 	// Scratch for that decision: the slots waiting for content this tick, and the producer's
 	// answer for all of them at once.
 	std::vector<int> vt_page_fade_waiting;

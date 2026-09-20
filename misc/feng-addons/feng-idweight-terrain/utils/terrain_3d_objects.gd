@@ -22,7 +22,9 @@ const CHILD_HELPER_PATH: NodePath = ^"TransformChangedSignaller"
 
 var _undo_redo = null
 var _terrain_id: int
+var _observed_terrain_data = null
 var _offsets: Dictionary # Object ID -> Vector3(X, Y offset relative to terrain height, Z)
+var _child_transform_callbacks: Dictionary = {}
 var _ignore_transform_change: bool = false
 
 
@@ -41,11 +43,13 @@ func _exit_tree() -> void:
 	if not Engine.is_editor_hint():
 		return
 	
+	_disconnect_terrain_data()
 	child_entered_tree.disconnect(_on_child_entered_tree)
 	child_exiting_tree.disconnect(_on_child_exiting_tree)
 	
 	for child in get_children():
 		_on_child_exiting_tree(child)
+	_child_transform_callbacks.clear()
 
 
 # Called by the plugin once, with itself: transform tracking registers its changes
@@ -64,10 +68,29 @@ func get_terrain() -> Terrain3D:
 			terrain = terrains[0]
 		_terrain_id = terrain.get_instance_id() if terrain else 0
 	
-	if terrain and terrain.data and not terrain.data.maps_edited.is_connected(_on_maps_edited):
-		terrain.data.maps_edited.connect(_on_maps_edited)
+	_bind_terrain_data(terrain.data if terrain and terrain.data else null)
 	
 	return terrain
+
+
+func _bind_terrain_data(p_data) -> void:
+	if p_data == _observed_terrain_data:
+		if p_data != null and is_instance_valid(p_data) and not p_data.maps_edited.is_connected(_on_maps_edited):
+			p_data.maps_edited.connect(_on_maps_edited)
+		return
+	_disconnect_terrain_data()
+	if p_data == null or not is_instance_valid(p_data):
+		return
+	if not p_data.maps_edited.is_connected(_on_maps_edited):
+		p_data.maps_edited.connect(_on_maps_edited)
+	_observed_terrain_data = p_data
+
+
+func _disconnect_terrain_data() -> void:
+	var data = _observed_terrain_data
+	_observed_terrain_data = null
+	if data != null and is_instance_valid(data) and data.maps_edited.is_connected(_on_maps_edited):
+		data.maps_edited.disconnect(_on_maps_edited)
 
 
 func _get_terrain_height(p_global_position: Vector3) -> float:
@@ -99,26 +122,32 @@ func _on_child_entered_tree(p_node: Node) -> void:
 
 
 func _setup_child_signal(p_node: Node, helper: TransformChangedNotifier) -> void:
-	if not p_node.is_inside_tree():
+	if not is_instance_valid(p_node) or not p_node.is_inside_tree():
 		return
-	if helper.transform_changed.is_connected(_on_child_transform_changed):
-		return
-	
-	helper.transform_changed.connect(_on_child_transform_changed.bind(p_node))
+	var child_id := p_node.get_instance_id()
+	var callback: Callable = _child_transform_callbacks.get(child_id, Callable())
+	if not callback.is_valid():
+		callback = _on_child_transform_changed.bind(p_node)
+		_child_transform_callbacks[child_id] = callback
+	if not helper.transform_changed.is_connected(callback):
+		helper.transform_changed.connect(callback)
 	_update_child_offset(p_node)
 
 
 func _on_child_exiting_tree(p_node: Node) -> void:
-	if not (p_node is Node3D) or not p_node.has_node(CHILD_HELPER_PATH):
+	if not p_node is Node3D:
 		return
+	var child_id := p_node.get_instance_id()
 	
 	var helper: TransformChangedNotifier = p_node.get_node_or_null(CHILD_HELPER_PATH)
 	if helper:
-		if helper.transform_changed.is_connected(_on_child_transform_changed):
-			helper.transform_changed.disconnect(_on_child_transform_changed)
+		var callback: Callable = _child_transform_callbacks.get(child_id, _on_child_transform_changed.bind(p_node))
+		if helper.transform_changed.is_connected(callback):
+			helper.transform_changed.disconnect(callback)
 		p_node.remove_child(helper)
 		helper.queue_free()
 	
+	_child_transform_callbacks.erase(child_id)
 	_offsets.erase(p_node.get_instance_id())
 
 

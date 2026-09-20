@@ -166,6 +166,11 @@ bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources
 		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
 				r_resources.sampler_nearest, _staging_rd_of(r_resources, channel));
 		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 1, r_resources.encode_buffer);
+		// Parameter packing reads canonical roughness from the normal staging layer. Keep this
+		// descriptor in every set so the shader layout stays stable while raw channels skip their
+		// dispatches.
+		append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2,
+				r_resources.sampler_nearest, r_resources.output_normal_rd);
 		r_resources.encode_uniform[channel] = _rd->uniform_set_create(uniforms, r_resources.encode_shader, 0);
 		if (!r_resources.encode_uniform[channel].is_valid()) {
 			LOG(ERROR, "Could not create the surface block encoder uniform set");

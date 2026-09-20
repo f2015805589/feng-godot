@@ -164,16 +164,22 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		LOG(ERROR, "Could not allocate surface bake buffers or pipeline");
 		return false;
 	}
-	// The block encoder is only built when a tier actually resolved to a compressed format.
+	// The block encoder is only built when at least one channel actually resolved to a
+	// compressed format.
 	// A build whose encoder cannot compile drops both tiers back to uncompressed: a page
 	// that samples an array nothing ever fills renders as the missing-page diagnostic, which
 	// is worse than the memory the codec would have saved.
-	if ((_tiers[TIER_AVT].applied.load() != 0 || _tiers[TIER_SVT].applied.load() != 0) && !_compile_encode_pipeline(next)) {
+	if (_any_tier_uses_sampled(true) && !_compile_encode_pipeline(next)) {
 		for (int tier = 0; tier < TIER_COUNT; ++tier) {
 			_tiers[tier].applied.store(0);
+			_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
+			_tiers[tier].params_encoded.store(false);
 			_tiers[tier].effective.store(0);
+			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
 			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
 			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].params_format.store(RenderingDevice::DATA_FORMAT_MAX);
 			next.sampled[tier] = SampledSet();
 		}
 		_free_bundle(_rd, next);

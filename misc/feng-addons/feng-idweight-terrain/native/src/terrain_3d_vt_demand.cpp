@@ -92,7 +92,10 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 		stages[p_index] = double(now - mark) / 1000.0;
 		mark = now;
 	};
-	const int protected_limit = MAX(1, p_physical_page_count / 2);
+	// Near and far detail share this pool. Reserve only a quarter for permanent
+	// far roots when AVT is active; keep the complete root window by sliding it
+	// coarser, never by clipping its world coverage. Visible SVT LOD is unchanged.
+	const int protected_limit = MAX(4, p_physical_page_count / (_vt.surface_vt_enabled ? 4 : 2));
 	const int root_levels = CLAMP(_vt.surface_svt_root_mips, 0, p_maximum_mip + 1);
 	const int indirection_size = _vt.surface_svt->get_indirection_size();
 	auto level_cells = [indirection_size](const int p_mip) {

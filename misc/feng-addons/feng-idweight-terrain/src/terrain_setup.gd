@@ -17,7 +17,7 @@ var progress_dialog: AcceptDialog
 var progress_bar: ProgressBar
 var progress_label: Label
 var target: Terrain3D
-var dismissed: Array[int] = []
+var dismissed: Array[WeakRef] = []
 var creating := false
 var _cancel_requested := false
 var _pending_directory := ""
@@ -25,6 +25,8 @@ var _region_limit := 1024
 
 func _exit_tree() -> void:
 	_cancel_requested = true
+	target = null
+	dismissed.clear()
 	for window in [dialog, size_dialog, progress_dialog]:
 		if is_instance_valid(window):
 			window.queue_free()
@@ -36,7 +38,7 @@ func request(terrain: Terrain3D, retry: bool = false) -> void:
 		return
 	if terrain.data.get_region_count() > 0:
 		return
-	if not retry and terrain.get_instance_id() in dismissed:
+	if not retry and _is_dismissed(terrain):
 		return
 	if is_instance_valid(dialog) and dialog.visible:
 		return
@@ -52,7 +54,7 @@ func request(terrain: Terrain3D, retry: bool = false) -> void:
 		dialog.dir_selected.connect(initialize_directory)
 		dialog.canceled.connect(func():
 			if is_instance_valid(target):
-				dismissed.append(target.get_instance_id())
+				_remember_dismissed(target)
 			target = null)
 		EditorInterface.get_base_control().add_child(dialog)
 	dialog.current_dir = "res://"
@@ -93,7 +95,7 @@ func _build_size_dialog() -> void:
 	size_dialog.confirmed.connect(_create_grid)
 	size_dialog.canceled.connect(func():
 		if is_instance_valid(target):
-			dismissed.append(target.get_instance_id())
+			_remember_dismissed(target)
 		target = null
 		_pending_directory = "")
 	var body := VBoxContainer.new()
@@ -129,6 +131,25 @@ func _build_size_dialog() -> void:
 	size_error = Label.new()
 	body.add_child(size_error)
 	EditorInterface.get_base_control().add_child(size_dialog)
+
+
+func _is_dismissed(p_terrain: Terrain3D) -> bool:
+	var index := dismissed.size() - 1
+	var found := false
+	while index >= 0:
+		var candidate = dismissed[index].get_ref()
+		if not is_instance_valid(candidate):
+			dismissed.remove_at(index)
+		elif candidate == p_terrain:
+			found = true
+		index -= 1
+	return found
+
+
+func _remember_dismissed(p_terrain: Terrain3D) -> void:
+	if not is_instance_valid(p_terrain) or _is_dismissed(p_terrain):
+		return
+	dismissed.append(weakref(p_terrain))
 
 func _update_size_summary() -> void:
 	var width := int(width_spin.value)

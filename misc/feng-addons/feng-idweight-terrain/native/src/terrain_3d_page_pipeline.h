@@ -1,6 +1,7 @@
 #pragma once
 #include "terrain_3d_data.h"
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -17,6 +18,14 @@ namespace TerrainVT { struct VisibleView; struct VisiblePatch; }
 class Terrain3DPagePipeline {
 public:
 	using Key = std::array<int, 5>;
+	static constexpr size_t QUEUE_CAPACITY = 32;
+	struct ReadyKeys {
+		std::array<Key, QUEUE_CAPACITY> keys;
+		size_t count = 0;
+		bool contains(const Key &p_key) const {
+			return std::binary_search(keys.begin(), keys.begin() + count, p_key);
+		}
+	};
 	struct Cell { PackedByteArray ids, heights, controls; const uint8_t *id_data = nullptr, *height_data = nullptr; int id_size = 0, height_size = 0, density = 1; mutable std::vector<std::vector<Vector2>> height_bounds; };
 	struct Snapshot {
 		int region_size; float spacing, source_step;
@@ -46,6 +55,9 @@ public:
 	void retain(const std::vector<Request> &requests);
 	void prime(const std::vector<Request> &requests, std::shared_ptr<const Snapshot> source);
 	bool poll(const Request &request, std::shared_ptr<const Snapshot> source, Result &result);
+	// A bounded value snapshot: consumers poll only results ready at the start
+	// of their pass. No queue storage or lock escapes the pipeline.
+	ReadyKeys ready_keys();
 	int get_worker_count() const { return int(_workers.size()); }
 	// What `p_workers = 0` resolves to on this machine.
 	static int default_worker_count();
@@ -116,7 +128,19 @@ private:
 	// allocation per wanted page. A flat open-addressed table is built in place, keeps its
 	// capacity, and answers in one probe: only the entry's footprint is compared afterwards.
 	static constexpr uint32_t RETAIN_EMPTY = 0xFFFFFFFFu;
-	struct KeyHash { size_t operator()(const Key &p_key) const { size_t h = 1469598103934665603ull; for (const int part : p_key) { h = (h ^ size_t(uint32_t(part))) * 1099511628211ull; } return h; } };
+	struct KeyHash {
+		size_t operator()(const Key &p_key) const {
+			uint64_t h = 1469598103934665603ull;
+			for (const int part : p_key) { h = (h ^ uint32_t(part)) * 1099511628211ull; }
+			// Page coordinates are power-of-two aligned. Mix their high bits before the
+			// power-of-two table mask, otherwise nearby mip pages form long probe chains.
+			h ^= h >> 33;
+			h *= 0xff51afd7ed558ccdull;
+			h ^= h >> 33;
+			h *= 0xc4ceb9fe1a85ec53ull;
+			return size_t(h ^ (h >> 33));
+		}
+	};
 	std::vector<Key> _retain_keys;
 	std::vector<uint32_t> _retain_slots;
 	size_t _retain_capacity = 0;

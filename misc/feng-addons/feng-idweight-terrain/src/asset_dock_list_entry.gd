@@ -33,6 +33,7 @@ var button_highlight: TextureButton
 var button_edit: TextureButton
 var spacer: Control 
 var button_clear: TextureButton
+var _observed_resource: Resource
 
 @onready var focus_style: StyleBox = get_theme_stylebox("focus", "Button").duplicate()
 @onready var background: StyleBox = get_theme_stylebox("pressed", "Button")
@@ -66,7 +67,6 @@ func setup_buttons() -> void:
 	destroy_buttons()
 	
 	button_row = FlowContainer.new()
-	button_enabled = TextureButton.new() 
 	button_highlight = TextureButton.new() 
 	button_edit = TextureButton.new() 
 	spacer = Control.new()
@@ -82,6 +82,7 @@ func setup_buttons() -> void:
 	# Icon clicks must not reach the tile selection handler: it refreshes
 	# the list on press, before these buttons receive their release.
 	if type == Terrain3DAssets.TYPE_MESH:
+		button_enabled = TextureButton.new()
 		button_enabled.set_texture_normal(enabled_icon)
 		button_enabled.set_texture_pressed(disabled_icon)
 		button_enabled.set_custom_minimum_size(icon_size)
@@ -211,11 +212,14 @@ func setup_count_label() -> void:
 	var mesh_resource: Terrain3DMeshAsset = resource as Terrain3DMeshAsset
 	if not mesh_resource: 
 		return
-	mesh_resource.instance_count_changed.connect(update_count_label)
+	if not mesh_resource.instance_count_changed.is_connected(update_count_label):
+		mesh_resource.instance_count_changed.connect(update_count_label)
 	update_count_label()
 
 
 func update_count_label() -> void:
+	if not is_instance_valid(count_label):
+		return
 	if not type == Terrain3DAssets.TYPE_MESH or \
 			( resource and not resource.is_enabled() ):
 		count_label.text = ""
@@ -230,6 +234,7 @@ func update_count_label() -> void:
 func _notification(p_what) -> void:
 	match p_what:
 		NOTIFICATION_PREDELETE:
+			_disconnect_resource_signals()
 			destroy_buttons()
 		NOTIFICATION_DRAW:
 			# Hide spacer if icons are crowding small textures
@@ -369,16 +374,9 @@ func _drop_data(p_at_position: Vector2, p_data: Variant) -> void:
 
 
 func set_edited_resource(p_res: Resource, p_no_signal: bool = true) -> void:
+	_disconnect_resource_signals()
 	resource = p_res
-	if resource:
-		if not resource.setting_changed.is_connected(_on_resource_changed):
-			resource.setting_changed.connect(_on_resource_changed)
-		if resource is Terrain3DTextureAsset:
-			if not resource.file_changed.is_connected(_on_resource_changed):
-				resource.file_changed.connect(_on_resource_changed)
-		elif resource is Terrain3DMeshAsset:
-			if not resource.instancer_setting_changed.is_connected(_on_resource_changed):
-				resource.instancer_setting_changed.connect(_on_resource_changed)
+	_connect_resource_signals(resource)
 	
 	if button_clear:
 		button_clear.set_visible(resource != null)
@@ -386,6 +384,40 @@ func set_edited_resource(p_res: Resource, p_no_signal: bool = true) -> void:
 	queue_redraw()
 	if not p_no_signal:
 		emit_signal("changed", resource)
+
+
+func _connect_resource_signals(p_resource: Resource) -> void:
+	if not is_instance_valid(p_resource):
+		_observed_resource = null
+		return
+	if not p_resource.setting_changed.is_connected(_on_resource_changed):
+		p_resource.setting_changed.connect(_on_resource_changed)
+	if p_resource is Terrain3DTextureAsset:
+		if not p_resource.file_changed.is_connected(_on_resource_changed):
+			p_resource.file_changed.connect(_on_resource_changed)
+	elif p_resource is Terrain3DMeshAsset:
+		if not p_resource.instancer_setting_changed.is_connected(_on_resource_changed):
+			p_resource.instancer_setting_changed.connect(_on_resource_changed)
+		if is_instance_valid(count_label) and not p_resource.instance_count_changed.is_connected(update_count_label):
+			p_resource.instance_count_changed.connect(update_count_label)
+	_observed_resource = p_resource
+
+
+func _disconnect_resource_signals() -> void:
+	var p_resource := _observed_resource
+	_observed_resource = null
+	if not is_instance_valid(p_resource):
+		return
+	if p_resource.setting_changed.is_connected(_on_resource_changed):
+		p_resource.setting_changed.disconnect(_on_resource_changed)
+	if p_resource is Terrain3DTextureAsset:
+		if p_resource.file_changed.is_connected(_on_resource_changed):
+			p_resource.file_changed.disconnect(_on_resource_changed)
+	elif p_resource is Terrain3DMeshAsset:
+		if p_resource.instancer_setting_changed.is_connected(_on_resource_changed):
+			p_resource.instancer_setting_changed.disconnect(_on_resource_changed)
+		if p_resource.instance_count_changed.is_connected(update_count_label):
+			p_resource.instance_count_changed.disconnect(update_count_label)
 
 
 func _on_resource_changed(_value: int = 0) -> void:

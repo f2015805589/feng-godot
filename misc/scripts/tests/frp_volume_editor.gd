@@ -41,9 +41,9 @@ func _run() -> void:
 
 	var profile := Profile.new()
 	var profile_key := profile.get_instance_id()
-	# The picker is editor-only state.  Set it as if the user selected the renderer
-	# in the resource picker; the profile must not gain a renderer property.
-	inspector._renderer_overrides[profile_key] = renderer
+	# The picker is editor-only state.  Deliver the same event as the resource
+	# picker; the profile must not gain a renderer property.
+	inspector._on_renderer_picked(renderer, profile, profile_key)
 	assert(inspector.resolve_renderer(profile, profile_key) == renderer,
 			"the explicitly picked renderer was not used for an independent profile")
 	assert(_property_exists(profile, "modules") and not _property_exists(profile, "renderer"),
@@ -121,6 +121,7 @@ func _run() -> void:
 	compositor.renderer = scene_renderer
 	assert(inspector._renderer_from_compositor(compositor) == scene_renderer,
 			"scene compositor renderer resolution failed")
+	_test_renderer_override_lifetime()
 
 	EditorInterface.inspect_object(null)
 	volume.queue_free()
@@ -176,6 +177,36 @@ func _find_label_containing(p_root: Node, p_text: String):
 func _settle_inspector() -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
+
+
+func _test_renderer_override_lifetime() -> void:
+	var owner := Profile.new()
+	var selected := Renderer.new()
+	var profile_key: int = owner.get_instance_id()
+	var selected_ref: WeakRef = weakref(selected)
+	var owner_ref: WeakRef = weakref(owner)
+
+	inspector._on_renderer_picked(selected, owner, profile_key)
+	assert(inspector.resolve_renderer(owner, profile_key) == selected,
+			"a picked Renderer must remain available while its profile is alive")
+	var entry: Dictionary = inspector._renderer_overrides[profile_key]
+	var stored_owner: Variant = entry.get("owner", null)
+	assert(stored_owner is WeakRef and stored_owner.get_ref() == owner,
+			"the inspector override must reference its owner weakly")
+	# The map intentionally owns the selected resource. Release this local copy
+	# before checking that the map, and later pruning, control its lifetime.
+	entry = {}
+	selected = null
+	assert(selected_ref.get_ref() != null,
+			"the selected Renderer was released before its profile owner")
+
+	owner = null
+	inspector._prune_renderer_overrides()
+	assert(owner_ref.get_ref() == null, "the inspector owner should be releasable")
+	assert(not inspector._renderer_overrides.has(profile_key),
+			"deleted profile overrides must be pruned on inspector events")
+	assert(selected_ref.get_ref() == null,
+			"pruning a deleted profile must release its selected Renderer")
 
 
 ## Exercise the real editor adapter.  EditorInterface's Scene view camera is not

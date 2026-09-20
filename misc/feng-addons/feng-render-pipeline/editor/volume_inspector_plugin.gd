@@ -19,7 +19,9 @@ var editor_plugin: EditorPlugin
 
 ## A renderer picked in this inspector is a browsing aid only.  The key is the
 ## edited profile (or the Volume while it has no profile), not the Resource
-## itself, so this state cannot leak into a saved runtime resource.
+## itself, so this state cannot leak into a saved runtime resource. Each entry
+## keeps the selected resource alive while its edited owner is alive, while the
+## owner WeakRef lets inspector events discard entries for deleted profiles.
 var _renderer_overrides: Dictionary = {}
 
 
@@ -58,6 +60,7 @@ func _parse_property(
 func _parse_begin(p_object: Object) -> void:
 	if not _can_handle(p_object):
 		return
+	_prune_renderer_overrides()
 
 	var panel := VBoxContainer.new()
 	panel.name = "FengVolumeModuleInspector"
@@ -87,7 +90,8 @@ func _parse_begin(p_object: Object) -> void:
 	picker.set_edited_resource(renderer if renderer is Renderer else null)
 	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	picker.tooltip_text = "Pick a FengRenderer for an independent profile; this choice is not saved in the profile."
-	picker.resource_changed.connect(_on_renderer_picked.bind(p_object, profile_key))
+	var override_owner: Object = profile if profile != null and is_instance_valid(profile) else p_object
+	picker.resource_changed.connect(_on_renderer_picked.bind(p_object, profile_key, override_owner))
 	renderer_row.add_child(picker)
 	panel.add_child(renderer_row)
 
@@ -260,12 +264,31 @@ func _profile_key(p_object: Object, p_profile) -> int:
 	return p_object.get_instance_id() if p_object != null else 0
 
 
-func _on_renderer_picked(p_resource: Resource, p_object: Object, p_profile_key: int) -> void:
+func _on_renderer_picked(p_resource: Resource, p_object: Object, p_profile_key: int, p_owner: Object = null) -> void:
+	_prune_renderer_overrides()
 	if p_resource is Renderer:
-		_renderer_overrides[p_profile_key] = p_resource
+		var owner := p_owner if p_owner != null else p_object
+		_renderer_overrides[p_profile_key] = {
+			"renderer": p_resource,
+			"owner": weakref(owner) if owner != null and is_instance_valid(owner) else null,
+		}
 	else:
 		_renderer_overrides.erase(p_profile_key)
 	_refresh_object(p_object)
+
+
+func _prune_renderer_overrides() -> void:
+	# This runs only while the inspector is rebuilding or a picker changes. The
+	# render path never touches this table, so cleanup cannot become a per-frame
+	# scan of editor history.
+	for key in _renderer_overrides.keys():
+		var entry: Variant = _renderer_overrides[key]
+		if not entry is Dictionary:
+			_renderer_overrides.erase(key)
+			continue
+		var owner_ref: Variant = entry.get("owner", null)
+		if not owner_ref is WeakRef or owner_ref.get_ref() == null:
+			_renderer_overrides.erase(key)
 
 
 ## Resolve the renderer with the same priority users see in the editor: current
@@ -276,7 +299,7 @@ func resolve_renderer(p_object: Object, p_profile_key: int = 0):
 
 
 func _renderer_for(p_object: Object, p_profile_key: int = 0):
-	var picked = _renderer_overrides.get(p_profile_key, null)
+	var picked = _renderer_override(p_profile_key)
 	if picked is Renderer:
 		return picked
 
@@ -286,6 +309,20 @@ func _renderer_for(p_object: Object, p_profile_key: int = 0):
 
 	var project_compositor = ProjectPipeline.resolve()
 	return _renderer_from_compositor(project_compositor)
+
+
+func _renderer_override(p_profile_key: int):
+	var entry: Variant = _renderer_overrides.get(p_profile_key, null)
+	if entry is Dictionary:
+		var owner_ref: Variant = entry.get("owner", null)
+		if not owner_ref is WeakRef or owner_ref.get_ref() == null:
+			_renderer_overrides.erase(p_profile_key)
+			return null
+		var renderer: Variant = entry.get("renderer", null)
+		return renderer if renderer is Renderer and is_instance_valid(renderer) else null
+	if entry != null:
+		_renderer_overrides.erase(p_profile_key)
+	return null
 
 
 func _scene_renderer(p_object: Object):

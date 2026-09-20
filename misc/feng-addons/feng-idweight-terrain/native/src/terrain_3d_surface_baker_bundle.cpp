@@ -258,7 +258,7 @@ void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t
 		std::fill(_sampled_channel_mask.begin(), _sampled_channel_mask.end(), uint8_t(0));
 	}
 	for (size_t slot = 0; slot < _ready.size(); ++slot) {
-		if (_ready[slot] && _slot_tier[slot] < TIER_COUNT && _tiers[_slot_tier[slot]].applied.load() != 0) {
+		if (_ready[slot] && _slot_tier[slot] < TIER_COUNT && _tier_uses_sampled(_slot_tier[slot])) {
 			_encode_pending[slot] = 1;
 		}
 	}
@@ -298,11 +298,8 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 			RenderingDevice::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE, 0.0f);
 	r_next.sampler_linear = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_LINEAR,
 			RenderingDevice::SAMPLER_REPEAT_MODE_REPEAT, 1000.0f);
-	// Compressed copies of the three channels, one set per tier whose codec resolved. These
-	// are the sampling targets of the block encoder, and the material samples them in place
-	// of the staging arrays for the tier that owns them. A tier left uncompressed keeps an
-	// empty set and samples the staging arrays directly, so an uncompressed tier costs
-	// nothing at all - and it is also what keeps the staging arrays page sized.
+	// Compressed copies are channel independent. A raw channel keeps sampling its canonical
+	// staging array, while the block encoder fills only the targets its mask names.
 	//
 	// The encoder's output region is a function of the stored page size, and every codec it
 	// implements writes at most four words per block.
@@ -310,13 +307,31 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 	_encode_region_words = _encode_region_bytes / int(sizeof(uint32_t));
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		_tiers[tier].applied.store(0);
+		_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
+		_tiers[tier].params_encoded.store(false);
 		SampledSet &set = r_next.sampled[tier];
-		const int mode = _tiers[tier].effective.load();
-		const RenderingDevice::DataFormat format = _tiers[tier].format.load();
-		const RenderingDevice::DataFormat format_srgb = _tiers[tier].format_srgb.load();
-		if (mode == 0 || format == RenderingDevice::DATA_FORMAT_MAX ||
-				format_srgb == RenderingDevice::DATA_FORMAT_MAX) {
+		const int diffuse_mode = _tiers[tier].effective.load();
+		const int normal_mode = _tiers[tier].normal_effective.load();
+		const bool want_albedo = diffuse_mode != SURFACE_PAGE_UNCOMPRESSED &&
+				_tiers[tier].format_srgb.load() != RenderingDevice::DATA_FORMAT_MAX;
+		const bool want_normal = normal_mode != SURFACE_NORMAL_UNCOMPRESSED &&
+				_tiers[tier].normal_format.load() != RenderingDevice::DATA_FORMAT_MAX;
+		const bool want_params = want_albedo || want_normal;
+		const int params_codec = params_codec_for_channels(diffuse_mode, normal_mode);
+		const RenderingDevice::DataFormat params_format = ATLAS_CODECS[params_codec].rd_format;
+		_tiers[tier].params_format = want_params ? params_format : RenderingDevice::DATA_FORMAT_MAX;
+		if (!want_albedo && !want_normal) {
 			continue;
+		}
+		if (want_params && params_format == RenderingDevice::DATA_FORMAT_MAX) {
+			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
+			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
+			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_free_bundle(_rd, r_next);
+			LOG(WARN, "Parameter codec format is unavailable; keeping ", tier == TIER_SVT ? "SVT" : "AVT", " pages canonical");
+			return false;
 		}
 		// Sampling, update, and readback. Copy-from is what lets a resident page be exported
 		// (the dock preview, the offline bake) once the scratch pool has reused the layer it
@@ -325,40 +340,50 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 		const uint64_t compressed_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 				RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
 				RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
-		set.albedo_rd = _create_texture(_rd, format_srgb, p_stored_size, p_page_count, compressed_usage);
-		set.normal_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
-		set.params_rd = _create_texture(_rd, format, p_stored_size, p_page_count, compressed_usage);
+		set.albedo_rd = want_albedo ? _create_texture(_rd, _tiers[tier].format_srgb.load(), p_stored_size, p_page_count, compressed_usage) : RID();
+		set.normal_rd = want_normal ? _create_texture(_rd, _tiers[tier].normal_format.load(), p_stored_size, p_page_count, compressed_usage) : RID();
+		set.params_rd = want_params ? _create_texture(_rd, params_format, p_stored_size, p_page_count, compressed_usage) : RID();
 		const String tier_name = tier == TIER_SVT ? String("SVT") : String("AVT");
-		if (set.albedo_rd.is_valid() && set.normal_rd.is_valid() && set.params_rd.is_valid()) {
-			_rd->set_resource_name(set.albedo_rd, "Surface VT " + tier_name + " Albedo Height (compressed)");
-			_rd->set_resource_name(set.normal_rd, "Surface VT " + tier_name + " Normal Roughness (compressed)");
-			_rd->set_resource_name(set.params_rd, "Surface VT " + tier_name + " Parameters (compressed)");
-			set.albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
-					set.albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			set.normal_rs = RenderingServer::get_singleton()->texture_rd_create(
-					set.normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			set.params_rs = RenderingServer::get_singleton()->texture_rd_create(
-					set.params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-			if (set.albedo_rs.is_valid() && set.normal_rs.is_valid() && set.params_rs.is_valid()) {
-				_tiers[tier].applied.store(mode);
-				continue;
-			}
-			// Fall back rather than render from an unwritable pair: drop the RS wrappers
-			// and let _free_bundle release the RD textures with the bundle.
-			set = SampledSet();
-			_tiers[tier].effective.store(0);
+		const bool allocated = (!want_albedo || set.albedo_rd.is_valid()) &&
+				(!want_normal || set.normal_rd.is_valid()) && (!want_params || set.params_rd.is_valid());
+		if (!allocated) {
+			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
+			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
 			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
 			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			LOG(WARN, "Could not wrap the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
-		} else {
-			// The capability probe only answers for a usage pair, not for this allocation
-			// size and layer count, so a device can still refuse the real array. Report the
-			// codec as unavailable instead of claiming a format the pages are not stored in.
-			_tiers[tier].effective.store(0);
-			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			LOG(WARN, "Could not allocate the compressed surface arrays; keeping ", tier_name, " pages uncompressed");
+			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_free_bundle(_rd, r_next);
+			LOG(WARN, "Could not allocate the compressed surface arrays; keeping ", tier_name, " pages canonical");
+			return false;
 		}
+		RenderingServer *server = RenderingServer::get_singleton();
+		if (want_albedo) {
+			_rd->set_resource_name(set.albedo_rd, "Surface VT " + tier_name + " Albedo Height (compressed)");
+			set.albedo_rs = server ? server->texture_rd_create(set.albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY) : RID();
+		}
+		if (want_normal) {
+			_rd->set_resource_name(set.normal_rd, "Surface VT " + tier_name + " Normal Octahedral (compressed)");
+			set.normal_rs = server ? server->texture_rd_create(set.normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY) : RID();
+		}
+		if (want_params) {
+			_rd->set_resource_name(set.params_rd, "Surface VT " + tier_name + " Parameters (selected codec packed)");
+			set.params_rs = server ? server->texture_rd_create(set.params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY) : RID();
+		}
+		const bool wrapped = (!want_albedo || set.albedo_rs.is_valid()) &&
+				(!want_normal || set.normal_rs.is_valid()) && (!want_params || set.params_rs.is_valid());
+		if (!wrapped) {
+			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
+			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
+			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
+			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+			_free_bundle(_rd, r_next);
+			LOG(WARN, "Could not wrap the compressed surface arrays; keeping ", tier_name, " pages canonical");
+			return false;
+		}
+		_tiers[tier].applied.store(want_albedo ? diffuse_mode : SURFACE_PAGE_UNCOMPRESSED);
+		_tiers[tier].normal_applied.store(want_normal ? normal_mode : SURFACE_NORMAL_UNCOMPRESSED);
+		_tiers[tier].params_encoded.store(want_params);
 	}
 	// The half-float staging arrays are page sized only while something samples them by slot.
 	// With every tier compressed they exist to be encoded and nothing else, so they come down

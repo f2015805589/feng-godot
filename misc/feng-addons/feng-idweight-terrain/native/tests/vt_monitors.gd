@@ -106,6 +106,14 @@ func run() -> void:
 	var ready := float(Performance.get_custom_monitor("terrain/pages_ready"))
 	print("VTMONITORS readings vt_cpu=%.6f material_bytes=%.0f pages_ready=%.0f" % [vt_cpu, material, ready])
 	require(vt_cpu >= 0.0, "the VT cost monitor must return a duration")
+	var settings: Dictionary = terrain.get_vt_settings()
+	require(is_equal_approx(vt_cpu * 1000.0, float(settings.get("vt_cpu_ms", -1.0))),
+			"time monitors must return seconds; the editor converts to milliseconds")
+	require(is_equal_approx(float(Performance.get_custom_monitor("terrain/vt_cpu_peak")) * 1000.0,
+			float(settings.get("vt_cpu_peak_ms", -1.0))), "peak time monitor must return seconds too")
+	for tier in ["avt", "svt"]:
+		require(is_equal_approx(float(Performance.get_custom_monitor("terrain/" + tier + "_cpu")) * 1000.0,
+				float(settings.get("vt_phases", {}).get(tier, -1.0))), "tier time monitors must return seconds")
 	require(material > 0.0, "the pool monitor must return the arrays' size (%f)" % material)
 
 	# The geometry backend runs from `frame_pre_draw` rather than from the tick, so its
@@ -116,7 +124,7 @@ func run() -> void:
 			str(geometry.get("backend", "")), int(geometry.get("selected_patches", 0)),
 			float(geometry.get("cpu_update_ms", -1.0))])
 	require(cdlod_cpu >= 0.0, "the geometry cost monitor must return a duration")
-	require(is_equal_approx(cdlod_cpu, float(geometry.get("cpu_update_ms", -1.0))),
+	require(is_equal_approx(cdlod_cpu * 1000.0, float(geometry.get("cpu_update_ms", -1.0))),
 			"the geometry monitor must report the backend's own reading, got %f vs %f" % [cdlod_cpu,
 					float(geometry.get("cpu_update_ms", -1.0))])
 	require(int(geometry.get("selected_patches", 0)) > 0,

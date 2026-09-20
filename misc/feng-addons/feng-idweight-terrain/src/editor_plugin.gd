@@ -27,6 +27,7 @@ var mouse_in_main: bool = false # Helper to track when mouse is in the editor vp
 # Terrain
 var terrain: Terrain3D
 var _last_terrain: Terrain3D
+var _assets_signal_terrain: Terrain3D
 var nav_region: NavigationRegion3D
 
 # Input
@@ -79,6 +80,7 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if debug:
 		print("Terrain3DEditorPlugin: _exit_tree")
+	_disconnect_assets_signal()
 	if vt_inspector_plugin != null:
 		remove_inspector_plugin(vt_inspector_plugin)
 		vt_inspector_plugin = null
@@ -150,7 +152,9 @@ func _edit(p_object: Object) -> void:
 
 	if p_object is Terrain3D:
 		if p_object == terrain:
+			_bind_assets_signal(p_object)
 			return
+		_disconnect_assets_signal()
 		terrain = p_object
 		_last_terrain = terrain
 		terrain.set_plugin(self)
@@ -161,8 +165,7 @@ func _edit(p_object: Object) -> void:
 		ui.set_visible(true)
 
 		# Get alerted when a new asset list is loaded
-		if not terrain.assets_changed.is_connected(asset_dock.update_assets):
-			terrain.assets_changed.connect(asset_dock.update_assets)
+		_bind_assets_signal(terrain)
 		asset_dock.update_assets()
 		if terrain_setup:
 			terrain_setup.call_deferred("request", terrain)
@@ -201,12 +204,40 @@ func _is_editing_terrain_asset() -> bool:
 
 
 func _clear() -> void:
+	_disconnect_assets_signal()
+	if is_instance_valid(asset_dock):
+		asset_dock.unbind_assets()
 	if is_terrain_valid():
 		editor.set_tool(Terrain3DEditor.TOOL_MAX)
 		editor.set_operation(Terrain3DEditor.OP_MAX)
 		terrain = null
 		editor.set_terrain(null)
 		ui.clear_picking()
+
+
+func _bind_assets_signal(p_terrain: Terrain3D) -> void:
+	if p_terrain == _assets_signal_terrain:
+		if is_instance_valid(p_terrain) and is_instance_valid(asset_dock):
+			var current_callable := Callable(asset_dock, &"update_assets")
+			if not p_terrain.assets_changed.is_connected(current_callable):
+				p_terrain.assets_changed.connect(current_callable)
+		return
+
+	_disconnect_assets_signal()
+	if not is_instance_valid(p_terrain) or not is_instance_valid(asset_dock):
+		return
+	var callback := Callable(asset_dock, &"update_assets")
+	if not p_terrain.assets_changed.is_connected(callback):
+		p_terrain.assets_changed.connect(callback)
+	_assets_signal_terrain = p_terrain
+
+
+func _disconnect_assets_signal() -> void:
+	if is_instance_valid(_assets_signal_terrain) and is_instance_valid(asset_dock):
+		var callback := Callable(asset_dock, &"update_assets")
+		if _assets_signal_terrain.assets_changed.is_connected(callback):
+			_assets_signal_terrain.assets_changed.disconnect(callback)
+	_assets_signal_terrain = null
 
 
 func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> AfterGUIInput:
@@ -480,7 +511,16 @@ func _on_scene_changed(scene_root: Node) -> void:
 	if debug:
 		print("Terrain3DEditorPlugin: _on_scene_changed: ", scene_root)
 	if not scene_root:
+		_disconnect_assets_signal()
+		if is_instance_valid(asset_dock):
+			asset_dock.unbind_assets()
 		return
+	if is_instance_valid(_assets_signal_terrain):
+		var terrain_in_scene := scene_root == _assets_signal_terrain or scene_root.is_ancestor_of(_assets_signal_terrain)
+		if not terrain_in_scene:
+			_disconnect_assets_signal()
+			if is_instance_valid(asset_dock):
+				asset_dock.unbind_assets()
 		
 	for node in scene_root.find_children("", "Terrain3DObjects"):
 		node.editor_setup(self)

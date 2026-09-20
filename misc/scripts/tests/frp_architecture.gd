@@ -3,6 +3,7 @@ extends SceneTree
 const PassBase = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
 const ViewState = preload("res://addons/feng-render-pipeline/pipeline/view_state.gd")
 const Evaluator = preload("res://addons/feng-render-pipeline/volume/volume_evaluator.gd")
+const TextureManager = preload("res://addons/feng-render-pipeline/passes/texture_manager.gd")
 
 class SettingsSource extends RefCounted:
 	var revision := 0
@@ -17,10 +18,20 @@ class ContractPass extends PassBase:
 	func _frp_execute(_ctx: FRPPassContext) -> void:
 		pass
 
+class BufferRenderData extends RenderDataExtension:
+	var _buffers: RenderSceneBuffersRD
+
+	func _init(p_buffers: RenderSceneBuffersRD) -> void:
+		_buffers = p_buffers
+
+	func _get_render_scene_buffers() -> RenderSceneBuffers:
+		return _buffers
+
 func _initialize() -> void:
 	run.call_deferred()
 
 func run() -> void:
+	_test_texture_manager_lifetime()
 	# Evaluation depends on settings and a position, not on scene/camera ownership.
 	var settings := SettingsSource.new()
 	var volume := FengVolume.new()
@@ -100,3 +111,36 @@ func run() -> void:
 	compositor.compositor_effects = []
 	print("PASS FRP contract resource notifications, view invalidation and detached dependency lifetime")
 	quit()
+
+
+func _test_texture_manager_lifetime() -> void:
+	var first := TextureManager.new()
+	var second := TextureManager.new()
+	var shared_buffers: RenderSceneBuffersRD = RenderSceneBuffersRD.new()
+	var first_data := BufferRenderData.new(shared_buffers)
+	first._render_callback(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_GBUFFER, first_data)
+	assert(shared_buffers.has_meta(TextureManager.BUFFER_SIGNATURE_META))
+	var first_signature: Variant = shared_buffers.get_meta(TextureManager.BUFFER_SIGNATURE_META)
+	var second_data := BufferRenderData.new(shared_buffers)
+	second._render_callback(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_GBUFFER, second_data)
+	assert(shared_buffers.get_meta(TextureManager.BUFFER_SIGNATURE_META) == first_signature,
+			"managers sharing the pipeline scope must observe one buffer signature")
+	first_data.free()
+	second_data.free()
+
+	# Exercise the manager callback for every short-lived buffer. A manager must
+	# not retain a buffer ID table after these objects disappear.
+	var buffers: Array[WeakRef] = []
+	for index in 96:
+		var transient: RenderSceneBuffersRD = RenderSceneBuffersRD.new()
+		var data := BufferRenderData.new(transient)
+		first._render_callback(CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_GBUFFER, data)
+		buffers.append(weakref(transient))
+		data.free()
+		transient = null
+	for reference in buffers:
+		assert(reference.get_ref() == null, "a released RenderSceneBuffersRD remained alive")
+
+	shared_buffers = null
+	first = null
+	second = null

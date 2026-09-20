@@ -116,17 +116,46 @@ void Terrain3D::_vt_update_motion_lead() {
 	if (_vt.avt_motion_valid && now > _vt.avt_motion_stamp_us) {
 		delta = float(double(now - _vt.avt_motion_stamp_us) / 1000000.0);
 		if (delta > 0.0005f) {
-			Vector2 velocity = (focus - _vt.avt_motion_last_focus) / delta;
-			if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
-			_vt.avt_motion_velocity = _vt.avt_motion_velocity.lerp(velocity, MOTION_SMOOTHING);
+			const Vector2 displacement = focus - _vt.avt_motion_last_focus;
+			const float discontinuity_distance = avt_motion_spatial_discontinuity_distance(
+				float(_vt.surface_vt_distance));
+			const bool displacement_cut = displacement.length_squared() >
+				discontinuity_distance * discontinuity_distance;
+			if (displacement_cut) {
+				// A large position step has already crossed the working-set window. Do not slew
+				// the old lead toward the new position: that would keep planning the old location
+				// while the standing plan is still the only safe draw fallback.
+				_vt.avt_motion_velocity = Vector2();
+				_vt.avt_motion_lead = Vector2();
+				_vt.avt_last_chain_frame = UINT64_MAX;
+				_vt.avt_refinement.reset();
+				_vt.avt_discard_retained = true;
+			} else {
+				Vector2 velocity = displacement / delta;
+				if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
+				_vt.avt_motion_velocity = _vt.avt_motion_velocity.lerp(velocity, MOTION_SMOOTHING);
+			}
 			// The gaze's rotation over the interval, as an axis and an angle. Two forward
 			// vectors cannot see roll, which is the point: see the state's note.
 			const Vector3 cross = _vt.avt_motion_last_forward.cross(forward);
-			const float step = std::asin(CLAMP(cross.length(), 0.f, 1.f));
+			// asin(|a x b|) folds angles above 90 degrees back toward zero. In
+			// particular, an exact 180 degree cut has a zero cross product and was
+			// mistaken for no turn. atan2 keeps the full [0, pi] interval while the
+			// dot product carries the sign that distinguishes a reversal.
+			const float dot = CLAMP(_vt.avt_motion_last_forward.dot(forward), -1.f, 1.f);
+			const float step = std::atan2(cross.length(), dot);
 			if (step > MOTION_MAX_TURN_STEP) {
-				// A snap. The interval holds no turn rate to smooth, and the lead the previous
-				// turn built up slews back down rather than being replaced by the snap's.
+				// A snap. The interval holds no turn rate to smooth. Clear the already
+				// applied lead as well: leaving it to slew down points the next plan at
+				// the old view for several frames. The next demand must bypass the normal
+				// refresh interval, and any refinement still owned by the terrain is
+				// superseded. The worker lambda owns its shared_ptr, so this does not
+				// cancel or invalidate work that is already executing.
 				_vt.avt_motion_turn = Vector3();
+				_vt.avt_motion_turn_lead = Vector3();
+				_vt.avt_last_chain_frame = UINT64_MAX;
+				_vt.avt_refinement.reset();
+				_vt.avt_discard_retained = true;
 			} else {
 				Vector3 turn = cross.length() > 1e-6f ? cross.normalized() * (step / delta) : Vector3();
 				if (turn.length() > MOTION_MAX_TURN_RATE) { turn = turn.normalized() * MOTION_MAX_TURN_RATE; }

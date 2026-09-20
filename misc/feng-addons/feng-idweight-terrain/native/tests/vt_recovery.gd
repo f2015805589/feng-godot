@@ -175,7 +175,10 @@ func run_scenario(codec: int) -> void:
 	var recovered := -1
 	for tick_index in 240:
 		await tick()
-		if ready_of(slot):
+		# GPU readiness can change after this tick's CPU classification. Require both
+		# halves of recovery within the same existing deadline, rather than reading
+		# the previous classification immediately after an asynchronous completion.
+		if ready_of(slot) and int(sector_stats().get("visible_missing_pages", -1)) == 0:
 			recovered = tick_index + 1
 			break
 	var after: Dictionary = sector_stats()
