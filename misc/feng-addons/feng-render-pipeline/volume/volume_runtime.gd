@@ -3,7 +3,8 @@ extends RefCounted
 ## Registration, viewport routing and override lifetime. Depends on the Volume
 ## spatial/profile protocol, not its concrete node class or editor APIs.
 
-const Resolver = preload("volume_resolver.gd")
+const Metrics = preload("volume_metrics.gd")
+const Evaluator = preload("volume_evaluator.gd")
 
 static var _volumes: Array[Node3D] = []
 static var _last_frame := -1
@@ -13,11 +14,15 @@ static var _samples: Dictionary = {}
 static func register(volume: Node3D) -> void:
 	if not _volumes.has(volume):
 		_volumes.append(volume)
+		Metrics.acquire()
 
 static func unregister(volume: Node3D) -> void:
+	var registered := _volumes.has(volume)
 	_volumes.erase(volume)
 	# Clear the last contribution even when no Volume remains to tick next frame.
 	evaluate_all()
+	if registered:
+		Metrics.release()
 
 static func tick() -> void:
 	if Engine.is_editor_hint():
@@ -37,6 +42,11 @@ static func get_scene_volumes(root: Node) -> Array:
 	return result
 
 static func evaluate_all() -> void:
+	var started := Time.get_ticks_usec()
+	_evaluate_all()
+	Metrics.record(0, Time.get_ticks_usec() - started)
+
+static func _evaluate_all() -> void:
 	# Editor camera discovery and transient compositor ownership are provided by
 	# editor/volume_preview.gd. They never enter the runtime viewport registry.
 	if Engine.is_editor_hint() or (_volumes.is_empty() and _pushed.is_empty()):
@@ -69,30 +79,20 @@ static func evaluate_all() -> void:
 	_pushed = current
 
 static func evaluate_camera(volumes: Array, camera: Camera3D, compositor: FengCompositor) -> bool:
-	var signature: Array = [compositor.renderer.get_instance_id() if compositor.renderer != null else 0,
-			compositor.renderer.get_parameter_revision() if compositor.renderer != null else 0]
-	var spatial := false
-	var influenced := false
-	for volume in volumes:
-		signature.append(volume.evaluation_key())
-		spatial = spatial or not volume.unbound
-		influenced = influenced or volume.influence_at(camera.global_position) > 0.0
-	if spatial:
-		signature.append(camera.global_position)
 	var id := compositor.get_instance_id()
-	var previous: Dictionary = _samples.get(id, {})
-	if not previous.is_empty() and previous.signature == signature:
+	var view: Dictionary = _samples.get(id, {})
+	if view.is_empty():
+		view = {"compositor": weakref(compositor), "evaluator": Evaluator.new()}
+		_samples[id] = view
+	var evaluator = view.evaluator
+	var resolved: Dictionary = evaluator.evaluate(volumes, camera.global_position, compositor.renderer)
+	if resolved.is_empty():
 		return false
-	# Weak ownership avoids keeping removed cameras or resources alive.
+	# Weak ownership avoids retaining removed cameras/resources. Keep this scan
+	# off the unchanged hot path; a new or changed view is enough to amortize it.
 	for old_id in _samples.keys():
 		if _samples[old_id].compositor.get_ref() == null:
 			_samples.erase(old_id)
-	_samples[id] = {"compositor": weakref(compositor), "signature": signature}
-	if not influenced:
-		compositor.set_volume_parameters({}, {})
-		return true
-	var context: Dictionary = compositor.renderer.get_volume_context() if compositor.renderer != null else {}
-	var resolved := Resolver.evaluate(volumes, context.get("base", {}), camera.global_position, context.get("schema", {}), context.get("aliases", {}), true)
 	compositor.set_volume_parameters(resolved.parameters, resolved.pass_states)
 	return true
 

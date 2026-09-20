@@ -5,10 +5,16 @@ extends Node
 ## No editor API or preview resources are needed by the runtime evaluator.
 
 const VolumeRuntime = preload("../volume/volume_runtime.gd")
+const VolumeMetrics = preload("../volume/volume_metrics.gd")
 
 var _views: Dictionary = {}
 
 func _process(_delta: float) -> void:
+	var started := Time.get_ticks_usec()
+	_update_preview()
+	VolumeMetrics.record(1, Time.get_ticks_usec() - started)
+
+func _update_preview() -> void:
 	var root := EditorInterface.get_edited_scene_root()
 	var volumes := VolumeRuntime.get_scene_volumes(root)
 	var current: Array = []

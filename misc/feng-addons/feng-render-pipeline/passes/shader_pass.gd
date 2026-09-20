@@ -11,13 +11,35 @@ enum Mode {
 const NativeSpec = preload("../pipeline/native_spec.gd")
 const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 
-@export var shader_file: RDShaderFile
-@export var mode: Mode = Mode.COMPUTE
+@export var shader_file: RDShaderFile:
+	set(value):
+		if shader_file == value:
+			return
+		if _observed_shader_file != null and _observed_shader_file.changed.is_connected(_on_shader_file_changed):
+			_observed_shader_file.changed.disconnect(_on_shader_file_changed)
+		shader_file = value
+		_observed_shader_file = shader_file
+		if _observed_shader_file != null and not _observed_shader_file.changed.is_connected(_on_shader_file_changed):
+			_observed_shader_file.changed.connect(_on_shader_file_changed)
+		emit_changed()
+@export var mode: Mode = Mode.COMPUTE:
+	set(value):
+		if mode == value:
+			return
+		mode = value
+		emit_changed()
 @export var parameters := Vector4(1.0, 1.0, 1.0, 1.0):
 	set(value):
+		if parameters == value:
+			return
 		parameters = value
 		emit_changed()
-@export var workgroup_size := Vector2i(8, 8)
+@export var workgroup_size := Vector2i(8, 8):
+	set(value):
+		if workgroup_size == value:
+			return
+		workgroup_size = value
+		emit_changed()
 
 ## Shader keywords: specialization constants, keyed by the `constant_id` the shader
 ## declares. A shader that starts with
@@ -27,12 +49,24 @@ const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 ## is given that keyword by `shader_keywords = { 0: true }`, or at runtime by
 ## `set_shader_keyword(0, true)`. Changing a keyword recreates the pipeline, so the
 ## shader really is re-specialized (the branch the keyword guards is compiled away).
+# This dictionary is also mutated by native post-process overlays on the render
+# thread. Keep that runtime path notification-free until it has a dedicated
+# execution-state API; authored keyword edit notifications remain a follow-up
+# once that API can distinguish the two paths.
 @export var shader_keywords: Dictionary = {}
 
 ## Empty targets mean the viewport's internal color texture for raster and the
 ## internal render size for compute. Named targets refer to frp_pipeline.
+# Native post-process overlays write raster_target/target_name on the render thread
+# for each resolved placement. These fields intentionally stay notification-free
+# until a runtime target API can separate execution state from authored state.
 @export var raster_target: StringName = &""
-@export var dispatch_target: StringName = &""
+@export var dispatch_target: StringName = &"":
+	set(value):
+		if dispatch_target == value:
+			return
+		dispatch_target = value
+		emit_changed()
 ## Common alias retained for templates that use one target field for either mode.
 @export var target_name: StringName = &""
 
@@ -41,11 +75,18 @@ var _compute_pipeline := RID()
 var _sampler := RID()
 var _spirv: RDShaderSPIRV
 var _shader_resource: RDShaderFile
+var _observed_shader_file: RDShaderFile
 var _shader_mode := -1
 var _keyword_signature := ""
 var _raster_pipelines := {}
 var _binding_error := false
 var _frame_parameters: Variant = null
+
+func _on_shader_file_changed() -> void:
+	# RDShaderFile emits when an imported SPIR-V version or its compile error is
+	# replaced. Forward that event to the owning renderer; _ensure_shader() keeps
+	# the existing lazy GPU-resource rebuild path on the render thread.
+	emit_changed()
 
 func get_frp_parameters() -> Dictionary:
 	return {"parameters": parameters}

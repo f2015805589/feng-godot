@@ -18,6 +18,7 @@ const NativeSpec = preload("pipeline/native_spec.gd")
 const ParameterResolver = preload("pipeline/parameter_resolver.gd")
 const ExecutionPlan = preload("pipeline/execution_plan.gd")
 const CompositorBinding = preload("pipeline/compositor_binding.gd")
+const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
@@ -94,17 +95,24 @@ var _last_validation_warnings := PackedStringArray()
 var _volume_parameters := {}
 var _volume_pass_states := {}
 var _normalizing := false
+var _seed_pending := true
 var _volume_context_cache := {}
 var _parameter_revision := 0
+## Only a successfully bound schedule may be reused for Volume-only updates.
+## Authored edits invalidate it through the parameter revision; switches force a
+## full validation because they can change texture availability and native ownership.
+var _volume_binding: Dictionary = {}
+var _view_plans: Array[Dictionary] = []
 
 func _init() -> void:
 	changed.connect(_invalidate_volume_context)
 	_manager = TextureManager.new()
-	# Seed a new resource for a useful inspector experience. If this object is
-	# loaded from disk, Godot restores serialized passes after _init(); migration
-	# below then replaces this seed with the legacy list.
-	_seed_default_passes()
-	_connect_passes()
+	# Fresh custom schedules are current too, even when assigned before the first
+	# default-list read. Resource loading restores its serialized version later.
+	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
+	# Seed on first use. Loading or duplicating a Renderer restores its own pass
+	# list: allocating nine throwaway default passes here needlessly loads shader
+	# templates and creates effect RIDs on every camera's first Volume entry.
 
 func _seed_default_passes() -> void:
 	if not _passes.is_empty():
@@ -176,6 +184,7 @@ func _make_default_implementation(native_id: int) -> PassBase:
 	return fallback
 
 func _set_passes(value: Array, emit: bool) -> void:
+	_seed_pending = false
 	var next: Array[PassBase] = []
 	for value_pass in value:
 		if value_pass == null or value_pass is PassBase:
@@ -252,6 +261,9 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 	if _normalizing:
 		return false
 	_normalizing = true
+	if _seed_pending:
+		_seed_pending = false
+		_seed_default_passes()
 	var changed := false
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION and not _has_native_schedule():
 		changed = _migrate_legacy_passes() or changed
@@ -359,18 +371,26 @@ func get_pass_parameters() -> Dictionary:
 func get_volume_context() -> Dictionary:
 	if _volume_context_cache.is_empty():
 		_ensure_pipeline_initialized(false)
+	return _initialized_volume_context().duplicate(true)
+
+## The caller already normalized the pipeline. Keep one author snapshot for the
+## entire application instead of re-entering library sync from each upload query.
+func _initialized_volume_context() -> Dictionary:
+	if _volume_context_cache.is_empty():
 		_volume_context_cache = {
 			"base": ParameterResolver.authored(_passes),
 			"schema": ParameterResolver.volume_schema(_passes),
 			"aliases": ParameterResolver.volume_aliases(_passes),
+			"bindings": ParameterResolver.parameter_bindings(_passes),
 		}
-	return _volume_context_cache.duplicate(true)
+	return _volume_context_cache
 
 func get_parameter_revision() -> int:
 	return _parameter_revision
 
 func _invalidate_volume_context() -> void:
 	_volume_context_cache = {}
+	_view_plans.clear()
 	_parameter_revision += 1
 
 ## Pass parameters and pass states a volume resolved for this camera. The compositor
@@ -490,6 +510,8 @@ func mark_library_pass(path: String) -> void:
 	emit_changed()
 
 func apply(compositor: Compositor) -> void:
+	_volume_binding = {}
+	_view_plans.clear()
 	if compositor == null:
 		return
 	_ensure_pipeline_initialized(true)
@@ -498,8 +520,19 @@ func apply(compositor: Compositor) -> void:
 	# Do not even derive a candidate effect list for an invalid schedule: binding's
 	# fallback intentionally leaves the engine's previous valid schedule untouched.
 	var schedule: Dictionary = {}
+	var provided := PackedInt32Array()
+	var parameters: Dictionary = {}
+	var context: Dictionary = {}
 	if candidate_warnings.is_empty():
 		schedule = _build_schedule()
+		for native_id in _provided_native_ids():
+			provided.append(native_id)
+		provided.sort()
+		# A full explicit apply must also observe direct dictionary edits and
+		# computed pass defaults, even when a caller did not emit changed.
+		_volume_context_cache = {}
+		context = _initialized_volume_context()
+		parameters = ParameterResolver.resolve_context(_passes, _volume_parameters, context)
 	var result := CompositorBinding.apply(
 		compositor,
 		_manager,
@@ -508,11 +541,86 @@ func apply(compositor: Compositor) -> void:
 		candidate_warnings,
 		_contract_source,
 		_is_entry_enabled,
-		get_provided_native_ids,
-		get_pass_parameters
+		func(): return provided,
+		func(): return parameters
 	)
 	if result.get("applied", false):
 		_last_valid_schedule = result["tokens"]
+		_volume_binding = {
+			"revision": _parameter_revision,
+			"compositor": compositor.get_instance_id(),
+			"states": _volume_pass_states.duplicate(true),
+			"context": context,
+			"parameters": _volume_parameters.duplicate(true),
+			"resolved": parameters,
+			"effects": schedule.effects,
+			"tokens": schedule.tokens,
+			"names": schedule.names,
+			"provided": provided,
+		}
+
+## Internal per-camera update. Runtime overrides do not edit author resources or
+## emit their changed signal. Public set_volume_parameters retains its protocol.
+func apply_volume(compositor: Compositor, parameters: Dictionary, pass_states: Dictionary) -> void:
+	if compositor == null:
+		return
+	_volume_parameters = parameters.duplicate(true)
+	_volume_pass_states = pass_states.duplicate(true)
+	var can_reuse: bool = not _volume_binding.is_empty() \
+			and _volume_binding.revision == _parameter_revision \
+			and _volume_binding.compositor == compositor.get_instance_id() \
+			and _volume_binding.states == pass_states
+	if can_reuse:
+		# Fixed presets keep the same resolved upload across boundary crossings.
+		if _volume_binding.parameters != _volume_parameters:
+			_volume_binding.parameters = _volume_parameters.duplicate(true)
+			_volume_binding.resolved = ParameterResolver.resolve_context(_passes, _volume_parameters, _volume_binding.context)
+		# Crossing a boundary switches between authored and runtime effect RIDs.
+		# Restore the cached binding even though neither renderer's author changed.
+		if compositor.compositor_effects != _volume_binding.effects:
+			compositor.compositor_effects = _volume_binding.effects
+		CompositorBinding.upload(compositor, _volume_binding.tokens, _volume_binding.names, _volume_binding.provided, _volume_binding.resolved)
+		return
+	apply(compositor)
+
+## Immutable plan shared by views. Volume switches are evaluated without writing
+## into this Renderer or changing any authored effect's enabled RID.
+func compile_view_plan(states: Dictionary) -> Dictionary:
+	for cached in _view_plans:
+		if cached.states == states:
+			return cached.plan
+	_ensure_pipeline_initialized(false)
+	var enabled_fn := func(entry): return ExecutionPlan.is_entry_enabled(entry, states)
+	var provided := ExecutionPlan.provided_native_ids(_passes, enabled_fn)
+	var declared := ExecutionPlan.declared_provided_ids(_passes, enabled_fn)
+	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn, _contract_source, _is_scripted)
+	if not warnings.is_empty():
+		return {"warnings": warnings}
+	# Effect slot zero belongs to each view's texture manager. Build keeps custom
+	# token indices based at one even when the manager is omitted here.
+	var schedule := ExecutionPlan.build(_passes, null, _is_scripted, enabled_fn)
+	var provided_ids := PackedInt32Array()
+	for native_id in provided:
+		provided_ids.append(native_id)
+	provided_ids.sort()
+	var enabled: Array[bool] = []
+	for source in schedule.effects:
+		enabled.append(enabled_fn.call(source))
+	var plan := {
+		"warnings": warnings, "tokens": schedule.tokens, "names": schedule.names,
+		"sources": schedule.effects, "enabled": enabled, "provided": provided_ids,
+		"context": _initialized_volume_context().duplicate(true),
+	}
+	if _view_plans.size() == 2:
+		_view_plans.pop_front()
+	_view_plans.append({"states": states.duplicate(true), "plan": plan})
+	return plan
+
+## Compatibility entry point for ViewState. The policy owns the implementation
+## classification; this method remains stable for callers and passes the renderer's
+## existing stock manifest without copying it.
+func is_view_shareable(entry: FengPass) -> bool:
+	return ViewExecutionPolicy.is_view_shareable(entry, NATIVE_PASS_SCRIPTS, FengAddonLayout.passes_dir())
 
 func _set_native_schedule(compositor: Compositor, tokens: PackedInt32Array, names: PackedStringArray) -> void:
 	# Passes a plugin runs itself are reported to the engine: the schedule dropped

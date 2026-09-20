@@ -9,11 +9,31 @@ enum Usage {
 	COLOR_ATTACHMENT = RenderingDevice.TEXTURE_USAGE_COLOR_ATTACHMENT_BIT,
 }
 
-@export var name: StringName = &""
-@export var data_format: int = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
-@export_flags("Sampled", "Storage", "Color Attachment") var usage: int = Usage.SAMPLED | Usage.STORAGE | Usage.COLOR_ATTACHMENT
+@export var name: StringName = &"":
+	set(value):
+		if name == value:
+			return
+		name = value
+		emit_changed()
+@export var data_format: int = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT:
+	set(value):
+		if data_format == value:
+			return
+		data_format = value
+		emit_changed()
+@export_flags("Sampled", "Storage", "Color Attachment") var usage: int = Usage.SAMPLED | Usage.STORAGE | Usage.COLOR_ATTACHMENT:
+	set(value):
+		if usage == value:
+			return
+		usage = value
+		emit_changed()
 ## Size of the texture relative to the viewport's internal size.
-@export var scale: Vector2 = Vector2.ONE
+@export var scale: Vector2 = Vector2.ONE:
+	set(value):
+		if scale == value:
+			return
+		scale = value
+		emit_changed()
 
 func get_scaled_size(internal_size: Vector2i) -> Vector2i:
 	var width := maxi(1, ceili(float(internal_size.x) * maxf(scale.x, 0.0)))

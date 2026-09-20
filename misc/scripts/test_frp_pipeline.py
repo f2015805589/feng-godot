@@ -79,6 +79,12 @@ run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_passes.gd")],
     "PASS configurable compute pass shader, bindings, parameters and enabled state")
 run("volume", ["--script", str(ROOT / "misc/scripts/tests/frp_volume.gd")],
     "PASS FRP author-defined Volume modules, typed fields, priority, persistence, custom frame parameters and compositor isolation")
+run("volume_metrics", ["--script", str(ROOT / "misc/scripts/tests/frp_volume_metrics.gd")],
+    "PASS volume CPU monitors: frame totals, units, idle reset and registration lifetime")
+run("architecture", ["--script", str(ROOT / "misc/scripts/tests/frp_architecture.gd")],
+    "PASS FRP contract resource notifications, view invalidation and detached dependency lifetime")
+run("view_state", ["--script", str(ROOT / "misc/scripts/tests/frp_view_state.gd")],
+    "PASS FRP shared view definitions, two-camera pixels, independent TAA switches, stateful plugin isolation and shader reuse")
 # Every frame that needs motion vectors without 3D upscaling: TAA, the motion
 # debug view and upscaling itself. FRP produces motion vectors in the G-buffer
 # pass. The Temporal AA entry is the TAA switch, and the viewport jitter follows it.

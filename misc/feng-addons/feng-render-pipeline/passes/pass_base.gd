@@ -29,10 +29,12 @@ const OutputDeclaration = preload("pass_output.gd")
 @export var inputs: Array[TextureInput] = []:
 	set(value):
 		inputs = value
+		_observe_contract_resources()
 		emit_changed()
 @export var outputs: Array[OutputDeclaration] = []:
 	set(value):
 		outputs = value
+		_observe_contract_resources()
 		emit_changed()
 ## Native FRP passes this pass takes over, by id. Declaring an id tells the
 ## renderer that a schedule without the matching built-in entry is complete: the
@@ -52,9 +54,56 @@ const OutputDeclaration = preload("pass_output.gd")
 var _setup_complete := false
 var _cleanup_scheduled := false
 var _last_error := ""
+var _parameter_layout_ready := false
+var _parameter_properties: Dictionary = {}
+var _parameter_exports := PackedStringArray()
+var _contract_resources: Array[Resource] = []
+
+## Declaration changes are events, not per-frame dependency polling. Observe here
+## so Renderer only needs the Pass.changed protocol, including for custom passes.
+func _observe_contract_resources() -> void:
+	for resource in _contract_resources:
+		if resource.changed.is_connected(_on_contract_resource_changed):
+			resource.changed.disconnect(_on_contract_resource_changed)
+	_contract_resources.clear()
+	for declarations in [inputs, outputs]:
+		for resource in declarations:
+			if resource != null and not _contract_resources.has(resource):
+				_contract_resources.append(resource)
+				resource.changed.connect(_on_contract_resource_changed)
+
+func _on_contract_resource_changed() -> void:
+	emit_changed()
 
 func _init() -> void:
 	effect_callback_type = stage
+	property_list_changed.connect(_invalidate_parameter_layout)
+	script_changed.connect(_invalidate_parameter_layout)
+
+func _invalidate_parameter_layout() -> void:
+	_parameter_layout_ready = false
+	_parameter_properties = {}
+	_parameter_exports = PackedStringArray()
+	# Dynamic schema changes also invalidate renderer and Volume snapshots.
+	emit_changed()
+
+## Cache metadata, never values: direct field edits still read fresh values.
+## Dynamic property schemas invalidate through Godot's property_list_changed.
+func _ensure_parameter_layout() -> void:
+	if _parameter_layout_ready:
+		return
+	_parameter_properties = {}
+	_parameter_exports = PackedStringArray()
+	for property in get_property_list():
+		var key := String(property.name)
+		_parameter_properties[key] = property
+		var usage := int(property.get("usage", 0))
+		if (usage & PROPERTY_USAGE_SCRIPT_VARIABLE) == 0 or (usage & PROPERTY_USAGE_EDITOR) == 0:
+			continue
+		if key in ["stage", "inputs", "outputs", "provides_native_ids", "pass_parameters", "overlay", "implementation"]:
+			continue
+		_parameter_exports.append(key)
+	_parameter_layout_ready = true
 
 func _setup(_rd: RenderingDevice) -> void:
 	pass
@@ -92,13 +141,8 @@ func _clear_report() -> void:
 func get_frp_parameters() -> Dictionary:
 	var parameters := {}
 	# Script exports are settings; the base protocol's exports are infrastructure.
-	for property in get_property_list():
-		var usage := int(property.get("usage", 0))
-		if (usage & PROPERTY_USAGE_SCRIPT_VARIABLE) == 0 or (usage & PROPERTY_USAGE_EDITOR) == 0:
-			continue
-		var key := String(property.name)
-		if key in ["stage", "inputs", "outputs", "provides_native_ids", "pass_parameters", "overlay", "implementation"]:
-			continue
+	_ensure_parameter_layout()
+	for key in _parameter_exports:
 		parameters[key] = get(key)
 	return parameters
 
@@ -119,17 +163,29 @@ func get_parameter_source() -> FengPass:
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray()
 
+## Opt into sharing this pass's execution resource across camera views.
+##
+## Return true only when the pass and every pass it carries can run without retaining
+## mutable state that belongs to one view. Per-view parameters, textures and render
+## data must be read from the FRPPassContext passed to _frp_execute(ctx); do not keep
+## them in the shared pass resource. The default is conservative isolation, so a
+## subclass must explicitly override this method. A top-level BuiltinPass opt-in also
+## accepts responsibility for its complete carried implementation/overlay graph.
+func can_share_view_execution() -> bool:
+	return false
+
 ## Reuses export types/ranges for the Volume UI; dictionary-only settings work too.
 func get_volume_parameter_list() -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
+	var names := get_volume_parameter_names()
+	if names.is_empty():
+		return result
 	var defaults := get_frp_parameters()
-	var properties := {}
-	for property in get_property_list():
-		properties[String(property.name)] = property
-	for key in get_volume_parameter_names():
+	_ensure_parameter_layout()
+	for key in names:
 		if not defaults.has(key):
 			continue
-		var info: Dictionary = properties.get(key, {"name": key, "type": typeof(defaults[key])}).duplicate()
+		var info: Dictionary = _parameter_properties.get(key, {"name": key, "type": typeof(defaults[key])}).duplicate()
 		info.usage = PROPERTY_USAGE_DEFAULT
 		result.append(info)
 	return result

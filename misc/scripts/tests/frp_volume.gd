@@ -16,9 +16,15 @@ class Probe extends PassBase:
 	@export var pipeline_only := 4.0
 	@export var tint := Color.BLACK
 	var observed := {}
+	var validation_count := 0
+	var volume_schema_count := 0
+	func get_configuration_warnings() -> PackedStringArray:
+		validation_count += 1
+		return super.get_configuration_warnings()
 	func get_parameter_key() -> Variant:
 		return "test:volume_probe"
 	func get_volume_parameter_names() -> PackedStringArray:
+		volume_schema_count += 1
 		return PackedStringArray(["strength", "tint"])
 	func _frp_execute(ctx: FRPPassContext) -> void:
 		observed = get_resolved_parameters(ctx)
@@ -37,6 +43,15 @@ class RepeatedPass extends PassBase:
 	func get_volume_parameter_names() -> PackedStringArray:
 		return PackedStringArray(["amount"])
 
+class DynamicSchemaPass extends PassBase:
+	@export var amount := 1.0
+	var hide_amount := false
+	func _validate_property(property: Dictionary) -> void:
+		if property.name == "amount" and hide_amount:
+			property.usage = PROPERTY_USAGE_STORAGE
+	func get_volume_parameter_names() -> PackedStringArray:
+		return PackedStringArray(["amount"])
+
 func _initialize() -> void:
 	_run.call_deferred()
 
@@ -46,6 +61,44 @@ func settle() -> void:
 		await RenderingServer.frame_post_draw
 
 func _run() -> void:
+	# Compare the compiled hot path with the independent generic resolver.
+	var layer_a := Volume.new()
+	var layer_b := Volume.new()
+	layer_a.profile = Profile.new()
+	layer_b.profile = Profile.new()
+	layer_b.profile.disabled_passes = [6]
+	var blend_base := {6: {"enabled": true, "amount": 2.0, "mode": 0, "tint": Color.BLACK}}
+	var blend_schema := {6: {"enabled": {"type": TYPE_BOOL}, "amount": {"type": TYPE_FLOAT},
+			"mode": {"type": TYPE_INT, "hint": PROPERTY_HINT_ENUM}, "tint": {"type": TYPE_COLOR}}}
+	var prepared := {"ordered": [layer_a, layer_b], "context": {"base": blend_base, "schema": blend_schema},
+			"settings": {layer_a.get_instance_id(): {6: {"amount": 8.0, "mode": 2, "tint": Color.RED, "ignored": 99}},
+			layer_b.get_instance_id(): {6: {"amount": 4.0, "enabled": true}}}}
+	var program := VolumeResolver.compile(prepared)
+	for a in [0.0, 0.2, 0.49, 0.5, 0.8, 1.0]:
+		for b in [0.0, 0.2, 0.49, 0.5, 0.8, 1.0]:
+			prepared.influences = {layer_a.get_instance_id(): a, layer_b.get_instance_id(): b}
+			assert(VolumeResolver.evaluate_compiled(program, prepared.influences) ==
+					VolumeResolver.evaluate([], blend_base, Vector3.ZERO, blend_schema, {}, true, prepared),
+					"compiled numeric/color/enum/switch blends must preserve generic semantics")
+	layer_a.free()
+	layer_b.free()
+	var dynamic := DynamicSchemaPass.new()
+	assert(dynamic.get_frp_parameters().amount == 1.0)
+	dynamic.amount = 3.0
+	assert(dynamic.get_frp_parameters().amount == 3.0, "metadata caching must never cache exported values")
+	var dynamic_module := Module.from_pass(dynamic)
+	assert(dynamic_module.get_parameters().has("amount"))
+	dynamic.hide_amount = true
+	dynamic.notify_property_list_changed()
+	assert(not dynamic.get_frp_parameters().has("amount"), "dynamic property schemas must invalidate cached exports")
+	assert(dynamic_module.get_parameters().is_empty(), "schema invalidation must propagate to Volume module caches")
+	dynamic.hide_amount = false
+	dynamic.notify_property_list_changed()
+	assert(dynamic_module.get_parameters().amount == 3.0)
+	dynamic_module.set("overrides/amount", false)
+	assert(dynamic_module.get_parameters().is_empty())
+	dynamic_module.set("overrides/amount", true)
+	assert(dynamic_module.get_parameters().amount == 3.0, "disabling override must retain the authored value")
 	var identities := Renderer.new()
 	var first := RepeatedPass.new()
 	var second_instance := RepeatedPass.new()
@@ -88,6 +141,17 @@ func _run() -> void:
 	assert(renderer.get_volume_modules().has(probe), "custom passes need no native capability to expose a Volume module")
 	var module := Module.from_pass(probe, renderer.get_authored_pass_parameters()[key])
 	assert(module.get_parameters().size() == 2 and not module.get_parameters().has("pipeline_only"))
+	var schema_count := probe.volume_schema_count
+	var module_snapshot := module.get_parameters()
+	module_snapshot.strength = -123.0
+	assert(module.get_parameters().strength == 4.0 and probe.volume_schema_count == schema_count,
+			"unchanged module reads must reuse schema and return isolated snapshots")
+	module.values.strength = 6.0
+	assert(module.get_parameters().strength == 6.0, "in-place module edits must invalidate the cache")
+	schema_count = probe.volume_schema_count
+	probe.emit_changed()
+	module.get_parameters()
+	assert(probe.volume_schema_count > schema_count, "source edits must invalidate module schema")
 	module.set("parameters/strength", 8.0)
 	module.set("parameters/tint", Color.WHITE)
 	module.values.pipeline_only = 99.0
@@ -134,6 +198,34 @@ func _run() -> void:
 	higher.weight = 0.5
 	root.add_child(higher)
 	assert(is_equal_approx(Volume.resolve_overrides([higher, volume], base, Vector3.ZERO)[key].strength, 9.0))
+	var blend_camera := Camera3D.new()
+	root.add_child(blend_camera)
+	var blend_compositor := CompositorScript.new()
+	blend_compositor.renderer = renderer
+	var blend_context := renderer.get_volume_context()
+	for index in 36:
+		blend_camera.position.x = -6.0 + index * 0.37
+		if index == 8:
+			higher.priority = -1
+		if index == 16:
+			module.values.strength = 5.0
+		if index == 24:
+			volume.blend_distance = 3.0
+		if index == 12:
+			module.set("overrides/strength", false)
+		if index == 20:
+			module.set("overrides/strength", true)
+		VolumeRuntime.evaluate_camera([higher, volume], blend_camera, blend_compositor)
+		var reference := VolumeResolver.evaluate([higher, volume], blend_context.base, blend_camera.global_position,
+				blend_context.schema, blend_context.aliases, true)
+		assert(blend_compositor.get_volume_parameters() == reference.parameters,
+				"prepared blends must match fresh resolution across motion, priority, dictionary and range edits")
+		assert(blend_compositor.get_volume_pass_states() == reference.pass_states)
+	VolumeRuntime.forget_camera(blend_compositor)
+	blend_compositor.renderer = null
+	blend_camera.free()
+	module.values.strength = 8.0
+	volume.blend_distance = 2.0
 	higher.queue_free()
 	renderer.set_volume_parameters({key: {"strength": 7.0, "pipeline_only": 99.0}})
 	assert(renderer.get_pass_parameters()[key].strength == 7.0)
@@ -148,10 +240,14 @@ func _run() -> void:
 	var saved := Profile.new()
 	var saved_module := Module.from_pass(taa)
 	saved_module.set("parameters/jitter_phases", 3)
+	saved_module.set("overrides/enabled", false)
+	assert(saved_module.get("parameters/enabled") == saved_module.values.enabled,
+			"disabled override must still display the stored switch value")
 	saved.modules = [saved_module]
 	assert(ResourceSaver.save(saved, "user://volume-profile.tres") == OK)
 	var restored = ResourceLoader.load("user://volume-profile.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
 	assert(restored.get_parameters()[6].jitter_phases == 3)
+	assert(not restored.get_parameters()[6].has("enabled"), "field override switches must survive saving")
 	var world := WorldEnvironment.new()
 	world.environment = Environment.new()
 	world.environment.background_mode = Environment.BG_COLOR
@@ -166,8 +262,8 @@ func _run() -> void:
 	# Volume snapshots own their effect instances; find the runtime probe.
 	var runtime_probe: Probe
 	for effect in compositor.compositor_effects:
-		if effect is Probe:
-			runtime_probe = effect
+		if effect.get("execution") is Probe:
+			runtime_probe = effect.execution
 	assert(runtime_probe != null and runtime_probe != probe)
 	assert(runtime_probe.observed.get("strength") == 8.0, "the custom pass must receive Volume values through the engine frame context")
 	VolumeRuntime.evaluate_camera([volume], camera, compositor)
@@ -176,8 +272,16 @@ func _run() -> void:
 		assert(not VolumeRuntime.evaluate_camera([volume], camera, compositor),
 				"unchanged Volume must not rebuild its parameter context")
 	print("PASS unchanged Volume fast path: %.2f us/evaluation" % (float(Time.get_ticks_usec() - started) / 300.0))
+	camera.position.x = 0.25
+	assert(not VolumeRuntime.evaluate_camera([volume], camera, compositor),
+			"moving within a constant-influence region must not repeat blending")
+	camera.position.x = 0.0
 	module.set("parameters/strength", 9.0)
 	assert(VolumeRuntime.evaluate_camera([volume], camera, compositor), "module edits must invalidate stationary evaluation")
+	var validations := runtime_probe.validation_count
+	await settle()
+	assert(runtime_probe.observed.get("strength") == 9.0, "cached binding must upload changed parameters")
+	assert(runtime_probe.validation_count == validations, "numeric overrides must not repeat schedule validation")
 	module.set("parameters/strength", 8.0)
 	assert(VolumeRuntime.evaluate_camera([volume], camera, compositor))
 	assert(probe.strength == 2.0 and probe.pass_parameters.strength == 4.0, "authored values were mutated")
@@ -212,16 +316,38 @@ func _run() -> void:
 	await settle()
 	var after := root.get_texture().get_image().get_pixel(100, 100)
 	assert(absf(before.r - after.r) < 0.01, "shader parameters must restore after leaving the Volume")
-	var warmed_renderer = compositor._runtime_renderer
+	var warmed_view = compositor._view_state
 	var transform_before := camera.global_transform
 	for i in 48:
-		volume.enabled = i % 2 == 0
+		var inside := i % 2 == 0
+		if i < 24:
+			volume.enabled = inside
+		else:
+			# The preset stays fixed; only the camera crosses its boundary.
+			volume.enabled = true
+			camera.position.x = 0.0 if inside else 20.0
+		var expected_transform := camera.global_transform
 		await process_frame
 		await RenderingServer.frame_post_draw
-		assert(compositor._runtime_renderer == warmed_renderer,
+		assert(compositor._view_state == warmed_view,
 				"Volume boundary crossing rebuilt the shader resources")
-		assert(camera.global_transform == transform_before, "Volume evaluation changed camera navigation")
+		assert(camera.global_transform == expected_transform, "Volume evaluation changed camera navigation")
+		var expected_effects: Array = warmed_view._effects if inside else renderer._volume_binding.effects
+		assert(compositor.compositor_effects == expected_effects, "cached boundary restore must bind the correct effect RIDs")
+		var boundary_pixel := root.get_texture().get_image().get_pixel(100, 100)
+		assert(boundary_pixel.r < before.r * 0.6 if inside else absf(boundary_pixel.r - before.r) < 0.01,
+				"fixed-preset boundary caching must preserve actual shader output")
+	camera.global_transform = transform_before
 	print("PASS Volume boundary stress preserves GPU resources and camera transform")
+	camera.position.x = 20.0
+	await settle()
+	tint_module.set("parameters/parameters", Vector4(1.0, 0.1, 1.0, 1.0))
+	await settle()
+	camera.global_transform = transform_before
+	await settle()
+	var edited_outside := root.get_texture().get_image().get_pixel(100, 100)
+	assert(edited_outside.r > before.r * 0.8 and edited_outside.g < before.g * 0.6,
+			"edits made outside the Volume must invalidate the cached preset on reentry")
 	volume.enabled = true
 	await settle()
 	assert(not compositor.get_volume_parameters().is_empty())

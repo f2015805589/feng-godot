@@ -170,12 +170,12 @@ Renderer 可以只含这一个 pass——校验零告警，规范化也不会把
 
 Pass 可以自由添加带类型的 `@export` 属性，基类自动收集自定义导出参数；需要不同名称或计算值时也可重写
 `get_frp_parameters()`。**哪些参数可进入 Volume 由 Pass 作者在代码中通过 `get_volume_parameter_names()` 规定**。
-默认空列表表示不提供 Volume 模块；Volume 使用者只能选择模块和修改已声明的字段，没有逐字段暴露权限或覆盖勾选。
+默认空列表表示不提供 Volume 模块；Volume 使用者只能选择模块和修改已声明的字段，并通过 `overrides/字段名` 勾选是否覆盖。覆盖开关不能扩大 Pass 声明的暴露权限。
 
 管线全局参数与 Volume 字段是两份独立声明：只出现在 `get_frp_parameters()` 中的字段不会进入 Volume。
 例如 TAA 的代码明确将 `enabled` 与 `jitter_phases` 开放给 Volume；其他 Pass 不会自动得到这些字段。
 Volume 中的 `enabled = false` 是该 Pass 参数的关闭覆盖，仍高于管线的 `true`，不是取消覆盖。
-取消覆盖请移除模块或关闭整个 Volume。旧模块存储的关闭状态会按 TAA 的新声明兼容读取。
+取消单个字段的覆盖请取消对应的 `overrides/字段名` 勾选，保留字段值并继承较低优先级的结果；也可以移除模块或关闭整个 Volume。旧模块默认覆盖全部已声明字段，存储的关闭状态会按 TAA 的新声明兼容读取。
 
 ```gdscript
 @tool
@@ -225,10 +225,22 @@ Volume 按 priority 从低到高应用，同优先级保持注册顺序；数值
 静止时只做轻量变更检查；参数、范围或管线变化才重新解析。隐藏视图和范围外相机跳过预览计算，
 进出范围复用已创建的运行时效果，避免重复编译着色器。Pass 作者的参数 setter 仍需调用 `emit_changed()`。
 
-每个相机的结果保存在其 `FengCompositor` 的运行时管线副本中，不改共享 Renderer 作者态；退出范围或关闭 Volume
+每个相机的结果保存在其 `FengCompositor` 的独立 ViewState 中，不再深复制整套 Renderer，也不改作者态；退出范围或关闭 Volume
 会恢复全局设置。不同相机若需要不同结果，应使用不同 `FengCompositor`，它们可以共享同一个 Renderer 资源。
+默认无 overlay 的原生 Pass 和标准 FengShaderPass 共享定义/执行对象；每相机的效果 RID、开关、
+参数和纹理管理独立。未知自定义子类及带 overlay 的条目保留独立执行实例，避免脚本状态相互污染。
+自定义 Pass 可覆写 `can_share_view_execution() -> bool` 返回 `true`，明确允许跨视图共享执行实例。
+这要求整个执行对象及其携带的 Pass 不保存跨相机可变状态，逐视图参数从 `FRPPassContext` 获取；
+仅实现此接口不会合并相机的效果 RID、开关或纹理。默认返回 `false`，无需修改 Renderer 中的类型白名单。
+输入、输出声明的字段变更通过 `Resource.changed` 传播至 Pass 和 Renderer，使视图快照失效；
+替换声明数组会重新连接依赖。脚本原位增删 `inputs` / `outputs` 后应重新赋值数组以更新观察关系。
 `volume_resolver.gd` 只负责混合，`pipeline/parameter_resolver.gd` 负责参数收集、模块身份关联和暴露权限，
 编辑器插件负责模块选择与 UndoRedo。新增模块无需修改这些服务或引擎。
+运行时在配置变化时将参与覆盖的字段编译为槽位和混合操作，预先解析权限、别名、默认值及枚举规则。
+`volume_runtime.gd` 负责路由和生命周期，每个视图的 `volume_evaluator.gd` 独立持有有界求值缓存；
+求值器只需要位置和设置来源，游戏及编辑器共用该实现。
+相机移动只更新权重并混合槽位，最后生成一份参数快照；多个 Volume 不会增加该 Pass 的渲染次数。
+为兼容直接修改公开字典，配置变更检测仍保留字典哈希；此实现没有将动态参数接口改为 C++ 结构。
 
 旧 Profile 的 `pass_parameters` 数据仍可加载；新界面使用 `FengVolumeModule`。
 旧 `enabled_passes` / `disabled_passes` 仅保留为兼容存储，不在新界面显示；运行时也要求当前 Pass

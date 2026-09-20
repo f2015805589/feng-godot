@@ -77,13 +77,28 @@ static func volume_aliases(entries: Array) -> Dictionary:
 	return result
 
 static func resolve(entries: Array, overrides: Dictionary) -> Dictionary:
+	return resolve_context(entries, overrides, {"base": authored(entries), "schema": volume_schema(entries)})
+
+static func parameter_bindings(entries: Array) -> Array:
+	var result: Array = []
+	for entry in sources(entries):
+		var aliases: Array = [entry.get_parameter_key()]
+		aliases.append_array(entry.provides_native_ids)
+		result.append({"key": entry.get_parameter_source().get_parameter_key(), "aliases": aliases})
+	return result
+
+## Reuse the renderer's revision-cached author schema on numeric Volume updates.
+## Alias expansion retains the same precedence as a full pipeline application.
+static func resolve_context(entries: Array, overrides: Dictionary, context: Dictionary) -> Dictionary:
+	if overrides.is_empty():
+		return context.get("base", {}).duplicate(true)
 	var expanded := overrides.duplicate(true)
 	# A script that implements a native slot has two consumers: the script reads
 	# its own key, while native feature setup (for example jitter) reads the slot.
-	for entry in sources(entries):
-		var key: Variant = entry.get_parameter_source().get_parameter_key()
-		var aliases: Array = [entry.get_parameter_key()]
-		aliases.append_array(entry.provides_native_ids)
+	var bindings: Array = context.bindings if context.has("bindings") else parameter_bindings(entries)
+	for binding in bindings:
+		var key: Variant = binding.key
+		var aliases: Array = binding.aliases
 		var merged: Dictionary = expanded.get(key, {}).duplicate()
 		for alias in aliases:
 			merged.merge(expanded.get(alias, {}), true)
@@ -91,7 +106,7 @@ static func resolve(entries: Array, overrides: Dictionary) -> Dictionary:
 			expanded[key] = merged
 			for alias in aliases:
 				expanded[alias] = merged.duplicate()
-	return with_overrides(authored(entries), expanded, volume_schema(entries))
+	return with_overrides(context.get("base", {}), expanded, context.get("schema", {}))
 
 static func warnings(entries: Array) -> PackedStringArray:
 	var result := PackedStringArray()

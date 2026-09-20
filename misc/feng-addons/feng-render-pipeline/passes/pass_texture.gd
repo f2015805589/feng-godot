@@ -45,11 +45,36 @@ static func required_native_pass(source: Source) -> int:
 			return NativeSpec.PASS_POST_PROCESS
 	return -1
 
-@export_range(0, 31) var binding: int = 0
-@export var source: Source = Source.COLOR
-@export var binding_type: BindingType = BindingType.SAMPLED_TEXTURE
-@export var custom_scope: StringName = &""
-@export var custom_name: StringName = &""
+@export_range(0, 31) var binding: int = 0:
+	set(value):
+		if binding == value:
+			return
+		binding = value
+		emit_changed()
+@export var source: Source = Source.COLOR:
+	set(value):
+		if source == value:
+			return
+		source = value
+		emit_changed()
+@export var binding_type: BindingType = BindingType.SAMPLED_TEXTURE:
+	set(value):
+		if binding_type == value:
+			return
+		binding_type = value
+		emit_changed()
+@export var custom_scope: StringName = &"":
+	set(value):
+		if custom_scope == value:
+			return
+		custom_scope = value
+		emit_changed()
+@export var custom_name: StringName = &"":
+	set(value):
+		if custom_name == value:
+			return
+		custom_name = value
+		emit_changed()
 
 func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 	if buffers == null:

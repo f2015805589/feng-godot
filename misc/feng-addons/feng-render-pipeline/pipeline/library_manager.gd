@@ -154,7 +154,16 @@ static func find_matching_library_pass(passes: Array, entry: Dictionary, templat
 	return null
 
 static func has_matching_library_pass(passes: Array, entry: Dictionary) -> bool:
-	return find_matching_library_pass(passes, entry, load_template(entry)) != null
+	return _find_synced_library_pass(passes, entry) != null
+
+## Current resources carry a stable ID. Loading a shader template just to find an
+## already identified entry repeats import/resource work during camera setup.
+## Legacy resources still use the original shader-path fallback.
+static func _find_synced_library_pass(passes: Array, entry: Dictionary):
+	var existing = find_matching_library_pass(passes, entry)
+	if existing != null:
+		return existing
+	return find_matching_library_pass(passes, entry, load_template(entry))
 
 ## Brings the pass list in step with the manifest.
 ##
@@ -180,7 +189,7 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 		if is_deleted(entry, deleted, deleted_ids) or not is_managed(entry, synced, synced_ids):
 			continue
 		if is_synced(entry, synced, synced_ids):
-			var synced_existing = find_matching_library_pass(passes, entry, load_template(entry))
+			var synced_existing = _find_synced_library_pass(passes, entry)
 			if synced_existing != null:
 				if synced_existing.stable_id != entry["id"]:
 					synced_existing.stable_id = entry["id"]
