@@ -192,7 +192,14 @@ Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_tra
 	// dividing by that inaccurate length no longer yields a unit axis. Treat an
 	// imperceptible turn as identity before entering the axis-angle constructor.
 	if (turn > 1e-6f) {
-		lead.basis = Basis(_vt.avt_motion_turn_lead / turn, turn) * p_camera_transform.basis;
+		// Normalize explicitly at the constructor boundary. The smoothed vector is
+		// repeatedly lerped and may contain enough accumulated error that division
+		// by the previously computed float length does not satisfy Basis' strict
+		// unit-axis check, especially while the editor keeps rendering for TAA.
+		const Vector3 turn_axis = _vt.avt_motion_turn_lead.normalized();
+		if (turn_axis.is_normalized()) {
+			lead.basis = Basis(turn_axis, turn) * p_camera_transform.basis;
+		}
 	}
 	return lead;
 }

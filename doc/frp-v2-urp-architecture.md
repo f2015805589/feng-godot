@@ -148,8 +148,8 @@ Lighting → Sky → Transparent → TAA → Post。
 
 ## 5. 数据契约
 
-* G-buffer：`normal_roughness`（10:10:10 直接法线 + roughness 在 `orm.g`）、`orm`
-  （occlusion/roughness/metallic）、`albedo`、`emission`（specular 在 `.a`）、`depth`、
+* G-buffer：`normal_roughness`（10:10:10 直接法线 + 动态标记）、`albedo`、`orm`
+  （occlusion/roughness/metallic、alpha 低 4 位为 ShadingModelID）、`emission`（specular 在 `.a`）、`depth`、
   `velocity`。运动矢量在 GBuffer pass 内产生（同一遍几何）。
 * 颜色 framebuffer 变体：`separate_specular` × `motion_vectors`，用
   `COLOR_PASS_FLAG_*` 表达，插件通过 `get_color_framebuffer()` 获取，不自己拼附件。
@@ -157,7 +157,7 @@ Lighting → Sky → Transparent → TAA → Post。
 
 ## 6. 迁移阶段与状态
 
-* **A1 已落地** 运动矢量并入 GBuffer：新的 G-buffer shader 变体（速度写在 location 5），
+* **A1 已落地** 运动矢量并入 GBuffer：新的 G-buffer shader 变体（速度写在 GBuffer location 4），
   `DEPTH_FB_GBUFFER_MOTION`，独立 Motion Vectors 几何 pass 删除。TAA/FSR2/debug-MVS 下不再有
   第二遍不透明几何。验证：`test_frp_pipeline.py --driver d3d12` 全绿，并由 `frp_taa.gd` 的
   **draw call 守卫**锁死（TAA 与运动矢量调试视图相对无 TAA 基线的新增 draw call ≤ 2，且计数器本身非零
@@ -173,7 +173,7 @@ Lighting → Sky → Transparent → TAA → Post。
   "条目关闭 ⇒ 帧与无 TAA 基线逐像素相同"、"条目打开且 `Viewport.use_taa` 关闭 ⇒ TAA 真正开启"。
 * **B 进行中** `FRPPassContext` 已落地：脚本可见的 Core 原语（shadow 预计算 / VT / GBuffer / 运动矢量 /
   延迟光照 / 次表面与高光合并 / 不透明 resolve / Sky / Sky resolve / 前向队列 / 屏幕与深度副本 /
-  半透明 / TAA 与上采样 / 最终 resolve / 历史 / tonemap / SSAO·SSIL·SSR·GI / Debug 几何 / `run_pass` /
+  半透明 / TAA 与上采样 / 最终 resolve / 历史 / tonemap / `run_pass` /
   `stage_compositor_effects`）全部转发到引擎内置 pass 调用的同一批 operation；条目执行时若资源实现了
   `_frp_execute(ctx)` 就走脚本路径（`FengPass` 默认转发回 CompositorEffect 回调，所以现有 pass 不受影响）。
   实测：脚本 pass 通过 Core 原语接管引擎条目时**与内置条目逐像素一致**——Sky 接管 0.4160 vs 内置
@@ -299,11 +299,10 @@ Lighting → Sky → Transparent → TAA → Post。
   rebase 触点表因此少了两行（那两个文件不需要再同步）。验证：scons 重建 + 9 个套件（含
   forward_plus 对照）全绿；`forward_clustered/` 与 `shaders/forward_clustered/` 仍逐字节一致。
 
-* **D8 已落地（VoxelGI 从 FRP 彻底删除 → G-buffer 少一个附件）**：FRP 的 G-buffer 原来照抄
-  `forward_clustered`，多带一个 voxel-GI 附件（`RB_TEX_VOXEL_GI`，每帧分配 + 每帧作为 framebuffer
-  第 5 个颜色附件 + 运动矢量因此排在 location 5）。现在整条链路删除：G-buffer framebuffer 只剩
-  4 个附件（normal_roughness / albedo / orm / emission），运动矢量 shader 输出从 location 5 回到
-  **location 4**（材质 pass 仍占 4，其运动矢量留在 5，两种组合不会同时编译）；`MODE_RENDER_VOXEL_GI`
+* **D8 已落地（VoxelGI 从 FRP 彻底删除）**：FRP 的旧 G-buffer 原来照抄
+  `forward_clustered`，多带一个 voxel-GI 附件。现在整条旧链路删除；当前 FRP G-buffer 仍为
+  4 个颜色附件，ShadingModelID 按 Unreal legacy 约定写入 ORM alpha 的低 4 位，运动矢量输出为
+  **location 4**。`MODE_RENDER_VOXEL_GI`
   不再出现在 GBUFFER 与 GBUFFER+MOTION 两个变体里；`ensure_voxelgi()` / `get_voxelgi*()` /
   `DEPTH_FB_ROUGHNESS_VOXELGI` / `PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI` / `_setup_voxelgis()` /
   `GeometryInstanceFRPClustered::voxel_gi_instances[]` / 每个实例的 probe 配对与

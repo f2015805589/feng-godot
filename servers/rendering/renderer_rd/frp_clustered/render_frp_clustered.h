@@ -113,7 +113,7 @@ public:
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
 			DEPTH_FB_GBUFFER,
-			// Same attachments as DEPTH_FB_GBUFFER plus the motion vector attachment,
+			// Same attachments as DEPTH_FB_GBUFFER plus the velocity attachment,
 			// used when the frame needs velocity (TAA, 3D upscaling, motion debug view).
 			DEPTH_FB_GBUFFER_MOTION
 		};

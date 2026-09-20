@@ -66,10 +66,12 @@ pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass →
 
 ## 3. 数据契约（插件读得到的东西）
 
-* G-buffer（scope `RB_SCOPE_FRP_CLUSTERED`）：`normal_roughness`（10:10:10 直接法线 + 2 bit 动态标记
+* G-buffer（scope `RB_SCOPE_FRP_CLUSTERED`）：`normal_roughness`（10:10:10 直接法线 + 动态标记
   在 alpha）、`albedo`、`orm`（**粗糙度在 `orm.g`**）、`emission`（specular 在 alpha）、
-  `velocity`（运动矢量，附件位置 4，即 shader 输出的 `layout(location = 4)`）。FRP 是唯一这样布局的
-  渲染器，但它不在共享代码里声明这件事：会解码粗糙度的共享代码只有 GI，而 FRP 不跑 GI。
+  `orm.a`（按 Unreal legacy GBufferB 约定，低 4 位保存 ShadingModelID，高 4 位预留 selective-output flags）。
+  当前 `orm` 仍是 RGBA8，ID 0=Unlit、1=DefaultLit，未知非零 ID 归一化到 DefaultLit；这是接入接口，
+  现阶段仅实现默认 BxDF。ID 是 G-buffer 像素语义，不能与 CPU render-list 的 sort material ID 混用。
+  普通 G-buffer 仍为 4 个颜色附件；开启运动矢量时 velocity 为 shader location 4。
 * 颜色 framebuffer 变体由 `separate_specular × motion_vectors` 决定，插件通过 Core 原语间接使用，
   不自己拼附件。
 * 运动矢量在 GBuffer pass 内产生（同一遍几何）；`frp_taa.gd` 的 draw call 守卫保证不会回退成两遍。

@@ -447,15 +447,6 @@ layout(set = 1, binding = 39) uniform texture2D gbuffer_emission_buffer;
 
 #endif
 
-vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {
-	float roughness = p_normal_roughness.w;
-	if (roughness > 0.5) {
-		roughness = 1.0 - roughness;
-	}
-	roughness /= (127.0 / 255.0);
-	return vec4(normalize(p_normal_roughness.xyz * 2.0 - 1.0) * 0.5 + 0.5, roughness);
-}
-
 // https://google.github.io/filament/Filament.html#toc5.3.4.7
 // Note: The roughness value is inverted
 vec3 prefiltered_dfg(float lod, float NoV) {

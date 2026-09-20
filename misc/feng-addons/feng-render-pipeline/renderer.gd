@@ -242,8 +242,11 @@ func _on_pass_changed() -> void:
 	# forwarded: Resource.changed bridges nested pass edits to a Compositor, and native
 	# enabled changes also need a new token list.
 	_connect_passes()
+	# Forward the nested edit so FengCompositor reapplies the schedule. Do not call
+	# notify_property_list_changed(): the renderer's property schema did not change,
+	# and rebuilding the Inspector collapses expanded pass resources (notably TAA)
+	# whenever one of their fields such as enabled is edited.
 	emit_changed()
-	notify_property_list_changed()
 
 func _ensure_pipeline_initialized(emit: bool) -> bool:
 	if _normalizing:

@@ -46,7 +46,13 @@ void main() {
 /* clang-format off */
 #include "../half_inc.glsl"
 #include "scene_frp_clustered_inc.glsl"
+
+// Keep clustered light lookup/shadows from the shared renderer include, but
+// route every resolved light through FRP's own ShadingModelID/BxDF dispatcher.
+void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light);
+#define FRP_LIGHT_COMPUTE frp_light_compute
 #include "../scene_forward_lights_inc.glsl"
+#include "frp_shading_models_inc.glsl"
 /* clang-format on */
 // GI is evaluated before lighting and sampled from ambient/reflection buffers.
 
@@ -95,6 +101,17 @@ layout(location = 0) out vec4 frag_color;
 layout(location = 1) out vec4 specular_color;
 #endif
 
+// Per-pixel BxDF state selected from ORM alpha. The shared clustered traversal
+// calls frp_light_compute() for directional, omni and spot lights.
+uint frp_active_shading_model_id;
+FRPBRDFData frp_active_brdf;
+
+void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light) {
+	FRPDirectLighting lighting = frp_integrate_bxdf(frp_active_shading_model_id, frp_active_brdf, vec3(N), vec3(V), vec3(L), float(A), vec3(light_color), float(attenuation), float(specular_amount));
+	diffuse_light += hvec3(lighting.diffuse + lighting.transmission);
+	specular_light += hvec3(lighting.specular);
+}
+
 void main() {
 	vec2 screen_uv = uv_interp.xy;
 
@@ -123,11 +140,8 @@ void main() {
 	vec4 normal_roughness = textureLod(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	// The normal is the only thing the lighting pass needs from this target.
-	// Roughness is deliberately NOT read from .w here: that channel carries the
-	// folded roughness-plus-dynamic-flag encoding that the GI compute shader
-	// still decodes, which costs ~1 bit. The unfolded 8-bit copy that the
-	// geometry pass already writes into orm.g is read below instead, matching
-	// the 8-bit roughness channel of Unreal's GBufferB.
+	// Roughness is deliberately read from orm.g; normal_roughness.a is reserved
+	// for the dynamic/static instance marker and is not a roughness channel.
 	vec3 normal = normalize(normal_roughness.xyz * 2.0 - 1.0);
 
 #ifdef USE_MULTIVIEW
@@ -146,7 +160,7 @@ void main() {
 	float ao = orm.r;
 	float roughness = orm.g;
 	float metallic = orm.b;
-	float sss_strength = orm.a;
+	float sss_strength = 0.0;
 
 #ifdef USE_MULTIVIEW
 	vec4 emission_alpha = textureLod(sampler2DArray(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
@@ -154,6 +168,9 @@ void main() {
 	vec4 emission_alpha = textureLod(sampler2D(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	vec3 emission = emission_alpha.rgb;
+	// GBufferB/ORM alpha is one packed byte: ShadingModelID in low 4 bits and
+	// selective-output flags in high 4 bits, matching Unreal's legacy contract.
+	uint shading_model_id = frp_normalize_shading_model(frp_decode_shading_model(orm.a));
 	// The G-buffer carries the material specular in the emission target's alpha
 	// (see the MODE_RENDER_GBUFFER branch in scene_frp_clustered.glsl). Feeding
 	// it to F0() replaces the hardcoded dielectric 0.5, matching Unreal's
@@ -169,9 +186,11 @@ void main() {
 	vec3 vertex_ddy = dFdy(vertex);
 
 	// Energy conservation.
-	vec3 f0 = F0(metallic, material_specular, albedo);
-	vec2 envBRDF = prefiltered_dfg(roughness, clamp(dot(normal, view), 0.0001, 1.0)).xy;
-	vec3 energy_compensation = get_energy_compensation(f0, envBRDF.y);
+	FRPBRDFData brdf = frp_make_brdf_data(albedo, alpha, ao, roughness, metallic, material_specular, sss_strength, emission, normal, view);
+	frp_active_shading_model_id = shading_model_id;
+	frp_active_brdf = brdf;
+	vec3 f0 = brdf.f0;
+	vec3 energy_compensation = brdf.energy_compensation;
 
 	vec3 direct_specular_light = vec3(0.0, 0.0, 0.0);
 	vec3 indirect_specular_light = vec3(0.0, 0.0, 0.0);
@@ -267,12 +286,13 @@ void main() {
 		ambient_light *= ao;
 		ambient_light *= albedo.rgb;
 
-		// Apply energy compensation and DFG to the indirect specular.
+		// Apply energy compensation and DFG to the indirect specular. The BxDF
+		// constructor computes the same DFG sample for energy compensation, but it
+		// intentionally stores only the derived BRDF data, so sample it here too.
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);
-		vec2 envBRDF2 = envBRDF;
-		vec3 energy_compensation2 = energy_compensation;
+		vec2 env_brdf = prefiltered_dfg(roughness, NdotV).xy;
 		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
-		indirect_specular_light *= energy_compensation2 * ((f90 - f0) * envBRDF2.x + f0 * envBRDF2.y);
+		indirect_specular_light *= energy_compensation * ((f90 - f0) * env_brdf.x + f0 * env_brdf.y);
 	}
 
 	// Direct lighting.
@@ -470,7 +490,7 @@ void main() {
 
 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
 
-			light_compute(normal, directional_lights.data[i].direction, view, size_A,
+			frp_light_compute(normal, directional_lights.data[i].direction, view, size_A,
 					directional_lights.data[i].color * directional_lights.data[i].energy,
 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
 					diffuse_light,
@@ -590,7 +610,7 @@ void main() {
 	diffuse_light *= 1.0 - metallic;
 	ambient_light *= 1.0 - metallic;
 
-	vec3 color = emission + ambient_light + diffuse_light + direct_specular_light + indirect_specular_light;
+	vec3 color = frp_compose_bxdf(shading_model_id, brdf, ambient_light, diffuse_light, direct_specular_light, indirect_specular_light);
 
 #ifdef MODE_SEPARATE_SPECULAR
 	frag_color = vec4(color - (direct_specular_light + indirect_specular_light), sss_strength);

@@ -259,6 +259,20 @@ public:
 		bool uses_particle_trails = false;
 		bool uses_normal_map = false;
 		bool uses_bent_normal_map = false;
+		// Source-level capabilities that change the deferred BRDF contract.  These
+		// are kept on compiled ShaderData so render-list routing has one owner.
+		bool uses_clearcoat = false;
+		bool uses_anisotropy = false;
+		bool uses_rim = false;
+		bool uses_backlight = false;
+		bool uses_ao_light_affect = false;
+		bool uses_custom_radiance = false;
+		bool uses_custom_irradiance = false;
+		bool uses_custom_fog = false;
+		bool uses_non_default_diffuse = false;
+		bool uses_non_default_specular = false;
+		bool uses_vertex_lighting = false;
+		bool uses_custom_light_code = false;
 		bool wireframe = false;
 
 		bool unshaded = false;

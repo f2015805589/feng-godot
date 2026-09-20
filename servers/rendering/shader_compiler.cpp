@@ -1647,6 +1647,9 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 
 	used_name_defines.clear();
 	used_rmode_defines.clear();
+	// light() is an entry point rather than a regular variable, so record it
+	// during shader generation instead of guessing from render modes.
+	r_gen_code.uses_custom_light = parser.get_shader()->functions.has("light");
 	used_flag_pointers.clear();
 	fragment_varyings.clear();
 

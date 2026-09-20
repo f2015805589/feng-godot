@@ -78,6 +78,18 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 	uses_position = false;
 	uses_sss = false;
 	uses_transmittance = false;
+	uses_clearcoat = false;
+	uses_anisotropy = false;
+	uses_rim = false;
+	uses_backlight = false;
+	uses_ao_light_affect = false;
+	uses_custom_radiance = false;
+	uses_custom_irradiance = false;
+	uses_custom_fog = false;
+	uses_non_default_diffuse = false;
+	uses_non_default_specular = false;
+	uses_vertex_lighting = false;
+	uses_custom_light_code = false;
 	uses_time = false;
 	writes_modelview_or_projection = false;
 	uses_world_coordinates = false;
@@ -131,6 +143,17 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 
 	actions.usage_flag_pointers["SSS_STRENGTH"] = &uses_sss;
 	actions.usage_flag_pointers["SSS_TRANSMITTANCE_DEPTH"] = &uses_transmittance;
+	actions.usage_flag_pointers["RIM"] = &uses_rim;
+	actions.usage_flag_pointers["CLEARCOAT"] = &uses_clearcoat;
+	actions.usage_flag_pointers["ANISOTROPY"] = &uses_anisotropy;
+	actions.usage_flag_pointers["BACKLIGHT"] = &uses_backlight;
+	actions.usage_flag_pointers["AO_LIGHT_AFFECT"] = &uses_ao_light_affect;
+	actions.usage_flag_pointers["RADIANCE"] = &uses_custom_radiance;
+	actions.usage_flag_pointers["IRRADIANCE"] = &uses_custom_irradiance;
+	actions.usage_flag_pointers["FOG"] = &uses_custom_fog;
+	// The light() body is a stage function; a dedicated usage flag is wired by
+	// the compiler when its generated LIGHT_CODE_USED define is present.
+	actions.usage_flag_pointers["LIGHT"] = &uses_custom_light_code;
 
 	actions.usage_flag_pointers["DISCARD"] = &uses_discard;
 	actions.usage_flag_pointers["TIME"] = &uses_time;
@@ -204,6 +227,7 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 	uses_normal_texture = gen_code.uses_normal_roughness_texture;
 	uses_vertex_time = gen_code.uses_vertex_time;
 	uses_fragment_time = gen_code.uses_fragment_time;
+	uses_custom_light_code = gen_code.uses_custom_light;
 	uses_normal |= uses_normal_map;
 	uses_normal |= uses_bent_normal_map;
 	uses_tangent |= uses_normal_map;
@@ -351,8 +375,9 @@ void SceneShaderFRPClustered::ShaderData::_create_pipeline(PipelineKey p_pipelin
 	blend_state_color_blend.attachments = { blend_attachment, RD::PipelineColorBlendState::Attachment(), RD::PipelineColorBlendState::Attachment() };
 	RD::PipelineColorBlendState blend_state_color_opaque = RD::PipelineColorBlendState::create_disabled(3);
 	RD::PipelineColorBlendState blend_state_depth_normal_roughness = RD::PipelineColorBlendState::create_disabled(1);
-	// The G-buffer writes four attachments (normal and roughness, albedo, orm,
-	// emission); with motion vectors enabled the velocity attachment is the fifth.
+	// The G-buffer writes four color attachments (normal, albedo, ORM and
+	// emission); with motion vectors enabled the velocity attachment is fifth.
+	// Depth is part of the framebuffer but is not a color blend attachment.
 	RD::PipelineColorBlendState blend_state_gbuffer = RD::PipelineColorBlendState::create_disabled(4);
 	RD::PipelineColorBlendState blend_state_gbuffer_motion = RD::PipelineColorBlendState::create_disabled(5);
 
@@ -473,11 +498,11 @@ void SceneShaderFRPClustered::ShaderData::_create_pipeline(PipelineKey p_pipelin
 				blend_state = RD::PipelineColorBlendState::create_disabled(5);
 				break;
 			case PIPELINE_VERSION_GBUFFER_PASS:
-				// Writes to all G-buffer attachments in opaque way.
+				// Writes normal, albedo, ORM (including packed ShadingModelID) and emission.
 				blend_state = blend_state_gbuffer;
 				break;
 			case PIPELINE_VERSION_GBUFFER_PASS_MOTION_VECTORS:
-				// G-buffer attachments plus the motion vector attachment.
+				// G-buffer color attachments plus motion vectors.
 				blend_state = blend_state_gbuffer_motion;
 				break;
 			case PIPELINE_VERSION_DEPTH_PASS:
@@ -783,6 +808,7 @@ void SceneShaderFRPClustered::init(const String p_defines) {
 		actions.renames["AO"] = "ao";
 		actions.renames["AO_LIGHT_AFFECT"] = "ao_light_affect";
 		actions.renames["EMISSION"] = "emission";
+		actions.renames["MATERIAL_ID"] = "material_id";
 		actions.renames["POINT_COORD"] = "point_coord";
 		actions.renames["INSTANCE_CUSTOM"] = "instance_custom";
 		actions.renames["SCREEN_UV"] = "screen_uv";
@@ -888,15 +914,15 @@ void SceneShaderFRPClustered::init(const String p_defines) {
 			actions.render_mode_defines["diffuse_burley"] = "#define DIFFUSE_BURLEY\n";
 		}
 
-		actions.render_mode_defines["diffuse_lambert_wrap"] = "#define DIFFUSE_LAMBERT_WRAP\n";
-		actions.render_mode_defines["diffuse_toon"] = "#define DIFFUSE_TOON\n";
+		actions.render_mode_defines["diffuse_lambert_wrap"] = "#define DIFFUSE_LAMBERT_WRAP\n#define FRP_NON_DEFAULT_DIFFUSE\n";
+		actions.render_mode_defines["diffuse_toon"] = "#define DIFFUSE_TOON\n#define FRP_NON_DEFAULT_DIFFUSE\n";
 
 		actions.render_mode_defines["sss_mode_skin"] = "#define SSS_MODE_SKIN\n";
 
 		actions.render_mode_defines["specular_schlick_ggx"] = "#define SPECULAR_SCHLICK_GGX\n";
 
-		actions.render_mode_defines["specular_toon"] = "#define SPECULAR_TOON\n";
-		actions.render_mode_defines["specular_disabled"] = "#define SPECULAR_DISABLED\n";
+		actions.render_mode_defines["specular_toon"] = "#define SPECULAR_TOON\n#define FRP_NON_DEFAULT_SPECULAR\n";
+		actions.render_mode_defines["specular_disabled"] = "#define SPECULAR_DISABLED\n#define FRP_NON_DEFAULT_SPECULAR\n";
 		actions.render_mode_defines["shadows_disabled"] = "#define SHADOWS_DISABLED\n";
 		actions.render_mode_defines["ambient_light_disabled"] = "#define AMBIENT_LIGHT_DISABLED\n";
 		actions.render_mode_defines["shadow_to_opacity"] = "#define USE_SHADOW_TO_OPACITY\n";
@@ -905,7 +931,7 @@ void SceneShaderFRPClustered::init(const String p_defines) {
 		bool force_vertex_shading = GLOBAL_GET("rendering/shading/overrides/force_vertex_shading");
 		if (!force_vertex_shading) {
 			// If forcing vertex shading, this will be defined already.
-			actions.render_mode_defines["vertex_lighting"] = "#define USE_VERTEX_LIGHTING\n";
+			actions.render_mode_defines["vertex_lighting"] = "#define USE_VERTEX_LIGHTING\n#define FRP_VERTEX_LIGHTING\n";
 		}
 
 		actions.render_mode_defines["debug_shadow_splits"] = "#define DEBUG_DRAW_PSSM_SPLITS\n";

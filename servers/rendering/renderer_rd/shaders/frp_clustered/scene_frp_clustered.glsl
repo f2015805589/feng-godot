@@ -1074,8 +1074,7 @@ layout(location = 0) out vec4 frag_color;
 
 #ifdef MOTION_VECTORS
 #if defined(MODE_RENDER_GBUFFER)
-// The four G-buffer attachments occupy locations 0..3, and FRP never renders voxel
-// GI, so the motion vector attachment directly follows them at location 4.
+// The four material attachments occupy locations 0..3; velocity follows at location 4.
 layout(location = 4) out vec2 motion_vector;
 #elif defined(MODE_RENDER_MATERIAL)
 // The material pass owns location 4 for depth, so motion vectors move up one slot.
@@ -1245,6 +1244,8 @@ void fragment_shader(in SceneData scene_data) {
 	float specular = 0.5;
 	vec3 emission = vec3(0.0);
 	float roughness_highp = 1.0;
+	uint material_id = 1u;
+
 	float rim = 0.0;
 	float rim_tint = 0.0;
 	float clearcoat = 0.0;
@@ -2819,16 +2820,19 @@ void fragment_shader(in SceneData scene_data) {
 	albedo_output_buffer.a = alpha;
 
 	// Unreal-style direct 10:10:10 normal: 30 bits instead of the 24-bit
-	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g
-	// (already written there and previously never read); the 2-bit alpha is only
-	// wide enough for the dynamic/static flag, which GI still needs.
+	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g;
+	// normal_roughness.a remains the dynamic/static marker.
 	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
 	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
 
 	orm_output_buffer.r = ao;
 	orm_output_buffer.g = roughness;
 	orm_output_buffer.b = metallic;
-	orm_output_buffer.a = sss_strength;
+	// Unreal legacy GBufferB packs ShadingModelID in the low nibble of alpha;
+	// the high nibble is reserved for future selective-output flags.
+	// Pack a full byte so the low nibble is ShadingModelID and the high nibble
+	// remains available for selective-output flags, as in Unreal's legacy GBufferB.
+	orm_output_buffer.a = float(material_id & 15u) / 255.0;
 
 	emission_output_buffer.rgb = emission;
 	// The alpha channel of the emission target is free (it was a constant 0 and
@@ -2851,6 +2855,7 @@ void fragment_shader(in SceneData scene_data) {
 	orm_output_buffer.r = ao;
 	orm_output_buffer.g = roughness;
 	orm_output_buffer.b = metallic;
+	// For material-only output, preserve the established SSS payload.
 	orm_output_buffer.a = sss_strength;
 
 	emission_output_buffer.rgb = emission;
@@ -2859,9 +2864,8 @@ void fragment_shader(in SceneData scene_data) {
 
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 	// Unreal-style direct 10:10:10 normal: 30 bits instead of the 24-bit
-	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g
-	// (already written there and previously never read); the 2-bit alpha is only
-	// wide enough for the dynamic/static flag, which GI still needs.
+	// best-fit normal, at the same 4 bytes per pixel. Roughness moved to orm.g;
+	// normal_roughness.a remains the dynamic/static marker.
 	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
 	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
 	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w;

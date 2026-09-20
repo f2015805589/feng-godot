@@ -90,6 +90,8 @@ public:
 		bool uses_screen_texture = false;
 		bool uses_depth_texture = false;
 		bool uses_normal_roughness_texture = false;
+		// True when the material provides a custom light() stage function.
+		bool uses_custom_light = false;
 	};
 
 	struct DefaultIdentifierActions {

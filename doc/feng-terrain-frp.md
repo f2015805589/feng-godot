@@ -81,7 +81,7 @@ Surface 材质使用 AVT 与 SVT 两级缓存。AVT 以 64 米 sector 动态分�
 运动矢量），所以这些记账步骤不再作为可独立开关的条目出现，但仍然照常执行。
 
 运动矢量由 **GBuffer Pass 在同一遍几何里写出**：该 Pass 的 framebuffer 带上速度附件，shader 使用
-带 `MOTION_VECTORS` 的 G-buffer 变体，速度写在 voxel-GI 槽之后的位置 5。TAA、3D 上采样与运动矢量
+带 `MOTION_VECTORS` 的 G-buffer 变体，速度写在 GBuffer 的 location 4（GBuffer 的第 5 个颜色输出，仅在需要运动矢量时附加）。TAA、3D 上采样与运动矢量
 调试视图因此不再需要第二遍不透明几何，GBuffer 仍是唯一遍历不透明几何的 pass。旧资源（schema < 5）
 里独立的 Motion Vectors 条目在加载迁移时折叠进 GBuffer。
 

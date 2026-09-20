@@ -262,8 +262,7 @@ RID RenderFRPClustered::RenderBufferDataFRPClustered::get_depth_fb(DepthFrameBuf
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer);
 		} break;
 		case DEPTH_FB_GBUFFER: {
-			// Attachment order has to match the shader's output locations: normal and
-			// roughness, albedo, orm, emission.
+			// Attachment order matches the shader: normal, albedo, ORM, emission.
 			ensure_normal_roughness_texture();
 			ensure_gbuffer();
 
@@ -271,12 +270,11 @@ RID RenderFRPClustered::RenderBufferDataFRPClustered::get_depth_fb(DepthFrameBuf
 			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ALBEDO_MSAA : RB_TEX_GBUFFER_ALBEDO);
 			RID orm_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_ORM_MSAA : RB_TEX_GBUFFER_ORM);
 			RID emission_buffer = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_GBUFFER_EMISSION_MSAA : RB_TEX_GBUFFER_EMISSION);
-
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, orm_buffer, emission_buffer);
 		} break;
 		case DEPTH_FB_GBUFFER_MOTION: {
-			// Attachment order has to match the shader's output locations: normal and
-			// roughness, albedo, orm, emission, then motion vectors.
+			// Attachment order matches shader outputs: normal, albedo, ORM, emission,
+			// then motion vectors.
 			ensure_normal_roughness_texture();
 			ensure_gbuffer();
 			render_buffers->ensure_velocity();
@@ -1222,6 +1220,18 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 							shader_data->writes_modelview_or_projection ||
 							shader_data->uses_z_clip_scale ||
 							shader_data->stencil_enabled ||
+							shader_data->uses_clearcoat ||
+							shader_data->uses_anisotropy ||
+							shader_data->uses_rim ||
+							shader_data->uses_backlight ||
+							shader_data->uses_ao_light_affect ||
+							shader_data->uses_custom_radiance ||
+							shader_data->uses_custom_irradiance ||
+							shader_data->uses_custom_fog ||
+							shader_data->uses_non_default_diffuse ||
+							shader_data->uses_non_default_specular ||
+							shader_data->uses_vertex_lighting ||
+							shader_data->uses_custom_light_code ||
 							uses_lightmap;
 
 					if (needs_forward_fallback) {

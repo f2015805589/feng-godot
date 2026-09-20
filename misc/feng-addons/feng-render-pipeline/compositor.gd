@@ -69,3 +69,13 @@ func get_volume_parameters() -> Dictionary:
 
 func get_volume_pass_states() -> Dictionary:
 	return _volume_pass_states.duplicate()
+
+
+func _validate_property(property: Dictionary) -> void:
+	if property.name == "compositor_effects":
+		# This array is derived from renderer.passes on every apply. Exposing it made
+		# the Compositor asset look like a second editable pipeline: reordering or
+		# toggling those generated effects is overwritten immediately and never
+		# changes the FRP schedule. Do not serialize the derived copies either; the
+		# renderer setter rebuilds them after load.
+		property.usage = PROPERTY_USAGE_NONE
