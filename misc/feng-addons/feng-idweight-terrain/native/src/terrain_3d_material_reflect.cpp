@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DMaterial, part 3 of 3: the property reflection and the ClassDB bindings.
+// Terrain3DMaterial, part 3 of 4: the property reflection and the ClassDB bindings.
 
-// One of three files that define the resource. `_get_property_list()` is what the inspector reads:
+// One of four files that define the resource. `_get_property_list()` is what the inspector reads:
 // it turns the active shader's uniform list into grouped properties, drops the private `_`-prefixed
 // ones, de-duplicates the displacement buffer's entries and rebuilds `_active_params`, which is the
 // set of names `_set`/`_get` will accept. The revert hooks and `_bind_methods()` are here for the

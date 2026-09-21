@@ -13,7 +13,7 @@
 // The visibility header comes first on purpose: it pulls in the Godot class headers, and in this
 // GDExtension version the `variant/` headers alone do not define `Rect2` or `Vector2` for a
 // translation unit that has not included a class header yet. This header is included first by
-// terrain_3d_vt_demand.cpp, so it cannot rely on someone else having done it.
+// terrain_3d_surface_views_far_walk.cpp, so it cannot rely on someone else having done it.
 #include "terrain_3d_vt_visibility.h"
 
 #include <godot_cpp/variant/rect2.hpp>

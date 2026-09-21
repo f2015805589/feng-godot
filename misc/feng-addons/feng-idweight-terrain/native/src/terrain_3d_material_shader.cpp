@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DMaterial's shader source pipeline.
+// Terrain3DMaterial, part 4 of 4: the shader source pipeline.
 //
-// One of four files that define Terrain3DMaterial: this one turns the shader inserts
+// One of four files that define the resource: this one turns the shader inserts
 // (auto_shader, backgrounds, editor_functions, debug views), the material's own snippets
 // and the editor/debug view selection into the final GLSL the material compiles, including
 // the comment stripper and the VT-sampler decision. The resource itself is the other three:

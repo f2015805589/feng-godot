@@ -1,12 +1,18 @@
-// Camera-visible SVT demand. Legacy raw-ID diagnostics retain their original scan.
+// The two surface views, part 3 of 4: the far field's visible walk and its demand pass.
+
+// One of four files that define the two views and their demand passes. This one is what
+// `update_surface_svt()` - the pass in terrain_3d_surface_views_far.cpp - delegates to while the
+// material pipeline is on: `_svt_plan_roots()` pins the coarse root pyramid the fallback resolves
+// through, `_svt_walk_visible_pages()` resolves the visible regions' footprints into pages nearest
+// first, and `_update_visible_svt()` spends the tick's page budget on them. The legacy raw-ID
+// diagnostic scan is the pass's other mode, and it stays with the pass.
 //
-// The three page helpers this file used to open with - the arrival flag, the fade pass and
-// the fade setting - now live in terrain_3d_vt_fade.cpp: they run on every tick and belong
-// to both views, while everything here is the far field. What stays is the root pyramid
-// plan, the visible walk, the demand pass that spends the page budget on them, and
-// `_vt_page_production_stale()` above them, which the near field's production pass and the
-// service call as well - a published page that has lost its content is the same question
-// for both views, so it is not the far field's helper.
+// The other halves: terrain_3d_surface_views.cpp (the views and the settings that size them),
+// terrain_3d_surface_views_far.cpp (the pass itself and the one distance -> level rule it walks)
+// and terrain_3d_surface_views_near.cpp (the near field's pass, its feedback pass and the sector
+// machinery). The one question both views ask of a resident page - has its content actually
+// arrived - is `_vt_page_production_stale()`, which is page plumbing and lives with it in
+// terrain_3d_vt_service_pages.cpp.
 #include "terrain_3d_svt.h"
 #include "terrain_3d.h"
 #include "terrain_3d_material.h"
@@ -20,46 +26,6 @@
 #include <map>
 #include <tuple>
 #include <functional>
-
-// How long a published far-field page may stay without content before demand produces it
-// again. Long enough that a bake, a cell copy and an asynchronous page read all complete
-// first, short enough that a production that was dropped, refused, or that failed leaves
-// the far field missing for a fraction of a second.
-static const uint64_t SVT_PAGE_RETRY_FRAMES = 30;
-
-// A page is only a hit when its content is actually there. The virtual texture's
-// indirection entry survives an invalidation - `_invalidate_vt_slot()` clears the material
-// slot, not the table - so a page whose production was dropped, refused for lack of a
-// source, or lost to a failed cell copy stays named by the table while the shader samples
-// an empty layer. `request_world_page_internal()` then reports it as a hit, so nothing ever
-// retried it: that is the far field that loads on one run and not on the next. Demand asks
-// the producer, and only a page with content or with a recent production in flight is a hit.
-bool Terrain3D::_vt_page_production_stale(int p_slot) {
-	return _vt_page_production_stale(p_slot, -1);
-}
-
-bool Terrain3D::_vt_page_production_stale(int p_slot, int p_ready) {
-	if (p_slot < 0) {
-		return true;
-	}
-	// A caller that has already asked the producer about a whole set passes that answer in,
-	// so a verification pass costs one lock instead of one per page. The retry window below
-	// is read from this side's records and needs no lock either way.
-	if (p_ready < 0) {
-		Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
-		p_ready = (producer && producer->is_page_ready(p_slot)) ? 1 : 0;
-	}
-	if (p_ready != 0) {
-		return false;
-	}
-	if (_vt.vt_page_records.has(p_slot)) {
-		const Dictionary record = _vt.vt_page_records[p_slot];
-		const uint64_t queued = uint64_t(int64_t(record.get("queued_frame", 0)));
-		const uint64_t now = Engine::get_singleton()->get_process_frames();
-		return now > queued + SVT_PAGE_RETRY_FRAMES;
-	}
-	return true;
-}
 
 // Pins the far field's root pyramid over `p_domain`.
 //
@@ -141,7 +107,7 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 	root_mix(uint64_t(uint32_t(root_levels)));
 	root_mix(uint64_t(uint32_t(protected_limit)));
 	root_mix(uint64_t(uint32_t(p_physical_page_count)));
-	root_mix(uint64_t(uint32_t(_vt.vt_pool_generation)));
+	root_mix(uint64_t(uint32_t(_vt.pool.generation)));
 	root_mix(uint64_t(_vt.vt_source_revision));
 
 	// A cached plan is only reusable while every root it pinned is still published and still
@@ -150,14 +116,14 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 	// entry published over an empty layer. Verifying that costs one read-only lookup per
 	// root, which is less than the allocator bookkeeping the walk below would spend on the
 	// same roots.
-	bool cached = _vt.svt_roots_settled && _vt.svt_root_key == root_key;
+	bool cached = _vt.svt_roots.matches(root_key);
 	if (cached) {
 		// The roots are resolved first and verified in one batch: this loop runs on every
 		// settled tick, and asking the producer about each root individually is a lock per
 		// root.
 		std::vector<int> &slots = _vt.svt_verify_slots;
 		slots.clear();
-		for (const Vector3i &root : _vt.svt_root_pages) {
+		for (const Vector3i &root : _vt.svt_roots.pages) {
 			int virtual_x = 0;
 			int virtual_y = 0;
 			_vt.surface_svt->world_page_to_virtual(root.x, root.y, root.z, virtual_x, virtual_y);
@@ -213,7 +179,7 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 		// A root outside the domain loses its pin, so a re-configured extent does not keep half
 		// the pool reserved for the rest of the session. Leaving the visible bounds is no longer
 		// a reason to unpin: that is what left the coarser level missing when it was needed.
-		for (const Vector3i &previous : _vt.svt_root_pages) {
+		for (const Vector3i &previous : _vt.svt_roots.pages) {
 			bool retained = false;
 			for (const Vector3i &next : next_roots) {
 				if (next == previous) { retained = true; break; }
@@ -228,7 +194,7 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 			const int slot = _vt.surface_svt->get_indirection_slot(virtual_x, virtual_y, previous.z);
 			if (slot != int(Terrain3DVirtualTexture::INVALID_SLOT)) { _vt.surface_svt->protect_page(slot, false); }
 		}
-		_vt.svt_root_pages = next_roots;
+		_vt.svt_roots.pages = next_roots;
 		stamp_root(1);
 
 		// A root the allocator could not hand out this pass has to be retried, so the plan
@@ -275,18 +241,18 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 		}
 		stamp_root(2);
 		// What the pinned set covers, which is what the fallback can answer with.
-		_vt.svt_root_coverage = Rect2();
-		_vt.svt_root_level_min = -1;
-		_vt.svt_root_level_max = -1;
+		_vt.svt_roots.coverage = Rect2();
+		_vt.svt_roots.level_min = -1;
+		_vt.svt_roots.level_max = -1;
 		for (const Vector3i &root : next_roots) {
 			const float span = _vt.surface_svt_page_world * float(1 << root.z);
 			const Rect2 footprint(Vector2(root.x, root.y) * _vt.surface_svt_page_world, Vector2(span, span));
-			_vt.svt_root_coverage = _vt.svt_root_coverage.size.x <= 0.f ? footprint : _vt.svt_root_coverage.merge(footprint);
-			_vt.svt_root_level_min = _vt.svt_root_level_min < 0 ? root.z : MIN(_vt.svt_root_level_min, root.z);
-			_vt.svt_root_level_max = MAX(_vt.svt_root_level_max, root.z);
+			_vt.svt_roots.coverage = _vt.svt_roots.coverage.size.x <= 0.f ? footprint : _vt.svt_roots.coverage.merge(footprint);
+			_vt.svt_roots.level_min = _vt.svt_roots.level_min < 0 ? root.z : MIN(_vt.svt_roots.level_min, root.z);
+			_vt.svt_roots.level_max = MAX(_vt.svt_roots.level_max, root.z);
 		}
-		_vt.svt_root_key = root_key;
-		_vt.svt_roots_settled = settled;
+		_vt.svt_roots.key = root_key;
+		_vt.svt_roots.settled = settled;
 		// `settled` means every address was allocated. Content readiness is verified by the
 		// cached pass above on the next tick; do not expose strict SVT before that verification.
 	}
@@ -442,14 +408,14 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// leftover budget, so counting it would make the capacity follow the budget that the
 	// capacity itself allows. No floor of one either - a request of zero pages must not ask for
 	// a minimum block of slots on every empty plan.
-	if (_ensure_vt_capacity(int(pages.size()) + (_vt.surface_vt_enabled ? int(_vt.avt_page_plan.size()) : 0))) { return 0; }
+	if (_ensure_vt_capacity(int(pages.size()) + (_vt.surface_vt_enabled ? int(_vt.avt_plan.pages.size()) : 0))) { return 0; }
 	stamp(ST_CAPACITY);
 
 	// The physical pool is shared with the near field, so the far field only claims what
 	// the near field is not holding.
 	const int physical_page_count = MAX(1, _vt.surface_svt->get_page_count());
 	_vt.vt_svt_visible_pages = int(pages.size());
-	const int near_reserve = _vt.surface_vt_enabled ? MIN(physical_page_count / 2, int(_vt.avt_page_plan.size())) : 0;
+	const int near_reserve = _vt.surface_vt_enabled ? MIN(physical_page_count / 2, int(_vt.avt_plan.pages.size())) : 0;
 	const int capacity = MAX(1, physical_page_count - near_reserve);
 
 	// Publish the level this frame uses. A saved maximum detail level is only ever raised,
@@ -466,8 +432,8 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	const int maximum_mip = MIN(used_mip, plan_limit);
 	if (maximum_mip != configured_mip) {
 		_vt.surface_svt->set_world_max_mip(maximum_mip);
-		for (const Vector2i &location : _data->get_region_locations()) { _vt.vt_svt_dirty_regions[location] = true; }
-		_vt.vt_svt_edit_time = 0;
+		for (const Vector2i &location : _data->get_region_locations()) { _vt.bake.dirty_regions[location] = true; }
+		_vt.bake.edit_time = 0;
 		if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 	}
 
@@ -482,7 +448,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	for (int i = 0; i < 4; ++i) { stage[ST_ROOTLIST + i] = root_stages[i]; }
 	stage_at = ST_ROOTCOV + 1;
 	mark = Time::get_singleton()->get_ticks_usec();
-	const int root_count = int(_vt.svt_root_pages.size());
+	const int root_count = int(_vt.svt_roots.pages.size());
 
 	// Over-subscription raises a shared coarseness floor instead of dropping the far end of
 	// the working set: a page finer than the floor is published at the floor, while a page
@@ -490,7 +456,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// footprint therefore still resolves through a page of some real level, and the floor is
 	// the smallest one that fits - a function of the visible set and the remaining capacity
 	// alone - so a settled view selects the same floor, levels and pages on every pass.
-	const int detail_capacity = MAX(1, capacity - int(_vt.svt_root_pages.size()));
+	const int detail_capacity = MAX(1, capacity - int(_vt.svt_roots.pages.size()));
 	std::vector<Terrain3DSVTPage> chosen;
 	_vt.svt_floor_level = 0;
 	if (int(pages.size()) <= detail_capacity) {
@@ -595,4 +561,37 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		stats["detail_ms"] = stage[ST_DETAIL];
 	}
 	return produced;
+}
+
+// The far field's half of `get_vt_settings()`: the level rule's density and world window, the root
+// pyramid the last walk pinned, and the counters that say a baked far field costs nothing per
+// frame. It is written here rather than in the report file because every key below reads a field
+// this family owns.
+void Terrain3D::_report_svt(Dictionary &r_result) const {
+	Dictionary &result = r_result;
+	result["svt_texels_per_meter"] = get_surface_svt_texels_per_meter();
+	result["svt_world_extent"] = (_vt.surface_svt ? _vt.surface_svt->get_indirection_size() : MAX(64, _vt.surface_svt_page_count * 4)) * _vt.surface_svt_page_world;
+	result["svt_effective_max_mip"] = _vt.surface_svt ? _vt.surface_svt->get_world_max_mip() : _vt.surface_svt_max_mip;
+	result["svt_feedback"] = _vt.svt_feedback;
+	// Far-field residency diagnostics: the root pyramid the last pass pinned, and the
+	// coarseness floor it raised its detail pages to (0 when the set fit).
+	result["svt_root_pages"] = int(_vt.svt_roots.pages.size());
+	// What the pinned set covers and which levels it used. The fallback can only answer
+	// inside this rect, so it is the property a test checks.
+	result["svt_root_coverage"] = _vt.svt_roots.coverage;
+	result["svt_root_level_min"] = _vt.svt_roots.level_min;
+	result["svt_root_level_max"] = _vt.svt_roots.level_max;
+	// Pages demand produced again because the table named them and the producer had no
+	// content. A settled view must stop growing this.
+	result["svt_requeues"] = int64_t(_vt.svt_requeues);
+	// Root walks that ran and passes that reused the plan. A baked far field settles after
+	// one walk, so the skip count is what proves the fallback costs nothing per frame.
+	result["svt_root_passes"] = int64_t(_vt.svt_root_passes);
+	result["svt_root_skips"] = int64_t(_vt.svt_root_skips);
+	result["svt_floor_level"] = _vt.svt_floor_level;
+	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
+	result["svt_stats"] = _vt.svt_stats;
+	result["svt_worst_ms"] = _vt.svt_worst_ms;
+	result["svt_worst_frames_ago"] = double(Engine::get_singleton()->get_process_frames() - _vt.svt_worst_frame);
+	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
 }

@@ -244,11 +244,18 @@ private:
 	// Whether a published page still has no content: true when the producer does
 	// not hold it ready and no production for it is in flight. Demand re-produces such a page
 	// instead of treating its indirection entry as a hit. Both views and the service ask this,
-	// so it is declared here and defined in the far field's demand file.
+	// so it is declared here and defined with the page plumbing it reads.
 	bool _vt_page_production_stale(int p_slot);
 	// The same question with the producer's answer already known (-1 asks it here), so a
 	// verification pass over a whole resident set takes one lock instead of one per page.
 	bool _vt_page_production_stale(int p_slot, int p_ready);
+	// `get_vt_settings()` is one flat dictionary assembled by owner: each view and the fade write
+	// the keys their own fields back, from the file that owns those fields, and
+	// `_report_vt_service()` adds the service's half.
+	void _report_vt_service(Dictionary &r_result) const;
+	void _report_avt(Dictionary &r_result) const;
+	void _report_svt(Dictionary &r_result) const;
+	void _report_vt_fade(Dictionary &r_result) const;
 	// The persisted far-field cell file for one address. A cell file carries its whole mip
 	// chain, so there is no per-mip path: mip 0 names the cell. This took a mip parameter it
 	// hard-coded to 0, which is a trap for the next caller rather than information.
@@ -356,7 +363,7 @@ public:
 	int get_vt_page_size() const { return _vt.vt_page_size; }
 	void set_vt_page_border(int p_border);
 	int get_vt_page_border() const { return _vt.vt_page_border; }
-	void set_vt_auto_capacity(bool p_enabled) { _vt.vt_auto_capacity = p_enabled; invalidate_avt_plan_key(_vt.avt_plan_key); }
+	void set_vt_auto_capacity(bool p_enabled) { _vt.vt_auto_capacity = p_enabled; invalidate_avt_plan_key(_vt.avt_plan.key); }
 	bool get_vt_auto_capacity() const { return _vt.vt_auto_capacity; }
 	void set_vt_page_count(int p_count);
 	int get_vt_page_count() const { return _vt.vt_page_count; }
@@ -473,7 +480,7 @@ public:
 	// physical slot, which is what lets the shader index it by the slot the indirection
 	// lookup already decoded. The pass that fills it, and the arrival decision it makes, are
 	// in terrain_3d_vt_fade.cpp.
-	RID get_vt_page_fade_rid() const { return _vt.vt_page_fade_texture.is_valid() ? _vt.vt_page_fade_texture->get_rid() : RID(); }
+	RID get_vt_page_fade_rid() const { return _vt.fade.texture.is_valid() ? _vt.fade.texture->get_rid() : RID(); }
 	int get_vt_page_fade_frames() const { return _vt.vt_page_fade_frames; }
 	void set_vt_page_fade_frames(int p_frames);
 	// Records that a slot's content is missing or still being produced, so the tick it stops

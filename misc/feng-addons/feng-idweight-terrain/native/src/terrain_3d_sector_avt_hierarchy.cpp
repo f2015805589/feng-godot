@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3D's near field, part 3 of 3: the sector scan, the hierarchy and the address directory.
+// Terrain3D's near field, part 3 of 5: the sector scan, the hierarchy and the address directory.
 
-// One of three files that own the near field's planning. `_avt_scan_sectors()` walks the visible
+// One of five files that own the near field. `_avt_scan_sectors()` walks the visible
 // view and produces the working set, `_avt_build_hierarchy()` folds it into a coarse hierarchy
 // with its owners, `_avt_sync_address_directory()` registers, resizes and releases the blocks the
 // directory points at, and `_publish_avt_directory()` / `_avt_publish_directory()` write the
@@ -10,8 +10,10 @@
 // model of the near field, and the selection that runs beside it is
 // `terrain_3d_avt_plan.cpp`.
 //
-// The other two: `terrain_3d_sector_avt.cpp` (the entry point and its configuration) and
-// `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key).
+// The other four: `terrain_3d_sector_avt.cpp` (the entry point and its configuration),
+// `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key), `terrain_3d_avt_plan.cpp` (the
+// plan worker this file's model is handed to) and `terrain_3d_avt_produce.cpp` (the production
+// pass that spends the tick's budget on the installed plan).
 
 #include "terrain_3d_sector_avt_internal.h"
 
@@ -142,7 +144,7 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 	// addresses remain stable during local refinement; residency is determined
 	// below by the actual visible mip range, not by reserving every ancestor.
 	const int pool_size = _vt.surface_vt->get_page_count();
-	const bool offline_bake = !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty();
+	const bool offline_bake = _vt.bake.busy();
 	// How much of the pool the near field's plan may name. `reserved` is what the plan may not
 	// reach: at least what the far field needs, and at least a quarter of the pool.
 	//
@@ -160,9 +162,9 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 	// far field already owns 320 roots plus its detail pages. Use the last published
 	// far set as the near budget's floor; the demand passes run near first, so an empty
 	// initial far set needs a conservative half-pool hold until that set is known.
-	const int svt_root_pages = CLAMP(int(_vt.svt_root_pages.size()), 0, pool_size);
+	const int svt_root_pages = CLAMP(int(_vt.svt_roots.pages.size()), 0, pool_size);
 	const int svt_detail_pages = CLAMP(_vt.vt_svt_visible_pages, 0, pool_size);
-	const int svt_reserved = svt_root_pages > 0 || _vt.svt_roots_settled
+	const int svt_reserved = svt_root_pages > 0 || _vt.svt_roots.settled
 			? MIN(pool_size, svt_root_pages + svt_detail_pages)
 			: pool_size / 2;
 	const int reserved = offline_bake ? pool_size / 2

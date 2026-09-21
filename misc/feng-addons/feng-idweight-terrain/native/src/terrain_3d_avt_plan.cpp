@@ -1,11 +1,17 @@
-// The near field's plan worker: the page selection the demand pass hands to a task.
-//
-// Everything this file is allowed to read arrives in `TerrainAVT::PlanInput` - the camera, the
+// Terrain3D's near field, part 4 of 5: the plan worker.
+
+// One of five files that own the near field. This is the page selection the demand pass hands to
+// a task: everything it is allowed to read arrives in `TerrainAVT::PlanInput` - the camera, the
 // source snapshot and the working set - so it runs against a world that cannot change under it
 // while the main thread installs, retains and produces. The demand pass that builds that input,
 // the plan key that decides when a new one is submitted, and the address directory the selection
 // resolves against are in terrain_3d_sector_avt.cpp; the input itself is declared in
 // terrain_3d_avt_plan.h.
+//
+// The other four: `terrain_3d_sector_avt.cpp` (the driver and its configuration),
+// `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key), `terrain_3d_sector_avt_hierarchy.cpp`
+// (the scan, the hierarchy and the address directory) and `terrain_3d_avt_produce.cpp` (the
+// production pass that consumes the plan this file returns).
 #include "terrain_3d.h"
 #include "terrain_3d_avt_plan.h"
 #include "terrain_3d_surface_baker.h"

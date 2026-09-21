@@ -8,6 +8,12 @@
 // the compression probe a codec test uses as its reference. Read-only: nothing here changes the
 // service.
 //
+// `get_vt_settings()` is one flat dictionary - every consumer reads a key by name, so the shape is
+// a compatibility surface and stays flat - but it is assembled by owner rather than written out
+// here: each view and the fade report the keys their own fields back, from the file that owns those
+// fields, and `_report_vt_service()` below adds the service's. A key added for a view therefore
+// belongs in that view's file, next to the field it reads.
+//
 // The other halves: terrain_3d_vt_service.cpp (settings and lifetime),
 // terrain_3d_vt_service_pages.cpp (page plumbing and the cell store) and
 // terrain_3d_vt_service_bake.cpp (the far field's bake and its cell files).
@@ -45,15 +51,31 @@ Dictionary Terrain3D::get_vt_material_textures() const {
 	// hand back arrays from two generations, which the material then binds as one set.
 	return baker(_vt.vt_baker)->get_published_arrays();
 }
+
+// The telemetry, in the order a reader asks about it: the shared service, the near field, the far
+// field, then the page-arrival fade. Four owners rather than one 180 line function, so a key is
+// written beside the field it reads and the next subsystem's keys do not have to be threaded
+// through this file.
 Dictionary Terrain3D::get_vt_settings() const {
 	Dictionary result;
+	_report_vt_service(result);
+	_report_avt(result);
+	_report_svt(result);
+	_report_vt_fade(result);
+	return result;
+}
+
+// The service's own half: the pool and the page footprint, both views' storage cost, the producer
+// handles, the tick's cost and its phases, and the far field's bake bookkeeping.
+void Terrain3D::_report_vt_service(Dictionary &r_result) const {
+	Dictionary &result = r_result;
 	result["page_size"] = _vt.vt_page_size;
 	result["border"] = _vt.vt_page_border;
 	result["page_count"] = _vt.vt_page_count;
-	result["effective_page_count"] = _vt.vt_effective_page_count;
+	result["effective_page_count"] = _vt.pool.capacity;
 	// How many times the service built a page pool. Building one releases every resident
 	// page, because the atlas cannot be resized in place.
-	result["pool_generation"] = _vt.vt_pool_generation;
+	result["pool_generation"] = _vt.pool.generation;
 	result["auto_capacity"] = _vt.vt_auto_capacity;
 	// Material page arrays, in bytes. The uncompressed figure is the formula over the slot
 	// count (three RGBA16F outputs plus the R16/R32F bake sources, 32 bytes per stored texel)
@@ -81,79 +103,16 @@ Dictionary Terrain3D::get_vt_settings() const {
 	result["surface_vt_compression_ready_slots"] = int64_t(producer_stats.get("avt_ready_slots", 0));
 	result["surface_svt_compression_ready_slots"] = int64_t(producer_stats.get("svt_ready_slots", 0));
 	result["pages_per_update"] = _vt.vt_pages_per_update;
-	// Page production and look-ahead: how many source threads assemble pages, what the
-	// last plan was aimed at, and the two readings that tell a page still inside its
-	// production window from one the image being rendered is missing.
+	// Page production and look-ahead: how many source threads assemble pages, and what the
+	// last plan was aimed at. Both views' own readings are in their own reports.
 	result["page_workers"] = _vt.vt_page_workers > 0
 			? _vt.vt_page_workers
 			: (_vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count() : Terrain3DPagePipeline::default_worker_count());
-	result["motion_lead_ms"] = _vt.vt_motion_lead_ms;
-	result["motion_lead_m"] = _vt.avt_motion_lead.length();
-	result["motion_speed"] = _vt.avt_motion_velocity.length();
-	result["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
-	result["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
-	result["visible_late_pages"] = _vt.avt_late_pages;
-	result["visible_late_worst_ms"] = double(_vt.avt_late_worst_us) / 1000.0;
-	result["visible_retained_pages"] = _vt.avt_retained_pages;
 	result["shared_pool"] = _vt.vt_shared_ready;
-	result["adaptive"] = _vt.vt_adaptive_enabled;
-	result["avt_feedback"] = _vt.avt_feedback;
-	result["svt_feedback"] = _vt.svt_feedback;
-	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
-	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
-	result["avt_distance"] = _vt.surface_vt_distance;
-	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
-	result["svt_texels_per_meter"] = get_surface_svt_texels_per_meter();
-	result["svt_world_extent"] = (_vt.surface_svt ? _vt.surface_svt->get_indirection_size() : MAX(64, _vt.surface_svt_page_count * 4)) * _vt.surface_svt_page_world;
-	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
-	result["avt_base_block_size"] = get_avt_base_block_size();
-	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
-	result["avt_sector_stats"] = _vt.avt_sector_stats;
-	result["avt_peak_stats"] = _vt.avt_peak_stats;
-	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0
-			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_peak_stamp_us) / 1000.0;
-	result["svt_effective_max_mip"] = _vt.surface_svt ? _vt.surface_svt->get_world_max_mip() : _vt.surface_svt_max_mip;
-	// Far-field residency diagnostics: the root pyramid the last pass pinned, and the
-	// coarseness floor it raised its detail pages to (0 when the set fit).
-	result["svt_root_pages"] = int(_vt.svt_root_pages.size());
-	// What the pinned set covers and which levels it used. The fallback can only answer
-	// inside this rect, so it is the property a test checks.
-	result["svt_root_coverage"] = _vt.svt_root_coverage;
-	result["svt_root_level_min"] = _vt.svt_root_level_min;
-	result["svt_root_level_max"] = _vt.svt_root_level_max;
-	// Pages demand produced again because the table named them and the producer had no
-	// content. A settled view must stop growing this.
-	result["svt_requeues"] = int64_t(_vt.svt_requeues);
-	// Root walks that ran and passes that reused the plan. A baked far field settles after
-	// one walk, so the skip count is what proves the fallback costs nothing per frame.
-	result["svt_root_passes"] = int64_t(_vt.svt_root_passes);
-	result["svt_root_skips"] = int64_t(_vt.svt_root_skips);
-	result["svt_floor_level"] = _vt.svt_floor_level;
-	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
-	result["svt_stats"] = _vt.svt_stats;
-	result["svt_worst_ms"] = _vt.svt_worst_ms;
-	result["svt_worst_frames_ago"] = double(Engine::get_singleton()->get_process_frames() - _vt.svt_worst_frame);
-	// Main-thread cost of the VT section of the last physics tick, its worst frame so
-	// far, and the far-field demand pass inside it.
+	// Main-thread cost of the VT section of the last physics tick, its worst frame so far, and
+	// the phases inside it. `svt_cpu_ms` is the far-field pass and is reported by the far field.
 	result["vt_cpu_ms"] = _vt.vt_cpu_ms;
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
-	result["svt_cpu_ms"] = _vt.svt_cpu_ms;
-	// The page-arrival fade, in the order a reader asks about it: the requested ramp length, the
-	// ramps the last tick advanced, the arrivals still waiting for content, the ones armed and
-	// waiting their turn, the ramps started, the most one tick has started - which is what says
-	// whether a burst is being spread or is still arriving as one step - and the longest ramp still
-	// running.
-	result["vt_page_fade_frames"] = _vt.vt_page_fade_frames;
-	result["vt_page_fade_active_slots"] = _vt.vt_page_fade_active;
-	result["vt_page_fade_pending_slots"] = _vt.vt_page_fade_pending;
-	result["vt_page_fade_held_slots"] = _vt.vt_page_fade_held;
-	result["vt_page_fade_starts"] = int64_t(_vt.vt_page_fade_starts);
-	result["vt_page_fade_starts_peak"] = _vt.vt_page_fade_starts_peak;
-	result["vt_page_fade_ticks_max"] = _vt.vt_page_fade_ticks_max;
-	// The FIFO has one node per physical slot. Its live length describes the armed arrivals, while
-	// capacity proves that historical arrivals do not leave a consumed prefix behind.
-	result["vt_page_fade_queue_size"] = int64_t(_vt.vt_page_fade_queue.size());
-	result["vt_page_fade_queue_capacity"] = int64_t(_vt.vt_page_fade_queue.capacity());
 	Dictionary phases;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
@@ -198,34 +157,29 @@ Dictionary Terrain3D::get_vt_settings() const {
 		result["avt_storage"] = avt_compression;
 		result["svt_storage"] = svt_compression;
 	}
-	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
 	result["editor_preview"] = _vt.vt_editor_preview;
 	result["editor_preview_active"] = is_vt_editor_preview_active();
-	result["avt_region_grid"] = _vt.surface_vt_region_grid;
-	result["avt_region_offset"] = _vt.surface_vt_region_offset;
-	result["avt_forward_regions"] = _vt.surface_vt_forward_regions;
-	result["avt_region_rect"] = get_surface_vt_region_rect();
 	result["callback_registered"] = _vt.vt_callback_registered;
 	result["material_signature"] = int64_t(_vt.vt_material_signature);
 	result["auto_bake"] = _vt.svt_auto_bake;
-	result["auto_pending_regions"] = _vt.vt_svt_dirty_regions.size();
-	result["bake_generation"] = int64_t(_vt.vt_svt_bake_generation);
-	result["bake_incremental"] = _vt.vt_svt_bake_incremental;
-	result["bake_total"] = _vt.vt_svt_bake_total;
-	result["cells_baked"] = int64_t(_vt.svt_cells_baked);
-	result["bake_done"] = _vt.vt_svt_bake_done;
+	result["auto_pending_regions"] = _vt.bake.dirty_regions.size();
+	result["bake_generation"] = int64_t(_vt.bake.generation);
+	result["bake_incremental"] = _vt.bake.incremental;
+	result["bake_total"] = _vt.bake.total;
+	result["cells_baked"] = int64_t(_vt.bake.cells_baked);
+	result["bake_done"] = _vt.bake.done;
 	result["svt_source_pending"] = int64_t(_vt.svt_pending_pages.size());
-	result["bake_pending"] = _vt.vt_svt_bake_queue.size() + _vt.vt_svt_bake_waiting.size();
-	result["bake_failed"] = _vt.vt_svt_bake_failed;
-	result["bake_error"] = _vt.vt_svt_bake_error;
+	result["bake_pending"] = _vt.bake.pending();
+	result["bake_failed"] = _vt.bake.failed;
+	result["bake_error"] = _vt.bake.error;
 	if (_vt.vt_baker.is_valid()) {
 		result["producer"] = producer_stats;
 	}
 	if (_vt.surface_vt) {
 		result["residency"] = _vt.surface_vt->get_stats();
 	}
-	return result;
 }
+
 Array Terrain3D::get_vt_pages() const {
 	Array result;
 	for (const Variant &key : _vt.vt_page_records.keys()) {

@@ -63,11 +63,6 @@ void Terrain3D::set_vt_page_border(int p_border) {
 	_vt.vt_page_border = p_border;
 	_reset_vt_configuration();
 }
-// How long the demand pass may skip production while the producer rebuilds its arrays for a
-// larger capacity. Long enough for the producer's render pass and the pool's own growth (two
-// or three frames), short enough that a device which cannot grow the arrays loses only a
-// fraction of one page budget.
-static const uint64_t MAX_CAPACITY_WAIT_FRAMES = 8;
 
 bool Terrain3D::_ensure_vt_capacity(int p_required) {
 	Terrain3DSurfaceBaker *producer = _vt.vt_baker.is_valid() ? baker(_vt.vt_baker) : nullptr;
@@ -77,8 +72,8 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 			// Publish higher slot IDs only after the GPU cache was copied. Keep
 			// addresses, owners and source jobs, including an already completed plan.
 			if (!_vt.surface_vt->grow_capacity(ready_capacity) || !_vt.surface_svt->grow_capacity(ready_capacity)) { return false; }
-			_vt.vt_page_count = _vt.vt_effective_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
-			_vt.vt_capacity_wait_start = UINT64_MAX;
+			_vt.vt_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
+			_vt.pool.grow(ready_capacity);
 			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 			notify_property_list_changed();
 			return true;
@@ -86,7 +81,7 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 	}
 	const int transition_capacity = p_required + MAX(8, p_required / 2);
 	if (!_vt.vt_auto_capacity || transition_capacity <= _vt.vt_page_count || _vt.vt_page_count >= 1024 ||
-		!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) { return false; }
+		_vt.bake.busy()) { return false; }
 	int capacity = 8;
 	// Leave room for old/new view overlap; capacity never oscillates or shrinks.
 	while (capacity < transition_capacity && capacity < 1024) { capacity *= 2; }
@@ -97,15 +92,9 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 		// that growth. The wait is bounded, so a state that cannot grow the arrays - no
 		// material arrays to build, a failed allocation - never stops page production.
 		const uint64_t frame = Engine::get_singleton()->get_process_frames();
-		if (producer->has_pending_capacity()) {
-			if (_vt.vt_capacity_wait_start == UINT64_MAX) {
-				_vt.vt_capacity_wait_start = frame;
-			}
-			if (frame < _vt.vt_capacity_wait_start + MAX_CAPACITY_WAIT_FRAMES) {
-				return true;
-			}
+		if (_vt.pool.waiting_for_capacity(frame, producer->has_pending_capacity())) {
+			return true;
 		}
-		_vt.vt_capacity_wait_start = UINT64_MAX;
 		return false;
 	}
 	set_vt_page_count(capacity);
@@ -120,7 +109,7 @@ void Terrain3D::set_vt_page_count(int p_count) {
 	}
 	_vt.vt_page_count = p_count;
 	// An explicit capacity is a request, not a floor: it replaces the auto-grown value.
-	_vt.vt_effective_page_count = p_count;
+	_vt.pool.request(p_count);
 	_reset_vt_configuration();
 }
 void Terrain3D::set_vt_pages_per_update(int p_pages) {
@@ -138,7 +127,7 @@ void Terrain3D::set_vt_page_workers(int p_workers) {
 	_vt.vt_page_pipeline.reset();
 	_vt.svt_page_pipeline.reset();
 	_vt.svt_pending_pages.clear();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 	_vt.avt_refinement.reset();
 }
 void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
@@ -153,7 +142,7 @@ void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
 		_vt.avt_motion_turn_lead = Vector3();
 	}
 	// A lead is part of the plan key, so a change has to be planned again.
-	invalidate_avt_plan_key(_vt.avt_plan_key);
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 }
 
 // Both tiers store the same shared pool, so both settings take the same path: the producer
@@ -322,7 +311,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.svt_startup_ready = false;
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// Detach both views before replacing their common pool. Clearing one view must
@@ -334,7 +323,7 @@ void Terrain3D::_configure_vt_service() {
 	// keeps the capacity that is already published: auto capacity only ever grows, and
 	// starting again from the setting would make the demand pass re-grow the pool - which
 	// releases every page it had just rebuilt - for no reason.
-	const int capacity = CLAMP(MAX(_vt.vt_page_count, _vt.vt_effective_page_count), 8, 1024);
+	const int capacity = CLAMP(MAX(_vt.vt_page_count, _vt.pool.capacity), 8, 1024);
 	_vt.vt_page_count = capacity;
 	_vt.surface_vt_page_size = _vt.surface_svt_page_size = _vt.vt_page_size;
 	_vt.surface_vt_page_border = _vt.surface_svt_page_border = _vt.vt_page_border;
@@ -353,10 +342,9 @@ void Terrain3D::_configure_vt_service() {
 	_vt.svt_pending_pages.clear();
 	_vt.vt_registered_sectors.clear();
 	_vt.avt_directory_bytes.clear();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
-	_vt.avt_page_plan.clear();
+	// The addresses every page of the standing plan resolved to no longer exist.
+	_vt.avt_plan.forget();
 	_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);
-	_vt.avt_prefetch_plan.clear();
 	_vt.avt_registered_owners.clear();
 	_vt.avt_allocated_sizes.clear();
 	_vt.avt_cached_addresses.clear();
@@ -372,7 +360,7 @@ void Terrain3D::_configure_vt_service() {
 	baker(_vt.vt_baker)->set_tier_compression(Terrain3DSurfaceBaker::TIER_SVT, _vt.surface_svt_compression);
 	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, capacity);
 	_configure_svt_cell_store();
-	_vt.vt_bound_albedo = RID();
+	_vt.bound.clear();
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 	}
@@ -380,7 +368,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.vt_shared_ready = true;
 	// A new pool has no resident page: everything has to be produced again. Callers that
 	// only change how a page is stored must not reach this point.
-	_vt.vt_pool_generation++;
+	_vt.pool.rebuilt();
 }
 
 bool Terrain3D::_vt_has_pending_upload() const {
@@ -406,10 +394,10 @@ bool Terrain3D::_vt_has_streaming_work() const {
 			return true;
 		}
 	}
-	if (!_vt.avt_page_plan.empty() && (_vt.avt_missing_pages > 0 || _vt.avt_pending_pages > 0)) {
+	if (!_vt.avt_plan.pages.empty() && (_vt.avt_missing_pages > 0 || _vt.avt_pending_pages > 0)) {
 		return true;
 	}
-	if (!_vt.svt_pending_pages.empty() || !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) {
+	if (!_vt.svt_pending_pages.empty() || _vt.bake.busy()) {
 		return true;
 	}
 	if (_vt.vt_page_pipeline) {
@@ -493,9 +481,8 @@ void Terrain3D::_update_vt_service() {
 	// material keeps sampling arrays the retire below has already released.
 	const uint64_t published_generation = producer->get_published_generation();
 	RID albedo = producer->get_albedo_rid();
-	if (published_generation != _vt.vt_bound_generation || albedo != _vt.vt_bound_albedo) {
-		_vt.vt_bound_generation = published_generation;
-		_vt.vt_bound_albedo = albedo;
+	if (!_vt.bound.matches(published_generation, albedo)) {
+		_vt.bound.adopt(published_generation, albedo);
 		if (_material.is_valid()) {
 			_material->update(Terrain3DMaterial::REGION_ARRAYS);
 		}
@@ -505,11 +492,10 @@ void Terrain3D::_update_vt_service() {
 	}
 
 	_process_async_svt_pages();
-	// The explicit job is done once its queue, its waiting set and the cell it was baking are
-	// all empty; only then may an automatic job take over the progress counters.
-	if (_vt.vt_svt_explicit_bake && _vt.vt_svt_bake_queue.is_empty() &&
-			_vt.vt_svt_bake_waiting.is_empty() && _vt.svt_cell_job.is_empty()) {
-		_vt.vt_svt_explicit_bake = false;
+	// The explicit job is done once nothing of it is left, including the cell it was baking; only
+	// then may an automatic job take over the progress counters.
+	if (_vt.bake.explicit_job && _vt.bake.drained()) {
+		_vt.bake.explicit_job = false;
 	}
 	_process_svt_auto_bake();
 	// RD writes and worker completion do not mark RenderingServer as changed.
@@ -534,20 +520,20 @@ void Terrain3D::_destroy_vt_service() {
 	_vt.svt_pending_pages.clear();
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
-	_vt.svt_cell_baker.unref();
+	invalidate_avt_plan_key(_vt.avt_plan.key);
+	_vt.bake.cell_baker.unref();
 	if (_vt.vt_callback_registered && RS && RS->has_method("virtual_texture_remove_update_callback")) {
 		RS->call("virtual_texture_remove_update_callback", int64_t(get_instance_id()));
 	}
 	_vt.vt_callback_registered = false;
 	_vt.vt_baker.unref();
-	_vt.vt_bound_albedo = RID();
+	_vt.bound.clear();
 	_vt.vt_shared_ready = false;
 	_vt.vt_page_records.clear();
 	_vt.svt_pending_pages.clear();
 	_vt.vt_registered_sectors.clear();
-	_vt.vt_svt_bake_queue.clear();
-	_vt.vt_svt_bake_waiting.clear();
+	_vt.bake.queue.clear();
+	_vt.bake.waiting.clear();
 }
 
 void Terrain3D::_bind_vt_methods() {

@@ -17,10 +17,11 @@ namespace {
 // and leaves both call sites byte-identical to the file this was split out of.
 //
 // `_flush_source_wakes_unless_ticking()` is public in terrain_3d.h, so the guard needs no
-// friendship. The three halves that include this:
-//   terrain_3d_surface_views.cpp      the view objects and their settings
-//   terrain_3d_surface_views_far.cpp  the far field's demand pass
-//   terrain_3d_surface_views_near.cpp the near field's demand pass, its feedback pass and the sectors
+// friendship. The four halves that include this:
+//   terrain_3d_surface_views.cpp          the view objects and their settings
+//   terrain_3d_surface_views_far.cpp      the far field's pass and its level rule
+//   terrain_3d_surface_views_far_walk.cpp the far field's root plan, visible walk and demand pass
+//   terrain_3d_surface_views_near.cpp     the near field's demand pass, its feedback pass and the sectors
 struct SourceWakeFlush {
 	Terrain3D *terrain;
 	~SourceWakeFlush() { terrain->_flush_source_wakes_unless_ticking(); }

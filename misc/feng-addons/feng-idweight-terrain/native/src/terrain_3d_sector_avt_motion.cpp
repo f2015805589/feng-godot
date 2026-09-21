@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3D's near field, part 2 of 3: motion prediction and the plan key.
+// Terrain3D's near field, part 2 of 5: motion prediction and the plan key.
 
-// One of three files that own the near field's planning. A page costs several frames to assemble
+// One of five files that own the near field. A page costs several frames to assemble
 // and a compressed one several more to encode and read back, so demand issued at the moment a page
 // becomes visible can only ever be late. The plan therefore describes the camera one lead ahead -
 // both where it will be and where it will be looking, because a turn brings new world into the
@@ -12,8 +12,10 @@
 // camera leaves a cell - a key that changed every frame would re-derive every page address and
 // throw away the worker's time on each tick.
 //
-// The other two: `terrain_3d_sector_avt.cpp` (the entry point and its configuration) and
-// `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy and the address directory).
+// The other four: `terrain_3d_sector_avt.cpp` (the entry point and its configuration),
+// `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy and the address directory),
+// `terrain_3d_avt_plan.cpp` (the plan worker) and `terrain_3d_avt_produce.cpp` (the production
+// pass).
 
 #include "terrain_3d.h"
 

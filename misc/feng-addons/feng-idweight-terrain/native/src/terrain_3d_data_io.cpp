@@ -114,6 +114,32 @@ void Terrain3DData::save_region(const Vector2i &p_region_loc, const String &p_di
 	}
 }
 
+// One region file, loaded, size-checked and adopted. Both load paths do exactly this much and
+// differ only in what a failure means to them, so the verdict is returned rather than handled:
+// `load_directory()` goes on to the next file after an unreadable one and stops the whole load
+// on a size mismatch, while `load_region()` stops on either.
+RegionFileLoad Terrain3DData::_load_region_file(const String &p_path, const Vector2i &p_region_loc, const bool p_update) {
+	Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load(p_path, "Terrain3DRegion", ResourceLoader::CACHE_MODE_IGNORE);
+	if (region.is_null()) {
+		LOG(ERROR, "Cannot load region at ", p_path);
+		return RegionFileLoad::UNREADABLE;
+	}
+	LOG(INFO, "Loaded region: ", p_region_loc, " size: ", region->get_region_size());
+	// The first region loaded sets the terrain's size; every later one has to agree with it.
+	if (_regions.is_empty()) {
+		_terrain->set_region_size((Terrain3D::RegionSize)region->get_region_size());
+	} else if (_terrain->get_region_size() != (Terrain3D::RegionSize)region->get_region_size()) {
+		LOG(ERROR, "Region size mismatch. First loaded: ", _terrain->get_region_size(), " next: ",
+				region->get_region_size(), " in file: ", p_path);
+		return RegionFileLoad::SIZE_MISMATCH;
+	}
+	region->take_over_path(p_path);
+	region->set_location(p_region_loc);
+	region->set_version(CURRENT_DATA_VERSION); // Sends upgrade warning if old version
+	add_region(region, p_update);
+	return RegionFileLoad::LOADED;
+}
+
 void Terrain3DData::load_directory(const String &p_dir) {
 	if (p_dir.is_empty()) {
 		LOG(ERROR, "Specified directory name is blank");
@@ -136,30 +162,15 @@ void Terrain3DData::load_directory(const String &p_dir) {
 			LOG(ERROR, "Cannot get region location from file name: ", fname);
 			continue;
 		}
-		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load(path, "Terrain3DRegion", ResourceLoader::CACHE_MODE_IGNORE);
-		if (region.is_null()) {
-			LOG(ERROR, "Cannot load region at ", path);
-			continue;
+		if (_load_region_file(path, loc, false) == RegionFileLoad::SIZE_MISMATCH) {
+			// A directory is one terrain: a region that disagrees with the size the first one
+			// set stops the load. The log above names the file and both sizes.
+			return;
 		}
-		LOG(INFO, "Loaded region: ", loc, " size: ", region->get_region_size());
-		if (_regions.is_empty()) {
-			_terrain->set_region_size((Terrain3D::RegionSize)region->get_region_size());
-		} else {
-			if (_terrain->get_region_size() != (Terrain3D::RegionSize)region->get_region_size()) {
-				LOG(ERROR, "Region size mismatch. First loaded: ", _terrain->get_region_size(), " next: ",
-						region->get_region_size(), " in file: ", path);
-				return;
-			}
-		}
-		region->take_over_path(path);
-		region->set_location(loc);
-		region->set_version(CURRENT_DATA_VERSION); // Sends upgrade warning if old version
-		add_region(region, false);
 	}
 	update_maps(TYPE_MAX, true, false);
 }
 
-//TODO have load_directory call load_region, or make a load_file that loads a specific path
 void Terrain3DData::load_region(const Vector2i &p_region_loc, const String &p_dir, const bool p_update) {
 	LOG(INFO, "Loading region from location ", p_region_loc);
 	String path = p_dir + String("/") + Util::location_to_filename(p_region_loc);
@@ -167,24 +178,9 @@ void Terrain3DData::load_region(const Vector2i &p_region_loc, const String &p_di
 		LOG(ERROR, "File ", path, " doesn't exist");
 		return;
 	}
-	Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load(path, "Terrain3DRegion", ResourceLoader::CACHE_MODE_IGNORE);
-	if (region.is_null()) {
-		LOG(ERROR, "Cannot load region at ", path);
-		return;
-	}
-	if (_regions.is_empty()) {
-		_terrain->set_region_size((Terrain3D::RegionSize)region->get_region_size());
-	} else {
-		if (_terrain->get_region_size() != (Terrain3D::RegionSize)region->get_region_size()) {
-			LOG(ERROR, "Region size mismatch. First loaded: ", _terrain->get_region_size(), " next: ",
-					region->get_region_size(), " in file: ", path);
-			return;
-		}
-	}
-	region->take_over_path(path);
-	region->set_location(p_region_loc);
-	region->set_version(CURRENT_DATA_VERSION); // Sends upgrade warning if old version
-	add_region(region, p_update);
+	// Either failure is final here: a caller that asked for one location has nothing else to try,
+	// so the verdict is dropped after the load path has logged why it failed.
+	_load_region_file(path, p_region_loc, p_update);
 }
 
 /**

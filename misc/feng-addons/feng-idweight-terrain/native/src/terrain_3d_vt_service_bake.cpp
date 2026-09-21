@@ -41,21 +41,21 @@ Ref<Image> cell_mip(const Ref<Image> &image, int level) {
 }
 
 void Terrain3D::_cancel_svt_bake(const String &p_reason) {
-	_vt.svt_cell_job.clear();
-	_vt.svt_cell_baker.unref();
-	if (!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) {
-		_vt.vt_svt_bake_failed += _vt.vt_svt_bake_queue.size() + _vt.vt_svt_bake_waiting.size();
-		_vt.vt_svt_bake_error = p_reason;
+	_vt.bake.cell_job.clear();
+	_vt.bake.cell_baker.unref();
+	// What the job still owed is lost, and only a job that owed something has a reason to record.
+	if (_vt.bake.abandon() > 0) {
+		_vt.bake.error = p_reason;
 	}
 	if (_vt.surface_svt && _vt.surface_svt->is_initialized()) {
-		for (const Variant &slot : _vt.vt_svt_bake_waiting.keys()) {
+		for (const Variant &slot : _vt.bake.waiting.keys()) {
 			if (int(slot) >= 0) {
 				_vt.surface_svt->protect_page(int(slot), false);
 			}
 		}
 	}
-	_vt.vt_svt_bake_queue.clear();
-	_vt.vt_svt_bake_waiting.clear();
+	_vt.bake.queue.clear();
+	_vt.bake.waiting.clear();
 }
 
 uint32_t Terrain3D::_svt_cell_signature(const Vector2i &p_cell) const {
@@ -143,24 +143,24 @@ Array Terrain3D::get_svt_baked_pages() {
 }
 
 int Terrain3D::bake_svt() {
-	_vt.svt_cell_baker.unref();
-	_vt.svt_cell_job.clear();
+	_vt.bake.cell_baker.unref();
+	_vt.bake.cell_job.clear();
 	if (!_data || _vt.vt_debug_direct_material) {
 		return 0;
 	}
 	set_surface_svt_enabled(true);
 	_update_vt_service();
-	_vt.vt_svt_bake_queue.clear();
-	for (const Variant &slot : _vt.vt_svt_bake_waiting.keys()) {
+	_vt.bake.queue.clear();
+	for (const Variant &slot : _vt.bake.waiting.keys()) {
 		if (int(slot) >= 0) {
 			_vt.surface_svt->protect_page(int(slot), false);
 		}
 	}
-	_vt.vt_svt_bake_waiting.clear();
-	_vt.vt_svt_dirty_regions.clear();
+	_vt.bake.waiting.clear();
+	_vt.bake.dirty_regions.clear();
 	// The explicit job owns the progress counters until it has fully drained, including the
 	// cell it happens to be baking when its queue empties.
-	_vt.vt_svt_explicit_bake = true;
+	_vt.bake.explicit_job = true;
 	return _queue_svt_bake(Dictionary());
 }
 
@@ -168,26 +168,24 @@ void Terrain3D::set_svt_auto_bake(bool p_enabled) {
 	_vt.svt_auto_bake = p_enabled;
 	if (p_enabled && _data) {
 		for (const Vector2i &location : _data->get_region_locations()) {
-			_vt.vt_svt_dirty_regions[location] = true;
+			_vt.bake.dirty_regions[location] = true;
 		}
-		_vt.vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
+		_vt.bake.edit_time = Time::get_singleton()->get_ticks_msec();
 	}
 }
 
 void Terrain3D::_process_svt_auto_bake() {
-	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !_vt.surface_svt_enabled || _data_directory.is_empty() || _vt.vt_svt_dirty_regions.is_empty() ||
-			!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty() || _vt.vt_svt_explicit_bake ||
-			Time::get_singleton()->get_ticks_msec() - _vt.vt_svt_edit_time < 500) {
+	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !_vt.surface_svt_enabled || _data_directory.is_empty() || _vt.bake.dirty_regions.is_empty() ||
+			_vt.bake.busy() || _vt.bake.explicit_job ||
+			Time::get_singleton()->get_ticks_msec() - _vt.bake.edit_time < 500) {
 		return;
 	}
-	Dictionary dirty = _vt.vt_svt_dirty_regions.duplicate();
-	_vt.vt_svt_dirty_regions.clear();
+	Dictionary dirty = _vt.bake.dirty_regions.duplicate();
+	_vt.bake.dirty_regions.clear();
 	_queue_svt_bake(dirty);
 }
 
 int Terrain3D::_queue_svt_bake(const Dictionary &p_dirty_regions) {
-	_vt.vt_svt_bake_generation++;
-	_vt.vt_svt_bake_incremental = !p_dirty_regions.is_empty();
 	for (const Vector2i &cell : _data->get_region_locations()) {
 		bool affected = p_dirty_regions.is_empty();
 		for (const Variant &key : p_dirty_regions.keys()) {
@@ -198,39 +196,37 @@ int Terrain3D::_queue_svt_bake(const Dictionary &p_dirty_regions) {
 			}
 		}
 		if (affected) {
-			_vt.vt_svt_bake_queue.push_back(Vector3i(cell.x, cell.y, 0));
+			_vt.bake.queue.push_back(Vector3i(cell.x, cell.y, 0));
 		}
 	}
-	_vt.vt_svt_bake_total = _vt.vt_svt_bake_queue.size();
-	_vt.vt_svt_bake_done = 0;
-	_vt.vt_svt_bake_failed = 0;
-	_vt.vt_svt_bake_error = String();
-	return _vt.vt_svt_bake_total;
+	// The job starts once its queue holds what it will drain: the counters describe this job and no
+	// earlier one.
+	_vt.bake.begin(!p_dirty_regions.is_empty());
+	return _vt.bake.total;
 }
 
 void Terrain3D::_process_svt_bake(int p_page_budget) {
 	if (!_data || _data_directory.is_empty()) {
 		return;
 	}
-	if (!_vt.svt_cell_job.is_empty()) {
-		Terrain3DSurfaceBaker *producer = baker(_vt.svt_cell_baker);
+	if (!_vt.bake.cell_job.is_empty()) {
+		Terrain3DSurfaceBaker *producer = baker(_vt.bake.cell_baker);
 		if (!producer) {
 			return;
 		}
 		if (!producer->is_page_ready(0)) {
-			int ticks = int(_vt.svt_cell_job.get("ticks", 0)) + 1;
-			_vt.svt_cell_job["ticks"] = ticks;
+			int ticks = int(_vt.bake.cell_job.get("ticks", 0)) + 1;
+			_vt.bake.cell_job["ticks"] = ticks;
 			if (ticks < 600) {
 				return;
 			}
-			_vt.vt_svt_bake_failed++;
-			_vt.vt_svt_bake_error = "Cell bake timed out.";
+			_vt.bake.fail("Cell bake timed out.");
 		} else {
 			Dictionary channels = producer->export_page(0);
-			Vector2i cell = _vt.svt_cell_job["cell"];
-			bool valid = bool(channels.get("valid", false)) && uint32_t(int64_t(_vt.svt_cell_job["signature"])) == _svt_cell_signature(cell);
+			Vector2i cell = _vt.bake.cell_job["cell"];
+			bool valid = bool(channels.get("valid", false)) && uint32_t(int64_t(_vt.bake.cell_job["signature"])) == _svt_cell_signature(cell);
 			Dictionary images;
-			int resolution = _vt.svt_cell_job["resolution"];
+			int resolution = _vt.bake.cell_job["resolution"];
 			if (valid) {
 				for (const String &name : { String("albedo_height"), String("normal_roughness"), String("params") }) {
 					Ref<Image> image = channels[name];
@@ -248,14 +244,14 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 			if (valid && _vt.svt_cells.is_valid() && _vt.svt_cells->is_initialized()) {
 				const Ref<Image> cell_channels[3] = { images["albedo_height"], images["normal_roughness"], images["params"] };
 				resident = _vt.svt_cells->publish_cell(cell, _svt_cell_state_key(cell),
-						_vt.svt_cell_job["world_rect"], cell_channels, resolution, &evicted);
+						_vt.bake.cell_job["world_rect"], cell_channels, resolution, &evicted);
 				if (resident) { _vt.svt_cell_file_probe[(int64_t(cell.x) << 32) ^ uint32_t(cell.y)] = 1; }
 			}
 			if (valid) {
 				Dictionary saved;
 				saved["version"] = TerrainVTCell::FORMAT_VERSION;
-				saved["signature"] = _vt.svt_cell_job["signature"];
-				saved["world_rect"] = _vt.svt_cell_job["world_rect"];
+				saved["signature"] = _vt.bake.cell_job["signature"];
+				saved["world_rect"] = _vt.bake.cell_job["world_rect"];
 				saved["density"] = get_surface_svt_texels_per_meter();
 				Ref<Image> albedo = images["albedo_height"];
 				Ref<Image> preview = cell_mip(albedo, MAX(0, albedo->get_mipmap_count() - 7));
@@ -296,15 +292,14 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 				}
 			}
 			if (valid || resident) {
-				_vt.vt_svt_bake_done++;
-				_vt.svt_cells_baked++;
+				_vt.bake.complete_cell();
 				_vt.vt_svt_catalog_loaded = false;
 				_vt.vt_svt_tiles.clear();
 				// Requeue the pages that sample this cell, so they are assembled from the
 				// bake that just landed instead of the payloads they were baked from. A cell
 				// that was evicted to make room has to be requeued the same way: its pages
 				// now name a layer that holds another cell.
-				const Rect2 requeue_rects[] = { Rect2(_vt.svt_cell_job["world_rect"]),
+				const Rect2 requeue_rects[] = { Rect2(_vt.bake.cell_job["world_rect"]),
 					evicted.x == INT32_MAX ? Rect2() : Rect2(Vector2(evicted) * float(_region_size) * _vertex_spacing,
 															Vector2(float(_region_size) * _vertex_spacing, float(_region_size) * _vertex_spacing)) };
 				for (const Rect2 &cell_rect : requeue_rects) {
@@ -322,36 +317,35 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 					}
 				}
 			} else {
-				_vt.vt_svt_bake_failed++;
-				_vt.vt_svt_bake_error = "Cell changed during baking or could not be saved: " + path;
+				_vt.bake.fail("Cell changed during baking or could not be saved: " + path);
 			}
 		}
-		_vt.svt_cell_job.clear();
-		_vt.vt_svt_bake_waiting.clear();
-		_vt.svt_cell_baker.unref();
+		_vt.bake.cell_job.clear();
+		_vt.bake.waiting.clear();
+		_vt.bake.cell_baker.unref();
 		return;
 	}
-	if (_vt.vt_svt_bake_queue.is_empty() || p_page_budget == 0) {
+	if (_vt.bake.queue.is_empty() || p_page_budget == 0) {
 		return;
 	}
-	Vector3i request = _vt.vt_svt_bake_queue[0];
-	_vt.vt_svt_bake_queue.remove_at(0);
+	Vector3i request = _vt.bake.take_next();
 	Vector2i cell(request.x, request.y);
-	if (_vt.vt_svt_bake_incremental && !_load_svt_cell(cell).is_empty()) {
-		_vt.vt_svt_bake_done++;
+	if (_vt.bake.incremental && !_load_svt_cell(cell).is_empty()) {
+		// The cell is already baked on disk: it counts as done, but it is not a bake of this
+		// session, so the cumulative `cells_baked` is deliberately left alone here.
+		_vt.bake.done++;
 		return;
 	}
 	float world = _region_size * _vertex_spacing;
 	int resolution = int(Math::ceil(world * get_surface_svt_texels_per_meter()));
 	if (resolution < 1 || resolution > 8192) {
-		_vt.vt_svt_bake_failed++;
-		_vt.vt_svt_bake_error = "Cell source resolution exceeds the supported 8192 texels; lower SVT density.";
+		_vt.bake.fail("Cell source resolution exceeds the supported 8192 texels; lower SVT density.");
 		return;
 	}
 	Rect2 rect(Vector2(cell) * world, Vector2(world, world));
 	Ref<Image> ids;
 	if (_data->produce_surface_rect_page(rect, resolution, 1, ids) < 0) {
-		_vt.vt_svt_bake_failed++;
+		_vt.bake.failed++;
 		return;
 	}
 	Ref<Image> height;
@@ -362,15 +356,15 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 			_assets->get_texture_colors(), _assets->get_texture_normal_depths(), _assets->get_texture_ao_strengths(),
 			_assets->get_texture_ao_light_affects(), _assets->get_texture_roughness_mods(), _assets->get_texture_uv_scales(),
 			_assets->get_texture_detiles(), _assets->get_texture_slope_params());
-	_vt.svt_cell_baker = producer;
-	_vt.svt_cell_job["cell"] = cell;
-	_vt.svt_cell_job["world_rect"] = rect;
-	_vt.svt_cell_job["resolution"] = resolution;
-	_vt.svt_cell_job["signature"] = int64_t(_svt_cell_signature(cell));
-	_vt.vt_svt_bake_waiting[-1] = 0;
+	_vt.bake.cell_baker = producer;
+	_vt.bake.cell_job["cell"] = cell;
+	_vt.bake.cell_job["world_rect"] = rect;
+	_vt.bake.cell_job["resolution"] = resolution;
+	_vt.bake.cell_job["signature"] = int64_t(_svt_cell_signature(cell));
+	_vt.bake.waiting[-1] = 0;
 	const Vector3 source_grid = bake_source_grid(_data, rect, resolution, 1,
 			_vertex_spacing / _surface_density, ids, height);
 	if (height.is_null()) { height = _data->make_vt_height_page(rect, resolution, 1); }
 	producer->queue_page(0, ids, height, rect, 1.f, source_grid);
-	RS->call_on_render_thread(Callable(producer.ptr(), "render_pending").bind(_vt.svt_cell_baker));
+	RS->call_on_render_thread(Callable(producer.ptr(), "render_pending").bind(_vt.bake.cell_baker));
 }

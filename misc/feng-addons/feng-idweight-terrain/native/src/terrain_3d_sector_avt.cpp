@@ -1,17 +1,19 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3D's near field, part 1 of 3: the demand entry point and its configuration.
+// Terrain3D's near field, part 1 of 5: the demand entry point and its configuration.
 
-// One of three files that own the near field's planning. `_update_sector_avt()` is the driver:
+// One of five files that own the near field. `_update_sector_avt()` is the driver:
 // it predicts the lead transform, derives the plan key, decides whether the previous plan can be
 // reused, and otherwise runs the chain - scan, hierarchy, address directory, publish - and submits
 // the result. The tier settings here are the ones the sector size is derived from
 // (`get_avt_base_block_size()` and `_avt_logical_ratio()`), so they live beside the driver that
 // reads them rather than in the properties file.
 //
-// The other two: `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key) and
+// The other four: `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key),
 // `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy, the address directory and its
-// publication). The prologue all three share is `terrain_3d_sector_avt_internal.h`.
+// publication), `terrain_3d_avt_plan.cpp` (the plan worker this driver submits to) and
+// `terrain_3d_avt_produce.cpp` (the production pass that spends the tick's budget on the installed
+// plan). The prologue the trio of scan-side files share is `terrain_3d_sector_avt_internal.h`.
 
 #include "terrain_3d_sector_avt_internal.h"
 
@@ -175,9 +177,9 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// also the element index of the key; an invalidated key has no component to report.
 	{
 		int first = -1;
-		if (is_valid_avt_plan_key(_vt.avt_plan_key)) {
+		if (is_valid_avt_plan_key(_vt.avt_plan.key)) {
 			for (size_t i = 0; i < plan_key.size(); ++i) {
-				if (plan_key[i] != _vt.avt_plan_key[i]) { first = int(i); break; }
+				if (plan_key[i] != _vt.avt_plan.key[i]) { first = int(i); break; }
 			}
 		}
 		_vt.avt_sector_stats["plan_key_dirty_component"] = first;
@@ -188,7 +190,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// A changed key does not have to mean a new plan: the plan is a look-ahead artifact, and the
 	// chain that derives it is the most expensive thing in the tick. Inside the refresh interval a
 	// changed key reuses the standing plan, which is what the production pass then works from.
-	// `avt_plan_key` is deliberately left at the key the standing plan was planned for, so the
+	// `avt_plan.key` is deliberately left at the key the standing plan was planned for, so the
 	// tick after the interval sees the change and plans.
 	//
 	// A key that was *invalidated* is not camera motion and does not wait: a region was added or
@@ -198,11 +200,11 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// this distinction a region whose slot had just been swapped rendered the missing-page
 	// diagnostic until the interval expired.
 	const uint64_t frame_now = Engine::get_singleton()->get_process_frames();
-	const bool key_same = _vt.avt_plan_key == plan_key;
-	const bool key_valid = is_valid_avt_plan_key(_vt.avt_plan_key);
-	const bool angular_refresh = !key_same && avt_plan_angular_deviation_exceeded(camera_transform, _vt.avt_plan_key);
+	const bool key_same = _vt.avt_plan.key == plan_key;
+	const bool key_valid = is_valid_avt_plan_key(_vt.avt_plan.key);
+	const bool angular_refresh = !key_same && avt_plan_angular_deviation_exceeded(camera_transform, _vt.avt_plan.key);
 	const bool spatial_refresh = avt_plan_spatial_deviation_exceeded(camera_transform,
-			_vt.avt_plan_key, _vt.avt_motion_lead, reach);
+			_vt.avt_plan.key, _vt.avt_motion_lead, reach);
 	const bool refresh_due = !key_valid || _vt.avt_last_chain_frame == UINT64_MAX ||
 			frame_now >= _vt.avt_last_chain_frame + _vt.avt_plan_refresh_frames || angular_refresh || spatial_refresh;
 	_vt.avt_sector_stats["plan_spatial_refresh"] = spatial_refresh;
@@ -289,7 +291,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, camera_position, bounds_ready, focus, reach);
 	mark_phase("submit_ms");
 	_vt.avt_chain_sum_ms += double(Time::get_singleton()->get_ticks_usec() - chain_started) / 1000.0;
-	_vt.avt_plan_key = plan_key;
+	_vt.avt_plan.key = plan_key;
 	_vt.avt_pending_hierarchy = Terrain3DAVTHierarchy();
 
 	_vt.avt_sector_stats["height_bounds_ready"] = bounds_ready;
@@ -336,11 +338,11 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	// installable while its own footprint is unchanged; an exact count in the key re-planned
 	// the whole working set whenever the far field gained or lost a single page.
 	append((_vt.vt_svt_visible_pages / 16) * 16); append(_vt.surface_svt_enabled); append(_vt.surface_vt_distance);
-	append(!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty());
+	append(_vt.bake.busy());
 	append(_vt.vt_page_count); append(_vt.vt_page_size);
 	append(avt_view_anisotropy(this, camera));
 	// Protected far roots consume physical slots independently of visible detail.
-	append(_vt.svt_root_pages.size());
+	append(_vt.svt_roots.pages.size());
 	return state;
 }
 
@@ -349,7 +351,7 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_max_pages, const bool p_same_plan) {
 	bool installed = false;
 	if (_vt.avt_refinement && _vt.avt_refinement->ready.load(std::memory_order_acquire)) {
-		if (_vt.avt_refinement->key == _vt.avt_plan_key) {
+		if (_vt.avt_refinement->key == _vt.avt_plan.key) {
 			// Sizing the pool for the pages the image actually samples, not for everything the
 			// plan names. The speculative apron is a function of the leftover budget, so
 			// counting it here closes a loop - a larger pool allows a larger apron, which asks
@@ -395,7 +397,7 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			const int retain_cap = discard_retained ? 0 :
 				MIN(128, MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
 			int retained = 0;
-			for (const Terrain3DAVTPageRequest &page : _vt.avt_page_plan) {
+			for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
 				if (retained == retain_cap) { break; }
 				if (page.last_visible_plan + uint64_t(_vt.avt_retain_epochs) < epoch ||
 						std::binary_search(current.begin(), current.end(),
@@ -418,24 +420,23 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			}
 			_vt.avt_sector_stats["retained_requests"] = retained;
 			_vt.avt_sector_stats["retain_epochs"] = _vt.avt_retain_epochs;
-			_vt.avt_page_plan = std::move(_vt.avt_refinement->pages);
-			_vt.avt_sampled_pages = _vt.avt_refinement->sampled;
+			// The selection and the retention flags are one operation: a new plan is a new wanted
+			// set, so the source queue has to be retained again.
+			_vt.avt_plan.install(std::move(_vt.avt_refinement->pages), _vt.avt_refinement->sampled,
+					std::move(_vt.avt_refinement->warm));
 			_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel) * std::exp2(-float(_vt.avt_refinement->mip_bias));
 			if (_material.is_valid()) {
 				RS->material_set_param(_material->get_material_rid(), "_avt_density_scale", _vt.avt_density_scale);
 			}
 			_vt.avt_sector_stats["capacity_mip_bias"] = _vt.avt_refinement->mip_bias;
 			_vt.avt_sector_stats["sampling_density_scale"] = _vt.avt_density_scale;
-			_vt.avt_prefetch_plan = std::move(_vt.avt_refinement->warm);
 			_vt.avt_prefetch_cursor = 0;
 			_vt.avt_prefetch_cycle_pending = false;
-			// A new plan is a new wanted set, so the source queue has to be retained again.
-			_vt.avt_retain_applied = false;
 			_vt.avt_sector_stats["refinement_requests_denied"] = _vt.avt_refinement->denied;
 			_vt.avt_sector_stats["finest_requested_texel_world"] = _vt.avt_refinement->finest;
 			_vt.avt_sector_stats["visible_root_pages"] = _vt.avt_refinement->roots;
-			_vt.avt_sector_stats["requested_physical_pages"] = int(_vt.avt_page_plan.size());
-			_vt.avt_sector_stats["prefetch_requests"] = int(_vt.avt_prefetch_plan.size());
+			_vt.avt_sector_stats["requested_physical_pages"] = int(_vt.avt_plan.pages.size());
+			_vt.avt_sector_stats["prefetch_requests"] = int(_vt.avt_plan.prefetch.size());
 			_vt.avt_sector_stats["planning_ms"] = double(_vt.avt_refinement->elapsed_us) / 1000.;
 			_vt.avt_sector_stats["plan_age_ms"] = double(p_started - _vt.avt_refinement->submitted_us) / 1000.;
 			installed = true;
@@ -447,8 +448,8 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 	// Installing a completed plan must not insert an idle planning frame. Its
 	// requests remain active while the next camera view is submitted below.
 	if (p_same_plan || _vt.avt_refinement) {
-		_vt.avt_plan_reused = !installed;
-		_vt.avt_sector_stats["plan_reused"] = _vt.avt_plan_reused;
+		_vt.avt_settled.reused = !installed;
+		_vt.avt_sector_stats["plan_reused"] = _vt.avt_settled.reused;
 		_vt.avt_sector_stats["directory_rebuilt"] = false;
 		const int produced = _produce_sector_avt_pages(p_max_pages);
 		_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - p_started) / 1000.0;
@@ -457,7 +458,7 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 	// A plan that is not being reused leaves the settled verdict false: the caller goes on to run
 	// this tick's production pass, and it must not read the absence of an install as an idle plan
 	// and skip the work the new view needs.
-	_vt.avt_plan_reused = false;
+	_vt.avt_settled.reused = false;
 	return -1;
 }
 
@@ -498,15 +499,16 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	// Camera motion changes demand, not existing virtual addresses. Avoid
 	// re-deriving every page mip when the address directory and scale agree.
 	if (r_hierarchy.directory_dirty || logical_ratio != _vt.avt_plan_logical_ratio) {
-		remap_plan(_vt.avt_page_plan);
-		remap_plan(_vt.avt_prefetch_plan);
+		remap_plan(_vt.avt_plan.pages);
+		remap_plan(_vt.avt_plan.prefetch);
 		_vt.avt_plan_logical_ratio = logical_ratio;
 		// The addresses the source queue is retained against just changed.
-		_vt.avt_retain_applied = false;
+		_vt.avt_plan.forget_retention();
 	}
 	_vt.avt_prefetch_cursor = 0;
 	_vt.avt_prefetch_cycle_pending = false;
-	_vt.avt_idle_revision = 0;
+	// The set the shortcut verified is about to be replaced by this plan's own selection.
+	_vt.avt_settled.unverify();
 	if (!_vt.vt_page_pipeline) { _vt.vt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(_vt.vt_page_workers); }
 	TerrainAVT::PlanInput input;
 	input.working = r_hierarchy.working;
@@ -524,4 +526,38 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	input.root_level = r_hierarchy.root_level;
 	input.page_size = _vt.vt_page_size;
 	_vt.vt_page_pipeline->submit_task([job, input]() mutable { TerrainAVT::plan_pages(*job, input); });
+}
+
+// The near field's half of `get_vt_settings()`: the motion lead, the standing plan's visible
+// readings, the density and sector geometry the plan is derived from, and the two stage
+// dictionaries. It is written here rather than in the report file because every key below reads a
+// field this family owns.
+void Terrain3D::_report_avt(Dictionary &r_result) const {
+	Dictionary &result = r_result;
+	result["motion_lead_ms"] = _vt.vt_motion_lead_ms;
+	result["motion_lead_m"] = _vt.avt_motion_lead.length();
+	result["motion_speed"] = _vt.avt_motion_velocity.length();
+	result["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
+	result["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
+	result["visible_late_pages"] = _vt.avt_late_pages;
+	result["visible_late_worst_ms"] = double(_vt.avt_late_worst_us) / 1000.0;
+	result["visible_retained_pages"] = _vt.avt_retained_pages;
+	result["adaptive"] = _vt.vt_adaptive_enabled;
+	result["avt_feedback"] = _vt.avt_feedback;
+	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
+	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
+	result["avt_distance"] = _vt.surface_vt_distance;
+	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
+	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
+	result["avt_base_block_size"] = get_avt_base_block_size();
+	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
+	result["avt_sector_stats"] = _vt.avt_sector_stats;
+	result["avt_peak_stats"] = _vt.avt_peak_stats;
+	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0
+			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_peak_stamp_us) / 1000.0;
+	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
+	result["avt_region_grid"] = _vt.surface_vt_region_grid;
+	result["avt_region_offset"] = _vt.surface_vt_region_offset;
+	result["avt_forward_regions"] = _vt.surface_vt_forward_regions;
+	result["avt_region_rect"] = get_surface_vt_region_rect();
 }

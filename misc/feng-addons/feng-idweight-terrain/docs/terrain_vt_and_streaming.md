@@ -14,7 +14,7 @@ far field persists baked material pages; geometry can run as a CDLOD quadtree. S
 |---|---|---|
 | **CDLOD** | Geometry quadtree, instanced patch meshes, GPU vertex morphing | `native/src/terrain_3d_cdlod.{h,cpp}`, `shaders/main.glsl` |
 | **AVT** | Near-field adaptive virtual texture over 64 m world sectors | `native/src/terrain_3d_sector_avt.cpp`, `terrain_3d_surface_views.cpp`, `terrain_3d_avt.h` |
-| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_vt_demand.cpp`, `terrain_3d_vt_service*.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
+| **SVT** | Far-field sparse virtual texture on a world-aligned page grid | `native/src/terrain_3d_surface_views_far.cpp`, `terrain_3d_surface_views_far_walk.cpp`, `terrain_3d_vt_service*.cpp`, `terrain_3d_page_pipeline.{h,cpp}` |
 
 They share the world cell grid and the physical page pool, but they have **separate
 address spaces, separate demand passes and separate level rules**. They are not one
@@ -945,7 +945,8 @@ page on every tick of a still camera, and all three are now one read of the same
   pyramid deliberately does not, because a root plan cut short leaves `settled` false and the whole
   plan is thrown away and rebuilt next tick, which never settles.
 * The statistics an idle pass publishes are constants of the settled state, so a run of idle ticks
-  writes them once (`avt_idle_stats_current`) instead of re-hashing the same String keys every frame.
+  writes them once (`Terrain3DAVTSettled::stats_current`) instead of re-hashing the same String keys
+  every frame.
 * **The plan key quantizes the camera's orientation as well as its position.** An exact basis
   changes the key on every frame of a pan, so every tick submitted a plan that the next tick
   replaced before the worker had finished it: the worker time was thrown away and the working set
@@ -969,7 +970,7 @@ page on every tick of a still camera, and all three are now one read of the same
 * **The source queue is retained once per plan, not once per pass.** What the queue should keep is
   the plan plus the prefetch plan, and that only changes when a plan is installed or the prefetch
   switch flips. A repeated retention is 250 map lookups that reach the state the previous one
-  already reached (`avt_retain_applied`).
+  already reached (`Terrain3DAVTPlan::retained()`).
 * **A completed page no longer wakes every source worker.** The workers wait on a count of
   claimable entries rather than on a walk of the queue, a batch wakes one worker per entry it added
   instead of the whole pool, and a worker that finishes a page notifies nobody because finishing
@@ -1156,14 +1157,15 @@ rebuilt arrays start blank: the setter forces `invalidate_surface_pages(location
 every loaded region, which also skips the editor-preview deferral (a deferred refresh would
 leave the material sampling arrays that no longer hold its content).
 
-**A reconfiguration reuses the published capacity.** `Terrain3DVTState::vt_effective_page_count`
-records what the views were actually configured with, is raised by the auto-capacity
-publication and replaced by an explicit `vt_page_count`, and `_configure_vt_service()` configures
-the views and the producer with `MAX(vt_page_count, vt_effective_page_count)`. Starting again
-from the setting would make the demand pass re-grow the pool right after the rebuild, releasing
-every page a second time. `get_vt_settings()` exposes `effective_page_count` and
-`pool_generation` (bumped once per pool build) so this is directly assertable, and the pool's
-growth warning is emitted only when slots were actually released, with the count.
+**A reconfiguration reuses the published capacity.** `Terrain3DVTPool::capacity` (the
+`Terrain3DVTPool` struct in `terrain_3d_vt_state.h`) records what the views were actually configured
+with, is raised by the auto-capacity publication and replaced by an explicit `vt_page_count`, and
+`_configure_vt_service()` configures the views and the producer with
+`MAX(vt_page_count, pool.capacity)`. Starting again from the setting would make the demand pass
+re-grow the pool right after the rebuild, releasing every page a second time. `get_vt_settings()`
+exposes `effective_page_count` and `pool_generation` (bumped once per pool build) so this is directly
+assertable, and the pool's growth warning is emitted only when slots were actually released, with the
+count.
 
 **The demand pass waits (briefly) for a capacity change to land.** Auto capacity requests the
 larger arrays from the producer and the pool follows them a frame or two later; a page produced
@@ -1362,7 +1364,7 @@ and were left alone rather than fixed blind.
 | Page record, indirection walk, POT block allocator | `native/src/terrain_vt.h` |
 | Per-frame VT state and settings | `native/src/terrain_3d_vt_state.h` |
 | Near-field planner, directory, production pass | `native/src/terrain_3d_sector_avt.cpp` |
-| Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_surface_views.cpp`, `terrain_3d_vt_demand.cpp` |
+| Far-field demand, both tiers' settings and lifecycle | `native/src/terrain_3d_surface_views.cpp`, `terrain_3d_surface_views_far.cpp`, `terrain_3d_surface_views_far_walk.cpp` |
 | Page table (indirection), per-view addressing | `native/src/terrain_3d_virtual_texture.{h,cpp}`, `terrain_3d_vt_indirection.{h,cpp}` |
 | Shared physical pool: atlas, slots, LRU, ownership | `native/src/terrain_3d_vt_page_pool.{h,cpp}` |
 | Producer worker, source snapshot, `.vtcell` contract | `native/src/terrain_3d_page_pipeline.{h,cpp}`, `terrain_vt_cell.h`, `terrain_3d_vt_service_bake.cpp` |

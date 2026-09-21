@@ -1,22 +1,19 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-
-
 # Surface VT editor. The editor intentionally keeps all expensive work behind
-
-
 # explicit buttons: page previews are GPU readbacks only when requested, and the
-
-
 # world thumbnail is stitched only when Refresh overview is pressed.
-
-
+#
+# The window is the shell: it owns the widgets, the selection state and which view
+# is shown. Everything with rules of its own lives in a sibling script - the page
+# rows in vt_editor_page_rows.gd, the mip distance bands in vt_editor_svt_bands.gd,
+# the CDLOD controls in vt_editor_cdlod_panel.gd, the duck-typed native API in
+# vt_terrain_bridge.gd and the world/image maths in vt_overview_image.gd.
 @tool
 extends Window
 class_name TerrainVTEditor
 
 const OVERVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_world_overview.gd")
 const OVERVIEW_EDGE: int = 768
-const MAX_PAGE_ROWS: int = 512
 const INVALID_LOCATION := Vector2i(2147483647, 2147483647)
 const SVT_AUTO_BAKE_PROPERTY: StringName = &"surface_svt_auto_bake"
 const BAKE_STATUS_POLL_INTERVAL: float = 0.25
@@ -43,6 +40,7 @@ var baked_mip_selector: OptionButton
 var settings_panel: VBoxContainer
 var cdlod_panel: VBoxContainer
 var svt_panel: VBoxContainer
+var _cdlod: TerrainVTEditorCdlodPanel
 var page_size_spin: SpinBox
 var page_border_spin: SpinBox
 var page_count_spin: SpinBox
@@ -63,11 +61,7 @@ var svt_auto_bake_button: CheckButton
 var auto_bake_hint: Label
 var bake_button: Button
 var bake_status: Label
-var svt_band_hint: Label
-var svt_band_grid: GridContainer
-var svt_band_auto_button: Button
-var svt_band_spins: Array[SpinBox] = []
-var _svt_band_signature: String = ""
+var _svt_bands: TerrainVTEditorSvtBands
 
 var _overview_texture: Texture2D
 var _overview_dirty: bool = true
@@ -123,14 +117,8 @@ func open_for_terrain(p_terrain: Object) -> void:
 
 
 ## Entry point used by the Terrain3D Inspector's VT Page foldout. Selecting
-
-
 ## the hierarchy row keeps the window useful even when no baked pages exist;
-
-
 ## the overview then shows the explicit height fallback or stitched SVT data.
-
-
 func open_vt_page_view() -> void:
 	if not _built:
 		_build_ui()
@@ -307,6 +295,7 @@ func _build_ui() -> void:
 	cdlod_panel = VBoxContainer.new()
 	cdlod_panel.name = "CDLODSettings"
 	details_box.add_child(cdlod_panel)
+	_cdlod = TerrainVTEditorCdlodPanel.new(cdlod_panel)
 	page_tree = Tree.new()
 	page_tree.name = "PageDetails"
 	page_tree.columns = 4
@@ -565,56 +554,17 @@ func _build_svt_panel() -> VBoxContainer:
 	bake_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	panel.add_child(bake_status)
 
-	# Distance -> mip level bands. One entry per level: the furthest camera distance at
-	# which the shader samples that level, and the level the page producer fills for it.
-	# Both read this one table, so the rendered detail is a function of distance rather
-	# than of whichever page happens to be resident.
-	var band_header := Label.new()
-	band_header.name = "SVTBandHeader"
-	band_header.text = "Mip distance bands"
-	panel.add_child(band_header)
-	svt_band_hint = Label.new()
-	svt_band_hint.name = "SVTBandHint"
-	svt_band_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	panel.add_child(svt_band_hint)
-	svt_band_grid = GridContainer.new()
-	svt_band_grid.name = "SVTBandGrid"
-	svt_band_grid.columns = 2
-	panel.add_child(svt_band_grid)
-	var band_buttons := HBoxContainer.new()
-	band_buttons.name = "SVTBandButtons"
-	svt_band_auto_button = Button.new()
-	svt_band_auto_button.name = "SVTBandAutomatic"
-	svt_band_auto_button.text = "Automatic"
-	svt_band_auto_button.tooltip_text = "Clear the table and derive one level per doubling of the far-field page size"
-	svt_band_auto_button.pressed.connect(_on_svt_band_auto_pressed)
-	band_buttons.add_child(svt_band_auto_button)
-	var band_fit_button := Button.new()
-	band_fit_button.name = "SVTBandFromPageSize"
-	band_fit_button.text = "From page size"
-	band_fit_button.tooltip_text = "Pin the bands explicitly to the automatic rule, as a starting point to edit"
-	band_fit_button.pressed.connect(_on_svt_band_fit_pressed)
-	band_buttons.add_child(band_fit_button)
-	panel.add_child(band_buttons)
+	_svt_bands = TerrainVTEditorSvtBands.new()
+	_svt_bands.build(panel)
 	return panel
 
 
 func _make_setting_label(p_text: String) -> Label:
-	var label := Label.new()
-	label.text = p_text
-	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	return label
+	return TerrainVTEditorWidgets.make_setting_label(p_text)
 
 
 func _make_spin(p_min: float, p_max: float, p_step: float) -> SpinBox:
-	var spin := SpinBox.new()
-	spin.min_value = p_min
-	spin.max_value = p_max
-	spin.step = p_step
-	spin.allow_greater = false
-	spin.allow_lesser = false
-	spin.custom_minimum_size.x = 130
-	return spin
+	return TerrainVTEditorWidgets.make_spin(p_min, p_max, p_step)
 
 
 func _refresh_all() -> void:
@@ -705,101 +655,12 @@ func _refresh_settings_controls() -> void:
 	_updating_settings = false
 
 
-# One spin box per world mip level: the furthest camera distance still sampled at that
-
-
-# level. Both the page producer and the shader resolve a level through this table, so a
-
-
-# value here is where the level boundary sits for the whole far field, not a hint.
-
-
+# The band table is its own editor: it owns the spin boxes, the automatic rule and
+# the hint that describes both. The window only decides when to refresh it.
 func _refresh_svt_bands() -> void:
-	if svt_band_grid == null or terrain == null or not is_instance_valid(terrain):
+	if _svt_bands == null:
 		return
-	if not _has_object_property(terrain, &"surface_svt_mip_distances"):
-		return
-	var view := _call(terrain, "get_surface_svt")
-	var max_mip := int(_call(view, "get_world_max_mip"))
-	if max_mip < 0:
-		max_mip = int(_call(terrain, "get_surface_svt_max_mip"))
-	var levels := maxi(1, max_mip + 1)
-	var configured_value: Variant = _call(terrain, "get_surface_svt_mip_distances")
-	var configured: PackedFloat32Array = configured_value if configured_value is PackedFloat32Array else PackedFloat32Array()
-	var page_world := maxf(0.001, float(_call(terrain, "get_surface_svt_page_world")))
-	# Rebuilding a grid of spin boxes while the user types in one of them would drop the
-	# edit, so only rebuild when the level count or the stored table actually changed.
-	var signature := "%d|%s|%s" % [levels, str(configured), str(page_world)]
-	if signature == _svt_band_signature:
-		return
-	_svt_band_signature = signature
-	var rebuilding := svt_band_spins.size() != levels
-	_updating_settings = true
-	if rebuilding:
-		for child in svt_band_grid.get_children():
-			child.queue_free()
-		svt_band_spins.clear()
-		for mip in levels:
-			svt_band_grid.add_child(_make_setting_label("mip %d ≤" % mip))
-			var spin := _make_spin(1.0, 100000000.0, 1.0)
-			spin.name = "SVTBandMip%d" % mip
-			spin.custom_minimum_size.x = 130
-			spin.tooltip_text = "Furthest camera distance in metres sampled at world mip %d" % mip
-			spin.value_changed.connect(_on_svt_band_value_changed.bind(mip))
-			svt_band_grid.add_child(spin)
-			svt_band_spins.append(spin)
-	for mip in svt_band_spins.size():
-		# An empty table is the automatic rule: show the edge that rule produces, so the
-		# boxes always read as real distances.
-		var automatic_edge := maxf(1.0, page_world * 2.0) * pow(2.0, float(mip))
-		svt_band_spins[mip].set_value_no_signal(float(configured[mip]) if mip < configured.size() else automatic_edge)
-	_updating_settings = false
-	var parts: PackedStringArray = []
-	var previous := 0.0
-	for mip in svt_band_spins.size():
-		var edge := float(svt_band_spins[mip].value)
-		parts.append("%s–%s m → mip %d" % [_format_distance(previous), _format_distance(edge), mip])
-		previous = edge
-	var mode := "Explicit bands: every level named here is produced at exactly that distance." if not configured.is_empty() else "Automatic bands: one level per doubling of the %.0f m page. Editing a distance pins all bands explicitly." % page_world
-	svt_band_hint.text = "%s\n%s" % [mode, " · ".join(parts)]
-
-
-func _format_distance(p_metres: float) -> String:
-	if p_metres >= 1000.0:
-		return "%.1f km" % (p_metres / 1000.0)
-	return "%.0f" % p_metres
-
-
-func _on_svt_band_value_changed(_p_value: float, _p_mip: int) -> void:
-	if _updating_settings or terrain == null or not is_instance_valid(terrain):
-		return
-	var distances := PackedFloat32Array()
-	for spin in svt_band_spins:
-		distances.append(float(spin.value))
-	_call(terrain, "set_surface_svt_mip_distances", [distances])
-	# The setter normalises the table, so read back what it stored.
-	_svt_band_signature = ""
-	_refresh_svt_bands()
-
-
-func _on_svt_band_auto_pressed() -> void:
-	if terrain == null or not is_instance_valid(terrain):
-		return
-	_call(terrain, "set_surface_svt_mip_distances", [PackedFloat32Array()])
-	_svt_band_signature = ""
-	_refresh_svt_bands()
-
-
-func _on_svt_band_fit_pressed() -> void:
-	if terrain == null or not is_instance_valid(terrain):
-		return
-	var page_world := maxf(0.001, float(_call(terrain, "get_surface_svt_page_world")))
-	var distances := PackedFloat32Array()
-	for mip in maxi(1, svt_band_spins.size()):
-		distances.append(maxf(1.0, page_world * 2.0) * pow(2.0, float(mip)))
-	_call(terrain, "set_surface_svt_mip_distances", [distances])
-	_svt_band_signature = ""
-	_refresh_svt_bands()
+	_svt_bands.refresh(terrain)
 
 
 func _refresh_bake_status(p_settings: Dictionary = {}) -> void:
@@ -869,7 +730,9 @@ func _on_density_changed(p_value: float, p_view: String) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
 	_call(terrain, "set_surface_%s_texels_per_meter" % p_view, [p_value])
-	_svt_band_signature = ""
+	# A density change moves the automatic band edges, so the table has to rebuild.
+	if _svt_bands != null:
+		_svt_bands.invalidate()
 	_overview_dirty = true
 	_refresh_header()
 	_refresh_settings_controls()
@@ -1050,144 +913,48 @@ func _refresh_page_details() -> void:
 			_add_surface_details(root)
 
 
+# The rows themselves are built by TerrainVTEditorPageRows, which reads one
+# snapshot of the terrain instead of a live scene, so the window keeps only the
+# dispatch above and the panel visibility. These stay as methods because the
+# window's own refresh paths and the editor regression suite drive them by name.
+func _page_snapshot() -> TerrainVTEditorPageRows.Snapshot:
+	return TerrainVTEditorPageRows.snapshot(terrain, _data, _selected_baked_mip)
+
+
 func _add_settings_summary(p_root: TreeItem) -> void:
-	var settings := _vt_settings()
-	_add_page_row(p_root, "Shared atlas", "Ready" if bool(settings.get("shared_pool", false)) else "Pending", "", "%d pages · %d + %d border texels" % [int(settings.get("page_count", 0)), int(settings.get("page_size", 0)), int(settings.get("border", 0))])
-	_add_page_row(p_root, "Adaptive AVT", "Enabled" if bool(settings.get("adaptive", false)) else "Disabled", "", "Adaptive blocks can resize while retaining overlap")
-	_add_page_row(p_root, "Producer", "Active" if settings.has("producer") else "Unavailable", "", "Material pages are produced by the Surface VT baker")
+	TerrainVTEditorPageRows.add_settings_summary(page_tree, p_root, _page_snapshot())
 
 
 func _add_surface_details(p_root: TreeItem) -> void:
-	var settings := _vt_settings()
-	_add_page_row(p_root, "Surface VT", "Shared", "", "AVT and SVT keep separate virtual addressing")
-	_add_page_row(p_root, "AVT", "Enabled" if bool(_call(terrain, "is_surface_vt_enabled")) else "Disabled", "", "%d resident pages" % _resident_pages("AVT").size())
-	_add_page_row(p_root, "SVT", "Enabled" if bool(_call(terrain, "is_surface_svt_enabled")) else "Disabled", "", "%d resident · %d baked" % [_resident_pages("SVT").size(), _baked_pages().size()])
-	_add_page_row(p_root, "Shared pool", "Ready" if bool(settings.get("shared_pool", false)) else "Pending", "", "One physical slot budget is shared by both views")
+	TerrainVTEditorPageRows.add_surface_details(page_tree, p_root, _page_snapshot())
 
 
 func _add_avt_details(p_root: TreeItem) -> void:
-	var stats := _view_stats("AVT")
-	_add_page_row(p_root, "AVT runtime material", "Runtime", "", "AVT uses surface ID/weight source data; it is not an offline material bake")
-	_add_page_row(p_root, "Resident", str(_resident_pages("AVT").size()), "", _stats_text(stats))
-	_add_page_row(p_root, "Adaptive", "Enabled" if bool(_vt_settings().get("adaptive", false)) else "Disabled", "", "Shared page blocks may resize for demand")
-	_add_resident_page_rows(p_root, "AVT")
-	_add_region_rows(p_root)
+	TerrainVTEditorPageRows.add_avt_details(page_tree, p_root, _page_snapshot())
 
 
 func _add_svt_details(p_root: TreeItem) -> void:
-	var stats := _view_stats("SVT")
-	var page_world := float(_call(terrain, "get_surface_svt_page_world"))
-	_add_page_row(p_root, "SVT persisted material", "Runtime", "", "One baked source with a full mip chain per terrain block; GPU copies runtime cache pages")
-	_add_page_row(p_root, "Resident", str(_resident_pages("SVT").size()), "", _stats_text(stats))
-	var region_world := _region_world_size()
-	var density := float(_call(terrain, "get_surface_svt_texels_per_meter"))
-	var resolution := Vector2i(ceil(region_world.x * density), ceil(region_world.y * density))
-	var page_edge := maxi(1, int(_vt_settings().get("page_size", 256)))
-	var page_grid := Vector2i(ceili(float(resolution.x) / page_edge), ceili(float(resolution.y) / page_edge))
-	_add_page_row(p_root, "Result per terrain block", "%d x %d texels" % [resolution.x, resolution.y], "%.2f texels/m" % density, "%d x %d internal pages at mip 0; not separate terrain blocks" % [page_grid.x, page_grid.y])
-	_add_page_row(p_root, "Physical page footprint", "%.3f m" % page_world, "mip 0", "%d baked cell sources, each containing its mip chain" % _baked_pages().size())
-	_add_resident_page_rows(p_root, "SVT")
-	_add_baked_page_rows(p_root)
+	TerrainVTEditorPageRows.add_svt_details(page_tree, p_root, _page_snapshot())
 
 
 func _add_all_page_details(p_root: TreeItem) -> void:
-	_add_resident_page_rows(p_root, "")
-	_add_baked_page_rows(p_root)
+	TerrainVTEditorPageRows.add_all_page_details(page_tree, p_root, _page_snapshot())
 
 
 func _add_resident_page_rows(p_root: TreeItem, p_kind: String) -> void:
-	var pages := _resident_pages(p_kind)
-	if pages.is_empty():
-		_add_page_row(p_root, "Resident pages", "None", "", "No physical pages are currently published")
-		return
-	var count := 0
-	for record in pages:
-		if count >= MAX_PAGE_ROWS:
-			_add_page_row(p_root, "…", "Truncated", "", "%d more pages" % (pages.size() - count))
-			break
-		if typeof(record) != TYPE_DICTIONARY:
-			continue
-		var slot := int(record.get("slot", -1))
-		var kind := _record_kind(record)
-		var address: Vector2i = record.get("address", Vector2i())
-		var mip := int(record.get("mip", 0))
-		var ready := bool(record.get("ready", false))
-		var rect: Rect2 = record.get("world_rect", Rect2())
-		var owners: Array = record.get("owners", [])
-		var location := _location_for_world_rect(rect)
-		var row := _add_page_row(p_root, "Slot %d · %s" % [slot, kind], str(record.get("state", "Ready" if ready else "Pending")), "%s m%d" % [address, mip], "%s · owners %d" % [_rect_text(rect), owners.size()])
-		var cache_reason := str(record.get("cache_reason", "")).strip_edges()
-		if not cache_reason.is_empty():
-			row.set_tooltip_text(1, cache_reason)
-		row.set_metadata(0, {"slot": slot, "kind": kind, "location": location})
-		for owner in owners:
-			if typeof(owner) != TYPE_DICTIONARY:
-				continue
-			var child := _add_page_row(row, "Owner", str(owner.get("owner_type", kind)), str(owner.get("virtual", address)), "sector %s · mip %d" % [owner.get("sector", Vector2i()), int(owner.get("mip", mip))])
-			child.set_metadata(0, {"slot": slot, "kind": kind, "location": location})
-		count += 1
+	TerrainVTEditorPageRows.add_resident_page_rows(page_tree, p_root, _page_snapshot(), p_kind)
 
 
 func _add_baked_page_rows(p_root: TreeItem) -> void:
-	var pages := _baked_pages()
-	var filtered: Array = []
-	for record in pages:
-		if typeof(record) == TYPE_DICTIONARY and (record.get("storage", "") == "Baked cell mip chain" or int(record.get("mip", 0)) == _selected_baked_mip):
-			filtered.append(record)
-	if filtered.is_empty() and not pages.is_empty() and _selected_baked_mip != 0:
-		_add_page_row(p_root, "Baked material tiles", "No selected mip", "mip %d" % _selected_baked_mip, "Choose another mip from Baked mip")
-		return
-	if filtered.is_empty():
-		_add_page_row(p_root, "Baked material tiles", "None", "mip %d" % _selected_baked_mip, "Bake SVT cells to create persisted sources")
-		return
-	var groups := {}
-	var region_world := _region_world_size()
-	for record: Dictionary in filtered:
-		var rect: Rect2 = record.get("world_rect", Rect2())
-		var group_key: Variant = "shared" if rect.size.x > region_world.x or rect.size.y > region_world.y else _location_for_world_rect(rect)
-		if not groups.has(group_key):
-			groups[group_key] = []
-		groups[group_key].append(record)
-	var density := float(_call(terrain, "get_surface_svt_texels_per_meter"))
-	var resolution := Vector2i(ceil(region_world.x * density / pow(2.0, _selected_baked_mip)), ceil(region_world.y * density / pow(2.0, _selected_baked_mip)))
-	var rows_left := MAX_PAGE_ROWS
-	for group_key: Variant in groups:
-		var entries: Array = groups[group_key]
-		var shared := group_key is String
-		var name_text := "Shared coarse coverage" if shared else "Terrain block %s" % group_key
-		var parent := _add_page_row(p_root, name_text, "%d source files" % entries.size(), "mip %d" % _selected_baked_mip, "Shared by multiple blocks" if shared else "%d x %d texels per block" % [resolution.x, resolution.y])
-		parent.collapsed = true
-		if not shared:
-			parent.set_metadata(0, {"location": group_key, "kind": "SVT"})
-		for record: Dictionary in entries:
-			if rows_left <= 0:
-				_add_page_row(parent, "More internal pages", "Not expanded", "", "The block summary includes all stored pages")
-				break
-			rows_left -= 1
-			var rect: Rect2 = record.get("world_rect", Rect2())
-			var preview = record.get("preview", null)
-			var row := _add_page_row(parent, "Cell source %s" % record.get("address", Vector2i()), "Preview ready" if _is_valid_image(preview) else "File only", "mip %d" % _selected_baked_mip, _rect_text(rect))
-			row.set_metadata(0, {"slot": int(record.get("slot", -1)), "kind": "SVT", "baked": true, "location": _location_for_world_rect(rect), "preview": preview})
+	TerrainVTEditorPageRows.add_baked_page_rows(page_tree, p_root, _page_snapshot())
 
 
 func _add_region_rows(p_root: TreeItem) -> void:
-	var locations := _region_locations(_data)
-	if locations.is_empty():
-		_add_page_row(p_root, "Terrain regions", "None", "", "No loaded regions")
-		return
-	var root := _add_page_row(p_root, "Terrain regions", str(locations.size()), "", "Click a region to inspect its Terrain3DRegion data")
-	for location in locations:
-		var child := _add_page_row(root, "Region %s" % location, "Loaded", str(location), "Terrain3DRegion")
-		child.set_metadata(0, {"location": location})
+	TerrainVTEditorPageRows.add_region_rows(page_tree, p_root, _page_snapshot())
 
 
 func _add_page_row(p_parent: TreeItem, p_name: String, p_state: String, p_address: String, p_details: String) -> TreeItem:
-	var item := page_tree.create_item(p_parent)
-	item.set_text(0, p_name)
-	item.set_text(1, p_state)
-	item.set_text(2, p_address)
-	item.set_text(3, p_details)
-	return item
+	return TerrainVTEditorPageRows.add_row(page_tree, p_parent, p_name, p_state, p_address, p_details)
 
 
 func _on_page_item_selected() -> void:
@@ -1311,18 +1078,11 @@ func _region_rect_world(p_location: Vector2i, p_region_world: Vector2) -> Rect2:
 
 
 func _region_world_size() -> Vector2:
-	var region_size := float(_call(terrain, "get_region_size"))
-	var spacing := float(_call(terrain, "get_vertex_spacing"))
-	return Vector2(maxf(region_size * spacing, 1.0), maxf(region_size * spacing, 1.0))
+	return TerrainVTEditorPageRows.region_world_size(terrain)
 
 
 func _location_for_world_rect(p_rect: Rect2) -> Vector2i:
-	var region_world := _region_world_size()
-	return Vector2i(floori((p_rect.position.x + p_rect.size.x * 0.5) / region_world.x), floori((p_rect.position.y + p_rect.size.y * 0.5) / region_world.y))
-
-
-func _rect_text(p_rect: Rect2) -> String:
-	return "world %.1f,%.1f %.1fx%.1f" % [p_rect.position.x, p_rect.position.y, p_rect.size.x, p_rect.size.y]
+	return TerrainVTEditorPageRows.location_for_world_rect(p_rect, _region_world_size())
 
 
 func _on_overview_region_clicked(p_location: Vector2i) -> void:
@@ -1374,18 +1134,6 @@ func _baked_pages() -> Array:
 	return TerrainVTBridge.baked_pages(terrain)
 
 
-func _record_kind(p_record: Dictionary) -> String:
-	return TerrainVTBridge.record_kind(p_record)
-
-
-func _view_stats(p_kind: String) -> Dictionary:
-	return TerrainVTBridge.view_stats(terrain, p_kind)
-
-
-func _stats_text(p_stats: Dictionary) -> String:
-	return TerrainVTBridge.stats_text(p_stats)
-
-
 func _region_locations(p_data: Object) -> Array:
 	return TerrainVTBridge.region_locations(p_data)
 
@@ -1398,49 +1146,16 @@ func _call(p_target: Object, p_method: StringName, p_args: Array = []) -> Varian
 	return TerrainVTBridge.call_method(p_target, p_method, p_args)
 
 
+# The CDLOD controls are terrain geometry rather than virtual texturing, so they
+# live in their own panel module. The window keeps the container, when it is on
+# screen, and the delegations below.
 func _refresh_cdlod_panel() -> void:
-	for child in cdlod_panel.get_children():
-		cdlod_panel.remove_child(child)
-		child.queue_free()
-	cdlod_panel.show()
-	if not terrain.has_method("get_cdlod_stats"):
-		cdlod_panel.add_child(_make_setting_label("Rebuild the terrain extension to enable CDLOD."))
+	if _cdlod == null:
 		return
-	var enabled := CheckButton.new()
-	enabled.name = "CDLODEnabled"
-	enabled.text = "Enable CDLOD"
-	enabled.set_pressed_no_signal(bool(terrain.get("cdlod_enabled")))
-	enabled.toggled.connect(_on_cdlod_setting.bind("cdlod_enabled"))
-	cdlod_panel.add_child(enabled)
-	cdlod_panel.add_child(_make_setting_label("LOD distance scale"))
-	var scale := _make_spin(8, 32, 0.5)
-	scale.name = "CDLODLODScale"
-	scale.set_value_no_signal(float(terrain.get("cdlod_lod_scale")))
-	scale.value_changed.connect(_on_cdlod_setting.bind("cdlod_lod_scale"))
-	cdlod_panel.add_child(scale)
-	var status := Label.new()
-	status.name = "CDLODMode"
-	cdlod_panel.add_child(status)
-	_sync_cdlod_panel()
+	_cdlod.refresh(terrain)
 
 
 func _sync_cdlod_panel() -> void:
-	if not is_instance_valid(cdlod_panel) or not cdlod_panel.visible:
+	if _cdlod == null:
 		return
-	var enabled := cdlod_panel.get_node_or_null("CDLODEnabled") as CheckButton
-	var status := cdlod_panel.get_node_or_null("CDLODMode") as Label
-	if enabled == null or status == null:
-		return
-	enabled.set_pressed_no_signal(bool(terrain.get("cdlod_enabled")))
-	var stats: Dictionary = terrain.get_cdlod_stats()
-	status.text = "Current mode: " + str(stats.get("backend", "Clipmap"))
-
-
-
-func _on_cdlod_setting(p_value: Variant, p_property: String) -> void:
-	if terrain == null or not is_instance_valid(terrain):
-		return
-	terrain.set(p_property, p_value)
-	_sync_cdlod_panel()
-	if Engine.is_editor_hint():
-		EditorInterface.mark_scene_as_unsaved()
+	_cdlod.sync(terrain)

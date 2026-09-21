@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DMaterial, part 2 of 3: the resource, its properties and save.
+// Terrain3DMaterial, part 2 of 4: the resource, its properties and save.
 
-// One of three files that define the resource. `initialize()`, `uninitialize()`, `destroy()` and
+// One of four files that define the resource. `initialize()`, `uninitialize()`, `destroy()` and
 // `update()` are the object's lifecycle, and every `set_*` the inspector, the scene file and a
 // script can write is here with the corresponding read. A setter owns its side effect rather than
 // only storing a value: the flags call `_update_shader()`, the outputs and debug views call

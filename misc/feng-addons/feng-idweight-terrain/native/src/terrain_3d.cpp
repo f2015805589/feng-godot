@@ -122,7 +122,7 @@ void Terrain3D::_initialize() {
 void Terrain3D::_invalidate_render_geometry() {
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	if (_terrain_mesher) { _terrain_mesher->invalidate_region_geometry(); }
@@ -190,7 +190,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	}
 	if (is_vt_editor_preview_active()) {
 		// Explicit offline baking remains available; navigation and painting do not stream VT.
-		if (!_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty()) {
+		if (_vt.bake.busy()) {
 			_update_vt_service();
 			_process_svt_bake(1);
 		}
@@ -253,7 +253,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// buys the same pages for the cost of one; what the top-up gave the near field, its share
 	// reserves instead.
 	int vt_remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
-	const bool svt_baking = !_vt.vt_svt_bake_queue.is_empty() || !_vt.vt_svt_bake_waiting.is_empty();
+	const bool svt_baking = _vt.bake.busy();
 	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
 	// How much of this tick's page budget the near field may take, and what the far field gets

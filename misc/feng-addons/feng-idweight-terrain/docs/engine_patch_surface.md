@@ -46,7 +46,35 @@ after the command that wrote the buffer and barriers the two. Nothing in `driver
   block-relative row length themselves;
 * it must not be called with a draw or compute list open - the same rule `texture_update()` has.
 
-## 2. Addon side - how the extension uses it without depending on it
+## 2. `RenderingServer::virtual_texture_set_update_callback` - the render-thread page producer
+
+**What it does.** Registers a callable the renderer invokes on the render thread, once per frame, as
+one pass of the frame. The terrain registers the VT baker's `render_pending()` there, because page
+encoding, composition and readback are GPU work that has to be recorded inside a frame - a demand
+pass on the main thread can only queue what that pass will do. Without the hook no material page is
+ever baked, and the node prints one warning and renders from the region texture array instead.
+
+**Patch surface (two spots):**
+
+| file | change |
+|---|---|
+| `servers/rendering/rendering_server.h` | two declarations, the callback map and its mutex |
+| `servers/rendering/rendering_server.cpp` | the two bodies, `execute_virtual_texture_updates()`, and the `ClassDB::bind_method` lines that expose all three |
+
+**Who runs it.** The FRP pass context: `FRPPassContext::execute_virtual_texture_updates()`
+(`servers/rendering/renderer_rd/frp_clustered/frp_pass_context.cpp`) invokes the registered callables
+as one pass, reached from `render_frp_clustered.cpp` and listed in `doc/frp-engine-contract.md`
+beside `precompute_shadows()` and `prepare_lighting()`. This half is the fork's own pipeline rather
+than a terrain patch, but the terrain cannot produce a page without it: a project that does not run
+FRP leaves every VT page unproduced, which is the failure the addon's warning names.
+
+**Addon side.** `terrain_3d_vt_service.cpp` resolves both methods with `has_method()` and calls them
+through `RS->call(...)`, so a stock engine resolves to no method, prints one `WARN_PRINT`, and the
+terrain keeps rendering from the region texture array. `get_vt_settings()` reports the state as
+`callback_registered` (and `editor_preview_active` for the editor-only preview path that pauses
+production).
+
+## 3. Addon side - how the extension uses it without depending on it
 
 `native/src/rd_gpu_copy.{h,cpp}` resolves the method **by name at runtime** and caches the method
 bind, so nothing links against the fork:
@@ -79,8 +107,15 @@ its encoded layers being resident, which the direct path makes zero.
 1. Search the new engine source for `texture_copy_from_buffer`. If it is absent, re-apply the three
    spots above (the file is self-contained; the two edits outside it are one declaration and one
    binding line).
-2. Rebuild the engine: `scons platform=windows target=editor arch=x86_64`.
-3. Refresh `TEXTURE_COPY_FROM_BUFFER_HASH` from `--dump-extension-api` **only if the signature
+2. Search for `virtual_texture_set_update_callback`. If it is absent, re-apply section 2: two
+   declarations, the callback map with its mutex, `execute_virtual_texture_updates()` and its
+   bindings. Then check that the new engine's FRP pass context still calls
+   `execute_virtual_texture_updates()` once per frame; without that call the patch is present and
+   the pages still never bake.
+3. Rebuild the engine: `scons platform=windows target=editor arch=x86_64`.
+4. Refresh `TEXTURE_COPY_FROM_BUFFER_HASH` from `--dump-extension-api` **only if the signature
    changed**.
-4. Rebuild the addon from `misc/feng-addons/feng-idweight-terrain/native`:
+5. Rebuild the addon from `misc/feng-addons/feng-idweight-terrain/native`:
    `scons platform=windows target=template_debug arch=x86_64`.
+6. `native/tests/vt_material_runner.py` is the check that the hook is live end to end: it requires
+   `callback_registered` and a page produced by the render-thread pass.

@@ -5,7 +5,8 @@
 // Invalidation - one slot, one region, every material - the queue that turns a payload the
 // producer finished into a material page, the resident far-field cell sources a page is assembled
 // from, and the two helpers that decide whether such a page can be assembled at all. None of it
-// plans demand; the demand passes are in terrain_3d_vt_demand.cpp and terrain_3d_sector_avt.cpp.
+// plans demand; the demand passes are in terrain_3d_surface_views_far_walk.cpp,
+// terrain_3d_surface_views_near.cpp and terrain_3d_sector_avt.cpp.
 //
 // The other halves: terrain_3d_vt_service.cpp (settings and lifetime),
 // terrain_3d_vt_service_report.cpp (the diagnostics) and terrain_3d_vt_service_bake.cpp (the far
@@ -81,13 +82,11 @@ void Terrain3D::_process_async_svt_pages() {
 				// A running explicit job already covers these cells: a full bake covers every
 				// region. Arming the automatic job here makes it start the frame the explicit
 				// job drains and replace its job-scoped progress counters.
-				const bool explicit_job = _vt.vt_svt_explicit_bake ||
-						!_vt.vt_svt_bake_queue.is_empty() ||
-						!_vt.vt_svt_bake_waiting.is_empty();
+				const bool explicit_job = _vt.bake.explicit_job || _vt.bake.busy();
 				if (_vt.svt_auto_bake && !_data_directory.is_empty() && !explicit_job) {
 					for (const Vector2i &cell : result.missing) {
-						if (_vt.vt_svt_dirty_regions.is_empty()) { _vt.vt_svt_edit_time = 0; }
-						_vt.vt_svt_dirty_regions[cell] = true;
+						if (_vt.bake.dirty_regions.is_empty()) { _vt.bake.edit_time = 0; }
+						_vt.bake.dirty_regions[cell] = true;
 					}
 				}
 			}
@@ -177,6 +176,49 @@ String Terrain3D::_svt_page_path(const Vector2i &p_address) const {
 	}
 	// Mip 0 names the cell; the cell's own mip chain lives inside the file.
 	return TerrainVTCell::path(_data_directory, p_address, 0);
+}
+
+// How long a published page may stay without content before demand produces it again. Long
+// enough that a bake, a cell copy and an asynchronous page read all complete first, short
+// enough that a production that was dropped, refused, or that failed leaves the view missing
+// for a fraction of a second.
+static const uint64_t SVT_PAGE_RETRY_FRAMES = 30;
+
+// A page is only a hit when its content is actually there. The virtual texture's
+// indirection entry survives an invalidation - `_invalidate_vt_slot()` clears the material
+// slot, not the table - so a page whose production was dropped, refused for lack of a
+// source, or lost to a failed cell copy stays named by the table while the shader samples
+// an empty layer. `request_world_page_internal()` then reports it as a hit, so nothing ever
+// retried it: that is the far field that loads on one run and not on the next. Demand asks
+// the producer, and only a page with content or with a recent production in flight is a hit.
+//
+// Both demand passes, the near field's production pass and the service ask this, so it belongs
+// to page plumbing rather than to either view, and it sits beside the record it reads.
+bool Terrain3D::_vt_page_production_stale(int p_slot) {
+	return _vt_page_production_stale(p_slot, -1);
+}
+
+bool Terrain3D::_vt_page_production_stale(int p_slot, int p_ready) {
+	if (p_slot < 0) {
+		return true;
+	}
+	// A caller that has already asked the producer about a whole set passes that answer in,
+	// so a verification pass costs one lock instead of one per page. The retry window below
+	// is read from this side's records and needs no lock either way.
+	if (p_ready < 0) {
+		Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+		p_ready = (producer && producer->is_page_ready(p_slot)) ? 1 : 0;
+	}
+	if (p_ready != 0) {
+		return false;
+	}
+	if (_vt.vt_page_records.has(p_slot)) {
+		const Dictionary record = _vt.vt_page_records[p_slot];
+		const uint64_t queued = uint64_t(int64_t(record.get("queued_frame", 0)));
+		const uint64_t now = Engine::get_singleton()->get_process_frames();
+		return now > queued + SVT_PAGE_RETRY_FRAMES;
+	}
+	return true;
 }
 
 bool Terrain3D::debug_invalidate_vt_page(int p_slot) {
@@ -447,7 +489,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
-	invalidate_avt_plan_key(_vt.avt_plan_key);
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->reset(); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->reset(); }
 	// A resident far-field cell is stale from the moment a region in it - or beside it, since
@@ -459,8 +501,8 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 			_vt.svt_cell_file_probe.erase((int64_t(cell.x) << 32) ^ uint32_t(cell.y));
 		}
 	}
-	_vt.vt_svt_dirty_regions[p_region] = true;
-	_vt.vt_svt_edit_time = Time::get_singleton()->get_ticks_msec();
+	_vt.bake.dirty_regions[p_region] = true;
+	_vt.bake.edit_time = Time::get_singleton()->get_ticks_msec();
 	if (_vt.vt_baker.is_null()) {
 		return;
 	}
@@ -471,10 +513,10 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 		Dictionary record = _vt.vt_page_records[keys[i]];
 		Rect2 rect = record["world_rect"];
 		if (rect.grow(MAX(_vertex_spacing, rect.size.x * float(_vt.vt_page_border + 1) / _vt.vt_page_size)).intersects(affected)) {
-			if (_vt.vt_svt_bake_waiting.has(keys[i])) {
+			if (_vt.bake.waiting.has(keys[i])) {
 				Vector2i address = record["address"];
-				_vt.vt_svt_bake_queue.push_back(Vector3i(address.x, address.y, int(record["mip"])));
-				_vt.vt_svt_bake_waiting.erase(keys[i]);
+				_vt.bake.queue.push_back(Vector3i(address.x, address.y, int(record["mip"])));
+				_vt.bake.waiting.erase(keys[i]);
 			}
 			baker(_vt.vt_baker)->invalidate_slot(int(keys[i]));
 			// Border edits can affect a neighbour's page. Remove its address too,

@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The two surface views, part 1 of 3: the view objects and the settings that size them.
+// The two surface views, part 1 of 4: the view objects and the settings that size them.
 
-// One of three files that define the two views and their demand passes. The two views' setup and
+// One of four files that define the two views and their demand passes. The two views' setup and
 // teardown
 // (`_setup_surface_vt()`, `_setup_surface_svt()`, `_configure_surface_view()` and their destroy
 // counterparts) and every setting the dock, the inspector and scripts write: the two enables, both
@@ -20,7 +20,9 @@
 // call `_reset_vt_configuration()`, which cancels a bake in flight, marks the shared setup and the
 // far field's startup gate as unproven and rebinds the material.
 //
-// The other halves: `terrain_3d_surface_views_far.cpp` (the far field's demand pass) and
+// The other halves: `terrain_3d_surface_views_far.cpp` (the far field's pass and the one
+// distance -> level rule it walks), `terrain_3d_surface_views_far_walk.cpp` (the far field's root
+// pyramid plan, its visible walk and the pass that spends the budget on them) and
 // `terrain_3d_surface_views_near.cpp` (the near field's pass, its feedback pass and the sector machinery).
 
 #include "terrain_3d.h"
@@ -225,7 +227,7 @@ void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_force) {
 	if (!p_force && is_vt_editor_preview_active()) {
 		_vt.vt_editor_dirty_regions[p_region_loc] = true;
-		_vt.vt_svt_dirty_regions[p_region_loc] = true;
+		_vt.bake.dirty_regions[p_region_loc] = true;
 		return;
 	}
 	_invalidate_vt_region(p_region_loc);

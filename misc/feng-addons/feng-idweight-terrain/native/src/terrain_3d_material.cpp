@@ -1,8 +1,8 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DMaterial, part 1 of 3: the shader and the uniforms it is filled with.
+// Terrain3DMaterial, part 1 of 4: the shader and the uniforms it is filled with.
 
-// One of three files that define the resource. `_update_shader()` installs the compiled shader on
+// One of four files that define the resource. `_update_shader()` installs the compiled shader on
 // the terrain's material and the displacement-buffer material, builds the noise and gradient
 // textures the shader samples, and re-applies every saved parameter; the three uniform passes below
 // it fill in the rest - `_update_vt_uniforms()` the virtual texture's samplers, block table, page

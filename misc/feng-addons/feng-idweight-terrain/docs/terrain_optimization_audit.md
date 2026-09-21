@@ -113,7 +113,7 @@ The inventory below covers native and editor implementation; additional tools/ex
 - [x] native/src/terrain_3d_virtual_texture_lookup.cpp
 - [x] native/src/terrain_3d_virtual_texture_sector.cpp
 - [x] native/src/terrain_3d_surface_views_near.cpp
-- [x] native/src/terrain_3d_vt_demand.cpp
+- [x] native/src/terrain_3d_surface_views_far_walk.cpp (was terrain_3d_vt_demand.cpp)
 - [x] native/src/terrain_3d_vt_fade.cpp
 - [x] native/src/terrain_3d_vt_feedback.cpp
 - [x] native/src/terrain_3d_vt_feedback.h
@@ -702,7 +702,7 @@ The new header also has a gotcha worth more than the header itself: **a Godot ty
 qualified in a header that can be included first.** `Rect2` and `Vector2` are in `namespace godot`, and
 the `using namespace godot;` that makes them writable unqualified lives in `terrain_3d_vt_visibility.h`
 and `constants.h` — which every other header in the addon happens to be included after. This one is
-first in `terrain_3d_vt_demand.cpp`, so it needed `godot::Rect2`. Two builds were spent on that, and
+first in `terrain_3d_surface_views_far_walk.cpp` (then `terrain_3d_vt_demand.cpp`), so it needed `godot::Rect2`. Two builds were spent on that, and
 the same two on including `terrain_vt.h`, which does not declare `VisiblePatch` at all — that is in
 `terrain_3d_vt_visibility.h`.
 
@@ -889,7 +889,7 @@ is exact. The duplication is recorded here as *deliberate* rather than as debt.
 * `Terrain3DVirtualTexture::_request_virtual()` is declared private, but sat between
   `request_page()` and `request_page_internal()` in the `.cpp`, so the "Public Functions" banner was
   wrong about one of the three. Moved, with no text changed.
-* `terrain_3d_vt_demand.cpp` carried an exact duplicate of the first line of a comment block as a
+* `terrain_3d_surface_views_far_walk.cpp` (then `terrain_3d_vt_demand.cpp`) carried an exact duplicate of the first line of a comment block as a
   stray line two blanks above the block it copies, and six other files plus that one separated two
   definitions with two blank lines. Both are gone, and the tree now contains no double blank line.
 * `Terrain3DData::_grow_slot_capacity()`'s ceiling comment named `MAX_REGIONS`, which is a GLSL macro
@@ -2756,10 +2756,79 @@ new. Both are recorded here because the technique is reused, and the third refin
   `vt_turn_budget` (the frame-budget assertion) all pass.
 * Full suite: SUITE_NUMBER
 
+## The VT window: 1,446 lines of shell, rows and three panels
 
+`vt_editor.gd` was the largest shipped GDScript file and it held five jobs: the Page
+tree's row builders, the mip distance band table, the CDLOD controls, the phrasing of
+the bake status, and the window itself. The window is the shell - widgets, selection
+state, which view is shown - and the other four are now siblings:
 
+| script | lines | owns |
+| --- | --- | --- |
+| `src/vt_editor.gd` | 1,161 | The window: the widget tree, the selection state, which hierarchy view is shown, and one-line delegations to everything below. |
+| `src/vt_editor_page_rows.gd` | 229 | The Page tree's rows, as pure functions over one `Snapshot` of the terrain, plus the TreeItem metadata the window reads back on selection. |
+| `src/vt_editor_svt_bands.gd` | 153 | The mip distance band table: one spin box per level, the automatic rule, the two rule buttons and the hint that describes both. |
+| `src/vt_editor_cdlod_panel.gd` | 77 | The CDLOD controls, which are terrain geometry rather than virtual texturing. |
+| `src/vt_editor_widgets.gd` | 35 | The settings label and the clamped spin box the panels share. |
 
+### The rows moved first, and why
 
+The row builders were the part of the file with real branching: two page kinds, owners
+nested under their slot, baked sources grouped per terrain block, a coarse tile listed
+once as shared coverage, and truncation. They read the terrain eleven times per refresh
+to do it, interleaved with the tree writes. `TerrainVTEditorPageRows.Snapshot` is now one
+read of the terrain and the builders take it, so the tree's shape can be reasoned about -
+and exercised - without a window or a live scene, in the style `vt_overview_image.gd`
+already used for the overview. The metadata contract (`location`, `slot`, `kind`,
+`baked`, `preview`) is written in one file, and it is also the file that documents what
+each key selects.
 
+### What was deliberately not split
 
+`_build_ui()` is still 201 lines. The preceding round recorded why it was left alone -
+"splitting a UI builder means extracting the widgets it creates into named builders" -
+and that reason still holds: the editor tests reach the window by node name
+(`find_child("CDLODEnabled")`, `vt_editor.page_size_spin`, `vt_editor.avt_band_spins`),
+so the fields a split would have to hand back are exactly the fields the tests read. The
+two panels that *did* move own their own controls because no test reads those nodes.
+`_refresh_bake_status()` (28 lines of branches over the settings dictionary) could be a
+pure function next, but its assertions live in the window's test, so it should move with
+them rather than before them.
 
+### The comment damage this file carried
+
+Every unindented comment block in `vt_editor.gd` had its lines separated by two blank
+lines - the header, `open_vt_page_view()`'s doc comment and the band table's. Nothing
+else in the addon has that shape (`indent` cannot see it and no audit mode looks at blank
+runs), so it was read as damage rather than style and repaired: the header and
+`open_vt_page_view()` read as paragraphs again, and the block that moved into
+`vt_editor_svt_bands.gd` was written joined. The new modules have no blank run longer
+than the two lines that separate members.
+
+### How it was verified
+
+* `bin/perf_probe/check_editor_literals.py` compares the pre-split window's string
+  literals with the union of the window and the four new modules: 344 before, 344 after,
+  nothing lost and nothing gained. A moved format string or node name cannot hide in a
+  file the parser accepts.
+* All eight code audits green: no dead function, no unread parameter, no duplicate body,
+  no mixed indentation, no comment naming something that does not exist.
+* Targeted: `editor_dock:dock` passed once (it drives the whole window - page rows with
+  baked blocks, the bake button, the overview stitch), `vt_adaptive:cdlod` passed twice
+  (it drives the CDLOD toggle, the backend label and, in `vt_resolution_controls`, the
+  density changes that invalidate the band table), and `editor_dock:svt_inspector` and
+  `editor_dock:slider` passed. `vt_adaptive:ownership` reports only its documented
+  pre-existing rendering failure while its `_add_baked_page_rows()` block grouping
+  assertions pass.
+* `editor_dock:dock` is the flake in this environment, and the flake is not this change:
+  it passed one run in four, and all three failures are the same environmental hit test
+  (`mouse event did not reach .../MeshesBtn at (347.0, 1251.0); hovered=<Object#null>`) -
+  a point below the editor viewport in the asset dock, which this change does not touch,
+  with no GDScript error in the log. Some of those runs also log the editor's own
+  `Can't use get_node() with absolute paths...` while tearing down the aborted test; it
+  has no GDScript frame, and no script in the addon or the tests asks for an absolute node
+  path, so it is a consequence of the early return rather than a call the window makes. The
+  runs that failed it still opened the window from the inspector's VT Page action and
+  refreshed it without error.
+* No C++ changed, so `scons platform=windows target=template_debug` reports the DLL and
+  godot-cpp up to date rather than rebuilding.
