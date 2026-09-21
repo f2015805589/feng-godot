@@ -57,10 +57,9 @@ struct PlanInput {
 	int tail_cap = 0;
 	int root_level = 0;
 	int page_size = 0;
-	// The last local mip a sector block may hold, from `Terrain3D::get_avt_mip_level_cap()`. The
-	// demand walk starts a 64 m sector's chain at this level instead of at `log2(size)`, so the
-	// plan holds the chain length the shader serves (`main.glsl`'s `top` clamp is the same number).
-	int mip_level_cap = 32;
+	int mip_level_cap = 2;
+	float section_world = 64.f;
+	Terrain3DAVTCoarseImage coarse;
 };
 
 // Selects the page set for one plan key. Runs on the plan worker; the result is

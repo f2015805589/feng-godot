@@ -176,6 +176,7 @@ void Terrain3D::_bind_methods() {
 	// Target Tracking
 	ClassDB::bind_method(D_METHOD("set_camera", "camera"), &Terrain3D::set_camera);
 	ClassDB::bind_method(D_METHOD("get_camera"), &Terrain3D::get_camera);
+	ClassDB::bind_method(D_METHOD("get_avt_layout_preview", "camera"), &Terrain3D::get_avt_layout_preview);
 	ClassDB::bind_method(D_METHOD("set_clipmap_target", "node"), &Terrain3D::set_clipmap_target);
 	ClassDB::bind_method(D_METHOD("get_clipmap_target"), &Terrain3D::get_clipmap_target);
 	ClassDB::bind_method(D_METHOD("get_clipmap_target_position"), &Terrain3D::get_clipmap_target_position);
@@ -409,14 +410,12 @@ void Terrain3D::_bind_methods() {
 	// docs/vt_sampling_review.md. The hint's own wording is the only place a caller sees "0 is
 	// auto", so it carries it.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_anisotropy", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_vt_anisotropy", "get_surface_vt_anisotropy");
-	// The near field's local mip chain, as a level count. 0 is automatic and is the shipped chain
-	// (the block size's own, nine levels at the default density); a positive value cuts the chain
-	// at that many levels, which is fewer coarse pages and a coarser fallback for a late page.
-	// The hint's wording carries the "0 is auto" contract, as the anisotropy property's does.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_mip_levels", PROPERTY_HINT_RANGE, "0,16,1,or_greater"), "set_surface_vt_mip_levels", "get_surface_vt_mip_levels");
+	// Number of sector image resolution tiers, default three. Each allocated
+	// block retains its complete local mip chain independently of this count.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_mip_levels", PROPERTY_HINT_RANGE, "2,16,1"), "set_surface_vt_mip_levels", "get_surface_vt_mip_levels");
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (Resident Baseline)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_grid", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_grid", "get_surface_vt_region_grid");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "surface_vt_region_offset", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_region_offset", "get_surface_vt_region_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_vt_forward_regions", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_forward_regions", "get_surface_vt_forward_regions");

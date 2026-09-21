@@ -4,11 +4,9 @@
 
 // One of five files that own the near field. A page costs several frames to assemble
 // and a compressed one several more to encode and read back, so demand issued at the moment a page
-// becomes visible can only ever be late. The plan therefore describes the camera one lead ahead -
-// both where it will be and where it will be looking, because a turn brings new world into the
-// frustum exactly as a step does: `_vt_update_motion_lead()` smooths the velocity and the turn rate
-// and slews both leads so that a noisy frame time cannot swing the working set, and
-// `_vt_plan_key_transform()` quantizes the predicted transform so the key only changes when the
+// becomes visible can only ever be late. Motion helpers estimate a bounded lead for callers
+// that prefetch. Sector AVT selects current-view demand and nearby omnidirectional roots;
+// `_vt_plan_key_transform()` quantizes the actual transform so the key only changes when the
 // camera leaves a cell - a key that changed every frame would re-derive every page address and
 // throw away the worker's time on each tick.
 //
@@ -38,7 +36,7 @@ constexpr float MOTION_LEAD_SLEW_RATE = 40.f;
 // Two ticks closer together than this carry no new motion information: a displacement over
 // almost no elapsed time is a velocity spike, and the demand plans with its result.
 constexpr uint64_t MOTION_MIN_INTERVAL_US = 1000;
-// The predicted transform is snapped to this grid (metres, and radians for yaw) so the
+// The actual transform is snapped to this grid (metres, and radians for yaw) so the
 // plan key is stable while the camera moves inside one cell. A plan key that changes every
 // frame re-derives the whole working set every frame: every page address is re-selected,
 // every source job in flight for the previous selection is thrown away, and the worker
@@ -55,7 +53,7 @@ constexpr float MOTION_HEIGHT_QUANTUM = 2.f;
 // - which throws the worker's time away, keeps the working set churning instead of
 // converging, and is what makes a turn refine in visible blocks. Two degrees of yaw is
 // under a third of a frame at a fast 6 degrees per frame, and the pages are still selected
-// from the exact predicted transform: the key only decides when a selection is re-derived.
+// from the exact actual transform: the key only decides when a selection is re-derived.
 constexpr float MOTION_YAW_QUANTUM = 0.034906585f; // 2 degrees
 constexpr float MOTION_PITCH_QUANTUM = 0.026179939f; // 1.5 degrees
 constexpr float MOTION_ROLL_QUANTUM = 0.052359878f; // 3 degrees
@@ -235,14 +233,14 @@ Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_tra
 	return lead;
 }
 
-// The transform the plan key is derived from: the predicted transform snapped to a grid, so the
+// The transform the plan key is derived from: the actual transform snapped to a grid, so the
 // key is unchanged while the camera moves inside one cell. A key that changes every frame
 // re-plans the whole working set every frame, and every source job already in flight for the
-// previous selection is thrown away with it. The demand itself still uses the exact predicted
+// previous selection is thrown away with it. The demand itself still uses the exact actual
 // transform - snapping the geometry pages are selected from would move the mip boundaries the
 // shader selects against, trading a key-identity problem for a paint one.
 Transform3D Terrain3D::_vt_plan_key_transform(const Transform3D &p_camera_transform) const {
-	Transform3D keyed = _vt_lead_camera_transform(p_camera_transform);
+	Transform3D keyed = p_camera_transform;
 	keyed.origin.x = Math::round(keyed.origin.x / MOTION_PLAN_QUANTUM) * MOTION_PLAN_QUANTUM;
 	keyed.origin.z = Math::round(keyed.origin.z / MOTION_PLAN_QUANTUM) * MOTION_PLAN_QUANTUM;
 	keyed.origin.y = Math::round(keyed.origin.y / MOTION_HEIGHT_QUANTUM) * MOTION_HEIGHT_QUANTUM;

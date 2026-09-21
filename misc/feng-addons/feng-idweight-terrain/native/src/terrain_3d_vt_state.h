@@ -625,15 +625,8 @@ struct Terrain3DVTState {
 	// `vt_page_border - 0.5`, and the two places that used to spell the rule separately now ask
 	// that one function. Eight is the default because it is what the default gutter admits.
 	int surface_vt_anisotropy = 8;
-	// The near field's local mip chain, as a level count: how many levels a sector's virtual image
-	// is allowed to keep above its finest. Zero is automatic and is the shipped behaviour - the
-	// chain is whatever the block size gives (`log2(get_avt_base_block_size()) + 1` levels, nine at
-	// the default density). The chain is what a fragment falls back *through*: a missing fine page
-	// resolves at the next level that is resident, so a shorter chain costs fallback depth and a
-	// longer one costs pages. This is not the block size and it does not move the finest resolution
-	// a sector can serve; `get_avt_mip_level_cap()` is the one reader of the setting, and both the
-	// plan's depth and the shader's `top` clamp come from it.
-	int surface_vt_mip_levels = 0;
+	// Sector virtual-image resolution tiers; this does not truncate local page-table mips.
+	int surface_vt_mip_levels = 3;
 	int surface_vt_pages_per_axis = 4;
 	// The near field's reach, in metres around the camera. It is the working set's radius: the plan
 	// covers the reach plus a sector of margin, and its size follows the area (measured at one fixed
@@ -651,6 +644,7 @@ struct Terrain3DVTState {
 	PackedByteArray avt_directory_bytes;
 	int avt_directory_mask = 0;
 	int avt_root_level = 1;
+	Terrain3DAVTCoarseImage avt_coarse;
 	Dictionary avt_sector_stats;
 	// Stage sums for the same pass, so the mean of a stage can be read beside the live value of
 	// the last one. The dictionary only ever holds the pass that just ran, and a pass that

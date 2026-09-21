@@ -469,14 +469,13 @@ func _build_settings_panel() -> VBoxContainer:
 	anisotropy_spin.tooltip_text = "Anisotropic filtering the near field asks for: 2, 4, 8 or 16 times, or 0 to follow the viewport's filtering level. The border above is the hard bound, so a request wider than border - 0.5 is filtered at the border. The effective value is Terrain3D.get_vt_settings()[\"avt_anisotropy_effective\"]."
 	anisotropy_spin.value_changed.connect(_on_setting_value_changed.bind("anisotropy"))
 	grid.add_child(anisotropy_spin)
-	# The fallback ladder's depth. It sits beside the two numbers above because all three are the
-	# same decision: the density fixes the finest level, the gutter fixes the filtering, and this
-	# fixes how many coarse levels a late page may resolve through. Automatic is the block's own
-	# chain (nine levels at the default density) and is the shipped behaviour.
-	grid.add_child(_make_setting_label("Mip levels (near field)"))
-	mip_levels_spin = _make_spin(0, 16, 1)
+	# This count chooses the virtual image resolution tier for each fixed 64 m
+	# world sector. Every allocated sector still carries its complete local page
+	# mip chain, so this setting is not a local-chain truncation.
+	grid.add_child(_make_setting_label("AVT resolution tiers"))
+	mip_levels_spin = _make_spin(2, 16, 1)
 	mip_levels_spin.name = "MipLevels"
-	mip_levels_spin.tooltip_text = "Local mip levels a 64 m sector block may keep: 0 is automatic, which is the block size's own chain (nine levels at 1024 texels/metre). A smaller number holds fewer coarse pages and leaves a late fine page resolving at a coarser level, so it is a residency setting paid for in fallback sharpness. Terrain3D.get_vt_settings()[\"avt_mip_level_cap\"] is the level the plan and the shader actually clamp to."
+	mip_levels_spin.tooltip_text = "Resolution tiers per fixed 64 m world sector (default 3: 64k/32k/16k, 1024/512/256 texels/m). Ten tiers extend to a 128x128 sector image (2 texels/m). Each allocated sector keeps its complete local page mip chain; cold sectors need not expose every tier immediately."
 	mip_levels_spin.value_changed.connect(_on_setting_value_changed.bind("mip_levels"))
 	grid.add_child(mip_levels_spin)
 	grid.add_child(_make_setting_label("Shared page count"))
@@ -501,12 +500,12 @@ func _build_settings_panel() -> VBoxContainer:
 	grid.add_child(_make_setting_label("AVT coverage"))
 	avt_mode_option = OptionButton.new()
 	avt_mode_option.name = "AVTCoverage"
-	avt_mode_option.add_item("Camera range / 64 m sectors", 2)
+	avt_mode_option.add_item("Camera range / coarse base + 64m sectors", 2)
 	avt_mode_option.add_item("Legacy region view", 0)
 	avt_mode_option.add_item("Legacy target grid", 1)
 	avt_mode_option.item_selected.connect(_on_avt_mode_selected)
 	grid.add_child(avt_mode_option)
-	grid.add_child(_make_setting_label("AVT texels / metre"))
+	grid.add_child(_make_setting_label("Fine max density (texels / metre)"))
 	avt_density_spin = _make_spin(1, 8192, 1)
 	avt_density_spin.name = "AVTTexelsPerMeter"
 	avt_density_spin.value_changed.connect(_on_density_changed.bind("vt"))
@@ -519,14 +518,14 @@ func _build_settings_panel() -> VBoxContainer:
 	avt_density_hint = Label.new()
 	avt_density_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	panel.add_child(avt_density_hint)
-	panel.add_child(_make_setting_label("AVT automatic mip density (texels / metre)"))
+	panel.add_child(_make_setting_label("AVT resolution tier density ceilings (texels / metre)"))
 	avt_band_grid = GridContainer.new()
 	avt_band_grid.columns = 2
 	panel.add_child(avt_band_grid)
 	grid.add_child(_make_setting_label("AVT range (metres)"))
 	avt_distance_spin = _make_spin(64, 65536, 64)
 	avt_distance_spin.name = "AVTRange"
-	avt_distance_spin.tooltip_text = "Camera-centred near field across terrain blocks. The outer 25% blends into SVT; page count stays bounded."
+	avt_distance_spin.tooltip_text = "Camera-centred AVT radius across fixed 64 m sectors and the coarse base. Outside this radius uses SVT; page count stays bounded."
 	avt_distance_spin.value_changed.connect(_on_avt_range_changed)
 	grid.add_child(avt_distance_spin)
 	editor_preview_button = CheckButton.new()
@@ -538,7 +537,7 @@ func _build_settings_panel() -> VBoxContainer:
 	adaptive_button = CheckButton.new()
 	adaptive_button.name = "AdaptiveAVT"
 	adaptive_button.text = "Adaptive AVT allocation"
-	adaptive_button.tooltip_text = "Allow adaptive blocks to resize while preserving overlapping cached pages"
+	adaptive_button.tooltip_text = "Allow per-sector virtual resolution allocations to adapt while preserving overlapping cached pages"
 	adaptive_button.toggled.connect(_on_adaptive_toggled)
 	panel.add_child(adaptive_button)
 	avt_enabled_button = CheckButton.new()
@@ -636,9 +635,13 @@ func _refresh_header() -> void:
 		"ready" if shared else "pending", "on" if adaptive else "off", resident, cached_blocks.size(), baked, pending]
 	if int(settings.get("avt_selection_mode", 0)) == 2:
 		var sectors: Dictionary = settings.get("avt_sector_stats", {})
-		summary_label.text += "\nFull AVT · 64 m sectors: %d visible, %d independent · %d shared coarse pages · max allocated %d texels" % [
-			int(sectors.get("visible_sectors", 0)), int(sectors.get("independent_sectors", 0)),
-			int(sectors.get("coarse_pages", 0)), int(sectors.get("max_allocated_resolution", 0))]
+		var fine_density := _fine_density(settings)
+		var coarse_density := _coarse_density(settings)
+		var resolution_levels := _resolution_level_count(settings)
+		var local_chain_levels := _local_chain_levels(settings)
+		summary_label.text += "\nAVT: %d fixed 64m sectors · %d coarse tier pages · fine max %s texel/m · coarse %s texel/m · tiers %d · local chain %s full" % [
+			int(sectors.get("independent_sectors", 0)), int(settings.get("avt_coarse_pages", 0)),
+			_density_text(fine_density), _density_text(coarse_density), resolution_levels, _integer_text(local_chain_levels)]
 	if bool(settings.get("editor_preview_active", false)):
 		summary_label.text += "\nEditor live preview: VT streaming and automatic baking paused."
 	_refresh_bake_status(settings)
@@ -654,15 +657,19 @@ func _refresh_settings_controls() -> void:
 	page_size_spin.value = float(settings.get("page_size", 256))
 	page_border_spin.value = float(settings.get("border", 9))
 	anisotropy_spin.value = float(settings.get("avt_anisotropy", 8))
-	mip_levels_spin.value = float(settings.get("avt_mip_levels", 0))
+	mip_levels_spin.value = float(settings.get("avt_mip_levels", 3))
 	page_count_spin.value = float(settings.get("page_count", 256))
 	auto_capacity_button.button_pressed = bool(settings.get("auto_capacity", true))
 	pages_per_update_spin.value = float(settings.get("pages_per_update", 16))
 	avt_density_spin.editable = mode == 2
-	avt_density_spin.tooltip_text = "Material texels per metre for sector AVT. Select Camera range / 64 m sectors to use this setting."
+	avt_density_spin.tooltip_text = "Fine maximum density for the highest virtual resolution tier (default 1024 texels/m). The independent coarse tier has its own budget and density."
 	avt_density_spin.value = float(settings.get("avt_texels_per_meter", 1024.0))
 	svt_density_spin.value = float(settings.get("svt_texels_per_meter", 1.0))
-	avt_density_hint.text = "64 m sector: %.0f x %.0f virtual texels; %d x %d page-table allocation. Physical pages load on demand. Source material detail still limits sharpness." % [64.0 * avt_density_spin.value, 64.0 * avt_density_spin.value, int(settings.get("avt_base_block_size", 256)), int(settings.get("avt_base_block_size", 256))]
+	var fine_density := _fine_density(settings)
+	var coarse_density := _coarse_density(settings)
+	avt_density_hint.text = "Fine max: %s texels/m (requested) · Coarse base: %s texels/m · resolution tiers: %d." % [
+		_density_text(fine_density), _density_text(coarse_density), _resolution_level_count(settings)]
+	avt_density_hint.text += "\nWorld sectors stay fixed at 64 m. Tiers choose each sector's virtual image by projected density; every allocation keeps its complete local page chain (%s levels). Cold sectors need not expose every tier immediately." % _integer_text(_local_chain_levels(settings))
 	avt_density_hint.text += "\nSVT addressable extent: %.2f x %.2f m, centred on world origin." % [float(settings.get("svt_world_extent", 0.0)), float(settings.get("svt_world_extent", 0.0))]
 	_refresh_avt_bands(settings)
 	avt_distance_spin.value = float(settings.get("avt_distance", 384.0))
@@ -769,22 +776,23 @@ func _on_density_changed(p_value: float, p_view: String) -> void:
 
 
 func _refresh_avt_bands(settings: Dictionary) -> void:
-	var levels := 3
+	var levels := _resolution_level_count(settings)
 	if avt_band_spins.size() != levels:
 		for child in avt_band_grid.get_children():
 			avt_band_grid.remove_child(child)
 			child.queue_free()
 		avt_band_spins.clear()
 		for mip in levels:
-			avt_band_grid.add_child(_make_setting_label("mip %d texels / metre" % mip))
+			avt_band_grid.add_child(_make_setting_label("tier %d max texel/m" % mip))
 			var spin := _make_spin(1.0 / pow(2.0, mip), 8192.0 / pow(2.0, mip), 1.0 / pow(2.0, mip))
 			spin.name = "AVTBandMip%d" % mip
-			spin.tooltip_text = "Automatic screen-footprint mip selection. Standard mip levels halve density; editing any level updates the whole chain."
+			spin.tooltip_text = "Maximum density for virtual resolution tier %d. Tiers are selected per fixed 64 m sector from projected density; they do not truncate that sector's local page mip chain." % mip
 			spin.value_changed.connect(_on_avt_band_changed.bind(mip))
 			avt_band_grid.add_child(spin)
 			avt_band_spins.append(spin)
+	var fine_density := _fine_density(settings)
 	for mip in levels:
-		avt_band_spins[mip].set_value_no_signal(float(settings.get("avt_texels_per_meter", 1024.0)) / pow(2.0, mip))
+		avt_band_spins[mip].set_value_no_signal(fine_density / pow(2.0, mip))
 
 
 func _on_avt_band_changed(value: float, mip: int) -> void:
@@ -1146,6 +1154,38 @@ func _get_data(p_terrain: Object) -> Object:
 
 func _vt_settings() -> Dictionary:
 	return TerrainVTBridge.vt_settings(terrain)
+
+
+func _fine_density(p_settings: Dictionary) -> float:
+	# The native report's effective_texels_per_meter is the fine target density
+	# in the new contract. Keep the requested property as a fallback for a
+	# partially upgraded binary, rather than displaying the coarse density here.
+	var density := float(p_settings.get("avt_effective_texels_per_meter",
+			p_settings.get("avt_texels_per_meter", 1024.0)))
+	return density if density > 0.0 else float(p_settings.get("avt_texels_per_meter", 1024.0))
+
+
+func _coarse_density(p_settings: Dictionary) -> float:
+	var density := float(p_settings.get("avt_coarse_texels_per_meter", 0.0))
+	return density if density > 0.0 else 0.0
+
+
+func _resolution_level_count(p_settings: Dictionary) -> int:
+	var requested := clampi(int(p_settings.get("avt_mip_levels", 3)), 2, 16)
+	return clampi(int(p_settings.get("avt_sector_resolution_levels", p_settings.get("avt_effective_mip_levels", requested))), 2, 16)
+
+
+func _local_chain_levels(p_settings: Dictionary) -> int:
+	var levels := int(p_settings.get("avt_local_mip_levels", 0))
+	return levels if levels > 0 else 0
+
+
+func _density_text(p_density: float) -> String:
+	return "—" if p_density <= 0.0 else "%.0f" % p_density
+
+
+func _integer_text(p_value: int) -> String:
+	return "—" if p_value <= 0 else str(p_value)
 
 
 func _get_svt_auto_bake() -> bool:

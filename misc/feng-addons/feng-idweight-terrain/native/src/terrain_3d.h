@@ -482,14 +482,12 @@ public:
 	PackedFloat32Array get_surface_vt_mip_distances() const { return _vt.surface_vt_mip_distances; }
 	int get_surface_vt_mip_for_distance(real_t p_distance) const;
 	int get_avt_base_block_size() const;
-	// The near field's local mip chain as a level count. `get_avt_mip_levels()` is the setting
-	// (zero means automatic) and `get_avt_mip_level_cap()` is the number every reader uses: the
-	// last local mip a sector block may serve, or a value past any block when the setting is
-	// automatic. The plan's depth and the shader's `top` both come from the cap, so the two cannot
-	// disagree about how deep the chain is.
+	// Sector resolution tier count (default three); local page tables keep complete mip chains.
 	int get_avt_mip_levels() const { return _vt.surface_vt_mip_levels; }
 	void set_surface_vt_mip_levels(int p_levels);
 	int get_avt_mip_level_cap() const;
+	int get_avt_local_block_size() const { return get_avt_base_block_size(); }
+	float get_avt_local_section_world() const { return 64.f; }
 	// The near field's anisotropy: `..._request()` is the setting (or the viewport's level when the
 	// setting is zero) and `get_avt_anisotropy()` is that request clamped by the page gutter, which
 	// is the hard bound - a filtering footprint cannot reach past the border texels a page carries.
@@ -515,6 +513,8 @@ public:
 	Transform3D _vt_plan_key_transform(const Transform3D &p_camera_transform) const;
 	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }
 	int get_avt_directory_mask() const { return _vt.avt_directory_mask; }
+	Dictionary get_avt_layout_preview(Camera3D *p_camera) const;
+	const Terrain3DAVTCoarseImage &get_avt_coarse_image() const { return _vt.avt_coarse; }
 	int get_avt_root_level() const { return _vt.avt_root_level; }
 	// Page-arrival fade: the per-slot ramp a page comes in over, so a page arriving is a
 	// sharpen instead of a rectangular step in the image. The texture is one texel per

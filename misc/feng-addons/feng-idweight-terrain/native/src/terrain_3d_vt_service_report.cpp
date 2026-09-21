@@ -215,10 +215,17 @@ Array Terrain3D::get_vt_pages() const {
 		}
 		const Array owners = _vt.surface_vt ? _vt.surface_vt->get_slot_owner_metadata(int(key)) : Array();
 		record["owners"] = owners;
-		for (const Dictionary &owner : owners) {
+		for (Dictionary owner : owners) {
 			if (bool(owner["world_space"])) { continue; }
 			const Vector2i sector = owner["sector"];
 			const int mip = owner["mip"];
+			owner["local_mip"] = mip;
+			const uint64_t sector_key = (uint64_t(uint32_t(sector.x)) << 32) | uint32_t(sector.y);
+			const auto cached = _vt.avt_cached_addresses.find(sector_key);
+			if (cached != _vt.avt_cached_addresses.end()) {
+				owner["resolution_level"] = cached->second.resolution_level;
+				owner["logical_pages"] = cached->second.logical_pages;
+			}
 			record["mip"] = mip;
 			record["address"] = Vector2i(owner["virtual"]) - Vector2i(_vt.surface_vt->get_sector_block_origin_x(sector) >> mip, _vt.surface_vt->get_sector_block_origin_y(sector) >> mip);
 		}

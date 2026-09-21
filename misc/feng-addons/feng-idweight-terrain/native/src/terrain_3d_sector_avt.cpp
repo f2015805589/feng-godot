@@ -73,7 +73,7 @@ bool avt_plan_spatial_deviation_exceeded(const Transform3D &p_camera_transform,
 		const Terrain3DAVTPlanKey &p_plan_key, const Vector2 &p_motion_lead, const float p_reach) {
 	if (!is_valid_avt_plan_key(p_plan_key)) { return false; }
 	const Vector2 standing_origin = avt_plan_key_origin_xz(p_plan_key);
-	const Vector2 standing_camera = standing_origin - p_motion_lead;
+	const Vector2 standing_camera = standing_origin;
 	const Vector2 camera_origin(p_camera_transform.origin.x, p_camera_transform.origin.z);
 	const Vector2 deviation = camera_origin - standing_camera;
 	const float threshold = avt_motion_spatial_discontinuity_distance(p_reach);
@@ -142,30 +142,18 @@ int Terrain3D::get_avt_base_block_size() const {
 	return size;
 }
 
-// The last local mip a sector block may serve, which is the setting's one reader. Automatic (`0`)
-// answers a value past any block the address space can allocate (the indirection is 2048 wide, so
-// no block has more than twelve levels), which leaves `top = log2(size)` exactly as it shipped; a
-// positive setting is the level count, so the last index is one less. Both the plan's chain depth
-// (`PlanInput::mip_level_cap`) and the shader's `top` clamp read this, so a shorter chain is one
-// number rather than two spellings of it.
+// Local page-table depth follows the maximum allocation, not the tier count.
 int Terrain3D::get_avt_mip_level_cap() const {
-	const int levels = _vt.surface_vt_mip_levels;
-	if (levels <= 0) { return 32; }
-	return CLAMP(levels - 1, 0, 31);
+	return TerrainVT::log2_power_of_two(get_avt_base_block_size());
 }
 
-// A shorter or longer chain changes which pages the plan holds and which level a missing fragment
-// resolves at, but it moves no page's footprint: like the anisotropy setting it reconfigures
-// nothing and releases nothing, and the plan's own state key carries the cap so the next tick
-// re-derives the chain by itself.
+// An explicit sector resolution tier count. Legacy zero migrates to three.
 void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
-	const int clamped = CLAMP(p_levels, 0, 16);
+	const int clamped = p_levels <= 0 ? 3 : CLAMP(p_levels, 2, 16);
 	if (_vt.surface_vt_mip_levels == clamped) { return; }
 	_vt.surface_vt_mip_levels = clamped;
-	// The shader's `top` clamp is a uniform and the depth is a plan-key entry, so the two are
-	// published on the two paths that already exist for a settings change: the material refresh
-	// below, and the next tick's key comparing unequal.
-	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
+	invalidate_avt_plan_key(_vt.avt_plan.key);
+	_vt.avt_settled.unverify();
 }
 
 // The number of texels a level 0 sector block carries per page, as a multiple of its page
@@ -174,7 +162,7 @@ void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
 // view publishes its directory before it submits the plan: the first publish of a configuration
 // would otherwise read the previous configuration's ratio.
 float Terrain3D::_avt_logical_ratio() const {
-	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * get_avt_base_block_size());
+	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * float(get_avt_base_block_size()));
 }
 
 // The near field's share of the tick's page budget: half of `vt_pages_per_update` while the far
@@ -212,11 +200,12 @@ void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distanc
 		normalized.push_back(std::isfinite(p_distances[i]) ? MAX(previous + 0.01f, p_distances[i]) : previous + 1.f);
 	}
 	_vt.surface_vt_mip_distances = normalized;
+	invalidate_avt_plan_key(_vt.avt_plan.key);
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 }
 
 int Terrain3D::get_surface_vt_mip_for_distance(real_t p_distance) const {
-	const int top = TerrainVT::log2_power_of_two(is_sector_avt() ? get_avt_base_block_size() : _vt.surface_vt_pages_per_axis);
+	const int top = is_sector_avt() ? _vt.surface_vt_mip_levels - 1 : TerrainVT::log2_power_of_two(_vt.surface_vt_pages_per_axis);
 	int mip = 0;
 	float edge = 8.f;
 	while (mip < top) {
@@ -246,12 +235,12 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	if (!_vt.surface_vt || !_data || !_vt.vt_shared_ready || !get_camera()) { return 0; }
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	_vt.avt_sector_ticks++;
-	// Demand is planned for the predicted camera, which is where the view will be when
-	// the pages being produced now are needed. The transform is the only difference: the
-	// shader still selects mips from the real frustum.
+	// Fine eligibility follows the rendered frustum, as does the Inspector preview.
+	// Keep motion tracking for refresh diagnostics, without excluding current cells
+	// when a predicted turn points away from them.
 	const Transform3D camera_transform = get_camera()->get_camera_transform();
-	const Transform3D lead_transform = _vt_lead_camera_transform(camera_transform);
-	const Vector3 camera_position = lead_transform.origin;
+	(void)_vt_lead_camera_transform(camera_transform);
+	const Vector3 camera_position = camera_transform.origin;
 	const Vector2 focus(camera_position.x, camera_position.z);
 	const float reach = MAX(64.f, float(_vt.surface_vt_distance));
 	// Published before the plan is installed or reused, so the readings describe this tick
@@ -263,7 +252,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// when a view streams while turning and not while running.
 	_vt.avt_sector_stats["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
 	_vt.avt_sector_stats["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
-	_vt.avt_sector_stats["plan_origin"] = Vector2(lead_transform.origin.x, lead_transform.origin.z);
+	_vt.avt_sector_stats["plan_origin"] = focus;
 	_vt.avt_sector_stats["camera_origin"] = Vector2(camera_transform.origin.x, camera_transform.origin.z);
 	if (!_vt.vt_source_snapshot) { _vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing, _surface_density); }
 	const bool bounds_ready = _vt.vt_source_snapshot->bounds_ready.load(std::memory_order_acquire);
@@ -356,9 +345,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// Phase timings for the uncached path, which is the one a moving camera takes on
 	// every tick: the visible scan, the sector hierarchy, the address directory, the
 	// hand-off to the refinement worker, the directory upload and the page production.
-	// The predicted frustum, not the rendered one. `camera_transform` is the real one the
-	// engine is using; only the plan moves ahead of it.
-	TerrainVT::VisibleView view(lead_transform, get_camera()->get_camera_projection(),
+	TerrainVT::VisibleView view(camera_transform, get_camera()->get_camera_projection(),
 			get_camera()->get_viewport() ? get_camera()->get_viewport()->get_visible_rect().size.y : 720.f,
 			get_camera()->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, 192.f);
 	view.anisotropy = get_avt_anisotropy(get_camera());
@@ -379,7 +366,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		_vt.avt_sector_stats[p_key] = double(now - phase_start) / 1000.0;
 		phase_start = now;
 	};
-	_vt.avt_pending_scan = _avt_scan_sectors(view, camera_position, bounds_ready, focus, reach);
+	_vt.avt_pending_scan = _avt_scan_sectors(view, camera_position, bounds_ready, Vector2(camera_transform.origin.x, camera_transform.origin.z), reach);
 	mark_phase("scan_ms");
 	_vt.avt_pending_hierarchy = _avt_build_hierarchy(_vt.avt_pending_scan);
 	_vt.avt_pending_scan = Terrain3DAVTSectorScan();
@@ -415,9 +402,8 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	// Filled in place and returned by value: this runs on every tick of a moving view, and the
 	// byte array it used to be built into was a 512 byte allocation and a copy per tick.
 	Terrain3DAVTPlanKey state = {};
-	// The key describes what the plan is a function of, which is the predicted transform the
-	// page set was derived from - not the rendered one, or a moving camera would re-plan every
-	// frame while the predicted view had not changed at all.
+	// Quantize the rendered camera used by the sector scan. Motion prediction must
+	// not rotate the demand away from the image currently being drawn.
 	const Transform3D transform = _vt_plan_key_transform(camera->get_camera_transform());
 	int component = TERRAIN_AVT_PLAN_BASIS_OFFSET;
 	auto append = [&](double value) { state[component++] = value; };
@@ -446,6 +432,8 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	append(get_avt_mip_level_cap());
 	// Protected far roots consume physical slots independently of visible detail.
 	append(_vt.svt_roots.pages.size());
+	append(_vt.surface_vt_mip_levels);
+	for (int i = 0; i < 16; ++i) { append(i < _vt.surface_vt_mip_distances.size() ? _vt.surface_vt_mip_distances[i] : -1.f); }
 	return state;
 }
 
@@ -751,7 +739,14 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	// Refine only visible page footprints. The refinement walk never enumerates a
 	// virtual image's full mip pyramid (256 squared entries need zero resident
 	// pages until requested). Budget exhaustion must remain visible in diagnostics.
-	for (Sector &sector : r_hierarchy.working) { sector.size = _vt.surface_vt->has_sector(sector.owner) ? _vt.surface_vt->get_sector_block_size(sector.owner) : 0; }
+	for (Sector &sector : r_hierarchy.working) {
+		sector.size = _vt.surface_vt->has_sector(sector.owner) ? _vt.surface_vt->get_sector_block_size(sector.owner) : 0;
+		const auto cached = _vt.avt_cached_addresses.find(avt_owner_key(sector.owner));
+		if (cached != _vt.avt_cached_addresses.end()) {
+			sector.logical_pages = cached->second.logical_pages;
+			sector.resolution_level = cached->second.resolution_level;
+		}
+	}
 	const float logical_ratio = _avt_logical_ratio();
 	auto job = std::make_shared<Terrain3DAVTRefinement>();
 	// The plan carries the key it was planned for, which is the key this tick
@@ -762,27 +757,14 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	_vt.avt_refinement = job;
 	// Keep producing the last completed view while its successor is being planned.
 	// A virtual block can grow without changing a physical page's world footprint.
-	auto remap_plan = [&](std::vector<Terrain3DAVTPageRequest> &plan) {
-		for (auto it = plan.begin(); it != plan.end();) {
-			auto address = _vt.avt_cached_addresses.find(avt_owner_key(it->owner));
-			if (address == _vt.avt_cached_addresses.end() || !_vt.surface_vt->has_sector(it->owner)) { it = plan.erase(it); continue; }
-			const auto &node = address->second;
-			const int size = _vt.surface_vt->get_sector_block_size(it->owner);
-			const float world = SECTOR_WORLD * float(1 << node.level);
-			const float logical = node.level ? 1.f : size * logical_ratio;
-			const int mip = int(std::round(std::log2(it->rect.size.x * logical / world)));
-			if (mip < 0 || mip > TerrainVT::log2_power_of_two(size)) { it = plan.erase(it); continue; }
-			it->mip = mip;
-			++it;
+	// Addresses use full-resolution local blocks. Remove requests for downgraded cells;
+	// the new dense image replaces the old plan atomically on layout changes.
+	if (r_hierarchy.directory_dirty) {
+		for (auto *pages : { &_vt.avt_plan.pages, &_vt.avt_plan.prefetch }) {
+			pages->erase(std::remove_if(pages->begin(), pages->end(), [&](const Terrain3DAVTPageRequest &page) {
+				return !_vt.surface_vt->has_sector(page.owner);
+			}), pages->end());
 		}
-	};
-	// Camera motion changes demand, not existing virtual addresses. Avoid
-	// re-deriving every page mip when the address directory and scale agree.
-	if (r_hierarchy.directory_dirty || logical_ratio != _vt.avt_plan_logical_ratio) {
-		remap_plan(_vt.avt_plan.pages);
-		remap_plan(_vt.avt_plan.prefetch);
-		_vt.avt_plan_logical_ratio = logical_ratio;
-		// The addresses the source queue is retained against just changed.
 		_vt.avt_plan.forget_retention();
 	}
 	_vt.avt_prefetch_cursor = 0;
@@ -812,7 +794,9 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	input.tail_cap = _avt_tick_allowance() * int(_vt.avt_plan_refresh_frames);
 	input.root_level = r_hierarchy.root_level;
 	input.page_size = _vt.vt_page_size;
-	input.mip_level_cap = get_avt_mip_level_cap();
+	input.coarse = _vt.avt_coarse;
+	input.section_world = get_avt_local_section_world();
+	input.mip_level_cap = MIN(get_avt_mip_level_cap(), TerrainVT::log2_power_of_two(get_avt_local_block_size()));
 	_vt.vt_page_pipeline->submit_task([job, input]() mutable { TerrainAVT::plan_pages(*job, input); });
 }
 
@@ -843,12 +827,19 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
 	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
 	result["avt_base_block_size"] = get_avt_base_block_size();
-	// The setting and the number it resolves to, side by side: the setting is 0 for automatic and
-	// the cap is the last local mip the shader and the plan both clamp to, so a line that printed
-	// only one of them could not say whether a shorter chain was asked for or derived.
+	// Requested versus effective chain length and the budget-limited resolution.
+	result["avt_max_adaptive_level"] = 1;
+	result["avt_local_block_size"] = get_avt_local_block_size();
+	result["avt_effective_mip_levels"] = _vt.surface_vt_mip_levels;
+	result["avt_local_mip_levels"] = get_avt_mip_level_cap() + 1;
+	result["avt_sector_resolution_levels"] = _vt.surface_vt_mip_levels;
+	result["avt_coarse_pages"] = int(_vt.avt_coarse.pages.size());
+	result["avt_coarse_size"] = _vt.avt_coarse.size;
+	result["avt_effective_texels_per_meter"] = _vt.surface_vt_texels_per_meter;
+	result["avt_coarse_texels_per_meter"] = _vt.avt_coarse.size > 0 ? _vt.vt_page_size / _vt.avt_coarse.page_world : 0.f;
 	result["avt_mip_levels"] = _vt.surface_vt_mip_levels;
 	result["avt_mip_level_cap"] = get_avt_mip_level_cap();
-	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
+	result["avt_sector_world"] = is_sector_avt() ? double(get_avt_local_section_world()) : double(_region_size * _vertex_spacing);
 	result["avt_sector_stats"] = _vt.avt_sector_stats;
 	result["avt_peak_stats"] = _vt.avt_peak_stats;
 	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0

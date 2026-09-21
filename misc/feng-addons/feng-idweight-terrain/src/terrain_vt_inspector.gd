@@ -9,6 +9,8 @@ class_name TerrainVTInspectorPlugin
 ## Terrain3D node without creating a second window or duplicating its state.
 var editor_plugin: EditorPlugin
 
+const AVT_LAYOUT_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_avt_layout_preview.gd")
+
 
 func _can_handle(p_object: Object) -> bool:
 	return p_object != null and (p_object is Terrain3D or p_object.has_method("get_vt_settings"))
@@ -52,9 +54,25 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
 
+	var avt_header := Label.new()
+	avt_header.name = "TerrainAVTVTPageHeader"
+	avt_header.text = "AVT VT Page · camera layout / allocation"
+	avt_header.tooltip_text = "Read-only AVT world-sector layout and current virtual allocations for the editor camera"
+	avt_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	body.add_child(avt_header)
+
+	var avt_preview = AVT_LAYOUT_PREVIEW_SCRIPT.new()
+	avt_preview.name = "TerrainAVTLayoutPreview"
+	# The preview computes its minimum height from the Inspector width so a
+	# narrow dock keeps a square map while a wide dock gives the map more room.
+	avt_preview.custom_minimum_size = Vector2.ZERO
+	avt_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	avt_preview.set_terrain(p_object)
+	body.add_child(avt_preview)
+
 	var description := Label.new()
 	description.name = "TerrainVTPageDescription"
-	description.text = "Inspect resident pages and stitched SVT material pages."
+	description.text = "Near-field AVT layout follows the editor camera; outside the radius uses SVT."
 	description.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	body.add_child(description)
 

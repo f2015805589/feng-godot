@@ -464,6 +464,27 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	r_pass.produced += r_pass.prefetched;
 	const uint64_t protect_start = Time::get_singleton()->get_ticks_usec();
 	for (int slot : r_pass.protected_slots) { _vt.surface_vt->protect_page(slot, false); }
+	// Baseline pages stay pinned across frames and competing SVT allocations.
+	for (const auto &page : _vt.avt_coarse.pages) {
+		const int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
+		if (slot >= 0 && !_vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, true); }
+	}
+	// Once the completed demand plan no longer needs mip 0, remove its local
+	// table after a ready coarse parent exists. Do not prune allocations being
+	// used by a still-running successor plan.
+	if (!_vt.avt_refinement && !_vt.avt_cached_addresses.empty()) {
+		Terrain3DAVTHierarchy active;
+		active.root_level = _vt.avt_root_level;
+		for (const auto &page : _vt.avt_plan.pages) {
+			if (page.owner != avt_coarse_owner()) { active.owners.insert((uint64_t(uint32_t(page.owner.x)) << 32) | uint32_t(page.owner.y)); }
+		}
+		const Vector3 camera_position = get_camera()->get_camera_transform().origin;
+		_avt_sync_address_directory(active, Vector2(camera_position.x, camera_position.z), _vt.surface_vt_distance);
+		if (active.directory_dirty) {
+			_avt_publish_directory(active, true);
+			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+		}
+	}
 	_vt.avt_sector_stats["protect_ms"] = since(protect_start);
 	_vt.avt_sector_stats["pins_released"] = int(r_pass.protected_slots.size());
 	const uint64_t commit_start = Time::get_singleton()->get_ticks_usec();

@@ -113,7 +113,7 @@ static func add_surface_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot
 static func add_avt_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) -> void:
 	add_row(p_tree, p_root, "AVT runtime material", "Runtime", "", "AVT uses surface ID/weight source data; it is not an offline material bake")
 	add_row(p_tree, p_root, "Resident", str(p_shot.avt_pages.size()), "", TerrainVTBridge.stats_text(p_shot.avt_stats))
-	add_row(p_tree, p_root, "Adaptive", "Enabled" if bool(p_shot.settings.get("adaptive", false)) else "Disabled", "", "Shared page blocks may resize for demand")
+	add_row(p_tree, p_root, "Adaptive", "Enabled" if bool(p_shot.settings.get("adaptive", false)) else "Disabled", "", "High-resolution local mip chains use the directory; the independent dense baseline is addressed directly")
 	add_resident_page_rows(p_tree, p_root, p_shot, "AVT")
 	add_region_rows(p_tree, p_root, p_shot)
 

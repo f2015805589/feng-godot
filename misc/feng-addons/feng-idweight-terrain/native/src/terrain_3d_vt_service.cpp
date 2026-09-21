@@ -369,6 +369,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.svt_pending_pages.clear();
 	_vt.vt_registered_sectors.clear();
 	_vt.avt_directory_bytes.clear();
+	_vt.avt_coarse = Terrain3DAVTCoarseImage();
 	// The addresses every page of the standing plan resolved to no longer exist.
 	_vt.avt_plan.forget();
 	_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);

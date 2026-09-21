@@ -63,11 +63,14 @@ uniform float _avt_density_scale = 1.0;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
 uniform int _avt_directory_mask = 0;
 uniform int _avt_root_level = 1;
-// The last local mip a sector block may serve, from `Terrain3D::get_avt_mip_level_cap()`: the plan's
-// chain depth and this clamp are the same number. Automatic answers past any block, so the clamp is
-// inert unless the setting asks for a shorter chain - a shorter chain is fewer coarse pages and a
-// coarser fallback, see docs/vt_hdrp_avt_alignment.md section 7.7.15.
-uniform int _avt_mip_level_cap = 32;
+// Last local mip a sector block may serve: explicit level count minus one.
+uniform int _avt_mip_level_cap = 2;
+uniform int _avt_coarse_mip_cap = 2;
+uniform float _avt_fine_section_world = 64.0;
+uniform float _avt_fine_texel = 0.0009765625;
+// Last published window center.xy, mip 1 page world span, mip 1 grid width.
+uniform vec4 _avt_coarse_grid = vec4(0.0);
+uniform ivec2 _avt_coarse_block = ivec2(0);
 #endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
@@ -602,52 +605,60 @@ int avt_distance_mip(float distance_to_camera, int top) {
 )"
 
 R"(
-// Select by pixel footprint across local mips and the world hierarchy.
-// Strict by default; optional coarse recovery stays within the AVT hierarchy.
+// Adaptive tier 0 has its own local mip chain. Tier 1 is the independent,
+// dense low-resolution image; its mip indices are not fine-image mip indices.
 bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_coarse, vec2 world_dx, vec2 world_dy, out material result, out vec3 result_normal,
 		out float texel_world, out float fade, out bool last_mip) {
 	fade = 1.0;
-	for (int level = 0; level <= _avt_root_level; ++level) {
-		float span = 64.0 * float(1 << level);
-		// The first world parent has a fixed world footprint. Its texel size
-		// can be less than twice the last local mip for non-power-of-two density
-		// (e.g. 768 texels/m); switch at its actual size, not a rounded local LOD.
-		if (level == 0 && _avt_base_block_size > 1.0 && pixel_world >= 128.0 / float(_surface_vt_page_size)) { continue; }
-		if (level > 0 && level < _avt_root_level && pixel_world >= 2.0 * span / float(_surface_vt_page_size)) { continue; }
-		ivec2 sector = ivec2(floor(world / span));
+	last_mip = false;
+	if (_avt_coarse_grid.w < 1.0 || _avt_coarse_grid.z <= 0.0) { return false; }
+	if (distance(world, v_camera_pos.xz) >= max(64.0, _avt_coverage_distance)) { return false; }
+	float coarse_texel = _avt_coarse_grid.z / float(_surface_vt_page_size);
+	// Requests already satisfied by the baseline bypass the directory entirely.
+	if (_avt_fine_texel < coarse_texel && max(pixel_world, minimum_texel) < coarse_texel) {
+		vec2 local_grid = world / _avt_fine_section_world;
+		ivec2 key = ivec2(floor(local_grid));
 		vec4 entry;
-		if (!avt_find_sector(sector, level, entry)) {
-			if (allow_coarse) { continue; }
-			return false;
-		}
-		float base_texel = span / (entry.w * float(_surface_vt_page_size));
-		int top = min(int(round(log2(entry.z))), _avt_mip_level_cap);
-		int start = int(floor(log2(max(1.0, pixel_world / base_texel))));
-		start = max(start, int(ceil(log2(max(1.0, minimum_texel / base_texel)))));
-		// A world parent is also the clamp for footprints larger than the tree root.
-		if (level == _avt_root_level && minimum_texel <= base_texel * float(1 << top)) { start = min(start, top); }
-		// Near a negative sector boundary, subtraction can round an interior
-		// coordinate up to 1.0. Keep the address in the sector selected above;
-		// otherwise its last pixel reads the next indirection block.
-		vec2 local = clamp(world / span - vec2(sector), vec2(0.0), vec2(0.99999994));
-		ivec2 page = ivec2(entry.xy) + ivec2(floor(local * entry.w));
-		for (int mip = max(0, start); mip <= top; ++mip) {
-			int slot = int(texelFetch(_surface_vt_indirection, page >> mip, mip).r + 0.5);
-			vec2 offset = fract(local * entry.w / float(1 << mip));
-			texel_world = base_texel * float(1 << mip);
-			if (!avt_material_slot(slot, offset, texel_world, world_dx, world_dy, result, result_normal)) {
-				if (allow_coarse) { continue; }
-				return false;
+		if (avt_find_sector(key, 0, entry)) {
+			vec2 local = clamp(local_grid - vec2(key), vec2(0.0), vec2(0.99999994));
+			int top = int(round(log2(entry.z)));
+			float local_texel = _avt_fine_section_world / (entry.w * float(_surface_vt_page_size));
+			int requested = min(top, int(floor(log2(max(1.0, pixel_world / local_texel)))));
+			requested = max(requested, int(ceil(log2(max(1.0, minimum_texel / local_texel)))));
+			for (int mip = requested; mip <= top; ++mip) {
+				vec2 page_uv = local * entry.w / float(1 << mip);
+				ivec2 page = (ivec2(entry.xy) >> mip) + ivec2(floor(page_uv));
+				int slot = int(texelFetch(_surface_vt_indirection, page, mip).r + 0.5);
+				texel_world = local_texel * float(1 << mip);
+				if (texel_world >= coarse_texel) { break; }
+				if (!avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) { continue; }
+				fade = surface_vt_page_fade(slot);
+				return true;
 			}
-			fade = surface_vt_page_fade(slot);
-			last_mip = level == _avt_root_level && mip == top;
-
-			return true;
 		}
+	}
+	int requested = 1 + min(_avt_coarse_mip_cap - 1, int(floor(log2(max(1.0, pixel_world / coarse_texel)))));
+	requested = max(requested, 1 + int(ceil(log2(max(1.0, minimum_texel / coarse_texel)))));
+	for (int mip = requested; mip <= _avt_coarse_mip_cap; ++mip) {
+		int side = int(_avt_coarse_grid.w) >> (mip - 1);
+		float span = _avt_coarse_grid.z * float(1 << (mip - 1));
+		ivec2 world_cell = ivec2(floor(world / span));
+		ivec2 first = ivec2(floor(_avt_coarse_grid.xy / span + vec2(0.5))) - ivec2(side / 2);
+		if (any(lessThan(world_cell, first)) || any(greaterThanEqual(world_cell, first + ivec2(side)))) { continue; }
+		ivec2 cell = world_cell & ivec2(side - 1);
+		int slot = int(texelFetch(_surface_vt_indirection, (_avt_coarse_block >> mip) + cell, mip).r + 0.5);
+		texel_world = coarse_texel * float(1 << (mip - 1));
+		if (!avt_material_slot(slot, fract(world / span), texel_world, world_dx, world_dy, result, result_normal)) { continue; }
+		fade = surface_vt_page_fade(slot);
+		last_mip = mip == _avt_coarse_mip_cap;
+		return true;
 	}
 	return false;
 }
 
+)"
+
+R"(
 bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 world_dy, out material r_mat, out vec3 r_normal) {
 	float fine_texel;
 	float fine_fade;

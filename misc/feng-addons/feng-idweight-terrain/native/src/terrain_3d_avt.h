@@ -119,6 +119,18 @@ struct Terrain3DAVTPageRequest {
 	uint64_t last_visible_plan = 0;
 };
 
+// upgrades use independent high-resolution local blocks; the dense chain starts at mip 1.
+inline Vector2i avt_coarse_owner() { return Vector2i(INT32_MIN, INT32_MIN); }
+struct Terrain3DAVTCoarseImage {
+	Vector2 origin;
+	Vector2 center;
+	float page_world = 1.f; // World span of a mip 1 page.
+	int size = 0; // mip 1 grid width, power of two.
+	int levels = 0; // Dense table mip limit plus one; mip 0 in this reserved block is unused.
+	Vector2i block; // Base (mip 0) coordinate in the shared page table.
+	std::vector<Terrain3DAVTPageRequest> pages;
+};
+
 // A camera/configuration key and the page set planned for it. The planner runs
 // on a worker thread, so only `ready` is synchronized; the payload is written
 // before it is published and read after it is observed.
@@ -165,6 +177,8 @@ struct Terrain3DAVTCachedAddress {
 	Vector2i location;
 	Vector2i owner;
 	int level = 0;
+	int resolution_level = 0;
+	float logical_pages = 1.f;
 };
 
 // One demand cell: a 64 m world sector, or one node of the hierarchy above it.
@@ -179,6 +193,8 @@ struct Terrain3DAVTSector {
 	bool produce = true;
 	float distance = 0.f;
 	Vector2 heights;
+	int resolution_level = 0;
+	float logical_pages = 1.f;
 };
 
 // What one scan of the resident regions produced: the demand cells and the
@@ -187,6 +203,8 @@ struct Terrain3DAVTSectorScan {
 	std::vector<Terrain3DAVTSector> visible;
 	int world_x0 = 0, world_y0 = 0, world_x1 = 0, world_y1 = 0;
 	bool has_world = false;
+	Terrain3DAVTCoarseImage coarse;
+	int budget = 0;
 };
 
 // The sorted working set a plan is built from, plus the coarse root level and

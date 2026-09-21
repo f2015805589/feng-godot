@@ -188,10 +188,13 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_anisotropy", _terrain->get_avt_anisotropy(camera));
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
 	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
-	// The local mip chain's last level, from the one function the plan's depth also reads. The
-	// shader clamps its `top` with it, so a chain cut shorter than the block size is one number and
-	// not a second spelling of the setting.
+	RS->material_set_param(p_material, "_avt_fine_section_world", _terrain->get_avt_local_section_world());
+	const auto &coarse = _terrain->get_avt_coarse_image();
 	RS->material_set_param(p_material, "_avt_mip_level_cap", _terrain->get_avt_mip_level_cap());
+	RS->material_set_param(p_material, "_avt_coarse_mip_cap", MAX(1, coarse.levels - 1));
+	RS->material_set_param(p_material, "_avt_fine_texel", 1.f / _terrain->get_surface_vt_texels_per_meter());
+	RS->material_set_param(p_material, "_avt_coarse_grid", Vector4(coarse.center.x, coarse.center.y, coarse.page_world, coarse.size));
+	RS->material_set_param(p_material, "_avt_coarse_block", coarse.block);
 	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
 	RS->material_set_param(p_material, "_avt_mip_distance_count", int(avt_distances.size()));
 	avt_distances.resize(16);

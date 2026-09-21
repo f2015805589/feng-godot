@@ -46,25 +46,24 @@ func run() -> void:
 	assert(window.find_child("AVTMipDistance0", true, false) == null)
 	window.avt_distance_spin.value = 768
 	assert(terrain.surface_vt_distance == 768)
-	# The near field's local mip chain is automatic by default, and the setting is a level *count*,
-	# so the cap the plan's depth and the shader's `top` both clamp to is one less than it. A chain
-	# shorter than the block size is a residency decision paid for in fallback sharpness, which is
-	# why automatic is what ships - so this asserts the arithmetic of the pair, not a default that
-	# is expected to change. See docs/vt_hdrp_avt_alignment.md section 7.7.15.
-	assert(terrain.surface_vt_mip_levels == 0)
-	assert(terrain.get_vt_settings().avt_mip_level_cap == 32)
+	# Sector tier count is independent of the complete local page-table chain.
+	assert(terrain.surface_vt_mip_levels == 3)
+	var local_cap := int(terrain.get_vt_settings().avt_mip_level_cap)
+	assert(local_cap == 9) # 64m * 1024 texels/m / 128 texels/page = 512 entries.
 	terrain.surface_vt_mip_levels = 4
 	assert(terrain.surface_vt_mip_levels == 4)
 	assert(terrain.get_vt_settings().avt_mip_levels == 4)
-	assert(terrain.get_vt_settings().avt_mip_level_cap == 3)
+	assert(terrain.get_vt_settings().avt_mip_level_cap == local_cap)
 	terrain.surface_vt_mip_levels = 0
-	assert(terrain.get_vt_settings().avt_mip_level_cap == 32)
+	assert(terrain.surface_vt_mip_levels == 3)
+	assert(terrain.get_vt_settings().avt_mip_level_cap == local_cap)
 	assert(window.mip_levels_spin != null and window.mip_levels_spin.name == "MipLevels")
-	window.mip_levels_spin.value = 6
-	assert(terrain.surface_vt_mip_levels == 6)
-	assert(terrain.get_vt_settings().avt_mip_level_cap == 5)
-	window.mip_levels_spin.value = 0
-	assert(terrain.surface_vt_mip_levels == 0)
+	window.mip_levels_spin.value = 10
+	assert(terrain.surface_vt_mip_levels == 10)
+	assert(terrain.get_vt_settings().avt_sector_resolution_levels == 10)
+	assert(terrain.get_vt_settings().avt_mip_level_cap == local_cap)
+	window.mip_levels_spin.value = 3
+	assert(terrain.surface_vt_mip_levels == 3)
 	# Preview preference must never suppress runtime VT.
 	assert(terrain.vt_editor_preview and not terrain.is_vt_editor_preview_active())
 	var packed := PackedScene.new()
@@ -74,9 +73,9 @@ func run() -> void:
 	assert(restored.surface_svt_texels_per_meter == 2)
 	assert(restored.surface_vt_mip_distances.is_empty())
 	assert(restored.surface_vt_distance == 768)
-	assert(restored.surface_vt_mip_levels == 0)
+	assert(restored.surface_vt_mip_levels == 3)
 	restored.free()
 	window.free()
 	terrain.free()
-	print("PASS independent VT density and automatic mip controls")
+	print("PASS independent VT density and explicit mip controls")
 	quit(0)

@@ -1,392 +1,96 @@
-// Terrain3D's near field, part 4 of 5: the plan worker.
-
-// One of five files that own the near field. This is the page selection the demand pass hands to
-// a task: everything it is allowed to read arrives in `TerrainAVT::PlanInput` - the camera, the
-// source snapshot and the working set - so it runs against a world that cannot change under it
-// while the main thread installs, retains and produces. The demand pass that builds that input,
-// the plan key that decides when a new one is submitted, and the address directory the selection
-// resolves against are in terrain_3d_sector_avt.cpp; the input itself is declared in
-// terrain_3d_avt_plan.h.
-//
-// The other four: `terrain_3d_sector_avt.cpp` (the driver and its configuration),
-// `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key), `terrain_3d_sector_avt_hierarchy.cpp`
-// (the scan, the hierarchy and the address directory) and `terrain_3d_avt_produce.cpp` (the
-// production pass that consumes the plan this file returns).
+// Independent dense fallback and demand-driven high-resolution local mip chains.
 #include "terrain_3d.h"
 #include "terrain_3d_avt_plan.h"
-#include "terrain_3d_surface_baker.h"
-#include "terrain_3d_vt_visibility.h"
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstring>
-#include <map>
-#include <queue>
-#include <tuple>
-#include <unordered_set>
-#include <utility>
-#include <godot_cpp/variant/utility_functions.hpp>
-#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <algorithm>
+#include <queue>
+#include <cmath>
 
-namespace {
-using Sector = Terrain3DAVTSector;
-// The plan's own spelling of the sector key and of the two world model constants the AVT
-// files share; the constants themselves are in terrain_3d_avt.h.
-using SectorKey = std::pair<int, int>;
-constexpr float SECTOR_WORLD = AVT_SECTOR_WORLD;
-constexpr float DEMAND_DENSITY_MARGIN = AVT_DEMAND_DENSITY_MARGIN;
-} // namespace
-
-// Builds one bounded page set for a fixed quality bias. The public wrapper below may
-// call this a small, fixed number of times; keeping the trial local means a rejected
-// detail walk never leaks a partial request set to the main thread.
-static void plan_pages_for_bias(Terrain3DAVTRefinement &r_job, const TerrainAVT::PlanInput &p_input,
-		const int p_mip_bias) {
-	const uint64_t plan_start = Time::get_singleton()->get_ticks_usec();
-	const std::vector<Sector> &working = p_input.working;
-	const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &source = p_input.source;
-	const TerrainVT::VisibleView &view = p_input.view;
-	const bool bounds_ready = p_input.bounds_ready;
-	const Vector3 &camera_position = p_input.camera_position;
-	const Vector2 &focus = p_input.focus;
-	const float reach = p_input.reach;
-	const float exact_radius = p_input.exact_radius;
-	const float logical_ratio = p_input.logical_ratio;
-	// A positive bias is the explicit LOD contract used while the physical pool is
-	// oversubscribed. The shader receives the same scale and therefore resolves the
-	// coarser parent this plan keeps instead of diagnosing the omitted fine child.
-	const float texels_per_pixel = MAX(0.000001f,
-			p_input.texels_per_pixel * std::ldexp(1.f, -p_mip_bias));
-	const int budget = p_input.budget;
-	const int root_level = p_input.root_level;
-	const int page_size = p_input.page_size;
-	r_job.mip_bias = p_mip_bias;
-
-	std::map<SectorKey, const Sector *> nodes;
-	for (const Sector &sector : working) { nodes[{ sector.owner.x, sector.owner.y }] = &sector; }
-	auto owner_key = [](const Vector2i &owner) { return SectorKey(owner.x, owner.y); };
-	// The other half of the reach test `_avt_scan_sectors()` applies in terrain_3d_sector_avt.cpp:
-	// this one rejects a page whose footprint is out of reach, that one never creates the cell in
-	// the first place, and the two have to agree or the plan names pages no scan enumerated. The
-	// arithmetic below is the scan's because `focus` and the camera's XZ are the same point.
-	auto surrounding_sample = [&](const Rect2 &rect, const Vector2 &heights, TerrainVT::VisiblePatch &patch) {
-		const Vector2 nearest(CLAMP(focus.x, rect.position.x, rect.get_end().x), CLAMP(focus.y, rect.position.y, rect.get_end().y));
-		if (nearest.distance_squared_to(focus) > (reach + SECTOR_WORLD) * (reach + SECTOR_WORLD)) { return false; }
-		patch.nearest = Vector3(nearest.x, CLAMP(camera_position.y, heights.x, heights.y), nearest.y);
-		patch.distance = patch.nearest.distance_to(camera_position);
-		patch.density = view.orthographic ? view.focal : view.focal * 2.f / MAX(0.01f, patch.distance);
-		return true;
-	};
-	struct Page {
-		const Sector *sector;
+namespace TerrainAVT {
+void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
+	const uint64_t started = Time::get_singleton()->get_ticks_usec();
+	r_job.pages = p_input.coarse.pages;
+	r_job.roots = int(r_job.pages.size());
+	r_job.budget = p_input.budget;
+	r_job.warm.clear();
+	r_job.retain_cap = r_job.tail_cap = r_job.mip_bias = r_job.denied = 0;
+	struct Node {
+		const Terrain3DAVTSector *cell;
 		int mip, x, y;
 		Rect2 rect;
-		float distance;
-		float priority;
-		float minimum_density;
-		bool required;
-		bool sampled;
+		float distance, density;
 	};
-	std::vector<Page> chosen;
-
-	auto make_page = [&](const Sector &sector, int mip, int x, int y, Page &page, bool prefetch = false) {
-		const int size = sector.size;
-		const float logical = sector.level ? 1.f : size * logical_ratio;
-		const float span = SECTOR_WORLD * float(1 << sector.level) * float(1 << mip) / logical;
-		const Rect2 sector_rect(Vector2(sector.location) * (SECTOR_WORLD * float(1 << sector.level)), Vector2(1, 1) * (SECTOR_WORLD * float(1 << sector.level)));
-		const Rect2 rect(sector_rect.position + Vector2(x, y) * span, Vector2(span, span));
+	auto farther = [](const Node &a, const Node &b) {
+		if (a.cell->produce != b.cell->produce) { return !a.cell->produce; }
+		if (a.distance != b.distance) { return a.distance > b.distance; }
+		return a.mip > b.mip;
+	};
+	std::priority_queue<Node, std::vector<Node>, decltype(farther)> pending(farther);
+	auto enqueue = [&](const Terrain3DAVTSector &cell, int mip, int x, int y, bool root = false) {
+		const float span = p_input.section_world * float(1 << mip) / cell.logical_pages;
+		const Rect2 rect(Vector2(cell.location) * p_input.section_world + Vector2(x, y) * span, Vector2(span, span));
+		const Rect2 footprint = rect.intersection(Rect2(Vector2(cell.location) * p_input.section_world, Vector2(p_input.section_world, p_input.section_world)));
+		if (!footprint.has_area()) { return; }
+		const Vector2 nearest(CLAMP(p_input.focus.x, footprint.position.x, footprint.get_end().x), CLAMP(p_input.focus.y, footprint.position.y, footprint.get_end().y));
+		if (nearest.distance_squared_to(p_input.focus) > p_input.reach * p_input.reach) { return; }
+		const Vector2 heights = p_input.bounds_ready ? p_input.source->bounds(footprint, cell.heights) : cell.heights;
 		TerrainVT::VisiblePatch patch;
-		if (!rect.intersects(sector_rect)) { return false; }
-		const Rect2 footprint = rect.intersection(sector_rect);
-		const Vector2 heights = bounds_ready ? source->bounds(footprint, sector.heights) : sector.heights;
-		if (prefetch ? !surrounding_sample(footprint, heights, patch) : !view.sample(footprint, heights, patch)) { return false; }
-		// Perspective derivatives on a slope need not match a horizontal plane.
-		// Sample the actual source triangles as well as the conservative bounds.
-		const Vector2 farthest(MAX(Math::abs(footprint.position.x - focus.x), Math::abs(footprint.get_end().x - focus.x)),
-				MAX(Math::abs(footprint.position.y - focus.y), Math::abs(footprint.get_end().y - focus.y)));
-		if (!prefetch && heights.x != heights.y && footprint.size.x <= 4.f * source->spacing && farthest.length() < exact_radius) {
-			// Clip the actual near-field mesh triangles. Height-box projection can
-			// request entire hidden/offscreen columns of mip 0 on a steep slope.
-			TerrainVT::VisiblePatch projected_surface;
-			if (!source->project_surface(footprint.grow(4.f * span / page_size + 0.0001f), view, projected_surface)) { return false; }
-			patch.density = projected_surface.density;
-			patch.minimum_density = projected_surface.minimum_density;
-		} else if (!prefetch && heights.x != heights.y) {
-			for (int z = 0; z < 3; ++z) for (int x = 0; x < 3; ++x) {
-				const Vector2 at = footprint.position + footprint.size * Vector2((x + 0.001f) / 2.002f, (z + 0.001f) / 2.002f);
-				Vector3 point, normal;
-				if (source->surface(at, point, normal)) {
-					patch.density = MAX(patch.density, view.surface_density(point, normal));
-				}
-			}
+		if (!p_input.view.sample(footprint, heights, patch)) {
+			if (!root) { return; }
+			patch.distance = cell.distance; patch.density = 0.f;
 		}
-		// Near slopes can expose a finer footprint abruptly as the eye crosses
-		// a source triangle. Keep a wider refinement apron there only.
-		const float density_margin = heights.x != heights.y && farthest.length() < exact_radius ? 3.f : DEMAND_DENSITY_MARGIN;
-		const float density = patch.density * texels_per_pixel * density_margin;
-		const float projected = span * density / page_size;
-		// The material applies the same quality/budget scale to its world
-		// derivative. Keep the lower bound in that scaled density space too;
-		// otherwise a parent selected after a positive mip bias can be marked
-		// optional even though it is the shader's first valid fallback.
-		const float minimum_density = patch.minimum_density * texels_per_pixel / density_margin;
-		// Predict demand, not urgency. At high speed the predicted eye can be tens
-		// of metres ahead; ordering by that eye delays the detail under the real
-		// camera. The immutable actual-eye snapshot adds no per-tick main-thread work.
-		const Vector3 &priority_eye = p_input.priority_camera_position;
-		const Vector3 closest(CLAMP(priority_eye.x, footprint.position.x, footprint.get_end().x),
-				CLAMP(priority_eye.y, heights.x, heights.y),
-				CLAMP(priority_eye.z, footprint.position.y, footprint.get_end().y));
-		const float priority_distance = closest.distance_to(priority_eye);
-		page = { &sector, mip, x, y, rect, priority_distance,
-				(mip > 0 || sector.level > 0) && projected > 1.f ? MAX(1.f, projected) : 0.f,
-				minimum_density,
-				prefetch || (mip == 0 && sector.level == 0) || minimum_density * span <= page_size * 2.f,
-				page_size <= span * patch.density * texels_per_pixel * 2.01f };
-		return true;
+		const float density = patch.density * p_input.texels_per_pixel * AVT_DEMAND_DENSITY_MARGIN;
+		// No local allocation/physical demand when the independent baseline suffices.
+		if (!root && p_input.coarse.page_world * density <= p_input.page_size) { return; }
+		pending.push({ &cell, mip, x, y, rect, patch.distance, density });
 	};
-	for (const Sector &sector : working) {
-		if (sector.level != root_level || !(sector.size > 0)) { continue; }
-		Page page;
-		// Terminal AVT roots are the feedback guarantee, not view-dependent detail. Select
-		// every root inside the CPU reach with the conservative surrounding sample so a yaw
-		// change keeps resolving within AVT. Treat it as sampled/required so it is produced
-		// before refinement instead of waiting in the idle-prefetch queue.
-		if (make_page(sector, 0, 0, 0, page, true)) {
-			page.sampled = true;
-			page.required = true;
-			chosen.push_back(page);
+	for (const auto &cell : p_input.working) {
+		if (cell.size > 0) { enqueue(cell, TerrainVT::log2_power_of_two(cell.size), 0, 0, true); }
+	}
+	const int coarse_count = r_job.roots;
+	const int available = MAX(0, p_input.budget - coarse_count);
+	const int root_limit = MAX(0, available / 3);
+	std::vector<Node> roots;
+	while (!pending.empty() && int(roots.size()) < root_limit) { roots.push_back(pending.top()); pending.pop(); }
+	while (!pending.empty()) { pending.pop(); }
+	for (const Node &node : roots) {
+		r_job.pages.push_back({ node.cell->owner, node.mip, node.x, node.y, node.rect,
+			TerrainVT::make_page_request_priority(TerrainVT::PageRequestKind::ROOT, node.distance, node.rect.size.x) });
+		if (node.mip > 0 && node.cell->produce && node.rect.size.x * node.density > p_input.page_size) {
+			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) { enqueue(*node.cell, node.mip - 1, x, y); }
 		}
 	}
-	const int root_count = int(chosen.size());
-	// How many addresses the completed plan holds for the retention window, which is appended to
-	// the plan *after* the walk. One number for both halves: the walk reserves it and the apron
-	// may not spend it.
-	static const int RETAIN_RESERVE = 128;
-	// Retain the mip interval reached by the visible footprint, including its
-	// transition apron. A completed child family supplies tighter parent bounds.
-	auto refine_pages = [&](std::vector<Page> &pages, int page_budget) {
-		int denied = 0;
-		// `pages` is the refinement walk, not the residency set: a complete family can
-		// leave its intermediate parent optional after all four children are accepted.
-		// Keep those two resources separate. The raster budget is checked after family
-		// requirements are finalized; this limit only bounds worker memory and CPU.
-		int sampled_required_count = 0;
-		for (const Page &page : pages) {
-			sampled_required_count += page.required && page.sampled ? 1 : 0;
-		}
-		const int visited_limit = MAX(root_count, MAX(32, page_budget * 8));
-		auto set_required = [&sampled_required_count](Page &page, const bool p_required) {
-			if (page.required == p_required) { return; }
-			if (page.sampled) { sampled_required_count += p_required ? 1 : -1; }
-			page.required = p_required;
-		};
-		auto set_sampled = [&sampled_required_count](Page &page, const bool p_sampled) {
-			if (page.sampled == p_sampled) { return; }
-			if (page.required) { sampled_required_count += p_sampled ? 1 : -1; }
-			page.sampled = p_sampled;
-		};
-		struct Family { int parent; std::array<int, 4> children; int count = 0; };
-		std::vector<Family> families;
-		std::priority_queue<std::pair<float, int>> candidates;
-		for (int i = 0; i < int(pages.size()); ++i) {
-			if (pages[i].priority > 0.f) { candidates.emplace(pages[i].priority, -i); }
-		}
-		while (!candidates.empty()) {
-			const int best = -candidates.top().second;
-			candidates.pop();
-			const Page parent = pages[best];
-			pages[best].priority = 0.f;
-			std::array<Page, 4> children;
-			int child_count = 0;
-			bool complete = true;
-			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
-				Page child;
-				if (parent.sector->level > 0) {
-					const int level = parent.sector->level - 1;
-					const Vector2i child_owner(parent.sector->location.x * 2 + x, parent.sector->location.y * 2 + y + (level ? 0x40000000 + level * 0x100000 : 0));
-					const auto node = nodes.find(owner_key(child_owner));
-					if (node == nodes.end() || !(node->second->size > 0)) { complete = false; continue; }
-					const int mip = level ? 0 : MIN(TerrainVT::log2_power_of_two(node->second->size), p_input.mip_level_cap);
-					if (make_page(*node->second, mip, 0, 0, child)) { children[child_count++] = child; }
-				} else if (parent.mip > 0 && make_page(*parent.sector, parent.mip - 1, parent.x * 2 + x, parent.y * 2 + y, child)) {
-					children[child_count++] = child;
-				}
-			}
-			if (int(pages.size()) + child_count <= visited_limit) {
-				Family family{ best, {} };
-				for (int i = 0; i < child_count; ++i) {
-					const Page &child = children[i];
-					family.children[family.count++] = int(pages.size());
-					if (child.priority > 0.f) { candidates.emplace(child.priority, -int(pages.size())); }
-					sampled_required_count += child.required && child.sampled ? 1 : 0;
-					pages.push_back(child);
-				}
-				if (complete && child_count > 0) { families.push_back(family); }
-			} else {
-				// A visited-limit denial must leave its parent as the page the shader can
-				// resolve. It is a traversal bound, not a physical residency decision;
-				// the final required count below drives any quality bias.
-				set_required(pages[best], true);
-				set_sampled(pages[best], true);
-				denied += child_count;
-			}
-			if (!complete || child_count == 0) {
-				// A hierarchy child can be absent from the visible working set (or all
-				// children can be clipped). Preserve the covering node rather than
-				// allowing an incomplete family to erase its only fallback.
-				set_required(pages[best], true);
-				set_sampled(pages[best], true);
-			}
-		}
-		for (auto family = families.rbegin(); family != families.rend(); ++family) {
-			Page &parent = pages[family->parent];
-			float minimum = 1e30f;
-			for (int i = 0; i < family->count; ++i) { minimum = MIN(minimum, pages[family->children[i]].minimum_density); }
-			parent.minimum_density = MAX(parent.minimum_density, minimum);
-			if (parent.sector->level == root_level) {
-				// World roots are the terminal strict-mode coverage guarantee. A
-				// complete child family must never erase the root that serves a
-				// still-arriving child or a view that turns into this world cell.
-				set_required(parent, true);
-				set_sampled(parent, true);
-			} else {
-				set_required(parent, parent.minimum_density * parent.rect.size.x <= page_size * 2.f);
-			}
-		}
-		// Optional traversal nodes and unsampled apron pages are free here; only
-		// required pages in the sampled prefix consume the raster budget. This is
-		// the signal for the bounded mip-bias retry in the outer wrapper.
-		denied += MAX(0, sampled_required_count - page_budget);
-		return denied;
-	};
-	r_job.denied = refine_pages(chosen, budget);
-
-	r_job.pages.clear();
-	std::vector<Terrain3DAVTPageRequest> apron;
-	auto request_from_page = [&](const Page &page, const bool p_optional) {
-		TerrainVT::PageRequestKind kind = TerrainVT::PageRequestKind::CURRENT;
-		if (p_optional) {
-			kind = TerrainVT::PageRequestKind::OPTIONAL;
-		} else if (page.sector->level == root_level) {
-			kind = TerrainVT::PageRequestKind::ROOT;
-		}
-		return Terrain3DAVTPageRequest{ page.sector->owner, page.mip, page.x, page.y, page.rect,
-				TerrainVT::make_page_request_priority(kind, page.distance, page.rect.size.x) };
-	};
-	for (const Page &page : chosen) {
-		if (!page.required) { continue; }
-		(page.sampled ? r_job.pages : apron).push_back(request_from_page(page, !page.sampled));
-	}
-	// Keep the plan handed to the main thread in the same order the producer and
-	// source queue will consume. The sampled prefix remains a prefix; only its
-	// roots/current bands are ordered, followed by the optional apron.
-	auto request_before = [](const Terrain3DAVTPageRequest &p_left, const Terrain3DAVTPageRequest &p_right) {
-		return TerrainVT::page_request_priority_before(p_left.priority, p_right.priority);
-	};
-	std::stable_sort(r_job.pages.begin(), r_job.pages.end(), request_before);
-	std::stable_sort(apron.begin(), apron.end(), request_before);
-	// Speculative fine mips must never get ahead of pages the current image
-	// samples. Limit the apron to spare capacity so it cannot saturate a large
-	// world's cache or starve real requests in the 16-page generation budget.
-	// The apron is what is left after the reservation above, not after the walk alone: the
-	// retention window is appended to this plan at install time, and an apron sized to the walk's
-	// own leftover spent that reservation as well, putting every installed plan a retention
-	// window over its budget.
-	const int retain_reserve = MIN(RETAIN_RESERVE, MAX(0, budget / 4));
-	// The rate term (section 7.7). `budget` is a *residency* bound: it says how many pages the pool
-	// can hold at once, and it says nothing about how fast they can be produced. The near field
-	// gets `_avt_tick_allowance()` pages a tick whatever this plan asks for, and each refresh of a
-	// moving view selects far more sampled pages than one window can fill, so a plan sized by
-	// residency alone spends its whole width on pages the image never samples and starves the ones
-	// it does. Measured: a 384-page plan against an eight-page allowance, a permanent deficit of up
-	// to 97 sampled pages, a pool with no free slot and a far field served at its coarsest mip.
-	//
-	// So the tail - the pages this plan holds that no fragment samples - is bounded by what one
-	// refresh window can actually produce. The pages the image samples are not bounded by it: they
-	// are what the plan is for, and a term that dropped one would put the missing-page diagnostic on
-	// the screen. A `tail_cap` of zero means the caller derived no term and the historical
-	// residency-only bound stands.
-	const int tail_room = MAX(0, budget - retain_reserve - int(r_job.pages.size()));
-	const int tail_cap = p_input.tail_cap > 0 ? MIN(p_input.tail_cap, tail_room) : MIN(256, tail_room);
-	// The retention window is not speculation: it holds the pages a rendered frame still samples
-	// while the plan has already moved past them (the plan is derived from the lead transform), so
-	// it takes the first share. The apron is speculation and takes what is left. The split is even
-	// because neither is required and neither may have the whole of one window: spending it on the
-	// apron drops the render-lag window, and spending it on retention stops the plan prefetching the
-	// pages a turn or a slope is about to bring in.
-	const int retain_share = MIN(retain_reserve, tail_cap / 2);
-	const int ahead_count = MIN(int(apron.size()), MAX(0, tail_cap - retain_share));
-	r_job.pages.insert(r_job.pages.end(), apron.begin(), apron.begin() + ahead_count);
-	// The leading entries are the pages the current image samples; the apron follows.
-	r_job.sampled = int(r_job.pages.size()) - ahead_count;
-	// What is left of the term after the apron took its share, for the retention append. The
-	// installer holds the whole-plan invariant at the point of the append; this is the same number
-	// the planner reserved there, kept where the term was derived.
-	r_job.retain_cap = MAX(0, tail_cap - ahead_count);
-	r_job.tail_cap = tail_cap;
-	float finest_requested_texel = FLT_MAX;
-	for (const Terrain3DAVTPageRequest &page : r_job.pages) { finest_requested_texel = MIN(finest_requested_texel, page.rect.size.x / page_size); }
-	r_job.finest = r_job.pages.empty() ? 0.f : finest_requested_texel;
-
-	// What the plan is made of, by level: how many of its pages are local-mip 0, 1, 2 ... of a 64 m
-	// sector, and how many belong to a world node above one. A page a fragment samples is at the
-	// local mip its footprint selects; the chain's coarser local mips are the fallback ladder above
-	// it, and they are the only part of the plan a chain shorter than the block size could give
-	// back. Nothing else reports that split, and it is the whole question "does the fallback ladder
-	// cost residency" is asked with: `plan_level_mips` is a histogram over local mip 0..16 and
-	// `plan_world_pages` is the count above the 64 m sectors.
-	{
-		PackedInt32Array histogram;
-		histogram.resize(17);
-		int world_pages = 0;
-		for (const Terrain3DAVTPageRequest &page : r_job.pages) {
-			const bool leaf = (page.owner.y & 0x40000000) == 0;
-			if (!leaf) { ++world_pages; continue; }
-			const int mip = CLAMP(page.mip, 0, 16);
-			histogram.set(mip, histogram[mip] + 1);
-		}
-		r_job.level_mips = histogram;
-		r_job.world_pages = world_pages;
-	}
-
-	// Prepare surrounding detail after the visible plan is fixed. A separate idle
-	// queue may use free slots, but never evicts a resident page or steals demand.
-	std::vector<Page> warm;
-	for (const Sector &sector : working) {
-		if (sector.level != root_level || !(sector.size > 0)) { continue; }
-		Page page;
-		if (make_page(sector, 0, 0, 0, page, true)) { warm.push_back(page); }
-	}
-	// Idle coverage needs only world roots. Refining a full spare-cache tree
-	// on every moving view delays visible planning and immediately becomes stale.
-	r_job.warm.clear();
-	for (const Page &page : warm) { r_job.warm.push_back(request_from_page(page, true)); }
-	std::stable_sort(r_job.warm.begin(), r_job.warm.end(), request_before);
-
-	r_job.roots = root_count;
-	// The budget the installer keeps the completed plan inside once the retention window is
-	// appended to it.
-	r_job.budget = budget;
-
-	r_job.elapsed_us = Time::get_singleton()->get_ticks_usec() - plan_start;
-}
-
-// Selects the page set for one plan key. Runs on the plan worker; the result is
-// published through `r_job.ready` only after a bounded bias search has produced a
-// self-consistent page set.
-void TerrainAVT::plan_pages(Terrain3DAVTRefinement &r_job, const TerrainAVT::PlanInput &p_input) {
-	static constexpr int MAX_MIP_BIAS = 32; // also clamps extreme root spans and high quality scales
-	const uint64_t started = Time::get_singleton()->get_ticks_usec();
-	// The installer reads only after ready is published. Reuse the unpublished
-	// payload across trials, avoiding copies and preserving vector capacity.
-	for (int bias = 0; bias <= MAX_MIP_BIAS; ++bias) {
-		plan_pages_for_bias(r_job, p_input, bias);
-		if (r_job.denied == 0) {
-			break;
+	r_job.roots = int(r_job.pages.size());
+	// Keep a small recently-visible window while making room for the new view.
+	// Every local image has a complete parent chain; the sector tier count never
+	// truncates this traversal or the shader's ready-parent search.
+	const int retain_reserve = MIN(16, available / 8);
+	const int visit_limit = MAX(64, p_input.budget * 64);
+	int visited = 0;
+	while (!pending.empty() && int(r_job.pages.size()) < p_input.budget - retain_reserve && visited++ < visit_limit) {
+		const Node node = pending.top(); pending.pop();
+		r_job.pages.push_back({ node.cell->owner, node.mip, node.x, node.y, node.rect,
+			TerrainVT::make_page_request_priority(TerrainVT::PageRequestKind::CURRENT, node.distance, node.rect.size.x) });
+		if (node.mip > 0 && node.rect.size.x * node.density > p_input.page_size) {
+			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) { enqueue(*node.cell, node.mip - 1, node.x * 2 + x, node.y * 2 + y); }
 		}
 	}
+	r_job.retain_cap = MIN(retain_reserve, MAX(0, p_input.budget - int(r_job.pages.size())));
+	r_job.tail_cap = r_job.retain_cap;
+	r_job.denied = int(pending.size());
+	std::stable_sort(r_job.pages.begin() + r_job.roots, r_job.pages.end(), [](const auto &a, const auto &b) {
+		return TerrainVT::page_request_priority_before(a.priority, b.priority);
+	});
+	r_job.sampled = int(r_job.pages.size());
+	r_job.finest = 0.f;
+	r_job.level_mips.resize(17); r_job.level_mips.fill(0);
+	for (const auto &page : r_job.pages) {
+		const float texel = page.rect.size.x / p_input.page_size;
+		r_job.finest = r_job.finest > 0.f ? MIN(r_job.finest, texel) : texel;
+		if (page.owner != avt_coarse_owner()) { r_job.level_mips.set(page.mip, r_job.level_mips[page.mip] + 1); }
+	}
+	r_job.world_pages = coarse_count;
 	r_job.elapsed_us = Time::get_singleton()->get_ticks_usec() - started;
 	r_job.ready.store(true, std::memory_order_release);
 }
+} // namespace TerrainAVT

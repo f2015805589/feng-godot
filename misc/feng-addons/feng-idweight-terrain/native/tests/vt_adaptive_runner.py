@@ -113,7 +113,7 @@ def main() -> int:
         result.returncode != 0
         or bool(errors)
         or ("PASS uphill and moving VT residency without substitution" if args.navigation else "PASS async edit invalidation, payload sampling and teardown" if args.async_pages else "PASS VT source corner blending" if args.blend else "PASS CDLOD batching and coverage" if args.cdlod else "PASS terrain instancer output and edits" if args.instancer else "PASS terrain rendering profile" if args.profile else "PASS slope residency through repeated camera turns" if args.residency else "PASS AVT camera rotation output and production measurements" if args.rotation else "PASS strict missing-page diagnostics and normal mip interpolation" if args.filtering else "PASS AVT region ownership, automatic mip filtering and grouped SVT results" if args.ownership else "PASS metric VT density, sparse entries and mip reuse" if args.metric else "PASS 10 km AVT visibility and bounded residency" if args.scale else "PASS full procedural AVT sectors, pressure coverage, refinement and edits" if args.sectors else "PASS per-sector AVT density and ready-ancestor refinement") not in output
-        or (not args.reference_dll and "PASS independent VT density and automatic mip controls" not in output)
+        or (not args.reference_dll and "PASS independent VT density and explicit mip controls" not in output)
     )
 
 

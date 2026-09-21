@@ -84,7 +84,7 @@ void Terrain3D::_configure_surface_view(Terrain3DVirtualTexture *p_view, const b
 	// One page per axis per sector is legal (a 1x1 virtual image), which is what a
 	// region whose surface map is already page-sized wants.
 	p_view->set_minimal_block(1);
-	p_view->set_indirection_size(is_sector_avt() ? 2048 : MAX(64, _vt.surface_vt_page_count * 4));
+	p_view->set_indirection_size(is_sector_avt() ? MIN(4096, MAX(2048, get_avt_base_block_size() * 2)) : MAX(64, _vt.surface_vt_page_count * 4));
 }
 
 void Terrain3D::_destroy_surface_svt() {
@@ -304,6 +304,14 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_fo
 }
 
 void Terrain3D::set_surface_vt_enabled(const bool p_enabled) {
+	if (!p_enabled && _vt.surface_vt_enabled && _vt.surface_vt) {
+		// A disabled near field must not reserve physical capacity from SVT.
+		for (const auto &page : _vt.avt_coarse.pages) {
+			const int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
+			if (slot >= 0 && _vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, false); }
+		}
+	}
+	if (p_enabled != _vt.surface_vt_enabled) { _vt.avt_settled.unverify(); }
 	_vt.surface_vt_enabled = p_enabled;
 	// The tick side effect both toggles have; see the contract at the top of this file. It is what a
 	// harness that drives the section itself has to undo *after* this setter, not before it.
