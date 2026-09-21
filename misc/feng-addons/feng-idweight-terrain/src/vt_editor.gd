@@ -43,6 +43,8 @@ var svt_panel: VBoxContainer
 var _cdlod: TerrainVTEditorCdlodPanel
 var page_size_spin: SpinBox
 var page_border_spin: SpinBox
+var anisotropy_spin: SpinBox
+var mip_levels_spin: SpinBox
 var page_count_spin: SpinBox
 var auto_capacity_button: CheckButton
 var pages_per_update_spin: SpinBox
@@ -454,8 +456,29 @@ func _build_settings_panel() -> VBoxContainer:
 	grid.add_child(_make_setting_label("Border (texels)"))
 	page_border_spin = _make_spin(1, 16, 1)
 	page_border_spin.name = "PageBorder"
+	page_border_spin.tooltip_text = "Gutter each page carries, in texels. It bounds the near field's anisotropic filtering, which can only sample inside it: a gutter of n supports n - 0.5, so the near anisotropy setting needs a gutter of request + 1. Both views share the number."
 	page_border_spin.value_changed.connect(_on_setting_value_changed.bind("border"))
 	grid.add_child(page_border_spin)
+	# The request the gutter above bounds. It sits here rather than in a page of its own because
+	# the two numbers are one decision: the gutter admits `border - 0.5` and the request is what a
+	# grazing view needs, so a caller who moves one has to see the other. A setting with no control
+	# was the state that made a 3.5x ceiling silent in the first place.
+	grid.add_child(_make_setting_label("Anisotropy (near field)"))
+	anisotropy_spin = _make_spin(0, 16, 1)
+	anisotropy_spin.name = "Anisotropy"
+	anisotropy_spin.tooltip_text = "Anisotropic filtering the near field asks for: 2, 4, 8 or 16 times, or 0 to follow the viewport's filtering level. The border above is the hard bound, so a request wider than border - 0.5 is filtered at the border. The effective value is Terrain3D.get_vt_settings()[\"avt_anisotropy_effective\"]."
+	anisotropy_spin.value_changed.connect(_on_setting_value_changed.bind("anisotropy"))
+	grid.add_child(anisotropy_spin)
+	# The fallback ladder's depth. It sits beside the two numbers above because all three are the
+	# same decision: the density fixes the finest level, the gutter fixes the filtering, and this
+	# fixes how many coarse levels a late page may resolve through. Automatic is the block's own
+	# chain (nine levels at the default density) and is the shipped behaviour.
+	grid.add_child(_make_setting_label("Mip levels (near field)"))
+	mip_levels_spin = _make_spin(0, 16, 1)
+	mip_levels_spin.name = "MipLevels"
+	mip_levels_spin.tooltip_text = "Local mip levels a 64 m sector block may keep: 0 is automatic, which is the block size's own chain (nine levels at 1024 texels/metre). A smaller number holds fewer coarse pages and leaves a late fine page resolving at a coarser level, so it is a residency setting paid for in fallback sharpness. Terrain3D.get_vt_settings()[\"avt_mip_level_cap\"] is the level the plan and the shader actually clamp to."
+	mip_levels_spin.value_changed.connect(_on_setting_value_changed.bind("mip_levels"))
+	grid.add_child(mip_levels_spin)
 	grid.add_child(_make_setting_label("Shared page count"))
 	page_count_spin = _make_spin(8, 1024, 1)
 	page_count_spin.name = "PageCount"
@@ -468,7 +491,10 @@ func _build_settings_panel() -> VBoxContainer:
 	auto_capacity_button.toggled.connect(_on_auto_capacity_toggled)
 	grid.add_child(auto_capacity_button)
 	grid.add_child(_make_setting_label("Pages per update"))
-	pages_per_update_spin = _make_spin(1, 16, 1)
+	# The native property has no ceiling, so the widget must not invent one: `allow_greater` lets a
+	# typed value past the spin's soft range instead of clamping the setting behind the user's back.
+	pages_per_update_spin = _make_spin(1, 32, 1)
+	pages_per_update_spin.allow_greater = true
 	pages_per_update_spin.name = "PagesPerUpdate"
 	pages_per_update_spin.value_changed.connect(_on_setting_value_changed.bind("pages_per_update"))
 	grid.add_child(pages_per_update_spin)
@@ -626,7 +652,9 @@ func _refresh_settings_controls() -> void:
 	var mode := int(settings.get("avt_selection_mode", 2))
 	avt_mode_option.select(avt_mode_option.get_item_index(mode))
 	page_size_spin.value = float(settings.get("page_size", 256))
-	page_border_spin.value = float(settings.get("border", 4))
+	page_border_spin.value = float(settings.get("border", 9))
+	anisotropy_spin.value = float(settings.get("avt_anisotropy", 8))
+	mip_levels_spin.value = float(settings.get("avt_mip_levels", 0))
 	page_count_spin.value = float(settings.get("page_count", 256))
 	auto_capacity_button.button_pressed = bool(settings.get("auto_capacity", true))
 	pages_per_update_spin.value = float(settings.get("pages_per_update", 16))
@@ -637,7 +665,7 @@ func _refresh_settings_controls() -> void:
 	avt_density_hint.text = "64 m sector: %.0f x %.0f virtual texels; %d x %d page-table allocation. Physical pages load on demand. Source material detail still limits sharpness." % [64.0 * avt_density_spin.value, 64.0 * avt_density_spin.value, int(settings.get("avt_base_block_size", 256)), int(settings.get("avt_base_block_size", 256))]
 	avt_density_hint.text += "\nSVT addressable extent: %.2f x %.2f m, centred on world origin." % [float(settings.get("svt_world_extent", 0.0)), float(settings.get("svt_world_extent", 0.0))]
 	_refresh_avt_bands(settings)
-	avt_distance_spin.value = float(settings.get("avt_distance", 512.0))
+	avt_distance_spin.value = float(settings.get("avt_distance", 384.0))
 	editor_preview_button.set_pressed_no_signal(bool(settings.get("editor_preview", true)))
 
 
@@ -705,6 +733,8 @@ func _on_setting_value_changed(p_value: float, p_key: String) -> void:
 	var method := {
 		"page_size": "set_vt_page_size",
 		"border": "set_vt_page_border",
+		"anisotropy": "set_surface_vt_anisotropy",
+		"mip_levels": "set_surface_vt_mip_levels",
 		"page_count": "set_vt_page_count",
 		"pages_per_update": "set_vt_pages_per_update",
 	}.get(p_key, "")

@@ -29,17 +29,22 @@ using namespace TerrainAVT;
 namespace {
 constexpr float MOTION_PLAN_DEVIATION_COSINE = 0.9612617f; // cos(16 degrees), including 2-degree key quantization.
 
-// The material and the CPU footprint must use the same hardware-supported
-// anisotropy. The gutter is the hard upper bound: asking the planner for a
-// wider singular footprint than the page can sample only adds work outside the
-// shader's supported footprint.
-float avt_view_anisotropy(const Terrain3D *p_terrain, const Camera3D *p_camera) {
-	int level = 2;
-	if (p_camera && p_camera->get_viewport()) {
-		level = int(p_camera->get_viewport()->get_anisotropic_filtering_level());
-	}
-	level = CLAMP(level, 0, 4);
-	return MIN(float(1 << level), MAX(1.f, float(p_terrain->get_vt_page_border()) - 0.5f));
+// A page's world *span* as an exact key, in 1/64 m units. The churn counters in
+// `_avt_install_or_reuse_plan()` compare two generations by coverage rather than by address:
+// `(mip, x, y)` and `(mip + 1, x / 2, y / 2)` cover the same rect, and so does the same rect after a
+// sector's block size is raised, at one mip lower. Equality of the *rect* is the right question for
+// "the same page", and intersection is the right question for "the same ground at another level" -
+// a coarser page contains the ground, it is not the same rect.
+//
+// The quantum is 1/64 m because it has to be finer than the finest page and coarser than a float's
+// resolution at world scale. The finest page is a 64 m sector at 2048 blocks, a span of 0.03125 m,
+// so 0.015625 m keeps two distinct spans apart; and a float32 holds about 7 decimal digits, so at
+// 4 km its own error is ~2.4e-4 m, far below the quantum, so two spellings of one span cannot land
+// in different buckets.
+constexpr double PAGE_SPAN_KEY_SCALE = 64.0;
+
+int64_t avt_page_span_key(const Rect2 &p_rect) {
+	return int64_t(std::llround(double(p_rect.size.x) * PAGE_SPAN_KEY_SCALE));
 }
 
 // The standing key stores each basis row in groups of three. The rendered
@@ -77,6 +82,47 @@ bool avt_plan_spatial_deviation_exceeded(const Transform3D &p_camera_transform,
 
 }
 
+// The request as a number: the setting, or the viewport's filtering level when the setting is zero
+// ("auto", which is the behaviour before the setting existed). Kept apart from the answer below
+// because a report that printed only one of the two could not say whether a request was reduced by
+// the gutter.
+float Terrain3D::get_avt_anisotropy_request(const Camera3D *p_camera) const {
+	int requested = _vt.surface_vt_anisotropy;
+	if (requested <= 0) {
+		int level = 2;
+		if (p_camera && p_camera->get_viewport()) {
+			level = int(p_camera->get_viewport()->get_anisotropic_filtering_level());
+		}
+		requested = 1 << CLAMP(level, 0, 4);
+	}
+	return float(CLAMP(requested, 1, 16));
+}
+
+// The number the shader and the demand footprint both use: the request above clamped by what the
+// page gutter can sample. The gutter is the hard upper bound and it is not a policy - a filtering
+// footprint cannot reach past the border texels a page carries, and a page asked for more samples
+// its own rim instead. The default pair is 8x inside a nine-texel gutter (which admits 8.5), so the
+// request is honoured as asked; a wider request is reduced here and readable as the
+// `avt_anisotropy_requested` / `avt_anisotropy_effective` pair in `get_vt_settings()`. See
+// docs/vt_sampling_review.md.
+float Terrain3D::get_avt_anisotropy(const Camera3D *p_camera) const {
+	const float supported = MAX(1.f, float(_vt.vt_page_border) - 0.5f);
+	return MIN(get_avt_anisotropy_request(p_camera), supported);
+}
+
+// The request above, as a setting. Unlike a density change this moves no page footprint - a page's
+// world span is the same whatever the filtering footprint is - so it reconfigures nothing and
+// releases nothing. The effective value is part of the AVT plan's state key, so a changed setting
+// makes the next tick re-derive the plan by itself, which is what that key entry is for.
+void Terrain3D::set_surface_vt_anisotropy(const int p_anisotropy) {
+	const int clamped = CLAMP(p_anisotropy, 0, 16);
+	if (_vt.surface_vt_anisotropy == clamped) { return; }
+	_vt.surface_vt_anisotropy = clamped;
+	if (_material.is_valid()) {
+		RS->material_set_param(_material->get_material_rid(), "_surface_vt_anisotropy", get_avt_anisotropy(get_camera()));
+	}
+}
+
 void Terrain3D::set_surface_vt_texels_per_meter(real_t p_value) {
 	if (!std::isfinite(p_value)) { return; }
 	p_value = CLAMP(p_value, 1.f, 8192.f);
@@ -96,6 +142,32 @@ int Terrain3D::get_avt_base_block_size() const {
 	return size;
 }
 
+// The last local mip a sector block may serve, which is the setting's one reader. Automatic (`0`)
+// answers a value past any block the address space can allocate (the indirection is 2048 wide, so
+// no block has more than twelve levels), which leaves `top = log2(size)` exactly as it shipped; a
+// positive setting is the level count, so the last index is one less. Both the plan's chain depth
+// (`PlanInput::mip_level_cap`) and the shader's `top` clamp read this, so a shorter chain is one
+// number rather than two spellings of it.
+int Terrain3D::get_avt_mip_level_cap() const {
+	const int levels = _vt.surface_vt_mip_levels;
+	if (levels <= 0) { return 32; }
+	return CLAMP(levels - 1, 0, 31);
+}
+
+// A shorter or longer chain changes which pages the plan holds and which level a missing fragment
+// resolves at, but it moves no page's footprint: like the anisotropy setting it reconfigures
+// nothing and releases nothing, and the plan's own state key carries the cap so the next tick
+// re-derives the chain by itself.
+void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
+	const int clamped = CLAMP(p_levels, 0, 16);
+	if (_vt.surface_vt_mip_levels == clamped) { return; }
+	_vt.surface_vt_mip_levels = clamped;
+	// The shader's `top` clamp is a uniform and the depth is a plan-key entry, so the two are
+	// published on the two paths that already exist for a settings change: the material refresh
+	// below, and the next tick's key comparing unequal.
+	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
+}
+
 // The number of texels a level 0 sector block carries per page, as a multiple of its page
 // count: `size * logical_ratio` is the block's virtual resolution for `SECTOR_WORLD`
 // metres. Derived here rather than read from the plan, because the chain that re-configures a
@@ -103,6 +175,34 @@ int Terrain3D::get_avt_base_block_size() const {
 // would otherwise read the previous configuration's ratio.
 float Terrain3D::_avt_logical_ratio() const {
 	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * get_avt_base_block_size());
+}
+
+// The near field's share of the tick's page budget: half of `vt_pages_per_update` while the far
+// field is drawing from the same number, all of it otherwise. A pure function of the live VT
+// configuration, spelled once because two readers size against it and they must not disagree.
+//
+// The tick hands the pass this many pages (`terrain_3d.cpp`), and the plan's own budget is a
+// *residency* bound (`_avt_build_hierarchy()`, `pool - reserved`) with no term for how fast that
+// residency can be filled. So the planner is the other reader: `_avt_submit_plan()` sizes the
+// plan's unsampled tail - the speculative apron and the retention window - by this allowance times
+// the refresh interval, which is the pages one plan generation can actually produce. Without that
+// term a plan names its whole residency budget whatever the supply, and the measured result is a
+// permanent sampled deficit, a pool with no free slot and a far field starved to its coarsest mip
+// (`docs/vt_hdrp_avt_alignment.md` sections 7.5-7.7).
+//
+// The even split stays even, and that is now a measured decision rather than an inherited one. A
+// fixed half looks wasteful - the far field's own demand is about **0.1 page a tick** once its
+// root pyramid is pinned, while the near field consumes everything it is given - so the split was
+// tried demand-aware, with the near field taking the remainder above a two-page floor for the far
+// field (`docs/vt_hdrp_avt_alignment.md` section 7.7.1). The near field then produced fourteen a
+// tick instead of eight and the sampled deficit did not fall at all: `n_miss` rose 41%, `evict`
+// 54%, `fade_starts` 38% and `alloc` 38% against the same run with the term below and the even
+// split. The near field's churn scales with its allowance, so its supply is not the binding
+// constraint and giving it more buys churn rather than coverage. Do not re-try this without a
+// measurement that says the demand has stopped scaling with the budget.
+int Terrain3D::_avt_tick_allowance() const {
+	const int remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
+	return _vt.surface_svt_enabled ? MAX(1, remaining / 2) : remaining;
 }
 
 void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distances) {
@@ -261,7 +361,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	TerrainVT::VisibleView view(lead_transform, get_camera()->get_camera_projection(),
 			get_camera()->get_viewport() ? get_camera()->get_viewport()->get_visible_rect().size.y : 720.f,
 			get_camera()->get_projection() == Camera3D::PROJECTION_ORTHOGONAL, 192.f);
-	view.anisotropy = avt_view_anisotropy(this, get_camera());
+	view.anisotropy = get_avt_anisotropy(get_camera());
 	if (_material.is_valid()) {
 		RS->material_set_param(_material->get_material_rid(), "_surface_vt_anisotropy", view.anisotropy);
 	}
@@ -340,7 +440,10 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	append((_vt.vt_svt_visible_pages / 16) * 16); append(_vt.surface_svt_enabled); append(_vt.surface_vt_distance);
 	append(_vt.bake.busy());
 	append(_vt.vt_page_count); append(_vt.vt_page_size);
-	append(avt_view_anisotropy(this, camera));
+	append(get_avt_anisotropy(camera));
+	// The chain's depth is part of what a plan is a function of: a shorter chain is a different
+	// page set, and a setting changed under a standing plan has to make the next tick re-derive it.
+	append(get_avt_mip_level_cap());
 	// Protected far roots consume physical slots independently of visible detail.
 	append(_vt.svt_roots.pages.size());
 	return state;
@@ -386,16 +489,179 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 				current.push_back({ page.owner.x, page.owner.y, page.mip, page.x, page.y });
 			}
 			std::sort(current.begin(), current.end());
+			// P0e: attribute the address churn. `current` is the selection the worker just made and
+			// `_vt.avt_plan.pages` is still the plan that was standing until now, so this is the one
+			// place where two generations can be compared. An address in the first that is not in the
+			// second needs a physical slot of its own, bought out of whatever the pool can recycle at
+			// the tick's allowance - which is the churn the phase E run measures (`alloc` and `evict`
+			// advancing together, `free` pinned at 0). What those new addresses *are* decides which
+			// mechanism can remove them:
+			//
+			// * carried - the previous plan already named this address. No slot, no production; the
+			//   number says how much of each generation is stable.
+			// * overlapped - the address is new, but a previous page **of the same owner** had a rect
+			//   that intersects this one. Another level means another span, so "the same ground at a
+			//   level the rule re-derived" shows up as an *overlapping* rect, never as an equal one -
+			//   the first version of these counters tested rect equality and read a structural zero,
+			//   which was an artefact of the test and not a property of the addressing. This is the
+			//   counter that decides the level question.
+			// * rescaled - the owner was in the previous plan but at no such *span*: the sector's
+			//   virtual block size stepped (`_avt_sync_address_directory()` only ever raises it), or
+			//   the refinement walk reached a new mip in it.
+			// * reselected - the owner and the span were both in the previous plan, but this page was
+			//   not. The same scale, a different page: the boundary decisions
+			//   (`projected > 1.f`, `minimum_density * span <= page_size * 2.f`) moved.
+			// * new_sector - no page of this owner was in the previous plan at all, so the view
+			//   reached an owner it was not looking at. Legitimate demand that no policy removes.
+			//
+			// `plan_dropped` is the other direction: addresses the previous plan named that this one
+			// does not, which is what the retention window has to hold and what the pool may finally
+			// evict. Section 7.7.1 records why these counters exist - a supply change was measured,
+			// rejected, and left the question of what the churn *is* unanswered.
+			std::vector<std::array<int, 5>> previous;
+			// One entry per (owner, span): whether that owner's *scale* is one the previous plan had.
+			std::vector<std::array<int64_t, 3>> previous_scales;
+			// The previous plan's rects grouped by owner, which is what the overlap test needs. Only
+			// pages of one owner can overlap - their rects are laid out on that owner's own grid - so
+			// the scan per new page is bounded by the few pages an owner has.
+			std::vector<std::pair<std::array<int, 2>, Rect2>> previous_by_owner;
+			previous.reserve(_vt.avt_plan.pages.size());
+			previous_scales.reserve(_vt.avt_plan.pages.size());
+			previous_by_owner.reserve(_vt.avt_plan.pages.size());
+			for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
+				previous.push_back({ page.owner.x, page.owner.y, page.mip, page.x, page.y });
+				previous_scales.push_back({ int64_t(page.owner.x), int64_t(page.owner.y),
+						avt_page_span_key(page.rect) });
+				previous_by_owner.push_back({ { page.owner.x, page.owner.y }, page.rect });
+			}
+			std::sort(previous.begin(), previous.end());
+			std::sort(previous_scales.begin(), previous_scales.end());
+			previous_scales.erase(std::unique(previous_scales.begin(), previous_scales.end()), previous_scales.end());
+			std::sort(previous_by_owner.begin(), previous_by_owner.end(),
+					[](const std::pair<std::array<int, 2>, Rect2> &p_left, const std::pair<std::array<int, 2>, Rect2> &p_right) {
+						return p_left.first < p_right.first;
+					});
+			int carried = 0;
+			int overlapped = 0;
+			int new_sector = 0;
+			int rescaled = 0;
+			for (const Terrain3DAVTPageRequest &page : _vt.avt_refinement->pages) {
+				const std::array<int, 5> address{ page.owner.x, page.owner.y, page.mip, page.x, page.y };
+				if (std::binary_search(previous.begin(), previous.end(), address)) {
+					++carried;
+					continue;
+				}
+				const std::array<int, 2> owner{ page.owner.x, page.owner.y };
+				const std::pair<std::array<int, 2>, Rect2> owner_key{ owner, Rect2() };
+				const auto range = std::equal_range(previous_by_owner.begin(), previous_by_owner.end(), owner_key,
+						[](const std::pair<std::array<int, 2>, Rect2> &p_left, const std::pair<std::array<int, 2>, Rect2> &p_right) {
+							return p_left.first < p_right.first;
+						});
+				if (range.first == range.second) {
+					// No page of this owner was in the previous plan at all: the view reached an
+					// owner it was not looking at. Real demand.
+					++new_sector;
+					continue;
+				}
+				for (auto entry = range.first; entry != range.second; ++entry) {
+					if (entry->second.intersects(page.rect)) { ++overlapped; break; }
+				}
+				const std::array<int64_t, 3> scale{ int64_t(page.owner.x), int64_t(page.owner.y),
+						avt_page_span_key(page.rect) };
+				if (!std::binary_search(previous_scales.begin(), previous_scales.end(), scale)) {
+					++rescaled;
+				}
+			}
+			// P2: *which way* the refinement depth moved, per owner. The first attempt at this asked
+			// the same question of the overlap test - was the previous rect over this ground finer,
+			// equal, or coarser than the new page - and all four of its buckets were structurally
+			// single-valued: `coarser` came out equal to `overlapped` in every generation of that run,
+			// and the other three never printed a value but zero. That is a tautology and not a
+			// property of the world: **a newly refined child always intersects its parent, and the
+			// parent is always in the previous plan**, so "the previous rect here was larger" is what
+			// being a child *means*. The identity is even provable from the counters that remain:
+			// `overlapped + new_sector == selected - carried` in every generation, which is exactly
+			// "no new address lacked a covering rect of its owner". A counter that cannot take more
+			// than one value is not a measurement (section 9).
+			//
+			// Depth per owner is the quantity that can take three values, so it is what is compared:
+			// the finest world span each plan offers for each owner. Finer than before is the walk
+			// reaching a deeper mip in that owner, or that owner's block size stepping (the two are
+			// told apart by `sector_size_grows`, which counts the sectors whose size stepped), and
+			// coarser is the walk giving up a level it had. World span rather than the mip index,
+			// because a block-size step moves the mip index of an unchanged span.
+			auto min_span_by_owner = [](const std::vector<std::pair<std::array<int, 2>, Rect2>> &p_sorted,
+											const std::array<int, 2> &p_owner, float &r_min) {
+				const std::pair<std::array<int, 2>, Rect2> key{ p_owner, Rect2() };
+				const auto range = std::equal_range(p_sorted.begin(), p_sorted.end(), key,
+						[](const std::pair<std::array<int, 2>, Rect2> &p_left, const std::pair<std::array<int, 2>, Rect2> &p_right) {
+							return p_left.first < p_right.first;
+						});
+				if (range.first == range.second) { return false; }
+				r_min = FLT_MAX;
+				for (auto entry = range.first; entry != range.second; ++entry) { r_min = MIN(r_min, entry->second.size.x); }
+				return true;
+			};
+			// The new selection's rects, grouped the same way, so the two plans can be compared owner
+			// by owner without a map on the hot path.
+			std::vector<std::pair<std::array<int, 2>, Rect2>> current_by_owner;
+			current_by_owner.reserve(current.size());
+			for (const Terrain3DAVTPageRequest &page : _vt.avt_refinement->pages) {
+				current_by_owner.push_back({ { page.owner.x, page.owner.y }, page.rect });
+			}
+			std::sort(current_by_owner.begin(), current_by_owner.end(),
+					[](const std::pair<std::array<int, 2>, Rect2> &p_left, const std::pair<std::array<int, 2>, Rect2> &p_right) {
+						return p_left.first < p_right.first;
+					});
+			int depth_deepened = 0;
+			int depth_receded = 0;
+			int depth_same = 0;
+			for (auto entry = current_by_owner.begin(); entry != current_by_owner.end();) {
+				const std::array<int, 2> owner = entry->first;
+				float previous_min = 0.f;
+				float current_min = FLT_MAX;
+				while (entry != current_by_owner.end() && entry->first == owner) { current_min = MIN(current_min, entry->second.size.x); ++entry; }
+				if (!min_span_by_owner(previous_by_owner, owner, previous_min)) { continue; } // new_sector above
+				if (current_min < previous_min * (1.f - 1e-4f)) {
+					++depth_deepened;
+				} else if (current_min > previous_min * (1.f + 1e-4f)) {
+					++depth_receded;
+				} else {
+					++depth_same;
+				}
+			}
+			const int selected = int(_vt.avt_refinement->pages.size());
+			_vt.avt_sector_stats["plan_selected"] = selected;
+			_vt.avt_sector_stats["plan_carried"] = carried;
+			_vt.avt_sector_stats["plan_overlapped"] = overlapped;
+			_vt.avt_sector_stats["plan_new_area"] = selected - carried;
+			_vt.avt_sector_stats["plan_new_sector"] = new_sector;
+			_vt.avt_sector_stats["plan_rescaled"] = rescaled;
+			_vt.avt_sector_stats["plan_reselected"] = selected - carried - new_sector - rescaled;
+			// Owners whose finest span moved, which is the level question the address counters
+			// cannot answer. `depth_deepened` plus `depth_same` plus `depth_receded` is the number
+			// of owners both plans held; compare it with `avt_sectors` for how much of the near
+			// field that is.
+			_vt.avt_sector_stats["plan_depth_deepened"] = depth_deepened;
+			_vt.avt_sector_stats["plan_depth_receded"] = depth_receded;
+			_vt.avt_sector_stats["plan_depth_same"] = depth_same;
+			_vt.avt_sector_stats["plan_dropped"] = int(previous.size()) - carried;
 			// The window is at least one lead wide: a page the plan moved ahead of is still
 			// in the image being rendered, and dropping its request would let the pool evict
-			// it out from under the view that has not caught up yet. The count is capped so a
-			// look-ahead plan cannot reserve the whole pool with pages the camera has left -
-			// and capped again by the room the completed plan left in its budget, so what this
-			// installs is never larger than the residency it is served from. The planner
-			// reserves that room; this is the same invariant, held where the append happens.
+			// it out from under the view that has not caught up yet.
+			//
+			// It is bounded twice, and the two bounds answer different questions. `retain_cap`
+			// is the planner's *rate* term - the part of it the apron did not spend - so the
+			// completed plan never holds more unsampled pages than one refresh window can produce.
+			// The budget expression beside it is the *residency* invariant, held where the append
+			// happens: what this installs is never larger than the residency it is served from.
+			// The residency bound alone was what stood here, as a fixed `MIN(128, budget - size)`,
+			// and it let the window keep a hundred addresses for `retain_epochs` generations while
+			// every one of them held a slot the sampled set needed (section 7.7).
 			const bool discard_retained = _vt.avt_discard_retained;
 			const int retain_cap = discard_retained ? 0 :
-				MIN(128, MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
+				MIN(_vt.avt_refinement->retain_cap,
+						MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
 			int retained = 0;
 			for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
 				if (retained == retain_cap) { break; }
@@ -419,6 +685,14 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 				_vt.avt_discard_retained = false;
 			}
 			_vt.avt_sector_stats["retained_requests"] = retained;
+			// The rate term as derived, as spent, and as it landed: `plan_tail_cap` is the whole
+			// term, `plan_retain_share` what the retention append was allowed, and
+			// `plan_apron_pages` the speculative part of the plan the refinement walk accepted. A
+			// plan whose tail sits at the term is a plan at the production rate; one well under it
+			// is a plan with nothing speculative to do.
+			_vt.avt_sector_stats["plan_tail_cap"] = _vt.avt_refinement->tail_cap;
+			_vt.avt_sector_stats["plan_retain_share"] = _vt.avt_refinement->retain_cap;
+			_vt.avt_sector_stats["plan_apron_pages"] = int(_vt.avt_refinement->pages.size()) - retained - _vt.avt_refinement->sampled;
 			_vt.avt_sector_stats["retain_epochs"] = _vt.avt_retain_epochs;
 			// The selection and the retention flags are one operation: a new plan is a new wanted
 			// set, so the source queue has to be retained again.
@@ -436,6 +710,12 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			_vt.avt_sector_stats["finest_requested_texel_world"] = _vt.avt_refinement->finest;
 			_vt.avt_sector_stats["visible_root_pages"] = _vt.avt_refinement->roots;
 			_vt.avt_sector_stats["requested_physical_pages"] = int(_vt.avt_plan.pages.size());
+			// What the plan is made of, by level: the histogram of local mips over the 64 m sector
+			// pages it holds and the count of world-node pages. The fine entries are what a fragment
+			// samples and the coarse ones are the fallback ladder above them, which is the residency
+			// a shorter chain could give back. See `Terrain3DAVTRefinement::level_mips`.
+			_vt.avt_sector_stats["plan_level_mips"] = _vt.avt_refinement->level_mips;
+			_vt.avt_sector_stats["plan_world_pages"] = _vt.avt_refinement->world_pages;
 			_vt.avt_sector_stats["prefetch_requests"] = int(_vt.avt_plan.prefetch.size());
 			_vt.avt_sector_stats["planning_ms"] = double(_vt.avt_refinement->elapsed_us) / 1000.;
 			_vt.avt_sector_stats["plan_age_ms"] = double(p_started - _vt.avt_refinement->submitted_us) / 1000.;
@@ -523,8 +803,16 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	input.logical_ratio = logical_ratio;
 	input.texels_per_pixel = _vt.surface_vt_texels_per_pixel;
 	input.budget = r_hierarchy.budget;
+	// The plan's rate term: the pages it may name beyond the ones the image samples, which is the
+	// pages one refresh window can produce at the allowance the tick actually hands this pass. Both
+	// halves are live configuration - `vt_pages_per_update` with the far field's share rule, and the
+	// refresh interval the motion lead derives - so the term tracks a camera that speeds up or a
+	// project that raises the page budget, and it cannot drift from the supply: `_avt_tick_allowance()`
+	// is the same call `terrain_3d.cpp` splits the tick with.
+	input.tail_cap = _avt_tick_allowance() * int(_vt.avt_plan_refresh_frames);
 	input.root_level = r_hierarchy.root_level;
 	input.page_size = _vt.vt_page_size;
+	input.mip_level_cap = get_avt_mip_level_cap();
 	_vt.vt_page_pipeline->submit_task([job, input]() mutable { TerrainAVT::plan_pages(*job, input); });
 }
 
@@ -545,11 +833,21 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
+	// The near field's share of the tick's page budget as it stood for the last pass, beside
+	// `pages_per_update` which is the whole of it. The two together are the supply the plan's rate
+	// term is sized against, so a probe that reports `avt_tail_cap` without them cannot say what
+	// the plan was measured against.
+	result["avt_allowance"] = _avt_tick_allowance();
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
 	result["avt_distance"] = _vt.surface_vt_distance;
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();
 	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
 	result["avt_base_block_size"] = get_avt_base_block_size();
+	// The setting and the number it resolves to, side by side: the setting is 0 for automatic and
+	// the cap is the last local mip the shader and the plan both clamp to, so a line that printed
+	// only one of them could not say whether a shorter chain was asked for or derived.
+	result["avt_mip_levels"] = _vt.surface_vt_mip_levels;
+	result["avt_mip_level_cap"] = get_avt_mip_level_cap();
 	result["avt_sector_world"] = is_sector_avt() ? 64.0 : double(_region_size * _vertex_spacing);
 	result["avt_sector_stats"] = _vt.avt_sector_stats;
 	result["avt_peak_stats"] = _vt.avt_peak_stats;

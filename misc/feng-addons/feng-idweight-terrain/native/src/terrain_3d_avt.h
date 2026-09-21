@@ -24,6 +24,7 @@
 #include "terrain_vt_request_priority.h"
 
 #include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
@@ -139,6 +140,22 @@ struct Terrain3DAVTRefinement {
 	// The residency the plan was budgeted against. The retention window is appended to the
 	// completed plan, so the installer needs the budget to keep the total inside it.
 	int budget = 0;
+	// The plan's rate term, as derived and as spent. `tail_cap` is the whole term - the pages the
+	// installed plan may hold beyond the ones the image samples - and `retain_cap` is what is left
+	// of it for the retention window the installer appends after the refinement walk has taken its
+	// apron. Both are bounded by what one refresh window can produce
+	// (`_avt_tick_allowance() * avt_plan_refresh_frames`), not by what the pool can hold. See
+	// `PlanInput::tail_cap` and `docs/vt_hdrp_avt_alignment.md` section 7.7.
+	int tail_cap = 0;
+	int retain_cap = 0;
+	// The plan's composition by level, over the pages above: `level_mips` is a histogram of the
+	// local mip of every 64 m sector page the plan holds (index 0 = the finest a block can address,
+	// the last index = the block's whole span), and `world_pages` counts the pages belonging to a
+	// world node above the sectors. The fine entries are what a fragment samples and the coarse
+	// ones are the fallback ladder above them, so the two are the residency a shorter chain could
+	// give back - the question "does the fallback ladder cost slots" answered with the plan itself.
+	PackedInt32Array level_mips;
+	int world_pages = 0;
 	uint64_t submitted_us = 0, elapsed_us = 0;
 };
 
@@ -182,6 +199,12 @@ struct Terrain3DAVTHierarchy {
 	int coarse_roots = 0; // Distinct coarse root cells.
 	int budget = 0; // Physical pages the near field may use.
 	bool directory_dirty = false;
+	// How many sectors had their virtual block size raised by the sync that consumed this working
+	// set. `_avt_sync_address_directory()` only ever grows one (`previous_size < sector.size`) or
+	// registers it for the first time, so this counts the one event that re-addresses a whole
+	// sector's pages at once. P0e's `plan_rescaled` is 0-75 addresses a generation; the pair says
+	// whether that is this growth or the refinement walk reaching a new mip by itself.
+	int size_grows = 0;
 };
 
 // One fill pass over a published plan. The pass is filled in observable stages -

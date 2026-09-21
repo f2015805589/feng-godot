@@ -30,6 +30,40 @@
 // and why it is a header.
 using namespace terrain_surface_vt;
 
+namespace {
+// Cells one page's world rect may cover for the cell sources - the resident store and the
+// persisted bakes - to be worth consulting at all. Both are per-cell accelerators: the store
+// costs a hash lookup a cell and the disk costs a file stat *and*, on a hit, a full Variant
+// deserialization of a cell's mip chain, so the disk side is two orders of magnitude more
+// expensive a cell than the answer is worth. A page this wide is a fallback page - a root
+// pyramid page is 63x63 = 3969 region cells at a 16 km span - and the region crop is the
+// documented source for it, so the gate is the same for both.
+//
+// Measured before it existed (alignment document section 7.7.13): a rebuilt pyramid of twenty
+// roots ran 16 x 3969 file stats in the one pass that plans it, 213.9 ms of a 214.1 ms pass,
+// and every one of those pages then took the region crop anyway because a page covering
+// thousands of cells can never have all of them baked.
+constexpr int64_t SVT_CELLS_PER_PAGE = 1024;
+
+// The cell range a page and its border ring touch, and whether that range is one the cell
+// sources may be asked about. One home for the geometry and the limit: the resident-store
+// resolver and the persisted-bake probe used to carry a copy each, and the copies disagreed
+// about what "too many cells" means.
+bool svt_page_cell_cover(const Rect2 &p_rect, const int p_page_size, const int p_border,
+		const real_t p_region_size, const real_t p_vertex_spacing, Vector2i &r_first, Vector2i &r_last) {
+	if (p_page_size <= 0 || p_rect.size.x <= 0.f) { return false; }
+	const real_t world = real_t(p_region_size) * p_vertex_spacing;
+	if (world <= 0.f) { return false; }
+	const real_t pixel = p_rect.size.x / real_t(p_page_size);
+	const Rect2 footprint = p_rect.grow(pixel * real_t(p_border));
+	r_first = Vector2i(int(Math::floor(footprint.position.x / world)), int(Math::floor(footprint.position.y / world)));
+	r_last = Vector2i(int(Math::floor(footprint.get_end().x / world)), int(Math::floor(footprint.get_end().y / world)));
+	const int64_t span_x = int64_t(r_last.x) - int64_t(r_first.x) + 1;
+	const int64_t span_z = int64_t(r_last.y) - int64_t(r_first.y) + 1;
+	return span_x > 0 && span_z > 0 && span_x * span_z <= SVT_CELLS_PER_PAGE;
+}
+} // namespace
+
 void Terrain3D::_process_async_svt_pages() {
 	if (_vt.svt_pending_pages.empty() || !_data || _vt.vt_baker.is_null()) { return; }
 	if (!_vt.svt_page_pipeline) { _vt.svt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(_vt.vt_page_workers); }
@@ -294,10 +328,10 @@ bool Terrain3D::_resolve_svt_cell_pieces(const Rect2 &p_rect, Array &r_pieces,
 			_vt.vt_page_size <= 0 || p_rect.size.x <= 0.f) {
 		return false;
 	}
+	// The cell size every piece below is placed in. A zero or negative one is not a world: the
+	// cover check below answers that, and it is the one gate this function and the persisted-bake
+	// probe share.
 	const float world = float(_region_size) * _vertex_spacing;
-	if (world <= 0.f) {
-		return false;
-	}
 	const float pixel = p_rect.size.x / float(_vt.vt_page_size);
 	const Rect2 footprint = p_rect.grow(pixel * _vt.vt_page_border);
 	// The store bakes at the far field's density, so the level is the one whose texel is
@@ -307,14 +341,10 @@ bool Terrain3D::_resolve_svt_cell_pieces(const Rect2 &p_rect, Array &r_pieces,
 											Math::log(2.f))),
 			0, MAX(0, _vt.svt_cells->get_level_count() - 1));
 	const int level_size = MAX(1, resolution >> level);
-	const Vector2i first(int(Math::floor(footprint.position.x / world)), int(Math::floor(footprint.position.y / world)));
-	const Vector2i last(int(Math::floor(footprint.get_end().x / world)), int(Math::floor(footprint.get_end().y / world)));
-	// A root page can span a continent. Above this many cells the store cannot serve the
-	// page usefully anyway (it holds a handful), and the caller falls back to cropping the
-	// resident payloads, which costs one pass over the regions instead of one per cell.
-	const int64_t span_x = int64_t(last.x) - int64_t(first.x) + 1;
-	const int64_t span_z = int64_t(last.y) - int64_t(first.y) + 1;
-	if (span_x <= 0 || span_z <= 0 || span_x * span_z > 4096) {
+	Vector2i first;
+	Vector2i last;
+	if (!svt_page_cell_cover(p_rect, _vt.vt_page_size, _vt.vt_page_border, _region_size,
+				_vertex_spacing, first, last)) {
 		return false;
 	}
 	for (int z = first.y; z <= last.y; ++z) {
@@ -360,28 +390,28 @@ bool Terrain3D::_resolve_svt_cell_pieces(const Rect2 &p_rect, Array &r_pieces,
 }
 
 // Whether any cell this page touches has a persisted bake. The answer is remembered per
-// cell, so the render path never stats the same file twice.
+// cell, so the render path never stats the same file twice. The page's cell cover decides
+// whether the question is worth asking at all - see `svt_page_cell_cover()`.
 bool Terrain3D::_svt_cells_have_persisted_bake(const Rect2 &p_rect) {
 	if (_data_directory.is_empty() || !_data) {
 		return false;
 	}
+	Vector2i first;
+	Vector2i last;
+	if (!svt_page_cell_cover(p_rect, _vt.vt_page_size, _vt.vt_page_border, _region_size,
+				_vertex_spacing, first, last)) {
+		// The page covers more cells than a cell source can serve, so the caller's region crop
+		// is the answer and the disk is not asked. This is the counter a regression into the
+		// per-cell scan shows up in; see the constant's comment.
+		++_vt.svt_persist_probe_skips;
+		return false;
+	}
 	const float world = float(_region_size) * _vertex_spacing;
-	if (world <= 0.f) {
-		return false;
-	}
-	const float pixel = p_rect.size.x / float(MAX(1, _vt.vt_page_size));
-	const Rect2 footprint = p_rect.grow(pixel * _vt.vt_page_border);
-	const Vector2i first(int(Math::floor(footprint.position.x / world)), int(Math::floor(footprint.position.y / world)));
-	const Vector2i last(int(Math::floor(footprint.get_end().x / world)), int(Math::floor(footprint.get_end().y / world)));
 	const int resolution = MAX(1, int(Math::ceil(double(world) * MAX(0.001, get_surface_svt_texels_per_meter()))));
-	const int64_t span_x = int64_t(last.x) - int64_t(first.x) + 1;
-	const int64_t span_z = int64_t(last.y) - int64_t(first.y) + 1;
-	if (span_x <= 0 || span_z <= 0 || span_x * span_z > 4096) {
-		return false;
-	}
 	for (int z = first.y; z <= last.y; ++z) {
 		for (int x = first.x; x <= last.x; ++x) {
 			const Vector2i cell(x, z);
+			++_vt.svt_persist_probe_cells;
 			const int64_t key = (int64_t(x) << 32) ^ uint32_t(z);
 			auto probe = _vt.svt_cell_file_probe.find(key);
 			if (probe == _vt.svt_cell_file_probe.end()) {

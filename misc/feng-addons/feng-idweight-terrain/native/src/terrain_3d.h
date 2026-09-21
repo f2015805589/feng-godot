@@ -29,6 +29,7 @@
 #include "terrain_3d_svt.h"
 #include "terrain_3d_virtual_texture.h"
 #include "terrain_3d_vt_feedback.h"
+#include "terrain_vt.h"
 #include "terrain_3d_vt_visibility.h"
 #include "terrain_3d_vt_state.h"
 #include "terrain_3d_page_pipeline.h"
@@ -94,6 +95,11 @@ private:
 	Dictionary _load_svt_cell(const Vector2i &p_cell);
 	int _update_sector_avt(int p_max_pages);
 	int _produce_sector_avt_pages(int p_max_pages);
+	// The near field's per-tick page allowance. Two readers size against it - the tick, which hands
+	// the pass this many pages, and the plan's rate term, which bounds the pages the plan may name
+	// beyond the ones the image samples by what one refresh window can produce - so the split has
+	// one home. See the definition and `docs/vt_hdrp_avt_alignment.md` section 7.7.
+	int _avt_tick_allowance() const;
 	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
 	// struct in terrain_3d_avt.h for what each stage owns.
 	void _avt_classify_plan(Terrain3DAVTProducePass &r_pass);
@@ -237,10 +243,25 @@ private:
 	// the new roots (and queueing the ones with no content), and recording what the pinned set
 	// covers. `r_produced` is the pass's production count, which the root walk adds its queued
 	// pages to; `r_cached` reports whether the previous plan was still valid, which is the case
-	// that makes a settled far field free. Split out of `_update_visible_svt()` so that pass reads
-	// as the stages it runs - see the definition for what the pyramid is for.
+	// that makes a settled far field free. `p_pass_budget` is how many pages the pass this belongs
+	// to may produce: the pyramid is queued under that same bound, so rebuilding it ramps over the
+	// passes the page budget allows instead of queueing the whole set in one tick - pinning is free
+	// and unconditional, so the plan still settles on the first pass. Split out of
+	// `_update_visible_svt()` so that pass reads as the stages it runs - see the definition for
+	// what the pyramid is for.
 	std::array<double, 4> _svt_plan_roots(const Rect2 &p_domain, int p_maximum_mip, int p_coverage_limit,
-			int p_physical_page_count, int &r_produced, bool &r_cached);
+			int p_physical_page_count, int p_pass_budget, const std::vector<Terrain3DSVTPage> &p_visible,
+			int &r_produced, bool &r_cached);
+	// The two fallback policies as strategies, and the one place that chooses between them. See the
+	// definitions for what each guarantees and H2 of `docs/vt_hdrp_avt_alignment.md` for the
+	// measurement that decides which is default.
+	std::vector<Vector3i> _svt_global_root_pyramid(int p_indirection_size, int p_protected_limit,
+			int p_root_top, int p_root_first);
+	std::vector<Vector3i> _svt_per_unit_coarsest(const std::vector<Terrain3DSVTPage> &p_visible,
+			int p_coarsest_mip, int p_protected_limit);
+	std::vector<Vector3i> _svt_fallback_pages(int p_policy, int p_maximum_mip, int p_indirection_size,
+			int p_protected_limit, int p_root_top, int p_root_first,
+			const std::vector<Terrain3DSVTPage> &p_visible);
 	// Whether a published page still has no content: true when the producer does
 	// not hold it ready and no production for it is in flight. Demand re-produces such a page
 	// instead of treating its indirection entry as a hit. Both views and the service ask this,
@@ -446,6 +467,11 @@ public:
 	int get_surface_vt_page_size() const { return _vt.surface_vt_page_size; }
 	void set_surface_vt_page_border(const int p_border);
 	int get_surface_vt_page_border() const { return _vt.surface_vt_page_border; }
+	// The near field's requested anisotropy: 0 follows the viewport's filtering level, any other
+	// value is the request itself. `get_avt_anisotropy()` is what the shader and the CPU footprint
+	// both use - this request clamped by what the page gutter can sample.
+	void set_surface_vt_anisotropy(const int p_anisotropy);
+	int get_surface_vt_anisotropy() const { return _vt.surface_vt_anisotropy; }
 	void set_surface_vt_pages_per_axis(const int p_pages);
 	int get_surface_vt_pages_per_axis() const { return _vt.surface_vt_pages_per_axis; }
 	void set_surface_vt_texels_per_meter(real_t p_value);
@@ -456,6 +482,21 @@ public:
 	PackedFloat32Array get_surface_vt_mip_distances() const { return _vt.surface_vt_mip_distances; }
 	int get_surface_vt_mip_for_distance(real_t p_distance) const;
 	int get_avt_base_block_size() const;
+	// The near field's local mip chain as a level count. `get_avt_mip_levels()` is the setting
+	// (zero means automatic) and `get_avt_mip_level_cap()` is the number every reader uses: the
+	// last local mip a sector block may serve, or a value past any block when the setting is
+	// automatic. The plan's depth and the shader's `top` both come from the cap, so the two cannot
+	// disagree about how deep the chain is.
+	int get_avt_mip_levels() const { return _vt.surface_vt_mip_levels; }
+	void set_surface_vt_mip_levels(int p_levels);
+	int get_avt_mip_level_cap() const;
+	// The near field's anisotropy: `..._request()` is the setting (or the viewport's level when the
+	// setting is zero) and `get_avt_anisotropy()` is that request clamped by the page gutter, which
+	// is the hard bound - a filtering footprint cannot reach past the border texels a page carries.
+	// One home for a rule that used to be spelled at both call sites: the material binds the second
+	// and the sector AVT footprint uses it for CPU demand.
+	float get_avt_anisotropy_request(const Camera3D *p_camera) const;
+	float get_avt_anisotropy(const Camera3D *p_camera) const;
 	void set_surface_vt_resolution(int p_resolution);
 	int get_surface_vt_resolution() const { return _vt.vt_page_size * _vt.surface_vt_pages_per_axis; }
 	void set_surface_vt_distance(const real_t p_distance);
@@ -531,6 +572,11 @@ public:
 	int get_surface_vt_mip() const { return _vt.surface_vt_mip; }
 	void set_surface_vt_feedback_enabled(const bool p_enabled);
 	bool is_surface_vt_feedback_enabled() const { return _vt.surface_vt_feedback_enabled; }
+	// The demand-source seam: whether the projection pass may run at all, and which source answers
+	// this frame. Two questions, one owner - see `TerrainVTPageDemandSource` in terrain_3d_vt_state.h
+	// for why a single flag could not express both.
+	bool _vt_projection_demand_enabled() const { return _vt.surface_vt_feedback_enabled; }
+	TerrainVTPageDemandSource _vt_demand_source() const;
 	void set_surface_vt_feedback_interval(const int p_updates);
 	int get_surface_vt_feedback_interval() const { return _vt.surface_vt_feedback_interval; }
 	void set_surface_vt_feedback_grid_chunks(const int p_chunks);
@@ -558,9 +604,16 @@ public:
 	real_t get_surface_svt_distance() const { return _vt.surface_svt_distance; }
 	void set_surface_svt_root_mips(const int p_mips);
 	int get_surface_svt_root_mips() const { return _vt.surface_svt_root_mips; }
+	void set_surface_svt_fallback_policy(const int p_policy);
+	int get_surface_svt_fallback_policy() const { return _vt.surface_svt_fallback_policy; }
 	void set_surface_svt_mip_distances(const PackedFloat32Array &p_distances);
 	PackedFloat32Array get_surface_svt_mip_distances() const { return _vt.surface_svt_mip_distances; }
 	int get_surface_svt_mip_distance_count() const { return int(_vt.surface_svt_mip_distances.size()); }
+	// The far field's level rule, built from the live settings, and the published cap it resolves
+	// against when a caller does not name one. `TerrainVT::MipRule` in terrain_vt.h is the rule
+	// itself; these two are the only parts of it that need the node. See the definitions.
+	TerrainVT::MipRule _svt_mip_rule() const;
+	int _svt_mip_rule_cap(int p_max_mip) const;
 	// Largest distance the table (or the automatic rule) still serves with a page.
 	real_t get_surface_svt_mip_reach() const;
 	void set_surface_array_enabled(const bool p_enabled);

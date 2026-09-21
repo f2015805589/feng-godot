@@ -149,11 +149,29 @@ void Terrain3D::set_surface_svt_page_count(const int p_count) {
 	}
 }
 
+// The far field's configured mip cap: the coarsest level the world grid may publish before demand
+// raises it. H3 step 1 established that a cap is a bound on which mips a *request* may name, not a
+// property of any page's content - a resident indirection entry survives it, because
+// `virtual = (page + half) >> mip` does not depend on the cap, and the levels it enables are derived
+// from the persisted cells on demand. Step 1 removed the whole-world re-bake from the *runtime* raise
+// for that reason; this setter was the same heavy hammer one level up, and the two demand-side setters
+// below (`set_surface_svt_root_mips()`, `set_surface_svt_fallback_policy()`) already show what the
+// cheap version looks like. `_reset_vt_configuration()` here marked the shared setup stale, which on
+// the next tick rebuilt both views' pool, released every resident page (including the near field's),
+// bumped `pool.generation` so the far field re-planned from nothing, and cancelled a bake in flight
+// whose catalogue is indexed by cell and level rather than by this cap.
+//
+// What does have to happen: publish the cap on the live view, because `_surface_svt_max_mip` is what
+// the shader's coarser walk clamps against and the view is its source; reopen the strict-sampling
+// gate, because the root window is planned inside the new cap and `_update_visible_svt()`'s root key
+// mixes `maximum_mip` and `root_top` so the next pass re-pins by itself; and republish the material,
+// which is where both reach the shader.
 void Terrain3D::set_surface_svt_max_mip(const int p_mip) {
 	_vt.surface_svt_max_mip = p_mip;
 	if (!_vt.vt_debug_direct_material) {
 		if (_vt.surface_svt) { _vt.surface_svt->set_world_max_mip(p_mip); }
-		_reset_vt_configuration();
+		_vt.svt_startup_ready = false;
+		if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
 		return;
 	}
 	if (_vt.surface_svt) {
@@ -177,6 +195,20 @@ void Terrain3D::set_surface_svt_root_mips(const int p_mips) {
 	// the same one flag `set_surface_svt_enabled()` reopens. Resetting the whole VT configuration here
 	// instead rebuilt the shared pool the near field samples and threw away its resident pages, and it
 	// cancelled a bake in flight whose output is indexed by level, not by this count.
+	if (!_vt.vt_debug_direct_material) { _vt.svt_startup_ready = false; }
+}
+
+// Which set answers a far-field fragment whose selected page is not resident. Like the root-mip
+// count above this is a demand-side setting: it moves no address, no page size and no atlas
+// dimension, and `_update_visible_svt()` mixes it into its plan hash, so a change invalidates the
+// plan by itself. It does have to be proven again - `is_svt_startup_ready()` gates strict sampling on
+// the protected set having content - which is the same one flag `set_surface_svt_enabled()` reopens.
+// Resetting the whole VT configuration here would rebuild the shared pool the near field samples and
+// throw away its resident pages for a setting that changes which pages are pinned.
+void Terrain3D::set_surface_svt_fallback_policy(const int p_policy) {
+	const int policy = CLAMP(p_policy, 0, 1);
+	if (_vt.surface_svt_fallback_policy == policy) { return; }
+	_vt.surface_svt_fallback_policy = policy;
 	if (!_vt.vt_debug_direct_material) { _vt.svt_startup_ready = false; }
 }
 

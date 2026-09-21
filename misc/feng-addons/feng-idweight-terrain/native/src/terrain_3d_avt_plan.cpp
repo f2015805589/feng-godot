@@ -208,7 +208,7 @@ static void plan_pages_for_bias(Terrain3DAVTRefinement &r_job, const TerrainAVT:
 					const Vector2i child_owner(parent.sector->location.x * 2 + x, parent.sector->location.y * 2 + y + (level ? 0x40000000 + level * 0x100000 : 0));
 					const auto node = nodes.find(owner_key(child_owner));
 					if (node == nodes.end() || !(node->second->size > 0)) { complete = false; continue; }
-					const int mip = level ? 0 : TerrainVT::log2_power_of_two(node->second->size);
+					const int mip = level ? 0 : MIN(TerrainVT::log2_power_of_two(node->second->size), p_input.mip_level_cap);
 					if (make_page(*node->second, mip, 0, 0, child)) { children[child_count++] = child; }
 				} else if (parent.mip > 0 && make_page(*parent.sector, parent.mip - 1, parent.x * 2 + x, parent.y * 2 + y, child)) {
 					children[child_count++] = child;
@@ -295,14 +295,61 @@ static void plan_pages_for_bias(Terrain3DAVTRefinement &r_job, const TerrainAVT:
 	// own leftover spent that reservation as well, putting every installed plan a retention
 	// window over its budget.
 	const int retain_reserve = MIN(RETAIN_RESERVE, MAX(0, budget / 4));
-	const int ahead_count = MIN(int(apron.size()),
-			MIN(256, MAX(0, budget - retain_reserve - int(r_job.pages.size()))));
+	// The rate term (section 7.7). `budget` is a *residency* bound: it says how many pages the pool
+	// can hold at once, and it says nothing about how fast they can be produced. The near field
+	// gets `_avt_tick_allowance()` pages a tick whatever this plan asks for, and each refresh of a
+	// moving view selects far more sampled pages than one window can fill, so a plan sized by
+	// residency alone spends its whole width on pages the image never samples and starves the ones
+	// it does. Measured: a 384-page plan against an eight-page allowance, a permanent deficit of up
+	// to 97 sampled pages, a pool with no free slot and a far field served at its coarsest mip.
+	//
+	// So the tail - the pages this plan holds that no fragment samples - is bounded by what one
+	// refresh window can actually produce. The pages the image samples are not bounded by it: they
+	// are what the plan is for, and a term that dropped one would put the missing-page diagnostic on
+	// the screen. A `tail_cap` of zero means the caller derived no term and the historical
+	// residency-only bound stands.
+	const int tail_room = MAX(0, budget - retain_reserve - int(r_job.pages.size()));
+	const int tail_cap = p_input.tail_cap > 0 ? MIN(p_input.tail_cap, tail_room) : MIN(256, tail_room);
+	// The retention window is not speculation: it holds the pages a rendered frame still samples
+	// while the plan has already moved past them (the plan is derived from the lead transform), so
+	// it takes the first share. The apron is speculation and takes what is left. The split is even
+	// because neither is required and neither may have the whole of one window: spending it on the
+	// apron drops the render-lag window, and spending it on retention stops the plan prefetching the
+	// pages a turn or a slope is about to bring in.
+	const int retain_share = MIN(retain_reserve, tail_cap / 2);
+	const int ahead_count = MIN(int(apron.size()), MAX(0, tail_cap - retain_share));
 	r_job.pages.insert(r_job.pages.end(), apron.begin(), apron.begin() + ahead_count);
 	// The leading entries are the pages the current image samples; the apron follows.
 	r_job.sampled = int(r_job.pages.size()) - ahead_count;
+	// What is left of the term after the apron took its share, for the retention append. The
+	// installer holds the whole-plan invariant at the point of the append; this is the same number
+	// the planner reserved there, kept where the term was derived.
+	r_job.retain_cap = MAX(0, tail_cap - ahead_count);
+	r_job.tail_cap = tail_cap;
 	float finest_requested_texel = FLT_MAX;
 	for (const Terrain3DAVTPageRequest &page : r_job.pages) { finest_requested_texel = MIN(finest_requested_texel, page.rect.size.x / page_size); }
 	r_job.finest = r_job.pages.empty() ? 0.f : finest_requested_texel;
+
+	// What the plan is made of, by level: how many of its pages are local-mip 0, 1, 2 ... of a 64 m
+	// sector, and how many belong to a world node above one. A page a fragment samples is at the
+	// local mip its footprint selects; the chain's coarser local mips are the fallback ladder above
+	// it, and they are the only part of the plan a chain shorter than the block size could give
+	// back. Nothing else reports that split, and it is the whole question "does the fallback ladder
+	// cost residency" is asked with: `plan_level_mips` is a histogram over local mip 0..16 and
+	// `plan_world_pages` is the count above the 64 m sectors.
+	{
+		PackedInt32Array histogram;
+		histogram.resize(17);
+		int world_pages = 0;
+		for (const Terrain3DAVTPageRequest &page : r_job.pages) {
+			const bool leaf = (page.owner.y & 0x40000000) == 0;
+			if (!leaf) { ++world_pages; continue; }
+			const int mip = CLAMP(page.mip, 0, 16);
+			histogram.set(mip, histogram[mip] + 1);
+		}
+		r_job.level_mips = histogram;
+		r_job.world_pages = world_pages;
+	}
 
 	// Prepare surrounding detail after the visible plan is fixed. A separate idle
 	// queue may use free slots, but never evicts a resident page or steals demand.

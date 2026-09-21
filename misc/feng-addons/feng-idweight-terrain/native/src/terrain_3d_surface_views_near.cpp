@@ -83,11 +83,25 @@ Rect2i Terrain3D::get_surface_vt_region_rect() const {
 	return Rect2i(center + _vt.surface_vt_region_offset - _vt.surface_vt_region_grid / 2, _vt.surface_vt_region_grid);
 }
 
+// Which demand source answers this frame. The projection source answers only while it is enabled
+// *and* it has a result: the first pass of a session has none, and the interval between passes keeps
+// the standing result rather than dropping back to the distance rule for a frame. That distinction -
+// the setting versus this frame - is the whole reason the source is a named value; see
+// `TerrainVTPageDemandSource` in terrain_3d_vt_state.h.
+TerrainVTPageDemandSource Terrain3D::_vt_demand_source() const {
+	if (!_vt_projection_demand_enabled()) { return TerrainVTPageDemandSource::CPURule; }
+	if (!_vt.surface_vt_feedback || !_vt.surface_vt_feedback->has_result()) { return TerrainVTPageDemandSource::CPURule; }
+	return TerrainVTPageDemandSource::Projected;
+}
+
 // Runs the demand pass and makes its result available. The readback of a local device is
 // delivered by sync(), so this is a stall; the interval exists to amortise it, and the
 // demand pass keeps using the last result in between.
+//
+// This is the projection source's *producer*: it asks whether the source may run, not which source
+// answers, because a result it produces this tick is what makes it answer on the next ones.
 bool Terrain3D::_update_surface_vt_feedback(const Vector3 &p_target) {
-	if (!_vt.surface_vt_feedback_enabled) {
+	if (!_vt_projection_demand_enabled()) {
 		return false;
 	}
 	Camera3D *camera = get_camera();
@@ -143,8 +157,7 @@ int Terrain3D::_surface_vt_mip_for_page(const Vector2i &p_region_loc, const int 
 		return MIN(_vt.surface_vt_mip, p_max_local_mip);
 	}
 	if (!_vt.vt_debug_direct_material) { return 0; }
-	if (_vt.surface_vt_feedback_enabled && _vt.surface_vt_feedback &&
-			_vt.surface_vt_feedback->has_result()) {
+	if (_vt_demand_source() == TerrainVTPageDemandSource::Projected) {
 		const int mip = _vt.surface_vt_feedback->get_mip_for_page(p_region_loc, _vt.surface_vt_pages_per_axis,
 				p_page_x0, p_page_y0, _vt.surface_vt_feedback_origin);
 		// -1 means the pass culled this page: off screen, behind the camera or too

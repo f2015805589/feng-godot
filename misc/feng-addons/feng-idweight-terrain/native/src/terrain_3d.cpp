@@ -257,7 +257,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
 	// How much of this tick's page budget the near field may take, and what the far field gets
-	// of it: the near field's half, then whatever the near field did not spend. The near field's
+	// of it: the near field's share, then whatever the near field did not spend. The near field's
 	// own report is what moves the remainder, and it is bounded by the share it was given, so
 	// the remainder is a real budget rather than a count of re-queues.
 	//
@@ -266,12 +266,18 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// that is not given a slot this tick is re-requested - and re-assembled - on the next one.
 	// Too small a share is therefore more total work, not less, and it also changes when the
 	// far field's startup grace ends - the frames in which a scene renders from the source
-	// array instead of the missing-page diagnostic.
+	// array instead of the missing-page diagnostic. The split also stays even for a measured
+	// reason, not an inherited one; `_avt_tick_allowance()` records the run that says so.
 	// With no far field to share with, the near field takes the whole budget: it is then the only
 	// consumer of it, and halving it halves how many pages a view fills in per tick. That case is
 	// the whole of `vt_sectors`, `vt_metric_density`, `vt_region_ownership` and `vt_filtering`, and
 	// four recorded-good scenarios failed when this line lost the conditional.
-	const int avt_share = _vt.surface_svt_enabled ? MAX(1, vt_remaining / 2) : vt_remaining;
+	//
+	// The rule now has one home (`_avt_tick_allowance()`), because the near field's plan is sized
+	// against the same number: its unsampled tail is capped at what one refresh window can produce
+	// with this allowance. Two spellings of the split would let the plan outrun the pass it is
+	// served from, which is the defect `docs/vt_hdrp_avt_alignment.md` section 7.7 records.
+	const int avt_share = _avt_tick_allowance();
 	int avt_produced = 0;
 	// The tiers run in the order they are built in: the near field's pass publishes the
 	// near-field addressing state the material reads and the far field's publishes the

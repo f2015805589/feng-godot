@@ -1,12 +1,12 @@
-## GPU regression for the far field's fallback pyramid.
-##
-## The root pyramid is what answers a fragment whose selected far-field page is missing or
-## still in production, and it is only a fallback where its pages actually are. The
-## candidate set used to be the whole SVT domain - which is thousands of pages at a level
-## the view selects - and the protection budget then truncated it in row-major order, so
-## every pinned root sat in one corner of the map and the fallback answered nowhere near the
-## camera. This test asserts coverage geometrically, asserts that every pinned root has
-## content, and asserts that a settled view stops producing.
+## GPU regression for the far field's fallback. Two policies, each on its own contract: the root
+## pyramid (default) covers the whole addressable domain, and the per-unit guarantee covers the units
+## the visible set selected. The pyramid is what answers a fragment whose selected far-field page is
+## missing or still in production, and it is only a fallback where its pages actually are. The
+## candidate set used to be the whole SVT domain - which is thousands of pages at a level the view
+## selects - and the protection budget then truncated it in row-major order, so every pinned root sat
+## in one corner of the map and the fallback answered nowhere near the camera. This test asserts
+## coverage geometrically, asserts that every pinned root has content, and asserts that a settled view
+## stops producing - then switches to the per-unit policy and asserts that one's own, weaker promise.
 extends SceneTree
 
 const REGION_SIZE := 64
@@ -248,6 +248,35 @@ func run() -> void:
 			str(settings().get("svt_root_skips", 0)), str(settings().get("svt_root_passes", 0))])
 	require(after == before,
 			"a settled far field must not re-produce pages every pass (requeues %d -> %d)" % [before, after])
+
+	# The other fallback policy, H2 of `docs/vt_hdrp_avt_alignment.md`: the coarsest level the world
+	# grid can express, for every unit the visible set selected, instead of one complete level window
+	# over the whole addressable domain.
+	#
+	# It is a different **contract**, not a different threshold, and that is why this pass asserts its
+	# own terms rather than the ones above: the pyramid's promise is that any world position resolves,
+	# which is what lets the region array be unnecessary, and a unit-local guarantee deliberately does
+	# not make that promise. Section 9 of the alignment document forbids relaxing an assertion to make
+	# a phase pass, so the pyramid's domain assertions above are untouched and the domain the
+	# alternative does not claim is *printed*, not asserted away.
+	terrain.surface_svt_fallback_policy = 1
+	for _frame in 150:
+		terrain.update_surface_svt(PAGE_COUNT)
+		await process_frame
+	var alt := await frame_image()
+	var alt_stats := patch_stats(alt, far_world)
+	var alt_info := settings()
+	var alt_coverage: Rect2 = alt_info.get("svt_root_coverage", Rect2())
+	var alt_roots := int(alt_info.get("svt_root_pages", 0))
+	print("VTROOTCOVER perunit coverage=%s roots=%d pyramid_roots=%d domain_covered=%s patch=%s" % [
+			str(alt_coverage), alt_roots, roots,
+			str(alt_coverage.has_point(Vector2(-domain * 0.45, -domain * 0.45))), str(alt_stats)])
+	require(alt_roots > 0, "the per-unit policy must pin the visible units' coarsest pages")
+	require(alt_roots < roots, "the per-unit set must be smaller than the domain pyramid (%d vs %d)" % [alt_roots, roots])
+	require(alt_coverage.has_point(CENTER_WORLD), "the per-unit fallback must cover the camera")
+	require(alt_coverage.has_point(far_world), "the per-unit fallback must cover the visible far field")
+	require(float(alt_stats["magenta"]) < 0.02,
+			"the per-unit fallback must not show the missing-page diagnostic in the visible field")
 
 	scene.queue_free()
 	await process_frame

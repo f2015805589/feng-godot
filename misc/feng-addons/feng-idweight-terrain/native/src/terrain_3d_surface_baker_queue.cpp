@@ -34,10 +34,22 @@
 using namespace terrain_surface_baker;
 
 void Terrain3DSurfaceBaker::set_page_budget(const int p_pages) {
-	_page_budget.store(CLAMP(p_pages, 1, 16));
-	// A budget change moves the depth the ring has to hold for that budget to be the rate
-	// that decides page production. It never exceeds what the bundle allocated, so this only
-	// ever re-admits positions the allocation already has.
+	// The producer's half of the page budget: how many page *writes* one frame admits
+	// (`_frame_page_updates >= _page_budget` in terrain_3d_surface_baker_frame.cpp). There is no
+	// upper clamp - a budget is a number the caller chose, and honouring it is the point. The only
+	// guard is positive, because zero writes a frame is indistinguishable from a stalled producer.
+	//
+	// What actually bounds throughput is the in-flight encode ring, not this number: it is derived
+	// from the budget (`_derive_encode_ring_pages() = budget * ENCODE_READBACK_FRAMES`) and clamped by
+	// the bytes the ring may hold and by `ENCODE_PAGES_MAX`. That ring is allocated for the whole
+	// ceiling at bundle build time, so raising this setting re-admits depth the allocation already
+	// has - up to the ceiling, which is what a budget above `ENCODE_PAGES_MAX / ENCODE_READBACK_FRAMES`
+	// meets. `get_vt_settings()` reports `encode_ring_capacity` and `encode_ring_allocated` so the
+	// effective depth is visible rather than guessed.
+	_page_budget.store(MAX(1, p_pages));
+	// A budget change moves the depth the ring has to hold for that budget to be the rate that
+	// decides page production. The allocation is the ceiling, the staging layers included, so this
+	// only ever re-admits positions that were reserved for exactly this.
 	_refresh_encode_ring_capacity();
 }
 

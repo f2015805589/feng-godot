@@ -141,7 +141,7 @@ preview.
 
 A new terrain region is 512 samples at 1 metre spacing: **512 x 512 metres of geometry**. Existing region files keep their dimensions. Bulk initialization accepts X/Z region counts; 20 x 20 spans 10.24 x 10.24 km.
 
-Procedural AVT partitions material addressing into **64 x 64 metre sectors** (8 x 8 per default region). The AVT indirection atlas has 2048 x 2048 R32F entries and a manual mip chain. The default shared pool has 256 physical slots, each with a 256 x 256 texel core and 4-texel borders (264 x 264 storage).
+Procedural AVT partitions material addressing into **64 x 64 metre sectors** (8 x 8 per default region). The AVT indirection atlas has 2048 x 2048 R32F entries and a manual mip chain. The default shared pool has 256 physical slots, each with a 256 x 256 texel core and 9-texel borders (274 x 274 storage). The gutter moved from four to nine when the near field's anisotropy default became 8x: a gutter of n supports n - 0.5, so four admitted 3.5x and silently reduced every larger request. Both views share the number; see [`vt_sampling_review.md`](vt_sampling_review.md) and, for the 7.7% texel cost a page carries, the estimate below.
 
 | Density | Virtual image per 64 m sector | Logical entries per axis | Allocator block |
 | --- | --- | --- | --- |
@@ -165,7 +165,7 @@ Missing detail resolves through ready parents. A complete cache miss uses explic
 
 ## Coverage, mip filtering and camera turns
 
-With both tiers enabled, AVT covers a camera-centred XZ radius of 512 m by default, requesting visible resident terrain across region boundaries. Its outer 25% blends into SVT; a sector-sized margin retains coarse coverage. SVT skips only footprints entirely inside the AVT interior. With SVT disabled, AVT supplies the whole visible world. Region Grid, Offset and Forward controls are hidden compatibility state and do not control sector coverage.
+With both tiers enabled, AVT covers a camera-centred XZ radius of 384 m by default, requesting visible resident terrain across region boundaries. Its outer 25% blends into SVT; a sector-sized margin retains coarse coverage. SVT skips only footprints entirely inside the AVT interior (`0.75 * surface_vt_distance`, so 288 m at the default). With SVT disabled, AVT supplies the whole visible world. Region Grid, Offset and Forward controls are hidden compatibility state and do not control sector coverage.
 
 The planner retains compatible nearby sector address blocks and ready pages across turns. Visible requests have priority. Idle surrounding prefetch uses only free physical slots and cannot evict visible work. Offscreen blocks can be reclaimed under pressure; terrain beyond the active range is released when SVT provides the far field. This avoids repeatedly rebuilding warmed headings without lowering foreground target density or enlarging the default pool.
 

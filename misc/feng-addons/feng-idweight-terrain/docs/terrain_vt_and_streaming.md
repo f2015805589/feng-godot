@@ -102,8 +102,8 @@ Physical residency is the real limit, and it is a *pool* limit, not an addressin
 them for the far field, and the far field protects its root pyramid. A configuration
 whose working set does not fit therefore degrades in a defined order — demand is served
 nearest-first, roots stay resident, and the coarsest levels keep real data — rather than
-failing an allocation. Size the pool from the working set (the near field's 512 m radius
-at density 4 is roughly 50 pages) and leave headroom for the LRU.
+failing an allocation. Size the pool from the working set (the near field's 384 m radius
+at density 4 is roughly 30 pages) and leave headroom for the LRU.
 
 ## 3. What the addon started from
 
@@ -716,7 +716,7 @@ that — a world-aligned page grid with its own page format, fed by baked cell s
   outright, because page contents are resolution specific.
 
 Defaults: near field page 256 texels / 4 pages per axis (1:1 at density 4) with
-`surface_vt_page_count` 128 (the 512 m radius working set is roughly 50 pages, so 64 had no LRU
+`surface_vt_page_count` 128 (the 384 m radius working set is roughly 30 pages, so 64 had no LRU
 headroom); far field page 512 m / 256 texels (0.5 texel/m at mip 0), `surface_svt_page_count`
 256, `surface_svt_root_mips` 2, `surface_svt_distance` 6144 m to the clipmap's reach,
 `surface_svt_mip_distances` empty (automatic bands: 1024 m, 2048 m, 4096 m, … for a 512 m page).

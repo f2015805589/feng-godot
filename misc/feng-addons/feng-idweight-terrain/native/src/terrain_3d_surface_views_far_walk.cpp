@@ -49,8 +49,73 @@
 // `ST_ROOTLIST`..`ST_ROOTCOV` order: the root list, releasing the previous plan's pins, requesting
 // and pinning the new roots (queueing the ones with no content), and recording what the pinned set
 // covers. A reused plan does none of the first three, so it reports only the fourth.
+// The two fallback policies H2 of the alignment document names, as the one place that decides which
+// pages answer a fragment whose selected page is not resident. Both return candidates as mip-0 page
+// coordinates plus the level they are requested at, which is what `_svt_plan_roots()` publishes,
+// pins and protects; everything downstream - the pin budget, the plan key, the reuse and verify
+// path, coverage accounting - is the same for either, which is why the decision is a strategy and
+// not a second code path in the pass.
+//
+// `Terrain3DSVTGlobalRootPyramid`: one complete level window over the *whole* addressable domain.
+// Every world position a fragment can address resolves, at a granularity of kilometres per page -
+// `indirection_size * page_world / 2^mip` metres - so a fallback page that lands or leaves changes a
+// continent's worth of shading.
+//
+// `Terrain3DSVTPerUnitCoarsest`: HDRP's `DeduplicateJob` guarantee - for every virtual image that is
+// *resident* (here: every page the visible set selected), the coarsest level the world grid can
+// express that contains it, requested unconditionally. The fallback's granularity becomes the unit
+// the fragment is looking at rather than the domain, and the coarsest ancestor of a page is a
+// function of the page, so the set moves with the detail set instead of with the world.
+std::vector<Vector3i> Terrain3D::_svt_global_root_pyramid(const int p_indirection_size,
+		const int p_protected_limit, const int p_root_top, const int p_root_first) {
+	std::vector<Vector3i> roots;
+	const int half_pages = p_indirection_size >> 1;
+	for (int mip = p_root_top; mip >= p_root_first && int(roots.size()) < p_protected_limit; --mip) {
+		const int level_size = MAX(1, p_indirection_size >> mip);
+		const int first_index = -(half_pages >> mip);
+		for (int iy = 0; iy < level_size && int(roots.size()) < p_protected_limit; ++iy) {
+			for (int ix = 0; ix < level_size && int(roots.size()) < p_protected_limit; ++ix) {
+				// Page requests and releases take a mip 0 page coordinate.
+				roots.push_back(Vector3i((first_index + ix) << mip, (first_index + iy) << mip, mip));
+			}
+		}
+	}
+	return roots;
+}
+
+std::vector<Vector3i> Terrain3D::_svt_per_unit_coarsest(const std::vector<Terrain3DSVTPage> &p_visible,
+		const int p_coarsest_mip, const int p_protected_limit) {
+	std::vector<Vector3i> roots;
+	if (p_coarsest_mip <= 0) { return roots; }
+	auto floor_div = [](int value, int scale) { return int(std::floor(double(value) / double(scale))); };
+	const int shift = p_coarsest_mip;
+	for (const Terrain3DSVTPage &page : p_visible) {
+		if (int(roots.size()) >= p_protected_limit) { break; }
+		// The coarsest ancestor, in mip-0 page coordinates. `floor_div` and not `>>`: a page
+		// coordinate is signed (the indirection is centred on the origin), and an arithmetic shift
+		// rounds toward negative infinity only by implementation coincidence.
+		const Vector3i root(floor_div(page.address.x, 1 << shift), floor_div(page.address.y, 1 << shift), shift);
+		bool known = false;
+		for (const Vector3i &existing : roots) {
+			if (existing == root) { known = true; break; }
+		}
+		if (!known) { roots.push_back(root); }
+	}
+	return roots;
+}
+
+// Wrapper so `_svt_plan_roots()` reads as the policy it applies. The two strategies are alternatives,
+// never layers: the caller publishes exactly one of them into `svt_roots.pages`.
+std::vector<Vector3i> Terrain3D::_svt_fallback_pages(const int p_policy, const int p_maximum_mip,
+		const int p_indirection_size, const int p_protected_limit, const int p_root_top, const int p_root_first,
+		const std::vector<Terrain3DSVTPage> &p_visible) {
+	if (p_policy == 1) { return _svt_per_unit_coarsest(p_visible, p_maximum_mip, p_protected_limit); }
+	return _svt_global_root_pyramid(p_indirection_size, p_protected_limit, p_root_top, p_root_first);
+}
+
 std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const int p_maximum_mip,
-		const int p_coverage_limit, const int p_physical_page_count, int &r_produced, bool &r_cached) {
+		const int p_coverage_limit, const int p_physical_page_count, const int p_pass_budget,
+		const std::vector<Terrain3DSVTPage> &p_visible, int &r_produced, bool &r_cached) {
 	std::array<double, 4> stages{};
 	uint64_t mark = Time::get_singleton()->get_ticks_usec();
 	auto stamp_root = [&stages, &mark](const int p_index) {
@@ -86,6 +151,7 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 			// visible fragment samples.
 			_vt.surface_svt->set_world_max_mip(root_top);
 			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+			++_vt.svt_root_cap_raises;
 		}
 	}
 	const int root_first = MAX(0, root_top - root_levels + 1);
@@ -105,6 +171,9 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 	root_mix(uint64_t(uint32_t(p_maximum_mip)));
 	root_mix(uint64_t(uint32_t(root_top)));
 	root_mix(uint64_t(uint32_t(root_levels)));
+	// The fallback policy is part of the set's identity: it decides which pages are pinned, so a
+	// changed policy has to re-plan even when the domain, the window and the pool are unchanged.
+	root_mix(uint64_t(uint32_t(_vt.surface_svt_fallback_policy)));
 	root_mix(uint64_t(uint32_t(protected_limit)));
 	root_mix(uint64_t(uint32_t(p_physical_page_count)));
 	root_mix(uint64_t(uint32_t(_vt.pool.generation)));
@@ -157,24 +226,10 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 		}
 	} else {
 		_vt.svt_root_passes++;
-		std::vector<Vector3i> next_roots;
-		if (root_levels > 0) {
-			// Every texel of every level in the window, which is what makes the fallback
-			// answer any world position rather than the ones that happen to be resident. The
-			// walk is in level coordinates so it cannot address a texel the level does not
-			// have, which a domain rect in world units does at its upper edge.
-			const int half_pages = indirection_size >> 1;
-			for (int mip = root_top; mip >= root_first && int(next_roots.size()) < protected_limit; --mip) {
-				const int level_size = MAX(1, indirection_size >> mip);
-				const int first_index = -(half_pages >> mip);
-				for (int iy = 0; iy < level_size && int(next_roots.size()) < protected_limit; ++iy) {
-					for (int ix = 0; ix < level_size && int(next_roots.size()) < protected_limit; ++ix) {
-						// Page requests and releases take a mip 0 page coordinate.
-						next_roots.push_back(Vector3i((first_index + ix) << mip, (first_index + iy) << mip, mip));
-					}
-				}
-			}
-		}
+		// The guaranteed page set, from the policy that owns that decision. See the two strategies
+		// above for what each guarantees.
+		std::vector<Vector3i> next_roots = _svt_fallback_pages(_vt.surface_svt_fallback_policy,
+				p_maximum_mip, indirection_size, protected_limit, root_top, root_first, p_visible);
 		stamp_root(0);
 		// A root outside the domain loses its pin, so a re-configured extent does not keep half
 		// the pool reserved for the rest of the session. Leaving the visible bounds is no longer
@@ -220,17 +275,21 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 			// to hand out a slot leaves the plan unsettled.
 			const bool root_stale = _vt_page_production_stale(slot);
 			if (!miss && !root_stale) { continue; }
-			// Queueing is what costs. A root page with no baked cell crops its payload from the
-			// density-scaled region data on this thread - about two milliseconds for a page this
-			// coarse - so a rebuilt pyramid of twenty roots put eight milliseconds into one tick
-			// each time the far field's level window moved. Pinning is free and is what the
-			// fallback needs, so the pin above stays unconditional and only the queue is gated,
-			// with a floor of one page so a pass that opens with its budget already spent still
-			// makes progress. A root that is skipped keeps no content, so the readiness check at
-			// the top of this pass reopens the plan next tick and the pyramid arrives as a ramp
-			// over a few ticks instead of as one hitch. `continue` and not `break`: the rest of
-			// the roots still have to be pinned.
-			if (r_produced > 0 && _vt_tick_expired()) { continue; }
+			// Queueing is what costs. A root page with no cell source crops its payload from the
+			// density-scaled region data on this thread, so a rebuilt pyramid used to put the
+			// whole set into one tick - measured at 213.9 ms for twenty roots in section 7.7.8,
+			// and every one of those passes was paid again whenever the set was rebuilt.
+			//
+			// Pinning is free and is what the fallback needs, so the pin above stays
+			// unconditional and only the queue is gated, by two bounds and a floor of one page:
+			// the pass's own page budget - a root is a page like any other, and the pass already
+			// knows how many it may produce - and the optional tick deadline beyond it. The floor
+			// keeps a pass whose budget is already spent making progress. A root that is skipped
+			// keeps no content, so the readiness check at the top of this pass reopens the plan
+			// next tick and the pyramid arrives as a ramp over the passes the budget allows
+			// instead of as one hitch. `continue` and not `break`: the rest of the roots still
+			// have to be pinned.
+			if (r_produced > 0 && (r_produced >= MAX(1, p_pass_budget) || _vt_tick_expired())) { continue; }
 			_vt.svt_requeues++;
 			_invalidate_vt_slot(slot);
 			Ref<Image> payload;
@@ -422,19 +481,48 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// never lowered, so a view that already extended the hierarchy keeps it.
 	int used_mip = configured_mip;
 	for (const Terrain3DSVTPage &page : pages) { used_mip = MAX(used_mip, page.mip); }
-	if (!regions.empty() && _vt.surface_svt_mip_distances.is_empty()) {
+	// The rule as a value, once for the pass: the cap raise below is the automatic rule's business
+	// only, and it asks the rule rather than the settings which one is active.
+	const TerrainVT::MipRule mip_rule = _svt_mip_rule();
+	if (!regions.empty() && mip_rule.kind == TerrainVT::MipRuleKind::AutomaticBands) {
 		// With the automatic rule a saved cap must not hide terrain the view can see, so
 		// the hierarchy extends to the level the farthest visible point selects. The
 		// raise is a function of the visible set rather than of pool pressure, and it
 		// only ever grows, so it cannot make a level move back and forth.
-		used_mip = MAX(used_mip, get_surface_svt_mip_for_distance(farthest_distance, plan_limit));
+		used_mip = MAX(used_mip, mip_rule.mip_for_distance(farthest_distance, plan_limit));
 	}
 	const int maximum_mip = MIN(used_mip, plan_limit);
 	if (maximum_mip != configured_mip) {
+		// H3 step 1: a cap change is not a content change. A resident indirection entry stays valid
+		// across it - `virtual = (page + half) >> mip` is level-invariant - so raising the cap enables
+		// coarser *requests* and moves nothing that is already published. What it does have to do is
+		// publish the cap, because `_surface_svt_max_mip` is what the shader's coarser walk clamps
+		// against, and a stale uniform would leave the new level unreachable.
+		//
+		// This used to mark every region in the world bake-dirty and rebuild the material's region
+		// arrays, which is a whole-world re-bake for a bound on which mips `request_world_page()`
+		// accepts. Nothing was waiting on that sweep: the level's pages are requested by the walk
+		// below like any other page and the producer serves them from the persisted catalogue, which
+		// already holds the cell's mip chain. The landing measurement (the turned phase of
+		// `vt_svt_coverage`) produced and served a page at the new level with no region marked, and
+		// `docs/vt_hdrp_avt_alignment.md` section 7.7.6 records it. It is exactly the heavy hammer
+		// section 4/H3 was written about.
+		const int region_marks_before = int(_vt.bake.dirty_regions.size());
+		const uint64_t cap_mark = Time::get_singleton()->get_ticks_usec();
 		_vt.surface_svt->set_world_max_mip(maximum_mip);
-		for (const Vector2i &location : _data->get_region_locations()) { _vt.bake.dirty_regions[location] = true; }
-		_vt.bake.edit_time = 0;
-		if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+		if (_material.is_valid()) { _material->update(Terrain3DMaterial::UNIFORMS_ONLY); }
+		const double cap_ms = double(Time::get_singleton()->get_ticks_usec() - cap_mark) / 1000.0;
+		++_vt.svt_cap_changes;
+		// The regions this change itself marked for re-bake - the increase across it, not the size
+		// afterwards - because that is what H3 step 1 claims is zero and what `vt_svt_coverage`
+		// asserts. Reading the size would report whatever an unrelated edit had already queued. A
+		// regression that reintroduces the sweep shows up here.
+		const int region_marks_after = int(_vt.bake.dirty_regions.size());
+		_vt.svt_cap_dirty_regions = uint64_t(MAX(0, region_marks_after - region_marks_before));
+		_vt.svt_cap_change_ms += cap_ms;
+		_vt.svt_cap_change_worst_ms = MAX(_vt.svt_cap_change_worst_ms, cap_ms);
+		_vt.svt_cap_last_from = configured_mip;
+		_vt.svt_cap_last_to = maximum_mip;
 	}
 
 	// The root pyramid is its own unit - pinning it, reusing or verifying the previous plan, and
@@ -444,7 +532,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	int produced = 0;
 	bool roots_cached = false;
 	std::array<double, 4> root_stages = _svt_plan_roots(domain, maximum_mip, coverage_limit,
-			physical_page_count, produced, roots_cached);
+			physical_page_count, p_max_pages, pages, produced, roots_cached);
 	for (int i = 0; i < 4; ++i) { stage[ST_ROOTLIST + i] = root_stages[i]; }
 	stage_at = ST_ROOTCOV + 1;
 	mark = Time::get_singleton()->get_ticks_usec();
@@ -581,6 +669,13 @@ void Terrain3D::_report_svt(Dictionary &r_result) const {
 	result["svt_root_coverage"] = _vt.svt_roots.coverage;
 	result["svt_root_level_min"] = _vt.svt_roots.level_min;
 	result["svt_root_level_max"] = _vt.svt_roots.level_max;
+	// Which set answers a non-resident fragment, and how many pages it is pinned as. The pair is
+	// what a measurement of the two policies reports: the granularity is `root_page_world` wide, so
+	// the policy with the larger count has the finer - and therefore smaller - update trace.
+	result["svt_fallback_policy"] = _vt.surface_svt_fallback_policy;
+	result["svt_root_page_world"] = _vt.svt_roots.level_max >= 0
+			? double(_vt.surface_svt_page_world * float(1 << _vt.svt_roots.level_max))
+			: 0.0;
 	// Pages demand produced again because the table named them and the producer had no
 	// content. A settled view must stop growing this.
 	result["svt_requeues"] = int64_t(_vt.svt_requeues);
@@ -588,7 +683,25 @@ void Terrain3D::_report_svt(Dictionary &r_result) const {
 	// one walk, so the skip count is what proves the fallback costs nothing per frame.
 	result["svt_root_passes"] = int64_t(_vt.svt_root_passes);
 	result["svt_root_skips"] = int64_t(_vt.svt_root_skips);
+	// The cell sources' own cost: cells the persisted-bake probe examined, and pages it refused
+	// to examine because they cover more cells than a cell source can serve. A pass that spends
+	// its time on the first without the second is a pass asking the disk about a page the disk
+	// cannot assemble; section 7.7.13 has the reading.
+	result["svt_persist_probe_cells"] = int64_t(_vt.svt_persist_probe_cells);
+	result["svt_persist_probe_skips"] = int64_t(_vt.svt_persist_probe_skips);
 	result["svt_floor_level"] = _vt.svt_floor_level;
+	// P0/H3: the world mip cap's change history. `svt_cap_changes` counts the level changes,
+	// `svt_cap_dirty_regions` how many region re-bakes they caused - zero since H3 step 1, and the
+	// property `vt_svt_coverage` asserts - the two `*_ms` keys what they cost, and the two `last_*`
+	// keys the most recent transition. A view that keeps moving the cap is a view whose far field
+	// keeps re-baking itself, which is the trace section 7.3 chased.
+	result["svt_cap_changes"] = int64_t(_vt.svt_cap_changes);
+	result["svt_cap_dirty_regions"] = int64_t(_vt.svt_cap_dirty_regions);
+	result["svt_cap_change_ms"] = _vt.svt_cap_change_ms;
+	result["svt_cap_change_worst_ms"] = _vt.svt_cap_change_worst_ms;
+	result["svt_cap_last_from"] = _vt.svt_cap_last_from;
+	result["svt_cap_last_to"] = _vt.svt_cap_last_to;
+	result["svt_root_cap_raises"] = int64_t(_vt.svt_root_cap_raises);
 	result["svt_visible_pages"] = _vt.vt_svt_visible_pages;
 	result["svt_stats"] = _vt.svt_stats;
 	result["svt_worst_ms"] = _vt.svt_worst_ms;

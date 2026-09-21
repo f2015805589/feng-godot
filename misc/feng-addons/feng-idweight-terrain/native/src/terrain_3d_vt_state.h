@@ -93,6 +93,24 @@ enum class PageArrival : uint8_t {
 	ARMED = 2,
 };
 
+// Which source answers "what level is this page wanted at" for the near field's *region* addressing
+// (the legacy path `_surface_vt_mip_for_page()` resolves; the sector path has its own footprint rule).
+//
+// The two are **layered, not alternatives**: the CPU rule always answers for the demand the lead
+// predicts, and the projection pass *refines* that answer while it has a result. Naming them is what
+// makes one distinction explicit, because a caller has to get it right and a single boolean cannot
+// express it: `_vt_projection_demand_enabled()` is the setting - "may the pass run at all" - and
+// `_vt_demand_source()` is this frame - "does it answer now". Both used to be `surface_vt_feedback_enabled`
+// read in two files with two different meanings, and one of them also re-tested `has_result()`.
+enum class TerrainVTPageDemandSource {
+	// The distance rule the page geometry implies, plus the motion/turn lead.
+	CPURule,
+	// `Terrain3DVTFeedback`'s projection: the level that puts about one page texel on one pixel, with
+	// off-screen and sub-pixel pages culled. It answers between passes too - the standing result is
+	// what the interval amortises the readback over.
+	Projected,
+};
+
 // The page-arrival fade's whole state: the per-slot ramps, the FIFO that orders the armed
 // arrivals, the one-texel texture the shader reads, and the counters the dock and the tests
 // report. One struct rather than fourteen sibling fields, because its parts are one fact each:
@@ -224,8 +242,18 @@ struct Terrain3DVTPool {
 	// only spends the bake budget on content the growth throws away.
 	uint64_t wait_start = UINT64_MAX;
 
-	// The producer's larger arrays arrived and the views were grown in place: this is the published
-	// capacity and the wait is over. No generation bump - nothing was released.
+	// The producer's larger arrays arrived and the views were grown: this is the published capacity
+	// and the wait is over. **No generation bump, because the generation is what tells a consumer to
+	// throw its plan away, and re-planning is the expensive half of the loss.** Growth does release
+	// every resident page - the atlas is one Texture2DArray and `ensure_layers()` recreates it blank
+	// when its layer count changes, which is why `Terrain3DVTPagePool::grow()` evicts every used slot -
+	// but what the consumers keep is their addresses, their source jobs and their completed plans, so
+	// they re-produce the same pages instead of re-deriving which pages they want. The far field's own
+	// root verification (`_svt_plan_roots()` checks every pinned root is still published and still has
+	// content) is what catches the released pins; without it this would have to be bumped, and a bumped
+	// generation costs a root pass of about 200 ms (section 7.7.8). Measured in section 7.7.10: in the
+	// probe's normal session the view's capacity grows 256 -> 512 while this generation stays put, and
+	// `evict_count` jumps by 355 in the interval that contains it.
 	void grow(const int p_capacity) {
 		capacity = p_capacity;
 		wait_start = UINT64_MAX;
@@ -489,7 +517,13 @@ struct Terrain3DVTState {
 	// ---- 1. the shared service: one surface service owns the settings and the GPU material cache;
 	// AVT and SVT below are addressing/producer views over its shared physical residency pool. ----
 	int vt_page_size = 256;
-	int vt_page_border = 4;
+	// The page gutter, in texels each side. Four was the shipped value while the near field's
+	// anisotropy was capped by this same number - a gutter of n supports n - 0.5, so four admitted
+	// 3.5x and silently reduced every larger request, whatever the viewport asked for. Nine admits
+	// the 8x the near field requests by default (`surface_vt_anisotropy`), which is what a grazing
+	// view needs. A stored page is `page_size + 2 * border`, so this is 7.7% more texels a page
+	// than four was, and both views share the number: see docs/vt_sampling_review.md.
+	int vt_page_border = 9;
 	int vt_page_count = 256;
 	// The capacity already published, the rebuild generation and the growth handshake, as one
 	// owner: a capacity change only reaches the two views through the generation. See
@@ -557,6 +591,12 @@ struct Terrain3DVTState {
 	// Per-cell probe of the persisted bake, remembered so the render path never stats the
 	// same file twice (1 = present, 2 = absent).
 	std::unordered_map<int64_t, uint8_t> svt_cell_file_probe;
+	// Cells `_svt_cells_have_persisted_bake()` has examined over the session, and the pages it
+	// refused to examine at all. A page-wide scan is a file stat a cell, so the pair is what says
+	// whether a pass spent its time asking the disk about a page the disk could not serve
+	// (alignment document section 7.7.13: a rebuilt root pyramid used to scan 16 x 3969 cells).
+	uint64_t svt_persist_probe_cells = 0;
+	uint64_t svt_persist_probe_skips = 0;
 	// Edit stamp per far-field cell. A resident cell is only reused while its stamp is at
 	// least the newest edit that touched it or one of its eight neighbours, because a page
 	// border reads them.
@@ -575,9 +615,36 @@ struct Terrain3DVTState {
 	// with the distance rule), so 64 left no headroom for the LRU.
 	int surface_vt_page_count = 128;
 	int surface_vt_page_size = 256;
-	int surface_vt_page_border = 4;
+	// Mirrors `vt_page_border`; the setter syncs all three unless the debug direct-material path
+	// keeps them apart.
+	int surface_vt_page_border = 9;
+	// The near field's requested anisotropic filtering, as a multiplier: 0 follows the viewport's
+	// level, any other value is the request. The gutter is the physical bound - a filtering
+	// footprint cannot reach past the border texels a page carries - so the number the shader and
+	// the CPU footprint both use is `get_avt_anisotropy()`, which is this request clamped by
+	// `vt_page_border - 0.5`, and the two places that used to spell the rule separately now ask
+	// that one function. Eight is the default because it is what the default gutter admits.
+	int surface_vt_anisotropy = 8;
+	// The near field's local mip chain, as a level count: how many levels a sector's virtual image
+	// is allowed to keep above its finest. Zero is automatic and is the shipped behaviour - the
+	// chain is whatever the block size gives (`log2(get_avt_base_block_size()) + 1` levels, nine at
+	// the default density). The chain is what a fragment falls back *through*: a missing fine page
+	// resolves at the next level that is resident, so a shorter chain costs fallback depth and a
+	// longer one costs pages. This is not the block size and it does not move the finest resolution
+	// a sector can serve; `get_avt_mip_level_cap()` is the one reader of the setting, and both the
+	// plan's depth and the shader's `top` clamp come from it.
+	int surface_vt_mip_levels = 0;
 	int surface_vt_pages_per_axis = 4;
-	real_t surface_vt_distance = 512.f;
+	// The near field's reach, in metres around the camera. It is the working set's radius: the plan
+	// covers the reach plus a sector of margin, and its size follows the area (measured at one fixed
+	// pose: 54 sectors and 15 pages at 512 m, 30 and 9 at 384). It shipped at 512, which is what a
+	// 256-slot pool reaches under HDRP's per-sector guarantee (section 3 of
+	// docs/vt_hdrp_avt_alignment.md), and 384 is where that reference implementation's own reach
+	// sits (camera sector +- 6 sectors). The trade is measured in section 7.7.14: the settled plan
+	// falls 44% and the per-move churn does not move at all, while the far field - which excludes
+	// only `0.75 * this` - takes the band the near field gives up. So this is not a way to make an
+	// update faster; it is a way to spend less residency on the ground furthest from the camera.
+	real_t surface_vt_distance = 384.f;
 	Vector2i surface_vt_region_grid = Vector2i(2, 2);
 	int surface_vt_selection_mode = 2;
 	Ref<ImageTexture> avt_sector_directory;
@@ -745,12 +812,17 @@ struct Terrain3DVTState {
 	// regions and its mip chain is world-space, which is what the region-aligned near field above
 	// cannot express. On by default; the region texture array still serves whenever no page covers a
 	// texel. ----
+
 	Terrain3DVirtualTexture *surface_svt = nullptr;
 	bool surface_svt_enabled = true;
 	// One mip 0 page covers this many metres.
 	real_t surface_svt_page_world = 256.f;
 	int surface_svt_page_size = 256;
-	int surface_svt_page_border = 4;
+	// Mirrors `vt_page_border`, which both views share. The far field samples with a plain
+	// `textureLod` (no gradients, no anisotropy), so the gutter it carries is for its own mip
+	// transitions rather than for a filtering footprint - see docs/vt_sampling_review.md for why
+	// the shared number moved to nine and what that costs the far field's pages.
+	int surface_svt_page_border = 9;
 	int surface_svt_page_count = 256;
 	// -1 means auto: the coarsest level the world grid can publish.
 	int surface_svt_max_mip = -1;
@@ -760,6 +832,17 @@ struct Terrain3DVTState {
 	// what lets the shader resolve any world position without the region texture array,
 	// so it is the far field's fallback rather than a separate fallback page.
 	int surface_svt_root_mips = 2;
+	// Which set answers a far-field fragment whose selected page is not resident (H2 in
+	// `docs/vt_hdrp_avt_alignment.md`). 0 is the root pyramid above: one complete level window over
+	// the whole addressable domain, so every world position resolves, at a granularity of kilometres
+	// per page. 1 is HDRP's per-unit guarantee: the coarsest level that covers each *visible* page,
+	// requested unconditionally, so the fallback's granularity is the unit the fragment is looking at
+	// and a fallback page that lands or leaves changes its own rectangle rather than a continent.
+	//
+	// The two are alternatives, not layers: both publish into `svt_roots.pages`, so the pin budget,
+	// the plan key and the reuse/verify path are the same for either. Default 0 keeps every recorded
+	// measurement valid; the policy is switched on numbers, never on preference.
+	int surface_svt_fallback_policy = 0;
 	int vt_svt_visible_pages = 0;
 	// Far-field roots this pass keeps resident and protected, the identity they were planned for and
 	// what the set covers. See `Terrain3DSVTRootPlan` above for why the key alone is not a hit.
@@ -778,6 +861,23 @@ struct Terrain3DVTState {
 	// Pages re-produced because the table named them but the producer had no content for
 	// them. A value that keeps growing in a settled view is a production that never lands.
 	uint64_t svt_requeues = 0;
+	// P0 instrumentation for the world mip cap, kept because H3 step 1 turned what it measured into
+	// an assertion. A cap change *was* treated as a content change - every region marked for re-bake
+	// and the material's region arrays rebuilt - and these counters said how often that happened and
+	// what it cost. Since H3 step 1 it publishes the cap and refreshes the uniform, so
+	// `svt_cap_dirty_regions` is the property `vt_svt_coverage` asserts and is zero because the
+	// change marks nothing. Read them from `get_vt_settings()`; see
+	// docs/vt_hdrp_avt_alignment.md sections 4/H3 and 7.
+	uint64_t svt_cap_changes = 0;
+	uint64_t svt_cap_dirty_regions = 0;
+	double svt_cap_change_ms = 0.0;
+	double svt_cap_change_worst_ms = 0.0;
+	int svt_cap_last_from = -1;
+	int svt_cap_last_to = -1;
+	// The root window's own cap raise (`_svt_plan_roots()`), which rebuilds the material but
+	// deliberately does not dirty regions. Counted separately because it is the other writer
+	// of the same field.
+	uint64_t svt_root_cap_raises = 0;
 	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
 	// 0 when the distance-selected set fit. Diagnostics and tests only.
 	int svt_floor_level = 0;

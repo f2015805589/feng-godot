@@ -15,11 +15,49 @@ owns the geometric bounds, and the planner still receives an immutable view.
 The legacy/SVT density path is unchanged.
 
 Physical pages use anisotropic samplers and explicit world-space gradients.
-Derivatives never pass through the page-coordinate `fract` operation. Hardware
-filtering and the available gutter bound the anisotropy: with a four-texel gutter,
-the conservative limit is 3.5. This accounts for the smaller texels of the lower
-virtual mip and bilinear support. It does not promise 16x filtering with a
-four-texel gutter. No software loop of additional material samples was added.
+Derivatives never pass through the page-coordinate `fract` operation. No software
+loop of additional material samples was added: hardware filtering does the work,
+and the page gutter is what bounds it.
+
+## The anisotropy pair, and why the default gutter is nine texels
+
+A filtering footprint cannot reach past the border texels a page carries, so the
+gutter is a physical bound rather than a policy: a page asked for more than its
+gutter admits samples its own rim instead of the neighbouring ground. The bound is
+`border - 0.5`, and it is conservative on purpose - it accounts for the smaller
+texels of the lower virtual mip and for bilinear support.
+
+The shipped values used to be a four-texel gutter and whatever the viewport's
+filtering level said, which the gutter then reduced to **3.5x** silently, whatever
+was asked for: a project set to 8x or 16x still filtered at 3.5x and nothing said
+so. The near field now has one setting for the request and one function for the
+answer:
+
+* `surface_vt_anisotropy` is the request, in multiples; `0` follows the viewport's
+  level, which is what the addon did before the setting existed. The default is
+  **8**.
+* `vt_page_border` is the gutter, and its default moved from four to **nine**, which
+  admits 8.5, so the default request is honoured as asked.
+* `Terrain3D::get_avt_anisotropy()` is the one home for the answer - request clamped
+  by the gutter - and both consumers call it: the material binds it to
+  `_surface_vt_anisotropy`, and the sector AVT footprint
+  (`TerrainVT::VisibleView::anisotropy`) uses it for CPU demand. Before this, the
+  material bound the raw viewport value C++-side and the shader clamped it, while the
+  planner clamped it separately: two spellings of one rule.
+* `get_vt_settings()["avt_anisotropy"]`, `["avt_anisotropy_requested"]` and
+  `["avt_anisotropy_effective"]` are the triple, so a request wider than its gutter is
+  readable instead of silent. Raising the border is the only way to admit it: 16x needs
+  a gutter of seventeen, which is above the sixteen the setting allows.
+
+What nine costs: a stored page is `page_size + 2 * border`, so a 256-texel page goes
+from 264 to 274 texels a side, **7.7% more texels per page** for the same world
+coverage - a proportional cost in pool memory, source production and the encoder's
+byte ceiling. Both views share `vt_page_border`, so the far field's gutter grows with
+it. That is memory it does not need for filtering - **the far field's sampling is
+unchanged**: it samples with a plain `textureLod(..., 0.0)` on `filter_linear`
+samplers, with no gradients and no anisotropy, and its level comes from the distance
+rule. Its gutter is for its own mip transitions. Giving the far field gradient-based
+anisotropic sampling is a separate change and is not made here.
 
 Camera cuts had a separate scheduling error: `asin(length(cross))` folds angles
 above 90 degrees, making an approximately 180-degree turn look almost stationary.
@@ -49,12 +87,49 @@ turn into uncached detail still requires asynchronous page production. Correct
 anisotropic filtering also has a GPU cost relative to a single linear sample;
 the implementation bounds that cost rather than claiming it is free.
 
+## Measured: what 8x costs the near field's working set
+
+`vt_cap_probe_runner.py --driver d3d12` at the default tick budget, the same script before and
+after the default pair moved (a four-texel gutter with 3.5x effective, then nine texels with 8x).
+Both columns were measured at the near-field reach that was the default at the time, 512 m; the
+reach itself moved to 384 m in the same round, for reasons and with measurements of its own
+(`vt_hdrp_avt_alignment.md` section 7.7.14), and the two changes are independent: this table is
+about the anisotropy, and the reach's own cost is in that section.
+
+| reading | 3.5x | 8x |
+| --- | --- | --- |
+| near plan pages `avt_pages` | 151 | **227** |
+| sampled `avt_sampled` | 116 | **183** |
+| plan `avt_sel` / `avt_carried` | 144 / 136 | 211 / 194 |
+| near field `n_miss` | 4453 | 5528 |
+| `fade_starts` | 4765 | 5842 |
+| pool `alloc` | 172 | 248 |
+| far field `miss` | 473 | 487 |
+| session pages per frame | 7.54 | 7.89 |
+| `produce_slot_wait` / `produce_source_wait` | 0 / 0 | 0 / 0 |
+| worst far-field pass | 15.7 ms | 15.2 ms |
+
+The request is what the finer singular footprint selects, so 8x asks for a finer mip at grazing
+angles: the near field's plan grows about **50%** and its page churn about 25% with it. Nothing in
+the probe was capacity-starved for it (`avt_missing` stays 0, both wait counters stay 0) and the far
+field's own miss count barely moves - the cost lands where 8x is meant to spend it. The gutter's own
+arithmetic is separate and certain: a stored page is `page_size + 2 * border`, so 264 -> 274 texels
+is **7.7% more texels a page**, and under compression the encoder's 96 MB byte ceiling admits about
+40 ring positions instead of 46, which is a compressed rate ceiling of ~20 pages a frame instead of
+~23. A page-sized run is bounded by its slot count and does not move.
+
 ## Regressions
 
 * Standalone VT contract tests cover front-facing, grazing and rolled Jacobians,
   plus conservative bounds over 20,000 random matrix intervals.
 * `vt_anisotropy_runner.py` checks native fine-page demand and renders distinct
   fine/coarse page colors at three grazing orientations, including a rolled view.
+  `vt_anisotropy.gd` also asserts the shipped pair - a nine-texel gutter with an
+  eight-times request, and an effective value of 8 read back from the report - before
+  it tightens its own gutter to four for the grazing case. The grazing fixture's
+  numbers are unchanged by the default: the material now binds the *effective* value
+  and the test clamps it again, so both spellings of `min(request, border - 0.5)`
+  still agree at 3.5.
 * `vt_snap_turn_runner.py` checks camera-cut planning and normal-plan reuse.
 * `vt_project_lifetime_probe.py --project F:/godot/project/test-1 --motion snap`
   alternates 180-degree views in a copied project, recording CPU diagnostics and

@@ -160,7 +160,8 @@ void Terrain3DSurfaceBaker::clear() {
 			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
 			_encoded_layers.clear();
 			// Sized to the deepest ring any budget can ask for; the admitted depth is
-			// `_encode_ring_capacity`, which a bundle derives from the page budget.
+			// `_encode_ring_capacity`, which the bundle derives from the page budget and the
+			// allocation below from the ring's whole ceiling.
 			_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
 		}
 		_encode_region_bytes = 0;
@@ -391,13 +392,16 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 	// failed to build its arrays above keeps `applied` at 0 and samples staging by slot, which
 	// is why the count is decided here and not from the request.
 	//
-	// The ring depth is derived from the page budget so that the budget, not the ring, decides
-	// the page rate, and it is capped by bytes because under the scratch regime these layers
-	// are the largest allocation in the design. It is also kept to half the slot count, so a
-	// compressed pool always costs at most half of what the page sized pool would - a small
-	// pool with a large budget is the one case where those two rules meet.
-	_encode_ring_allocated.store(CLAMP(MIN(_derive_encode_ring_pages(), MAX(p_page_count / 2, ENCODE_PAGES_MIN)),
-			ENCODE_PAGES_MIN, ENCODE_PAGES_MAX));
+	// The ring's *admitted* depth is derived from the page budget so that the budget, not the
+	// ring, decides the page rate; the ring's *allocation* is the whole ceiling, because the
+	// staging layers and the encoder's output buffer are fixed here and
+	// `_refresh_encode_ring_capacity()` can never admit more than what this line reserved.
+	// Allocating for the budget of this moment would make the setting a startup setting in
+	// effect: measured in section 7.7.12, a session that raised `vt_pages_per_update` from 16 to
+	// 64 kept the 32-position ring the build-time budget derived and produced the rate of a
+	// 16-page budget. The ceiling is already bounded by bytes and by half the slot count, so the
+	// headroom costs what the larger budget would have cost anyway.
+	_encode_ring_allocated.store(_encode_ring_depth_ceiling());
 	_staging_layers = _staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count;
 	_refresh_encode_ring_capacity();
 	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,

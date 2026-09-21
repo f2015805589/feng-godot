@@ -312,18 +312,22 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 			if (!registered && sector.produce) { reclaim_addresses(); registered = _vt.surface_vt->register_sector(sector.owner, sector.size); }
 			if (registered) {
 				_vt.vt_registered_sectors[sector.owner] = true; _vt.avt_allocated_sizes[avt_owner_key(sector.owner)] = sector.size; directory_dirty = true;
+				++r_hierarchy.size_grows;
 			}
 		} else if (previous_size < sector.size) {
 			bool resized = _vt.surface_vt->resize_sector(sector.owner, sector.size);
 			if (!resized && sector.produce) { reclaim_addresses(); resized = _vt.surface_vt->resize_sector(sector.owner, sector.size); }
 			directory_dirty |= resized;
-			if (resized) { _vt.avt_allocated_sizes[avt_owner_key(sector.owner)] = sector.size; }
+			if (resized) { _vt.avt_allocated_sizes[avt_owner_key(sector.owner)] = sector.size; ++r_hierarchy.size_grows; }
 		}
 		if (_vt.surface_vt->has_sector(sector.owner)) { _vt.avt_cached_addresses[avt_owner_key(sector.owner)] = { sector.location, sector.owner, sector.level }; }
 	}
 	_vt.avt_registered_owners.clear();
 	for (const auto &entry : _vt.avt_cached_addresses) { _vt.avt_registered_owners.push_back(entry.second.owner); }
 	_vt.avt_sector_stats["retained_sector_addresses"] = int(_vt.avt_cached_addresses.size());
+	// The one event in this pass that re-addresses a whole sector at once. Read beside P0e's
+	// `plan_rescaled` to tell a block-size growth from the refinement walk picking a new mip.
+	_vt.avt_sector_stats["sector_size_grows"] = r_hierarchy.size_grows;
 }
 
 // Publishes the sector directory the shader reads. A sparse hash directory

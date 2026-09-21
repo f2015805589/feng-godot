@@ -63,6 +63,11 @@ uniform float _avt_density_scale = 1.0;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
 uniform int _avt_directory_mask = 0;
 uniform int _avt_root_level = 1;
+// The last local mip a sector block may serve, from `Terrain3D::get_avt_mip_level_cap()`: the plan's
+// chain depth and this clamp are the same number. Automatic answers past any block, so the clamp is
+// inert unless the setting asks for a shorter chain - a shorter chain is fewer coarse pages and a
+// coarser fallback, see docs/vt_hdrp_avt_alignment.md section 7.7.15.
+uniform int _avt_mip_level_cap = 32;
 #endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
@@ -92,7 +97,11 @@ const int _surface_vt_page_fade_frames = 0;
 uniform bool _surface_vt_enabled = false;
 uniform int _surface_vt_region_size = 256;
 uniform int _surface_vt_page_size = 256;
-uniform int _surface_vt_page_border = 4;
+// Nine, not four: the near field asks for 8x anisotropic filtering by default and a gutter of n
+// supports n - 0.5, so four admitted 3.5x and silently reduced every larger request. A stored page
+// is `page_size + 2 * border`, which is 7.7% more texels a page than four was. The C++ default and
+// the dock's range are the same number; see docs/vt_sampling_review.md.
+uniform int _surface_vt_page_border = 9;
 uniform int _surface_vt_pages_per_axis = 4;
 uniform int _surface_vt_max_local_mip = 2;
 uniform int _surface_vt_indirection_size = 256;
@@ -126,7 +135,10 @@ uniform bool _surface_params_encoded = false;
 uniform int _surface_svt_normal_encoding = 0;
 uniform bool _surface_svt_params_encoded = false;
 uniform highp sampler2DArray _surface_material_params : filter_linear_mipmap_anisotropic, repeat_disable;
-uniform float _surface_vt_anisotropy = 4.0;
+// Bound per frame from `Terrain3D::get_avt_anisotropy()`, which answers the request clamped by the
+// gutter above; the clamp below is the shader's own copy of that physical bound, so a material
+// that binds a wider number than its pages carry is still filtered inside the page.
+uniform float _surface_vt_anisotropy = 8.0;
 // The far field's own set. AVT and SVT store the same shared page pool in independent
 // formats - an AVT page is rewritten by every edit, an SVT page is assembled once - so each
 // tier samples the arrays it was produced into. A tier left uncompressed is bound the
@@ -150,7 +162,10 @@ uniform bool _surface_svt_enabled = false;
 uniform bool _svt_feedback = false;
 uniform float _surface_svt_page_world = 512.0;
 uniform int _surface_svt_page_size = 256;
-uniform int _surface_svt_page_border = 4;
+// The same number as the near field's gutter, because both views share `vt_page_border`. The far
+// field samples with a plain `textureLod` and no gradients, so this gutter is for its own mip
+// transitions rather than for a filtering footprint; it grows with the near field's anyway.
+uniform int _surface_svt_page_border = 9;
 uniform int _surface_svt_max_mip = 4;
 uniform int _surface_svt_indirection_size = 1024;
 // Distance -> level table, in metres: entry m is the largest camera distance sampled at
@@ -606,7 +621,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 			return false;
 		}
 		float base_texel = span / (entry.w * float(_surface_vt_page_size));
-		int top = int(round(log2(entry.z)));
+		int top = min(int(round(log2(entry.z))), _avt_mip_level_cap);
 		int start = int(floor(log2(max(1.0, pixel_world / base_texel))));
 		start = max(start, int(ceil(log2(max(1.0, minimum_texel / base_texel)))));
 		// A world parent is also the clamp for footprints larger than the tree root.

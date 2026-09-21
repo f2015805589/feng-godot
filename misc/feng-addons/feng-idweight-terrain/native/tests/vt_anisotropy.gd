@@ -5,6 +5,12 @@ extends "res://vt_adaptive_base.gd"
 # used the long derivative as its mip level and therefore selected the coarse probe page;
 # the shader under test is expected to keep the fine page when the long axis fits inside
 # the page's supported anisotropy.
+#
+# The shipped pair is a nine-texel gutter and an eight-times request
+# (`vt_page_border` / `surface_vt_anisotropy`), so the request survives: the gutter admits
+# `border - 0.5` = 8.5. This fixture then tightens the gutter to four, which admits 3.5 and
+# therefore caps the request - the case the grazing assertions below are about, and the one
+# that used to be the only case there was.
 const REGION := Vector2i.ZERO
 const TARGET := Vector3(34.0, 0.0, 34.0)
 const TARGET_XZ := Vector2(34.0, 34.0)
@@ -139,6 +145,12 @@ func run() -> void:
 	terrain = Terrain3D.new()
 	terrain.vt_auto_capacity = false
 	terrain.vt_page_size = PAGE_SIZE
+	# Read while the instance still holds its defaults: the pair a project that changes nothing
+	# gets, and the reason the grazing case below no longer describes the shipped behaviour.
+	require(terrain.vt_page_border == 9,
+			"the shipped gutter must admit the near field's 8x default, got %d" % terrain.vt_page_border)
+	require(terrain.surface_vt_anisotropy == 8,
+			"the near field must request 8x anisotropy by default, got %d" % terrain.surface_vt_anisotropy)
 	terrain.vt_page_border = PAGE_BORDER
 	terrain.vt_page_count = 256
 	terrain.vt_pages_per_update = 16
@@ -175,6 +187,16 @@ func run() -> void:
 	terrain.surface_vt_enabled = true
 	if terrain.material != null:
 		terrain.material.update()
+
+	# The rule that says the request survives the shipped gutter, measured rather than restated:
+	# with the border back at its default the report's effective value is the 8x that was asked
+	# for. The fixture's own border is restored right after, and the loop below settles it.
+	terrain.vt_page_border = 9
+	var shipped_anisotropy := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
+	require(shipped_anisotropy >= 8.0,
+			"the default gutter must admit the default 8x request, got %.2f" % shipped_anisotropy)
+	terrain.vt_page_border = PAGE_BORDER
+	await process_frame
 
 	# Let the real planner publish the sector directory first.  The test then freezes
 	# scheduling and only changes the payload slots, so a colour result cannot be a

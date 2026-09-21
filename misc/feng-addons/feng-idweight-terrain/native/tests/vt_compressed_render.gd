@@ -482,6 +482,29 @@ func run() -> void:
 			"a compressed demand burst must not stall on the ring (peak %d of %d regions)" % [
 				ring_peak, int(ring_depth.get(BC7, 0))])
 
+	# A page budget raised *after* the bundle was built must be admitted. The staging layers and
+	# the encoder's output buffer are fixed when the bundle is built, so the ring's allocation is
+	# made for the whole ceiling rather than for the budget of the moment; before that, a session
+	# that raised 16 to 64 kept the 32-position ring its build-time budget derived and produced
+	# the rate of a 16-page budget (alignment document section 7.7.12). The pool is grown first
+	# because the ring may never hold more than half the slots, so the fixture's 64-slot pool is
+	# already at its ceiling at this budget.
+	terrain.vt_page_count = 256
+	await process_frame
+	terrain.vt_pages_per_update = budget
+	await process_frame
+	var budget_depth := int(producer_stats().get("encode_ring_capacity", 0))
+	terrain.vt_pages_per_update = budget * 4
+	await process_frame
+	var raised_depth := int(producer_stats().get("encode_ring_capacity", 0))
+	print("VTCOMPRESS_RENDER ring raise budget=%d depth=%d raised_budget=%d depth=%d allocated=%d" % [
+			budget, budget_depth, budget * 4, raised_depth,
+			int(producer_stats().get("encode_ring_allocated", 0))])
+	require(raised_depth > budget_depth,
+			"a page budget raised after the bundle must deepen the ring (%d regions at %d, %d at %d)" % [
+				budget_depth, budget, raised_depth, budget * 4])
+	terrain.vt_pages_per_update = budget
+
 	terrain.surface_svt_compression = 0
 	await process_frame
 	scene.queue_free()

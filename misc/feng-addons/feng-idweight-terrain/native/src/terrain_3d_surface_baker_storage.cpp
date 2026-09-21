@@ -364,17 +364,26 @@ int64_t Terrain3DSurfaceBaker::_encode_page_bytes() const {
 	return regions + int64_t(_stored_size) * _stored_size * 30;
 }
 
-// Depth the ring needs so that the caller's page budget, not the ring, decides how many
-// pages a frame finishes: a page's regions are held for about two frames, so the ring has to
-// hold two budgets' worth. Bounded by bytes, because the same positions are the staging pool
-// under the scratch regime.
-int Terrain3DSurfaceBaker::_derive_encode_ring_pages() const {
+// The depth the ring may ever hold: what the byte ceiling affords, what the slot count justifies
+// (a compressed pool must still cost less than the page-sized one it replaces) and what the
+// encoder may have in flight. This is the allocation's question, not the budget's, and it is the
+// only place either is answered: `_derive_encode_ring_pages()` asks it for the bound, and the
+// bundle build asks it for what to size the staging layers and the encoder's output buffer for.
+int Terrain3DSurfaceBaker::_encode_ring_depth_ceiling() const {
 	const int64_t page_bytes = _encode_page_bytes();
 	const int64_t affordable = page_bytes > 0 ? ENCODE_RING_BUDGET_BYTES / page_bytes
 											  : int64_t(ENCODE_PAGES_MAX);
-	const int ceiling = int(CLAMP(affordable, int64_t(ENCODE_PAGES_MIN), int64_t(ENCODE_PAGES_MAX)));
+	const int slot_bound = MAX(_page_count / 2, ENCODE_PAGES_MIN);
+	return int(CLAMP(MIN(affordable, int64_t(slot_bound)), int64_t(ENCODE_PAGES_MIN),
+			int64_t(ENCODE_PAGES_MAX)));
+}
+
+// Depth the ring has to admit so that the caller's page budget, not the ring, decides how many
+// pages a frame finishes: a page's regions are held for about two frames, so the ring has to
+// hold two budgets' worth, bounded by what it was allocated for and by the ceiling above.
+int Terrain3DSurfaceBaker::_derive_encode_ring_pages() const {
 	const int wanted = _page_budget.load() * ENCODE_READBACK_FRAMES;
-	return CLAMP(MIN(wanted, ceiling), ENCODE_PAGES_MIN, ENCODE_PAGES_MAX);
+	return CLAMP(MIN(wanted, _encode_ring_depth_ceiling()), ENCODE_PAGES_MIN, ENCODE_PAGES_MAX);
 }
 
 void Terrain3DSurfaceBaker::_refresh_encode_ring_capacity() {

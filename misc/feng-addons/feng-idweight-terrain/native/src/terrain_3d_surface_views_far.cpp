@@ -33,35 +33,31 @@
 // `p_max_mip` -1 means the level the far field currently publishes; the demand pass
 // passes the indirection's absolute limit while it plans a frame, so a plan never depends
 // on the level cap it is about to change.
-int Terrain3D::get_surface_svt_mip_for_distance(const real_t p_distance, const int p_max_mip) const {
-	const int max_mip = p_max_mip >= 0
+//
+// The rule itself is `TerrainVT::MipRule` in terrain_vt.h, beside the addressing contract it belongs
+// to and where the engine-free contract test can pin it. This file owns only the two things that need
+// the live settings: building the rule, and resolving the cap when the caller did not name one.
+TerrainVT::MipRule Terrain3D::_svt_mip_rule() const {
+	const PackedFloat32Array &bands = _vt.surface_svt_mip_distances;
+	return TerrainVT::select_mip_rule(_vt.surface_svt_page_world,
+			bands.is_empty() ? nullptr : bands.ptr(), int(bands.size()));
+}
+
+// The published level cap when `p_max_mip` does not name one.
+int Terrain3D::_svt_mip_rule_cap(const int p_max_mip) const {
+	return p_max_mip >= 0
 			? p_max_mip
 			: (_vt.surface_svt ? MAX(0, _vt.surface_svt->get_world_max_mip()) : MAX(0, _vt.surface_svt_max_mip));
-	if (_vt.surface_svt_mip_distances.is_empty()) {
-		int mip = 0;
-		real_t threshold = MAX(1.f, _vt.surface_svt_page_world * 2.f);
-		while (mip < max_mip && p_distance > threshold) {
-			threshold *= 2.f;
-			mip++;
-		}
-		return mip;
-	}
-	const int last = int(_vt.surface_svt_mip_distances.size()) - 1;
-	int mip = 0;
-	while (mip < last && p_distance > _vt.surface_svt_mip_distances[mip]) {
-		mip++;
-	}
-	return MIN(mip, max_mip);
+}
+
+int Terrain3D::get_surface_svt_mip_for_distance(const real_t p_distance, const int p_max_mip) const {
+	return _svt_mip_rule().mip_for_distance(float(p_distance), _svt_mip_rule_cap(p_max_mip));
 }
 
 // Furthest distance an explicit table still serves with a produced page; 0 means the
 // automatic rule, which coarsens without a limit of its own.
 real_t Terrain3D::get_surface_svt_mip_reach() const {
-	if (_vt.surface_svt_mip_distances.is_empty()) {
-		return 0.f;
-	}
-	const int max_mip = _vt.surface_svt ? MAX(0, _vt.surface_svt->get_world_max_mip()) : MAX(0, _vt.surface_svt_max_mip);
-	return _vt.surface_svt_mip_distances[MIN(int(_vt.surface_svt_mip_distances.size()) - 1, max_mip)];
+	return _svt_mip_rule().reach(_svt_mip_rule_cap(-1));
 }
 
 // A page the raw-ID diagnostic mode allocates carries the packed id/weight payload the
@@ -151,6 +147,8 @@ int Terrain3D::update_surface_svt(int p_max_pages) {
 	scan_hash = mix_i64(scan_hash, _vt.surface_svt->get_indirection_size());
 	scan_hash = mix_i64(scan_hash, _vt.surface_svt->get_world_max_mip());
 	scan_hash = mix_i64(scan_hash, _vt.surface_svt_root_mips);
+	// The fallback policy decides which pages are pinned, so a changed policy is a changed scan.
+	scan_hash = mix_i64(scan_hash, _vt.surface_svt_fallback_policy);
 	scan_hash = mix_i64(scan_hash, _vt.surface_svt->get_page_count());
 	scan_hash = mix_i64(scan_hash, int64_t(Math::floor(double(page_world))));
 	scan_hash = mix_i64(scan_hash, int64_t(Math::floor(double(reach))));

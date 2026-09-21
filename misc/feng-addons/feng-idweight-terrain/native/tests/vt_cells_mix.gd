@@ -46,6 +46,12 @@ func run() -> void:
 	for page: Dictionary in terrain.get_vt_pages():
 		if page.ready and page.kind == "SVT" and page.world_rect.has_point(Vector2(32,32)) and page.world_rect.has_point(Vector2(96,32)):
 			composite = true
+	print("MIXDIAG skips=%d cells=%d roots=%d baked=%d pages=%s" % [
+			int(terrain.get_vt_settings().get("svt_persist_probe_skips", -1)),
+			int(terrain.get_vt_settings().get("svt_persist_probe_cells", -1)),
+			int(terrain.get_vt_settings().get("svt_root_pages", -1)),
+			int(terrain.get_vt_settings().producer.baked_pages),
+			str(terrain.get_vt_pages())])
 	require(composite, "one runtime page combines two independently baked cells")
 	require(terrain.get_vt_settings().producer.baked_pages == 0, "compositing does not rebake materials")
 	require(terrain.get_svt_baked_pages().size() == 3, "three source files contain all mips")

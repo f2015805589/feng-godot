@@ -75,6 +75,10 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_vt_page_size"), &Terrain3D::get_surface_vt_page_size);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_page_border", "border"), &Terrain3D::set_surface_vt_page_border);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_page_border"), &Terrain3D::get_surface_vt_page_border);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_anisotropy", "anisotropy"), &Terrain3D::set_surface_vt_anisotropy);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_anisotropy"), &Terrain3D::get_surface_vt_anisotropy);
+	ClassDB::bind_method(D_METHOD("set_surface_vt_mip_levels", "levels"), &Terrain3D::set_surface_vt_mip_levels);
+	ClassDB::bind_method(D_METHOD("get_surface_vt_mip_levels"), &Terrain3D::get_avt_mip_levels);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_pages_per_axis", "pages"), &Terrain3D::set_surface_vt_pages_per_axis);
 	ClassDB::bind_method(D_METHOD("get_surface_vt_pages_per_axis"), &Terrain3D::get_surface_vt_pages_per_axis);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_resolution", "resolution"), &Terrain3D::set_surface_vt_resolution);
@@ -141,6 +145,8 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_surface_svt", "max_pages"), &Terrain3D::update_surface_svt, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_surface_svt_root_mips", "mips"), &Terrain3D::set_surface_svt_root_mips);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_root_mips"), &Terrain3D::get_surface_svt_root_mips);
+	ClassDB::bind_method(D_METHOD("set_surface_svt_fallback_policy", "policy"), &Terrain3D::set_surface_svt_fallback_policy);
+	ClassDB::bind_method(D_METHOD("get_surface_svt_fallback_policy"), &Terrain3D::get_surface_svt_fallback_policy);
 	ClassDB::bind_method(D_METHOD("set_surface_svt_mip_distances", "distances"), &Terrain3D::set_surface_svt_mip_distances);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_distances"), &Terrain3D::get_surface_svt_mip_distances);
 	ClassDB::bind_method(D_METHOD("get_surface_svt_mip_distance_count"), &Terrain3D::get_surface_svt_mip_distance_count);
@@ -356,7 +362,10 @@ void Terrain3D::_bind_methods() {
 	// the inspector, so a scene saved against it keeps working.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_atlas_compression", PROPERTY_HINT_ENUM, "Uncompressed,BC7,BC3 RGBA", PROPERTY_USAGE_NONE), "set_vt_atlas_compression", "get_vt_atlas_compression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_auto_capacity"), "set_vt_auto_capacity", "get_vt_auto_capacity");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_pages_per_update", "get_vt_pages_per_update");
+	// No range hint: the setter takes any positive budget, and a hint would put the ceiling back in the
+	// inspector's widget after it was removed from the property. The effective rate is reported by
+	// `get_vt_settings()` (`encode_ring_capacity`) rather than enforced here.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_pages_per_update"), "set_vt_pages_per_update", "get_vt_pages_per_update");
 	// Source threads that assemble pages: 0 = auto (half the machine, 1..4).
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_workers", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_page_workers", "get_vt_page_workers");
 	// Motion look-ahead in milliseconds: the demand plans for where the camera will be,
@@ -394,6 +403,17 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_count", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_count", "get_surface_vt_page_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_size", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_size", "get_surface_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_border", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_border", "get_surface_vt_page_border");
+	// The near field's anisotropic filtering, as a multiplier; 0 follows the viewport's filtering
+	// level. What actually reaches the shader and the planner is this request clamped by the page
+	// gutter, which is `get_vt_settings()["vt_anisotropy_effective"]`; see
+	// docs/vt_sampling_review.md. The hint's own wording is the only place a caller sees "0 is
+	// auto", so it carries it.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_anisotropy", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_vt_anisotropy", "get_surface_vt_anisotropy");
+	// The near field's local mip chain, as a level count. 0 is automatic and is the shipped chain
+	// (the block size's own, nine levels at the default density); a positive value cuts the chain
+	// at that many levels, which is fewer coarse pages and a coarser fallback for a late page.
+	// The hint's wording carries the "0 is auto" contract, as the anisotropy property's does.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_mip_levels", PROPERTY_HINT_RANGE, "0,16,1,or_greater"), "set_surface_vt_mip_levels", "get_surface_vt_mip_levels");
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (64 m sectors)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");
@@ -429,6 +449,9 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_max_mip"), "set_surface_svt_max_mip", "get_surface_svt_max_mip");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_distance", "get_surface_svt_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_root_mips", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_svt_root_mips", "get_surface_svt_root_mips");
+	// 0 = the global root pyramid, 1 = HDRP's per-unit coarsest-page guarantee. Alternatives, not
+	// layers; see `surface_svt_fallback_policy` in terrain_3d_vt_state.h and H2 of the alignment doc.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_fallback_policy", PROPERTY_HINT_RANGE, "0,1,1"), "set_surface_svt_fallback_policy", "get_surface_svt_fallback_policy");
 	// One entry per world mip level, in metres: the largest camera distance still
 	// sampled at that level. Empty = automatic (one level per doubling of the page).
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "surface_svt_mip_distances", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT, "float"), "set_surface_svt_mip_distances", "get_surface_svt_mip_distances");

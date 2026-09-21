@@ -69,8 +69,13 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 	if (_vt.vt_shared_ready && producer && !_vt.vt_debug_direct_material) {
 		const int ready_capacity = producer->get_capacity();
 		if (ready_capacity > _vt.vt_page_count) {
-			// Publish higher slot IDs only after the GPU cache was copied. Keep
-			// addresses, owners and source jobs, including an already completed plan.
+			// Publish higher slot IDs only after the GPU cache was copied. What survives the growth is
+			// the *addresses*, the owners, the source jobs and an already completed plan - not the
+			// pages: the atlas is one Texture2DArray and its layer count changed, so
+			// `Terrain3DVTPagePool::grow()` evicts every used slot and the next write recreates the
+			// layers blank. The demand passes therefore re-produce the same pages instead of
+			// re-deriving which pages they want, which is why the pool generation is not bumped here
+			// (section 7.7.10 measures both halves of that trade).
 			if (!_vt.surface_vt->grow_capacity(ready_capacity) || !_vt.surface_svt->grow_capacity(ready_capacity)) { return false; }
 			_vt.vt_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
 			_vt.pool.grow(ready_capacity);
@@ -112,8 +117,30 @@ void Terrain3D::set_vt_page_count(int p_count) {
 	_vt.pool.request(p_count);
 	_reset_vt_configuration();
 }
+// How many pages one tick may produce, all tiers together. It is a *budget* and both halves of the
+// pass spend it: `_avt_tick_allowance()` gives the near field half of it first and the far field gets
+// the remainder, so this is what decides how fast a view that has just changed direction is
+// re-covered.
+//
+// **There is no upper clamp.** The setting used to clamp at 16 and then at 32, and a ceiling nobody
+// can see is worse than no ceiling: it silently overrides the number the caller chose, and tuning a
+// rate is exactly what a caller sets this for. What the caller should know instead is that this is not
+// the only rate in the path - `Terrain3DSurfaceBaker::set_page_budget()` is the producer's copy of it
+// (how many page writes one frame admits) and the producer's in-flight encode ring is derived from the
+// same budget, bounded by bytes and by `ENCODE_PAGES_MAX`. That ring's *allocation* is made for the whole
+// ceiling when the bundle is built, so a setting raised here is admitted without a rebuild; the admitted
+// depth and the allocation are both in `get_vt_settings()` as `encode_ring_capacity` and
+// `encode_ring_allocated`, so whether the requested rate is actually being admitted is readable rather
+// than guessable. Sections 7.7.12 and 7.7.13 record what those two numbers do.
+//
+// Expect it to cost churn rather than to buy coverage: section 7.7.11 measured the same script at 16
+// and 32 and the sampled deficit's peak did not move (102 vs 101) while the near field's misses rose
+// 47% and evictions 61% - partly the plan's rate term, which follows this number (`tail_cap =
+// _avt_tick_allowance() * refresh_frames`). Section 7.7.1's supply experiment says the same thing.
 void Terrain3D::set_vt_pages_per_update(int p_pages) {
-	_vt.vt_pages_per_update = CLAMP(p_pages, 1, 16);
+	// The only guard is positive: a budget of zero is not a rate, and the near field's share floors at
+	// one page anyway, so zero would read as "one page" through one path and "none" through another.
+	_vt.vt_pages_per_update = MAX(1, p_pages);
 }
 // A pipeline owns its threads, so a changed worker count is applied by dropping the
 // pipelines: every entry in them is in flight work the demand pass re-requests anyway,

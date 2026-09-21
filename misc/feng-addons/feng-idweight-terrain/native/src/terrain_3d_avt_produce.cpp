@@ -372,7 +372,17 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 		// missing from is shaded from the source in the meantime.
 		if (r_pass.produced >= floor && _vt_tick_expired()) { break; }
 		const auto &page = *r_pass.missing[r_pass.missing_next];
-		if (!ready.contains({ page.owner.x, page.owner.y, page.mip, page.x, page.y })) { continue; }
+		if (!ready.contains({ page.owner.x, page.owner.y, page.mip, page.x, page.y })) {
+			// The page's source payload is not ready yet, which is the definition of
+			// `source_wait` - and it used to be the one case that did not count itself. The walk
+			// advances past the page either way, so a pass that produced eight pages out of a
+			// hundred-miss working set reported no wait at all and looked like a pass with
+			// nothing left to do. The number is what decides whether the fix is worker
+			// throughput or demand: `produced` is bounded by how many payloads the source
+			// pipeline delivers per tick, not by this pass's budget.
+			++r_pass.source_wait;
+			continue;
+		}
 		if (_avt_produce_page(r_pass, page)) {
 			++r_pass.produced;
 			r_pass.missing[r_pass.missing_next] = nullptr;

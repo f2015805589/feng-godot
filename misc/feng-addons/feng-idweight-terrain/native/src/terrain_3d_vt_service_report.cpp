@@ -26,6 +26,8 @@
 
 #include <godot_cpp/classes/control.hpp>
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/time.hpp>
 
 // The two helpers the four halves share; see terrain_3d_vt_service_internal.h for what it holds
@@ -71,6 +73,15 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	Dictionary &result = r_result;
 	result["page_size"] = _vt.vt_page_size;
 	result["border"] = _vt.vt_page_border;
+	// The near field's anisotropy as the triple that says whether the request survives the gutter:
+	// `avt_anisotropy` is what the terrain holds (zero means "follow the viewport"), `requested` is
+	// that resolved against the viewport, and `effective` is what the shader and the planner use.
+	// The last two differ only when the request is wider than the page's border texels can sample,
+	// which is the one thing about anisotropy that used to be silent; see
+	// `Terrain3D::get_avt_anisotropy()` and docs/vt_sampling_review.md.
+	result["avt_anisotropy"] = _vt.surface_vt_anisotropy;
+	result["avt_anisotropy_requested"] = get_avt_anisotropy_request(get_camera());
+	result["avt_anisotropy_effective"] = get_avt_anisotropy(get_camera());
 	result["page_count"] = _vt.vt_page_count;
 	result["effective_page_count"] = _vt.pool.capacity;
 	// How many times the service built a page pool. Building one releases every resident
@@ -109,6 +120,16 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 			? _vt.vt_page_workers
 			: (_vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count() : Terrain3DPagePipeline::default_worker_count());
 	result["shared_pool"] = _vt.vt_shared_ready;
+	// What this frame can and cannot do on the GPU, resolved at runtime the way `rd_gpu_copy.cpp`
+	// resolves the direct page store (`has_method`, so a stock engine answers false and prints
+	// nothing). These three are exactly the capabilities a GPU-side demand source needs, and they are
+	// the H4 probe's answer recorded on the running binary rather than read out of the source: see
+	// `docs/vt_hdrp_avt_alignment.md` section 7.7.5 for what each one settles and which of them is
+	// absent.
+	RenderingDevice *rd = RenderingServer::get_singleton() != nullptr ? RenderingServer::get_singleton()->get_rendering_device() : nullptr;
+	result["rd_direct_store"] = rd != nullptr && rd->has_method("texture_copy_from_buffer");
+	result["rd_async_buffer_readback"] = rd != nullptr && rd->has_method("buffer_get_data_async");
+	result["rd_async_texture_readback"] = rd != nullptr && rd->has_method("texture_get_data_async");
 	// Main-thread cost of the VT section of the last physics tick, its worst frame so far, and
 	// the phases inside it. `svt_cpu_ms` is the far-field pass and is reported by the far field.
 	result["vt_cpu_ms"] = _vt.vt_cpu_ms;

@@ -91,21 +91,23 @@ func all_visible_points_ready(p_points: Array[Dictionary]) -> bool:
 func has_incremental_bake(p_settings: Dictionary, p_generation: int) -> bool:
 	return int(p_settings.get("bake_generation", 0)) > p_generation and bool(p_settings.get("bake_incremental", false))
 
+# Waits for what every phase actually needs: every visible far point ready, no persisted job in
+# flight, and the required level published. It used to also wait for a repair *generation bump*,
+# because a hierarchy extension was reached by marking every region dirty. H3 step 1 removed that
+# mechanism (section 7.7.6), so the parameter and the flag it fed are gone rather than defaulted to
+# "no repair expected" - a caller that still wanted the bump would be asserting the old code.
 func wait_for_visible_coverage(p_phase: String, p_limit: int = 2400,
-		p_generation: int = -1, p_required_mip: int = -1) -> Array[Dictionary]:
+		p_required_mip: int = -1) -> Array[Dictionary]:
 	var stable_frames := 0
 	var points: Array[Dictionary] = []
-	var repair_seen := p_generation < 0
 	for frame in p_limit:
 		await tick()
 		points = visible_far_points()
 		var settings: Dictionary = terrain.get_vt_settings()
 		var producer: Dictionary = settings.get("producer", {})
 		var idle := int(settings.get("bake_pending", 0)) == 0 and int(settings.get("auto_pending_regions", 0)) == 0 and int(producer.get("pending", 0)) == 0
-		if has_incremental_bake(settings, p_generation):
-			repair_seen = true
 		var mip_ready := p_required_mip < 0 or terrain.get_surface_svt().get_world_max_mip() >= p_required_mip
-		if points.size() >= MIN_VISIBLE_POINTS and all_visible_points_ready(points) and idle and mip_ready and repair_seen:
+		if points.size() >= MIN_VISIBLE_POINTS and all_visible_points_ready(points) and idle and mip_ready:
 			stable_frames += 1
 		else:
 			stable_frames = 0
@@ -116,9 +118,9 @@ func wait_for_visible_coverage(p_phase: String, p_limit: int = 2400,
 					str(terrain.get_vt_settings().get("producer", {}))])
 			return points
 	var final_settings: Dictionary = terrain.get_vt_settings()
-	print("VTSVTCOVER_TIMEOUT phase=%s points=%d mip=%d generation=%d incremental=%s repair_seen=%s settings=%s ready=%s pages=%s" % [
+	print("VTSVTCOVER_TIMEOUT phase=%s points=%d mip=%d generation=%d incremental=%s settings=%s ready=%s pages=%s" % [
 			p_phase, points.size(), terrain.get_surface_svt().get_world_max_mip(),
-			int(final_settings.get("bake_generation", 0)), str(bool(final_settings.get("bake_incremental", false))), str(repair_seen), str(final_settings),
+			int(final_settings.get("bake_generation", 0)), str(bool(final_settings.get("bake_incremental", false))), str(final_settings),
 			str(all_visible_points_ready(points)), str(terrain.get_vt_pages())])
 	return points
 
@@ -297,12 +299,26 @@ func run() -> void:
 			terrain.get_surface_vt().get_sector_block_size(Vector2i(2, 2)), INITIAL_MAX_MIP,
 			terrain.get_surface_svt().get_world_max_mip(), str(terrain.get_vt_settings().get("avt_region_rect"))])
 
+	# H3 step 1: the cap raise above is a bound on which mips `request_world_page()` accepts, and
+	# a resident indirection entry survives it - `virtual = (page + half) >> mip` does not depend on
+	# the cap. So the raise must publish the cap and re-bake nothing. This setup reaches the raise
+	# by construction (`configured` above), which is what makes it the place to assert the pair:
+	# the cap moved, and it left no region dirty. The second assertion is the regression guard for
+	# the whole-world re-bake the old code did here.
+	var cap_settings: Dictionary = terrain.get_vt_settings()
+	require(int(cap_settings.get("svt_cap_changes", 0)) > 0,
+			"this setup must raise the world mip cap at least once, so H3 step 1 is actually exercised")
+	require(int(cap_settings.get("svt_cap_dirty_regions", -1)) == 0,
+			"a cap raise must not mark any region for re-bake, got %d" % int(cap_settings.get("svt_cap_dirty_regions", -1)))
+
 	var initial_points := visible_far_points()
 	require(initial_points.size() >= MIN_VISIBLE_POINTS,
 			"the first camera view must include many visible non-AVT regions beyond %dm, got %d" % [OLD_WORLD_RADIUS, initial_points.size()])
 	# Enable auto-bake for the whole regression, then immediately launch the initial
-	# full bake. bake_svt() consumes the setter's initial dirty set; later hierarchy
-	# extensions must be handled by automatic incremental jobs.
+	# full bake. bake_svt() consumes the setter's initial dirty set. A later hierarchy
+	# extension is *not* an automatic incremental job any more (H3 step 1, asserted at the
+	# turned phase): the walk queues any root without content and the producer restores it
+	# from the persisted catalogue.
 	terrain.surface_svt_auto_bake = true
 	var queued := terrain.bake_svt()
 	require(queued > 0, "full SVT bake should queue actual world pages")
@@ -366,24 +382,41 @@ func run() -> void:
 	# footprint under 990 m and could never raise the hierarchy.
 	prepare_camera(Vector3(720.0, 700.0, 480.0), Vector3(160.0, 0.0, 320.0), Vector2i(10, 10))
 	var extended_mip := await wait_for_hierarchy_growth(moved_mip)
-	var turned_points := await wait_for_visible_coverage("turned", 2400, moved_generation, extended_mip)
+	# H3 step 1 changed what this phase waits for, and the change is the point of the phase. The
+	# raise used to mark every region dirty, which launched a persisted repair, and this call used
+	# to wait for that repair's generation bump. The raise now marks nothing - asserted as a pair at
+	# setup - so waiting for a generation bump would time out for 2400 frames and then proceed
+	# anyway, asserting the old mechanism rather than the served result. `p_generation = -1` says no
+	# repair announces itself.
+	#
+	# The new level's pages are still built without it: the far field's walk requests the pages it
+	# wants and the producer serves them from the persisted cell catalogue, which already holds this
+	# level. So the property to assert is the served pixels, below.
+	var turned_points := await wait_for_visible_coverage("turned", 2400, extended_mip)
 	require(turned_points.size() >= MIN_VISIBLE_POINTS, "turned view must retain many visible non-AVT regions")
 	var turned_settings: Dictionary = terrain.get_vt_settings()
-	require(has_incremental_bake(turned_settings, moved_generation),
-			"turning the camera must launch an incremental persisted SVT repair: %s" % str(turned_settings))
-	# The catalogue names cells (one file each, holding the full mip chain), so it cannot be
-	# asked for "the pages of mip 4", and a repair that finds the same content on disk rewrites
-	# nothing. What has to hold is that the incremental job for the new level *completed*, and
-	# the frame check below is what proves the served pixels came from it: the source albedo is
-	# still poisoned, so a page that was not produced from the persisted bake renders blue.
+	require(extended_mip > moved_mip,
+			"the turned view must demand a level the moved view did not, got %d then %d" % [moved_mip, extended_mip])
+	require(int(turned_settings.get("svt_cap_dirty_regions", -1)) == 0,
+			"the raise that served mip %d must not have marked a region for re-bake, got %d" % [
+					extended_mip, int(turned_settings.get("svt_cap_dirty_regions", -1))])
+	require(not has_incremental_bake(turned_settings, moved_generation),
+			"the raise must not need a whole-terrain repair: generation went %d -> %d" % [
+					moved_generation, int(turned_settings.get("bake_generation", 0))])
+	# The catalogue names cells (one file each, holding the full mip chain), so it cannot be asked
+	# for "the pages of mip 4", and a repair that finds the same content on disk rewrites nothing.
+	# What has to hold is that no persisted job is still in flight, and the frame check below is what
+	# proves the served pixels came from the catalogue: the source albedo is still poisoned, so a
+	# page that was not produced from the persisted bake renders blue.
 	var turned_done := int(turned_settings.get("bake_done", 0))
 	var turned_total := int(turned_settings.get("bake_total", 0))
 	require(turned_total > 0 and turned_done >= turned_total,
-			"automatic repair for mip %d must finish before coverage is accepted (%d/%d cells, generation %d)" % [
-					extended_mip, turned_done, turned_total, int(turned_settings.get("bake_generation", 0))])
-	print("VTSVTCOVER_REPAIRED mip=%d generation=%d total=%d done=%d" % [
+			"the persisted catalogue must be drained before coverage is accepted (%d/%d cells, generation %d)" % [
+					turned_done, turned_total, int(turned_settings.get("bake_generation", 0))])
+	print("VTSVTCOVER_REPAIRED mip=%d generation=%d total=%d done=%d dirty_regions=%d" % [
 			extended_mip, int(turned_settings.get("bake_generation", 0)),
-			int(turned_settings.get("bake_total", 0)), int(turned_settings.get("bake_done", 0))])
+			int(turned_settings.get("bake_total", 0)), int(turned_settings.get("bake_done", 0)),
+			int(turned_settings.get("svt_cap_dirty_regions", -1))])
 	await check_visible_frame("turned", turned_points)
 
 	restore_source_albedo()

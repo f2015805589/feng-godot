@@ -6,6 +6,7 @@ Read in this order:
 | --- | --- |
 | [`vt_architecture_review.md`](vt_architecture_review.md) | **Start here.** What the surface virtual texture is today: the module map, the controls and their units, the frame flow, the far/near split, baked sources and the editor/shader specialisation. |
 | [`terrain_vt_and_streaming.md`](terrain_vt_and_streaming.md) | Why it is built this way: the addressing contract, the design of each subsystem, the rules the implementation is built around, and the per-subsystem verification commands. |
+| [`vt_hdrp_avt_alignment.md`](vt_hdrp_avt_alignment.md) | **Read before changing what a demand pass asks for or what answers a miss.** The plan and the decision record for taking the HDRP adaptive-VT reference's stronger mechanisms (pixel-footprint level rule, per-unit coarsest-page guarantee, level-space remap, and the gated fragment feedback) while keeping this addon's far field, fade, lead and address budget. It also carries the measured near-field page-churn investigation, the one alternative that was implemented and rejected, and the known-red tests confirmed against a pristine build. |
 | [`cdlod_and_capture.md`](cdlod_and_capture.md) | The optional quadtree/MultiMesh geometry backend and RenderDoc capture. |
 | [`vt_frame_budget.md`](vt_frame_budget.md) | Measured CPU/GPU costs and the budgets the demand passes obey. |
 | [`vt_lifetime_review.md`](vt_lifetime_review.md) | CPU monitor units, sustained page arrivals, plugin ownership fixes, HDRP comparison and project reproduction. |

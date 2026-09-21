@@ -22,7 +22,6 @@
 #include <godot_cpp/classes/gradient.hpp>
 #include <godot_cpp/classes/noise_texture2d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
-#include <godot_cpp/classes/viewport.hpp>
 
 ///////////////////////////
 // Private Functions
@@ -180,14 +179,19 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RID page_fade = _terrain->get_vt_page_fade_rid();
 	RS->material_set_param(p_material, "_surface_vt_page_fade", page_fade.is_valid() ? page_fade : _generated_dummy_2d.get_rid());
 	RS->material_set_param(p_material, "_surface_vt_page_fade_frames", _terrain->get_vt_page_fade_frames());
-	// Match the rendering view's hardware sampler without polling project settings
-	// or rebuilding the page plan. The shader also limits support to the page gutter.
+	// The near field's anisotropy, from the one function that owns the rule: the terrain's request
+	// (or the viewport's filtering level when the setting is zero, which is its "auto") clamped by
+	// the page gutter. The shader clamps by the same gutter as its own physical bound, so binding
+	// the effective number here and reading `vt_anisotropy_effective` from the settings cannot
+	// disagree. See docs/vt_sampling_review.md.
 	Camera3D *camera = _terrain->get_camera();
-	Viewport *view = camera ? camera->get_viewport() : _terrain->get_viewport();
-	const int anisotropy = view ? int(view->get_anisotropic_filtering_level()) : 2;
-	RS->material_set_param(p_material, "_surface_vt_anisotropy", float(1 << CLAMP(anisotropy, 0, 4)));
+	RS->material_set_param(p_material, "_surface_vt_anisotropy", _terrain->get_avt_anisotropy(camera));
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
 	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
+	// The local mip chain's last level, from the one function the plan's depth also reads. The
+	// shader clamps its `top` with it, so a chain cut shorter than the block size is one number and
+	// not a second spelling of the setting.
+	RS->material_set_param(p_material, "_avt_mip_level_cap", _terrain->get_avt_mip_level_cap());
 	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
 	RS->material_set_param(p_material, "_avt_mip_distance_count", int(avt_distances.size()));
 	avt_distances.resize(16);

@@ -302,14 +302,22 @@ private:
 	// slot, which is what keeps compression a storage decision rather than another page-sized
 	// allocation per slot.
 	//
-	// The depth is not a constant. A page holds its regions until its readbacks arrive, and
-	// the render graph delivers them about two frames after the recording that asked for
-	// them, so the ring has to hold the caller's whole page budget times that latency.
-	// Measured with the previous fixed depth of eight and a sixteen page budget, a compressed
-	// tier became ready at four pages per frame - eight pages every two frames - however much
-	// the demand asked for, because the ring, not the budget, decided the rate.
+	// The admitted depth is not a constant. A page holds its regions until its readbacks
+	// arrive, and the render graph delivers them about two frames after the recording that
+	// asked for them, so the ring has to hold the caller's whole page budget times that
+	// latency. Measured with the previous fixed depth of eight and a sixteen page budget, a
+	// compressed tier became ready at four pages per frame - eight pages every two frames -
+	// however much the demand asked for, because the ring, not the budget, decided the rate.
+	//
+	// Above `ENCODE_PAGES_MAX / ENCODE_READBACK_FRAMES` pages a frame the ring, not the
+	// budget, is the rate again, so this is the number a caller raising the budget has to
+	// raise too. It is deliberately not the byte ceiling: pages a tier does not compress cost
+	// three encoded regions and no staging layer, so a page-sized run can afford far more
+	// positions than the scratch regime can, and the byte ceiling below is what bounds that
+	// case. At 256 a page-sized run reaches 128 pages a frame and a compressed one is still
+	// held to whatever `ENCODE_RING_BUDGET_BYTES` admits.
 	static constexpr int ENCODE_PAGES_MIN = 8;
-	static constexpr int ENCODE_PAGES_MAX = 64;
+	static constexpr int ENCODE_PAGES_MAX = 256;
 	static constexpr int ENCODE_READBACK_FRAMES = 2;
 	// The same ring is the staging pool under the scratch regime, so its depth is bounded by
 	// bytes rather than by pages: this is the ceiling a derived depth may cost.
@@ -322,17 +330,25 @@ private:
 	// Both are a function of the stored page size, so they are set with the resources.
 	int _encode_region_bytes = 0;
 	int _encode_region_words = 0;
-	// Ring depth. `allocated` is what the vectors and the encoder's output buffer were sized
-	// for, `capacity` is what the ring admits right now; the admitted depth never exceeds the
-	// allocated one, so a page budget the caller raises later is served by the headroom the
-	// allocation already has instead of indexing past it. The render thread writes both while
-	// the caller's `set_page_budget()` reads them, so they are atomic.
+	// Ring depth. `allocated` is what the vectors, the staging layers and the encoder's output
+	// buffer were sized for, `capacity` is what the ring admits right now. The admitted depth
+	// never exceeds the allocated one - those buffers are fixed at bundle build - so the
+	// allocation is made for the whole ceiling rather than for the budget of the moment: a
+	// budget the caller raises later is then served by that headroom instead of being silently
+	// capped at whatever the setting happened to be on the frame the bundle was built. Measured
+	// (alignment document section 7.7.12): with an allocation derived from the build-time
+	// budget, raising `vt_pages_per_update` from 16 to 64 in a running session changed the
+	// tick's split and the plan's tail and nothing about the page rate. The render thread
+	// writes both while the caller's `set_page_budget()` reads them, so they are atomic.
 	std::atomic<int> _encode_ring_allocated{ ENCODE_PAGES_MIN };
 	std::atomic<int> _encode_ring_capacity{ ENCODE_PAGES_MIN };
 	// Bytes one ring position costs - the encoder's three regions plus the half-float staging
-	// layer the same position owns under the scratch regime - and the depth that covers the
-	// caller's budget for the frames a readback takes without exceeding the byte ceiling.
+	// layer the same position owns under the scratch regime. Two depths are derived from it,
+	// and they are different questions: the ceiling is what the ring may *ever* hold (bytes,
+	// the slot count and `ENCODE_PAGES_MAX`), and the admitted depth is what the caller's
+	// budget needs of it for the frames a readback takes.
 	int64_t _encode_page_bytes() const;
+	int _encode_ring_depth_ceiling() const;
 	int _derive_encode_ring_pages() const;
 	// Re-derives the admitted depth from the current page budget.
 	void _refresh_encode_ring_capacity();

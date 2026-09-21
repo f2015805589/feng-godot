@@ -379,6 +379,85 @@ private:
 	uint32_t next_generation_ = 1;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Level rule
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Which level a far-field page is *requested* at. Two implementations today and a third planned
+// (H1's pixel footprint, `docs/vt_hdrp_avt_alignment.md`), which is why the decision is a value the
+// callers hold rather than a branch each of them re-tests against the live settings: the demand pass
+// that resolves a page's level and the shader that samples it have to agree, and a third kind must
+// not mean a third copy of the arithmetic.
+//
+// It lives here, beside the addressing contract, because it is arithmetic both sides evaluate: the
+// GLSL mirror is `surface_svt_mip_for_distance()` in `shaders/main.glsl`, and this side is pinned by
+// `native/tests/vt/terrain_vt_contract_test.cpp`. No engine dependency, no runtime state.
+enum class MipRuleKind : int {
+	// A level m page covers `page_world * 2^m` metres, so level m is the right choice out to twice
+	// that distance and the bands follow the page size with nothing to keep in step.
+	AutomaticBands = 0,
+	// The distances are stated directly, one entry per level, in metres.
+	ExplicitTable = 1,
+};
+
+struct MipRule {
+	MipRuleKind kind = MipRuleKind::AutomaticBands;
+	float page_world = 1.f;
+	// The explicit table, one entry per level, in metres. Borrowed, not owned: a caller builds a rule
+	// from the live settings at the top of a pass and uses it within that pass.
+	const float *bands = nullptr;
+	int band_count = 0;
+
+	// The level a point `p_distance` metres away is requested at, never finer than `p_max_mip`.
+	int mip_for_distance(float p_distance, int p_max_mip) const {
+		const int max_mip = p_max_mip > 0 ? p_max_mip : 0;
+		if (kind == MipRuleKind::ExplicitTable && bands != nullptr && band_count > 0) {
+			const int last = band_count - 1;
+			int mip = 0;
+			while (mip < last && p_distance > bands[mip]) {
+				mip++;
+			}
+			return mip < max_mip ? mip : max_mip;
+		}
+		int mip = 0;
+		// A page is never smaller than a metre, which is what the old inline `MAX(1.f, ...)` said.
+		float threshold = page_world * 2.f;
+		if (threshold < 1.f) {
+			threshold = 1.f;
+		}
+		while (mip < max_mip && p_distance > threshold) {
+			threshold *= 2.f;
+			mip++;
+		}
+		return mip;
+	}
+
+	// Furthest distance the rule still serves with a produced page: the band at the published cap, or
+	// 0 for the automatic rule, which coarsens without a limit of its own.
+	float reach(int p_max_mip) const {
+		if (kind != MipRuleKind::ExplicitTable || bands == nullptr || band_count <= 0) {
+			return 0.f;
+		}
+		const int index = band_count - 1 < p_max_mip ? band_count - 1 : p_max_mip;
+		return bands[index > 0 ? index : 0];
+	}
+};
+
+// The one place the mode is decided from the live settings. A rule with no bands *is* the automatic
+// rule, so the emptiness test that used to sit at each call site sits here. The shader has the mirror
+// of this decision and it is the shader's own: `_surface_svt_mip_distance_count` is what its side
+// tests, and `terrain_3d_material.cpp` uploads the count and the table without deciding anything.
+inline MipRule select_mip_rule(const float p_page_world, const float *p_bands, const int p_band_count) {
+	MipRule rule;
+	rule.page_world = p_page_world;
+	if (p_bands != nullptr && p_band_count > 0) {
+		rule.kind = MipRuleKind::ExplicitTable;
+		rule.bands = p_bands;
+		rule.band_count = p_band_count;
+	}
+	return rule;
+}
+
 } // namespace TerrainVT
 
 #endif // TERRAIN_VT_H

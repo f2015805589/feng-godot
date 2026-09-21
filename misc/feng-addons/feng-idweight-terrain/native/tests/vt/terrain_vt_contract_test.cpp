@@ -416,6 +416,61 @@ static void test_request_priority() {
 	std::cout << "PASS: AVT request priority root/current/optional, distance bands and invalid input\n";
 }
 
+// The far field's level rule, both implementations and the selector that chooses between them. This
+// is the side that has to agree with the GLSL mirror `surface_svt_mip_for_distance()` in
+// `src/shaders/main.glsl`: a level the demand pass produces and the level the shader samples are the
+// same level or the far field renders the diagnostic, so the arithmetic is pinned here rather than
+// left to the two call sites that used to spell it.
+static void test_mip_rule() {
+	// The automatic rule follows the page size: a level m page covers `page_world * 2^m` metres, so
+	// level m is right out to twice that and the bands double.
+	const MipRule automatic = select_mip_rule(64.f, nullptr, 0);
+	CHECK(automatic.kind == MipRuleKind::AutomaticBands);
+	CHECK_NEAR(automatic.mip_for_distance(0.f, 16), 0.f, 0.f);
+	CHECK_NEAR(automatic.mip_for_distance(128.f, 16), 0.f, 0.f); // the threshold itself is still level 0
+	CHECK_NEAR(automatic.mip_for_distance(128.001f, 16), 1.f, 0.f);
+	CHECK_NEAR(automatic.mip_for_distance(256.f, 16), 1.f, 0.f);
+	CHECK_NEAR(automatic.mip_for_distance(256.001f, 16), 2.f, 0.f);
+	CHECK_NEAR(automatic.mip_for_distance(1024.f, 16), 3.f, 0.f);
+	// It coarsens without a limit of its own, so the cap is what stops it, and a cap of 0 is level 0.
+	CHECK_NEAR(automatic.mip_for_distance(1e9f, 5), 5.f, 0.f);
+	CHECK_NEAR(automatic.mip_for_distance(1e9f, 0), 0.f, 0.f);
+	// The floor the old inline `MAX(1.f, page_world * 2.f)` carried: a page is never smaller than a
+	// metre, so a sub-metre page size does not make the bands sub-metre too.
+	const MipRule tiny = select_mip_rule(0.25f, nullptr, 0);
+	CHECK_NEAR(tiny.mip_for_distance(1.f, 16), 0.f, 0.f);
+	CHECK_NEAR(tiny.mip_for_distance(1.001f, 16), 1.f, 0.f);
+	CHECK_NEAR(tiny.reach(16), 0.f, 0.f);
+
+	// The explicit table states the distances directly, one entry per level, and the last entry is
+	// where it stops coarsening whatever the cap says.
+	const float bands[4] = { 100.f, 500.f, 2000.f, 8000.f };
+	const MipRule table = select_mip_rule(64.f, bands, 4);
+	CHECK(table.kind == MipRuleKind::ExplicitTable);
+	CHECK_NEAR(table.mip_for_distance(0.f, 16), 0.f, 0.f);
+	CHECK_NEAR(table.mip_for_distance(100.f, 16), 0.f, 0.f); // the band itself is still its own level
+	CHECK_NEAR(table.mip_for_distance(100.001f, 16), 1.f, 0.f);
+	CHECK_NEAR(table.mip_for_distance(500.f, 16), 1.f, 0.f);
+	CHECK_NEAR(table.mip_for_distance(5000.f, 16), 3.f, 0.f);
+	CHECK_NEAR(table.mip_for_distance(1e9f, 16), 3.f, 0.f); // the last band, then no further
+	CHECK_NEAR(table.mip_for_distance(1e9f, 2), 2.f, 0.f); // the cap wins over the table
+	// The reach is the band at the published cap, not always the last entry: a table longer than the
+	// level the far field publishes is only served up to what it publishes.
+	CHECK_NEAR(table.reach(16), 8000.f, 0.f);
+	CHECK_NEAR(table.reach(1), 500.f, 0.f);
+	CHECK_NEAR(table.reach(0), 100.f, 0.f);
+
+	// The selector is the one place the mode is decided, and an empty table *is* the automatic rule.
+	CHECK(select_mip_rule(64.f, bands, 0).kind == MipRuleKind::AutomaticBands);
+	CHECK(select_mip_rule(64.f, nullptr, 4).kind == MipRuleKind::AutomaticBands);
+	// Both rules agree with the automatic one at the level the page size implies, which is what makes
+	// the table a statement of the same thing rather than a second rule.
+	CHECK_NEAR(automatic.mip_for_distance(1024.f, 16), 3.f, 0.f);
+	CHECK_NEAR(select_mip_rule(64.f, bands, 4).mip_for_distance(1024.001f, 16), 2.f, 0.f);
+
+	std::cout << "PASS: far-field level rule, automatic bands and explicit table\n";
+}
+
 int main() {
 	test_indirection_lookup();
 	test_virtual_image_atlas();
@@ -424,6 +479,7 @@ int main() {
 	test_sampling_footprint();
 	test_sampling_bounds();
 	test_request_priority();
+	test_mip_rule();
 	std::cout << "PASS: indirection mip chain walk, POT VirtualImageAtlas allocation and "
 				 "full leaf capacity\n";
 	return 0;
