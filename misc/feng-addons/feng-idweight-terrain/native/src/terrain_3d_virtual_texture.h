@@ -208,9 +208,11 @@ public:
 	// only walks the mip chain. Both return -1 when there is nothing to serve.
 	int request_page(const Vector2i &p_sector, const int p_local_mip, const int p_page_x, const int p_page_y);
 	// Same, but reports whether the page had to be allocated, so a producer only
-	// fills the pages that are actually new.
+	// fills the pages that are actually new. `p_reserved` publishes the page as one the addressing
+	// treats as a guarantee: the pool will not choose it as an eviction victim, so the caller's
+	// residency for it does not depend on the view or on the production order.
 	int request_page_internal(const Vector2i &p_sector, const int p_local_mip,
-			const int p_page_x, const int p_page_y, bool *r_miss);
+			const int p_page_x, const int p_page_y, bool *r_miss, const bool p_reserved = false);
 	int lookup_page(const Vector2i &p_sector, const int p_local_mip, const int p_page_x, const int p_page_y) const;
 	int lookup_page_exact(const Vector2i &p_sector, int p_mip, int p_x, int p_y) const;
 	int lookup_virtual(const int p_virtual_x, const int p_virtual_y, const int p_mip, const int p_max_mip) const;

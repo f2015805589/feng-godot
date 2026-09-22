@@ -13,7 +13,7 @@
 #include "logger.h"
 
 void Terrain3DData::add_edited_area(const AABB &p_area) {
-	if (_terrain && (_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled())) {
+	if (_terrain && _terrain->has_vt_delivery()) {
 		float world = _region_size * _vertex_spacing;
 		Vector3 end = p_area.position + p_area.size;
 		for (int z = int(Math::floor((p_area.position.z - _vertex_spacing) / world)); z <= int(Math::floor((end.z + _vertex_spacing) / world)); z++) {
@@ -21,6 +21,11 @@ void Terrain3DData::add_edited_area(const AABB &p_area) {
 				_terrain->invalidate_surface_pages(Vector2i(x, z));
 			}
 		}
+		// The clipmap ring's half of the same statement: it produced its texels from the height map,
+		// so the levels the edited area covers stop being current here and re-produce the rect on the
+		// ticks that follow. A ring that does not exist is not told, and a rect a level is already
+		// producing whole costs nothing. See `Terrain3D::invalidate_vt_clipmap_area()`.
+		_terrain->invalidate_vt_clipmap_area(p_area);
 	}
 	if (_edited_area.has_surface()) {
 		_edited_area = _edited_area.merge(p_area);

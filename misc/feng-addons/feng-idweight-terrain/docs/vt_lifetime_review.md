@@ -136,9 +136,9 @@ data/child callback rebinding, and live/dead dismissal weak references. It runs
 as a real editor plugin so shutdown follows the normal editor lifecycle; it
 does not suppress resource or RID leak reports.
 
-## Comparison with HDRPVirtualTexture
+## Comparison with the reference implementation
 
-Local reference: `F:/godot/HDRPVirtualTexture/Packages/com.noovertime.virtual-texture/Runtime`.
+Local reference: `the reference implementation's Runtime folder`.
 
 * `Pass/CorePass.cs` separates reallocation, feedback/readback, deduplication,
   sorting and page rendering. Persistent native lists/sets are cleared and reused.

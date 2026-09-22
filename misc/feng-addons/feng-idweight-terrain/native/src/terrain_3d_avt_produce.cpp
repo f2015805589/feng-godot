@@ -190,10 +190,19 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 	}
 	int index = 0;
 	size_t plan_index = 0;
+	const float adaptive_threshold = get_avt_adaptive_threshold_level();
 	for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
 		const int slot = plan_index < _vt.avt_verify_slots.size() ? _vt.avt_verify_slots[plan_index] : -1;
 		const int slot_ready = plan_index < _vt.avt_verify_ready.size() ? int(_vt.avt_verify_ready[plan_index]) : 0;
 		++plan_index;
+		// The fallback tier is counted separately from the upgraded pages the same plan holds. It is
+		// the tier a fragment with no upgrade resolves through, so a cell of it without content is a
+		// fragment with no owner rather than a page that is merely late. See
+		// `docs/avt_addressing_redesign.md` rules R2 and R3.
+		if (page.owner == avt_coarse_owner()) {
+			++r_pass.fallback_plan;
+			if (slot >= 0 && slot_ready != 0) { ++r_pass.fallback_ready; }
+		}
 		if (slot >= 0 && !_vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, true); r_pass.protected_slots.push_back(slot); }
 		const bool sampled_ready = slot >= 0 && slot_ready != 0;
 		const bool stale = slot >= 0 && !sampled_ready && _vt_page_production_stale(slot, slot_ready);
@@ -202,6 +211,16 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 			// material; one whose production is still inside its retry window is a
 			// pending miss that the next frames resolve.
 			r_pass.sampled_plan++;
+			// The plan's half of the level threshold: an upgrade page whose own level is at or above
+			// the level the fallback takes over at is a page no fragment asks the upgrade path for.
+			// The reading is the plan and the read order agreeing, which is what deriving both from
+			// one number is for; a non-zero value says the plan is producing upgrade pages the
+			// shader will resolve through the fallback instead.
+			if (page.owner != avt_coarse_owner() && adaptive_threshold > 0.f) {
+				const float page_texel = page.rect.size.x / float(MAX(1, _vt.vt_page_size));
+				const float page_level = std::log2(MAX(1e-9f, page_texel * float(MAX(1.f, float(_vt.surface_vt_texels_per_meter)))));
+				if (page_level >= adaptive_threshold) { ++r_pass.upgrade_above_level; }
+			}
 			if (slot < 0) { r_pass.sampled_missing++; } else if (!sampled_ready) { stale ? r_pass.sampled_missing++ : r_pass.sampled_pending++; }
 			// Age the miss from the frame the page was first demanded without content.
 			// A page younger than one lead is not late: the plan is ahead of the camera,
@@ -234,6 +253,19 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 			[](const Terrain3DAVTPageRequest *p_left, const Terrain3DAVTPageRequest *p_right) {
 				return TerrainVT::page_request_priority_before(p_left->priority, p_right->priority);
 			});
+	// The fallback tier's residency against its own plan. Published from the classification that
+	// resolved every slot, so a settled view reading `fallback_ready_pages < fallback_plan_pages`
+	// is the tier losing cells to production or eviction, which is what decides whether the
+	// guarantee of rule R2 needs a reservation in the pool or already holds.
+	_vt.avt_sector_stats["fallback_plan_pages"] = r_pass.fallback_plan;
+	_vt.avt_sector_stats["fallback_ready_pages"] = r_pass.fallback_ready;
+	// How many slots the pool currently holds for a reserved page. This is the guarantee as
+	// residency rather than as a plan entry: with rule R2 in force it tracks `fallback_ready_pages`
+	// in a settled view, because the pages the fallback tier has are the pages nothing else may take.
+	_vt.avt_sector_stats["fallback_reserved_pages"] = pool->count_reserved_slots();
+	_vt.avt_sector_stats["fallback_reserved_blocked"] = pool->reserved_block_count;
+	_vt.avt_sector_stats["plan_upgrade_above_level"] = r_pass.upgrade_above_level;
+	_vt.avt_sector_stats["plan_adaptive_threshold_level"] = adaptive_threshold;
 }
 
 // Queued idle work must not occupy every source-worker slot while visible requests
@@ -319,7 +351,11 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 	const uint64_t allocation_start = Time::get_singleton()->get_ticks_usec();
 	if (slot < 0) {
 		bool miss = false;
-		slot = _vt.surface_vt->request_page_internal(p_page.owner, p_page.mip, p_page.x, p_page.y, &miss);
+		// The fallback tier's pages are published as reserved: the pool will not evict them, so the
+		// cell a fragment with no upgrade resolves through stays answerable whatever the upgrade set
+		// is doing. See `docs/avt_addressing_redesign.md` rule R2.
+		const bool reserved = p_page.owner == avt_coarse_owner();
+		slot = _vt.surface_vt->request_page_internal(p_page.owner, p_page.mip, p_page.x, p_page.y, &miss, reserved);
 		if (slot < 0 || !miss) {
 			r_pass.slot_wait++;
 			return false;

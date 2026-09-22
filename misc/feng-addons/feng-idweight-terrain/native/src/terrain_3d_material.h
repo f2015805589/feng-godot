@@ -115,6 +115,13 @@ private:
 	// Functions
 	bool _shader_uses_vt = true;
 	bool _needs_vt_shader() const;
+	// The second axis of the same variant choice: whether the generated code carries the height
+	// group's clipmap arm (`TERRAIN_HEIGHT_CLIPMAP`). Kept beside `_shader_uses_vt` rather than folded
+	// into it because the two move independently - a configuration can have the material arms and no
+	// ring, or (deliberately) the ring and no material arms - and a rebuild has to happen when
+	// *either* changed.
+	bool _shader_height_clipmap = false;
+	bool _needs_height_clipmap_arm() const;
 	void _preload_shaders();
 	void _parse_shader(const String &p_shader, const String &p_name);
 	String _apply_inserts(const String &p_shader, const Array &p_excludes = Array()) const;
@@ -125,6 +132,7 @@ private:
 	String _inject_editor_code(const String &p_shader) const;
 	void _update_shader();
 	void _update_vt_uniforms(const RID &p_material);
+	void _bind_vt_clipmap_uniforms(const RID &p_material);
 	void _update_uniforms(const RID &p_material, const uint32_t p_update = UNIFORMS_ONLY);
 	void _set_shader_parameters(const Dictionary &p_dict);
 	Dictionary _get_shader_parameters() const { return _shader_params; }
@@ -138,8 +146,21 @@ public:
 	void destroy();
 
 	void update(const uint32_t p_flags = UNIFORMS_ONLY);
+	// Rebinds the height group's clipmap uniforms and nothing else, for a ring whose per-level state
+	// moved: the full pass would republish every VT uniform (and the region tables) on a tick the
+	// camera merely walked. A no-op in a variant that carries no ring arm.
+	void update_vt_clipmap_uniforms();
 	RID get_material_rid() const { return _material; }
 	RID get_shader_rid() const { return _shader.is_valid() ? _shader->get_rid() : RID(); }
+	// Whether the *generated* shader carries the virtual-texture arms. It is the verdict the last
+	// `_update_shader()` reached, not a setting: the delivery matrix decides it, and it is published
+	// because "a configuration that selects no method costs no shader code" is otherwise a claim
+	// about a string nobody can read. False means the code compiled is the no-VT build.
+	bool is_shader_using_vt() const { return _shader_uses_vt; }
+	// Whether the same generated shader carries the height group's clipmap arm. Published for the
+	// same reason: "a height group delivered `Direct` in both bands compiles no ring code and binds
+	// no ring uniform" is otherwise a claim about a string nobody can read.
+	bool is_shader_using_height_clipmap() const { return _shader_height_clipmap; }
 
 	RID get_buffer_material_rid() const { return _buffer_material; }
 	RID get_buffer_shader_rid() const { return _buffer_shader.is_valid() ? _buffer_shader->get_rid() : RID(); }

@@ -223,6 +223,7 @@ void Terrain3DMaterial::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update", "flags"), &Terrain3DMaterial::update, DEFVAL(Terrain3DMaterial::UNIFORMS_ONLY));
 	ClassDB::bind_method(D_METHOD("get_material_rid"), &Terrain3DMaterial::get_material_rid);
 	ClassDB::bind_method(D_METHOD("get_shader_rid"), &Terrain3DMaterial::get_shader_rid);
+	ClassDB::bind_method(D_METHOD("is_shader_using_vt"), &Terrain3DMaterial::is_shader_using_vt);
 	ClassDB::bind_method(D_METHOD("get_buffer_material_rid"), &Terrain3DMaterial::get_buffer_material_rid);
 	ClassDB::bind_method(D_METHOD("get_buffer_shader_rid"), &Terrain3DMaterial::get_buffer_shader_rid);
 

@@ -350,7 +350,7 @@ Dictionary Terrain3D::_compute_adaptive_sector_sizes(const Dictionary &p_eligibl
 	struct SectorDemand { Vector2i location; int size; float distance; };
 	std::vector<SectorDemand> demands;
 	const float world = _region_size * _vertex_spacing;
-	const int capacity = _vt.surface_svt_enabled ? MAX(1, _vt.surface_vt->get_page_count() / 2) : _vt.surface_vt->get_page_count();
+	const int capacity = has_svt_delivery() ? MAX(1, _vt.surface_vt->get_page_count() / 2) : _vt.surface_vt->get_page_count();
 	auto cost = [](int size) { return (4 * size * size - 1) / 3; };
 	int total = 0;
 	for (const Variant &key : p_eligible.keys()) {

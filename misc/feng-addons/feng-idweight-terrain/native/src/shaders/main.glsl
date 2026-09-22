@@ -68,9 +68,39 @@ uniform int _avt_mip_level_cap = 2;
 uniform int _avt_coarse_mip_cap = 2;
 uniform float _avt_fine_section_world = 64.0;
 uniform float _avt_fine_texel = 0.0009765625;
+// The sample level at which the fallback table takes over. A sample at or above it reads the
+// fallback table directly; one below it is an upgrade and goes through the sector directory and its
+// page table for second-level addressing. Distinct from `_avt_coarse_mip_cap`, which is the
+// fallback grid's own last mip: this one is in the sample's level units, so it is the number the
+// plan and the read order can both be stated against.
+uniform float _avt_adaptive_threshold_level = 0.0;
 // Last published window center.xy, mip 1 page world span, mip 1 grid width.
 uniform vec4 _avt_coarse_grid = vec4(0.0);
 uniform ivec2 _avt_coarse_block = ivec2(0);
+#endif
+#ifdef TERRAIN_HEIGHT_CLIPMAP
+// The height group's clipmap ring, and the only uniforms this method costs the shader. The whole
+// block is inside `TERRAIN_HEIGHT_CLIPMAP`, which the generated code defines for exactly the
+// configurations whose height group is delivered by the ring (both bands `Direct` => no define => no
+// uniforms, no samplers and no branch), so a method nobody selected is not merely unused here: it is
+// absent. `_avt_coverage_distance` above is the band edge the ring serves inside, which is the one
+// published reach both the material split and this one are measured against.
+//
+// One entry per level, in level order: the level's *snapped* centre and its toroidal offset, so the
+// shader's addressing is `Terrain3DClipmap::sample()`'s. `_clipmap_level_valid` is 1 for a level
+// whose every texel is current and 0 for one that is mid-fill, mid-strip or mid-invalidation - a 0
+// is what keeps a level that still holds the level it replaces out of a fragment.
+uniform bool _clipmap_height_near = false;
+uniform bool _clipmap_height_far = false;
+uniform highp sampler2DArray _clipmap_atlas : filter_nearest, repeat_disable;
+uniform vec2 _clipmap_center[16];
+// Not `ivec2[16]`: Godot binds a uniform array from a packed array, and there is no packed ivec2.
+// The values are whole texel counts, so the cast below is exact.
+uniform vec2 _clipmap_ring[16];
+uniform float _clipmap_level_valid[16];
+uniform int _clipmap_size = 256;
+uniform int _clipmap_level_count = 0;
+uniform float _clipmap_base_world = 256.0;
 #endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
@@ -612,10 +642,23 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 	fade = 1.0;
 	last_mip = false;
 	if (_avt_coarse_grid.w < 1.0 || _avt_coarse_grid.z <= 0.0) { return false; }
-	if (distance(world, v_camera_pos.xz) >= max(64.0, _avt_coverage_distance)) { return false; }
 	float coarse_texel = _avt_coarse_grid.z / float(_surface_vt_page_size);
-	// Requests already satisfied by the baseline bypass the directory entirely.
-	if (_avt_fine_texel < coarse_texel && max(pixel_world, minimum_texel) < coarse_texel) {
+	// The near field's reach bounds its *upgrade* path and nothing else. Reach is what the plan
+	// that produces upgraded pages is sized against, so past it the plan names no fine page and an
+	// upgrade that happens to be resident there must not outrank the fallback the rest of the view
+	// is drawn from. The fallback tier is instead bounded by its own table: it is the last resort
+	// for a fragment no upgrade covers, and past reach it is the only owner the near field has at
+	// all - a fragment there has no other provider when the far field is off, and rejecting it is
+	// what turns settled ground into a missing-page diagnostic.
+	bool in_reach = distance(world, v_camera_pos.xz) < max(64.0, _avt_coverage_distance);
+	// Which table answers this sample, stated as the level it asks for against the level the
+	// fallback takes over at. At or above that level the fallback answers and the sector directory
+	// and its page table are not touched at all; below it the sample is an upgrade and is addressed
+	// through the directory. The two are the same fact as the texel comparison this replaced, but
+	// stated once, in the units the plan classifies in: a level the plan never produced an upgrade
+	// for cannot be asked of the upgrade path by a rounding difference.
+	float level = log2(max(1.0, max(pixel_world, minimum_texel) / max(_avt_fine_texel, 1e-9)));
+	if (in_reach && _avt_adaptive_threshold_level > 0.0 && level < _avt_adaptive_threshold_level) {
 		vec2 local_grid = world / _avt_fine_section_world;
 		ivec2 key = ivec2(floor(local_grid));
 		vec4 entry;
@@ -838,7 +881,31 @@ vec3 get_index_uv(const vec2 uv2) {
 	return vec3(uv2 - _region_locations[max(layer_index, 0)], float(layer_index));
 }
 
-float interpolated_height(vec2 pos) {
+)"
+// Another split, for the same reason as the one above: MSVC truncates a string literal past
+// 16 kB, and the height channel's own reads and the vertex stage together crossed it.
+		R"(
+// ---- The height channel's two sources ----------------------------------------------------------
+// The height group is delivered by the region texture array (`Direct`) or by the clipmap ring, in
+// the band its cell names. Everything below is that choice in one place, and the array is the
+// `#else` arm of every branch, so a configuration whose height group is `Direct` in both bands
+// compiles exactly the read it always did.
+//
+// A ring read is always an explicit, clamped `texelFetch` and never a filtered one. The ring is
+// toroidal: a tap outside a level would land on the far edge of the same level, which is a different
+// world position, so no sampler may filter across it - the bilinear this file needs is rebuilt from
+// four clamped taps instead. The array path is point-sampled for the same reason (its regions are
+// separate layers), and the mesh's own nested vertex grids are what make the two agree where it
+// matters.
+
+// The region array's own read of one height texel, point sampled - the arm every fallback returns.
+float array_height_point_uv(vec2 p_uv) {
+	return texelFetch(_height_maps, get_index_coord(p_uv), 0).r;
+}
+
+// The region array's sub-texel read: the four corners of the cell that contains `pos` and the
+// weights between them. This is the shipped height read, unchanged.
+float array_height_interpolated_uv(vec2 pos) {
 	const vec2 offsets = vec2(0, 1);
 	vec2 index_id = floor(pos);
 	ivec3 index[4];
@@ -855,6 +922,170 @@ float interpolated_height(vec2 pos) {
 	vec4 w = vec4(i.x * f.y, f.x * f.y, f.x * i.y, i.x * i.y);
 	float h = h0 * w[0] + h1 * w[1] + h2 * w[2] + h3 * w[3];
 	return h;
+}
+
+#ifdef TERRAIN_HEIGHT_CLIPMAP
+float clipmap_texel_world(int p_level) {
+	return _clipmap_base_world * exp2(float(p_level)) / float(max(_clipmap_size, 1));
+}
+
+// Whether a level's own texel range contains a point - `Terrain3DClipmap::_contains_level()` exactly.
+// Deliberately not `abs(point - centre) <= half`: that includes the far edge, which is one texel past
+// the last stored one, and the clamped read below would answer it with the edge texel, i.e. with the
+// height of a world position one texel away. The range is half-open, which is the set of texels the
+// level stores.
+bool clipmap_contains(int p_level, vec2 p_world) {
+	float half_size = _clipmap_base_world * exp2(float(p_level)) * 0.5;
+	vec2 local = (p_world - _clipmap_center[p_level] + vec2(half_size)) / clipmap_texel_world(p_level);
+	float size = float(max(_clipmap_size, 1));
+	return local.x >= 0.0 && local.y >= 0.0 && local.x < size && local.y < size;
+}
+
+// The finest level whose own texel range contains the point, and the coarsest when none does -
+// `Terrain3DClipmap::level_for_world()` exactly. A level's centre is snapped to its own texel size,
+// so two levels' coverage is not concentric and this is a search rather than a log2 of a shared
+// centre.
+int clipmap_level_for_world(vec2 p_world) {
+	int last = max(_clipmap_level_count - 1, 0);
+	for (int level = 0; level < last; level++) {
+		if (clipmap_contains(level, p_world)) {
+			return level;
+		}
+	}
+	return last;
+}
+
+// The level's snapped grid, in logical texel units: `Terrain3DClipmap::sample()`'s own inverse of
+// `world_of_logical()`, so the shader and the CPU read the same texel for the same world point. `z`
+// is the level.
+vec3 clipmap_address(vec2 p_world) {
+	int level = clipmap_level_for_world(p_world);
+	float texel = clipmap_texel_world(level);
+	float half_size = _clipmap_base_world * exp2(float(level)) * 0.5;
+	vec2 local = (p_world - _clipmap_center[level] + vec2(half_size)) / texel;
+	return vec3(local, float(level));
+}
+
+// One stored texel, named by a *logical* index: the ring offset turns it into the stored one
+// (`physical = (logical + ring) mod size`, the wrap `Terrain3DClipmap::_wrap()` applies), and the
+// clamp keeps a tap at a level's edge inside that level instead of wrapping it onto the opposite
+// edge, where the neighbouring level is the correct source.
+float clipmap_texel_at(int p_level, vec2 p_logical) {
+	float size = float(max(_clipmap_size, 1));
+	vec2 logical = clamp(p_logical, vec2(0.0), vec2(size - 1.0));
+	vec2 physical = mod(logical + _clipmap_ring[p_level], vec2(size));
+	return texelFetch(_clipmap_atlas, ivec3(ivec2(physical), p_level), 0).r;
+}
+
+float clipmap_height_at_world(vec2 p_world) {
+	vec3 address = clipmap_address(p_world);
+	return clipmap_texel_at(int(address.z), floor(address.xy));
+}
+
+// The same, bilinearly interpolated on the level's own grid. The weights are the level's, not the
+// height grid's: a coarse level's texels are further apart than the height grid's, so the finer
+// grid's fraction would sample inside one texel and read it as four.
+float clipmap_height_interpolated_at_world(vec2 p_world) {
+	vec3 address = clipmap_address(p_world);
+	vec2 base = floor(address.xy);
+	vec2 f = address.xy - base;
+	int level = int(address.z);
+	float h00 = clipmap_texel_at(level, base);
+	float h10 = clipmap_texel_at(level, base + vec2(1.0, 0.0));
+	float h01 = clipmap_texel_at(level, base + vec2(0.0, 1.0));
+	float h11 = clipmap_texel_at(level, base + vec2(1.0, 1.0));
+	return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+// The ring's share of the height at a world point: 1 where the ring serves, 0 where the region array
+// does, and a blend across the band edge. Zero has four causes and one meaning - read the array: the
+// point is outside the band the two cells named, it is outside the coarsest level's own texel range,
+// or the level that would answer it is not current (mid-fill, mid-strip, mid-invalidation).
+//
+// The range test is what keeps a clamped read from being served as if it were an answer. A point no
+// level contains is answered by the coarsest level *at its edge* - a different world position, and
+// the reason `clipmap_texel_at()` clamps rather than wrapping - so the ring has nothing to say there
+// and the region array, which does, serves it. The CPU's `sample_vt_clipmap()` still answers that
+// point: a reading of what the ring holds is not the same question as what a fragment may read.
+//
+// The band is measured *horizontally*, in both stages, because the vertex stage is computing the
+// vertical distance. The material split next door measures the fragment's 3D distance instead; the
+// two are different questions and each is measured where it is asked. `_avt_coverage_distance` is
+// the one published reach both use.
+float clipmap_height_weight(vec2 p_world) {
+	if (_clipmap_level_count <= 0) {
+		return 0.0;
+	}
+	int level = clipmap_level_for_world(p_world);
+	if (!clipmap_contains(level, p_world)) {
+		return 0.0;
+	}
+	if (_clipmap_level_valid[level] < 0.5) {
+		return 0.0;
+	}
+	float reach = max(64.0, _avt_coverage_distance);
+	float far_band = smoothstep(reach * 0.75, reach, length(p_world - v_camera_pos.xz));
+	float weight = _clipmap_height_near ? 1.0 - far_band : 0.0;
+	if (_clipmap_height_far) {
+		weight = max(weight, far_band);
+	}
+	return weight;
+}
+
+#endif // TERRAIN_HEIGHT_CLIPMAP
+
+// How far apart the height reads of one normal are, in height-grid units: the ring's texel where the
+// ring serves, and the height grid's own step where the array does. Never below 1 - a level finer
+// than the height grid is still read at the grid's step, which is what those taps are stated in. One
+// for a configuration with no ring arm, which is what keeps that path's arithmetic unchanged.
+float height_tap_scale(vec2 p_uv) {
+#ifdef TERRAIN_HEIGHT_CLIPMAP
+	vec2 world = p_uv * _vertex_spacing;
+	float weight = clipmap_height_weight(world);
+	if (weight <= 0.0) {
+		return 1.0;
+	}
+	float texel = clipmap_texel_world(clipmap_level_for_world(world));
+	return mix(1.0, max(texel / _vertex_spacing, 1.0), weight);
+#else
+	return 1.0;
+#endif
+}
+
+// One height texel, point sampled, through whichever source the height group's cells select.
+float height_at_uv(vec2 p_uv) {
+#ifdef TERRAIN_HEIGHT_CLIPMAP
+	vec2 world = p_uv * _vertex_spacing;
+	float weight = clipmap_height_weight(world);
+	if (weight >= 1.0) {
+		return clipmap_height_at_world(world);
+	}
+	float array_height = array_height_point_uv(p_uv);
+	if (weight <= 0.0) {
+		return array_height;
+	}
+	return mix(array_height, clipmap_height_at_world(world), weight);
+#else
+	return array_height_point_uv(p_uv);
+#endif
+}
+
+// The sub-texel read the finest mesh LOD uses, through the same choice.
+float interpolated_height(vec2 pos) {
+#ifdef TERRAIN_HEIGHT_CLIPMAP
+	vec2 world = pos * _vertex_spacing;
+	float weight = clipmap_height_weight(world);
+	if (weight >= 1.0) {
+		return clipmap_height_interpolated_at_world(world);
+	}
+	float array_height = array_height_interpolated_uv(pos);
+	if (weight <= 0.0) {
+		return array_height;
+	}
+	return mix(array_height, clipmap_height_interpolated_at_world(world), weight);
+#else
+	return array_height_interpolated_uv(pos);
+#endif
 }
 
 //INSERT: DISPLACEMENT_FUNCTIONS
@@ -922,9 +1153,11 @@ void vertex() {
 		if (scale < _vertex_spacing) {
 			h = interpolated_height(UV);
 		} else {
-			ivec3 coord_a = get_index_coord(start_pos);
-			ivec3 coord_b = get_index_coord(end_pos);
-			h = mix(texelFetch(_height_maps, coord_a, 0).r, texelFetch(_height_maps, coord_b, 0).r, vertex_lerp);
+			// The two grids the geomorph interpolates between, each read through the group's own
+			// source. Point reads: a tap is a vertex position on a nested grid, so a ring level whose
+			// texels are the vertex's own step answers it with that vertex's height exactly, whichever
+			// of the two rings that contain the vertex is selected.
+			h = mix(height_at_uv(start_pos), height_at_uv(end_pos), vertex_lerp);
 		}
 
 //INSERT: FLAT_VERTEX
@@ -1076,8 +1309,12 @@ void idweight_add_pair_vertex(uint packed, float barycentric,
 	interpolatedOverlayWeight += barycentric * overlayWeight;
 }
 
-float get_height(vec2 index_id, vec2 offset) {
-	float height = texelFetch(_height_maps, get_index_coord(index_id + offset), 0).r;
+// One of the eight taps the terrain normal is reconstructed from. `p_tap_scale` is how far apart
+// those taps are in height-grid units: 1 while the region array serves, and the serving clipmap
+// level's texel where the ring does, so a coarse level is differenced at its own resolution instead
+// of reading the same stored value eight times.
+float get_height(vec2 index_id, vec2 offset, float p_tap_scale) {
+	float height = height_at_uv(index_id + offset * p_tap_scale);
 //INSERT: FLAT_FRAGMENT
 	return height;
 }
@@ -1123,13 +1360,19 @@ void fragment() {
 	// Allows for additional derivatives, eg world background, brush previews etc
 	float u = 0.0;
 	float v = 0.0;
+	// How far apart the eight taps below are, in height-grid units, and the world distance they stand
+	// for: the height grid's own step while the region array serves this fragment, and the serving
+	// clipmap level's texel while the ring does. One for a `Direct` height group, which is what keeps
+	// that path's arithmetic unchanged.
+	float height_scale = height_tap_scale(uv);
+	float height_step = _vertex_spacing * height_scale;
 
 //INSERT: WORLD_NOISE_FRAGMENT
 
-	h[3] = get_height(index_id, offsets.xx); // 0 (0, 0)
-	h[2] = get_height(index_id, offsets.yx); // 1 (1, 0)
-	h[0] = get_height(index_id, offsets.xy); // 2 (0, 1)
-	index_normal[3] = normalize(vec3(h[3] - h[2] + u, _vertex_spacing, h[3] - h[0] + v));
+	h[3] = get_height(index_id, offsets.xx, height_scale); // 0 (0, 0)
+	h[2] = get_height(index_id, offsets.yx, height_scale); // 1 (1, 0)
+	h[0] = get_height(index_id, offsets.xy, height_scale); // 2 (0, 1)
+	index_normal[3] = normalize(vec3(h[3] - h[2] + u, height_step, h[3] - h[0] + v));
 
 	// Set flat world normal - overwritten if bilerp is true
 	vec3 w_normal = index_normal[3];
@@ -1165,16 +1408,16 @@ void fragment() {
 
 		// 5 lookups
 		// Fetch the additional required height values for smooth normals
-		h[1] = get_height(index_id, offsets.yy); // 3 (1, 1)
-		float h_4 = get_height(index_id, offsets.yz); // 4 (1, 2)
-		float h_5 = get_height(index_id, offsets.zy); // 5 (2, 1)
-		float h_6 = get_height(index_id, offsets.zx); // 6 (2, 0)
-		float h_7 = get_height(index_id, offsets.xz); // 7 (0, 2)
+		h[1] = get_height(index_id, offsets.yy, height_scale); // 3 (1, 1)
+		float h_4 = get_height(index_id, offsets.yz, height_scale); // 4 (1, 2)
+		float h_5 = get_height(index_id, offsets.zy, height_scale); // 5 (2, 1)
+		float h_6 = get_height(index_id, offsets.zx, height_scale); // 6 (2, 0)
+		float h_7 = get_height(index_id, offsets.xz, height_scale); // 7 (0, 2)
 
 		// Calculate the normal for the remaining index ids.
-		index_normal[0] = normalize(vec3(h[0] - h[1] + u, _vertex_spacing, h[0] - h_7 + v));
-		index_normal[1] = normalize(vec3(h[1] - h_5 + u, _vertex_spacing, h[1] - h_4 + v));
-		index_normal[2] = normalize(vec3(h[2] - h_6 + u, _vertex_spacing, h[2] - h[1] + v));
+		index_normal[0] = normalize(vec3(h[0] - h[1] + u, height_step, h[0] - h_7 + v));
+		index_normal[1] = normalize(vec3(h[1] - h_5 + u, height_step, h[1] - h_4 + v));
+		index_normal[2] = normalize(vec3(h[2] - h_6 + u, height_step, h[2] - h[1] + v));
 
 		// Set interpolated world normal
 		w_normal =

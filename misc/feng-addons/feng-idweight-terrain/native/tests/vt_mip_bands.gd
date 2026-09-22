@@ -257,24 +257,35 @@ func run() -> void:
 	# miss has real coarse data to fall back on, and an over-subscribed pool raises a
 	# coarseness floor instead of dropping the far end of the working set. Phase 4 above
 	# runs with roots disabled, so this phase restores them.
+	#
+	# Automatic capacity is switched off for this phase, and that is what makes the assertion a
+	# statement about the floor instead of a function of everything the earlier phases left behind:
+	# with it on, the pool grows to fit the visible set - measured, 7 visible pages beside 8 roots
+	# grew the pool to 16, so 7 <= 16 - 8 and nothing was over-subscribed by it. The floor is a
+	# function of the visible set and the capacity left after the roots, so the test has to fix the
+	# capacity to ask about it, and `detail_capacity` is the number the deciding pass published.
 	terrain.surface_svt_root_mips = 2
+	terrain.vt_auto_capacity = false
 	terrain.vt_page_count = 4
 	await frame_barrier()
 	await settle(12)
 	var root_settings: Dictionary = terrain.get_vt_settings()
-	print("VT_MIP_BANDS roots root_pages=%d floor=%d visible=%d protected=%d" % [
+	print("VT_MIP_BANDS roots root_pages=%d floor=%d visible=%d protected=%d pool=%d setting=%d detail_capacity=%d" % [
 			int(root_settings.get("svt_root_pages", 0)), int(root_settings.get("svt_floor_level", 0)),
 			int(root_settings.get("svt_visible_pages", 0)),
-			int(terrain.get_surface_svt().get_stats().get("protected_count", 0))])
+			int(terrain.get_surface_svt().get_stats().get("protected_count", 0)),
+			int(root_settings.get("effective_page_count", 0)), int(root_settings.get("page_count", 0)),
+			int(root_settings.get("svt_detail_capacity", 0))])
 	require(int(root_settings.get("svt_root_pages", 0)) > 0,
 			"the far field must pin a root pyramid covering the visible world")
 	require(int(terrain.get_surface_svt().get_stats().get("protected_count", 0)) > 0,
 			"root pages must stay protected so a detail miss resolves coarsely")
-	# Only pressure can raise the floor, so assert it exactly when the distance-selected
-	# set does not fit the pool that is left after the roots.
-	if int(root_settings.get("svt_visible_pages", 0)) > 2:
-		require(int(root_settings.get("svt_floor_level", 0)) > 0,
-				"an over-subscribed pool must raise a coarseness floor instead of dropping pages")
+	var detail_capacity := int(root_settings.get("svt_detail_capacity", 0))
+	require(int(root_settings.get("svt_visible_pages", 0)) > detail_capacity,
+			"this phase must actually over-subscribe the pool: %d visible pages against %d detail slots" %
+			[int(root_settings.get("svt_visible_pages", 0)), detail_capacity])
+	require(int(root_settings.get("svt_floor_level", 0)) > 0,
+			"an over-subscribed pool must raise a coarseness floor instead of dropping pages")
 
 	scene.queue_free()
 	camera.queue_free()

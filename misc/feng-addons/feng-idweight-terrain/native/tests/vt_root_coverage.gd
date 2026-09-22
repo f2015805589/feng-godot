@@ -249,7 +249,7 @@ func run() -> void:
 	require(after == before,
 			"a settled far field must not re-produce pages every pass (requeues %d -> %d)" % [before, after])
 
-	# The other fallback policy, H2 of `docs/vt_hdrp_avt_alignment.md`: the coarsest level the world
+	# The other fallback policy, H2 of `docs/vt_reference_avt_alignment.md`: the coarsest level the world
 	# grid can express, for every unit the visible set selected, instead of one complete level window
 	# over the whole addressable domain.
 	#

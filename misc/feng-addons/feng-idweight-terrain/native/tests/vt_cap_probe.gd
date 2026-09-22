@@ -1,5 +1,5 @@
 extends SceneTree
-## P0 probe for `docs/vt_hdrp_avt_alignment.md` section 7.
+## P0 probe for `docs/vt_reference_avt_alignment.md` section 7.
 ##
 ## Section 7 suspects that a change of the far field's world mip cap is treated as a content
 ## change - every region is marked for re-bake and the material's region arrays are rebuilt -
@@ -380,7 +380,7 @@ func build_scene() -> void:
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
 	terrain.vt_page_count = PAGE_COUNT
-	# An A/B knob for the one feng extension HDRP does not have: growing the physical pool at runtime
+	# An A/B knob for the one feng extension the reference does not have: growing the physical pool at runtime
 	# (`vt_auto_capacity`). Growth cannot preserve a page - the atlas is one Texture2DArray and
 	# `ensure_layers()` recreates it blank when its layer count changes, so `Terrain3DVTPagePool::grow()`
 	# evicts every used slot - and the generation is deliberately not bumped for it, so the wipe is

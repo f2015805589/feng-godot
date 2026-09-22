@@ -66,8 +66,14 @@ void Terrain3D::_update_vt_page_fade() {
 	_vt.fade.active = 0;
 	_vt.fade.pending = 0;
 	_vt.fade.held = 0;
-	if (_vt.vt_page_fade_frames <= 0 || !_vt.surface_vt || !_vt.vt_shared_ready) { return; }
-	const int slots = MAX(1, _vt.surface_vt->get_page_count());
+	if (_vt.vt_page_fade_frames <= 0 || !_vt.vt_shared_ready) { return; }
+	// The fade is per *physical slot* of the shared pool, so the view it asks is whichever one
+	// exists: requiring the near view made a far-only configuration publish no ramps at all, which
+	// is a page arriving as a step - the defect this pass exists to remove - on the tier that has
+	// the coarser pages and therefore the more visible steps.
+	const Terrain3DVirtualTexture *fade_view = _vt.surface_vt ? _vt.surface_vt : _vt.surface_svt;
+	if (fade_view == nullptr) { return; }
+	const int slots = MAX(1, fade_view->get_page_count());
 	const int frames = MAX(1, _vt.vt_page_fade_frames);
 	if (_vt.fade.queue.capacity() != size_t(slots)) {
 		_vt.fade.queue.resize(size_t(slots));

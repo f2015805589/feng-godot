@@ -14,6 +14,7 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	r_job.budget = p_input.budget;
 	r_job.warm.clear();
 	r_job.retain_cap = r_job.tail_cap = r_job.mip_bias = r_job.denied = 0;
+	r_job.invisible_cell_pages = 0;
 	struct Node {
 		const Terrain3DAVTSector *cell;
 		int mip, x, y;
@@ -22,8 +23,19 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	};
 	auto farther = [](const Node &a, const Node &b) {
 		if (a.cell->produce != b.cell->produce) { return !a.cell->produce; }
+		// Breadth-first in *world span*, not in local mip and not by distance. A page's span is the
+		// one quantity two chains can be compared by across blocks of different sizes: a 256-page
+		// block and a 64-page block hold the same world resolution at different local mips, so
+		// ordering by mip let the larger block's chain outrank the smaller block's at every level,
+		// and ordering by distance made the walk depth-first on the nearest cell. Either way the plan
+		// spent its ~128 entries on one cell's chain and left every other cell its whole-cell page:
+		// the near-field probe measured 43 of 45 points within 16 m of the camera with no ready fine
+		// page, and the level histogram was bimodal - a fine cluster for one cell, 35 whole-cell pages
+		// for the rest. Ordering by span descends every cell one world level before any cell descends
+		// two, which is what makes adjacent cells at one distance share a resolution.
+		if (a.rect.size.x != b.rect.size.x) { return a.rect.size.x < b.rect.size.x; }
 		if (a.distance != b.distance) { return a.distance > b.distance; }
-		return a.mip > b.mip;
+		return false;
 	};
 	std::priority_queue<Node, std::vector<Node>, decltype(farther)> pending(farther);
 	auto enqueue = [&](const Terrain3DAVTSector &cell, int mip, int x, int y, bool root = false) {
@@ -37,7 +49,19 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 		TerrainVT::VisiblePatch patch;
 		if (!p_input.view.sample(footprint, heights, patch)) {
 			if (!root) { return; }
-			patch.distance = cell.distance; patch.density = 0.f;
+			// An unsampled footprint keeps the cell's distance and no demand of its own, which is the
+			// behaviour that was measured against the alternative. Two variants were tried here and
+			// both were rejected: giving every unsampled footprint the cell's distance density filled
+			// the plan with detail for off-screen ground and stopped `vt_avt_dense`'s narrow view from
+			// publishing the local mip-0 page its demand asks for (four assertions); giving it only to
+			// cells the view does not sample at all left `plan_invisible_cell_pages` at 8 - one
+			// whole-cell page per apron cell - because those cells are the ones beyond ~195 m, where
+			// the distance's demand stops above the whole-cell page anyway. Neither variant moved the
+			// reading this was aimed at, and the cells a camera sees at a few metres are always sampled
+			// (a 64 m box containing the eye cannot be rejected by a frustum plane), so the visible
+			// patch this addresses is not the view's answer for a cell. It is residency.
+			patch.distance = cell.distance;
+			patch.density = 0.f;
 		}
 		const float density = patch.density * p_input.texels_per_pixel * AVT_DEMAND_DENSITY_MARGIN;
 		// No local allocation/physical demand when the independent baseline suffices.
@@ -56,6 +80,7 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	for (const Node &node : roots) {
 		r_job.pages.push_back({ node.cell->owner, node.mip, node.x, node.y, node.rect,
 			TerrainVT::make_page_request_priority(TerrainVT::PageRequestKind::ROOT, node.distance, node.rect.size.x) });
+		if (!node.cell->produce) { ++r_job.invisible_cell_pages; }
 		if (node.mip > 0 && node.cell->produce && node.rect.size.x * node.density > p_input.page_size) {
 			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) { enqueue(*node.cell, node.mip - 1, x, y); }
 		}
@@ -71,6 +96,7 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 		const Node node = pending.top(); pending.pop();
 		r_job.pages.push_back({ node.cell->owner, node.mip, node.x, node.y, node.rect,
 			TerrainVT::make_page_request_priority(TerrainVT::PageRequestKind::CURRENT, node.distance, node.rect.size.x) });
+		if (!node.cell->produce) { ++r_job.invisible_cell_pages; }
 		if (node.mip > 0 && node.rect.size.x * node.density > p_input.page_size) {
 			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) { enqueue(*node.cell, node.mip - 1, node.x * 2 + x, node.y * 2 + y); }
 		}

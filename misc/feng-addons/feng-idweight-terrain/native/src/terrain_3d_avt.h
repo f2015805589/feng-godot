@@ -157,7 +157,7 @@ struct Terrain3DAVTRefinement {
 	// of it for the retention window the installer appends after the refinement walk has taken its
 	// apron. Both are bounded by what one refresh window can produce
 	// (`_avt_tick_allowance() * avt_plan_refresh_frames`), not by what the pool can hold. See
-	// `PlanInput::tail_cap` and `docs/vt_hdrp_avt_alignment.md` section 7.7.
+	// `PlanInput::tail_cap` and `docs/vt_reference_avt_alignment.md` section 7.7.
 	int tail_cap = 0;
 	int retain_cap = 0;
 	// The plan's composition by level, over the pages above: `level_mips` is a histogram of the
@@ -168,6 +168,11 @@ struct Terrain3DAVTRefinement {
 	// give back - the question "does the fallback ladder cost slots" answered with the plan itself.
 	PackedInt32Array level_mips;
 	int world_pages = 0;
+	// Pages the plan holds for cells the view did not sample. These are what keep a cell beside the
+	// frustum's edge from being drawn as one whole-cell page: before refinement followed the
+	// distance's demand rather than the view's answer for the cell, this was nothing but whole-cell
+	// roots, and a cell at the edge was a 0.25-1 m per texel patch next to a millimetre neighbour.
+	int invisible_cell_pages = 0;
 	uint64_t submitted_us = 0, elapsed_us = 0;
 };
 
@@ -256,6 +261,17 @@ struct Terrain3DAVTProducePass {
 	// Why a planned page was not produced this pass: its source job was not ready yet
 	// (the workers are behind) or the pool handed out no slot (residency is saturated).
 	int source_wait = 0, slot_wait = 0;
+	// The fallback tier's own residency, measured against its plan. This tier is the one the
+	// addressing rules make a guarantee rather than demand: a fragment no upgrade covers resolves
+	// through it, so a cell of it that is not resident is a fragment with no owner. The pair is the
+	// reading that decides whether the guarantee needs a reservation - `plan` is what the plan holds
+	// and `ready` is how much of it has content, so a settled view whose `ready` is short of `plan`
+	// is the tier being starved, and an `evict` count that moves with it says by whom.
+	int fallback_plan = 0, fallback_ready = 0;
+	// Upgrade pages the plan holds whose own level is at or above the level the fallback takes over
+	// at: pages no fragment asks the upgrade path for. The plan and the shader's read order derive
+	// from one number by rule R3, so this is the reading that says they agree.
+	int upgrade_above_level = 0;
 };
 
 #endif // TERRAIN3D_AVT_TYPES_H

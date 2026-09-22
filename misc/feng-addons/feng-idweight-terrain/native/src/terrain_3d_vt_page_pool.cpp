@@ -88,6 +88,7 @@ bool Terrain3DVTPagePool::initialize(const int p_page_size, const int p_page_bor
 	alloc_count = 0;
 	evict_count = 0;
 	protected_block_count = 0;
+	reserved_block_count = 0;
 	initialized = true;
 	return true;
 }
@@ -117,6 +118,8 @@ bool Terrain3DVTPagePool::grow(int p_count) {
 	for (int slot = p_count - 1; slot >= 0; --slot) { free_slots.push_back(uint32_t(slot)); }
 	page_count = p_count;
 	++residency_revision;
+	// A grown pool has no reserved page either: every slot above was just released.
+	reserved_block_count = 0;
 	// Terrain3DVTPagePool is a plain struct, so it has no GDCLASS __class__ for LOG;
 	// warn through the engine macro instead. Only a growth that actually released pages is
 	// worth reporting: an empty pool grows into a blank atlas without losing anything, and
@@ -181,6 +184,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 	}
 	uint32_t slot = INVALID_PHYSICAL_PAGE_SLOT;
 	bool evict_on_commit = false;
+	bool saw_reserved_victim = false;
 	if (!free_slots.empty()) {
 		slot = free_slots.back();
 		free_slots.pop_back();
@@ -191,6 +195,15 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 			const uint32_t candidate = lru[i];
 			if (candidate >= uint32_t(page_count) || !slot_used[candidate] ||
 					slot_protected[candidate] || slot_reserved[candidate]) {
+				continue;
+			}
+			// A page the addressing reserved is not a victim at any pressure. The fallback tier's
+			// residency is a guarantee rather than demand (docs/avt_addressing_redesign.md rules R2
+			// and R3), so the search skips it exactly as it skips a protected page - and counts it
+			// separately, so a view whose upgrade set is competing for reserved slots reports that
+			// instead of looking like a view that is simply full.
+			if (has_reserved_owner(candidate)) {
+				saw_reserved_victim = true;
 				continue;
 			}
 			// An oversubscribed working set must not evict its own still-needed
@@ -211,6 +224,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 		}
 		if (slot == INVALID_PHYSICAL_PAGE_SLOT) {
 			protected_block_count++;
+			if (saw_reserved_victim) { reserved_block_count++; }
 			return -1;
 		}
 	}

@@ -76,9 +76,11 @@
 #include <godot_cpp/variant/vector3i.hpp>
 
 #include "terrain_3d_avt.h"
+#include "terrain_3d_clipmap.h"
 #include "terrain_3d_page_pipeline.h"
 #include "terrain_vt_arrival_queue.h"
 #include "terrain_3d_vt_cells.h"
+#include "terrain_3d_vt_delivery.h"
 
 class Terrain3DVirtualTexture;
 class Terrain3DVTFeedback;
@@ -516,6 +518,46 @@ struct Terrain3DSVTBakeJob {
 struct Terrain3DVTState {
 	// ---- 1. the shared service: one surface service owns the settings and the GPU material cache;
 	// AVT and SVT below are addressing/producer views over its shared physical residency pool. ----
+
+	// Which method carries which channel group, in which distance band. This is the *only* input
+	// to what the layer assembles: a view object exists because a cell selected its method, an
+	// array family is published because a group samples it, the material's shader carries a method's
+	// arm because a cell asked for it, and a pass runs because its service was selected. The default
+	// is the shipped architecture written in this vocabulary - near material on AVT, far material on
+	// SVT, height direct in both bands - so a scene that never writes a cell loads unchanged.
+	// `TerrainVT::DeliveryMatrix` holds the values and the three questions asked of them; see
+	// docs/vt_delivery_assembly.md for the channel inventory and the assembly rule.
+	TerrainVT::DeliveryMatrix delivery;
+	// The two read-only editor previews, counted. `*_calls` is how many times one was asked and
+	// `*_computed` how many of those asks did the work; the two differ exactly when no cell selects
+	// the method, where the query refuses before its scan. That refusal is the readable half of the
+	// assembly rule ("a method no row selects is never built") and counting it is what makes it a
+	// measurement instead of a claim. `mutable` because the queries are const and these record what
+	// they were asked, not state they set.
+	mutable uint64_t avt_preview_calls = 0;
+	mutable uint64_t avt_preview_computed = 0;
+	mutable uint64_t clipmap_preview_calls = 0;
+	mutable uint64_t clipmap_preview_computed = 0;
+	// ---- The clipmap delivery's own settings, one ring per channel group ----
+	// A group no cell delivers by Clipmap has no ring at all: no levels, no texture, no jobs and no
+	// budget. `_setup_vt_clipmap()` is the only place one is built, and the assembly rule calls it,
+	// so "no clipmap selected" is zero cost rather than a ring that happens to be idle.
+	//
+	// `size` is texels an axis on every level, `levels` how many levels the ring holds, and
+	// `base_world` the metres the finest level covers: level l covers `base_world * 2^l` metres in
+	// `size` texels. `budget_texels` is what one ring may produce in one tick, in channel texels;
+	// it is not part of the page budget, because the ring does not touch the shared pool.
+	int clipmap_size = 256;
+	int clipmap_levels = 8;
+	real_t clipmap_base_world = 256.f;
+	int clipmap_budget_texels = 65536;
+	std::unique_ptr<Terrain3DClipmap> clipmap[TerrainVT::GROUP_COUNT];
+	// The state stamp of each ring as the shader was last *bound* with, so a change the shader has to
+	// follow is one comparison per ring rather than a rebind per tick. See
+	// `Terrain3DClipmap::get_state_stamp()` and `Terrain3D::_update_vt_clipmap_arm()`.
+	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	// Channel texels produced by all rings in the tick that just ran.
+	int clipmap_produced_texels = 0;
 	int vt_page_size = 256;
 	// The page gutter, in texels each side. Four was the shipped value while the near field's
 	// anisotropy was capped by this same number - a gutter of n supports n - 0.5, so four admitted
@@ -610,7 +652,6 @@ struct Terrain3DVTState {
 	// default since AVT, SVT and CDLOD became the shipped defaults; the array path still serves
 	// every texel no page covers. ----
 	Terrain3DVirtualTexture *surface_vt = nullptr;
-	bool surface_vt_enabled = true;
 	// The near field's working set is roughly 50 pages at density 4 (a 512 m radius
 	// with the distance rule), so 64 left no headroom for the LRU.
 	int surface_vt_page_count = 128;
@@ -631,8 +672,8 @@ struct Terrain3DVTState {
 	// The near field's reach, in metres around the camera. It is the working set's radius: the plan
 	// covers the reach plus a sector of margin, and its size follows the area (measured at one fixed
 	// pose: 54 sectors and 15 pages at 512 m, 30 and 9 at 384). It shipped at 512, which is what a
-	// 256-slot pool reaches under HDRP's per-sector guarantee (section 3 of
-	// docs/vt_hdrp_avt_alignment.md), and 384 is where that reference implementation's own reach
+	// 256-slot pool reaches under the reference's per-sector guarantee (section 3 of
+	// docs/vt_reference_avt_alignment.md), and 384 is where that reference implementation's own reach
 	// sits (camera sector +- 6 sectors). The trade is measured in section 7.7.14: the settled plan
 	// falls 44% and the per-move churn does not move at all, while the far field - which excludes
 	// only `0.75 * this` - takes the band the near field gives up. So this is not a way to make an
@@ -808,7 +849,6 @@ struct Terrain3DVTState {
 	// texel. ----
 
 	Terrain3DVirtualTexture *surface_svt = nullptr;
-	bool surface_svt_enabled = true;
 	// One mip 0 page covers this many metres.
 	real_t surface_svt_page_world = 256.f;
 	int surface_svt_page_size = 256;
@@ -827,9 +867,9 @@ struct Terrain3DVTState {
 	// so it is the far field's fallback rather than a separate fallback page.
 	int surface_svt_root_mips = 2;
 	// Which set answers a far-field fragment whose selected page is not resident (H2 in
-	// `docs/vt_hdrp_avt_alignment.md`). 0 is the root pyramid above: one complete level window over
+	// `docs/vt_reference_avt_alignment.md`). 0 is the root pyramid above: one complete level window over
 	// the whole addressable domain, so every world position resolves, at a granularity of kilometres
-	// per page. 1 is HDRP's per-unit guarantee: the coarsest level that covers each *visible* page,
+	// per page. 1 is the reference's per-unit guarantee: the coarsest level that covers each *visible* page,
 	// requested unconditionally, so the fallback's granularity is the unit the fragment is looking at
 	// and a fallback page that lands or leaves changes its own rectangle rather than a continent.
 	//
@@ -861,7 +901,7 @@ struct Terrain3DVTState {
 	// what it cost. Since H3 step 1 it publishes the cap and refreshes the uniform, so
 	// `svt_cap_dirty_regions` is the property `vt_svt_coverage` asserts and is zero because the
 	// change marks nothing. Read them from `get_vt_settings()`; see
-	// docs/vt_hdrp_avt_alignment.md sections 4/H3 and 7.
+	// docs/vt_reference_avt_alignment.md sections 4/H3 and 7.
 	uint64_t svt_cap_changes = 0;
 	uint64_t svt_cap_dirty_regions = 0;
 	double svt_cap_change_ms = 0.0;
@@ -875,6 +915,11 @@ struct Terrain3DVTState {
 	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
 	// 0 when the distance-selected set fit. Diagnostics and tests only.
 	int svt_floor_level = 0;
+	// The capacity that decision was made against: the pool left once the pinned roots have taken
+	// theirs. Published beside the floor because the floor is a function of it - a reader cannot
+	// tell "no pressure" from "plenty of room" without both, and a test that asks about the floor
+	// has to fix this number to be asking a question with an answer.
+	int svt_detail_capacity = 0;
 	// Breakdown of the far field's worst pass, published as `svt_stats` and attributed to
 	// `svt_worst_ms`. The near field has `avt_sector_stats`; without the same for the far
 	// field a peak in `svt_cpu_ms` could not be told apart between the visible-footprint
@@ -919,6 +964,9 @@ struct Terrain3DVTState {
 	// measures is the bookkeeping between the far-field phase and the bake - microseconds, never a
 	// phase's own cost. See Terrain3D::__physics_process() for why the pass went.
 	double vt_service_ms = 0.0;
+	// The ring phase. It is reported beside the service's phases but it is not one of them: no ring
+	// touches the shared pool, so this is the only phase that is pure production.
+	double vt_clipmap_ms = 0.0;
 	double vt_avt_ms = 0.0;
 	double vt_svt_ms = 0.0;
 	double vt_topup_ms = 0.0;

@@ -41,6 +41,18 @@ const TURN_STEP := 6.0 # Degrees per frame: ten times a fast mouse swipe.
 # whole re-plan chain, and the working set never settles. A normal fast turn is a few tens of
 # degrees per second, which is what this measures.
 const TURN_STEP_SLOW := 1.5
+# How close to the camera the per-cell readiness report samples, in metres. A point this close has a
+# pixel footprint of a few millimetres, so anything answered at 0.02 m per texel or coarser is a
+# visible patch rather than detail.
+const NEAR_PROBE_RADIUS := 16.0
+# The bound the report asserts. A cell's whole-cell page is 64 m of world in one 256-texel page, i.e.
+# 0.25 m per texel, and two cells at the same distance must not differ by a whole level of the
+# pyramid: one refined and its neighbour left at the root. Ordering the plan's walk by page span
+# instead of by distance or local mip descends every cell one world level before any cell descends
+# two, which is what this bound checks. It is deliberately not the pixel footprint: a complete
+# quadtree chain to a few millimetres costs 1+4+16+... entries per cell and the plan holds ~128 for
+# the whole reach, so the reachable contract is uniformity, not full detail everywhere.
+const NEAR_TEXEL_BOUND := 0.2
 const SWEEP_FRAMES := 60 # One full revolution.
 const SAMPLE_SIZE := Vector2i(160, 90)
 const SETTLE_FRAMES := 300
@@ -305,6 +317,216 @@ func report(label: String) -> void:
 	require(total_vt_ms / float(frames) < VT_SECTION_BUDGET_MS,
 			"%s turn VT streaming averaged %.4f ms, over the %.2f ms three-phase section budget" % [label, total_vt_ms / float(frames), VT_SECTION_BUDGET_MS])
 
+# The finest page that is *ready* and covers one world point, and whether only the coarse tier covers
+# it. This is the reading the per-cell blur report is made of: a point a few metres away that has no
+# ready fine page is a point the shader draws from the coarse grid or from its cell's whole-cell page.
+func finest_ready_at(p: Vector2) -> Dictionary:
+	var best := {"texel": 1e9, "page_world": -1.0, "coarse_only": true, "pages": 0}
+	var page_size := float(terrain.get_surface_vt().get_page_size())
+	for record: Dictionary in terrain.get_vt_pages():
+		if not bool(record.get("ready", false)):
+			continue
+		var rect: Rect2 = record.get("world_rect", Rect2())
+		if not rect.has_area() or not rect.has_point(p):
+			continue
+		var coarse := false
+		var fine := false
+		for owner: Dictionary in record.get("owners", []):
+			if String(owner.get("owner_type", "")) != "avt":
+				continue
+			if owner.get("sector", Vector2i.ZERO) == Vector2i(-2147483648, -2147483648):
+				coarse = true
+			else:
+				fine = true
+		var texel := rect.size.x / page_size
+		if texel < float(best["texel"]):
+			best["texel"] = texel
+			best["page_world"] = rect.size.x
+			best["coarse_only"] = not fine
+		if fine:
+			best["pages"] = int(best["pages"]) + 1
+	return best
+
+
+# Every cell point within `NEAR_PROBE_RADIUS` of the camera, and what actually answers it once the
+# view has settled. Prints one line per sample so a coarse patch beside a sharp one is visible as
+# numbers rather than as an impression, and asserts the property the report exists to check: ground
+# this close must be answered by a ready *fine* page, not by the coarse grid or a whole-cell page.
+func near_ready_report() -> void:
+	var origin := camera.position
+	var page_size := float(terrain.get_surface_vt().get_page_size())
+	# The two explanations the point report cannot tell apart: the plan never asked for the finer
+	# pages, or it asked and the pool could not give them a slot. `plan_level_mips` and the missing
+	# counts answer the first, the pool's own counters answer the second.
+	var settings_now: Dictionary = terrain.get_vt_settings()
+	var avt: Dictionary = settings_now.get("avt_sector_stats", {})
+	var pool: Dictionary = terrain.get_surface_vt().get_stats()
+	print("VT_TURNBUDGET near plan requested=", avt.get("requested_physical_pages", -1),
+			" sampled=", avt.get("sampled_pages", -1), " missing=", avt.get("visible_missing_pages", -1),
+			" pending=", avt.get("visible_pending_pages", -1),
+			" dropped=", avt.get("plan_dropped", -1), " carried=", avt.get("plan_carried", -1),
+			" slot_wait=", avt.get("produce_slot_wait", -1), " source_wait=", avt.get("produce_source_wait", -1))
+	print("VT_TURNBUDGET near level_mips=", avt.get("plan_level_mips", []))
+	# The plan's own size against what it was allowed, and where its pages sit in world resolution.
+	# The span histogram says which limiter stopped the walk: a budget left unused means the demand
+	# gate stopped it, a budget spent means the plan is too small for the resolution it is being asked
+	# for - and those two have different fixes.
+	var spans := {}
+	for record: Dictionary in terrain.get_vt_pages():
+		if not bool(record.get("ready", false)):
+			continue
+		var fine := false
+		for owner: Dictionary in record.get("owners", []):
+			if String(owner.get("owner_type", "")) == "avt" and owner.get("sector", Vector2i.ZERO) != Vector2i(-2147483648, -2147483648):
+				fine = true
+		if not fine:
+			continue
+		var rect: Rect2 = record.get("world_rect", Rect2())
+		var key := "%.2f" % (rect.size.x / page_size)
+		spans[key] = int(spans.get(key, 0)) + 1
+	var span_keys := spans.keys()
+	span_keys.sort_custom(func(a, b): return float(a) < float(b))
+	var span_text := ""
+	for k: String in span_keys:
+		span_text += "%s m/texel x%d  " % [k, int(spans[k])]
+	print("VT_TURNBUDGET near budget=", avt.get("plan_budget", -1), " pool=", avt.get("pool_pages", -1),
+			" allowance=", avt.get("allowance", -1), " used=", avt.get("requested_physical_pages", -1),
+			" coarse_pages=", avt.get("avt_coarse_pages", -1))
+	print("VT_TURNBUDGET near spans ", span_text)
+	print("VT_TURNBUDGET near pool page_count=", pool.get("page_count", -1), " free=", pool.get("free_count", -1),
+			" evict=", pool.get("evict_count", -1), " miss=", pool.get("miss_count", -1),
+			" protected=", pool.get("protected_count", -1), " reserved=", pool.get("reserved_count", -1),
+			" reserved_blocked=", pool.get("reserved_block_count", -1),
+			" protected_blocked=", pool.get("protected_block_count", -1))
+	var coarse_texel := 1.0
+	# The settled reading, then the same readings after a small move: the reported symptom is a patch
+	# changing as a whole when the camera moves, so the contract has to be checked after one.
+	var before := near_scan(true)
+	camera.position.z -= 3.0
+	for frame in 60:
+		await tick(false)
+	var after := near_scan(false)
+	print("VT_TURNBUDGET near move before_worst=%.5f after_worst=%.5f before_unanswered=%d after_unanswered=%d" % [
+			float(before["worst"]), float(after["worst"]), int(before["unanswered"]), int(after["unanswered"])])
+	var regressed := 0
+	var worst_ratio := 0.0
+	for key: String in before["offsets"].keys():
+		if not after["offsets"].has(key):
+			continue
+		var was := float(before["offsets"][key])
+		var now := float(after["offsets"][key])
+		worst_ratio = maxf(worst_ratio, now / maxf(was, 1e-9))
+		if now > was * 2.0 + 1e-6:
+			regressed += 1
+	print("VT_TURNBUDGET near move regressed_points=", regressed, " worst_ratio=%.2f" % worst_ratio)
+	# The turn half of the same contract: a cell that leaves the frustum on a small yaw is the case the
+	# plan's own per-cell answer could starve, and the symptom is that it comes back as a coarse patch.
+	turn(6.0)
+	for frame in 60:
+		await tick(false)
+	var turned := near_scan(false)
+	var turn_regressed := 0
+	var turn_ratio := 0.0
+	for key: String in before["offsets"].keys():
+		if not turned["offsets"].has(key):
+			continue
+		var was := float(before["offsets"][key])
+		var now := float(turned["offsets"][key])
+		turn_ratio = maxf(turn_ratio, now / maxf(was, 1e-9))
+		if now > was * 2.0 + 1e-6:
+			turn_regressed += 1
+	print("VT_TURNBUDGET near turn after_worst=%.5f after_unanswered=%d regressed_points=%d worst_ratio=%.2f" % [
+			float(turned["worst"]), int(turned["unanswered"]), turn_regressed, turn_ratio])
+	require(int(turned["unanswered"]) == 0,
+			"after a 6 degree turn, %d of %d points within %d m of the camera had no ready fine page finer than %.3f m (worst texel %.5f m)" % [
+				int(turned["unanswered"]), int(turned["samples"]), int(NEAR_PROBE_RADIUS), NEAR_TEXEL_BOUND, float(turned["worst"])])
+	require(turn_regressed == 0,
+			"%d points lost a whole level of near-field resolution after a 6 degree turn (worst ratio %.2f)" % [
+				turn_regressed, turn_ratio])
+	print("VT_TURNBUDGET near summary samples=", int(before["samples"]), " unanswered=", int(before["unanswered"]),
+			" worst_texel_m=%.5f" % float(before["worst"]), " bound_m=%.3f" % NEAR_TEXEL_BOUND,
+			" page_size=", page_size, " coarse_texel_m=%.5f" % coarse_texel)
+	require(int(before["samples"]) > 0, "the near-field probe sampled no point")
+	require(int(before["unanswered"]) == 0,
+			"%d of %d points within %d m of the camera had no ready fine page finer than %.3f m (worst texel %.5f m): a cell beside the frustum's edge is left at its whole-cell page" % [
+				int(before["unanswered"]), int(before["samples"]), int(NEAR_PROBE_RADIUS), NEAR_TEXEL_BOUND, float(before["worst"])])
+	require(int(after["unanswered"]) == 0,
+			"after a 3 m move, %d of %d points within %d m of the camera had no ready fine page finer than %.3f m (worst texel %.5f m)" % [
+				int(after["unanswered"]), int(after["samples"]), int(NEAR_PROBE_RADIUS), NEAR_TEXEL_BOUND, float(after["worst"])])
+	require(regressed == 0,
+			"%d points lost a whole level of near-field resolution after a 3 m camera move (worst ratio %.2f): a patch changed as a whole instead of following the view" % [
+				regressed, worst_ratio])
+
+
+# One pass of the near-field point scan. The per-offset finest ready texel is returned so two scans can
+# be compared point by point: a patch that sharpens or blurs as a whole when the camera moves is the
+# symptom this measures, and it shows up as points whose texel doubles while their neighbours do not.
+func near_scan(verbose: bool) -> Dictionary:
+	var origin := camera.position
+	var preview := terrain.get_avt_layout_preview(camera)
+	var result := {"samples": 0, "unanswered": 0, "worst": 0.0, "offsets": {}}
+	for dz in range(-3, 4):
+		for dx in range(-3, 4):
+			var p := Vector2(origin.x + float(dx) * 4.0, origin.z + float(dz) * 4.0)
+			if p.distance_to(Vector2(origin.x, origin.z)) > NEAR_PROBE_RADIUS:
+				continue
+			result["samples"] = int(result["samples"]) + 1
+			var at := finest_ready_at(p)
+			var texel := float(at["texel"])
+			result["worst"] = maxf(float(result["worst"]), texel)
+			result["offsets"]["%d,%d" % [dx, dz]] = texel
+			var key := Vector2i((p / 64.0).floor())
+			var level := -1
+			var visible := false
+			for cell: Dictionary in preview.get("sectors", []):
+				var rect: Rect2 = cell.get("rect", Rect2())
+				if rect.has_point(p):
+					level = int(cell.get("level", -1))
+					visible = bool(cell.get("visible", false))
+					break
+			if verbose:
+				print("VT_TURNBUDGET near point=", p, " cell=", key, " cell_level=", level,
+						" cell_visible=", visible, " finest_texel_m=%.5f" % texel,
+						" page_world=%.1f" % float(at["page_world"]), " fine_pages=", int(at["pages"]),
+						" coarse_only=", bool(at["coarse_only"]))
+			if bool(at["coarse_only"]) or texel > NEAR_TEXEL_BOUND:
+				result["unanswered"] = int(result["unanswered"]) + 1
+	return result
+
+
+# Temporal stability of a grazing view. A stationary camera must not shimmer: the reported symptom is
+# distant sloped ground flickering, which is what sampling a mip finer than the view can carry looks
+# like frame to frame. Measured as the mean absolute per-pixel change between consecutive frames, with
+# the distant (upper) and near (lower) screen halves kept apart so one cannot hide behind the other.
+func stability_report() -> void:
+	turn(0.0)
+	for frame in 40:
+		await tick(false)
+	var previous: Image
+	var far_sum := 0.0
+	var near_sum := 0.0
+	var far_worst := 0.0
+	var pairs := 0
+	for frame in 6:
+		await tick(false)
+		var image := root.get_texture().get_image()
+		image.resize(SAMPLE_SIZE.x, SAMPLE_SIZE.y, Image.INTERPOLATE_BILINEAR)
+		if previous != null:
+			pairs += 1
+			for y in SAMPLE_SIZE.y:
+				for x in SAMPLE_SIZE.x:
+					var d := absf(image.get_pixel(x, y).r - previous.get_pixel(x, y).r)
+					if y < SAMPLE_SIZE.y / 2:
+						far_sum += d
+						far_worst = maxf(far_worst, d)
+					else:
+						near_sum += d
+		previous = image
+	var divisor := float(SAMPLE_SIZE.x * SAMPLE_SIZE.y / 2) * float(maxi(1, pairs))
+	print("VT_TURNBUDGET stability pairs=", pairs, " far_mean=%.6f" % (far_sum / divisor),
+			" far_worst=%.4f" % far_worst, " near_mean=%.6f" % (near_sum / divisor))
+
+
 func run() -> void:
 	var args := OS.get_cmdline_user_args()
 	if args.size() > 1:
@@ -366,6 +588,9 @@ func run() -> void:
 			" cdlod=", terrain.get_cdlod_stats())
 	require(int(settled.get("producer", {}).get("ready_pages", 0)) > 0, "the settle phase produced no material page")
 	require(int(terrain.get_cdlod_stats().get("selected_patches", 0)) > 0, "CDLOD selected no patch")
+	# What the settled view actually has near the camera, cell by cell, before anything is measured.
+	await near_ready_report()
+	await stability_report()
 
 	# Warm sweep: report what the turn paints, then measure what it costs. A page that is
 	# late while the camera sweeps fast is shown as the diagnostic on purpose - the

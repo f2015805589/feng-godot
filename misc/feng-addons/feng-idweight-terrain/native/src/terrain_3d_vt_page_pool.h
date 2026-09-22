@@ -46,6 +46,11 @@ struct Terrain3DVTPageOwner {
 	int virtual_y = 0;
 	int mip = 0;
 	bool world_space = false;
+	// A page the addressing treats as a guarantee rather than as demand: it is never chosen as an
+	// eviction victim, so its owner's residency is a function of configuration instead of of what
+	// the view asks for and of the production order. The near field's fallback tier is the owner
+	// that sets this. See `docs/avt_addressing_redesign.md` rules R2 and R3.
+	bool reserved = false;
 };
 
 // Shared physical residency state for the near and far virtual texture views.
@@ -87,8 +92,39 @@ struct Terrain3DVTPagePool {
 	int alloc_count = 0;
 	int evict_count = 0;
 	int protected_block_count = 0;
+	// Times a slot request found no victim because the only candidates left were reserved pages.
+	// It is the reservation's own pressure reading: non-zero means the upgrade set is competing for
+	// slots the fallback tier is holding, and zero means the reservation is not the binding term.
+	int reserved_block_count = 0;
 	int aborted_acquires = 0;
 	bool initialized = false;
+
+	// Whether any owner of this slot is a reserved page, which is what keeps the slot out of the
+	// victim search. A slot can carry several owners - a page a sector grew into and the fallback
+	// entry that named it - so the question is asked of the set, not of one entry.
+	bool has_reserved_owner(const uint32_t p_slot) const {
+		if (p_slot >= slot_owners.size()) {
+			return false;
+		}
+		for (const Terrain3DVTPageOwner &owner : slot_owners[p_slot]) {
+			if (owner.reserved) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// How many slots currently hold a reserved page. The fallback tier's residency, as opposed to
+	// how often a request was blocked by it.
+	int count_reserved_slots() const {
+		int count = 0;
+		for (uint32_t slot = 0; slot < uint32_t(slot_owners.size()); ++slot) {
+			if (has_reserved_owner(slot)) {
+				++count;
+			}
+		}
+		return count;
+	}
 
 	bool grow(int p_page_count);
 	bool initialize(int p_page_size, int p_page_border, int p_page_count,

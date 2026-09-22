@@ -384,7 +384,7 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Which level a far-field page is *requested* at. Two implementations today and a third planned
-// (H1's pixel footprint, `docs/vt_hdrp_avt_alignment.md`), which is why the decision is a value the
+// (H1's pixel footprint, `docs/vt_reference_avt_alignment.md`), which is why the decision is a value the
 // callers hold rather than a branch each of them re-tests against the live settings: the demand pass
 // that resolves a page's level and the shader that samples it have to agree, and a third kind must
 // not mean a third copy of the arithmetic.

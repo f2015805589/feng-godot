@@ -67,6 +67,60 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_streaming_enabled", "enabled"), &Terrain3D::set_streaming_enabled);
 	ClassDB::bind_method(D_METHOD("is_streaming_enabled"), &Terrain3D::is_streaming_enabled);
 	ClassDB::bind_method(D_METHOD("get_surface_vt"), &Terrain3D::get_surface_vt);
+	// The delivery matrix: which method carries which channel group in which distance band. The
+	// generic pair takes the row and column so a script can walk the four cells; the four
+	// properties below are the ones a scene and the dock write, and each is one cell. See
+	// docs/vt_delivery_assembly.md for the groups, the methods and the assembly rule.
+	ClassDB::bind_method(D_METHOD("set_vt_delivery", "tier", "group", "delivery"), &Terrain3D::set_vt_delivery);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery", "tier", "group"), &Terrain3D::get_vt_delivery);
+	ClassDB::bind_method(D_METHOD("set_vt_delivery_near_material", "delivery"), &Terrain3D::set_vt_delivery_near_material);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery_near_material"), &Terrain3D::get_vt_delivery_near_material);
+	ClassDB::bind_method(D_METHOD("set_vt_delivery_near_height", "delivery"), &Terrain3D::set_vt_delivery_near_height);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery_near_height"), &Terrain3D::get_vt_delivery_near_height);
+	ClassDB::bind_method(D_METHOD("set_vt_delivery_far_material", "delivery"), &Terrain3D::set_vt_delivery_far_material);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery_far_material"), &Terrain3D::get_vt_delivery_far_material);
+	ClassDB::bind_method(D_METHOD("set_vt_delivery_far_height", "delivery"), &Terrain3D::set_vt_delivery_far_height);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery_far_height"), &Terrain3D::get_vt_delivery_far_height);
+	// Whether any cell selected a method, by its value. It is the one question a debug view asks
+	// before it draws: a method no cell selects owns no layout, so the view hides itself instead of
+	// polling a preview that would refuse.
+	ClassDB::bind_method(D_METHOD("is_vt_delivery_used", "method"), &Terrain3D::is_vt_delivery_used);
+	// The matrix's acceptance rule, which a panel needs before it offers a choice: a method this
+	// build cannot deliver for a group is refused by `set_vt_delivery()`, so the row is disabled from
+	// this answer (and the reason below is what its tooltip says) rather than from a list the panel
+	// keeps of its own.
+	ClassDB::bind_method(D_METHOD("is_vt_delivery_supported", "group", "method"), &Terrain3D::is_vt_delivery_supported);
+	ClassDB::bind_method(D_METHOD("get_vt_delivery_unsupported_reason", "group", "method"), &Terrain3D::get_vt_delivery_unsupported_reason);
+	// The clipmap ring's shape, its per-tick production budget, and the reads a test or the dock needs
+	// to compare what the ring holds against the height map it was produced from. The ring is built
+	// by the assembly rule the first time a cell selects `Clipmap` for a group, and `get_vt_clipmap_arm()`
+	// is the same state in the form the shader arm is bound from.
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_size", "size"), &Terrain3D::set_vt_clipmap_size);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_size"), &Terrain3D::get_vt_clipmap_size);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_levels", "levels"), &Terrain3D::set_vt_clipmap_levels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_levels"), &Terrain3D::get_vt_clipmap_levels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_base_world", "metres"), &Terrain3D::set_vt_clipmap_base_world);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_base_world"), &Terrain3D::get_vt_clipmap_base_world);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_budget_texels", "texels"), &Terrain3D::set_vt_clipmap_budget_texels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_budget_texels"), &Terrain3D::get_vt_clipmap_budget_texels);
+	ClassDB::bind_method(D_METHOD("sample_vt_clipmap", "group", "world_xz", "channel"), &Terrain3D::sample_vt_clipmap, DEFVAL(0));
+	// Whether a ring object exists, which is what the ring's debug view and its native preview are
+	// gated on: a ring exists because a cell selected the method or because the entry below built one
+	// to measure the mechanism.
+	ClassDB::bind_method(D_METHOD("has_vt_clipmap_ring"), &Terrain3D::has_vt_clipmap_ring);
+	// The mechanism's own entry: build the group's ring if needed, run the phase the tick would run
+	// for it, and return the texels it produced (-1 when no ring can be built). The tick's own phase
+	// runs whenever a cell names the method, so this is the door a reading takes when it wants the
+	// mechanism with every cell `Direct`.
+	ClassDB::bind_method(D_METHOD("debug_update_vt_clipmap", "group"), &Terrain3D::debug_update_vt_clipmap);
+	ClassDB::bind_method(D_METHOD("get_clipmap_layout_preview"), &Terrain3D::get_clipmap_layout_preview);
+	// The ring in the form the height arm is bound from: per-level centres, rings and validity, the
+	// level rule, and the texture the arm samples. The shader's copy of the ring's addressing and this
+	// one are the same numbers, so a test reads the arm's inputs rather than the shader's arithmetic.
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_arm", "group"), &Terrain3D::get_vt_clipmap_arm);
+	// An edit changed the source under a world AABB. The one place every editor edit reports itself
+	// calls it, and it is public because a script that writes heights through the data API can.
+	ClassDB::bind_method(D_METHOD("invalidate_vt_clipmap_area", "area"), &Terrain3D::invalidate_vt_clipmap_area);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_enabled", "enabled"), &Terrain3D::set_surface_vt_enabled);
 	ClassDB::bind_method(D_METHOD("is_surface_vt_enabled"), &Terrain3D::is_surface_vt_enabled);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_page_count", "count"), &Terrain3D::set_surface_vt_page_count);
@@ -340,7 +394,20 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "streamer", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE, "Terrain3DStreamer"), "", "get_streamer");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "streaming_enabled"), "set_streaming_enabled", "is_streaming_enabled");
 	ADD_GROUP("Surface VT", "");
+	// The group reads in the order the layer is assembled: the settings that decide what exists, the
+	// delivery matrix that does the deciding, then one subgroup per method it can select, then the
+	// physical pages those methods fill. The matrix is the first thing *inside* the settings rather
+	// than a sibling subgroup because it is what the rest of them configure: a method no cell selects
+	// owns no view, no array family, no uniform and no shader arm, so nothing below it is built for a
+	// method no row names. The four cells are the two distance bands by the two channel groups -
+	// diffuse+normal is one group (with the control payload it is baked from) and height is the
+	// other; `Direct` is the pure region-array path and `Clipmap` the toroidal level ring. See
+	// docs/vt_delivery_assembly.md.
 	ADD_SUBGROUP("VT Setting", "vt_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_material", "get_vt_delivery_near_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_height", "get_vt_delivery_near_height");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_material", "get_vt_delivery_far_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_height", "get_vt_delivery_far_height");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
@@ -382,6 +449,15 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_fade_frames", PROPERTY_HINT_RANGE, "0,60,1"), "set_vt_page_fade_frames", "get_vt_page_fade_frames");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
+	// The ring's shape, its own subgroup between the settings that select it and the methods that
+	// share the page pool with it. `levels` above 12 is 4096 texels an axis on the coarsest level,
+	// which is already past what a terrain's own reach needs; the mechanism clamps to 16 and refuses
+	// a size it cannot build.
+	ADD_SUBGROUP("Clipmap", "vt_clipmap_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_size", PROPERTY_HINT_RANGE, "8,4096,8"), "set_vt_clipmap_size", "get_vt_clipmap_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "1.0,4096.0,1.0"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");
@@ -405,8 +481,10 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_size", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_size", "get_surface_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_border", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_page_border", "get_surface_vt_page_border");
 	// The near field's anisotropic filtering, as a multiplier; 0 follows the viewport's filtering
-	// level. What actually reaches the shader and the planner is this request clamped by the page
-	// gutter, which is `get_vt_settings()["vt_anisotropy_effective"]`; see
+	// level. What actually reaches the shader and the planner is this request clamped by the
+	// viewport's own filtering level (the only place Godot takes a sampler's tap count from) and by
+	// the page gutter, which is `get_vt_settings()["avt_anisotropy_effective"]`; the three readings
+	// are `avt_anisotropy_sampler` / `avt_anisotropy_requested` / `avt_anisotropy_effective`. See
 	// docs/vt_sampling_review.md. The hint's own wording is the only place a caller sees "0 is
 	// auto", so it carries it.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_anisotropy", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_vt_anisotropy", "get_surface_vt_anisotropy");
@@ -448,7 +526,7 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_max_mip"), "set_surface_svt_max_mip", "get_surface_svt_max_mip");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_svt_distance", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_svt_distance", "get_surface_svt_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_root_mips", PROPERTY_HINT_RANGE, "0,16,1"), "set_surface_svt_root_mips", "get_surface_svt_root_mips");
-	// 0 = the global root pyramid, 1 = HDRP's per-unit coarsest-page guarantee. Alternatives, not
+	// 0 = the global root pyramid, 1 = the reference's per-unit coarsest-page guarantee. Alternatives, not
 	// layers; see `surface_svt_fallback_policy` in terrain_3d_vt_state.h and H2 of the alignment doc.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_svt_fallback_policy", PROPERTY_HINT_RANGE, "0,1,1"), "set_surface_svt_fallback_policy", "get_surface_svt_fallback_policy");
 	// One entry per world mip level, in metres: the largest camera distance still

@@ -1,9 +1,10 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Small, texture-free AVT layout preview for the Terrain3D Inspector.
+# Small, texture-free AVT layout preview for the Terrain3D Inspector. It extends the base both layout
+# previews share (`vt_layout_preview.gd`) for the terrain reference, the availability boolean and the
+# poll interval; what is left here is the AVT half - the sector scan and the drawing.
 @tool
-extends Control
+extends "res://addons/feng-idweight-terrain/src/vt_layout_preview.gd"
 
-const POLL_INTERVAL_SEC := 0.20
 const MAP_MARGIN := 8.0
 const MAP_TOP := 28.0
 const MAP_GAP := 6.0
@@ -16,12 +17,11 @@ const MAX_WORLD_GRID_CELLS := 4096
 const MAX_SECTOR_RECTS := 2048
 const MAX_COARSE_PAGE_RECTS := 2048
 const MAX_RESOLUTION_LEVELS := 16
+## `TerrainVT::Delivery::AVT`, which is also the value of the property that selects it.
+const DELIVERY_AVT := 1
 
-var _terrain_ref: WeakRef
-var _terrain_instance_id: int = 0
 var _snapshot: Dictionary = {}
 var _status := "Waiting for an editor camera"
-var _last_poll_sec := -INF
 
 
 func _ready() -> void:
@@ -61,31 +61,42 @@ func _minimum_height_for_width(p_width: float) -> float:
 	return ceil(map_side + MAP_TOP + LEGEND_HEIGHT + STATS_HEIGHT + MAP_GAP * 2.0 + MAP_MARGIN)
 
 
-## Keep only a weak reference: Inspector controls can outlive a selected node
-## while the scene is being reloaded or the node is freed.
-func set_terrain(p_terrain: Object) -> void:
-	if p_terrain != null and is_instance_valid(p_terrain):
-		_terrain_ref = weakref(p_terrain)
-		_terrain_instance_id = p_terrain.get_instance_id()
-	else:
-		_terrain_ref = null
-		_terrain_instance_id = 0
+## Drops the last terrain's layout, so a host never draws it over the new terrain's name.
+func _reset_preview_state() -> void:
 	_snapshot.clear()
 	_status = "Terrain unavailable"
-	_last_poll_sec = -INF
-	queue_redraw()
 
 
 func _process(_p_delta: float) -> void:
-	# Inspector sections stop being visible when their foldout is collapsed. Do
-	# not even poll the native API in that state.
-	if not visible or not is_visible_in_tree():
-		return
 	var now_sec := float(Time.get_ticks_msec()) / 1000.0
 	if now_sec - _last_poll_sec < POLL_INTERVAL_SEC:
 		return
 	_last_poll_sec = now_sec
+	var terrain := _get_terrain()
+	if terrain == null:
+		_set_available(false)
+		_clear_preview("Terrain unavailable")
+		return
+	# The gate is one boolean and runs whether or not the view is on screen, because the matrix can
+	# select AVT while the section is folded and a gate that stopped would never notice. The *scan* -
+	# the half that walks the visible grid and builds a record per sector - still waits for
+	# visibility, which is the rule this preview has always followed.
+	_set_available(_gate(terrain))
+	if not _available:
+		if not _snapshot.is_empty():
+			_clear_preview("")
+		return
+	if not is_visible_in_tree():
+		return
 	_refresh_preview()
+
+
+func _gate(p_terrain: Object) -> bool:
+	# A terrain that cannot answer is not gated: the delivery matrix is what says a method is unused,
+	# and a stub (or a build that predates the matrix) has nothing to conclude from.
+	if not p_terrain.has_method("is_vt_delivery_used"):
+		return true
+	return bool(p_terrain.call("is_vt_delivery_used", DELIVERY_AVT))
 
 
 func _refresh_preview() -> void:
@@ -115,17 +126,6 @@ func _refresh_preview() -> void:
 	_snapshot = layout.duplicate(true)
 	_set_status("")
 	queue_redraw()
-
-
-func _get_terrain() -> Object:
-	if _terrain_ref == null:
-		return null
-	var terrain: Object = _terrain_ref.get_ref()
-	if terrain == null or not is_instance_valid(terrain):
-		return null
-	if _terrain_instance_id != 0 and terrain.get_instance_id() != _terrain_instance_id:
-		return null
-	return terrain
 
 
 func _get_active_camera(p_terrain: Object) -> Camera3D:

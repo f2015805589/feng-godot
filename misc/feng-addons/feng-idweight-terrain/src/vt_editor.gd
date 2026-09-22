@@ -13,10 +13,21 @@ extends Window
 class_name TerrainVTEditor
 
 const OVERVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_world_overview.gd")
+const CLIPMAP_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd")
 const OVERVIEW_EDGE: int = 768
 const INVALID_LOCATION := Vector2i(2147483647, 2147483647)
 const SVT_AUTO_BAKE_PROPERTY: StringName = &"surface_svt_auto_bake"
 const BAKE_STATUS_POLL_INTERVAL: float = 0.25
+# The delivery methods in the order of the native `TerrainVT::Delivery` enum, which is also the
+# item id the OptionButtons store: the widget, the property and the C++ value are one number, so a
+# method added natively appears here as one more string and no mapping has to be kept in step.
+const DELIVERY_METHODS: Array[String] = ["Direct (pure RVT)", "AVT", "Clipmap", "SVT"]
+const DELIVERY_BANDS: Array[String] = ["near", "far"]
+const DELIVERY_GROUPS: Array[String] = ["material", "height"]
+const DELIVERY_GROUP_LABELS: Dictionary = {"material": "Diffuse + normal", "height": "Height"}
+# The method these rows are about, by the native enum's value (`Clipmap`): the rows read the published
+# capability rather than keeping a list of their own.
+const DELIVERY_CLIPMAP: int = 2
 
 var plugin: EditorPlugin
 var terrain: Object
@@ -38,6 +49,15 @@ var mip_label: Label
 var baked_mip_selector: OptionButton
 
 var settings_panel: VBoxContainer
+var clipmap_panel: VBoxContainer
+var clipmap_debug_panel: VBoxContainer
+var clipmap_size_spin: SpinBox
+var clipmap_levels_spin: SpinBox
+var clipmap_base_spin: SpinBox
+var clipmap_budget_spin: SpinBox
+var clipmap_hint: Label
+var _clipmap_preview: Control
+var delivery_hint: Label
 var cdlod_panel: VBoxContainer
 var svt_panel: VBoxContainer
 var _cdlod: TerrainVTEditorCdlodPanel
@@ -57,8 +77,15 @@ var avt_band_grid: GridContainer
 var avt_band_spins: Array[SpinBox] = []
 var avt_density_hint: Label
 var avt_mode_option: OptionButton
-var avt_enabled_button: CheckButton
-var svt_enabled_button: CheckButton
+# The delivery matrix: one row per distance band, one column per channel group. Each cell is an
+# OptionButton whose item id is the native delivery value, so the widget stores the same number the
+# property does and no name lookup has to be kept in step. The four rows replace the old
+# "AVT runtime material" / "SVT persisted material" check boxes, which could only express one
+# method per tier for both groups at once.
+var delivery_near_material: OptionButton
+var delivery_near_height: OptionButton
+var delivery_far_material: OptionButton
+var delivery_far_height: OptionButton
 var svt_auto_bake_button: CheckButton
 var auto_bake_hint: Label
 var bake_button: Button
@@ -160,6 +187,8 @@ func set_terrain(p_terrain: Object) -> void:
 	if not _built:
 		return
 	_clear_preview()
+	if _clipmap_preview != null and is_instance_valid(_clipmap_preview):
+		_clipmap_preview.set_terrain(terrain)
 	if hierarchy:
 		hierarchy.deselect_all()
 		var root := hierarchy.get_root()
@@ -292,6 +321,10 @@ func _build_ui() -> void:
 	details_box.add_child(details_label)
 	settings_panel = _build_settings_panel()
 	details_box.add_child(settings_panel)
+	clipmap_panel = _build_clipmap_panel()
+	details_box.add_child(clipmap_panel)
+	clipmap_debug_panel = _build_clipmap_debug_panel()
+	details_box.add_child(clipmap_debug_panel)
 	svt_panel = _build_svt_panel()
 	details_box.add_child(svt_panel)
 	cdlod_panel = VBoxContainer.new()
@@ -398,6 +431,18 @@ func _build_hierarchy() -> void:
 	settings_child.set_text(0, "Atlas config")
 	settings_child.set_metadata(0, "settings")
 
+	# The methods, in the order the assembly rule reads them: the matrix is what selects a method and
+	# the ring's own shape sits directly after the settings that select it, ahead of the two views it
+	# shares the page pool with. The tree the user reads is the order the layer assembles in.
+	var clipmap := hierarchy.create_item(surface)
+	clipmap.set_text(0, "Clipmap")
+	clipmap.set_metadata(0, "clipmap")
+	clipmap.set_tooltip_text(0, "Toroidal ring of power-of-two levels, one ring per channel group")
+	clipmap.collapsed = false
+	var clipmap_levels := hierarchy.create_item(clipmap)
+	clipmap_levels.set_text(0, "Ring levels")
+	clipmap_levels.set_metadata(0, "clipmap")
+
 	var avt := hierarchy.create_item(surface)
 	avt.set_text(0, "AVT")
 	avt.set_metadata(0, "avt")
@@ -437,12 +482,22 @@ func _build_hierarchy() -> void:
 	var baked_all := hierarchy.create_item(pages)
 	baked_all.set_text(0, "Baked cell sources")
 	baked_all.set_metadata(0, "baked_pages")
+	# The ring is not paged, so it has no slot to list and nothing to preview from the GPU. What it
+	# has is its levels and the strips still queued, which is the one debug view that belongs beside
+	# the physical residency: both answer "what does this VT layer hold right now".
+	var clipmap_page := hierarchy.create_item(pages)
+	clipmap_page.set_text(0, "Clipmap ring")
+	clipmap_page.set_metadata(0, "clipmap_debug")
+	clipmap_page.set_tooltip_text(0, "The ring's levels and the rects it still has queued")
 
 
 func _build_settings_panel() -> VBoxContainer:
 	var panel := VBoxContainer.new()
 	panel.name = "VTSettings"
 	panel.visible = false
+	# The delivery matrix first, because it decides what the rest of this panel and the two method
+	# panels configure: a method no cell selects owns no view, no array, no uniform and no shader arm.
+	_build_delivery_rows(panel)
 	var grid := GridContainer.new()
 	grid.name = "SettingsGrid"
 	grid.columns = 2
@@ -540,16 +595,65 @@ func _build_settings_panel() -> VBoxContainer:
 	adaptive_button.tooltip_text = "Allow per-sector virtual resolution allocations to adapt while preserving overlapping cached pages"
 	adaptive_button.toggled.connect(_on_adaptive_toggled)
 	panel.add_child(adaptive_button)
-	avt_enabled_button = CheckButton.new()
-	avt_enabled_button.name = "AVTRuntimeMaterial"
-	avt_enabled_button.text = "AVT runtime material"
-	avt_enabled_button.toggled.connect(_on_view_enabled_toggled.bind("avt"))
-	panel.add_child(avt_enabled_button)
-	svt_enabled_button = CheckButton.new()
-	svt_enabled_button.name = "SVTPersistedMaterial"
-	svt_enabled_button.text = "SVT persisted material"
-	svt_enabled_button.toggled.connect(_on_view_enabled_toggled.bind("svt"))
-	panel.add_child(svt_enabled_button)
+	return panel
+
+
+# The ring's shape and its budget, in their own panel beside the settings that select it. Three of
+# the four are shape - they reconfigure every existing ring, which is why the setter resolves the
+# assembly - and the fourth is the per-tick production budget, which is not a shape at all: a ring
+# keeps its content and a value of 0 is a legal "produce nothing this tick".
+func _build_clipmap_panel() -> VBoxContainer:
+	var panel := VBoxContainer.new()
+	panel.name = "ClipmapSettings"
+	panel.visible = false
+	var grid := GridContainer.new()
+	grid.name = "ClipmapGrid"
+	grid.columns = 2
+	panel.add_child(grid)
+	grid.add_child(_make_setting_label("Level edge (texels)"))
+	clipmap_size_spin = _make_spin(8, 4096, 8)
+	clipmap_size_spin.name = "ClipmapSize"
+	clipmap_size_spin.tooltip_text = "Texels an axis on every level of the ring. It is not terrain metres: level 0 covers the base extent below in this many texels, and every coarser level doubles the extent and the texel size."
+	clipmap_size_spin.value_changed.connect(_on_clipmap_setting_changed.bind("size"))
+	grid.add_child(clipmap_size_spin)
+	grid.add_child(_make_setting_label("Levels"))
+	clipmap_levels_spin = _make_spin(1, 16, 1)
+	clipmap_levels_spin.name = "ClipmapLevels"
+	clipmap_levels_spin.tooltip_text = "How many levels the ring holds. Level l covers base_world * 2^l metres, so the coarsest level of n covers 2^(n-1) times the finest."
+	clipmap_levels_spin.value_changed.connect(_on_clipmap_setting_changed.bind("levels"))
+	grid.add_child(clipmap_levels_spin)
+	grid.add_child(_make_setting_label("Base extent (metres)"))
+	clipmap_base_spin = _make_spin(1.0, 4096.0, 1.0)
+	clipmap_base_spin.name = "ClipmapBaseWorld"
+	clipmap_base_spin.tooltip_text = "The metres the finest level covers. A texel of level l is base_world * 2^l / size metres wide, so at a 1 m vertex spacing a base of 256 m with 256 texels is 1 m per texel."
+	clipmap_base_spin.value_changed.connect(_on_clipmap_setting_changed.bind("base_world"))
+	grid.add_child(clipmap_base_spin)
+	grid.add_child(_make_setting_label("Budget (texels / tick)"))
+	clipmap_budget_spin = _make_spin(0, 1048576, 1024)
+	clipmap_budget_spin.allow_greater = true
+	clipmap_budget_spin.name = "ClipmapBudgetTexels"
+	clipmap_budget_spin.tooltip_text = "Channel texels all rings may produce in one tick. It is spent beside the page budget rather than out of it, because the ring does not touch the shared page pool; 0 holds every ring still."
+	clipmap_budget_spin.value_changed.connect(_on_clipmap_setting_changed.bind("budget"))
+	grid.add_child(clipmap_budget_spin)
+	clipmap_hint = Label.new()
+	clipmap_hint.name = "ClipmapHint"
+	clipmap_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	panel.add_child(clipmap_hint)
+	return panel
+
+
+# The VT Page's clipmap view, which is the same control the Inspector's VT Page section hosts: one
+# picture of the ring, two windows. The control hides itself when no delivery cell selects Clipmap,
+# so the panel needs no gate of its own.
+func _build_clipmap_debug_panel() -> VBoxContainer:
+	var panel := VBoxContainer.new()
+	panel.name = "ClipmapDebug"
+	panel.visible = false
+	_clipmap_preview = CLIPMAP_PREVIEW_SCRIPT.new()
+	_clipmap_preview.name = "ClipmapDebugPreview"
+	_clipmap_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_clipmap_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	panel.add_child(_clipmap_preview)
 	return panel
 
 
@@ -590,6 +694,113 @@ func _make_setting_label(p_text: String) -> Label:
 
 func _make_spin(p_min: float, p_max: float, p_step: float) -> SpinBox:
 	return TerrainVTEditorWidgets.make_spin(p_min, p_max, p_step)
+
+
+# The delivery matrix: two bands by two channel groups. A grid of four OptionButtons rather than
+# the two check boxes it replaces, because a check box can only say "on or off" for one method and
+# the whole point is that a group may be carried by AVT, by a clipmap, by SVT, or by nothing at all
+# (`Direct`, the region arrays). The hint spells out the consequence, which is a property of the
+# architecture and not visible in the widgets: a method no row selects is never built, and a method
+# this build cannot deliver is refused by the setter rather than accepted and rendered from
+# somewhere else.
+func _build_delivery_rows(p_panel: VBoxContainer) -> void:
+	delivery_hint = Label.new()
+	delivery_hint.name = "DeliveryHint"
+	delivery_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	delivery_hint.text = "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring. A method no row selects owns no object, no array and no shader code."
+	p_panel.add_child(delivery_hint)
+	var grid := GridContainer.new()
+	grid.name = "DeliveryGrid"
+	grid.columns = 3
+	grid.add_child(_make_setting_label("Band"))
+	for group in DELIVERY_GROUPS:
+		grid.add_child(_make_setting_label(DELIVERY_GROUP_LABELS[group]))
+	for band in DELIVERY_BANDS:
+		grid.add_child(_make_setting_label(band.capitalize()))
+		for group in DELIVERY_GROUPS:
+			var option := OptionButton.new()
+			option.name = "Delivery%s%s" % [band.capitalize(), group.capitalize()]
+			option.tooltip_text = "Delivery method for %s in the %s band." % [DELIVERY_GROUP_LABELS[group], band]
+			for method in DELIVERY_METHODS.size():
+				option.add_item(DELIVERY_METHODS[method], method)
+			option.item_selected.connect(_on_delivery_selected.bind(band, group))
+			grid.add_child(option)
+			_set_delivery_option(band, group, option)
+	p_panel.add_child(grid)
+
+
+func _set_delivery_option(p_band: String, p_group: String, p_option: OptionButton) -> void:
+	match "%s_%s" % [p_band, p_group]:
+		"near_material": delivery_near_material = p_option
+		"near_height": delivery_near_height = p_option
+		"far_material": delivery_far_material = p_option
+		"far_height": delivery_far_height = p_option
+
+
+func _delivery_option(p_band: String, p_group: String) -> OptionButton:
+	match "%s_%s" % [p_band, p_group]:
+		"near_material": return delivery_near_material
+		"near_height": return delivery_near_height
+		"far_material": return delivery_far_material
+		"far_height": return delivery_far_height
+	return null
+
+
+# Reads the four cells from the settings dictionary the native side publishes rather than from four
+# separate getters: one call, one snapshot, and a widget cannot show a state the rest of the panel
+# was not read with. A native build that predates the matrix has no keys and no property, and the
+# rows disable themselves instead of offering a choice the build cannot honour.
+#
+# Per method rather than per row: `delivery_supported` names the methods this build can deliver for
+# each group and `delivery_unsupported` the sentence for each one it cannot, so an option this build
+# has no arm for is disabled with the reason as its tooltip. The setter refuses the same pair, so a
+# disabled item is a visible half of one rule rather than a second copy of it.
+func _refresh_delivery_rows(p_settings: Dictionary) -> void:
+	var supported := _has_object_property(terrain, &"vt_delivery_near_material")
+	var allowed: Dictionary = p_settings.get("delivery_supported", {})
+	var refused: Dictionary = p_settings.get("delivery_unsupported", {})
+	for band in DELIVERY_BANDS:
+		for group in DELIVERY_GROUPS:
+			var option := _delivery_option(band, group)
+			if option == null:
+				continue
+			option.disabled = not supported
+			if not supported:
+				continue
+			_apply_delivery_availability(option, group, allowed, refused)
+			var value := int(p_settings.get("delivery_%s_%s" % [band, group], 0))
+			var index := option.get_item_index(value)
+			if index >= 0:
+				option.select(index)
+	if delivery_hint == null:
+		return
+	var text := "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring. A method no row selects owns no object, no array and no shader code."
+	for group in DELIVERY_GROUPS:
+		var reasons: Dictionary = refused.get(group, {})
+		for name: Variant in reasons:
+			text += "\nUnavailable here: %s %s: %s." % [DELIVERY_GROUP_LABELS[group], str(name), str(reasons[name])]
+	delivery_hint.text = text
+
+
+# Disables the items this build cannot deliver for the group, with the setter's own sentence as the
+# tooltip. A build that publishes no `delivery_supported` key (an older binary) keeps every item
+# enabled: the panel has nothing to say about it then, and the setter remains the authority.
+func _apply_delivery_availability(p_option: OptionButton, p_group: String, p_allowed: Dictionary, p_refused: Dictionary) -> void:
+	if not p_allowed.has(p_group):
+		return
+	var methods: Array = p_allowed.get(p_group, [])
+	var reasons: Dictionary = p_refused.get(p_group, {})
+	for method in DELIVERY_METHODS.size():
+		var index := p_option.get_item_index(method)
+		if index < 0:
+			continue
+		var deliverable := methods.has(method)
+		p_option.set_item_disabled(index, not deliverable)
+		if deliverable:
+			continue
+		var reason: String = str(reasons.get(DELIVERY_METHODS[method], "not available in this build"))
+		p_option.set_item_tooltip(index, "%s is not available for the %s group: %s" % [
+			DELIVERY_METHODS[method], DELIVERY_GROUP_LABELS[p_group].to_lower(), reason])
 
 
 func _refresh_all() -> void:
@@ -677,8 +888,8 @@ func _refresh_settings_controls() -> void:
 
 
 	adaptive_button.button_pressed = bool(settings.get("adaptive", false))
-	avt_enabled_button.button_pressed = bool(_call(terrain, "is_surface_vt_enabled"))
-	svt_enabled_button.button_pressed = bool(_call(terrain, "is_surface_svt_enabled"))
+	_refresh_delivery_rows(settings)
+	_refresh_clipmap_controls(settings)
 	var auto_bake_enabled := _get_svt_auto_bake()
 	svt_auto_bake_button.button_pressed = auto_bake_enabled
 	svt_auto_bake_button.disabled = not _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY)
@@ -688,6 +899,87 @@ func _refresh_settings_controls() -> void:
 		auto_bake_hint.text = "Automatic baking is paused during editor live preview. Close preview to resume, or use Bake All SVT Cells."
 	_refresh_svt_bands()
 	_updating_settings = false
+
+
+# The ring's shape and what it cost. Like the delivery rows, this reads the one snapshot the rest of
+# the panel was refreshed from, so a control cannot show a state the panel was not read with, and a
+# native build that predates the ring disables the four spins instead of offering a shape it cannot
+# build.
+func _refresh_clipmap_controls(p_settings: Dictionary) -> void:
+	if clipmap_panel == null or clipmap_size_spin == null:
+		return
+	var supported := _has_object_property(terrain, &"vt_clipmap_size")
+	if supported:
+		clipmap_size_spin.set_value_no_signal(float(p_settings.get("clipmap_size", 256)))
+		clipmap_levels_spin.set_value_no_signal(float(p_settings.get("clipmap_levels_setting", 8)))
+		clipmap_base_spin.set_value_no_signal(float(p_settings.get("clipmap_base_world", 256.0)))
+		clipmap_budget_spin.set_value_no_signal(float(p_settings.get("clipmap_budget_texels", 65536)))
+	clipmap_size_spin.editable = supported
+	clipmap_levels_spin.editable = supported
+	clipmap_base_spin.editable = supported
+	clipmap_budget_spin.editable = supported
+	clipmap_hint.text = _clipmap_hint_text(p_settings)
+
+
+# The ring's consequence, in the panel that configures it: what a level is, which group carries one,
+# and what the last update cost. Every number is read from the report rather than recomputed here, so
+# the hint and `get_vt_settings()` cannot disagree. The first thing it has to say is whether a ring
+# can exist at all: a ring is built the first time a cell selects `Clipmap` for a group, and selecting
+# `Near/Height` is the one cell this build can deliver, so a terrain whose height row is left on
+# `Direct` has no ring and the four spins below configure one that does not exist yet.
+func _clipmap_hint_text(p_settings: Dictionary) -> String:
+	if not _has_object_property(terrain, &"vt_clipmap_size"):
+		return "This Terrain3D build has no clipmap ring."
+	var levels := int(p_settings.get("clipmap_levels_setting", 0))
+	var base := float(p_settings.get("clipmap_base_world", 0.0))
+	var text := "Level l covers base * 2^l metres: at %d texels an axis the finest is %.1f m and the coarsest %.1f m. A level is addressed by arithmetic, so a move costs strips rather than a rebuild and the stored content never moves." % [
+			int(p_settings.get("clipmap_size", 0)), base, base * pow(2.0, float(maxi(0, levels - 1)))]
+	if not bool(p_settings.get("clipmap_ring", false)):
+		var supported: Dictionary = p_settings.get("delivery_supported", {})
+		var unsupported: Dictionary = p_settings.get("delivery_unsupported", {})
+		if (supported.get("height", []) as Array).has(DELIVERY_CLIPMAP):
+			text += "\nNo ring: no cell selects Clipmap yet, so nothing is built, ticked or uploaded. Select it in the height row above, or measure the mechanism through debug_update_vt_clipmap() (native/tests/vt_clipmap)."
+		else:
+			text += "\nNo ring: %s. Nothing here is built, ticked or uploaded by a terrain." % str(
+					(unsupported.get("height", {}) as Dictionary).get("Clipmap", "no delivery cell may select Clipmap in this build"))
+		text += "\nLast update produced %d channel texels." % int(p_settings.get("clipmap_produced_texels", 0))
+		return text
+	var rings: Dictionary = p_settings.get("clipmap", {})
+	for group in DELIVERY_GROUPS:
+		var entry: Dictionary = rings.get(group, {})
+		if typeof(entry) != TYPE_DICTIONARY or entry.is_empty():
+			continue
+		var label: String = DELIVERY_GROUP_LABELS[group]
+		if bool(entry.get("configured", false)):
+			text += "\n%s: %d/%d levels valid · %d queued · %d texels produced · %.1f KB uploaded" % [
+					label, int(entry.get("valid_levels", 0)), int(entry.get("levels", 0)), int(entry.get("pending_jobs", 0)),
+					int(entry.get("produced_texels", 0)), float(entry.get("upload_bytes", 0)) / 1024.0]
+		else:
+			text += "\n%s: no ring object for this group" % label
+	text += "\nLast update produced %d channel texels." % int(p_settings.get("clipmap_produced_texels", 0))
+	return text
+
+
+# Three of the four settings are the ring's shape: the native setter reconfigures every existing ring,
+# so a write here is a shape change and not a setting parked for later. The budget is not a shape, and
+# the native setter says so by not reconfiguring anything.
+func _on_clipmap_setting_changed(p_value: float, p_key: String) -> void:
+	if _updating_settings or terrain == null or not is_instance_valid(terrain):
+		return
+	if not _has_object_property(terrain, &"vt_clipmap_%s" % p_key):
+		return
+	var method := {
+		"size": "set_vt_clipmap_size",
+		"levels": "set_vt_clipmap_levels",
+		"base_world": "set_vt_clipmap_base_world",
+		"budget": "set_vt_clipmap_budget_texels",
+	}.get(p_key, "")
+	if method.is_empty():
+		return
+	var argument: Variant = p_value if p_key == "base_world" else int(round(p_value))
+	_call(terrain, method, [argument])
+	_refresh_header()
+	_refresh_settings_controls()
 
 
 # The band table is its own editor: it owns the spin boxes, the automatic rule and
@@ -821,11 +1113,21 @@ func _on_editor_preview_toggled(enabled: bool) -> void:
 	_refresh_settings_controls()
 
 
-func _on_view_enabled_toggled(p_enabled: bool, p_kind: String) -> void:
+func _on_delivery_selected(p_index: int, p_band: String, p_group: String) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	var method := "set_surface_vt_enabled" if p_kind == "avt" else "set_surface_svt_enabled"
-	_call(terrain, method, [p_enabled])
+	var option: OptionButton = _delivery_option(p_band, p_group)
+	if option == null or p_index < 0 or p_index >= option.item_count:
+		return
+	var property := StringName("vt_delivery_%s_%s" % [p_band, p_group])
+	if not TerrainVTBridge.has_property(terrain, property):
+		return
+	# A write the setter refuses leaves the cell where it was, and the refresh below re-reads the cells
+	# rather than the widget's own selection, so an option that is somehow chosen while disabled snaps
+	# back to the method the terrain actually holds instead of showing a value nothing stored.
+	terrain.set(property, option.get_item_id(p_index))
+	if Engine.is_editor_hint() and plugin != null and is_instance_valid(plugin):
+		EditorInterface.mark_scene_as_unsaved()
 	_refresh_header()
 	_refresh_settings_controls()
 
@@ -914,6 +1216,8 @@ func _refresh_page_details() -> void:
 	page_tree.clear()
 	_clear_preview()
 	settings_panel.visible = false
+	clipmap_panel.visible = false
+	clipmap_debug_panel.visible = false
 	svt_panel.visible = false
 	cdlod_panel.visible = false
 	var root := page_tree.create_item()
@@ -930,6 +1234,16 @@ func _refresh_page_details() -> void:
 			settings_panel.visible = true
 			_refresh_settings_controls()
 			_add_settings_summary(root)
+		"clipmap":
+			details_label.text = "Clipmap · toroidal ring levels"
+			clipmap_panel.visible = true
+			_refresh_settings_controls()
+			_add_clipmap_details(root)
+		"clipmap_debug":
+			details_label.text = "VT Page · clipmap ring"
+			clipmap_debug_panel.visible = true
+			_refresh_settings_controls()
+			_add_clipmap_details(root)
 		"avt", "avt_pages":
 			details_label.text = "AVT · runtime material view"
 			_add_avt_details(root)
@@ -961,6 +1275,10 @@ func _page_snapshot() -> TerrainVTEditorPageRows.Snapshot:
 
 func _add_settings_summary(p_root: TreeItem) -> void:
 	TerrainVTEditorPageRows.add_settings_summary(page_tree, p_root, _page_snapshot())
+
+
+func _add_clipmap_details(p_root: TreeItem) -> void:
+	TerrainVTEditorPageRows.add_clipmap_details(page_tree, p_root, _page_snapshot())
 
 
 func _add_surface_details(p_root: TreeItem) -> void:

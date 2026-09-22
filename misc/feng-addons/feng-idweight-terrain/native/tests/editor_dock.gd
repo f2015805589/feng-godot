@@ -222,15 +222,21 @@ func _run() -> void:
 	# custom control must be inside the native EditorInspectorSection so its
 	# visibility follows the real subgroup, rather than living in the asset dock.
 	await _wait_frames(4)
-	var last_subgroup := ""
-	var cdlod_group_seen := false
+	var subgroup_names: Array[String] = []
 	for property in terrain.get_property_list():
 		if int(property.usage) & PROPERTY_USAGE_SUBGROUP:
-			if property.name == "CDLOD":
-				if not _require(last_subgroup == "SVT", "CDLOD foldout must follow SVT"): return
-				cdlod_group_seen = true
-			last_subgroup = property.name
-	if not _require(cdlod_group_seen, "native CDLOD foldout is missing"): return
+			subgroup_names.append(str(property.name))
+	# The native subgroups read in the order the layer assembles: the settings that decide what
+	# exists (with the delivery matrix as the first thing inside them), the ring's own shape, then one
+	# subgroup per method, then the pages those methods fill. The empty entry is the subgroup that
+	# closes the settings group for `surface_array_enabled`. A method's subgroup sitting *above* the
+	# settings that select it was the order this pins.
+	var expected_subgroups := ["VT Setting", "Clipmap", "", "AVT", "SVT", "CDLOD", "VT Page"]
+	if not _require(subgroup_names.size() >= expected_subgroups.size() and
+			subgroup_names.slice(0, expected_subgroups.size()) == expected_subgroups,
+			"native Surface VT subgroups are not in assembly order: %s" % str(subgroup_names)):
+		return
+	if not _require(subgroup_names.has("CDLOD"), "native CDLOD foldout is missing"): return
 	var inspector := EditorInterface.get_inspector()
 	if not _require(inspector.find_child("TerrainCDLODDescription", true, false) == null, "CDLOD should not inject a description above the switch"): return
 	var inspector_page_section := inspector.find_child("TerrainVTPageSection", true, false) as Control
@@ -302,6 +308,40 @@ func _run() -> void:
 		return
 	native_page_section.call("unfold")
 	await _wait_frames(2)
+	# The VT Page section hosts one debug view per VT method that has a layout to draw, and each is
+	# gated on the delivery matrix: showing a view of a service nobody selected is the state the two
+	# gates exist to prevent. This scene's default matrix selects AVT for the near material band and
+	# Clipmap nowhere, so exactly one of the two blocks is on screen.
+	var avt_debug_block := inspector_page_section.find_child("TerrainAVTDebugBlock", true, false) as Control
+	var clipmap_debug_block := inspector_page_section.find_child("TerrainClipmapDebugBlock", true, false) as Control
+	var clipmap_view := inspector_page_section.find_child("TerrainClipmapPreview", true, false) as Control
+	if not _require(avt_debug_block != null and clipmap_debug_block != null and clipmap_view != null,
+			"Inspector VT Page did not create a debug view per VT method"):
+		return
+	if not _require(avt_debug_block.visible and not clipmap_debug_block.visible,
+			"a debug view must follow the delivery matrix: AVT is selected here and Clipmap is not"):
+		return
+	# The clipmap's view follows the ring *object* rather than a matrix cell, and in this build no cell
+	# may name the method at all: the write below is refused, the cell keeps its method, and the block
+	# stays hidden because there is no ring to draw. The two counters are what make "nothing was
+	# scanned" a reading instead of a claim.
+	var calls_before := int(terrain.get_vt_settings().get("clipmap_preview_calls", 0))
+	var computed_before := int(terrain.get_vt_settings().get("clipmap_preview_computed", 0))
+	terrain.vt_delivery_near_height = 2
+	await _wait_frames(2)
+	if not _require(terrain.vt_delivery_near_height == 0,
+			"a height cell naming Clipmap must be refused and keep its method: this build has no arm for it"):
+		return
+	clipmap_view.set("_last_poll_sec", -INF)
+	clipmap_view.call("_process", 0.0)
+	if not _require(not bool(clipmap_view.call("is_available")) and not clipmap_debug_block.visible,
+			"so its debug view stays hidden: there is no ring behind it"):
+		return
+	var gate_settings := terrain.get_vt_settings()
+	if not _require(int(gate_settings.get("clipmap_preview_computed", 0)) == computed_before and
+			int(gate_settings.get("clipmap_preview_calls", 0)) == calls_before,
+			"and a hidden view with no ring behind it must not ask for a layout at all"):
+		return
 	inspector_open_button.pressed.emit()
 	await _wait_frames(4)
 	var inspector_vt_editor: Window = dock.vt_editor
@@ -396,16 +436,25 @@ func _run() -> void:
 			"VT editor did not create the Surface VT hierarchy root"):
 		return
 	var settings_item: TreeItem = surface_item.get_first_child()
-	var avt_item: TreeItem = settings_item.get_next() if settings_item else null
+	var clipmap_item: TreeItem = settings_item.get_next() if settings_item else null
+	var avt_item: TreeItem = clipmap_item.get_next() if clipmap_item else null
 	var svt_item: TreeItem = avt_item.get_next() if avt_item else null
 	var cdlod_item: TreeItem = svt_item.get_next() if svt_item else null
 	var pages_item: TreeItem = cdlod_item.get_next() if cdlod_item else null
+	# The tree reads in the order the layer assembles: the settings that select a method, the ring's
+	# own shape, then one node per method, then the physical pages. `Clipmap` between the settings and
+	# AVT is the node the matrix's third method was missing.
 	if not _require(settings_item != null and settings_item.get_text(0) == "VT Setting" and
+			clipmap_item != null and clipmap_item.get_text(0) == "Clipmap" and
 			avt_item != null and avt_item.get_text(0) == "AVT" and
 			svt_item != null and svt_item.get_text(0) == "SVT" and
 			cdlod_item != null and cdlod_item.get_text(0) == "CDLOD" and
 			pages_item != null and pages_item.get_text(0) == "VT Page",
-			"VT editor hierarchy did not expose VT Setting, AVT, SVT, and VT Page groups"):
+			"VT editor hierarchy did not expose VT Setting, Clipmap, AVT, SVT, CDLOD and VT Page in assembly order"):
+		return
+	var clipmap_child: TreeItem = clipmap_item.get_first_child()
+	if not _require(clipmap_child != null and clipmap_child.get_metadata(0) == "clipmap",
+			"Clipmap hierarchy group did not expose the ring's own settings"):
 		return
 	var avt_pages: TreeItem = avt_item.get_first_child()
 	var svt_pages: TreeItem = svt_item.get_first_child()
@@ -443,6 +492,53 @@ func _run() -> void:
 			vt_editor.page_border_spin != null and vt_editor.page_count_spin != null and
 			vt_editor.pages_per_update_spin != null and vt_editor.adaptive_button != null,
 			"VT Setting group did not expose unified page controls"):
+		return
+	# The ring's shape and its budget are their own node, and a write there has to land on the native
+	# property rather than on a widget the report will overwrite on the next refresh.
+	clipmap_item.select(0)
+	vt_editor.hierarchy.item_selected.emit()
+	await _wait_frames(2)
+	if not _require(vt_editor.clipmap_panel.visible and vt_editor.clipmap_size_spin != null and
+			vt_editor.clipmap_levels_spin != null and vt_editor.clipmap_base_spin != null and
+			vt_editor.clipmap_budget_spin != null and vt_editor.clipmap_hint != null,
+			"Clipmap hierarchy group did not expose the ring's shape and budget"):
+		return
+	var saved_clipmap_size: int = terrain.vt_clipmap_size
+	var saved_clipmap_budget: int = terrain.vt_clipmap_budget_texels
+	vt_editor.clipmap_size_spin.value = 32.0
+	if not _require(terrain.vt_clipmap_size == 32, "the clipmap level edge control did not update the native setting"):
+		return
+	vt_editor.clipmap_budget_spin.value = 512.0
+	if not _require(terrain.vt_clipmap_budget_texels == 512, "the clipmap budget control did not update the native setting"):
+		return
+	vt_editor.clipmap_size_spin.value = float(saved_clipmap_size)
+	vt_editor.clipmap_budget_spin.value = float(saved_clipmap_budget)
+	if not _require(terrain.vt_clipmap_size == saved_clipmap_size and terrain.vt_clipmap_budget_texels == saved_clipmap_budget,
+			"the clipmap controls did not restore the settings they read"):
+		return
+	# The VT Page's clipmap view is the same control the Inspector hosts. The gate is asked natively
+	# here as well, so a scene whose matrix selects Clipmap nowhere must not even pay for a payload.
+	var resident_item: TreeItem = pages_item.get_first_child()
+	var baked_item: TreeItem = resident_item.get_next() if resident_item else null
+	var clipmap_page: TreeItem = baked_item.get_next() if baked_item else null
+	if not _require(clipmap_page != null and clipmap_page.get_text(0) == "Clipmap ring" and
+			clipmap_page.get_metadata(0) == "clipmap_debug",
+			"VT Page did not expose the clipmap debug view"):
+		return
+	clipmap_page.select(0)
+	vt_editor.hierarchy.item_selected.emit()
+	await _wait_frames(2)
+	var dock_clipmap_view := vt_editor.find_child("ClipmapDebugPreview", true, false) as Control
+	if not _require(vt_editor.clipmap_debug_panel.visible and dock_clipmap_view != null,
+			"VT Page's clipmap view was not created"):
+		return
+	var preview_calls_before := int(terrain.get_vt_settings().get("clipmap_preview_computed", 0))
+	if not _require(not terrain.is_vt_delivery_used(2) and terrain.get_clipmap_layout_preview().is_empty() and
+			int(terrain.get_vt_settings().get("clipmap_preview_computed", 0)) == preview_calls_before,
+			"the clipmap preview must refuse a method that no delivery cell selects"):
+		return
+	if not _require(not bool(dock_clipmap_view.call("is_available")),
+			"and the VT Page's clipmap view must report itself unavailable in that state"):
 		return
 	if not _require(vt_editor.baked_mip_selector != null,
 			"VT Page view did not expose a baked mip selector"):

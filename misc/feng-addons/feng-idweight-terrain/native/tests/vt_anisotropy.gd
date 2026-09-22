@@ -4,24 +4,38 @@ extends "res://vt_adaptive_base.gd"
 # long footprint in the view direction and a short one across it.  The old AVT resolver
 # used the long derivative as its mip level and therefore selected the coarse probe page;
 # the shader under test is expected to keep the fine page when the long axis fits inside
-# the page's supported anisotropy.
+# the number of taps the sampler really has.
 #
-# The shipped pair is a nine-texel gutter and an eight-times request
-# (`vt_page_border` / `surface_vt_anisotropy`), so the request survives: the gutter admits
-# `border - 0.5` = 8.5. This fixture then tightens the gutter to four, which admits 3.5 and
-# therefore caps the request - the case the grazing assertions below are about, and the one
-# that used to be the only case there was.
+# That number is the point of this file. `get_avt_anisotropy()` used to be the terrain's request
+# clamped only by the page gutter, and the shipped pair - a nine-texel gutter and an eight-times
+# request - made it 8. But Godot builds a material sampler per *viewport* with
+# `anisotropy_max = 1 << level` and there is no per-material anisotropy, so on a stock project
+# (4x) the shader was selecting mips for taps that no fragment gets. This file pins the rule that
+# fixed it - the effective number is the request clamped by the sampler *and* the gutter - and then
+# measures, at a saturated grazing pose, what believing the wrong number costs on pixels.
 const REGION := Vector2i.ZERO
 const TARGET := Vector3(34.0, 0.0, 34.0)
 const TARGET_XZ := Vector2(34.0, 34.0)
 const PAGE_SIZE := 32
-const PAGE_BORDER := 4
+# The shipped gutter. It admits `9 - 0.5 = 8.5`, so what caps the assumed anisotropy here is the
+# sampler's own 4x and not the page - which is the pair a project gets and the pair the grazing
+# measurement at the end of this file is about.
+const PAGE_BORDER := 9
 const DENSITY := 8.0
 const EXPECTED_BLOCK_SIZE := 16
 const CAMERA_SIZE := 16.0
 const SCREEN_CENTER := Vector2(160.0, 120.0)
 const CAMERA_ELEVATION := 2.0
 const CAMERA_DISTANCE := 11.3425636 # 2 / tan(10 degrees)
+# The saturated grazing pose. `sin` of the elevation angle, chosen so the major footprint is about
+# 1.15 m: 1.15 / 8 = 0.144 m and 1.15 / 4 = 0.288 m straddle the 0.25 m boundary between the cell's
+# local mip 0 (0.125 m per texel) and mip 1 (0.250 m), with margin on both sides.
+const GRAZING_ELEVATION_SIN := 0.058
+# The measurement window has to stay inside the cell's mip 0 page, which at this pose is about
+# +/-2 m of ground: `major` is 1.15 m per screen row, so one row above and below, and 25 columns is
+# 1.7 m across.
+const GRAZING_ROWS := 1
+const GRAZING_COLUMNS := 25
 
 var albedo_array: Texture2DArray
 var normal_array: Texture2DArray
@@ -79,6 +93,73 @@ func make_layer(color: Color) -> Image:
 	var image := Image.create(stored, stored, false, Image.FORMAT_RGBAF)
 	image.fill(color)
 	return image
+
+# A one-texel black/white noise page and, below it, the 2x2 box average of that page - the
+# relationship a produced mip chain has (`the parent's texel is the child's four`). That average is
+# what makes the grazing reading below mean something: a page the sampler can cover returns a
+# correctly prefiltered average, and a page twice finer than its taps can cover returns four
+# unfiltered samples instead, which is sampling noise that crawls frame to frame.
+func make_noise_layers() -> Array:
+	var stored := PAGE_SIZE + 2 * PAGE_BORDER
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 20240922
+	var fine := Image.create(stored, stored, false, Image.FORMAT_RGBAF)
+	for y in stored:
+		for x in stored:
+			var value := 1.0 if rng.randf() < 0.5 else 0.0
+			fine.set_pixel(x, y, Color(value, value, value, 1.0))
+	# Only the coarse page's lower-left quadrant maps onto this cell's fine page (a mip 1 page spans
+	# four mip 0 pages); the rest is filled with the pattern's mean, which is what the neighbouring
+	# child pages would average to anyway.
+	var quadrant := PAGE_SIZE / 2 + PAGE_BORDER
+	var coarse := Image.create(stored, stored, false, Image.FORMAT_RGBAF)
+	coarse.fill(Color(0.5, 0.5, 0.5, 1.0))
+	for y in quadrant:
+		for x in quadrant:
+			var sum := 0.0
+			for dy in 2:
+				for dx in 2:
+					sum += fine.get_pixel(x * 2 + dx, y * 2 + dy).r
+			var value := sum * 0.25
+			coarse.set_pixel(x, y, Color(value, value, value, 1.0))
+	return [fine, coarse]
+
+# A grazing pose whose major footprint is a chosen multiple of the page texel. The elevation is what
+# sets the ratio: a flat ground plane seen from `theta` above the horizon has a major axis of
+# `size / height / sin(theta)` and a minor axis of `size / height`.
+func set_grazing_pose(azimuth_degrees: float) -> void:
+	var sine := GRAZING_ELEVATION_SIN
+	var distance := CAMERA_ELEVATION * sqrt(1.0 - sine * sine) / sine
+	var azimuth := deg_to_rad(azimuth_degrees)
+	var horizontal := Vector3(sin(azimuth), 0.0, cos(azimuth)) * distance
+	camera.position = TARGET + Vector3(horizontal.x, CAMERA_ELEVATION, horizontal.z)
+	camera.look_at(TARGET, Vector3.UP)
+
+# The mean and the mean absolute deviation of the red channel inside one screen window. The mean is
+# what a filtered page must reproduce (it is the pattern's true average) and the deviation says how
+# patchy the same window is, which is the frame-to-frame crawling a moving camera sees.
+func window_values(image: Image) -> PackedFloat32Array:
+	var values := PackedFloat32Array()
+	var center := Vector2i(int(SCREEN_CENTER.x), int(SCREEN_CENTER.y))
+	for y in range(center.y - GRAZING_ROWS, center.y + GRAZING_ROWS + 1):
+		for x in range(center.x - GRAZING_COLUMNS, center.x + GRAZING_COLUMNS + 1):
+			values.push_back(image.get_pixel(clampi(x, 0, image.get_width() - 1), clampi(y, 0, image.get_height() - 1)).r)
+	return values
+
+func window_mean(image: Image) -> float:
+	var values := window_values(image)
+	var sum := 0.0
+	for value: float in values:
+		sum += value
+	return sum / float(maxi(1, values.size()))
+
+func window_spread(image: Image) -> float:
+	var values := window_values(image)
+	var mean := window_mean(image)
+	var spread := 0.0
+	for value: float in values:
+		spread += absf(value - mean)
+	return spread / float(maxi(1, values.size()))
 
 func install_probe_pages(block_size: int) -> Dictionary:
 	var vt := terrain.get_surface_vt()
@@ -188,13 +269,40 @@ func run() -> void:
 	if terrain.material != null:
 		terrain.material.update()
 
-	# The rule that says the request survives the shipped gutter, measured rather than restated:
-	# with the border back at its default the report's effective value is the 8x that was asked
-	# for. The fixture's own border is restored right after, and the loop below settles it.
+	# The rule that owns the number, measured rather than restated. Two bounds decide what the
+	# shader and the planner may assume, and they are checked in the order they bind:
+	#
+	# 1. the sampler. Godot builds a material sampler per viewport with `anisotropy_max = 1 << level`
+	#    from the viewport's own filtering level (the project default is 4x), and there is no
+	#    per-material anisotropy, so a terrain request above it is a wish the hardware never
+	#    implements. Believing the wish selects a page two times finer than the sampler can cover -
+	#    see the grazing measurement at the end of this file.
+	# 2. the page gutter, `border - 0.5`, unchanged.
 	terrain.vt_page_border = 9
-	var shipped_anisotropy := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
-	require(shipped_anisotropy >= 8.0,
-			"the default gutter must admit the default 8x request, got %.2f" % shipped_anisotropy)
+	root.get_viewport().set_anisotropic_filtering_level(2) # Viewport.ANISOTROPY_4X
+	var shipped: Dictionary = terrain.get_vt_settings()
+	var shipped_sampler := float(shipped.get("avt_anisotropy_sampler", 0.0))
+	var shipped_requested := float(shipped.get("avt_anisotropy_requested", 0.0))
+	var shipped_anisotropy := float(shipped.get("avt_anisotropy_effective", 0.0))
+	print("VT_ANISO_SHIPPED sampler=", shipped_sampler, " requested=", shipped_requested,
+			" effective=", shipped_anisotropy, " border=9 viewport_level=2")
+	require(shipped_sampler == 4.0,
+			"the sampler reading must be the viewport's filtering level (4x here), got %.2f" % shipped_sampler)
+	require(shipped_requested == 8.0,
+			"the near field must request 8x anisotropy by default, got %.2f" % shipped_requested)
+	require(is_equal_approx(shipped_anisotropy, minf(minf(shipped_requested, shipped_sampler), 8.5)),
+			"the effective anisotropy must be the request clamped by the sampler and by the gutter, got %.2f" % shipped_anisotropy)
+	# The bound is live in both directions: raising the viewport's filtering level raises the number
+	# the shader may assume, up to the request, and a gutter narrower than the request still caps it.
+	root.get_viewport().set_anisotropic_filtering_level(3) # Viewport.ANISOTROPY_8X
+	var raised := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
+	require(is_equal_approx(raised, 8.0),
+			"an 8x viewport must let the 8x request through a nine-texel gutter, got %.2f" % raised)
+	terrain.vt_page_border = 4
+	var gutter_capped := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
+	require(is_equal_approx(gutter_capped, 3.5),
+			"a four-texel gutter must cap an 8x viewport at 3.5, got %.2f" % gutter_capped)
+	root.get_viewport().set_anisotropic_filtering_level(2)
 	terrain.vt_page_border = PAGE_BORDER
 	await process_frame
 
@@ -266,6 +374,66 @@ func run() -> void:
 		var center := shot.get_pixelv(Vector2i(int(SCREEN_CENTER.x), int(SCREEN_CENTER.y)))
 		print("VT_ANISO_SAMPLE pose=", pose.name, " label=", label, " center=", center)
 		require(label == "red", "%s must retain the distinct fine-page colour; got %s" % [pose.name, label])
+
+	# The reason the sampler bound above exists, measured on pixels instead of argued.
+	#
+	# A grazing footprint whose anisotropy is wider than the sampler can filter. Every slot starts as
+	# the parent's pattern, so a page this fixture does not name still answers with correctly
+	# prefiltered content, and the cell's two resident pages hold a one-texel noise page and its 2x2
+	# box average: the reading asks one question of the same pose twice - how much of the pattern the
+	# four taps this viewport really has can cover.
+	#   assumed 8: footprint 1.15/8 = 0.144 m -> local mip 0, a 0.125 m page, four taps 2.3 texels
+	#              apart cover 44% of the footprint
+	#   assumed 4: footprint 1.15/4 = 0.288 m -> local mip 1, a 0.250 m page, four taps a texel apart
+	#              cover it and average the sixteen child texels the pattern is made of
+	# The sampler runs at 4x in both, so the first is exactly the two-times overshoot the aliasing
+	# argument predicts and the second is what the fix delivers. The reading is the window's mean
+	# absolute deviation - sampling noise, uncorrelated frame to frame, which is what a moving camera
+	# sees as crawling.
+	root.get_viewport().set_anisotropic_filtering_level(2) # Viewport.ANISOTROPY_4X
+	# Precondition: the two assumptions must land on *different* resident pages of this cell, or the
+	# reading below compares one page with itself. Read as colour first, with the flat red and green
+	# pages the poses above used.
+	for slot in terrain.vt_page_count:
+		albedo_array.update_layer(make_layer(Color.MAGENTA), slot)
+	albedo_array.update_layer(make_layer(Color(0.95, 0.04, 0.02, 1.0)), int(slots[0]))
+	albedo_array.update_layer(make_layer(Color(0.02, 0.82, 0.06, 1.0)), int(slots[1]))
+	set_grazing_pose(0.0)
+	var landing := {}
+	for assumed in [8.0, 4.0]:
+		RenderingServer.material_set_param(material_rid, "_surface_vt_anisotropy", assumed)
+		var page_shot := await frame_image(3)
+		landing[assumed] = probe_label(page_shot)
+		print("VT_ANISO_GRAZING_PAGE assumed=%.0f label=%s" % [assumed, landing[assumed]])
+	require(landing[8.0] == "red" and landing[4.0] == "green",
+			"the coarse grazing pose must make 8x land on the fine page and 4x on its parent, got %s and %s" % [landing[8.0], landing[4.0]])
+
+	var layers := make_noise_layers()
+	var fine_noise: Image = layers[0]
+	var coarse_noise: Image = layers[1]
+	for slot in terrain.vt_page_count:
+		albedo_array.update_layer(coarse_noise, slot)
+	albedo_array.update_layer(fine_noise, int(slots[0]))
+	albedo_array.update_layer(coarse_noise, int(slots[1]))
+	set_grazing_pose(0.0)
+	var grazing := footprint_metrics(4.0)
+	print("VT_ANISO_GRAZING major=%.4f minor=%.4f ratio=%.2f page_texel=%.4f mip0_footprint=%.4f mip1_footprint=%.4f" % [
+			grazing.major, grazing.minor, grazing.major / maxf(grazing.minor, 1e-9), observed_texel,
+			grazing.major / 8.0, grazing.major / 4.0])
+	var spread := {}
+	for assumed in [8.0, 4.0]:
+		RenderingServer.material_set_param(material_rid, "_surface_vt_anisotropy", assumed)
+		var shot := await frame_image(3)
+		shot.save_png(output_dir.path_join("anisotropy-grazing-%d.png" % int(assumed)))
+		spread[assumed] = window_spread(shot)
+		print("VT_ANISO_GRAZING assumed=%.0f window_mean=%.5f spread=%.5f" % [
+				assumed, window_mean(shot), spread[assumed]])
+	# Restore the value the terrain publishes, so the teardown renders what the fix delivers.
+	RenderingServer.material_set_param(material_rid, "_surface_vt_anisotropy", shader_anisotropy)
+	print("VT_ANISO_GRAZING restored=", shader_anisotropy, " ratio=%.2f" % (float(spread[8.0]) / maxf(float(spread[4.0]), 1e-9)))
+	require(float(spread[8.0]) > float(spread[4.0]) * 1.25,
+			"a page twice finer than the sampler's taps can cover must read noisier than its parent: spread %.5f against %.5f" % [
+				float(spread[8.0]), float(spread[4.0])])
 
 	# Stop callbacks before freeing the camera and terrain.  The synthetic arrays remain
 	# referenced until the material is no longer used by a draw.

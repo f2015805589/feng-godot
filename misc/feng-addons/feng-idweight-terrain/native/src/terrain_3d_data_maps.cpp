@@ -241,6 +241,19 @@ Color Terrain3DData::get_pixel_descaled(const MapType p_map_type, const Vector2i
 	}
 }
 
+real_t Terrain3DData::get_height_texel_nearest(const Vector2 &p_world_xz) const {
+	const Vector2i vgrid(Math::floor(p_world_xz.x / _vertex_spacing), Math::floor(p_world_xz.y / _vertex_spacing));
+	const Terrain3DRegion *region = get_region_ptr(V2I_DIVIDE_FLOOR(vgrid, _region_size));
+	if (!region || region->is_deleted()) {
+		return 0.f;
+	}
+	Image *map = region->get_map_ptr(TYPE_HEIGHT);
+	if (map == nullptr) {
+		return 0.f;
+	}
+	return map->get_pixelv(Vector2i(Math::posmod(vgrid.x, _region_size), Math::posmod(vgrid.y, _region_size))).r;
+}
+
 real_t Terrain3DData::get_surface_height(const Vector3 &p_global_position) const {
 	Vector3 pos = p_global_position;
 	const real_t &step = _vertex_spacing;

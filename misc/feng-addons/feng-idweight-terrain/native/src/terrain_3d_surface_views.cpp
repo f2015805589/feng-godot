@@ -5,9 +5,17 @@
 // One of four files that define the two views and their demand passes. The two views' setup and
 // teardown
 // (`_setup_surface_vt()`, `_setup_surface_svt()`, `_configure_surface_view()` and their destroy
-// counterparts) and every setting the dock, the inspector and scripts write: the two enables, both
-// fields' page size, border, count and distances, the level bands, the array toggle, the feedback
-// controls and `invalidate_surface_pages()`.
+// counterparts), the delivery matrix that decides which of them exist at all
+// (`set_vt_delivery()` / `_resolve_vt_delivery()`) with the rule that decides which cells it accepts
+// (`is_vt_delivery_supported()`), the clipmap ring's one owner and the mechanism's own entry
+// (`_setup_vt_clipmap()` / `debug_update_vt_clipmap()`), and every setting the dock, the inspector
+// and scripts write: both fields' page size, border, count and distances, the level bands, the array
+// toggle, the feedback controls and `invalidate_surface_pages()`.
+//
+// The two legacy enables (`surface_vt_enabled`, `surface_svt_enabled`) are now *views of a cell*
+// of that matrix rather than independent state: writing one writes the near or far material cell,
+// and reading one asks whether that cell selected the method. Nothing else reads them, so a
+// configuration cannot be described twice and drift.
 //
 // A setter here owns its side effects rather than only storing a value, and the one to know about is
 // the *toggle*: enabling either field puts a field that is about to be demanded into a world that
@@ -29,6 +37,9 @@
 #include "terrain_3d_surface_views_internal.h"
 
 #include "logger.h"
+#include "terrain_3d_clipmap_source_height.h"
+
+#include <godot_cpp/classes/time.hpp>
 
 ///////////////////////////
 // Surface virtual texture
@@ -42,12 +53,24 @@ void Terrain3D::_setup_surface_vt() {
 	_vt.surface_vt = memnew(Terrain3DVirtualTexture);
 	_configure_surface_view(_vt.surface_vt, false);
 	_vt.surface_vt->initialize();
+	// The shared service is a function of which views exist: it is the pool and the producer both
+	// sample, so a view arriving or leaving invalidates the configuration the last one proved and
+	// the next tick reconfigures it. Without this a view created after a shared configuration had
+	// been proven would keep its own private pool and never be given the shared one.
+	_vt.vt_shared_ready = false;
 }
 
 void Terrain3D::_destroy_surface_vt() {
 	LOG(INFO, "Destroying surface virtual texture");
+	// A near field that is going away must not reserve physical capacity from a far field that
+	// stays: the coarse owner's pages are protected, and a protection held by a destroyed view is a
+	// slot the far field can never evict.
+	_release_avt_coarse_protections();
 	memdelete_safely(_vt.surface_vt);
-	_vt.surface_vt_enabled = false;
+	_vt.avt_settled.unverify();
+	// The surviving view is the one the next tick must hand the shared pool to; see the note in
+	// `_setup_surface_vt()`.
+	_vt.vt_shared_ready = false;
 }
 
 void Terrain3D::_setup_surface_svt() {
@@ -58,6 +81,12 @@ void Terrain3D::_setup_surface_svt() {
 	_vt.surface_svt = memnew(Terrain3DVirtualTexture);
 	_configure_surface_view(_vt.surface_svt, true);
 	_vt.surface_svt->initialize();
+	// A view that has just been created has proven nothing, so the shader renders from the live
+	// source material until the root pyramid is verified. Reopening the gate here as well as in
+	// the enable path is what makes creation and re-enable the same state.
+	_vt.svt_startup_ready = false;
+	// See `_setup_surface_vt()`: the shared configuration is a function of the view set.
+	_vt.vt_shared_ready = false;
 }
 
 // One view's configuration, apart from the physical pool it is attached to. Both
@@ -90,22 +119,17 @@ void Terrain3D::_configure_surface_view(Terrain3DVirtualTexture *p_view, const b
 void Terrain3D::_destroy_surface_svt() {
 	LOG(INFO, "Destroying far-field surface virtual texture");
 	memdelete_safely(_vt.surface_svt);
-	_vt.surface_svt_enabled = false;
+	// The far field's root plan and its startup gate describe a view that no longer exists; a
+	// re-created one plans and proves itself from scratch.
+	_vt.svt_roots = Terrain3DSVTRootPlan();
+	_vt.svt_startup_ready = false;
+	_vt.vt_shared_ready = false;
 }
 
 void Terrain3D::set_surface_svt_enabled(const bool p_enabled) {
-	_vt.surface_svt_enabled = p_enabled;
-	// A far field that has just been switched on has to prove its root pyramid before the shader
-	// may sample it strictly - it renders from the live source material until then - so the gate has
-	// to be reopened here and not only in setup, which is the only reason a re-enable differs from
-	// a first enable.
-	if (p_enabled) { _vt.svt_startup_ready = false; }
-	// The tick side effect both toggles have; see the contract at the top of this file.
-	if (p_enabled && _initialized) { set_physics_process(true); }
-	LOG(INFO, "Far-field surface virtual texture ", p_enabled ? "enabled" : "disabled");
-	if (_initialized && _material.is_valid()) {
-		_material->update(Terrain3DMaterial::REGION_ARRAYS);
-	}
+	// A view of the far field's material cell; the assembly rule is `set_vt_delivery()`'s.
+	set_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Material),
+			int(p_enabled ? TerrainVT::Delivery::SVT : TerrainVT::Delivery::Direct));
 }
 
 void Terrain3D::set_surface_svt_page_world(const real_t p_size) {
@@ -240,9 +264,9 @@ void Terrain3D::set_surface_svt_mip_distances(const PackedFloat32Array &p_distan
 void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 	_vt.surface_array_enabled = p_enabled;
 	LOG(INFO, "Surface region texture array ", p_enabled ? "enabled" : "disabled");
-	if (!p_enabled && !_vt.surface_vt_enabled && !_vt.surface_svt_enabled) {
-		LOG(WARN, "Both surface virtual textures are off, so the region texture array keeps "
-				  "carrying the surface channel until one of them is enabled.");
+	if (!p_enabled && !group_has_vt_delivery(TerrainVT::ChannelGroup::Material)) {
+		LOG(WARN, "No cell delivers the diffuse/normal group, so the region texture array keeps "
+				  "carrying the surface channel until one does.");
 	}
 	if (_data) {
 		// Re-upload (or blank) every surface layer so the change takes effect now.
@@ -304,24 +328,10 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_fo
 }
 
 void Terrain3D::set_surface_vt_enabled(const bool p_enabled) {
-	if (!p_enabled && _vt.surface_vt_enabled && _vt.surface_vt) {
-		// A disabled near field must not reserve physical capacity from SVT.
-		for (const auto &page : _vt.avt_coarse.pages) {
-			const int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
-			if (slot >= 0 && _vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, false); }
-		}
-	}
-	if (p_enabled != _vt.surface_vt_enabled) { _vt.avt_settled.unverify(); }
-	_vt.surface_vt_enabled = p_enabled;
-	// The tick side effect both toggles have; see the contract at the top of this file. It is what a
-	// harness that drives the section itself has to undo *after* this setter, not before it.
-	if (p_enabled && _initialized) { set_physics_process(true); }
-	LOG(INFO, "Surface virtual texture ", p_enabled ? "enabled" : "disabled");
-	if (_initialized && _material.is_valid()) {
-		// The shader's `_vt.surface_vt_enabled` uniform and its block table have to follow
-		// the toggle, otherwise the material keeps sampling the atlas after it is off.
-		_material->update(Terrain3DMaterial::REGION_ARRAYS);
-	}
+	// A view of the near field's material cell. The assembly rule - what a service creation or
+	// destruction costs, and when the material is rebound - lives in `set_vt_delivery()`.
+	set_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Material),
+			int(p_enabled ? TerrainVT::Delivery::AVT : TerrainVT::Delivery::Direct));
 }
 
 void Terrain3D::set_surface_vt_page_count(const int p_count) {
@@ -378,7 +388,7 @@ void Terrain3D::set_surface_vt_feedback_enabled(const bool p_enabled) {
 	if (!p_enabled && _vt.surface_vt_feedback) {
 		memdelete_safely(_vt.surface_vt_feedback);
 	}
-	if (_initialized && (_vt.surface_vt_enabled || _vt.surface_svt_enabled)) {
+	if (_initialized && has_vt_delivery()) {
 		set_physics_process(true);
 	}
 	LOG(INFO, "Surface virtual texture GPU feedback ", p_enabled ? "enabled" : "disabled");
@@ -398,4 +408,418 @@ void Terrain3D::set_surface_vt_feedback_grid_chunks(const int p_chunks) {
 
 void Terrain3D::set_surface_vt_feedback_min_extent(const real_t p_extent) {
 	_vt.surface_vt_feedback_min_extent = CLAMP(p_extent, 0.f, 1024.f);
+}
+
+///////////////////////////
+// Delivery assembly
+///////////////////////////
+
+// Which method carries which channel group in which band. `TerrainVT::DeliveryMatrix` holds the
+// four values; everything below is the assembly that follows from them, and it is deliberately the
+// only place a service is created or destroyed outside teardown. See
+// docs/vt_delivery_assembly.md for the channel inventory and the rule.
+
+int Terrain3D::get_vt_delivery(const int p_tier, const int p_group) const {
+	if (p_tier < 0 || p_tier >= TerrainVT::TIER_COUNT || p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return int(TerrainVT::Delivery::Direct);
+	}
+	return int(_vt.delivery.get(TerrainVT::Tier(p_tier), TerrainVT::ChannelGroup(p_group)));
+}
+
+// Which (channel group, method) pairs this build can deliver, and the sentence that says why not.
+// This is the one place the matrix's *acceptance* is decided, so a cell can only ever name a method
+// that reaches a fragment here, and the matrix is deliberately **asymmetric**: the two channel groups
+// do not have the same choices.
+//
+//   * The **material** group (diffuse + normal, and the control payload they are baked from) is the
+//     paged one: AVT and SVT are its two arms and are what this build ships. Clipmap needs a
+//     material-channel source, which is M4.
+//   * The **height** group (displacement, normals, holes) has exactly two choices, by design:
+//     `Direct`, the region array, and the clipmap ring - which the shader arm `height_at_uv()`
+//     samples, so the cell is deliverable and selecting it is what compiles the arm in. AVT and SVT
+//     page the material group and are not height's methods: a height cell naming one of them is not
+//     a method waiting for an arm, because there is no height arm of that kind to write.
+//
+// `Direct` is always deliverable: the region arrays are the fallback and the only method that is
+// always correct (see the enum's comment). The tier does not enter, because the two bands select
+// reach rather than capability - and that matters most for the height group, where a ring is one
+// object per *group*: the near and the far height cell name the same ring, so either one of them
+// selecting Clipmap is the whole of the choice, and the band they name is where the ring serves.
+bool Terrain3D::is_vt_delivery_supported(const int p_group, const int p_method) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || !TerrainVT::is_valid_delivery(p_method)) {
+		return false;
+	}
+	const TerrainVT::Delivery method = TerrainVT::Delivery(p_method);
+	if (method == TerrainVT::Delivery::Direct) {
+		return true;
+	}
+	if (p_group == int(TerrainVT::ChannelGroup::Height)) {
+		return method == TerrainVT::Delivery::Clipmap;
+	}
+	return method == TerrainVT::Delivery::AVT || method == TerrainVT::Delivery::SVT;
+}
+
+String Terrain3D::get_vt_delivery_unsupported_reason(const int p_group, const int p_method) const {
+	if (is_vt_delivery_supported(p_group, p_method)) {
+		return String();
+	}
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || !TerrainVT::is_valid_delivery(p_method)) {
+		return "the cell is out of range";
+	}
+	if (p_group == int(TerrainVT::ChannelGroup::Height)) {
+		return "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group";
+	}
+	return TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap
+			? "no clipmap source carries the diffuse+normal channel in this build (M4)"
+			: "the diffuse+normal channel has no arm for this method";
+}
+
+void Terrain3D::set_vt_delivery(const int p_tier, const int p_group, const int p_delivery) {
+	if (p_tier < 0 || p_tier >= TerrainVT::TIER_COUNT || p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		LOG(WARN, "Delivery cell (tier ", p_tier, ", group ", p_group, ") is out of range; keeping the current methods.");
+		return;
+	}
+	if (!TerrainVT::is_valid_delivery(p_delivery)) {
+		LOG(WARN, "Delivery method ", p_delivery, " is not one of Direct/AVT/Clipmap/SVT; keeping the current method.");
+		return;
+	}
+	const TerrainVT::Tier tier = TerrainVT::Tier(p_tier);
+	const TerrainVT::ChannelGroup group = TerrainVT::ChannelGroup(p_group);
+	const TerrainVT::Delivery previous = _vt.delivery.get(tier, group);
+	// A method this build cannot deliver is refused here, at the one door every write goes through
+	// (the panel, the four properties, the two legacy booleans and a script). The alternative - take
+	// the cell and render from the region arrays anyway - is a cell that reads as working while the
+	// picture is the fallback, which is exactly the state this refusal exists to make impossible.
+	if (!is_vt_delivery_supported(p_group, p_delivery)) {
+		LOG(WARN, "Delivery ", p_tier == int(TerrainVT::Tier::Near) ? "near" : "far", "/",
+				p_group == int(TerrainVT::ChannelGroup::Material) ? "diffuse+normal" : "height", ": ",
+				TerrainVT::delivery_name(TerrainVT::Delivery(p_delivery)), " is unavailable: ",
+				get_vt_delivery_unsupported_reason(p_group, p_delivery), "; it stays ",
+				TerrainVT::delivery_name(previous), ".");
+		return;
+	}
+	const bool changed = _vt.delivery.set(tier, group, TerrainVT::Delivery(p_delivery));
+	if (changed) {
+		LOG(INFO, "Delivery ", p_tier == int(TerrainVT::Tier::Near) ? "near" : "far", "/",
+				p_group == int(TerrainVT::ChannelGroup::Material) ? "diffuse+normal" : "height", ": ",
+				TerrainVT::delivery_name(previous), " -> ", TerrainVT::delivery_name(TerrainVT::Delivery(p_delivery)));
+	}
+	_resolve_vt_delivery(changed);
+}
+
+void Terrain3D::set_vt_delivery_near_material(const int p_delivery) {
+	set_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Material), p_delivery);
+}
+
+void Terrain3D::set_vt_delivery_near_height(const int p_delivery) {
+	set_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Height), p_delivery);
+}
+
+void Terrain3D::set_vt_delivery_far_material(const int p_delivery) {
+	set_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Material), p_delivery);
+}
+
+void Terrain3D::set_vt_delivery_far_height(const int p_delivery) {
+	set_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Height), p_delivery);
+}
+
+// The assembly rule, in one place. Every write to the matrix - the four properties, the generic
+// setter and the two legacy views - reaches the services through here, so a method's object has one
+// owner and a new method adds one arm rather than a setter that has to remember to rebuild.
+//
+// **Creation is selection-driven; freeing is at teardown.** A method no cell ever selected is never
+// built, which is the whole point: an all-`Direct` configuration owns no view, no page pool, no
+// material arrays, no VT uniform, no shader arm and no pass - measured in `vt_delivery`. What a
+// *deselection* does is stop the service: its pass stops, its uniform gate closes, its arms leave
+// the generated shader, its protected pages are released and its capacity is no longer reserved.
+// The object itself stays, deliberately, for three reasons that are one decision:
+//
+//   * it is a residency cache as well as a renderer. Freeing it releases every page it holds, so a
+//     toggle would cost a full re-stream - and the lifetime design (`docs/vt_lifetime_review.md`)
+//     treats a toggle as a rendering choice, not a residency reset. Four recorded scenarios toggle
+//     and then measure continuity across it.
+//   * the pool and the producer are **shared** between the two views (rule 6 of the assembly doc).
+//     They are not per-cell state, so "this cell is direct now" cannot decide their lifetime, and
+//     freeing one view while the other samples the pool is exactly the coupling that produced the
+//     five-suite failure recorded in section 9 there.
+//   * it removes a whole class of failure by construction: with no view ever freed at runtime,
+//     `_vt.surface_vt` cannot become null under a code path written when it never could. Five
+//     suites crashed or failed on the unguarded dereferences the first attempt exposed.
+//
+// The tick side effect is applied even when the write did not move the cell: a harness that
+// switched processing off before re-applying a setting has to get it back, which is the contract at
+// the top of this file and the reason this is not an early return.
+void Terrain3D::_resolve_vt_delivery(const bool p_changed) {
+	// The clipmap is the one method whose service is per channel *group* rather than per tier: a ring
+	// carries one group's channel, so a cell selecting Clipmap asks for exactly one ring, and the
+	// group that selected it is the ring's identity. Every ring that exists is reconfigured here as
+	// well, so a size or level write lands on the same call as the cell that selected the method.
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
+		if (_vt.clipmap[group] != nullptr || _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
+			_setup_vt_clipmap(channel);
+		}
+	}
+	if (has_avt_delivery() && _vt.surface_vt == nullptr) {
+		_setup_surface_vt();
+	}
+	if (has_svt_delivery() && _vt.surface_svt == nullptr) {
+		_setup_surface_svt();
+	}
+	if (p_changed) {
+		if (!has_avt_delivery() && _vt.surface_vt != nullptr) {
+			// A field that was turned off must give back what it held from the *shared* pool: the
+			// coarse owner's pages are protected, and a protection held by a field nobody samples is
+			// a slot the surviving field can never evict. It must also forget what it proved - a
+			// settled verdict describes a residency that is no longer maintained. Both used to live
+			// in the enable setter; they belong here now, because the cell is what turns the field
+			// off.
+			_release_avt_coarse_protections();
+			_vt.avt_settled.unverify();
+		}
+		if (_initialized && _material.is_valid()) {
+			// The shader's variant is built from the service set, and its uniform gate from the
+			// material group's own cell: one rebuild covers both, and the flag the material compares
+			// (`_shader_uses_vt` against `_needs_vt_shader()`) is what decides whether the code is
+			// regenerated or only the uniforms are rebound.
+			_material->update(Terrain3DMaterial::REGION_ARRAYS);
+		}
+	}
+	if (has_vt_delivery() && _initialized) { set_physics_process(true); }
+}
+
+// Releases the near field's coarse owner from the shared pool's protection. Called when the field
+// stops being selected and when it is destroyed: the two moments it stops being sampled, and
+// therefore the two moments its reservation is not a reservation for anything.
+void Terrain3D::_release_avt_coarse_protections() {
+	if (_vt.surface_vt == nullptr) {
+		return;
+	}
+	for (const auto &page : _vt.avt_coarse.pages) {
+		const int slot = _vt.surface_vt->lookup_page_exact(page.owner, page.mip, page.x, page.y);
+		if (slot >= 0 && _vt.surface_vt->is_page_protected(slot)) { _vt.surface_vt->protect_page(slot, false); }
+	}
+}
+
+///////////////////////////
+// Clipmap ring
+///////////////////////////
+
+// The ring's one owner, called by the assembly rule. Which *source* carries a group is the whole of
+// the difference between the rings: the addressing, the levels, the strips and the budget are one
+// object for either group, so a second channel is a source and a line here rather than a second
+// clipmap implementation.
+//
+// A ring is a residency cache as well as a renderer, so a deselection stops its pass and keeps its
+// content - the rule the two views follow (`_resolve_vt_delivery()`), and a selection that comes
+// back finds the ring it left instead of a blank one. The return value is whether a ring exists after
+// the call, which is what `debug_update_vt_clipmap()` reports as -1 rather than as "produced nothing".
+bool Terrain3D::_setup_vt_clipmap(const TerrainVT::ChannelGroup p_group) {
+	if (_data == nullptr) {
+		return false;
+	}
+	const int index = int(p_group);
+	if (_vt.clipmap[index] == nullptr) {
+		if (p_group != TerrainVT::ChannelGroup::Height) {
+			// The matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`),
+			// so this branch is reached by `debug_update_vt_clipmap()` asking for a channel no source
+			// carries: the material group's, which is M4. It says so per call rather than handing
+			// back a ring nothing could produce.
+			LOG(WARN, "Clipmap has no source for the ",
+					p_group == TerrainVT::ChannelGroup::Material ? "diffuse+normal" : "height",
+					" channel in this build; it stays direct.");
+			return false;
+		}
+		LOG(DEBUG, "Creating height clipmap ring");
+		_vt.clipmap[index] = std::make_unique<Terrain3DClipmap>(
+				std::make_unique<Terrain3DClipmapSourceHeight>(_data));
+	}
+	Terrain3DClipmap::Config config;
+	config.size = _vt.clipmap_size;
+	config.levels = _vt.clipmap_levels;
+	config.base_world = _vt.clipmap_base_world;
+	// One value a texel, in the height map's own format: the ring's layer is what the height arm
+	// samples in place of the region array, so the two carry the same numbers in the same format.
+	config.channels = 1;
+	config.format = Image::FORMAT_RF;
+	_vt.clipmap[index]->configure(config);
+	return true;
+}
+
+// Whether any ring object exists. Read by the ring's debug view, its native preview and the report:
+// the gate is "is there a ring to draw", not "does a cell name the method", because a build that
+// cannot deliver Clipmap still has the mechanism - built by `debug_update_vt_clipmap()` - and a ring
+// that exists is what a picture of a ring is a picture of.
+bool Terrain3D::has_vt_clipmap_ring() const {
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		if (_vt.clipmap[group] != nullptr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void Terrain3D::set_vt_clipmap_size(const int p_size) {
+	// 0 is refused rather than clamped: a ring with no texels an axis is not a small clipmap, it is
+	// not a clipmap, and the setter should not accept a shape the mechanism cannot build.
+	if (p_size <= 0 || p_size == _vt.clipmap_size) {
+		return;
+	}
+	_vt.clipmap_size = p_size;
+	_resolve_vt_delivery(false);
+}
+
+void Terrain3D::set_vt_clipmap_levels(const int p_levels) {
+	if (p_levels <= 0 || p_levels == _vt.clipmap_levels) {
+		return;
+	}
+	_vt.clipmap_levels = p_levels;
+	_resolve_vt_delivery(false);
+}
+
+void Terrain3D::set_vt_clipmap_base_world(const real_t p_metres) {
+	if (p_metres <= 0.f || Math::is_equal_approx(p_metres, _vt.clipmap_base_world)) {
+		return;
+	}
+	_vt.clipmap_base_world = p_metres;
+	_resolve_vt_delivery(false);
+}
+
+void Terrain3D::set_vt_clipmap_budget_texels(const int p_texels) {
+	// The budget is not a shape: a ring keeps its content when it changes, and 0 is a legal "produce
+	// nothing this tick" that a test uses to hold the ring still.
+	_vt.clipmap_budget_texels = MAX(0, p_texels);
+}
+
+real_t Terrain3D::sample_vt_clipmap(const int p_group, const Vector2 &p_world_xz, const int p_channel) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return NAN;
+	}
+	const Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
+	return ring != nullptr ? ring->sample(p_world_xz, p_channel) : NAN;
+}
+
+// The height arm's binding, and the reason it is one dictionary rather than five accessors: the
+// shader's copy of the ring's addressing has to be the *same* numbers the CPU's is, and the two are
+// one publish. `centers` and `rings` are the per-level state the shader indexes with, `valid` is the
+// gate that keeps a level which is not current out of a fragment, and the shape is the level rule
+// (`base_world * 2^l` metres in `size` texels).
+//
+// Padded to `Terrain3DClipmap::MAX_LEVELS`, which is the shader's declared array size: Godot's
+// uniform arrays are read at their declared length, so a shorter binding leaves the tail undefined,
+// and `levels` is what tells a reader how many entries are meaningful. Not published in
+// `get_vt_settings()`: the dock and the tests read it from here, and the settings dictionary already
+// carries the same state per level (`clipmap[group].level_reports[]`).
+Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
+	Dictionary arm;
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return arm;
+	}
+	const Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
+	if (ring == nullptr || !ring->is_configured()) {
+		return arm;
+	}
+	const int levels = ring->get_level_count();
+	PackedVector2Array centers;
+	PackedVector2Array rings;
+	PackedFloat32Array valid;
+	centers.resize(Terrain3DClipmap::MAX_LEVELS);
+	rings.resize(Terrain3DClipmap::MAX_LEVELS);
+	valid.resize(Terrain3DClipmap::MAX_LEVELS);
+	for (int level = 0; level < levels; level++) {
+		const Terrain3DClipmap::Level &entry = ring->get_level(level);
+		centers[level] = entry.center;
+		rings[level] = Vector2(real_t(entry.ring.x), real_t(entry.ring.y));
+		valid[level] = entry.valid ? 1.f : 0.f;
+	}
+	arm["configured"] = true;
+	arm["texture"] = ring->get_texture_rid();
+	arm["size"] = ring->get_size();
+	arm["levels"] = levels;
+	arm["base_world"] = ring->get_base_world();
+	arm["channels"] = ring->get_channel_count();
+	arm["centers"] = centers;
+	arm["rings"] = rings;
+	arm["valid"] = valid;
+	return arm;
+}
+
+// An edit reached the source. Every ring that carries a channel the edit can change re-produces the
+// texels the area covers and stops serving the levels that touch it until they have, so a fragment
+// reads the region array for those few ticks instead of a height from before the stroke. Only a ring
+// that exists is told: a group with no ring has nothing that could be stale.
+int Terrain3D::invalidate_vt_clipmap_area(const AABB &p_area) {
+	const Vector2 origin(p_area.position.x, p_area.position.z);
+	const Rect2 rect(origin, Vector2(p_area.size.x, p_area.size.z));
+	int queued = 0;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		if (ring == nullptr) {
+			continue;
+		}
+		queued += ring->invalidate_rect(rect);
+	}
+	// The levels that stopped being current are the shader's gate, and the gate is a uniform: without
+	// this the ring would keep serving the height it held before the stroke.
+	_update_vt_clipmap_arm();
+	return queued;
+}
+
+// Whether any ring's addressing moved since the shader was bound with it, and the rebind that
+// follows. Both halves are the ring's own state rather than a copy kept here, so a ring that was
+// freed and rebuilt is a change like any other.
+bool Terrain3D::_vt_clipmap_state_changed() {
+	bool changed = false;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		const uint64_t stamp = ring != nullptr ? ring->get_state_stamp() : 0;
+		if (stamp != _vt.clipmap_state[group]) {
+			_vt.clipmap_state[group] = stamp;
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+void Terrain3D::_update_vt_clipmap_arm() {
+	if (!_vt_clipmap_state_changed()) {
+		return;
+	}
+	if (_initialized && _material.is_valid()) {
+		_material->update_vt_clipmap_uniforms();
+	}
+}
+
+// The mechanism's own entry, beside the read above, and the reason it exists: the matrix refuses
+// `Clipmap` for every group in this build (`is_vt_delivery_supported()` - the height channel's arm is
+// M2b and the material channel's source is M4), so no cell can name the method and the tick never
+// enters its phase. The ring's addressing, strips, budget and content still have to be measurable -
+// `native/tests/vt_clipmap` is nothing but those readings - so this runs exactly what that phase
+// runs: the same `Terrain3DClipmap::update()`, with the same focus (`get_clipmap_target_position()`)
+// and the same `vt_clipmap_budget_texels`, over the rings the caller names rather than the rings a
+// cell selected. It publishes the same two numbers the phase publishes, so a panel or a test reads
+// the mechanism through the one report either way.
+//
+// A reading taken here is the mechanism's and not a render's: nothing samples the ring yet.
+int Terrain3D::debug_update_vt_clipmap(const int p_group) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return -1;
+	}
+	if (!_setup_vt_clipmap(TerrainVT::ChannelGroup(p_group))) {
+		_vt.clipmap_produced_texels = 0;
+		return -1;
+	}
+	Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
+	if (ring == nullptr) {
+		_vt.clipmap_produced_texels = 0;
+		return -1;
+	}
+	const uint64_t started = Time::get_singleton()->get_ticks_usec();
+	const Vector2 focus = v3v2(get_clipmap_target_position());
+	_vt.clipmap_produced_texels = ring->update(focus, _vt.clipmap_budget_texels);
+	_vt.vt_clipmap_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+	// The same rebind the tick's phase does, so a ring a test or the dock drove with this entry is
+	// the ring the shader reads.
+	_update_vt_clipmap_arm();
+	return _vt.clipmap_produced_texels;
 }

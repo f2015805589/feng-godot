@@ -1314,3 +1314,53 @@ Run GPU tests serially. The block test dispatches the real encoder and uses the 
 independent decompressor to check negative normals, BC3 alpha tail indices, independent
 color/alpha, roughness and validity. The rendering matrix compares AVT/SVT raw baselines with unified BC7/BC3 compression,
 asserts all three physical formats match, and includes normal strength above one.
+
+## The delivery matrix and the clipmap ring
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_delivery_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_clipmap_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_debug_views_runner.py --driver d3d12
+```
+
+`vt_delivery` is the assembly test: it writes the four (tier, group) cells before a terrain enters
+the tree and asserts the configuration owns **nothing** - no view object, no page pool, no material
+array, no VT uniform and no shader arm - then takes a live terrain through all-direct, the
+undeliverable writes, the mechanism's entry and restored, asserting what each stopped or built. It
+reads the live service pointers, the material's own verdict on the shader it generated
+(`is_shader_using_vt()`) and the published booleans (`avt_service`/`svt_service`/`clipmap_service`,
+`clipmap_ring`, `delivery_supported`/`delivery_unsupported`), never a frame time, because the claim
+is about what *exists*. The acceptance rule is the matrix's other half here: `near/height = Clipmap`,
+`far/height = AVT` and `far/material = Clipmap` are written in one step and every cell keeps the
+method it had, because a method this build cannot deliver for that group is refused rather than
+stored (the height channel's choices are `Direct` and the ring; the material channel has no clipmap
+source yet).
+
+`vt_clipmap` is the ring's own test, and it **no cell selects anything**: this build refuses
+`Clipmap` for the height group, so the ring is built and stepped by
+`Terrain3D::debug_update_vt_clipmap()` - the same `Terrain3DClipmap::update()`, focus and budget the
+tick's clipmap phase runs - on a one-level ring of 16 texels an axis over 16 m, i.e. one texel a
+metre, so every production number is exact. It pins the shape and snap from the level reports, the
+strip cost (a one-texel move produces exactly `size` texels of CPU production and one whole-layer
+upload; a diagonal produces both bands; a stationary focus produces nothing and is counted idle), the
+budget (with `vt_clipmap_budget_texels = 4` one tick produces exactly 4 and queues the job, 63 more
+drain the level, and the level uploads once), the content (every texel centre is read back through
+`Terrain3D::sample_vt_clipmap()` and compared against `Terrain3DData.get_pixel()` at the same world
+position, plus a level built out of eight strips versus the same level rebuilt whole), and the
+refusal itself (a terrain whose only `Clipmap` write was refused owns no ring, produces nothing and
+answers a sample with `NAN`). See `docs/vt_delivery_assembly.md` section 8.2 for the readings.
+
+`vt_debug_views` is the editor-facing half: the order the matrix is read in (the native `Surface VT`
+subgroups straight from `get_property_list()` - `VT Setting` with the delivery matrix first inside
+it, then `Clipmap`, `AVT`, `SVT`, `CDLOD`, `VT Page` - and the Surface VT window's own hierarchy),
+the dock's four delivery rows (the height row disables `Clipmap`, `AVT` and `SVT`, the
+diffuse+normal row disables only `Clipmap`, each with its reason as the tooltip - read from
+`is_item_disabled()` rather than from a screenshot), the VT Page's clipmap view **rendered** into a
+SubViewport (the pixel counts prove the level strip, the world map and the queued strips' colour are
+all drawn; the screenshot is kept as `user://vt_clipmap_debug_view.png`), and the gate on both debug
+Controls. The clipmap's gate is the ring *object* (`has_vt_clipmap_ring()`) rather than a matrix
+cell, so no ring reports unavailable, hides itself and never calls the native preview, while a ring
+the entry built makes the view appear on the same poll - read from
+`clipmap_preview_calls`/`..._computed` and `avt_preview_calls`/`..._computed`, which separate an ask
+that was refused from one that did the work.
+

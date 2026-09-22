@@ -1,11 +1,10 @@
-# Alignment with the HDRP adaptive virtual texture
+# Alignment with the reference adaptive virtual texture
 
 ## 1. Scope and status
 
-The reference implementation at `D:\godot\HDRPVirtualTexture` (Unity 6000.1.11f1, HDRP,
-UPM package `com.noovertime.virtual-texture`, author lifangjie / NoOvertime) was read
-end to end. This document records what this addon takes from it, what it does not, in
-which order the work lands, and how each step is verified.
+The reference implementation (Unity 6000.1.11f1, its adaptive virtual texture, UPM package
+`com.noovertime.virtual-texture`) was read end to end. This document records what this addon takes
+from it, what it does not, in which order the work lands, and how each step is verified.
 
 **This is a plan. Nothing below describes current code unless it says so.** Every claim
 about current behaviour cites a file and line.
@@ -17,7 +16,7 @@ measurement, **P3 (H2)** has landed as a mode with the default unchanged, **P4 (
 **P1's three seams have all landed** (section 5). Nine code changes: a behaviour-neutral diagnostic fix
 (section 7.6.1); the plan's **rate term** (section 7.7.2), a measured 12-13% reduction in pool churn
 and 76% less unsampled residency at unchanged CPU cost; the **churn counters** of P0e (section 7.7.3),
-diagnostics only; the **fallback-policy seam** with HDRP's per-unit guarantee as its second strategy
+diagnostics only; the **fallback-policy seam** with the reference's per-unit guarantee as its second strategy
 (section 7.7.4); the **capability report** that answers the H4 probe on the running binary (section
 7.7.5); **`VTMipRule` + `VTPageDemandSource`** (P1) - the far field's level arithmetic moved into the
 engine-free contract surface and the two demand-source questions given one owner; the **cap change is
@@ -32,7 +31,7 @@ field's level rule is stable per owner and the churn is lateral. **P4 is now clo
 instances**: step 1 and the setting landed (sections 7.7.6, 7.7.9), and step 2 - the dynamic remap - is
 *not applicable to this addressing*, on evidence rather than on a deferral (section 7.7.10: the grid is
 derived from the capacity, the atlas is one `Texture2DArray` recreated blank when it grows, so `grow()`
-evicts every slot and there is no capacity change that moves addresses without destroying content; HDRP
+evicts every slot and there is no capacity change that moves addresses without destroying content; the reference
 remaps because its physical table never grows). That section also corrects two comments that claimed
 growth keeps residency, measures the wipe in a normal session (`evict` +355 with no generation bump),
 and A/Bs `vt_auto_capacity` off (-4% `alloc`, +21% `evict`, deficit peak unchanged at 102). **No clause
@@ -43,11 +42,11 @@ Section 1.1 is the per-clause table. Nothing is committed.
 
 The agreed scope is:
 
-* Adopt the mechanisms where HDRP AVT is genuinely stronger.
-* Also fill the gaps where HDRP AVT has a mechanism this addon lacks -- dynamic remap of
+* Adopt the mechanisms where the reference AVT is genuinely stronger.
+* Also fill the gaps where the reference AVT has a mechanism this addon lacks -- dynamic remap of
   the resident set on a level-space change is the example.
 * **Keep** the far-field SVT, the page-arrival fade, the motion/turn lead, the address
-  budget, the diagnostics and the tests. These are extensions HDRP AVT does not have.
+  budget, the diagnostics and the tests. These are extensions the reference AVT does not have.
 * Express the result as strategies behind existing seams, not as a rearrangement of the
   existing files (section 5).
 
@@ -65,7 +64,7 @@ not to write the code, recorded where the reason was found.
 | Fragment-level feedback (H4) | **Closed, two engine-level reasons** | section 7.7.5 (no storage-image type in the shading language, so a `shader_type spatial` fragment cannot write a UAV) and section 7.7.5's addendum (the render-thread hook passes no frame context, and its FRP operation is ordered "before the G-buffer", so a compute pass cannot see the screen either). The enabling fork patch is named; no measurement asks for it |
 | Pixel-footprint level rule (H1) | **Answered** | far-field form closed by section 7.3's arithmetic; the near field already has it and section 7.7.7 measures it stable per owner (`avt_depth_down` 0-2). The level rule is a value on the seam (`TerrainVT::MipRule`, pinned by `test_mip_rule()`) |
 | Per-resident-unit coarsest page (H2) | **Landed as a mode, default unchanged** | `surface_svt_fallback_policy` with `_svt_global_root_pyramid()` / `_svt_per_unit_coarsest()`; measured in section 7.7.4 (20 -> 1 pinned page, `served` unchanged) |
-| Far-field level remap (H3) | **Closed: the mechanism's case does not exist here** | step 1 (runtime raise) and the setting landed (sections 7.7.6, 7.7.9); the remap itself in section 7.7.10 (the grid is derived from the capacity and the atlas is recreated blank when it grows, so the address change and the content loss are one event; HDRP remaps because its physical table never grows) |
+| Far-field level remap (H3) | **Closed: the mechanism's case does not exist here** | step 1 (runtime raise) and the setting landed (sections 7.7.6, 7.7.9); the remap itself in section 7.7.10 (the grid is derived from the capacity and the atlas is recreated blank when it grows, so the address change and the content loss are one event; the reference remaps because its physical table never grows) |
 | Replace/complete the AVT+SVT demand and fallback logic | **Landed** | the demand-source seam (`CPURule` / `Projected`, section 5) and the fallback-policy seam; section 5's table records what each landed *as* |
 | Keep feng's non-conflicting optimizations | **Kept** | far-field SVT coverage, page fade, motion/turn lead, address budget, diagnostics: all still present, and the far field's own miss rate stays ~1/frame in the phase E cruise; the plan's rate term *improved* churn 12-13% (section 7.7.2) |
 | Collapse demand source / level rule / fallback policy into low-coupling strategy interfaces | **Landed** | section 5, all three seams, with the layer-not-alternative correction |
@@ -78,9 +77,9 @@ with the code path that would have to change named. Everything the objective cou
 
 ### 1.2 The two projects' shapes
 
-| | HDRP AVT | This addon |
+| | the reference AVT | This addon |
 | --- | --- | --- |
-| Language / host | C# + HLSL on Unity HDRP, 26 files, ~80 KB | C++ GDExtension + GLSL on a Godot fork, VT machinery ~10 kLOC |
+| Language / host | C# + HLSL on the Unity reference renderer, 26 files, ~80 KB | C++ GDExtension + GLSL on a Godot fork, VT machinery ~10 kLOC |
 | Sector / page / border | 64 m / 256 / 4 (264 stored) | 64 m / 256 / 9 (274 stored) |
 | Indirection | 1024 x 1024 `R16_UINT`, 9 hand-written mips | near 2048 x 2048 `R32F`; far `max(64, page_count * 4)` entries, hand-written mips |
 | Indirection payload | physical slot, 16 bit, 65535 = empty | physical slot, 11 bit, 65535 = empty |
@@ -88,28 +87,28 @@ with the code path that would have to change named. Everything the objective cou
 | Max density | 1024 texel/m per sector (`HighestResolution` 65536) | near `surface_vt_texels_per_meter` 1024; far `surface_svt_texels_per_meter` 1.0 |
 | Reach | camera sector +- 6 sectors (~384 m) | near 384 m (`surface_vt_distance`, section 7.7.14), far 6144 m (`surface_svt_distance`) |
 
-## 2. Already HDRP AVT
+## 2. Already in the reference AVT
 
 The addressing core is a port, not a design that happens to resemble one. Rebuilding any
 of the left column would be re-implementing what exists.
 
-| HDRP AVT | This addon | Notes |
+| the reference AVT | This addon | Notes |
 | --- | --- | --- |
-| `Runtime/Core/VirtualImageAtlas.cs` | `TerrainVT::VirtualImageAtlas`, `terrain_vt.h:152-380` | Same 4-ary tree, same `parent = (index - 1) >> 2`, same child index `index << 2` + 1..4, same low-coordinate-first DFS push order (`push_children`, `terrain_vt.h:354`), same "a non-minimal node must have no occupied descendant". `occupied_area_` replaces HDRP's child count so the accounting stays valid with all 65536 leaf blocks allocated. |
+| `Runtime/Core/VirtualImageAtlas.cs` | `TerrainVT::VirtualImageAtlas`, `terrain_vt.h:152-380` | Same 4-ary tree, same `parent = (index - 1) >> 2`, same child index `index << 2` + 1..4, same low-coordinate-first DFS push order (`push_children`, `terrain_vt.h:354`), same "a non-minimal node must have no occupied descendant". `occupied_area_` replaces the reference's child count so the accounting stays valid with all 65536 leaf blocks allocated. |
 | `InsertImage` / `RemoveImage` | `try_insert_avt_image` / `remove_image` | Same. |
 | `ReallocateVirtualPagePass.ReallocateVirtualImage` (allocate the new block, remap, release the old) | `try_resize_avt_image` + `_remap_sector_pages`, `terrain_3d_virtual_texture_sector.cpp:85-144` | Same transaction, plus an explicit rollback of the old node when the new size cannot be placed. |
 | `IndirectionTexture.RemapVirtualImage` (a page keeps its world footprint, so a doubling moves it one mip) | `new_mip = old_mip + new_max_mip - old_max_mip`, `terrain_3d_virtual_texture_sector.cpp:120` | Identical rule. |
-| `Runtime/Core/IndirectionTexture.cs` (hand-written mip chain, per-mip writes, per-image clearing) | `Terrain3DVTIndirection`, `terrain_3d_vt_indirection.{h,cpp}` | Same idea; upload is coalesced into 16x16 tile patches and scattered by a compute shader instead of HDRP's separate mip0 / other-mip kernels. |
+| `Runtime/Core/IndirectionTexture.cs` (hand-written mip chain, per-mip writes, per-image clearing) | `Terrain3DVTIndirection`, `terrain_3d_vt_indirection.{h,cpp}` | Same idea; upload is coalesced into 16x16 tile patches and scattered by a compute shader instead of the reference's separate mip0 / other-mip kernels. |
 | `VirtualTexture.hlsl: MatchMipLevel` (walk coarser, `>>= 1`, until a resident slot) | `TerrainVT::try_match_indirection_slot`, `terrain_vt.h:59-89` | Same walk, same "the level it succeeded at is the level sampled". |
-| `PhysicalPageAtlas` + `LRUCache` (miss evicts the least recently used slot, and the evicted page's indirection entry is cleared as it goes) | `Terrain3DVTPagePool` + `_request_virtual`, `terrain_3d_virtual_texture_lookup.cpp:32-73` | Same, plus an acquire/commit/abort transaction HDRP does not have: the victim is only *chosen* at acquire and actually evicted at commit, so a producer that fails destroys nothing. |
+| `PhysicalPageAtlas` + `LRUCache` (miss evicts the least recently used slot, and the evicted page's indirection entry is cleared as it goes) | `Terrain3DVTPagePool` + `_request_virtual`, `terrain_3d_virtual_texture_lookup.cpp:32-73` | Same, plus an acquire/commit/abort transaction the reference does not have: the victim is only *chosen* at acquire and actually evicted at commit, so a producer that fails destroys nothing. |
 | `Constant.cs` page geometry | `Terrain3DVTState`, `terrain_3d_vt_state.h:491-500` | Same numbers, same stored-size-with-border arithmetic. |
-| Address size from screen footprint | `terrain_3d_sector_avt_hierarchy.cpp:116-119` (`screen_mip = log2(texels_per_meter / required_density)`, `wanted = base >> screen_mip`) | Same idea as HDRP's `CalculateTargetImageSize`, driven by a required density rather than a switch distance. |
+| Address size from screen footprint | `terrain_3d_sector_avt_hierarchy.cpp:116-119` (`screen_mip = log2(texels_per_meter / required_density)`, `wanted = base >> screen_mip`) | Same idea as the reference's `CalculateTargetImageSize`, driven by a required density rather than a switch distance. |
 | `Sector2VirtualImageInfoTexture` (one uint per sector carrying image origin and size log) | `_avt_sector_directory` (`RGBA32F`, two texels per sector) read by `avt_find_sector`, `main.glsl:555-560` | Same job, different encoding (origin and size as floats rather than packed into one uint). |
 
-Two additions of this addon's that HDRP AVT does not have and that must survive:
+Two additions of this addon's that the reference AVT does not have and that must survive:
 
 * **Address-space budgeting.** `virtual_bias` (`terrain_3d_sector_avt_hierarchy.cpp:209-216`)
-  halves every sector's requested block until the visible set fits. HDRP lets `InsertImage`
+  halves every sector's requested block until the visible set fits. the reference lets `InsertImage`
   fail and asserts under `DEBUG_TERRAIN`. Keeping this is a deliberate divergence.
 * **Residency policy under pressure.** A shared coarseness floor (`svt_floor_level`) plus a
   pinned root pyramid, rather than failing an allocation
@@ -117,7 +116,7 @@ Two additions of this addon's that HDRP AVT does not have and that must survive:
 
 ## 3. Why the address space is not replaced
 
-HDRP AVT is not "a far field too", it is **a 384 m near field with no outside**. Two
+the reference AVT is not "a far field too", it is **a 384 m near field with no outside**. Two
 constants make that exact, and they are tuned against each other:
 
 * `ReallocateVirtualPagePass.UpdateRequestSectors` (`ReallocateVirtualPagePass.cs:67-94`)
@@ -132,19 +131,19 @@ constants make that exact, and they are tuned against each other:
   `size = 65536 >> ((int)log2(t) + 1)` for `t >= 1`. At 384 m that lands exactly on
   `MinimalVirtualImageSize` (2048 texels = 32 texel/m). Beyond the disc, the sector has no
   image, `Sector2VirtualImageInfoTexture` reads 0, `OutputPageID` writes 0 and `SampleVT`
-  returns 0, so HDRP's terrain falls back to its own global map.
+  returns 0, so the reference's terrain falls back to its own global map.
 
-The fallback mechanism HDRP uses inside that disc is **one guaranteed coarsest page per
+The fallback mechanism the reference uses inside that disc is **one guaranteed coarsest page per
 resident sector** (`DeduplicateJob` adds, for every resident virtual image, the page at
 `mip = sizeLog`, i.e. a single physical page covering the whole 64 m sector). That
-guarantee is what bounds HDRP's reach, because the pool must hold one page per sector:
+guarantee is what bounds the reference's reach, because the pool must hold one page per sector:
 
 | Pool | Detail pages | Guaranteed pages | Reach (one page per sector) |
 | --- | --- | --- | --- |
 | 256 (this addon's default) | ~200 | ~56 | `sqrt(200/pi)` ~= 8 sectors ~= **512 m** |
 | 1024 (the dock's maximum) | ~800 | ~224 | `sqrt(800/pi)` ~= 16 sectors ~= **1024 m** |
 
-512 m is exactly `surface_vt_distance`'s default. So at the default pool, HDRP's per-sector
+512 m is exactly `surface_vt_distance`'s default. So at the default pool, the reference's per-sector
 guarantee reaches exactly as far as this addon's near field -- and this addon reaches
 6144 m only because the SVT world grid lets **one page cover kilometres** instead of one
 sector. A faithful port would therefore delete the far field, and with it:
@@ -156,17 +155,17 @@ sector. A faithful port would therefore delete the far field, and with it:
   budget and the diagnostics are all orthogonal to the address space and would survive.
 
 Since the far field is the subsystem that exists to solve the far field, the work below
-adopts HDRP's *mechanisms* without adopting its *reach*.
+adopts the reference's *mechanisms* without adopting its *reach*.
 
 ## 4. Adopted mechanisms
 
-Each item states what HDRP does, what this addon does today, what changes, where it lands,
+Each item states what the reference does, what this addon does today, what changes, where it lands,
 the risk, and how it is verified. H1-H3 are the substance; H4 is gated on a feasibility
 probe; H5 is verification only.
 
 ### H1. The pixel-footprint level rule
 
-**HDRP.** `VirtualTexture.hlsl: GetVirtualPageID` takes the fragment's level from
+**The reference.** `VirtualTexture.hlsl: GetVirtualPageID` takes the fragment's level from
 `MipLevelAnisotropy(positionWS.xz, MAX_TEXEL_DENSITY)`, a port of the D3D anisotropic LOD
 specification with `maxAniso = 8`, and moves it into the sector's own virtual-image mip
 space with `- 8 + virtualPageSizeLog`, clamped to `[0, virtualPageSizeLog]`. Demand is
@@ -223,7 +222,7 @@ terms. So H1's remaining work in this document is one measurement, not a mechani
 
 ### H2. The per-unit coarsest-page guarantee
 
-**HDRP.** `DeduplicateJob` de-duplicates the read-back page IDs and then adds, for every
+**The reference.** `DeduplicateJob` de-duplicates the read-back page IDs and then adds, for every
 resident virtual image, one additional page at `mip = sizeLog` -- the coarsest level that
 image can express. Every unit is therefore always resolvable from a *local* fallback, and
 `MatchMipLevel` can always stop inside the unit.
@@ -234,7 +233,7 @@ image can express. Every unit is therefore always resolvable from a *local* fall
 `_svt_feedback` (`main.glsl:384`, `:509`). It guarantees coverage of *every* world position
 (asserted by `vt_root_coverage`) at a granularity of kilometres per page.
 
-**Change.** Add HDRP's guarantee as a second **fallback policy** beside the root pyramid:
+**Change.** Add the reference's guarantee as a second **fallback policy** beside the root pyramid:
 request each resident unit's coarsest level unconditionally, on every pass, so the
 fallback's granularity is the unit (a band, or a mip-0 page neighbourhood) instead of the
 whole world. Both policies publish into the same pinned set, so the existing protection
@@ -265,9 +264,9 @@ two strategies are `_svt_global_root_pyramid()` and `_svt_per_unit_coarsest()` b
 
 ### H3. Dynamic remap of the far field on a level change
 
-**HDRP.** `IndirectionTexture.RemapVirtualImage` moves resident indirection entries when a
+**The reference.** `IndirectionTexture.RemapVirtualImage` moves resident indirection entries when a
 virtual image is resized, so no content is thrown away and no frame renders a hole. It is
-the reason HDRP can reallocate on every camera move past
+the reason the reference can reallocate on every camera move past
 `CameraPositionSqrDeltaThreshold`.
 
 **Today.** The **near** field has this: `try_resize_avt_image()` allocates or rolls back,
@@ -327,12 +326,12 @@ renderer at all**, for the structural reason in section 7.7.10: the far field's 
 from the pool's capacity, the physical atlas is one `Texture2DArray` that `ensure_layers()` recreates
 blank when its layer count changes, and `Terrain3DVTPagePool::grow()` therefore evicts every resident
 slot - so the address change a remap would serve and the content loss it cannot prevent are the same
-event. HDRP can remap because its physical table never grows at runtime; what answers the same pressure
+event. the reference can remap because its physical table never grows at runtime; what answers the same pressure
 here is the coarsening the planner already has (`capacity_mip_bias`).
 
 ### H4. Fragment-level feedback (gated, last)
 
-**HDRP.** The terrain's GBuffer fragment writes its packed page ID into an `R32_UINT` UAV at
+**The reference.** The terrain's GBuffer fragment writes its packed page ID into an `R32_UINT` UAV at
 `register(u7)` through `OutputPageID`, but only at the one sub-texel of each 8x8 block that
 the frame's `BayerDither8X8` entry selects, on a target 1/8 the depth buffer's size. The
 result is read back asynchronously, de-duplicated in a Burst job, sorted coarse-to-fine and
@@ -364,7 +363,7 @@ H1, and it must not regress the property the lead exists for. Adopt it only afte
 answers: does the fork's terrain material path expose a writeable storage binding and a
 read-back that does not stall the frame? **The probe has been run and the answer is no to the first
 half and yes to the second - section 7.7.5.** There is no storage-image type in the shading language,
-so a material's fragment cannot write a UAV here and HDRP's form of this mechanism is a documented
+so a material's fragment cannot write a UAV here and the reference's form of this mechanism is a documented
 gap; the two deferred read-backs and a per-frame render-thread hook are present, so the *effect* is
 reachable as a demand-source strategy (`ScreenDrivenDemand`) rather than as a new subsystem.
 
@@ -374,7 +373,7 @@ with the CPU rule as the third.
 
 ### H5. Parity that needs no change (verify and record)
 
-| Mechanism | HDRP | This addon | Action |
+| Mechanism | the reference | This addon | Action |
 | --- | --- | --- | --- |
 | Coarse-to-fine request order | `PackedPageIDComparer` sorts by `sizeLog - mip` ascending | `PageRequestPriority` sorts by `kind` (ROOT, CURRENT, OPTIONAL), then `distance_band`, then `span` **descending** (`terrain_vt_request_priority.h:61-76`) | Equivalent intent (a larger span is a coarser page). Confirm with a counter, then record -- no code change expected. |
 | De-duplication | Burst job, `NativeHashSet<uint>`, skips 0, bounded by `MaxDeduplicatedPageCount` 256 | The plan de-duplicates per owner | Confirm with a counter; no change expected. |
@@ -433,12 +432,12 @@ Conventions this must follow, all already load-bearing in this codebase:
 
 ## 6. Rejected
 
-| HDRP mechanism | Why not |
+| the reference mechanism | Why not |
 | --- | --- |
 | The unified sector-image address space | Section 3: it is a 384 m near field, and at this pool size its own per-sector guarantee reaches the same 512 m. Adopting it means deleting the far field. |
 | Two fixed 1023 x 264 x 264 `R8G8B8A8` atlases (~570 MB) | This addon's pool is configurable (8..1024 slots) in the format the material already samples. A fixed larger atlas is a memory regression with no addressing benefit. |
 | The eight-stage, one-stage-per-frame tick | This addon's tick already budgets production (`pages_per_update` 16, `vt_frame_budget_ms`) and its demand is predictive, so it does not need a read-back round trip to decide. Splitting the tick would add a frame of latency to the near field. |
-| The packed 12+12+4+4 page ID | This addon's indirection is `R32F` with an 11-bit slot and a separate mip walk, so it has no packing overflow to work around (HDRP's README documents two workarounds for exactly that). |
+| The packed 12+12+4+4 page ID | This addon's indirection is `R32F` with an 11-bit slot and a separate mip walk, so it has no packing overflow to work around (the reference's README documents two workarounds for exactly that). |
 | No fade, no lead | Both are this addon's, both are orthogonal to the address space, and the lead is the reason a fast turn no longer shows a rectangular refinement (`terrain_3d_vt_state.h:698-702`). |
 | Falling back to a global map outside the VT reach | The region array is already the last fallback in `get_surface_value()`; the far field exists so that path is almost never taken. |
 
@@ -667,7 +666,7 @@ budget, its own pages then evict each other, the pool ends full, ~100 pages are 
 fading, and the far field is starved down to mip 8 - while two thirds of the near field's own
 plan is never sampled by the image.
 
-That is the gap the HDRP comparison is actually about. HDRP's demand source is the fragment: a
+That is the gap the reference comparison is actually about. the reference's demand source is the fragment: a
 page is requested because a fragment sampled it, so "asked for" and "sampled" cannot diverge.
 This addon's demand is computed, and this run has it asking for two to three times what the image
 samples and spending every production slot on the difference.
@@ -786,7 +785,7 @@ hundred new sampled pages. Supply 8 a tick against demand on the order of 14 a t
 
 The plan has no term for the rate at which its pages can be produced. `budget` bounds how many
 pages may be **resident**; nothing bounds how many may be **demanded per refresh** against eight
-pages a tick. That is the divergence HDRP does not have: there, demand is the fragment set and the
+pages a tick. That is the divergence the reference does not have: there, demand is the fragment set and the
 frame renders 16 pages of it, so a plan cannot outrun production by two orders of magnitude.
 
 *(The heading above says "suspected" because the section's second half did not survive its own
@@ -1042,7 +1041,7 @@ span has a **new address**, so it must be produced again whatever the plan carri
 does not change the span removes the production. Sizing the tail differently moves a few percent of
 123 addresses and cannot reach 50. That is why P0f is closed without a code change (section 8).
 
-**And it is where the HDRP comparison becomes the mechanism.** HDRP's demand is the set of pages
+**And it is where the reference comparison becomes the mechanism.** the reference's demand is the set of pages
 fragments sampled *this frame*: a function of what is on screen, stable while the screen is, and its
 pages persist in the atlas until its allocator recycles them. This addon re-derives the selection
 from a thresholded footprint/density model every generation, and the counters above name the two
@@ -1060,7 +1059,7 @@ call site no longer branches on anything:
 * `_svt_global_root_pyramid()` (policy 0, the default): today's behaviour, one complete level window
   over the whole addressable domain, which is what makes any world position resolve and what lets the
   region array be unnecessary.
-* `_svt_per_unit_coarsest()` (policy 1): HDRP's `DeduplicateJob` guarantee, literally - for every
+* `_svt_per_unit_coarsest()` (policy 1): the reference's `DeduplicateJob` guarantee, literally - for every
   virtual image the visible set selected, one page at `mip = sizeLog`, the coarsest level the world
   grid can express for it, requested unconditionally. Both publish into the same `svt_roots.pages`, so
   the pin budget, the plan key, the reuse/verify path and the coverage accounting are shared.
@@ -1092,13 +1091,13 @@ does not make that promise. That property is why the region array is not needed 
 policy's own weaker one - the domain it does not claim is printed, not asserted away, because
 section 9 forbids relaxing an assertion to make a phase pass.
 
-**Why H2 cannot do what HDRP's version does here.** HDRP's `mip = sizeLog` is *per virtual image*, so
+**Why H2 cannot do what the reference's version does here.** the reference's `mip = sizeLog` is *per virtual image*, so
 the fallback page is as wide as the unit and a fallback arrival changes only that unit's rectangle.
 In this addon the world grid has **one** cap, `svt_effective_max_mip`, which is global: the coarsest
 level a grid page can express is the same for every unit, and at 32 m mip-0 pages it is **16 km** wide
 (`svt_root_page_world` in the probe reports 16384 for policy 1). The per-unit set is therefore
 *smaller* but not *finer* - which is exactly the outcome §4/H2 said was not obvious either way, and
-§3's arithmetic is the same reason on the other side: at this pool size HDRP's per-sector guarantee
+§3's arithmetic is the same reason on the other side: at this pool size the reference's per-sector guarantee
 also reaches hundreds of metres.
 
 Making the fallback level follow the *unit* would mean pinning, for each unit, a page at the level
@@ -1125,7 +1124,7 @@ first-class uniform type (`servers/rendering/rendering_device.h:1078`) and engin
 (`servers/rendering/renderer_rd/effects/bokeh_dof.cpp:149`) - but that is reachable only from a pass
 the engine or an extension records through `RenderingDevice`, not from a material.
 
-This is the capability HDRP's H4 is made of, and it is the half that is missing. `OutputPageID`
+This is the capability the reference's H4 is made of, and it is the half that is missing. `OutputPageID`
 writing a packed page ID into an `R32_UINT` UAV from the terrain's GBuffer fragment
 (`VirtualTexture.hlsl`) has no equivalent here.
 
@@ -1161,14 +1160,14 @@ VTCAP start  rd_store=1 rd_async_buf=1 rd_async_tex=1
 so on this build the direct GPU page store and both deferred read-backs resolve, and the missing
 capability is not a boolean because it is absent from the language rather than from the binding.
 
-**Conclusion, and what it does to the phases.** HDRP's H4 cannot be ported in its form: there is no
+**Conclusion, and what it does to the phases.** the reference's H4 cannot be ported in its form: there is no
 fragment-authored demand buffer here. Its *effect* - a screen-space demand buffer produced on the
 GPU and consumed without stalling the frame - **is** reachable, and the shape it has is exactly
 `Terrain3DVTFeedback`'s minus its two accidents: it must be recorded on the **main** device (through
 patch 2's hook) rather than a local one, and it must be **driven by the screen** (the pixels the
 fragment covers) rather than by projecting every candidate. That is a **demand-source strategy**, not
 a new subsystem: the third implementation of the section 5 seam, next to `CPURuleDemand` and today's
-`ProjectedDemand`, and it is what HDRP's mechanism reduces to in this renderer.
+`ProjectedDemand`, and it is what the reference's mechanism reduces to in this renderer.
 
 So P5 closes H4's fragment form as a **documented gap** and re-scopes the seam's GPU strategy to
 `ScreenDrivenDemand` with the two accidents fixed. §4/H4's "what is kept either way" holds: the
@@ -1192,11 +1191,11 @@ covered, which means the frame's depth (or GBuffer). Three facts close that door
 3. Making it reachable is a *fork-side* change with a *new subsystem* behind it: the operation would
    have to hand the callables the scene buffers (an extension of patch 2 at
    `frp_pass_context.cpp`/`rendering_server.cpp`), and the addon would then own a screen-space demand
-   pass reading the previous frame's depth - HDRP's latency, which is acceptable, but a subsystem whose
+   pass reading the previous frame's depth - the reference's latency, which is acceptable, but a subsystem whose
    benefit nothing has measured.
 
 **And nothing measured asks for it.** The residual difference between feng's `Projected` source and
-HDRP's fragment feedback is *occlusion*: the fragment sees only visible ground, a page-level projection
+the reference's fragment feedback is *occlusion*: the fragment sees only visible ground, a page-level projection
 sees all of it. Section 7.7.1 and 7.7.7 measured what the near field's churn actually is -
 `avt_missing = max(0, new addresses - ~50)`, with the new addresses being laterally-new refined pages on
 ground the plan already covered, and the level rule stable per owner. Over-requesting occluded ground is
@@ -1469,7 +1468,7 @@ part of the addressing (`virtual = (page + half) >> mip`, `half = indirection_si
 `terrain_3d_virtual_texture_lookup.cpp:152-157`), and the indirection is sized from the capacity
 (`_configure_surface_view()`), so **a runtime capacity change moves every resident page's virtual
 coordinate while its content stays valid** - page size, border and the world grid are untouched. That
-is exactly HDRP's `RemapVirtualImage` case, and it is reached by `set_surface_svt_page_count()` (also
+is exactly the reference's `RemapVirtualImage` case, and it is reached by `set_surface_svt_page_count()` (also
 `vt_page_count`), which goes through `set_vt_page_count()` -> `_reset_vt_configuration()`. The current
 policy is the hammer: a new pool, every page released.
 
@@ -1512,12 +1511,12 @@ facts, each in the code with its own comment:
    destroys the content are **the same event**. There is no capacity change that moves the addressing
    without moving the atlas.
 
-HDRP's `RemapVirtualImage` exists because its physical page table is allocated once and never grows: a
+the reference's `RemapVirtualImage` exists because its physical page table is allocated once and never grows: a
 *virtual* image can be resized inside a fixed physical table, so moving entries is enough. This addon
 grows the table. **The mechanism that answers the same pressure here is not a remap - it is the
 coarsening that already exists** (`capacity_mip_bias`, `refinement_requests_denied`: the planner picks a
 coarser level when the hierarchy does not fit). Growth is the other response to that pressure, and it is
-a feng extension HDRP does not have. So step 2 closes as *not applicable to this addressing*, with the
+a feng extension the reference does not have. So step 2 closes as *not applicable to this addressing*, with the
 reason measured rather than argued, and the question that replaces it is the one section 7.7.1 already
 opened: whether growing is worth what it costs.
 
@@ -1813,8 +1812,8 @@ addressing 1024 texels a metre by default against the far field's one, so what l
 is resolved by a much coarser source rather than removed.
 
 **The default is 384 m as a residency decision, not a rate one.** It is also where the reference
-implementation's reach sits (HDRP's camera sector +- 6 sectors, section 3), while 512 m is what a
-256-slot pool reaches under HDRP's *per-sector guarantee* - the two numbers answer different
+implementation's reach sits (the reference's camera sector +- 6 sectors, section 3), while 512 m is what a
+256-slot pool reaches under the reference's *per-sector guarantee* - the two numbers answer different
 questions, and the guarantee is a capability the plan does not have to spend. With the near field's
 anisotropy at 8x in the same round (the sibling change, recorded in
 [`vt_sampling_review.md`](vt_sampling_review.md)) the working set grew about 50%, and the reach is
@@ -1896,7 +1895,7 @@ committed by the agent.
 | **P1** | **Done.** The three seams, of which this phase's own step is `VTMipRule` and `VTPageDemandSource`: `TerrainVT::MipRule` with `AutomaticBands`/`ExplicitTable` and `select_mip_rule()` moves the far field's distance -> level arithmetic into `terrain_vt.h`, adds `test_mip_rule()` to the engine-free contract test, and leaves the node with exactly two helpers (`_svt_mip_rule()`, `_svt_mip_rule_cap()`); the demand-source seam names `CPURule`/`Projected` and splits the two questions the one flag was answering (`_vt_projection_demand_enabled()`, `_vt_demand_source()`). `VTFallbackPolicy` landed with P3. | **Met on the evidence it can have**: no behaviour change is allowed, so the acceptance is that every existing test is unchanged. `vt_mip_bands` (the explicit table), `vt_svt_coverage`, `vt_root_coverage`, `vt_fallback`, `vt_demand`, `vt_root_budget`, `vt_svt_root_mips`, `vt_anisotropy`, `vt_feedback`, `vt_perf`, `vt_idle_cost` and the rest of the far-field set green; the engine-free contract test green with `test_mip_rule()` added; `vt_pressure` (the fixture race) and `vt_visibility` (red at `HEAD`) red as recorded. The correction the landing produced - the demand sources are *layered*, not alternatives - is in section 5, and no flag was deleted: the settings became the seams' selectors, which is what section 5's "not left beside them" was protecting against. |
 | **P2** | **Re-scoped a third time, by its own measurement - and this time the scope is falsified rather than moved.** The far-field form stays closed (§7.3) and H4's fragment form is closed (§7.7.5), so the near field is the case. P0e had put the near field's *level rule* there (`plan_overlapped` 90-99%, `plan_rescaled` 0-67, `plan_reselected` 0-75). Section 7.7.7 measures the direction of that level move and finds the premise was an artefact: `plan_overlapped` counts a newly refined child intersecting its parent, which is what being a child means, and per-owner depth never recedes (`avt_depth_down` 0-2, `avt_depth_up` 1-7, `avt_depth_same` 28-60). The churn is **lateral** - pages appearing and dropping inside owners whose depth is stable. | **Not met, and the acceptance it was written against is withdrawn as measuring the wrong mechanism.** No code change is claimed. What landed is the pair of counters that *can* answer the level question (`plan_depth_deepened`/`plan_depth_receded`/`plan_depth_same`, replacing the single-valued `plan_overlap_*`), and the next measurement is named: which density-margin branch each selected page takes, since `projected` is multiplied by discrete terms (`density_margin` 3 vs its default, and production-dependent bounds) and a boundary whose terms step while the camera moves smoothly is a boundary that moves without the camera. `avt_missing` still peaks at 89 and is still `max(0, new - ~50)`. |
 | **P3** | **Done, and the default does not change.** H2 behind a mode: `surface_svt_fallback_policy` (0 = root pyramid, the default; 1 = per-unit coarsest), two strategies behind `_svt_fallback_pages()` so no call site branches on the flag, the policy in the scan hash and the root plan key, `svt_fallback_policy` and `svt_root_page_world` reported, a probe phase that drives policy 1 on phase E's exact pose and profile, and `vt_root_coverage` asserting each policy against its own contract. | Done, **"does not"**: section 7.7.4. The pool cost is reported - **20 -> 1 pinned page**, 78 more free slots of 512 - and the cruise's `served` sequence is unchanged line for line, `>8` collapse included. `vt_root_coverage` passes with either policy, the pyramid's domain assertions untouched and the per-unit policy's `domain_covered=false` printed rather than asserted away. Default stays 0 on the numbers: the policy gives up the "any world position resolves" property that makes the region array unnecessary, and buys a smaller *set* rather than a finer *fallback*, because this renderer's `sizeLog` is the world grid's global cap and not a per-unit one. |
-| **P4** | **H3 done, and step 2 is closed as not applicable to this addressing.** Step 1: the runtime raise publishes the cap and refreshes the uniform only. The *setting* (`set_surface_svt_max_mip()`) was the same hammer and is now four lines. Step 2 (the remap) turned out to have no case here: the far field's grid size is derived from the capacity, the atlas is one `Texture2DArray` that `ensure_layers()` recreates blank when its layer count changes, and `Terrain3DVTPagePool::grow()` therefore evicts every slot - so the address change a remap would serve and the content loss it cannot prevent are the same event. HDRP remaps because its physical table never grows. The mechanism that answers the pressure here is the coarsening that already exists (`capacity_mip_bias`). | **Met, with the third part closed on evidence instead of implemented.** Section 7.7.6: the turned phase goes 3 -> 4 with `svt_cap_dirty_regions=0` and `bake_generation` frozen, 101 visible far points all hold ready persisted owners including a `mip=4` page, and the poisoned-source frame check passes. Section 7.7.9: the probe's phase G lowers the setting on a settled view and reads `resident 512->512`, `pool_gen 1->1`, `settle frames=1 worst_delta=0` where the old path rebuilt the pool. Section 7.7.10: the growth that cannot be remapped is measured in a normal session (`evict` +355 with no generation bump) and A/B'd against `vt_auto_capacity=false` (-4% `alloc`/`fade_starts`, +21% `evict`, same `avt_missing` peak of 102), with the two comments that claimed residency survives corrected. `vt_svt_coverage` green in 24.0 s (down from 63.5 s); `vt_mip_bands`, `vt_root_coverage`, `vt_auto_bake`, `vt_material`, `vt_fallback`, `vt_svt_root_mips`, `vt_demand`, `vt_perf`, `vt_idle_cost`, `vt_cells`, `vt_pressure`, `editor_dock:svt_inspector` all green on this revision. This row's own acceptance list named a `vt_residency` test that does not exist; corrected in section 4/H3. |
+| **P4** | **H3 done, and step 2 is closed as not applicable to this addressing.** Step 1: the runtime raise publishes the cap and refreshes the uniform only. The *setting* (`set_surface_svt_max_mip()`) was the same hammer and is now four lines. Step 2 (the remap) turned out to have no case here: the far field's grid size is derived from the capacity, the atlas is one `Texture2DArray` that `ensure_layers()` recreates blank when its layer count changes, and `Terrain3DVTPagePool::grow()` therefore evicts every slot - so the address change a remap would serve and the content loss it cannot prevent are the same event. the reference remaps because its physical table never grows. The mechanism that answers the pressure here is the coarsening that already exists (`capacity_mip_bias`). | **Met, with the third part closed on evidence instead of implemented.** Section 7.7.6: the turned phase goes 3 -> 4 with `svt_cap_dirty_regions=0` and `bake_generation` frozen, 101 visible far points all hold ready persisted owners including a `mip=4` page, and the poisoned-source frame check passes. Section 7.7.9: the probe's phase G lowers the setting on a settled view and reads `resident 512->512`, `pool_gen 1->1`, `settle frames=1 worst_delta=0` where the old path rebuilt the pool. Section 7.7.10: the growth that cannot be remapped is measured in a normal session (`evict` +355 with no generation bump) and A/B'd against `vt_auto_capacity=false` (-4% `alloc`/`fade_starts`, +21% `evict`, same `avt_missing` peak of 102), with the two comments that claimed residency survives corrected. `vt_svt_coverage` green in 24.0 s (down from 63.5 s); `vt_mip_bands`, `vt_root_coverage`, `vt_auto_bake`, `vt_material`, `vt_fallback`, `vt_svt_root_mips`, `vt_demand`, `vt_perf`, `vt_idle_cost`, `vt_cells`, `vt_pressure`, `editor_dock:svt_inspector` all green on this revision. This row's own acceptance list named a `vt_residency` test that does not exist; corrected in section 4/H3. |
 | **P5** | **Done in two steps, and H4 is closed in both of its forms.** Step 1: the gating question - a writeable storage binding from the material path, and a non-stalling read-back - is answered in section 7.7.5, from the engine source *and* on the running binary (`get_vt_settings()` reports `rd_direct_store`, `rd_async_buffer_readback`, `rd_async_texture_readback`, all resolved). The write is absent from the shading language, not from the binding; the two deferred read-backs and the per-frame render-thread hook are present. Step 2: the *re-scoped* form (`ScreenDrivenDemand`) is closed too, on the complementary evidence - the hook passes no frame context and its FRP operation is ordered "before the G-buffer" (`render_frp_clustered.cpp:2191`), so the screen is unreachable where the addon may record GPU work, and reaching it is a third engine patch plus a new subsystem whose benefit (occlusion-exact demand) is not on the measured critical path. | Closed as a documented gap, twice, with the gap now precise: "no fragment-authored demand buffer in this renderer" and "no frame context at the render-thread hook, by ordering". `vt_feedback` stays green (its four assertions are the working `Projected` source), and the enabling fork patch is named in section 7.7.5's addendum rather than taken. |
 | **P6** | **Done: measured, and the decision is to record rather than chase.** `vt_cap_probe.gd` now prints the worst pass's own stage dictionary (`svt_stats` is written only when a pass becomes the new worst) as its own `VTCAP worstpass` line. | **Met, by the second half of its own acceptance.** Section 7.7.8: `pass_ms=231.9` is `rootreq_ms=231.745` - the region gather is 0.04 ms, the walk 0.023 ms, the detail stage 0.084 ms - so the ~200 ms first pass is the twenty root pages being requested on the pass that first plans the pyramid (`roots=20`, `roots_skipped=false`, `svt_worst_frames_ago=1560`). ~10 ms per root page, once per session; three runs give 207.0, 207.0 and 231.7 ms for that one stage and the attribution does not move. Not chased because it is once per session and the phase asked for the breakdown first; the follow-up if it is chased is to split `rootreq_ms` per root. |
 
@@ -1941,8 +1940,8 @@ stability fix - was **closed without a code change**, because a page whose groun
 another span has a new address and must be produced again whatever the plan carries; no tail sizing
 moves 123 addresses to 50.
 
-This is the point at which the HDRP comparison becomes the mechanism rather than the diagnosis.
-HDRP's demand is the set of pages fragments sampled this frame, so it is a function of the screen and
+This is the point at which the reference comparison becomes the mechanism rather than the diagnosis.
+the reference's demand is the set of pages fragments sampled this frame, so it is a function of the screen and
 cannot re-derive the same ground differently; its pages persist until its allocator recycles them.
 This addon re-derives the selection from a thresholded footprint/density model every generation, and
 P0e names the thresholds and the rule that moves.
@@ -1962,7 +1961,7 @@ source of section 7.7.5 as the one item that is feasible but not on any measured
 
 P3 (H2) has also landed, as a mode with the default unchanged, and its result belongs with the above
 rather than beside it (section 7.7.4): the literal port pins 5% of the pages and changes nothing a
-fragment lands on, because HDRP's `sizeLog` is per virtual image and this renderer's is the world
+fragment lands on, because the reference's `sizeLog` is per virtual image and this renderer's is the world
 grid's global cap. The fallback-level question that H2 was meant to answer is the same one P2 now
 carries, from the detail side instead of the fallback side.
 

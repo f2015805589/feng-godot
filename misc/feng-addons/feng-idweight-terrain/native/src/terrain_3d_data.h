@@ -288,6 +288,13 @@ public:
 	// Height Map
 	void set_height(const Vector3 &p_global_position, const real_t p_height);
 	real_t get_height(const Vector3 &p_global_position) const;
+	// The height map texel under a world XZ, by nearest vertex, and 0 anywhere no height map covers
+	// it. Nearest, not the bilinear `get_height()`: one clipmap texel stands for one vertex, and a
+	// bilinear read would make the ring's content depend on the level's texel size. 0, not NAN: the
+	// ring caches what the height map array holds, and an array sample outside a filled layer is 0,
+	// so a hole and a region blend stay decisions of whoever reads the ring. See
+	// terrain_3d_clipmap_source_height.h.
+	real_t get_height_texel_nearest(const Vector2 &p_world_xz) const;
 	real_t get_surface_height(const Vector3 &p_global_position) const;
 	real_t get_modified_height(const Vector2i &p_vgrid) const;
 	real_t get_region_blend(const Vector2 &p_uv2) const;

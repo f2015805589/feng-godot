@@ -50,9 +50,20 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 	}
 	if (!scan.has_world) { return scan; }
 	const int pool = _vt.vt_page_count;
-	// Fixed reservation, not last frame's visible count: turning the camera must
-	// not change the dense grid's world footprint or its resident addresses.
-	scan.budget = MAX(1, _vt.surface_svt_enabled ? pool / 2 : pool);
+	// The near plan's share of the pool: everything except the far field's floor. This is a residency
+	// budget, fixed rather than derived from last frame's visible count, because turning the camera
+	// must not change the dense grid's world footprint or its resident addresses.
+	//
+	// It used to be exactly half the pool whenever the far field was enabled, which is not a share but
+	// a ceiling: measured on the near-field probe, the near plan held 116 of its 128 entries while the
+	// far field held 27 pages and 101 slots sat free, and the plan could afford a second level for only
+	// 15 of the 36 cells it covers - every other cell kept its whole-cell page at 0.25 m per texel,
+	// which is the per-cell blur. A quarter of the pool is more than the far field's own demand (its
+	// root pyramid is 20 pages and its visible set tens), so the near field takes the rest. The
+	// per-tick *production* split stays where it is: it is a separate decision with its own
+	// measurements (`_avt_tick_allowance()`).
+	const int far_floor = MAX(4, pool / 4);
+	scan.budget = MAX(1, has_svt_delivery() ? pool - far_floor : pool);
 	// A 2x2 ring is the minimum that can cover both sides of world zero.
 	// Tiny pools reserve four pages; normal pools reserve at most one quarter.
 	const int resident_budget = MIN(scan.budget, MAX(4, scan.budget / 4));
@@ -342,9 +353,19 @@ bool Terrain3D::_avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy,
 
 // Read-only inspector data. It uses the same grid and demand rules as runtime,
 // including when the editor's live-material preview pauses VT production.
+//
+// **A preview of a service nobody selected is refused, not drawn empty.** The scan below walks the
+// visible grid and builds one dictionary per sector, so running it for a configuration whose
+// material group is on `Direct` or `SVT` would be work whose only result is a picture of a service
+// that was never built. The delivery matrix is asked first instead, and the two counters in
+// `get_vt_settings()` (`avt_preview_calls` / `avt_preview_computed`) record which of the asks went
+// on to scan, so "the preview costs nothing when AVT is unused" is a reading and not a claim.
 Dictionary Terrain3D::get_avt_layout_preview(Camera3D *p_camera) const {
 	Dictionary result;
+	_vt.avt_preview_calls++;
+	if (!has_avt_delivery()) { return result; }
 	if (!_data || !p_camera) { return result; }
+	_vt.avt_preview_computed++;
 	TerrainVT::VisibleView view(p_camera);
 	view.anisotropy = get_avt_anisotropy(p_camera);
 	const Vector3 eye = p_camera->get_camera_transform().origin;

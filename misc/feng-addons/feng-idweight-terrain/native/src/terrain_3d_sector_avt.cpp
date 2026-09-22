@@ -82,32 +82,53 @@ bool avt_plan_spatial_deviation_exceeded(const Transform3D &p_camera_transform,
 
 }
 
-// The request as a number: the setting, or the viewport's filtering level when the setting is zero
-// ("auto", which is the behaviour before the setting existed). Kept apart from the answer below
-// because a report that printed only one of the two could not say whether a request was reduced by
-// the gutter.
+// The taps a fragment actually gets, read from the one owner of that number: Godot's material
+// samplers are built per viewport with `anisotropy_max = 1 << level`
+// (`MaterialStorage::samplers_rd_allocate`), and a viewport's level defaults to the project's
+// `rendering/textures/default_filters/anisotropic_filtering_level`, which is 4x. There is no
+// per-material anisotropy in Godot, so the terrain cannot raise this: a wider
+// `surface_vt_anisotropy` is a wish, not a tap count. The level math must not believe the wish.
+//
+// Why it matters, in the units the shader selects in. A grazing pixel's major-axis footprint is
+// `ratio` times its minor-axis one. Anisotropic filtering answers that by clamping the minor axis to
+// `major / taps` - so the mip it samples is the one whose texel is `major / taps` - and then taking
+// `taps` samples at a stride of exactly one texel of that mip. Full coverage, no aliasing. A shader
+// that picks the mip for a larger `taps` than the sampler has asks for a page whose texel is finer
+// than `major / taps`; the sampler clamps only within the mips it may read (an AVT page is one
+// physical mip, and the atlas carries exactly one), so it stays on that finer page and covers it
+// with a stride of `assumed / actual` texels. The texels in between are never read: that is
+// undersampling, and at a grazing angle it is visible as the distant ground crawling frame to frame.
+float Terrain3D::get_avt_anisotropy_sampler(const Camera3D *p_camera) const {
+	int level = 2;
+	if (p_camera && p_camera->get_viewport()) {
+		level = int(p_camera->get_viewport()->get_anisotropic_filtering_level());
+	}
+	return float(1 << CLAMP(level, 0, 4));
+}
+
+// The request as a number: the setting, or the sampler's own level when the setting is zero ("auto",
+// which is the behaviour before the setting existed). Kept apart from the answer below because a
+// report that printed only one of them could not say which bound reduced the other.
 float Terrain3D::get_avt_anisotropy_request(const Camera3D *p_camera) const {
 	int requested = _vt.surface_vt_anisotropy;
 	if (requested <= 0) {
-		int level = 2;
-		if (p_camera && p_camera->get_viewport()) {
-			level = int(p_camera->get_viewport()->get_anisotropic_filtering_level());
-		}
-		requested = 1 << CLAMP(level, 0, 4);
+		requested = int(get_avt_anisotropy_sampler(p_camera));
 	}
 	return float(CLAMP(requested, 1, 16));
 }
 
-// The number the shader and the demand footprint both use: the request above clamped by what the
-// page gutter can sample. The gutter is the hard upper bound and it is not a policy - a filtering
-// footprint cannot reach past the border texels a page carries, and a page asked for more samples
-// its own rim instead. The default pair is 8x inside a nine-texel gutter (which admits 8.5), so the
-// request is honoured as asked; a wider request is reduced here and readable as the
-// `avt_anisotropy_requested` / `avt_anisotropy_effective` pair in `get_vt_settings()`. See
+// The number the shader and the demand footprint both use: the request above, clamped by what the
+// sampler delivers and by what the page gutter can sample. Two hard bounds and no policy - a
+// filtering footprint can neither take taps the viewport does not give it nor reach past the border
+// texels a page carries (a page asked for more samples its own rim instead; the gutter admits
+// `border - 0.5`). The shipped pair is a 9-texel gutter and an 8x request, and on a stock project
+// (4x filtering) the effective number is therefore 4, which is the fix for the grazing aliasing
+// described above. `avt_anisotropy`, `..._sampler`, `..._requested` and `..._effective` in
+// `get_vt_settings()` are the readings a project checks to see which bound binds. See
 // docs/vt_sampling_review.md.
 float Terrain3D::get_avt_anisotropy(const Camera3D *p_camera) const {
 	const float supported = MAX(1.f, float(_vt.vt_page_border) - 0.5f);
-	return MIN(get_avt_anisotropy_request(p_camera), supported);
+	return MIN(MIN(get_avt_anisotropy_request(p_camera), get_avt_anisotropy_sampler(p_camera)), supported);
 }
 
 // The request above, as a setting. Unlike a density change this moves no page footprint - a page's
@@ -147,6 +168,20 @@ int Terrain3D::get_avt_mip_level_cap() const {
 	return TerrainVT::log2_power_of_two(get_avt_base_block_size());
 }
 
+// The sample level at which the fallback table takes over, in the sample's own level units. It is
+// derived from the two texel sizes rather than configured, so it cannot disagree with the tables it
+// describes: the finest fallback texel is `avt_coarse.page_world / page_size`, the finest upgrade
+// texel is `1 / texels_per_meter`, and the level between them is what separates "this sample is an
+// upgrade" from "the fallback answers this sample". A zero means the two tiers are the same
+// resolution and there is no upgrade range at all, which is the case the shader must not read as
+// "everything is an upgrade".
+float Terrain3D::get_avt_adaptive_threshold_level() const {
+	const float fine_texel = 1.f / MAX(1.f, float(_vt.surface_vt_texels_per_meter));
+	const float coarse_texel = _vt.avt_coarse.page_world / float(MAX(1, _vt.vt_page_size));
+	if (_vt.avt_coarse.page_world <= 0.f || coarse_texel <= fine_texel) { return 0.f; }
+	return std::log2(coarse_texel / fine_texel);
+}
+
 // An explicit sector resolution tier count. Legacy zero migrates to three.
 void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
 	const int clamped = p_levels <= 0 ? 3 : CLAMP(p_levels, 2, 16);
@@ -176,13 +211,13 @@ float Terrain3D::_avt_logical_ratio() const {
 // the refresh interval, which is the pages one plan generation can actually produce. Without that
 // term a plan names its whole residency budget whatever the supply, and the measured result is a
 // permanent sampled deficit, a pool with no free slot and a far field starved to its coarsest mip
-// (`docs/vt_hdrp_avt_alignment.md` sections 7.5-7.7).
+// (`docs/vt_reference_avt_alignment.md` sections 7.5-7.7).
 //
 // The even split stays even, and that is now a measured decision rather than an inherited one. A
 // fixed half looks wasteful - the far field's own demand is about **0.1 page a tick** once its
 // root pyramid is pinned, while the near field consumes everything it is given - so the split was
 // tried demand-aware, with the near field taking the remainder above a two-page floor for the far
-// field (`docs/vt_hdrp_avt_alignment.md` section 7.7.1). The near field then produced fourteen a
+// field (`docs/vt_reference_avt_alignment.md` section 7.7.1). The near field then produced fourteen a
 // tick instead of eight and the sampled deficit did not fall at all: `n_miss` rose 41%, `evict`
 // 54%, `fade_starts` 38% and `alloc` 38% against the same run with the term below and the even
 // split. The near field's churn scales with its allowance, so its supply is not the binding
@@ -190,7 +225,7 @@ float Terrain3D::_avt_logical_ratio() const {
 // measurement that says the demand has stopped scaling with the budget.
 int Terrain3D::_avt_tick_allowance() const {
 	const int remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
-	return _vt.surface_svt_enabled ? MAX(1, remaining / 2) : remaining;
+	return has_svt_delivery() ? MAX(1, remaining / 2) : remaining;
 }
 
 void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distances) {
@@ -341,7 +376,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 
 	_vt.avt_sector_stats["plan_reused"] = false;
 	_vt.avt_sector_stats["coverage_center"] = focus;
-	_vt.avt_sector_stats["coverage_radius"] = _vt.surface_svt_enabled ? reach : -1.f;
+	_vt.avt_sector_stats["coverage_radius"] = has_svt_delivery() ? reach : -1.f;
 	// Phase timings for the uncached path, which is the one a moving camera takes on
 	// every tick: the visible scan, the sector hierarchy, the address directory, the
 	// hand-off to the refinement worker, the directory upload and the page production.
@@ -423,7 +458,7 @@ Terrain3DAVTPlanKey Terrain3D::_avt_plan_state(const bool p_bounds_ready) const 
 	// or two on every frame of a moving view. Bucketing it keeps the near field's plan
 	// installable while its own footprint is unchanged; an exact count in the key re-planned
 	// the whole working set whenever the far field gained or lost a single page.
-	append((_vt.vt_svt_visible_pages / 16) * 16); append(_vt.surface_svt_enabled); append(_vt.surface_vt_distance);
+	append((_vt.vt_svt_visible_pages / 16) * 16); append(has_svt_delivery()); append(_vt.surface_vt_distance);
 	append(_vt.bake.busy());
 	append(_vt.vt_page_count); append(_vt.vt_page_size);
 	append(get_avt_anisotropy(camera));
@@ -704,6 +739,9 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// a shorter chain could give back. See `Terrain3DAVTRefinement::level_mips`.
 			_vt.avt_sector_stats["plan_level_mips"] = _vt.avt_refinement->level_mips;
 			_vt.avt_sector_stats["plan_world_pages"] = _vt.avt_refinement->world_pages;
+			// How much of the plan exists for ground the view did not sample. It is the reading that
+			// says whether a cell beside the frustum's edge holds a chain or a single whole-cell page.
+			_vt.avt_sector_stats["plan_invisible_cell_pages"] = _vt.avt_refinement->invisible_cell_pages;
 			_vt.avt_sector_stats["prefetch_requests"] = int(_vt.avt_plan.prefetch.size());
 			_vt.avt_sector_stats["planning_ms"] = double(_vt.avt_refinement->elapsed_us) / 1000.;
 			_vt.avt_sector_stats["plan_age_ms"] = double(p_started - _vt.avt_refinement->submitted_us) / 1000.;
@@ -828,7 +866,14 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_virtual_resolution"] = 64.f * get_surface_vt_texels_per_meter();
 	result["avt_base_block_size"] = get_avt_base_block_size();
 	// Requested versus effective chain length and the budget-limited resolution.
+	// The fallback grid's own mip boundary: its dense chain starts at its mip 1, and its mip 0
+	// address space is what the block registration reserves. It is a property of the grid, and it
+	// stays one by construction.
 	result["avt_max_adaptive_level"] = 1;
+	// The sample level at or above which that grid answers and the sector directory is not touched.
+	// Derived from the two tiers' texel sizes, so it is the number the shader's read order and the
+	// plan's classification share rather than a constant either of them could drift from.
+	result["avt_adaptive_threshold_level"] = get_avt_adaptive_threshold_level();
 	result["avt_local_block_size"] = get_avt_local_block_size();
 	result["avt_effective_mip_levels"] = _vt.surface_vt_mip_levels;
 	result["avt_local_mip_levels"] = get_avt_mip_level_cap() + 1;

@@ -71,15 +71,127 @@ Dictionary Terrain3D::get_vt_settings() const {
 // handles, the tick's cost and its phases, and the far field's bake bookkeeping.
 void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	Dictionary &result = r_result;
+	// The delivery matrix and the assembly it resolved to, first because everything below is a
+	// consequence of it: the four cells say what was asked for, the three booleans say which
+	// services therefore exist, and a reader that wants to know why a view is missing an object
+	// reads the two together. `delivery_names` is the readable form, so a diagnostic line does not
+	// have to map the numbers. See docs/vt_delivery_assembly.md.
+	result["delivery_near_material"] = get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Material));
+	result["delivery_near_height"] = get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Height));
+	result["delivery_far_material"] = get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Material));
+	result["delivery_far_height"] = get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Height));
+	result["delivery_names"] = String("near/material=") + TerrainVT::delivery_name(_vt.delivery.get(TerrainVT::Tier::Near, TerrainVT::ChannelGroup::Material)) +
+			" near/height=" + TerrainVT::delivery_name(_vt.delivery.get(TerrainVT::Tier::Near, TerrainVT::ChannelGroup::Height)) +
+			" far/material=" + TerrainVT::delivery_name(_vt.delivery.get(TerrainVT::Tier::Far, TerrainVT::ChannelGroup::Material)) +
+			" far/height=" + TerrainVT::delivery_name(_vt.delivery.get(TerrainVT::Tier::Far, TerrainVT::ChannelGroup::Height));
+	// A service exists iff a cell selected its method, so these three are the whole of what was
+	// assembled, and `vt_shader_arms` is whether the material's generated code carries any VT arms
+	// at all - false is the no-VT build, not a build whose arms are branched around.
+	result["avt_service"] = has_avt_delivery();
+	result["svt_service"] = has_svt_delivery();
+	result["clipmap_service"] = has_clipmap_delivery();
+	// Which methods a cell may name, per channel group, and the sentence for each one it may not:
+	// the matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`), so a
+	// panel disables a row from published state rather than from its own hard-coded list, and the
+	// reason it shows is the same sentence the setter logs. Without this a reader sees four cells
+	// that all look writable and has to infer the refusal from a service that is missing.
+	Dictionary delivery_supported;
+	Dictionary delivery_unsupported;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const String group_name = group == int(TerrainVT::ChannelGroup::Material) ? "material" : "height";
+		PackedInt32Array allowed;
+		Dictionary refused;
+		for (int method = 0; method < TerrainVT::DELIVERY_COUNT; method++) {
+			if (is_vt_delivery_supported(group, method)) {
+				allowed.push_back(method);
+			} else {
+				refused[TerrainVT::delivery_name(TerrainVT::Delivery(method))] = get_vt_delivery_unsupported_reason(group, method);
+			}
+		}
+		delivery_supported[group_name] = allowed;
+		delivery_unsupported[group_name] = refused;
+	}
+	result["delivery_supported"] = delivery_supported;
+	result["delivery_unsupported"] = delivery_unsupported;
+	// Whether any ring object exists, which is the clipmap's own "is this used" question and what its
+	// debug view and preview are gated on. `clipmap_service` above is the matrix's answer; this is the
+	// object's, and the two differ exactly when `debug_update_vt_clipmap()` has built a ring to
+	// measure the mechanism while no cell names the method.
+	result["clipmap_ring"] = has_vt_clipmap_ring();
+	// The two editor previews, counted: how many asks each got and how many of those did the work.
+	// The difference is the asks a delivery gate refused, and it is the reading behind "a method no
+	// row selects owns no layout, so its debug view neither draws nor scans". See
+	// `get_avt_layout_preview()` and `get_clipmap_layout_preview()`.
+	result["avt_preview_calls"] = int64_t(_vt.avt_preview_calls);
+	result["avt_preview_computed"] = int64_t(_vt.avt_preview_computed);
+	result["clipmap_preview_calls"] = int64_t(_vt.clipmap_preview_calls);
+	result["clipmap_preview_computed"] = int64_t(_vt.clipmap_preview_computed);
+	result["vt_shader_arms"] = needs_vt_shader_arms();
+	// The height group's own arm, which is the narrower of the two and moves on its own: a
+	// configuration can carry the material arms with a `Direct` height group (the default) and bind no
+	// ring uniform at all, so "which methods the generated code has an arm for" is two readings and
+	// not one. Read from the material's verdict rather than from the policy, because the verdict is
+	// what the compiled string is.
+	result["vt_shader_height_clipmap"] = _material.is_valid() && _material->is_shader_using_height_clipmap();
+	// Whether the region texture array still has to carry the diffuse/normal group, which is the
+	// case exactly when no service delivers it. Published because it is the other half of the
+	// assembly statement: with every cell direct the array is not a fallback, it is the renderer.
+	result["surface_array_upload_needed"] = is_surface_array_upload_needed();
+	// The clipmap ring: the object that exists and what it cost. `selected` is the matrix's claim for
+	// this group and `configured` is the object; a reader can therefore tell "the mechanism exists and
+	// nothing delivers it" (a ring the entry built while every cell is `Direct`) from "no ring at
+	// all" without reading a log. The per-group entry carries the addressing that says a level is
+	// *current* rather than approximate (each level's centre, ring and `valid`), the counters that
+	// say what the ring has produced, and the upload bytes: the CPU side is incremental and a
+	// whole-layer transfer is not, so the second half is a published measurement rather than an
+	// assumption. `invalidation_calls` / `invalidated_texels` are the same statement for an edit: a
+	// changed rect is re-produced rather than the ring. See docs/vt_delivery_assembly.md section 6.
+	result["clipmap_size"] = _vt.clipmap_size;
+	result["clipmap_levels_setting"] = _vt.clipmap_levels;
+	result["clipmap_base_world"] = _vt.clipmap_base_world;
+	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
+	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
+	Dictionary clipmap;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
+		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		Dictionary entry;
+		entry["configured"] = ring != nullptr && ring->is_configured();
+		entry["selected"] = _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap);
+		entry["source"] = ring != nullptr ? ring->get_source_name() : String("none");
+		if (ring != nullptr) {
+			entry["size"] = ring->get_size();
+			entry["levels"] = ring->get_level_count();
+			entry["channels"] = ring->get_channel_count();
+			entry["base_world"] = ring->get_base_world();
+			entry["valid_levels"] = ring->get_level_valid_count();
+			entry["pending_jobs"] = ring->get_pending_jobs();
+			entry["texture_layers"] = ring->get_texture_layer_count();
+			entry["produced_texels"] = int64_t(ring->get_produced_texels());
+			entry["full_productions"] = int64_t(ring->get_full_level_productions());
+			entry["upload_bytes"] = int64_t(ring->get_upload_bytes());
+			entry["update_calls"] = int64_t(ring->get_update_calls());
+			entry["idle_updates"] = int64_t(ring->get_idle_updates());
+			entry["invalidation_calls"] = int64_t(ring->get_invalidation_calls());
+			entry["invalidated_texels"] = int64_t(ring->get_invalidated_texels());
+			entry["level_reports"] = ring->get_level_reports();
+		}
+		clipmap[channel == TerrainVT::ChannelGroup::Material ? "material" : "height"] = entry;
+	}
+	result["clipmap"] = clipmap;
 	result["page_size"] = _vt.vt_page_size;
 	result["border"] = _vt.vt_page_border;
-	// The near field's anisotropy as the triple that says whether the request survives the gutter:
-	// `avt_anisotropy` is what the terrain holds (zero means "follow the viewport"), `requested` is
-	// that resolved against the viewport, and `effective` is what the shader and the planner use.
-	// The last two differ only when the request is wider than the page's border texels can sample,
-	// which is the one thing about anisotropy that used to be silent; see
-	// `Terrain3D::get_avt_anisotropy()` and docs/vt_sampling_review.md.
+	// The near field's anisotropy as the triple that says which bound decides it: `avt_anisotropy` is
+	// what the terrain holds (zero means "follow the viewport"), `sampler` is the tap count the
+	// viewport's filtering level gives the material samplers, `requested` is that setting resolved
+	// against the sampler, and `effective` is what the shader and the planner use. `requested` and
+	// `effective` differ when the page's border texels cannot sample the request; `sampler` and
+	// `requested` differ when a project asks for more filtering than its viewport renders with, in
+	// which case `effective` is the sampler's number and the grazing view is filtered for that many
+	// taps instead of aliasing on an assumption of more. See `Terrain3D::get_avt_anisotropy()` and
+	// docs/vt_sampling_review.md.
 	result["avt_anisotropy"] = _vt.surface_vt_anisotropy;
+	result["avt_anisotropy_sampler"] = get_avt_anisotropy_sampler(get_camera());
 	result["avt_anisotropy_requested"] = get_avt_anisotropy_request(get_camera());
 	result["avt_anisotropy_effective"] = get_avt_anisotropy(get_camera());
 	result["page_count"] = _vt.vt_page_count;
@@ -124,7 +236,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	// resolves the direct page store (`has_method`, so a stock engine answers false and prints
 	// nothing). These three are exactly the capabilities a GPU-side demand source needs, and they are
 	// the H4 probe's answer recorded on the running binary rather than read out of the source: see
-	// `docs/vt_hdrp_avt_alignment.md` section 7.7.5 for what each one settles and which of them is
+	// `docs/vt_reference_avt_alignment.md` section 7.7.5 for what each one settles and which of them is
 	// absent.
 	RenderingDevice *rd = RenderingServer::get_singleton() != nullptr ? RenderingServer::get_singleton()->get_rendering_device() : nullptr;
 	result["rd_direct_store"] = rd != nullptr && rd->has_method("texture_copy_from_buffer");
@@ -135,6 +247,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["vt_cpu_ms"] = _vt.vt_cpu_ms;
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
 	Dictionary phases;
+	phases["clipmap"] = _vt.vt_clipmap_ms;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
 	phases["svt"] = _vt.vt_svt_ms;
@@ -203,8 +316,13 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 
 Array Terrain3D::get_vt_pages() const {
 	Array result;
+	// The owners of a slot are recorded by the *pool*, which both views share, so the view that can
+	// be asked about a slot is whichever one exists. Reading the near view alone - which used to be
+	// the only way, because a node always had both views - reported an empty list whenever only the
+	// far field was selected, and two suites read that as a page that had been lost.
+	const Terrain3DVirtualTexture *view = _vt.surface_vt ? _vt.surface_vt : _vt.surface_svt;
 	for (const Variant &key : _vt.vt_page_records.keys()) {
-		if (!_vt.surface_vt || _vt.surface_vt->get_slot_owner_count(int(key)) == 0) {
+		if (view == nullptr || view->get_slot_owner_count(int(key)) == 0) {
 			continue;
 		}
 		Dictionary record = Dictionary(_vt.vt_page_records[key]).duplicate();
@@ -213,10 +331,13 @@ Array Terrain3D::get_vt_pages() const {
 		if (bool(record["ready"])) {
 			record["state"] = "Ready";
 		}
-		const Array owners = _vt.surface_vt ? _vt.surface_vt->get_slot_owner_metadata(int(key)) : Array();
+		const Array owners = view->get_slot_owner_metadata(int(key));
 		record["owners"] = owners;
 		for (Dictionary owner : owners) {
 			if (bool(owner["world_space"])) { continue; }
+			// Only the near field records a non-world-space owner, so this is the one part of the
+			// record that needs it; a build without it has no such owner to describe.
+			if (_vt.surface_vt == nullptr) { continue; }
 			const Vector2i sector = owner["sector"];
 			const int mip = owner["mip"];
 			owner["local_mip"] = mip;
@@ -235,4 +356,53 @@ Array Terrain3D::get_vt_pages() const {
 }
 Ref<Image> Terrain3D::get_vt_page_preview(int p_slot) {
 	return _vt.vt_baker.is_valid() ? baker(_vt.vt_baker)->get_page_preview(p_slot) : Ref<Image>();
+}
+
+// The clipmap's debug payload: the world squares the ring's levels occupy right now and the rects
+// each one still has queued. One entry per ring that exists, so a group with no ring appears as
+// nothing at all rather than as a ring with zero levels, and a terrain with no ring - which in this
+// build is every terrain whose rings only `debug_update_vt_clipmap()` built - returns an empty
+// dictionary: the scan is refused, not drawn empty, which is the rule `get_avt_layout_preview()`
+// follows for AVT and the reason the two preview counters exist. The gate is therefore "is there a
+// ring", not "does a cell name the method": a ring that exists is what a picture of a ring is a
+// picture of, whichever door built it.
+//
+// The focus is reported beside the levels because it is what the levels are snapped to: a level's
+// `center` is its own texel-snapped focus, so the three together say whether a level is current or
+// still holds the one it replaces.
+Dictionary Terrain3D::get_clipmap_layout_preview() const {
+	Dictionary result;
+	_vt.clipmap_preview_calls++;
+	if (!has_vt_clipmap_ring()) {
+		return result;
+	}
+	_vt.clipmap_preview_computed++;
+	const Vector2 focus = v3v2(get_clipmap_target_position());
+	result["focus"] = focus;
+	result["size"] = _vt.clipmap_size;
+	result["levels_setting"] = _vt.clipmap_levels;
+	result["base_world"] = _vt.clipmap_base_world;
+	result["budget_texels"] = _vt.clipmap_budget_texels;
+	Array rings;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
+		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		if (ring == nullptr || !ring->is_configured()) {
+			continue;
+		}
+		Dictionary entry;
+		entry["group"] = channel == TerrainVT::ChannelGroup::Material ? "material" : "height";
+		entry["source"] = ring->get_source_name();
+		entry["size"] = ring->get_size();
+		entry["channels"] = ring->get_channel_count();
+		entry["base_world"] = ring->get_base_world();
+		entry["valid_levels"] = ring->get_level_valid_count();
+		entry["pending_jobs"] = ring->get_pending_jobs();
+		entry["produced_texels"] = int64_t(ring->get_produced_texels());
+		entry["upload_bytes"] = int64_t(ring->get_upload_bytes());
+		entry["levels"] = ring->get_layout_reports();
+		rings.push_back(entry);
+	}
+	result["rings"] = rings;
+	return result;
 }

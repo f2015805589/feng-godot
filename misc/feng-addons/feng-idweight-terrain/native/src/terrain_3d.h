@@ -98,7 +98,7 @@ private:
 	// The near field's per-tick page allowance. Two readers size against it - the tick, which hands
 	// the pass this many pages, and the plan's rate term, which bounds the pages the plan may name
 	// beyond the ones the image samples by what one refresh window can produce - so the split has
-	// one home. See the definition and `docs/vt_hdrp_avt_alignment.md` section 7.7.
+	// one home. See the definition and `docs/vt_reference_avt_alignment.md` section 7.7.
 	int _avt_tick_allowance() const;
 	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
 	// struct in terrain_3d_avt.h for what each stage owns.
@@ -205,6 +205,18 @@ private:
 	void _destroy_streamer();
 
 	void _setup_surface_vt();
+	// The assembly rule: brings the live service objects in line with the delivery matrix, and
+	// rebuilds the material when the set moved. Called by every write to a cell and by
+	// `_initialize()`, so a service's lifetime has one owner instead of a setup call site each.
+	void _resolve_vt_delivery(const bool p_changed);
+	// Builds the clipmap ring of one channel group if it does not exist and (re)applies the ring
+	// settings to it. The one owner of the ring's lifetime, called from the assembly rule and by
+	// `debug_update_vt_clipmap()`; a group whose channel this build has no source for stays unbuilt,
+	// says so, and is reported by the return value rather than by a ring nobody can produce.
+	bool _setup_vt_clipmap(const TerrainVT::ChannelGroup p_group);
+	// Gives the near field's coarse owner back to the shared pool. The two moments it stops being
+	// sampled are a deselection and a destruction, and both go through here so neither forgets.
+	void _release_avt_coarse_protections();
 	// Applies one view's configuration apart from its physical pool: page
 	// dimensions, format and the mode-specific addressing. Shared by the initial
 	// setup and the shared-pool rebuild so neither depends on stored state.
@@ -253,7 +265,7 @@ private:
 			int p_physical_page_count, int p_pass_budget, const std::vector<Terrain3DSVTPage> &p_visible,
 			int &r_produced, bool &r_cached);
 	// The two fallback policies as strategies, and the one place that chooses between them. See the
-	// definitions for what each guarantees and H2 of `docs/vt_hdrp_avt_alignment.md` for the
+	// definitions for what each guarantees and H2 of `docs/vt_reference_avt_alignment.md` for the
 	// measurement that decides which is default.
 	std::vector<Vector3i> _svt_global_root_pyramid(int p_indirection_size, int p_protected_limit,
 			int p_root_top, int p_root_first);
@@ -397,6 +409,12 @@ public:
 	void set_avt_feedback(bool p_enabled);
 	bool get_avt_feedback() const { return _vt.avt_feedback; }
 	float get_avt_density_scale() const { return _vt.avt_density_scale; }
+	// The sample level at which the fallback table takes over: a sample at or above it reads the
+	// fallback table directly, one below it is an upgrade and goes through the sector directory for
+	// second-level addressing. One home for the number, because the shader's read order and the
+	// plan's own classification both derive from it. Distinct from `avt_max_adaptive_level`, which
+	// is the fallback grid's own mip boundary rather than a sample level.
+	float get_avt_adaptive_threshold_level() const;
 	void set_svt_feedback(bool p_enabled);
 	bool get_svt_feedback() const { return _vt.svt_feedback; }
 	bool is_svt_startup_ready() const { return !_vt.svt_feedback || _vt.surface_svt_root_mips <= 0 || _vt.svt_startup_ready; }
@@ -459,8 +477,140 @@ public:
 	bool is_streaming_enabled() const { return _streaming_enabled; }
 
 	Terrain3DVirtualTexture *get_surface_vt() const { return _vt.surface_vt; }
+
+	// ---- Delivery assembly ---------------------------------------------------------------------
+	// Which method carries which channel group in which distance band, and the three service
+	// questions the rest of the node asks of it. `TerrainVT::DeliveryMatrix` in
+	// terrain_3d_vt_delivery.h holds the four values; the accessors here are what the bindings,
+	// the dock, the setters and the passes use, and `set_vt_delivery()` is the one place a
+	// change reaches the assembly - it creates the service a newly selected method needs and
+	// destroys the one the last cell that used it has left. See docs/vt_delivery_assembly.md.
+	void set_vt_delivery(const int p_tier, const int p_group, const int p_delivery);
+	int get_vt_delivery(const int p_tier, const int p_group) const;
+	const TerrainVT::DeliveryMatrix &get_vt_delivery_matrix() const { return _vt.delivery; }
+	void set_vt_delivery_near_material(const int p_delivery);
+	int get_vt_delivery_near_material() const { return get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Material)); }
+	void set_vt_delivery_near_height(const int p_delivery);
+	int get_vt_delivery_near_height() const { return get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Height)); }
+	void set_vt_delivery_far_material(const int p_delivery);
+	int get_vt_delivery_far_material() const { return get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Material)); }
+	void set_vt_delivery_far_height(const int p_delivery);
+	int get_vt_delivery_far_height() const { return get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Height)); }
+	// Whether any cell selected the method's service. A service object is created iff its question
+	// is true and destroyed when the last cell that selected it changes away, so this - not a
+	// group's own delivery - is what a pass, a pool reservation and the tick test.
+	bool has_avt_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::AVT); }
+	bool has_svt_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::SVT); }
+	// Whether any cell selected the ring. This is the matrix's answer; `has_vt_clipmap_ring()` is the
+	// question about the object, and the two differ for a ring `debug_update_vt_clipmap()` built to
+	// measure the mechanism with no cell naming the method.
+	bool has_clipmap_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::Clipmap); }
+	// The same three questions by property value, which is the form a debug view asks them in: a
+	// method no cell selects has no layout to draw, so its view hides itself instead of polling a
+	// scan of an empty service. An out-of-range value is false rather than a clamp, mirroring
+	// `TerrainVT::is_valid_delivery()`.
+	bool is_vt_delivery_used(const int p_method) const {
+		return TerrainVT::is_valid_delivery(p_method) && _vt.delivery.uses(TerrainVT::Delivery(p_method));
+	}
+	// Whether this build can *deliver* a method for a channel group, which is what the matrix's
+	// acceptance is decided from: a cell may only name a method that reaches a fragment here. A
+	// method this build has no arm for is refused rather than accepted and rendered from somewhere
+	// else, because "selected, but nothing samples it" is a configuration nobody can tell from a
+	// broken one. The matrix is deliberately asymmetric: the material group's methods are AVT, SVT
+	// and (M4) Clipmap, while the height group's choices are `Direct` and the clipmap ring alone -
+	// AVT and SVT page the material group and are not height's methods at all. The tier does not
+	// enter, because the two bands select reach rather than capability. `Direct` is always
+	// deliverable, being the fallback and the one method that is always correct. See
+	// docs/vt_delivery_assembly.md, "What a cell may name".
+	bool is_vt_delivery_supported(const int p_group, const int p_method) const;
+	// Whether the height group is delivered by the ring in either band, which is exactly the
+	// condition the generated shader carries the height arm under: a configuration whose height group
+	// is `Direct` in both bands compiles no ring code, binds no ring uniform and tests no branch, so
+	// a method nobody selected costs the Direct path nothing.
+	bool height_clipmap_arm() const { return _vt.delivery.group_uses(TerrainVT::ChannelGroup::Height, TerrainVT::Delivery::Clipmap); }
+	// Why the pair above is refused, in the sentence the setter logs, a panel shows and a test pins.
+	// Empty for a pair that is supported.
+	String get_vt_delivery_unsupported_reason(const int p_group, const int p_method) const;
+	// Whether the layer assembles any service at all. False is the all-direct configuration - the
+	// one that must own no view, no array family, no VT uniform, no VT shader arm and no tick.
+	bool has_vt_delivery() const { return _vt.delivery.any_service(); }
+	// Whether a channel group is delivered by a service in either band. This is the *family*
+	// question: the material arrays are not published for a tier whose only user is the height
+	// group, and the region arrays stay authoritative for a group no service carries.
+	bool group_has_vt_delivery(const TerrainVT::ChannelGroup p_group) const {
+		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::AVT) ||
+				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap) ||
+				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::SVT);
+	}
+
+	// ---- Clipmap: the ring's settings and its readings -----------------------------------------
+	// One ring per channel group, built by the assembly rule the first time a cell selects Clipmap
+	// and kept afterwards, exactly like the two views. Level l covers `base_world * 2^l` metres in
+	// `size` texels, so its texel is `base_world * 2^l / size` metres wide.
+	void set_vt_clipmap_size(const int p_size);
+	int get_vt_clipmap_size() const { return _vt.clipmap_size; }
+	void set_vt_clipmap_levels(const int p_levels);
+	int get_vt_clipmap_levels() const { return _vt.clipmap_levels; }
+	void set_vt_clipmap_base_world(const real_t p_metres);
+	real_t get_vt_clipmap_base_world() const { return _vt.clipmap_base_world; }
+	// What one ring may produce in one tick, in channel texels. The ring does not touch the shared
+	// page pool, so this is spent beside `vt_pages_per_update` rather than out of it.
+	void set_vt_clipmap_budget_texels(const int p_texels);
+	int get_vt_clipmap_budget_texels() const { return _vt.clipmap_budget_texels; }
+	// The ring's stored value at a world position, through the ring's own addressing: the same level
+	// rule, snapping and ring the shader arm samples with. Read by the deterministic tests and the
+	// dock, which otherwise have no way to compare what the ring holds against the height map it was
+	// produced from. NAN when the group has no ring.
+	real_t sample_vt_clipmap(const int p_group, const Vector2 &p_world_xz, const int p_channel = 0) const;
+	// Everything the height arm is bound from, in one dictionary, so the shader's copy of the ring's
+	// addressing and the CPU's are the *same* numbers rather than two implementations that agree
+	// until one changes: `centers` and `rings` are the per-level state the shader indexes with,
+	// `valid` is the gate that keeps a level that is not current out of a fragment, and `size`,
+	// `levels` and `base_world` are the level rule. Padded to the shader's fixed array size, with
+	// `levels` naming how many entries are meaningful. Empty when the group has no ring.
+	Dictionary get_vt_clipmap_arm(const int p_group) const;
+	// An edit changed the source under a world AABB: the ring re-produces the texels that cover it
+	// and stops serving the levels that touch it until they have. Called from the one place every
+	// edit reports itself to (`Terrain3DData::add_edited_area()`), and public because a script that
+	// writes heights through the data API without going through the editor can call it. Returns how
+	// many rect jobs were queued; zero when no ring exists or the level is already being produced.
+	int invalidate_vt_clipmap_area(const AABB &p_area);
+	// Whether any ring object exists, which is the clipmap's own "is this used" question and the
+	// gate the ring's debug view and its native preview are read with: a ring exists because a cell
+	// selected the method (once a build can deliver it) or because `debug_update_vt_clipmap()` built
+	// one to measure the mechanism, and it is kept afterwards. False is the state with no ring at
+	// all: no levels, no texture, no jobs and no budget.
+	bool has_vt_clipmap_ring() const;
+	// The mechanism's own entry, beside `sample_vt_clipmap()`: build the ring for `p_group` from the
+	// clipmap settings if it does not exist, run the phase the tick runs for it - the same
+	// `Terrain3DClipmap::update()`, the same focus and the same `vt_clipmap_budget_texels` - and
+	// return the channel texels produced, or -1 when no ring can be built for that group. The height
+	// cell is deliverable now, so the tick's own phase runs whenever a cell names the method; this
+	// stays as the door a reading takes the mechanism through *without* a delivery claim: the ring's
+	// addressing, strips and budget are measurable with every cell `Direct`, which is how
+	// `native/tests/vt_clipmap` isolates the mechanism from the arm. It publishes
+	// `clipmap_produced_texels` and `vt_clipmap_ms` exactly as the tick's phase does.
+	int debug_update_vt_clipmap(const int p_group);
+	// The ring's read-only debug payload: the world square every level of every existing ring
+	// occupies right now, its addressing (`center`, `ring`, `valid`) and the rects still queued for
+	// it, which is what the VT Page's clipmap view draws. Empty when no ring exists - the scan is
+	// refused rather than drawn empty, the way `get_avt_layout_preview()` refuses - and the two
+	// counters in `get_vt_settings()` record the difference between an ask and the work.
+	Dictionary get_clipmap_layout_preview() const;
+	// Whether any ring's addressing changed since the shader was last bound with it - its shape, any
+	// level's snapped centre or toroidal offset, or which levels are current - and the rebind that
+	// follows. The ring's own stamp is the answer, so a tick that produced nothing rebinds nothing:
+	// the alternative, rebinding every tick, would republish the whole VT uniform set (and the region
+	// tables with it) for a ring that had not moved. The rebind is the ring's own uniforms and not
+	// `Terrain3DMaterial::update()`, for the same reason.
+	void _update_vt_clipmap_arm();
+	bool _vt_clipmap_state_changed();
+
 	void set_surface_vt_enabled(const bool p_enabled);
-	bool is_surface_vt_enabled() const { return _vt.surface_vt_enabled; }
+	// A view of the near field's material cell: the AVT carries the diffuse+normal group. It is not
+	// a second source of truth - writing it writes that cell - and it is exactly what the material's
+	// `_surface_vt_enabled` uniform means, which is why the setter is kept rather than retired.
+	bool is_surface_vt_enabled() const { return _vt.delivery.get(TerrainVT::Tier::Near, TerrainVT::ChannelGroup::Material) == TerrainVT::Delivery::AVT; }
 	void set_surface_vt_page_count(const int p_count);
 	int get_surface_vt_page_count() const { return _vt.surface_vt_page_count; }
 	void set_surface_vt_page_size(const int p_size);
@@ -488,11 +638,14 @@ public:
 	int get_avt_mip_level_cap() const;
 	int get_avt_local_block_size() const { return get_avt_base_block_size(); }
 	float get_avt_local_section_world() const { return 64.f; }
-	// The near field's anisotropy: `..._request()` is the setting (or the viewport's level when the
-	// setting is zero) and `get_avt_anisotropy()` is that request clamped by the page gutter, which
-	// is the hard bound - a filtering footprint cannot reach past the border texels a page carries.
-	// One home for a rule that used to be spelled at both call sites: the material binds the second
-	// and the sector AVT footprint uses it for CPU demand.
+	// The near field's anisotropy: `..._sampler()` is the tap count the viewport's filtering level
+	// gives the material samplers (the terrain cannot raise it), `..._request()` is the setting (or
+	// the sampler's level when the setting is zero), and `get_avt_anisotropy()` is the request
+	// clamped by both that tap count and the page gutter - the two hard bounds, because a filtering
+	// footprint can neither take taps the viewport does not give it nor reach past the border texels
+	// a page carries. One home for a rule that used to be spelled at both call sites: the material
+	// binds the third and the sector AVT footprint uses it for CPU demand.
+	float get_avt_anisotropy_sampler(const Camera3D *p_camera) const;
 	float get_avt_anisotropy_request(const Camera3D *p_camera) const;
 	float get_avt_anisotropy(const Camera3D *p_camera) const;
 	void set_surface_vt_resolution(int p_resolution);
@@ -589,7 +742,9 @@ public:
 	// Far field
 	Terrain3DVirtualTexture *get_surface_svt() const { return _vt.surface_svt; }
 	void set_surface_svt_enabled(const bool p_enabled);
-	bool is_surface_svt_enabled() const { return _vt.surface_svt_enabled; }
+	// A view of the far field's material cell, the far-tier counterpart of
+	// `is_surface_vt_enabled()`.
+	bool is_surface_svt_enabled() const { return _vt.delivery.get(TerrainVT::Tier::Far, TerrainVT::ChannelGroup::Material) == TerrainVT::Delivery::SVT; }
 	void set_surface_svt_page_world(const real_t p_size);
 	real_t get_surface_svt_page_world() const { return _vt.surface_svt_page_world; }
 	void set_surface_svt_page_size(const int p_size);
@@ -619,11 +774,18 @@ public:
 	void set_surface_array_enabled(const bool p_enabled);
 	bool is_surface_array_enabled() const { return _vt.surface_array_enabled; }
 	// Whether the array still has to carry the surface channel. It must, whenever no
-	// virtual texture tier is enabled: with both off the array is the only source, and a
-	// blank array would render every texel as material 0.
+	// service delivers the diffuse/normal group: with the group direct the array is its only
+	// source, and a blank array would render every texel as material 0.
 	bool is_surface_array_upload_needed() const {
-		return is_vt_editor_preview_active() || _vt.surface_array_enabled || (!_vt.surface_vt_enabled && !_vt.surface_svt_enabled);
+		return is_vt_editor_preview_active() || _vt.surface_array_enabled || !group_has_vt_delivery(TerrainVT::ChannelGroup::Material);
 	}
+	// Whether the generated shader carries a virtual-texture arm at all. A group that a service
+	// does not carry is sampled from the region arrays, and that arm contributes no code, no
+	// uniform and no sampler - so this is the single input to the material's variant choice and it
+	// must name every group that has an arm. It is the union of the two: the material group's paged
+	// arms and the height group's clipmap arm, so an all-`Direct` matrix stays the no-VT build and a
+	// height-only configuration still compiles the arm it asked for.
+	bool needs_vt_shader_arms() const { return group_has_vt_delivery(TerrainVT::ChannelGroup::Material) || height_clipmap_arm(); }
 	// Drops the pages that carry a region's surface, so an edit is re-produced instead
 	// of being served stale from either virtual texture. While the editor preview is active
 	// an edit is only recorded and the refresh is deferred; p_force skips that, which a

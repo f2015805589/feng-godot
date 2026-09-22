@@ -43,11 +43,21 @@ void Terrain3DMaterial::_update_shader() {
 		}
 	} else {
 		code = _generate_shader_code();
+		// The variant's own two defines, in front of everything. A matrix with no non-`Direct` cell
+		// is the no-VT build; a matrix whose height group names the ring compiles the ring's arm,
+		// uniforms and samplers, and one whose height group is `Direct` in both bands compiles none
+		// of it - no branch, no binding, no code, which is what "a method nobody selected costs
+		// nothing" means on the shader side. The second cannot be defined with the first: a height
+		// cell on `Clipmap` is what makes `needs_vt_shader_arms()` true.
+		if (_needs_height_clipmap_arm()) {
+			code = "#define TERRAIN_HEIGHT_CLIPMAP\n" + code;
+		}
 		if (!_needs_vt_shader()) {
 			code = "#define TERRAIN_NO_VT\n" + code;
 		}
 	}
 	_shader_uses_vt = _needs_vt_shader();
+	_shader_height_clipmap = _needs_height_clipmap_arm();
 	_shader->set_code(_inject_editor_code(code));
 	RS->material_set_shader(_material, get_shader_rid());
 	LOG(DEBUG, "Material rid: ", _material, ", shader rid: ", get_shader_rid());
@@ -181,9 +191,10 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_page_fade_frames", _terrain->get_vt_page_fade_frames());
 	// The near field's anisotropy, from the one function that owns the rule: the terrain's request
 	// (or the viewport's filtering level when the setting is zero, which is its "auto") clamped by
-	// the page gutter. The shader clamps by the same gutter as its own physical bound, so binding
-	// the effective number here and reading `vt_anisotropy_effective` from the settings cannot
-	// disagree. See docs/vt_sampling_review.md.
+	// the taps the viewport's material samplers actually have and by the page gutter. The shader
+	// clamps by the same gutter as its own physical bound, so binding the effective number here and
+	// reading `avt_anisotropy_effective` from the settings cannot disagree. See
+	// docs/vt_sampling_review.md.
 	Camera3D *camera = _terrain->get_camera();
 	RS->material_set_param(p_material, "_surface_vt_anisotropy", _terrain->get_avt_anisotropy(camera));
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
@@ -193,6 +204,9 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_avt_mip_level_cap", _terrain->get_avt_mip_level_cap());
 	RS->material_set_param(p_material, "_avt_coarse_mip_cap", MAX(1, coarse.levels - 1));
 	RS->material_set_param(p_material, "_avt_fine_texel", 1.f / _terrain->get_surface_vt_texels_per_meter());
+	// Which table answers a sample. Published from the same accessor the report and the plan read,
+	// so the shader's read order cannot drift from the number the plan classified against.
+	RS->material_set_param(p_material, "_avt_adaptive_threshold_level", _terrain->get_avt_adaptive_threshold_level());
 	RS->material_set_param(p_material, "_avt_coarse_grid", Vector4(coarse.center.x, coarse.center.y, coarse.page_world, coarse.size));
 	RS->material_set_param(p_material, "_avt_coarse_block", coarse.block);
 	PackedFloat32Array avt_distances = _terrain->get_surface_vt_mip_distances();
@@ -264,6 +278,11 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 		RS->material_set_param(p_material, "_surface_vt_indirection", _generated_dummy_2d.get_rid());
 		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
 	}
+
+	// The height group's clipmap arm. Bound only while the generated code carries it, so a
+	// configuration whose height group is `Direct` in both bands binds no ring uniform at all - the
+	// names would not exist in that variant.
+	_bind_vt_clipmap_uniforms(p_material);
 
 	// Far field (sparse virtual texture). World-space page grid, no block table: the
 	// shader derives the page from the world position and the same centre offset the
@@ -423,7 +442,45 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	RS->material_set_param(p_material, "_texture_slope_params_array", asset_list->get_texture_slope_params());
 }
 
-void Terrain3DMaterial::_set_shader_parameters(const Dictionary &p_dict) {
-	SET_IF_DIFF(_shader_params, p_dict);
+// The height group's clipmap arm, in one place because it is bound twice: by the full uniform pass
+// when the material or the variant changes, and by `update_vt_clipmap_uniforms()` when the *ring*
+// changed - which is per-level state that moves every tick a level is produced into, and therefore
+// deliberately not a reason to republish every VT uniform and the region tables with them.
+//
+// The ring's own numbers come from `get_vt_clipmap_arm()`, which is the CPU's addressing, so the
+// shader's level rule and the ring's cannot drift. The texture is the dummy (a blank array, height 0)
+// until the first level drains, which the `valid` gate covers: an invalid level is never read. The
+// two cells are bound even in the window before a ring exists, so a uniform never keeps the last
+// configuration's answer.
+void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
+	if (!_shader_height_clipmap || _terrain == nullptr) {
+		return;
+	}
+	Dictionary arm = _terrain->get_vt_clipmap_arm(int(TerrainVT::ChannelGroup::Height));
+	RID atlas = arm.get("texture", RID());
+	RS->material_set_param(p_material, "_clipmap_atlas", atlas.is_valid() ? atlas : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_clipmap_size", arm.get("size", 0));
+	RS->material_set_param(p_material, "_clipmap_level_count", arm.get("levels", 0));
+	RS->material_set_param(p_material, "_clipmap_base_world", arm.get("base_world", 0.0));
+	// Padded to the shader's declared array size by the accessor, so the tail is never unbound.
+	RS->material_set_param(p_material, "_clipmap_center", arm.get("centers", PackedVector2Array()));
+	RS->material_set_param(p_material, "_clipmap_ring", arm.get("rings", PackedVector2Array()));
+	RS->material_set_param(p_material, "_clipmap_level_valid", arm.get("valid", PackedFloat32Array()));
+	RS->material_set_param(p_material, "_clipmap_height_near",
+			_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Height)) == int(TerrainVT::Delivery::Clipmap));
+	RS->material_set_param(p_material, "_clipmap_height_far",
+			_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Height)) == int(TerrainVT::Delivery::Clipmap));
+}
+
+void Terrain3DMaterial::update_vt_clipmap_uniforms() {
+	_bind_vt_clipmap_uniforms(_material);
+	// The displacement buffer samples the same height through the same arm, so it is bound with it
+	// whenever it exists - the rule the whole uniform pass follows.
+	if (_terrain != nullptr && _terrain->get_tessellation_level() > 0) {
+		_bind_vt_clipmap_uniforms(_buffer_material);
+	}
+}
+
+void Terrain3DMaterial::_set_shader_parameters(const Dictionary &p_dict) {	SET_IF_DIFF(_shader_params, p_dict);
 	LOG(INFO, "Setting shader params dictionary: ", p_dict.size());
 }

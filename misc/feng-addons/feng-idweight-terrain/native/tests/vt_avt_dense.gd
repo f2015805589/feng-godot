@@ -625,6 +625,26 @@ func _validate_records(settings: Dictionary) -> Dictionary:
 			"AVT base block follows the exact 64 metre tier-0 density/page-size ratio")
 	_require(int(settings.get("avt_max_adaptive_level", 0)) == 1,
 			"AVT MaxAdaptiveLevel stays fixed at one")
+	# The threshold that decides which table answers a sample is derived, not configured, so it is
+	# checked against the two texel sizes it is derived from rather than against a constant: the
+	# level between the fallback tier's texels-per-metre and the upgrade tier's is exactly
+	# log2(upgrade / fallback).
+	var coarse_texels_per_meter := float(settings.get("avt_coarse_texels_per_meter", 0.0))
+	var upgrade_texels_per_meter := float(settings.get("avt_texels_per_meter", 0.0))
+	_require(coarse_texels_per_meter > 0.0 and upgrade_texels_per_meter > coarse_texels_per_meter,
+			"AVT reports both tiers' texel sizes for the threshold to be derived from")
+	_require(is_equal_approx(float(settings.get("avt_adaptive_threshold_level", 0.0)),
+				log(upgrade_texels_per_meter / coarse_texels_per_meter) / log(2.0)),
+			"AVT adaptive threshold level is the level between the two tiers' texel sizes")
+	# The plan's half of that one number: it must be the number the report publishes, and the plan
+	# must hold no upgrade page at or above it. A settled view that disagrees here is the plan and
+	# the shader's read order deriving from two different thresholds.
+	var sector_stats: Dictionary = settings.get("avt_sector_stats", {})
+	_require(is_equal_approx(float(sector_stats.get("plan_adaptive_threshold_level", -1.0)),
+				float(settings.get("avt_adaptive_threshold_level", -2.0))),
+			"AVT plan classifies against the adaptive threshold the report publishes")
+	_require(int(sector_stats.get("plan_upgrade_above_level", -1)) == 0,
+			"AVT plan holds no upgrade page at or above the fallback threshold")
 	_require(terrain.get_surface_vt().has_sector(COARSE_OWNER),
 			"dense AVT mip 1+ grid owns the reserved sentinel sector")
 	_require(terrain.get_surface_vt().get_sector_block_size(COARSE_OWNER) == coarse_size * 2,

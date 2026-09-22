@@ -432,6 +432,10 @@ Dictionary Terrain3DVirtualTexture::get_stats() const {
 	stats["hit_count"] = _hit_count;
 	stats["miss_count"] = _miss_count;
 	stats["protected_block_count"] = _page_pool ? _page_pool->protected_block_count : 0;
+	// Reserved residency and the pressure it caused: how many slots the addressing is holding for a
+	// page it treats as a guarantee, and how often a request found only reserved candidates left.
+	stats["reserved_count"] = _page_pool ? _page_pool->count_reserved_slots() : 0;
+	stats["reserved_block_count"] = _page_pool ? _page_pool->reserved_block_count : 0;
 	stats["commit_count"] = _commit_count;
 	stats["page_write_count"] = _page_write_count;
 	stats["free_count"] = _page_pool ? int(_page_pool->free_slots.size()) : 0;

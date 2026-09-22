@@ -69,8 +69,10 @@ void Terrain3D::_initialize() {
 		LOG(DEBUG, "Creating region streamer");
 		_streamer = memnew(Terrain3DStreamer);
 	}
-	_setup_surface_vt();
-	_setup_surface_svt();
+	// The services are assembled from the delivery matrix, not created unconditionally: a
+	// configuration whose four cells are all `Direct` owns no view, no page table, no array family
+	// and no VT shader arm. See docs/vt_delivery_assembly.md.
+	_resolve_vt_delivery(false);
 	// Connect signals
 	// Any region was changed, update region labels
 	if (!_data->is_connected("region_map_changed", callable_mp(this, &Terrain3D::update_region_labels))) {
@@ -236,6 +238,36 @@ void Terrain3D::__physics_process(const double p_delta) {
 		TerrainProfileZone zone(p_name);
 		p_body();
 	};
+	// The rings run first, and only when a cell selects the method. They are the only production that
+	// does not go through the shared pool, so they are outside the demand block below, and running
+	// them before the service phase means the service publishes a ring's texture in the same tick the
+	// ring produced into it. **A configuration with no cell on `Clipmap` does not enter this at all**:
+	// no focus read, no group scan, no phase - the same rule the two demand passes follow, so a
+	// method nobody selected costs nothing rather than costing a check. A ring is entered only while
+	// a cell still selects it: the object staying (a deselection stops a service rather than freeing
+	// it) is not a reason to spend its budget.
+	if (has_clipmap_delivery()) {
+		traced("vt_clipmap", [&] {
+			_vt.clipmap_produced_texels = 0;
+			const Vector2 focus = v3v2(get_clipmap_target_position());
+			for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+				Terrain3DClipmap *ring = _vt.clipmap[group].get();
+				if (ring == nullptr || !_vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::Clipmap)) {
+					continue;
+				}
+				_vt.clipmap_produced_texels += ring->update(focus, _vt.clipmap_budget_texels);
+			}
+		});
+		vt_phase(_vt.vt_clipmap_ms);
+		// A ring that moved a level, turned its ring or changed which levels are current is a uniform
+		// rebind: the shader's copy of the ring's addressing is stale from that moment, and serving it
+		// would read the texel a *previous* centre put under a world position. The stamp is the ring's
+		// own, so this is one comparison per ring on a tick that changed nothing.
+		_update_vt_clipmap_arm();
+	} else {
+		_vt.clipmap_produced_texels = 0;
+		_vt.vt_clipmap_ms = 0.0;
+	}
 	traced("vt_service", [&] { _update_vt_service(); });
 	vt_phase(_vt.vt_service_ms);
 	// The demand passes below do not release the source workers they prime; the tick does, once every
@@ -254,7 +286,12 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// reserves instead.
 	int vt_remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
 	const bool svt_baking = _vt.bake.busy();
-	const auto demand_pool = !_vt.vt_debug_direct_material && _vt.surface_vt ? _vt.surface_vt->get_page_pool() : nullptr;
+	// The pool belongs to the shared service, not to the near view: a configuration that selects
+	// only the far field still has one, and it is the far view that holds it.
+	const auto demand_pool = !_vt.vt_debug_direct_material
+			? (_vt.surface_vt ? _vt.surface_vt->get_page_pool()
+							  : (_vt.surface_svt ? _vt.surface_svt->get_page_pool() : nullptr))
+			: nullptr;
 	if (demand_pool) { demand_pool->begin_demand(); }
 	// How much of this tick's page budget the near field may take, and what the far field gets
 	// of it: the near field's share, then whatever the near field did not spend. The near field's
@@ -276,7 +313,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// The rule now has one home (`_avt_tick_allowance()`), because the near field's plan is sized
 	// against the same number: its unsampled tail is capped at what one refresh window can produce
 	// with this allowance. Two spellings of the split would let the plan outrun the pass it is
-	// served from, which is the defect `docs/vt_hdrp_avt_alignment.md` section 7.7 records.
+	// served from, which is the defect `docs/vt_reference_avt_alignment.md` section 7.7 records.
 	const int avt_share = _avt_tick_allowance();
 	int avt_produced = 0;
 	// The tiers run in the order they are built in: the near field's pass publishes the
@@ -288,7 +325,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// resident pages as demanded, and a tick skipped here would let the pool evict the view.
 	arm_phase_deadline();
 	traced("vt_avt", [&] {
-		if (_vt.surface_vt_enabled) { avt_produced = update_surface_vt(avt_share); }
+		if (has_avt_delivery()) { avt_produced = update_surface_vt(avt_share); }
 	});
 	vt_phase(_vt.vt_avt_ms);
 	if (_vt.vt_avt_ms > _vt.vt_avt_peak_ms) {
@@ -303,7 +340,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	const int svt_share = MAX(0, vt_remaining - MIN(vt_remaining, avt_produced));
 	arm_phase_deadline();
 	traced("vt_svt", [&] {
-		if (_vt.surface_svt_enabled && svt_share > 0) { update_surface_svt(svt_share); }
+		if (has_svt_delivery() && svt_share > 0) { update_surface_svt(svt_share); }
 	});
 	vt_phase(_vt.vt_svt_ms);
 	if (_vt.vt_svt_ms > _vt.vt_svt_peak_ms) { _vt.vt_svt_peak_ms = _vt.vt_svt_ms; }

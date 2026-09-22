@@ -70,7 +70,14 @@ func refresh(p_terrain: Object) -> void:
 	if not TerrainVTBridge.has_property(terrain, &"surface_svt_mip_distances"):
 		return
 	var view := TerrainVTBridge.call_method(terrain, "get_surface_svt")
-	var max_mip := int(TerrainVTBridge.call_method(view, "get_world_max_mip"))
+	# A terrain with no far view - the delivery matrix makes "no cell selects SVT" a live
+	# configuration, and this panel is refreshed for it like any other - has no view to ask for its
+	# world mip reach. Asking through it was a null call that logged a script error on every refresh;
+	# without a view the configured ceiling is the number, which is what the table is built from.
+	var max_mip := -1
+	var reach: Variant = TerrainVTBridge.call_method(view, "get_world_max_mip")
+	if reach != null:
+		max_mip = int(reach)
 	if max_mip < 0:
 		max_mip = int(TerrainVTBridge.call_method(terrain, "get_surface_svt_max_mip"))
 	var levels := maxi(1, max_mip + 1)

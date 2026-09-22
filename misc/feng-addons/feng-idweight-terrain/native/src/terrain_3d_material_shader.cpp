@@ -543,6 +543,12 @@ bool Terrain3DMaterial::_needs_vt_shader() const {
 	// Overrides retain the full interface, including when first populated from
 	// the default shader. Their source must not freeze an editor-preview variant.
 	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
-			(!_terrain->is_vt_editor_preview_active() &&
-					(_terrain->is_surface_vt_enabled() || _terrain->is_surface_svt_enabled()));
+			(!_terrain->is_vt_editor_preview_active() && _terrain->needs_vt_shader_arms());
+}
+
+// The height group's own arm, on the same three cases: a group the editor preview is holding still,
+// or a shader override that owns its own code, keeps the interface rather than losing it.
+bool Terrain3DMaterial::_needs_height_clipmap_arm() const {
+	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
+			(!_terrain->is_vt_editor_preview_active() && _terrain->height_clipmap_arm());
 }

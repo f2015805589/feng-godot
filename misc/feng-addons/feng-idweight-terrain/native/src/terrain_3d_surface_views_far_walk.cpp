@@ -61,7 +61,7 @@
 // `indirection_size * page_world / 2^mip` metres - so a fallback page that lands or leaves changes a
 // continent's worth of shading.
 //
-// `Terrain3DSVTPerUnitCoarsest`: HDRP's `DeduplicateJob` guarantee - for every virtual image that is
+// `Terrain3DSVTPerUnitCoarsest`: the reference's `DeduplicateJob` guarantee - for every virtual image that is
 // *resident* (here: every page the visible set selected), the coarsest level the world grid can
 // express that contains it, requested unconditionally. The fallback's granularity becomes the unit
 // the fragment is looking at rather than the domain, and the coarsest ancestor of a page is a
@@ -124,9 +124,11 @@ std::array<double, 4> Terrain3D::_svt_plan_roots(const Rect2 &p_domain, const in
 		mark = now;
 	};
 	// Near and far detail share this pool. Reserve only a quarter for permanent
-	// far roots when AVT is active; keep the complete root window by sliding it
-	// coarser, never by clipping its world coverage. Visible SVT LOD is unchanged.
-	const int protected_limit = MAX(4, p_physical_page_count / (_vt.surface_vt_enabled ? 4 : 2));
+	// far roots while the AVT service is live; keep the complete root window by sliding it
+	// coarser, never by clipping its world coverage. Visible SVT LOD is unchanged. The
+	// question is the *service*'s, not a group's: a cell that puts the height channel on
+	// AVT holds pages from this pool exactly as the material channel does.
+	const int protected_limit = MAX(4, p_physical_page_count / (has_avt_delivery() ? 4 : 2));
 	const int root_levels = CLAMP(_vt.surface_svt_root_mips, 0, p_maximum_mip + 1);
 	const int indirection_size = _vt.surface_svt->get_indirection_size();
 	auto level_cells = [indirection_size](const int p_mip) {
@@ -422,7 +424,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	auto avt_interior = [&](const Rect2 &rect) {
 		Vector2 farthest(MAX(Math::abs(rect.position.x - focus.x), Math::abs(rect.get_end().x - focus.x)),
 				MAX(Math::abs(rect.position.y - focus.y), Math::abs(rect.get_end().y - focus.y)));
-		return _vt.surface_vt_enabled && is_sector_avt() && farthest.length() < MAX(64.f, float(_vt.surface_vt_distance)) * 0.75f;
+		return has_avt_delivery() && is_sector_avt() && farthest.length() < MAX(64.f, float(_vt.surface_vt_distance)) * 0.75f;
 	};
 	const float region_world = _region_size * _vertex_spacing;
 	const float page_world = MAX(0.001f, _vt.surface_svt_page_world);
@@ -431,7 +433,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		if (region.is_null() || region->is_deleted()) { continue; }
 		// Legacy region AVT owns whole regions; sector AVT excludes only the
 		// metric near interior during footprint traversal below.
-		if (_vt.surface_vt_enabled && !is_sector_avt() && _vt.vt_registered_sectors.has(location)) { continue; }
+		if (has_avt_delivery() && !is_sector_avt() && _vt.vt_registered_sectors.has(location)) { continue; }
 		Rect2 rect(Vector2(location) * region_world, Vector2(region_world, region_world));
 		TerrainVT::VisiblePatch visible;
 		if (!view.sample(rect, region->get_height_range(), visible)) { continue; }
@@ -467,14 +469,14 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// leftover budget, so counting it would make the capacity follow the budget that the
 	// capacity itself allows. No floor of one either - a request of zero pages must not ask for
 	// a minimum block of slots on every empty plan.
-	if (_ensure_vt_capacity(int(pages.size()) + (_vt.surface_vt_enabled ? int(_vt.avt_plan.pages.size()) : 0))) { return 0; }
+	if (_ensure_vt_capacity(int(pages.size()) + (has_avt_delivery() ? int(_vt.avt_plan.pages.size()) : 0))) { return 0; }
 	stamp(ST_CAPACITY);
 
 	// The physical pool is shared with the near field, so the far field only claims what
 	// the near field is not holding.
 	const int physical_page_count = MAX(1, _vt.surface_svt->get_page_count());
 	_vt.vt_svt_visible_pages = int(pages.size());
-	const int near_reserve = _vt.surface_vt_enabled ? MIN(physical_page_count / 2, int(_vt.avt_plan.pages.size())) : 0;
+	const int near_reserve = has_avt_delivery() ? MIN(physical_page_count / 2, int(_vt.avt_plan.pages.size())) : 0;
 	const int capacity = MAX(1, physical_page_count - near_reserve);
 
 	// Publish the level this frame uses. A saved maximum detail level is only ever raised,
@@ -505,7 +507,7 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 		// below like any other page and the producer serves them from the persisted catalogue, which
 		// already holds the cell's mip chain. The landing measurement (the turned phase of
 		// `vt_svt_coverage`) produced and served a page at the new level with no region marked, and
-		// `docs/vt_hdrp_avt_alignment.md` section 7.7.6 records it. It is exactly the heavy hammer
+		// `docs/vt_reference_avt_alignment.md` section 7.7.6 records it. It is exactly the heavy hammer
 		// section 4/H3 was written about.
 		const int region_marks_before = int(_vt.bake.dirty_regions.size());
 		const uint64_t cap_mark = Time::get_singleton()->get_ticks_usec();
@@ -545,6 +547,9 @@ int Terrain3D::_update_visible_svt(int p_max_pages) {
 	// the smallest one that fits - a function of the visible set and the remaining capacity
 	// alone - so a settled view selects the same floor, levels and pages on every pass.
 	const int detail_capacity = MAX(1, capacity - int(_vt.svt_roots.pages.size()));
+	// Published beside the floor below: the two are one decision, and a reader that only sees the
+	// floor cannot tell whether the pool had room.
+	_vt.svt_detail_capacity = detail_capacity;
 	std::vector<Terrain3DSVTPage> chosen;
 	_vt.svt_floor_level = 0;
 	if (int(pages.size()) <= detail_capacity) {
@@ -690,6 +695,7 @@ void Terrain3D::_report_svt(Dictionary &r_result) const {
 	result["svt_persist_probe_cells"] = int64_t(_vt.svt_persist_probe_cells);
 	result["svt_persist_probe_skips"] = int64_t(_vt.svt_persist_probe_skips);
 	result["svt_floor_level"] = _vt.svt_floor_level;
+	result["svt_detail_capacity"] = _vt.svt_detail_capacity;
 	// P0/H3: the world mip cap's change history. `svt_cap_changes` counts the level changes,
 	// `svt_cap_dirty_regions` how many region re-bakes they caused - zero since H3 step 1, and the
 	// property `vt_svt_coverage` asserts - the two `*_ms` keys what they cost, and the two `last_*`

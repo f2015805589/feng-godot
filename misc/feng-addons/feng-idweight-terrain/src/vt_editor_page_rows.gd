@@ -18,6 +18,10 @@ extends RefCounted
 # truncated with a "…" row instead of being laid out in full.
 const MAX_ROWS: int = 512
 
+# The delivery method this file's rows are about, by the native enum's value (`Clipmap`). The rows read
+# the published capability and never re-derive it.
+const CLIPMAP: int = 2
+
 
 # One read of the live terrain for one details refresh. The window gathers it so
 # that filling the tree never reaches back into the scene midway, and so every
@@ -100,6 +104,65 @@ static func add_settings_summary(p_tree: Tree, p_root: TreeItem, p_shot: Snapsho
 	add_row(p_tree, p_root, "Shared atlas", "Ready" if bool(settings.get("shared_pool", false)) else "Pending", "", "%d pages · %d + %d border texels" % [int(settings.get("page_count", 0)), int(settings.get("page_size", 0)), int(settings.get("border", 0))])
 	add_row(p_tree, p_root, "Adaptive AVT", "Enabled" if bool(settings.get("adaptive", false)) else "Disabled", "", "Adaptive blocks can resize while retaining overlap")
 	add_row(p_tree, p_root, "Producer", "Active" if settings.has("producer") else "Unavailable", "", "Material pages are produced by the Surface VT baker")
+
+
+# The clipmap is not paged, so it has no slot for the residency list and nothing to read back from
+# the GPU. What it has is one square per level, which the window draws, and the rows here are the
+# readings that make that drawing checkable: the addressing a level is snapped to, whether it is
+# current, and what the ring cost. With no ring there is nothing to report but the state itself - the
+# height cell is deliverable, so "no ring" means no cell names it, which the row says rather than
+# reading as a build that cannot do it.
+static func add_clipmap_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) -> void:
+	var settings := p_shot.settings
+	var rings: Dictionary = settings.get("clipmap", {})
+	for group in ["material", "height"]:
+		var entry: Dictionary = rings.get(group, {})
+		if typeof(entry) != TYPE_DICTIONARY or entry.is_empty():
+			continue
+		var label := "Diffuse + normal" if group == "material" else "Height"
+		if not bool(entry.get("configured", false)):
+			continue
+		var row := add_row(p_tree, p_root, "%s ring" % label,
+				"%d/%d levels valid" % [int(entry.get("valid_levels", 0)), int(entry.get("levels", 0))],
+				"%d texels an axis" % int(entry.get("size", 0)),
+				"source %s · base %.1f m · %d queued · %d produced · %.1f KB uploaded" % [
+						str(entry.get("source", "none")), float(entry.get("base_world", 0.0)),
+						int(entry.get("pending_jobs", 0)), int(entry.get("produced_texels", 0)),
+						float(entry.get("upload_bytes", 0)) / 1024.0])
+		for value: Variant in entry.get("level_reports", []):
+			if typeof(value) != TYPE_DICTIONARY:
+				continue
+			var level: Dictionary = value
+			var center: Vector2 = level.get("center", Vector2.ZERO)
+			add_row(p_tree, row, "Level %d" % int(level.get("level", 0)),
+					"Valid" if bool(level.get("valid", false)) else "Holds the level it replaces",
+					"ring %s" % str(level.get("ring", Vector2i())),
+					"%.1f m an axis · %.3f m a texel · centre %.1f, %.1f" % [
+							float(level.get("world_size", 0.0)), float(level.get("texel_world", 0.0)),
+							center.x, center.y])
+	# One row a group, because "this group is not delivered by the ring" is a state of its own cell: the
+	# height group may name `Clipmap` and simply not have, and the diffuse+normal group may not name it
+	# at all until a source carries that channel. Both sentences come from the report.
+	var supported: Dictionary = settings.get("delivery_supported", {})
+	var unsupported: Dictionary = settings.get("delivery_unsupported", {})
+	for group in ["material", "height"]:
+		if typeof(rings.get(group, {})) == TYPE_DICTIONARY and bool((rings.get(group, {}) as Dictionary).get("configured", false)):
+			continue
+		var label := "Diffuse + normal" if group == "material" else "Height"
+		var deliverable: bool = (supported.get(group, []) as Array).has(CLIPMAP)
+		add_row(p_tree, p_root, "%s ring" % label,
+				"No ring" if deliverable else "Not deliverable",
+				"none built",
+				"A cell selecting Clipmap builds the ring when the matrix resolves; with none selected nothing is built, ticked or uploaded, and the mechanism stays measurable through debug_update_vt_clipmap() (native/tests/vt_clipmap)" if deliverable else
+				"%s: no cell may select Clipmap for this group, so no ring is built" % str(
+						(unsupported.get(group, {}) as Dictionary).get("Clipmap", "this build has no arm for this group's clipmap")))
+	add_row(p_tree, p_root, "Shape",
+			"%d texels · %d levels" % [int(settings.get("clipmap_size", 0)), int(settings.get("clipmap_levels_setting", 0))],
+			"%.1f m base" % float(settings.get("clipmap_base_world", 0.0)),
+			"level l covers base * 2^l metres, so level 0 is the base extent in size texels")
+	add_row(p_tree, p_root, "Production", "%d texels last update" % int(settings.get("clipmap_produced_texels", 0)),
+			"%d a tick" % int(settings.get("clipmap_budget_texels", 0)),
+			"The budget is shared by every ring and is spent beside the page budget, not out of it")
 
 
 static func add_surface_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) -> void:

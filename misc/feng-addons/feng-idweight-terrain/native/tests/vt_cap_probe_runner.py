@@ -1,7 +1,7 @@
 """P0: report the far-field world mip cap's change history under a scripted view.
 
 The probe asserts nothing about the numbers - it prints them. See
-`vt_cap_probe.gd` and `docs/vt_hdrp_avt_alignment.md` section 7.
+`vt_cap_probe.gd` and `docs/vt_reference_avt_alignment.md` section 7.
 """
 
 from __future__ import annotations

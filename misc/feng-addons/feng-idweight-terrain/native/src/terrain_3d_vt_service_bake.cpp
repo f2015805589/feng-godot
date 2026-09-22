@@ -175,7 +175,7 @@ void Terrain3D::set_svt_auto_bake(bool p_enabled) {
 }
 
 void Terrain3D::_process_svt_auto_bake() {
-	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !_vt.surface_svt_enabled || _data_directory.is_empty() || _vt.bake.dirty_regions.is_empty() ||
+	if (is_vt_editor_preview_active() || !_vt.svt_auto_bake || !has_svt_delivery() || _data_directory.is_empty() || _vt.bake.dirty_regions.is_empty() ||
 			_vt.bake.busy() || _vt.bake.explicit_job ||
 			Time::get_singleton()->get_ticks_msec() - _vt.bake.edit_time < 500) {
 		return;

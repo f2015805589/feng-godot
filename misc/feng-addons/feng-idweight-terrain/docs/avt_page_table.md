@@ -49,11 +49,20 @@ is drawn separately from the colored 64 m sectors. Reducing coarse density or
 coarse residency does not change the sector grid or the available fine
 resolution tiers. Under pressure, a sector can fall back to a ready page; that
 is a residency result, not a change to its selected virtual image definition.
+A coarse page is also not evictable: once the tier has produced it, the pool
+never chooses its slot as a victim, so the base a sector falls back to does not
+depend on what the fine sectors are asking for. The counters `fallback_ready_pages`
+and `fallback_reserved_pages` report that tier's residency against its plan.
 
-`surface_vt_distance`, default **384 metres**, is the horizontal radius of the
-whole AVT. Fine sectors and the coarse base are planned inside that radius.
-Sampling outside the radius uses SVT. Storage rectangles can pad the circular
-boundary, but that padding does not extend AVT shading into the outside region.
+`surface_vt_distance`, default **384 metres**, is the horizontal radius the near
+field's demand and its resolution tiers are planned against. Fine sectors and the
+coarse base are planned inside that radius; outside it the far field owns the
+sample. The radius bounds the *upgrade* path, not the coarse base: a fragment
+outside the radius that the far field cannot answer - because it is disabled or
+because its own page has not arrived - still recovers from a resident coarse page
+rather than being drawn as a missing-page diagnostic. Storage rectangles can pad
+the circular boundary, but that padding does not extend fine shading into the
+outside region.
 
 The shared physical pool limits coarse residency and the allocations that fine
 sectors can receive. With **Automatic cache capacity** enabled (the default),

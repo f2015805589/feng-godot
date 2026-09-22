@@ -123,7 +123,7 @@ int Terrain3DVirtualTexture::request_page(const Vector2i &p_sector, const int p_
 }
 
 int Terrain3DVirtualTexture::request_page_internal(const Vector2i &p_sector, const int p_local_mip,
-		const int p_page_x, const int p_page_y, bool *r_miss) {
+		const int p_page_x, const int p_page_y, bool *r_miss, const bool p_reserved) {
 	if (r_miss) {
 		*r_miss = false;
 	}
@@ -137,6 +137,7 @@ int Terrain3DVirtualTexture::request_page_internal(const Vector2i &p_sector, con
 	owner.sector_x = p_sector.x;
 	owner.sector_y = p_sector.y;
 	owner.world_space = false;
+	owner.reserved = p_reserved;
 	return _request_virtual(virtual_x, virtual_y, p_local_mip,
 			_sector_max_local_mip(p_sector.x, p_sector.y), owner, r_miss);
 }

@@ -76,7 +76,16 @@ bool Terrain3D::_ensure_vt_capacity(int p_required) {
 			// layers blank. The demand passes therefore re-produce the same pages instead of
 			// re-deriving which pages they want, which is why the pool generation is not bumped here
 			// (section 7.7.10 measures both halves of that trade).
-			if (!_vt.surface_vt->grow_capacity(ready_capacity) || !_vt.surface_svt->grow_capacity(ready_capacity)) { return false; }
+			// Grow whichever views exist: a configuration that selects one method has one view, and
+			// the shared pool it allocates from is the same one. Requiring both here would make the
+			// growth unreachable - and dereference a null view - in exactly that configuration.
+			// The two calls are made unconditionally rather than short-circuited, which is what the
+			// pre-delivery code did: `grow_capacity()` grows the shared pool, so which of the two
+			// runs first must not decide whether the second runs at all. A/B measured against the
+			// old short-circuit form: identical outcomes on the recorded suites.
+			const bool avt_grown = _vt.surface_vt == nullptr || _vt.surface_vt->grow_capacity(ready_capacity);
+			const bool svt_grown = _vt.surface_svt == nullptr || _vt.surface_svt->grow_capacity(ready_capacity);
+			if (!avt_grown || !svt_grown) { return false; }
 			_vt.vt_page_count = _vt.surface_vt_page_count = _vt.surface_svt_page_count = ready_capacity;
 			_vt.pool.grow(ready_capacity);
 			if (_material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
@@ -329,7 +338,17 @@ void Terrain3D::set_vt_debug_direct_material(bool p_enabled) {
 }
 
 void Terrain3D::_configure_vt_service() {
-	if (_vt.vt_debug_direct_material || !_vt.surface_vt || !_vt.surface_svt) {
+	if (_vt.vt_debug_direct_material) {
+		return;
+	}
+	// The *shared* service is the page pool plus the material producer, which both views sample.
+	// It exists as long as one of them does: requiring both was the coupling that made "one
+	// delivery method selected" mean "no service at all" - a configuration that selected only the
+	// far field built no pool and no producer, so the field it did select had no arrays to sample
+	// and reported "SVT material arrays were not created". The views below are configured as a
+	// list of the ones that exist, which is also what keeps the loop from dereferencing a null.
+	Terrain3DVirtualTexture *views[2] = { _vt.surface_vt, _vt.surface_svt };
+	if (views[0] == nullptr && views[1] == nullptr) {
 		return;
 	}
 	if (_vt.vt_shared_ready) {
@@ -355,7 +374,10 @@ void Terrain3D::_configure_vt_service() {
 	_vt.surface_vt_page_size = _vt.surface_svt_page_size = _vt.vt_page_size;
 	_vt.surface_vt_page_border = _vt.surface_svt_page_border = _vt.vt_page_border;
 	_vt.surface_vt_page_count = _vt.surface_svt_page_count = capacity;
-	for (Terrain3DVirtualTexture *view : { _vt.surface_vt, _vt.surface_svt }) {
+	for (Terrain3DVirtualTexture *view : views) {
+		if (view == nullptr) {
+			continue;
+		}
 		view->clear();
 		view->set_page_pool(pool);
 		view->set_material_cache_mode(!_vt.vt_debug_direct_material);
@@ -440,10 +462,10 @@ bool Terrain3D::_vt_has_streaming_work() const {
 }
 
 void Terrain3D::_update_vt_service() {
-	if (!_vt.surface_svt_enabled) {
+	if (!has_svt_delivery()) {
 		_cancel_svt_bake("SVT was disabled; the offline bake was cancelled.");
 	}
-	if (!_vt.surface_vt_enabled && !_vt.surface_svt_enabled) {
+	if (!has_vt_delivery()) {
 		if (_vt.vt_callback_registered && RS->has_method("virtual_texture_remove_update_callback")) {
 			RS->call("virtual_texture_remove_update_callback", int64_t(get_instance_id()));
 			_vt.vt_callback_registered = false;
