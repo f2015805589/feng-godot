@@ -124,6 +124,11 @@ private:
 	void _avt_finish_produce(Terrain3DAVTProducePass &r_pass);
 	Terrain3DAVTPlanKey _avt_plan_state(bool p_bounds_ready) const;
 	int _avt_install_or_reuse_plan(uint64_t p_started, int p_max_pages, bool p_same_plan);
+	// Republishes the standing plan's page set to the near field's indirection as its "planned"
+	// levels, which is what the shader's strict resolve (feedback off) coarsens against. Called
+	// wherever `_vt.avt_plan.pages` changes shape, never per tick: the write is a diff over two
+	// page sets, not a pass over the address space.
+	void _avt_publish_plan_coverage();
 	Terrain3DAVTSectorScan _avt_scan_sectors(const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position,
 			bool p_bounds_ready, const Vector2 &p_focus, float p_reach) const;
 	Terrain3DAVTHierarchy _avt_build_hierarchy(const Terrain3DAVTSectorScan &p_scan);

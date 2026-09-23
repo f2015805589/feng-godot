@@ -852,6 +852,18 @@ struct Terrain3DVTState {
 	std::unordered_map<uint64_t, uint64_t> avt_demand_age;
 	int avt_late_pages = 0;
 	int avt_late_worst_us = 0;
+	// Session totals of the page publish: wall time inside `_avt_produce_page()` and the pages it
+	// published. Their ratio is the per-page cost the motion rate multiplies, and it stays as a
+	// diagnostic because a view moving continuously is the case that number decides.
+	uint64_t avt_page_us_sum = 0;
+	uint64_t avt_page_count_sum = 0;
+	// The same publish split into the four things it spends the per-page time on, as session sums.
+	// The live readings describe the last pass only, and a moving view's cost is a mean over
+	// thousands of pages, so the parts have to be summed to be attributable at all.
+	double avt_request_sum_ms = 0.0;
+	double avt_invalidate_sum_ms = 0.0;
+	double avt_payload_sum_ms = 0.0;
+	double avt_queue_sum_ms = 0.0;
 	// Pages of the sampled prefix that have no content this pass, and of those, the ones
 	// whose production is still inside its window. Kept as state and not only as a stat:
 	// the editor has to keep rendering while a page is still owed, and a demand waiting on
@@ -865,9 +877,12 @@ struct Terrain3DVTState {
 	// lead. The pool capacity request counts them, so a look-ahead plan cannot grow the
 	// pool exactly large enough to evict the view it is leading.
 	int avt_retained_pages = 0;
-	// Sampling density belongs to the installed plan. The plan has no capacity coarsening any more,
-	// so this is the configured texels-per-pixel and nothing else; it stays a member because the
-	// material is published from it and the shader divides its footprint by it.
+	// Sampling density belongs to the installed plan. The plan has no *global* capacity bias - the
+	// coarsening is per level and lives in the indirection as the plan marker
+	// (`Terrain3DVirtualTexture::set_planned_levels()`), so the strict resolve reads the level the
+	// plan actually holds instead of being handed a footprint scaled by one number - so this is the
+	// configured texels-per-pixel and nothing else; it stays a member because the material is
+	// published from it and the shader divides its footprint by it.
 	float avt_density_scale = 1.f;
 	// The settled shortcut: the caller's verdict that the standing plan is this tick's, the pool
 	// residency revision an idle pass verified, the resident set it verified and whether the idle

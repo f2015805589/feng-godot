@@ -185,6 +185,7 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 			coarse.block = Vector2i(_vt.surface_vt->get_sector_block_origin_x(avt_coarse_owner()),
 					_vt.surface_vt->get_sector_block_origin_y(avt_coarse_owner()));
 			_vt.avt_plan.install(std::vector<Terrain3DAVTPageRequest>(coarse.pages), int(coarse.pages.size()));
+			_avt_publish_plan_coverage();
 		} else { coarse.size = 0; coarse.levels = 0; }
 	}
 	if (!changed && coarse.size > 0) {
@@ -208,6 +209,7 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 			for (const auto &page : _vt.avt_plan.pages) { if (page.owner != avt_coarse_owner()) { pages.push_back(page); } }
 			const int sampled = int(pages.size());
 			_vt.avt_plan.install(std::move(pages), sampled);
+			_avt_publish_plan_coverage();
 			_vt.avt_settled.unverify();
 		}
 	}
@@ -244,6 +246,7 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 		const Vector2i owner = found->second.owner;
 		_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
 				[&](const auto &page) { return page.owner == owner; }), _vt.avt_plan.pages.end());
+		_avt_publish_plan_coverage();
 		_vt.surface_vt->unregister_sector(owner);
 		_vt.vt_registered_sectors.erase(found->second.owner);
 		_vt.avt_allocated_sizes.erase(key);
@@ -299,6 +302,7 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 			for (auto &page : _vt.avt_plan.pages) { if (page.owner == cell.owner) { page.mip += shift; } }
 			_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
 					[&](const auto &page) { return page.owner == cell.owner && page.mip < 0; }), _vt.avt_plan.pages.end());
+			_avt_publish_plan_coverage();
 		}
 		_vt.avt_cached_addresses[key] = { cell.location, cell.owner, 0, cell.resolution_level, cell.logical_pages };
 		_vt.avt_allocated_sizes[key] = cell.size;

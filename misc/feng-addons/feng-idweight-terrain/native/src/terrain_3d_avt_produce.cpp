@@ -244,10 +244,13 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 			// Age the miss from the frame the page was first demanded without content.
 			// A page younger than one lead is not late: the plan is ahead of the camera,
 			// so the frames it holds in flight are its production window, not a stall.
-			const uint64_t age_key = avt_page_age_key(page);
+			// The map is only touched while something is actually unready: on a moving view most
+			// of the sampled prefix is resident, and an unconditional lookup+erase for every one
+			// of those pages was most of this stage's cost.
 			if (sampled_ready) {
-				_vt.avt_demand_age.erase(age_key);
+				if (!_vt.avt_demand_age.empty()) { _vt.avt_demand_age.erase(avt_page_age_key(page)); }
 			} else {
+				const uint64_t age_key = avt_page_age_key(page);
 				auto found = _vt.avt_demand_age.find(age_key);
 				const uint64_t since = found == _vt.avt_demand_age.end() ? now_us : found->second;
 				if (found == _vt.avt_demand_age.end()) { _vt.avt_demand_age.emplace(age_key, since); }
@@ -356,15 +359,19 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const 
 // material copy and pins the slot for the rest of the pass. Returns whether a page
 // was produced.
 bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page) {
+	const uint64_t page_started = Time::get_singleton()->get_ticks_usec();
 	int slot = _vt.surface_vt->lookup_page_exact(p_page.owner, p_page.mip, p_page.x, p_page.y);
 	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
-	if (slot >= 0 && (!producer || producer->is_page_ready(slot))) { return false; }
+	const int slot_ready = (slot >= 0 && (!producer || producer->is_page_ready(slot))) ? 1 : 0;
+	if (slot_ready != 0) { return false; }
 	// A recent exact entry is production already in flight. Re-queueing it would advance the
 	// slot sequence every frame and make every async encode completion stale before arrival.
 	// Its prepared source is not going to be consumed, though - the producer is filling the
 	// slot from the GPU - so the entry is dropped here. Leaving it in the queue is what
 	// starved the pages behind it: 32 slots filled with results nobody would ever poll.
-	if (slot >= 0 && !_vt_page_production_stale(slot)) {
+	// The readiness answer above is the one the staleness check needs, so the producer's mutex
+	// is asked once per page instead of twice.
+	if (slot >= 0 && !_vt_page_production_stale(slot, slot_ready)) {
 		_vt.vt_page_pipeline->discard(_avt_page_request(p_page).key);
 		return false;
 	}
@@ -386,7 +393,27 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 		}
 	}
 	const uint64_t request_done = Time::get_singleton()->get_ticks_usec();
-	_invalidate_vt_slot(slot);
+	// A page that is about to be written needs one thing from the invalidation path and only one:
+	// the far-field job for this slot cancelled, because the pool is shared and a slot can pass
+	// between the views. The two other things `_invalidate_vt_slot()` does are re-established by
+	// the queue call below - `queue_page()` resets the producer's readiness, bumps the slot
+	// sequence so an in-flight completion for the old content is discarded, and
+	// `_queue_vt_material_page()` replaces the page record and records the arrival - so asking the
+	// producer's mutex and destroying the old record here paid for the same two facts twice. On a
+	// moving view that was 10.0 us of a 15.2 us page, the largest single item of the near field's
+	// per-tick cost.
+	//
+	// The shortcut is taken only while the queue call can actually take the page: `queue_page()`
+	// refuses a null source image, and then the reset above never happens, so the slot would keep
+	// the old readiness and the page would never be retried. That case keeps the full
+	// invalidation. `_invalidate_vt_slot()` also keeps its full form for the callers that need it
+	// (a production lost after it was queued, a debug drop, a source-edit invalidation).
+	const bool queue_takes_page = producer != nullptr && prepared.ids.is_valid() && prepared.height.is_valid();
+	if (!queue_takes_page) {
+		_invalidate_vt_slot(slot);
+	} else if (_vt.svt_pending_pages.erase(slot) > 0 && _vt.svt_page_pipeline) {
+		_vt.svt_page_pipeline->cancel({slot, 0, 0, 0, 0});
+	}
 	const uint64_t payload_start = Time::get_singleton()->get_ticks_usec();
 	r_pass.allocation_us += payload_start - allocation_start;
 	r_pass.request_us += request_done - allocation_start;
@@ -402,6 +429,8 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 	r_pass.queue_us += Time::get_singleton()->get_ticks_usec() - queue_start;
 	_vt.surface_vt->protect_page(slot, true);
 	r_pass.protected_slots.push_back(slot);
+	++r_pass.pages;
+	r_pass.page_us += Time::get_singleton()->get_ticks_usec() - page_started;
 	return true;
 }
 
@@ -531,6 +560,23 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	_vt.avt_sector_stats["invalidate_ms"] = double(r_pass.invalidate_us) / 1000.;
 	_vt.avt_sector_stats["payload_ms"] = double(r_pass.payload_us) / 1000.;
 	_vt.avt_sector_stats["queue_ms"] = double(r_pass.queue_us) / 1000.;
+	// The publish's own cost per page, which is what a moving view's rate multiplies: `page_ms` is
+	// the whole `_avt_produce_page()` and `page_count` how many it published, so the mean is the
+	// number to move and `upload_ms` minus the pair is the fixed part of the stage.
+	_vt.avt_sector_stats["page_ms"] = double(r_pass.page_us) / 1000.;
+	_vt.avt_sector_stats["page_count"] = r_pass.pages;
+	_vt.avt_page_us_sum += r_pass.page_us;
+	_vt.avt_page_count_sum += r_pass.pages;
+	_vt.avt_request_sum_ms += double(r_pass.request_us) / 1000.;
+	_vt.avt_invalidate_sum_ms += double(r_pass.invalidate_us) / 1000.;
+	_vt.avt_payload_sum_ms += double(r_pass.payload_us) / 1000.;
+	_vt.avt_queue_sum_ms += double(r_pass.queue_us) / 1000.;
+	_vt.avt_sector_stats["page_sum_ms"] = double(_vt.avt_page_us_sum) / 1000.;
+	_vt.avt_sector_stats["page_sum_count"] = int64_t(_vt.avt_page_count_sum);
+	_vt.avt_sector_stats["request_sum_ms"] = _vt.avt_request_sum_ms;
+	_vt.avt_sector_stats["invalidate_sum_ms"] = _vt.avt_invalidate_sum_ms;
+	_vt.avt_sector_stats["payload_sum_ms"] = _vt.avt_payload_sum_ms;
+	_vt.avt_sector_stats["queue_sum_ms"] = _vt.avt_queue_sum_ms;
 	_vt.surface_vt->set_allocation_budget(-1);
 	_vt.avt_sector_stats["produced"] = r_pass.produced;
 	if (r_pass.missing.empty() && r_pass.produced == 0) { _vt.avt_settled.verified(pool->residency_revision); }

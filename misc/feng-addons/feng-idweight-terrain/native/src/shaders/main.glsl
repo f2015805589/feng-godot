@@ -554,7 +554,7 @@ bool surface_decode_page(vec4 albedo, vec4 normal_rough, vec4 params,
 
 bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
-	if (slot < 0 || slot == 65535) { return false; }
+	if (slot < 0 || slot == 65535 || slot == 65534) { return false; }
 	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
 	vec4 params = textureLod(_surface_material_params, coord, 0.0);
 	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
@@ -568,7 +568,10 @@ bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 // the hardware anisotropic footprint. Padding is budgeted by avt_pixel_footprint.
 bool avt_material_slot(int slot, vec2 offset, float texel_world, vec2 world_dx, vec2 world_dy,
 		out material r_mat, out vec3 r_normal) {
-	if (slot < 0 || slot == 65535) { return false; }
+	// 65534 is the plan marker (`PLANNED_PHYSICAL_PAGE_SLOT` in terrain_vt.h): a level the demand
+	// plan names whose page has no content yet. It is not a slot - the pool is capped at 2047 - so
+	// it must never be sampled, and rejecting it here keeps the fallback loop honest too.
+	if (slot < 0 || slot == 65535 || slot == 65534) { return false; }
 	float stored = float(_surface_vt_page_size + 2 * _surface_vt_page_border);
 	vec3 coord = vec3((offset * float(_surface_vt_page_size) + float(_surface_vt_page_border)) / stored, float(slot));
 	vec2 dx = world_dx / (texel_world * stored);
@@ -750,19 +753,34 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 				int slot = int(texelFetch(_surface_vt_indirection, page, mip).r + 0.5);
 				texel_world = local_texel * float(1 << mip);
 				if (texel_world >= coarse_texel) { break; }
-				if (!avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) {
-					// Strict mode asks for the one page the footprint requests and reports the
-					// miss instead of recovering at a coarser level of the same sector's chain.
-					// That is what `surface_vt_feedback` off means (`vt_sampling_review.md`:
-					// "the feedback property controls coarse recovery in the shader"), it is the
-					// contract `vt_transition_parent` and `vt_filtering` pin, and it is why this
-					// function takes the flag at all - it was declared and passed but never read,
-					// so a missing fine page still resolved through a resident ancestor.
+				// 65534 is the demand plan's marker: this level is one the plan names and its page
+				// simply has not arrived. Strict mode reports that as the miss it is; coarse recovery
+				// continues to the next level, exactly as it does for any page still in production.
+				if (slot == 65534) {
 					if (!allow_coarse) { return false; }
 					continue;
 				}
-				fade = surface_vt_page_fade(slot);
-				return true;
+				if (slot != 65535) {
+					if (avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) {
+						fade = surface_vt_page_fade(slot);
+						return true;
+					}
+					// A page the plan names whose content is not readable yet (still encoding, or
+					// its parameters not compiled). Strict mode asks for that one page and reports
+					// the miss instead of recovering at a coarser level of the same sector's chain:
+					// that is what `surface_vt_feedback` off means (`vt_sampling_review.md`: "the
+					// feedback property controls coarse recovery in the shader"), and it is the
+					// contract `vt_transition_parent` and `vt_filtering` pin.
+					if (!allow_coarse) { return false; }
+					continue;
+				}
+				// 65535 here is not a late page: the plan does not name this level for this ground
+				// at all. The plan is budget-limited, so the level a footprint asks for is a level
+				// the near field will never hold unless the residency coarsens - and coarsening the
+				// requested level is what keeps a strict view from drawing the missing-page
+				// diagnostic forever. Walk on to the level the plan does hold; the marker above is
+				// what distinguishes "late" from "never".
+				continue;
 			}
 		}
 	}

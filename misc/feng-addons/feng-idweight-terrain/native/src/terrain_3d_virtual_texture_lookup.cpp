@@ -41,8 +41,10 @@ int Terrain3DVirtualTexture::_request_virtual(const int p_virtual_x, const int p
 	}
 	// A coarse fallback is usable for sampling, but is not a hit for production:
 	// otherwise a previously cached root prevents finer pages from ever arriving.
+	// The plan marker is not a slot either: the level is wanted and still has no content, so this
+	// is a miss that allocates it.
 	const uint32_t existing = _read_level(p_virtual_x, p_virtual_y, p_local_mip);
-	if (existing != INVALID_SLOT) {
+	if (existing != INVALID_SLOT && existing != TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT) {
 		_hit_count++;
 		_touch_slot(uint32_t(existing));
 		return existing;
@@ -227,7 +229,7 @@ bool Terrain3DVirtualTexture::release_page(const Vector2i &p_sector, const int p
 		return false;
 	}
 	const uint32_t slot = _read_level(virtual_x, virtual_y, p_local_mip);
-	if (slot == INVALID_SLOT) {
+	if (slot == INVALID_SLOT || slot == TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT) {
 		return false;
 	}
 	_write_level(virtual_x, virtual_y, p_local_mip, INVALID_SLOT);
@@ -243,7 +245,7 @@ bool Terrain3DVirtualTexture::release_world_page(const int p_page_x, const int p
 	int virtual_y = 0;
 	world_page_to_virtual(p_page_x, p_page_y, p_local_mip, virtual_x, virtual_y);
 	const uint32_t slot = _read_level(virtual_x, virtual_y, p_local_mip);
-	if (slot == INVALID_SLOT) {
+	if (slot == INVALID_SLOT || slot == TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT) {
 		return false;
 	}
 	_write_level(virtual_x, virtual_y, p_local_mip, INVALID_SLOT);

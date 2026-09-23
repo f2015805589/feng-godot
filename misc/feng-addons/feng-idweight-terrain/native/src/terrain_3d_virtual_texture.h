@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 #include <godot_cpp/core/object.hpp>
@@ -62,6 +63,11 @@ public:
 	static inline const int DEFAULT_INDIRECTION_SIZE = 512;
 	static inline const int DEFAULT_MINIMAL_BLOCK = 4;
 	static inline const uint32_t INVALID_SLOT = TerrainVT::INVALID_PHYSICAL_PAGE_SLOT;
+	// The key form of one virtual level in the plan-coverage set: `(mip << 32) | (x << 16) | y`.
+	// Public because the near field builds the set from its plan and has to agree on the encoding.
+	static uint64_t planned_level_key(int p_x, int p_y, int p_mip) {
+		return (uint64_t(uint32_t(p_mip)) << 32) | (uint64_t(uint32_t(p_x)) << 16) | uint64_t(uint32_t(p_y));
+	}
 
 private:
 	// Configuration
@@ -96,6 +102,13 @@ private:
 	GeneratedTexture _indirection; // Compatibility renderer fallback.
 	Ref<Terrain3DVTIndirection> _indirection_gpu;
 	std::set<uint64_t> _dirty_tiles;
+	// The near field's demand plan as the set of virtual levels it names, in the indirection's own
+	// coordinates: `(mip << 32) | (x << 16) | y`. A level in this set that has no physical slot is
+	// published as `PLANNED_PHYSICAL_PAGE_SLOT` instead of `INVALID`, which is what lets the strict
+	// resolve (feedback off) tell "the plan does not ask for this level" from "the plan asks for it
+	// and it is late". Empty for the far field and for any view with no plan, so nothing changes
+	// where no plan exists.
+	std::unordered_set<uint64_t> _planned_levels;
 	uint64_t _indirection_uploaded_bytes = 0;
 	Ref<Image> _indirection_image;
 	PackedByteArray _bytes;
@@ -108,8 +121,11 @@ private:
 	std::unique_ptr<TerrainVT::VirtualImageAtlas> _virtual_atlas;
 	// The exact owner the atlas handed out per sector. VirtualImageOwner carries a
 	// generation counter, so removal has to present the original owner, not a
-	// reconstructed one.
-	std::map<uint64_t, TerrainVT::VirtualImageOwner> _sector_owners;
+	// reconstructed one. A flat hash, not an ordered map: the three readers
+	// (`register`/`resize`/`unregister`) only look one key up, while the per-page path reads the
+	// atlas and the plan paths read this one, so the ordered container's log n and node
+	// allocations are paid on every page of every moving tick and buy nothing.
+	std::unordered_map<uint64_t, TerrainVT::VirtualImageOwner> _sector_owners;
 	static uint64_t _sector_key(const Vector2i &p_sector) {
 		return (uint64_t(uint32_t(p_sector.x)) << 32) | uint64_t(uint32_t(p_sector.y));
 	}
@@ -122,7 +138,13 @@ private:
 	bool _material_cache_mode = false;
 
 	uint32_t _read_level(int p_x, int p_y, int p_mip) const;
+	// Writes the exact value, with no plan composition. Only the plan-marker path uses it.
+	void _write_level_raw(int p_x, int p_y, int p_mip, uint32_t p_value);
 	void _write_level(int p_x, int p_y, int p_mip, uint32_t p_slot);
+	// Publishes or withdraws the plan marker on one level without touching a real slot: a level
+	// that leaves the plan keeps whatever content it holds (the retention window and the pool
+	// own that decision), and a level that enters it is marked only while it has no slot.
+	void _refresh_planned_level(int p_x, int p_y, int p_mip);
 	void _touch_slot(uint32_t p_slot);
 	int _acquire_slot();
 	void _invalidate_pool_owner(uint32_t p_slot, const Terrain3DVTPageOwner &p_owner);
@@ -173,6 +195,14 @@ public:
 	void set_page_pool(const std::shared_ptr<Terrain3DVTPagePool> &p_pool);
 	void share_physical_pool(Terrain3DVirtualTexture *p_source);
 	std::shared_ptr<Terrain3DVTPagePool> get_page_pool() const { return _page_pool; }
+
+	// The demand plan this view's strict resolve is contracted against, as virtual level
+	// coordinates (see `_planned_levels`). Replacing it re-publishes the marker on every level
+	// that entered or left, so a plan change is one pass over two page sets and no page content
+	// is touched. An empty vector withdraws the plan (the far field's case).
+	void set_planned_levels(const std::vector<uint64_t> &p_levels);
+	void clear_planned_levels();
+	int get_planned_level_count() const { return int(_planned_levels.size()); }
 
 	// Sectors
 	bool register_sector(const Vector2i &p_sector, const int p_virtual_image_size);

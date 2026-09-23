@@ -21,6 +21,18 @@ constexpr int SLOT_BIT_COUNT = 11;
 constexpr uint32_t SLOT_MASK = (1u << SLOT_BIT_COUNT) - 1u;
 // An indirection texel that names no page.
 constexpr uint32_t INVALID_PHYSICAL_PAGE_SLOT = 65535u;
+// An indirection texel whose page the standing demand plan names but which has no physical
+// content yet. It is not a slot: no allocator can hand out 65534 (the pool is capped at
+// `SLOT_MASK` = 2047), so the value is free to mean "planned, still in production".
+//
+// It exists so the shader's strict resolve (feedback off) can tell the two reasons a level has
+// no content apart. `INVALID` means the plan does not name that page at all, so the ground is
+// asking for a level it will never hold and the walk must continue to the level the plan does
+// hold. `PLANNED` means the plan names it and it is simply late, which strict mode must render
+// as the missing-page diagnostic rather than resolving through a coarser ancestor. A plan that
+// names a page is the *only* thing that can turn a level into `PLANNED`, which is what makes
+// the demand plan the strict path's LOD contract instead of an invisible budget cut.
+constexpr uint32_t PLANNED_PHYSICAL_PAGE_SLOT = 65534u;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Address profile
@@ -71,7 +83,7 @@ bool try_match_indirection_slot(const PageId &page_id, uint32_t max_local_mip, L
 	uint32_t virtual_page_y = page_id.y;
 	for (uint32_t mip = page_id.z; mip <= max_local_mip; mip++) {
 		const uint32_t candidate = lookup(virtual_page_x, virtual_page_y, mip);
-		if (candidate != INVALID_PHYSICAL_PAGE_SLOT) {
+		if (candidate != INVALID_PHYSICAL_PAGE_SLOT && candidate != PLANNED_PHYSICAL_PAGE_SLOT) {
 			slot = candidate & SLOT_MASK;
 			matched_page_x = virtual_page_x;
 			matched_page_y = virtual_page_y;

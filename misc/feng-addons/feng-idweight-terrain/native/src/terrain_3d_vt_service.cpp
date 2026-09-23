@@ -291,6 +291,12 @@ void Terrain3D::_reset_vt_configuration() {
 void Terrain3D::set_avt_feedback(bool p_enabled) {
 	if (_vt.avt_feedback == p_enabled) { return; }
 	_vt.avt_feedback = p_enabled;
+	// The strict resolve's contract is the standing plan's page set. Turning the switch off is a
+	// request to start reading it, so it is published now rather than at the next plan install -
+	// otherwise the view the user is looking at would keep its pre-switch diagnostics for up to a
+	// whole refresh interval. Turning it on withdraws the markers, so the shipped path's
+	// indirection carries exactly what it always did.
+	_avt_publish_plan_coverage();
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
@@ -411,6 +417,7 @@ void Terrain3D::_configure_vt_service() {
 	_vt.avt_coarse = Terrain3DAVTCoarseImage();
 	// The addresses every page of the standing plan resolved to no longer exist.
 	_vt.avt_plan.forget();
+	if (_vt.surface_vt) { _vt.surface_vt->clear_planned_levels(); }
 	_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);
 	_vt.avt_registered_owners.clear();
 	_vt.avt_allocated_sizes.clear();

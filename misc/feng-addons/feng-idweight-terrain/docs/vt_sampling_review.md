@@ -382,3 +382,62 @@ feedback-off static plus two-turn coverage test, with final missing/pending
 and diagnostic sample counts zero (`near_strict.log` / `near_strict_output`).
 The actual test-1 addon is a junction to the rebuilt source addon; restarting
 a running scene/editor is necessary to load its new native DLL.
+
+## Strict coverage against the sector plan (2026-09-24)
+
+The sector AVT that replaced the region addressing kept the feedback switch's
+meaning - `surface_vt_feedback` off selects one level and diagnoses a miss
+instead of recovering at a coarser one - but the *demand* it resolves against
+is now the sparse, budget-limited refinement walk
+(`terrain_3d_avt_plan.cpp`). That walk stops at `plan_budget`
+(`pool - max(4, pool/4)` in `terrain_3d_sector_avt_hierarchy.cpp`) and reports
+the pages it could not afford as `refinement_requests_denied`. Coarse recovery
+hid the difference: the shader walked from the level its footprint asked for to
+the first *resident* page, which is always a page the plan holds. With the
+switch off, the walk reported the first miss instead, and a level the budgeted
+plan will never hold was a permanent missing-page diagnostic - the CPU could
+report `visible_missing_pages = 0` while the image carried 2.19% diagnostic
+samples, because a page the plan never named is not in the plan prefix the
+counter walks.
+
+The repair is the plan's page set as the strict resolve's LOD contract, per
+level and per page. `Terrain3DVirtualTexture` publishes the indirection entry of
+a level the plan names but which has no slot as
+`PLANNED_PHYSICAL_PAGE_SLOT` (65534, `terrain_vt.h`) instead of empty, from
+`Terrain3D::_avt_publish_plan_coverage()` - a diff over two page sets, called
+wherever `_vt.avt_plan.pages` changes shape and when the switch is turned off,
+and published only while the switch is off so the shipped path's table is
+unchanged. The shader's upgrade walk then reads three states instead of two:
+
+* a real slot that is not samplable yet, and the plan marker, are what strict
+  mode diagnoses (the page is late, and the contract is that the level it asked
+  for is the level it draws or the fragment is a miss);
+* an empty level is a level the plan does not name at all, so the walk
+  continues to the level the plan does hold - which is the same page coarse
+  recovery draws, so a settled strict view and a settled recovering view resolve
+  at the same level.
+
+Measured at 1920x1080 on the copied `test-1` scene (`vt_strict_coverage_runner.py
+--project F:/godot/project/test-1`, 240 static ticks, a 180-degree turn and 180
+settle frames): static diagnostic samples 2.19% -> 0, first settled frame 21 of
+240 with missing and pending both zero, the turn's final 0.0%. The plan still
+denies 282 of 1050 demanded refinements - the residency budget is unchanged - so
+the LOD is what coarsens, not the budget.
+
+The motion cost was investigated in the same round and is unchanged. On the same
+scene (`probe_batch.py --motion orbit`, 4x240 ticks, max tier 128) the moving
+windows read `vt_avt` 0.93/0.83 ms before and 0.86-0.95 ms after across three
+runs - run-to-run spread of the same order - at `vt_cpu` 1.50 ms and viewport
+GPU 18.8 ms. The per-tick total is 0.61-0.65 ms, of which 0.32-0.42 is the page
+publish (21-26 pages/tick at 15-16 us each), 0.07 classify, 0.05 retain, 0.04
+finish, and 0.06 the plan key, install and chain overhead. Splitting the publish
+shows the cost is not in its own steps: moving `_invalidate_vt_slot()`'s two
+redundant operations (the producer's readiness record and the page record, both
+re-established by the `queue_page()` that follows) out of the produce path
+moved 10.0 us of `invalidate` into `queue` (2.97 -> 13.9 us) and left the total
+unchanged, which identifies the producer's mutex held by the render thread as
+the cost. The near field's mean is therefore page-production-bound, not
+bookkeeping-bound; a mean near 0.2 ms needs fewer main-thread mutex crossings
+per page or a shorter render-thread critical section, neither of which is a
+demand or budget change.
+

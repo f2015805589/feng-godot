@@ -196,8 +196,14 @@ void Terrain3D::_invalidate_vt_slot(int p_slot) {
 	// invalidated through this function, and so is the slot a page is about to be written into,
 	// which is what makes every produced page an arrival the fade can see.
 	_vt_mark_page_waiting(p_slot);
-	_vt.svt_pending_pages.erase(p_slot);
-	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0}); }
+	// The far-field queue only holds far-field work: an entry is admitted to `svt_pending_pages`
+	// when it is queued (see `_queue_vt_material_page()`), so a slot that is not in that map has no
+	// far-field job to cancel. Asking the queue anyway takes its mutex and scans up to the whole
+	// 256 entry window, and this runs once per produced page - the measured cost was the largest
+	// single item of the near field's per-page publish on a moving view.
+	if (_vt.svt_pending_pages.erase(p_slot) > 0 && _vt.svt_page_pipeline) {
+		_vt.svt_page_pipeline->cancel({p_slot, 0, 0, 0, 0});
+	}
 	if (_vt.vt_baker.is_valid() && p_slot >= 0) {
 		baker(_vt.vt_baker)->invalidate_slot(p_slot);
 	}

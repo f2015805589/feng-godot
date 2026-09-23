@@ -339,6 +339,47 @@ void Terrain3D::_publish_avt_page_budget() {
 	}
 }
 
+// The standing plan as the shader's strict LOD contract, published to the near field's
+// indirection. The strict resolve (feedback off) has to know which levels the plan names so it can
+// tell a page that is merely late (a diagnostic, the contract `vt_transition_parent` pins) from a
+// level the budgeted plan will never hold (the level the ground should actually be asking for).
+// Only the plan's own pages can make that distinction; residency cannot, because a released page
+// and a never-planned page are both empty in the table.
+//
+// The pages are converted to the indirection's own coordinates with the same expression the
+// shader uses for its lookup (`(block origin >> mip) + local page`), so a page the shader cannot
+// address is a page the plan cannot mark - the two cannot drift apart. The publish is a diff over
+// last plan's set and this one, and it writes only the levels that entered or left.
+void Terrain3D::_avt_publish_plan_coverage() {
+	if (!_vt.surface_vt || _vt.vt_debug_direct_material) {
+		return;
+	}
+	std::vector<uint64_t> levels;
+	// Only the strict resolve reads the markers, and coarse recovery treats a marked level exactly
+	// as it treats an empty one. Publishing them while the switch is on would rewrite and re-upload
+	// part of the indirection on every plan install for a distinction nothing reads, so the shipped
+	// (feedback on) path keeps the table exactly as it was and the markers exist only while the
+	// switch is off. `set_avt_feedback()` calls this so turning the switch publishes the standing
+	// plan's coverage in the same tick.
+	if (!_vt.avt_feedback) {
+		levels.reserve(_vt.avt_plan.pages.size());
+		for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
+			if (page.mip < 0 || page.x < 0 || page.y < 0) {
+				continue;
+			}
+			const int origin_x = _vt.surface_vt->get_sector_block_origin_x(page.owner);
+			const int origin_y = _vt.surface_vt->get_sector_block_origin_y(page.owner);
+			if (origin_x < 0 || origin_y < 0) {
+				continue;
+			}
+			levels.push_back(Terrain3DVirtualTexture::planned_level_key((origin_x >> page.mip) + page.x,
+					(origin_y >> page.mip) + page.y, page.mip));
+		}
+	}
+	_vt.surface_vt->set_planned_levels(levels);
+	_vt.avt_sector_stats["plan_coverage_pages"] = int(levels.size());
+}
+
 // One tick of the budget governor, immediately after the motion sampler that feeds it. Nothing else
 // in the tick decides the tier, so the rate a pass runs at and the motion it was aimed with cannot
 // disagree.
@@ -907,6 +948,8 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// The selection and the retention flags are one operation: a new plan is a new wanted
 			// set, so the source queue has to be retained again.
 			_vt.avt_plan.install(std::move(_vt.avt_refinement->pages), _vt.avt_refinement->sampled);
+			// The plan is the strict resolve's LOD contract from this tick on.
+			_avt_publish_plan_coverage();
 			_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);
 			if (_material.is_valid()) {
 				RS->material_set_param(_material->get_material_rid(), "_avt_density_scale", _vt.avt_density_scale);
@@ -983,6 +1026,7 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 					return !_vt.surface_vt->has_sector(page.owner);
 				}), _vt.avt_plan.pages.end());
 		_vt.avt_plan.forget_retention();
+		_avt_publish_plan_coverage();
 	}
 	// The set the shortcut verified is about to be replaced by this plan's own selection.
 	_vt.avt_settled.unverify();

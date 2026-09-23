@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+﻿// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 // Terrain3DVirtualTexture, part 1 of 3: the view object, its indirection table and its settings.
 
@@ -42,7 +42,7 @@ uint32_t Terrain3DVirtualTexture::_read_level(const int p_x, const int p_y, cons
 	return uint32_t(value);
 }
 
-void Terrain3DVirtualTexture::_write_level(const int p_x, const int p_y, const int p_mip, const uint32_t p_slot) {
+void Terrain3DVirtualTexture::_write_level_raw(const int p_x, const int p_y, const int p_mip, const uint32_t p_value) {
 	if (p_mip < 0 || p_mip >= _level_count) {
 		return;
 	}
@@ -53,11 +53,65 @@ void Terrain3DVirtualTexture::_write_level(const int p_x, const int p_y, const i
 	const int64_t offset = int64_t(_level_offsets[p_mip]) + (int64_t(p_y) * size + p_x) * 4;
 	float old_value;
 	std::memcpy(&old_value, _bytes.ptr() + offset, sizeof(old_value));
-	if (uint32_t(old_value) == p_slot) { return; }
-	const float value = float(p_slot);
+	if (uint32_t(old_value) == p_value) { return; }
+	const float value = float(p_value);
 	std::memcpy(_bytes.ptrw() + offset, &value, sizeof(value));
 	_dirty_tiles.insert((uint64_t(p_mip) << 32) | (uint64_t(p_y >> 4) << 16) | uint64_t(p_x >> 4));
 	_indirection_dirty = true;
+}
+
+void Terrain3DVirtualTexture::_write_level(const int p_x, const int p_y, const int p_mip, const uint32_t p_slot) {
+	// A level the plan names but that holds no slot is published as the plan marker rather than
+	// as empty. The composition lives in the one write path so no caller has to know about it:
+	// a released or evicted page whose level is still planned keeps its marker, and writing a
+	// real slot over a marker is just the slot. See `PLANNED_PHYSICAL_PAGE_SLOT`.
+	uint32_t desired = p_slot;
+	if (p_slot == INVALID_SLOT && _planned_levels.count(planned_level_key(p_x, p_y, p_mip)) != 0) {
+		desired = TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT;
+	}
+	_write_level_raw(p_x, p_y, p_mip, desired);
+}
+
+// Re-applies the plan marker alone to one level, for the levels a plan change added or removed.
+// The two directions are deliberately asymmetric, and both are decided against the set as it
+// stands *after* the change: entering the plan marks an empty level, and leaving it unmarks only
+// a marker - a level that leaves the plan keeps its content, because the retention window and the
+// pool own residence, not the plan. A real slot is never touched either way.
+void Terrain3DVirtualTexture::_refresh_planned_level(const int p_x, const int p_y, const int p_mip) {
+	const bool planned = _planned_levels.count(planned_level_key(p_x, p_y, p_mip)) != 0;
+	const uint32_t current = _read_level(p_x, p_y, p_mip);
+	if (current == TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT) {
+		if (!planned) { _write_level_raw(p_x, p_y, p_mip, INVALID_SLOT); }
+	} else if (current == INVALID_SLOT) {
+		if (planned) { _write_level_raw(p_x, p_y, p_mip, TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT); }
+	}
+}
+
+void Terrain3DVirtualTexture::set_planned_levels(const std::vector<uint64_t> &p_levels) {
+	if (_level_count <= 0 || _bytes.is_empty()) {
+		_planned_levels.clear();
+		return;
+	}
+	std::unordered_set<uint64_t> next(p_levels.begin(), p_levels.end());
+	// The old set is kept for the union walk, then replaced: every changed level is decided
+	// against the new plan, which is what makes a level in both sets a no-op.
+	std::unordered_set<uint64_t> previous = std::move(_planned_levels);
+	_planned_levels = std::move(next);
+	for (const uint64_t key : previous) {
+		if (_planned_levels.count(key) == 0) { _refresh_planned_level(int((key >> 16) & 0xffff), int(key & 0xffff), int(key >> 32)); }
+	}
+	for (const uint64_t key : _planned_levels) {
+		if (previous.count(key) == 0) { _refresh_planned_level(int((key >> 16) & 0xffff), int(key & 0xffff), int(key >> 32)); }
+	}
+}
+
+void Terrain3DVirtualTexture::clear_planned_levels() {
+	if (_planned_levels.empty()) { return; }
+	const std::unordered_set<uint64_t> previous = std::move(_planned_levels);
+	_planned_levels.clear();
+	for (const uint64_t key : previous) {
+		_refresh_planned_level(int((key >> 16) & 0xffff), int(key & 0xffff), int(key >> 32));
+	}
 }
 
 void Terrain3DVirtualTexture::_touch_slot(const uint32_t p_slot) {
@@ -223,6 +277,9 @@ Error Terrain3DVirtualTexture::initialize() {
 	}
 	_level_count = int(_level_sizes.size());
 	_bytes.resize(total_texels * 4);
+	// The plan markers name levels of the address space that is being rebuilt, so they cannot
+	// survive it: every entry starts empty and the plan is re-published against the new table.
+	_planned_levels.clear();
 	_bytes.encode_float(0, real_t(INVALID_SLOT));
 	uint8_t *indirection_bytes = _bytes.ptrw();
 	for (int64_t i = 1; i < total_texels; i++) {
@@ -258,6 +315,7 @@ void Terrain3DVirtualTexture::clear() {
 	_indirection.clear();
 	_indirection_gpu.unref();
 	_dirty_tiles.clear();
+	_planned_levels.clear();
 	_indirection_uploaded_bytes = 0;
 	_indirection_image.unref();
 	_bytes.clear();
@@ -271,7 +329,11 @@ void Terrain3DVirtualTexture::clear() {
 
 int Terrain3DVirtualTexture::get_indirection_slot(const int p_virtual_x, const int p_virtual_y,
 		const int p_mip) const {
-	return int(_read_level(p_virtual_x, p_virtual_y, p_mip));
+	const uint32_t value = _read_level(p_virtual_x, p_virtual_y, p_mip);
+	// A plan marker is not a slot, and every caller of this accessor asks whether a page is
+	// resident. Reporting the marker's own number would make an unproduced page look addressable
+	// to a GDScript probe, so it reads as empty here and only the shader sees the distinction.
+	return value == TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT ? int(INVALID_SLOT) : int(value);
 }
 
 bool Terrain3DVirtualTexture::write_page(const int p_slot, const Ref<Image> &p_page) {

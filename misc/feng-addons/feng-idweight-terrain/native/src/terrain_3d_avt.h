@@ -389,6 +389,12 @@ struct Terrain3DAVTProducePass {
 	// content before the new page is written (the producer's).
 	uint64_t request_us = 0, invalidate_us = 0;
 	int produced = 0;
+	// Wall time inside `_avt_produce_page()` and how many pages it published. `upload_us` covers
+	// the whole stage - the readiness snapshot and the walk included - so the pair is what says
+	// whether a moving view's publish cost is per page or per pass. It is a sum over the pass and
+	// never reset, and `_produce_sector_avt_pages()` differences two readings into a mean.
+	uint64_t page_us = 0;
+	int pages = 0;
 	// Diagnostics over the sampled prefix of the plan: pages the current image
 	// samples, how many of them have no content yet, and how many are already being
 	// produced. A visible miss is what the shader draws as the missing-page material.
