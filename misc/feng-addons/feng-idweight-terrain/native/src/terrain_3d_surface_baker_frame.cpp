@@ -17,6 +17,7 @@
 #include "terrain_3d_surface_baker_internal.h"
 
 #include "logger.h"
+#include "terrain_3d_material_clipmap_detail.h"
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -701,6 +702,316 @@ int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
 	return int(landed.size());
 }
 
+///////////////////////////
+// The detail layer's bake
+///////////////////////////
+
+// One detail layer's descriptor set: the layer's own source arrays as the bake's two inputs, the
+// bundle's material arrays, and the layer's three arrays as the outputs. Built here rather than
+// through the bundle path because nothing about it is a page - its size is the tile's stored size,
+// its layers are the layer's slots, and its inputs are the very texels the manager uploaded a
+// pipeline result into rather than a page's staging copy. The job format, the material list and the
+// job buffer are the page producer's, which is what makes one shader serve a page, a ring rect and a
+// detail tile.
+bool Terrain3DSurfaceBaker::_ensure_detail_bake(Terrain3DMaterialClipmapDetail *p_detail) {
+	if (p_detail == nullptr || !p_detail->is_enabled()) {
+		return false;
+	}
+	if (!_rd || !_resources.shader.is_valid() || !_resources.pipeline.is_valid() ||
+			!_resources.job_buffer.is_valid() || !_resources.material_buffer.is_valid() ||
+			!_resources.sampler_nearest.is_valid() || !_resources.sampler_linear.is_valid()) {
+		// No producer, no bake: the layer keeps its source and serves nothing, which is the state of
+		// a build whose material group never took a page - and therefore has no bake pipeline - or a
+		// configuration Stage 1 has not finished unlocking. The layer reports the tiles as pending
+		// and the shader falls back to the coarse ring.
+		return false;
+	}
+	const int stored_size = p_detail->get_stored_size();
+	const int slots = p_detail->get_slot_count();
+	const RID payload_rd = resolve_main_texture(p_detail->get_payload_texture_rid());
+	const RID height_rd = resolve_main_texture(p_detail->get_height_texture_rid());
+	const RID outputs[3] = { p_detail->get_baked_device_rid(0), p_detail->get_baked_device_rid(1),
+		p_detail->get_baked_device_rid(2) };
+	if (!payload_rd.is_valid() || !height_rd.is_valid() || stored_size <= 0 || slots <= 0 ||
+			!outputs[0].is_valid() || !outputs[1].is_valid() || !outputs[2].is_valid()) {
+		return false;
+	}
+	// The set survives a tick: it is rebuilt when the bundle it takes its buffers, samplers and
+	// shader from was replaced, and rebuilt *and* the jobs dropped when the layer's own shape or
+	// arrays changed. The two are different because a bundle rebuild does not invalidate the work the
+	// layer already produced: `_free_detail_set()` keeps the queues, so a dispatch collected before
+	// the rebuild still lands, and a landing that still owes an acknowledgment is not thrown away
+	// before it is reported.
+	const bool same_shape = _detail_bake.detail == p_detail && _detail_bake.stored_size == stored_size &&
+			_detail_bake.slots == slots && _detail_bake.payload_rd == payload_rd &&
+			_detail_bake.height_rd == height_rd;
+	if (same_shape && _detail_bake.uniform_set.is_valid() &&
+			_detail_bake.job_buffer == _resources.job_buffer) {
+		return true;
+	}
+	if (!same_shape) {
+		// The old shape's landings still describe the old layer's slots, so they are reported before
+		// the jobs go: dropping them would leave the layer's `bake_in_flight` flag set with no
+		// acknowledgment until its own timeout.
+		if (_detail_bake.detail != nullptr) {
+			std::lock_guard<std::mutex> lock(_mutex);
+			for (const DetailJob &landed : _detail_bake.landed) {
+				_detail_bake.detail->acknowledge_bake(landed.slot, landed.generation);
+			}
+		}
+		_free_detail_bake();
+	} else {
+		_free_detail_set();
+	}
+	RID albedo_rd;
+	RID normal_rd;
+	_resolve_material_rd(_resources, albedo_rd, normal_rd, _material_albedo_rs, _material_normal_rs);
+	TypedArray<Ref<RDUniform>> uniforms;
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
+			_resources.sampler_nearest, payload_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1,
+			_resources.sampler_nearest, height_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2,
+			_resources.sampler_linear, albedo_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3,
+			_resources.sampler_linear, normal_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 4, _resources.material_buffer);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 5, _resources.job_buffer);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 6, outputs[0]);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 7, outputs[1]);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 8, outputs[2]);
+	const RID set = _rd->uniform_set_create(uniforms, _resources.shader, 0);
+	if (!set.is_valid()) {
+		LOG(WARN, "Could not create the detail material bake uniform set");
+		return false;
+	}
+	_detail_bake.detail = p_detail;
+	_detail_bake.payload_rd = payload_rd;
+	_detail_bake.height_rd = height_rd;
+	_detail_bake.job_buffer = _resources.job_buffer;
+	_detail_bake.stored_size = stored_size;
+	_detail_bake.slots = slots;
+	_detail_bake.uniform_set = set;
+	return true;
+}
+
+void Terrain3DSurfaceBaker::_free_detail_set() {
+	if (_detail_bake.uniform_set.is_valid() && _rd && _rd->uniform_set_is_valid(_detail_bake.uniform_set)) {
+		_rd->free_rid(_detail_bake.uniform_set);
+	}
+	_detail_bake.uniform_set = RID();
+	_detail_bake.payload_rd = RID();
+	_detail_bake.height_rd = RID();
+	_detail_bake.job_buffer = RID();
+	_detail_bake.detail = nullptr;
+	_detail_bake.stored_size = 0;
+	_detail_bake.slots = 0;
+}
+
+void Terrain3DSurfaceBaker::_free_detail_bake() {
+	_free_detail_set();
+	std::lock_guard<std::mutex> lock(_mutex);
+	_detail_bake.collected.clear();
+	_detail_bake.queued.clear();
+	_detail_bake.landed.clear();
+}
+
+int Terrain3DSurfaceBaker::queue_detail_tiles(Terrain3DMaterialClipmapDetail *p_detail, const int p_budget_texels) {
+	if (p_detail == nullptr || !p_detail->is_enabled()) {
+		return 0;
+	}
+	if (!_ensure_detail_bake(p_detail)) {
+		// The offers stay with the layer: it re-offers them after its own timeout, so a producer
+		// that is not ready yet delays the bake instead of losing it.
+		return 0;
+	}
+	std::vector<DetailJob> fresh;
+	std::vector<DetailJob> previous;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &landed : _detail_bake.landed) {
+			// The layer is what decides, not this thread: a slot that was reused, or a tile whose
+			// content an edit invalidated while the dispatch was in flight, carries a different
+			// generation - and serving those texels to a fragment is exactly what the generation
+			// exists to prevent.
+			if (_detail_bake.detail == p_detail) {
+				p_detail->acknowledge_bake(landed.slot, landed.generation);
+			}
+		}
+		_detail_bake.landed.clear();
+		previous = std::move(_detail_bake.collected);
+		// The tiles the layer has produced a source for and no bake has covered, in the order it
+		// produced them. A tile already on its way to a dispatch is not collected twice: the second
+		// bake would read the same source and land the same layers.
+		int budget = MAX(0, p_budget_texels);
+		// A copy of the layer's offers, because taking one mutates the layer's queue: iterating the
+		// live queue while erasing from it would skip entries and read past its end.
+		std::vector<Terrain3DMaterialClipmapDetail::BakeOffer> offers;
+		const int offer_count = p_detail->get_pending_bake_count();
+		offers.reserve(size_t(offer_count));
+		for (int index = 0; index < offer_count; index++) {
+			offers.push_back(p_detail->get_pending_bake(index));
+		}
+		for (const Terrain3DMaterialClipmapDetail::BakeOffer &offer : offers) {
+			bool already = false;
+			for (const DetailJob &job : previous) {
+				already = already || (job.slot == offer.slot && job.generation == offer.generation);
+			}
+			for (const DetailJob &job : fresh) {
+				already = already || (job.slot == offer.slot && job.generation == offer.generation);
+			}
+			if (already) {
+				continue;
+			}
+			const int64_t texels = int64_t(offer.stored_size) * int64_t(offer.stored_size);
+			// The budget is the ring's own unit - channel texels - and it is a *soft* one: at least
+			// one tile is collected per offer, because a single 1024-density tile is larger than the
+			// default tick budget and a budget that never admitted it would leave the layer unbaked
+			// forever. After that first tile the budget is a real bound - it is clamped at zero, so a
+			// tile that overspent it is the last of this offer rather than the first of an unbounded
+			// batch. What is left stays with the layer for the next offer.
+			if (!fresh.empty() && texels > budget) {
+				break;
+			}
+			budget = int(MAX(int64_t(0), int64_t(budget) - texels));
+			DetailJob job;
+			job.slot = offer.slot;
+			job.level = offer.level;
+			job.generation = offer.generation;
+			job.world_rect = offer.world_rect;
+			job.source_grid = offer.source_grid;
+			job.texel = offer.texel_world;
+			job.border = offer.border;
+			job.stored_size = offer.stored_size;
+			fresh.push_back(job);
+			// The offer is taken here rather than cleared wholesale after the loop: the budget
+			// admits one tile at the default shape, and every offer it deferred has a tile already
+			// marked in flight - clearing the queue would lose those until their timeout.
+			p_detail->take_pending_bake(offer.slot, offer.generation);
+		}
+		_detail_bake.collected = std::move(fresh);
+		// This tick collects, the next dispatches: the source upload the layer just issued is a
+		// RenderingServer command that has not run yet, and a device dispatch issued in the same tick
+		// would race that queue and read the texels the upload is replacing.
+		_detail_bake.queued = std::move(previous);
+	}
+	return int(_detail_bake.collected.size());
+}
+
+int Terrain3DSurfaceBaker::_dispatch_detail_bake() {
+	std::vector<DetailJob> jobs;
+	RID set;
+	RID job_buffer;
+	int stored_size = 0;
+	int material_count = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_detail_bake.queued.empty()) {
+			return 0;
+		}
+		jobs = std::move(_detail_bake.queued);
+		_detail_bake.queued.clear();
+		set = _detail_bake.uniform_set;
+		job_buffer = _detail_bake.job_buffer;
+		stored_size = _detail_bake.stored_size;
+		material_count = _material_count;
+	}
+	// No material list means the shader would invalidate every output instead of baking it, and a
+	// dispatch that wrote black into a tile must not be allowed to mark it readable. Nothing is
+	// dispatched, and the jobs go back to the queue: a delay rather than a lost bake.
+	if (!_rd || !set.is_valid() || !job_buffer.is_valid() || stored_size <= 0 || material_count <= 0 ||
+			jobs.empty()) {
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &job : jobs) {
+			_detail_bake.queued.push_back(job);
+		}
+		return 0;
+	}
+	PackedByteArray job_bytes;
+	job_bytes.resize(int64_t(jobs.size()) * JOB_STRIDE);
+	for (size_t index = 0; index < jobs.size(); index++) {
+		const DetailJob &job = jobs[index];
+		const int64_t offset = int64_t(index) * JOB_STRIDE;
+		// A detail tile's job is page-shaped: an affine world rect, the output texel size, the tile's
+		// stored size and gutter, and the *source* grid the pipeline produced (`policy.yz` its origin
+		// and `policy.w` its step). That last pair is what makes a 1024 texels/m output filtered from
+		// real source corners rather than read from the same low-density texel: the shader reaches a
+		// source tap through the grid, not through the output texel.
+		const real_t texel_x = job.texel;
+		const real_t texel_z = job.texel;
+		encode_vec4(job_bytes, offset, job.world_rect.position.x, job.world_rect.position.y,
+				job.world_rect.size.x, job.world_rect.size.y);
+		encode_vec4(job_bytes, offset + 16, float(texel_x), float(texel_z), float(stored_size),
+				float(job.border));
+		// The source layer *is* the slot: one array holds the payload and one the height, so the two
+		// indices are the same number into two textures (`indices.w` names the second).
+		job_bytes.encode_u32(offset + 32, uint32_t(MAX(0, job.slot)));
+		job_bytes.encode_u32(offset + 36, uint32_t(MAX(0, job.slot)));
+		job_bytes.encode_u32(offset + 40, 1u);
+		job_bytes.encode_u32(offset + 44, uint32_t(MAX(0, job.slot)));
+		encode_vec4(job_bytes, offset + 48, 1.0f, job.source_grid.x, job.source_grid.y, job.source_grid.z);
+	}
+	if (_rd->buffer_update(job_buffer, 0, uint32_t(job_bytes.size()), job_bytes) != OK) {
+		LOG(WARN, "Could not upload the detail material bake jobs");
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &job : jobs) {
+			_detail_bake.queued.push_back(job);
+		}
+		return 0;
+	}
+	PackedByteArray push;
+	push.resize(48);
+	push.encode_u32(0, uint32_t(stored_size));
+	push.encode_u32(4, uint32_t(jobs.size()));
+	push.encode_u32(8, uint32_t(MAX(0, material_count)));
+	push.encode_u32(12, 0u);
+	// `source.x == 0`: a tile's source is a stored rect with a gutter whose taps clamp, exactly like
+	// a page's. `source.w == 0` is the normalised `R16_UNORM` payload read, which is the format the
+	// layer's source array carries.
+	push.encode_u32(16, 0u);
+	push.encode_u32(20, 0u);
+	push.encode_u32(24, 0u);
+	push.encode_u32(28, 0u);
+	// A tile's job covers the layer it fills: origin zero, the stored size either way.
+	push.encode_u32(32, 0u);
+	push.encode_u32(36, 0u);
+	push.encode_u32(40, uint32_t(stored_size));
+	push.encode_u32(44, uint32_t(stored_size));
+	SurfaceVTLabel dispatch_label(_rd, "Detail Material Bake - " + String::num_int64(jobs.size()) + " tiles");
+	const int64_t compute_list = _rd->compute_list_begin();
+	if (compute_list < 0) {
+		LOG(WARN, "Could not begin a detail material bake compute list");
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &job : jobs) {
+			_detail_bake.queued.push_back(job);
+		}
+		return 0;
+	}
+	_rd->compute_list_bind_compute_pipeline(compute_list, _resources.pipeline);
+	_rd->compute_list_bind_uniform_set(compute_list, set, 0);
+	_rd->compute_list_set_push_constant(compute_list, push, uint32_t(push.size()));
+	_rd->compute_list_dispatch(compute_list, uint32_t((stored_size + 7) / 8),
+			uint32_t((stored_size + 7) / 8), uint32_t(jobs.size()));
+	_rd->compute_list_end();
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &job : jobs) {
+			_detail_bake.landed.push_back(job);
+		}
+		_detail_bake.dispatches += uint64_t(jobs.size());
+	}
+	return int(jobs.size());
+}
+
+Dictionary Terrain3DSurfaceBaker::get_detail_bake_stats() const {
+	Dictionary stats;
+	std::lock_guard<std::mutex> lock(_mutex);
+	stats["dispatches"] = int64_t(_detail_bake.dispatches);
+	stats["pending"] = int64_t(_detail_bake.collected.size() + _detail_bake.queued.size());
+	stats["configured"] = _detail_bake.uniform_set.is_valid();
+	return stats;
+}
+
 void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) {
 	(void)p_keep_alive;
 	std::map<int, PendingJob> pending;
@@ -807,6 +1118,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	// channel is delivered by the ring has no pages at all, and `_dispatch_frame_jobs()` refuses an
 	// empty batch, so a ring baked after it would only ever bake on frames the pages did.
 	_dispatch_ring_bake();
+	// And the detail layer's, for the same reason and in the same place: its tiles are not pages, so
+	// its dispatch must not depend on this frame having page work either.
+	_dispatch_detail_bake();
 
 	// A ring-only bundle has no page arrays and no page uniform set, so the page batch below has
 	// nothing it could dispatch into. The ring's bake above is the frame's whole device work.

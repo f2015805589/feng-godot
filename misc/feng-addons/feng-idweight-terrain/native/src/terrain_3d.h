@@ -634,6 +634,61 @@ public:
 	void _update_vt_clipmap_arm();
 	bool _vt_clipmap_state_changed();
 
+	// ---- The material group's detail layer ------------------------------------------------------
+	// The sparse, demand-resident fine layer that reaches the 1024 texels/m target the coarse ring
+	// cannot. It is a *layer on top of* the ring rather than a replacement: the ring keeps its
+	// complete coverage and its fallback, and this object only exists while the material group is
+	// delivered by `Clipmap` and its switch is on. See
+	// `Terrain3DMaterialClipmapDetail` (terrain_3d_material_clipmap_detail.h) for the mechanism.
+	void set_vt_detail_enabled(const bool p_enabled);
+	bool is_vt_detail_enabled() const { return _vt.detail_enabled; }
+	void set_vt_detail_density(const real_t p_texels_per_meter);
+	real_t get_vt_detail_density() const { return _vt.detail_density; }
+	void set_vt_detail_min_density(const real_t p_texels_per_meter);
+	real_t get_vt_detail_min_density() const { return _vt.detail_min_density; }
+	void set_vt_detail_tile_size(const int p_texels);
+	int get_vt_detail_tile_size() const { return _vt.detail_tile_size; }
+	void set_vt_detail_directory_size(const int p_texels);
+	int get_vt_detail_directory_size() const { return _vt.detail_directory_size; }
+	void set_vt_detail_budget_bytes(const int p_bytes);
+	int get_vt_detail_budget_bytes() const { return _vt.detail_budget_bytes; }
+	void set_vt_detail_demand_radius(const real_t p_metres);
+	real_t get_vt_detail_demand_radius() const { return _vt.detail_demand_radius; }
+	void set_vt_detail_texels_per_pixel(const real_t p_texels);
+	real_t get_vt_detail_texels_per_pixel() const { return _vt.detail_texels_per_pixel; }
+	// Whether a detail object exists. It is built by the assembly rule when the material group
+	// selects Clipmap and freed with the node; a deselection stops its tick rather than freeing its
+	// content, the rule the rings and the views follow.
+	bool has_vt_detail_layer() const { return _vt.material_detail != nullptr; }
+	// Everything the detail arm is bound from, or an empty dictionary when the layer is off. Built by
+	// the manager, so the shader's directory, window origin and tile span are the CPU's own numbers.
+	Dictionary get_vt_detail_arm() const;
+	// Whether the detail layer's arm addressing moved since the shader was bound with it: a directory
+	// publish, a window move, or a tile becoming readable. One comparison a tick, like the ring's.
+	void _update_vt_detail_arm();
+	bool _vt_detail_state_changed();
+	// The detail layer's own report, for `get_vt_settings()` and the tests: the request (density,
+	// budget, radius), the *delivered* state (resident, valid, pending, starved), the byte accounting
+	// and the source pipeline's counters. Kept beside the layer rather than in the service report so
+	// the two halves of "asked for" and "delivered" are one dictionary.
+	Dictionary get_vt_detail_settings() const;
+	// The finest level with a readable tile at a world point, and its density in texels per metre
+	// (0 / -1 when none). The CPU mirror of the fragment's lookup, so the stage's density acceptance
+	// can be asserted without reading a picture.
+	int sample_vt_detail_level(const Vector2 &p_world_xz) const;
+	real_t sample_vt_detail(const Vector2 &p_world_xz) const;
+	// The detail layer's demand pass, run from the clipmap phase's own tick hook. It derives the
+	// frame's wanted tiles, hands out slots, primes and polls the source pipeline, and offers landed
+	// tiles to the baker. A no-op - no focus read, no scan - while the layer does not exist.
+	void _update_vt_material_detail();
+	// An edit changed the source under a world AABB: the tiles that cover it stop being readable and
+	// are re-produced. Returns how many tiles were invalidated.
+	int invalidate_vt_detail_area(const AABB &p_area);
+	// Builds the detail layer when the material group selects Clipmap and the switch is on, and
+	// clears it when either stops being true. The one owner of the layer's lifetime, called from the
+	// assembly rule and from the settings' setters.
+	bool _setup_vt_material_detail();
+
 	void set_surface_vt_enabled(const bool p_enabled);
 	// A view of the near field's material cell: the AVT carries the diffuse+normal group. It is not
 	// a second source of truth - writing it writes that cell - and it is exactly what the material's

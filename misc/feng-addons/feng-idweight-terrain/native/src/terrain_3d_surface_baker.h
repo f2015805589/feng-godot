@@ -24,6 +24,12 @@
 #include <mutex>
 #include <vector>
 
+// The material group's sparse fine layer. Declared rather than included: the baker only holds a
+// pointer to it and calls into it from the one translation unit that bakes its tiles, so the layer's
+// own header (and the page pipeline it carries) does not become a dependency of every file that
+// includes the baker.
+class Terrain3DMaterialClipmapDetail;
+
 /**
  * What a material page array can be stored in. This is deliberately a shorter list than the
  * shared texture-array vocabulary the asset inspector offers, and the two must not be
@@ -253,6 +259,58 @@ private:
 		uint64_t dispatches = 0;
 	};
 	RingBake _ring_bake;
+	// ---- The detail layer's bake -----------------------------------------------------------------
+	// The material group's sparse fine layer (`Terrain3DMaterialClipmapDetail`) is baked by the same
+	// shader as a page and the same shader as a ring rect: one *tile* is one page-shaped job, its
+	// source the two layers the manager uploaded a pipeline result into, its output the manager's own
+	// three arrays at the tile's slot. It is a separate path from the ring's rather than a third kind
+	// of `RingJob` because the two differ in every part of their geometry: a ring rect names a
+	// wrapping level in stored texels, a detail tile is an affine page rect with a gutter. What they
+	// share is the job format, the material list and the one-tick separation, which is why one shader
+	// and one job buffer serve both.
+	struct DetailJob {
+		int slot = -1;
+		int level = 0;
+		uint64_t generation = 0;
+		Rect2 world_rect;
+		// `(origin.x, origin.y, step)` of the source the pipeline produced - the *source* corner
+		// grid, which is a different spacing from the tile's output texel.
+		Vector3 source_grid;
+		real_t texel = 1.f;
+		int border = 0;
+		int stored_size = 0;
+	};
+	struct DetailBake {
+		Terrain3DMaterialClipmapDetail *detail = nullptr;
+		RID uniform_set;
+		RID payload_rd;
+		RID height_rd;
+		// Part of the set's identity for the same reason the ring's is: the set names this buffer,
+		// and a bundle a generation later retires and frees its predecessor.
+		RID job_buffer;
+		int stored_size = 0;
+		int slots = 0;
+		std::vector<DetailJob> collected;
+		std::vector<DetailJob> queued;
+		std::vector<DetailJob> landed;
+		uint64_t dispatches = 0;
+	};
+	DetailBake _detail_bake;
+	// Builds the detail bake's descriptor set when there is none or when the layer it describes is
+	// not this one, and frees the previous set. False when the layer cannot be baked at all - no
+	// device, no bundle to take the material list and job buffer from, or an unfinished allocation.
+	bool _ensure_detail_bake(Terrain3DMaterialClipmapDetail *p_detail);
+	// Frees the descriptor set and forgets the identity it was built for, but *keeps* the three job
+	// lists: a bundle rebuild replaces the job buffer the set names without invalidating the work the
+	// layer already produced, and dropping that work would silently lose both a queued dispatch and a
+	// landing that still owes the layer an acknowledgment.
+	void _free_detail_set();
+	// The whole bake: the set and the jobs. Called when the layer's shape changes and at teardown,
+	// where the jobs describe a slot table that no longer exists.
+	void _free_detail_bake();
+	// The render callback's half: one dispatch for the queued tiles, recording what landed for the
+	// next offer to acknowledge. Returns how many jobs were dispatched.
+	int _dispatch_detail_bake();
 	// Builds the ring bake's descriptor set when there is none or when the ring it describes is not
 	// this one, and frees the previous set. False when the ring cannot be baked at all - no device, no
 	// bundle to take the material list and job buffer from, or a channel count the bake shader does not
@@ -626,6 +684,17 @@ public:
 	// tick would let the bake read the payload the rect is replacing. Returns how many rects this call
 	// offered, which is not how many are baked - that is `Terrain3DClipmap::is_level_baked()`.
 	int queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels);
+
+	// The detail layer's offer, beside the ring's. The caller offers the layer once a tick with the
+	// same budget the layer's own production is charged in (channel texels, a soft floor of one tile
+	// per offer) and the tiles this call can bake are handed to the render callback, which dispatches
+	// them and records that they landed. The *next* call reports each landed tile back to the layer,
+	// which decides whether the bake still describes the generation the slot was handed out under.
+	// Returns how many tiles this call offered, which is not how many are baked - that is the layer's
+	// `valid` count.
+	int queue_detail_tiles(Terrain3DMaterialClipmapDetail *p_detail, const int p_budget_texels);
+	// The detail bake's own accounting: the dispatches it recorded, and the tiles still queued.
+	Dictionary get_detail_bake_stats() const;
 
 	// Called by the parent through RenderingServer::call_on_render_thread().  The
 	// keep-alive is intentionally unused; binding a Ref<RefCounted> to the Callable

@@ -15,6 +15,7 @@
 
 #include "logger.h"
 #include "terrain_3d_material.h"
+#include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_virtual_texture.h"
 
@@ -75,6 +76,14 @@ void Terrain3DMaterial::_update_shader() {
 			// declaration, so a table shorter than the ring's answer is not expressible.
 			defines += "#define CLIPMAP_MAX_OUTSTANDING " +
 					String::num_int64(Terrain3DClipmap::MAX_OUTSTANDING_RECTS) + "\n";
+			// The detail layer's per-level arrays, declared once more with the one number that sizes
+			// them: the shader's window count, the CPU's `MAX_LEVELS` and the arm's padding are the
+			// same value, so a table shorter than the layer's answer is not expressible. The detail
+			// arm itself lives inside the material group's arm (a detail tile is a finer source under
+			// the same band), so it costs a variant nothing beyond these uniforms unless the material
+			// group selects the ring at all.
+			defines += "#define CLIPMAP_DETAIL_MAX_LEVELS " +
+					String::num_int64(Terrain3DMaterialClipmapDetail::MAX_LEVELS) + "\n";
 		}
 		if (!_needs_vt_shader()) {
 			defines += "#define TERRAIN_NO_VT\n";
@@ -570,6 +579,53 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_clipmap_level_count", levels);
 	RS->material_set_param(p_material, "_clipmap_channels", channels);
 	RS->material_set_param(p_material, "_clipmap_band", bands);
+	// The detail layer's arm, bound from the layer's own dictionary so the shader's directory, the
+	// window origin it indexes with and the tile span are the CPU's own numbers. A configuration
+	// whose material group is not on the ring has no layer: every name is then bound to the dummy
+	// array, zero levels and a disabled flag, so no name is left holding the previous one.
+	const Dictionary detail = _terrain->get_vt_detail_arm();
+	const bool detail_on = !detail.is_empty() && bool(detail.get("enabled", false));
+	const Array detail_directory_rids = detail.get("directory", Array());
+	const PackedVector2Array detail_windows_arm = detail.get("window_origin", PackedVector2Array());
+	const PackedFloat32Array detail_tile_worlds = detail.get("tile_world", PackedFloat32Array());
+	const PackedFloat32Array detail_texel_worlds = detail.get("texel_world", PackedFloat32Array());
+	const PackedFloat32Array detail_densities = detail.get("texels_per_meter", PackedFloat32Array());
+	Array detail_directories;
+	PackedVector2Array detail_windows;
+	PackedFloat32Array detail_tile_world;
+	PackedFloat32Array detail_texel_world;
+	PackedFloat32Array detail_texels_per_meter;
+	for (int level = 0; level < Terrain3DMaterialClipmapDetail::MAX_LEVELS; level++) {
+		const RID directory = detail_on && level < detail_directory_rids.size()
+				? RID(detail_directory_rids[level])
+				: RID();
+		detail_directories.push_back(directory.is_valid() ? directory : _generated_dummy_2d.get_rid());
+		detail_windows.push_back(level < detail_windows_arm.size() ? detail_windows_arm[level] : Vector2());
+		detail_tile_world.push_back(level < detail_tile_worlds.size() ? detail_tile_worlds[level] : 0.f);
+		detail_texel_world.push_back(level < detail_texel_worlds.size() ? detail_texel_worlds[level] : 0.f);
+		detail_texels_per_meter.push_back(level < detail_densities.size() ? detail_densities[level] : 0.f);
+	}
+	RS->material_set_param(p_material, "_detail_directory", detail_directories);
+	RS->material_set_param(p_material, "_detail_window_origin", detail_windows);
+	RS->material_set_param(p_material, "_detail_tile_world", detail_tile_world);
+	RS->material_set_param(p_material, "_detail_texel_world", detail_texel_world);
+	RS->material_set_param(p_material, "_detail_texels_per_meter", detail_texels_per_meter);
+	RS->material_set_param(p_material, "_detail_enabled", detail_on ? 1 : 0);
+	RS->material_set_param(p_material, "_detail_level_count", int(detail.get("levels", 0)));
+	RS->material_set_param(p_material, "_detail_tile_size", int(detail.get("tile_size", 0)));
+	RS->material_set_param(p_material, "_detail_border", int(detail.get("border", 0)));
+	RS->material_set_param(p_material, "_detail_stored_size", int(detail.get("stored_size", 0)));
+	RS->material_set_param(p_material, "_detail_directory_size", int(detail.get("directory_size", 0)));
+	RS->material_set_param(p_material, "_detail_slots", int(detail.get("slots", 0)));
+	const RID detail_albedo = detail_on ? RID(detail.get("baked_albedo", RID())) : RID();
+	const RID detail_normal = detail_on ? RID(detail.get("baked_normal", RID())) : RID();
+	const RID detail_params = detail_on ? RID(detail.get("baked_params", RID())) : RID();
+	RS->material_set_param(p_material, "_detail_baked_albedo",
+			detail_albedo.is_valid() ? detail_albedo : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_detail_baked_normal",
+			detail_normal.is_valid() ? detail_normal : _generated_dummy.get_rid());
+	RS->material_set_param(p_material, "_detail_baked_params",
+			detail_params.is_valid() ? detail_params : _generated_dummy.get_rid());
 }
 
 void Terrain3DMaterial::update_vt_clipmap_uniforms() {

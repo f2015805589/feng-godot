@@ -138,6 +138,9 @@ void Terrain3DSurfaceBaker::clear() {
 	// Before the lock and before `_rd` is dropped: the ring's descriptor set is a device object like
 	// the bundles' are, and it is released while the device is still known.
 	_free_ring_bake();
+	// The detail layer's set goes with it: it names the same job buffer and the same bundle's
+	// material arrays, so a set built against the bundle being freed is a stale set either way.
+	_free_detail_bake();
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		resource_rd = _rd;

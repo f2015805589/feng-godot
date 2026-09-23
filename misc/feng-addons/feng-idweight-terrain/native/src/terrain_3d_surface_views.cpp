@@ -42,6 +42,7 @@
 #include "terrain_3d_surface_baker.h"
 
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/viewport.hpp>
 
 ///////////////////////////
 // Surface virtual texture
@@ -568,6 +569,11 @@ void Terrain3D::_resolve_vt_delivery(const bool p_changed) {
 			_setup_vt_clipmap(channel);
 		}
 	}
+	// And the material group's detail layer, which is a second object over the same group: a finer,
+	// sparse layer whose lifetime follows the material cell exactly like the ring's does. It is
+	// rebuilt here rather than by the ring because it is not a ring - its own settings size it and
+	// its own budget turns it off.
+	_setup_vt_material_detail();
 	if (has_avt_delivery() && _vt.surface_vt == nullptr) {
 		_setup_surface_vt();
 	}
@@ -882,6 +888,13 @@ bool Terrain3D::_vt_clipmap_state_changed() {
 }
 
 void Terrain3D::_update_vt_clipmap_arm() {
+	// The detail layer's own tick rides on this hook. The physics tick's clipmap phase is the one
+	// place that runs every tick a cell selects the method, and it calls this immediately after the
+	// rings produce - but it lives in `terrain_3d.cpp`, which the parallel Stage 1 task owns, so
+	// hanging the detail pass here is the minimal adaptation rather than editing that file. The
+	// layer early-returns unless the material group selected Clipmap, so a height-only ring pays one
+	// null check. See the summary's dependency note.
+	_update_vt_material_detail();
 	if (!_vt_clipmap_state_changed()) {
 		return;
 	}
@@ -929,4 +942,320 @@ int Terrain3D::debug_update_vt_clipmap(const int p_group) {
 	// the ring the shader reads.
 	_update_vt_clipmap_arm();
 	return _vt.clipmap_produced_texels;
+}
+
+///////////////////////////
+// The material group's detail layer
+///////////////////////////
+//
+// A sparse, demand-resident layer of fine tiles over the coarse ring, and the only path to the 1024
+// texels/m the near material field is measured at. The mechanism is
+// `Terrain3DMaterialClipmapDetail`; this is its one owner on the node: the lifetime, the settings,
+// the demand view built from the camera, the tick hook, and the arm the material binds.
+//
+// **Why it is a layer and not a denser ring.** The ring is one dense level per octave, so its finest
+// level covers `base_world` metres: making that 1024 texels/m with a 256-texel axis would cover
+// 0.25 m, and the 1.6 m probe would fall several levels up - the ring's low density is a *shape*
+// property, not a setting that is merely set too coarse. The detail layer spends its bytes where the
+// screen footprint asks for them, keeps the ring's complete coverage and fallback underneath, and
+// owns nothing when the material group does not select Clipmap.
+//
+// **Selection.** `_setup_vt_material_detail()` is the one owner of the layer's lifetime and is called
+// from the assembly rule (so a cell write creates or frees it with the ring) and from every setting
+// setter. `_update_vt_material_detail()` is the tick, hung on `_update_vt_clipmap_arm()` so it runs
+// wherever the ring phase already runs; it builds the screen-footprint demand view from the live
+// camera, runs the layer's update, and offers the layers' landed tiles to the producer.
+
+bool Terrain3D::_setup_vt_material_detail() {
+	// On exactly while the material group is delivered by the ring *and* the switch is on. The ring
+	// must exist too, because it is the layer's fallback: a detail tile that cannot be baked is
+	// served by the ring's coarse level, and without the ring the fragment would have nothing
+	// between the tile and the region array.
+	const bool wanted = _vt.detail_enabled && _data != nullptr &&
+			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
+	if (!wanted) {
+		if (_vt.material_detail != nullptr) {
+			_vt.material_detail->clear();
+			_vt.material_detail.reset();
+			_vt.material_detail_state = 0;
+			_vt.detail_requested_tiles = 0;
+			_vt.detail_starved_tiles = 0;
+			// The arm's names are still declared by the material clipmap block, so the uniforms are
+			// rebound to an empty arm rather than left naming the arrays just freed.
+			if (_initialized && _material.is_valid()) {
+				_material->update_vt_clipmap_uniforms();
+			}
+		}
+		return false;
+	}
+	if (_vt.material_detail == nullptr) {
+		_vt.material_detail = std::make_unique<Terrain3DMaterialClipmapDetail>();
+	}
+	Terrain3DMaterialClipmapDetail::Config config;
+	config.tile_size = _vt.detail_tile_size;
+	// The gutter is shared with the ring and the pages: one setting for "how far a filtering
+	// footprint may reach past the texels a tile owns", which is why it is not a detail setting.
+	config.border = _vt.vt_page_border;
+	config.density = _vt.detail_density;
+	config.directory_size = _vt.detail_directory_size;
+	config.budget_bytes = _vt.detail_budget_bytes;
+	config.demand_radius = _vt.detail_demand_radius;
+	config.texels_per_pixel = _vt.detail_texels_per_pixel;
+	// The layer's source workers are the shared setting: the pipeline is a page pipeline, and its
+	// cost profile is the same question whoever it feeds.
+	config.source_workers = _vt.vt_page_workers;
+	// Levels: the finest is the requested density and the coarsest is the first that would fall
+	// below `detail_min_density`. That is what makes the fringe a density step rather than the
+	// finest level stretched over metres, and it is why a level count is not a user setting.
+	int levels = 1;
+	real_t density = config.density;
+	while (levels < Terrain3DMaterialClipmapDetail::MAX_LEVELS && density * 0.5f >= _vt.detail_min_density) {
+		density *= 0.5f;
+		levels++;
+	}
+	config.levels = levels;
+	_vt.material_detail->configure(config);
+	_vt.material_detail_state = _vt.material_detail->get_state_stamp();
+	const bool enabled = _vt.material_detail->is_enabled();
+	if (!enabled) {
+		// The budget could not afford a slot table. The message is the manager's; this is the
+		// node-level statement that the coarse ring is what serves instead.
+		LOG(WARN, "Detail material layer is off; the coarse ring serves the near field.");
+	}
+	return enabled;
+}
+
+void Terrain3D::_update_vt_material_detail() {
+	_vt.detail_requested_tiles = 0;
+	_vt.detail_starved_tiles = 0;
+	_vt.vt_detail_ms = 0.0;
+	Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	if (detail == nullptr || !detail->is_enabled()) {
+		return;
+	}
+	// The source snapshot is the pages' and the layer's one source of truth; the pages build it in
+	// `_configure_vt_service()`, which returns early when no view exists - and "no view, material on
+	// the ring" is exactly the configuration this layer is for. Filling it here is what lets the
+	// layer prepare sources in that case; every edit resets it, so a stale snapshot is not a hazard.
+	if (!_vt.vt_source_snapshot && _data != nullptr) {
+		_vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing,
+				_surface_density);
+	}
+	const uint64_t started = Time::get_singleton()->get_ticks_usec();
+	Terrain3DMaterialClipmapDetail::DemandView view;
+	const Vector3 target = get_clipmap_target_position();
+	view.focus = v3v2(target);
+	view.viewport_height = 1080;
+	view.texels_per_pixel = _vt.detail_texels_per_pixel;
+	if (Camera3D *camera = get_camera()) {
+		// The fragment-side camera: it is the position and direction the band rule in the shader
+		// measures with (`v_camera_pos`), so the demand walk and the fragment's own footprint agree.
+		const Vector3 position = camera->get_global_position();
+		view.focus = Vector2(position.x, position.z);
+		const Vector3 forward = -camera->get_global_transform().basis.get_column(2);
+		const Vector2 flat(forward.x, forward.z);
+		if (flat.length_squared() > 1e-8f) {
+			view.forward = flat.normalized();
+		}
+		view.height = MAX(real_t(0.1), position.y - target.y);
+		view.fov_y = Math::deg_to_rad(camera->get_fov());
+		if (Viewport *viewport = camera->get_viewport()) {
+			const Vector2 size = viewport->get_visible_rect().size;
+			if (size.y >= 1.f) {
+				view.viewport_height = int(size.y);
+			}
+		}
+	}
+	_vt.detail_requested_tiles = detail->update(view, _vt.vt_source_snapshot, _vt.clipmap_budget_texels);
+	_vt.detail_starved_tiles = detail->get_starved_tiles();
+	if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels);
+	}
+	_vt.vt_detail_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+	_update_vt_detail_arm();
+}
+
+bool Terrain3D::_vt_detail_state_changed() {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	const uint64_t stamp = detail != nullptr ? detail->get_state_stamp() : 0;
+	if (stamp == _vt.material_detail_state) {
+		return false;
+	}
+	_vt.material_detail_state = stamp;
+	return true;
+}
+
+void Terrain3D::_update_vt_detail_arm() {
+	if (!_vt_detail_state_changed()) {
+		return;
+	}
+	if (_initialized && _material.is_valid()) {
+		_material->update_vt_clipmap_uniforms();
+	}
+}
+
+Dictionary Terrain3D::get_vt_detail_arm() const {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	return detail != nullptr ? detail->get_arm() : Dictionary();
+}
+
+int Terrain3D::sample_vt_detail_level(const Vector2 &p_world_xz) const {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	return detail != nullptr ? detail->level_at(p_world_xz) : -1;
+}
+
+real_t Terrain3D::sample_vt_detail(const Vector2 &p_world_xz) const {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	return detail != nullptr ? detail->density_at(p_world_xz) : 0.f;
+}
+
+int Terrain3D::invalidate_vt_detail_area(const AABB &p_area) {
+	Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	if (detail == nullptr || !detail->is_enabled()) {
+		return 0;
+	}
+	const Vector2 origin(p_area.position.x, p_area.position.z);
+	const Rect2 rect(origin, Vector2(p_area.size.x, p_area.size.z));
+	const int touched = detail->invalidate_rect(rect);
+	if (touched > 0) {
+		_update_vt_detail_arm();
+	}
+	return touched;
+}
+
+Dictionary Terrain3D::get_vt_detail_settings() const {
+	Dictionary result;
+	result["enabled_setting"] = _vt.detail_enabled;
+	result["density"] = _vt.detail_density;
+	result["min_density"] = _vt.detail_min_density;
+	result["tile_size"] = _vt.detail_tile_size;
+	result["directory_size"] = _vt.detail_directory_size;
+	result["budget_bytes_setting"] = int64_t(_vt.detail_budget_bytes);
+	result["demand_radius"] = _vt.detail_demand_radius;
+	result["texels_per_pixel"] = _vt.detail_texels_per_pixel;
+	result["exists"] = _vt.material_detail != nullptr;
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	if (detail == nullptr) {
+		result["active"] = false;
+		result["requested_tiles"] = 0;
+		result["starved_tiles"] = 0;
+		result["vt_detail_ms"] = 0.0;
+		return result;
+	}
+	result["active"] = detail->is_enabled();
+	result["levels"] = detail->get_level_count();
+	result["tile_size"] = detail->get_tile_size();
+	result["border"] = detail->get_border();
+	result["stored_size"] = detail->get_stored_size();
+	result["directory_bytes"] = int64_t(detail->get_directory_bytes());
+	result["bytes_per_slot"] = int64_t(detail->bytes_per_slot());
+	result["slot_count"] = detail->get_slot_count();
+	result["used_bytes"] = int64_t(detail->get_used_bytes());
+	result["budget_bytes"] = int64_t(detail->get_budget_bytes());
+	result["resident_tiles"] = detail->get_used_slots();
+	result["valid_tiles"] = detail->get_valid_count();
+	result["pending_tiles"] = detail->get_pending_count();
+	result["starved_tiles"] = detail->get_starved_tiles();
+	result["requested_tiles"] = _vt.detail_requested_tiles;
+	result["vt_detail_ms"] = _vt.vt_detail_ms;
+	result["hit_tiles"] = int64_t(detail->get_hit_count());
+	result["miss_tiles"] = int64_t(detail->get_miss_count());
+	result["evictions"] = int64_t(detail->get_evictions());
+	result["source_uploads"] = int64_t(detail->get_source_uploads());
+	result["bake_offers"] = int64_t(detail->get_bake_offers());
+	result["bake_acks"] = int64_t(detail->get_bake_acks());
+	result["bake_rejects"] = int64_t(detail->get_bake_rejects());
+	result["invalidation_calls"] = int64_t(detail->get_invalidation_calls());
+	result["invalidated_tiles"] = int64_t(detail->get_invalidated_tiles());
+	result["directory_publishes"] = int64_t(detail->get_directory_publishes());
+	result["budget_report"] = detail->get_budget_report();
+	// The per-level density the level rule resolves to, so a reader can see the 1024 target beside
+	// what each level actually is without re-deriving it.
+	PackedFloat32Array level_density;
+	PackedFloat32Array level_tile_world;
+	for (int level = 0; level < detail->get_level_count(); level++) {
+		level_density.push_back(detail->get_level_texels_per_meter(level));
+		level_tile_world.push_back(detail->get_level_tile_world(level));
+	}
+	result["level_density"] = level_density;
+	result["level_tile_world"] = level_tile_world;
+	if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		result["bake"] = surface_baker->get_detail_bake_stats();
+	}
+	return result;
+}
+
+void Terrain3D::set_vt_detail_enabled(const bool p_enabled) {
+	if (p_enabled == _vt.detail_enabled) {
+		return;
+	}
+	_vt.detail_enabled = p_enabled;
+	_setup_vt_material_detail();
+	if (_initialized && _material.is_valid()) {
+		_material->update_vt_clipmap_uniforms();
+	}
+	if (p_enabled && has_vt_delivery() && _initialized) {
+		set_physics_process(true);
+	}
+}
+
+void Terrain3D::set_vt_detail_density(const real_t p_texels_per_meter) {
+	// A density is a positive number of texels per metre. Zero or negative is refused rather than
+	// clamped: a level with no texels is not a coarser layer, it is not a layer.
+	if (p_texels_per_meter <= 0.f || Math::is_equal_approx(p_texels_per_meter, _vt.detail_density)) {
+		return;
+	}
+	_vt.detail_density = p_texels_per_meter;
+	if (_vt.detail_min_density > p_texels_per_meter) {
+		_vt.detail_min_density = p_texels_per_meter;
+	}
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_min_density(const real_t p_texels_per_meter) {
+	if (p_texels_per_meter <= 0.f || Math::is_equal_approx(p_texels_per_meter, _vt.detail_min_density)) {
+		return;
+	}
+	// The floor cannot be above the target: a layer whose coarsest level is finer than its finest
+	// has no level rule at all, so the request is clamped to the target instead.
+	_vt.detail_min_density = MIN(p_texels_per_meter, _vt.detail_density);
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_tile_size(const int p_texels) {
+	if (p_texels <= 0 || p_texels == _vt.detail_tile_size) {
+		return;
+	}
+	_vt.detail_tile_size = p_texels;
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_directory_size(const int p_texels) {
+	if (p_texels <= 0 || p_texels == _vt.detail_directory_size) {
+		return;
+	}
+	_vt.detail_directory_size = p_texels;
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_budget_bytes(const int p_bytes) {
+	// Not a shape: the layer keeps its content when the budget changes in the policy sense, but a
+	// derived slot table cannot be resized in place, so the manager rebuilds. Zero is a legal
+	// "spend nothing", which turns the layer off with a report rather than allocating a slot table
+	// it cannot afford.
+	_vt.detail_budget_bytes = MAX(0, p_bytes);
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_demand_radius(const real_t p_metres) {
+	// Policy, not shape: the manager's `configure()` takes the fast path for it (nothing resident
+	// moves), so this reaches the next demand walk without evicting a tile.
+	_vt.detail_demand_radius = CLAMP(p_metres, real_t(0.25), real_t(4096));
+	_setup_vt_material_detail();
+}
+
+void Terrain3D::set_vt_detail_texels_per_pixel(const real_t p_texels) {
+	// Policy as well: the screen-footprint target the level rule is derived from.
+	_vt.detail_texels_per_pixel = CLAMP(p_texels, real_t(0.25), real_t(64));
+	_setup_vt_material_detail();
 }

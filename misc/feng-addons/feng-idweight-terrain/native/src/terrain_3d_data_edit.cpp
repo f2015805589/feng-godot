@@ -26,6 +26,10 @@ void Terrain3DData::add_edited_area(const AABB &p_area) {
 		// ticks that follow. A ring that does not exist is not told, and a rect a level is already
 		// producing whole costs nothing. See `Terrain3D::invalidate_vt_clipmap_area()`.
 		_terrain->invalidate_vt_clipmap_area(p_area);
+		// And the detail layer's, which is the finer half of the same statement: a tile is baked
+		// from the same source, so the tiles the area covers stop being readable and re-produce.
+		// Only tiles that exist are told, so a configuration with the layer off pays one null check.
+		_terrain->invalidate_vt_detail_area(p_area);
 	}
 	if (_edited_area.has_surface()) {
 		_edited_area = _edited_area.merge(p_area);
