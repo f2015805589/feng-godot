@@ -91,6 +91,50 @@ constexpr float AVT_SECTOR_WORLD = 64.f;
 // shared for the same reason the cell size is.
 constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 
+// A view whose sampled plan has almost no content is *cold*: a snap turn, a teleport, a cut, the
+// first frames of a session. The shader draws such a view through the independent dense fallback,
+// which is one texel per metre - a flat smear at a 1080p pixel footprint - and the steady allowance
+// fills the plan over tens of ticks (measured: `vt_project_lifetime_probe.py --motion snap` at
+// 1920x1080 needs ~97 ticks to clear 90% of the textured ground against 752 sampled pages at eight
+// pages a tick). A cold view is therefore served by a bounded burst instead: while it is armed the
+// near field takes `avt_burst_allowance()` pages a tick and the producer's frame budget is raised to
+// match, so the plan that the image is actually shading is filled in the few ticks the user allows
+// rather than over a second. The burst is bounded in ticks and in pages, and it is the same work at
+// a higher rate - no page is asked for that the steady plan did not name already.
+//
+// The threshold is a fraction of the *sampled* plan, not of the pool: a moving view that is merely
+// streaming keeps most of its sampled set resident, so it never arms the burst, while a cut leaves
+// almost none of it.
+constexpr float AVT_COLD_BURST_MISSING_FRACTION = 0.25f;
+// How many ticks a cold view is served at the burst rate. Four is the window the reference project
+// asks for; six leaves the ramp a tail to finish on.
+constexpr int AVT_COLD_BURST_TICKS = 6;
+// The burst rate as a multiple of the configured page budget, and its ceiling. The ceiling is what
+// bounds the transient on the main thread: one page costs a source poll, a pool write and a bake
+// dispatch, and the measured main-thread cost of a pass is ~0.05 ms a page.
+constexpr int AVT_COLD_BURST_FACTOR = 6;
+constexpr int AVT_COLD_BURST_PAGES_MAX = 128;
+// The arrival ramp a cold view's burst shortens the fade to, in ticks. A page that has arrived but
+// is still ramping is drawn as the level it replaced, so the ramp is part of the time a viewer waits
+// for the ground to stop being a smear: the shipped twelve ticks are longer than the window the
+// reference project asks for. Three is the shortest ramp that still crosses a page boundary over
+// more than one frame; the setting is untouched and a settled view ramps at its full length again.
+constexpr int AVT_COLD_BURST_FADE_FRAMES = 3;
+// What the near field's production pass may ever be handed in one tick. The steady path never asks
+// for more than `vt_pages_per_update`; this is the ceiling the burst is admitted under, and it is
+// the same number the source queue window is raised to while the burst runs.
+constexpr int AVT_PAGE_BUDGET_CEILING = 128;
+
+// The near field's share of a cold view's burst, and 0 when no burst is running. The burst never
+// reduces the steady allowance and it is off in the diagnostic direct-material mode, where the
+// budget is deliberately pinned to four pages.
+inline int avt_cold_burst_allowance(const int p_page_budget, const int p_steady_allowance, const int p_ticks_left) {
+	if (p_ticks_left <= 0) {
+		return 0;
+	}
+	return CLAMP(p_page_budget * AVT_COLD_BURST_FACTOR, p_steady_allowance, AVT_COLD_BURST_PAGES_MAX);
+}
+
 // A position that crosses this fraction of the near field no longer belongs to the old
 // retention window. Both motion sampling and plan refresh use this one contract.
 constexpr float AVT_MOTION_SPATIAL_DISCONTINUITY_REACH_FRACTION = 0.125f;

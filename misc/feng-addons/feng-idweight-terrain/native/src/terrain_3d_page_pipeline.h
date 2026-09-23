@@ -18,9 +18,15 @@ namespace TerrainVT { struct VisibleView; struct VisiblePatch; }
 class Terrain3DPagePipeline {
 public:
 	using Key = std::array<int, 5>;
+	// The steady window: one queue slot holds a prepared payload of a few hundred kilobytes, so
+	// the queue is kept shallow while a view is streaming normally. `MAX_QUEUE_CAPACITY` is the
+	// window a cold-view burst may raise it to - the same payload, admitted at the rate the burst
+	// asks for - and it is what `ReadyKeys` is sized for, because a snapshot taken while the burst
+	// runs has to describe the window the burst filled.
 	static constexpr size_t QUEUE_CAPACITY = 32;
+	static constexpr size_t MAX_QUEUE_CAPACITY = 256;
 	struct ReadyKeys {
-		std::array<Key, QUEUE_CAPACITY> keys;
+		std::array<Key, MAX_QUEUE_CAPACITY> keys;
 		size_t count = 0;
 		bool contains(const Key &p_key) const {
 			return std::binary_search(keys.begin(), keys.begin() + count, p_key);
@@ -107,6 +113,15 @@ public:
 	}
 	// How many requests a worker could still claim right now. Lock free.
 	int claimable_count() const { return _claimable_count.load(std::memory_order_relaxed); }
+	// The depth of the queue window. A cold-view burst raises it so the workers may hold a burst's
+	// worth of prepared pages instead of the steady window's, which is what lets one pass consume
+	// more than `QUEUE_CAPACITY` prepared pages; a settled or moving view leaves it at the steady
+	// window and pays the shallow queue's scan cost. Bounded by `MAX_QUEUE_CAPACITY`, which is what
+	// `ReadyKeys` holds.
+	void set_queue_limit(int p_limit) {
+		_queue_limit.store(CLAMP(p_limit, int(QUEUE_CAPACITY), int(MAX_QUEUE_CAPACITY)), std::memory_order_relaxed);
+	}
+	int get_queue_limit() const { return _queue_limit.load(std::memory_order_relaxed); }
 	// Wakes the workers for the work submitted since the last call. The demand pass calls this when
 	// it is finished rather than in the middle of itself: a worker woken inside a measured phase
 	// starts competing for this thread's cores, so the phase reads as its own cost when what it
@@ -165,6 +180,10 @@ private:
 	std::atomic<int> _claimable_count{ 0 };
 	// Wakes owed to the workers, released by flush_wakes() at the end of the producing pass.
 	std::atomic<int> _pending_wakes{ 0 };
+	// The live queue window. It has one writer, the demand pass that arms or ends a cold-view
+	// burst, and every reader takes it relaxed: a pass that saw the previous window for one tick
+	// is still correct, it just has one tick of the old depth.
+	std::atomic<int> _queue_limit{ int(QUEUE_CAPACITY) };
 	// How many workers are parked in `wait`. A batch only wakes a worker that is asleep, and
 	// a wake is a syscall: waking one worker per entry added was thirty-two of them on a
 	// demand pass whose workers were all busy anyway.

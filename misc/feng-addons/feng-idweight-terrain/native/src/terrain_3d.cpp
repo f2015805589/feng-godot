@@ -335,7 +335,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// against the same number: its unsampled tail is capped at what one refresh window can produce
 	// with this allowance. Two spellings of the split would let the plan outrun the pass it is
 	// served from, which is the defect `docs/vt_reference_avt_alignment.md` section 7.7 records.
-	const int avt_share = _avt_tick_allowance();
+	const int avt_share = MAX(_avt_tick_allowance(), _avt_burst_allowance());
 	int avt_produced = 0;
 	// The tiers run in the order they are built in: the near field's pass publishes the
 	// near-field addressing state the material reads and the far field's publishes the

@@ -822,6 +822,34 @@ struct Terrain3DVTState {
 	bool avt_motion_valid = false;
 	// A camera cut invalidates the old-view retention tail at the next plan install.
 	bool avt_discard_retained = false;
+	// Ticks left of the cold-view production burst, and the rate it is served at. A plan whose
+	// sampled set is mostly missing is a view nothing has produced for yet - a snap turn, a
+	// teleport, the first frames of a session - and the shader draws it through the one-texel-per-
+	// metre fallback, which is a flat smear at a 1080p footprint. The steady allowance fills such a
+	// plan over tens of ticks, so the burst serves it at `avt_burst_allowance()` pages a tick for
+	// `AVT_COLD_BURST_TICKS` ticks. `avt_burst_peak` and `avt_burst_pages` are what it did: the
+	// largest allowance it asked for, and how many pages it produced across the burst.
+	int avt_cold_burst_ticks = 0;
+	int avt_burst_peak = 0;
+	int64_t avt_burst_pages = 0;
+	// The rate the producer's frame budget and the source queue window were last set from, so the
+	// tick that arms or ends a burst publishes it once instead of every tick. Zero means nothing has
+	// published yet, which is what makes the first tick of a session apply the configured budget.
+	int avt_page_budget_applied = 0;
+	// Whether the shader was last told the view is cold, i.e. that a fragment served only by the
+	// independent fallback tier should take the source evaluator instead. It is the shader's copy of
+	// `avt_cold_source_fallback`, published with the burst's rate and reported beside it.
+	bool avt_cold_source_published = false;
+	// Whether a *cut* put the view in the cold state - the burst's own arm. A camera that merely
+	// moves never sets it, which is what keeps the burst and the source fallback off every ordinary
+	// streaming path. It is consumed by the production pass that finds the view served again.
+	bool avt_burst_from_cut = false;
+	// Whether the shader should draw a cold view's under-served fragments from the source evaluator.
+	// Armed by the cut that creates the cold view and cleared by the pass that has nothing left to
+	// fill, so its window is the *serving* one and not the burst's six ticks: the fragment-level
+	// handover is the shader's texel tolerance, and this flag only bounds how long that tolerance may
+	// apply. See `_avt_cold_source_fallback` in the shader.
+	bool avt_cold_source_fallback = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
 	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum

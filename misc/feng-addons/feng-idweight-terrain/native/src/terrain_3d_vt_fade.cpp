@@ -74,7 +74,17 @@ void Terrain3D::_update_vt_page_fade() {
 	const Terrain3DVirtualTexture *fade_view = _vt.surface_vt ? _vt.surface_vt : _vt.surface_svt;
 	if (fade_view == nullptr) { return; }
 	const int slots = MAX(1, fade_view->get_page_count());
-	const int frames = MAX(1, _vt.vt_page_fade_frames);
+	// The ramp length. A cold view is filled by a production burst whose whole point is that the
+	// ground stops being a one-texel-per-metre smear within a few ticks, and a page that has arrived
+	// but is still ramping is drawn as the level it replaced for the length of the ramp: the shipped
+	// twelve ticks are longer than the window the reference project asks for, so a burst that filled
+	// the plan in four ticks would still show the old level for another twelve. While the burst is
+	// armed the ramp is shortened to `AVT_COLD_BURST_FADE_FRAMES`. The setting is untouched, an
+	// in-flight ramp only ever moves forward when the length changes, and a settled view ramps at its
+	// full length again. See `AVT_COLD_BURST_FADE_FRAMES`.
+	const int frames = MAX(1, _vt.avt_cold_burst_ticks > 0
+			? MIN(_vt.vt_page_fade_frames, AVT_COLD_BURST_FADE_FRAMES)
+			: _vt.vt_page_fade_frames);
 	if (_vt.fade.queue.capacity() != size_t(slots)) {
 		_vt.fade.queue.resize(size_t(slots));
 	}

@@ -554,7 +554,12 @@ void Terrain3D::_update_vt_service() {
 		_vt.vt_callback_missing_warned = true;
 		WARN_PRINT("This engine build has no virtual_texture_set_update_callback; surface material pages cannot be produced. Rebuild the engine from this source tree.");
 	}
-	producer->set_page_budget(_vt.vt_pages_per_update);
+	// The steady page budget, or a cold-view burst's rate while one is armed. The tick re-publishes
+	// this the tick a burst arms or ends (`_update_sector_avt()`); this call is what a service
+	// rebuild - a setting change, a pool rebuild - leaves behind, so it reads the same number the
+	// tick does rather than the setting alone.
+	producer->set_page_budget(_avt_page_budget());
+	_vt.avt_page_budget_applied = _avt_page_budget();
 	if (_vt.vt_materials_dirty || producer->materials_stale()) {
 		// Also re-publish when the producer reports its snapshot unbound: the arrays it named
 		// were freed by a newer asset edit, and publishing the current pair is what recovers,

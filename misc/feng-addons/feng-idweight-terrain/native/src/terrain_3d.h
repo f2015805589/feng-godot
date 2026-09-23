@@ -100,6 +100,15 @@ private:
 	// beyond the ones the image samples by what one refresh window can produce - so the split has
 	// one home. See the definition and `docs/vt_reference_avt_alignment.md` section 7.7.
 	int _avt_tick_allowance() const;
+	// The near field's share of a cold-view burst, and 0 when none is armed. A plan whose sampled
+	// set is mostly missing is a view nothing has produced for yet - a snap turn, a teleport, a
+	// session's first frames - and the shader draws it through the one-texel-per-metre fallback
+	// while the steady allowance fills it over tens of ticks. See `AVT_COLD_BURST_*`.
+	int _avt_burst_allowance() const;
+	// The one number the producer's frame budget and the source queue window are both set from:
+	// the burst's rate while one is armed, the configured page budget otherwise. Both readers have
+	// to move together - a burst that raised only one of them would stall on the other.
+	int _avt_page_budget() const;
 	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
 	// struct in terrain_3d_avt.h for what each stage owns.
 	void _avt_classify_plan(Terrain3DAVTProducePass &r_pass);
@@ -745,6 +754,9 @@ public:
 	// turn brings new world into the frustum the way a step does. See
 	// Terrain3DVTState::vt_motion_lead_ms and the note on the turn half of the state.
 	void _vt_update_motion_lead();
+	// Arms the cold-view burst and the source fallback a cut leaves behind. Called by the two
+	// discontinuity branches of the motion sampler, which are the only places a cut is recognised.
+	void _vt_arm_cold_view();
 	Transform3D _vt_lead_camera_transform(const Transform3D &p_camera_transform) const;
 	Transform3D _vt_plan_key_transform(const Transform3D &p_camera_transform) const;
 	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }

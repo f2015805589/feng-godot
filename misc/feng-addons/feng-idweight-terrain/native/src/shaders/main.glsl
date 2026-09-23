@@ -59,6 +59,24 @@ uniform float _avt_mip_distance[16];
 uniform int _avt_mip_distance_count = 0;
 uniform bool _avt_sectors_enabled = false;
 uniform bool _avt_feedback = false;
+// A cold view: a plan nothing has produced for yet - a snap turn, a teleport, a session's first
+// frames - is drawn from the independent fallback grid, which is one texel per metre, while the
+// source evaluator is right there at the authored density. The fallback is the tier a fragment *no
+// upgrade covers* resolves through, and at a 1080p footprint that is a flat smear: it is the "wide
+// blur" a turn shows for as long as the plan takes to fill. While the near field reports the view
+// cold, a fragment whose only content is that tier takes the source instead - the same answer
+// `Direct` delivery gives, which is the one method that is always correct. A fragment with any
+// upgrade page, and every fragment of a settled or moving view, is unaffected: this is a fallback
+// *chain* quality flag, not a read-order change. See `get_vt_settings()`'s
+// `avt_cold_burst_*`.
+uniform bool _avt_cold_source_fallback = false;
+// How much coarser than the fragment's own footprint a page may be before a cold view prefers the
+// source evaluator. One is exact: the resolve must have returned the level the footprint asked for,
+// because the shader's own level is the `floor` of `log2(pixel_world / local_texel)` and a page one
+// level coarser than that is the difference between "slightly blurry" and a flat patch of surface.
+// A fragment whose sector holds a page at its own level keeps the page; only the under-served ones
+// take the source, so the two hand over per fragment as the plan fills rather than at one instant.
+const float AVT_COLD_SOURCE_TEXEL_TOLERANCE = 1.0;
 uniform float _avt_density_scale = 1.0;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
 uniform int _avt_directory_mask = 0;
@@ -709,10 +727,16 @@ int avt_distance_mip(float distance_to_camera, int top) {
 R"(
 // Adaptive tier 0 has its own local mip chain. Tier 1 is the independent,
 // dense low-resolution image; its mip indices are not fine-image mip indices.
+//
+// `r_upgrade` reports which of the two answered: true when the material came from the sector's own
+// mip chain (an upgrade page), false when it came from the independent fallback tier. A caller that
+// treats the two differently - the cold-view source fallback in `avt_filtered_sample()` - needs that
+// distinction, and only this function knows it.
 bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_coarse, vec2 world_dx, vec2 world_dy, out material result, out vec3 result_normal,
-		out float texel_world, out float fade, out bool last_mip) {
+		out float texel_world, out float fade, out bool last_mip, out bool r_upgrade) {
 	fade = 1.0;
 	last_mip = false;
+	r_upgrade = false;
 	if (_avt_coarse_grid.w < 1.0 || _avt_coarse_grid.z <= 0.0) { return false; }
 	float coarse_texel = _avt_coarse_grid.z / float(_surface_vt_page_size);
 	// The near field's reach bounds its *upgrade* path and nothing else. Reach is what the plan
@@ -758,6 +782,7 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 					continue;
 				}
 				fade = surface_vt_page_fade(slot);
+				r_upgrade = true;
 				return true;
 			}
 		}
@@ -784,11 +809,23 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 )"
 
 R"(
-bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 world_dy, out material r_mat, out vec3 r_normal) {
+// `r_fallback_only` reports that the material is entirely the independent fallback tier's: the
+// fragment's sector held no upgrade page at any level, so the only content behind it is the
+// one-texel-per-metre grid. `r_texel` is the world size of the texel the resolve settled on, which
+// is what says whether that content is the level the fragment's footprint asked for or a level one
+// or two coarser - the reading the cold-view source fallback in `surface_material_sample()` uses.
+bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 world_dy, out material r_mat, out vec3 r_normal, out bool r_fallback_only, out float r_texel, out float r_fade) {
 	float fine_texel;
 	float fine_fade;
 	bool last_mip;
-	if (!avt_resolve(world, pixel_world, 0.0, _avt_feedback, world_dx, world_dy, r_mat, r_normal, fine_texel, fine_fade, last_mip)) { return false; }
+	bool fine_upgrade;
+	r_fallback_only = false;
+	r_texel = 0.0;
+	r_fade = 1.0;
+	if (!avt_resolve(world, pixel_world, 0.0, _avt_feedback, world_dx, world_dy, r_mat, r_normal, fine_texel, fine_fade, last_mip, fine_upgrade)) { return false; }
+	r_fallback_only = !fine_upgrade;
+	r_texel = fine_texel;
+	r_fade = fine_fade;
 	// The blend is the pixel footprint's mip interpolation, and - while a page is still coming in
 	// - the level that page replaced. A page that has just arrived is resolved at full weight for
 	// its own texels, so without the second term it appears as a rectangular step in the image;
@@ -801,10 +838,11 @@ bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 worl
 	vec3 coarse_normal;
 	float coarse_texel;
 	float coarse_fade;
+	bool coarse_upgrade;
 	// Strict mode checks the requested fine page above. Its transition parent is
 	// an availability query: skipping an unfinished intermediate parent must not
 	// bypass the fade while a valid world ancestor is already resident.
-	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, true, world_dx, world_dy, coarse, coarse_normal, coarse_texel, coarse_fade, last_mip)) { return true; }
+	if (!avt_resolve(world, pixel_world, fine_texel * 1.001, true, world_dx, world_dy, coarse, coarse_normal, coarse_texel, coarse_fade, last_mip, coarse_upgrade)) { return true; }
 	// The coarser resolve can land on the same page when nothing coarser is resident; there is
 	// then nothing to fade against and the sharp page stands.
 	if (coarse_texel <= fine_texel) { return true; }
@@ -830,8 +868,9 @@ bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 worl
 		vec3 parent_normal;
 		float parent_texel;
 		float parent_fade;
+		bool parent_upgrade;
 		if (!avt_resolve(world, pixel_world, coarse_texel * 1.001, true, world_dx, world_dy, parent, parent_normal,
-				parent_texel, parent_fade, last_mip) || parent_texel <= coarse_texel) { break; }
+				parent_texel, parent_fade, last_mip, parent_upgrade) || parent_texel <= coarse_texel) { break; }
 		remaining *= 1.0 - coarse_fade;
 		r_mat.albedo_height += (parent.albedo_height - coarse.albedo_height) * remaining;
 		r_mat.normal_rough += (parent.normal_rough - coarse.normal_rough) * remaining;
@@ -902,7 +941,23 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal, 
 		float reach = max(64.0, _avt_coverage_distance);
 		float far_weight = _surface_svt_enabled ? smoothstep(reach * 0.75, reach, distance(world, v_camera_pos.xz)) : 0.0;
 		if (far_weight >= 1.0) { return surface_svt_material_sample(world, r_mat, r_normal); }
-		bool avt_ready = avt_filtered_sample(world, pixel_world, world_dx, world_dy, r_mat, r_normal);
+		bool avt_fallback_only;
+		float avt_texel;
+		float avt_fade;
+		bool avt_ready = avt_filtered_sample(world, pixel_world, world_dx, world_dy, r_mat, r_normal, avt_fallback_only, avt_texel, avt_fade);
+		// A cold view's ground is the source evaluator's, not the fallback grid's. See
+		// `_avt_cold_source_fallback`: while nothing has produced the fragment's sector, the content
+		// behind it is the fallback tier - one texel per metre - an upgrade page coarser than the
+		// footprint asked for, or a page that has arrived but is still ramping in against either of
+		// those. Each of the three draws as the flat smear a turn is reported to show, and each of
+		// them is a fragment the pages are not serving. Such a fragment takes the source evaluator,
+		// which is the same answer `Direct` delivery gives and the one method that is always correct.
+		// `r_page_share` at zero is what makes the caller evaluate: the pages own none of this
+		// fragment, so the evaluated material is the whole answer. A fragment the pages serve at its
+		// own level, already arrived, and every fragment of a settled or moving view, is unaffected -
+		// the flag is only set while a cut's view is filling.
+		if (avt_ready && _avt_cold_source_fallback &&
+				(avt_fallback_only || avt_fade < 0.99 || avt_texel > pixel_world * AVT_COLD_SOURCE_TEXEL_TOLERANCE)) { r_page_share = 0.0; }
 		if (far_weight <= 0.0) { return avt_ready; }
 		material far_mat;
 		vec3 far_normal;

@@ -205,7 +205,7 @@ void Terrain3DPagePipeline::_lock_queue(std::unique_lock<std::mutex> &r_lock) {
 // page whose slot the producer is already filling leaves its entry behind, and without
 // this the window fills with dead results and the workers run out of work to do.
 void Terrain3DPagePipeline::_make_room() {
-	if (_entries.size() < QUEUE_CAPACITY) { return; }
+	if (int(_entries.size()) < _queue_limit.load(std::memory_order_relaxed)) { return; }
 	int oldest = -1;
 	for (size_t i = 0; i < _entries.size(); ++i) {
 		if (!_entries[i].ready) { continue; }
@@ -286,7 +286,7 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 			// immediately after prime. Evicting those here repeatedly prepares the
 			// same pages and delays nearby detail. Consumption opens the slots for
 			// the bounded refill later in this pass.
-			if (_entries.size() >= QUEUE_CAPACITY) { break; }
+			if (int(_entries.size()) >= _queue_limit.load(std::memory_order_relaxed)) { break; }
 			const uint64_t token = ++_token;
 			_entries.push_back(Entry{request, source, {}, token});
 			_claim_order.push_back(request.key);
@@ -335,7 +335,7 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 	// A poll that finds nothing submits the request, but it never evicts: the caller walks
 	// its whole demand list, so evicting here would replace the work in flight with the far
 	// end of that list and throw away every result the workers had just finished.
-	if (_entries.size() < QUEUE_CAPACITY) {
+	if (int(_entries.size()) < _queue_limit.load(std::memory_order_relaxed)) {
 		const uint64_t token = ++_token;
 		_entries.push_back(Entry{request, std::move(source), {}, token});
 		_claim_order.push_back(request.key);

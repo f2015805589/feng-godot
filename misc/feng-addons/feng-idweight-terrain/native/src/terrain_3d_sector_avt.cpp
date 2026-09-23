@@ -19,6 +19,7 @@
 
 #include "terrain_3d.h"
 #include "terrain_3d_avt_plan.h"
+#include "terrain_3d_surface_baker.h"
 #include "terrain_3d_vt_visibility.h"
 
 #include <godot_cpp/classes/engine.hpp>
@@ -229,6 +230,25 @@ int Terrain3D::_avt_tick_allowance() const {
 	return has_svt_delivery() ? MAX(1, remaining / 2) : remaining;
 }
 
+// The burst's half of the same split. It is a *rate* on top of the steady allowance and never a
+// replacement for it: a burst asks for `AVT_COLD_BURST_FACTOR` times the configured page budget,
+// bounded by what one pass may be handed and never below the steady share the far field's split
+// already reserved. Off in the diagnostic direct-material mode, whose budget is pinned to four
+// pages so the diagnostic measures what it always measured.
+int Terrain3D::_avt_burst_allowance() const {
+	if (_vt.avt_cold_burst_ticks <= 0 || _vt.vt_debug_direct_material) { return 0; }
+	return avt_cold_burst_allowance(_vt.vt_pages_per_update, _avt_tick_allowance(), _vt.avt_cold_burst_ticks);
+}
+
+// The shared rate the burst moves. The producer admits this many page *writes* per displayed
+// frame and the source queue holds this many prepared pages; the near field's own allowance is the
+// third reader. All three are the same decision - how fast this view is filled - so they are spelled
+// once. The steady value is the configured budget, which is what the producer has always been given.
+int Terrain3D::_avt_page_budget() const {
+	const int burst = _avt_burst_allowance();
+	return burst > 0 ? burst : MAX(1, _vt.vt_pages_per_update);
+}
+
 void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distances) {
 	PackedFloat32Array normalized;
 	for (int i = 0; i < MIN(16, int(p_distances.size())); ++i) {
@@ -271,6 +291,33 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	if (!_vt.surface_vt || !_data || !_vt.vt_shared_ready || !get_camera()) { return 0; }
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	_vt.avt_sector_ticks++;
+	// One tick of the cold-view burst is spent here, before the pass it pays for. The burst is armed
+	// by the motion sampler where it recognises a cut (`_vt_arm_cold_view()`) and re-armed by the
+	// production pass for as long as the plan the cut installed is still mostly missing, so counting
+	// it down on the tick rather than on the pass keeps a burst from lasting longer than the ticks it
+	// names. The rate the three consumers read is refreshed here too: the producer's frame budget and
+	// the source queue window are not re-published by anything else while a plan is being produced.
+	if (_vt.avt_cold_burst_ticks > 0) { --_vt.avt_cold_burst_ticks; }
+	const bool source_fallback = _vt.avt_cold_source_fallback;
+	const int page_budget = _avt_page_budget();
+	// While the source fallback is on the parameter is re-published every tick: the shader's copy is
+	// a material parameter, and a material rebuilt in the middle of a cold view would come back with
+	// the default. The window is a few dozen ticks at most, and a parameter write is not a cost worth
+	// guarding against. The rate the producer's frame budget and the source queue window read is
+	// published once when either it or the flag moves.
+	if (page_budget != _vt.avt_page_budget_applied || source_fallback || _vt.avt_cold_source_published) {
+		if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+			producer->set_page_budget(page_budget);
+		}
+		if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->set_queue_limit(page_budget); }
+		if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->set_queue_limit(page_budget); }
+		if (_material.is_valid()) {
+			RS->material_set_param(_material->get_material_rid(), "_avt_cold_source_fallback", source_fallback);
+		}
+		_vt.avt_page_budget_applied = page_budget;
+		_vt.avt_cold_source_published = source_fallback;
+	}
+	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_peak = MAX(_vt.avt_burst_peak, page_budget); }
 	// Fine eligibility follows the rendered frustum, as does the Inspector preview.
 	// Keep motion tracking for refresh diagnostics, without excluding current cells
 	// when a predicted turn points away from them.
@@ -655,6 +702,13 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 				}
 			}
 			const int selected = int(_vt.avt_refinement->pages.size());
+			// A plan that mostly names ground the previous one did not is a view nothing has produced
+			// for: a snap turn, a teleport, a camera that left the working set. The motion sampler arms
+			// the same cold state where it recognises the cut itself; this arms it from the plan, so a
+			// cut that fell inside one refresh interval, or that was not a rotation at all, is covered
+			// too. A moving camera's consecutive plans overlap heavily - `carried` is most of the
+			// selection - so ordinary streaming never reaches the threshold.
+			if (selected > 0 && selected - carried > selected / 2) { _vt_arm_cold_view(); }
 			_vt.avt_sector_stats["plan_selected"] = selected;
 			_vt.avt_sector_stats["plan_carried"] = carried;
 			_vt.avt_sector_stats["plan_overlapped"] = overlapped;
@@ -861,6 +915,18 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	// term is sized against, so a probe that reports `avt_tail_cap` without them cannot say what
 	// the plan was measured against.
 	result["avt_allowance"] = _avt_tick_allowance();
+	// The cold-view burst: whether one is armed, what rate it asks for, and what it has done. The
+	// steady allowance and the configured page budget are beside them, so a reading of "the burst
+	// never armed" and "the burst armed and moved nothing" are told apart.
+	result["avt_cold_burst_ticks"] = _vt.avt_cold_burst_ticks;
+	result["avt_cold_burst_allowance"] = _avt_burst_allowance();
+	result["avt_cold_burst_peak"] = _vt.avt_burst_peak;
+	result["avt_cold_burst_pages"] = _vt.avt_burst_pages;
+	result["avt_cold_source_fallback"] = _vt.avt_cold_source_fallback;
+	result["avt_page_budget"] = _avt_page_budget();
+	result["avt_page_budget_steady"] = _vt.vt_pages_per_update;
+	result["avt_source_queue_limit"] = _vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_queue_limit()
+			: int(Terrain3DPagePipeline::QUEUE_CAPACITY);
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.
 	result["avt_distance"] = _vt.surface_vt_distance;
 	result["avt_texels_per_meter"] = get_surface_vt_texels_per_meter();

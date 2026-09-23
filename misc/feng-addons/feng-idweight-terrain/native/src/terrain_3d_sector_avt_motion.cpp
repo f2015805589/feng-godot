@@ -130,6 +130,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_last_chain_frame = UINT64_MAX;
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
+				_vt_arm_cold_view();
 			} else {
 				Vector2 velocity = displacement / delta;
 				if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
@@ -156,6 +157,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_last_chain_frame = UINT64_MAX;
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
+				_vt_arm_cold_view();
 			} else {
 				Vector3 turn = cross.length() > 1e-6f ? cross.normalized() * (step / delta) : Vector3();
 				if (turn.length() > MOTION_MAX_TURN_RATE) { turn = turn.normalized() * MOTION_MAX_TURN_RATE; }
@@ -204,6 +206,21 @@ void Terrain3D::_vt_update_motion_lead() {
 	// phase budgets on its own, on every frame of a turn. Derived from the lead rather than set
 	// separately, so there is one number for how far ahead the plan looks.
 	_vt.avt_plan_refresh_frames = uint64_t(CLAMP(int(float(_vt.vt_motion_lead_ms) / 16.7f) / 2, 2, 8));
+}
+
+// A cut - a snap turn, a teleport, a camera that crossed the working-set window in one interval -
+// leaves a view nothing has produced for. The plan that a cut submits is installed a tick or two
+// later and is almost entirely missing, and the shader draws it through the independent fallback,
+// which is one texel per metre: at a 1080p footprint that is a flat smear, and it is what a turn is
+// reported to show for as long as the plan takes to fill. Arm the two things that answer it here,
+// where the cut is recognised: the bounded production burst that fills the plan in a few ticks, and
+// the source fallback that draws the fragments the pages cannot serve yet. The burst is re-armed by
+// the production pass while the plan is still mostly missing and the fallback lasts until it is
+// served, so neither outlives the cold view; an ordinary moving camera never arms either.
+void Terrain3D::_vt_arm_cold_view() {
+	_vt.avt_burst_from_cut = true;
+	_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
+	_vt.avt_cold_source_fallback = true;
 }
 
 Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_transform) const {

@@ -50,7 +50,12 @@ uint64_t avt_page_age_key(const Terrain3DAVTPageRequest &p_page) {
 // per tick rather than once per caller.
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (p_max_pages == 0) { return 0; }
-	p_max_pages = p_max_pages < 0 ? 16 : MIN(p_max_pages, 16);
+	// The steady caller passes the near field's share of `vt_pages_per_update`; a cold-view burst
+	// passes its own rate, up to `AVT_PAGE_BUDGET_CEILING`. The clamp only bounds the burst - the
+	// steady path's allowance is already below it - and a negative budget keeps its old meaning of
+	// "the default window".
+	const int ceiling = _vt.avt_cold_burst_ticks > 0 ? MAX(16, _avt_burst_allowance()) : 16;
+	p_max_pages = p_max_pages < 0 ? 16 : MIN(p_max_pages, ceiling);
 	const auto pool = _vt.surface_vt->get_page_pool();
 	// A repeated plan with nothing left to upload still has to re-mark its resident
 	// pages as demanded, or the pool evicts them while the camera is stationary.
@@ -73,6 +78,17 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		idle_lost = idle_producer->count_unready_pages(_vt.avt_settled.slots);
 	}
 	if (idle_candidate && idle_lost == 0) {
+		// A settled view is served by definition, so this is where a cold view's burst and its source
+		// fallback end when the plan fills without the pass ever seeing a missing page: the shortcut
+		// returns before the classification the clear below is written against, and a flag left on
+		// here would keep drawing under-served fragments from the source for the rest of the session.
+		// Not while the burst still has ticks to run, though: the tick a cut lands on still holds the
+		// *previous*, settled plan, so clearing here would end the fallback in the same tick the cut
+		// armed it and the cut's own plan would never be drawn with it.
+		if (_vt.avt_cold_burst_ticks <= 0) {
+			_vt.avt_burst_from_cut = false;
+			_vt.avt_cold_source_fallback = false;
+		}
 		for (int slot : _vt.avt_settled.slots) { pool->mark_demanded(slot); }
 		// Only the first tick of an idle run publishes: every value below is a constant of
 		// the settled state, and rewriting the same numbers into a String-keyed dictionary
@@ -148,6 +164,37 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	_avt_produce_prefetch(pass, p_max_pages);
 	_avt_finish_produce(pass);
 	mark("finish_ms", _vt.avt_finish_sum_ms);
+	// A cold view - a cut, a teleport, or a plan that mostly names ground the previous one did not -
+	// is what arms this (`_vt_arm_cold_view()`, called from the motion sampler and from the plan
+	// installer): nothing has produced for that view yet, and the shader draws it through the
+	// independent fallback until the plan is filled. The burst is re-armed here, on the pass that
+	// measures how cold the view still is, so it lasts exactly as long as that holds and expires
+	// without a timer to keep in step with the plan. An ordinary moving view never arms it: its plan
+	// is mostly carried from the last one, so the pages it is missing are the ones the steady rate
+	// already covers, and a burst there would be churn.
+	if (_vt.avt_burst_from_cut) {
+		if (pass.sampled_plan > 0 &&
+				pass.sampled_missing > int(float(pass.sampled_plan) * AVT_COLD_BURST_MISSING_FRACTION)) {
+			_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
+		} else if (_vt.avt_cold_burst_ticks <= 0) {
+			_vt.avt_burst_from_cut = false;
+		}
+	}
+	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_pages += pass.produced; }
+	// The source fallback's own window is the *serving* one, not the burst's: it must not expire on
+	// a clock while the image is still sampling content the pages cannot stand behind. It hands over
+	// per fragment as the pages that serve them arrive (the shader's texel tolerance), and it ends on
+	// the first pass after the burst whose sampled pages all have content *and* whose arrival ramps
+	// have finished: a page that has landed but is still ramping in is drawn as the level it replaced,
+	// which is one of the three states the fallback exists to cover. The burst has to have run out
+	// first: the tick a cut lands on still classifies the *previous*, settled plan, which reports
+	// nothing missing, and clearing the flag there would end the fallback before the cut's own plan
+	// exists.
+	if (_vt.avt_cold_source_fallback && _vt.avt_cold_burst_ticks <= 0 && pass.sampled_plan > 0 &&
+			pass.sampled_missing == 0 && pass.sampled_pending == 0 &&
+			_vt.fade.pending == 0 && _vt.fade.held == 0 && _vt.fade.active == 0) {
+		_vt.avt_cold_source_fallback = false;
+	}
 	// The stage sums and the count they are summed over, so `report()` can difference two readings
 	// and state the mean of one sweep. The live keys above describe the last pass only.
 	_vt.avt_pass_count++;
@@ -302,15 +349,22 @@ Terrain3DPagePipeline::Request Terrain3D::_avt_page_request(const Terrain3DAVTPa
 // a queue the workers are still working through is not re-scanned and re-inserted into - which
 // measured as ~0.15 ms of a peak tick, almost all of it waiting for the queue's mutex.
 void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const int p_refill_above, const bool p_refill) {
-	if (p_refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= p_refill_above) { return; }
+	if (!_vt.vt_page_pipeline) { return; }
+	// The window the workers may hold prepared pages in is the rate the tick was given, and it moves
+	// with the cold-view burst (`_avt_page_budget()`). Both bounds below read it: how deep the queue
+	// has to be before a refill is worth the queue mutex, and how many requests one fill may insert.
+	// At the steady window the two resolve to the values they always had.
+	const int window = _vt.vt_page_pipeline->get_queue_limit();
+	const int refill_above = p_refill_above > 0 ? MAX(p_refill_above, window / 2) : 0;
+	if (refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= refill_above) { return; }
 	std::vector<Terrain3DPagePipeline::Request> requests;
-	requests.reserve(32);
+	requests.reserve(size_t(window));
 	// The readiness snapshot may skip unfinished pages before reaching the end.
 	// Refill those holes too; successfully consumed requests are cleared below.
 	for (size_t i = p_refill ? 0 : p_pass.missing_next; i < p_pass.missing.size(); ++i) {
 		if (!p_pass.missing[i]) { continue; }
 		requests.push_back(_avt_page_request(*p_pass.missing[i]));
-		if (requests.size() == 32) { break; }
+		if (int(requests.size()) >= window) { break; }
 	}
 	if (requests.empty()) { return; }
 	_vt.vt_page_pipeline->prime(requests, _vt.vt_source_snapshot);
