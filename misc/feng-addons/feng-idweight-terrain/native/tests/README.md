@@ -1469,3 +1469,67 @@ the entry built makes the view appear on the same poll - read from
 `clipmap_preview_calls`/`..._computed` and `avt_preview_calls`/`..._computed`, which separate an ask
 that was refused from one that did the work.
 
+## 1024 texels/m clipmap material density acceptance
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_clipmap_density_runner.py --driver d3d12 --resolution 1920x1080
+```
+
+`vt_clipmap_density` is the acceptance test the plan's section 6 asks for: with
+`vt_delivery_near_material = Clipmap`, the near ground a 1080p gameplay view samples has to deliver
+**1024 texels/m** - a texel no wider than 1/1024 m - and it has to be the material a fragment
+samples, not a setting or an allocation. The earlier clipmap tests stop at the ring's *source*
+grid (one texel per metre) or at a density matched to the far field; none of them measures the
+number the plan accepts the feature on, and the AVT probe (`vt_near_density`) proves a different
+tier.
+
+The pose is the project's convention: a 1.7 m eye pitched 8 degrees down, 1920x1080 through the
+runner's `--resolution`, over blank 64 m regions. The probe point is the ground 1.6 m in front of
+the camera. The coarse ring is configured at a sane density - 256 texels over 256 m, four levels -
+rather than shrunk to a fraction of a metre: the plan is explicit that a small `vt_clipmap_base_world`
+makes level 0 dense but a quarter of a metre wide, so the acceptance has to come from the plan's
+stage 2 detail layer, and the coarse ring only has to be a correct fallback.
+
+Five readings:
+
+* **Delivered density** at the probe point, and the **hit rate** over every on-screen ground point
+  within 8 m of the camera (the visible high-demand region). Delivered is a resident detail tile if
+  the report publishes one, otherwise the finest *baked* coarse ring level whose square contains
+  the point, `size / (base_world * 2^level)`; the requested density, missing tiles, fallback count
+  and cache bytes come from `get_vt_settings()`. The assertions are `delivered >= 1024` and
+  `hit rate >= 0.90` (the chosen floor - nine of ten visible near points), repeated after a camera
+  move. Their failure text is `密度未达标` so a failing log names the acceptance.
+* **A shader source probe** that tells the three sources apart in one screen readback. The payload
+  fallback is bound blue through every door it can come from (the region texture array, the AVT page
+  array and the SVT page array), so a blue patch is the payload evaluation serving the fragment;
+  anything else is the ring's own baked layers. The coarse/detail split of that reading comes from
+  the level and density the report publishes, and from `_clipmap_detail_albedo` (bound green) on a
+  build that gives the detail layer separate samplers - the contract this test imposes on such a
+  build. The coarse baked layers are deliberately not repainted: `_clipmap_baked_albedo` is bound by
+  the addon as the ring's own two-group array on every uniform republication, and an override was
+  measured to sample black and force the fallback, which would make the probe measure itself. The
+  readings are taken with the terrain's tick frozen, because the far field's page-arrival fade
+  republishes the material's textures every frame it runs. Deselecting the ring must read blue and
+  the coarse-only ring must read the ring's own material, or a detail reading would mean nothing.
+* **The operations**, judged against the array path's own render or the render before them: a draw
+  edit, a material-albedo replacement (updated in place - an asset swap with the far field up was
+  measured to leave the renderer without a uniform set for several frames, an engine error the
+  harness forbids), a patch straddling a material boundary, and `surface_array_enabled = false`. The
+  mean channel difference over the patch must stay under 0.06 (a whole 8-bit material step) where the
+  two paths must agree, and must exceed it where an edit or a replacement has to reach the screen.
+* **Both far-field configurations**: `Clipmap` with the far field `Direct` (the ring stands alone,
+  the plan's stage 1) and with the far field `SVT` (the shared producer is up). The source and
+  density probes run in both; the operations run with the far field up, the only configuration in
+  which a bake exists before the stage 1 change.
+
+**Expected behaviour before the fix: fail, with clear evidence.** The detail layer does not exist
+yet, so on a pre-merge binary the delivered density is the coarse ring's 1 texel/m, the hit rate is
+0, the detail reading never appears, and with the far field `Direct` the ring produces all its
+levels but nothing bakes them (the shader's readiness table refuses every fragment and the region
+array serves). The test prints every reading under `CLIPMAP_DENSITY` and its failures say which half
+is missing; the runner prints the raw log path in `LOG=`. After stage 1 and stage 2 it must pass. A
+material replacement not reaching the ring's baked layers is a stage 3 failure and is asserted too.
+The recorded pre-fix evidence is in
+`native/tests/baselines/clipmap-material-baseline-2026-09-23.md`.
+
+
