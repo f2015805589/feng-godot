@@ -546,6 +546,10 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 			// The *rect's* lease, not a fresh one from the level: it is the content this rect holds, and
 			// the ring accepts the bake only while the rect still carries it.
 			job.lease = rect.lease;
+			// The material list this offer was made under. The dispatch reads whatever list the
+			// buffer holds, so a rect collected before a replacement is dropped rather than baked
+			// with the new materials and reported as the old rect's content.
+			job.material_version = _material_version;
 			job.texel = p_ring->get_texel_world(rect.level);
 			// The level's world origin, which with its texel size is the whole of what the shader needs
 			// to turn a *stored* texel back into the world position it stands for.
@@ -576,8 +580,15 @@ int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
 	RID job_buffer;
 	int size = 0;
 	int material_count = 0;
+	uint64_t material_version = 0;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		// A set that names a bundle this callback just replaced would dispatch against a freed job
+		// buffer. Nothing is drained: the next offer rebuilds the set from the live bundle and
+		// collects the ring's rects again, because the ring never acknowledged them.
+		if (_ring_bake.job_buffer != _resources.job_buffer) {
+			return 0;
+		}
 		if (_ring_bake.queued.empty()) {
 			return 0;
 		}
@@ -586,10 +597,18 @@ int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
 		set = _ring_bake.uniform_set;
 		size = _ring_bake.size;
 		material_count = _material_count;
+		material_version = _material_version;
 		// The set's own buffer, not the bundle's: they are the same resource or the set is stale, and
 		// `_ensure_ring_bake()` is where that is decided.
 		job_buffer = _ring_bake.job_buffer;
 	}
+	// A rect offered under a material list that has since been replaced is not a rect this dispatch
+	// can cover: the layers it would write evaluate the *new* list, while the ring would be told the
+	// bake describes the content it queued under the old one. Dropping it is what makes the material
+	// generation a discard rather than a mislabel; the ring keeps the rect and re-offers it.
+	jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+					  [material_version](const RingJob &p_job) { return p_job.material_version != material_version; }),
+			jobs.end());
 	// No material list means the shader would invalidate every output instead of baking it, and a
 	// dispatch that wrote black into a level must not be allowed to mark it baked: nothing is
 	// dispatched, and the levels come back through the next offer.
@@ -704,7 +723,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	// with a set the device no longer has: the renderer reports that as a null uniform set on
 	// the bind and a missing set 0 on the dispatch. Reporting the materials as stale as well
 	// asks the caller for the current pair, which is what makes the rebuild bind live arrays.
-	if (_resources.pipeline.is_valid() && !_resources.uniform_set.is_valid()) {
+	// A ring-only bundle owns no page uniform set at all, so the state below is its normal one
+	// and not a reason to report the materials stale.
+	if (!_ring_only.load() && _resources.pipeline.is_valid() && !_resources.uniform_set.is_valid()) {
 		std::lock_guard<std::mutex> lock(_mutex);
 		_materials_dirty = true;
 		_materials_stale = true;
@@ -754,7 +775,13 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		return;
 	}
 	if (materials_dirty) {
-		if (!_upload_materials(material_bytes) || !_rebuild_uniform_set(_resources, material_albedo, material_normal)) {
+		// The material list is uploaded in both shapes: a ring-only bundle's bake reads it out of
+		// the same buffer, and the page uniform set that names it is the only part a ring-only
+		// bundle does not have.
+		const bool uploaded = _upload_materials(material_bytes);
+		const bool bound = uploaded && (_ring_only.load() ||
+				_rebuild_uniform_set(_resources, material_albedo, material_normal));
+		if (!bound) {
 			std::lock_guard<std::mutex> lock(_mutex);
 			// The snapshot named an array the asset system already replaced and freed. Forget
 			// the cached pair so no later snapshot repeats it, and report the staleness: the
@@ -781,18 +808,22 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 	// empty batch, so a ring baked after it would only ever bake on frames the pages did.
 	_dispatch_ring_bake();
 
-	// Material updates invalidate every old result, but a newer operation for a slot	// supersedes that invalidation.  Keeping one operation per slot also avoids races
-	// between two z slices of the compute dispatch.
-	std::vector<PendingJob> jobs = _build_frame_jobs(pending, invalidate_all, generation, page_count);
+	// A ring-only bundle has no page arrays and no page uniform set, so the page batch below has
+	// nothing it could dispatch into. The ring's bake above is the frame's whole device work.
+	if (!_ring_only.load()) {
+		// Material updates invalidate every old result, but a newer operation for a slot	// supersedes that invalidation.  Keeping one operation per slot also avoids races
+		// between two z slices of the compute dispatch.
+		std::vector<PendingJob> jobs = _build_frame_jobs(pending, invalidate_all, generation, page_count);
 
-	if (!_dispatch_frame_jobs(jobs, generation, material_version, page_count, page_size, border,
-				stored_size, material_count, invalidate_all, cell_store.ptr())) {
-		return;
-	}
-	if (requested_capacity > page_count) {
-		// Migrate after this frame's writes so both the still-bound old arrays and
-		// the newly published arrays contain the same completed page contents.
-		_ensure_resources(generation, requested_capacity, stored_size, material_albedo, material_normal, material_bytes);
+		if (!_dispatch_frame_jobs(jobs, generation, material_version, page_count, page_size, border,
+					stored_size, material_count, invalidate_all, cell_store.ptr())) {
+			return;
+		}
+		if (requested_capacity > page_count) {
+			// Migrate after this frame's writes so both the still-bound old arrays and
+			// the newly published arrays contain the same completed page contents.
+			_ensure_resources(generation, requested_capacity, stored_size, material_albedo, material_normal, material_bytes);
+		}
 	}
 }
 
@@ -1010,8 +1041,11 @@ Ref<Image> Terrain3DSurfaceBaker::get_page_preview(int p_slot) const {
 
 bool Terrain3DSurfaceBaker::has_render_work() const {
 	std::lock_guard<std::mutex> lock(_mutex);
+	// A queued ring rect is device work with no page behind it: a ring-only configuration has an
+	// empty `_pending` and still needs the render callback to run, so it is part of this answer.
 	return _configured && (!_pending.empty() || _invalidate_all || _materials_dirty || _materials_stale ||
-			_requested_capacity > _page_count || !_retired.empty() || _retire_ready);
+			_requested_capacity > _page_count || !_retired.empty() || _retire_ready ||
+			!_ring_bake.queued.empty());
 }
 
 Dictionary Terrain3DSurfaceBaker::get_stats() const {

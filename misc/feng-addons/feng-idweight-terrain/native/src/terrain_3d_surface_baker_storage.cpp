@@ -40,8 +40,12 @@ using namespace terrain_surface_baker;
 // CPU queue and uploads
 ///////////////////////////
 
-void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_count) {
+void Terrain3DSurfaceBaker::configure(int p_page_size, int p_border, int p_page_count, bool p_ring_only) {
 	std::lock_guard<std::mutex> lock(_mutex);
+	// Which shape the next bundle is built for. A ring-only configuration allocates the bake core
+	// and none of the page arrays; a page bundle serves the ring's bake as well, so this is set
+	// from the delivery matrix and not inferred from a page count.
+	_ring_only.store(p_ring_only);
 	_page_size = std::max(1, p_page_size);
 	_border = std::max(0, p_border);
 	_page_count = std::max(1, p_page_count);

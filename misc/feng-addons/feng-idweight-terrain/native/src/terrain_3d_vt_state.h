@@ -611,6 +611,12 @@ struct Terrain3DVTState {
 	Dictionary vt_editor_dirty_regions;
 	uint64_t vt_service_frame = UINT64_MAX;
 	bool vt_shared_ready = false;
+	// True while the shared service was built for the ring's bake alone: no paged tier is selected,
+	// so the producer owns the bake shader, the material list and the job buffer but none of the
+	// page arrays. A page selected later moves the service to the page bundle (see
+	// `_configure_vt_service()`), and a page bundle serves a ring as well, so that is the only
+	// direction a rebuild is needed in.
+	bool vt_ring_only = false;
 	bool vt_materials_dirty = true;
 	// Whether a material list has been asked for on behalf of a *ring* already. `_setup_vt_clipmap()`
 	// runs on every write to the matrix, and a ring that declares baked layers needs the list published

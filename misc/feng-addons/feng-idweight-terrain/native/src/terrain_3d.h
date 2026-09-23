@@ -805,7 +805,15 @@ public:
 	// service delivers the diffuse/normal group: with the group direct the array is its only
 	// source, and a blank array would render every texel as material 0.
 	bool is_surface_array_upload_needed() const {
-		return is_vt_editor_preview_active() || _vt.surface_array_enabled || !group_has_vt_delivery(TerrainVT::ChannelGroup::Material);
+		return is_vt_editor_preview_active() || _vt.surface_array_enabled ||
+				!group_has_vt_delivery(TerrainVT::ChannelGroup::Material) ||
+				// A material group the ring carries still has fragments its baked layers cannot
+				// answer - outside the band, and every rect the CPU side is producing or the bake
+				// has not covered - and those fall back to the payload evaluation, whose control
+				// texel is the region array. Stopping the array upload for a group only the paged
+				// tiers carry would be correct; doing it for the ring would render material 0 for
+				// every fallback fragment.
+				clipmap_arm_used(TerrainVT::ChannelGroup::Material);
 	}
 	// Whether the generated shader carries a virtual-texture arm at all. A group that a service
 	// does not carry is sampled from the region arrays, and that arm contributes no code, no

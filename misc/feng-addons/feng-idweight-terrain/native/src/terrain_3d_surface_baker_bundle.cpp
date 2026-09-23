@@ -25,6 +25,8 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 
+#include <algorithm>
+
 // The codec vocabulary, the shared constants and the small helpers of the halves; see
 // terrain_3d_surface_baker_internal.h for what it holds and why it is a header.
 using namespace terrain_surface_baker;
@@ -151,6 +153,7 @@ void Terrain3DSurfaceBaker::clear() {
 		_resources = ResourceBundle();
 		_resource_generation = 0;
 		_configured = false;
+		_ring_only.store(false);
 		_pending.clear();
 		_ready.clear();
 		_sampled_channel_mask.clear();
@@ -268,20 +271,14 @@ void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t
 	}
 }
 
-// Creates every texture and sampler of one bundle, and validates them. The bundle is passed in
-// rather than returned so a failure frees it in place: the caller has nothing to adopt either way.
-// The three compressed tiers are built first, because whether the half-float staging arrays are
-// page sized or only as deep as the encoder ring depends on which of them resolved - see the
-// comment on `_staging_layers` below.
-bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, const int p_stored_size,
-		const int p_page_count) {
+// The producer's core, and the whole point of the split: a page and a ring bake read the same
+// shader, the same material table, the same job buffer and the same samplers, and none of those is
+// a page array. Building them here is what lets `queue_clipmap_ring()` and `render_pending()` work
+// in a configuration whose material group takes no page at all.
+bool Terrain3DSurfaceBaker::_create_bake_core_resources(ResourceBundle &r_next,
+		const PackedByteArray &p_material_bytes, const int p_page_count) {
 	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
-	const uint64_t output_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
-			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT |
-			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
-			RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT |
-			RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 	PackedByteArray dummy_albedo;
 	dummy_albedo.resize(4);
 	dummy_albedo[0] = 255;
@@ -302,13 +299,40 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 			RenderingDevice::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE, 0.0f);
 	r_next.sampler_linear = _create_sampler(_rd, RenderingDevice::SAMPLER_FILTER_LINEAR,
 			RenderingDevice::SAMPLER_REPEAT_MODE_REPEAT, 1000.0f);
+	PackedByteArray initial_materials = p_material_bytes;
+	if (initial_materials.size() != MATERIAL_COUNT * MATERIAL_STRIDE) {
+		initial_materials.resize(MATERIAL_COUNT * MATERIAL_STRIDE);
+		for (int64_t i = 0; i < initial_materials.size(); i++) {
+			initial_materials[i] = 0;
+		}
+	}
+	r_next.material_buffer = _rd->storage_buffer_create(uint32_t(initial_materials.size()), initial_materials);
+	r_next.job_buffer = _rd->storage_buffer_create(uint32_t(std::max(1, p_page_count) * JOB_STRIDE));
+	if (!r_next.dummy_albedo_rd.is_valid() || !r_next.dummy_normal_rd.is_valid() ||
+			!r_next.sampler_nearest.is_valid() || !r_next.sampler_linear.is_valid() ||
+			!r_next.material_buffer.is_valid() || !r_next.job_buffer.is_valid() ||
+			!_compile_pipeline(r_next)) {
+		_free_bundle(_rd, r_next);
+		LOG(ERROR, "Could not allocate the surface bake core resources");
+		return false;
+	}
+	// The encoder's output region is a function of the stored page size, and every codec it
+	// implements writes at most four words per block. Recorded here because the page half and the
+	// ring's ceiling both read it.
+	_encode_region_bytes = ((_stored_size + 3) / 4) * ((_stored_size + 3) / 4) * 4 * int(sizeof(uint32_t));
+	_encode_region_words = _encode_region_bytes / int(sizeof(uint32_t));
+	_rd->set_resource_name(r_next.job_buffer, "Surface VT Jobs (64 bytes: world rect, texel size, slot, mode)");
+	_rd->set_resource_name(r_next.material_buffer, "Surface VT Material Parameters");
+	_rd->set_resource_name(r_next.shader, "Surface VT Page Baker");
+	return true;
+}
+
+// The page half, and only the page half: everything whose shape is a page. A ring-only bundle
+// never reaches this function, which is what keeps its allocation to the core above.
+bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const int p_stored_size,
+		const int p_page_count) {
 	// Compressed copies are channel independent. A raw channel keeps sampling its canonical
 	// staging array, while the block encoder fills only the targets its mask names.
-	//
-	// The encoder's output region is a function of the stored page size, and every codec it
-	// implements writes at most four words per block.
-	_encode_region_bytes = ((p_stored_size + 3) / 4) * ((p_stored_size + 3) / 4) * 4 * int(sizeof(uint32_t));
-	_encode_region_words = _encode_region_bytes / int(sizeof(uint32_t));
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		_tiers[tier].applied.store(0);
 		_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
@@ -407,6 +431,13 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 	_encode_ring_allocated.store(_encode_ring_depth_ceiling());
 	_staging_layers = _staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count;
 	_refresh_encode_ring_capacity();
+	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	const uint64_t output_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
 			_staging_layers, sampled_usage);
 	r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
@@ -417,9 +448,7 @@ bool Terrain3DSurfaceBaker::_create_bundle_resources(ResourceBundle &r_next, con
 			p_stored_size, _staging_layers, output_usage);
 	r_next.output_params_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
 			p_stored_size, _staging_layers, output_usage);
-	if (!r_next.dummy_albedo_rd.is_valid() || !r_next.dummy_normal_rd.is_valid() ||
-			!r_next.sampler_nearest.is_valid() || !r_next.sampler_linear.is_valid() ||
-			!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid() ||
+	if (!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid() ||
 			!r_next.output_albedo_rd.is_valid() || !r_next.output_normal_rd.is_valid() ||
 			!r_next.output_params_rd.is_valid()) {
 		_free_bundle(_rd, r_next);
