@@ -452,23 +452,20 @@ private:
 	// positions than the scratch regime can, and the byte ceiling below is what bounds that
 	// case.
 	static constexpr int ENCODE_PAGES_MIN = 8;
-	static constexpr int ENCODE_PAGES_MAX = 512;
+	static constexpr int ENCODE_PAGES_MAX = 256;
 	static constexpr int ENCODE_READBACK_FRAMES = 2;
 	// The same ring is the staging pool under the scratch regime, so its depth is bounded by
 	// bytes rather than by pages: this is the ceiling a derived depth may cost.
 	//
-	// It is what decides the rate a cold view is filled at, and it is the whole of that decision:
-	// a page's regions are held for `ENCODE_READBACK_FRAMES` frames, so the ring finishes
-	// `depth / ENCODE_READBACK_FRAMES` pages a frame whatever the caller's budget asks for. At the
-	// shipped 96 MiB the ceiling resolved to 43 positions on the reference project and the near
-	// field finished 96 pages a frame - 192 admitted over two frames - which is what made a snap
-	// turn's 752 page plan take twenty frames to become acceptable however much of it was admitted
-	// per tick. Sized here so the deepest ring the rest of the design allows is what a burst meets:
-	// `_encode_ring_depth_ceiling()` also clamps to `page_count / 2`, so the reference project's
-	// 1024 slot pool resolves to 512 positions and 256 finished pages a frame. Measured cost on the
-	// reference project: `_encode_page_bytes()` is ~2.12 MB, so 512 positions is ~1.1 GB of staging
-	// and encoder regions, against ~91 MB at 43.
-	static constexpr int64_t ENCODE_RING_BUDGET_BYTES = 1280 * 1024 * 1024;
+	// It is a *staging* bound, not a rate. The rate is `AVT_PAGE_BATCH_MAX` and the producer's
+	// frame budget, which is what the tick hands the near field; the ring only has to be deep
+	// enough to hold the pages the batch and the far field put in flight for the two frames the
+	// readback takes, and `_derive_encode_ring_pages()` sizes it from exactly that. Deepening it
+	// to raise the rate was tried and is a bypass of the batch bound, not a mechanism: it buys
+	// throughput the batch is supposed to bound. Measured cost at the shipped value on the
+	// reference project: `_encode_page_bytes()` is ~2.12 MB, so the ~43 positions it resolves to
+	// are ~91 MB of staging and encoder regions.
+	static constexpr int64_t ENCODE_RING_BUDGET_BYTES = 96 * 1024 * 1024;
 	static constexpr int ENCODE_CHANNELS = 3;
 	// `_slot_scratch` entry of a slot that has no ring page: either the page is not produced
 	// yet, or the arrays are page sized and the slot names its own layer.

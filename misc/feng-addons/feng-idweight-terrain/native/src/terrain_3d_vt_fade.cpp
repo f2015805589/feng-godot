@@ -74,20 +74,12 @@ void Terrain3D::_update_vt_page_fade() {
 	const Terrain3DVirtualTexture *fade_view = _vt.surface_vt ? _vt.surface_vt : _vt.surface_svt;
 	if (fade_view == nullptr) { return; }
 	const int slots = MAX(1, fade_view->get_page_count());
-	// The ramp length. A cold view is filled by a production burst whose whole point is that the
-	// ground stops being a one-texel-per-metre smear within a few frames, and a page that has arrived
-	// but is still ramping is drawn as the level it replaced for the length of the ramp. While the
-	// cut's cold episode lasts the ramp is shortened to `AVT_COLD_BURST_FADE_FRAMES`, which is zero:
-	// every page of the view arrives in the same few frames, so the blend that hides one page's step
-	// behind its resident ancestor is applied to the whole footprint at once and the ground stays at
-	// the level it left until the last page's ramp has run. The window is the *episode*, not the
-	// burst: the pages arrive over the frames the burst runs and the one or two after it, and a page
-	// that arrives after the rate has been restored would otherwise take the full ramp and hold the
-	// last of the ground soft for a second. The setting is untouched and a settled or ordinary moving
-	// view ramps at its full length again. See `AVT_COLD_BURST_FADE_FRAMES`.
-	const int frames = MAX(1, _vt.avt_burst_from_cut
-			? MIN(_vt.vt_page_fade_frames, AVT_COLD_BURST_FADE_FRAMES)
-			: _vt.vt_page_fade_frames);
+	// The ramp length: the configured setting, in ticks. It is never shortened any more. A cold
+	// view used to switch it off for the frames a cut's plan was filling, which bought the whole
+	// convergence window at the cost of a step wherever an arrived page met one still missing; the
+	// rate (`AVT_PAGE_BATCH_MAX`) and the shader's recursive mip lookup are what serve that window
+	// now, and the blend is left doing the one job it exists for.
+	const int frames = MAX(1, _vt.vt_page_fade_frames);
 	if (_vt.fade.queue.capacity() != size_t(slots)) {
 		_vt.fade.queue.resize(size_t(slots));
 	}

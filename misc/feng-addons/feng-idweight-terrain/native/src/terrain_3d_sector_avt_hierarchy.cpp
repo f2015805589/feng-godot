@@ -101,15 +101,6 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 	if (_vt.surface_vt_texels_per_meter <= _vt.vt_page_size / coarse.page_world || scan.budget <= int(coarse.pages.size())) { return scan; }
 	const float maximum_pages = SECTOR_WORLD * _vt.surface_vt_texels_per_meter / _vt.vt_page_size;
 	const float section_world = get_avt_local_section_world();
-	// The cells the standing plan's retention window holds a page of. The window is the previous
-	// view's pages the plan kept (`_avt_install_or_reuse_plan()`), and its entries are the sampled
-	// prefix's tail, so its owners are exactly the cells whose *previous* block resolution a
-	// retained page is expressed in. See the tier hold below.
-	std::unordered_set<uint64_t> retained_owners;
-	for (size_t i = size_t(MAX(0, _vt.avt_plan.sampled)); i < _vt.avt_plan.pages.size(); ++i) {
-		const Terrain3DAVTPageRequest &page = _vt.avt_plan.pages[i];
-		if (page.owner != avt_coarse_owner()) { retained_owners.insert(avt_owner_key(page.owner)); }
-	}
 	const Vector2i first = Vector2i(((p_focus - Vector2(p_reach, p_reach)) / section_world).floor());
 	const Vector2i last = Vector2i(((p_focus + Vector2(p_reach, p_reach)) / section_world).floor());
 	for (int y = first.y; y <= last.y; ++y) for (int x = first.x; x <= last.x; ++x) {
@@ -143,17 +134,21 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 		const float logical = maximum_pages * std::exp2(-float(tier));
 		int size = 1;
 		while (size < logical) { size <<= 1; }
-		scan.visible.push_back({ key, key, 0, size, size, visible, distance, heights, tier, logical });
+		scan.visible.push_back({ key, key, 0, size, visible, distance, heights, tier, logical });
 	}
 	std::stable_sort(scan.visible.begin(), scan.visible.end(), [](const auto &a, const auto &b) { return a.distance < b.distance; });
-	// Dense coarse pages cover the entire circle. Sparse address space belongs
-	// primarily to the rendered view; only a small nearby apron is kept behind
-	// the camera for turns, rather than allocating every sector in the circle.
-	const int apron_limit = MIN(8, MAX(1, scan.budget / 16));
-	int apron = 0;
-	scan.visible.erase(std::remove_if(scan.visible.begin(), scan.visible.end(), [&](const auto &cell) {
-		return !cell.produce && apron++ >= apron_limit;
-	}), scan.visible.end());
+	// Every cell the near field can reach is kept, on screen or not.
+	//
+	// This is the reference implementation's *additional feedback*: its feedback pass adds one
+	// entry per resident virtual image every frame - each image's coarsest page - so no image the
+	// camera has an address for can be dropped from demand while the camera is not looking at it,
+	// and a turn finds the ground it turns onto already addressable rather than planned from
+	// nothing. The readme's badcase is exactly that turn. The old rule kept only
+	// `MIN(8, budget / 16)` cells behind the camera, so a 180-degree cut named ground the previous
+	// plan had never held and had to build every page of it - roots included - from a source read.
+	// A cell outside the frustum still never competes for refinement: `produce` is false for it, and
+	// the walk's own comparators put a producing cell first inside every level. What it does keep is
+	// its whole-cell root page, which is resident, reserved and demanded across the turn.
 	std::stable_sort(scan.visible.begin(), scan.visible.end(), [](const auto &a, const auto &b) {
 		if (a.produce != b.produce) { return a.produce; }
 		return a.distance < b.distance;
@@ -189,7 +184,7 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 		if (coarse.size > 0 && _vt.surface_vt->register_sector(avt_coarse_owner(), coarse.size * 2)) {
 			coarse.block = Vector2i(_vt.surface_vt->get_sector_block_origin_x(avt_coarse_owner()),
 					_vt.surface_vt->get_sector_block_origin_y(avt_coarse_owner()));
-			_vt.avt_plan.install(std::vector<Terrain3DAVTPageRequest>(coarse.pages), int(coarse.pages.size()), {});
+			_vt.avt_plan.install(std::vector<Terrain3DAVTPageRequest>(coarse.pages), int(coarse.pages.size()));
 		} else { coarse.size = 0; coarse.levels = 0; }
 	}
 	if (!changed && coarse.size > 0) {
@@ -212,11 +207,10 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 			std::vector<Terrain3DAVTPageRequest> pages = coarse.pages;
 			for (const auto &page : _vt.avt_plan.pages) { if (page.owner != avt_coarse_owner()) { pages.push_back(page); } }
 			const int sampled = int(pages.size());
-			_vt.avt_plan.install(std::move(pages), sampled, {});
+			_vt.avt_plan.install(std::move(pages), sampled);
 			_vt.avt_settled.unverify();
 		}
 	}
-	hierarchy.coarse_roots = int(coarse.pages.size());
 	_vt.avt_sector_stats["pool_pages"] = _vt.surface_vt->get_page_count();
 	_vt.avt_sector_stats["plan_budget"] = hierarchy.budget;
 	_vt.avt_sector_stats["virtual_budget_bias"] = 0;
@@ -248,9 +242,8 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 		const auto found = _vt.avt_cached_addresses.find(key);
 		if (found == _vt.avt_cached_addresses.end()) { return; }
 		const Vector2i owner = found->second.owner;
-		for (auto *pages : { &_vt.avt_plan.pages, &_vt.avt_plan.prefetch }) {
-			pages->erase(std::remove_if(pages->begin(), pages->end(), [&](const auto &page) { return page.owner == owner; }), pages->end());
-		}
+		_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
+				[&](const auto &page) { return page.owner == owner; }), _vt.avt_plan.pages.end());
 		_vt.surface_vt->unregister_sector(owner);
 		_vt.vt_registered_sectors.erase(found->second.owner);
 		_vt.avt_allocated_sizes.erase(key);
@@ -297,11 +290,15 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 		}
 		if (!allocated) { continue; }
 		if (old_size > 0) {
+			// The same mip-shift the reference implementation's `RemapVirtualImage` applies: a page
+			// stands for a fixed world footprint, so doubling the image moves the same payload from
+			// local mip L to L + shift and halving it moves L to L - shift. A page whose new mip
+			// falls outside the block is the one case the shift cannot express, and only those are
+			// dropped.
 			const int shift = TerrainVT::log2_power_of_two(cell.size) - TerrainVT::log2_power_of_two(old_size);
-			for (auto *pages : { &_vt.avt_plan.pages, &_vt.avt_plan.prefetch }) {
-				for (auto &page : *pages) { if (page.owner == cell.owner) { page.mip += shift; } }
-				pages->erase(std::remove_if(pages->begin(), pages->end(), [&](const auto &page) { return page.owner == cell.owner && page.mip < 0; }), pages->end());
-			}
+			for (auto &page : _vt.avt_plan.pages) { if (page.owner == cell.owner) { page.mip += shift; } }
+			_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
+					[&](const auto &page) { return page.owner == cell.owner && page.mip < 0; }), _vt.avt_plan.pages.end());
 		}
 		_vt.avt_cached_addresses[key] = { cell.location, cell.owner, 0, cell.resolution_level, cell.logical_pages };
 		_vt.avt_allocated_sizes[key] = cell.size;
@@ -331,11 +328,11 @@ bool Terrain3D::_avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy,
 	uint8_t *output = bytes.ptrw();
 	std::vector<bool> occupied(entries, false);
 	int detailed = 0, max_size = 0;
-	// The block size the shader reads is this ratio, and the planner only records it in the
-	// plan it submits after publishing, so derive the live value instead of reading
-	// `_vt.avt_plan_logical_ratio`: on the first publish of a configuration that member is
-	// still its default of zero, and a zero block size collapses every fragment of the
-	// sector onto the block's first page.
+	// The block size the shader reads is this ratio, derived from the live configuration rather
+	// than carried by the plan: the chain that re-configures a view publishes its directory
+	// before it submits the plan, so a value the plan carried would still be the previous
+	// configuration's on the first publish - and a zero block size collapses every fragment
+	// of the sector onto the block's first page.
 	for (const auto &cached : _vt.avt_cached_addresses) {
 		const Terrain3DAVTCachedAddress &sector = cached.second;
 		if (!_vt.surface_vt->has_sector(sector.owner)) { continue; }

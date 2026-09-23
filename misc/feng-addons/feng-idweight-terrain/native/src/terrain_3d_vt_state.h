@@ -34,7 +34,7 @@
 //     arrival that is mid-ramp is not finished as a step. Its methods are the only place a length
 //     changes, which is what keeps a new field from being forgotten by a rebuild or a teardown.
 //   * the standing plan is `Terrain3DAVTPlan` below: the key, the selection with its sampled
-//     length, the prefetch set and the two retention flags. `install()` is the one way a completed
+//     length and the single retention flag. `install()` is the one way a completed
 //     plan replaces the standing one, which is what makes forgetting the retention impossible to
 //     forget: a stale "already retained" flag leaves the source queue holding work the new plan
 //     does not name.
@@ -329,56 +329,45 @@ struct Terrain3DSVTRootPlan {
 };
 
 // The near field's standing plan: the key it was planned for, the page selection, the length of
-// its sampled prefix and its prefetch set, plus whether the source queue has already been retained
-// against this plan. One owner because replacing the plan has to forget that retention: retention
-// is one set operation over the whole plan, so a stale "already retained" flag leaves the source
-// queue holding work the new plan does not name.
+// its sampled prefix, plus whether the source queue has already been retained against this plan.
+// One owner because replacing the plan has to forget that retention: retention is one set operation
+// over the whole plan, so a stale "already retained" flag leaves the source queue holding work the
+// new plan does not name.
 struct Terrain3DAVTPlan {
 	// The key of the chain that produced this selection. Deliberately left stale while the refresh
 	// interval holds a change: the plan describes the view a lead ahead, and re-deriving it every
 	// tick is the cost that interval exists to avoid.
 	Terrain3DAVTPlanKey key = invalid_avt_plan_key();
 	std::vector<Terrain3DAVTPageRequest> pages;
-	// Length of the sampled prefix of `pages`. Everything after it is the speculative apron, which
-	// is allowed to lag without the view showing a miss.
+	// Length of the sampled prefix of `pages`. Everything after it is the retention window this
+	// plan's installer appended, which is allowed to lag without the view showing a miss.
 	int sampled = 0;
-	std::vector<Terrain3DAVTPageRequest> prefetch;
-	// Whether the source queue was already retained against this plan, and whether that retention
-	// included the prefetch set. A pass that would repeat the previous wanted set returns early
-	// instead of repeating 250 map lookups to reach the state the last pass already reached.
+	// Whether the source queue was already retained against this plan. A pass that would repeat the
+	// previous wanted set returns early instead of repeating 250 map lookups to reach the state the
+	// last pass already reached.
 	bool retain_applied = false;
-	bool retain_with_prefetch = false;
 
 	// The retention no longer describes this selection: a plan was replaced, or the addresses it
 	// resolved to were remapped under it. The next retain pass re-applies it.
 	void forget_retention() {
 		retain_applied = false;
-		retain_with_prefetch = false;
 	}
-	// Install a completed plan: its selection, its sampled length and its prefetch set, and forget
-	// the retention, because this is a new wanted set.
-	void install(std::vector<Terrain3DAVTPageRequest> &&p_pages, const int p_sampled,
-			std::vector<Terrain3DAVTPageRequest> &&p_prefetch) {
+	// Install a completed plan: its selection and its sampled length, and forget the retention,
+	// because this is a new wanted set.
+	void install(std::vector<Terrain3DAVTPageRequest> &&p_pages, const int p_sampled) {
 		pages = std::move(p_pages);
 		sampled = p_sampled;
-		prefetch = std::move(p_prefetch);
 		forget_retention();
 	}
 	// Whether the queue already holds this exact wanted set.
-	bool retained(const bool p_with_prefetch) const {
-		return retain_applied && retain_with_prefetch == p_with_prefetch;
-	}
-	void mark_retained(const bool p_with_prefetch) {
-		retain_applied = true;
-		retain_with_prefetch = p_with_prefetch;
-	}
-	// A page-pool rebuild invalidates every address this selection resolved to, so the key and both
-	// selections go. The sampled length and the retention flags are left alone: no pass reads them
+	bool retained() const { return retain_applied; }
+	void mark_retained() { retain_applied = true; }
+	// A page-pool rebuild invalidates every address this selection resolved to, so the key and the
+	// selection go. The sampled length and the retention flag are left alone: no pass reads them
 	// without a resident plan, and the next install overwrites them.
 	void forget() {
 		invalidate_avt_plan_key(key);
 		pages.clear();
-		prefetch.clear();
 	}
 };
 
@@ -654,16 +643,6 @@ struct Terrain3DVTState {
 	// Far field: allow a miss at the level the distance rule selected to be served by a
 	// coarser resident level instead of the diagnostic. Off restores the strict walk.
 	bool svt_feedback = true;
-	// Which page source the near field's feedback switch may answer a cold page from. One of
-	// `AVT_FEEDBACK_SOURCE_COARSE` (the near field's own hierarchy and its fallback grid, the
-	// shipped contract) or `AVT_FEEDBACK_SOURCE_SVT` (the far field's own sparse virtual texture).
-	// Only a cold page - a cut's view whose burst has not served it yet - reads the second source,
-	// so the switch's steady meaning does not change with it.
-	int avt_feedback_source = AVT_FEEDBACK_SOURCE_COARSE;
-	// Whether the shader was last told that cold pages take the far field's pages. Published with
-	// the same tick as the burst, because the shader's copy is a material parameter and a material
-	// rebuilt in the middle of a cold view would come back with the default.
-	bool avt_cold_svt_published = false;
 	bool vt_debug_direct_material = false;
 	bool vt_editor_preview = true;
 	Dictionary vt_editor_dirty_regions;
@@ -804,7 +783,6 @@ struct Terrain3DVTState {
 	Dictionary avt_peak_stats;
 	uint64_t avt_peak_stamp_us = 0;
 	uint64_t avt_plan_epoch = 0;
-	float avt_plan_logical_ratio = 0.f;
 	// How many frames apart the plan is re-derived, and the frame the last chain ran on. The plan
 	// is re-derived once per interval rather than once per frame; a key that changed inside the
 	// interval is left for the next refresh, and the plan key is then left at the value the
@@ -815,8 +793,8 @@ struct Terrain3DVTState {
 	// interval saved, and what it means for how stale the plan a moving view produces from is.
 	uint64_t avt_plan_refresh_skips = 0;
 	std::shared_ptr<Terrain3DAVTRefinement> avt_refinement;
-	// The standing plan: the key it was planned for, the page selection, its sampled length and its
-	// prefetch set, with the two retention flags that say whether the source queue already holds it.
+	// The standing plan: the key it was planned for, the page selection, its sampled length and the
+	// retention flag that says whether the source queue already holds it.
 	// See `Terrain3DAVTPlan` above for why replacing the plan has to forget the retention.
 	Terrain3DAVTPlan avt_plan;
 	// Motion look-ahead: the planner plans for where the camera will be in
@@ -832,23 +810,16 @@ struct Terrain3DVTState {
 	bool avt_motion_valid = false;
 	// A camera cut invalidates the old-view retention tail at the next plan install.
 	bool avt_discard_retained = false;
-	// Ticks left of the cold-view production burst, and the rate it is served at. A plan whose
-	// sampled set is mostly missing is a view nothing has produced for yet - a snap turn, a
-	// teleport, the first frames of a session - and the shader draws it through the one-texel-per-
-	// metre fallback, which is a flat smear at a 1080p footprint. The steady allowance fills such a
-	// plan over tens of ticks, so the burst serves it at `avt_burst_allowance()` pages a tick for
-	// `AVT_COLD_BURST_TICKS` ticks. `avt_burst_peak` and `avt_burst_pages` are what it did: the
-	// largest allowance it asked for, and how many pages it produced across the burst.
-	int avt_cold_burst_ticks = 0;
-	int avt_burst_peak = 0;
-	// Pages this cold episode has produced, and the ticks it has spent at the burst rate. The first
-	// bounds the episode (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`); both are what the report reads.
-	int64_t avt_burst_pages = 0;
-	int avt_cold_burst_spent = 0;
-	// Whether a *cut* put the view in the cold state - the burst's own arm. A camera that merely
-	// moves never sets it, which is what keeps the burst off every ordinary streaming path. It is
-	// consumed by the production pass that finds the view served again.
-	bool avt_burst_from_cut = false;
+	// Whether the view the near field is filling is still unserved: a cut, a teleport or a plan that
+	// mostly names ground the previous one did not. It is the whole of the cold-view rate - while it
+	// holds, the near field takes the full `AVT_PAGE_BATCH_MAX` batch instead of its even share with
+	// the far field - and the production pass clears it on the first tick every page the image
+	// samples has a slot and content. There is no timer, no rate multiple and no episode counter.
+	bool avt_view_unserved = false;
+	// The largest batch any production pass of this session handed to the pool. The acceptance probe
+	// reads it against `AVT_PAGE_BATCH_MAX`; it is a MAX and never reset, so one oversized batch
+	// shows up whenever it happened.
+	int avt_batch_peak = 0;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
 	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum
@@ -883,7 +854,9 @@ struct Terrain3DVTState {
 	// lead. The pool capacity request counts them, so a look-ahead plan cannot grow the
 	// pool exactly large enough to evict the view it is leading.
 	int avt_retained_pages = 0;
-	// Sampling density belongs to the installed plan, including its capacity LOD.
+	// Sampling density belongs to the installed plan. The plan has no capacity coarsening any more,
+	// so this is the configured texels-per-pixel and nothing else; it stays a member because the
+	// material is published from it and the shader divides its footprint by it.
 	float avt_density_scale = 1.f;
 	// The settled shortcut: the caller's verdict that the standing plan is this tick's, the pool
 	// residency revision an idle pass verified, the resident set it verified and whether the idle
@@ -905,8 +878,6 @@ struct Terrain3DVTState {
 	// against a mostly missing view took five hundred queue locks to read one array.
 	std::vector<int> avt_verify_slots;
 	std::vector<uint8_t> avt_verify_ready;
-	size_t avt_prefetch_cursor = 0;
-	bool avt_prefetch_cycle_pending = false;
 	std::vector<Vector2i> avt_registered_owners;
 	std::unordered_map<uint64_t, int> avt_allocated_sizes;
 	std::unordered_map<uint64_t, Terrain3DAVTCachedAddress> avt_cached_addresses;

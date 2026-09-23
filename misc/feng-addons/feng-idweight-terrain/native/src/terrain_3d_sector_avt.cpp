@@ -193,60 +193,24 @@ void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
 	_vt.avt_settled.unverify();
 }
 
-// The number of texels a level 0 sector block carries per page, as a multiple of its page
-// count: `size * logical_ratio` is the block's virtual resolution for `SECTOR_WORLD`
-// metres. Derived here rather than read from the plan, because the chain that re-configures a
-// view publishes its directory before it submits the plan: the first publish of a configuration
-// would otherwise read the previous configuration's ratio.
-float Terrain3D::_avt_logical_ratio() const {
-	return SECTOR_WORLD * _vt.surface_vt_texels_per_meter / (_vt.vt_page_size * float(get_avt_base_block_size()));
-}
-
-// The near field's share of the tick's page budget: half of `vt_pages_per_update` while the far
-// field is drawing from the same number, all of it otherwise. A pure function of the live VT
-// configuration, spelled once because two readers size against it and they must not disagree.
+// The near field's share of the tick's page budget, always inside `AVT_PAGE_BATCH_MAX`. The steady
+// rule is an even split with the far field while it is drawing from the same number, and the whole
+// budget when it is not. A *view nothing has served yet* - the plan that was just installed names
+// ground the previous one did not - takes the whole batch instead of its half, because the far
+// field's own demand is about a tenth of a page a tick once its root pyramid is pinned and the
+// batch is the hard ceiling either way. That is the whole of the cold-view rate: one condition the
+// production pass itself reports (`_vt.avt_view_unserved`), not a timer, not a rate multiple and
+// not a second page budget.
 //
-// The tick hands the pass this many pages (`terrain_3d.cpp`), and the plan's own budget is a
-// *residency* bound (`_avt_build_hierarchy()`, `pool - reserved`) with no term for how fast that
-// residency can be filled. So the planner is the other reader: `_avt_submit_plan()` sizes the
-// plan's unsampled tail - the speculative apron and the retention window - by this allowance times
-// the refresh interval, which is the pages one plan generation can actually produce. Without that
-// term a plan names its whole residency budget whatever the supply, and the measured result is a
-// permanent sampled deficit, a pool with no free slot and a far field starved to its coarsest mip
-// (`docs/vt_reference_avt_alignment.md` sections 7.5-7.7).
-//
-// The even split stays even, and that is now a measured decision rather than an inherited one. A
-// fixed half looks wasteful - the far field's own demand is about **0.1 page a tick** once its
-// root pyramid is pinned, while the near field consumes everything it is given - so the split was
-// tried demand-aware, with the near field taking the remainder above a two-page floor for the far
-// field (`docs/vt_reference_avt_alignment.md` section 7.7.1). The near field then produced fourteen a
-// tick instead of eight and the sampled deficit did not fall at all: `n_miss` rose 41%, `evict`
-// 54%, `fade_starts` 38% and `alloc` 38% against the same run with the term below and the even
-// split. The near field's churn scales with its allowance, so its supply is not the binding
-// constraint and giving it more buys churn rather than coverage. Do not re-try this without a
-// measurement that says the demand has stopped scaling with the budget.
+// A pure function of the live VT configuration and that one flag, spelled once because two readers
+// size against it and they must not disagree: the tick hands the pass this many pages, and the
+// pass's own allocation budget is the same number. See `AVT_PAGE_BATCH_MAX`.
 int Terrain3D::_avt_tick_allowance() const {
-	const int remaining = _vt.vt_debug_direct_material ? 4 : _vt.vt_pages_per_update;
-	return has_svt_delivery() ? MAX(1, remaining / 2) : remaining;
-}
-
-// The burst's half of the same split. It is a *rate* on top of the steady allowance and never a
-// replacement for it: a burst asks for `AVT_COLD_BURST_FACTOR` times the configured page budget,
-// bounded by what one pass may be handed and never below the steady share the far field's split
-// already reserved. Off in the diagnostic direct-material mode, whose budget is pinned to four
-// pages so the diagnostic measures what it always measured.
-int Terrain3D::_avt_burst_allowance() const {
-	if (_vt.avt_cold_burst_ticks <= 0 || _vt.vt_debug_direct_material) { return 0; }
-	return avt_cold_burst_allowance(_vt.vt_pages_per_update, _avt_tick_allowance(), _vt.avt_cold_burst_ticks);
-}
-
-// The shared rate the burst moves. The producer admits this many page *writes* per displayed
-// frame and the source queue holds this many prepared pages; the near field's own allowance is the
-// third reader. All three are the same decision - how fast this view is filled - so they are spelled
-// once. The steady value is the configured budget, which is what the producer has always been given.
-int Terrain3D::_avt_page_budget() const {
-	const int burst = _avt_burst_allowance();
-	return burst > 0 ? burst : MAX(1, _vt.vt_pages_per_update);
+	const int remaining = _vt.vt_debug_direct_material
+			? MIN(4, AVT_PAGE_BATCH_MAX)
+			: MIN(_vt.vt_pages_per_update, AVT_PAGE_BATCH_MAX);
+	if (!has_svt_delivery() || _vt.avt_view_unserved) { return remaining; }
+	return MAX(1, remaining / 2);
 }
 
 void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distances) {
@@ -291,50 +255,24 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	if (!_vt.surface_vt || !_data || !_vt.vt_shared_ready || !get_camera()) { return 0; }
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	_vt.avt_sector_ticks++;
-	// One tick of the cold-view burst is spent here, before the pass it pays for. The burst is armed
-	// by the motion sampler where it recognises a cut (`_vt_arm_cold_view()`) and re-armed by the
-	// production pass for as long as the plan the cut installed is still mostly missing, so counting
-	// it down on the tick rather than on the pass keeps a burst from lasting longer than the ticks it
-	// names. The rate the three consumers read is refreshed here too: the producer's frame budget and
-	// the source queue window are not re-published by anything else while a plan is being produced.
-	if (_vt.avt_cold_burst_ticks > 0) { --_vt.avt_cold_burst_ticks; ++_vt.avt_cold_burst_spent; }
-	const int page_budget = _avt_page_budget();
 	// The rate the producer's frame budget and the source queue window are both set from, published
-	// on every tick rather than on the tick it moves. Both readers have to move together - a burst
-	// that raised only one of them would stall on the other - and the source pipeline is built
-	// lazily inside the production pass, so a change-detected publish can run on the one tick the
-	// pipeline does not exist yet and leave the queue at the steady window for the whole burst.
-	// Measured: a 180-degree cut at 1920x1080 kept `avt_source_queue_limit` at 32 while
-	// `avt_page_budget` read 96, which held page completion to ~32 a frame and the ground flat for
-	// twenty frames. Three atomic stores and one integer derivation a tick are not worth a state
-	// machine that can miss.
+	// on every tick rather than on the tick it moves. Both readers have to move together, and the
+	// source pipeline is built lazily inside the production pass, so a change-detected publish can
+	// run on the one tick the pipeline does not exist yet and leave the queue at the wrong window.
+	// The value is bounded by `AVT_PAGE_BATCH_MAX` in every case.
+	const int page_budget = _avt_tick_allowance();
 	if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
 		producer->set_page_budget(page_budget);
 	}
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->set_queue_limit(page_budget); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->set_queue_limit(page_budget); }
-	// The feedback switch's source, for the pages the burst has not served yet. It is a material
-	// parameter, so it is re-published every tick it is on - a material rebuilt in the middle of a
-	// cold view would come back with the default - and once when it turns off. Off is the steady
-	// state and costs nothing.
-	const bool cold_svt_source = _vt.avt_feedback_source == AVT_FEEDBACK_SOURCE_SVT && _vt.avt_burst_from_cut;
-	if (cold_svt_source || cold_svt_source != _vt.avt_cold_svt_published) {
-		if (_material.is_valid()) {
-			RS->material_set_param(_material->get_material_rid(), "_avt_cold_svt_source", cold_svt_source);
-		}
-		_vt.avt_cold_svt_published = cold_svt_source;
-	}
-	// The arrival blend is off for the frames a cut's view is filling. It is the shader's own early
-	// out (`surface_vt_page_fade()` answers 1 for every slot at zero frames), so the pages of a view
-	// nothing had produced for are drawn as themselves the moment they land instead of being held at
-	// the level they replaced for the length of the ramp. See `AVT_COLD_BURST_FADE_FRAMES`. Published
-	// every tick rather than on change: the setting is republished by any material rebuild, and the
-	// window is a handful of frames. `vt_page_fade_frames` itself is never changed.
+	// The arrival blend is always the configured one. The cold-view episode this pipeline used to
+	// carry switched it off for the frames a cut's view was filling, which bought the window at the
+	// cost of a step wherever an arrived page met one still missing; the rate and the recursive mip
+	// lookup are what serve that window now, so the setting is published as itself.
 	if (_material.is_valid()) {
-		RS->material_set_param(_material->get_material_rid(), "_surface_vt_page_fade_frames",
-				_vt.avt_burst_from_cut ? AVT_COLD_BURST_FADE_FRAMES : _vt.vt_page_fade_frames);
+		RS->material_set_param(_material->get_material_rid(), "_surface_vt_page_fade_frames", _vt.vt_page_fade_frames);
 	}
-	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_peak = MAX(_vt.avt_burst_peak, page_budget); }
 	// Fine eligibility follows the rendered frustum, as does the Inspector preview.
 	// Keep motion tracking for refresh diagnostics, without excluding current cells
 	// when a predicted turn points away from them.
@@ -475,7 +413,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	mark_phase("sync_ms");
 	_publish_avt_directory(_vt.avt_pending_hierarchy);
 	mark_phase("publish_ms");
-	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, camera_position, bounds_ready, focus, reach);
+	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, bounds_ready, focus, reach);
 	mark_phase("submit_ms");
 	_vt.avt_chain_sum_ms += double(Time::get_singleton()->get_ticks_usec() - chain_started) / 1000.0;
 	_vt.avt_plan.key = plan_key;
@@ -720,12 +658,12 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			}
 			const int selected = int(_vt.avt_refinement->pages.size());
 			// A plan that mostly names ground the previous one did not is a view nothing has produced
-			// for: a snap turn, a teleport, a camera that left the working set. The motion sampler arms
-			// the same cold state where it recognises the cut itself; this arms it from the plan, so a
-			// cut that fell inside one refresh interval, or that was not a rotation at all, is covered
-			// too. A moving camera's consecutive plans overlap heavily - `carried` is most of the
-			// selection - so ordinary streaming never reaches the threshold.
-			if (selected > 0 && selected - carried > selected / 2) { _vt_arm_cold_view(); }
+			// for: a snap turn, a teleport, a camera that left the working set. Such a view is the one
+			// case where the near field takes the whole `AVT_PAGE_BATCH_MAX` batch instead of its even
+			// share, and the flag is cleared by the first pass that finds the view served. A moving
+			// camera's consecutive plans overlap heavily - `carried` is most of the selection - so
+			// ordinary streaming never sets it.
+			_vt.avt_view_unserved = selected > 0 && selected - carried > selected / 2;
 			_vt.avt_sector_stats["plan_selected"] = selected;
 			_vt.avt_sector_stats["plan_carried"] = carried;
 			_vt.avt_sector_stats["plan_overlapped"] = overlapped;
@@ -810,27 +748,20 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// whole-cell page is one that kept the fallback ladder; one whose finest entry is a
 			// sub-metre page is one that kept the level the view just left.
 			_vt.avt_sector_stats["retained_finest_texel_world"] = retained_finest;
-			// The rate term as derived, as spent, and as it landed: `plan_tail_cap` is the whole
-			// term, `plan_retain_share` what the retention append was allowed, and
-			// `plan_apron_pages` the speculative part of the plan the refinement walk accepted. A
-			// plan whose tail sits at the term is a plan at the production rate; one well under it
-			// is a plan with nothing speculative to do.
-			_vt.avt_sector_stats["plan_tail_cap"] = _vt.avt_refinement->tail_cap;
+			// The rate term as spent: `plan_retain_share` is what the retention append was allowed.
+			// A plan whose retention sits at the cap is a plan that kept every level the view left
+			// that the epoch window still covered.
 			_vt.avt_sector_stats["plan_retain_share"] = _vt.avt_refinement->retain_cap;
 			_vt.avt_sector_stats["plan_apron_pages"] = int(_vt.avt_refinement->pages.size()) - retained - _vt.avt_refinement->sampled;
 			_vt.avt_sector_stats["retain_epochs"] = _vt.avt_retain_epochs;
 			// The selection and the retention flags are one operation: a new plan is a new wanted
 			// set, so the source queue has to be retained again.
-			_vt.avt_plan.install(std::move(_vt.avt_refinement->pages), _vt.avt_refinement->sampled,
-					std::move(_vt.avt_refinement->warm));
-			_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel) * std::exp2(-float(_vt.avt_refinement->mip_bias));
+			_vt.avt_plan.install(std::move(_vt.avt_refinement->pages), _vt.avt_refinement->sampled);
+			_vt.avt_density_scale = float(_vt.surface_vt_texels_per_pixel);
 			if (_material.is_valid()) {
 				RS->material_set_param(_material->get_material_rid(), "_avt_density_scale", _vt.avt_density_scale);
 			}
-			_vt.avt_sector_stats["capacity_mip_bias"] = _vt.avt_refinement->mip_bias;
 			_vt.avt_sector_stats["sampling_density_scale"] = _vt.avt_density_scale;
-			_vt.avt_prefetch_cursor = 0;
-			_vt.avt_prefetch_cycle_pending = false;
 			_vt.avt_sector_stats["refinement_requests_denied"] = _vt.avt_refinement->denied;
 			_vt.avt_sector_stats["finest_requested_texel_world"] = _vt.avt_refinement->finest;
 			_vt.avt_sector_stats["visible_root_pages"] = _vt.avt_refinement->roots;
@@ -844,7 +775,6 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			// How much of the plan exists for ground the view did not sample. It is the reading that
 			// says whether a cell beside the frustum's edge holds a chain or a single whole-cell page.
 			_vt.avt_sector_stats["plan_invisible_cell_pages"] = _vt.avt_refinement->invisible_cell_pages;
-			_vt.avt_sector_stats["prefetch_requests"] = int(_vt.avt_plan.prefetch.size());
 			_vt.avt_sector_stats["planning_ms"] = double(_vt.avt_refinement->elapsed_us) / 1000.;
 			_vt.avt_sector_stats["plan_age_ms"] = double(p_started - _vt.avt_refinement->submitted_us) / 1000.;
 			installed = true;
@@ -875,7 +805,7 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 // plan worker and arrives through _avt_install_or_reuse_plan on a later tick.
 void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terrain3DAVTPlanKey &p_plan_key,
 		const TerrainVT::VisibleView &p_view,
-		const Vector3 &p_camera_position, const bool p_bounds_ready, const Vector2 &p_focus, const float p_reach) {
+		const bool p_bounds_ready, const Vector2 &p_focus, const float p_reach) {
 	// Refine only visible page footprints. The refinement walk never enumerates a
 	// virtual image's full mip pyramid (256 squared entries need zero resident
 	// pages until requested). Budget exhaustion must remain visible in diagnostics.
@@ -887,9 +817,7 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 			sector.resolution_level = cached->second.resolution_level;
 		}
 	}
-	const float logical_ratio = _avt_logical_ratio();
-	auto job = std::make_shared<Terrain3DAVTRefinement>();
-	// The plan carries the key it was planned for, which is the key this tick
+	auto job = std::make_shared<Terrain3DAVTRefinement>();	// The plan carries the key it was planned for, which is the key this tick
 	// publishes at its end. The install step compares it against the member, so it
 	// must be the new key and not the one being replaced.
 	job->key = p_plan_key;
@@ -900,15 +828,12 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	// Addresses use full-resolution local blocks. Remove requests for downgraded cells;
 	// the new dense image replaces the old plan atomically on layout changes.
 	if (r_hierarchy.directory_dirty) {
-		for (auto *pages : { &_vt.avt_plan.pages, &_vt.avt_plan.prefetch }) {
-			pages->erase(std::remove_if(pages->begin(), pages->end(), [&](const Terrain3DAVTPageRequest &page) {
-				return !_vt.surface_vt->has_sector(page.owner);
-			}), pages->end());
-		}
+		_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
+				[&](const Terrain3DAVTPageRequest &page) {
+					return !_vt.surface_vt->has_sector(page.owner);
+				}), _vt.avt_plan.pages.end());
 		_vt.avt_plan.forget_retention();
 	}
-	_vt.avt_prefetch_cursor = 0;
-	_vt.avt_prefetch_cycle_pending = false;
 	// The set the shortcut verified is about to be replaced by this plan's own selection.
 	_vt.avt_settled.unverify();
 	if (!_vt.vt_page_pipeline) { _vt.vt_page_pipeline = std::make_unique<Terrain3DPagePipeline>(_vt.vt_page_workers); }
@@ -917,26 +842,13 @@ void Terrain3D::_avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terra
 	input.source = _vt.vt_source_snapshot;
 	input.view = p_view;
 	input.bounds_ready = p_bounds_ready;
-	input.camera_position = p_camera_position;
-	input.priority_camera_position = get_camera()->get_camera_transform().origin;
 	input.focus = p_focus;
 	input.reach = p_reach;
-	input.exact_radius = float(_cdlod_enabled && _tessellation_level == 0 ? _cdlod_patch_size * _vertex_spacing * _cdlod_lod_scale * 0.7 / (1 << _tessellation_level) : 0);
-	input.logical_ratio = logical_ratio;
 	input.texels_per_pixel = _vt.surface_vt_texels_per_pixel;
 	input.budget = r_hierarchy.budget;
-	// The plan's rate term: the pages it may name beyond the ones the image samples, which is the
-	// pages one refresh window can produce at the allowance the tick actually hands this pass. Both
-	// halves are live configuration - `vt_pages_per_update` with the far field's share rule, and the
-	// refresh interval the motion lead derives - so the term tracks a camera that speeds up or a
-	// project that raises the page budget, and it cannot drift from the supply: `_avt_tick_allowance()`
-	// is the same call `terrain_3d.cpp` splits the tick with.
-	input.tail_cap = _avt_tick_allowance() * int(_vt.avt_plan_refresh_frames);
-	input.root_level = r_hierarchy.root_level;
 	input.page_size = _vt.vt_page_size;
 	input.coarse = _vt.avt_coarse;
 	input.section_world = get_avt_local_section_world();
-	input.mip_level_cap = MIN(get_avt_mip_level_cap(), TerrainVT::log2_power_of_two(get_avt_local_block_size()));
 	_vt.vt_page_pipeline->submit_task([job, input]() mutable { TerrainAVT::plan_pages(*job, input); });
 }
 
@@ -956,26 +868,17 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["visible_retained_pages"] = _vt.avt_retained_pages;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
-	// Which page path the feedback switch answers an unserved cold page from, and whether that is
-	// what the shader is currently reading.
-	result["avt_feedback_source"] = _vt.avt_feedback_source;
-	result["avt_cold_svt_source"] = _vt.avt_cold_svt_published;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
-	// The near field's share of the tick's page budget as it stood for the last pass, beside
-	// `pages_per_update` which is the whole of it. The two together are the supply the plan's rate
-	// term is sized against, so a probe that reports `avt_tail_cap` without them cannot say what
-	// the plan was measured against.
+	// The near field's per-pass allowance, the ceiling it is always inside, and what the passes
+	// actually handed over. `avt_batch_peak` is the acceptance reading for the batch bound: a MAX
+	// over every pass of the session, so one oversized batch shows up wherever it happened.
 	result["avt_allowance"] = _avt_tick_allowance();
-	// The cold-view burst: whether one is armed, what rate it asks for, and what it has done. The
-	// steady allowance and the configured page budget are beside them, so a reading of "the burst
-	// never armed" and "the burst armed and moved nothing" are told apart.
-	result["avt_cold_burst_ticks"] = _vt.avt_cold_burst_ticks;
-	result["avt_cold_burst_allowance"] = _avt_burst_allowance();
-	result["avt_cold_burst_peak"] = _vt.avt_burst_peak;
-	result["avt_cold_burst_pages"] = _vt.avt_burst_pages;
-	result["avt_cold_burst_spent"] = _vt.avt_cold_burst_spent;
-	result["avt_page_budget"] = _avt_page_budget();
-	result["avt_page_budget_steady"] = _vt.vt_pages_per_update;
+	result["avt_page_budget"] = _vt.vt_pages_per_update;
+	result["avt_batch_max"] = AVT_PAGE_BATCH_MAX;
+	result["avt_batch_peak"] = _vt.avt_batch_peak;
+	// Whether the view is still unserved, which is the one thing that moves the allowance from the
+	// even share to the whole batch.
+	result["avt_view_unserved"] = _vt.avt_view_unserved;
 	result["avt_source_queue_limit"] = _vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_queue_limit()
 			: int(Terrain3DPagePipeline::QUEUE_CAPACITY);
 	result["avt_resolution"] = get_surface_vt_resolution(); // Legacy API only.

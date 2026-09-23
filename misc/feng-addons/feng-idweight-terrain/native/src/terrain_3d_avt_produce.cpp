@@ -50,12 +50,10 @@ uint64_t avt_page_age_key(const Terrain3DAVTPageRequest &p_page) {
 // per tick rather than once per caller.
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (p_max_pages == 0) { return 0; }
-	// The steady caller passes the near field's share of `vt_pages_per_update`; a cold-view burst
-	// passes its own rate, up to `AVT_PAGE_BUDGET_CEILING`. The clamp only bounds the burst - the
-	// steady path's allowance is already below it - and a negative budget keeps its old meaning of
-	// "the default window".
-	const int ceiling = _vt.avt_cold_burst_ticks > 0 ? MAX(16, _avt_burst_allowance()) : 16;
-	p_max_pages = p_max_pages < 0 ? 16 : MIN(p_max_pages, ceiling);
+	// The caller passes the near field's allowance; the batch ceiling is enforced here, at the one
+	// place a page is handed to the pool, so no caller and no future rate can exceed it. A negative
+	// budget keeps its old meaning of "the default window".
+	p_max_pages = p_max_pages < 0 ? AVT_PAGE_BATCH_MAX : MIN(p_max_pages, AVT_PAGE_BATCH_MAX);
 	const auto pool = _vt.surface_vt->get_page_pool();
 	// A repeated plan with nothing left to upload still has to re-mark its resident
 	// pages as demanded, or the pool evicts them while the camera is stationary.
@@ -78,12 +76,9 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		idle_lost = idle_producer->count_unready_pages(_vt.avt_settled.slots);
 	}
 	if (idle_candidate && idle_lost == 0) {
-		// A settled view is served by definition, so this is where a cold view's burst ends when the
-		// plan fills without the pass ever seeing a missing page. Not while the burst still has ticks
-		// to run, though: the tick a cut lands on still holds the *previous*, settled plan.
-		if (_vt.avt_cold_burst_ticks <= 0) {
-			_vt.avt_burst_from_cut = false;
-		}
+		// A settled view is served by definition, so the view is no longer unserved and the near
+		// field's allowance returns to its even share on the next tick.
+		_vt.avt_view_unserved = false;
 		for (int slot : _vt.avt_settled.slots) { pool->mark_demanded(slot); }
 		// Only the first tick of an idle run publishes: every value below is a constant of
 		// the settled state, and rewriting the same numbers into a String-keyed dictionary
@@ -91,7 +86,6 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		if (!_vt.avt_settled.stats_current) {
 			_vt.avt_settled.stats_current = true;
 			_vt.avt_sector_stats["produced"] = 0;
-			_vt.avt_sector_stats["prefetched"] = 0;
 			// An idle pass is only reached once the previous one produced nothing, the residency
 			// did not change, and every page above was verified to still have its content.
 			_vt.avt_sector_stats["visible_plan_pages"] = _vt.avt_plan.sampled;
@@ -156,49 +150,22 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// re-inserting into it buys nothing.
 	_avt_prime_sources(pass, SOURCE_QUEUE_REFILL_ABOVE, true);
 	mark("refill_ms", _vt.avt_refill_sum_ms);
-	_avt_produce_prefetch(pass, p_max_pages);
 	_avt_finish_produce(pass);
 	mark("finish_ms", _vt.avt_finish_sum_ms);
-	// A cold view - a cut, a teleport, or a plan that mostly names ground the previous one did not -
-	// is what arms this (`_vt_arm_cold_view()`, called from the motion sampler and from the plan
-	// installer): nothing has produced for that view yet, and the shader draws it through the
-	// independent fallback until the plan is filled. The burst is re-armed here, on the pass that
-	// measures how cold the view still is, so it lasts exactly as long as that holds and expires
-	// without a timer to keep in step with the plan. An ordinary moving view never arms it: its plan
-	// is mostly carried from the last one, so the pages it is missing are the ones the steady rate
-	// already covers, and a burst there would be churn.
-	//
-	// "Still cold" is pages the image cannot be served, which is a page with no slot *or* a page whose
-	// content has not arrived. Counting only the first is what let a cut's burst expire while the
-	// view was still unserved: the source pass can allocate every slot in a few frames, and the pages
-	// then wait for their encode and readback, so the measured re-arm test read zero missing at the
-	// exact frame the image was still a smear and the burst's rate was what the readback needed.
-	// Measured on the reference project: a 180-degree cut left 752 pages with 0 missing and 288
-	// in flight at the frame the burst expired, and the remaining 288 then completed at the steady
-	// sixteen a frame - seventeen frames of a flat ground behind a three-frame burst.
-	//
-	// The threshold is therefore nothing: the burst runs until every page the image samples has a
-	// slot and content. A fraction of the plan is not the same question - at a quarter, the reference
-	// project's cut still had 137 pages outstanding when the burst stopped and those 137 were the
-	// transition's last five frames - and the episode is bounded in pages instead
-	// (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`), which is the bound that also covers a plan the pool
-	// cannot serve. A stray page whose production keeps failing cannot hold the rate open past the
-	// budget.
-	const int outstanding = pass.sampled_missing + pass.sampled_pending;
-	if (_vt.avt_burst_from_cut) {
-		const int64_t page_budget = int64_t(pass.sampled_plan) * AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE;
-		if (outstanding > 0 && _vt.avt_burst_pages < page_budget) {
-			_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
-		} else if (_vt.avt_cold_burst_ticks <= 0 &&
-				// The episode also owns the shortened arrival ramp, so it ends when the last page it
-				// produced has finished blending - not when the last one landed. A page whose ramp is
-				// still running would otherwise be re-armed at the full length and hold the ground soft
-				// for a second after the view was served. See `AVT_COLD_BURST_FADE_FRAMES`.
-				_vt.fade.pending == 0 && _vt.fade.held == 0 && _vt.fade.active == 0) {
-			_vt.avt_burst_from_cut = false;
-		}
-	}
-	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_pages += pass.produced; }
+	// The view is served once every page the image samples has a slot *and* content. A page with a
+	// slot but no content is not served - the source pass can allocate every slot in a few frames
+	// while the pages wait for their encode and readback, so a test that read only "no missing
+	// page" would declare the view done while the ground was still flat. The flag drives the only
+	// rate difference the near field has (`_avt_tick_allowance()`): its even share while the view is
+	// served, the whole `AVT_PAGE_BATCH_MAX` batch while it is not. There is no timer and no page
+	// multiple behind it any more; the ceiling bounds every pass either way.
+	_vt.avt_view_unserved = _vt.avt_view_unserved &&
+			(pass.sampled_missing + pass.sampled_pending) > 0;
+	// What this pass handed to the pool, against the ceiling it is allowed. `avt_batch_peak` is the
+	// acceptance reading: it is a MAX over every pass of the session, so a single batch over
+	// `AVT_PAGE_BATCH_MAX` shows up in it whenever it happened.
+	_vt.avt_sector_stats["batch_pages"] = pass.produced;
+	_vt.avt_batch_peak = MAX(_vt.avt_batch_peak, pass.produced);
 	// The stage sums and the count they are summed over, so `report()` can difference two readings
 	// and state the mean of one sweep. The live keys above describe the last pass only.
 	_vt.avt_pass_count++;
@@ -335,21 +302,13 @@ void Terrain3D::_avt_retain_visible(const Terrain3DAVTProducePass &p_pass) {
 	// replacement can be polled this pass. Ready resident pages are consumed by the GPU and
 	// never polled here; an in-flight, non-stale slot explicitly discards its source result in
 	// _avt_produce_page(). Keeping either kind in the queue only occupies one of its 32 entries
-	// and makes prime scan more work. Once the visible set has no missing page, retain the warm
-	// prefetch set instead. This set only changes when a plan is installed or the prefetch switch
-	// flips, so the operation remains off the per-tick hot path after it has been applied.
-	const bool with_prefetch = p_pass.missing.empty();
-	if (_vt.avt_plan.retained(with_prefetch)) { return; }
+	// and makes prime scan more work.
+	if (_vt.avt_plan.retained()) { return; }
 	std::vector<Terrain3DPagePipeline::Request> wanted;
-	if (with_prefetch) {
-		wanted.reserve(_vt.avt_plan.prefetch.size());
-		for (const auto &page : _vt.avt_plan.prefetch) { wanted.push_back(_avt_page_request(page)); }
-	} else {
-		wanted.reserve(p_pass.missing.size());
-		for (const Terrain3DAVTPageRequest *page : p_pass.missing) { wanted.push_back(_avt_page_request(*page)); }
-	}
+	wanted.reserve(p_pass.missing.size());
+	for (const Terrain3DAVTPageRequest *page : p_pass.missing) { wanted.push_back(_avt_page_request(*page)); }
 	_vt.vt_page_pipeline->retain(wanted);
-	_vt.avt_plan.mark_retained(with_prefetch);
+	_vt.avt_plan.mark_retained();
 }
 
 Terrain3DPagePipeline::Request Terrain3D::_avt_page_request(const Terrain3DAVTPageRequest &p_page) const {
@@ -363,10 +322,9 @@ Terrain3DPagePipeline::Request Terrain3D::_avt_page_request(const Terrain3DAVTPa
 // measured as ~0.15 ms of a peak tick, almost all of it waiting for the queue's mutex.
 void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const int p_refill_above, const bool p_refill) {
 	if (!_vt.vt_page_pipeline) { return; }
-	// The window the workers may hold prepared pages in is the rate the tick was given, and it moves
-	// with the cold-view burst (`_avt_page_budget()`). Both bounds below read it: how deep the queue
-	// has to be before a refill is worth the queue mutex, and how many requests one fill may insert.
-	// At the steady window the two resolve to the values they always had.
+	// The window the workers may hold prepared pages in is the rate the tick was given. Both bounds
+	// below read it: how deep the queue has to be before a refill is worth the queue mutex, and how
+	// many requests one fill may insert.
 	const int window = _vt.vt_page_pipeline->get_queue_limit();
 	const int refill_above = p_refill_above > 0 ? MAX(p_refill_above, window / 2) : 0;
 	if (refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= refill_above) { return; }
@@ -396,7 +354,7 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const 
 // Publishes one prepared page: allocates the slot, writes the payload, queues the
 // material copy and pins the slot for the rest of the pass. Returns whether a page
 // was produced.
-bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page, bool p_prefetch) {
+bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page) {
 	int slot = _vt.surface_vt->lookup_page_exact(p_page.owner, p_page.mip, p_page.x, p_page.y);
 	Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
 	if (slot >= 0 && (!producer || producer->is_page_ready(slot))) { return false; }
@@ -409,9 +367,7 @@ bool Terrain3D::_avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain
 		_vt.vt_page_pipeline->discard(_avt_page_request(p_page).key);
 		return false;
 	}
-	if (p_prefetch) { r_pass.prefetch_pending = true; }
-	Terrain3DPagePipeline::Result prepared;
-	if (!_vt.vt_page_pipeline->poll(_avt_page_request(p_page), _vt.vt_source_snapshot, prepared)) {
+	Terrain3DPagePipeline::Result prepared;	if (!_vt.vt_page_pipeline->poll(_avt_page_request(p_page), _vt.vt_source_snapshot, prepared)) {
 		r_pass.source_wait++;
 		return false;
 	}
@@ -493,35 +449,12 @@ void Terrain3D::_avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_
 	}
 }
 
-// Fills the pool with off-screen pages, but only once the visible plan is complete,
-// and never twice over the same page in one cycle.
-void Terrain3D::_avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max_pages) {
-	if (!r_pass.missing.empty() || _vt.avt_plan.prefetch.empty()) { return; }
-	const auto pool = _vt.surface_vt->get_page_pool();
-	bool complete = pool->free_slots.empty();
-	for (size_t checked = 0; checked < _vt.avt_plan.prefetch.size() && !complete; ++checked) {
-		if (r_pass.prefetched >= p_max_pages || _vt_tick_expired()) { break; }
-		r_pass.prefetch_pending = false;
-		r_pass.prefetched += _avt_produce_page(r_pass, _vt.avt_plan.prefetch[_vt.avt_prefetch_cursor], true) ? 1 : 0;
-		_vt.avt_prefetch_cycle_pending |= r_pass.prefetch_pending;
-		if (++_vt.avt_prefetch_cursor == _vt.avt_plan.prefetch.size()) {
-			_vt.avt_prefetch_cursor = 0;
-			complete = !_vt.avt_prefetch_cycle_pending;
-			_vt.avt_prefetch_cycle_pending = false;
-			break;
-		}
-		complete = pool->free_slots.empty();
-	}
-	r_pass.prefetch_pending = !complete;
-}
-
 // Releases the pins and publishes the pass to the render thread in one commit, then
-// reports what it cost. A pass that produced nothing and owes no prefetch is idle,
-// so the next plan with the same residency can be reused.
+// reports what it cost. A pass that produced nothing is idle, so the next plan with
+// the same residency can be reused.
 void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	const auto pool = _vt.surface_vt->get_page_pool();
 	const uint64_t finish_start = Time::get_singleton()->get_ticks_usec();
-	_vt.avt_sector_stats["prefetched"] = r_pass.prefetched;
 	// Visible-miss diagnostics: pages the current image samples, of which how many are
 	// waiting on production and how many have already been retried past their window.
 	_vt.avt_sector_stats["visible_plan_pages"] = r_pass.sampled_plan;
@@ -564,7 +497,6 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 		_vt.avt_sector_stats["worker_queue"] = queued;
 	}
 	_vt.avt_sector_stats["worker_stats_ms"] = since(worker_start);
-	r_pass.produced += r_pass.prefetched;
 	const uint64_t protect_start = Time::get_singleton()->get_ticks_usec();
 	for (int slot : r_pass.protected_slots) { _vt.surface_vt->protect_page(slot, false); }
 	// Baseline pages stay pinned across frames and competing SVT allocations.
@@ -600,5 +532,5 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	_vt.avt_sector_stats["queue_ms"] = double(r_pass.queue_us) / 1000.;
 	_vt.surface_vt->set_allocation_budget(-1);
 	_vt.avt_sector_stats["produced"] = r_pass.produced;
-	if (r_pass.missing.empty() && r_pass.produced == 0 && !r_pass.prefetch_pending) { _vt.avt_settled.verified(pool->residency_revision); }
+	if (r_pass.missing.empty() && r_pass.produced == 0) { _vt.avt_settled.verified(pool->residency_revision); }
 }

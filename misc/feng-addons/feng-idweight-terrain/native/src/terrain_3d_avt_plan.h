@@ -34,30 +34,11 @@ struct PlanInput {
 	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> source;
 	TerrainVT::VisibleView view;
 	bool bounds_ready = false;
-	Vector3 camera_position;
-	// Demand can lead the view; submission priority belongs to the eye being drawn.
-	Vector3 priority_camera_position;
 	Vector2 focus;
 	float reach = 0.f;
-	float exact_radius = 0.f;
-	float logical_ratio = 0.f;
 	float texels_per_pixel = 1.f;
 	int budget = 0;
-	// How many pages the plan may hold beyond the ones the image samples, shared by the speculative
-	// apron the refinement walk accepts and the retention window the installer appends after it.
-	//
-	// `budget` bounds the plan by *residency* - what the pool can hold at once - and has no term
-	// for how fast that residency can be filled: the tick hands the near field
-	// `_avt_tick_allowance()` pages whatever the plan asks for, and each refresh of a moving view
-	// adds far more sampled pages than that. The pages the image samples are not negotiable, so the
-	// tail is what the term bounds: the planner accepts all the required sampled pages it selected
-	// and only as many speculative ones as one refresh window can produce
-	// (`_avt_tick_allowance() * avt_plan_refresh_frames`). Zero means no term - the plan is bounded
-	// by residency alone, which is the behaviour before section 7.7's fix.
-	int tail_cap = 0;
-	int root_level = 0;
 	int page_size = 0;
-	int mip_level_cap = 2;
 	float section_world = 64.f;
 	Terrain3DAVTCoarseImage coarse;
 };

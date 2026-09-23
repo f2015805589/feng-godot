@@ -216,10 +216,6 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
 	RS->material_set_param(p_material, "_avt_feedback", _terrain->get_avt_feedback());
-	// The switch's second source has to survive a material rebuild too. A rebuild outside a cold
-	// window publishes the off state, which is the steady one; the tick re-publishes the live value
-	// while a cut's burst is armed, so a rebuild inside one comes back on the next tick.
-	RS->material_set_param(p_material, "_avt_cold_svt_source", false);
 	RS->material_set_param(p_material, "_avt_density_scale", _terrain->get_avt_density_scale());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());
@@ -238,10 +234,8 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	Camera3D *camera = _terrain->get_camera();
 	RS->material_set_param(p_material, "_surface_vt_anisotropy", _terrain->get_avt_anisotropy(camera));
 	RS->material_set_param(p_material, "_avt_coverage_distance", _terrain->get_surface_vt_distance());
-	RS->material_set_param(p_material, "_avt_base_block_size", float(_terrain->get_avt_base_block_size()));
 	RS->material_set_param(p_material, "_avt_fine_section_world", _terrain->get_avt_local_section_world());
 	const auto &coarse = _terrain->get_avt_coarse_image();
-	RS->material_set_param(p_material, "_avt_mip_level_cap", _terrain->get_avt_mip_level_cap());
 	RS->material_set_param(p_material, "_avt_coarse_mip_cap", MAX(1, coarse.levels - 1));
 	RS->material_set_param(p_material, "_avt_fine_texel", 1.f / _terrain->get_surface_vt_texels_per_meter());
 	// Which table answers a sample. Published from the same accessor the report and the plan read,
@@ -254,7 +248,6 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	avt_distances.resize(16);
 	RS->material_set_param(p_material, "_avt_mip_distance", avt_distances);
 	RS->material_set_param(p_material, "_avt_directory_mask", _terrain->get_avt_directory_mask());
-	RS->material_set_param(p_material, "_avt_root_level", _terrain->get_avt_root_level());
 	RS->material_set_param(p_material, "_surface_vt_blocks", padded_blocks);
 	PackedFloat32Array block_sizes = _terrain->get_surface_vt_block_sizes();
 	PackedFloat32Array padded_sizes;

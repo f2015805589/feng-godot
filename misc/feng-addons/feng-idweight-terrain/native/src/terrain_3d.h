@@ -95,45 +95,30 @@ private:
 	Dictionary _load_svt_cell(const Vector2i &p_cell);
 	int _update_sector_avt(int p_max_pages);
 	int _produce_sector_avt_pages(int p_max_pages);
-	// The near field's per-tick page allowance. Two readers size against it - the tick, which hands
-	// the pass this many pages, and the plan's rate term, which bounds the pages the plan may name
-	// beyond the ones the image samples by what one refresh window can produce - so the split has
-	// one home. See the definition and `docs/vt_reference_avt_alignment.md` section 7.7.
+	// The near field's per-pass page allowance, always inside `AVT_PAGE_BATCH_MAX`. The tick hands
+	// the pass this many pages and the producer's frame budget and the source queue window are set
+	// from the same number, so the split has one home. See the definition.
 	int _avt_tick_allowance() const;
-	// The near field's share of a cold-view burst, and 0 when none is armed. A plan whose sampled
-	// set is mostly missing is a view nothing has produced for yet - a snap turn, a teleport, a
-	// session's first frames - and the shader draws it through the one-texel-per-metre fallback
-	// while the steady allowance fills it over tens of ticks. See `AVT_COLD_BURST_*`.
-	int _avt_burst_allowance() const;
-	// The one number the producer's frame budget and the source queue window are both set from:
-	// the burst's rate while one is armed, the configured page budget otherwise. Both readers have
-	// to move together - a burst that raised only one of them would stall on the other.
-	int _avt_page_budget() const;
 	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
 	// struct in terrain_3d_avt.h for what each stage owns.
 	void _avt_classify_plan(Terrain3DAVTProducePass &r_pass);
 	void _avt_retain_visible(const Terrain3DAVTProducePass &p_pass);
 	Terrain3DPagePipeline::Request _avt_page_request(const Terrain3DAVTPageRequest &p_page) const;
-	bool _avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page, bool p_prefetch = false);
+	bool _avt_produce_page(Terrain3DAVTProducePass &r_pass, const Terrain3DAVTPageRequest &p_page);
 	// `p_refill_above` > 0 skips the call when the source queue already holds that many claimable
 	// requests; the second call of a tick passes it. `p_refill` names which of the two the
 	// statistics describe. See the definition.
 	void _avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const int p_refill_above = 0, const bool p_refill = false);
 	void _avt_produce_visible(Terrain3DAVTProducePass &r_pass, int p_max_pages);
-	void _avt_produce_prefetch(Terrain3DAVTProducePass &r_pass, int p_max_pages);
 	void _avt_finish_produce(Terrain3DAVTProducePass &r_pass);
 	Terrain3DAVTPlanKey _avt_plan_state(bool p_bounds_ready) const;
 	int _avt_install_or_reuse_plan(uint64_t p_started, int p_max_pages, bool p_same_plan);
 	Terrain3DAVTSectorScan _avt_scan_sectors(const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position,
 			bool p_bounds_ready, const Vector2 &p_focus, float p_reach) const;
-	// World/texel scale of one AVT world level's logical image. A pure function of the live
-	// VT configuration, so the plan that stores it and the directory that publishes it read
-	// it independently instead of one planner phase reading what another wrote.
-	float _avt_logical_ratio() const;
 	Terrain3DAVTHierarchy _avt_build_hierarchy(const Terrain3DAVTSectorScan &p_scan);
 	void _avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, const Vector2 &p_focus, float p_reach);
 	void _avt_submit_plan(Terrain3DAVTHierarchy &r_hierarchy, const Terrain3DAVTPlanKey &p_plan_key,
-			const TerrainVT::VisibleView &p_view, const Vector3 &p_camera_position, bool p_bounds_ready,
+			const TerrainVT::VisibleView &p_view, bool p_bounds_ready,
 			const Vector2 &p_focus, float p_reach);
 	bool _avt_publish_directory(const Terrain3DAVTHierarchy &p_hierarchy, bool p_directory_dirty);
 	// Regions
@@ -437,12 +422,6 @@ public:
 	real_t get_vt_motion_lead_ms() const { return _vt.vt_motion_lead_ms; }
 	void set_avt_feedback(bool p_enabled);
 	bool get_avt_feedback() const { return _vt.avt_feedback; }
-	// Which page source the near field's feedback switch may answer an unserved cold page from.
-	// `AVT_FEEDBACK_SOURCE_COARSE` is the near field's own resident hierarchy and its independent
-	// fallback grid; `AVT_FEEDBACK_SOURCE_SVT` is the far field's own sparse virtual texture, which
-	// is a second virtual texture path with its own atlas and residency. See the definitions.
-	void set_avt_feedback_source(int p_source);
-	int get_avt_feedback_source() const { return _vt.avt_feedback_source; }
 	float get_avt_density_scale() const { return _vt.avt_density_scale; }
 	// The sample level at which the fallback table takes over: a sample at or above it reads the
 	// fallback table directly, one below it is an upgrade and goes through the sector directory for
@@ -760,9 +739,6 @@ public:
 	// turn brings new world into the frustum the way a step does. See
 	// Terrain3DVTState::vt_motion_lead_ms and the note on the turn half of the state.
 	void _vt_update_motion_lead();
-	// Arms the cold-view burst and the source fallback a cut leaves behind. Called by the two
-	// discontinuity branches of the motion sampler, which are the only places a cut is recognised.
-	void _vt_arm_cold_view();
 	Transform3D _vt_lead_camera_transform(const Transform3D &p_camera_transform) const;
 	Transform3D _vt_plan_key_transform(const Transform3D &p_camera_transform) const;
 	RID get_avt_sector_directory() const { return _vt.avt_sector_directory.is_valid() ? _vt.avt_sector_directory->get_rid() : RID(); }

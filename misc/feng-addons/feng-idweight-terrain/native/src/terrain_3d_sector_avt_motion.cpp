@@ -4,8 +4,9 @@
 
 // One of five files that own the near field. A page costs several frames to assemble
 // and a compressed one several more to encode and read back, so demand issued at the moment a page
-// becomes visible can only ever be late. Motion helpers estimate a bounded lead for callers
-// that prefetch. Sector AVT selects current-view demand and nearby omnidirectional roots;
+// becomes visible can only ever be late. Motion helpers estimate a bounded lead, which the plan
+// key and the refinement walk are both derived from. Sector AVT selects current-view demand and
+// nearby omnidirectional roots;
 // `_vt_plan_key_transform()` quantizes the actual transform so the key only changes when the
 // camera leaves a cell - a key that changed every frame would re-derive every page address and
 // throw away the worker's time on each tick.
@@ -130,7 +131,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_last_chain_frame = UINT64_MAX;
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
-				_vt_arm_cold_view();
+				_vt.avt_view_unserved = true;
 			} else {
 				Vector2 velocity = displacement / delta;
 				if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
@@ -157,7 +158,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_last_chain_frame = UINT64_MAX;
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
-				_vt_arm_cold_view();
+				_vt.avt_view_unserved = true;
 			} else {
 				Vector3 turn = cross.length() > 1e-6f ? cross.normalized() * (step / delta) : Vector3();
 				if (turn.length() > MOTION_MAX_TURN_RATE) { turn = turn.normalized() * MOTION_MAX_TURN_RATE; }
@@ -206,21 +207,6 @@ void Terrain3D::_vt_update_motion_lead() {
 	// phase budgets on its own, on every frame of a turn. Derived from the lead rather than set
 	// separately, so there is one number for how far ahead the plan looks.
 	_vt.avt_plan_refresh_frames = uint64_t(CLAMP(int(float(_vt.vt_motion_lead_ms) / 16.7f) / 2, 2, 8));
-}
-
-// A cut - a snap turn, a teleport, a camera that crossed the working-set window in one interval -
-// leaves a view nothing has produced for. The plan that a cut submits is installed a tick or two
-// later and is almost entirely missing, and the shader draws it through the independent fallback,
-// which is one texel per metre: at a 1080p footprint that is a flat smear, and it is what a turn is
-// reported to show for as long as the plan takes to fill. Arm the production burst that answers it
-// here, where the cut is recognised: it is re-armed by the production pass while the plan is still
-// mostly missing, so it does not outlive the cold view and an ordinary moving camera never arms it.
-void Terrain3D::_vt_arm_cold_view() {
-	_vt.avt_burst_from_cut = true;
-	_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
-	_vt.avt_cold_burst_spent = 0;
-	// The episode's own page count, which is what bounds it (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`).
-	_vt.avt_burst_pages = 0;
 }
 
 Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_transform) const {

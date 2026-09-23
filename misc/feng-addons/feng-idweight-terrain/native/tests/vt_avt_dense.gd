@@ -345,8 +345,18 @@ func _check_preview_read_only() -> Dictionary:
 			_require(is_equal_approx(allocation.size.x, float(cell.get("block_size", 0))) and
 						is_equal_approx(allocation.size.y, float(cell.get("block_size", 0))),
 					"allocated AVT sector reports its real page-table block")
-	_require(offscreen_apron <= 8,
-			"AVT preview limits invisible sectors to the bounded offscreen apron")
+	# The near field keeps a page for every cell inside its reach, on screen or not. That is the
+	# additional-feedback guarantee a snap turn lands on - the reference implementation adds one
+	# coarsest page per resident virtual image every frame - and it replaced the eight cell offscreen
+	# apron this used to assert, which left a 180 degree turn naming ground no plan had ever held.
+	# The bound that matters now is the reach itself: the scan may not enumerate a cell outside the
+	# square the reach circle is inscribed in.
+	var reach: float = max(64.0, float(terrain.get_surface_vt_distance()))
+	var reach_span: int = int(ceil(reach / SECTOR_WORLD)) * 2 + 1
+	_require(offscreen_apron > 0,
+			"AVT keeps off-frustum cells addressable for a turn")
+	_require(sectors.size() <= reach_span * reach_span,
+			"AVT scans no cell outside the near field's own reach")
 	_require(preview == preview_again, "repeating the read-only AVT preview is deterministic")
 	var after_stats: Dictionary = terrain.get_surface_vt().get_stats()
 	_require(_page_records().size() == before_pages and int(after_stats.get("alloc_count", 0)) == before_allocs and

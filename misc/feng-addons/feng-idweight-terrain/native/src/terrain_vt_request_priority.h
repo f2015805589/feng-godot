@@ -58,6 +58,21 @@ inline PageRequestPriority make_page_request_priority(const PageRequestKind p_ki
 // Return true when p_left must be submitted/consumed before p_right. Equal
 // keys deliberately return false both ways; callers use stable_sort so page
 // generation order remains the deterministic final tie breaker.
+//
+// Whole-cell roots first, then the nearest distance band, and inside one band the *coarser* page
+// before its children. The band before the span is deliberate and measured, not inherited.
+//
+// The reference implementation orders its bake queue by page level instead: `PackedPageIDComparer`
+// sorts by physical mip and so produces the coarsest page of the whole view first. Its coarse page
+// is a real image - the minimum virtual image is 32 texels per metre over a sector - so that order
+// gives a uniformly *readable* view within a few pages. This pipeline's coarse end is a 4 texels
+// per metre whole-cell page over the independent dense fallback, and a view whose every fragment
+// resolves there reads as flat ground. Porting the order was tried and measured on the reference
+// project's first 180-degree cut at 1920x1080: frames-to-acceptable moved from 14/32 to 20/48 over
+// the four windows, because the batch then spent its first frames on pages that sharpen no block
+// above the acceptance floor. Nearest-band-first spends them where the screen is largest, which is
+// the same greedy over drawn area that the coarse order is a greedy over level. See
+// `docs/vt_reference_avt_alignment.md`.
 inline bool page_request_priority_before(const PageRequestPriority &p_left,
 		const PageRequestPriority &p_right) noexcept {
 	if (p_left.kind != p_right.kind) {

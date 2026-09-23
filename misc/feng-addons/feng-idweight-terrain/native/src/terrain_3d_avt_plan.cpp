@@ -12,8 +12,7 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	r_job.pages = p_input.coarse.pages;
 	r_job.roots = int(r_job.pages.size());
 	r_job.budget = p_input.budget;
-	r_job.warm.clear();
-	r_job.retain_cap = r_job.tail_cap = r_job.mip_bias = r_job.denied = 0;
+	r_job.retain_cap = r_job.denied = 0;
 	r_job.invisible_cell_pages = 0;
 	struct Node {
 		const Terrain3DAVTSector *cell;
@@ -141,13 +140,26 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	while (!pending.empty() && int(roots.size()) < root_limit) { roots.push_back(pop_pending()); }
 	pending.clear();
 	for (const Node &node : roots) {
+		// A cell the view samples has its whole-cell page produced as a root, ahead of every
+		// refinement. A cell the view does *not* sample keeps one too - that is the additional
+		// feedback guarantee, and it is what a turn lands on - but as OPTIONAL work, behind all of
+		// the current view's pages. The order matters: the ring's off-frustum roots are residency
+		// the *next* view needs, and spending the first frames of a session on them leaves the view
+		// the user is looking at flat for as long as they take. Produced last they cost nothing
+		// today and are resident by the time a settled view is asked to turn.
+		const TerrainVT::PageRequestKind kind = node.cell->produce
+				? TerrainVT::PageRequestKind::ROOT
+				: TerrainVT::PageRequestKind::OPTIONAL;
 		r_job.pages.push_back({ node.cell->owner, node.mip, node.x, node.y, node.rect,
-			TerrainVT::make_page_request_priority(TerrainVT::PageRequestKind::ROOT, node.distance, node.rect.size.x) });
+			TerrainVT::make_page_request_priority(kind, node.distance, node.rect.size.x) });
 		if (!node.cell->produce) { ++r_job.invisible_cell_pages; }
 		if (node.mip > 0 && node.cell->produce && node.rect.size.x * node.density > p_input.page_size) {
 			for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) { enqueue(*node.cell, node.mip - 1, x, y); }
 		}
 	}
+	// The off-frustum roots carry the OPTIONAL kind, so the production order - which
+	// `_avt_classify_plan()` derives from the same priority, kind first - puts every page the
+	// current view samples ahead of them whatever order this walk appended them in.
 	r_job.roots = int(r_job.pages.size());
 	// Keep a small recently-visible window while making room for the new view.
 	// Every local image has a complete parent chain; the sector tier count never
@@ -181,7 +193,6 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 		}
 	}
 	r_job.retain_cap = MIN(retain_reserve, MAX(0, p_input.budget - int(r_job.pages.size())));
-	r_job.tail_cap = r_job.retain_cap;
 	r_job.denied = int(pending.size());
 	std::stable_sort(r_job.pages.begin() + r_job.roots, r_job.pages.end(), [](const auto &a, const auto &b) {
 		return TerrainVT::page_request_priority_before(a.priority, b.priority);
@@ -192,7 +203,7 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	for (const auto &page : r_job.pages) {
 		const float texel = page.rect.size.x / p_input.page_size;
 		r_job.finest = r_job.finest > 0.f ? MIN(r_job.finest, texel) : texel;
-		if (page.owner != avt_coarse_owner()) { r_job.level_mips.set(page.mip, r_job.level_mips[page.mip] + 1); }
+		if (page.owner != avt_coarse_owner()) { r_job.level_mips.set(CLAMP(page.mip, 0, 16), r_job.level_mips[CLAMP(page.mip, 0, 16)] + 1); }
 	}
 	r_job.world_pages = coarse_count;
 	r_job.elapsed_us = Time::get_singleton()->get_ticks_usec() - started;
