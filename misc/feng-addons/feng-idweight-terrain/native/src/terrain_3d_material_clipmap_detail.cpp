@@ -628,27 +628,98 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	const Vector2 forward = p_view.forward.length_squared() > 1e-8f ? p_view.forward.normalized()
 																	: Vector2(0.f, -1.f);
 	const real_t cos_limit = Math::cos(_config.forward_half_angle);
+	// The ground footprint of one screen pixel at distance d is `pixel_unit * d` metres, where
+	// `pixel_unit` is the viewport's angular pixel size. `required_texels_per_meter(d)` is
+	// `tpp / (pixel_unit * d)`, so the *requested* band of a level - the distances over which its
+	// density is the one a pixel wants - runs from where the next finer level's density stops being
+	// enough to where its own does, and the coarsest runs to the demand radius.
+	//
+	// That rule is a request, and at the shipped shape it asks for far more 2 MiB tiles than the slot
+	// table holds: the finest band alone needs hundreds. The walk below spends the table nearest
+	// first, so a table that cannot hold the whole request used to leave everything past the nearest
+	// tiles to the 1 texel/m ring while the tile under the focus - the one every density reading is
+	// taken at - answered 1024. That is the "numbers pass, picture is mush" state this fit exists to
+	// remove. The bands are therefore fitted to the table first: one factor `scale <= 1` shrinks every
+	// boundary except the coarsest (which always reaches `demand_radius`), chosen as the largest that
+	// keeps the demanded tile count inside the table. The near field is then covered *contiguously* -
+	// the finest level over its share, each coarser level over the next - so the whole `demand_radius`
+	// is detail, at the finest density the table can afford, instead of a fine patch under the camera.
+	const real_t pixel_unit = 2.f * Math::tan(p_view.fov_y * 0.5f) / real_t(MAX(1, p_view.viewport_height));
+	const real_t tpp = p_view.texels_per_pixel > 0.f ? p_view.texels_per_pixel : _config.texels_per_pixel;
+	real_t desired[MAX_LEVELS];
+	for (int level = 0; level < _config.levels; level++) {
+		desired[level] = _config.demand_radius;
+		if (level < _config.levels - 1) {
+			desired[level] = MIN(desired[level],
+					tpp / MAX(real_t(1e-4), pixel_unit * get_level_texels_per_meter(level)));
+		}
+	}
+	// The tiles a fitted band set demands, over the disc the forward cone keeps. The walk below keeps
+	// a tile whose *square* meets its band (one half diagonal of reach), so the estimate measures each
+	// band grown by that reach and targets 90% of the table: the ~10% left over keeps the walk from
+	// starving its own tail, and whatever survives the discrete grid is still reported through
+	// `_starved`.
+	const real_t cone_fraction = _config.forward_half_angle / real_t(Math_PI);
+	real_t band_outer[MAX_LEVELS];
+	const double table_target = double(_slot_count) * 0.9;
+	auto fit_bands = [&](const real_t p_scale) {
+		for (int level = 0; level < _config.levels; level++) {
+			band_outer[level] = level == _config.levels - 1
+					? _config.demand_radius
+					: MIN(_config.demand_radius, p_scale * desired[level]);
+		}
+		// The scale preserves the order, but a tiny `demand_radius` can make the coarsest boundary
+		// smaller than a scaled one; keep the boundaries monotone either way.
+		for (int level = 1; level < _config.levels; level++) {
+			band_outer[level] = MAX(band_outer[level], band_outer[level - 1]);
+		}
+	};
+	auto estimate_tiles = [&]() {
+		double total = 0.0;
+		for (int level = 0; level < _config.levels; level++) {
+			const real_t tile_world = get_level_tile_world(level);
+			// The walk below keeps a tile whose *square* meets its band, not only whose centre does -
+			// that is what closes the seams between two bands, whose boundary is one radius but whose
+			// tiles are two sizes. The estimate therefore measures the bands grown by a tile's half
+			// diagonal, which is the set the walk actually keeps.
+			const real_t reach = tile_world * 0.70710678f;
+			const real_t inner = MAX(real_t(0), (level > 0 ? band_outer[level - 1] : 0.f) - reach);
+			const real_t outer = band_outer[level] + reach;
+			if (outer > inner) {
+				total += double(cone_fraction) * double(Math_PI) *
+						double(outer * outer - inner * inner) / double(tile_world * tile_world);
+			}
+		}
+		return total;
+	};
+	fit_bands(1.f);
+	if (estimate_tiles() > table_target) {
+		real_t low = 0.f;
+		real_t high = 1.f;
+		for (int step = 0; step < 32; step++) {
+			const real_t mid = (low + high) * 0.5f;
+			fit_bands(mid);
+			if (estimate_tiles() <= table_target) {
+				low = mid;
+			} else {
+				high = mid;
+			}
+		}
+		fit_bands(low);
+	}
 	for (int level = 0; level < _config.levels; level++) {
 		const real_t tile_world = get_level_tile_world(level);
-		const real_t tpp = p_view.texels_per_pixel > 0.f ? p_view.texels_per_pixel : _config.texels_per_pixel;
-		// The ground footprint of one screen pixel at distance d is `pixel_unit * d` metres, where
-		// `pixel_unit` is the viewport's angular pixel size. `required_texels_per_meter(d)` is
-		// `tpp / (pixel_unit * d)`, so this level's band - the distances over which its density is
-		// the one a pixel wants - runs from where the *next finer* level's density stops being
-		// enough to where this level's own does. The coarsest level runs to the demand radius,
-		// because there is no coarser detail level to hand the fringe to: beyond it the ring serves.
-		const real_t pixel_unit = 2.f * Math::tan(p_view.fov_y * 0.5f) / real_t(MAX(1, p_view.viewport_height));
-		real_t outer = _config.demand_radius;
-		if (level < _config.levels - 1) {
-			outer = MIN(outer, tpp / MAX(real_t(1e-4), pixel_unit * get_level_texels_per_meter(level)));
-		}
-		const real_t inner = level > 0
-				? tpp / MAX(real_t(1e-4), pixel_unit * get_level_texels_per_meter(level - 1))
-				: 0.f;
+		const real_t outer = band_outer[level];
+		const real_t inner = level > 0 ? band_outer[level - 1] : 0.f;
 		if (inner >= outer) {
 			continue;
 		}
-		const int radius = int(Math::ceil(outer / tile_world)) + 1;
+		// A tile joins its band when its *square* meets the annulus, not when its centre does: two
+		// adjacent bands meet at one radius but hold tiles of two sizes, so a centre test leaves a
+		// tile-wide seam between them where neither level's tile is kept and the fragment falls to the
+		// ring. Growing each band by a half diagonal makes the two overlap instead.
+		const real_t reach = tile_world * 0.70710678f;
+		const int radius = int(Math::ceil((outer + reach) / tile_world)) + 1;
 		const Vector2i center = _tile_of_world(level, p_view.focus);
 		for (int dy = -radius; dy <= radius; dy++) {
 			for (int dx = -radius; dx <= radius; dx++) {
@@ -657,7 +728,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 				const Vector2 tile_center((real_t(x) + 0.5f) * tile_world, (real_t(y) + 0.5f) * tile_world);
 				const Vector2 offset = tile_center - p_view.focus;
 				const real_t distance = offset.length();
-				if (distance < inner || distance >= outer) {
+				if (distance - reach >= outer || distance + reach < inner) {
 					continue;
 				}
 				// The forward cone. A tile behind the camera is not drawn, and a slot spent on it is
@@ -669,8 +740,8 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 			}
 		}
 	}
-	// Nearest first: a budget that cannot hold the whole walk keeps the finest, closest tiles and
-	// lets the coarse ring serve the rest.
+	// Nearest first: the fitted walk fits the table, but eviction and the one-tile-a-tick bake offer
+	// both read this order, so the tile a fragment is waiting for is still the first one served.
 	std::sort(demand.begin(), demand.end(), [](const Demand &a, const Demand &b) {
 		if (a.distance != b.distance) {
 			return a.distance < b.distance;

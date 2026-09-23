@@ -227,6 +227,11 @@ func setup() -> void:
 	terrain.vt_delivery_far_material = DIRECT
 	terrain.vt_delivery_near_height = DIRECT
 	terrain.vt_delivery_far_height = DIRECT
+	# The detail layer is on by default, because selecting `Clipmap` for the material group is what
+	# asks for the 1024 texels/m near field. This suite is about the *ring's* baked arm answering the
+	# material band, so the layer is switched off here and the ring is isolated; the layer's own
+	# behaviour is `vt_clipmap_density`'s.
+	terrain.vt_clipmap_detail_enabled = false
 	terrain.assets = Terrain3DAssets.new()
 	for id in 2:
 		var asset := Terrain3DTextureAsset.new()

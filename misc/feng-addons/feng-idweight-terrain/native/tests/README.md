@@ -1532,4 +1532,28 @@ material replacement not reaching the ring's baked layers is a stage 3 failure a
 The recorded pre-fix evidence is in
 `native/tests/baselines/clipmap-material-baseline-2026-09-23.md`.
 
+`vt_clipmap_sharpness` is the companion evidence runner for the same feature along the **user's** path:
+it selects `Clipmap` on the near material group and changes nothing else - the detail layer, its
+density and its budget are left at their shipped defaults - and then measures the *point-wise* density
+at every visible ground point within 8 m through `Terrain3D.sample_vt_detail()`, the CPU mirror of the
+shader's own directory lookup. That is the reading the density test's report cannot give: its
+`delivered_density` answers at the last demand walk's focus, so a build whose focus tile is 1024 while
+the rest of the near field falls to the 1 texel/m ring reads as `1024/1.000` - the "numbers pass,
+picture is mush" state the fix removes. The runner asserts the probe point at 1024 and that every
+visible near point is served by the detail layer (>= 128 texels/m, the coarsest level) rather than the
+ring, at rest and after a camera move, and saves the same patch with the detail layer on and off to the
+fixture's `shots/` directory.
+
+Two pieces of the fix that reading made necessary are worth naming here. Selecting `Clipmap` for the
+material group now brings the detail layer up **by default**, because at the shipped shape the ring
+alone is 1 texel/m and the hidden switch was the whole of the difference between the acceptance
+reading and the picture the user saw. And the demand walk now *fits* its level bands to the slot table:
+the screen-footprint rule asks for far more fine tiles than the budget holds, and the walk spends the
+table nearest-first, so the unfitted rule covered a fine patch under the camera and left the rest of
+the near field to the ring. One scale factor shrinks every band boundary except the coarsest - which
+always reaches `demand_radius` - to the largest set the table holds, the bands are grown by a tile's
+half diagonal so adjacent levels overlap instead of leaving a seam, and the near field is covered
+contiguously at the finest density the table can afford. The starved remainder is still published as
+`fallback_tiles`.
+
 

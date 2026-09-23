@@ -572,18 +572,29 @@ struct Terrain3DVTState {
 	// that cannot afford one ring of tiles turns the layer off with a log rather than allocating
 	// something unusable. `detail_demand_radius` bounds the near field the layer sharpens, in metres;
 	// beyond it the ring serves.
-	// The layer's own switch. **Off by default, deliberately.** Selecting `Clipmap` for the material
-	// group alone must keep the picture the ring's own baked layers produce, which is what the
-	// existing render suite compares and what its expectations are written against; a layer that
-	// sharpens the near field over that picture is a choice a project opts into, not a side effect of
-	// choosing a delivery method. With it off nothing is allocated: no textures, no directory and no
-	// job queue. The 1024-density acceptance enables it.
-	bool detail_enabled = false;
+	// The layer's own switch. **On by default.** Selecting `Clipmap` for the material group is the
+	// whole instruction: at the shipped shape the ring alone is 1 texel/m, so leaving the layer off
+	// renders the picture a user who asked for 1024 texels/m reads as blur, with no visible control
+	// that says why - the switch is not the answer to "why is my near material mushy". The layer is
+	// therefore part of what selecting the method means, and a project that wants the ring's own
+	// picture turns it off. With it off nothing is allocated: no textures, no directory and no job
+	// queue.
+	bool detail_enabled = true;
 	real_t detail_density = 1024.f;
-	real_t detail_min_density = 256.f;
+	// The coarsest detail level. 128 gives four levels (1024/512/256/128) out of the same slot table
+	// the three-level shape used. The coarsest level is the cheap one - a tile is `tile_size / 128`
+	// metres wide, four times the area of the finest tile per slot - and the demand fit in the
+	// manager uses it to keep the whole `demand_radius` covered by the detail layer instead of letting
+	// the fringe fall back to the 1 texel/m ring.
+	real_t detail_min_density = 128.f;
 	int detail_tile_size = 256;
 	int detail_directory_size = 128;
-	int detail_budget_bytes = 256 * 1024 * 1024;
+	// What the whole layer may hold on the GPU. The finest tiles are ~2 MiB each, so this is what
+	// decides how much of the screen footprint rule the near field can actually be served at; the
+	// manager fits its level bands to the table, and reports the starved remainder rather than hiding
+	// it. 512 MiB keeps the 1024 level over the ground a 1080p view actually reads at the reference
+	// pose and still leaves the coarser levels to cover the rest of `demand_radius`.
+	int detail_budget_bytes = 512 * 1024 * 1024;
 	real_t detail_demand_radius = 12.f;
 	real_t detail_texels_per_pixel = 4.f;
 	std::unique_ptr<Terrain3DMaterialClipmapDetail> material_detail;

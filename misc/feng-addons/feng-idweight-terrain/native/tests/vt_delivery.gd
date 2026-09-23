@@ -146,6 +146,10 @@ func run() -> void:
 	scene = Node3D.new()
 	terrain = Terrain3D.new()
 	terrain.surface_svt_auto_bake = false
+	# The matrix is this suite's subject, not the 1024 detail layer that selecting `Clipmap` on the
+	# material group now brings up by default: it is switched off so a matrix read allocates no detail
+	# arrays and the ring's own arm is the material this suite measures.
+	terrain.vt_clipmap_detail_enabled = false
 	scene.add_child(terrain)
 	root.add_child(scene)
 	terrain.set_camera(camera)

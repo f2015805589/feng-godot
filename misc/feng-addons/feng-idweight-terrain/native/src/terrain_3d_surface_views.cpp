@@ -1070,7 +1070,13 @@ void Terrain3D::_update_vt_material_detail() {
 	_vt.detail_requested_tiles = detail->update(view, _vt.vt_source_snapshot, _vt.clipmap_budget_texels);
 	_vt.detail_starved_tiles = detail->get_starved_tiles();
 	if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-		surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels);
+		// The ring's texel budget is a tick's worth of *ring* work, and one detail tile is a whole
+		// small array at the same cost, so that budget admits exactly one tile a tick: the near field
+		// took seconds to fill after a move, which is a second kind of blur. The offers are spent in
+		// tile units and the layer is bounded by its own slot table, so asking for a multiple of the
+		// ring's budget fills the near field in a few frames without changing what one ring tick
+		// produces.
+		surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels * 4);
 	}
 	_vt.vt_detail_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	_update_vt_detail_arm();
