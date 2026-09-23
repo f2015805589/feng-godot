@@ -206,6 +206,10 @@ private:
 	PackedByteArray _material_bytes;
 	int _material_count = 0;
 	std::map<int, PendingJob> _pending;
+	// The producer handoff's cost, split into the wait for the queue's mutex and the work done
+	// under it. See `get_queue_lock_stats()`.
+	std::atomic<uint64_t> _queue_wait_us{ 0 }, _queue_hold_us{ 0 };
+	std::atomic<uint64_t> _queue_calls{ 0 };
 
 	// One *rect of a level* waiting for its bake, which is the ring's own unit of production: a fill, a
 	// strip, an invalidated area. Everything the dispatch needs is copied in: the callback runs on
@@ -747,6 +751,11 @@ public:
 	// belong to. Bind the material from this, never from the three getters above.
 	godot::Dictionary get_published_arrays() const;
 	bool is_page_ready(int p_slot) const;
+	// Where a `queue_page()` call's wall time went: waiting for the queue's mutex and the work
+	// done while holding it. A demand pass hands the producer one page at a time, so the two are
+	// what separates "the render thread is holding the queue" from "the call's own work is what
+	// it costs". Session totals; the reader differences two readings.
+	void get_queue_lock_stats(uint64_t &r_wait_us, uint64_t &r_hold_us, uint64_t &r_calls) const;
 	// How many of these slots hold no content, read under one lock so a resident set can be
 	// verified without a lock per slot.
 	int count_unready_pages(const std::vector<int> &p_slots) const;

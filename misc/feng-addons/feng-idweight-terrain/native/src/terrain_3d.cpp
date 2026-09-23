@@ -359,7 +359,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 		// The stages of the pass that produced the peak, kept in their own dictionary. The live
 		// one is overwritten by every pass, so a peak read from it describes whatever ran last -
 		// which is never the peak, because the peak is by definition the pass that took longest.
-		_vt.avt_peak_stats = _vt.avt_sector_stats.duplicate();
+		_vt.avt_peak_stats = _vt.avt_sector_stats.to_dictionary();
 		_vt.avt_peak_stamp_us = Time::get_singleton()->get_ticks_usec();
 	}
 	// Refresh the far field: a world-space page grid that spans regions.

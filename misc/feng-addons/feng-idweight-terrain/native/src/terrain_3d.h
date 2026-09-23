@@ -312,6 +312,10 @@ private:
 	// The same question with the producer's answer already known (-1 asks it here), so a
 	// verification pass over a whole resident set takes one lock instead of one per page.
 	bool _vt_page_production_stale(int p_slot, int p_ready);
+	// One page record as the script-facing dictionary `get_vt_pages()` returns. The production path
+	// stores records as plain values (`Terrain3DVTState::PageRecord`), so the dictionary a
+	// diagnostic reads is built here, on demand, instead of once per produced page.
+	Dictionary _vt_page_record_dictionary(const Terrain3DVTState::PageRecord &p_record) const;
 	// `get_vt_settings()` is one flat dictionary assembled by owner: each view and the fade write
 	// the keys their own fields back, from the file that owns those fields, and
 	// `_report_vt_service()` adds the service's half.

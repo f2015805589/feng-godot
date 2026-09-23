@@ -670,7 +670,46 @@ struct Terrain3DVTState {
 	std::unique_ptr<Terrain3DPagePipeline> vt_page_pipeline, svt_page_pipeline;
 	std::map<int, Terrain3DPagePipeline::Request> svt_pending_pages;
 	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> vt_source_snapshot;
-	Dictionary vt_page_records;
+	// One produced page's demand record. It is written once for every page a pass hands to the
+	// pool, so it is a plain value in a slot-keyed table and not a Godot Dictionary: building the
+	// Dictionary here - nine String-keyed entries and the nodes they allocate - measured 14.7 us
+	// of an 18.3 us per-page publish on a moving view, which made the *record* of a production the
+	// largest cost the production had. Every reader either wants one field (`queued_frame` for the
+	// retry window, `world_rect` for a region invalidation) or is a diagnostic that can afford to
+	// build the script-facing Dictionary on demand (`get_vt_pages()`); see
+	// `_vt_page_record_dictionary()`.
+	struct PageRecord {
+		// What the page's production is doing. The script-facing state string is spelled from
+		// this, so the two cannot drift.
+		enum State {
+			PENDING_BAKE = 0,
+			PENDING_CELL_COPY = 1,
+			MISSING_BAKE = 2,
+			PENDING_RESIDENT_FALLBACK = 3,
+			MISSING_STALE_CELL_BAKE = 4,
+			NO_RESIDENT_PAYLOAD = 5,
+			READY = 6,
+		};
+		// The state the debug page list publishes. It is spelled here, beside the enum, so the
+		// two cannot drift - the strings are the ones the tests and the editor dock read.
+		const char *state_name() const;
+		int slot = -1;
+		// The view that queued it: the near field's pages and the far field's share one record
+		// table because they share one pool.
+		bool svt = false;
+		State state = PENDING_BAKE;
+		Rect2 world_rect;
+		int mip = 0;
+		Vector2i address;
+		int64_t revision = 0;
+		int64_t queued_frame = 0;
+		// Cells a pending cell copy covers, for the debug list.
+		int cells = 0;
+		// The source the page is being produced from: a page's payload is a few hundred
+		// kilobytes and this is a refcount, not a copy.
+		Ref<Image> source;
+	};
+	std::unordered_map<int, PageRecord> vt_page_records;
 	Dictionary vt_registered_sectors;
 	PackedFloat32Array surface_vt_block_sizes;
 	// The page-array bundle the material is bound to, with the invariant that identifies it. See
@@ -741,7 +780,41 @@ struct Terrain3DVTState {
 	int avt_directory_mask = 0;
 	int avt_root_level = 1;
 	Terrain3DAVTCoarseImage avt_coarse;
-	Dictionary avt_sector_stats;
+	// The near field's published statistics, keyed by name. Writing one used to be a String-keyed
+	// Godot Dictionary assignment: a `String` built from the literal, its hash, a boxed Variant and
+	// an inserted node. The AVT tick makes about a hundred of those per planning tick and forty per
+	// production pass, and at the ~1.5 us each measures they were the whole of the `finish` stage
+	// and most of the `key`/plan bookkeeping - the pass spent more time describing itself than
+	// producing. Here the values live in a plain keyed set, written with a `std::string`-keyed
+	// insert, and the Dictionary a script reads is materialized on demand by `to_dictionary()`:
+	// once per report, not once per write.
+	//
+	// `operator[]` is kept so every call site still reads `stats["name"] = value`; it hands back a
+	// one-assignment proxy rather than a Dictionary slot.
+	struct Stats {
+		std::unordered_map<std::string, Variant> values;
+
+		struct Slot {
+			Stats *owner = nullptr;
+			const char *key = nullptr;
+			Slot &operator=(const Variant &p_value) {
+				owner->values.insert_or_assign(std::string(key), p_value);
+				return *this;
+			}
+		};
+		Slot operator[](const char *p_key) { return Slot{ this, p_key }; }
+
+		void clear() { values.clear(); }
+
+		Dictionary to_dictionary() const {
+			Dictionary result;
+			for (const auto &entry : values) {
+				result[String(entry.first.c_str())] = entry.second;
+			}
+			return result;
+		}
+	};
+	Stats avt_sector_stats;
 	// Stage sums for the same pass, so the mean of a stage can be read beside the live value of
 	// the last one. The dictionary only ever holds the pass that just ran, and a pass that
 	// installed a plan costs several times one that reused it, so a single reading of it says
@@ -864,6 +937,18 @@ struct Terrain3DVTState {
 	double avt_invalidate_sum_ms = 0.0;
 	double avt_payload_sum_ms = 0.0;
 	double avt_queue_sum_ms = 0.0;
+	// The queue call split further, because `avt_queue_sum_ms` is the whole per-page publish cost
+	// and it is not one thing: `avt_queue_record_sum_ms` is the page record - a String-keyed
+	// Dictionary with eight entries, built and inserted on every produced page - and
+	// `avt_queue_bake_sum_ms` is the producer handoff itself. They have different fixes.
+	double avt_queue_record_sum_ms = 0.0;
+	double avt_queue_bake_sum_ms = 0.0;
+	// Scratch the production pass fills and the source pipeline consumes: the requests it retains
+	// and the requests it primes. Both are built from the pass's missing list - up to the whole
+	// plan - and were local vectors, so a moving view allocated and freed a thirty-kilobyte vector
+	// twice a tick. Held here, `clear()` keeps the capacity and a tick allocates nothing.
+	std::vector<Terrain3DPagePipeline::Request> avt_retain_requests;
+	std::vector<Terrain3DPagePipeline::Request> avt_prime_requests;
 	// Pages of the sampled prefix that have no content this pass, and of those, the ones
 	// whose production is still inside its window. Kept as state and not only as a stat:
 	// the editor has to keep rendering while a page is still owed, and a demand waiting on

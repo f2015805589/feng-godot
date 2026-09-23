@@ -25,6 +25,10 @@ public:
 	// runs has to describe the window the burst filled.
 	static constexpr size_t QUEUE_CAPACITY = 32;
 	static constexpr size_t MAX_QUEUE_CAPACITY = 256;
+	// Payloads a worker may still have to release. Every deferred page holds one page-sized image
+	// (a couple of hundred kilobytes), so the bound is what keeps a queue nobody drains - every
+	// worker parked on a settled view - from being a leak.
+	static constexpr size_t RELEASE_QUEUE_LIMIT = 256;
 	struct ReadyKeys {
 		std::array<Key, MAX_QUEUE_CAPACITY> keys;
 		size_t count = 0;
@@ -122,6 +126,27 @@ public:
 		_queue_limit.store(CLAMP(p_limit, int(QUEUE_CAPACITY), int(MAX_QUEUE_CAPACITY)), std::memory_order_relaxed);
 	}
 	int get_queue_limit() const { return _queue_limit.load(std::memory_order_relaxed); }
+	// Hands a payload the demand thread has finished with to the source workers, which destroy it
+	// between jobs. A produced page replaces the payload it held, and releasing that one is not a
+	// refcount any more: it destroys an `Image`, which takes the object database's lock - the same
+	// lock every source worker takes to *create* the payloads it assembles - and on the demanding
+	// thread that measured as an 11 us stall per produced page, at the page's own handoff, against
+	// 4 us for the whole publish once it was moved. It is deferred rather than avoided: the payload
+	// is dead either way, and the worker that releases it is a thread with slack while the demand
+	// thread is the one the frame is waiting on.
+	//
+	// The demand thread only *stages* here. `flush_releases()` publishes the stage once, at the end
+	// of the tick, because a lock per page is the contention this exists to remove: with every
+	// worker draining, the mutex measured 2.2 us a page on the demanding thread - a smaller copy of
+	// the stall it was introduced to remove. Nothing else touches the stage, so it needs no lock.
+	//
+	// Returns false when the stage is full, which means no worker has drained the published queue
+	// for a while (every one parked on a settled view); the caller's own release is then the
+	// answer, so a queue no one drains cannot grow without bound.
+	bool defer_release(const Ref<godot::Image> &p_payload);
+	// Publishes whatever the demand thread staged, once per tick. Called from the tick's own
+	// "wakes owed" flush, so it runs whichever view is active.
+	void flush_releases();
 	// Wakes the workers for the work submitted since the last call. The demand pass calls this when
 	// it is finished rather than in the middle of itself: a worker woken inside a measured phase
 	// starts competing for this thread's cores, so the phase reads as its own cost when what it
@@ -174,6 +199,27 @@ private:
 	size_t _claim_head = 0;
 	std::mutex _mutex;
 	std::condition_variable _wake, _task_wake;
+	// Payloads the demand thread handed over. The stage is written only by the demanding thread and
+	// needs no lock; the queue beside it is published by `flush_releases()` and drained by the
+	// workers, which is why it has one. Destroying a payload happens outside both, on the draining
+	// worker, because that is exactly the work this exists to keep off the demanding thread's path.
+	std::vector<Ref<godot::Image>> _release_staging;
+	std::mutex _release_mutex;
+	std::vector<Ref<godot::Image>> _released;
+	// How many payloads are published and not yet drained. Read without the lock, so a worker with
+	// nothing to drain does not take it at all.
+	std::atomic<int> _released_count{ 0 };
+	// Releases whatever is published on this thread. Called at the top of a worker's loop, so the
+	// cost lands between two pages rather than on the frame.
+	void _drain_released();
+	// Stages one payload. Called only by the demanding thread, from inside the queue's own critical
+	// sections, so it must not take a lock of its own.
+	bool _stage_release(const Ref<godot::Image> &p_payload);
+	// Hands a queue entry's prepared images to the workers before the entry is dropped. Every path
+	// that erases an entry - `retain` dropping the demand a plan no longer names, `_make_room`, a
+	// cancel - would otherwise destroy three page-sized `Image`s on the demanding thread inside the
+	// queue's own critical section, which is what made one `retain` call measure 0.67 ms.
+	void _defer_result_release(Result &r_result);
 	// How many entries are neither in progress nor finished, i.e. the work a sleeping worker could
 	// still claim, readable without the lock so the demand pass can decide whether a refill is
 	// worth taking the queue mutex for.

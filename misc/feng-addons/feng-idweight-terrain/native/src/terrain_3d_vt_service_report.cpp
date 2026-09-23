@@ -354,6 +354,49 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	}
 }
 
+// The state string the debug page list publishes for one record. Spelled beside the enum so the
+// two cannot drift; the strings are the ones the tests and the editor dock read.
+const char *Terrain3DVTState::PageRecord::state_name() const {
+	switch (state) {
+		case PENDING_BAKE:
+			return "Pending bake";
+		case PENDING_CELL_COPY:
+			return "Pending cell copy";
+		case MISSING_BAKE:
+			return "Missing bake";
+		case PENDING_RESIDENT_FALLBACK:
+			return "Pending resident fallback";
+		case MISSING_STALE_CELL_BAKE:
+			return "Missing/stale cell bake";
+		case NO_RESIDENT_PAYLOAD:
+			return "No resident payload";
+		case READY:
+			return "Ready";
+	}
+	return "Pending bake";
+}
+
+// One record as the dictionary `get_vt_pages()` hands a script. The production path never builds
+// this: a page's record is written once per production and a String-keyed Dictionary there measured
+// 14.7 us of an 18.3 us per-page publish, so the shape a diagnostic wants is assembled on the
+// diagnostic. `source` is deliberately absent - it is the payload Ref, and the page list is a
+// description of residency, not a way to read the image back.
+Dictionary Terrain3D::_vt_page_record_dictionary(const Terrain3DVTState::PageRecord &p_record) const {
+	Dictionary record;
+	record["slot"] = p_record.slot;
+	record["kind"] = p_record.svt ? "SVT" : "AVT";
+	record["state"] = p_record.state_name();
+	record["world_rect"] = p_record.world_rect;
+	record["mip"] = p_record.mip;
+	record["address"] = p_record.address;
+	record["revision"] = p_record.revision;
+	record["queued_frame"] = p_record.queued_frame;
+	if (p_record.cells > 0) {
+		record["cells"] = p_record.cells;
+	}
+	return record;
+}
+
 Array Terrain3D::get_vt_pages() const {
 	Array result;
 	// The owners of a slot are recorded by the *pool*, which both views share, so the view that can
@@ -361,17 +404,19 @@ Array Terrain3D::get_vt_pages() const {
 	// the only way, because a node always had both views - reported an empty list whenever only the
 	// far field was selected, and two suites read that as a page that had been lost.
 	const Terrain3DVirtualTexture *view = _vt.surface_vt ? _vt.surface_vt : _vt.surface_svt;
-	for (const Variant &key : _vt.vt_page_records.keys()) {
-		if (view == nullptr || view->get_slot_owner_count(int(key)) == 0) {
+	for (const auto &entry : _vt.vt_page_records) {
+		const int key = entry.first;
+		if (view == nullptr || view->get_slot_owner_count(key) == 0) {
 			continue;
 		}
-		Dictionary record = Dictionary(_vt.vt_page_records[key]).duplicate();
-		record.erase("source");
-		record["ready"] = _vt.vt_baker.is_valid() && baker(_vt.vt_baker)->is_page_ready(int(key));
+		// The script-facing dictionary is materialized here, on the diagnostic call, rather than
+		// built by the production path: see `Terrain3DVTState::PageRecord`.
+		Dictionary record = _vt_page_record_dictionary(entry.second);
+		record["ready"] = _vt.vt_baker.is_valid() && baker(_vt.vt_baker)->is_page_ready(key);
 		if (bool(record["ready"])) {
 			record["state"] = "Ready";
 		}
-		const Array owners = view->get_slot_owner_metadata(int(key));
+		const Array owners = view->get_slot_owner_metadata(key);
 		record["owners"] = owners;
 		for (Dictionary owner : owners) {
 			if (bool(owner["world_space"])) { continue; }

@@ -1127,7 +1127,7 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_mip_levels"] = _vt.surface_vt_mip_levels;
 	result["avt_mip_level_cap"] = get_avt_mip_level_cap();
 	result["avt_sector_world"] = is_sector_avt() ? double(get_avt_local_section_world()) : double(_region_size * _vertex_spacing);
-	result["avt_sector_stats"] = _vt.avt_sector_stats;
+	result["avt_sector_stats"] = _vt.avt_sector_stats.to_dictionary();
 	result["avt_peak_stats"] = _vt.avt_peak_stats;
 	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0
 			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_peak_stamp_us) / 1000.0;

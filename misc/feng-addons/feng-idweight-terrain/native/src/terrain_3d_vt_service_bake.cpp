@@ -306,14 +306,14 @@ void Terrain3D::_process_svt_bake(int p_page_budget) {
 					if (cell_rect.size.x <= 0.f) {
 						continue;
 					}
-					for (const Variant &key : _vt.vt_page_records.keys()) {
-						Dictionary record = _vt.vt_page_records[key];
-						Rect2 rect = record["world_rect"];
-						if (record.get("kind", String()) != Variant("SVT") || !rect.grow(rect.size.x * _vt.vt_page_border / _vt.vt_page_size).intersects(cell_rect)) {
+					for (const auto &entry : _vt.vt_page_records) {
+						const Terrain3DVTState::PageRecord &record = entry.second;
+						const Rect2 rect = record.world_rect;
+						if (!record.svt || !rect.grow(rect.size.x * _vt.vt_page_border / _vt.vt_page_size).intersects(cell_rect)) {
 							continue;
 						}
 						Ref<Image> payload;
-						_queue_vt_material_page(int(key), payload, rect, true, int(record["mip"]), record["address"]);
+						_queue_vt_material_page(entry.first, payload, rect, true, record.mip, record.address);
 					}
 				}
 			} else {

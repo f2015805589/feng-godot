@@ -285,7 +285,7 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 			if (request_slot < 0) {
 				continue;
 			}
-			const bool tracked = _vt.vt_page_records.has(request_slot);
+			const bool tracked = _vt.vt_page_records.count(request_slot) > 0;
 			if (was_miss || (tracked && _vt_page_production_stale(request_slot))) {
 				_invalidate_vt_slot(request_slot);
 				missing.push_back(request);
@@ -414,13 +414,13 @@ bool Terrain3D::_prepare_vt_sector(const Vector2i &p_region_loc, int p_pages_per
 		_vt.surface_vt->resize_sector(p_region_loc, p_pages_per_axis);
 		// Resizing keeps world footprints while changing their mip addresses.
 		// Keep the inspector's records consistent with the remapped page table.
-		for (const Variant &key : _vt.vt_page_records.keys()) {
-			for (const Dictionary &owner : _vt.surface_vt->get_slot_owner_metadata(int(key))) {
+		for (auto &entry : _vt.vt_page_records) {
+			Terrain3DVTState::PageRecord &record = entry.second;
+			for (const Dictionary &owner : _vt.surface_vt->get_slot_owner_metadata(entry.first)) {
 				if (bool(owner["world_space"]) || Vector2i(owner["sector"]) != p_region_loc) { continue; }
 				const int mip = owner["mip"];
-				Dictionary record = _vt.vt_page_records[key];
-				record["mip"] = mip;
-				record["address"] = Vector2i(owner["virtual"]) - Vector2i(
+				record.mip = mip;
+				record.address = Vector2i(owner["virtual"]) - Vector2i(
 						_vt.surface_vt->get_sector_block_origin_x(p_region_loc) >> mip,
 						_vt.surface_vt->get_sector_block_origin_y(p_region_loc) >> mip);
 			}

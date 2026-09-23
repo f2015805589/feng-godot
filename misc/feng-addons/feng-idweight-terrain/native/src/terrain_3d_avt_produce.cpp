@@ -308,7 +308,11 @@ void Terrain3D::_avt_retain_visible(const Terrain3DAVTProducePass &p_pass) {
 	// _avt_produce_page(). Keeping either kind in the queue only occupies one of its 32 entries
 	// and makes prime scan more work.
 	if (_vt.avt_plan.retained()) { return; }
-	std::vector<Terrain3DPagePipeline::Request> wanted;
+	// The wanted list is a member: it is rebuilt from the whole missing set on every plan the pass
+	// has not retained yet, and a local vector paid a thirty-kilobyte allocation and free for it on
+	// every one of those ticks.
+	std::vector<Terrain3DPagePipeline::Request> &wanted = _vt.avt_retain_requests;
+	wanted.clear();
 	wanted.reserve(p_pass.missing.size());
 	for (const Terrain3DAVTPageRequest *page : p_pass.missing) { wanted.push_back(_avt_page_request(*page)); }
 	_vt.vt_page_pipeline->retain(wanted);
@@ -332,7 +336,8 @@ void Terrain3D::_avt_prime_sources(const Terrain3DAVTProducePass &p_pass, const 
 	const int window = _vt.vt_page_pipeline->get_queue_limit();
 	const int refill_above = p_refill_above > 0 ? MAX(p_refill_above, window / 2) : 0;
 	if (refill_above > 0 && _vt.vt_page_pipeline->claimable_count() >= refill_above) { return; }
-	std::vector<Terrain3DPagePipeline::Request> requests;
+	std::vector<Terrain3DPagePipeline::Request> &requests = _vt.avt_prime_requests;
+	requests.clear();
 	requests.reserve(size_t(window));
 	// The readiness snapshot may skip unfinished pages before reaching the end.
 	// Refill those holes too; successfully consumed requests are cleared below.
@@ -577,6 +582,17 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	_vt.avt_sector_stats["invalidate_sum_ms"] = _vt.avt_invalidate_sum_ms;
 	_vt.avt_sector_stats["payload_sum_ms"] = _vt.avt_payload_sum_ms;
 	_vt.avt_sector_stats["queue_sum_ms"] = _vt.avt_queue_sum_ms;
+	_vt.avt_sector_stats["queue_record_sum_ms"] = _vt.avt_queue_record_sum_ms;
+	_vt.avt_sector_stats["queue_bake_sum_ms"] = _vt.avt_queue_bake_sum_ms;
+	// And the producer handoff split into the wait for its queue's mutex and the work done while
+	// holding it, so "the render thread is holding the queue" is a reading and not a hypothesis.
+	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		uint64_t queue_wait_us = 0, queue_hold_us = 0, queue_calls = 0;
+		baker->get_queue_lock_stats(queue_wait_us, queue_hold_us, queue_calls);
+		_vt.avt_sector_stats["producer_lock_wait_ms"] = double(queue_wait_us) / 1000.0;
+		_vt.avt_sector_stats["producer_lock_hold_ms"] = double(queue_hold_us) / 1000.0;
+		_vt.avt_sector_stats["producer_lock_calls"] = int64_t(queue_calls);
+	}
 	_vt.surface_vt->set_allocation_budget(-1);
 	_vt.avt_sector_stats["produced"] = r_pass.produced;
 	if (r_pass.missing.empty() && r_pass.produced == 0) { _vt.avt_settled.verified(pool->residency_revision); }

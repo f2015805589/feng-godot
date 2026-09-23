@@ -75,16 +75,16 @@ void Terrain3D::_process_async_svt_pages() {
 		if (!_vt.svt_page_pipeline->poll(it->second, _vt.vt_source_snapshot, result)) {
 			++it; continue;
 		}
-		if (_vt.vt_page_records.has(slot)) {
-			Dictionary record = _vt.vt_page_records[slot];
+		if (_vt.vt_page_records.count(slot) > 0) {
+			Terrain3DVTState::PageRecord &record = _vt.vt_page_records[slot];
 			const bool written = result.payload.is_valid() &&
 					_vt.surface_svt->write_page(slot, result.payload);
 			if (written) {
-				record["source"] = result.payload;
+				record.source = result.payload;
 			}
 			bool cell_copy_queued = false;
 			if (result.missing.empty() && !result.sources.is_empty()) {
-				record["state"] = "Pending cell copy";
+				record.state = Terrain3DVTState::PageRecord::PENDING_CELL_COPY;
 				baker(_vt.vt_baker)->queue_cell_page(slot, result.sources, it->second.rect,
 						Terrain3DSurfaceBaker::TIER_SVT);
 				cell_copy_queued = true;
@@ -104,14 +104,14 @@ void Terrain3D::_process_async_svt_pages() {
 								_vt.vt_page_size, _vt.vt_page_border);
 					}
 					if (ids.is_valid() && height.is_valid()) {
-						record["state"] = "Pending resident fallback";
+						record.state = Terrain3DVTState::PageRecord::PENDING_RESIDENT_FALLBACK;
 						baker(_vt.vt_baker)->queue_page(slot, ids, height,
 								it->second.rect, 1.f, source_grid, Terrain3DSurfaceBaker::TIER_SVT);
 						cell_copy_queued = true;
 					}
 				}
 				if (!cell_copy_queued) {
-					record["state"] = "Missing/stale cell bake";
+					record.state = Terrain3DVTState::PageRecord::MISSING_STALE_CELL_BAKE;
 				}
 				// A running explicit job already covers these cells: a full bake covers every
 				// region. Arming the automatic job here makes it start the frame the explicit
@@ -130,8 +130,10 @@ void Terrain3D::_process_async_svt_pages() {
 				// requests the page again instead of sampling an unwritten layer for the
 				// rest of the session.
 				WARN_PRINT("Releasing SVT slot " + String::num_int64(slot) + " after failed page production");
-				const Vector2i address = record.get("address", Vector2i());
-				const int mip = record.get("mip", 0);
+				// Read the address first: `_invalidate_vt_slot()` erases the record these two
+				// fields live in.
+				const Vector2i address = record.address;
+				const int mip = record.mip;
 				// Advance the iterator first: _invalidate_vt_slot() erases this entry by key.
 				it = _vt.svt_pending_pages.erase(it);
 				_invalidate_vt_slot(slot);
@@ -177,8 +179,14 @@ void Terrain3D::invalidate_vt_materials() {
 }
 
 void Terrain3D::_flush_source_wakes() {
-	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->flush_wakes(); }
-	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->flush_wakes(); }
+	if (_vt.vt_page_pipeline) {
+		_vt.vt_page_pipeline->flush_wakes();
+		_vt.vt_page_pipeline->flush_releases();
+	}
+	if (_vt.svt_page_pipeline) {
+		_vt.svt_page_pipeline->flush_wakes();
+		_vt.svt_page_pipeline->flush_releases();
+	}
 }
 
 // The wakes a demand pass owes, released unless the tick will release them itself. A pass driven
@@ -252,9 +260,9 @@ bool Terrain3D::_vt_page_production_stale(int p_slot, int p_ready) {
 	if (p_ready != 0) {
 		return false;
 	}
-	if (_vt.vt_page_records.has(p_slot)) {
-		const Dictionary record = _vt.vt_page_records[p_slot];
-		const uint64_t queued = uint64_t(int64_t(record.get("queued_frame", 0)));
+	const auto tracked = _vt.vt_page_records.find(p_slot);
+	if (tracked != _vt.vt_page_records.end()) {
+		const uint64_t queued = uint64_t(tracked->second.queued_frame);
 		const uint64_t now = Engine::get_singleton()->get_process_frames();
 		return now > queued + SVT_PAGE_RETRY_FRAMES;
 	}
@@ -280,21 +288,18 @@ int Terrain3D::prepare_vt_capture() {
 	}
 	// Reissue resident production into the same slots for a diagnostic capture.
 	// This does not evict pages, edit terrain, or run a persistent full bake.
-	const Array records = _vt.vt_page_records.values();
 	const int stored_size = _vt.vt_page_size + 2 * _vt.vt_page_border;
 	int queued = 0;
-	for (const Dictionary &record : records) {
-		const int slot = record.get("slot", -1);
-		if (!producer->is_page_ready(slot)) {
+	for (const auto &entry : _vt.vt_page_records) {
+		const Terrain3DVTState::PageRecord &record = entry.second;
+		if (!producer->is_page_ready(record.slot)) {
 			continue;
 		}
-		Ref<Image> source = record.get("source", Ref<Image>());
+		const Ref<Image> source = record.source;
 		if (source.is_null() || source->get_width() != stored_size || source->get_height() != stored_size) {
 			continue;
 		}
-		_queue_vt_material_page(slot, source, record.get("world_rect", Rect2()),
-				record.get("kind", String()) == Variant("SVT"), record.get("mip", 0),
-				record.get("address", Vector2i()));
+		_queue_vt_material_page(record.slot, source, record.world_rect, record.svt, record.mip, record.address);
 		++queued;
 	}
 	return queued;
@@ -447,26 +452,42 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	// fade pass finds it ready. Every production funnels through this call, which is what makes
 	// the arrival decision complete: a page re-produced into a *fresh* slot has no earlier
 	// unready reading anywhere else.
+	const uint64_t queue_started = Time::get_singleton()->get_ticks_usec();
 	_vt_mark_page_waiting(p_slot);
 	Ref<Image> height;
-	Dictionary record;
-	record["slot"] = p_slot;
-	record["kind"] = p_svt ? "SVT" : "AVT";
-	record["state"] = "Pending bake";
-	record["world_rect"] = p_rect;
-	record["mip"] = p_mip;
-	record["address"] = p_address;
-	record["revision"] = int64_t(_vt.vt_source_revision);
+	// The record is written in place: `operator[]` on the slot table inserts a default-constructed
+	// value on the first production and finds the row afterwards, and every field below is a plain
+	// assignment. It used to be a String-keyed Dictionary built here - nine keys, their nodes and
+	// their hashes per produced page - which measured 14.7 us of the 18.3 us a page cost on a
+	// moving view, i.e. the *bookkeeping* was four fifths of the production it describes.
+	Terrain3DVTState::PageRecord &record = _vt.vt_page_records[p_slot];
+	record.slot = p_slot;
+	record.svt = p_svt;
+	record.state = Terrain3DVTState::PageRecord::PENDING_BAKE;
+	record.world_rect = p_rect;
+	record.mip = p_mip;
+	record.address = p_address;
+	record.revision = int64_t(_vt.vt_source_revision);
+	record.cells = 0;
 	// When this production was queued. Demand retries a page whose content never arrived
 	// once this stamp is older than SVT_PAGE_RETRY_FRAMES, which is what recovers from a
 	// production that was dropped, refused, or lost to a failed cell copy.
-	record["queued_frame"] = int64_t(Engine::get_singleton()->get_process_frames());
-	// The record holds the source image, not its bytes. A page's payload is a few hundred
-	// kilobytes, and copying it into a String-keyed dictionary on every production put that
-	// copy on the page-production path - and kept a second full copy of every resident page
-	// alive for the rest of the session. A Ref is a refcount.
-	record["source"] = p_payload;
-	_vt.vt_page_records[p_slot] = record;
+	record.queued_frame = int64_t(Engine::get_singleton()->get_process_frames());
+	// The payload being replaced is handed to the source workers to destroy: that release is an
+	// `Image` teardown - the object database's lock, which the workers are taking anyway to build
+	// the payloads they assemble - and it measured 11 us of the 12.5 us a page cost on the demand
+	// thread. See `Terrain3DPagePipeline::defer_release()`.
+	if (record.source.is_valid()) {
+		Terrain3DPagePipeline *release_to = p_svt ? _vt.svt_page_pipeline.get() : _vt.vt_page_pipeline.get();
+		if (release_to != nullptr) { release_to->defer_release(record.source); }
+	}
+	record.source = p_payload;
+	// What the handoff itself costs, and where: `record_ms` is `_vt_mark_page_waiting()` and the
+	// record above, both written once per produced page, and `bake_ms` is the producer call. The
+	// two are the whole per-page publish cost a moving view multiplies, and they have different
+	// fixes, so they are published apart. See `_avt_finish_produce()`.
+	const uint64_t record_done = Time::get_singleton()->get_ticks_usec();
+	_vt.avt_queue_record_sum_ms += double(record_done - queue_started) / 1000.0;
 	if (p_svt) {
 		// The far field has three sources, in this order of preference:
 		//   1. a resident baked cell (this store) - a GPU copy, no CPU work and no file;
@@ -478,9 +499,8 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 			Array pieces;
 			std::vector<Vector2i> missing;
 			if (_resolve_svt_cell_pieces(p_rect, pieces, missing) && missing.empty() && !pieces.is_empty()) {
-				record["state"] = "Pending cell copy";
-				record["cells"] = pieces.size();
-				_vt.vt_page_records[p_slot] = record;
+				record.state = Terrain3DVTState::PageRecord::PENDING_CELL_COPY;
+				record.cells = int(pieces.size());
 				producer->queue_cell_page(p_slot, pieces, p_rect, Terrain3DSurfaceBaker::TIER_SVT);
 				return;
 			}
@@ -490,8 +510,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 			Terrain3DPagePipeline::Request request{{p_slot, 0, 0, 0, 0}, p_rect, _vt.vt_page_size, _vt.vt_page_border};
 			request.svt = true; request.directory = _data_directory;
 			request.materials = _vt.vt_material_signature; request.density = get_surface_svt_texels_per_meter();
-			record["state"] = "Missing bake";
-			_vt.vt_page_records[p_slot] = record;
+			record.state = Terrain3DVTState::PageRecord::MISSING_BAKE;
 			_vt.svt_pending_pages[p_slot] = std::move(request);
 			return;
 		}
@@ -499,8 +518,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 		// and the GPU bake turns it into material channels, exactly like the near field.
 		Ref<Image> ids;
 		if (_data->produce_surface_rect_page(p_rect, _vt.vt_page_size, _vt.vt_page_border, ids) < 0) {
-			record["state"] = "No resident payload";
-			_vt.vt_page_records[p_slot] = record;
+			record.state = Terrain3DVTState::PageRecord::NO_RESIDENT_PAYLOAD;
 			return;
 		}
 		const Vector3 source_grid = bake_source_grid(_data, p_rect, _vt.vt_page_size, _vt.vt_page_border,
@@ -512,6 +530,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (p_prepared) {
 		producer->queue_page(p_slot, p_prepared->ids, p_prepared->height, p_rect, 1.f, p_prepared->grid,
 				p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
+		_vt.avt_queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
 		return;
 	}
 	Ref<Image> ids = p_payload;
@@ -520,6 +539,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
 	producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid,
 			p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
+	_vt.avt_queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
 }
 
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
@@ -544,17 +564,24 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 	}
 	float world = float(_region_size) * _vertex_spacing;
 	Rect2 affected(Vector2(p_region) * world, Vector2(world, world));
-	Array keys = _vt.vt_page_records.keys();
-	for (int i = 0; i < keys.size(); i++) {
-		Dictionary record = _vt.vt_page_records[keys[i]];
-		Rect2 rect = record["world_rect"];
+	// The slots are collected before anything is erased: the table is walked once and the loop
+	// below mutates it.
+	std::vector<int> keys;
+	keys.reserve(_vt.vt_page_records.size());
+	for (const auto &entry : _vt.vt_page_records) { keys.push_back(entry.first); }
+	for (const int key : keys) {
+		const auto found = _vt.vt_page_records.find(key);
+		if (found == _vt.vt_page_records.end()) {
+			continue;
+		}
+		const Terrain3DVTState::PageRecord &record = found->second;
+		const Rect2 rect = record.world_rect;
 		if (rect.grow(MAX(_vertex_spacing, rect.size.x * float(_vt.vt_page_border + 1) / _vt.vt_page_size)).intersects(affected)) {
-			if (_vt.bake.waiting.has(keys[i])) {
-				Vector2i address = record["address"];
-				_vt.bake.queue.push_back(Vector3i(address.x, address.y, int(record["mip"])));
-				_vt.bake.waiting.erase(keys[i]);
+			if (_vt.bake.waiting.has(key)) {
+				_vt.bake.queue.push_back(Vector3i(record.address.x, record.address.y, record.mip));
+				_vt.bake.waiting.erase(key);
 			}
-			baker(_vt.vt_baker)->invalidate_slot(int(keys[i]));
+			baker(_vt.vt_baker)->invalidate_slot(key);
 			// Border edits can affect a neighbour's page. Remove its address too,
 			// otherwise the scheduler would keep treating an invalid payload as a hit. The
 			// owner list is the *shared pool's*, so either view reads the same entries - and a
@@ -563,9 +590,9 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 			// at all, and the region invalidation above reaches here whenever it has pages).
 			Array owners;
 			if (_vt.surface_vt != nullptr) {
-				owners = _vt.surface_vt->get_slot_owner_metadata(int(keys[i]));
+				owners = _vt.surface_vt->get_slot_owner_metadata(key);
 			} else if (_vt.surface_svt != nullptr) {
-				owners = _vt.surface_svt->get_slot_owner_metadata(int(keys[i]));
+				owners = _vt.surface_svt->get_slot_owner_metadata(key);
 			}
 			for (const Dictionary &owner : owners) {
 				int mip = owner["mip"];
@@ -586,10 +613,9 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 					_vt.surface_vt->release_page(sector, mip, x, y);
 				}
 			}
-			const int slot = keys[i];
-			_vt.svt_pending_pages.erase(slot);
-			if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({slot, 0, 0, 0, 0}); }
-			_vt.vt_page_records.erase(keys[i]);
+			_vt.svt_pending_pages.erase(key);
+			if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->cancel({key, 0, 0, 0, 0}); }
+			_vt.vt_page_records.erase(key);
 		}
 	}
 }

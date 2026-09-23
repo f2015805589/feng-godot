@@ -24,6 +24,7 @@
 #include <godot_cpp/classes/rd_texture_format.hpp>
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rd_uniform.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/rect2i.hpp>
 
 #include <algorithm>
@@ -171,7 +172,9 @@ void Terrain3DSurfaceBaker::set_materials(const RID &p_albedo_array_rid, const R
 void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights,
 		const Ref<Image> &p_height, const Rect2 &p_world_rect, float p_slope_factor, Vector3 p_source_grid,
 		int p_tier) {
-	std::lock_guard<std::mutex> lock(_mutex);
+	const uint64_t entered = Time::get_singleton()->get_ticks_usec();
+	std::unique_lock<std::mutex> lock(_mutex);
+	const uint64_t got_lock = Time::get_singleton()->get_ticks_usec();
 	if (!_configured || p_slot < 0 || p_slot >= _page_count || p_idweights.is_null() || p_height.is_null()) {
 		return;
 	}
@@ -192,6 +195,17 @@ void Terrain3DSurfaceBaker::queue_page(int p_slot, const Ref<Image> &p_idweights
 	_slot_tier[size_t(p_slot)] = uint8_t(tier);
 	_ready[size_t(p_slot)] = 0;
 	_sampled_channel_mask[size_t(p_slot)] = 0;
+	const uint64_t done = Time::get_singleton()->get_ticks_usec();
+	_queue_wait_us.fetch_add(got_lock - entered, std::memory_order_relaxed);
+	_queue_hold_us.fetch_add(done - got_lock, std::memory_order_relaxed);
+	_queue_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Terrain3DSurfaceBaker::get_queue_lock_stats(uint64_t &r_wait_us, uint64_t &r_hold_us,
+		uint64_t &r_calls) const {
+	r_wait_us = _queue_wait_us.load(std::memory_order_relaxed);
+	r_hold_us = _queue_hold_us.load(std::memory_order_relaxed);
+	r_calls = _queue_calls.load(std::memory_order_relaxed);
 }
 
 void Terrain3DSurfaceBaker::queue_cached_page(int p_slot, const Dictionary &p_channels, int p_tier) {

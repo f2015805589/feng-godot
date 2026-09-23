@@ -143,7 +143,17 @@ Terrain3DPagePipeline::~Terrain3DPagePipeline() {
 	for (std::thread &worker : _workers) { if (worker.joinable()) { worker.join(); } }
 	if (_planner.joinable()) { _planner.join(); }
 }
-void Terrain3DPagePipeline::reset() { std::lock_guard<std::mutex> lock(_mutex); _entries.clear(); _claim_order.clear(); _claim_head = 0; _claimable_count.store(0, std::memory_order_relaxed); _task = {}; }
+void Terrain3DPagePipeline::reset() {
+	std::lock_guard<std::mutex> lock(_mutex);
+	// The entries a reset drops are dropped for the same reason a retain drops one, so their
+	// prepared images go the same way rather than being destroyed inside the queue's lock.
+	for (Entry &entry : _entries) { _defer_result_release(entry.result); }
+	_entries.clear();
+	_claim_order.clear();
+	_claim_head = 0;
+	_claimable_count.store(0, std::memory_order_relaxed);
+	_task = {};
+}
 void Terrain3DPagePipeline::submit_task(std::function<void()> task) {
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -180,6 +190,7 @@ int Terrain3DPagePipeline::_count_claimable() const {
 	return count;
 }
 void Terrain3DPagePipeline::_erase_at(int p_index) {
+	_defer_result_release(_entries[size_t(p_index)].result);
 	_entries[size_t(p_index)] = std::move(_entries.back());
 	_entries.pop_back();
 	_claimable_count.store(_count_claimable(), std::memory_order_relaxed);
@@ -217,6 +228,7 @@ void Terrain3DPagePipeline::_make_room() {
 	// Only a finished result is ever evicted, and a finished result is not claimable, so the
 	// claimable count does not move here.
 	if (oldest >= 0) {
+		_defer_result_release(_entries[size_t(oldest)].result);
 		_entries[size_t(oldest)] = std::move(_entries.back());
 		_entries.pop_back();
 		_stat_evicted.fetch_add(1, std::memory_order_relaxed);
@@ -264,6 +276,10 @@ void Terrain3DPagePipeline::retain(const std::vector<Request> &requests) {
 	for (int i = int(_entries.size()) - 1; i >= 0; --i) {
 		if (_entries[size_t(i)].retained) { continue; }
 		const size_t last = _entries.size() - 1;
+		// The dropped entry's prepared images go to the workers: this loop runs inside the queue's
+		// critical section, and destroying them here is what made one call of this function
+		// measure 0.67 ms while every other stage of the tick measured tens of microseconds.
+		_defer_result_release(_entries[size_t(i)].result);
 		// Not `_erase_at`: it moves the last entry onto itself when the entry being dropped is
 		// already the last one, and an entry that is being erased is the only place a damaged
 		// self-move could hide.
@@ -331,6 +347,11 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 		if (!entry.ready) { return false; }
 		if (entry.request.rect != request.rect) { _stat_rect_mismatch.fetch_add(1, std::memory_order_relaxed); return false; }
 		result = std::move(entry.result);
+		// `Ref` has no move assignment, so the entry still names the images the caller just took.
+		// Clearing them before the erase is what keeps the release stage from carrying payloads the
+		// caller owns - which would only hand them back to a worker to drop a reference nothing
+		// needed dropped.
+		entry.result = Result();
 		_erase_at(index);
 		_stat_hits.fetch_add(1, std::memory_order_relaxed);
 		return true;
@@ -347,8 +368,60 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 	}
 	return false;
 }
+void Terrain3DPagePipeline::_drain_released() {
+	if (_released_count.load(std::memory_order_relaxed) == 0) { return; }
+	std::vector<Ref<Image>> released;
+	{
+		std::lock_guard<std::mutex> lock(_release_mutex);
+		if (_released.empty()) { return; }
+		released.swap(_released);
+		_released_count.store(0, std::memory_order_relaxed);
+	}
+	// `released` dies here: the payloads are destroyed on this worker, between two pages.
+}
+
+// The stage itself: no lock, because only the demanding thread calls this and it is called from
+// inside the queue's own critical section. Publishing is `flush_releases()`.
+bool Terrain3DPagePipeline::_stage_release(const Ref<Image> &p_payload) {
+	if (p_payload.is_null()) { return true; }
+	if (_release_staging.size() >= RELEASE_QUEUE_LIMIT) { return false; }
+	_release_staging.push_back(p_payload);
+	return true;
+}
+
+void Terrain3DPagePipeline::flush_releases() {
+	if (_release_staging.empty()) { return; }
+	std::lock_guard<std::mutex> lock(_release_mutex);
+	if (_released.size() + _release_staging.size() <= RELEASE_QUEUE_LIMIT) {
+		_released.insert(_released.end(), _release_staging.begin(), _release_staging.end());
+	}
+	// Whatever did not fit is dropped here, by the demanding thread: the limit bounds the published
+	// queue, and a queue no worker drained is not allowed to grow.
+	_release_staging.clear();
+	_released_count.store(int(_released.size()), std::memory_order_relaxed);
+}
+
+bool Terrain3DPagePipeline::defer_release(const Ref<Image> &p_payload) {
+	return _stage_release(p_payload);
+}
+
+void Terrain3DPagePipeline::_defer_result_release(Result &r_result) {
+	if (!r_result.payload.is_valid() && !r_result.ids.is_valid() && !r_result.height.is_valid()) {
+		return;
+	}
+	if (_release_staging.size() + 3 > RELEASE_QUEUE_LIMIT) {
+		// No worker has drained the published queue, so this entry is released here rather than
+		// left to accumulate. The caller's own destruction is the fallback the limit exists for.
+		return;
+	}
+	if (r_result.payload.is_valid()) { _release_staging.push_back(r_result.payload); }
+	if (r_result.ids.is_valid()) { _release_staging.push_back(r_result.ids); }
+	if (r_result.height.is_valid()) { _release_staging.push_back(r_result.height); }
+}
+
 void Terrain3DPagePipeline::run() {
 	for (;;) {
+		_drain_released();
 		Entry job;
 		bool claimed = false;
 		{
