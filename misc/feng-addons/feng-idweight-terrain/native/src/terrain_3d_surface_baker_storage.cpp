@@ -368,17 +368,28 @@ int64_t Terrain3DSurfaceBaker::_encode_page_bytes() const {
 	return regions + int64_t(_stored_size) * _stored_size * 30;
 }
 
-// The depth the ring may ever hold: what the byte ceiling affords, what the slot count justifies
-// (a compressed pool must still cost less than the page-sized one it replaces) and what the
-// encoder may have in flight. This is the allocation's question, not the budget's, and it is the
-// only place either is answered: `_derive_encode_ring_pages()` asks it for the bound, and the
-// bundle build asks it for what to size the staging layers and the encoder's output buffer for.
+// The depth the ring may ever hold: what the byte ceiling affords, what the caller's configured
+// page-budget peak needs for the two frames a readback takes, what the slot count justifies (a
+// compressed pool must still cost less than the page-sized one it replaces) and what the encoder may
+// have in flight. This is the allocation's question, not the budget's, and it is the only place
+// either is answered: `_derive_encode_ring_pages()` asks it for the bound, and the bundle build asks
+// it for what to size the staging layers and the encoder's output buffer for.
+//
+// The byte ceiling is a *floor*, not the answer, once the caller says how far its tiers go. The
+// shipped 96 MiB resolves to ~43 positions at this project's page cost, which is two frames of a
+// 21 page budget - so a batch raised above that would be served at 21 pages a frame however high
+// the setting went, which is the ring deciding the rate rather than the budget. The peak a
+// configuration admits is therefore also afforded, bounded by the same `ENCODE_PAGES_MAX` and slot
+// count everything else is; a caller that never sets a peak leaves the byte ceiling in charge and
+// the allocation is exactly what it always was.
 int Terrain3DSurfaceBaker::_encode_ring_depth_ceiling() const {
 	const int64_t page_bytes = _encode_page_bytes();
 	const int64_t affordable = page_bytes > 0 ? ENCODE_RING_BUDGET_BYTES / page_bytes
 											  : int64_t(ENCODE_PAGES_MAX);
+	const int64_t configured = int64_t(_page_budget_ceiling.load()) * ENCODE_READBACK_FRAMES;
+	const int64_t budgeted = MAX(affordable, MIN(configured, int64_t(ENCODE_PAGES_MAX)));
 	const int slot_bound = MAX(_page_count / 2, ENCODE_PAGES_MIN);
-	return int(CLAMP(MIN(affordable, int64_t(slot_bound)), int64_t(ENCODE_PAGES_MIN),
+	return int(CLAMP(MIN(budgeted, int64_t(slot_bound)), int64_t(ENCODE_PAGES_MIN),
 			int64_t(ENCODE_PAGES_MAX)));
 }
 

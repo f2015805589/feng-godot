@@ -1076,6 +1076,60 @@ original order and deriving the far field's share from the near field's own prod
 keeps the painted result at the value it had before all of this (`vt_turn_budget`'s settled-view
 diagnostic count is 528 before and after, and its isolated-turn count is 906/14 before and after).
 
+## The near field's page budget, and the movement that raises it
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_page_budget_runner.py --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_project_lifetime_probe.py --project F:/godot/project/test-1 --motion snap
+```
+
+`surface_vt_page_batch_default` (16) and `surface_vt_page_batch_max` (128) are the near field's page
+budget. The first is the stable rate and the whole of the shipped behaviour; the second is the
+"over page" the plugin raises the batch to **by itself** while the camera is moving fast, while the
+view it is filling is still unserved, or on the tick the motion sampler sees a discontinuity - a
+snap turn, a teleport, a displacement cut. The rate falls back on its own: a tier is held for
+`AVT_BATCH_HOLD_US` (250 ms) after the condition ends and then steps down, so a camera that has
+settled is back at 16 about 350 ms later and a threshold crossed for one frame costs nothing. No
+game code drives any of it, and `default = max` is a legal configuration with no headroom, in which
+the governor is inert and the rate is the constant it always was.
+
+The budget has one owner (`Terrain3DAVTPageBudget`, resolved once per tick by
+`avt_page_budget_update()`), and one reader path: `_avt_tick_allowance()` is what the production
+pass, the producer's frame budget, the source queue window and the encode ring all size against, so
+the four cannot disagree about the rate. The one build-time consequence is `peak_pages()`, which
+sizes the ring's *allocation* when the bundle is built - 43 positions at the shipped 16, 128 at 64,
+256 at 128 - while the *admitted* depth still follows the live tier, so `encode_ring_allocated` is
+the configuration and `encode_ring_capacity` is the tick.
+
+`vt_page_budget.gd` pins the part a script can decide alone: the clamps, the cross-constraint
+(`default` above `max` raises `max`), the ceiling, serialization, and that a collapsed budget reads
+as the shipped 16. The movement itself needs a live view, so it is read from the snap probe's
+`VT_AVT_TIMELINE` line: one line per displayed frame carrying the motion sample, the tier it
+resolved to, the allowance and the batch the pass actually handed over. On the reference project at
+1080p the shipped configuration escalates for 32 ticks of the initial window and 25-27 of each 180
+degree turn, hands over at most 127 pages in the frame the view is cold, and returns to 16; the
+batch the pass hands over matches its allowance in every window, so the budget rather than the ring,
+the readback or the four source threads is what bounds the rate.
+
+Measured frames-to-acceptable on the same probe (the frozen `analyze_frames.py` judge, w0 the
+session's first frame, w1/w3 the two 180 degree turns, w2 the turn back; three runs where the
+spread is worth showing):
+
+| configuration | w0 | w1 | w2 | w3 | ring positions | staging |
+| --- | --- | --- | --- | --- | --- | --- |
+| `default = max = 16` (shipped rate) | 32 | 24-32 | 11-14 | 12-16 | 43 | 87 MiB |
+| `default = 16, max = 32` | 20 | 10 | 11 | 10 | 64 | 130 MiB |
+| `default = 16, max = 64` | 12 | 7 | 9 | 8 | 128 | 259 MiB |
+| **`default = 16, max = 128` (shipped)** | **9-10** | **3-5** | **7** | **6-8** | **256** | **518 MiB** |
+| `default = max = 128` (governor inert) | 9 | 4 | 8 | 8 | 256 | 518 MiB |
+
+The ring's `allocated * 2 <= physical_cache_bytes_uncompressed` invariant still holds at the widest
+setting (939 MiB of physical cache against a 2211 MiB page-sized pool), and the settled frame's
+absolute gradient reading is unchanged across the arms, so the escalation buys frames rather than
+quality. What it costs is the ring's allocation, which is made once when the bundle is built: a
+project that would rather have the 259 MiB than the frames sets `max` back to 64, and one that wants
+the shipped rate and nothing else sets `max = default`.
+
 ## A page arrival is a ramp, not a step
 
 ```powershell

@@ -535,6 +535,15 @@ void Terrain3D::_bind_methods() {
 	// Number of sector image resolution tiers, default three. Each allocated
 	// block retains its complete local mip chain independently of this count.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_mip_levels", PROPERTY_HINT_RANGE, "2,16,1"), "set_surface_vt_mip_levels", "get_surface_vt_mip_levels");
+	// The near field's page budget, in two settings. `default` is the stable rate and the shipped 16;
+	// `max` is the "over page" the plugin escalates to by itself while the camera is moving fast,
+	// while the view it is filling is not yet served, or on a discontinuity - a snap turn, a
+	// teleport, a displacement cut. The two read as `default <= max <= 256`, no game code drives
+	// them, and a change reconfigures nothing: it applies on the next tick. `get_vt_settings()`
+	// reports the tier in force as `avt_batch_tier` / `avt_batch_max` beside the observed
+	// `avt_batch_peak`.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_batch_default", PROPERTY_HINT_RANGE, "1,256,1"), "set_surface_vt_page_batch_default", "get_surface_vt_page_batch_default");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_page_batch_max", PROPERTY_HINT_RANGE, "1,256,1"), "set_surface_vt_page_batch_max", "get_surface_vt_page_batch_max");
 	// Derived from the stored page size/count: no competing serialized setting.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_pages_per_axis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_surface_vt_pages_per_axis", "get_surface_vt_pages_per_axis");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_selection_mode", PROPERTY_HINT_ENUM, "Legacy Region View,Legacy Target Grid,Full AVT (Resident Baseline)"), "set_surface_vt_selection_mode", "get_surface_vt_selection_mode");

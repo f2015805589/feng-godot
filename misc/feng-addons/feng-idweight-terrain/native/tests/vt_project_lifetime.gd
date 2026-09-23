@@ -30,6 +30,11 @@ func run() -> void:
 		sample_frames = []
 		for part in sample_env.split(","):
 			sample_frames.append(int(part))
+	# The page-budget timeline: one line per displayed frame, with no readback, so the frame cadence
+	# the tier decision is made on is not disturbed by it. This is what a probe reads to show
+	# "motion -> tier -> batch" across a whole snap turn, in the same run whose images give the
+	# convergence curve.
+	var timeline := OS.get_environment("VT_TEST_TIMELINE") == "1"
 	# Saving a 1080p PNG stalls the loop for a couple of hundred milliseconds, which the engine then
 	# fills with physics ticks: a sampled frame would no longer be one displayed frame, and the
 	# per-frame curve would not describe what a viewer sees. The readback itself has to happen on
@@ -54,6 +59,25 @@ func run() -> void:
 			await physics_frame
 			await RenderingServer.frame_post_draw
 			var settings: Dictionary = terrain.get_vt_settings()
+			if timeline:
+				var sector: Dictionary = settings.get("avt_sector_stats", {})
+				print("VT_AVT_TIMELINE ", JSON.stringify({"window": window, "frame": frame,
+						"drawn": int(Engine.get_frames_drawn()), "physics": int(Engine.get_physics_frames()),
+						"tier": settings.get("avt_batch_tier_name", "?"),
+						"live": int(settings.get("avt_batch_max", 0)),
+						"allowance": int(settings.get("avt_allowance", 0)),
+						"peak": int(settings.get("avt_batch_peak", 0)),
+						"batch": int(sector.get("batch_pages", 0)),
+						"produced": int(sector.get("produced", 0)),
+						"missing": int(sector.get("visible_missing_pages", 0)),
+						"pending": int(sector.get("visible_pending_pages", 0)),
+						"sampled": int(sector.get("visible_plan_pages", 0)),
+						"speed": float(settings.get("avt_batch_motion_speed", 0.0)),
+						"turn": float(settings.get("avt_batch_motion_turn_deg_s", 0.0)),
+						"cut": bool(settings.get("avt_batch_motion_discontinuity", false)),
+						"cuts": int(settings.get("avt_batch_cuts", 0)),
+						"workers": int(settings.get("avt_source_workers", 0)),
+						"unserved": bool(settings.get("avt_view_unserved", false))}))
 			if snap_turn and frame in sample_frames:
 				# Sparse readbacks belong to this diagnostic, never the terrain tick.
 				pending_shots.append([window, frame, root.get_texture().get_image()])

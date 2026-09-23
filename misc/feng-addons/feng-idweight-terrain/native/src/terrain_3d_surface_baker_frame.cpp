@@ -1505,6 +1505,11 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	}
 	stats["encode_ring_capacity"] = _encode_ring_capacity.load();
 	stats["encode_ring_allocated"] = _encode_ring_allocated.load();
+	// The peak the caller's page-budget settings admit and the depth that would need to serve it, so
+	// the cost table reads "this tier needs this ring" rather than inferring it from the allocation.
+	stats["page_budget_ceiling"] = _page_budget_ceiling.load();
+	// Bytes one ring position costs, i.e. what one more page in flight costs in staging.
+	stats["encode_page_bytes"] = _encode_page_bytes();
 	stats["encode_requests"] = int64_t(_encode_requests);
 	stats["encode_readbacks"] = int64_t(_encode_readbacks);
 	stats["encode_updates"] = int64_t(_encode_updates);

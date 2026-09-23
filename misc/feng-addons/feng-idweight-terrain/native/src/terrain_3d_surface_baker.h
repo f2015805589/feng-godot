@@ -457,7 +457,7 @@ private:
 	// The same ring is the staging pool under the scratch regime, so its depth is bounded by
 	// bytes rather than by pages: this is the ceiling a derived depth may cost.
 	//
-	// It is a *staging* bound, not a rate. The rate is `AVT_PAGE_BATCH_MAX` and the producer's
+	// It is a *staging* bound, not a rate. The rate is `surface_vt_page_batch_max` and the producer's
 	// frame budget, which is what the tick hands the near field; the ring only has to be deep
 	// enough to hold the pages the batch and the far field put in flight for the two frames the
 	// readback takes, and `_derive_encode_ring_pages()` sizes it from exactly that. Deepening it
@@ -486,6 +486,13 @@ private:
 	// writes both while the caller's `set_page_budget()` reads them, so they are atomic.
 	std::atomic<int> _encode_ring_allocated{ ENCODE_PAGES_MIN };
 	std::atomic<int> _encode_ring_capacity{ ENCODE_PAGES_MIN };
+	// The peak the caller's page-budget settings can reach. It is a *configuration* number, not the
+	// rate of the tick: the ring is allocated once, when the bundle is built, and the byte ceiling
+	// below is only what it may ever hold on its own. Sizing the allocation from the rate of the
+	// moment would make every escalation a rate its own staging never had - the measured failure
+	// section 7.7.12 records - so the caller publishes its peak instead and the byte ceiling stays
+	// the floor for a caller that never sets one.
+	std::atomic<int> _page_budget_ceiling{ ENCODE_PAGES_MIN };
 	// Bytes one ring position costs - the encoder's three regions plus the half-float staging
 	// layer the same position owns under the scratch regime. Two depths are derived from it,
 	// and they are different questions: the ceiling is what the ring may *ever* hold (bytes,
@@ -654,6 +661,13 @@ public:
 	// rate: compression re-encodes a page on the GPU after it is produced, so it must not
 	// change how many pages a demand pass hands the producer.
 	void set_page_budget(int p_pages);
+	// The most pages a frame may be asked for, i.e. the peak of the page-budget settings rather than
+	// the tier in force this tick. The ring's *allocation* is made for this when the bundle is built
+	// (its *admitted* depth still follows `set_page_budget()`), so a configuration whose tiers reach
+	// above the shipped 16 has the staging to serve them and a tick that escalates does not have to
+	// rebuild anything to be admitted. Leaving it at its default keeps the byte ceiling in charge.
+	void set_page_budget_ceiling(int p_pages);
+	int get_page_budget_ceiling() const { return _page_budget_ceiling.load(); }
 	int get_capacity() const;
 	bool has_render_work() const;
 	// True when the last material snapshot could not be bound because the arrays it named were

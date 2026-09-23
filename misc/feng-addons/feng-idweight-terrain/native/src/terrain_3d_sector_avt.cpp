@@ -193,8 +193,8 @@ void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
 	_vt.avt_settled.unverify();
 }
 
-// The near field's share of the tick's page budget, always inside `AVT_PAGE_BATCH_MAX`. The steady
-// rule is an even split with the far field while it is drawing from the same number, and the whole
+// The near field's share of the tick's page budget, always inside its live tier. The steady rule
+// is an even split with the far field while it is drawing from the same number, and the whole
 // budget when it is not. A *view nothing has served yet* - the plan that was just installed names
 // ground the previous one did not - takes the whole batch instead of its half, because the far
 // field's own demand is about a tenth of a page a tick once its root pyramid is pinned and the
@@ -202,15 +202,158 @@ void Terrain3D::set_surface_vt_mip_levels(const int p_levels) {
 // production pass itself reports (`_vt.avt_view_unserved`), not a timer, not a rate multiple and
 // not a second page budget.
 //
-// A pure function of the live VT configuration and that one flag, spelled once because two readers
-// size against it and they must not disagree: the tick hands the pass this many pages, and the
-// pass's own allocation budget is the same number. See `AVT_PAGE_BATCH_MAX`.
+// A pure function of the live page budget and that one flag, spelled once because three readers
+// size against it and they must not disagree: the tick hands the pass this many pages, the pass's
+// own allocation budget is the same number, and the producer's frame budget and the source queue
+// window are set from it. See `Terrain3DAVTPageBudget`.
 int Terrain3D::_avt_tick_allowance() const {
-	const int remaining = _vt.vt_debug_direct_material
-			? MIN(4, AVT_PAGE_BATCH_MAX)
-			: MIN(_vt.vt_pages_per_update, AVT_PAGE_BATCH_MAX);
+	const int remaining = _avt_live_batch();
 	if (!has_svt_delivery() || _vt.avt_view_unserved) { return remaining; }
 	return MAX(1, remaining / 2);
+}
+
+// The near field's per-pass ceiling: the live tier, clamped by the tick's shared budget when that
+// budget was deliberately set *below* the shipped rate. Two settings can bound the near field and
+// they answer different questions. `vt_pages_per_update` is the tick's budget for every tier that
+// shares the page pool; at the shipped 16 it only trims the share the tick hands over while the live
+// tier is the shipped default (`min(16, 16) = 16`, the pairing every acceptance reading was
+// calibrated against), and a tier above the default is the near field's own rate - the whole point
+// of the auto escalation - so the field then runs at it instead of at a share of the shared budget,
+// which the far field keeps. Below the shipped rate the setting is a deliberate throttle, not a
+// share: a project (or a test) that asked for four pages a tick keeps four whatever the governor
+// decides, and the escalation is then a wish the configuration does not admit rather than a rate.
+int Terrain3D::_avt_live_batch() const {
+	const int live = _vt.avt_page_budget.live_pages();
+	if (_vt.vt_debug_direct_material) { return MIN(4, live); }
+	if (_vt.vt_pages_per_update < AVT_PAGE_BATCH_DEFAULT) { return MIN(_vt.vt_pages_per_update, live); }
+	return live;
+}
+
+// The tier relationship, spelled once. `default` is the floor and `max` is the tier the governor
+// escalates to, each clamped to the ceiling. A `max` below `default` - which the setters below never
+// leave behind, but a serialized scene can - still resolves the escalated tier onto the floor rather
+// than reading as two values for one rate.
+int Terrain3DAVTPageBudget::pages_for_tier(const Terrain3DAVTBatchTier p_tier) const {
+	const int base = CLAMP(default_pages, 1, AVT_PAGE_BATCH_CEILING);
+	const int top = CLAMP(MAX(max_pages, base), 1, AVT_PAGE_BATCH_CEILING);
+	return p_tier == Terrain3DAVTBatchTier::Escalated ? top : base;
+}
+
+// One tick of the governor: what the tick's motion asks for, against the tier already held, with the
+// hold and the decay above. It is deliberately a pure function of the sample and the state it is
+// handed - not of the terrain - so the policy is readable in one screen and the caller's only job is
+// to feed it the same motion the plan was aimed with.
+//
+// Every condition means one thing: *this view has no resident pages behind it*. A discontinuity is
+// the >25 degree step and the displacement cut the motion sampler just detected; `unserved` is the
+// production pass saying its plan mostly names ground nothing has produced yet; the two rates are a
+// camera merely moving fast. All four ask for the same tier, because there is only one headroom
+// setting to ask for.
+void avt_page_budget_update(Terrain3DAVTPageBudget &r_budget, const bool p_discontinuity, const bool p_unserved,
+		const float p_speed, const float p_turn_deg_s, const uint64_t p_delta_us) {
+	r_budget.last_speed = p_speed;
+	r_budget.last_turn_deg_s = p_turn_deg_s;
+	r_budget.last_discontinuity = p_discontinuity;
+	r_budget.last_unserved = p_unserved;
+	Terrain3DAVTBatchTier wanted = Terrain3DAVTBatchTier::Stable;
+	if (p_discontinuity || p_unserved || p_speed >= AVT_BATCH_ESCALATE_SPEED_M_S ||
+			p_turn_deg_s >= AVT_BATCH_ESCALATE_TURN_DEG_S) {
+		wanted = Terrain3DAVTBatchTier::Escalated;
+	}
+	// A configuration with no headroom has one tier, so the governor is inert rather than asking for
+	// a rate the settings do not admit. This is also how the acceptance comparison runs the shipped
+	// 16-page behaviour through the same governor: `default = max = 16`.
+	if (r_budget.pages_for_tier(wanted) <= r_budget.default_pages) { wanted = Terrain3DAVTBatchTier::Stable; }
+	if (p_discontinuity) { r_budget.cuts++; }
+	if (wanted >= r_budget.tier) {
+		if (wanted > r_budget.tier) {
+			r_budget.escalations++;
+			r_budget.tier = wanted;
+		}
+		// Any tick that still wants the tier resets the clock, so the hold measures time since the
+		// condition ended rather than time since it began - which is what makes a jitter that crosses
+		// a threshold for one frame cost nothing.
+		r_budget.hold_us = 0;
+		r_budget.calm_us = 0;
+	} else {
+		r_budget.hold_us += p_delta_us;
+		if (r_budget.hold_us >= AVT_BATCH_HOLD_US) {
+			r_budget.calm_us += p_delta_us;
+			if (r_budget.calm_us >= AVT_BATCH_DECAY_US) {
+				r_budget.calm_us = 0;
+				r_budget.tier = Terrain3DAVTBatchTier(int(r_budget.tier) - 1);
+			}
+		}
+	}
+	r_budget.ticks++;
+	if (r_budget.tier == Terrain3DAVTBatchTier::Escalated) { r_budget.escalated_ticks++; }
+}
+
+// The near field's page budget as two settings. Each clamps to `[1, AVT_PAGE_BATCH_CEILING]` and the
+// pair holds the cross-constraint the tiers spell (`default <= max <= ceiling`):
+//
+//   * `default` above `max` raises `max` to it rather than being refused. The alternative - ignore
+//     the setter - leaves the caller with a property that reads back a different number than it was
+//     given and no way to tell why; raising the bound keeps the documented invariant and is what the
+//     caller asked for by ordering the two that way. It also keeps the headroom at least zero instead
+//     of turning a raised floor into an inversion.
+//   * `max` below `default` is raised to `default`, for the same reason: the stable rate is the floor
+//     the caller has already stated, and a ceiling under it would mean the escalation had nothing to
+//     escalate to.
+//   * both are clamped up to one page: a zero budget is not a rate, and the near field's share floors
+//     at one page anyway, so zero would read as "one page" through one path and "none" through
+//     another.
+//
+// Neither reconfigures anything: a page's footprint, the plan's residency budget and the addressing
+// are independent of the rate, so the value is read on the next tick by `_avt_tick_allowance()` and by
+// the pass's own clamp. The one build-time consequence is `peak_pages()`, which sizes the producer's
+// encode ring when its bundle is built, and it is published here and every tick for exactly that
+// reason.
+void Terrain3D::set_surface_vt_page_batch_default(const int p_pages) {
+	const int clamped = CLAMP(p_pages, 1, AVT_PAGE_BATCH_CEILING);
+	Terrain3DAVTPageBudget &budget = _vt.avt_page_budget;
+	if (budget.default_pages == clamped) { return; }
+	budget.default_pages = clamped;
+	budget.max_pages = MAX(budget.max_pages, clamped);
+	_publish_avt_page_budget();
+}
+
+void Terrain3D::set_surface_vt_page_batch_max(const int p_pages) {
+	const int clamped = CLAMP(p_pages, 1, AVT_PAGE_BATCH_CEILING);
+	Terrain3DAVTPageBudget &budget = _vt.avt_page_budget;
+	const int raised = MAX(clamped, budget.default_pages);
+	if (budget.max_pages == raised) { return; }
+	budget.max_pages = raised;
+	_publish_avt_page_budget();
+}
+
+// The peak the configured tiers can reach, handed to the producer. Only the encode ring reads it,
+// and only when its bundle is built: the ring is allocated once for the widest window the settings
+// admit and re-admitted per tick, so sizing it for the tier of the moment would make the escalation
+// a rate its own staging never had. It is published on every tick, before the service check and the
+// production pass, so a bundle built on any tick already sees the configured peak rather than the
+// build's own default.
+void Terrain3D::_publish_avt_page_budget() {
+	if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		producer->set_page_budget_ceiling(_vt.avt_page_budget.peak_pages());
+	}
+}
+
+// One tick of the budget governor, immediately after the motion sampler that feeds it. Nothing else
+// in the tick decides the tier, so the rate a pass runs at and the motion it was aimed with cannot
+// disagree.
+void Terrain3D::_vt_update_avt_page_budget() {
+	const uint64_t now = Time::get_singleton()->get_ticks_usec();
+	Terrain3DAVTPageBudget &budget = _vt.avt_page_budget;
+	// A stall is not a long calm stretch: a frame that took a second must not decay the tier on the
+	// strength of the time it spent blocked, and the tick's own interval is what the hold and decay
+	// are measured in.
+	const uint64_t delta = budget.stamp_us == 0 ? 0 : MIN(now - budget.stamp_us, uint64_t(250000));
+	budget.stamp_us = now;
+	// The discontinuity flag is consumed, not read: it describes the sample just taken.
+	avt_page_budget_update(budget, _vt.avt_motion_discontinuity, _vt.avt_view_unserved,
+			_vt.avt_motion_velocity.length(), Math::rad_to_deg(_vt.avt_motion_turn.length()), delta);
+	_publish_avt_page_budget();
 }
 
 void Terrain3D::set_surface_vt_mip_distances(const PackedFloat32Array &p_distances) {
@@ -259,11 +402,18 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// on every tick rather than on the tick it moves. Both readers have to move together, and the
 	// source pipeline is built lazily inside the production pass, so a change-detected publish can
 	// run on the one tick the pipeline does not exist yet and leave the queue at the wrong window.
-	// The value is bounded by `AVT_PAGE_BATCH_MAX` in every case.
+	// The value is bounded by the live page-budget tier in every case.
 	const int page_budget = _avt_tick_allowance();
 	if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
 		producer->set_page_budget(page_budget);
 	}
+	// The source pool is deliberately *not* resized with the tier. A raised budget is spent through
+	// the same queue the steady rate uses - the pass primes, the workers assemble and the next pass
+	// polls - so the pool only has to be deep enough for the rate the queue window asks for, and
+	// rebuilding a pool of threads on every episode would cost a join and a thread spawn on exactly
+	// the frame the view is filling. The probe's `produced` column against its `allowance` column is
+	// what decides whether that holds: a raised budget the four configured threads cannot fill would
+	// show up there as a `produced` below the budget, and the pool would have to scale with the tier.
 	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->set_queue_limit(page_budget); }
 	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->set_queue_limit(page_budget); }
 	// The arrival blend is always the configured one. The cold-view episode this pipeline used to
@@ -659,10 +809,10 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			const int selected = int(_vt.avt_refinement->pages.size());
 			// A plan that mostly names ground the previous one did not is a view nothing has produced
 			// for: a snap turn, a teleport, a camera that left the working set. Such a view is the one
-			// case where the near field takes the whole `AVT_PAGE_BATCH_MAX` batch instead of its even
-			// share, and the flag is cleared by the first pass that finds the view served. A moving
-			// camera's consecutive plans overlap heavily - `carried` is most of the selection - so
-			// ordinary streaming never sets it.
+			// case where the near field takes the whole live tier instead of its even share, and the
+			// flag is cleared by the first pass that finds the view served. A
+			// moving camera's consecutive plans overlap heavily - `carried` is most of the selection -
+			// so ordinary streaming never sets it.
 			_vt.avt_view_unserved = selected > 0 && selected - carried > selected / 2;
 			_vt.avt_sector_stats["plan_selected"] = selected;
 			_vt.avt_sector_stats["plan_carried"] = carried;
@@ -869,13 +1019,40 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
-	// The near field's per-pass allowance, the ceiling it is always inside, and what the passes
-	// actually handed over. `avt_batch_peak` is the acceptance reading for the batch bound: a MAX
-	// over every pass of the session, so one oversized batch shows up wherever it happened.
+	// The near field's per-pass allowance, the page budget the governor currently resolves, and what
+	// the passes actually handed over. `avt_batch_max` keeps its old meaning - the live ceiling a pass
+	// is bounded by, which is the stable tier's 16 before anything moves - and the two settings behind
+	// it and the tier they are in are reported beside it, so a probe can show the timeline rather than
+	// infer it. `avt_batch_peak` is the acceptance reading for the bound: a MAX over every pass of the
+	// session, so one oversized batch shows up wherever it happened.
 	result["avt_allowance"] = _avt_tick_allowance();
 	result["avt_page_budget"] = _vt.vt_pages_per_update;
-	result["avt_batch_max"] = AVT_PAGE_BATCH_MAX;
+	result["avt_batch_max"] = _vt.avt_page_budget.live_pages();
+	result["avt_batch_default_pages"] = _vt.avt_page_budget.default_pages;
+	result["avt_batch_max_pages"] = _vt.avt_page_budget.max_pages;
+	result["avt_batch_peak_setting"] = _vt.avt_page_budget.peak_pages();
+	result["avt_batch_ceiling"] = AVT_PAGE_BATCH_CEILING;
+	// The tier in force, as its number and its name, beside the motion the decision was made from.
+	// `avt_batch_tier_ticks` / `_escalated_ticks` / `_escalations` are the session counters the
+	// acceptance timeline is read from.
+	result["avt_batch_tier"] = int(_vt.avt_page_budget.tier);
+	result["avt_batch_tier_name"] = _vt.avt_page_budget.tier == Terrain3DAVTBatchTier::Escalated
+			? String("escalated")
+			: String("stable");
+	result["avt_batch_tier_ticks"] = int64_t(_vt.avt_page_budget.ticks);
+	result["avt_batch_escalated_ticks"] = int64_t(_vt.avt_page_budget.escalated_ticks);
+	result["avt_batch_escalations"] = int64_t(_vt.avt_page_budget.escalations);
+	result["avt_batch_cuts"] = int64_t(_vt.avt_page_budget.cuts);
+	result["avt_batch_motion_speed"] = _vt.avt_page_budget.last_speed;
+	result["avt_batch_motion_turn_deg_s"] = _vt.avt_page_budget.last_turn_deg_s;
+	result["avt_batch_motion_discontinuity"] = _vt.avt_page_budget.last_discontinuity;
+	result["avt_batch_motion_unserved"] = _vt.avt_page_budget.last_unserved;
 	result["avt_batch_peak"] = _vt.avt_batch_peak;
+	// The source half of the same rate: the pool the near field actually runs with and the count the
+	// caller configured. A `produced` that matches the batch while this stays at the configured floor
+	// is the source side *not* being the rate the budget asks for.
+	result["avt_source_workers"] = _vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count()
+														: _vt.vt_page_workers;
 	// Whether the view is still unserved, which is the one thing that moves the allowance from the
 	// even share to the whole batch.
 	result["avt_view_unserved"] = _vt.avt_view_unserved;

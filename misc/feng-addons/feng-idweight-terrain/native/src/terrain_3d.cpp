@@ -211,6 +211,11 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// lead is what both views plan for, and a value updated per demand pass would differ
 	// between them.
 	_vt_update_motion_lead();
+	// The page budget follows the same sample: a snap turn, a displacement cut or a fast run raises
+	// the near field's rate for the ticks it lasts and the governor decays it back to the stable tier
+	// afterwards. It runs before the service check and the demand passes, which is what lets the
+	// producer's frame budget, the source queue window and the pass's own clamp all read one tier.
+	_vt_update_avt_page_budget();
 	// The budget a phase that can stop between two units of work reads before continuing.
 	//
 	// It is re-armed at the start of every phase, so `vt_frame_budget_ms` bounds what one

@@ -812,14 +812,25 @@ struct Terrain3DVTState {
 	bool avt_discard_retained = false;
 	// Whether the view the near field is filling is still unserved: a cut, a teleport or a plan that
 	// mostly names ground the previous one did not. It is the whole of the cold-view rate - while it
-	// holds, the near field takes the full `AVT_PAGE_BATCH_MAX` batch instead of its even share with
-	// the far field - and the production pass clears it on the first tick every page the image
-	// samples has a slot and content. There is no timer, no rate multiple and no episode counter.
+	// holds, the near field takes the full batch instead of its even share with the far field - and
+	// the production pass clears it on the first tick every page the image samples has a slot and
+	// content. There is no timer, no rate multiple and no episode counter.
 	bool avt_view_unserved = false;
+	// The near field's page budget: the two settings (`surface_vt_page_batch_default` and
+	// `surface_vt_page_batch_max`), the tier the tick's motion currently resolves them to, and the
+	// hysteresis that moves it. One owner with one reader path - `_avt_tick_allowance()`, which the
+	// production pass, the producer's frame budget, the source queue window and the encode ring all
+	// derive from - so a change applies on the next tick. See `Terrain3DAVTPageBudget`.
+	Terrain3DAVTPageBudget avt_page_budget;
 	// The largest batch any production pass of this session handed to the pool. The acceptance probe
-	// reads it against `AVT_PAGE_BATCH_MAX`; it is a MAX and never reset, so one oversized batch
-	// shows up whenever it happened.
+	// reads it against the live tier (`avt_batch_max`); it is a MAX and never reset, so one oversized
+	// batch shows up whenever it happened.
 	int avt_batch_peak = 0;
+	// Whether the last motion sample was a discontinuity: a step over `MOTION_MAX_TURN_STEP` or a
+	// displacement past `avt_motion_spatial_discontinuity_distance()`. The motion sampler raises it
+	// on the tick it sees one and the budget governor consumes it on the same tick, so it is a tick's
+	// event rather than a lasting state - which is what the escalated tier is: the answer to an event.
+	bool avt_motion_discontinuity = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
 	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum

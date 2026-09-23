@@ -120,7 +120,7 @@ Vector2 Terrain3DPagePipeline::Snapshot::bounds(const Rect2 &rect, Vector2 fallb
 // view: a page costs a source scan plus an id/height payload, and the demand of a camera
 // crossing a sector is an order of magnitude above what a single worker can prepare per
 // frame. The default keeps half the machine's threads, capped so the renderer, the planner
-// and the game keep their cores. The cap is four: the batch bound (`AVT_PAGE_BATCH_MAX`) is
+// and the game keep their cores. The cap is four: the page batch (`surface_vt_page_batch_max`) is
 // what decides how many pages a tick may hand over, and a pool deeper than the batch can feed
 // is throughput the batch is supposed to bound rather than a mechanism. Raising it to eight was
 // measured as a rate change, not a coverage change.

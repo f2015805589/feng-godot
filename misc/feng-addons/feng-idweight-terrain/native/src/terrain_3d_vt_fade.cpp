@@ -77,7 +77,8 @@ void Terrain3D::_update_vt_page_fade() {
 	// The ramp length: the configured setting, in ticks. It is never shortened any more. A cold
 	// view used to switch it off for the frames a cut's plan was filling, which bought the whole
 	// convergence window at the cost of a step wherever an arrived page met one still missing; the
-	// rate (`AVT_PAGE_BATCH_MAX`) and the shader's recursive mip lookup are what serve that window
+	// rate (`surface_vt_page_batch_max`, the tier the plugin escalates to while a view is filling)
+	// and the shader's recursive mip lookup are what serve that window
 	// now, and the blend is left doing the one job it exists for.
 	const int frames = MAX(1, _vt.vt_page_fade_frames);
 	if (_vt.fade.queue.capacity() != size_t(slots)) {

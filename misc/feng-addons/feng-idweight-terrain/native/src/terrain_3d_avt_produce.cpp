@@ -50,10 +50,11 @@ uint64_t avt_page_age_key(const Terrain3DAVTPageRequest &p_page) {
 // per tick rather than once per caller.
 int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	if (p_max_pages == 0) { return 0; }
-	// The caller passes the near field's allowance; the batch ceiling is enforced here, at the one
-	// place a page is handed to the pool, so no caller and no future rate can exceed it. A negative
-	// budget keeps its old meaning of "the default window".
-	p_max_pages = p_max_pages < 0 ? AVT_PAGE_BATCH_MAX : MIN(p_max_pages, AVT_PAGE_BATCH_MAX);
+	// The caller passes the near field's allowance; the live page-budget tier is enforced here, at
+	// the one place a page is handed to the pool, so no caller and no future rate can exceed it. A
+	// negative budget keeps its old meaning of "the default window", which is the tier in force.
+	p_max_pages = p_max_pages < 0 ? _vt.avt_page_budget.live_pages()
+								  : MIN(p_max_pages, _vt.avt_page_budget.live_pages());
 	const auto pool = _vt.surface_vt->get_page_pool();
 	// A repeated plan with nothing left to upload still has to re-mark its resident
 	// pages as demanded, or the pool evicts them while the camera is stationary.
@@ -157,13 +158,13 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// while the pages wait for their encode and readback, so a test that read only "no missing
 	// page" would declare the view done while the ground was still flat. The flag drives the only
 	// rate difference the near field has (`_avt_tick_allowance()`): its even share while the view is
-	// served, the whole `AVT_PAGE_BATCH_MAX` batch while it is not. There is no timer and no page
-	// multiple behind it any more; the ceiling bounds every pass either way.
+	// served, the whole live tier while it is not. There is no timer and no page multiple behind it
+	// any more; the tier bounds every pass either way.
 	_vt.avt_view_unserved = _vt.avt_view_unserved &&
 			(pass.sampled_missing + pass.sampled_pending) > 0;
-	// What this pass handed to the pool, against the ceiling it is allowed. `avt_batch_peak` is the
-	// acceptance reading: it is a MAX over every pass of the session, so a single batch over
-	// `AVT_PAGE_BATCH_MAX` shows up in it whenever it happened.
+	// What this pass handed to the pool, against the tier it is allowed. `avt_batch_peak` is the
+	// acceptance reading: it is a MAX over every pass of the session, so a single batch over the
+	// live tier shows up in it whenever it happened.
 	_vt.avt_sector_stats["batch_pages"] = pass.produced;
 	_vt.avt_batch_peak = MAX(_vt.avt_batch_peak, pass.produced);
 	// The stage sums and the count they are summed over, so `report()` can difference two readings

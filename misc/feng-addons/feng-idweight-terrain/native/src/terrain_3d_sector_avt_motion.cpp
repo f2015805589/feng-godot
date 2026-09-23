@@ -94,6 +94,10 @@ constexpr float MOTION_TURN_SLEW_RATE = 6.f;
 // that ends decays the lead instead of leaving the plan aimed where the camera no longer
 // is, and an edit, a teleport or a snap is bounded by the clamps below.
 void Terrain3D::_vt_update_motion_lead() {
+	// A discontinuity is an event of this sample, so the flag is cleared here and raised only by the
+	// branches below. The page-budget governor consumes it on the same tick, which is what lets the
+	// escalated tier be an answer to an event rather than a state that outlives one.
+	_vt.avt_motion_discontinuity = false;
 	Camera3D *camera = get_camera();
 	if (!camera || !camera->is_inside_tree() || _vt.vt_motion_lead_ms <= 0.f) {
 		_vt.avt_motion_lead = Vector2();
@@ -132,6 +136,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
 				_vt.avt_view_unserved = true;
+				_vt.avt_motion_discontinuity = true;
 			} else {
 				Vector2 velocity = displacement / delta;
 				if (velocity.length() > MOTION_MAX_SPEED) { velocity = velocity.normalized() * MOTION_MAX_SPEED; }
@@ -159,6 +164,7 @@ void Terrain3D::_vt_update_motion_lead() {
 				_vt.avt_refinement.reset();
 				_vt.avt_discard_retained = true;
 				_vt.avt_view_unserved = true;
+				_vt.avt_motion_discontinuity = true;
 			} else {
 				Vector3 turn = cross.length() > 1e-6f ? cross.normalized() * (step / delta) : Vector3();
 				if (turn.length() > MOTION_MAX_TURN_RATE) { turn = turn.normalized() * MOTION_MAX_TURN_RATE; }

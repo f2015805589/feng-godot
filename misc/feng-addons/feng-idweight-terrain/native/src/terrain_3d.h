@@ -95,10 +95,21 @@ private:
 	Dictionary _load_svt_cell(const Vector2i &p_cell);
 	int _update_sector_avt(int p_max_pages);
 	int _produce_sector_avt_pages(int p_max_pages);
-	// The near field's per-pass page allowance, always inside `AVT_PAGE_BATCH_MAX`. The tick hands
-	// the pass this many pages and the producer's frame budget and the source queue window are set
-	// from the same number, so the split has one home. See the definition.
+	// The near field's per-pass page allowance, always inside the live page-budget tier. The tick
+	// hands the pass this many pages and the producer's frame budget and the source queue window are
+	// set from the same number, so the split has one home. See the definition.
 	int _avt_tick_allowance() const;
+	// The near field's per-pass ceiling before the even split: the live tier, clamped by
+	// `vt_pages_per_update` when that budget was set below the shipped rate. One spelling, because
+	// the allowance and the pass's own clamp both size against it. See the definition.
+	int _avt_live_batch() const;
+	// The near field's page budget for this tick: consumes the motion sample the lead was built from
+	// and picks the tier (stable / escalated) with its hold and decay. The only writer of the tier,
+	// called once per tick right after `_vt_update_motion_lead()`.
+	void _vt_update_avt_page_budget();
+	// Hands the producer the peak the configured tiers can reach, which is what its encode ring is
+	// sized for when its bundle is built.
+	void _publish_avt_page_budget();
 	// Stages of one _produce_sector_avt_pages() pass, in call order. See the pass
 	// struct in terrain_3d_avt.h for what each stage owns.
 	void _avt_classify_plan(Terrain3DAVTProducePass &r_pass);
@@ -713,6 +724,18 @@ public:
 	int get_avt_mip_levels() const { return _vt.surface_vt_mip_levels; }
 	void set_surface_vt_mip_levels(int p_levels);
 	int get_avt_mip_level_cap() const;
+	// The near field's page budget, in two settings. `default` (16) is the stable rate and the
+	// shipped behaviour; `max` is the "over page" the plugin escalates to *by itself* while the
+	// camera is moving fast, while the view it is filling is still unserved, or on a discontinuity -
+	// a snap turn, a teleport, a displacement cut. The two read as
+	// `default <= max <= AVT_PAGE_BATCH_CEILING`. Both are properties, neither reconfigures
+	// anything, and a change applies on the next tick. No game code is needed to drive them;
+	// `get_vt_settings()` reports the live tier as `avt_batch_max` / `avt_batch_tier` beside the
+	// observed `avt_batch_peak`. See `Terrain3DAVTPageBudget`.
+	void set_surface_vt_page_batch_default(int p_pages);
+	int get_surface_vt_page_batch_default() const { return _vt.avt_page_budget.default_pages; }
+	void set_surface_vt_page_batch_max(int p_pages);
+	int get_surface_vt_page_batch_max() const { return _vt.avt_page_budget.max_pages; }
 	int get_avt_local_block_size() const { return get_avt_base_block_size(); }
 	float get_avt_local_section_world() const { return 64.f; }
 	// The near field's anisotropy: `..._sampler()` is the tap count the viewport's filtering level

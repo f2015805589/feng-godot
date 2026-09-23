@@ -557,7 +557,9 @@ void Terrain3D::_update_vt_service() {
 	// The near field's page allowance. The tick publishes this every tick
 	// (`_update_sector_avt()`); this call is what a service rebuild - a setting change, a pool
 	// rebuild - leaves behind, so it reads the same number the tick does rather than the setting
-	// alone, and it is inside `AVT_PAGE_BATCH_MAX` either way.
+	// alone, and it is inside the live page-budget tier either way. The tier's peak goes with it:
+	// that is what the producer's encode ring is sized for when its bundle is built.
+	producer->set_page_budget_ceiling(_vt.avt_page_budget.peak_pages());
 	producer->set_page_budget(_avt_tick_allowance());
 	if (_vt.vt_materials_dirty || producer->materials_stale()) {
 		// Also re-publish when the producer reports its snapshot unbound: the arrays it named
@@ -672,6 +674,11 @@ void Terrain3D::_bind_vt_methods() {
 	VT_BIND_SETTING(vt_frame_budget_ms);
 	VT_BIND_SETTING(vt_page_workers);
 	VT_BIND_SETTING(vt_motion_lead_ms);
+	// The near field's page budget. The accessors are bound here with the other VT settings; their
+	// `ADD_PROPERTY` entries live in the "Surface VT" group in `terrain_3d_bindings.cpp`, which is
+	// where every other `surface_vt_*` setting is declared, so the two read as one group.
+	VT_BIND_SETTING(surface_vt_page_batch_default);
+	VT_BIND_SETTING(surface_vt_page_batch_max);
 	VT_BIND_SETTING(svt_feedback);
 #undef VT_BIND_SETTING
 	ClassDB::bind_method(D_METHOD("set_avt_feedback", "enabled"), &Terrain3D::set_avt_feedback);

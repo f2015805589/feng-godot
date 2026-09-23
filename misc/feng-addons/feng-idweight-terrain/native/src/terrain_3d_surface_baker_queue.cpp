@@ -53,6 +53,16 @@ void Terrain3DSurfaceBaker::set_page_budget(const int p_pages) {
 	_refresh_encode_ring_capacity();
 }
 
+// The caller's page-budget *ceiling*: the most a frame will ever be asked for, which is the peak of
+// the page-budget settings rather than the tier of the tick. It is read when the bundle is built, so
+// the ring's allocation covers every tier the configuration admits and a tick that escalates is
+// admitted by the depth already reserved rather than by a rebuild. A change therefore applies on
+// the next bundle build; `encode_ring_allocated` in `get_vt_settings()` says which allocation the
+// running session has.
+void Terrain3DSurfaceBaker::set_page_budget_ceiling(const int p_pages) {
+	_page_budget_ceiling.store(MAX(1, p_pages));
+}
+
 void Terrain3DSurfaceBaker::request_capacity(int p_count) {
 	std::lock_guard<std::mutex> lock(_mutex);
 	_requested_capacity = std::max(_requested_capacity, p_count);

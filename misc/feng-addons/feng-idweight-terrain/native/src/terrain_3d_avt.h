@@ -99,7 +99,7 @@ constexpr float AVT_SECTOR_WORLD = 64.f;
 // shared for the same reason the cell size is.
 constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 
-// The hard ceiling on one production pass, and the rate a view that is not yet served is filled at.
+// The near field's page budget, in two settings and one owner (`Terrain3DAVTPageBudget` below).
 //
 // The reference implementation this pipeline follows bakes at most sixteen physical pages a frame
 // (`RenderingPagePerFrame` in HDRPVirtualTexture's `Constant.cs`) and reaches a converged picture by
@@ -107,15 +107,130 @@ constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 // whether or not the view looks at it, an indirection remap that leaves no mip empty across a
 // resize, a recursive mip lookup in the sampler, a feedback set that names the pages the view
 // samples, and an LRU that holds what the last view used. A pass of this pipeline is one batch, and
-// it may never hand more than this many pages to the pool allocator, whatever view it is filling.
-// `avt_batch_pages` and `avt_batch_peak` report what it actually handed over, and the acceptance
-// probe reads them to prove the bound holds.
+// it may never hand more pages to the pool allocator than the live tier allows, whatever view it is
+// filling. `avt_batch_pages` and `avt_batch_peak` report what it actually handed over, and the
+// acceptance probe reads them to prove the bound holds.
 //
-// The value is the reference's own: it is the number of page *bakes* per frame the HDRP
-// implementation admits, and the number a cold view of this project's 752 page plan was originally
-// diagnosed against. The rate a view that is not yet served runs at is this ceiling and the steady
-// share is `_avt_tick_allowance()`; the ceiling is a bound on the batch, never a second timer.
-constexpr int AVT_PAGE_BATCH_MAX = 16;
+// The shipped rate is still the reference's own sixteen, and that is the *stable* tier: a camera
+// that is not doing anything violent runs exactly the rate `cb8e06cf80` ran. What is new is that the
+// rate is a function of how violently the view changed rather than a constant, because the mechanism
+// decides what a converged picture *is*, not how many frames it takes to reach it - and the frames
+// are what a snap turn is judged on. The two settings are:
+//
+//   * `default_pages` (`surface_vt_page_batch_default`): the stable tier, 16. This is the whole of
+//     the shipped behaviour and every existing acceptance reading.
+//   * `max_pages` (`surface_vt_page_batch_max`): the tier the plugin raises the batch to *by itself*
+//     while the camera is moving fast, while the view it is filling is still unserved, or on the
+//     tick the motion sampler sees a discontinuity. This is the "over page" the request named - the
+//     most a large movement may add - and it is deliberately not a third setting: an `over` quota
+//     and a `max` would be two spellings of one number, so the headroom has one knob and one
+//     relationship to keep.
+//
+// The two read as `default <= max <= ceiling`. A configuration with `max == default` has one tier:
+// the governor is then inert and the rate is the constant it always was, which is how the shipped
+// 16-page behaviour runs through this same code in the acceptance comparison.
+//
+// The tier is resolved once per tick by `avt_page_budget_update()`, in the file that owns the near
+// field's configuration, and read by everything that spends or bounds the rate:
+// `_avt_tick_allowance()` (the pass, the producer's frame budget, the source queue window), the
+// production pass's own clamp, and the producer's encode ring depth. A setting change therefore
+// reconfigures nothing and applies on the next tick, and no game code drives any of it.
+// The default `max`: the smallest headroom that reaches the acceptance target on the reference
+// project. Measured on the snap probe it is the difference between converging in 4 displayed frames
+// instead of the 24 a 16 page batch takes (`auto32` 10, `auto64` 7, `auto128` 4 on the first 180
+// degree turn), and what it costs is the encode ring's allocation - 128 positions instead of the 43
+// the shipped 16 needs, i.e. 518 MiB of staging against 87 MiB, still inside the slot-count
+// invariant the ring answers to (`allocated * 2 <= physical_cache_bytes_uncompressed`). A project
+// that would rather have the memory than the frames sets it back to 64, which converges in 7.
+constexpr int AVT_PAGE_BATCH_DEFAULT = 16;
+constexpr int AVT_PAGE_BATCH_MAX_DEFAULT = 128;
+
+// The most either may be set to, so "raise it while moving" cannot be turned into a stall or an
+// out-of-memory by a typo. It is not an arbitrary guard: it is the widest window the rest of the
+// path is sized for, so a larger batch could not be served in one pass anyway. `ReadyKeys` and
+// `Terrain3DPagePipeline::MAX_QUEUE_CAPACITY` hold 256 keys, and the producer's encode ring is
+// capped at `Terrain3DSurfaceBaker::ENCODE_PAGES_MAX` = 256 positions. 256 pages a frame is already
+// sixteen times the shipped rate, which is where a value stops being tuning and becomes churn.
+constexpr int AVT_PAGE_BATCH_CEILING = 256;
+
+// What the governor reads to decide the tier: the two quantities the motion look-ahead already
+// estimates and clamps - the smoothed linear speed in metres per second and the smoothed turn rate
+// in degrees per second - so the budget follows the same signal the plan does and the two cannot
+// disagree about whether the camera is moving fast. A brisk run or a deliberate turn asks for the
+// escalated tier: 24 m/s is 86 km/h and 45 deg/s is a quarter turn a second, both past what a
+// walking camera does and below what a vehicle or a flick does.
+//
+// The two *events* ask for the same tier without any threshold at all, because they mean the same
+// thing - a view with no resident pages behind it. A discontinuity is the >25 degree step and the
+// working-set cut the motion sampler already detects; `avt_view_unserved` is the same condition seen
+// from the production side, a plan that mostly names ground nothing has produced.
+constexpr float AVT_BATCH_ESCALATE_SPEED_M_S = 24.f;
+constexpr float AVT_BATCH_ESCALATE_TURN_DEG_S = 45.f;
+
+// The hysteresis, and it is the whole reason a jitter does not move the budget: a tier is *held* for
+// this long after the condition that asked for it stopped, and only then does it step down, one
+// tier per decay interval. So a threshold crossed for a frame or two costs nothing, a snap turn
+// keeps the raised rate for the ~15 ticks a 60 Hz frame spends in the hold - which is the ticks the
+// view is actually filling - and a settled camera is back at the stable rate about 350 ms after the
+// motion ended. The hold is longer than the decay on purpose: the fall is a ramp, not a step.
+constexpr uint64_t AVT_BATCH_HOLD_US = 250000;
+constexpr uint64_t AVT_BATCH_DECAY_US = 100000;
+
+// The two page-budget tiers, in order. The numeric order is the order the governor compares them in,
+// so `wanted > tier` is "escalate" and `wanted < tier` is "decay".
+enum class Terrain3DAVTBatchTier {
+	Stable = 0,
+	Escalated = 1,
+};
+
+// The one owner of the near field's page budget: the two settings, the tier they currently resolve
+// to, and the hysteresis that moves it. Everything else reads `live_pages()`.
+//
+// Settings and policy live together because they answer one question - how many pages may this pass
+// hand over - and the two must not be able to disagree: `pages_for_tier()` is the only spelling of
+// the relationship, so a setter that raises `default` past `max` cannot leave a tier that reads as a
+// different number than it was clamped to.
+struct Terrain3DAVTPageBudget {
+	int default_pages = AVT_PAGE_BATCH_DEFAULT;
+	int max_pages = AVT_PAGE_BATCH_MAX_DEFAULT;
+	// The most pages the configuration can ever ask for: the escalated tier. This is what the
+	// producer's encode ring is sized for at bundle build, because the ring is allocated once and
+	// re-admitted per tick - sizing it for the tier of the moment would make the escalation a rate
+	// its own staging never had.
+	int peak_pages() const {
+		return std::min(pages_for_tier(Terrain3DAVTBatchTier::Escalated), AVT_PAGE_BATCH_CEILING);
+	}
+	int pages_for_tier(Terrain3DAVTBatchTier p_tier) const;
+	// The tier in force, which is what every reader of the rate is handed.
+	int live_pages() const { return pages_for_tier(tier); }
+
+	// The tier and the hysteresis that produced it.
+	Terrain3DAVTBatchTier tier = Terrain3DAVTBatchTier::Stable;
+	uint64_t hold_us = 0;
+	uint64_t calm_us = 0;
+	uint64_t stamp_us = 0;
+	// Diagnostics for the acceptance probe's timeline: how many ticks the session spent at each
+	// tier, how many times the governor escalated, and the last motion the decision was made from.
+	uint64_t ticks = 0;
+	uint64_t escalated_ticks = 0;
+	uint64_t escalations = 0;
+	uint64_t cuts = 0;
+	float last_speed = 0.f;
+	float last_turn_deg_s = 0.f;
+	bool last_discontinuity = false;
+	bool last_unserved = false;
+};
+
+// `pages_for_tier()` is the tier-resolving half of the owner - the relationship between the two
+// settings, spelled once, in the file that owns the near field's configuration. A configuration with
+// no headroom (`max <= default`) collapses both tiers onto the default, which is how "auto escalation
+// off" is expressed and how the acceptance comparison runs the shipped 16-page behaviour through the
+// same governor.
+
+// One tick of the governor: what the motion asks for, against the tier already held, with the hold
+// and decay above. `p_delta_us` is the tick's own interval, clamped by the caller.
+void avt_page_budget_update(Terrain3DAVTPageBudget &r_budget, bool p_discontinuity, bool p_unserved,
+		float p_speed, float p_turn_deg_s, uint64_t p_delta_us);
 // How many of the previous view's pages the plan's retention window may hold. The window is what
 // makes a level the view has just left a level it can come back to: a page it holds stays named by
 // the plan, stays demanded in the pool and keeps its address, so returning to its level is a

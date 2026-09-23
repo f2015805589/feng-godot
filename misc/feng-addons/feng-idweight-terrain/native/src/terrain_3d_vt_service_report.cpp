@@ -245,6 +245,14 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 			? uncompressed_cache_bytes
 			: int64_t(producer_stats.get("material_bytes", uncompressed_cache_bytes));
 	result["material_staging_bytes"] = int64_t(producer_stats.get("staging_bytes", uncompressed_cache_bytes));
+	// The encode ring's allocation and admission, and the two numbers behind them: the peak the live
+	// page-budget settings can reach (what the allocation was made for) and what one ring position
+	// costs. A budget raised above `encode_ring_allocated / 2` would be a rate the staging cannot
+	// admit, so a probe reads these rather than inferring the ceiling from the settings.
+	result["encode_ring_capacity"] = int64_t(producer_stats.get("encode_ring_capacity", 0));
+	result["encode_ring_allocated"] = int64_t(producer_stats.get("encode_ring_allocated", 0));
+	result["page_budget_ceiling"] = int64_t(producer_stats.get("page_budget_ceiling", 0));
+	result["encode_page_bytes"] = int64_t(producer_stats.get("encode_page_bytes", 0));
 	result["material_compressed_bytes"] = int64_t(producer_stats.get("compressed_bytes", 0));
 	result["surface_vt_compression_bytes"] = int64_t(producer_stats.get("avt_bytes", 0));
 	result["surface_svt_compression_bytes"] = int64_t(producer_stats.get("svt_bytes", 0));
@@ -254,10 +262,14 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["surface_svt_compression_ready_slots"] = int64_t(producer_stats.get("svt_ready_slots", 0));
 	result["pages_per_update"] = _vt.vt_pages_per_update;
 	// Page production and look-ahead: how many source threads assemble pages, and what the
-	// last plan was aimed at. Both views' own readings are in their own reports.
-	result["page_workers"] = _vt.vt_page_workers > 0
-			? _vt.vt_page_workers
-			: (_vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count() : Terrain3DPagePipeline::default_worker_count());
+	// last plan was aimed at. Both views' own readings are in their own reports. `page_workers` is
+	// the near field's live pool when it exists - the tier moves it - and `page_workers_setting`
+	// is the floor the caller configured; the far field keeps the floor.
+	result["page_workers"] = _vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_worker_count()
+												  : (_vt.vt_page_workers > 0
+																  ? _vt.vt_page_workers
+																  : Terrain3DPagePipeline::default_worker_count());
+	result["page_workers_setting"] = _vt.vt_page_workers;
 	result["shared_pool"] = _vt.vt_shared_ready;
 	// What this frame can and cannot do on the GPU, resolved at runtime the way `rd_gpu_copy.cpp`
 	// resolves the direct page store (`has_method`, so a stock engine answers false and prints
