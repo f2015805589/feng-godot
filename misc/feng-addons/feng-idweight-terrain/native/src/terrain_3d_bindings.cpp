@@ -125,6 +125,32 @@ void Terrain3D::_bind_methods() {
 	// An edit changed the source under a world AABB. The one place every editor edit reports itself
 	// calls it, and it is public because a script that writes heights through the data API can.
 	ClassDB::bind_method(D_METHOD("invalidate_vt_clipmap_area", "area"), &Terrain3D::invalidate_vt_clipmap_area);
+	// The material group's detail layer: the switch, the density target (1024 texels/m by default),
+	// the shape, the GPU budget the slot table is derived from, and the near-field reach. The layer
+	// exists only while the material group is delivered by `Clipmap`; `has_vt_detail_layer()` is
+	// whether a usable one exists after the budget was resolved.
+	ClassDB::bind_method(D_METHOD("set_vt_detail_enabled", "enabled"), &Terrain3D::set_vt_detail_enabled);
+	ClassDB::bind_method(D_METHOD("is_vt_detail_enabled"), &Terrain3D::is_vt_detail_enabled);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_density", "texels_per_meter"), &Terrain3D::set_vt_detail_density);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_density"), &Terrain3D::get_vt_detail_density);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_min_density", "texels_per_meter"), &Terrain3D::set_vt_detail_min_density);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_min_density"), &Terrain3D::get_vt_detail_min_density);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_tile_size", "texels"), &Terrain3D::set_vt_detail_tile_size);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_tile_size"), &Terrain3D::get_vt_detail_tile_size);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_directory_size", "texels"), &Terrain3D::set_vt_detail_directory_size);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_directory_size"), &Terrain3D::get_vt_detail_directory_size);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_budget_bytes", "bytes"), &Terrain3D::set_vt_detail_budget_bytes);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_budget_bytes"), &Terrain3D::get_vt_detail_budget_bytes);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_demand_radius", "metres"), &Terrain3D::set_vt_detail_demand_radius);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_demand_radius"), &Terrain3D::get_vt_detail_demand_radius);
+	ClassDB::bind_method(D_METHOD("set_vt_detail_texels_per_pixel", "texels"), &Terrain3D::set_vt_detail_texels_per_pixel);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_texels_per_pixel"), &Terrain3D::get_vt_detail_texels_per_pixel);
+	ClassDB::bind_method(D_METHOD("has_vt_detail_layer"), &Terrain3D::has_vt_detail_layer);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_arm"), &Terrain3D::get_vt_detail_arm);
+	ClassDB::bind_method(D_METHOD("get_vt_detail_settings"), &Terrain3D::get_vt_detail_settings);
+	ClassDB::bind_method(D_METHOD("sample_vt_detail_level", "world_xz"), &Terrain3D::sample_vt_detail_level);
+	ClassDB::bind_method(D_METHOD("sample_vt_detail", "world_xz"), &Terrain3D::sample_vt_detail);
+	ClassDB::bind_method(D_METHOD("invalidate_vt_detail_area", "area"), &Terrain3D::invalidate_vt_detail_area);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_enabled", "enabled"), &Terrain3D::set_surface_vt_enabled);
 	ClassDB::bind_method(D_METHOD("is_surface_vt_enabled"), &Terrain3D::is_surface_vt_enabled);
 	ClassDB::bind_method(D_METHOD("set_surface_vt_page_count", "count"), &Terrain3D::set_surface_vt_page_count);
@@ -462,6 +488,20 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "1.0,4096.0,1.0"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
+	// The material group's detail layer, under the Clipmap subgroup because that is what it is: the
+	// ring's own finer half, which exists only while the material group is delivered by the ring. The
+	// density target is the measurement the layer exists to make, so the inspector's lower bound is 1
+	// and the default 1024; the budget is the *whole* layer's GPU storage, and the slot table is
+	// derived from it. The reach is the near field the layer sharpens - beyond it the ring serves -
+	// and the directory size is how many tiles the shader's window holds an axis.
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_clipmap_detail_enabled"), "set_vt_detail_enabled", "is_vt_detail_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_density", PROPERTY_HINT_RANGE, "1.0,8192.0,1.0,or_greater"), "set_vt_detail_density", "get_vt_detail_density");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_min_density", PROPERTY_HINT_RANGE, "1.0,8192.0,1.0,or_greater"), "set_vt_detail_min_density", "get_vt_detail_min_density");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_tile_size", PROPERTY_HINT_RANGE, "32,1024,32"), "set_vt_detail_tile_size", "get_vt_detail_tile_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_directory_size", PROPERTY_HINT_RANGE, "16,512,16"), "set_vt_detail_directory_size", "get_vt_detail_directory_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_budget_bytes", PROPERTY_HINT_RANGE, "0,2147483647,1048576,or_greater"), "set_vt_detail_budget_bytes", "get_vt_detail_budget_bytes");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_demand_radius", PROPERTY_HINT_RANGE, "0.25,4096.0,0.25,or_greater"), "set_vt_detail_demand_radius", "get_vt_detail_demand_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64.0,0.25,or_greater"), "set_vt_detail_texels_per_pixel", "get_vt_detail_texels_per_pixel");
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");

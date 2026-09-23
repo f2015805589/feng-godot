@@ -145,6 +145,11 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["clipmap_base_world"] = _vt.clipmap_base_world;
 	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
 	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
+	// The material group's detail layer: the request (density, budget, radius), what it delivered
+	// (resident/valid/starved tiles, bytes) and its source and bake counters. One dictionary, because
+	// "asked for 1024" and "has 1024 resident and baked" are the two halves a reader has to compare
+	// and neither is the acceptance on its own.
+	result["detail_material"] = get_vt_detail_settings();
 	Dictionary clipmap;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
@@ -261,6 +266,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
 	Dictionary phases;
 	phases["clipmap"] = _vt.vt_clipmap_ms;
+	phases["detail"] = _vt.vt_detail_ms;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;
 	phases["svt"] = _vt.vt_svt_ms;

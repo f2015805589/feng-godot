@@ -138,6 +138,36 @@ uniform int _clipmap_channels[CLIPMAP_GROUP_COUNT];
 uniform highp sampler2DArray _clipmap_baked_albedo : filter_linear, repeat_disable;
 uniform highp sampler2DArray _clipmap_baked_normal : filter_linear, repeat_disable;
 uniform highp sampler2DArray _clipmap_baked_params : filter_linear, repeat_disable;
+// ---- The material group's detail layer ----
+// A sparse, demand-resident layer of fine tiles *inside* the band the ring serves, and the only
+// source that reaches the 1024 texels/m the near field is measured at: the ring is one dense level
+// per octave, so its finest level is a coverage question rather than a density one, and the density
+// has to be spent where a fragment reads it. A tile is `level + snapped tile X/Y`, addressed
+// entirely in integers, and a level's directory is one texel a tile holding `slot + 1` (0 = "no
+// readable tile").
+//
+// The directory bit is the whole of the reader's gate, which is what makes the fallback chain safe:
+// a tile that is missing, still being produced, or invalidated by a move or an edit is *absent* from
+// the directory rather than present with stale content, so this arm returns false and the fragment
+// falls through to the ring's baked layers and then to the payload evaluation. `_detail_window_origin`
+// is the world origin of directory texel (0,0) for each level and `_detail_tile_world` its tile span,
+// so the shader's `floor((world - origin) / span)` and the CPU's integer tile index are the same
+// index. Both come from `Terrain3DMaterialClipmapDetail::get_arm()`, which is why they cannot drift.
+uniform highp sampler2DArray _detail_baked_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _detail_baked_normal : filter_linear, repeat_disable;
+uniform highp sampler2DArray _detail_baked_params : filter_linear, repeat_disable;
+uniform highp sampler2D _detail_directory[CLIPMAP_DETAIL_MAX_LEVELS] : filter_nearest, repeat_disable;
+uniform vec2 _detail_window_origin[CLIPMAP_DETAIL_MAX_LEVELS];
+uniform float _detail_tile_world[CLIPMAP_DETAIL_MAX_LEVELS];
+uniform float _detail_texel_world[CLIPMAP_DETAIL_MAX_LEVELS];
+uniform float _detail_texels_per_meter[CLIPMAP_DETAIL_MAX_LEVELS];
+uniform int _detail_enabled = 0;
+uniform int _detail_level_count = 0;
+uniform int _detail_tile_size = 0;
+uniform int _detail_border = 0;
+uniform int _detail_stored_size = 0;
+uniform int _detail_directory_size = 0;
+uniform int _detail_slots = 0;
 #endif
 #endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
@@ -1546,8 +1576,138 @@ bool clipmap_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal)
 	// `surface_decode_page()` is exactly this, and a page's octahedral or packed forms never apply.
 	return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
 }
-#endif // TERRAIN_CLIPMAP_MATERIAL
 
+)"
+// A split of its own: the detail arm is a section rather than an addition to the ring arm's
+// literal, which is already near MSVC's 16 kB limit, and it is logically its own concern anyway -
+// the ring arm samples a dense level, this one samples a sparse directory of tiles.
+R"(
+// ---- The material group's detail layer, sampled ------------------------------------------------
+// The readable slot at a world point for one detail level, or -1. `r_tile_local` is the position
+// inside the tile in [0,1), which is what the stored-texel address below is built from. The whole
+// lookup is the directory fetch: a slot is published exactly while its bake has landed for the
+// generation the tile was handed out under, so `-1` covers "not resident", "being produced" and
+// "invalidated" with one answer - the fragment falls through to the ring.
+//
+// The directory is passed in rather than indexed here, because a *sampler* array index has to be a
+// constant in a shader: `detail_baked_material()` below unrolls the level loop so every call names
+// its sampler with a literal. The numeric tables around it are plain arrays and are indexed at
+// runtime, which is what keeps the level count a setting instead of a compile-time shape.
+int detail_slot_at(int p_level, highp sampler2D p_directory, vec2 p_world, out vec2 r_tile_local) {
+	r_tile_local = vec2(0.0);
+	if (p_level < 0 || p_level >= _detail_level_count || p_level >= CLIPMAP_DETAIL_MAX_LEVELS) {
+		return -1;
+	}
+	float tile_world = _detail_tile_world[p_level];
+	int directory_size = _detail_directory_size;
+	if (tile_world <= 0.0 || directory_size <= 0) {
+		return -1;
+	}
+	vec2 local = (p_world - _detail_window_origin[p_level]) / tile_world;
+	ivec2 tile = ivec2(floor(local));
+	if (tile.x < 0 || tile.y < 0 || tile.x >= directory_size || tile.y >= directory_size) {
+		return -1;
+	}
+	int slot = int(texelFetch(p_directory, tile, 0).r + 0.5) - 1;
+	if (slot < 0 || slot >= _detail_slots) {
+		return -1;
+	}
+	r_tile_local = local - vec2(tile);
+	return slot;
+}
+
+// One detail level's material at a world point: its three baked layers read bilinearly at the
+// tile's own texel grid, through the gutter. `r_density` is the level's texels per metre, published
+// so a probe can say *which* density answered rather than only that some material did - the 1024
+// acceptance reads it. False means this level has no readable tile here.
+bool detail_baked_level(int p_level, highp sampler2D p_directory, vec2 p_world, out material r_mat,
+		out vec3 r_normal, out float r_density) {
+	r_density = 0.0;
+	int tile_size = _detail_tile_size;
+	int border = _detail_border;
+	int stored = _detail_stored_size;
+	if (tile_size <= 0 || stored <= 0) {
+		return false;
+	}
+	vec2 tile_local;
+	int slot = detail_slot_at(p_level, p_directory, p_world, tile_local);
+	if (slot < 0) {
+		return false;
+	}
+	// The stored texel the bilinear footprint reads. The interior is `tile_size` texels wide and
+	// the gutter `border` on each side, so a tap never leaves the stored square; the clamp is
+	// there for the tile's own rim, where the tap before the first interior texel reads the
+	// gutter - which the producer filled with the neighbouring ground, not with the rim.
+	//
+	// TODO(stage 3): the four taps below are an explicit bilinear read of level 0 of the tile - there
+	// is no mip chain and no anisotropic footprint, so a grazing view or a fragment whose footprint
+	// spans many detail texels filters only within its own two-by-two. That is the sampling work the
+	// plan defers; the residency, the directory gate and the fallback chain are what this stage has
+	// to get right, and they are what the taps depend on.
+	vec2 address = tile_local * float(tile_size) + float(border) - 0.5;
+	vec2 base = floor(address);
+	vec2 fraction = address - base;
+	vec2 limit = vec2(float(stored - 1));
+	ivec2 c00 = ivec2(clamp(base, vec2(0.0), limit));
+	ivec2 c10 = ivec2(clamp(base + vec2(1.0, 0.0), vec2(0.0), limit));
+	ivec2 c01 = ivec2(clamp(base + vec2(0.0, 1.0), vec2(0.0), limit));
+	ivec2 c11 = ivec2(clamp(base + vec2(1.0, 1.0), vec2(0.0), limit));
+	vec4 a00 = texelFetch(_detail_baked_albedo, ivec3(c00, slot), 0);
+	vec4 a10 = texelFetch(_detail_baked_albedo, ivec3(c10, slot), 0);
+	vec4 a01 = texelFetch(_detail_baked_albedo, ivec3(c01, slot), 0);
+	vec4 a11 = texelFetch(_detail_baked_albedo, ivec3(c11, slot), 0);
+	vec4 n00 = texelFetch(_detail_baked_normal, ivec3(c00, slot), 0);
+	vec4 n10 = texelFetch(_detail_baked_normal, ivec3(c10, slot), 0);
+	vec4 n01 = texelFetch(_detail_baked_normal, ivec3(c01, slot), 0);
+	vec4 n11 = texelFetch(_detail_baked_normal, ivec3(c11, slot), 0);
+	vec4 p00 = texelFetch(_detail_baked_params, ivec3(c00, slot), 0);
+	vec4 p10 = texelFetch(_detail_baked_params, ivec3(c10, slot), 0);
+	vec4 p01 = texelFetch(_detail_baked_params, ivec3(c01, slot), 0);
+	vec4 p11 = texelFetch(_detail_baked_params, ivec3(c11, slot), 0);
+	vec4 albedo = mix(mix(a00, a10, fraction.x), mix(a01, a11, fraction.x), fraction.y);
+	vec4 normal_rough = mix(mix(n00, n10, fraction.x), mix(n01, n11, fraction.x), fraction.y);
+	vec4 params = mix(mix(p00, p10, fraction.x), mix(p01, p11, fraction.x), fraction.y);
+	// The layers hold the bake's own output rather than a page's storage encoding, so the whole of
+	// the decode is the readiness alpha - exactly the ring's baked read.
+	r_density = _detail_texels_per_meter[p_level];
+	return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
+}
+
+// The material the detail layer holds at a world point: the finest level with a readable tile. False
+// means no detail level has one here, and then the caller must fall through to the ring's baked
+// material and then to the source evaluation. That ordering is the whole of the fallback chain, and
+// this function deliberately never reads a layer whose directory entry it did not just check: an
+// unreadable tile is invisible, never stale.
+bool detail_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal, out float r_density) {
+	r_density = 0.0;
+	if (_detail_enabled == 0) {
+		return false;
+	}
+	// The detail layer is a finer source *inside* the band the ring serves, not a second band: a
+	// fragment the pages own, or one outside the ring's reach, has nothing to refine here.
+	if (clipmap_material_weight(p_world) <= 0.0) {
+		return false;
+	}
+	int count = clamp(_detail_level_count, 0, CLIPMAP_DETAIL_MAX_LEVELS);
+	if (count > 0 && detail_baked_level(0, _detail_directory[0], p_world, r_mat, r_normal, r_density)) {
+		return true;
+	}
+	if (count > 1 && detail_baked_level(1, _detail_directory[1], p_world, r_mat, r_normal, r_density)) {
+		return true;
+	}
+	if (count > 2 && detail_baked_level(2, _detail_directory[2], p_world, r_mat, r_normal, r_density)) {
+		return true;
+	}
+	if (count > 3 && detail_baked_level(3, _detail_directory[3], p_world, r_mat, r_normal, r_density)) {
+		return true;
+	}
+	return false;
+}
+#endif // TERRAIN_CLIPMAP_MATERIAL
+)"
+
+// The source evaluation, in its own literal again for the same reason.
+R"(
 // ---- The source evaluation, in one function -------------------------------------------------------
 // The material a fragment gets from the *stored payload*: the `R16` control texel - through the array or
 // the paging method - resolved against the texture assets by the idweight rules. It is one function
@@ -1816,9 +1976,20 @@ void fragment() {
 		// paged tiers - and the payload evaluation below is what they replace. A level that is not
 		// baked yet falls through to that evaluation unchanged, which is the answer it has always had:
 		// the same content at the payload's own density, read through the control texel.
+		//
+		// The *detail* layer is read before it, because it is the finer of the two and the whole
+		// point of the layer: the finest readable source wins. A detail tile that is missing, still
+		// being produced, or invalidated is absent from its directory - never stale - so this is a
+		// fallback *chain* rather than a choice between two cached answers: detail -> ring baked ->
+		// source evaluation.
 		bool evaluated_baked = false;
+		float evaluated_detail_density = 0.0;
 #ifdef TERRAIN_CLIPMAP_MATERIAL
-		evaluated_baked = clipmap_baked_material(v_vertex.xz, evaluated, evaluated_normal);
+		evaluated_baked = detail_baked_material(v_vertex.xz, evaluated, evaluated_normal,
+				evaluated_detail_density);
+		if (!evaluated_baked) {
+			evaluated_baked = clipmap_baked_material(v_vertex.xz, evaluated, evaluated_normal);
+		}
 #endif
 		if (!evaluated_baked) {
 			evaluate_idweight_material(uv, weight, index[0], index[1], index[2], index[3], bilerp, w_normal,

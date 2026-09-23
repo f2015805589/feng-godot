@@ -77,6 +77,7 @@
 
 #include "terrain_3d_avt.h"
 #include "terrain_3d_clipmap.h"
+#include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_page_pipeline.h"
 #include "terrain_vt_arrival_queue.h"
 #include "terrain_3d_vt_cells.h"
@@ -558,6 +559,42 @@ struct Terrain3DVTState {
 	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
 	// Channel texels produced by all rings in the tick that just ran.
 	int clipmap_produced_texels = 0;
+	// ---- The material group's detail layer, which is the only path to the 1024 texels/m target ----
+	// A sparse, demand-resident layer of fine tiles in front of the camera, above the coarse ring and
+	// independent of it: the ring keeps its complete, low-density coverage and its fallback, and the
+	// detail layer only exists while the material group is delivered by `Clipmap` *and* this switch
+	// is on. It owns its own GPU arrays, directory and source pipeline; nothing is allocated when it
+	// is not selected, which is the same rule the rings and the two views follow.
+	//
+	// `detail_density` is the level-0 density in texels per metre - the measurement the layer exists
+	// to make - and level `l` is that over `2^l` down to `detail_min_density`. `detail_budget_bytes`
+	// is what the whole layer may hold on the GPU; the slot table is *derived* from it, and a budget
+	// that cannot afford one ring of tiles turns the layer off with a log rather than allocating
+	// something unusable. `detail_demand_radius` bounds the near field the layer sharpens, in metres;
+	// beyond it the ring serves.
+	// The layer's own switch. **Off by default, deliberately.** Selecting `Clipmap` for the material
+	// group alone must keep the picture the ring's own baked layers produce, which is what the
+	// existing render suite compares and what its expectations are written against; a layer that
+	// sharpens the near field over that picture is a choice a project opts into, not a side effect of
+	// choosing a delivery method. With it off nothing is allocated: no textures, no directory and no
+	// job queue. The 1024-density acceptance enables it.
+	bool detail_enabled = false;
+	real_t detail_density = 1024.f;
+	real_t detail_min_density = 256.f;
+	int detail_tile_size = 256;
+	int detail_directory_size = 128;
+	int detail_budget_bytes = 256 * 1024 * 1024;
+	real_t detail_demand_radius = 12.f;
+	real_t detail_texels_per_pixel = 4.f;
+	std::unique_ptr<Terrain3DMaterialClipmapDetail> material_detail;
+	// The state stamp of the detail arm as the shader was last bound with, so a directory or a
+	// validity change is one comparison a tick rather than a rebind. See
+	// `Terrain3DMaterialClipmapDetail::get_state_stamp()` and `Terrain3D::_update_vt_detail_arm()`.
+	uint64_t material_detail_state = 0;
+	// Ticks the detail layer's demand pass ran, and the last pass's requested-tile count and cost.
+	int detail_requested_tiles = 0;
+	int detail_starved_tiles = 0;
+	double vt_detail_ms = 0.0;
 	int vt_page_size = 256;
 	// The page gutter, in texels each side. It is a *bound*, not a policy: a page asked for more
 	// anisotropy than its border can sample reads its own rim instead of the neighbouring ground,
