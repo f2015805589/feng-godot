@@ -148,8 +148,11 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	// The material group's detail layer: the request (density, budget, radius), what it delivered
 	// (resident/valid/starved tiles, bytes) and its source and bake counters. One dictionary, because
 	// "asked for 1024" and "has 1024 resident and baked" are the two halves a reader has to compare
-	// and neither is the acceptance on its own.
-	result["detail_material"] = get_vt_detail_settings();
+	// and neither is the acceptance on its own. It is published both at the service level and nested
+	// in the material ring's entry below: the ring's entry is where a reader looks for the material
+	// group's own state, and the density acceptance reads the nested shape.
+	const Dictionary detail_material = get_vt_detail_settings();
+	result["detail_material"] = detail_material;
 	Dictionary clipmap;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
@@ -193,6 +196,12 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 			entry["bake_rejects"] = int64_t(ring->get_bake_rejects());
 			entry["pending_bake_rects"] = ring->get_pending_bake_rect_count();
 			entry["level_reports"] = ring->get_level_reports();
+		}
+		// The material group's finer half, in the entry of the group it belongs to: a fragment's
+		// fallback chain runs detail -> this ring -> the payload evaluation -> the array, so the two
+		// granularities of the same group are read together.
+		if (channel == TerrainVT::ChannelGroup::Material) {
+			entry["detail"] = detail_material;
 		}
 		clipmap[TerrainVT::group_name(channel)] = entry;
 	}

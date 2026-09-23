@@ -493,6 +493,23 @@ bool Terrain3D::_vt_has_streaming_work() const {
 			return true;
 		}
 	}
+	// The material group's detail layer is the same kind of production one level down, and it has the
+	// same two halves. A tile whose source is still being prepared or polled is CPU work this tick
+	// owes - and because that work only happens in the tick, an editor that slept on it would never
+	// finish the tile. A tile whose bake the producer has not taken is device work, counted only
+	// while a producer exists, exactly as the ring's bake half is: a tile nothing will ever bake is a
+	// state the report carries, not a reason to spin.
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	if (detail != nullptr && detail->is_enabled()) {
+		if (_vt.vt_baker.is_valid() && (detail->get_pending_count() > 0 || detail->get_pending_bake_count() > 0)) {
+			return true;
+		}
+		// A tick that handed out slots has a source to submit on the next one: the walk itself is
+		// outstanding work even before any tile is resident.
+		if (_vt.detail_requested_tiles > 0) {
+			return true;
+		}
+	}
 	if (_vt.vt_page_pipeline) {
 		int pages = 0, queued = 0;
 		int64_t usec = 0;

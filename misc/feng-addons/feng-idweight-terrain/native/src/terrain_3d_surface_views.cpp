@@ -888,13 +888,6 @@ bool Terrain3D::_vt_clipmap_state_changed() {
 }
 
 void Terrain3D::_update_vt_clipmap_arm() {
-	// The detail layer's own tick rides on this hook. The physics tick's clipmap phase is the one
-	// place that runs every tick a cell selects the method, and it calls this immediately after the
-	// rings produce - but it lives in `terrain_3d.cpp`, which the parallel Stage 1 task owns, so
-	// hanging the detail pass here is the minimal adaptation rather than editing that file. The
-	// layer early-returns unless the material group selected Clipmap, so a height-only ring pays one
-	// null check. See the summary's dependency note.
-	_update_vt_material_detail();
 	if (!_vt_clipmap_state_changed()) {
 		return;
 	}
@@ -962,9 +955,11 @@ int Terrain3D::debug_update_vt_clipmap(const int p_group) {
 //
 // **Selection.** `_setup_vt_material_detail()` is the one owner of the layer's lifetime and is called
 // from the assembly rule (so a cell write creates or frees it with the ring) and from every setting
-// setter. `_update_vt_material_detail()` is the tick, hung on `_update_vt_clipmap_arm()` so it runs
-// wherever the ring phase already runs; it builds the screen-footprint demand view from the live
-// camera, runs the layer's update, and offers the layers' landed tiles to the producer.
+// setter. `_update_vt_material_detail()` is the tick, called from `terrain_3d.cpp`'s clipmap phase -
+// the one production pass every tick a cell selects `Clipmap` runs - where the ring's production and
+// its bake offer already live; it builds the screen-footprint demand view from the live camera, runs
+// the layer's update, and offers the layers' landed tiles to the producer. Its outstanding work is
+// counted by `_vt_has_streaming_work()` so a still-baking tile keeps the editor drawing.
 
 bool Terrain3D::_setup_vt_material_detail() {
 	// On exactly while the material group is delivered by the ring *and* the switch is on. The ring
@@ -975,6 +970,12 @@ bool Terrain3D::_setup_vt_material_detail() {
 			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
 	if (!wanted) {
 		if (_vt.material_detail != nullptr) {
+			// The producer holds a descriptor set that names this layer's textures and this bundle's
+			// job buffer, and jobs that name its slots. It has to forget them while the layer still
+			// exists: the arrays are freed just below, and the producer's set would outlive them.
+			if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+				surface_baker->drop_detail_bake();
+			}
 			_vt.material_detail->clear();
 			_vt.material_detail.reset();
 			_vt.material_detail_state = 0;
@@ -1134,6 +1135,22 @@ Dictionary Terrain3D::get_vt_detail_settings() const {
 	result["demand_radius"] = _vt.detail_demand_radius;
 	result["texels_per_pixel"] = _vt.detail_texels_per_pixel;
 	result["exists"] = _vt.material_detail != nullptr;
+	// The acceptance reading of the layer, under the names the 1024 density test takes (a `detail`
+	// dictionary inside the material ring's entry): `enabled` is whether the layer is on *and* usable,
+	// `requested_density` is the level-0 density that was asked for, and `delivered_density` is the
+	// density the directory actually answers at the focus of the last demand walk - a reading of
+	// resident, generation-matched, baked content rather than of a setting. `missing_tiles` counts the
+	// demanded tiles no fragment can read yet, `fallback_tiles` the ones the coarse ring serves because
+	// the budget could not hold them, and `cache_bytes` what the arrays occupy. They are written here
+	// as well as beside the layer's own keys so one dictionary satisfies both the panel and the test.
+	result["enabled"] = false;
+	result["requested_density"] = _vt.detail_density;
+	result["delivered_density"] = 0.0;
+	result["delivered_density_focus"] = _vt.material_detail != nullptr ? _vt.material_detail->get_last_focus()
+																	 : Vector2();
+	result["missing_tiles"] = 0;
+	result["fallback_tiles"] = 0;
+	result["cache_bytes"] = int64_t(0);
 	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
 	if (detail == nullptr) {
 		result["active"] = false;
@@ -1143,6 +1160,14 @@ Dictionary Terrain3D::get_vt_detail_settings() const {
 		return result;
 	}
 	result["active"] = detail->is_enabled();
+	result["enabled"] = detail->is_enabled();
+	// The density a fragment at the focus would be served, through the same directory lookup the
+	// shader does. A layer whose tiles are still baking reads 0 or a coarser level here, which is the
+	// whole point of reporting a delivered number instead of the requested one.
+	result["delivered_density"] = detail->density_at(detail->get_last_focus());
+	result["missing_tiles"] = detail->get_pending_count() + detail->get_starved_tiles();
+	result["fallback_tiles"] = detail->get_starved_tiles();
+	result["cache_bytes"] = detail->get_used_bytes();
 	result["levels"] = detail->get_level_count();
 	result["tile_size"] = detail->get_tile_size();
 	result["border"] = detail->get_border();

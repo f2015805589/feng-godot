@@ -488,6 +488,17 @@ int Terrain3DMaterialClipmapDetail::_acquire_slot(const int64_t p_key, const Vec
 		// directory never names a slot twice.
 		_resident.erase(_slots[size_t(slot)].key);
 		_release_slot(slot);
+		// `_release_slot()` puts the slot back on the free list, and this allocation is taking it
+		// straight out again. Leaving it there handed the *same* slot to the next key that needed one
+		// - the resident map then held two keys per slot, `used_slots` grew past the slot table, and
+		// the directory published a slot under a key whose content was another tile's, so a fragment
+		// at the focus found no readable tile and the coarse ring served instead. Measured before the
+		// fix: `used_slots` reached 252 of 126 slots with `dup_slots=126`.
+		if (!_free_slots.empty() && _free_slots.back() == slot) {
+			_free_slots.pop_back();
+		} else {
+			_free_slots.erase(std::remove(_free_slots.begin(), _free_slots.end(), slot), _free_slots.end());
+		}
 		_evictions++;
 	}
 	Tile &tile = _slots[size_t(slot)];
@@ -588,6 +599,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	_tick++;
 	_starved = 0;
 	_wanted.clear();
+	_last_focus = p_view.focus;
 
 	// 1. The windows. A level whose window moved has to re-publish its directory, because the
 	//    directory's index is relative to the window the shader is told about.
@@ -667,9 +679,10 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	});
 
 	// 3. The wanted set, before any slot is handed out, so eviction can tell this frame's demand
-	//    from what the last frame left behind.
-	for (const Demand &entry : demand) {
-		_wanted[entry.key] = 1;
+	//    from what the last frame left behind. The value is the tile's rank in the walk (1 is the
+	//    nearest), which is what the offer queue below orders by.
+	for (size_t rank = 0; rank < demand.size(); rank++) {
+		_wanted[demand[rank].key] = uint32_t(rank) + 1;
 	}
 
 	// 4. Residency: keep what is wanted, allocate what is missing.
@@ -794,8 +807,20 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	//    an offer that has gone unacknowledged for too long is offered again, because a producer
 	//    that could not dispatch (no material list, no device) leaves its queue holding work it
 	//    will not report back.
-	for (int slot = 0; slot < _slot_count; slot++) {
-		Tile &tile = _slots[size_t(slot)];
+	//
+	//    The walk's own order, nearest first: the producer bakes one tile a tick at the default
+	//    budget, so the order decides *which* tile a fragment waits for. Iterating the slot table
+	//    instead offered whatever slot happened to be free first, which put the tile under the
+	//    crosshair last behind a hundred tiles the view does not need yet - measured, the probe point
+	//    1.6 m ahead stayed unreadable for the whole acceptance window while ten tiles a mile away
+	//    were valid. Only a tile this walk wants is offered: a resident tile the view has left is
+	//    about to be evicted, and spending a dispatch on it is the same defect from the other side.
+	for (const Demand &entry : demand) {
+		auto found = _resident.find(entry.key);
+		if (found == _resident.end()) {
+			continue;
+		}
+		Tile &tile = _slots[size_t(found->second)];
 		if (tile.slot < 0 || tile.valid || !tile.source_ready) {
 			continue;
 		}
@@ -806,7 +831,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		// producer that arrives late would dispatch the same tile twice.
 		bool already_offered = false;
 		for (const BakeOffer &offer : _offers) {
-			already_offered = already_offered || (offer.slot == slot && offer.generation == tile.generation);
+			already_offered = already_offered || (offer.slot == tile.slot && offer.generation == tile.generation);
 		}
 		if (already_offered) {
 			continue;
@@ -814,7 +839,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		tile.bake_in_flight = true;
 		tile.offer_tick = _tick;
 		BakeOffer offer;
-		offer.slot = slot;
+		offer.slot = tile.slot;
 		offer.level = tile.level;
 		offer.generation = tile.generation;
 		offer.world_rect = _tile_world_rect(tile.level, tile.x, tile.y);
@@ -825,6 +850,20 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		_offers.push_back(offer);
 		_bake_offers++;
 	}
+	// The queue is re-ordered by the walk's own rank, nearest first, because the producer takes one
+	// tile a tick at the default budget while the source pipeline can deliver a dozen: without this
+	// the bake order was the order the *workers* happened to finish in, and the tile under the
+	// crosshair sat behind a hundred tiles further away - measured, the focus tile's offer was the
+	// 112th of 238 and the probe point read the coarse ring for the whole acceptance window. An
+	// offer whose tile the walk no longer wants sorts last; it is collected only if nothing nearer
+	// is left, which is the same priority the slot table's eviction already uses.
+	std::stable_sort(_offers.begin(), _offers.end(), [this](const BakeOffer &p_a, const BakeOffer &p_b) {
+		auto rank_of = [this](const BakeOffer &p_offer) {
+			const auto found = _wanted.find(_slots[size_t(p_offer.slot)].key);
+			return found != _wanted.end() ? found->second : UINT32_MAX;
+		};
+		return rank_of(p_a) < rank_of(p_b);
+	});
 
 	// 8. Publish the directories that moved. Only `valid` tiles are written, so a resident but
 	//    unbaked slot is invisible to a fragment rather than merely unadvertised.

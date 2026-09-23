@@ -294,6 +294,11 @@ private:
 		std::vector<DetailJob> queued;
 		std::vector<DetailJob> landed;
 		uint64_t dispatches = 0;
+		// Offers that reached this producer and could not be taken because its set was not ready:
+		// the layer re-offers after its own timeout, so a nonzero count is a delay, and a count that
+		// keeps growing is a set that never builds.
+		uint64_t set_failures = 0;
+		uint64_t offers_taken = 0;
 	};
 	DetailBake _detail_bake;
 	// Builds the detail bake's descriptor set when there is none or when the layer it describes is
@@ -695,6 +700,13 @@ public:
 	int queue_detail_tiles(Terrain3DMaterialClipmapDetail *p_detail, const int p_budget_texels);
 	// The detail bake's own accounting: the dispatches it recorded, and the tiles still queued.
 	Dictionary get_detail_bake_stats() const;
+	// Drops everything this producer holds for the detail layer: its descriptor set (which names the
+	// layer's own textures and this bundle's job buffer) and the three job lists. The layer's lifetime
+	// is the node's - `_setup_vt_material_detail()` frees it whenever the material group leaves the
+	// ring, exactly as the plan requires a deselection to release the layer's storage - so the
+	// producer must be told before that happens. Without this the set would name freed textures and,
+	// worse, `_detail_bake.detail` would be a pointer to a manager that no longer exists.
+	void drop_detail_bake();
 
 	// Called by the parent through RenderingServer::call_on_render_thread().  The
 	// keep-alive is intentionally unused; binding a Ref<RefCounted> to the Callable

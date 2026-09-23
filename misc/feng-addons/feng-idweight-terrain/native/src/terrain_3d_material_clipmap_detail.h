@@ -253,6 +253,10 @@ public:
 	// no level has a readable tile there.
 	int level_at(const Vector2 &p_world) const;
 	real_t density_at(const Vector2 &p_world) const;
+	// The focus the last demand walk was built from. Kept because the walk is the only place the
+	// layer learns where the view is, and the report has to state the density the directory actually
+	// answers *there* rather than the density that was requested.
+	Vector2 get_last_focus() const { return _last_focus; }
 
 	// ---- Readings ---------------------------------------------------------------------------------
 	int get_slot_count() const { return _slot_count; }
@@ -348,6 +352,8 @@ private:
 	bool _enabled = false;
 	int _stored_size = 0;
 	int _slot_count = 0;
+	// Focus of the last demand walk, reported beside the density the directory answers there.
+	Vector2 _last_focus;
 	// Slot index -> tile, the authoritative residency table. A free slot's entry has `slot == -1`.
 	std::vector<Tile> _slots;
 	// Free slot indices, so a demand walk does not scan the table for a hole per allocation.
@@ -355,9 +361,10 @@ private:
 	// Resident tile key -> slot. `_slots[_resident[key]]` is the same tile; this is the lookup the
 	// demand walk and the producer's acknowledgment both need.
 	std::unordered_map<int64_t, int> _resident;
-	// The keys this frame's walk asked for, so eviction can tell "resident and wanted" from
-	// "resident and stale" without re-running the rule.
-	std::unordered_map<int64_t, uint8_t> _wanted;
+	// The keys this frame's walk asked for, mapped to the tile's *rank* in that walk (1 is the nearest
+	// tile). Eviction reads membership to tell "resident and wanted" from "resident and stale"; the
+	// offer queue reads the rank to spend a scarce bake budget on the tile the view needs first.
+	std::unordered_map<int64_t, uint32_t> _wanted;
 	uint64_t _tick = 0;
 	uint64_t _state_stamp = 1;
 

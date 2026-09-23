@@ -266,6 +266,14 @@ void Terrain3D::__physics_process(const double p_delta) {
 					baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
 				}
 			}
+			// The material group's detail layer is the ring's own finer half and it runs in this
+			// phase rather than beside it: the phase is the only production pass a cell that selects
+			// `Clipmap` is guaranteed, the layer exists while the material group is delivered by the
+			// ring, and a tick that runs nowhere else is what keeps the editor drawing for a tile
+			// whose source or bake is still in flight (`_vt_has_streaming_work()` is the other half).
+			// It early-returns when the layer was never created, so a height-only ring pays a null
+			// check and a group whose detail switch is off owns nothing.
+			_update_vt_material_detail();
 		});
 		vt_phase(_vt.vt_clipmap_ms);
 		// A ring that moved a level, turned its ring or changed which levels are current is a uniform
@@ -276,6 +284,10 @@ void Terrain3D::__physics_process(const double p_delta) {
 	} else {
 		_vt.clipmap_produced_texels = 0;
 		_vt.vt_clipmap_ms = 0.0;
+		// No group selects the ring, so the material detail layer - which is gated on exactly that -
+		// cannot be ticked here. Its phase reading is reset so a panel never shows the last tick's
+		// cost as this one's.
+		_vt.vt_detail_ms = 0.0;
 	}
 	traced("vt_service", [&] { _update_vt_service(); });
 	vt_phase(_vt.vt_service_ms);
