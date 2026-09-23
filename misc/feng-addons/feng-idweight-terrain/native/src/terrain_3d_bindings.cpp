@@ -125,6 +125,23 @@ void Terrain3D::_bind_methods() {
 	// An edit changed the source under a world AABB. The one place every editor edit reports itself
 	// calls it, and it is public because a script that writes heights through the data API can.
 	ClassDB::bind_method(D_METHOD("invalidate_vt_clipmap_area", "area"), &Terrain3D::invalidate_vt_clipmap_area);
+	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
+	// A mechanism before it is a delivery, exactly as the ring was: the entry below builds it for a
+	// group and runs the phase the tick would run, and the layout payload is what the debug view draws
+	// instead of a ring's squares. The atlas is the answer to "a ring publishes a whole layer per
+	// movement, an atlas publishes the block rects that changed", so it is measured beside the ring by
+	// `native/tests/vt_clipmap_load` rather than claimed against it.
+	ClassDB::bind_method(D_METHOD("has_vt_clipmap_atlas"), &Terrain3D::has_vt_clipmap_atlas);
+	ClassDB::bind_method(D_METHOD("clipmap_atlas_available"), &Terrain3D::clipmap_atlas_available);
+	ClassDB::bind_method(D_METHOD("debug_update_vt_clipmap_atlas", "group"), &Terrain3D::debug_update_vt_clipmap_atlas);
+	ClassDB::bind_method(D_METHOD("get_clipmap_atlas_layout", "group"), &Terrain3D::get_clipmap_atlas_layout);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_arm", "group"), &Terrain3D::get_vt_clipmap_atlas_arm);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_rings", "rings"), &Terrain3D::set_vt_clipmap_atlas_rings);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_rings"), &Terrain3D::get_vt_clipmap_atlas_rings);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_global_texels", "texels"), &Terrain3D::set_vt_clipmap_atlas_global_texels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_global_texels"), &Terrain3D::get_vt_clipmap_atlas_global_texels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_blocks_per_frame", "blocks"), &Terrain3D::set_vt_clipmap_atlas_blocks_per_frame);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_blocks_per_frame"), &Terrain3D::get_vt_clipmap_atlas_blocks_per_frame);
 	// The material group's detail layer: the switch, the density target (1024 texels/m by default),
 	// the shape, the GPU budget the slot table is derived from, and the near-field reach. The layer
 	// exists only while the material group is delivered by `Clipmap`; `has_vt_detail_layer()` is
@@ -488,6 +505,12 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "1.0,4096.0,1.0"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
+	// The clipmap atlas's own three settings: the ring count, the one-time global block's resolution
+	// and the per-frame production bound. The atlas's block size and block world are the ring's own
+	// `vt_clipmap_size` and `vt_clipmap_base_world`, so the two mechanisms share one density ladder.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_rings", PROPERTY_HINT_RANGE, "1,4,1"), "set_vt_clipmap_atlas_rings", "get_vt_clipmap_atlas_rings");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_global_texels", PROPERTY_HINT_RANGE, "1,1024,1"), "set_vt_clipmap_atlas_global_texels", "get_vt_clipmap_atlas_global_texels");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_blocks_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_clipmap_atlas_blocks_per_frame", "get_vt_clipmap_atlas_blocks_per_frame");
 	// The material group's detail layer, under the Clipmap subgroup because that is what it is: the
 	// ring's own finer half, which exists only while the material group is delivered by the ring. The
 	// density target is the measurement the layer exists to make, so the inspector's lower bound is 1

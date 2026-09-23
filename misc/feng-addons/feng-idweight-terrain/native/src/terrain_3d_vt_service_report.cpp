@@ -145,6 +145,71 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["clipmap_base_world"] = _vt.clipmap_base_world;
 	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
 	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
+	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
+	// The mechanism's own readings, published beside the ring's so the load comparison is one report
+	// rather than two programs. The numbers that matter are the update *unit*: `block_uploads` is how
+	// many block rects were published (against the ring's whole-layer `upload_bytes`), and
+	// `blocks_loaded` / `blocks_retained` are the rolling evidence - a scroll that reloaded the grid
+	// would report `blocks_retained` at zero.
+	result["clipmap_atlas_available"] = has_vt_clipmap_atlas();
+	result["clipmap_atlas_rings"] = _vt.clipmap_atlas_rings;
+	result["clipmap_atlas_global_texels"] = _vt.clipmap_atlas_global_texels;
+	result["clipmap_atlas_blocks_per_frame"] = _vt.clipmap_atlas_blocks_per_frame;
+	result["clipmap_atlas_produced_texels"] = _vt.clipmap_atlas_produced_texels;
+	result["clipmap_atlas_block_uploads"] = _vt.clipmap_atlas_block_uploads;
+	result["clipmap_atlas_scroll_events"] = _vt.clipmap_atlas_scroll_events;
+	result["clipmap_atlas_blocks_loaded"] = _vt.clipmap_atlas_blocks_loaded;
+	result["clipmap_atlas_blocks_retained"] = _vt.clipmap_atlas_blocks_retained;
+	result["clipmap_atlas_preview_calls"] = int64_t(_vt.clipmap_atlas_preview_calls);
+	result["clipmap_atlas_preview_computed"] = int64_t(_vt.clipmap_atlas_preview_computed);
+	Dictionary clipmap_atlas;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
+		Dictionary entry;
+		entry["configured"] = atlas != nullptr && atlas->is_configured();
+		entry["source"] = atlas != nullptr ? atlas->get_source_name() : String("none");
+		entry["source_available"] = has_clipmap_source(group);
+		if (atlas != nullptr && atlas->is_configured()) {
+			entry["rings"] = atlas->get_rings();
+			entry["blocks"] = atlas->get_block_count();
+			entry["slots"] = atlas->get_slot_count();
+			entry["cells"] = atlas->get_cell_count();
+			entry["channels"] = atlas->get_channel_count();
+			entry["block_size"] = atlas->get_config().block_size;
+			entry["block_world"] = atlas->get_config().base_world;
+			entry["width"] = atlas->get_atlas_width();
+			entry["height"] = atlas->get_atlas_height();
+			entry["produced_texels"] = int64_t(atlas->get_produced_texels());
+			entry["upload_bytes"] = int64_t(atlas->get_upload_bytes());
+			entry["block_uploads"] = int64_t(atlas->get_block_uploads());
+			entry["pending_jobs"] = atlas->get_pending_jobs();
+			entry["scroll_events"] = int64_t(atlas->get_scroll_events());
+			entry["blocks_loaded"] = int64_t(atlas->get_edge_blocks_loaded());
+			entry["blocks_retained"] = int64_t(atlas->get_interior_blocks_retained());
+			entry["last_scroll_loaded"] = int64_t(atlas->get_last_scroll_loaded());
+			entry["last_scroll_retained"] = int64_t(atlas->get_last_scroll_retained());
+			entry["update_calls"] = int64_t(atlas->get_update_calls());
+			entry["idle_updates"] = int64_t(atlas->get_idle_updates());
+			// The two readings the settle criteria are written against: how many cells point at a
+			// current block right now, and how many are waiting for one.
+			int current = 0;
+			int pending_cells = 0;
+			for (int cell = 0; cell < atlas->get_cell_count(); cell++) {
+				current += atlas->is_cell_current(cell) ? 1 : 0;
+				pending_cells += atlas->get_cell_pending_slot(cell) >= 0 ? 1 : 0;
+			}
+			entry["current_cells"] = current;
+			// A cell is either serving a block or waiting for one, and never neither: that identity is
+			// the anti-flash property the per-frame timeline is evidence for - the replacement is built
+			// in a spare slot before the block it replaces is released, so no frame has a gap.
+			entry["pending_cells"] = pending_cells;
+			entry["serving_or_loading"] = current + pending_cells;
+			entry["ring_reports"] = atlas->get_ring_reports();
+			entry["layout"] = atlas->get_layout_report();
+		}
+		clipmap_atlas[TerrainVT::group_name(TerrainVT::ChannelGroup(group))] = entry;
+	}
+	result["clipmap_atlas"] = clipmap_atlas;
 	// The material group's detail layer: the request (density, budget, radius), what it delivered
 	// (resident/valid/starved tiles, bytes) and its source and bake counters. One dictionary, because
 	// "asked for 1024" and "has 1024 resident and baked" are the two halves a reader has to compare

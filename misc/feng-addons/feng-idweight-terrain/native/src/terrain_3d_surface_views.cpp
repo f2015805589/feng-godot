@@ -737,6 +737,184 @@ bool Terrain3D::has_vt_clipmap_ring() const {
 	return false;
 }
 
+///////////////////////////
+// The clipmap atlas
+///////////////////////////
+//
+// The same rings as `Terrain3DClipmap`, organised as discrete blocks packed into one texture per
+// channel (`terrain_3d_clipmap_atlas.h`), and built by the same assembly rule for the same reason:
+// which *source* carries a group is the whole of the difference, so a second channel is a source and
+// a line here rather than a second atlas.
+//
+// **It is a mechanism before it is a delivery, exactly as the ring was.** The atlas's own entry is
+// `debug_update_vt_clipmap_atlas()`, beside `debug_update_vt_clipmap()` and for the same reason: the
+// addressing, the block layout, the rolling counters, the per-frame timeline and the texture still
+// have to be *measurable* - `native/tests/vt_clipmap_atlas` and `native/tests/vt_clipmap_load` are
+// nothing but those readings - and a cell has no arm for it yet, so no cell may name it. What it
+// already answers is the load question: a ring publishes a whole `size x size` layer per movement, an
+// atlas publishes the block rects that changed, and the two are measured side by side by one script.
+bool Terrain3D::has_vt_clipmap_atlas() const {
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		if (_vt.clipmap_atlas[group] != nullptr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool Terrain3D::_setup_vt_clipmap_atlas(const TerrainVT::ChannelGroup p_group) {
+	if (_data == nullptr) {
+		return false;
+	}
+	const int index = int(p_group);
+	if (_vt.clipmap_atlas[index] == nullptr) {
+		std::unique_ptr<Terrain3DClipmapSource> source = _make_clipmap_source(p_group);
+		if (source == nullptr) {
+			return false;
+		}
+		LOG(DEBUG, "Creating ", source->get_source_name(), " clipmap atlas");
+		_vt.clipmap_atlas[index] = std::make_unique<Terrain3DClipmapAtlas>(std::move(source));
+	}
+	Terrain3DClipmapAtlas::Config config;
+	// The block is `clipmap_size` texels of `clipmap_base_world` metres, so ring `r`'s block is
+	// `clipmap_size >> r` texels of the *same* world size: the density ladder the ring's levels have,
+	// with the shells nested instead of laid over each other. The settings that shape a ring shape an
+	// atlas the same way, so a user who tuned one has tuned the other.
+	config.block_size = _vt.clipmap_size;
+	config.rings = CLAMP(_vt.clipmap_atlas_rings, 1, Terrain3DClipmapAtlas::MAX_RINGS);
+	config.base_world = _vt.clipmap_base_world;
+	config.channels = _vt.clipmap_atlas[index]->get_source_channel_count();
+	config.format = _vt.clipmap_atlas[index]->get_source_format();
+	config.global_texels = _vt.clipmap_atlas_global_texels;
+	config.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
+	_vt.clipmap_atlas[index]->configure(config);
+	return true;
+}
+
+// The atlas's own arm: the rect array, the per-cell current-frame index, the per-ring start point and
+// phase, and the grid's shape. The shader's copy of the block addressing has to be the *same* numbers
+// the CPU's is, so the two are one publish - the same rule the ring's arm follows.
+Dictionary Terrain3D::get_vt_clipmap_atlas_arm(const int p_group) const {
+	Dictionary arm;
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return arm;
+	}
+	const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
+	if (atlas == nullptr || !atlas->is_configured()) {
+		return arm;
+	}
+	const int rings = atlas->get_rings();
+	const int cells = atlas->get_cell_count();
+	const int slots = atlas->get_slot_count();
+	PackedVector2Array starts;
+	PackedVector4Array rects;
+	PackedInt32Array cell_slots;
+	PackedVector2Array cell_offsets;
+	PackedFloat32Array cell_current;
+	starts.resize(rings);
+	rects.resize(slots);
+	cell_slots.resize(cells);
+	cell_offsets.resize(cells);
+	cell_current.resize(cells);
+	for (int ring = 0; ring < rings; ring++) {
+		starts[ring] = atlas->get_grid_origin(ring);
+	}
+	for (int slot = 0; slot < slots; slot++) {
+		const Rect2i rect = atlas->get_slot_rect(slot);
+		rects[slot] = Vector4(real_t(rect.position.x), real_t(rect.position.y),
+				real_t(rect.size.x), real_t(rect.size.y));
+	}
+	for (int cell = 0; cell < cells; cell++) {
+		cell_slots[cell] = atlas->get_cell_slot(cell);
+		const Vector2i offset = atlas->get_cell_offset(cell);
+		cell_offsets[cell] = Vector2(real_t(offset.x), real_t(offset.y));
+		cell_current[cell] = atlas->is_cell_current(cell) ? 1.f : 0.f;
+	}
+	arm["configured"] = true;
+	arm["texture"] = atlas->get_texture_rid();
+	arm["block_size"] = atlas->get_config().block_size;
+	arm["block_world"] = atlas->get_config().base_world;
+	arm["rings"] = rings;
+	arm["grid_side"] = atlas->get_config().rings * 2 + 1;
+	arm["cells"] = cells;
+	arm["slots"] = slots;
+	arm["channels"] = atlas->get_channel_count();
+	arm["width"] = atlas->get_atlas_width();
+	arm["height"] = atlas->get_atlas_height();
+	arm["starts"] = starts;
+	arm["rects"] = rects;
+	arm["cell_slots"] = cell_slots;
+	arm["cell_offsets"] = cell_offsets;
+	arm["cell_current"] = cell_current;
+	return arm;
+}
+
+// The mechanism's own entry, beside `debug_update_vt_clipmap()` and the same shape: the same focus
+// (`get_clipmap_target_position()`), the same `vt_clipmap_budget_texels`, and the same two published
+// numbers, so a panel or a test reads the atlas through the one report either way.
+int Terrain3D::debug_update_vt_clipmap_atlas(const int p_group) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return -1;
+	}
+	if (!_setup_vt_clipmap_atlas(TerrainVT::ChannelGroup(p_group))) {
+		_vt.clipmap_atlas_produced_texels = 0;
+		return -1;
+	}
+	Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
+	if (atlas == nullptr) {
+		_vt.clipmap_atlas_produced_texels = 0;
+		return -1;
+	}
+	const Vector2 focus = v3v2(get_clipmap_target_position());
+	_vt.clipmap_atlas_produced_texels = atlas->update(focus, _vt.clipmap_budget_texels);
+	// The rolling evidence, read straight off the mechanism: how many blocks a scroll loaded and how
+	// many cells kept their content. It is published rather than kept local because "only the edge
+	// reloads" is a claim the acceptance asks to see as a number.
+	_vt.clipmap_atlas_block_uploads = int64_t(atlas->get_block_uploads());
+	_vt.clipmap_atlas_scroll_events = int64_t(atlas->get_scroll_events());
+	_vt.clipmap_atlas_blocks_loaded = int64_t(atlas->get_edge_blocks_loaded());
+	_vt.clipmap_atlas_blocks_retained = int64_t(atlas->get_interior_blocks_retained());
+	return _vt.clipmap_atlas_produced_texels;
+}
+
+// Whether any atlas exists, for the debug view's gate: the same rule the ring's gate follows, so a
+// picture of an atlas is a picture of an object that exists rather than of a selection.
+bool Terrain3D::clipmap_atlas_available() const {
+	return has_vt_clipmap_atlas();
+}
+
+// The debug view's payload for the atlas: the layout the packer chose, the ring/block counts, every
+// rect, and every cell's current-frame index - the user's "the debug should show the atlas's region".
+Dictionary Terrain3D::get_clipmap_atlas_layout(const int p_group) const {
+	Dictionary result;
+	_vt.clipmap_atlas_preview_calls++;
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return result;
+	}
+	const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
+	if (atlas == nullptr || !atlas->is_configured()) {
+		return result;
+	}
+	_vt.clipmap_atlas_preview_computed++;
+	result["group"] = String(TerrainVT::group_name(TerrainVT::ChannelGroup(p_group)));
+	result["source"] = atlas->get_source_name();
+	result["focus"] = atlas->get_focus();
+	result["produced_texels"] = int64_t(atlas->get_produced_texels());
+	result["upload_bytes"] = int64_t(atlas->get_upload_bytes());
+	result["block_uploads"] = int64_t(atlas->get_block_uploads());
+	result["pending_jobs"] = atlas->get_pending_jobs();
+	result["rings"] = atlas->get_ring_reports();
+	result["layout"] = atlas->get_layout_report();
+	result["timeline"] = atlas->get_load_timeline();
+	result["scroll_events"] = int64_t(atlas->get_scroll_events());
+	result["blocks_loaded"] = int64_t(atlas->get_edge_blocks_loaded());
+	result["blocks_retained"] = int64_t(atlas->get_interior_blocks_retained());
+	result["last_scroll_loaded"] = int64_t(atlas->get_last_scroll_loaded());
+	result["last_scroll_retained"] = int64_t(atlas->get_last_scroll_retained());
+	result["state_stamp"] = int64_t(atlas->get_state_stamp());
+	return result;
+}
+
 void Terrain3D::set_vt_clipmap_size(const int p_size) {
 	// 0 is refused rather than clamped: a ring with no texels an axis is not a small clipmap, it is
 	// not a clipmap, and the setter should not accept a shape the mechanism cannot build.
@@ -767,6 +945,32 @@ void Terrain3D::set_vt_clipmap_budget_texels(const int p_texels) {
 	// The budget is not a shape: a ring keeps its content when it changes, and 0 is a legal "produce
 	// nothing this tick" that a test uses to hold the ring still.
 	_vt.clipmap_budget_texels = MAX(0, p_texels);
+}
+
+// The three atlas settings. None of them is a delivery: the atlas is built and driven through
+// `debug_update_vt_clipmap_atlas()`, so a write here is a *shape* write and the next reading picks it
+// up. `rings` and `global_texels` are clamped by `configure()`, so a value outside the structure the
+// header states is refused there with a log rather than accepted and mis-laid-out.
+void Terrain3D::set_vt_clipmap_atlas_rings(const int p_rings) {
+	if (p_rings <= 0) {
+		return;
+	}
+	_vt.clipmap_atlas_rings = p_rings;
+}
+
+void Terrain3D::set_vt_clipmap_atlas_global_texels(const int p_texels) {
+	if (p_texels <= 0) {
+		return;
+	}
+	_vt.clipmap_atlas_global_texels = p_texels;
+}
+
+void Terrain3D::set_vt_clipmap_atlas_blocks_per_frame(const int p_blocks) {
+	// 0 is refused rather than clamped: a per-frame bound of zero is a mechanism that never loads.
+	if (p_blocks <= 0) {
+		return;
+	}
+	_vt.clipmap_atlas_blocks_per_frame = p_blocks;
 }
 
 real_t Terrain3D::sample_vt_clipmap(const int p_group, const Vector2 &p_world_xz, const int p_channel) const {

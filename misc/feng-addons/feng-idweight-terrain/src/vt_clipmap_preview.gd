@@ -55,9 +55,21 @@ const VALID_FILL_ALPHA := 0.16
 const INVALID_FILL_ALPHA := 0.05
 const BLOCK_LINE_ALPHA := 0.35
 const PENDING_COLOR := Color("ff9f43")
+## The atlas view's own constants. The atlas is drawn as two squares: the *region* - every rect the
+## packer placed, at its real position and size in the texture - and the *grid* - the 9x9 arrangement
+## of cells, coloured by the ring that owns each one and marked with the atlas index it reads this
+## frame. The user asked for exactly this: "the debug should show the atlas's region".
+const ATLAS_GAP := 10.0
+const GLOBAL_COLOR := Color("f3d28a")
+const SPARE_ALPHA := 0.45
+const ATLAS_MIN_HEIGHT := 420.0
 
 var _snapshot: Dictionary = {}
+var _atlas: Dictionary = {}
 var _status := ""
+
+func _has_atlas() -> bool:
+	return not _atlas.is_empty()
 
 
 func _ready() -> void:
@@ -69,6 +81,7 @@ func _ready() -> void:
 
 func _reset_preview_state() -> void:
 	_snapshot.clear()
+	_atlas.clear()
 	_status = ""
 
 
@@ -85,8 +98,9 @@ func _process(_p_delta: float) -> void:
 	# into existence while the section is folded and a gate that stopped would never notice.
 	_set_available(_gate(terrain))
 	if not _available:
-		if not _snapshot.is_empty():
+		if not _snapshot.is_empty() or not _atlas.is_empty():
 			_snapshot.clear()
+			_atlas.clear()
 			queue_redraw()
 		return
 	if not is_visible_in_tree():
@@ -97,31 +111,47 @@ func _process(_p_delta: float) -> void:
 func _gate(p_terrain: Object) -> bool:
 	# A terrain that cannot answer is not gated: the ring's existence is what says a view has something
 	# to draw, and a stub (or a build that predates the query) has nothing to conclude from. The real
-	# terrain always has the method, so the gate is exact where it matters.
+	# terrain always has the method, so the gate is exact where it matters. The atlas answers the same
+	# question beside the ring, because a build can carry the atlas with no ring built at all and the
+	# atlas's region is what this view is then for.
 	if not p_terrain.has_method("has_vt_clipmap_ring"):
 		return true
-	return bool(p_terrain.call("has_vt_clipmap_ring"))
+	if bool(p_terrain.call("has_vt_clipmap_ring")):
+		return true
+	if not p_terrain.has_method("has_vt_clipmap_atlas"):
+		return false
+	return bool(p_terrain.call("has_vt_clipmap_atlas"))
 
 
+# The two payloads are asked for independently: a build can carry either, and the atlas's own payload
+# is the one the drawing prefers when it is there - the user's request is that the debug show the
+# atlas's region, and the ring's strip is the picture of the mechanism it replaces.
 func _refresh_preview(p_terrain: Object) -> void:
-	if not p_terrain.has_method("get_clipmap_layout_preview"):
-		_clear_preview("Clipmap debug needs a newer native Terrain3D")
+	var layout: Dictionary = {}
+	if p_terrain.has_method("get_clipmap_layout_preview"):
+		var value: Variant = p_terrain.call("get_clipmap_layout_preview")
+		if typeof(value) == TYPE_DICTIONARY:
+			layout = value
+	var atlas: Dictionary = {}
+	if p_terrain.has_method("get_clipmap_atlas_layout"):
+		for group in [0, 1]:
+			var atlas_value: Variant = p_terrain.call("get_clipmap_atlas_layout", group)
+			if typeof(atlas_value) == TYPE_DICTIONARY and not (atlas_value as Dictionary).is_empty():
+				atlas = atlas_value
+				break
+	if layout.is_empty() and atlas.is_empty():
+		_clear_preview("No ring or atlas exists: no delivery cell selects Clipmap in this build")
 		return
-	var value: Variant = p_terrain.call("get_clipmap_layout_preview")
-	if typeof(value) != TYPE_DICTIONARY:
-		_clear_preview("Clipmap preview unavailable")
-		return
-	var layout: Dictionary = value
-	if layout.is_empty():
-		_clear_preview("No ring exists: no delivery cell may select Clipmap in this build")
-		return
-	_snapshot = layout.duplicate(true)
+	_snapshot = layout.duplicate(true) if not layout.is_empty() else {}
+	_atlas = atlas.duplicate(true) if not atlas.is_empty() else {}
 	_status = ""
+	custom_minimum_size = Vector2(0.0, ATLAS_MIN_HEIGHT if _has_atlas() else MIN_HEIGHT)
 	queue_redraw()
 
 
 func _clear_preview(p_status: String) -> void:
 	_snapshot.clear()
+	_atlas.clear()
 	_status = p_status
 	queue_redraw()
 
@@ -131,13 +161,20 @@ func _draw() -> void:
 	var font := get_theme_default_font()
 	var font_size := 11
 	var text_color := get_theme_color("font_color", "Label")
+	var title := "Clipmap atlas · region / cells" if _has_atlas() else "Clipmap ring · levels / world"
 	if font:
-		draw_string(font, Vector2(MAP_MARGIN, 14.0), "Clipmap ring · levels / world", HORIZONTAL_ALIGNMENT_LEFT,
+		draw_string(font, Vector2(MAP_MARGIN, 14.0), title, HORIZONTAL_ALIGNMENT_LEFT,
 				maxf(1.0, size.x - MAP_MARGIN * 2.0), font_size, text_color)
 	if not _status.is_empty():
 		if font:
 			draw_string(font, Vector2(MAP_MARGIN, STRIP_TOP + 14.0), _status, HORIZONTAL_ALIGNMENT_LEFT,
 					maxf(1.0, size.x - MAP_MARGIN * 2.0), font_size, text_color)
+		return
+	# The atlas is the picture when one exists, and the ring's strip is the picture when none does. The
+	# two are not drawn together: they are two answers to the same question, and a view that stacked
+	# them would make the atlas's own region the smaller half of its own picture.
+	if _has_atlas():
+		_draw_atlas(font, font_size, text_color)
 		return
 	var rings := _rings()
 	if rings.is_empty():
@@ -299,6 +336,136 @@ func _legend_lines(p_rings: Array) -> Array[String]:
 	return lines
 
 
+# ---- The atlas's own picture ---------------------------------------------------------------------
+#
+# Two squares, because the atlas raises two questions the ring does not. The left one is the
+# **region**: the texture the packer laid out, drawn to scale, every rect at its own position and
+# size, coloured by the ring whose block it is, with the spare rects outlined and the one-time global
+# block in its own colour. The right one is the **grid**: the `(2 * rings + 1)^2` cells the four rings
+# tile, each coloured by its ring and marked with what it reads this frame - a bright outline for a
+# cell that is current, the pending colour for one whose replacement is in flight. "Which rect does
+# this cell read" is the current-frame atlas index, and it is the arrow between the two squares.
+func _draw_atlas(p_font: Font, p_font_size: int, p_text_color: Color) -> void:
+	var layout: Dictionary = _atlas.get("layout", {})
+	var legend := _atlas_legend_lines(layout)
+	var legend_height := float(legend.size()) * LEGEND_LINE + 6.0
+	var available := size.y - STRIP_TOP - legend_height - MAP_MARGIN
+	var panel := minf((size.x - MAP_MARGIN * 3.0 - ATLAS_GAP) * 0.5, available)
+	if panel <= 16.0:
+		_draw_legend(Vector2(MAP_MARGIN, size.y - legend_height), legend, p_font, p_font_size)
+		return
+	var region_rect := Rect2(Vector2(MAP_MARGIN, STRIP_TOP), Vector2(panel, panel))
+	var grid_rect := Rect2(Vector2(MAP_MARGIN + panel + ATLAS_GAP, STRIP_TOP), Vector2(panel, panel))
+	_draw_atlas_region(region_rect, layout, p_font, p_font_size, p_text_color)
+	_draw_atlas_grid(grid_rect, layout, p_font, p_font_size, p_text_color)
+	_draw_legend(Vector2(MAP_MARGIN, size.y - legend_height), legend, p_font, p_font_size)
+
+
+func _draw_atlas_region(p_panel: Rect2, p_layout: Dictionary, p_font: Font, p_font_size: int,
+		p_text_color: Color) -> void:
+	var width := maxi(1, int(p_layout.get("width", 1)))
+	var height := maxi(1, int(p_layout.get("height", 1)))
+	var span := maxf(float(width), float(height))
+	var scale := p_panel.size.x / span
+	var texture_rect := Rect2(p_panel.position, Vector2(float(width), float(height)) * scale)
+	draw_rect(p_panel, Color("10161b"), true)
+	draw_rect(texture_rect, Color("1b242c"), true)
+	var live_slots := {}
+	for cell: Variant in p_layout.get("cells", []):
+		if typeof(cell) == TYPE_DICTIONARY:
+			live_slots[int((cell as Dictionary).get("slot", -1))] = bool((cell as Dictionary).get("current", false))
+	var slot_index := 0
+	for value: Variant in p_layout.get("rects", []):
+		if typeof(value) != TYPE_DICTIONARY:
+			slot_index += 1
+			continue
+		var entry: Dictionary = value
+		var rect := _rect2(entry.get("rect", Rect2()))
+		if not rect.has_area():
+			slot_index += 1
+			continue
+		var canvas := Rect2(texture_rect.position + rect.position * scale, rect.size * scale)
+		if bool(entry.get("global", false)):
+			draw_rect(canvas, Color(GLOBAL_COLOR.r, GLOBAL_COLOR.g, GLOBAL_COLOR.b, 0.30), true)
+			draw_rect(canvas, GLOBAL_COLOR, false, 1.2)
+			slot_index += 1
+			continue
+		var color := _level_color(int(entry.get("ring", 0)))
+		# The rects are published in slot order, so the array position *is* the atlas index the cells
+		# name - the rect array and the cell table are the same array.
+		var current := bool(live_slots.get(slot_index, false))
+		var spare := bool(entry.get("spare", false))
+		# A spare is drawn as an outline only: it is a slot, not content, and filling it would say a
+		# block is there when nothing has been produced into it.
+		if not spare:
+			draw_rect(canvas, Color(color.r, color.g, color.b, VALID_FILL_ALPHA), true)
+		draw_rect(canvas, Color(color.r, color.g, color.b, SPARE_ALPHA if spare else 1.0), false,
+				1.0 if spare else 1.2)
+		if current:
+			draw_rect(canvas.grow(-0.5), Color("ffffff"), false, 1.4)
+		slot_index += 1
+	draw_rect(texture_rect, Color("3b4b56"), false, 1.0)
+	if p_font:
+		draw_string(p_font, p_panel.position + Vector2(0.0, p_panel.size.y + 11.0),
+				"atlas %d x %d texels · %d rects" % [width, height, int(p_layout.get("total_blocks", 0))],
+				HORIZONTAL_ALIGNMENT_LEFT, p_panel.size.x, p_font_size - 1, p_text_color)
+
+
+func _draw_atlas_grid(p_panel: Rect2, p_layout: Dictionary, p_font: Font, p_font_size: int,
+		p_text_color: Color) -> void:
+	var side := maxi(1, int(p_layout.get("grid_side", 1)))
+	var half := (side - 1) / 2
+	var edge := p_panel.size.x / float(side)
+	draw_rect(p_panel, Color("10161b"), true)
+	for cell: Variant in p_layout.get("cells", []):
+		if typeof(cell) != TYPE_DICTIONARY:
+			continue
+		var entry: Dictionary = cell
+		var gx := int(entry.get("gx", 0))
+		var gy := int(entry.get("gy", 0))
+		var box := Rect2(p_panel.position + Vector2(float(gx + half), float(gy + half)) * edge,
+				Vector2(edge, edge))
+		var color := _level_color(int(entry.get("ring", 0)))
+		# The 3x3 square and each shell after it are one ring, so the fill says which ring owns the
+		# cell and the outline says whether the cell has the block it wants this frame.
+		draw_rect(box.grow(-0.5), Color(color.r, color.g, color.b, 0.28), true)
+		if int(entry.get("pending_slot", -1)) >= 0:
+			draw_rect(box.grow(-1.0), PENDING_COLOR, false, 1.6)
+			draw_rect(box.grow(-1.0), Color(PENDING_COLOR.r, PENDING_COLOR.g, PENDING_COLOR.b, 0.35), true)
+		elif bool(entry.get("current", false)):
+			draw_rect(box.grow(-0.5), Color(color.r, color.g, color.b, 1.0), false, 1.4)
+		else:
+			draw_rect(box.grow(-0.5), Color(color.r, color.g, color.b, 0.35), false, 1.0)
+		if p_font and edge >= 14.0:
+			draw_string(p_font, box.position + Vector2(2.0, edge - 3.0), "%d" % int(entry.get("slot", -1)),
+					HORIZONTAL_ALIGNMENT_LEFT, edge, maxi(8, p_font_size - 2), p_text_color)
+	draw_rect(p_panel, Color("3b4b56"), false, 1.0)
+	if p_font:
+		draw_string(p_font, p_panel.position + Vector2(0.0, p_panel.size.y + 11.0),
+				"%d x %d cells · number is the current-frame atlas index" % [side, side],
+				HORIZONTAL_ALIGNMENT_LEFT, p_panel.size.x, p_font_size - 1, p_text_color)
+
+
+func _atlas_legend_lines(p_layout: Dictionary) -> Array[String]:
+	var lines: Array[String] = []
+	var focus := _vector2(_atlas.get("focus", Vector2.ZERO))
+	lines.append("%s atlas · source %s · focus %.1f, %.1f" % [str(_atlas.get("group", "?")),
+			str(_atlas.get("source", "?")), focus.x, focus.y])
+	lines.append("%d blocks in %s · %d rects · %.0f%% packed · %d x %d texels" % [
+			int(p_layout.get("blocks", 0)), str(p_layout.get("chosen", "?")),
+			int(p_layout.get("total_blocks", 0)), float(p_layout.get("efficiency", 0.0)) * 100.0,
+			int(p_layout.get("width", 0)), int(p_layout.get("height", 0))])
+	lines.append("rings %s blocks · %.1f KB uploaded in %d block rects · %d pending" % [
+			str(p_layout.get("ring_blocks", [])), float(_atlas.get("upload_bytes", 0)) / 1024.0,
+			int(_atlas.get("block_uploads", 0)), int(_atlas.get("pending_jobs", 0))])
+	lines.append("rolling: %d scrolls · %d blocks loaded, %d cells kept · last %d loaded / %d kept" % [
+			int(_atlas.get("scroll_events", 0)), int(_atlas.get("blocks_loaded", 0)),
+			int(_atlas.get("blocks_retained", 0)), int(_atlas.get("last_scroll_loaded", 0)),
+			int(_atlas.get("last_scroll_retained", 0))])
+	lines.append("white outline: a cell reads this rect now · orange: its replacement is in flight · yellow: the one-time global block")
+	return lines
+
+
 func _level_label(p_level: Dictionary, p_index: int) -> String:
 	return "L%d %.0fm%s" % [p_index, float(p_level.get("world_size", 0.0)),
 			"" if bool(p_level.get("valid", false)) else "*"]
@@ -328,3 +495,10 @@ func _world_rect_to_canvas(p_rect: Rect2, p_bounds: Rect2, p_origin: Vector2, p_
 
 func _vector2(p_value: Variant) -> Vector2:
 	return p_value if p_value is Vector2 else Vector2.ZERO
+
+
+# A `Rect2` out of a payload value, the way `_vector2()` is a `Vector2` out of one. The native side
+# publishes `Rect2` for a slot's rect, so the guard is what keeps a payload a stub or an older build
+# answers with from being a hard failure in the drawing code.
+func _rect2(p_value: Variant) -> Rect2:
+	return p_value if p_value is Rect2 else Rect2()

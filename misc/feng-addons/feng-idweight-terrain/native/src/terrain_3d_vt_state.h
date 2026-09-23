@@ -77,6 +77,7 @@
 
 #include "terrain_3d_avt.h"
 #include "terrain_3d_clipmap.h"
+#include "terrain_3d_clipmap_atlas.h"
 #include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_page_pipeline.h"
 #include "terrain_vt_arrival_queue.h"
@@ -546,6 +547,35 @@ struct Terrain3DVTState {
 	// follow is one comparison per ring rather than a rebind per tick. See
 	// `Terrain3DClipmap::get_state_stamp()` and `Terrain3D::_update_vt_clipmap_arm()`.
 	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	// ---- The clipmap *atlas*, one per channel group ----
+	// The same rings as `clipmap[]`, organised as discrete blocks packed into one texture per channel
+	// (`terrain_3d_clipmap_atlas.h`). It is a second object rather than a mode of the ring because the
+	// two are different *update units*: a ring publishes a whole layer, an atlas publishes a block
+	// rect, and the choice is per cell. `clipmap_atlas[]` is built by the same assembly rule and only
+	// while a cell selects `ClipmapAtlas`, so a configuration that does not costs nothing.
+	//
+	// The shape is derived from the ring's own settings where it can be - the block size is
+	// `clipmap_size`, the block world is `clipmap_base_world` - so a user who tuned the ring's shape
+	// gets the same density ladder from the atlas, and the ring count is `clipmap_atlas_rings`.
+	int clipmap_atlas_rings = 4;
+	int clipmap_atlas_global_texels = 64;
+	// The per-frame production bound. One is the user's "a frame loads one block".
+	int clipmap_atlas_blocks_per_frame = 1;
+	std::unique_ptr<Terrain3DClipmapAtlas> clipmap_atlas[TerrainVT::GROUP_COUNT];
+	uint64_t clipmap_atlas_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	// Channel texels produced by all atlases in the tick that just ran, and the counters the rolling
+	// evidence is read from: how many block rects were published, how many blocks a scroll loaded and
+	// how many cells it kept.
+	int clipmap_atlas_produced_texels = 0;
+	int64_t clipmap_atlas_block_uploads = 0;
+	int64_t clipmap_atlas_scroll_events = 0;
+	int64_t clipmap_atlas_blocks_loaded = 0;
+	int64_t clipmap_atlas_blocks_retained = 0;
+	// How many times the atlas's debug payload was asked for and how many of those found an atlas:
+	// the same pair the ring's preview reports, so a test can tell "no atlas exists" from "the view
+	// did not ask".
+	mutable uint64_t clipmap_atlas_preview_calls = 0;
+	mutable uint64_t clipmap_atlas_preview_computed = 0;
 	// Channel texels produced by all rings in the tick that just ran.
 	int clipmap_produced_texels = 0;
 	// ---- The material group's detail layer, which is the only path to the 1024 texels/m target ----

@@ -599,6 +599,18 @@ public:
 	// page pool, so this is spent beside `vt_pages_per_update` rather than out of it.
 	void set_vt_clipmap_budget_texels(const int p_texels);
 	int get_vt_clipmap_budget_texels() const { return _vt.clipmap_budget_texels; }
+	// ---- The clipmap atlas's settings ----------------------------------------------------------
+	// The atlas's block size and block world are the ring's `size` and `base_world`, so the two
+	// mechanisms describe the same density ladder; these three are what the atlas adds. `rings` is
+	// how many shells the grid holds - four is the shipped structure, 9 + 16 + 24 + 32 blocks -
+	// `global_texels` is the one-time minimal-resolution block outside the grid, and
+	// `blocks_per_frame` is the per-frame production bound, one being "a frame loads one block".
+	void set_vt_clipmap_atlas_rings(const int p_rings);
+	int get_vt_clipmap_atlas_rings() const { return _vt.clipmap_atlas_rings; }
+	void set_vt_clipmap_atlas_global_texels(const int p_texels);
+	int get_vt_clipmap_atlas_global_texels() const { return _vt.clipmap_atlas_global_texels; }
+	void set_vt_clipmap_atlas_blocks_per_frame(const int p_blocks);
+	int get_vt_clipmap_atlas_blocks_per_frame() const { return _vt.clipmap_atlas_blocks_per_frame; }
 	// The ring's stored value at a world position, through the ring's own addressing: the same level
 	// rule, snapping and ring the shader arm samples with. Read by the deterministic tests and the
 	// dock, which otherwise have no way to compare what the ring holds against the height map it was
@@ -623,6 +635,35 @@ public:
 	// one to measure the mechanism, and it is kept afterwards. False is the state with no ring at
 	// all: no levels, no texture, no jobs and no budget.
 	bool has_vt_clipmap_ring() const;
+	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
+	// `terrain_3d_clipmap_atlas.h` states the structure - 9 + 16 + 24 + 32 blocks over four rings
+	// plus one global, one-time block, packed into one texture per channel - and the two things it
+	// changes about the ring: the unit of *production* is a block, and the unit of *upload* is a block
+	// rect rather than a whole layer.
+	//
+	// It is built and driven exactly the way the ring is when no cell names it, through
+	// `debug_update_vt_clipmap_atlas()`, and it publishes the same shape of readings
+	// (`clipmap_atlas_produced_texels`, the block-upload and rolling counters, the layout payload).
+	// That is deliberate: the mechanism has to be measurable before it is a delivery, which is the
+	// same order the ring was built in, and the load comparison the user asked for is a measurement
+	// of two mechanisms rather than a claim about two settings.
+	bool has_vt_clipmap_atlas() const;
+	// Whether an atlas exists, for the debug view's gate.
+	bool clipmap_atlas_available() const;
+	// Build the atlas for `p_group` from the clipmap settings if it does not exist, hand it the
+	// source it carries, and configure it. False when no source carries that group in this build.
+	bool _setup_vt_clipmap_atlas(const TerrainVT::ChannelGroup p_group);
+	// The atlas's arm: the rect array, the per-cell current-frame atlas index, the per-ring start
+	// point and phase, and the grid's shape. Empty when no atlas is configured for the group.
+	Dictionary get_vt_clipmap_atlas_arm(const int p_group) const;
+	// The atlas's own entry, beside `debug_update_vt_clipmap()` and deliberately the same shape: the
+	// same focus, the same `vt_clipmap_budget_texels`, the same published numbers. Returns the channel
+	// texels produced, or -1 when no atlas can be built for that group.
+	int debug_update_vt_clipmap_atlas(const int p_group);
+	// The atlas's read-only debug payload: the packing the layout algorithm chose, every rect, and
+	// every cell's current-frame atlas index - so the debug view draws the *atlas's region* rather
+	// than a ring's square. Empty when no atlas exists.
+	Dictionary get_clipmap_atlas_layout(const int p_group) const;
 	// The mechanism's own entry, beside `sample_vt_clipmap()`: build the ring for `p_group` from the
 	// clipmap settings if it does not exist, run the phase the tick runs for it - the same
 	// `Terrain3DClipmap::update()`, the same focus and the same `vt_clipmap_budget_texels` - and
