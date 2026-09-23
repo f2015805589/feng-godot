@@ -33,6 +33,13 @@ func run() -> void:
 	require(checked > 4, "exercise multiple ready material pages")
 	terrain.set_process(false)
 	terrain.set_physics_process(false)
+	# The property is the shader's coarse-recovery switch and it ships **on**
+	# (`vt_reference_avt_alignment.md`: "`avt_feedback` is on by default", so a missing fine page
+	# resolves at the next resident level). The strict phase below - a missing fine neighbour over a
+	# ready parent - therefore has to turn it off itself. It used to be a GPU page-demand switch that
+	# defaulted off, and the phase relied on that default instead of stating it.
+	require(terrain.surface_vt_feedback, "coarse recovery is on by default")
+	terrain.surface_vt_feedback = false
 	var vt := terrain.get_surface_vt()
 	# A missing fine neighbour must stay diagnostic even over a ready parent.
 	for mip in 5:
@@ -75,7 +82,6 @@ func run() -> void:
 	var transition := shot.get_pixelv(screen_of(Vector2(32.5,34)))
 	require(classify(transition) == "red", "missing neighbours do not change ready-page shading")
 	# Optional recovery uses resident AVT parents without changing page demand.
-	require(not terrain.surface_vt_feedback, "coarse recovery defaults off")
 	terrain.surface_vt_feedback = true
 	# The public setter refreshes material uniforms; restore our synthetic cache.
 	RenderingServer.material_set_param(rid, "_surface_material_albedo", albedo_array.get_rid())
@@ -142,11 +148,25 @@ func run() -> void:
 	# populate its future world levels; the scheduler need not retain mips that
 	# the original small view could never sample.
 	vt = terrain.get_surface_vt()
-	var root_level := int(round(log(terrain.get_vt_settings().avt_sector_stats.coarse_world_size / 64.0) / log(2.0)))
+	# The world levels above the 64 m sectors are the **mips of the one coarse owner**
+	# (`avt_coarse_owner()` is `Vector2i(INT32_MIN, INT32_MIN)` in `terrain_3d_avt.h`, and
+	# `_avt_build_hierarchy()` pushes its pages with the level as their mip). Two things here were the
+	# encoding the redesign replaced: the per-level owner key `0x40000000 + level * 0x100000`, which no
+	# longer appears anywhere in `native/src` and made every request return -1, and the level count
+	# itself, which came from `coarse_world_size / 64` - the world hierarchy above the sectors that the
+	# redesign folded into the coarse image's mips. The levels this probe can populate are the ones the
+	# coarse block addresses, `block >> level` pages an axis; measured here the block is 4, so levels
+	# 1-2 exist and the 3-4 the old formula asked for do not (and `request_page()` refused them).
+	var coarse_owner := Vector2i(-2147483648, -2147483648)
+	var root_level := int(round(log(float(vt.get_sector_block_size(coarse_owner))) / log(2.0)))
+	var edit_stats: Dictionary = terrain.get_vt_settings().avt_sector_stats
+	print("VT_FILTERING_WORLD_PROBE coarse_world=", edit_stats.get("coarse_world_size"),
+			" coarse_pages=", edit_stats.get("coarse_pages"), " root_level=", root_level,
+			" block=", vt.get_sector_block_size(coarse_owner),
+			" origin=", Vector2i(vt.get_sector_block_origin_x(coarse_owner), vt.get_sector_block_origin_y(coarse_owner)))
 	for level in range(1, root_level + 1):
-		var owner := Vector2i(0, 0x40000000 + level * 0x100000)
-		var slot := vt.request_page(owner, 0, 0, 0)
-		require(slot >= 0, "allocate the selected world mip for the paused shader probe")
+		var slot := vt.request_page(coarse_owner, level, 0, 0)
+		require(slot >= 0, "allocate world mip %d for the paused shader probe" % level)
 		if slot >= 0: albedo_images[slot].fill(Color.RED if level == 1 else Color.BLUE)
 	vt.commit()
 	for slot in 64:

@@ -42,7 +42,7 @@ runtime.
 | Constant | Value | Where |
 |---|---|---|
 | Sector size | 64 m | `SECTOR_WORLD`, `terrain_3d_sector_avt.cpp` |
-| Page content / border / stored | 256 / 4 / **264** | `Terrain3DVTState`, `Terrain3DVirtualTexture` |
+| Page content / border / stored | 256 / 5 / **266** | `Terrain3DVTState`, `Terrain3DVirtualTexture` |
 | Physical slot bits | 11 (`slot & 0x7FF`) | `terrain_vt.h` |
 | Invalid slot | 65535 | `terrain_vt.h` |
 | Near-field page table | 2048×2048 entries, `R32F` | `_configure_surface_view()` |
@@ -1342,6 +1342,59 @@ not fall back to the poisoned source array while the far block keeps sampling it
 `editor_dock:dock`/`editor_dock:setup` also
 fail identically with the addon reverted to `HEAD`, so they are outside this document's contract
 and were left alone rather than fixed blind.
+
+**Where the red set stands now (2026-09-23).** The lists above describe the tree as each fix landed;
+the tree has moved since. A full `run_all.py` pass on the rebuilt debug template and D3D12 ends at
+**60 of 75** (`bin/suite-2026-09-23.json`); after the fixes recorded in
+`avt_addressing_redesign.md` section 6.8 - the shader's resolve flag, two stale world-level probes and
+`vt_near_arrival`'s fixture default - the suite is **64 of 75**
+(`bin/suite-2026-09-23-round2.json`) and the remaining reds are `vt_adaptive:scale`, `:metric`,
+`:ownership`, `:rotation`, `:blend`, `:sectors`, `vt_strict_coverage`, `vt_turn_budget`, `vt_render`,
+`texture_compression` and `editor_dock:setup`. Per-test attribution with the A/B evidence is in
+`avt_addressing_redesign.md` section 6.7. Five entries in that record were never assertion failures
+and are now gone from the set:
+
+* `vt_adaptive:navigation` was red on one engine `ERROR:` line - `_grab_camera: Cannot find clipmap
+  target or active camera` - and both of its own assertions passed. Enabling VT delivery turns the
+  terrain node's tick back on, so the tick after the test freed its camera had no camera to find.
+  The four tests that free a camera now stop the tick first.
+* Every other test was reported red partly by `ERROR: Failed to read the root certificate store.`,
+  which this machine's engine prints once per launch. `fixture.ENVIRONMENTAL_ERRORS` and
+  `fixture.log_errors()` exclude it from both the runners' `ERRORS=` count and `run_all.py`'s
+  verdict; a clean runner now exits 0 with `ERRORS=0` again.
+* `vt_near_arrival` was reported red with no script output at all: it exited 2 in 0.1 s because its
+  default source project was the leftover `bin/terrain-project-lifetime-ke6fwkn0`, a directory
+  `vt_project_lifetime_probe.py` names with a random suffix and `run_all.py --prune` deletes. It now
+  defaults to the real project `vt_strict_coverage_runner.py` copies, runs in 51.6 s and passes.
+* `vt_transition_parent` was red because `avt_resolve()` declared `bool allow_coarse`, was passed
+  `_avt_feedback`, and never read it - so a missing fine page resolved through a resident ancestor
+  even with coarse recovery off. The upgrade loop reports the miss when the flag is off now, which
+  also cleared `vt_adaptive:filtering`.
+* `vt_visibility` was two model assumptions: a fixture that never asked for the far field still got
+  SVT demand from the shipped delivery matrix, and the engine's own tick produced the page its
+  one-shot manual call was about to ask for.
+* `vt_adaptive:filtering` additionally probed world levels with per-level owner keys
+  (`0x40000000 + level * 0x100000`) that the redesign replaced with the coarse owner's mips, and
+  derived a level count from the sector hierarchy rather than from the coarse block.
+
+`vt_adaptive:sectors`' edit phase used to fail in a quarter of the runs in both plan orders - a
+test-side race, not the plan: `settle_sectors()` waited for the producer to go quiet but not for the
+view to have no missing pages, so it could take its "settled" verdict before the edit's 35 pages had
+been refilled one per tick. It now requires `visible_missing_pages == 0` too, and 8 of 8 runs after
+the change reach `VT_SECTORS_EDIT color=red` with 24 zero-producing ticks. The only stable line left
+in that test is `512 m region contains independently addressed 64 m sectors`.
+
+`texture_compression` is red again on the class section 6 records as fixed: two engine errors per run
+(`Parameter "uniform_set" is null.`, `Uniforms were never supplied for set (0) at the time of
+drawing`) while its own assertion passes, reproducible in 2 of 2 runs.
+
+`vt_adaptive:ownership` is down to one assertion (section 6.9 of `avt_addressing_redesign.md`): the
+near-field plan does not cover the cell under the camera. Measured - plan origin equal to the camera
+origin, motion lead zero, the cell among the scan's 100 visible sectors, `denied=0`, and a plan of 18
+pages all at local mip 2 on cells 356-484 m away in +X; 300 further frames (about 7 s) leave it that
+way. An orthographic camera answers the same density for every cell, so the deficit key differs
+between equally-sized cells only by sampler noise and the comparator tests it with `!=` before its
+span and distance tie-breaks. That is the next thing to take, with the A/B section 6.4 was accepted on.
 
 ### Known flaky results — do not chase these as regressions
 

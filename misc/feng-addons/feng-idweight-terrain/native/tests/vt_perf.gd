@@ -22,7 +22,7 @@ const SVT_BORDER := 4
 const SVT_PAGE_COUNT := 256
 const SVT_DISTANCE := 6144.0
 const SETTLED_RUNS := 20
-# A page is 264x264 texels at the shipped settings. Producing one is a resample of a
+# A page is 266x266 texels at the shipped settings. Producing one is a resample of a
 # region's payload, which is a memory-bound copy, not a computation: anything above
 # this in a debug build means the producer is paying per-texel API overhead.
 const MAX_US_PER_PAGE := 3000.0

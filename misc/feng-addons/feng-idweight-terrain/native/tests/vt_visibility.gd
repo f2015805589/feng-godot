@@ -88,6 +88,10 @@ func run() -> void:
 	terrain.surface_svt_root_mips = 0
 	terrain.surface_svt_distance = 1024.0
 	terrain.surface_svt_auto_bake = false
+	# The shipped delivery matrix puts the far field on SVT, so a fixture that never asked for it
+	# still gets SVT demand from the engine's own tick - and then the manual SVT phase below cannot
+	# start from zero. Turn the far field off for the AVT phases and on again in the SVT phase.
+	terrain.surface_svt_enabled = false
 	terrain.free_editor_textures = false
 	terrain.data_directory = "user://vt_visibility_data"
 	add_materials()
@@ -118,6 +122,11 @@ func run() -> void:
 	# AVT's one-region focus starts directly under the top-down camera.
 	terrain.surface_vt_enabled = true
 	terrain.set_surface_vt_force_mip(true, 0)
+	# Enabling VT delivery turns this node's own tick back on (`terrain_3d_surface_views.cpp`), and
+	# that tick runs the demand pass during the `await frame_barrier()` calls below - which produces
+	# the page the manual pass is about to ask for, so the manual call correctly returns 0. The
+	# passes in this test are the authoritative ones, so stop the tick after enabling the view.
+	terrain.set_physics_process(false)
 	var top_focus: Rect2i = terrain.get_surface_vt_region_rect()
 	print("VT_VISIBILITY_AVT_TOP_FOCUS ", top_focus)
 	require(top_focus.position == Vector2i.ZERO,
@@ -159,6 +168,7 @@ func run() -> void:
 	terrain.surface_vt_enabled = false
 	terrain.surface_svt_enabled = true
 	terrain.set_surface_vt_force_mip(false)
+	terrain.set_physics_process(false)
 	require(svt_records().is_empty(), "fresh fixture unexpectedly has SVT requests before the manual demand pass")
 	var requested := terrain.update_surface_svt(1)
 	var records := svt_records()

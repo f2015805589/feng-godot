@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from fixture import ROOT, write_fixture
+from fixture import ROOT, is_environmental_error, log_errors, write_fixture
 
 
 def main() -> int:
@@ -82,9 +82,9 @@ def main() -> int:
         return 124
 
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     for line in output.splitlines():
-        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VTSVTCOVER")):
+        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VTSVTCOVER")) and not is_environmental_error(line):
             print(line)
     exit_code = result.returncode if result is not None else 1
     marker = "PASS persisted SVT covers visible non-AVT regions under eight-page shared-pool pressure"

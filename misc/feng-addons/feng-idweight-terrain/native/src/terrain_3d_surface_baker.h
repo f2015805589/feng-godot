@@ -4,6 +4,7 @@
 #define TERRAIN3D_SURFACE_BAKER_CLASS_H
 
 #include "constants.h"
+#include "terrain_3d_clipmap.h"
 #include "terrain_3d_vt_cells.h"
 
 #include <godot_cpp/classes/image.hpp>
@@ -194,6 +195,68 @@ private:
 	PackedByteArray _material_bytes;
 	int _material_count = 0;
 	std::map<int, PendingJob> _pending;
+
+	// One *rect of a level* waiting for its bake, which is the ring's own unit of production: a fill, a
+	// strip, an invalidated area. Everything the dispatch needs is copied in: the callback runs on
+	// another thread than the one that owns the ring, so it holds no pointer into it, and the lease the
+	// offer took is what the ring later uses to say whether what the bake wrote still describes the
+	// level. The rect is in *stored* texels - the frame the ring's own payload and baked layers are in,
+	// and the one that keeps naming the same world position as the level turns - and `level_origin` is
+	// the level's world origin, which with the level's texel size and ring offset is the whole of what
+	// the shader needs to turn a stored texel back into the world position it stands for.
+	struct RingJob {
+		int level = 0;
+		uint64_t lease = 0;
+		int x0 = 0;
+		int y0 = 0;
+		int x1 = 0;
+		int y1 = 0;
+		Vector2 level_origin;
+		real_t texel = 1.f;
+		Vector2i ring;
+		int payload_layer = 0;
+		int height_layer = 0;
+	};
+
+	// The ring bake's state: the ring the set was built for (identity only - a ring is baked by the
+	// baker it is offered to, and the lease, not the pointer, is what survives the dispatch), the
+	// descriptor set that binds the ring's own atlas to the bake shader's two inputs and the ring's
+	// three arrays to its outputs, and the three rect sets that make the one-tick separation:
+	// `collected` is what the tick can bake now, `queued` is what the next render callback dispatches,
+	// and `landed` is what a dispatch wrote and the next offer reports back to the ring. One ring at a
+	// time, because the channel that declares baked layers is the material group's: a second one would
+	// need a second entry and a second descriptor set, which is the shape a second baked channel would
+	// take.
+	struct RingBake {
+		const Terrain3DClipmap *ring = nullptr;
+		RID uniform_set;
+		RID atlas_rd;
+		// The bundle's job buffer the set was built against. It is part of the set's identity because
+		// the set names that buffer: a bundle a generation later has its own, its predecessor is
+		// retired and freed, and a dispatch from a set that outlived its buffer would either read a
+		// job nobody wrote or bind a buffer the device has already released.
+		RID job_buffer;
+		int size = 0;
+		std::vector<RingJob> collected;
+		std::vector<RingJob> queued;
+		std::vector<RingJob> landed;
+		uint64_t dispatches = 0;
+	};
+	RingBake _ring_bake;
+	// Builds the ring bake's descriptor set when there is none or when the ring it describes is not
+	// this one, and frees the previous set. False when the ring cannot be baked at all - no device, no
+	// bundle to take the material list and job buffer from, or a channel count the bake shader does not
+	// write - in which case the ring keeps serving nothing but its own texels.
+	bool _ensure_ring_bake(Terrain3DClipmap *p_ring);
+	void _free_ring_bake();
+	// The render callback's half. Dispatches the queued levels into the ring's own layers and records
+	// what landed; the next offer marks them. Returns how many jobs were dispatched.
+	int _dispatch_ring_bake();
+	// The albedo and normal arrays the bake samples, resolved to the device's own textures, with the
+	// bundle's dummy arrays as the fallback for a snapshot the device no longer owns. Shared with the
+	// page bake's descriptor set, so "which array does the bake read" has one answer.
+	void _resolve_material_rd(const ResourceBundle &p_resources, RID &r_albedo_rd, RID &r_normal_rd,
+			const RID &p_albedo_array_rs, const RID &p_normal_array_rs) const;
 	// Consumer-visible readiness. With compression this becomes true only after all three
 	// sampled layers were uploaded, not merely after the writable staging page finished.
 	std::vector<uint8_t> _ready;
@@ -533,6 +596,20 @@ public:
 	// still queued.
 	void set_cell_store(const Ref<Terrain3DCellStore> &p_store);
 	void invalidate_slot(int p_slot);
+
+	// ---- The ring's bake -------------------------------------------------------------------------
+	// A ring that declares baked channels is baked by the same shader that bakes a page, because a job
+	// carries its own geometry and its own input layers: one *rect of a level* is one job, its rect the
+	// one the ring produced, and nothing in this path knows what a page or a codec is. The caller offers
+	// the ring once a tick with the same budget the ring's own production is charged in - channel
+	// texels, a soft floor of one rect per offer - and the rects this call can bake are handed to the
+	// render callback, which dispatches them and records that they landed. The *next* call reports each
+	// landed rect back to the ring, which is what decides whether the bake still describes the level.
+	// The one-tick separation is not an optimisation: a rect's payload reaches the ring through
+	// RenderingServer's queue while the bake is a device dispatch, and issuing both for one rect in one
+	// tick would let the bake read the payload the rect is replacing. Returns how many rects this call
+	// offered, which is not how many are baked - that is `Terrain3DClipmap::is_level_baked()`.
+	int queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels);
 
 	// Called by the parent through RenderingServer::call_on_render_thread().  The
 	// keep-alive is intentionally unused; binding a Ref<RefCounted> to the Callable

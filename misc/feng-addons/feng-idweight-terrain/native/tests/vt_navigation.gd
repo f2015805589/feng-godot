@@ -146,6 +146,11 @@ func run() -> void:
 		" avt_cpu_peak_ms=", avt_cpu_peak_ms, " physics_cpu_peak_ms=", cpu_peak_us / 1000.0,
 		" physics_cpu_average_ms=", cpu_total_us / (1000.0 * maxi(1, cpu_frames)),
 		" migrated_pages=", terrain.get_vt_settings().get("producer", {}).get("migrated_pages", 0))
+	# Enabling VT delivery turns this node's own tick back on (`terrain_3d_surface_views.cpp`), so
+	# the manual physics notifications above are the only tick while the test runs. Stop it again
+	# before the camera goes: a tick with the camera freed cannot find a clipmap target and the
+	# engine logs that as an error, which the runner counts against the test.
+	terrain.set_physics_process(false)
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

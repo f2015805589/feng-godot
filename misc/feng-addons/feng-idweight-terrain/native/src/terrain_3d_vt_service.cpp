@@ -519,6 +519,15 @@ void Terrain3D::_update_vt_service() {
 		signature["textures"] = _assets->get_texture_cache_identity();
 		_vt.vt_material_signature = signature.hash();
 		_vt.vt_materials_dirty = false;
+		// A ring's baked layers are this same list evaluated against the ring's own texels, so a new
+		// list makes every one of them stale although not a payload texel moved: the rings are told
+		// directly rather than through `invalidate_vt_clipmap_area()`, which would re-produce payload
+		// a list change cannot have altered, and the next offer re-bakes the levels they lost.
+		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+			if (_vt.clipmap[group] != nullptr) {
+				_vt.clipmap[group]->mark_baked_stale();
+			}
+		}
 		// Re-request old addresses using the current materials; stale pages remain
 		// hidden until their producer has completed again.
 		for (const Vector2i &location : _data->get_region_locations()) {

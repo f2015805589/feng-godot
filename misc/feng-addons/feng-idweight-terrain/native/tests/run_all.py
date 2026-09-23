@@ -23,6 +23,8 @@ import sys
 import time
 from pathlib import Path
 
+from fixture import is_environmental_error
+
 HERE = Path(__file__).resolve().parent
 # HERE is already the tests directory, so the checkout is four levels up.
 ROOT = HERE.parents[4]
@@ -90,8 +92,13 @@ def run_one(name: str, argv: list[str], driver: str, keep: bool, timeout: float)
         shutil.rmtree(fixture, ignore_errors=True)
 
     lines = [line for line in output.splitlines()
-             if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "TIMEOUT"))]
+             if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "TIMEOUT"))
+             and not is_environmental_error(line)]
     failures = [line for line in lines if not line.startswith("PASS")]
+    # The runner's exit code is meaningful again: `fixture.ENVIRONMENTAL_ERRORS` is filtered out of
+    # both this verdict and every runner's own `ERRORS=` count, so a clean test exits 0. Before
+    # that filter a single certificate-store line made every runner return 1 and no test could be
+    # green.
     if code == 0 and not failures:
         status = "pass"
     elif failures:

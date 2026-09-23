@@ -41,6 +41,7 @@ extends SceneTree
 const MATERIAL := 0
 const HEIGHT := 1
 const DIRECT := 0
+const AVT := 1
 const CLIPMAP := 2
 
 # A one-level ring of 16 texels an axis covering 16 m, i.e. exactly one texel a metre at the default
@@ -209,8 +210,9 @@ func move_to(world_x: float, world_z: float) -> void:
 
 # A configuration that never selects the method owns no ring: no levels, no texture, no jobs and no
 # budget, which is the assembly rule measured on the mechanism itself rather than on a log line. The
-# write that *is* refused here is the other group's - the material channel has no clipmap source in
-# this build - so a refused cell is still read as a cell that builds nothing.
+# write that *is* refused here is a height cell naming `AVT` - the height channel's choices are the
+# array and the ring, so that refusal is a channel rule - and the registry below answers for the two
+# channels the ring *can* carry, which is what the matrix's acceptance is read from.
 func run_never_selected_block() -> void:
 	var plain := Terrain3D.new()
 	plain.surface_svt_auto_bake = false
@@ -233,15 +235,25 @@ func run_never_selected_block() -> void:
 	# object, no levels, and a production counter that stays at zero because there is nothing to drive.
 	plain.data.add_region_blank(Vector2i.ZERO)
 	await settle(4)
-	# The refused write, on a live terrain: the material group has no clipmap source, so the cell keeps
-	# its method and no ring is ever created for it.
-	plain.vt_delivery_near_material = CLIPMAP
+	# The refused write, on a live terrain: the height channel has no `AVT` arm, so the cell keeps its
+	# method and no ring is created by it.
+	plain.vt_delivery_near_height = AVT
 	await settle(2)
 	var s := plain.get_vt_settings()
 	var entry: Dictionary = s.get("clipmap", {}).get("height", {})
-	require(plain.vt_delivery_near_material == DIRECT, "the material group refuses the Clipmap cell: no source carries that channel")
-	require(not plain.is_vt_delivery_supported(MATERIAL, CLIPMAP), "and says so through the published capability")
-	require(not bool(entry.get("configured", true)), "so a terrain whose only Clipmap write was refused owns no ring")
+	var material_entry: Dictionary = s.get("clipmap", {}).get("material", {})
+	require(plain.vt_delivery_near_height == DIRECT, "the height group refuses the AVT cell: that channel has no paged arm")
+	require(not plain.is_vt_delivery_supported(HEIGHT, AVT), "and says so through the published capability")
+	# The acceptance is the *registry's* answer rather than a table, which is what makes a channel a
+	# source and a case: each group the ring can carry is deliverable for `Clipmap`, and one it cannot
+	# is refused, in the same call the setter uses.
+	require(plain.has_clipmap_source(HEIGHT) and plain.has_clipmap_source(MATERIAL),
+			"the source factory answers which channels the ring can carry, and the matrix accepts exactly those")
+	var refused: Dictionary = s.get("delivery_unsupported", {}).get("height", {})
+	require(str(refused.get("AVT", "")).contains("clipmap ring"),
+			"and the refusal names what that channel's choices are: %s" % str(refused.get("AVT", "")))
+	require(not bool(entry.get("configured", true)) and not bool(material_entry.get("configured", true)),
+			"so a terrain whose only Clipmap writes were refused owns no ring")
 	require(entry.get("levels", -1) == -1, "and therefore no levels, no texture and no jobs")
 	require(not bool(s.get("clipmap_service", true)), "and reports no clipmap service")
 	require(not bool(s.get("clipmap_ring", true)), "and no ring object")
@@ -250,7 +262,8 @@ func run_never_selected_block() -> void:
 			"and answers a sample with NAN rather than with a value")
 	require(not plain.is_vt_delivery_used(CLIPMAP), "and does not report Clipmap as used")
 	require(plain.get_clipmap_layout_preview().is_empty(), "and has no layout to draw: the preview refuses it")
-	require(plain.debug_update_vt_clipmap(MATERIAL) == -1, "and the other group's entry builds nothing either, having no source")
+	require(plain.debug_update_vt_clipmap(HEIGHT) >= 0 and plain.debug_update_vt_clipmap(MATERIAL) >= 0,
+			"and the mechanism's own entry builds either channel's ring, with no cell claiming the method")
 	print("VT_CLIPMAP_NEVER_SELECTED configured=%s levels=%s service=%s produced=%d" % [
 		str(entry.get("configured", "?")), str(entry.get("levels", "none")),
 		str(s.get("clipmap_service", "?")), int(s.get("clipmap_produced_texels", -1))])

@@ -192,8 +192,10 @@ func run() -> void:
 	#    report rather than from the log is what makes "refused" a number a test can hold.
 	require(terrain.is_vt_delivery_supported(MATERIAL, AVT), "the diffuse+normal group can be delivered by AVT")
 	require(terrain.is_vt_delivery_supported(MATERIAL, SVT), "and by SVT")
-	require(not terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP),
-			"but not by Clipmap, which has no source for that channel yet")
+	require(terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP),
+			"and by the ring, whose source carries that group's R16 control payload")
+	require(terrain.has_clipmap_source(MATERIAL) and terrain.has_clipmap_source(HEIGHT),
+			"which is the registry's answer for both channels rather than a table")
 	require(terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP),
 			"the height group is delivered by Clipmap, whose arm samples the ring")
 	require(not terrain.is_vt_delivery_supported(HEIGHT, AVT) and not terrain.is_vt_delivery_supported(HEIGHT, SVT),
@@ -203,19 +205,18 @@ func run() -> void:
 	require(height_reason == "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group",
 			"and the reason names the design rather than a missing arm: %s" % height_reason)
 	var supported: Dictionary = settings().get("delivery_supported", {})
-	require(str(supported.get("material", [])) == str([DIRECT, AVT, SVT]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP]),
+	require(str(supported.get("material", [])) == str([DIRECT, AVT, CLIPMAP, SVT]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP]),
 			"the report publishes the methods each group may name: material %s, height %s" % [
 					str(supported.get("material")), str(supported.get("height"))])
 
-	# The writes themselves, on the live terrain, in one step: each is refused and every cell stays
-	# where it was, so a scene that asks for an undeliverable method loads into the configuration it
-	# can actually render rather than into one that reads as working.
+	# The writes themselves, on the live terrain, in one step: the refused one is a height cell naming
+	# `AVT` (that channel's choices are the array and the ring), and it leaves every cell where it was,
+	# so a scene that asks for an undeliverable method loads into the configuration it can actually
+	# render rather than into one that reads as working.
 	terrain.vt_delivery_far_height = AVT
-	terrain.vt_delivery_far_material = CLIPMAP
 	await settle(4)
 	require(cell(NEAR, HEIGHT) == DIRECT and cell(FAR, HEIGHT) == DIRECT,
 			"a height cell naming AVT is refused and stays Direct")
-	require(cell(FAR, MATERIAL) == DIRECT, "and a material cell naming Clipmap stays on the method it had")
 	s = settings()
 	require(not bool(s.get("clipmap_service", true)) and not bool(s.get("clipmap_ring", true)),
 			"so no clipmap service is selected and no ring is built")
@@ -235,14 +236,54 @@ func run() -> void:
 	require(bool(s.get("clipmap_service", false)), "which selects the clipmap service")
 	require(bool(s.get("clipmap_ring", false)), "and builds its ring")
 	require(shader_uses_vt(), "and the generated shader carries the VT arms")
-	require(bool(s.get("vt_shader_height_clipmap", false)), "including the height ring's own")
+	# The ring's arm per channel group, published with the group it belongs to rather than in a key of
+	# its own, so a build can carry one group's arm without the other's.
+	var clipmap: Dictionary = s.get("clipmap", {})
+	var ring_entry: Dictionary = clipmap.get("height", {})
+	require(bool(ring_entry.get("shader_arm", false)), "including the height ring's own")
 	terrain.vt_delivery_near_height = DIRECT
 	await settle(4)
 	s = settings()
 	require(cell(NEAR, HEIGHT) == DIRECT, "deselecting it takes the method back")
-	require(not bool(s.get("vt_shader_height_clipmap", true)), "and the ring's arm leaves the generated shader")
+	clipmap = s.get("clipmap", {})
+	ring_entry = clipmap.get("height", {})
+	require(not bool(ring_entry.get("shader_arm", true)), "and the ring's arm leaves the generated shader")
 	require(not shader_uses_vt(), "with the rest of the VT arms, no cell naming a service any more")
 	require(bool(s.get("clipmap_ring", false)), "while the ring object stays, being a residency cache as well as a renderer")
+
+	# The material cell is the second channel the ring can carry, and its source is the packed `R16`
+	# surface payload the group's baked pages are produced *from*: the band the ring serves is therefore
+	# the group's source resolution rather than a page. Selecting it builds that group's ring and
+	# compiles that group's arm - and the two channels' arms move independently, which is what the
+	# deselection above left in place.
+	terrain.vt_delivery_near_material = CLIPMAP
+	await settle(4)
+	s = settings()
+	require(cell(NEAR, MATERIAL) == CLIPMAP, "the diffuse+normal group accepts Clipmap")
+	require(shader_uses_vt(), "which compiles the VT arms")
+	var material_ring: Dictionary = s.get("clipmap", {}).get("material", {})
+	require(bool(material_ring.get("configured", false)), "and builds that group's ring")
+	require(str(material_ring.get("source", "")) == "material", "whose source names the channel it carries")
+	require(bool(material_ring.get("shader_arm", false)), "and whose arm is in the generated shader")
+	require(bool(s.get("clipmap_service", false)), "so the clipmap service is selected by that cell alone")
+	# What the ring carries for a producer: the three arrays a bake writes out of its payload. This is
+	# the *shape* reading only, because a ring this configuration builds has no producer behind it - no
+	# cell here takes a page, so no bake runs and the `baked` flag has nothing to be set by. The
+	# dispatch-and-mark handshake across ticks, and the material it produces, are `vt_clipmap_render`'s
+	# bake block, which brings the far field up for exactly that reason.
+	var baked_channels := 0
+	for report in (material_ring.get("level_reports", []) as Array):
+		baked_channels = int(report.get("baked_channels", 0))
+	require(baked_channels == 3, "the material ring carries the three arrays a producer bakes out of it")
+	# The height ring's own arm left the code above, so this is the material arm being carried rather
+	# than the height one.
+	clipmap = s.get("clipmap", {})
+	require(not bool((clipmap.get("height", {}) as Dictionary).get("shader_arm", true)),
+			"while the height ring's arm is still out of it")
+	print("VT_DELIVERY_MATERIAL_CLIPMAP ", describe())
+	terrain.vt_delivery_near_material = DIRECT
+	await settle(4)
+	require(cell(NEAR, MATERIAL) == DIRECT, "and deselecting the material cell takes the method back")
 
 	# 3b. The mechanism's own entry, which is how the ring stays measurable with every cell `Direct`: it
 	#     builds the height ring, runs the phase the tick would run for it - the same `update()`, focus
@@ -258,8 +299,12 @@ func run() -> void:
 			"the entry publishes the same number the tick's phase publishes")
 	# This terrain ticks normally, so the next tick's own clipmap branch runs - and it is the branch
 	# that clears the counter, because no cell selects the method. Both halves are one reading: the
-	# entry produced texels, and a tick that enters no clipmap phase reports none.
-	await settle(2)
+	# entry produced texels, and a tick that enters no clipmap phase reports none. The tick is a
+	# *physics* tick - the branch is in `__physics_process()` - so the wait is for that tick rather than
+	# for two process frames, which an off-screen window can serve several of without one, the same
+	# fixture precondition `vt_pressure` records.
+	await physics_frame
+	await physics_frame
 	s = settings()
 	require(int(s.get("clipmap_produced_texels", -1)) == 0,
 			"and the tick that follows reports zero, entering no clipmap phase: no cell selects the method")
@@ -269,8 +314,8 @@ func run() -> void:
 	require(not bool(ring.get("selected", false)), "while no cell claims the method")
 	require(str(ring.get("source", "")) == "height", "and it names the channel it carries")
 	require(bool(s.get("clipmap_ring", false)), "and the report says a ring exists")
-	require(terrain.debug_update_vt_clipmap(MATERIAL) == -1,
-			"while the diffuse+normal group has no source, so its entry builds nothing")
+	require(terrain.debug_update_vt_clipmap(MATERIAL) >= 0,
+			"while the diffuse+normal group's entry steps the ring its own source carries as well")
 	require(not terrain.is_vt_delivery_used(CLIPMAP), "and none of this makes the matrix report Clipmap as used")
 	print("VT_DELIVERY_CLIPMAP_ENTRY ", describe())
 

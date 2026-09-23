@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from fixture import ROOT, write_fixture
+from fixture import ROOT, is_environmental_error, log_errors, write_fixture
 
 
 def main() -> int:
@@ -64,9 +64,9 @@ def main() -> int:
         print(f"TIMEOUT LOG={log}")
         return 124
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     for line in output.splitlines():
-        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VT_CLIPMAP_RENDER")):
+        if line.startswith(("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", "VT_CLIPMAP_RENDER")) and not is_environmental_error(line):
             print(line)
     print(f"EXIT={result.returncode} ERRORS={len(errors)} LOG={log}")
     return int(result.returncode != 0 or bool(errors) or "PASS clipmap height arm" not in output)

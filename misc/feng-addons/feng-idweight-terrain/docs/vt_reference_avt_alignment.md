@@ -80,7 +80,7 @@ with the code path that would have to change named. Everything the objective cou
 | | the reference AVT | This addon |
 | --- | --- | --- |
 | Language / host | C# + HLSL on the Unity reference renderer, 26 files, ~80 KB | C++ GDExtension + GLSL on a Godot fork, VT machinery ~10 kLOC |
-| Sector / page / border | 64 m / 256 / 4 (264 stored) | 64 m / 256 / 9 (274 stored) |
+| Sector / page / border | 64 m / 256 / 4 (264 stored) | 64 m / 256 / 5 (266 stored) |
 | Indirection | 1024 x 1024 `R16_UINT`, 9 hand-written mips | near 2048 x 2048 `R32F`; far `max(64, page_count * 4)` entries, hand-written mips |
 | Indirection payload | physical slot, 16 bit, 65535 = empty | physical slot, 11 bit, 65535 = empty |
 | Physical pool | 1023 layers x 264 x 264 `R8G8B8A8`, two atlases (~570 MB) | configurable 8..1024 layers, same page shape, one atlas per tier's storage format |
@@ -850,6 +850,14 @@ The rule was reverted to the even split and the run reproduced the even-split nu
 (`alloc` 3850, `evict` 2558, `fade_starts` 3841, `n_miss` 3588, `avt_tail_cap` 56): the probe is
 deterministic, so those differences are the rule and not noise. The comment above the split now
 carries the measurement, so the experiment is not repeated.
+
+**What was rejected here is the share, not the ordering.** Every reading above changes *how fast* the
+near field may fill its budget. The plan's *selection order* was changed later, to the demand deficit
+(`span * density`, `native/src/terrain_3d_avt_plan.cpp`; measured in `avt_addressing_redesign.md`,
+"Superseded: the queue is ordered by demand deficit"): that changes *which* pages the same residency
+holds - the probe's own reading is 496 resident pages both before and after - and the near field's miss
+count was not part of it. A future reading of this section should not read the ordering change as a
+second attempt at candidate 2.
 
 **What this falsifies.** Section 7.7's framing - "a structural undersupply that no residency policy
 can fix" - is wrong in its second half. Residency policy *did* fix a measurable 12% of the churn

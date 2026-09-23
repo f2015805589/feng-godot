@@ -118,7 +118,15 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 		const float density = visible ? patch.density * _vt.surface_vt_texels_per_pixel * AVT_DEMAND_DENSITY_MARGIN :
 				p_view.focal * _vt.surface_vt_texels_per_pixel / MAX(0.01f, distance);
 		int tier = CLAMP(int(std::floor(std::log2(MAX(1.f, _vt.surface_vt_texels_per_meter / MAX(0.00001f, density))))), 0, _vt.surface_vt_mip_levels - 1);
-		if (!_vt.surface_vt_mip_distances.is_empty()) { tier = MIN(_vt.surface_vt_mip_levels - 1, get_surface_vt_mip_for_distance(distance)); }
+		// The distance table is a *perspective* control. An orthographic camera's footprint does not
+		// shrink with distance - `terrain_3d_vt_visibility.h` answers `density = focal` for it, flat
+		// in depth - so letting the table replace the footprint's own tier discards detail the view
+		// still asks for. Measured in `vt_region_ownership`: over unchanged ground the block fell
+		// 16 -> 8 -> 4 as the camera rose 5 -> 15 -> 30 m, while the orthographic footprint was
+		// identical at all three heights.
+		if (!_vt.surface_vt_mip_distances.is_empty() && !p_view.orthographic) {
+			tier = MIN(_vt.surface_vt_mip_levels - 1, get_surface_vt_mip_for_distance(distance));
+		}
 		const auto cached = _vt.avt_cached_addresses.find(avt_owner_key(key));
 		// Turning away is not a request to discard fine addresses. Preserve the
 		// previous resolution until distance demand or address pressure replaces it.

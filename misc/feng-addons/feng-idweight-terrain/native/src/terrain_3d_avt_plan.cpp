@@ -21,23 +21,39 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 		Rect2 rect;
 		float distance, density;
 	};
-	auto farther = [](const Node &a, const Node &b) {
+	// The walk order: the footprint that is *most undersampled relative to the density the view asks
+	// of it* is refined first. `span * density` is how many texels this page would carry if it were
+	// produced at the density its pixel footprint demands, so `span * density / page_size` is how
+	// many times coarser than its own demand the page is - its deficit. Refining the largest deficit
+	// first is a greedy over that ratio, and residency then collects where the view needs it instead
+	// of buying one *world size* everywhere.
+	//
+	// Breadth-first by world span was the previous order and is what this replaces. It reads as even
+	// coverage - every cell descends one world level before any cell descends two - and that is
+	// exactly its failure: it spends the plan on a uniform world size rather than on the levels the
+	// view asks for. Measured on `native/tests/vt_near_density.gd` (1080p gameplay view, shipped
+	// defaults, the pool auto-grown to 512 pages): 496 pages resident, not one of them finer than a
+	// metre, no page at local mip 0 or 1 of any sector, and a delivered ceiling of 256 texels/m -
+	// while the ground two metres in front of the camera asked for 0.25-0.5 m pages.
+	//
+	// The failure this order used to guard against - one cell's chain eating the plan, which left
+	// every other cell its whole-cell page and made the level histogram bimodal - cannot come back
+	// from the ordering alone: a footprint is only refined while its own `span * density` still
+	// exceeds one page (the descent test below), so a cell can only take the pages its own demand
+	// justifies, and the deficit of every other cell keeps competing for the rest.
+	auto most_undersampled = [](const Node &a, const Node &b) {
 		if (a.cell->produce != b.cell->produce) { return !a.cell->produce; }
-		// Breadth-first in *world span*, not in local mip and not by distance. A page's span is the
-		// one quantity two chains can be compared by across blocks of different sizes: a 256-page
-		// block and a 64-page block hold the same world resolution at different local mips, so
-		// ordering by mip let the larger block's chain outrank the smaller block's at every level,
-		// and ordering by distance made the walk depth-first on the nearest cell. Either way the plan
-		// spent its ~128 entries on one cell's chain and left every other cell its whole-cell page:
-		// the near-field probe measured 43 of 45 points within 16 m of the camera with no ready fine
-		// page, and the level histogram was bimodal - a fine cluster for one cell, 35 whole-cell pages
-		// for the rest. Ordering by span descends every cell one world level before any cell descends
-		// two, which is what makes adjacent cells at one distance share a resolution.
+		const float a_deficit = a.rect.size.x * a.density;
+		const float b_deficit = b.rect.size.x * b.density;
+		if (a_deficit != b_deficit) { return a_deficit < b_deficit; }
+		// Equal deficit: the coarser footprint first, so one chain is walked parent before child and
+		// the level histogram stays contiguous rather than sprouting a fine page beside an
+		// unrefined sibling.
 		if (a.rect.size.x != b.rect.size.x) { return a.rect.size.x < b.rect.size.x; }
 		if (a.distance != b.distance) { return a.distance > b.distance; }
 		return false;
 	};
-	std::priority_queue<Node, std::vector<Node>, decltype(farther)> pending(farther);
+	std::priority_queue<Node, std::vector<Node>, decltype(most_undersampled)> pending(most_undersampled);
 	auto enqueue = [&](const Terrain3DAVTSector &cell, int mip, int x, int y, bool root = false) {
 		const float span = p_input.section_world * float(1 << mip) / cell.logical_pages;
 		const Rect2 rect(Vector2(cell.location) * p_input.section_world + Vector2(x, y) * span, Vector2(span, span));

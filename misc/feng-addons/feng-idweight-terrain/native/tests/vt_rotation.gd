@@ -90,6 +90,10 @@ func run() -> void:
 	var overdraw := await frame_image(12)
 	overdraw.save_png(output_dir.path_join("overdraw_flat_clipmap.png"))
 	root.debug_draw = Viewport.DEBUG_DRAW_DISABLED
+	# Enabling VT delivery turns this node's own tick back on (`terrain_3d_surface_views.cpp`), so
+	# stop it before the camera goes: a tick with the camera freed cannot find a clipmap target and
+	# the engine logs that as an error, which the runner counts against the test.
+	terrain.set_physics_process(false)
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

@@ -321,17 +321,13 @@ func _run() -> void:
 	if not _require(avt_debug_block.visible and not clipmap_debug_block.visible,
 			"a debug view must follow the delivery matrix: AVT is selected here and Clipmap is not"):
 		return
-	# The clipmap's view follows the ring *object* rather than a matrix cell, and in this build no cell
-	# may name the method at all: the write below is refused, the cell keeps its method, and the block
-	# stays hidden because there is no ring to draw. The two counters are what make "nothing was
-	# scanned" a reading instead of a claim.
+	# The clipmap's view follows the ring *object* rather than a matrix cell: this scene has never put a
+	# cell on `Clipmap`, so no ring exists, the block stays hidden and nothing is scanned. The two
+	# counters are what make "nothing was scanned" a reading instead of a claim. (Selecting the method
+	# is what builds a ring - both channels can now name it - and the reading that an arm renders from
+	# one is `vt_clipmap_render`'s and `vt_delivery`'s.)
 	var calls_before := int(terrain.get_vt_settings().get("clipmap_preview_calls", 0))
 	var computed_before := int(terrain.get_vt_settings().get("clipmap_preview_computed", 0))
-	terrain.vt_delivery_near_height = 2
-	await _wait_frames(2)
-	if not _require(terrain.vt_delivery_near_height == 0,
-			"a height cell naming Clipmap must be refused and keep its method: this build has no arm for it"):
-		return
 	clipmap_view.set("_last_poll_sec", -INF)
 	clipmap_view.call("_process", 0.0)
 	if not _require(not bool(clipmap_view.call("is_available")) and not clipmap_debug_block.visible,
@@ -505,11 +501,15 @@ func _run() -> void:
 		return
 	var saved_clipmap_size: int = terrain.vt_clipmap_size
 	var saved_clipmap_budget: int = terrain.vt_clipmap_budget_texels
+	# Both controls carry the same three states, so both are written and read back. The budget box
+	# steps in 1024 (`vt_editor.gd` builds it with `_make_spin(0, 1048576, 1024)`) and `Range` snaps a
+	# written value to its step, so the value below is a multiple of it: asking for 512 would land on 0
+	# and read as a control that did nothing.
 	vt_editor.clipmap_size_spin.value = 32.0
 	if not _require(terrain.vt_clipmap_size == 32, "the clipmap level edge control did not update the native setting"):
 		return
-	vt_editor.clipmap_budget_spin.value = 512.0
-	if not _require(terrain.vt_clipmap_budget_texels == 512, "the clipmap budget control did not update the native setting"):
+	vt_editor.clipmap_budget_spin.value = 1024.0
+	if not _require(terrain.vt_clipmap_budget_texels == 1024, "the clipmap budget control did not update the native setting"):
 		return
 	vt_editor.clipmap_size_spin.value = float(saved_clipmap_size)
 	vt_editor.clipmap_budget_spin.value = float(saved_clipmap_budget)

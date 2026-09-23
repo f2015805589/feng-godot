@@ -119,7 +119,10 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 		job_bytes.encode_u32(offset + 32, uint32_t(std::max(0, layer)));
 		job_bytes.encode_u32(offset + 36, uint32_t(std::max(0, layer)));
 		job_bytes.encode_u32(offset + 40, mode);
-		job_bytes.encode_u32(offset + 44, 0);
+		// `indices.w` is the layer the *height* is read from. A page holds its payload and its height
+		// at one layer index of two arrays, so here the two are the same number; a ring that keeps
+		// both in one array names a different one, which is the only reason the field exists.
+		job_bytes.encode_u32(offset + 44, uint32_t(std::max(0, layer)));
 		encode_vec4(job_bytes, offset + 48, std::clamp(job.slope_factor, 0.0f, 1.0f), job.source_grid.x, job.source_grid.y, job.source_grid.z);
 	}
 	if (_rd->buffer_update(_resources.job_buffer, 0, uint32_t(job_bytes.size()), job_bytes) != OK) {
@@ -127,11 +130,24 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 		return false;
 	}
 	PackedByteArray push;
-	push.resize(16);
+	push.resize(48);
 	push.encode_u32(0, uint32_t(p_stored_size));
 	push.encode_u32(4, uint32_t(p_jobs.size()));
 	push.encode_u32(8, uint32_t(std::max(0, p_material_count)));
 	push.encode_u32(12, uint32_t(p_generation & 0xFFFFFFFFu));
+	// `source.x == 0`: a page's source is a stored rect with a gutter, whose taps clamp. The ring's
+	// jobs are the only ones that carry a wrapping square, and they are dispatched by
+	// `_dispatch_ring_bake()` - this block is the same size for both, so one shader serves the two.
+	push.encode_u32(16, 0u);
+	push.encode_u32(20, 0u);
+	push.encode_u32(24, 0u);
+	push.encode_u32(28, 0u);
+	// And a page's job covers the layer it fills: origin zero, the stored size either way. A ring's
+	// job names one rect of a level here instead, which is the whole difference between the two.
+	push.encode_u32(32, 0u);
+	push.encode_u32(36, 0u);
+	push.encode_u32(40, uint32_t(p_stored_size));
+	push.encode_u32(44, uint32_t(p_stored_size));
 	SurfaceVTLabel dispatch_label(_rd, "Bake / Invalidate Pages - Dispatch Z = job index");
 	const int64_t compute_list = _rd->compute_list_begin();
 	if (compute_list < 0) {
@@ -377,6 +393,295 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 	return true;
 }
 
+///////////////////////////
+// The ring's bake
+///////////////////////////
+
+// One ring's descriptor set: the ring's own atlas as both inputs of the bake shader and the ring's
+// three arrays as its outputs. Built here rather than through the bundle path because nothing about
+// it is a page - its size is the ring's texel count, its layers are the ring's levels, and its inputs
+// are the very texels the bake reads rather than a page's staging copy.
+bool Terrain3DSurfaceBaker::_ensure_ring_bake(Terrain3DClipmap *p_ring) {
+	if (p_ring == nullptr || !_rd || !_resources.shader.is_valid() || !_resources.pipeline.is_valid() ||
+			!_resources.job_buffer.is_valid() || !_resources.material_buffer.is_valid() ||
+			!_resources.sampler_nearest.is_valid() || !_resources.sampler_linear.is_valid()) {
+		// No producer, no bake: the ring keeps serving its own texels (the payload) and every level
+		// reports `baked` false. The bake shader, the material list and the job buffer are the page
+		// producer's, so this is the state of a build whose material group never took the paged path -
+		// which is also why the owner publishes that list to this producer for a ring (see
+		// `Terrain3D::_setup_vt_clipmap()`).
+		return false;
+	}
+	// The bake shader writes exactly three arrays, and the payload and the height are two layers of
+	// one: a channel that declares another shape is not one this path can fill, and refusing here is
+	// what keeps a ring from holding layers nothing would write.
+	if (p_ring->get_baked_channel_count() != 3 || p_ring->get_channel_count() < 2) {
+		return false;
+	}
+	const RID atlas = resolve_main_texture(p_ring->get_texture_rid());
+	if (!atlas.is_valid() || !_rd->texture_is_valid(atlas)) {
+		return false;
+	}
+	const RID outputs[3] = { p_ring->get_baked_device_rid(0), p_ring->get_baked_device_rid(1),
+		p_ring->get_baked_device_rid(2) };
+	if (!outputs[0].is_valid() || !outputs[1].is_valid() || !outputs[2].is_valid()) {
+		return false;
+	}
+	// The set survives a tick: it is rebuilt when the ring it describes is not this one, when the
+	// ring's atlas changed (a reconfigure makes a new texture), when its shape did, or when the bundle
+	// it takes its buffers, samplers and shader from was replaced - a set that named a retired
+	// bundle's buffer would dispatch against a resource the device no longer owns.
+	if (_ring_bake.ring == p_ring && _ring_bake.uniform_set.is_valid() && _ring_bake.atlas_rd == atlas &&
+			_ring_bake.job_buffer == _resources.job_buffer && _ring_bake.size == p_ring->get_size()) {
+		return true;
+	}
+	_free_ring_bake();
+	RID albedo_rd;
+	RID normal_rd;
+	_resolve_material_rd(_resources, albedo_rd, normal_rd, _material_albedo_rs, _material_normal_rs);
+	TypedArray<Ref<RDUniform>> uniforms;
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
+			_resources.sampler_nearest, atlas);
+	// The same texture twice: the payload and the height are two layers of one array, and the job
+	// names both, which is the whole reason `indices.w` exists.
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1,
+			_resources.sampler_nearest, atlas);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2,
+			_resources.sampler_linear, albedo_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3,
+			_resources.sampler_linear, normal_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 4, _resources.material_buffer);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 5, _resources.job_buffer);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 6, outputs[0]);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 7, outputs[1]);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 8, outputs[2]);
+	const RID set = _rd->uniform_set_create(uniforms, _resources.shader, 0);
+	if (!set.is_valid()) {
+		LOG(WARN, "Could not create the clipmap ring bake uniform set");
+		return false;
+	}
+	_ring_bake.ring = p_ring;
+	_ring_bake.atlas_rd = atlas;
+	_ring_bake.job_buffer = _resources.job_buffer;
+	_ring_bake.size = p_ring->get_size();
+	_ring_bake.uniform_set = set;
+	return true;
+}
+
+void Terrain3DSurfaceBaker::_free_ring_bake() {
+	if (_ring_bake.uniform_set.is_valid() && _rd && _rd->uniform_set_is_valid(_ring_bake.uniform_set)) {
+		_rd->free_rid(_ring_bake.uniform_set);
+	}
+	_ring_bake.uniform_set = RID();
+	_ring_bake.atlas_rd = RID();
+	_ring_bake.job_buffer = RID();
+	_ring_bake.ring = nullptr;
+	_ring_bake.size = 0;
+	std::lock_guard<std::mutex> lock(_mutex);
+	_ring_bake.collected.clear();
+	_ring_bake.queued.clear();
+	_ring_bake.landed.clear();
+}
+
+int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels) {
+	if (p_ring == nullptr || !p_ring->is_configured() || p_ring->get_baked_channel_count() != 3) {
+		return 0;
+	}
+	if (!_ensure_ring_bake(p_ring)) {
+		return 0;
+	}
+	const int channels = MAX(1, p_ring->get_channel_count());
+	std::vector<RingJob> fresh;
+	std::vector<RingJob> previous;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const RingJob &landed : _ring_bake.landed) {
+			// The ring is what decides, not this thread: a rect whose level moved after the dispatch, or
+			// whose shape changed, describes texels the bake never read, and the ring keeps it queued -
+			// serving those layers to a fragment is exactly what the lease exists to prevent.
+			if (_ring_bake.ring == p_ring) {
+				p_ring->acknowledge_bake_rect(landed.level, landed.x0, landed.y0, landed.x1, landed.y1,
+						landed.lease);
+			}
+		}
+		_ring_bake.landed.clear();
+		previous = std::move(_ring_bake.collected);
+		// The rects the ring has produced and no bake has covered, in the order it produced them -
+		// which is not the order of its levels: a strip of the finest level and a fill of the coarsest
+		// are the same kind of entry here, because both are "this rect is not baked yet".
+		int budget = MAX(0, p_budget_texels);
+		for (int index = 0; index < p_ring->get_pending_bake_rect_count(); index++) {
+			const Terrain3DClipmap::BakeRect &rect = p_ring->get_pending_bake_rect(index);
+			// A rect already on its way to a dispatch is not collected twice: the second bake would
+			// read the same texels and land the same layers.
+			bool already = false;
+			for (const RingJob &job : previous) {
+				already = already || (job.level == rect.level && job.x0 == rect.x0 && job.y0 == rect.y0 &&
+											 job.x1 == rect.x1 && job.y1 == rect.y1);
+			}
+			for (const RingJob &job : fresh) {
+				already = already || (job.level == rect.level && job.x0 == rect.x0 && job.y0 == rect.y0 &&
+											 job.x1 == rect.x1 && job.y1 == rect.y1);
+			}
+			if (already) {
+				continue;
+			}
+			const int64_t texels = int64_t(rect.x1 - rect.x0) * int64_t(rect.y1 - rect.y0) *
+					int64_t(channels);
+			// The budget is the production budget's own unit - channel texels - and it is a *soft* one:
+			// at least one rect is collected per offer, because a whole-level fill is larger than a
+			// tick's budget and a budget that never admitted it would leave the level unbaked forever.
+			// What is left stays in the ring's queue for the next offer, which is the same deferral the
+			// production budget makes.
+			if (!fresh.empty() && budget > 0 && texels > int64_t(budget)) {
+				break;
+			}
+			budget -= int(texels);
+			RingJob job;
+			job.level = rect.level;
+			job.x0 = rect.x0;
+			job.y0 = rect.y0;
+			job.x1 = rect.x1;
+			job.y1 = rect.y1;
+			// The *rect's* lease, not a fresh one from the level: it is the content this rect holds, and
+			// the ring accepts the bake only while the rect still carries it.
+			job.lease = rect.lease;
+			job.texel = p_ring->get_texel_world(rect.level);
+			// The level's world origin, which with its texel size is the whole of what the shader needs
+			// to turn a *stored* texel back into the world position it stands for.
+			job.level_origin = p_ring->get_level_world_bounds(rect.level).position;
+			// The rotation the level's stored content is under. The shader *reads* it - a stored texel's
+			// world position is its logical one, which is this offset turned back - and the lease taken
+			// above is what makes a level whose ring turned before the dispatch stale instead of wrongly
+			// baked.
+			job.ring = p_ring->get_ring(rect.level);
+			// Layer `level * channels + 0` is the payload, `+ 1` the height: one array, two layers,
+			// named separately because the bake reads them through two samplers at one job.
+			job.payload_layer = rect.level * channels;
+			job.height_layer = job.payload_layer + 1;
+			fresh.push_back(job);
+		}
+		// This tick collects, the next dispatches: the payload of a rect collected now is a
+		// RenderingServer command that has not run yet, and a device dispatch issued in the same tick
+		// would race that queue and read the texels the rect is replacing.
+		_ring_bake.collected = std::move(fresh);
+		_ring_bake.queued = std::move(previous);
+	}
+	return int(_ring_bake.collected.size());
+}
+
+int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
+	std::vector<RingJob> jobs;
+	RID set;
+	RID job_buffer;
+	int size = 0;
+	int material_count = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (_ring_bake.queued.empty()) {
+			return 0;
+		}
+		jobs = std::move(_ring_bake.queued);
+		_ring_bake.queued.clear();
+		set = _ring_bake.uniform_set;
+		size = _ring_bake.size;
+		material_count = _material_count;
+		// The set's own buffer, not the bundle's: they are the same resource or the set is stale, and
+		// `_ensure_ring_bake()` is where that is decided.
+		job_buffer = _ring_bake.job_buffer;
+	}
+	// No material list means the shader would invalidate every output instead of baking it, and a
+	// dispatch that wrote black into a level must not be allowed to mark it baked: nothing is
+	// dispatched, and the levels come back through the next offer.
+	if (!_rd || !set.is_valid() || !job_buffer.is_valid() || size <= 0 || material_count <= 0 || jobs.empty()) {
+		// Nothing is dispatched and nothing lands, so no level is marked: a ring baked with an empty
+		// material list would write black into a level and then serve it. The levels stay queued out of
+		// this tick and come back through the next offer, which is what makes this a delay rather than a
+		// lost bake. `Terrain3D::_setup_vt_clipmap()` is what makes sure the list is published at all for
+		// a configuration whose material group takes no page.
+		return 0;
+	}
+	// One dispatch per rect, one job in the buffer at a time: a rect's ring offset is part of what its
+	// job *reads*, so it cannot ride in the push constant of a batch that carries several rects - and
+	// such a batch would have to be cut to the job buffer's page-sized capacity, which is a coupling
+	// between the ring and the page pool that a channel delivered by the ring alone must not have. The
+	// dispatch covers the rect, which is what keeps a level that turned a strip from paying a bake of
+	// its whole square. See `surface_bake_source_coord()` for what the source words mean to the shader.
+	std::vector<RingJob> landed;
+	for (const RingJob &job : jobs) {
+		const int width = job.x1 - job.x0;
+		const int height = job.y1 - job.y0;
+		if (width <= 0 || height <= 0) {
+			continue;
+		}
+		PackedByteArray job_bytes;
+		job_bytes.resize(JOB_STRIDE);
+		// The job's own rect in world terms - its extent, and the level's origin rather than the rect's,
+		// because a *stored* rect's world position is not affine in the rect: the shader reaches it
+		// through the level's policy grid, ring offset and all. A page's job is the affine one, which is
+		// what its `source.x == 0` says.
+		encode_vec4(job_bytes, 0, job.level_origin.x, job.level_origin.y, float(width) * float(job.texel),
+				float(height) * float(job.texel));
+		// No border: a ring rect *is* the world rect it covers. `page.z` is the level's texel count,
+		// `page.w` the border, and a tap that leaves the layer wraps rather than clamps, which is what
+		// a level without a border needs.
+		encode_vec4(job_bytes, 16, float(job.texel), float(job.texel), float(size), 0.f);
+		job_bytes.encode_u32(32, uint32_t(MAX(0, job.payload_layer)));
+		job_bytes.encode_u32(36, uint32_t(MAX(0, job.level)));
+		job_bytes.encode_u32(40, 1u);
+		job_bytes.encode_u32(44, uint32_t(MAX(0, job.height_layer)));
+		// The source grid is the *level's* own rect at the level's own texel size, so a world position
+		// maps back to the logical texel the payload was read from - which for a rect of the level is
+		// its own origin inside the level, not zero.
+		encode_vec4(job_bytes, 48, 1.0f, job.level_origin.x, job.level_origin.y, float(job.texel));
+		if (_rd->buffer_update(job_buffer, 0, uint32_t(job_bytes.size()), job_bytes) != OK) {
+			LOG(WARN, "Could not upload a clipmap ring bake job");
+			break;
+		}
+		PackedByteArray push;
+		push.resize(48);
+		push.encode_u32(0, uint32_t(size));
+		push.encode_u32(4, 1u);
+		push.encode_u32(8, uint32_t(MAX(0, material_count)));
+		push.encode_u32(12, 0u);
+		// The source square wraps by the level's own ring, and the payload layer is the ring's raw
+		// `FORMAT_RF` rather than a page's normalised `R16_UNORM`.
+		push.encode_u32(16, uint32_t(size));
+		push.encode_u32(20, uint32_t(MAX(0, job.ring.x)));
+		push.encode_u32(24, uint32_t(MAX(0, job.ring.y)));
+		push.encode_u32(28, 1u);
+		// Where in the output layer this rect goes, and how big it is: the dispatch below covers it,
+		// and the shader writes each invocation at its own texel inside it.
+		push.encode_u32(32, uint32_t(MAX(0, job.x0)));
+		push.encode_u32(36, uint32_t(MAX(0, job.y0)));
+		push.encode_u32(40, uint32_t(width));
+		push.encode_u32(44, uint32_t(height));
+		SurfaceVTLabel label(_rd, "Clipmap Ring Bake - level " + String::num_int64(job.level) + " rect " +
+						String::num_int64(job.x0) + "," + String::num_int64(job.y0));
+		const int64_t compute_list = _rd->compute_list_begin();
+		if (compute_list < 0) {
+			LOG(WARN, "Could not begin a clipmap ring bake compute list");
+			break;
+		}
+		_rd->compute_list_bind_compute_pipeline(compute_list, _resources.pipeline);
+		_rd->compute_list_bind_uniform_set(compute_list, set, 0);
+		_rd->compute_list_set_push_constant(compute_list, push, uint32_t(push.size()));
+		_rd->compute_list_dispatch(compute_list, uint32_t((width + 7) / 8), uint32_t((height + 7) / 8), 1u);
+		_rd->compute_list_end();
+		// Only a rect that was actually recorded is a rect that landed: a batch that failed to record
+		// must not report its rects as written.
+		landed.push_back(job);
+	}
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const RingJob &job : landed) {
+			_ring_bake.landed.push_back(job);
+		}
+		_ring_bake.dispatches += uint64_t(landed.size());
+	}
+	return int(landed.size());
+}
+
 void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) {
 	(void)p_keep_alive;
 	std::map<int, PendingJob> pending;
@@ -470,8 +775,13 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		}
 	}
 
-	// Material updates invalidate every old result, but a newer operation for a slot
-	// supersedes that invalidation.  Keeping one operation per slot also avoids races
+	// And the ring's bake, before the page batch: it reads the material list out of the buffer the
+	// block above just wrote, and it must not depend on this frame having page work - a ring whose
+	// channel is delivered by the ring has no pages at all, and `_dispatch_frame_jobs()` refuses an
+	// empty batch, so a ring baked after it would only ever bake on frames the pages did.
+	_dispatch_ring_bake();
+
+	// Material updates invalidate every old result, but a newer operation for a slot	// supersedes that invalidation.  Keeping one operation per slot also avoids races
 	// between two z slices of the compute dispatch.
 	std::vector<PendingJob> jobs = _build_frame_jobs(pending, invalidate_all, generation, page_count);
 
@@ -720,6 +1030,11 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["invalidated_pages"] = int64_t(_invalidated_pages);
 	stats["source_uploads"] = int64_t(_source_uploads);
 	stats["dispatch_count"] = int64_t(_dispatch_count);
+	// The ring's own dispatches, recorded rather than acknowledged: a rect the ring later refuses (its
+	// lease moved before the bake landed) is counted here and re-queued there, so the two numbers
+	// together are what says whether a moving focus is being baked at all. See `vt_clipmap_render`.
+	// This function holds `_mutex` already, which is also what the three counters above rely on.
+	stats["ring_bake_dispatches"] = int64_t(_ring_bake.dispatches);
 	// Replaced arrays still alive because the material has not been rebound yet. This
 	// has to read 0 in a settled frame, otherwise a rebuild is leaking its predecessor.
 	stats["retired_bundles"] = int64_t(_retired.size());

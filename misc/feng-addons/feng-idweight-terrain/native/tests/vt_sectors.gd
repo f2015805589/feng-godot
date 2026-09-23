@@ -23,7 +23,14 @@ func settle_sectors() -> void:
 	for i in 600:
 		var produced := await tick()
 		var stats: Dictionary = terrain.get_vt_settings()
-		if produced == 0 and int(stats.get("producer", {}).get("pending", 1)) == 0:
+		# A tick that produced nothing is not yet a settled view. `invalidate_surface_pages()`
+		# arms the edit and the plan re-derives on its own refresh, so the first quiet ticks can
+		# land *before* the invalidation has been turned into demand - and then 35 pages are
+		# visible-missing while the producer refills them one page per tick, which is exactly the
+		# edit phase that used to fail in a quarter of the runs. Waiting for the visible miss
+		# count to reach zero as well is what "settled" means for this test's assertions.
+		var missing := int(stats.get("avt_sector_stats", {}).get("visible_missing_pages", 0))
+		if produced == 0 and int(stats.get("producer", {}).get("pending", 1)) == 0 and missing == 0:
 			quiet += 1
 		else:
 			quiet = 0
@@ -141,8 +148,33 @@ func run() -> void:
 	image.save_png(output_dir.path_join("full-avt-edited.png"))
 	print("VT_SECTORS_EDIT color=", sample_area(image, Vector2(224, 160), 1))
 	require(sample_area(image, Vector2(224, 160), 1) == "red", "region editing invalidates sub-sector and coarse AVT pages")
+	# This phase is flaky in both plan orders (see `docs/avt_addressing_redesign.md` section 6.7):
+	# the pool is the size of the plan, so the reading that says *why* a run did not settle is the
+	# plan's own numbers and the count every tick produced, not the assertion text alone.
+	var edit_stats: Dictionary = terrain.get_vt_settings().get("avt_sector_stats", {})
+	print("VT_SECTORS_EDIT_STATS plan_selected=", edit_stats.get("plan_selected"),
+			" denied=", edit_stats.get("refinement_requests_denied"),
+			" visible_missing=", edit_stats.get("visible_missing_pages"),
+			" visible_pending=", edit_stats.get("visible_pending_pages"),
+			" requested=", edit_stats.get("requested_physical_pages"),
+			" pool=", edit_stats.get("pool_pages"),
+			" retain_share=", edit_stats.get("plan_retain_share"),
+			" carried=", edit_stats.get("plan_carried"),
+			" overlapped=", edit_stats.get("plan_overlapped"),
+			" new_area=", edit_stats.get("plan_new_area"),
+			" reselected=", edit_stats.get("plan_reselected"),
+			" depth_deepened=", edit_stats.get("plan_depth_deepened"),
+			" level_mips=", edit_stats.get("plan_level_mips"))
+	var produced_after_edit := []
 	for i in 24:
-		require(await tick() == 0, "edited AVT must settle without repeated baking")
+		var produced := await tick()
+		produced_after_edit.append(produced)
+		require(produced == 0, "edited AVT must settle without repeated baking")
+	print("VT_SECTORS_EDIT_TICKS ", produced_after_edit)
+	# Enabling VT delivery turns this node's own tick back on (`terrain_3d_surface_views.cpp`), so
+	# stop it before the camera goes: a tick with the camera freed cannot find a clipmap target and
+	# the engine logs that as an error, which the runner counts against the test.
+	terrain.set_physics_process(false)
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

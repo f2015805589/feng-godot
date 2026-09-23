@@ -3,9 +3,9 @@
 Every script test does the same thing: copy the addon into a throwaway project
 under `bin/`, point APPDATA/LOCALAPPDATA at that project, run the engine twice
 (a headless import, then a real-driver run of one script), then decide pass/fail
-from the exit code, the log's `ERROR:` lines and one required `PASS` marker. That
-lives here so a runner only names its script, its log and its marker, and adding
-a test is a few lines rather than a copy of fifty.
+from the exit code, the log's `ERROR:` lines minus `ENVIRONMENTAL_ERRORS`, and one
+required `PASS` marker. That lives here so a runner only names its script, its log
+and its marker, and adding a test is a few lines rather than a copy of fifty.
 
 Import from the tests directory, which is what running `..._runner.py` does.
 """
@@ -28,6 +28,23 @@ DEFAULT_EDITOR = ROOT / "bin" / "godot.windows.editor.x86_64.exe"
 # Off-desktop position for every engine window. The editor restores its own layout, so
 # `--position -10000,-10000` alone still leaves a maximized window covering the screen.
 OFFSCREEN_POSITION = -32000
+
+# While starting, the engine asks the OS for its certificate store and prints one `ERROR:` line
+# per launch when that read fails. The line describes the machine, not the test - but a runner
+# counts `ERROR:` lines and `run_all.py` reads those counts, so one unfiltered line turned every
+# test in the suite red. Only this exact text is exempt: every other `ERROR:` line stays fatal.
+# `vt_project_lifetime_probe.py` already ignored it locally; this is the shared version.
+ENVIRONMENTAL_ERRORS = ("Failed to read the root certificate store.",)
+
+
+def is_environmental_error(line: str) -> bool:
+    """True for a log line the engine emits about the machine rather than about the test."""
+    return any(text in line for text in ENVIRONMENTAL_ERRORS)
+
+
+def log_errors(output: str) -> list[str]:
+    """The `ERROR:` lines of `output` that describe the test rather than the machine."""
+    return [line for line in output.splitlines() if "ERROR:" in line and not is_environmental_error(line)]
 
 
 def move_windows_offscreen(pid: int) -> int:
@@ -216,11 +233,11 @@ def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: s
         return 127
 
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     banned = [text for text in forbidden if text in output]
     wanted: Iterable[str] = ("PASS", "REGRESSION", "ERROR:", "SCRIPT ERROR:", *prefixes)
     for line in output.splitlines():
-        if line.startswith(tuple(wanted)):
+        if line.startswith(tuple(wanted)) and not is_environmental_error(line):
             print(line)
     for text in banned:
         print(f"FORBIDDEN: {text}")

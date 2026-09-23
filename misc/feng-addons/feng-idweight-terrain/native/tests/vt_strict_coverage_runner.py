@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, run_with_offscreen_window, write_fixture
+from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, write_fixture
 
 
 def copy_source_project(source: Path, target: Path) -> None:
@@ -134,10 +134,10 @@ def main() -> int:
             )
 
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     report_paths: list[Path] = []
     for line in output.splitlines():
-        if line.startswith(("VT_STRICT", "REGRESSION", "SCRIPT ERROR:", "ERROR:", "PASS ")):
+        if line.startswith(("VT_STRICT", "REGRESSION", "SCRIPT ERROR:", "ERROR:", "PASS ")) and not is_environmental_error(line):
             print(line)
         if line.startswith("VT_STRICT_REPORT path="):
             report_paths.append(Path(line.split("=", 1)[1].strip()))

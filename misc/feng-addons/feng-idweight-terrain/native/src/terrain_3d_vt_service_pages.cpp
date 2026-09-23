@@ -550,14 +550,30 @@ void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {
 			}
 			baker(_vt.vt_baker)->invalidate_slot(int(keys[i]));
 			// Border edits can affect a neighbour's page. Remove its address too,
-			// otherwise the scheduler would keep treating an invalid payload as a hit.
-			for (const Dictionary &owner : _vt.surface_vt->get_slot_owner_metadata(int(keys[i]))) {
+			// otherwise the scheduler would keep treating an invalid payload as a hit. The
+			// owner list is the *shared pool's*, so either view reads the same entries - and a
+			// configuration with only one view up has only that one to ask through, which is
+			// why this does not name the near view (a far-field-only scene owns no near view
+			// at all, and the region invalidation above reaches here whenever it has pages).
+			Array owners;
+			if (_vt.surface_vt != nullptr) {
+				owners = _vt.surface_vt->get_slot_owner_metadata(int(keys[i]));
+			} else if (_vt.surface_svt != nullptr) {
+				owners = _vt.surface_svt->get_slot_owner_metadata(int(keys[i]));
+			}
+			for (const Dictionary &owner : owners) {
 				int mip = owner["mip"];
 				Vector2i address = owner["virtual"];
 				if (bool(owner["world_space"])) {
+					if (_vt.surface_svt == nullptr) {
+						continue;
+					}
 					int half = _vt.surface_svt->get_indirection_size() >> 1;
 					_vt.surface_svt->release_world_page((address.x << mip) - half, (address.y << mip) - half, mip);
 				} else {
+					if (_vt.surface_vt == nullptr) {
+						continue;
+					}
 					Vector2i sector = owner["sector"];
 					int x = address.x - (_vt.surface_vt->get_sector_block_origin_x(sector) >> mip);
 					int y = address.y - (_vt.surface_vt->get_sector_block_origin_y(sector) >> mip);

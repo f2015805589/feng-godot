@@ -295,6 +295,13 @@ public:
 	// so a hole and a region blend stay decisions of whoever reads the ring. See
 	// terrain_3d_clipmap_source_height.h.
 	real_t get_height_texel_nearest(const Vector2 &p_world_xz) const;
+	// The `R16` surface payload texel under a world XZ, by nearest payload texel, as the *packed*
+	// integer the shader's own corner read takes (0 anywhere no surface map covers it). Nearest for the
+	// same reason as the height read above: one clipmap texel stands for one payload texel, and a read
+	// that depended on the ring's own texel size would make the ring's content a function of its shape.
+	// Raw rather than UNORM because the ring's layer is `FORMAT_RF`: a packed id/weight pair is not a
+	// colour and must not be rescaled on either side. See terrain_3d_clipmap_source_material.h.
+	uint32_t get_surface_texel_nearest(const Vector2 &p_world_xz) const;
 	real_t get_surface_height(const Vector3 &p_global_position) const;
 	real_t get_modified_height(const Vector2i &p_vgrid) const;
 	real_t get_region_blend(const Vector2 &p_uv2) const;

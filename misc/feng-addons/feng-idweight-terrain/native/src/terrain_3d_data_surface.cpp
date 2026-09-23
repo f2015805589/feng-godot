@@ -259,3 +259,39 @@ Ref<Image> Terrain3DData::make_sparse_surface_page(const int p_page_x, const int
 			p_border, page);
 	return page;
 }
+
+// One payload texel, by nearest, in the form the shader's own corner read takes it
+// (`get_surface_texel()`): the grid is the *stored payload's*, so the index is
+// `floor(world * density / vertex_spacing)` on the region's own density - the one the image was
+// written at - and is reduced into that image. A region with no surface map, or an image that cannot
+// hold the texel, reads 0 - the value an array sample outside a filled layer gives, so a hole and a
+// region blend stay decisions of whoever reads the ring rather than of the source.
+uint32_t Terrain3DData::get_surface_texel_nearest(const Vector2 &p_world_xz) const {
+	const real_t spacing = MAX(0.0001f, _vertex_spacing);
+	// The region first, on the vertex grid: the payload's grid belongs to the region that owns it
+	// (its image is `region_size * that region's density` texels an axis), so the density is not known
+	// until the region is.
+	const Vector2i vgrid(int(Math::floor(p_world_xz.x / spacing)), int(Math::floor(p_world_xz.y / spacing)));
+	const Terrain3DRegion *region = get_region_ptr(V2I_DIVIDE_FLOOR(vgrid, _region_size));
+	if (region == nullptr || region->is_deleted()) {
+		return 0u;
+	}
+	const Ref<Image> map = region->get_surface_map();
+	if (map.is_null()) {
+		return 0u;
+	}
+	const int size = map->get_width();
+	if (size <= 0) {
+		return 0u;
+	}
+	const int density = MAX(1, region->get_surface_density());
+	const Vector2i payload(int(Math::floor(p_world_xz.x * real_t(density) / spacing)),
+			int(Math::floor(p_world_xz.y * real_t(density) / spacing)));
+	const Vector2i texel(Math::posmod(payload.x, size), Math::posmod(payload.y, size));
+	const PackedByteArray bytes = map->get_data();
+	if (bytes.size() < int64_t(size) * int64_t(size) * 2) {
+		return 0u;
+	}
+	const uint8_t *packed = bytes.ptr() + (int64_t(texel.y) * int64_t(size) + int64_t(texel.x)) * 2;
+	return uint32_t(packed[0]) | (uint32_t(packed[1]) << 8);
+}

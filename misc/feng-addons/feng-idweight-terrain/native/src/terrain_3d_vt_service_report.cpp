@@ -98,7 +98,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	Dictionary delivery_supported;
 	Dictionary delivery_unsupported;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		const String group_name = group == int(TerrainVT::ChannelGroup::Material) ? "material" : "height";
+		const String group_name = TerrainVT::group_name(TerrainVT::ChannelGroup(group));
 		PackedInt32Array allowed;
 		Dictionary refused;
 		for (int method = 0; method < TerrainVT::DELIVERY_COUNT; method++) {
@@ -127,12 +127,6 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["clipmap_preview_calls"] = int64_t(_vt.clipmap_preview_calls);
 	result["clipmap_preview_computed"] = int64_t(_vt.clipmap_preview_computed);
 	result["vt_shader_arms"] = needs_vt_shader_arms();
-	// The height group's own arm, which is the narrower of the two and moves on its own: a
-	// configuration can carry the material arms with a `Direct` height group (the default) and bind no
-	// ring uniform at all, so "which methods the generated code has an arm for" is two readings and
-	// not one. Read from the material's verdict rather than from the policy, because the verdict is
-	// what the compiled string is.
-	result["vt_shader_height_clipmap"] = _material.is_valid() && _material->is_shader_using_height_clipmap();
 	// Whether the region texture array still has to carry the diffuse/normal group, which is the
 	// case exactly when no service delivers it. Published because it is the other half of the
 	// assembly statement: with every cell direct the array is not a fallback, it is the renderer.
@@ -159,6 +153,17 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 		entry["configured"] = ring != nullptr && ring->is_configured();
 		entry["selected"] = _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap);
 		entry["source"] = ring != nullptr ? ring->get_source_name() : String("none");
+		// Whether this build has a *source* for the group, which is the same answer the matrix's
+		// acceptance is read from (`has_clipmap_source()`): a reader can therefore tell "the mechanism
+		// exists and nothing delivers it" from "this build cannot deliver it at all", and which of the
+		// two a refused cell is.
+		entry["source_available"] = has_clipmap_source(group);
+		// Whether the generated shader carries *this group's* ring arm. It is the narrower reading
+		// beside `vt_shader_arms` above and it moves on its own: a group delivered `Direct` in both
+		// bands compiles no ring code and binds no ring uniform, and a build can carry one group's arm
+		// without the other's. Read from the material's verdict rather than from the policy, because
+		// the verdict is what the compiled string is.
+		entry["shader_arm"] = _material.is_valid() && _material->is_shader_using_clipmap(group);
 		if (ring != nullptr) {
 			entry["size"] = ring->get_size();
 			entry["levels"] = ring->get_level_count();
@@ -174,9 +179,17 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 			entry["idle_updates"] = int64_t(ring->get_idle_updates());
 			entry["invalidation_calls"] = int64_t(ring->get_invalidation_calls());
 			entry["invalidated_texels"] = int64_t(ring->get_invalidated_texels());
+			// The bake's own accounting, in the same unit the production counters above are in: what a
+			// producer has written into the ring's layers, and what is still owed. A level's `baked` is
+			// the last rect's answer, so these are what say whether the ring is one strip behind or one
+			// level behind.
+			entry["baked_texels"] = int64_t(ring->get_baked_texels());
+			entry["bake_dispatches"] = int64_t(ring->get_bake_dispatches());
+			entry["bake_rejects"] = int64_t(ring->get_bake_rejects());
+			entry["pending_bake_rects"] = ring->get_pending_bake_rect_count();
 			entry["level_reports"] = ring->get_level_reports();
 		}
-		clipmap[channel == TerrainVT::ChannelGroup::Material ? "material" : "height"] = entry;
+		clipmap[TerrainVT::group_name(channel)] = entry;
 	}
 	result["clipmap"] = clipmap;
 	result["page_size"] = _vt.vt_page_size;
@@ -391,7 +404,7 @@ Dictionary Terrain3D::get_clipmap_layout_preview() const {
 			continue;
 		}
 		Dictionary entry;
-		entry["group"] = channel == TerrainVT::ChannelGroup::Material ? "material" : "height";
+		entry["group"] = TerrainVT::group_name(channel);
 		entry["source"] = ring->get_source_name();
 		entry["size"] = ring->get_size();
 		entry["channels"] = ring->get_channel_count();

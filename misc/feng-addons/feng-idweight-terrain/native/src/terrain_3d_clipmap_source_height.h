@@ -20,6 +20,10 @@ public:
 
 	void fill_row(const Row &p_row, float *r_values) override;
 	String get_source_name() const override { return "height"; }
+	// One value a texel, in the height map's own format: the layer the height arm samples in place
+	// of the region array carries the same numbers in the same format.
+	int get_channel_count() const override { return 1; }
+	Image::Format get_format() const override { return Image::FORMAT_RF; }
 
 private:
 	const Terrain3DData *_data = nullptr;

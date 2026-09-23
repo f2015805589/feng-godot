@@ -91,6 +91,10 @@ void Terrain3D::_bind_methods() {
 	// keeps of its own.
 	ClassDB::bind_method(D_METHOD("is_vt_delivery_supported", "group", "method"), &Terrain3D::is_vt_delivery_supported);
 	ClassDB::bind_method(D_METHOD("get_vt_delivery_unsupported_reason", "group", "method"), &Terrain3D::get_vt_delivery_unsupported_reason);
+	// Whether the ring has a source for a group in this build, which is the same answer the line above
+	// reads for `Clipmap`: published so a panel or a test can tell "this build cannot carry that
+	// channel" from "the cell does not name it", and so the one registry the two read is visible.
+	ClassDB::bind_method(D_METHOD("has_clipmap_source", "group"), &Terrain3D::has_clipmap_source);
 	// The clipmap ring's shape, its per-tick production budget, and the reads a test or the dock needs
 	// to compare what the ring holds against the height map it was produced from. The ring is built
 	// by the assembly rule the first time a cell selects `Clipmap` for a group, and `get_vt_clipmap_arm()`

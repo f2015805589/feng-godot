@@ -12,7 +12,7 @@ from pathlib import Path
 
 # The fixture and the two-phase invocation live in fixture.py, shared with every
 # script runner. This file owns the graphical-editor tests only.
-from fixture import ROOT, run_with_offscreen_window, write_fixture
+from fixture import ROOT, log_errors, run_with_offscreen_window, write_fixture
 
 
 def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
@@ -54,7 +54,7 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
     result_code = status
 
     output = log.read_text(encoding="utf-8", errors="replace")
-    error_lines = [line for line in output.splitlines() if "ERROR:" in line]
+    error_lines = log_errors(output)
     print(f"EXIT={result_code} ERROR_LINES={len(error_lines)} LOG={log}")
     print(output, end="")
     if result_code != 0 or error_lines:

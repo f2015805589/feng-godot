@@ -489,14 +489,40 @@ func run() -> void:
 	# the rate of a 16-page budget (alignment document section 7.7.12). The pool is grown first
 	# because the ring may never hold more than half the slots, so the fixture's 64-slot pool is
 	# already at its ceiling at this budget.
+	#
+	# The growth rebuilds the producer's arrays and the bundle that carries them, and that rebuild
+	# lands on the render thread a frame or more later - the shared-pool path waits up to
+	# `Terrain3DVTPool::MAX_WAIT_FRAMES` frames for exactly this, and the near field skips
+	# production while it does. A fixture that raises the budget before the rebuild lands measures
+	# the *previous* bundle's staging layers, which cap the ring below the allocation the larger
+	# pool just earned, so wait for the allocation the growth asked for instead of counting frames.
+	var allocation_before := int(producer_stats().get("encode_ring_allocated", 0))
 	terrain.vt_page_count = 256
 	await process_frame
+	await physics_frame
+	var rebuilt := false
+	for _frame in 30:
+		if int(producer_stats().get("encode_ring_allocated", 0)) > allocation_before:
+			rebuilt = true
+			break
+		await process_frame
+		await physics_frame
+	require(rebuilt, "the producer's arrays must be rebuilt for the grown pool before the ring is measured (%d, was %d)" % [
+			int(producer_stats().get("encode_ring_allocated", 0)), allocation_before])
 	terrain.vt_pages_per_update = budget
 	await process_frame
+	await physics_frame
 	var budget_depth := int(producer_stats().get("encode_ring_capacity", 0))
+	# The budget reaches the producer through the service update, which the frame's own tick may
+	# skip, so the raise is measured over the frames it takes to land rather than after one.
 	terrain.vt_pages_per_update = budget * 4
-	await process_frame
-	var raised_depth := int(producer_stats().get("encode_ring_capacity", 0))
+	var raised_depth := budget_depth
+	for _frame in 30:
+		await process_frame
+		await physics_frame
+		raised_depth = int(producer_stats().get("encode_ring_capacity", 0))
+		if raised_depth > budget_depth:
+			break
 	print("VTCOMPRESS_RENDER ring raise budget=%d depth=%d raised_budget=%d depth=%d allocated=%d" % [
 			budget, budget_depth, budget * 4, raised_depth,
 			int(producer_stats().get("encode_ring_allocated", 0))])

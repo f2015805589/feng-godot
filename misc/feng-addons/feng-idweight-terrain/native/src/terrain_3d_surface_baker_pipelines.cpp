@@ -55,8 +55,8 @@ layout(set = 0, binding = 4, std430) readonly buffer MaterialBuffer {
 struct BakeJob {
 	vec4 world_rect; // world origin x/z, core page size x/z
 	vec4 page; // world texel size x/z, core texel size, physical border
-	uvec4 indices; // source layer, output layer, mode (0 invalid, 1 bake), reserved
-	vec4 policy; // slope distance/policy factor, reserved
+	uvec4 indices; // source layer, output layer, mode (0 invalid, 1 bake), height layer
+	vec4 policy; // slope distance/policy factor, source grid origin x/z and texel step
 };
 
 layout(set = 0, binding = 5, std430) readonly buffer JobBuffer {
@@ -69,6 +69,18 @@ layout(set = 0, binding = 8, rgba16f) uniform writeonly image2DArray bake_output
 
 layout(push_constant, std430) uniform BakePushConstants {
 	uvec4 dims; // physical size, job count, material count, reserved
+	// The shape of the *source* the two payload reads fetch from. A page job's source is a stored rect
+	// with a gutter, which clamps: `x` is zero and the rest is unused. A clipmap job's source is a
+	// level of the ring, which wraps by the level's own ring offset - `x` is the level's texel count,
+	// `y`/`z` its ring - and whose payload layer is `FORMAT_RF` holding the packed pair raw rather than
+	// `R16_UNORM` holding it normalised, which is what `w` names. See `surface_bake_source_coord()`.
+	uvec4 source;
+	// The rect of the output layer this dispatch writes: origin x/y and extent x/y. A page's job covers
+	// the layer it fills, so its origin is zero and its extent is the stored size; a clipmap job covers
+	// *one rect of a level* - a fill, a strip, an invalidated area - which is what keeps a level that
+	// turned a strip from paying a bake of its whole square. `dims.x` stays the source square's size
+	// either way, so the clamp a page's taps take and the wrap a ring's taps take are unchanged.
+	uvec4 dest;
 } bake_push;
 )"
 #include "shaders/idweight_r16.glsl"
@@ -180,6 +192,34 @@ bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources
 	return true;
 }
 
+// The albedo and normal arrays a bake samples. A supplied array the device no longer owns is dead:
+// Terrain3DAssets replaces the pair and frees the previous one, while a rebuild on the render thread
+// can still hold that snapshot. resolve_main_texture() would hand the raw RenderingServer RID to the
+// device, which rejects the binding - and the caller retried the same snapshot every frame, so a
+// single dead pair produced an error per frame for the rest of the session. Fall back to the dummy
+// array instead; the caller re-publishes the current pair as soon as materials_dirty() reports the
+// snapshot was not accepted.
+void Terrain3DSurfaceBaker::_resolve_material_rd(const ResourceBundle &p_resources, RID &r_albedo_rd,
+		RID &r_normal_rd, const RID &p_albedo_array_rs, const RID &p_normal_array_rs) const {
+	RenderingServer *server = RenderingServer::get_singleton();
+	r_albedo_rd = server && p_albedo_array_rs.is_valid() ? server->texture_get_rd_texture(p_albedo_array_rs, true) : RID();
+	r_normal_rd = server && p_normal_array_rs.is_valid() ? server->texture_get_rd_texture(p_normal_array_rs, false) : RID();
+	if (!r_albedo_rd.is_valid()) {
+		const RID resolved = resolve_main_texture(p_albedo_array_rs, true);
+		r_albedo_rd = _rd->texture_is_valid(resolved) ? resolved : RID();
+	}
+	if (!r_normal_rd.is_valid()) {
+		const RID resolved = resolve_main_texture(p_normal_array_rs, false);
+		r_normal_rd = _rd->texture_is_valid(resolved) ? resolved : RID();
+	}
+	if (!r_albedo_rd.is_valid()) {
+		r_albedo_rd = p_resources.dummy_albedo_rd;
+	}
+	if (!r_normal_rd.is_valid()) {
+		r_normal_rd = p_resources.dummy_normal_rd;
+	}
+}
+
 bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 		const RID &p_albedo_array_rs, const RID &p_normal_array_rs) {
 	if (!_rd || !r_resources.shader.is_valid()) {
@@ -192,30 +232,9 @@ bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 		_rd->free_rid(r_resources.uniform_set);
 	}
 	r_resources.uniform_set = RID();
-	RenderingServer *server = RenderingServer::get_singleton();
-	RID albedo_rd = server && p_albedo_array_rs.is_valid() ? server->texture_get_rd_texture(p_albedo_array_rs, true) : RID();
-	RID normal_rd = server && p_normal_array_rs.is_valid() ? server->texture_get_rd_texture(p_normal_array_rs, false) : RID();
-	// A supplied array the device no longer owns is dead: Terrain3DAssets replaces the pair
-	// and frees the previous one, while a rebuild on the render thread can still hold that
-	// snapshot. resolve_main_texture() would hand the raw RenderingServer RID to the device,
-	// which rejects the binding - and the caller retried the same snapshot every frame, so a
-	// single dead pair produced an error per frame for the rest of the session. Fall back to
-	// the dummy array instead; the caller re-publishes the current pair as soon as
-	// materials_dirty() reports the snapshot was not accepted.
-	if (!albedo_rd.is_valid()) {
-		const RID resolved = resolve_main_texture(p_albedo_array_rs, true);
-		albedo_rd = _rd->texture_is_valid(resolved) ? resolved : RID();
-	}
-	if (!normal_rd.is_valid()) {
-		const RID resolved = resolve_main_texture(p_normal_array_rs, false);
-		normal_rd = _rd->texture_is_valid(resolved) ? resolved : RID();
-	}
-	if (!albedo_rd.is_valid()) {
-		albedo_rd = r_resources.dummy_albedo_rd;
-	}
-	if (!normal_rd.is_valid()) {
-		normal_rd = r_resources.dummy_normal_rd;
-	}
+	RID albedo_rd;
+	RID normal_rd;
+	_resolve_material_rd(r_resources, albedo_rd, normal_rd, p_albedo_array_rs, p_normal_array_rs);
 
 	TypedArray<Ref<RDUniform>> uniforms;
 	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,

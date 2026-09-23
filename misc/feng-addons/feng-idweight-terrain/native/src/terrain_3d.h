@@ -214,6 +214,26 @@ private:
 	// `debug_update_vt_clipmap()`; a group whose channel this build has no source for stays unbuilt,
 	// says so, and is reported by the return value rather than by a ring nobody can produce.
 	bool _setup_vt_clipmap(const TerrainVT::ChannelGroup p_group);
+	// The channels this build's ring can carry. One decision read twice - by `has_clipmap_source()`
+	// above and by the factory below - so the matrix's acceptance and the ring's construction cannot
+	// disagree, and adding a channel is one case here plus its source class. `None` is the answer for
+	// a group whose payload another path produces (the material group's baked arrays, today).
+	enum class ClipmapChannel {
+		None,
+		// The height channel: `R32F`, one height-map texel a ring texel.
+		Height,
+		// The material group: the packed `R16` surface payload, one payload texel a ring texel. The
+		// group's *baked* arrays are the baker's, so the ring carries the payload they are baked from
+		// and the fragment evaluates from it inside the band the ring serves.
+		Material,
+	};
+	ClipmapChannel _clipmap_channel(const TerrainVT::ChannelGroup p_group) const;
+	// The whole of what a channel group costs the assembly rule: one arm, naming the source that
+	// carries it, and nothing when this build has none. The ring's addressing, budget, strips,
+	// invalidation, reporting and the tick are channel-agnostic, so a new channel group is a
+	// `Terrain3DClipmapSource` subclass and a case above. Null while the instance has no data, which
+	// is a state the assembly rule retries rather than a capability the matrix reads.
+	std::unique_ptr<Terrain3DClipmapSource> _make_clipmap_source(const TerrainVT::ChannelGroup p_group) const;
 	// Gives the near field's coarse owner back to the shared pool. The two moments it stops being
 	// sampled are a deselection and a destruction, and both go through here so neither forgets.
 	void _release_avt_coarse_protections();
@@ -523,11 +543,19 @@ public:
 	// deliverable, being the fallback and the one method that is always correct. See
 	// docs/vt_delivery_assembly.md, "What a cell may name".
 	bool is_vt_delivery_supported(const int p_group, const int p_method) const;
-	// Whether the height group is delivered by the ring in either band, which is exactly the
-	// condition the generated shader carries the height arm under: a configuration whose height group
-	// is `Direct` in both bands compiles no ring code, binds no ring uniform and tests no branch, so
-	// a method nobody selected costs the Direct path nothing.
-	bool height_clipmap_arm() const { return _vt.delivery.group_uses(TerrainVT::ChannelGroup::Height, TerrainVT::Delivery::Clipmap); }
+	// Whether a channel group has a clipmap source in this build - which is the same question as
+	// "may a cell of this group name `Clipmap`", because the matrix's acceptance is read from here
+	// rather than from a table of its own. `_clipmap_channel()` is the registry, so "which source" and
+	// "is there one" cannot disagree: the day a group has a source its cells become writable
+	// everywhere at once (the dock's rows, both previews, the report and the setter), and until then
+	// the refusal names the group. It is a question about the *build* and not about an instance, so a
+	// cell is accepted - and a scene's stored cell kept - before a data resource exists.
+	bool has_clipmap_source(const int p_group) const;
+	// Whether a group is delivered by the ring in either band, which is exactly the condition the
+	// generated shader carries that group's arm under: a group that is `Direct` in both bands
+	// compiles no ring code, binds no ring uniform and tests no branch, so a method nobody selected
+	// costs the Direct path nothing.
+	bool clipmap_arm_used(const TerrainVT::ChannelGroup p_group) const { return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap); }
 	// Why the pair above is refused, in the sentence the setter logs, a panel shows and a test pins.
 	// Empty for a pair that is supported.
 	String get_vt_delivery_unsupported_reason(const int p_group, const int p_method) const;
@@ -782,10 +810,17 @@ public:
 	// Whether the generated shader carries a virtual-texture arm at all. A group that a service
 	// does not carry is sampled from the region arrays, and that arm contributes no code, no
 	// uniform and no sampler - so this is the single input to the material's variant choice and it
-	// must name every group that has an arm. It is the union of the two: the material group's paged
-	// arms and the height group's clipmap arm, so an all-`Direct` matrix stays the no-VT build and a
-	// height-only configuration still compiles the arm it asked for.
-	bool needs_vt_shader_arms() const { return group_has_vt_delivery(TerrainVT::ChannelGroup::Material) || height_clipmap_arm(); }
+	// must name every group that has an arm. It is the union over the groups, so an all-`Direct`
+	// matrix stays the no-VT build and a configuration with one arm still compiles the arm it asked
+	// for.
+	bool needs_vt_shader_arms() const {
+		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+			if (group_has_vt_delivery(TerrainVT::ChannelGroup(group))) {
+				return true;
+			}
+		}
+		return false;
+	}
 	// Drops the pages that carry a region's surface, so an edit is re-produced instead
 	// of being served stale from either virtual texture. While the editor preview is active
 	// an edit is only recorded and the refresh is deferred; p_force skips that, which a

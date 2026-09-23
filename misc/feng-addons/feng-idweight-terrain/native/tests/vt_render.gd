@@ -228,7 +228,12 @@ func run() -> void:
 	terrain.surface_vt_enabled = false
 	var restored := await frame_image()
 	var restored_class := sample_area(restored, probe)
-	require(restored_class == "g", "disabling the virtual texture should restore the array path")
+	# The class and the two cells are printed because this assertion is the one that races: the far
+	# field may resolve through the *shared* staging pool inside the six frames the frame waits, and
+	# that pool is where the pages blanked above were written - so a late SVT page renders the blank
+	# as well. `docs/vt_delivery_assembly.md` section 8.5 records the counts.
+	require(restored_class == "g", "disabling the virtual texture should restore the array path, got %s (near/material=%d far/material=%d)" % [
+			restored_class, int(terrain.get_vt_delivery(0, 0)), int(terrain.get_vt_delivery(1, 0))])
 	if not failed:
 		print("PASS surface vt disable restores the array path")
 

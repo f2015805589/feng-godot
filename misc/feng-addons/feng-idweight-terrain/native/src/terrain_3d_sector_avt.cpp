@@ -120,14 +120,15 @@ float Terrain3D::get_avt_anisotropy_request(const Camera3D *p_camera) const {
 // The number the shader and the demand footprint both use: the request above, clamped by what the
 // sampler delivers and by what the page gutter can sample. Two hard bounds and no policy - a
 // filtering footprint can neither take taps the viewport does not give it nor reach past the border
-// texels a page carries (a page asked for more samples its own rim instead; the gutter admits
-// `border - 0.5`). The shipped pair is a 9-texel gutter and an 8x request, and on a stock project
-// (4x filtering) the effective number is therefore 4, which is the fix for the grazing aliasing
-// described above. `avt_anisotropy`, `..._sampler`, `..._requested` and `..._effective` in
+// texels a page carries. With the mip selection holding the minor axis at about one texel, a ratio
+// of n spans about n texels along the major axis, so `n / 2 + 0.5 <= border`, i.e. the gutter admits
+// `2 * border - 1`. The shipped pair is a five-texel gutter and an 8x request, and on a stock
+// project (4x filtering) the effective number is therefore 4, which is the fix for the grazing
+// aliasing described above. `avt_anisotropy`, `..._sampler`, `..._requested` and `..._effective` in
 // `get_vt_settings()` are the readings a project checks to see which bound binds. See
 // docs/vt_sampling_review.md.
 float Terrain3D::get_avt_anisotropy(const Camera3D *p_camera) const {
-	const float supported = MAX(1.f, float(_vt.vt_page_border) - 0.5f);
+	const float supported = MAX(1.f, 2.f * float(_vt.vt_page_border) - 1.f);
 	return MIN(MIN(get_avt_anisotropy_request(p_camera), get_avt_anisotropy_sampler(p_camera)), supported);
 }
 

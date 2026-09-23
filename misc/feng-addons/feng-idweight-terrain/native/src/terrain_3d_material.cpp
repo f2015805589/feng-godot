@@ -43,21 +43,48 @@ void Terrain3DMaterial::_update_shader() {
 		}
 	} else {
 		code = _generate_shader_code();
-		// The variant's own two defines, in front of everything. A matrix with no non-`Direct` cell
-		// is the no-VT build; a matrix whose height group names the ring compiles the ring's arm,
-		// uniforms and samplers, and one whose height group is `Direct` in both bands compiles none
-		// of it - no branch, no binding, no code, which is what "a method nobody selected costs
-		// nothing" means on the shader side. The second cannot be defined with the first: a height
-		// cell on `Clipmap` is what makes `needs_vt_shader_arms()` true.
-		if (_needs_height_clipmap_arm()) {
-			code = "#define TERRAIN_HEIGHT_CLIPMAP\n" + code;
+		// The variant's own defines, in front of everything. A matrix with no non-`Direct` cell is
+		// the no-VT build; a matrix whose group names the ring compiles that group's arm, uniforms
+		// and samplers, and one whose group is `Direct` in both bands compiles none of it - no
+		// branch, no binding, no code, which is what "a method nobody selected costs nothing" means
+		// on the shader side. The ring's *uniforms* are one table every group indexes into
+		// (`CLIPMAP_GROUP_COUNT` groups of `CLIPMAP_MAX_LEVELS` levels, plus one atlas, one shape
+		// and one band mask per group), so the loop below is the whole of what a channel the ring
+		// gains costs the variant: one more `TERRAIN_CLIPMAP_<GROUP>` arm, and no second uniform set
+		// to keep in step. The two cannot be defined with the first: a group on `Clipmap` is what
+		// makes `needs_vt_shader_arms()` true.
+		String defines;
+		int arms = 0;
+		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+			if (!_needs_clipmap_arm(group)) {
+				continue;
+			}
+			const String name = String(TerrainVT::group_name(TerrainVT::ChannelGroup(group))).to_upper();
+			defines += "#define TERRAIN_CLIPMAP_" + name + "\n";
+			// The group's own index, so the arm names its entry in the shared table instead of
+			// assuming it is the only one.
+			defines += "#define CLIPMAP_GROUP_" + name + " " + String::num_int64(group) + "\n";
+			arms++;
+		}
+		if (arms > 0) {
+			defines += "#define TERRAIN_CLIPMAP\n";
+			defines += "#define CLIPMAP_GROUP_COUNT " + String::num_int64(TerrainVT::GROUP_COUNT) + "\n";
+			defines += "#define CLIPMAP_MAX_LEVELS " + String::num_int64(Terrain3DClipmap::MAX_LEVELS) + "\n";
+			// How many rects of one level a reader can be told about, which is the table the arm's
+			// per-fragment readiness gate indexes: one number for the ring's clamp and the shader's
+			// declaration, so a table shorter than the ring's answer is not expressible.
+			defines += "#define CLIPMAP_MAX_OUTSTANDING " +
+					String::num_int64(Terrain3DClipmap::MAX_OUTSTANDING_RECTS) + "\n";
 		}
 		if (!_needs_vt_shader()) {
-			code = "#define TERRAIN_NO_VT\n" + code;
+			defines += "#define TERRAIN_NO_VT\n";
 		}
+		code = defines + code;
 	}
 	_shader_uses_vt = _needs_vt_shader();
-	_shader_height_clipmap = _needs_height_clipmap_arm();
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		_shader_clipmap[group] = _needs_clipmap_arm(group);
+	}
 	_shader->set_code(_inject_editor_code(code));
 	RS->material_set_shader(_material, get_shader_rid());
 	LOG(DEBUG, "Material rid: ", _material, ", shader rid: ", get_shader_rid());
@@ -279,8 +306,8 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 		RS->material_set_param(p_material, "_surface_vt_atlas", _generated_dummy.get_rid());
 	}
 
-	// The height group's clipmap arm. Bound only while the generated code carries it, so a
-	// configuration whose height group is `Direct` in both bands binds no ring uniform at all - the
+	// The clipmap arm's uniforms. Bound only while the generated code carries some group's ring arm,
+	// so a configuration whose groups are `Direct` in both bands binds no ring uniform at all - the
 	// names would not exist in that variant.
 	_bind_vt_clipmap_uniforms(p_material);
 
@@ -442,34 +469,107 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	RS->material_set_param(p_material, "_texture_slope_params_array", asset_list->get_texture_slope_params());
 }
 
-// The height group's clipmap arm, in one place because it is bound twice: by the full uniform pass
-// when the material or the variant changes, and by `update_vt_clipmap_uniforms()` when the *ring*
+// The clipmap arm's uniforms, in one place because they are bound twice: by the full uniform pass
+// when the material or the variant changes, and by `update_vt_clipmap_uniforms()` when a *ring*
 // changed - which is per-level state that moves every tick a level is produced into, and therefore
 // deliberately not a reason to republish every VT uniform and the region tables with them.
 //
-// The ring's own numbers come from `get_vt_clipmap_arm()`, which is the CPU's addressing, so the
-// shader's level rule and the ring's cannot drift. The texture is the dummy (a blank array, height 0)
-// until the first level drains, which the `valid` gate covers: an invalid level is never read. The
-// two cells are bound even in the window before a ring exists, so a uniform never keeps the last
-// configuration's answer.
+// One table, indexed by group: `CLIPMAP_GROUP_COUNT` groups of `CLIPMAP_MAX_LEVELS` levels, which is
+// the shape the generated shader declares, plus one atlas, one shape and one band mask per group.
+// Every entry is bound on every call - a group with no ring gets the dummy array, zeroed levels and a
+// zero shape - so a uniform never keeps the last configuration's answer, and a channel the ring gains
+// needs no binding code of its own. The ring's own numbers come from `get_vt_clipmap_arm()`, which is
+// the CPU's addressing, so the shader's level rule and the ring's cannot drift.
 void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
-	if (!_shader_height_clipmap || _terrain == nullptr) {
+	if (_terrain == nullptr) {
 		return;
 	}
-	Dictionary arm = _terrain->get_vt_clipmap_arm(int(TerrainVT::ChannelGroup::Height));
-	RID atlas = arm.get("texture", RID());
-	RS->material_set_param(p_material, "_clipmap_atlas", atlas.is_valid() ? atlas : _generated_dummy.get_rid());
-	RS->material_set_param(p_material, "_clipmap_size", arm.get("size", 0));
-	RS->material_set_param(p_material, "_clipmap_level_count", arm.get("levels", 0));
-	RS->material_set_param(p_material, "_clipmap_base_world", arm.get("base_world", 0.0));
-	// Padded to the shader's declared array size by the accessor, so the tail is never unbound.
-	RS->material_set_param(p_material, "_clipmap_center", arm.get("centers", PackedVector2Array()));
-	RS->material_set_param(p_material, "_clipmap_ring", arm.get("rings", PackedVector2Array()));
-	RS->material_set_param(p_material, "_clipmap_level_valid", arm.get("valid", PackedFloat32Array()));
-	RS->material_set_param(p_material, "_clipmap_height_near",
-			_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Height)) == int(TerrainVT::Delivery::Clipmap));
-	RS->material_set_param(p_material, "_clipmap_height_far",
-			_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), int(TerrainVT::ChannelGroup::Height)) == int(TerrainVT::Delivery::Clipmap));
+	// A variant no group's arm is in declares none of these names, so there is nothing to fill: the
+	// whole table is skipped rather than built and thrown away.
+	bool armed = false;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		armed = armed || _shader_clipmap[group];
+	}
+	if (!armed) {
+		return;
+	}
+	Array atlases;
+	Array baked_albedos;
+	Array baked_normals;
+	Array baked_params;
+	PackedVector2Array centers;
+	PackedVector2Array rings;
+	PackedFloat32Array valid;
+	PackedVector4Array outstanding;
+	PackedInt32Array outstanding_counts;
+	PackedFloat32Array base_worlds;
+	PackedInt32Array sizes;
+	PackedInt32Array levels;
+	PackedInt32Array channels;
+	PackedInt32Array bands;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const Dictionary arm = _terrain->get_vt_clipmap_arm(group);
+		const RID atlas = arm.get("texture", RID());
+		atlases.push_back(atlas.is_valid() ? atlas : _generated_dummy.get_rid());
+		// The baked layers, when the ring's channel declares them: the three arrays the material arm
+		// samples where a level is baked. A group without them gets the dummy array, which is what a
+		// group whose arm never reads them samples - the same rule the atlas follows, so no name is
+		// ever left holding the previous configuration's texture.
+		const RID baked_albedo_rid = arm.get("baked_albedo", RID());
+		const RID baked_normal_rid = arm.get("baked_normal", RID());
+		const RID baked_params_rid = arm.get("baked_params", RID());
+		baked_albedos.push_back(baked_albedo_rid.is_valid() ? baked_albedo_rid : _generated_dummy.get_rid());
+		baked_normals.push_back(baked_normal_rid.is_valid() ? baked_normal_rid : _generated_dummy.get_rid());
+		baked_params.push_back(baked_params_rid.is_valid() ? baked_params_rid : _generated_dummy.get_rid());
+		const PackedVector2Array arm_centers = arm.get("centers", PackedVector2Array());
+		const PackedVector2Array arm_rings = arm.get("rings", PackedVector2Array());
+		const PackedFloat32Array arm_valid = arm.get("valid", PackedFloat32Array());
+		const PackedVector4Array arm_outstanding = arm.get("outstanding", PackedVector4Array());
+		const PackedInt32Array arm_outstanding_counts = arm.get("outstanding_counts", PackedInt32Array());
+		// Padded to the shader's declared table size by the accessor, so the tail is never unbound;
+		// the copy below is the same statement for a group whose arm dictionary is empty. The
+		// outstanding table is a row per level: every entry of a row is written, and a level with
+		// nothing outstanding publishes zeroes and a count of zero, so a stale rect can never be read.
+		for (int level = 0; level < Terrain3DClipmap::MAX_LEVELS; level++) {
+			centers.push_back(level < arm_centers.size() ? arm_centers[level] : Vector2());
+			rings.push_back(level < arm_rings.size() ? arm_rings[level] : Vector2());
+			valid.push_back(level < arm_valid.size() ? arm_valid[level] : 0.f);
+			outstanding_counts.push_back(level < arm_outstanding_counts.size() ? arm_outstanding_counts[level] : 0);
+			for (int index = 0; index < Terrain3DClipmap::MAX_OUTSTANDING_RECTS; index++) {
+				const int at = level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + index;
+				outstanding.push_back(at < arm_outstanding.size() ? arm_outstanding[at] : Vector4());
+			}
+		}
+		base_worlds.push_back(arm.get("base_world", 0.0));
+		sizes.push_back(int(arm.get("size", 0)));
+		levels.push_back(int(arm.get("levels", 0)));
+		channels.push_back(MAX(1, int(arm.get("channels", 1))));
+		// The two cells' claim about *this* group, as one mask: bit 0 the near band, bit 1 the far
+		// one. The band is reach rather than capability, so it can move without a shader rebuild and
+		// is therefore a uniform and not a define.
+		int band = 0;
+		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), group) == int(TerrainVT::Delivery::Clipmap)) {
+			band |= 1;
+		}
+		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), group) == int(TerrainVT::Delivery::Clipmap)) {
+			band |= 2;
+		}
+		bands.push_back(band);
+	}
+	RS->material_set_param(p_material, "_clipmap_atlas", atlases);
+	RS->material_set_param(p_material, "_clipmap_baked_albedo", baked_albedos);
+	RS->material_set_param(p_material, "_clipmap_baked_normal", baked_normals);
+	RS->material_set_param(p_material, "_clipmap_baked_params", baked_params);
+	RS->material_set_param(p_material, "_clipmap_center", centers);
+	RS->material_set_param(p_material, "_clipmap_ring", rings);
+	RS->material_set_param(p_material, "_clipmap_level_valid", valid);
+	RS->material_set_param(p_material, "_clipmap_outstanding", outstanding);
+	RS->material_set_param(p_material, "_clipmap_outstanding_count", outstanding_counts);
+	RS->material_set_param(p_material, "_clipmap_base_world", base_worlds);
+	RS->material_set_param(p_material, "_clipmap_size", sizes);
+	RS->material_set_param(p_material, "_clipmap_level_count", levels);
+	RS->material_set_param(p_material, "_clipmap_channels", channels);
+	RS->material_set_param(p_material, "_clipmap_band", bands);
 }
 
 void Terrain3DMaterial::update_vt_clipmap_uniforms() {

@@ -84,6 +84,10 @@ func run() -> void:
 		bounded_elapsed += Time.get_ticks_usec() - start
 		await process_frame
 	print("VT_SECTORS_PERF camera_range_sectors=", bounded.visible_sectors, " camera_range_moving_ms=", float(bounded_elapsed) / 20000.0)
+	# Enabling VT delivery turns this node's own tick back on (`terrain_3d_surface_views.cpp`), so
+	# stop it before the camera goes: a tick with the camera freed cannot find a clipmap target and
+	# the engine logs that as an error, which the runner counts against the test.
+	terrain.set_physics_process(false)
 	scene.queue_free()
 	camera.queue_free()
 	await process_frame

@@ -133,6 +133,9 @@ Terrain3DSurfaceBaker::~Terrain3DSurfaceBaker() {
 void Terrain3DSurfaceBaker::clear() {
 	std::vector<ResourceBundle> doomed;
 	RenderingDevice *resource_rd = nullptr;
+	// Before the lock and before `_rd` is dropped: the ring's descriptor set is a device object like
+	// the bundles' are, and it is released while the device is still known.
+	_free_ring_bake();
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		resource_rd = _rd;

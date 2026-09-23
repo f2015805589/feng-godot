@@ -559,13 +559,20 @@ struct Terrain3DVTState {
 	// Channel texels produced by all rings in the tick that just ran.
 	int clipmap_produced_texels = 0;
 	int vt_page_size = 256;
-	// The page gutter, in texels each side. Four was the shipped value while the near field's
-	// anisotropy was capped by this same number - a gutter of n supports n - 0.5, so four admitted
-	// 3.5x and silently reduced every larger request, whatever the viewport asked for. Nine admits
-	// the 8x the near field requests by default (`surface_vt_anisotropy`), which is what a grazing
-	// view needs. A stored page is `page_size + 2 * border`, so this is 7.7% more texels a page
-	// than four was, and both views share the number: see docs/vt_sampling_review.md.
-	int vt_page_border = 9;
+	// The page gutter, in texels each side. It is a *bound*, not a policy: a page asked for more
+	// anisotropy than its border can sample reads its own rim instead of the neighbouring ground,
+	// which is why `get_avt_anisotropy()` is the request clamped by this number and the two places
+	// that used to spell the rule separately now ask that one function.
+	//
+	// The arithmetic is the anisotropic kernel's own. With the mip selection holding the minor axis
+	// at about one texel, a ratio of n spans about n texels along the major axis, so its half-extent
+	// is n / 2 and bilinear filtering adds half a texel: `n <= 2 * border - 1`. Five therefore
+	// admits the 8x the near field requests by default (`surface_vt_anisotropy`), at
+	// `page_size + 2 * border` = 266 stored texels a side. Nine - the value this replaces - was
+	// derived from `border - 0.5` and so bought a bound (17x) three times larger than any request
+	// the setting can name, for 7.7% more texels on every page of both views. See
+	// docs/vt_sampling_review.md.
+	int vt_page_border = 5;
 	int vt_page_count = 256;
 	// The capacity already published, the rebuild generation and the growth handshake, as one
 	// owner: a capacity change only reaches the two views through the generation. See
@@ -605,6 +612,12 @@ struct Terrain3DVTState {
 	uint64_t vt_service_frame = UINT64_MAX;
 	bool vt_shared_ready = false;
 	bool vt_materials_dirty = true;
+	// Whether a material list has been asked for on behalf of a *ring* already. `_setup_vt_clipmap()`
+	// runs on every write to the matrix, and a ring that declares baked layers needs the list published
+	// even when no cell takes a page - but asking again is not free: the service answers a publish by
+	// telling every ring its baked layers are stale, which queues a whole level per ring. This is what
+	// makes that need a first-time one.
+	bool vt_materials_published = false;
 	bool vt_callback_registered = false;
 	// Warn once when the engine build has no virtual texture update callback: without it the
 	// material page producer never runs, and every page-dependent test would fail with no
@@ -658,13 +671,12 @@ struct Terrain3DVTState {
 	int surface_vt_page_size = 256;
 	// Mirrors `vt_page_border`; the setter syncs all three unless the debug direct-material path
 	// keeps them apart.
-	int surface_vt_page_border = 9;
+	int surface_vt_page_border = 5;
 	// The near field's requested anisotropic filtering, as a multiplier: 0 follows the viewport's
 	// level, any other value is the request. The gutter is the physical bound - a filtering
 	// footprint cannot reach past the border texels a page carries - so the number the shader and
 	// the CPU footprint both use is `get_avt_anisotropy()`, which is this request clamped by
-	// `vt_page_border - 0.5`, and the two places that used to spell the rule separately now ask
-	// that one function. Eight is the default because it is what the default gutter admits.
+	// `2 * vt_page_border - 1`. Eight is the default because it is what the default gutter admits.
 	int surface_vt_anisotropy = 8;
 	// Sector virtual-image resolution tiers; this does not truncate local page-table mips.
 	int surface_vt_mip_levels = 3;
@@ -854,9 +866,9 @@ struct Terrain3DVTState {
 	int surface_svt_page_size = 256;
 	// Mirrors `vt_page_border`, which both views share. The far field samples with a plain
 	// `textureLod` (no gradients, no anisotropy), so the gutter it carries is for its own mip
-	// transitions rather than for a filtering footprint - see docs/vt_sampling_review.md for why
-	// the shared number moved to nine and what that costs the far field's pages.
-	int surface_svt_page_border = 9;
+	// transitions rather than for a filtering footprint - see docs/vt_sampling_review.md for the
+	// shared bound and what a page's border costs both views.
+	int surface_svt_page_border = 5;
 	int surface_svt_page_count = 256;
 	// -1 means auto: the coarsest level the world grid can publish.
 	int surface_svt_max_mip = -1;

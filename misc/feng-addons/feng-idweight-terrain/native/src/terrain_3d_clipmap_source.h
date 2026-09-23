@@ -15,6 +15,7 @@
 // putting a virtual call in the innermost loop. The clipmap still decides where every value lands,
 // because only it knows the ring - the source never sees a physical index.
 
+#include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 
@@ -49,6 +50,24 @@ public:
 
 	// What this source carries, for the dock and the reports: "height", "material", ...
 	virtual String get_source_name() const = 0;
+
+	// The shape of one value: how many scalars a texel holds (one texture array layer each) and
+	// one value's format. It is the whole of what the *mechanism* has to be told about a channel:
+	// the ring publishes `levels * channels` layers of `format`, and nothing else in it depends on
+	// what the values mean. Declaring the shape here rather than writing it into the owner is what
+	// makes a second channel group a source and a line in the owner's factory instead of a shape
+	// the assembly rule has to know.
+	virtual int get_channel_count() const = 0;
+	virtual Image::Format get_format() const = 0;
+
+	// And what a *producer* bakes out of the channel's texels, if anything: this many arrays of
+	// `get_baked_format()`, one layer per level, written by a pass rather than by a row filler. Zero
+	// - the height channel's answer - means the ring is only what `fill_row()` produces. A value that
+	// needs several components of its own is not a wider ring: it is a baked channel, and this is
+	// where a channel says it has one. The material channel's three arrays (diffuse and height, an
+	// octahedral normal and roughness, the parameters) are what the bake shader writes.
+	virtual int get_baked_channel_count() const { return 0; }
+	virtual Image::Format get_baked_format() const { return Image::FORMAT_RGBAH; }
 };
 
 #endif // TERRAIN3D_CLIPMAP_SOURCE_H

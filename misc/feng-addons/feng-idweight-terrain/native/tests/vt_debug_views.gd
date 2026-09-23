@@ -202,10 +202,11 @@ func check_dock_order() -> void:
 	require(not bool(control.call("is_available")),
 			"and it must report itself unavailable while no ring exists")
 	# The panel's own half of the acceptance rule: the height row offers the two methods the channel
-	# has (Direct and the ring) and disables the other two, while the diffuse+normal row disables only
-	# Clipmap - which is the asymmetry as a user sees it, read from the widget a click would hit. The
-	# window in this harness is never shown, so its periodic refresh never runs; `open_vt_page_view()`
-	# is the public entry that refreshes it.
+	# has (Direct and the ring) and disables the other two, while the diffuse+normal row offers all
+	# four - the ring carries that group's `R16` control payload, and AVT/SVT page it - which is the
+	# asymmetry as a user sees it, read from the widget a click would hit. The window in this harness is
+	# never shown, so its periodic refresh never runs; `open_vt_page_view()` is the public entry that
+	# refreshes it.
 	window.call("open_vt_page_view")
 	await process_frame
 	var height_row: OptionButton = window.delivery_near_height
@@ -219,11 +220,14 @@ func check_dock_order() -> void:
 	require(height_row.is_item_disabled(height_row.get_item_index(AVT)) and
 			height_row.is_item_disabled(height_row.get_item_index(SVT)),
 			"and disable AVT and SVT, neither of which is a method the height channel has")
-	require(material_row.is_item_disabled(material_row.get_item_index(CLIPMAP)),
-			"the diffuse+normal row disables Clipmap too, having no source for that channel")
+	require(not material_row.is_item_disabled(material_row.get_item_index(CLIPMAP)),
+			"the diffuse+normal row offers Clipmap as well: the ring has a source for that channel")
 	require(not material_row.is_item_disabled(material_row.get_item_index(AVT)) and
 			not material_row.is_item_disabled(material_row.get_item_index(SVT)),
-			"while AVT and SVT stay available there: the same method is offered or refused per group")
+			"and AVT and SVT stay available there: the same method is offered or refused per group")
+	var clipmap_reason: String = height_row.get_item_tooltip(height_row.get_item_index(CLIPMAP))
+	require(clipmap_reason.is_empty(),
+			"an item this build can deliver carries no refusal as its tooltip: %s" % clipmap_reason)
 	var svt_reason: String = height_row.get_item_tooltip(height_row.get_item_index(SVT))
 	require(svt_reason.contains("AVT and SVT page the diffuse+normal group"),
 			"and a disabled item carries the reason as its tooltip: %s" % svt_reason)

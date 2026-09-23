@@ -87,7 +87,7 @@ void Terrain3DMaterial::update(uint32_t p_flags) {
 	// rebuild rather than a uniform rebind.
 	if ((p_flags & (FULL_REBUILD & ~UPDATE_ARRAYS)) ||
 			_shader_uses_vt != _needs_vt_shader() ||
-			_shader_height_clipmap != _needs_height_clipmap_arm()) {
+			_clipmap_arm_changed()) {
 		_update_shader();
 	}
 	if (_terrain && (p_flags & TEXTURE_ARRAYS)) { _terrain->invalidate_vt_materials(); }

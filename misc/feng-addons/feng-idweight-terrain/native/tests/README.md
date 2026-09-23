@@ -289,9 +289,29 @@ step, before any terrain code runs, so it is an environment fault rather than a
 regression.
 
 A test only passes when its process exits 0, its required `PASS` marker is
-present **and** its log contains no `ERROR:` line at all. That last rule is why
-a run can print every assertion as passing and still be reported as a failure:
-read the `ERROR:` lines under it.
+present **and** its log contains no `ERROR:` line at all - with one exemption.
+The engine asks the OS for its certificate store while it starts and prints
+`ERROR: Failed to read the root certificate store.` once per launch on a machine
+where that read fails. It describes the machine, not the test, but the runners
+count `ERROR:` lines and return nonzero when they see one, so before this
+exemption existed the line failed every test in the suite at once.
+`fixture.ENVIRONMENTAL_ERRORS` names it, `fixture.log_errors()` and
+`fixture.is_environmental_error()` exclude it, the runners use them for both their
+count and their printed lines, and `run_all.py` uses them too. Every other
+`ERROR:` line stays fatal, and because of that rule a run can print every
+assertion as passing and still be reported as a failure: read the `ERROR:` lines
+under it.
+
+Tearing a test down is part of the contract. Enabling VT delivery turns the
+terrain node's own tick back on (`terrain_3d_surface_views.cpp`), so a test that
+frees its camera while the terrain is still alive gets one more physics tick, that
+tick finds no camera, and `_grab_camera()` logs
+`ERROR: ... Cannot find clipmap target or active camera.` - a real error line,
+counted against an otherwise green test. Call `terrain.set_physics_process(false)`
+before freeing the scene and the camera; `vt_navigation.gd`, `vt_rotation.gd`,
+`vt_sectors.gd` and `vt_sectors_scale.gd` do, and `vt_transition_parent.gd` always
+did. Before this, `vt_adaptive:navigation` was red on that line alone: both of its
+own assertions passed.
 
 Comparing runs: keep the `--json` output of the run before your change and diff
 the statuses. Several tests are red in this checkout (legacy region-AVT page
@@ -327,6 +347,24 @@ def main() -> int:
         fixture_prefix="terrain-vtnew-", project_name="VT new tests", log_name="vtnew.log",
         script="vt_new.gd", marker="PASS virtual texture new behaviour")
 ```
+
+Three conventions a VT script test has to state rather than inherit, each one found by a test that
+did not:
+
+* **The strict miss is a setting now.** `surface_vt_feedback` is the shader's coarse-recovery switch
+  and ships **on** (`vt_reference_avt_alignment.md`: a missing fine page then resolves at the next
+  resident level). A test that pins the missing-page diagnostic - `vt_filtering`,
+  `vt_transition_parent`, `vt_strict_coverage`, or the grazing probe in `vt_anisotropy` - has to set
+  `terrain.surface_vt_feedback = false` itself.
+* **Manual passes need the node's own tick off.** Enabling VT delivery turns
+  `set_physics_process(true)` back on (`terrain_3d_surface_views.cpp`), and that tick runs the
+  engine's demand pass during any awaited frame - producing the page a one-shot manual call is about
+  to ask for, so the call correctly returns 0. Call `terrain.set_physics_process(false)` *after*
+  enabling the view.
+* **World levels are the coarse owner's mips.** `avt_coarse_owner()` is `Vector2i(INT32_MIN,
+  INT32_MIN)`, and `request_page(owner, level, x, y)` addresses `block >> level` pages an axis on it.
+  There is no per-level owner key; the probe in `vt_filtering` is the one that shows the shape, and it
+  prints what it found (`VT_FILTERING_WORLD_PROBE`).
 
 Two rules the harness enforces, both learned the hard way: a test only passes
 when the log has **no `ERROR:` line at all** (an engine error fails the run even
@@ -1212,6 +1250,43 @@ mip from following page residency — the regression this covers:
 `vt_svt_coverage_runner.py` keeps covering the persisted-material side (auto-bake repair of newly
 required levels over 144 regions with an eight-slot pool).
 
+## Near-field delivered density
+
+```powershell
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_near_density_runner.py --driver d3d12
+```
+
+The sector AVT can address up to `surface_vt_texels_per_meter` (1024 by default), but a fragment gets the
+finest *resident* page of the cell it lands in, and that is what this test measures: the tier and block
+the scan hands each visible sector (`get_avt_layout_preview`), the plan's page selection by local mip
+(`avt_sector_stats.plan_level_mips`), and the world footprint of every ready fine page.
+
+The view is a 1.7 m eye looking 8 degrees down over blank 64 m regions at 1920x1080, with the shipped
+defaults (256-texel pages, 1024 texels/m, three tiers, 384 m reach, auto capacity, far field off so the
+near field is what is measured). The assertions are the contract: the plan must request half-metre pages
+or finer, a settled view must hold a 512 texels/m page or finer within 8 m of the camera, at least 64
+ready pages at 256+ texels/m must sit within 24 m, the outer cells must keep at least 40 ready pages of
+their own, the dense fallback tier must be complete, and a settled view must owe no page.
+
+Written against the span-breadth-first selection it replaced: that order spent the same 496 resident
+pages uniformly down to one world size, held nothing finer than a metre, and left the ground two metres
+from the camera at 256 texels/m. See `docs/avt_addressing_redesign.md`, "Superseded: the queue is
+ordered by demand deficit".
+
+The test ends with an end-to-end reading rather than another counter: it moves the camera 100 m in XZ,
+switches to a narrow orthographic pose (0.5 m over 1080 rows, so the pixel footprint is below the page's
+own texel and no fractional mip blend can mix a coarser page in) and binds a synthetic material array
+whose finest page under the camera is green and every other page red. The rendered pixel must be that
+page, which is what separates "the density is resident" from "the image is drawn from it", and that page
+must be 512 texels/m or finer because a pose change has to re-plan.
+
+That phase drives the pose through the terrain's own process/physics callbacks on purpose. Its first
+version called `update_surface_vt()` by hand many times inside one frame and read a stale plan: the
+plan's refresh interval is counted in process frames, so ticking by hand measures the interval and not
+the product. The callbacks re-derive the pose's own selection (`chain_ticks` +1, the narrow histogram)
+and land the page. See `docs/avt_addressing_redesign.md`, "A pose change re-plans, and how that was
+nearly mis-read".
+
 ## AVT material pages and persisted SVT
 
 ```powershell
@@ -1330,14 +1405,42 @@ undeliverable writes, the mechanism's entry and restored, asserting what each st
 reads the live service pointers, the material's own verdict on the shader it generated
 (`is_shader_using_vt()`) and the published booleans (`avt_service`/`svt_service`/`clipmap_service`,
 `clipmap_ring`, `delivery_supported`/`delivery_unsupported`), never a frame time, because the claim
-is about what *exists*. The acceptance rule is the matrix's other half here: `near/height = Clipmap`,
-`far/height = AVT` and `far/material = Clipmap` are written in one step and every cell keeps the
-method it had, because a method this build cannot deliver for that group is refused rather than
-stored (the height channel's choices are `Direct` and the ring; the material channel has no clipmap
-source yet).
+is about what *exists*. The acceptance rule is the matrix's other half here: `near/height = Clipmap`
+and `near/material = Clipmap` are both accepted (each channel has a ring source and the cell compiles
+that channel's arm), while `far/height = AVT` keeps the method it had, because a method this build
+cannot deliver for that group is refused rather than stored - the height channel's choices are `Direct`
+and the ring, and `AVT`/`SVT` page the material group. The refusals are read from
+`has_clipmap_source()`/`is_vt_delivery_supported()` and from the published
+`delivery_supported`/`delivery_unsupported`, so the test pins the registry that decides them. The
+material cell then goes through the assembly block: its ring is configured, its `source` reads
+`material`, and its `shader_arm` is in the generated variant while the height ring's is out - which is
+the two arms moving independently.
 
-`vt_clipmap` is the ring's own test, and it **no cell selects anything**: this build refuses
-`Clipmap` for the height group, so the ring is built and stepped by
+`vt_clipmap_render` is the *arm's* half of that: a camera whose visible square is inside the ring's own
+coverage, and one reading per claim - an all-`Direct` matrix compiles no ring code at all, selecting the
+height cell compiles the arm and a ring at the height grid's own density renders pixel-identical to the
+array (a coarser one does not), `Near/Material = Clipmap` does the same for the material arm on the
+payload's density, and an editor stroke falls back to the array until the rect has drained and then
+agrees again. Its material block ends with the ring's **baked layers**, which need the far field up
+(the bake is the shared producer's pass, and a ring owns none): the far field is settled, its resident
+root level read out of the report and pinned through its own distance table, and the ring configured to
+that same density - after which the ring's three `RGBA16F` layers are baked from the ring's own texels,
+the producer's dispatch-and-mark handshake is read off the level report (`baked`, `pending_bake_rects`),
+the arm's readiness table is read back from the material, and the two producers' renders are compared: the mean
+channel difference is under half a step of an 8-bit image with three of 76 800 pixels differing visibly
+(a shadow terminator), while the array's own picture - the per-fragment evaluation - differs on four
+fifths of the frame. The block then reads the bake's **grain**: one texel of focus movement bakes 192
+channel texels, one column strip of a 64-texel level, where the level's square is 12 288 - and an editor
+material stroke re-bakes the rect it covers (asserted to be smaller than the level) rather than the ring.
+It ends by writing the arm's readiness table itself: with one rect the camera cannot see added, the
+render is **unchanged** (0 pixels - a rect the fragment's taps miss costs nothing); with one rect
+covering the level, the band reads the array and the picture becomes a different material (mean channel
+difference 0.069, 51 556 pixels); and binding the ring's own answer again returns the baked one exactly.
+The block's last reading walks the focus a texel every two frames: the bakes are then acknowledged with
+no refusals at all, where a lease taken from the level instead of from the rect was measured to
+acknowledge nothing while moving. See `docs/vt_delivery_assembly.md` sections 8.7 and 8.8.
+
+`vt_clipmap` is the ring's own test, and it **selects nothing**: the ring is built and stepped by
 `Terrain3D::debug_update_vt_clipmap()` - the same `Terrain3DClipmap::update()`, focus and budget the
 tick's clipmap phase runs - on a one-level ring of 16 texels an axis over 16 m, i.e. one texel a
 metre, so every production number is exact. It pins the shape and snap from the level reports, the
@@ -1347,8 +1450,10 @@ budget (with `vt_clipmap_budget_texels = 4` one tick produces exactly 4 and queu
 drain the level, and the level uploads once), the content (every texel centre is read back through
 `Terrain3D::sample_vt_clipmap()` and compared against `Terrain3DData.get_pixel()` at the same world
 position, plus a level built out of eight strips versus the same level rebuilt whole), and the
-refusal itself (a terrain whose only `Clipmap` write was refused owns no ring, produces nothing and
-answers a sample with `NAN`). See `docs/vt_delivery_assembly.md` section 8.2 for the readings.
+refusal itself (the height group's `AVT` write, whose channel has no paged arm, keeps its method, owns
+no ring, produces nothing and answers a sample with `NAN`), and that the mechanism's own entry builds
+either channel's ring with no cell claiming the method. See `docs/vt_delivery_assembly.md` section 8.2
+for the readings.
 
 `vt_debug_views` is the editor-facing half: the order the matrix is read in (the native `Surface VT`
 subgroups straight from `get_property_list()` - `VT Setting` with the delivery matrix first inside

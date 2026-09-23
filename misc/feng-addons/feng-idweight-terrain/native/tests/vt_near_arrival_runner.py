@@ -16,7 +16,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, run_with_offscreen_window, write_fixture
+from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, write_fixture
 
 
 DEFAULT_FIXTURE = ROOT / "bin" / "terrain-project-lifetime-ke6fwkn0"
@@ -60,8 +60,8 @@ def main() -> int:
     parser.add_argument(
         "--project",
         type=Path,
-        default=None,
-        help="read-only project or fixture to copy; defaults to the prepared bin fixture",
+        default=ROOT.parent / "project" / "test-1",
+        help="read-only project to copy; defaults to the same real project vt_strict_coverage uses",
     )
     parser.add_argument(
         "--existing-fixture",
@@ -82,7 +82,13 @@ def main() -> int:
 
     if args.project is not None and args.existing_fixture is not None:
         parser.error("use either --project or --existing-fixture, not both")
-    source = (args.existing_fixture or args.project or DEFAULT_FIXTURE).resolve()
+    # `DEFAULT_FIXTURE` below is a leftover from `vt_project_lifetime_probe.py`, whose directory name
+    # carries a random suffix (`mkdtemp(prefix="terrain-project-lifetime-")`). Pinning that exact name
+    # as the default meant the runner exited 2 in 0.1 s - with no `PASS`, `REGRESSION` or `ERROR:` line
+    # for `run_all.py` to report - as soon as `run_all.py --prune` removed the leftover, which is what
+    # the pruner exists to do. The default is the real project the sibling real-scene runner copies;
+    # `--existing-fixture` still selects a prepared fixture.
+    source = (args.existing_fixture or args.project).resolve()
     if not source.is_dir():
         parser.error(f"read-only source project does not exist: {source}")
 
@@ -160,10 +166,10 @@ def main() -> int:
             )
 
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     report_path: Path | None = None
     for line in output.splitlines():
-        if line.startswith(("VT_NEAR", "REGRESSION", "SCRIPT ERROR:", "ERROR:", "PASS ")):
+        if line.startswith(("VT_NEAR", "REGRESSION", "SCRIPT ERROR:", "ERROR:", "PASS ")) and not is_environmental_error(line):
             print(line)
         if line.startswith("VT_NEAR_REPORT path="):
             report_path = Path(line.split("=", 1)[1].strip())

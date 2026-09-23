@@ -966,18 +966,20 @@ func _clipmap_hint_text(p_settings: Dictionary) -> String:
 func _on_clipmap_setting_changed(p_value: float, p_key: String) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	if not _has_object_property(terrain, &"vt_clipmap_%s" % p_key):
-		return
-	var method := {
-		"size": "set_vt_clipmap_size",
-		"levels": "set_vt_clipmap_levels",
-		"base_world": "set_vt_clipmap_base_world",
-		"budget": "set_vt_clipmap_budget_texels",
-	}.get(p_key, "")
-	if method.is_empty():
+	# The property the write is addressed by and the setter it calls, in one entry, because the two have
+	# to name the same setting: the budget's property carries the `_texels` suffix its setter does, which
+	# a `"vt_clipmap_%s" % p_key` probe cannot know - so the budget control used to be refused here and
+	# never reached the terrain at all.
+	var setting: Array = {
+		"size": ["vt_clipmap_size", "set_vt_clipmap_size"],
+		"levels": ["vt_clipmap_levels", "set_vt_clipmap_levels"],
+		"base_world": ["vt_clipmap_base_world", "set_vt_clipmap_base_world"],
+		"budget": ["vt_clipmap_budget_texels", "set_vt_clipmap_budget_texels"],
+	}.get(p_key, [])
+	if setting.is_empty() or not _has_object_property(terrain, setting[0]):
 		return
 	var argument: Variant = p_value if p_key == "base_world" else int(round(p_value))
-	_call(terrain, method, [argument])
+	_call(terrain, setting[1], [argument])
 	_refresh_header()
 	_refresh_settings_controls()
 

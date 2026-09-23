@@ -64,6 +64,20 @@ inline constexpr int DELIVERY_COUNT = 4;
 inline constexpr int TIER_COUNT = 2;
 inline constexpr int GROUP_COUNT = 2;
 
+// The group's name as a *key*: the report's `delivery_supported`, `delivery_unsupported` and
+// `clipmap` dictionaries are keyed by it, the dock and the tests read those keys, and the shader's
+// per-group defines are spelled from it. One spelling, so a group cannot be "material" in one place
+// and "Material" in another.
+inline const char *group_name(const ChannelGroup p_group) {
+	return p_group == ChannelGroup::Material ? "material" : "height";
+}
+
+// The group as the *channel* a refusal sentence names: what reaches a fragment. Spelled apart from
+// `group_name()` because a user-facing sentence and a dictionary key are different questions.
+inline const char *group_channel_name(const ChannelGroup p_group) {
+	return p_group == ChannelGroup::Material ? "diffuse+normal" : "height";
+}
+
 // The stored form is the API; a value outside the range is refused rather than clamped, so
 // a caller that hands over a stale number is told instead of silently given `Direct`.
 inline bool is_valid_delivery(const int p_delivery) {

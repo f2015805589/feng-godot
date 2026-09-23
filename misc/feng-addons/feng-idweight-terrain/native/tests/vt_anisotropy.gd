@@ -7,7 +7,7 @@ extends "res://vt_adaptive_base.gd"
 # the number of taps the sampler really has.
 #
 # That number is the point of this file. `get_avt_anisotropy()` used to be the terrain's request
-# clamped only by the page gutter, and the shipped pair - a nine-texel gutter and an eight-times
+# clamped only by the page gutter, and the shipped pair - a five-texel gutter and an eight-times
 # request - made it 8. But Godot builds a material sampler per *viewport* with
 # `anisotropy_max = 1 << level` and there is no per-material anisotropy, so on a stock project
 # (4x) the shader was selecting mips for taps that no fragment gets. This file pins the rule that
@@ -17,10 +17,12 @@ const REGION := Vector2i.ZERO
 const TARGET := Vector3(34.0, 0.0, 34.0)
 const TARGET_XZ := Vector2(34.0, 34.0)
 const PAGE_SIZE := 32
-# The shipped gutter. It admits `9 - 0.5 = 8.5`, so what caps the assumed anisotropy here is the
-# sampler's own 4x and not the page - which is the pair a project gets and the pair the grazing
-# measurement at the end of this file is about.
-const PAGE_BORDER := 9
+# The shipped gutter. A ratio of n spans about n texels along the major axis and bilinear adds half
+# a texel, so the gutter admits `2 * border - 1`; five texels therefore admit `9`, which is above the
+# 8x the near field requests by default - so what caps the assumed anisotropy here is the sampler's
+# own 4x and not the page, which is the pair a project gets and the pair the grazing measurement at
+# the end of this file is about.
+const PAGE_BORDER := 5
 const DENSITY := 8.0
 const EXPECTED_BLOCK_SIZE := 16
 const CAMERA_SIZE := 16.0
@@ -67,7 +69,7 @@ func footprint_metrics(anisotropy: float) -> Dictionary:
 	var major := sqrt(maxf(0.5 * (a + c + sqrt(discriminant)), 1e-16))
 	var minor := absf(dx.x * dy.y - dx.y * dy.x) / major
 	var scalar := maxf(dx.length(), dy.length())
-	var supported := maxf(1.0, float(PAGE_BORDER) - 0.5)
+	var supported := maxf(1.0, 2.0 * float(PAGE_BORDER) - 1.0)
 	var capped := maxf(minor, major / minf(maxf(1.0, anisotropy), supported))
 	return {
 		"dx": dx,
@@ -228,7 +230,7 @@ func run() -> void:
 	terrain.vt_page_size = PAGE_SIZE
 	# Read while the instance still holds its defaults: the pair a project that changes nothing
 	# gets, and the reason the grazing case below no longer describes the shipped behaviour.
-	require(terrain.vt_page_border == 9,
+	require(terrain.vt_page_border == 5,
 			"the shipped gutter must admit the near field's 8x default, got %d" % terrain.vt_page_border)
 	require(terrain.surface_vt_anisotropy == 8,
 			"the near field must request 8x anisotropy by default, got %d" % terrain.surface_vt_anisotropy)
@@ -277,31 +279,31 @@ func run() -> void:
 	#    per-material anisotropy, so a terrain request above it is a wish the hardware never
 	#    implements. Believing the wish selects a page two times finer than the sampler can cover -
 	#    see the grazing measurement at the end of this file.
-	# 2. the page gutter, `border - 0.5`, unchanged.
-	terrain.vt_page_border = 9
+	# 2. the page gutter, `2 * border - 1`, unchanged.
+	terrain.vt_page_border = 5
 	root.get_viewport().set_anisotropic_filtering_level(2) # Viewport.ANISOTROPY_4X
 	var shipped: Dictionary = terrain.get_vt_settings()
 	var shipped_sampler := float(shipped.get("avt_anisotropy_sampler", 0.0))
 	var shipped_requested := float(shipped.get("avt_anisotropy_requested", 0.0))
 	var shipped_anisotropy := float(shipped.get("avt_anisotropy_effective", 0.0))
 	print("VT_ANISO_SHIPPED sampler=", shipped_sampler, " requested=", shipped_requested,
-			" effective=", shipped_anisotropy, " border=9 viewport_level=2")
+			" effective=", shipped_anisotropy, " border=5 viewport_level=2")
 	require(shipped_sampler == 4.0,
 			"the sampler reading must be the viewport's filtering level (4x here), got %.2f" % shipped_sampler)
 	require(shipped_requested == 8.0,
 			"the near field must request 8x anisotropy by default, got %.2f" % shipped_requested)
-	require(is_equal_approx(shipped_anisotropy, minf(minf(shipped_requested, shipped_sampler), 8.5)),
+	require(is_equal_approx(shipped_anisotropy, minf(minf(shipped_requested, shipped_sampler), 9.0)),
 			"the effective anisotropy must be the request clamped by the sampler and by the gutter, got %.2f" % shipped_anisotropy)
 	# The bound is live in both directions: raising the viewport's filtering level raises the number
 	# the shader may assume, up to the request, and a gutter narrower than the request still caps it.
 	root.get_viewport().set_anisotropic_filtering_level(3) # Viewport.ANISOTROPY_8X
 	var raised := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
 	require(is_equal_approx(raised, 8.0),
-			"an 8x viewport must let the 8x request through a nine-texel gutter, got %.2f" % raised)
+			"an 8x viewport must let the 8x request through a five-texel gutter, got %.2f" % raised)
 	terrain.vt_page_border = 4
 	var gutter_capped := float(terrain.get_vt_settings().get("avt_anisotropy_effective", 0.0))
-	require(is_equal_approx(gutter_capped, 3.5),
-			"a four-texel gutter must cap an 8x viewport at 3.5, got %.2f" % gutter_capped)
+	require(is_equal_approx(gutter_capped, 7.0),
+			"a four-texel gutter must cap an 8x viewport at 7, got %.2f" % gutter_capped)
 	root.get_viewport().set_anisotropic_filtering_level(2)
 	terrain.vt_page_border = PAGE_BORDER
 	await process_frame
@@ -345,7 +347,7 @@ func run() -> void:
 	var shader_anisotropy := float(bound_anisotropy) if bound_anisotropy != null else 4.0
 	if shader_anisotropy <= 0.0:
 		shader_anisotropy = 4.0
-	var supported := minf(shader_anisotropy, float(PAGE_BORDER) - 0.5)
+	var supported := minf(shader_anisotropy, 2.0 * float(PAGE_BORDER) - 1.0)
 	require(supported >= 3.0, "the test viewport must expose at least 4x anisotropy")
 
 	var poses := [

@@ -78,29 +78,67 @@ uniform float _avt_adaptive_threshold_level = 0.0;
 uniform vec4 _avt_coarse_grid = vec4(0.0);
 uniform ivec2 _avt_coarse_block = ivec2(0);
 #endif
-#ifdef TERRAIN_HEIGHT_CLIPMAP
-// The height group's clipmap ring, and the only uniforms this method costs the shader. The whole
-// block is inside `TERRAIN_HEIGHT_CLIPMAP`, which the generated code defines for exactly the
-// configurations whose height group is delivered by the ring (both bands `Direct` => no define => no
-// uniforms, no samplers and no branch), so a method nobody selected is not merely unused here: it is
-// absent. `_avt_coverage_distance` above is the band edge the ring serves inside, which is the one
-// published reach both the material split and this one are measured against.
+#ifdef TERRAIN_CLIPMAP
+// The clipmap rings, and the only uniforms this method costs the shader. The whole block is inside
+// `TERRAIN_CLIPMAP`, which the generated code defines for exactly the configurations whose *some*
+// channel group is delivered by a ring (both groups `Direct` => no define => no uniforms, no samplers
+// and no branch), so a method nobody selected is not merely unused here: it is absent.
+// `_avt_coverage_distance` above is the band edge a ring serves inside, which is the one published
+// reach both the material split and the height one are measured against.
+//
+// One table for every group, indexed `group * CLIPMAP_MAX_LEVELS + level`: the numeric state is the
+// same for a height ring and any other, so a channel the ring gains adds no uniform of its own - it
+// names its entry with `CLIPMAP_GROUP_<GROUP>`, which the generated code defines beside its arm. The
+// atlas is one sampler per group rather than an array indexed at runtime: a sampler array index has
+// to be a constant, so each arm passes its own and the shared addressing below takes it as a
+// parameter.
 //
 // One entry per level, in level order: the level's *snapped* centre and its toroidal offset, so the
 // shader's addressing is `Terrain3DClipmap::sample()`'s. `_clipmap_level_valid` is 1 for a level
 // whose every texel is current and 0 for one that is mid-fill, mid-strip or mid-invalidation - a 0
-// is what keeps a level that still holds the level it replaces out of a fragment.
-uniform bool _clipmap_height_near = false;
-uniform bool _clipmap_height_far = false;
-uniform highp sampler2DArray _clipmap_atlas : filter_nearest, repeat_disable;
-uniform vec2 _clipmap_center[16];
-// Not `ivec2[16]`: Godot binds a uniform array from a packed array, and there is no packed ivec2.
+// is what keeps a level that still holds the level it replaces out of a fragment. `_clipmap_band` is
+// the two cells' claim in one mask: bit 0 the near band of that group, bit 1 the far one.
+uniform highp sampler2DArray _clipmap_atlas[CLIPMAP_GROUP_COUNT] : filter_nearest, repeat_disable;
+uniform vec2 _clipmap_center[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
+// Not `ivec2[...]`: Godot binds a uniform array from a packed array, and there is no packed ivec2.
 // The values are whole texel counts, so the cast below is exact.
-uniform vec2 _clipmap_ring[16];
-uniform float _clipmap_level_valid[16];
-uniform int _clipmap_size = 256;
-uniform int _clipmap_level_count = 0;
-uniform float _clipmap_base_world = 256.0;
+uniform vec2 _clipmap_ring[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
+uniform float _clipmap_level_valid[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
+// The rects of *stored* texels a reader must not serve from the ring's baked layers right now: the
+// rects no bake has covered yet, and the rects the CPU side is still producing (between a job being
+// queued and the bake that follows it, the level's stored texels are being replaced, so the layers
+// describe world positions the level no longer covers). This is what makes a reader's readiness the
+// *fragment's* rather than the level's: a level under a moving focus has a strip outstanding almost
+// every tick, and a reader that fell back for the whole level whenever it did would never serve the
+// material the ring actually holds. One row per level, `CLIPMAP_MAX_OUTSTANDING` entries each, and a
+// count per level; a level with more outstanding rects than that answers with its whole square.
+uniform vec4 _clipmap_outstanding[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS * CLIPMAP_MAX_OUTSTANDING];
+uniform int _clipmap_outstanding_count[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
+uniform int _clipmap_size[CLIPMAP_GROUP_COUNT];
+uniform int _clipmap_level_count[CLIPMAP_GROUP_COUNT];
+uniform float _clipmap_base_world[CLIPMAP_GROUP_COUNT];
+uniform int _clipmap_band[CLIPMAP_GROUP_COUNT];
+)"
+		R"(
+// How many values a group's texel holds, one layer each, and therefore how its layers are strided:
+// slice `level * channels + channel`. One for every channel group the ring carries today - a height
+// and a material texel are each one value - but it is a uniform rather than the constant 1 it has
+// always been, because the material ring also carries the height beside the payload and the bake
+// reads both from one array.
+uniform int _clipmap_channels[CLIPMAP_GROUP_COUNT];
+#ifdef TERRAIN_CLIPMAP_MATERIAL
+// The material group's *baked* layers: the three arrays a producer writes out of the ring's own
+// texels - diffuse and height, an unencoded world normal and roughness, the parameters - one layer per
+// level, which is what makes the ring a sampled material source rather than a payload one. They are
+// declared only for the arm that samples them, and they are indexed exactly the way the payload layer
+// is: by the *stored* texel, the one the level's ring offset names, because that is the frame that
+// keeps pointing at the same world position as the level turns. A read here is therefore the payload
+// read's own arithmetic - clamp the logical tap inside the level, turn it into the stored texel - with
+// the baked layer instead of the payload. See `clipmap_baked_material()`.
+uniform highp sampler2DArray _clipmap_baked_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _clipmap_baked_normal : filter_linear, repeat_disable;
+uniform highp sampler2DArray _clipmap_baked_params : filter_linear, repeat_disable;
+#endif
 #endif
 uniform float _vertex_density = 1.0; // = 1./_vertex_spacing
 uniform float _region_size = 1024.0;
@@ -134,7 +172,7 @@ uniform int _surface_vt_page_size = 256;
 // supports n - 0.5, so four admitted 3.5x and silently reduced every larger request. A stored page
 // is `page_size + 2 * border`, which is 7.7% more texels a page than four was. The C++ default and
 // the dock's range are the same number; see docs/vt_sampling_review.md.
-uniform int _surface_vt_page_border = 9;
+uniform int _surface_vt_page_border = 5;
 uniform int _surface_vt_pages_per_axis = 4;
 uniform int _surface_vt_max_local_mip = 2;
 uniform int _surface_vt_indirection_size = 256;
@@ -198,7 +236,7 @@ uniform int _surface_svt_page_size = 256;
 // The same number as the near field's gutter, because both views share `vt_page_border`. The far
 // field samples with a plain `textureLod` and no gradients, so this gutter is for its own mip
 // transitions rather than for a filtering footprint; it grows with the near field's anyway.
-uniform int _surface_svt_page_border = 9;
+uniform int _surface_svt_page_border = 5;
 uniform int _surface_svt_max_mip = 4;
 uniform int _surface_svt_indirection_size = 1024;
 // Distance -> level table, in metres: entry m is the largest camera distance sampled at
@@ -520,8 +558,12 @@ float avt_pixel_footprint(vec2 dx, vec2 dy) {
 	float major = sqrt(max(0.5 * (a + c + sqrt(max((a-c)*(a-c) + 4.0*b*b, 0.0))), 1e-16));
 	float minor = abs(dx.x * dy.y - dx.y * dy.x) / major;
 	// The fine virtual mip is floor(LOD), so its texel can be half the desired
-	// footprint. Leave half a texel for bilinear support within the page gutter.
-	float supported = max(1.0, float(_surface_vt_page_border) - 0.5);
+	// footprint. Leave half a texel for bilinear support within the page gutter:
+	// a ratio of n spans about n texels along the major axis, so its half-extent
+	// is n / 2 and bilinear adds half a texel - the gutter admits `2 * border - 1`.
+	// This is the shader's half of `Terrain3D::get_avt_anisotropy()`, which
+	// publishes `_surface_vt_anisotropy` clamped by the same bound.
+	float supported = max(1.0, 2.0 * float(_surface_vt_page_border) - 1.0);
 	float anisotropy = max(1.0, min(_surface_vt_anisotropy, supported));
 	return max(minor, major / anisotropy);
 }
@@ -674,7 +716,17 @@ bool avt_resolve(vec2 world, float pixel_world, float minimum_texel, bool allow_
 				int slot = int(texelFetch(_surface_vt_indirection, page, mip).r + 0.5);
 				texel_world = local_texel * float(1 << mip);
 				if (texel_world >= coarse_texel) { break; }
-				if (!avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) { continue; }
+				if (!avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) {
+					// Strict mode asks for the one page the footprint requests and reports the
+					// miss instead of recovering at a coarser level of the same sector's chain.
+					// That is what `surface_vt_feedback` off means (`vt_sampling_review.md`:
+					// "the feedback property controls coarse recovery in the shader"), it is the
+					// contract `vt_transition_parent` and `vt_filtering` pin, and it is why this
+					// function takes the flag at all - it was declared and passed but never read,
+					// so a missing fine page still resolved through a resident ancestor.
+					if (!allow_coarse) { return false; }
+					continue;
+				}
 				fade = surface_vt_page_fade(slot);
 				return true;
 			}
@@ -765,8 +817,52 @@ bool avt_filtered_sample(vec2 world, float pixel_world, vec2 world_dx, vec2 worl
 	return true;
 }
 
-bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
-	if (!_surface_material_enabled) { return false; }
+// The paged methods' material for a fragment, and how much of the fragment is theirs:
+// `r_page_share` is the fraction of it the pages own and `r_page_band` is whether the fragment lies
+// inside the band they serve at all. Both are 1/true for a configuration with no ring on the material
+// group - the shape the two paged methods have always had, and the reason those configurations compile
+// and run the code they always did - while a ring's cell takes the band it names out of them. A miss
+// leaves the share at `0`: the source evaluation is then the whole answer. `r_page_band` is what the
+// strict-miss diagnostic reads, so a fragment the ring legitimately serves is not a diagnostic merely
+// because no page stands behind it. See `evaluate_idweight_material()` for the other half.
+bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal, out float r_page_share,
+		out bool r_page_band) {
+	r_page_share = 1.0;
+	r_page_band = true;
+	if (!_surface_material_enabled) {
+		r_page_share = 0.0;
+		r_page_band = false;
+		return false;
+	}
+#ifdef TERRAIN_CLIPMAP_MATERIAL
+	// A ring cell turns the group's two *tiers* into its two *bands*: the ring owns the band its cell
+	// names and the pages keep the other one, so what the pages own here is the other band's own curve
+	// - the one the height arm serves by, at the distance this split already measures with. Both bits
+	// set (the ring owns both bands) leaves them nothing, and so does a `Direct` other band. Zero means
+	// no cell put this group on `Clipmap`, and then they keep the whole fragment.
+	// Not `const`: these derive from a uniform, which Godot's shader language does not accept in a
+	// constant expression.
+	int ring_band = _clipmap_band[CLIPMAP_GROUP_MATERIAL] & 3;
+	if (ring_band != 0) {
+		float ring_reach = max(64.0, _avt_coverage_distance);
+		float far_band = smoothstep(ring_reach * 0.75, ring_reach, distance(world, v_camera_pos.xz));
+		// bit 0 = the ring owns the near band, so the pages keep the far one; bit 1 = the ring owns the
+		// far band, so the pages keep the near one.
+		r_page_share = (ring_band & 2) != 0 ? 0.0
+										   : ((ring_band & 1) != 0 ? (_surface_svt_enabled ? far_band : 0.0) : 1.0 - far_band);
+		r_page_band = r_page_share > 0.0;
+		// Nothing paged in this fragment: the evaluation is the whole answer, and a strict-miss
+		// diagnostic is not this fragment's business.
+		if (r_page_share <= 0.0) {
+			return false;
+		}
+		// The ring owns the near band, so the far one is the SVT's alone: the tier the cell replaced is
+		// not asked, rather than asked and then overruled.
+		if ((ring_band & 1) != 0) {
+			return _surface_svt_enabled ? surface_svt_material_sample(world, r_mat, r_normal) : false;
+		}
+	}
+#endif
 	if (_surface_vt_enabled && _avt_sectors_enabled) {
 		vec2 world_dx = dFdx(world);
 		vec2 world_dy = dFdy(world);
@@ -825,7 +921,10 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) 
 	return surface_svt_material_sample(world, r_mat, r_normal);
 }
 #else
-bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal) {
+bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal, out float r_page_share,
+		out bool r_page_band) {
+	r_page_share = 0.0;
+	r_page_band = false;
 	return false;
 }
 #endif
@@ -924,20 +1023,27 @@ float array_height_interpolated_uv(vec2 pos) {
 	return h;
 }
 
-#ifdef TERRAIN_HEIGHT_CLIPMAP
-float clipmap_texel_world(int p_level) {
-	return _clipmap_base_world * exp2(float(p_level)) / float(max(_clipmap_size, 1));
+#ifdef TERRAIN_CLIPMAP
+// The group's level inside the one table: `group * CLIPMAP_MAX_LEVELS + level`. Every read below goes
+// through it, so a channel's index and a level's index cannot be confused.
+int clipmap_level_index(int p_group, int p_level) {
+	return p_group * CLIPMAP_MAX_LEVELS + p_level;
+}
+
+float clipmap_texel_world(int p_group, int p_level) {
+	return _clipmap_base_world[p_group] * exp2(float(p_level)) / float(max(_clipmap_size[p_group], 1));
 }
 
 // Whether a level's own texel range contains a point - `Terrain3DClipmap::_contains_level()` exactly.
 // Deliberately not `abs(point - centre) <= half`: that includes the far edge, which is one texel past
 // the last stored one, and the clamped read below would answer it with the edge texel, i.e. with the
-// height of a world position one texel away. The range is half-open, which is the set of texels the
+// value of a world position one texel away. The range is half-open, which is the set of texels the
 // level stores.
-bool clipmap_contains(int p_level, vec2 p_world) {
-	float half_size = _clipmap_base_world * exp2(float(p_level)) * 0.5;
-	vec2 local = (p_world - _clipmap_center[p_level] + vec2(half_size)) / clipmap_texel_world(p_level);
-	float size = float(max(_clipmap_size, 1));
+bool clipmap_contains(int p_group, int p_level, vec2 p_world) {
+	float half_size = _clipmap_base_world[p_group] * exp2(float(p_level)) * 0.5;
+	vec2 local = (p_world - _clipmap_center[clipmap_level_index(p_group, p_level)] + vec2(half_size)) /
+			clipmap_texel_world(p_group, p_level);
+	float size = float(max(_clipmap_size[p_group], 1));
 	return local.x >= 0.0 && local.y >= 0.0 && local.x < size && local.y < size;
 }
 
@@ -945,10 +1051,10 @@ bool clipmap_contains(int p_level, vec2 p_world) {
 // `Terrain3DClipmap::level_for_world()` exactly. A level's centre is snapped to its own texel size,
 // so two levels' coverage is not concentric and this is a search rather than a log2 of a shared
 // centre.
-int clipmap_level_for_world(vec2 p_world) {
-	int last = max(_clipmap_level_count - 1, 0);
+int clipmap_level_for_world(int p_group, vec2 p_world) {
+	int last = max(_clipmap_level_count[p_group] - 1, 0);
 	for (int level = 0; level < last; level++) {
-		if (clipmap_contains(level, p_world)) {
+		if (clipmap_contains(p_group, level, p_world)) {
 			return level;
 		}
 	}
@@ -958,94 +1064,126 @@ int clipmap_level_for_world(vec2 p_world) {
 // The level's snapped grid, in logical texel units: `Terrain3DClipmap::sample()`'s own inverse of
 // `world_of_logical()`, so the shader and the CPU read the same texel for the same world point. `z`
 // is the level.
-vec3 clipmap_address(vec2 p_world) {
-	int level = clipmap_level_for_world(p_world);
-	float texel = clipmap_texel_world(level);
-	float half_size = _clipmap_base_world * exp2(float(level)) * 0.5;
-	vec2 local = (p_world - _clipmap_center[level] + vec2(half_size)) / texel;
+vec3 clipmap_address(int p_group, vec2 p_world) {
+	int level = clipmap_level_for_world(p_group, p_world);
+	float texel = clipmap_texel_world(p_group, level);
+	float half_size = _clipmap_base_world[p_group] * exp2(float(level)) * 0.5;
+	vec2 local = (p_world - _clipmap_center[clipmap_level_index(p_group, level)] + vec2(half_size)) / texel;
 	return vec3(local, float(level));
 }
 
 // One stored texel, named by a *logical* index: the ring offset turns it into the stored one
 // (`physical = (logical + ring) mod size`, the wrap `Terrain3DClipmap::_wrap()` applies), and the
 // clamp keeps a tap at a level's edge inside that level instead of wrapping it onto the opposite
-// edge, where the neighbouring level is the correct source.
-float clipmap_texel_at(int p_level, vec2 p_logical) {
-	float size = float(max(_clipmap_size, 1));
+// edge, where the neighbouring level is the correct source. The atlas is the *caller's*: a sampler
+// array index has to be constant, so each arm names its own and this stays shared. The layer is the
+// level's *first* channel: this is the arm that reads a group's own value, and a group that carries
+// more than one keeps them beside it (`_clipmap_channels`).
+float clipmap_texel_at(int p_group, int p_level, vec2 p_logical, highp sampler2DArray p_atlas) {
+	float size = float(max(_clipmap_size[p_group], 1));
 	vec2 logical = clamp(p_logical, vec2(0.0), vec2(size - 1.0));
-	vec2 physical = mod(logical + _clipmap_ring[p_level], vec2(size));
-	return texelFetch(_clipmap_atlas, ivec3(ivec2(physical), p_level), 0).r;
+	vec2 physical = mod(logical + _clipmap_ring[clipmap_level_index(p_group, p_level)], vec2(size));
+	int layer = p_level * max(_clipmap_channels[p_group], 1);
+	return texelFetch(p_atlas, ivec3(ivec2(physical), layer), 0).r;
 }
 
-float clipmap_height_at_world(vec2 p_world) {
-	vec3 address = clipmap_address(p_world);
-	return clipmap_texel_at(int(address.z), floor(address.xy));
-}
-
-// The same, bilinearly interpolated on the level's own grid. The weights are the level's, not the
-// height grid's: a coarse level's texels are further apart than the height grid's, so the finer
-// grid's fraction would sample inside one texel and read it as four.
-float clipmap_height_interpolated_at_world(vec2 p_world) {
-	vec3 address = clipmap_address(p_world);
-	vec2 base = floor(address.xy);
-	vec2 f = address.xy - base;
-	int level = int(address.z);
-	float h00 = clipmap_texel_at(level, base);
-	float h10 = clipmap_texel_at(level, base + vec2(1.0, 0.0));
-	float h01 = clipmap_texel_at(level, base + vec2(0.0, 1.0));
-	float h11 = clipmap_texel_at(level, base + vec2(1.0, 1.0));
-	return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
-}
-
-// The ring's share of the height at a world point: 1 where the ring serves, 0 where the region array
-// does, and a blend across the band edge. Zero has four causes and one meaning - read the array: the
-// point is outside the band the two cells named, it is outside the coarsest level's own texel range,
-// or the level that would answer it is not current (mid-fill, mid-strip, mid-invalidation).
+// The ring's share of a value at a world point: 1 where the ring serves, 0 where the source it
+// replaces does, and a blend across the band edge. Zero has three causes and one meaning - read the
+// fallback: the point is outside the band the two cells named, it is outside the coarsest level's own
+// texel range, or `p_require_valid` and the level that would answer it is not current (mid-fill,
+// mid-strip, mid-invalidation). The *measure* of the distance is the caller's, because the two stages
+// ask different questions: the vertex stage is computing the vertical distance and measures
+// horizontally, while the material split measures the fragment's 3D distance. `_avt_coverage_distance`
+// is the one published reach both use.
+//
+// `p_require_valid` is the one thing a channel differs in: the height arm reads a level's own scalars,
+// which are only there once the CPU side has drained the level, while the material arm reads the
+// *baked* layers, whose readiness is a per-*rect* question the arm answers for itself
+// (`clipmap_baked_material()`). A level's `valid` is therefore not this arm's gate, and asking for it
+// here would make a level that is mid-strip fall back as a whole.
 //
 // The range test is what keeps a clamped read from being served as if it were an answer. A point no
 // level contains is answered by the coarsest level *at its edge* - a different world position, and
 // the reason `clipmap_texel_at()` clamps rather than wrapping - so the ring has nothing to say there
-// and the region array, which does, serves it. The CPU's `sample_vt_clipmap()` still answers that
-// point: a reading of what the ring holds is not the same question as what a fragment may read.
-//
-// The band is measured *horizontally*, in both stages, because the vertex stage is computing the
-// vertical distance. The material split next door measures the fragment's 3D distance instead; the
-// two are different questions and each is measured where it is asked. `_avt_coverage_distance` is
-// the one published reach both use.
-float clipmap_height_weight(vec2 p_world) {
-	if (_clipmap_level_count <= 0) {
+// and the source it replaces, which does, serves it. The CPU's `sample_vt_clipmap()` still answers
+// that point: a reading of what the ring holds is not the same question as what a fragment may read.
+float clipmap_weight(int p_group, vec2 p_world, float p_distance, bool p_require_valid) {
+	if (_clipmap_level_count[p_group] <= 0) {
 		return 0.0;
 	}
-	int level = clipmap_level_for_world(p_world);
-	if (!clipmap_contains(level, p_world)) {
+	int level = clipmap_level_for_world(p_group, p_world);
+	if (!clipmap_contains(p_group, level, p_world)) {
 		return 0.0;
 	}
-	if (_clipmap_level_valid[level] < 0.5) {
+	if (p_require_valid && _clipmap_level_valid[clipmap_level_index(p_group, level)] < 0.5) {
 		return 0.0;
 	}
 	float reach = max(64.0, _avt_coverage_distance);
-	float far_band = smoothstep(reach * 0.75, reach, length(p_world - v_camera_pos.xz));
-	float weight = _clipmap_height_near ? 1.0 - far_band : 0.0;
-	if (_clipmap_height_far) {
+	float far_band = smoothstep(reach * 0.75, reach, p_distance);
+	float weight = (_clipmap_band[p_group] & 1) != 0 ? 1.0 - far_band : 0.0;
+	if ((_clipmap_band[p_group] & 2) != 0) {
 		weight = max(weight, far_band);
 	}
 	return weight;
 }
 
-#endif // TERRAIN_HEIGHT_CLIPMAP
+// One stored value at a world point through the addressing above, and the same bilinearly
+// interpolated on the level's own grid. The weights are the level's, not the fallback grid's: a
+// coarse level's texels are further apart than the finer grid's, so its fraction would sample inside
+// one texel and read it as four.
+float clipmap_texel(int p_group, vec2 p_world, highp sampler2DArray p_atlas) {
+	vec3 address = clipmap_address(p_group, p_world);
+	return clipmap_texel_at(p_group, int(address.z), floor(address.xy), p_atlas);
+}
+
+float clipmap_texel_interpolated(int p_group, vec2 p_world, highp sampler2DArray p_atlas) {
+	vec3 address = clipmap_address(p_group, p_world);
+	vec2 base = floor(address.xy);
+	vec2 f = address.xy - base;
+	int level = int(address.z);
+	float v00 = clipmap_texel_at(p_group, level, base, p_atlas);
+	float v10 = clipmap_texel_at(p_group, level, base + vec2(1.0, 0.0), p_atlas);
+	float v01 = clipmap_texel_at(p_group, level, base + vec2(0.0, 1.0), p_atlas);
+	float v11 = clipmap_texel_at(p_group, level, base + vec2(1.0, 1.0), p_atlas);
+	return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+}
+#endif // TERRAIN_CLIPMAP
+
+// ---- The height channel's ring arm ---------------------------------------------------------------
+// The height group's own three reads, and nothing else: the level rule, the coverage test, the
+// validity gate and the band blend above are the ring's and are shared with every other channel, so
+// this arm is the group's index, its atlas, and the distance its stage is asking about.
+#ifdef TERRAIN_CLIPMAP_HEIGHT
+float clipmap_height_at_world(vec2 p_world) {
+	return clipmap_texel(CLIPMAP_GROUP_HEIGHT, p_world, _clipmap_atlas[CLIPMAP_GROUP_HEIGHT]);
+}
+
+float clipmap_height_interpolated_at_world(vec2 p_world) {
+	return clipmap_texel_interpolated(CLIPMAP_GROUP_HEIGHT, p_world, _clipmap_atlas[CLIPMAP_GROUP_HEIGHT]);
+}
+
+// The height group's share of the height at a world point, measured horizontally: the vertex stage is
+// computing the vertical distance, and the material split next door measures the fragment's 3D
+// distance instead. The two are different questions and each is measured where it is asked.
+float clipmap_height_weight(vec2 p_world) {
+	// `true`: a height read is the level's own scalars, and those are only there once the CPU side has
+	// drained the level - unlike the material arm, whose readiness is per rect and is its own question.
+	return clipmap_weight(CLIPMAP_GROUP_HEIGHT, p_world, length(p_world - v_camera_pos.xz), true);
+}
+#endif // TERRAIN_CLIPMAP_HEIGHT
 
 // How far apart the height reads of one normal are, in height-grid units: the ring's texel where the
 // ring serves, and the height grid's own step where the array does. Never below 1 - a level finer
 // than the height grid is still read at the grid's step, which is what those taps are stated in. One
 // for a configuration with no ring arm, which is what keeps that path's arithmetic unchanged.
 float height_tap_scale(vec2 p_uv) {
-#ifdef TERRAIN_HEIGHT_CLIPMAP
+#ifdef TERRAIN_CLIPMAP_HEIGHT
 	vec2 world = p_uv * _vertex_spacing;
 	float weight = clipmap_height_weight(world);
 	if (weight <= 0.0) {
 		return 1.0;
 	}
-	float texel = clipmap_texel_world(clipmap_level_for_world(world));
+	float texel = clipmap_texel_world(CLIPMAP_GROUP_HEIGHT, clipmap_level_for_world(CLIPMAP_GROUP_HEIGHT, world));
 	return mix(1.0, max(texel / _vertex_spacing, 1.0), weight);
 #else
 	return 1.0;
@@ -1054,7 +1192,7 @@ float height_tap_scale(vec2 p_uv) {
 
 // One height texel, point sampled, through whichever source the height group's cells select.
 float height_at_uv(vec2 p_uv) {
-#ifdef TERRAIN_HEIGHT_CLIPMAP
+#ifdef TERRAIN_CLIPMAP_HEIGHT
 	vec2 world = p_uv * _vertex_spacing;
 	float weight = clipmap_height_weight(world);
 	if (weight >= 1.0) {
@@ -1072,7 +1210,7 @@ float height_at_uv(vec2 p_uv) {
 
 // The sub-texel read the finest mesh LOD uses, through the same choice.
 float interpolated_height(vec2 pos) {
-#ifdef TERRAIN_HEIGHT_CLIPMAP
+#ifdef TERRAIN_CLIPMAP_HEIGHT
 	vec2 world = pos * _vertex_spacing;
 	float weight = clipmap_height_weight(world);
 	if (weight >= 1.0) {
@@ -1322,6 +1460,216 @@ float get_height(vec2 index_id, vec2 offset, float p_tap_scale) {
 )"
 
 		R"(
+)"
+// A split of its own, for the same reason as the ones above (MSVC truncates a string literal past
+// 16 kB): the material group's ring arm and the source evaluation it feeds are a section rather than
+// an addition to a literal that is already near the limit.
+R"(
+// ---- The material group's ring arm ---------------------------------------------------------------
+#ifdef TERRAIN_CLIPMAP_MATERIAL
+// How much of the ring the fragment is served by: the shared band rule at the horizontal distance the
+// material split measures with, so the weight a fragment is banded by is the weight it is mixed by.
+// Zero covers the band the two cells named and the coarsest level's texel range; one means the ring is
+// the only source the fragment has. Whether the ring can *answer* it is the arm's own question below,
+// because the baked layers' readiness is per rect and this weight is per fragment.
+float clipmap_material_weight(vec2 p_world) {
+	return clipmap_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance(p_world, v_camera_pos.xz), false);
+}
+
+// Whether one level's stored texel is one its layers do not describe yet - a rect the CPU side is still
+// producing, or one the producer has not baked. It is the arm's readiness, at the granularity the ring
+// actually produces: a strip.
+bool clipmap_outstanding(int p_group, int p_level, ivec2 p_stored) {
+	int count = _clipmap_outstanding_count[clipmap_level_index(p_group, p_level)];
+	int row = clipmap_level_index(p_group, p_level) * CLIPMAP_MAX_OUTSTANDING;
+	for (int index = 0; index < count; index++) {
+		vec4 rect = _clipmap_outstanding[row + index];
+		if (float(p_stored.x) >= rect.x && float(p_stored.x) < rect.z &&
+				float(p_stored.y) >= rect.y && float(p_stored.y) < rect.w) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The stored texel one corner of a level's bilinear footprint reads. The logical tap is clamped inside
+// the level - there is no neighbour outside it, the world beyond belongs to a coarser level - and then
+// turned into the stored texel the level's ring offset names, exactly as the ring's payload read does.
+// The gate and the fetch use this one function, so a tap the arm refuses is the tap it would have read.
+ivec2 clipmap_baked_tap(vec2 p_base, vec2 p_size, vec2 p_ring, int p_corner) {
+	vec2 limit = max(p_size - vec2(1.0), vec2(0.0));
+	vec2 logical = p_base + vec2(p_corner == 1 || p_corner == 3 ? 1.0 : 0.0,
+									 p_corner >= 2 ? 1.0 : 0.0);
+	return ivec2(mod(clamp(logical, vec2(0.0), limit) + p_ring, p_size));
+}
+
+// Four taps of one level's baked layer, bilinearly combined. The producer baked at exactly this density,
+// which is what makes a coarser material ring a coarser material rather than the same one stretched.
+vec4 clipmap_baked_texel(highp sampler2DArray p_array, int p_level, vec2 p_base, vec2 p_fraction,
+		vec2 p_size, vec2 p_ring) {
+	vec4 v00 = texelFetch(p_array, ivec3(clipmap_baked_tap(p_base, p_size, p_ring, 0), p_level), 0);
+	vec4 v10 = texelFetch(p_array, ivec3(clipmap_baked_tap(p_base, p_size, p_ring, 1), p_level), 0);
+	vec4 v01 = texelFetch(p_array, ivec3(clipmap_baked_tap(p_base, p_size, p_ring, 2), p_level), 0);
+	vec4 v11 = texelFetch(p_array, ivec3(clipmap_baked_tap(p_base, p_size, p_ring, 3), p_level), 0);
+	return mix(mix(v00, v10, p_fraction.x), mix(v01, v11, p_fraction.x), p_fraction.y);
+}
+
+// The material the ring's *baked layers* hold at a world point. This is the group's third sampled
+// material beside the two paged tiers: the same three arrays a page carries, evaluated at the level's
+// own texel centres by the same bake shader, from the ring's own payload and height. The addressing is
+// the payload's - the level rule, the coverage test and the band curve are the shared ones - and the
+// layer is indexed the way the payload layer is, by the *stored* texel, because that is the frame the
+// ring offset keeps pointing at the same world position. False means the fragment is not the ring's, or
+// one of the four texels its bilinear footprint reads is a texel the ring is still producing or has not
+// baked - and then the whole footprint falls back to the source evaluation rather than blending a stale
+// texel into it.
+bool clipmap_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal) {
+	if (clipmap_material_weight(p_world) <= 0.0) {
+		return false;
+	}
+	vec3 address = clipmap_address(CLIPMAP_GROUP_MATERIAL, p_world);
+	int level = int(address.z);
+	vec2 size = vec2(float(max(_clipmap_size[CLIPMAP_GROUP_MATERIAL], 1)));
+	vec2 base = floor(address.xy);
+	vec2 fraction = address.xy - base;
+	vec2 ring = _clipmap_ring[clipmap_level_index(CLIPMAP_GROUP_MATERIAL, level)];
+	for (int corner = 0; corner < 4; corner++) {
+		if (clipmap_outstanding(CLIPMAP_GROUP_MATERIAL, level, clipmap_baked_tap(base, size, ring, corner))) {
+			return false;
+		}
+	}
+	vec4 albedo = clipmap_baked_texel(_clipmap_baked_albedo, level, base, fraction, size, ring);
+	vec4 normal_rough = clipmap_baked_texel(_clipmap_baked_normal, level, base, fraction, size, ring);
+	vec4 params = clipmap_baked_texel(_clipmap_baked_params, level, base, fraction, size, ring);
+	// The layers hold the bake's own output rather than a page's storage encoding: the whole of the
+	// decode is the readiness alpha, which the producer writes as 1 - so the unencoded pair of
+	// `surface_decode_page()` is exactly this, and a page's octahedral or packed forms never apply.
+	return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
+}
+#endif // TERRAIN_CLIPMAP_MATERIAL
+
+// ---- The source evaluation, in one function -------------------------------------------------------
+// The material a fragment gets from the *stored payload*: the `R16` control texel - through the array or
+// the paging method - resolved against the texture assets by the idweight rules. It is one function
+// rather than a block inside `fragment()` because it has two callers by construction: the fragment of a
+// group no page serves (which is the whole of its material) and the fragment of a group whose other band
+// a page owns (which mixes this with the page's material). A ring on the material group is deliberately
+// not one of its sources: the ring's channel is the *material*, so a fragment its layers cannot answer
+// reads the payload where the shipped paths keep it, and the ring's own payload layer is nothing but the
+// producer's input.
+void evaluate_idweight_material(vec2 p_uv, vec2 p_weight, ivec3 p_index0, ivec3 p_index1, ivec3 p_index2,
+		ivec3 p_index3, bool p_bilerp, vec3 p_w_normal, vec3 p_base_ddx, vec3 p_base_ddy,
+		out material r_mat, out vec3 r_blended_normal, out uint r_material_count) {
+	const vec3 offsets = vec3(0, 1, 2);
+	// GLSL out parameters are undefined before the first write and the accumulation below adds into
+	// them, so the accumulator starts here rather than at the caller.
+	r_mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
+	r_blended_normal = vec3(0.0);
+	r_material_count = 1u;
+	// ── IdWeight surface evaluation ──
+	// Precise corner reads from the R16 surface map (no sampler interpolation).
+	// R16 UNORM texelFetch returns a normalized float; scale back to the packed
+	// 16-bit integer exactly (65536 discrete values fit float precisely).
+	// The idweight cell is evaluated on the stored payload's own grid when the virtual
+	// texture serves it. At density 1 that is exactly the per-cell contract, and a
+	// denser payload is the same contract on a dyadically subdivided cell: the fixed
+	// BL-TR diagonal survives dyadic subdivision, so the triangle selection below stays
+	// consistent with the mesh. With the virtual texture off the region array is
+	// authoritative, so the cell keeps the mesh's 1 m grid and the array path renders
+	// exactly as it did before surface_density existed.
+	vec2 surface_weight = _surface_vt_enabled ? fract(p_uv * float(max(1, _surface_density))) : p_weight;
+	uvec4 surface = uvec4(0u);
+	surface[3] = get_surface_value(surface_corner(p_uv, ivec2(offsets.xx)), p_index3,
+			get_surface_texel(p_uv, ivec2(offsets.xx)));
+	// At distant mips only one corner is fetched. All triangle vertices must use
+	// that sample; zero-filled corners would spuriously blend material ID 0.
+	surface = uvec4(surface[3]);
+	if (p_bilerp) {
+		surface[0] = get_surface_value(surface_corner(p_uv, ivec2(offsets.xy)), p_index0,
+				get_surface_texel(p_uv, ivec2(offsets.xy)));
+		surface[1] = get_surface_value(surface_corner(p_uv, ivec2(offsets.yy)), p_index1,
+				get_surface_texel(p_uv, ivec2(offsets.yy)));
+		surface[2] = get_surface_value(surface_corner(p_uv, ivec2(offsets.yx)), p_index2,
+				get_surface_texel(p_uv, ivec2(offsets.yx)));
+	}
+
+	// Cell-local coordinates and triangle selection.
+	// ONE fixed mesh diagonal in every cell: LowerLeft (BL, BR, TR)
+	// when local.x > local.y, UpperLeft (BL, TL, TR) otherwise, with p0 = BL,
+	// p1 = isLowerLeft ? BR : TL and p2 = TR. The clipmap must therefore keep
+	// that same diagonal on every LOD
+	// (see Terrain3DMesher::_generate_mesh); a per-cell alternating diagonal
+	// makes this interpolation disagree with the triangles actually rendered.
+	vec2 local = surface_weight;
+	bool is_lower_left = local.x > local.y;
+	uint p0 = surface[3]; // BL
+	uint p1 = is_lower_left ? surface[2] : surface[0]; // BR or TL
+	uint p2 = surface[1]; // TR
+	float w0, w1, w2;
+	if (is_lower_left) {
+		w0 = 1.0 - local.x; // BL
+		w1 = local.x - local.y; // BR
+		w2 = local.y; // TR
+	} else {
+		w0 = 1.0 - local.y; // BL
+		w1 = local.y - local.x; // TL
+		w2 = local.x; // TR
+	}
+
+	// Select material candidates once, after pair-aware slope evaluation.
+	float materialResidualSelector = idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
+	uvec3 materialIds;
+	vec3 materialWeights;
+
+	// Random triplanar projection. The slope factor changes stochastic
+	// coverage probability, not the number of texture samples.
+	float triplanarFactor = idweight_get_triplanar_factor(p_w_normal);
+	vec3 triplanarWeights = idweight_get_triplanar_weights(p_w_normal);
+	uint projectionAxis = 1u; // XZ
+	if (triplanarFactor > 0.0) {
+		vec3 projectionWeights = mix(vec3(0.0, 1.0, 0.0), triplanarWeights, triplanarFactor);
+		projectionAxis = idweight_select_stochastic_coverage_axis(v_vertex, projectionWeights);
+	}
+
+	// Pair-aware slope modification. Set and distant pixels stay linear; active
+	// slope Pairs use four-corner coverage so the transition remains smooth
+	// across the fixed mesh diagonal.
+	float slopeDistanceBlend = 1.0 - smoothstep(
+		IDWEIGHT_SLOPE_FULL_DISTANCE_SQ,
+		IDWEIGHT_SLOPE_MAX_DISTANCE_SQ,
+		dot(v_vertex - v_camera_pos, v_vertex - v_camera_pos));
+	// Persistent material pages use a camera-independent slope policy. Cache
+	// misses use that same policy, avoiding a different material while refining.
+	if (_surface_material_enabled && (_surface_vt_enabled || _surface_svt_enabled)) {
+		slopeDistanceBlend = 1.0;
+	}
+	IdWeightContributions pairValues = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
+	float overlayWeight = 0.0;
+	idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, p_w_normal, p_base_ddx, p_base_ddy, pairValues, overlayWeight);
+	idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, p_w_normal, p_base_ddx, p_base_ddy, pairValues, overlayWeight);
+	idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, p_w_normal, p_base_ddx, p_base_ddy, pairValues, overlayWeight);
+	idweight_select_budgeted_3(pairValues, materialResidualSelector, materialIds, materialWeights, r_material_count);
+
+	// 3 texture lookups max (one per selected layer).
+	for (int layerIndex = 0; layerIndex < IDWEIGHT_MAX_LAYERS; layerIndex++) {
+		if (uint(layerIndex) >= r_material_count) {
+			break;
+		}
+		accumulate_idweight_layer(int(materialIds[layerIndex]), materialWeights[layerIndex],
+			p_base_ddx, p_base_ddy, projectionAxis, p_w_normal, r_mat, r_blended_normal);
+	}
+
+	// normalize accumulated values back to 0.0 - 1.0 range.
+	float weight_inv = 1.0 / max(r_mat.total_weight, 1e-8);
+	r_mat.albedo_height *= weight_inv;
+	r_mat.normal_rough *= weight_inv;
+	r_mat.normal_map_depth *= weight_inv;
+	r_mat.ao *= weight_inv;
+	r_mat.ao_affect *= weight_inv;
+}
+
+)"
+R"(
 void fragment() {
 	// Recover UVs
 	vec2 uv = UV;
@@ -1444,119 +1792,55 @@ void fragment() {
 	material mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
 	vec3 blendedNormalWS = vec3(0.0);
 	uint materialCount = 1u;
-	bool material_cached = surface_material_sample(v_vertex.xz, mat, blendedNormalWS);
-	bool material_missing = _surface_material_required && !material_cached;
+	// The paged methods' material, how much of this fragment they own, and whether the fragment is in
+	// the band they serve at all. A group with no ring on `Clipmap` gets 1 and true here, which is the
+	// whole of what this call used to answer; a ring's cell takes its band out of both, and then the
+	// source evaluation below serves the rest - with the page material mixed in by that same weight, so
+	// the mix across the band edge is the one the two paged methods already do.
+	float page_share = 1.0;
+	bool page_band = true;
+	bool material_cached = surface_material_sample(v_vertex.xz, mat, blendedNormalWS, page_share, page_band);
+	if (!material_cached) { page_share = 0.0; }
+	bool material_missing = _surface_material_required && !material_cached && page_band;
 	if (material_missing) {
 		// VT mode is strict: missing/pending material pages are visible diagnostics,
 		// never silently replaced by the original terrain evaluator.
 		mat = material(vec4(1.0, 0.0, 1.0, 0.0), vec4(w_normal, 1.0), 0., 1., 0., 1.);
 		blendedNormalWS = w_normal;
-	} else if (!material_cached) {
-	// GLSL out parameters are undefined on a cache miss. Initialize the source
-	// accumulator after that call, rather than relying on values it overwrote.
-	mat = material(vec4(0.0), vec4(0.0), 0., 0., 0., 0.);
-	blendedNormalWS = vec3(0.0);
-	// ── IdWeight surface evaluation ──
-	// Precise corner reads from the R16 surface map (no sampler interpolation).
-	// R16 UNORM texelFetch returns a normalized float; scale back to the packed
-	// 16-bit integer exactly (65536 discrete values fit float precisely).
-	// The idweight cell is evaluated on the stored payload's own grid when the virtual
-	// texture serves it. At density 1 that is exactly the per-cell contract, and a
-	// denser payload is the same contract on a dyadically subdivided cell: the fixed
-	// BL-TR diagonal survives dyadic subdivision, so the triangle selection below stays
-	// consistent with the mesh. With the virtual texture off the region array is
-	// authoritative, so the cell keeps the mesh's 1 m grid and the array path renders
-	// exactly as it did before surface_density existed.
-	vec2 surface_weight = _surface_vt_enabled ? fract(uv * float(max(1, _surface_density))) : weight;
-	uvec4 surface = uvec4(0u);
-	surface[3] = get_surface_value(surface_corner(uv, ivec2(offsets.xx)), index[3],
-			get_surface_texel(uv, ivec2(offsets.xx)));
-	// At distant mips only one corner is fetched. All triangle vertices must use
-	// that sample; zero-filled corners would spuriously blend material ID 0.
-	surface = uvec4(surface[3]);
-	if (bilerp) {
-		surface[0] = get_surface_value(surface_corner(uv, ivec2(offsets.xy)), index[0],
-				get_surface_texel(uv, ivec2(offsets.xy)));
-		surface[1] = get_surface_value(surface_corner(uv, ivec2(offsets.yy)), index[1],
-				get_surface_texel(uv, ivec2(offsets.yy)));
-		surface[2] = get_surface_value(surface_corner(uv, ivec2(offsets.yx)), index[2],
-				get_surface_texel(uv, ivec2(offsets.yx)));
-	}
-
-	// Cell-local coordinates and triangle selection.
-	// ONE fixed mesh diagonal in every cell: LowerLeft (BL, BR, TR)
-	// when local.x > local.y, UpperLeft (BL, TL, TR) otherwise, with p0 = BL,
-	// p1 = isLowerLeft ? BR : TL and p2 = TR. The clipmap must therefore keep
-	// that same diagonal on every LOD
-	// (see Terrain3DMesher::_generate_mesh); a per-cell alternating diagonal
-	// makes this interpolation disagree with the triangles actually rendered.
-	vec2 local = surface_weight;
-	bool is_lower_left = local.x > local.y;
-	uint p0 = surface[3]; // BL
-	uint p1 = is_lower_left ? surface[2] : surface[0]; // BR or TL
-	uint p2 = surface[1]; // TR
-	float w0, w1, w2;
-	if (is_lower_left) {
-		w0 = 1.0 - local.x; // BL
-		w1 = local.x - local.y; // BR
-		w2 = local.y; // TR
-	} else {
-		w0 = 1.0 - local.y; // BL
-		w1 = local.y - local.x; // TL
-		w2 = local.x; // TR
-	}
-
-	// Select material candidates once, after pair-aware slope evaluation.
-	float materialResidualSelector = idweight_stochastic_coverage01_with_salt(v_vertex, 0x68bc21ebu);
-	uvec3 materialIds;
-	vec3 materialWeights;
-
-	// Random triplanar projection. The slope factor changes stochastic
-	// coverage probability, not the number of texture samples.
-	float triplanarFactor = idweight_get_triplanar_factor(w_normal);
-	vec3 triplanarWeights = idweight_get_triplanar_weights(w_normal);
-	uint projectionAxis = 1u; // XZ
-	if (triplanarFactor > 0.0) {
-		vec3 projectionWeights = mix(vec3(0.0, 1.0, 0.0), triplanarWeights, triplanarFactor);
-		projectionAxis = idweight_select_stochastic_coverage_axis(v_vertex, projectionWeights);
-	}
-
-	// Pair-aware slope modification. Set and distant pixels stay linear; active
-	// slope Pairs use four-corner coverage so the transition remains smooth
-	// across the fixed mesh diagonal.
-	float slopeDistanceBlend = 1.0 - smoothstep(
-		IDWEIGHT_SLOPE_FULL_DISTANCE_SQ,
-		IDWEIGHT_SLOPE_MAX_DISTANCE_SQ,
-		dot(v_vertex - v_camera_pos, v_vertex - v_camera_pos));
-	// Persistent material pages use a camera-independent slope policy. Cache
-	// misses use that same policy, avoiding a different material while refining.
-	if (_surface_material_enabled && (_surface_vt_enabled || _surface_svt_enabled)) {
-		slopeDistanceBlend = 1.0;
-	}
-	IdWeightContributions pairValues = IdWeightContributions(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
-	float overlayWeight = 0.0;
-	idweight_add_pair_vertex(p0, w0, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	idweight_add_pair_vertex(p1, w1, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	idweight_add_pair_vertex(p2, w2, surface[3], surface[2], surface[0], surface[1], local, slopeDistanceBlend, projectionAxis, w_normal, base_ddx, base_ddy, pairValues, overlayWeight);
-	idweight_select_budgeted_3(pairValues, materialResidualSelector, materialIds, materialWeights, materialCount);
-
-	// 3 texture lookups max (one per selected layer).
-	for (int layerIndex = 0; layerIndex < IDWEIGHT_MAX_LAYERS; layerIndex++) {
-		if (uint(layerIndex) >= materialCount) {
-			break;
+	} else if (!material_cached || page_share < 1.0) {
+		material evaluated;
+		vec3 evaluated_normal;
+		uint evaluated_count = 1u;
+		// The ring's *baked layers* first. Where the producer has written the level this fragment's
+		// band is served by, they are the material - the group's third sampled source beside the two
+		// paged tiers - and the payload evaluation below is what they replace. A level that is not
+		// baked yet falls through to that evaluation unchanged, which is the answer it has always had:
+		// the same content at the payload's own density, read through the control texel.
+		bool evaluated_baked = false;
+#ifdef TERRAIN_CLIPMAP_MATERIAL
+		evaluated_baked = clipmap_baked_material(v_vertex.xz, evaluated, evaluated_normal);
+#endif
+		if (!evaluated_baked) {
+			evaluate_idweight_material(uv, weight, index[0], index[1], index[2], index[3], bilerp, w_normal,
+					base_ddx, base_ddy, evaluated, evaluated_normal, evaluated_count);
 		}
-		accumulate_idweight_layer(int(materialIds[layerIndex]), materialWeights[layerIndex],
-			base_ddx, base_ddy, projectionAxis, w_normal, mat, blendedNormalWS);
+		if (!material_cached || page_share <= 0.0) {
+			mat = evaluated;
+			blendedNormalWS = evaluated_normal;
+			materialCount = evaluated_count;
+		} else {
+			// The band the ring serves and the band the pages own: the page's share replaces the
+			// evaluated material as it grows, which is what keeps a ring coarser than the pages from
+			// stepping at the band edge.
+			mat.albedo_height = mix(evaluated.albedo_height, mat.albedo_height, page_share);
+			mat.normal_rough = mix(evaluated.normal_rough, mat.normal_rough, page_share);
+			mat.normal_map_depth = mix(evaluated.normal_map_depth, mat.normal_map_depth, page_share);
+			mat.ao = mix(evaluated.ao, mat.ao, page_share);
+			mat.ao_affect = mix(evaluated.ao_affect, mat.ao_affect, page_share);
+			blendedNormalWS = mix(evaluated_normal, blendedNormalWS, page_share);
+			materialCount = max(evaluated_count, 1u);
+		}
 	}
-
-	// normalize accumulated values back to 0.0 - 1.0 range.
-	float weight_inv = 1.0 / max(mat.total_weight, 1e-8);
-	mat.albedo_height *= weight_inv;
-	mat.normal_rough *= weight_inv;
-	mat.normal_map_depth *= weight_inv;
-	mat.ao *= weight_inv;
-	mat.ao_affect *= weight_inv;
-	} // Source evaluation on a cache miss.
 	if (materialCount == 0u) {
 		ALBEDO = vec3(1.0, 0.0, 1.0);
 		ROUGHNESS = 1.0;

@@ -7,10 +7,14 @@
 
 #include "terrain_3d_clipmap.h"
 
+#include <godot_cpp/classes/rd_texture_format.hpp>
+#include <godot_cpp/classes/rd_texture_view.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/math.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
 
 #include "logger.h"
 
@@ -19,12 +23,37 @@
 // budget the addon can produce under.
 static constexpr int CLIPMAP_MIN_SIZE = 8;
 static constexpr int CLIPMAP_MAX_SIZE = 4096;
-static constexpr int CLIPMAP_MAX_CHANNELS = 4;
+// The most scalars one texel may hold, and therefore the ceiling on what a source may declare
+// (`Terrain3DClipmapSource::get_channel_count()`). A level's CPU side is `size * size * channels`
+// floats and its GPU side is the same count in `format`, so this is a memory statement rather than
+// an arbitrary limit: at the shape the settings default to (256 texels an axis, 8 levels, four
+// bytes a value) one channel is 2 MB and this ceiling is 32 MB, while at the largest ring the
+// settings allow (4096 texels, 16 levels) one channel alone is 1 GB. A multi-component value is not
+// a channel at all: it is a *baked* channel, a whole layer a producer writes, so this ceiling never
+// sees the material group's three arrays.
+static constexpr int CLIPMAP_MAX_CHANNELS = 16;
 
-// One value per texel per layer, so the layer's format is the value's format. A format with more
-// components is a different publish, not a different ring.
+// One value per texel per layer, so a *channel's* format is the value's format. A baked channel is
+// the exception and the reason the two are separate: its layer is a whole texel - albedo and height,
+// an octahedral normal and roughness, the parameters - so it carries four components and this is
+// where its bytes are counted.
 static int _clipmap_bytes_per_texel(const Image::Format p_format) {
-	return p_format == Image::FORMAT_RF ? 4 : 1;
+	switch (p_format) {
+		case Image::FORMAT_R8:
+			return 1;
+		case Image::FORMAT_RGBA8:
+			return 4;
+		case Image::FORMAT_RGBAH:
+			return 8;
+		default:
+			return 4;
+	}
+}
+
+// The device format of a baked channel: the one the bake shader's `rgba16f` storage images write.
+// `configure()` accepts no other request, so there is nothing to translate.
+static RenderingDevice::DataFormat _clipmap_baked_data_format() {
+	return RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT;
 }
 
 // The world rect a rect of *logical* texels covers. Logical index (0,0)'s texel *centre* is
@@ -62,12 +91,22 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 		LOG(ERROR, "Clipmap format ", int(config.format), " has no publish path; using RF");
 		config.format = Image::FORMAT_RF;
 	}
+	config.baked_channels = CLAMP(config.baked_channels, 0, CLIPMAP_MAX_CHANNELS);
+	// One producer, one format. The bake shader writes `rgba16f` storage images, so a baked layer is
+	// half float: a ring asked for anything else is refused here rather than carrying a format no
+	// pass can fill, which is the same rule `format` above follows.
+	if (config.baked_channels > 0 && config.baked_format != Image::FORMAT_RGBAH) {
+		LOG(ERROR, "Clipmap baked format ", int(config.baked_format), " has no producer; using RGBAH");
+		config.baked_format = Image::FORMAT_RGBAH;
+	}
 	if (!_levels.empty() && config.size == _config.size && config.levels == int(_levels.size()) &&
 			config.channels == _config.channels && config.format == _config.format &&
+			config.baked_channels == _config.baked_channels && config.baked_format == _config.baked_format &&
 			Math::is_equal_approx(config.base_world, _config.base_world)) {
 		return;
 	}	LOG(INFO, "Configuring clipmap (", get_source_name(), "): ", config.size, " texels, ", config.levels,
-			" levels, ", config.channels, " channels, base ", config.base_world, " m");
+			" levels, ", config.channels, " channels, ", config.baked_channels, " baked, base ",
+			config.base_world, " m");
 	_config = config;
 	_levels.assign(size_t(config.levels), Level());
 	for (int level = 0; level < config.levels; level++) {
@@ -78,12 +117,26 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 		entry.ring = Vector2i();
 		entry.texels.assign(size_t(config.size) * size_t(config.size) * size_t(config.channels), 0.f);
 		entry.valid = false;
+		entry.baked = false;
 	}
 	_row_values.assign(size_t(config.size), 0.f);
+	// A lease names a level of *this* shape, so a fresh shape is what makes every lease taken before
+	// it stale.
+	_content_serial.assign(size_t(config.levels), 0);
+	_shape_serial++;
 	// Content cannot survive a different shape, and neither can the texture the last shape was
-	// published into: the layer size and the layer count both changed.
+	// published into: the layer size and the layer count both changed. The baked channels are the
+	// same statement a fortiori - their layers are the levels - so they are freed and reallocated.
 	_jobs.clear();
 	_texture.clear();
+	_free_baked();
+	_ensure_baked();
+	// The layers a fresh shape holds are empty, so every level owes a bake: a ring that reported them
+	// baked before anything wrote them would serve whatever the allocation left behind.
+	_bake_rects.clear();
+	for (int level = 0; level < config.levels; level++) {
+		_queue_bake_rect(level, 0, 0, config.size, config.size);
+	}
 	_layer_image.unref();
 	_has_focus = false;
 	_last_focus = Vector2();
@@ -93,13 +146,17 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 void Terrain3DClipmap::clear() {
 	_levels.clear();
 	_jobs.clear();
+	_bake_rects.clear();
 	_row_values.clear();
+	_content_serial.clear();
 	_texture.clear();
+	_free_baked();
 	_layer_image.unref();
 	_config.size = 0;
 	_config.levels = 0;
 	_has_focus = false;
 	_last_focus = Vector2();
+	_shape_serial++;
 	_state_stamp++;
 }
 
@@ -246,6 +303,8 @@ int Terrain3DClipmap::invalidate_rect(const Rect2 &p_world) {
 		const int x1 = CLAMP(int(Math::ceil(local_end.x)), x0 + 1, _config.size);
 		const int y1 = CLAMP(int(Math::ceil(local_end.y)), y0 + 1, _config.size);
 		entry.valid = false;
+		entry.baked = false;
+		_content_serial[size_t(level)]++;
 		_jobs.push_back(Job(level, x0, y0, x1, y1));
 		_invalidated_texels += uint64_t(x1 - x0) * uint64_t(y1 - y0);
 		queued++;
@@ -289,6 +348,10 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 			}
 			break;
 		}
+		// The rect is whole, so a bake has something to cover: the *rect*, not the level, because the
+		// texels outside it still describe the world positions they described before - which is the
+		// whole reason the baked layers are indexed logically.
+		_queue_bake_rect(job.level, job.x0, job.y0, job.x1, job.y1);
 	}
 	// A level that had work and has none left is now whole: it becomes valid and is published. A
 	// level the budget left half-produced stays invalid, which is what tells a reader it still
@@ -344,6 +407,8 @@ void Terrain3DClipmap::_rebuild_jobs(const Vector2 &p_focus) {
 		if (first_fill || !entry.valid) {
 			entry.center = snapped;
 			entry.valid = false;
+			entry.baked = false;
+			_content_serial[size_t(level)]++;
 			fills.push_back({ level, 0, 0, _config.size, _config.size });
 			_full_productions++;
 			continue;
@@ -357,6 +422,8 @@ void Terrain3DClipmap::_rebuild_jobs(const Vector2 &p_focus) {
 		// The level stops being valid the moment it has work queued, not when the budget finally
 		// drains it: between the two it holds the level it replaces, and `valid` is what says so.
 		entry.valid = false;
+		entry.baked = false;
+		_content_serial[size_t(level)]++;
 		if (Math::abs(delta.x) >= _config.size || Math::abs(delta.y) >= _config.size) {
 			// The focus left the level's own coverage: nothing of the old content belongs to the new
 			// one, so the level is rebuilt whole rather than edge by edge.
@@ -471,6 +538,9 @@ void Terrain3DClipmap::_ensure_texture() {
 		_layer_image = Image::create_from_data(_config.size, _config.size, false, _config.format, blank);
 	}
 	_texture.ensure_layers(_layer_image, int(_levels.size()) * _config.channels);
+	// A ring configured before a device was reachable allocates its baked channels here instead, so
+	// the producer finds storage rather than having to ask for a reconfigure.
+	_ensure_baked();
 }
 
 void Terrain3DClipmap::_publish_level(const int p_level) {
@@ -504,6 +574,346 @@ void Terrain3DClipmap::_publish_level(const int p_level) {
 	}
 }
 
+RID Terrain3DClipmap::get_baked_device_rid(const int p_channel) const {
+	if (p_channel < 0 || p_channel >= int(_baked_rd.size())) {
+		return RID();
+	}
+	return _baked_rd[size_t(p_channel)];
+}
+
+RID Terrain3DClipmap::get_baked_texture_rid(const int p_channel) const {
+	if (p_channel < 0 || p_channel >= int(_baked_rs.size())) {
+		return RID();
+	}
+	return _baked_rs[size_t(p_channel)];
+}
+
+void Terrain3DClipmap::mark_baked_stale() {
+	// Every level, because what a bake writes is a function of the level's payload *and* of the
+	// surface material list it is evaluated against (`Terrain3DSurfaceBaker::set_materials()`), and an
+	// asset edit changes the list for the whole ring at once. The payload is untouched by that - the
+	// source still holds exactly these texels - so this is not an invalidation of `valid`: it is the
+	// bake's own staleness, and every level is queued whole for the next offer.
+	for (int level = 0; level < int(_levels.size()); level++) {
+		_queue_bake_rect(level, 0, 0, _config.size, _config.size);
+	}
+}
+
+// One produced rect joins its level's queue, translated into the level's *stored* frame.
+//
+// The produced rect is a rect of logical texels - the ones whose content the level's own movement
+// changed - and the baked layer is indexed the way the payload layer is, by the *stored* texel,
+// because the stored frame is the one that keeps naming the same world position as the level turns:
+// the centre moves and the ring offset turns with it, so a texel the movement did not touch still
+// describes the world position it described. That is what makes a strip's bake sufficient, and a layer
+// indexed in the level's own (moving) frame would leave the rest of the level describing world
+// positions it no longer covers. A rect that crosses the wrap is two rects, because a stored rect is
+// contiguous.
+void Terrain3DClipmap::_queue_bake_rect(const int p_level, const int p_x0, const int p_y0, const int p_x1,
+		const int p_y1) {
+	if (p_level < 0 || p_level >= int(_levels.size()) || p_x1 <= p_x0 || p_y1 <= p_y0) {
+		return;
+	}
+	const int size = _config.size;
+	const int width = p_x1 - p_x0;
+	const int height = p_y1 - p_y0;
+	// A whole level is the whole stored square whatever the ring is: that keeps a first fill and a
+	// material change one rect rather than the two the wrap would make of it.
+	if (width >= size && height >= size) {
+		_queue_stored_bake_rect(p_level, 0, 0, size, size);
+		return;
+	}
+	const Vector2i ring = _levels[size_t(p_level)].ring;
+	const int x_start = _wrap(p_x0 + ring.x);
+	const int y_start = _wrap(p_y0 + ring.y);
+	// One interval an axis, or two when that interval runs off the end of the stored square.
+	const int x_starts[2] = { x_start, 0 };
+	const int x_ends[2] = { MIN(x_start + width, size), x_start + width - size };
+	const int x_count = x_start + width <= size ? 1 : 2;
+	const int y_starts[2] = { y_start, 0 };
+	const int y_ends[2] = { MIN(y_start + height, size), y_start + height - size };
+	const int y_count = y_start + height <= size ? 1 : 2;
+	for (int xi = 0; xi < x_count; xi++) {
+		for (int yi = 0; yi < y_count; yi++) {
+			if (x_ends[xi] <= x_starts[xi] || y_ends[yi] <= y_starts[yi]) {
+				continue;
+			}
+			_queue_stored_bake_rect(p_level, x_starts[xi], y_starts[yi], x_ends[xi], y_ends[yi]);
+		}
+	}
+}
+
+void Terrain3DClipmap::_queue_stored_bake_rect(const int p_level, const int p_x0, const int p_y0,
+		const int p_x1, const int p_y1) {
+	// The rect's own content, which is the level's content *now*: what the CPU side has produced into
+	// this rect is exactly what a bake of it will read, and a later production into the same rect is
+	// what takes the lease away again.
+	const uint64_t lease = take_bake_lease(p_level);
+	for (BakeRect &rect : _bake_rects) {
+		if (rect.level != p_level) {
+			continue;
+		}
+		// Disjoint: a second entry for the level, which is the honest shape - two strips that do not
+		// touch are two rects, and a producer may bake one and not the other.
+		if (rect.x1 <= p_x0 || rect.x0 >= p_x1 || rect.y1 <= p_y0 || rect.y0 >= p_y1) {
+			continue;
+		}
+		rect.x0 = MIN(rect.x0, p_x0);
+		rect.y0 = MIN(rect.y0, p_y0);
+		rect.x1 = MAX(rect.x1, p_x1);
+		rect.y1 = MAX(rect.y1, p_y1);
+		// The merged rect covers content the in-flight bake never read, so its lease moves with it: the
+		// dispatch that covered the smaller rect is refused and the larger one is baked instead.
+		rect.lease = lease;
+		_refresh_baked(p_level);
+		_state_stamp++;
+		return;
+	}
+	BakeRect queued;
+	queued.level = p_level;
+	queued.x0 = p_x0;
+	queued.y0 = p_y0;
+	queued.x1 = p_x1;
+	queued.y1 = p_y1;
+	queued.lease = lease;
+	_bake_rects.push_back(queued);
+	_refresh_baked(p_level);
+	_state_stamp++;
+}
+
+// What a reader must not serve right now: everything un-baked plus everything still being produced.
+// The two are the same statement at different stages - "the stored texels here do not match the layers
+// yet" - and the second is what lets a reader keep serving the rest of a level while a strip is filled.
+int Terrain3DClipmap::get_outstanding_rects(const int p_level, BakeRect *r_rects, const int p_max) const {
+	if (p_level < 0 || p_level >= int(_levels.size()) || r_rects == nullptr || p_max <= 0) {
+		return 0;
+	}
+	int count = 0;
+	bool overflow = false;
+	// The stored image of a rect of *logical* texels, which is what a job holds. The conversion is the
+	// same one the bake queue takes, including the split a rect crossing the wrap needs.
+	auto append_logical = [&](const int p_x0, const int p_y0, const int p_x1, const int p_y1) {
+		const int size = _config.size;
+		const int width = p_x1 - p_x0;
+		const int height = p_y1 - p_y0;
+		if (width <= 0 || height <= 0) {
+			return;
+		}
+		if (width >= size && height >= size) {
+			if (count >= p_max) {
+				overflow = true;
+				return;
+			}
+			r_rects[count++] = BakeRect{ p_level, 0, 0, size, size, 0 };
+			return;
+		}
+		const Vector2i ring = _levels[size_t(p_level)].ring;
+		const int x_start = _wrap(p_x0 + ring.x);
+		const int y_start = _wrap(p_y0 + ring.y);
+		const int x_starts[2] = { x_start, 0 };
+		const int x_ends[2] = { MIN(x_start + width, size), x_start + width - size };
+		const int x_count = x_start + width <= size ? 1 : 2;
+		const int y_starts[2] = { y_start, 0 };
+		const int y_ends[2] = { MIN(y_start + height, size), y_start + height - size };
+		const int y_count = y_start + height <= size ? 1 : 2;
+		for (int xi = 0; xi < x_count; xi++) {
+			for (int yi = 0; yi < y_count; yi++) {
+				if (x_ends[xi] <= x_starts[xi] || y_ends[yi] <= y_starts[yi]) {
+					continue;
+				}
+				if (count >= p_max) {
+					overflow = true;
+					return;
+				}
+				r_rects[count++] = BakeRect{ p_level, x_starts[xi], y_starts[yi], x_ends[xi], y_ends[yi], 0 };
+			}
+		}
+	};
+	// The rects still being produced come first: they are the ones a reader has no baked content for at
+	// all, so a table that has to cut something keeps those.
+	for (const Job &job : _jobs) {
+		if (job.level == p_level) {
+			append_logical(job.x0, job.y0, job.x1, job.y1);
+		}
+	}
+	for (const BakeRect &rect : _bake_rects) {
+		if (rect.level != p_level) {
+			continue;
+		}
+		if (count >= p_max) {
+			overflow = true;
+			break;
+		}
+		r_rects[count++] = rect;
+	}
+	if (overflow) {
+		r_rects[0] = BakeRect{ p_level, 0, 0, _config.size, _config.size, 0 };
+		return 1;
+	}
+	return count;
+}
+
+// One writer for the flag the arm and the report read: a level is baked when nothing of it is queued.
+// A level whose rects are all still queued - or which has never been baked - is not baked, and the arm
+// falls back for it.
+void Terrain3DClipmap::_refresh_baked(const int p_level) {
+	if (p_level < 0 || p_level >= int(_levels.size())) {
+		return;
+	}
+	bool queued = false;
+	for (const BakeRect &rect : _bake_rects) {
+		if (rect.level == p_level) {
+			queued = true;
+			break;
+		}
+	}
+	Level &entry = _levels[size_t(p_level)];
+	if (entry.baked == !queued) {
+		return;
+	}
+	entry.baked = !queued;
+	// A reader's addressing depends on it, so this is a state change like a centre or a ring.
+	_state_stamp++;
+}
+
+bool Terrain3DClipmap::acknowledge_bake_rect(const int p_level, const int p_x0, const int p_y0,
+		const int p_x1, const int p_y1, const uint64_t p_lease) {
+	if (p_level < 0 || p_level >= int(_levels.size())) {
+		_bake_rejects++;
+		return false;
+	}
+	for (size_t index = 0; index < _bake_rects.size(); index++) {
+		const BakeRect &rect = _bake_rects[index];
+		if (rect.level != p_level || rect.x0 != p_x0 || rect.y0 != p_y0 || rect.x1 != p_x1 ||
+				rect.y1 != p_y1) {
+			continue;
+		}
+		// The rect's *own* lease, not the level's: a rect that was not produced into since it was queued
+		// holds exactly the texels the bake read, however many times the level moved around it - which is
+		// the whole reason a focused camera can be baked at all. A rect that grew over new content since
+		// carries a newer lease, so the dispatch that covered the smaller rect is refused and the larger
+		// one is baked instead.
+		if (rect.lease != p_lease) {
+			_bake_rejects++;
+			return false;
+		}
+		_bake_rects.erase(_bake_rects.begin() + int64_t(index));
+		_baked_texels += uint64_t(p_x1 - p_x0) * uint64_t(p_y1 - p_y0) *
+				uint64_t(MAX(1, _config.baked_channels));
+		_bake_dispatches++;
+		_refresh_baked(p_level);
+		_state_stamp++;
+		return true;
+	}
+	// No such rect: the queue was cleared under the dispatch (a reconfigure), or the rect was merged
+	// into another one. Both mean the bake describes texels this ring no longer queues.
+	_bake_rejects++;
+	return false;
+}
+
+uint64_t Terrain3DClipmap::take_bake_lease(const int p_level) const {
+	if (p_level < 0 || p_level >= int(_content_serial.size())) {
+		return 0;
+	}
+	// The shape in the high half, the level's content in the low one. One number so a producer stores
+	// one value per rect it dispatches, and `0` is not a lease: a level that has no content counter
+	// has no lease to take.
+	return (_shape_serial << 32) | (_content_serial[size_t(p_level)] & 0xFFFFFFFFull);
+}
+
+Rect2 Terrain3DClipmap::get_level_world_bounds(const int p_level) const {
+	if (p_level < 0 || p_level >= int(_levels.size())) {
+		return Rect2();
+	}
+	return _clipmap_logical_rect_world(_levels[size_t(p_level)], 0, 0, _config.size, _config.size);
+}
+
+// One device texture per baked channel, `levels` layers each, plus its `RenderingServer` wrapper.
+// The producer writes the device texture as a storage image and the arm samples the wrapper, so
+// the two are created together and freed together: a wrapper with no producer would be a sampler
+// over memory nobody wrote, and a producer with no wrapper would bake into something nothing can
+// read.
+void Terrain3DClipmap::_ensure_baked() {
+	if (_config.baked_channels <= 0 || _levels.empty()) {
+		return;
+	}
+	if (!_baked_rd.empty() && _baked_rd[0].is_valid()) {
+		return;
+	}
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		// No device yet - a headless run, or a configure before the first frame. `_ensure_texture()`
+		// calls this again on the first publish, which is the first moment a device is certain.
+		return;
+	}
+	_free_baked();
+	Ref<RDTextureFormat> format;
+	format.instantiate();
+	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
+	format->set_format(_clipmap_baked_data_format());
+	format->set_width(uint32_t(_config.size));
+	format->set_height(uint32_t(_config.size));
+	format->set_depth(1);
+	// At least two layers, whatever the ring's level count: the renderer refuses to wrap a one-layer
+	// array as a layered texture (`texture_rd_create()` fails on `array_layers == 1`), and the arm
+	// samples these as an array. A one-level ring therefore allocates one layer that is never written
+	// and never read - one layer of one level is cheaper than a second publish path for that shape.
+	format->set_array_layers(uint32_t(MAX(_levels.size(), size_t(2))));
+	format->set_mipmaps(1);
+	// Storage, so a producer writes a level; sampling, so the arm reads it; update, because the
+	// producer's pass is issued against the same texture the material binds. Neither copy direction
+	// is asked for: nothing moves a baked layer, because the CPU has no copy of one by construction.
+	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT);
+	Ref<RDTextureView> view;
+	view.instantiate();
+	// Created uninitialised: every texel of every layer belongs to a producer, and a level is only
+	// ever read while it is `baked`. Seeding a blank layer per level here would cost a transfer per
+	// configure and buy nothing a reader uses.
+	TypedArray<PackedByteArray> initial;
+	for (int channel = 0; channel < _config.baked_channels; channel++) {
+		RID device = rd->texture_create(format, view, initial);
+		RID shader = device.is_valid()
+				? server->texture_rd_create(device, RenderingServer::TEXTURE_LAYERED_2D_ARRAY)
+				: RID();
+		if (!shader.is_valid()) {
+			if (device.is_valid()) {
+				rd->free_rid(device);
+			}
+			LOG(ERROR, "Could not allocate clipmap baked channel ", channel, " (", get_source_name(), ")");
+			_free_baked();
+			return;
+		}
+		rd->set_resource_name(device, "Terrain3D Clipmap " + get_source_name() + " baked " +
+						String::num_int64(channel));
+		_baked_rd.push_back(device);
+		_baked_rs.push_back(shader);
+	}
+}
+
+void Terrain3DClipmap::_free_baked() {
+	if (_baked_rd.empty() && _baked_rs.empty()) {
+		return;
+	}
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	// The wrapper first and the device texture second: the wrapper is what a material holds, and it
+	// is the device texture's lifetime that has to outlast every reader of it.
+	for (const RID &rid : _baked_rs) {
+		if (rid.is_valid() && server != nullptr) {
+			server->free_rid(rid);
+		}
+	}
+	for (const RID &rid : _baked_rd) {
+		if (rid.is_valid() && rd != nullptr) {
+			rd->free_rid(rid);
+		}
+	}
+	_baked_rd.clear();
+	_baked_rs.clear();
+}
+
 Array Terrain3DClipmap::get_level_reports() const {
 	Array reports;
 	for (int level = 0; level < int(_levels.size()); level++) {
@@ -517,6 +927,22 @@ Array Terrain3DClipmap::get_level_reports() const {
 		report["center"] = entry.center;
 		report["ring"] = entry.ring;
 		report["valid"] = entry.valid;
+		report["baked_channels"] = _config.baked_channels;
+		report["baked"] = entry.baked;
+		// What the level still owes the device, and in the same unit the production budget is charged
+		// in - channel texels - so "how much of this level is unbaked" is a number rather than a flag.
+		int pending_rects = 0;
+		int64_t pending_texels = 0;
+		for (const BakeRect &rect : _bake_rects) {
+			if (rect.level != level) {
+				continue;
+			}
+			pending_rects++;
+			pending_texels += int64_t(rect.x1 - rect.x0) * int64_t(rect.y1 - rect.y0) *
+					int64_t(MAX(1, _config.baked_channels));
+		}
+		report["pending_bake_rects"] = pending_rects;
+		report["pending_bake_texels"] = pending_texels;
 		reports.push_back(report);
 	}
 	return reports;
@@ -535,6 +961,8 @@ Array Terrain3DClipmap::get_layout_reports() const {
 		report["center"] = entry.center;
 		report["ring"] = entry.ring;
 		report["valid"] = entry.valid;
+		report["baked_channels"] = _config.baked_channels;
+		report["baked"] = entry.baked;
 		// What is left of this level's jobs, in world space, because that is what a debug view draws
 		// and because a queued rect is the one thing a settled report cannot show. A rect the budget
 		// cut short is up to *two* rects - the rest of the row it stopped inside, then the rows below

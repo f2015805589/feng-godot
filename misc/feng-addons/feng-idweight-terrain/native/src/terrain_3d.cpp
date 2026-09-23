@@ -256,6 +256,15 @@ void Terrain3D::__physics_process(const double p_delta) {
 					continue;
 				}
 				_vt.clipmap_produced_texels += ring->update(focus, _vt.clipmap_budget_texels);
+				// And whatever a producer bakes out of what the ring produced - the *rects* it produced,
+				// offered under the same budget they were produced under. The ring carries the layers, the
+				// bake belongs to the shader's owner, and this is where the two meet: a ring whose channel
+				// declares no baked layers answers without touching the device, and one that does has its
+				// rects dispatched by the next render callback, reported back a call later
+				// (see `Terrain3DSurfaceBaker::queue_clipmap_ring()`).
+				if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+					baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
+				}
 			}
 		});
 		vt_phase(_vt.vt_clipmap_ms);

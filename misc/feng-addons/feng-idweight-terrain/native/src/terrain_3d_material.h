@@ -7,6 +7,7 @@
 
 #include "constants.h"
 #include "generated_texture.h"
+#include "terrain_3d_vt_delivery.h"
 
 class Terrain3D;
 
@@ -115,13 +116,18 @@ private:
 	// Functions
 	bool _shader_uses_vt = true;
 	bool _needs_vt_shader() const;
-	// The second axis of the same variant choice: whether the generated code carries the height
-	// group's clipmap arm (`TERRAIN_HEIGHT_CLIPMAP`). Kept beside `_shader_uses_vt` rather than folded
-	// into it because the two move independently - a configuration can have the material arms and no
-	// ring, or (deliberately) the ring and no material arms - and a rebuild has to happen when
-	// *either* changed.
-	bool _shader_height_clipmap = false;
-	bool _needs_height_clipmap_arm() const;
+	// The second axis of the same variant choice: which channel groups' clipmap arms the generated
+	// code carries (one `TERRAIN_CLIPMAP_<GROUP>` define each). Kept beside `_shader_uses_vt` rather
+	// than folded into it because the two move independently - a configuration can have the material
+	// arms and no ring, or (deliberately) the ring and no material arms - and a rebuild has to happen
+	// when *either* changed. One entry per group, indexable by `TerrainVT::ChannelGroup`, so the
+	// channel the ring gains later needs no change here.
+	bool _shader_clipmap[TerrainVT::GROUP_COUNT] = { false };
+	bool _needs_clipmap_arm(const int p_group) const;
+	// Whether any group's arm differs from the one the policy asks for. Both halves of the variant
+	// choice are compared through here, because either one entering or leaving the generated code is
+	// a shader rebuild rather than a uniform rebind.
+	bool _clipmap_arm_changed() const;
 	void _preload_shaders();
 	void _parse_shader(const String &p_shader, const String &p_name);
 	String _apply_inserts(const String &p_shader, const Array &p_excludes = Array()) const;
@@ -157,10 +163,14 @@ public:
 	// because "a configuration that selects no method costs no shader code" is otherwise a claim
 	// about a string nobody can read. False means the code compiled is the no-VT build.
 	bool is_shader_using_vt() const { return _shader_uses_vt; }
-	// Whether the same generated shader carries the height group's clipmap arm. Published for the
-	// same reason: "a height group delivered `Direct` in both bands compiles no ring code and binds
-	// no ring uniform" is otherwise a claim about a string nobody can read.
-	bool is_shader_using_height_clipmap() const { return _shader_height_clipmap; }
+	// Whether the same generated shader carries one channel group's clipmap arm. Published for the
+	// same reason, and per group rather than once: "a group delivered `Direct` in both bands compiles
+	// no ring code and binds no ring uniform" is otherwise a claim about a string nobody can read, and
+	// a build can carry one group's arm without the other's. Read as `clipmap[group].shader_arm` in
+	// `get_vt_settings()`.
+	bool is_shader_using_clipmap(const int p_group) const {
+		return p_group >= 0 && p_group < TerrainVT::GROUP_COUNT && _shader_clipmap[p_group];
+	}
 
 	RID get_buffer_material_rid() const { return _buffer_material; }
 	RID get_buffer_shader_rid() const { return _buffer_shader.is_valid() ? _buffer_shader->get_rid() : RID(); }

@@ -19,13 +19,28 @@ Derivatives never pass through the page-coordinate `fract` operation. No softwar
 loop of additional material samples was added: hardware filtering does the work,
 and the page gutter is what bounds it.
 
-## The anisotropy triple, and why the default gutter is nine texels
+## The anisotropy triple, and what the page gutter bounds
 
 A filtering footprint cannot reach past the border texels a page carries, so the
 gutter is a physical bound rather than a policy: a page asked for more than its
 gutter admits samples its own rim instead of the neighbouring ground. The bound is
-`border - 0.5`, and it is conservative on purpose - it accounts for the smaller
-texels of the lower virtual mip and for bilinear support.
+the anisotropic kernel's own extent. The mip selection holds the minor axis at
+about one texel, so a ratio of `n` spans about `n` texels along the major axis, its
+half-extent is `n / 2`, and bilinear support adds half a texel:
+
+```
+n / 2 + 0.5 <= border   ->   n <= 2 * border - 1
+```
+
+This is the rule `Terrain3D::get_avt_anisotropy()` and the shader's
+`avt_pixel_footprint()` both evaluate. The default gutter is **five** texels because
+that is the smallest gutter that admits the near field's default 8x request.
+
+The accounting this replaced was `border - 0.5`, which reads a gutter of `n` as a
+ratio of `n` rather than as a half-extent: it made five texels admit 4.5x and nine
+texels admit 8.5x, so the shipped gutter had to be nine to let the 8x request through
+at all, and a project that measured its own kernel would have found the bound three
+times larger than any request the setting can name.
 
 The second physical bound is the sampler itself, and until it was added the level
 math could assume taps no fragment gets. Godot builds a material sampler per
@@ -39,25 +54,25 @@ selects the mip whose texel is `major / taps`, and then takes `taps` samples a t
 apart: full coverage. A shader that selects the mip for a *larger* number asks for a
 page finer than that, and an AVT page is one physical mip in a one-mip atlas, so the
 sampler stays on it and covers it with a stride of `assumed / actual` texels. The
-texels in between are never read. At the shipped pair - a nine-texel gutter and an
+texels in between are never read. At the shipped pair - a five-texel gutter and an
 eight-times request on a stock 4x project - that was a two-times overshoot, and
 `vt_anisotropy.gd` measures it at a saturated grazing pose on a noise page and its
-box-averaged parent: **0.0677** window deviation for the page chosen for 8x against
-**0.0362** for the page chosen for the sampler's 4x, a 1.87x difference in sampling
+box-averaged parent: **0.0692** window deviation for the page chosen for 8x against
+**0.0326** for the page chosen for the sampler's 4x, a 2.12x difference in sampling
 noise, which is what a moving camera sees as crawling.
 
-The shipped values used to be a four-texel gutter and whatever the viewport's
-filtering level said, which the gutter then reduced to **3.5x** silently, whatever
-was asked for: a project set to 8x or 16x still filtered at 3.5x and nothing said
-so. The near field now has one setting for the request, one reading for the taps,
-and one function for the answer:
+The shipped values used to be a four-texel gutter read through the same accounting,
+which the old rule then reduced to **3.5x** silently, whatever was asked for: a
+project set to 8x or 16x still filtered at 3.5x and nothing said so. The near field
+now has one setting for the request, one reading for the taps, and one function for
+the answer:
 
 * `surface_vt_anisotropy` is the request, in multiples; `0` follows the viewport's
   level, which is what the addon did before the setting existed. The default is
   **8**, and it is an upper bound on what the near field will assume rather than a
   demand it can place on the hardware.
-* `vt_page_border` is the gutter, and its default moved from four to **nine**, which
-  admits 8.5.
+* `vt_page_border` is the gutter. Its default is **five**, which admits
+  `2 * 5 - 1 = 9`.
 * `Terrain3D::get_avt_anisotropy_sampler()` reads the taps the viewport's filtering
   level gives the material samplers. `Terrain3D::get_avt_anisotropy()` is the one
   home for the answer - the request clamped by that reading *and* the gutter - and
@@ -71,20 +86,23 @@ and one function for the answer:
   `["avt_anisotropy_requested"]` and `["avt_anisotropy_effective"]` are the four
   readings, so a project can see which bound decides its near field: a 4x project
   reads sampler 4, requested 8, effective 4. Raising the border admits a wider
-  *request* up to `border - 0.5` (16x needs a gutter of seventeen, above the sixteen
-  the setting allows); raising the *sampler* means setting the viewport's - or the
-  project's default - anisotropic filtering level, which is the only thing that
-  changes how many taps a fragment gets.
+  *request* up to `2 * border - 1` (16x needs a gutter of nine, well inside the
+  sixteen the setting allows); raising the *sampler* means setting the viewport's -
+  or the project's default - anisotropic filtering level, which is the only thing
+  that changes how many taps a fragment gets.
 
-What nine costs: a stored page is `page_size + 2 * border`, so a 256-texel page goes
-from 264 to 274 texels a side, **7.7% more texels per page** for the same world
-coverage - a proportional cost in pool memory, source production and the encoder's
-byte ceiling. Both views share `vt_page_border`, so the far field's gutter grows with
-it. That is memory it does not need for filtering - **the far field's sampling is
-unchanged**: it samples with a plain `textureLod(..., 0.0)` on `filter_linear`
-samplers, with no gradients and no anisotropy, and its level comes from the distance
-rule. Its gutter is for its own mip transitions. Giving the far field gradient-based
-anisotropic sampling is a separate change and is not made here.
+What the gutter costs: a stored page is `page_size + 2 * border`, so the shipped
+266-texel page stores 1.5% more texels a side than the 264 a four-texel gutter
+stores and **5.8% fewer** than the 274 the nine-texel bound cost - a proportional
+cost in pool memory, source production and the encoder's byte ceiling. The border is
+now the smallest one that admits the request, so the cost is a function of the
+setting rather than of the accounting. Both views share `vt_page_border`, so the far
+field's gutter follows the near field's. That is memory it does not need for
+filtering - **the far field's sampling is unchanged**: it samples with a plain
+`textureLod(..., 0.0)` on `filter_linear` samplers, with no gradients and no
+anisotropy, and its level comes from the distance rule. Its gutter is for its own mip
+transitions. Giving the far field gradient-based anisotropic sampling is a separate
+change and is not made here.
 
 Camera cuts had a separate scheduling error: `asin(length(cross))` folds angles
 above 90 degrees, making an approximately 180-degree turn look almost stationary.
@@ -117,7 +135,8 @@ the implementation bounds that cost rather than claiming it is free.
 ## Measured: what 8x costs the near field's working set
 
 `vt_cap_probe_runner.py --driver d3d12` at the default tick budget, the same script before and
-after the default pair moved (a four-texel gutter with 3.5x effective, then nine texels with 8x).
+after the default pair moved (a 3.5x effective request when the gutter was four, then 8x with the
+gutter corrected).
 Both columns were measured at the near-field reach that was the default at the time, 512 m; the
 reach itself moved to 384 m in the same round, for reasons and with measurements of its own
 (`vt_reference_avt_alignment.md` section 7.7.14), and the two changes are independent: this table is
@@ -140,10 +159,11 @@ The request is what the finer singular footprint selects, so 8x asks for a finer
 angles: the near field's plan grows about **50%** and its page churn about 25% with it. Nothing in
 the probe was capacity-starved for it (`avt_missing` stays 0, both wait counters stay 0) and the far
 field's own miss count barely moves - the cost lands where 8x is meant to spend it. The gutter's own
-arithmetic is separate and certain: a stored page is `page_size + 2 * border`, so 264 -> 274 texels
-is **7.7% more texels a page**, and under compression the encoder's 96 MB byte ceiling admits about
-40 ring positions instead of 46, which is a compressed rate ceiling of ~20 pages a frame instead of
-~23. A page-sized run is bounded by its slot count and does not move.
+arithmetic is separate and certain: a stored page is `page_size + 2 * border`, so the 266 texels the
+shipped five-texel bound stores is **5.8% fewer** than the 274 the nine-texel bound cost (and 1.5%
+more than the 264 a four-texel gutter stores, which could not admit the request at all). The table
+above was measured under the nine-texel gutter; the request it spent is the same one, and the
+encoder's ring ceiling scales down with the page, not up.
 
 ## Regressions
 
@@ -153,11 +173,11 @@ is **7.7% more texels a page**, and under compression the encoder's 96 MB byte c
   fine/coarse page colors at three grazing orientations, including a rolled view.
   `vt_anisotropy.gd` also pins the rule that decides the number the shader and the
   planner may assume: the request clamped by the sampler's tap count *and* the
-  gutter, read live in both directions (a 4x viewport under a nine-texel gutter reads
-  4; an 8x viewport reads 8; a four-texel gutter caps it at 3.5). It then renders a
+  gutter, read live in both directions (a 4x viewport under the shipped five-texel
+  gutter reads 4; an 8x viewport reads 8; a four-texel gutter caps it at 7). It then renders a
   saturated grazing pose twice - bound to 8 and to 4 - over a one-texel noise page and
   its box-averaged parent, and asserts that the page chosen for 8x reads noisier
-  (measured 0.0677 against 0.0362, a 1.87x ratio; the window is 3 x 51 pixels and the
+  (measured 0.0692 against 0.0326, a 2.12x ratio; the window is 3 x 51 pixels and the
   assertion is `> 1.25x`). A precondition asserts the two assumptions land on
   different resident pages (fine at 8x, its parent at 4x), so the measurement cannot
   silently become a comparison of one page with itself.

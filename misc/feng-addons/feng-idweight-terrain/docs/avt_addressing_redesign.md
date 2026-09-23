@@ -219,11 +219,13 @@ every other. The walk in `plan_pages()` popped its pending queue by `(produce, d
 was depth-first on the closest cell: a chain to the pixel footprint is 1+4+16+... entries and the plan
 holds ~128, so one cell consumed the budget and every other cell kept its root.
 
-**The fix.** The pending queue is ordered by **page world span** first: every cell descends one world
-level before any cell descends two. Span is the one quantity two chains can be compared by across
-blocks of different sizes - a 256-page block and a 64-page block hold the same world resolution at
-different local mips, which is why ordering by local mip (tried first) let the larger block outrank the
-smaller at every level.
+**The fix, and what later replaced it.** The pending queue was ordered by **page world span** first:
+every cell descends one world level before any cell descends two. Span is the one quantity two chains
+can be compared by across blocks of different sizes - a 256-page block and a 64-page block hold the same
+world resolution at different local mips, which is why ordering by local mip (tried first) let the larger
+block outrank the smaller at every level. That order fixed the bimodality and left the ceiling this
+section's own "does not do" note measured; it is **superseded by the demand-deficit order** in the next
+subsection.
 
 | Reading | Before | After |
 | --- | --- | --- |
@@ -242,12 +244,75 @@ levels alone is 756 entries. The remaining levers, in cost order, are the **fall
 radius so the same budget buys more depth where the camera is looking, and the pool default. The probe
 and its assertion are now part of `vt_turn_budget`, so the next change here is measured the same way.
 
+**Superseded: the queue is ordered by demand deficit, and the ceiling is gone.** `native/tests/vt_near_density.gd` measures the delivered density at a 1080p gameplay view with the shipped defaults (pool 256, auto-grown to 512): under the span order the plan held **496 resident pages, none finer than a metre, no page at local mip 0 or 1 of any sector, and the finest thing on screen was 256 texels/m** - while the ground two metres in front of the camera asked for 0.25-0.5 m pages. The budget was not short; it was spent on one *world size* everywhere. Ordering the same walk by `span * density` - how many times coarser than its own demand a footprint's page is - spends that residency where the view asks for it, and the per-footprint descent test already bounds what any one cell can take:
+
+| `vt_near_density` reading | span order | deficit order |
+| --- | --- | --- |
+| `plan_level_mips` | `[0, 0, 153, 108, 60, 38, 41, 10, 2]` | `[62, 110, 98, 57, 30, 20, 23, 10, 2]` |
+| `finest_requested_texel_world` | 1/256 m | **1/1024 m** |
+| Finest ready page | 256 texels/m | **1024 texels/m**, 1.6 m in front of the camera |
+| Ready fine pages at 512+ texels/m | 0 | **172** |
+| Ready fine pages at 16-64 texels/m | 122 | 60 |
+| Ready fine pages at 4-8 texels/m (the outer cells) | 29 | 25 |
+| `visible_missing_pages` / fallback tier | 0 / 84 of 84 | 0 / 84 of 84 |
+
+The outer cells keep their coarse pages, so this is not the "one cell eats the plan" failure returning:
+it is the same residency placed by the metric the view is judged on. The lever list above changes with
+it - the fallback tier's precision and the pool default are now what decide how far past 1024 texels/m
+the near ground could go, while a smaller radius or a larger pool buys depth *inside* the demand rather
+than coverage across it. The test is a regression of its own (`vt_near_density_runner.py`), so the next
+change here is measured the same way.
+
+**The other candidates, checked and not needed.** The blur this fixed had four other suspects, and each
+was answered by reading the path rather than by changing it:
+
+* **Writing the coarser level's entry into the new fine entry (the reference's remap trick).** It saves
+  the indirection mip walk, not sharpness: the entry names the *same* physical page, so the sample is
+  identical. Here the walk is one to three `texelFetch`es and the indirection payload is a bare `R32F`
+  slot (`TerrainVT::SLOT_BIT_COUNT` 11) with no room for a mip, so the trick has neither a target nor a
+  payoff. What was wrong was *which* pages were resident - the selection above.
+* **`mip_bias`.** The plan coarsens every sector together when the visible hierarchy cannot fit the
+  residency budget. At the shipped pose it is 0 (`capacity_mip_bias`), while
+  `refinement_requests_denied` is 643 against 496 selected - the plan is budget-bound but not biased -
+  so the coarsening was a pressure response that did not fire, not the steady-state ceiling the
+  measurement found.
+* **Parent blending and the page fade.** `avt_filtered_sample()` blends the level the footprint's mip
+  fraction asks for, and a page still arriving blends from the level it replaced; both are bounded by
+  the arrival ramp (`vt_page_fade_frames`, 12 by default). The probe runs with the ramp off
+  (`vt_page_fade_frames = 0`) and still measured 256 texels/m as the ceiling, so neither is what held
+  the image back.
+* **The source density ceiling.** A region's ID/weight payload is `region_size x surface_density`
+  (1/2/4/8 texels per metre, default 1), so *material blend boundaries* cannot be placed finer than a
+  metre however fine the physical page is. That is a real ceiling on boundary sharpness - the pages
+  carry the material detail at their own density, but a transition between two materials is
+  interpolated from a 1 texel/m source. It is a `surface_density` question rather than an AVT
+  addressing one, and it is the next lever if the view still reads soft at the seams.
+
+**A pose change re-plans, and how that was nearly mis-read.** `vt_near_density`'s closing phase moves the
+camera 100 m in XZ, raises it to 20 m and switches it to a narrow orthographic projection, then asserts
+what the view asks for: `vt_near_density` holds a 1024 texels/m page under the camera (a 0.25 m page
+whose slot the synthetic material probe then reads back green) with `visible_missing_pages` 0. The
+plan's own readings follow the pose - `chain_ticks` +1 and the histogram becomes the narrow pose's own
+`[20, 9, 4, 2, 2, 1, 8, 2, 1]` instead of the game view's `[62, 110, 98, 57, ...]`.
+
+The first version of that phase drove the tick by calling `update_surface_vt()` by hand, many times
+inside one process frame, and it measured something else entirely: `plan_reused` true, no changed key
+component reported, and the standing game-view plan still in place, so the finest page under the camera
+stayed the cell's whole-cell root (4 texels/m) while `finest_requested_texel_world` read 1/1024 from the
+older pose. Invalidating the key by hand in the same run re-derived correctly, which is what showed the
+selection itself was never the problem. The refresh interval is measured in **process frames**
+(`Engine::get_process_frames()` against `avt_last_chain_frame + avt_plan_refresh_frames`), so a fixture
+that ticks many times inside one frame is measuring the interval, not the product: with the pose driven
+through the terrain's own process/physics callbacks, one chain run re-derives everything above. The
+recorded lesson is the fixture rule, not a defect: **plan-lifetime questions have to be driven through
+the callbacks the product uses.** `vt_near_density` now does that, and its assertion is the density the
+new pose asks for.
+
 **The plan's budget was the second half of the same defect.** The walk was ordering-limited *and*
 starved: the near plan's residency budget was capped at exactly half the pool whenever the far field
 was enabled (`_avt_scan_sectors()`), which is a ceiling rather than a share. The near-field probe
 measured the near plan holding 116 of its 128 entries while the far field held 27 pages and **101 of
-the pool's 256 slots sat free**, so the plan could afford a second level for only 15 of the 36 cells it
-covers. The far field keeps a quarter of the pool as a floor instead, and the near plan takes the rest.
+the pool's 256 slots sat free**, so the plan could afford a second level for only 15 of the 36 cells it covers. The far field keeps a quarter of the pool as a floor instead, and the near plan takes the rest.
 
 | Reading | pool/2 ceiling | quarter floor |
 | --- | --- | --- |
@@ -293,7 +358,9 @@ baseline. That is the intended behaviour, and it made a latent arithmetic error 
 the shader uses to cap its anisotropic footprint was not the number of taps the sampler has.
 
 * `Terrain3D::get_avt_anisotropy()` clamped the request (`surface_vt_anisotropy`, default **8**) by
-  the page gutter only (`border - 0.5` = 8.5 at the shipped border of nine).
+  the page gutter only (the rule read then was `border - 0.5` = 8.5 at the border of nine; the gutter's
+  own arithmetic was corrected afterwards to `2 * border - 1`, which is what the function and the
+  shader's `avt_pixel_footprint()` evaluate now - see `vt_sampling_review.md`).
 * Godot builds the material samplers per **viewport** with `anisotropy_max = 1 << level`
   (`MaterialStorage::samplers_rd_allocate`), the viewport's level defaults to the project's
   `rendering/textures/default_filters/anisotropic_filtering_level`, which is **2** (4x), and no
@@ -311,7 +378,7 @@ near field's demand density at grazing angles, because the CPU footprint uses th
 
 **Fixed by reading the taps instead of assuming them.** `get_avt_anisotropy_sampler()` returns
 `1 << viewport_level` (1-16, the project default when there is no camera yet), and
-`get_avt_anisotropy()` is now `min(request, sampler, border - 0.5)`. The request keeps its meaning as
+`get_avt_anisotropy()` is now `min(request, sampler, 2 * border - 1)`. The request keeps its meaning as
 the widest filtering the near field will *assume*; it can no longer exceed what the hardware delivers.
 `get_vt_settings()` reports the four readings (`avt_anisotropy`, `..._sampler`, `..._requested`,
 `..._effective`) so a project can see which bound decides its near field; on a stock project that is
@@ -365,6 +432,224 @@ red, and were A/B'd as pre-existing rather than caused by this: reverting the on
 `get_avt_anisotropy()` to the pre-fix clamp, rebuilding, and re-running all three reproduces every
 failure byte for byte (`vt_visibility` is already recorded as red at HEAD in
 `vt_reference_avt_alignment.md` section 6/H3, and `vt_adaptive:rotation` in 6.5).
+
+### 6.7 What the deficit order actually changed in the red set
+
+The ordering is one lambda in `terrain_3d_avt_plan.cpp`, so the honest question after it landed was
+not "does the near field look right" (6.4 answers that with `vt_near_density`) but "which tests did it
+change". It was A/B'd on one machine with everything else held: the file reverted to `HEAD`, rebuilt,
+the same seven reds run, then restored and rebuilt. The tree's other uncommitted work - the clipmap
+ring, the delivery matrix, the surface views - was identical in both directions.
+
+Five of the seven reds produce a **byte-identical** `REGRESSION` set in both directions:
+
+| Test | `REGRESSION` lines | Deficit order vs `HEAD` |
+| --- | --- | --- |
+| `vt_adaptive:scale` | 1x 25600 visible sectors, 20x moving camera recomputes demand, 16x 10 km coarse coverage (37) | identical |
+| `vt_adaptive:metric` | 2x sparse physical residency, 2x widening the view retains addresses (4) | identical |
+| `vt_adaptive:filtering` | missing fine neighbour stays diagnostic, coarse recovery defaults off, 4x allocate the selected world mip (6) | identical |
+| `vt_adaptive:rotation` | 3x warm camera turn must reuse resident pages | identical |
+| `vt_strict_coverage` | turns 1-3 did not settle after 180 + 120 ticks (3x, printed twice) | identical |
+| `vt_adaptive:ownership` | 6 distinct, 14 lines | **one more**: `camera movement retains automatic coverage` (15) |
+| `vt_adaptive:sectors` | edit phase fails 3 of 7 runs | edit phase fails 3 of 11 runs; see below |
+
+So the ordering's whole measured cost is one assertion inside a test that is red in both directions.
+
+`vt_adaptive:sectors` is the one entry whose text differed, and the first reading of it - "the
+ordering costs a red" - was wrong twice over. Its last phase repaints a region, invalidates its pages,
+settles, and then requires 24 ticks that produce nothing. That phase failed in **both** directions:
+3 of 11 runs with the deficit order, 3 of 7 at `HEAD`.
+
+The first explanation was the pool: demand is ~750 pages for a 256-slot pool, the plan selects 240 and
+reserves 16, so the plan is the pool and one marginal change costs an eviction plus a re-bake. The
+diagnostic added to the test refutes it. Failing runs print
+`VT_SECTORS_EDIT_STATS ... visible_missing=35 ... carried=240 overlapped=0 new_area=0 reselected=0`
+and `VT_SECTORS_EDIT_TICKS [1,1,1,...]` - the plan is *not* churning at all (240 of 240 carried, no
+new area, no reselection); 35 pages are simply visible-missing and the producer refills them at the
+configured one page per tick. Settling runs print `visible_missing=0` and 24 zeroes.
+
+So the defect was in the test's own `settle_sectors()`: it waited for `produced == 0` and
+`producer.pending == 0` for twelve ticks, but not for the view to have no missing pages.
+`invalidate_surface_pages()` arms the edit and the plan turns it into demand on its own refresh, so
+the first quiet ticks can land *before* that, and the "settled" verdict is taken while 35 pages are
+still being refilled. It now requires `avt_sector_stats.visible_missing_pages == 0` as well, which is
+what "settled" means for the assertions that follow. Measured after the change: **8 of 8 runs** reach
+`VT_SECTORS_EDIT color=red` with `VT_SECTORS_EDIT_TICKS [0 x 24]` and no edit-phase regression. The
+test stays red on one line that neither the ordering nor this race touches - `512 m region contains
+independently addressed 64 m sectors` (`has_sector(Vector2i(3, 3))`, with 20 sectors independently
+addressed out of 136 visible in that configuration), which is pre-existing in both directions.
+
+The other rows the user's report was about are unchanged by it too, and the two that are *not* in this
+table are the ones the ordering was aimed at, both green: `vt_near_density` (best delivered page 1024
+texels/m, 110 pages at 512 and 62 at 1024, zero missing) and `vt_anisotropy` (gutter 5, spread 2.12x).
+
+Attribution for the rest of the red set, with the evidence:
+
+| Test | Owner | Evidence |
+| --- | --- | --- |
+| `vt_adaptive:scale`, `metric`, `filtering`, `rotation`, `strict_coverage` | this redesign's earlier revisions, not the ordering | byte-identical A/B above; `rotation` is 6.5, and the `2026-09-17` baseline in `bin/terrain-adaptive-baseline.json` already records `scale`, `metric`, `ownership`, `filtering`, `navigation`, `blend` and `sectors` as failures with the same text |
+| `vt_adaptive:ownership`, `blend` | the delivery/assembly work in the tree (`far/material=SVT`) | `blend`'s remaining line is `missing AVT cannot fall back to available SVT in blend band`; its other assertion was fixed by that work |
+| `vt_render`, `vt_visibility`, `vt_transition_parent` | same | all three assert the pre-delivery model (a fresh fixture with no SVT requests, and a near-field toggle that restores the array path); `vt_visibility` fails on `fresh fixture unexpectedly has SVT requests` and `one-page SVT budget should create one SVT record, got 7` |
+| `vt_turn_budget` | the CPU phase budgets, pre-existing | red in both directions of a dedicated A/B (2 runs each): warm 0.158 / 0.166 ms at `HEAD` against 0.171 / 0.235 ms with the deficit order, slow 0.116-0.156 against 0.126-0.165, all against a 0.10 ms per-phase budget - the ranges overlap and 6.6 records 0.21 ms for the same phase on the pre-change tree, so the misses are not attributable to the ordering, though the sample is small and the warm phase is the one a denser plan could touch |
+| `texture_compression` | the material/baker uniform-set path, not the VT plan | 2 engine errors per run (`Parameter "uniform_set" is null.`, `Uniforms were never supplied for set (0) at the time of drawing`) while the test's own assertion passes - the class `terrain_vt_and_streaming.md` section 6 records as fixed once already, reproducible in 2 of 2 runs on this tree |
+
+The whole suite, on the rebuilt debug template and D3D12, at the end of this work: **60 of 75 pass**
+(`bin/suite-2026-09-23.json`, 06:14-06:44). The 15 reds are the table above plus `editor_dock:setup`
+(recorded as flaky in `terrain_vt_and_streaming.md` section 6, `Add Region did not expand into empty
+space with background disabled` this time) and `vt_near_arrival`, which was not a red at all:
+it exited 2 in 0.1 s, before the engine started, because its default source project was the leftover
+`bin/terrain-project-lifetime-ke6fwkn0` - a directory `vt_project_lifetime_probe.py` creates with a
+random suffix and `run_all.py --prune` exists to delete. With the default pointed at the same real
+project `vt_strict_coverage_runner.py` copies, it runs in 51.6 s, prints its marker and exits 0 with
+`ERRORS=0` - so the same suite is **61 of 75** with that fix in.
+
+Two further reds in that set were **not** defects at all, and both are now green:
+
+- `vt_adaptive:navigation` was red on one engine `ERROR:` line and nothing else - both of its own
+  assertions passed. Enabling VT delivery turns the terrain node's tick back on, so the test's final
+  `await process_frame` ran one physics tick after it had freed the camera, and `_grab_camera()` logged
+  `Cannot find clipmap target or active camera`. The four tests that free their camera now stop the
+  tick first (`native/tests/README.md`).
+- Every other test was *reported* red by a line about the machine: `ERROR: Failed to read the root
+  certificate store.`, which the engine prints once per launch here. `fixture.ENVIRONMENTAL_ERRORS`
+  and `fixture.log_errors()` exclude it, the runners use them, and `vt_fallback_runner.py` now exits 0
+  with `ERRORS=0` on a clean run instead of 1 with `ERRORS=2`.
+
+### 6.8 The resolve parameter nobody read, and two probes built on the old encoding
+
+The suite was re-run at the end of 6.7 and four of its reds turned out to be neither a plan nor a
+residency defect. Three of them are fixed here, and all three were found by reading what the failing
+assertion was actually asking for rather than by re-tuning the thing it named.
+
+**`avt_resolve()` declared `bool allow_coarse` and never read it.** `avt_filtered_sample` passes
+`_avt_feedback` - the `surface_vt_feedback` property, which `vt_sampling_review.md` documents as
+"the feedback property controls coarse recovery in the shader" and `vt_reference_avt_alignment.md` as
+"on by default, so a missing fine page resolves at the next resident level" - into a parameter the
+body never referenced. The upgrade loop walked the sector's own mip chain on a miss regardless, so
+with recovery *off* a missing fine page still resolved through a resident ancestor. Measured in
+`vt_transition_parent`: `VT_TRANSITION_PARENT strict_missing center=(0.1255, 0.2667, 0.851, 1.0)` -
+the ancestor's blue, not the diagnostic. The loop now reports the miss when the flag is off:
+
+```glsl
+if (!avt_material_slot(slot, fract(page_uv), texel_world, world_dx, world_dy, result, result_normal)) {
+    if (!allow_coarse) { return false; }
+    continue;
+}
+```
+
+Only fragments with `_avt_feedback == false` change; with the shipped default the branch is not taken,
+so every other test is unaffected by construction. Verified on all five scripts that turn it off:
+`vt_transition_parent` **PASS** 19.3 s (was red), `vt_adaptive:filtering` **PASS** 19.3 s,
+`vt_anisotropy` **PASS**, `vt_normal_compression` **PASS**, and `vt_strict_coverage` byte-identical
+(its 18 lines, still the real coverage defect it was).
+
+**`vt_adaptive:filtering` needed three corrections, all of them assumptions the redesign replaced.**
+
+* It asserted `not terrain.surface_vt_feedback` with the message "coarse recovery defaults off". The
+  property is the shader's coarse-recovery switch now and ships **on**, so the strict phase it guards
+  is the thing that has to turn it off - which the test already did two lines later. The default is
+  now asserted the way it ships, and the phase states its own requirement.
+* Its world-level probe built per-level owner keys `0x40000000 + level * 0x100000`. That encoding
+  appears nowhere in `native/src`: the world levels are the **mips of the one coarse owner**
+  (`avt_coarse_owner() == Vector2i(INT32_MIN, INT32_MIN)`, and `_avt_build_hierarchy()` pushes its
+  pages with the level as their mip). All four requests returned -1 and the probe painted nothing.
+* Its level count came from `coarse_world_size / 64` - the hierarchy *above* the 64 m sectors, which
+  the redesign folded into the coarse image's mips. What the block addresses is `block >> level` pages
+  an axis, so with the measured block of 4 only levels 1-2 exist and levels 3-4 are correctly refused.
+  The probe derives its levels from the block and prints what it found
+  (`VT_FILTERING_WORLD_PROBE ... coarse_world=1024.0 coarse_pages=4 root_level=2 block=4 origin=(0, 0)`).
+  The other two assertions in this test - the strict diagnostic over a ready parent, and the
+  non-power-of-two sector/world mip handoff - pass on the same run.
+
+**`vt_visibility`'s three assertions were two model assumptions.** Its fixture never asked for the far
+field, but the shipped delivery matrix puts `far/material` on SVT, so the engine's own tick had already
+requested seven SVT pages by the time the manual SVT phase expected zero; and enabling VT delivery
+turns the terrain's tick back on, so the engine's demand pass ran inside the `await frame_barrier()`
+before the test's "exactly one page" manual call, which then correctly produced nothing. The test's own
+comment says its manual passes are the authoritative ones. It now disables the far field for the AVT
+phases, turns it on for the SVT phase, and stops the tick after each enabling: the SVT phase creates
+exactly one record (mip 0, the nearest visible region, `Pending bake`) and facing away requests none.
+
+**`vt_near_arrival` never ran at all** - its default source project was a leftover probe directory with
+a random name that `run_all.py --prune` exists to delete. It defaults to the real project
+`vt_strict_coverage_runner.py` copies now, runs in 51.6 s and passes.
+
+With those four in, the suite is **64 of 75** on the same tree (`bin/suite-2026-09-23-round2.json`,
+up from 60 in 6.7), and the remaining reds and their owners are unchanged from the 6.7 table:
+`vt_adaptive:scale`, `:metric`, `:ownership`, `:rotation`, `:blend` and `:sectors`,
+`vt_strict_coverage`, `vt_turn_budget`, `vt_render`, `texture_compression` and `editor_dock:setup`.
+None of them names the plan order, the gutter or the resolve flag.
+
+### 6.9 The distance table that outranked an orthographic footprint
+
+`vt_adaptive:ownership` was the largest remaining red - seven distinct assertions - and six of them
+were one line of the hierarchy scan:
+
+```cpp
+if (!_vt.surface_vt_mip_distances.is_empty()) { tier = MIN(mip_levels - 1, get_surface_vt_mip_for_distance(distance)); }
+```
+
+`surface_vt_mip_distances` is a *perspective* control: it maps world distance to a resolution tier.
+The test configures it (`[10, 20, 40]`), points an **orthographic** camera at unchanged ground, and
+raises it 5 -> 15 -> 30 -> 60 m. An orthographic footprint does not change with height -
+`terrain_3d_vt_visibility.h` answers `density = focal` for it, flat in depth - so the block size
+must not change either. It did: the table replaced the footprint's own tier, and the block fell
+**16 -> 8 -> 4 -> 4**. The fourth probe then failed too, because a 4-page block cannot address the
+page the probe asked for (all four allocations returned -1, and everything downstream of them read
+the magenta poison colour).
+
+The table now applies only where there is a perspective distance to map:
+
+```cpp
+if (!_vt.surface_vt_mip_distances.is_empty() && !p_view.orthographic) { ... }
+```
+
+Measured after the change: block **16 at all four heights**, all four probe allocations succeed, and
+the shader's four mip samples read exactly `red`, `green`, `blue`, `red`. `vt_adaptive:ownership`
+falls from seven distinct assertions to one. The change is gated twice - a non-empty table *and* an
+orthographic view - and `vt_region_ownership` is the only test in the tree that sets the table on an
+orthographic AVT view; `vt_sectors` sets it after switching to a perspective camera. Verified:
+`vt_adaptive:sectors` and `vt_adaptive:metric` byte-identical, `vt_near_density`, `vt_mip_bands` and
+`vt_avt_dense` green, and `vt_strict_coverage` improves from turns 1-3 unsettled to turns 1-2.
+
+Two of the other assertions were stale probe geometry, not addressing. The AVT/SVT blend band is
+`smoothstep(reach * 0.75, reach, distance)` from the camera's ground position, and `reach` is the
+shipped `surface_vt_distance = 384` (`terrain_3d_vt_state.h`), so the band is 288-384 m. Both probes
+sat outside it (448 m and 504 m from a camera at x=512), which is why "blends AVT with SVT" read
+pure SVT. Moved to 352 m and 448 m, they read `(0.1529, 0.2235, 0.0)` - a real blend - and a clean
+green respectively.
+
+**What the last assertion found, and why it is recorded rather than fixed here.** `camera movement
+retains automatic coverage` asks for a non-zero block on the sector under the camera after it moves
+28 m. It is still zero, and the diagnostics added to the test say what it is not:
+
+```
+VT_OWNERSHIP after_move camera=(540, 800, 256) blocks={(7,3):0 (8,3):0 (7,4):0 (8,4):0 (9,4):0 (8,5):0}
+  visible_sectors=100 independent=18 retained=18
+  avt_owners=[(-2147483648,-2147483648) (12,3) (12,4) (12,2) (12,5) (13,3) ... (14,6)]
+  lead_m=3.9e-05 speed=1.6e-04 plan_origin=(540.0, 256.0) camera_origin=(540.0, 256.0) plan_reused=true
+  plan_selected=18 world_pages=4 new_sector=4 level_mips=[0, 0, 14, 0, ...] denied=0
+VT_OWNERSHIP after_extra_settle blocks={(7,4):0 (8,4):0 (9,4):0} visible_sectors=100
+  independent=18 retained=18 ... reuse_ticks=495 chain_ticks=8
+```
+
+The plan is centred on the camera and the motion lead is zero, the scan counts the cell among its 100
+visible sectors, nothing was denied (`denied=0`), and the plan holds **18 pages, all at local mip 2** -
+on cells 356-484 m away in +X, none of them the one under the camera. `independent_sectors` equals the
+whole cached set, so every address that exists is one the plan asked for: this is the plan's own
+selection, not the address allocator's, and 300 further frames (about 7 s, `reuse_ticks=495` against
+`chain_ticks=8`) do not change it.
+
+Why the ordering is the suspect rather than the sampler: an **orthographic** camera answers the same
+density for every cell (`terrain_3d_vt_visibility.h`, `density = focal`, flat in depth), so the
+deficit key `span * density` that 6.4 introduced differs between equally-sized cells only by sampler
+noise - and the comparator tests it with `!=` before the span and distance tie-breaks. That puts the
+noise in charge of which cells a starved plan fills with, which is exactly the size of the observed
+failure: 6.7's A/B recorded this assertion as the one line the deficit order added to
+`vt_adaptive:ownership`, and it is the last one left in that test. The fix belongs in the comparator's
+tie handling - compare deficits as levels rather than as floats, so the deterministic span/distance
+tie-breaks decide - and it needs the same A/B and the same regression set 6.4 was accepted on, because
+the alternative tie-break (nearest first) is the depth-first walk the old comment rejected.
 
 ## 7. Out of scope
 

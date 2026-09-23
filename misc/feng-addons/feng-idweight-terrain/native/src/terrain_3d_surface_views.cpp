@@ -38,6 +38,8 @@
 
 #include "logger.h"
 #include "terrain_3d_clipmap_source_height.h"
+#include "terrain_3d_clipmap_source_material.h"
+#include "terrain_3d_surface_baker.h"
 
 #include <godot_cpp/classes/time.hpp>
 
@@ -431,20 +433,22 @@ int Terrain3D::get_vt_delivery(const int p_tier, const int p_group) const {
 // that reaches a fragment here, and the matrix is deliberately **asymmetric**: the two channel groups
 // do not have the same choices.
 //
-//   * The **material** group (diffuse + normal, and the control payload they are baked from) is the
-//     paged one: AVT and SVT are its two arms and are what this build ships. Clipmap needs a
-//     material-channel source, which is M4.
-//   * The **height** group (displacement, normals, holes) has exactly two choices, by design:
-//     `Direct`, the region array, and the clipmap ring - which the shader arm `height_at_uv()`
-//     samples, so the cell is deliverable and selecting it is what compiles the arm in. AVT and SVT
-//     page the material group and are not height's methods: a height cell naming one of them is not
-//     a method waiting for an arm, because there is no height arm of that kind to write.
+//   * `Direct` is always deliverable: the region arrays are the fallback and the only method that is
+//     always correct (see the enum's comment).
+//   * `Clipmap` is deliverable for exactly the groups that have a *source* - `has_clipmap_source()`,
+//     which is the source factory's own answer. The ring's mechanism, its settings, its reporting and
+//     its arm's uniforms are channel-agnostic, so this is not a capability list: registering a source
+//     is what makes the method selectable for that group, in the dock, in both previews, in the
+//     report and at the setter, with nothing else edited.
+//   * `AVT` and `SVT` are the **material** group's, and that is a channel rule rather than a
+//     capability that could arrive: they page a baked diffuse+normal+AO/roughness payload, while the
+//     height channel's two choices are the region array and the ring. A height cell naming one of
+//     them is not a method waiting for an arm, because there is no height arm of that kind to write.
 //
-// `Direct` is always deliverable: the region arrays are the fallback and the only method that is
-// always correct (see the enum's comment). The tier does not enter, because the two bands select
-// reach rather than capability - and that matters most for the height group, where a ring is one
-// object per *group*: the near and the far height cell name the same ring, so either one of them
-// selecting Clipmap is the whole of the choice, and the band they name is where the ring serves.
+// The tier does not enter, because the two bands select reach rather than capability - and that
+// matters most for the height group, where a ring is one object per *group*: the near and the far
+// height cell name the same ring, so either one of them selecting Clipmap is the whole of the choice,
+// and the band they name is where the ring serves.
 bool Terrain3D::is_vt_delivery_supported(const int p_group, const int p_method) const {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || !TerrainVT::is_valid_delivery(p_method)) {
 		return false;
@@ -453,10 +457,11 @@ bool Terrain3D::is_vt_delivery_supported(const int p_group, const int p_method) 
 	if (method == TerrainVT::Delivery::Direct) {
 		return true;
 	}
-	if (p_group == int(TerrainVT::ChannelGroup::Height)) {
-		return method == TerrainVT::Delivery::Clipmap;
+	if (method == TerrainVT::Delivery::Clipmap) {
+		return has_clipmap_source(p_group);
 	}
-	return method == TerrainVT::Delivery::AVT || method == TerrainVT::Delivery::SVT;
+	return p_group == int(TerrainVT::ChannelGroup::Material) &&
+			(method == TerrainVT::Delivery::AVT || method == TerrainVT::Delivery::SVT);
 }
 
 String Terrain3D::get_vt_delivery_unsupported_reason(const int p_group, const int p_method) const {
@@ -466,12 +471,15 @@ String Terrain3D::get_vt_delivery_unsupported_reason(const int p_group, const in
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || !TerrainVT::is_valid_delivery(p_method)) {
 		return "the cell is out of range";
 	}
-	if (p_group == int(TerrainVT::ChannelGroup::Height)) {
+	const TerrainVT::ChannelGroup group = TerrainVT::ChannelGroup(p_group);
+	if (TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap) {
+		return String("no clipmap source carries the ") + TerrainVT::group_channel_name(group) +
+				" channel in this build";
+	}
+	if (group == TerrainVT::ChannelGroup::Height) {
 		return "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group";
 	}
-	return TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap
-			? "no clipmap source carries the diffuse+normal channel in this build (M4)"
-			: "the diffuse+normal channel has no arm for this method";
+	return "the diffuse+normal channel has no arm for this method";
 }
 
 void Terrain3D::set_vt_delivery(const int p_tier, const int p_group, const int p_delivery) {
@@ -492,7 +500,7 @@ void Terrain3D::set_vt_delivery(const int p_tier, const int p_group, const int p
 	// picture is the fallback, which is exactly the state this refusal exists to make impossible.
 	if (!is_vt_delivery_supported(p_group, p_delivery)) {
 		LOG(WARN, "Delivery ", p_tier == int(TerrainVT::Tier::Near) ? "near" : "far", "/",
-				p_group == int(TerrainVT::ChannelGroup::Material) ? "diffuse+normal" : "height", ": ",
+				TerrainVT::group_channel_name(group), ": ",
 				TerrainVT::delivery_name(TerrainVT::Delivery(p_delivery)), " is unavailable: ",
 				get_vt_delivery_unsupported_reason(p_group, p_delivery), "; it stays ",
 				TerrainVT::delivery_name(previous), ".");
@@ -501,7 +509,7 @@ void Terrain3D::set_vt_delivery(const int p_tier, const int p_group, const int p
 	const bool changed = _vt.delivery.set(tier, group, TerrainVT::Delivery(p_delivery));
 	if (changed) {
 		LOG(INFO, "Delivery ", p_tier == int(TerrainVT::Tier::Near) ? "near" : "far", "/",
-				p_group == int(TerrainVT::ChannelGroup::Material) ? "diffuse+normal" : "height", ": ",
+				TerrainVT::group_channel_name(group), ": ",
 				TerrainVT::delivery_name(previous), " -> ", TerrainVT::delivery_name(TerrainVT::Delivery(p_delivery)));
 	}
 	_resolve_vt_delivery(changed);
@@ -605,10 +613,56 @@ void Terrain3D::_release_avt_coarse_protections() {
 // Clipmap ring
 ///////////////////////////
 
+// The one place a channel group is bound to a channel, and therefore the whole of what adding a
+// channel to the ring costs on this side: a `Terrain3DClipmapSource` subclass and a case below (plus
+// the class's own `get_channel_count()` / `get_format()`, which is where its *shape* is declared). The
+// mechanism is the levels, the addressing, the strips, the budget and the upload
+// (`terrain_3d_clipmap.h`), so nothing here or above has to know what the values mean.
+//
+// A group whose channel is `None` has no ring rather than a ring nothing could produce - the shape a
+// channel with no scalar payload at all would take. The two channels that exist are the height map's
+// `R32F` texel and the material group's packed `R16` surface payload; the material group's *baked*
+// arrays are a publish path (the baker's) rather than a source, which is why the ring carries the
+// payload those arrays are baked from and the arm evaluates from it.
+Terrain3D::ClipmapChannel Terrain3D::_clipmap_channel(const TerrainVT::ChannelGroup p_group) const {
+	switch (p_group) {
+		case TerrainVT::ChannelGroup::Height:
+			return ClipmapChannel::Height;
+		case TerrainVT::ChannelGroup::Material:
+			return ClipmapChannel::Material;
+		default:
+			return ClipmapChannel::None;
+	}
+}
+
+std::unique_ptr<Terrain3DClipmapSource> Terrain3D::_make_clipmap_source(const TerrainVT::ChannelGroup p_group) const {
+	if (_data == nullptr) {
+		return nullptr;
+	}
+	switch (_clipmap_channel(p_group)) {
+		case ClipmapChannel::Height:
+			return std::make_unique<Terrain3DClipmapSourceHeight>(_data);
+		case ClipmapChannel::Material:
+			return std::make_unique<Terrain3DClipmapSourceMaterial>(_data);
+		default:
+			return nullptr;
+	}
+}
+
+// The matrix's acceptance question, and deliberately not `_make_clipmap_source() != nullptr`: the
+// factory needs the data resource (a height source reads it), while the capability is a property of the
+// build. Reading the factory here would refuse a cell on a terrain whose data is assigned later - and a
+// cell refused is a cell a scene loses, which is exactly the failure the refusal exists to prevent.
+bool Terrain3D::has_clipmap_source(const int p_group) const {
+	return p_group >= 0 && p_group < TerrainVT::GROUP_COUNT &&
+			_clipmap_channel(TerrainVT::ChannelGroup(p_group)) != ClipmapChannel::None;
+}
+
 // The ring's one owner, called by the assembly rule. Which *source* carries a group is the whole of
 // the difference between the rings: the addressing, the levels, the strips and the budget are one
-// object for either group, so a second channel is a source and a line here rather than a second
-// clipmap implementation.
+// object for either group, so a second channel is a source and the line above rather than a second
+// clipmap implementation - and the shape it is configured with is the source's own declaration, not
+// a number written here.
 //
 // A ring is a residency cache as well as a renderer, so a deselection stops its pass and keeps its
 // content - the rule the two views follow (`_resolve_vt_delivery()`), and a selection that comes
@@ -620,29 +674,47 @@ bool Terrain3D::_setup_vt_clipmap(const TerrainVT::ChannelGroup p_group) {
 	}
 	const int index = int(p_group);
 	if (_vt.clipmap[index] == nullptr) {
-		if (p_group != TerrainVT::ChannelGroup::Height) {
+		std::unique_ptr<Terrain3DClipmapSource> source = _make_clipmap_source(p_group);
+		if (source == nullptr) {
 			// The matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`),
 			// so this branch is reached by `debug_update_vt_clipmap()` asking for a channel no source
-			// carries: the material group's, which is M4. It says so per call rather than handing
-			// back a ring nothing could produce.
-			LOG(WARN, "Clipmap has no source for the ",
-					p_group == TerrainVT::ChannelGroup::Material ? "diffuse+normal" : "height",
+			// carries. It says so per call and per group rather than handing back a ring nothing
+			// could produce.
+			LOG(WARN, "Clipmap has no source for the ", TerrainVT::group_channel_name(p_group),
 					" channel in this build; it stays direct.");
 			return false;
 		}
-		LOG(DEBUG, "Creating height clipmap ring");
-		_vt.clipmap[index] = std::make_unique<Terrain3DClipmap>(
-				std::make_unique<Terrain3DClipmapSourceHeight>(_data));
+		LOG(DEBUG, "Creating ", source->get_source_name(), " clipmap ring");
+		_vt.clipmap[index] = std::make_unique<Terrain3DClipmap>(std::move(source));
 	}
 	Terrain3DClipmap::Config config;
 	config.size = _vt.clipmap_size;
 	config.levels = _vt.clipmap_levels;
 	config.base_world = _vt.clipmap_base_world;
-	// One value a texel, in the height map's own format: the ring's layer is what the height arm
-	// samples in place of the region array, so the two carry the same numbers in the same format.
-	config.channels = 1;
-	config.format = Image::FORMAT_RF;
+	// The channel's shape is the channel's: the ring is told how many scalars a texel holds and what
+	// one value's format is, and no line here knows whether they are heights or anything else.
+	config.channels = _vt.clipmap[index]->get_source_channel_count();
+	config.format = _vt.clipmap[index]->get_source_format();
+	// And what a producer bakes out of those texels, if the channel has one: the ring allocates the
+	// layers here and the bake itself belongs to the owner (`Terrain3D::_bake_clipmap_rings()`), so a
+	// channel with no bake declares zero and its ring is only what its source fills.
+	config.baked_channels = _vt.clipmap[index]->get_source_baked_channel_count();
+	config.baked_format = _vt.clipmap[index]->get_source_baked_format();
 	_vt.clipmap[index]->configure(config);
+	if (config.baked_channels > 0 && !_vt.vt_materials_published) {
+		// The bake reads the surface *material list*, which the page path publishes to the producer
+		// whenever the assets change. A ring that declares baked layers is a consumer of that list
+		// exactly like a page is, and without this the list is never published in a configuration whose
+		// material group takes no page at all - which is the configuration a ring is selected for.
+		//
+		// *Once*, though: this runs on every write to the matrix, and asking for the list again is not
+		// free - the service answers a publish by telling every ring its baked layers are stale, which
+		// queues a whole level per ring. A ring that needs the list because the list was never there is
+		// the case this covers; a ring that already has it is re-baked only when the assets change,
+		// which is the service's own trigger.
+		_vt.vt_materials_dirty = true;
+		_vt.vt_materials_published = true;
+	}
 	return true;
 }
 
@@ -723,14 +795,31 @@ Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
 	PackedVector2Array centers;
 	PackedVector2Array rings;
 	PackedFloat32Array valid;
+	PackedVector4Array outstanding;
+	PackedInt32Array outstanding_counts;
 	centers.resize(Terrain3DClipmap::MAX_LEVELS);
 	rings.resize(Terrain3DClipmap::MAX_LEVELS);
 	valid.resize(Terrain3DClipmap::MAX_LEVELS);
+	outstanding_counts.resize(Terrain3DClipmap::MAX_LEVELS);
+	// One entry per level per rect, in the shape the shader's table has, so the arm's per-tap gate is a
+	// lookup rather than a search: the rects of *stored* texels a reader must not serve from the baked
+	// layers right now (un-baked, or still being produced). A level with nothing outstanding publishes
+	// zeroes and a count of zero, and an unused entry stays zero as well.
+	outstanding.resize(Terrain3DClipmap::MAX_LEVELS * Terrain3DClipmap::MAX_OUTSTANDING_RECTS);
 	for (int level = 0; level < levels; level++) {
 		const Terrain3DClipmap::Level &entry = ring->get_level(level);
 		centers[level] = entry.center;
 		rings[level] = Vector2(real_t(entry.ring.x), real_t(entry.ring.y));
 		valid[level] = entry.valid ? 1.f : 0.f;
+		Terrain3DClipmap::BakeRect rects[Terrain3DClipmap::MAX_OUTSTANDING_RECTS];
+		const int count = ring->get_outstanding_rects(level, rects,
+				Terrain3DClipmap::MAX_OUTSTANDING_RECTS);
+		outstanding_counts[level] = count;
+		for (int index = 0; index < count; index++) {
+			outstanding[level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + index] = Vector4(
+					real_t(rects[index].x0), real_t(rects[index].y0), real_t(rects[index].x1),
+					real_t(rects[index].y1));
+		}
 	}
 	arm["configured"] = true;
 	arm["texture"] = ring->get_texture_rid();
@@ -741,6 +830,17 @@ Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
 	arm["centers"] = centers;
 	arm["rings"] = rings;
 	arm["valid"] = valid;
+	arm["outstanding"] = outstanding;
+	arm["outstanding_counts"] = outstanding_counts;
+	// The arrays a producer bakes out of the ring's own texels, when the channel declares them: what
+	// the material arm samples where a level is baked, one layer per level. A ring whose channel
+	// declares none publishes none, and the arm's names are bound to the dummy array instead - the
+	// rule the atlas above follows.
+	if (ring->get_baked_channel_count() >= 3) {
+		arm["baked_albedo"] = ring->get_baked_texture_rid(0);
+		arm["baked_normal"] = ring->get_baked_texture_rid(1);
+		arm["baked_params"] = ring->get_baked_texture_rid(2);
+	}
 	return arm;
 }
 
@@ -790,17 +890,18 @@ void Terrain3D::_update_vt_clipmap_arm() {
 	}
 }
 
-// The mechanism's own entry, beside the read above, and the reason it exists: the matrix refuses
-// `Clipmap` for every group in this build (`is_vt_delivery_supported()` - the height channel's arm is
-// M2b and the material channel's source is M4), so no cell can name the method and the tick never
-// enters its phase. The ring's addressing, strips, budget and content still have to be measurable -
-// `native/tests/vt_clipmap` is nothing but those readings - so this runs exactly what that phase
-// runs: the same `Terrain3DClipmap::update()`, with the same focus (`get_clipmap_target_position()`)
-// and the same `vt_clipmap_budget_texels`, over the rings the caller names rather than the rings a
-// cell selected. It publishes the same two numbers the phase publishes, so a panel or a test reads
-// the mechanism through the one report either way.
+// The mechanism's own entry, beside the read above, and the reason it exists: a group with no source
+// this build cannot deliver has no matrix door (`is_vt_delivery_supported()` reads
+// `has_clipmap_source()`), so no cell can name the method and the tick never enters its phase for it.
+// The ring's addressing, strips, budget and content still have to be measurable - `native/tests/vt_clipmap`
+// is nothing but those readings - so this runs exactly what that phase runs: the same
+// `Terrain3DClipmap::update()`, with the same focus (`get_clipmap_target_position()`) and the same
+// `vt_clipmap_budget_texels`, over the rings the caller names rather than the rings a cell selected.
+// It publishes the same two numbers the phase publishes, so a panel or a test reads the mechanism
+// through the one report either way, and it is also how a ring is built for a group a cell *may* name
+// but does not (the mechanism's own tests drive every cell `Direct`).
 //
-// A reading taken here is the mechanism's and not a render's: nothing samples the ring yet.
+// A reading taken here is the mechanism's and not a render's.
 int Terrain3D::debug_update_vt_clipmap(const int p_group) {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
 		return -1;
@@ -817,6 +918,12 @@ int Terrain3D::debug_update_vt_clipmap(const int p_group) {
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	const Vector2 focus = v3v2(get_clipmap_target_position());
 	_vt.clipmap_produced_texels = ring->update(focus, _vt.clipmap_budget_texels);
+	// The tests drive the ring through this entry, so the bake is offered here too: a ring whose rects
+	// are never offered to a producer reports `baked` false for the rest of the session, which is a
+	// state only a caller that forgot the offer can produce.
+	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
+	}
 	_vt.vt_clipmap_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	// The same rebind the tick's phase does, so a ring a test or the dock drove with this entry is
 	// the ring the shader reads.

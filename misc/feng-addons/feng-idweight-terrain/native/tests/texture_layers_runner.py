@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from fixture import ROOT, write_fixture
+from fixture import ROOT, is_environmental_error, log_errors, write_fixture
 
 MARKER = "PASS height/ID/weight/slope debug shaders"
 
@@ -44,10 +44,10 @@ def main():
         print(f"TIMEOUT LOG={log}")
         return 124
     output = log.read_text(encoding="utf-8", errors="replace")
-    errors = [line for line in output.splitlines() if "ERROR:" in line]
+    errors = log_errors(output)
     passes = [line for line in output.splitlines() if line.startswith("PASS")]
     for line in output.splitlines():
-        if line.startswith(("PASS", "SLOPE", "REGRESSION", "ERROR:", "SCRIPT ERROR:")):
+        if line.startswith(("PASS", "SLOPE", "REGRESSION", "ERROR:", "SCRIPT ERROR:")) and not is_environmental_error(line):
             print(line)
     print(f"EXIT={result.returncode} PASSES={len(passes)} ERRORS={len(errors)} LOG={log}")
     return int(result.returncode != 0 or bool(errors) or MARKER not in output)

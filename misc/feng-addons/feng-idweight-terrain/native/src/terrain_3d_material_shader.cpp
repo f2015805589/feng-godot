@@ -546,9 +546,23 @@ bool Terrain3DMaterial::_needs_vt_shader() const {
 			(!_terrain->is_vt_editor_preview_active() && _terrain->needs_vt_shader_arms());
 }
 
-// The height group's own arm, on the same three cases: a group the editor preview is holding still,
-// or a shader override that owns its own code, keeps the interface rather than losing it.
-bool Terrain3DMaterial::_needs_height_clipmap_arm() const {
+// One channel group's own arm, on the same three cases: a group the editor preview is holding still,
+// or a shader override that owns its own code, keeps the interface rather than losing it. The
+// question is per group and read from the matrix (`clipmap_arm_used()`), so it names no channel: the
+// channel a group's ring carries is the source's business.
+bool Terrain3DMaterial::_needs_clipmap_arm(const int p_group) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return false;
+	}
 	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
-			(!_terrain->is_vt_editor_preview_active() && _terrain->height_clipmap_arm());
+			(!_terrain->is_vt_editor_preview_active() && _terrain->clipmap_arm_used(TerrainVT::ChannelGroup(p_group)));
+}
+
+bool Terrain3DMaterial::_clipmap_arm_changed() const {
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		if (_shader_clipmap[group] != _needs_clipmap_arm(group)) {
+			return true;
+		}
+	}
+	return false;
 }

@@ -12,17 +12,33 @@ vec2 surface_bake_rotate(vec2 v, vec2 cs) {
 	return vec2(fma(cs.x, v.x, cs.y * v.y), fma(cs.x, v.y, -cs.y * v.x));
 }
 
-uint surface_bake_read_id(ivec2 coord, uint layer) {
+// The square one tap reads from, which is the one thing about a job's *source* the ring changed. A
+// page job's source is a stored rect `dims.x` texels wide with a gutter, and a tap that leaves it
+// clamps - the shipped behaviour, which is what `source.x == 0` names. A clipmap job's source is a
+// level of the ring: `dims.x` texels that *wrap*, because the ring stores a level rotated by its own
+// ring offset - the payload and the height of logical texel `l` live at `mod(l + ring, size)` - which
+// is what lets a level that turned a strip keep the texels it did not lose.
+ivec2 surface_bake_source_coord(ivec2 coord) {
 	ivec2 size = ivec2(int(bake_push.dims.x));
-	coord = clamp(coord, ivec2(0), size - ivec2(1));
-	float encoded = texelFetch(bake_idweights, ivec3(coord, int(layer)), 0).r;
-	return uint(round(clamp(encoded, 0.0, 1.0) * 65535.0));
+	if (bake_push.source.x == 0u) {
+		return clamp(coord, ivec2(0), size - ivec2(1));
+	}
+	return (coord + ivec2(bake_push.source.yz)) % size;
+}
+
+uint surface_bake_read_id(ivec2 coord, uint layer) {
+	float encoded = texelFetch(bake_idweights, ivec3(surface_bake_source_coord(coord), int(layer)), 0).r;
+	// A page's id layer is `R16_UNORM`, so the fetch is normalised and the packed id/weight pair is
+	// 65535 times it. The ring's is `FORMAT_RF` holding the pair raw - the material source writes it
+	// unrescaled, because a packed pair is not a colour - and clamping that to 1.0 would read every id
+	// as 65535.
+	return bake_push.source.w == 0u
+			? uint(round(clamp(encoded, 0.0, 1.0) * 65535.0))
+			: uint(round(clamp(encoded, 0.0, 65535.0)));
 }
 
 float surface_bake_read_height(ivec2 coord, uint layer) {
-	ivec2 size = ivec2(int(bake_push.dims.x));
-	coord = clamp(coord, ivec2(0), size - ivec2(1));
-	return texelFetch(bake_height, ivec3(coord, int(layer)), 0).r;
+	return texelFetch(bake_height, ivec3(surface_bake_source_coord(coord), int(layer)), 0).r;
 }
 
 vec3 surface_bake_normal(float left, float right, float up, float dx, float dz) {
@@ -145,6 +161,11 @@ void surface_bake_add_pair_vertex(uint packed, float barycentric,
 	interpolated_overlay_weight += barycentric * overlay_weight;
 }
 
+)"
+		R"(
+// A split of its own, for the reason `main.glsl` has one (MSVC truncates a string literal past 16 kB):
+// the entry point below is a section rather than an addition to a literal that is already at the limit.
+
 void surface_bake_invalidate(ivec3 output_coord) {
 	imageStore(bake_output_albedo, output_coord, vec4(0.0));
 	imageStore(bake_output_normal, output_coord, vec4(0.0));
@@ -153,20 +174,47 @@ void surface_bake_invalidate(ivec3 output_coord) {
 
 void main() {
 	ivec3 gid = ivec3(gl_GlobalInvocationID);
-	if (uint(gid.x) >= bake_push.dims.x || uint(gid.y) >= bake_push.dims.x || uint(gid.z) >= bake_push.dims.y) {
+	// The dispatch covers `output.zw` texels - the rect this job fills - not the whole layer, which is
+	// what lets a ring's job cover a strip of a level while `dims.x` still names the level's own size
+	// for the source reads below.
+	if (uint(gid.x) >= bake_push.dest.z || uint(gid.y) >= bake_push.dest.w || uint(gid.z) >= bake_push.dims.y) {
 		return;
 	}
 	BakeJob job = bake_jobs.jobs[gid.z];
-	ivec3 output_coord = ivec3(gid.xy, int(job.indices.y));
+	// The output texel is `dest.xy` inside the output layer plus the invocation's own texel. Those
+	// layers are indexed by the *stored* texel either way: a page's job covers a rect of the page's own
+	// grid (its origin is zero), and a ring's covers a rect of a level in the order the level's stored
+	// content is - the order the ring's own payload layer is in, and the one that keeps naming the same
+	// world position as the level turns. A reader of these layers - the material arm - therefore samples
+	// a ring level with the payload's own addressing, ring offset and all.
+	ivec3 output_coord = ivec3(gid.xy + ivec2(bake_push.dest.xy), int(job.indices.y));
 	if (job.indices.z == 0u || bake_push.dims.z == 0u) {
 		surface_bake_invalidate(output_coord);
 		return;
 	}
 
 	uint source_layer = job.indices.x;
+	// The height is read from its own layer, which is a *different* array of the same layer count,
+	// not necessarily the layer the payload came from. A page holds both at one index, so its job
+	// sets the two equal; a ring's material channel keeps its payload and its height in two layers
+	// of one array, so its job names both. One field, because both readers are the same fetch.
+	uint height_layer = job.indices.w;
 	int border = int(job.page.w + 0.5);
 	vec2 local = vec2(gid.xy) - vec2(float(border)) + vec2(0.5);
-	vec2 world_xz = job.world_rect.xy + local * job.page.xy;
+	vec2 world_xz;
+	if (bake_push.source.x != 0u) {
+		// A ring level: the invocation's texel is a *stored* one, and the world position it stands for
+		// is its *logical* texel's - the stored index turned back by the level's ring. `policy.yz` is
+		// the level's world origin and `policy.w` its texel, so the mapping below is the same affine one
+		// a page's job uses, and the tap it names is the *logical* texel - which is what
+		// `surface_bake_source_coord()` turns into the stored one the payload and height layers hold.
+		ivec2 stored_size = ivec2(int(bake_push.dims.x));
+		ivec2 stored = ivec2(bake_push.dest.xy) + gid.xy;
+		ivec2 logical = (stored - ivec2(bake_push.source.yz) + stored_size) % stored_size;
+		world_xz = job.policy.yz + (vec2(logical) + vec2(0.5)) * job.page.xy;
+	} else {
+		world_xz = job.world_rect.xy + local * job.page.xy;
+	}
 	bool source_grid = job.policy.w > 0.0;
 	vec2 source_position = source_grid ? (world_xz - job.policy.yz) / job.policy.w : local + vec2(border);
 	ivec2 cell = ivec2(floor(source_position));
@@ -176,14 +224,14 @@ void main() {
 	uint packed_top_left = surface_bake_read_id(cell + ivec2(0, 1), source_layer);
 	uint packed_top_right = surface_bake_read_id(cell + ivec2(1, 1), source_layer);
 
-	float h00 = surface_bake_read_height(cell, source_layer);
-	float h10 = surface_bake_read_height(cell + ivec2(1, 0), source_layer);
-	float h01 = surface_bake_read_height(cell + ivec2(0, 1), source_layer);
-	float h11 = surface_bake_read_height(cell + ivec2(1, 1), source_layer);
-	float h20 = surface_bake_read_height(cell + ivec2(2, 0), source_layer);
-	float h02 = surface_bake_read_height(cell + ivec2(0, 2), source_layer);
-	float h21 = surface_bake_read_height(cell + ivec2(2, 1), source_layer);
-	float h12 = surface_bake_read_height(cell + ivec2(1, 2), source_layer);
+	float h00 = surface_bake_read_height(cell, height_layer);
+	float h10 = surface_bake_read_height(cell + ivec2(1, 0), height_layer);
+	float h01 = surface_bake_read_height(cell + ivec2(0, 1), height_layer);
+	float h11 = surface_bake_read_height(cell + ivec2(1, 1), height_layer);
+	float h20 = surface_bake_read_height(cell + ivec2(2, 0), height_layer);
+	float h02 = surface_bake_read_height(cell + ivec2(0, 2), height_layer);
+	float h21 = surface_bake_read_height(cell + ivec2(2, 1), height_layer);
+	float h12 = surface_bake_read_height(cell + ivec2(1, 2), height_layer);
 	float dx = max(source_grid ? job.policy.w : abs(job.page.x), 1e-5);
 	float dz = max(source_grid ? job.policy.w : abs(job.page.y), 1e-5);
 	vec3 normal_bottom_left = surface_bake_normal(h00, h10, h01, dx, dz);
@@ -196,8 +244,12 @@ void main() {
 			normal_top_left * ((1.0 - cell_local.x) * cell_local.y) +
 			normal_top_right * (cell_local.x * cell_local.y));
 	float height = mix(mix(h00, h10, cell_local.x), mix(h01, h11, cell_local.x), cell_local.y);
-	vec3 vertex = vec3(job.world_rect.x + local.x * job.page.x, height,
-			job.world_rect.y + local.y * job.page.y);
+	// The vertex the material is evaluated at is the world position the tap above named, which for a
+	// ring job is reached through the level's grid rather than through `world_rect`: the whole of what
+	// the evaluation (the texture uv, the detile, the macro noise, the triplanar axis) sees is this
+	// point, so a stored rect whose vertex ignored the ring would evaluate the right payload at the
+	// wrong world position.
+	vec3 vertex = vec3(world_xz.x, height, world_xz.y);
 	vec3 base_ddx = vec3(job.page.x, 0.0, 0.0);
 	vec3 base_ddy = vec3(0.0, 0.0, job.page.y);
 

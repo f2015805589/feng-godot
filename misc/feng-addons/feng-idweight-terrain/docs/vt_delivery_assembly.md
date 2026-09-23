@@ -46,7 +46,7 @@ What actually reaches a fragment today, and what each thing is:
 | Channel group | Payload | Where it lives now | Producer |
 | --- | --- | --- | --- |
 | **Material** (diffuse + normal + AO/roughness) | three arrays: albedo `RGBA8`(sRGB), normal, params | `_surface_material_albedo` / `_normal` / `_params`, addressed by the near field's or the far field's indirection | `Terrain3DSurfaceBaker`, from the `R16` control payload and the texture assets |
-| | its input: control (id + weight) | `_surface_vt_atlas` / `_surface_svt_atlas` (`R16`) | region surface maps, resampled per page |
+| | its input: control (id + weight) | `_surface_vt_atlas` / `_surface_svt_atlas` (`R16`), or the clipmap ring's own layer | region surface maps, resampled per page - or read by the ring's source, one payload texel a ring texel; the ring's *baked* layers are the same material the pages hold, produced from those texels (section 6.5, 8.7) |
 | **Height** (displacement, normals, holes) | `R32F` texel | `_height_maps`, the region texture array, and the clipmap ring the height arm samples | region height maps, and the height clipmap source |
 
 The **Material** group is the user-facing "diffuse + normal" group; it carries the control
@@ -110,8 +110,18 @@ tooltip):
 
 | Group | Methods this build accepts | Refused, and why |
 | --- | --- | --- |
-| Material (diffuse + normal) | `Direct`, `AVT`, `SVT` | `Clipmap`: no clipmap source carries that channel yet (M4) |
+| Material (diffuse + normal) | `Direct`, `AVT`, `Clipmap`, `SVT` | none: the ring carries that group's `R16` control payload and the paged methods bake it (section 6.5) |
 | Height | `Direct`, `Clipmap` | `AVT`, `SVT`: not this channel's methods at all - they page the material group |
+
+The two rows are decided differently, and that is the point of the split. `Clipmap` is not a table
+entry for either group: `is_vt_delivery_supported()` reads `has_clipmap_source()`, which is the source
+factory's own answer (`Terrain3D::_clipmap_channel()`), so a group's cell becomes writable - in the
+dock's rows, in both previews, in the report and at the setter - on the day the group has a source,
+with nothing else edited. What the table still decides is the height channel's missing `AVT`/`SVT`
+arms: those are the *material* group's methods because they page a baked payload the height channel
+does not have, and that is a channel rule rather than a capability that could arrive. A refusal is one
+door (the four properties, the two legacy booleans, the dock and a script), not a warning over a cell
+that was stored anyway.
 
 The rule is a refusal at the one door every write goes through (the four properties, the two
 legacy booleans, the dock and a script), not a warning over a cell that was stored anyway. The
@@ -252,16 +262,28 @@ split is two files:
 | `terrain_3d_clipmap_source.h` | `Terrain3DClipmapSource`: what a texel holds | one row of one channel of one level, in *logical* indices, and the world XZ of logical texel (0, 0). |
 | `terrain_3d_clipmap_source_height.{h,cpp}` | the height source | `Terrain3DData::get_height_texel_nearest()`. |
 
-A second channel group on `Clipmap` is therefore a *source* and one line in
-`Terrain3D::_setup_vt_clipmap()` - not a second ring, and not a channel test inside the ring.
-The material channel's source does not exist yet (M4), so a material cell naming `Clipmap` is
-refused (section 3.1) and no ring is built for it. The height cell is delivered by the ring: the
-shader arm `height_at_uv()` samples it (section 6.4), so there are **two doors** to a ring - the
-cell a user selects, and the mechanism's own entry `debug_update_vt_clipmap()`, which builds and
-steps a ring while every cell is `Direct`. The ring's own suite (`vt_clipmap`) drives the second
-one deliberately, with no cell selecting anything: the mechanism is exercised with no view, no
-pool and no shader
-arm in the picture.
+A second channel group on `Clipmap` is therefore a *source* and a case in
+`Terrain3D::_clipmap_channel()` - not a second ring, and not a channel test inside the ring. The
+source declares its own shape (`get_channel_count()` / `get_format()`), the ring is told it when the
+assembly rule calls `configure()`, and the matrix's acceptance, the dock's rows, the report's
+`clipmap[group]` entry and the refusal sentence are all read from `has_clipmap_source()` - the same
+registry. That is what landed the material group's channel (section 6.5): `Terrain3DClipmapSourceMaterial`
+fills a row with the packed `R16` surface payload, one payload texel a ring texel - and it declares the
+group's three *baked* arrays, `RGBA16F`, one layer per level, which the ring allocates because the shape
+is the ring's and which the shared producer bakes from those texels (section 8.7). The channel's source
+is therefore the group's input *and* its sampled material, and the arm is the reader of both: a level the
+producer has baked is the pages' material at the level's density, and a level it has not is the payload
+evaluated per fragment, which is what the ring served before the baked layers existed.
+
+What a channel still owns is its *arm*: the shader code that samples the ring (the height one is
+section 6.4, the material one section 6.5), because the band rule and the read are the channel's
+questions, while the ring's addressing, its level rule, its validity gate and the one uniform table
+every group indexes into are shared. The height cell is delivered by the ring: the shader arm
+`height_at_uv()` samples it (section 6.4), so there are **two doors** to a ring - the cell a user
+selects, and the mechanism's own entry `debug_update_vt_clipmap()`, which builds and steps a ring while
+every cell is `Direct`. The ring's own suite (`vt_clipmap`) drives the second one deliberately, with no
+cell selecting anything: the mechanism is exercised with no view, no pool and no shader arm in the
+picture.
 
 The interface is asked per *row*, not per texel: a source's cost is its own lookup (region
 resolution, page or cell fetch), so a row gives it locality without a virtual call in the
@@ -430,28 +452,34 @@ The payload behind both panels is `get_vt_settings()`'s `clipmap[group]` plus `p
 method beside `get_level_reports()`: this one builds the rects, so only a caller that draws them pays
 for them.
 
-### 6.4 The height arm
+### 6.4 The ring's arms, and the height one
 
 The ring was measurable before anything sampled it, which is why the arm is a section of its own
-rather than a line in the mechanism. What it does is route the height channel's reads through the
-ring: `height_at_uv()` is the one entry every height read in `main.glsl` goes through - the vertex
-stage's point read and its sub-texel read, and the eight taps the terrain normal is reconstructed
-from - and the region array is the `#else` arm of every branch, so a configuration with no height
-cell on `Clipmap` compiles the read it always had.
+rather than a line in the mechanism - and why the arm is written per channel *group*: the addressing,
+the level rule, the validity gate, the band blend and the uniform table are the ring's and are shared,
+while what a channel reads and how it measures its band are the channel's. The height arm routes the
+height channel's reads through the ring: `height_at_uv()` is the one entry every height read in
+`main.glsl` goes through - the vertex stage's point read and its sub-texel read, and the eight taps the
+terrain normal is reconstructed from - and the region array is the `#else` arm of every branch, so a
+configuration with no height cell on `Clipmap` compiles the read it always had.
 
-**The variant is a define, not a branch.** `TERRAIN_HEIGHT_CLIPMAP` is prepended to the generated
-shader when the height group names the ring (and never together with `TERRAIN_NO_VT`, which a matrix
-with no non-`Direct` cell still gets). So a height group delivered `Direct` in both bands has no ring
-uniform, no ring sampler, no level search and no branch - not a cheaper path, an absent one - and a
-material-only VT configuration does not pay for the height arm either. The material's variant choice
-is therefore two booleans rather than one: the material arms and the height arm move independently,
-and `Terrain3DMaterial::update()` rebuilds the code when either changed.
+**The variant is a define, not a branch.** One `TERRAIN_CLIPMAP_<GROUP>` per channel group whose arm
+the code carries (`TERRAIN_CLIPMAP_HEIGHT`, and `TERRAIN_CLIPMAP_MATERIAL` the day that arm exists),
+plus the shared `TERRAIN_CLIPMAP`, `CLIPMAP_GROUP_COUNT`, `CLIPMAP_MAX_LEVELS` and the group's own
+`CLIPMAP_GROUP_<GROUP>` index that the one uniform table is declared and addressed from. They are
+never defined together with `TERRAIN_NO_VT`, which a matrix with no non-`Direct` cell still gets. So a
+group delivered `Direct` in both bands has no ring uniform, no ring sampler, no level search and no
+branch - not a cheaper path, an absent one - and a material-only VT configuration does not pay for the
+height arm either. The variant choice is therefore one flag per group rather than one for the ring:
+`Terrain3DMaterial::_shader_clipmap[]` is set from `_needs_clipmap_arm(group)`, and `update()`
+rebuilds the code when any of them changed.
 
-**What the arm reads, and why it is the CPU's own addressing.** `get_vt_clipmap_arm()` publishes the
-per-level snapped centre, the toroidal offset, the validity flag, the level rule and the texture;
-the shader computes `local = (world - centre + half) / texel`, takes `floor()` of it as the logical
-texel and applies `physical = (logical + ring) mod size` - the same three steps
-`Terrain3DClipmap::sample()` takes. Two things in that are deliberate:
+**What the arm reads, and why it is the CPU's own addressing.** `get_vt_clipmap_arm()` publishes, per
+group, the level rule (`size`, `levels`, `base_world`), the per-level snapped centre, the toroidal
+offset, the validity flag and the ring's texture, into the one table the shader indexes as
+`group * CLIPMAP_MAX_LEVELS + level`; the shader computes `local = (world - centre + half) / texel`,
+takes `floor()` of it as the logical texel and applies `physical = (logical + ring) mod size` - the
+same three steps `Terrain3DClipmap::sample()` takes. Two things in that are deliberate:
 
 * **Every tap is an explicit, clamped `texelFetch`, never a filtered sample.** The ring is toroidal:
   a tap outside a level would land on the far edge of the *same* level, which is a different world
@@ -471,8 +499,10 @@ not a diagnostic - and it is what lets an edit be answered by the array for the 
 takes to re-produce. The band the ring serves in is the two cells': `Near/Height = Clipmap` serves
 the near band, `Far/Height = Clipmap` the far one, both in the same ring, with the transition blended
 across `_avt_coverage_distance`'s own edge - the reach the material split next door already uses. The
-band is measured *horizontally* in both stages, because the vertex stage is computing the vertical
-distance.
+band *rule* is one function shared by every group (`clipmap_weight()`); the distance it is measured at
+is the caller's, because the two stages ask different questions - the height arm measures horizontally
+in both stages, the vertex stage already computing the vertical distance, while a fragment-stage arm
+measures its own 3D distance.
 
 **The normal's taps follow the source's texel.** `height_tap_scale()` is how far apart the eight
 normal taps are, in height-grid units: 1 while the array serves, and the serving level's texel while
@@ -488,6 +518,118 @@ pass, which would republish every VT uniform and the region tables with them. Th
 the first render reading caught: with the uniforms bound only when a *cell* changed, the shader read a
 ring whose validity uniform still said "not current", so every render was the array's and the
 pixel-identical result was a fallback agreeing with itself. Section 8.4 records it.
+
+### 6.5 The material arm
+
+The material group's channel is the **source payload** - the packed `R16` id/weight texel the texture
+assets are blended by - **and the three arrays the producer bakes out of it**. Both are the group's, one
+step apart: `Terrain3DSurfaceBaker` produces the group's albedo, normal and params *from* this payload,
+so a ring that carries the payload carries the same information one step earlier, and a ring that
+carries the baked arrays carries the same material the pages do. `Terrain3DClipmapSourceMaterial` fills
+a row with `Terrain3DData::get_surface_texel_nearest()` - nearest payload texel, the rule the height
+source reads by, so the ring's content cannot depend on its own texel size - into an `RF` layer, because
+a packed id/weight pair is an integer rather than a colour and must not be rescaled on either side. It
+also fills the height beside it (`get_height_texel_nearest()`), because the bake needs both inputs at
+one level index, and it declares the three baked arrays (`get_baked_channel_count()` /
+`get_baked_format()`), which is what a ring allocates its per-level baked layers from - `RGBA16F`, one
+layer per level, the format the bake shader writes as storage images.
+
+**The arm is the group's third sampler.** Where a level of the ring is *baked*, the arm reads the ring's
+three layers instead of evaluating the payload: the same decode the paged tiers do
+(`surface_decode_page()` with the unencoded pair, because the producer writes the canonical form), and
+bilinear across the level's own grid, because the producer baked at exactly that density. A coarser
+level is therefore a coarser material rather than the same material stretched, and the material the
+fragment gets is the material the pages hold at that density (section 8.7). A fragment whose four taps
+are not all baked reads the payload where the *shipped* paths keep it - the region array or a page -
+because the ring's channel is the material and not the payload it is baked from: the ring's own payload
+layer is the producer's input and nothing reads it from a fragment. That is also the step that removed
+the ring's payload arm (`clipmap_material_payload()`), which is what makes "the ring's band is the baked
+layers, never the intermediate" a property of the code rather than of the timing (section 8.8 measures
+the pixels with the gate poisoned either way).
+
+**The producer, and why it is not the ring's own pass.** The ring owns the storage, because the shape is
+the ring's: one layer per level, at the ring's size, following its centres and its rings. The *pass* is
+the shared producer's - one bake shader, one material list, one job buffer, one descriptor set that
+binds the ring's own atlas to its two inputs and the ring's three arrays to its outputs
+(`Terrain3DSurfaceBaker::_ensure_ring_bake()`). The ring's owner offers it once a tick
+(`Terrain3DSurfaceBaker::queue_clipmap_ring()`, from the tick's clipmap phase and from the mechanism's
+own entry), and the offer is handed **the ring's own rects**: every rect the ring has produced and no
+bake has covered yet, merged per level as it is produced. The render callback dispatches them.
+**One dispatch per rect**, because a level's ring offset is part of what its job *reads* and cannot ride
+in the push constant of a batch, and because the rect is the unit that makes the bake incremental: a
+level that turned by one texel owes one column strip, not its square. The rect is in the level's
+**stored** frame - the frame the payload layer is in, and the one that keeps naming the same world
+position as the level turns, because the centre moves and the ring offset turns with it - so the texels
+a strip did not touch keep describing the world positions they already described, which is what makes a
+rect bake *sufficient* rather than a shortcut. A stored texel's world position is its *logical* one, and
+the shader reaches it through the level's policy grid and turns the tap back with the ring
+(`surface_bake_source_coord()`, `mod(logical + ring, size)`); a page's jobs keep clamping (a stored rect
+with a gutter) and its id layer keeps its `R16_UNORM` read. The two words of the `source` push constant
+are what says which kind of square a job has, and `dest` is where in the output layer its rect goes.
+
+**The rect queue, and the budget.** `Terrain3DClipmap::_bake_rects` is the queue, in the order the ring
+produced, with overlapping rects merged - a level that turned four times before its first strip was
+baked owes one rect, not four. The offer drains it under the *same* budget the ring's own production is
+charged in, channel texels (`vt_clipmap_budget_texels`), with a soft floor of one rect per offer: a
+whole-level fill is larger than a tick's budget, and a budget that never admitted it would leave the
+level unbaked forever. What is left stays queued for the next offer, which is the deferral the
+production budget already makes - and the report publishes both halves in that unit, so "how much of
+this level is unbaked" (`pending_bake_texels`), "what the producer has written" (`baked_texels`) and
+"how many dispatches it took" (`bake_dispatches`) are numbers beside the fill's own counters.
+
+**Landing, and the lease.** A bake is dispatched on the render thread and lands while the main thread
+ticks, so the ring - not the producer - is what says whether the bake still describes the *rect* it
+covered. Each queued rect carries its own lease (`shape serial` and the level's `content serial` at the
+moment it was queued or merged), the producer dispatches with that lease, and the next offer reports the
+rect back (`Terrain3DClipmap::acknowledge_bake_rect()`), which drops it - leaving it queued - when the
+rect no longer carries it, because a reconfigured ring has different layers and a rect that grew over
+new content holds texels the bake never read. **The lease is the rect's and not the level's**, which is
+what makes a moving focus bakeable at all: a level that moved elsewhere does not change what this rect's
+stored texels hold, while a lease taken from the level's serial refuses every dispatch as soon as the
+focus moves again (section 8.8 measures both). A rect the ring accepts is counted and its level becomes
+baked when it was the last one queued, which bumps the ring's state stamp and rebinds the arm's uniforms.
+The offer collects on one tick and dispatches on the next, deliberately: a rect's payload reaches the
+ring through `RenderingServer::texture_2d_update()`, and a device dispatch issued in the same tick would
+race the queue that has not run yet.
+
+**What makes a baked level stale, and what the arm is told.** `Terrain3DClipmap::get_outstanding_rects()`
+is the reader's answer, per level: the rects no bake has covered yet *and* the rects the CPU side is
+still producing - the same statement at two stages, "the stored texels here do not match the layers yet",
+and the second kind is why a job's rect is a `get_outstanding_rects()` entry rather than only a bake's.
+They are published in the arm's table in *stored* texels and the shader tests a fragment's four
+bilinear taps against them, so the arm's readiness is the **fragment's** rather than the level's: a
+level under a moving focus has a strip outstanding almost every tick, and an arm that fell back for the
+whole level whenever it did would never serve the material the ring actually holds. A level with more
+outstanding rects than the table holds answers with its whole square, which can only make a reader fall
+back more. A *material list* change is the other cause and a different one: `Terrain3D` tells every ring
+`mark_baked_stale()` when it publishes the assets, which queues **a whole-level rect on every level
+without touching `valid`**, because the payload did not move and only the material it evaluates to did.
+That is what keeps an edited texture asset from being served by a ring that baked the old one - and it is
+also the one case where the bake is a level rather than a strip, because the change *is* level-wide.
+
+**The band split, and the mix.** A material cell on `Clipmap` makes the group's two tiers its two
+*bands*: the ring owns the band its cell names and the paged methods keep the other one, on the same
+curve the height arm serves by (`surface_material_sample()` reports the pages' share of the fragment and
+the ring's own weight is its complement, so the band a fragment is banded by is the weight it is mixed
+by). The payload cannot be interpolated - it is a packed pair - which is why the ring's band was served
+whole rather than blended into the array's before it was baked; the baked layers *can* be, so a baked
+level's band is now the material's own read, and the band edge is where the ring's material meets the
+pages' exactly as the two paged tiers meet each other. The source evaluation stays extracted
+(`evaluate_idweight_material()`), because it is what serves a level that is not baked yet, and
+`surface_corner_value()` was the one line the ring changed about it; section 8.8 removed that indirection
+with the ring's payload arm, so the four corner reads are `get_surface_value()`'s again.
+
+**What it costs, and what it buys.** A fragment inside the ring's band pays one bilinear fetch of three
+`RGBA16F` layers per tap and no indirection, no LRU and no page. A fragment outside that band is served
+by the method its other cell names, unchanged - and the strict-miss diagnostic stays that fragment's
+business, because the share the pages own is what it reads. What the ring buys is the per-fragment
+evaluation: the material is resolved once per level texel by the device and interpolated per fragment,
+which is the same trade the pages make - and it stays inside the ring's own strip model, because the
+producer is handed the rects the ring produced rather than its levels (section 8.8). What it costs is
+the producer's coupling: the bake needs the shared producer's shader, material list and job buffer, so a
+configuration whose material group takes no page anywhere has no producer and the ring serves the
+payload - which is why the owner publishes the material list for a ring that declares baked layers
+(`Terrain3D::_setup_vt_clipmap()`).
 
 ## 7. Compatibility
 
@@ -518,7 +660,7 @@ pixel-identical result was a fallback agreeing with itself. Section 8.4 records 
 | **M2** | the clipmap service, height group first: array, ring, strips, budget, deterministic tests | a stationary camera writes nothing; a one-texel move writes one strip per level; every physical texel maps to its own world texel after a ring wrap; a camera sweep shows no seam and no crawl. **Ring landed and measured** (section 8.2): the mechanism, the height source, the settings, the reporting and the mechanism's own entry (`debug_update_vt_clipmap()`) are in, with `vt_clipmap` pinning the addressing, the strip cost, the budget and the content. The editor's debug views landed with it and follow a gate of their own - a ring that does not exist has no layout to draw and asking for one costs nothing (section 6.3), pinned by `vt_debug_views`. |
 | **M2b** | the height arm: `height_at_uv()` through the ring, the cell that turns it on, edit invalidation, the sweep | the height cell is deliverable and selecting it compiles the arm; a ring at the height grid's own density renders pixel-identical to the array; a coarser ring does not; an edit re-produces the rect it covers and the array serves until it has. **Landed and measured** (section 8.4), with `vt_clipmap_render` the suite that takes those readings and `vt_delivery` / `vt_clipmap` / `vt_debug_views` updated for the cell that is no longer refused. |
 | **M3** | `Near/Height = Clipmap` as a default | measured against M2b's `Direct` baseline: resident bytes, per-frame texels, and the height error at the near band's edge. `Far/Height` stays `Direct`: the height channel has no `SVT` arm to write. |
-| **M4** | `Material` on clipmap, and the per-cell shader variants | the material group renders identically through the clipmap at a matched density, and an all-`Direct` build is byte-identical to `TERRAIN_NO_VT` |
+| **M4** | `Material` on clipmap, and the per-cell shader variants | the material group renders identically through the clipmap at a matched density, and an all-`Direct` build is byte-identical to `TERRAIN_NO_VT`. **Landed and measured** (section 8.6): a payload ring at the payload's own density renders the array's pixels, a coarser ring does not, the per-cell variant carries the material arm and the height arm independently, and the matrix's acceptance is read from the source registry. What was traded is the per-fragment evaluation inside the ring's band - a ring of the *baked* arrays is a publish path rather than a source, and section 8.7 is the step that landed it |
 
 ### M1, as measured
 
@@ -545,7 +687,7 @@ published capability is the same reading from the other side:
 | `delivery_supported.material` | `[0, 1, 3]` - `Direct`, `AVT`, `SVT` |
 | `delivery_supported.height` | `[0, 2]` - `Direct` and the ring |
 | `delivery_unsupported.height.SVT` | "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group" |
-| `delivery_unsupported.material.Clipmap` | "no clipmap source carries the diffuse+normal channel in this build (M4)" |
+| `delivery_unsupported.material.Clipmap` | "no clipmap source carries the diffuse+normal channel in this build" |
 
 The height cell that *is* deliverable is read on the same live terrain, because it is the one write
 that reaches the shader: selecting it selects the clipmap service, builds the ring, compiles the VT
@@ -765,8 +907,8 @@ height group's source.
 
 | Step | Reading |
 | --- | --- |
-| all cells `Direct` | the generated code is the no-VT arm: no `_avt_coverage_distance`, no `_clipmap_atlas`, no `_clipmap_level_valid`, and `vt_shader_height_clipmap` false |
-| `Near/Height = Clipmap` | the VT arms are in the compiled code, including the ring's sampler, its gate and the band edge; `vt_shader_height_clipmap` true; the tick's own phase produced into the ring before the entry was asked |
+| all cells `Direct` | the generated code is the no-VT arm: no `_avt_coverage_distance`, no `_clipmap_atlas`, no `_clipmap_level_valid`, and `clipmap.height.shader_arm` false |
+| `Near/Height = Clipmap` | the VT arms are in the compiled code, including the ring's sampler, its gate and the band edge; `clipmap.height.shader_arm` true; the tick's own phase produced into the ring before the entry was asked |
 | settled at 64 texels / 64 m (one texel a metre) | the level is current, nothing queued, and the render is **pixel-identical** to the array's: 0 of 76 800 pixels differ |
 | the same ring at 256 m base (four metres a texel) | the render differs in a large fraction of the frame: the pixel-identical result above is the ring's render, not a fallback agreeing with itself |
 | 32 texels / 32 m (±16 m coverage) | the view reaches past the ring's coverage, and the render is still pixel-identical: outside a level's range the array serves |
@@ -789,7 +931,7 @@ height group's source.
   coverage edge, 4 269 pixels. `_contains_level()` and `clipmap_contains()` now test the half-open
   texel range on both sides, which is exactly the set of texels the level stores.
 * **A function guarded out of the variant that calls it.** `height_tap_scale()` was declared inside
-  `#ifdef TERRAIN_HEIGHT_CLIPMAP` while the fragment stage called it unconditionally, so the no-VT
+  `#ifdef TERRAIN_CLIPMAP_HEIGHT` while the fragment stage called it unconditionally, so the no-VT
   variant failed to compile - caught immediately, but it is the class of mistake a generated shader
   invites: the *call* and the *definition* have to be guarded by the same condition. It is now a
   function with an `#else` arm returning 1.
@@ -801,6 +943,262 @@ readings are unchanged by the arm - it drives the mechanism with every cell `Dir
 what the entry exists for - and the new invalidation block adds one row to the table above. The
 acceptance the plan set for the sweep is a full `run_all.py --driver d3d12` on the final tree, whose
 summary is recorded at the end of this section.
+
+### 8.5 The channel extension point, as measured
+
+M2b's arm left the ring usable for exactly one channel, and the shape of "one more channel" was spread
+over five places that each named the height group: the source's shape was written into
+`_setup_vt_clipmap()` (`channels = 1`, `FORMAT_RF`, and a `p_group != Height` refusal), the matrix's
+acceptance was a table, the variant was one boolean and one define, the uniforms were one set named
+for the ring rather than for a group, and the ring capped a texel at four scalars. Section 6.1's
+promise - a source and a line - was therefore a plan rather than a property of the code. This step
+makes it the property:
+
+| What a channel is now | Where |
+| --- | --- |
+| one `Terrain3DClipmapSource` subclass that declares its own shape (`get_channel_count()`, `get_format()`) and name | `terrain_3d_clipmap_source.h`, `terrain_3d_clipmap_source_height.h` |
+| one case in the factory/registry `Terrain3D::_clipmap_channel()` | `terrain_3d_surface_views.cpp` |
+| nothing else | the ring's addressing, strips, budget, invalidation, the tick, `clipmap[group]` in the report, both debug views and the dock's rows are channel-agnostic - and the matrix's acceptance is `has_clipmap_source()`, which is that case's answer, so a new source makes the method writable everywhere at once |
+
+The arm's side became one table and one flag per group rather than one of each for the ring: the
+shader declares `_clipmap_atlas[CLIPMAP_GROUP_COUNT]` and one `CLIPMAP_GROUP_COUNT *
+CLIPMAP_MAX_LEVELS` table indexed `group * CLIPMAP_MAX_LEVELS + level`, the shared helpers take the
+group (and the caller's atlas, because a sampler array index must be constant), the band mask
+`_clipmap_band[]` replaces the two height booleans, and `Terrain3DMaterial::_shader_clipmap[]` /
+`is_shader_using_clipmap(group)` replace the single height flag. A group's arm is its *own* code - the
+band rule's distance measure and the read are the channel's questions - which is cohesion rather than
+coupling: the height arm is now three lines over the shared rule, and the material arm has somewhere
+to go that is not a copy of the ring.
+
+**What the step measured.** `vt_clipmap_render` is green with the refactored arm and its own
+pixel-identical reading unchanged (a 64-texel, 64 m ring against the array: 0 of 76 800 pixels
+differ; the same ring at 256 m differs; outside the coarsest level's coverage the array serves; an
+edit falls back and then agrees again), `vt_clipmap` is green with two new assertions that pin the
+registry (`has_clipmap_source(Height)` true, `has_clipmap_source(Material)` false, and the refusal
+naming the `diffuse+normal` channel), `vt_delivery` and `vt_debug_views` are green, and `editor_dock`
+passes seven of its eight modes - including the `dock` mode recorded as red at `HEAD` in
+`docs/vt_reference_avt_alignment.md` section 9, whose three causes this step fixed (below).
+
+The full sweep is `run_all.py --driver d3d12` on this tree: **58 of 74 pass**, and every failure is one
+of the names recorded here or in `docs/vt_reference_avt_alignment.md` section 9 - the seven
+`vt_adaptive` modes that target the legacy region view (plus `vt_adaptive:rotation`, which fails the
+same three page-reuse assertions on both trees), `vt_turn_budget`'s coin flip,
+`vt_near_arrival`'s infrastructure exit, `vt_visibility`'s three assertions, and three this step
+A/B'd against a stashed-and-rebuilt `HEAD`: `vt_material` ("stationary AVT does not rebake unchanged
+pages"), `vt_transition_parent` ("a missing fine page must remain diagnostic") and
+`texture_compression` (a null `uniform_set` at draw time) fail identically on both trees. `vt_pressure`
+and `vt_idle_cost` passed on this run, `vt_strict_coverage` - recorded as an infrastructure exit - ran
+green in 84.5 s, and the two remaining failures (`editor_dock:setup`, `vt_render`) are recorded below
+rather than chased.
+
+**Three defects the step found, all pre-existing and all in the way of "a channel is a source".**
+
+* **A control that could not write.** `vt_editor.gd`'s clipmap handler probed the property
+  `"vt_clipmap_%s" % p_key`, which for the budget reads `vt_clipmap_budget` - a property that does not
+  exist, because the setting's setter is `set_vt_clipmap_budget_texels`. The budget spin therefore
+  returned early on every write and never reached the terrain, for a user as much as for a test. The
+  probe and the setter are now one entry per control, and `editor_dock:dock` reads the write back.
+* **A stale assertion in `editor_dock:dock`.** It wrote `near/height = Clipmap` and required the cell
+  to be refused "because this build has no arm for it" - a pre-M2b claim that contradicts the
+  acceptance rule at `HEAD` (`git show HEAD:...terrain_3d_surface_views.cpp` accepts it). It now
+  demonstrates the refusal with the group that has no source, which is the claim that is still true.
+* **A test reading the tick's counter with the wrong wait.** `vt_delivery` awaited two *process*
+  frames and then read `clipmap_produced_texels`, which the clipmap branch of `__physics_process()`
+  clears - so an off-screen window fast enough to serve two process frames without a physics tick read
+  the entry's number and called it a regression. It awaits the tick the assertion names now, the same
+  fixture precondition `vt_pressure` records.
+
+**What the step did not fix, recorded rather than chased.** `editor_dock:setup` fails in this
+environment on a click the fixture computes outside the window it runs in: its own diagnostic reads
+`point=(800.4, 401.8)` for a `640x480` off-screen editor, so the synthetic click never lands and the
+region count stays 1. It is the class of environment geometry `docs/vt_reference_avt_alignment.md`
+section 9 records for the dock runner, it is not touched by this step (the mode is scene painting, Add
+Region and a saved reload, and nothing here moves a container or a widget), and the other seven modes
+of the same suite pass - including `dock`, whose recorded failures this step did fix.
+
+`vt_render` is flaky at `HEAD` as well, and its race is the fixture's rather than a rendering path's.
+Its last block blanks four slots of the near field's atlas and then disables the near field, expecting
+the array path back; but the far field may resolve through the *shared* staging pool inside the six
+frames the sampled image waits for, and that pool is where those slots were written - so a far page
+that lands late renders the blank too. The A/B is five runs a side with `native/src` stashed and
+rebuilt against this tree: baseline passes four and fails one, this tree passes two and fails three,
+and the failing image reads `r` at `(0.9725, 0, 0, 1)` - the blank's own colour, not the strict-miss
+diagnostic - with the same cells, preview state, arm reading and generated code on both sides. It is
+recorded, not chased, for the reason section 9 gives for `vt_pressure`: what the assertion is really
+about is the race, and the fix belongs in the fixture (blank through the far field's own addressing, or
+assert on the pool's generation) rather than in a threshold. The suite's first three readings - the
+array baseline, the pixel-identical comparison and "the shader samples the atlas" - pass in every run
+of both trees. The full sweep's summary is at the end of this section.
+
+**What was left for M4, and is now landed.** The material group's cell was refused at the end of this
+step because the group's payload had no scalar form; section 8.6 is the step that gave it one (the
+packed `R16` surface payload, one payload texel a ring texel), the arm that reads it in the band the
+cell names, and the mix with the paged band. What that step left was a ring of the group's *baked*
+arrays - the group's albedo, normal and params rather than the payload they are produced from - which
+section 8.7 landed: the ring owns one layer per level and the shared producer bakes them from the ring's
+own texels, so the material arm samples what the pages sample instead of evaluating the payload per
+fragment.
+
+### 8.6 The material arm, as measured
+
+The material channel's source is `Terrain3DClipmapSourceMaterial`: one packed `R16` surface-payload
+texel a ring texel, read by nearest payload texel in `RF` (section 6.5). The arm is the payload read,
+the band weight and `surface_corner_value()`; the evaluation it feeds is the shipped one, moved into
+`evaluate_idweight_material()`.
+
+| Step | Reading |
+| --- | --- |
+| all cells `Direct` | the generated code carries no material arm at all (`clipmap_baked_material` is absent) and the fixture's two painted ids render as two colours |
+| `Near/Material = Clipmap`, ring 64 texels / 64 m (one ring texel a metre, the payload's own grid) | the cell is accepted, `has_clipmap_source(Material)` is true, the shader carries the material arm, the group's ring is `configured` with a current level, its `source` reads `material`, and the render is **pixel-identical** to the array's |
+| the same ring at 256 m base (four metres a texel) | the render differs in a large fraction of the frame: the identical result above is the ring's render, not a fallback agreeing with itself |
+| the material cell taken back to `Direct` | the arm leaves the generated code and the render returns to the array's, pixel-identical |
+| `far/material = SVT` | the pages keep the far band and the ring keeps the near one: the near band renders the ring's payload at the payload's own density, the far band is the SVT's material, and the transition is the mix of the two (section 6.5) |
+
+**The fixture the readings needed.** The first shape of this block painted two large uniform material
+patches, and its third reading passed for the wrong reason: a coarse ring point-samples one value out
+of a uniform patch, so a four-metre ring and a one-metre ring rendered the same picture and "0 pixels
+differ" was the fixture agreeing with itself. The scene now paints alternating ids in eight-metre blocks
+(after the height profile's own reason for being a gradient rather than a ramp) and `setup()` asserts
+the payload varies before any comparison runs - the same lesson `docs/vt_reference_avt_alignment.md`
+section 9 records for a counter whose one branch could not occur.
+
+**The suites.** `vt_clipmap_render` is green with the material block (and its six height readings
+unchanged), `vt_clipmap` is green with the registry's answer for both channels and the height channel's
+`AVT` refusal in place of the material one it used to demonstrate, `vt_delivery` is green carrying the
+material cell through its own assembly block (the cell is accepted, the material ring is configured and
+its `shader_arm` is in the variant while the height ring's is out), `vt_debug_views` is green with both
+rows offering `Clipmap`, `editor_dock` passes seven of eight modes (the `setup` mode is the environment
+failure recorded above), and `vt_render` keeps its recorded flake rate. The generated shader was
+verified to compile for the material variant by the first run of this work: `Expected constant
+expression` at `const int ring_band = _clipmap_band[ 0 ] & 3` - a `const` initialised from a uniform is
+not a constant expression in Godot's shader language, the same trap the block table's own comment
+records.
+
+### 8.7 The ring's baked layers, as measured
+
+Section 8.6's arm reads the payload; this step gives the ring the *baked* layers themselves, produced by
+the shared producer from the ring's own texels (section 6.5). `vt_clipmap_render` carries the readings,
+all of them in one block after the material arm's own.
+
+| Step | Reading |
+| --- | --- |
+| the far field brought up (`far/material = SVT`, 32-texel pages) | the producer exists and has pages (`ready_pages > 0`), which is the precondition for a bake: a ring owns no pass |
+| the far field's own levels, read after it configured | `svt_effective_max_mip 7`, `svt_root_page_world 512`, so the resident root is `512 / 32` = **16 m a texel**; its distance table is then pinned to that level, so every fragment and every page the demand pass asks for is that level |
+| the ring configured to that density (`vt_clipmap_base_world = 64 * 16 = 1024`) | the setter takes it, the level's report reads `world_size 1024`, `texel_world 16` |
+| the paged render (near cell `Direct`, the far field serving) | the reference: the pages' material at 16 m a texel |
+| `Near/Material = Clipmap` | the cell is accepted, the group's ring is `configured` with a current level, `baked_channels` is 3 |
+| the bake's handshake | `valid_levels 1`, `baked_levels 1`: the dispatch landed *and* the next offer's lease check accepted it - which is what the flag is, not a request |
+| the arm's binding | the outstanding-rect table reads back empty from the material for a settled ring, and the generated shader carries `clipmap_baked_material` |
+| **the judge: the ring's baked render against the paged one at that density** | **mean channel difference 0.0018** (under half a step of an 8-bit image, and a wrong id moves it by ~0.1), with **3 of 76 800 pixels** differing visibly (max 0.098) - a single shadow terminator at (160..162, 62), where a texel-scale normal difference flips the shadow test |
+| the same ring against the *array* render | a different picture: the evaluation resolves the payload per fragment on the payload's own grid, not the material at the level's texels - which is what the arm would show if it had fallen back |
+| the ring at twice that density | renders *its* density (the pair above is not a picture neither source is in) |
+
+**What the step had to fix, and what it cost.**
+
+* **The arm's samplers were silently unbound.** The first version of the block commented the three
+  `material_set_param()` calls out while bisecting a crash, and the judge then *passed*: with the
+  samplers unbound the baked layers' readiness alpha reads 0, `surface_decode_page()` refuses them, the
+  arm falls back to the payload evaluation, and the render is the array's - so "identical to the array"
+  was the fallback agreeing with itself. The corrected block no longer claims identity with the array at
+  all: it claims the *paged* material at a matched density, which is a picture the fallback cannot
+  produce (the fallback's is the array's, and that is asserted as a different picture beside it).
+* **A cached descriptor set outliving its bundle.** The ring's bake set names the bundle's job buffer,
+  samplers and shader, and the bundle is replaced a generation at a time (the material list's
+  publication is one reason). The set's identity now includes the job buffer it was built against, so a
+  replaced bundle rebuilds it rather than dispatching from a set whose buffer the device has retired -
+  which was an access violation inside `render_pending()`.
+* **A far-field-only configuration dereferenced the absent near view.** `_invalidate_vt_region()`
+  reached the shared page pool's owner list through `_vt.surface_vt` unconditionally, and a
+  configuration with only the far view up (the one this block needs, because the near cell is the ring's
+  and the far cell keeps the producer alive) has no near view at all: the owner list is now read through
+  whichever view exists - it is the *pool's* list either way - and the per-owner branches are guarded by
+  the view they act on.
+* **The job's shape was the level, one dispatch each.** A level's ring offset is part of what its job
+  reads, so it cannot ride in a batch's push constant, and a batch would have to be cut to the job
+  buffer's page-sized capacity - a coupling between the ring and the page pool that a channel delivered
+  by the ring alone should not have. The push constant gained the two words that say which kind of source
+  a job has (`source`), and the page path writes them as zero. Section 8.8 took the same argument one
+  step further and made the unit a *rect* rather than a level, which is what kept the ring's strip model
+  through the device pass; `dest` is the field that made the dispatch rect-sized.
+
+**What is not measured here.** The literal "pixel-identical" of the judge is not what two producers do at
+their edges and in their last bits: a page's source is a staging array resampled at the page's own grid
+with the page's own slope policy, while the ring's is its own payload layer, so the values agree to
+within the render's precision rather than bit for bit, and a shadow terminator can flip a handful of
+pixels. The bound the block asserts is therefore *quantitative* - under half a step on the mean, under a
+hundredth of a percent of the frame visibly - and the numbers above say how far from the bound it
+actually runs. A page whose rect *is* the ring's level is the configuration that would make the two
+producers' inputs identical and the comparison bit-exact; that is the producer's own next step.
+
+### 8.8 The bake's grain, as measured
+
+Section 8.7 landed the ring's baked layers with the producer baking a *level* per offer; this step hands
+it the ring's own rects instead (section 6.5), which is the difference between a ring whose strip model
+ends at the CPU and one that keeps it through the device pass. `vt_clipmap_render`'s last block is the
+reading, at the same 16 m a texel the judge above runs at (a 64-texel level, `size * channels` = 192
+channel texels a strip, `size * size * channels` = 12 288 a level).
+
+| Step | Reading |
+| --- | --- |
+| a settled ring | `pending_bake_rects` 0 - a level that has been baked owes the producer nothing, which is what `baked` is derived from |
+| one texel of focus movement under the `Clipmap` cell | the ring produces the column strip it lost, and the producer bakes **192 channel texels**: one strip, not the 12 288 the level's square would cost, i.e. **64x less device work per texel of camera movement** |
+| the same move, settled | the level is `baked` again and `pending_bake_rects` is 0, so the strip's bake landed and the ring's lease accepted it |
+| **the same move, rendered** | the render matches the paged material exactly as well as it did *before* the move (mean channel difference 0.0018, 3 of 76 800 pixels visibly different) - which is the reading that says the strip bake left the rest of the level where it was |
+| an editor material stroke | one invalidation, one rect, **204 channel texels** baked (the stroked rect), and the level current and baked again |
+| **the arm's gate turned off by the test** | the render becomes a *different* material: mean channel difference **0.069** against the baked one, 51 556 of 76 800 pixels visibly different, and binding the gate again returns the baked picture exactly. This is the reading that says the fragments inside the ring's band were answered from the ring's **layers** and not from the payload evaluated per fragment - the question the whole step exists to answer - and it is the same trick `vt_material` uses when it poisons a source array to show that ready pages bypass it |
+
+**What the step had to change.**
+
+* **The producer's unit is a rect, in the level's *stored* frame.** `RingJob` carries a rect of stored
+  texels and the level's world origin; the push constant gained `dest` (the rect's origin and extent
+  inside the output layer), the dispatch is sized to the rect, and the page path writes the same field as
+  "origin zero, the stored size" - one shader, two kinds of job.
+* **The baked layer is indexed like the payload layer, not like the level's own frame.** This is the
+  correction the step's own rendering reading caught: a rect baked into a layer indexed in the level's
+  *logical* (moving) frame is correct only for the rect itself - every other texel holds the material of
+  a world position the level no longer covers, because the logical frame moves with the centre while the
+  stored frame is what the ring offset keeps pointing at the same world position. The first version of
+  this step had it the other way round and rendered 560 visibly different pixels after one texel of
+  movement; with the stored frame that number is 3, the same three the pre-move render has. The bake
+  reaches a stored texel's world position through the level's policy grid and turns the tap back with the
+  ring, and the arm reads the baked layer with the payload read's own arithmetic.
+* **`baked` is derived from the queue, not set by a producer.** A level is baked when no rect of it is
+  queued, so the arm's gate, the report's flag and the producer's accounting are one state: a level that
+  turned a strip is not served baked until that strip's bake lands, and the untouched texels' baked
+  content is still correct while it waits - which is what the stored frame buys.
+* **A stale rect stays queued.** The acknowledgement is per rect *and* the lease it is answered by is the
+  rect's own (`BakeRect::lease`): a rect that grew over new content while its dispatch was in flight is
+  not counted and is dispatched again, so a producer can never mark a rect baked over texels it did not
+  read - while a *different* rect of the same level, or a later strip, is not this rect's business.
+* **The offer is budgeted in the production unit.** `queue_clipmap_ring()` takes
+  `vt_clipmap_budget_texels` and stops collecting when the rects it has chosen reach it, with a soft
+  floor of one rect per offer - a whole-level fill (a first fill, a material change) is larger than a
+  tick's budget and would otherwise never be admitted. The report publishes `pending_bake_rects`,
+  per-level `pending_bake_rects` / `pending_bake_texels`, `baked_texels`, `bake_dispatches` and
+  `bake_rejects`, all in channel texels, beside the fill's own `produced_texels`.
+
+**A focus that keeps moving, measured.** The two readings above are what the lease and the gate are
+*for*, and the step's own acceptance was taken with the focus advanced one texel every two frames:
+
+| Version | Reading |
+| --- | --- |
+| the lease the level's (the first shape of this step) | producer dispatches 1, 2, 3, 5, 7 while the ring acknowledged **0** and refused 4 (`bake_rejects`): `baked` false in all eight frames, so the layers were written over and over and never served |
+| the lease the rect's (this step) | the same walk acknowledged **2** with **0** refusals, the queue drained (`pending_bake_rects` 2 rather than growing to 8), and the ring was baked again the moment the focus stopped |
+
+And the arm's readiness reads as the *fragment's*, from the test writing the table itself: with the
+ring's own answer bound, the render is the pages' material (mean channel difference 0.0018); with one
+rect the camera cannot see added, the render is **unchanged** (0 pixels); with one rect covering the
+level, the band reads the array and the picture becomes a different material (mean 0.069, 51 556 pixels
+differing visibly). The first and the last are what say the fragments were answered from the ring's
+*layers*; the middle one is what says a rect the fragment's taps miss costs nothing.
+
+**What is still not incremental.** The *payload transfer* is: `RenderingServer::texture_2d_update()`
+replaces a whole layer, so a level that turned a strip still uploads `size * size * channels` values per
+channel for the strip it produced (section 6.2's note). The bake no longer pays for it, which is the half
+this step could take without a second staging path; a rect-granular transfer needs a scratch layer and a
+device-to-device copy, or the payload read from the paged producer's staging, and that is a step of its
+own - as is dropping the ring's payload layer entirely, which is the producer's input and nothing else
+now that the arm has no payload of its own to read.
 
 ## 9. Rejected alternatives
 * **A cell that is stored and published as inert.** The alternative to section 3.1's refusal is to
