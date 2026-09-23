@@ -135,15 +135,15 @@ constexpr float AVT_DEMAND_DENSITY_MARGIN = 1.25f;
 // `_avt_tick_allowance()` (the pass, the producer's frame budget, the source queue window), the
 // production pass's own clamp, and the producer's encode ring depth. A setting change therefore
 // reconfigures nothing and applies on the next tick, and no game code drives any of it.
-// The default `max`: the smallest headroom that reaches the acceptance target on the reference
-// project. Measured on the snap probe it is the difference between converging in 4 displayed frames
-// instead of the 24 a 16 page batch takes (`auto32` 10, `auto64` 7, `auto128` 4 on the first 180
-// degree turn), and what it costs is the encode ring's allocation - 128 positions instead of the 43
-// the shipped 16 needs, i.e. 518 MiB of staging against 87 MiB, still inside the slot-count
-// invariant the ring answers to (`allocated * 2 <= physical_cache_bytes_uncompressed`). A project
-// that would rather have the memory than the frames sets it back to 64, which converges in 7.
+// The default `max`: 64, the value the request named. Measured on the snap probe it converges in 7
+// displayed frames on the first 180 degree turn where the shipped 16 page batch takes 24 (`auto32`
+// 10, `auto64` 7, `auto128` 4), and what it costs is the encode ring's allocation - 128 positions
+// instead of the 43 the shipped 16 needs, i.e. 259 MiB of staging against 87 MiB, still inside the
+// slot-count invariant the ring answers to (`allocated * 2 <= physical_cache_bytes_uncompressed`).
+// A project that would rather have the frames than the memory sets it to 128, which converges in
+// 3-5 frames on the same turn at 256 positions and 518 MiB of staging.
 constexpr int AVT_PAGE_BATCH_DEFAULT = 16;
-constexpr int AVT_PAGE_BATCH_MAX_DEFAULT = 128;
+constexpr int AVT_PAGE_BATCH_MAX_DEFAULT = 64;
 
 // The most either may be set to, so "raise it while moving" cannot be turned into a stall or an
 // out-of-memory by a typo. It is not an arbitrary guard: it is the widest window the rest of the

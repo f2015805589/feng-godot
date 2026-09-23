@@ -1083,7 +1083,7 @@ python misc/feng-addons/feng-idweight-terrain/native/tests/vt_page_budget_runner
 python misc/feng-addons/feng-idweight-terrain/native/tests/vt_project_lifetime_probe.py --project F:/godot/project/test-1 --motion snap
 ```
 
-`surface_vt_page_batch_default` (16) and `surface_vt_page_batch_max` (128) are the near field's page
+`surface_vt_page_batch_default` (16) and `surface_vt_page_batch_max` (64) are the near field's page
 budget. The first is the stable rate and the whole of the shipped behaviour; the second is the
 "over page" the plugin raises the batch to **by itself** while the camera is moving fast, while the
 view it is filling is still unserved, or on the tick the motion sampler sees a discontinuity - a
@@ -1106,10 +1106,10 @@ the configuration and `encode_ring_capacity` is the tick.
 as the shipped 16. The movement itself needs a live view, so it is read from the snap probe's
 `VT_AVT_TIMELINE` line: one line per displayed frame carrying the motion sample, the tier it
 resolved to, the allowance and the batch the pass actually handed over. On the reference project at
-1080p the shipped configuration escalates for 32 ticks of the initial window and 25-27 of each 180
-degree turn, hands over at most 127 pages in the frame the view is cold, and returns to 16; the
-batch the pass hands over matches its allowance in every window, so the budget rather than the ring,
-the readback or the four source threads is what bounds the rate.
+1080p the shipped configuration escalates for roughly 22-36 ticks of each 240-frame window, hands
+over up to the configured 64 pages in the frame the view is cold, and returns to 16; the batch the
+pass hands over matches its allowance in every window, so the budget rather than the ring, the
+readback or the four source threads is what bounds the rate.
 
 Measured frames-to-acceptable on the same probe (the frozen `analyze_frames.py` judge, w0 the
 session's first frame, w1/w3 the two 180 degree turns, w2 the turn back; three runs where the
@@ -1117,18 +1117,19 @@ spread is worth showing):
 
 | configuration | w0 | w1 | w2 | w3 | ring positions | staging |
 | --- | --- | --- | --- | --- | --- | --- |
-| `default = max = 16` (shipped rate) | 32 | 24-32 | 11-14 | 12-16 | 43 | 87 MiB |
+| `default = max = 16` (the stable rate) | 32 | 24-32 | 11-14 | 12-16 | 43 | 87 MiB |
 | `default = 16, max = 32` | 20 | 10 | 11 | 10 | 64 | 130 MiB |
-| `default = 16, max = 64` | 12 | 7 | 9 | 8 | 128 | 259 MiB |
-| **`default = 16, max = 128` (shipped)** | **9-10** | **3-5** | **7** | **6-8** | **256** | **518 MiB** |
+| **`default = 16, max = 64` (shipped)** | **12** | **7** | **9** | **8** | **128** | **259 MiB** |
+| `default = 16, max = 128` (frames over memory) | 9-10 | 3-5 | 7 | 6-8 | 256 | 518 MiB |
 | `default = max = 128` (governor inert) | 9 | 4 | 8 | 8 | 256 | 518 MiB |
 
 The ring's `allocated * 2 <= physical_cache_bytes_uncompressed` invariant still holds at the widest
 setting (939 MiB of physical cache against a 2211 MiB page-sized pool), and the settled frame's
 absolute gradient reading is unchanged across the arms, so the escalation buys frames rather than
-quality. What it costs is the ring's allocation, which is made once when the bundle is built: a
-project that would rather have the 259 MiB than the frames sets `max` back to 64, and one that wants
-the shipped rate and nothing else sets `max = default`.
+quality. What it costs is the ring's allocation, which is made once when the bundle is built: the
+shipped 64 already spends 259 MiB where the 16 rate needs 87 MiB, a project that would rather have
+the frames than the memory sets `max = 128` for 518 MiB, and one that wants the shipped rate and
+nothing else sets `max = default`.
 
 ## A page arrival is a ramp, not a step
 

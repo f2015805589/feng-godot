@@ -17,8 +17,8 @@ func run() -> void:
 	var terrain := Terrain3D.new()
 	var settings: Dictionary = terrain.get_vt_settings()
 	_require(int(settings.avt_batch_default_pages) == 16, "the stable tier defaults to the shipped 16")
-	_require(int(settings.avt_batch_max_pages) == 128, "the escalated tier defaults to 128")
-	_require(int(settings.avt_batch_peak_setting) == 128, "the configured peak is the max")
+	_require(int(settings.avt_batch_max_pages) == 64, "the escalated tier defaults to 64")
+	_require(int(settings.avt_batch_peak_setting) == 64, "the configured peak is the max")
 	_require(int(settings.avt_batch_ceiling) == 256, "the ceiling is 256")
 	# At rest the live ceiling is the stable tier, which is what every existing acceptance reading
 	# was calibrated against.
