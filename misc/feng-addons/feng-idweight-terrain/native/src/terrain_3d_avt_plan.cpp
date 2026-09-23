@@ -152,7 +152,15 @@ void plan_pages(Terrain3DAVTRefinement &r_job, const PlanInput &p_input) {
 	// Keep a small recently-visible window while making room for the new view.
 	// Every local image has a complete parent chain; the sector tier count never
 	// truncates this traversal or the shader's ready-parent search.
-	const int retain_reserve = MIN(16, available / 8);
+	//
+	// The window is the pages the *previous* view held that this plan does not name, and it is what
+	// keeps a level the view has just left addressable and resident instead of letting it fall out
+	// of the plan, out of the pool's demand record and into a source read, a bake and an arrival
+	// ramp the next time the view asks for it. It is spent rather than free - the walk stops this
+	// many pages short of the budget - so it is bounded by `AVT_RETAIN_PAGES_MAX` and by an eighth
+	// of what the plan may hold. `_avt_install_or_reuse_plan()` chooses *which* pages, finest
+	// first; this is only how many.
+	const int retain_reserve = MIN(AVT_RETAIN_PAGES_MAX, available / 8);
 	const int visit_limit = MAX(64, p_input.budget * 64);
 	// The near-refinement phase's share. A third of the available budget is the same fraction the
 	// root phase already reserves, and it is enough for the nearest cells to reach their demanded

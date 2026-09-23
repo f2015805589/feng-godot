@@ -119,12 +119,18 @@ Vector2 Terrain3DPagePipeline::Snapshot::bounds(const Rect2 &rect, Vector2 fallb
 // Pages are assembled on more than one thread because one thread cannot feed a moving
 // view: a page costs a source scan plus an id/height payload, and the demand of a camera
 // crossing a sector is an order of magnitude above what a single worker can prepare per
-// frame. The default keeps half the machine's threads (at least one, at most four) so the
-// renderer, the planner and the game keep their cores.
+// frame. The default keeps half the machine's threads, capped so the renderer, the planner
+// and the game keep their cores. The cap was four, which is what a *moving* view needs; a
+// cold view's burst is a different rate, and it is bounded by this thread pool rather than by
+// the tick it is admitted at. Measured on the reference project's first 180-degree cut, four
+// workers prepared ~140 pages a frame while the encoder ring could finish 192, so the pool
+// was the limiter for exactly the frames the transition is judged on. Eight on a
+// twenty-thread machine still leaves twelve for everything else, and the burst is off in
+// every settled or ordinary moving view.
 static int default_page_workers() {
 	const unsigned int hardware = std::thread::hardware_concurrency();
 	const int threads = hardware > 0 ? int(hardware) : 4;
-	return CLAMP(threads / 2, 1, 4);
+	return CLAMP(threads / 2, 1, 8);
 }
 
 int Terrain3DPagePipeline::default_worker_count() { return default_page_workers(); }

@@ -75,14 +75,17 @@ void Terrain3D::_update_vt_page_fade() {
 	if (fade_view == nullptr) { return; }
 	const int slots = MAX(1, fade_view->get_page_count());
 	// The ramp length. A cold view is filled by a production burst whose whole point is that the
-	// ground stops being a one-texel-per-metre smear within a few ticks, and a page that has arrived
-	// but is still ramping is drawn as the level it replaced for the length of the ramp: the shipped
-	// twelve ticks are longer than the window the reference project asks for, so a burst that filled
-	// the plan in four ticks would still show the old level for another twelve. While the burst is
-	// armed the ramp is shortened to `AVT_COLD_BURST_FADE_FRAMES`. The setting is untouched, an
-	// in-flight ramp only ever moves forward when the length changes, and a settled view ramps at its
-	// full length again. See `AVT_COLD_BURST_FADE_FRAMES`.
-	const int frames = MAX(1, _vt.avt_cold_burst_ticks > 0
+	// ground stops being a one-texel-per-metre smear within a few frames, and a page that has arrived
+	// but is still ramping is drawn as the level it replaced for the length of the ramp. While the
+	// cut's cold episode lasts the ramp is shortened to `AVT_COLD_BURST_FADE_FRAMES`, which is zero:
+	// every page of the view arrives in the same few frames, so the blend that hides one page's step
+	// behind its resident ancestor is applied to the whole footprint at once and the ground stays at
+	// the level it left until the last page's ramp has run. The window is the *episode*, not the
+	// burst: the pages arrive over the frames the burst runs and the one or two after it, and a page
+	// that arrives after the rate has been restored would otherwise take the full ramp and hold the
+	// last of the ground soft for a second. The setting is untouched and a settled or ordinary moving
+	// view ramps at its full length again. See `AVT_COLD_BURST_FADE_FRAMES`.
+	const int frames = MAX(1, _vt.avt_burst_from_cut
 			? MIN(_vt.vt_page_fade_frames, AVT_COLD_BURST_FADE_FRAMES)
 			: _vt.vt_page_fade_frames);
 	if (_vt.fade.queue.capacity() != size_t(slots)) {

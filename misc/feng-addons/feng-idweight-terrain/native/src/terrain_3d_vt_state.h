@@ -654,6 +654,16 @@ struct Terrain3DVTState {
 	// Far field: allow a miss at the level the distance rule selected to be served by a
 	// coarser resident level instead of the diagnostic. Off restores the strict walk.
 	bool svt_feedback = true;
+	// Which page source the near field's feedback switch may answer a cold page from. One of
+	// `AVT_FEEDBACK_SOURCE_COARSE` (the near field's own hierarchy and its fallback grid, the
+	// shipped contract) or `AVT_FEEDBACK_SOURCE_SVT` (the far field's own sparse virtual texture).
+	// Only a cold page - a cut's view whose burst has not served it yet - reads the second source,
+	// so the switch's steady meaning does not change with it.
+	int avt_feedback_source = AVT_FEEDBACK_SOURCE_COARSE;
+	// Whether the shader was last told that cold pages take the far field's pages. Published with
+	// the same tick as the burst, because the shader's copy is a material parameter and a material
+	// rebuilt in the middle of a cold view would come back with the default.
+	bool avt_cold_svt_published = false;
 	bool vt_debug_direct_material = false;
 	bool vt_editor_preview = true;
 	Dictionary vt_editor_dirty_regions;
@@ -831,25 +841,14 @@ struct Terrain3DVTState {
 	// largest allowance it asked for, and how many pages it produced across the burst.
 	int avt_cold_burst_ticks = 0;
 	int avt_burst_peak = 0;
+	// Pages this cold episode has produced, and the ticks it has spent at the burst rate. The first
+	// bounds the episode (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`); both are what the report reads.
 	int64_t avt_burst_pages = 0;
-	// The rate the producer's frame budget and the source queue window were last set from, so the
-	// tick that arms or ends a burst publishes it once instead of every tick. Zero means nothing has
-	// published yet, which is what makes the first tick of a session apply the configured budget.
-	int avt_page_budget_applied = 0;
-	// Whether the shader was last told the view is cold, i.e. that a fragment served only by the
-	// independent fallback tier should take the source evaluator instead. It is the shader's copy of
-	// `avt_cold_source_fallback`, published with the burst's rate and reported beside it.
-	bool avt_cold_source_published = false;
+	int avt_cold_burst_spent = 0;
 	// Whether a *cut* put the view in the cold state - the burst's own arm. A camera that merely
-	// moves never sets it, which is what keeps the burst and the source fallback off every ordinary
-	// streaming path. It is consumed by the production pass that finds the view served again.
+	// moves never sets it, which is what keeps the burst off every ordinary streaming path. It is
+	// consumed by the production pass that finds the view served again.
 	bool avt_burst_from_cut = false;
-	// Whether the shader should draw a cold view's under-served fragments from the source evaluator.
-	// Armed by the cut that creates the cold view and cleared by the pass that has nothing left to
-	// fill, so its window is the *serving* one and not the burst's six ticks: the fragment-level
-	// handover is the shader's texel tolerance, and this flag only bounds how long that tolerance may
-	// apply. See `_avt_cold_source_fallback` in the shader.
-	bool avt_cold_source_fallback = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
 	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum

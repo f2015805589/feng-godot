@@ -78,16 +78,11 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		idle_lost = idle_producer->count_unready_pages(_vt.avt_settled.slots);
 	}
 	if (idle_candidate && idle_lost == 0) {
-		// A settled view is served by definition, so this is where a cold view's burst and its source
-		// fallback end when the plan fills without the pass ever seeing a missing page: the shortcut
-		// returns before the classification the clear below is written against, and a flag left on
-		// here would keep drawing under-served fragments from the source for the rest of the session.
-		// Not while the burst still has ticks to run, though: the tick a cut lands on still holds the
-		// *previous*, settled plan, so clearing here would end the fallback in the same tick the cut
-		// armed it and the cut's own plan would never be drawn with it.
+		// A settled view is served by definition, so this is where a cold view's burst ends when the
+		// plan fills without the pass ever seeing a missing page. Not while the burst still has ticks
+		// to run, though: the tick a cut lands on still holds the *previous*, settled plan.
 		if (_vt.avt_cold_burst_ticks <= 0) {
 			_vt.avt_burst_from_cut = false;
-			_vt.avt_cold_source_fallback = false;
 		}
 		for (int slot : _vt.avt_settled.slots) { pool->mark_demanded(slot); }
 		// Only the first tick of an idle run publishes: every value below is a constant of
@@ -172,29 +167,38 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// without a timer to keep in step with the plan. An ordinary moving view never arms it: its plan
 	// is mostly carried from the last one, so the pages it is missing are the ones the steady rate
 	// already covers, and a burst there would be churn.
+	//
+	// "Still cold" is pages the image cannot be served, which is a page with no slot *or* a page whose
+	// content has not arrived. Counting only the first is what let a cut's burst expire while the
+	// view was still unserved: the source pass can allocate every slot in a few frames, and the pages
+	// then wait for their encode and readback, so the measured re-arm test read zero missing at the
+	// exact frame the image was still a smear and the burst's rate was what the readback needed.
+	// Measured on the reference project: a 180-degree cut left 752 pages with 0 missing and 288
+	// in flight at the frame the burst expired, and the remaining 288 then completed at the steady
+	// sixteen a frame - seventeen frames of a flat ground behind a three-frame burst.
+	//
+	// The threshold is therefore nothing: the burst runs until every page the image samples has a
+	// slot and content. A fraction of the plan is not the same question - at a quarter, the reference
+	// project's cut still had 137 pages outstanding when the burst stopped and those 137 were the
+	// transition's last five frames - and the episode is bounded in pages instead
+	// (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`), which is the bound that also covers a plan the pool
+	// cannot serve. A stray page whose production keeps failing cannot hold the rate open past the
+	// budget.
+	const int outstanding = pass.sampled_missing + pass.sampled_pending;
 	if (_vt.avt_burst_from_cut) {
-		if (pass.sampled_plan > 0 &&
-				pass.sampled_missing > int(float(pass.sampled_plan) * AVT_COLD_BURST_MISSING_FRACTION)) {
+		const int64_t page_budget = int64_t(pass.sampled_plan) * AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE;
+		if (outstanding > 0 && _vt.avt_burst_pages < page_budget) {
 			_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
-		} else if (_vt.avt_cold_burst_ticks <= 0) {
+		} else if (_vt.avt_cold_burst_ticks <= 0 &&
+				// The episode also owns the shortened arrival ramp, so it ends when the last page it
+				// produced has finished blending - not when the last one landed. A page whose ramp is
+				// still running would otherwise be re-armed at the full length and hold the ground soft
+				// for a second after the view was served. See `AVT_COLD_BURST_FADE_FRAMES`.
+				_vt.fade.pending == 0 && _vt.fade.held == 0 && _vt.fade.active == 0) {
 			_vt.avt_burst_from_cut = false;
 		}
 	}
 	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_pages += pass.produced; }
-	// The source fallback's own window is the *serving* one, not the burst's: it must not expire on
-	// a clock while the image is still sampling content the pages cannot stand behind. It hands over
-	// per fragment as the pages that serve them arrive (the shader's texel tolerance), and it ends on
-	// the first pass after the burst whose sampled pages all have content *and* whose arrival ramps
-	// have finished: a page that has landed but is still ramping in is drawn as the level it replaced,
-	// which is one of the three states the fallback exists to cover. The burst has to have run out
-	// first: the tick a cut lands on still classifies the *previous*, settled plan, which reports
-	// nothing missing, and clearing the flag there would end the fallback before the cut's own plan
-	// exists.
-	if (_vt.avt_cold_source_fallback && _vt.avt_cold_burst_ticks <= 0 && pass.sampled_plan > 0 &&
-			pass.sampled_missing == 0 && pass.sampled_pending == 0 &&
-			_vt.fade.pending == 0 && _vt.fade.held == 0 && _vt.fade.active == 0) {
-		_vt.avt_cold_source_fallback = false;
-	}
 	// The stage sums and the count they are summed over, so `report()` can difference two readings
 	// and state the mean of one sweep. The live keys above describe the last pass only.
 	_vt.avt_pass_count++;
@@ -296,6 +300,15 @@ void Terrain3D::_avt_classify_plan(Terrain3DAVTProducePass &r_pass) {
 	// the parent before its child inside one band; the optional apron and retained requests
 	// are last. The plan and the source queue use this same typed order, so a 16-page pass
 	// cannot spend its whole budget on speculative coarse work ahead of the rendered view.
+	//
+	// A cold view was tried with the band replaced by the span - every cell one level deeper before
+	// any cell goes two - on the theory that a cut's wide flat patch is a whole-footprint question.
+	// It is not, on this view: the ground the reading is taken over is the near and mid ground the
+	// camera is looking at, and the band order refines exactly that chain first. Measured on the
+	// reference project's first 180-degree cut, span-major needed 662 of 704 pages resident to clear
+	// the reading where band order cleared it with 463, and the window it reached acceptable in went
+	// from 8 frames to 9 with 96 more pages resident at every sampled frame. Do not re-try this
+	// without a reading that says the blurred ground is behind the near band.
 	std::stable_sort(r_pass.missing.begin(), r_pass.missing.end(),
 			[](const Terrain3DAVTPageRequest *p_left, const Terrain3DAVTPageRequest *p_right) {
 				return TerrainVT::page_request_priority_before(p_left->priority, p_right->priority);

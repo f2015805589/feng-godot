@@ -507,6 +507,11 @@ void Terrain3D::_bind_methods() {
 	ADD_SUBGROUP("AVT", "surface_vt_");
 	// The subgroup strips `surface_vt_`, so the Inspector shows exactly `Feedback`.
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_vt_feedback"), "set_avt_feedback", "get_avt_feedback");
+	// Which page path that switch answers a page it cannot serve from. `Coarse ladder` is the near
+	// field's own hierarchy and its independent fallback grid; `SVT pages` is the far field's sparse
+	// virtual texture. Both are virtual texture page paths - neither evaluates the material source.
+	// Only a cold page reads the second one, so the switch's steady meaning does not change.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "surface_vt_feedback_source", PROPERTY_HINT_ENUM, "Coarse ladder,SVT pages"), "set_avt_feedback_source", "get_avt_feedback_source");
 	// Near-field page storage. AVT pages are rewritten by every edit that invalidates them,
 	// so this codec is paid per production; the GPU block encoder keeps that cost off the CPU.
 	// See the shared comment on `vt_atlas_compression` for why the list has three entries.

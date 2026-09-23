@@ -30,8 +30,24 @@
 #include <godot_cpp/variant/vector2i.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 
-// What a page plan is a function of: the predicted camera transform, the projection, the viewport
-// and the settings that size the plan. A fixed-size value rather than a byte array, because it is
+// What the near field's feedback switch may answer a page it cannot serve from. The switch itself
+// is `surface_vt_feedback` (the shader's `_avt_feedback`): it decides whether a miss recovers at a
+// resident coarser level of the near field's own hierarchy instead of rendering the diagnostic.
+// This is the *source* that recovery may read.
+//
+//   COARSE - the near field's own hierarchy only: the sector's local mip chain and, above it, the
+//            independent dense fallback grid. This is the shipped contract, and the one
+//            `vt_fallback.gd` pins: a selected AVT miss never crosses into the far field.
+//   SVT    - the far field's own sparse virtual texture, a second page path with its own atlas,
+//            its own indirection and its own residency.
+//
+// Only a *cold* page uses the second source - the pages of a cut's view that the burst has not
+// produced yet - so the switch's steady meaning is unchanged whichever source it names. See
+// `_avt_cold_svt_source` in the shader and `Terrain3D::set_avt_feedback_source()`.
+constexpr int AVT_FEEDBACK_SOURCE_COARSE = 0;
+constexpr int AVT_FEEDBACK_SOURCE_SVT = 1;
+
+// What a page plan is a function of: the predicted camera transform, the projection, the viewport// and the settings that size the plan. A fixed-size value rather than a byte array, because it is
 // built, copied and compared on every tick of a moving view and an allocation per tick was the
 // largest single thing that build cost. `_avt_plan_state()` fills it in the order the component
 // diagnostic numbers (9 basis, 3 origin, 16 projection, 4 viewport, then the scalars).
@@ -109,21 +125,65 @@ constexpr float AVT_COLD_BURST_MISSING_FRACTION = 0.25f;
 // How many ticks a cold view is served at the burst rate. Four is the window the reference project
 // asks for; six leaves the ramp a tail to finish on.
 constexpr int AVT_COLD_BURST_TICKS = 6;
+// How many pages one cold episode may produce at the burst rate, as a multiple of the plan it is
+// filling, so a plan the pool cannot serve - a deliberately oversubscribed one, a pressure fixture -
+// cannot hold the burst open forever. It is not a second expiry timer: the burst ends on the pass
+// that finds the view served, and this only bounds how long "unserved" is allowed to mean "still
+// worth a burst". Expressed in pages rather than ticks because the rate is per *tick* and the window
+// being judged is in displayed frames: measured on the reference project, seven physics ticks run
+// per displayed frame during a cut, so a tick budget meant to cover the window expired inside three
+// frames and the burst's own rate stopped applying exactly when the remaining pages needed it.
+constexpr int AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE = 2;
 // The burst rate as a multiple of the configured page budget, and its ceiling. The ceiling is what
 // bounds the transient on the main thread: one page costs a source poll, a pool write and a bake
-// dispatch, and the measured main-thread cost of a pass is ~0.05 ms a page.
-constexpr int AVT_COLD_BURST_FACTOR = 6;
-constexpr int AVT_COLD_BURST_PAGES_MAX = 128;
-// The arrival ramp a cold view's burst shortens the fade to, in ticks. A page that has arrived but
-// is still ramping is drawn as the level it replaced, so the ramp is part of the time a viewer waits
-// for the ground to stop being a smear: the shipped twelve ticks are longer than the window the
-// reference project asks for. Three is the shortest ramp that still crosses a page boundary over
-// more than one frame; the setting is untouched and a settled view ramps at its full length again.
-constexpr int AVT_COLD_BURST_FADE_FRAMES = 3;
+// dispatch, and the measured main-thread cost of a pass is ~0.05 ms a page. The multiple is the
+// rate, and the rate is what the encoder ring is sized from (`_derive_encode_ring_pages()` is the
+// budget times the readback latency), so it is also the number that decides how many pages a frame
+// can finish.
+//
+// The end of the chain is the ring's own ceiling, `_page_count / 2`, so the budget that reaches it
+// is `_page_count / 4` - 256 pages a tick for the reference project's 1024 slot pool, which is 256
+// finished pages a frame. That is the number this multiple is set from, and it is a reading rather
+// than a preference: the transition's own criterion is nearly converged ground, the reference
+// project's first 180-degree cut plan is 752 pages, and at 256 a frame the plan is resident inside
+// the window it is judged on. Six (96 a frame) left the ground flat for twenty frames, eight (128)
+// for seven, twelve (192) for six; each step was measured, and the last two were still bounded by
+// pages the shader could not resolve rather than by the rate they arrived at.
+constexpr int AVT_COLD_BURST_FACTOR = 16;
+constexpr int AVT_COLD_BURST_PAGES_MAX = 384;
+// The arrival blend a cold view's burst switches off, in ticks. A page that has arrived but is still
+// ramping is drawn as the level it replaced, and on a cold view *every* page of the view arrives in
+// the same few frames: the blend that hides one page's step behind its resident ancestor is then
+// applied to the whole footprint at once, so the ground stays at `1 - fade` of the level it left
+// until the ramp of the last page has run. Measured on the reference project's first 180-degree cut:
+// with the shipped twelve tick ramp the picture was still at 0.39 of the settled gradient energy
+// four frames after every page of its 752 page plan was resident, and reached the transition's own
+// threshold only at frame seven; with the blend off it was at 1.41 of settled the frame after the
+// cut and at the threshold by frame one. Zero is therefore the cold value: the pages of a view
+// nothing had produced for are drawn as themselves the moment they land, which costs the one thing
+// the blend exists for - a step where an arrived page meets one still missing - and buys the whole
+// of the window the transition is judged on. The trade is a *transient* one and it is bounded by the
+// episode: `vt_page_fade_frames` is untouched, a settled or ordinary moving view ramps at its full
+// length, and the ramp state is left finished so the blend does not reappear mid-arrival when the
+// episode ends. See `_update_vt_page_fade()` and `_update_sector_avt()`.
+constexpr int AVT_COLD_BURST_FADE_FRAMES = 0;
 // What the near field's production pass may ever be handed in one tick. The steady path never asks
 // for more than `vt_pages_per_update`; this is the ceiling the burst is admitted under, and it is
 // the same number the source queue window is raised to while the burst runs.
-constexpr int AVT_PAGE_BUDGET_CEILING = 128;
+constexpr int AVT_PAGE_BUDGET_CEILING = 384;
+// How many of the previous view's pages the plan's retention window may hold. The window is what
+// makes a level the view has just left a level it can come back to: a page it holds stays named by
+// the plan, stays demanded in the pool and keeps its address, so returning to its level is a
+// resolve that finds a resident ancestor instead of a source read, a bake and an arrival ramp. It
+// is spent rather than free - every page it holds is a page the current walk cannot add - and the
+// walk's tail is the *finest* page of each chain, so the window is exactly as many pages as it
+// costs to keep: measured on the reference project, reserving 64 of a 768 page budget cost 48
+// pages of the finest content and moved the gradient reading at a given residency by ~0.15 of
+// settled, while 16 costs nothing measurable. Which pages it holds is the other half of the
+// decision and is not a budget question at all: `_avt_install_or_reuse_plan()` orders the
+// candidates finest first, because the coarse end of a chain is what the always-resident fallback
+// ladder already answers for and the fine end is what costs a rebuild.
+constexpr int AVT_RETAIN_PAGES_MAX = 16;
 
 // The near field's share of a cold view's burst, and 0 when no burst is running. The burst never
 // reduces the steady allowance and it is off in the diagnostic direct-material mode, where the

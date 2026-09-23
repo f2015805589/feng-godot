@@ -59,23 +59,22 @@ uniform float _avt_mip_distance[16];
 uniform int _avt_mip_distance_count = 0;
 uniform bool _avt_sectors_enabled = false;
 uniform bool _avt_feedback = false;
-// A cold view: a plan nothing has produced for yet - a snap turn, a teleport, a session's first
-// frames - is drawn from the independent fallback grid, which is one texel per metre, while the
-// source evaluator is right there at the authored density. The fallback is the tier a fragment *no
-// upgrade covers* resolves through, and at a 1080p footprint that is a flat smear: it is the "wide
-// blur" a turn shows for as long as the plan takes to fill. While the near field reports the view
-// cold, a fragment whose only content is that tier takes the source instead - the same answer
-// `Direct` delivery gives, which is the one method that is always correct. A fragment with any
-// upgrade page, and every fragment of a settled or moving view, is unaffected: this is a fallback
-// *chain* quality flag, not a read-order change. See `get_vt_settings()`'s
-// `avt_cold_burst_*`.
-uniform bool _avt_cold_source_fallback = false;
-// How much coarser than the fragment's own footprint a page may be before a cold view prefers the
-// source evaluator. One is exact: the resolve must have returned the level the footprint asked for,
-// because the shader's own level is the `floor` of `log2(pixel_world / local_texel)` and a page one
-// level coarser than that is the difference between "slightly blurry" and a flat patch of surface.
-// A fragment whose sector holds a page at its own level keeps the page; only the under-served ones
-// take the source, so the two hand over per fragment as the plan fills rather than at one instant.
+// The source the switch above may answer a page it cannot serve from. `_avt_feedback` is the
+// near field's own hierarchy: a miss recovers at a resident coarser level of the sector's local
+// mip chain and, above it, of the independent dense fallback grid. With this on, a *cold* page -
+// a page of a cut's view the production burst has not served yet - is instead resolved from the
+// far field's own sparse virtual texture. That is a second virtual texture path with its own page
+// atlas, its own indirection and its own residency, so the transition stays inside the VT read
+// chain: nothing here evaluates the material source, and a fragment the near field serves, and
+// every fragment of a settled or moving view, reads exactly what it read before. See
+// `Terrain3D::set_avt_feedback_source()`.
+uniform bool _avt_cold_svt_source = false;
+// How much coarser than the fragment's own footprint a page may be before a cold view treats the
+// fragment as unserved. One is exact: the resolve must have returned the level the footprint asked
+// for, because the shader's own level is the `floor` of `log2(pixel_world / local_texel)` and a
+// page one level coarser than that is the difference between "slightly blurry" and a flat patch of
+// surface. A fragment whose sector holds a page at its own level keeps the page, so the sources
+// hand over per fragment as the plan fills rather than at one instant.
 const float AVT_COLD_SOURCE_TEXEL_TOLERANCE = 1.0;
 uniform float _avt_density_scale = 1.0;
 uniform sampler2D _avt_sector_directory : filter_nearest, repeat_disable;
@@ -945,19 +944,25 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal, 
 		float avt_texel;
 		float avt_fade;
 		bool avt_ready = avt_filtered_sample(world, pixel_world, world_dx, world_dy, r_mat, r_normal, avt_fallback_only, avt_texel, avt_fade);
-		// A cold view's ground is the source evaluator's, not the fallback grid's. See
-		// `_avt_cold_source_fallback`: while nothing has produced the fragment's sector, the content
-		// behind it is the fallback tier - one texel per metre - an upgrade page coarser than the
-		// footprint asked for, or a page that has arrived but is still ramping in against either of
-		// those. Each of the three draws as the flat smear a turn is reported to show, and each of
-		// them is a fragment the pages are not serving. Such a fragment takes the source evaluator,
-		// which is the same answer `Direct` delivery gives and the one method that is always correct.
-		// `r_page_share` at zero is what makes the caller evaluate: the pages own none of this
-		// fragment, so the evaluated material is the whole answer. A fragment the pages serve at its
-		// own level, already arrived, and every fragment of a settled or moving view, is unaffected -
-		// the flag is only set while a cut's view is filling.
-		if (avt_ready && _avt_cold_source_fallback &&
-				(avt_fallback_only || avt_fade < 0.99 || avt_texel > pixel_world * AVT_COLD_SOURCE_TEXEL_TOLERANCE)) { r_page_share = 0.0; }
+		// The feedback switch's second source, and only for a page the near field has not served
+		// yet: no upgrade page at all, one coarser than the footprint asked for, or one that has
+		// arrived but is still ramping in against either of those. Each of the three draws as the
+		// flat smear a turn is reported to show, and each is a fragment the near field's pages are
+		// not answering. `_avt_cold_svt_source` resolves those from the far field's sparse virtual
+		// texture - a real page path - so the near field's one-texel-per-metre fallback grid is not
+		// the last word on a cold frame. A fragment the pages serve at its own level, already
+		// arrived, and every fragment of a settled or moving view, is untouched: the flag is only
+		// set while a cut's view is filling.
+		if (avt_ready && _avt_cold_svt_source &&
+				(avt_fallback_only || avt_fade < 0.99 || avt_texel > pixel_world * AVT_COLD_SOURCE_TEXEL_TOLERANCE)) {
+			material cold_mat;
+			vec3 cold_normal;
+			if (surface_svt_material_sample(world, cold_mat, cold_normal)) {
+				r_mat = cold_mat;
+				r_normal = cold_normal;
+				return true;
+			}
+		}
 		if (far_weight <= 0.0) { return avt_ready; }
 		material far_mat;
 		vec3 far_normal;

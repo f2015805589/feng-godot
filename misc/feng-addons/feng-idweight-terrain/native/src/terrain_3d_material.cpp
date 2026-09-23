@@ -216,6 +216,10 @@ void Terrain3DMaterial::_update_vt_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_surface_vt_enabled", vt_on);
 	RS->material_set_param(p_material, "_avt_sectors_enabled", _terrain->is_sector_avt());
 	RS->material_set_param(p_material, "_avt_feedback", _terrain->get_avt_feedback());
+	// The switch's second source has to survive a material rebuild too. A rebuild outside a cold
+	// window publishes the off state, which is the steady one; the tick re-publishes the live value
+	// while a cut's burst is armed, so a rebuild inside one comes back on the next tick.
+	RS->material_set_param(p_material, "_avt_cold_svt_source", false);
 	RS->material_set_param(p_material, "_avt_density_scale", _terrain->get_avt_density_scale());
 	RID sector_directory = _terrain->get_avt_sector_directory();
 	RS->material_set_param(p_material, "_avt_sector_directory", sector_directory.is_valid() ? sector_directory : _generated_dummy_2d.get_rid());

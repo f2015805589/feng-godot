@@ -297,25 +297,42 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	// it down on the tick rather than on the pass keeps a burst from lasting longer than the ticks it
 	// names. The rate the three consumers read is refreshed here too: the producer's frame budget and
 	// the source queue window are not re-published by anything else while a plan is being produced.
-	if (_vt.avt_cold_burst_ticks > 0) { --_vt.avt_cold_burst_ticks; }
-	const bool source_fallback = _vt.avt_cold_source_fallback;
+	if (_vt.avt_cold_burst_ticks > 0) { --_vt.avt_cold_burst_ticks; ++_vt.avt_cold_burst_spent; }
 	const int page_budget = _avt_page_budget();
-	// While the source fallback is on the parameter is re-published every tick: the shader's copy is
-	// a material parameter, and a material rebuilt in the middle of a cold view would come back with
-	// the default. The window is a few dozen ticks at most, and a parameter write is not a cost worth
-	// guarding against. The rate the producer's frame budget and the source queue window read is
-	// published once when either it or the flag moves.
-	if (page_budget != _vt.avt_page_budget_applied || source_fallback || _vt.avt_cold_source_published) {
-		if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-			producer->set_page_budget(page_budget);
-		}
-		if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->set_queue_limit(page_budget); }
-		if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->set_queue_limit(page_budget); }
+	// The rate the producer's frame budget and the source queue window are both set from, published
+	// on every tick rather than on the tick it moves. Both readers have to move together - a burst
+	// that raised only one of them would stall on the other - and the source pipeline is built
+	// lazily inside the production pass, so a change-detected publish can run on the one tick the
+	// pipeline does not exist yet and leave the queue at the steady window for the whole burst.
+	// Measured: a 180-degree cut at 1920x1080 kept `avt_source_queue_limit` at 32 while
+	// `avt_page_budget` read 96, which held page completion to ~32 a frame and the ground flat for
+	// twenty frames. Three atomic stores and one integer derivation a tick are not worth a state
+	// machine that can miss.
+	if (Terrain3DSurfaceBaker *producer = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		producer->set_page_budget(page_budget);
+	}
+	if (_vt.vt_page_pipeline) { _vt.vt_page_pipeline->set_queue_limit(page_budget); }
+	if (_vt.svt_page_pipeline) { _vt.svt_page_pipeline->set_queue_limit(page_budget); }
+	// The feedback switch's source, for the pages the burst has not served yet. It is a material
+	// parameter, so it is re-published every tick it is on - a material rebuilt in the middle of a
+	// cold view would come back with the default - and once when it turns off. Off is the steady
+	// state and costs nothing.
+	const bool cold_svt_source = _vt.avt_feedback_source == AVT_FEEDBACK_SOURCE_SVT && _vt.avt_burst_from_cut;
+	if (cold_svt_source || cold_svt_source != _vt.avt_cold_svt_published) {
 		if (_material.is_valid()) {
-			RS->material_set_param(_material->get_material_rid(), "_avt_cold_source_fallback", source_fallback);
+			RS->material_set_param(_material->get_material_rid(), "_avt_cold_svt_source", cold_svt_source);
 		}
-		_vt.avt_page_budget_applied = page_budget;
-		_vt.avt_cold_source_published = source_fallback;
+		_vt.avt_cold_svt_published = cold_svt_source;
+	}
+	// The arrival blend is off for the frames a cut's view is filling. It is the shader's own early
+	// out (`surface_vt_page_fade()` answers 1 for every slot at zero frames), so the pages of a view
+	// nothing had produced for are drawn as themselves the moment they land instead of being held at
+	// the level they replaced for the length of the ramp. See `AVT_COLD_BURST_FADE_FRAMES`. Published
+	// every tick rather than on change: the setting is republished by any material rebuild, and the
+	// window is a handful of frames. `vt_page_fade_frames` itself is never changed.
+	if (_material.is_valid()) {
+		RS->material_set_param(_material->get_material_rid(), "_surface_vt_page_fade_frames",
+				_vt.avt_burst_from_cut ? AVT_COLD_BURST_FADE_FRAMES : _vt.vt_page_fade_frames);
 	}
 	if (_vt.avt_cold_burst_ticks > 0) { _vt.avt_burst_peak = MAX(_vt.avt_burst_peak, page_budget); }
 	// Fine eligibility follows the rendered frustum, as does the Inspector preview.
@@ -740,20 +757,45 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 			const int retain_cap = discard_retained ? 0 :
 				MIN(_vt.avt_refinement->retain_cap,
 						MAX(0, _vt.avt_refinement->budget - int(_vt.avt_refinement->pages.size())));
-			int retained = 0;
+			// Which of the previous view's pages the window holds is a decision about mips, not about
+			// plan order. The plan is laid out coarse end first, so taking its first `retain_cap`
+			// entries keeps the coarsest pages - the ones the always-resident fallback ladder already
+			// answers for, and the cheapest to produce again - and drops the fine ones, which are
+			// exactly the pages a level regression costs a source read, a bake and an arrival ramp to
+			// get back. The candidates are therefore ordered by fineness (the smallest world span
+			// first), then by how recently the view asked for them, so the window keeps the deepest
+			// level of each sector the view has just left. That is the whole point of the window: a
+			// level the view has left stays addressable and resident, so coming back to it is a
+			// switch rather than a rebuild.
+			std::vector<const Terrain3DAVTPageRequest *> retainable;
+			retainable.reserve(64);
 			for (const Terrain3DAVTPageRequest &page : _vt.avt_plan.pages) {
-				if (retained == retain_cap) { break; }
+				// The fallback ladder is re-published by every plan and is reserved in the pool; it
+				// needs no window.
+				if (page.owner == avt_coarse_owner()) { continue; }
 				if (page.last_visible_plan + uint64_t(_vt.avt_retain_epochs) < epoch ||
 						std::binary_search(current.begin(), current.end(),
 								std::array<int, 5>{ page.owner.x, page.owner.y, page.mip, page.x, page.y })) {
 					continue;
 				}
-				Terrain3DAVTPageRequest retained_page = page;
+				retainable.push_back(&page);
+			}
+			std::stable_sort(retainable.begin(), retainable.end(),
+					[](const Terrain3DAVTPageRequest *p_left, const Terrain3DAVTPageRequest *p_right) {
+						if (p_left->rect.size.x != p_right->rect.size.x) { return p_left->rect.size.x < p_right->rect.size.x; }
+						return p_left->last_visible_plan > p_right->last_visible_plan;
+					});
+			int retained = 0;
+			float retained_finest = 0.f;
+			for (const Terrain3DAVTPageRequest *page : retainable) {
+				if (retained == retain_cap) { break; }
+				Terrain3DAVTPageRequest retained_page = *page;
 				// A retained request belongs to the previous view. Keep it available
 				// for residency, but never let it outrank pages the current image
 				// samples when the producer refills its queue.
 				retained_page.priority.kind = TerrainVT::PageRequestKind::OPTIONAL;
 				_vt.avt_refinement->pages.push_back(retained_page);
+				retained_finest = retained_finest > 0.f ? MIN(retained_finest, page->rect.size.x) : page->rect.size.x;
 				++retained;
 			}
 			_vt.avt_retained_pages = retained;
@@ -763,6 +805,11 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 				_vt.avt_discard_retained = false;
 			}
 			_vt.avt_sector_stats["retained_requests"] = retained;
+			// The finest world span the window holds, so the reading says *what level* the window is
+			// keeping rather than only how many pages it kept. A window whose finest entry is a
+			// whole-cell page is one that kept the fallback ladder; one whose finest entry is a
+			// sub-metre page is one that kept the level the view just left.
+			_vt.avt_sector_stats["retained_finest_texel_world"] = retained_finest;
 			// The rate term as derived, as spent, and as it landed: `plan_tail_cap` is the whole
 			// term, `plan_retain_share` what the retention append was allowed, and
 			// `plan_apron_pages` the speculative part of the plan the refinement walk accepted. A
@@ -909,6 +956,10 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["visible_retained_pages"] = _vt.avt_retained_pages;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
+	// Which page path the feedback switch answers an unserved cold page from, and whether that is
+	// what the shader is currently reading.
+	result["avt_feedback_source"] = _vt.avt_feedback_source;
+	result["avt_cold_svt_source"] = _vt.avt_cold_svt_published;
 	result["avt_texels_per_pixel"] = _vt.surface_vt_texels_per_pixel;
 	// The near field's share of the tick's page budget as it stood for the last pass, beside
 	// `pages_per_update` which is the whole of it. The two together are the supply the plan's rate
@@ -922,7 +973,7 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_cold_burst_allowance"] = _avt_burst_allowance();
 	result["avt_cold_burst_peak"] = _vt.avt_burst_peak;
 	result["avt_cold_burst_pages"] = _vt.avt_burst_pages;
-	result["avt_cold_source_fallback"] = _vt.avt_cold_source_fallback;
+	result["avt_cold_burst_spent"] = _vt.avt_cold_burst_spent;
 	result["avt_page_budget"] = _avt_page_budget();
 	result["avt_page_budget_steady"] = _vt.vt_pages_per_update;
 	result["avt_source_queue_limit"] = _vt.vt_page_pipeline ? _vt.vt_page_pipeline->get_queue_limit()

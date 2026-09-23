@@ -294,6 +294,18 @@ void Terrain3D::set_avt_feedback(bool p_enabled) {
 	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
 }
 
+// The feedback switch's *source*: which page path a cold page it cannot serve is answered from.
+// Like the switch itself, it changes only what the shader does with an unserved page - residency,
+// demand and production are untouched - so a uniform update is the whole effect. `Coarse ladder`
+// is the near field's own hierarchy and fallback grid and is the shipped contract; `SVT pages` is
+// the far field's sparse virtual texture, which is a second VT path and not a source evaluator.
+void Terrain3D::set_avt_feedback_source(int p_source) {
+	const int source = p_source == AVT_FEEDBACK_SOURCE_SVT ? AVT_FEEDBACK_SOURCE_SVT : AVT_FEEDBACK_SOURCE_COARSE;
+	if (_vt.avt_feedback_source == source) { return; }
+	_vt.avt_feedback_source = source;
+	if (_initialized && _material.is_valid()) { _material->update(Terrain3DMaterial::REGION_ARRAYS); }
+}
+
 // The far field's sibling of the switch above. It only changes what the shader does with
 // a miss; residency, demand and production are untouched, so no pool or page has to be
 // rebuilt - a uniform update is the whole effect.
@@ -554,12 +566,11 @@ void Terrain3D::_update_vt_service() {
 		_vt.vt_callback_missing_warned = true;
 		WARN_PRINT("This engine build has no virtual_texture_set_update_callback; surface material pages cannot be produced. Rebuild the engine from this source tree.");
 	}
-	// The steady page budget, or a cold-view burst's rate while one is armed. The tick re-publishes
-	// this the tick a burst arms or ends (`_update_sector_avt()`); this call is what a service
-	// rebuild - a setting change, a pool rebuild - leaves behind, so it reads the same number the
-	// tick does rather than the setting alone.
+	// The steady page budget, or a cold-view burst's rate while one is armed. The tick publishes
+	// this every tick (`_update_sector_avt()`); this call is what a service rebuild - a setting
+	// change, a pool rebuild - leaves behind, so it reads the same number the tick does rather than
+	// the setting alone.
 	producer->set_page_budget(_avt_page_budget());
-	_vt.avt_page_budget_applied = _avt_page_budget();
 	if (_vt.vt_materials_dirty || producer->materials_stale()) {
 		// Also re-publish when the producer reports its snapshot unbound: the arrays it named
 		// were freed by a newer asset edit, and publishing the current pair is what recovers,
@@ -677,6 +688,8 @@ void Terrain3D::_bind_vt_methods() {
 #undef VT_BIND_SETTING
 	ClassDB::bind_method(D_METHOD("set_avt_feedback", "enabled"), &Terrain3D::set_avt_feedback);
 	ClassDB::bind_method(D_METHOD("get_avt_feedback"), &Terrain3D::get_avt_feedback);
+	ClassDB::bind_method(D_METHOD("set_avt_feedback_source", "source"), &Terrain3D::set_avt_feedback_source);
+	ClassDB::bind_method(D_METHOD("get_avt_feedback_source"), &Terrain3D::get_avt_feedback_source);
 	ClassDB::bind_method(D_METHOD("set_vt_adaptive_enabled", "enabled"), &Terrain3D::set_vt_adaptive_enabled);
 	ClassDB::bind_method(D_METHOD("is_vt_adaptive_enabled"), &Terrain3D::is_vt_adaptive_enabled);
 	ClassDB::bind_method(D_METHOD("set_vt_editor_preview", "enabled"), &Terrain3D::set_vt_editor_preview);

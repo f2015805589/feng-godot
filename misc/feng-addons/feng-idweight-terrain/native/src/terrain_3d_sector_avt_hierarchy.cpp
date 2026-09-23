@@ -101,6 +101,15 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 	if (_vt.surface_vt_texels_per_meter <= _vt.vt_page_size / coarse.page_world || scan.budget <= int(coarse.pages.size())) { return scan; }
 	const float maximum_pages = SECTOR_WORLD * _vt.surface_vt_texels_per_meter / _vt.vt_page_size;
 	const float section_world = get_avt_local_section_world();
+	// The cells the standing plan's retention window holds a page of. The window is the previous
+	// view's pages the plan kept (`_avt_install_or_reuse_plan()`), and its entries are the sampled
+	// prefix's tail, so its owners are exactly the cells whose *previous* block resolution a
+	// retained page is expressed in. See the tier hold below.
+	std::unordered_set<uint64_t> retained_owners;
+	for (size_t i = size_t(MAX(0, _vt.avt_plan.sampled)); i < _vt.avt_plan.pages.size(); ++i) {
+		const Terrain3DAVTPageRequest &page = _vt.avt_plan.pages[i];
+		if (page.owner != avt_coarse_owner()) { retained_owners.insert(avt_owner_key(page.owner)); }
+	}
 	const Vector2i first = Vector2i(((p_focus - Vector2(p_reach, p_reach)) / section_world).floor());
 	const Vector2i last = Vector2i(((p_focus + Vector2(p_reach, p_reach)) / section_world).floor());
 	for (int y = first.y; y <= last.y; ++y) for (int x = first.x; x <= last.x; ++x) {

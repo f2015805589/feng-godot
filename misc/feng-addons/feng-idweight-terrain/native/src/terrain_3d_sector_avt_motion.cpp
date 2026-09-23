@@ -212,15 +212,15 @@ void Terrain3D::_vt_update_motion_lead() {
 // leaves a view nothing has produced for. The plan that a cut submits is installed a tick or two
 // later and is almost entirely missing, and the shader draws it through the independent fallback,
 // which is one texel per metre: at a 1080p footprint that is a flat smear, and it is what a turn is
-// reported to show for as long as the plan takes to fill. Arm the two things that answer it here,
-// where the cut is recognised: the bounded production burst that fills the plan in a few ticks, and
-// the source fallback that draws the fragments the pages cannot serve yet. The burst is re-armed by
-// the production pass while the plan is still mostly missing and the fallback lasts until it is
-// served, so neither outlives the cold view; an ordinary moving camera never arms either.
+// reported to show for as long as the plan takes to fill. Arm the production burst that answers it
+// here, where the cut is recognised: it is re-armed by the production pass while the plan is still
+// mostly missing, so it does not outlive the cold view and an ordinary moving camera never arms it.
 void Terrain3D::_vt_arm_cold_view() {
 	_vt.avt_burst_from_cut = true;
 	_vt.avt_cold_burst_ticks = AVT_COLD_BURST_TICKS;
-	_vt.avt_cold_source_fallback = true;
+	_vt.avt_cold_burst_spent = 0;
+	// The episode's own page count, which is what bounds it (`AVT_COLD_BURST_PAGE_BUDGET_MULTIPLE`).
+	_vt.avt_burst_pages = 0;
 }
 
 Transform3D Terrain3D::_vt_lead_camera_transform(const Transform3D &p_camera_transform) const {

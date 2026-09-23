@@ -437,6 +437,12 @@ public:
 	real_t get_vt_motion_lead_ms() const { return _vt.vt_motion_lead_ms; }
 	void set_avt_feedback(bool p_enabled);
 	bool get_avt_feedback() const { return _vt.avt_feedback; }
+	// Which page source the near field's feedback switch may answer an unserved cold page from.
+	// `AVT_FEEDBACK_SOURCE_COARSE` is the near field's own resident hierarchy and its independent
+	// fallback grid; `AVT_FEEDBACK_SOURCE_SVT` is the far field's own sparse virtual texture, which
+	// is a second virtual texture path with its own atlas and residency. See the definitions.
+	void set_avt_feedback_source(int p_source);
+	int get_avt_feedback_source() const { return _vt.avt_feedback_source; }
 	float get_avt_density_scale() const { return _vt.avt_density_scale; }
 	// The sample level at which the fallback table takes over: a sample at or above it reads the
 	// fallback table directly, one below it is an upgrade and goes through the sector directory for
