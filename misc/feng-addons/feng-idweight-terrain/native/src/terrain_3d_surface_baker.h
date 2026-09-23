@@ -180,6 +180,11 @@ private:
 	int _requested_capacity = 0;
 	int _resource_page_count = 0;
 	int _stored_size = 0;
+	// True when no paged tier is selected and the bundle exists for the ring's bake alone: the
+	// shader, the material list, the job buffer and the samplers are built, and none of the
+	// page-sized storage is. Written by `configure()` on the main thread and read by the render
+	// callback and the bundle builder, so it is atomic like the tier state beside it.
+	std::atomic<bool> _ring_only{ false };
 	uint64_t _generation = 1;
 	uint64_t _material_version = 1;
 	uint64_t _next_sequence = 1;
@@ -216,6 +221,11 @@ private:
 		Vector2i ring;
 		int payload_layer = 0;
 		int height_layer = 0;
+		// The material list the rect was offered under. The bake reads whatever list the buffer
+		// holds when it is dispatched, so a rect collected before a material replacement must not
+		// be dispatched after it: the layers it would write describe the old materials, and the
+		// ring would then be told they are current. A mismatch drops the job instead.
+		uint64_t material_version = 0;
 	};
 
 	// The ring bake's state: the ring the set was built for (identity only - a ring is baked by the
@@ -510,9 +520,15 @@ private:
 	uint64_t _take_resources(ResourceBundle &r_resources);
 	// Takes the main device the first time a bundle is needed. False when there is no device.
 	bool _acquire_device();
-	// Creates every texture and sampler of one bundle and validates them. Returns false - with the
-	// bundle freed in place - when the device could not allocate them.
-	bool _create_bundle_resources(ResourceBundle &r_next, int p_stored_size, int p_page_count);
+	// The producer's core: the dummy sampling arrays, the samplers, the material table, the job
+	// buffer and the bake pipeline. Built for every bundle, including a ring-only one, because a
+	// ring's bake needs exactly these and nothing a page owns.
+	bool _create_bake_core_resources(ResourceBundle &r_next, const PackedByteArray &p_material_bytes,
+			int p_page_count);
+	// The page half: the per-tier compressed sets, the half-float staging pool the page-sized source
+	// and output arrays, and the choice between page-sized and ring-deep staging. Built only while a
+	// paged tier is selected; a ring-only bundle never allocates any of it.
+	bool _create_page_resources(ResourceBundle &r_next, int p_stored_size, int p_page_count);
 	// Carries a grown pool's finished pages into the bundle replacing it, and queues the old bundle for
 	// retirement. Returns false - with `p_next` freed - when a copy fails.
 	bool _adopt_grown_pages(const ResourceBundle &p_old, ResourceBundle &p_next, int p_old_count,
@@ -544,7 +560,7 @@ public:
 	Terrain3DSurfaceBaker() = default;
 	~Terrain3DSurfaceBaker() override;
 
-	void configure(int p_page_size, int p_border, int p_page_count);
+	void configure(int p_page_size, int p_border, int p_page_count, bool p_ring_only = false);
 	// Storage format of the material page arrays, per tier, written in SurfacePageCompression.
 	// Each tier's three arrays share one format. Which codecs a page can be stored in at all
 	// is decided by that enum; what remains is a device question, so a request is resolved

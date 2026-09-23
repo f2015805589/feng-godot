@@ -19,10 +19,12 @@
 #     rather than waiting for the ring - and the ring's own counters say which texels were produced.
 #     Once it has drained the ring serves the same picture the array did.
 #
-# The material group stays `Direct` in every render, so the only difference between two images is the
-# height group's source. Read `docs/vt_delivery_assembly.md` section 6 for the design; the group index
-# is Material=0/Height=1 and the delivery values are Direct=0/AVT=1/Clipmap=2/SVT=3, i.e. the native
-# `TerrainVT` enum values, which are also the property values.
+# The material group stays `Direct` through the height section, so the only difference between two
+# images there is the height group's source; the material section that follows selects it and checks
+# the baked layers the ring alone produces. Read `docs/vt_delivery_assembly.md` section 6 for the
+# design; the group index is Material=0/Height=1 and the delivery values are
+# Direct=0/AVT=1/Clipmap=2/SVT=3, i.e. the native `TerrainVT` enum values, which are also the
+# property values.
 extends SceneTree
 
 const MATERIAL := 0
@@ -624,18 +626,66 @@ func run() -> void:
 	require(bool(mat_entry.get("configured", false)), "the ring exists for the material group")
 	require(str(mat_entry.get("source", "")) == "material", "and names the channel it carries")
 	require(int(mat_entry.get("valid_levels", 0)) >= 1, "with a current level")
-	# No producer is up in this configuration - an all-`Direct` matrix owns no paged tier and therefore
-	# no bake - so this is the ring's *fallback*, and the array is what a ring band with nothing baked
-	# serves: the same pixels, because the array is what the ring's own source reads its payload from.
+	# A ring whose group no page carries is still a producer's owner: the bake is the same pass a
+	# page runs, so this configuration has one and the ring's levels are baked rather than left
+	# waiting for a producer that never comes. `baked_levels` is the handshake's own reading - a
+	# level counts only after the dispatch that covered its rect landed - so this waits on the
+	# render callback and not on the mechanism's entry.
+	for frame in 240:
+		if baked_levels() >= material_valid_levels() and material_valid_levels() > 0:
+			break
+		await process_frame
+	settle_material_ring()
+	require(material_baked_channels() == 3, "and carries the three arrays the bake writes")
+	require(baked_levels() >= material_valid_levels() and material_valid_levels() > 0,
+			"the producer baked every current level for the ring alone, %d of %d" % [
+				baked_levels(), material_valid_levels()])
+	require(pending_bake_rects() == 0,
+			"with nothing left waiting for a producer, %d rects" % pending_bake_rects())
+	# And the ring alone allocated no page pool. The producer's own storage reading is the one
+	# place the two bundle shapes are distinguishable: a ring-only bundle owns the bake core and no
+	# page-sized staging layer and no compressed page array.
+	var ring_producer: Dictionary = settings().get("producer", {})
+	require(int(ring_producer.get("staging_layers", -1)) == 0,
+			"a ring-only producer owns no page staging layers, %d" % int(ring_producer.get("staging_layers", -1)))
+	require(int(ring_producer.get("material_bytes", -1)) == 0,
+			"and no page array bytes, %d" % int(ring_producer.get("material_bytes", -1)))
 	var mat_ring_image := await frame_image()
 	save_image(mat_ring_image, "clipmap-material-ring.png")
-	var mat_diff := differing(mat_direct_image, mat_ring_image)
-	require(mat_diff == 0,
-			"a material ring band with nothing baked serves the array, %d pixels differ" % mat_diff)
-	require(int(mat_entry.get("pending_bake_rects", 0)) > 0,
-			"and the ring says so: %d rects are waiting for a producer" % int(mat_entry.get("pending_bake_rects", 0)))
+	var mat_ring_delta := channel_delta(mat_direct_image, mat_ring_image)
+	print("CLIPMAP_MATERIAL_RING_DELTA differing=%d max=%.6f mean=%.6f strong=%d" % [
+		differing(mat_direct_image, mat_ring_image), mat_ring_delta.x, mat_ring_delta.y,
+		int(mat_ring_delta.z)])
+	var mat_ring_arm: RID = terrain.material.get_material_rid()
+	require(mat_outstanding_total(mat_ring_arm) == 0,
+			"and the ring has nothing outstanding to fall back for, %d rects" % mat_outstanding_total(mat_ring_arm))
+	# Which of the arm's two sources answered the fragment. The baked layer and the payload
+	# evaluation are the same material read at different points - the bake evaluates at the level's
+	# texel centres, the fallback at the fragment - so the two renders are close but not equal, and
+	# the gate is what decides between them. Filling the arm's table with the level's whole stored
+	# square refuses every tap, so the band reads the payload evaluation and the render must change;
+	# binding the ring's own answer again must return the baked picture exactly.
+	var ring_outstanding_bound: Variant = RenderingServer.material_get_param(mat_ring_arm, "_clipmap_outstanding")
+	var ring_counts_bound: Variant = RenderingServer.material_get_param(mat_ring_arm, "_clipmap_outstanding_count")
+	var ring_outstanding_full := PackedVector4Array()
+	ring_outstanding_full.resize(32 * 4)
+	ring_outstanding_full[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_size), float(terrain.vt_clipmap_size))
+	var ring_counts_full := PackedInt32Array()
+	ring_counts_full.resize(32)
+	ring_counts_full[0] = 1
+	RenderingServer.material_set_param(mat_ring_arm, "_clipmap_outstanding", ring_outstanding_full)
+	RenderingServer.material_set_param(mat_ring_arm, "_clipmap_outstanding_count", ring_counts_full)
+	var mat_ring_fallback := await frame_image()
+	save_image(mat_ring_fallback, "clipmap-material-ring-fallback.png")
+	require(differing(mat_ring_image, mat_ring_fallback) > 0,
+			"the baked layer is what answered the band: refusing it changes the render, %d pixels" % differing(mat_ring_image, mat_ring_fallback))
+	RenderingServer.material_set_param(mat_ring_arm, "_clipmap_outstanding", ring_outstanding_bound)
+	RenderingServer.material_set_param(mat_ring_arm, "_clipmap_outstanding_count", ring_counts_bound)
+	var mat_ring_restored := await frame_image()
+	require(differing(mat_ring_image, mat_ring_restored) == 0,
+			"and the ring's own answer returns the baked picture, %d pixels differ" % differing(mat_ring_image, mat_ring_restored))
 	if not failed:
-		print("PASS clipmap material arm: with no producer the ring band falls back to the array, and says why")
+		print("PASS clipmap material arm: the ring alone is baked, and its layers answer the band")
 
 	# Direct restores the array, unchanged by any of this.
 	terrain.vt_clipmap_base_world = 64.0
@@ -650,10 +700,11 @@ func run() -> void:
 	diag("material")
 
 	# ---- The material group's baked layers ----
-	# The section above is the *fallback*: with no paged tier up there is no producer, so nothing is
-	# baked and the ring's band reads the array, which is why that pair is identical. This section is the
-	# other half: the ring's own baked layers, produced by the producer's bake from the ring's own payload
-	# and height, and the arm that samples them.
+	# The section above is the ring *alone*: a producer exists because the ring's bake is the pass a
+	# page runs, and the ring's own baked layers answer the band, which the gate reading there proves.
+	# This section is the other producer's half: the same ring held at the far field's density, so the
+	# two producers can be compared on one lattice and the material the pages hold can be read beside
+	# the material the ring bakes.
 	#
 	# The pages have to be up for the producer to exist - the bake is a pass the *shared* producer runs,
 	# and a ring owns no pass of its own - so the far field is selected and settled first. What it is

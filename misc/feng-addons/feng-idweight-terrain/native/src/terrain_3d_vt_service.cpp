@@ -347,11 +347,23 @@ void Terrain3D::_configure_vt_service() {
 	// far field built no pool and no producer, so the field it did select had no arrays to sample
 	// and reported "SVT material arrays were not created". The views below are configured as a
 	// list of the ones that exist, which is also what keeps the loop from dereferencing a null.
+	//
+	// The material group delivered by the ring alone is the third owner of the producer: a ring's
+	// bake reads the same shader, material table, job buffer and samplers a page does, so a
+	// configuration with no paged tier still needs one. That bundle is *ring-only* - the bake core
+	// and none of the page arrays - and a page selected later rebuilds it as a page bundle, which
+	// also serves the ring.
 	Terrain3DVirtualTexture *views[2] = { _vt.surface_vt, _vt.surface_svt };
-	if (views[0] == nullptr && views[1] == nullptr) {
+	const bool page_service = has_avt_delivery() || has_svt_delivery();
+	const Terrain3DClipmap *material_ring = _vt.clipmap[int(TerrainVT::ChannelGroup::Material)].get();
+	const bool ring_service = material_ring != nullptr && material_ring->get_baked_channel_count() > 0 &&
+			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
+	if (!page_service && !ring_service) {
 		return;
 	}
-	if (_vt.vt_shared_ready) {
+	if (_vt.vt_shared_ready && !(page_service && _vt.vt_ring_only)) {
+		// What is built already serves this configuration: a page bundle covers the ring as well,
+		// so the only rebuild needed is "there was no page and now there is one".
 		return;
 	}
 	_vt.svt_startup_ready = false;
@@ -363,7 +375,10 @@ void Terrain3D::_configure_vt_service() {
 	// Detach both views before replacing their common pool. Clearing one view must
 	// never destroy a pool that another view is still sampling.
 	_reset_vt_page_fade();
-	auto pool = Terrain3DVirtualTexture::create_page_pool();
+	std::shared_ptr<Terrain3DVTPagePool> pool;
+	if (page_service) {
+		pool = Terrain3DVirtualTexture::create_page_pool();
+	}
 	// Both views adopt the shared dimensions before they are configured, so the one
 	// configuration helper describes the view that is actually built. A reconfiguration
 	// keeps the capacity that is already published: auto capacity only ever grows, and
@@ -374,15 +389,17 @@ void Terrain3D::_configure_vt_service() {
 	_vt.surface_vt_page_size = _vt.surface_svt_page_size = _vt.vt_page_size;
 	_vt.surface_vt_page_border = _vt.surface_svt_page_border = _vt.vt_page_border;
 	_vt.surface_vt_page_count = _vt.surface_svt_page_count = capacity;
-	for (Terrain3DVirtualTexture *view : views) {
-		if (view == nullptr) {
-			continue;
+	if (page_service) {
+		for (Terrain3DVirtualTexture *view : views) {
+			if (view == nullptr) {
+				continue;
+			}
+			view->clear();
+			view->set_page_pool(pool);
+			view->set_material_cache_mode(!_vt.vt_debug_direct_material);
+			_configure_surface_view(view, view == _vt.surface_svt);
+			view->initialize();
 		}
-		view->clear();
-		view->set_page_pool(pool);
-		view->set_material_cache_mode(!_vt.vt_debug_direct_material);
-		_configure_surface_view(view, view == _vt.surface_svt);
-		view->initialize();
 	}
 	_vt.surface_vt_blocks.clear();
 	_vt.surface_vt_block_sizes.clear();
@@ -408,17 +425,24 @@ void Terrain3D::_configure_vt_service() {
 	}
 	baker(_vt.vt_baker)->set_tier_compression(Terrain3DSurfaceBaker::TIER_AVT, _vt.surface_vt_compression);
 	baker(_vt.vt_baker)->set_tier_compression(Terrain3DSurfaceBaker::TIER_SVT, _vt.surface_svt_compression);
-	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, capacity);
-	_configure_svt_cell_store();
+	// One page of job buffer is all a ring bake uses; the page count is what sizes the page arrays,
+	// and a ring-only bundle allocates none of them.
+	baker(_vt.vt_baker)->configure(_vt.vt_page_size, _vt.vt_page_border, page_service ? capacity : 1, !page_service);
+	if (page_service) {
+		_configure_svt_cell_store();
+	}
 	_vt.bound.clear();
 	if (_initialized && _material.is_valid()) {
 		_material->update(Terrain3DMaterial::REGION_ARRAYS);
 	}
 	_vt.vt_materials_dirty = true;
+	_vt.vt_ring_only = !page_service;
 	_vt.vt_shared_ready = true;
 	// A new pool has no resident page: everything has to be produced again. Callers that
 	// only change how a page is stored must not reach this point.
-	_vt.pool.rebuilt();
+	if (page_service) {
+		_vt.pool.rebuilt();
+	}
 }
 
 bool Terrain3D::_vt_has_pending_upload() const {
@@ -449,6 +473,25 @@ bool Terrain3D::_vt_has_streaming_work() const {
 	}
 	if (!_vt.svt_pending_pages.empty() || _vt.bake.busy()) {
 		return true;
+	}
+	// The rings are production the page pipeline never sees: their rects are filled on the CPU and
+	// baked on the device, and a ring-only configuration has no page queue to keep the editor
+	// drawing. A ring that still owes texels, or whose baked layers are a bake behind, has to keep
+	// the editor awake - and the bake half is only counted while a producer can actually run it,
+	// because a rect no producer will ever cover is a state to report, not a reason to spin.
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		// Only a ring a cell still selects is produced or baked: a deselected ring keeps its
+		// content and its queue, and neither is work this tick will ever do.
+		if (ring == nullptr || !_vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::Clipmap)) {
+			continue;
+		}
+		if (ring->get_pending_jobs() > 0) {
+			return true;
+		}
+		if (ring->get_pending_bake_rect_count() > 0 && _vt.vt_baker.is_valid()) {
+			return true;
+		}
 	}
 	if (_vt.vt_page_pipeline) {
 		int pages = 0, queued = 0;
@@ -588,6 +631,7 @@ void Terrain3D::_destroy_vt_service() {
 	_vt.vt_baker.unref();
 	_vt.bound.clear();
 	_vt.vt_shared_ready = false;
+	_vt.vt_ring_only = false;
 	_vt.vt_page_records.clear();
 	_vt.svt_pending_pages.clear();
 	_vt.vt_registered_sectors.clear();

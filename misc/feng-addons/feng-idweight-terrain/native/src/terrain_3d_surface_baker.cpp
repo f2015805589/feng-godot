@@ -126,76 +126,72 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		}
 	}
 	ResourceBundle next;
-	if (!_create_bundle_resources(next, p_stored_size, p_page_count)) {
+	if (!_create_bake_core_resources(next, p_material_bytes, p_page_count)) {
 		return false;
 	}
-	const String layer_note = _staging_is_scratch()
-			? String(" (scratch layer = encoder ring page)")
-			: String(" (layer = physical slot)");
-	_rd->set_resource_name(next.source_id_rd, "Surface VT Source IDWeights" + layer_note);
-	_rd->set_resource_name(next.source_height_rd, "Surface VT Source Height" + layer_note);
-	_rd->set_resource_name(next.output_albedo_rd, "Surface VT Albedo Height" + layer_note);
-	_rd->set_resource_name(next.output_normal_rd, "Surface VT Normal Roughness" + layer_note);
-	_rd->set_resource_name(next.output_params_rd, "Surface VT Parameters" + layer_note);
-	next.output_albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
-			next.output_albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-	next.output_normal_rs = RenderingServer::get_singleton()->texture_rd_create(
-			next.output_normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-	next.output_params_rs = RenderingServer::get_singleton()->texture_rd_create(
-			next.output_params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
-	if (!next.output_albedo_rs.is_valid() || !next.output_normal_rs.is_valid() ||
-			!next.output_params_rs.is_valid()) {
-		_free_bundle(_rd, next);
-		LOG(ERROR, "Could not wrap surface bake arrays as RS textures");
-		return false;
-	}
-	PackedByteArray initial_materials = p_material_bytes;
-	if (initial_materials.size() != MATERIAL_COUNT * MATERIAL_STRIDE) {
-		initial_materials.resize(MATERIAL_COUNT * MATERIAL_STRIDE);
-		for (int64_t i = 0; i < initial_materials.size(); i++) {
-			initial_materials[i] = 0;
+	// A bundle built for the ring alone stops here: the shader, the material table, the job buffer
+	// and the samplers are the whole of what a ring's bake reads, and none of the page-sized
+	// storage below is allocated. This is what keeps a cold "material ring only" configuration
+	// from reserving the AVT/SVT page pool it never samples.
+	if (!_ring_only.load()) {
+		if (!_create_page_resources(next, p_stored_size, p_page_count)) {
+			return false;
 		}
-	}
-	next.material_buffer = _rd->storage_buffer_create(uint32_t(initial_materials.size()), initial_materials);
-	next.job_buffer = _rd->storage_buffer_create(uint32_t(std::max(1, p_page_count) * JOB_STRIDE));
-	if (!next.material_buffer.is_valid() || !next.job_buffer.is_valid() || !_compile_pipeline(next) ||
-			!_rebuild_uniform_set(next, p_albedo_array_rs, p_normal_array_rs)) {
-		_free_bundle(_rd, next);
-		LOG(ERROR, "Could not allocate surface bake buffers or pipeline");
-		return false;
-	}
-	// The block encoder is only built when at least one channel actually resolved to a
-	// compressed format.
-	// A build whose encoder cannot compile drops both tiers back to uncompressed: a page
-	// that samples an array nothing ever fills renders as the missing-page diagnostic, which
-	// is worse than the memory the codec would have saved.
-	if (_any_tier_uses_sampled(true) && !_compile_encode_pipeline(next)) {
-		for (int tier = 0; tier < TIER_COUNT; ++tier) {
-			_tiers[tier].applied.store(0);
-			_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
-			_tiers[tier].params_encoded.store(false);
-			_tiers[tier].effective.store(0);
-			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
-			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].params_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			next.sampled[tier] = SampledSet();
+		const String layer_note = _staging_is_scratch()
+				? String(" (scratch layer = encoder ring page)")
+				: String(" (layer = physical slot)");
+		_rd->set_resource_name(next.source_id_rd, "Surface VT Source IDWeights" + layer_note);
+		_rd->set_resource_name(next.source_height_rd, "Surface VT Source Height" + layer_note);
+		_rd->set_resource_name(next.output_albedo_rd, "Surface VT Albedo Height" + layer_note);
+		_rd->set_resource_name(next.output_normal_rd, "Surface VT Normal Roughness" + layer_note);
+		_rd->set_resource_name(next.output_params_rd, "Surface VT Parameters" + layer_note);
+		next.output_albedo_rs = RenderingServer::get_singleton()->texture_rd_create(
+				next.output_albedo_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+		next.output_normal_rs = RenderingServer::get_singleton()->texture_rd_create(
+				next.output_normal_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+		next.output_params_rs = RenderingServer::get_singleton()->texture_rd_create(
+				next.output_params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+		if (!next.output_albedo_rs.is_valid() || !next.output_normal_rs.is_valid() ||
+				!next.output_params_rs.is_valid()) {
+			_free_bundle(_rd, next);
+			LOG(ERROR, "Could not wrap surface bake arrays as RS textures");
+			return false;
 		}
-		_free_bundle(_rd, next);
-		LOG(WARN, "Could not build the surface block encoder; keeping every page uncompressed");
-		return false;
-	}
-	_rd->set_resource_name(next.job_buffer, "Surface VT Jobs (64 bytes: world rect, texel size, slot, mode)");
-	_rd->set_resource_name(next.material_buffer, "Surface VT Material Parameters");
-	_rd->set_resource_name(next.shader, "Surface VT Page Baker");
-	// A fresh output has no valid pages.  Clearing all channels is recorded on the
-	// main device; no submit or sync is performed here.
-	_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
-	_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
-	_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
-	if (growing && !_adopt_grown_pages(old, next, old_count, ready, old_generation, p_stored_size)) {
-		return false;
+		// The block encoder is only built when at least one channel actually resolved to a
+		// compressed format.
+		// A build whose encoder cannot compile drops both tiers back to uncompressed: a page
+		// that samples an array nothing ever fills renders as the missing-page diagnostic, which
+		// is worse than the memory the codec would have saved.
+		if (_any_tier_uses_sampled(true) && !_compile_encode_pipeline(next)) {
+			for (int tier = 0; tier < TIER_COUNT; ++tier) {
+				_tiers[tier].applied.store(0);
+				_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
+				_tiers[tier].params_encoded.store(false);
+				_tiers[tier].effective.store(0);
+				_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
+				_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
+				_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
+				_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+				_tiers[tier].params_format.store(RenderingDevice::DATA_FORMAT_MAX);
+				next.sampled[tier] = SampledSet();
+			}
+			_free_bundle(_rd, next);
+			LOG(WARN, "Could not build the surface block encoder; keeping every page uncompressed");
+			return false;
+		}
+		if (!_rebuild_uniform_set(next, p_albedo_array_rs, p_normal_array_rs)) {
+			_free_bundle(_rd, next);
+			LOG(ERROR, "Could not create the surface bake uniform set");
+			return false;
+		}
+		// A fresh output has no valid pages.  Clearing all channels is recorded on the
+		// main device; no submit or sync is performed here.
+		_rd->texture_clear(next.output_albedo_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
+		_rd->texture_clear(next.output_normal_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
+		_rd->texture_clear(next.output_params_rd, Color(0.0f, 0.0f, 0.0f, 0.0f), 0, 1, 0, uint32_t(_staging_layers));
+		if (growing && !_adopt_grown_pages(old, next, old_count, ready, old_generation, p_stored_size)) {
+			return false;
+		}
 	}
 	_adopt_bundle(next, p_generation, p_page_count);
 	return true;
