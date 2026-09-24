@@ -10,17 +10,11 @@
 # on a plain property change in the editor, so this test pins the invariant directly:
 # the pool generation must not move, the capacity must not shrink, and the runner rejects
 # that warning anywhere in the log.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func producer_stats(p_terrain: Terrain3D) -> Dictionary:
 	return p_terrain.get_vt_settings().get("producer", {})

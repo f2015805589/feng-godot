@@ -370,7 +370,7 @@ private:
 	int64_t _monitor_pages_pending() const;
 	// Pages the image being rendered samples with no content. With the motion lead on
 	// this is the reading that says whether the view is streaming in.
-	int64_t _monitor_pages_late() const { return _vt.avt_late_pages; }
+	int64_t _monitor_pages_late() const { return _vt.avt_cost.late_pages; }
 	void _cancel_svt_bake(const String &p_reason);
 	void _destroy_surface_vt();
 	// One demand pass: registers sectors for the regions near the target, picks a mip

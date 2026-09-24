@@ -5,7 +5,7 @@
 ## is reduced to a small sample and compared with the last frame after a settle period.  Keeping
 ## this comparison in the test makes the visible transition reproducible without treating the
 ## image readback time as a frame-time measurement.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const DEFAULT_WARM_TICKS := 240
 const DEFAULT_ARRIVAL_FRAMES := 96
@@ -18,20 +18,12 @@ const ROI_BOTTOM := 1.0
 const LARGE_DIFFERENCE_THRESHOLD := 0.05
 const KEY_FRAMES: Array[int] = [0, 1, 3, 7, 15, 31, 63, 95]
 
-var terrain: Terrain3D
 var scene: Node
-var camera: Camera3D
 var origin: Transform3D
 var output_dir := "user://vt-near-arrival"
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func environment_int(name: String, fallback: int, minimum: int = 0) -> int:
 	var raw := OS.get_environment(name)

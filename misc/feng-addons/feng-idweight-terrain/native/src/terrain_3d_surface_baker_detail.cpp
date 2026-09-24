@@ -90,19 +90,8 @@ bool Terrain3DSurfaceBaker::_ensure_detail_bake(Terrain3DMaterialClipmapDetail *
 	RID normal_rd;
 	_resolve_material_rd(_resources, albedo_rd, normal_rd, _material_albedo_rs, _material_normal_rs);
 	TypedArray<Ref<RDUniform>> uniforms;
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
-			_resources.sampler_nearest, payload_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1,
-			_resources.sampler_nearest, height_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2,
-			_resources.sampler_linear, albedo_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3,
-			_resources.sampler_linear, normal_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 4, _resources.material_buffer);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 5, _resources.job_buffer);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 6, outputs[0]);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 7, outputs[1]);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 8, outputs[2]);
+	append_bake_uniforms(uniforms, _resources.sampler_nearest, _resources.sampler_linear, payload_rd,
+			height_rd, albedo_rd, normal_rd, _resources.material_buffer, _resources.job_buffer, outputs);
 	const RID set = _rd->uniform_set_create(uniforms, _resources.shader, 0);
 	if (!set.is_valid()) {
 		LOG(WARN, "Could not create the detail material bake uniform set");
@@ -119,10 +108,7 @@ bool Terrain3DSurfaceBaker::_ensure_detail_bake(Terrain3DMaterialClipmapDetail *
 }
 
 void Terrain3DSurfaceBaker::_free_detail_set() {
-	if (_detail_bake.uniform_set.is_valid() && _rd && _rd->uniform_set_is_valid(_detail_bake.uniform_set)) {
-		_rd->free_rid(_detail_bake.uniform_set);
-	}
-	_detail_bake.uniform_set = RID();
+	free_bake_set(_rd, _detail_bake.uniform_set);
 	_detail_bake.payload_rd = RID();
 	_detail_bake.height_rd = RID();
 	_detail_bake.job_buffer = RID();
@@ -158,84 +144,60 @@ int Terrain3DSurfaceBaker::queue_detail_tiles(Terrain3DMaterialClipmapDetail *p_
 		_detail_bake.set_failures++;
 		return 0;
 	}
-	std::vector<DetailJob> fresh;
-	std::vector<DetailJob> previous;
-	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		for (const DetailJob &landed : _detail_bake.landed) {
-			// The layer is what decides, not this thread: a slot that was reused, or a tile whose
-			// content an edit invalidated while the dispatch was in flight, carries a different
-			// generation - and serving those texels to a fragment is exactly what the generation
-			// exists to prevent.
-			if (_detail_bake.detail == p_detail) {
-				p_detail->acknowledge_bake(landed.slot, landed.generation);
-			}
-		}
-		_detail_bake.landed.clear();
-		previous = std::move(_detail_bake.collected);
-		// The tiles the layer has produced a source for and no bake has covered, in the order it
-		// produced them. A tile already on its way to a dispatch is not collected twice: the second
-		// bake would read the same source and land the same layers.
-		int budget = MAX(0, p_budget_texels);
-		// A copy of the layer's offers, because taking one mutates the layer's queue: iterating the
-		// live queue while erasing from it would skip entries and read past its end.
-		std::vector<Terrain3DMaterialClipmapDetail::BakeOffer> offers;
-		const int offer_count = p_detail->get_pending_bake_count();
-		offers.reserve(size_t(offer_count));
-		for (int index = 0; index < offer_count; index++) {
-			offers.push_back(p_detail->get_pending_bake(index));
-		}
-		for (const Terrain3DMaterialClipmapDetail::BakeOffer &offer : offers) {
-			bool already = false;
-			for (const DetailJob &job : previous) {
-				already = already || (job.slot == offer.slot && job.generation == offer.generation);
-			}
-			for (const DetailJob &job : fresh) {
-				already = already || (job.slot == offer.slot && job.generation == offer.generation);
-			}
-			if (already) {
-				continue;
-			}
-			const int64_t texels = int64_t(offer.stored_size) * int64_t(offer.stored_size);
-			// The budget is the ring's own unit - channel texels - and it is a *soft* one: at least
-			// one tile is collected per offer, because a single 1024-density tile is larger than the
-			// default tick budget and a budget that never admitted it would leave the layer unbaked
-			// forever. After that first tile the budget is a real bound - it is clamped at zero, so a
-			// tile that overspent it is the last of this offer rather than the first of an unbounded
-			// batch. What is left stays with the layer for the next offer.
-			if (!fresh.empty() && texels > budget) {
-				break;
-			}
-			budget = int(MAX(int64_t(0), int64_t(budget) - texels));
-			DetailJob job;
-			job.slot = offer.slot;
-			job.level = offer.level;
-			job.generation = offer.generation;
-			job.world_rect = offer.world_rect;
-			job.source_grid = offer.source_grid;
-			job.texel = offer.texel_world;
-			job.border = offer.border;
-			job.stored_size = offer.stored_size;
-			fresh.push_back(job);
-			// The offer is taken here rather than cleared wholesale after the loop: the budget
-			// admits one tile at the default shape, and every offer it deferred has a tile already
-			// marked in flight - clearing the queue would lose those until their timeout.
-			p_detail->take_pending_bake(offer.slot, offer.generation);
-		}
-		_detail_bake.collected = std::move(fresh);
-		_detail_bake.offers_taken += uint64_t(_detail_bake.collected.size());
-		// This tick collects, the next dispatches: the source upload the layer just issued is a
-		// RenderingServer command that has not run yet, and a device dispatch issued in the same tick
-		// would race that queue and read the texels the upload is replacing. The batch is *appended*
-		// to whatever the render callback has not drained yet: assigning it instead dropped every
-		// batch collected while more than one tick ran between two callbacks - measured, 84 offers
-		// taken and 6 dispatches in a configuration whose frames carried several physics ticks, so
-		// the tiles the view asked for were collected and then thrown away.
-		for (const DetailJob &job : previous) {
-			_detail_bake.queued.push_back(job);
+	// A copy of the layer's offers, because taking one mutates the layer's queue: iterating the
+	// live queue while erasing from it would skip entries and read past its end. It is taken under
+	// the lock the same way the layer's own queue always was: the read and the take below are the
+	// two halves of one hand-off.
+	std::lock_guard<std::mutex> lock(_mutex);
+	for (const DetailJob &landed : _detail_bake.landed) {
+		// The layer is what decides, not this thread: a slot that was reused, or a tile whose
+		// content an edit invalidated while the dispatch was in flight, carries a different
+		// generation - and serving those texels to a fragment is exactly what the generation
+		// exists to prevent.
+		if (_detail_bake.detail == p_detail) {
+			p_detail->acknowledge_bake(landed.slot, landed.generation);
 		}
 	}
-	return int(_detail_bake.collected.size());
+	_detail_bake.landed.clear();
+	std::vector<Terrain3DMaterialClipmapDetail::BakeOffer> offers;
+	const int offer_count = p_detail->get_pending_bake_count();
+	offers.reserve(size_t(offer_count));
+	for (int index = 0; index < offer_count; index++) {
+		offers.push_back(p_detail->get_pending_bake(index));
+	}
+	// The tiles the layer has produced a source for and no bake has covered, in the order it
+	// produced them. `offer_bake_jobs()` is the loop itself (terrain_3d_surface_baker_internal.h),
+	// shared with the two clipmap bakes; what is the layer's own is the job a tile becomes. A tile's
+	// identity is its slot and its generation - an edit invalidates the content without changing the
+	// rect - which is what the shared key carries as its unit and lease.
+	const int taken = offer_bake_jobs(_detail_bake.collected, _detail_bake.queued, p_budget_texels,
+			offer_count,
+			[&](const int p_index, BakeOfferKey &r_key, int64_t &r_texels) {
+				const Terrain3DMaterialClipmapDetail::BakeOffer &offer = offers[size_t(p_index)];
+				r_key = { offer.slot, offer.generation, 0, 0, 0, 0 };
+				r_texels = int64_t(offer.stored_size) * int64_t(offer.stored_size);
+				return true;
+			},
+			[](const DetailJob &p_job) { return BakeOfferKey{ p_job.slot, p_job.generation, 0, 0, 0, 0 }; },
+			[&](const int p_index) {
+				const Terrain3DMaterialClipmapDetail::BakeOffer &offer = offers[size_t(p_index)];
+				DetailJob job;
+				job.slot = offer.slot;
+				job.level = offer.level;
+				job.generation = offer.generation;
+				job.world_rect = offer.world_rect;
+				job.source_grid = offer.source_grid;
+				job.texel = offer.texel_world;
+				job.border = offer.border;
+				job.stored_size = offer.stored_size;
+				// The offer is taken here rather than cleared wholesale after the loop: the budget
+				// admits one tile at the default shape, and every offer it deferred has a tile already
+				// marked in flight - clearing the queue would lose those until their timeout.
+				p_detail->take_pending_bake(offer.slot, offer.generation);
+				return job;
+			});
+	_detail_bake.offers_taken += uint64_t(taken);
+	return taken;
 }
 
 int Terrain3DSurfaceBaker::_dispatch_detail_bake() {
@@ -315,52 +277,27 @@ int Terrain3DSurfaceBaker::_dispatch_detail_bake() {
 			// source tap through the grid, not through the output texel.
 			const real_t texel_x = job.texel;
 			const real_t texel_z = job.texel;
-			encode_vec4(job_bytes, offset, job.world_rect.position.x, job.world_rect.position.y,
-					job.world_rect.size.x, job.world_rect.size.y);
-			encode_vec4(job_bytes, offset + 16, float(texel_x), float(texel_z), float(stored_size),
-					float(job.border));
 			// The source layer *is* the slot: one array holds the payload and one the height, so the two
 			// indices are the same number into two textures (`indices.w` names the second).
-			job_bytes.encode_u32(offset + 32, uint32_t(MAX(0, job.slot)));
-			job_bytes.encode_u32(offset + 36, uint32_t(MAX(0, job.slot)));
-			job_bytes.encode_u32(offset + 40, 1u);
-			job_bytes.encode_u32(offset + 44, uint32_t(MAX(0, job.slot)));
-			encode_vec4(job_bytes, offset + 48, 1.0f, job.source_grid.x, job.source_grid.y, job.source_grid.z);
+			encode_bake_job(job_bytes, offset,
+					Vector4(job.world_rect.position.x, job.world_rect.position.y, job.world_rect.size.x,
+							job.world_rect.size.y),
+					Vector4(float(texel_x), float(texel_z), float(stored_size), float(job.border)),
+					uint32_t(MAX(0, job.slot)), uint32_t(MAX(0, job.slot)), 1u, uint32_t(MAX(0, job.slot)),
+					Vector4(1.0f, job.source_grid.x, job.source_grid.y, job.source_grid.z));
 		}
-		if (_rd->buffer_update(job_buffer, 0, uint32_t(job_bytes.size()), job_bytes) != OK) {
-			LOG(WARN, "Could not upload the detail material bake jobs");
-			break;
-		}
-		PackedByteArray push;
-		push.resize(48);
-		push.encode_u32(0, uint32_t(stored_size));
-		push.encode_u32(4, uint32_t(count));
-		push.encode_u32(8, uint32_t(MAX(0, material_count)));
-		push.encode_u32(12, 0u);
 		// `source.x == 0`: a tile's source is a stored rect with a gutter whose taps clamp, exactly like
 		// a page's. `source.w == 0` is the normalised `R16_UNORM` payload read, which is the format the
-		// layer's source array carries.
-		push.encode_u32(16, 0u);
-		push.encode_u32(20, 0u);
-		push.encode_u32(24, 0u);
-		push.encode_u32(28, 0u);
-		// A tile's job covers the layer it fills: origin zero, the stored size either way.
-		push.encode_u32(32, 0u);
-		push.encode_u32(36, 0u);
-		push.encode_u32(40, uint32_t(stored_size));
-		push.encode_u32(44, uint32_t(stored_size));
-		SurfaceVTLabel dispatch_label(_rd, "Detail Material Bake - " + String::num_int64(count) + " tiles");
-		const int64_t compute_list = _rd->compute_list_begin();
-		if (compute_list < 0) {
-			LOG(WARN, "Could not begin a detail material bake compute list");
+		// layer's source array carries. A tile's job also covers the layer it fills: origin zero, the
+		// stored size either way.
+		if (!record_bake_dispatch(_rd, job_buffer, set, _resources.pipeline, job_bytes,
+					{ { uint32_t(stored_size), uint32_t(count), uint32_t(MAX(0, material_count)), 0u },
+							{ 0u, 0u, 0u, 0u },
+							{ 0u, 0u, uint32_t(stored_size), uint32_t(stored_size) } },
+					(stored_size + 7) / 8, (stored_size + 7) / 8, int(count),
+					"Detail Material Bake - " + String::num_int64(count) + " tiles")) {
 			break;
 		}
-		_rd->compute_list_bind_compute_pipeline(compute_list, _resources.pipeline);
-		_rd->compute_list_bind_uniform_set(compute_list, set, 0);
-		_rd->compute_list_set_push_constant(compute_list, push, uint32_t(push.size()));
-		_rd->compute_list_dispatch(compute_list, uint32_t((stored_size + 7) / 8),
-				uint32_t((stored_size + 7) / 8), uint32_t(count));
-		_rd->compute_list_end();
 		for (size_t index = 0; index < count; index++) {
 			landed.push_back(jobs[base + index]);
 		}

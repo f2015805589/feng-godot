@@ -26,11 +26,6 @@ const REGIONS: Array[Vector2i] = [
 func _initialize() -> void:
 	call_deferred("run")
 
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
 func tick() -> void:
 	terrain.notification(Node.NOTIFICATION_PHYSICS_PROCESS)
 	await process_frame

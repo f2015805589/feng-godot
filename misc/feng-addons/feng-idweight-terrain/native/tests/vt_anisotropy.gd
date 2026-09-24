@@ -46,11 +46,6 @@ var param_array: Texture2DArray
 func _initialize() -> void:
 	call_deferred("run")
 
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
 func ground_point(screen: Vector2) -> Vector2:
 	var hit = Plane(Vector3.UP, 0.0).intersects_ray(
 			camera.project_ray_origin(screen), camera.project_ray_normal(screen))

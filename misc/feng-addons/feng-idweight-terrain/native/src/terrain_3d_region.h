@@ -167,23 +167,42 @@ constexpr inline const Color *COLOR = Terrain3DRegion::COLOR;
 
 // Inline functions
 
+// The height range's two widening rules, shared by a region's own range and by the data's master
+// range: a range grows to include a height, or to include another range. Returning whether it grew
+// is what lets the region mark itself modified without testing the range a second time.
+inline bool merge_height_range(Vector2 &r_range, const real_t p_height) {
+	if (p_height < r_range.x) {
+		r_range.x = p_height;
+		return true;
+	}
+	if (p_height > r_range.y) {
+		r_range.y = p_height;
+		return true;
+	}
+	return false;
+}
+
+inline bool merge_height_range(Vector2 &r_range, const Vector2 &p_low_high) {
+	bool grew = false;
+	if (p_low_high.x < r_range.x) {
+		r_range.x = p_low_high.x;
+		grew = true;
+	}
+	if (p_low_high.y > r_range.y) {
+		r_range.y = p_low_high.y;
+		grew = true;
+	}
+	return grew;
+}
+
 inline void Terrain3DRegion::update_height(const real_t p_height) {
-	if (p_height < _height_range.x) {
-		_height_range.x = p_height;
-		_modified = true;
-	} else if (p_height > _height_range.y) {
-		_height_range.y = p_height;
+	if (merge_height_range(_height_range, p_height)) {
 		_modified = true;
 	}
 }
 
 inline void Terrain3DRegion::update_heights(const Vector2 &p_low_high) {
-	if (p_low_high.x < _height_range.x) {
-		_height_range.x = p_low_high.x;
-		_modified = true;
-	}
-	if (p_low_high.y > _height_range.y) {
-		_height_range.y = p_low_high.y;
+	if (merge_height_range(_height_range, p_low_high)) {
 		_modified = true;
 	}
 }

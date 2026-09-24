@@ -4,7 +4,7 @@
 ## counters and a quantised readback of every frame, because a plan can report no pending
 ## work while the material still exposes a missing-page diagnostic.  The scene is never
 ## saved: only the runtime feedback switch and the camera transform are changed.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const IMAGE_STEP := 8
 const DEFAULT_STATIC_TICKS := 240
@@ -12,20 +12,12 @@ const DEFAULT_TURN_FRAMES := 180
 const DEFAULT_POST_SETTLE_FRAMES := 120
 const DEFAULT_TURNS := 4
 
-var terrain: Terrain3D
 var scene: Node
-var camera: Camera3D
 var origin: Transform3D
-var failed := false
 var output_dir := "user://vt-strict-coverage"
 
 func _initialize() -> void:
 	run.call_deferred()
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func environment_int(name: String, fallback: int, minimum: int = 0) -> int:
 	var raw := OS.get_environment(name)

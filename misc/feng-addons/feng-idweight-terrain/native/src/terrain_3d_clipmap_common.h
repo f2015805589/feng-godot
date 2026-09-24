@@ -81,6 +81,18 @@ inline constexpr real_t LADDER_FINEST_DENSITY = 1024.f; // texels a metre at uni
 inline constexpr real_t LADDER_COARSEST_DENSITY = 1.f; // texels a metre at the outermost unit
 inline constexpr int LADDER_UNITS = 11; // log2(1024 / 1) + 1
 
+// ---- The block atlas's shape ----------------------------------------------------------------------
+//
+// The numbers a `ClipmapAtlas` arm's tables are sized from: the units one atlas may hold, the cells
+// one unit is (`9 * rings`: the centre block and its eight neighbours, which is what nests), and the
+// slots those cells need (one a cell, one spare a unit, one global block and room for a layout that
+// leaves a hole). They live in the shared vocabulary rather than on the atlas class because the
+// *material* owns the numeric tables and the shader defines sized from them, and a material that had
+// to name the implementation to size its own uniforms would be reaching across the delivery.
+inline constexpr int ATLAS_MAX_RINGS = 12;
+inline constexpr int ATLAS_MAX_CELLS = 9 * ATLAS_MAX_RINGS;
+inline constexpr int ATLAS_MAX_SLOTS = ATLAS_MAX_CELLS + ATLAS_MAX_RINGS + 8;
+
 inline bool is_valid_implementation(const int p_implementation) {
 	return p_implementation >= 0 && p_implementation < IMPLEMENTATION_COUNT;
 }

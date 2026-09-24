@@ -1,4 +1,4 @@
-﻿// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 // Terrain3DVirtualTexture, part 1 of 3: the view object, its indirection table and its settings.
 
@@ -261,30 +261,25 @@ Error Terrain3DVirtualTexture::initialize() {
 	}
 	_stored_page_size = _page_pool->stored_page_size;
 
-	// Indirection mip chain, built by hand. Level m is indirection_size >> m.
+	// Indirection mip chain: level m is `indirection_size >> m`, down to one texel, laid out one
+	// level after another. The chain's shape is TerrainVT's (terrain_vt.h), so the table the
+	// device is handed before its first commit is the same table.
+	_level_count = TerrainVT::log2_power_of_two(_indirection_size) + 1;
 	_level_offsets.clear();
 	_level_sizes.clear();
-	int64_t total_texels = 0;
-	int size = _indirection_size;
-	while (true) {
-		_level_offsets.push_back(int(total_texels * 4));
-		_level_sizes.push_back(size);
-		total_texels += int64_t(size) * size;
-		if (size == 1) {
-			break;
-		}
-		size >>= 1;
+	int64_t level_offset_bytes = 0;
+	for (int mip = 0; mip < _level_count; mip++) {
+		const int level_size = TerrainVT::indirection_level_size(_indirection_size, mip);
+		_level_offsets.push_back(int(level_offset_bytes));
+		_level_sizes.push_back(level_size);
+		level_offset_bytes += int64_t(level_size) * level_size * 4;
 	}
-	_level_count = int(_level_sizes.size());
+	const int64_t total_texels = TerrainVT::indirection_total_texels(_indirection_size, _level_count);
 	_bytes.resize(total_texels * 4);
 	// The plan markers name levels of the address space that is being rebuilt, so they cannot
 	// survive it: every entry starts empty and the plan is re-published against the new table.
 	_planned_levels.clear();
-	_bytes.encode_float(0, real_t(INVALID_SLOT));
-	uint8_t *indirection_bytes = _bytes.ptrw();
-	for (int64_t i = 1; i < total_texels; i++) {
-		std::memcpy(indirection_bytes + i * 4, indirection_bytes, 4);
-	}
+	TerrainVT::fill_indirection_cleared(_bytes.ptrw(), total_texels);
 	_indirection_dirty = true;
 
 	if (_world_space) {

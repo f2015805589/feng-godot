@@ -38,7 +38,7 @@
 #     Block 6 measures that with the two counter pairs in `get_vt_settings()`, because "the debug
 #     view costs nothing when it has nothing to draw" is otherwise a claim about a picture nobody can
 #     see the cost of.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const NEAR := 0
 const FAR := 1
@@ -52,20 +52,11 @@ const SVT := 3
 # atlas is an implementation *inside* the one clipmap layer). A value past the enum is refused.
 const OUT_OF_RANGE := 4
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 func cell(p_tier: int, p_group: int) -> int:

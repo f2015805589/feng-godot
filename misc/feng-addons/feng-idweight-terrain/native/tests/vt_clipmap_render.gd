@@ -25,31 +25,22 @@
 # design; the group index is Material=0/Height=1 and the delivery values are
 # Direct=0/AVT=1/Clipmap=2/SVT=3, i.e. the native `TerrainVT` enum values, which are also the
 # property values.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const MATERIAL := 0
 const HEIGHT := 1
 const DIRECT := 0
 const CLIPMAP := 2
 
-var terrain: Terrain3D
 var painter: Terrain3DEditor
-var camera: Camera3D
 var target: Node3D
 var scene: Node3D
 var brush: Image
-var failed := false
 var output_dir := "user://"
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 # ---- stand-ins for Terrain3DEditorPlugin's undo interface ---------------------------------------

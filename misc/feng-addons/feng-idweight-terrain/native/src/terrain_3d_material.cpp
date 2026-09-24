@@ -37,12 +37,12 @@
 // then the band mask, the ring count and the block's world size. The shader's offsets are the same
 // numbers, emitted as defines from these constants, so the two cannot drift.
 static constexpr int ATLAS_DATA_STARTS = 0;
-static constexpr int ATLAS_DATA_SLOTS = Terrain3DClipmapAtlas::MAX_RINGS * 2;
-static constexpr int ATLAS_DATA_OFFSETS = ATLAS_DATA_SLOTS + Terrain3DClipmapAtlas::MAX_CELLS;
-static constexpr int ATLAS_DATA_CURRENT = ATLAS_DATA_OFFSETS + Terrain3DClipmapAtlas::MAX_CELLS * 2;
-static constexpr int ATLAS_DATA_BAKED = ATLAS_DATA_CURRENT + Terrain3DClipmapAtlas::MAX_CELLS;
-static constexpr int ATLAS_DATA_RECTS = ATLAS_DATA_BAKED + Terrain3DClipmapAtlas::MAX_CELLS;
-static constexpr int ATLAS_DATA_BAND = ATLAS_DATA_RECTS + Terrain3DClipmapAtlas::MAX_SLOTS * 4;
+static constexpr int ATLAS_DATA_SLOTS = TerrainClipmap::ATLAS_MAX_RINGS * 2;
+static constexpr int ATLAS_DATA_OFFSETS = ATLAS_DATA_SLOTS + TerrainClipmap::ATLAS_MAX_CELLS;
+static constexpr int ATLAS_DATA_CURRENT = ATLAS_DATA_OFFSETS + TerrainClipmap::ATLAS_MAX_CELLS * 2;
+static constexpr int ATLAS_DATA_BAKED = ATLAS_DATA_CURRENT + TerrainClipmap::ATLAS_MAX_CELLS;
+static constexpr int ATLAS_DATA_RECTS = ATLAS_DATA_BAKED + TerrainClipmap::ATLAS_MAX_CELLS;
+static constexpr int ATLAS_DATA_BAND = ATLAS_DATA_RECTS + TerrainClipmap::ATLAS_MAX_SLOTS * 4;
 static constexpr int ATLAS_DATA_RINGS = ATLAS_DATA_BAND + 1;
 static constexpr int ATLAS_DATA_WORLD = ATLAS_DATA_RINGS + 1;
 // The row must hold one group's whole table, and the image must hold every group's row. Both are
@@ -131,11 +131,11 @@ void Terrain3DMaterial::_update_shader() {
 			if (atlas_arms > 0) {
 				defines += "#define TERRAIN_CLIPMAP_ATLAS\n";
 				defines += "#define CLIPMAP_ATLAS_MAX_RINGS " +
-						String::num_int64(Terrain3DClipmapAtlas::MAX_RINGS) + "\n";
+						String::num_int64(TerrainClipmap::ATLAS_MAX_RINGS) + "\n";
 				defines += "#define CLIPMAP_ATLAS_MAX_CELLS " +
-						String::num_int64(Terrain3DClipmapAtlas::MAX_CELLS) + "\n";
+						String::num_int64(TerrainClipmap::ATLAS_MAX_CELLS) + "\n";
 				defines += "#define CLIPMAP_ATLAS_MAX_SLOTS " +
-						String::num_int64(Terrain3DClipmapAtlas::MAX_SLOTS) + "\n";
+						String::num_int64(TerrainClipmap::ATLAS_MAX_SLOTS) + "\n";
 				// The data texture's shape and row layout, from the one set of constants the CPU
 				// packs with: a shader offset and a CPU offset cannot disagree.
 				defines += "#define CLIPMAP_ATLAS_DATA_WIDTH " + String::num_int64(ATLAS_DATA_WIDTH) + "\n";
@@ -679,12 +679,12 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 		const PackedFloat32Array arm_block_current = atlas_arm.get("cell_current", PackedFloat32Array());
 		const PackedFloat32Array arm_block_baked = atlas_arm.get("cell_baked", PackedFloat32Array());
 		const int base = group * ATLAS_DATA_STRIDE;
-		for (int ring = 0; ring < Terrain3DClipmapAtlas::MAX_RINGS; ring++) {
+		for (int ring = 0; ring < TerrainClipmap::ATLAS_MAX_RINGS; ring++) {
 			const Vector2 start = ring < arm_block_starts.size() ? arm_block_starts[ring] : Vector2();
 			block_data[base + ATLAS_DATA_STARTS + ring * 2] = start.x;
 			block_data[base + ATLAS_DATA_STARTS + ring * 2 + 1] = start.y;
 		}
-		for (int cell = 0; cell < Terrain3DClipmapAtlas::MAX_CELLS; cell++) {
+		for (int cell = 0; cell < TerrainClipmap::ATLAS_MAX_CELLS; cell++) {
 			const int slot = cell < arm_block_slots.size() ? arm_block_slots[cell] : -1;
 			block_data[base + ATLAS_DATA_SLOTS + cell] = float(slot);
 			// The stored index is the *logical* one: a block's content is a function of its own world
@@ -698,7 +698,7 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 			block_data[base + ATLAS_DATA_BAKED + cell] =
 					cell < arm_block_baked.size() ? arm_block_baked[cell] : 0.f;
 		}
-		for (int slot = 0; slot < Terrain3DClipmapAtlas::MAX_SLOTS; slot++) {
+		for (int slot = 0; slot < TerrainClipmap::ATLAS_MAX_SLOTS; slot++) {
 			const Vector4 rect = slot < arm_block_rects.size() ? arm_block_rects[slot] : Vector4();
 			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 0] = rect.x;
 			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 1] = rect.y;

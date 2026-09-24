@@ -217,25 +217,9 @@ func _svt_bake_status(p_terrain: Object) -> String:
 	if p_terrain == null or not is_instance_valid(p_terrain) or \
 			(p_terrain is Node and not p_terrain.is_inside_tree()) or not p_terrain.has_method("get_vt_settings"):
 		return "Terrain unavailable"
-	var value: Variant = p_terrain.call("get_vt_settings")
-	if typeof(value) != TYPE_DICTIONARY:
+	var settings := TerrainVTBridge.vt_settings(p_terrain)
+	if settings.is_empty():
 		return "SVT status unavailable"
-	var settings: Dictionary = value
-	var auto_enabled := bool(settings.get("auto_bake", p_terrain.get("surface_svt_auto_bake")))
-	var dirty_regions := int(settings.get("auto_pending_regions", 0))
-	var incremental := bool(settings.get("bake_incremental", false))
-	if bool(settings.get("bake_failed", false)):
-		var mode := "Automatic incremental" if incremental else "Manual full"
-		return "%s SVT bake failed: %s" % [mode, str(settings.get("bake_error", "unknown error"))]
-	var total := int(settings.get("bake_total", 0))
-	var done := int(settings.get("bake_done", 0))
-	var pending := int(settings.get("bake_pending", 0))
-	if pending > 0 or total > 0 or done > 0:
-		var mode := "Automatic incremental" if incremental else "Manual full"
-		var state := "complete" if total > 0 and done >= total and pending == 0 else "progress"
-		return "%s SVT bake %s: %d/%d pages, %d pending." % [mode, state, done, total, pending]
-	if auto_enabled and dirty_regions > 0:
-		return "Auto Bake: %d changed region(s) queued; updates merge after 500 ms idle." % dirty_regions
-	if auto_enabled:
-		return "Auto Bake on · changed regions rebake 500 ms after editing stops."
-	return "Auto Bake off · use Bake All SVT Pages for a full persisted bake."
+	# The sentence itself is the bridge's, which the VT window's status label reads too.
+	return TerrainVTBridge.svt_bake_status(settings,
+			TerrainVTBridge.svt_auto_bake(p_terrain, &"surface_svt_auto_bake"))

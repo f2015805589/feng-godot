@@ -14,7 +14,7 @@
 # dropped cache entry leaves behind: nothing about the page's address or its published slot
 # changes, only its content is gone. A demand pass is the only thing that can repair it, so
 # the test requires the page to be ready again within a bounded number of ticks.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const GRID := 6
@@ -25,18 +25,10 @@ const VIEW_WORLD := Vector2(160.0, 160.0)
 const UNCOMPRESSED := 0
 const BC7 := 1
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func producer_stats() -> Dictionary:
 	return terrain.get_vt_settings().get("producer", {})
@@ -49,22 +41,6 @@ func sector_stats() -> Dictionary:
 func tick() -> void:
 	terrain.update_surface_vt(64)
 	await process_frame
-
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
-
-func make_pattern(size: int, a: Color, b: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	for y in size:
-		for x in size:
-			var checker := ((x / 8 + y / 8) & 1) == 0
-			var gradient := float(x + y) / float(maxi(1, (size - 1) * 2))
-			var color := a.lerp(b, 0.25 + gradient * 0.45)
-			if not checker:
-				color = color.lerp(b, 0.35)
-			image.set_pixel(x, y, color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func fill_region(location: Vector2i, id: int) -> void:
 	var bytes := PackedByteArray()

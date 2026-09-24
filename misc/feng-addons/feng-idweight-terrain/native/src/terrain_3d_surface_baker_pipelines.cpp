@@ -237,19 +237,10 @@ bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 	_resolve_material_rd(r_resources, albedo_rd, normal_rd, p_albedo_array_rs, p_normal_array_rs);
 
 	TypedArray<Ref<RDUniform>> uniforms;
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0,
-			r_resources.sampler_nearest, r_resources.source_id_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1,
-			r_resources.sampler_nearest, r_resources.source_height_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2,
-			r_resources.sampler_linear, albedo_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3,
-			r_resources.sampler_linear, normal_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 4, r_resources.material_buffer);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 5, r_resources.job_buffer);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 6, r_resources.output_albedo_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 7, r_resources.output_normal_rd);
-	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 8, r_resources.output_params_rd);
+	append_bake_uniforms(uniforms, r_resources.sampler_nearest, r_resources.sampler_linear,
+			r_resources.source_id_rd, r_resources.source_height_rd, albedo_rd, normal_rd,
+			r_resources.material_buffer, r_resources.job_buffer,
+			{ r_resources.output_albedo_rd, r_resources.output_normal_rd, r_resources.output_params_rd });
 	r_resources.uniform_set = _rd->uniform_set_create(uniforms, r_resources.shader, 0);
 	if (!r_resources.uniform_set.is_valid()) {
 		LOG(ERROR, "Could not create the surface bake uniform set");

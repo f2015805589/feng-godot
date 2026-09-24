@@ -1,29 +1,15 @@
 # GPU regression for per-sector AVT density and mip-chain reuse during growth.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const NEAR_REGION := Vector2i(0, 0)
 const FAR_REGION := Vector2i(0, 2)
 
-var terrain: Terrain3D
-var camera: Camera3D
 var scene: Node3D
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
-func make_texture(color: Color) -> ImageTexture:
-	var image := Image.create(32, 32, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func add_assets() -> void:
 	terrain.assets = Terrain3DAssets.new()

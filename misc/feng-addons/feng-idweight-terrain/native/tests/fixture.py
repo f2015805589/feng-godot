@@ -39,6 +39,78 @@ OFFSCREEN_POSITION = -32000
 # `vt_project_lifetime_probe.py` already ignored it locally; this is the shared version.
 ENVIRONMENTAL_ERRORS = ("Failed to read the root certificate store.",)
 
+# The skeleton every script test that drives its own SceneTree shares: the failure flag a run() ends
+# on, the assertion it reports with, the terrain and camera it builds, and the images a codec or
+# coverage test feeds the material. Forty of them carried their own copy of the assertion alone, and
+# the helpers below were copied into five files each. It is written rather than kept as a file in this
+# directory because a test's `extends "res://..."` resolves inside the throwaway project, which is
+# what this fixture is.
+SCENE_BASE = """extends SceneTree
+
+var terrain: Terrain3D
+var camera: Camera3D
+var failed := false
+
+
+func require(value: bool, message: String) -> void:
+	if not value:
+		push_error("REGRESSION: " + message)
+		failed = true
+
+
+func material_word(id: int) -> int:
+	return (id << 11) | (id << 6)
+
+
+func make_pattern(size: int, a: Color, b: Color) -> ImageTexture:
+	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	for y in size:
+		for x in size:
+			var checker := ((x / 8 + y / 8) & 1) == 0
+			var gradient := float(x + y) / float(maxi(1, (size - 1) * 2))
+			var color := a.lerp(b, 0.25 + gradient * 0.45)
+			if not checker:
+				color = color.lerp(b, 0.35)
+			image.set_pixel(x, y, color)
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
+
+
+func make_normal(size: int) -> ImageTexture:
+	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	for y in size:
+		for x in size:
+			var n := 0.5 + 0.08 * sin(float(x) * 0.35) * cos(float(y) * 0.27)
+			image.set_pixel(x, y, Color(n, 0.5, 1.0, 1.0))
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
+
+
+func texture(size: int, color: Color) -> ImageTexture:
+	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	image.fill(color)
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
+
+
+func make_texture(color: Color) -> ImageTexture:
+	return texture(32, color)
+
+
+func classify(color: Color) -> String:
+	var peak := maxf(color.r, maxf(color.g, color.b))
+	if peak <= 0.001:
+		return "black"
+	var result := ""
+	if color.r / peak > 0.4:
+		result += "r"
+	if color.g / peak > 0.4:
+		result += "g"
+	if color.b / peak > 0.4:
+		result += "b"
+	return result
+"""
+
 
 def is_environmental_error(line: str) -> bool:
     """True for a log line the engine emits about the machine rather than about the test."""
@@ -137,6 +209,7 @@ def write_fixture(fixture: Path, test: str = "dock") -> None:
     addons = fixture / "addons"
     addons.mkdir(parents=True)
     copy_terrain_addon(addons / "feng-idweight-terrain")
+    (fixture / "vt_scene_base.gd").write_text(SCENE_BASE, encoding="utf-8")
 
     # feng_addons.cpp links every source addon that is absent. Keep ordinary
     # placeholder directories for the other source addons so this test never

@@ -9,7 +9,7 @@
 # The budget is per phase and in the same units the editor's profiler shows, so a
 # regression that puts a walk back in front of an idle gate is reported as the phase it
 # landed in rather than as one number for the whole section.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 256
 const GRID := 3
@@ -30,24 +30,10 @@ const SVT_MEAN_BUDGET_MS := 0.08
 const TOPUP_MEAN_BUDGET_MS := 0.005
 const TOTAL_MEAN_BUDGET_MS := 0.15
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
-func make_texture(color: Color) -> ImageTexture:
-	var image := Image.create(32, 32, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func add_assets() -> void:
 	terrain.assets = Terrain3DAssets.new()

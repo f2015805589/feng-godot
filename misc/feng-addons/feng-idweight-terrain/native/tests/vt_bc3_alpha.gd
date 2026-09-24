@@ -4,7 +4,7 @@
 ## production compute pass, and the page is exported back through the engine's compressed
 ## array decoder.  Comparing that page with the same page in the uncompressed array keeps
 ## this test independent of a second BC3 implementation in the test itself.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGE_SIZE := 32
@@ -12,24 +12,13 @@ const PAGE_BORDER := 2
 const PAGE_COUNT := 64
 const BC3 := 2
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
 
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
 func producer_stats() -> Dictionary:
 	return terrain.get_vt_settings().get("producer", {})
-
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
 
 func make_alpha_pattern(size: int) -> ImageTexture:
 	# A diagonal 0..1 ramp keeps every 4x4 output block away from a constant channel,

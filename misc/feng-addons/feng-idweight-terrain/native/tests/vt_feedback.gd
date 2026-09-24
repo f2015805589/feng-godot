@@ -8,7 +8,7 @@
 # computed in GDScript, so this pins the projection, the off-screen cull and the mip
 # maths rather than just "some numbers came back". It also checks that the readback is
 # genuinely deferred: the result is not available when it is requested.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const GRID_CHUNKS := 24
 const PAGES_PER_AXIS := 4
@@ -24,16 +24,9 @@ const VIEWPORT := Vector2i(1280, 720)
 # reject exactly the pages the gradient test needs.
 const MIN_EXTENT := 4.0
 
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # The same rule the compute shader implements, written out separately.
 func expected_mip(vp: Projection, origin: Vector2) -> int:

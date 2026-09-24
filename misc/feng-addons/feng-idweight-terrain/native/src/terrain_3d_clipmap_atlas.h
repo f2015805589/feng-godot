@@ -88,17 +88,17 @@ class Terrain3DClipmapAtlas : public Terrain3DClipmapImpl {
 	CLASS_NAME_STATIC("Terrain3DClipmapAtlas");
 
 public:
-	// The units one atlas may hold. Each unit is a 3x3 arrangement of its own blocks and reaches
-	// `1.5 * base_world * 2^unit` metres, so the count is the layer's reach in octaves. Twelve is one
-	// more than the eleven the shipping 1024 -> 1 ladder needs, so the ladder's outer endpoint is
-	// always expressible and the ceiling only bounds the shader's per-cell tables rather than the
-	// span. The clamp is reported when it is hit (see `configure()`).
-	static constexpr int MAX_RINGS = 12;
-	// Nine cells a unit: the centre block and its eight neighbours, which is what nests.
-	static constexpr int MAX_CELLS = 9 * MAX_RINGS;
-	// One slot per cell, one spare a unit, one global block, and room for a layout that leaves a hole.
-	// The packing never needs more than this and the shader's rect array is sized from it.
-	static constexpr int MAX_SLOTS = MAX_CELLS + MAX_RINGS + 8;
+	// The units one atlas may hold, and the cells and slots that follow from them. The numbers
+	// themselves are the shared shape's (terrain_3d_clipmap_common.h): the material's numeric tables
+	// and the shader's defines are sized from them, so they are stated where both can read them.
+	// Each unit is a 3x3 arrangement of its own blocks and reaches `1.5 * base_world * 2^unit` metres,
+	// so the count is the layer's reach in octaves. Twelve is one more than the eleven the shipping
+	// 1024 -> 1 ladder needs, so the ladder's outer endpoint is always expressible and the ceiling
+	// only bounds the shader's per-cell tables rather than the span. The clamp is reported when it is
+	// hit (see `configure()`).
+	static constexpr int MAX_RINGS = TerrainClipmap::ATLAS_MAX_RINGS;
+	static constexpr int MAX_CELLS = TerrainClipmap::ATLAS_MAX_CELLS;
+	static constexpr int MAX_SLOTS = TerrainClipmap::ATLAS_MAX_SLOTS;
 	static constexpr int MAX_CHANNELS = 16;
 	// The packing schemes the layout report compares. Every one of them is a *different* answer to
 	// "how do these 9-per-ring rects occupy the least area", and the report publishes all of them so the

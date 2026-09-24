@@ -16,7 +16,7 @@
 #     landed must fall back rather than sample a rect no dispatch wrote;
 #  3. **the generated shader**: `_clipmap_block` and `clipmap_block_find` are in the compiled string
 #     when, and only when, the implementation the selected cell answers with is the atlas.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const MATERIAL := 0
 const HEIGHT := 1
@@ -26,24 +26,15 @@ const CLIPMAP := 2
 const LOD := 0
 const ATLAS := 1
 
-var terrain: Terrain3D
-var camera: Camera3D
 var target: Node3D
 var scene: Node3D
 var painter: Terrain3DEditor
 var brush: Image
-var failed := false
 var output_dir := "user://"
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 # ---- stand-ins for Terrain3DEditorPlugin's undo interface ---------------------------------------

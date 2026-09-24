@@ -9,7 +9,7 @@
 #  2) The shader must actually be reading the atlas. Overwriting the pages that cover
 #     the sample point with a different material and watching the rendered pixel
 #     change is what proves it, rather than the shader silently falling back.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGES_PER_AXIS := 4
@@ -17,23 +17,15 @@ const PAGE := 16
 const BORDER := 2
 const STORED := PAGE + 2 * BORDER
 
-var terrain: Terrain3D
 var painter: Terrain3DEditor
-var camera: Camera3D
 var scene: Node3D
 var brush: Image
 var undo_action: Callable
 var redo_action: Callable
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func create_undo_action(_name: String) -> void:
 	pass
@@ -49,25 +41,6 @@ func frame_image() -> Image:
 		await process_frame
 	await RenderingServer.frame_post_draw
 	return root.get_texture().get_image()
-
-func texture(size: int, color: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
-
-func classify(color: Color) -> String:
-	var peak := maxf(color.r, maxf(color.g, color.b))
-	if peak <= 0.001:
-		return "black"
-	var result := ""
-	if color.r / peak > 0.4:
-		result += "r"
-	if color.g / peak > 0.4:
-		result += "g"
-	if color.b / peak > 0.4:
-		result += "b"
-	return result
 
 # Screen position of a world XZ point.
 func screen_of(image: Image, world: Vector2) -> Vector2i:

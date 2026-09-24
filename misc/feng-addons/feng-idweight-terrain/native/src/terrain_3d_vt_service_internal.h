@@ -3,7 +3,6 @@
 #ifndef TERRAIN3D_VT_SERVICE_INTERNAL_H
 #define TERRAIN3D_VT_SERVICE_INTERNAL_H
 
-#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 #include "terrain_3d_surface_baker.h"
 
@@ -28,7 +27,9 @@
 //   terrain_3d_vt_service_report.cpp  the diagnostics the dock, inspector and tests read
 //   terrain_3d_vt_service_bake.cpp    the far field's bake and its cell files
 //
-// Include this after terrain_3d.h and add `using namespace terrain_surface_vt;`.
+// Include this after terrain_3d.h and add `using namespace terrain_surface_vt;`. The node header
+// itself is *not* included here: both helpers below work on the data object and the producer, so a
+// header that only wants them does not have to pull the node, its state and its clipmap in.
 namespace terrain_surface_vt {
 
 inline Terrain3DSurfaceBaker *baker(const Ref<RefCounted> &p_ref) {

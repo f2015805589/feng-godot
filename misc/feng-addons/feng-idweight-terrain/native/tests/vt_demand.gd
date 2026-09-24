@@ -8,7 +8,7 @@
 # (feedback window origin, page coordinates, level grouping, production order) rather
 # than the shader alone, and the page contents are read back so a page that is resident
 # but filled from the wrong region texel still fails.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGES_PER_AXIS := 4
@@ -25,10 +25,7 @@ const MIN_EXTENT := 8.0
 const PAGE_WORLD := float(REGION_SIZE) / float(PAGES_PER_AXIS) # 16 m
 const PAGE_COUNT := 1024
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 # Regions the pattern was written to; a border texel outside all of them is material 0.
 var pattern_locs: Array = []
 # Read from the camera: the runtime measures extents in real viewport pixels, and the
@@ -37,11 +34,6 @@ var viewport_size := Vector2i(1280, 720)
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # The same rule the compute shader implements, written out separately. A page is
 # culled (-1) when a corner is behind the camera, when it is off screen, or when its

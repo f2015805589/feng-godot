@@ -152,15 +152,12 @@ void Terrain3DVTIndirection::_upload(const Ref<Terrain3DVTIndirection> &p_keep_a
 		// let the sampler read garbage slot indices.
 		PackedByteArray cleared;
 		if (initial.is_empty()) {
-			int64_t texels = 0;
-			for (int mip = 0; mip < _levels; ++mip) {
-				const int64_t level = MAX(1, _size >> mip);
-				texels += level * level;
-			}
+			// The same chain shape the page table's owner builds (TerrainVT::indirection_*): the
+			// cleared table has to have exactly the texels and levels that one does, or the device
+			// would be handed a slice the CPU table later disagrees with.
+			const int64_t texels = TerrainVT::indirection_total_texels(_size, _levels);
 			cleared.resize(texels * 4);
-			cleared.encode_float(0, real_t(TerrainVT::INVALID_PHYSICAL_PAGE_SLOT));
-			uint8_t *cleared_bytes = cleared.ptrw();
-			for (int64_t i = 1; i < texels; ++i) { std::memcpy(cleared_bytes + i * 4, cleared_bytes, 4); }
+			TerrainVT::fill_indirection_cleared(cleared.ptrw(), texels);
 		}
 		Ref<RDTextureFormat> format; format.instantiate();
 		format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);

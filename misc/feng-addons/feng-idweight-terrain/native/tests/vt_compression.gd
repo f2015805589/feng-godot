@@ -10,17 +10,11 @@
 # the whole texture-array vocabulary. The accepted set stays device dependent - a desktop
 # device can only sample BC formats, and the BC formats are the only ones with an encoder -
 # so the test asserts the invariants and prints what it found.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func producer_stats(p_terrain: Terrain3D) -> Dictionary:
 	return p_terrain.get_vt_settings().get("producer", {})

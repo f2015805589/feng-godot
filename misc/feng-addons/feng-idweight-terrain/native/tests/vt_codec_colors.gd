@@ -6,7 +6,7 @@
 ## engine's own software decoder, so a codec that writes the wrong channel order, or whose
 ## colour half lands in the wrong bytes, is visible per channel and per texel - with no
 ## renderer in the way.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const GRID := 8
@@ -15,43 +15,10 @@ const PAGE_BORDER := 2
 const BC7 := 1
 const BC3 := 2
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
-
-func make_pattern(size: int, a: Color, b: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	for y in size:
-		for x in size:
-			var checker := ((x / 8 + y / 8) & 1) == 0
-			var gradient := float(x + y) / float(maxi(1, (size - 1) * 2))
-			var color := a.lerp(b, 0.25 + gradient * 0.45)
-			if not checker:
-				color = color.lerp(b, 0.35)
-			image.set_pixel(x, y, color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
-
-func make_normal(size: int) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	for y in size:
-		for x in size:
-			var n := 0.5 + 0.08 * sin(float(x) * 0.35) * cos(float(y) * 0.27)
-			image.set_pixel(x, y, Color(n, 0.5, 1.0, 1.0))
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func fill_region(location: Vector2i, id: int) -> void:
 	var bytes := PackedByteArray()

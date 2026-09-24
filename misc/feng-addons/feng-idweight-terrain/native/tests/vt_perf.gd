@@ -9,7 +9,7 @@
 # pass (nothing changed, so the demand walk is pure overhead) and the pass after the
 # camera moved by one region. A per-page cost above a few hundred microseconds in a
 # debug build is what makes the editor stutter while the camera moves.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 256 # Terrain3D's default region size in metres.
 const PAGES_PER_AXIS := 4
@@ -27,18 +27,10 @@ const SETTLED_RUNS := 20
 # this in a debug build means the producer is paying per-texel API overhead.
 const MAX_US_PER_PAGE := 3000.0
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func write_pattern(loc: Vector2i) -> void:
 	var bytes := PackedByteArray()

@@ -364,8 +364,8 @@ void Terrain3D::__physics_process(const double p_delta) {
 		// The stages of the pass that produced the peak, kept in their own dictionary. The live
 		// one is overwritten by every pass, so a peak read from it describes whatever ran last -
 		// which is never the peak, because the peak is by definition the pass that took longest.
-		_vt.avt_peak_stats = _vt.avt_sector_stats.to_dictionary();
-		_vt.avt_peak_stamp_us = Time::get_singleton()->get_ticks_usec();
+		_vt.avt_cost.peak_stats = _vt.avt_sector_stats.to_dictionary();
+		_vt.avt_cost.peak_stamp_us = Time::get_singleton()->get_ticks_usec();
 	}
 	// Refresh the far field: a world-space page grid that spans regions.
 	const int svt_share = MAX(0, vt_remaining - MIN(vt_remaining, avt_produced));
@@ -413,7 +413,7 @@ void Terrain3D::__physics_process(const double p_delta) {
 		TerrainProfileZone::plot("pages_ready", double(producer->get_ready_page_count()));
 		TerrainProfileZone::plot("pages_pending", double(producer->get_pending_page_count()));
 	}
-	TerrainProfileZone::plot("pages_late", double(_vt.avt_late_pages));
+	TerrainProfileZone::plot("pages_late", double(_vt.avt_cost.late_pages));
 	TerrainProfileZone::plot("motion_speed", double(_vt.avt_motion_velocity.length()));
 	// The turn's own reading, beside the speed it is the counterpart of: a view that streams while
 	// turning shows as a rate with no lead to match it.

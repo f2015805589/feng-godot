@@ -95,7 +95,7 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 			_vt.avt_sector_stats["visible_late_pages"] = 0;
 			_vt.avt_sector_stats["idle_ready_lost"] = 0;
 		}
-		_vt.avt_late_pages = 0;
+		_vt.avt_cost.late_pages = 0;
 		_vt.avt_missing_pages = 0;
 		_vt.avt_pending_pages = 0;
 		_vt.avt_demand_age.clear();
@@ -127,9 +127,9 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		stage_started = now;
 	};
 	_avt_classify_plan(pass);
-	mark("classify_ms", _vt.avt_classify_sum_ms);
+	mark("classify_ms", _vt.avt_cost.classify_sum_ms);
 	_avt_retain_visible(pass);
-	mark("retain_ms", _vt.avt_retain_sum_ms);
+	mark("retain_ms", _vt.avt_cost.retain_sum_ms);
 	if (_vt.vt_page_pipeline) {
 		// The retention is the largest stage of a pass that installed a plan, and it is two
 		// unrelated costs: waiting for the queue's mutex against producing workers, and comparing
@@ -142,17 +142,17 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 		_vt.avt_sector_stats["retain_index_ms"] = double(retain_index_us) / 1000.0;
 	}
 	_avt_prime_sources(pass, SOURCE_QUEUE_REFILL_ABOVE);
-	mark("prime_ms", _vt.avt_prime_sum_ms);
+	mark("prime_ms", _vt.avt_cost.prime_sum_ms);
 	_avt_produce_visible(pass, p_max_pages);
-	mark("upload_ms", _vt.avt_upload_sum_ms);
+	mark("upload_ms", _vt.avt_cost.upload_sum_ms);
 	// Refill after consuming ready results even when the render budget is spent, so the workers
 	// are not left idle between ticks - but only when the queue is actually running low. A queue
 	// that is still half full is work the workers have not reached yet, and re-scanning and
 	// re-inserting into it buys nothing.
 	_avt_prime_sources(pass, SOURCE_QUEUE_REFILL_ABOVE, true);
-	mark("refill_ms", _vt.avt_refill_sum_ms);
+	mark("refill_ms", _vt.avt_cost.refill_sum_ms);
 	_avt_finish_produce(pass);
-	mark("finish_ms", _vt.avt_finish_sum_ms);
+	mark("finish_ms", _vt.avt_cost.finish_sum_ms);
 	// The view is served once every page the image samples has a slot *and* content. A page with a
 	// slot but no content is not served - the source pass can allocate every slot in a few frames
 	// while the pages wait for their encode and readback, so a test that read only "no missing
@@ -166,17 +166,17 @@ int Terrain3D::_produce_sector_avt_pages(int p_max_pages) {
 	// acceptance reading: it is a MAX over every pass of the session, so a single batch over the
 	// live tier shows up in it whenever it happened.
 	_vt.avt_sector_stats["batch_pages"] = pass.produced;
-	_vt.avt_batch_peak = MAX(_vt.avt_batch_peak, pass.produced);
+	_vt.avt_cost.batch_peak = MAX(_vt.avt_cost.batch_peak, pass.produced);
 	// The stage sums and the count they are summed over, so `report()` can difference two readings
 	// and state the mean of one sweep. The live keys above describe the last pass only.
-	_vt.avt_pass_count++;
-	_vt.avt_sector_stats["passes"] = int64_t(_vt.avt_pass_count);
-	_vt.avt_sector_stats["classify_sum_ms"] = _vt.avt_classify_sum_ms;
-	_vt.avt_sector_stats["retain_sum_ms"] = _vt.avt_retain_sum_ms;
-	_vt.avt_sector_stats["prime_sum_ms"] = _vt.avt_prime_sum_ms;
-	_vt.avt_sector_stats["upload_sum_ms"] = _vt.avt_upload_sum_ms;
-	_vt.avt_sector_stats["refill_sum_ms"] = _vt.avt_refill_sum_ms;
-	_vt.avt_sector_stats["finish_sum_ms"] = _vt.avt_finish_sum_ms;
+	_vt.avt_cost.pass_count++;
+	_vt.avt_sector_stats["passes"] = int64_t(_vt.avt_cost.pass_count);
+	_vt.avt_sector_stats["classify_sum_ms"] = _vt.avt_cost.classify_sum_ms;
+	_vt.avt_sector_stats["retain_sum_ms"] = _vt.avt_cost.retain_sum_ms;
+	_vt.avt_sector_stats["prime_sum_ms"] = _vt.avt_cost.prime_sum_ms;
+	_vt.avt_sector_stats["upload_sum_ms"] = _vt.avt_cost.upload_sum_ms;
+	_vt.avt_sector_stats["refill_sum_ms"] = _vt.avt_cost.refill_sum_ms;
+	_vt.avt_sector_stats["finish_sum_ms"] = _vt.avt_cost.finish_sum_ms;
 	return pass.produced;
 }
 
@@ -498,8 +498,8 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	_vt.avt_sector_stats["visible_late_pages"] = r_pass.sampled_late;
 	_vt.avt_sector_stats["visible_late_worst_ms"] = double(r_pass.late_worst_us) / 1000.0;
 	_vt.avt_sector_stats["demand_age_entries"] = int(_vt.avt_demand_age.size());
-	_vt.avt_late_pages = r_pass.sampled_late;
-	_vt.avt_late_worst_us = r_pass.late_worst_us;
+	_vt.avt_cost.late_pages = r_pass.sampled_late;
+	_vt.avt_cost.late_worst_us = r_pass.late_worst_us;
 	_vt.avt_missing_pages = r_pass.sampled_missing;
 	_vt.avt_pending_pages = r_pass.sampled_pending;
 	_vt.avt_sector_stats["sampled_pages"] = _vt.avt_plan.sampled;
@@ -570,20 +570,20 @@ void Terrain3D::_avt_finish_produce(Terrain3DAVTProducePass &r_pass) {
 	// number to move and `upload_ms` minus the pair is the fixed part of the stage.
 	_vt.avt_sector_stats["page_ms"] = double(r_pass.page_us) / 1000.;
 	_vt.avt_sector_stats["page_count"] = r_pass.pages;
-	_vt.avt_page_us_sum += r_pass.page_us;
-	_vt.avt_page_count_sum += r_pass.pages;
-	_vt.avt_request_sum_ms += double(r_pass.request_us) / 1000.;
-	_vt.avt_invalidate_sum_ms += double(r_pass.invalidate_us) / 1000.;
-	_vt.avt_payload_sum_ms += double(r_pass.payload_us) / 1000.;
-	_vt.avt_queue_sum_ms += double(r_pass.queue_us) / 1000.;
-	_vt.avt_sector_stats["page_sum_ms"] = double(_vt.avt_page_us_sum) / 1000.;
-	_vt.avt_sector_stats["page_sum_count"] = int64_t(_vt.avt_page_count_sum);
-	_vt.avt_sector_stats["request_sum_ms"] = _vt.avt_request_sum_ms;
-	_vt.avt_sector_stats["invalidate_sum_ms"] = _vt.avt_invalidate_sum_ms;
-	_vt.avt_sector_stats["payload_sum_ms"] = _vt.avt_payload_sum_ms;
-	_vt.avt_sector_stats["queue_sum_ms"] = _vt.avt_queue_sum_ms;
-	_vt.avt_sector_stats["queue_record_sum_ms"] = _vt.avt_queue_record_sum_ms;
-	_vt.avt_sector_stats["queue_bake_sum_ms"] = _vt.avt_queue_bake_sum_ms;
+	_vt.avt_cost.page_us_sum += r_pass.page_us;
+	_vt.avt_cost.page_count_sum += r_pass.pages;
+	_vt.avt_cost.request_sum_ms += double(r_pass.request_us) / 1000.;
+	_vt.avt_cost.invalidate_sum_ms += double(r_pass.invalidate_us) / 1000.;
+	_vt.avt_cost.payload_sum_ms += double(r_pass.payload_us) / 1000.;
+	_vt.avt_cost.queue_sum_ms += double(r_pass.queue_us) / 1000.;
+	_vt.avt_sector_stats["page_sum_ms"] = double(_vt.avt_cost.page_us_sum) / 1000.;
+	_vt.avt_sector_stats["page_sum_count"] = int64_t(_vt.avt_cost.page_count_sum);
+	_vt.avt_sector_stats["request_sum_ms"] = _vt.avt_cost.request_sum_ms;
+	_vt.avt_sector_stats["invalidate_sum_ms"] = _vt.avt_cost.invalidate_sum_ms;
+	_vt.avt_sector_stats["payload_sum_ms"] = _vt.avt_cost.payload_sum_ms;
+	_vt.avt_sector_stats["queue_sum_ms"] = _vt.avt_cost.queue_sum_ms;
+	_vt.avt_sector_stats["queue_record_sum_ms"] = _vt.avt_cost.queue_record_sum_ms;
+	_vt.avt_sector_stats["queue_bake_sum_ms"] = _vt.avt_cost.queue_bake_sum_ms;
 	// And the producer handoff split into the wait for its queue's mutex and the work done while
 	// holding it, so "the render thread is holding the queue" is a reading and not a hypothesis.
 	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {

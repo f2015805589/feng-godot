@@ -625,11 +625,10 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
 							auto neighbor = source.cells.find({location.x + x, location.y + y});
 							if (neighbor == source.cells.end()) { return Array(); }
 							const Cell &cell = neighbor->second;
-							Array hashes;
-							hashes.push_back(cell.controls.is_empty() ? 0 : Variant(cell.controls).hash());
-							hashes.push_back(cell.ids.is_empty() ? 0 : Variant(cell.ids).hash());
-							hashes.push_back(cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
-							return hashes;
+							return TerrainVTCell::source_hashes(
+									cell.controls.is_empty() ? 0 : Variant(cell.controls).hash(),
+									cell.ids.is_empty() ? 0 : Variant(cell.ids).hash(),
+									cell.heights.is_empty() ? 0 : Variant(cell.heights).hash());
 						});
 				cached_signature = _signatures.emplace(entry.first, computed).first;
 			}
@@ -651,7 +650,10 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
 			const Dictionary saved = header;
 			const int resolution = saved.get("resolution", 0), levels = saved.get("levels", 0);
 			const PackedInt64Array index = saved.get("index", PackedInt64Array());
-			if (int(saved.get("version", 0)) != TerrainVTCell::FORMAT_VERSION || uint32_t(int64_t(saved.get("signature", 0))) != hash || resolution < 1 || resolution > 8192 || levels < 1 || levels > 14 || index.size() != levels * 6) { result.missing.push_back(location); continue; }
+			// The version and signature test is the contract's own (terrain_vt_cell.h), so this reader
+			// and the baker's explicit load accept and refuse exactly the same files. The shape checks
+			// below are this reader's: only it reads the mip index.
+			if (!TerrainVTCell::header_is_current(saved, hash) || resolution < 1 || resolution > 8192 || levels < 1 || levels > 14 || index.size() != levels * 6) { result.missing.push_back(location); continue; }
 			const int mip = MIN(requested_mip, levels - 1), size = MAX(1, resolution >> mip);
 			const String names[] = {"albedo_height", "normal_roughness", "params"};
 			bool valid = true;

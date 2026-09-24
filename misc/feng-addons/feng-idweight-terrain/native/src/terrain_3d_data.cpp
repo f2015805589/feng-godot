@@ -314,7 +314,7 @@ uint16_t Terrain3DData::_sample_payload_world(const real_t p_world_x, const real
 		return 0;
 	}
 	const uint8_t *texel = payload.ptr() + (int64_t(y) * size + x) * 2;
-	return uint16_t(texel[0]) | (uint16_t(texel[1]) << 8);
+	return load_u16_le(texel);
 }
 
 Ref<Image> Terrain3DData::_get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const {

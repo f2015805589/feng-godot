@@ -243,7 +243,7 @@ Color Terrain3DData::get_pixel_descaled(const MapType p_map_type, const Vector2i
 }
 
 real_t Terrain3DData::get_height_texel_nearest(const Vector2 &p_world_xz) const {
-	const Vector2i vgrid(Math::floor(p_world_xz.x / _vertex_spacing), Math::floor(p_world_xz.y / _vertex_spacing));
+	const Vector2i vgrid = world_to_vgrid_xz(p_world_xz.x, p_world_xz.y, _vertex_spacing);
 	const Terrain3DRegion *region = get_region_ptr(V2I_DIVIDE_FLOOR(vgrid, _region_size));
 	if (!region || region->is_deleted()) {
 		return 0.f;

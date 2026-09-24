@@ -29,7 +29,7 @@
 # Read `docs/vt_delivery_assembly.md` section 6 for the layer and the view; the group ids are
 # Material=0/Height=1, the tiers Near=0/Far=1 and the delivery values are the native enum
 # values, Direct=0/AVT=1/Clipmap=2/SVT=3. The implementations are LOD=0/Atlas=1.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const NEAR := 0
 const FAR := 1
@@ -52,21 +52,12 @@ const CLIPMAP_PREVIEW_SCRIPT := "res://addons/feng-idweight-terrain/src/vt_clipm
 const AVT_PREVIEW_SCRIPT := "res://addons/feng-idweight-terrain/src/vt_avt_layout_preview.gd"
 const VT_EDITOR_SCRIPT := "res://addons/feng-idweight-terrain/src/vt_editor.gd"
 
-var terrain: Terrain3D
 var target: Node3D
-var camera: Camera3D
 var viewport: SubViewport
-var failed := false
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 func settings() -> Dictionary:

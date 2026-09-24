@@ -58,7 +58,6 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 	const int stored = p_page_size + 2 * p_border;
 	const uint8_t *source_ptr = source_bytes.is_empty() ? nullptr : source_bytes.ptr();
 	std::vector<int> columns(size_t(stored), 0);
-	auto floor_divide = [](int n, int d) { return n >= 0 ? n / d : -((-n + d - 1) / d); };
 
 	for (const Vector3i &request : p_requests) {
 		const int local_mip = request.z;
@@ -83,7 +82,7 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 		// GDExtension builtin-method calls with Variant marshalling, and at 264x264
 		// texels per page they were the entire cost of a demand pass.
 		for (int x = 0; x < stored; x++) {
-			columns[size_t(x)] = origin_x + floor_divide((x - p_border) * span, p_page_size);
+			columns[size_t(x)] = origin_x + int_divide_floor((x - p_border) * span, p_page_size);
 		}
 		if (source_ptr == nullptr) {
 			// `resize` already zero-filled, which is single material 0.
@@ -96,7 +95,7 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 			const real_t payload_texel = vertex_spacing / real_t(MAX(1, region->get_surface_density()));
 			for (int y = 0; y < stored; y++) {
 				// Floor negative fractional border positions into the adjacent texel.
-				const int region_y = origin_y + floor_divide((y - p_border) * span, p_page_size);
+				const int region_y = origin_y + int_divide_floor((y - p_border) * span, p_page_size);
 				const bool inside_y = region_y >= 0 && region_y < source_size;
 				const int64_t row = int64_t(region_y) * source_size;
 				uint8_t *out = page_ptr + int64_t(y) * stored * 2;
@@ -105,7 +104,7 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 					uint16_t value = 0;
 					if (inside_y && region_x >= 0 && region_x < source_size) {
 						const uint8_t *texel = source_ptr + (row + region_x) * 2;
-						value = uint16_t(texel[0]) | (uint16_t(texel[1]) << 8);
+						value = load_u16_le(texel);
 					} else {
 						// A border texel belongs to a neighbouring region, so sample it by
 						// world position rather than replicating this region's edge. The
@@ -272,7 +271,7 @@ uint32_t Terrain3DData::get_surface_texel_nearest(const Vector2 &p_world_xz) con
 	// The region first, on the vertex grid: the payload's grid belongs to the region that owns it
 	// (its image is `region_size * that region's density` texels an axis), so the density is not known
 	// until the region is.
-	const Vector2i vgrid(int(Math::floor(p_world_xz.x / spacing)), int(Math::floor(p_world_xz.y / spacing)));
+	const Vector2i vgrid = world_to_vgrid_xz(p_world_xz.x, p_world_xz.y, spacing);
 	const Terrain3DRegion *region = get_region_ptr(V2I_DIVIDE_FLOOR(vgrid, _region_size));
 	if (region == nullptr || region->is_deleted()) {
 		return 0u;
@@ -294,5 +293,5 @@ uint32_t Terrain3DData::get_surface_texel_nearest(const Vector2 &p_world_xz) con
 		return 0u;
 	}
 	const uint8_t *packed = bytes.ptr() + (int64_t(texel.y) * int64_t(size) + int64_t(texel.x)) * 2;
-	return uint32_t(packed[0]) | (uint32_t(packed[1]) << 8);
+	return load_u16_le(packed);
 }

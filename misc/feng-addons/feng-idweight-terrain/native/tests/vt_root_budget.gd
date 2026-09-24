@@ -3,17 +3,11 @@
 # The root pyramid is intentionally configured beyond the normal editor setting. The
 # regression is that root_mips=16 must remain bounded by the physical cache and by a
 # finite CPU scan, even when the detail distance is effectively the whole world.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func check_bounded(terrain: Terrain3D, label: String, max_usec: int) -> void:
 	var start := Time.get_ticks_usec()

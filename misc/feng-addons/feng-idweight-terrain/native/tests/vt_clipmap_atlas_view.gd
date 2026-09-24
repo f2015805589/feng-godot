@@ -11,7 +11,7 @@
 # the atlas's region" is a picture rather than a claim, and it asserts the properties the picture is
 # supposed to have: the layer's implementation payload carries the layout, one rect a slot, and nine
 # cells a unit.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const MATERIAL := 0
 const DIRECT := 0
@@ -21,19 +21,11 @@ const ATLAS := 1
 const UNITS := 4
 const VIEWPORT_SIZE := Vector2i(1920, 1080)
 
-var terrain: Terrain3D
-var camera: Camera3D
 var scene: Node3D
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # The material layer's entry from `get_clipmap_layout_preview()`, which is the payload the debug view
 # draws. It replaces `get_clipmap_atlas_layout()`; the atlas's own rect/cell table is `impl["layout"]`.

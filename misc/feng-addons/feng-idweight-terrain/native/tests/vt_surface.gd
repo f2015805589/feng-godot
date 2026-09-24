@@ -5,7 +5,7 @@
 # newly allocated by resampling the region's surface map. The pages are read back
 # from the GPU atlas and compared texel by texel, so this pins the crop origin, the
 # mip pyramid and the clamped border, not just "something got written".
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGES_PER_AXIS := 4
@@ -14,20 +14,12 @@ const BORDER := 2
 const STORED := PAGE + 2 * BORDER
 const INVALID := 65535
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 # Regions the pattern was written to; a border texel outside all of them is material 0.
 var pattern_locs: Array = []
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # Every texel of a region's surface map is distinguishable, so a page's crop origin
 # can be recovered from its content alone.

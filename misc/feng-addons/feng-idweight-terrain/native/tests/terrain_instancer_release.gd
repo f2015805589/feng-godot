@@ -13,14 +13,12 @@
 #
 # Both removal paths are driven, because they reach the instancer differently: `remove_region()` marks
 # the region deleted and then updates, while `unload_region()` drops it from memory and then updates.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REMOVED := Vector2i.ZERO
 const UNLOADED := Vector2i(1, 0)
 
-var terrain: Terrain3D
 var scene: Node3D
-var failed := false
 # One region's width in metres, read from the terrain rather than assumed: `add_transforms()` groups a
 # global batch by the region each transform lands in, and a batch placed over a region that is not
 # there adds nothing at all.
@@ -29,12 +27,6 @@ var region_span := 0.0
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 # The instancer queues its work and processes it on the RenderingServer's frame_pre_draw, so the MMIs

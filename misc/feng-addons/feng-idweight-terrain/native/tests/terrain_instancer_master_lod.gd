@@ -8,24 +8,16 @@
 #
 # The asset needs more than one LOD for that, which a generated mesh cannot express (it is one card), so
 # the fixture packs a scene whose meshes are named `*LOD?` - the convention `set_scene_file()` looks for.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REMOVED_AFTER := 3
 
-var terrain: Terrain3D
 var scene: Node3D
-var failed := false
 var region_span := 0.0
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 func _settle() -> void:

@@ -5,7 +5,7 @@
 ## the baker's normal transform, BC5/BC3N block encoder, page binding, shader decode,
 ## and PBR debug view.  The roughness view similarly proves that the parameter page's
 ## encoded alpha survives when either channel is compressed.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGE_SIZE := 32
@@ -23,22 +23,11 @@ const AVT_NORMAL_KEY := "surface_vt_normal_compression"
 const SVT_DIFFUSE_KEY := "surface_svt_diffuse_compression"
 const SVT_NORMAL_KEY := "surface_svt_normal_compression"
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
 
 func make_albedo(size: int) -> ImageTexture:
 	# A coloured gradient makes the independent diffuse codec observable as well as

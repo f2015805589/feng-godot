@@ -4,7 +4,7 @@
 # chain, physical page storage and the LRU/protected slot allocator. Everything is
 # checked against GPU readback, not just the CPU mirror, because the indirection and
 # the atlas are what the shader will actually sample.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const PAGE := 32
 const BORDER := 2
@@ -12,15 +12,9 @@ const STORED := PAGE + 2 * BORDER # 36
 const INDIRECTION := 64 # 7 mips: 64, 32, 16, 8, 4, 2, 1
 const INVALID := 65535
 
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # A page image in the atlas format (R16, the same format as the surface map).
 func make_page(value: int) -> Image:

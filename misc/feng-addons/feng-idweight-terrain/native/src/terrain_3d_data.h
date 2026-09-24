@@ -11,6 +11,14 @@
 
 class Terrain3D;
 
+// Descale and floor a world XZ pair to a vertex grid of `p_vertex_spacing`. The member below is
+// the node's own spacing; the two callers that hold only the pair - and, in the page producer, a
+// spacing that is not the node's - name this one rather than repeat the two floors.
+inline Vector2i world_to_vgrid_xz(const real_t p_world_x, const real_t p_world_z,
+		const real_t p_vertex_spacing) {
+	return Vector2i(Math::floor(p_world_x / p_vertex_spacing), Math::floor(p_world_z / p_vertex_spacing));
+}
+
 // How one region file load ended. Both load paths adopt a file the same way and differ only in
 // what a failure means to them: a directory skips a file it cannot read and stops on a size
 // mismatch, while a single-region load stops on either. See `_load_region_file()`.
@@ -470,8 +478,7 @@ inline Ref<Terrain3DRegion> Terrain3DData::get_regionp(const Vector3 &p_global_p
 
 // Descale and floor global position to vertex grid
 inline Vector2i Terrain3DData::world_to_vgrid(const Vector3 &p_global_position) const {
-	return Vector2i(Math::floor(p_global_position.x / _vertex_spacing),
-			Math::floor(p_global_position.z / _vertex_spacing));
+	return world_to_vgrid_xz(p_global_position.x, p_global_position.z, _vertex_spacing);
 }
 
 inline Color Terrain3DData::get_pixel(const MapType p_map_type, const Vector3 &p_global_position) const {
@@ -613,20 +620,11 @@ inline real_t Terrain3DData::get_roughness(const Vector3 &p_global_position) con
 }
 
 inline void Terrain3DData::update_master_height(const real_t p_height) {
-	if (p_height < _master_height_range.x) {
-		_master_height_range.x = p_height;
-	} else if (p_height > _master_height_range.y) {
-		_master_height_range.y = p_height;
-	}
+	merge_height_range(_master_height_range, p_height);
 }
 
 inline void Terrain3DData::update_master_heights(const Vector2 &p_low_high) {
-	if (p_low_high.x < _master_height_range.x) {
-		_master_height_range.x = p_low_high.x;
-	}
-	if (p_low_high.y > _master_height_range.y) {
-		_master_height_range.y = p_low_high.y;
-	}
+	merge_height_range(_master_height_range, p_low_high);
 }
 
 #endif // TERRAIN3D_DATA_CLASS_H

@@ -9,7 +9,7 @@
 #   3) resampling is block exact and never re-derives from the legacy control map
 #   4) the shader evaluates the idweight cell on the density grid, so the render shows
 #      the finer material where the array path can only show the block origin
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const DENSITY := 4
@@ -23,20 +23,12 @@ const STORED := PAGE + 2 * BORDER
 const MAT_RED := 0
 const MAT_GREEN := (1 << 11) | (1 << 6)
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
 var painter: Terrain3DEditor
 var brush: Image
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # Undo plumbing: the editor calls these on the plugin.
 func create_undo_action(_name: String) -> void:
@@ -53,12 +45,6 @@ func frame_image() -> Image:
 		await process_frame
 	await RenderingServer.frame_post_draw
 	return root.get_texture().get_image()
-
-func texture(size: int, color: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 # Red dominance rather than a pure-red test. A block origin is one dense texel wide
 # (0.25 m at density 4), so at the 1:1 mip a pixel lands on a texel edge more often

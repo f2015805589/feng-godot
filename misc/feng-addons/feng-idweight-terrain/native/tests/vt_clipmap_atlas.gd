@@ -21,7 +21,7 @@
 #  5. **no gap**: at every frame of a fill or a relabel a cell is either serving a block or waiting
 #     for one, and never neither, which is what the spare slot buys;
 #  6. **the one-time global block**: it is produced once and never again.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const MATERIAL := 0
 const HEIGHT := 1
@@ -37,18 +37,10 @@ const UNITS := 4
 const BASE_WORLD := 64.0
 const GLOBAL_TEXELS := 16
 
-var terrain: Terrain3D
-var camera: Camera3D
 var scene: Node3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func settings() -> Dictionary:
 	return terrain.get_vt_settings()

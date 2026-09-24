@@ -13,7 +13,7 @@
 #      resident),
 #   4. that an over-subscribed pool keeps the nearest pages and still settles instead of
 #      rewriting levels.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const REGION_COUNT := 10
@@ -31,19 +31,11 @@ const BAND_VALUES := [128.0, 256.0, 512.0, 1024.0]
 const PROBE_Z := [0, 64, 128, 192, 256, 384, 512, 576]
 const EXPECTED_LEVELS := [0, 1, 1, 2, 2, 2, 3, 3]
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func make_texture(color: Color) -> ImageTexture:
 	var image := Image.create(16, 16, false, Image.FORMAT_RGBA8)

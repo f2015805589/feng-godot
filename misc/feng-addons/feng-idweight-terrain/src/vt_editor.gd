@@ -23,12 +23,8 @@ const BAKE_STATUS_POLL_INTERVAL: float = 0.25
 # enum, which is also the item id the OptionButton stores. They are not deliveries: the matrix selects
 # `Clipmap` once and this chooses how that one layer stores its units.
 const CLIPMAP_IMPLEMENTATIONS: Array[String] = ["LOD", "Atlas"]
-# The matrix's own vocabulary - the methods, the bands and the four cell labels - lives with the rows
-# in vt_editor_delivery_rows.gd. The clipmap hint below names the same two channel groups, and
-# GDScript will not fold another script's constant into this `const`, so these two are the window's
-# copy of the same two facts.
-const DELIVERY_GROUPS: Array[String] = ["material", "height"]
-const DELIVERY_GROUP_LABELS: Dictionary = {"material": "Diffuse + normal", "height": "Height"}
+# The matrix's own vocabulary - the methods, the bands, the channel groups and the cell labels - lives
+# with the rows in vt_editor_delivery_rows.gd, and the hint below reads it from there.
 # The method these rows are about, by the native enum's value (`Clipmap`): the rows read the published
 # capability rather than keeping a list of their own.
 const DELIVERY_CLIPMAP: int = 2
@@ -881,8 +877,8 @@ func _clipmap_hint_text(p_settings: Dictionary) -> String:
 	var levels := int(p_settings.get("clipmap_levels_setting", 0))
 	var base := float(p_settings.get("clipmap_base_world", 0.0))
 	var size := int(p_settings.get("clipmap_size", 0))
-	var finest := (float(size) / base) if base > 0.0 else 0.0
-	var coarsest := finest / pow(2.0, float(maxi(0, levels - 1)))
+	var finest := TerrainVTEditorPageRows.shape_finest_density(p_settings)
+	var coarsest := TerrainVTEditorPageRows.shape_coarsest_density(p_settings)
 	# A base extent below a metre is the shipped shape, so it is written with the precision that keeps it
 	# readable rather than rounded to "0.2 m"; a coarse shape keeps the one decimal.
 	var base_text := ("%.2f" % base) if base < 10.0 else ("%.1f" % base)
@@ -911,11 +907,11 @@ func _clipmap_hint_text(p_settings: Dictionary) -> String:
 		text += "\nLast update produced %d channel texels." % int(p_settings.get("clipmap_produced_texels", 0))
 		return text
 	var layers: Dictionary = p_settings.get("clipmap", {})
-	for group in DELIVERY_GROUPS:
+	for group in TerrainVTEditorDeliveryRows.DELIVERY_GROUPS:
 		var entry: Dictionary = layers.get(group, {})
 		if typeof(entry) != TYPE_DICTIONARY or entry.is_empty():
 			continue
-		var label: String = DELIVERY_GROUP_LABELS[group]
+		var label: String = TerrainVTEditorDeliveryRows.DELIVERY_GROUP_LABELS[group]
 		if bool(entry.get("configured", false)):
 			var valid := 0
 			var units := 0
@@ -981,28 +977,10 @@ func _refresh_bake_status(p_settings: Dictionary = {}) -> void:
 		return
 	if p_settings.is_empty():
 		p_settings = _vt_settings()
-	var auto_enabled := bool(p_settings.get("auto_bake", _get_svt_auto_bake()))
-	var auto_regions := int(p_settings.get("auto_pending_regions", 0))
-	var incremental := bool(p_settings.get("bake_incremental", false))
-	if bool(p_settings.get("bake_failed", false)):
-		var error_text := str(p_settings.get("bake_error", "unknown error"))
-		var failed_label := "Automatic incremental SVT bake failed" if incremental else "Manual full SVT bake failed"
-		bake_status.text = "%s: %s" % [failed_label, error_text]
-		return
-	var total := int(p_settings.get("bake_total", 0))
-	var done := int(p_settings.get("bake_done", 0))
-	var pending := int(p_settings.get("bake_pending", 0))
-	if pending > 0 or total > 0 or done > 0:
-		var mode := "Automatic incremental SVT bake" if incremental else "Manual full SVT bake"
-		var state := "complete" if total > 0 and done >= total and pending == 0 else "progress"
-		var queued_regions := " · %d changed regions queued" % auto_regions if auto_enabled and incremental and auto_regions > 0 else ""
-		bake_status.text = "%s %s: %d/%d pages, %d pending%s" % [mode, state, done, total, pending, queued_regions]
-	elif auto_enabled and auto_regions > 0:
-		bake_status.text = "Auto Bake: %d changed region(s) queued; updates merge after 500 ms without edits." % auto_regions
-	elif auto_enabled:
-		bake_status.text = "Auto Bake on · changed SVT cells rebake incrementally 500 ms after editing stops."
-	else:
-		bake_status.text = "Auto Bake off · use Bake All SVT Cells for a full persisted bake."
+	# The sentence is the bridge's (vt_terrain_bridge.gd), which the node inspector's status label
+	# reads too: one reading of the report, so the two surfaces cannot describe the same state
+	# differently.
+	bake_status.text = TerrainVTBridge.svt_bake_status(p_settings, _get_svt_auto_bake())
 
 
 func _on_auto_capacity_toggled(p_enabled: bool) -> void:

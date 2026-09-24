@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -108,6 +109,36 @@ inline int log2_power_of_two(int value) {
 		result++;
 	}
 	return result;
+}
+
+// The indirection mip chain's shape. Level m is `p_size >> m` texels per axis, never below one, and
+// the chain's levels are addressed one after another in a table whose texels are four bytes wide.
+// It is one definition because three places build or read the same table - the CPU page table, the
+// cleared table the device is handed before the first commit, and the level-size accessor - and a
+// reader that disagreed with the builder would address the wrong level.
+inline int indirection_level_size(const int p_size, const int p_mip) {
+	const int size = p_mip <= 0 ? p_size : p_size >> p_mip;
+	return std::max(1, size);
+}
+
+// The texel count of a chain of `p_levels` levels, which is the size of the table.
+inline int64_t indirection_total_texels(const int p_size, const int p_levels) {
+	int64_t texels = 0;
+	for (int mip = 0; mip < p_levels; ++mip) {
+		const int64_t level = indirection_level_size(p_size, mip);
+		texels += level * level;
+	}
+	return texels;
+}
+
+// The table a page table starts as: every texel names no page. The invalid value is a slot index
+// written as a float bit pattern - the sampler reads the table as floats - so it is broadcast
+// word by word rather than produced by arithmetic.
+inline void fill_indirection_cleared(uint8_t *p_bytes, const int64_t p_texels) {
+	const float word = float(INVALID_PHYSICAL_PAGE_SLOT);
+	for (int64_t i = 0; i < p_texels; ++i) {
+		std::memcpy(p_bytes + i * 4, &word, 4);
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

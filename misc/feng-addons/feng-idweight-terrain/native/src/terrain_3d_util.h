@@ -150,6 +150,13 @@ inline T int_divide_floor(const T numer, const T denom) {
 	return result;
 }
 
+// One 16-bit texel of a packed payload, as it is stored in memory and on disk: two bytes,
+// little-endian. The byte order is the file format's, so it is read here once rather than at each
+// of the places that unpack a payload.
+inline uint16_t load_u16_le(const uint8_t *p_bytes) {
+	return uint16_t(p_bytes[0]) | (uint16_t(p_bytes[1]) << 8);
+}
+
 // Returns the bilinearly interpolated value derived from parameters:
 // * 4 values to be interpolated
 // * Positioned at the 4 corners of the p_pos00 - p_pos11 rectangle

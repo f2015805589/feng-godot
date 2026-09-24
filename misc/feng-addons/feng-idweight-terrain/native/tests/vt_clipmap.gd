@@ -36,7 +36,7 @@
 # Read `docs/vt_delivery_assembly.md` section 6 for the design; the group index is Material=0/Height=1
 # and the delivery values are Direct=0/AVT=1/Clipmap=2/SVT=3, i.e. the native `TerrainVT` enum
 # values, which are also the property values.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const MATERIAL := 0
 const HEIGHT := 1
@@ -53,20 +53,11 @@ const BASE_WORLD := 16.0
 const TEXELS := SIZE * SIZE
 const LAYER_BYTES := TEXELS * 4
 
-var terrain: Terrain3D
 var target: Node3D
-var camera: Camera3D
-var failed := false
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 # ---- readings -----------------------------------------------------------------------------------

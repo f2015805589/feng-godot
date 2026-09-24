@@ -194,6 +194,14 @@ void Terrain3D::_flush_source_wakes_unless_ticking() {
 	_flush_source_wakes();
 }
 
+// The entry point the surface-views guard calls (terrain_3d_surface_views_internal.h). It exists so
+// that guard - and the header it lives in - needs the node *declared* rather than defined.
+void flush_source_wakes_unless_ticking(Terrain3D *p_terrain) {
+	if (p_terrain != nullptr) {
+		p_terrain->_flush_source_wakes_unless_ticking();
+	}
+}
+
 void Terrain3D::_invalidate_vt_slot(int p_slot) {
 	// The slot's content is gone, so whatever it holds next is an arrival. The fade has to be
 	// told here and not only by the demand pass's readiness check: a page dropped and produced
@@ -485,7 +493,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	// two are the whole per-page publish cost a moving view multiplies, and they have different
 	// fixes, so they are published apart. See `_avt_finish_produce()`.
 	const uint64_t record_done = Time::get_singleton()->get_ticks_usec();
-	_vt.avt_queue_record_sum_ms += double(record_done - queue_started) / 1000.0;
+	_vt.avt_cost.queue_record_sum_ms += double(record_done - queue_started) / 1000.0;
 	if (p_svt) {
 		// The far field has three sources, in this order of preference:
 		//   1. a resident baked cell (this store) - a GPU copy, no CPU work and no file;
@@ -528,7 +536,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (p_prepared) {
 		producer->queue_page(p_slot, p_prepared->ids, p_prepared->height, p_rect, 1.f, p_prepared->grid,
 				p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
-		_vt.avt_queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
+		_vt.avt_cost.queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
 		return;
 	}
 	Ref<Image> ids = p_payload;
@@ -537,7 +545,7 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	if (height.is_null()) { height = _data->make_vt_height_page(p_rect, _vt.vt_page_size, _vt.vt_page_border); }
 	producer->queue_page(p_slot, ids, height, p_rect, 1.f, source_grid,
 			p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT);
-	_vt.avt_queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
+	_vt.avt_cost.queue_bake_sum_ms += double(Time::get_singleton()->get_ticks_usec() - record_done) / 1000.0;
 }
 
 void Terrain3D::_invalidate_vt_region(const Vector2i &p_region) {

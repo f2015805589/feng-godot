@@ -4,7 +4,7 @@
 # visible 1x1 region even when the clipmap target is fixed at the terrain origin;
 # SVT must request the nearest page visible to the camera, rather than the first
 # region in storage order or the first world row.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const REGION_COUNT := 13
@@ -14,19 +14,11 @@ const TOP_POSITION := Vector3(32.0, 40.0, 32.0)
 const FAR_LOOK_AT := Vector3(32.0, 0.0, 400.0)
 const AWAY_LOOK_AT := Vector3(32.0, 0.0, -400.0)
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func make_texture(color: Color) -> ImageTexture:
 	var image := Image.create(16, 16, false, Image.FORMAT_RGBA8)

@@ -65,24 +65,22 @@ uint32_t Terrain3D::_svt_cell_signature(const Vector2i &p_cell) const {
 				if (region.is_null() || region->is_deleted()) {
 					return Array();
 				}
-				Array hashes;
-				hashes.push_back(region->get_control_map().is_valid() ? Variant(region->get_control_map()->get_data()).hash() : 0);
-				hashes.push_back(region->get_surface_map().is_valid() ? Variant(region->get_surface_map()->get_data()).hash() : 0);
-				hashes.push_back(region->get_height_map().is_valid() ? Variant(region->get_height_map()->get_data()).hash() : 0);
-				return hashes;
+				return TerrainVTCell::source_hashes(
+						region->get_control_map().is_valid() ? Variant(region->get_control_map()->get_data()).hash() : 0,
+						region->get_surface_map().is_valid() ? Variant(region->get_surface_map()->get_data()).hash() : 0,
+						region->get_height_map().is_valid() ? Variant(region->get_height_map()->get_data()).hash() : 0);
 			});
 }
 
 Dictionary Terrain3D::_load_svt_cell(const Vector2i &p_cell) {
 	// Explicit/incremental bake validation only. Runtime reads use the worker.
-	String path = _svt_page_path(p_cell);
+	const String path = _svt_page_path(p_cell);
 	if (path.is_empty() || !FileAccess::file_exists(path)) { return Dictionary(); }
 	Ref<FileAccess> file = FileAccess::open(path, FileAccess::READ);
-	Variant value = file.is_valid() ? file->get_var(false) : Variant();
+	const Variant value = file.is_valid() ? file->get_var(false) : Variant();
 	if (value.get_type() != Variant::DICTIONARY) { return Dictionary(); }
-	Dictionary saved = value;
-	if (int(saved.get("version", 0)) != TerrainVTCell::FORMAT_VERSION || uint32_t(int64_t(saved.get("signature", 0))) != _svt_cell_signature(p_cell)) { return Dictionary(); }
-	return saved;
+	const Dictionary saved = value;
+	return TerrainVTCell::header_is_current(saved, _svt_cell_signature(p_cell)) ? saved : Dictionary();
 }
 
 Array Terrain3D::get_svt_baked_pages() {

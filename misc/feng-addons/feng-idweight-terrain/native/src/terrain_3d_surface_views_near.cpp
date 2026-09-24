@@ -164,14 +164,11 @@ int Terrain3D::_surface_vt_mip_for_page(const Vector2i &p_region_loc, const int 
 		// rule, so it is honoured rather than treated as a failure.
 		return mip;
 	}
-	// Distance fallback. A mip 0 page covers region_size / pages_per_axis metres, and
-	// each doubling of that threshold steps one mip.
-	int mip = 0;
-	const real_t threshold = MAX(1.f, p_page_world_size * 2.f);
-	while (mip < p_max_local_mip && p_distance > threshold * real_t(1 << mip)) {
-		mip++;
-	}
-	return mip;
+	// Distance fallback: the shared rule (terrain_vt.h), which is also what the far field and the
+	// shader's mirror evaluate - a page requested at one level and sampled at another is the one
+	// thing the rule's single definition exists to prevent.
+	return TerrainVT::select_mip_rule(float(p_page_world_size), nullptr, 0).mip_for_distance(
+			float(p_distance), p_max_local_mip);
 }
 
 // Both views are bound to the material by RID, so a view that was cleared by hand (the
@@ -215,7 +212,7 @@ int Terrain3D::update_surface_vt(int p_max_pages) {
 		// attribution at all.
 		const double wrapper_ms = double(Time::get_singleton()->get_ticks_usec() - entered) / 1000.0;
 		_vt.avt_sector_stats["wrapper_ms"] = wrapper_ms;
-		_vt.avt_wrapper_sum_ms += wrapper_ms;
+		_vt.avt_cost.wrapper_sum_ms += wrapper_ms;
 		return _update_sector_avt(p_max_pages);
 	}
 	if (!_vt.surface_vt || !_data) {

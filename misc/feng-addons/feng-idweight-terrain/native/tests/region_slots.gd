@@ -10,7 +10,7 @@
 #  2) The four Texture2DArrays are not reallocated when the resident set changes.
 #     get_map_stats() counts GPU array allocations vs. single layer uploads, so a
 #     swap must show zero creates.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const GRID := 2 # regions (0,0)..(1,1); the swap adds (2,0)
@@ -20,23 +20,15 @@ const GRID := 2 # regions (0,0)..(1,1); the swap adds (2,0)
 const COLORS := [Color(1, 0, 0), Color(0, 1, 0), Color(0, 0, 1), Color(1, 1, 0)]
 const LABELS := ["r", "g", "b", "rg"]
 
-var terrain: Terrain3D
 var painter: Terrain3DEditor
-var camera: Camera3D
 var scene: Node3D
 var brush: Image
 var undo_action: Callable
 var redo_action: Callable
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func create_undo_action(_name: String) -> void:
 	pass
@@ -53,30 +45,11 @@ func frame_image() -> Image:
 	await RenderingServer.frame_post_draw
 	return root.get_texture().get_image()
 
-func texture(size: int, color: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
-
 func region_center(loc: Vector2i) -> Vector3:
 	return Vector3(loc.x * REGION_SIZE + REGION_SIZE * 0.5, 0.0, loc.y * REGION_SIZE + REGION_SIZE * 0.5)
 
 # Which channels are lit relative to the brightest one, so the directional light's
 # overall brightness does not matter.
-func classify(color: Color) -> String:
-	var peak := maxf(color.r, maxf(color.g, color.b))
-	if peak <= 0.001:
-		return "black"
-	var result := ""
-	if color.r / peak > 0.4:
-		result += "r"
-	if color.g / peak > 0.4:
-		result += "g"
-	if color.b / peak > 0.4:
-		result += "b"
-	return result
-
 func sample(image: Image, loc: Vector2i) -> Color:
 	var screen := camera.unproject_position(region_center(loc))
 	return image.get_pixel(clampi(int(screen.x), 0, image.get_width() - 1), clampi(int(screen.y), 0, image.get_height() - 1))

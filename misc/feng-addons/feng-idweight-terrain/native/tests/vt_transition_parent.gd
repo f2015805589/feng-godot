@@ -22,11 +22,6 @@ var fade_texture: ImageTexture
 func _initialize() -> void:
 	call_deferred("run")
 
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
 func make_layer(color: Color) -> Image:
 	var stored := PAGE_SIZE + 2 * PAGE_BORDER
 	var image := Image.create(stored, stored, false, Image.FORMAT_RGBAF)

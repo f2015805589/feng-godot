@@ -60,6 +60,29 @@ inline uint32_t signature(const int64_t p_materials, const real_t p_density,
 	return uint32_t(signature.hash());
 }
 
+// The three hashes one cell contributes to a signature, in the order the hash is taken in: its
+// control map, its surface map and its height map. The two sides read them from different
+// structures - live regions and an immutable snapshot - so the *order* is named here rather than
+// spelled out at each side, where a reordering would silently make the two hash different arrays
+// and every bake look stale.
+inline Array source_hashes(const int64_t p_control, const int64_t p_surface, const int64_t p_height) {
+	Array hashes;
+	hashes.push_back(p_control);
+	hashes.push_back(p_surface);
+	hashes.push_back(p_height);
+	return hashes;
+}
+
+// The header test both sides of a bake must apply. The baker's explicit load (main thread) and the
+// worker's runtime read have to accept and refuse the same files: a version or signature test that
+// lived in each of them would let one side start accepting files the other still refuses, and the
+// cells it accepted would read as permanently missing. `p_signature` is the neighbor hash the
+// caller computed with `signature()` above.
+inline bool header_is_current(const Dictionary &p_header, const uint32_t p_signature) {
+	return int(p_header.get("version", 0)) == FORMAT_VERSION &&
+			uint32_t(int64_t(p_header.get("signature", 0))) == p_signature;
+}
+
 } // namespace TerrainVTCell
 
 #endif // TERRAIN_VT_CELL_H

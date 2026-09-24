@@ -23,6 +23,19 @@ const MAX_ROWS: int = 512
 const CLIPMAP: int = 2
 
 
+# Unit l covers `base * 2^l` metres and serves `size / (base * 2^l)` texels a metre, so the shape's
+# density ladder has exactly two endpoints and both follow from its three settings. The shape row here
+# and the window's clipmap hint both print them; the arithmetic used to be spelled out in each.
+static func shape_finest_density(p_settings: Dictionary) -> float:
+	var base := float(p_settings.get("clipmap_base_world", 0.0))
+	return (float(int(p_settings.get("clipmap_size", 0))) / base) if base > 0.0 else 0.0
+
+
+static func shape_coarsest_density(p_settings: Dictionary) -> float:
+	var units := maxi(0, int(p_settings.get("clipmap_levels_setting", 0)) - 1)
+	return shape_finest_density(p_settings) / pow(2.0, float(units))
+
+
 # One read of the live terrain for one details refresh. The window gathers it so
 # that filling the tree never reaches back into the scene midway, and so every
 # builder below takes data instead of a terrain.
@@ -168,11 +181,11 @@ static func add_clipmap_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot
 	var shape_size := int(settings.get("clipmap_size", 0))
 	var shape_base := float(settings.get("clipmap_base_world", 0.0))
 	var shape_units := int(settings.get("clipmap_levels_setting", 0))
-	var shape_finest := (float(shape_size) / shape_base) if shape_base > 0.0 else 0.0
+	var shape_finest := shape_finest_density(settings)
 	add_row(p_tree, p_root, "Shape",
 			"%d texels · %d units" % [shape_size, shape_units],
 			"%.4f m base · %.0f -> %.3f texels/m" % [shape_base, shape_finest,
-					shape_finest / pow(2.0, float(maxi(0, shape_units - 1)))],
+					shape_coarsest_density(settings)],
 			"unit l covers base * 2^l metres and serves size / (base * 2^l) texels a metre, so the shape's two endpoints are the numbers the density is read against")
 	add_row(p_tree, p_root, "Production", "%d texels last update" % int(settings.get("clipmap_produced_texels", 0)),
 			"%d a tick" % int(settings.get("clipmap_budget_texels", 0)),

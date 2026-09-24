@@ -16,7 +16,7 @@
 # toolbar can produce, asserts the visible effect of each one, and pins the
 # resulting region maps with a digest so a refactor of _operate_map() cannot
 # quietly drop a branch or change a write.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAINT_Y := 32.0
@@ -86,20 +86,13 @@ var expected := {
 	"texture_replace_dense": "e72c6b35c7ea8a05",
 }
 
-var terrain: Terrain3D
 var painter: Terrain3DEditor
 var scene: Node3D
 var brush: Image
-var failed := false
 var output_dir := "user://"
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 # Stand-ins for Terrain3DEditorPlugin's undo interface.
 func create_undo_action(_name: String) -> void:

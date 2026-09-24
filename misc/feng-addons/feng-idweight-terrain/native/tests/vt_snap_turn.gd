@@ -1,20 +1,12 @@
-extends SceneTree
+extends "res://vt_scene_base.gd"
 ## A snap must discard the old angular lead and bypass the normal plan debounce.
 ## Small turns still use the interval so the fix does not turn ordinary motion into
 ## a full re-plan every frame.
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	_run.call_deferred()
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func _tick() -> void:
 	await process_frame

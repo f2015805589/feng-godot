@@ -39,7 +39,7 @@
 #
 # Each measurement builds its own scene. Dropping a page reshapes the pool, so a second
 # measurement in the same scene does not start from the state the first one did.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 # Stored surface payload texels per metre.
@@ -70,18 +70,10 @@ const WARMUP := 240
 # Ticks an arrival is observed for: the ~24 of a re-production plus the ramp.
 const OBSERVE := 80
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 func tick() -> void:
 	# The engine's whole VT section, not one demand pass: the page-arrival fade is a phase of the
@@ -92,9 +84,6 @@ func tick() -> void:
 	require(int(fade_settings.get("vt_page_fade_held_slots", 0)) == 0,
 			"ready material pages must start their fade without a second publication queue")
 	await RenderingServer.frame_post_draw
-
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
 
 func make_pattern(size: int, a: Color, b: Color) -> ImageTexture:
 	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)

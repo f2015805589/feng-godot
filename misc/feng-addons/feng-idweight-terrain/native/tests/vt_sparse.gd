@@ -10,7 +10,7 @@
 #      is what a bilinear tap at a page seam needs
 #   3) the mip chain is world-space: a distant page is published at a coarser level
 #      while a near one stays at mip 0
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 64
 const PAGE_WORLD := 64.0
@@ -19,23 +19,12 @@ const BORDER := 4
 const STORED := PAGE + 2 * BORDER
 const INVALID := 65535
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 
 func _initialize() -> void:
 	call_deferred("run")
 
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
 # single(id) = (id << 11) | (id << 6), the packed word for one material with no overlay.
-func material_word(id: int) -> int:
-	return (id << 11) | (id << 6)
-
 func fill_region(loc: Vector2i, material_id: int) -> void:
 	var bytes := PackedByteArray()
 	bytes.resize(REGION_SIZE * REGION_SIZE * 2)
@@ -95,12 +84,6 @@ func frame_image() -> Image:
 		await process_frame
 	await RenderingServer.frame_post_draw
 	return root.get_texture().get_image()
-
-func texture(size: int, color: Color) -> ImageTexture:
-	var image := Image.create(size, size, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func run() -> void:
 	scene = Node3D.new()

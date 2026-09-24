@@ -847,46 +847,10 @@ struct Terrain3DVTState {
 		}
 	};
 	Stats avt_sector_stats;
-	// Stage sums for the same pass, so the mean of a stage can be read beside the live value of
-	// the last one. The dictionary only ever holds the pass that just ran, and a pass that
-	// installed a plan costs several times one that reused it, so a single reading of it says
-	// nothing about where a sweep's average went: `report()` prints the cumulative sums and the
-	// pass count, and the mean of a sweep is their difference across it.
-	double avt_classify_sum_ms = 0.0;
-	double avt_retain_sum_ms = 0.0;
-	double avt_prime_sum_ms = 0.0;
-	double avt_upload_sum_ms = 0.0;
-	double avt_refill_sum_ms = 0.0;
-	double avt_finish_sum_ms = 0.0;
-	uint64_t avt_pass_count = 0;
-	// The same accounting for the tick around the pass, so the difference between the two is what
-	// a tick that took the idle shortcut costs - the near field's own report only counts the
-	// passes that did work, and a settled turn is mostly not those. `reuse_ticks + chain_ticks` is
-	// the number of ticks that reached the production pass, so subtracting `avt_pass_count` leaves
-	// the ticks it answered as already settled.
-	uint64_t avt_sector_ticks = 0;
-	uint64_t avt_reuse_ticks = 0;
-	uint64_t avt_chain_ticks = 0;
-	// Ticks the production pass was not called at all because the pool was waiting for the
-	// producer to publish a larger capacity. They are not idle ticks and they are not a pass, so
-	// they need their own count or they read as one of the two.
-	uint64_t avt_capacity_skip_ticks = 0;
-	double avt_key_sum_ms = 0.0;
-	double avt_plan_state_sum_ms = 0.0;
-	double avt_install_sum_ms = 0.0;
-	double avt_chain_sum_ms = 0.0;
-	double avt_produce_sum_ms = 0.0;
-	// The whole sector update, from its entry to its return, summed on the same clock the tick
-	// uses for the phase it reports. The stage sums above describe what the function did; this is
-	// what the phase measured, so a difference between them is time the phase spent outside the
-	// function rather than inside it.
-	double avt_update_sum_ms = 0.0;
-	double avt_wrapper_sum_ms = 0.0;
-	// The near field's stage timings as of the pass that produced `vt_avt_peak_ms`, and when that
-	// was. The live dictionary is overwritten by every pass, so without this the stages of a peak
-	// could not be read at all - and the peak is by definition not the last pass.
-	Dictionary avt_peak_stats;
-	uint64_t avt_peak_stamp_us = 0;
+	// The session sums, the tick counters and the peak reading are one owner - `Terrain3DAVTCost
+	// avt_cost`, in the cost section below (part 4) - so what a pass *did* is not mixed into what the
+	// near field *is*. This dictionary is the live reading of the pass that just ran; `avt_cost` is
+	// what makes a mean over a sweep readable.
 	uint64_t avt_plan_epoch = 0;
 	// How many frames apart the plan is re-derived, and the frame the last chain ran on. The plan
 	// is re-derived once per interval rather than once per frame; a key that changed inside the
@@ -894,9 +858,6 @@ struct Terrain3DVTState {
 	// installed plan was planned for, so the tick that follows still sees the change.
 	uint64_t avt_plan_refresh_frames = 1;
 	uint64_t avt_last_chain_frame = UINT64_MAX;
-	// Ticks a changed plan key was held back for the refresh interval. Diagnostics: what the
-	// interval saved, and what it means for how stale the plan a moving view produces from is.
-	uint64_t avt_plan_refresh_skips = 0;
 	std::shared_ptr<Terrain3DAVTRefinement> avt_refinement;
 	// The standing plan: the key it was planned for, the page selection, its sampled length and the
 	// retention flag that says whether the source queue already holds it.
@@ -927,10 +888,6 @@ struct Terrain3DVTState {
 	// production pass, the producer's frame budget, the source queue window and the encode ring all
 	// derive from - so a change applies on the next tick. See `Terrain3DAVTPageBudget`.
 	Terrain3DAVTPageBudget avt_page_budget;
-	// The largest batch any production pass of this session handed to the pool. The acceptance probe
-	// reads it against the live tier (`avt_batch_max`); it is a MAX and never reset, so one oversized
-	// batch shows up whenever it happened.
-	int avt_batch_peak = 0;
 	// Whether the last motion sample was a discontinuity: a step over `MOTION_MAX_TURN_STEP` or a
 	// displacement past `avt_motion_spatial_discontinuity_distance()`. The motion sampler raises it
 	// on the tick it sees one and the budget governor consumes it on the same tick, so it is a tick's
@@ -955,26 +912,6 @@ struct Terrain3DVTState {
 	// being rendered shows as a miss. Entries are dropped as pages become ready, so this
 	// only ever holds the pages currently in flight.
 	std::unordered_map<uint64_t, uint64_t> avt_demand_age;
-	int avt_late_pages = 0;
-	int avt_late_worst_us = 0;
-	// Session totals of the page publish: wall time inside `_avt_produce_page()` and the pages it
-	// published. Their ratio is the per-page cost the motion rate multiplies, and it stays as a
-	// diagnostic because a view moving continuously is the case that number decides.
-	uint64_t avt_page_us_sum = 0;
-	uint64_t avt_page_count_sum = 0;
-	// The same publish split into the four things it spends the per-page time on, as session sums.
-	// The live readings describe the last pass only, and a moving view's cost is a mean over
-	// thousands of pages, so the parts have to be summed to be attributable at all.
-	double avt_request_sum_ms = 0.0;
-	double avt_invalidate_sum_ms = 0.0;
-	double avt_payload_sum_ms = 0.0;
-	double avt_queue_sum_ms = 0.0;
-	// The queue call split further, because `avt_queue_sum_ms` is the whole per-page publish cost
-	// and it is not one thing: `avt_queue_record_sum_ms` is the page record - a String-keyed
-	// Dictionary with eight entries, built and inserted on every produced page - and
-	// `avt_queue_bake_sum_ms` is the producer handoff itself. They have different fixes.
-	double avt_queue_record_sum_ms = 0.0;
-	double avt_queue_bake_sum_ms = 0.0;
 	// Scratch the production pass fills and the source pipeline consumes: the requests it retains
 	// and the requests it primes. Both are built from the pass's missing list - up to the whole
 	// plan - and were local vectors, so a moving view allocated and freed a thirty-kilobyte vector
@@ -1158,6 +1095,81 @@ struct Terrain3DVTState {
 	// ---- 4. cost and diagnostics: what this layer cost and why, for both views. The live phase
 	// values describe the tick that just ran and the `*_sum_ms` fields are cumulative since
 	// startup, so a mean over a sweep is their difference across it. ----
+	// The near field's cost: every sum, counter and peak reading its report prints, in one owner.
+	// Nothing here is model state - no algorithm branches on one of these - so a reader can tell
+	// what a pass *did* (this) from what the near field *is* (the members around it). The live
+	// per-pass readings are the `avt_sector_stats` dictionary above; these are the session sums
+	// that make a mean over a sweep readable.
+	struct Terrain3DAVTCost {
+		// Stage sums for the same pass, so the mean of a stage can be read beside the live value of
+		// the last one. The dictionary only ever holds the pass that just ran, and a pass that
+		// installed a plan costs several times one that reused it, so a single reading of it says
+		// nothing about where a sweep's average went: `report()` prints the cumulative sums and the
+		// pass count, and the mean of a sweep is their difference across it.
+		double classify_sum_ms = 0.0;
+		double retain_sum_ms = 0.0;
+		double prime_sum_ms = 0.0;
+		double upload_sum_ms = 0.0;
+		double refill_sum_ms = 0.0;
+		double finish_sum_ms = 0.0;
+		uint64_t pass_count = 0;
+		// The same accounting for the tick around the pass, so the difference between the two is what
+		// a tick that took the idle shortcut costs - the near field's own report only counts the
+		// passes that did work, and a settled turn is mostly not those. `reuse_ticks + chain_ticks` is
+		// the number of ticks that reached the production pass, so subtracting `pass_count` leaves
+		// the ticks it answered as already settled.
+		uint64_t sector_ticks = 0;
+		uint64_t reuse_ticks = 0;
+		uint64_t chain_ticks = 0;
+		// Ticks the production pass was not called at all because the pool was waiting for the
+		// producer to publish a larger capacity. They are not idle ticks and they are not a pass, so
+		// they need their own count or they read as one of the two.
+		uint64_t capacity_skip_ticks = 0;
+		double key_sum_ms = 0.0;
+		double plan_state_sum_ms = 0.0;
+		double install_sum_ms = 0.0;
+		double chain_sum_ms = 0.0;
+		double produce_sum_ms = 0.0;
+		// The whole sector update, from its entry to its return, summed on the same clock the tick
+		// uses for the phase it reports. The stage sums above describe what the function did; this is
+		// what the phase measured, so a difference between them is time the phase spent outside the
+		// function rather than inside it.
+		double update_sum_ms = 0.0;
+		double wrapper_sum_ms = 0.0;
+		// The near field's stage timings as of the pass that produced `vt_avt_peak_ms`, and when that
+		// was. The live dictionary is overwritten by every pass, so without this the stages of a peak
+		// could not be read at all - and the peak is by definition not the last pass.
+		Dictionary peak_stats;
+		uint64_t peak_stamp_us = 0;
+		// Ticks a changed plan key was held back for the refresh interval. Diagnostics: what the
+		// interval saved, and what it means for how stale the plan a moving view produces from is.
+		uint64_t plan_refresh_skips = 0;
+		// The largest batch any production pass of this session handed to the pool. The acceptance probe
+		// reads it against the live tier (`avt_batch_max`); it is a MAX and never reset, so one oversized
+		// batch shows up whenever it happened.
+		int batch_peak = 0;
+		int late_pages = 0;
+		int late_worst_us = 0;
+		// Session totals of the page publish: wall time inside `_avt_produce_page()` and the pages it
+		// published. Their ratio is the per-page cost the motion rate multiplies, and it stays as a
+		// diagnostic because a view moving continuously is the case that number decides.
+		uint64_t page_us_sum = 0;
+		uint64_t page_count_sum = 0;
+		// The same publish split into the four things it spends the per-page time on, as session sums.
+		// The live readings describe the last pass only, and a moving view's cost is a mean over
+		// thousands of pages, so the parts have to be summed to be attributable at all.
+		double request_sum_ms = 0.0;
+		double invalidate_sum_ms = 0.0;
+		double payload_sum_ms = 0.0;
+		double queue_sum_ms = 0.0;
+		// The queue call split further, because `queue_sum_ms` is the whole per-page publish cost
+		// and it is not one thing: `queue_record_sum_ms` is the page record - a String-keyed
+		// Dictionary with eight entries, built and inserted on every produced page - and
+		// `queue_bake_sum_ms` is the producer handoff itself. They have different fixes.
+		double queue_record_sum_ms = 0.0;
+		double queue_bake_sum_ms = 0.0;
+	};
+	Terrain3DAVTCost avt_cost;
 	// Main-thread cost of one VT section of the physics tick, in milliseconds, and the
 	// worst frame since the terrain was created. `svt_cpu_ms` is the far-field demand
 	// pass inside that section, so a peak can be attributed to one of the two views.

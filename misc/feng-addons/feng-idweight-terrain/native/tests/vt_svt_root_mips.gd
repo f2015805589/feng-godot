@@ -12,21 +12,13 @@
 # can re-establish the pool in between. The test asserts both halves of the distinction - a demand-side
 # setting leaves the flag alone, a page-footprint setting clears it - because a fix that simply stopped
 # resetting would break the second half.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
-var terrain: Terrain3D
 var scene: Node3D
-var failed := false
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 func shared_pool() -> bool:

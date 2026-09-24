@@ -91,6 +91,30 @@ static func stats_text(p_stats: Dictionary) -> String:
 		int(p_stats.get("evict_count", 0)), int(p_stats.get("free_count", 0))]
 
 
+# The SVT bake's state as one sentence, read from the native report's own keys. The window's status
+# label and the node inspector's both show it and used to spell the same states out separately, which
+# is how the two drifted apart in wording. `p_auto_bake` is the fallback the report omits.
+static func svt_bake_status(p_settings: Dictionary, p_auto_bake: bool = true) -> String:
+	var auto_enabled := bool(p_settings.get("auto_bake", p_auto_bake))
+	var regions := int(p_settings.get("auto_pending_regions", 0))
+	var incremental := bool(p_settings.get("bake_incremental", false))
+	var mode := "Automatic incremental" if incremental else "Manual full"
+	if bool(p_settings.get("bake_failed", false)):
+		return "%s SVT bake failed: %s" % [mode, str(p_settings.get("bake_error", "unknown error"))]
+	var total := int(p_settings.get("bake_total", 0))
+	var done := int(p_settings.get("bake_done", 0))
+	var pending := int(p_settings.get("bake_pending", 0))
+	if pending > 0 or total > 0 or done > 0:
+		var state := "complete" if total > 0 and done >= total and pending == 0 else "progress"
+		var queued := " · %d changed regions queued" % regions if auto_enabled and incremental and regions > 0 else ""
+		return "%s SVT bake %s: %d/%d pages, %d pending%s" % [mode, state, done, total, pending, queued]
+	if auto_enabled and regions > 0:
+		return "Auto Bake: %d changed region(s) queued; updates merge after 500 ms without edits." % regions
+	if auto_enabled:
+		return "Auto Bake on · changed SVT cells rebake incrementally 500 ms after editing stops."
+	return "Auto Bake off · use Bake All SVT Cells for a full persisted bake."
+
+
 static func region_locations(p_data: Object) -> Array:
 	var value := call_method(p_data, "get_region_locations")
 	if typeof(value) != TYPE_ARRAY:

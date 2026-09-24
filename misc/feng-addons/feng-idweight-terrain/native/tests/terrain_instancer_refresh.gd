@@ -12,21 +12,13 @@
 # The observable is the instance count, because it is derived from the resident multimeshes
 # (`_recount_master_lods()`). The fixture edits a region's stored transforms directly, which is the state
 # a restored or hand-edited region is in, and then asks for the refresh the instancer contract requires.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
-var terrain: Terrain3D
 var scene: Node3D
-var failed := false
 
 
 func _initialize() -> void:
 	call_deferred("run")
-
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
 
 
 func settle(frames: int = 4) -> void:

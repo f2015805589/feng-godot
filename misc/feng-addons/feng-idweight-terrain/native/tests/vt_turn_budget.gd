@@ -29,7 +29,7 @@
 # side of it on a loaded machine about as often as not. Read the counters and the stage sums before
 # believing a red or a green, and see README.md for the same table and for the session drift that
 # makes a run comparable only to one taken under the same machine state.
-extends SceneTree
+extends "res://vt_scene_base.gd"
 
 const REGION_SIZE := 256
 const GRID := 3 # Regions -1..1, a 768 m world.
@@ -64,10 +64,7 @@ const VT_BUDGET_MS := 0.1
 const VT_SECTION_BUDGET_MS := 3.0 * VT_BUDGET_MS
 const CDLOD_BUDGET_MS := 0.1
 
-var terrain: Terrain3D
 var scene: Node3D
-var camera: Camera3D
-var failed := false
 var output_dir := "user://"
 
 var peak_vt_ms := 0.0
@@ -91,17 +88,6 @@ var sum_fade_ms := 0.0
 
 func _initialize() -> void:
 	call_deferred("run")
-
-func require(value: bool, message: String) -> void:
-	if not value:
-		push_error("REGRESSION: " + message)
-		failed = true
-
-func make_texture(color: Color) -> ImageTexture:
-	var image := Image.create(32, 32, false, Image.FORMAT_RGBA8)
-	image.fill(color)
-	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
 
 func add_assets() -> void:
 	terrain.assets = Terrain3DAssets.new()

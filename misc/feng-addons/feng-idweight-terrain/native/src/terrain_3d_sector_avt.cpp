@@ -438,7 +438,7 @@ void Terrain3D::set_surface_vt_selection_mode(int p_mode) {
 int Terrain3D::_update_sector_avt(int p_max_pages) {
 	if (!_vt.surface_vt || !_data || !_vt.vt_shared_ready || !get_camera()) { return 0; }
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
-	_vt.avt_sector_ticks++;
+	_vt.avt_cost.sector_ticks++;
 	// The rate the producer's frame budget and the source queue window are both set from, published
 	// on every tick rather than on the tick it moves. Both readers have to move together, and the
 	// source pipeline is built lazily inside the production pass, so a change-detected publish can
@@ -488,7 +488,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 
 	const uint64_t plan_state_started = Time::get_singleton()->get_ticks_usec();
 	const Terrain3DAVTPlanKey plan_key = _avt_plan_state(bounds_ready);
-	_vt.avt_plan_state_sum_ms += double(Time::get_singleton()->get_ticks_usec() - plan_state_started) / 1000.0;
+	_vt.avt_cost.plan_state_sum_ms += double(Time::get_singleton()->get_ticks_usec() - plan_state_started) / 1000.0;
 	// Diagnostic: a plan key that changes every frame re-plans the whole working set, so
 	// which component moved is the question worth answering. Component indices follow
 	// `_avt_plan_state` (9 basis, 3 origin, 16 projection, 4 viewport, then the scalars), which is
@@ -503,7 +503,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 		_vt.avt_sector_stats["plan_key_dirty_component"] = first;
 		_vt.avt_sector_stats["plan_key_unchanged"] = first < 0;
 	}
-	_vt.avt_key_sum_ms += double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+	_vt.avt_cost.key_sum_ms += double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	const uint64_t install_started = Time::get_singleton()->get_ticks_usec();
 	// A changed key does not have to mean a new plan: the plan is a look-ahead artifact, and the
 	// chain that derives it is the most expensive thing in the tick. Inside the refresh interval a
@@ -527,45 +527,45 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 			frame_now >= _vt.avt_last_chain_frame + _vt.avt_plan_refresh_frames || angular_refresh || spatial_refresh;
 	_vt.avt_sector_stats["plan_spatial_refresh"] = spatial_refresh;
 	_vt.avt_sector_stats["discard_retained_pending"] = _vt.avt_discard_retained;
-	if (!key_same && !refresh_due) { _vt.avt_plan_refresh_skips++; }
+	if (!key_same && !refresh_due) { _vt.avt_cost.plan_refresh_skips++; }
 	// A spatial deviation can be large even while quantization leaves the key unchanged. Let it
 	// enter the existing chain path; otherwise `key_same` would turn the guard into a diagnostic
 	// with no effect.
 	const bool reuse_plan = (key_same && !spatial_refresh) || !refresh_due;
 	const int finished = _avt_install_or_reuse_plan(started, p_max_pages, reuse_plan);
-	_vt.avt_install_sum_ms += double(Time::get_singleton()->get_ticks_usec() - install_started) / 1000.0;
+	_vt.avt_cost.install_sum_ms += double(Time::get_singleton()->get_ticks_usec() - install_started) / 1000.0;
 	// Where a tick's cost goes, summed over the session: the plan key, the install or reuse
 	// decision - which includes a production pass on every path, so it is not the tick's total -
 	// and the planning chain a moving camera pays on the ticks where the key changed. The
 	// per-pass sums are beside them, and `idle_ticks` is the count of ticks the production pass
 	// answered as already settled.
 	auto publish_tick_sums = [this]() {
-		const uint64_t produce_calls = _vt.avt_reuse_ticks + _vt.avt_chain_ticks;
-		_vt.avt_sector_stats["sector_ticks"] = int64_t(_vt.avt_sector_ticks);
-		_vt.avt_sector_stats["reuse_ticks"] = int64_t(_vt.avt_reuse_ticks);
-		_vt.avt_sector_stats["chain_ticks"] = int64_t(_vt.avt_chain_ticks);
-		_vt.avt_sector_stats["capacity_skip_ticks"] = int64_t(_vt.avt_capacity_skip_ticks);
-		_vt.avt_sector_stats["plan_refresh_skips"] = int64_t(_vt.avt_plan_refresh_skips);
+		const uint64_t produce_calls = _vt.avt_cost.reuse_ticks + _vt.avt_cost.chain_ticks;
+		_vt.avt_sector_stats["sector_ticks"] = int64_t(_vt.avt_cost.sector_ticks);
+		_vt.avt_sector_stats["reuse_ticks"] = int64_t(_vt.avt_cost.reuse_ticks);
+		_vt.avt_sector_stats["chain_ticks"] = int64_t(_vt.avt_cost.chain_ticks);
+		_vt.avt_sector_stats["capacity_skip_ticks"] = int64_t(_vt.avt_cost.capacity_skip_ticks);
+		_vt.avt_sector_stats["plan_refresh_skips"] = int64_t(_vt.avt_cost.plan_refresh_skips);
 		_vt.avt_sector_stats["plan_refresh_frames"] = int64_t(_vt.avt_plan_refresh_frames);
-		_vt.avt_sector_stats["idle_ticks"] = int64_t(produce_calls - MIN(produce_calls, _vt.avt_pass_count));
-		_vt.avt_sector_stats["key_sum_ms"] = _vt.avt_key_sum_ms;
-		_vt.avt_sector_stats["plan_state_sum_ms"] = _vt.avt_plan_state_sum_ms;
-		_vt.avt_sector_stats["install_sum_ms"] = _vt.avt_install_sum_ms;
-		_vt.avt_sector_stats["chain_sum_ms"] = _vt.avt_chain_sum_ms;
-		_vt.avt_sector_stats["produce_sum_ms"] = _vt.avt_produce_sum_ms;
-		_vt.avt_sector_stats["update_sum_ms"] = _vt.avt_update_sum_ms;
-		_vt.avt_sector_stats["wrapper_sum_ms"] = _vt.avt_wrapper_sum_ms;
+		_vt.avt_sector_stats["idle_ticks"] = int64_t(produce_calls - MIN(produce_calls, _vt.avt_cost.pass_count));
+		_vt.avt_sector_stats["key_sum_ms"] = _vt.avt_cost.key_sum_ms;
+		_vt.avt_sector_stats["plan_state_sum_ms"] = _vt.avt_cost.plan_state_sum_ms;
+		_vt.avt_sector_stats["install_sum_ms"] = _vt.avt_cost.install_sum_ms;
+		_vt.avt_sector_stats["chain_sum_ms"] = _vt.avt_cost.chain_sum_ms;
+		_vt.avt_sector_stats["produce_sum_ms"] = _vt.avt_cost.produce_sum_ms;
+		_vt.avt_sector_stats["update_sum_ms"] = _vt.avt_cost.update_sum_ms;
+		_vt.avt_sector_stats["wrapper_sum_ms"] = _vt.avt_cost.wrapper_sum_ms;
 	};
 	auto leave = [this, &publish_tick_sums, started](const int p_result) {
-		_vt.avt_update_sum_ms += double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+		_vt.avt_cost.update_sum_ms += double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 		publish_tick_sums();
 		return p_result;
 	};
 	if (finished >= 0) {
-		_vt.avt_reuse_ticks++;
+		_vt.avt_cost.reuse_ticks++;
 		return leave(finished);
 	}
-	_vt.avt_chain_ticks++;
+	_vt.avt_cost.chain_ticks++;
 	_vt.avt_last_chain_frame = frame_now;
 
 	_vt.avt_sector_stats["plan_reused"] = false;
@@ -606,7 +606,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	mark_phase("publish_ms");
 	_avt_submit_plan(_vt.avt_pending_hierarchy, plan_key, view, bounds_ready, focus, reach);
 	mark_phase("submit_ms");
-	_vt.avt_chain_sum_ms += double(Time::get_singleton()->get_ticks_usec() - chain_started) / 1000.0;
+	_vt.avt_cost.chain_sum_ms += double(Time::get_singleton()->get_ticks_usec() - chain_started) / 1000.0;
 	_vt.avt_plan.key = plan_key;
 	_vt.avt_pending_hierarchy = Terrain3DAVTHierarchy();
 
@@ -618,7 +618,7 @@ int Terrain3D::_update_sector_avt(int p_max_pages) {
 	_vt.avt_sector_stats["indirection_size"] = 2048;
 	const uint64_t produce_started = Time::get_singleton()->get_ticks_usec();
 	const int produced = _produce_sector_avt_pages(p_max_pages);
-	_vt.avt_produce_sum_ms += double(Time::get_singleton()->get_ticks_usec() - produce_started) / 1000.0;
+	_vt.avt_cost.produce_sum_ms += double(Time::get_singleton()->get_ticks_usec() - produce_started) / 1000.0;
 	mark_phase("produce_ms");
 	_vt.avt_sector_stats["cpu_update_ms"] = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	return leave(produced);
@@ -689,7 +689,7 @@ int Terrain3D::_avt_install_or_reuse_plan(const uint64_t p_started, const int p_
 				// The pool is waiting for a larger capacity, so this tick produced nothing and
 				// did not classify either. Counted separately from the settled shortcut, which
 				// reads the same way from the outside.
-				_vt.avt_capacity_skip_ticks++;
+				_vt.avt_cost.capacity_skip_ticks++;
 				return 0;
 			}
 			// A grazing mip can disappear for one plan and reappear immediately.
@@ -1057,8 +1057,8 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["motion_speed"] = _vt.avt_motion_velocity.length();
 	result["motion_turn_deg_s"] = Math::rad_to_deg(_vt.avt_motion_turn.length());
 	result["motion_turn_lead_deg"] = Math::rad_to_deg(_vt.avt_motion_turn_lead.length());
-	result["visible_late_pages"] = _vt.avt_late_pages;
-	result["visible_late_worst_ms"] = double(_vt.avt_late_worst_us) / 1000.0;
+	result["visible_late_pages"] = _vt.avt_cost.late_pages;
+	result["visible_late_worst_ms"] = double(_vt.avt_cost.late_worst_us) / 1000.0;
 	result["visible_retained_pages"] = _vt.avt_retained_pages;
 	result["adaptive"] = _vt.vt_adaptive_enabled;
 	result["avt_feedback"] = _vt.avt_feedback;
@@ -1091,7 +1091,7 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_batch_motion_turn_deg_s"] = _vt.avt_page_budget.last_turn_deg_s;
 	result["avt_batch_motion_discontinuity"] = _vt.avt_page_budget.last_discontinuity;
 	result["avt_batch_motion_unserved"] = _vt.avt_page_budget.last_unserved;
-	result["avt_batch_peak"] = _vt.avt_batch_peak;
+	result["avt_batch_peak"] = _vt.avt_cost.batch_peak;
 	// The source half of the same rate: the pool the near field actually runs with and the count the
 	// caller configured. A `produced` that matches the batch while this stays at the configured floor
 	// is the source side *not* being the rate the budget asks for.
@@ -1128,9 +1128,9 @@ void Terrain3D::_report_avt(Dictionary &r_result) const {
 	result["avt_mip_level_cap"] = get_avt_mip_level_cap();
 	result["avt_sector_world"] = is_sector_avt() ? double(get_avt_local_section_world()) : double(_region_size * _vertex_spacing);
 	result["avt_sector_stats"] = _vt.avt_sector_stats.to_dictionary();
-	result["avt_peak_stats"] = _vt.avt_peak_stats;
-	result["avt_peak_age_ms"] = _vt.avt_peak_stamp_us == 0 ? -1.0
-			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_peak_stamp_us) / 1000.0;
+	result["avt_peak_stats"] = _vt.avt_cost.peak_stats;
+	result["avt_peak_age_ms"] = _vt.avt_cost.peak_stamp_us == 0 ? -1.0
+			: double(Time::get_singleton()->get_ticks_usec() - _vt.avt_cost.peak_stamp_us) / 1000.0;
 	result["avt_selection_mode"] = _vt.surface_vt_selection_mode;
 	result["avt_region_grid"] = _vt.surface_vt_region_grid;
 	result["avt_region_offset"] = _vt.surface_vt_region_offset;
