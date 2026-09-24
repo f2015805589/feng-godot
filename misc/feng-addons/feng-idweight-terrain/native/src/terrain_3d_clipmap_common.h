@@ -75,8 +75,8 @@ inline constexpr int IMPLEMENTATION_COUNT = 2;
 // clipmap's name.
 //
 // `1024 / 2^10 == 1`, so the span is eleven units. Every ceiling an implementation clamps `units` to
-// is at least this, and a clamp that would shorten the ladder is reported rather than applied in
-// silence (see `truncates_ladder()` and the two `configure()`s).
+// is at least this, and the layer reports the units a shape's own densities require
+// (`units_for_density()`), so a clamp that would shorten the ladder is visible rather than silent.
 inline constexpr real_t LADDER_FINEST_DENSITY = 1024.f; // texels a metre at unit 0
 inline constexpr real_t LADDER_COARSEST_DENSITY = 1.f; // texels a metre at the outermost unit
 inline constexpr int LADDER_UNITS = 11; // log2(1024 / 1) + 1
@@ -143,12 +143,6 @@ struct Ladder {
 	real_t texel_world(const int p_unit) const {
 		return base_world * real_t(int64_t(1) << CLAMP(p_unit, 0, 30)) / real_t(MAX(1, size));
 	}
-	// The world size one unit covers: the square the LOD level stores, i.e. `base_world * 2^unit`.
-	// The atlas's unit is a shell of blocks of the same world size, so its *reach* is this times the
-	// grid's half extent; that difference is the implementation's and lives there.
-	real_t unit_world(const int p_unit) const {
-		return base_world * real_t(int64_t(1) << CLAMP(p_unit, 0, 30));
-	}
 	// The density a fragment is served by one unit, in texels a metre. It is the reciprocal of the
 	// texel size, and it is the number the acceptance's "density - distance" curve is made of: a curve
 	// that reads it per unit and measures the distance in the unit's own reach is a property of the
@@ -165,8 +159,8 @@ struct Ladder {
 		return density_of_unit(MAX(1, p_units) - 1);
 	}
 	// How many units *this* ladder needs to fall from its own finest density to `p_coarsest`. A shape
-	// whose settings ask for fewer units than this presents a truncated ladder, which is what
-	// `truncates_ladder()` reports rather than hiding behind the clamp.
+	// whose settings ask for fewer units than this presents a truncated ladder, which is the number
+	// the layer's debug schema publishes (`ladder_units_required`) rather than hiding behind a clamp.
 	int units_for_density(const real_t p_coarsest = LADDER_COARSEST_DENSITY) const {
 		int units = 1;
 		while (units < 31 && density_of_unit(units - 1) > p_coarsest) {
@@ -182,9 +176,6 @@ struct Ladder {
 		return finest >= LADDER_FINEST_DENSITY * 0.999f && finest <= LADDER_FINEST_DENSITY * 1.001f &&
 				coarsest >= LADDER_COARSEST_DENSITY * 0.999f && coarsest <= LADDER_COARSEST_DENSITY * 1.001f;
 	}
-	// Whether a layer of `p_units` units is shorter than this ladder's own 1024 -> 1 span, which is the
-	// state a clamp must never reach silently.
-	bool truncates_ladder(const int p_units) const { return p_units < units_for_density(); }
 };
 
 inline Ladder ladder_of(const Shape &p_shape) {
@@ -267,34 +258,8 @@ inline Dictionary unit_report_to_dictionary(const UnitReport &p_report) {
 	return entry;
 }
 
-// ---- Shared rect arithmetic ----------------------------------------------------------------------
+// ---- Shared addressing arithmetic -----------------------------------------------------------------
 //
-// Both implementations queue rects, and both have to merge what they queue (a focus that turned twice
-// before its first strip was baked is one rect, not two) and to keep a rect half-open and inside one
-// unit. One spelling, so the two cannot disagree about whether a rect is inclusive.
-
-inline Rect2i merge_rect(const Rect2i &p_a, const Rect2i &p_b) {
-	if (!p_a.has_area()) {
-		return p_b;
-	}
-	if (!p_b.has_area()) {
-		return p_a;
-	}
-	const int x0 = MIN(p_a.position.x, p_b.position.x);
-	const int y0 = MIN(p_a.position.y, p_b.position.y);
-	const int x1 = MAX(p_a.position.x + p_a.size.x, p_b.position.x + p_b.size.x);
-	const int y1 = MAX(p_a.position.y + p_a.size.y, p_b.position.y + p_b.size.y);
-	return Rect2i(x0, y0, x1 - x0, y1 - y0);
-}
-
-inline Rect2i clamp_rect(const Rect2i &p_rect, const int p_size) {
-	const int x0 = CLAMP(p_rect.position.x, 0, p_size);
-	const int y0 = CLAMP(p_rect.position.y, 0, p_size);
-	const int x1 = CLAMP(p_rect.position.x + p_rect.size.x, 0, p_size);
-	const int y1 = CLAMP(p_rect.position.y + p_rect.size.y, 0, p_size);
-	return Rect2i(x0, y0, MAX(0, x1 - x0), MAX(0, y1 - y0));
-}
-
 // Reduces a signed texel index into `[0, size)`. The ring's `physical = (logical + ring) mod size` and
 // the atlas's per-block offset both go through this one function.
 inline int wrap_texel(const int p_value, const int p_size) {
@@ -303,6 +268,22 @@ inline int wrap_texel(const int p_value, const int p_size) {
 	}
 	const int reduced = p_value % p_size;
 	return reduced < 0 ? reduced + p_size : reduced;
+}
+
+// Bytes one stored value occupies, which is the channel's format: one value per texel per layer, and a
+// baked channel's layer is a whole texel (four components), so both implementations count the same
+// bytes for the same format. One spelling, so an upload's byte count cannot differ from the atlas's.
+inline int bytes_per_texel(const Image::Format p_format) {
+	switch (p_format) {
+		case Image::FORMAT_R8:
+			return 1;
+		case Image::FORMAT_RGBA8:
+			return 4;
+		case Image::FORMAT_RGBAH:
+			return 8;
+		default:
+			return 4;
+	}
 }
 
 } // namespace TerrainClipmap

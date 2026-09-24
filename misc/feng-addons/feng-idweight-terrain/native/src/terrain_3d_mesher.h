@@ -89,19 +89,6 @@ public:
 	void reset_target_position() { _last_target_position = V2_MAX; }
 	void update();
 	void update_aabbs(const real_t p_cull_margin = -1.f, const Vector2 &p_height_range = V2_MAX);
-
-	void set_material(const RID &p_material) { _material = p_material; }
-	RID get_material() const { return _material; }
-	void set_lods(const int p_lods) { _lods = p_lods; }
-	int get_lods() const { return _lods; }
-	void set_tessellation_level(const int p_level) { _tessellation_level = p_level; }
-	int get_tessellation_level() const { return _tessellation_level; }
-	void set_mesh_size(const int p_size) { _mesh_size = p_size; }
-	int get_mesh_size() const { return _mesh_size; }
-	void set_vertex_spacing(const real_t p_spacing) { _vertex_spacing = p_spacing; }
-	real_t get_vertex_spacing() const { return _vertex_spacing; }
-	void set_render_layers(const uint32_t p_layers) { _render_layers = p_layers; }
-	uint32_t get_render_layers() const { return _render_layers; }
 };
 // Inline Functions
 

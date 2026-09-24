@@ -39,20 +39,8 @@ static constexpr int CLIPMAP_MAX_CHANNELS = 16;
 
 // One value per texel per layer, so a *channel's* format is the value's format. A baked channel is
 // the exception and the reason the two are separate: its layer is a whole texel - albedo and height,
-// an octahedral normal and roughness, the parameters - so it carries four components and this is
-// where its bytes are counted.
-static int _clipmap_bytes_per_texel(const Image::Format p_format) {
-	switch (p_format) {
-		case Image::FORMAT_R8:
-			return 1;
-		case Image::FORMAT_RGBA8:
-			return 4;
-		case Image::FORMAT_RGBAH:
-			return 8;
-		default:
-			return 4;
-	}
-}
+// an octahedral normal and roughness, the parameters - so it carries four components and the shared
+// `TerrainClipmap::bytes_per_texel()` is where its bytes are counted.
 
 // The device format of a baked channel: the one the bake shader's `rgba16f` storage images write.
 // `configure()` accepts no other request, so there is nothing to translate.
@@ -151,7 +139,6 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 	}
 	_layer_image.unref();
 	_has_focus = false;
-	_last_focus = Vector2();
 	_state_stamp++;
 }
 
@@ -167,19 +154,8 @@ void Terrain3DClipmap::clear() {
 	_config.size = 0;
 	_config.levels = 0;
 	_has_focus = false;
-	_last_focus = Vector2();
 	_shape_serial++;
 	_state_stamp++;
-}
-
-int Terrain3DClipmap::get_level_valid_count() const {
-	int valid = 0;
-	for (const Level &level : _levels) {
-		if (level.valid) {
-			valid++;
-		}
-	}
-	return valid;
 }
 
 real_t Terrain3DClipmap::get_texel_world(const int p_level) const {
@@ -221,22 +197,15 @@ int Terrain3DClipmap::level_for_world(const Vector2 &p_world) const {
 	return int(_levels.size()) - 1;
 }
 
-Vector2 Terrain3DClipmap::world_of_logical(const int p_level, const Vector2i &p_logical) const {
-	const Level &entry = _levels[size_t(p_level)];
-	const real_t half = entry.world_size * 0.5f;
-	return Vector2(entry.center.x - half + (real_t(p_logical.x) + 0.5f) * entry.texel_world,
-			entry.center.y - half + (real_t(p_logical.y) + 0.5f) * entry.texel_world);
-}
-
 real_t Terrain3DClipmap::sample(const Vector2 &p_world, const int p_channel) const {
 	if (_levels.empty()) {
 		return NAN;
 	}
 	const int level_index = level_for_world(p_world);
 	const Level &entry = _levels[size_t(level_index)];
-	// The inverse of `world_of_logical()`: the texel whose centre the point is nearest, i.e. the one
-	// `floor(local / texel)` names. Going through the *logical* index is what undoes the ring; the
-	// physical index alone names a different world position after every wrap.
+	// The texel whose centre the point is nearest, i.e. the one `floor(local / texel)` names. Going
+	// through the *logical* index is what undoes the ring; the physical index alone names a different
+	// world position after every wrap.
 	const Vector2 half(entry.world_size * 0.5f, entry.world_size * 0.5f);
 	const Vector2 local = p_world - entry.center + half;
 	const Vector2i logical(CLAMP(int(Math::floor(local.x / entry.texel_world)), 0, _config.size - 1),
@@ -247,18 +216,12 @@ real_t Terrain3DClipmap::sample(const Vector2 &p_world, const int p_channel) con
 }
 
 int Terrain3DClipmap::_wrap(const int p_value) const {
-	const int reduced = p_value % _config.size;
-	return reduced < 0 ? reduced + _config.size : reduced;
+	return TerrainClipmap::wrap_texel(p_value, _config.size);
 }
 
 Vector2i Terrain3DClipmap::physical_of_logical(const int p_level, const Vector2i &p_logical) const {
 	const Vector2i ring = _levels[size_t(p_level)].ring;
 	return Vector2i(_wrap(p_logical.x + ring.x), _wrap(p_logical.y + ring.y));
-}
-
-Vector2i Terrain3DClipmap::logical_of_physical(const int p_level, const Vector2i &p_physical) const {
-	const Vector2i ring = _levels[size_t(p_level)].ring;
-	return Vector2i(_wrap(p_physical.x - ring.x), _wrap(p_physical.y - ring.y));
 }
 
 // The source changed under a world rect. The texels that cover it are queued per level against the
@@ -395,7 +358,6 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 		}
 	}
 	_jobs = std::move(remaining);
-	_last_focus = p_focus;
 	return produced;
 }
 
@@ -526,8 +488,8 @@ void Terrain3DClipmap::_fill_row(const Job &p_job, const int p_channel, const in
 	row.x1 = p_x1;
 	row.size = _config.size;
 	row.texel_world = entry.texel_world;
-	// The world position of the centre of logical texel (0, 0), which is the inverse of
-	// `world_of_logical()` and of `sample()`: all three agree on where a logical texel is.
+	// The world position of the centre of logical texel (0, 0), which is the same addressing
+	// `sample()` inverts: the two agree on where a logical texel is.
 	const real_t half = entry.world_size * 0.5f;
 	const real_t centre_of_first = 0.5f * entry.texel_world;
 	row.origin = Vector2(entry.center.x - half + centre_of_first, entry.center.y - half + centre_of_first);
@@ -542,7 +504,7 @@ void Terrain3DClipmap::_fill_row(const Job &p_job, const int p_channel, const in
 }
 
 void Terrain3DClipmap::_ensure_texture() {
-	const int bytes_per_texel = _clipmap_bytes_per_texel(_config.format);
+	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
 	const int64_t texels = int64_t(_config.size) * int64_t(_config.size);
 	if (_layer_image.is_null() || _layer_image->get_width() != _config.size || _layer_image->get_format() != _config.format) {
 		PackedByteArray blank;
@@ -562,7 +524,7 @@ void Terrain3DClipmap::_publish_level(const int p_level) {
 	}
 	const Level &entry = _levels[size_t(p_level)];
 	const int64_t texels = int64_t(_config.size) * int64_t(_config.size);
-	const int bytes_per_texel = _clipmap_bytes_per_texel(_config.format);
+	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
 	PackedByteArray bytes;
 	bytes.resize(texels * bytes_per_texel);
 	uint8_t *dst = bytes.ptrw();
@@ -960,50 +922,6 @@ Array Terrain3DClipmap::get_level_reports() const {
 		}
 		report["pending_bake_rects"] = pending_rects;
 		report["pending_bake_texels"] = pending_texels;
-		reports.push_back(report);
-	}
-	return reports;
-}
-
-Array Terrain3DClipmap::get_layout_reports() const {
-	Array reports;
-	for (int level = 0; level < int(_levels.size()); level++) {
-		const Level &entry = _levels[size_t(level)];
-		Dictionary report;
-		report["level"] = level;
-		report["size"] = _config.size;
-		report["channels"] = _config.channels;
-		report["world_size"] = entry.world_size;
-		report["texel_world"] = entry.texel_world;
-		report["center"] = entry.center;
-		report["ring"] = entry.ring;
-		report["valid"] = entry.valid;
-		report["baked_channels"] = _config.baked_channels;
-		report["baked"] = entry.baked;
-		// What is left of this level's jobs, in world space, because that is what a debug view draws
-		// and because a queued rect is the one thing a settled report cannot show. A rect the budget
-		// cut short is up to *two* rects - the rest of the row it stopped inside, then the rows below
-		// it - since a partial row with the rows under it is not a rectangle. `cursor_channel` above
-		// zero means the row itself is unfinished, so it is pending from its own start.
-		Array rects;
-		int pending = 0;
-		for (const Job &job : _jobs) {
-			if (job.level != level) {
-				continue;
-			}
-			pending++;
-			const int open_x0 = job.cursor_channel == 0 ? job.cursor_x : job.x0;
-			if (open_x0 == job.x0) {
-				rects.push_back(_clipmap_logical_rect_world(entry, job.x0, job.cursor_y, job.x1, job.y1));
-				continue;
-			}
-			rects.push_back(_clipmap_logical_rect_world(entry, open_x0, job.cursor_y, job.x1, job.cursor_y + 1));
-			if (job.cursor_y + 1 < job.y1) {
-				rects.push_back(_clipmap_logical_rect_world(entry, job.x0, job.cursor_y + 1, job.x1, job.y1));
-			}
-		}
-		report["pending"] = pending;
-		report["pending_rects"] = rects;
 		reports.push_back(report);
 	}
 	return reports;

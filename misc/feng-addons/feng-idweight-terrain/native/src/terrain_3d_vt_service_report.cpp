@@ -1,4 +1,4 @@
-﻿// Copyright 婕?2026 Terrain3D contributors.
+// Copyright 婕?2026 Terrain3D contributors.
 
 // Terrain3D's virtual texture service, part 3 of 4: the diagnostics.
 //
@@ -379,8 +379,6 @@ const char *Terrain3DVTState::PageRecord::state_name() const {
 			return "Missing/stale cell bake";
 		case NO_RESIDENT_PAYLOAD:
 			return "No resident payload";
-		case READY:
-			return "Ready";
 	}
 	return "Pending bake";
 }

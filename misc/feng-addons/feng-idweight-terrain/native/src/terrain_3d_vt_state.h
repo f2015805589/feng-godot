@@ -1,4 +1,4 @@
-﻿// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef TERRAIN3D_VT_STATE_H
 #define TERRAIN3D_VT_STATE_H
@@ -721,7 +721,6 @@ struct Terrain3DVTState {
 			PENDING_RESIDENT_FALLBACK = 3,
 			MISSING_STALE_CELL_BAKE = 4,
 			NO_RESIDENT_PAYLOAD = 5,
-			READY = 6,
 		};
 		// The state the debug page list publishes. It is spelled here, beside the enum, so the
 		// two cannot drift - the strings are the ones the tests and the editor dock read.

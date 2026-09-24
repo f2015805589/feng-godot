@@ -417,7 +417,7 @@ the two halves of the phase's own cell check by making the same focus move with 
 and deselected.
 
 The ring's report keeps the two answers apart rather than collapsing them: `clipmap_service` and
-`clipmap[group].selected` are the matrix's claim, `clipmap_ring` and `clipmap[group].configured`
+`clipmap[group].selected` are the matrix's claim, `clipmap_layer` and `clipmap[group].configured`
 are the object. They differ for a ring the entry built with no cell naming the method, which is the
 state a reader has to be able to tell from "no ring at all".
 
@@ -607,7 +607,7 @@ the ring's: one layer per level, at the ring's size, following its centres and i
 the shared producer's - one bake shader, one material list, one job buffer, one descriptor set that
 binds the ring's own atlas to its two inputs and the ring's three arrays to its outputs
 (`Terrain3DSurfaceBaker::_ensure_ring_bake()`). The ring's owner offers it once a tick
-(`Terrain3DSurfaceBaker::queue_clipmap_ring()`, from the tick's clipmap phase and from the mechanism's
+(`Terrain3DSurfaceBaker::queue_clipmap_layer()`, from the tick's clipmap phase and from the mechanism's
 own entry), and the offer is handed **the ring's own rects**: every rect the ring has produced and no
 bake has covered yet, merged per level as it is produced. The render callback dispatches them.
 **One dispatch per rect**, because a level's ring offset is part of what its job *reads* and cannot ride
@@ -690,7 +690,7 @@ payload - which is why the owner publishes the material list for a ring that dec
 
 * The two legacy properties stay, as views of `Near/Material` and `Far/Material`.
 * `get_vt_settings()` publishes the four cells, the three service booleans, the ring's existence
-  (`clipmap_ring`) and the acceptance rule (`delivery_supported` / `delivery_unsupported`), so a
+  (`clipmap_layer`) and the acceptance rule (`delivery_supported` / `delivery_unsupported`), so a
   test or the dock reads the decision rather than inferring it from a service's presence.
 * Existing native tests that drive `set_surface_vt_enabled()` keep their meaning, because
   the near field's material group is the only thing that ever selected AVT in them.
@@ -757,7 +757,7 @@ carries the sentence as its tooltip.
 The mechanism stays reachable with every cell `Direct`, and that door is measured too: the entry
 fills a 16-texel level whole (`256` texels) and publishes the same number as
 `clipmap_produced_texels`, the ring it built reports `configured` true with `selected` false, and
-`clipmap_ring` is true - while the material group's entry returns `-1`, because no source carries
+`clipmap_layer` is true - while the material group's entry returns `-1`, because no source carries
 that channel. The tick is the other half: this terrain ticks normally, and the tick after the entry
 reports `0` clipmap texels, because it enters no clipmap phase for a method no cell selected. The
 never-selected terrain reads the same way with nothing built at all: `configured=false`, no levels,
@@ -1225,7 +1225,7 @@ channel texels a strip, `size * size * channels` = 12 288 a level).
   rect's own (`BakeRect::lease`): a rect that grew over new content while its dispatch was in flight is
   not counted and is dispatched again, so a producer can never mark a rect baked over texels it did not
   read - while a *different* rect of the same level, or a later strip, is not this rect's business.
-* **The offer is budgeted in the production unit.** `queue_clipmap_ring()` takes
+* **The offer is budgeted in the production unit.** `queue_clipmap_layer()` takes
   `vt_clipmap_budget_texels` and stops collecting when the rects it has chosen reach it, with a soft
   floor of one rect per offer - a whole-level fill (a first fill, a material change) is larger than a
   tick's budget and would otherwise never be admitted. The report publishes `pending_bake_rects`,

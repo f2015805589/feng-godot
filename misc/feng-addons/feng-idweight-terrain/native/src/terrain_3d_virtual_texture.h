@@ -202,7 +202,6 @@ public:
 	// is touched. An empty vector withdraws the plan (the far field's case).
 	void set_planned_levels(const std::vector<uint64_t> &p_levels);
 	void clear_planned_levels();
-	int get_planned_level_count() const { return int(_planned_levels.size()); }
 
 	// Sectors
 	bool register_sector(const Vector2i &p_sector, const int p_virtual_image_size);

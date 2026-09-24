@@ -137,10 +137,6 @@ private:
 		RID albedo_rs;
 		RID normal_rs;
 		RID params_rs;
-		bool empty() const {
-			return !albedo_rd.is_valid() && !normal_rd.is_valid() && !params_rd.is_valid() &&
-					!albedo_rs.is_valid() && !normal_rs.is_valid() && !params_rs.is_valid();
-		}
 	};
 
 	struct ResourceBundle {
@@ -488,7 +484,6 @@ private:
 	std::vector<uint8_t> _slot_tier;
 	// Staging and sampled channel accessors, so a channel is addressed by index.
 	static RID _staging_rd_of(const ResourceBundle &p_resources, int p_channel);
-	RID _staging_rd(int p_channel) const;
 	RID _sampled_rd(int p_tier, int p_channel) const;
 	RID _sampled_rs(int p_tier, int p_channel) const;
 	// Bit 0/1/2 are albedo, normal and params. The resolved mask is used while a bundle is

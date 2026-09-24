@@ -281,7 +281,6 @@ void Terrain3DVTPagePool::abort_slot(const uint32_t p_slot) {
 	if (allocation_budget > 0) {
 		allocation_budget++;
 	}
-	aborted_acquires++;
 }
 
 void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {

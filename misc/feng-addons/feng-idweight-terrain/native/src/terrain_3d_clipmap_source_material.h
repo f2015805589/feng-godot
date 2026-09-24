@@ -11,7 +11,7 @@
 // blended by. The three arrays a page carries - diffuse and height, an octahedral normal and
 // roughness, the parameters - are baked from exactly this payload, and the ring carries them too:
 // `get_baked_channel_count()` declares them and `Terrain3DSurfaceBaker` writes them from the ring's
-// own texels (`queue_clipmap_ring()`, offered once a tick by the ring's owner), one *rect it produced*
+// own texels (`queue_clipmap_layer()`, offered once a tick by the ring's owner), one *rect it produced*
 // at a time, no page and no codec involved. A level that is baked serves the arrays; a level that is
 // not is served by the payload through `evaluate_idweight_material()`, which is the same resolution at
 // the payload's own density.

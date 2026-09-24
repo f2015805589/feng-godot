@@ -208,15 +208,6 @@ bool Terrain3DCellStore::publish_cell(const Vector2i &p_cell, uint32_t p_signatu
 	return true;
 }
 
-void Terrain3DCellStore::forget_cell(const Vector2i &p_cell) {
-	const auto found = _cells.find(cell_key(p_cell));
-	if (found == _cells.end()) {
-		return;
-	}
-	_release_layer(found->second.layer);
-	_cells.erase(found);
-}
-
 RID Terrain3DCellStore::get_texture_rid(int p_channel) const {
 	return p_channel >= 0 && p_channel < 3 ? _channel_rd[p_channel] : RID();
 }

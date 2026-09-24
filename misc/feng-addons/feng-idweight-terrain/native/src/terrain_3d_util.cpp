@@ -498,41 +498,6 @@ Ref<Image> Terrain3DUtil::luminance_to_height(const Ref<Image> &p_src_rgb) {
 	return dst;
 }
 
-void Terrain3DUtil::benchmark(Terrain3D *p_terrain) {
-	if (!p_terrain) {
-		return;
-	}
-	const Terrain3DData *data = p_terrain->get_data();
-	if (!data) {
-		return;
-	}
-	uint64_t start_time;
-	Vector3 vec;
-	Color col;
-	for (int i = 0; i < 3; i++) {
-		start_time = Time::get_singleton()->get_ticks_msec();
-		for (int j = 0; j < 10000000; j++) {
-			col = data->get_pixel(TYPE_HEIGHT, vec);
-		}
-		LOG(MESG, "get_pixel() 10M: ", Time::get_singleton()->get_ticks_msec() - start_time, "ms");
-	}
-
-	vec = Vector3(0.5f, 0.f, 0.5f);
-	for (int i = 0; i < 3; i++) {
-		start_time = Time::get_singleton()->get_ticks_msec();
-		for (int j = 0; j < 1000000; j++) {
-			data->get_surface_height(vec);
-		}
-		LOG(MESG, "get_height() 1M interpolated: ", Time::get_singleton()->get_ticks_msec() - start_time, "ms");
-	}
-
-	for (int i = 0; i < 2; i++) {
-		start_time = Time::get_singleton()->get_ticks_msec();
-		p_terrain->bake_mesh(0);
-		LOG(MESG, "Bake ArrayMesh: ", Time::get_singleton()->get_ticks_msec() - start_time, "ms");
-	}
-}
-
 ///////////////////////////
 // Protected Functions
 ///////////////////////////

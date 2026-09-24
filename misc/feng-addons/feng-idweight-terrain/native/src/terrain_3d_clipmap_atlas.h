@@ -1,4 +1,4 @@
-﻿// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef TERRAIN3D_CLIPMAP_ATLAS_H
 #define TERRAIN3D_CLIPMAP_ATLAS_H
@@ -52,13 +52,10 @@
 // fill (the fallback every finer read depends on exists soonest) and finest first for a scroll (the
 // ground under the camera is the first to be right), which is the ring's own dependency rule.
 //
-// **Everything is derived in the frame's space.** The grid, the block origins, the per-block matrix
-// and the offset between them are computed in the space `Config::frame` maps to world, and only the
-// final origin is transformed. For the shipped height and material consumers that frame is the world
-// XZ plane (identity), because material sampling is a camera/world question and a light-aligned grid
-// would make the material move with the sun; the machinery is the shadow clipmap's - a start matrix
-// plus a fixed block size is all a block matrix needs - and `set_frame()` is where a light camera's
-// matrix would be installed. See `docs/vt_delivery_assembly.md` section 6 and the task summary.
+// **Everything is derived in world XZ.** The grid, the block origins and the offset between them are
+// computed on the world plane, because material sampling is a camera/world question and a
+// light-aligned grid would make the material move with the sun. See
+// `docs/vt_delivery_assembly.md` section 6 and the task summary.
 //
 // A single **global block** covers everything outside the outermost ring at a minimal resolution. It
 // is produced once at `configure()` and never again, which is the user's "one global, one-time-loaded,
@@ -152,13 +149,6 @@ public:
 		// requirement is a nested, recursively subdivided arrangement, and the shelf and ring-band
 		// schemes stay selectable so the comparison is one build and one report rather than a claim.
 		int packer = PACK_QUADTREE;
-		// The **start matrix**: the light camera a block's own matrix is derived from. It is the one
-		// value the matrix array stores; every block's matrix is this matrix carried to the block's
-		// own origin by the fixed block size, which is the user's "fixed size/far/near automatic
-		// offset, store only one origin" simplification. Identity is the shipped arrangement: the
-		// height and material consumers sample in world XZ, so the grid is derived there and only the
-		// published matrices are in the light camera. See `get_cell_matrix()`.
-		Transform2D frame = Transform2D();
 	};
 
 	// One physical rect of the atlas: the entry of the **rect array** the shader indexes. A slot
@@ -179,7 +169,7 @@ public:
 		bool spare = false;
 		bool global = false;
 		// Whether the three *baked* arrays hold this content. The source landing makes a block
-		// readable; the producer's dispatch, acknowledged by `acknowledge_bake_rect()`, is what makes
+		// readable; the producer's dispatch, acknowledged by `acknowledge_bake()`, is what makes
 		// it a **material**. A slot reused for another coordinate is not baked until its own bake
 		// lands, which is the whole of what keeps a stale rect out of a fragment.
 		bool baked = false;
@@ -251,10 +241,8 @@ public:
 	void clear() override;
 
 	bool is_configured() const override { return _config.block_size > 0 && !_cells.empty(); }
-	const Config &get_config() const { return _config; }
-	int get_rings() const { return _config.rings; }
 	// ---- The shared contract this implementation answers ----------------------------------------
-	// The ladder is the *shared* one: ring `r`'s block is `block_size >> r` texels over `base_world`
+	// The ladder is the *shared* one: ring `r`'s block is `block_size` texels over `base_world * 2^r`
 	// metres, which is `base_world * 2^r / block_size` a texel - the same function the LOD ring's levels
 	// answer with. The two organisations therefore serve the same density at the same distance, and the
 	// only thing that differs is where those texels are stored.
@@ -268,7 +256,6 @@ public:
 		return TerrainClipmap::ladder_of(shape);
 	}
 	int get_unit_count() const override { return _config.rings; }
-	real_t get_unit_texel_world(const int p_unit) const override { return _texel_of_ring(p_unit); }
 	// What one unit covers: the side of its own 3x3 square, `UNIT_SIDE * base_world * 2^unit` metres,
 	// which is the shared ladder's unit size times the grid the storage lays it out in. The *radius* a
 	// caller reads off it is half of this, and the density at that edge is the shared ladder's
@@ -279,7 +266,6 @@ public:
 	}
 	int get_unit_for_world(const Vector2 &p_world) const override;
 	real_t get_texel_world_at(const Vector2 &p_world) const override;
-	bool covers(const Vector2 &p_world) const override { return get_unit_for_world(p_world) >= 0; }
 	int get_size() const override { return _config.block_size; }
 	int get_channel_count() const override { return _config.channels; }
 	Image::Format get_format() const override { return _config.format; }
@@ -290,18 +276,6 @@ public:
 	int get_cell_count() const { return int(_cells.size()); }
 	int get_slot_count() const { return int(_slots.size()); }
 	String get_source_name() const override;
-	int get_source_channel_count() const { return _source != nullptr ? _source->get_channel_count() : 1; }
-	Image::Format get_source_format() const { return _source != nullptr ? _source->get_format() : Image::FORMAT_RF; }
-	// What a producer bakes out of the atlas's blocks, exactly as the ring asks its source: the
-	// material channel declares three arrays, the height channel none. The atlas owns the baked
-	// textures for the same reason the ring does - the producer writes rects of them and the arm
-	// samples them by the same rect array the source lives in.
-	int get_source_baked_channel_count() const {
-		return _source != nullptr ? _source->get_baked_channel_count() : 0;
-	}
-	Image::Format get_source_baked_format() const {
-		return _source != nullptr ? _source->get_baked_format() : Image::FORMAT_RGBAH;
-	}
 
 	// ---- The atlas texture ---------------------------------------------------------------------
 	// `channels` layers of one `Texture2DArray`, each layer a full 2D atlas for one value of a texel.
@@ -311,7 +285,6 @@ public:
 	int get_texture_layer_count() const override { return _texture_layers; }
 	int get_atlas_width() const { return _layout.width; }
 	int get_atlas_height() const { return _layout.height; }
-	int64_t get_atlas_texels() const { return int64_t(_layout.width) * int64_t(_layout.height); }
 	// One entry of the **rect array** the shader indexes, in atlas pixels. The rect's `size` is the
 	// block's texel size, which is the uv scale a reader needs; the position is its uv offset.
 	Rect2i get_slot_rect(const int p_slot) const { return _slots[size_t(p_slot)].rect; }
@@ -319,49 +292,23 @@ public:
 	// Which ring a slot's content belongs to. The producer reads it beside the shared bake entry, whose
 	// `unit` names the slot rather than the ring.
 	int get_slot_ring(const int p_slot) const { return _slots[size_t(p_slot)].ring; }
-	const Slot &get_slot(const int p_slot) const { return _slots[size_t(p_slot)]; }
 
-	// ---- The grid, the cells and the matrices ---------------------------------------------------
-	// The world XZ of a cell's first texel *centre*, which is the origin its block is addressed from.
-	// Derived from the ring's own snapped grid origin and the cell's grid coordinate, which is the
-	// user's "store one origin, offset by fixed size" simplification rather than one origin per block.
-	Vector2 get_cell_origin(const int p_cell) const;
-	// The **matrix array** entry: the frame's start matrix carried to this cell's own block. A cell
-	// under the identity frame is a pure translation, which is the fixed size/far/near case; under a
-	// light camera it is the light's matrix with the block's offset folded in.
-	Transform2D get_cell_matrix(const int p_cell) const;
-	// The frame's own start matrix - the single value a matrix array is derived from.
-	Transform2D get_frame_matrix() const { return _config.frame; }
-	void set_frame(const Transform2D &p_frame);
-	// The ring's snapped grid origin in the frame's space, which is where every cell's block is
-	// measured from.
-	Vector2 get_grid_origin(const int p_ring) const;
+	// ---- The grid and the cells -----------------------------------------------------------------
 	// The ring's **start point**: the centre of the grid's centre block, a whole number of blocks from
-	// the frame origin. This - not the texel-snapped grid origin - is what `cell_for_world()` and
-	// `sample()` measure a block coordinate from, so it is the number the shader's copy of the
-	// addressing must be published: the two would disagree by up to half a block at a boundary.
+	// the origin. This - not the texel-snapped grid origin - is what `cell_for_ring()` and `sample()`
+	// measure a block coordinate from, so it is the number the shader's copy of the addressing must
+	// publish: the two would disagree by up to half a block at a boundary.
 	Vector2 get_ring_start(const int p_ring) const { return _ring_start(p_ring, _last_focus); }
-	Vector2 get_focus() const { return _last_focus; }
-	// The block coordinate the grid's centre cell holds, `(m, m)`: the integer that tells a
-	// relabelling from a phase turn.
-	Vector2i get_grid_step() const { return _grid_step; }
 	int get_cell_index(const int p_ring, const int p_gx, const int p_gy) const;
 	int get_cell_slot(const int p_cell) const { return _cells[size_t(p_cell)].slot; }
-	int get_cell_pending_slot(const int p_cell) const { return _cells[size_t(p_cell)].pending_slot; }
 	bool is_cell_current(const int p_cell) const { return _cells[size_t(p_cell)].current; }
 	Vector2i get_cell_offset(const int p_cell) const { return _cells[size_t(p_cell)].offset; }
-	// The cell the clipmap's own addressing selects for a world point, or -1 when the point is
-	// outside the grid and the global block answers it. The mirror of the shader's arm.
-	int cell_for_world(const Vector2 &p_world) const;
 	// The cell of *one* unit that holds a world point, or -1 when that unit's own 3x3 does not. It is
-	// the addressing rule in one place, so the finder, `cell_for_world()` and `sample()` cannot
-	// disagree - and the shader's own finder is this same arithmetic.
+	// the addressing rule in one place, so the finder and `sample()` cannot disagree - and the
+	// shader's own finder is this same arithmetic.
 	int cell_for_ring(const int p_ring, const Vector2 &p_world) const;
 	real_t sample(const Vector2 &p_world, const int p_channel = 0) const override;
 	// The global block's own readings: the minimal-resolution resource outside the grid.
-	Rect2i get_global_rect() const { return _global_rect; }
-	Vector2 get_global_origin() const { return _global_origin; }
-	real_t get_global_world() const { return _global_world; }
 	int get_global_texels() const { return _config.global_texels; }
 
 	// ---- The baked arrays ----------------------------------------------------------------------
@@ -415,24 +362,12 @@ public:
 	uint64_t get_state_stamp() const override { return _state_stamp; }
 	uint64_t get_produced_texels() const override { return _produced_texels; }
 	uint64_t get_upload_bytes() const override { return _upload_bytes; }
-	// The number that says whether the atlas's update unit is the block: how many block rects were
-	// published, and how many bytes one of them cost. A whole-atlas publish is what this is *not*.
-	uint64_t get_block_uploads() const { return _block_uploads; }
 	uint64_t get_update_calls() const override { return _update_calls; }
 	uint64_t get_idle_updates() const override { return _idle_updates; }
-	// The rolling evidence: how many blocks were loaded because they entered the grid, and how many
-	// cells kept their content. A scroll that reloaded the grid would show `retained` at zero.
-	uint64_t get_scroll_events() const { return _scroll_events; }
-	uint64_t get_edge_blocks_loaded() const { return _edge_blocks_loaded; }
-	uint64_t get_interior_blocks_retained() const { return _interior_blocks_retained; }
-	uint64_t get_last_scroll_loaded() const { return _last_scroll_loaded; }
-	uint64_t get_last_scroll_retained() const { return _last_scroll_retained; }
 	int get_pending_jobs() const override { return int(_jobs.size()); }
 	// The per-frame timeline: one entry per update that produced anything, oldest first, so "one
 	// block a frame" is a table and not a claim. Keys: `frame`, `slot`, `ring`, `texels`, `bytes`.
 	Array get_load_timeline() const;
-	void clear_load_timeline();
-	uint64_t get_frame_counter() const { return _frame_counter; }
 	// The layout report: every scheme the packer evaluated with its bounding box and efficiency, the
 	// chosen one, and the per-ring block counts. The task's "packing report" is this dictionary.
 	Dictionary get_layout_report() const;
@@ -551,7 +486,7 @@ private:
 	std::vector<RID> _baked_rd;
 	std::vector<RID> _baked_rs;
 	// The blocks whose source has landed and whose bake no dispatch has covered. One entry per
-	// produced block, removed by `acknowledge_bake_rect()`.
+	// produced block, removed by `acknowledge_bake()`.
 	std::vector<BakeRect> _bake_rects;
 	Rect2i _global_rect;
 	Vector2 _global_origin;

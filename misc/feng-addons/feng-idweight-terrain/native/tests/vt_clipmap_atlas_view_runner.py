@@ -2,7 +2,7 @@
 
 `vt_clipmap_atlas_view.gd` renders `vt_clipmap_preview.gd` at 1080p with an atlas built and saves the
 PNG, so "the debug shows the atlas's region" is a picture. It also asserts the snapshot the view draws
-from carries the layout (one rect a slot, 81 cells) and that the render is not an empty panel.
+from carries the layout (one rect a slot, nine cells a unit) and that the render is not an empty panel.
 """
 
 from __future__ import annotations

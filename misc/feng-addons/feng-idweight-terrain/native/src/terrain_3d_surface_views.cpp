@@ -1029,7 +1029,6 @@ void Terrain3D::_update_vt_material_detail() {
 		if (flat.length_squared() > 1e-8f) {
 			view.forward = flat.normalized();
 		}
-		view.height = MAX(real_t(0.1), position.y - target.y);
 		view.fov_y = Math::deg_to_rad(camera->get_fov());
 		if (Viewport *viewport = camera->get_viewport()) {
 			const Vector2 size = viewport->get_visible_rect().size;

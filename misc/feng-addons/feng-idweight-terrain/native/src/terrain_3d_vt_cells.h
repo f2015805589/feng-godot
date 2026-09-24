@@ -64,13 +64,11 @@ public:
 	bool is_initialized() const { return _rd != nullptr && _layers > 0 && _level_count > 0; }
 	int get_resolution() const { return _resolution; }
 	int get_level_count() const { return _level_count; }
-	int get_layer_capacity() const { return _layers; }
 	int get_cell_count() const { return int(_cells.size()); }
 
 	// A cell is only reusable when it was baked from the same material and edit state,
 	// which is what the signature carries.
 	const Cell *find_cell(const godot::Vector2i &p_cell, uint32_t p_signature) const;
-	bool has_cell(const godot::Vector2i &p_cell, uint32_t p_signature) const { return find_cell(p_cell, p_signature) != nullptr; }
 	// Publishes one baked cell. The channels are the mipmapped images the bake produced;
 	// a chain that stops short of the store's level count is padded with its coarsest
 	// level, because one texture update writes one layer's whole chain. When every layer
@@ -78,7 +76,6 @@ public:
 	// drop the pages that were assembled from it.
 	bool publish_cell(const godot::Vector2i &p_cell, uint32_t p_signature, const godot::Rect2 &p_world_rect,
 			const godot::Ref<godot::Image> *p_channels, int p_resolution, godot::Vector2i *r_evicted = nullptr);
-	void forget_cell(const godot::Vector2i &p_cell);
 	void touch_cell(const godot::Vector2i &p_cell);
 
 	godot::RID get_texture_rid(int p_channel) const;

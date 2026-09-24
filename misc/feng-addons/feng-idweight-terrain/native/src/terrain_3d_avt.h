@@ -348,7 +348,6 @@ struct Terrain3DAVTSector {
 // world sector bounds they cover.
 struct Terrain3DAVTSectorScan {
 	std::vector<Terrain3DAVTSector> visible;
-	int world_x0 = 0, world_y0 = 0, world_x1 = 0, world_y1 = 0;
 	bool has_world = false;
 	Terrain3DAVTCoarseImage coarse;
 	int budget = 0;

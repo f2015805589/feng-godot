@@ -279,7 +279,7 @@ void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t
 
 // The producer's core, and the whole point of the split: a page and a ring bake read the same
 // shader, the same material table, the same job buffer and the same samplers, and none of those is
-// a page array. Building them here is what lets `queue_clipmap_ring()` and `render_pending()` work
+// a page array. Building them here is what lets `queue_clipmap_layer()` and `render_pending()` work
 // in a configuration whose material group takes no page at all.
 bool Terrain3DSurfaceBaker::_create_bake_core_resources(ResourceBundle &r_next,
 		const PackedByteArray &p_material_bytes, const int p_page_count) {

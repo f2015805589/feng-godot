@@ -6,8 +6,12 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 
-#include "terrain_3d.h"
 #include "terrain_3d_region.h"
+
+// The editor holds a pointer to the node it edits and never dereferences it in a header, so a
+// declaration is enough: including `terrain_3d.h` here would make the two headers reach each other
+// and every editor TU would drag the whole node.
+class Terrain3D;
 
 class Terrain3DEditor : public Object {
 	GDCLASS(Terrain3DEditor, Object);

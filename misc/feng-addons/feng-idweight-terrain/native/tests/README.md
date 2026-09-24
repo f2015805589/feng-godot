@@ -1459,7 +1459,7 @@ array, no VT uniform and no shader arm - then takes a live terrain through all-d
 undeliverable writes, the mechanism's entry and restored, asserting what each stopped or built. It
 reads the live service pointers, the material's own verdict on the shader it generated
 (`is_shader_using_vt()`) and the published booleans (`avt_service`/`svt_service`/`clipmap_service`,
-`clipmap_ring`, `delivery_supported`/`delivery_unsupported`), never a frame time, because the claim
+`clipmap_layer`, `delivery_supported`/`delivery_unsupported`), never a frame time, because the claim
 is about what *exists*. The acceptance rule is the matrix's other half here: `near/height = Clipmap`
 and `near/material = Clipmap` are both accepted (each channel has a ring source and the cell compiles
 that channel's arm), while `far/height = AVT` keeps the method it had, because a method this build
@@ -1513,12 +1513,12 @@ for the readings.
 `vt_debug_views` is the editor-facing half: the order the matrix is read in (the native `Surface VT`
 subgroups straight from `get_property_list()` - `VT Setting` with the delivery matrix first inside
 it, then `Clipmap`, `AVT`, `SVT`, `CDLOD`, `VT Page` - and the Surface VT window's own hierarchy),
-the dock's four delivery rows (the height row disables `Clipmap`, `AVT` and `SVT`, the
-diffuse+normal row disables only `Clipmap`, each with its reason as the tooltip - read from
+the dock's four delivery rows (the height row keeps `Direct` and `Clipmap` and disables `AVT` and
+`SVT`, the diffuse+normal row keeps all three, each with its reason as the tooltip - read from
 `is_item_disabled()` rather than from a screenshot), the VT Page's clipmap view **rendered** into a
 SubViewport (the pixel counts prove the level strip, the world map and the queued strips' colour are
 all drawn; the screenshot is kept as `user://vt_clipmap_debug_view.png`), and the gate on both debug
-Controls. The clipmap's gate is the ring *object* (`has_vt_clipmap_ring()`) rather than a matrix
+Controls. The clipmap's gate is the ring *object* (`has_vt_clipmap_layer()`) rather than a matrix
 cell, so no ring reports unavailable, hides itself and never calls the native preview, while a ring
 the entry built makes the view appear on the same poll - read from
 `clipmap_preview_calls`/`..._computed` and `avt_preview_calls`/`..._computed`, which separate an ask

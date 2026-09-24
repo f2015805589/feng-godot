@@ -1,10 +1,10 @@
 """Regression runner for the clipmap *atlas* mechanism.
 
-`vt_clipmap_atlas.gd` drives `Terrain3DClipmapAtlas` through the mechanism's own entry
-(`debug_update_vt_clipmap_atlas()`) with every delivery cell `Direct`, exactly as
-`vt_clipmap_runner.py` drives the ring: the structure, the packing, the block-granular upload, the
-rolling counters and the anti-gap identity are what it asserts, and none of them depends on a
-rendering.
+`vt_clipmap_atlas.gd` drives `Terrain3DClipmapAtlas` through the mechanism's one entry
+(`debug_update_vt_clipmap()` with `vt_clipmap_implementation` naming the atlas) with every delivery
+cell `Direct`, exactly as `vt_clipmap_runner.py` drives the ring: the structure, the packing, the
+block-granular upload, the rolling counters and the anti-gap identity are what it asserts, and none
+of them depends on a rendering.
 """
 
 from __future__ import annotations

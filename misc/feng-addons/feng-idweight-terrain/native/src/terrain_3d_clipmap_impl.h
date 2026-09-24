@@ -56,9 +56,8 @@ public:
 	// The finest unit's resolution in texels an axis: the LOD ring's level size, the atlas's block
 	// size. It is the number `base_world` is divided by, so it is half of the layer's density.
 	virtual int get_size() const = 0;
-	// The texel size of one unit, and the world size one unit covers. Both are the shared ladder's
-	// answer; an implementation overrides them only to state a unit it does not have.
-	virtual real_t get_unit_texel_world(const int p_unit) const = 0;
+	// The world size one unit covers: the shared ladder's answer, which an implementation states for
+	// the units it actually holds (the atlas's unit is a shell of blocks, so its reach is its grid's).
 	virtual real_t get_unit_world_size(const int p_unit) const = 0;
 
 	// ---- The sampling contract ------------------------------------------------------------------
@@ -68,7 +67,6 @@ public:
 	// density a fragment would be served there - 0 outside.
 	virtual int get_unit_for_world(const Vector2 &p_world) const = 0;
 	virtual real_t get_texel_world_at(const Vector2 &p_world) const = 0;
-	virtual bool covers(const Vector2 &p_world) const = 0;
 	virtual real_t sample(const Vector2 &p_world, const int p_channel = 0) const = 0;
 
 	// ---- The tick -------------------------------------------------------------------------------

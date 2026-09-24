@@ -262,10 +262,6 @@ RID Terrain3DSurfaceBaker::_staging_rd_of(const ResourceBundle &p_resources, con
 	}
 }
 
-RID Terrain3DSurfaceBaker::_staging_rd(const int p_channel) const {
-	return _staging_rd_of(_resources, p_channel);
-}
-
 RID Terrain3DSurfaceBaker::_sampled_rd(const int p_tier, const int p_channel) const {
 	const SampledSet &set = _resources.sampled[CLAMP(p_tier, 0, TIER_COUNT - 1)];
 	switch (p_channel) {

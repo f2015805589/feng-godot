@@ -95,14 +95,8 @@ public:
 	Image::Format get_format() const {
 		return _impl != nullptr ? _impl->get_format() : _settings.shape.format;
 	}
-	real_t get_unit_texel_world(const int p_unit) const {
-		return _impl != nullptr ? _impl->get_unit_texel_world(p_unit) : 0.f;
-	}
 	real_t get_unit_world_size(const int p_unit) const {
 		return _impl != nullptr ? _impl->get_unit_world_size(p_unit) : 0.f;
-	}
-	int get_unit_for_world(const Vector2 &p_world) const {
-		return _impl != nullptr ? _impl->get_unit_for_world(p_world) : -1;
 	}
 	real_t get_texel_world_at(const Vector2 &p_world) const {
 		return _impl != nullptr ? _impl->get_texel_world_at(p_world) : 0.f;
@@ -114,7 +108,6 @@ public:
 		const real_t texel = get_texel_world_at(p_world);
 		return texel > 0.f ? 1.f / texel : 0.f;
 	}
-	bool covers(const Vector2 &p_world) const { return _impl != nullptr && _impl->covers(p_world); }
 	real_t sample(const Vector2 &p_world, const int p_channel = 0) const {
 		return _impl != nullptr ? _impl->sample(p_world, p_channel) : NAN;
 	}

@@ -1794,13 +1794,8 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	// to false on the following publish; a stuck true means the bake is using the fallback
 	// array and the material pages it produces are not the artist's material.
 	stats["materials_stale"] = _materials_stale;
-	// The AVT tier under the legacy keys, both tiers under their own. `applied` is what the
-	// tier's pages are actually stored in, which is what a test checks against the request.
-	stats["atlas_compression"] = _tiers[TIER_AVT].requested;
-	stats["atlas_compression_available"] = _tiers[TIER_AVT].effective.load();
-	stats["atlas_compression_applied"] = _tiers[TIER_AVT].applied.load();
-	stats["atlas_compression_name"] = String(page_codec(_tiers[TIER_AVT].effective.load()).name);
-	stats["atlas_compression_reason"] = get_tier_compression_info(TIER_AVT).get("reason", String());
+	// Both tiers' compression under their own keys. `applied` is what the tier's pages are actually
+	// stored in, which is what a test checks against the request.
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		const String prefix = tier == TIER_SVT ? String("svt_compression") : String("avt_compression");
 		const Dictionary info = get_tier_compression_info(tier);

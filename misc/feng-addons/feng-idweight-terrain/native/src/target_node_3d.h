@@ -38,10 +38,6 @@ public:
 		Node3D *node = get_target();
 		return node && node->is_inside_tree() && !node->is_queued_for_deletion();
 	}
-
-	bool is_null() const {
-		return !is_valid();
-	}
 };
 
 #endif // TARGET_NODE3D_CLASS_H

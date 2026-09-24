@@ -85,6 +85,4 @@ public:
 	// cost near zero means the pass reused its previous result - nothing moved and nothing
 	// changed - rather than a missing reading.
 	double get_cpu_update_ms() const { return _cpu_update_ms; }
-	int get_selected_patches() const { return _selected; }
-	int get_visible_patches() const { return _visible; }
 };

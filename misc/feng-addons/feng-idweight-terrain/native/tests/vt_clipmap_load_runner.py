@@ -8,7 +8,7 @@ the detail fill and a scroll. The `CLIPMAP_LOAD` lines are the table; the `CLIPM
 are the per-tick timeline.
 
 It is a *mechanism* test as well as a measurement: when the build carries the atlas
-(`has_vt_clipmap_atlas()`), the same windows are run against the atlas's own counters, so the
+(`has_vt_clipmap_layer()`), the same windows are run against the atlas's own counters, so the
 before/after comparison comes from one script on one binary.
 """
 

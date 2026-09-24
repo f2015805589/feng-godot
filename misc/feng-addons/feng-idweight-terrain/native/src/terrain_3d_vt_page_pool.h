@@ -96,7 +96,6 @@ struct Terrain3DVTPagePool {
 	// It is the reservation's own pressure reading: non-zero means the upgrade set is competing for
 	// slots the fallback tier is holding, and zero means the reservation is not the binding term.
 	int reserved_block_count = 0;
-	int aborted_acquires = 0;
 	bool initialized = false;
 
 	// Whether any owner of this slot is a reserved page, which is what keeps the slot out of the
@@ -139,9 +138,6 @@ struct Terrain3DVTPagePool {
 	// Drops a reservation without producing anything. The victim (if any) is untouched, so
 	// the page it still serves stays resident and its table entries stay valid.
 	void abort_slot(uint32_t p_slot);
-	bool is_slot_reserved(uint32_t p_slot) const {
-		return p_slot < slot_reserved.size() && slot_reserved[p_slot] != 0;
-	}
 	void touch_slot(uint32_t p_slot);
 	void mark_demanded(uint32_t p_slot) { if (demand_active && p_slot < slot_demand_epoch.size()) { slot_demand_epoch[p_slot] = demand_epoch; } }
 	void evict_slot(uint32_t p_slot);

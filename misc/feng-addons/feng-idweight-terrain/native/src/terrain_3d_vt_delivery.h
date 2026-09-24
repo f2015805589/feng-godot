@@ -10,8 +10,7 @@
 // selected it, an array family is published because a group samples it, the shader variant
 // carries an arm because a cell asked for it, and the tick enters a pass because a service
 // exists. Nothing here decides *how* a method works - that belongs to the method - so this
-// header has no engine dependency and no runtime state beyond the four values themselves,
-// and its arithmetic is pinned by `native/tests/vt/terrain_vt_contract_test.cpp`.
+// header has no engine dependency and no runtime state beyond the four values themselves.
 //
 // Read `docs/vt_delivery_assembly.md` before changing a default or adding a method: the
 // document carries the channel inventory, the assembly rule and what each default
@@ -90,10 +89,6 @@ inline bool is_valid_delivery(const int p_delivery) {
 	return p_delivery >= 0 && p_delivery < DELIVERY_COUNT;
 }
 
-inline Delivery delivery_from_int(const int p_delivery, const Delivery p_fallback = Delivery::Direct) {
-	return is_valid_delivery(p_delivery) ? Delivery(p_delivery) : p_fallback;
-}
-
 inline const char *delivery_name(const Delivery p_delivery) {
 	switch (p_delivery) {
 		case Delivery::AVT:
@@ -166,23 +161,6 @@ struct DeliveryMatrix {
 		}
 		return false;
 	}
-
-	bool tier_uses(const Tier p_tier, const Delivery p_delivery) const {
-		for (int group = 0; group < GROUP_COUNT; group++) {
-			if (cell[int(p_tier)][group] == p_delivery) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	// The tier a group is delivered in by this method, or the tier that is nearer when
-	// neither is. Diagnostics only: the shader and the CPU both walk the two tiers
-	// themselves, so nothing depends on this being a choice.
-	bool near_material() const { return get(Tier::Near, ChannelGroup::Material) != Delivery::Direct; }
-	bool near_height() const { return get(Tier::Near, ChannelGroup::Height) != Delivery::Direct; }
-	bool far_material() const { return get(Tier::Far, ChannelGroup::Material) != Delivery::Direct; }
-	bool far_height() const { return get(Tier::Far, ChannelGroup::Height) != Delivery::Direct; }
 };
 
 } // namespace TerrainVT

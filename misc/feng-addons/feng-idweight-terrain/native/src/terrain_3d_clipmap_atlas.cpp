@@ -40,19 +40,6 @@ static constexpr int ATLAS_MIN_BLOCK = 8;
 static constexpr int ATLAS_MAX_BLOCK = 4096;
 static constexpr int ATLAS_MAX_RINGS = Terrain3DClipmapAtlas::MAX_RINGS;
 
-static int _atlas_bytes_per_texel(const Image::Format p_format) {
-	switch (p_format) {
-		case Image::FORMAT_R8:
-			return 1;
-		case Image::FORMAT_RGBA8:
-			return 4;
-		case Image::FORMAT_RGBAH:
-			return 8;
-		default:
-			return 4;
-	}
-}
-
 static RenderingDevice::DataFormat _atlas_data_format(const Image::Format p_format) {
 	switch (p_format) {
 		case Image::FORMAT_R8:
@@ -138,53 +125,6 @@ Vector2i Terrain3DClipmapAtlas::_ring_phase(const int p_ring, const Vector2 &p_f
 		y += texels;
 	}
 	return Vector2i(x, y);
-}
-
-Vector2 Terrain3DClipmapAtlas::get_grid_origin(const int p_ring) const {
-	if (p_ring < 0 || p_ring >= _config.rings) {
-		return Vector2();
-	}
-	return _grid_origin_of_ring(p_ring, _last_focus);
-}
-
-// The cell's first texel *centre* in world XZ: the block's own square, offset by the ring's phase -
-// the content's frame, which is what a source fills from and what a reader's inverse subtracts.
-Vector2 Terrain3DClipmapAtlas::get_cell_origin(const int p_cell) const {
-	if (p_cell < 0 || p_cell >= int(_cells.size())) {
-		return Vector2();
-	}
-	const Cell &cell = _cells[size_t(p_cell)];
-	const Vector2 start = _ring_start(cell.ring, _last_focus);
-	const real_t texel = _texel_of_ring(cell.ring);
-	const real_t block_world = _block_world_of_ring(cell.ring);
-	const Vector2 block(start.x + real_t(cell.gx) * block_world,
-			start.y + real_t(cell.gy) * block_world);
-	return Vector2(block.x - 0.5f * block_world + 0.5f * texel,
-			block.y - 0.5f * block_world + 0.5f * texel);
-}
-
-// The matrix array's entry. The start matrix carried to this cell's own block: the linear part is
-// the light camera's and the origin is the block's centre put through the same matrix. The block
-// size is fixed, so nothing else has to be stored per block.
-Transform2D Terrain3DClipmapAtlas::get_cell_matrix(const int p_cell) const {
-	if (p_cell < 0 || p_cell >= int(_cells.size())) {
-		return Transform2D();
-	}
-	const Cell &cell = _cells[size_t(p_cell)];
-	const Vector2 start = _ring_start(cell.ring, _last_focus);
-	const real_t block_world = _block_world_of_ring(cell.ring);
-	const Vector2 block(start.x + real_t(cell.gx) * block_world,
-			start.y + real_t(cell.gy) * block_world);
-	return Transform2D(_config.frame.get_rotation(), _config.frame.get_scale(),
-			_config.frame.get_skew(), _config.frame.xform(block));
-}
-
-void Terrain3DClipmapAtlas::set_frame(const Transform2D &p_frame) {
-	if (_config.frame == p_frame) {
-		return;
-	}
-	_config.frame = p_frame;
-	_state_stamp++;
 }
 
 // The cell index of a unit's own 3x3 arrangement: unit `r` owns cells `[r * 9, (r + 1) * 9)`, and
@@ -951,7 +891,7 @@ void Terrain3DClipmapAtlas::_upload_rect(const int p_staging, const Rect2i &p_re
 	if (p_staging >= int(_staging_rd.size())) {
 		return;
 	}
-	const int bytes_per_texel = _atlas_bytes_per_texel(_config.format);
+	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
 	PackedByteArray bytes;
 	bytes.resize(int64_t(p_texels) * int64_t(p_texels) * int64_t(bytes_per_texel));
 	uint8_t *dst = bytes.ptrw();
@@ -1342,7 +1282,7 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 		entry.ring = job.ring;
 		entry.texels = int64_t(slot.texels) * int64_t(slot.texels) * int64_t(_config.channels);
 		entry.bytes = int64_t(slot.texels) * int64_t(slot.texels) *
-				int64_t(_atlas_bytes_per_texel(_config.format)) * int64_t(_config.channels);
+				int64_t(TerrainClipmap::bytes_per_texel(_config.format)) * int64_t(_config.channels);
 		_timeline.push_back(entry);
 		_state_stamp++;
 	}
@@ -1390,25 +1330,9 @@ int Terrain3DClipmapAtlas::invalidate_rect(const Rect2 &p_world) {
 
 // ---- Addressing --------------------------------------------------------------------------------
 
-int Terrain3DClipmapAtlas::cell_for_world(const Vector2 &p_world) const {
-	if (!is_configured() || _cells.empty()) {
-		return -1;
-	}
-	// The finest unit whose own start point puts the point in one of its nine cells - the ring class's
-	// `level_for_world()` rule with a 3x3 arrangement instead of a square, and the mirror of the
-	// shader's arm. Finest first is what keeps a shell's inner hole from answering for a finer unit.
-	for (int ring = 0; ring < _config.rings; ring++) {
-		const int cell = cell_for_ring(ring, p_world);
-		if (cell >= 0 && _cells[size_t(cell)].current) {
-			return cell;
-		}
-	}
-	return -1;
-}
-
 // The cell of *one* unit that holds a world point, or -1 when that unit's own 3x3 does not. It is the
-// addressing rule in one place, so `cell_for_world()`, `get_unit_for_world()` and `sample()` cannot
-// disagree about which cell answers - and the shader's finder is this same arithmetic.
+// addressing rule in one place, so `get_unit_for_world()` and `sample()` cannot disagree about which
+// cell answers - and the shader's finder is this same arithmetic.
 int Terrain3DClipmapAtlas::cell_for_ring(const int p_ring, const Vector2 &p_world) const {
 	if (p_ring < 0 || p_ring >= _config.rings) {
 		return -1;
@@ -1453,8 +1377,8 @@ real_t Terrain3DClipmapAtlas::sample(const Vector2 &p_world, const int p_channel
 		const Vector2 origin(block.x - 0.5f * block_world, block.y - 0.5f * block_world);
 		const int logical_x = int(Math::floor((p_world.x - origin.x) / texel));
 		const int logical_y = int(Math::floor((p_world.y - origin.y) / texel));
-		const int stored_x = ((logical_x + cell.offset.x) % texels + texels) % texels;
-		const int stored_y = ((logical_y + cell.offset.y) % texels + texels) % texels;
+		const int stored_x = TerrainClipmap::wrap_texel(logical_x + cell.offset.x, texels);
+		const int stored_y = TerrainClipmap::wrap_texel(logical_y + cell.offset.y, texels);
 		// The world position the *logical* texel names, which is what the cell's block was produced
 		// from - the content, not the view. Reading the source here is exact because a block's texels
 		// are the source's values at exactly these positions.
@@ -1557,8 +1481,8 @@ Dictionary Terrain3DClipmapAtlas::get_layout_report() const {
 	report["area"] = _layout.area;
 	report["chosen"] = String(_layout.name);
 	report["channels"] = _config.channels;
-	report["format_bytes"] = _atlas_bytes_per_texel(_config.format);
-	report["bytes"] = _layout.area * _atlas_bytes_per_texel(_config.format) * MAX(_config.channels, 1);
+	report["format_bytes"] = TerrainClipmap::bytes_per_texel(_config.format);
+	report["bytes"] = _layout.area * TerrainClipmap::bytes_per_texel(_config.format) * MAX(_config.channels, 1);
 	Array schemes;
 	for (int packer = 0; packer < PACK_COUNT; packer++) {
 		Dictionary scheme;
@@ -1630,17 +1554,13 @@ Array Terrain3DClipmapAtlas::get_load_timeline() const {
 	return entries;
 }
 
-void Terrain3DClipmapAtlas::clear_load_timeline() {
-	_timeline.clear();
-}
-
 ///////////////////////////
 // The shared contract: the sampling rule, the debug schema and the arm
 ///////////////////////////
 
 // The ring whose grid holds a world point, whether or not the cell is current: the *coverage* answer
-// the shared contract asks for. Finest first, exactly like `cell_for_world()` and the shader's own
-// finder, so a shell's inner hole never answers for a finer ring.
+// the shared contract asks for. Finest first, exactly like the shader's own finder, so a shell's
+// inner hole never answers for a finer ring.
 int Terrain3DClipmapAtlas::get_unit_for_world(const Vector2 &p_world) const {
 	if (!is_configured() || _cells.empty()) {
 		return -1;

@@ -211,7 +211,6 @@ private:
 	void _update_mesher_aabbs() { _terrain_mesher ? _terrain_mesher->update_aabbs() : void(); }
 	void _destroy_terrain_mesher(const bool p_final = false);
 	void _setup_ocean_mesher();
-	void _update_ocean_aabbs() { _ocean_mesher ? _ocean_mesher->update_aabbs() : void(); }
 	void _destroy_ocean_mesher(const bool p_final = false);
 	void _destroy_streamer();
 
@@ -527,7 +526,6 @@ public:
 	// destroys the one the last cell that used it has left. See docs/vt_delivery_assembly.md.
 	void set_vt_delivery(const int p_tier, const int p_group, const int p_delivery);
 	int get_vt_delivery(const int p_tier, const int p_group) const;
-	const TerrainVT::DeliveryMatrix &get_vt_delivery_matrix() const { return _vt.delivery; }
 	void set_vt_delivery_near_material(const int p_delivery);
 	int get_vt_delivery_near_material() const { return get_vt_delivery(int(TerrainVT::Tier::Near), int(TerrainVT::ChannelGroup::Material)); }
 	void set_vt_delivery_near_height(const int p_delivery);
@@ -803,7 +801,6 @@ public:
 	int get_avt_directory_mask() const { return _vt.avt_directory_mask; }
 	Dictionary get_avt_layout_preview(Camera3D *p_camera) const;
 	const Terrain3DAVTCoarseImage &get_avt_coarse_image() const { return _vt.avt_coarse; }
-	int get_avt_root_level() const { return _vt.avt_root_level; }
 	// Page-arrival fade: the per-slot ramp a page comes in over, so a page arriving is a
 	// sharpen instead of a rectangular step in the image. The texture is one texel per
 	// physical slot, which is what lets the shader index it by the slot the indirection
@@ -997,7 +994,6 @@ public:
 	// Main-thread CPU the VT section of one physics tick may spend, in milliseconds.
 	void set_vt_frame_budget_ms(real_t p_budget) { _vt.vt_frame_budget_ms = CLAMP(p_budget, 0.f, 16.f); }
 	real_t get_vt_frame_budget_ms() const { return _vt.vt_frame_budget_ms; }
-	Terrain3DMesher *get_mesher() const { return _terrain_mesher; }
 	void set_material(const Ref<Terrain3DMaterial> &p_material);
 	Ref<Terrain3DMaterial> get_material() const { return _material; }
 	void set_mesh_lods(const int p_count);
@@ -1028,7 +1024,6 @@ public:
 	Ref<Shader> get_buffer_shader_override() const { return _material.is_valid() ? _material->get_buffer_shader_override() : Ref<Shader>(); }
 
 	// Ocean Mesh
-	Terrain3DMesher *get_ocean_mesher() const { return _ocean_mesher; }
 	void set_ocean_enabled(const bool p_enabled);
 	bool is_ocean_enabled() const { return _ocean_enabled; }
 	void set_ocean_mesh_lods(const int p_count);

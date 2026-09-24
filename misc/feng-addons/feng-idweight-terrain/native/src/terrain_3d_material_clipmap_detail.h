@@ -71,7 +71,8 @@ public:
 	// A slot table below this is not a cache: the pool has to be able to hold at least a ring of
 	// tiles around the focus or every move would evict what the next frame needs.
 	static constexpr int MIN_SLOTS = 8;
-	// Rects published per level in the arm dictionary, for the debug view only.
+	// The floor the slot table's byte budget is clamped to, so a script cannot express a manager
+	// too small to hold the tiles the next frame needs.
 	static constexpr int64_t MIN_BUDGET_BYTES = 16ll << 20;
 
 	// The shape and the policy. Every field is clamped by `configure()`, so a script cannot express a
@@ -116,8 +117,7 @@ public:
 	struct DemandView {
 		Vector2 focus;
 		Vector2 forward = Vector2(0.f, -1.f);
-		// Camera height above the ground and the vertical field of view, both in metres/radians.
-		real_t height = 1.7f;
+		// The vertical field of view in radians.
 		real_t fov_y = 1.1868f;
 		int viewport_height = 1080;
 		// Overrides `Config::texels_per_pixel` when positive, so a test can ask for one level.
@@ -196,7 +196,6 @@ public:
 	// Whether the budget could afford a usable slot table. False is reported, not hidden: the
 	// caller keeps the coarse ring and logs why this layer does not exist.
 	bool is_enabled() const { return _enabled; }
-	const Config &get_config() const { return _config; }
 
 	// ---- The demand tick --------------------------------------------------------------------------
 	// One update: derive this frame's wanted tile set from `p_view`, hand the missing ones slots
@@ -268,24 +267,13 @@ public:
 	int get_tile_size() const { return _config.tile_size; }
 	int get_border() const { return _config.border; }
 	int get_stored_size() const { return _stored_size; }
-	int get_directory_size() const { return _config.directory_size; }
-	real_t get_density() const { return _config.density; }
-	// Level `l`'s density in texels per metre, its tile span in metres, and the world origin the
-	// level's directory is currently snapped to.
+	// Level `l`'s density in texels per metre and its tile span in metres.
 	real_t get_level_texels_per_meter(const int p_level) const;
 	real_t get_level_tile_world(const int p_level) const;
-	Vector2 get_window_origin(const int p_level) const;
 	int64_t get_budget_bytes() const { return _config.budget_bytes; }
 	int64_t get_used_bytes() const;
 	int64_t get_directory_bytes() const;
 	int64_t bytes_per_slot() const;
-	// How many slots the budget and the ceiling allow, without configuring anything.
-	int slot_capacity_for(const Config &p_config) const;
-	// How many screen texels per world metre a fragment at `p_distance` needs to put
-	// `texels_per_pixel` on a pixel, and which detail level that selects on this view. Public so a
-	// test can assert the rule rather than the picture.
-	real_t required_texels_per_meter(const DemandView &p_view, const real_t p_distance) const;
-	int level_for_distance(const DemandView &p_view, const real_t p_distance) const;
 	// Cumulative counters: tiles that were demanded with a readable slot (hits) and without one
 	// (misses), slots evicted to make room, source results that landed, bakes offered and
 	// acknowledged, and invalidations.
@@ -342,12 +330,6 @@ private:
 	// `valid` tiles are published, which is what makes a stale slot unreadable rather than merely
 	// unadvertised.
 	void _publish_directory(const int p_level);
-	void _mark_directory_dirty() {
-		for (int level = 0; level < MAX_LEVELS; level++) {
-			_directory_dirty[level] = true;
-		}
-		_state_stamp++;
-	}
 
 	Config _config;
 	bool _enabled = false;

@@ -55,7 +55,6 @@ public:
 			const int p_alpha_channel = 0,
 			const int p_ao_channel = 0);
 	static Ref<Image> luminance_to_height(const Ref<Image> &p_src_rgb);
-	static void benchmark(Terrain3D *p_terrain);
 
 protected:
 	static void _bind_methods();
@@ -82,11 +81,6 @@ inline Vector3 v2iv3(const Vector2i &p_v2) {
 // Convert Vector3 to Vector2, ignoring Y
 inline Vector2 v3v2(const Vector3 &p_v3) {
 	return Vector2(p_v3.x, p_v3.z);
-}
-
-// Convert Vector2 to Vector3, ignoring Y
-inline Vector3 v2v3(const Vector2 &p_v2) {
-	return Vector3(p_v2.x, 0., p_v2.y);
 }
 
 ///////////////////////////
@@ -156,14 +150,6 @@ inline T int_divide_floor(const T numer, const T denom) {
 	return result;
 }
 
-// Integer division rounding to nearest int
-template <typename T>
-inline T int_divide_round(const T numer, const T denom) {
-	static_assert(std::numeric_limits<T>::is_integer, "Only integer types are allowed");
-	T result = ((numer) < 0) != ((denom) < 0) ? ((numer) - ((denom) / 2)) / (denom) : ((numer) + ((denom) / 2)) / (denom);
-	return result;
-}
-
 // Returns the bilinearly interpolated value derived from parameters:
 // * 4 values to be interpolated
 // * Positioned at the 4 corners of the p_pos00 - p_pos11 rectangle
@@ -183,14 +169,6 @@ inline real_t bilerp(const real_t p_v00, const real_t p_v01, const real_t p_v10,
 			(x2x1 * y2y1);
 }
 
-inline real_t bilerp(const real_t p_v00, const real_t p_v01, const real_t p_v10, const real_t p_v11,
-		const Vector3 &p_pos00, const Vector3 &p_pos11, const Vector3 &p_pos) {
-	Vector2 pos00 = Vector2(p_pos00.x, p_pos00.z);
-	Vector2 pos11 = Vector2(p_pos11.x, p_pos11.z);
-	Vector2 pos = Vector2(p_pos.x, p_pos.z);
-	return bilerp(p_v00, p_v01, p_v10, p_v11, pos00, pos11, pos);
-}
-
 inline Rect2 aabb2rect(const AABB &p_aabb) {
 	Rect2 rect;
 	rect.position = Vector2(p_aabb.position.x, p_aabb.position.z);
@@ -202,21 +180,6 @@ inline Rect2 aabb2rect(const AABB &p_aabb) {
 inline real_t smoothstep(const real_t p_low, const real_t p_high, const real_t p_value) {
 	real_t t = CLAMP((p_value - p_low) / (p_high - p_low), 0.f, 1.f);
 	return t * t * (3.f - 2.f * t);
-}
-
-inline Vector2 smoothstep(const real_t p_low, const real_t p_high, const Vector2 &p_value) {
-	Vector2 t = (p_value - Vector2(p_low, p_low)) / (p_high - p_low);
-	t.x = CLAMP(t.x, 0.f, 1.f);
-	t.y = CLAMP(t.y, 0.f, 1.f);
-	return t * t * (Vector2(3.f, 3.f) - 2.f * t);
-}
-
-inline Vector3 smoothstep(const real_t p_low, const real_t p_high, const Vector3 &p_value) {
-	Vector3 t = (p_value - Vector3(p_low, p_low, p_low)) / (p_high - p_low);
-	t.x = CLAMP(t.x, 0.f, 1.f);
-	t.y = CLAMP(t.y, 0.f, 1.f);
-	t.z = CLAMP(t.z, 0.f, 1.f);
-	return t * t * (Vector3(3.f, 3.f, 3.f) - 2.f * t);
 }
 
 ///////////////////////////

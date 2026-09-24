@@ -184,17 +184,6 @@ int64_t Terrain3DMaterialClipmapDetail::bytes_per_slot() const {
 							DETAIL_HEIGHT_BYTES_PER_TEXEL);
 }
 
-int Terrain3DMaterialClipmapDetail::slot_capacity_for(const Config &p_config) const {
-	const int stored = p_config.tile_size + p_config.border * 2;
-	const int64_t per_slot = int64_t(stored) * int64_t(stored) *
-			(DETAIL_BAKED_CHANNELS * DETAIL_BAKED_BYTES_PER_TEXEL + DETAIL_PAYLOAD_BYTES_PER_TEXEL +
-					DETAIL_HEIGHT_BYTES_PER_TEXEL);
-	if (per_slot <= 0) {
-		return 0;
-	}
-	return int(CLAMP(int64_t(p_config.budget_bytes) / per_slot, int64_t(0), int64_t(p_config.max_slots)));
-}
-
 int64_t Terrain3DMaterialClipmapDetail::get_used_bytes() const {
 	return int64_t(_slot_count) * bytes_per_slot() + get_directory_bytes();
 }
@@ -219,10 +208,6 @@ real_t Terrain3DMaterialClipmapDetail::get_level_tile_world(const int p_level) c
 	return real_t(_config.tile_size) / ppm;
 }
 
-Vector2 Terrain3DMaterialClipmapDetail::get_window_origin(const int p_level) const {
-	return _window_origin[CLAMP(p_level, 0, MAX_LEVELS - 1)];
-}
-
 Vector2i Terrain3DMaterialClipmapDetail::_tile_of_world(const int p_level, const Vector2 &p_world) const {
 	const real_t tile_world = get_level_tile_world(p_level);
 	return Vector2i(int(Math::floor(p_world.x / tile_world)), int(Math::floor(p_world.y / tile_world)));
@@ -244,31 +229,6 @@ Vector2 Terrain3DMaterialClipmapDetail::_snap_window(const int p_level, const Ve
 	const Vector2i center(int(Math::floor(p_focus.x / tile_world)), int(Math::floor(p_focus.y / tile_world)));
 	const Vector2i base = center - Vector2i(_config.directory_size / 2, _config.directory_size / 2);
 	return Vector2(real_t(base.x) * tile_world, real_t(base.y) * tile_world);
-}
-
-real_t Terrain3DMaterialClipmapDetail::required_texels_per_meter(const DemandView &p_view,
-		const real_t p_distance) const {
-	const real_t tpp = p_view.texels_per_pixel > 0.f ? p_view.texels_per_pixel : _config.texels_per_pixel;
-	// The ground footprint of one screen pixel at `p_distance`, from the vertical field of view and
-	// the viewport's pixel height: `2 * d * tan(fov/2) / height` metres a pixel, so the density that
-	// puts `tpp` texels on it is the reciprocal. The camera's height and pitch are deliberately not
-	// in this: the rule is a screen-footprint rule, and the caller measures the distance it asks
-	// about on the ground plane.
-	const real_t pixel_world = MAX(real_t(1e-4),
-			2.f * p_distance * Math::tan(p_view.fov_y * 0.5f) / real_t(MAX(1, p_view.viewport_height)));
-	return tpp / pixel_world;
-}
-
-int Terrain3DMaterialClipmapDetail::level_for_distance(const DemandView &p_view, const real_t p_distance) const {
-	const real_t required = required_texels_per_meter(p_view, p_distance);
-	int chosen = _config.levels - 1;
-	for (int level = 0; level < _config.levels; level++) {
-		if (get_level_texels_per_meter(level) >= required) {
-			chosen = level;
-			break;
-		}
-	}
-	return chosen;
 }
 
 ///////////////////////////
@@ -629,7 +589,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 																	: Vector2(0.f, -1.f);
 	const real_t cos_limit = Math::cos(_config.forward_half_angle);
 	// The ground footprint of one screen pixel at distance d is `pixel_unit * d` metres, where
-	// `pixel_unit` is the viewport's angular pixel size. `required_texels_per_meter(d)` is
+	// `pixel_unit` is the viewport's angular pixel size. The density a pixel wants at distance d is
 	// `tpp / (pixel_unit * d)`, so the *requested* band of a level - the distances over which its
 	// density is the one a pixel wants - runs from where the next finer level's density stops being
 	// enough to where its own does, and the coarsest runs to the demand radius.
