@@ -225,7 +225,7 @@ private:
 	// The shape and implementation the layer is configured from, in the shared vocabulary. One place
 	// builds it, so the settings, the assembly rule and the debug entry cannot disagree about what a
 	// group's layer is.
-	Terrain3DClipmapLayer::Settings _clipmap_settings() const;
+	Terrain3DClipmapLayer::Settings _clipmap_settings(const TerrainVT::ChannelGroup p_group) const;
 	// The channels this build's ring can carry. One decision read twice - by `has_clipmap_source()`
 	// above and by the factory below - so the matrix's acceptance and the ring's construction cannot
 	// disagree, and adding a channel is one case here plus its source class. `None` is the answer for
@@ -591,15 +591,42 @@ public:
 
 	// ---- Clipmap: the layer's settings and its readings -----------------------------------------
 	// One layer per channel group, built by the assembly rule the first time a cell selects Clipmap
-	// and kept afterwards, exactly like the two views. Unit l covers `base_world * 2^l` metres in
-	// `size` texels, so its texel is `base_world * 2^l / size` metres wide - the shared ladder both
-	// implementations address by.
+	// and kept afterwards, exactly like the two views. The legacy global shape remains a fallback for
+	// existing projects; group-specific zero-valued fields inherit it when customized, or the group's
+	// recommended default otherwise. Unit l covers `base_world * 2^l` metres in `size` texels, so its
+	// texel is `base_world * 2^l / size` metres wide - the shared ladder both implementations address by.
 	void set_vt_clipmap_size(const int p_size);
 	int get_vt_clipmap_size() const { return _vt.clipmap_size; }
 	void set_vt_clipmap_levels(const int p_levels);
 	int get_vt_clipmap_levels() const { return _vt.clipmap_units; }
 	void set_vt_clipmap_base_world(const real_t p_metres);
 	real_t get_vt_clipmap_base_world() const { return _vt.clipmap_base_world; }
+	// Per-group shape overrides are data-only. Zero clears that one field back to inheritance;
+	// get_vt_clipmap_group_shape() reports the fully resolved shape. The old three properties remain
+	// the compatible global fallback while Material and Height can carry different ladders.
+	void set_vt_clipmap_group_size(const int p_group, const int p_size);
+	int get_vt_clipmap_group_size(const int p_group) const;
+	void set_vt_clipmap_group_levels(const int p_group, const int p_levels);
+	int get_vt_clipmap_group_levels(const int p_group) const;
+	void set_vt_clipmap_group_base_world(const int p_group, const real_t p_metres);
+	real_t get_vt_clipmap_group_base_world(const int p_group) const;
+	void reset_vt_clipmap_group_shape(const int p_group);
+	bool is_vt_clipmap_group_shape_overridden(const int p_group) const;
+	Dictionary get_vt_clipmap_group_shape(const int p_group) const;
+	// Inspector-facing serialized fields. Zero means inherit; setting one positive value overrides only
+	// that group's field, with the remaining fields still resolved through the same fallback chain.
+	void set_vt_clipmap_material_size(const int p_size) { set_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Material), p_size); }
+	int get_vt_clipmap_material_size() const { return get_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Material)); }
+	void set_vt_clipmap_material_levels(const int p_levels) { set_vt_clipmap_group_levels(int(TerrainVT::ChannelGroup::Material), p_levels); }
+	int get_vt_clipmap_material_levels() const { return get_vt_clipmap_group_levels(int(TerrainVT::ChannelGroup::Material)); }
+	void set_vt_clipmap_material_base_world(const real_t p_metres) { set_vt_clipmap_group_base_world(int(TerrainVT::ChannelGroup::Material), p_metres); }
+	real_t get_vt_clipmap_material_base_world() const { return get_vt_clipmap_group_base_world(int(TerrainVT::ChannelGroup::Material)); }
+	void set_vt_clipmap_height_size(const int p_size) { set_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Height), p_size); }
+	int get_vt_clipmap_height_size() const { return get_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Height)); }
+	void set_vt_clipmap_height_levels(const int p_levels) { set_vt_clipmap_group_levels(int(TerrainVT::ChannelGroup::Height), p_levels); }
+	int get_vt_clipmap_height_levels() const { return get_vt_clipmap_group_levels(int(TerrainVT::ChannelGroup::Height)); }
+	void set_vt_clipmap_height_base_world(const real_t p_metres) { set_vt_clipmap_group_base_world(int(TerrainVT::ChannelGroup::Height), p_metres); }
+	real_t get_vt_clipmap_height_base_world() const { return get_vt_clipmap_group_base_world(int(TerrainVT::ChannelGroup::Height)); }
 	// **The implementation selector**, and the whole of what used to be a second delivery: `LOD` is
 	// the toroidal level ring, `Atlas` the block atlas. A write here re-resolves the assembly, so the
 	// switch takes effect on the next resolve and the next tick - the storage is replaced, not added.

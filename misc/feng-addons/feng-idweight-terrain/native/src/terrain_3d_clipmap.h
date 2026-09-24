@@ -328,6 +328,29 @@ public:
 	Dictionary get_arm() const override;
 
 private:
+	// Per-call timings and work counts for the LOD implementation. Durations are accumulated in
+	// nanoseconds so the per-row source/scatter split keeps useful precision; the debug payload exposes
+	// them as microseconds. These are reset at the start of every update().
+	struct UpdateDiagnostics {
+		uint64_t update_ns = 0;
+		uint64_t rebuild_schedule_ns = 0;
+		uint64_t source_fill_ns = 0;
+		uint64_t ring_scatter_ns = 0;
+		uint64_t full_level_pack_ns = 0;
+		uint64_t gpu_publish_ns = 0;
+		uint64_t produced_texels = 0;
+		uint64_t packed_texels = 0;
+		uint64_t published_bytes = 0;
+		int jobs_before = 0;
+		int jobs_scheduled = 0;
+		int jobs_completed = 0;
+		int jobs_after = 0;
+		int source_row_calls = 0;
+		int levels_configured = 0;
+		int levels_completed = 0;
+		int published_layers = 0;
+	};
+
 	// Reduces a signed texel index into [0, size). The two wraps - the map's and the source's - are
 	// the trap the addressing tests exist for, so both go through here.
 	int _wrap(const int p_value) const;
@@ -381,6 +404,7 @@ private:
 	uint64_t _produced_texels = 0;
 	uint64_t _full_productions = 0;
 	uint64_t _upload_bytes = 0;
+	UpdateDiagnostics _last_update_diagnostics;
 	uint64_t _update_calls = 0;
 	uint64_t _idle_updates = 0;
 	uint64_t _invalidation_calls = 0;

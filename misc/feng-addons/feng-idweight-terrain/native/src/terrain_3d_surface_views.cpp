@@ -44,6 +44,8 @@
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/viewport.hpp>
 
+#include <cmath>
+
 ///////////////////////////
 // Surface virtual texture
 ///////////////////////////
@@ -677,12 +679,39 @@ bool Terrain3D::has_clipmap_source(const int p_group) const {
 // content - the rule the two views follow (`_resolve_vt_delivery()`), and a selection that comes back
 // finds the layer it left instead of a blank one. The return value is whether a layer exists after the
 // call, which is what `debug_update_vt_clipmap()` reports as -1 rather than as "produced nothing".
-Terrain3DClipmapLayer::Settings Terrain3D::_clipmap_settings() const {
+Terrain3DClipmapLayer::Settings Terrain3D::_clipmap_settings(const TerrainVT::ChannelGroup p_group) const {
 	Terrain3DClipmapLayer::Settings settings;
 	settings.implementation = _vt.clipmap_implementation;
-	settings.shape.size = _vt.clipmap_size;
-	settings.shape.units = _vt.clipmap_units;
-	settings.shape.base_world = _vt.clipmap_base_world;
+	// A legacy tuple that differs from its historical default is an explicit compatibility fallback for
+	// both groups. With the tuple untouched, each group starts from its own recommended shape: material
+	// keeps the complete 1024 -> 1 ladder, while height trades some fine density and storage for the same
+	// one-texel/metre outer endpoint. Per-group fields then override only the values they specify.
+	const TerrainClipmap::Shape legacy_default;
+	const bool has_legacy_override = _vt.clipmap_size != legacy_default.size ||
+			_vt.clipmap_units != legacy_default.units ||
+			!Math::is_equal_approx(_vt.clipmap_base_world, legacy_default.base_world);
+	if (has_legacy_override) {
+		settings.shape.size = _vt.clipmap_size;
+		settings.shape.units = _vt.clipmap_units;
+		settings.shape.base_world = _vt.clipmap_base_world;
+	} else if (p_group == TerrainVT::ChannelGroup::Height) {
+		// 128 texels over 2 m is 64 texels/m; seven units halve this to 1 texel/m at 128 m reach.
+		settings.shape.size = 128;
+		settings.shape.units = 7;
+		settings.shape.base_world = 2.f;
+	} // Material keeps TerrainClipmap::Shape's shipped (256, 11, 0.25 m) defaults.
+	const int index = int(p_group);
+	if (index >= 0 && index < TerrainVT::GROUP_COUNT) {
+		if (_vt.clipmap_group_size[index] > 0) {
+			settings.shape.size = _vt.clipmap_group_size[index];
+		}
+		if (_vt.clipmap_group_units[index] > 0) {
+			settings.shape.units = _vt.clipmap_group_units[index];
+		}
+		if (_vt.clipmap_group_base_world[index] > 0.f) {
+			settings.shape.base_world = _vt.clipmap_group_base_world[index];
+		}
+	}
 	settings.shape.global_texels = _vt.clipmap_atlas_global_texels;
 	settings.shape.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
 	return settings;
@@ -700,7 +729,7 @@ bool Terrain3D::_setup_vt_clipmap(const TerrainVT::ChannelGroup p_group) {
 		_vt.clipmap_layer[index] = std::make_unique<Terrain3DClipmapLayer>(
 				[this, p_group]() { return _make_clipmap_source(p_group); });
 	}
-	Terrain3DClipmapLayer::Settings settings = _clipmap_settings();
+	Terrain3DClipmapLayer::Settings settings = _clipmap_settings(p_group);
 	// The channel's shape is the channel's: a source declares how many scalars a texel holds, what one
 	// value's format is, and what a producer bakes out of those texels. Asking for it *before* the
 	// build is what makes the shape travel with the channel rather than being written here - and it is
@@ -771,6 +800,81 @@ void Terrain3D::set_vt_clipmap_base_world(const real_t p_metres) {
 	}
 	_vt.clipmap_base_world = p_metres;
 	_resolve_vt_delivery(false);
+}
+
+void Terrain3D::set_vt_clipmap_group_size(const int p_group, const int p_size) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || p_size < 0 ||
+			p_size == _vt.clipmap_group_size[p_group]) {
+		return;
+	}
+	_vt.clipmap_group_size[p_group] = p_size;
+	_resolve_vt_delivery(false);
+}
+
+int Terrain3D::get_vt_clipmap_group_size(const int p_group) const {
+	return p_group >= 0 && p_group < TerrainVT::GROUP_COUNT ? _vt.clipmap_group_size[p_group] : 0;
+}
+
+void Terrain3D::set_vt_clipmap_group_levels(const int p_group, const int p_levels) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || p_levels < 0 ||
+			p_levels == _vt.clipmap_group_units[p_group]) {
+		return;
+	}
+	_vt.clipmap_group_units[p_group] = p_levels;
+	_resolve_vt_delivery(false);
+}
+
+int Terrain3D::get_vt_clipmap_group_levels(const int p_group) const {
+	return p_group >= 0 && p_group < TerrainVT::GROUP_COUNT ? _vt.clipmap_group_units[p_group] : 0;
+}
+
+void Terrain3D::set_vt_clipmap_group_base_world(const int p_group, const real_t p_metres) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT || !std::isfinite(p_metres) || p_metres < 0.f ||
+			Math::is_equal_approx(p_metres, _vt.clipmap_group_base_world[p_group])) {
+		return;
+	}
+	_vt.clipmap_group_base_world[p_group] = p_metres;
+	_resolve_vt_delivery(false);
+}
+
+real_t Terrain3D::get_vt_clipmap_group_base_world(const int p_group) const {
+	return p_group >= 0 && p_group < TerrainVT::GROUP_COUNT ? _vt.clipmap_group_base_world[p_group] : 0.f;
+}
+
+void Terrain3D::reset_vt_clipmap_group_shape(const int p_group) {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT ||
+			(_vt.clipmap_group_size[p_group] == 0 && _vt.clipmap_group_units[p_group] == 0 &&
+					_vt.clipmap_group_base_world[p_group] == 0.f)) {
+		return;
+	}
+	_vt.clipmap_group_size[p_group] = 0;
+	_vt.clipmap_group_units[p_group] = 0;
+	_vt.clipmap_group_base_world[p_group] = 0.f;
+	_resolve_vt_delivery(false);
+}
+
+bool Terrain3D::is_vt_clipmap_group_shape_overridden(const int p_group) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return false;
+	}
+	return _vt.clipmap_group_size[p_group] > 0 || _vt.clipmap_group_units[p_group] > 0 ||
+			_vt.clipmap_group_base_world[p_group] > 0.f;
+}
+
+Dictionary Terrain3D::get_vt_clipmap_group_shape(const int p_group) const {
+	Dictionary result;
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return result;
+	}
+	const Terrain3DClipmapLayer::Settings settings = _clipmap_settings(TerrainVT::ChannelGroup(p_group));
+	const TerrainClipmap::Shape &shape = settings.shape;
+	result["size"] = shape.size;
+	result["levels"] = shape.units;
+	result["base_world"] = shape.base_world;
+	result["finest_density"] = real_t(shape.size) / MAX(real_t(0.001), shape.base_world);
+	result["coarsest_density"] = TerrainClipmap::ladder_of(shape).density_at_unit_count(shape.units);
+	result["overridden"] = is_vt_clipmap_group_shape_overridden(p_group);
+	return result;
 }
 
 // The implementation switch. It goes through the assembly rule like every other shape write, so the

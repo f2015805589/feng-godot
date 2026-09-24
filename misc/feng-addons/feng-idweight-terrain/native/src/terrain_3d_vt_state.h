@@ -546,21 +546,21 @@ struct Terrain3DVTState {
 	// texels, which is the shared ladder both implementations address by. `budget_texels` is what one
 	// layer may produce in one tick, in channel texels; it is not part of the page budget, because the
 	// clipmap does not touch the shared pool.
-	// The numbers below are the **recommended configuration**, and they are the ladder's own two
-	// endpoints: `size / base_world` is the finest density (256 texels over 0.25 m is **1024 texels a
-	// metre**) and `units` is the count that halves down to **1 texel a metre** (`1024 / 2^10 == 1`,
-	// eleven units). The earlier shapes capped the ladder at 1 (the inherited `base_world` 256) or at 8
-	// (`base_world` 32), which is why the near field was mush however many units the layer held: the
-	// cap is what a unit's density flattens to inside its own coverage. The reach that buys is
-	// `base_world * 2^10 = 256 m` of level square for the LOD implementation (+/-128 m) and 1.5 times
-	// that for the atlas, with 1024 texels a metre inside the first quarter-metre and 32 texels a metre
-	// at 4 m. See the task summary's cost table: the price is memory (levels x size^2 for the ring,
-	// 9 x blocksize^2 per ring for the atlas) and, for the LOD implementation, a whole-layer upload a
-	// finer unit publishes more often - which is exactly the cost the Atlas implementation does not pay.
+	// The legacy tuple remains at its historical material-oriented default: 256 texels over 0.25 m for
+	// eleven units, or 1024 -> 1 texels a metre. `_clipmap_settings(group)` keeps that tuple as the
+	// fallback for projects that customize it, while untouched defaults may choose a lower-density
+	// height ladder. A per-group zero field inherits; a positive field overrides that one value.
 	TerrainClipmap::Implementation clipmap_implementation = TerrainClipmap::Implementation::LOD;
 	int clipmap_size = 256;
 	int clipmap_units = TerrainClipmap::LADDER_UNITS;
 	real_t clipmap_base_world = 0.25f;
+	// Per-group fields are data-only overrides of the legacy/global shape above. Zero means "inherit":
+	// the group's shipped default when the legacy tuple is untouched, or the legacy tuple when a project
+	// has customized it. The effective values are always assembled into one TerrainClipmap::Shape by
+	// Terrain3D::_clipmap_settings(group), then shared by the LOD and Atlas implementations.
+	int clipmap_group_size[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	int clipmap_group_units[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	real_t clipmap_group_base_world[TerrainVT::GROUP_COUNT] = { 0.f, 0.f };
 	int clipmap_budget_texels = 65536;
 	// The atlas's own shape, used by the Atlas implementation and ignored by LOD: the texels its
 	// one-time global block holds, and the per-frame production bound (one is the user's "a frame

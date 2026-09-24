@@ -7,6 +7,8 @@
 
 #include "terrain_3d_clipmap.h"
 
+#include <chrono>
+
 #include <godot_cpp/classes/rd_texture_format.hpp>
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
@@ -21,6 +23,15 @@
 #include <godot_cpp/variant/typed_array.hpp>
 
 #include "logger.h"
+
+namespace {
+
+uint64_t clipmap_clock_ns() {
+	return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+} // namespace
 
 // The smallest and largest ring the settings can ask for. A level below 8 texels an axis stops
 // being a clipmap (there is no strip left to update); above 4096 the array is larger than any
@@ -292,18 +303,29 @@ int Terrain3DClipmap::invalidate_rect(const Rect2 &p_world) {
 }
 
 int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) {
+	const uint64_t update_started_ns = clipmap_clock_ns();
+	_last_update_diagnostics = UpdateDiagnostics();
+	_last_update_diagnostics.levels_configured = int(_levels.size());
+	_last_update_diagnostics.jobs_before = int(_jobs.size());
+	_last_update_diagnostics.jobs_after = int(_jobs.size());
 	_update_calls++;
 	if (!is_configured() || _source == nullptr) {
+		_last_update_diagnostics.update_ns = clipmap_clock_ns() - update_started_ns;
 		return 0;
 	}
 	// Jobs already queued describe the mapping the levels were advanced to. Re-deriving them from
 	// the focus now would discard a partially produced level and produce a rect the ring no longer
 	// matches, so the queue is only rebuilt once it is empty.
 	if (_jobs.empty()) {
+		const uint64_t rebuild_started_ns = clipmap_clock_ns();
 		_rebuild_jobs(p_focus);
+		_last_update_diagnostics.rebuild_schedule_ns += clipmap_clock_ns() - rebuild_started_ns;
+		_last_update_diagnostics.jobs_scheduled = int(_jobs.size());
 	}
 	if (_jobs.empty()) {
 		_idle_updates++;
+		_last_update_diagnostics.jobs_after = int(_jobs.size());
+		_last_update_diagnostics.update_ns = clipmap_clock_ns() - update_started_ns;
 		return 0;
 	}
 	int budget = MAX(0, p_budget_texels);
@@ -323,6 +345,7 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 			}
 			break;
 		}
+		_last_update_diagnostics.jobs_completed++;
 		// The rect is whole, so a bake has something to cover: the *rect*, not the level, because the
 		// texels outside it still describe the world positions they described before - which is the
 		// whole reason the baked layers are indexed logically.
@@ -351,6 +374,7 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 		}
 		if (!still_queued) {
 			_levels[size_t(level)].valid = true;
+			_last_update_diagnostics.levels_completed++;
 			_publish_level(level);
 			// A level that just became current is a level a reader may now serve, which is addressing
 			// state like any other.
@@ -358,6 +382,9 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 		}
 	}
 	_jobs = std::move(remaining);
+	_last_update_diagnostics.produced_texels = uint64_t(produced);
+	_last_update_diagnostics.jobs_after = int(_jobs.size());
+	_last_update_diagnostics.update_ns = clipmap_clock_ns() - update_started_ns;
 	return produced;
 }
 
@@ -493,14 +520,20 @@ void Terrain3DClipmap::_fill_row(const Job &p_job, const int p_channel, const in
 	const real_t half = entry.world_size * 0.5f;
 	const real_t centre_of_first = 0.5f * entry.texel_world;
 	row.origin = Vector2(entry.center.x - half + centre_of_first, entry.center.y - half + centre_of_first);
+	const uint64_t source_started_ns = clipmap_clock_ns();
 	_source->fill_row(row, _row_values.data());
+	const uint64_t source_finished_ns = clipmap_clock_ns();
+	_last_update_diagnostics.source_fill_ns += source_finished_ns - source_started_ns;
+	_last_update_diagnostics.source_row_calls++;
 	// The source never sees a physical index: the ring is undone here, per value, so a wrap cannot
 	// reach the producer.
+	const uint64_t scatter_started_ns = source_finished_ns;
 	for (int x = p_x0; x < p_x1; x++) {
 		const Vector2i physical = physical_of_logical(p_job.level, Vector2i(x, p_y));
 		entry.texels[(size_t(physical.y) * size_t(_config.size) + size_t(physical.x)) * size_t(_config.channels) +
 				size_t(p_channel)] = _row_values[size_t(x)];
 	}
+	_last_update_diagnostics.ring_scatter_ns += clipmap_clock_ns() - scatter_started_ns;
 }
 
 void Terrain3DClipmap::_ensure_texture() {
@@ -518,17 +551,22 @@ void Terrain3DClipmap::_ensure_texture() {
 }
 
 void Terrain3DClipmap::_publish_level(const int p_level) {
+	const uint64_t ensure_started_ns = clipmap_clock_ns();
 	_ensure_texture();
+	_last_update_diagnostics.gpu_publish_ns += clipmap_clock_ns() - ensure_started_ns;
 	if (!_texture.get_rid().is_valid()) {
 		return;
 	}
 	const Level &entry = _levels[size_t(p_level)];
 	const int64_t texels = int64_t(_config.size) * int64_t(_config.size);
 	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
+	const uint64_t allocation_started_ns = clipmap_clock_ns();
 	PackedByteArray bytes;
 	bytes.resize(texels * bytes_per_texel);
 	uint8_t *dst = bytes.ptrw();
+	_last_update_diagnostics.full_level_pack_ns += clipmap_clock_ns() - allocation_started_ns;
 	for (int channel = 0; channel < _config.channels; channel++) {
+		const uint64_t pack_started_ns = clipmap_clock_ns();
 		if (_config.format == Image::FORMAT_RF) {
 			float *values = reinterpret_cast<float *>(dst);
 			for (int64_t texel = 0; texel < texels; texel++) {
@@ -543,7 +581,13 @@ void Terrain3DClipmap::_publish_level(const int p_level) {
 		// A fresh image per layer, not a reused one: `texture_2d_update()` queues the image it was
 		// given, so a shared buffer would be rewritten before the queue flushes.
 		Ref<Image> image = Image::create_from_data(_config.size, _config.size, false, _config.format, bytes);
+		_last_update_diagnostics.full_level_pack_ns += clipmap_clock_ns() - pack_started_ns;
+		_last_update_diagnostics.packed_texels += uint64_t(texels);
+		const uint64_t gpu_started_ns = clipmap_clock_ns();
 		_texture.update(image, p_level * _config.channels + channel);
+		_last_update_diagnostics.gpu_publish_ns += clipmap_clock_ns() - gpu_started_ns;
+		_last_update_diagnostics.published_layers++;
+		_last_update_diagnostics.published_bytes += uint64_t(texels * bytes_per_texel);
 		_upload_bytes += uint64_t(texels * bytes_per_texel);
 	}
 }
@@ -989,6 +1033,27 @@ Dictionary Terrain3DClipmap::get_impl_payload() const {
 	payload["bake_rejects"] = int64_t(_bake_rejects);
 	payload["invalidation_calls"] = int64_t(_invalidation_calls);
 	payload["invalidated_texels"] = int64_t(_invalidated_texels);
+	Dictionary update_diagnostics;
+	update_diagnostics["update_us"] = double(_last_update_diagnostics.update_ns) / 1000.0;
+	update_diagnostics["rebuild_schedule_us"] = double(_last_update_diagnostics.rebuild_schedule_ns) / 1000.0;
+	update_diagnostics["source_fill_us"] = double(_last_update_diagnostics.source_fill_ns) / 1000.0;
+	update_diagnostics["ring_scatter_us"] = double(_last_update_diagnostics.ring_scatter_ns) / 1000.0;
+	update_diagnostics["full_level_pack_us"] = double(_last_update_diagnostics.full_level_pack_ns) / 1000.0;
+	// This is the synchronous time spent ensuring storage and submitting layer updates through
+	// RenderingServer. It does not include later render-thread transfer or GPU completion time.
+	update_diagnostics["gpu_publish_us"] = double(_last_update_diagnostics.gpu_publish_ns) / 1000.0;
+	update_diagnostics["jobs_before"] = _last_update_diagnostics.jobs_before;
+	update_diagnostics["jobs_scheduled"] = _last_update_diagnostics.jobs_scheduled;
+	update_diagnostics["jobs_completed"] = _last_update_diagnostics.jobs_completed;
+	update_diagnostics["jobs_after"] = _last_update_diagnostics.jobs_after;
+	update_diagnostics["source_row_calls"] = _last_update_diagnostics.source_row_calls;
+	update_diagnostics["levels_configured"] = _last_update_diagnostics.levels_configured;
+	update_diagnostics["produced_texels"] = int64_t(_last_update_diagnostics.produced_texels);
+	update_diagnostics["packed_texels"] = int64_t(_last_update_diagnostics.packed_texels);
+	update_diagnostics["published_bytes"] = int64_t(_last_update_diagnostics.published_bytes);
+	update_diagnostics["levels_completed"] = _last_update_diagnostics.levels_completed;
+	update_diagnostics["published_layers"] = _last_update_diagnostics.published_layers;
+	payload["update_diagnostics"] = update_diagnostics;
 	return payload;
 }
 

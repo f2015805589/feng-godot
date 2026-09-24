@@ -1128,6 +1128,15 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 			if (cell.pending_slot != job.slot) {
 				continue;
 			}
+			// A ring can move again while this job waits behind the per-frame block budget. Its
+			// waiter then names a newer coordinate, so landing this old block must not publish it as
+			// current. Release the stale waiter; the next reconciliation either reuses the landed
+			// coordinate where it is still wanted or queues the cell's latest block into a free slot.
+			if (cell.ring != job.ring || cell.want_x != job.block_x || cell.want_y != job.block_y) {
+				cell.pending_slot = -1;
+				cell.current = false;
+				continue;
+			}
 			cell.slot = job.slot;
 			cell.have_x = job.block_x;
 			cell.have_y = job.block_y;
@@ -1372,6 +1381,7 @@ Dictionary Terrain3DClipmapAtlas::get_layout_report() const {
 		Dictionary entry;
 		entry["rect"] = Rect2(slot.rect);
 		entry["ring"] = slot.ring;
+		entry["block"] = Vector2i(int(slot.block_x), int(slot.block_y));
 		entry["texels"] = slot.texels;
 		entry["spare"] = slot.spare;
 		entry["global"] = slot.global;

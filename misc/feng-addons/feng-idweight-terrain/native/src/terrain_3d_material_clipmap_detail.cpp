@@ -24,6 +24,7 @@
 #include <godot_cpp/variant/typed_array.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 // `tile_key()` packs a signed tile coordinate into 27 bits an axis and the level above them, so the
@@ -33,6 +34,12 @@ static constexpr int DETAIL_TILE_BITS = 27;
 static constexpr int64_t DETAIL_TILE_MASK = (int64_t(1) << DETAIL_TILE_BITS) - 1;
 static constexpr int64_t DETAIL_TILE_SIGN = int64_t(1) << (DETAIL_TILE_BITS - 1);
 static constexpr int DETAIL_LEVEL_SHIFT = DETAIL_TILE_BITS * 2;
+
+using DetailUpdateClock = std::chrono::steady_clock;
+
+static uint64_t detail_elapsed_usec(const DetailUpdateClock::time_point p_start) {
+	return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(DetailUpdateClock::now() - p_start).count());
+}
 
 // How many ticks an offer may stay unacknowledged before the tile is offered again. A producer that
 // exists but cannot dispatch (no material list yet, no device) leaves its offers queued rather than
@@ -158,6 +165,8 @@ void Terrain3DMaterialClipmapDetail::clear() {
 	_wanted.clear();
 	_payload.clear();
 	_height.clear();
+	_payload_blank.unref();
+	_height_blank.unref();
 	for (int level = 0; level < MAX_LEVELS; level++) {
 		_directory[level].clear();
 		_directory_dirty[level] = true;
@@ -236,10 +245,14 @@ Vector2 Terrain3DMaterialClipmapDetail::_snap_window(const int p_level, const Ve
 ///////////////////////////
 
 void Terrain3DMaterialClipmapDetail::_ensure_storage() {
-	Ref<Image> payload_blank = Image::create(_stored_size, _stored_size, false, IDWEIGHT_IMAGE_FORMAT);
-	Ref<Image> height_blank = Image::create(_stored_size, _stored_size, false, Image::FORMAT_RF);
-	_payload.ensure_layers(payload_blank, _slot_count);
-	_height.ensure_layers(height_blank, _slot_count);
+	if (_payload_blank.is_null()) {
+		_payload_blank = Image::create(_stored_size, _stored_size, false, IDWEIGHT_IMAGE_FORMAT);
+	}
+	if (_height_blank.is_null()) {
+		_height_blank = Image::create(_stored_size, _stored_size, false, Image::FORMAT_RF);
+	}
+	_payload.ensure_layers(_payload_blank, _slot_count);
+	_height.ensure_layers(_height_blank, _slot_count);
 	_ensure_baked();
 	if (_pipeline == nullptr) {
 		_pipeline = std::make_unique<Terrain3DPagePipeline>(_config.source_workers);
@@ -552,10 +565,15 @@ int Terrain3DMaterialClipmapDetail::invalidate_rect(const Rect2 &p_world) {
 
 int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot, const int p_source_budget) {
+	const DetailUpdateClock::time_point update_started = DetailUpdateClock::now();
+	_last_update = UpdateDiagnostics();
 	if (!is_enabled()) {
+		_last_update.total_us = detail_elapsed_usec(update_started);
 		return 0;
 	}
+	const DetailUpdateClock::time_point storage_started = DetailUpdateClock::now();
 	_ensure_storage();
+	_last_update.storage_us = detail_elapsed_usec(storage_started);
 	_tick++;
 	_starved = 0;
 	_wanted.clear();
@@ -563,6 +581,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 
 	// 1. The windows. A level whose window moved has to re-publish its directory, because the
 	//    directory's index is relative to the window the shader is told about.
+	const DetailUpdateClock::time_point windows_started = DetailUpdateClock::now();
 	for (int level = 0; level < _config.levels; level++) {
 		const Vector2 origin = _snap_window(level, p_view.focus);
 		if (!origin.is_equal_approx(_window_origin[level])) {
@@ -571,6 +590,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 			_state_stamp++;
 		}
 	}
+	_last_update.windows_us = detail_elapsed_usec(windows_started);
 
 	// 2. The demand walk. Each level owns a *band* of distances: the range over which its density is
 	//    the one the screen footprint asks for. That is what makes the demand follow the camera: the
@@ -585,6 +605,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	};
 	std::vector<Demand> demand;
 	demand.reserve(256);
+	const DetailUpdateClock::time_point band_fit_started = DetailUpdateClock::now();
 	const Vector2 forward = p_view.forward.length_squared() > 1e-8f ? p_view.forward.normalized()
 																	: Vector2(0.f, -1.f);
 	const real_t cos_limit = Math::cos(_config.forward_half_angle);
@@ -667,6 +688,8 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		}
 		fit_bands(low);
 	}
+	_last_update.band_fit_us = detail_elapsed_usec(band_fit_started);
+	const DetailUpdateClock::time_point candidate_started = DetailUpdateClock::now();
 	for (int level = 0; level < _config.levels; level++) {
 		const real_t tile_world = get_level_tile_world(level);
 		const real_t outer = band_outer[level];
@@ -683,6 +706,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		const Vector2i center = _tile_of_world(level, p_view.focus);
 		for (int dy = -radius; dy <= radius; dy++) {
 			for (int dx = -radius; dx <= radius; dx++) {
+				_last_update.candidate_tests++;
 				const int x = center.x + dx;
 				const int y = center.y + dy;
 				const Vector2 tile_center((real_t(x) + 0.5f) * tile_world, (real_t(y) + 0.5f) * tile_world);
@@ -708,10 +732,13 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		}
 		return a.level < b.level;
 	});
+	_last_update.candidate_walk_sort_us = detail_elapsed_usec(candidate_started);
+	_last_update.candidates = int64_t(demand.size());
 
 	// 3. The wanted set, before any slot is handed out, so eviction can tell this frame's demand
 	//    from what the last frame left behind. The value is the tile's rank in the walk (1 is the
 	//    nearest), which is what the offer queue below orders by.
+	const DetailUpdateClock::time_point residency_started = DetailUpdateClock::now();
 	for (size_t rank = 0; rank < demand.size(); rank++) {
 		_wanted[demand[rank].key] = uint32_t(rank) + 1;
 	}
@@ -767,18 +794,18 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		++it;
 	}
 	(void)released;
+	_last_update.residency_eviction_us = detail_elapsed_usec(residency_started);
+	_last_update.requested = requested;
+	_last_update.released = released;
 
 	// 6. Source: submit what the walk newly asked for, then collect what the workers finished. The
 	//    pipeline is only touched when there is something to do, so a settled view costs a scan of
 	//    the resident set rather than a queue lock.
-	if (_pipeline && p_snapshot) {
-		std::vector<Terrain3DPagePipeline::Request> requests;
-		const int budget = CLAMP(p_source_budget, 1, 32);
-		requests.reserve(size_t(budget));
+	const DetailUpdateClock::time_point source_submit_started = DetailUpdateClock::now();
+	std::vector<Terrain3DPagePipeline::Request> source_requests;
+	auto collect_source_requests = [&]() {
+		source_requests.clear();
 		for (const Demand &entry : demand) {
-			if (int(requests.size()) >= budget) {
-				break;
-			}
 			auto found = _resident.find(entry.key);
 			if (found == _resident.end()) {
 				continue;
@@ -787,16 +814,36 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 			if (!tile.pending || tile.source_ready) {
 				continue;
 			}
-			requests.push_back({ { tile.level, tile.x, tile.y, 0, 0 },
+			source_requests.push_back({ { tile.level, tile.x, tile.y, 0, 0 },
 					_tile_world_rect(tile.level, tile.x, tile.y), _config.tile_size, _config.border,
 					false, String(), 0u, get_level_texels_per_meter(tile.level) });
 		}
-		if (!requests.empty()) {
-			_pipeline->prime(requests, p_snapshot);
+	};
+	if (_pipeline && p_snapshot) {
+		// The queue is the source budget: it is deliberately shallow, and `prime()` admits the
+		// nearest still-pending tiles up to that bound in one locked batch. Passing only
+		// p_source_budget requests here does not cap the old poll path, which inserted the remaining
+		// demanded keys one at a time below until the queue filled.
+		const int budget = CLAMP(p_source_budget, 1, 32);
+		collect_source_requests();
+		_last_update.source_requests = int64_t(MIN(source_requests.size(), size_t(budget)));
+		if (!source_requests.empty()) {
+			const DetailUpdateClock::time_point queue_started = DetailUpdateClock::now();
+			_pipeline->prime(source_requests, p_snapshot);
+			_last_update.source_queue_us += detail_elapsed_usec(queue_started);
 		}
-		// Poll every tile that is still waiting for its source, in demand order. A result that is
-		// not ready is left for the tick that follows; a result that is ready is uploaded now, and
-		// its bake is offered to the producer below.
+	}
+	_last_update.source_submit_us = detail_elapsed_usec(source_submit_started);
+	const DetailUpdateClock::time_point source_poll_started = DetailUpdateClock::now();
+	const uint64_t source_uploads_before = _source_uploads;
+	if (_pipeline && p_snapshot) {
+		// Snapshot ready keys once, then poll only completed work. Calling `poll()` on every pending
+		// resident performs a queue lock and a linear search even when its result is still running;
+		// the bounded ready-key snapshot keeps the same nearest-first consumption order with one
+		// queue scan and one lock per completed tile.
+		const DetailUpdateClock::time_point ready_started = DetailUpdateClock::now();
+		const Terrain3DPagePipeline::ReadyKeys ready = _pipeline->ready_keys();
+		_last_update.source_queue_us += detail_elapsed_usec(ready_started);
 		for (const Demand &entry : demand) {
 			auto found = _resident.find(entry.key);
 			if (found == _resident.end()) {
@@ -804,23 +851,32 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 			}
 			Tile &tile = _slots[size_t(found->second)];
 			if (!tile.pending || tile.source_ready) {
+				continue;
+			}
+			const Terrain3DPagePipeline::Key key{ tile.level, tile.x, tile.y, 0, 0 };
+			if (!ready.contains(key)) {
 				continue;
 			}
 			Terrain3DPagePipeline::Request request{ { tile.level, tile.x, tile.y, 0, 0 },
 				_tile_world_rect(tile.level, tile.x, tile.y), _config.tile_size, _config.border, false,
 				String(), 0u, get_level_texels_per_meter(tile.level) };
 			Terrain3DPagePipeline::Result prepared;
+			const DetailUpdateClock::time_point poll_started = DetailUpdateClock::now();
 			if (!_pipeline->poll(request, p_snapshot, prepared)) {
+				_last_update.source_queue_us += detail_elapsed_usec(poll_started);
 				continue;
 			}
+			_last_update.source_queue_us += detail_elapsed_usec(poll_started);
 			if (prepared.ids.is_null() || prepared.height.is_null()) {
 				continue;
 			}
 			// The two source arrays are RenderingServer-owned, so the upload is a queued command
 			// and the bake that reads it is dispatched a call later - the ring's own one-tick
 			// separation, for the same reason.
+			const DetailUpdateClock::time_point upload_started = DetailUpdateClock::now();
 			_payload.update(prepared.ids, tile.slot);
 			_height.update(prepared.height, tile.slot);
+			_last_update.source_texture_upload_us += detail_elapsed_usec(upload_started);
 			// The pipeline answers with the *source* corner grid when the output texel is finer than
 			// the source step, which is the case this layer exists for. A zero grid means it produced
 			// the output-resolution payload instead (the output texel is coarser than the source, so
@@ -832,7 +888,17 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 			tile.offer_tick = 0;
 			_source_uploads++;
 		}
+		// Consuming completed results opened queue slots. Re-prime the same nearest-first request
+		// batch once so those slots are refilled this tick, as the former per-key poll side effect did.
+		collect_source_requests();
+		if (!source_requests.empty()) {
+			const DetailUpdateClock::time_point queue_started = DetailUpdateClock::now();
+			_pipeline->prime(source_requests, p_snapshot);
+			_last_update.source_queue_us += detail_elapsed_usec(queue_started);
+		}
 	}
+	_last_update.source_poll_upload_us = detail_elapsed_usec(source_poll_started);
+	_last_update.source_uploads = int64_t(_source_uploads - source_uploads_before);
 
 	// 7. Offers. A tile whose source landed and whose bake no producer has taken is offered here;
 	//    an offer that has gone unacknowledged for too long is offered again, because a producer
@@ -846,6 +912,8 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	//    1.6 m ahead stayed unreadable for the whole acceptance window while ten tiles a mile away
 	//    were valid. Only a tile this walk wants is offered: a resident tile the view has left is
 	//    about to be evicted, and spending a dispatch on it is the same defect from the other side.
+	const uint64_t bake_offers_before = _bake_offers;
+	const DetailUpdateClock::time_point offer_started = DetailUpdateClock::now();
 	for (const Demand &entry : demand) {
 		auto found = _resident.find(entry.key);
 		if (found == _resident.end()) {
@@ -895,17 +963,25 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		};
 		return rank_of(p_a) < rank_of(p_b);
 	});
+	_last_update.offer_sort_us = detail_elapsed_usec(offer_started);
+	_last_update.bake_offers_added = int64_t(_bake_offers - bake_offers_before);
 
 	// 8. Publish the directories that moved. Only `valid` tiles are written, so a resident but
 	//    unbaked slot is invisible to a fragment rather than merely unadvertised.
+	const DetailUpdateClock::time_point directory_started = DetailUpdateClock::now();
 	for (int level = 0; level < _config.levels; level++) {
 		if (_directory_dirty[level]) {
 			_publish_directory(level);
+			_last_update.directories_published++;
 		}
 	}
+	_last_update.directory_publish_us = detail_elapsed_usec(directory_started);
+	const DetailUpdateClock::time_point flush_started = DetailUpdateClock::now();
 	if (_pipeline) {
 		_pipeline->flush_wakes();
 	}
+	_last_update.source_submit_us += detail_elapsed_usec(flush_started);
+	_last_update.total_us = detail_elapsed_usec(update_started);
 	return requested;
 }
 
@@ -993,6 +1069,28 @@ Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
 	arm["texel_world"] = texel_worlds;
 	arm["window_origin"] = window_origins;
 	arm["directory"] = directories;
+	Dictionary update_diagnostics;
+	update_diagnostics["total_us"] = int64_t(_last_update.total_us);
+	update_diagnostics["storage_us"] = int64_t(_last_update.storage_us);
+	update_diagnostics["windows_us"] = int64_t(_last_update.windows_us);
+	update_diagnostics["band_fit_us"] = int64_t(_last_update.band_fit_us);
+	update_diagnostics["candidate_walk_sort_us"] = int64_t(_last_update.candidate_walk_sort_us);
+	update_diagnostics["residency_eviction_us"] = int64_t(_last_update.residency_eviction_us);
+	update_diagnostics["source_submit_us"] = int64_t(_last_update.source_submit_us);
+	update_diagnostics["source_queue_us"] = int64_t(_last_update.source_queue_us);
+	update_diagnostics["source_poll_upload_us"] = int64_t(_last_update.source_poll_upload_us);
+	update_diagnostics["source_texture_upload_us"] = int64_t(_last_update.source_texture_upload_us);
+	update_diagnostics["offer_sort_us"] = int64_t(_last_update.offer_sort_us);
+	update_diagnostics["directory_publish_us"] = int64_t(_last_update.directory_publish_us);
+	update_diagnostics["candidate_tests"] = int64_t(_last_update.candidate_tests);
+	update_diagnostics["candidates"] = _last_update.candidates;
+	update_diagnostics["requested"] = _last_update.requested;
+	update_diagnostics["released"] = _last_update.released;
+	update_diagnostics["directories_published"] = _last_update.directories_published;
+	update_diagnostics["source_requests"] = _last_update.source_requests;
+	update_diagnostics["source_uploads"] = _last_update.source_uploads;
+	update_diagnostics["bake_offers_added"] = _last_update.bake_offers_added;
+	arm["update_diagnostics"] = update_diagnostics;
 	return arm;
 }
 

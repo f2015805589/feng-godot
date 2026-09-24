@@ -154,6 +154,47 @@ func mat_entry() -> Dictionary:
 	return settings().get("clipmap", {}).get("material", {})
 
 
+func preview_group(preview: Dictionary, group_name: String) -> Dictionary:
+	for layer: Dictionary in preview.get("layers", []):
+		if str(layer.get("group", "")) == group_name:
+			return layer
+	return {}
+
+
+func density_series_text(densities: PackedFloat32Array) -> String:
+	var values := PackedStringArray()
+	for density in densities:
+		values.append("%.0f" % float(density))
+	return "[" + ",".join(values) + "]"
+
+
+# Read the layers the native clipmap mechanism actually configured before the render fixture applies
+# its deliberately coarse legacy Material shape. This keeps the material and height defaults visible
+# in the named density probe instead of relying only on property values or another test family.
+func probe_actual_group_ladders() -> void:
+	terrain.call("debug_update_vt_clipmap", HEIGHT)
+	terrain.call("debug_update_vt_clipmap", MATERIAL)
+	var preview := terrain.get_clipmap_layout_preview()
+	var material_layer := preview_group(preview, "material")
+	var height_layer := preview_group(preview, "height")
+	require(not material_layer.is_empty() and not height_layer.is_empty(),
+			"the density probe exposes actual Material and Height clipmap layers")
+	var material_densities: PackedFloat32Array = material_layer.get("unit_density", PackedFloat32Array())
+	var height_densities: PackedFloat32Array = height_layer.get("unit_density", PackedFloat32Array())
+	print("CLIPMAP_DENSITY ladders material=%s height=%s" % [
+		density_series_text(material_densities), density_series_text(height_densities)])
+	var material_ladder_ok := material_densities.size() == 11
+	if material_ladder_ok:
+		material_ladder_ok = is_equal_approx(material_densities[0], 1024.0) and is_equal_approx(material_densities[10], 1.0)
+	require(material_ladder_ok,
+			"the actual default Material ladder stays 1024 -> 1 texels/m")
+	var height_ladder_ok := height_densities.size() == 7
+	if height_ladder_ok:
+		height_ladder_ok = is_equal_approx(height_densities[0], 64.0) and is_equal_approx(height_densities[6], 1.0)
+	require(height_ladder_ok,
+			"the actual default Height ladder is lower density and still ends at 1 texel/m")
+
+
 func coarse_levels() -> int:
 	return int(mat_entry().get("units", RING_LEVELS))
 
@@ -661,7 +702,6 @@ func setup() -> void:
 	terrain.vt_delivery_near_height = DIRECT
 	terrain.vt_delivery_far_height = DIRECT
 	add_probe_assets()
-	configure_ring()
 	terrain.set_camera(camera)
 	terrain.set_clipmap_target(camera)
 	scene.add_child(terrain)
@@ -679,6 +719,8 @@ func setup() -> void:
 		for x in range(-1, 2):
 			terrain.data.add_region_blank(Vector2i(x, z), false)
 	terrain.data.update_maps()
+	probe_actual_group_ladders()
+	configure_ring()
 	for bz in 8:
 		for bx in 8:
 			paint_material(Vector3(float(bx) * 8.0 + 4.0, 0.0, float(bz) * 8.0 + 4.0), (bx + bz) % 2)

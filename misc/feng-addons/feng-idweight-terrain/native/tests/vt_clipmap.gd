@@ -147,6 +147,55 @@ func sample(world: Vector2) -> float:
 	return terrain.sample_vt_clipmap(HEIGHT, world)
 
 
+func preview_layer(preview: Dictionary, group_name: String) -> Dictionary:
+	for entry: Dictionary in preview.get("layers", []):
+		if str(entry.get("group", "")) == group_name:
+			return entry
+	return {}
+
+
+func run_clipmap_shape_serialization_block() -> void:
+	# The exported native properties are the storage contract for old scene files as well as the new
+	# group-specific overrides, so exercise a real PackedScene roundtrip rather than only method calls.
+	var serialized := Terrain3D.new()
+	serialized.vt_clipmap_size = 32
+	serialized.vt_clipmap_levels = 5
+	serialized.vt_clipmap_base_world = 8.0
+	serialized.vt_clipmap_height_size = 64
+	var packed := PackedScene.new()
+	var pack_error := packed.pack(serialized)
+	require(pack_error == OK, "a Terrain3D with legacy and per-group clipmap values packs into a scene")
+	if pack_error != OK:
+		serialized.free()
+		return
+	const path := "user://vt_clipmap_group_shape_roundtrip.tscn"
+	var save_error := ResourceSaver.save(packed, path)
+	require(save_error == OK, "clipmap shape properties serialize to a PackedScene")
+	if save_error != OK:
+		serialized.free()
+		return
+	var loaded_scene := ResourceLoader.load(path) as PackedScene
+	require(loaded_scene != null, "the serialized clipmap scene can be loaded")
+	if loaded_scene == null:
+		serialized.free()
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+		return
+	var loaded_node := loaded_scene.instantiate()
+	var loaded := loaded_node as Terrain3D
+	require(loaded != null, "the loaded scene retains its Terrain3D root")
+	if loaded != null:
+		require(loaded.vt_clipmap_size == 32 and loaded.vt_clipmap_levels == 5 and
+				is_equal_approx(loaded.vt_clipmap_base_world, 8.0),
+				"legacy global clipmap values survive scene serialization")
+		require(loaded.vt_clipmap_height_size == 64 and
+				int(loaded.get_vt_clipmap_group_shape(HEIGHT).get("size", 0)) == 64 and
+				int(loaded.get_vt_clipmap_group_shape(HEIGHT).get("levels", 0)) == 5,
+				"a per-group override survives serialization and composes with inherited fields")
+		loaded.free()
+	serialized.free()
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+
+
 # The worst difference between the ring and the height map, over *every* texel centre of the finest
 # level: the ring's own addressing decides where each stored value is read from, so a wrap, a snap or
 # a strip rect that is off by anything shows up here.
@@ -265,8 +314,64 @@ func run_never_selected_block() -> void:
 			"and answers a sample with NAN rather than with a value")
 	require(not plain.is_vt_delivery_used(CLIPMAP), "and does not report Clipmap as used")
 	require(plain.get_clipmap_layout_preview().is_empty(), "and has no layout to draw: the preview refuses it")
+	var legacy_material: Dictionary = plain.get_vt_clipmap_group_shape(MATERIAL)
+	var legacy_height: Dictionary = plain.get_vt_clipmap_group_shape(HEIGHT)
+	require(int(legacy_material.get("size", 0)) == SIZE and int(legacy_material.get("levels", 0)) == LEVELS and
+			is_equal_approx(float(legacy_material.get("base_world", 0.0)), BASE_WORLD) and
+			int(legacy_height.get("size", 0)) == SIZE and int(legacy_height.get("levels", 0)) == LEVELS and
+			is_equal_approx(float(legacy_height.get("base_world", 0.0)), BASE_WORLD),
+			"a customized legacy tuple remains the fallback shape for both groups")
 	require(plain.debug_update_vt_clipmap(HEIGHT) >= 0 and plain.debug_update_vt_clipmap(MATERIAL) >= 0,
 			"and the mechanism's own entry builds either channel's ring, with no cell claiming the method")
+	# A positive field overrides only that group; zero clears it back to the customized legacy tuple.
+	plain.vt_clipmap_material_size = 32
+	var material_override: Dictionary = plain.get_vt_clipmap_group_shape(MATERIAL)
+	var unaffected_height: Dictionary = plain.get_vt_clipmap_group_shape(HEIGHT)
+	require(int(material_override.get("size", 0)) == 32 and
+			int(unaffected_height.get("size", 0)) == SIZE and plain.is_vt_clipmap_group_shape_overridden(MATERIAL),
+			"the Material shape override is isolated from Height")
+	plain.reset_vt_clipmap_group_shape(MATERIAL)
+	require(int(plain.get_vt_clipmap_group_shape(MATERIAL).get("size", 0)) == SIZE and
+			not plain.is_vt_clipmap_group_shape_overridden(MATERIAL),
+			"reset clears group fields back to the legacy fallback")
+	# With the old tuple at its unchanged defaults, both actual layers use the new per-group defaults.
+	plain.vt_clipmap_size = 256
+	plain.vt_clipmap_levels = 11
+	plain.vt_clipmap_base_world = 0.25
+	plain.vt_clipmap_budget_texels = 1
+	plain.debug_update_vt_clipmap(HEIGHT)
+	plain.debug_update_vt_clipmap(MATERIAL)
+	var shape_preview := plain.get_clipmap_layout_preview()
+	var material_layer := preview_layer(shape_preview, "material")
+	var height_layer := preview_layer(shape_preview, "height")
+	require(not material_layer.is_empty() and not height_layer.is_empty(),
+			"the shared preview exposes the actual Material and Height layers")
+	if not material_layer.is_empty() and not height_layer.is_empty():
+		var material_densities: PackedFloat32Array = material_layer.get("unit_density", PackedFloat32Array())
+		var height_densities: PackedFloat32Array = height_layer.get("unit_density", PackedFloat32Array())
+		require(material_densities.size() == 11 and is_equal_approx(material_densities[0], 1024.0) and
+				is_equal_approx(material_densities[10], 1.0),
+			"the default Material clipmap keeps its full 1024 -> 1 density ladder")
+		require(height_densities.size() == 7 and is_equal_approx(height_densities[0], 64.0) and
+				is_equal_approx(height_densities[6], 1.0),
+			"the default Height clipmap uses lower fine density and still reaches 1 texel/metre")
+		require(is_equal_approx(plain.sample_vt_clipmap_density(MATERIAL, Vector2(8.5, 8.5)), 1024.0) and
+				is_equal_approx(plain.sample_vt_clipmap_density(HEIGHT, Vector2(8.5, 8.5)), 64.0),
+			"the density sampler probes both groups at the same focus with their own ladders")
+	# A group-specific material shape can still choose 1024 -> 1 without changing Height's ladder.
+	plain.vt_clipmap_material_size = 128
+	plain.vt_clipmap_material_base_world = 0.125
+	plain.debug_update_vt_clipmap(MATERIAL)
+	var overridden_material: Dictionary = plain.get_vt_clipmap_group_shape(MATERIAL)
+	require(int(overridden_material.get("size", 0)) == 128 and
+			is_equal_approx(float(overridden_material.get("finest_density", 0.0)), 1024.0) and
+			is_equal_approx(float(plain.get_vt_clipmap_group_shape(HEIGHT).get("finest_density", 0.0)), 64.0),
+			"the material override preserves its density endpoints and leaves Height unchanged")
+	plain.reset_vt_clipmap_group_shape(MATERIAL)
+	plain.debug_update_vt_clipmap(MATERIAL)
+	require(int(plain.get_vt_clipmap_group_shape(MATERIAL).get("size", 0)) == 256,
+			"reset restores the Material default after an actual layer reconfiguration")
+	run_clipmap_shape_serialization_block()
 	print("VT_CLIPMAP_NEVER_SELECTED configured=%s levels=%s service=%s produced=%d" % [
 		str(entry.get("configured", "?")), str(entry.get("units", "none")),
 		str(s.get("clipmap_service", "?")), int(s.get("clipmap_produced_texels", -1))])

@@ -19,10 +19,10 @@
 //     / size`, and the world size of a unit. Both implementations address by exactly this ladder; the
 //     atlas merely stores its units as shells of blocks instead of whole squares. Writing it once is
 //     what makes the density a fragment is served a property of the layer rather than of the storage.
-//     The ladder's two **endpoints** are part of the contract and are stated once below
-//     (`LADDER_FINEST_DENSITY` / `LADDER_COARSEST_DENSITY` / `LADDER_UNITS`): the finest unit serves
-//     1024 texels a metre, the coarsest 1, each unit halves the one inside it, and a shape that cannot
-//     express that span is a truncation rather than a smaller clipmap.
+//     The material group's recommended endpoints are stated once below
+//     (`LADDER_FINEST_DENSITY` / `LADDER_COARSEST_DENSITY` / `LADDER_UNITS`): 1024 texels a metre at
+//     the finest unit, 1 at the coarsest, with each unit halving. Other groups may choose a lower
+//     finest density while using the same ladder formula and preserving the 1 texel/metre outer end.
 //   * `BakeRect` - the producer's queue entry. The ring queued a rect of a level, the atlas a rect of
 //     a slot; a producer only ever needs "which unit, which rect of it, and the lease that says the
 //     content still matches", so that is the shape both publish.
@@ -67,16 +67,15 @@ inline constexpr int IMPLEMENTATION_COUNT = 2;
 
 // ---- The shipping ladder's two endpoints ----------------------------------------------------------
 //
-// The layer's job is one density ladder, and it has two hard endpoints: the **finest** unit serves
-// **1024 texels a metre** and the **coarsest** serves **1 texel a metre**, with every unit between
-// them half the density of the one inside it (`1024 -> 512 -> ... -> 1`). The two numbers are stated
-// here once because the defaults, the dock's hint, the tests and *both* implementations have to name
-// the same pair; a shape that reached only part of the span would be a truncated ladder wearing a
-// clipmap's name.
+// The material group's recommended density endpoints are 1024 texels a metre at the finest unit and
+// 1 at the coarsest, with every unit between them half the density of the one inside (`1024 -> ... ->
+// 1`). These constants name that target once for its defaults, hint and acceptance. A different group
+// may intentionally begin at lower density; `Ladder` remains the same shared arithmetic and reports
+// the actual endpoints the configured shape reaches.
 //
-// `1024 / 2^10 == 1`, so the span is eleven units. Every ceiling an implementation clamps `units` to
-// is at least this, and the layer reports the units a shape's own densities require
-// (`units_for_density()`), so a clamp that would shorten the ladder is visible rather than silent.
+// `1024 / 2^10 == 1`, so the material span is eleven units. Every ceiling an implementation clamps
+// `units` to is at least this, and the layer reports how many units a shape needs to reach 1
+// (`units_for_density()`), so a clamp that shortens the chosen shape is visible rather than silent.
 inline constexpr real_t LADDER_FINEST_DENSITY = 1024.f; // texels a metre at unit 0
 inline constexpr real_t LADDER_COARSEST_DENSITY = 1.f; // texels a metre at the outermost unit
 inline constexpr int LADDER_UNITS = 11; // log2(1024 / 1) + 1

@@ -104,6 +104,27 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_levels"), &Terrain3D::get_vt_clipmap_levels);
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_base_world", "metres"), &Terrain3D::set_vt_clipmap_base_world);
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_base_world"), &Terrain3D::get_vt_clipmap_base_world);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_group_size", "group", "size"), &Terrain3D::set_vt_clipmap_group_size);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_group_size", "group"), &Terrain3D::get_vt_clipmap_group_size);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_group_levels", "group", "levels"), &Terrain3D::set_vt_clipmap_group_levels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_group_levels", "group"), &Terrain3D::get_vt_clipmap_group_levels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_group_base_world", "group", "metres"), &Terrain3D::set_vt_clipmap_group_base_world);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_group_base_world", "group"), &Terrain3D::get_vt_clipmap_group_base_world);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_material_size", "size"), &Terrain3D::set_vt_clipmap_material_size);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_material_size"), &Terrain3D::get_vt_clipmap_material_size);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_material_levels", "levels"), &Terrain3D::set_vt_clipmap_material_levels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_material_levels"), &Terrain3D::get_vt_clipmap_material_levels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_material_base_world", "metres"), &Terrain3D::set_vt_clipmap_material_base_world);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_material_base_world"), &Terrain3D::get_vt_clipmap_material_base_world);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_height_size", "size"), &Terrain3D::set_vt_clipmap_height_size);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_height_size"), &Terrain3D::get_vt_clipmap_height_size);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_height_levels", "levels"), &Terrain3D::set_vt_clipmap_height_levels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_height_levels"), &Terrain3D::get_vt_clipmap_height_levels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_height_base_world", "metres"), &Terrain3D::set_vt_clipmap_height_base_world);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_height_base_world"), &Terrain3D::get_vt_clipmap_height_base_world);
+	ClassDB::bind_method(D_METHOD("reset_vt_clipmap_group_shape", "group"), &Terrain3D::reset_vt_clipmap_group_shape);
+	ClassDB::bind_method(D_METHOD("is_vt_clipmap_group_shape_overridden", "group"), &Terrain3D::is_vt_clipmap_group_shape_overridden);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_group_shape", "group"), &Terrain3D::get_vt_clipmap_group_shape);
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_budget_texels", "texels"), &Terrain3D::set_vt_clipmap_budget_texels);
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_budget_texels"), &Terrain3D::get_vt_clipmap_budget_texels);
 	ClassDB::bind_method(D_METHOD("sample_vt_clipmap", "group", "world_xz", "channel"), &Terrain3D::sample_vt_clipmap, DEFVAL(0));
@@ -492,17 +513,27 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
 	// The layer's shape, its own subgroup between the settings that select it and the methods that
-	// share the page pool with it. The three shape settings together are the density ladder: the
-	// shipped defaults are 256 texels an axis over a 0.25 m finest unit (1024 texels a metre) held for
-	// eleven units (down to 1 texel a metre). The mechanism's ceilings are 16 levels for the ring and
-	// 12 rings for the atlas, both above that span, and a shape it cannot build is refused.
+	// share the page pool with it. The legacy three shape properties and their defaults remain intact;
+	// optional group fields below let Material and Height resolve separate shapes. Material's default
+	// keeps the 1024 -> 1 eleven-unit ladder, while Height uses a lower-density default with the same
+	// one-texel/metre outer endpoint. The implementation ceilings still hold the full material span.
 	ADD_SUBGROUP("Clipmap", "vt_clipmap_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_size", PROPERTY_HINT_RANGE, "8,4096,8"), "set_vt_clipmap_size", "get_vt_clipmap_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
-	// The finest unit's world size. The inspector's lower bound has to admit the shipped default
-	// (`size / base_world` is the finest density, and 256 / 0.25 is the ladder's 1024 texels a metre),
-	// so a range that started at 1 m would silently clamp the ladder's own inner endpoint.
+	// The finest unit's world size. The legacy property's lower bound admits its historical 0.25 m
+	// default, whose 256 texels give the material ladder's 1024 texels a metre.
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "0.0625,4096.0,0.0625,or_greater"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
+	// Per-group shape fields are optional overrides. Zero means inherit the legacy global tuple when
+	// it has been customized, otherwise use that group's defaults. Keeping the legacy fields above
+	// unchanged preserves existing scene/script values and their old shared fallback behavior. The raw
+	// per-group getters retain zero so an inherited setting remains visible in the Inspector; scripts
+	// can query the fully resolved values with get_vt_clipmap_group_shape(group).
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_size", PROPERTY_HINT_RANGE, "0,4096,8"), "set_vt_clipmap_material_size", "get_vt_clipmap_material_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_levels", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_clipmap_material_levels", "get_vt_clipmap_material_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_material_base_world", PROPERTY_HINT_RANGE, "0.0,4096.0,0.0625,or_greater"), "set_vt_clipmap_material_base_world", "get_vt_clipmap_material_base_world");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_size", PROPERTY_HINT_RANGE, "0,4096,8"), "set_vt_clipmap_height_size", "get_vt_clipmap_height_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_levels", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_clipmap_height_levels", "get_vt_clipmap_height_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_height_base_world", PROPERTY_HINT_RANGE, "0.0,4096.0,0.0625,or_greater"), "set_vt_clipmap_height_base_world", "get_vt_clipmap_height_base_world");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
 	// **The implementation selector**, and the whole of what used to be a second delivery. It sits in
 	// the clipmap settings because that is what it is: a choice of *how* the one clipmap delivery

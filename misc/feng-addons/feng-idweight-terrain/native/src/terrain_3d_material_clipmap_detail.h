@@ -300,6 +300,31 @@ public:
 	static int key_y(const int64_t p_key);
 
 private:
+	// Timings and work counts for the last `update()` call. These are diagnostic-only and are reset
+	// at the start of every call; timings are wall-clock microseconds on the update thread.
+	struct UpdateDiagnostics {
+		uint64_t total_us = 0;
+		uint64_t storage_us = 0;
+		uint64_t windows_us = 0;
+		uint64_t band_fit_us = 0;
+		uint64_t candidate_walk_sort_us = 0;
+		uint64_t residency_eviction_us = 0;
+		uint64_t source_submit_us = 0;
+		uint64_t source_queue_us = 0;
+		uint64_t source_poll_upload_us = 0;
+		uint64_t source_texture_upload_us = 0;
+		uint64_t offer_sort_us = 0;
+		uint64_t directory_publish_us = 0;
+		uint64_t candidate_tests = 0;
+		int64_t candidates = 0;
+		int64_t requested = 0;
+		int64_t released = 0;
+		int64_t directories_published = 0;
+		int64_t source_requests = 0;
+		int64_t source_uploads = 0;
+		int64_t bake_offers_added = 0;
+	};
+
 	// ---- Addressing ------------------------------------------------------------------------------
 	// The tile index a world position falls in, for a level whose window origin is already snapped.
 	// Integer floor of a real division: the origin and the span are both exact multiples of the
@@ -350,6 +375,7 @@ private:
 	std::unordered_map<int64_t, uint32_t> _wanted;
 	uint64_t _tick = 0;
 	uint64_t _state_stamp = 1;
+	UpdateDiagnostics _last_update;
 
 	// The source pipeline: its own, because the near field's is retained against a plan that does
 	// not name these keys, and a shared queue would evict one against the other every tick.
@@ -365,6 +391,10 @@ private:
 	// through storage images. `_baked_rd` and `_baked_rs` are created and freed together.
 	GeneratedTexture _payload;
 	GeneratedTexture _height;
+	// Blank seeds are retained after array creation so `_ensure_storage()` does not allocate two Images
+	// again on every camera tick. `clear()` drops them with the arrays; a reconfigure creates new sizes.
+	Ref<Image> _payload_blank;
+	Ref<Image> _height_blank;
 	std::vector<RID> _baked_rd;
 	std::vector<RID> _baked_rs;
 	// Latched when the device was reached and the baked arrays could not be allocated. Retrying a
