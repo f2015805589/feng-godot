@@ -124,6 +124,18 @@ private:
 	// channel the ring gains later needs no change here.
 	bool _shader_clipmap[TerrainVT::GROUP_COUNT] = { false };
 	bool _needs_clipmap_arm(const int p_group) const;
+	// The same per-group question for the block atlas: a group whose cells name `ClipmapAtlas`
+	// compiles the atlas's tables and samplers as well, and a group that names only the ring does
+	// not. Kept apart from `_shader_clipmap` because a group can carry the ring's arm and the atlas's
+	// tables at once when its two bands name different units, and a rebuild has to happen when
+	// either moves.
+	bool _shader_clipmap_atlas[TerrainVT::GROUP_COUNT] = { false };
+	bool _needs_clipmap_atlas_arm(const int p_group) const;
+	// The block atlas's numeric tables, as the image the texture is updated from and the texture
+	// itself. Kept on the material because the tables move with the atlas's addressing and the
+	// texture is one object per material rather than one per bind.
+	Ref<Image> _block_atlas_image;
+	Ref<ImageTexture> _block_atlas_data;
 	// Whether any group's arm differs from the one the policy asks for. Both halves of the variant
 	// choice are compared through here, because either one entering or leaving the generated code is
 	// a shader rebuild rather than a uniform rebind.
@@ -139,6 +151,9 @@ private:
 	void _update_shader();
 	void _update_vt_uniforms(const RID &p_material);
 	void _bind_vt_clipmap_uniforms(const RID &p_material);
+	// The block atlas's numeric tables as one `R32F` texture, created once and updated in place.
+	// Returns the texture's RID, or an invalid RID when there is no device yet.
+	RID _update_block_data_texture(const PackedFloat32Array &p_data);
 	void _update_uniforms(const RID &p_material, const uint32_t p_update = UNIFORMS_ONLY);
 	void _set_shader_parameters(const Dictionary &p_dict);
 	Dictionary _get_shader_parameters() const { return _shader_params; }

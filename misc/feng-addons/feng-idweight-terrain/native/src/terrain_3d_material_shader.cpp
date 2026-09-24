@@ -558,9 +558,20 @@ bool Terrain3DMaterial::_needs_clipmap_arm(const int p_group) const {
 			(!_terrain->is_vt_editor_preview_active() && _terrain->clipmap_arm_used(TerrainVT::ChannelGroup(p_group)));
 }
 
+bool Terrain3DMaterial::_needs_clipmap_atlas_arm(const int p_group) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return false;
+	}
+	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
+			(!_terrain->is_vt_editor_preview_active() && _terrain->clipmap_atlas_arm_used(TerrainVT::ChannelGroup(p_group)));
+}
+
 bool Terrain3DMaterial::_clipmap_arm_changed() const {
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		if (_shader_clipmap[group] != _needs_clipmap_arm(group)) {
+			return true;
+		}
+		if (_shader_clipmap_atlas[group] != _needs_clipmap_atlas_arm(group)) {
 			return true;
 		}
 	}

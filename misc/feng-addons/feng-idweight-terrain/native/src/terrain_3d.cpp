@@ -251,24 +251,50 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// method nobody selected costs nothing rather than costing a check. A ring is entered only while
 	// a cell still selects it: the object staying (a deselection stops a service rather than freeing
 	// it) is not a reason to spend its budget.
-	if (has_clipmap_delivery()) {
+	if (has_clipmap_layer_delivery()) {
 		traced("vt_clipmap", [&] {
 			_vt.clipmap_produced_texels = 0;
+			_vt.clipmap_atlas_produced_texels = 0;
 			const Vector2 focus = v3v2(get_clipmap_target_position());
 			for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+				const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
 				Terrain3DClipmap *ring = _vt.clipmap[group].get();
-				if (ring == nullptr || !_vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::Clipmap)) {
+				if (ring == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
+					ring = nullptr;
+				}
+				Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
+				if (atlas == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::ClipmapAtlas)) {
+					atlas = nullptr;
+				}
+				if (ring == nullptr && atlas == nullptr) {
 					continue;
 				}
-				_vt.clipmap_produced_texels += ring->update(focus, _vt.clipmap_budget_texels);
-				// And whatever a producer bakes out of what the ring produced - the *rects* it produced,
-				// offered under the same budget they were produced under. The ring carries the layers, the
-				// bake belongs to the shader's owner, and this is where the two meet: a ring whose channel
-				// declares no baked layers answers without touching the device, and one that does has its
-				// rects dispatched by the next render callback, reported back a call later
-				// (see `Terrain3DSurfaceBaker::queue_clipmap_ring()`).
+				if (ring != nullptr) {
+					_vt.clipmap_produced_texels += ring->update(focus, _vt.clipmap_budget_texels);
+				}
+				if (atlas != nullptr) {
+					// The block atlas is the same layer's other residency unit: the same focus, the
+					// same budget, the same per-group object. It produces block rects where the ring
+					// produces a whole level, and it publishes its own counters through the same
+					// `_publish_clipmap_atlas_readings()` the mechanism's entry uses.
+					_vt.clipmap_atlas_produced_texels =
+							atlas->update(focus, _vt.clipmap_budget_texels);
+					_publish_clipmap_atlas_readings(atlas);
+				}
+				// And whatever a producer bakes out of what the layer produced - the *rects* it
+				// produced, offered under the same budget they were produced under. The ring and the
+				// atlas carry the layers, the bake belongs to the shader's owner, and this is where
+				// the two meet: a channel that declares no baked layers answers without touching the
+				// device, and one that does has its rects dispatched by the next render callback,
+				// reported back a call later (`Terrain3DSurfaceBaker::queue_clipmap_ring()` and
+				// `queue_clipmap_atlas()`).
 				if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-					baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
+					if (ring != nullptr) {
+						baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
+					}
+					if (atlas != nullptr) {
+						baker->queue_clipmap_atlas(atlas, _vt.clipmap_budget_texels);
+					}
 				}
 			}
 			// The material group's detail layer is the ring's own finer half and it runs in this

@@ -90,6 +90,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["avt_service"] = has_avt_delivery();
 	result["svt_service"] = has_svt_delivery();
 	result["clipmap_service"] = has_clipmap_delivery();
+	result["clipmap_atlas_service"] = has_clipmap_atlas_delivery();
 	// Which methods a cell may name, per channel group, and the sentence for each one it may not:
 	// the matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`), so a
 	// panel disables a row from published state rather than from its own hard-coded list, and the
@@ -167,6 +168,7 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 		const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
 		Dictionary entry;
 		entry["configured"] = atlas != nullptr && atlas->is_configured();
+		entry["selected"] = _vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::ClipmapAtlas);
 		entry["source"] = atlas != nullptr ? atlas->get_source_name() : String("none");
 		entry["source_available"] = has_clipmap_source(group);
 		if (atlas != nullptr && atlas->is_configured()) {
@@ -194,11 +196,18 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 			// current block right now, and how many are waiting for one.
 			int current = 0;
 			int pending_cells = 0;
+			int baked_cells = 0;
 			for (int cell = 0; cell < atlas->get_cell_count(); cell++) {
 				current += atlas->is_cell_current(cell) ? 1 : 0;
 				pending_cells += atlas->get_cell_pending_slot(cell) >= 0 ? 1 : 0;
+				baked_cells += atlas->is_cell_baked(cell) ? 1 : 0;
 			}
 			entry["current_cells"] = current;
+			// The *material* readiness: a cell whose block's baked rect the producer has acknowledged.
+			// It is the gate the material arm reads, so a measurement of "the near material is there"
+			// is this number and not the source residency above.
+			entry["baked_cells"] = baked_cells;
+			entry["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
 			// A cell is either serving a block or waiting for one, and never neither: that identity is
 			// the anti-flash property the per-frame timeline is evidence for - the replacement is built
 			// in a spare slot before the block it replaces is released, so no frame has a gap.

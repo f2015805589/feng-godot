@@ -127,6 +127,38 @@ uniform int _clipmap_band[CLIPMAP_GROUP_COUNT];
 // always been, because the material ring also carries the height beside the payload and the bake
 // reads both from one array.
 uniform int _clipmap_channels[CLIPMAP_GROUP_COUNT];
+#ifdef TERRAIN_CLIPMAP_ATLAS
+// The block atlas: the same clipmap layer, its content packed as discrete blocks into one texture
+// per channel. `_clipmap_block` is the source (one layer a channel value) and `_clipmap_block_data`
+// the block tables: one `R32F` texture holding the per-ring start points, the per-cell current-frame
+// slot, offsets, readiness flags and the per-slot rect array, one row a channel group. The tables
+// are a texture rather than uniform arrays because the material's uniform buffer is already close to
+// the device's limit at the default region maximum; a texture costs one sampler and no uniform bytes.
+// `clipmap_block_data()` below is the read, and the offsets are the CPU's own constants emitted as
+// defines. The addressing that turns a world point into one of those cells is the generic block arm
+// below; the start points are the per-ring block starts the CPU's `cell_for_world()` measures from.
+uniform highp sampler2DArray _clipmap_block[CLIPMAP_GROUP_COUNT] : filter_nearest, repeat_disable;
+uniform highp sampler2D _clipmap_block_data : filter_nearest, repeat_disable;
+// One float of the block tables, by its index in the packed row: the texture is `R32F`, so the read
+// is exact for the whole texel counts and the ids it holds. The layout is the CPU's own
+// (`Terrain3DMaterial::_update_block_data_texture()`), emitted as defines, so an index cannot mean
+// one thing here and another there. It is defined with the uniforms because the material split reads
+// a group's band before the addressing below is reached.
+float clipmap_block_data_at(int p_group, int p_index) {
+	int index = p_group * CLIPMAP_ATLAS_DATA_STRIDE + p_index;
+	return texelFetch(_clipmap_block_data,
+					 ivec2(index % CLIPMAP_ATLAS_DATA_WIDTH, index / CLIPMAP_ATLAS_DATA_WIDTH), 0)
+			.r;
+}
+#ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
+// The atlas's three baked arrays, one rect a block: the material the producer wrote out of the
+// block's own payload and height. They are sampled by the *same* rect array the source lives in, so
+// a block's material is the texel the block's height is.
+uniform highp sampler2DArray _clipmap_block_baked_albedo : filter_linear, repeat_disable;
+uniform highp sampler2DArray _clipmap_block_baked_normal : filter_linear, repeat_disable;
+uniform highp sampler2DArray _clipmap_block_baked_params : filter_linear, repeat_disable;
+#endif
+#endif
 #ifdef TERRAIN_CLIPMAP_MATERIAL
 // The material group's *baked* layers: the three arrays a producer writes out of the ring's own
 // texels - diffuse and height, an unencoded world normal and roughness, the parameters - one layer per
@@ -897,6 +929,13 @@ bool surface_material_sample(vec2 world, out material r_mat, out vec3 r_normal, 
 	// Not `const`: these derive from a uniform, which Godot's shader language does not accept in a
 	// constant expression.
 	int ring_band = _clipmap_band[CLIPMAP_GROUP_MATERIAL] & 3;
+#ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
+	// The block atlas is the same layer's other residency unit, and a cell may name it in one band
+	// and the ring in the other: the two masks are one claim about which bands the clipmap layer
+	// owns, so the pages keep what neither owns.
+	int block_band = int(clipmap_block_data_at(CLIPMAP_GROUP_MATERIAL, CLIPMAP_ATLAS_DATA_BAND) + 0.5);
+	ring_band = (ring_band | block_band) & 3;
+#endif
 	if (ring_band != 0) {
 		float ring_reach = max(64.0, _avt_coverage_distance);
 		float far_band = smoothstep(ring_reach * 0.75, ring_reach, distance(world, v_camera_pos.xz));
@@ -1201,18 +1240,235 @@ float clipmap_texel_interpolated(int p_group, vec2 p_world, highp sampler2DArray
 	float v11 = clipmap_texel_at(p_group, level, base + vec2(1.0, 1.0), p_atlas);
 	return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
 }
-#endif // TERRAIN_CLIPMAP
 
+// ---- The block atlas's shared addressing ---------------------------------------------------------
+// One cell of the block grid, resolved from a world point. The CPU's `cell_for_world()` in one
+// function: walk the rings finest first, keep the ring whose own start point puts the point inside
+// one of *its* cells (the 3x3 square is ring 0, the Chebyshev shell at distance d >= 2 is ring
+// d - 1), and stop there. `found` is the coverage test - outside the grid every ring declines and
+// the region array answers - `current`/`baked` are the gates the two arms read.
+#ifdef TERRAIN_CLIPMAP_ATLAS
+struct ClipmapBlockCell {
+	bool found;
+	bool current;
+	bool baked;
+	int ring;
+	int gx;
+	int gy;
+	int slot;
+	vec2 start;
+	vec2 offset;
+	vec4 rect;
+	int texels;
+	float texel;
+};
+
+ClipmapBlockCell clipmap_block_find(int p_group, vec2 p_world) {
+	ClipmapBlockCell cell;
+	cell.found = false;
+	cell.current = false;
+	cell.baked = false;
+	cell.ring = -1;
+	cell.gx = 0;
+	cell.gy = 0;
+	cell.slot = -1;
+	cell.start = vec2(0.0);
+	cell.offset = vec2(0.0);
+	cell.rect = vec4(0.0);
+	cell.texels = 1;
+	cell.texel = 0.0;
+	int rings = int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_RINGS) + 0.5);
+	float block_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
+	if (rings <= 0 || block_world <= 0.0) {
+		return cell;
+	}
+	int side = 2 * rings + 1;
+	for (int ring = 0; ring < CLIPMAP_ATLAS_MAX_RINGS; ring++) {
+		if (ring >= rings) {
+			break;
+		}
+		vec2 start = vec2(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_STARTS + ring * 2),
+				clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_STARTS + ring * 2 + 1));
+		// The block a coordinate names is a *half-open* square, `[start + b * W - W/2, ... + W/2)`,
+		// so the index is `floor((world - start) / W + 0.5)` rather than `round(...)`: GLSL's
+		// `round()` is implementation-defined at a tie, and at a boundary it picked the block below
+		// the point, whose clamped edge texel is one metre away from the array's.
+		int gx = int(floor((p_world.x - start.x) / block_world + 0.5));
+		int gy = int(floor((p_world.y - start.y) / block_world + 0.5));
+		if (abs(gx) > rings || abs(gy) > rings) {
+			continue;
+		}
+		int d = max(abs(gx), abs(gy));
+		if ((d <= 1 ? 0 : d - 1) != ring) {
+			continue;
+		}
+		int cell_index = (gy + rings) * side + (gx + rings);
+		int slot = int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_SLOTS + cell_index) + 0.5);
+		cell.found = true;
+		cell.current = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_CURRENT + cell_index) > 0.5;
+		cell.baked = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_BAKED + cell_index) > 0.5;
+		cell.ring = ring;
+		cell.gx = gx;
+		cell.gy = gy;
+		cell.slot = slot;
+		cell.start = start;
+		cell.offset = vec2(
+				clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_OFFSETS + cell_index * 2),
+				clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_OFFSETS + cell_index * 2 + 1));
+		if (slot >= 0 && slot < CLIPMAP_ATLAS_MAX_SLOTS) {
+			int rect_at = CLIPMAP_ATLAS_DATA_RECTS + slot * 4;
+			cell.rect = vec4(clipmap_block_data_at(p_group, rect_at),
+					clipmap_block_data_at(p_group, rect_at + 1),
+					clipmap_block_data_at(p_group, rect_at + 2),
+					clipmap_block_data_at(p_group, rect_at + 3));
+		}
+		cell.texels = max(1, int(cell.rect.z));
+		cell.texel = block_world / float(cell.texels);
+		return cell;
+	}
+	return cell;
+}
+
+// The world point the block's content index names, which is the block square carried to its own grid
+// coordinate: `block start + gx * block_world - half a block`. The content is unrotated, so the
+// stored index is the logical one - unlike the ring's level, which a movement turns.
+vec2 clipmap_block_origin(int p_group, ClipmapBlockCell p_cell) {
+	float block_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
+	return p_cell.start + vec2(float(p_cell.gx), float(p_cell.gy)) * block_world -
+			vec2(0.5 * block_world);
+}
+
+// The atlas texel a logical tap reads: clamped inside the block - there is no neighbour inside it,
+// the world beyond belongs to another ring - and then the rect's own offset added. A tap at the edge
+// therefore reads the block's edge texel rather than wrapping onto the opposite edge, which is the
+// ring's clamp with a block instead of a level.
+ivec2 clipmap_block_stored(ClipmapBlockCell p_cell, vec2 p_logical) {
+	vec2 limit = max(vec2(float(p_cell.texels - 1)), vec2(0.0));
+	vec2 clamped = clamp(p_logical, vec2(0.0), limit);
+	return ivec2(p_cell.rect.xy + mod(clamped + p_cell.offset, vec2(float(p_cell.texels))));
+}
+
+// One stored value, point sampled, through the cell that answers the point. `p_require_current` is
+// the height arm's gate - a height read is a cell's own scalars, which only exist once the CPU side
+// has produced it - and the material arm asks for the *baked* gate instead.
+float clipmap_block_texel_at(int p_group, vec2 p_world, highp sampler2DArray p_texture, int p_layer,
+		bool p_require_current) {
+	ClipmapBlockCell cell = clipmap_block_find(p_group, p_world);
+	if (!cell.found || (p_require_current && !cell.current)) {
+		return 0.0;
+	}
+	vec2 origin = clipmap_block_origin(p_group, cell);
+	vec2 logical = floor((p_world - origin) / cell.texel);
+	return texelFetch(p_texture, ivec3(clipmap_block_stored(cell, logical), p_layer), 0).r;
+}
+
+// The same value bilinearly interpolated on the block's own grid. Each of the four texels is a world
+// position resolved through the cell that *owns* it, so a tap that leaves this block reads the
+// neighbouring block rather than clamping to this one's edge - which is what makes the atlas's
+// interpolated read the array's own at an internal block boundary.
+float clipmap_block_texel_interpolated_at(int p_group, vec2 p_world, highp sampler2DArray p_texture,
+		int p_layer, bool p_require_current) {
+	ClipmapBlockCell cell = clipmap_block_find(p_group, p_world);
+	if (!cell.found || (p_require_current && !cell.current)) {
+		return 0.0;
+	}
+	vec2 origin = clipmap_block_origin(p_group, cell);
+	vec2 address = (p_world - origin) / cell.texel;
+	vec2 base = floor(address);
+	vec2 f = address - base;
+	float v00 = clipmap_block_texel_at(p_group, origin + (base + vec2(0.5, 0.5)) * cell.texel,
+			p_texture, p_layer, p_require_current);
+	float v10 = clipmap_block_texel_at(p_group, origin + (base + vec2(1.5, 0.5)) * cell.texel,
+			p_texture, p_layer, p_require_current);
+	float v01 = clipmap_block_texel_at(p_group, origin + (base + vec2(0.5, 1.5)) * cell.texel,
+			p_texture, p_layer, p_require_current);
+	float v11 = clipmap_block_texel_at(p_group, origin + (base + vec2(1.5, 1.5)) * cell.texel,
+			p_texture, p_layer, p_require_current);
+	return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+}
+)"
+// A split of its own: the weight below is a section rather than an addition to the addressing above,
+// whose literal is at MSVC's 16 kB limit.
+R"(
+// The block's share of a value at a world point: the shared band rule, measured against the *atlas's*
+// own band mask - the two cells may name the ring in one band and the atlas in the other, so the two
+// units have a mask each rather than one. Zero means the array answers: the point is outside the
+// grid, the atlas owns neither band here, or `p_require_current` and the cell that would answer is
+// not current. The coverage test is the find above, which is why a point the grid does not hold - the
+// one-time global block's world - falls back to the region array rather than to a minimal-resolution
+// block, exactly as the ring's coverage rule does.
+float clipmap_block_weight(int p_group, vec2 p_world, float p_distance, bool p_require_current) {
+	int band = int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_BAND) + 0.5);
+	if (int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_RINGS) + 0.5) <= 0 || (band & 3) == 0) {
+		return 0.0;
+	}
+	ClipmapBlockCell cell = clipmap_block_find(p_group, p_world);
+	if (!cell.found || (p_require_current && !cell.current)) {
+		return 0.0;
+	}
+	float reach = max(64.0, _avt_coverage_distance);
+	float far_band = smoothstep(reach * 0.75, reach, p_distance);
+	float weight = (band & 1) != 0 ? 1.0 - far_band : 0.0;
+	if ((band & 2) != 0) {
+		weight = max(weight, far_band);
+	}
+	return weight;
+}
+#endif // TERRAIN_CLIPMAP_ATLAS
+#endif // TERRAIN_CLIPMAP
+)"
+// A split of its own, for the reason every other one here has one: the string literal above is at
+// MSVC's 16 kB limit, so the arm below is a section rather than an addition to it.
+R"(
 // ---- The height channel's ring arm ---------------------------------------------------------------
 // The height group's own three reads, and nothing else: the level rule, the coverage test, the
 // validity gate and the band blend above are the ring's and are shared with every other channel, so
 // this arm is the group's index, its atlas, and the distance its stage is asking about.
 #ifdef TERRAIN_CLIPMAP_HEIGHT
+// Whether the *block atlas* is the unit that answers a point, when the group owns both. The atlas and
+// the ring have a band mask each, and the finer unit - the larger weight - is what a reader takes;
+// where only one owns the band the other's weight is zero, so this is that one. A group that owns
+// only the ring returns false on the `#else`, and the arm below is the shipped ring read.
+bool clipmap_height_uses_block(vec2 p_world) {
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+	float distance_xz = length(p_world - v_camera_pos.xz);
+	float block_weight = clipmap_block_weight(CLIPMAP_GROUP_HEIGHT, p_world, distance_xz, true);
+	if (block_weight <= 0.0) {
+		return false;
+	}
+	return block_weight >= clipmap_weight(CLIPMAP_GROUP_HEIGHT, p_world, distance_xz, true);
+#else
+	return false;
+#endif
+}
+
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+float clipmap_block_height_at_world(vec2 p_world) {
+	return clipmap_block_texel_at(CLIPMAP_GROUP_HEIGHT, p_world, _clipmap_block[CLIPMAP_GROUP_HEIGHT],
+			0, true);
+}
+
+float clipmap_block_height_interpolated_at_world(vec2 p_world) {
+	return clipmap_block_texel_interpolated_at(CLIPMAP_GROUP_HEIGHT, p_world,
+			_clipmap_block[CLIPMAP_GROUP_HEIGHT], 0, true);
+}
+#endif
+
 float clipmap_height_at_world(vec2 p_world) {
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+	if (clipmap_height_uses_block(p_world)) {
+		return clipmap_block_height_at_world(p_world);
+	}
+#endif
 	return clipmap_texel(CLIPMAP_GROUP_HEIGHT, p_world, _clipmap_atlas[CLIPMAP_GROUP_HEIGHT]);
 }
 
 float clipmap_height_interpolated_at_world(vec2 p_world) {
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+	if (clipmap_height_uses_block(p_world)) {
+		return clipmap_block_height_interpolated_at_world(p_world);
+	}
+#endif
 	return clipmap_texel_interpolated(CLIPMAP_GROUP_HEIGHT, p_world, _clipmap_atlas[CLIPMAP_GROUP_HEIGHT]);
 }
 
@@ -1220,9 +1476,15 @@ float clipmap_height_interpolated_at_world(vec2 p_world) {
 // computing the vertical distance, and the material split next door measures the fragment's 3D
 // distance instead. The two are different questions and each is measured where it is asked.
 float clipmap_height_weight(vec2 p_world) {
-	// `true`: a height read is the level's own scalars, and those are only there once the CPU side has
-	// drained the level - unlike the material arm, whose readiness is per rect and is its own question.
-	return clipmap_weight(CLIPMAP_GROUP_HEIGHT, p_world, length(p_world - v_camera_pos.xz), true);
+	// `true`: a height read is the cell's own scalars, and those are only there once the CPU side has
+	// produced the block or drained the level - unlike the material arm, whose readiness is per rect
+	// and is its own question.
+	float distance_xz = length(p_world - v_camera_pos.xz);
+	float weight = clipmap_weight(CLIPMAP_GROUP_HEIGHT, p_world, distance_xz, true);
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+	weight = max(weight, clipmap_block_weight(CLIPMAP_GROUP_HEIGHT, p_world, distance_xz, true));
+#endif
+	return weight;
 }
 #endif // TERRAIN_CLIPMAP_HEIGHT
 
@@ -1238,6 +1500,13 @@ float height_tap_scale(vec2 p_uv) {
 		return 1.0;
 	}
 	float texel = clipmap_texel_world(CLIPMAP_GROUP_HEIGHT, clipmap_level_for_world(CLIPMAP_GROUP_HEIGHT, world));
+#ifdef TERRAIN_CLIPMAP_ATLAS_HEIGHT
+	if (clipmap_height_uses_block(world)) {
+		// The block the point falls in is the source, so the taps are differenced at *its* texel: a
+		// coarse block is a coarse normal, which is the same statement the ring's level makes.
+		texel = clipmap_block_find(CLIPMAP_GROUP_HEIGHT, world).texel;
+	}
+#endif
 	return mix(1.0, max(texel / _vertex_spacing, 1.0), weight);
 #else
 	return 1.0;
@@ -1521,13 +1790,22 @@ float get_height(vec2 index_id, vec2 offset, float p_tap_scale) {
 R"(
 // ---- The material group's ring arm ---------------------------------------------------------------
 #ifdef TERRAIN_CLIPMAP_MATERIAL
-// How much of the ring the fragment is served by: the shared band rule at the horizontal distance the
-// material split measures with, so the weight a fragment is banded by is the weight it is mixed by.
-// Zero covers the band the two cells named and the coarsest level's texel range; one means the ring is
-// the only source the fragment has. Whether the ring can *answer* it is the arm's own question below,
-// because the baked layers' readiness is per rect and this weight is per fragment.
+// How much of the clipmap layer the fragment is served by: the shared band rule at the horizontal
+// distance the material split measures with, so the weight a fragment is banded by is the weight it
+// is mixed by. Zero covers the bands the two cells named and the coverage of the grid; one means the
+// layer is the only source the fragment has. Whether the layer can *answer* it is the arm's own
+// question below, because the baked arrays' readiness is per rect and this weight is per fragment.
+//
+// The block atlas is the layer's other residency unit, so its own band mask is folded in here: the
+// detail layer beneath keys off this weight, and a fragment the atlas serves must be one the detail
+// layer considers its own - exactly as it is for the ring.
 float clipmap_material_weight(vec2 p_world) {
-	return clipmap_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance(p_world, v_camera_pos.xz), false);
+	float distance_xz = distance(p_world, v_camera_pos.xz);
+	float weight = clipmap_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance_xz, false);
+#ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
+	weight = max(weight, clipmap_block_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance_xz, false));
+#endif
+	return weight;
 }
 
 // Whether one level's stored texel is one its layers do not describe yet - a rect the CPU side is still
@@ -1545,6 +1823,79 @@ bool clipmap_outstanding(int p_group, int p_level, ivec2 p_stored) {
 	}
 	return false;
 }
+
+// ---- The block atlas's baked material read --------------------------------------------------
+#ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
+// Four taps of one block's baked arrays, bilinearly combined. Each tap is a world position resolved
+// through the cell that *owns* it, so a tap that leaves this block reads the neighbouring block's
+// rect rather than clamping to this one's edge - which is what makes the atlas's baked read the ring's
+// own at an internal block boundary.
+vec4 clipmap_block_baked_texel(highp sampler2DArray p_array, int p_group, ClipmapBlockCell p_cell,
+		vec2 p_origin, vec2 p_base, vec2 p_fraction, out bool r_readable) {
+	r_readable = true;
+	vec2 tap00 = p_origin + (p_base + vec2(0.5, 0.5)) * p_cell.texel;
+	vec2 tap10 = p_origin + (p_base + vec2(1.5, 0.5)) * p_cell.texel;
+	vec2 tap01 = p_origin + (p_base + vec2(0.5, 1.5)) * p_cell.texel;
+	vec2 tap11 = p_origin + (p_base + vec2(1.5, 1.5)) * p_cell.texel;
+	ClipmapBlockCell c00 = clipmap_block_find(p_group, tap00);
+	ClipmapBlockCell c10 = clipmap_block_find(p_group, tap10);
+	ClipmapBlockCell c01 = clipmap_block_find(p_group, tap01);
+	ClipmapBlockCell c11 = clipmap_block_find(p_group, tap11);
+	if (!c00.found || !c00.baked || !c10.found || !c10.baked ||
+			!c01.found || !c01.baked || !c11.found || !c11.baked) {
+		r_readable = false;
+		return vec4(0.0);
+	}
+	vec4 v00 = texelFetch(p_array, ivec3(clipmap_block_stored(c00,
+							   floor((tap00 - clipmap_block_origin(p_group, c00)) / c00.texel)), 0), 0);
+	vec4 v10 = texelFetch(p_array, ivec3(clipmap_block_stored(c10,
+							   floor((tap10 - clipmap_block_origin(p_group, c10)) / c10.texel)), 0), 0);
+	vec4 v01 = texelFetch(p_array, ivec3(clipmap_block_stored(c01,
+							   floor((tap01 - clipmap_block_origin(p_group, c01)) / c01.texel)), 0), 0);
+	vec4 v11 = texelFetch(p_array, ivec3(clipmap_block_stored(c11,
+							   floor((tap11 - clipmap_block_origin(p_group, c11)) / c11.texel)), 0), 0);
+	return mix(mix(v00, v10, p_fraction.x), mix(v01, v11, p_fraction.x), p_fraction.y);
+}
+
+// The material the block atlas's *baked arrays* hold at a world point. False means the fragment is not
+// the atlas's, or the cell that would answer it has not been baked yet - a block whose source landed
+// but whose producer's dispatch has not - and then the whole fragment falls through to the ring and
+// then to the source evaluation rather than sampling a rect no dispatch has written. The gate is the
+// *cell's* baked flag, which the producer sets when it acknowledges the rect, so it is a per-block
+// answer and not a per-level one.
+bool clipmap_block_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal) {
+	if (clipmap_block_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance(p_world, v_camera_pos.xz), false) <= 0.0) {
+		return false;
+	}
+	ClipmapBlockCell cell = clipmap_block_find(CLIPMAP_GROUP_MATERIAL, p_world);
+	if (!cell.found || !cell.baked) {
+		return false;
+	}
+	vec2 origin = clipmap_block_origin(CLIPMAP_GROUP_MATERIAL, cell);
+	vec2 address = (p_world - origin) / cell.texel;
+	vec2 base = floor(address);
+	vec2 fraction = address - base;
+	bool readable = true;
+	vec4 albedo = clipmap_block_baked_texel(_clipmap_block_baked_albedo, CLIPMAP_GROUP_MATERIAL, cell,
+			origin, base, fraction, readable);
+	if (!readable) {
+		return false;
+	}
+	vec4 normal_rough = clipmap_block_baked_texel(_clipmap_block_baked_normal, CLIPMAP_GROUP_MATERIAL,
+			cell, origin, base, fraction, readable);
+	if (!readable) {
+		return false;
+	}
+	vec4 params = clipmap_block_baked_texel(_clipmap_block_baked_params, CLIPMAP_GROUP_MATERIAL, cell,
+			origin, base, fraction, readable);
+	if (!readable) {
+		return false;
+	}
+	// The arrays hold the bake's own output rather than a page's storage encoding: the whole of the
+	// decode is the readiness alpha, exactly the ring's baked read.
+	return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
+}
+#endif // TERRAIN_CLIPMAP_ATLAS_MATERIAL
 
 // The stored texel one corner of a level's bilinear footprint reads. The logical tap is clamped inside
 // the level - there is no neighbour outside it, the world beyond belongs to a coarser level - and then
@@ -1578,7 +1929,19 @@ vec4 clipmap_baked_texel(highp sampler2DArray p_array, int p_level, vec2 p_base,
 // baked - and then the whole footprint falls back to the source evaluation rather than blending a stale
 // texel into it.
 bool clipmap_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal) {
-	if (clipmap_material_weight(p_world) <= 0.0) {
+#ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
+	// The block atlas first when it owns the fragment: it is the same layer's other residency unit,
+	// and a cell that named it is the claim that the atlas serves this band. A cell whose bake has
+	// not landed returns false and the ring below is then the fallback, exactly as the source
+	// evaluation is when the ring has nothing.
+	if (clipmap_block_baked_material(p_world, r_mat, r_normal)) {
+		return true;
+	}
+#endif
+	// The *ring's* own weight, not the combined one: a group whose band the atlas owns has a ring
+	// that owns nothing, and running the level addressing below for it would read a level that does
+	// not exist.
+	if (clipmap_weight(CLIPMAP_GROUP_MATERIAL, p_world, distance(p_world, v_camera_pos.xz), false) <= 0.0) {
 		return false;
 	}
 	vec3 address = clipmap_address(CLIPMAP_GROUP_MATERIAL, p_world);

@@ -25,6 +25,7 @@ const MATERIAL := 0
 const HEIGHT := 1
 const DIRECT := 0
 const CLIPMAP := 2
+const CLIPMAP_ATLAS := 4
 
 # The measurement window. A frame cap, not a settle criterion: the script reports what it saw even
 # when something never settles, because "it never settled" is itself the answer the user gave.
@@ -150,6 +151,18 @@ func atlas_settled() -> bool:
 	return int(entry.get("pending_jobs", 0)) == 0 \
 			and int(entry.get("current_cells", 0)) >= int(entry.get("cells", 0))
 
+# The material group's delivery path is settled when the blocks are current *and* their baked rects
+# have been acknowledged: that is the moment a fragment reads the atlas's material rather than the
+# payload evaluation.
+func material_atlas_settled() -> bool:
+	var entry := atlas_entry()
+	if entry.is_empty():
+		return true
+	return int(entry.get("pending_jobs", 0)) == 0 \
+			and int(entry.get("current_cells", 0)) >= int(entry.get("cells", 0)) \
+			and int(entry.get("pending_bake_rects", 0)) == 0 \
+			and int(entry.get("baked_cells", 0)) >= int(entry.get("current_cells", 0))
+
 # The near field is the finest ring's own cells: the blocks the ground under the camera reads. It is
 # the moment the atlas is *usable*, and it is deliberately a separate reading from the whole grid
 # being current, because the dependency order fills the finest ring first.
@@ -216,6 +229,54 @@ func atlas_window(label: String, p_settled: Callable, p_cap: int) -> Dictionary:
 	}
 	print("CLIPMAP_LOAD %s frames=%d atlas_ms=%.3f peak_ms=%.3f produced=%d upload_bytes=%d block_uploads=%d current=%d pending=%d" % [
 		label, frames, ms, peak_ms, produced, upload_bytes, block_uploads, current, pending])
+	return result
+
+# The **delivery path's** own window: a cell names `ClipmapAtlas`, so the tick's phase drives the
+# atlas and this only *observes* - no `debug_update_vt_clipmap_atlas()` call in the loop. `clipmap_ms`
+# is the tick's whole clipmap phase, which is the number a user's frame pays; the per-entry counters
+# are the atlas's own.
+func delivery_window(label: String, p_settled: Callable, p_cap: int) -> Dictionary:
+	var frames := 0
+	var ms := 0.0
+	var peak_ms := 0.0
+	var produced := 0
+	var upload_bytes := 0
+	var block_uploads := 0
+	var current := 0
+	var baked := 0
+	var pending := 0
+	while frames < p_cap:
+		await process_frame
+		frames += 1
+		var frame_ms := float(phases().get("clipmap", 0.0))
+		ms += frame_ms
+		peak_ms = maxf(peak_ms, frame_ms)
+		produced += int(settings().get("clipmap_atlas_produced_texels", 0))
+		var entry := atlas_entry()
+		upload_bytes = int(entry.get("upload_bytes", 0))
+		block_uploads = int(entry.get("block_uploads", 0))
+		current = int(entry.get("current_cells", 0))
+		baked = int(entry.get("baked_cells", 0))
+		pending = int(entry.get("pending_jobs", 0))
+		print("CLIPMAP_LOAD_ROW %s frame=%d atlas_ms=%.3f produced=%d upload_bytes=%d block_uploads=%d current=%d baked=%d pending=%d" % [
+			label, frames, frame_ms, int(settings().get("clipmap_atlas_produced_texels", 0)),
+			upload_bytes, block_uploads, current, baked, pending])
+		if p_settled.call():
+			break
+	var result := {
+		"label": label,
+		"frames": frames,
+		"clipmap_ms": ms,
+		"peak_ms": peak_ms,
+		"produced": produced,
+		"upload_bytes": upload_bytes,
+		"block_uploads": block_uploads,
+		"current": current,
+		"baked": baked,
+		"pending_jobs": pending,
+	}
+	print("CLIPMAP_LOAD %s frames=%d atlas_ms=%.3f peak_ms=%.3f produced=%d upload_bytes=%d block_uploads=%d current=%d baked=%d pending=%d" % [
+		label, frames, ms, peak_ms, produced, upload_bytes, block_uploads, current, baked, pending])
 	return result
 
 # The rolling evidence, read off the mechanism after a scroll: how many blocks entered the grid and
@@ -356,6 +417,47 @@ func run() -> void:
 		else:
 			print("CLIPMAP_LOAD_ATLAS_SKIPPED no atlas source for the material group")
 
+	# ---- D. The delivery path ---------------------------------------------------------------------
+	# The measurement the user's report is about: a *cell* names `ClipmapAtlas`, the tick's own phase
+	# drives it, and this only observes - no `debug_update_vt_clipmap_atlas()` call in the loop. The
+	# near material's whole chain is here: the atlas's first fill (its cells current *and* their baked
+	# rects acknowledged), the detail layer's own fill, and the two scrolls.
+	terrain.vt_delivery_near_material = CLIPMAP_ATLAS
+	await settle(6)
+	camera.position = Vector3(0.0, 12.0, 14.0)
+	await settle(2)
+	# The atlas object is a residency cache and was filled by the mechanism section above, so the
+	# delivery fill below is measured as a *delta*: the camera is moved back to the start, which
+	# relabels the grid under the selected cell, and the window reports what the tick's own phase
+	# produced for that move. The mechanism section's table is the object's true first fill.
+	var before_delivery := atlas_entry()
+	var d_near: Dictionary = await delivery_window("delivery_near", Callable(self, "atlas_near_settled"), LOAD_CAP)
+	var d_first: Dictionary = await delivery_window("delivery_first", Callable(self, "material_atlas_settled"), LOAD_CAP)
+	var d_detail: Dictionary = await window("delivery_detail", Callable(self, "detail_settled"), LOAD_CAP)
+	print("CLIPMAP_LOAD_DELIVERY_TABLE near_frames=%d near_ms=%.3f first_frames=%d first_ms=%.3f first_peak_ms=%.3f first_delta_bytes=%d first_delta_blocks=%d detail_frames=%d detail_ms=%.3f chain_frames=%d" % [
+		int(d_near["frames"]), float(d_near["clipmap_ms"]),
+		int(d_first["frames"]), float(d_first["clipmap_ms"]), float(d_first["peak_ms"]),
+		int(d_first["upload_bytes"]) - int(before_delivery.get("upload_bytes", 0)),
+		int(d_first["block_uploads"]) - int(before_delivery.get("block_uploads", 0)),
+		int(d_detail["frames"]), float(d_detail["detail_ms"]),
+		int(d_first["frames"]) + int(d_detail["frames"])])
+	# A scroll inside a block: the phase turns and the atlas produces nothing at all.
+	var block_world := float(terrain.vt_clipmap_base_world)
+	var texel_world := block_world / float(terrain.vt_clipmap_size)
+	var before_phase := atlas_entry()
+	camera.position = Vector3(camera.position.x + texel_world * 4.0, camera.position.y, camera.position.z)
+	var d_phase: Dictionary = await delivery_window("delivery_scroll_phase", Callable(self, "atlas_settled"), 4)
+	var after_phase := atlas_entry()
+	# A whole-block scroll: only the blocks that entered are loaded, block by block, one a frame.
+	camera.position = Vector3(camera.position.x + block_world, camera.position.y, camera.position.z)
+	var d_scroll: Dictionary = await delivery_window("delivery_scroll", Callable(self, "material_atlas_settled"), LOAD_CAP)
+	var d_roll := atlas_roll_report("delivery_after_one_block_scroll")
+	var d_scroll_detail: Dictionary = await window("delivery_scroll_detail", Callable(self, "detail_settled"), LOAD_CAP)
+	print("CLIPMAP_LOAD_DELIVERY_ROLL phase_frames=%d phase_produced=%d phase_upload_delta=%d scroll_frames=%d scroll_upload_delta=%d roll_loaded=%d roll_retained=%d scroll_detail_frames=%d" % [
+		int(d_phase["frames"]), int(d_phase["produced"]),
+		int(after_phase.get("upload_bytes", 0)) - int(before_phase.get("upload_bytes", 0)),
+		int(d_scroll["frames"]), int(d_scroll["upload_bytes"]) - int(d_first["upload_bytes"]),
+		int(d_roll["last_loaded"]), int(d_roll["last_retained"]), int(d_scroll_detail["frames"])])
 	if terrain != null:
 		terrain.set_process(false)
 		terrain.set_physics_process(false)

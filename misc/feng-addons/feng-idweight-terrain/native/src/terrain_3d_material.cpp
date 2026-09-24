@@ -21,8 +21,32 @@
 
 #include <godot_cpp/classes/fast_noise_lite.hpp>
 #include <godot_cpp/classes/gradient.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/noise_texture2d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+
+// The block atlas's numeric tables live in one `R32F` texture rather than in uniform arrays. The
+// material's uniform buffer is already close to the device's limit at the default region maximum -
+// the region and block arrays are tens of kilobytes once std140 padding is counted - and a block's
+// 186-entry rect array on top of them removes the D3D12 device at pipeline creation. A texture costs
+// one sampler and no uniform bytes, and `texelFetch` is the read the data wants.
+//
+// One row a channel group, `ATLAS_DATA_STRIDE` floats each, in this order: the per-ring start points,
+// the per-cell slot, the per-cell offsets, the per-cell current and baked flags, the per-slot rects,
+// then the band mask, the ring count and the block's world size. The shader's offsets are the same
+// numbers, emitted as defines from these constants, so the two cannot drift.
+static constexpr int ATLAS_DATA_STARTS = 0;
+static constexpr int ATLAS_DATA_SLOTS = Terrain3DClipmapAtlas::MAX_RINGS * 2;
+static constexpr int ATLAS_DATA_OFFSETS = ATLAS_DATA_SLOTS + Terrain3DClipmapAtlas::MAX_CELLS;
+static constexpr int ATLAS_DATA_CURRENT = ATLAS_DATA_OFFSETS + Terrain3DClipmapAtlas::MAX_CELLS * 2;
+static constexpr int ATLAS_DATA_BAKED = ATLAS_DATA_CURRENT + Terrain3DClipmapAtlas::MAX_CELLS;
+static constexpr int ATLAS_DATA_RECTS = ATLAS_DATA_BAKED + Terrain3DClipmapAtlas::MAX_CELLS;
+static constexpr int ATLAS_DATA_BAND = ATLAS_DATA_RECTS + Terrain3DClipmapAtlas::MAX_SLOTS * 4;
+static constexpr int ATLAS_DATA_RINGS = ATLAS_DATA_BAND + 1;
+static constexpr int ATLAS_DATA_WORLD = ATLAS_DATA_RINGS + 1;
+static constexpr int ATLAS_DATA_STRIDE = 800;
+static constexpr int ATLAS_DATA_WIDTH = 128;
+static constexpr int ATLAS_DATA_HEIGHT = 16;
 
 ///////////////////////////
 // Private Functions
@@ -56,6 +80,7 @@ void Terrain3DMaterial::_update_shader() {
 		// makes `needs_vt_shader_arms()` true.
 		String defines;
 		int arms = 0;
+		int atlas_arms = 0;
 		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 			if (!_needs_clipmap_arm(group)) {
 				continue;
@@ -65,6 +90,13 @@ void Terrain3DMaterial::_update_shader() {
 			// The group's own index, so the arm names its entry in the shared table instead of
 			// assuming it is the only one.
 			defines += "#define CLIPMAP_GROUP_" + name + " " + String::num_int64(group) + "\n";
+			// And the block atlas's own arm for the same group, when its cells name that residency
+			// unit: the tables and the samplers are a second set of names under one more define, so a
+			// group that names only the ring compiles none of them.
+			if (_needs_clipmap_atlas_arm(group)) {
+				defines += "#define TERRAIN_CLIPMAP_ATLAS_" + name + "\n";
+				atlas_arms++;
+			}
 			arms++;
 		}
 		if (arms > 0) {
@@ -84,6 +116,31 @@ void Terrain3DMaterial::_update_shader() {
 			// group selects the ring at all.
 			defines += "#define CLIPMAP_DETAIL_MAX_LEVELS " +
 					String::num_int64(Terrain3DMaterialClipmapDetail::MAX_LEVELS) + "\n";
+			// The block atlas's own array sizes, with the mechanism's constants so the shader's
+			// declaration and the arm's padding are the same number: a table shorter than the atlas's
+			// answer is not expressible.
+			if (atlas_arms > 0) {
+				defines += "#define TERRAIN_CLIPMAP_ATLAS\n";
+				defines += "#define CLIPMAP_ATLAS_MAX_RINGS " +
+						String::num_int64(Terrain3DClipmapAtlas::MAX_RINGS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_MAX_CELLS " +
+						String::num_int64(Terrain3DClipmapAtlas::MAX_CELLS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_MAX_SLOTS " +
+						String::num_int64(Terrain3DClipmapAtlas::MAX_SLOTS) + "\n";
+				// The data texture's shape and row layout, from the one set of constants the CPU
+				// packs with: a shader offset and a CPU offset cannot disagree.
+				defines += "#define CLIPMAP_ATLAS_DATA_WIDTH " + String::num_int64(ATLAS_DATA_WIDTH) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_STRIDE " + String::num_int64(ATLAS_DATA_STRIDE) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_STARTS " + String::num_int64(ATLAS_DATA_STARTS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_SLOTS " + String::num_int64(ATLAS_DATA_SLOTS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_OFFSETS " + String::num_int64(ATLAS_DATA_OFFSETS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_CURRENT " + String::num_int64(ATLAS_DATA_CURRENT) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_BAKED " + String::num_int64(ATLAS_DATA_BAKED) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_RECTS " + String::num_int64(ATLAS_DATA_RECTS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_BAND " + String::num_int64(ATLAS_DATA_BAND) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_RINGS " + String::num_int64(ATLAS_DATA_RINGS) + "\n";
+				defines += "#define CLIPMAP_ATLAS_DATA_WORLD " + String::num_int64(ATLAS_DATA_WORLD) + "\n";
+			}
 		}
 		if (!_needs_vt_shader()) {
 			defines += "#define TERRAIN_NO_VT\n";
@@ -93,6 +150,7 @@ void Terrain3DMaterial::_update_shader() {
 	_shader_uses_vt = _needs_vt_shader();
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		_shader_clipmap[group] = _needs_clipmap_arm(group);
+		_shader_clipmap_atlas[group] = _needs_clipmap_atlas_arm(group);
 	}
 	_shader->set_code(_inject_editor_code(code));
 	RS->material_set_shader(_material, get_shader_rid());
@@ -475,6 +533,27 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	RS->material_set_param(p_material, "_texture_slope_params_array", asset_list->get_texture_slope_params());
 }
 
+// One `R32F` texture holding the block tables, created once and updated in place. A device that has
+// none yet leaves the sampler on the dummy 2D texture, which is the arm's "no atlas" state.
+RID Terrain3DMaterial::_update_block_data_texture(const PackedFloat32Array &p_data) {
+	if (_block_atlas_image.is_null()) {
+		_block_atlas_image = Image::create(ATLAS_DATA_WIDTH, ATLAS_DATA_HEIGHT, false, Image::FORMAT_RF);
+	}
+	PackedByteArray bytes;
+	bytes.resize(int64_t(ATLAS_DATA_WIDTH) * int64_t(ATLAS_DATA_HEIGHT) * 4);
+	float *dst = reinterpret_cast<float *>(bytes.ptrw());
+	for (int64_t index = 0; index < int64_t(ATLAS_DATA_WIDTH) * int64_t(ATLAS_DATA_HEIGHT); index++) {
+		dst[index] = index < p_data.size() ? p_data[index] : 0.f;
+	}
+	_block_atlas_image->set_data(ATLAS_DATA_WIDTH, ATLAS_DATA_HEIGHT, false, Image::FORMAT_RF, bytes);
+	if (_block_atlas_data.is_null()) {
+		_block_atlas_data = ImageTexture::create_from_image(_block_atlas_image);
+	} else {
+		_block_atlas_data->update(_block_atlas_image);
+	}
+	return _block_atlas_data.is_valid() ? _block_atlas_data->get_rid() : RID();
+}
+
 // The clipmap arm's uniforms, in one place because they are bound twice: by the full uniform pass
 // when the material or the variant changes, and by `update_vt_clipmap_uniforms()` when a *ring*
 // changed - which is per-level state that moves every tick a level is produced into, and therefore
@@ -493,8 +572,14 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	// A variant no group's arm is in declares none of these names, so there is nothing to fill: the
 	// whole table is skipped rather than built and thrown away.
 	bool armed = false;
+	bool atlas_armed = false;
+	bool atlas_material = false;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		armed = armed || _shader_clipmap[group];
+		if (_shader_clipmap_atlas[group]) {
+			atlas_armed = true;
+			atlas_material = atlas_material || group == int(TerrainVT::ChannelGroup::Material);
+		}
 	}
 	if (!armed) {
 		return;
@@ -503,6 +588,15 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	Array baked_albedos;
 	Array baked_normals;
 	Array baked_params;
+	// The block atlas's own tables, one row a group and packed into one `R32F` texture: a group that
+	// does not name the atlas publishes zeroes, so the texture never keeps the previous
+	// configuration's answer.
+	Array block_textures;
+	Array block_baked_albedos;
+	Array block_baked_normals;
+	Array block_baked_params;
+	PackedFloat32Array block_data;
+	block_data.resize(ATLAS_DATA_WIDTH * ATLAS_DATA_HEIGHT);
 	PackedVector2Array centers;
 	PackedVector2Array rings;
 	PackedFloat32Array valid;
@@ -550,6 +644,67 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 		sizes.push_back(int(arm.get("size", 0)));
 		levels.push_back(int(arm.get("levels", 0)));
 		channels.push_back(MAX(1, int(arm.get("channels", 1))));
+		// ---- The block atlas's tables for this group ---------------------------------------------
+		// The numeric tables are packed into one `R32F` texture rather than uniform arrays: the
+		// material's uniform buffer is already close to the device's limit at the default region
+		// maximum (the region and block arrays are tens of kilobytes once std140 padding is counted),
+		// and a block's 186-entry rect array would push the whole block past what D3D12 accepts - the
+		// device is removed at pipeline creation. A texture costs one sampler and no uniform bytes,
+		// and `texelFetch` is the read the data wants. `block_data` is filled below, after the loop.
+		const Dictionary atlas_arm = _terrain->get_vt_clipmap_atlas_arm(group);
+		const RID block_texture = atlas_arm.get("texture", RID());
+		block_textures.push_back(block_texture.is_valid() ? block_texture : _generated_dummy.get_rid());
+		const RID block_albedo = atlas_arm.get("baked_albedo", RID());
+		const RID block_normal = atlas_arm.get("baked_normal", RID());
+		const RID block_params = atlas_arm.get("baked_params", RID());
+		block_baked_albedos.push_back(block_albedo.is_valid() ? block_albedo : _generated_dummy.get_rid());
+		block_baked_normals.push_back(block_normal.is_valid() ? block_normal : _generated_dummy.get_rid());
+		block_baked_params.push_back(block_params.is_valid() ? block_params : _generated_dummy.get_rid());
+		const PackedVector4Array arm_block_rects = atlas_arm.get("rects", PackedVector4Array());
+		const PackedVector2Array arm_block_starts = atlas_arm.get("starts", PackedVector2Array());
+		const PackedInt32Array arm_block_slots = atlas_arm.get("cell_slots", PackedInt32Array());
+		const PackedFloat32Array arm_block_current = atlas_arm.get("cell_current", PackedFloat32Array());
+		const PackedFloat32Array arm_block_baked = atlas_arm.get("cell_baked", PackedFloat32Array());
+		const int base = group * ATLAS_DATA_STRIDE;
+		for (int ring = 0; ring < Terrain3DClipmapAtlas::MAX_RINGS; ring++) {
+			const Vector2 start = ring < arm_block_starts.size() ? arm_block_starts[ring] : Vector2();
+			block_data[base + ATLAS_DATA_STARTS + ring * 2] = start.x;
+			block_data[base + ATLAS_DATA_STARTS + ring * 2 + 1] = start.y;
+		}
+		for (int cell = 0; cell < Terrain3DClipmapAtlas::MAX_CELLS; cell++) {
+			const int slot = cell < arm_block_slots.size() ? arm_block_slots[cell] : -1;
+			block_data[base + ATLAS_DATA_SLOTS + cell] = float(slot);
+			// The stored index is the *logical* one: a block's content is a function of its own world
+			// square, so unlike the ring's level it is not rotated by the focus's phase. The arm
+			// publishes the phase for the debug view and the record, but adding it here would read a
+			// texel 30 metres away on the shipped shape.
+			block_data[base + ATLAS_DATA_OFFSETS + cell * 2] = 0.f;
+			block_data[base + ATLAS_DATA_OFFSETS + cell * 2 + 1] = 0.f;
+			block_data[base + ATLAS_DATA_CURRENT + cell] =
+					cell < arm_block_current.size() ? arm_block_current[cell] : 0.f;
+			block_data[base + ATLAS_DATA_BAKED + cell] =
+					cell < arm_block_baked.size() ? arm_block_baked[cell] : 0.f;
+		}
+		for (int slot = 0; slot < Terrain3DClipmapAtlas::MAX_SLOTS; slot++) {
+			const Vector4 rect = slot < arm_block_rects.size() ? arm_block_rects[slot] : Vector4();
+			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 0] = rect.x;
+			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 1] = rect.y;
+			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 2] = rect.z;
+			block_data[base + ATLAS_DATA_RECTS + slot * 4 + 3] = rect.w;
+		}
+		block_data[base + ATLAS_DATA_RINGS] = float(int(atlas_arm.get("rings", 0)));
+		block_data[base + ATLAS_DATA_WORLD] = atlas_arm.get("block_world", 0.0);
+		// The atlas's own band mask, bit 0 the near band and bit 1 the far one - separate from the
+		// ring's, because the two cells may name different units and the region arrays keep what
+		// neither owns.
+		int block_band = 0;
+		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), group) == int(TerrainVT::Delivery::ClipmapAtlas)) {
+			block_band |= 1;
+		}
+		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), group) == int(TerrainVT::Delivery::ClipmapAtlas)) {
+			block_band |= 2;
+		}
+		block_data[base + ATLAS_DATA_BAND] = float(block_band);
 		// The two cells' claim about *this* group, as one mask: bit 0 the near band, bit 1 the far
 		// one. The band is reach rather than capability, so it can move without a shader rebuild and
 		// is therefore a uniform and not a define.
@@ -576,6 +731,19 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_clipmap_level_count", levels);
 	RS->material_set_param(p_material, "_clipmap_channels", channels);
 	RS->material_set_param(p_material, "_clipmap_band", bands);
+	if (atlas_armed) {
+		// The atlas's names are declared only when a group's cells name it, so a ring-only variant
+		// binds none of them - a name the generated code does not carry would be an error per bind.
+		RS->material_set_param(p_material, "_clipmap_block", block_textures);
+		const RID block_data_rid = _update_block_data_texture(block_data);
+		RS->material_set_param(p_material, "_clipmap_block_data",
+				block_data_rid.is_valid() ? block_data_rid : _generated_dummy_2d.get_rid());
+		if (atlas_material) {
+			RS->material_set_param(p_material, "_clipmap_block_baked_albedo", block_baked_albedos);
+			RS->material_set_param(p_material, "_clipmap_block_baked_normal", block_baked_normals);
+			RS->material_set_param(p_material, "_clipmap_block_baked_params", block_baked_params);
+		}
+	}
 	// The detail layer's arm, bound from the layer's own dictionary so the shader's directory, the
 	// window origin it indexes with and the tile span are the CPU's own numbers. A configuration
 	// whose material group is not on the ring has no layer: every name is then bound to the dummy

@@ -420,6 +420,7 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	_block_values.assign(size_t(config.block_size) * size_t(config.block_size), 0.f);
 	_row_values.assign(size_t(config.block_size) + 1, 0.f);
 	_jobs.clear();
+	_bake_rects.clear();
 	_timeline.clear();
 	_free_textures();
 	_texture_layers = MAX(config.channels, 2);
@@ -440,6 +441,7 @@ void Terrain3DClipmapAtlas::clear() {
 	_jobs.clear();
 	_packed.clear();
 	_items.clear();
+	_bake_rects.clear();
 	_timeline.clear();
 	_block_values.clear();
 	_row_values.clear();
@@ -475,6 +477,7 @@ void Terrain3DClipmapAtlas::_free_textures() {
 	}
 	_texture_rid = RID();
 	_texture_rd = RID();
+	_free_baked();
 }
 
 // The atlas is one `Texture2DArray` of `channels` layers, each layer a whole 2D atlas for one value
@@ -523,6 +526,9 @@ void Terrain3DClipmapAtlas::_ensure_texture() {
 		return;
 	}
 	_ensure_staging();
+	// The baked arrays the material arm samples are sized by the same layout, so they are allocated
+	// where the layout is known: a device that appears after `configure()` gets them here.
+	_ensure_baked();
 }
 
 // One staging texture per (ring, channel), each exactly that ring's block size: `texture_update()`
@@ -584,6 +590,184 @@ RID Terrain3DClipmapAtlas::_create_staging(const int p_texels) {
 		LOG(ERROR, "Could not allocate clipmap atlas staging (", get_source_name(), ")");
 	}
 	return staging;
+}
+
+// ---- The baked arrays --------------------------------------------------------------------------
+//
+// The three material arrays a producer writes out of a block's source texels, sized to the whole
+// atlas so a block's output is a *rect* of one array rather than a layer: the producer dispatches
+// one rect per block, exactly the way it dispatches one rect per ring level. The source landing is
+// what makes a block readable; the producer's dispatch is what makes it a material, and a slot whose
+// bake has not landed reports `baked` false so the arm falls back instead of sampling a rect no
+// dispatch has written.
+//
+// The array has at least two layers whatever the channel count, for the same reason the ring's does:
+// the renderer refuses to wrap a one-layer array as a layered texture, and the arm samples these as
+// an array. Only layer 0 is ever written or read; the second is the wrapper's price.
+void Terrain3DClipmapAtlas::_ensure_baked() {
+	if (get_baked_channel_count() <= 0 || _layout.width <= 0 || _layout.height <= 0 || !is_configured()) {
+		return;
+	}
+	if (!_baked_rd.empty() && _baked_rd[0].is_valid()) {
+		return;
+	}
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		// No device yet: `_ensure_texture()` calls this again on the first publish, which is the
+		// first moment a device is certain.
+		return;
+	}
+	_free_baked();
+	Ref<RDTextureFormat> format;
+	format.instantiate();
+	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
+	format->set_format(RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT);
+	format->set_width(uint32_t(_layout.width));
+	format->set_height(uint32_t(_layout.height));
+	format->set_depth(1);
+	format->set_array_layers(2);
+	format->set_mipmaps(1);
+	// Storage, so a producer writes a rect; sampling, so the arm reads it; update, because the
+	// producer's pass is issued against the same texture the material binds.
+	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT);
+	Ref<RDTextureView> view;
+	view.instantiate();
+	TypedArray<PackedByteArray> initial;
+	for (int channel = 0; channel < get_baked_channel_count(); channel++) {
+		RID device = rd->texture_create(format, view, initial);
+		RID shader = device.is_valid()
+				? server->texture_rd_create(device, RenderingServer::TEXTURE_LAYERED_2D_ARRAY)
+				: RID();
+		if (!shader.is_valid()) {
+			if (device.is_valid()) {
+				rd->free_rid(device);
+			}
+			LOG(ERROR, "Could not allocate clipmap atlas baked channel ", channel, " (", get_source_name(), ")");
+			_free_baked();
+			return;
+		}
+		rd->set_resource_name(device, "Terrain3D Clipmap atlas " + get_source_name() + " baked " +
+						String::num_int64(channel));
+		_baked_rd.push_back(device);
+		_baked_rs.push_back(shader);
+	}
+}
+
+void Terrain3DClipmapAtlas::_free_baked() {
+	if (_baked_rd.empty() && _baked_rs.empty()) {
+		return;
+	}
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	for (const RID &rid : _baked_rs) {
+		if (rid.is_valid() && server != nullptr) {
+			server->free_rid(rid);
+		}
+	}
+	for (const RID &rid : _baked_rd) {
+		if (rid.is_valid() && rd != nullptr) {
+			rd->free_rid(rid);
+		}
+	}
+	_baked_rd.clear();
+	_baked_rs.clear();
+}
+
+RID Terrain3DClipmapAtlas::get_baked_device_rid(const int p_channel) const {
+	if (p_channel < 0 || p_channel >= int(_baked_rd.size())) {
+		return RID();
+	}
+	return _baked_rd[size_t(p_channel)];
+}
+
+RID Terrain3DClipmapAtlas::get_baked_texture_rid(const int p_channel) const {
+	if (p_channel < 0 || p_channel >= int(_baked_rs.size())) {
+		return RID();
+	}
+	return _baked_rs[size_t(p_channel)];
+}
+
+// The block's world square origin: the corner before the first texel's centre, which is what the
+// producer's job carries as its policy origin. `get_slot_texel_world()` is the ring's own texel, so
+// the two numbers together are the whole of the affine map from a content index to a world position.
+Vector2 Terrain3DClipmapAtlas::get_slot_block_origin(const int p_slot) const {
+	if (p_slot < 0 || p_slot >= int(_slots.size())) {
+		return Vector2();
+	}
+	const Slot &slot = _slots[size_t(p_slot)];
+	return Vector2(real_t(slot.block_x) * _config.base_world - 0.5f * _config.base_world,
+			real_t(slot.block_y) * _config.base_world - 0.5f * _config.base_world);
+}
+
+real_t Terrain3DClipmapAtlas::get_slot_texel_world(const int p_slot) const {
+	if (p_slot < 0 || p_slot >= int(_slots.size())) {
+		return 1.f;
+	}
+	return _texel_of_ring(_slots[size_t(p_slot)].ring);
+}
+
+// One block produced: queue its baked rect and stop claiming it is baked. A block re-produced into
+// the same slot (an invalidation) queues a second rect, and the previous dispatch's acknowledgment is
+// then refused by the serial below - the content the first bake read is gone.
+void Terrain3DClipmapAtlas::_queue_bake(const int p_slot) {
+	if (get_baked_channel_count() <= 0 || p_slot < 0 || p_slot >= int(_slots.size())) {
+		return;
+	}
+	Slot &slot = _slots[size_t(p_slot)];
+	slot.baked = false;
+	// A slot's bake queue holds at most its *latest* production: an older rect describes content the
+	// slot no longer holds, so a dispatch of it could only be refused, and leaving it queued would
+	// keep `pending_bake_rects` from ever reaching zero.
+	for (size_t index = 0; index < _bake_rects.size();) {
+		if (_bake_rects[index].slot == p_slot) {
+			_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
+			continue;
+		}
+		index++;
+	}
+	BakeRect rect;
+	rect.slot = p_slot;
+	rect.ring = slot.ring;
+	rect.rect = slot.rect;
+	rect.texels = slot.texels;
+	rect.block_x = slot.block_x;
+	rect.block_y = slot.block_y;
+	rect.serial = slot.serial;
+	_bake_rects.push_back(rect);
+}
+
+bool Terrain3DClipmapAtlas::acknowledge_bake_rect(const int p_slot, const uint64_t p_serial) {
+	if (p_slot < 0 || p_slot >= int(_slots.size())) {
+		return false;
+	}
+	Slot &slot = _slots[size_t(p_slot)];
+	// The slot has been reused since the rect was taken: the dispatch read content the slot no
+	// longer holds, so its acknowledgment describes nothing the atlas serves now. Any rect still
+	// queued for the slot up to this serial is stale for the same reason and is dropped.
+	if (slot.serial != p_serial) {
+		for (size_t index = 0; index < _bake_rects.size();) {
+			const BakeRect &rect = _bake_rects[index];
+			if (rect.slot == p_slot && rect.serial <= p_serial) {
+				_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
+				continue;
+			}
+			index++;
+		}
+		return false;
+	}
+	slot.baked = true;
+	for (size_t index = 0; index < _bake_rects.size();) {
+		const BakeRect &rect = _bake_rects[index];
+		if (rect.slot == p_slot && rect.serial == p_serial) {
+			_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
+			continue;
+		}
+		index++;
+	}
+	_state_stamp++;
+	return true;
 }
 
 // One block's rect, one channel at a time: a block-sized `texture_update()` into the ring's staging
@@ -746,6 +930,7 @@ int Terrain3DClipmapAtlas::_take_free_slot(const int p_ring) {
 		}
 		if (_slot_owner(int(index), true) < 0) {
 			slot.resident = false;
+			slot.baked = false;
 			return int(index);
 		}
 	}
@@ -755,6 +940,7 @@ int Terrain3DClipmapAtlas::_take_free_slot(const int p_ring) {
 		}
 		if (_slot_owner(spare, true) < 0) {
 			_slots[size_t(spare)].resident = false;
+			_slots[size_t(spare)].baked = false;
 			return spare;
 		}
 	}
@@ -960,6 +1146,11 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 		slot.phase = job.phase;
 		slot.serial = _serial();
 		slot.resident = true;
+		slot.baked = false;
+		// The source is in the atlas and the slot names the coordinate, so the block is ready to be
+		// *baked*: the producer's rect is queued here, and the slot stays unbaked until its dispatch
+		// lands and acknowledges this serial.
+		_queue_bake(job.slot);
 		for (Cell &cell : _cells) {
 			if (cell.pending_slot != job.slot) {
 				continue;

@@ -18,12 +18,19 @@ vec2 surface_bake_rotate(vec2 v, vec2 cs) {
 // level of the ring: `dims.x` texels that *wrap*, because the ring stores a level rotated by its own
 // ring offset - the payload and the height of logical texel `l` live at `mod(l + ring, size)` - which
 // is what lets a level that turned a strip keep the texels it did not lose.
+//
+// A block atlas job is the same wrapping source one organisation down: `dims.x` is the *block's*
+// texel count, the block's content lives at `dest.xy` of the atlas layer, and `dims.w` is set - so
+// the wrap is inside the block and the rect offset is added after it. The block's phase is zero: its
+// content is a function of its world square rather than of a level that turns, so the stored index is
+// the logical one.
 ivec2 surface_bake_source_coord(ivec2 coord) {
 	ivec2 size = ivec2(int(bake_push.dims.x));
 	if (bake_push.source.x == 0u) {
 		return clamp(coord, ivec2(0), size - ivec2(1));
 	}
-	return (coord + ivec2(bake_push.source.yz)) % size;
+	ivec2 offset = bake_push.dims.w != 0u ? ivec2(bake_push.dest.xy) : ivec2(0);
+	return offset + (coord + ivec2(bake_push.source.yz)) % size;
 }
 
 uint surface_bake_read_id(ivec2 coord, uint layer) {
@@ -209,7 +216,9 @@ void main() {
 		// a page's job uses, and the tap it names is the *logical* texel - which is what
 		// `surface_bake_source_coord()` turns into the stored one the payload and height layers hold.
 		ivec2 stored_size = ivec2(int(bake_push.dims.x));
-		ivec2 stored = ivec2(bake_push.dest.xy) + gid.xy;
+		// A block atlas job's stored index is the invocation's own texel inside the block; a ring
+		// level's is the rect's origin inside the level plus the invocation's texel.
+		ivec2 stored = bake_push.dims.w != 0u ? gid.xy : ivec2(bake_push.dest.xy) + gid.xy;
 		ivec2 logical = (stored - ivec2(bake_push.source.yz) + stored_size) % stored_size;
 		world_xz = job.policy.yz + (vec2(logical) + vec2(0.5)) * job.page.xy;
 	} else {

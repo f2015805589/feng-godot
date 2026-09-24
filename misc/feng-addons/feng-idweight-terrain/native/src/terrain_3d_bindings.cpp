@@ -451,10 +451,10 @@ void Terrain3D::_bind_methods() {
 	// other; `Direct` is the pure region-array path and `Clipmap` the toroidal level ring. See
 	// docs/vt_delivery_assembly.md.
 	ADD_SUBGROUP("VT Setting", "vt_");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_material", "get_vt_delivery_near_material");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_height", "get_vt_delivery_near_height");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_material", "get_vt_delivery_far_material");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_height", "get_vt_delivery_far_height");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_near_material", "get_vt_delivery_near_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_near_height", "get_vt_delivery_near_height");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_far_material", "get_vt_delivery_far_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_far_height", "get_vt_delivery_far_height");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");

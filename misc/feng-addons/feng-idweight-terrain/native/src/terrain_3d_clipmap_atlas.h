@@ -149,6 +149,11 @@ public:
 		bool resident = false;
 		bool spare = false;
 		bool global = false;
+		// Whether the three *baked* arrays hold this content. The source landing makes a block
+		// readable; the producer's dispatch, acknowledged by `acknowledge_bake_rect()`, is what makes
+		// it a **material**. A slot reused for another coordinate is not baked until its own bake
+		// lands, which is the whole of what keeps a stale rect out of a fragment.
+		bool baked = false;
 	};
 
 	// One cell of the grid: a fixed place in the 9x9 arrangement whose world block coordinate moves
@@ -192,6 +197,22 @@ public:
 				slot(p_slot), ring(p_ring), block_x(p_block_x), block_y(p_block_y), phase(p_phase) {}
 	};
 
+	// One block the producer has to *bake*: the rect of the baked atlas this block's three material
+	// arrays were produced into, and the content it describes. Queued the moment a block's source
+	// lands, acknowledged by the producer once its dispatch has been recorded, and - until then -
+	// the cell is not `baked`, so the material arm falls back rather than reading a rect no bake has
+	// covered. This is the ring's `BakeRect` with a block rect instead of a level rect, and the
+	// `serial` is what makes a slot reused for another block refuse the old bake's acknowledgment.
+	struct BakeRect {
+		int slot = 0;
+		int ring = 0;
+		Rect2i rect;
+		int texels = 0;
+		int64_t block_x = 0;
+		int64_t block_y = 0;
+		uint64_t serial = 0;
+	};
+
 	// What one packing scheme produced, published by the layout report so the comparison the task
 	// asks for is the mechanism's own numbers rather than a script's.
 	struct LayoutScheme {
@@ -223,6 +244,16 @@ public:
 	String get_source_name() const;
 	int get_source_channel_count() const { return _source != nullptr ? _source->get_channel_count() : 1; }
 	Image::Format get_source_format() const { return _source != nullptr ? _source->get_format() : Image::FORMAT_RF; }
+	// What a producer bakes out of the atlas's blocks, exactly as the ring asks its source: the
+	// material channel declares three arrays, the height channel none. The atlas owns the baked
+	// textures for the same reason the ring does - the producer writes rects of them and the arm
+	// samples them by the same rect array the source lives in.
+	int get_source_baked_channel_count() const {
+		return _source != nullptr ? _source->get_baked_channel_count() : 0;
+	}
+	Image::Format get_source_baked_format() const {
+		return _source != nullptr ? _source->get_baked_format() : Image::FORMAT_RGBAH;
+	}
 
 	// ---- The atlas texture ---------------------------------------------------------------------
 	// `channels` layers of one `Texture2DArray`, each layer a full 2D atlas for one value of a texel.
@@ -254,6 +285,11 @@ public:
 	// The ring's snapped grid origin in the frame's space, which is where every cell's block is
 	// measured from.
 	Vector2 get_grid_origin(const int p_ring) const;
+	// The ring's **start point**: the centre of the grid's centre block, a whole number of blocks from
+	// the frame origin. This - not the texel-snapped grid origin - is what `cell_for_world()` and
+	// `sample()` measure a block coordinate from, so it is the number the shader's copy of the
+	// addressing must be published: the two would disagree by up to half a block at a boundary.
+	Vector2 get_ring_start(const int p_ring) const { return _ring_start(p_ring, _last_focus); }
 	Vector2 get_focus() const { return _last_focus; }
 	// The block coordinate the grid's centre cell holds, `(m, m)`: the integer that tells a
 	// relabelling from a phase turn.
@@ -272,6 +308,37 @@ public:
 	Vector2 get_global_origin() const { return _global_origin; }
 	real_t get_global_world() const { return _global_world; }
 	int get_global_texels() const { return _config.global_texels; }
+
+	// ---- The baked arrays ----------------------------------------------------------------------
+	// The three arrays a producer writes out of a block's source texels, one rect of one array per
+	// block: the same `RGBAH` material the ring's bake produces, addressed by the *same* rect array
+	// the source lives in. `get_baked_texture_rid()` is what the material arm binds; the device RIDs
+	// are what the producer writes as storage images. A channel with no bake (the height one)
+	// allocates none, and the arm binds the dummy array instead.
+	int get_baked_channel_count() const { return _source != nullptr ? _source->get_baked_channel_count() : 0; }
+	RID get_baked_device_rid(const int p_channel) const;
+	RID get_baked_texture_rid(const int p_channel) const;
+	// Whether a block's content has been baked and may be sampled. `is_cell_baked()` is the arm's
+	// question - the cell's *current* slot, which is the only one a fragment reads.
+	bool is_slot_baked(const int p_slot) const {
+		return p_slot >= 0 && p_slot < int(_slots.size()) && _slots[size_t(p_slot)].baked;
+	}
+	bool is_cell_baked(const int p_cell) const {
+		return p_cell >= 0 && p_cell < int(_cells.size()) && _cells[size_t(p_cell)].current &&
+				is_slot_baked(_cells[size_t(p_cell)].slot);
+	}
+	// The bake queue: one entry per block whose source has landed and whose baked rect no dispatch
+	// has covered yet. `acknowledge_bake_rect()` is the producer's answer, refused when the slot
+	// has been reused since the rect was taken (the serial no longer matches), which is what makes a
+	// bake that read content the atlas has since replaced a no-op rather than a mislabel.
+	int get_pending_bake_rect_count() const { return int(_bake_rects.size()); }
+	const BakeRect &get_pending_bake_rect(const int p_index) const { return _bake_rects[size_t(p_index)]; }
+	bool acknowledge_bake_rect(const int p_slot, const uint64_t p_serial);
+	// The block's world square origin: the world XZ of the corner *before* the first texel's centre,
+	// so content index `i` names `get_slot_block_origin() + (i + 0.5) * get_slot_texel_world()`.
+	// This is the number the producer's job carries as its policy origin.
+	Vector2 get_slot_block_origin(const int p_slot) const;
+	real_t get_slot_texel_world(const int p_slot) const;
 
 	// One update: re-derive the grid the focus implies, relabel the cells, queue the blocks that
 	// entered, drain up to `blocks_per_frame` of them. Returns the channel texels produced.
@@ -367,7 +434,12 @@ private:
 	void _publish_global();
 	void _ensure_texture();
 	void _ensure_staging();
+	void _ensure_baked();
+	void _free_baked();
 	void _free_textures();
+	// Queues the block the job just produced for the producer, and clears the slot's baked flag: the
+	// rect is what a dispatch will cover, and until it does the material arm must fall back.
+	void _queue_bake(const int p_slot);
 	uint64_t _serial() { return ++_serial_counter; }
 
 	Config _config;
@@ -395,6 +467,14 @@ private:
 	// transfer is the point; a full-atlas staging image would be the thing this mechanism replaces.
 	std::vector<RID> _staging_rd;
 	std::vector<RID> _staging_rs;
+	// One device texture per baked channel, sized to the whole atlas, plus its RenderingServer
+	// wrapper. The producer writes rects of the device texture as storage images and the arm samples
+	// the wrapper; the two are created and freed together, exactly like the ring's baked arrays.
+	std::vector<RID> _baked_rd;
+	std::vector<RID> _baked_rs;
+	// The blocks whose source has landed and whose bake no dispatch has covered. One entry per
+	// produced block, removed by `acknowledge_bake_rect()`.
+	std::vector<BakeRect> _bake_rects;
 	Rect2i _global_rect;
 	Vector2 _global_origin;
 	real_t _global_world = 0.f;

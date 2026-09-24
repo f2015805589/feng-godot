@@ -48,6 +48,7 @@ const DIRECT := 0
 const AVT := 1
 const CLIPMAP := 2
 const SVT := 3
+const CLIPMAP_ATLAS := 4
 
 var terrain: Terrain3D
 var scene: Node3D
@@ -202,14 +203,18 @@ func run() -> void:
 			"which is the registry's answer for both channels rather than a table")
 	require(terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP),
 			"the height group is delivered by Clipmap, whose arm samples the ring")
+	# The block atlas is the clipmap layer's second residency unit and is deliverable for exactly the
+	# groups the ring is: it carries the same source, and both its arms sample block rects of it.
+	require(terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP_ATLAS) and terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP_ATLAS),
+			"and by ClipmapAtlas, which is deliverable for either group that has a clipmap source")
 	require(not terrain.is_vt_delivery_supported(HEIGHT, AVT) and not terrain.is_vt_delivery_supported(HEIGHT, SVT),
-			"while AVT and SVT are not the height channel's methods at all: its choices are Direct and the ring")
+			"while AVT and SVT are not the height channel's methods at all: its choices are Direct and the clipmap layer")
 	require(terrain.is_vt_delivery_supported(HEIGHT, DIRECT), "Direct is deliverable for either group, being the fallback")
 	var height_reason := terrain.get_vt_delivery_unsupported_reason(HEIGHT, SVT)
 	require(height_reason == "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group",
 			"and the reason names the design rather than a missing arm: %s" % height_reason)
 	var supported: Dictionary = settings().get("delivery_supported", {})
-	require(str(supported.get("material", [])) == str([DIRECT, AVT, CLIPMAP, SVT]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP]),
+	require(str(supported.get("material", [])) == str([DIRECT, AVT, CLIPMAP, SVT, CLIPMAP_ATLAS]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP, CLIPMAP_ATLAS]),
 			"the report publishes the methods each group may name: material %s, height %s" % [
 					str(supported.get("material")), str(supported.get("height"))])
 

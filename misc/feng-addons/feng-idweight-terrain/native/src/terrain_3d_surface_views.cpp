@@ -458,7 +458,7 @@ bool Terrain3D::is_vt_delivery_supported(const int p_group, const int p_method) 
 	if (method == TerrainVT::Delivery::Direct) {
 		return true;
 	}
-	if (method == TerrainVT::Delivery::Clipmap) {
+	if (method == TerrainVT::Delivery::Clipmap || method == TerrainVT::Delivery::ClipmapAtlas) {
 		return has_clipmap_source(p_group);
 	}
 	return p_group == int(TerrainVT::ChannelGroup::Material) &&
@@ -473,7 +473,8 @@ String Terrain3D::get_vt_delivery_unsupported_reason(const int p_group, const in
 		return "the cell is out of range";
 	}
 	const TerrainVT::ChannelGroup group = TerrainVT::ChannelGroup(p_group);
-	if (TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap) {
+	if (TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap ||
+			TerrainVT::Delivery(p_method) == TerrainVT::Delivery::ClipmapAtlas) {
 		return String("no clipmap source carries the ") + TerrainVT::group_channel_name(group) +
 				" channel in this build";
 	}
@@ -567,6 +568,13 @@ void Terrain3D::_resolve_vt_delivery(const bool p_changed) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
 		if (_vt.clipmap[group] != nullptr || _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
 			_setup_vt_clipmap(channel);
+		}
+		// The block atlas is the same layer's other residency unit, so a cell that names it asks for
+		// the same one-ring-per-group object and is built beside the ring - never instead of it, so
+		// a group that splits its two bands between the ring and the atlas owns both.
+		if (_vt.clipmap_atlas[group] != nullptr ||
+				_vt.delivery.group_uses(channel, TerrainVT::Delivery::ClipmapAtlas)) {
+			_setup_vt_clipmap_atlas(channel);
 		}
 	}
 	// And the material group's detail layer, which is a second object over the same group: a finer,
@@ -746,13 +754,16 @@ bool Terrain3D::has_vt_clipmap_ring() const {
 // which *source* carries a group is the whole of the difference, so a second channel is a source and
 // a line here rather than a second atlas.
 //
-// **It is a mechanism before it is a delivery, exactly as the ring was.** The atlas's own entry is
-// `debug_update_vt_clipmap_atlas()`, beside `debug_update_vt_clipmap()` and for the same reason: the
-// addressing, the block layout, the rolling counters, the per-frame timeline and the texture still
-// have to be *measurable* - `native/tests/vt_clipmap_atlas` and `native/tests/vt_clipmap_load` are
-// nothing but those readings - and a cell has no arm for it yet, so no cell may name it. What it
-// already answers is the load question: a ring publishes a whole `size x size` layer per movement, an
-// atlas publishes the block rects that changed, and the two are measured side by side by one script.
+// **It is a delivery and a mechanism.** A cell that names `ClipmapAtlas` builds it through this
+// assembly rule, the tick's phase drives it beside the ring, and both of its arms read it: the height
+// arm samples the block rects' source texels and the material arm samples the block rects' baked
+// arrays. `debug_update_vt_clipmap_atlas()` stays as the mechanism's own entry, beside
+// `debug_update_vt_clipmap()` and for the same reason: the addressing, the block layout, the rolling
+// counters, the per-frame timeline and the texture still have to be *measurable* without a delivery
+// claim - `native/tests/vt_clipmap_atlas` and `native/tests/vt_clipmap_load` are nothing but those
+// readings. What the two organisations answer together is the load question: a ring publishes a whole
+// `size x size` layer per movement, an atlas publishes the block rects that changed, and the two are
+// measured side by side by one script.
 bool Terrain3D::has_vt_clipmap_atlas() const {
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		if (_vt.clipmap_atlas[group] != nullptr) {
@@ -788,6 +799,13 @@ bool Terrain3D::_setup_vt_clipmap_atlas(const TerrainVT::ChannelGroup p_group) {
 	config.global_texels = _vt.clipmap_atlas_global_texels;
 	config.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
 	_vt.clipmap_atlas[index]->configure(config);
+	// The atlas's channel carries the same baked layers the ring's does, and the bake reads the
+	// surface material list - which the page path publishes and a configuration whose material group
+	// takes no page never does. The same one-time publication the ring makes, for the same reason.
+	if (_vt.clipmap_atlas[index]->get_source_baked_channel_count() > 0 && !_vt.vt_materials_published) {
+		_vt.vt_materials_dirty = true;
+		_vt.vt_materials_published = true;
+	}
 	return true;
 }
 
@@ -811,13 +829,18 @@ Dictionary Terrain3D::get_vt_clipmap_atlas_arm(const int p_group) const {
 	PackedInt32Array cell_slots;
 	PackedVector2Array cell_offsets;
 	PackedFloat32Array cell_current;
+	PackedFloat32Array cell_baked;
 	starts.resize(rings);
 	rects.resize(slots);
 	cell_slots.resize(cells);
 	cell_offsets.resize(cells);
 	cell_current.resize(cells);
+	cell_baked.resize(cells);
 	for (int ring = 0; ring < rings; ring++) {
-		starts[ring] = atlas->get_grid_origin(ring);
+		// The *block* start point, not the texel-snapped grid origin: `cell_for_world()` and
+		// `sample()` measure a block coordinate from the start, and publishing the grid origin would
+		// put the shader's blocks up to half a block away from the CPU's at a boundary.
+		starts[ring] = atlas->get_ring_start(ring);
 	}
 	for (int slot = 0; slot < slots; slot++) {
 		const Rect2i rect = atlas->get_slot_rect(slot);
@@ -829,6 +852,9 @@ Dictionary Terrain3D::get_vt_clipmap_atlas_arm(const int p_group) const {
 		const Vector2i offset = atlas->get_cell_offset(cell);
 		cell_offsets[cell] = Vector2(real_t(offset.x), real_t(offset.y));
 		cell_current[cell] = atlas->is_cell_current(cell) ? 1.f : 0.f;
+		// The *baked* readiness, which is the material arm's gate: a cell whose source is current but
+		// whose baked rect no dispatch has covered must fall back, not sample a rect nobody wrote.
+		cell_baked[cell] = atlas->is_cell_baked(cell) ? 1.f : 0.f;
 	}
 	arm["configured"] = true;
 	arm["texture"] = atlas->get_texture_rid();
@@ -846,12 +872,43 @@ Dictionary Terrain3D::get_vt_clipmap_atlas_arm(const int p_group) const {
 	arm["cell_slots"] = cell_slots;
 	arm["cell_offsets"] = cell_offsets;
 	arm["cell_current"] = cell_current;
+	arm["cell_baked"] = cell_baked;
+	arm["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
+	// The atlas's three *baked* arrays, when its channel declares them: what the material arm samples
+	// where a block is baked. An atlas whose channel declares none publishes none, and the arm's
+	// names are bound to the dummy array instead - the rule the ring's arm follows.
+	if (atlas->get_baked_channel_count() >= 3) {
+		arm["baked_albedo"] = atlas->get_baked_texture_rid(0);
+		arm["baked_normal"] = atlas->get_baked_texture_rid(1);
+		arm["baked_params"] = atlas->get_baked_texture_rid(2);
+	}
 	return arm;
+}
+
+// The atlas's rolling evidence, read straight off the mechanism: how many blocks a scroll loaded and
+// how many cells kept their content. It is published rather than kept local because "only the edge
+// reloads" is a claim the acceptance asks to see as a number. One writer, so the tick's phase and the
+// mechanism's own entry below publish the same counters.
+void Terrain3D::_publish_clipmap_atlas_readings(const Terrain3DClipmapAtlas *p_atlas) {
+	if (p_atlas == nullptr) {
+		_vt.clipmap_atlas_block_uploads = 0;
+		_vt.clipmap_atlas_scroll_events = 0;
+		_vt.clipmap_atlas_blocks_loaded = 0;
+		_vt.clipmap_atlas_blocks_retained = 0;
+		return;
+	}
+	_vt.clipmap_atlas_block_uploads = int64_t(p_atlas->get_block_uploads());
+	_vt.clipmap_atlas_scroll_events = int64_t(p_atlas->get_scroll_events());
+	_vt.clipmap_atlas_blocks_loaded = int64_t(p_atlas->get_edge_blocks_loaded());
+	_vt.clipmap_atlas_blocks_retained = int64_t(p_atlas->get_interior_blocks_retained());
 }
 
 // The mechanism's own entry, beside `debug_update_vt_clipmap()` and the same shape: the same focus
 // (`get_clipmap_target_position()`), the same `vt_clipmap_budget_texels`, and the same two published
-// numbers, so a panel or a test reads the atlas through the one report either way.
+// numbers, so a panel or a test reads the atlas through the one report either way. The tick's phase
+// runs the identical call while a cell selects the method; this stays as the door a reading takes the
+// mechanism through *without* a delivery claim, which is how `native/tests/vt_clipmap_atlas` isolates
+// the addressing from the arm.
 int Terrain3D::debug_update_vt_clipmap_atlas(const int p_group) {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
 		return -1;
@@ -867,13 +924,12 @@ int Terrain3D::debug_update_vt_clipmap_atlas(const int p_group) {
 	}
 	const Vector2 focus = v3v2(get_clipmap_target_position());
 	_vt.clipmap_atlas_produced_texels = atlas->update(focus, _vt.clipmap_budget_texels);
-	// The rolling evidence, read straight off the mechanism: how many blocks a scroll loaded and how
-	// many cells kept their content. It is published rather than kept local because "only the edge
-	// reloads" is a claim the acceptance asks to see as a number.
-	_vt.clipmap_atlas_block_uploads = int64_t(atlas->get_block_uploads());
-	_vt.clipmap_atlas_scroll_events = int64_t(atlas->get_scroll_events());
-	_vt.clipmap_atlas_blocks_loaded = int64_t(atlas->get_edge_blocks_loaded());
-	_vt.clipmap_atlas_blocks_retained = int64_t(atlas->get_interior_blocks_retained());
+	_publish_clipmap_atlas_readings(atlas);
+	// The tests drive the mechanism through this entry, so the bake is offered here too: an atlas
+	// whose rects are never offered to a producer reports `baked` false for the rest of the session.
+	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+		baker->queue_clipmap_atlas(atlas, _vt.clipmap_budget_texels);
+	}
 	return _vt.clipmap_atlas_produced_texels;
 }
 
@@ -903,6 +959,12 @@ Dictionary Terrain3D::get_clipmap_atlas_layout(const int p_group) const {
 	result["upload_bytes"] = int64_t(atlas->get_upload_bytes());
 	result["block_uploads"] = int64_t(atlas->get_block_uploads());
 	result["pending_jobs"] = atlas->get_pending_jobs();
+	result["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
+	int baked_cells = 0;
+	for (int cell = 0; cell < atlas->get_cell_count(); cell++) {
+		baked_cells += atlas->is_cell_baked(cell) ? 1 : 0;
+	}
+	result["baked_cells"] = baked_cells;
 	result["rings"] = atlas->get_ring_reports();
 	result["layout"] = atlas->get_layout_report();
 	result["timeline"] = atlas->get_load_timeline();
@@ -1064,10 +1126,16 @@ int Terrain3D::invalidate_vt_clipmap_area(const AABB &p_area) {
 	int queued = 0;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		Terrain3DClipmap *ring = _vt.clipmap[group].get();
-		if (ring == nullptr) {
-			continue;
+		if (ring != nullptr) {
+			queued += ring->invalidate_rect(rect);
 		}
-		queued += ring->invalidate_rect(rect);
+		Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
+		if (atlas != nullptr) {
+			// The atlas is the same layer's other residency unit: a block the edit touches stops
+			// being current and is re-produced, which is the block-granular invalidation the
+			// mechanism exists for. Its baked rect follows the re-production automatically.
+			queued += atlas->invalidate_rect(rect);
+		}
 	}
 	// The levels that stopped being current are the shader's gate, and the gate is a uniform: without
 	// this the ring would keep serving the height it held before the stroke.
@@ -1085,6 +1153,15 @@ bool Terrain3D::_vt_clipmap_state_changed() {
 		const uint64_t stamp = ring != nullptr ? ring->get_state_stamp() : 0;
 		if (stamp != _vt.clipmap_state[group]) {
 			_vt.clipmap_state[group] = stamp;
+			changed = true;
+		}
+		// The atlas's addressing is the shader's other copy of the same layer, so a block that
+		// relabelled, turned its phase or changed which cell is current is a rebind of its own. The
+		// two stamps are compared in one pass because one rebind publishes both tables.
+		const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
+		const uint64_t atlas_stamp = atlas != nullptr ? atlas->get_state_stamp() : 0;
+		if (atlas_stamp != _vt.clipmap_atlas_state[group]) {
+			_vt.clipmap_atlas_state[group] = atlas_stamp;
 			changed = true;
 		}
 	}
@@ -1171,7 +1248,8 @@ bool Terrain3D::_setup_vt_material_detail() {
 	// served by the ring's coarse level, and without the ring the fragment would have nothing
 	// between the tile and the region array.
 	const bool wanted = _vt.detail_enabled && _data != nullptr &&
-			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
+			(_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap) ||
+					_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::ClipmapAtlas));
 	if (!wanted) {
 		if (_vt.material_detail != nullptr) {
 			// The producer holds a descriptor set that names this layer's textures and this bundle's
@@ -1274,13 +1352,18 @@ void Terrain3D::_update_vt_material_detail() {
 	_vt.detail_requested_tiles = detail->update(view, _vt.vt_source_snapshot, _vt.clipmap_budget_texels);
 	_vt.detail_starved_tiles = detail->get_starved_tiles();
 	if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-		// The ring's texel budget is a tick's worth of *ring* work, and one detail tile is a whole
-		// small array at the same cost, so that budget admits exactly one tile a tick: the near field
-		// took seconds to fill after a move, which is a second kind of blur. The offers are spent in
-		// tile units and the layer is bounded by its own slot table, so asking for a multiple of the
-		// ring's budget fills the near field in a few frames without changing what one ring tick
-		// produces.
-		surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels * 4);
+		// The offers are charged in *stored texels* a tile (`stored_size^2`, one channel), while the
+		// budget below is the ring's channel-texel budget: the two are different units. Measured, the
+		// `* 4` admits **three tiles a tick**, not the "one ring tick's worth" the comment above
+		// claims (4 * 65,536 = 262,144 and a tile costs 70,756 stored texels: 3 * 70,756 = 212,268,
+		// the fourth does not fit). 238 demanded tiles / 3 a tick = ~79 ticks, which is the ~211
+		// frames the load probe reports for the near material's detail half - the largest single item
+		// in that load, and a *throughput* bound rather than a cost bound (0.29 ms of CPU a tick).
+		// Sixteen times the ring's budget admits 14 tiles a tick (14 * 70,756 = 990,584 <= 1,048,576)
+		// and fills the same demand in ~23 frames: the same tiles, density, slot table and thresholds,
+		// with no fallback and no quality change. The layer is still bounded by its own slot table,
+		// and the offer remains a soft floor of one tile a tick.
+		surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels * 16);
 	}
 	_vt.vt_detail_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
 	_update_vt_detail_arm();

@@ -29,6 +29,7 @@
 // own header (and the page pipeline it carries) does not become a dependency of every file that
 // includes the baker.
 class Terrain3DMaterialClipmapDetail;
+class Terrain3DClipmapAtlas;
 
 /**
  * What a material page array can be stored in. This is deliberately a shorter list than the
@@ -263,6 +264,40 @@ private:
 		uint64_t dispatches = 0;
 	};
 	RingBake _ring_bake;
+	// ---- The atlas's bake ------------------------------------------------------------------------
+	// The block atlas's three baked arrays are one rect per block, so the job carries the block's rect
+	// in atlas pixels and the block's world square rather than a level's stored grid. Everything else -
+	// the one-tick separation, the material-version discard, the lease - is the ring's, which is why
+	// the two paths share one shader, one job buffer and one material list.
+	struct AtlasJob {
+		int slot = -1;
+		int ring = 0;
+		uint64_t serial = 0;
+		int x0 = 0;
+		int y0 = 0;
+		int texels = 0;
+		Vector2 block_origin;
+		real_t texel = 1.f;
+		int payload_layer = 0;
+		int height_layer = 1;
+		uint64_t material_version = 0;
+	};
+	struct AtlasBake {
+		const Terrain3DClipmapAtlas *atlas = nullptr;
+		RID uniform_set;
+		RID atlas_rd;
+		RID job_buffer;
+		int width = 0;
+		int height = 0;
+		std::vector<AtlasJob> collected;
+		std::vector<AtlasJob> queued;
+		std::vector<AtlasJob> landed;
+		uint64_t dispatches = 0;
+	};
+	AtlasBake _atlas_bake;
+	bool _ensure_atlas_bake(Terrain3DClipmapAtlas *p_atlas);
+	void _free_atlas_bake();
+	int _dispatch_atlas_bake();
 	// ---- The detail layer's bake -----------------------------------------------------------------
 	// The material group's sparse fine layer (`Terrain3DMaterialClipmapDetail`) is baked by the same
 	// shader as a page and the same shader as a ring rect: one *tile* is one page-shaped job, its
@@ -715,6 +750,17 @@ public:
 	// tick would let the bake read the payload the rect is replacing. Returns how many rects this call
 	// offered, which is not how many are baked - that is `Terrain3DClipmap::is_level_baked()`.
 	int queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels);
+
+	// ---- The atlas's bake ------------------------------------------------------------------------
+	// The block atlas is the ring's second residency unit and is baked by the same shader: one *block
+	// rect of the atlas* is one job, its rect the one the atlas produced, its source the atlas's own
+	// payload and height layers, and its outputs the atlas's three baked arrays at that rect. The
+	// offer/acknowledge handshake is the ring's exactly - the caller offers once a tick with the same
+	// budget, the render callback dispatches the rects the offer could take, and the next offer
+	// reports each landed rect back to the atlas, which refuses a rect whose slot has been reused.
+	int queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, const int p_budget_texels);
+	// The atlas bake's own accounting: the dispatches it recorded and the rects still queued.
+	Dictionary get_atlas_bake_stats() const;
 
 	// The detail layer's offer, beside the ring's. The caller offers the layer once a tick with the
 	// same budget the layer's own production is charged in (channel texels, a soft floor of one tile

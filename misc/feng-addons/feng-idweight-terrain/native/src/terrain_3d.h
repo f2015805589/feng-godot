@@ -539,6 +539,14 @@ public:
 	// question about the object, and the two differ for a ring `debug_update_vt_clipmap()` built to
 	// measure the mechanism with no cell naming the method.
 	bool has_clipmap_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::Clipmap); }
+	// Whether any cell selected the block atlas. It is the ring's second residency unit rather than
+	// a second layer: the band rule, the bake and the fallback to the region arrays are the ring's,
+	// and only the storage and the update unit differ, so the tick enters the same phase for it.
+	bool has_clipmap_atlas_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::ClipmapAtlas); }
+	// Whether any cell selected either residency unit of the clipmap layer. The tick's phase, the
+	// material detail layer and the shader's arm set are gated on this rather than on the ring
+	// alone: an atlas-only matrix is as much "the clipmap layer is selected" as a ring-only one.
+	bool has_clipmap_layer_delivery() const { return has_clipmap_delivery() || has_clipmap_atlas_delivery(); }
 	// The same three questions by property value, which is the form a debug view asks them in: a
 	// method no cell selects has no layout to draw, so its view hides itself instead of polling a
 	// scan of an empty service. An out-of-range value is false rather than a clamp, mirroring
@@ -568,8 +576,18 @@ public:
 	// Whether a group is delivered by the ring in either band, which is exactly the condition the
 	// generated shader carries that group's arm under: a group that is `Direct` in both bands
 	// compiles no ring code, binds no ring uniform and tests no branch, so a method nobody selected
-	// costs the Direct path nothing.
-	bool clipmap_arm_used(const TerrainVT::ChannelGroup p_group) const { return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap); }
+	// costs the Direct path nothing. The block atlas is the same layer's other residency unit and
+	// compiles the same arm - its own tables are bound under it - so it answers here too.
+	bool clipmap_arm_used(const TerrainVT::ChannelGroup p_group) const {
+		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap) ||
+				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas);
+	}
+	// Whether a group is delivered by the block atlas in either band. The arm's own copy of the
+	// atlas's tables is bound only while this is true, which is what keeps an atlas nobody selected
+	// from costing a uniform.
+	bool clipmap_atlas_arm_used(const TerrainVT::ChannelGroup p_group) const {
+		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas);
+	}
 	// Why the pair above is refused, in the sentence the setter logs, a panel shows and a test pins.
 	// Empty for a pair that is supported.
 	String get_vt_delivery_unsupported_reason(const int p_group, const int p_method) const;
@@ -582,6 +600,7 @@ public:
 	bool group_has_vt_delivery(const TerrainVT::ChannelGroup p_group) const {
 		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::AVT) ||
 				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap) ||
+				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas) ||
 				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::SVT);
 	}
 
@@ -641,12 +660,12 @@ public:
 	// changes about the ring: the unit of *production* is a block, and the unit of *upload* is a block
 	// rect rather than a whole layer.
 	//
-	// It is built and driven exactly the way the ring is when no cell names it, through
-	// `debug_update_vt_clipmap_atlas()`, and it publishes the same shape of readings
-	// (`clipmap_atlas_produced_texels`, the block-upload and rolling counters, the layout payload).
-	// That is deliberate: the mechanism has to be measurable before it is a delivery, which is the
-	// same order the ring was built in, and the load comparison the user asked for is a measurement
-	// of two mechanisms rather than a claim about two settings.
+	// It is **a delivery and a mechanism**: a cell that names `ClipmapAtlas` builds it through the
+	// same assembly rule the ring's `Clipmap` uses, the tick's phase drives it, and its blocks are
+	// baked and sampled by the material arm; `debug_update_vt_clipmap_atlas()` is the mechanism's own
+	// entry for the tests, the same way `debug_update_vt_clipmap()` is the ring's. It publishes the
+	// same shape of readings (`clipmap_atlas_produced_texels`, the block-upload and rolling counters,
+	// the layout payload), so the load comparison is one script on one build.
 	bool has_vt_clipmap_atlas() const;
 	// Whether an atlas exists, for the debug view's gate.
 	bool clipmap_atlas_available() const;
@@ -660,6 +679,10 @@ public:
 	// same focus, the same `vt_clipmap_budget_texels`, the same published numbers. Returns the channel
 	// texels produced, or -1 when no atlas can be built for that group.
 	int debug_update_vt_clipmap_atlas(const int p_group);
+	// The atlas's rolling readings, published from whichever entry drove it - the tick's phase or
+	// the mechanism's own `debug_update_vt_clipmap_atlas()`. One writer, so a panel or a test reads
+	// the same counters either way.
+	void _publish_clipmap_atlas_readings(const Terrain3DClipmapAtlas *p_atlas);
 	// The atlas's read-only debug payload: the packing the layout algorithm chose, every rect, and
 	// every cell's current-frame atlas index - so the debug view draws the *atlas's region* rather
 	// than a ring's square. Empty when no atlas exists.

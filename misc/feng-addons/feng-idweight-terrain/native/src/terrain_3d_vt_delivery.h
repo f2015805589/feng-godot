@@ -58,9 +58,17 @@ enum class Delivery : uint8_t {
 	// The world-space sparse virtual texture: one global page grid, a distance level rule
 	// and a pinned root pyramid.
 	SVT = 3,
+	// The same rings as `Clipmap`, organised as discrete blocks packed into one texture per
+	// channel (`terrain_3d_clipmap_atlas.h`) instead of one toroidal level per array layer. The
+	// storage and the update unit are what differ: a block is a rect of one texture and is
+	// written with `RenderingDevice::texture_copy()`, so a movement republishes the rects that
+	// changed rather than every level's whole square. The band rule, the fallback to the region
+	// arrays and the material bake are the ring's, so a cell selects this exactly as it selects
+	// `Clipmap` and the two are the same layer with a different residency unit.
+	ClipmapAtlas = 4,
 };
 
-inline constexpr int DELIVERY_COUNT = 4;
+inline constexpr int DELIVERY_COUNT = 5;
 inline constexpr int TIER_COUNT = 2;
 inline constexpr int GROUP_COUNT = 2;
 
@@ -94,6 +102,8 @@ inline const char *delivery_name(const Delivery p_delivery) {
 			return "AVT";
 		case Delivery::Clipmap:
 			return "Clipmap";
+		case Delivery::ClipmapAtlas:
+			return "ClipmapAtlas";
 		case Delivery::SVT:
 			return "SVT";
 		default:
@@ -145,7 +155,10 @@ struct DeliveryMatrix {
 
 	// Whether any *service* was selected at all: false is the all-direct configuration,
 	// which is the one that must build no service, no array, no uniform and no shader arm.
-	bool any_service() const { return uses(Delivery::AVT) || uses(Delivery::Clipmap) || uses(Delivery::SVT); }
+	bool any_service() const {
+		return uses(Delivery::AVT) || uses(Delivery::Clipmap) || uses(Delivery::ClipmapAtlas) ||
+				uses(Delivery::SVT);
+	}
 
 	// Whether a group is delivered by a method in a tier, which is what a family's
 	// publication is decided from: the material arrays are not produced for a tier whose

@@ -21,7 +21,7 @@ const BAKE_STATUS_POLL_INTERVAL: float = 0.25
 # The delivery methods in the order of the native `TerrainVT::Delivery` enum, which is also the
 # item id the OptionButtons store: the widget, the property and the C++ value are one number, so a
 # method added natively appears here as one more string and no mapping has to be kept in step.
-const DELIVERY_METHODS: Array[String] = ["Direct (pure RVT)", "AVT", "Clipmap", "SVT"]
+const DELIVERY_METHODS: Array[String] = ["Direct (pure RVT)", "AVT", "Clipmap", "SVT", "Clipmap atlas"]
 const DELIVERY_BANDS: Array[String] = ["near", "far"]
 const DELIVERY_GROUPS: Array[String] = ["material", "height"]
 const DELIVERY_GROUP_LABELS: Dictionary = {"material": "Diffuse + normal", "height": "Height"}
@@ -707,7 +707,7 @@ func _build_delivery_rows(p_panel: VBoxContainer) -> void:
 	delivery_hint = Label.new()
 	delivery_hint.name = "DeliveryHint"
 	delivery_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	delivery_hint.text = "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring. A method no row selects owns no object, no array and no shader code."
+	delivery_hint.text = "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring, Clipmap atlas the same rings packed as blocks in one texture per channel (a movement republishes block rects, not whole levels). A method no row selects owns no object, no array and no shader code."
 	p_panel.add_child(delivery_hint)
 	var grid := GridContainer.new()
 	grid.name = "DeliveryGrid"
@@ -774,7 +774,7 @@ func _refresh_delivery_rows(p_settings: Dictionary) -> void:
 				option.select(index)
 	if delivery_hint == null:
 		return
-	var text := "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring. A method no row selects owns no object, no array and no shader code."
+	var text := "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the toroidal level ring, Clipmap atlas the same rings packed as blocks in one texture per channel (a movement republishes block rects, not whole levels). A method no row selects owns no object, no array and no shader code."
 	for group in DELIVERY_GROUPS:
 		var reasons: Dictionary = refused.get(group, {})
 		for name: Variant in reasons:
