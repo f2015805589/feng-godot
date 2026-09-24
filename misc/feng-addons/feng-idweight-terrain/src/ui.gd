@@ -12,10 +12,6 @@ const GradientOperationBuilder: Script = preload("res://addons/feng-idweight-ter
 const TerrainUIDecal: Script = preload("res://addons/feng-idweight-terrain/src/ui_decal.gd")
 const LIVE_INFO_PANEL: String = "res://addons/feng-idweight-terrain/src/live_info_panel.tscn"
 
-const OP_NONE: int = 0x0
-const OP_POSITIVE_ONLY: int = 0x01
-const OP_NEGATIVE_ONLY: int = 0x02
-
 var plugin: EditorPlugin # Actually Terrain3DEditorPlugin, but Godot still has CRC errors
 var toolbar: TerrainToolbar
 var tool_settings: TerrainToolSettings

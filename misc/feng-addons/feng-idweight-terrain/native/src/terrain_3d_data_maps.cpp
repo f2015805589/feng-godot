@@ -7,6 +7,7 @@
 // side every consumer uses: `set_pixel()`, `get_pixel_descaled()`, the height, normal, blend,
 // slope and texture-id queries and the mesh-vertex decimation they feed.
 
+#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 
 #include "logger.h"

@@ -1,18 +1,10 @@
 """Storage-level codec check: a stored page must keep its colour."""
-import argparse
-from pathlib import Path
 
-from fixture import DEFAULT_EDITOR, run_script_test
+from fixture import run_script_test
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR)
-    parser.add_argument("--driver", default="vulkan")
-    args = parser.parse_args()
     return run_script_test(
-        editor=args.editor,
-        driver=args.driver,
         fixture_prefix="terrain-vtcodec-colors-",
         script="vt_codec_colors.gd",
         marker="PASS stored pages keep their colour in every codec",

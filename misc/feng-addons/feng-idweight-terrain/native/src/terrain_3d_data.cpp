@@ -15,6 +15,7 @@
 // <unordered_map>, none of which appears in it.
 
 #include "terrain_3d_data.h"
+#include "terrain_3d.h"
 
 #include "logger.h"
 

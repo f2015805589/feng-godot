@@ -15,6 +15,7 @@
 // for `TerrainVT::log2_power_of_two()`, the level arithmetic this half shares with the addressing
 // contract.
 
+#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 #include "terrain_vt.h"
 

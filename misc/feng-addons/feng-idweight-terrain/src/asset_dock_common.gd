@@ -17,13 +17,12 @@
 @tool
 extends PanelContainer
 
+# `confirmation_closed` is the one signal both docks publish: the list container
+# awaits it and then reads `_confirmed` for the answer.
 signal confirmation_closed
-signal confirmation_confirmed
-signal confirmation_canceled
 
 const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
 const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
-const ES_DOCK_TAB: String = "terrain3d/dock/tab"
 
 # The list and the tile live in their own scripts, shared with the other dock version. Both docks
 # inherit them, so they stay addressable as a dock's ListContainer / ListEntry.
@@ -63,6 +62,77 @@ func _enter_tree() -> void:
 	if not _initialized or not is_instance_valid(plugin) or not plugin.is_terrain_valid():
 		return
 	_bind_assets_signals(plugin.terrain.assets if plugin.terrain.assets else null)
+
+
+## Shared initialize() wiring
+#
+# Both docks build the same list controls, connect the same signals and add the same confirmation
+# dialog; each version calls these and keeps only what its own hosting adds (4.6 the EditorDock, the
+# management menu and the debug-view menu; 4.5 the slot, floating and window controls).
+
+func _bind_common_controls() -> void:
+	pinned_btn = $Box/Buttons/Pinned
+	pinned_btn.owner = null
+	size_slider = $Box/Buttons/SizeSlider
+	size_slider.owner = null
+	box = $Box
+	buttons = $Box/Buttons
+	textures_btn = $Box/Buttons/TexturesBtn
+	meshes_btn = $Box/Buttons/MeshesBtn
+	asset_container = $Box/ScrollContainer
+	search_box = $Box/Buttons/SearchBox
+	search_box.owner = null
+	search_button = $Box/Buttons/SearchBox/SearchButton
+
+
+func _create_asset_lists() -> void:
+	texture_list = ListContainer.new()
+	texture_list.name = "TextureList"
+	texture_list.plugin = plugin
+	texture_list.type = Terrain3DAssets.TYPE_TEXTURE
+	asset_container.add_child(texture_list, true)
+	mesh_list = ListContainer.new()
+	mesh_list.name = "MeshList"
+	mesh_list.plugin = plugin
+	mesh_list.type = Terrain3DAssets.TYPE_MESH
+	mesh_list.visible = false
+	asset_container.add_child(mesh_list, true)
+	current_list = texture_list
+
+
+func _connect_common_signals() -> void:
+	resized.connect(update_layout)
+	textures_btn.pressed.connect(_on_textures_pressed)
+	meshes_btn.pressed.connect(_on_meshes_pressed)
+	pinned_btn.toggled.connect(_on_pin_changed)
+	size_slider.value_changed.connect(_on_slider_changed)
+	plugin.ui.toolbar.tool_changed.connect(_on_tool_changed)
+	var editor_scale: float = EditorInterface.get_editor_scale()
+	meshes_btn.add_theme_font_size_override("font_size", int(16. * editor_scale))
+	textures_btn.add_theme_font_size_override("font_size", int(16. * editor_scale))
+
+
+func _connect_search_signals() -> void:
+	search_box.text_changed.connect(_on_search_text_changed)
+	search_button.pressed.connect(_on_search_button_pressed)
+
+
+func _create_confirm_dialog() -> void:
+	confirm_dialog = ConfirmationDialog.new()
+	add_child(confirm_dialog, true)
+	confirm_dialog.hide()
+	confirm_dialog.confirmed.connect(func() -> void: _confirmed = true; confirmation_closed.emit() )
+	confirm_dialog.canceled.connect(func() -> void: _confirmed = false; confirmation_closed.emit() )
+
+
+# The dock draws its own panel and, while the dock scene is being edited, leaves the theme icons off
+# the buttons so a saved .tscn does not carry icon resources.
+func _apply_dock_styles() -> void:
+	set("theme_override_styles/panel", get_theme_stylebox("panel", "Panel"))
+	if EditorInterface.get_edited_scene_root() != self:
+		pinned_btn.icon = get_theme_icon("Pin", "EditorIcons")
+		pinned_btn.text = ""
+		search_button.icon = get_theme_icon("Search", "EditorIcons")
 
 
 ## Dock button handlers
@@ -248,6 +318,16 @@ func _on_godot_window_entered() -> void:
 		print("Terrain3DAssetDock: _on_godot_window_entered")
 	if is_instance_valid(window) and window.has_focus():
 		plugin.godot_editor_window.grab_focus()
+
+
+## Hosting overrides
+#
+# Each version hosts itself differently, so `update_layout()` is theirs to implement. It is declared
+# here as an empty override - the same shape as `save_editor_settings()` below - so the shared wiring
+# above can name it: GDScript resolves an inherited name at parse time.
+
+func update_layout() -> void:
+	pass
 
 
 ## Editor settings

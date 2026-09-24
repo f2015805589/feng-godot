@@ -17,6 +17,7 @@
 #include "terrain_3d_assets.h"
 
 #include "logger.h"
+#include "terrain_3d.h"
 #include "terrain_3d_util.h"
 
 #include <godot_cpp/classes/image_texture.hpp>

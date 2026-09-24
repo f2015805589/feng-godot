@@ -54,33 +54,11 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	_dock.open()
 	_dock.make_visible()
 
-	pinned_btn = $Box/Buttons/Pinned
-	size_slider = $Box/Buttons/SizeSlider
-	size_slider.owner = null
-	box = $Box
-	buttons = $Box/Buttons
-	textures_btn = $Box/Buttons/TexturesBtn
-	meshes_btn = $Box/Buttons/MeshesBtn
-	asset_container = $Box/ScrollContainer
-	search_box = $Box/Buttons/SearchBox
-	search_box.owner = null
+	_bind_common_controls()
 	# Scale left column width to editor scale
 	var editor_scale: float = EditorInterface.get_editor_scale()
 	search_box.custom_minimum_size = Vector2(100. * editor_scale, 30. * editor_scale)
-	search_button = $Box/Buttons/SearchBox/SearchButton
-	
-	texture_list = ListContainer.new()
-	texture_list.name = "TextureList"
-	texture_list.plugin = plugin
-	texture_list.type = Terrain3DAssets.TYPE_TEXTURE
-	asset_container.add_child(texture_list, true)
-	mesh_list = ListContainer.new()
-	mesh_list.name = "MeshList"
-	mesh_list.plugin = plugin
-	mesh_list.type = Terrain3DAssets.TYPE_MESH
-	mesh_list.visible = false
-	asset_container.add_child(mesh_list, true)
-	current_list = texture_list
+	_create_asset_lists()
 	# Keep the management controls in one menu item. A row of buttons inside the
 	# narrow vertical Buttons column wraps and makes the bottom dock grow several
 	# rows tall before the asset list gets any space.
@@ -121,39 +99,10 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	# that layout in both the narrow and the wide dock arrangement.
 
 	load_editor_settings()
-
-	# Connect signals
-	resized.connect(update_layout)
-	textures_btn.pressed.connect(_on_textures_pressed)
-	meshes_btn.pressed.connect(_on_meshes_pressed)
-	pinned_btn.toggled.connect(_on_pin_changed)
-	pinned_btn.owner = null
-	size_slider.value_changed.connect(_on_slider_changed)
-	plugin.ui.toolbar.tool_changed.connect(_on_tool_changed)
-
-	meshes_btn.add_theme_font_size_override("font_size", int(16. * EditorInterface.get_editor_scale()))
-	textures_btn.add_theme_font_size_override("font_size", int(16. * EditorInterface.get_editor_scale()))
-
-	search_box.text_changed.connect(_on_search_text_changed)
-	search_button.pressed.connect(_on_search_button_pressed)
-	
-	confirm_dialog = ConfirmationDialog.new()
-	add_child(confirm_dialog, true)
-	confirm_dialog.hide()
-	confirm_dialog.confirmed.connect(func(): _confirmed = true; \
-		confirmation_closed.emit(); \
-		confirmation_confirmed.emit() )
-	confirm_dialog.canceled.connect(func(): _confirmed = false; \
-		confirmation_closed.emit(); \
-		confirmation_canceled.emit() )
-
-	# Setup styles
-	set("theme_override_styles/panel", get_theme_stylebox("panel", "Panel"))
-	# Avoid saving icon resources in tscn when editing w/ a tool script
-	if EditorInterface.get_edited_scene_root() != self:
-		pinned_btn.icon = get_theme_icon("Pin", "EditorIcons")
-		pinned_btn.text = ""
-		search_button.icon = get_theme_icon("Search", "EditorIcons")
+	_connect_common_signals()
+	_connect_search_signals()
+	_create_confirm_dialog()
+	_apply_dock_styles()
 
 	_initialized = true
 	update_dock()
@@ -311,9 +260,6 @@ func load_editor_settings() -> void:
 	pinned_btn.button_pressed = plugin.get_setting(ES_DOCK_PINNED, true)
 	size_slider.value = plugin.get_setting(ES_DOCK_TILE_SIZE, 90)
 	_on_slider_changed(size_slider.value)
-	# TODO Don't save tab until thumbnail generation more reliable
-	#if plugin.get_setting(ES_DOCK_TAB, 0) == 1:
-	#	_on_meshes_pressed()
 
 
 func save_editor_settings() -> void:
@@ -321,5 +267,3 @@ func save_editor_settings() -> void:
 		return
 	plugin.set_setting(ES_DOCK_TILE_SIZE, size_slider.value)
 	plugin.set_setting(ES_DOCK_PINNED, pinned_btn.button_pressed)
-	# TODO Don't save tab until thumbnail generation more reliable
-	# plugin.set_setting(ES_DOCK_TAB, 0 if current_list == texture_list else 1)

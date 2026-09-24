@@ -8,6 +8,7 @@
 // editor's debug output and several tests print; `_bind_methods()` is the whole script-facing
 // surface of the class, which is why it is here rather than beside any one half's definitions.
 
+#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 
 #include "logger.h"

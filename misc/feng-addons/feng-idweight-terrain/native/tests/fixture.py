@@ -12,13 +12,16 @@ Import from the tests directory, which is what running `..._runner.py` does.
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence, TextIO
+from typing import Iterable, Mapping, Sequence, TextIO
 
 ROOT = Path(__file__).resolve().parents[5]
 ADDON_SOURCE = ROOT / "misc" / "feng-addons"
@@ -179,17 +182,68 @@ def write_fixture(fixture: Path, test: str = "dock") -> None:
             '[node name="Terrain3D" type="Terrain3D" parent="."]\n', encoding="utf-8")
 
 
-def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: str, marker: str,
-                    project_name: str, log_name: str, prefixes: Sequence[str] = (),
+def runner_parser() -> argparse.ArgumentParser:
+    """The command line every `*_runner.py` starts from: an editor and a rendering driver.
+
+    A runner whose test has no flag of its own never builds one - `run_script_test()` parses
+    this itself when it is not handed an editor and a driver. A runner with a flag of its own
+    calls this, adds the flag, parses, and passes what `run_script_test()` needs.
+    """
+    parser = argparse.ArgumentParser(description=sys.modules["__main__"].__doc__)
+    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR,
+                        help="the editor binary to drive")
+    parser.add_argument("--driver", default="d3d12", help="rendering driver")
+    return parser
+
+
+@dataclass(frozen=True)
+class Followup:
+    """A second (or third) engine invocation of one script test.
+
+    `vt_auto_bake` and `vt_cells` run their script again with `reload` so the second process
+    reads what the first persisted, and `vt_adaptive` runs `vt_resolution_controls.gd` after a
+    successful scenario. Each is the same import/run pair with its own script, arguments,
+    timeout and marker, so the runner names it and shares the rest.
+    """
+    script: str
+    args: tuple[str, ...] = ()
+    marker: str = ""
+    timeout: float = 300.0
+    shotted: bool = True
+
+
+def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[str],
+                    project_name: str, log_name: str, editor: Path | None = None,
+                    driver: str | None = None, prefixes: Sequence[str] = (),
                     forbidden: Sequence[str] = (), extra_scripts: Sequence[tuple[str, str]] = (),
-                    resolution: str = "320x240", shots: bool = False,
-                    timeout_import: float = 180, timeout_run: float = 300) -> int:
-    """Runs one test script in a fresh project. Returns the process exit status.
+                    env: Mapping[str, str] | None = None, resolution: str = "320x240",
+                    shots: bool = False, timeout_import: float = 180, timeout_run: float = 300,
+                    followups: Sequence[Followup] = (),
+                    native_library: Path | None = None) -> int:
+    """Runs one test script in a fresh project and returns its verdict.
+
+    `editor` and `driver` default to the runner's own command line, so a runner only names its
+    test; pass them explicitly only to override the parsed value.
 
     `extra_scripts` copies further test scripts into the fixture root under a chosen name,
     which is what a test extending another test (`res://vt_render_base.gd`) needs: the
     engine resolves that path inside the throwaway project, not in the tests directory.
+
+    `native_library` replaces the fixture's built extension DLL, which is how a before/after or
+    reference run drives a preserved build without touching the checkout's own.
+
+    `marker` is every `PASS` line the log must carry - a test that runs twice needs both its
+    own and its `Followup`'s, and a test whose second run is a different script names it there.
     """
+    if editor is None or driver is None:
+        parsed = runner_parser().parse_args()
+        editor = editor if editor is not None else parsed.editor
+        driver = driver if driver is not None else parsed.driver
+
+    markers = (marker,) if isinstance(marker, str) else tuple(marker)
+    phases = [(script, (), timeout_run, shots)]
+    phases += [(item.script, tuple(item.args), item.timeout, item.shotted) for item in followups]
+
     fixture = Path(tempfile.mkdtemp(prefix=fixture_prefix, dir=ROOT / "bin"))
     write_fixture(fixture)
     for source_name, target_name in extra_scripts:
@@ -197,37 +251,45 @@ def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: s
             (Path(__file__).parent / source_name).read_text(encoding="utf-8"), encoding="utf-8")
     (fixture / "project.godot").write_text(
         f'config_version=5\n[application]\nconfig/name="{project_name}"\n', encoding="utf-8")
-    shots_directory = None
-    if shots:
-        shots_directory = fixture / "shots"
+    if native_library is not None:
+        shutil.copy2(native_library.resolve(),
+                     fixture / "addons" / "feng-idweight-terrain" / "bin"
+                     / "libfeng-idweight-terrain.windows.debug.x86_64.dll")
+    shots_directory = fixture / "shots"
+    if any(phase[3] for phase in phases):
         shots_directory.mkdir()
-    env = os.environ.copy()
+    environment = os.environ.copy()
+    environment.update(env or {})
     for key, folder in [("APPDATA", "config"), ("LOCALAPPDATA", "cache")]:
         (fixture / folder).mkdir()
-        env[key] = str(fixture / folder)
+        environment[key] = str(fixture / folder)
     log = fixture / log_name
     print(f"FIXTURE={fixture}", flush=True)
 
     base = [str(Path(editor).resolve()), "--path", str(fixture), "--audio-driver", "Dummy"]
-    run = base + ["--rendering-method", "frp", "--rendering-driver", driver,
-                  "--resolution", resolution, "--position", "-10000,-10000",
-                  "--script", str((Path(__file__).parent / script).resolve())]
-    if shots_directory is not None:
-        run += ["--", "", str(shots_directory)]
+    result_code = 1
     try:
         with log.open("w", encoding="utf-8") as out:
-            status = run_with_offscreen_window(
-                base + ["--headless", "--editor", "--import"], env=env, stream=out,
+            result_code = run_with_offscreen_window(
+                base + ["--headless", "--editor", "--import"], env=environment, stream=out,
                 timeout=timeout_import)
-            if status is None:
+            if result_code is None:
                 print(f"TIMEOUT LOG={log}")
                 return 124
-            if status == 0:
-                status = run_with_offscreen_window(run, env=env, stream=out, timeout=timeout_run)
-                if status is None:
+            for phase_script, phase_args, phase_timeout, shotted in phases:
+                if result_code != 0:
+                    break
+                run = base + ["--rendering-method", "frp", "--rendering-driver", driver,
+                              "--resolution", resolution, "--position", "-10000,-10000",
+                              "--script",
+                              str((Path(__file__).parent / phase_script).resolve())]
+                if shotted:
+                    run += ["--", "", str(shots_directory), *phase_args]
+                result_code = run_with_offscreen_window(run, env=environment, stream=out,
+                                                        timeout=phase_timeout)
+                if result_code is None:
                     print(f"TIMEOUT LOG={log}")
                     return 124
-        result_code = status
     except OSError as error:
         print(f"LAUNCH FAILED: {error}")
         return 127
@@ -242,4 +304,6 @@ def run_script_test(*, editor: Path, driver: str, fixture_prefix: str, script: s
     for text in banned:
         print(f"FORBIDDEN: {text}")
     print(f"EXIT={result_code} ERRORS={len(errors)} LOG={log}")
-    return int(result_code != 0 or bool(errors) or bool(banned) or marker not in output)
+    required = markers + tuple(item.marker for item in followups if item.marker)
+    missing = [text for text in required if text not in output]
+    return int(result_code != 0 or bool(errors) or bool(banned) or bool(missing))

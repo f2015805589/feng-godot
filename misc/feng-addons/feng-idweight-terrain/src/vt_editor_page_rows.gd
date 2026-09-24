@@ -237,11 +237,6 @@ static func add_resident_page_rows(p_tree: Tree, p_root: TreeItem, p_shot: Snaps
 		var owners: Array = record.get("owners", [])
 		var location := location_for_world_rect(rect, p_shot.region_world)
 		var row := add_row(p_tree, p_root, "Slot %d · %s" % [slot, kind], str(record.get("state", "Ready" if ready else "Pending")), "%s m%d" % [address, mip], "%s · owners %d" % [rect_text(rect), owners.size()])
-		# A page that is cached rather than freshly produced says why, and that
-		# reason belongs on the state column of its row.
-		var cache_reason := str(record.get("cache_reason", "")).strip_edges()
-		if not cache_reason.is_empty():
-			row.set_tooltip_text(1, cache_reason)
 		row.set_metadata(0, {"slot": slot, "kind": kind, "location": location})
 		for owner in owners:
 			if typeof(owner) != TYPE_DICTIONARY:

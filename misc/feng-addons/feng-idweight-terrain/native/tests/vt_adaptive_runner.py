@@ -1,19 +1,17 @@
 """GPU regression for per-sector AVT density and ready-ancestor refinement."""
 
-import argparse
 import os
 import shutil
 from pathlib import Path
 import subprocess
 import tempfile
 
-from fixture import ROOT, is_environmental_error, log_errors, write_fixture
+from fixture import ROOT, is_environmental_error, log_errors, runner_parser, write_fixture
+
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--editor", type=Path, default=ROOT / "bin" / "godot.windows.editor.x86_64.exe")
-    parser.add_argument("--driver", default="d3d12")
+    parser = runner_parser()
     parser.add_argument("--sectors", action="store_true", help="Exercise full world-aligned 64 m AVT sectors")
     parser.add_argument("--scale", action="store_true", help="Exercise a 10.24 km world with 25600 sectors")
     parser.add_argument("--metric", action="store_true", help="Verify exact 768/1024 texels per metre, sparse residency and distance mips")
@@ -115,6 +113,7 @@ def main() -> int:
         or ("PASS uphill and moving VT residency without substitution" if args.navigation else "PASS async edit invalidation, payload sampling and teardown" if args.async_pages else "PASS VT source corner blending" if args.blend else "PASS CDLOD batching and coverage" if args.cdlod else "PASS terrain instancer output and edits" if args.instancer else "PASS terrain rendering profile" if args.profile else "PASS slope residency through repeated camera turns" if args.residency else "PASS AVT camera rotation output and production measurements" if args.rotation else "PASS strict missing-page diagnostics and normal mip interpolation" if args.filtering else "PASS AVT region ownership, automatic mip filtering and grouped SVT results" if args.ownership else "PASS metric VT density, sparse entries and mip reuse" if args.metric else "PASS 10 km AVT visibility and bounded residency" if args.scale else "PASS full procedural AVT sectors, pressure coverage, refinement and edits" if args.sectors else "PASS per-sector AVT density and ready-ancestor refinement") not in output
         or (not args.reference_dll and "PASS independent VT density and explicit mip controls" not in output)
     )
+
 
 
 if __name__ == "__main__":

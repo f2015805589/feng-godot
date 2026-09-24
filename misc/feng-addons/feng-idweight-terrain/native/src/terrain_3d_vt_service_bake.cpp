@@ -11,11 +11,9 @@
 // terrain_3d_vt_service_pages.cpp (page plumbing and the cell store) and
 // terrain_3d_vt_service_report.cpp (the diagnostics).
 
-#include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_vt_service_internal.h"
-#include "terrain_3d_virtual_texture.h"
 #include "terrain_vt_cell.h"
 
 #include <godot_cpp/classes/dir_access.hpp>

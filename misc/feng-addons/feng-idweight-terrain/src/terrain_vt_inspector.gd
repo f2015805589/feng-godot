@@ -24,10 +24,11 @@ func _can_handle(p_object: Object) -> bool:
 func _parse_group(p_object: Object, p_group: String) -> void:
 	if not _can_handle(p_object):
 		return
+	# One host, not two: the native binary always publishes `vt_page_status`, so
+	# the "SVT but no VT Page subgroup" shape this entry used to fall back to
+	# cannot occur and there is nothing to build for it.
 	var native_page_group := p_group == "Surface VT/VT Page" or p_group.ends_with("/VT Page")
-	var svt_fallback_group := (p_group == "Surface VT/SVT" or p_group.ends_with("/SVT")) and \
-			not _has_property(p_object, "vt_page_status")
-	if not native_page_group and not svt_fallback_group:
+	if not native_page_group:
 		return
 
 	var section := VBoxContainer.new()
@@ -35,27 +36,10 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 	section.set_meta("native_vt_page", native_page_group)
 	section.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
+	# The native subgroup already supplies the foldout container. This control is
+	# the content inside it, and keeps a stable name for editor tests and
+	# inspection tools.
 	var body: VBoxContainer = section
-	if not native_page_group:
-		# Compatibility for an older native binary that has SVT but no VT Page
-		# subgroup. The current native subgroup path below is the authoritative UI.
-		var header := Button.new()
-		header.name = "TerrainVTPageHeader"
-		header.text = "VT Page"
-		header.tooltip_text = "Shared physical residency and persisted SVT material pages"
-		header.alignment = HORIZONTAL_ALIGNMENT_LEFT
-		header.toggle_mode = true
-		header.button_pressed = true
-		header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		section.add_child(header)
-		body = VBoxContainer.new()
-		body.name = "TerrainVTPageContent"
-		section.add_child(body)
-		header.toggled.connect(_toggle_section.bind(body))
-	else:
-		# The native subgroup already supplies the foldout container. Keep the
-		# custom control's stable name for editor tests and inspection tools.
-		pass
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
 
@@ -95,34 +79,32 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 
 	# The clipmap's debug view is the same kind of page as the AVT one and sits beside it: the
 	# matrix's two *VT* methods each have a layout, and the two bands' pages are what the physical
-	# residency list below cannot show. It is added only where the native VT Page subgroup exists -
-	# the SVT fallback branch below describes an older binary that has no layer at all.
-	if native_page_group:
-		var clipmap_block := VBoxContainer.new()
-		clipmap_block.name = "TerrainClipmapDebugBlock"
-		clipmap_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		clipmap_block.add_theme_constant_override("separation", 2)
-		body.add_child(clipmap_block)
+	# residency list below cannot show.
+	var clipmap_block := VBoxContainer.new()
+	clipmap_block.name = "TerrainClipmapDebugBlock"
+	clipmap_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	clipmap_block.add_theme_constant_override("separation", 2)
+	body.add_child(clipmap_block)
 
-		var clipmap_header := Label.new()
-		clipmap_header.name = "TerrainClipmapDebugHeader"
-		clipmap_header.text = "Clipmap VT Page · layer units / world"
-		clipmap_header.tooltip_text = "Read-only clipmap layer: its units' world squares and addressing for the selected implementation, and the strips it still has queued"
-		clipmap_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		clipmap_block.add_child(clipmap_header)
+	var clipmap_header := Label.new()
+	clipmap_header.name = "TerrainClipmapDebugHeader"
+	clipmap_header.text = "Clipmap VT Page · layer units / world"
+	clipmap_header.tooltip_text = "Read-only clipmap layer: its units' world squares and addressing for the selected implementation, and the strips it still has queued"
+	clipmap_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	clipmap_block.add_child(clipmap_header)
 
-		var clipmap_preview = CLIPMAP_PREVIEW_SCRIPT.new()
-		clipmap_preview.name = "TerrainClipmapPreview"
-		clipmap_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		clipmap_preview.set_terrain(p_object)
-		clipmap_block.add_child(clipmap_preview)
+	var clipmap_preview = CLIPMAP_PREVIEW_SCRIPT.new()
+	clipmap_preview.name = "TerrainClipmapPreview"
+	clipmap_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	clipmap_preview.set_terrain(p_object)
+	clipmap_block.add_child(clipmap_preview)
 
-		var clipmap_note := Label.new()
-		clipmap_note.name = "TerrainClipmapDebugNote"
-		clipmap_note.text = "One clipmap delivery, two storages: the LOD level array and the packed block atlas. A unit is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
-		clipmap_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		clipmap_block.add_child(clipmap_note)
-		_connect_debug_block(clipmap_preview, clipmap_block, p_object, &"has_vt_clipmap_layer")
+	var clipmap_note := Label.new()
+	clipmap_note.name = "TerrainClipmapDebugNote"
+	clipmap_note.text = "One clipmap delivery, two storages: the LOD level array and the packed block atlas. A unit is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
+	clipmap_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	clipmap_block.add_child(clipmap_note)
+	_connect_debug_block(clipmap_preview, clipmap_block, p_object, &"has_vt_clipmap_layer")
 
 	_connect_debug_block(avt_preview, avt_block, p_object, &"is_vt_delivery_used", DELIVERY_AVT)
 
@@ -180,20 +162,6 @@ func _parse_property(
 
 	add_custom_control(controls)
 	return false
-
-
-func _has_property(p_object: Object, p_name: String) -> bool:
-	if p_object == null or not is_instance_valid(p_object):
-		return false
-	for property_info in p_object.get_property_list():
-		if typeof(property_info) == TYPE_DICTIONARY and str(property_info.get("name", "")) == p_name:
-			return true
-	return false
-
-
-func _toggle_section(p_expanded: bool, p_body: Control) -> void:
-	if is_instance_valid(p_body):
-		p_body.visible = p_expanded
 
 
 # Ties a debug block's visibility to whether its view has something to draw: a cell selecting the

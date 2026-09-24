@@ -16,6 +16,7 @@
 // The two RegEx headers are the reason they were ever in the block at all - the comment stripper
 // is the only RegEx user in the family.
 
+#include "terrain_3d.h"
 #include <godot_cpp/classes/reg_ex.hpp>
 #include <godot_cpp/classes/reg_ex_match.hpp>
 #include "logger.h"

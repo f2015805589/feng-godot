@@ -1,4 +1,4 @@
-"""Run the near-field page-arrival image diagnostic in a disposable project.
+﻿"""Run the near-field page-arrival image diagnostic in a disposable project.
 
 The source project is always treated as read-only.  By default the runner creates a fresh
 temporary fixture below ``bin/`` and writes screenshots, JSON, and logs only below that fixture.
@@ -9,14 +9,13 @@ lives in a separate temporary ``bin/`` directory, so no source project is overwr
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
 
-from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, write_fixture
+from fixture import ADDON_SOURCE, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, runner_parser, write_fixture
 
 
 DEFAULT_FIXTURE = ROOT / "bin" / "terrain-project-lifetime-ke6fwkn0"
@@ -55,8 +54,9 @@ def copy_source_project(source: Path, target: Path) -> None:
     shutil.copytree(ADDON_SOURCE / "feng-render-pipeline", frp, dirs_exist_ok=True)
 
 
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = runner_parser()
     parser.add_argument(
         "--project",
         type=Path,
@@ -74,9 +74,7 @@ def main() -> int:
     parser.add_argument("--warm-ticks", type=int, default=240)
     parser.add_argument("--arrival-frames", type=int, default=96)
     parser.add_argument("--settle-frames", type=int, default=120)
-    parser.add_argument("--driver", default="d3d12")
     parser.add_argument("--resolution", default="1920x1080")
-    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR)
     parser.add_argument("--timeout", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -212,6 +210,7 @@ def main() -> int:
         print(output[-12000:])
         return 1
     return 0
+
 
 
 if __name__ == "__main__":

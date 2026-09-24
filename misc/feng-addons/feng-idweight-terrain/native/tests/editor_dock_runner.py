@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 import tempfile
@@ -12,7 +11,11 @@ from pathlib import Path
 
 # The fixture and the two-phase invocation live in fixture.py, shared with every
 # script runner. This file owns the graphical-editor tests only.
-from fixture import ROOT, log_errors, run_with_offscreen_window, write_fixture
+from fixture import ROOT, log_errors, run_with_offscreen_window, runner_parser, write_fixture
+
+# The console build still creates a window - which is what these tests drive - and its stdout
+# reaches this process's log.
+CONSOLE_EDITOR = ROOT / "bin" / "godot.windows.editor.x86_64.console.exe"
 
 
 def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
@@ -74,15 +77,10 @@ def run(editor: Path, fixture: Path, driver: str, test: str = "dock") -> int:
     return 0
 
 
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--editor",
-        type=Path,
-        default=ROOT / "bin" / "godot.windows.editor.x86_64.console.exe",
-        help="graphical Godot editor executable (the console build still creates a window)",
-    )
-    parser.add_argument("--driver", default="d3d12")
+    parser = runner_parser()
+    parser.set_defaults(editor=CONSOLE_EDITOR)
     parser.add_argument("--test", choices=["dock", "input", "setup", "grid", "pairroles", "svt_inspector", "vt_idle", "slider"], default="dock")
     args = parser.parse_args()
     editor = args.editor.resolve()
@@ -93,6 +91,7 @@ def main() -> int:
     write_fixture(fixture, args.test)
     print(f"FIXTURE={fixture}")
     return run(editor, fixture, args.driver, args.test)
+
 
 
 if __name__ == "__main__":

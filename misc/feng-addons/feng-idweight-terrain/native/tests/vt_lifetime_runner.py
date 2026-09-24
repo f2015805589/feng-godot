@@ -1,18 +1,9 @@
 """Run the long-lived AVT fade/queue regression in one real rendering process."""
-
-from __future__ import annotations
-
-import argparse
-import os
-from pathlib import Path
-
-from fixture import DEFAULT_EDITOR, run_script_test
+from fixture import runner_parser, run_script_test
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR)
-    parser.add_argument("--driver", default="d3d12")
+if __name__ == "__main__":
+    parser = runner_parser()
     parser.add_argument(
         "--ticks",
         type=int,
@@ -23,21 +14,17 @@ def main() -> int:
     args = parser.parse_args()
     if args.ticks < 2000:
         parser.error("--ticks must be at least 2000")
-    os.environ["VT_LIFETIME_TICKS"] = str(args.ticks)
-    return run_script_test(
+    raise SystemExit(run_script_test(
         editor=args.editor,
         driver=args.driver,
         fixture_prefix="terrain-vtlifetime-",
-        script="vt_lifetime.gd",
-        marker="PASS VT fade lifetime keeps CPU diagnostics and page-arrival FIFO bounded over static and ping-pong windows",
         project_name="VT fade lifetime tests",
         log_name="vtlifetime.log",
+        script="vt_lifetime.gd",
+        marker="PASS VT fade lifetime keeps CPU diagnostics and page-arrival FIFO bounded over static and ping-pong windows",
         prefixes=("VTLIFETIME",),
         extra_scripts=(("vt_render.gd", "vt_render_base.gd"),),
-        shots=False,
+        env={"VT_LIFETIME_TICKS": str(args.ticks)},
+        resolution="320x240",
         timeout_run=args.timeout,
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    ))

@@ -13,6 +13,7 @@
 // The other halves: `terrain_3d_material.cpp` (the shader and its uniforms) and
 // `terrain_3d_material_reflect.cpp` (the property list and the ClassDB bindings).
 
+#include "terrain_3d.h"
 #include "logger.h"
 #include "terrain_3d_material.h"
 #include "terrain_3d_util.h"

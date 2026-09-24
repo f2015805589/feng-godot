@@ -9,6 +9,7 @@
 // `terrain_3d_data.cpp`; this half never touches a slot index directly, it goes through
 // `_acquire_slot()` / `_release_slot()`.
 
+#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 
 #include "logger.h"

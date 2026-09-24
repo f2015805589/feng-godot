@@ -21,6 +21,7 @@
 #include "terrain_3d_assets.h"
 #include "terrain_3d_collision.h"
 #include "terrain_3d_data.h"
+#include "terrain_3d_debug.h"
 #include "terrain_3d_editor.h"
 #include "terrain_3d_instancer.h"
 #include "terrain_3d_material.h"
@@ -40,14 +41,10 @@ class Terrain3D : public Node3D {
 	CLASS_NAME();
 
 public: // Constants
-	enum DebugLevel {
-		MESG = -2, // Always print except in release builds
-		WARN = -1, // Always print except in release builds
-		ERROR = 0, // Always print except in release builds
-		INFO = 1, // Print every function call and important entries
-		DEBUG = 2, // Print details within functions
-		EXTREME = 3, // Continuous operations like snapping
-	};
+	// The levels and their names are `Terrain3DDebug::Level`, declared in terrain_3d_debug.h so
+	// that `logger.h` can reach them without this class. The property, the setter and the value
+	// itself are still this class's: `debug_level` below is a `Terrain3D` static member.
+	using DebugLevel = Terrain3DDebug::Level;
 
 	enum RegionSize {
 		SIZE_64 = 64,
@@ -1123,12 +1120,5 @@ protected:
 
 VARIANT_ENUM_CAST(Terrain3D::RegionSize);
 VARIANT_ENUM_CAST(Terrain3D::DebugLevel);
-
-constexpr Terrain3D::DebugLevel MESG = Terrain3D::DebugLevel::MESG;
-constexpr Terrain3D::DebugLevel WARN = Terrain3D::DebugLevel::WARN;
-constexpr Terrain3D::DebugLevel ERROR = Terrain3D::DebugLevel::ERROR;
-constexpr Terrain3D::DebugLevel INFO = Terrain3D::DebugLevel::INFO;
-constexpr Terrain3D::DebugLevel DEBUG = Terrain3D::DebugLevel::DEBUG;
-constexpr Terrain3D::DebugLevel EXTREME = Terrain3D::DebugLevel::EXTREME;
 
 #endif // TERRAIN3D_CLASS_H

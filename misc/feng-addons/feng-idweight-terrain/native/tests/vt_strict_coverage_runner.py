@@ -1,4 +1,4 @@
-"""Run the strict feedback-off VT coverage diagnostic in a disposable project.
+﻿"""Run the strict feedback-off VT coverage diagnostic in a disposable project.
 
 The source project is read-only.  The runner copies it to ``bin/`` and writes all
 screenshots and the JSON report below that temporary copy, so a real test-1 scene
@@ -7,14 +7,13 @@ can be used without changing its resources or project settings.
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
 
-from fixture import ADDON_SOURCE, DEFAULT_EDITOR, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, write_fixture
+from fixture import ADDON_SOURCE, ROOT, is_environmental_error, log_errors, run_with_offscreen_window, runner_parser, write_fixture
 
 
 def copy_source_project(source: Path, target: Path) -> None:
@@ -45,8 +44,9 @@ def copy_source_project(source: Path, target: Path) -> None:
     shutil.copytree(ADDON_SOURCE / "feng-render-pipeline", frp, dirs_exist_ok=True)
 
 
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = runner_parser()
     parser.add_argument(
         "--project",
         type=Path,
@@ -59,9 +59,7 @@ def main() -> int:
     parser.add_argument("--post-settle-frames", type=int, default=120)
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--pages", type=int, default=0, help="optional fixed pool size for capacity stress")
-    parser.add_argument("--driver", default="d3d12")
     parser.add_argument("--resolution", default="1920x1080")
-    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR)
     parser.add_argument("--timeout", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -171,6 +169,7 @@ def main() -> int:
         print(output[-12000:])
         return 1
     return 0
+
 
 
 if __name__ == "__main__":

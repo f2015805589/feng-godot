@@ -14,6 +14,7 @@
 #include "terrain_3d_region.h"
 
 #include "logger.h"
+#include "terrain_3d.h"
 
 #include <godot_cpp/classes/resource_saver.hpp>
 

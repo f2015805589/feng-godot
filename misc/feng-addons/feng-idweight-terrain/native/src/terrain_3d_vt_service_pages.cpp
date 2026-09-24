@@ -12,11 +12,9 @@
 // terrain_3d_vt_service_report.cpp (the diagnostics) and terrain_3d_vt_service_bake.cpp (the far
 // field's bake and its cell files).
 
-#include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_vt_service_internal.h"
-#include "terrain_3d_virtual_texture.h"
 #include "terrain_vt_cell.h"
 
 #include <godot_cpp/classes/engine.hpp>

@@ -16,6 +16,7 @@
 #include "terrain_3d_region.h"
 
 #include "logger.h"
+#include "terrain_3d.h"
 #include "terrain_3d_util.h"
 #include "terrain_surface_idweight.h"
 

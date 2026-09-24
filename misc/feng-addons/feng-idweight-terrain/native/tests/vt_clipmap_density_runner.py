@@ -9,21 +9,14 @@ reading (density, hit rate, source, per-operation picture) is printed under `CLI
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
-
-from fixture import DEFAULT_EDITOR, run_script_test
+from fixture import runner_parser, run_script_test
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--editor", type=Path, default=DEFAULT_EDITOR)
-    parser.add_argument("--driver", default="d3d12")
+    parser = runner_parser()
     parser.add_argument("--resolution", default="1920x1080")
     args = parser.parse_args()
     return run_script_test(
-        editor=args.editor,
-        driver=args.driver,
         fixture_prefix="terrain-vtclipmapdensity-",
         project_name="Clipmap material density acceptance",
         log_name="vtclipmapdensity.log",

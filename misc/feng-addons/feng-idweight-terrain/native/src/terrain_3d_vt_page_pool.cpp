@@ -13,7 +13,6 @@
 #include "terrain_3d_vt_page_pool.h"
 
 #include "constants.h"
-#include "logger.h"
 #include "terrain_3d_virtual_texture.h"
 
 #include <algorithm>

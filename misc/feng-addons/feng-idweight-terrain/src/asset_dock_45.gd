@@ -48,49 +48,16 @@ func initialize(p_plugin: EditorPlugin) -> void:
 	
 	_godot_last_state = plugin.godot_editor_window.mode
 	placement_opt = $Box/Buttons/PlacementOpt
-	pinned_btn = $Box/Buttons/Pinned
 	floating_btn = $Box/Buttons/Floating
 	floating_btn.owner = null # Godot complains about buttons that are reparented
-	size_slider = $Box/Buttons/SizeSlider
-	size_slider.owner = null
-	box = $Box
-	buttons = $Box/Buttons
-	textures_btn = $Box/Buttons/TexturesBtn
-	meshes_btn = $Box/Buttons/MeshesBtn
-	asset_container = $Box/ScrollContainer
-	search_box = $Box/Buttons/SearchBox
-	search_box.owner = null
-	search_button = $Box/Buttons/SearchBox/SearchButton
-	
-	texture_list = ListContainer.new()
-	texture_list.name = "TextureList"
-	texture_list.plugin = plugin
-	texture_list.type = Terrain3DAssets.TYPE_TEXTURE
-	asset_container.add_child(texture_list, true)
-	mesh_list = ListContainer.new()
-	mesh_list.name = "MeshList"
-	mesh_list.plugin = plugin
-	mesh_list.type = Terrain3DAssets.TYPE_MESH
-	mesh_list.visible = false
-	asset_container.add_child(mesh_list, true)
-	current_list = texture_list
+	_bind_common_controls()
+	_create_asset_lists()
 
 	load_editor_settings()
-
-	# Connect signals
-	resized.connect(update_layout)
-	textures_btn.pressed.connect(_on_textures_pressed)
-	meshes_btn.pressed.connect(_on_meshes_pressed)
+	_connect_common_signals()
 	placement_opt.item_selected.connect(set_slot)
 	floating_btn.pressed.connect(make_dock_float)
-	pinned_btn.toggled.connect(_on_pin_changed)
 	pinned_btn.visible = ( window != null )
-	pinned_btn.owner = null
-	size_slider.value_changed.connect(_on_slider_changed)
-	plugin.ui.toolbar.tool_changed.connect(_on_tool_changed)
-
-	meshes_btn.add_theme_font_size_override("font_size", 16 * EditorInterface.get_editor_scale())
-	textures_btn.add_theme_font_size_override("font_size", 16 * EditorInterface.get_editor_scale())
 
 	_initialized = true
 	update_dock()
@@ -100,29 +67,14 @@ func initialize(p_plugin: EditorPlugin) -> void:
 func _ready() -> void:
 	if not _initialized:
 		return
-		
-	# Setup styles
-	set("theme_override_styles/panel", get_theme_stylebox("panel", "Panel"))
-	# Avoid saving icon resources in tscn when editing w/ a tool script
+
+	_apply_dock_styles()
 	if EditorInterface.get_edited_scene_root() != self:
-		pinned_btn.icon = get_theme_icon("Pin", "EditorIcons")
-		pinned_btn.text = ""
 		floating_btn.icon = get_theme_icon("MakeFloating", "EditorIcons")
 		floating_btn.text = ""
-		search_button.icon = get_theme_icon("Search", "EditorIcons")
-	
-	search_box.text_changed.connect(_on_search_text_changed)
-	search_button.pressed.connect(_on_search_button_pressed)
-	
-	confirm_dialog = ConfirmationDialog.new()
-	add_child(confirm_dialog, true)
-	confirm_dialog.hide()
-	confirm_dialog.confirmed.connect(func(): _confirmed = true; \
-		emit_signal("confirmation_closed"); \
-		emit_signal("confirmation_confirmed") )
-	confirm_dialog.canceled.connect(func(): _confirmed = false; \
-		emit_signal("confirmation_closed"); \
-		emit_signal("confirmation_canceled") )
+
+	_connect_search_signals()
+	_create_confirm_dialog()
 
 
 ## Dock placement
@@ -321,9 +273,6 @@ func load_editor_settings() -> void:
 	set_slot(plugin.get_setting(ES_DOCK_SLOT, POS_BOTTOM))
 	if floating_btn.button_pressed:
 		make_dock_float()
-	# TODO Don't save tab until thumbnail generation more reliable
-	#if plugin.get_setting(ES_DOCK_TAB, 0) == 1:
-	#	_on_meshes_pressed()
 
 
 func save_editor_settings() -> void:
@@ -334,8 +283,6 @@ func save_editor_settings() -> void:
 	plugin.set_setting(ES_DOCK_TILE_SIZE, size_slider.value)
 	plugin.set_setting(ES_DOCK_FLOATING, floating_btn.button_pressed)
 	plugin.set_setting(ES_DOCK_PINNED, pinned_btn.button_pressed)
-	# TODO Don't save tab until thumbnail generation more reliable
-	# plugin.set_setting(ES_DOCK_TAB, 0 if current_list == texture_list else 1)
 	if window:
 		plugin.set_setting(ES_DOCK_WINDOW_SIZE, window.size)
 		plugin.set_setting(ES_DOCK_WINDOW_POSITION, window.position)

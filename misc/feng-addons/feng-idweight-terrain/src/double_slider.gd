@@ -83,10 +83,6 @@ func update_label() -> void:
 		label.custom_minimum_size.x = minimum_x + 5 * display_scale
 
 
-func _get_handle() -> int:
-	return 1
-
-
 func _gui_input(p_event: InputEvent) -> void:
 	if p_event is InputEventMouseButton:
 		var button: int = p_event.get_button_index()

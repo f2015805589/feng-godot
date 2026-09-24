@@ -239,20 +239,12 @@ func _draw() -> void:
 
 	# A sector always remains a fixed 64 m world rectangle; its tier and block
 	# describe the independent virtual allocation attached to that rectangle.
+	# The native preview publishes `sectors` unconditionally, so this is the only
+	# sector shape there is to draw.
 	var sectors := _valid_sectors()
 	var resolution_levels := _valid_resolution_levels()
-	var sector_contract := _snapshot.has("sectors")
-	if sector_contract:
-		for sector: Dictionary in sectors:
-			_draw_sector(sector, view_bounds, map_origin, scale, camera, radius, resolution_levels)
-	else:
-		# Older binaries only expose fine_cells. Keep that fallback drawable, but
-		# do not present its records as the new resolution-tier contract.
-		for cell: Rect2 in _rect_array(_snapshot.get("fine_cells", [])):
-			var active := _rect_touches_circle(cell, camera, radius)
-			_draw_world_fill(cell, view_bounds, map_origin, scale, Color(0.34, 0.88, 0.98, 0.08 if active else 0.02))
-			_draw_world_outline(cell, view_bounds, map_origin, scale,
-					Color(0.34, 0.88, 0.98, 0.72 if active else 0.16), 1.4)
+	for sector: Dictionary in sectors:
+		_draw_sector(sector, view_bounds, map_origin, scale, camera, radius, resolution_levels)
 
 	# The native preview provides horizontal camera forward in XZ. Draw it only
 	# when it is valid, so a top-down camera with no horizontal heading is not
@@ -275,10 +267,9 @@ func _draw() -> void:
 	draw_line(camera_canvas - Vector2(0.0, 7.0), camera_canvas + Vector2(0.0, 7.0), Color("f3d28a"), 1.0)
 
 	_draw_resolution_schematic(legend_rect, resolution_levels, font, font_size, text_color)
-	_draw_stats(stats_rect, font, font_size, sectors, resolution_levels, coarse_count, radius,
-			sector_contract)
+	_draw_stats(stats_rect, font, font_size, sectors, resolution_levels, coarse_count, radius)
 	if font:
-		var contract_note := "" if sector_contract and not resolution_levels.is_empty() else " · tier data needed"
+		var contract_note := "" if not resolution_levels.is_empty() else " · tier data needed"
 		var text_width := maxf(1.0, size.x - MAP_MARGIN * 2.0)
 		draw_string(font, Vector2(MAP_MARGIN, 17.0), "AVT layout · world / allocation" + contract_note,
 				HORIZONTAL_ALIGNMENT_LEFT, text_width, font_size, text_color)
@@ -370,7 +361,7 @@ func _draw_resolution_schematic(p_map: Rect2, p_levels: Array, p_font: Font,
 
 
 func _draw_stats(p_panel: Rect2, p_font: Font, p_font_size: int, p_sectors: Array,
-		p_levels: Array, p_coarse_count: int, p_radius: float, p_sector_contract: bool) -> void:
+		p_levels: Array, p_coarse_count: int, p_radius: float) -> void:
 	draw_rect(p_panel, Color(0.04, 0.07, 0.09, 0.94), true)
 	draw_rect(p_panel, Color(0.25, 0.34, 0.40, 0.75), false, 1.0)
 	if not p_font:
@@ -378,7 +369,7 @@ func _draw_stats(p_panel: Rect2, p_font: Font, p_font_size: int, p_sectors: Arra
 	var visible_count := _visible_sector_count(p_sectors)
 	var allocated_count := _allocated_sector_count(p_sectors)
 	var lines := [
-		"Visible sectors: %d" % visible_count if p_sector_contract else "Visible sectors: legacy data",
+		"Visible sectors: %d" % visible_count,
 		"Allocated sectors: %d" % allocated_count,
 		"Coarse pages: %d" % p_coarse_count,
 		"Resolution tiers: %s (%s)" % [_integer_text(p_levels.size()), _resolution_range_text(p_levels)],
@@ -490,16 +481,6 @@ func _valid_resolution_levels() -> Array:
 		result.append(level)
 		if result.size() >= MAX_RESOLUTION_LEVELS:
 			break
-	return result
-
-
-func _rect_array(p_value: Variant) -> Array[Rect2]:
-	var result: Array[Rect2] = []
-	if not p_value is Array:
-		return result
-	for item in p_value:
-		if item is Rect2 and (item as Rect2).has_area():
-			result.append(item)
 	return result
 
 

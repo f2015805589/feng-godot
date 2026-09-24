@@ -16,6 +16,7 @@
 #include "terrain_3d_assets.h"
 
 #include "logger.h"
+#include "terrain_3d.h"
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>

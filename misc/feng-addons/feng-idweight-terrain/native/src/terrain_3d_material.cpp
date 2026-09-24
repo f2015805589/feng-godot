@@ -15,6 +15,7 @@
 
 #include "logger.h"
 #include "terrain_3d_material.h"
+#include "terrain_3d.h"
 #include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_virtual_texture.h"

@@ -17,7 +17,6 @@
 #include "terrain_3d.h"
 #include "terrain_3d_surface_views_internal.h"
 
-#include "logger.h"
 
 #include <godot_cpp/classes/time.hpp>
 

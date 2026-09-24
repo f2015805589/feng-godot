@@ -15,6 +15,7 @@
 // `editor_file_system.hpp` is here for the complete type behind
 // `EditorInterface::get_resource_filesystem()`, which the code calls `is_scanning()` and `scan()` on.
 
+#include "terrain_3d.h"
 #include "terrain_3d_data.h"
 
 #include "logger.h"

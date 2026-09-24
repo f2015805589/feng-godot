@@ -6,8 +6,9 @@
 # The window is the shell: it owns the widgets, the selection state and which view
 # is shown. Everything with rules of its own lives in a sibling script - the page
 # rows in vt_editor_page_rows.gd, the mip distance bands in vt_editor_svt_bands.gd,
-# the CDLOD controls in vt_editor_cdlod_panel.gd, the duck-typed native API in
-# vt_terrain_bridge.gd and the world/image maths in vt_overview_image.gd.
+# the delivery matrix in vt_editor_delivery_rows.gd, the CDLOD controls in
+# vt_editor_cdlod_panel.gd, the duck-typed native API in vt_terrain_bridge.gd and the
+# world/image maths in vt_overview_image.gd.
 @tool
 extends Window
 class_name TerrainVTEditor
@@ -18,15 +19,14 @@ const OVERVIEW_EDGE: int = 768
 const INVALID_LOCATION := Vector2i(2147483647, 2147483647)
 const SVT_AUTO_BAKE_PROPERTY: StringName = &"surface_svt_auto_bake"
 const BAKE_STATUS_POLL_INTERVAL: float = 0.25
-# The delivery methods in the order of the native `TerrainVT::Delivery` enum, which is also the
-# item id the OptionButtons store: the widget, the property and the C++ value are one number, so a
-# method added natively appears here as one more string and no mapping has to be kept in step.
-const DELIVERY_METHODS: Array[String] = ["Direct (pure RVT)", "AVT", "Clipmap", "SVT"]
 # The one clipmap delivery's two storages, in the order of the native `TerrainClipmap::Implementation`
 # enum, which is also the item id the OptionButton stores. They are not deliveries: the matrix selects
 # `Clipmap` once and this chooses how that one layer stores its units.
 const CLIPMAP_IMPLEMENTATIONS: Array[String] = ["LOD", "Atlas"]
-const DELIVERY_BANDS: Array[String] = ["near", "far"]
+# The matrix's own vocabulary - the methods, the bands and the four cell labels - lives with the rows
+# in vt_editor_delivery_rows.gd. The clipmap hint below names the same two channel groups, and
+# GDScript will not fold another script's constant into this `const`, so these two are the window's
+# copy of the same two facts.
 const DELIVERY_GROUPS: Array[String] = ["material", "height"]
 const DELIVERY_GROUP_LABELS: Dictionary = {"material": "Diffuse + normal", "height": "Height"}
 # The method these rows are about, by the native enum's value (`Clipmap`): the rows read the published
@@ -62,7 +62,9 @@ var clipmap_budget_spin: SpinBox
 var clipmap_implementation_option: OptionButton
 var clipmap_hint: Label
 var _clipmap_preview: Control
-var delivery_hint: Label
+## The delivery matrix: its four OptionButtons are aliased into the members below, which the
+## window's own layout, refreshes and editor tests read.
+var _delivery: TerrainVTEditorDeliveryRows
 var cdlod_panel: VBoxContainer
 var svt_panel: VBoxContainer
 var _cdlod: TerrainVTEditorCdlodPanel
@@ -711,111 +713,29 @@ func _make_spin(p_min: float, p_max: float, p_step: float) -> SpinBox:
 	return TerrainVTEditorWidgets.make_spin(p_min, p_max, p_step)
 
 
-# The delivery matrix: two bands by two channel groups. A grid of four OptionButtons rather than
-# the two check boxes it replaces, because a check box can only say "on or off" for one method and
-# the whole point is that a group may be carried by AVT, by a clipmap, by SVT, or by nothing at all
-# (`Direct`, the region arrays). The hint spells out the consequence, which is a property of the
-# architecture and not visible in the widgets: a method no row selects is never built, and a method
-# this build cannot deliver is refused by the setter rather than accepted and rendered from
-# somewhere else.
 func _build_delivery_rows(p_panel: VBoxContainer) -> void:
-	delivery_hint = Label.new()
-	delivery_hint.name = "DeliveryHint"
-	delivery_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	delivery_hint.text = "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the one toroidal layer whose storage the Clipmap group's implementation selector chooses - the LOD level array or the packed block atlas. A method no row selects owns no object, no array and no shader code."
-	p_panel.add_child(delivery_hint)
-	var grid := GridContainer.new()
-	grid.name = "DeliveryGrid"
-	grid.columns = 3
-	grid.add_child(_make_setting_label("Band"))
-	for group in DELIVERY_GROUPS:
-		grid.add_child(_make_setting_label(DELIVERY_GROUP_LABELS[group]))
-	for band in DELIVERY_BANDS:
-		grid.add_child(_make_setting_label(band.capitalize()))
-		for group in DELIVERY_GROUPS:
-			var option := OptionButton.new()
-			option.name = "Delivery%s%s" % [band.capitalize(), group.capitalize()]
-			option.tooltip_text = "Delivery method for %s in the %s band." % [DELIVERY_GROUP_LABELS[group], band]
-			for method in DELIVERY_METHODS.size():
-				option.add_item(DELIVERY_METHODS[method], method)
-			option.item_selected.connect(_on_delivery_selected.bind(band, group))
-			grid.add_child(option)
-			_set_delivery_option(band, group, option)
-	p_panel.add_child(grid)
+	_delivery = TerrainVTEditorDeliveryRows.new()
+	_delivery.changed = _on_delivery_cell_changed
+	_delivery.build(p_panel)
+	delivery_near_material = _delivery.option("near", "material")
+	delivery_near_height = _delivery.option("near", "height")
+	delivery_far_material = _delivery.option("far", "material")
+	delivery_far_height = _delivery.option("far", "height")
 
 
-func _set_delivery_option(p_band: String, p_group: String, p_option: OptionButton) -> void:
-	match "%s_%s" % [p_band, p_group]:
-		"near_material": delivery_near_material = p_option
-		"near_height": delivery_near_height = p_option
-		"far_material": delivery_far_material = p_option
-		"far_height": delivery_far_height = p_option
+# The matrix wrote a cell: mark the scene and re-read the panel the write changed, the same two things
+# every other setting row does after its own write.
+func _on_delivery_cell_changed() -> void:
+	if Engine.is_editor_hint() and plugin != null and is_instance_valid(plugin):
+		EditorInterface.mark_scene_as_unsaved()
+	_refresh_header()
+	_refresh_settings_controls()
 
 
-func _delivery_option(p_band: String, p_group: String) -> OptionButton:
-	match "%s_%s" % [p_band, p_group]:
-		"near_material": return delivery_near_material
-		"near_height": return delivery_near_height
-		"far_material": return delivery_far_material
-		"far_height": return delivery_far_height
-	return null
-
-
-# Reads the four cells from the settings dictionary the native side publishes rather than from four
-# separate getters: one call, one snapshot, and a widget cannot show a state the rest of the panel
-# was not read with. A native build that predates the matrix has no keys and no property, and the
-# rows disable themselves instead of offering a choice the build cannot honour.
-#
-# Per method rather than per row: `delivery_supported` names the methods this build can deliver for
-# each group and `delivery_unsupported` the sentence for each one it cannot, so an option this build
-# has no arm for is disabled with the reason as its tooltip. The setter refuses the same pair, so a
-# disabled item is a visible half of one rule rather than a second copy of it.
 func _refresh_delivery_rows(p_settings: Dictionary) -> void:
-	var supported := _has_object_property(terrain, &"vt_delivery_near_material")
-	var allowed: Dictionary = p_settings.get("delivery_supported", {})
-	var refused: Dictionary = p_settings.get("delivery_unsupported", {})
-	for band in DELIVERY_BANDS:
-		for group in DELIVERY_GROUPS:
-			var option := _delivery_option(band, group)
-			if option == null:
-				continue
-			option.disabled = not supported
-			if not supported:
-				continue
-			_apply_delivery_availability(option, group, allowed, refused)
-			var value := int(p_settings.get("delivery_%s_%s" % [band, group], 0))
-			var index := option.get_item_index(value)
-			if index >= 0:
-				option.select(index)
-	if delivery_hint == null:
-		return
-	var text := "How each channel group reaches the shader, per distance band. Direct samples the region arrays and builds no service; AVT is the sectored adaptive page table, SVT the world-space page grid, Clipmap the one toroidal layer whose storage the Clipmap group's implementation selector chooses - the LOD level array or the packed block atlas. A method no row selects owns no object, no array and no shader code."
-	for group in DELIVERY_GROUPS:
-		var reasons: Dictionary = refused.get(group, {})
-		for name: Variant in reasons:
-			text += "\nUnavailable here: %s %s: %s." % [DELIVERY_GROUP_LABELS[group], str(name), str(reasons[name])]
-	delivery_hint.text = text
-
-
-# Disables the items this build cannot deliver for the group, with the setter's own sentence as the
-# tooltip. A build that publishes no `delivery_supported` key (an older binary) keeps every item
-# enabled: the panel has nothing to say about it then, and the setter remains the authority.
-func _apply_delivery_availability(p_option: OptionButton, p_group: String, p_allowed: Dictionary, p_refused: Dictionary) -> void:
-	if not p_allowed.has(p_group):
-		return
-	var methods: Array = p_allowed.get(p_group, [])
-	var reasons: Dictionary = p_refused.get(p_group, {})
-	for method in DELIVERY_METHODS.size():
-		var index := p_option.get_item_index(method)
-		if index < 0:
-			continue
-		var deliverable := methods.has(method)
-		p_option.set_item_disabled(index, not deliverable)
-		if deliverable:
-			continue
-		var reason: String = str(reasons.get(DELIVERY_METHODS[method], "not available in this build"))
-		p_option.set_item_tooltip(index, "%s is not available for the %s group: %s" % [
-			DELIVERY_METHODS[method], DELIVERY_GROUP_LABELS[p_group].to_lower(), reason])
+	if _delivery != null:
+		_delivery.terrain = terrain
+		_delivery.refresh(p_settings)
 
 
 func _refresh_all() -> void:
@@ -1179,25 +1099,6 @@ func _on_editor_preview_toggled(enabled: bool) -> void:
 	_refresh_settings_controls()
 
 
-func _on_delivery_selected(p_index: int, p_band: String, p_group: String) -> void:
-	if _updating_settings or terrain == null or not is_instance_valid(terrain):
-		return
-	var option: OptionButton = _delivery_option(p_band, p_group)
-	if option == null or p_index < 0 or p_index >= option.item_count:
-		return
-	var property := StringName("vt_delivery_%s_%s" % [p_band, p_group])
-	if not TerrainVTBridge.has_property(terrain, property):
-		return
-	# A write the setter refuses leaves the cell where it was, and the refresh below re-reads the cells
-	# rather than the widget's own selection, so an option that is somehow chosen while disabled snaps
-	# back to the method the terrain actually holds instead of showing a value nothing stored.
-	terrain.set(property, option.get_item_id(p_index))
-	if Engine.is_editor_hint() and plugin != null and is_instance_valid(plugin):
-		EditorInterface.mark_scene_as_unsaved()
-	_refresh_header()
-	_refresh_settings_controls()
-
-
 func _on_svt_auto_bake_toggled(p_enabled: bool) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
@@ -1363,16 +1264,8 @@ func _add_all_page_details(p_root: TreeItem) -> void:
 	TerrainVTEditorPageRows.add_all_page_details(page_tree, p_root, _page_snapshot())
 
 
-func _add_resident_page_rows(p_root: TreeItem, p_kind: String) -> void:
-	TerrainVTEditorPageRows.add_resident_page_rows(page_tree, p_root, _page_snapshot(), p_kind)
-
-
 func _add_baked_page_rows(p_root: TreeItem) -> void:
 	TerrainVTEditorPageRows.add_baked_page_rows(page_tree, p_root, _page_snapshot())
-
-
-func _add_region_rows(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_region_rows(page_tree, p_root, _page_snapshot())
 
 
 func _add_page_row(p_parent: TreeItem, p_name: String, p_state: String, p_address: String, p_details: String) -> TreeItem:
@@ -1485,10 +1378,6 @@ func _display_preview_texture(p_value: Variant) -> Texture2D:
 
 func _overview_image_size(p_bounds: Rect2) -> Vector2i:
 	return TerrainVTOverviewImage.overview_size(p_bounds, OVERVIEW_EDGE)
-
-
-func _world_to_image(p_world: Vector2, p_bounds: Rect2, p_size: Vector2i) -> Vector2i:
-	return TerrainVTOverviewImage.world_to_image(p_world, p_bounds, p_size)
 
 
 func _region_world_bounds(p_locations: Array, p_region_world: Vector2) -> Rect2:

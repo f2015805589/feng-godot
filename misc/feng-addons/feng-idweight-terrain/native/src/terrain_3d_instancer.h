@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "constants.h"
+#include "terrain_3d_mesh_asset.h"
 #include "terrain_3d_region.h"
 
 class Terrain3D;

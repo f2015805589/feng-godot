@@ -12,6 +12,7 @@
 // The other halves: `terrain_3d_instancer.cpp` (the MMI table and the lifetime) and
 // `terrain_3d_instancer_place.cpp` (the placement API).
 
+#include "terrain_3d.h"
 #include "constants.h"
 #include "logger.h"
 #include "terrain_3d_instancer.h"

@@ -544,19 +544,12 @@ func _draw_density(p_rect: Rect2, p_pairs: Array, p_font: Font, p_font_size: int
 
 func _density_pairs() -> Array:
 	# The x is the unit's **coverage outer radius** - the distance at which the unit's density stops
-	# being the one a fragment gets - because that is the reading "density against distance" means. The
-	# layer publishes it directly; `unit_reach` (the square's side) is halved for an older payload.
+	# being the one a fragment gets - because that is the reading "density against distance" means.
+	# The payload publishes it directly as `unit_radius` beside `unit_density`; the layer's own
+	# `density_curve` / `density_distance` pair is the same curve and is read by the service report,
+	# not by this plot.
 	var reach := _float_series("unit_radius")
-	if reach.is_empty():
-		reach = _float_series("unit_reach")
-		for index in reach.size():
-			reach[index] = reach[index] * 0.5
 	var density := _float_series("unit_density")
-	# Both implementations publish the layer's own curve; fall back to it when the per-unit arrays are
-	# absent so an older payload still yields a coverage reading rather than an empty plot.
-	if reach.is_empty() or density.is_empty():
-		reach = _float_series("density_distance")
-		density = _float_series("density_curve")
 	var count := mini(reach.size(), density.size())
 	var pairs: Array = []
 	for index in count:

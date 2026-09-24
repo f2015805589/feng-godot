@@ -5,7 +5,6 @@
 
 #include "terrain_3d.h"
 
-#include "logger.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_util.h"
 #include "terrain_3d_vt_visibility.h"

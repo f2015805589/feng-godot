@@ -11,6 +11,7 @@
 
 #include "logger.h"
 #include "terrain_3d_mesh_asset.h"
+#include "terrain_3d.h"
 
 ///////////////////////////
 // Private Functions
