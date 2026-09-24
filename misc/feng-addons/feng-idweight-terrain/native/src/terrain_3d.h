@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef TERRAIN3D_CLASS_H
 #define TERRAIN3D_CLASS_H
@@ -32,6 +32,7 @@
 #include "terrain_vt.h"
 #include "terrain_3d_vt_visibility.h"
 #include "terrain_3d_vt_state.h"
+#include "terrain_3d_clipmap_layer.h"
 #include "terrain_3d_page_pipeline.h"
 
 class Terrain3D : public Node3D {
@@ -219,11 +220,16 @@ private:
 	// rebuilds the material when the set moved. Called by every write to a cell and by
 	// `_initialize()`, so a service's lifetime has one owner instead of a setup call site each.
 	void _resolve_vt_delivery(const bool p_changed);
-	// Builds the clipmap ring of one channel group if it does not exist and (re)applies the ring
-	// settings to it. The one owner of the ring's lifetime, called from the assembly rule and by
-	// `debug_update_vt_clipmap()`; a group whose channel this build has no source for stays unbuilt,
-	// says so, and is reported by the return value rather than by a ring nobody can produce.
+	// Builds the clipmap layer of one channel group if it does not exist and (re)applies the layer
+	// settings to it - including which implementation answers them. The one owner of the layer's
+	// lifetime, called from the assembly rule and by `debug_update_vt_clipmap()`; a group whose
+	// channel this build has no source for stays unbuilt, says so, and is reported by the return value
+	// rather than by a layer nobody can produce.
 	bool _setup_vt_clipmap(const TerrainVT::ChannelGroup p_group);
+	// The shape and implementation the layer is configured from, in the shared vocabulary. One place
+	// builds it, so the settings, the assembly rule and the debug entry cannot disagree about what a
+	// group's layer is.
+	Terrain3DClipmapLayer::Settings _clipmap_settings() const;
 	// The channels this build's ring can carry. One decision read twice - by `has_clipmap_source()`
 	// above and by the factory below - so the matrix's acceptance and the ring's construction cannot
 	// disagree, and adding a channel is one case here plus its source class. `None` is the answer for
@@ -535,19 +541,11 @@ public:
 	// group's own delivery - is what a pass, a pool reservation and the tick test.
 	bool has_avt_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::AVT); }
 	bool has_svt_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::SVT); }
-	// Whether any cell selected the ring. This is the matrix's answer; `has_vt_clipmap_ring()` is the
-	// question about the object, and the two differ for a ring `debug_update_vt_clipmap()` built to
-	// measure the mechanism with no cell naming the method.
+	// Whether any cell selected the clipmap. This is the matrix's answer; `has_vt_clipmap_layer()` is
+	// the question about the object, and the two differ for a layer `debug_update_vt_clipmap()` built
+	// to measure the mechanism with no cell naming the method.
 	bool has_clipmap_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::Clipmap); }
-	// Whether any cell selected the block atlas. It is the ring's second residency unit rather than
-	// a second layer: the band rule, the bake and the fallback to the region arrays are the ring's,
-	// and only the storage and the update unit differ, so the tick enters the same phase for it.
-	bool has_clipmap_atlas_delivery() const { return _vt.delivery.uses(TerrainVT::Delivery::ClipmapAtlas); }
-	// Whether any cell selected either residency unit of the clipmap layer. The tick's phase, the
-	// material detail layer and the shader's arm set are gated on this rather than on the ring
-	// alone: an atlas-only matrix is as much "the clipmap layer is selected" as a ring-only one.
-	bool has_clipmap_layer_delivery() const { return has_clipmap_delivery() || has_clipmap_atlas_delivery(); }
-	// The same three questions by property value, which is the form a debug view asks them in: a
+	// The same question by property value, which is the form a debug view asks it in: a
 	// method no cell selects has no layout to draw, so its view hides itself instead of polling a
 	// scan of an empty service. An out-of-range value is false rather than a clamp, mirroring
 	// `TerrainVT::is_valid_delivery()`.
@@ -573,20 +571,13 @@ public:
 	// the refusal names the group. It is a question about the *build* and not about an instance, so a
 	// cell is accepted - and a scene's stored cell kept - before a data resource exists.
 	bool has_clipmap_source(const int p_group) const;
-	// Whether a group is delivered by the ring in either band, which is exactly the condition the
+	// Whether a group is delivered by the clipmap in either band, which is exactly the condition the
 	// generated shader carries that group's arm under: a group that is `Direct` in both bands
-	// compiles no ring code, binds no ring uniform and tests no branch, so a method nobody selected
-	// costs the Direct path nothing. The block atlas is the same layer's other residency unit and
-	// compiles the same arm - its own tables are bound under it - so it answers here too.
+	// compiles no clipmap code, binds no clipmap uniform and tests no branch, so a method nobody
+	// selected costs the Direct path nothing. Which *implementation*'s tables the arm binds is the
+	// layer's own answer (`vt_clipmap_implementation`), not a second gate.
 	bool clipmap_arm_used(const TerrainVT::ChannelGroup p_group) const {
-		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap) ||
-				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas);
-	}
-	// Whether a group is delivered by the block atlas in either band. The arm's own copy of the
-	// atlas's tables is bound only while this is true, which is what keeps an atlas nobody selected
-	// from costing a uniform.
-	bool clipmap_atlas_arm_used(const TerrainVT::ChannelGroup p_group) const {
-		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas);
+		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap);
 	}
 	// Why the pair above is refused, in the sentence the setter logs, a panel shows and a test pins.
 	// Empty for a pair that is supported.
@@ -600,114 +591,85 @@ public:
 	bool group_has_vt_delivery(const TerrainVT::ChannelGroup p_group) const {
 		return _vt.delivery.group_uses(p_group, TerrainVT::Delivery::AVT) ||
 				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::Clipmap) ||
-				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::ClipmapAtlas) ||
 				_vt.delivery.group_uses(p_group, TerrainVT::Delivery::SVT);
 	}
 
-	// ---- Clipmap: the ring's settings and its readings -----------------------------------------
-	// One ring per channel group, built by the assembly rule the first time a cell selects Clipmap
-	// and kept afterwards, exactly like the two views. Level l covers `base_world * 2^l` metres in
-	// `size` texels, so its texel is `base_world * 2^l / size` metres wide.
+	// ---- Clipmap: the layer's settings and its readings -----------------------------------------
+	// One layer per channel group, built by the assembly rule the first time a cell selects Clipmap
+	// and kept afterwards, exactly like the two views. Unit l covers `base_world * 2^l` metres in
+	// `size` texels, so its texel is `base_world * 2^l / size` metres wide - the shared ladder both
+	// implementations address by.
 	void set_vt_clipmap_size(const int p_size);
 	int get_vt_clipmap_size() const { return _vt.clipmap_size; }
 	void set_vt_clipmap_levels(const int p_levels);
-	int get_vt_clipmap_levels() const { return _vt.clipmap_levels; }
+	int get_vt_clipmap_levels() const { return _vt.clipmap_units; }
 	void set_vt_clipmap_base_world(const real_t p_metres);
 	real_t get_vt_clipmap_base_world() const { return _vt.clipmap_base_world; }
-	// What one ring may produce in one tick, in channel texels. The ring does not touch the shared
+	// **The implementation selector**, and the whole of what used to be a second delivery: `LOD` is
+	// the toroidal level ring, `Atlas` the block atlas. A write here re-resolves the assembly, so the
+	// switch takes effect on the next resolve and the next tick - the storage is replaced, not added.
+	void set_vt_clipmap_implementation(const int p_implementation);
+	int get_vt_clipmap_implementation() const { return int(_vt.clipmap_implementation); }
+	// What one layer may produce in one tick, in channel texels. The clipmap does not touch the shared
 	// page pool, so this is spent beside `vt_pages_per_update` rather than out of it.
 	void set_vt_clipmap_budget_texels(const int p_texels);
 	int get_vt_clipmap_budget_texels() const { return _vt.clipmap_budget_texels; }
-	// ---- The clipmap atlas's settings ----------------------------------------------------------
-	// The atlas's block size and block world are the ring's `size` and `base_world`, so the two
-	// mechanisms describe the same density ladder; these three are what the atlas adds. `rings` is
-	// how many shells the grid holds - four is the shipped structure, 9 + 16 + 24 + 32 blocks -
-	// `global_texels` is the one-time minimal-resolution block outside the grid, and
-	// `blocks_per_frame` is the per-frame production bound, one being "a frame loads one block".
-	void set_vt_clipmap_atlas_rings(const int p_rings);
-	int get_vt_clipmap_atlas_rings() const { return _vt.clipmap_atlas_rings; }
-	void set_vt_clipmap_atlas_global_texels(const int p_texels);
-	int get_vt_clipmap_atlas_global_texels() const { return _vt.clipmap_atlas_global_texels; }
-	void set_vt_clipmap_atlas_blocks_per_frame(const int p_blocks);
-	int get_vt_clipmap_atlas_blocks_per_frame() const { return _vt.clipmap_atlas_blocks_per_frame; }
-	// The ring's stored value at a world position, through the ring's own addressing: the same level
-	// rule, snapping and ring the shader arm samples with. Read by the deterministic tests and the
-	// dock, which otherwise have no way to compare what the ring holds against the height map it was
-	// produced from. NAN when the group has no ring.
+	// The Atlas implementation's own settings. They are *layer* settings - the LOD implementation
+	// simply does not use them - so they are named after the layer rather than after a mode:
+	// `global_texels` is the one-time minimal-resolution block outside the atlas grid, and
+	// `blocks_per_frame` its per-frame production bound, one being "a frame loads one block". How many
+	// rings the grid holds is the layer's own `vt_clipmap_levels`.
+	void set_vt_clipmap_global_texels(const int p_texels);
+	int get_vt_clipmap_global_texels() const { return _vt.clipmap_atlas_global_texels; }
+	void set_vt_clipmap_blocks_per_frame(const int p_blocks);
+	int get_vt_clipmap_blocks_per_frame() const { return _vt.clipmap_atlas_blocks_per_frame; }
+	// The layer's stored value at a world position, through the layer's own addressing - the same unit
+	// rule, snapping and offset the shader arm samples with, whichever implementation is selected.
+	// Read by the deterministic tests and the dock, which otherwise have no way to compare what the
+	// layer holds against the height map it was produced from. NAN when the group has no layer.
 	real_t sample_vt_clipmap(const int p_group, const Vector2 &p_world_xz, const int p_channel = 0) const;
-	// Everything the height arm is bound from, in one dictionary, so the shader's copy of the ring's
-	// addressing and the CPU's are the *same* numbers rather than two implementations that agree
-	// until one changes: `centers` and `rings` are the per-level state the shader indexes with,
-	// `valid` is the gate that keeps a level that is not current out of a fragment, and `size`,
-	// `levels` and `base_world` are the level rule. Padded to the shader's fixed array size, with
-	// `levels` naming how many entries are meaningful. Empty when the group has no ring.
+	// The density the layer serves at a world point, in texels a metre: the shared ladder's reciprocal,
+	// asked of the *layer* rather than of either storage, so the "density - distance" curve is one
+	// reading for both implementations. Zero outside the layer's coverage.
+	real_t sample_vt_clipmap_density(const int p_group, const Vector2 &p_world_xz) const;
+	// Everything the material's arm is bound from, in one dictionary, so the shader's copy of the
+	// layer's addressing and the CPU's are the *same* numbers rather than two implementations that
+	// agree until one changes. The selected implementation fills it and `arm["implementation"]` names
+	// which, so the binding above it is one path. Empty when the group has no configured layer.
 	Dictionary get_vt_clipmap_arm(const int p_group) const;
-	// An edit changed the source under a world AABB: the ring re-produces the texels that cover it
-	// and stops serving the levels that touch it until they have. Called from the one place every
-	// edit reports itself to (`Terrain3DData::add_edited_area()`), and public because a script that
-	// writes heights through the data API without going through the editor can call it. Returns how
-	// many rect jobs were queued; zero when no ring exists or the level is already being produced.
+	// An edit changed the source under a world AABB: the layer re-produces the texels that cover it
+	// and stops serving the units that touch it until they have. Called from the one place every edit
+	// reports itself to (`Terrain3DData::add_edited_area()`), and public because a script that writes
+	// heights through the data API without going through the editor can call it. Returns how many rect
+	// jobs were queued; zero when no layer exists or the unit is already being produced.
 	int invalidate_vt_clipmap_area(const AABB &p_area);
-	// Whether any ring object exists, which is the clipmap's own "is this used" question and the
-	// gate the ring's debug view and its native preview are read with: a ring exists because a cell
-	// selected the method (once a build can deliver it) or because `debug_update_vt_clipmap()` built
-	// one to measure the mechanism, and it is kept afterwards. False is the state with no ring at
-	// all: no levels, no texture, no jobs and no budget.
-	bool has_vt_clipmap_ring() const;
-	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
-	// `terrain_3d_clipmap_atlas.h` states the structure - 9 + 16 + 24 + 32 blocks over four rings
-	// plus one global, one-time block, packed into one texture per channel - and the two things it
-	// changes about the ring: the unit of *production* is a block, and the unit of *upload* is a block
-	// rect rather than a whole layer.
-	//
-	// It is **a delivery and a mechanism**: a cell that names `ClipmapAtlas` builds it through the
-	// same assembly rule the ring's `Clipmap` uses, the tick's phase drives it, and its blocks are
-	// baked and sampled by the material arm; `debug_update_vt_clipmap_atlas()` is the mechanism's own
-	// entry for the tests, the same way `debug_update_vt_clipmap()` is the ring's. It publishes the
-	// same shape of readings (`clipmap_atlas_produced_texels`, the block-upload and rolling counters,
-	// the layout payload), so the load comparison is one script on one build.
-	bool has_vt_clipmap_atlas() const;
-	// Whether an atlas exists, for the debug view's gate.
-	bool clipmap_atlas_available() const;
-	// Build the atlas for `p_group` from the clipmap settings if it does not exist, hand it the
-	// source it carries, and configure it. False when no source carries that group in this build.
-	bool _setup_vt_clipmap_atlas(const TerrainVT::ChannelGroup p_group);
-	// The atlas's arm: the rect array, the per-cell current-frame atlas index, the per-ring start
-	// point and phase, and the grid's shape. Empty when no atlas is configured for the group.
-	Dictionary get_vt_clipmap_atlas_arm(const int p_group) const;
-	// The atlas's own entry, beside `debug_update_vt_clipmap()` and deliberately the same shape: the
-	// same focus, the same `vt_clipmap_budget_texels`, the same published numbers. Returns the channel
-	// texels produced, or -1 when no atlas can be built for that group.
-	int debug_update_vt_clipmap_atlas(const int p_group);
-	// The atlas's rolling readings, published from whichever entry drove it - the tick's phase or
-	// the mechanism's own `debug_update_vt_clipmap_atlas()`. One writer, so a panel or a test reads
-	// the same counters either way.
-	void _publish_clipmap_atlas_readings(const Terrain3DClipmapAtlas *p_atlas);
-	// The atlas's read-only debug payload: the packing the layout algorithm chose, every rect, and
-	// every cell's current-frame atlas index - so the debug view draws the *atlas's region* rather
-	// than a ring's square. Empty when no atlas exists.
-	Dictionary get_clipmap_atlas_layout(const int p_group) const;
-	// The mechanism's own entry, beside `sample_vt_clipmap()`: build the ring for `p_group` from the
-	// clipmap settings if it does not exist, run the phase the tick runs for it - the same
-	// `Terrain3DClipmap::update()`, the same focus and the same `vt_clipmap_budget_texels` - and
-	// return the channel texels produced, or -1 when no ring can be built for that group. The height
-	// cell is deliverable now, so the tick's own phase runs whenever a cell names the method; this
-	// stays as the door a reading takes the mechanism through *without* a delivery claim: the ring's
-	// addressing, strips and budget are measurable with every cell `Direct`, which is how
-	// `native/tests/vt_clipmap` isolates the mechanism from the arm. It publishes
-	// `clipmap_produced_texels` and `vt_clipmap_ms` exactly as the tick's phase does.
+	// Whether any clipmap layer object exists, which is the layer's own "is this used" question and
+	// the gate its debug view and native preview are read with: a layer exists because a cell selected
+	// the method (once a build can deliver it) or because `debug_update_vt_clipmap()` built one to
+	// measure the mechanism, and it is kept afterwards. False is the state with no layer at all: no
+	// units, no texture, no jobs and no budget.
+	bool has_vt_clipmap_layer() const;
+	// The mechanism's own entry, beside `sample_vt_clipmap()`: build the layer for `p_group` from the
+	// clipmap settings if it does not exist - with whichever implementation is selected - run the phase
+	// the tick runs for it (the same `update()`, the same focus and the same `vt_clipmap_budget_texels`)
+	// and return the channel texels produced, or -1 when no layer can be built for that group. This is
+	// the door a reading takes the mechanism through *without* a delivery claim: the addressing, the
+	// units and the budget are measurable with every cell `Direct`, which is how `native/tests/vt_clipmap`
+	// isolates the mechanism from the arm. It publishes `clipmap_produced_texels` and `vt_clipmap_ms`
+	// exactly as the tick's phase does.
 	int debug_update_vt_clipmap(const int p_group);
-	// The ring's read-only debug payload: the world square every level of every existing ring
-	// occupies right now, its addressing (`center`, `ring`, `valid`) and the rects still queued for
-	// it, which is what the VT Page's clipmap view draws. Empty when no ring exists - the scan is
-	// refused rather than drawn empty, the way `get_avt_layout_preview()` refuses - and the two
-	// counters in `get_vt_settings()` record the difference between an ask and the work.
+	// The layer's read-only debug payload, in the **one schema** the facade assembles: the shared
+	// per-unit entries, the shape, the density/reach curve and the implementation's private payload
+	// (`impl`) - so the debug view draws the selected implementation's picture and both of them can be
+	// plotted against the same density axis. Empty when no layer exists - the scan is refused rather
+	// than drawn empty, the way `get_avt_layout_preview()` refuses - and the two counters in
+	// `get_vt_settings()` record the difference between an ask and the work.
 	Dictionary get_clipmap_layout_preview() const;
-	// Whether any ring's addressing changed since the shader was last bound with it - its shape, any
-	// level's snapped centre or toroidal offset, or which levels are current - and the rebind that
-	// follows. The ring's own stamp is the answer, so a tick that produced nothing rebinds nothing:
-	// the alternative, rebinding every tick, would republish the whole VT uniform set (and the region
-	// tables with it) for a ring that had not moved. The rebind is the ring's own uniforms and not
+	// Whether any layer's addressing changed since the shader was last bound with it - its shape, any
+	// unit's snapped origin or offset, or which units are current - and the rebind that follows. The
+	// layer's own stamp is the answer, so a tick that produced nothing rebinds nothing: the
+	// alternative, rebinding every tick, would republish the whole VT uniform set (and the region
+	// tables with it) for a layer that had not moved. The rebind is the clipmap's own uniforms and not
 	// `Terrain3DMaterial::update()`, for the same reason.
 	void _update_vt_clipmap_arm();
 	bool _vt_clipmap_state_changed();

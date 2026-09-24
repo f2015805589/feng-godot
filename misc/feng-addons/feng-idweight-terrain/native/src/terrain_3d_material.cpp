@@ -44,9 +44,17 @@ static constexpr int ATLAS_DATA_RECTS = ATLAS_DATA_BAKED + Terrain3DClipmapAtlas
 static constexpr int ATLAS_DATA_BAND = ATLAS_DATA_RECTS + Terrain3DClipmapAtlas::MAX_SLOTS * 4;
 static constexpr int ATLAS_DATA_RINGS = ATLAS_DATA_BAND + 1;
 static constexpr int ATLAS_DATA_WORLD = ATLAS_DATA_RINGS + 1;
-static constexpr int ATLAS_DATA_STRIDE = 800;
+// The row must hold one group's whole table, and the image must hold every group's row. Both are
+// derived from the atlas's own constants above rather than written by hand, so raising a ceiling
+// (`MAX_RINGS`, and with it `MAX_CELLS` / `MAX_SLOTS`) cannot silently overflow the texture: the two
+// static assertions are the compile-time half of that, and the image size is sized with room to spare.
+static constexpr int ATLAS_DATA_STRIDE = 1152;
 static constexpr int ATLAS_DATA_WIDTH = 128;
-static constexpr int ATLAS_DATA_HEIGHT = 16;
+static constexpr int ATLAS_DATA_HEIGHT = 24;
+static_assert(ATLAS_DATA_WORLD + 1 <= ATLAS_DATA_STRIDE,
+		"the block-atlas data row must hold the whole table");
+static_assert(ATLAS_DATA_STRIDE * TerrainVT::GROUP_COUNT <= ATLAS_DATA_WIDTH * ATLAS_DATA_HEIGHT,
+		"the block-atlas data image must hold one row per channel group");
 
 ///////////////////////////
 // Private Functions
@@ -644,14 +652,18 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 		sizes.push_back(int(arm.get("size", 0)));
 		levels.push_back(int(arm.get("levels", 0)));
 		channels.push_back(MAX(1, int(arm.get("channels", 1))));
-		// ---- The block atlas's tables for this group ---------------------------------------------
-		// The numeric tables are packed into one `R32F` texture rather than uniform arrays: the
-		// material's uniform buffer is already close to the device's limit at the default region
-		// maximum (the region and block arrays are tens of kilobytes once std140 padding is counted),
-		// and a block's 186-entry rect array would push the whole block past what D3D12 accepts - the
-		// device is removed at pipeline creation. A texture costs one sampler and no uniform bytes,
-		// and `texelFetch` is the read the data wants. `block_data` is filled below, after the loop.
-		const Dictionary atlas_arm = _terrain->get_vt_clipmap_atlas_arm(group);
+		// ---- The selected implementation's tables for this group ---------------------------------
+		// **One arm dictionary**, whichever implementation is selected: the facade publishes the layer
+		// in the selected storage's own uniform names and stamps `implementation`, so the two branches
+		// below are uniform-name plumbing and not two owners. The numeric tables of the atlas arm are
+		// packed into one `R32F` texture rather than uniform arrays: the material's uniform buffer is
+		// already close to the device's limit at the default region maximum, and a block's rect array
+		// would push the whole block past what D3D12 accepts - the device is removed at pipeline
+		// creation. A texture costs one sampler and no uniform bytes, and `texelFetch` is the read the
+		// data wants. `block_data` is filled below, after the loop.
+		const String implementation = arm.get("implementation", String("LOD"));
+		const bool atlas_group = _shader_clipmap_atlas[group];
+		const Dictionary atlas_arm = atlas_group ? arm : Dictionary();
 		const RID block_texture = atlas_arm.get("texture", RID());
 		block_textures.push_back(block_texture.is_valid() ? block_texture : _generated_dummy.get_rid());
 		const RID block_albedo = atlas_arm.get("baked_albedo", RID());
@@ -694,27 +706,22 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 		}
 		block_data[base + ATLAS_DATA_RINGS] = float(int(atlas_arm.get("rings", 0)));
 		block_data[base + ATLAS_DATA_WORLD] = atlas_arm.get("block_world", 0.0);
-		// The atlas's own band mask, bit 0 the near band and bit 1 the far one - separate from the
-		// ring's, because the two cells may name different units and the region arrays keep what
-		// neither owns.
+		// The two arms' band masks. There is **one delivery** - the clipmap - and two implementations of
+		// it, so a cell that names Clipmap names whichever implementation is selected, and the mask goes
+		// to that arm and zero to the other: the shader then serves the delivery through the arm the
+		// variant and the implementation agree on, and the region arrays keep what neither band owns.
 		int block_band = 0;
-		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), group) == int(TerrainVT::Delivery::ClipmapAtlas)) {
-			block_band |= 1;
+		int band = 0;
+		const int near_cell = _terrain->get_vt_delivery(int(TerrainVT::Tier::Near), group);
+		const int far_cell = _terrain->get_vt_delivery(int(TerrainVT::Tier::Far), group);
+		const bool atlas_selected = implementation == "Atlas";
+		if (near_cell == int(TerrainVT::Delivery::Clipmap)) {
+			(atlas_selected ? block_band : band) |= 1;
 		}
-		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), group) == int(TerrainVT::Delivery::ClipmapAtlas)) {
-			block_band |= 2;
+		if (far_cell == int(TerrainVT::Delivery::Clipmap)) {
+			(atlas_selected ? block_band : band) |= 2;
 		}
 		block_data[base + ATLAS_DATA_BAND] = float(block_band);
-		// The two cells' claim about *this* group, as one mask: bit 0 the near band, bit 1 the far
-		// one. The band is reach rather than capability, so it can move without a shader rebuild and
-		// is therefore a uniform and not a define.
-		int band = 0;
-		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Near), group) == int(TerrainVT::Delivery::Clipmap)) {
-			band |= 1;
-		}
-		if (_terrain->get_vt_delivery(int(TerrainVT::Tier::Far), group) == int(TerrainVT::Delivery::Clipmap)) {
-			band |= 2;
-		}
 		bands.push_back(band);
 	}
 	RS->material_set_param(p_material, "_clipmap_atlas", atlases);

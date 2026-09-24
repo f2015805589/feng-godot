@@ -1,27 +1,30 @@
 # Run with a graphical rendering driver; see README.md in this directory.
 #
 # The block atlas's **render acceptance**: the mechanism (`vt_clipmap_atlas`) proves the structure with
-# every cell `Direct`; this proves the *arms*. It is the same pixel-identity method `vt_clipmap_render`
-# uses for the ring - `differing(direct_image, atlas_image) == 0` - applied to a delivery cell that
-# names `ClipmapAtlas`:
+# every cell `Direct`; this proves the *arms*. The clipmap is now one delivery (`Clipmap`) with an
+# implementation selector, so this is the same pixel-identity method `vt_clipmap_render` uses for the
+# LOD ring - `differing(direct_image, atlas_image) == 0` - applied to a delivery cell that names
+# `Clipmap` while `vt_clipmap_implementation` names `Atlas`:
 #
 #  1. **the height arm**: at the height grid's own density (64 texels over 64 m, i.e. one texel a
 #     metre) a block atlas serving the near band renders the region array's pixels exactly. The
 #     shader's cell, rect and texel arithmetic must therefore be the CPU's, and the arm must be the
-#     block reader rather than the array or the ring;
+#     block reader rather than the array or the LOD ring;
 #  2. **the material arm**: the atlas bakes the same three arrays out of the same payload at the same
-#     density as the ring, so the two density-matched renders are pixel-identical inside the ring's
-#     own coverage. The atlas's baked rects are the addressing, and a cell whose bake has not landed
-#     must fall back rather than sample a rect no dispatch wrote;
+#     density as the LOD ring, so the two density-matched renders are pixel-identical inside the
+#     ring's own coverage. The atlas's baked rects are the addressing, and a cell whose bake has not
+#     landed must fall back rather than sample a rect no dispatch wrote;
 #  3. **the generated shader**: `_clipmap_block` and `clipmap_block_find` are in the compiled string
-#     when, and only when, a cell names the atlas.
+#     when, and only when, the implementation the selected cell answers with is the atlas.
 extends SceneTree
 
 const MATERIAL := 0
 const HEIGHT := 1
 const DIRECT := 0
 const CLIPMAP := 2
-const CLIPMAP_ATLAS := 4
+# The implementation selector inside the one `Clipmap` delivery: `LOD = 0`, `Atlas = 1`.
+const LOD := 0
+const ATLAS := 1
 
 var terrain: Terrain3D
 var camera: Camera3D
@@ -63,11 +66,25 @@ func commit_action(_execute: bool) -> void:
 func settings() -> Dictionary:
 	return terrain.get_vt_settings()
 
-func atlas_height() -> Dictionary:
-	return settings().get("clipmap_atlas", {}).get("height", {})
+# The group's entry. What only the selected implementation can say - the atlas's cell table, the LOD
+# ring's level reports - is nested under `layout`, the implementation payload.
+func group_entry(key: String) -> Dictionary:
+	return settings().get("clipmap", {}).get(key, {})
 
-func atlas_material() -> Dictionary:
-	return settings().get("clipmap_atlas", {}).get("material", {})
+func impl_of(p_entry: Dictionary) -> Dictionary:
+	return p_entry.get("layout", {})
+
+func cell_table(p_entry: Dictionary) -> Array:
+	return (impl_of(p_entry).get("layout", {}) as Dictionary).get("cells", [])
+
+func current_cells(p_entry: Dictionary) -> int:
+	var count := 0
+	for value: Variant in cell_table(p_entry):
+		count += 1 if bool((value as Dictionary).get("current", false)) else 0
+	return count
+
+func baked_cells(p_entry: Dictionary) -> int:
+	return int(impl_of(p_entry).get("baked_cells", 0))
 
 func shader_code() -> String:
 	return RenderingServer.shader_get_code(terrain.material.get_shader_rid())
@@ -124,13 +141,13 @@ func settle_atlas(group: int) -> void:
 	# height channel's readiness is the cell's own `current`.
 	var wants_baked := group == MATERIAL
 	for _i in 8192:
-		var entry: Dictionary = settings().get("clipmap_atlas", {}).get(key, {})
+		var entry: Dictionary = group_entry(key)
 		if int(entry.get("pending_jobs", 1)) == 0 \
-				and int(entry.get("current_cells", 0)) >= int(entry.get("cells", 1)) \
+				and current_cells(entry) >= cell_table(entry).size() \
 				and (!wants_baked or (int(entry.get("pending_bake_rects", 1)) == 0 \
-						and int(entry.get("baked_cells", 0)) >= int(entry.get("current_cells", 1)))):
+						and baked_cells(entry) >= current_cells(entry))):
 			break
-		terrain.call("debug_update_vt_clipmap_atlas", group)
+		terrain.call("debug_update_vt_clipmap", group)
 		await process_frame
 
 func settle_ring() -> void:
@@ -138,16 +155,18 @@ func settle_ring() -> void:
 	# rects are queued but whose producer has not acknowledged them serves the payload evaluation, and
 	# the material comparison below would then be two fallbacks agreeing.
 	for _i in 8192:
-		var entry: Dictionary = settings().get("clipmap", {}).get("material", {})
+		var entry: Dictionary = group_entry("material")
 		var baked := 0
+		var valid := 0
 		var channels := 0
-		for report: Dictionary in (entry.get("level_reports", []) as Array):
+		for report: Dictionary in (impl_of(entry).get("level_reports", []) as Array):
 			baked += 1 if bool(report.get("baked", false)) else 0
+			valid += 1 if bool(report.get("valid", false)) else 0
 			channels = int(report.get("baked_channels", 0))
 		if int(entry.get("pending_jobs", 1)) == 0 \
-				and int(entry.get("valid_levels", 0)) >= int(entry.get("levels", 1)) \
+				and valid >= int(entry.get("units", 1)) \
 				and int(entry.get("pending_bake_rects", 1)) == 0 \
-				and baked >= int(entry.get("valid_levels", 1)) \
+				and baked >= valid \
 				and channels == 3:
 			break
 		terrain.call("debug_update_vt_clipmap", MATERIAL)
@@ -227,15 +246,16 @@ func setup() -> void:
 		asset.albedo_texture = solid_texture(32, Color(0.8, 0.15, 0.1) if id == 0 else Color(0.1, 0.7, 0.2))
 		asset.normal_texture = solid_texture(32, Color(0.5, 0.5, 1.0, 1.0))
 		terrain.assets.set_texture_asset(id, asset)
-	# One block of 64 texels over 64 m: ring 0 is exactly one texel a metre, the height map's own grid
-	# and the material payload's own grid. The budget fills a level in one call, which is why the ring
-	# settles deterministically below.
+	# One block of 64 texels over 64 m: unit 0 is exactly one texel a metre, the height map's own grid
+	# and the material payload's own grid. `vt_clipmap_levels` is the layer's unit count for both
+	# implementations now, so one LOD level and one atlas unit - the atlas unit's 3x3 blocks cover the
+	# visible square. The budget fills a level in one call, which is why the LOD ring settles
+	# deterministically below; the implementation is selected in `run()`.
 	terrain.vt_clipmap_size = 64
 	terrain.vt_clipmap_levels = 1
 	terrain.vt_clipmap_base_world = 64.0
 	terrain.vt_clipmap_budget_texels = 64 * 64
-	terrain.vt_clipmap_atlas_rings = 4
-	terrain.vt_clipmap_atlas_blocks_per_frame = 1
+	terrain.vt_clipmap_blocks_per_frame = 1
 	terrain.set_camera(camera)
 	terrain.set_clipmap_target(target)
 	scene.add_child(terrain)
@@ -280,21 +300,24 @@ func run() -> void:
 	var direct_image := await frame_image()
 	save_image(direct_image, "clipmap-atlas-direct.png")
 
-	# 2. The height arm. The cell is deliverable, the arm enters the compiled string, and the atlas
-	#    renders the array's pixels exactly at the grid's own density.
-	terrain.vt_delivery_near_height = CLIPMAP_ATLAS
+	# 2. The height arm. The cell is deliverable, the implementation answers with the atlas, the arm
+	#    enters the compiled string, and the atlas renders the array's pixels exactly at the grid's
+	#    own density.
+	terrain.vt_clipmap_implementation = ATLAS
+	terrain.vt_delivery_near_height = CLIPMAP
 	await settle(20)
-	require(terrain.vt_delivery_near_height == CLIPMAP_ATLAS, "the height cell accepts ClipmapAtlas")
-	require(terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP_ATLAS), "and publishes it as deliverable")
-	require(terrain.is_vt_delivery_used(CLIPMAP_ATLAS), "and as used")
+	require(terrain.vt_delivery_near_height == CLIPMAP, "the height cell accepts Clipmap")
+	require(terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP), "and publishes it as deliverable")
+	require(terrain.is_vt_delivery_used(CLIPMAP), "and as used")
+	require(terrain.vt_clipmap_implementation == ATLAS, "and the layer answers with the atlas")
 	await settle_atlas(HEIGHT)
 	var atlas_code := shader_code()
 	save_text(atlas_code, "clipmap-atlas-height.glsl")
 	require(atlas_code.contains("_clipmap_block"), "selecting it compiles the atlas's sampler")
 	require(atlas_code.contains("clipmap_block_find"), "including the block addressing")
-	require(bool(atlas_height().get("configured", false)), "the height atlas exists")
-	require(int(atlas_height().get("current_cells", 0)) == int(atlas_height().get("cells", 81)),
-			"with every cell current")
+	var height_entry := group_entry("height")
+	require(bool(height_entry.get("configured", false)), "the height atlas exists")
+	require(current_cells(height_entry) == cell_table(height_entry).size(), "with every cell current")
 	var height_atlas_image := await frame_image()
 	save_image(height_atlas_image, "clipmap-atlas-height.png")
 	var height_diff := differing(direct_image, height_atlas_image)
@@ -306,22 +329,27 @@ func run() -> void:
 	if not failed:
 		print("PASS clipmap atlas height arm: the block atlas renders pixel-identical to the array")
 
-	# 3. The material arm. The ring at the same density is the reference: both bake the same three
-	#    arrays out of the same payload at the same texel lattice, so the two are pixel-identical.
+	# 3. The material arm. The LOD ring at the same density is the reference: both bake the same three
+	#    arrays out of the same payload at the same texel lattice, so the two are pixel-identical. The
+	#    implementation selector is a layer setting, so it goes back to LOD before this reference.
 	terrain.vt_delivery_near_height = DIRECT
+	terrain.vt_clipmap_implementation = LOD
 	terrain.vt_delivery_near_material = CLIPMAP
 	await settle(20)
 	await settle_ring()
-	var ring_entry: Dictionary = settings().get("clipmap", {}).get("material", {})
+	var ring_entry: Dictionary = group_entry("material")
 	require(bool(ring_entry.get("configured", false)), "the material ring exists")
-	require(int(ring_entry.get("valid_levels", 0)) >= 1, "with a current level")
+	require(str(ring_entry.get("implementation", "")) == "LOD", "and answers with the LOD ring")
+	var ring_valid := 0
 	var ring_baked := 0
 	var ring_channels := 0
-	for report: Dictionary in (ring_entry.get("level_reports", []) as Array):
+	for report: Dictionary in (impl_of(ring_entry).get("level_reports", []) as Array):
+		ring_valid += 1 if bool(report.get("valid", false)) else 0
 		ring_baked += 1 if bool(report.get("baked", false)) else 0
 		ring_channels = int(report.get("baked_channels", 0))
+	require(ring_valid >= 1, "with a current level")
 	print("CLIPMAP_ATLAS_RENDER ring_diag baked_levels=%d valid=%d baked_channels=%d pending_bake=%d" % [
-		ring_baked, int(ring_entry.get("valid_levels", -1)), ring_channels,
+		ring_baked, ring_valid, ring_channels,
 		int(ring_entry.get("pending_bake_rects", -1))])
 	var ring_code := shader_code()
 	require(ring_code.contains("clipmap_baked_material"), "and the ring's baked arm is compiled")
@@ -351,22 +379,24 @@ func run() -> void:
 	RenderingServer.material_set_param(ring_arm, "_clipmap_outstanding_count", ring_counts_bound)
 	require(differing(ring_image, await frame_image()) == 0, "and the ring's own answer returns the baked picture")
 
-	terrain.vt_delivery_near_material = CLIPMAP_ATLAS
+	terrain.vt_clipmap_implementation = ATLAS
+	terrain.vt_delivery_near_material = CLIPMAP
 	await settle(20)
-	require(terrain.vt_delivery_near_material == CLIPMAP_ATLAS, "the material cell accepts ClipmapAtlas")
-	require(terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP_ATLAS), "and publishes it as deliverable")
+	require(terrain.vt_delivery_near_material == CLIPMAP, "the material cell accepts Clipmap")
+	require(terrain.vt_clipmap_implementation == ATLAS, "with the atlas implementation selected")
+	require(terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP), "and publishes it as deliverable")
 	var material_code := shader_code()
 	save_text(material_code, "clipmap-atlas-material.glsl")
 	require(material_code.contains("clipmap_block_baked_material"),
 			"selecting it compiles the atlas's baked-material arm")
 	await settle_atlas(MATERIAL)
-	var mat_entry := atlas_material()
+	var mat_entry := group_entry("material")
 	require(bool(mat_entry.get("selected", false)), "the atlas reports the material cell")
-	require(int(mat_entry.get("current_cells", 0)) == int(mat_entry.get("cells", 81)),
+	require(current_cells(mat_entry) == cell_table(mat_entry).size(),
 			"with every cell current")
-	require(int(mat_entry.get("baked_cells", 0)) >= int(mat_entry.get("current_cells", 1)),
+	require(baked_cells(mat_entry) >= current_cells(mat_entry),
 			"and every current cell baked: %d of %d" % [
-				int(mat_entry.get("baked_cells", 0)), int(mat_entry.get("current_cells", 1))])
+				baked_cells(mat_entry), current_cells(mat_entry)])
 	require(int(mat_entry.get("pending_bake_rects", 1)) == 0, "with nothing left waiting for a producer")
 	var material_atlas_image := await frame_image()
 	save_image(material_atlas_image, "clipmap-atlas-material.png")

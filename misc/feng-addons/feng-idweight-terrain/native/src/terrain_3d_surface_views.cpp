@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 // The two surface views, part 1 of 4: the view objects and the settings that size them.
 
@@ -458,7 +458,7 @@ bool Terrain3D::is_vt_delivery_supported(const int p_group, const int p_method) 
 	if (method == TerrainVT::Delivery::Direct) {
 		return true;
 	}
-	if (method == TerrainVT::Delivery::Clipmap || method == TerrainVT::Delivery::ClipmapAtlas) {
+	if (method == TerrainVT::Delivery::Clipmap) {
 		return has_clipmap_source(p_group);
 	}
 	return p_group == int(TerrainVT::ChannelGroup::Material) &&
@@ -473,13 +473,12 @@ String Terrain3D::get_vt_delivery_unsupported_reason(const int p_group, const in
 		return "the cell is out of range";
 	}
 	const TerrainVT::ChannelGroup group = TerrainVT::ChannelGroup(p_group);
-	if (TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap ||
-			TerrainVT::Delivery(p_method) == TerrainVT::Delivery::ClipmapAtlas) {
+	if (TerrainVT::Delivery(p_method) == TerrainVT::Delivery::Clipmap) {
 		return String("no clipmap source carries the ") + TerrainVT::group_channel_name(group) +
 				" channel in this build";
 	}
 	if (group == TerrainVT::ChannelGroup::Height) {
-		return "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group";
+		return "the height channel is delivered directly or by the clipmap layer; AVT and SVT page the diffuse+normal group";
 	}
 	return "the diffuse+normal channel has no arm for this method";
 }
@@ -560,21 +559,16 @@ void Terrain3D::set_vt_delivery_far_height(const int p_delivery) {
 // switched processing off before re-applying a setting has to get it back, which is the contract at
 // the top of this file and the reason this is not an early return.
 void Terrain3D::_resolve_vt_delivery(const bool p_changed) {
-	// The clipmap is the one method whose service is per channel *group* rather than per tier: a ring
-	// carries one group's channel, so a cell selecting Clipmap asks for exactly one ring, and the
-	// group that selected it is the ring's identity. Every ring that exists is reconfigured here as
-	// well, so a size or level write lands on the same call as the cell that selected the method.
+	// The clipmap is the one method whose service is per channel *group* rather than per tier: a layer
+	// carries one group's channel, so a cell selecting Clipmap asks for exactly one layer, and the
+	// group that selected it is the layer's identity. Every layer that exists is reconfigured here as
+	// well, so a size, level, implementation or budget write lands on the same call as the cell that
+	// selected the method - and a switch of implementation replaces the storage in that one call.
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
-		if (_vt.clipmap[group] != nullptr || _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
+		if (_vt.clipmap_layer[group] != nullptr ||
+				_vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
 			_setup_vt_clipmap(channel);
-		}
-		// The block atlas is the same layer's other residency unit, so a cell that names it asks for
-		// the same one-ring-per-group object and is built beside the ring - never instead of it, so
-		// a group that splits its two bands between the ring and the atlas owns both.
-		if (_vt.clipmap_atlas[group] != nullptr ||
-				_vt.delivery.group_uses(channel, TerrainVT::Delivery::ClipmapAtlas)) {
-			_setup_vt_clipmap_atlas(channel);
 		}
 	}
 	// And the material group's detail layer, which is a second object over the same group: a finer,
@@ -672,313 +666,89 @@ bool Terrain3D::has_clipmap_source(const int p_group) const {
 			_clipmap_channel(TerrainVT::ChannelGroup(p_group)) != ClipmapChannel::None;
 }
 
-// The ring's one owner, called by the assembly rule. Which *source* carries a group is the whole of
-// the difference between the rings: the addressing, the levels, the strips and the budget are one
-// object for either group, so a second channel is a source and the line above rather than a second
-// clipmap implementation - and the shape it is configured with is the source's own declaration, not
-// a number written here.
+// The layer's one owner, called by the assembly rule. Which *source* carries a group is the whole of
+// the difference between two groups: the addressing ladder, the units, the budget and the bake queue
+// are one object for either group, so a second channel is a source and the line above rather than a
+// second clipmap. Which *implementation* answers them is a setting of that one object
+// (`vt_clipmap_implementation`), and the facade owns the selected one - so a switch replaces the
+// storage instead of standing a second mechanism beside the first.
 //
-// A ring is a residency cache as well as a renderer, so a deselection stops its pass and keeps its
-// content - the rule the two views follow (`_resolve_vt_delivery()`), and a selection that comes
-// back finds the ring it left instead of a blank one. The return value is whether a ring exists after
-// the call, which is what `debug_update_vt_clipmap()` reports as -1 rather than as "produced nothing".
+// A layer is a residency cache as well as a renderer, so a deselection stops its pass and keeps its
+// content - the rule the two views follow (`_resolve_vt_delivery()`), and a selection that comes back
+// finds the layer it left instead of a blank one. The return value is whether a layer exists after the
+// call, which is what `debug_update_vt_clipmap()` reports as -1 rather than as "produced nothing".
+Terrain3DClipmapLayer::Settings Terrain3D::_clipmap_settings() const {
+	Terrain3DClipmapLayer::Settings settings;
+	settings.implementation = _vt.clipmap_implementation;
+	settings.shape.size = _vt.clipmap_size;
+	settings.shape.units = _vt.clipmap_units;
+	settings.shape.base_world = _vt.clipmap_base_world;
+	settings.shape.global_texels = _vt.clipmap_atlas_global_texels;
+	settings.shape.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
+	return settings;
+}
+
 bool Terrain3D::_setup_vt_clipmap(const TerrainVT::ChannelGroup p_group) {
 	if (_data == nullptr) {
 		return false;
 	}
 	const int index = int(p_group);
-	if (_vt.clipmap[index] == nullptr) {
-		std::unique_ptr<Terrain3DClipmapSource> source = _make_clipmap_source(p_group);
-		if (source == nullptr) {
-			// The matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`),
-			// so this branch is reached by `debug_update_vt_clipmap()` asking for a channel no source
-			// carries. It says so per call and per group rather than handing back a ring nothing
-			// could produce.
-			LOG(WARN, "Clipmap has no source for the ", TerrainVT::group_channel_name(p_group),
-					" channel in this build; it stays direct.");
-			return false;
-		}
-		LOG(DEBUG, "Creating ", source->get_source_name(), " clipmap ring");
-		_vt.clipmap[index] = std::make_unique<Terrain3DClipmap>(std::move(source));
+	if (_vt.clipmap_layer[index] == nullptr) {
+		// The facade is handed the channel's *factory*, not one source: it asks for a source each time
+		// it builds an implementation, which is what lets the implementation be replaced without
+		// moving ownership back out of the one being replaced.
+		_vt.clipmap_layer[index] = std::make_unique<Terrain3DClipmapLayer>(
+				[this, p_group]() { return _make_clipmap_source(p_group); });
 	}
-	Terrain3DClipmap::Config config;
-	config.size = _vt.clipmap_size;
-	config.levels = _vt.clipmap_levels;
-	config.base_world = _vt.clipmap_base_world;
-	// The channel's shape is the channel's: the ring is told how many scalars a texel holds and what
-	// one value's format is, and no line here knows whether they are heights or anything else.
-	config.channels = _vt.clipmap[index]->get_source_channel_count();
-	config.format = _vt.clipmap[index]->get_source_format();
-	// And what a producer bakes out of those texels, if the channel has one: the ring allocates the
-	// layers here and the bake itself belongs to the owner (`Terrain3D::_bake_clipmap_rings()`), so a
-	// channel with no bake declares zero and its ring is only what its source fills.
-	config.baked_channels = _vt.clipmap[index]->get_source_baked_channel_count();
-	config.baked_format = _vt.clipmap[index]->get_source_baked_format();
-	_vt.clipmap[index]->configure(config);
-	if (config.baked_channels > 0 && !_vt.vt_materials_published) {
-		// The bake reads the surface *material list*, which the page path publishes to the producer
-		// whenever the assets change. A ring that declares baked layers is a consumer of that list
-		// exactly like a page is, and without this the list is never published in a configuration whose
-		// material group takes no page at all - which is the configuration a ring is selected for.
-		//
-		// *Once*, though: this runs on every write to the matrix, and asking for the list again is not
-		// free - the service answers a publish by telling every ring its baked layers are stale, which
-		// queues a whole level per ring. A ring that needs the list because the list was never there is
-		// the case this covers; a ring that already has it is re-baked only when the assets change,
-		// which is the service's own trigger.
-		_vt.vt_materials_dirty = true;
-		_vt.vt_materials_published = true;
-	}
-	return true;
-}
-
-// Whether any ring object exists. Read by the ring's debug view, its native preview and the report:
-// the gate is "is there a ring to draw", not "does a cell name the method", because a build that
-// cannot deliver Clipmap still has the mechanism - built by `debug_update_vt_clipmap()` - and a ring
-// that exists is what a picture of a ring is a picture of.
-bool Terrain3D::has_vt_clipmap_ring() const {
-	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		if (_vt.clipmap[group] != nullptr) {
-			return true;
-		}
-	}
-	return false;
-}
-
-///////////////////////////
-// The clipmap atlas
-///////////////////////////
-//
-// The same rings as `Terrain3DClipmap`, organised as discrete blocks packed into one texture per
-// channel (`terrain_3d_clipmap_atlas.h`), and built by the same assembly rule for the same reason:
-// which *source* carries a group is the whole of the difference, so a second channel is a source and
-// a line here rather than a second atlas.
-//
-// **It is a delivery and a mechanism.** A cell that names `ClipmapAtlas` builds it through this
-// assembly rule, the tick's phase drives it beside the ring, and both of its arms read it: the height
-// arm samples the block rects' source texels and the material arm samples the block rects' baked
-// arrays. `debug_update_vt_clipmap_atlas()` stays as the mechanism's own entry, beside
-// `debug_update_vt_clipmap()` and for the same reason: the addressing, the block layout, the rolling
-// counters, the per-frame timeline and the texture still have to be *measurable* without a delivery
-// claim - `native/tests/vt_clipmap_atlas` and `native/tests/vt_clipmap_load` are nothing but those
-// readings. What the two organisations answer together is the load question: a ring publishes a whole
-// `size x size` layer per movement, an atlas publishes the block rects that changed, and the two are
-// measured side by side by one script.
-bool Terrain3D::has_vt_clipmap_atlas() const {
-	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		if (_vt.clipmap_atlas[group] != nullptr) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool Terrain3D::_setup_vt_clipmap_atlas(const TerrainVT::ChannelGroup p_group) {
-	if (_data == nullptr) {
+	Terrain3DClipmapLayer::Settings settings = _clipmap_settings();
+	// The channel's shape is the channel's: a source declares how many scalars a texel holds, what one
+	// value's format is, and what a producer bakes out of those texels. Asking for it *before* the
+	// build is what makes the shape travel with the channel rather than being written here - and it is
+	// the same question whichever implementation ends up answering.
+	const int existing = _vt.clipmap_layer[index]->get_source_channel_count();
+	const Image::Format existing_format = _vt.clipmap_layer[index]->get_source_format();
+	const int existing_baked = _vt.clipmap_layer[index]->get_source_baked_channel_count();
+	const Image::Format existing_baked_format = _vt.clipmap_layer[index]->get_source_baked_format();
+	settings.shape.channels = existing;
+	settings.shape.format = existing_format;
+	settings.shape.baked_channels = existing_baked;
+	settings.shape.baked_format = existing_baked_format;
+	if (!_vt.clipmap_layer[index]->configure(settings)) {
+		// The matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`), so this
+		// branch is reached by `debug_update_vt_clipmap()` asking for a channel no source carries, or by
+		// an implementation the shape cannot build. It says so per call and per group rather than
+		// handing back a layer nothing could produce.
+		LOG(WARN, "Clipmap has no source for the ", TerrainVT::group_channel_name(p_group),
+				" channel in this build; it stays direct.");
 		return false;
 	}
-	const int index = int(p_group);
-	if (_vt.clipmap_atlas[index] == nullptr) {
-		std::unique_ptr<Terrain3DClipmapSource> source = _make_clipmap_source(p_group);
-		if (source == nullptr) {
-			return false;
-		}
-		LOG(DEBUG, "Creating ", source->get_source_name(), " clipmap atlas");
-		_vt.clipmap_atlas[index] = std::make_unique<Terrain3DClipmapAtlas>(std::move(source));
-	}
-	Terrain3DClipmapAtlas::Config config;
-	// The block is `clipmap_size` texels of `clipmap_base_world` metres, so ring `r`'s block is
-	// `clipmap_size >> r` texels of the *same* world size: the density ladder the ring's levels have,
-	// with the shells nested instead of laid over each other. The settings that shape a ring shape an
-	// atlas the same way, so a user who tuned one has tuned the other.
-	config.block_size = _vt.clipmap_size;
-	config.rings = CLAMP(_vt.clipmap_atlas_rings, 1, Terrain3DClipmapAtlas::MAX_RINGS);
-	config.base_world = _vt.clipmap_base_world;
-	config.channels = _vt.clipmap_atlas[index]->get_source_channel_count();
-	config.format = _vt.clipmap_atlas[index]->get_source_format();
-	config.global_texels = _vt.clipmap_atlas_global_texels;
-	config.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
-	_vt.clipmap_atlas[index]->configure(config);
-	// The atlas's channel carries the same baked layers the ring's does, and the bake reads the
-	// surface material list - which the page path publishes and a configuration whose material group
-	// takes no page never does. The same one-time publication the ring makes, for the same reason.
-	if (_vt.clipmap_atlas[index]->get_source_baked_channel_count() > 0 && !_vt.vt_materials_published) {
+	// The producer bakes out of the layer's texels, so the bake needs the surface *material list* -
+	// which the page path publishes and a configuration whose material group takes no page never does.
+	// The same one-time publication the ring made, for the same reason: this runs on every write to
+	// the matrix, and asking for the list again is not free (the service answers a publish by telling
+	// every layer its baked content is stale).
+	if (settings.shape.baked_channels > 0 && !_vt.vt_materials_published) {
 		_vt.vt_materials_dirty = true;
 		_vt.vt_materials_published = true;
 	}
 	return true;
 }
 
-// The atlas's own arm: the rect array, the per-cell current-frame index, the per-ring start point and
-// phase, and the grid's shape. The shader's copy of the block addressing has to be the *same* numbers
-// the CPU's is, so the two are one publish - the same rule the ring's arm follows.
-Dictionary Terrain3D::get_vt_clipmap_atlas_arm(const int p_group) const {
-	Dictionary arm;
-	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
-		return arm;
+// Whether any layer object exists. Read by the layer's debug view, its native preview and the report:
+// the gate is "is there a layer to draw", not "does a cell name the method", because a build that
+// cannot deliver Clipmap still has the mechanism - built by `debug_update_vt_clipmap()` - and a layer
+// that exists is what a picture of one is a picture of.
+bool Terrain3D::has_vt_clipmap_layer() const {
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		if (_vt.clipmap_layer[group] != nullptr) {
+			return true;
+		}
 	}
-	const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
-	if (atlas == nullptr || !atlas->is_configured()) {
-		return arm;
-	}
-	const int rings = atlas->get_rings();
-	const int cells = atlas->get_cell_count();
-	const int slots = atlas->get_slot_count();
-	PackedVector2Array starts;
-	PackedVector4Array rects;
-	PackedInt32Array cell_slots;
-	PackedVector2Array cell_offsets;
-	PackedFloat32Array cell_current;
-	PackedFloat32Array cell_baked;
-	starts.resize(rings);
-	rects.resize(slots);
-	cell_slots.resize(cells);
-	cell_offsets.resize(cells);
-	cell_current.resize(cells);
-	cell_baked.resize(cells);
-	for (int ring = 0; ring < rings; ring++) {
-		// The *block* start point, not the texel-snapped grid origin: `cell_for_world()` and
-		// `sample()` measure a block coordinate from the start, and publishing the grid origin would
-		// put the shader's blocks up to half a block away from the CPU's at a boundary.
-		starts[ring] = atlas->get_ring_start(ring);
-	}
-	for (int slot = 0; slot < slots; slot++) {
-		const Rect2i rect = atlas->get_slot_rect(slot);
-		rects[slot] = Vector4(real_t(rect.position.x), real_t(rect.position.y),
-				real_t(rect.size.x), real_t(rect.size.y));
-	}
-	for (int cell = 0; cell < cells; cell++) {
-		cell_slots[cell] = atlas->get_cell_slot(cell);
-		const Vector2i offset = atlas->get_cell_offset(cell);
-		cell_offsets[cell] = Vector2(real_t(offset.x), real_t(offset.y));
-		cell_current[cell] = atlas->is_cell_current(cell) ? 1.f : 0.f;
-		// The *baked* readiness, which is the material arm's gate: a cell whose source is current but
-		// whose baked rect no dispatch has covered must fall back, not sample a rect nobody wrote.
-		cell_baked[cell] = atlas->is_cell_baked(cell) ? 1.f : 0.f;
-	}
-	arm["configured"] = true;
-	arm["texture"] = atlas->get_texture_rid();
-	arm["block_size"] = atlas->get_config().block_size;
-	arm["block_world"] = atlas->get_config().base_world;
-	arm["rings"] = rings;
-	arm["grid_side"] = atlas->get_config().rings * 2 + 1;
-	arm["cells"] = cells;
-	arm["slots"] = slots;
-	arm["channels"] = atlas->get_channel_count();
-	arm["width"] = atlas->get_atlas_width();
-	arm["height"] = atlas->get_atlas_height();
-	arm["starts"] = starts;
-	arm["rects"] = rects;
-	arm["cell_slots"] = cell_slots;
-	arm["cell_offsets"] = cell_offsets;
-	arm["cell_current"] = cell_current;
-	arm["cell_baked"] = cell_baked;
-	arm["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
-	// The atlas's three *baked* arrays, when its channel declares them: what the material arm samples
-	// where a block is baked. An atlas whose channel declares none publishes none, and the arm's
-	// names are bound to the dummy array instead - the rule the ring's arm follows.
-	if (atlas->get_baked_channel_count() >= 3) {
-		arm["baked_albedo"] = atlas->get_baked_texture_rid(0);
-		arm["baked_normal"] = atlas->get_baked_texture_rid(1);
-		arm["baked_params"] = atlas->get_baked_texture_rid(2);
-	}
-	return arm;
-}
-
-// The atlas's rolling evidence, read straight off the mechanism: how many blocks a scroll loaded and
-// how many cells kept their content. It is published rather than kept local because "only the edge
-// reloads" is a claim the acceptance asks to see as a number. One writer, so the tick's phase and the
-// mechanism's own entry below publish the same counters.
-void Terrain3D::_publish_clipmap_atlas_readings(const Terrain3DClipmapAtlas *p_atlas) {
-	if (p_atlas == nullptr) {
-		_vt.clipmap_atlas_block_uploads = 0;
-		_vt.clipmap_atlas_scroll_events = 0;
-		_vt.clipmap_atlas_blocks_loaded = 0;
-		_vt.clipmap_atlas_blocks_retained = 0;
-		return;
-	}
-	_vt.clipmap_atlas_block_uploads = int64_t(p_atlas->get_block_uploads());
-	_vt.clipmap_atlas_scroll_events = int64_t(p_atlas->get_scroll_events());
-	_vt.clipmap_atlas_blocks_loaded = int64_t(p_atlas->get_edge_blocks_loaded());
-	_vt.clipmap_atlas_blocks_retained = int64_t(p_atlas->get_interior_blocks_retained());
-}
-
-// The mechanism's own entry, beside `debug_update_vt_clipmap()` and the same shape: the same focus
-// (`get_clipmap_target_position()`), the same `vt_clipmap_budget_texels`, and the same two published
-// numbers, so a panel or a test reads the atlas through the one report either way. The tick's phase
-// runs the identical call while a cell selects the method; this stays as the door a reading takes the
-// mechanism through *without* a delivery claim, which is how `native/tests/vt_clipmap_atlas` isolates
-// the addressing from the arm.
-int Terrain3D::debug_update_vt_clipmap_atlas(const int p_group) {
-	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
-		return -1;
-	}
-	if (!_setup_vt_clipmap_atlas(TerrainVT::ChannelGroup(p_group))) {
-		_vt.clipmap_atlas_produced_texels = 0;
-		return -1;
-	}
-	Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
-	if (atlas == nullptr) {
-		_vt.clipmap_atlas_produced_texels = 0;
-		return -1;
-	}
-	const Vector2 focus = v3v2(get_clipmap_target_position());
-	_vt.clipmap_atlas_produced_texels = atlas->update(focus, _vt.clipmap_budget_texels);
-	_publish_clipmap_atlas_readings(atlas);
-	// The tests drive the mechanism through this entry, so the bake is offered here too: an atlas
-	// whose rects are never offered to a producer reports `baked` false for the rest of the session.
-	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-		baker->queue_clipmap_atlas(atlas, _vt.clipmap_budget_texels);
-	}
-	return _vt.clipmap_atlas_produced_texels;
-}
-
-// Whether any atlas exists, for the debug view's gate: the same rule the ring's gate follows, so a
-// picture of an atlas is a picture of an object that exists rather than of a selection.
-bool Terrain3D::clipmap_atlas_available() const {
-	return has_vt_clipmap_atlas();
-}
-
-// The debug view's payload for the atlas: the layout the packer chose, the ring/block counts, every
-// rect, and every cell's current-frame index - the user's "the debug should show the atlas's region".
-Dictionary Terrain3D::get_clipmap_atlas_layout(const int p_group) const {
-	Dictionary result;
-	_vt.clipmap_atlas_preview_calls++;
-	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
-		return result;
-	}
-	const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[p_group].get();
-	if (atlas == nullptr || !atlas->is_configured()) {
-		return result;
-	}
-	_vt.clipmap_atlas_preview_computed++;
-	result["group"] = String(TerrainVT::group_name(TerrainVT::ChannelGroup(p_group)));
-	result["source"] = atlas->get_source_name();
-	result["focus"] = atlas->get_focus();
-	result["produced_texels"] = int64_t(atlas->get_produced_texels());
-	result["upload_bytes"] = int64_t(atlas->get_upload_bytes());
-	result["block_uploads"] = int64_t(atlas->get_block_uploads());
-	result["pending_jobs"] = atlas->get_pending_jobs();
-	result["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
-	int baked_cells = 0;
-	for (int cell = 0; cell < atlas->get_cell_count(); cell++) {
-		baked_cells += atlas->is_cell_baked(cell) ? 1 : 0;
-	}
-	result["baked_cells"] = baked_cells;
-	result["rings"] = atlas->get_ring_reports();
-	result["layout"] = atlas->get_layout_report();
-	result["timeline"] = atlas->get_load_timeline();
-	result["scroll_events"] = int64_t(atlas->get_scroll_events());
-	result["blocks_loaded"] = int64_t(atlas->get_edge_blocks_loaded());
-	result["blocks_retained"] = int64_t(atlas->get_interior_blocks_retained());
-	result["last_scroll_loaded"] = int64_t(atlas->get_last_scroll_loaded());
-	result["last_scroll_retained"] = int64_t(atlas->get_last_scroll_retained());
-	result["state_stamp"] = int64_t(atlas->get_state_stamp());
-	return result;
+	return false;
 }
 
 void Terrain3D::set_vt_clipmap_size(const int p_size) {
-	// 0 is refused rather than clamped: a ring with no texels an axis is not a small clipmap, it is
+	// 0 is refused rather than clamped: a layer with no texels an axis is not a small clipmap, it is
 	// not a clipmap, and the setter should not accept a shape the mechanism cannot build.
 	if (p_size <= 0 || p_size == _vt.clipmap_size) {
 		return;
@@ -988,10 +758,10 @@ void Terrain3D::set_vt_clipmap_size(const int p_size) {
 }
 
 void Terrain3D::set_vt_clipmap_levels(const int p_levels) {
-	if (p_levels <= 0 || p_levels == _vt.clipmap_levels) {
+	if (p_levels <= 0 || p_levels == _vt.clipmap_units) {
 		return;
 	}
-	_vt.clipmap_levels = p_levels;
+	_vt.clipmap_units = p_levels;
 	_resolve_vt_delivery(false);
 }
 
@@ -1003,31 +773,41 @@ void Terrain3D::set_vt_clipmap_base_world(const real_t p_metres) {
 	_resolve_vt_delivery(false);
 }
 
+// The implementation switch. It goes through the assembly rule like every other shape write, so the
+// storage is replaced - the old implementation is freed and the new one configured in the same call -
+// and the shader's arm and the material's uniforms are rebuilt because the addressing changed shape.
+void Terrain3D::set_vt_clipmap_implementation(const int p_implementation) {
+	if (!TerrainClipmap::is_valid_implementation(p_implementation)) {
+		LOG(WARN, "Clipmap implementation ", p_implementation, " is not one of ", TerrainClipmap::implementation_hint(),
+				"; it stays ", TerrainClipmap::implementation_name(_vt.clipmap_implementation), ".");
+		return;
+	}
+	const TerrainClipmap::Implementation wanted = TerrainClipmap::implementation_from_int(p_implementation);
+	if (wanted == _vt.clipmap_implementation) {
+		return;
+	}
+	LOG(INFO, "Clipmap implementation ", TerrainClipmap::implementation_name(_vt.clipmap_implementation), " -> ",
+			TerrainClipmap::implementation_name(wanted));
+	_vt.clipmap_implementation = wanted;
+	_resolve_vt_delivery(true);
+}
+
 void Terrain3D::set_vt_clipmap_budget_texels(const int p_texels) {
-	// The budget is not a shape: a ring keeps its content when it changes, and 0 is a legal "produce
-	// nothing this tick" that a test uses to hold the ring still.
+	// The budget is not a shape: a layer keeps its content when it changes, and 0 is a legal "produce
+	// nothing this tick" that a test uses to hold the layer still.
 	_vt.clipmap_budget_texels = MAX(0, p_texels);
 }
 
-// The three atlas settings. None of them is a delivery: the atlas is built and driven through
-// `debug_update_vt_clipmap_atlas()`, so a write here is a *shape* write and the next reading picks it
-// up. `rings` and `global_texels` are clamped by `configure()`, so a value outside the structure the
-// header states is refused there with a log rather than accepted and mis-laid-out.
-void Terrain3D::set_vt_clipmap_atlas_rings(const int p_rings) {
-	if (p_rings <= 0) {
-		return;
-	}
-	_vt.clipmap_atlas_rings = p_rings;
-}
-
-void Terrain3D::set_vt_clipmap_atlas_global_texels(const int p_texels) {
+// The Atlas implementation's two settings. Neither is a delivery: they are fields of the layer's shape
+// and the next resolve picks them up, exactly as `size` and `base_world` are.
+void Terrain3D::set_vt_clipmap_global_texels(const int p_texels) {
 	if (p_texels <= 0) {
 		return;
 	}
 	_vt.clipmap_atlas_global_texels = p_texels;
 }
 
-void Terrain3D::set_vt_clipmap_atlas_blocks_per_frame(const int p_blocks) {
+void Terrain3D::set_vt_clipmap_blocks_per_frame(const int p_blocks) {
 	// 0 is refused rather than clamped: a per-frame bound of zero is a mechanism that never loads.
 	if (p_blocks <= 0) {
 		return;
@@ -1035,133 +815,69 @@ void Terrain3D::set_vt_clipmap_atlas_blocks_per_frame(const int p_blocks) {
 	_vt.clipmap_atlas_blocks_per_frame = p_blocks;
 }
 
+// The layer's stored value at a world position, through the layer's own addressing - the same ladder
+// and the same offset the shader arm samples with, whichever implementation is selected.
 real_t Terrain3D::sample_vt_clipmap(const int p_group, const Vector2 &p_world_xz, const int p_channel) const {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
 		return NAN;
 	}
-	const Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
-	return ring != nullptr ? ring->sample(p_world_xz, p_channel) : NAN;
+	const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	return layer != nullptr ? layer->sample(p_world_xz, p_channel) : NAN;
 }
 
-// The height arm's binding, and the reason it is one dictionary rather than five accessors: the
-// shader's copy of the ring's addressing has to be the *same* numbers the CPU's is, and the two are
-// one publish. `centers` and `rings` are the per-level state the shader indexes with, `valid` is the
-// gate that keeps a level which is not current out of a fragment, and the shape is the level rule
-// (`base_world * 2^l` metres in `size` texels).
-//
-// Padded to `Terrain3DClipmap::MAX_LEVELS`, which is the shader's declared array size: Godot's
-// uniform arrays are read at their declared length, so a shorter binding leaves the tail undefined,
-// and `levels` is what tells a reader how many entries are meaningful. Not published in
-// `get_vt_settings()`: the dock and the tests read it from here, and the settings dictionary already
-// carries the same state per level (`clipmap[group].level_reports[]`).
-Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
-	Dictionary arm;
+// The density a fragment is served at a world point, in texels a metre. It is the *shared ladder's*
+// reciprocal and the layer answers it for either implementation, which is what makes the acceptance's
+// "density - distance" curve a reading of the delivery rather than of a storage layout.
+real_t Terrain3D::sample_vt_clipmap_density(const int p_group, const Vector2 &p_world_xz) const {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
-		return arm;
+		return 0.f;
 	}
-	const Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
-	if (ring == nullptr || !ring->is_configured()) {
-		return arm;
-	}
-	const int levels = ring->get_level_count();
-	PackedVector2Array centers;
-	PackedVector2Array rings;
-	PackedFloat32Array valid;
-	PackedVector4Array outstanding;
-	PackedInt32Array outstanding_counts;
-	centers.resize(Terrain3DClipmap::MAX_LEVELS);
-	rings.resize(Terrain3DClipmap::MAX_LEVELS);
-	valid.resize(Terrain3DClipmap::MAX_LEVELS);
-	outstanding_counts.resize(Terrain3DClipmap::MAX_LEVELS);
-	// One entry per level per rect, in the shape the shader's table has, so the arm's per-tap gate is a
-	// lookup rather than a search: the rects of *stored* texels a reader must not serve from the baked
-	// layers right now (un-baked, or still being produced). A level with nothing outstanding publishes
-	// zeroes and a count of zero, and an unused entry stays zero as well.
-	outstanding.resize(Terrain3DClipmap::MAX_LEVELS * Terrain3DClipmap::MAX_OUTSTANDING_RECTS);
-	for (int level = 0; level < levels; level++) {
-		const Terrain3DClipmap::Level &entry = ring->get_level(level);
-		centers[level] = entry.center;
-		rings[level] = Vector2(real_t(entry.ring.x), real_t(entry.ring.y));
-		valid[level] = entry.valid ? 1.f : 0.f;
-		Terrain3DClipmap::BakeRect rects[Terrain3DClipmap::MAX_OUTSTANDING_RECTS];
-		const int count = ring->get_outstanding_rects(level, rects,
-				Terrain3DClipmap::MAX_OUTSTANDING_RECTS);
-		outstanding_counts[level] = count;
-		for (int index = 0; index < count; index++) {
-			outstanding[level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + index] = Vector4(
-					real_t(rects[index].x0), real_t(rects[index].y0), real_t(rects[index].x1),
-					real_t(rects[index].y1));
-		}
-	}
-	arm["configured"] = true;
-	arm["texture"] = ring->get_texture_rid();
-	arm["size"] = ring->get_size();
-	arm["levels"] = levels;
-	arm["base_world"] = ring->get_base_world();
-	arm["channels"] = ring->get_channel_count();
-	arm["centers"] = centers;
-	arm["rings"] = rings;
-	arm["valid"] = valid;
-	arm["outstanding"] = outstanding;
-	arm["outstanding_counts"] = outstanding_counts;
-	// The arrays a producer bakes out of the ring's own texels, when the channel declares them: what
-	// the material arm samples where a level is baked, one layer per level. A ring whose channel
-	// declares none publishes none, and the arm's names are bound to the dummy array instead - the
-	// rule the atlas above follows.
-	if (ring->get_baked_channel_count() >= 3) {
-		arm["baked_albedo"] = ring->get_baked_texture_rid(0);
-		arm["baked_normal"] = ring->get_baked_texture_rid(1);
-		arm["baked_params"] = ring->get_baked_texture_rid(2);
-	}
-	return arm;
+	const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	return layer != nullptr ? layer->get_density_at(p_world_xz) : 0.f;
 }
 
-// An edit reached the source. Every ring that carries a channel the edit can change re-produces the
-// texels the area covers and stops serving the levels that touch it until they have, so a fragment
-// reads the region array for those few ticks instead of a height from before the stroke. Only a ring
-// that exists is told: a group with no ring has nothing that could be stale.
+// The material's arm binding, and the reason it is one dictionary rather than five accessors: the
+// shader's copy of the layer's addressing has to be the *same* numbers the CPU's is, and the two are
+// one publish. The selected implementation fills the dictionary in its own uniform names and stamps
+// `implementation`, so this is a forward and the binding above it is one path.
+Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return Dictionary();
+	}
+	const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	return layer != nullptr ? layer->get_arm() : Dictionary();
+}
+
+// An edit reached the source. Every layer that carries a channel the edit can change re-produces the
+// texels the area covers and stops serving the units that touch it until they have, so a fragment
+// reads the region array for those few ticks instead of a height from before the stroke. Only a layer
+// that exists is told: a group with none has nothing that could be stale.
 int Terrain3D::invalidate_vt_clipmap_area(const AABB &p_area) {
 	const Vector2 origin(p_area.position.x, p_area.position.z);
 	const Rect2 rect(origin, Vector2(p_area.size.x, p_area.size.z));
 	int queued = 0;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		Terrain3DClipmap *ring = _vt.clipmap[group].get();
-		if (ring != nullptr) {
-			queued += ring->invalidate_rect(rect);
-		}
-		Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
-		if (atlas != nullptr) {
-			// The atlas is the same layer's other residency unit: a block the edit touches stops
-			// being current and is re-produced, which is the block-granular invalidation the
-			// mechanism exists for. Its baked rect follows the re-production automatically.
-			queued += atlas->invalidate_rect(rect);
+		Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+		if (layer != nullptr) {
+			queued += layer->invalidate_rect(rect);
 		}
 	}
-	// The levels that stopped being current are the shader's gate, and the gate is a uniform: without
-	// this the ring would keep serving the height it held before the stroke.
+	// The units that stopped being current are the shader's gate, and the gate is a uniform: without
+	// this the layer would keep serving the height it held before the stroke.
 	_update_vt_clipmap_arm();
 	return queued;
 }
 
-// Whether any ring's addressing moved since the shader was bound with it, and the rebind that
-// follows. Both halves are the ring's own state rather than a copy kept here, so a ring that was
-// freed and rebuilt is a change like any other.
+// Whether any layer's addressing moved since the shader was bound with it, and the rebind that
+// follows. The stamp is the layer's own state rather than a copy kept here, so a layer that was freed
+// and rebuilt is a change like any other - and a switch of implementation is one by construction.
 bool Terrain3D::_vt_clipmap_state_changed() {
 	bool changed = false;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
-		const uint64_t stamp = ring != nullptr ? ring->get_state_stamp() : 0;
+		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+		const uint64_t stamp = layer != nullptr ? layer->get_state_stamp() : 0;
 		if (stamp != _vt.clipmap_state[group]) {
 			_vt.clipmap_state[group] = stamp;
-			changed = true;
-		}
-		// The atlas's addressing is the shader's other copy of the same layer, so a block that
-		// relabelled, turned its phase or changed which cell is current is a rebind of its own. The
-		// two stamps are compared in one pass because one rebind publishes both tables.
-		const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
-		const uint64_t atlas_stamp = atlas != nullptr ? atlas->get_state_stamp() : 0;
-		if (atlas_stamp != _vt.clipmap_atlas_state[group]) {
-			_vt.clipmap_atlas_state[group] = atlas_stamp;
 			changed = true;
 		}
 	}
@@ -1180,13 +896,12 @@ void Terrain3D::_update_vt_clipmap_arm() {
 // The mechanism's own entry, beside the read above, and the reason it exists: a group with no source
 // this build cannot deliver has no matrix door (`is_vt_delivery_supported()` reads
 // `has_clipmap_source()`), so no cell can name the method and the tick never enters its phase for it.
-// The ring's addressing, strips, budget and content still have to be measurable - `native/tests/vt_clipmap`
-// is nothing but those readings - so this runs exactly what that phase runs: the same
-// `Terrain3DClipmap::update()`, with the same focus (`get_clipmap_target_position()`) and the same
-// `vt_clipmap_budget_texels`, over the rings the caller names rather than the rings a cell selected.
-// It publishes the same two numbers the phase publishes, so a panel or a test reads the mechanism
-// through the one report either way, and it is also how a ring is built for a group a cell *may* name
-// but does not (the mechanism's own tests drive every cell `Direct`).
+// The layer's addressing, units, budget and content still have to be measurable -
+// `native/tests/vt_clipmap` and `native/tests/vt_clipmap_atlas` are nothing but those readings - so
+// this runs exactly what that phase runs: the same `update()`, with the same focus
+// (`get_clipmap_target_position()`) and the same `vt_clipmap_budget_texels`, over the layers the
+// caller names rather than the layers a cell selected. **It drives whichever implementation is
+// selected**, which is how the two are measured side by side by one script on one build.
 //
 // A reading taken here is the mechanism's and not a render's.
 int Terrain3D::debug_update_vt_clipmap(const int p_group) {
@@ -1197,59 +912,33 @@ int Terrain3D::debug_update_vt_clipmap(const int p_group) {
 		_vt.clipmap_produced_texels = 0;
 		return -1;
 	}
-	Terrain3DClipmap *ring = _vt.clipmap[p_group].get();
-	if (ring == nullptr) {
+	Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	if (layer == nullptr) {
 		_vt.clipmap_produced_texels = 0;
 		return -1;
 	}
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	const Vector2 focus = v3v2(get_clipmap_target_position());
-	_vt.clipmap_produced_texels = ring->update(focus, _vt.clipmap_budget_texels);
-	// The tests drive the ring through this entry, so the bake is offered here too: a ring whose rects
-	// are never offered to a producer reports `baked` false for the rest of the session, which is a
-	// state only a caller that forgot the offer can produce.
+	_vt.clipmap_produced_texels = layer->update(focus, _vt.clipmap_budget_texels);
+	// The tests drive the layer through this entry, so the bake is offered here too: a layer whose
+	// rects are never offered to a producer reports `baked` false for the rest of the session, which is
+	// a state only a caller that forgot the offer can produce.
 	if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-		baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
+		baker->queue_clipmap_layer(layer, _vt.clipmap_budget_texels);
 	}
 	_vt.vt_clipmap_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
-	// The same rebind the tick's phase does, so a ring a test or the dock drove with this entry is
-	// the ring the shader reads.
+	// The same rebind the tick's phase does, so a layer a test or the dock drove with this entry is
+	// the layer the shader reads.
 	_update_vt_clipmap_arm();
 	return _vt.clipmap_produced_texels;
 }
-
-///////////////////////////
-// The material group's detail layer
-///////////////////////////
-//
-// A sparse, demand-resident layer of fine tiles over the coarse ring, and the only path to the 1024
-// texels/m the near material field is measured at. The mechanism is
-// `Terrain3DMaterialClipmapDetail`; this is its one owner on the node: the lifetime, the settings,
-// the demand view built from the camera, the tick hook, and the arm the material binds.
-//
-// **Why it is a layer and not a denser ring.** The ring is one dense level per octave, so its finest
-// level covers `base_world` metres: making that 1024 texels/m with a 256-texel axis would cover
-// 0.25 m, and the 1.6 m probe would fall several levels up - the ring's low density is a *shape*
-// property, not a setting that is merely set too coarse. The detail layer spends its bytes where the
-// screen footprint asks for them, keeps the ring's complete coverage and fallback underneath, and
-// owns nothing when the material group does not select Clipmap.
-//
-// **Selection.** `_setup_vt_material_detail()` is the one owner of the layer's lifetime and is called
-// from the assembly rule (so a cell write creates or frees it with the ring) and from every setting
-// setter. `_update_vt_material_detail()` is the tick, called from `terrain_3d.cpp`'s clipmap phase -
-// the one production pass every tick a cell selects `Clipmap` runs - where the ring's production and
-// its bake offer already live; it builds the screen-footprint demand view from the live camera, runs
-// the layer's update, and offers the layers' landed tiles to the producer. Its outstanding work is
-// counted by `_vt_has_streaming_work()` so a still-baking tile keeps the editor drawing.
-
 bool Terrain3D::_setup_vt_material_detail() {
 	// On exactly while the material group is delivered by the ring *and* the switch is on. The ring
 	// must exist too, because it is the layer's fallback: a detail tile that cannot be baked is
 	// served by the ring's coarse level, and without the ring the fragment would have nothing
 	// between the tile and the region array.
 	const bool wanted = _vt.detail_enabled && _data != nullptr &&
-			(_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap) ||
-					_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::ClipmapAtlas));
+			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
 	if (!wanted) {
 		if (_vt.material_detail != nullptr) {
 			// The producer holds a descriptor set that names this layer's textures and this bundle's

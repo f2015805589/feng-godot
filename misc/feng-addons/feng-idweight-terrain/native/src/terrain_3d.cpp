@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+﻿// Copyright 漏 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 // Terrain3D, part 1 of 3: the node, its lifecycle and its frame schedule.
 
@@ -243,81 +243,60 @@ void Terrain3D::__physics_process(const double p_delta) {
 		TerrainProfileZone zone(p_name);
 		p_body();
 	};
-	// The rings run first, and only when a cell selects the method. They are the only production that
-	// does not go through the shared pool, so they are outside the demand block below, and running
-	// them before the service phase means the service publishes a ring's texture in the same tick the
-	// ring produced into it. **A configuration with no cell on `Clipmap` does not enter this at all**:
-	// no focus read, no group scan, no phase - the same rule the two demand passes follow, so a
-	// method nobody selected costs nothing rather than costing a check. A ring is entered only while
-	// a cell still selects it: the object staying (a deselection stops a service rather than freeing
-	// it) is not a reason to spend its budget.
-	if (has_clipmap_layer_delivery()) {
+	// The clipmap layers run first, and only when a cell selects the method. They are the only
+	// production that does not go through the shared pool, so they are outside the demand block below,
+	// and running them before the service phase means the service publishes a layer's texture in the
+	// same tick the layer produced into it. **A configuration with no cell on `Clipmap` does not enter
+	// this at all**: no focus read, no group scan, no phase - the same rule the two demand passes
+	// follow, so a method nobody selected costs nothing rather than costing a check. A layer is entered
+	// only while a cell still selects it: the object staying (a deselection stops a service rather than
+	// freeing it) is not a reason to spend its budget.
+	//
+	// Which *implementation* answers is the layer's own setting (`vt_clipmap_implementation`), so this
+	// phase is written once: the same `update()`, the same bake offer, the same readings, whether the
+	// storage behind it is the toroidal level ring or the block atlas.
+	if (has_clipmap_delivery()) {
 		traced("vt_clipmap", [&] {
 			_vt.clipmap_produced_texels = 0;
-			_vt.clipmap_atlas_produced_texels = 0;
 			const Vector2 focus = v3v2(get_clipmap_target_position());
 			for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 				const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
-				Terrain3DClipmap *ring = _vt.clipmap[group].get();
-				if (ring == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
-					ring = nullptr;
-				}
-				Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
-				if (atlas == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::ClipmapAtlas)) {
-					atlas = nullptr;
-				}
-				if (ring == nullptr && atlas == nullptr) {
+				Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+				if (layer == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
 					continue;
 				}
-				if (ring != nullptr) {
-					_vt.clipmap_produced_texels += ring->update(focus, _vt.clipmap_budget_texels);
-				}
-				if (atlas != nullptr) {
-					// The block atlas is the same layer's other residency unit: the same focus, the
-					// same budget, the same per-group object. It produces block rects where the ring
-					// produces a whole level, and it publishes its own counters through the same
-					// `_publish_clipmap_atlas_readings()` the mechanism's entry uses.
-					_vt.clipmap_atlas_produced_texels =
-							atlas->update(focus, _vt.clipmap_budget_texels);
-					_publish_clipmap_atlas_readings(atlas);
-				}
+				_vt.clipmap_produced_texels += layer->update(focus, _vt.clipmap_budget_texels);
 				// And whatever a producer bakes out of what the layer produced - the *rects* it
-				// produced, offered under the same budget they were produced under. The ring and the
-				// atlas carry the layers, the bake belongs to the shader's owner, and this is where
-				// the two meet: a channel that declares no baked layers answers without touching the
-				// device, and one that does has its rects dispatched by the next render callback,
-				// reported back a call later (`Terrain3DSurfaceBaker::queue_clipmap_ring()` and
-				// `queue_clipmap_atlas()`).
+				// produced, offered under the same budget they were produced under. The layer carries
+				// the storage, the bake belongs to the shader's owner, and this is where the two meet:
+				// a channel that declares no baked layers answers without touching the device, and one
+				// that does has its rects dispatched by the next render callback, reported back a call
+				// later (`Terrain3DSurfaceBaker::queue_clipmap_layer()`).
 				if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-					if (ring != nullptr) {
-						baker->queue_clipmap_ring(ring, _vt.clipmap_budget_texels);
-					}
-					if (atlas != nullptr) {
-						baker->queue_clipmap_atlas(atlas, _vt.clipmap_budget_texels);
-					}
+					baker->queue_clipmap_layer(layer, _vt.clipmap_budget_texels);
 				}
 			}
-			// The material group's detail layer is the ring's own finer half and it runs in this
-			// phase rather than beside it: the phase is the only production pass a cell that selects
-			// `Clipmap` is guaranteed, the layer exists while the material group is delivered by the
-			// ring, and a tick that runs nowhere else is what keeps the editor drawing for a tile
-			// whose source or bake is still in flight (`_vt_has_streaming_work()` is the other half).
-			// It early-returns when the layer was never created, so a height-only ring pays a null
-			// check and a group whose detail switch is off owns nothing.
+			// The material group's detail layer is the layer's own finer half and it runs in this phase
+			// rather than beside it: the phase is the only production pass a cell that selects `Clipmap`
+			// is guaranteed, the layer exists while the material group is delivered by the clipmap, and a
+			// tick that runs nowhere else is what keeps the editor drawing for a tile whose source or
+			// bake is still in flight (`_vt_has_streaming_work()` is the other half). It early-returns
+			// when the layer was never created, so a height-only layer pays a null check and a group
+			// whose detail switch is off owns nothing.
 			_update_vt_material_detail();
 		});
 		vt_phase(_vt.vt_clipmap_ms);
-		// A ring that moved a level, turned its ring or changed which levels are current is a uniform
-		// rebind: the shader's copy of the ring's addressing is stale from that moment, and serving it
-		// would read the texel a *previous* centre put under a world position. The stamp is the ring's
-		// own, so this is one comparison per ring on a tick that changed nothing.
+		// A layer that moved a unit, turned its offset or changed which units are current is a uniform
+		// rebind: the shader's copy of the layer's addressing is stale from that moment, and serving it
+		// would read the texel a *previous* origin put under a world position. The stamp is the layer's
+		// own, so this is one comparison per layer on a tick that changed nothing.
 		_update_vt_clipmap_arm();
 	} else {
 		_vt.clipmap_produced_texels = 0;
 		_vt.vt_clipmap_ms = 0.0;
-		// No group selects the ring, so the material detail layer - which is gated on exactly that -
-		// cannot be ticked here. Its phase reading is reset so a panel never shows the last tick's
-		// cost as this one's.
+		// No group selects the clipmap, so the material detail layer - which is gated on exactly that -
+		// cannot be ticked here. Its phase reading is reset so a panel never shows the last tick's cost
+		// as this one's.
 		_vt.vt_detail_ms = 0.0;
 	}
 	traced("vt_service", [&] { _update_vt_service(); });

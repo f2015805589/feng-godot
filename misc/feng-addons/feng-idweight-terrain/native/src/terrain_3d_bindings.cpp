@@ -108,40 +108,36 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_budget_texels", "texels"), &Terrain3D::set_vt_clipmap_budget_texels);
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_budget_texels"), &Terrain3D::get_vt_clipmap_budget_texels);
 	ClassDB::bind_method(D_METHOD("sample_vt_clipmap", "group", "world_xz", "channel"), &Terrain3D::sample_vt_clipmap, DEFVAL(0));
-	// Whether a ring object exists, which is what the ring's debug view and its native preview are
-	// gated on: a ring exists because a cell selected the method or because the entry below built one
+	// The density the layer serves at a world point, in texels a metre: the shared ladder's reciprocal,
+	// so the "density - distance" curve is one reading whichever implementation is selected.
+	ClassDB::bind_method(D_METHOD("sample_vt_clipmap_density", "group", "world_xz"), &Terrain3D::sample_vt_clipmap_density);
+	// **The implementation selector**: `LOD` is the toroidal level ring, `Atlas` the block atlas. There
+	// is one clipmap delivery and this is what a user picks inside it.
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_implementation", "implementation"), &Terrain3D::set_vt_clipmap_implementation);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_implementation"), &Terrain3D::get_vt_clipmap_implementation);
+	// Whether a layer object exists, which is what the layer's debug view and its native preview are
+	// gated on: a layer exists because a cell selected the method or because the entry below built one
 	// to measure the mechanism.
-	ClassDB::bind_method(D_METHOD("has_vt_clipmap_ring"), &Terrain3D::has_vt_clipmap_ring);
-	// The mechanism's own entry: build the group's ring if needed, run the phase the tick would run
-	// for it, and return the texels it produced (-1 when no ring can be built). The tick's own phase
-	// runs whenever a cell names the method, so this is the door a reading takes when it wants the
-	// mechanism with every cell `Direct`.
+	ClassDB::bind_method(D_METHOD("has_vt_clipmap_layer"), &Terrain3D::has_vt_clipmap_layer);
+	// The mechanism's own entry: build the group's layer if needed - with whichever implementation is
+	// selected - run the phase the tick would run for it, and return the texels it produced (-1 when no
+	// layer can be built). The tick's own phase runs whenever a cell names the method, so this is the
+	// door a reading takes when it wants the mechanism with every cell `Direct`.
 	ClassDB::bind_method(D_METHOD("debug_update_vt_clipmap", "group"), &Terrain3D::debug_update_vt_clipmap);
 	ClassDB::bind_method(D_METHOD("get_clipmap_layout_preview"), &Terrain3D::get_clipmap_layout_preview);
-	// The ring in the form the height arm is bound from: per-level centres, rings and validity, the
-	// level rule, and the texture the arm samples. The shader's copy of the ring's addressing and this
-	// one are the same numbers, so a test reads the arm's inputs rather than the shader's arithmetic.
+	// The layer in the form the material's arm is bound from, in the *selected* implementation's own
+	// uniform names. The shader's copy of the layer's addressing and this one are the same numbers, so
+	// a test reads the arm's inputs rather than the shader's arithmetic.
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_arm", "group"), &Terrain3D::get_vt_clipmap_arm);
 	// An edit changed the source under a world AABB. The one place every editor edit reports itself
 	// calls it, and it is public because a script that writes heights through the data API can.
 	ClassDB::bind_method(D_METHOD("invalidate_vt_clipmap_area", "area"), &Terrain3D::invalidate_vt_clipmap_area);
-	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
-	// A mechanism before it is a delivery, exactly as the ring was: the entry below builds it for a
-	// group and runs the phase the tick would run, and the layout payload is what the debug view draws
-	// instead of a ring's squares. The atlas is the answer to "a ring publishes a whole layer per
-	// movement, an atlas publishes the block rects that changed", so it is measured beside the ring by
-	// `native/tests/vt_clipmap_load` rather than claimed against it.
-	ClassDB::bind_method(D_METHOD("has_vt_clipmap_atlas"), &Terrain3D::has_vt_clipmap_atlas);
-	ClassDB::bind_method(D_METHOD("clipmap_atlas_available"), &Terrain3D::clipmap_atlas_available);
-	ClassDB::bind_method(D_METHOD("debug_update_vt_clipmap_atlas", "group"), &Terrain3D::debug_update_vt_clipmap_atlas);
-	ClassDB::bind_method(D_METHOD("get_clipmap_atlas_layout", "group"), &Terrain3D::get_clipmap_atlas_layout);
-	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_arm", "group"), &Terrain3D::get_vt_clipmap_atlas_arm);
-	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_rings", "rings"), &Terrain3D::set_vt_clipmap_atlas_rings);
-	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_rings"), &Terrain3D::get_vt_clipmap_atlas_rings);
-	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_global_texels", "texels"), &Terrain3D::set_vt_clipmap_atlas_global_texels);
-	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_global_texels"), &Terrain3D::get_vt_clipmap_atlas_global_texels);
-	ClassDB::bind_method(D_METHOD("set_vt_clipmap_atlas_blocks_per_frame", "blocks"), &Terrain3D::set_vt_clipmap_atlas_blocks_per_frame);
-	ClassDB::bind_method(D_METHOD("get_vt_clipmap_atlas_blocks_per_frame"), &Terrain3D::get_vt_clipmap_atlas_blocks_per_frame);
+	// The Atlas implementation's own settings, named after the *layer* because that is what they are:
+	// how many texels its one-time global block holds, and its per-frame production bound.
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_global_texels", "texels"), &Terrain3D::set_vt_clipmap_global_texels);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_global_texels"), &Terrain3D::get_vt_clipmap_global_texels);
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_blocks_per_frame", "blocks"), &Terrain3D::set_vt_clipmap_blocks_per_frame);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_blocks_per_frame"), &Terrain3D::get_vt_clipmap_blocks_per_frame);
 	// The material group's detail layer: the switch, the density target (1024 texels/m by default),
 	// the shape, the GPU budget the slot table is derived from, and the near-field reach. The layer
 	// exists only while the material group is delivered by `Clipmap`; `has_vt_detail_layer()` is
@@ -451,10 +447,10 @@ void Terrain3D::_bind_methods() {
 	// other; `Direct` is the pure region-array path and `Clipmap` the toroidal level ring. See
 	// docs/vt_delivery_assembly.md.
 	ADD_SUBGROUP("VT Setting", "vt_");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_near_material", "get_vt_delivery_near_material");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_near_height", "get_vt_delivery_near_height");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_far_material", "get_vt_delivery_far_material");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT,ClipmapAtlas"), "set_vt_delivery_far_height", "get_vt_delivery_far_height");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_material", "get_vt_delivery_near_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_near_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_near_height", "get_vt_delivery_near_height");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_material", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_material", "get_vt_delivery_far_material");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_delivery_far_height", PROPERTY_HINT_ENUM, "Direct,AVT,Clipmap,SVT"), "set_vt_delivery_far_height", "get_vt_delivery_far_height");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_size", PROPERTY_HINT_RANGE, "16,1024,16"), "set_vt_page_size", "get_vt_page_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_border", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_page_border", "get_vt_page_border");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_count", PROPERTY_HINT_RANGE, "8,1024,1"), "set_vt_page_count", "get_vt_page_count");
@@ -496,26 +492,35 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_fade_frames", PROPERTY_HINT_RANGE, "0,60,1"), "set_vt_page_fade_frames", "get_vt_page_fade_frames");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
-	// The ring's shape, its own subgroup between the settings that select it and the methods that
-	// share the page pool with it. `levels` above 12 is 4096 texels an axis on the coarsest level,
-	// which is already past what a terrain's own reach needs; the mechanism clamps to 16 and refuses
-	// a size it cannot build.
+	// The layer's shape, its own subgroup between the settings that select it and the methods that
+	// share the page pool with it. The three shape settings together are the density ladder: the
+	// shipped defaults are 256 texels an axis over a 0.25 m finest unit (1024 texels a metre) held for
+	// eleven units (down to 1 texel a metre). The mechanism's ceilings are 16 levels for the ring and
+	// 12 rings for the atlas, both above that span, and a shape it cannot build is refused.
 	ADD_SUBGROUP("Clipmap", "vt_clipmap_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_size", PROPERTY_HINT_RANGE, "8,4096,8"), "set_vt_clipmap_size", "get_vt_clipmap_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "1.0,4096.0,1.0"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
+	// The finest unit's world size. The inspector's lower bound has to admit the shipped default
+	// (`size / base_world` is the finest density, and 256 / 0.25 is the ladder's 1024 texels a metre),
+	// so a range that started at 1 m would silently clamp the ladder's own inner endpoint.
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "0.0625,4096.0,0.0625,or_greater"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
-	// The clipmap atlas's own three settings: the ring count, the one-time global block's resolution
-	// and the per-frame production bound. The atlas's block size and block world are the ring's own
-	// `vt_clipmap_size` and `vt_clipmap_base_world`, so the two mechanisms share one density ladder.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_rings", PROPERTY_HINT_RANGE, "1,4,1"), "set_vt_clipmap_atlas_rings", "get_vt_clipmap_atlas_rings");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_global_texels", PROPERTY_HINT_RANGE, "1,1024,1"), "set_vt_clipmap_atlas_global_texels", "get_vt_clipmap_atlas_global_texels");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_atlas_blocks_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_clipmap_atlas_blocks_per_frame", "get_vt_clipmap_atlas_blocks_per_frame");
+	// **The implementation selector**, and the whole of what used to be a second delivery. It sits in
+	// the clipmap settings because that is what it is: a choice of *how* the one clipmap delivery
+	// stores and uploads what it holds, not a second way to deliver a channel. The default is `LOD`,
+	// which is the shipped behaviour of an unset property.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_implementation", PROPERTY_HINT_ENUM, TerrainClipmap::implementation_hint()), "set_vt_clipmap_implementation", "get_vt_clipmap_implementation");
+	// The Atlas implementation's own two settings: the one-time global block's resolution and the
+	// per-frame production bound. Its block size, block world and ring count are the layer's own
+	// `vt_clipmap_size`, `vt_clipmap_base_world` and `vt_clipmap_levels`, so the two implementations
+	// share one density ladder and one shape.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_global_texels", PROPERTY_HINT_RANGE, "1,4096,1"), "set_vt_clipmap_global_texels", "get_vt_clipmap_global_texels");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_blocks_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_clipmap_blocks_per_frame", "get_vt_clipmap_blocks_per_frame");
 	// The material group's detail layer, under the Clipmap subgroup because that is what it is: the
-	// ring's own finer half, which exists only while the material group is delivered by the ring. The
-	// density target is the measurement the layer exists to make, so the inspector's lower bound is 1
-	// and the default 1024; the budget is the *whole* layer's GPU storage, and the slot table is
-	// derived from it. The reach is the near field the layer sharpens - beyond it the ring serves -
+	// layer's own finer half, which exists only while the material group is delivered by the clipmap.
+	// The density target is the measurement the layer exists to make, so the inspector's lower bound is
+	// 1 and the default 1024; the budget is the *whole* layer's GPU storage, and the slot table is
+	// derived from it. The reach is the near field the layer sharpens - beyond it the layer serves -
 	// and the directory size is how many tiles the shader's window holds an axis.
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_clipmap_detail_enabled"), "set_vt_detail_enabled", "is_vt_detail_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_density", PROPERTY_HINT_RANGE, "1.0,8192.0,1.0,or_greater"), "set_vt_detail_density", "get_vt_detail_density");

@@ -4,14 +4,15 @@
 #define TERRAIN3D_MATERIAL_CLIPMAP_DETAIL_H
 
 // The material group's *detail* layer: a sparse, demand-resident ring of small fine tiles that sits
-// between the camera and the coarse clipmap ring, and the only thing in the delivery matrix that can
-// reach the 1024 texels/m the near field is measured at.
+// between the camera and the ladder's coarser units, and the thing in the delivery matrix that holds
+// 1024 texels/m over the *near view* rather than inside one small square.
 //
-// **Why it is not a denser ring.** The coarse ring is one dense level per octave: making its finest
-// level 1024 texels/m with a 256-texel axis would cover 0.25 m, and a point 1.6 m ahead would fall to
-// level 3 or 4 - the same 64-128 texels/m it has today - while a single dense 4096-texel level over
-// the whole near field costs hundreds of MiB. The density has to be spent where a fragment actually
-// reads it, and that is a sparse set of tiles with a bounded pool, not a denser square.
+// **Why it is not a denser ladder.** The ladder is one dense unit per octave. Its finest unit is now a
+// real 1024 texels/m - 256 texels over 0.25 m since the 1024 -> 1 task - so a point 0.1 m from the
+// focus is served at 1024, but a point 1.6 m ahead falls to unit 4 or 5 and reads 64-128 texels/m: the
+// density falls off with distance by construction, and a single dense unit wide enough to cover the
+// near field at 1024 would be a 4096-texel square - hundreds of MiB. The detail layer exists to spend
+// the same density where a fragment actually reads it: a sparse set of tiles with a bounded pool.
 //
 // **What lives here, and what does not.** This class owns residency only: integer world tile keys
 // (`level + snapped tile X/Y`, so a world 10 km out addresses exactly like the origin), a fixed slot

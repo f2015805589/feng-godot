@@ -13,6 +13,10 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/math.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
+#include <godot_cpp/variant/packed_vector4_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 
@@ -84,7 +88,15 @@ String Terrain3DClipmap::get_source_name() const {
 void Terrain3DClipmap::configure(const Config &p_config) {
 	Config config = p_config;
 	config.size = CLAMP(config.size, CLIPMAP_MIN_SIZE, CLIPMAP_MAX_SIZE);
+	// The ceiling is a table size, not a preference: a ring past it has no shader array to live in.
+	// It is above the shipping ladder's eleven units, so this clamp cannot shorten 1024 -> 1 - but a
+	// request that *did* hit either end says so rather than quietly answering a shorter ladder.
+	const int requested_levels = config.levels;
 	config.levels = CLAMP(config.levels, 1, Terrain3DClipmap::MAX_LEVELS);
+	if (requested_levels != config.levels) {
+		LOG(WARN, "Clipmap levels ", requested_levels, " clamped to ", config.levels, " of ",
+				Terrain3DClipmap::MAX_LEVELS, " (", get_source_name(), ")");
+	}
 	config.base_world = MAX(real_t(0.001), config.base_world);
 	config.channels = CLAMP(config.channels, 1, CLIPMAP_MAX_CHANNELS);
 	if (config.format != Image::FORMAT_RF && config.format != Image::FORMAT_R8) {
@@ -650,7 +662,7 @@ void Terrain3DClipmap::_queue_stored_bake_rect(const int p_level, const int p_x0
 	// what takes the lease away again.
 	const uint64_t lease = take_bake_lease(p_level);
 	for (BakeRect &rect : _bake_rects) {
-		if (rect.level != p_level) {
+		if (rect.unit != p_level) {
 			continue;
 		}
 		// Disjoint: a second entry for the level, which is the honest shape - two strips that do not
@@ -670,7 +682,7 @@ void Terrain3DClipmap::_queue_stored_bake_rect(const int p_level, const int p_x0
 		return;
 	}
 	BakeRect queued;
-	queued.level = p_level;
+	queued.unit = p_level;
 	queued.x0 = p_x0;
 	queued.y0 = p_y0;
 	queued.x1 = p_x1;
@@ -737,7 +749,7 @@ int Terrain3DClipmap::get_outstanding_rects(const int p_level, BakeRect *r_rects
 		}
 	}
 	for (const BakeRect &rect : _bake_rects) {
-		if (rect.level != p_level) {
+		if (rect.unit != p_level) {
 			continue;
 		}
 		if (count >= p_max) {
@@ -762,7 +774,7 @@ void Terrain3DClipmap::_refresh_baked(const int p_level) {
 	}
 	bool queued = false;
 	for (const BakeRect &rect : _bake_rects) {
-		if (rect.level == p_level) {
+		if (rect.unit == p_level) {
 			queued = true;
 			break;
 		}
@@ -776,15 +788,20 @@ void Terrain3DClipmap::_refresh_baked(const int p_level) {
 	_state_stamp++;
 }
 
-bool Terrain3DClipmap::acknowledge_bake_rect(const int p_level, const int p_x0, const int p_y0,
-		const int p_x1, const int p_y1, const uint64_t p_lease) {
+bool Terrain3DClipmap::acknowledge_bake(const TerrainClipmap::BakeRect &p_rect) {
+	const int p_level = p_rect.unit;
+	const int p_x0 = p_rect.x0;
+	const int p_y0 = p_rect.y0;
+	const int p_x1 = p_rect.x1;
+	const int p_y1 = p_rect.y1;
+	const uint64_t p_lease = p_rect.lease;
 	if (p_level < 0 || p_level >= int(_levels.size())) {
 		_bake_rejects++;
 		return false;
 	}
 	for (size_t index = 0; index < _bake_rects.size(); index++) {
 		const BakeRect &rect = _bake_rects[index];
-		if (rect.level != p_level || rect.x0 != p_x0 || rect.y0 != p_y0 || rect.x1 != p_x1 ||
+		if (rect.unit != p_level || rect.x0 != p_x0 || rect.y0 != p_y0 || rect.x1 != p_x1 ||
 				rect.y1 != p_y1) {
 			continue;
 		}
@@ -934,7 +951,7 @@ Array Terrain3DClipmap::get_level_reports() const {
 		int pending_rects = 0;
 		int64_t pending_texels = 0;
 		for (const BakeRect &rect : _bake_rects) {
-			if (rect.level != level) {
+			if (rect.unit != level) {
 				continue;
 			}
 			pending_rects++;
@@ -990,4 +1007,122 @@ Array Terrain3DClipmap::get_layout_reports() const {
 		reports.push_back(report);
 	}
 	return reports;
+}
+
+///////////////////////////
+// The shared contract's debug and arm halves
+///////////////////////////
+
+// One level in the *shared* schema (`TerrainClipmap::UnitReport`). A level has one square, so its
+// centre and offset are the ring's own addressing; a level with no bake (the height channel) reports
+// `baked == valid`, because "the layers the material samples" and "the texels the source filled" are
+// the same content when nothing bakes.
+void Terrain3DClipmap::get_unit_report(const int p_unit, TerrainClipmap::UnitReport &r_report) const {
+	r_report = TerrainClipmap::UnitReport();
+	if (p_unit < 0 || p_unit >= int(_levels.size())) {
+		return;
+	}
+	const Level &entry = _levels[size_t(p_unit)];
+	r_report.index = p_unit;
+	r_report.kind = "level";
+	r_report.texels = _config.size;
+	r_report.world_size = entry.world_size;
+	r_report.texel_world = entry.texel_world;
+	r_report.density = entry.texel_world > 0.f ? 1.f / entry.texel_world : 0.f;
+	r_report.valid = entry.valid;
+	r_report.baked = _config.baked_channels > 0 ? entry.baked : entry.valid;
+	r_report.center = entry.center;
+	r_report.offset = entry.ring;
+	r_report.resident = entry.valid ? 1 : 0;
+	r_report.blocks = 1;
+	// The rects the *level* still owes, in world space: the queued job rects and the un-baked rects,
+	// which are two different statements - where production stopped, and what the device has not been
+	// told yet - and a debug view draws both.
+	for (const Job &job : _jobs) {
+		if (job.level != p_unit) {
+			continue;
+		}
+		const int open_x0 = job.cursor_channel == 0 ? job.cursor_x : job.x0;
+		if (open_x0 == job.x0) {
+			r_report.pending_rects.push_back(
+					_clipmap_logical_rect_world(entry, job.x0, job.cursor_y, job.x1, job.y1));
+			continue;
+		}
+		r_report.pending_rects.push_back(
+				_clipmap_logical_rect_world(entry, open_x0, job.cursor_y, job.x1, job.cursor_y + 1));
+		if (job.cursor_y + 1 < job.y1) {
+			r_report.pending_rects.push_back(
+					_clipmap_logical_rect_world(entry, job.x0, job.cursor_y + 1, job.x1, job.y1));
+		}
+	}
+	r_report.pending = int(r_report.pending_rects.size());
+}
+
+// What only the ring can say. The shared schema above describes a level as a square; a drawing that
+// needs the level rule's own arithmetic - the outstanding stored rects the material's gate is built
+// from - reads it here, so the shared schema is not widened by this implementation's frame.
+Dictionary Terrain3DClipmap::get_impl_payload() const {
+	Dictionary payload;
+	payload["storage"] = "toroidal_level_array";
+	payload["layers"] = _texture.get_layer_count();
+	payload["level_reports"] = get_level_reports();
+	payload["full_level_productions"] = int64_t(_full_productions);
+	payload["bake_dispatches"] = int64_t(_bake_dispatches);
+	payload["bake_rejects"] = int64_t(_bake_rejects);
+	payload["invalidation_calls"] = int64_t(_invalidation_calls);
+	payload["invalidated_texels"] = int64_t(_invalidated_texels);
+	return payload;
+}
+
+// The ring's arm: the per-level centres, rings and validity, the outstanding-rect table the material's
+// per-tap gate reads, and the level rule. It lives here because it *is* this implementation's
+// addressing - the shader arm computes with exactly these numbers - so the binding above it is one
+// forward rather than a copy per owner.
+Dictionary Terrain3DClipmap::get_arm() const {
+	Dictionary arm;
+	if (!is_configured()) {
+		return arm;
+	}
+	const int levels = get_level_count();
+	PackedVector2Array centers;
+	PackedVector2Array rings;
+	PackedFloat32Array valid;
+	PackedVector4Array outstanding;
+	PackedInt32Array outstanding_counts;
+	centers.resize(MAX_LEVELS);
+	rings.resize(MAX_LEVELS);
+	valid.resize(MAX_LEVELS);
+	outstanding_counts.resize(MAX_LEVELS);
+	outstanding.resize(MAX_LEVELS * MAX_OUTSTANDING_RECTS);
+	for (int level = 0; level < levels; level++) {
+		const Level &entry = _levels[size_t(level)];
+		centers[level] = entry.center;
+		rings[level] = Vector2(real_t(entry.ring.x), real_t(entry.ring.y));
+		valid[level] = entry.valid ? 1.f : 0.f;
+		BakeRect rects[MAX_OUTSTANDING_RECTS];
+		const int count = get_outstanding_rects(level, rects, MAX_OUTSTANDING_RECTS);
+		outstanding_counts[level] = count;
+		for (int index = 0; index < count; index++) {
+			outstanding[level * MAX_OUTSTANDING_RECTS + index] = Vector4(real_t(rects[index].x0),
+					real_t(rects[index].y0), real_t(rects[index].x1), real_t(rects[index].y1));
+		}
+	}
+	arm["implementation"] = String(TerrainClipmap::implementation_name(TerrainClipmap::Implementation::LOD));
+	arm["configured"] = true;
+	arm["texture"] = _texture.get_rid();
+	arm["size"] = _config.size;
+	arm["levels"] = levels;
+	arm["base_world"] = _config.base_world;
+	arm["channels"] = _config.channels;
+	arm["centers"] = centers;
+	arm["rings"] = rings;
+	arm["valid"] = valid;
+	arm["outstanding"] = outstanding;
+	arm["outstanding_counts"] = outstanding_counts;
+	if (_config.baked_channels >= 3) {
+		arm["baked_albedo"] = get_baked_texture_rid(0);
+		arm["baked_normal"] = get_baked_texture_rid(1);
+		arm["baked_params"] = get_baked_texture_rid(2);
+	}
+	return arm;
 }

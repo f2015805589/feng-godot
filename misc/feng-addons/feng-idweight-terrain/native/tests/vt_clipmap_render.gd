@@ -77,13 +77,29 @@ func ring() -> Dictionary:
 	return settings().get("clipmap", {}).get("height", {})
 
 
+# What only the selected implementation can say, nested under the layer's shared entry: the LOD
+# implementation carries the per-level reports and the fill/bake/invalidation counters here.
+func ring_layout() -> Dictionary:
+	return ring().get("layout", {})
+
+
 func level_report(index: int = 0) -> Dictionary:
-	var reports: Array = ring().get("level_reports", [])
+	var reports: Array = ring_layout().get("level_reports", [])
 	return reports[index] if reports.size() > index else {}
 
 
+# The valid units of one layer, from the shared per-unit schema: the old per-group `valid_levels`
+# counter is gone, and a unit is current exactly when its own report says so.
+func valid_units(entry: Dictionary) -> int:
+	var count := 0
+	for report: Dictionary in (entry.get("unit_reports", []) as Array):
+		if bool(report.get("valid", false)):
+			count += 1
+	return count
+
+
 func valid_levels() -> int:
-	return int(ring().get("valid_levels", -1))
+	return valid_units(ring())
 
 
 func produced() -> int:
@@ -91,11 +107,11 @@ func produced() -> int:
 
 
 func invalidated_texels() -> int:
-	return int(ring().get("invalidated_texels", -1))
+	return int(ring_layout().get("invalidated_texels", -1))
 
 
 func invalidation_calls() -> int:
-	return int(ring().get("invalidation_calls", -1))
+	return int(ring_layout().get("invalidation_calls", -1))
 
 
 # The generated shader, read back from the RID the GPU was handed. Godot's `Shader` resource runs the
@@ -175,7 +191,7 @@ func frame_image() -> Image:
 # so a settled ring is the same ring either way.
 func settle_ring() -> void:
 	for _i in 4096:
-		if int(ring().get("pending_jobs", 1)) == 0 && valid_levels() >= int(ring().get("levels", 1)):
+		if int(ring().get("pending_jobs", 1)) == 0 && valid_levels() >= int(ring().get("units", 1)):
 			break
 		terrain.call("debug_update_vt_clipmap", HEIGHT)
 	await process_frame
@@ -332,7 +348,7 @@ func paint_material(center: Vector3, asset_id: int) -> void:
 func settle_material_ring() -> void:
 	for _i in 4096:
 		var entry: Dictionary = settings().get("clipmap", {}).get("material", {})
-		if int(entry.get("pending_jobs", 1)) == 0 && int(entry.get("valid_levels", 0)) >= int(entry.get("levels", 1)):
+		if int(entry.get("pending_jobs", 1)) == 0 && valid_units(entry) >= int(entry.get("units", 1)):
 			break
 		terrain.call("debug_update_vt_clipmap", MATERIAL)
 	await process_frame
@@ -349,9 +365,13 @@ func material_ring() -> Dictionary:
 	return settings().get("clipmap", {}).get("material", {})
 
 
+func material_layout() -> Dictionary:
+	return material_ring().get("layout", {})
+
+
 func baked_levels() -> int:
 	var count := 0
-	for report: Dictionary in (material_ring().get("level_reports", []) as Array):
+	for report: Dictionary in (material_layout().get("level_reports", []) as Array):
 		if bool(report.get("baked", false)):
 			count += 1
 	return count
@@ -361,20 +381,25 @@ func baked_levels() -> int:
 # separate objects with separate levels, so a bake reading taken from the wrong one is a reading of
 # nothing.
 func material_valid_levels() -> int:
-	return int(material_ring().get("valid_levels", 0))
+	return valid_units(material_ring())
 
 
 func material_baked_channels() -> int:
 	var channels := 0
-	for report: Dictionary in (material_ring().get("level_reports", []) as Array):
+	for report: Dictionary in (material_layout().get("level_reports", []) as Array):
 		channels = int(report.get("baked_channels", 0))
 	return channels
 
 
-# What a producer has written into the ring's layers, in channel texels - the unit the ring's
-# production budget is charged in - and what the ring still owes it.
-func baked_texels() -> int:
-	return int(material_ring().get("baked_texels", 0))
+# The rects the layer has queued for the producer but no dispatch has covered yet, in channel texels -
+# the unit both the production budget and the bake queue are charged in. The old cumulative
+# `baked_texels` counter is not republished by the unified layer, so the bake's grain is read one step
+# earlier: right after the layer has queued the rects and before the producer has drained them.
+func pending_bake_texels() -> int:
+	var texels := 0
+	for report: Dictionary in (material_layout().get("level_reports", []) as Array):
+		texels += int(report.get("pending_bake_texels", 0))
+	return texels
 
 
 func pending_bake_rects() -> int:
@@ -630,7 +655,7 @@ func run() -> void:
 	var mat_entry: Dictionary = settings().get("clipmap", {}).get("material", {})
 	require(bool(mat_entry.get("configured", false)), "the ring exists for the material group")
 	require(str(mat_entry.get("source", "")) == "material", "and names the channel it carries")
-	require(int(mat_entry.get("valid_levels", 0)) >= 1, "with a current level")
+	require(material_valid_levels() >= 1, "with a current level")
 	# A ring whose group no page carries is still a producer's owner: the bake is the same pass a
 	# page runs, so this configuration has one and the ring's levels are baked rather than left
 	# waiting for a producer that never comes. `baked_levels` is the handshake's own reading - a
@@ -909,9 +934,14 @@ func run() -> void:
 		await process_frame
 	settle_material_ring()
 	require(pending_bake_rects() == 0, "a settled ring owes the producer nothing, %d rects" % pending_bake_rects())
-	var baked_before := baked_texels()
+	var bake_before := pending_bake_texels()
 	var focus := target.position
 	target.position = Vector3(focus.x + far_texel, focus.y, focus.z)
+	# One synchronous step, so the strip's bake rect is read while it is still queued: the layer
+	# queues the rect and offers it to the producer in the same call, and the producer drains it over
+	# the frames that follow.
+	terrain.debug_update_vt_clipmap(MATERIAL)
+	var baked_strip := pending_bake_texels() - bake_before
 	await settle(6)
 	settle_material_ring()
 	for frame in 240:
@@ -919,7 +949,6 @@ func run() -> void:
 			break
 		await process_frame
 	settle_material_ring()
-	var baked_strip := baked_texels() - baked_before
 	var level_texels := terrain.vt_clipmap_size * terrain.vt_clipmap_size * material_baked_channels()
 	print("CLIPMAP_MATERIAL_BAKE_GRAIN strip=%d level=%d texels_per_texel_move=%d" % [
 		baked_strip, level_texels, terrain.vt_clipmap_size * material_baked_channels()])
@@ -957,15 +986,19 @@ func run() -> void:
 	# the rect has drained, and the producer is then handed *that* rect - the same shape as the height
 	# arm's stroke reading, with the bake in place of the CPU fill. The stroke is painted where the
 	# camera looks, so it lands inside the ring's coverage rather than outside every level.
-	var invalidations_before := int(material_ring().get("invalidation_calls", 0))
-	var baked_before_edit := baked_texels()
+	var invalidations_before := int(material_layout().get("invalidation_calls", 0))
+	var bake_before_edit := pending_bake_texels()
 	paint_material(Vector3(30.0, 0.0, 30.0), 1)
 	terrain.data.update_maps()
+	# The invalidated rect is produced and offered to the producer in one synchronous step, so the
+	# rect's bake is read while it is still queued rather than after the producer has drained it.
+	terrain.debug_update_vt_clipmap(MATERIAL)
+	var baked_edit := pending_bake_texels() - bake_before_edit
 	await settle(2)
 	print("CLIPMAP_MATERIAL_EDIT calls=%d pending=%d valid=%d" % [
-		int(material_ring().get("invalidation_calls", 0)) - invalidations_before,
+		int(material_layout().get("invalidation_calls", 0)) - invalidations_before,
 		pending_bake_rects(), material_valid_levels()])
-	require(int(material_ring().get("invalidation_calls", 0)) > invalidations_before,
+	require(int(material_layout().get("invalidation_calls", 0)) > invalidations_before,
 			"the stroke reaches the material ring as an invalidation")
 	settle_material_ring()
 	for frame in 240:
@@ -973,7 +1006,6 @@ func run() -> void:
 			break
 		await process_frame
 	settle_material_ring()
-	var baked_edit := baked_texels() - baked_before_edit
 	print("CLIPMAP_MATERIAL_EDIT_BAKE rect=%d level=%d" % [baked_edit, level_texels])
 	require(baked_edit > 0, "and the producer bakes the rect it queued, %d channel texels" % baked_edit)
 	require(baked_edit < level_texels,
@@ -992,15 +1024,15 @@ func run() -> void:
 	# bakes: the strips do not overlap, so no rect's content changes under its own dispatch. A lease taken
 	# from the *level* instead was measured to accept nothing at all while moving: the dispatches grew
 	# while every one of them was refused and the queue grew with them.
-	var dispatches_before_move := int(material_ring().get("bake_dispatches", 0))
-	var rejects_before_move := int(material_ring().get("bake_rejects", 0))
+	var dispatches_before_move := int(material_layout().get("bake_dispatches", 0))
+	var rejects_before_move := int(material_layout().get("bake_rejects", 0))
 	var focus_walk := target.position
 	for step in 8:
 		target.position = Vector3(focus_walk.x + far_texel * float(step + 1), focus_walk.y, focus_walk.z)
 		await process_frame
 		await process_frame
-	var walked_dispatches := int(material_ring().get("bake_dispatches", 0)) - dispatches_before_move
-	var walked_rejects := int(material_ring().get("bake_rejects", 0)) - rejects_before_move
+	var walked_dispatches := int(material_layout().get("bake_dispatches", 0)) - dispatches_before_move
+	var walked_rejects := int(material_layout().get("bake_rejects", 0)) - rejects_before_move
 	print("CLIPMAP_MATERIAL_WALK dispatches=%d rejects=%d pending=%d producer_dispatches=%d" % [
 		walked_dispatches, walked_rejects, pending_bake_rects(),
 		int(settings().get("producer", {}).get("ring_bake_dispatches", -1))])

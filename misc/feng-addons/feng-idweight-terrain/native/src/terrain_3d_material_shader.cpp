@@ -18,8 +18,8 @@
 
 #include <godot_cpp/classes/reg_ex.hpp>
 #include <godot_cpp/classes/reg_ex_match.hpp>
-
 #include "logger.h"
+#include "terrain_3d_clipmap_common.h"
 #include "terrain_3d_material.h"
 
 ///////////////////////////
@@ -549,7 +549,7 @@ bool Terrain3DMaterial::_needs_vt_shader() const {
 // One channel group's own arm, on the same three cases: a group the editor preview is holding still,
 // or a shader override that owns its own code, keeps the interface rather than losing it. The
 // question is per group and read from the matrix (`clipmap_arm_used()`), so it names no channel: the
-// channel a group's ring carries is the source's business.
+// channel a group's layer carries is the source's business.
 bool Terrain3DMaterial::_needs_clipmap_arm(const int p_group) const {
 	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
 		return false;
@@ -558,12 +558,22 @@ bool Terrain3DMaterial::_needs_clipmap_arm(const int p_group) const {
 			(!_terrain->is_vt_editor_preview_active() && _terrain->clipmap_arm_used(TerrainVT::ChannelGroup(p_group)));
 }
 
+// Whether the group's arm is compiled in the **Atlas** implementation's shape. It is the same delivery
+// and the same gate as above - a group whose cells name neither band compiles neither arm - with the
+// layer's implementation selector deciding which of the two *storages* the compiled arm addresses. A
+// switch therefore regenerates the variant, which is exactly what "the debug and the render follow the
+// setting" means on the shader side: the ring's level table and the atlas's rect table are different
+// code, not one branch on a uniform.
 bool Terrain3DMaterial::_needs_clipmap_atlas_arm(const int p_group) const {
-	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+	if (!_needs_clipmap_arm(p_group)) {
 		return false;
 	}
-	return !_terrain || (_shader_override_enabled && _shader_override.is_valid()) ||
-			(!_terrain->is_vt_editor_preview_active() && _terrain->clipmap_atlas_arm_used(TerrainVT::ChannelGroup(p_group)));
+	if (!_terrain || (_shader_override_enabled && _shader_override.is_valid())) {
+		// A shader override owns its own code and keeps the interface: the arm is compiled so the
+		// names exist, and both are declared because the override may read either.
+		return true;
+	}
+	return _terrain->get_vt_clipmap_implementation() == int(TerrainClipmap::Implementation::Atlas);
 }
 
 bool Terrain3DMaterial::_clipmap_arm_changed() const {

@@ -484,7 +484,7 @@ void Terrain3DSurfaceBaker::_free_ring_bake() {
 	_ring_bake.landed.clear();
 }
 
-int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels) {
+int Terrain3DSurfaceBaker::_queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels) {
 	if (p_ring == nullptr || !p_ring->is_configured() || p_ring->get_baked_channel_count() != 3) {
 		return 0;
 	}
@@ -501,8 +501,7 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 			// whose shape changed, describes texels the bake never read, and the ring keeps it queued -
 			// serving those layers to a fragment is exactly what the lease exists to prevent.
 			if (_ring_bake.ring == p_ring) {
-				p_ring->acknowledge_bake_rect(landed.level, landed.x0, landed.y0, landed.x1, landed.y1,
-						landed.lease);
+				p_ring->acknowledge_bake(landed.rect());
 			}
 		}
 		_ring_bake.landed.clear();
@@ -511,17 +510,17 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 		// which is not the order of its levels: a strip of the finest level and a fill of the coarsest
 		// are the same kind of entry here, because both are "this rect is not baked yet".
 		int budget = MAX(0, p_budget_texels);
-		for (int index = 0; index < p_ring->get_pending_bake_rect_count(); index++) {
-			const Terrain3DClipmap::BakeRect &rect = p_ring->get_pending_bake_rect(index);
+		for (int index = 0; index < p_ring->get_pending_bake_count(); index++) {
+			const Terrain3DClipmap::BakeRect &rect = p_ring->get_pending_bake(index);
 			// A rect already on its way to a dispatch is not collected twice: the second bake would
 			// read the same texels and land the same layers.
 			bool already = false;
 			for (const RingJob &job : previous) {
-				already = already || (job.level == rect.level && job.x0 == rect.x0 && job.y0 == rect.y0 &&
+				already = already || (job.level == rect.unit && job.x0 == rect.x0 && job.y0 == rect.y0 &&
 											 job.x1 == rect.x1 && job.y1 == rect.y1);
 			}
 			for (const RingJob &job : fresh) {
-				already = already || (job.level == rect.level && job.x0 == rect.x0 && job.y0 == rect.y0 &&
+				already = already || (job.level == rect.unit && job.x0 == rect.x0 && job.y0 == rect.y0 &&
 											 job.x1 == rect.x1 && job.y1 == rect.y1);
 			}
 			if (already) {
@@ -539,7 +538,7 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 			}
 			budget -= int(texels);
 			RingJob job;
-			job.level = rect.level;
+			job.level = rect.unit;
 			job.x0 = rect.x0;
 			job.y0 = rect.y0;
 			job.x1 = rect.x1;
@@ -551,18 +550,18 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 			// buffer holds, so a rect collected before a replacement is dropped rather than baked
 			// with the new materials and reported as the old rect's content.
 			job.material_version = _material_version;
-			job.texel = p_ring->get_texel_world(rect.level);
+			job.texel = p_ring->get_texel_world(rect.unit);
 			// The level's world origin, which with its texel size is the whole of what the shader needs
 			// to turn a *stored* texel back into the world position it stands for.
-			job.level_origin = p_ring->get_level_world_bounds(rect.level).position;
+			job.level_origin = p_ring->get_level_world_bounds(rect.unit).position;
 			// The rotation the level's stored content is under. The shader *reads* it - a stored texel's
 			// world position is its logical one, which is this offset turned back - and the lease taken
 			// above is what makes a level whose ring turned before the dispatch stale instead of wrongly
 			// baked.
-			job.ring = p_ring->get_ring(rect.level);
+			job.ring = p_ring->get_ring(rect.unit);
 			// Layer `level * channels + 0` is the payload, `+ 1` the height: one array, two layers,
 			// named separately because the bake reads them through two samplers at one job.
-			job.payload_layer = rect.level * channels;
+			job.payload_layer = rect.unit * channels;
 			job.height_layer = job.payload_layer + 1;
 			fresh.push_back(job);
 		}
@@ -573,6 +572,43 @@ int Terrain3DSurfaceBaker::queue_clipmap_ring(Terrain3DClipmap *p_ring, const in
 		_ring_bake.queued = std::move(previous);
 	}
 	return int(_ring_bake.collected.size());
+}
+
+// ---- The three bake sets' liveness ---------------------------------------------------------------
+
+// Whether a descriptor set the producer built still exists on the device. A set is a RID that names
+// the textures and buffers it was built from, so freeing any of them - the layer's own texture, its
+// baked arrays, the bundle's job buffer - invalidates the set rather than leaving it usable. The
+// device answers that question and this is where it is asked.
+bool Terrain3DSurfaceBaker::_bake_set_is_live(const RID &p_set) const {
+	return _rd != nullptr && p_set.is_valid() && _rd->uniform_set_is_valid(p_set);
+}
+
+// Forgets every bake set the device has released. It is called from a dispatch that just found its own
+// set stale, so the next offer rebuilds the set from the storage that is live now. The queue is left
+// alone: the storage owning the work still holds its rects (nothing was acknowledged), and the dispatch
+// below drains its own `queued` list on the way to the check.
+void Terrain3DSurfaceBaker::_retire_stale_bake_sets() {
+	if (!_bake_set_is_live(_ring_bake.uniform_set)) {
+		_ring_bake.uniform_set = RID();
+		_ring_bake.atlas_rd = RID();
+		_ring_bake.ring = nullptr;
+		_ring_bake.size = 0;
+	}
+	if (!_bake_set_is_live(_atlas_bake.uniform_set)) {
+		_atlas_bake.uniform_set = RID();
+		_atlas_bake.atlas_rd = RID();
+		_atlas_bake.atlas = nullptr;
+		_atlas_bake.width = 0;
+		_atlas_bake.height = 0;
+	}
+	if (!_bake_set_is_live(_detail_bake.uniform_set)) {
+		_detail_bake.uniform_set = RID();
+		_detail_bake.payload_rd = RID();
+		_detail_bake.height_rd = RID();
+		_detail_bake.detail = nullptr;
+		_detail_bake.stored_size = 0;
+	}
 }
 
 int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
@@ -619,6 +655,14 @@ int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
 		// this tick and come back through the next offer, which is what makes this a delay rather than a
 		// lost bake. `Terrain3D::_setup_vt_clipmap()` is what makes sure the list is published at all for
 		// a configuration whose material group takes no page.
+		return 0;
+	}
+	// The set still has to *exist*: the layer's implementation may have been replaced since the offer,
+	// which frees the texture and the baked arrays the set names. Dispatching it is the device's
+	// null-uniform-set error and a write nothing lands, so the producer forgets it and returns; the
+	// ring keeps its rects (none of them was acknowledged) and re-offers them next tick.
+	if (!_bake_set_is_live(set)) {
+		_retire_stale_bake_sets();
 		return 0;
 	}
 	// One dispatch per rect, one job in the buffer at a time: a rect's ring offset is part of what its
@@ -700,6 +744,25 @@ int Terrain3DSurfaceBaker::_dispatch_ring_bake() {
 		_ring_bake.dispatches += uint64_t(landed.size());
 	}
 	return int(landed.size());
+}
+
+///////////////////////////
+// The clipmap layer's bake
+///////////////////////////
+
+// The one entry the layer's owner calls, whichever implementation is selected. It forwards to the
+// storage-specific offer below: the queue's *shape*, its budget, its lease and its acknowledgment are
+// the shared contract's (`TerrainClipmap::BakeRect`), so this is the only place in the addon that has
+// to know which storage a rect lands in - and the reason it is here rather than at the call sites is
+// that the descriptor sets and the job encoding are this producer's own plumbing.
+int Terrain3DSurfaceBaker::queue_clipmap_layer(Terrain3DClipmapLayer *p_layer, const int p_budget_texels) {
+	if (p_layer == nullptr || !p_layer->is_configured()) {
+		return 0;
+	}
+	if (p_layer->get_implementation() == TerrainClipmap::Implementation::Atlas) {
+		return _queue_clipmap_atlas(p_layer->atlas_impl(), p_budget_texels);
+	}
+	return _queue_clipmap_ring(p_layer->lod_impl(), p_budget_texels);
 }
 
 ///////////////////////////
@@ -785,7 +848,7 @@ void Terrain3DSurfaceBaker::_free_atlas_bake() {
 	_atlas_bake.landed.clear();
 }
 
-int Terrain3DSurfaceBaker::queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, const int p_budget_texels) {
+int Terrain3DSurfaceBaker::_queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, const int p_budget_texels) {
 	if (p_atlas == nullptr || !p_atlas->is_configured() || p_atlas->get_baked_channel_count() != 3) {
 		return 0;
 	}
@@ -802,26 +865,30 @@ int Terrain3DSurfaceBaker::queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, c
 			// describes content no bake read, and the atlas refuses the acknowledgment so the cell
 			// keeps falling back rather than serving a stale rect.
 			if (_atlas_bake.atlas == p_atlas) {
-				p_atlas->acknowledge_bake_rect(landed.slot, landed.serial);
+				p_atlas->acknowledge_bake(landed.rect());
 			}
 		}
 		_atlas_bake.landed.clear();
 		previous = std::move(_atlas_bake.collected);
 		// The blocks the atlas has produced and no bake has covered, in the order it produced them.
 		int budget = MAX(0, p_budget_texels);
-		for (int index = 0; index < p_atlas->get_pending_bake_rect_count(); index++) {
-			const Terrain3DClipmapAtlas::BakeRect &rect = p_atlas->get_pending_bake_rect(index);
+		for (int index = 0; index < p_atlas->get_pending_bake_count(); index++) {
+			const Terrain3DClipmapAtlas::BakeRect &rect = p_atlas->get_pending_bake(index);
 			bool already = false;
 			for (const AtlasJob &job : previous) {
-				already = already || (job.slot == rect.slot && job.serial == rect.serial);
+				already = already || (job.slot == rect.unit && job.serial == rect.lease);
 			}
 			for (const AtlasJob &job : fresh) {
-				already = already || (job.slot == rect.slot && job.serial == rect.serial);
+				already = already || (job.slot == rect.unit && job.serial == rect.lease);
 			}
 			if (already) {
 				continue;
 			}
-			const int64_t texels = int64_t(rect.texels) * int64_t(rect.texels) * int64_t(channels);
+			// The block's texel size is the slot's, and the shared entry's rect *is* the slot's rect:
+			// the producer reads both back off the slot the entry names rather than carrying a second
+			// copy of them in the queue.
+			const int block_texels = p_atlas->get_slot_texels(rect.unit);
+			const int64_t texels = int64_t(block_texels) * int64_t(block_texels) * int64_t(channels);
 			// The budget is the production budget's own unit - channel texels - and it is a soft one:
 			// at least one block is collected per offer, because a block is larger than a tick's
 			// budget and a budget that never admitted it would leave the block unbaked forever.
@@ -830,14 +897,14 @@ int Terrain3DSurfaceBaker::queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, c
 			}
 			budget -= int(texels);
 			AtlasJob job;
-			job.slot = rect.slot;
-			job.ring = rect.ring;
-			job.serial = rect.serial;
-			job.x0 = rect.rect.position.x;
-			job.y0 = rect.rect.position.y;
-			job.texels = rect.texels;
-			job.block_origin = p_atlas->get_slot_block_origin(rect.slot);
-			job.texel = p_atlas->get_slot_texel_world(rect.slot);
+			job.slot = rect.unit;
+			job.ring = p_atlas->get_slot_ring(rect.unit);
+			job.serial = rect.lease;
+			job.x0 = rect.x0;
+			job.y0 = rect.y0;
+			job.texels = block_texels;
+			job.block_origin = p_atlas->get_slot_block_origin(rect.unit);
+			job.texel = p_atlas->get_slot_texel_world(rect.unit);
 			// Layer 0 is the payload and layer 1 the height: one array of two layers, named
 			// separately because the bake reads them through two samplers at one job.
 			job.payload_layer = 0;
@@ -879,6 +946,13 @@ int Terrain3DSurfaceBaker::_dispatch_atlas_bake() {
 					  [material_version](const AtlasJob &p_job) { return p_job.material_version != material_version; }),
 			jobs.end());
 	if (!_rd || !set.is_valid() || !job_buffer.is_valid() || material_count <= 0 || jobs.empty()) {
+		return 0;
+	}
+	// Same liveness rule as the ring's: replacing the implementation, or reconfiguring the atlas, frees
+	// the atlas texture and its baked arrays and invalidates this set. The atlas keeps every rect it
+	// queued, so forgetting the set costs a tick rather than a bake.
+	if (!_bake_set_is_live(set)) {
+		_retire_stale_bake_sets();
 		return 0;
 	}
 	std::vector<AtlasJob> landed;
@@ -1207,6 +1281,17 @@ int Terrain3DSurfaceBaker::_dispatch_detail_bake() {
 	// dispatched, and the jobs go back to the queue: a delay rather than a lost bake.
 	if (!_rd || !set.is_valid() || !job_buffer.is_valid() || stored_size <= 0 || material_count <= 0 ||
 			jobs.empty()) {
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const DetailJob &job : jobs) {
+			_detail_bake.queued.push_back(job);
+		}
+		return 0;
+	}
+	// The same liveness rule as the two clipmap bakes: the detail layer's own directory and tile arrays
+	// can have been freed under the set, which makes binding it a null-uniform-set dispatch. The jobs go
+	// back to the queue rather than being dropped, because this path has somewhere to put them.
+	if (!_bake_set_is_live(set)) {
+		_retire_stale_bake_sets();
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (const DetailJob &job : jobs) {
 			_detail_bake.queued.push_back(job);

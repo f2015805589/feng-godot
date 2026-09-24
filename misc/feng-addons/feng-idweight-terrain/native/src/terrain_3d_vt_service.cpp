@@ -361,8 +361,8 @@ void Terrain3D::_configure_vt_service() {
 	// also serves the ring.
 	Terrain3DVirtualTexture *views[2] = { _vt.surface_vt, _vt.surface_svt };
 	const bool page_service = has_avt_delivery() || has_svt_delivery();
-	const Terrain3DClipmap *material_ring = _vt.clipmap[int(TerrainVT::ChannelGroup::Material)].get();
-	const bool ring_service = material_ring != nullptr && material_ring->get_baked_channel_count() > 0 &&
+	const Terrain3DClipmapLayer *material_layer = _vt.clipmap_layer[int(TerrainVT::ChannelGroup::Material)].get();
+	const bool ring_service = material_layer != nullptr && material_layer->get_baked_channel_count() > 0 &&
 			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
 	if (!page_service && !ring_service) {
 		return;
@@ -487,16 +487,16 @@ bool Terrain3D::_vt_has_streaming_work() const {
 	// the editor awake - and the bake half is only counted while a producer can actually run it,
 	// because a rect no producer will ever cover is a state to report, not a reason to spin.
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
-		// Only a ring a cell still selects is produced or baked: a deselected ring keeps its
+		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+		// Only a layer a cell still selects is produced or baked: a deselected layer keeps its
 		// content and its queue, and neither is work this tick will ever do.
-		if (ring == nullptr || !_vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::Clipmap)) {
+		if (layer == nullptr || !_vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::Clipmap)) {
 			continue;
 		}
-		if (ring->get_pending_jobs() > 0) {
+		if (layer->get_pending_jobs() > 0) {
 			return true;
 		}
-		if (ring->get_pending_bake_rect_count() > 0 && _vt.vt_baker.is_valid()) {
+		if (layer->get_pending_bake_count() > 0 && _vt.vt_baker.is_valid()) {
 			return true;
 		}
 	}
@@ -597,8 +597,8 @@ void Terrain3D::_update_vt_service() {
 		// directly rather than through `invalidate_vt_clipmap_area()`, which would re-produce payload
 		// a list change cannot have altered, and the next offer re-bakes the levels they lost.
 		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-			if (_vt.clipmap[group] != nullptr) {
-				_vt.clipmap[group]->mark_baked_stale();
+			if (_vt.clipmap_layer[group] != nullptr) {
+				_vt.clipmap_layer[group]->mark_baked_stale();
 			}
 		}
 		// Re-request old addresses using the current materials; stale pages remain

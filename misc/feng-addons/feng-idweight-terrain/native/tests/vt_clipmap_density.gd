@@ -155,7 +155,17 @@ func mat_entry() -> Dictionary:
 
 
 func coarse_levels() -> int:
-	return int(mat_entry().get("levels", RING_LEVELS))
+	return int(mat_entry().get("units", RING_LEVELS))
+
+
+# The units of one layer that are current right now, from the shared per-unit schema: the old
+# per-group `valid_levels` counter is gone.
+func valid_units(entry: Dictionary) -> int:
+	var count := 0
+	for report: Dictionary in (entry.get("unit_reports", []) as Array):
+		if bool(report.get("valid", false)):
+			count += 1
+	return count
 
 
 # The detail layer's own report. The plan (section 3, "get_vt_settings()") asks the report for the
@@ -216,7 +226,7 @@ func level_contains(report: Dictionary, world: Vector2) -> bool:
 # for the material arm - so a run with no producer answers 0, i.e. "the ring serves nothing here".
 func ring_density_from(entry: Dictionary, world: Vector2, require_baked: bool = true) -> float:
 	var best := 0.0
-	for report: Dictionary in (entry.get("level_reports", []) as Array):
+	for report: Dictionary in (entry.get("layout", {}).get("level_reports", []) as Array):
 		if require_baked and not bool(report.get("baked", false)):
 			continue
 		if not level_contains(report, world):
@@ -309,7 +319,7 @@ func near_hit_rate() -> float:
 
 func baked_level_count(entry: Dictionary) -> int:
 	var count := 0
-	for report: Dictionary in (entry.get("level_reports", []) as Array):
+	for report: Dictionary in (entry.get("layout", {}).get("level_reports", []) as Array):
 		if bool(report.get("baked", false)):
 			count += 1
 	return count
@@ -323,7 +333,7 @@ func diag(label: String) -> void:
 		label, float(report.get("requested_density", 0.0)), delivered_density_from(entry, report, probe),
 		ring_density_from(entry, probe, true), detail_density_from(report, probe), array_density(),
 		near_hit_rate(), visible_near_points().size(),
-		baked_level_count(entry), int(entry.get("valid_levels", -1)), int(entry.get("pending_jobs", -1)),
+		baked_level_count(entry), valid_units(entry), int(entry.get("pending_jobs", -1)),
 		int(entry.get("pending_bake_rects", -1)), str(detail_enabled()),
 		int(report.get("resident_tiles", 0)), detail_missing_tiles(), detail_fallback_tiles(),
 		detail_cache_bytes(), int(entry.get("texture_layers", -1))])
@@ -539,7 +549,7 @@ func settle_pages(frames: int = 600) -> void:
 func settle_ring(max_calls: int = 4096) -> void:
 	for _i in max_calls:
 		var entry := mat_entry()
-		if int(entry.get("pending_jobs", 1)) == 0 and int(entry.get("valid_levels", 0)) >= int(entry.get("levels", 1)):
+		if int(entry.get("pending_jobs", 1)) == 0 and valid_units(entry) >= int(entry.get("units", 1)):
 			break
 		terrain.call("debug_update_vt_clipmap", MATERIAL)
 	await process_frame
@@ -553,7 +563,7 @@ func settle_ring_and_bake(label: String, frames: int = 300) -> void:
 		await process_frame
 		var entry := mat_entry()
 		var un_baked := false
-		for report: Dictionary in (entry.get("level_reports", []) as Array):
+		for report: Dictionary in (entry.get("layout", {}).get("level_reports", []) as Array):
 			if bool(report.get("valid", false)) and not bool(report.get("baked", false)):
 				un_baked = true
 		if int(entry.get("pending_jobs", 1)) == 0 and int(entry.get("pending_bake_rects", -1)) == 0 and not un_baked:

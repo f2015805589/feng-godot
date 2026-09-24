@@ -321,10 +321,10 @@ func _run() -> void:
 	if not _require(avt_debug_block.visible and not clipmap_debug_block.visible,
 			"a debug view must follow the delivery matrix: AVT is selected here and Clipmap is not"):
 		return
-	# The clipmap's view follows the ring *object* rather than a matrix cell: this scene has never put a
-	# cell on `Clipmap`, so no ring exists, the block stays hidden and nothing is scanned. The two
+	# The clipmap's view follows the layer *object* rather than a matrix cell: this scene has never put a
+	# cell on `Clipmap`, so no layer exists, the block stays hidden and nothing is scanned. The two
 	# counters are what make "nothing was scanned" a reading instead of a claim. (Selecting the method
-	# is what builds a ring - both channels can now name it - and the reading that an arm renders from
+	# is what builds a layer - both channels can now name it - and the reading that an arm renders from
 	# one is `vt_clipmap_render`'s and `vt_delivery`'s.)
 	var calls_before := int(terrain.get_vt_settings().get("clipmap_preview_calls", 0))
 	var computed_before := int(terrain.get_vt_settings().get("clipmap_preview_computed", 0))
@@ -450,7 +450,7 @@ func _run() -> void:
 		return
 	var clipmap_child: TreeItem = clipmap_item.get_first_child()
 	if not _require(clipmap_child != null and clipmap_child.get_metadata(0) == "clipmap",
-			"Clipmap hierarchy group did not expose the ring's own settings"):
+			"Clipmap hierarchy group did not expose the layer's own settings"):
 		return
 	var avt_pages: TreeItem = avt_item.get_first_child()
 	var svt_pages: TreeItem = svt_item.get_first_child()
@@ -497,7 +497,7 @@ func _run() -> void:
 	if not _require(vt_editor.clipmap_panel.visible and vt_editor.clipmap_size_spin != null and
 			vt_editor.clipmap_levels_spin != null and vt_editor.clipmap_base_spin != null and
 			vt_editor.clipmap_budget_spin != null and vt_editor.clipmap_hint != null,
-			"Clipmap hierarchy group did not expose the ring's shape and budget"):
+			"Clipmap hierarchy group did not expose the layer's shape and budget"):
 		return
 	var saved_clipmap_size: int = terrain.vt_clipmap_size
 	var saved_clipmap_budget: int = terrain.vt_clipmap_budget_texels

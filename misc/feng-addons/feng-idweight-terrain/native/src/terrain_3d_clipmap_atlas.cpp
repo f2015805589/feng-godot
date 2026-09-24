@@ -24,6 +24,10 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/math.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
+#include <godot_cpp/variant/packed_vector4_array.hpp>
 
 #include <algorithm>
 #include <map>
@@ -74,38 +78,35 @@ String Terrain3DClipmapAtlas::get_source_name() const {
 	return _source != nullptr ? _source->get_source_name() : String("none");
 }
 
-// Ring 0 is the whole 3x3 square - its centre block plus its 8 shell blocks - and every ring after it
-// is one shell of the (2r+3)^2 square. That is the user's "8n, plus one extra for the first ring".
+// Every ring is the same 3x3 arrangement of its *own* blocks: the centre plus its eight neighbours.
+// The centre is inside the ring below and is kept anyway (see the header), so the count is nine for
+// every ring and the shell a ring contributes beyond the one inside it is eight blocks.
 int Terrain3DClipmapAtlas::get_ring_block_count(const int p_ring) const {
 	if (p_ring < 0 || p_ring >= _config.rings) {
 		return 0;
 	}
-	if (p_ring == 0) {
-		return 9;
-	}
-	return 8 * (p_ring + 1);
+	return 9;
 }
 
 int Terrain3DClipmapAtlas::get_block_count() const {
-	int total = 0;
-	for (int ring = 0; ring < _config.rings; ring++) {
-		total += get_ring_block_count(ring);
-	}
-	return total;
+	return 9 * _config.rings;
 }
 
-// The 3x3 square is ring 0; the Chebyshev shell at distance d >= 2 is ring d - 1.
-int Terrain3DClipmapAtlas::_ring_of_cell(const int p_gx, const int p_gy) {
-	const int d = MAX(Math::abs(p_gx), Math::abs(p_gy));
-	return d <= 1 ? 0 : d - 1;
+// The world size of one unit's blocks: the *shared ladder's* own unit size (`base_world * 2^unit`),
+// which is what makes the atlas's unit `r` serve the same density the LOD ring's unit `r` serves at the
+// distance unit `r`'s shell stands at. Unit `r`'s blocks are `block_size` texels of *that* span, so the
+// texel count a unit costs is constant and only its reach grows.
+real_t Terrain3DClipmapAtlas::_block_world_of_ring(const int p_ring) const {
+	return _config.base_world * real_t(int64_t(1) << CLAMP(p_ring, 0, 30));
 }
 
 int Terrain3DClipmapAtlas::_texels_of_ring(const int p_ring) const {
-	return MAX(1, _config.block_size >> p_ring);
+	(void)p_ring;
+	return MAX(1, _config.block_size);
 }
 
 real_t Terrain3DClipmapAtlas::_texel_of_ring(const int p_ring) const {
-	return _config.base_world / real_t(_texels_of_ring(p_ring));
+	return _block_world_of_ring(p_ring) / real_t(_texels_of_ring(p_ring));
 }
 
 Vector2 Terrain3DClipmapAtlas::_grid_origin_of_ring(const int p_ring, const Vector2 &p_focus) const {
@@ -118,8 +119,9 @@ Vector2 Terrain3DClipmapAtlas::_grid_origin_of_ring(const int p_ring, const Vect
 // than at its edge, which is what keeps the phase in `[-W/2, W/2)`.
 Vector2 Terrain3DClipmapAtlas::_ring_start(const int p_ring, const Vector2 &p_focus) const {
 	const Vector2 grid_origin = _grid_origin_of_ring(p_ring, p_focus);
-	return Vector2(Math::round(grid_origin.x / _config.base_world) * _config.base_world,
-			Math::round(grid_origin.y / _config.base_world) * _config.base_world);
+	const real_t block_world = _block_world_of_ring(p_ring);
+	return Vector2(Math::round(grid_origin.x / block_world) * block_world,
+			Math::round(grid_origin.y / block_world) * block_world);
 }
 
 Vector2i Terrain3DClipmapAtlas::_ring_phase(const int p_ring, const Vector2 &p_focus) const {
@@ -154,10 +156,11 @@ Vector2 Terrain3DClipmapAtlas::get_cell_origin(const int p_cell) const {
 	const Cell &cell = _cells[size_t(p_cell)];
 	const Vector2 start = _ring_start(cell.ring, _last_focus);
 	const real_t texel = _texel_of_ring(cell.ring);
-	const Vector2 block(start.x + real_t(cell.gx) * _config.base_world,
-			start.y + real_t(cell.gy) * _config.base_world);
-	return Vector2(block.x - 0.5f * _config.base_world + 0.5f * texel,
-			block.y - 0.5f * _config.base_world + 0.5f * texel);
+	const real_t block_world = _block_world_of_ring(cell.ring);
+	const Vector2 block(start.x + real_t(cell.gx) * block_world,
+			start.y + real_t(cell.gy) * block_world);
+	return Vector2(block.x - 0.5f * block_world + 0.5f * texel,
+			block.y - 0.5f * block_world + 0.5f * texel);
 }
 
 // The matrix array's entry. The start matrix carried to this cell's own block: the linear part is
@@ -169,8 +172,9 @@ Transform2D Terrain3DClipmapAtlas::get_cell_matrix(const int p_cell) const {
 	}
 	const Cell &cell = _cells[size_t(p_cell)];
 	const Vector2 start = _ring_start(cell.ring, _last_focus);
-	const Vector2 block(start.x + real_t(cell.gx) * _config.base_world,
-			start.y + real_t(cell.gy) * _config.base_world);
+	const real_t block_world = _block_world_of_ring(cell.ring);
+	const Vector2 block(start.x + real_t(cell.gx) * block_world,
+			start.y + real_t(cell.gy) * block_world);
 	return Transform2D(_config.frame.get_rotation(), _config.frame.get_scale(),
 			_config.frame.get_skew(), _config.frame.xform(block));
 }
@@ -183,14 +187,14 @@ void Terrain3DClipmapAtlas::set_frame(const Transform2D &p_frame) {
 	_state_stamp++;
 }
 
-int Terrain3DClipmapAtlas::get_cell_index(const int p_gx, const int p_gy) const {
-	const int side = _grid_side();
-	const int x = p_gx + _config.rings;
-	const int y = p_gy + _config.rings;
-	if (x < 0 || y < 0 || x >= side || y >= side) {
+// The cell index of a unit's own 3x3 arrangement: unit `r` owns cells `[r * 9, (r + 1) * 9)`, and
+// inside it the same `(gy + 1) * 3 + (gx + 1)` the shader's own finder computes. One arithmetic, so the
+// CPU's cell table and the shader's cannot disagree about which cell a world point falls in.
+int Terrain3DClipmapAtlas::get_cell_index(const int p_ring, const int p_gx, const int p_gy) const {
+	if (p_ring < 0 || p_ring >= _config.rings || p_gx < -1 || p_gx > 1 || p_gy < -1 || p_gy > 1) {
 		return -1;
 	}
-	return y * side + x;
+	return p_ring * 9 + (p_gy + 1) * 3 + (p_gx + 1);
 }
 
 // ---- Layout ------------------------------------------------------------------------------------
@@ -202,10 +206,100 @@ int Terrain3DClipmapAtlas::get_cell_index(const int p_gx, const int p_gy) const 
 // The width is the one free variable, so each scheme searches it: the packer is run for every
 // candidate width from the largest block up to eight times it, and the run with the smallest
 // bounding area wins. That search *is* the "how do we place these to occupy the least area" answer.
+// ---- The quadtree arrangement -------------------------------------------------------------------
+//
+// A power-of-two root that is recursively subdivided, with each block placed by descending-size
+// insertion into the smallest free node that holds it. This is the arrangement the user asked for
+// ("the atlas should look like the quadtree"): same-sized blocks end up clustered in the same subtree,
+// a node that has been split is visible as the nested border its children sit in, and the picture is
+// one of nested squares rather than of shelf rows.
+//
+// It is also the arrangement the layer's own structure wants. A unit is a 3x3 arrangement of its own
+// blocks, so the whole atlas is a set of equal-sized squares: a recursive allocator places one unit's
+// nine blocks in one subtree and the next unit's in the next free node, which is the nesting the
+// *world* arrangement has. The shelf packer remains implemented because the task asks for the
+// comparison, and `get_layout_report()` publishes every scheme's bounding box and efficiency, so the
+// choice is a measurement rather than a preference.
+//
+// The root is a power-of-two *rectangle* rather than a square only because a square root would waste
+// more: a root that holds the content at 62% is better than the smallest square, which halves it.
+// Both sides are powers of two, so every split is exact and every rect is placed at a power-of-two
+// offset of its own size.
+bool Terrain3DClipmapAtlas::_pack_quadtree(const std::vector<PackedItem> &p_items, const int p_width,
+		const int p_height, std::vector<Rect2i> &r_rects) const {
+	struct Node {
+		int x = 0;
+		int y = 0;
+		int w = 0;
+		int h = 0;
+	};
+	std::vector<Node> free_nodes;
+	free_nodes.push_back({ 0, 0, p_width, p_height });
+	std::vector<Rect2i> placed;
+	placed.reserve(p_items.size());
+	for (const PackedItem &item : p_items) {
+		const int size = MAX(1, item.size);
+		// Best fit over the free nodes: the smallest area that holds the item. A first fit would place
+		// a small block in a large free node and split the rest for nothing, which is the fragmentation
+		// the recursive allocator exists to avoid.
+		int best = -1;
+		int64_t best_area = 0;
+		for (size_t index = 0; index < free_nodes.size(); index++) {
+			const Node &node = free_nodes[index];
+			if (node.w < size || node.h < size) {
+				continue;
+			}
+			const int64_t area = int64_t(node.w) * int64_t(node.h);
+			if (best < 0 || area < best_area) {
+				best = int(index);
+				best_area = area;
+			}
+		}
+		if (best < 0) {
+			return false;
+		}
+		Node node = free_nodes[size_t(best)];
+		free_nodes.erase(free_nodes.begin() + best);
+		// Split along both axes until one quadrant is exactly the item's size. Each split keeps one
+		// quadrant and returns the others to the free list, so the tree's subdivision *is* the free
+		// list - which is what makes the layout nested rather than row-ordered.
+		while (node.w > size || node.h > size) {
+			const int w1 = MAX(1, node.w / 2);
+			const int h1 = MAX(1, node.h / 2);
+			const int w2 = node.w - w1;
+			const int h2 = node.h - h1;
+			if (node.w > size && w1 >= size) {
+				free_nodes.push_back({ node.x, node.y + h1, w1, h2 });
+				free_nodes.push_back({ node.x + w1, node.y, w2, node.h });
+				node.w = w1;
+				node.h = h1;
+				continue;
+			}
+			if (node.h > size && h1 >= size) {
+				free_nodes.push_back({ node.x + w1, node.y, w2, h1 });
+				free_nodes.push_back({ node.x, node.y + h1, node.w, h2 });
+				node.h = h1;
+				continue;
+			}
+			// The remaining extent cannot be halved without losing the item - its short side already
+			// fits and its long side is not a whole multiple. Keep it whole.
+			break;
+		}
+		placed.push_back(Rect2i(node.x, node.y, size, size));
+	}
+	r_rects = std::move(placed);
+	return true;
+}
+
 void Terrain3DClipmapAtlas::_pack_scheme(const int p_packer, std::vector<PackedItem> &r_items,
 		std::vector<Rect2i> &r_rects, int &r_width, int &r_height) const {
 	std::vector<PackedItem> items;
 	for (int ring = 0; ring < _config.rings; ring++) {
+		// Every unit's blocks are the same texel count and only their *world* size grows, so the
+		// packing sees a single size class per unit: `block_size` for all of them. The quadtree below
+		// therefore places them by the order the units are offered in, not by a size ladder - the
+		// "coarse outward" of the picture comes from the units' own nesting in the world, and the
+		// texture's nested subdivision comes from the quadtree's own splitting.
 		const int size = _texels_of_ring(ring);
 		for (int index = 0; index < get_ring_block_count(ring); index++) {
 			items.push_back({ size, ring, false, false });
@@ -245,6 +339,35 @@ void Terrain3DClipmapAtlas::_pack_scheme(const int p_packer, std::vector<PackedI
 	for (const PackedItem &item : items) {
 		total_area += int64_t(item.size) * int64_t(item.size);
 		max_size = MAX(max_size, item.size);
+	}
+	if (p_packer == PACK_QUADTREE) {
+		// The root search: powers of two from the largest block up, square and 2:1 both, keeping the
+		// smallest area that admits the whole content and the squarer root among equals. The first size
+		// that admits anything wins, so the search is one doubling rather than a sweep.
+		r_items = items;
+		int64_t best_area = 0;
+		for (int step = max_size; step <= max_size * 16; step *= 2) {
+			const int candidates[3][2] = { { step, step }, { step * 2, step }, { step, step * 2 } };
+			for (const auto &candidate : candidates) {
+				std::vector<Rect2i> rects;
+				if (!_pack_quadtree(items, candidate[0], candidate[1], rects)) {
+					continue;
+				}
+				const int64_t area = int64_t(candidate[0]) * int64_t(candidate[1]);
+				const bool better = best_area == 0 || area < best_area ||
+						(area == best_area && MAX(candidate[0], candidate[1]) < MAX(r_width, r_height));
+				if (better) {
+					best_area = area;
+					r_width = candidate[0];
+					r_height = candidate[1];
+					r_rects = std::move(rects);
+				}
+			}
+			if (best_area != 0) {
+				break;
+			}
+		}
+		return;
 	}
 	// The candidate widths: at the largest block, then at each step above it. A step of the largest
 	// block is the granularity that matters, because the ladder is made of halves of it.
@@ -301,18 +424,25 @@ void Terrain3DClipmapAtlas::_pack_scheme(const int p_packer, std::vector<PackedI
 }
 
 void Terrain3DClipmapAtlas::_build_layout() {
+	// Every scheme is measured; the *chosen* one is what the settings ask for (the quadtree by
+	// default), because the arrangement is a form requirement and the report is what makes the cost of
+	// that form a number rather than a claim. A scheme that cannot place the content at all is skipped,
+	// and the smallest-area usable scheme is the fallback, so an atlas always has a layout.
+	std::vector<Rect2i> scheme_rects[PACK_COUNT];
+	std::vector<PackedItem> scheme_items[PACK_COUNT];
 	int64_t best_area = 0;
+	int best_index = -1;
 	for (int packer = 0; packer < PACK_COUNT; packer++) {
-		std::vector<PackedItem> items;
-		std::vector<Rect2i> rects;
 		int width = 0;
 		int height = 0;
-		_pack_scheme(packer, items, rects, width, height);
+		_pack_scheme(packer, scheme_items[packer], scheme_rects[packer], width, height);
 		int64_t packed = 0;
-		for (const Rect2i &rect : rects) {
+		for (const Rect2i &rect : scheme_rects[packer]) {
 			packed += int64_t(rect.size.x) * int64_t(rect.size.y);
 		}
-		_schemes[packer].name = packer == PACK_SHELF ? "shelf" : "ring_bands";
+		_schemes[packer].name = packer == PACK_SHELF
+				? "shelf"
+				: (packer == PACK_RING_BANDS ? "ring_bands" : "quadtree");
 		_schemes[packer].width = width;
 		_schemes[packer].height = height;
 		_schemes[packer].area = int64_t(width) * int64_t(height);
@@ -320,30 +450,45 @@ void Terrain3DClipmapAtlas::_build_layout() {
 				? double(packed) / double(_schemes[packer].area)
 				: 0.0;
 		_schemes[packer].chosen = false;
-		if (_packed.empty() || _schemes[packer].area < best_area) {
+		if (scheme_rects[packer].empty() || _schemes[packer].area <= 0) {
+			continue;
+		}
+		if (best_index < 0 || _schemes[packer].area < best_area) {
 			best_area = _schemes[packer].area;
-			_layout = _schemes[packer];
-			_packed = rects;
-			_items = items;
+			best_index = packer;
 		}
 	}
+	const int wanted = CLAMP(int(_config.packer), 0, PACK_COUNT - 1);
+	const int pick = !scheme_rects[wanted].empty() ? wanted : best_index;
+	if (pick < 0) {
+		LOG(ERROR, "Clipmap atlas could not lay out any block; the atlas stays empty (", get_source_name(), ")");
+		_layout = LayoutScheme();
+		_packed.clear();
+		_items.clear();
+		return;
+	}
+	_layout = _schemes[pick];
+	_packed = scheme_rects[pick];
+	_items = scheme_items[pick];
 	// Round the bounding box up to the *smallest* block so every rect stays inside the texture, and
 	// then round the area the report publishes with it. The alignment is the smallest block and not
 	// the largest: a rect is placed at a power-of-two offset of its own size, so nothing needs more
-	// than the ladder's finest step - and aligning to the largest block instead inflated the chosen
-	// 1280 x 864 layout to 1280 x 1024, an 18% area the packer never asked for.
-	const int align = MAX(1, _texels_of_ring(_config.rings - 1));
-	_layout.width = ((_layout.width + align - 1) / align) * align;
-	_layout.height = ((_layout.height + align - 1) / align) * align;
-	_layout.area = int64_t(_layout.width) * int64_t(_layout.height);
+	// than the ladder's finest step. The quadtree's root is already exact - both its sides are powers
+	// of two and every rect is placed at a multiple of its own size - so it needs no pass at all.
+	if (pick != PACK_QUADTREE) {
+		const int align = MAX(1, _texels_of_ring(_config.rings - 1));
+		_layout.width = ((_layout.width + align - 1) / align) * align;
+		_layout.height = ((_layout.height + align - 1) / align) * align;
+		_layout.area = int64_t(_layout.width) * int64_t(_layout.height);
+	}
 	for (int packer = 0; packer < PACK_COUNT; packer++) {
-		_schemes[packer].chosen = _schemes[packer].name == _layout.name;
+		_schemes[packer].chosen = packer == pick;
+		if (packer == pick) {
+			_schemes[packer] = _layout;
+			_schemes[packer].chosen = true;
+		}
 	}
 }
-
-// Slot `i` is rect `i` in the order the packer placed them, so the rect array the shader indexes and
-// the slot table the CPU walks are the same array. The spare blocks and the global block are in the
-// sequence, which is what puts the spares inside the atlas rather than beside it.
 void Terrain3DClipmapAtlas::_assign_slots(const std::vector<PackedItem> &p_items,
 		const std::vector<Rect2i> &p_rects) {
 	_slots.clear();
@@ -369,16 +514,21 @@ void Terrain3DClipmapAtlas::_assign_slots(const std::vector<PackedItem> &p_items
 
 void Terrain3DClipmapAtlas::_rebuild_cells() {
 	_cells.clear();
-	const int side = _grid_side();
-	_cells.reserve(size_t(side) * size_t(side));
-	for (int gy = -_config.rings; gy <= _config.rings; gy++) {
-		for (int gx = -_config.rings; gx <= _config.rings; gx++) {
-			Cell cell;
-			cell.gx = gx;
-			cell.gy = gy;
-			cell.chebyshev = MAX(Math::abs(gx), Math::abs(gy));
-			cell.ring = _ring_of_cell(gx, gy);
-			_cells.push_back(cell);
+	_cells.reserve(size_t(_config.rings) * 9u);
+	// Unit `r` is a 3x3 arrangement of *its own* blocks, centred on its own snapped start point: the
+	// centre cell plus the eight neighbours. The centre of unit `r` is covered by unit `r - 1`'s square
+	// (which is why the finder walks finest first), so the arrangement is a shell with a hole - the
+	// nesting the user asked for, and the reason a unit's reach is its own 3x3 and not the whole grid.
+	for (int ring = 0; ring < _config.rings; ring++) {
+		for (int gy = -1; gy <= 1; gy++) {
+			for (int gx = -1; gx <= 1; gx++) {
+				Cell cell;
+				cell.gx = gx;
+				cell.gy = gy;
+				cell.chebyshev = MAX(Math::abs(gx), Math::abs(gy));
+				cell.ring = ring;
+				_cells.push_back(cell);
+			}
 		}
 	}
 }
@@ -386,7 +536,14 @@ void Terrain3DClipmapAtlas::_rebuild_cells() {
 void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	Config config = p_config;
 	config.block_size = CLAMP(config.block_size, ATLAS_MIN_BLOCK, ATLAS_MAX_BLOCK);
+	// The ring ceiling is a table size, not a preference, and it is above the shipping ladder's eleven
+	// units: a request that hit it is reported rather than answered with a shorter 1024 -> 1 span.
+	const int requested_rings = config.rings;
 	config.rings = CLAMP(config.rings, 1, ATLAS_MAX_RINGS);
+	if (requested_rings != config.rings) {
+		LOG(WARN, "Clipmap atlas rings ", requested_rings, " clamped to ", config.rings, " of ",
+				ATLAS_MAX_RINGS, " (", get_source_name(), ")");
+	}
 	config.base_world = MAX(real_t(0.001), config.base_world);
 	config.channels = CLAMP(config.channels, 1, MAX_CHANNELS);
 	if (config.format != Image::FORMAT_RF && config.format != Image::FORMAT_R8) {
@@ -396,7 +553,12 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	config.global_texels = CLAMP(config.global_texels, 1, config.block_size);
 	config.blocks_per_frame = CLAMP(config.blocks_per_frame, 1, 64);
 	if (config.global_world <= 0.f) {
-		config.global_world = real_t(2 * config.rings + 1) * config.base_world * 4.f;
+		// The global block covers what the grid does not: the coarsest unit's own 3x3 square, grown so
+		// the fragment has a minimal-resolution answer well past it. It is produced once and sampled by
+		// a reader that is outside every unit's arrangement.
+		const real_t grid_reach = 1.5f * config.base_world *
+				real_t(int64_t(1) << CLAMP(config.rings - 1, 0, 30));
+		config.global_world = grid_reach * 4.f;
 	}
 	if (!_cells.empty() && config.block_size == _config.block_size && config.rings == _config.rings &&
 			config.channels == _config.channels && config.format == _config.format &&
@@ -697,8 +859,9 @@ Vector2 Terrain3DClipmapAtlas::get_slot_block_origin(const int p_slot) const {
 		return Vector2();
 	}
 	const Slot &slot = _slots[size_t(p_slot)];
-	return Vector2(real_t(slot.block_x) * _config.base_world - 0.5f * _config.base_world,
-			real_t(slot.block_y) * _config.base_world - 0.5f * _config.base_world);
+	const real_t block_world = _block_world_of_ring(slot.ring);
+	return Vector2(real_t(slot.block_x) * block_world - 0.5f * block_world,
+			real_t(slot.block_y) * block_world - 0.5f * block_world);
 }
 
 real_t Terrain3DClipmapAtlas::get_slot_texel_world(const int p_slot) const {
@@ -721,24 +884,29 @@ void Terrain3DClipmapAtlas::_queue_bake(const int p_slot) {
 	// slot no longer holds, so a dispatch of it could only be refused, and leaving it queued would
 	// keep `pending_bake_rects` from ever reaching zero.
 	for (size_t index = 0; index < _bake_rects.size();) {
-		if (_bake_rects[index].slot == p_slot) {
+		if (_bake_rects[index].unit == p_slot) {
 			_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
 			continue;
 		}
 		index++;
 	}
+	// The **shared** queue entry: `unit` is this slot, `lease` the slot's serial. The ring/texel/block
+	// numbers the producer also needs are read back off the slot it names (`get_slot_ring()`,
+	// `get_slot_texels()`, `get_slot_block_origin()`), so one producer queue serves both
+	// implementations instead of one shape per storage layout.
 	BakeRect rect;
-	rect.slot = p_slot;
-	rect.ring = slot.ring;
-	rect.rect = slot.rect;
-	rect.texels = slot.texels;
-	rect.block_x = slot.block_x;
-	rect.block_y = slot.block_y;
-	rect.serial = slot.serial;
+	rect.unit = p_slot;
+	rect.x0 = slot.rect.position.x;
+	rect.y0 = slot.rect.position.y;
+	rect.x1 = slot.rect.position.x + slot.rect.size.x;
+	rect.y1 = slot.rect.position.y + slot.rect.size.y;
+	rect.lease = slot.serial;
 	_bake_rects.push_back(rect);
 }
 
-bool Terrain3DClipmapAtlas::acknowledge_bake_rect(const int p_slot, const uint64_t p_serial) {
+bool Terrain3DClipmapAtlas::acknowledge_bake(const TerrainClipmap::BakeRect &p_rect) {
+	const int p_slot = p_rect.unit;
+	const uint64_t p_serial = p_rect.lease;
 	if (p_slot < 0 || p_slot >= int(_slots.size())) {
 		return false;
 	}
@@ -749,7 +917,7 @@ bool Terrain3DClipmapAtlas::acknowledge_bake_rect(const int p_slot, const uint64
 	if (slot.serial != p_serial) {
 		for (size_t index = 0; index < _bake_rects.size();) {
 			const BakeRect &rect = _bake_rects[index];
-			if (rect.slot == p_slot && rect.serial <= p_serial) {
+			if (rect.unit == p_slot && rect.lease <= p_serial) {
 				_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
 				continue;
 			}
@@ -760,7 +928,7 @@ bool Terrain3DClipmapAtlas::acknowledge_bake_rect(const int p_slot, const uint64
 	slot.baked = true;
 	for (size_t index = 0; index < _bake_rects.size();) {
 		const BakeRect &rect = _bake_rects[index];
-		if (rect.slot == p_slot && rect.serial == p_serial) {
+		if (rect.unit == p_slot && rect.lease == p_serial) {
 			_bake_rects.erase(_bake_rects.begin() + ptrdiff_t(index));
 			continue;
 		}
@@ -831,9 +999,10 @@ void Terrain3DClipmapAtlas::_fill_job_row(const Job &p_job, const int p_channel,
 	// The block's own world origin: its square is `[b*W - W/2, b*W + W/2)`, so the first texel's
 	// centre is half a texel inside it. A block's content is a function of the world position, which
 	// is what lets a slot move between cells without being re-produced.
-	row.origin = Vector2(real_t(p_job.block_x) * _config.base_world - 0.5f * _config.base_world +
+	const real_t job_block_world = _block_world_of_ring(p_job.ring);
+	row.origin = Vector2(real_t(p_job.block_x) * job_block_world - 0.5f * job_block_world +
 						 0.5f * row.texel_world,
-			real_t(p_job.block_y) * _config.base_world - 0.5f * _config.base_world +
+			real_t(p_job.block_y) * job_block_world - 0.5f * job_block_world +
 					0.5f * row.texel_world);
 	_source->fill_row(row, _row_values.data());
 	for (int x = p_x0; x < p_x1; x++) {
@@ -961,8 +1130,9 @@ void Terrain3DClipmapAtlas::_queue_block(const int p_cell, const int p_slot) {
 // whole of "only the edge data reloads", and the counters below are its evidence.
 void Terrain3DClipmapAtlas::_relabel_ring(const int p_ring, const bool p_first) {
 	const Vector2 start = _ring_start(p_ring, _last_focus);
-	const int64_t m_x = int64_t(Math::round(start.x / _config.base_world));
-	const int64_t m_y = int64_t(Math::round(start.y / _config.base_world));
+	const real_t block_world = _block_world_of_ring(p_ring);
+	const int64_t m_x = int64_t(Math::round(start.x / block_world));
+	const int64_t m_y = int64_t(Math::round(start.y / block_world));
 	const int texels = _texels_of_ring(p_ring);
 	const Vector2i phase = _ring_phase(p_ring, _last_focus);
 	for (Cell &cell : _cells) {
@@ -1061,7 +1231,7 @@ void Terrain3DClipmapAtlas::_reconcile_cells() {
 			if (slot < 0) {
 				continue;
 			}
-			_queue_block(get_cell_index(cell.gx, cell.gy), slot);
+			_queue_block(get_cell_index(cell.ring, cell.gx, cell.gy), slot);
 			loaded++;
 		}
 	}
@@ -1087,8 +1257,13 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 	for (int ring = 0; ring < _config.rings; ring++) {
 		_ring_origin[size_t(ring)] = _ring_start(ring, p_focus);
 		_ring_phase_value[size_t(ring)] = _ring_phase(ring, p_focus);
-		const Vector2i step(int64_t(Math::round(_ring_origin[size_t(ring)].x / _config.base_world)),
-				int64_t(Math::round(_ring_origin[size_t(ring)].y / _config.base_world)));
+		// The step is in the unit's *own* blocks: a unit whose blocks are `base_world * 2^r` metres
+		// relabels when the focus crosses one of them, so the fine units follow the camera closely and
+		// the coarse ones hardly ever move - which is the whole reason a shell only ever reloads its
+		// edge.
+		const real_t block_world = _block_world_of_ring(ring);
+		const Vector2i step(int64_t(Math::round(_ring_origin[size_t(ring)].x / block_world)),
+				int64_t(Math::round(_ring_origin[size_t(ring)].y / block_world)));
 		if (_ring_step[size_t(ring)] != step || first) {
 			// A new scroll starts its own count: `last_scroll_loaded` is what *this* grid step cost,
 			// and the recycled blocks the updates after it queue are added to it. The reset is here,
@@ -1187,9 +1362,10 @@ int Terrain3DClipmapAtlas::invalidate_rect(const Rect2 &p_world) {
 	// The block is the invalidation unit: a cell whose block the rect touches is re-produced whole,
 	// into a free slot, and stays not-current until it lands.
 	for (Cell &cell : _cells) {
-		const Vector2 origin(real_t(cell.have_x) * _config.base_world - 0.5f * _config.base_world,
-				real_t(cell.have_y) * _config.base_world - 0.5f * _config.base_world);
-		const Rect2 block_rect(origin, Vector2(_config.base_world, _config.base_world));
+		const real_t block_world = _block_world_of_ring(cell.ring);
+		const Vector2 origin(real_t(cell.have_x) * block_world - 0.5f * block_world,
+				real_t(cell.have_y) * block_world - 0.5f * block_world);
+		const Rect2 block_rect(origin, Vector2(block_world, block_world));
 		if (!block_rect.intersects(rect)) {
 			continue;
 		}
@@ -1202,7 +1378,7 @@ int Terrain3DClipmapAtlas::invalidate_rect(const Rect2 &p_world) {
 			cell.current = false;
 			continue;
 		}
-		_queue_block(get_cell_index(cell.gx, cell.gy), slot);
+		_queue_block(get_cell_index(cell.ring, cell.gx, cell.gy), slot);
 		cell.current = false;
 		queued++;
 	}
@@ -1218,25 +1394,36 @@ int Terrain3DClipmapAtlas::cell_for_world(const Vector2 &p_world) const {
 	if (!is_configured() || _cells.empty()) {
 		return -1;
 	}
-	// The finest ring whose own start point puts the point in one of its cells - the ring class's
-	// `level_for_world()` rule with a block grid instead of a square, and the mirror of the shader's
-	// arm. Finest first is what keeps a shell's inner hole from answering for a finer ring.
+	// The finest unit whose own start point puts the point in one of its nine cells - the ring class's
+	// `level_for_world()` rule with a 3x3 arrangement instead of a square, and the mirror of the
+	// shader's arm. Finest first is what keeps a shell's inner hole from answering for a finer unit.
 	for (int ring = 0; ring < _config.rings; ring++) {
-		const Vector2 start = _ring_start(ring, _last_focus);
-		const int gx = int(Math::round((p_world.x - start.x) / _config.base_world));
-		const int gy = int(Math::round((p_world.y - start.y) / _config.base_world));
-		if (Math::abs(gx) > _config.rings || Math::abs(gy) > _config.rings) {
-			continue;
-		}
-		if (_ring_of_cell(gx, gy) != ring) {
-			continue;
-		}
-		const int cell = get_cell_index(gx, gy);
+		const int cell = cell_for_ring(ring, p_world);
 		if (cell >= 0 && _cells[size_t(cell)].current) {
 			return cell;
 		}
 	}
 	return -1;
+}
+
+// The cell of *one* unit that holds a world point, or -1 when that unit's own 3x3 does not. It is the
+// addressing rule in one place, so `cell_for_world()`, `get_unit_for_world()` and `sample()` cannot
+// disagree about which cell answers - and the shader's finder is this same arithmetic.
+int Terrain3DClipmapAtlas::cell_for_ring(const int p_ring, const Vector2 &p_world) const {
+	if (p_ring < 0 || p_ring >= _config.rings) {
+		return -1;
+	}
+	const Vector2 start = _ring_start(p_ring, _last_focus);
+	const real_t block_world = _block_world_of_ring(p_ring);
+	// A block is a half-open square, so the index is `floor((world - start) / W + 0.5)` rather than
+	// `round(...)`: GLSL's `round()` is implementation-defined at a tie, and at a boundary it picked the
+	// block below the point, whose clamped edge texel is one block away from the array's.
+	const int gx = int(Math::floor((p_world.x - start.x) / block_world + 0.5f));
+	const int gy = int(Math::floor((p_world.y - start.y) / block_world + 0.5f));
+	if (Math::abs(gx) > 1 || Math::abs(gy) > 1) {
+		return -1;
+	}
+	return get_cell_index(p_ring, gx, gy);
 }
 
 // The stored value at a world position through the atlas's own addressing, with the fallback chain a
@@ -1249,16 +1436,7 @@ real_t Terrain3DClipmapAtlas::sample(const Vector2 &p_world, const int p_channel
 	}
 	const int channel = CLAMP(p_channel, 0, _config.channels - 1);
 	for (int ring = 0; ring < _config.rings; ring++) {
-		const Vector2 start = _ring_start(ring, _last_focus);
-		const int gx = int(Math::round((p_world.x - start.x) / _config.base_world));
-		const int gy = int(Math::round((p_world.y - start.y) / _config.base_world));
-		if (Math::abs(gx) > _config.rings || Math::abs(gy) > _config.rings) {
-			continue;
-		}
-		if (_ring_of_cell(gx, gy) != ring) {
-			continue;
-		}
-		const int cell_index = get_cell_index(gx, gy);
+		const int cell_index = cell_for_ring(ring, p_world);
 		if (cell_index < 0) {
 			continue;
 		}
@@ -1266,11 +1444,13 @@ real_t Terrain3DClipmapAtlas::sample(const Vector2 &p_world, const int p_channel
 		if (!cell.current) {
 			continue;
 		}
+		const Vector2 start = _ring_start(ring, _last_focus);
+		const real_t block_world = _block_world_of_ring(ring);
 		const real_t texel = _texel_of_ring(ring);
 		const int texels = _texels_of_ring(ring);
-		const Vector2 block(start.x + real_t(gx) * _config.base_world,
-				start.y + real_t(gy) * _config.base_world);
-		const Vector2 origin(block.x - 0.5f * _config.base_world, block.y - 0.5f * _config.base_world);
+		const Vector2 block(start.x + real_t(cell.gx) * block_world,
+				start.y + real_t(cell.gy) * block_world);
+		const Vector2 origin(block.x - 0.5f * block_world, block.y - 0.5f * block_world);
 		const int logical_x = int(Math::floor((p_world.x - origin.x) / texel));
 		const int logical_y = int(Math::floor((p_world.y - origin.y) / texel));
 		const int stored_x = ((logical_x + cell.offset.x) % texels + texels) % texels;
@@ -1320,13 +1500,13 @@ Array Terrain3DClipmapAtlas::get_ring_reports() const {
 	for (int ring = 0; ring < _config.rings; ring++) {
 		Dictionary report;
 		report["ring"] = ring;
-		report["shape"] = 2 * ring + 3;
+		report["shape"] = UNIT_SIDE;
 		report["blocks"] = get_ring_block_count(ring);
 		report["texels"] = _texels_of_ring(ring);
 		report["texel_world"] = _texel_of_ring(ring);
-		// The ring's coverage: the (2r+1) blocks of its own scale, which is the user's
-		// "(2n+1) x (2n+1) range".
-		report["extent"] = real_t(2 * ring + 1) * _config.base_world;
+		// The ring's coverage: its own 3x3 square of blocks, which is the side a reader halves for the
+		// radius the ring serves at its density.
+		report["extent"] = real_t(UNIT_SIDE) * _block_world_of_ring(ring);
 		report["spare"] = _config.spares;
 		report["origin"] = ring < int(_ring_origin.size()) ? _ring_origin[size_t(ring)] : Vector2();
 		report["phase"] = ring < int(_ring_phase_value.size()) ? _ring_phase_value[size_t(ring)] : Vector2i();
@@ -1364,7 +1544,7 @@ Dictionary Terrain3DClipmapAtlas::get_layout_report() const {
 	report["block_size"] = _config.block_size;
 	report["rings"] = _config.rings;
 	report["base_world"] = _config.base_world;
-	report["grid_side"] = _grid_side();
+	report["grid_side"] = UNIT_SIDE;
 	report["blocks"] = get_block_count();
 	report["total_blocks"] = get_slot_count();
 	Array counts;
@@ -1452,4 +1632,186 @@ Array Terrain3DClipmapAtlas::get_load_timeline() const {
 
 void Terrain3DClipmapAtlas::clear_load_timeline() {
 	_timeline.clear();
+}
+
+///////////////////////////
+// The shared contract: the sampling rule, the debug schema and the arm
+///////////////////////////
+
+// The ring whose grid holds a world point, whether or not the cell is current: the *coverage* answer
+// the shared contract asks for. Finest first, exactly like `cell_for_world()` and the shader's own
+// finder, so a shell's inner hole never answers for a finer ring.
+int Terrain3DClipmapAtlas::get_unit_for_world(const Vector2 &p_world) const {
+	if (!is_configured() || _cells.empty()) {
+		return -1;
+	}
+	for (int ring = 0; ring < _config.rings; ring++) {
+		if (cell_for_ring(ring, p_world) >= 0) {
+			return ring;
+		}
+	}
+	return -1;
+}
+
+// The texel size a fragment is served at that point, which is the density's own reciprocal: the slot's
+// texel when a cell answers, and the global block's when the point is outside the grid. Zero means the
+// layer does not reach it.
+real_t Terrain3DClipmapAtlas::get_texel_world_at(const Vector2 &p_world) const {
+	const int ring = get_unit_for_world(p_world);
+	if (ring < 0) {
+		return _global_produced ? _global_world / real_t(MAX(1, _config.global_texels)) : 0.f;
+	}
+	return _texel_of_ring(ring);
+}
+
+// Every block's baked content is stale. The source texels are untouched, so every cell stays current -
+// only the three arrays the bake produces from them are out of date, which is exactly the statement
+// the ring's `mark_baked_stale()` makes. Clearing the flags without a queue leaves the material arm
+// falling back forever, so each resident slot that carries content is queued as well.
+void Terrain3DClipmapAtlas::mark_baked_stale() {
+	if (get_baked_channel_count() <= 0) {
+		return;
+	}
+	_bake_rects.clear();
+	for (int slot = 0; slot < int(_slots.size()); slot++) {
+		Slot &entry = _slots[size_t(slot)];
+		if (!entry.resident) {
+			entry.baked = false;
+			continue;
+		}
+		_queue_bake(slot);
+	}
+	_state_stamp++;
+}
+
+// One ring in the *shared* schema. A ring is a 3x3 arrangement of its own blocks around the rings
+// inside it, so it has no single centre: `world_size` is the square it spans, `valid` is "every cell of
+// the ring has the block it wants", and the per-cell detail travels in `get_impl_payload()`.
+void Terrain3DClipmapAtlas::get_unit_report(const int p_unit, TerrainClipmap::UnitReport &r_report) const {
+	r_report = TerrainClipmap::UnitReport();
+	if (p_unit < 0 || p_unit >= _config.rings) {
+		return;
+	}
+	int cells = 0;
+	int current = 0;
+	int pending = 0;
+	int resident = 0;
+	for (const Cell &cell : _cells) {
+		if (cell.ring != p_unit) {
+			continue;
+		}
+		cells++;
+		current += cell.current ? 1 : 0;
+		pending += cell.pending_slot >= 0 ? 1 : 0;
+		if (cell.slot >= 0 && cell.current) {
+			resident++;
+		}
+	}
+	r_report.index = p_unit;
+	r_report.kind = "ring";
+	r_report.texels = _texels_of_ring(p_unit);
+	r_report.world_size = real_t(UNIT_SIDE) * _block_world_of_ring(p_unit);
+	r_report.texel_world = _texel_of_ring(p_unit);
+	r_report.density = r_report.texel_world > 0.f ? 1.f / r_report.texel_world : 0.f;
+	r_report.valid = cells > 0 && current == cells;
+	r_report.baked = r_report.valid;
+	r_report.pending = pending;
+	r_report.blocks = cells;
+	r_report.resident = resident;
+	r_report.offset = p_unit < int(_ring_phase_value.size()) ? _ring_phase_value[size_t(p_unit)] : Vector2i();
+	r_report.center = p_unit < int(_ring_origin.size()) ? _ring_origin[size_t(p_unit)] : Vector2();
+	return;
+}
+
+// What only the atlas can say: the rect array, the cells' current-frame indices, the packing schemes
+// and the rolling counters. The facade nests it under one key, so a debug view draws the quadtree
+// arrangement without the shared schema above growing an atlas branch.
+Dictionary Terrain3DClipmapAtlas::get_impl_payload() const {
+	Dictionary payload;
+	payload["storage"] = "packed_block_atlas";
+	payload["layout"] = get_layout_report();
+	payload["ring_reports"] = get_ring_reports();
+	payload["timeline"] = get_load_timeline();
+	payload["atlas_width"] = _layout.width;
+	payload["atlas_height"] = _layout.height;
+	payload["global_world"] = _global_world;
+	payload["global_texels"] = _config.global_texels;
+	payload["global_produced"] = _global_produced;
+	payload["block_uploads"] = int64_t(_block_uploads);
+	payload["scroll_events"] = int64_t(_scroll_events);
+	payload["blocks_loaded"] = int64_t(_edge_blocks_loaded);
+	payload["blocks_retained"] = int64_t(_interior_blocks_retained);
+	payload["last_scroll_loaded"] = int64_t(_last_scroll_loaded);
+	payload["last_scroll_retained"] = int64_t(_last_scroll_retained);
+	int baked_cells = 0;
+	for (int cell = 0; cell < get_cell_count(); cell++) {
+		baked_cells += is_cell_baked(cell) ? 1 : 0;
+	}
+	payload["baked_cells"] = baked_cells;
+	return payload;
+}
+
+// The atlas's arm: the rect array, the per-ring start points and phases, the grid's shape and the cell
+// table. The shader's copy of the block addressing has to be the *same* numbers the CPU's is, so the
+// two are one publish - the same rule the LOD ring's arm follows.
+Dictionary Terrain3DClipmapAtlas::get_arm() const {
+	Dictionary arm;
+	if (!is_configured()) {
+		return arm;
+	}
+	const int rings = _config.rings;
+	const int cells = get_cell_count();
+	const int slots = get_slot_count();
+	PackedVector2Array starts;
+	PackedVector4Array rects;
+	PackedInt32Array cell_slots;
+	PackedVector2Array cell_offsets;
+	PackedFloat32Array cell_current;
+	PackedFloat32Array cell_baked;
+	starts.resize(rings);
+	rects.resize(slots);
+	cell_slots.resize(cells);
+	cell_offsets.resize(cells);
+	cell_current.resize(cells);
+	cell_baked.resize(cells);
+	for (int ring = 0; ring < rings; ring++) {
+		starts[ring] = get_ring_start(ring);
+	}
+	for (int slot = 0; slot < slots; slot++) {
+		const Rect2i rect = get_slot_rect(slot);
+		rects[slot] = Vector4(real_t(rect.position.x), real_t(rect.position.y),
+				real_t(rect.size.x), real_t(rect.size.y));
+	}
+	for (int cell = 0; cell < cells; cell++) {
+		cell_slots[cell] = get_cell_slot(cell);
+		const Vector2i offset = get_cell_offset(cell);
+		cell_offsets[cell] = Vector2(real_t(offset.x), real_t(offset.y));
+		cell_current[cell] = is_cell_current(cell) ? 1.f : 0.f;
+		cell_baked[cell] = is_cell_baked(cell) ? 1.f : 0.f;
+	}
+	arm["implementation"] = String(TerrainClipmap::implementation_name(TerrainClipmap::Implementation::Atlas));
+	arm["configured"] = true;
+	arm["texture"] = get_texture_rid();
+	arm["block_size"] = _config.block_size;
+	arm["block_world"] = _config.base_world;
+	arm["rings"] = rings;
+	arm["grid_side"] = UNIT_SIDE;
+	arm["cells"] = cells;
+	arm["slots"] = slots;
+	arm["channels"] = _config.channels;
+	arm["width"] = _layout.width;
+	arm["height"] = _layout.height;
+	arm["starts"] = starts;
+	arm["rects"] = rects;
+	arm["cell_slots"] = cell_slots;
+	arm["cell_offsets"] = cell_offsets;
+	arm["cell_current"] = cell_current;
+	arm["cell_baked"] = cell_baked;
+	arm["pending_bake_rects"] = get_pending_bake_count();
+	if (get_baked_channel_count() >= 3) {
+		arm["baked_albedo"] = get_baked_texture_rid(0);
+		arm["baked_normal"] = get_baked_texture_rid(1);
+		arm["baked_params"] = get_baked_texture_rid(2);
+	}
+	return arm;
 }

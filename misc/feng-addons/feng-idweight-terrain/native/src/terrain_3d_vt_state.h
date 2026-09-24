@@ -1,4 +1,4 @@
-// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
+﻿// Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #ifndef TERRAIN3D_VT_STATE_H
 #define TERRAIN3D_VT_STATE_H
@@ -78,6 +78,8 @@
 #include "terrain_3d_avt.h"
 #include "terrain_3d_clipmap.h"
 #include "terrain_3d_clipmap_atlas.h"
+#include "terrain_3d_clipmap_common.h"
+#include "terrain_3d_clipmap_layer.h"
 #include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_page_pipeline.h"
 #include "terrain_vt_arrival_queue.h"
@@ -529,82 +531,83 @@ struct Terrain3DVTState {
 	mutable uint64_t avt_preview_computed = 0;
 	mutable uint64_t clipmap_preview_calls = 0;
 	mutable uint64_t clipmap_preview_computed = 0;
-	// ---- The clipmap delivery's own settings, one ring per channel group ----
-	// A group no cell delivers by Clipmap has no ring at all: no levels, no texture, no jobs and no
-	// budget. `_setup_vt_clipmap()` is the only place one is built, and the assembly rule calls it,
-	// so "no clipmap selected" is zero cost rather than a ring that happens to be idle.
+	// ---- The clipmap layer: one delivery, one object per channel group, two implementations ----
+	// A group no cell delivers by Clipmap has no layer at all: no units, no texture, no jobs and no
+	// budget. `_setup_vt_clipmap()` is the only place one is built, and the assembly rule calls it, so
+	// "no clipmap selected" is zero cost rather than a layer that happens to be idle.
 	//
-	// `size` is texels an axis on every level, `levels` how many levels the ring holds, and
-	// `base_world` the metres the finest level covers: level l covers `base_world * 2^l` metres in
-	// `size` texels. `budget_texels` is what one ring may produce in one tick, in channel texels;
-	// it is not part of the page budget, because the ring does not touch the shared pool.
+	// `implementation` is what the user chooses *inside* the clipmap settings: `LOD` (the toroidal
+	// level ring) or `Atlas` (the block atlas). It is not a delivery and not a second object - the
+	// facade (`terrain_3d_clipmap_layer.h`) owns whichever one is selected, so a switch replaces the
+	// storage rather than adding a second memory.
+	//
+	// `size` is texels an axis of the finest unit, `units` how many units the layer holds, and
+	// `base_world` the metres the finest unit covers: unit l covers `base_world * 2^l` metres in `size`
+	// texels, which is the shared ladder both implementations address by. `budget_texels` is what one
+	// layer may produce in one tick, in channel texels; it is not part of the page budget, because the
+	// clipmap does not touch the shared pool.
+	// The numbers below are the **recommended configuration**, and they are the ladder's own two
+	// endpoints: `size / base_world` is the finest density (256 texels over 0.25 m is **1024 texels a
+	// metre**) and `units` is the count that halves down to **1 texel a metre** (`1024 / 2^10 == 1`,
+	// eleven units). The earlier shapes capped the ladder at 1 (the inherited `base_world` 256) or at 8
+	// (`base_world` 32), which is why the near field was mush however many units the layer held: the
+	// cap is what a unit's density flattens to inside its own coverage. The reach that buys is
+	// `base_world * 2^10 = 256 m` of level square for the LOD implementation (+/-128 m) and 1.5 times
+	// that for the atlas, with 1024 texels a metre inside the first quarter-metre and 32 texels a metre
+	// at 4 m. See the task summary's cost table: the price is memory (levels x size^2 for the ring,
+	// 9 x blocksize^2 per ring for the atlas) and, for the LOD implementation, a whole-layer upload a
+	// finer unit publishes more often - which is exactly the cost the Atlas implementation does not pay.
+	TerrainClipmap::Implementation clipmap_implementation = TerrainClipmap::Implementation::LOD;
 	int clipmap_size = 256;
-	int clipmap_levels = 8;
-	real_t clipmap_base_world = 256.f;
+	int clipmap_units = TerrainClipmap::LADDER_UNITS;
+	real_t clipmap_base_world = 0.25f;
 	int clipmap_budget_texels = 65536;
-	std::unique_ptr<Terrain3DClipmap> clipmap[TerrainVT::GROUP_COUNT];
-	// The state stamp of each ring as the shader was last *bound* with, so a change the shader has to
-	// follow is one comparison per ring rather than a rebind per tick. See
-	// `Terrain3DClipmap::get_state_stamp()` and `Terrain3D::_update_vt_clipmap_arm()`.
-	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
-	// ---- The clipmap *atlas*, one per channel group ----
-	// The same rings as `clipmap[]`, organised as discrete blocks packed into one texture per channel
-	// (`terrain_3d_clipmap_atlas.h`). It is a second object rather than a mode of the ring because the
-	// two are different *update units*: a ring publishes a whole layer, an atlas publishes a block
-	// rect, and the choice is per cell. `clipmap_atlas[]` is built by the same assembly rule and only
-	// while a cell selects `ClipmapAtlas`, so a configuration that does not costs nothing.
-	//
-	// The shape is derived from the ring's own settings where it can be - the block size is
-	// `clipmap_size`, the block world is `clipmap_base_world` - so a user who tuned the ring's shape
-	// gets the same density ladder from the atlas, and the ring count is `clipmap_atlas_rings`.
-	int clipmap_atlas_rings = 4;
+	// The atlas's own shape, used by the Atlas implementation and ignored by LOD: the texels its
+	// one-time global block holds, and the per-frame production bound (one is the user's "a frame
+	// loads one block").
 	int clipmap_atlas_global_texels = 64;
-	// The per-frame production bound. One is the user's "a frame loads one block".
 	int clipmap_atlas_blocks_per_frame = 1;
-	std::unique_ptr<Terrain3DClipmapAtlas> clipmap_atlas[TerrainVT::GROUP_COUNT];
-	uint64_t clipmap_atlas_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
-	// Channel texels produced by all atlases in the tick that just ran, and the counters the rolling
-	// evidence is read from: how many block rects were published, how many blocks a scroll loaded and
-	// how many cells it kept.
-	int clipmap_atlas_produced_texels = 0;
-	int64_t clipmap_atlas_block_uploads = 0;
-	int64_t clipmap_atlas_scroll_events = 0;
-	int64_t clipmap_atlas_blocks_loaded = 0;
-	int64_t clipmap_atlas_blocks_retained = 0;
-	// How many times the atlas's debug payload was asked for and how many of those found an atlas:
-	// the same pair the ring's preview reports, so a test can tell "no atlas exists" from "the view
-	// did not ask".
-	mutable uint64_t clipmap_atlas_preview_calls = 0;
-	mutable uint64_t clipmap_atlas_preview_computed = 0;
-	// Channel texels produced by all rings in the tick that just ran.
+	std::unique_ptr<Terrain3DClipmapLayer> clipmap_layer[TerrainVT::GROUP_COUNT];
+	// The state stamp of each layer as the shader was last *bound* with, so a change the shader has to
+	// follow is one comparison per layer rather than a rebind per tick. See
+	// `Terrain3DClipmapLayer::get_state_stamp()` and `Terrain3D::_update_vt_clipmap_arm()`.
+	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	// Channel texels produced by every layer in the tick that just ran.
 	int clipmap_produced_texels = 0;
-	// ---- The material group's detail layer, which is the only path to the 1024 texels/m target ----
-	// A sparse, demand-resident layer of fine tiles in front of the camera, above the coarse ring and
-	// independent of it: the ring keeps its complete, low-density coverage and its fallback, and the
-	// detail layer only exists while the material group is delivered by `Clipmap` *and* this switch
+	// ---- The material group's detail layer, the wide 1024 texels/m patch over the ladder -----------
+	// A sparse, demand-resident layer of fine tiles in front of the camera, above the ladder and
+	// independent of it: the layer keeps its complete, octave-stepped coverage and its fallback, and
+	// the detail layer only exists while the material group is delivered by `Clipmap` *and* this switch
 	// is on. It owns its own GPU arrays, directory and source pipeline; nothing is allocated when it
 	// is not selected, which is the same rule the rings and the two views follow.
+	//
+	// The division of labour, now that the clipmap's own ladder reaches 1024: the *layer* is an
+	// octave ladder over the whole visible field (1024 at the focus falling to 1 at its outer edge),
+	// and the *detail layer* is the same 1024 spent over a wide near patch - `directory_size` tiles of
+	// `tile_size` texels, so 32 m of level-0 density at the shipped shape - under screen-footprint
+	// demand rather than under a ring geometry. Neither replaces the other: the ladder is what the
+	// whole ground is served by and what the arms fall back to, and the detail layer is what makes the
+	// near ground dense *across the view* rather than inside the first quarter-metre.
 	//
 	// `detail_density` is the level-0 density in texels per metre - the measurement the layer exists
 	// to make - and level `l` is that over `2^l` down to `detail_min_density`. `detail_budget_bytes`
 	// is what the whole layer may hold on the GPU; the slot table is *derived* from it, and a budget
 	// that cannot afford one ring of tiles turns the layer off with a log rather than allocating
 	// something unusable. `detail_demand_radius` bounds the near field the layer sharpens, in metres;
-	// beyond it the ring serves.
+	// beyond it the ladder serves.
 	// The layer's own switch. **On by default.** Selecting `Clipmap` for the material group is the
-	// whole instruction: at the shipped shape the ring alone is 1 texel/m, so leaving the layer off
-	// renders the picture a user who asked for 1024 texels/m reads as blur, with no visible control
-	// that says why - the switch is not the answer to "why is my near material mushy". The layer is
-	// therefore part of what selecting the method means, and a project that wants the ring's own
-	// picture turns it off. With it off nothing is allocated: no textures, no directory and no job
-	// queue.
+	// whole instruction: the ladder's own finest unit is a quarter of a metre wide, so a user who asked
+	// for 1024 texels/m would still read the wider near field as blur with the layer off - the switch
+	// is not the answer to "why is my near material mushy". The layer is therefore part of what
+	// selecting the method means, and a project that wants the ladder's own picture turns it off. With
+	// it off nothing is allocated: no textures, no directory and no job queue.
 	bool detail_enabled = true;
 	real_t detail_density = 1024.f;
 	// The coarsest detail level. 128 gives four levels (1024/512/256/128) out of the same slot table
 	// the three-level shape used. The coarsest level is the cheap one - a tile is `tile_size / 128`
 	// metres wide, four times the area of the finest tile per slot - and the demand fit in the
 	// manager uses it to keep the whole `demand_radius` covered by the detail layer instead of letting
-	// the fringe fall back to the 1 texel/m ring.
+	// the fringe fall back to the ladder's own, coarser units.
 	real_t detail_min_density = 128.f;
 	int detail_tile_size = 256;
 	int detail_directory_size = 128;

@@ -79,8 +79,16 @@ func ring() -> Dictionary:
 	return settings().get("clipmap", {}).get("height", {})
 
 
+# What only the selected implementation can say, nested under the layer's shared entry. The LOD
+# implementation carries the per-level reports and the fill/bake/invalidation counters; the
+# implementation selector is a setting of the one layer, so the shared keys above `layout` are the
+# same either way.
+func layout() -> Dictionary:
+	return ring().get("layout", {})
+
+
 func level_report() -> Dictionary:
-	var reports: Array = ring().get("level_reports", [])
+	var reports: Array = layout().get("level_reports", [])
 	return reports[0] if not reports.is_empty() else {}
 
 
@@ -99,7 +107,7 @@ func uploads() -> int:
 
 
 func fulls() -> int:
-	return int(ring().get("full_productions", 0))
+	return int(layout().get("full_level_productions", 0))
 
 
 func pending() -> int:
@@ -107,7 +115,11 @@ func pending() -> int:
 
 
 func valid_levels() -> int:
-	return int(ring().get("valid_levels", 0))
+	var count := 0
+	for report: Dictionary in (ring().get("unit_reports", []) as Array):
+		if bool(report.get("valid", false)):
+			count += 1
+	return count
 
 
 func idle() -> int:
@@ -115,11 +127,11 @@ func idle() -> int:
 
 
 func invalidations() -> int:
-	return int(ring().get("invalidation_calls", -1))
+	return int(layout().get("invalidation_calls", -1))
 
 
 func invalidated_texels() -> int:
-	return int(ring().get("invalidated_texels", -1))
+	return int(layout().get("invalidated_texels", -1))
 
 
 func updates() -> int:
@@ -164,7 +176,7 @@ func describe() -> String:
 	var report := level_report()
 	return "configured=%s selected=%s source=%s size=%d levels=%d valid=%d pending=%d|produced=%d full=%d upload=%d layers=%d|center=%s ring=%s texel_world=%.3f world_size=%.1f" % [
 		str(ring().get("configured", false)), str(ring().get("selected", false)), str(ring().get("source", "?")),
-		int(ring().get("size", 0)), int(ring().get("levels", 0)), valid_levels(), pending(),
+		int(ring().get("size", 0)), int(ring().get("units", 0)), valid_levels(), pending(),
 		produced(), fulls(), uploads(), int(ring().get("texture_layers", 0)),
 		str(report.get("center", "?")), str(report.get("ring", "?")),
 		float(report.get("texel_world", 0.0)), float(report.get("world_size", 0.0))]
@@ -250,13 +262,13 @@ func run_never_selected_block() -> void:
 	require(plain.has_clipmap_source(HEIGHT) and plain.has_clipmap_source(MATERIAL),
 			"the source factory answers which channels the ring can carry, and the matrix accepts exactly those")
 	var refused: Dictionary = s.get("delivery_unsupported", {}).get("height", {})
-	require(str(refused.get("AVT", "")).contains("clipmap ring"),
+	require(str(refused.get("AVT", "")).contains("clipmap layer"),
 			"and the refusal names what that channel's choices are: %s" % str(refused.get("AVT", "")))
 	require(not bool(entry.get("configured", true)) and not bool(material_entry.get("configured", true)),
 			"so a terrain whose only Clipmap writes were refused owns no ring")
-	require(entry.get("levels", -1) == -1, "and therefore no levels, no texture and no jobs")
+	require(entry.get("units", -1) == -1, "and therefore no levels, no texture and no jobs")
 	require(not bool(s.get("clipmap_service", true)), "and reports no clipmap service")
-	require(not bool(s.get("clipmap_ring", true)), "and no ring object")
+	require(not bool(s.get("clipmap_layer", true)), "and no layer object")
 	require(int(s.get("clipmap_produced_texels", -1)) == 0, "and produces nothing while it ticks")
 	require(plain.sample_vt_clipmap(HEIGHT, Vector2(4.0, 4.0)) != plain.sample_vt_clipmap(HEIGHT, Vector2(4.0, 4.0)),
 			"and answers a sample with NAN rather than with a value")
@@ -265,7 +277,7 @@ func run_never_selected_block() -> void:
 	require(plain.debug_update_vt_clipmap(HEIGHT) >= 0 and plain.debug_update_vt_clipmap(MATERIAL) >= 0,
 			"and the mechanism's own entry builds either channel's ring, with no cell claiming the method")
 	print("VT_CLIPMAP_NEVER_SELECTED configured=%s levels=%s service=%s produced=%d" % [
-		str(entry.get("configured", "?")), str(entry.get("levels", "none")),
+		str(entry.get("configured", "?")), str(entry.get("units", "none")),
 		str(s.get("clipmap_service", "?")), int(s.get("clipmap_produced_texels", -1))])
 	holder.queue_free()
 	await process_frame
@@ -329,7 +341,7 @@ func run() -> void:
 	require(not bool(ring().get("selected", false)), "while no delivery cell claims the method, which this build refuses")
 	require(str(ring().get("source", "")) == "height", "the ring names the channel it carries")
 	require(int(ring().get("size", 0)) == SIZE, "the ring takes the configured size")
-	require(int(ring().get("levels", 0)) == LEVELS, "the ring takes the configured level count")
+	require(int(ring().get("units", 0)) == LEVELS, "the ring takes the configured level count")
 	require(int(ring().get("texture_layers", 0)) == LEVELS, "one layer a level, one channel a texel")
 	require(pending() == 0, "a budget of one whole level drains it in one tick")
 	require(valid_levels() == 1, "the drained level is valid")
@@ -493,14 +505,14 @@ func run() -> void:
 	#    carry the world square of every level - a clipped *view* of a ring is exactly what makes a
 	#    strip look right for a frame - and it has to state what is still queued, because the queued
 	#    rects are the only part of a ring a picture can show changing.
-	require(terrain.has_vt_clipmap_ring(), "the ring the entry built exists, and that is what the payload is gated on")
+	require(terrain.has_vt_clipmap_layer(), "the layer the entry built exists, and that is what the payload is gated on")
 	require(not terrain.is_vt_delivery_used(CLIPMAP), "while no delivery cell claims the method, which this build refuses")
 	var preview := terrain.get_clipmap_layout_preview()
-	var rings: Array = preview.get("rings", [])
-	require(rings.size() == 1, "the preview describes exactly the one ring that exists, not one a group")
-	var entry: Dictionary = rings[0] if not rings.is_empty() else {}
+	var layers: Array = preview.get("layers", [])
+	require(layers.size() == 1, "the preview describes exactly the one layer that exists, not one a group")
+	var entry: Dictionary = layers[0] if not layers.is_empty() else {}
 	require(str(entry.get("group", "")) == "height", "and names the channel group it carries")
-	var squares: Array = entry.get("levels", [])
+	var squares: Array = entry.get("unit_reports", [])
 	require(squares.size() == LEVELS, "with one square a level")
 	var square: Dictionary = squares[0] if not squares.is_empty() else {}
 	require(absf(float(square.get("world_size", 0.0)) - BASE_WORLD) < 0.001, "each square is the world that level covers")
@@ -520,7 +532,10 @@ func run() -> void:
 	await tick()
 	require(pending() == 1 and produced() > 0, "a four-texel budget leaves the job queued")
 	var partial := preview_level(squares_of(terrain.get_clipmap_layout_preview()))
-	require(int(partial.get("pending", 0)) == 1, "the payload counts the queued job")
+	# The shared per-unit schema publishes `pending` as the number of queued rects a unit owes (the
+	# old per-group preview published the job count beside the rects). One job split in two is
+	# therefore two, which the rect assertion below reads as its own statement.
+	require(int(partial.get("pending", 0)) == 2, "the payload counts the queued rects")
 	var rects: Array = partial.get("pending_rects", [])
 	require(rects.size() == 2, "and splits what is left into the rest of the row and the rows below it")
 	var remaining := 0.0
@@ -529,8 +544,8 @@ func run() -> void:
 	require(absf(remaining - float(TEXELS - 4)) < 0.001,
 			"the rects are exactly the %d texels the budget has not produced" % (TEXELS - 4))
 	require(not bool(partial.get("valid", true)), "and the level is not valid while that work is queued")
-	print("VT_CLIPMAP_PREVIEW rings=%d levels=%d queued=%d rects=%d remaining=%.0f focus=%.1f,%.1f" % [
-		rings.size(), squares.size(), int(partial.get("pending", 0)), rects.size(), remaining, focus.x, focus.y])
+	print("VT_CLIPMAP_PREVIEW layers=%d levels=%d queued=%d rects=%d remaining=%.0f focus=%.1f,%.1f" % [
+		layers.size(), squares.size(), int(partial.get("pending", 0)), rects.size(), remaining, focus.x, focus.y])
 
 	# The gate: the payload is refused while no ring exists and answered once one does, and the ring is
 	# the gate's whole subject - it does not ask the matrix, which could never say yes in this build.
@@ -541,15 +556,15 @@ func run() -> void:
 	await ticks_until_drained()
 	require(not terrain.is_vt_delivery_used(CLIPMAP),
 			"Clipmap stays unselected: this build refuses the cell for the height group")
-	require(terrain.has_vt_clipmap_ring(), "but the ring the entry built exists")
+	require(terrain.has_vt_clipmap_layer(), "but the layer the entry built exists")
 	require(not terrain.get_clipmap_layout_preview().is_empty(), "so the preview answers it")
 	var answered := settings()
 	require(int(answered.get("clipmap_preview_calls", 0)) - before_calls == 1, "the ask was counted")
-	require(int(answered.get("clipmap_preview_computed", 0)) - before_computed == 1, "and it did the work, because a ring was there")
-	print("VT_CLIPMAP_GATE calls=%d computed=%d ring=%s selected=%s" % [
+	require(int(answered.get("clipmap_preview_computed", 0)) - before_computed == 1, "and it did the work, because a layer was there")
+	print("VT_CLIPMAP_GATE calls=%d computed=%d layer=%s selected=%s" % [
 		int(answered.get("clipmap_preview_calls", 0)) - before_calls,
 		int(answered.get("clipmap_preview_computed", 0)) - before_computed,
-		str(answered.get("clipmap_ring")), str(terrain.is_vt_delivery_used(CLIPMAP))])
+		str(answered.get("clipmap_layer")), str(terrain.is_vt_delivery_used(CLIPMAP))])
 
 	if failed:
 		print("REGRESSION: clipmap ring")
@@ -572,13 +587,14 @@ func snapshots() -> Array:
 	return values
 
 
-# The level squares the preview reports for the first ring in its payload, which is the ring this
-# scene builds: one entry a level, in level order.
+# The per-unit entries the preview reports for the first layer in its payload, which is the layer
+# this scene builds: one entry a unit, in unit order, in the shared schema either implementation
+# fills.
 func squares_of(p_preview: Dictionary) -> Array:
-	var rings: Array = p_preview.get("rings", [])
-	if rings.is_empty():
+	var layers: Array = p_preview.get("layers", [])
+	if layers.is_empty():
 		return []
-	return (rings[0] as Dictionary).get("levels", [])
+	return (layers[0] as Dictionary).get("unit_reports", [])
 
 
 # The finest level of a set of squares, which is the one a one-level ring has.

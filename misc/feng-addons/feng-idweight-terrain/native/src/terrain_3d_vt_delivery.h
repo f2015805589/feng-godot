@@ -52,23 +52,21 @@ enum class Delivery : uint8_t {
 	// The sectored adaptive virtual texture: region-local addressing, a per-sector virtual
 	// image, a mip-carrying page table and a coarse owner.
 	AVT = 1,
-	// A toroidal ring of power-of-two levels in one Texture2DArray. No indirection, no
-	// allocator, no LRU: an address is arithmetic.
+	// The clipmap: a ring of power-of-two levels over the near field, one *delivery* with two
+	// interchangeable *implementations* (`vt_clipmap_implementation`): the toroidal level ring
+	// (`terrain_3d_clipmap.h`, "LOD") and the block atlas (`terrain_3d_clipmap_atlas.h`,
+	// "Atlas"). The two differ in storage, upload unit, rolling and layout, which is why the user
+	// picks one *inside* the clipmap settings rather than as a second delivery: the sampling
+	// contract, the shape, the debug schema and the producer's queue are one layer's
+	// (`terrain_3d_clipmap_layer.h`), and a cell that names Clipmap gets whichever
+	// implementation is selected.
 	Clipmap = 2,
 	// The world-space sparse virtual texture: one global page grid, a distance level rule
 	// and a pinned root pyramid.
 	SVT = 3,
-	// The same rings as `Clipmap`, organised as discrete blocks packed into one texture per
-	// channel (`terrain_3d_clipmap_atlas.h`) instead of one toroidal level per array layer. The
-	// storage and the update unit are what differ: a block is a rect of one texture and is
-	// written with `RenderingDevice::texture_copy()`, so a movement republishes the rects that
-	// changed rather than every level's whole square. The band rule, the fallback to the region
-	// arrays and the material bake are the ring's, so a cell selects this exactly as it selects
-	// `Clipmap` and the two are the same layer with a different residency unit.
-	ClipmapAtlas = 4,
 };
 
-inline constexpr int DELIVERY_COUNT = 5;
+inline constexpr int DELIVERY_COUNT = 4;
 inline constexpr int TIER_COUNT = 2;
 inline constexpr int GROUP_COUNT = 2;
 
@@ -102,8 +100,6 @@ inline const char *delivery_name(const Delivery p_delivery) {
 			return "AVT";
 		case Delivery::Clipmap:
 			return "Clipmap";
-		case Delivery::ClipmapAtlas:
-			return "ClipmapAtlas";
 		case Delivery::SVT:
 			return "SVT";
 		default:
@@ -156,8 +152,7 @@ struct DeliveryMatrix {
 	// Whether any *service* was selected at all: false is the all-direct configuration,
 	// which is the one that must build no service, no array, no uniform and no shader arm.
 	bool any_service() const {
-		return uses(Delivery::AVT) || uses(Delivery::Clipmap) || uses(Delivery::ClipmapAtlas) ||
-				uses(Delivery::SVT);
+		return uses(Delivery::AVT) || uses(Delivery::Clipmap) || uses(Delivery::SVT);
 	}
 
 	// Whether a group is delivered by a method in a tier, which is what a family's

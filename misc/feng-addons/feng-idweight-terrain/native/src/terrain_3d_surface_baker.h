@@ -5,6 +5,7 @@
 
 #include "constants.h"
 #include "terrain_3d_clipmap.h"
+#include "terrain_3d_clipmap_layer.h"
 #include "terrain_3d_vt_cells.h"
 
 #include <godot_cpp/classes/image.hpp>
@@ -237,6 +238,20 @@ private:
 		// be dispatched after it: the layers it would write describe the old materials, and the
 		// ring would then be told they are current. A mismatch drops the job instead.
 		uint64_t material_version = 0;
+
+		// The job as the **shared** acknowledgment entry (`TerrainClipmap::BakeRect`): the ring
+		// decides whether the bake still describes current content, and it takes that decision in the
+		// same shape whichever implementation queued the rect.
+		TerrainClipmap::BakeRect rect() const {
+			TerrainClipmap::BakeRect entry;
+			entry.unit = level;
+			entry.x0 = x0;
+			entry.y0 = y0;
+			entry.x1 = x1;
+			entry.y1 = y1;
+			entry.lease = lease;
+			return entry;
+		}
 	};
 
 	// The ring bake's state: the ring the set was built for (identity only - a ring is baked by the
@@ -281,6 +296,20 @@ private:
 		int payload_layer = 0;
 		int height_layer = 1;
 		uint64_t material_version = 0;
+
+		// The job as the **shared** acknowledgment entry (`TerrainClipmap::BakeRect`): `unit` is the
+		// block's slot and `lease` the slot serial, which is what makes a slot reused since the rect
+		// was taken refuse the old bake. The rect is the block's own square of the atlas.
+		TerrainClipmap::BakeRect rect() const {
+			TerrainClipmap::BakeRect entry;
+			entry.unit = slot;
+			entry.x0 = x0;
+			entry.y0 = y0;
+			entry.x1 = x0 + texels;
+			entry.y1 = y0 + texels;
+			entry.lease = serial;
+			return entry;
+		}
 	};
 	struct AtlasBake {
 		const Terrain3DClipmapAtlas *atlas = nullptr;
@@ -361,9 +390,24 @@ private:
 	// write - in which case the ring keeps serving nothing but its own texels.
 	bool _ensure_ring_bake(Terrain3DClipmap *p_ring);
 	void _free_ring_bake();
+	// A bake's descriptor set names the storage it was built for, so the device releases it when that
+	// storage is freed - which is what replacing the layer's implementation, or reconfiguring it, does.
+	// Binding such a set is a null-uniform-set dispatch instead of a bake, so every dispatch checks it
+	// first and the producer forgets the stale sets. Nothing is lost: the storage still holds the rects
+	// it queued and a job the producer drops was never acknowledged, so the next offer rebuilds the set
+	// and collects them again.
+	bool _bake_set_is_live(const RID &p_set) const;
+	void _retire_stale_bake_sets();
 	// The render callback's half. Dispatches the queued levels into the ring's own layers and records
 	// what landed; the next offer marks them. Returns how many jobs were dispatched.
 	int _dispatch_ring_bake();
+	// The two implementations' offers, reached from the one public entry below. They are separate
+	// because their *storage* is: a ring job writes a rect of a level's layer of one array, an atlas job
+	// writes a rect of the atlas's array with the block's own origin, and the two descriptor sets name
+	// different textures. Everything above them - the queue's shape, the budget, the lease and the
+	// acknowledgment - is the shared contract's, which is why this is the only branch in the addon.
+	int _queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels);
+	int _queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, const int p_budget_texels);
 	// The albedo and normal arrays the bake samples, resolved to the device's own textures, with the
 	// bundle's dummy arrays as the fallback for a snapshot the device no longer owns. Shared with the
 	// page bake's descriptor set, so "which array does the bake read" has one answer.
@@ -749,16 +793,22 @@ public:
 	// RenderingServer's queue while the bake is a device dispatch, and issuing both for one rect in one
 	// tick would let the bake read the payload the rect is replacing. Returns how many rects this call
 	// offered, which is not how many are baked - that is `Terrain3DClipmap::is_level_baked()`.
-	int queue_clipmap_ring(Terrain3DClipmap *p_ring, const int p_budget_texels);
-
-	// ---- The atlas's bake ------------------------------------------------------------------------
-	// The block atlas is the ring's second residency unit and is baked by the same shader: one *block
-	// rect of the atlas* is one job, its rect the one the atlas produced, its source the atlas's own
-	// payload and height layers, and its outputs the atlas's three baked arrays at that rect. The
-	// offer/acknowledge handshake is the ring's exactly - the caller offers once a tick with the same
-	// budget, the render callback dispatches the rects the offer could take, and the next offer
-	// reports each landed rect back to the atlas, which refuses a rect whose slot has been reused.
-	int queue_clipmap_atlas(Terrain3DClipmapAtlas *p_atlas, const int p_budget_texels);
+	// ---- The clipmap layer's bake, one entry for both implementations ----------------------------
+	// The layer is baked by one shader: a job is one *rect the layer produced*, its source the layer's
+	// own payload and height, and its outputs the layer's three baked arrays at that rect. What differs
+	// between the two implementations is only where those rects land - a whole level's layer or a
+	// block's rect of the atlas - and that is this producer's own plumbing, so the caller offers the
+	// layer once a tick with the same budget the layer's production is charged in (channel texels, a
+	// soft floor of one rect per offer) and the rects this call can bake are handed to the render
+	// callback, which dispatches them and records that they landed. The *next* call reports each landed
+	// rect back to the layer, which is what decides whether the bake still describes current content -
+	// a level whose content moved, or an atlas slot that has been reused since.
+	//
+	// The one-tick separation is not an optimisation: a rect's payload reaches the layer through
+	// RenderingServer's queue while the bake is a device dispatch, and issuing both for one rect in one
+	// tick would let the bake read the payload the rect is replacing. Returns how many rects this call
+	// offered.
+	int queue_clipmap_layer(Terrain3DClipmapLayer *p_layer, const int p_budget_texels);
 	// The atlas bake's own accounting: the dispatches it recorded and the rects still queued.
 	Dictionary get_atlas_bake_stats() const;
 

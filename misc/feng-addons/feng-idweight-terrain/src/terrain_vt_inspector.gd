@@ -13,7 +13,7 @@ const AVT_LAYOUT_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-te
 const CLIPMAP_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd")
 ## `TerrainVT::Delivery::AVT`, which is also the value of the property that selects it. Named so the
 ## block below says which method it describes rather than carrying a bare number; the clipmap's block
-## has no constant here because its gate is the ring's existence rather than a delivery value.
+## has no constant here because its gate is the layer's existence rather than a delivery value.
 const DELIVERY_AVT := 1
 
 
@@ -96,7 +96,7 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 	# The clipmap's debug view is the same kind of page as the AVT one and sits beside it: the
 	# matrix's two *VT* methods each have a layout, and the two bands' pages are what the physical
 	# residency list below cannot show. It is added only where the native VT Page subgroup exists -
-	# the SVT fallback branch below describes an older binary that has no ring at all.
+	# the SVT fallback branch below describes an older binary that has no layer at all.
 	if native_page_group:
 		var clipmap_block := VBoxContainer.new()
 		clipmap_block.name = "TerrainClipmapDebugBlock"
@@ -106,8 +106,8 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 
 		var clipmap_header := Label.new()
 		clipmap_header.name = "TerrainClipmapDebugHeader"
-		clipmap_header.text = "Clipmap VT Page · ring levels / world"
-		clipmap_header.tooltip_text = "Read-only clipmap ring: each level's world square and addressing, and the strips it still has queued"
+		clipmap_header.text = "Clipmap VT Page · layer units / world"
+		clipmap_header.tooltip_text = "Read-only clipmap layer: its units' world squares and addressing for the selected implementation, and the strips it still has queued"
 		clipmap_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		clipmap_block.add_child(clipmap_header)
 
@@ -119,10 +119,10 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 
 		var clipmap_note := Label.new()
 		clipmap_note.name = "TerrainClipmapDebugNote"
-		clipmap_note.text = "A clipmap level is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
+		clipmap_note.text = "One clipmap delivery, two storages: the LOD level array and the packed block atlas. A unit is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
 		clipmap_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		clipmap_block.add_child(clipmap_note)
-		_connect_debug_block(clipmap_preview, clipmap_block, p_object, &"has_vt_clipmap_ring")
+		_connect_debug_block(clipmap_preview, clipmap_block, p_object, &"has_vt_clipmap_layer")
 
 	_connect_debug_block(avt_preview, avt_block, p_object, &"is_vt_delivery_used", DELIVERY_AVT)
 

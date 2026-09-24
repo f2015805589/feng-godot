@@ -48,7 +48,9 @@ const DIRECT := 0
 const AVT := 1
 const CLIPMAP := 2
 const SVT := 3
-const CLIPMAP_ATLAS := 4
+# The delivery enum is Direct/AVT/Clipmap/SVT; there is no ClipmapAtlas delivery any more (the
+# atlas is an implementation *inside* the one clipmap layer). A value past the enum is refused.
+const OUT_OF_RANGE := 4
 
 var terrain: Terrain3D
 var scene: Node3D
@@ -80,10 +82,10 @@ func shader_uses_vt() -> bool:
 
 func describe() -> String:
 	var s := settings()
-	return "cells near/material=%d near/height=%d far/material=%d far/height=%d | services avt=%s svt=%s clipmap=%s | objects avt=%s svt=%s ring=%s | shader_arms=%s | array_needed=%s" % [
+	return "cells near/material=%d near/height=%d far/material=%d far/height=%d | services avt=%s svt=%s clipmap=%s | objects avt=%s svt=%s layer=%s | shader_arms=%s | array_needed=%s" % [
 		cell(NEAR, MATERIAL), cell(NEAR, HEIGHT), cell(FAR, MATERIAL), cell(FAR, HEIGHT),
 		str(s.get("avt_service", "?")), str(s.get("svt_service", "?")), str(s.get("clipmap_service", "?")),
-		str(terrain.get_surface_vt() != null), str(terrain.get_surface_svt() != null), str(s.get("clipmap_ring", "?")),
+		str(terrain.get_surface_vt() != null), str(terrain.get_surface_svt() != null), str(s.get("clipmap_layer", "?")),
 		str(s.get("vt_shader_arms", "?")), str(s.get("surface_array_upload_needed", "?"))]
 
 
@@ -117,7 +119,7 @@ func run_never_selected_block() -> void:
 	require(not bool(s.get("avt_service", true)), "a terrain that never selected AVT reports no AVT service")
 	require(not bool(s.get("svt_service", true)), "a terrain that never selected SVT reports no SVT service")
 	require(not bool(s.get("clipmap_service", true)), "a terrain that never selected clipmap reports no clipmap service")
-	require(not bool(s.get("clipmap_ring", true)), "and owns no ring at all")
+	require(not bool(s.get("clipmap_layer", true)), "and owns no layer at all")
 	require(plain.is_vt_delivery_supported(HEIGHT, CLIPMAP),
 			"and Clipmap is deliverable for the height group, because the shader arm samples the ring")
 	require(not plain.is_vt_delivery_used(CLIPMAP), "while a cell that never named it is not a use of it")
@@ -203,18 +205,20 @@ func run() -> void:
 			"which is the registry's answer for both channels rather than a table")
 	require(terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP),
 			"the height group is delivered by Clipmap, whose arm samples the ring")
-	# The block atlas is the clipmap layer's second residency unit and is deliverable for exactly the
-	# groups the ring is: it carries the same source, and both its arms sample block rects of it.
-	require(terrain.is_vt_delivery_supported(MATERIAL, CLIPMAP_ATLAS) and terrain.is_vt_delivery_supported(HEIGHT, CLIPMAP_ATLAS),
-			"and by ClipmapAtlas, which is deliverable for either group that has a clipmap source")
+	# A value outside the enum is refused rather than clamped, which is the rule the stored form
+	# follows: the matrix has four methods, and there is no fifth for either group.
+	require(not terrain.is_vt_delivery_supported(MATERIAL, OUT_OF_RANGE) and
+			not terrain.is_vt_delivery_supported(MATERIAL, OUT_OF_RANGE + 1) and
+			not terrain.is_vt_delivery_supported(HEIGHT, OUT_OF_RANGE),
+			"and a value outside the enum is refused rather than clamped")
 	require(not terrain.is_vt_delivery_supported(HEIGHT, AVT) and not terrain.is_vt_delivery_supported(HEIGHT, SVT),
 			"while AVT and SVT are not the height channel's methods at all: its choices are Direct and the clipmap layer")
 	require(terrain.is_vt_delivery_supported(HEIGHT, DIRECT), "Direct is deliverable for either group, being the fallback")
 	var height_reason := terrain.get_vt_delivery_unsupported_reason(HEIGHT, SVT)
-	require(height_reason == "the height channel is delivered directly or by the clipmap ring; AVT and SVT page the diffuse+normal group",
+	require(height_reason == "the height channel is delivered directly or by the clipmap layer; AVT and SVT page the diffuse+normal group",
 			"and the reason names the design rather than a missing arm: %s" % height_reason)
 	var supported: Dictionary = settings().get("delivery_supported", {})
-	require(str(supported.get("material", [])) == str([DIRECT, AVT, CLIPMAP, SVT, CLIPMAP_ATLAS]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP, CLIPMAP_ATLAS]),
+	require(str(supported.get("material", [])) == str([DIRECT, AVT, CLIPMAP, SVT]) and str(supported.get("height", [])) == str([DIRECT, CLIPMAP]),
 			"the report publishes the methods each group may name: material %s, height %s" % [
 					str(supported.get("material")), str(supported.get("height"))])
 
@@ -227,8 +231,8 @@ func run() -> void:
 	require(cell(NEAR, HEIGHT) == DIRECT and cell(FAR, HEIGHT) == DIRECT,
 			"a height cell naming AVT is refused and stays Direct")
 	s = settings()
-	require(not bool(s.get("clipmap_service", true)) and not bool(s.get("clipmap_ring", true)),
-			"so no clipmap service is selected and no ring is built")
+	require(not bool(s.get("clipmap_service", true)) and not bool(s.get("clipmap_layer", true)),
+			"so no clipmap service is selected and no layer is built")
 	require(not bool(s.get("avt_service", true)) and not bool(s.get("svt_service", true)),
 			"and a refused cell selects no paged service either")
 	require(not shader_uses_vt(), "so the arms of a matrix whose only non-direct writes were refused are not compiled")
@@ -243,7 +247,7 @@ func run() -> void:
 	s = settings()
 	require(cell(NEAR, HEIGHT) == CLIPMAP, "the height group accepts Clipmap")
 	require(bool(s.get("clipmap_service", false)), "which selects the clipmap service")
-	require(bool(s.get("clipmap_ring", false)), "and builds its ring")
+	require(bool(s.get("clipmap_layer", false)), "and builds its layer")
 	require(shader_uses_vt(), "and the generated shader carries the VT arms")
 	# The ring's arm per channel group, published with the group it belongs to rather than in a key of
 	# its own, so a build can carry one group's arm without the other's.
@@ -258,7 +262,7 @@ func run() -> void:
 	ring_entry = clipmap.get("height", {})
 	require(not bool(ring_entry.get("shader_arm", true)), "and the ring's arm leaves the generated shader")
 	require(not shader_uses_vt(), "with the rest of the VT arms, no cell naming a service any more")
-	require(bool(s.get("clipmap_ring", false)), "while the ring object stays, being a residency cache as well as a renderer")
+	require(bool(s.get("clipmap_layer", false)), "while the layer object stays, being a residency cache as well as a renderer")
 
 	# The material cell is the second channel the ring can carry, and its source is the packed `R16`
 	# surface payload the group's baked pages are produced *from*: the band the ring serves is therefore
@@ -281,7 +285,7 @@ func run() -> void:
 	# dispatch-and-mark handshake across ticks, and the material it produces, are `vt_clipmap_render`'s
 	# bake block, which brings the far field up for exactly that reason.
 	var baked_channels := 0
-	for report in (material_ring.get("level_reports", []) as Array):
+	for report in (material_ring.get("layout", {}).get("level_reports", []) as Array):
 		baked_channels = int(report.get("baked_channels", 0))
 	require(baked_channels == 3, "the material ring carries the three arrays a producer bakes out of it")
 	# The height ring's own arm left the code above, so this is the material arm being carried rather
@@ -322,7 +326,7 @@ func run() -> void:
 	require(bool(ring.get("configured", false)), "so the ring it built is reported")
 	require(not bool(ring.get("selected", false)), "while no cell claims the method")
 	require(str(ring.get("source", "")) == "height", "and it names the channel it carries")
-	require(bool(s.get("clipmap_ring", false)), "and the report says a ring exists")
+	require(bool(s.get("clipmap_layer", false)), "and the report says a layer exists")
 	require(terrain.debug_update_vt_clipmap(MATERIAL) >= 0,
 			"while the diffuse+normal group's entry steps the ring its own source carries as well")
 	require(not terrain.is_vt_delivery_used(CLIPMAP), "and none of this makes the matrix report Clipmap as used")
@@ -364,7 +368,8 @@ func run() -> void:
 	#    and leaves `*_preview_computed` where it was.
 	require(terrain.is_vt_delivery_used(AVT), "AVT is reported as used while a cell selects it")
 	require(not terrain.is_vt_delivery_used(CLIPMAP), "and Clipmap is not, because no cell names it in this configuration")
-	require(not terrain.is_vt_delivery_used(4), "and a value outside the enum is refused rather than clamped")
+	require(not terrain.is_vt_delivery_used(OUT_OF_RANGE) and not terrain.is_vt_delivery_used(OUT_OF_RANGE + 1),
+			"and a value outside the enum is refused rather than clamped")
 	var before := settings()
 	terrain.get_avt_layout_preview(camera)
 	require(not terrain.get_clipmap_layout_preview().is_empty(),
@@ -396,7 +401,7 @@ func run() -> void:
 	print("VT_DELIVERY_PREVIEW_GATE avt_calls=%d avt_computed=%d clipmap_calls=%d clipmap_computed=%d ring=%s" % [
 		int(refused.get("avt_preview_calls", 0)), int(refused.get("avt_preview_computed", 0)),
 		int(refused.get("clipmap_preview_calls", 0)), int(refused.get("clipmap_preview_computed", 0)),
-		str(refused.get("clipmap_ring"))])
+		str(refused.get("clipmap_layer"))])
 
 	if failed:
 		print("REGRESSION: delivery matrix assembly")

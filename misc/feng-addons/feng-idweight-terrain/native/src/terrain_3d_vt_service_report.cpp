@@ -1,4 +1,4 @@
-// Copyright © 2026 Terrain3D contributors.
+﻿// Copyright 婕?2026 Terrain3D contributors.
 
 // Terrain3D's virtual texture service, part 3 of 4: the diagnostics.
 //
@@ -90,7 +90,6 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["avt_service"] = has_avt_delivery();
 	result["svt_service"] = has_svt_delivery();
 	result["clipmap_service"] = has_clipmap_delivery();
-	result["clipmap_atlas_service"] = has_clipmap_atlas_delivery();
 	// Which methods a cell may name, per channel group, and the sentence for each one it may not:
 	// the matrix refuses a method this build cannot deliver (`is_vt_delivery_supported()`), so a
 	// panel disables a row from published state rather than from its own hard-coded list, and the
@@ -114,11 +113,11 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	}
 	result["delivery_supported"] = delivery_supported;
 	result["delivery_unsupported"] = delivery_unsupported;
-	// Whether any ring object exists, which is the clipmap's own "is this used" question and what its
+	// Whether any layer object exists, which is the clipmap's own "is this used" question and what its
 	// debug view and preview are gated on. `clipmap_service` above is the matrix's answer; this is the
-	// object's, and the two differ exactly when `debug_update_vt_clipmap()` has built a ring to
+	// object's, and the two differ exactly when `debug_update_vt_clipmap()` has built a layer to
 	// measure the mechanism while no cell names the method.
-	result["clipmap_ring"] = has_vt_clipmap_ring();
+	result["clipmap_layer"] = has_vt_clipmap_layer();
 	// The two editor previews, counted: how many asks each got and how many of those did the work.
 	// The difference is the asks a delivery gate refused, and it is the reading behind "a method no
 	// row selects owns no layout, so its debug view neither draws nor scans". See
@@ -132,147 +131,83 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	// case exactly when no service delivers it. Published because it is the other half of the
 	// assembly statement: with every cell direct the array is not a fallback, it is the renderer.
 	result["surface_array_upload_needed"] = is_surface_array_upload_needed();
-	// The clipmap ring: the object that exists and what it cost. `selected` is the matrix's claim for
-	// this group and `configured` is the object; a reader can therefore tell "the mechanism exists and
-	// nothing delivers it" (a ring the entry built while every cell is `Direct`) from "no ring at
-	// all" without reading a log. The per-group entry carries the addressing that says a level is
-	// *current* rather than approximate (each level's centre, ring and `valid`), the counters that
-	// say what the ring has produced, and the upload bytes: the CPU side is incremental and a
-	// whole-layer transfer is not, so the second half is a published measurement rather than an
-	// assumption. `invalidation_calls` / `invalidated_texels` are the same statement for an edit: a
-	// changed rect is re-produced rather than the ring. See docs/vt_delivery_assembly.md section 6.
+	// The clipmap layer: the object that exists, what it cost, and which implementation answered.
+	// `selected` is the matrix's claim for this group and `configured` is the object, so a reader can
+	// tell "the mechanism exists and nothing delivers it" (a layer the entry built while every cell is
+	// `Direct`) from "no layer at all" without reading a log. Every key below is the *shared* schema -
+	// `TerrainClipmap::UnitReport` and the layer's own readings - so the report is one table whichever
+	// implementation is selected; `implementation` names which, and `layout` nests what only that one
+	// can say. The counters say what the layer has produced and uploaded: the LOD ring's CPU side is
+	// incremental and its transfer is not, the atlas's unit is a block rect, and both are published
+	// rather than assumed. `invalidation_calls` / `invalidated_texels` are the same statement for an
+	// edit: a changed rect is re-produced rather than a whole unit. See
+	// docs/vt_delivery_assembly.md section 6.
 	result["clipmap_size"] = _vt.clipmap_size;
-	result["clipmap_levels_setting"] = _vt.clipmap_levels;
+	result["clipmap_levels_setting"] = _vt.clipmap_units;
 	result["clipmap_base_world"] = _vt.clipmap_base_world;
 	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
 	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
-	// ---- The clipmap atlas: the same rings, block-organised and block-uploaded ------------------
-	// The mechanism's own readings, published beside the ring's so the load comparison is one report
-	// rather than two programs. The numbers that matter are the update *unit*: `block_uploads` is how
-	// many block rects were published (against the ring's whole-layer `upload_bytes`), and
-	// `blocks_loaded` / `blocks_retained` are the rolling evidence - a scroll that reloaded the grid
-	// would report `blocks_retained` at zero.
-	result["clipmap_atlas_available"] = has_vt_clipmap_atlas();
-	result["clipmap_atlas_rings"] = _vt.clipmap_atlas_rings;
-	result["clipmap_atlas_global_texels"] = _vt.clipmap_atlas_global_texels;
-	result["clipmap_atlas_blocks_per_frame"] = _vt.clipmap_atlas_blocks_per_frame;
-	result["clipmap_atlas_produced_texels"] = _vt.clipmap_atlas_produced_texels;
-	result["clipmap_atlas_block_uploads"] = _vt.clipmap_atlas_block_uploads;
-	result["clipmap_atlas_scroll_events"] = _vt.clipmap_atlas_scroll_events;
-	result["clipmap_atlas_blocks_loaded"] = _vt.clipmap_atlas_blocks_loaded;
-	result["clipmap_atlas_blocks_retained"] = _vt.clipmap_atlas_blocks_retained;
-	result["clipmap_atlas_preview_calls"] = int64_t(_vt.clipmap_atlas_preview_calls);
-	result["clipmap_atlas_preview_computed"] = int64_t(_vt.clipmap_atlas_preview_computed);
-	Dictionary clipmap_atlas;
-	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
-		const Terrain3DClipmapAtlas *atlas = _vt.clipmap_atlas[group].get();
-		Dictionary entry;
-		entry["configured"] = atlas != nullptr && atlas->is_configured();
-		entry["selected"] = _vt.delivery.group_uses(TerrainVT::ChannelGroup(group), TerrainVT::Delivery::ClipmapAtlas);
-		entry["source"] = atlas != nullptr ? atlas->get_source_name() : String("none");
-		entry["source_available"] = has_clipmap_source(group);
-		if (atlas != nullptr && atlas->is_configured()) {
-			entry["rings"] = atlas->get_rings();
-			entry["blocks"] = atlas->get_block_count();
-			entry["slots"] = atlas->get_slot_count();
-			entry["cells"] = atlas->get_cell_count();
-			entry["channels"] = atlas->get_channel_count();
-			entry["block_size"] = atlas->get_config().block_size;
-			entry["block_world"] = atlas->get_config().base_world;
-			entry["width"] = atlas->get_atlas_width();
-			entry["height"] = atlas->get_atlas_height();
-			entry["produced_texels"] = int64_t(atlas->get_produced_texels());
-			entry["upload_bytes"] = int64_t(atlas->get_upload_bytes());
-			entry["block_uploads"] = int64_t(atlas->get_block_uploads());
-			entry["pending_jobs"] = atlas->get_pending_jobs();
-			entry["scroll_events"] = int64_t(atlas->get_scroll_events());
-			entry["blocks_loaded"] = int64_t(atlas->get_edge_blocks_loaded());
-			entry["blocks_retained"] = int64_t(atlas->get_interior_blocks_retained());
-			entry["last_scroll_loaded"] = int64_t(atlas->get_last_scroll_loaded());
-			entry["last_scroll_retained"] = int64_t(atlas->get_last_scroll_retained());
-			entry["update_calls"] = int64_t(atlas->get_update_calls());
-			entry["idle_updates"] = int64_t(atlas->get_idle_updates());
-			// The two readings the settle criteria are written against: how many cells point at a
-			// current block right now, and how many are waiting for one.
-			int current = 0;
-			int pending_cells = 0;
-			int baked_cells = 0;
-			for (int cell = 0; cell < atlas->get_cell_count(); cell++) {
-				current += atlas->is_cell_current(cell) ? 1 : 0;
-				pending_cells += atlas->get_cell_pending_slot(cell) >= 0 ? 1 : 0;
-				baked_cells += atlas->is_cell_baked(cell) ? 1 : 0;
-			}
-			entry["current_cells"] = current;
-			// The *material* readiness: a cell whose block's baked rect the producer has acknowledged.
-			// It is the gate the material arm reads, so a measurement of "the near material is there"
-			// is this number and not the source residency above.
-			entry["baked_cells"] = baked_cells;
-			entry["pending_bake_rects"] = atlas->get_pending_bake_rect_count();
-			// A cell is either serving a block or waiting for one, and never neither: that identity is
-			// the anti-flash property the per-frame timeline is evidence for - the replacement is built
-			// in a spare slot before the block it replaces is released, so no frame has a gap.
-			entry["pending_cells"] = pending_cells;
-			entry["serving_or_loading"] = current + pending_cells;
-			entry["ring_reports"] = atlas->get_ring_reports();
-			entry["layout"] = atlas->get_layout_report();
-		}
-		clipmap_atlas[TerrainVT::group_name(TerrainVT::ChannelGroup(group))] = entry;
-	}
-	result["clipmap_atlas"] = clipmap_atlas;
+	result["clipmap_implementation"] = String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
+	result["clipmap_implementation_hint"] = String(TerrainClipmap::implementation_hint());
+	result["clipmap_global_texels"] = _vt.clipmap_atlas_global_texels;
+	result["clipmap_blocks_per_frame"] = _vt.clipmap_atlas_blocks_per_frame;
 	// The material group's detail layer: the request (density, budget, radius), what it delivered
 	// (resident/valid/starved tiles, bytes) and its source and bake counters. One dictionary, because
 	// "asked for 1024" and "has 1024 resident and baked" are the two halves a reader has to compare
 	// and neither is the acceptance on its own. It is published both at the service level and nested
-	// in the material ring's entry below: the ring's entry is where a reader looks for the material
+	// in the material layer's entry below: the layer's entry is where a reader looks for the material
 	// group's own state, and the density acceptance reads the nested shape.
 	const Dictionary detail_material = get_vt_detail_settings();
 	result["detail_material"] = detail_material;
 	Dictionary clipmap;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
-		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
+		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
 		Dictionary entry;
-		entry["configured"] = ring != nullptr && ring->is_configured();
+		entry["configured"] = layer != nullptr && layer->is_configured();
 		entry["selected"] = _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap);
-		entry["source"] = ring != nullptr ? ring->get_source_name() : String("none");
+		entry["source"] = layer != nullptr ? layer->get_source_name() : String("none");
 		// Whether this build has a *source* for the group, which is the same answer the matrix's
 		// acceptance is read from (`has_clipmap_source()`): a reader can therefore tell "the mechanism
 		// exists and nothing delivers it" from "this build cannot deliver it at all", and which of the
 		// two a refused cell is.
 		entry["source_available"] = has_clipmap_source(group);
-		// Whether the generated shader carries *this group's* ring arm. It is the narrower reading
+		// Whether the generated shader carries *this group's* clipmap arm. It is the narrower reading
 		// beside `vt_shader_arms` above and it moves on its own: a group delivered `Direct` in both
-		// bands compiles no ring code and binds no ring uniform, and a build can carry one group's arm
-		// without the other's. Read from the material's verdict rather than from the policy, because
-		// the verdict is what the compiled string is.
+		// bands compiles no clipmap code and binds no clipmap uniform, and a build can carry one
+		// group's arm without the other's. Read from the material's verdict rather than from the
+		// policy, because the verdict is what the compiled string is.
 		entry["shader_arm"] = _material.is_valid() && _material->is_shader_using_clipmap(group);
-		if (ring != nullptr) {
-			entry["size"] = ring->get_size();
-			entry["levels"] = ring->get_level_count();
-			entry["channels"] = ring->get_channel_count();
-			entry["base_world"] = ring->get_base_world();
-			entry["valid_levels"] = ring->get_level_valid_count();
-			entry["pending_jobs"] = ring->get_pending_jobs();
-			entry["texture_layers"] = ring->get_texture_layer_count();
-			entry["produced_texels"] = int64_t(ring->get_produced_texels());
-			entry["full_productions"] = int64_t(ring->get_full_level_productions());
-			entry["upload_bytes"] = int64_t(ring->get_upload_bytes());
-			entry["update_calls"] = int64_t(ring->get_update_calls());
-			entry["idle_updates"] = int64_t(ring->get_idle_updates());
-			entry["invalidation_calls"] = int64_t(ring->get_invalidation_calls());
-			entry["invalidated_texels"] = int64_t(ring->get_invalidated_texels());
-			// The bake's own accounting, in the same unit the production counters above are in: what a
-			// producer has written into the ring's layers, and what is still owed. A level's `baked` is
-			// the last rect's answer, so these are what say whether the ring is one strip behind or one
-			// level behind.
-			entry["baked_texels"] = int64_t(ring->get_baked_texels());
-			entry["bake_dispatches"] = int64_t(ring->get_bake_dispatches());
-			entry["bake_rejects"] = int64_t(ring->get_bake_rejects());
-			entry["pending_bake_rects"] = ring->get_pending_bake_rect_count();
-			entry["level_reports"] = ring->get_level_reports();
+		entry["implementation"] = layer != nullptr
+				? String(TerrainClipmap::implementation_name(layer->get_implementation()))
+				: String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
+		if (layer != nullptr && layer->is_configured()) {
+			entry["units"] = layer->get_unit_count();
+			entry["size"] = layer->get_size();
+			entry["channels"] = layer->get_channel_count();
+			entry["base_world"] = layer->get_ladder().base_world;
+			entry["texture_layers"] = layer->get_texture_layer_count();
+			entry["produced_texels"] = int64_t(layer->get_produced_texels());
+			entry["upload_bytes"] = int64_t(layer->get_upload_bytes());
+			entry["update_calls"] = int64_t(layer->get_update_calls());
+			entry["idle_updates"] = int64_t(layer->get_idle_updates());
+			entry["pending_jobs"] = layer->get_pending_jobs();
+			entry["pending_bake_rects"] = layer->get_pending_bake_count();
+			// The *unit* table, in the one shared schema: one entry per unit with its texel size, its
+			// reach, the density it serves, whether it is readable right now, whether its baked content
+			// is, and the rects it still owes. This is what a density/coverage reading and the debug
+			// view both consume, whichever implementation answered - asked once and read four ways.
+			const Dictionary payload = layer->get_debug_layout(String(TerrainVT::group_name(channel)));
+			entry["unit_reports"] = payload.get("unit_reports", Array());
+			entry["density_curve"] = payload.get("density_curve", PackedFloat32Array());
+			entry["unit_reach"] = payload.get("unit_reach", PackedFloat32Array());
+			entry["unit_density"] = payload.get("unit_density", PackedFloat32Array());
+			// What only the selected implementation can say - the LOD ring's per-level addressing and
+			// its bake accounting, the atlas's rect array, cells, packing and rolling counters.
+			entry["layout"] = payload.get("impl", Dictionary());
 		}
 		// The material group's finer half, in the entry of the group it belongs to: a fragment's
-		// fallback chain runs detail -> this ring -> the payload evaluation -> the array, so the two
+		// fallback chain runs detail -> the layer -> the payload evaluation -> the array, so the two
 		// granularities of the same group are read together.
 		if (channel == TerrainVT::ChannelGroup::Material) {
 			entry["detail"] = detail_material;
@@ -517,51 +452,46 @@ Ref<Image> Terrain3D::get_vt_page_preview(int p_slot) {
 	return _vt.vt_baker.is_valid() ? baker(_vt.vt_baker)->get_page_preview(p_slot) : Ref<Image>();
 }
 
-// The clipmap's debug payload: the world squares the ring's levels occupy right now and the rects
-// each one still has queued. One entry per ring that exists, so a group with no ring appears as
-// nothing at all rather than as a ring with zero levels, and a terrain with no ring - which in this
-// build is every terrain whose rings only `debug_update_vt_clipmap()` built - returns an empty
-// dictionary: the scan is refused, not drawn empty, which is the rule `get_avt_layout_preview()`
-// follows for AVT and the reason the two preview counters exist. The gate is therefore "is there a
-// ring", not "does a cell name the method": a ring that exists is what a picture of a ring is a
-// picture of, whichever door built it.
+// The clipmap's debug payload, in the **one schema** the facade assembles: the shared per-unit
+// entries, the layer's shape, its density/reach curve and the implementation's private payload
+// (`impl`). One entry per layer that exists, so a group with no layer appears as nothing at all rather
+// than as one with zero units, and a terrain with no layer - which in this build is every terrain
+// whose layers only `debug_update_vt_clipmap()` built - returns an empty dictionary: the scan is
+// refused, not drawn empty, which is the rule `get_avt_layout_preview()` follows for AVT and the reason
+// the two preview counters exist. The gate is therefore "is there a layer", not "does a cell name the
+// method": a layer that exists is what a picture of one is a picture of, whichever door built it.
 //
-// The focus is reported beside the levels because it is what the levels are snapped to: a level's
-// `center` is its own texel-snapped focus, so the three together say whether a level is current or
-// still holds the one it replaces.
+// The focus is reported beside the units because it is what they are snapped to, so the two together
+// say whether a unit is current or still holds the one it replaces. The *implementation* is reported
+// because the debug view draws the selected storage's picture: the LOD ring's nested squares and the
+// atlas's packed rects are two drawings of the same layer, and which one is right is this key.
 Dictionary Terrain3D::get_clipmap_layout_preview() const {
 	Dictionary result;
 	_vt.clipmap_preview_calls++;
-	if (!has_vt_clipmap_ring()) {
+	if (!has_vt_clipmap_layer()) {
 		return result;
 	}
 	_vt.clipmap_preview_computed++;
 	const Vector2 focus = v3v2(get_clipmap_target_position());
 	result["focus"] = focus;
 	result["size"] = _vt.clipmap_size;
-	result["levels_setting"] = _vt.clipmap_levels;
+	result["units_setting"] = _vt.clipmap_units;
 	result["base_world"] = _vt.clipmap_base_world;
 	result["budget_texels"] = _vt.clipmap_budget_texels;
-	Array rings;
+	result["implementation"] = String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
+	result["implementation_hint"] = String(TerrainClipmap::implementation_hint());
+	Array layers;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
-		const Terrain3DClipmap *ring = _vt.clipmap[group].get();
-		if (ring == nullptr || !ring->is_configured()) {
+		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+		if (layer == nullptr || !layer->is_configured()) {
 			continue;
 		}
-		Dictionary entry;
-		entry["group"] = TerrainVT::group_name(channel);
-		entry["source"] = ring->get_source_name();
-		entry["size"] = ring->get_size();
-		entry["channels"] = ring->get_channel_count();
-		entry["base_world"] = ring->get_base_world();
-		entry["valid_levels"] = ring->get_level_valid_count();
-		entry["pending_jobs"] = ring->get_pending_jobs();
-		entry["produced_texels"] = int64_t(ring->get_produced_texels());
-		entry["upload_bytes"] = int64_t(ring->get_upload_bytes());
-		entry["levels"] = ring->get_layout_reports();
-		rings.push_back(entry);
+		Dictionary entry = layer->get_debug_layout(String(TerrainVT::group_name(channel)));
+		entry["focus"] = focus;
+		entry["budget_texels"] = _vt.clipmap_budget_texels;
+		layers.push_back(entry);
 	}
-	result["rings"] = rings;
+	result["layers"] = layers;
 	return result;
 }

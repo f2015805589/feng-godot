@@ -10,6 +10,9 @@
 // them by construction: no indirection texture, no allocator, no page table, no LRU. Level `l`
 // covers `base_world * 2^l` metres in `size` texels, so its texel is `base_world * 2^l / size`
 // metres wide, and a world position is answered by the finest level whose coverage contains it.
+// The shipped shape's eleven levels are the task's ladder: `size / base_world = 1024` texels a metre
+// at level 0 falling by half per level to `1` at level 10 (see `LADDER_UNITS` in
+// `terrain_3d_clipmap_common.h`), which is why level 10 is a 256 m square and level 0 a 0.25 m one.
 //
 // **The ring is channel-agnostic, and that is the point.** This class is the *mechanism*: the
 // levels, the addressing, the strips, the budget and the upload. What a texel holds is a
@@ -60,9 +63,16 @@
 #include <vector>
 
 #include "generated_texture.h"
+#include "terrain_3d_clipmap_common.h"
+#include "terrain_3d_clipmap_impl.h"
 #include "terrain_3d_clipmap_source.h"
 
-class Terrain3DClipmap {
+// The **LOD implementation** of the one clipmap layer: the shared contract is
+// `terrain_3d_clipmap_impl.h`, the shared vocabulary is `terrain_3d_clipmap_common.h`, and what this
+// file adds is the toroidal level ring's storage, strips, upload and rolling. The facade
+// (`terrain_3d_clipmap_layer.h`) selects between this and the block atlas; nothing above either class
+// names which one it holds.
+class Terrain3DClipmap : public Terrain3DClipmapImpl {
 	// The ring is not a Godot class, so it has to name itself for the log macro the way
 	// `GeneratedTexture` does.
 	CLASS_NAME_STATIC("Terrain3DClipmap");
@@ -70,7 +80,8 @@ class Terrain3DClipmap {
 public:
 	// The most levels a ring can hold, and therefore the fixed size of the shader's per-level arrays
 	// and of the dictionaries that bind them. One number for the clamp, the publish and the
-	// declaration, so a ring that grew past the shader's arrays is not expressible.
+	// declaration, so a ring that grew past the shader's arrays is not expressible. It is above the
+	// eleven units the shipping 1024 -> 1 ladder needs, so the ceiling can never truncate that span.
 	static constexpr int MAX_LEVELS = 16;
 	// The shape of the ring. `size`, `levels` and `channels` are clamped by `configure()`.
 	// `channels` is how many values a texel holds, one texture array layer each (slice
@@ -79,8 +90,10 @@ public:
 	// needs several components is a different publish path, not a different ring.
 	struct Config {
 		int size = 256;
-		int levels = 8;
-		real_t base_world = 256.f;
+		// The shipped ladder: 256 texels over 0.25 m is the 1024 texels a metre inner endpoint, and
+		// eleven levels of it reach the 1 texel a metre outer one.
+		int levels = TerrainClipmap::LADDER_UNITS;
+		real_t base_world = 0.25f;
 		int channels = 1;
 		Image::Format format = Image::FORMAT_RF;
 		// The *baked* channels: this many arrays of `baked_format`, one layer per level, that a
@@ -154,15 +167,46 @@ public:
 	// content cannot survive a different shape, so every level is invalidated and rebuilt from the
 	// next update. A no-op when nothing changed.
 	void configure(const Config &p_config);
-	void clear();
+	void clear() override;
 
-	bool is_configured() const { return _config.size > 0 && !_levels.empty(); }
+	bool is_configured() const override { return _config.size > 0 && !_levels.empty(); }
 	const Config &get_config() const { return _config; }
-	int get_size() const { return _config.size; }
+	int get_size() const override { return _config.size; }
 	int get_level_count() const { return int(_levels.size()); }
-	int get_channel_count() const { return _config.channels; }
-	Image::Format get_format() const { return _config.format; }
-	String get_source_name() const;
+	int get_unit_count() const override { return int(_levels.size()); }
+	int get_channel_count() const override { return _config.channels; }
+	Image::Format get_format() const override { return _config.format; }
+	// ---- The shared contract this implementation answers ----------------------------------------
+	// The density ladder is the *shared* one, built from the shape the settings asked for, so a
+	// caller's "what density is 40 m away" is answered identically whichever implementation is
+	// selected - the ladder is the layer's, not the storage's.
+	TerrainClipmap::Implementation get_implementation() const override {
+		return TerrainClipmap::Implementation::LOD;
+	}
+	TerrainClipmap::Ladder get_ladder() const override {
+		TerrainClipmap::Shape shape;
+		shape.size = _config.size;
+		shape.base_world = _config.base_world;
+		return TerrainClipmap::ladder_of(shape);
+	}
+	real_t get_unit_texel_world(const int p_unit) const override { return get_texel_world(p_unit); }
+	real_t get_unit_world_size(const int p_unit) const override {
+		const int unit = CLAMP(p_unit, 0, MAX(0, int(_levels.size()) - 1));
+		return _levels.empty() ? 0.f : _levels[size_t(unit)].world_size;
+	}
+	// The unit that serves a world position, and the texel size a fragment would be served there. The
+	// shader's own arm is exactly this rule (`clipmap_level_for_world()`), which is why the two are
+	// stated as one.
+	int get_unit_for_world(const Vector2 &p_world) const override {
+		return covers(p_world) ? level_for_world(p_world) : -1;
+	}
+	real_t get_texel_world_at(const Vector2 &p_world) const override {
+		const int unit = get_unit_for_world(p_world);
+		return unit < 0 ? 0.f : get_texel_world(unit);
+	}
+	bool covers(const Vector2 &p_world) const override;
+	real_t sample(const Vector2 &p_world, const int p_channel = 0) const override;
+	String get_source_name() const override;
 	// The shape the *source* declares, which is what `configure()` is called with: the mechanism's
 	// owner asks the ring rather than knowing a channel, so the channel's shape travels with the
 	// channel. The fallbacks are a one-value RF texel, i.e. what a ring with no source would be.
@@ -193,31 +237,28 @@ public:
 	// A producer copies what it will dispatch and reports each rect back when its bake lands; the ring
 	// keeps a rect whose lease moved, so "the level is baked" is a statement about what the device wrote
 	// rather than about what was asked for.
-	struct BakeRect {
-		int level = 0;
-		int x0 = 0;
-		int y0 = 0;
-		int x1 = 0;
-		int y1 = 0;
-		// The rect's own content, as a lease: the ring's shape and the level's content serial at the
-		// moment this rect was last queued or merged. It is what makes a bake acceptable *per rect*
-		// rather than per level - a rect that was not produced into again holds exactly the texels the
-		// bake read, however many times the level moved around it - and it is refreshed when a rect
-		// grows over new content, which is what makes the dispatch that covered the old rect stale.
-		uint64_t lease = 0;
-	};
-	int get_baked_channel_count() const { return _config.baked_channels; }
-	Image::Format get_baked_format() const { return _config.baked_format; }
+	// The **shared** bake-queue entry (`TerrainClipmap::BakeRect`), not a second shape: a rect of one
+	// level tagged with the lease that says the level's content still matches what the producer read.
+	// `unit` is the level here. Keeping the shared type is what lets one producer queue serve both
+	// implementations instead of one queue per storage layout.
+	using BakeRect = TerrainClipmap::BakeRect;
+	// The rects this ring has produced and a producer has not yet covered, oldest first. The producer
+	// copies what it will dispatch - with each rect's own lease, because that is what the bake reads -
+	// and reports each rect back when its dispatch lands.
+	int get_pending_bake_count() const override { return int(_bake_rects.size()); }
+	const BakeRect &get_pending_bake(const int p_index) const override { return _bake_rects[size_t(p_index)]; }
+	int get_baked_channel_count() const override { return _config.baked_channels; }
+	Image::Format get_baked_format() const override { return _config.baked_format; }
 	// One device texture per baked channel, `levels` layers, layer `l` the level `l`'s. The layer is
 	// indexed exactly the way the level's payload layer is - by the *stored* texel, the one
 	// `physical_of_logical()` names - so a reader samples a level's baked layer with the same addressing
 	// it samples the payload with, and a producer writes a rect of stored texels. That frame is the one
 	// that keeps naming the same world position as the level turns; see `_queue_bake_rect()` and
 	// `shaders/surface_bake.glsl`.
-	RID get_baked_device_rid(const int p_channel) const;
+	RID get_baked_device_rid(const int p_channel) const override;
 	// The same texture as a shader samples it, i.e. the `RenderingServer` wrapper of the above. What
 	// the material's arm binds; a producer would bind the device RID instead.
-	RID get_baked_texture_rid(const int p_channel) const;
+	RID get_baked_texture_rid(const int p_channel) const override;
 	// Whether every rect this level has produced has been baked - which is what the arm gates on, and
 	// what the *report* publishes per level. A level with nothing queued and nothing ever baked is not
 	// baked: the layers it would serve hold nothing.
@@ -235,21 +276,15 @@ public:
 	// `p_max`; more than that is answered with one rect covering the level, because a reader that falls
 	// back too much is correct while one that serves a texel the device has not written is not.
 	int get_outstanding_rects(const int p_level, BakeRect *r_rects, const int p_max) const;
-	// The rects this ring has produced and a producer has not yet covered, oldest first. The producer
-	// copies what it will dispatch - with each rect's own lease, because that is what the bake reads -
-	// and reports each rect back when its dispatch lands.
-	int get_pending_bake_rect_count() const { return int(_bake_rects.size()); }
-	const BakeRect &get_pending_bake_rect(const int p_index) const { return _bake_rects[size_t(p_index)]; }
 	// A dispatch for `p_rect` landed. The ring says whether it still describes the level - the shape
 	// and the level's content both have to match the lease the producer took - and forgets the rect
 	// when it does. Returns whether the bake counted, so the producer's accounting is the ring's
-	// answer too.
-	bool acknowledge_bake_rect(const int p_level, const int p_x0, const int p_y0, const int p_x1,
-			const int p_y1, const uint64_t p_lease);
+	// answer too. `p_rect.unit` is the level, which is the shared schema's spelling of it.
+	bool acknowledge_bake(const TerrainClipmap::BakeRect &p_rect) override;
 	// Every level's baked layers are stale, which is what a change to the material the bake evaluates
 	// against is: the payload is untouched, so the levels stay current - only the layers produced from
 	// it are. Each level is queued whole. See `Terrain3DSurfaceBaker::set_materials()`.
-	void mark_baked_stale();
+	void mark_baked_stale() override;
 	// A producer that is about to dispatch a rect takes the rect's lease - which the queue stored when it
 	// queued it - and reports it back with the rect, and the ring accepts the bake only if the rect still
 	// carries that lease: the shape, because a reconfigured ring has different layers (and clears its
@@ -276,15 +311,12 @@ public:
 	int get_level_valid_count() const;
 	real_t get_base_world() const { return _config.base_world; }
 	real_t get_texel_world(const int p_level) const;
-	// Whether the coarsest level's own texel range contains a point. Inside it the ring answers;
-	// outside it a reader must go elsewhere, because the level rule clamps to the coarsest level and
-	// its edge texel names a different world position. The shader arm's gate is exactly this test;
-	// `sample()` below deliberately does not apply it, so a reading can still ask what the ring holds.
-	bool covers(const Vector2 &p_world) const;
+	// The gate above is declared beside the shared contract (`covers()`), because it *is* part of it:
+	// "does this layer reach that world position" is a question every implementation answers.
 
 	// One update: re-derive the jobs a new focus implies, drain them under the budget, publish the
 	// levels that drained. Returns the number of channel texels produced by this call.
-	int update(const Vector2 &p_focus, const int p_budget_texels);
+	int update(const Vector2 &p_focus, const int p_budget_texels) override;
 
 	// The source changed under a world rect: mark every level the rect touches not-current and queue
 	// the texels that cover it for re-production. Returns how many rect jobs were queued, and costs
@@ -292,15 +324,11 @@ public:
 	// yet are read from the source as it stands, edit included). Content outside the rect is
 	// untouched, which is the difference between this and a whole-ring refresh: a brush stroke pays
 	// for the texels it covers rather than for every level.
-	int invalidate_rect(const Rect2 &p_world);
+	int invalidate_rect(const Rect2 &p_world) override;
 
 	// ---- Addressing: the mirror of the shader's arm -------------------------------------------
 	// The finest level whose coverage contains `p_world`, clamped to the coarsest.
 	int level_for_world(const Vector2 &p_world) const;
-	// The stored value at a world position through the clipmap's own addressing: the level
-	// `level_for_world()` selects, the texel its centre and ring put under that position. NAN when
-	// the ring is not configured.
-	real_t sample(const Vector2 &p_world, const int p_channel = 0) const;
 	// The world position the *centre* of a logical texel of a level stands for.
 	Vector2 world_of_logical(const int p_level, const Vector2i &p_logical) const;
 
@@ -313,22 +341,22 @@ public:
 	// that state, so this is what lets the node rebind it once per change instead of once per tick -
 	// a ring that produced nothing reports the same stamp and costs one integer comparison. See
 	// `Terrain3D::_update_vt_clipmap_arm()`.
-	uint64_t get_state_stamp() const { return _state_stamp; }
-	RID get_texture_rid() const { return _texture.get_rid(); }	// `levels * channels`.
-	int get_texture_layer_count() const { return _texture.get_layer_count(); }
+	uint64_t get_state_stamp() const override { return _state_stamp; }
+	RID get_texture_rid() const override { return _texture.get_rid(); }	// `levels * channels`.
+	int get_texture_layer_count() const override { return _texture.get_layer_count(); }
 	const Level &get_level(const int p_level) const { return _levels[p_level]; }
 	Vector2 get_center(const int p_level) const { return _levels[p_level].center; }
 	Vector2i get_ring(const int p_level) const { return _levels[p_level].ring; }
-	uint64_t get_produced_texels() const { return _produced_texels; }
+	uint64_t get_produced_texels() const override { return _produced_texels; }
 	uint64_t get_full_level_productions() const { return _full_productions; }
-	uint64_t get_upload_bytes() const { return _upload_bytes; }
-	uint64_t get_update_calls() const { return _update_calls; }
-	uint64_t get_idle_updates() const { return _idle_updates; }
+	uint64_t get_upload_bytes() const override { return _upload_bytes; }
+	uint64_t get_update_calls() const override { return _update_calls; }
+	uint64_t get_idle_updates() const override { return _idle_updates; }
 	// How many invalidations were asked for and how many texels they queued, so "an edit re-produces
 	// the rect it covers rather than the ring" is a reading and not a claim about the code.
 	uint64_t get_invalidation_calls() const { return _invalidation_calls; }
 	uint64_t get_invalidated_texels() const { return _invalidated_texels; }
-	int get_pending_jobs() const { return int(_jobs.size()); }
+	int get_pending_jobs() const override { return int(_jobs.size()); }
 	// Per-level readings for the dock and the tests: one dictionary per level, in level order.
 	Array get_level_reports() const;
 	// The debug view's data, and deliberately a second method rather than a key of the one above:
@@ -336,6 +364,17 @@ public:
 	// that draws them pays for building them. One entry per level, in level order, with the same
 	// shape/address keys as `get_level_reports()` plus `pending` and `pending_rects`.
 	Array get_layout_reports() const;
+	// ---- The shared contract's debug half --------------------------------------------------------
+	// One level's entry in the *shared* schema (`TerrainClipmap::UnitReport`), which is what the
+	// facade assembles and a debug view or a test reads whichever implementation is selected.
+	void get_unit_report(const int p_unit, TerrainClipmap::UnitReport &r_report) const override;
+	// What only the ring can say: the per-level centre, toroidal ring, world size and the stored-space
+	// rects a producer must not serve. Nested by the facade, so the shared schema above is untouched.
+	Dictionary get_impl_payload() const override;
+	// This ring's own arm: the per-level centres/rings/validity, the outstanding-rect table and the
+	// level rule. The material binds it, and the numbers here are the ones the shader's arm computes
+	// with - one publish, so the two cannot drift.
+	Dictionary get_arm() const override;
 
 private:
 	// Reduces a signed texel index into [0, size). The two wraps - the map's and the source's - are

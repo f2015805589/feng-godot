@@ -1278,31 +1278,31 @@ ClipmapBlockCell clipmap_block_find(int p_group, vec2 p_world) {
 	cell.texels = 1;
 	cell.texel = 0.0;
 	int rings = int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_RINGS) + 0.5);
-	float block_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
-	if (rings <= 0 || block_world <= 0.0) {
+	float base_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
+	if (rings <= 0 || base_world <= 0.0) {
 		return cell;
 	}
-	int side = 2 * rings + 1;
+	// One unit is a 3x3 arrangement of *its own* blocks, and unit `r`'s blocks cover
+	// `base_world * 2^r` metres: the shared ladder's own unit size, which is what makes the atlas serve
+	// the density the LOD ring's unit `r` serves at the distance unit `r` stands at. Finest first, so a
+	// shell's inner hole never answers for a finer unit - the nesting the user asked for.
 	for (int ring = 0; ring < CLIPMAP_ATLAS_MAX_RINGS; ring++) {
 		if (ring >= rings) {
 			break;
 		}
+		float block_world = base_world * exp2(float(ring));
 		vec2 start = vec2(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_STARTS + ring * 2),
 				clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_STARTS + ring * 2 + 1));
 		// The block a coordinate names is a *half-open* square, `[start + b * W - W/2, ... + W/2)`,
 		// so the index is `floor((world - start) / W + 0.5)` rather than `round(...)`: GLSL's
 		// `round()` is implementation-defined at a tie, and at a boundary it picked the block below
-		// the point, whose clamped edge texel is one metre away from the array's.
+		// the point, whose clamped edge texel is one block away from the array's.
 		int gx = int(floor((p_world.x - start.x) / block_world + 0.5));
 		int gy = int(floor((p_world.y - start.y) / block_world + 0.5));
-		if (abs(gx) > rings || abs(gy) > rings) {
+		if (abs(gx) > 1 || abs(gy) > 1) {
 			continue;
 		}
-		int d = max(abs(gx), abs(gy));
-		if ((d <= 1 ? 0 : d - 1) != ring) {
-			continue;
-		}
-		int cell_index = (gy + rings) * side + (gx + rings);
+		int cell_index = ring * 9 + (gy + 1) * 3 + (gx + 1);
 		int slot = int(clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_SLOTS + cell_index) + 0.5);
 		cell.found = true;
 		cell.current = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_CURRENT + cell_index) > 0.5;
@@ -1333,7 +1333,8 @@ ClipmapBlockCell clipmap_block_find(int p_group, vec2 p_world) {
 // coordinate: `block start + gx * block_world - half a block`. The content is unrotated, so the
 // stored index is the logical one - unlike the ring's level, which a movement turns.
 vec2 clipmap_block_origin(int p_group, ClipmapBlockCell p_cell) {
-	float block_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
+	float base_world = clipmap_block_data_at(p_group, CLIPMAP_ATLAS_DATA_WORLD);
+	float block_world = base_world * exp2(float(p_cell.ring));
 	return p_cell.start + vec2(float(p_cell.gx), float(p_cell.gy)) * block_world -
 			vec2(0.5 * block_world);
 }

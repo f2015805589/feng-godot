@@ -246,9 +246,64 @@ Two properties this buys, both verifiable without reading a frame time:
 
 ## 6. The clipmap service
 
-The fourth method. It is deliberately the simplest of the four: no indirection texture, no
-allocator, no LRU, no page table - an address is `(level, texel)`, and the whole service is a
-ring of levels.
+The third method. There is **one** clipmap delivery, and it has two interchangeable *implementations*
+selected inside its own settings (`vt_clipmap_implementation`): `LOD`, the toroidal level ring, and
+`Atlas`, the block atlas. The two differ in storage, upload unit, rolling and layout, and in nothing
+else - which is why they are one row of the matrix and one object per channel group. An earlier
+revision made the atlas a fifth delivery (`Delivery::ClipmapAtlas`); it was withdrawn because a user
+who wants "clipmap, packed as blocks" is choosing *how* one delivery works, not *which* delivery
+carries the channel.
+
+### 6.0 The layer's structure, one facade and two implementations
+
+| File | What it is | What it owns |
+| --- | --- | --- |
+| `terrain_3d_clipmap_common.h` | the shared vocabulary | `Implementation`, `Shape`, the density `Ladder` (`texel_world(unit) = base_world * 2^unit / size`), the shared rect arithmetic, the `BakeRect` queue entry and the `UnitReport` debug schema. |
+| `terrain_3d_clipmap_impl.h` | the contract | every question anything above the layer may ask, in implementation-neutral terms. |
+| `terrain_3d_clipmap.{h,cpp}` | the **LOD implementation** | levels, snapping, the toroidal wrap, strips, the whole-layer publish, the layered texture. |
+| `terrain_3d_clipmap_atlas.{h,cpp}` | the **Atlas implementation** | the 3x3-per-unit nesting, the packing (quadtree by default), the rolling relabelling, the block-rect upload, the rect array. |
+| `terrain_3d_clipmap_layer.{h,cpp}` | the **facade** | which implementation is selected, its lifetime, the forwarding, and the assembly of the one debug schema. |
+
+Everything above the facade - the tick's phase, the assembly rule, the material's uniform binding, the
+baker's offer, the report and the debug payload - goes through the contract, so adding a third
+implementation would add a file and a case in `_build()` and nothing else. The two consumers that
+genuinely differ per storage are the shader (two arms, selected by the implementation because the two
+tables are different code rather than one branch on a uniform) and the producer (two descriptor sets,
+because a level's layer and a block's rect are different textures); each has exactly one branch, in one
+place.
+
+The density ladder is the *layer's*, not either storage's: unit `u` serves `size / (base_world * 2^u)`
+texels a metre over a region of `base_world * 2^u` metres. The LOD implementation stores that unit as
+one toroidal square; the Atlas implementation stores it as a 3x3 arrangement of its own blocks, which is
+what nests - unit `u`'s hole is unit `u-1`'s square - and what makes the picture a quadtree.
+
+### 6.0.1 The shape defaults: the ladder's two endpoints
+
+The ladder's *cap* is `size / base_world`: inside the finest unit's own coverage the density is flat, and
+past it `size / 2` per metre falls off. The shape this worktree inherited (`size` 256, `base_world` 256)
+therefore capped the whole visible near field at **one** texel a metre however many units the layer had,
+which is the "only a small patch is sharp" report; an intermediate round raised the cap to eight by
+lowering `base_world` to 32, which made the near field denser but still left the ladder's *inner* end
+eight times short of what was asked for.
+
+The shipped defaults are the two endpoints themselves, stated once in
+`terrain_3d_clipmap_common.h` (`LADDER_FINEST_DENSITY`, `LADDER_COARSEST_DENSITY`, `LADDER_UNITS`):
+`size` 256 over a `base_world` of **0.25 m** is **1024 texels a metre** at unit 0, and **eleven** units
+of the halving ladder reach **1 texel a metre** at unit 10 (`256 / (0.25 * 2^10) = 1`). Both storages
+are configured from that one `Shape`, and both implement the same `Ladder`, so the density a fragment is
+served at a distance is a property of the layer rather than of the storage. The reach that buys is
+`0.25 * 2^10 = 256 m` of level square for the LOD implementation (+/-128 m) and 1.5 times that for the
+atlas, whose unit is a 3x3 square; at 4 m the ladder serves 32 texels a metre against the inherited
+shape's one. The ceilings (`MAX_LEVELS` 16, `MAX_RINGS` 12) are both above the eleven units the span
+needs, and a clamp that is hit is logged - the ladder's span is not something a default may silently
+truncate.
+
+The prices are listed in the acceptance measurements: memory grows with the unit count, and the LOD
+implementation's *whole-layer* upload is published more often because its finest unit now moves in
+millimetre steps - which is the cost the Atlas implementation does not pay, and the reason it is the
+recommended storage at a dense near field. The material group's detail layer stays as the *wide* 1024
+texels/m patch: the ladder is the ground's coverage and fallback, the detail layer is what spends the
+same density over the near view under screen-footprint demand.
 
 ### 6.1 One mechanism, one source per channel
 
@@ -400,7 +455,7 @@ the copy this replaced.
 **A preview with nothing behind it is refused, not answered with an empty drawing.** The native
 side is where that is enforced - `get_avt_layout_preview()` returns an empty dictionary before it
 scans the visible grid when `has_avt_delivery()` is false, and `get_clipmap_layout_preview()`
-returns one before it walks a ring when `has_vt_clipmap_ring()` is false - and each Control asks
+returns one before it walks a unit when `has_vt_clipmap_layer()` is false - and each Control asks
 its own one-boolean gate first so it can hide itself (and the heading and note around it, through
 `availability_changed`) instead of asking at all.
 
@@ -410,7 +465,7 @@ subject:
 | View | Its gate | Why that one |
 | --- | --- | --- |
 | AVT layout | `is_vt_delivery_used(AVT)` | a cell is the only door to the AVT view, so the matrix's answer and the object's are the same answer |
-| Clipmap ring | `has_vt_clipmap_ring()` | a ring can exist without a cell naming the method (a ring the mechanism's entry built, or one a deselection left behind), and a picture of a ring is a picture of the ring that is there rather than of the setting that asked for it |
+| Clipmap layer | `has_vt_clipmap_layer()` | a layer can exist without a cell naming the method (a layer the mechanism's entry built, or one a deselection left behind), and a picture of a layer is a picture of the layer that is there rather than of the setting that asked for it. Which *implementation* it draws is the selected one. |
 
 A terrain that never selects `Clipmap` and never lets the entry build a ring therefore has no clipmap
 view at all for a user, which is the requirement's own rule ("show nothing where nothing is used")
@@ -1225,9 +1280,9 @@ now that the arm has no payload of its own to read.
   empty. That is the cost the requirement names, paid by a view for a method nobody selected: the ring
   payload walks every level and builds the queued rects, and the AVT preview scans the visible grid and
   builds a record per sector. The gate is now both halves - the native preview refuses *before* its
-  scan (`get_clipmap_layout_preview()` returns an empty dictionary while no ring exists,
+  scan (`get_clipmap_layout_preview()` returns an empty dictionary while no layer exists,
   `get_avt_layout_preview()` on `!has_avt_delivery()`), and the Clipmap Control asks
-  `has_vt_clipmap_ring()` (the AVT one asks `is_vt_delivery_used(AVT)`) first so the refused call is
+  `has_vt_clipmap_layer()` (the AVT one asks `is_vt_delivery_used(AVT)`) first so the refused call is
   never made. `vt_delivery` and `vt_debug_views` read the difference from `*_preview_calls` against
   `*_preview_computed` rather than trusting it, and assert that a hidden view does not even ask.
 * **The delivery matrix as a subgroup above the settings.** That is the shape this landed with first,
