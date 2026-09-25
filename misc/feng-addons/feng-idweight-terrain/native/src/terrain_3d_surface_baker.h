@@ -275,6 +275,7 @@ private:
 		uint64_t dispatches = 0;
 	};
 	RingBake _ring_bake;
+	std::atomic<uint64_t> _ring_bake_lock_skips{ 0 };
 	// ---- The atlas's bake ------------------------------------------------------------------------
 	// The block atlas's three baked arrays are one rect per block, so the job carries the block's rect
 	// in atlas pixels and the block's world square rather than a level's stored grid. Everything else -
@@ -354,6 +355,8 @@ private:
 		RID job_buffer;
 		int stored_size = 0;
 		int slots = 0;
+		Terrain3DMaterialClipmapDetail *requested_detail = nullptr;
+		int requested_budget_texels = 0;
 		std::vector<DetailJob> collected;
 		std::vector<DetailJob> queued;
 		std::vector<DetailJob> landed;
@@ -380,6 +383,9 @@ private:
 	// The render callback's half: one dispatch for the queued tiles, recording what landed for the
 	// next offer to acknowledge. Returns how many jobs were dispatched.
 	int _dispatch_detail_bake();
+	// Transfers source-ready offers into the render callback's job queue. The scene thread only
+	// posts the manager and budget; offer copying and generation acknowledgments stay off its tick.
+	int _queue_detail_tiles_now(Terrain3DMaterialClipmapDetail *p_detail, const int p_budget_texels);
 	// Builds the ring bake's descriptor set when there is none or when the ring it describes is not
 	// this one, and frees the previous set. False when the ring cannot be baked at all - no device, no
 	// bundle to take the material list and job buffer from, or a channel count the bake shader does not

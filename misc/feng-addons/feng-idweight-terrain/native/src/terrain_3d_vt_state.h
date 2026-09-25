@@ -572,8 +572,20 @@ struct Terrain3DVTState {
 	// follow is one comparison per layer rather than a rebind per tick. See
 	// `Terrain3DClipmapLayer::get_state_stamp()` and `Terrain3D::_update_vt_clipmap_arm()`.
 	uint64_t clipmap_state[TerrainVT::GROUP_COUNT] = { 0, 0 };
+	// The shader's texture/configuration bindings are separate from the moving address state. A ring
+	// may be configured after the shader variant was first bound, so the address-only path must detect
+	// a new texture or shape once and publish the sampler plus its dimensions before tracking moves.
+	struct ClipmapUniformBinding {
+		bool valid = false;
+		Terrain3DClipmapLayer::Settings settings;
+		RID texture;
+		RID baked[3];
+	};
+	ClipmapUniformBinding clipmap_uniform_binding[TerrainVT::GROUP_COUNT];
 	// Channel texels produced by every layer in the tick that just ran.
 	int clipmap_produced_texels = 0;
+	// Wall time the last completed background LOD ring update spent producing and publishing its level.
+	uint64_t clipmap_worker_usec = 0;
 	// ---- The material group's detail layer, the wide 1024 texels/m patch over the ladder -----------
 	// A sparse, demand-resident layer of fine tiles in front of the camera, above the ladder and
 	// independent of it: the layer keeps its complete, octave-stepped coverage and its fallback, and
@@ -620,14 +632,15 @@ struct Terrain3DVTState {
 	real_t detail_demand_radius = 12.f;
 	real_t detail_texels_per_pixel = 4.f;
 	std::unique_ptr<Terrain3DMaterialClipmapDetail> material_detail;
-	// The state stamp of the detail arm as the shader was last bound with, so a directory or a
-	// validity change is one comparison a tick rather than a rebind. See
-	// `Terrain3DMaterialClipmapDetail::get_state_stamp()` and `Terrain3D::_update_vt_detail_arm()`.
+	// Layout and window stamps last bound to the material. Window moves update only that uniform;
+	// shape and directory RID changes rebuild the detail arm. See the manager's paired stamps.
 	uint64_t material_detail_state = 0;
+	uint64_t material_detail_window_state = 0;
 	// Ticks the detail layer's demand pass ran, and the last pass's requested-tile count and cost.
 	int detail_requested_tiles = 0;
 	int detail_starved_tiles = 0;
 	double vt_detail_ms = 0.0;
+	uint64_t vt_detail_worker_us = 0;
 	int vt_page_size = 256;
 	// The page gutter, in texels each side. It is a *bound*, not a policy: a page asked for more
 	// anisotropy than its border can sample reads its own rim instead of the neighbouring ground,
@@ -1186,6 +1199,17 @@ struct Terrain3DVTState {
 	// The ring phase. It is reported beside the service's phases but it is not one of them: no ring
 	// touches the shared pool, so this is the only phase that is pure production.
 	double vt_clipmap_ms = 0.0;
+	double vt_clipmap_setup_ms = 0.0;
+	double vt_clipmap_worker_ms = 0.0;
+	double vt_clipmap_loop_ms = 0.0;
+	double vt_clipmap_arm_ms = 0.0;
+	double vt_clipmap_consume_ms = 0.0;
+	double vt_clipmap_bake_ms = 0.0;
+	double vt_clipmap_uniform_ms = 0.0;
+	double vt_clipmap_schedule_ms = 0.0;
+	double vt_clipmap_sync_update_ms = 0.0;
+	double vt_clipmap_detail_update_ms = 0.0;
+	bool vt_clipmap_detail_deferred = false;
 	double vt_avt_ms = 0.0;
 	double vt_svt_ms = 0.0;
 	double vt_topup_ms = 0.0;

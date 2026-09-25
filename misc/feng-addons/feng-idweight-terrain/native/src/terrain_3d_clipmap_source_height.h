@@ -19,6 +19,9 @@ public:
 			_data(p_data) {}
 
 	void fill_row(const Row &p_row, float *r_values) override;
+	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) override {
+		_snapshot = p_snapshot;
+	}
 	String get_source_name() const override { return "height"; }
 	// One value a texel, in the height map's own format: the layer the height arm samples in place
 	// of the region array carries the same numbers in the same format.
@@ -27,6 +30,7 @@ public:
 
 private:
 	const Terrain3DData *_data = nullptr;
+	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> _snapshot;
 };
 
 #endif // TERRAIN3D_CLIPMAP_SOURCE_HEIGHT_H

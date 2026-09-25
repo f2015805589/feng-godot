@@ -659,6 +659,9 @@ public:
 	// agree until one changes. The selected implementation fills it and `arm["implementation"]` names
 	// which, so the binding above it is one path. Empty when the group has no configured layer.
 	Dictionary get_vt_clipmap_arm(const int p_group) const;
+	Dictionary get_vt_clipmap_address_arm(const int p_group) const;
+	void get_vt_clipmap_address_uniforms(const int p_group, PackedVector4Array &r_addresses,
+			PackedVector4Array &r_outstanding, PackedInt32Array &r_outstanding_counts) const;
 	// An edit changed the source under a world AABB: the layer re-produces the texels that cover it
 	// and stops serving the units that touch it until they have. Called from the one place every edit
 	// reports itself to (`Terrain3DData::add_edited_area()`), and public because a script that writes
@@ -725,10 +728,13 @@ public:
 	// Everything the detail arm is bound from, or an empty dictionary when the layer is off. Built by
 	// the manager, so the shader's directory, window origin and tile span are the CPU's own numbers.
 	Dictionary get_vt_detail_arm() const;
-	// Whether the detail layer's arm addressing moved since the shader was bound with it: a directory
-	// publish, a window move, or a tile becoming readable. One comparison a tick, like the ring's.
+	// Shader-only detail uniforms, without the slot and diagnostic counters used by the settings report.
+	Dictionary get_vt_detail_shader_arm() const;
+	// Whether the detail layer's bound shape or directory RIDs changed since material binding. Window
+	// motion has a separate stamp so it updates only `_detail_window_origin` on the hot path.
 	void _update_vt_detail_arm();
 	bool _vt_detail_state_changed();
+	bool _vt_detail_window_state_changed();
 	// The detail layer's own report, for `get_vt_settings()` and the tests: the request (density,
 	// budget, radius), the *delivered* state (resident, valid, pending, starved), the byte accounting
 	// and the source pipeline's counters. Kept beside the layer rather than in the service report so

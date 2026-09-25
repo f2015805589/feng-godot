@@ -269,6 +269,9 @@ public:
 	int get_size() const override { return _config.block_size; }
 	int get_channel_count() const override { return _config.channels; }
 	Image::Format get_format() const override { return _config.format; }
+	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) override {
+		if (_source != nullptr) { _source->set_source_snapshot(p_snapshot); }
+	}
 	// The whole point of the structure, published so a test reads the user's arithmetic rather than
 	// a comment: 9, 16, 24, 32 for four rings, and the centre block counted in the first.
 	int get_ring_block_count(const int p_ring) const;

@@ -7,6 +7,9 @@
 
 #include "terrain_3d_clipmap_layer.h"
 
+#include <chrono>
+#include <thread>
+
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 
@@ -22,7 +25,70 @@ Terrain3DClipmapLayer::~Terrain3DClipmapLayer() {
 }
 
 void Terrain3DClipmapLayer::_destroy() {
+	wait_for_async_update();
 	_impl.reset();
+}
+
+void Terrain3DClipmapLayer::wait_for_async_update() const {
+	const std::shared_ptr<AsyncUpdate> update = _async_update;
+	while (update != nullptr && !update->complete.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+}
+
+bool Terrain3DClipmapLayer::async_update_in_progress() const {
+	return _async_update != nullptr && !_async_update->complete.load(std::memory_order_acquire);
+}
+
+bool Terrain3DClipmapLayer::consume_async_update(int &r_produced, uint64_t &r_worker_usec,
+		PackedVector4Array &r_addresses, PackedVector4Array &r_outstanding,
+		PackedInt32Array &r_outstanding_counts) {
+	if (_async_update == nullptr || !_async_update->complete.load(std::memory_order_acquire)) {
+		return false;
+	}
+	r_produced = _async_update->produced;
+	r_worker_usec = _async_update->worker_usec;
+	r_addresses = _async_update->addresses;
+	r_outstanding = _async_update->outstanding;
+	r_outstanding_counts = _async_update->outstanding_counts;
+	_async_update.reset();
+	return true;
+}
+
+void Terrain3DClipmapLayer::set_source_snapshot(
+		const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) {
+	wait_for_async_update();
+	if (_impl != nullptr) {
+		_impl->set_source_snapshot(p_snapshot);
+	}
+}
+
+bool Terrain3DClipmapLayer::schedule_async_update(const Vector2 &p_focus, const int p_budget_texels,
+		const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot,
+		Terrain3DPagePipeline *p_pipeline) {
+	if (_impl == nullptr || p_pipeline == nullptr || async_update_in_progress() ||
+			_impl->get_implementation() != TerrainClipmap::Implementation::LOD) {
+		return false;
+	}
+	Terrain3DClipmap *ring = static_cast<Terrain3DClipmap *>(_impl.get());
+	if (!ring->needs_update_at(p_focus)) {
+		return true;
+	}
+	set_source_snapshot(p_snapshot);
+	const std::shared_ptr<AsyncUpdate> update = std::make_shared<AsyncUpdate>();
+	_async_update = update;
+	p_pipeline->submit_render_task([this, update, focus = p_focus, budget = p_budget_texels]() {
+		const auto started = std::chrono::steady_clock::now();
+		update->produced = _impl != nullptr ? _impl->update(focus, budget) : 0;
+		if (_impl != nullptr) {
+			_impl->get_address_uniforms(update->addresses, update->outstanding,
+					update->outstanding_counts);
+		}
+		update->worker_usec = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - started).count());
+		update->complete.store(true, std::memory_order_release);
+	});
+	return true;
 }
 
 bool Terrain3DClipmapLayer::_build() {
@@ -48,6 +114,7 @@ bool Terrain3DClipmapLayer::_build() {
 }
 
 bool Terrain3DClipmapLayer::configure(const Settings &p_settings) {
+	wait_for_async_update();
 	const bool switched = _impl != nullptr && _impl->get_implementation() != p_settings.implementation;
 	_settings = p_settings;
 	if (switched) {
@@ -88,6 +155,7 @@ bool Terrain3DClipmapLayer::configure(const Settings &p_settings) {
 }
 
 void Terrain3DClipmapLayer::clear() {
+	wait_for_async_update();
 	if (_impl != nullptr) {
 		_impl->clear();
 	}
@@ -104,6 +172,7 @@ std::unique_ptr<Terrain3DClipmapSource> Terrain3DClipmapLayer::_probe_source() c
 }
 
 int Terrain3DClipmapLayer::get_source_channel_count() const {
+	wait_for_async_update();
 	if (_impl != nullptr) {
 		return _impl->get_channel_count();
 	}
@@ -112,6 +181,7 @@ int Terrain3DClipmapLayer::get_source_channel_count() const {
 }
 
 Image::Format Terrain3DClipmapLayer::get_source_format() const {
+	wait_for_async_update();
 	if (_impl != nullptr) {
 		return _impl->get_format();
 	}
@@ -120,6 +190,7 @@ Image::Format Terrain3DClipmapLayer::get_source_format() const {
 }
 
 int Terrain3DClipmapLayer::get_source_baked_channel_count() const {
+	wait_for_async_update();
 	if (_impl != nullptr) {
 		return _impl->get_baked_channel_count();
 	}
@@ -128,6 +199,7 @@ int Terrain3DClipmapLayer::get_source_baked_channel_count() const {
 }
 
 Image::Format Terrain3DClipmapLayer::get_source_baked_format() const {
+	wait_for_async_update();
 	if (_impl != nullptr) {
 		return _impl->get_baked_format();
 	}
@@ -136,6 +208,7 @@ Image::Format Terrain3DClipmapLayer::get_source_baked_format() const {
 }
 
 const TerrainClipmap::BakeRect &Terrain3DClipmapLayer::get_pending_bake(const int p_index) const {
+	wait_for_async_update();
 	static const TerrainClipmap::BakeRect empty;
 	return _impl != nullptr ? _impl->get_pending_bake(p_index) : empty;
 }
@@ -170,6 +243,7 @@ const Terrain3DClipmapAtlas *Terrain3DClipmapLayer::atlas_impl() const {
 // "density against distance" reads the same keys whichever implementation is selected, and a view that
 // draws the storage draws the implementation's own picture.
 Dictionary Terrain3DClipmapLayer::get_debug_layout(const String &p_group) const {
+	wait_for_async_update();
 	Dictionary result;
 	if (_impl == nullptr) {
 		return result;

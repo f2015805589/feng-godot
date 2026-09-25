@@ -42,6 +42,49 @@ std::shared_ptr<const Terrain3DPagePipeline::Snapshot> Terrain3DPagePipeline::sn
 	}
 	return result;
 }
+
+float Terrain3DPagePipeline::Snapshot::clipmap_height_texel(const Vector2 &world) const {
+	if (region_size <= 0 || spacing <= 0.f) { return 0.f; }
+	const int vx = int(std::floor(world.x / spacing));
+	const int vz = int(std::floor(world.y / spacing));
+	const int rx = int(std::floor(double(vx) / double(region_size)));
+	const int rz = int(std::floor(double(vz) / double(region_size)));
+	const auto found = cells.find({rx, rz});
+	if (found == cells.end() || !found->second.height_data || found->second.height_size <= 0) { return 0.f; }
+	const Cell &cell = found->second;
+	auto positive_mod = [](const int value, const int modulus) {
+		const int result = value % modulus;
+		return result < 0 ? result + modulus : result;
+	};
+	const int x = positive_mod(vx, region_size);
+	const int z = positive_mod(vz, region_size);
+	const int64_t offset = (int64_t(z) * cell.height_size + x) * int64_t(sizeof(float));
+	float value = 0.f;
+	std::memcpy(&value, cell.height_data + offset, sizeof(value));
+	return value;
+}
+
+uint32_t Terrain3DPagePipeline::Snapshot::clipmap_surface_texel(const Vector2 &world) const {
+	if (region_size <= 0 || spacing <= 0.f) { return 0u; }
+	const int vx = int(std::floor(world.x / spacing));
+	const int vz = int(std::floor(world.y / spacing));
+	const int rx = int(std::floor(double(vx) / double(region_size)));
+	const int rz = int(std::floor(double(vz) / double(region_size)));
+	const auto found = cells.find({rx, rz});
+	if (found == cells.end() || !found->second.id_data || found->second.id_size <= 0) { return 0u; }
+	const Cell &cell = found->second;
+	const int x = int(std::floor(world.x * float(cell.density) / spacing));
+	const int z = int(std::floor(world.y * float(cell.density) / spacing));
+	auto positive_mod = [](const int value, const int modulus) {
+		const int result = value % modulus;
+		return result < 0 ? result + modulus : result;
+	};
+	const int px = positive_mod(x, cell.id_size);
+	const int pz = positive_mod(z, cell.id_size);
+	const int64_t offset = (int64_t(pz) * cell.id_size + px) * 2;
+	return uint32_t(cell.id_data[offset]) | (uint32_t(cell.id_data[offset + 1]) << 8);
+}
+
 bool Terrain3DPagePipeline::Snapshot::surface(const Vector2 &world, Vector3 &point, Vector3 &normal) const {
 	const Vector2 grid = world / spacing;
 	const int ix = int(std::floor(grid.x)), iz = int(std::floor(grid.y));
@@ -162,16 +205,34 @@ void Terrain3DPagePipeline::submit_task(std::function<void()> task) {
 	}
 	_task_wake.notify_one();
 }
+void Terrain3DPagePipeline::submit_render_task(std::function<void()> task) {
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_render_tasks.push_back(std::move(task));
+		if (!_planner.joinable()) { _planner = std::thread(&Terrain3DPagePipeline::plan, this); }
+	}
+	_task_wake.notify_one();
+}
 void Terrain3DPagePipeline::plan() {
 	// Refinement must not monopolize the worker that supplies ready page bytes.
-	// These stages share immutable snapshots but otherwise progress independently.
+	// These stages share immutable snapshots but otherwise progress independently. Renderer uploads
+	// are FIFO entries rather than the replaceable latest-plan task: each carries a slot lease, and the
+	// owner does not offer that slot to the baker until its command has been queued.
 	for (;;) {
 		std::function<void()> task;
 		{
 			std::unique_lock<std::mutex> lock(_mutex);
-			_task_wake.wait(lock, [&]() { return _stop || bool(_task); });
-			if (_stop) { return; }
-			task = std::move(_task); _task = {};
+			_task_wake.wait(lock, [&]() { return _stop || bool(_task) || !_render_tasks.empty(); });
+			// Render tasks own already-published storage leases. Drain the FIFO before the planner exits
+			// so a queued clipmap update can publish its completion and its layer can be destroyed safely.
+			if (_stop && _render_tasks.empty() && !_task) { return; }
+			if (!_render_tasks.empty()) {
+				task = std::move(_render_tasks.front());
+				_render_tasks.pop_front();
+			} else {
+				task = std::move(_task);
+				_task = {};
+			}
 		}
 		task();
 	}

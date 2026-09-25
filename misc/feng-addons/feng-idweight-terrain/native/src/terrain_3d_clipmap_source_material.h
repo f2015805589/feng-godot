@@ -46,6 +46,9 @@ public:
 			_data(p_data) {}
 
 	void fill_row(const Row &p_row, float *r_values) override;
+	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) override {
+		_snapshot = p_snapshot;
+	}
 	String get_source_name() const override { return "material"; }
 	// The packed payload and the height under it, both in float layers because the payload is an
 	// integer rather than a normalised value.
@@ -57,6 +60,7 @@ public:
 
 private:
 	const Terrain3DData *_data = nullptr;
+	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> _snapshot;
 };
 
 #endif // TERRAIN3D_CLIPMAP_SOURCE_MATERIAL_H

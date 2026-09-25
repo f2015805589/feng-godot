@@ -49,6 +49,10 @@
 
 namespace TerrainClipmap {
 
+// Fixed shader table dimensions shared by both implementations and their material binding.
+inline constexpr int MAX_LEVELS = 16;
+inline constexpr int MAX_OUTSTANDING_RECTS = 4;
+
 // How a clipmap layer stores and uploads what it holds. The int values are the property values the
 // dock and scripts write, so they are part of the API and must not be renumbered; `LOD` is 0 because
 // it is the shipped behaviour and therefore the default of an unset property.

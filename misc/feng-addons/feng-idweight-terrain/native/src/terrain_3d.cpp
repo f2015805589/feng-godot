@@ -256,8 +256,33 @@ void Terrain3D::__physics_process(const double p_delta) {
 	// phase is written once: the same `update()`, the same bake offer, the same readings, whether the
 	// storage behind it is the toroidal level ring or the block atlas.
 	if (has_clipmap_delivery()) {
+		// Keep the clipmap reading limited to the layer, detail and uniform work it names. The
+		// registration, motion sampling and budget governor above remain visible in their own
+		// setup reading and in the whole VT tick; they are not charged to clipmap production.
+		vt_mark = Time::get_singleton()->get_ticks_usec();
+		_vt.vt_clipmap_setup_ms = double(vt_mark - vt_started) / 1000.0;
 		traced("vt_clipmap", [&] {
+			const uint64_t clipmap_loop_started = Time::get_singleton()->get_ticks_usec();
 			_vt.clipmap_produced_texels = 0;
+			_vt.clipmap_worker_usec = 0;
+			_vt.vt_clipmap_worker_ms = 0.0;
+			_vt.vt_clipmap_consume_ms = 0.0;
+			_vt.vt_clipmap_bake_ms = 0.0;
+			_vt.vt_clipmap_uniform_ms = 0.0;
+			_vt.vt_clipmap_schedule_ms = 0.0;
+			_vt.vt_clipmap_sync_update_ms = 0.0;
+			_vt.vt_clipmap_detail_update_ms = 0.0;
+			_vt.vt_clipmap_detail_deferred = false;
+			bool clipmap_state_pending = false;
+			bool clipmap_address_updated = false;
+			auto queue_clipmap_bakes = [&](Terrain3DClipmapLayer *p_layer) {
+				Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr());
+				if (baker != nullptr) {
+					const uint64_t started = Time::get_singleton()->get_ticks_usec();
+					baker->queue_clipmap_layer(p_layer, _vt.clipmap_budget_texels);
+					_vt.vt_clipmap_bake_ms += double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+				}
+			};
 			const Vector2 focus = v3v2(get_clipmap_target_position());
 			for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 				const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
@@ -265,16 +290,79 @@ void Terrain3D::__physics_process(const double p_delta) {
 				if (layer == nullptr || !_vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap)) {
 					continue;
 				}
+				int completed_texels = 0;
+				uint64_t worker_usec = 0;
+				PackedVector4Array addresses;
+				PackedVector4Array outstanding;
+				PackedInt32Array outstanding_counts;
+				bool consumed_async_update = false;
+				const uint64_t consume_started = Time::get_singleton()->get_ticks_usec();
+				if (layer->consume_async_update(completed_texels, worker_usec, addresses,
+						outstanding, outstanding_counts)) {
+					consumed_async_update = true;
+					_vt.clipmap_produced_texels += completed_texels;
+					_vt.clipmap_worker_usec += worker_usec;
+					queue_clipmap_bakes(layer);
+					// The layer may have completed between the loop above and this consume. In that case
+					// `_update_vt_clipmap_arm()` already published this exact stamp at the end of the
+					// previous tick; resending all address and outstanding tables here would duplicate the
+					// same render-thread upload. Bake acknowledgments made by the call above still change
+					// the stamp and therefore publish their fallback gate here.
+					const uint64_t state_stamp = layer->get_state_stamp();
+					if (state_stamp != _vt.clipmap_state[group]) {
+						const uint64_t uniform_started = Time::get_singleton()->get_ticks_usec();
+						layer->get_outstanding_uniforms(outstanding, outstanding_counts);
+						if (_initialized && _material.is_valid() && !addresses.is_empty()) {
+							_material->update_vt_clipmap_address_uniforms(group, addresses, outstanding,
+									outstanding_counts);
+							clipmap_address_updated = true;
+						}
+						_vt.vt_clipmap_uniform_ms += double(Time::get_singleton()->get_ticks_usec() - uniform_started) / 1000.0;
+						_vt.clipmap_state[group] = state_stamp;
+					}
+				}
+				_vt.vt_clipmap_consume_ms += double(Time::get_singleton()->get_ticks_usec() - consume_started) / 1000.0;
+				if (layer->async_update_in_progress()) {
+					clipmap_state_pending = true;
+					continue;
+				}
+				Terrain3DPagePipeline *clipmap_pipeline = nullptr;
+				if (channel == TerrainVT::ChannelGroup::Material && _vt.material_detail != nullptr &&
+						_vt.material_detail->is_enabled()) {
+					clipmap_pipeline = _vt.material_detail->task_pipeline();
+				}
+				if (clipmap_pipeline != nullptr && _data != nullptr) {
+					if (!_vt.vt_source_snapshot) {
+						_vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size,
+								_vertex_spacing, _surface_density);
+					}
+					const uint64_t schedule_started = Time::get_singleton()->get_ticks_usec();
+					const bool scheduled = layer->schedule_async_update(focus, _vt.clipmap_budget_texels,
+							_vt.vt_source_snapshot, clipmap_pipeline);
+					_vt.vt_clipmap_schedule_ms += double(Time::get_singleton()->get_ticks_usec() - schedule_started) / 1000.0;
+					if (scheduled) {
+						if (!layer->async_update_in_progress()) {
+							// A completed result already offered bakes above. Calling again here can
+							// acknowledge a render callback that landed between offers, change the gate
+							// stamp after we published it, then force a second whole-array rebind below.
+							if (!consumed_async_update) {
+								queue_clipmap_bakes(layer);
+							}
+						}
+						clipmap_state_pending = clipmap_state_pending || layer->async_update_in_progress();
+						continue;
+					}
+				}
+				const uint64_t sync_update_started = Time::get_singleton()->get_ticks_usec();
 				_vt.clipmap_produced_texels += layer->update(focus, _vt.clipmap_budget_texels);
+				_vt.vt_clipmap_sync_update_ms += double(Time::get_singleton()->get_ticks_usec() - sync_update_started) / 1000.0;
 				// And whatever a producer bakes out of what the layer produced - the *rects* it
 				// produced, offered under the same budget they were produced under. The layer carries
 				// the storage, the bake belongs to the shader's owner, and this is where the two meet:
 				// a channel that declares no baked layers answers without touching the device, and one
 				// that does has its rects dispatched by the next render callback, reported back a call
 				// later (`Terrain3DSurfaceBaker::queue_clipmap_layer()`).
-				if (Terrain3DSurfaceBaker *baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
-					baker->queue_clipmap_layer(layer, _vt.clipmap_budget_texels);
-				}
+				queue_clipmap_bakes(layer);
 			}
 			// The material group's detail layer is the layer's own finer half and it runs in this phase
 			// rather than beside it: the phase is the only production pass a cell that selects `Clipmap`
@@ -283,21 +371,56 @@ void Terrain3D::__physics_process(const double p_delta) {
 			// bake is still in flight (`_vt_has_streaming_work()` is the other half). It early-returns
 			// when the layer was never created, so a height-only layer pays a null check and a group
 			// whose detail switch is off owns nothing.
-			_update_vt_material_detail();
+			// A ring whose address table was updated or whose worker result/bake acknowledgment is still
+			// awaiting publication gets the scene-thread budget first. Defer the separate fine-detail
+			// demand pump by this one physics tick so its task handoff cannot push the ring's sampler and
+			// address work over budget; the next tick resumes the same detail policy, density, and queue.
+			clipmap_state_pending = clipmap_state_pending || clipmap_address_updated;
+			for (int group = 0; group < TerrainVT::GROUP_COUNT && !clipmap_state_pending; group++) {
+				const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+				clipmap_state_pending = layer != nullptr &&
+						(layer->async_update_in_progress() || layer->get_state_stamp() != _vt.clipmap_state[group]);
+			}
+			if (clipmap_state_pending) {
+				_vt.vt_clipmap_detail_deferred = true;
+				_vt.detail_requested_tiles = 0;
+				_vt.detail_starved_tiles = 0;
+				_vt.vt_detail_ms = 0.0;
+			} else {
+				const uint64_t detail_update_started = Time::get_singleton()->get_ticks_usec();
+				_update_vt_material_detail();
+				_vt.vt_clipmap_detail_update_ms = double(Time::get_singleton()->get_ticks_usec() - detail_update_started) / 1000.0;
+			}
+			_vt.vt_clipmap_worker_ms = double(_vt.clipmap_worker_usec) / 1000.0;
+			_vt.vt_clipmap_loop_ms = double(Time::get_singleton()->get_ticks_usec() - clipmap_loop_started) / 1000.0;
 		});
-		vt_phase(_vt.vt_clipmap_ms);
 		// A layer that moved a unit, turned its offset or changed which units are current is a uniform
 		// rebind: the shader's copy of the layer's addressing is stale from that moment, and serving it
 		// would read the texel a *previous* origin put under a world position. The stamp is the layer's
 		// own, so this is one comparison per layer on a tick that changed nothing.
+		const uint64_t clipmap_arm_started = Time::get_singleton()->get_ticks_usec();
 		_update_vt_clipmap_arm();
+		_vt.vt_clipmap_arm_ms = double(Time::get_singleton()->get_ticks_usec() - clipmap_arm_started) / 1000.0;
+		vt_phase(_vt.vt_clipmap_ms);
 	} else {
 		_vt.clipmap_produced_texels = 0;
 		_vt.vt_clipmap_ms = 0.0;
+		_vt.vt_clipmap_setup_ms = 0.0;
+		_vt.vt_clipmap_worker_ms = 0.0;
+		_vt.vt_clipmap_loop_ms = 0.0;
+		_vt.vt_clipmap_arm_ms = 0.0;
+		_vt.vt_clipmap_consume_ms = 0.0;
+		_vt.vt_clipmap_bake_ms = 0.0;
+		_vt.vt_clipmap_uniform_ms = 0.0;
+		_vt.vt_clipmap_schedule_ms = 0.0;
+		_vt.vt_clipmap_sync_update_ms = 0.0;
+		_vt.vt_clipmap_detail_update_ms = 0.0;
+		_vt.vt_clipmap_detail_deferred = false;
 		// No group selects the clipmap, so the material detail layer - which is gated on exactly that -
 		// cannot be ticked here. Its phase reading is reset so a panel never shows the last tick's cost
 		// as this one's.
 		_vt.vt_detail_ms = 0.0;
+		vt_mark = Time::get_singleton()->get_ticks_usec();
 	}
 	traced("vt_service", [&] { _update_vt_service(); });
 	vt_phase(_vt.vt_service_ms);

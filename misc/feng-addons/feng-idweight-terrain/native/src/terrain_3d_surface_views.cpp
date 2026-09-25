@@ -952,6 +952,32 @@ Dictionary Terrain3D::get_vt_clipmap_arm(const int p_group) const {
 	return layer != nullptr ? layer->get_arm() : Dictionary();
 }
 
+Dictionary Terrain3D::get_vt_clipmap_address_arm(const int p_group) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		return Dictionary();
+	}
+	const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	return layer != nullptr ? layer->get_address_arm() : Dictionary();
+}
+
+void Terrain3D::get_vt_clipmap_address_uniforms(const int p_group, PackedVector4Array &r_addresses,
+		PackedVector4Array &r_outstanding, PackedInt32Array &r_outstanding_counts) const {
+	if (p_group < 0 || p_group >= TerrainVT::GROUP_COUNT) {
+		r_addresses.clear();
+		r_outstanding.clear();
+		r_outstanding_counts.clear();
+		return;
+	}
+	const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[p_group].get();
+	if (layer != nullptr) {
+		layer->get_address_uniforms(r_addresses, r_outstanding, r_outstanding_counts);
+	} else {
+		r_addresses.clear();
+		r_outstanding.clear();
+		r_outstanding_counts.clear();
+	}
+}
+
 // An edit reached the source. Every layer that carries a channel the edit can change re-produces the
 // texels the area covers and stops serving the units that touch it until they have, so a fragment
 // reads the region array for those few ticks instead of a height from before the stroke. Only a layer
@@ -972,9 +998,34 @@ int Terrain3D::invalidate_vt_clipmap_area(const AABB &p_area) {
 	return queued;
 }
 
+static bool _clipmap_settings_equal(const Terrain3DClipmapLayer::Settings &a,
+		const Terrain3DClipmapLayer::Settings &b) {
+	const TerrainClipmap::Shape &x = a.shape;
+	const TerrainClipmap::Shape &y = b.shape;
+	return a.implementation == b.implementation && x.size == y.size && x.units == y.units &&
+			x.base_world == y.base_world && x.channels == y.channels && x.format == y.format &&
+			x.baked_channels == y.baked_channels && x.baked_format == y.baked_format &&
+			x.global_texels == y.global_texels && x.blocks_per_frame == y.blocks_per_frame && x.spares == y.spares;
+}
+
+static void _cache_clipmap_uniform_binding(Terrain3DVTState::ClipmapUniformBinding &binding,
+		const Terrain3DClipmapLayer *layer) {
+	binding = Terrain3DVTState::ClipmapUniformBinding();
+	if (layer == nullptr || !layer->exists()) {
+		return;
+	}
+	binding.valid = true;
+	binding.settings = layer->get_settings();
+	binding.texture = layer->get_texture_rid();
+	for (int channel = 0; channel < 3; channel++) {
+		binding.baked[channel] = layer->get_baked_texture_rid(channel);
+	}
+}
+
 // Whether any layer's addressing moved since the shader was bound with it, and the rebind that
-// follows. The stamp is the layer's own state rather than a copy kept here, so a layer that was freed
-// and rebuilt is a change like any other - and a switch of implementation is one by construction.
+// follows. The state stamp covers movement. A separate resource/configuration comparison catches a
+// layer that was built after its shader variant (or resized later), when its texture and dimensions
+// need a full bind before subsequent moves can use the address-only path.
 bool Terrain3D::_vt_clipmap_state_changed() {
 	bool changed = false;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
@@ -989,11 +1040,60 @@ bool Terrain3D::_vt_clipmap_state_changed() {
 }
 
 void Terrain3D::_update_vt_clipmap_arm() {
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+		if (layer != nullptr && layer->async_update_in_progress()) {
+			return;
+		}
+	}
 	if (!_vt_clipmap_state_changed()) {
 		return;
 	}
 	if (_initialized && _material.is_valid()) {
-		_material->update_vt_clipmap_uniforms();
+		bool atlas_changed = false;
+		bool resources_changed = false;
+		for (const auto &layer : _vt.clipmap_layer) {
+			if (layer != nullptr && layer->get_implementation() ==
+					TerrainClipmap::Implementation::Atlas) {
+				atlas_changed = true;
+			}
+		}
+		for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+			const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
+			const Terrain3DVTState::ClipmapUniformBinding &binding = _vt.clipmap_uniform_binding[group];
+			const bool exists = layer != nullptr && layer->exists();
+			if (exists != binding.valid) {
+				resources_changed = true;
+				break;
+			}
+			if (!exists) {
+				continue;
+			}
+			const Terrain3DClipmapLayer::Settings &settings = layer->get_settings();
+			if (!_clipmap_settings_equal(settings, binding.settings) ||
+					layer->get_texture_rid() != binding.texture) {
+				resources_changed = true;
+				break;
+			}
+			for (int channel = 0; channel < 3; channel++) {
+				if (layer->get_baked_texture_rid(channel) != binding.baked[channel]) {
+					resources_changed = true;
+					break;
+				}
+			}
+			if (resources_changed) {
+				break;
+			}
+		}
+		if (atlas_changed || resources_changed) {
+			_material->update_vt_clipmap_uniforms();
+			for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+				_cache_clipmap_uniform_binding(_vt.clipmap_uniform_binding[group],
+						_vt.clipmap_layer[group].get());
+			}
+		} else {
+			_material->update_vt_clipmap_address_uniforms();
+		}
 	}
 }
 
@@ -1109,6 +1209,26 @@ void Terrain3D::_update_vt_material_detail() {
 	if (detail == nullptr || !detail->is_enabled()) {
 		return;
 	}
+	const uint64_t started = Time::get_singleton()->get_ticks_usec();
+	int completed_requested = 0;
+	uint64_t completed_worker_us = 0;
+	if (detail->consume_update_result(completed_requested, completed_worker_us)) {
+		_vt.detail_requested_tiles = completed_requested;
+		_vt.detail_starved_tiles = detail->get_starved_tiles();
+		_vt.vt_detail_worker_us = completed_worker_us;
+		if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
+			// Offer dispatch stays on the scene thread; the expensive demand walk, source polling and
+			// directory assembly have already completed on the page pipeline's planner worker.
+			surface_baker->queue_detail_tiles(detail, _vt.clipmap_budget_texels * 16);
+		}
+		_update_vt_detail_arm();
+	}
+	// One update is allowed in flight. Its snapshot and view are immutable, and all readers that
+	// touch the manager wait for its completion before accessing the same residency table.
+	if (detail->update_in_progress()) {
+		_vt.vt_detail_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+		return;
+	}
 	// The source snapshot is the pages' and the layer's one source of truth; the pages build it in
 	// `_configure_vt_service()`, which returns early when no view exists - and "no view, material on
 	// the ring" is exactly the configuration this layer is for. Filling it here is what lets the
@@ -1117,7 +1237,6 @@ void Terrain3D::_update_vt_material_detail() {
 		_vt.vt_source_snapshot = Terrain3DPagePipeline::snapshot(_data, _region_size, _vertex_spacing,
 				_surface_density);
 	}
-	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	Terrain3DMaterialClipmapDetail::DemandView view;
 	const Vector3 target = get_clipmap_target_position();
 	view.focus = v3v2(target);
@@ -1141,6 +1260,12 @@ void Terrain3D::_update_vt_material_detail() {
 			}
 		}
 	}
+	if (detail->schedule_update(view, _vt.vt_source_snapshot, _vt.clipmap_budget_texels)) {
+		_vt.vt_detail_ms = double(Time::get_singleton()->get_ticks_usec() - started) / 1000.0;
+		return;
+	}
+	// The first configured tick has to build storage and its worker pipeline on this thread. After
+	// that warm-up, scheduling above carries every demand tick on the already-created worker.
 	_vt.detail_requested_tiles = detail->update(view, _vt.vt_source_snapshot, _vt.clipmap_budget_texels);
 	_vt.detail_starved_tiles = detail->get_starved_tiles();
 	if (Terrain3DSurfaceBaker *surface_baker = Object::cast_to<Terrain3DSurfaceBaker>(_vt.vt_baker.ptr())) {
@@ -1172,17 +1297,41 @@ bool Terrain3D::_vt_detail_state_changed() {
 }
 
 void Terrain3D::_update_vt_detail_arm() {
-	if (!_vt_detail_state_changed()) {
+	const bool layout_changed = _vt_detail_state_changed();
+	const bool window_changed = _vt_detail_window_state_changed();
+	if (!layout_changed && !window_changed) {
 		return;
 	}
 	if (_initialized && _material.is_valid()) {
-		_material->update_vt_clipmap_uniforms();
+		if (layout_changed) {
+			_material->update_vt_detail_uniforms();
+		} else {
+			const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+			if (detail != nullptr) {
+				_material->update_vt_detail_window_uniforms(detail->get_window_origins());
+			}
+		}
 	}
+}
+
+bool Terrain3D::_vt_detail_window_state_changed() {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	const uint64_t stamp = detail != nullptr ? detail->get_window_stamp() : 0;
+	if (stamp == _vt.material_detail_window_state) {
+		return false;
+	}
+	_vt.material_detail_window_state = stamp;
+	return true;
 }
 
 Dictionary Terrain3D::get_vt_detail_arm() const {
 	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
 	return detail != nullptr ? detail->get_arm() : Dictionary();
+}
+
+Dictionary Terrain3D::get_vt_detail_shader_arm() const {
+	const Terrain3DMaterialClipmapDetail *detail = _vt.material_detail.get();
+	return detail != nullptr ? detail->get_shader_arm() : Dictionary();
 }
 
 int Terrain3D::sample_vt_detail_level(const Vector2 &p_world_xz) const {
@@ -1242,6 +1391,7 @@ Dictionary Terrain3D::get_vt_detail_settings() const {
 		result["requested_tiles"] = 0;
 		result["starved_tiles"] = 0;
 		result["vt_detail_ms"] = 0.0;
+		result["update_worker_us"] = int64_t(0);
 		return result;
 	}
 	result["active"] = detail->is_enabled();
@@ -1268,6 +1418,7 @@ Dictionary Terrain3D::get_vt_detail_settings() const {
 	result["starved_tiles"] = detail->get_starved_tiles();
 	result["requested_tiles"] = _vt.detail_requested_tiles;
 	result["vt_detail_ms"] = _vt.vt_detail_ms;
+	result["update_worker_us"] = int64_t(_vt.vt_detail_worker_us);
 	result["hit_tiles"] = int64_t(detail->get_hit_count());
 	result["miss_tiles"] = int64_t(detail->get_miss_count());
 	result["evictions"] = int64_t(detail->get_evictions());

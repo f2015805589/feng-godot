@@ -111,10 +111,11 @@ func print_statistics() -> void:
 	var p90 := percentile(sorted_values, 0.90)
 	var p95 := percentile(sorted_values, 0.95)
 	var p99 := percentile(sorted_values, 0.99)
+	var minimum: float = float(sorted_values.front()) if not sorted_values.is_empty() else 0.0
 	var peak: float = float(sorted_values.back()) if not sorted_values.is_empty() else 0.0
-	print("CLIPMAP_TICK_STATS mode=continuous_lod ticks=%d move_mps=%.3f size=%d levels=%d base_world=%.3f mean_ms=%.6f median_ms=%.6f p90_ms=%.6f p95_ms=%.6f p99_ms=%.6f peak_ms=%.6f over_0_05=%d" % [
+	print("CLIPMAP_TICK_STATS mode=continuous_lod ticks=%d move_mps=%.3f size=%d levels=%d base_world=%.3f mean_ms=%.6f median_ms=%.6f p90_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f peak_ms=%.6f over_0_05=%d" % [
 		samples.size(), MOVE_METRES_PER_SECOND, SHAPE_SIZE, SHAPE_LEVELS, SHAPE_BASE_WORLD,
-		mean, median, p90, p95, p99, peak, over_target])
+		mean, median, p90, p95, p99, minimum, peak, over_target])
 
 func run() -> void:
 	await setup()
@@ -147,7 +148,17 @@ func run() -> void:
 			var current_settings := settings()
 			var phase: Dictionary = current_settings.get("vt_phases", {})
 			var clipmap_ms := float(phase.get("clipmap", 0.0))
+			var clipmap_setup_ms := float(phase.get("clipmap_setup", 0.0))
+			var clipmap_loop_ms := float(phase.get("clipmap_loop", 0.0))
+			var clipmap_arm_ms := float(phase.get("clipmap_arm", 0.0))
 			var detail_ms := float(phase.get("detail", 0.0))
+			var consume_ms := float(phase.get("clipmap_consume", 0.0))
+			var bake_ms := float(phase.get("clipmap_bake", 0.0))
+			var uniform_ms := float(phase.get("clipmap_uniform", 0.0))
+			var schedule_ms := float(phase.get("clipmap_schedule", 0.0))
+			var sync_update_ms := float(phase.get("clipmap_sync_update", 0.0))
+			var detail_update_ms := float(phase.get("clipmap_detail_update", 0.0))
+			var detail_deferred := bool(phase.get("clipmap_detail_deferred", false))
 			samples.append(clipmap_ms)
 			var entry: Dictionary = (current_settings.get("clipmap", {}) as Dictionary).get("material", {})
 			var upload_bytes := int(entry.get("upload_bytes", 0))
@@ -156,8 +167,11 @@ func run() -> void:
 			var layout: Dictionary = entry.get("layout", {})
 			var diagnostics: Dictionary = layout.get("update_diagnostics", {})
 			var detail_diagnostics: Dictionary = terrain.get_vt_detail_arm().get("update_diagnostics", {})
-			print("CLIPMAP_TICK_ROW tick=%d x=%.3f clipmap_ms=%.6f detail_ms=%.6f produced=%d upload_delta=%d ring_update_us=%.3f rebuild_us=%.3f source_us=%.3f scatter_us=%.3f pack_us=%.3f publish_us=%.3f jobs=%d scheduled=%d completed=%d rows=%d packed=%d levels=%d layers=%d valid=%d pending=%d bake_pending=%d detail_update_us=%d storage_us=%d windows_us=%d band_fit_us=%d candidate_us=%d candidate_tests=%d candidates=%d residency_us=%d requested=%d released=%d source_submit_us=%d source_queue_us=%d source_poll_us=%d source_texture_upload_us=%d source_uploads=%d offer_sort_us=%d bake_offers=%d directory_us=%d directories=%d" % [
-				tick + 1, camera.position.x, clipmap_ms, detail_ms,
+			var producer: Dictionary = current_settings.get("producer", {})
+			print("CLIPMAP_TICK_ROW tick=%d x=%.3f clipmap_ms=%.6f clipmap_setup_ms=%.6f clipmap_loop_ms=%.6f clipmap_arm_ms=%.6f detail_ms=%.6f consume_ms=%.6f bake_ms=%.6f uniform_ms=%.6f schedule_ms=%.6f sync_update_ms=%.6f detail_update_ms=%.6f detail_deferred=%s clipmap_worker_us=%d produced=%d upload_delta=%d ring_update_us=%.3f rebuild_us=%.3f source_us=%.3f scatter_us=%.3f pack_us=%.3f publish_us=%.3f jobs=%d scheduled=%d completed=%d rows=%d packed=%d levels=%d layers=%d valid=%d pending=%d bake_pending=%d detail_update_us=%d storage_us=%d windows_us=%d band_fit_us=%d candidate_us=%d candidate_tests=%d candidates=%d residency_us=%d requested=%d released=%d source_submit_us=%d source_queue_us=%d source_poll_us=%d source_texture_upload_us=%d source_async_upload_us=%d source_uploads=%d offer_sort_us=%d bake_offers=%d directory_us=%d directories=%d ring_bake_lock_skips=%d" % [
+				tick + 1, camera.position.x, clipmap_ms, clipmap_setup_ms, clipmap_loop_ms, clipmap_arm_ms, detail_ms,
+				consume_ms, bake_ms, uniform_ms, schedule_ms, sync_update_ms, detail_update_ms, str(detail_deferred),
+				int(current_settings.get("clipmap_worker_usec", 0)),
 				int(current_settings.get("clipmap_produced_texels", 0)), upload_delta,
 				float(diagnostics.get("update_us", 0.0)),
 				float(diagnostics.get("rebuild_schedule_us", 0.0)),
@@ -188,11 +202,13 @@ func run() -> void:
 				int(detail_diagnostics.get("source_queue_us", 0)),
 				int(detail_diagnostics.get("source_poll_upload_us", 0)),
 				int(detail_diagnostics.get("source_texture_upload_us", 0)),
+				int(detail_diagnostics.get("source_texture_upload_worker_us", 0)),
 				int(detail_diagnostics.get("source_uploads", 0)),
 				int(detail_diagnostics.get("offer_sort_us", 0)),
 				int(detail_diagnostics.get("bake_offers_added", 0)),
 				int(detail_diagnostics.get("directory_publish_us", 0)),
-				int(detail_diagnostics.get("directories_published", 0))])
+				int(detail_diagnostics.get("directories_published", 0)),
+				int(producer.get("ring_bake_lock_skips", 0))])
 		print("CLIPMAP_TICK_SETUP settled_ticks=%d detail_missing=%d detail_fallback=%d" % [
 			settle_ticks, int(detail_entry().get("missing_tiles", 0)), int(detail_entry().get("fallback_tiles", 0))])
 		print_statistics()

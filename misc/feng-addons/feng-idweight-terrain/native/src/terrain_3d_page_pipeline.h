@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,10 @@ public:
 		std::map<std::pair<int, int>, Cell> cells;
 		mutable std::once_flag bounds_once;
 		mutable std::atomic<bool> bounds_ready{false};
+		// The clipmap's immutable row source, shared with page production so its worker can read region
+		// maps without touching Terrain3DData or racing an editor write.
+		float clipmap_height_texel(const Vector2 &world) const;
+		uint32_t clipmap_surface_texel(const Vector2 &world) const;
 		Vector2 bounds(const Rect2 &rect, Vector2 fallback) const;
 		bool surface(const Vector2 &world, Vector3 &point, Vector3 &normal) const;
 		bool project_surface(const Rect2 &rect, const TerrainVT::VisibleView &view, TerrainVT::VisiblePatch &result) const;
@@ -57,6 +62,11 @@ public:
 	~Terrain3DPagePipeline();
 	void reset();
 	void submit_task(std::function<void()> task);
+	// A FIFO for renderer commands that can run off the scene thread. Unlike `submit_task()`, these
+	// tasks are not replaceable: dropping one could publish a tile whose source arrays were never
+	// updated. It shares the pipeline's existing planner thread and is deliberately bounded by its
+	// caller, which keeps this queue small without adding another worker pool.
+	void submit_render_task(std::function<void()> task);
 	void cancel(const Key &key);
 	// Drop a request whose prepared source will never be consumed: a page whose slot the
 	// producer is already filling no longer needs the pipeline's copy, and a ready result
@@ -235,6 +245,7 @@ private:
 	// demand pass whose workers were all busy anyway.
 	int _waiters = 0;
 	std::function<void()> _task;
+	std::deque<std::function<void()>> _render_tasks;
 	uint64_t _token = 0;
 	bool _stop = false;
 	std::vector<std::thread> _workers;

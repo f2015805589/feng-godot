@@ -41,11 +41,13 @@
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -143,6 +145,7 @@ public:
 		// The pipeline produced this tile's source and it has been uploaded into the slot's source
 		// layers. The bake can be offered.
 		bool source_ready = false;
+		bool source_uploading = false;
 		// An offer for this tile is with the producer, and `offer_tick` is when it was made. The
 		// flag keeps the same tile from being offered twice while a dispatch is in flight; the tick
 		// is what retries an offer a producer that cannot dispatch never acknowledges.
@@ -206,12 +209,19 @@ public:
 	// it because it is a property of the terrain's regions, not of this layer.
 	int update(const DemandView &p_view, const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot,
 			const int p_source_budget);
+	// Schedules the same demand update on this layer's existing pipeline worker. The owner consumes its
+	// result on a later tick before it hands the resulting bake offers to the surface baker.
+	bool schedule_update(const DemandView &p_view,
+			const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot, const int p_source_budget);
+	bool consume_update_result(int &r_requested, uint64_t &r_worker_us);
+	bool update_in_progress() const;
+	Terrain3DPagePipeline *task_pipeline() const { return _pipeline.get(); }
 
 	// ---- The producer's side ---------------------------------------------------------------------
 	// Offers the tiles whose source has landed and whose bake no producer has taken yet. The caller
 	// copies them and reports each one back through `acknowledge_bake()` when its dispatch lands.
-	int get_pending_bake_count() const { return int(_offers.size()); }
-	const BakeOffer &get_pending_bake(const int p_index) const { return _offers[size_t(p_index)]; }
+	int get_pending_bake_count() const;
+	const BakeOffer &get_pending_bake(const int p_index) const;
 	// Takes one offer out of the queue once a producer has copied it. The producer takes only what
 	// its budget admitted, so this is per offer rather than a clear: clearing the whole queue would
 	// drop the offers the budget deferred, and their tiles are already marked in flight - they would
@@ -243,9 +253,14 @@ public:
 	// One dictionary the material binds, built here so the shader's window origin, tile span and
 	// directory cannot drift from the CPU's. Empty when the layer is not configured.
 	Dictionary get_arm() const;
-	// A counter that moves whenever something the shader reads changed: the shape, a directory, or
-	// any tile's validity. The caller rebinds on the comparison instead of every tick.
-	uint64_t get_state_stamp() const { return _state_stamp; }
+	// The shader-only subset used for uniform updates; unlike get_arm(), this omits report counters
+	// and slot scans so a directory allocation does not build a full diagnostics report.
+	Dictionary get_shader_arm() const;
+	// The detail arm's layout binding state: shape and directory RIDs. Per-move window origins have
+	// their own stamp, so the hot path can update only that uniform instead of rebuilding every arm.
+	uint64_t get_state_stamp() const;
+	uint64_t get_window_stamp() const;
+	PackedVector2Array get_window_origins() const;
 	// The finest level with a *readable* tile at a world point, or -1. It is the CPU's mirror of the
 	// fragment's own lookup - the same window origin, tile index and directory bit - so a test can
 	// assert what a fragment would be served without reading a picture, and it is what the stage's
@@ -256,11 +271,11 @@ public:
 	// The focus the last demand walk was built from. Kept because the walk is the only place the
 	// layer learns where the view is, and the report has to state the density the directory actually
 	// answers *there* rather than the density that was requested.
-	Vector2 get_last_focus() const { return _last_focus; }
+	Vector2 get_last_focus() const;
 
 	// ---- Readings ---------------------------------------------------------------------------------
 	int get_slot_count() const { return _slot_count; }
-	int get_used_slots() const { return int(_resident.size()); }
+	int get_used_slots() const;
 	int get_valid_count() const;
 	int get_pending_count() const;
 	int get_level_count() const { return _config.levels; }
@@ -290,7 +305,7 @@ public:
 	// Tiles the demand walk wanted and could not hold because every slot was taken by a tile the
 	// same walk also wanted. This is the "budget insufficient" reading the plan asks for: the coarse
 	// ring serves those fragments and the number says how many.
-	int get_starved_tiles() const { return _starved; }
+	int get_starved_tiles() const;
 	String get_budget_report() const;
 
 	// The tile key of a snapped world tile, and its inverse, public for the tests and the report.
@@ -301,7 +316,7 @@ public:
 
 private:
 	// Timings and work counts for the last `update()` call. These are diagnostic-only and are reset
-	// at the start of every call; timings are wall-clock microseconds on the update thread.
+	// at the start of every call; timings are wall-clock microseconds on the page pipeline planner thread once async updates are enabled.
 	struct UpdateDiagnostics {
 		uint64_t total_us = 0;
 		uint64_t storage_us = 0;
@@ -313,6 +328,7 @@ private:
 		uint64_t source_queue_us = 0;
 		uint64_t source_poll_upload_us = 0;
 		uint64_t source_texture_upload_us = 0;
+		uint64_t source_texture_upload_worker_us = 0;
 		uint64_t offer_sort_us = 0;
 		uint64_t directory_publish_us = 0;
 		uint64_t candidate_tests = 0;
@@ -324,6 +340,23 @@ private:
 		int64_t source_uploads = 0;
 		int64_t bake_offers_added = 0;
 	};
+	struct SourceUpload {
+		int64_t key = 0;
+		int slot = -1;
+		uint64_t generation = 0;
+		Vector3 grid;
+	};
+	struct SourceUploadBatch {
+		std::vector<SourceUpload> sources;
+		std::atomic<bool> complete{ false };
+		std::atomic<uint64_t> worker_us{ 0 };
+	};
+	struct AsyncUpdateResult {
+		int requested = 0;
+		uint64_t worker_us = 0;
+		std::atomic<bool> complete{ false };
+	};
+	void wait_for_async_update() const;
 
 	// ---- Addressing ------------------------------------------------------------------------------
 	// The tile index a world position falls in, for a level whose window origin is already snapped.
@@ -375,11 +408,16 @@ private:
 	std::unordered_map<int64_t, uint32_t> _wanted;
 	uint64_t _tick = 0;
 	uint64_t _state_stamp = 1;
+	uint64_t _window_stamp = 1;
 	UpdateDiagnostics _last_update;
 
 	// The source pipeline: its own, because the near field's is retained against a plan that does
 	// not name these keys, and a shared queue would evict one against the other every tick.
 	std::unique_ptr<Terrain3DPagePipeline> _pipeline;
+	// One in-flight batch at a time. The renderer thread holds only immutable Images and RIDs; its
+	// completed slot leases are returned to the scene thread before the bake offer is exposed.
+	std::shared_ptr<SourceUploadBatch> _source_upload_batch;
+	std::shared_ptr<AsyncUpdateResult> _async_update;
 	// Tiles whose source landed and whose bake no producer has taken. Held here rather than offered
 	// straight out, because the producer is offered once a tick and the offer has to survive the
 	// frame the source was uploaded in - the ring's one-tick separation, for the same reason: the

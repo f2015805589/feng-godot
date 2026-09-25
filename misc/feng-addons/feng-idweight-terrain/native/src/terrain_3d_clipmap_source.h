@@ -19,8 +19,11 @@
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 
+#include <memory>
+
 // For `using namespace godot` (this is a GDExtension build) and `real_t`.
 #include "constants.h"
+#include "terrain_3d_page_pipeline.h"
 
 class Terrain3DClipmapSource {
 public:
@@ -43,6 +46,9 @@ public:
 	};
 
 	virtual ~Terrain3DClipmapSource() {}
+	// Refreshes the immutable map snapshot a background update reads. Test sources and other small
+	// producers may ignore it; terrain sources override it so worker rows never touch scene-owned data.
+	virtual void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &) {}
 
 	// Writes `p_row.x1 - p_row.x0` values for one channel, in ascending `x`. The buffer is the
 	// caller's and is sized for a full row; only `[x0, x1)` is read afterwards.

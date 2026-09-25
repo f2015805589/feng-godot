@@ -82,7 +82,7 @@ public:
 	// and of the dictionaries that bind them. One number for the clamp, the publish and the
 	// declaration, so a ring that grew past the shader's arrays is not expressible. It is above the
 	// eleven units the shipping 1024 -> 1 ladder needs, so the ceiling can never truncate that span.
-	static constexpr int MAX_LEVELS = 16;
+	static constexpr int MAX_LEVELS = TerrainClipmap::MAX_LEVELS;
 	// The shape of the ring. `size`, `levels` and `channels` are clamped by `configure()`.
 	// `channels` is how many values a texel holds, one texture array layer each (slice
 	// `level * channels + channel`); `format` is one *value's* format - `FORMAT_RF` (float32) or
@@ -175,6 +175,9 @@ public:
 	int get_unit_count() const override { return int(_levels.size()); }
 	int get_channel_count() const override { return _config.channels; }
 	Image::Format get_format() const override { return _config.format; }
+	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) override {
+		if (_source != nullptr) { _source->set_source_snapshot(p_snapshot); }
+	}
 	// ---- The shared contract this implementation answers ----------------------------------------
 	// The density ladder is the *shared* one, built from the shape the settings asked for, so a
 	// caller's "what density is 40 m away" is answered identically whichever implementation is
@@ -246,7 +249,7 @@ public:
 	// queues one strip per movement, and the arm's gate is per rect, so the table has to cover what a
 	// tick's own production can leave outstanding; beyond it the ring answers with the level's whole
 	// square, which can only make a reader fall back more.
-	static constexpr int MAX_OUTSTANDING_RECTS = 4;
+	static constexpr int MAX_OUTSTANDING_RECTS = TerrainClipmap::MAX_OUTSTANDING_RECTS;
 	// The rects of *stored* texels a reader must not serve from this ring's baked layers right now, for
 	// one level: the rects no bake has covered yet and the rects the CPU side is still producing. The
 	// second kind is why this is a reading rather than a mirror of `_bake_rects`: between a job being
@@ -284,6 +287,9 @@ public:
 	// One update: re-derive the jobs a new focus implies, drain them under the budget, publish the
 	// levels that drained. Returns the number of channel texels produced by this call.
 	int update(const Vector2 &p_focus, const int p_budget_texels) override;
+	// True when the ring has pending production, an invalid level, or a snapped centre that differs
+	// from this focus. The owner uses this to avoid dispatching an idle worker task between texel moves.
+	bool needs_update_at(const Vector2 &p_focus) const;
 
 	// The source changed under a world rect: mark every level the rect touches not-current and queue
 	// the texels that cover it for re-production. Returns how many rect jobs were queued, and costs
@@ -326,6 +332,11 @@ public:
 	// level rule. The material binds it, and the numbers here are the ones the shader's arm computes
 	// with - one publish, so the two cannot drift.
 	Dictionary get_arm() const override;
+	Dictionary get_address_arm() const override;
+	void get_address_uniforms(PackedVector4Array &r_addresses, PackedVector4Array &r_outstanding,
+			PackedInt32Array &r_outstanding_counts) const override;
+	void get_outstanding_uniforms(PackedVector4Array &r_outstanding,
+			PackedInt32Array &r_outstanding_counts) const override;
 
 private:
 	// Per-call timings and work counts for the LOD implementation. Durations are accumulated in

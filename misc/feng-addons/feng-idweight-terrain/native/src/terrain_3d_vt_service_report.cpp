@@ -146,6 +146,8 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["clipmap_base_world"] = _vt.clipmap_base_world;
 	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
 	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
+	result["clipmap_worker_usec"] = int64_t(_vt.clipmap_worker_usec);
+	result["clipmap_worker_ms"] = _vt.vt_clipmap_worker_ms;
 	result["clipmap_implementation"] = String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
 	result["clipmap_implementation_hint"] = String(TerrainClipmap::implementation_hint());
 	result["clipmap_global_texels"] = _vt.clipmap_atlas_global_texels;
@@ -295,6 +297,17 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	result["vt_cpu_peak_ms"] = _vt.vt_cpu_peak_ms;
 	Dictionary phases;
 	phases["clipmap"] = _vt.vt_clipmap_ms;
+	phases["clipmap_setup"] = _vt.vt_clipmap_setup_ms;
+	phases["clipmap_worker"] = _vt.vt_clipmap_worker_ms;
+	phases["clipmap_loop"] = _vt.vt_clipmap_loop_ms;
+	phases["clipmap_arm"] = _vt.vt_clipmap_arm_ms;
+	phases["clipmap_consume"] = _vt.vt_clipmap_consume_ms;
+	phases["clipmap_bake"] = _vt.vt_clipmap_bake_ms;
+	phases["clipmap_uniform"] = _vt.vt_clipmap_uniform_ms;
+	phases["clipmap_schedule"] = _vt.vt_clipmap_schedule_ms;
+	phases["clipmap_sync_update"] = _vt.vt_clipmap_sync_update_ms;
+	phases["clipmap_detail_update"] = _vt.vt_clipmap_detail_update_ms;
+	phases["clipmap_detail_deferred"] = _vt.vt_clipmap_detail_deferred;
 	phases["detail"] = _vt.vt_detail_ms;
 	phases["service"] = _vt.vt_service_ms;
 	phases["avt"] = _vt.vt_avt_ms;

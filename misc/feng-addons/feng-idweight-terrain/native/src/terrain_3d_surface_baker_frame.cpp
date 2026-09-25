@@ -456,11 +456,29 @@ int Terrain3DSurfaceBaker::_queue_clipmap_ring(Terrain3DClipmap *p_ring, const i
 	if (p_ring == nullptr || !p_ring->is_configured() || p_ring->get_baked_channel_count() != 3) {
 		return 0;
 	}
+	if (p_ring->get_pending_bake_count() == 0) {
+		std::unique_lock<std::mutex> lock(_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			_ring_bake_lock_skips.fetch_add(1, std::memory_order_relaxed);
+			return 0;
+		}
+		if (_ring_bake.landed.empty()) {
+			return 0;
+		}
+	}
 	if (!_ensure_ring_bake(p_ring)) {
 		return 0;
 	}
 	const int channels = MAX(1, p_ring->get_channel_count());
-	std::lock_guard<std::mutex> lock(_mutex);
+	// Baking is incremental: if the render callback owns the producer queue, leave the ring's
+	// outstanding rectangles and landed acknowledgments untouched and retry next tick. Waiting here
+	// makes an idle frame inherit the callback's unrelated page recording time; deferring one offer
+	// preserves the lease and never exposes a substitute material.
+	std::unique_lock<std::mutex> lock(_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		_ring_bake_lock_skips.fetch_add(1, std::memory_order_relaxed);
+		return 0;
+	}
 	for (const RingJob &landed : _ring_bake.landed) {
 		// The ring is what decides, not this thread: a rect whose level moved after the dispatch, or
 		// whose shape changed, describes texels the bake never read, and the ring keeps it queued -
@@ -470,13 +488,16 @@ int Terrain3DSurfaceBaker::_queue_clipmap_ring(Terrain3DClipmap *p_ring, const i
 		}
 	}
 	_ring_bake.landed.clear();
+	// Acknowledging landed rectangles removes accepted work from the ring queue. Read the offer count
+	// after that mutation so the pending indices below still name the rectangles that remain.
+	const int pending_count = p_ring->get_pending_bake_count();
 	// The rects the ring has produced and no bake has covered, in the order it produced them - which
 	// is not the order of its levels: a strip of the finest level and a fill of the coarsest are the
 	// same kind of entry here, because both are "this rect is not baked yet". `offer_bake_jobs()` is
 	// the loop itself (terrain_3d_surface_baker_internal.h), shared with the atlas and the detail
 	// layer; what is the ring's own is the job a rect becomes.
 	return offer_bake_jobs(_ring_bake.collected, _ring_bake.queued, p_budget_texels,
-			p_ring->get_pending_bake_count(),
+			pending_count,
 			[&](const int p_index, BakeOfferKey &r_key, int64_t &r_texels) {
 				const Terrain3DClipmap::BakeRect &rect = p_ring->get_pending_bake(p_index);
 				r_key = bake_offer_key(rect);
@@ -789,6 +810,21 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		}
 	}
 
+	// The detail layer's offer is a small scene-thread request. Resolve it here on the render thread,
+	// before dispatch, so copying offers and acknowledging landed tiles cannot extend the movement tick.
+	Terrain3DMaterialClipmapDetail *detail_request = nullptr;
+	int detail_budget_texels = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		detail_request = _detail_bake.requested_detail;
+		detail_budget_texels = _detail_bake.requested_budget_texels;
+		_detail_bake.requested_detail = nullptr;
+		_detail_bake.requested_budget_texels = 0;
+	}
+	if (detail_request != nullptr) {
+		_queue_detail_tiles_now(detail_request, detail_budget_texels);
+	}
+
 	// And the ring's bake, before the page batch: it reads the material list out of the buffer the
 	// block above just wrote, and it must not depend on this frame having page work - a ring whose
 	// channel is delivered by the ring has no pages at all, and `_dispatch_frame_jobs()` refuses an
@@ -1041,7 +1077,8 @@ bool Terrain3DSurfaceBaker::has_render_work() const {
 	// before they are dispatched, and a frame that skipped the callback would leave them there.
 	return _configured && (!_pending.empty() || _invalidate_all || _materials_dirty || _materials_stale ||
 			_requested_capacity > _page_count || !_retired.empty() || _retire_ready ||
-			!_ring_bake.queued.empty() || !_detail_bake.queued.empty() || !_atlas_bake.queued.empty());
+			!_ring_bake.queued.empty() || !_detail_bake.queued.empty() ||
+			_detail_bake.requested_detail != nullptr || !_atlas_bake.queued.empty());
 }
 
 Dictionary Terrain3DSurfaceBaker::get_stats() const {
@@ -1065,6 +1102,7 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	// together are what says whether a moving focus is being baked at all. See `vt_clipmap_render`.
 	// This function holds `_mutex` already, which is also what the three counters above rely on.
 	stats["ring_bake_dispatches"] = int64_t(_ring_bake.dispatches);
+	stats["ring_bake_lock_skips"] = int64_t(_ring_bake_lock_skips.load(std::memory_order_relaxed));
 	// Replaced arrays still alive because the material has not been rebound yet. This
 	// has to read 0 in a settled frame, otherwise a rebuild is leaking its predecessor.
 	stats["retired_bundles"] = int64_t(_retired.size());

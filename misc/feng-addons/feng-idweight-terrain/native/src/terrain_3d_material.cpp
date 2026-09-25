@@ -25,6 +25,18 @@
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/noise_texture2d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
+
+static void set_clipmap_uniforms_on_render_thread(const RID &p_material,
+		const PackedVector4Array &p_addresses, const PackedVector4Array &p_outstanding,
+		const PackedInt32Array &p_outstanding_counts) {
+	RenderingServer *server = RenderingServer::get_singleton();
+	if (server != nullptr && p_material.is_valid()) {
+		server->material_set_param(p_material, "_clipmap_address", p_addresses);
+		server->material_set_param(p_material, "_clipmap_outstanding", p_outstanding);
+		server->material_set_param(p_material, "_clipmap_outstanding_count", p_outstanding_counts);
+	}
+}
 
 // The block atlas's numeric tables live in one `R32F` texture rather than in uniform arrays. The
 // material's uniform buffer is already close to the device's limit at the default region maximum -
@@ -606,9 +618,7 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	Array block_baked_params;
 	PackedFloat32Array block_data;
 	block_data.resize(ATLAS_DATA_WIDTH * ATLAS_DATA_HEIGHT);
-	PackedVector2Array centers;
-	PackedVector2Array rings;
-	PackedFloat32Array valid;
+	PackedVector4Array addresses;
 	PackedVector4Array outstanding;
 	PackedInt32Array outstanding_counts;
 	PackedFloat32Array base_worlds;
@@ -640,9 +650,12 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 		// outstanding table is a row per level: every entry of a row is written, and a level with
 		// nothing outstanding publishes zeroes and a count of zero, so a stale rect can never be read.
 		for (int level = 0; level < Terrain3DClipmap::MAX_LEVELS; level++) {
-			centers.push_back(level < arm_centers.size() ? arm_centers[level] : Vector2());
-			rings.push_back(level < arm_rings.size() ? arm_rings[level] : Vector2());
-			valid.push_back(level < arm_valid.size() ? arm_valid[level] : 0.f);
+			const Vector2 center = level < arm_centers.size() ? arm_centers[level] : Vector2();
+			const Vector2 ring = level < arm_rings.size() ? arm_rings[level] : Vector2();
+			const float level_valid = level < arm_valid.size() ? arm_valid[level] : 0.f;
+			// The y ring offset is an integer texel coordinate. Its fractional half encodes the
+			// current bit, preserving the CPU arm's existing representation in one uniform entry.
+			addresses.push_back(Vector4(center.x, center.y, ring.x, ring.y + (level_valid > 0.5f ? 0.5f : 0.f)));
 			outstanding_counts.push_back(level < arm_outstanding_counts.size() ? arm_outstanding_counts[level] : 0);
 			for (int index = 0; index < Terrain3DClipmap::MAX_OUTSTANDING_RECTS; index++) {
 				const int at = level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + index;
@@ -729,9 +742,10 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 	RS->material_set_param(p_material, "_clipmap_baked_albedo", baked_albedos);
 	RS->material_set_param(p_material, "_clipmap_baked_normal", baked_normals);
 	RS->material_set_param(p_material, "_clipmap_baked_params", baked_params);
-	RS->material_set_param(p_material, "_clipmap_center", centers);
-	RS->material_set_param(p_material, "_clipmap_ring", rings);
-	RS->material_set_param(p_material, "_clipmap_level_valid", valid);
+	_clipmap_addresses = addresses;
+	_clipmap_outstanding = outstanding;
+	_clipmap_outstanding_counts = outstanding_counts;
+	RS->material_set_param(p_material, "_clipmap_address", addresses);
 	RS->material_set_param(p_material, "_clipmap_outstanding", outstanding);
 	RS->material_set_param(p_material, "_clipmap_outstanding_count", outstanding_counts);
 	RS->material_set_param(p_material, "_clipmap_base_world", base_worlds);
@@ -752,11 +766,18 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 			RS->material_set_param(p_material, "_clipmap_block_baked_params", block_baked_params);
 		}
 	}
-	// The detail layer's arm, bound from the layer's own dictionary so the shader's directory, the
-	// window origin it indexes with and the tile span are the CPU's own numbers. A configuration
-	// whose material group is not on the ring has no layer: every name is then bound to the dummy
-	// array, zero levels and a disabled flag, so no name is left holding the previous one.
-	const Dictionary detail = _terrain->get_vt_detail_arm();
+	_bind_vt_detail_uniforms(p_material);
+}
+
+// Bind only the sparse detail arm after its directory table or storage changes. Its shader uniforms
+// are independent of the clipmap and page-region arms, so republishing those tables here only
+// added work to the first detail directory allocation and shape changes.
+void Terrain3DMaterial::_bind_vt_detail_uniforms(const RID &p_material) {
+	const int material_group = int(TerrainVT::ChannelGroup::Material);
+	if (_terrain == nullptr || !p_material.is_valid() || !_shader_clipmap[material_group]) {
+		return;
+	}
+	const Dictionary detail = _terrain->get_vt_detail_shader_arm();
 	const bool detail_on = !detail.is_empty() && bool(detail.get("enabled", false));
 	const Array detail_directory_rids = detail.get("directory", Array());
 	const PackedVector2Array detail_windows_arm = detail.get("window_origin", PackedVector2Array());
@@ -801,12 +822,142 @@ void Terrain3DMaterial::_bind_vt_clipmap_uniforms(const RID &p_material) {
 			detail_params.is_valid() ? detail_params : _generated_dummy.get_rid());
 }
 
+void Terrain3DMaterial::update_vt_detail_uniforms() {
+	_bind_vt_detail_uniforms(_material);
+	if (_terrain != nullptr && _terrain->get_tessellation_level() > 0) {
+		_bind_vt_detail_uniforms(_buffer_material);
+	}
+}
+
 void Terrain3DMaterial::update_vt_clipmap_uniforms() {
 	_bind_vt_clipmap_uniforms(_material);
 	// The displacement buffer samples the same height through the same arm, so it is bound with it
 	// whenever it exists - the rule the whole uniform pass follows.
 	if (_terrain != nullptr && _terrain->get_tessellation_level() > 0) {
 		_bind_vt_clipmap_uniforms(_buffer_material);
+	}
+}
+
+// A moving LOD ring changes only the addressing triplet. Rebuilding the complete arm here used to
+// allocate and upload every material/detail/bake table (and rebind the region data) on each snapped
+// movement step. This hot path copies just the three arrays whose contents actually changed.
+void Terrain3DMaterial::_bind_vt_clipmap_address_uniforms(const RID &p_material) {
+	if (_terrain == nullptr || !p_material.is_valid()) {
+		return;
+	}
+	bool armed = false;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		armed = armed || _shader_clipmap[group];
+	}
+	if (!armed) {
+		return;
+	}
+	const int level_count = Terrain3DClipmap::MAX_LEVELS;
+	const int entry_count = TerrainVT::GROUP_COUNT * level_count;
+	const int rect_count = entry_count * Terrain3DClipmap::MAX_OUTSTANDING_RECTS;
+	PackedVector4Array addresses;
+	addresses.resize(entry_count);
+	PackedVector4Array outstanding;
+	 outstanding.resize(rect_count);
+	PackedInt32Array outstanding_counts;
+	outstanding_counts.resize(entry_count);
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		if (!_shader_clipmap[group]) {
+			continue;
+		}
+		PackedVector4Array group_addresses;
+		PackedVector4Array group_outstanding;
+		PackedInt32Array group_counts;
+		_terrain->get_vt_clipmap_address_uniforms(group, group_addresses, group_outstanding, group_counts);
+		for (int level = 0; level < level_count && level < group_addresses.size(); level++) {
+			const int at = group * level_count + level;
+			const Vector4 address = group_addresses[level];
+			addresses.set(at, address);
+			outstanding_counts.set(at, level < group_counts.size() ? group_counts[level] : 0);
+			for (int rect = 0; rect < Terrain3DClipmap::MAX_OUTSTANDING_RECTS; rect++) {
+				const int group_at = level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + rect;
+				const int at_rect = at * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + rect;
+				outstanding.set(at_rect, group_at < group_outstanding.size()
+						? group_outstanding[group_at] : Vector4());
+			}
+		}
+	}
+	_clipmap_addresses = addresses;
+	_clipmap_outstanding = outstanding;
+	_clipmap_outstanding_counts = outstanding_counts;
+	if (RS->is_on_render_thread()) {
+		set_clipmap_uniforms_on_render_thread(p_material, addresses, outstanding,
+				outstanding_counts);
+	} else {
+		RS->call_on_render_thread(callable_mp_static(&set_clipmap_uniforms_on_render_thread)
+					.bind(p_material, addresses, outstanding, outstanding_counts));
+	}
+}
+
+void Terrain3DMaterial::update_vt_clipmap_address_uniforms() {
+	_bind_vt_clipmap_address_uniforms(_material);
+	if (_terrain != nullptr && _terrain->get_tessellation_level() > 0) {
+		_bind_vt_clipmap_address_uniforms(_buffer_material);
+	}
+}
+
+void Terrain3DMaterial::update_vt_clipmap_address_uniforms(const int p_group,
+		const PackedVector4Array &p_addresses, const PackedVector4Array &p_outstanding,
+		const PackedInt32Array &p_outstanding_counts) {
+	if (_terrain == nullptr || p_group < 0 || p_group >= TerrainVT::GROUP_COUNT ||
+			!_shader_clipmap[p_group]) {
+		return;
+	}
+	const int level_count = Terrain3DClipmap::MAX_LEVELS;
+	const int entry_count = TerrainVT::GROUP_COUNT * level_count;
+	if (_clipmap_addresses.size() != entry_count || _clipmap_outstanding.size() !=
+			entry_count * Terrain3DClipmap::MAX_OUTSTANDING_RECTS ||
+			_clipmap_outstanding_counts.size() != entry_count || p_addresses.size() < level_count ||
+			p_outstanding.size() < level_count * Terrain3DClipmap::MAX_OUTSTANDING_RECTS ||
+			p_outstanding_counts.size() < level_count) {
+		update_vt_clipmap_uniforms();
+		return;
+	}
+	const int offset = p_group * level_count;
+	for (int level = 0; level < level_count; level++) {
+		const Vector4 address = p_addresses[level];
+		_clipmap_addresses.set(offset + level, address);
+		_clipmap_outstanding_counts.set(offset + level, p_outstanding_counts[level]);
+		for (int rect = 0; rect < Terrain3DClipmap::MAX_OUTSTANDING_RECTS; rect++) {
+			const int group_at = level * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + rect;
+			const int at = (offset + level) * Terrain3DClipmap::MAX_OUTSTANDING_RECTS + rect;
+			_clipmap_outstanding.set(at, p_outstanding[group_at]);
+		}
+	}
+	auto publish = [&](const RID &p_material) {
+		if (!p_material.is_valid()) {
+			return;
+		}
+		if (RS->is_on_render_thread()) {
+			set_clipmap_uniforms_on_render_thread(p_material, _clipmap_addresses, _clipmap_outstanding,
+					_clipmap_outstanding_counts);
+		} else {
+			RS->call_on_render_thread(callable_mp_static(&set_clipmap_uniforms_on_render_thread)
+					.bind(p_material, _clipmap_addresses, _clipmap_outstanding,
+							_clipmap_outstanding_counts));
+		}
+	};
+	publish(_material);
+	if (_terrain->get_tessellation_level() > 0) {
+		publish(_buffer_material);
+	}
+}
+
+void Terrain3DMaterial::update_vt_detail_window_uniforms(const PackedVector2Array &p_origins) {
+	const int material_group = int(TerrainVT::ChannelGroup::Material);
+	if (_terrain == nullptr || !_shader_clipmap[material_group]) {
+		return;
+	}
+	if (_material.is_valid()) {
+		RS->material_set_param(_material, "_detail_window_origin", p_origins);
+	}
+	if (_terrain->get_tessellation_level() > 0 && _buffer_material.is_valid()) {
+		RS->material_set_param(_buffer_material, "_detail_window_origin", p_origins);
 	}
 }
 

@@ -5,6 +5,8 @@
 
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/shader.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
+#include <godot_cpp/variant/packed_vector4_array.hpp>
 
 #include "constants.h"
 #include "generated_texture.h"
@@ -124,6 +126,9 @@ private:
 	// when *either* changed. One entry per group, indexable by `TerrainVT::ChannelGroup`, so the
 	// channel the ring gains later needs no change here.
 	bool _shader_clipmap[TerrainVT::GROUP_COUNT] = { false };
+	PackedVector4Array _clipmap_addresses;
+	PackedVector4Array _clipmap_outstanding;
+	PackedInt32Array _clipmap_outstanding_counts;
 	bool _needs_clipmap_arm(const int p_group) const;
 	// The same per-group question for the block atlas: a group whose cells name `ClipmapAtlas`
 	// compiles the atlas's tables and samplers as well, and a group that names only the ring does
@@ -152,6 +157,8 @@ private:
 	void _update_shader();
 	void _update_vt_uniforms(const RID &p_material);
 	void _bind_vt_clipmap_uniforms(const RID &p_material);
+	void _bind_vt_clipmap_address_uniforms(const RID &p_material);
+	void _bind_vt_detail_uniforms(const RID &p_material);
 	// The block atlas's numeric tables as one `R32F` texture, created once and updated in place.
 	// Returns the texture's RID, or an invalid RID when there is no device yet.
 	RID _update_block_data_texture(const PackedFloat32Array &p_data);
@@ -172,6 +179,15 @@ public:
 	// moved: the full pass would republish every VT uniform (and the region tables) on a tick the
 	// camera merely walked. A no-op in a variant that carries no ring arm.
 	void update_vt_clipmap_uniforms();
+	void update_vt_clipmap_address_uniforms();
+	void update_vt_clipmap_address_uniforms(int p_group, const PackedVector4Array &p_addresses,
+			const PackedVector4Array &p_outstanding, const PackedInt32Array &p_outstanding_counts);
+	// Detail directory RIDs and their shape are separate from the ring arm; rebind that arm alone
+	// when its storage changes instead of re-uploading every VT table.
+	void update_vt_detail_uniforms();
+	// Window origins change while walking, but the layer shape and bound directory RIDs do not.
+	// Rebind just that hot uniform instead of rebuilding both groups' clipmap tables every tile.
+	void update_vt_detail_window_uniforms(const PackedVector2Array &p_origins);
 	RID get_material_rid() const { return _material; }
 	RID get_shader_rid() const { return _shader.is_valid() ? _shader->get_rid() : RID(); }
 	// Whether the *generated* shader carries the virtual-texture arms. It is the verdict the last

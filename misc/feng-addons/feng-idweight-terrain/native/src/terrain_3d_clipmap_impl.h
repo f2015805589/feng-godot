@@ -23,14 +23,21 @@
 // `TerrainClipmap::Shape` and forwards. Call sites therefore branch nowhere.
 
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
+#include <godot_cpp/variant/packed_vector4_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/vector2.hpp>
+#include <godot_cpp/variant/vector4.hpp>
 
 #include <cstdint>
+#include <memory>
 
 #include "terrain_3d_clipmap_common.h"
+#include "terrain_3d_page_pipeline.h"
 
 class Terrain3DClipmapImpl {
 public:
@@ -49,6 +56,8 @@ public:
 	virtual void clear() = 0;
 	virtual int get_channel_count() const = 0;
 	virtual Image::Format get_format() const = 0;
+	// Supplies the immutable region bytes the source reads if this update runs on a worker.
+	virtual void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &) {}
 	// The shape the layer was configured with, in the shared vocabulary. A report or a test that asks
 	// "what is the density at 40 m" needs only this.
 	virtual TerrainClipmap::Ladder get_ladder() const = 0;
@@ -119,6 +128,50 @@ public:
 	// names. The material binds it through one path (`arm["implementation"]` decides which names), so
 	// the two arms are plumbing rather than two owners.
 	virtual Dictionary get_arm() const = 0;
+	// Address-only view for a moving LOD arm. The LOD ring overrides this to avoid building its
+	// outstanding-rectangle and texture tables when only centre/offset/validity changed.
+	virtual Dictionary get_address_arm() const {
+		const Dictionary arm = get_arm();
+		Dictionary result;
+		result["centers"] = arm.get("centers", PackedVector2Array());
+		result["rings"] = arm.get("rings", PackedVector2Array());
+		result["valid"] = arm.get("valid", PackedFloat32Array());
+		return result;
+	}
+	// The moving shader state in typed arrays. The LOD implementation fills these directly so a
+	// moved ring does not allocate dictionaries on the main thread; the atlas fallback is infrequent
+	// and can use the shared arm it already owns.
+	virtual void get_address_uniforms(PackedVector4Array &r_addresses, PackedVector4Array &r_outstanding,
+			PackedInt32Array &r_outstanding_counts) const {
+		const Dictionary arm = get_address_arm();
+		const PackedVector2Array centers = arm.get("centers", PackedVector2Array());
+		const PackedVector2Array rings = arm.get("rings", PackedVector2Array());
+		const PackedFloat32Array valid = arm.get("valid", PackedFloat32Array());
+		const PackedVector4Array outstanding = arm.get("outstanding", PackedVector4Array());
+		const PackedInt32Array counts = arm.get("outstanding_counts", PackedInt32Array());
+		const int levels = TerrainClipmap::MAX_LEVELS;
+		const int max_rects = TerrainClipmap::MAX_OUTSTANDING_RECTS;
+		r_addresses.resize(levels);
+		r_outstanding.resize(levels * max_rects);
+		r_outstanding_counts.resize(levels);
+		for (int level = 0; level < levels; level++) {
+			const Vector2 center = level < centers.size() ? centers[level] : Vector2();
+			const Vector2 ring = level < rings.size() ? rings[level] : Vector2();
+			const float is_valid = level < valid.size() ? valid[level] : 0.f;
+			r_addresses.set(level, Vector4(center.x, center.y, ring.x,
+					ring.y + (is_valid > 0.5f ? 0.5f : 0.f)));
+			r_outstanding_counts.set(level, level < counts.size() ? counts[level] : 0);
+			for (int index = 0; index < max_rects; index++) {
+				const int at = level * max_rects + index;
+				r_outstanding.set(at, at < outstanding.size() ? outstanding[at] : Vector4());
+			}
+		}
+	}
+	virtual void get_outstanding_uniforms(PackedVector4Array &r_outstanding,
+			PackedInt32Array &r_outstanding_counts) const {
+		PackedVector4Array addresses;
+		get_address_uniforms(addresses, r_outstanding, r_outstanding_counts);
+	}
 };
 
 #endif // TERRAIN3D_CLIPMAP_IMPL_H

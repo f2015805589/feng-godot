@@ -121,6 +121,15 @@ func differing(a: Image, b: Image) -> int:
 				count += 1
 	return count
 
+func strict_missing_pixels(image: Image) -> int:
+	var count := 0
+	for y in image.get_height():
+		for x in image.get_width():
+			var pixel := image.get_pixel(x, y)
+			if pixel.r > 0.65 and pixel.b > 0.65 and pixel.g < 0.25:
+				count += 1
+	return count
+
 
 # How far apart two renders of the same material are: the count of differing pixels says nothing about
 # whether the difference is a different material or the same material's last bit. `x` is the worst
@@ -247,9 +256,17 @@ func setup() -> void:
 		terrain.assets.set_texture_asset(id, asset)
 	# One level of 64 texels over 64 m, i.e. exactly one ring texel a metre: the height map's own
 	# grid. The budget fills a whole level in one call, which is what makes the settling below exact.
-	terrain.vt_clipmap_size = 64
-	terrain.vt_clipmap_levels = 1
-	terrain.vt_clipmap_base_world = 64.0
+	# Keep the legacy fallback deliberately different. The actual height and material render paths
+	# below use independent, explicit per-group tuples of 64 x 1 x 64 m.
+	terrain.vt_clipmap_size = 256
+	terrain.vt_clipmap_levels = 11
+	terrain.vt_clipmap_base_world = 0.25
+	terrain.vt_clipmap_height_size = 64
+	terrain.vt_clipmap_height_levels = 1
+	terrain.vt_clipmap_height_base_world = 64.0
+	terrain.vt_clipmap_material_size = 64
+	terrain.vt_clipmap_material_levels = 1
+	terrain.vt_clipmap_material_base_world = 64.0
 	terrain.vt_clipmap_budget_texels = 64 * 64
 	terrain.set_camera(camera)
 	terrain.set_clipmap_target(target)
@@ -452,7 +469,7 @@ func run() -> void:
 	require(direct_code.contains("const bool _surface_vt_enabled"), "an all-direct matrix compiles the no-VT arm")
 	require(not direct_code.contains("_avt_coverage_distance"), "which has no VT uniform in it")
 	require(not direct_code.contains("_clipmap_atlas"), "and no ring sampler")
-	require(not direct_code.contains("_clipmap_level_valid"), "and no ring gate")
+	require(not direct_code.contains("_clipmap_address"), "and no ring address table")
 	require(not clipmap_arm("height"), "and the report says so")
 	var direct_image := await frame_image()
 	save_image(direct_image, "clipmap-height-direct.png")
@@ -472,7 +489,7 @@ func run() -> void:
 	save_text(clip_code, "clipmap-height-ring.glsl")
 	require(clip_code.contains("_surface_vt_enabled"), "selecting it compiles the VT arms")
 	require(clip_code.contains("_clipmap_atlas"), "including the ring's sampler")
-	require(clip_code.contains("_clipmap_level_valid"), "and the gate that keeps a stale level out")
+	require(clip_code.contains("_clipmap_address"), "and the address table that keeps a stale level out")
 	require(clip_code.contains("_avt_coverage_distance"), "with the band edge the ring serves inside")
 	require(clipmap_arm("height"), "and the report says so")
 	require(int(ring().get("update_calls", 0)) > tick_updates, "the tick's own phase drives the ring")
@@ -480,9 +497,55 @@ func run() -> void:
 	diag("matched_ring")
 	require(bool(ring().get("configured", false)), "the ring exists")
 	require(int(ring().get("size", 0)) == 64, "with the configured size")
+	require(terrain.vt_clipmap_size == 256 and terrain.vt_clipmap_height_size == 64,
+			"the height render uses its group override while the legacy fallback stays at 256")
 	require(absf(float(level_report().get("texel_world", 0.0)) - 1.0) < 0.0001, "and one texel a metre")
 	require(valid_levels() == 1, "and its one level is current")
 	require(int(ring().get("pending_jobs", -1)) == 0, "with nothing queued")
+	var height_arm: Dictionary = terrain.get_vt_clipmap_arm(HEIGHT)
+	var height_centers: PackedVector2Array = height_arm.get("centers", PackedVector2Array())
+	var height_rings: PackedVector2Array = height_arm.get("rings", PackedVector2Array())
+	var height_valid: PackedFloat32Array = height_arm.get("valid", PackedFloat32Array())
+	var material_rid := terrain.material.get_material_rid()
+	var bound_addresses: PackedVector4Array = RenderingServer.material_get_param(material_rid, "_clipmap_address")
+	var bound_sizes: PackedInt32Array = RenderingServer.material_get_param(material_rid, "_clipmap_size")
+	var bound_levels: PackedInt32Array = RenderingServer.material_get_param(material_rid, "_clipmap_level_count")
+	var bound_channels: PackedInt32Array = RenderingServer.material_get_param(material_rid, "_clipmap_channels")
+	var bound_base_world: PackedFloat32Array = RenderingServer.material_get_param(material_rid, "_clipmap_base_world")
+	var bound_band: PackedInt32Array = RenderingServer.material_get_param(material_rid, "_clipmap_band")
+	var bound_atlases: Array = RenderingServer.material_get_param(material_rid, "_clipmap_atlas")
+	var height_texture: RID = height_arm.get("texture", RID())
+	var height_layer: Image = RenderingServer.texture_2d_layer_get(height_texture, 0)
+	var bound_height_texture: RID = bound_atlases[1] if bound_atlases.size() > 1 else RID()
+	var bound_height_layer: Image = RenderingServer.texture_2d_layer_get(bound_height_texture, 0)
+	var height_gpu_samples := PackedFloat32Array()
+	for world in [Vector2(20.5, 20.5), Vector2(30.5, 30.5), Vector2(40.5, 40.5)]:
+		var logical := Vector2i(floori(world.x - 30.0 + 32.0), floori(world.y - 30.0 + 32.0))
+		height_gpu_samples.push_back(height_layer.get_pixelv(logical).r if height_layer != null else NAN)
+	print("CLIPMAP_HEIGHT_ADDRESS_PROBE cpu_center=%s cpu_ring=%s cpu_valid=%.1f gpu_center=%s gpu_ring=%s gpu_valid=%.1f size=%d levels=%d channels=%d base=%.3f band=%d texture_match=%s arm_texture=%s/%s shader_texture=%s/%s gpu_samples=%.4f,%.4f,%.4f sampler_samples=%.4f,%.4f,%.4f direct_samples=%.4f,%.4f,%.4f" % [
+		str(height_centers[0] if not height_centers.is_empty() else Vector2()),
+		str(height_rings[0] if not height_rings.is_empty() else Vector2()),
+		height_valid[0] if not height_valid.is_empty() else 0.0,
+		str(Vector2(bound_addresses[16].x, bound_addresses[16].y) if bound_addresses.size() > 16 else Vector2()),
+		str(Vector2(bound_addresses[16].z, floorf(bound_addresses[16].w)) if bound_addresses.size() > 16 else Vector2()),
+		1.0 if bound_addresses.size() > 16 and fposmod(bound_addresses[16].w, 1.0) > 0.25 else 0.0,
+		bound_sizes[1] if bound_sizes.size() > 1 else -1,
+		bound_levels[1] if bound_levels.size() > 1 else -1,
+		bound_channels[1] if bound_channels.size() > 1 else -1,
+		bound_base_world[1] if bound_base_world.size() > 1 else -1.0,
+		bound_band[1] if bound_band.size() > 1 else -1,
+		str(bound_height_texture == height_texture),
+		str(height_layer.get_size()) if height_layer != null else "null",
+		str(height_layer.get_format()) if height_layer != null else "null",
+		str(bound_height_layer.get_size()) if bound_height_layer != null else "null",
+		str(bound_height_layer.get_format()) if bound_height_layer != null else "null",
+		height_gpu_samples[0], height_gpu_samples[1], height_gpu_samples[2],
+		bound_height_layer.get_pixelv(Vector2i(22, 22)).r if bound_height_layer != null and bound_height_layer.get_width() > 42 and bound_height_layer.get_height() > 42 else NAN,
+		bound_height_layer.get_pixelv(Vector2i(32, 32)).r if bound_height_layer != null and bound_height_layer.get_width() > 42 and bound_height_layer.get_height() > 42 else NAN,
+		bound_height_layer.get_pixelv(Vector2i(42, 42)).r if bound_height_layer != null and bound_height_layer.get_width() > 42 and bound_height_layer.get_height() > 42 else NAN,
+		reference(Vector2(20.5, 20.5)), reference(Vector2(30.5, 30.5)), reference(Vector2(40.5, 40.5))])
+	require(bound_height_texture == height_texture,
+			"the shader's height sampler is bound to its layer texture, not the dummy array")
 	var clip_image := await frame_image()
 	save_image(clip_image, "clipmap-height-ring.png")
 	var matched_diff := differing(direct_image, clip_image)
@@ -492,7 +555,7 @@ func run() -> void:
 
 	# 3. Coarser: four texels a metre holds one value where the grid holds four, so the picture must
 	#    change. Reconfiguring drops the ring's content and the next fill rebuilds it whole.
-	terrain.vt_clipmap_base_world = 256.0
+	terrain.vt_clipmap_height_base_world = 256.0
 	await settle(2)
 	settle_ring()
 	require(absf(float(level_report().get("texel_world", 0.0)) - 4.0) < 0.0001, "the reconfigured ring is four texels a metre")
@@ -508,8 +571,8 @@ func run() -> void:
 	#     different world position. A ring of 32 texels over 32 m is still one texel a metre (so its
 	#     grid is the height grid's) but covers only ±16 m around the focus, which the view reaches
 	#     past: the render must be the array's, inside the coverage and outside it alike.
-	terrain.vt_clipmap_size = 32
-	terrain.vt_clipmap_base_world = 32.0
+	terrain.vt_clipmap_height_size = 32
+	terrain.vt_clipmap_height_base_world = 32.0
 	await settle(2)
 	settle_ring()
 	require(absf(float(level_report().get("texel_world", 0.0)) - 1.0) < 0.0001, "the smaller ring is still one texel a metre")
@@ -522,8 +585,8 @@ func run() -> void:
 		print("PASS clipmap height arm: outside the coarsest level's coverage the array serves, and the render is unchanged")
 
 	# Back to the matched shape, settled, before the stroke below.
-	terrain.vt_clipmap_size = 64
-	terrain.vt_clipmap_base_world = 64.0
+	terrain.vt_clipmap_height_size = 64
+	terrain.vt_clipmap_height_base_world = 64.0
 	await settle(2)
 	settle_ring()
 	require(valid_levels() == 1, "the matched ring is current again")
@@ -617,7 +680,7 @@ func run() -> void:
 	# grid. So a ring serving the material group's band must render the pixels the array renders, and a
 	# ring four metres a texel must not: the identical pair is the ring's render rather than a fallback
 	# agreeing with itself only because the coarse one differs.
-	terrain.vt_clipmap_base_world = 64.0
+	terrain.vt_clipmap_material_base_world = 64.0
 	var mat_direct_image := await frame_image()
 	save_image(mat_direct_image, "clipmap-material-direct.png")
 	# The two painted ids and the two colours they render as, which is the reading behind "the material
@@ -646,6 +709,14 @@ func run() -> void:
 	var mat_entry: Dictionary = settings().get("clipmap", {}).get("material", {})
 	require(bool(mat_entry.get("configured", false)), "the ring exists for the material group")
 	require(str(mat_entry.get("source", "")) == "material", "and names the channel it carries")
+	require(int(mat_entry.get("size", 0)) == 64 and int(mat_entry.get("units", 0)) == 1 and
+			is_equal_approx(float(mat_entry.get("base_world", 0.0)), 64.0) and
+			terrain.vt_clipmap_size == 256 and terrain.vt_clipmap_height_size == 64,
+			"the material render uses its own 64x1x64 shape without changing Height or the legacy fallback")
+	print("CLIPMAP_GROUP_RENDER material=(%d,%d,%.2f) height=(%d,%d,%.2f) legacy=(%d,%d,%.2f)" % [
+		int(mat_entry.get("size", 0)), int(mat_entry.get("units", 0)), float(mat_entry.get("base_world", 0.0)),
+		int(ring().get("size", 0)), int(ring().get("units", 0)), float(ring().get("base_world", 0.0)),
+		terrain.vt_clipmap_size, terrain.vt_clipmap_levels, terrain.vt_clipmap_base_world])
 	require(material_valid_levels() >= 1, "with a current level")
 	# A ring whose group no page carries is still a producer's owner: the bake is the same pass a
 	# page runs, so this configuration has one and the ring's levels are baked rather than left
@@ -690,7 +761,7 @@ func run() -> void:
 	var ring_counts_bound: Variant = RenderingServer.material_get_param(mat_ring_arm, "_clipmap_outstanding_count")
 	var ring_outstanding_full := PackedVector4Array()
 	ring_outstanding_full.resize(32 * 4)
-	ring_outstanding_full[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_size), float(terrain.vt_clipmap_size))
+	ring_outstanding_full[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_height_size), float(terrain.vt_clipmap_height_size))
 	var ring_counts_full := PackedInt32Array()
 	ring_counts_full.resize(32)
 	ring_counts_full[0] = 1
@@ -709,7 +780,7 @@ func run() -> void:
 		print("PASS clipmap material arm: the ring alone is baked, and its layers answer the band")
 
 	# Direct restores the array, unchanged by any of this.
-	terrain.vt_clipmap_base_world = 64.0
+	terrain.vt_clipmap_material_base_world = 64.0
 	terrain.vt_delivery_near_material = DIRECT
 	await settle(6)
 	require(not shader_code().contains("clipmap_baked_material"),
@@ -775,12 +846,12 @@ func run() -> void:
 	mip_distances[far_root_mip] = 4096.0
 	terrain.set_surface_svt_mip_distances(mip_distances)
 	await settle_pages()
-	var ring_base_world := float(terrain.vt_clipmap_size) * far_texel
-	terrain.vt_clipmap_base_world = ring_base_world
-	require(is_equal_approx(terrain.vt_clipmap_base_world, ring_base_world),
+	var ring_base_world := float(terrain.vt_clipmap_material_size) * far_texel
+	terrain.vt_clipmap_material_base_world = ring_base_world
+	require(is_equal_approx(terrain.vt_clipmap_material_base_world, ring_base_world),
 			"the ring takes the far field's texel as its own, %.4f m" % far_texel)
 	print("CLIPMAP_MATERIAL_DENSITY far_root_mip=%d far_root_world=%.1f far_texel=%.4f ring_base_world=%.1f" % [
-		far_root_mip, far_root_world, far_texel, terrain.vt_clipmap_base_world])
+		far_root_mip, far_root_world, far_texel, terrain.vt_clipmap_material_base_world])
 	# The reference image: no ring on the near cell, so the paged tier answers every fragment.
 	terrain.vt_delivery_near_material = DIRECT
 	await settle(4)
@@ -809,10 +880,17 @@ func run() -> void:
 	var arm_rid: RID = terrain.material.get_material_rid()
 	require(shader_code().contains("clipmap_baked_material"),
 			"the arm that samples the layers is compiled into the generated shader")
+	require(shader_code().contains("material_clipmap_missing") and
+			shader_code().contains("if (!evaluated_baked && !material_clipmap_missing)"),
+			"a selected material clipmap suppresses the source evaluator when no cached VT level can answer")
 	require(mat_outstanding_total(arm_rid) == 0,
 			"and a settled ring has nothing outstanding to bind, %d rects" % mat_outstanding_total(arm_rid))
 	var mat_baked_image := await frame_image()
 	save_image(mat_baked_image, "clipmap-material-baked.png")
+	var strict_missing_static := strict_missing_pixels(mat_baked_image)
+	print("CLIPMAP_MATERIAL_ROUTE label=settled-static strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_static, mat_baked_image.get_width(), mat_baked_image.get_height()])
+	require(strict_missing_static == 0, "the settled material clipmap has no missing-VT diagnostic pixels")
 	# The judge, as the two producers can meet it. They bake one material through one shader, but not
 	# from one staging copy: a page's source is a staging array resampled at the page's own grid with the
 	# page's own slope policy, while the ring's is its own payload layer - so the last bits of the values
@@ -848,7 +926,7 @@ func run() -> void:
 	# `vt_material` uses when it poisons a source array to prove ready pages bypass it.
 	var outstanding_full := PackedVector4Array()
 	outstanding_full.resize(32 * 4)
-	outstanding_full[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_size), float(terrain.vt_clipmap_size))
+	outstanding_full[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_material_size), float(terrain.vt_clipmap_material_size))
 	var counts_full := PackedInt32Array()
 	counts_full.resize(32)
 	counts_full[0] = 1
@@ -869,15 +947,21 @@ func run() -> void:
 	var mat_far_rect_image := await frame_image()
 	require(differing(mat_baked_image, mat_far_rect_image) == 0,
 			"a rect the camera cannot see leaves the render the layers', %d pixels differ" % differing(mat_baked_image, mat_far_rect_image))
-	# The whole square: every fragment's taps are in it, so the arm answers none of them and the band
-	# reads the array - a different material at this density.
+	# The whole square: every fragment's taps are in it, so the ring cannot answer. A clipmap-owned
+	# fragment must show the shader's missing-VT diagnostic; evaluating the source material here would
+	# hide the missing ring and violate the no-substitute delivery contract.
 	RenderingServer.material_set_param(arm_rid, "_clipmap_outstanding", outstanding_full)
 	RenderingServer.material_set_param(arm_rid, "_clipmap_outstanding_count", counts_full)
 	var mat_fallback_image := await frame_image()
 	save_image(mat_fallback_image, "clipmap-material-fallback.png")
+	var strict_missing_forced := strict_missing_pixels(mat_fallback_image)
 	var mat_fallback_delta := channel_delta(mat_baked_image, mat_fallback_image)
 	print("CLIPMAP_MATERIAL_SOURCE_DELTA differing=%d mean=%.6f strong=%d" % [
 		differing(mat_baked_image, mat_fallback_image), mat_fallback_delta.y, int(mat_fallback_delta.z)])
+	print("CLIPMAP_MATERIAL_ROUTE label=ring-missing-forced strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_forced, mat_fallback_image.get_width(), mat_fallback_image.get_height()])
+	require(strict_missing_forced > 0,
+		"a clipmap-owned fragment with no ring answer shows the missing-VT diagnostic instead of source material")
 	require(int(mat_fallback_delta.z) > 0,
 			"a rect covering the level is what decides the source: it changes the render, %d pixels" % int(mat_fallback_delta.z))
 	# And binding the ring's own answer again returns the baked picture exactly.
@@ -889,7 +973,7 @@ func run() -> void:
 
 	# And a ring twice as coarse is *its* density, which is what makes the identical pair above a
 	# density both producers reached rather than a picture neither of them is in.
-	terrain.vt_clipmap_base_world = ring_base_world * 2.0
+	terrain.vt_clipmap_material_base_world = ring_base_world * 2.0
 	await settle(6)
 	settle_material_ring()
 	for frame in 240:
@@ -916,7 +1000,7 @@ func run() -> void:
 	# rects, so this is a number rather than a claim: one texel of focus movement under a `Clipmap` cell
 	# bakes `size * channels` channel texels - one column strip - where the level's square is
 	# `size * size * channels`.
-	terrain.vt_clipmap_base_world = ring_base_world
+	terrain.vt_clipmap_material_base_world = ring_base_world
 	await settle(6)
 	settle_material_ring()
 	for frame in 240:
@@ -940,12 +1024,12 @@ func run() -> void:
 			break
 		await process_frame
 	settle_material_ring()
-	var level_texels := terrain.vt_clipmap_size * terrain.vt_clipmap_size * material_baked_channels()
+	var level_texels := terrain.vt_clipmap_material_size * terrain.vt_clipmap_material_size * material_baked_channels()
 	print("CLIPMAP_MATERIAL_BAKE_GRAIN strip=%d level=%d texels_per_texel_move=%d" % [
-		baked_strip, level_texels, terrain.vt_clipmap_size * material_baked_channels()])
-	require(baked_strip >= terrain.vt_clipmap_size * material_baked_channels(),
+		baked_strip, level_texels, terrain.vt_clipmap_material_size * material_baked_channels()])
+	require(baked_strip >= terrain.vt_clipmap_material_size * material_baked_channels(),
 			"a one-texel focus move bakes the strip it produced, %d channel texels" % baked_strip)
-	require(baked_strip <= terrain.vt_clipmap_size * material_baked_channels() * 2,
+	require(baked_strip <= terrain.vt_clipmap_material_size * material_baked_channels() * 2,
 			"and not the level's square: %d against %d" % [baked_strip, level_texels])
 	require(baked_levels() >= material_valid_levels() and material_valid_levels() > 0,
 			"with the level baked again, %d of %d" % [baked_levels(), material_valid_levels()])
@@ -957,6 +1041,10 @@ func run() -> void:
 	# show the material shifted by the texel the focus moved, and this reading is what says so.
 	var mat_moved_image := await frame_image()
 	save_image(mat_moved_image, "clipmap-material-baked-moved.png")
+	var strict_missing_moved := strict_missing_pixels(mat_moved_image)
+	print("CLIPMAP_MATERIAL_ROUTE label=focus-moved strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_moved, mat_moved_image.get_width(), mat_moved_image.get_height()])
+	require(strict_missing_moved == 0, "the moved material clipmap has no missing-VT diagnostic pixels")
 	var mat_moved_delta := channel_delta(mat_paged_image, mat_moved_image)
 	print("CLIPMAP_MATERIAL_MOVED_DELTA differing=%d max=%.6f mean=%.6f strong=%d" % [
 		differing(mat_paged_image, mat_moved_image), mat_moved_delta.x, mat_moved_delta.y,
@@ -1046,6 +1134,69 @@ func run() -> void:
 				baked_levels(), material_valid_levels()])
 	if not failed:
 		print("PASS clipmap material bake: a moving focus lands its bakes, a strip at a time")
+
+	# Move both the camera and the clipmap focus by one source texel, then compare at that moved view
+	# against the same scene with its paged material path selected. This runs after the focus/edit cases
+	# so its intentionally perturbed view cannot affect their ring setup.
+	var camera_origin := camera.position
+	var target_origin := target.position
+	terrain.vt_delivery_near_material = DIRECT
+	camera.position.x += far_texel
+	target.position.x += far_texel
+	await settle_pages()
+	var mat_paged_moved_image := await frame_image()
+	save_image(mat_paged_moved_image, "clipmap-material-paged-camera-moved.png")
+	terrain.vt_delivery_near_material = CLIPMAP
+	await settle(6)
+	settle_material_ring()
+	for frame in 240:
+		if baked_levels() >= material_valid_levels() and material_valid_levels() > 0:
+			break
+		await process_frame
+	settle_material_ring()
+	require(baked_levels() >= material_valid_levels() and material_valid_levels() > 0,
+			"the camera-moved material ring is current and baked")
+	var mat_baked_moved_camera_image := await frame_image()
+	save_image(mat_baked_moved_camera_image, "clipmap-material-baked-camera-moved.png")
+	var strict_missing_moved_camera := strict_missing_pixels(mat_baked_moved_camera_image)
+	var moved_camera_delta := channel_delta(mat_paged_moved_image, mat_baked_moved_camera_image)
+	print("CLIPMAP_MATERIAL_ROUTE label=camera-and-focus-moved strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_moved_camera, mat_baked_moved_camera_image.get_width(), mat_baked_moved_camera_image.get_height()])
+	print("CLIPMAP_MATERIAL_MOVED_CAMERA_DELTA differing=%d max=%.6f mean=%.6f strong=%d" % [
+		differing(mat_paged_moved_image, mat_baked_moved_camera_image), moved_camera_delta.x,
+		moved_camera_delta.y, int(moved_camera_delta.z)])
+	require(strict_missing_moved_camera == 0,
+		"the camera-moved material clipmap has no missing-VT diagnostic pixels")
+	require(moved_camera_delta.y <= 0.015 and
+			int(moved_camera_delta.z) * 4 <= mat_paged_moved_image.get_width() * mat_paged_moved_image.get_height(),
+		"the moved ring picture stays within the measured same-density paged image envelope")
+	var moved_arm_rid: RID = terrain.material.get_material_rid()
+	var moved_outstanding: Variant = RenderingServer.material_get_param(moved_arm_rid, "_clipmap_outstanding")
+	var moved_counts: Variant = RenderingServer.material_get_param(moved_arm_rid, "_clipmap_outstanding_count")
+	var moved_poisoned_rects := PackedVector4Array()
+	moved_poisoned_rects.resize(32 * 4)
+	moved_poisoned_rects[0] = Vector4(0.0, 0.0, float(terrain.vt_clipmap_material_size), float(terrain.vt_clipmap_material_size))
+	var moved_poisoned_counts := PackedInt32Array()
+	moved_poisoned_counts.resize(32)
+	moved_poisoned_counts[0] = 1
+	RenderingServer.material_set_param(moved_arm_rid, "_clipmap_outstanding", moved_poisoned_rects)
+	RenderingServer.material_set_param(moved_arm_rid, "_clipmap_outstanding_count", moved_poisoned_counts)
+	var moved_missing_image := await frame_image()
+	var strict_missing_forced_moved := strict_missing_pixels(moved_missing_image)
+	print("CLIPMAP_MATERIAL_ROUTE label=camera-and-focus-moved-ring-withheld strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_forced_moved, moved_missing_image.get_width(), moved_missing_image.get_height()])
+	require(strict_missing_forced_moved > 0,
+		"a moved clipmap-owned fragment shows the missing-VT diagnostic when its ring texels are withheld")
+	RenderingServer.material_set_param(moved_arm_rid, "_clipmap_outstanding", moved_outstanding)
+	RenderingServer.material_set_param(moved_arm_rid, "_clipmap_outstanding_count", moved_counts)
+	var moved_restored_image := await frame_image()
+	require(differing(mat_baked_moved_camera_image, moved_restored_image) == 0 &&
+			strict_missing_pixels(moved_restored_image) == 0,
+		"restoring the moved ring's own availability restores its image with no missing-VT diagnostic")
+	camera.position = camera_origin
+	target.position = target_origin
+	await settle(6)
+	settle_material_ring()
 
 	terrain.vt_delivery_near_material = DIRECT
 	terrain.surface_svt_enabled = false

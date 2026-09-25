@@ -98,6 +98,9 @@ func run() -> void:
 	# Verify the ID/weight residency contract separately from material baking.
 	terrain.set_vt_debug_direct_material(true)
 	terrain.free_editor_textures = false
+	# This case isolates the near atlas/array toggle. Far SVT shares the staging pool and
+	# can asynchronously publish the deliberately blanked pages into the later readback.
+	terrain.surface_svt_enabled = false
 	scene.add_child(terrain)
 	root.add_child(scene)
 	terrain.assets = Terrain3DAssets.new()

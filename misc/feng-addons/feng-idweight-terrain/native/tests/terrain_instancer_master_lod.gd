@@ -54,10 +54,16 @@ func _transforms() -> Array[Transform3D]:
 
 func run() -> void:
 	scene = Node3D.new()
+	var test_camera := Camera3D.new()
+	test_camera.position = Vector3(16.0, 32.0, 16.0)
+	test_camera.current = true
+	scene.add_child(test_camera)
 	terrain = Terrain3D.new()
 	terrain.surface_vt_enabled = false
 	terrain.surface_svt_enabled = false
 	terrain.surface_svt_auto_bake = false
+	terrain.set_camera(test_camera)
+	terrain.set_clipmap_target(test_camera)
 	scene.add_child(terrain)
 	root.add_child(scene)
 	await process_frame

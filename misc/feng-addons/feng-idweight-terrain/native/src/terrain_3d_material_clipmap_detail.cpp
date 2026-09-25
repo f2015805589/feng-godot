@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <thread>
 
 // `tile_key()` packs a signed tile coordinate into 27 bits an axis and the level above them, so the
 // key is one integer: a world 2^26 tiles out - about 16 000 km at level 0's quarter-metre tile -
@@ -87,6 +88,7 @@ Terrain3DMaterialClipmapDetail::~Terrain3DMaterialClipmapDetail() {
 ///////////////////////////
 
 void Terrain3DMaterialClipmapDetail::configure(const Config &p_config) {
+	wait_for_async_update();
 	Config config = p_config;
 	config.tile_size = CLAMP(config.tile_size, 32, 1024);
 	// The gutter is a *bound*, the same one the ring and the pages carry: a filtering footprint
@@ -152,12 +154,15 @@ void Terrain3DMaterialClipmapDetail::configure(const Config &p_config) {
 }
 
 void Terrain3DMaterialClipmapDetail::clear() {
+	wait_for_async_update();
+	_async_update.reset();
 	// A reconfigure tears the pipeline down with the arrays: a queued source result for a shape that
 	// no longer exists would be uploaded into a layer count that no longer matches.
 	if (_pipeline) {
 		_pipeline->reset();
 		_pipeline.reset();
 	}
+	_source_upload_batch.reset();
 	_offers.clear();
 	_resident.clear();
 	_free_slots.clear();
@@ -182,6 +187,7 @@ void Terrain3DMaterialClipmapDetail::clear() {
 	_starved = 0;
 	_generation_serial++;
 	_state_stamp++;
+	_window_stamp++;
 }
 
 int64_t Terrain3DMaterialClipmapDetail::bytes_per_slot() const {
@@ -201,6 +207,93 @@ int64_t Terrain3DMaterialClipmapDetail::get_directory_bytes() const {
 	// One R32F texel a tile per level, per level. The directory is the only CPU-side image the layer
 	// keeps, and it is charged here so the budget figure is the whole layer rather than the arrays.
 	return int64_t(_config.levels) * int64_t(_config.directory_size) * int64_t(_config.directory_size) * 4;
+}
+
+void Terrain3DMaterialClipmapDetail::wait_for_async_update() const {
+	const std::shared_ptr<AsyncUpdateResult> update = _async_update;
+	while (update && !update->complete.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+}
+
+bool Terrain3DMaterialClipmapDetail::schedule_update(const DemandView &p_view,
+		const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot, const int p_source_budget) {
+	if (!_enabled || !_pipeline || _async_update) {
+		return false;
+	}
+	const std::shared_ptr<AsyncUpdateResult> update = std::make_shared<AsyncUpdateResult>();
+	_async_update = update;
+	_pipeline->submit_render_task([this, update, view = p_view, snapshot = p_snapshot, budget = p_source_budget]() {
+		const DetailUpdateClock::time_point started = DetailUpdateClock::now();
+		update->requested = this->update(view, snapshot, budget);
+		update->worker_us = detail_elapsed_usec(started);
+		// `update()` may have queued directory and source-array writes behind itself on the same
+		// FIFO. Publish the result only after that handoff has drained, so the owner never binds a
+		// moved window before its directory pixels are visible.
+		_pipeline->submit_render_task([update]() {
+			update->complete.store(true, std::memory_order_release);
+		});
+	});
+	return true;
+}
+
+bool Terrain3DMaterialClipmapDetail::consume_update_result(int &r_requested, uint64_t &r_worker_us) {
+	if (!_async_update || !_async_update->complete.load(std::memory_order_acquire)) {
+		return false;
+	}
+	r_requested = _async_update->requested;
+	r_worker_us = _async_update->worker_us;
+	_async_update.reset();
+	return true;
+}
+
+bool Terrain3DMaterialClipmapDetail::update_in_progress() const {
+	return _async_update && !_async_update->complete.load(std::memory_order_acquire);
+}
+
+uint64_t Terrain3DMaterialClipmapDetail::get_state_stamp() const {
+	wait_for_async_update();
+	return _state_stamp;
+}
+
+uint64_t Terrain3DMaterialClipmapDetail::get_window_stamp() const {
+	wait_for_async_update();
+	return _window_stamp;
+}
+
+PackedVector2Array Terrain3DMaterialClipmapDetail::get_window_origins() const {
+	wait_for_async_update();
+	PackedVector2Array origins;
+	origins.resize(MAX_LEVELS);
+	for (int level = 0; level < MAX_LEVELS; level++) {
+		origins[level] = level < _config.levels ? _window_origin[level] : Vector2();
+	}
+	return origins;
+}
+
+int Terrain3DMaterialClipmapDetail::get_used_slots() const {
+	wait_for_async_update();
+	return int(_resident.size());
+}
+
+int Terrain3DMaterialClipmapDetail::get_starved_tiles() const {
+	wait_for_async_update();
+	return _starved;
+}
+
+Vector2 Terrain3DMaterialClipmapDetail::get_last_focus() const {
+	wait_for_async_update();
+	return _last_focus;
+}
+
+int Terrain3DMaterialClipmapDetail::get_pending_bake_count() const {
+	wait_for_async_update();
+	return int(_offers.size());
+}
+
+const Terrain3DMaterialClipmapDetail::BakeOffer &Terrain3DMaterialClipmapDetail::get_pending_bake(const int p_index) const {
+	wait_for_async_update();
+	return _offers[size_t(p_index)];
 }
 
 ///////////////////////////
@@ -361,6 +454,7 @@ RID Terrain3DMaterialClipmapDetail::get_directory_rid(const int p_level) const {
 }
 
 bool Terrain3DMaterialClipmapDetail::take_pending_bake(const int p_slot, const uint64_t p_generation) {
+	wait_for_async_update();
 	for (size_t index = 0; index < _offers.size(); index++) {
 		if (_offers[index].slot != p_slot || _offers[index].generation != p_generation) {
 			continue;
@@ -493,6 +587,7 @@ int Terrain3DMaterialClipmapDetail::_acquire_slot(const int64_t p_key, const Vec
 }
 
 bool Terrain3DMaterialClipmapDetail::acknowledge_bake(const int p_slot, const uint64_t p_generation) {
+	wait_for_async_update();
 	if (p_slot < 0 || p_slot >= _slot_count) {
 		_bake_rejects++;
 		return false;
@@ -511,11 +606,11 @@ bool Terrain3DMaterialClipmapDetail::acknowledge_bake(const int p_slot, const ui
 	tile.last_used = _tick;
 	_bake_acks++;
 	_directory_dirty[tile.level] = true;
-	_state_stamp++;
 	return true;
 }
 
 int Terrain3DMaterialClipmapDetail::invalidate_rect(const Rect2 &p_world) {
+	wait_for_async_update();
 	if (!is_enabled()) {
 		return 0;
 	}
@@ -553,9 +648,6 @@ int Terrain3DMaterialClipmapDetail::invalidate_rect(const Rect2 &p_world) {
 			_directory_dirty[level] = true;
 		}
 	}
-	if (touched > 0) {
-		_state_stamp++;
-	}
 	return touched;
 }
 
@@ -571,6 +663,28 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		_last_update.total_us = detail_elapsed_usec(update_started);
 		return 0;
 	}
+	const uint64_t source_uploads_before = _source_uploads;
+	if (_source_upload_batch && _source_upload_batch->complete.load(std::memory_order_acquire)) {
+		_last_update.source_texture_upload_worker_us =
+				_source_upload_batch->worker_us.load(std::memory_order_relaxed);
+			for (const SourceUpload &upload : _source_upload_batch->sources) {
+				auto found = _resident.find(upload.key);
+				if (found == _resident.end() || found->second != upload.slot) {
+					continue;
+				}
+				Tile &tile = _slots[size_t(upload.slot)];
+				tile.source_uploading = false;
+				if (tile.generation != upload.generation || !tile.pending) {
+					continue;
+				}
+				tile.source_grid = upload.grid;
+				tile.source_ready = true;
+				tile.bake_in_flight = false;
+				tile.offer_tick = 0;
+				_source_uploads++;
+			}
+			_source_upload_batch.reset();
+		}
 	const DetailUpdateClock::time_point storage_started = DetailUpdateClock::now();
 	_ensure_storage();
 	_last_update.storage_us = detail_elapsed_usec(storage_started);
@@ -587,7 +701,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		if (!origin.is_equal_approx(_window_origin[level])) {
 			_window_origin[level] = origin;
 			_directory_dirty[level] = true;
-			_state_stamp++;
+			_window_stamp++;
 		}
 	}
 	_last_update.windows_us = detail_elapsed_usec(windows_started);
@@ -811,7 +925,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 				continue;
 			}
 			Tile &tile = _slots[size_t(found->second)];
-			if (!tile.pending || tile.source_ready) {
+			if (!tile.pending || tile.source_ready || tile.source_uploading) {
 				continue;
 			}
 			source_requests.push_back({ { tile.level, tile.x, tile.y, 0, 0 },
@@ -835,61 +949,74 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	}
 	_last_update.source_submit_us = detail_elapsed_usec(source_submit_started);
 	const DetailUpdateClock::time_point source_poll_started = DetailUpdateClock::now();
-	const uint64_t source_uploads_before = _source_uploads;
 	if (_pipeline && p_snapshot) {
-		// Snapshot ready keys once, then poll only completed work. Calling `poll()` on every pending
-		// resident performs a queue lock and a linear search even when its result is still running;
-		// the bounded ready-key snapshot keeps the same nearest-first consumption order with one
-		// queue scan and one lock per completed tile.
-		const DetailUpdateClock::time_point ready_started = DetailUpdateClock::now();
-		const Terrain3DPagePipeline::ReadyKeys ready = _pipeline->ready_keys();
-		_last_update.source_queue_us += detail_elapsed_usec(ready_started);
-		for (const Demand &entry : demand) {
-			auto found = _resident.find(entry.key);
-			if (found == _resident.end()) {
-				continue;
-			}
-			Tile &tile = _slots[size_t(found->second)];
-			if (!tile.pending || tile.source_ready) {
-				continue;
-			}
-			const Terrain3DPagePipeline::Key key{ tile.level, tile.x, tile.y, 0, 0 };
-			if (!ready.contains(key)) {
-				continue;
-			}
-			Terrain3DPagePipeline::Request request{ { tile.level, tile.x, tile.y, 0, 0 },
-				_tile_world_rect(tile.level, tile.x, tile.y), _config.tile_size, _config.border, false,
-				String(), 0u, get_level_texels_per_meter(tile.level) };
-			Terrain3DPagePipeline::Result prepared;
-			const DetailUpdateClock::time_point poll_started = DetailUpdateClock::now();
-			if (!_pipeline->poll(request, p_snapshot, prepared)) {
+		if (!_source_upload_batch) {
+			// Snapshot ready keys once, then poll only completed work. A completed source is staged
+			// as one bounded batch on the existing pipeline planner thread; the scene thread does not
+			// wait for RenderingServer to copy either of its two tile images.
+			const DetailUpdateClock::time_point ready_started = DetailUpdateClock::now();
+			const Terrain3DPagePipeline::ReadyKeys ready = _pipeline->ready_keys();
+			_last_update.source_queue_us += detail_elapsed_usec(ready_started);
+			struct UploadImages {
+				Ref<Image> ids;
+				Ref<Image> height;
+				int slot = -1;
+			};
+			std::vector<UploadImages> images;
+			images.reserve(4);
+			auto batch = std::make_shared<SourceUploadBatch>();
+			batch->sources.reserve(4);
+			for (const Demand &entry : demand) {
+				auto found = _resident.find(entry.key);
+				if (found == _resident.end()) {
+					continue;
+				}
+				Tile &tile = _slots[size_t(found->second)];
+				if (!tile.pending || tile.source_ready || tile.source_uploading) {
+					continue;
+				}
+				const Terrain3DPagePipeline::Key key{ tile.level, tile.x, tile.y, 0, 0 };
+				if (!ready.contains(key)) {
+					continue;
+				}
+				Terrain3DPagePipeline::Request request{ { tile.level, tile.x, tile.y, 0, 0 },
+					_tile_world_rect(tile.level, tile.x, tile.y), _config.tile_size, _config.border, false,
+					String(), 0u, get_level_texels_per_meter(tile.level) };
+				Terrain3DPagePipeline::Result prepared;
+				const DetailUpdateClock::time_point poll_started = DetailUpdateClock::now();
+				if (!_pipeline->poll(request, p_snapshot, prepared)) {
+					_last_update.source_queue_us += detail_elapsed_usec(poll_started);
+					continue;
+				}
 				_last_update.source_queue_us += detail_elapsed_usec(poll_started);
-				continue;
+				if (prepared.ids.is_null() || prepared.height.is_null()) {
+					continue;
+				}
+				batch->sources.push_back({ tile.key, tile.slot, tile.generation, prepared.grid });
+				images.push_back({ prepared.ids, prepared.height, tile.slot });
+				tile.source_uploading = true;
+				if (images.size() >= 4) {
+					break;
+				}
 			}
-			_last_update.source_queue_us += detail_elapsed_usec(poll_started);
-			if (prepared.ids.is_null() || prepared.height.is_null()) {
-				continue;
+			if (!images.empty()) {
+				const RID payload_rid = _payload.get_rid();
+				const RID height_rid = _height.get_rid();
+				_pipeline->submit_render_task([batch, images = std::move(images), payload_rid, height_rid]() mutable {
+					const DetailUpdateClock::time_point upload_started = DetailUpdateClock::now();
+					RenderingServer *rendering_server = RenderingServer::get_singleton();
+					for (const UploadImages &upload : images) {
+						rendering_server->texture_2d_update(payload_rid, upload.ids, upload.slot);
+						rendering_server->texture_2d_update(height_rid, upload.height, upload.slot);
+					}
+					batch->worker_us.store(detail_elapsed_usec(upload_started), std::memory_order_relaxed);
+					batch->complete.store(true, std::memory_order_release);
+				});
+				_source_upload_batch = std::move(batch);
 			}
-			// The two source arrays are RenderingServer-owned, so the upload is a queued command
-			// and the bake that reads it is dispatched a call later - the ring's own one-tick
-			// separation, for the same reason.
-			const DetailUpdateClock::time_point upload_started = DetailUpdateClock::now();
-			_payload.update(prepared.ids, tile.slot);
-			_height.update(prepared.height, tile.slot);
-			_last_update.source_texture_upload_us += detail_elapsed_usec(upload_started);
-			// The pipeline answers with the *source* corner grid when the output texel is finer than
-			// the source step, which is the case this layer exists for. A zero grid means it produced
-			// the output-resolution payload instead (the output texel is coarser than the source, so
-			// there is nothing to filter from); the bake job then carries `policy.w == 0`, which is
-			// the page path's own "read the stored texel at the output resolution" rule.
-			tile.source_grid = prepared.grid;
-			tile.source_ready = true;
-			tile.bake_in_flight = false;
-			tile.offer_tick = 0;
-			_source_uploads++;
 		}
-		// Consuming completed results opened queue slots. Re-prime the same nearest-first request
-		// batch once so those slots are refilled this tick, as the former per-key poll side effect did.
+		// Results are removed from the page queue only after they are ready. Newly requested tiles
+		// still prime below, while an upload-in-flight tile stays out until its slot lease returns.
 		collect_source_requests();
 		if (!source_requests.empty()) {
 			const DetailUpdateClock::time_point queue_started = DetailUpdateClock::now();
@@ -1010,20 +1137,67 @@ void Terrain3DMaterialClipmapDetail::_publish_directory(const int p_level) {
 		image->set_pixel(local_x, local_y, Color(real_t(tile.slot + 1), 0.f, 0.f, 1.f));
 	}
 	if (_directory[p_level].get_rid().is_valid()) {
-		_directory[p_level].update(image, 0);
+		const RID directory_rid = _directory[p_level].get_rid();
+		if (_pipeline) {
+			_pipeline->submit_render_task([directory_rid, image]() {
+				RenderingServer::get_singleton()->texture_2d_update(directory_rid, image, 0);
+			});
+		} else {
+			_directory[p_level].update(image, 0);
+		}
 	} else {
 		_directory[p_level].create(image);
+		// Creating the texture changes its RID, which is part of the shader binding. Updating pixels
+		// in an existing directory does not: the shader already samples that same RID.
+		_state_stamp++;
 	}
 	_directory_dirty[p_level] = false;
 	_directory_publishes++;
-	_state_stamp++;
 }
 
 ///////////////////////////
 // The arm
 ///////////////////////////
 
+Dictionary Terrain3DMaterialClipmapDetail::get_shader_arm() const {
+	wait_for_async_update();
+	Dictionary arm;
+	arm["enabled"] = is_enabled();
+	arm["levels"] = _config.levels;
+	arm["tile_size"] = _config.tile_size;
+	arm["border"] = _config.border;
+	arm["stored_size"] = _stored_size;
+	arm["directory_size"] = _config.directory_size;
+	arm["slots"] = _slot_count;
+	arm["baked_albedo"] = get_baked_texture_rid(0);
+	arm["baked_normal"] = get_baked_texture_rid(1);
+	arm["baked_params"] = get_baked_texture_rid(2);
+	PackedFloat32Array texels_per_meter;
+	PackedFloat32Array tile_worlds;
+	PackedFloat32Array texel_worlds;
+	PackedVector2Array window_origins;
+	Array directories;
+	texels_per_meter.resize(MAX_LEVELS);
+	tile_worlds.resize(MAX_LEVELS);
+	texel_worlds.resize(MAX_LEVELS);
+	window_origins.resize(MAX_LEVELS);
+	for (int level = 0; level < MAX_LEVELS; level++) {
+		texels_per_meter[level] = get_level_texels_per_meter(level);
+		tile_worlds[level] = get_level_tile_world(level);
+		texel_worlds[level] = 1.f / get_level_texels_per_meter(level);
+		window_origins[level] = level < _config.levels ? _window_origin[level] : Vector2();
+		directories.push_back(level < _config.levels ? get_directory_rid(level) : RID());
+	}
+	arm["texels_per_meter"] = texels_per_meter;
+	arm["tile_world"] = tile_worlds;
+	arm["texel_world"] = texel_worlds;
+	arm["window_origin"] = window_origins;
+	arm["directory"] = directories;
+	return arm;
+}
+
 Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
+	wait_for_async_update();
 	Dictionary arm;
 	arm["configured"] = is_configured();
 	arm["enabled"] = is_enabled();
@@ -1042,6 +1216,7 @@ Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
 	arm["pending"] = get_pending_count();
 	arm["starved"] = _starved;
 	arm["state_stamp"] = get_state_stamp();
+	arm["window_stamp"] = get_window_stamp();
 	arm["baked_albedo"] = get_baked_texture_rid(0);
 	arm["baked_normal"] = get_baked_texture_rid(1);
 	arm["baked_params"] = get_baked_texture_rid(2);
@@ -1080,6 +1255,7 @@ Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
 	update_diagnostics["source_queue_us"] = int64_t(_last_update.source_queue_us);
 	update_diagnostics["source_poll_upload_us"] = int64_t(_last_update.source_poll_upload_us);
 	update_diagnostics["source_texture_upload_us"] = int64_t(_last_update.source_texture_upload_us);
+	update_diagnostics["source_texture_upload_worker_us"] = int64_t(_last_update.source_texture_upload_worker_us);
 	update_diagnostics["offer_sort_us"] = int64_t(_last_update.offer_sort_us);
 	update_diagnostics["directory_publish_us"] = int64_t(_last_update.directory_publish_us);
 	update_diagnostics["candidate_tests"] = int64_t(_last_update.candidate_tests);
@@ -1099,6 +1275,7 @@ Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
 ///////////////////////////
 
 int Terrain3DMaterialClipmapDetail::get_valid_count() const {
+	wait_for_async_update();
 	int valid = 0;
 	for (int slot = 0; slot < _slot_count; slot++) {
 		if (_slots[size_t(slot)].slot >= 0 && _slots[size_t(slot)].valid) {
@@ -1109,6 +1286,7 @@ int Terrain3DMaterialClipmapDetail::get_valid_count() const {
 }
 
 int Terrain3DMaterialClipmapDetail::get_pending_count() const {
+	wait_for_async_update();
 	int pending = 0;
 	for (int slot = 0; slot < _slot_count; slot++) {
 		const Tile &tile = _slots[size_t(slot)];
@@ -1120,6 +1298,7 @@ int Terrain3DMaterialClipmapDetail::get_pending_count() const {
 }
 
 int Terrain3DMaterialClipmapDetail::level_at(const Vector2 &p_world) const {
+	wait_for_async_update();
 	if (!is_enabled()) {
 		return -1;
 	}
@@ -1153,6 +1332,7 @@ real_t Terrain3DMaterialClipmapDetail::density_at(const Vector2 &p_world) const 
 }
 
 String Terrain3DMaterialClipmapDetail::get_budget_report() const {
+	wait_for_async_update();
 	return String("detail_material: ") + (is_enabled() ? "on" : "off") + ", budget " +
 			String::num_int64(get_budget_bytes()) + " B, slots " + String::num_int64(_slot_count) +
 			" of " + String::num_int64(_config.max_slots) + ", " + String::num_int64(get_used_bytes()) +

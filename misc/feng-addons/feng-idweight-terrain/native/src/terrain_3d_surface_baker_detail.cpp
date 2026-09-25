@@ -120,6 +120,8 @@ void Terrain3DSurfaceBaker::_free_detail_set() {
 void Terrain3DSurfaceBaker::_free_detail_bake() {
 	_free_detail_set();
 	std::lock_guard<std::mutex> lock(_mutex);
+	_detail_bake.requested_detail = nullptr;
+	_detail_bake.requested_budget_texels = 0;
 	_detail_bake.collected.clear();
 	_detail_bake.queued.clear();
 	_detail_bake.landed.clear();
@@ -134,6 +136,20 @@ void Terrain3DSurfaceBaker::drop_detail_bake() {
 }
 
 int Terrain3DSurfaceBaker::queue_detail_tiles(Terrain3DMaterialClipmapDetail *p_detail, const int p_budget_texels) {
+	if (p_detail == nullptr || !p_detail->is_enabled()) {
+		return 0;
+	}
+	// Offer walks, acknowledgments and job construction touch the manager's residency table and can
+	// scan hundreds of offers. The scene thread only publishes this bounded request; the existing
+	// render callback owns the transfer and dispatch immediately before the detail bake.
+	std::lock_guard<std::mutex> lock(_mutex);
+	_detail_bake.requested_detail = p_detail;
+	_detail_bake.requested_budget_texels = MAX(1, p_budget_texels);
+	return 0;
+}
+
+int Terrain3DSurfaceBaker::_queue_detail_tiles_now(Terrain3DMaterialClipmapDetail *p_detail,
+		const int p_budget_texels) {
 	if (p_detail == nullptr || !p_detail->is_enabled()) {
 		return 0;
 	}
@@ -329,4 +345,3 @@ Dictionary Terrain3DSurfaceBaker::get_detail_bake_stats() const {
 	stats["landed"] = int64_t(_detail_bake.landed.size());
 	return stats;
 }
-

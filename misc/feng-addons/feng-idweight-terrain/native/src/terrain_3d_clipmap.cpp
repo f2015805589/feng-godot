@@ -388,6 +388,26 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 	return produced;
 }
 
+bool Terrain3DClipmap::needs_update_at(const Vector2 &p_focus) const {
+	if (!is_configured() || _source == nullptr) {
+		return false;
+	}
+	if (!_has_focus || !_jobs.empty()) {
+		return true;
+	}
+	for (const Level &entry : _levels) {
+		if (!entry.valid) {
+			return true;
+		}
+		const Vector2 snapped(Math::floor(p_focus.x / entry.texel_world) * entry.texel_world,
+				Math::floor(p_focus.y / entry.texel_world) * entry.texel_world);
+		if (snapped != entry.center) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // What the new focus costs, and the mapping it costs it under. Every level is advanced *here* -
 // centre and ring both - because a job's rect is a rect of *logical* texels and its world positions
 // come from the centre and ring the level has after this call. Producing a rect against the old
@@ -1108,4 +1128,64 @@ Dictionary Terrain3DClipmap::get_arm() const {
 		arm["baked_params"] = get_baked_texture_rid(2);
 	}
 	return arm;
+}
+
+Dictionary Terrain3DClipmap::get_address_arm() const {
+	Dictionary arm;
+	if (!is_configured()) {
+		return arm;
+	}
+	const int levels = get_level_count();
+	PackedVector2Array centers;
+	PackedVector2Array rings;
+	PackedFloat32Array valid;
+	centers.resize(MAX_LEVELS);
+	rings.resize(MAX_LEVELS);
+	valid.resize(MAX_LEVELS);
+	for (int level = 0; level < levels; level++) {
+		const Level &entry = _levels[size_t(level)];
+		centers[level] = entry.center;
+		rings[level] = Vector2(real_t(entry.ring.x), real_t(entry.ring.y));
+		valid[level] = entry.valid ? 1.f : 0.f;
+	}
+	arm["centers"] = centers;
+	arm["rings"] = rings;
+	arm["valid"] = valid;
+	return arm;
+}
+
+void Terrain3DClipmap::get_address_uniforms(PackedVector4Array &r_addresses,
+		PackedVector4Array &r_outstanding, PackedInt32Array &r_outstanding_counts) const {
+	const int levels = get_level_count();
+	r_addresses.resize(MAX_LEVELS);
+	for (int level = 0; level < MAX_LEVELS; level++) {
+		const Level *entry = level < levels ? &_levels[size_t(level)] : nullptr;
+		const Vector2 center = entry != nullptr ? entry->center : Vector2();
+		const Vector2 ring = entry != nullptr ? Vector2(real_t(entry->ring.x), real_t(entry->ring.y)) : Vector2();
+		const bool valid = entry != nullptr && entry->valid;
+		r_addresses.set(level, Vector4(center.x, center.y, ring.x, ring.y + (valid ? 0.5f : 0.f)));
+	}
+	get_outstanding_uniforms(r_outstanding, r_outstanding_counts);
+}
+
+void Terrain3DClipmap::get_outstanding_uniforms(PackedVector4Array &r_outstanding,
+		PackedInt32Array &r_outstanding_counts) const {
+	const int levels = get_level_count();
+	r_outstanding.resize(MAX_LEVELS * MAX_OUTSTANDING_RECTS);
+	r_outstanding_counts.resize(MAX_LEVELS);
+	for (int level = 0; level < MAX_LEVELS; level++) {
+		const Level *entry = level < levels ? &_levels[size_t(level)] : nullptr;
+		BakeRect rects[MAX_OUTSTANDING_RECTS];
+		const int count = entry != nullptr ? get_outstanding_rects(level, rects, MAX_OUTSTANDING_RECTS) : 0;
+		r_outstanding_counts.set(level, count);
+		for (int index = 0; index < MAX_OUTSTANDING_RECTS; index++) {
+			const int at = level * MAX_OUTSTANDING_RECTS + index;
+			if (index < count) {
+				r_outstanding.set(at, Vector4(real_t(rects[index].x0), real_t(rects[index].y0),
+						real_t(rects[index].x1), real_t(rects[index].y1)));
+			} else {
+				r_outstanding.set(at, Vector4());
+			}
+		}
+	}
 }

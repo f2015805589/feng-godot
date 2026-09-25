@@ -161,7 +161,12 @@ func run_clipmap_shape_serialization_block() -> void:
 	serialized.vt_clipmap_size = 32
 	serialized.vt_clipmap_levels = 5
 	serialized.vt_clipmap_base_world = 8.0
+	serialized.vt_clipmap_material_size = 128
+	serialized.vt_clipmap_material_levels = 6
+	serialized.vt_clipmap_material_base_world = 0.5
 	serialized.vt_clipmap_height_size = 64
+	serialized.vt_clipmap_height_levels = 5
+	serialized.vt_clipmap_height_base_world = 16.0
 	var packed := PackedScene.new()
 	var pack_error := packed.pack(serialized)
 	require(pack_error == OK, "a Terrain3D with legacy and per-group clipmap values packs into a scene")
@@ -188,9 +193,22 @@ func run_clipmap_shape_serialization_block() -> void:
 				is_equal_approx(loaded.vt_clipmap_base_world, 8.0),
 				"legacy global clipmap values survive scene serialization")
 		require(loaded.vt_clipmap_height_size == 64 and
+				loaded.vt_clipmap_height_levels == 5 and
+				is_equal_approx(loaded.vt_clipmap_height_base_world, 16.0) and
 				int(loaded.get_vt_clipmap_group_shape(HEIGHT).get("size", 0)) == 64 and
-				int(loaded.get_vt_clipmap_group_shape(HEIGHT).get("levels", 0)) == 5,
-				"a per-group override survives serialization and composes with inherited fields")
+				int(loaded.get_vt_clipmap_group_shape(HEIGHT).get("levels", 0)) == 5 and
+				is_equal_approx(float(loaded.get_vt_clipmap_group_shape(HEIGHT).get("base_world", 0.0)), 16.0),
+				"the Height size/levels/base_world overrides survive serialization")
+		require(loaded.vt_clipmap_material_size == 128 and loaded.vt_clipmap_material_levels == 6 and
+				is_equal_approx(loaded.vt_clipmap_material_base_world, 0.5) and
+				int(loaded.get_vt_clipmap_group_shape(MATERIAL).get("size", 0)) == 128 and
+				int(loaded.get_vt_clipmap_group_shape(MATERIAL).get("levels", 0)) == 6 and
+				is_equal_approx(float(loaded.get_vt_clipmap_group_shape(MATERIAL).get("base_world", 0.0)), 0.5),
+				"the Material size/levels/base_world overrides survive serialization")
+		print("VT_CLIPMAP_GROUP_PACKED legacy=(%d,%d,%.3f) material=(%d,%d,%.3f) height=(%d,%d,%.3f)" % [
+				loaded.vt_clipmap_size, loaded.vt_clipmap_levels, loaded.vt_clipmap_base_world,
+				loaded.vt_clipmap_material_size, loaded.vt_clipmap_material_levels, loaded.vt_clipmap_material_base_world,
+				loaded.vt_clipmap_height_size, loaded.vt_clipmap_height_levels, loaded.vt_clipmap_height_base_world])
 		loaded.free()
 	serialized.free()
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
@@ -371,6 +389,33 @@ func run_never_selected_block() -> void:
 	plain.debug_update_vt_clipmap(MATERIAL)
 	require(int(plain.get_vt_clipmap_group_shape(MATERIAL).get("size", 0)) == 256,
 			"reset restores the Material default after an actual layer reconfiguration")
+	plain.vt_clipmap_height_size = 64
+	plain.vt_clipmap_height_levels = 5
+	plain.vt_clipmap_height_base_world = 16.0
+	plain.debug_update_vt_clipmap(HEIGHT)
+	var height_override: Dictionary = plain.get_vt_clipmap_group_shape(HEIGHT)
+	var material_unaffected: Dictionary = plain.get_vt_clipmap_group_shape(MATERIAL)
+	var override_preview := plain.get_clipmap_layout_preview()
+	var override_material := preview_layer(override_preview, "material")
+	var override_height := preview_layer(override_preview, "height")
+	var override_material_density: PackedFloat32Array = override_material.get("unit_density", PackedFloat32Array())
+	var override_height_density: PackedFloat32Array = override_height.get("unit_density", PackedFloat32Array())
+	require(int(height_override.get("size", 0)) == 64 and int(height_override.get("levels", 0)) == 5 and
+			is_equal_approx(float(height_override.get("base_world", 0.0)), 16.0) and
+			int(material_unaffected.get("size", 0)) == 256 and
+			is_equal_approx(float(material_unaffected.get("finest_density", 0.0)), 1024.0),
+			"a runtime Height override is independent of Material")
+	require(override_material_density.size() == 11 and override_height_density.size() == 5 and
+			is_equal_approx(override_material_density[0], 1024.0) and
+			is_equal_approx(override_material_density[10], 1.0) and
+			is_equal_approx(override_height_density[0], 4.0) and
+			is_equal_approx(override_height_density[4], 0.25),
+			"the configured runtime layers report their independent density tiers")
+	print("VT_CLIPMAP_GROUP_RUNTIME material_size=%d material_levels=%d material_density=%.2f->%.2f height_size=%d height_levels=%d height_density=%.2f->%.2f" % [
+			int(material_unaffected.get("size", 0)), override_material_density.size(),
+			float(override_material_density[0]), float(override_material_density[override_material_density.size() - 1]),
+			int(height_override.get("size", 0)), override_height_density.size(),
+			float(override_height_density[0]), float(override_height_density[override_height_density.size() - 1])])
 	run_clipmap_shape_serialization_block()
 	print("VT_CLIPMAP_NEVER_SELECTED configured=%s levels=%s service=%s produced=%d" % [
 		str(entry.get("configured", "?")), str(entry.get("units", "none")),

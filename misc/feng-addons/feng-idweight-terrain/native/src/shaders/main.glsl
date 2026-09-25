@@ -94,17 +94,10 @@ uniform ivec2 _avt_coarse_block = ivec2(0);
 // to be a constant, so each arm passes its own and the shared addressing below takes it as a
 // parameter.
 //
-// One entry per level, in level order: the level's *snapped* centre and its toroidal offset, so the
-// shader's addressing is `Terrain3DClipmap::sample()`'s. `_clipmap_level_valid` is 1 for a level
-// whose every texel is current and 0 for one that is mid-fill, mid-strip or mid-invalidation - a 0
-// is what keeps a level that still holds the level it replaces out of a fragment. `_clipmap_band` is
-// the two cells' claim in one mask: bit 0 the near band of that group, bit 1 the far one.
+// One entry per level: snapped centre in xy, toroidal offset in z and integer(w), and the current
+// bit in the fractional part of w. The compact table keeps snapped movement to one address upload.
 uniform highp sampler2DArray _clipmap_atlas[CLIPMAP_GROUP_COUNT] : filter_nearest, repeat_disable;
-uniform vec2 _clipmap_center[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
-// Not `ivec2[...]`: Godot binds a uniform array from a packed array, and there is no packed ivec2.
-// The values are whole texel counts, so the cast below is exact.
-uniform vec2 _clipmap_ring[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
-uniform float _clipmap_level_valid[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
+uniform vec4 _clipmap_address[CLIPMAP_GROUP_COUNT * CLIPMAP_MAX_LEVELS];
 // The rects of *stored* texels a reader must not serve from the ring's baked layers right now: the
 // rects no bake has covered yet, and the rects the CPU side is still producing (between a job being
 // queued and the bake that follows it, the level's stored texels are being replaced, so the layers
@@ -1123,6 +1116,21 @@ int clipmap_level_index(int p_group, int p_level) {
 	return p_group * CLIPMAP_MAX_LEVELS + p_level;
 }
 
+vec2 clipmap_center(int p_group, int p_level) {
+	return _clipmap_address[clipmap_level_index(p_group, p_level)].xy;
+}
+
+vec2 clipmap_ring(int p_group, int p_level) {
+	vec4 address = _clipmap_address[clipmap_level_index(p_group, p_level)];
+	return vec2(address.z, floor(address.w));
+}
+
+bool clipmap_level_valid(int p_group, int p_level) {
+	return fract(_clipmap_address[clipmap_level_index(p_group, p_level)].w) > 0.25;
+}
+ )"
+R"(
+
 float clipmap_texel_world(int p_group, int p_level) {
 	return _clipmap_base_world[p_group] * exp2(float(p_level)) / float(max(_clipmap_size[p_group], 1));
 }
@@ -1134,7 +1142,7 @@ float clipmap_texel_world(int p_group, int p_level) {
 // level stores.
 bool clipmap_contains(int p_group, int p_level, vec2 p_world) {
 	float half_size = _clipmap_base_world[p_group] * exp2(float(p_level)) * 0.5;
-	vec2 local = (p_world - _clipmap_center[clipmap_level_index(p_group, p_level)] + vec2(half_size)) /
+	vec2 local = (p_world - clipmap_center(p_group, p_level) + vec2(half_size)) /
 			clipmap_texel_world(p_group, p_level);
 	float size = float(max(_clipmap_size[p_group], 1));
 	return local.x >= 0.0 && local.y >= 0.0 && local.x < size && local.y < size;
@@ -1161,7 +1169,7 @@ vec3 clipmap_address(int p_group, vec2 p_world) {
 	int level = clipmap_level_for_world(p_group, p_world);
 	float texel = clipmap_texel_world(p_group, level);
 	float half_size = _clipmap_base_world[p_group] * exp2(float(level)) * 0.5;
-	vec2 local = (p_world - _clipmap_center[clipmap_level_index(p_group, level)] + vec2(half_size)) / texel;
+	vec2 local = (p_world - clipmap_center(p_group, level) + vec2(half_size)) / texel;
 	return vec3(local, float(level));
 }
 
@@ -1175,7 +1183,7 @@ vec3 clipmap_address(int p_group, vec2 p_world) {
 float clipmap_texel_at(int p_group, int p_level, vec2 p_logical, highp sampler2DArray p_atlas) {
 	float size = float(max(_clipmap_size[p_group], 1));
 	vec2 logical = clamp(p_logical, vec2(0.0), vec2(size - 1.0));
-	vec2 physical = mod(logical + _clipmap_ring[clipmap_level_index(p_group, p_level)], vec2(size));
+	vec2 physical = mod(logical + clipmap_ring(p_group, p_level), vec2(size));
 	int layer = p_level * max(_clipmap_channels[p_group], 1);
 	return texelFetch(p_atlas, ivec3(ivec2(physical), layer), 0).r;
 }
@@ -1208,7 +1216,7 @@ float clipmap_weight(int p_group, vec2 p_world, float p_distance, bool p_require
 	if (!clipmap_contains(p_group, level, p_world)) {
 		return 0.0;
 	}
-	if (p_require_valid && _clipmap_level_valid[clipmap_level_index(p_group, level)] < 0.5) {
+	if (p_require_valid && !clipmap_level_valid(p_group, level)) {
 		return 0.0;
 	}
 	float reach = max(64.0, _avt_coverage_distance);
@@ -1240,6 +1248,9 @@ float clipmap_texel_interpolated(int p_group, vec2 p_world, highp sampler2DArray
 	float v11 = clipmap_texel_at(p_group, level, base + vec2(1.0, 1.0), p_atlas);
 	return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
 }
+ )"
+// Keep the shared ring reads and following atlas lookup in separate source literals on MSVC.
+R"(
 
 // ---- The block atlas's shared addressing ---------------------------------------------------------
 // One cell of the block grid, resolved from a world point. The CPU's `cell_for_world()` in one
@@ -1925,10 +1936,9 @@ vec4 clipmap_baked_texel(highp sampler2DArray p_array, int p_level, vec2 p_base,
 // own texel centres by the same bake shader, from the ring's own payload and height. The addressing is
 // the payload's - the level rule, the coverage test and the band curve are the shared ones - and the
 // layer is indexed the way the payload layer is, by the *stored* texel, because that is the frame the
-// ring offset keeps pointing at the same world position. False means the fragment is not the ring's, or
-// one of the four texels its bilinear footprint reads is a texel the ring is still producing or has not
-// baked - and then the whole footprint falls back to the source evaluation rather than blending a stale
-// texel into it.
+// ring offset keeps pointing at the same world position. A pending fine strip uses the next readable
+// coarser level whose coverage includes this point. Only when no ring level can answer does the caller
+// report a visible missing-VT diagnostic; the source material evaluator never substitutes for a ring.
 bool clipmap_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal) {
 #ifdef TERRAIN_CLIPMAP_ATLAS_MATERIAL
 	// The block atlas first when it owns the fragment: it is the same layer's other residency unit,
@@ -1946,23 +1956,36 @@ bool clipmap_baked_material(vec2 p_world, out material r_mat, out vec3 r_normal)
 		return false;
 	}
 	vec3 address = clipmap_address(CLIPMAP_GROUP_MATERIAL, p_world);
-	int level = int(address.z);
+	int first_level = int(address.z);
 	vec2 size = vec2(float(max(_clipmap_size[CLIPMAP_GROUP_MATERIAL], 1)));
-	vec2 base = floor(address.xy);
-	vec2 fraction = address.xy - base;
-	vec2 ring = _clipmap_ring[clipmap_level_index(CLIPMAP_GROUP_MATERIAL, level)];
-	for (int corner = 0; corner < 4; corner++) {
-		if (clipmap_outstanding(CLIPMAP_GROUP_MATERIAL, level, clipmap_baked_tap(base, size, ring, corner))) {
-			return false;
+	for (int level = first_level; level < _clipmap_level_count[CLIPMAP_GROUP_MATERIAL]; level++) {
+		if (!clipmap_contains(CLIPMAP_GROUP_MATERIAL, level, p_world)) {
+			continue;
 		}
+		float texel = clipmap_texel_world(CLIPMAP_GROUP_MATERIAL, level);
+		float half_size = _clipmap_base_world[CLIPMAP_GROUP_MATERIAL] * exp2(float(level)) * 0.5;
+		vec2 logical = (p_world - clipmap_center(CLIPMAP_GROUP_MATERIAL, level) +
+				vec2(half_size)) / texel;
+		vec2 base = floor(logical);
+		vec2 fraction = logical - base;
+		vec2 ring = clipmap_ring(CLIPMAP_GROUP_MATERIAL, level);
+		bool readable = true;
+		for (int corner = 0; corner < 4; corner++) {
+			if (clipmap_outstanding(CLIPMAP_GROUP_MATERIAL, level,
+					clipmap_baked_tap(base, size, ring, corner))) {
+				readable = false;
+				break;
+			}
+		}
+		if (!readable) {
+			continue;
+		}
+		vec4 albedo = clipmap_baked_texel(_clipmap_baked_albedo, level, base, fraction, size, ring);
+		vec4 normal_rough = clipmap_baked_texel(_clipmap_baked_normal, level, base, fraction, size, ring);
+		vec4 params = clipmap_baked_texel(_clipmap_baked_params, level, base, fraction, size, ring);
+		return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
 	}
-	vec4 albedo = clipmap_baked_texel(_clipmap_baked_albedo, level, base, fraction, size, ring);
-	vec4 normal_rough = clipmap_baked_texel(_clipmap_baked_normal, level, base, fraction, size, ring);
-	vec4 params = clipmap_baked_texel(_clipmap_baked_params, level, base, fraction, size, ring);
-	// The layers hold the bake's own output rather than a page's storage encoding: the whole of the
-	// decode is the readiness alpha, which the producer writes as 1 - so the unencoded pair of
-	// `surface_decode_page()` is exactly this, and a page's octahedral or packed forms never apply.
-	return surface_decode_page(albedo, normal_rough, params, 0, false, r_mat, r_normal);
+	return false;
 }
 
 )"
@@ -2359,31 +2382,29 @@ void fragment() {
 		material evaluated;
 		vec3 evaluated_normal;
 		uint evaluated_count = 1u;
-		// The ring's *baked layers* first. Where the producer has written the level this fragment's
-		// band is served by, they are the material - the group's third sampled source beside the two
-		// paged tiers - and the payload evaluation below is what they replace. A level that is not
-		// baked yet falls through to that evaluation unchanged, which is the answer it has always had:
-		// the same content at the payload's own density, read through the control texel.
-		//
-		// The *detail* layer is read before it, because it is the finer of the two and the whole
-		// point of the layer: the finest readable source wins. A detail tile that is missing, still
-		// being produced, or invalidated is absent from its directory - never stale - so this is a
-		// fallback *chain* rather than a choice between two cached answers: detail -> ring baked ->
-		// source evaluation.
+		// The finest readable VT source wins: detail, then this level's baked ring, then a coarser
+		// baked ring. If no clipmap level can answer a fragment inside the clipmap band, show the
+		// strict missing-VT diagnostic instead of evaluating the Direct/source material.
 		bool evaluated_baked = false;
 		float evaluated_detail_density = 0.0;
+		bool material_clipmap_owns = false;
 #ifdef TERRAIN_CLIPMAP_MATERIAL
+		material_clipmap_owns = clipmap_material_weight(v_vertex.xz) > 0.0;
 		evaluated_baked = detail_baked_material(v_vertex.xz, evaluated, evaluated_normal,
 				evaluated_detail_density);
 		if (!evaluated_baked) {
 			evaluated_baked = clipmap_baked_material(v_vertex.xz, evaluated, evaluated_normal);
 		}
 #endif
-		if (!evaluated_baked) {
+		bool material_clipmap_missing = material_clipmap_owns && !evaluated_baked;
+		if (!evaluated_baked && !material_clipmap_missing) {
 			evaluate_idweight_material(uv, weight, index[0], index[1], index[2], index[3], bilerp, w_normal,
 					base_ddx, base_ddy, evaluated, evaluated_normal, evaluated_count);
 		}
-		if (!material_cached || page_share <= 0.0) {
+		if (material_clipmap_missing) {
+			mat = material(vec4(1.0, 0.0, 1.0, 0.0), vec4(w_normal, 1.0), 0., 1., 0., 1.);
+			blendedNormalWS = w_normal;
+		} else if (!material_cached || page_share <= 0.0) {
 			mat = evaluated;
 			blendedNormalWS = evaluated_normal;
 			materialCount = evaluated_count;

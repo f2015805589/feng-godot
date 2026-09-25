@@ -395,13 +395,13 @@ func uniform_diag(label: String) -> void:
 	var bands: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_band")
 	var levels: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_level_count")
 	var counts: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_outstanding_count")
-	var centers: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_center")
+	var addresses: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_address")
 	var baked: Variant = RenderingServer.material_get_param(mat_rid, "_clipmap_baked_albedo")
 	var center0 := "?"
-	if centers is PackedVector2Array:
-		var values: PackedVector2Array = centers
+	if addresses is PackedVector4Array:
+		var values: PackedVector4Array = addresses
 		if values.size() > 0:
-			center0 = str(values[0])
+			center0 = str(Vector2(values[0].x, values[0].y))
 	var baked_kind := "null"
 	if baked is Array:
 		baked_kind = "array"

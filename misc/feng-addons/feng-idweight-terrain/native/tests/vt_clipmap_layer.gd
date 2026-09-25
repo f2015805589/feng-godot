@@ -50,7 +50,7 @@ const DETAIL_FLOOR := 128.0
 # The product's own debug view, instantiated and polled the way the editor polls it: the two-state
 # screenshots the task asks for are of this control, not a re-drawing.
 const DEBUG_VIEW_SCRIPT := "res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd"
-const DEBUG_VIEW_SIZE := Vector2i(900, 620)
+const DEBUG_VIEW_SIZE := Vector2i(1920, 1080)
 # The dock's own script, whose Clipmap node shows the shape the settings carry.
 const EDITOR_SCRIPT := "res://addons/feng-idweight-terrain/src/vt_editor.gd"
 
@@ -305,11 +305,13 @@ func setup() -> void:
 	brush = Image.create(16, 16, false, Image.FORMAT_RF)
 	brush.fill(Color.WHITE)
 
-	terrain.data.add_region_blank(Vector2i(0, 0), false)
-	terrain.data.add_region_blank(Vector2i(1, 0), false)
-	terrain.data.add_region_blank(Vector2i(0, 1), false)
-	terrain.data.add_region_blank(Vector2i(1, 1), false)
-	terrain.data.add_region_blank(Vector2i(-1, -1), false)
+	# The 1080p camera's horizon crosses both negative-Z and positive-X terrain. A diagonal
+	# five-region fixture left empty neighbor strips there, which made those source-data holes
+	# look like clipmap banding in every implementation, including Direct. Keep the complete 3x3
+	# neighborhood loaded so this probe measures ring coverage rather than absent world regions.
+	for rz in range(-1, 2):
+		for rx in range(-1, 2):
+			terrain.data.add_region_blank(Vector2i(rx, rz), false)
 	terrain.data.update_maps()
 	for bz in 6:
 		for bx in 6:
@@ -439,7 +441,7 @@ func cost_line(label: String) -> void:
 # The steady-state cost: bytes the layer uploads per metre of camera travel. The camera is walked along
 # the ground for a known distance over a fixed number of ticks and the layer's own `upload_bytes`
 # counter is read before and after, so the number is the mechanism's rather than the script's.
-func travel_cost(label: String) -> void:
+func travel_cost(label: String, capture_moving: bool = false) -> void:
 	var report := layer_report()
 	var before := float(report.get("upload_bytes", 0))
 	var start := camera.position
@@ -447,12 +449,78 @@ func travel_cost(label: String) -> void:
 		camera.position = start + Vector3(ground_forward().x, 0.0, ground_forward().y) * (
 				TRAVEL_METRES * float(step + 1) / float(TRAVEL_STEPS))
 		await process_frame
-	settle_layer(240)
+	await settle_layer(240)
+	if capture_moving:
+		var moved_image := await captured_image()
+		var moving_image_name := "clipmap-layer-" + label + "-moving-1080p.png"
+		moved_image.save_png(output_dir.path_join(moving_image_name))
+		print("CLIPMAP_LAYER_ROUTE label=%s-moving strict_missing_pixels=%d size=%dx%d" % [
+			label, strict_missing_pixels(moved_image), moved_image.get_width(), moved_image.get_height()])
+		report_black_bands(label + "-moving", moved_image)
+		await render_debug_view(label + "-moving", "clipmap-layer-debug-" + label + "-moving-1080p.png")
 	var after := float(layer_report().get("upload_bytes", 0))
 	print("CLIPMAP_LAYER_TRAVEL %s metres=%.1f bytes=%.0f bytes_per_metre=%.0f" % [
 		label, TRAVEL_METRES, after - before, (after - before) / TRAVEL_METRES])
 	camera.position = start
-	settle_layer(240)
+	await settle_layer(240)
+
+func strict_missing_pixels(image: Image) -> int:
+	var count := 0
+	for y in image.get_height():
+		for x in image.get_width():
+			var pixel := image.get_pixel(x, y)
+			if pixel.r > 0.65 and pixel.b > 0.65 and pixel.g < 0.25:
+				count += 1
+	return count
+
+# Scan the rendered ground for black bands. The sky and bottom frame edge are excluded; a missing
+# world strip appears as a near-black horizontal run or a near-black column through covered ground.
+func black_band_metrics(image: Image) -> Dictionary:
+	var width := image.get_width()
+	var height := image.get_height()
+	var top := clampi(int(float(height) * 0.50), 0, height - 1)
+	var bottom := clampi(int(float(height) * 0.95), top + 1, height)
+	var row_black := PackedInt32Array()
+	row_black.resize(bottom - top)
+	var column_black := PackedInt32Array()
+	column_black.resize(width)
+	var black_pixels := 0
+	for y in range(top, bottom):
+		for x in width:
+			var pixel := image.get_pixel(x, y)
+			if maxf(pixel.r, maxf(pixel.g, pixel.b)) < 0.025:
+				row_black[y - top] += 1
+				column_black[x] += 1
+				black_pixels += 1
+	var horizontal_rows := 0
+	var vertical_columns := 0
+	var max_horizontal_fraction := 0.0
+	var max_vertical_fraction := 0.0
+	for count: int in row_black:
+		var fraction := float(count) / float(maxi(width, 1))
+		max_horizontal_fraction = maxf(max_horizontal_fraction, fraction)
+		horizontal_rows += 1 if fraction >= 0.02 else 0
+	for count: int in column_black:
+		var fraction := float(count) / float(maxi(bottom - top, 1))
+		max_vertical_fraction = maxf(max_vertical_fraction, fraction)
+		vertical_columns += 1 if fraction >= 0.02 else 0
+	return {
+		"black_pixels": black_pixels,
+		"horizontal_rows": horizontal_rows,
+		"vertical_columns": vertical_columns,
+		"max_horizontal_fraction": max_horizontal_fraction,
+		"max_vertical_fraction": max_vertical_fraction,
+	}
+
+func report_black_bands(label: String, image: Image) -> Dictionary:
+	var metrics := black_band_metrics(image)
+	print("CLIPMAP_LAYER_BLACK_BANDS label=%s size=%dx%d threshold=0.025 ground_y=0.50..0.95 black_pixels=%d horizontal_rows=%d vertical_columns=%d max_row_fraction=%.5f max_column_fraction=%.5f" % [
+		label, image.get_width(), image.get_height(), int(metrics["black_pixels"]),
+		int(metrics["horizontal_rows"]), int(metrics["vertical_columns"]),
+		float(metrics["max_horizontal_fraction"]), float(metrics["max_vertical_fraction"])])
+	require(int(metrics["horizontal_rows"]) == 0 and int(metrics["vertical_columns"]) == 0,
+		label + " has no near-black horizontal or vertical band through the ground")
+	return metrics
 
 # The coverage audit, reported and asserted below: the union of the published unit squares must hold
 # every point inside the guaranteed radius (no hole), and the density the layer serves there must be the
@@ -603,11 +671,14 @@ func run() -> void:
 	var lod := measure("lod", await captured_image())
 	var lod_image := await captured_image()
 	lod_image.save_png(output_dir.path_join("clipmap-layer-lod-1080p.png"))
+	print("CLIPMAP_LAYER_ROUTE label=lod-static strict_missing_pixels=%d size=%dx%d" % [
+		strict_missing_pixels(lod_image), lod_image.get_width(), lod_image.get_height()])
+	report_black_bands("lod-static", lod_image)
 	var lod_audit := audit_coverage("lod", lod["report"])
 	var lod_scan := scan_ladder("lod", lod["report"])
 	cost_line("lod")
 	await render_debug_view("lod", "clipmap-layer-debug-lod.png")
-	await travel_cost("lod")
+	await travel_cost("lod", true)
 
 	# ---- The same defaults through the Atlas implementation, same scene, same camera ----------------
 	terrain.vt_clipmap_implementation = ATLAS
@@ -616,11 +687,12 @@ func run() -> void:
 	var atlas := measure("atlas", await captured_image())
 	var atlas_image := await captured_image()
 	atlas_image.save_png(output_dir.path_join("clipmap-layer-atlas-1080p.png"))
+	report_black_bands("atlas-static", atlas_image)
 	var atlas_audit := audit_coverage("atlas", atlas["report"])
 	var atlas_scan := scan_ladder("atlas", atlas["report"])
 	cost_line("atlas")
 	await render_debug_view("atlas", "clipmap-layer-debug-atlas.png")
-	await travel_cost("atlas")
+	await travel_cost("atlas", true)
 
 	# ---- And the same camera with the **region arrays** carrying the material, which is what "a
 	#      fallback" looks like: a cell naming Clipmap must *not* render this.
@@ -628,6 +700,7 @@ func run() -> void:
 	await settle(48)
 	var direct_image := await captured_image()
 	direct_image.save_png(output_dir.path_join("clipmap-layer-direct-1080p.png"))
+	report_black_bands("direct-static-reference", direct_image)
 	terrain.vt_delivery_near_material = CLIPMAP
 	await settle(48)
 
@@ -647,6 +720,7 @@ func run() -> void:
 	await settle_layer()
 	var after_image := await captured_image()
 	after_image.save_png(output_dir.path_join("clipmap-layer-after-ladder-1080p.png"))
+	report_black_bands("after-ladder-static", after_image)
 	terrain.vt_delivery_near_material = DIRECT
 	await settle(48)
 	var layer_direct_image := await captured_image()
