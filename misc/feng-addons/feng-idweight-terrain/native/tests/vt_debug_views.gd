@@ -185,21 +185,36 @@ func check_dock_order() -> void:
 		item = item.get_next()
 	require(names == ["VT Setting", "Clipmap", "AVT", "SVT", "CDLOD", "VT Page"],
 			"the Surface VT window's hierarchy is not in assembly order: %s" % str(names))
-	# The layer's own node is where its storage, shape and budget are configured, and a write there has
-	# to land on the native property rather than on a widget the next refresh overwrites.
+	# The layer's own node exposes one quality profile and one implementation selector; detailed shape,
+	# budget and detail-cache parameters are internal defaults.
 	var clipmap_item: TreeItem = surface.get_first_child().get_next()
 	clipmap_item.select(0)
 	window.hierarchy.item_selected.emit()
 	await process_frame
-	require(window.clipmap_panel.visible and window.clipmap_size_spin != null and
-			window.clipmap_levels_spin != null and window.clipmap_base_spin != null and
-			window.clipmap_budget_spin != null and window.clipmap_implementation_option != null,
-			"the Clipmap node did not show the layer's storage, shape and budget")
-	var saved_size: int = terrain.vt_clipmap_size
-	window.clipmap_size_spin.value = 32.0
-	require(terrain.vt_clipmap_size == 32, "the level edge control did not write the native setting")
-	window.clipmap_size_spin.value = float(saved_size)
-	require(terrain.vt_clipmap_size == saved_size, "the level edge control did not write the setting back")
+	require(window.clipmap_panel.visible and window.clipmap_quality_option != null and
+			window.clipmap_implementation_option != null,
+			"the Clipmap node did not show its quality and implementation choices")
+	var quality_option: OptionButton = window.clipmap_quality_option
+	require(quality_option.item_count == 2 and quality_option.get_item_text(0) == "Standard" and
+			quality_option.get_item_text(1) == "Performance",
+			"the quality selector must offer Standard and Performance")
+	var saved_quality: int = terrain.vt_clipmap_quality
+	quality_option.select(Terrain3D.CLIPMAP_QUALITY_PERFORMANCE)
+	quality_option.item_selected.emit(Terrain3D.CLIPMAP_QUALITY_PERFORMANCE)
+	await process_frame
+	require(terrain.vt_clipmap_quality == Terrain3D.CLIPMAP_QUALITY_PERFORMANCE,
+			"the quality selector did not write the native setting")
+	quality_option.select(saved_quality)
+	quality_option.item_selected.emit(saved_quality)
+	await process_frame
+	require(terrain.vt_clipmap_quality == saved_quality,
+			"the quality selector did not write the profile back")
+	# Profile selection is also the legacy-shape migration action. Restore this fixture's intentionally
+	# small shape so the debug-view checks below continue exercising their documented 64-texel layers.
+	terrain.vt_clipmap_size = SIZE
+	terrain.vt_clipmap_levels = LEVELS
+	terrain.vt_clipmap_base_world = BASE_WORLD
+	terrain.vt_clipmap_budget_texels = LEVEL_TEXELS
 	# The one delivery's implementation selector: its items are the native enum's two storages in order,
 	# and a click has to reach `vt_clipmap_implementation`.
 	var implementation_option: OptionButton = window.clipmap_implementation_option

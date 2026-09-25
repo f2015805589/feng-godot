@@ -258,7 +258,7 @@ carries the channel.
 
 | File | What it is | What it owns |
 | --- | --- | --- |
-| `terrain_3d_clipmap_common.h` | the shared vocabulary | `Implementation`, `Shape`, the density `Ladder` (`texel_world(unit) = base_world * 2^unit / size`), the shared rect arithmetic, the `BakeRect` queue entry and the `UnitReport` debug schema. |
+| `terrain_3d_clipmap_common.h` | the shared vocabulary | `Implementation`, `Shape`, the density `Ladder` (`unit_world_size = base_world * 2^unit`; `texel_world = unit_world_size / size`), shared rect arithmetic, the `BakeRect` queue entry and the `UnitReport` debug schema. |
 | `terrain_3d_clipmap_impl.h` | the contract | every question anything above the layer may ask, in implementation-neutral terms. |
 | `terrain_3d_clipmap.{h,cpp}` | the **LOD implementation** | levels, snapping, the toroidal wrap, strips, the whole-layer publish, the layered texture. |
 | `terrain_3d_clipmap_atlas.{h,cpp}` | the **Atlas implementation** | the 3x3-per-unit nesting, the packing (quadtree by default), the rolling relabelling, the block-rect upload, the rect array. |
@@ -277,33 +277,52 @@ texels a metre over a region of `base_world * 2^u` metres. The LOD implementatio
 one toroidal square; the Atlas implementation stores it as a 3x3 arrangement of its own blocks, which is
 what nests - unit `u`'s hole is unit `u-1`'s square - and what makes the picture a quadtree.
 
-### 6.0.1 The shape defaults: the ladder's two endpoints
+### 6.0.1 Quality profiles, internal defaults and saved scenes
 
-The ladder's *cap* is `size / base_world`: inside the finest unit's own coverage the density is flat, and
-past it `size / 2` per metre falls off. The shape this worktree inherited (`size` 256, `base_world` 256)
-therefore capped the whole visible near field at **one** texel a metre however many units the layer had,
-which is the "only a small patch is sharp" report; an intermediate round raised the cap to eight by
-lowering `base_world` to 32, which made the near field denser but still left the ladder's *inner* end
-eight times short of what was asked for.
+The Inspector exposes two choices for this layer: `vt_clipmap_quality` and
+`vt_clipmap_implementation`. The four `vt_delivery_*` cells above still choose which channel groups
+use Clipmap. `clipmap_target` remains the focus node used by the terrain mesh and the VT update. Storage
+shape, per-tick work, atlas packing and the material detail cache are implementation defaults owned by
+the native setup code, rather than separate per-group knobs.
 
-The shipped defaults are the two endpoints themselves, stated once in
-`terrain_3d_clipmap_common.h` (`LADDER_FINEST_DENSITY`, `LADDER_COARSEST_DENSITY`, `LADDER_UNITS`):
-`size` 256 over a `base_world` of **0.25 m** is **1024 texels a metre** at unit 0, and **eleven** units
-of the halving ladder reach **1 texel a metre** at unit 10 (`256 / (0.25 * 2^10) = 1`). Both storages
-are configured from that one `Shape`, and both implement the same `Ladder`, so the density a fragment is
-served at a distance is a property of the layer rather than of the storage. The reach that buys is
-`0.25 * 2^10 = 256 m` of level square for the LOD implementation (+/-128 m) and 1.5 times that for the
-atlas, whose unit is a 3x3 square; at 4 m the ladder serves 32 texels a metre against the inherited
-shape's one. The ceilings (`MAX_LEVELS` 16, `MAX_RINGS` 12) are both above the eleven units the span
-needs, and a clamp that is hit is logged - the ladder's span is not something a default may silently
-truncate.
+| Quality | Group | Texels/axis | Units | Base extent | Finest → coarsest density |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Standard | Material | 256 | 11 | 0.25 m | 1024 → 1 texel/m |
+| Standard | Height | 128 | 7 | 2 m | 64 → 1 texel/m |
+| Performance | Material | 128 | 11 | 0.5 m | 256 → 0.25 texel/m |
+| Performance | Height | 64 | 9 | 1 m | 64 → 0.25 texel/m |
 
-The prices are listed in the acceptance measurements: memory grows with the unit count, and the LOD
-implementation's *whole-layer* upload is published more often because its finest unit now moves in
-millimetre steps - which is the cost the Atlas implementation does not pay, and the reason it is the
-recommended storage at a dense near field. The material group's detail layer stays as the *wide* 1024
-texels/m patch: the ladder is the ground's coverage and fallback, the detail layer is what spends the
-same density over the near view under screen-footprint demand.
+Standard preserves the established Material ladder and the established 64 texel/m Height endpoint.
+Performance uses four times fewer material-ring texels per unit and about one third of the Height ring
+storage. Its Material detail cache stays at 1024 texel/m around the near view; the wider fallback ring
+is softer. Choose Performance when the lower-cost coverage is enough for the scene. Neither profile
+changes the source channel or routes a missing sample through Direct.
+
+The internal defaults have one owner each:
+
+| Setting | Default | Owner / reason |
+| --- | --- | --- |
+| Channel-group shape | Profile table above | `TerrainClipmap::Shape` supplies the Standard Material baseline; `Terrain3D::_clipmap_settings()` applies group and Performance overrides. |
+| Production budget | 65,536 channel texels per tick | `Terrain3DVTState`; bounds work while each selected group keeps its own layer. |
+| Atlas global block | 64 texels/axis | `TerrainClipmap::Shape`; supplies the atlas outside its rings. |
+| Atlas block pacing | 1 block per update | `TerrainClipmap::Shape`; bounds discrete uploads. |
+| Atlas spare slots / packer | enabled / quadtree | Atlas implementation; lets replacements land before release and keeps the packed layout. |
+| Material detail cache | enabled, 1024 to 128 texel/m, 256-texel tiles, 128×128 directory, 512 MiB, 12 m demand radius, 4 texels/pixel | `Terrain3DVTState`; preserves the near high-resolution material patch while bounding its demand. |
+
+Old scenes remain loadable. Former shape, group-shape, budget, atlas and detail properties remain as
+hidden `STORAGE` aliases so Godot can deserialize their saved values without invalid-property errors.
+A non-default legacy value remains active to preserve the scene's old setup until its owner migrates it.
+The dock reports each group's resolved shape, including any saved override. Selecting a Quality profile
+clears the old global/group shape and Atlas
+layout overrides, including when the selected profile was already active. Old budget and detail values
+remain active for compatibility; set them through the old callable setters to the defaults in the table
+above if they should be reset. Save the scene after migrating so hidden aliases write their new values.
+Scripts can replace reads of old shape fields with `get_vt_settings().clipmap[group].resolved_shape`;
+old tuning setters remain callable during migration but are not the supported configuration API.
+The report keeps the two states separate: `clipmap[group].resolved_shape` is the profile/legacy shape
+the group would use, even before allocation; `configured`, `units`, `unit_reports`, textures and queued
+jobs describe only an allocated runtime layer. An unallocated group therefore has `units = -1` and no
+runtime work while the dock can still show the resolved profile.
 
 ### 6.1 One mechanism, one source per channel
 
@@ -1048,11 +1067,10 @@ rather than chased.
 
 **Three defects the step found, all pre-existing and all in the way of "a channel is a source".**
 
-* **A control that could not write.** `vt_editor.gd`'s clipmap handler probed the property
-  `"vt_clipmap_%s" % p_key`, which for the budget reads `vt_clipmap_budget` - a property that does not
-  exist, because the setting's setter is `set_vt_clipmap_budget_texels`. The budget spin therefore
-  returned early on every write and never reached the terrain, for a user as much as for a test. The
-  probe and the setter are now one entry per control, and `editor_dock:dock` reads the write back.
+* **A control that could not write (historical).** The prior dock generated the budget property name
+  from a key and missed its `_texels` suffix. The current profile-based dock no longer exposes that
+  budget control; its Quality and Implementation handlers map explicitly to their native properties,
+  while the old budget setter remains a hidden serialized alias for existing scenes.
 * **A stale assertion in `editor_dock:dock`.** It wrote `near/height = Clipmap` and required the cell
   to be refused "because this build has no arm for it" - a pre-M2b claim that contradicts the
   acceptance rule at `HEAD` (`git show HEAD:...terrain_3d_surface_views.cpp` accepts it). It now

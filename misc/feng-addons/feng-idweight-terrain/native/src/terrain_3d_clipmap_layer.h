@@ -73,9 +73,9 @@ public:
 	// An immutable snapshot is installed before the worker can call the source. It is also the input
 	// snapshot already used by page and detail production.
 	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot);
-	// The LOD ring's full-layer pack and publish can dominate a moving tick. Schedule changed work on
-	// the existing source planner, and treat unchanged mappings as handled without a worker task; Atlas
-	// retains its implementation-specific frame pacing. True means the caller should skip sync update.
+	// Schedule changed work on the existing source planner, and treat unchanged mappings as handled
+	// without a worker task. Each implementation answers its own pending-work and movement check and
+	// retains its own production pacing. True means the caller should skip sync update.
 	bool schedule_async_update(const Vector2 &p_focus, int p_budget_texels,
 			const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot,
 			Terrain3DPagePipeline *p_pipeline);
@@ -155,7 +155,12 @@ public:
 
 	int update(const Vector2 &p_focus, const int p_budget_texels) {
 		wait_for_async_update();
-		return _impl != nullptr ? _impl->update(p_focus, p_budget_texels) : 0;
+		if (_impl == nullptr) {
+			return 0;
+		}
+		const int produced = _impl->update(p_focus, p_budget_texels);
+		_impl->publish_pending_uploads();
+		return produced;
 	}
 	int invalidate_rect(const Rect2 &p_world) {
 		wait_for_async_update();

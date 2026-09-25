@@ -494,27 +494,20 @@ func _run() -> void:
 	clipmap_item.select(0)
 	vt_editor.hierarchy.item_selected.emit()
 	await _wait_frames(2)
-	if not _require(vt_editor.clipmap_panel.visible and vt_editor.clipmap_size_spin != null and
-			vt_editor.clipmap_levels_spin != null and vt_editor.clipmap_base_spin != null and
-			vt_editor.clipmap_budget_spin != null and vt_editor.clipmap_hint != null,
-			"Clipmap hierarchy group did not expose the layer's shape and budget"):
+	if not _require(vt_editor.clipmap_panel.visible and vt_editor.clipmap_quality_option != null and
+			vt_editor.clipmap_implementation_option != null and vt_editor.clipmap_hint != null,
+			"Clipmap hierarchy group did not expose its quality and implementation choices"):
 		return
-	var saved_clipmap_size: int = terrain.vt_clipmap_size
-	var saved_clipmap_budget: int = terrain.vt_clipmap_budget_texels
-	# Both controls carry the same three states, so both are written and read back. The budget box
-	# steps in 1024 (`vt_editor.gd` builds it with `_make_spin(0, 1048576, 1024)`) and `Range` snaps a
-	# written value to its step, so the value below is a multiple of it: asking for 512 would land on 0
-	# and read as a control that did nothing.
-	vt_editor.clipmap_size_spin.value = 32.0
-	if not _require(terrain.vt_clipmap_size == 32, "the clipmap level edge control did not update the native setting"):
+	var saved_clipmap_quality: int = terrain.vt_clipmap_quality
+	vt_editor.clipmap_quality_option.select(Terrain3D.CLIPMAP_QUALITY_PERFORMANCE)
+	vt_editor.clipmap_quality_option.item_selected.emit(Terrain3D.CLIPMAP_QUALITY_PERFORMANCE)
+	if not _require(terrain.vt_clipmap_quality == Terrain3D.CLIPMAP_QUALITY_PERFORMANCE,
+			"the clipmap quality selector did not update the native profile"):
 		return
-	vt_editor.clipmap_budget_spin.value = 1024.0
-	if not _require(terrain.vt_clipmap_budget_texels == 1024, "the clipmap budget control did not update the native setting"):
-		return
-	vt_editor.clipmap_size_spin.value = float(saved_clipmap_size)
-	vt_editor.clipmap_budget_spin.value = float(saved_clipmap_budget)
-	if not _require(terrain.vt_clipmap_size == saved_clipmap_size and terrain.vt_clipmap_budget_texels == saved_clipmap_budget,
-			"the clipmap controls did not restore the settings they read"):
+	vt_editor.clipmap_quality_option.select(saved_clipmap_quality)
+	vt_editor.clipmap_quality_option.item_selected.emit(saved_clipmap_quality)
+	if not _require(terrain.vt_clipmap_quality == saved_clipmap_quality,
+			"the clipmap quality selector did not restore the profile it read"):
 		return
 	# The VT Page's clipmap view is the same control the Inspector hosts. The gate is asked natively
 	# here as well, so a scene whose matrix selects Clipmap nowhere must not even pay for a payload.

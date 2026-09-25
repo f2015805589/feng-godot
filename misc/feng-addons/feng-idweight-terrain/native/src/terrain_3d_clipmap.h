@@ -89,11 +89,10 @@ public:
 	// `FORMAT_R8` (normalised) - because a layer holds exactly one value per texel. A channel that
 	// needs several components is a different publish path, not a different ring.
 	struct Config {
-		int size = 256;
-		// The shipped ladder: 256 texels over 0.25 m is the 1024 texels a metre inner endpoint, and
-		// eleven levels of it reach the 1 texel a metre outer one.
-		int levels = TerrainClipmap::LADDER_UNITS;
-		real_t base_world = 0.25f;
+		// Filled from the facade's shared Shape. Zero means a caller did not resolve a shape.
+		int size = 0;
+		int levels = 0;
+		real_t base_world = 0.f;
 		int channels = 1;
 		Image::Format format = Image::FORMAT_RF;
 		// The *baked* channels: this many arrays of `baked_format`, one layer per level, that a
@@ -186,10 +185,7 @@ public:
 		return TerrainClipmap::Implementation::LOD;
 	}
 	TerrainClipmap::Ladder get_ladder() const override {
-		TerrainClipmap::Shape shape;
-		shape.size = _config.size;
-		shape.base_world = _config.base_world;
-		return TerrainClipmap::ladder_of(shape);
+		return _ladder;
 	}
 	real_t get_unit_world_size(const int p_unit) const override {
 		const int unit = CLAMP(p_unit, 0, MAX(0, int(_levels.size()) - 1));
@@ -289,7 +285,7 @@ public:
 	int update(const Vector2 &p_focus, const int p_budget_texels) override;
 	// True when the ring has pending production, an invalid level, or a snapped centre that differs
 	// from this focus. The owner uses this to avoid dispatching an idle worker task between texel moves.
-	bool needs_update_at(const Vector2 &p_focus) const;
+	bool needs_update_at(const Vector2 &p_focus) const override;
 
 	// The source changed under a world rect: mark every level the rect touches not-current and queue
 	// the texels that cover it for re-production. Returns how many rect jobs were queued, and costs
@@ -398,6 +394,7 @@ private:
 	void _refresh_baked(const int p_level);
 
 	Config _config;
+	TerrainClipmap::Ladder _ladder;
 	std::unique_ptr<Terrain3DClipmapSource> _source;
 	std::vector<Level> _levels;
 	std::vector<Job> _jobs;

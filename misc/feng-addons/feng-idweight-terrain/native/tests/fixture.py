@@ -292,6 +292,7 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
                     env: Mapping[str, str] | None = None, resolution: str = "320x240",
                     shots: bool = False, timeout_import: float = 180, timeout_run: float = 300,
                     followups: Sequence[Followup] = (),
+                    script_args: Sequence[str] = (),
                     native_library: Path | None = None) -> int:
     """Runs one test script in a fresh project and returns its verdict.
 
@@ -314,7 +315,7 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
         driver = driver if driver is not None else parsed.driver
 
     markers = (marker,) if isinstance(marker, str) else tuple(marker)
-    phases = [(script, (), timeout_run, shots)]
+    phases = [(script, tuple(script_args), timeout_run, shots)]
     phases += [(item.script, tuple(item.args), item.timeout, item.shotted) for item in followups]
 
     fixture = Path(tempfile.mkdtemp(prefix=fixture_prefix, dir=ROOT / "bin"))

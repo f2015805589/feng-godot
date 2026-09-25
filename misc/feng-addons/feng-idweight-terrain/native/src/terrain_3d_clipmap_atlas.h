@@ -125,26 +125,26 @@ public:
 		// Ring 0's block resolution in texels an axis. Every ring's block is this many texels, so the
 		// ladder is the shared one (`block_size / (base_world * 2^ring)` texels a metre) and the
 		// user's 1024/512/256/128 is exactly this shape's first four rings.
-		int block_size = 256;
+		int block_size = 0;
 		// How many units the atlas holds. Clamped to `[1, MAX_RINGS]`, and the layer's own
 		// `vt_clipmap_levels` is what a user sets: unit `r` reaches `1.5 * base_world * 2^r` metres.
-		int rings = TerrainClipmap::LADDER_UNITS;
+		int rings = 0;
 		// The *world* size of unit 0's blocks; unit `r`'s blocks are `base_world * 2^r` metres, which
 		// is the shared ladder's own unit size, so the atlas serves the LOD ring's density at every
 		// distance. The finest unit reaches `1.5 * base_world` metres and each unit after it doubles.
-		real_t base_world = 0.25f;
+		real_t base_world = 0.f;
 		// Values a texel holds, one atlas texture layer each - the same shape the ring declares.
 		int channels = 1;
 		Image::Format format = Image::FORMAT_RF;
 		// The global block: `global_texels` an axis over `global_world` metres, produced once. Zero
 		// `global_world` derives it from the grid's own reach.
-		int global_texels = 64;
+		int global_texels = 0;
 		real_t global_world = 0.f;
 		// One spare slot per ring, which is what lets a replacement be built before its predecessor
 		// is released. Off is the "exactly enough, unload then load" arrangement the user rejected.
-		bool spares = true;
+		bool spares = false;
 		// The per-frame production bound. One is the user's "a frame loads one block".
-		int blocks_per_frame = 1;
+		int blocks_per_frame = 0;
 		// The packing scheme the layout uses. The default is the **quadtree**: the user's form
 		// requirement is a nested, recursively subdivided arrangement, and the shelf and ring-band
 		// schemes stay selectable so the comparison is one build and one report rather than a claim.
@@ -216,6 +216,16 @@ public:
 				slot(p_slot), ring(p_ring), block_x(p_block_x), block_y(p_block_y), phase(p_phase) {}
 	};
 
+	// The planner worker prepares tightly packed block bytes; the facade publishes them only after it
+	// consumes that worker result on the render thread.
+	struct PendingUpload {
+		int staging = -1;
+		Rect2i rect;
+		int texels = 0;
+		int channel = 0;
+		std::vector<uint8_t> bytes;
+	};
+
 	// One block the producer has to *bake*: the rect of the baked atlas this block's three material
 	// arrays were produced into, and the content it describes. It is the **shared** queue entry
 	// (`TerrainClipmap::BakeRect`), with `unit` naming the atlas slot and `lease` the slot serial:
@@ -250,10 +260,7 @@ public:
 		return TerrainClipmap::Implementation::Atlas;
 	}
 	TerrainClipmap::Ladder get_ladder() const override {
-		TerrainClipmap::Shape shape;
-		shape.size = _config.block_size;
-		shape.base_world = _config.base_world;
-		return TerrainClipmap::ladder_of(shape);
+		return _ladder;
 	}
 	int get_unit_count() const override { return _config.rings; }
 	// What one unit covers: the side of its own 3x3 square, `UNIT_SIDE * base_world * 2^unit` metres,
@@ -357,6 +364,10 @@ public:
 	// One update: re-derive the grid the focus implies, relabel the cells, queue the blocks that
 	// entered, drain up to `blocks_per_frame` of them. Returns the channel texels produced.
 	int update(const Vector2 &p_focus, const int p_budget_texels = 0) override;
+	// True while the atlas needs production or its ring origin/phase differs from this focus.
+	bool needs_update_at(const Vector2 &p_focus) const override;
+	// Atlas payload packing can run on the planner worker; publish its device copies on the render thread.
+	void publish_pending_uploads() override;
 	// The source changed under a world rect: the blocks the rect touches stop being current and are
 	// queued for re-production. A block is the unit, so this is the block-incremental invalidation.
 	int invalidate_rect(const Rect2 &p_world) override;
@@ -459,6 +470,7 @@ private:
 	uint64_t _serial() { return ++_serial_counter; }
 
 	Config _config;
+	TerrainClipmap::Ladder _ladder;
 	std::unique_ptr<Terrain3DClipmapSource> _source;
 	std::vector<Cell> _cells;
 	std::vector<Slot> _slots;
@@ -482,6 +494,7 @@ private:
 	// The block-sized staging textures the upload copies out of, one a channel. A block-sized
 	// transfer is the point; a full-atlas staging image would be the thing this mechanism replaces.
 	std::vector<RID> _staging_rd;
+	std::vector<PendingUpload> _pending_uploads;
 	std::vector<RID> _staging_rs;
 	// One device texture per baked channel, sized to the whole atlas, plus its RenderingServer
 	// wrapper. The producer writes rects of the device texture as storage images and the arm samples

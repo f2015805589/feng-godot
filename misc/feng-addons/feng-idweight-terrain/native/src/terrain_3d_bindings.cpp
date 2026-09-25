@@ -39,6 +39,8 @@ void Terrain3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(SIZE_512);
 	BIND_ENUM_CONSTANT(SIZE_1024);
 	BIND_ENUM_CONSTANT(SIZE_2048);
+	BIND_ENUM_CONSTANT(CLIPMAP_QUALITY_STANDARD);
+	BIND_ENUM_CONSTANT(CLIPMAP_QUALITY_PERFORMANCE);
 
 	// The vocabulary the two page compression settings are written in, so a script reads
 	// `Terrain3D.SURFACE_PAGE_BC7` instead of a bare 1. It is not the asset array enum: see
@@ -94,10 +96,10 @@ void Terrain3D::_bind_methods() {
 	// reads for `Clipmap`: published so a panel or a test can tell "this build cannot carry that
 	// channel" from "the cell does not name it", and so the one registry the two read is visible.
 	ClassDB::bind_method(D_METHOD("has_clipmap_source", "group"), &Terrain3D::has_clipmap_source);
-	// The clipmap ring's shape, its per-tick production budget, and the reads a test or the dock needs
-	// to compare what the ring holds against the height map it was produced from. The ring is built
-	// by the assembly rule the first time a cell selects `Clipmap` for a group, and `get_vt_clipmap_arm()`
-	// is the same state in the form the shader arm is bound from.
+	// The clipmap profile and implementation, plus diagnostics. Detailed shape setters remain as
+	// compatibility APIs for scripts and old scenes; their serialized aliases are hidden below.
+	ClassDB::bind_method(D_METHOD("set_vt_clipmap_quality", "quality"), &Terrain3D::set_vt_clipmap_quality);
+	ClassDB::bind_method(D_METHOD("get_vt_clipmap_quality"), &Terrain3D::get_vt_clipmap_quality);
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_size", "size"), &Terrain3D::set_vt_clipmap_size);
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_size"), &Terrain3D::get_vt_clipmap_size);
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_levels", "levels"), &Terrain3D::set_vt_clipmap_levels);
@@ -158,10 +160,8 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_global_texels"), &Terrain3D::get_vt_clipmap_global_texels);
 	ClassDB::bind_method(D_METHOD("set_vt_clipmap_blocks_per_frame", "blocks"), &Terrain3D::set_vt_clipmap_blocks_per_frame);
 	ClassDB::bind_method(D_METHOD("get_vt_clipmap_blocks_per_frame"), &Terrain3D::get_vt_clipmap_blocks_per_frame);
-	// The material group's detail layer: the switch, the density target (1024 texels/m by default),
-	// the shape, the GPU budget the slot table is derived from, and the near-field reach. The layer
-	// exists only while the material group is delivered by `Clipmap`; `has_vt_detail_layer()` is
-	// whether a usable one exists after the budget was resolved.
+	// The material detail layer's diagnostics and compatibility setters. Its new-project configuration
+	// is internal; the hidden aliases below still load old serialized values.
 	ClassDB::bind_method(D_METHOD("set_vt_detail_enabled", "enabled"), &Terrain3D::set_vt_detail_enabled);
 	ClassDB::bind_method(D_METHOD("is_vt_detail_enabled"), &Terrain3D::is_vt_detail_enabled);
 	ClassDB::bind_method(D_METHOD("set_vt_detail_density", "texels_per_meter"), &Terrain3D::set_vt_detail_density);
@@ -512,54 +512,35 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_page_fade_frames", PROPERTY_HINT_RANGE, "0,60,1"), "set_vt_page_fade_frames", "get_vt_page_fade_frames");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_editor_preview"), "set_vt_editor_preview", "is_vt_editor_preview");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_debug_direct_material"), "set_vt_debug_direct_material", "is_vt_debug_direct_material");
-	// The layer's shape, its own subgroup between the settings that select it and the methods that
-	// share the page pool with it. The legacy three shape properties and their defaults remain intact;
-	// optional group fields below let Material and Height resolve separate shapes. Material's default
-	// keeps the 1024 -> 1 eleven-unit ladder, while Height uses a lower-density default with the same
-	// one-texel/metre outer endpoint. The implementation ceilings still hold the full material span.
+	// The layer's quality and implementation, between the delivery matrix and the methods sharing the
+	// page pool. The group-specific shape and work defaults are documented beside `_clipmap_settings()`;
+	// compatibility fields below deserialize old scenes without appearing in the Inspector.
 	ADD_SUBGROUP("Clipmap", "vt_clipmap_");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_size", PROPERTY_HINT_RANGE, "8,4096,8"), "set_vt_clipmap_size", "get_vt_clipmap_size");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_RANGE, "1,16,1"), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
-	// The finest unit's world size. The legacy property's lower bound admits its historical 0.25 m
-	// default, whose 256 texels give the material ladder's 1024 texels a metre.
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_RANGE, "0.0625,4096.0,0.0625,or_greater"), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
-	// Per-group shape fields are optional overrides. Zero means inherit the legacy global tuple when
-	// it has been customized, otherwise use that group's defaults. Keeping the legacy fields above
-	// unchanged preserves existing scene/script values and their old shared fallback behavior. The raw
-	// per-group getters retain zero so an inherited setting remains visible in the Inspector; scripts
-	// can query the fully resolved values with get_vt_clipmap_group_shape(group).
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_size", PROPERTY_HINT_RANGE, "0,4096,8"), "set_vt_clipmap_material_size", "get_vt_clipmap_material_size");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_levels", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_clipmap_material_levels", "get_vt_clipmap_material_levels");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_material_base_world", PROPERTY_HINT_RANGE, "0.0,4096.0,0.0625,or_greater"), "set_vt_clipmap_material_base_world", "get_vt_clipmap_material_base_world");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_size", PROPERTY_HINT_RANGE, "0,4096,8"), "set_vt_clipmap_height_size", "get_vt_clipmap_height_size");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_levels", PROPERTY_HINT_RANGE, "0,16,1"), "set_vt_clipmap_height_levels", "get_vt_clipmap_height_levels");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_height_base_world", PROPERTY_HINT_RANGE, "0.0,4096.0,0.0625,or_greater"), "set_vt_clipmap_height_base_world", "get_vt_clipmap_height_base_world");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_RANGE, "0,1048576,1024"), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
-	// **The implementation selector**, and the whole of what used to be a second delivery. It sits in
-	// the clipmap settings because that is what it is: a choice of *how* the one clipmap delivery
-	// stores and uploads what it holds, not a second way to deliver a channel. The default is `LOD`,
-	// which is the shipped behaviour of an unset property.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_quality", PROPERTY_HINT_ENUM, "Standard,Performance"), "set_vt_clipmap_quality", "get_vt_clipmap_quality");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_implementation", PROPERTY_HINT_ENUM, TerrainClipmap::implementation_hint()), "set_vt_clipmap_implementation", "get_vt_clipmap_implementation");
-	// The Atlas implementation's own two settings: the one-time global block's resolution and the
-	// per-frame production bound. Its block size, block world and ring count are the layer's own
-	// `vt_clipmap_size`, `vt_clipmap_base_world` and `vt_clipmap_levels`, so the two implementations
-	// share one density ladder and one shape.
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_global_texels", PROPERTY_HINT_RANGE, "1,4096,1"), "set_vt_clipmap_global_texels", "get_vt_clipmap_global_texels");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_blocks_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), "set_vt_clipmap_blocks_per_frame", "get_vt_clipmap_blocks_per_frame");
-	// The material group's detail layer, under the Clipmap subgroup because that is what it is: the
-	// layer's own finer half, which exists only while the material group is delivered by the clipmap.
-	// The density target is the measurement the layer exists to make, so the inspector's lower bound is
-	// 1 and the default 1024; the budget is the *whole* layer's GPU storage, and the slot table is
-	// derived from it. The reach is the near field the layer sharpens - beyond it the layer serves -
-	// and the directory size is how many tiles the shader's window holds an axis.
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_clipmap_detail_enabled"), "set_vt_detail_enabled", "is_vt_detail_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_density", PROPERTY_HINT_RANGE, "1.0,8192.0,1.0,or_greater"), "set_vt_detail_density", "get_vt_detail_density");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_min_density", PROPERTY_HINT_RANGE, "1.0,8192.0,1.0,or_greater"), "set_vt_detail_min_density", "get_vt_detail_min_density");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_tile_size", PROPERTY_HINT_RANGE, "32,1024,32"), "set_vt_detail_tile_size", "get_vt_detail_tile_size");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_directory_size", PROPERTY_HINT_RANGE, "16,512,16"), "set_vt_detail_directory_size", "get_vt_detail_directory_size");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_budget_bytes", PROPERTY_HINT_RANGE, "0,2147483647,1048576,or_greater"), "set_vt_detail_budget_bytes", "get_vt_detail_budget_bytes");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_demand_radius", PROPERTY_HINT_RANGE, "0.25,4096.0,0.25,or_greater"), "set_vt_detail_demand_radius", "get_vt_detail_demand_radius");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_texels_per_pixel", PROPERTY_HINT_RANGE, "0.25,64.0,0.25,or_greater"), "set_vt_detail_texels_per_pixel", "get_vt_detail_texels_per_pixel");
+	// Storage-only aliases migrate old scenes without invalid-property errors. They stay hidden from
+	// the Inspector; new scenes choose a profile and let the documented defaults shape both groups.
+	constexpr uint32_t legacy_clipmap = PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_NO_EDITOR;
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_size", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_size", "get_vt_clipmap_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_levels", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_levels", "get_vt_clipmap_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_base_world", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_base_world", "get_vt_clipmap_base_world");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_size", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_material_size", "get_vt_clipmap_material_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_material_levels", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_material_levels", "get_vt_clipmap_material_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_material_base_world", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_material_base_world", "get_vt_clipmap_material_base_world");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_size", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_height_size", "get_vt_clipmap_height_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_height_levels", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_height_levels", "get_vt_clipmap_height_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_height_base_world", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_height_base_world", "get_vt_clipmap_height_base_world");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_budget_texels", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_budget_texels", "get_vt_clipmap_budget_texels");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_global_texels", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_global_texels", "get_vt_clipmap_global_texels");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_blocks_per_frame", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_clipmap_blocks_per_frame", "get_vt_clipmap_blocks_per_frame");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vt_clipmap_detail_enabled", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_enabled", "is_vt_detail_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_density", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_density", "get_vt_detail_density");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_min_density", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_min_density", "get_vt_detail_min_density");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_tile_size", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_tile_size", "get_vt_detail_tile_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_directory_size", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_directory_size", "get_vt_detail_directory_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "vt_clipmap_detail_budget_bytes", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_budget_bytes", "get_vt_detail_budget_bytes");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_demand_radius", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_demand_radius", "get_vt_detail_demand_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vt_clipmap_detail_texels_per_pixel", PROPERTY_HINT_NONE, "", legacy_clipmap), "set_vt_detail_texels_per_pixel", "get_vt_detail_texels_per_pixel");
 	ADD_SUBGROUP("", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "surface_array_enabled"), "set_surface_array_enabled", "is_surface_array_enabled");
 	ADD_SUBGROUP("AVT", "surface_vt_");

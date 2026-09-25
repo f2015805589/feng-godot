@@ -15,8 +15,8 @@
 //     reports and the debug view spell the two the same way.
 //   * `Shape` - the numbers a layer is built from. Both implementations are configured from this one
 //     struct, so a setting cannot exist for one of them and not the other.
-//   * `Ladder` - the *sampling contract*: the density ladder `texel_world(unit) = base_world * 2^unit
-//     / size`, and the world size of a unit. Both implementations address by exactly this ladder; the
+	//   * `Ladder` - the *sampling contract*: `unit_world_size(unit) = base_world * 2^unit` and
+	//     `texel_world(unit) = unit_world_size(unit) / size`. Both implementations address by this ladder; the
 //     atlas merely stores its units as shells of blocks instead of whole squares. Writing it once is
 //     what makes the density a fragment is served a property of the layer rather than of the storage.
 //     The material group's recommended endpoints are stated once below
@@ -149,14 +149,18 @@ struct Shape {
 // ladder; the atlas stores a unit as a shell of blocks rather than as one square, which changes where a
 // texel *lives* and not which texel a world position gets.
 struct Ladder {
-	// The finest unit's texels an axis, and the metres it covers.
-	int size = 256;
-	real_t base_world = 256.f;
-	// The world size of one texel of a unit: `base_world * 2^unit / size` metres. The density a
+	// A neutral empty ladder until `ladder_of(shape)` supplies the configured layer's values.
+	int size = 1;
+	real_t base_world = 1.f;
+	// The world side length of one unit: `base_world * 2^unit` metres.
+	real_t unit_world_size(const int p_unit) const {
+		return base_world * real_t(int64_t(1) << CLAMP(p_unit, 0, 30));
+	}
+	// The world size of one texel of a unit: its shared world size divided by `size`. The density a
 	// fragment is served at a distance is the reciprocal, which is why the "density - distance" curve
 	// is this function sampled by `unit_for_distance()`.
 	real_t texel_world(const int p_unit) const {
-		return base_world * real_t(int64_t(1) << CLAMP(p_unit, 0, 30)) / real_t(MAX(1, size));
+		return unit_world_size(p_unit) / real_t(MAX(1, size));
 	}
 	// The density a fragment is served by one unit, in texels a metre. It is the reciprocal of the
 	// texel size, and it is the number the acceptance's "density - distance" curve is made of: a curve

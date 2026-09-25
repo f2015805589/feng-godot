@@ -682,24 +682,36 @@ bool Terrain3D::has_clipmap_source(const int p_group) const {
 Terrain3DClipmapLayer::Settings Terrain3D::_clipmap_settings(const TerrainVT::ChannelGroup p_group) const {
 	Terrain3DClipmapLayer::Settings settings;
 	settings.implementation = _vt.clipmap_implementation;
-	// A legacy tuple that differs from its historical default is an explicit compatibility fallback for
-	// both groups. With the tuple untouched, each group starts from its own recommended shape: material
-	// keeps the complete 1024 -> 1 ladder, while height trades some fine density and storage for the same
-	// one-texel/metre outer endpoint. Per-group fields then override only the values they specify.
-	const TerrainClipmap::Shape legacy_default;
-	const bool has_legacy_override = _vt.clipmap_size != legacy_default.size ||
-			_vt.clipmap_units != legacy_default.units ||
-			!Math::is_equal_approx(_vt.clipmap_base_world, legacy_default.base_world);
-	if (has_legacy_override) {
-		settings.shape.size = _vt.clipmap_size;
-		settings.shape.units = _vt.clipmap_units;
-		settings.shape.base_world = _vt.clipmap_base_world;
+	// One quality choice maps to two fixed, documented ladders. Standard preserves the shipped
+	// material defaults and the 64 texel/m Height default; Performance cuts the material ring texel
+	// count by four while the near detail cache still supplies its 1024 texel/m patch, and reduces
+	// height storage about threefold while keeping 64 texel/m at the finest level. Both keep a coarse
+	// fallback beyond their outermost unit. Legacy scene overrides below take precedence during load.
+	if (_vt.clipmap_quality == CLIPMAP_QUALITY_PERFORMANCE) {
+		if (p_group == TerrainVT::ChannelGroup::Height) {
+			settings.shape.size = 64;
+			settings.shape.units = 9;
+			settings.shape.base_world = 1.f;
+		} else {
+			settings.shape.size = 128;
+			settings.shape.units = TerrainClipmap::LADDER_UNITS;
+			settings.shape.base_world = 0.5f;
+		}
 	} else if (p_group == TerrainVT::ChannelGroup::Height) {
-		// 128 texels over 2 m is 64 texels/m; seven units halve this to 1 texel/m at 128 m reach.
 		settings.shape.size = 128;
 		settings.shape.units = 7;
 		settings.shape.base_world = 2.f;
-	} // Material keeps TerrainClipmap::Shape's shipped (256, 11, 0.25 m) defaults.
+	}
+	const TerrainClipmap::Shape legacy_default;
+	const TerrainClipmap::Shape &legacy = _vt.clipmap_legacy_shape;
+	const bool has_legacy_override = legacy.size != legacy_default.size ||
+			legacy.units != legacy_default.units ||
+			!Math::is_equal_approx(legacy.base_world, legacy_default.base_world);
+	if (has_legacy_override) {
+		settings.shape.size = legacy.size;
+		settings.shape.units = legacy.units;
+		settings.shape.base_world = legacy.base_world;
+	}
 	const int index = int(p_group);
 	if (index >= 0 && index < TerrainVT::GROUP_COUNT) {
 		if (_vt.clipmap_group_size[index] > 0) {
@@ -712,8 +724,8 @@ Terrain3DClipmapLayer::Settings Terrain3D::_clipmap_settings(const TerrainVT::Ch
 			settings.shape.base_world = _vt.clipmap_group_base_world[index];
 		}
 	}
-	settings.shape.global_texels = _vt.clipmap_atlas_global_texels;
-	settings.shape.blocks_per_frame = _vt.clipmap_atlas_blocks_per_frame;
+	settings.shape.global_texels = legacy.global_texels;
+	settings.shape.blocks_per_frame = legacy.blocks_per_frame;
 	return settings;
 }
 
@@ -776,29 +788,59 @@ bool Terrain3D::has_vt_clipmap_layer() const {
 	return false;
 }
 
+void Terrain3D::set_vt_clipmap_quality(const int p_quality) {
+	if (p_quality < CLIPMAP_QUALITY_STANDARD || p_quality > CLIPMAP_QUALITY_PERFORMANCE) {
+		LOG(WARN, "Clipmap quality ", p_quality, " is invalid; use Standard or Performance.");
+		return;
+	}
+	const TerrainClipmap::Shape defaults;
+	const TerrainClipmap::Shape &legacy = _vt.clipmap_legacy_shape;
+	bool has_legacy_override = legacy.size != defaults.size || legacy.units != defaults.units ||
+			!Math::is_equal_approx(legacy.base_world, defaults.base_world) ||
+			legacy.global_texels != defaults.global_texels ||
+			legacy.blocks_per_frame != defaults.blocks_per_frame;
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		has_legacy_override = has_legacy_override || _vt.clipmap_group_size[group] > 0 ||
+				_vt.clipmap_group_units[group] > 0 || _vt.clipmap_group_base_world[group] > 0.f;
+	}
+	if (p_quality == _vt.clipmap_quality && !has_legacy_override) {
+		return;
+	}
+	_vt.clipmap_quality = p_quality;
+	// An explicit profile selection supersedes compatibility shape/atlas overrides already loaded in
+	// this session. Even choosing the currently selected profile performs this migration.
+	_vt.clipmap_legacy_shape = TerrainClipmap::Shape();
+	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
+		_vt.clipmap_group_size[group] = 0;
+		_vt.clipmap_group_units[group] = 0;
+		_vt.clipmap_group_base_world[group] = 0.f;
+	}
+	_resolve_vt_delivery(true);
+}
+
 void Terrain3D::set_vt_clipmap_size(const int p_size) {
 	// 0 is refused rather than clamped: a layer with no texels an axis is not a small clipmap, it is
 	// not a clipmap, and the setter should not accept a shape the mechanism cannot build.
-	if (p_size <= 0 || p_size == _vt.clipmap_size) {
+	if (p_size <= 0 || p_size == _vt.clipmap_legacy_shape.size) {
 		return;
 	}
-	_vt.clipmap_size = p_size;
+	_vt.clipmap_legacy_shape.size = p_size;
 	_resolve_vt_delivery(false);
 }
 
 void Terrain3D::set_vt_clipmap_levels(const int p_levels) {
-	if (p_levels <= 0 || p_levels == _vt.clipmap_units) {
+	if (p_levels <= 0 || p_levels == _vt.clipmap_legacy_shape.units) {
 		return;
 	}
-	_vt.clipmap_units = p_levels;
+	_vt.clipmap_legacy_shape.units = p_levels;
 	_resolve_vt_delivery(false);
 }
 
 void Terrain3D::set_vt_clipmap_base_world(const real_t p_metres) {
-	if (p_metres <= 0.f || Math::is_equal_approx(p_metres, _vt.clipmap_base_world)) {
+	if (p_metres <= 0.f || Math::is_equal_approx(p_metres, _vt.clipmap_legacy_shape.base_world)) {
 		return;
 	}
-	_vt.clipmap_base_world = p_metres;
+	_vt.clipmap_legacy_shape.base_world = p_metres;
 	_resolve_vt_delivery(false);
 }
 
@@ -868,11 +910,12 @@ Dictionary Terrain3D::get_vt_clipmap_group_shape(const int p_group) const {
 	}
 	const Terrain3DClipmapLayer::Settings settings = _clipmap_settings(TerrainVT::ChannelGroup(p_group));
 	const TerrainClipmap::Shape &shape = settings.shape;
+	const TerrainClipmap::Ladder ladder = TerrainClipmap::ladder_of(shape);
 	result["size"] = shape.size;
 	result["levels"] = shape.units;
 	result["base_world"] = shape.base_world;
-	result["finest_density"] = real_t(shape.size) / MAX(real_t(0.001), shape.base_world);
-	result["coarsest_density"] = TerrainClipmap::ladder_of(shape).density_at_unit_count(shape.units);
+	result["finest_density"] = ladder.finest_density();
+	result["coarsest_density"] = ladder.density_at_unit_count(shape.units);
 	result["overridden"] = is_vt_clipmap_group_shape_overridden(p_group);
 	return result;
 }
@@ -899,7 +942,9 @@ void Terrain3D::set_vt_clipmap_implementation(const int p_implementation) {
 void Terrain3D::set_vt_clipmap_budget_texels(const int p_texels) {
 	// The budget is not a shape: a layer keeps its content when it changes, and 0 is a legal "produce
 	// nothing this tick" that a test uses to hold the layer still.
-	_vt.clipmap_budget_texels = MAX(0, p_texels);
+	if (_vt.clipmap_budget_texels != MAX(0, p_texels)) {
+		_vt.clipmap_budget_texels = MAX(0, p_texels);
+	}
 }
 
 // The Atlas implementation's two settings. Neither is a delivery: they are fields of the layer's shape
@@ -908,7 +953,9 @@ void Terrain3D::set_vt_clipmap_global_texels(const int p_texels) {
 	if (p_texels <= 0) {
 		return;
 	}
-	_vt.clipmap_atlas_global_texels = p_texels;
+	if (_vt.clipmap_legacy_shape.global_texels != p_texels) {
+		_vt.clipmap_legacy_shape.global_texels = p_texels;
+	}
 }
 
 void Terrain3D::set_vt_clipmap_blocks_per_frame(const int p_blocks) {
@@ -916,7 +963,9 @@ void Terrain3D::set_vt_clipmap_blocks_per_frame(const int p_blocks) {
 	if (p_blocks <= 0) {
 		return;
 	}
-	_vt.clipmap_atlas_blocks_per_frame = p_blocks;
+	if (_vt.clipmap_legacy_shape.blocks_per_frame != p_blocks) {
+		_vt.clipmap_legacy_shape.blocks_per_frame = p_blocks;
+	}
 }
 
 // The layer's stored value at a world position, through the layer's own addressing - the same ladder
@@ -1504,19 +1553,27 @@ void Terrain3D::set_vt_detail_budget_bytes(const int p_bytes) {
 	// derived slot table cannot be resized in place, so the manager rebuilds. Zero is a legal
 	// "spend nothing", which turns the layer off with a report rather than allocating a slot table
 	// it cannot afford.
-	_vt.detail_budget_bytes = MAX(0, p_bytes);
+	if (_vt.detail_budget_bytes != MAX(0, p_bytes)) {
+		_vt.detail_budget_bytes = MAX(0, p_bytes);
+	}
 	_setup_vt_material_detail();
 }
 
 void Terrain3D::set_vt_detail_demand_radius(const real_t p_metres) {
 	// Policy, not shape: the manager's `configure()` takes the fast path for it (nothing resident
 	// moves), so this reaches the next demand walk without evicting a tile.
-	_vt.detail_demand_radius = CLAMP(p_metres, real_t(0.25), real_t(4096));
+	const real_t radius = CLAMP(p_metres, real_t(0.25), real_t(4096));
+	if (!Math::is_equal_approx(radius, _vt.detail_demand_radius)) {
+		_vt.detail_demand_radius = radius;
+	}
 	_setup_vt_material_detail();
 }
 
 void Terrain3D::set_vt_detail_texels_per_pixel(const real_t p_texels) {
 	// Policy as well: the screen-footprint target the level rule is derived from.
-	_vt.detail_texels_per_pixel = CLAMP(p_texels, real_t(0.25), real_t(64));
+	const real_t target = CLAMP(p_texels, real_t(0.25), real_t(64));
+	if (!Math::is_equal_approx(target, _vt.detail_texels_per_pixel)) {
+		_vt.detail_texels_per_pixel = target;
+	}
 	_setup_vt_material_detail();
 }

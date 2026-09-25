@@ -46,6 +46,9 @@ bool Terrain3DClipmapLayer::consume_async_update(int &r_produced, uint64_t &r_wo
 	if (_async_update == nullptr || !_async_update->complete.load(std::memory_order_acquire)) {
 		return false;
 	}
+	if (_impl != nullptr) {
+		_impl->publish_pending_uploads();
+	}
 	r_produced = _async_update->produced;
 	r_worker_usec = _async_update->worker_usec;
 	r_addresses = _async_update->addresses;
@@ -66,12 +69,10 @@ void Terrain3DClipmapLayer::set_source_snapshot(
 bool Terrain3DClipmapLayer::schedule_async_update(const Vector2 &p_focus, const int p_budget_texels,
 		const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot,
 		Terrain3DPagePipeline *p_pipeline) {
-	if (_impl == nullptr || p_pipeline == nullptr || async_update_in_progress() ||
-			_impl->get_implementation() != TerrainClipmap::Implementation::LOD) {
+	if (_impl == nullptr || p_pipeline == nullptr || async_update_in_progress()) {
 		return false;
 	}
-	Terrain3DClipmap *ring = static_cast<Terrain3DClipmap *>(_impl.get());
-	if (!ring->needs_update_at(p_focus)) {
+	if (!_impl->needs_update_at(p_focus)) {
 		return true;
 	}
 	set_source_snapshot(p_snapshot);

@@ -83,22 +83,22 @@ public:
 		// Interior texels an axis, and the gutter each side. The gutter is what lets the 8x
 		// anisotropy the near field requests filter across a tile edge without reading a neighbour
 		// tile's texel as if it were its own; it is the same 5 the ring and the pages carry.
-		int tile_size = 256;
-		int border = 5;
+		int tile_size = 0;
+		int border = 0;
 		// Texels per metre at level 0. This is the value the whole layer exists to deliver.
-		real_t density = 1024.f;
-		int levels = 3;
+		real_t density = 0.f;
+		int levels = 0;
 		// Directory texels an axis per level. The window a level covers is
 		// `directory_size * tile_world(l)` metres, so this is the near field's reach as a tile count:
 		// 128 tiles of 0.25 m is 32 m at level 0, and 128 m at level 2.
-		int directory_size = 128;
+		int directory_size = 0;
 		// Bytes of GPU storage the whole layer may hold. `slot_capacity()` turns it into slots.
-		int64_t budget_bytes = 256ll << 20;
+		int64_t budget_bytes = 0;
 		// A hard ceiling on the derived slot count, applied after the budget.
 		int max_slots = 512;
 		// How far from the focus any detail tile is demanded, in metres. Beyond it the coarse ring
 		// serves: the layer is a near-field sharpener, not a second world.
-		real_t demand_radius = 12.f;
+		real_t demand_radius = 0.f;
 		// The camera's half-angle the demand walk keeps, in radians. A tile behind the camera is not
 		// visible, so demanding it would spend a slot on ground no fragment reads.
 		real_t forward_half_angle = 1.31f;
@@ -106,7 +106,7 @@ public:
 		// level rule is built from: a level is demanded while its density still puts at least this
 		// many texels on a pixel at that distance. Four keeps the 1.6 m probe at level 0 (1024) on
 		// a 1080p viewport at the reference's 8-degree pitch.
-		real_t texels_per_pixel = 4.f;
+		real_t texels_per_pixel = 0.f;
 		// Source threads its own pipeline may run. 0 selects the machine default; the manager is
 		// only created when the layer is selected, so this is a cost a configuration that never
 		// selects Clipmap material does not pay.

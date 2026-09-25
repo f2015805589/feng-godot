@@ -55,6 +55,11 @@ public: // Constants
 		SIZE_2048 = 2048,
 	};
 
+	enum ClipmapQuality {
+		CLIPMAP_QUALITY_STANDARD = 0,
+		CLIPMAP_QUALITY_PERFORMANCE = 1,
+	};
+
 	// Length of the shader's far-field distance table (main.glsl declares
 	// `_surface_svt_mip_distance[16]`). Levels above this are unreachable anyway: the
 	// indirection's mip chain caps the effective level well below it.
@@ -591,19 +596,20 @@ public:
 
 	// ---- Clipmap: the layer's settings and its readings -----------------------------------------
 	// One layer per channel group, built by the assembly rule the first time a cell selects Clipmap
-	// and kept afterwards, exactly like the two views. The legacy global shape remains a fallback for
-	// existing projects; group-specific zero-valued fields inherit it when customized, or the group's
-	// recommended default otherwise. Unit l covers `base_world * 2^l` metres in `size` texels, so its
-	// texel is `base_world * 2^l / size` metres wide - the shared ladder both implementations address by.
+	// and kept afterwards, exactly like the two views. New projects expose one quality profile and the
+	// implementation selector; per-group shapes are derived defaults. Hidden legacy properties remain
+	// readable for old serialized scenes and scripts. Unit l covers `base_world * 2^l` metres in `size`
+	// texels, so its texel is `base_world * 2^l / size` metres wide for either implementation.
+	void set_vt_clipmap_quality(const int p_quality);
+	int get_vt_clipmap_quality() const { return _vt.clipmap_quality; }
 	void set_vt_clipmap_size(const int p_size);
-	int get_vt_clipmap_size() const { return _vt.clipmap_size; }
+	int get_vt_clipmap_size() const { return _vt.clipmap_legacy_shape.size; }
 	void set_vt_clipmap_levels(const int p_levels);
-	int get_vt_clipmap_levels() const { return _vt.clipmap_units; }
+	int get_vt_clipmap_levels() const { return _vt.clipmap_legacy_shape.units; }
 	void set_vt_clipmap_base_world(const real_t p_metres);
-	real_t get_vt_clipmap_base_world() const { return _vt.clipmap_base_world; }
-	// Per-group shape overrides are data-only. Zero clears that one field back to inheritance;
-	// get_vt_clipmap_group_shape() reports the fully resolved shape. The old three properties remain
-	// the compatible global fallback while Material and Height can carry different ladders.
+	real_t get_vt_clipmap_base_world() const { return _vt.clipmap_legacy_shape.base_world; }
+	// Per-group shape values exist only as serialized migration aliases. Zero clears that field back to
+	// inheritance; get_vt_clipmap_group_shape() reports the fully resolved profile shape.
 	void set_vt_clipmap_group_size(const int p_group, const int p_size);
 	int get_vt_clipmap_group_size(const int p_group) const;
 	void set_vt_clipmap_group_levels(const int p_group, const int p_levels);
@@ -613,8 +619,8 @@ public:
 	void reset_vt_clipmap_group_shape(const int p_group);
 	bool is_vt_clipmap_group_shape_overridden(const int p_group) const;
 	Dictionary get_vt_clipmap_group_shape(const int p_group) const;
-	// Inspector-facing serialized fields. Zero means inherit; setting one positive value overrides only
-	// that group's field, with the remaining fields still resolved through the same fallback chain.
+	// Hidden STORAGE aliases for old scenes. Zero means inherit; a positive value temporarily overrides
+	// the selected quality profile until a profile is explicitly chosen.
 	void set_vt_clipmap_material_size(const int p_size) { set_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Material), p_size); }
 	int get_vt_clipmap_material_size() const { return get_vt_clipmap_group_size(int(TerrainVT::ChannelGroup::Material)); }
 	void set_vt_clipmap_material_levels(const int p_levels) { set_vt_clipmap_group_levels(int(TerrainVT::ChannelGroup::Material), p_levels); }
@@ -636,15 +642,13 @@ public:
 	// page pool, so this is spent beside `vt_pages_per_update` rather than out of it.
 	void set_vt_clipmap_budget_texels(const int p_texels);
 	int get_vt_clipmap_budget_texels() const { return _vt.clipmap_budget_texels; }
-	// The Atlas implementation's own settings. They are *layer* settings - the LOD implementation
-	// simply does not use them - so they are named after the layer rather than after a mode:
-	// `global_texels` is the one-time minimal-resolution block outside the atlas grid, and
-	// `blocks_per_frame` its per-frame production bound, one being "a frame loads one block". How many
-	// rings the grid holds is the layer's own `vt_clipmap_levels`.
+	// Legacy Atlas tuning aliases. Their defaults are internal to the shared Shape: `global_texels` is
+	// the one-time minimal-resolution block outside the atlas grid and `blocks_per_frame` bounds block
+	// production. The LOD implementation ignores both values.
 	void set_vt_clipmap_global_texels(const int p_texels);
-	int get_vt_clipmap_global_texels() const { return _vt.clipmap_atlas_global_texels; }
+	int get_vt_clipmap_global_texels() const { return _vt.clipmap_legacy_shape.global_texels; }
 	void set_vt_clipmap_blocks_per_frame(const int p_blocks);
-	int get_vt_clipmap_blocks_per_frame() const { return _vt.clipmap_atlas_blocks_per_frame; }
+	int get_vt_clipmap_blocks_per_frame() const { return _vt.clipmap_legacy_shape.blocks_per_frame; }
 	// The layer's stored value at a world position, through the layer's own addressing - the same unit
 	// rule, snapping and offset the shader arm samples with, whichever implementation is selected.
 	// Read by the deterministic tests and the dock, which otherwise have no way to compare what the
@@ -1153,5 +1157,6 @@ protected:
 
 VARIANT_ENUM_CAST(Terrain3D::RegionSize);
 VARIANT_ENUM_CAST(Terrain3D::DebugLevel);
+VARIANT_ENUM_CAST(Terrain3D::ClipmapQuality);
 
 #endif // TERRAIN3D_CLASS_H

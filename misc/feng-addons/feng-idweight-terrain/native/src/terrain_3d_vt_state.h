@@ -546,27 +546,17 @@ struct Terrain3DVTState {
 	// texels, which is the shared ladder both implementations address by. `budget_texels` is what one
 	// layer may produce in one tick, in channel texels; it is not part of the page budget, because the
 	// clipmap does not touch the shared pool.
-	// The legacy tuple remains at its historical material-oriented default: 256 texels over 0.25 m for
-	// eleven units, or 1024 -> 1 texels a metre. `_clipmap_settings(group)` keeps that tuple as the
-	// fallback for projects that customize it, while untouched defaults may choose a lower-density
-	// height ladder. A per-group zero field inherits; a positive field overrides that one value.
+	// New projects choose one documented quality profile. The legacy shapes below are storage-only
+	// migration aliases: old scenes may still supply them, but new scenes use the profile defaults.
 	TerrainClipmap::Implementation clipmap_implementation = TerrainClipmap::Implementation::LOD;
-	int clipmap_size = 256;
-	int clipmap_units = TerrainClipmap::LADDER_UNITS;
-	real_t clipmap_base_world = 0.25f;
-	// Per-group fields are data-only overrides of the legacy/global shape above. Zero means "inherit":
-	// the group's shipped default when the legacy tuple is untouched, or the legacy tuple when a project
-	// has customized it. The effective values are always assembled into one TerrainClipmap::Shape by
-	// Terrain3D::_clipmap_settings(group), then shared by the LOD and Atlas implementations.
+	int clipmap_quality = 0; // Standard; see `_clipmap_settings()` for the profile table.
+	TerrainClipmap::Shape clipmap_legacy_shape;
+	// Per-group fields are old serialized overrides. Zero means no legacy override for that dimension;
+	// they take precedence over the new profile only while an old scene still carries those values.
 	int clipmap_group_size[TerrainVT::GROUP_COUNT] = { 0, 0 };
 	int clipmap_group_units[TerrainVT::GROUP_COUNT] = { 0, 0 };
 	real_t clipmap_group_base_world[TerrainVT::GROUP_COUNT] = { 0.f, 0.f };
 	int clipmap_budget_texels = 65536;
-	// The atlas's own shape, used by the Atlas implementation and ignored by LOD: the texels its
-	// one-time global block holds, and the per-frame production bound (one is the user's "a frame
-	// loads one block").
-	int clipmap_atlas_global_texels = 64;
-	int clipmap_atlas_blocks_per_frame = 1;
 	std::unique_ptr<Terrain3DClipmapLayer> clipmap_layer[TerrainVT::GROUP_COUNT];
 	// The state stamp of each layer as the shader was last *bound* with, so a change the shader has to
 	// follow is one comparison per layer rather than a rebind per tick. See

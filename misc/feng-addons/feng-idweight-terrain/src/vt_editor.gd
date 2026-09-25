@@ -23,6 +23,7 @@ const BAKE_STATUS_POLL_INTERVAL: float = 0.25
 # enum, which is also the item id the OptionButton stores. They are not deliveries: the matrix selects
 # `Clipmap` once and this chooses how that one layer stores its units.
 const CLIPMAP_IMPLEMENTATIONS: Array[String] = ["LOD", "Atlas"]
+const CLIPMAP_QUALITIES: Array[String] = ["Standard", "Performance"]
 # The matrix's own vocabulary - the methods, the bands, the channel groups and the cell labels - lives
 # with the rows in vt_editor_delivery_rows.gd, and the hint below reads it from there.
 # The method these rows are about, by the native enum's value (`Clipmap`): the rows read the published
@@ -51,10 +52,7 @@ var baked_mip_selector: OptionButton
 var settings_panel: VBoxContainer
 var clipmap_panel: VBoxContainer
 var clipmap_debug_panel: VBoxContainer
-var clipmap_size_spin: SpinBox
-var clipmap_levels_spin: SpinBox
-var clipmap_base_spin: SpinBox
-var clipmap_budget_spin: SpinBox
+var clipmap_quality_option: OptionButton
 var clipmap_implementation_option: OptionButton
 var clipmap_hint: Label
 var _clipmap_preview: Control
@@ -601,11 +599,8 @@ func _build_settings_panel() -> VBoxContainer:
 	return panel
 
 
-# The one layer's storage, shape and budget, in their own panel beside the settings that select it.
-# The implementation switch and three of the four spins are shape - they reconfigure every existing
-# layer, which is why the setter resolves the assembly - and the fourth is the per-tick production
-# budget, which is not a shape at all: a layer keeps its content and a value of 0 is a legal "produce
-# nothing this tick".
+# The layer's two user choices. Its channel-specific shapes, work budgets and detail cache are
+# documented internal defaults, with old serialized values handled by hidden compatibility aliases.
 func _build_clipmap_panel() -> VBoxContainer:
 	var panel := VBoxContainer.new()
 	panel.name = "ClipmapSettings"
@@ -622,32 +617,14 @@ func _build_clipmap_panel() -> VBoxContainer:
 		clipmap_implementation_option.add_item(CLIPMAP_IMPLEMENTATIONS[implementation], implementation)
 	clipmap_implementation_option.item_selected.connect(_on_clipmap_implementation_selected)
 	grid.add_child(clipmap_implementation_option)
-	grid.add_child(_make_setting_label("Level edge (texels)"))
-	clipmap_size_spin = _make_spin(8, 4096, 8)
-	clipmap_size_spin.name = "ClipmapSize"
-	clipmap_size_spin.tooltip_text = "Texels an axis on every unit of the layer. It is not terrain metres: the finest unit covers the base extent below in this many texels, so the layer's finest density is size / base (the shipped 256 / 0.25 is 1024 texels a metre), and every coarser unit halves it while doubling the extent."
-	clipmap_size_spin.value_changed.connect(_on_clipmap_setting_changed.bind("size"))
-	grid.add_child(clipmap_size_spin)
-	grid.add_child(_make_setting_label("Levels"))
-	clipmap_levels_spin = _make_spin(1, 16, 1)
-	clipmap_levels_spin.name = "ClipmapLevels"
-	clipmap_levels_spin.tooltip_text = "How many units the layer holds. Unit l covers base * 2^l metres and serves half the density of unit l-1, so n units span size/base down to size/base/2^(n-1). The shipped ladder is 1024 -> 1 texels a metre, i.e. eleven units; fewer truncates the ladder and the hint below says so."
-	clipmap_levels_spin.value_changed.connect(_on_clipmap_setting_changed.bind("levels"))
-	grid.add_child(clipmap_levels_spin)
-	grid.add_child(_make_setting_label("Base extent (metres)"))
-	clipmap_base_spin = _make_spin(0.0625, 4096.0, 0.0625)
-	clipmap_base_spin.allow_greater = true
-	clipmap_base_spin.name = "ClipmapBaseWorld"
-	clipmap_base_spin.tooltip_text = "The metres the finest unit covers. A texel of unit l is base * 2^l / size metres wide, so the finest density is size / base: the shipped 256 texels over 0.25 m is 1024 texels a metre, and the coarsest of eleven units is 1."
-	clipmap_base_spin.value_changed.connect(_on_clipmap_setting_changed.bind("base_world"))
-	grid.add_child(clipmap_base_spin)
-	grid.add_child(_make_setting_label("Budget (texels / tick)"))
-	clipmap_budget_spin = _make_spin(0, 1048576, 1024)
-	clipmap_budget_spin.allow_greater = true
-	clipmap_budget_spin.name = "ClipmapBudgetTexels"
-	clipmap_budget_spin.tooltip_text = "Channel texels every layer may produce in one tick. It is spent beside the page budget rather than out of it, because the layer does not touch the shared page pool; 0 holds every layer still."
-	clipmap_budget_spin.value_changed.connect(_on_clipmap_setting_changed.bind("budget"))
-	grid.add_child(clipmap_budget_spin)
+	grid.add_child(_make_setting_label("Quality"))
+	clipmap_quality_option = OptionButton.new()
+	clipmap_quality_option.name = "ClipmapQuality"
+	clipmap_quality_option.tooltip_text = "Standard keeps the shipped 1024 texel/m near material detail and 64 texel/m height shape. Performance uses smaller ring storage; near detail remains 1024 texel/m."
+	for quality in CLIPMAP_QUALITIES.size():
+		clipmap_quality_option.add_item(CLIPMAP_QUALITIES[quality], quality)
+	clipmap_quality_option.item_selected.connect(_on_clipmap_quality_selected)
+	grid.add_child(clipmap_quality_option)
 	clipmap_hint = Label.new()
 	clipmap_hint.name = "ClipmapHint"
 	clipmap_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -837,21 +814,14 @@ func _refresh_settings_controls() -> void:
 # and a native build that predates the layer disables the controls instead of offering a shape it
 # cannot build.
 func _refresh_clipmap_controls(p_settings: Dictionary) -> void:
-	if clipmap_panel == null or clipmap_size_spin == null:
+	if clipmap_panel == null or clipmap_quality_option == null:
 		return
-	var supported := _has_object_property(terrain, &"vt_clipmap_size")
-	if supported:
-		clipmap_size_spin.set_value_no_signal(float(p_settings.get("clipmap_size", 256)))
-		clipmap_levels_spin.set_value_no_signal(float(p_settings.get("clipmap_levels_setting", 11)))
-		clipmap_base_spin.set_value_no_signal(float(p_settings.get("clipmap_base_world", 0.25)))
-		clipmap_budget_spin.set_value_no_signal(float(p_settings.get("clipmap_budget_texels", 65536)))
-	clipmap_size_spin.editable = supported
-	clipmap_levels_spin.editable = supported
-	clipmap_base_spin.editable = supported
-	clipmap_budget_spin.editable = supported
-	# The implementation is a separate property, so it is enabled by its own answer rather than by the
-	# shape's: a build can carry the layer without the selector, and the setting arrives as the enum's
-	# *name*, which is what the item list above was built from.
+	var quality_supported := _has_object_property(terrain, &"vt_clipmap_quality")
+	clipmap_quality_option.disabled = not quality_supported
+	if quality_supported:
+		var quality := int(p_settings.get("clipmap_quality", 0))
+		clipmap_quality_option.select(clipmap_quality_option.get_item_index(quality))
+	# The implementation setting arrives by name; the native implementation table owns that vocabulary.
 	var implementation_supported := _has_object_property(terrain, &"vt_clipmap_implementation")
 	if clipmap_implementation_option != null:
 		clipmap_implementation_option.disabled = not implementation_supported
@@ -872,30 +842,21 @@ func _refresh_clipmap_controls(p_settings: Dictionary) -> void:
 # say is whether a layer can exist at all: a layer is built the first time a cell selects `Clipmap` for
 # a group, and the implementation selector above chooses how that one layer stores its units.
 func _clipmap_hint_text(p_settings: Dictionary) -> String:
-	if not _has_object_property(terrain, &"vt_clipmap_size"):
+	if not _has_object_property(terrain, &"vt_clipmap_quality"):
 		return "This Terrain3D build has no clipmap layer."
-	var levels := int(p_settings.get("clipmap_levels_setting", 0))
-	var base := float(p_settings.get("clipmap_base_world", 0.0))
-	var size := int(p_settings.get("clipmap_size", 0))
-	var finest := TerrainVTEditorPageRows.shape_finest_density(p_settings)
-	var coarsest := TerrainVTEditorPageRows.shape_coarsest_density(p_settings)
-	# A base extent below a metre is the shipped shape, so it is written with the precision that keeps it
-	# readable rather than rounded to "0.2 m"; a coarse shape keeps the one decimal.
-	var base_text := ("%.2f" % base) if base < 10.0 else ("%.1f" % base)
-	var coarsest_text := ("%.2f" % (base * pow(2.0, float(maxi(0, levels - 1))))) if base < 10.0 else (
-			"%.1f" % (base * pow(2.0, float(maxi(0, levels - 1)))))
-	var text := "Unit l covers base * 2^l metres: at %d texels an axis the finest is %s m and the coarsest %s m. A unit is addressed by arithmetic, so a move costs strips rather than a rebuild and the stored content never moves." % [
-			size, base_text, coarsest_text]
-	# The ladder's own readout, which is what the settings above are *for*: the density each end
-	# serves. A shape that does not span 1024 -> 1 is a truncated ladder, and the hint says so rather
-	# than letting the numbers look like a smaller clipmap.
-	text += "\nDensity ladder: %.1f texels/m at the focus down to %.3f at the outer edge over %d units." % [
-			finest, coarsest, levels]
-	if levels > 0 and (absf(finest - 1024.0) > 1.0 or absf(coarsest - 1.0) > 0.001):
-		text += " The shipped ladder is 1024 -> 1 (256 texels over a 0.25 m base, eleven units); this shape does not span it."
+	var quality_name := str(p_settings.get("clipmap_quality_name", "Standard"))
+	var text := "%s profile. Standard preserves the shipped material detail density and height ladder; Performance uses smaller ring storage while keeping the same near detail cache." % quality_name
 	text += "\nImplementation %s: %s. Switching it replaces the storage and rebuilds the shader arm." % [
 			str(p_settings.get("clipmap_implementation", "LOD")),
 			"the toroidal level array" if str(p_settings.get("clipmap_implementation", "LOD")) != "Atlas" else "the packed block atlas"]
+	var layers: Dictionary = p_settings.get("clipmap", {})
+	for group in TerrainVTEditorDeliveryRows.DELIVERY_GROUPS:
+		var entry: Dictionary = layers.get(group, {})
+		if typeof(entry) == TYPE_DICTIONARY and not entry.is_empty():
+			var resolved_shape: Dictionary = entry.get("resolved_shape", {})
+			text += "\n%s resolved: %s texels, %s units, %s m base." % [
+					group.capitalize(), str(resolved_shape.get("size", 0)),
+					str(resolved_shape.get("units", 0)), str(resolved_shape.get("base_world", 0.0))]
 	if not bool(p_settings.get("clipmap_layer", false)):
 		var supported: Dictionary = p_settings.get("delivery_supported", {})
 		var unsupported: Dictionary = p_settings.get("delivery_unsupported", {})
@@ -906,12 +867,11 @@ func _clipmap_hint_text(p_settings: Dictionary) -> String:
 					(unsupported.get("height", {}) as Dictionary).get("Clipmap", "no delivery cell may select Clipmap in this build"))
 		text += "\nLast update produced %d channel texels." % int(p_settings.get("clipmap_produced_texels", 0))
 		return text
-	var layers: Dictionary = p_settings.get("clipmap", {})
 	for group in TerrainVTEditorDeliveryRows.DELIVERY_GROUPS:
 		var entry: Dictionary = layers.get(group, {})
 		if typeof(entry) != TYPE_DICTIONARY or entry.is_empty():
 			continue
-		var label: String = TerrainVTEditorDeliveryRows.DELIVERY_GROUP_LABELS[group]
+		var label := group.capitalize()
 		if bool(entry.get("configured", false)):
 			var valid := 0
 			var units := 0
@@ -920,36 +880,28 @@ func _clipmap_hint_text(p_settings: Dictionary) -> String:
 					continue
 				units += 1
 				valid += 1 if bool((value as Dictionary).get("valid", false)) else 0
-			text += "\n%s: %s · %d/%d units valid · %d queued · %d texels produced · %.1f KB uploaded" % [
-					label, str(entry.get("implementation", "?")), valid,
-					int(entry.get("units", units)), int(entry.get("pending_jobs", 0)),
-					int(entry.get("produced_texels", 0)), float(entry.get("upload_bytes", 0)) / 1024.0]
+			text += "\n%s: %s · %s/%s units valid · %s queued · %s texels produced · %s KB uploaded" % [
+					label, str(entry.get("implementation", "?")), str(valid),
+					str(entry.get("units", units)), str(entry.get("pending_jobs", 0)),
+					str(entry.get("produced_texels", 0)), str(snappedf(float(entry.get("upload_bytes", 0)) / 1024.0, 0.1))]
 		else:
 			text += "\n%s: no layer object for this group" % label
 	text += "\nLast update produced %d channel texels." % int(p_settings.get("clipmap_produced_texels", 0))
 	return text
 
 
-# The implementation switch and three of the four spin settings are the layer's shape: the native
-# setter reconfigures every existing layer, so a write here is a shape change and not a setting parked
-# for later. The budget is not a shape, and the native setter says so by not reconfiguring anything.
+# Profile and implementation changes both reconfigure the one selected clipmap layer.
 func _on_clipmap_setting_changed(p_value: float, p_key: String) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	# The property the write is addressed by and the setter it calls, in one entry, because the two have
-	# to name the same setting: the budget's property carries the `_texels` suffix its setter does, which
-	# a `"vt_clipmap_%s" % p_key` probe cannot know - so the budget control used to be refused here and
-	# never reached the terrain at all.
+	# Keep the small selector-to-property mapping explicit so dock and native property names stay aligned.
 	var setting: Array = {
-		"size": ["vt_clipmap_size", "set_vt_clipmap_size"],
-		"levels": ["vt_clipmap_levels", "set_vt_clipmap_levels"],
-		"base_world": ["vt_clipmap_base_world", "set_vt_clipmap_base_world"],
-		"budget": ["vt_clipmap_budget_texels", "set_vt_clipmap_budget_texels"],
+		"quality": ["vt_clipmap_quality", "set_vt_clipmap_quality"],
 		"implementation": ["vt_clipmap_implementation", "set_vt_clipmap_implementation"],
 	}.get(p_key, [])
 	if setting.is_empty() or not _has_object_property(terrain, setting[0]):
 		return
-	var argument: Variant = p_value if p_key == "base_world" else int(round(p_value))
+	var argument := int(round(p_value))
 	_call(terrain, setting[1], [argument])
 	_refresh_header()
 	_refresh_settings_controls()
@@ -962,6 +914,12 @@ func _on_clipmap_implementation_selected(p_index: int) -> void:
 	if clipmap_implementation_option == null or p_index < 0 or p_index >= clipmap_implementation_option.item_count:
 		return
 	_on_clipmap_setting_changed(float(clipmap_implementation_option.get_item_id(p_index)), "implementation")
+
+
+func _on_clipmap_quality_selected(p_index: int) -> void:
+	if clipmap_quality_option == null or p_index < 0 or p_index >= clipmap_quality_option.item_count:
+		return
+	_on_clipmap_setting_changed(float(clipmap_quality_option.get_item_id(p_index)), "quality")
 
 
 # The band table is its own editor: it owns the spin boxes, the automatic rule and

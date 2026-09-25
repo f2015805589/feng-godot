@@ -141,17 +141,21 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	// rather than assumed. `invalidation_calls` / `invalidated_texels` are the same statement for an
 	// edit: a changed rect is re-produced rather than a whole unit. See
 	// docs/vt_delivery_assembly.md section 6.
-	result["clipmap_size"] = _vt.clipmap_size;
-	result["clipmap_levels_setting"] = _vt.clipmap_units;
-	result["clipmap_base_world"] = _vt.clipmap_base_world;
+	result["clipmap_quality"] = _vt.clipmap_quality;
+	result["clipmap_quality_name"] = _vt.clipmap_quality == CLIPMAP_QUALITY_PERFORMANCE ? "Performance" : "Standard";
+	// Kept as legacy diagnostics while scripts migrate to the single quality profile. Resolved group
+	// shapes are reported below even before a layer is allocated.
+	result["clipmap_size"] = _vt.clipmap_legacy_shape.size;
+	result["clipmap_levels_setting"] = _vt.clipmap_legacy_shape.units;
+	result["clipmap_base_world"] = _vt.clipmap_legacy_shape.base_world;
 	result["clipmap_budget_texels"] = _vt.clipmap_budget_texels;
 	result["clipmap_produced_texels"] = _vt.clipmap_produced_texels;
 	result["clipmap_worker_usec"] = int64_t(_vt.clipmap_worker_usec);
 	result["clipmap_worker_ms"] = _vt.vt_clipmap_worker_ms;
 	result["clipmap_implementation"] = String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
 	result["clipmap_implementation_hint"] = String(TerrainClipmap::implementation_hint());
-	result["clipmap_global_texels"] = _vt.clipmap_atlas_global_texels;
-	result["clipmap_blocks_per_frame"] = _vt.clipmap_atlas_blocks_per_frame;
+	result["clipmap_global_texels"] = _vt.clipmap_legacy_shape.global_texels;
+	result["clipmap_blocks_per_frame"] = _vt.clipmap_legacy_shape.blocks_per_frame;
 	// The material group's detail layer: the request (density, budget, radius), what it delivered
 	// (resident/valid/starved tiles, bytes) and its source and bake counters. One dictionary, because
 	// "asked for 1024" and "has 1024 resident and baked" are the two halves a reader has to compare
@@ -163,8 +167,16 @@ void Terrain3D::_report_vt_service(Dictionary &r_result) const {
 	Dictionary clipmap;
 	for (int group = 0; group < TerrainVT::GROUP_COUNT; group++) {
 		const TerrainVT::ChannelGroup channel = TerrainVT::ChannelGroup(group);
+		const Terrain3DClipmapLayer::Settings resolved_settings = _clipmap_settings(channel);
 		const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
 		Dictionary entry;
+		// Keep requested defaults separate from the runtime layer fields below: an unallocated group
+		// has a resolved shape for the editor to show, but no runtime levels, texture or queued work.
+		Dictionary resolved_shape;
+		resolved_shape["units"] = resolved_settings.shape.units;
+		resolved_shape["size"] = resolved_settings.shape.size;
+		resolved_shape["base_world"] = resolved_settings.shape.base_world;
+		entry["resolved_shape"] = resolved_shape;
 		entry["configured"] = layer != nullptr && layer->is_configured();
 		entry["selected"] = _vt.delivery.group_uses(channel, TerrainVT::Delivery::Clipmap);
 		entry["source"] = layer != nullptr ? layer->get_source_name() : String("none");
@@ -484,9 +496,10 @@ Dictionary Terrain3D::get_clipmap_layout_preview() const {
 	_vt.clipmap_preview_computed++;
 	const Vector2 focus = v3v2(get_clipmap_target_position());
 	result["focus"] = focus;
-	result["size"] = _vt.clipmap_size;
-	result["units_setting"] = _vt.clipmap_units;
-	result["base_world"] = _vt.clipmap_base_world;
+	result["quality"] = _vt.clipmap_quality;
+	result["size"] = _vt.clipmap_legacy_shape.size;
+	result["units_setting"] = _vt.clipmap_legacy_shape.units;
+	result["base_world"] = _vt.clipmap_legacy_shape.base_world;
 	result["budget_texels"] = _vt.clipmap_budget_texels;
 	result["implementation"] = String(TerrainClipmap::implementation_name(_vt.clipmap_implementation));
 	result["implementation_hint"] = String(TerrainClipmap::implementation_hint());

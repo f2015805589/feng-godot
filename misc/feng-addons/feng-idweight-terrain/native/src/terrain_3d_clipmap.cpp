@@ -110,6 +110,11 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 		LOG(ERROR, "Clipmap baked format ", int(config.baked_format), " has no producer; using RGBAH");
 		config.baked_format = Image::FORMAT_RGBAH;
 	}
+	TerrainClipmap::Shape shape;
+	shape.size = config.size;
+	shape.units = config.levels;
+	shape.base_world = config.base_world;
+	const TerrainClipmap::Ladder ladder = TerrainClipmap::ladder_of(shape);
 	if (!_levels.empty() && config.size == _config.size && config.levels == int(_levels.size()) &&
 			config.channels == _config.channels && config.format == _config.format &&
 			config.baked_channels == _config.baked_channels && config.baked_format == _config.baked_format &&
@@ -119,11 +124,12 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 			" levels, ", config.channels, " channels, ", config.baked_channels, " baked, base ",
 			config.base_world, " m");
 	_config = config;
+	_ladder = ladder;
 	_levels.assign(size_t(config.levels), Level());
 	for (int level = 0; level < config.levels; level++) {
 		Level &entry = _levels[size_t(level)];
-		entry.world_size = config.base_world * real_t(int64_t(1) << level);
-		entry.texel_world = entry.world_size / real_t(config.size);
+		entry.world_size = _ladder.unit_world_size(level);
+		entry.texel_world = _ladder.texel_world(level);
 		entry.center = Vector2();
 		entry.ring = Vector2i();
 		entry.texels.assign(size_t(config.size) * size_t(config.size) * size_t(config.channels), 0.f);
@@ -164,6 +170,7 @@ void Terrain3DClipmap::clear() {
 	_layer_image.unref();
 	_config.size = 0;
 	_config.levels = 0;
+	_ladder = TerrainClipmap::Ladder();
 	_has_focus = false;
 	_shape_serial++;
 	_state_stamp++;

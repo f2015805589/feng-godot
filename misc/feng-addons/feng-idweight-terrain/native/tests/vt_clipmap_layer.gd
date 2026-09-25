@@ -184,11 +184,9 @@ func paint_material(center: Vector3, asset_id: int) -> void:
 	painter.operate(center, 0.0)
 	painter.stop_operation()
 
-# The dock's own shape display, which is where a user reads the ladder. The panel takes its numbers from
-# `get_vt_settings()`, so the shipped defaults have to arrive there and the controls have to be able to
-# *show* them: a base-extent spin whose range started at 1 m - as this worktree's did - would display a
-# value the layer does not use, which is a silent truncation in the UI rather than in the shape. The
-# hint is asserted to name both endpoints, and not to warn, on the shipped shape.
+# The dock shows the selected quality and the resolved Material and Height ladders while keeping only
+# Quality and Implementation as user-facing clipmap choices. The runtime shape summary comes from the
+# native report so the dock cannot invent a second default table.
 func check_dock_shape() -> void:
 	var window: Window = load(EDITOR_SCRIPT).new()
 	window.initialize(null)
@@ -202,23 +200,51 @@ func check_dock_shape() -> void:
 		clipmap_item.select(0)
 		window.hierarchy.item_selected.emit()
 		await process_frame
-		require(window.clipmap_base_spin != null and
-				is_equal_approx(float(window.clipmap_base_spin.value), 0.25),
-				"the dock shows the ladder's 0.25 m base extent (got %s)" % str(
-						window.clipmap_base_spin.value if window.clipmap_base_spin != null else "none"))
-		require(window.clipmap_levels_spin != null and int(window.clipmap_levels_spin.value) == LADDER_UNITS,
-				"the dock shows the ladder's %d units (got %s)" % [LADDER_UNITS, str(
-						window.clipmap_levels_spin.value if window.clipmap_levels_spin != null else "none")])
-		require(window.clipmap_size_spin != null and int(window.clipmap_size_spin.value) == 256,
-				"and its 256-texel unit edge")
+		require(window.clipmap_quality_option != null and
+				window.clipmap_quality_option.get_item_text(window.clipmap_quality_option.selected) == "Standard",
+				"the dock exposes the Standard profile as the default")
 		var hint := str(window.clipmap_hint.text)
-		require(hint.contains("1024.0 texels/m") and hint.contains("1.000 at the outer edge"),
-				"the dock's hint states both endpoints of the ladder: %s" % hint)
-		require(not hint.contains("does not span"),
-				"and does not call the shipped shape a truncated ladder: %s" % hint)
-		print("CLIPMAP_LAYER_DOCK base=%s levels=%s size=%s hint=%s" % [
-				str(window.clipmap_base_spin.value), str(window.clipmap_levels_spin.value),
-				str(window.clipmap_size_spin.value), hint.replace("\n", " | ")])
+		require(hint.contains("Material resolved: 256 texels") and hint.contains("Height resolved: 128 texels"),
+				"the dock summarizes the two derived Standard shapes: %s" % hint)
+		var clipmap_report: Dictionary = terrain.get_vt_settings().get("clipmap", {})
+		var unused_height: Dictionary = clipmap_report.get("height", {})
+		var unused_height_shape: Dictionary = unused_height.get("resolved_shape", {})
+		require(not bool(unused_height.get("configured", true)) and
+				int(unused_height.get("units", -1)) == -1 and
+				int(unused_height_shape.get("size", 0)) == 128 and
+				int(unused_height_shape.get("units", 0)) == 7 and
+				is_equal_approx(float(unused_height_shape.get("base_world", 0.0)), 2.0),
+				"an unallocated group keeps runtime units empty while publishing its resolved profile separately")
+		var inspector_clipmap_count := 0
+		var has_quality := false
+		var has_implementation := false
+		var legacy_size_is_storage_only := false
+		for property: Dictionary in terrain.get_property_list():
+			var property_name := str(property.get("name", ""))
+			var usage := int(property.get("usage", 0))
+			if property_name == "vt_clipmap_material_size":
+				legacy_size_is_storage_only = (usage & PROPERTY_USAGE_STORAGE) != 0 and \
+						(usage & PROPERTY_USAGE_NO_EDITOR) != 0 and (usage & PROPERTY_USAGE_EDITOR) == 0
+			if (usage & PROPERTY_USAGE_EDITOR) == 0 or not property_name.begins_with("vt_clipmap_"):
+				continue
+			inspector_clipmap_count += 1
+			has_quality = has_quality or property_name == "vt_clipmap_quality"
+			has_implementation = has_implementation or property_name == "vt_clipmap_implementation"
+		require(inspector_clipmap_count == 2 and has_quality and has_implementation,
+				"only Quality and Implementation remain as clipmap Inspector fields (count=%d)" % inspector_clipmap_count)
+		require(legacy_size_is_storage_only,
+			"a removed shape field remains serialized for old scenes but is hidden from the Inspector")
+		terrain.vt_clipmap_material_size = 64
+		require(int(terrain.get_vt_clipmap_group_shape(0).get("size", 0)) == 64,
+			"a saved legacy group shape still applies while that scene is being migrated")
+		# Selecting the currently active profile is the explicit migration action for old shape aliases.
+		terrain.vt_clipmap_quality = Terrain3D.CLIPMAP_QUALITY_STANDARD
+		require(int(terrain.get_vt_clipmap_group_shape(0).get("size", 0)) == 256 and
+				int(terrain.get_vt_clipmap_group_shape(1).get("size", 0)) == 128,
+			"selecting the active profile clears legacy shape overrides back to the group defaults")
+		print("CLIPMAP_LAYER_DOCK quality=%s hint=%s inspector_fields=%d" % [
+				window.clipmap_quality_option.get_item_text(window.clipmap_quality_option.selected),
+				hint.replace("\n", " | "), inspector_clipmap_count])
 	window.queue_free()
 	await process_frame
 

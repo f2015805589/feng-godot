@@ -34,6 +34,7 @@
 #include <godot_cpp/variant/packed_vector4_array.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 
 #include "logger.h"
@@ -76,7 +77,7 @@ int Terrain3DClipmapAtlas::get_block_count() const {
 // distance unit `r`'s shell stands at. Unit `r`'s blocks are `block_size` texels of *that* span, so the
 // texel count a unit costs is constant and only its reach grows.
 real_t Terrain3DClipmapAtlas::_block_world_of_ring(const int p_ring) const {
-	return _config.base_world * real_t(int64_t(1) << CLAMP(p_ring, 0, 30));
+	return _ladder.unit_world_size(p_ring);
 }
 
 int Terrain3DClipmapAtlas::_texels_of_ring(const int p_ring) const {
@@ -85,7 +86,7 @@ int Terrain3DClipmapAtlas::_texels_of_ring(const int p_ring) const {
 }
 
 real_t Terrain3DClipmapAtlas::_texel_of_ring(const int p_ring) const {
-	return _block_world_of_ring(p_ring) / real_t(_texels_of_ring(p_ring));
+	return _ladder.texel_world(p_ring);
 }
 
 Vector2 Terrain3DClipmapAtlas::_grid_origin_of_ring(const int p_ring, const Vector2 &p_focus) const {
@@ -484,12 +485,16 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	}
 	config.global_texels = CLAMP(config.global_texels, 1, config.block_size);
 	config.blocks_per_frame = CLAMP(config.blocks_per_frame, 1, 64);
+	TerrainClipmap::Shape shape;
+	shape.size = config.block_size;
+	shape.units = config.rings;
+	shape.base_world = config.base_world;
+	const TerrainClipmap::Ladder ladder = TerrainClipmap::ladder_of(shape);
 	if (config.global_world <= 0.f) {
 		// The global block covers what the grid does not: the coarsest unit's own 3x3 square, grown so
 		// the fragment has a minimal-resolution answer well past it. It is produced once and sampled by
 		// a reader that is outside every unit's arrangement.
-		const real_t grid_reach = 1.5f * config.base_world *
-				real_t(int64_t(1) << CLAMP(config.rings - 1, 0, 30));
+		const real_t grid_reach = 1.5f * ladder.unit_world_size(config.rings - 1);
 		config.global_world = grid_reach * 4.f;
 	}
 	if (!_cells.empty() && config.block_size == _config.block_size && config.rings == _config.rings &&
@@ -504,6 +509,7 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 			" texels, ", config.rings, " rings, ", config.channels, " channels, block world ",
 			config.base_world, " m");
 	_config = config;
+	_ladder = ladder;
 	_global_world = config.global_world;
 	_build_layout();
 	_assign_slots(_items, _packed);
@@ -514,6 +520,7 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	_block_values.assign(size_t(config.block_size) * size_t(config.block_size), 0.f);
 	_row_values.assign(size_t(config.block_size) + 1, 0.f);
 	_jobs.clear();
+	_pending_uploads.clear();
 	_bake_rects.clear();
 	_timeline.clear();
 	_free_textures();
@@ -533,6 +540,7 @@ void Terrain3DClipmapAtlas::clear() {
 	_slots.clear();
 	_spare_slots.clear();
 	_jobs.clear();
+	_pending_uploads.clear();
 	_packed.clear();
 	_items.clear();
 	_bake_rects.clear();
@@ -546,6 +554,7 @@ void Terrain3DClipmapAtlas::clear() {
 	_global_produced = false;
 	_config.block_size = 0;
 	_config.rings = 0;
+	_ladder = TerrainClipmap::Ladder();
 	_has_focus = false;
 	_last_focus = Vector2();
 	_shape_serial++;
@@ -741,18 +750,20 @@ bool Terrain3DClipmapAtlas::acknowledge_bake(const TerrainClipmap::BakeRect &p_r
 // the block's own bytes and nothing else.
 void Terrain3DClipmapAtlas::_upload_rect(const int p_staging, const Rect2i &p_rect, const int p_texels,
 		const int p_channel, const std::vector<float> &p_values) {
-	RenderingServer *server = RenderingServer::get_singleton();
-	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
-	if (rd == nullptr || !_texture_rd.is_valid() || p_staging < 0 || p_texels <= 0) {
+	if (p_staging < 0 || p_texels <= 0) {
 		return;
 	}
 	if (p_staging >= int(_staging_rd.size())) {
 		return;
 	}
 	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
-	PackedByteArray bytes;
-	bytes.resize(int64_t(p_texels) * int64_t(p_texels) * int64_t(bytes_per_texel));
-	uint8_t *dst = bytes.ptrw();
+	PendingUpload upload;
+	upload.staging = p_staging;
+	upload.rect = p_rect;
+	upload.texels = p_texels;
+	upload.channel = CLAMP(p_channel, 0, _texture_layers - 1);
+	upload.bytes.resize(size_t(p_texels) * size_t(p_texels) * size_t(bytes_per_texel));
+	uint8_t *dst = upload.bytes.data();
 	if (_config.format == Image::FORMAT_RF) {
 		float *values = reinterpret_cast<float *>(dst);
 		for (int64_t index = 0; index < int64_t(p_texels) * int64_t(p_texels); index++) {
@@ -764,18 +775,47 @@ void Terrain3DClipmapAtlas::_upload_rect(const int p_staging, const Rect2i &p_re
 			dst[index] = uint8_t(CLAMP(value, 0.f, 1.f) * 255.f + 0.5f);
 		}
 	}
-	if (rd->texture_update(_staging_rd[size_t(p_staging)], 0, bytes) != OK) {
-		LOG(WARN, "Clipmap atlas staging update failed (", get_source_name(), ")");
+	_pending_uploads.push_back(std::move(upload));
+}
+
+void Terrain3DClipmapAtlas::publish_pending_uploads() {
+	if (_pending_uploads.empty()) {
 		return;
 	}
-	if (rd->texture_copy(_staging_rd[size_t(p_staging)], _texture_rd,
-				Vector3(0, 0, 0), Vector3(p_rect.position.x, p_rect.position.y, 0),
-				Vector3(p_texels, p_texels, 1), 0, 0, 0, CLAMP(p_channel, 0, _texture_layers - 1)) != OK) {
-		LOG(WARN, "Clipmap atlas block copy failed (", get_source_name(), ")");
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr || !_texture_rd.is_valid()) {
 		return;
 	}
-	_upload_bytes += uint64_t(p_texels) * uint64_t(p_texels) * uint64_t(bytes_per_texel);
-	_block_uploads++;
+	std::vector<PendingUpload> retry;
+	retry.reserve(_pending_uploads.size());
+	for (PendingUpload &upload : _pending_uploads) {
+		if (upload.staging < 0 || upload.staging >= int(_staging_rd.size()) ||
+				!_staging_rd[size_t(upload.staging)].is_valid()) {
+			retry.push_back(std::move(upload));
+			continue;
+		}
+		PackedByteArray bytes;
+		bytes.resize(int64_t(upload.bytes.size()));
+		if (!upload.bytes.empty()) {
+			memcpy(bytes.ptrw(), upload.bytes.data(), upload.bytes.size());
+		}
+		if (rd->texture_update(_staging_rd[size_t(upload.staging)], 0, bytes) != OK) {
+			LOG(WARN, "Clipmap atlas staging update failed (", get_source_name(), ")");
+			retry.push_back(std::move(upload));
+			continue;
+		}
+		if (rd->texture_copy(_staging_rd[size_t(upload.staging)], _texture_rd,
+				Vector3(0, 0, 0), Vector3(upload.rect.position.x, upload.rect.position.y, 0),
+				Vector3(upload.texels, upload.texels, 1), 0, 0, 0, upload.channel) != OK) {
+			LOG(WARN, "Clipmap atlas block copy failed (", get_source_name(), ")");
+			retry.push_back(std::move(upload));
+			continue;
+		}
+		_upload_bytes += uint64_t(upload.bytes.size());
+		_block_uploads++;
+	}
+	_pending_uploads = std::move(retry);
 }
 
 // ---- Production --------------------------------------------------------------------------------
@@ -1054,7 +1094,9 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 	bool relabelled = false;
 	for (int ring = 0; ring < _config.rings; ring++) {
 		_ring_origin[size_t(ring)] = _ring_start(ring, p_focus);
-		_ring_phase_value[size_t(ring)] = _ring_phase(ring, p_focus);
+		const Vector2i phase = _ring_phase(ring, p_focus);
+		const bool phase_changed = _ring_phase_value[size_t(ring)] != phase;
+		_ring_phase_value[size_t(ring)] = phase;
 		// The step is in the unit's *own* blocks: a unit whose blocks are `base_world * 2^r` metres
 		// relabels when the focus crosses one of them, so the fine units follow the camera closely and
 		// the coarse ones hardly ever move - which is the whole reason a shell only ever reloads its
@@ -1075,6 +1117,14 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 			_grid_step = step;
 			_relabel_ring(ring, first);
 			relabelled = true;
+		} else if (phase_changed) {
+			// The block content is unchanged, but its toroidal origin moved within the block. Keep
+			// each cell's address in step with the shader phase without relabelling or reloading it.
+			for (Cell &cell : _cells) {
+				if (cell.ring == ring) {
+					cell.offset = phase;
+				}
+			}
 		}
 	}
 	_has_focus = true;
@@ -1155,6 +1205,34 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 	}
 	(void)p_budget_texels;
 	return produced;
+}
+
+bool Terrain3DClipmapAtlas::needs_update_at(const Vector2 &p_focus) const {
+	if (!is_configured() || _source == nullptr) {
+		return false;
+	}
+	// An upload that the render-thread publisher could not complete must stay scheduled; otherwise a
+	// failed device copy could leave a cell marked current forever with old atlas contents.
+	if (!_has_focus || !_jobs.empty() || !_pending_uploads.empty()) {
+		return true;
+	}
+	for (const Cell &cell : _cells) {
+		if (!cell.current && cell.pending_slot < 0) {
+			return true;
+		}
+	}
+	for (int ring = 0; ring < _config.rings; ring++) {
+		const size_t index = size_t(ring);
+		const Vector2 origin = _ring_start(ring, p_focus);
+		const Vector2i phase = _ring_phase(ring, p_focus);
+		const real_t block_world = _block_world_of_ring(ring);
+		const Vector2i step(int64_t(Math::round(origin.x / block_world)),
+				int64_t(Math::round(origin.y / block_world)));
+		if (_ring_step[index] != step || _ring_phase_value[index] != phase) {
+			return true;
+		}
+	}
+	return false;
 }
 
 int Terrain3DClipmapAtlas::invalidate_rect(const Rect2 &p_world) {

@@ -82,6 +82,12 @@ public:
 	// One update: re-derive what the focus implies, drain it under the budget, publish what drained.
 	// Returns the channel texels produced.
 	virtual int update(const Vector2 &p_focus, const int p_budget_texels) = 0;
+	// Whether update has work for this focus. The facade uses this to avoid scheduling idle worker
+	// tasks, while each storage layout keeps its own movement and pending-work test.
+	virtual bool needs_update_at(const Vector2 &p_focus) const = 0;
+	// Publish device work produced by update(). Implementations whose device API is render-thread-only
+	// defer it here; the facade calls this before exposing the new addressing state.
+	virtual void publish_pending_uploads() {}
 	// The source changed under a world rect: the units the rect touches stop being readable and are
 	// queued for re-production. Returns how many rect jobs were queued.
 	virtual int invalidate_rect(const Rect2 &p_world) = 0;
@@ -128,8 +134,8 @@ public:
 	// names. The material binds it through one path (`arm["implementation"]` decides which names), so
 	// the two arms are plumbing rather than two owners.
 	virtual Dictionary get_arm() const = 0;
-	// Address-only view for a moving LOD arm. The LOD ring overrides this to avoid building its
-	// outstanding-rectangle and texture tables when only centre/offset/validity changed.
+	// Address-only view for a moving arm. Implementations may override this to avoid building their
+	// storage and content tables when only centre/offset/validity changed.
 	virtual Dictionary get_address_arm() const {
 		const Dictionary arm = get_arm();
 		Dictionary result;
