@@ -57,6 +57,15 @@ const ArrayCodec ARRAY_CODECS[] = {
 	{"ASTC 8x8 HDR RGBA", Image::COMPRESS_ASTC, Image::USED_CHANNELS_RGBA, true, Image::ASTC_FORMAT_8x8},
 };
 static_assert(sizeof(ARRAY_CODECS) / sizeof(ArrayCodec) == Terrain3DAssets::ARRAY_COMPRESSION_MAX);
+
+// True when this build ships the codec's encoder (cvtt for BPTC, squish for
+// S3TC, astcenc for ASTC). The engine keeps the encoder function pointers
+// private, so availability is probed by compressing a tiny image once per
+// update instead of discovering the failure layer by layer.
+bool encoder_available(const ArrayCodec &p_codec) {
+	Ref<Image> probe = Image::create_empty(4, 4, false, p_codec.hdr ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8);
+	return probe.is_valid() && probe->compress_from_channels(p_codec.mode, p_codec.channels, p_codec.block) == OK;
+}
 } // namespace
 
 void Terrain3DAssets::_update_texture_files() {
@@ -76,11 +85,19 @@ void Terrain3DAssets::_update_texture_files() {
 
 	// A Terrain3DAssets resource manages this terrain's two channel arrays.
 	// All layers follow explicit authoring settings, independent of imports.
-	const ArrayCodec &codec = ARRAY_CODECS[_texture_array_compression];
+	// When the build lacks the selected codec's encoder (e.g. no cvtt for BC7),
+	// fall back to the uncompressed row: the arrays still upload and render
+	// instead of the update aborting onto empty or stale arrays.
+	TextureArrayCompression effective_compression = _texture_array_compression;
+	if (effective_compression != ARRAY_UNCOMPRESSED && !encoder_available(ARRAY_CODECS[effective_compression])) {
+		LOG(WARN, "Encoder for ", ARRAY_CODECS[effective_compression].name, " is unavailable in this build; using Uncompressed instead.");
+		effective_compression = ARRAY_UNCOMPRESSED;
+	}
+	const ArrayCodec &codec = ARRAY_CODECS[effective_compression];
 	Dictionary next_cache;
 	PackedStringArray next_identity;
 	auto prepare_layers = [&](bool p_normal, TypedArray<Image> &r_layers) -> bool {
-		Image::Format working_format = (_texture_array_compression != ARRAY_UNCOMPRESSED && codec.hdr) ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
+		Image::Format working_format = (effective_compression != ARRAY_UNCOMPRESSED && codec.hdr) ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8;
 		Vector2i size = _texture_array_size > 0 ? V2I(_texture_array_size) : V2I_ZERO;
 		for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
 			Ref<Texture2D> texture;
@@ -113,7 +130,7 @@ void Terrain3DAssets::_update_texture_files() {
 		}
 		for (int i = 0; i < r_layers.size(); i++) {
 			Ref<Image> source = r_layers[i];
-			String key = String::num_int64(size.x) + ":" + String::num_int64(size.y) + ":" + String::num_int64(_texture_array_compression) + ":" + String::num_int64(_texture_array_mipmaps) + ":" + String::num_int64(p_normal) + ":" + String::num_int64(working_format);
+			String key = String::num_int64(size.x) + ":" + String::num_int64(size.y) + ":" + String::num_int64(effective_compression) + ":" + String::num_int64(_texture_array_mipmaps) + ":" + String::num_int64(p_normal) + ":" + String::num_int64(working_format);
 			if (source.is_valid()) {
 				Ref<HashingContext> hash;
 				hash.instantiate();
@@ -149,7 +166,7 @@ void Terrain3DAssets::_update_texture_files() {
 				LOG(ERROR, "Cannot generate texture mipmaps; retaining previous arrays.");
 				return false;
 			}
-			if (_texture_array_compression != ARRAY_UNCOMPRESSED) {
+			if (effective_compression != ARRAY_UNCOMPRESSED) {
 				// Explicit channels keep every array layer in the same format even
 				// when one source happens to have opaque alpha or fewer used channels.
 				if (image->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !image->is_compressed()) {
@@ -187,7 +204,7 @@ void Terrain3DAssets::_update_texture_files() {
 		case Image::COMPRESS_ASTC: feature = codec.hdr ? "astc_hdr" : "astc"; break;
 		default: break;
 	}
-	const bool fallback = _texture_array_compression != ARRAY_UNCOMPRESSED && !RenderingServer::get_singleton()->has_os_feature(feature);
+	const bool fallback = effective_compression != ARRAY_UNCOMPRESSED && !RenderingServer::get_singleton()->has_os_feature(feature);
 	TypedArray<Image> albedo_upload = albedo_layers;
 	TypedArray<Image> normal_upload = normal_layers;
 	if (fallback) {
@@ -224,7 +241,7 @@ void Terrain3DAssets::_update_texture_files() {
 	_texture_array_info["layers"] = albedo_layers.size();
 	_texture_array_info["albedo_size"] = albedo_first->get_size();
 	_texture_array_info["normal_size"] = normal_first->get_size();
-	_texture_array_info["format"] = _texture_array_compression == ARRAY_UNCOMPRESSED ? (albedo_first->get_format() == Image::FORMAT_RGBAF ? "RGBAF" : "RGBA8") : codec.name;
+	_texture_array_info["format"] = effective_compression == ARRAY_UNCOMPRESSED ? (albedo_first->get_format() == Image::FORMAT_RGBAF ? "RGBAF" : "RGBA8") : codec.name;
 	_texture_array_info["albedo_image_format"] = albedo_first->get_format();
 	_texture_array_info["normal_image_format"] = normal_first->get_format();
 	_texture_array_info["channel_warning"] = codec.channels == Image::USED_CHANNELS_RGBA ? "" : "This format drops channels, including packed height/roughness in alpha. RGBA formats preserve the complete terrain material.";
@@ -234,6 +251,7 @@ void Terrain3DAssets::_update_texture_files() {
 	Ref<Image> normal_gpu = normal_upload[0];
 	_texture_array_info["gpu_bytes"] = (albedo_gpu->get_data().size() + normal_gpu->get_data().size()) * albedo_upload.size();
 	_texture_array_info["gpu_fallback"] = fallback;
+	_texture_array_info["encoder_missing"] = effective_compression != _texture_array_compression;
 	_texture_array_info["albedo_upload_format"] = albedo_gpu->get_format();
 	_texture_array_info["normal_upload_format"] = normal_gpu->get_format();
 	_texture_array_info["gpu_note"] = fallback ? "GPU does not support this codec; decoded upload uses uncompressed memory." : "Native GPU format";

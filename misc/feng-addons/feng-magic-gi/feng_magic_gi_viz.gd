@@ -15,8 +15,6 @@ extends RefCounted
 const MAX_SH_VIZ_PROBES := 256
 const SH_VIZ_SIDES := 12   # rings and sectors of the reconstruction mesh
 
-const Baker = preload("feng_magic_gi_baker.gd")
-
 static func build(volume: FMagicGIVolume) -> Node3D:
 	var root := Node3D.new()
 	root.name = "_FMagicGIViz"
@@ -27,7 +25,6 @@ static func rebuild(volume: FMagicGIVolume, root: Node3D) -> void:
 	for child in root.get_children():
 		child.queue_free()
 		root.remove_child(child)
-	root.visible = true
 	_build_box(volume, root)
 	if volume.show_probes:
 		_build_probes(volume, root)
@@ -90,29 +87,12 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, local))
 		var color := Color(0.35, 0.35, 0.35)
 		if has_data:
-			# Average radiance = c0 * Y00; clamp to displayable [0,1].
-			color = Color(volume.bake_data.sh[i * 27] * 0.2820947918,
-					volume.bake_data.sh[i * 27 + 1] * 0.2820947918,
-					volume.bake_data.sh[i * 27 + 2] * 0.2820947918).clamp()
+			color = volume.bake_data.dc_color(i)
 		mm.set_instance_color(i, color)
 	var node := MultiMeshInstance3D.new()
 	node.name = "_Probes"
 	node.multimesh = mm
 	root.add_child(node)
-
-## Evaluates baked radiance SH in a direction (no cosine convolution): what the
-## probe "sees" arriving from d.
-static func _sh_radiance(sh: PackedFloat32Array, probe_index: int, dir: Vector3) -> Vector3:
-	var y := Baker.sh_basis(dir)
-	var base := probe_index * 27
-	var r := 0.0
-	var g := 0.0
-	var b := 0.0
-	for k in 9:
-		r += sh[base + k * 3] * y[k]
-		g += sh[base + k * 3 + 1] * y[k]
-		b += sh[base + k * 3 + 2] * y[k]
-	return Vector3(r, g, b)
 
 static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
 	var data := volume.bake_data
@@ -148,13 +128,13 @@ static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float) -> Arr
 	for ring in rings + 1:
 		for sector in sectors:
 			var dir := _ring_dir(ring, rings, sector, sectors)
-			scale = maxf(scale, _sh_radiance(data.sh, probe_index, dir).length())
+			scale = maxf(scale, data.radiance(probe_index, dir).length())
 	if scale <= 0.0:
 		scale = 1.0
 	for ring in rings + 1:
 		for sector in sectors:
 			var dir := _ring_dir(ring, rings, sector, sectors)
-			var e := _sh_radiance(data.sh, probe_index, dir)
+			var e := data.radiance(probe_index, dir)
 			var magnitude := e.length() / scale
 			verts.append(dir * (radius * (0.25 + 0.75 * magnitude)))
 			colors.append(Color(maxf(e.x, 0.0), maxf(e.y, 0.0), maxf(e.z, 0.0)) / scale)

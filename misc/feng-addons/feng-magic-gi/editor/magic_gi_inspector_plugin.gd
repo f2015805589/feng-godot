@@ -22,6 +22,10 @@ func _parse_begin(_object: Object) -> void:
 	if volume.has_bake():
 		info.text = "%d probes baked (v%d)." % [
 			volume.probe_count(), volume.bake_data.bake_version]
+	elif volume.bake_data != null:
+		info.text = "Stale bake (%d x %d x %d) - re-bake for %d probes at %d px/face." % [
+			volume.bake_data.grid_dims.x, volume.bake_data.grid_dims.y,
+			volume.bake_data.grid_dims.z, volume.probe_count(), volume.bake_resolution]
 	else:
 		info.text = "No bake yet: %d probes at %d px/face." % [
 			volume.probe_count(), volume.bake_resolution]
@@ -34,11 +38,14 @@ func _on_bake_pressed(volume: FMagicGIVolume, button: Button) -> void:
 	_baking = true
 	button.text = "Baking..."
 	button.disabled = true
-	# Async: the bake awaits one rendered frame per face.
+	# Async: the bake awaits one rendered frame per face. The inspector may be
+	# rebuilt (or the volume deleted) while it runs, so both refs are re-checked.
 	var ok: bool = await volume.bake()
 	_baking = false
-	button.text = "Bake Probes"
-	button.disabled = false
+	if is_instance_valid(button):
+		button.text = "Bake Probes"
+		button.disabled = false
 	if not ok:
 		push_warning("FMagicGI: bake did not run (volume not in tree?).")
-	EditorInterface.inspect_object(volume)
+	if is_instance_valid(volume):
+		EditorInterface.inspect_object(volume)

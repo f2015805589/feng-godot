@@ -26,11 +26,15 @@ static var _bake_counter := 0
 	set(value):
 		size = value
 		_rebuild_probes()
+		Runtime.publish(self)
 ## Probes per axis. Set an axis to 1 for a flat single-probe layer.
 @export var probe_dims := Vector3i(4, 4, 4):
 	set(value):
 		probe_dims = value.clampi(1, 64)
 		_rebuild_probes()
+		# Re-dimming invalidates the current bake (has_bake() checks dims), so the
+		# runtime is republished: the stale field must stop feeding the pipeline.
+		Runtime.publish(self)
 ## Cubemap edge length in pixels captured per probe face at bake time.
 @export var bake_resolution := 32:
 	set(value):
@@ -67,6 +71,7 @@ static var _bake_counter := 0
 var probe_positions := PackedVector3Array()
 
 var _viz: Node3D
+var _viz_queued := false
 var _baking := false
 
 func _enter_tree() -> void:
@@ -77,8 +82,11 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	Runtime.unregister(self)
 
+## A bake counts only while it still describes the current probe grid: resizing
+## or re-dimming after baking leaves a valid resource that no longer applies,
+## so callers must not sample it as if it were this volume's field.
 func has_bake() -> bool:
-	return bake_data != null and bake_data.is_valid()
+	return bake_data != null and bake_data.fits(probe_dims)
 
 func probe_count() -> int:
 	return probe_positions.size()
@@ -90,10 +98,19 @@ func bake() -> bool:
 	if not is_inside_tree() or _baking:
 		return false
 	_baking = true
+	# The probe captures render this world too; the debug meshes would bake
+	# themselves into the field, so the viz is hidden for the run.
+	var viz_was_visible := false
+	if _viz != null:
+		viz_was_visible = _viz.visible
+		_viz.visible = false
 	var baker := Baker.new()
 	var data := await baker.bake_volume(self)
+	if _viz != null:
+		_viz.visible = viz_was_visible
 	_baking = false
 	if data == null:
+		_refresh_viz()
 		return false
 	_bake_counter += 1
 	data.bake_version = _bake_counter
@@ -144,8 +161,18 @@ func _notification(what: int) -> void:
 			bake_data.world_to_grid = world_to_grid_transform()
 			Runtime.publish(self)
 
+## Viz rebuilds are deferred and coalesced: transform notifications and
+## property edits can fire many times a frame while dragging the volume, and
+## each rebuild is O(probes).
 func _refresh_viz() -> void:
-	if not is_inside_tree() or not Engine.is_editor_hint():
+	if _viz_queued or not is_inside_tree() or not Engine.is_editor_hint():
+		return
+	_viz_queued = true
+	call_deferred("_apply_viz")
+
+func _apply_viz() -> void:
+	_viz_queued = false
+	if not is_inside_tree() or not Engine.is_editor_hint() or _baking:
 		return
 	if _viz == null:
 		_viz = Viz.build(self)

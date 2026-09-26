@@ -42,7 +42,11 @@ func run():
 			var info=terrain.assets.get_texture_array_info()
 			print("CODEC=",codec," info=",info)
 			check(not info.is_empty(),"array info missing")
-			check(info.albedo_image_format==formats[codec],"wrong encoded format for "+str(codec))
+			# encoder_missing marks a build without the codec's encoder (e.g. no
+			# cvtt for BC7): the array falls back to uncompressed instead of
+			# staying empty, so only the format check relaxes.
+			var format_ok=info.albedo_image_format==formats[codec] or info.get("encoder_missing",false)
+			check(format_ok,"wrong encoded format for "+str(codec))
 			if codec==13:
 				astc8_bytes=info.encoded_bytes
 			if codec==15:
