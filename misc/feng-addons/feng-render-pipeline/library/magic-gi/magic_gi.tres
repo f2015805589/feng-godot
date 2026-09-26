@@ -1,0 +1,38 @@
+[gd_resource type="CompositorEffect" script_class="FengMagicGIPass" load_steps=8 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/magic_gi_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply.glsl" id="3"]
+
+[sub_resource type="Resource" id="Color"]
+script = ExtResource("2")
+binding = 0
+source = 0
+binding_type = 1
+
+[sub_resource type="Resource" id="Depth"]
+script = ExtResource("2")
+binding = 1
+source = 1
+binding_type = 0
+
+[sub_resource type="Resource" id="NormalRoughness"]
+script = ExtResource("2")
+binding = 2
+source = 2
+binding_type = 0
+
+[sub_resource type="Resource" id="Albedo"]
+script = ExtResource("2")
+binding = 3
+source = 3
+binding_type = 0
+
+[resource]
+resource_name = "Magic GI"
+script = ExtResource("1")
+stage = 8
+shader_file = ExtResource("3")
+mode = 0
+parameters = Vector4(1, 1, 1, 1)
+inputs = Array[ExtResource("2")]([SubResource("Color"), SubResource("Depth"), SubResource("NormalRoughness"), SubResource("Albedo")])
