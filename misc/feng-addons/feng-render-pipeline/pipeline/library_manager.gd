@@ -23,6 +23,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_downsample", "path": "bloom-lite/bloom_downsample.tres", "name": "Bloom Downsample"},
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
+	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI"},
 ]
 
 ## The library entries a fresh pipeline seeds. The rest are templates the Library menu
