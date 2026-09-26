@@ -20,8 +20,9 @@ func _parse_begin(_object: Object) -> void:
 	var info := Label.new()
 	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	if volume.has_bake():
-		info.text = "%d probes baked (v%d)." % [
-			volume.probe_count(), volume.bake_data.bake_version]
+		info.text = "%d/%d probes baked (v%d)." % [
+			volume.bake_data.live_count(), volume.probe_count(),
+			volume.bake_data.bake_version]
 	elif volume.bake_data != null:
 		info.text = "Stale bake (%d x %d x %d) - re-bake for %d probes at %d px/face." % [
 			volume.bake_data.grid_dims.x, volume.bake_data.grid_dims.y,

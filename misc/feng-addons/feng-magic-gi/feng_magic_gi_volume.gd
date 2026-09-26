@@ -39,6 +39,12 @@ static var _bake_counter := 0
 @export var bake_resolution := 32:
 	set(value):
 		bake_resolution = clampi(value, 8, 512)
+## Probe culling reach, in cell spacings: bake keeps only probes within this
+## distance of geometry and drops probes buried in terrain or inside
+## colliders. 0 bakes the full grid.
+@export var bake_coverage := 1.5:
+	set(value):
+		bake_coverage = maxf(value, 0.0)
 ## Extra intensity applied to the indirect light this volume contributes.
 @export var gi_strength := 1.0:
 	set(value):

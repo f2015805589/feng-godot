@@ -11,6 +11,7 @@ extends RefCounted
 ## shader applies at apply time.
 
 const Data = preload("feng_magic_gi_data.gd")
+const Placement = preload("feng_magic_gi_placement.gd")
 
 const FACE_DIRS: Array[Vector3] = [
 	Vector3.RIGHT, Vector3.LEFT, Vector3.UP, Vector3.DOWN, Vector3.FORWARD, Vector3.BACK]
@@ -51,15 +52,22 @@ func bake_volume(volume: FMagicGIVolume) -> Data:
 			var v := 2.0 * (t + 0.5) / size - 1.0
 			weights.append(4.0 / (size * size) / pow(1.0 + u * u + v * v, 1.5))
 
+	var mask := Placement.classify(volume)
+	var slots := Placement.build_slot_map(mask)
+	var live := Placement.live_count(mask)
+
 	var data := Data.new()
 	data.grid_dims = volume.probe_dims
 	data.volume_transform = volume.global_transform
 	data.world_to_grid = volume.world_to_grid_transform()
-	var count := positions.size()
+	data.slot_of_probe = slots
 	data.sh = PackedFloat32Array()
-	data.sh.resize(count * 27)
+	data.sh.resize(live * 27)
 
-	for probe_index in count:
+	for probe_index in positions.size():
+		var slot := slots[probe_index]
+		if slot < 0:
+			continue
 		var probe_pos: Vector3 = positions[probe_index]
 		var coeffs := PackedFloat32Array()
 		coeffs.resize(27)
@@ -98,7 +106,7 @@ func bake_volume(volume: FMagicGIVolume) -> Data:
 			total_w += w
 		var norm := FOUR_PI / (total_w * 6.0)
 		for k in 27:
-			data.sh[probe_index * 27 + k] = coeffs[k] * norm
+			data.sh[slot * 27 + k] = coeffs[k] * norm
 
 	vp.queue_free()
 	return data

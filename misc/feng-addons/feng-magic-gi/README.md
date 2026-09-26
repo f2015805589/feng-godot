@@ -14,9 +14,15 @@ Ramamoorthi & Hanrahan 2001 的辐照度环境贴图卷积权重(π, 2π/3, π/4
    (`link_plugin.ps1` 挂接后,`res://addons/feng-magic-gi/` 可用)。
 2. 场景中创建 **FMagicGIVolume** 节点,调整 `size` 覆盖光照区域,
    `probe_dims` 控制每轴探针数(初版上限 64³)。
-3. 选中 Volume,Inspector 中点 **Bake Probes**:每个探针对场景做 6 面
+3. 选中 Volume,Inspector 中点 **Bake Probes**:每个存活探针对场景做 6 面
    90° 小孔相机捕获(共享世界 SubViewport,`bake_resolution` 为每面分辨率),
    逐像素按立体角权重投影到 SH。烘焙逐帧推进,探针多时会占用编辑器若干秒。
+   烘焙前先按占用情况裁剪布点(`bake_coverage`,单位:格距倍数):埋在
+   地形表面之下或实心几何内的探针、以及离任何几何超过覆盖距离的探针
+   不烘焙;地形用 `Terrain3DData.get_height` 判定(无需碰撞体),其余几何
+   走物理查询(向上射线找"上方楼板"判埋、coverage 球判"邻近")。
+   `bake_coverage = 0` 关闭裁剪退回全量烘焙;一个有效探针都测不出时
+   也退化为全量(如场景无碰撞体)。编辑器 viz 中被裁探针画成小暗点。
 4. 在 FengRenderer 的 Passes 中通过 **Add Pass from Library → Magic GI**
    添加 pass(自动落在 `Post Lighting` 回调;确认顺序在 Lighting 之后)。
    已烘焙且 enabled 的 Volume 会被 `FMagicGIRuntime` 发布,
@@ -34,11 +40,14 @@ Ramamoorthi & Hanrahan 2001 的辐照度环境贴图卷积权重(π, 2π/3, π/4
 
 ## 数据布局
 
-`FMagicGIData.sh`:每探针 27 个 float32,系数主序 `c0r,c0g,c0b,c1r,...`,
+`FMagicGIData.sh`:每**存活**探针 27 个 float32,系数主序 `c0r,c0g,c0b,c1r,...`,
 基序与 `feng_magic_gi_baker.gd` 的 `sh_basis` 一致
 (Y0, Y1-1(y), Y10(z), Y11(x), Y2-2(xy), Y2-1(yz), Y20(3z²-1), Y21(xz), Y22(x²-y²))。
-打包成 `probe_count*7 × 1` 的 RGBA32F 一行图集传入着色器,
-`texelFetch(sh_atlas, 7*p+k)` 读取。
+`slot_of_probe` 把稠密网格索引映射到稀疏图集槽位(-1 = 被裁,空 = 全量烘焙),
+打包成 `live_count*7 × 1` 的 RGBA32F 一行图集传入着色器,
+另传一张 `dims.x × dims.y*dims.z` 的 R32SINT 索引纹理
+(`texelFetch(index_map, (p % dx, p / dx))` 得槽位),
+被裁角点三线性权重归零后按存活权重归一。
 
 ## 已知限制(初版)
 

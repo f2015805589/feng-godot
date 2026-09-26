@@ -22,6 +22,7 @@ static var _runtime_looked_up := false
 
 var _scene_data = null
 var _sh_texture := RID()
+var _index_texture := RID()
 var _sh_version := -1
 var _ubo := RID()
 var _frame_strength := 1.0
@@ -81,6 +82,19 @@ func _ensure_resources(rd: RenderingDevice, data, version: int) -> bool:
 		if not _sh_texture.is_valid():
 			_report("Could not upload the SH atlas texture.")
 			return false
+		if _index_texture.is_valid():
+			rd.free_rid(_index_texture)
+			_index_texture = RID()
+		var dims: Vector3i = data.grid_dims
+		var index_format := RDTextureFormat.new()
+		index_format.format = RenderingDevice.DATA_FORMAT_R32_SINT
+		index_format.width = dims.x
+		index_format.height = dims.y * dims.z
+		index_format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+		_index_texture = rd.texture_create(index_format, view, [data.make_index_bytes()])
+		if not _index_texture.is_valid():
+			_report("Could not upload the probe index map.")
+			return false
 		_sh_version = version
 	return true
 
@@ -123,6 +137,13 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		atlas.add_id(_sh_texture)
 		uniforms.append(atlas)
 		binding_data["textures"].append(_sh_texture)
+		var index := RDUniform.new()
+		index.binding = 6
+		index.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		index.add_id(_sampler)
+		index.add_id(_index_texture)
+		uniforms.append(index)
+		binding_data["textures"].append(_index_texture)
 	var params := RDUniform.new()
 	params.binding = 5
 	params.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
@@ -135,6 +156,9 @@ func _cleanup(rd: RenderingDevice) -> void:
 		if _sh_texture.is_valid():
 			rd.free_rid(_sh_texture)
 			_sh_texture = RID()
+		if _index_texture.is_valid():
+			rd.free_rid(_index_texture)
+			_index_texture = RID()
 		if _ubo.is_valid():
 			rd.free_rid(_ubo)
 			_ubo = RID()

@@ -79,15 +79,22 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 	mm.use_colors = true
 	mm.mesh = sphere
 	mm.instance_count = count
-	var has_data := volume.has_bake()
+	var data := volume.bake_data if volume.has_bake() else null
 	for i in count:
 		# probe_positions is world space; the viz node is a volume child, so
 		# convert through the inverse transform.
 		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
-		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, local))
 		var color := Color(0.35, 0.35, 0.35)
-		if has_data:
-			color = volume.bake_data.dc_color(i)
+		var s := 1.0
+		if data != null:
+			if data.is_live(i):
+				color = data.dc_color(i)
+			else:
+				# Culled probe (buried or far from geometry): small dark ghost.
+				color = Color(0.08, 0.10, 0.14)
+				s = 0.4
+		var scale_basis := Basis.from_scale(Vector3.ONE * s)
+		mm.set_instance_transform(i, Transform3D(scale_basis, local))
 		mm.set_instance_color(i, color)
 	var node := MultiMeshInstance3D.new()
 	node.name = "_Probes"
@@ -102,6 +109,8 @@ static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
 	holder.name = "_SH"
 	root.add_child(holder)
 	for i in count:
+		if not data.is_live(i):
+			continue
 		var mesh := _sh_mesh(data, i, radius)
 		var node := MeshInstance3D.new()
 		node.mesh = mesh

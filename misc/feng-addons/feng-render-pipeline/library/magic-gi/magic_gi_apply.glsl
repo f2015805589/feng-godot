@@ -12,6 +12,9 @@ layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness;
 layout(set = 0, binding = 3) uniform sampler2D gbuffer_albedo;
 layout(set = 0, binding = 4) uniform sampler2D sh_atlas;
+// Dense probe index -> atlas slot (-1 = culled). dims.x wide, dims.y*dims.z
+// tall so probe p is texel (p % dims.x, p / dims.x).
+layout(set = 0, binding = 6) uniform usampler2D index_map;
 
 layout(push_constant, std430) uniform Params {
 	vec4 extra; // x = authored strength multiplier (the .tres' parameters)
@@ -86,23 +89,35 @@ void main() {
 	vec3 n_local = normalize(mat3(params.world_to_grid) * normal);
 
 	// Trilinear blend of the irradiance evaluated at the 8 surrounding probes.
+	// Culled probes (-1 slot) contribute nothing; the surviving weights are
+	// renormalized so surface cells keep full-strength light.
 	vec3 base = clamp(floor(g), vec3(0.0), max(dims - vec3(2.0), vec3(0.0)));
 	vec3 f = clamp(g - base, vec3(0.0), vec3(1.0));
 	ivec3 i0 = ivec3(base);
 	vec3 irradiance = vec3(0.0);
+	float weight_sum = 0.0;
 	for (int dz = 0; dz <= 1; dz++) {
 		for (int dy = 0; dy <= 1; dy++) {
 			for (int dx = 0; dx <= 1; dx++) {
 				ivec3 cell = i0 + ivec3(dx, dy, dz);
 				cell = clamp(cell, ivec3(0), ivec3(dims) - 1);
 				int probe = cell.x + cell.y * int(dims.x) + cell.z * int(dims.x * dims.y);
-				vec3 e = irradiance_of_probe(probe, n_local);
+				int slot = int(texelFetch(index_map,
+						ivec2(cell.x, cell.y + cell.z * int(dims.y)), 0).x);
+				if (slot < 0) {
+					continue;
+				}
+				vec3 e = irradiance_of_probe(slot, n_local);
 				float w = ((dx == 0) ? (1.0 - f.x) : f.x)
 						* ((dy == 0) ? (1.0 - f.y) : f.y)
 						* ((dz == 0) ? (1.0 - f.z) : f.z);
 				irradiance += e * w;
+				weight_sum += w;
 			}
 		}
+	}
+	if (weight_sum > 0.0) {
+		irradiance /= weight_sum;
 	}
 
 	vec4 color = imageLoad(color_image, pixel);
