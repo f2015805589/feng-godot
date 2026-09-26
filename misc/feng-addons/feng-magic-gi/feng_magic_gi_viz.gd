@@ -57,11 +57,8 @@ static func _build_box(volume: FMagicGIVolume, root: Node3D) -> void:
 	root.add_child(instance)
 
 static func _cell_extent(volume: FMagicGIVolume) -> float:
-	var dims := Vector3(volume.probe_dims)
-	return minf(minf(
-			volume.size.x / maxf(dims.x - 1.0, 1.0),
-			volume.size.y / maxf(dims.y - 1.0, 1.0)),
-			volume.size.z / maxf(dims.z - 1.0, 1.0))
+	var cell := volume.cell_size()
+	return minf(cell.x, minf(cell.y, cell.z))
 
 static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 	var count := volume.probe_count()

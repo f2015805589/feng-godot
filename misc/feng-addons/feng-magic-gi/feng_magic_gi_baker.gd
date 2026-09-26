@@ -64,6 +64,9 @@ func bake_volume(volume: FMagicGIVolume) -> Data:
 	data.sh = PackedFloat32Array()
 	data.sh.resize(live * 27)
 
+	# The SH is stored in the volume's local frame so a moved or rotated
+	# volume drags its baked field along rigidly.
+	var world_to_local_basis := volume.global_transform.basis.inverse()
 	for probe_index in positions.size():
 		var slot := slots[probe_index]
 		if slot < 0:
@@ -75,9 +78,6 @@ func bake_volume(volume: FMagicGIVolume) -> Data:
 			cam.global_transform = Transform3D(Basis.IDENTITY, probe_pos).looking_at(
 					probe_pos + FACE_DIRS[face], FACE_UPS[face])
 			var basis_now := cam.global_transform.basis
-			# The SH is stored in the volume's local frame so a moved or rotated
-			# volume drags its baked field along rigidly.
-			var world_to_local_basis := volume.global_transform.basis.inverse()
 			vp.render_target_update_mode = SubViewport.UPDATE_ONCE
 			await RenderingServer.frame_post_draw
 			var image := vp.get_texture().get_image()

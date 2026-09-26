@@ -147,6 +147,15 @@ static func _axis_frac(i: int, axis_dims: int) -> float:
 		return 0.0
 	return float(i) / float(axis_dims - 1) - 0.5
 
+## Probe spacing in volume-local units (edge probes span `size`, so the grid
+## has dims-1 cells per axis). Multiply by the world scale for world units.
+func cell_size() -> Vector3:
+	var dims := probe_dims
+	return Vector3(
+			size.x / maxf(dims.x - 1.0, 1.0),
+			size.y / maxf(dims.y - 1.0, 1.0),
+			size.z / maxf(dims.z - 1.0, 1.0))
+
 ## The transform the shader uses: world -> probe-grid index space.
 func world_to_grid_transform() -> Transform3D:
 	var dims := Vector3(probe_dims)

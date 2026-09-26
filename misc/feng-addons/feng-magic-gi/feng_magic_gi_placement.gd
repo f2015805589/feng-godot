@@ -29,11 +29,8 @@ const FLOOR_NORMAL_Y := 0.6
 
 ## Axis-aligned cell spacing of the probe grid in world units.
 static func cell_spacing(volume: FMagicGIVolume) -> Vector3:
-	var dims := Vector3(maxi(volume.probe_dims.x - 1, 1),
-			maxi(volume.probe_dims.y - 1, 1), maxi(volume.probe_dims.z - 1, 1))
 	var scale := volume.global_transform.basis.get_scale().abs()
-	return Vector3(volume.size.x * scale.x / dims.x,
-			volume.size.y * scale.y / dims.y, volume.size.z * scale.z / dims.z)
+	return volume.cell_size() * scale
 
 ## Dense mask in bake index order: 1 = live probe, 0 = culled.
 static func classify(volume: FMagicGIVolume) -> PackedByteArray:

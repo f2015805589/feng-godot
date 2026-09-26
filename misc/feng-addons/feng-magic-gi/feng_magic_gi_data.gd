@@ -79,13 +79,14 @@ func is_valid() -> bool:
 	if slot_of_probe.size() != probe_count():
 		return false
 	var live := 0
-	var used := {}
+	var live_slots := 0
 	for s in slot_of_probe:
 		if s >= 0:
+			live_slots += 1
 			live = maxi(live, s + 1)
-			used[s] = true
-	# Slots must be a contiguous 0..live-1 range so the atlas has no holes.
-	return used.size() == live and sh.size() == live * 27
+	# Slots must be a contiguous 0..live-1 range so the atlas has no holes:
+	# live_slots live entries in [0, live) means exactly that range, once each.
+	return live_slots == live and sh.size() == live * 27
 
 ## True when this bake also describes `dims`: a volume resized after baking keeps
 ## a well-formed resource whose probes no longer match its grid.

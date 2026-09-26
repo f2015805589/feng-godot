@@ -14,7 +14,6 @@ extends FengShaderPass
 ## albedo * irradiance onto the resolved color.
 
 const RUNTIME_SCRIPT := "res://addons/feng-magic-gi/feng_magic_gi_runtime.gd"
-const SH_TEXELS_PER_PROBE := 7
 const UBO_FLOATS := 40  # inv_view_proj, world_to_grid, grid(dims,count), control
 
 static var _runtime_script = null
