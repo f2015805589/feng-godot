@@ -375,18 +375,24 @@ void Terrain3D::__physics_process(const double p_delta) {
 			// awaiting publication gets the scene-thread budget first. Defer the separate fine-detail
 			// demand pump by this one physics tick so its task handoff cannot push the ring's sampler and
 			// address work over budget; the next tick resumes the same detail policy, density, and queue.
+			// The handoff is bounded: under sustained motion the ring has pending work on every tick, so
+			// a predicate alone starves the detail pump for the whole move - which is the layer a
+			// fragment within metres of the camera actually reads. At most one tick is deferred; the
+			// tick after is the detail pump's, whatever the ring still owes.
 			clipmap_state_pending = clipmap_state_pending || clipmap_address_updated;
 			for (int group = 0; group < TerrainVT::GROUP_COUNT && !clipmap_state_pending; group++) {
 				const Terrain3DClipmapLayer *layer = _vt.clipmap_layer[group].get();
 				clipmap_state_pending = layer != nullptr &&
 						(layer->async_update_in_progress() || layer->get_state_stamp() != _vt.clipmap_state[group]);
 			}
-			if (clipmap_state_pending) {
+			if (clipmap_state_pending && _vt.vt_clipmap_detail_deferred_ticks == 0) {
 				_vt.vt_clipmap_detail_deferred = true;
+				_vt.vt_clipmap_detail_deferred_ticks++;
 				_vt.detail_requested_tiles = 0;
 				_vt.detail_starved_tiles = 0;
 				_vt.vt_detail_ms = 0.0;
 			} else {
+				_vt.vt_clipmap_detail_deferred_ticks = 0;
 				const uint64_t detail_update_started = Time::get_singleton()->get_ticks_usec();
 				_update_vt_material_detail();
 				_vt.vt_clipmap_detail_update_ms = double(Time::get_singleton()->get_ticks_usec() - detail_update_started) / 1000.0;

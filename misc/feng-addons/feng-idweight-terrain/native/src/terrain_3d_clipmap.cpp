@@ -145,7 +145,8 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 	// published into: the layer size and the layer count both changed. The baked channels are the
 	// same statement a fortiori - their layers are the levels - so they are freed and reallocated.
 	_jobs.clear();
-	_texture.clear();
+	_pending_uploads.clear();
+	_free_textures();
 	_free_baked();
 	_ensure_baked();
 	// The layers a fresh shape holds are empty, so every level owes a bake: a ring that reported them
@@ -154,7 +155,6 @@ void Terrain3DClipmap::configure(const Config &p_config) {
 	for (int level = 0; level < config.levels; level++) {
 		_queue_bake_rect(level, 0, 0, config.size, config.size);
 	}
-	_layer_image.unref();
 	_has_focus = false;
 	_state_stamp++;
 }
@@ -163,11 +163,11 @@ void Terrain3DClipmap::clear() {
 	_levels.clear();
 	_jobs.clear();
 	_bake_rects.clear();
+	_pending_uploads.clear();
 	_row_values.clear();
 	_content_serial.clear();
-	_texture.clear();
+	_free_textures();
 	_free_baked();
-	_layer_image.unref();
 	_config.size = 0;
 	_config.levels = 0;
 	_ladder = TerrainClipmap::Ladder();
@@ -357,10 +357,13 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 		// texels outside it still describe the world positions they described before - which is the
 		// whole reason the baked layers are indexed logically.
 		_queue_bake_rect(job.level, job.x0, job.y0, job.x1, job.y1);
+		// The upload is the same produced rect: the bytes are packed here, on the producing thread,
+		// and `publish_pending_uploads()` lands them on the device from the caller's thread.
+		_queue_upload_rect(job.level, job.x0, job.y0, job.x1, job.y1);
 	}
-	// A level that had work and has none left is now whole: it becomes valid and is published. A
-	// level the budget left half-produced stays invalid, which is what tells a reader it still
-	// holds the level it replaces.
+	// A level that had work and has none left is now whole: it becomes valid. A level the budget
+	// left half-produced stays invalid, which is what tells a reader it still holds the level it
+	// replaces.
 	for (int level = 0; level < int(_levels.size()); level++) {
 		bool was_queued = false;
 		for (const Job &job : _jobs) {
@@ -382,7 +385,6 @@ int Terrain3DClipmap::update(const Vector2 &p_focus, const int p_budget_texels) 
 		if (!still_queued) {
 			_levels[size_t(level)].valid = true;
 			_last_update_diagnostics.levels_completed++;
-			_publish_level(level);
 			// A level that just became current is a level a reader may now serve, which is addressing
 			// state like any other.
 			_state_stamp++;
@@ -563,60 +565,265 @@ void Terrain3DClipmap::_fill_row(const Job &p_job, const int p_channel, const in
 	_last_update_diagnostics.ring_scatter_ns += clipmap_clock_ns() - scatter_started_ns;
 }
 
+// The device format of one channel's layer: `configure()` admits only RF and R8, so the mapping
+// never sees the multi-component cases a baked channel carries (its own format is a fixed rgba16f
+// the bake shader writes, declared in `configure()`).
+static RenderingDevice::DataFormat _ring_data_format(const Image::Format p_format) {
+	return p_format == Image::FORMAT_R8 ? RenderingDevice::DATA_FORMAT_R8_UNORM
+										: RenderingDevice::DATA_FORMAT_R32_SFLOAT;
+}
+
+// The ring's layered texture is a *device* texture wrapped for the renderer, and the reason is the
+// upload: `texture_copy()` - the call a produced rect is written with - only lands in a destination
+// that declares `CAN_COPY_TO`, which a `RenderingServer` texture never does. The wrapper is what
+// the material arm binds, and the bake producer unwraps it back through `texture_get_rd_texture()`.
+// Two layers are allocated whatever the shape: the renderer refuses to wrap a one-layer array as a
+// layered texture (`texture_rd_create()` fails on `array_layers == 1`).
 void Terrain3DClipmap::_ensure_texture() {
-	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
-	const int64_t texels = int64_t(_config.size) * int64_t(_config.size);
-	if (_layer_image.is_null() || _layer_image->get_width() != _config.size || _layer_image->get_format() != _config.format) {
-		PackedByteArray blank;
-		blank.resize(texels * bytes_per_texel);
-		_layer_image = Image::create_from_data(_config.size, _config.size, false, _config.format, blank);
+	if (_texture_rd.is_valid() || !is_configured()) {
+		return;
 	}
-	_texture.ensure_layers(_layer_image, int(_levels.size()) * _config.channels);
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		return;
+	}
+	Ref<RDTextureFormat> format;
+	format.instantiate();
+	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
+	format->set_format(_ring_data_format(_config.format));
+	format->set_width(uint32_t(_config.size));
+	format->set_height(uint32_t(_config.size));
+	format->set_depth(1);
+	_texture_layers = MAX(int(_levels.size()) * _config.channels, 2);
+	format->set_array_layers(uint32_t(_texture_layers));
+	format->set_mipmaps(1);
+	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT);
+	Ref<RDTextureView> view;
+	view.instantiate();
+	TypedArray<PackedByteArray> initial;
+	_texture_rd = rd->texture_create(format, view, initial);
+	if (!_texture_rd.is_valid()) {
+		LOG(ERROR, "Could not allocate clipmap ring texture (", get_source_name(), ")");
+		return;
+	}
+	rd->set_resource_name(_texture_rd, "Terrain3D clipmap ring " + get_source_name());
+	_texture_rid = server->texture_rd_create(_texture_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
+	if (!_texture_rid.is_valid()) {
+		LOG(ERROR, "Could not wrap clipmap ring texture (", get_source_name(), ")");
+		_free_textures();
+		return;
+	}
 	// A ring configured before a device was reachable allocates its baked channels here instead, so
 	// the producer finds storage rather than having to ask for a reconfigure.
 	_ensure_baked();
 }
 
-void Terrain3DClipmap::_publish_level(const int p_level) {
-	const uint64_t ensure_started_ns = clipmap_clock_ns();
-	_ensure_texture();
-	_last_update_diagnostics.gpu_publish_ns += clipmap_clock_ns() - ensure_started_ns;
-	if (!_texture.get_rid().is_valid()) {
-		return;
+void Terrain3DClipmap::_free_textures() {
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	for (const std::pair<const uint64_t, RID> &entry : _staging_rd) {
+		if (entry.second.is_valid() && rd != nullptr) {
+			rd->free_rid(entry.second);
+		}
 	}
-	const Level &entry = _levels[size_t(p_level)];
-	const int64_t texels = int64_t(_config.size) * int64_t(_config.size);
-	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
-	const uint64_t allocation_started_ns = clipmap_clock_ns();
-	PackedByteArray bytes;
-	bytes.resize(texels * bytes_per_texel);
-	uint8_t *dst = bytes.ptrw();
-	_last_update_diagnostics.full_level_pack_ns += clipmap_clock_ns() - allocation_started_ns;
-	for (int channel = 0; channel < _config.channels; channel++) {
-		const uint64_t pack_started_ns = clipmap_clock_ns();
-		if (_config.format == Image::FORMAT_RF) {
-			float *values = reinterpret_cast<float *>(dst);
-			for (int64_t texel = 0; texel < texels; texel++) {
-				values[texel] = entry.texels[size_t(texel) * size_t(_config.channels) + size_t(channel)];
-			}
-		} else {
-			for (int64_t texel = 0; texel < texels; texel++) {
-				const float value = entry.texels[size_t(texel) * size_t(_config.channels) + size_t(channel)];
-				dst[texel] = uint8_t(CLAMP(value, 0.f, 1.f) * 255.f + 0.5f);
+	_staging_rd.clear();
+	// The wrapper first: freeing the device texture under a live wrapper would leave the shader
+	// binding a handle that no longer names anything.
+	if (_texture_rid.is_valid() && server != nullptr) {
+		server->free_rid(_texture_rid);
+	}
+	if (_texture_rd.is_valid() && rd != nullptr) {
+		rd->free_rid(_texture_rd);
+	}
+	_texture_rid = RID();
+	_texture_rd = RID();
+	_texture_layers = 0;
+}
+
+// One staging texture for `p_width x p_height`: `texture_update()` demands a whole layer's worth of
+// bytes, so the staging texture's own size is what makes a transfer the rect's and not the level's.
+// The pool is keyed by dimensions because a moving focus repeats the same few strip widths; past
+// the cap the pool is rebuilt lazily rather than grown - a shape that churns sizes still pays the
+// rect's bytes and not an unbounded table.
+RID Terrain3DClipmap::_staging_for(const int p_width, const int p_height) {
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr || p_width <= 0 || p_height <= 0) {
+		return RID();
+	}
+	const uint64_t key = (uint64_t(p_width) << 20) | uint64_t(p_height);
+	auto found = _staging_rd.find(key);
+	if (found != _staging_rd.end() && found->second.is_valid()) {
+		return found->second;
+	}
+	if (_staging_rd.size() >= 24) {
+		for (const std::pair<const uint64_t, RID> &entry : _staging_rd) {
+			if (entry.second.is_valid()) {
+				rd->free_rid(entry.second);
 			}
 		}
-		// A fresh image per layer, not a reused one: `texture_2d_update()` queues the image it was
-		// given, so a shared buffer would be rewritten before the queue flushes.
-		Ref<Image> image = Image::create_from_data(_config.size, _config.size, false, _config.format, bytes);
-		_last_update_diagnostics.full_level_pack_ns += clipmap_clock_ns() - pack_started_ns;
-		_last_update_diagnostics.packed_texels += uint64_t(texels);
-		const uint64_t gpu_started_ns = clipmap_clock_ns();
-		_texture.update(image, p_level * _config.channels + channel);
-		_last_update_diagnostics.gpu_publish_ns += clipmap_clock_ns() - gpu_started_ns;
-		_last_update_diagnostics.published_layers++;
-		_last_update_diagnostics.published_bytes += uint64_t(texels * bytes_per_texel);
-		_upload_bytes += uint64_t(texels * bytes_per_texel);
+		_staging_rd.clear();
 	}
+	Ref<RDTextureFormat> format;
+	format.instantiate();
+	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
+	format->set_format(_ring_data_format(_config.format));
+	format->set_width(uint32_t(p_width));
+	format->set_height(uint32_t(p_height));
+	format->set_depth(1);
+	format->set_array_layers(1);
+	format->set_mipmaps(1);
+	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+			RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+	Ref<RDTextureView> view;
+	view.instantiate();
+	TypedArray<PackedByteArray> initial;
+	RID staging = rd->texture_create(format, view, initial);
+	if (!staging.is_valid()) {
+		LOG(ERROR, "Could not allocate clipmap ring staging (", get_source_name(), ")");
+		return RID();
+	}
+	_staging_rd[key] = staging;
+	return staging;
+}
+
+// The stored pieces one *logical* rect lands in: `physical = (logical + ring) mod size`, so a rect
+// that crosses the wrap is two pieces an axis and at most four overall. A rect covering the whole
+// level is the one piece `[0, size)` whatever the ring is, which keeps a first fill and an
+// invalidation a single write rather than the four the wrap would make of it.
+int Terrain3DClipmap::_stored_rects_of_logical(const int p_level, const int p_x0, const int p_y0,
+		const int p_x1, const int p_y1, Rect2i *r_rects) const {
+	const int size = _config.size;
+	const int width = p_x1 - p_x0;
+	const int height = p_y1 - p_y0;
+	if (width >= size && height >= size) {
+		r_rects[0] = Rect2i(0, 0, size, size);
+		return 1;
+	}
+	const Vector2i ring = _levels[size_t(p_level)].ring;
+	const int x_start = _wrap(p_x0 + ring.x);
+	const int y_start = _wrap(p_y0 + ring.y);
+	const int x_starts[2] = { x_start, 0 };
+	const int x_ends[2] = { MIN(x_start + width, size), x_start + width - size };
+	const int x_count = x_start + width <= size ? 1 : 2;
+	const int y_starts[2] = { y_start, 0 };
+	const int y_ends[2] = { MIN(y_start + height, size), y_start + height - size };
+	const int y_count = y_start + height <= size ? 1 : 2;
+	int count = 0;
+	for (int xi = 0; xi < x_count; xi++) {
+		for (int yi = 0; yi < y_count; yi++) {
+			if (x_ends[xi] <= x_starts[xi] || y_ends[yi] <= y_starts[yi]) {
+				continue;
+			}
+			r_rects[count++] = Rect2i(x_starts[xi], y_starts[yi], x_ends[xi] - x_starts[xi],
+					y_ends[yi] - y_starts[yi]);
+		}
+	}
+	return count;
+}
+
+// Queues the upload of one produced rect of *logical* texels. The pack happens here - on the
+// thread that produced it - so `publish_pending_uploads()` only makes device calls, and the bytes
+// are the rect's own: the strip of a moving focus is a few thousand texels where the whole-layer
+// republish this replaced paid `size * size` per level.
+void Terrain3DClipmap::_queue_upload_rect(const int p_level, const int p_x0, const int p_y0,
+		const int p_x1, const int p_y1) {
+	const Level &entry = _levels[size_t(p_level)];
+	const int size = _config.size;
+	const int bytes_per_texel = TerrainClipmap::bytes_per_texel(_config.format);
+	Rect2i pieces[4];
+	const int piece_count = _stored_rects_of_logical(p_level, p_x0, p_y0, p_x1, p_y1, pieces);
+	for (int piece = 0; piece < piece_count; piece++) {
+		const Rect2i &rect = pieces[piece];
+		const int64_t rect_texels = int64_t(rect.size.x) * int64_t(rect.size.y);
+		for (int channel = 0; channel < _config.channels; channel++) {
+			const uint64_t pack_started_ns = clipmap_clock_ns();
+			PendingUpload upload;
+			upload.layer = p_level * _config.channels + channel;
+			upload.rect = rect;
+			upload.bytes.resize(rect_texels * bytes_per_texel);
+			uint8_t *dst = upload.bytes.ptrw();
+			if (_config.format == Image::FORMAT_RF) {
+				float *values = reinterpret_cast<float *>(dst);
+				for (int y = 0; y < rect.size.y; y++) {
+					const size_t row = size_t(rect.position.y + y) * size_t(size) + size_t(rect.position.x);
+					float *out = values + size_t(y) * size_t(rect.size.x);
+					for (int x = 0; x < rect.size.x; x++) {
+						out[x] = entry.texels[(row + size_t(x)) * size_t(_config.channels) + size_t(channel)];
+					}
+				}
+			} else {
+				for (int y = 0; y < rect.size.y; y++) {
+					const size_t row = size_t(rect.position.y + y) * size_t(size) + size_t(rect.position.x);
+					uint8_t *out = dst + size_t(y) * size_t(rect.size.x);
+					for (int x = 0; x < rect.size.x; x++) {
+						const float value = entry.texels[(row + size_t(x)) * size_t(_config.channels) + size_t(channel)];
+						out[x] = uint8_t(CLAMP(value, 0.f, 1.f) * 255.f + 0.5f);
+					}
+				}
+			}
+			_last_update_diagnostics.pack_ns += clipmap_clock_ns() - pack_started_ns;
+			_last_update_diagnostics.packed_texels += uint64_t(rect_texels);
+			_pending_uploads.push_back(std::move(upload));
+		}
+	}
+}
+
+// The device half of the publish, run by the facade on the caller's thread after every `update()` -
+// the worker a scheduled update runs on never names the device. Each queued piece is one
+// `texture_update()` of its staging texture plus one `texture_copy()` into the layer it names - or,
+// when the piece is the whole layer, one direct `texture_update()` and no staging at all.
+void Terrain3DClipmap::publish_pending_uploads() {
+	const uint64_t started_ns = clipmap_clock_ns();
+	_ensure_texture();
+	RenderingServer *server = RenderingServer::get_singleton();
+	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
+	if (rd == nullptr || !_texture_rd.is_valid()) {
+		// No device texture to receive the bytes (headless, or the allocation refused): the queue is
+		// dropped rather than grown, and `entry.texels` still answers the CPU's own reads.
+		_pending_uploads.clear();
+		_last_update_diagnostics.publish_ns += clipmap_clock_ns() - started_ns;
+		return;
+	}
+	const int size = _config.size;
+	std::vector<PendingUpload> retry;
+	for (PendingUpload &upload : _pending_uploads) {
+		const bool whole_layer = upload.rect.size.x >= size && upload.rect.size.y >= size;
+		RID source;
+		if (whole_layer) {
+			source = RID();
+		} else {
+			source = _staging_for(upload.rect.size.x, upload.rect.size.y);
+			if (!source.is_valid()) {
+				continue;
+			}
+			if (rd->texture_update(source, 0, upload.bytes) != OK) {
+				LOG(WARN, "Clipmap ring staging update failed (", get_source_name(), ")");
+				retry.push_back(std::move(upload));
+				continue;
+			}
+		}
+		const int layer = upload.layer;
+		const Error landed = whole_layer
+				? rd->texture_update(_texture_rd, uint32_t(layer), upload.bytes)
+				: rd->texture_copy(source, _texture_rd, Vector3(0, 0, 0),
+						Vector3(real_t(upload.rect.position.x), real_t(upload.rect.position.y), 0.f),
+						Vector3(real_t(upload.rect.size.x), real_t(upload.rect.size.y), 1.f),
+						0, 0, 0, uint32_t(layer));
+		if (landed != OK) {
+			LOG(WARN, "Clipmap ring upload failed (", get_source_name(), ")");
+			retry.push_back(std::move(upload));
+			continue;
+		}
+		_last_update_diagnostics.published_uploads++;
+		_last_update_diagnostics.published_bytes += uint64_t(upload.bytes.size());
+		_upload_bytes += uint64_t(upload.bytes.size());
+	}
+	_pending_uploads = std::move(retry);
+	_last_update_diagnostics.publish_ns += clipmap_clock_ns() - started_ns;
 }
 
 RID Terrain3DClipmap::get_baked_device_rid(const int p_channel) const {
@@ -659,32 +866,12 @@ void Terrain3DClipmap::_queue_bake_rect(const int p_level, const int p_x0, const
 	if (p_level < 0 || p_level >= int(_levels.size()) || p_x1 <= p_x0 || p_y1 <= p_y0) {
 		return;
 	}
-	const int size = _config.size;
-	const int width = p_x1 - p_x0;
-	const int height = p_y1 - p_y0;
-	// A whole level is the whole stored square whatever the ring is: that keeps a first fill and a
-	// material change one rect rather than the two the wrap would make of it.
-	if (width >= size && height >= size) {
-		_queue_stored_bake_rect(p_level, 0, 0, size, size);
-		return;
-	}
-	const Vector2i ring = _levels[size_t(p_level)].ring;
-	const int x_start = _wrap(p_x0 + ring.x);
-	const int y_start = _wrap(p_y0 + ring.y);
-	// One interval an axis, or two when that interval runs off the end of the stored square.
-	const int x_starts[2] = { x_start, 0 };
-	const int x_ends[2] = { MIN(x_start + width, size), x_start + width - size };
-	const int x_count = x_start + width <= size ? 1 : 2;
-	const int y_starts[2] = { y_start, 0 };
-	const int y_ends[2] = { MIN(y_start + height, size), y_start + height - size };
-	const int y_count = y_start + height <= size ? 1 : 2;
-	for (int xi = 0; xi < x_count; xi++) {
-		for (int yi = 0; yi < y_count; yi++) {
-			if (x_ends[xi] <= x_starts[xi] || y_ends[yi] <= y_starts[yi]) {
-				continue;
-			}
-			_queue_stored_bake_rect(p_level, x_starts[xi], y_starts[yi], x_ends[xi], y_ends[yi]);
-		}
+	Rect2i pieces[4];
+	const int piece_count = _stored_rects_of_logical(p_level, p_x0, p_y0, p_x1, p_y1, pieces);
+	for (int piece = 0; piece < piece_count; piece++) {
+		const Rect2i &rect = pieces[piece];
+		_queue_stored_bake_rect(p_level, rect.position.x, rect.position.y,
+				rect.position.x + rect.size.x, rect.position.y + rect.size.y);
 	}
 }
 
@@ -735,43 +922,22 @@ int Terrain3DClipmap::get_outstanding_rects(const int p_level, BakeRect *r_rects
 	}
 	int count = 0;
 	bool overflow = false;
-	// The stored image of a rect of *logical* texels, which is what a job holds. The conversion is the
-	// same one the bake queue takes, including the split a rect crossing the wrap needs.
+	// The stored image of a rect of *logical* texels, which is what a job holds - the same conversion
+	// the bake queue and the upload take, through the one function the wrap lives in.
 	auto append_logical = [&](const int p_x0, const int p_y0, const int p_x1, const int p_y1) {
-		const int size = _config.size;
-		const int width = p_x1 - p_x0;
-		const int height = p_y1 - p_y0;
-		if (width <= 0 || height <= 0) {
+		if (p_x1 <= p_x0 || p_y1 <= p_y0) {
 			return;
 		}
-		if (width >= size && height >= size) {
+		Rect2i pieces[4];
+		const int piece_count = _stored_rects_of_logical(p_level, p_x0, p_y0, p_x1, p_y1, pieces);
+		for (int piece = 0; piece < piece_count; piece++) {
 			if (count >= p_max) {
 				overflow = true;
 				return;
 			}
-			r_rects[count++] = BakeRect{ p_level, 0, 0, size, size, 0 };
-			return;
-		}
-		const Vector2i ring = _levels[size_t(p_level)].ring;
-		const int x_start = _wrap(p_x0 + ring.x);
-		const int y_start = _wrap(p_y0 + ring.y);
-		const int x_starts[2] = { x_start, 0 };
-		const int x_ends[2] = { MIN(x_start + width, size), x_start + width - size };
-		const int x_count = x_start + width <= size ? 1 : 2;
-		const int y_starts[2] = { y_start, 0 };
-		const int y_ends[2] = { MIN(y_start + height, size), y_start + height - size };
-		const int y_count = y_start + height <= size ? 1 : 2;
-		for (int xi = 0; xi < x_count; xi++) {
-			for (int yi = 0; yi < y_count; yi++) {
-				if (x_ends[xi] <= x_starts[xi] || y_ends[yi] <= y_starts[yi]) {
-					continue;
-				}
-				if (count >= p_max) {
-					overflow = true;
-					return;
-				}
-				r_rects[count++] = BakeRect{ p_level, x_starts[xi], y_starts[yi], x_ends[xi], y_ends[yi], 0 };
-			}
+			const Rect2i &rect = pieces[piece];
+			r_rects[count++] = BakeRect{ p_level, rect.position.x, rect.position.y,
+				rect.position.x + rect.size.x, rect.position.y + rect.size.y, 0 };
 		}
 	};
 	// The rects still being produced come first: they are the ones a reader has no baked content for at
@@ -1053,22 +1219,25 @@ void Terrain3DClipmap::get_unit_report(const int p_unit, TerrainClipmap::UnitRep
 Dictionary Terrain3DClipmap::get_impl_payload() const {
 	Dictionary payload;
 	payload["storage"] = "toroidal_level_array";
-	payload["layers"] = _texture.get_layer_count();
+	payload["layers"] = _texture_layers;
 	payload["level_reports"] = get_level_reports();
 	payload["full_level_productions"] = int64_t(_full_productions);
 	payload["bake_dispatches"] = int64_t(_bake_dispatches);
 	payload["bake_rejects"] = int64_t(_bake_rejects);
 	payload["invalidation_calls"] = int64_t(_invalidation_calls);
 	payload["invalidated_texels"] = int64_t(_invalidated_texels);
+	// Packed rect uploads the scene thread has not drained yet - nonzero past an update means the
+	// transfer queue is holding work the producer thread already finished packing.
+	payload["pending_uploads"] = int64_t(_pending_uploads.size());
 	Dictionary update_diagnostics;
 	update_diagnostics["update_us"] = double(_last_update_diagnostics.update_ns) / 1000.0;
 	update_diagnostics["rebuild_schedule_us"] = double(_last_update_diagnostics.rebuild_schedule_ns) / 1000.0;
 	update_diagnostics["source_fill_us"] = double(_last_update_diagnostics.source_fill_ns) / 1000.0;
 	update_diagnostics["ring_scatter_us"] = double(_last_update_diagnostics.ring_scatter_ns) / 1000.0;
-	update_diagnostics["full_level_pack_us"] = double(_last_update_diagnostics.full_level_pack_ns) / 1000.0;
-	// This is the synchronous time spent ensuring storage and submitting layer updates through
-	// RenderingServer. It does not include later render-thread transfer or GPU completion time.
-	update_diagnostics["gpu_publish_us"] = double(_last_update_diagnostics.gpu_publish_ns) / 1000.0;
+	update_diagnostics["pack_us"] = double(_last_update_diagnostics.pack_ns) / 1000.0;
+	// The scene-thread time spent in `publish_pending_uploads()` - staging updates and copies into
+	// the ring texture. It does not include the later render-thread transfer or GPU completion time.
+	update_diagnostics["publish_us"] = double(_last_update_diagnostics.publish_ns) / 1000.0;
 	update_diagnostics["jobs_before"] = _last_update_diagnostics.jobs_before;
 	update_diagnostics["jobs_scheduled"] = _last_update_diagnostics.jobs_scheduled;
 	update_diagnostics["jobs_completed"] = _last_update_diagnostics.jobs_completed;
@@ -1079,7 +1248,7 @@ Dictionary Terrain3DClipmap::get_impl_payload() const {
 	update_diagnostics["packed_texels"] = int64_t(_last_update_diagnostics.packed_texels);
 	update_diagnostics["published_bytes"] = int64_t(_last_update_diagnostics.published_bytes);
 	update_diagnostics["levels_completed"] = _last_update_diagnostics.levels_completed;
-	update_diagnostics["published_layers"] = _last_update_diagnostics.published_layers;
+	update_diagnostics["published_uploads"] = _last_update_diagnostics.published_uploads;
 	payload["update_diagnostics"] = update_diagnostics;
 	return payload;
 }
@@ -1119,7 +1288,7 @@ Dictionary Terrain3DClipmap::get_arm() const {
 	}
 	arm["implementation"] = String(TerrainClipmap::implementation_name(TerrainClipmap::Implementation::LOD));
 	arm["configured"] = true;
-	arm["texture"] = _texture.get_rid();
+	arm["texture"] = _texture_rid;
 	arm["size"] = _config.size;
 	arm["levels"] = levels;
 	arm["base_world"] = _config.base_world;

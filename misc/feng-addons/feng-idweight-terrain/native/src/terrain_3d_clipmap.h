@@ -45,24 +45,31 @@
 // not-current, the fallback answers for the few ticks the re-production takes, and the ring takes
 // over again when the rect has drained.
 //
-// **Uploading.** `RenderingServer::texture_2d_update()` replaces a whole layer of a layered texture,
-// so a drained level is published as one layer update per channel and the byte count is reported
-// (`get_upload_bytes()`): the CPU side is incremental and the transfer is not, and the number is
-// published so the second half is a measurement rather than an assumption. See
-// docs/vt_delivery_assembly.md section 6.
+// **Uploading.** The GPU copy is published per produced *rect*, not per level: a produced rect is
+// split into the level's stored frame (at most four pieces through the wrap), packed per channel on
+// the producing thread, and landed by `RenderingDevice::texture_copy()` out of a staging texture
+// sized to the piece. `texture_update()` writes a whole layer only when the piece *is* the layer;
+// a strip pays its own texels rather than the square the old whole-layer republish paid. The device
+// calls run in `publish_pending_uploads()`, which the facade invokes on the caller's thread after
+// every update - the block atlas's own split, mirrored - so the worker never touches the device.
+// The byte count is reported (`get_upload_bytes()`): the CPU side is incremental and now the
+// transfer is too, and the number is published so it stays a measurement rather than an assumption.
+// See docs/vt_delivery_assembly.md section 6.
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
+#include <godot_cpp/variant/rect2i.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
 
+#include <map>
 #include <memory>
 #include <vector>
 
-#include "generated_texture.h"
 #include "terrain_3d_clipmap_common.h"
 #include "terrain_3d_clipmap_impl.h"
 #include "terrain_3d_clipmap_source.h"
@@ -73,8 +80,8 @@
 // (`terrain_3d_clipmap_layer.h`) selects between this and the block atlas; nothing above either class
 // names which one it holds.
 class Terrain3DClipmap : public Terrain3DClipmapImpl {
-	// The ring is not a Godot class, so it has to name itself for the log macro the way
-	// `GeneratedTexture` does.
+	// The ring is not a Godot class, so it has to name itself for the log macro the way the baked
+	// channel storage does.
 	CLASS_NAME_STATIC("Terrain3DClipmap");
 
 public:
@@ -158,7 +165,8 @@ public:
 	// The ring is built around one source. It is owned here, and it is the only thing that differs
 	// between the channels this class can carry.
 	explicit Terrain3DClipmap(std::unique_ptr<Terrain3DClipmapSource> p_source);
-	// Frees the layered texture's RID; `GeneratedTexture` has no destructor of its own.
+	// Frees the device texture, its renderer wrapper and the staging pool; none of them has a
+	// destructor of its own.
 	~Terrain3DClipmap();
 
 	// Sizes the ring from `p_config`: `size` texels an axis over `levels` levels, the finest covering
@@ -280,9 +288,14 @@ public:
 	// The gate above is declared beside the shared contract (`covers()`), because it *is* part of it:
 	// "does this layer reach that world position" is a question every implementation answers.
 
-	// One update: re-derive the jobs a new focus implies, drain them under the budget, publish the
-	// levels that drained. Returns the number of channel texels produced by this call.
+	// One update: re-derive the jobs a new focus implies, drain them under the budget, and queue the
+	// upload and the bake of every rect that drained. Returns the number of channel texels produced
+	// by this call. The device half of the upload is `publish_pending_uploads()`.
 	int update(const Vector2 &p_focus, const int p_budget_texels) override;
+	// Lands the uploads `update()` packed: one `texture_update()` + `texture_copy()` per stored
+	// piece, on the thread the facade calls this from. Drops the queue when the device texture does
+	// not exist to receive it.
+	void publish_pending_uploads() override;
 	// True when the ring has pending production, an invalid level, or a snapped centre that differs
 	// from this focus. The owner uses this to avoid dispatching an idle worker task between texel moves.
 	bool needs_update_at(const Vector2 &p_focus) const override;
@@ -307,8 +320,8 @@ public:
 	// a ring that produced nothing reports the same stamp and costs one integer comparison. See
 	// `Terrain3D::_update_vt_clipmap_arm()`.
 	uint64_t get_state_stamp() const override { return _state_stamp; }
-	RID get_texture_rid() const override { return _texture.get_rid(); }	// `levels * channels`.
-	int get_texture_layer_count() const override { return _texture.get_layer_count(); }
+	RID get_texture_rid() const override { return _texture_rid; }	// renderer wrapper of `_texture_rd`.
+	int get_texture_layer_count() const override { return _texture_layers; }
 	Vector2i get_ring(const int p_level) const { return _levels[p_level].ring; }
 	uint64_t get_produced_texels() const override { return _produced_texels; }
 	uint64_t get_upload_bytes() const override { return _upload_bytes; }
@@ -343,8 +356,8 @@ private:
 		uint64_t rebuild_schedule_ns = 0;
 		uint64_t source_fill_ns = 0;
 		uint64_t ring_scatter_ns = 0;
-		uint64_t full_level_pack_ns = 0;
-		uint64_t gpu_publish_ns = 0;
+		uint64_t pack_ns = 0;
+		uint64_t publish_ns = 0;
 		uint64_t produced_texels = 0;
 		uint64_t packed_texels = 0;
 		uint64_t published_bytes = 0;
@@ -355,7 +368,7 @@ private:
 		int source_row_calls = 0;
 		int levels_configured = 0;
 		int levels_completed = 0;
-		int published_layers = 0;
+		int published_uploads = 0;
 	};
 
 	// Reduces a signed texel index into [0, size). The two wraps - the map's and the source's - are
@@ -370,9 +383,25 @@ private:
 	bool _produce_rect(Job &p_job, int &r_budget);
 	// Asks the source for one row segment of one channel and scatters it to its ring position.
 	void _fill_row(const Job &p_job, const int p_channel, const int p_y, const int p_x0, const int p_x1);
-	// Copies every channel of one level into its layer of the ring texture and counts the bytes.
-	void _publish_level(const int p_level);
+	// The stored pieces one *logical* rect lands in, through `physical = (logical + ring) mod size`:
+	// at most four rects through `r_rects`, one for a rect that is the whole level. Every reader that
+	// maps a produced rect into stored space - the bake queue, the outstanding table, the upload - goes
+	// through this one function, so the wrap's arithmetic lives in exactly one place.
+	int _stored_rects_of_logical(const int p_level, const int p_x0, const int p_y0, const int p_x1,
+			const int p_y1, Rect2i *r_rects) const;
+	// Packs the produced rect's channel bytes and queues them for `publish_pending_uploads()` - one
+	// upload per stored piece per channel, which is what makes a strip's transfer its own texels.
+	void _queue_upload_rect(const int p_level, const int p_x0, const int p_y0, const int p_x1,
+			const int p_y1);
+	// The ring's device texture and renderer wrapper, allocated once the device is reachable. The
+	// texture is the `CAN_COPY_TO` destination the rect upload writes into; the wrapper is the RID the
+	// material and the bake producer bind (`resolve_main_texture` unwraps it back).
 	void _ensure_texture();
+	// Frees the wrapper, the device texture and every staging texture the upload pool holds.
+	void _free_textures();
+	// One staging texture per rect size published, pooled by dimensions: `texture_update()` demands a
+	// whole layer's worth of bytes, so a staging texture's own size is what makes a transfer the rect's.
+	RID _staging_for(const int p_width, const int p_height);
 	// Allocates the baked channels when the shape calls for them and the device is reachable, and
 	// frees the ones that are stale. Called from `configure()` and from `_ensure_texture()`, so a
 	// ring configured before a device existed still gets its layers on the first publish.
@@ -400,14 +429,27 @@ private:
 	std::vector<Job> _jobs;
 	// One row of source values, reused so a production does not allocate.
 	std::vector<float> _row_values;
-	GeneratedTexture _texture;
+	// The ring's `Texture2DArray` as the device knows it (`levels * channels` layers, at least two),
+	// plus the `RenderingServer` wrapper the material arm binds. It is a device texture rather than a
+	// `RenderingServer` one for one flag: `TEXTURE_USAGE_CAN_COPY_TO`, which is what a `texture_copy()`
+	// destination must declare and what makes the per-rect upload possible at all.
+	RID _texture_rd;
+	RID _texture_rid;
+	int _texture_layers = 0;
+	// The staging pool the rect uploads pass through, keyed by `width << 20 | height`, and the packed
+	// uploads waiting on it. One produced *logical* rect is up to four stored pieces; each piece is
+	// one entry per channel, its bytes already packed so the publish does no CPU work of its own.
+	std::map<uint64_t, RID> _staging_rd;
+	struct PendingUpload {
+		int layer = 0;
+		Rect2i rect;
+		PackedByteArray bytes;
+	};
+	std::vector<PendingUpload> _pending_uploads;
 	// The baked channels, one device texture and one `RenderingServer` wrapper each, in channel
 	// order. Both are created and freed together, and both are invalid on a ring with none.
 	std::vector<RID> _baked_rd;
 	std::vector<RID> _baked_rs;
-	// The blank layer `ensure_layers()` is called with; one layer image per publish is allocated from
-	// the bytes instead, because a queued `texture_2d_update()` holds the image it was given.
-	Ref<Image> _layer_image;
 	bool _has_focus = false;
 	uint64_t _produced_texels = 0;
 	uint64_t _full_productions = 0;

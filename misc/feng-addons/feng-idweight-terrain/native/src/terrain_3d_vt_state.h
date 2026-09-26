@@ -1200,6 +1200,10 @@ struct Terrain3DVTState {
 	double vt_clipmap_sync_update_ms = 0.0;
 	double vt_clipmap_detail_update_ms = 0.0;
 	bool vt_clipmap_detail_deferred = false;
+	// Consecutive ticks the detail pump was deferred to the ring's consumption. The deferral's intent
+	// is one tick's handoff; without a bound it starves the pump for the whole of a sustained move,
+	// which is the 12 m field a fragment reads while the ring's own levels only reach metres.
+	int vt_clipmap_detail_deferred_ticks = 0;
 	double vt_avt_ms = 0.0;
 	double vt_svt_ms = 0.0;
 	double vt_topup_ms = 0.0;
