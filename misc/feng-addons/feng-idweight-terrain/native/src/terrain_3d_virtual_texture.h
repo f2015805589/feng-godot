@@ -208,7 +208,30 @@ public:
 	// Reallocates a registered POT block and remaps its cached exact pages. A
 	// failed allocation leaves the original block and page mappings untouched.
 	bool resize_sector(const Vector2i &p_sector, const int p_virtual_image_size);
+	// resize_sector()'s atlas half, for callers batching many resizes in one pass:
+	// the block is reallocated and the owner record updated, while the resident
+	// pages' indirection entries are left for remap_sectors_pages() - one
+	// owner-index scan for every remap instead of one per sector. A caller that
+	// resizes through this MUST hand the reported pair to remap_sectors_pages()
+	// before the new block can serve pages.
+	bool resize_sector_block(const Vector2i &p_sector, const int p_virtual_image_size,
+			TerrainVT::ImageInfo &r_old_info, TerrainVT::ImageInfo &r_new_info);
+	struct SectorRemap {
+		Vector2i sector;
+		TerrainVT::ImageInfo old_info;
+		TerrainVT::ImageInfo new_info;
+	};
+	void remap_sectors_pages(const std::vector<SectorRemap> &p_remaps);
 	bool unregister_sector(const Vector2i &p_sector);
+	// Two halves of unregister_sector split for callers that release many sectors in
+	// one pass. unregister_sector_block() frees the atlas image immediately (so the
+	// space is reclaimable inside the same pass) but leaves the sector's published
+	// indirection entries in place; release_sectors_pages() then clears every
+	// released sector's entries with one owner-index scan instead of one per sector.
+	// A caller using unregister_sector_block() MUST call release_sectors_pages() with
+	// the sectors before any of their blocks can serve new pages.
+	bool unregister_sector_block(const Vector2i &p_sector);
+	void release_sectors_pages(const std::unordered_set<Vector2i, Vector2iHash> &p_sectors);
 	bool has_sector(const Vector2i &p_sector) const;
 	int get_sector_block_size(const Vector2i &p_sector) const;
 	int get_sector_block_origin_x(const Vector2i &p_sector) const;

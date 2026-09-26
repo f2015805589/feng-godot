@@ -136,7 +136,6 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 		while (size < logical) { size <<= 1; }
 		scan.visible.push_back({ key, key, 0, size, visible, distance, heights, tier, logical });
 	}
-	std::stable_sort(scan.visible.begin(), scan.visible.end(), [](const auto &a, const auto &b) { return a.distance < b.distance; });
 	// Every cell the near field can reach is kept, on screen or not.
 	//
 	// This is the reference implementation's *additional feedback*: its feedback pass adds one
@@ -149,6 +148,8 @@ Terrain3DAVTSectorScan Terrain3D::_avt_scan_sectors(const TerrainVT::VisibleView
 	// A cell outside the frustum still never competes for refinement: `produce` is false for it, and
 	// the walk's own comparators put a producing cell first inside every level. What it does keep is
 	// its whole-cell root page, which is resident, reserved and demanded across the turn.
+	// One sort does it: the composite key already carries distance inside the
+	// producing group, so a preceding distance sort would be fully overwritten.
 	std::stable_sort(scan.visible.begin(), scan.visible.end(), [](const auto &a, const auto &b) {
 		if (a.produce != b.produce) { return a.produce; }
 		return a.distance < b.distance;
@@ -172,12 +173,20 @@ Terrain3DAVTHierarchy Terrain3D::_avt_build_hierarchy(const Terrain3DAVTSectorSc
 	hierarchy.directory_dirty = changed || _vt.avt_directory_bytes.is_empty();
 	if (changed) {
 		// Source/layout changes invalidate the old world's requests as well as its
-		// addresses. Ordinary camera motion never enters this branch.
-		for (const auto &entry : _vt.avt_cached_addresses) { _vt.surface_vt->unregister_sector(entry.second.owner); }
+		// addresses. Ordinary camera motion never enters this branch. The release
+		// is the batched pair: a full world's unregister_sector() would rescan the
+		// pool's owner index once per sector.
+		std::unordered_set<Vector2i, Vector2iHash> released;
+		for (const auto &entry : _vt.avt_cached_addresses) {
+			_vt.surface_vt->unregister_sector_block(entry.second.owner);
+			released.insert(entry.second.owner);
+		}
+		_vt.surface_vt->unregister_sector_block(avt_coarse_owner());
+		released.insert(avt_coarse_owner());
+		_vt.surface_vt->release_sectors_pages(released);
 		_vt.avt_cached_addresses.clear();
 		_vt.avt_allocated_sizes.clear();
 		_vt.vt_registered_sectors.clear();
-		_vt.surface_vt->unregister_sector(avt_coarse_owner());
 		_vt.avt_plan.forget();
 		_vt.avt_settled.unverify();
 		coarse = next;
@@ -240,14 +249,24 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 		}
 		return false;
 	};
+	// Release bookkeeping is deferred: each sector used to erase its plan pages,
+	// republish coverage and scan the pool's owner index - three passes over a
+	// working set that can be thousands of sectors, once per sector. On a
+	// whole-visible-world plan that made the sync quadratic (~22 ms). The atlas
+	// block still frees inline because the reclaim below reuses it in the same
+	// pass; everything else is applied once after the loops. Nothing below
+	// publishes a sector page - that is the produce pass's job - so stale
+	// indirection entries cannot collide with a re-registered block inside this
+	// call.
+	std::unordered_set<Vector2i, Vector2iHash> released_owners;
+	std::unordered_map<uint64_t, int> mip_shifts;
+	std::vector<Terrain3DVirtualTexture::SectorRemap> remaps;
 	auto release = [&](uint64_t key) {
 		const auto found = _vt.avt_cached_addresses.find(key);
 		if (found == _vt.avt_cached_addresses.end()) { return; }
 		const Vector2i owner = found->second.owner;
-		_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
-				[&](const auto &page) { return page.owner == owner; }), _vt.avt_plan.pages.end());
-		_avt_publish_plan_coverage();
-		_vt.surface_vt->unregister_sector(owner);
+		released_owners.insert(owner);
+		_vt.surface_vt->unregister_sector_block(owner);
 		_vt.vt_registered_sectors.erase(found->second.owner);
 		_vt.avt_allocated_sizes.erase(key);
 		_vt.avt_cached_addresses.erase(found);
@@ -275,7 +294,12 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 				release(key); old_size = 0;
 			}
 		}
-		auto allocate = [&]() { return old_size > 0 ? _vt.surface_vt->resize_sector(cell.owner, cell.size) : _vt.surface_vt->register_sector(cell.owner, cell.size); };
+		TerrainVT::ImageInfo remap_old, remap_new;
+		auto allocate = [&]() {
+			return old_size > 0
+					? _vt.surface_vt->resize_sector_block(cell.owner, cell.size, remap_old, remap_new)
+					: _vt.surface_vt->register_sector(cell.owner, cell.size);
+		};
 		bool allocated = allocate();
 		if (!allocated) {
 			// Working cells are nearest first. An old, still-visible far block
@@ -292,23 +316,43 @@ void Terrain3D::_avt_sync_address_directory(Terrain3DAVTHierarchy &r_hierarchy, 
 			}
 		}
 		if (!allocated) { continue; }
-		if (old_size > 0) {
+		if (old_size > 0 && remap_old.size != remap_new.size) {
 			// The same mip-shift the reference implementation's `RemapVirtualImage` applies: a page
 			// stands for a fixed world footprint, so doubling the image moves the same payload from
 			// local mip L to L + shift and halving it moves L to L - shift. A page whose new mip
 			// falls outside the block is the one case the shift cannot express, and only those are
-			// dropped.
-			const int shift = TerrainVT::log2_power_of_two(cell.size) - TerrainVT::log2_power_of_two(old_size);
-			for (auto &page : _vt.avt_plan.pages) { if (page.owner == cell.owner) { page.mip += shift; } }
-			_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
-					[&](const auto &page) { return page.owner == cell.owner && page.mip < 0; }), _vt.avt_plan.pages.end());
-			_avt_publish_plan_coverage();
+			// dropped. The plan-side shift is recorded per owner here; the resident pages'
+			// indirection remap is deferred with the releases to one owner-index scan.
+			mip_shifts[key] = TerrainVT::log2_power_of_two(cell.size) - TerrainVT::log2_power_of_two(old_size);
+			remaps.push_back({ cell.owner, remap_old, remap_new });
 		}
 		_vt.avt_cached_addresses[key] = { cell.location, cell.owner, 0, cell.resolution_level, cell.logical_pages };
 		_vt.avt_allocated_sizes[key] = cell.size;
 		_vt.vt_registered_sectors[cell.owner] = true;
 		r_hierarchy.directory_dirty = true;
 		++r_hierarchy.size_grows;
+	}
+	// The deferred page-table edits: one owner-index scan clears every released
+	// sector's indirection entries and one more remaps every resized sector's
+	// resident pages, then one plan pass drops released pages and applies every
+	// mip shift, and coverage publishes once.
+	if (!released_owners.empty()) {
+		_vt.surface_vt->release_sectors_pages(released_owners);
+	}
+	if (!remaps.empty()) {
+		_vt.surface_vt->remap_sectors_pages(remaps);
+	}
+	if (!released_owners.empty() || !mip_shifts.empty()) {
+		for (auto &page : _vt.avt_plan.pages) {
+			const auto shift = mip_shifts.find(avt_owner_key(page.owner));
+			if (shift != mip_shifts.end()) { page.mip += shift->second; }
+		}
+		_vt.avt_plan.pages.erase(std::remove_if(_vt.avt_plan.pages.begin(), _vt.avt_plan.pages.end(),
+				[&](const auto &page) {
+					return released_owners.count(page.owner) != 0 ||
+							(mip_shifts.count(avt_owner_key(page.owner)) && page.mip < 0);
+				}), _vt.avt_plan.pages.end());
+		_avt_publish_plan_coverage();
 	}
 	_vt.avt_registered_owners.clear();
 	for (const auto &entry : _vt.avt_cached_addresses) { _vt.avt_registered_owners.push_back(entry.second.owner); }

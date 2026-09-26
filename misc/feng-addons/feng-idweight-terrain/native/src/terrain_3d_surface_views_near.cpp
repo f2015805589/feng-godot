@@ -134,7 +134,7 @@ bool Terrain3D::_update_surface_vt_feedback(const Vector3 &p_target) {
 			Projection(camera->get_global_transform().affine_inverse());
 	const real_t page_world_size = real_t(_region_size) * _vertex_spacing / real_t(pages_per_axis);
 	Viewport *viewport = camera->get_viewport();
-	const Vector2i viewport_size = viewport ? viewport->get_visible_rect().size : Vector2i(1920, 1080);
+	const Vector2i viewport_size = viewport ? Vector2i(viewport->get_visible_rect().size) : Vector2i(1920, 1080);
 
 	if (_vt.surface_vt_feedback->dispatch(view_projection, pages_per_axis, real_t(_region_size),
 				page_world_size, _vt.surface_vt->get_page_size(),
@@ -389,13 +389,18 @@ void Terrain3D::_retire_stale_vt_sectors(const Dictionary &p_eligible) {
 	if (_vt.vt_debug_direct_material) {
 		return;
 	}
+	std::unordered_set<Vector2i, Vector2iHash> released;
 	for (const Variant &key : _vt.vt_registered_sectors.keys()) {
 		Vector2i location = key;
 		if (_data->get_region_id(location) < 0 || !p_eligible.has(location)) {
-			_vt.surface_vt->unregister_sector(location);
+			_vt.surface_vt->unregister_sector_block(location);
+			released.insert(location);
 			_vt.vt_registered_sectors.erase(key);
 		}
 	}
+	// One owner-index scan clears every retired sector's indirection entries;
+	// unregister_sector() per sector would rescan it once per sector.
+	_vt.surface_vt->release_sectors_pages(released);
 }
 
 // Gives this region a virtual block of the requested size. False means the block

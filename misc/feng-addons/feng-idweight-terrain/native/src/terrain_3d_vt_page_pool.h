@@ -68,7 +68,13 @@ struct Terrain3DVTPagePool {
 	int page_count = 0;
 	Image::Format format = Image::FORMAT_MAX;
 
-	std::vector<uint32_t> lru;
+	// Recency is a stamp, not a list: touch_slot() is hit once per demanded page per
+	// tick by the demand passes, so a move-to-front vector turned every resident hit into
+	// a linear scan plus two memmoves of the whole pool. A monotonically increasing stamp
+	// per slot is the same total order; acquire_slot() finds the victim as the eligible
+	// slot with the smallest stamp.
+	std::vector<uint64_t> slot_recency;
+	uint64_t recency_counter = 0;
 	std::vector<uint8_t> slot_used;
 	std::vector<Ref<Image>> authored_pages;
 	std::vector<uint8_t> slot_protected;

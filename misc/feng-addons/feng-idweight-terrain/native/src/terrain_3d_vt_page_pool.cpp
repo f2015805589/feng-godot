@@ -4,7 +4,7 @@
 // (reserve / commit / abort), the reverse owner index, and page content access.
 //
 // Read terrain_3d_vt_page_pool.h first: it states the three contracts these functions rely on.
-// What is here is only the mechanics of them - the free list and the LRU, the per-slot arrays
+// What is here is only the mechanics of them - the free list and slot recency, the per-slot arrays
 // that all have the pool's page count, and the counters the diagnostics report. The per-view
 // half is terrain_3d_virtual_texture.cpp, and this file calls into it in exactly one place: an
 // eviction invalidates the indirection entry that published the page, through
@@ -71,7 +71,8 @@ bool Terrain3DVTPagePool::initialize(const int p_page_size, const int p_page_bor
 		return false;
 	}
 
-	lru.clear();
+	slot_recency.assign(page_count, 0);
+	recency_counter = 0;
 	slot_used.assign(page_count, 0);
 	authored_pages.resize(page_count);
 	slot_protected.assign(page_count, 0);
@@ -103,7 +104,7 @@ bool Terrain3DVTPagePool::grow(int p_count) {
 	for (uint32_t slot = 0; slot < uint32_t(page_count); ++slot) {
 		if (slot_used[slot]) { evict_slot(slot); ++released; }
 	}
-	lru.clear();
+	slot_recency.assign(p_count, 0);
 	slot_used.resize(p_count, 0);
 	authored_pages.resize(p_count);
 	slot_protected.assign(p_count, 0);
@@ -137,7 +138,7 @@ void Terrain3DVTPagePool::clear() {
 	// tears down a pool after all views have already gone away.
 	atlas.clear();
 	atlas_template.unref();
-	lru.clear();
+	slot_recency.clear();
 	slot_used.clear();
 	authored_pages.clear();
 	slot_protected.clear();
@@ -167,13 +168,10 @@ void Terrain3DVTPagePool::touch_slot(const uint32_t p_slot) {
 		return;
 	}
 	if (demand_active) { slot_demand_epoch[p_slot] = demand_epoch; }
-	for (size_t i = 0; i < lru.size(); i++) {
-		if (lru[i] == p_slot) {
-			lru.erase(lru.begin() + i);
-			break;
-		}
-	}
-	lru.insert(lru.begin(), p_slot);
+	// One stamp per touch instead of a move-to-front list: the demand passes hit a
+	// resident page once per slot per tick, so the list's linear find plus two
+	// memmoves of the whole pool was the per-tick cost this is sized to remove.
+	slot_recency[p_slot] = ++recency_counter;
 }
 
 int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
@@ -188,12 +186,13 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 		slot = free_slots.back();
 		free_slots.pop_back();
 	} else {
-		// Nothing free: choose the least recently used unprotected page. Entries
-		// left in LRU by release/detach are skipped because they are already free.
-		for (int i = int(lru.size()) - 1; i >= 0; i--) {
-			const uint32_t candidate = lru[i];
-			if (candidate >= uint32_t(page_count) || !slot_used[candidate] ||
-					slot_protected[candidate] || slot_reserved[candidate]) {
+		// Nothing free: choose the least recently used unprotected page. With a
+		// stamp per slot the victim is the eligible slot with the smallest stamp -
+		// the same choice the back-to-front LRU list scan made - and freed slots
+		// are skipped on `slot_used` the same way stale list entries were.
+		uint64_t oldest_stamp = UINT64_MAX;
+		for (uint32_t candidate = 0; candidate < uint32_t(page_count); ++candidate) {
+			if (!slot_used[candidate] || slot_protected[candidate] || slot_reserved[candidate]) {
 				continue;
 			}
 			// A page the addressing reserved is not a victim at any pressure. The fallback tier's
@@ -217,9 +216,13 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 			// The victim is only *chosen* here. Evicting it now would destroy a
 			// resident page even when the caller fails before publishing the
 			// replacement; commit_slot() makes it final.
-			slot = candidate;
+			if (slot_recency[candidate] < oldest_stamp) {
+				oldest_stamp = slot_recency[candidate];
+				slot = candidate;
+			}
+		}
+		if (slot != INVALID_PHYSICAL_PAGE_SLOT) {
 			evict_on_commit = true;
-			break;
 		}
 		if (slot == INVALID_PHYSICAL_PAGE_SLOT) {
 			protected_block_count++;
