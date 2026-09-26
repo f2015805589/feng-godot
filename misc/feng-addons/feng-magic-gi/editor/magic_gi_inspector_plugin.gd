@@ -10,7 +10,7 @@ func _can_handle(object: Object) -> bool:
 	return object is Volume
 
 func _parse_begin(_object: Object) -> void:
-	var volume: FMagicGIVolume = _object
+	var volume := _object as Volume
 	var container := VBoxContainer.new()
 	var button := Button.new()
 	button.text = "Bake Probes" if not _baking else "Baking..."
