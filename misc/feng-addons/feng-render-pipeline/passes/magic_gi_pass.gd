@@ -87,14 +87,14 @@ func _ensure_resources(rd: RenderingDevice, data, version: int) -> bool:
 func _fill_ubo(rd: RenderingDevice, data, view: int) -> bool:
 	if _scene_data == null:
 		return false
-	var inv_vp := _scene_data.get_view_projection(view).inverse()
+	var inv_vp: Projection = _scene_data.get_view_projection(view).inverse()
 	var floats := PackedFloat32Array()
 	floats.resize(UBO_FLOATS)
 	for i in 4:
 		var c: Vector4 = inv_vp[i]
 		floats[i * 4] = c.x; floats[i * 4 + 1] = c.y
 		floats[i * 4 + 2] = c.z; floats[i * 4 + 3] = c.w
-	var w2g := data.world_to_grid
+	var w2g: Transform3D = data.world_to_grid
 	for i in 3:
 		floats[16 + i * 4] = w2g.basis[i].x
 		floats[16 + i * 4 + 1] = w2g.basis[i].y

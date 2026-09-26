@@ -2,13 +2,13 @@
 
 importer="glsl"
 type="RDShaderFile"
-uid="uid://1c4zv7mr58c4e"
-path="res://.godot/imported/magic_gi_apply.glsl-58851dfc1828f2f7732c9fdf4a2eb2d90f.res"
+uid="uid://c5osdu4ar03ks"
+path="res://.godot/imported/magic_gi_apply.glsl-0c38db1e9454c446dee526d718db3193.res"
 
 [deps]
 
 source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply.glsl"
-dest_files=["res://.godot/imported/magic_gi_apply.glsl-58851dfc1828f2f7732c9fdf4a2eb2d90f.res"]
+dest_files=["res://.godot/imported/magic_gi_apply.glsl-0c38db1e9454c446dee526d718db3193.res"]
 
 [params]
 

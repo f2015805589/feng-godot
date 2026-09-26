@@ -102,7 +102,7 @@ func bake_volume(volume: FMagicGIVolume) -> Data:
 			var pixels := image.get_data().to_float32_array()
 			for s in size:
 				for t in size:
-					var pi := s * size + t
+					var pi := t * size + s
 					var dir := (world_to_local_basis * basis_now * Vector3(
 							2.0 * (s + 0.5) / size - 1.0,
 							-(2.0 * (t + 0.5) / size - 1.0),
