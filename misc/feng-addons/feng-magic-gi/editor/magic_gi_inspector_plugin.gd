@@ -3,7 +3,7 @@ extends EditorInspectorPlugin
 ## Inspector for FMagicGIVolume: the bake button plus a status line.
 
 const Volume = preload("../feng_magic_gi_volume.gd")
-const Baker = preload("../feng_magic_gi_baker.gd")
+const Data = preload("../feng_magic_gi_data.gd")
 
 var _baking := false
 
@@ -61,7 +61,7 @@ func _update_status(volume: FMagicGIVolume, info: Label) -> void:
 	if volume.has_bake():
 		info.text = "%d surface samples baked with %d rays/point (randomized QMC sampler r%d, bake v%d)." % [
 			volume.bake_data.probe_count(), volume.bake_data.bake_samples,
-			Baker.SAMPLER_REVISION, volume.bake_data.bake_version]
+			Data.SAMPLER_REVISION, volume.bake_data.bake_version]
 		if not volume.has_nonzero_indirect_transfer():
 			info.text += "\n" + Volume.ZERO_TRANSFER_DIAGNOSTIC
 	elif volume.bake_data != null:

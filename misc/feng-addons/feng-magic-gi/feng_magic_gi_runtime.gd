@@ -3,14 +3,15 @@ class_name FMagicGIRuntime
 extends RefCounted
 ## Main-thread lighting publishes immutable, world-scoped PRT snapshots.
 
-const Lighting = preload("feng_magic_gi_lighting.gd")
+const RuntimeState = preload("feng_magic_gi_runtime_state.gd")
 const VIEWPORT_SCAN_MSEC := 1000
 
-static var _volumes: Dictionary = {}
+# One per-volume entry owns its weak reference, lighting calculator, emission
+# helper/cache, data identity, and diagnostic state. Viewports and publication
+# are service-wide concerns and remain separate.
+static var _registry: Dictionary = {}
 static var _viewports: Dictionary = {}
-static var _lighting: Dictionary = {}
-static var _published_at: Dictionary = {}
-static var _data_keys: Dictionary = {}
+static var _emission_revision_sequence := 0
 static var _publish_sequence := 0
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
@@ -19,19 +20,19 @@ static var _next_viewport_scan := 0
 
 static func register(volume: FMagicGIVolume) -> void:
 	var id := volume.get_instance_id()
-	if not _volumes.has(id):
-		_volumes[id] = weakref(volume)
+	var state: RuntimeState = _registry.get(id)
+	if state == null or state.get_volume() != volume:
+		state = RuntimeState.new()
+		state.attach(volume)
+		_registry[id] = state
 		_publish_sequence += 1
-		_published_at[id] = _publish_sequence
-		_data_keys.erase(id)
+		state.published_sequence = _publish_sequence
+		state.data_key = ""
 	register_viewport(volume.get_viewport())
 
 static func unregister(volume: FMagicGIVolume) -> void:
 	var id := volume.get_instance_id()
-	_volumes.erase(id)
-	_lighting.erase(id)
-	_published_at.erase(id)
-	_data_keys.erase(id)
+	_registry.erase(id)
 	_publish()
 
 static func register_viewport(viewport: Viewport) -> void:
@@ -48,12 +49,13 @@ static func publish(volume: FMagicGIVolume) -> void:
 	if volume.is_inside_tree():
 		register(volume)
 		var id := volume.get_instance_id()
+		var state: RuntimeState = _registry.get(id)
 		var data := volume.bake_data
 		var data_key := "%d:%d" % [data.get_instance_id(), data.bake_version] if data != null else ""
-		if str(_data_keys.get(id, "")) != data_key:
-			_data_keys[id] = data_key
+		if state.data_key != data_key:
+			state.data_key = data_key
 			_publish_sequence += 1
-			_published_at[id] = _publish_sequence
+			state.published_sequence = _publish_sequence
 	_publish()
 
 static func tick() -> void:
@@ -68,15 +70,43 @@ static func tick() -> void:
 	_publish()
 
 static func snapshots() -> Array[Dictionary]:
+	# Published arrays and dictionaries are immutable by convention. The producer
+	# replaces the whole array under the mutex instead of mutating a published one.
 	_mutex.lock()
 	var result := _snapshots
 	_mutex.unlock()
 	return result
 
+static func emission_warning(volume: FMagicGIVolume) -> String:
+	if volume == null or not is_instance_valid(volume):
+		return ""
+	var state: RuntimeState = _registry.get(volume.get_instance_id())
+	return state.emission_warning if state != null else ""
+
+## Refreshes warnings for a volume that may not currently be selected for a
+## viewport. This explicit, throttled path keeps configuration warnings useful
+## without making the warning getter mutate emission state.
+static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
+	if volume == null or not is_instance_valid(volume) or not volume.is_inside_tree():
+		return
+	var state: RuntimeState = _registry.get(volume.get_instance_id())
+	if state == null:
+		return
+	_mutex.lock()
+	for snapshot in _snapshots:
+		if int(snapshot.get("volume_id", 0)) == volume.get_instance_id():
+			_mutex.unlock()
+			return # The selected volume's warning was refreshed by _publish().
+	_mutex.unlock()
+	if not volume.has_bake():
+		state.emission_warning = ""
+		return
+	state.refresh_emission_diagnostics(volume, volume.bake_data)
+
 static func _refresh_viewports() -> void:
-	for id in _volumes.keys():
-		var reference: WeakRef = _volumes.get(id)
-		var volume: FMagicGIVolume = reference.get_ref() if reference != null else null
+	for id in _registry.keys():
+		var state: RuntimeState = _registry.get(id)
+		var volume: FMagicGIVolume = state.get_volume() if state != null else null
 		if volume == null or not volume.is_inside_tree():
 			continue
 		register_viewport(volume.get_viewport())
@@ -112,39 +142,48 @@ static func _render_targets(world: World3D) -> Array[RID]:
 
 static func _publish() -> void:
 	var selected: Dictionary = {} # world instance id -> latest valid volume
-	for id in _volumes.keys():
-		var reference: WeakRef = _volumes[id]
-		var volume: FMagicGIVolume = reference.get_ref() if reference != null else null
+	for id in _registry.keys():
+		var state: RuntimeState = _registry.get(id)
+		var volume: FMagicGIVolume = state.get_volume() if state != null else null
 		if volume == null:
-			_volumes.erase(id)
-			_lighting.erase(id)
-			_published_at.erase(id)
+			_registry.erase(id)
 			continue
-		if not volume.is_inside_tree() or not volume.enabled or not volume.has_bake():
+		if not volume.is_inside_tree():
+			state.emission_warning = ""
+			continue
+		if not volume.enabled:
+			continue
+		if not volume.has_bake():
+			state.emission_warning = ""
 			continue
 		var world := volume.get_world_3d()
 		if world == null:
 			continue
 		var world_id := world.get_instance_id()
-		var sequence: int = int(_published_at.get(id, 0))
-		if not selected.has(world_id) or sequence > int(selected[world_id].sequence):
-			selected[world_id] = {"volume": volume, "sequence": sequence, "id": id, "world": world}
+		if not selected.has(world_id) or state.published_sequence > int(selected[world_id].sequence):
+			selected[world_id] = {"volume": volume, "state": state,
+					"sequence": state.published_sequence, "id": id, "world": world}
 	var result: Array[Dictionary] = []
 	for world_id in selected.keys():
 		var entry: Dictionary = selected[world_id]
 		var volume: FMagicGIVolume = entry.volume
+		var state: RuntimeState = entry.state
 		var id: int = entry.id
-		if not _lighting.has(id):
-			_lighting[id] = Lighting.new()
 		var data := volume.bake_data
 		var bake_version: int = data.bake_version
 		var cache_key := "%d:%d" % [id, bake_version]
+		if state.update_emission_snapshot(volume, data, bake_version):
+			_emission_revision_sequence += 1
+			state.emission_revision = _emission_revision_sequence
 		result.append({
 			"data": data,
 			"version": bake_version,
 			"cache_key": cache_key,
 			"strength": volume.gi_strength,
-			"lighting": _lighting[id].coefficients(volume),
+			"lighting": state.lighting.coefficients(volume),
+			"emission_payload": state.emission_payload,
+			"emission_revision": state.emission_revision,
+			"emission_identity": state.emission_identity if not state.emission_identity.is_empty() else cache_key,
 			"world_id": world_id,
 			"volume_id": id,
 			"render_targets": _render_targets(entry.world),

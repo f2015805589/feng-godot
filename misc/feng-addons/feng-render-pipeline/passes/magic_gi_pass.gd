@@ -161,6 +161,9 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	if not _ensure_bake_resources(cache_key, data, version, rd):
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
+	if not _update_emission_texture(cache_key, _frame_snapshot, data, rd):
+		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		return
 	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
@@ -177,30 +180,48 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 				and cached.get("version", -1) == version \
 				and cached.get("transfer", RID()).is_valid() \
 				and cached.get("geometry", RID()).is_valid() \
-				and cached.get("indices", RID()).is_valid():
+				and cached.get("indices", RID()).is_valid() \
+				and cached.get("emission", RID()).is_valid():
 			return true
 		_release_bake_resources(cache_key, rd)
 
-	# is_valid() traverses the full bake payload. Keep it on the cache-miss path
-	# only; unchanged frames are O(1) and never regenerate or reupload bake data.
-	if not data.has_method("is_valid") or not bool(data.call("is_valid")):
+	# Data owns validation and all atlas layouts. It validates once, then prepares
+	# the complete immutable upload bundle; the FRP boundary only checks its shape.
+	if not data.has_method("make_render_upload"):
+		_report("The selected Magic GI bake does not provide runtime upload data; rebake or update the Magic GI addon.")
+		return false
+	var upload: Variant = data.call("make_render_upload")
+	if not upload is Dictionary:
 		_report("The selected Magic GI bake is invalid or stale; rebake it with the current PRT format.")
 		return false
-	var transfer_image: Image = data.call("make_atlas_image")
-	var geometry_image: Image = data.call("make_geometry_image")
-	var index_bytes: PackedByteArray = data.call("make_index_bytes")
-	if transfer_image == null or geometry_image == null or index_bytes.is_empty():
-		_report("The selected Magic GI bake could not create its PRT lookup textures.")
+	var transfer_value: Variant = upload.get("transfer_image")
+	var geometry_value: Variant = upload.get("geometry_image")
+	var index_value: Variant = upload.get("index_bytes")
+	var emission_value: Variant = upload.get("emission_image")
+	if not transfer_value is Image or not geometry_value is Image \
+			or not index_value is PackedByteArray \
+			or not emission_value is Image:
+		_report("The selected Magic GI bake could not create its complete PRT upload bundle.")
+		return false
+	var transfer_image: Image = transfer_value
+	var geometry_image: Image = geometry_value
+	var index_bytes: PackedByteArray = index_value
+	var emission_image: Image = emission_value
+	if transfer_image.is_empty() or geometry_image.is_empty() or index_bytes.is_empty() \
+			or emission_image.is_empty():
+		_report("The selected Magic GI bake returned an empty runtime upload payload.")
 		return false
 	var transfer_rid := _create_image_texture(rd, transfer_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
 	var geometry_rid := _create_image_texture(rd, geometry_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
 	var dims: Vector3i = data.get("grid_dims")
 	var index_rid := _create_index_texture(rd, dims, index_bytes)
-	if not transfer_rid.is_valid() or not geometry_rid.is_valid() or not index_rid.is_valid():
-		for rid in [transfer_rid, geometry_rid, index_rid]:
+	var emission_rid := _create_image_texture(rd, emission_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
+			RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT)
+	if not transfer_rid.is_valid() or not geometry_rid.is_valid() or not index_rid.is_valid() or not emission_rid.is_valid():
+		for rid in [transfer_rid, geometry_rid, index_rid, emission_rid]:
 			if rid.is_valid():
 				rd.free_rid(rid)
-		_report("RenderingDevice could not upload the Magic GI PRT atlas or index grid.")
+		_report("RenderingDevice could not upload the Magic GI PRT atlas, emission atlas, or index grid.")
 		return false
 	_bake_resources[cache_key] = {
 		"data_id": data.get_instance_id(),
@@ -208,6 +229,9 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 		"transfer": transfer_rid,
 		"geometry": geometry_rid,
 		"indices": index_rid,
+		"emission": emission_rid,
+		"emission_identity": "",
+		"emission_revision": -1,
 		"grid_dims": dims,
 		"spacing": float(data.get("spacing")),
 		"probe_count": int(data.call("probe_count")),
@@ -216,7 +240,45 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	_prune_bake_cache(rd)
 	return true
 
-func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int) -> RID:
+func _make_emission_image(data: Resource, snapshot: Dictionary) -> Image:
+	var payload: Variant = snapshot.get("emission_payload", PackedFloat32Array())
+	if not payload is PackedFloat32Array:
+		_report("Magic GI emissive response is not a packed float array; using a black emission atlas.")
+		payload = PackedFloat32Array()
+	var payload_array: PackedFloat32Array = payload
+	var image: Variant = data.call("make_emission_atlas_image", payload_array)
+	if image is Image:
+		return image
+	if not payload_array.is_empty():
+		_report("Magic GI emissive response does not match the bake; using a black emission atlas.")
+	image = data.call("make_emission_atlas_image", PackedFloat32Array())
+	return image if image is Image else null
+
+func _update_emission_texture(cache_key: String, snapshot: Dictionary, data: Resource, rd: RenderingDevice) -> bool:
+	if not _bake_resources.has(cache_key):
+		return false
+	var cached: Dictionary = _bake_resources[cache_key]
+	var identity := str(snapshot.get("emission_identity", cache_key))
+	var revision := int(snapshot.get("emission_revision", 0))
+	if cached.get("emission_identity", "") == identity \
+			and cached.get("emission_revision", -1) == revision:
+		return true
+	var image := _make_emission_image(data, snapshot)
+	if image == null:
+		_report("Magic GI could not create the emissive atlas; clearing only emissive contribution.")
+		image = data.call("make_emission_atlas_image", PackedFloat32Array())
+		if image == null:
+			return false
+	var emission_rid: RID = cached.get("emission", RID())
+	if not emission_rid.is_valid() or rd.texture_update(emission_rid, 0, image.get_data()) != OK:
+		_report("RenderingDevice could not update the Magic GI emission atlas.")
+		return false
+	cached["emission_identity"] = identity
+	cached["emission_revision"] = revision
+	_bake_resources[cache_key] = cached
+	return true
+
+func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int, extra_usage_bits := 0) -> RID:
 	var format := RDTextureFormat.new()
 	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
 	format.format = data_format
@@ -226,7 +288,7 @@ func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int) 
 	format.array_layers = 1
 	format.mipmaps = 1
 	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
-	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | extra_usage_bits
 	var layer_data: Array[PackedByteArray] = [image.get_data()]
 	return rd.texture_create(format, RDTextureView.new(), layer_data)
 
@@ -262,7 +324,7 @@ func _release_bake_resources(cache_key: String, rd: RenderingDevice) -> void:
 		return
 	var cached: Dictionary = _bake_resources[cache_key]
 	_bake_resources.erase(cache_key)
-	for name in ["transfer", "geometry", "indices"]:
+	for name in ["transfer", "geometry", "indices", "emission"]:
 		var rid: RID = cached.get(name, RID())
 		if rid.is_valid():
 			rd.free_rid(rid)
@@ -326,6 +388,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		{"binding": 6, "texture": cached["transfer"]},
 		{"binding": 7, "texture": cached["geometry"]},
 		{"binding": 8, "texture": cached["indices"]},
+		{"binding": 10, "texture": cached["emission"]},
 	]:
 		var uniform := RDUniform.new()
 		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
@@ -360,7 +423,7 @@ func _notification(what: int) -> void:
 	var ubo := _ubo
 	var bake_rids: Array[RID] = []
 	for cached in _bake_resources.values():
-		for name in ["transfer", "geometry", "indices"]:
+		for name in ["transfer", "geometry", "indices", "emission"]:
 			var rid: RID = cached.get(name, RID())
 			if rid.is_valid():
 				bake_rids.append(rid)

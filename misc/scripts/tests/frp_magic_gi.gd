@@ -3,6 +3,7 @@ extends SceneTree
 
 const Data = preload("res://addons/feng-magic-gi/feng_magic_gi_data.gd")
 const Baker = preload("res://addons/feng-magic-gi/feng_magic_gi_baker.gd")
+const Emission = preload("res://addons/feng-magic-gi/feng_magic_gi_emission.gd")
 const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
 
 var _renderer: FengRenderer
@@ -103,6 +104,19 @@ func changed_texels(a: Image, b: Image, threshold := 0.02) -> int:
 			if color_delta(a.get_pixel(x, y), b.get_pixel(x, y)) > threshold:
 				count += 1
 	return count
+
+func maximum_channel(image_value: Image) -> float:
+	var maximum := 0.0
+	for y in image_value.get_height():
+		for x in image_value.get_width():
+			maximum = maxf(maximum, max_channel(image_value.get_pixel(x, y)))
+	return maximum
+
+func runtime_snapshot() -> Dictionary:
+	for snapshot in Runtime.snapshots():
+		if int(snapshot.get("volume_id", 0)) == _volume.get_instance_id():
+			return snapshot
+	return {}
 
 func run() -> void:
 	print("START FRP Magic GI D3D12 tests")
@@ -331,7 +345,7 @@ func run() -> void:
 		return
 
 	# Consume a bake produced by the CPU baker through the real D3D12 pass as well.
-	# This also exercises cache replacement (synthetic fixture -> persisted PRT v2)
+	# This also exercises cache replacement (synthetic fixture -> persisted PRT v3)
 	# before the process exits and releases the pass-owned GPU resources.
 	var red_wall := MeshInstance3D.new()
 	var wall_mesh := BoxMesh.new()
@@ -342,6 +356,20 @@ func run() -> void:
 	red_wall.mesh = wall_mesh
 	red_wall.position = Vector3(1.0, 1.5, 0.0)
 	scene.add_child(red_wall)
+	var emitter_material := StandardMaterial3D.new()
+	emitter_material.albedo_color = Color.BLACK
+	emitter_material.emission_enabled = true
+	emitter_material.emission = Color.RED
+	emitter_material.emission_energy_multiplier = 1.0
+	var emitter_panel := MeshInstance3D.new()
+	emitter_panel.name = "DynamicEmitterPanel"
+	var emitter_mesh := PlaneMesh.new()
+	emitter_mesh.size = Vector2(0.8, 0.8)
+	emitter_panel.mesh = emitter_mesh
+	emitter_panel.material_override = emitter_material
+	emitter_panel.rotation.x = PI
+	emitter_panel.position = Vector3(-1.8, 2.0, 0.4)
+	scene.add_child(emitter_panel)
 	_volume.bake_samples = 128
 	_volume.bake_bounces = 1
 	_volume.sun = _light
@@ -350,13 +378,27 @@ func run() -> void:
 	_volume.refresh_surface_points()
 	await settle(4)
 	var real_bake_succeeded: bool = await _volume.bake()
-	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v2 resource for the GPU pass"):
+	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v3 resource for the GPU pass"):
 		return
 	var actual_data: Resource = _volume.bake_data
 	var actual_transfer_energy := 0.0
 	for coefficient in actual_data.transfer:
 		actual_transfer_energy += absf(coefficient)
 	if not check(actual_transfer_energy > 0.001, "real bake produced no geometry transfer coefficients"):
+		return
+	var emitter_transport_energy := 0.0
+	for coefficient in actual_data.emitter_transport:
+		emitter_transport_energy += absf(coefficient)
+	print("Actual area-emitter PRT: emitters=", actual_data.emitter_count(),
+		" transport_l1=", emitter_transport_energy)
+	if not check(actual_data.emitter_count() == 1 and emitter_transport_energy > 0.0001,
+			"real CPU bake includes nonzero fixed-area-emitter transport"):
+		return
+	var emission_helper := Emission.new()
+	var initial_emission_values: PackedFloat32Array = emission_helper.read_source_values(_volume, actual_data)
+	if not check(initial_emission_values.size() == 6 and initial_emission_values[0] > 0.99
+			and initial_emission_values[1] == 0.0 and initial_emission_values[2] == 0.0,
+			"runtime helper resolves the baked emitter key to the live red StandardMaterial3D"):
 		return
 	Runtime.publish(_volume)
 	await settle(20)
@@ -377,6 +419,142 @@ func run() -> void:
 	if not check(actual_data.bake_version == actual_transfer_version,
 			"live sunlight changed the actual baked transfer version"):
 		return
+	var immutable_actual_transfer: PackedByteArray = actual_data.transfer.to_byte_array()
+	var immutable_actual_emitter: PackedByteArray = actual_data.emitter_transport.to_byte_array()
+	_volume.sun = null
+	_light.visible = false
+	_environment.sky = null
+	_environment.background_mode = Environment.BG_CLEAR_COLOR
+	_environment.background_color = Color.BLACK
+	_environment.background_energy_multiplier = 0.0
+	_environment.ambient_light_source = Environment.AMBIENT_SOURCE_DISABLED
+	emitter_material.emission_enabled = false
+	Runtime.publish(_volume)
+	await create_timer(0.65).timeout # Lighting scans scene sources every 500 ms.
+	await settle(16)
+	var emitter_off_image := await frame_for(6)
+	var emitter_off_maximum := maximum_channel(emitter_off_image)
+	var off_snapshot := runtime_snapshot()
+	var off_payload: PackedFloat32Array = off_snapshot.get("emission_payload", PackedFloat32Array())
+	print("All distant/emissive sources off: GI max=", emitter_off_maximum,
+		" emission revision=", int(off_snapshot.get("emission_revision", -1)),
+		" payload size=", off_payload.size())
+	if not check(_volume.has_bake() and _packed_float_payload_is_zero(off_payload)
+			and emitter_off_maximum <= 0.000001,
+			"with sun, sky and every area source disabled, GPU GI is strictly black"):
+		return
+	emitter_material.emission_enabled = true
+	emitter_material.emission = Color.RED
+	emitter_material.emission_energy_multiplier = 1.0
+	var emitter_red_values: PackedFloat32Array = emission_helper.read_source_values(_volume, actual_data)
+	var emitter_red_payload: PackedFloat32Array = actual_data.compose_emission(emitter_red_values)
+	Runtime.publish(_volume)
+	await settle(14)
+	var emitter_red_image := await frame_for(6)
+	var emitter_red_pixel := center(emitter_red_image)
+	var red_snapshot := runtime_snapshot()
+	var red_payload: PackedFloat32Array = red_snapshot.get("emission_payload", PackedFloat32Array())
+	var red_revision := int(red_snapshot.get("emission_revision", -1))
+	print("Emitter-only red GI: center=", emitter_red_pixel, " max=", maximum_channel(emitter_red_image),
+		" nonzero=", nonzero_texels(emitter_red_image), " revision=", red_revision)
+	if not check(maximum_channel(emitter_red_image) > 0.02
+			and max_channel(emitter_red_pixel) > 0.02
+			and not _packed_float_payload_is_zero(emitter_red_payload)
+			and not _packed_float_payload_is_zero(red_payload)
+			and red_payload.size() == actual_data.probe_count() * 3,
+			"fixed area emitter produces GPU GI after sun and sky are removed"):
+		return
+	emitter_material.emission = Color.BLUE
+	var before_warning_query := runtime_snapshot()
+	var warning_revision := int(before_warning_query.get("emission_revision", -1))
+	var warning_payload: PackedFloat32Array = before_warning_query.get("emission_payload", PackedFloat32Array()).duplicate()
+	var first_warning := Runtime.emission_warning(_volume)
+	var repeated_warning := Runtime.emission_warning(_volume)
+	_volume._get_configuration_warnings()
+	_volume._get_configuration_warnings()
+	var after_warning_query := runtime_snapshot()
+	var after_warning_payload: PackedFloat32Array = after_warning_query.get("emission_payload", PackedFloat32Array())
+	if not check(first_warning == repeated_warning
+			and int(after_warning_query.get("emission_revision", -1)) == warning_revision
+			and after_warning_payload == warning_payload,
+			"warning getters do not publish changed live emitter values"):
+		return
+	# Return the material to the published value before publishing. A warning query
+	# that silently mutates the emission cache would otherwise allocate a new
+	# revision for this round trip even though the final source value is unchanged.
+	emitter_material.emission = Color.RED
+	Runtime.publish(_volume)
+	var warning_roundtrip_snapshot := runtime_snapshot()
+	var warning_roundtrip_payload: PackedFloat32Array = warning_roundtrip_snapshot.get("emission_payload", PackedFloat32Array())
+	if not check(int(warning_roundtrip_snapshot.get("emission_revision", -1)) == warning_revision
+			and warning_roundtrip_payload == warning_payload,
+			"warning getters leave internal emission payload and revision unchanged"):
+		return
+	emitter_material.emission = Color.BLUE
+	Runtime.publish(_volume)
+	await settle(12)
+	var emitter_blue_image := await frame_for(6)
+	var emitter_blue_pixel := center(emitter_blue_image)
+	var emitter_blue_values: PackedFloat32Array = emission_helper.read_source_values(_volume, actual_data)
+	var emitter_blue_payload: PackedFloat32Array = actual_data.compose_emission(emitter_blue_values)
+	var blue_snapshot := runtime_snapshot()
+	var blue_revision := int(blue_snapshot.get("emission_revision", -1))
+	print("Emitter-only blue GI: center=", emitter_blue_pixel, " max=", maximum_channel(emitter_blue_image),
+		" changed texels=", changed_texels(emitter_red_image, emitter_blue_image), " revision=", blue_revision)
+	if not check(changed_texels(emitter_red_image, emitter_blue_image) > 8
+			and color_delta(emitter_blue_pixel, emitter_red_pixel) > 0.01
+			and blue_revision != red_revision,
+			"changing fixed-emitter RGB updates the live D3D12 GI atlas without rebaking"):
+		return
+	emitter_material.emission_energy_multiplier = 2.0
+	var emitter_double_values: PackedFloat32Array = emission_helper.read_source_values(_volume, actual_data)
+	var emitter_double_payload: PackedFloat32Array = actual_data.compose_emission(emitter_double_values)
+	Runtime.publish(_volume)
+	await settle(12)
+	var emitter_double_image := await frame_for(6)
+	var emitter_double_pixel := center(emitter_double_image)
+	print("Emitter-only doubled energy GI: center=", emitter_double_pixel,
+		" max=", maximum_channel(emitter_double_image),
+		" changed texels=", changed_texels(emitter_blue_image, emitter_double_image))
+	if not check(emitter_double_pixel.b > emitter_blue_pixel.b + 0.001,
+			"doubling live emitter energy increases D3D12 GI response"):
+		return
+	if not check(_packed_payload_ratio_matches(emitter_blue_payload, emitter_double_payload, 2.0),
+			"doubling emitter energy scales raw composed GI exactly 2x"):
+		return
+	var before_reregister := runtime_snapshot()
+	var before_reregister_revision := int(before_reregister.get("emission_revision", -1))
+	var before_reregister_payload: PackedFloat32Array = before_reregister.get("emission_payload", PackedFloat32Array()).duplicate()
+	Runtime.unregister(_volume)
+	emitter_material.emission = Color.GREEN
+	emitter_material.emission_energy_multiplier = 1.0
+	Runtime.register(_volume)
+	Runtime.publish(_volume)
+	await settle(16)
+	var after_reregister := runtime_snapshot()
+	var after_reregister_revision := int(after_reregister.get("emission_revision", -1))
+	var after_reregister_payload: PackedFloat32Array = after_reregister.get("emission_payload", PackedFloat32Array())
+	var reregister_image := await frame_for(6)
+	var reregister_pixel := center(reregister_image)
+	print("Unregister/register with same volume and bake: old revision=", before_reregister_revision,
+		" new revision=", after_reregister_revision, " changed texels=",
+		changed_texels(emitter_double_image, reregister_image))
+	if not check(after_reregister_revision > before_reregister_revision
+			and after_reregister_payload != before_reregister_payload
+			and changed_texels(emitter_double_image, reregister_image) > 8
+			and reregister_pixel.g > reregister_pixel.r,
+			"re-registering the same volume/bake refreshes its GPU emission payload after a live source change"):
+		return
+	emitter_material.emission_enabled = false
+	Runtime.publish(_volume)
+	await settle(14)
+	var final_off_image := await frame_for(6)
+	if not check(maximum_channel(final_off_image) <= 0.000001 and _volume.has_bake()
+			and actual_data.bake_version == actual_transfer_version
+			and actual_data.transfer.to_byte_array() == immutable_actual_transfer
+			and actual_data.emitter_transport.to_byte_array() == immutable_actual_emitter,
+			"turning all emitters off returns to black without changing bake version or data"):
+		return
 	var remaining: Array[FengPass] = _renderer.passes.duplicate()
 	remaining.erase(_magic_pass)
 	_renderer.passes = remaining
@@ -393,3 +571,21 @@ func run() -> void:
 	scene.queue_free()
 	await process_frame
 	quit()
+
+func _packed_float_payload_is_zero(payload: PackedFloat32Array) -> bool:
+	for value in payload:
+		if value != 0.0:
+			return false
+	return true
+
+func _packed_payload_ratio_matches(before: PackedFloat32Array, after: PackedFloat32Array,
+		ratio: float) -> bool:
+	if before.size() != after.size():
+		return false
+	var count := 0
+	for index in before.size():
+		if before[index] > 0.00001:
+			if absf(after[index] / before[index] - ratio) > 0.0001:
+				return false
+			count += 1
+	return count > 0

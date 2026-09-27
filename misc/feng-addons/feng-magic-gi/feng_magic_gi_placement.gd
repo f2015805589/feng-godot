@@ -4,19 +4,22 @@ extends RefCounted
 ## Physics-independent surface sampling and the offline PRT triangle BVH.
 
 const Data = preload("feng_magic_gi_data.gd")
+const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
+const EmitterBinding = preload("feng_magic_gi_emitter_binding.gd")
+const EmitterBakeSet = preload("feng_magic_gi_emitter_bake_set.gd")
 const MAX_PROBES := 65536
 const MAX_GEOMETRY_TRIANGLES := 250000
 const MAX_TERRAIN_CELLS := 500000
 const MAX_SAMPLE_CANDIDATES := 2000000
 const MAX_TRIANGLE_STEPS := 512
-const BROADPHASE_EPSILON := 0.001
-
-static var _watched_resources: Dictionary = {}
-static var _resource_revisions: Dictionary = {}
-static var _next_resource_prune := 0
+const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 
 var faces := PackedVector3Array()
 var reflectance := PackedVector3Array()
+var face_emitter_indices := PackedInt32Array()
+var emitter_keys := PackedStringArray()
+var emitter_static_signatures := PackedInt64Array()
+var emitter_groups: Array[Dictionary] = []
 var bvh: TriangleMesh
 var positions := PackedVector3Array()
 var normals := PackedVector3Array()
@@ -29,6 +32,7 @@ var _spatial_hash: Dictionary = {}
 var _cell_counts: Dictionary = {}
 var _volume: Node3D
 var _world: World3D
+var _collect_emission := false
 var _bounds: AABB
 var _world_bounds: AABB
 var _bake_world_bounds: AABB
@@ -39,10 +43,15 @@ var _candidate_count := 0
 var _terrain_work := 0
 var _triangle_count := 0
 var _triangle_reflectance: Vector3
+var _triangle_emitter_index := -1
+var _scene_root: Node
+var _emitter_set: EmitterBakeSet
 
-func collect(volume: Node3D, for_bake := false, build_bvh := true) -> bool:
+func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emission := false) -> bool:
 	_volume = volume
 	_world = volume.get_world_3d()
+	_collect_emission = collect_emission
+	_emitter_set = EmitterBakeSet.new()
 	_inverse = volume.global_transform.affine_inverse()
 	_dimensions = volume.grid_dimensions()
 	_bounds = AABB(-volume.size * 0.5, volume.size)
@@ -51,6 +60,10 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true) -> bool:
 	error_message = ""
 	faces.clear()
 	reflectance.clear()
+	face_emitter_indices.clear()
+	emitter_keys.clear()
+	emitter_static_signatures.clear()
+	emitter_groups.clear()
 	positions.clear()
 	normals.clear()
 	_cells.clear()
@@ -60,6 +73,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true) -> bool:
 	_candidate_count = 0
 	_terrain_work = 0
 	_triangle_count = 0
+	_triangle_emitter_index = -1
 	bvh = null
 	bvh_ready = false
 	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
@@ -67,10 +81,8 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true) -> bool:
 			or _dimensions.z > Data.MAX_GRID_AXIS:
 		error_message = "Lookup grid exceeds the supported 64 cells per axis."
 		return false
-	var root: Node = volume
-	while root.get_parent() != null and not root.get_parent() is Viewport:
-		root = root.get_parent()
-	_collect_node(root, for_bake)
+	_scene_root = scene_root(volume)
+	_collect_node(_scene_root, for_bake)
 	if not error_message.is_empty():
 		return false
 	if for_bake and build_bvh and not faces.is_empty():
@@ -82,6 +94,9 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true) -> bool:
 	for entry in _cells.values():
 		positions.append(entry.position)
 		normals.append(entry.normal)
+	emitter_keys = _emitter_set.keys
+	emitter_static_signatures = _emitter_set.static_signatures
+	emitter_groups = _emitter_set.groups
 	scene_signature = hash([faces, reflectance, positions, normals])
 	return true
 
@@ -90,9 +105,7 @@ func _collect_node(node: Node, for_bake: bool) -> void:
 		return
 	# A nested SubViewport with its own World3D is a hard scene boundary. Geometry
 	# and sources from it must not leak into another world's transport.
-	if node is Viewport and node != _volume and node.find_world_3d() != _world:
-		return
-	if node is Node3D and node != _volume and node.get_world_3d() != _world:
+	if SceneTracker.should_skip_world_boundary(node, _scene_root, _world):
 		return
 	if node is MeshInstance3D and node.mesh != null and node.is_visible_in_tree():
 		_collect_mesh(node, for_bake)
@@ -108,45 +121,100 @@ func _collect_mesh(node: MeshInstance3D, for_bake: bool) -> void:
 	var mesh_world_box: AABB = node.global_transform * mesh.get_aabb()
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(_bake_world_bounds.grow(BROADPHASE_EPSILON)):
 		return
-	# PrimitiveMesh and custom Mesh resources expose their triangles through
-	# get_faces(), while per-surface array/type access is only bound for ArrayMesh.
+	if mesh is PrimitiveMesh:
+		var arrays: Array = mesh.get_mesh_arrays()
+		if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
+			_collect_primitive_surface(node, mesh, arrays, for_bake)
+			return
+		_collect_faces_only_mesh(node, mesh, for_bake)
+		return
 	if not mesh is ArrayMesh:
 		if mesh.get_surface_count() > 1:
 			error_message = "Non-ArrayMesh resources with multiple material surfaces cannot provide per-face reflectance."
 			return
-		var primitive_faces: PackedVector3Array = mesh.get_faces()
-		if primitive_faces.is_empty() or not _prepare_surface(node, 0):
-			return
-		for i in range(0, primitive_faces.size() - 2, 3):
-			var a: Vector3 = node.global_transform * primitive_faces[i]
-			var b: Vector3 = node.global_transform * primitive_faces[i + 1]
-			var c: Vector3 = node.global_transform * primitive_faces[i + 2]
-			if not _triangle(a, b, c, for_bake):
-				return
+		_collect_faces_only_mesh(node, mesh, for_bake)
 		return
 	for surface in mesh.get_surface_count():
 		if mesh.surface_get_primitive_type(surface) != Mesh.PRIMITIVE_TRIANGLES:
 			continue
 		var arrays := mesh.surface_get_arrays(surface)
-		if arrays.is_empty() or arrays[Mesh.ARRAY_VERTEX] == null:
-			continue
-		var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
-		var count := indices.size() if not indices.is_empty() else vertices.size()
-		if not _prepare_surface(node, surface):
-			continue
-		for i in range(0, count - 2, 3):
-			var a: Vector3 = node.global_transform * vertices[indices[i] if not indices.is_empty() else i]
-			var b: Vector3 = node.global_transform * vertices[indices[i + 1] if not indices.is_empty() else i + 1]
-			var c: Vector3 = node.global_transform * vertices[indices[i + 2] if not indices.is_empty() else i + 2]
-			if not _triangle(a, b, c, for_bake):
-				return
+		_collect_array_surface(node, surface, arrays, for_bake)
+		if not error_message.is_empty():
+			return
 
-func _prepare_surface(node: MeshInstance3D, surface: int) -> bool:
+func _collect_faces_only_mesh(node: MeshInstance3D, mesh: Mesh, for_bake: bool) -> void:
+	var primitive_faces: PackedVector3Array = mesh.get_faces()
+	if primitive_faces.is_empty():
+		return
+	if not _prepare_surface(node, 0):
+		return
+	if _triangle_emitter_index >= 0:
+		error_message = "An emissive mesh without CPU-accessible UV arrays cannot be baked as an area source."
+		return
+	for i in range(0, primitive_faces.size() - 2, 3):
+		var a: Vector3 = node.global_transform * primitive_faces[i]
+		var b: Vector3 = node.global_transform * primitive_faces[i + 1]
+		var c: Vector3 = node.global_transform * primitive_faces[i + 2]
+		if not _triangle(a, b, c, for_bake):
+			return
+
+func _collect_primitive_surface(node: MeshInstance3D, mesh: PrimitiveMesh,
+		arrays: Array, for_bake: bool) -> void:
+	_collect_surface_triangles(node, 0, arrays, for_bake, mesh)
+
+func _collect_array_surface(node: MeshInstance3D, surface: int, arrays: Array, for_bake: bool) -> void:
+	_collect_surface_triangles(node, surface, arrays, for_bake)
+
+func _collect_surface_triangles(node: MeshInstance3D, surface: int, arrays: Array,
+		for_bake: bool, primitive_mesh: PrimitiveMesh = null) -> void:
+	if arrays.is_empty() or arrays[Mesh.ARRAY_VERTEX] == null:
+		return
+	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+	var uv1: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays.size() > Mesh.ARRAY_TEX_UV and arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
+	var uv2: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV2] if arrays.size() > Mesh.ARRAY_TEX_UV2 and arrays[Mesh.ARRAY_TEX_UV2] != null else PackedVector2Array()
+	var count := indices.size() if not indices.is_empty() else vertices.size()
+	var snapped_faces: PackedVector3Array
+	if primitive_mesh != null:
+		snapped_faces = primitive_mesh.get_faces()
+		if count % 3 != 0 or snapped_faces.size() != count:
+			error_message = "PrimitiveMesh face positions and array UV indices disagree; refusing unstable surface data."
+			return
+	if not _prepare_surface(node, surface, uv1, uv2, vertices.size()):
+		return
+	for i in range(0, count - 2, 3):
+		var ia := indices[i] if not indices.is_empty() else i
+		var ib := indices[i + 1] if not indices.is_empty() else i + 1
+		var ic := indices[i + 2] if not indices.is_empty() else i + 2
+		# PrimitiveMesh.get_faces() snaps positions through TriangleMesh; preserve
+		# that legacy geometry order while taking UVs from the matching arrays.
+		var a: Vector3 = node.global_transform * (snapped_faces[i] if primitive_mesh != null else vertices[ia])
+		var b: Vector3 = node.global_transform * (snapped_faces[i + 1] if primitive_mesh != null else vertices[ib])
+		var c: Vector3 = node.global_transform * (snapped_faces[i + 2] if primitive_mesh != null else vertices[ic])
+		var ta := uv1[ia] if uv1.size() == vertices.size() else Vector2.ZERO
+		var tb := uv1[ib] if uv1.size() == vertices.size() else Vector2.ZERO
+		var tc := uv1[ic] if uv1.size() == vertices.size() else Vector2.ZERO
+		var t2a := uv2[ia] if uv2.size() == vertices.size() else Vector2.ZERO
+		var t2b := uv2[ib] if uv2.size() == vertices.size() else Vector2.ZERO
+		var t2c := uv2[ic] if uv2.size() == vertices.size() else Vector2.ZERO
+		if not _triangle(a, b, c, for_bake, ta, tb, tc, t2a, t2b, t2c):
+			return
+
+func _prepare_surface(node: MeshInstance3D, surface: int,
+		uv1 := PackedVector2Array(), uv2 := PackedVector2Array(), vertex_count := 0) -> bool:
+	_triangle_emitter_index = -1
 	var material := node.get_active_material(surface)
 	if material is BaseMaterial3D and material.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
+		if _collect_emission and material.emission_enabled:
+			error_message = "Transparent emissive surfaces are not supported by the static area-source baker."
 		return false # Transparent surfaces cannot be represented by this opaque PRT bake.
 	_triangle_reflectance = _material_reflectance(material)
+	if _collect_emission and material is BaseMaterial3D and material.emission_enabled:
+		_triangle_emitter_index = _emitter_set.register_surface(
+				_scene_root, node, surface, material, uv1, uv2, vertex_count)
+		if not _emitter_set.error_message.is_empty():
+			error_message = _emitter_set.error_message
+			return false
 	return true
 
 func _material_reflectance(material: Material) -> Vector3:
@@ -165,6 +233,7 @@ func _material_reflectance(material: Material) -> Vector3:
 	return color
 
 func _collect_terrain(terrain: Node3D, for_bake: bool) -> void:
+	_triangle_emitter_index = -1
 	var data = terrain.get("data")
 	if not data.has_method("get_surface_height"):
 		error_message = "Terrain3D data is missing get_surface_height(); refusing raw height sampling."
@@ -206,7 +275,9 @@ func _collect_terrain(terrain: Node3D, for_bake: bool) -> void:
 			if not _triangle(a, b, c, for_bake) or not _triangle(b, d, c, for_bake):
 				return
 
-func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool) -> bool:
+func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool,
+		uv1_a := Vector2.ZERO, uv1_b := Vector2.ZERO, uv1_c := Vector2.ZERO,
+		uv2_a := Vector2.ZERO, uv2_b := Vector2.ZERO, uv2_c := Vector2.ZERO) -> bool:
 	var triangle_box := AABB(a, Vector3.ZERO).expand(b).expand(c)
 	if not triangle_box.grow(BROADPHASE_EPSILON).intersects(_bake_world_bounds.grow(BROADPHASE_EPSILON)):
 		return true
@@ -219,6 +290,10 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool) -> bool:
 		return false
 	faces.append_array([a, b, c])
 	reflectance.append(_triangle_reflectance)
+	face_emitter_indices.append(_triangle_emitter_index)
+	if _triangle_emitter_index >= 0:
+		_emitter_set.append_triangle(_triangle_emitter_index, a, b, c, normal,
+				uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c)
 	var polygon := [_inverse * a, _inverse * b, _inverse * c]
 	polygon = _clip_polygon(polygon, 0, -_volume.size.x * 0.5, true)
 	polygon = _clip_polygon(polygon, 0, _volume.size.x * 0.5, false)
@@ -335,95 +410,36 @@ func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictiona
 		return {}
 	var hit := bvh.intersect_segment(origin, origin + direction * max_distance)
 	if not hit.is_empty():
-		hit["albedo"] = reflectance[int(hit["face_index"])]
+		var face_index := int(hit["face_index"])
+		hit["albedo"] = reflectance[face_index]
+		hit["emitter_index"] = face_emitter_indices[face_index]
 	return hit
 
-## Cheap editor/runtime polling fingerprint. It walks scene nodes and their
-## transforms/material properties but does not read mesh vertex arrays or sample
-## the surface; full placement/signature rebuilds happen only on a change.
+## Uniform-area next-event sample for one fixed emissive surface binding.
+## Returns the geometric estimator weight and texture sample, but never source color.
+func sample_emitter_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
+		u_triangle: float, u_barycentric: float, u_edge: float, max_distance: float) -> Dictionary:
+	if _emitter_set == null:
+		return {}
+	return _emitter_set.sample_connection(emitter_index, receiver, receiver_normal,
+			u_triangle, u_barycentric, u_edge, max_distance, _volume.surface_offset)
+
+static func scene_root(volume: Node) -> Node:
+	return SceneTracker.scene_root(volume)
+
+static func make_emitter_key(root: Node, node: Node, surface: int) -> String:
+	return EmitterBinding.make_key(root, node, surface)
+
+static func emitter_static_signature(node: MeshInstance3D, surface: int,
+		material: BaseMaterial3D) -> int:
+	return EmitterBinding.static_signature(node, surface, material)
+
+static func emitter_runtime_fingerprint(node: MeshInstance3D, surface: int,
+		material: BaseMaterial3D) -> int:
+	return EmitterBinding.runtime_fingerprint(node, surface, material)
+
+static func current_emitter_keys(volume: Node3D) -> PackedStringArray:
+	return EmitterBinding.current_keys(volume)
+
 static func quick_signature(volume: Node3D) -> int:
-	var values: Array = [volume.global_transform, volume.size, volume.probe_spacing,
-			volume.surface_offset, volume.bake_distance, volume.terrain_reflectance,
-			volume.fallback_material_reflectance]
-	var root: Node = volume
-	while root.get_parent() != null and not root.get_parent() is Viewport:
-		root = root.get_parent()
-	_append_quick_signature(root, volume.get_world_3d(), values)
-	return hash(values)
-
-static func _append_quick_signature(node: Node, world: World3D, values: Array) -> void:
-	if node is Viewport and node.find_world_3d() != world:
-		return
-	if node is Node3D and node.get_world_3d() != world:
-		return
-	if node is MeshInstance3D and node.mesh != null:
-		var mesh: Mesh = node.mesh
-		_watch_resource(mesh)
-		var material_values: Array = []
-		for surface in mesh.get_surface_count():
-			var material: Material = node.get_active_material(surface)
-			if material == null:
-				material_values.append([0, _resource_revision(null)])
-				continue
-			_watch_resource(material)
-			var properties: Array = [material.get_instance_id(), _resource_revision(material)]
-			if material is BaseMaterial3D:
-				properties.append_array([material.albedo_color, material.metallic,
-						material.transparency, material.albedo_texture.get_instance_id() if material.albedo_texture != null else 0])
-				if material.albedo_texture != null:
-					_watch_resource(material.albedo_texture)
-			material_values.append(properties)
-		values.append([node.get_instance_id(), node.global_transform, node.is_visible_in_tree(),
-				mesh.get_instance_id(), _resource_revision(mesh), mesh.get_surface_count(), material_values])
-	elif node.is_class("Terrain3D"):
-		var data = node.get("data")
-		if data is Object:
-			_watch_object(data)
-		values.append([node.get_instance_id(), node.global_transform, node.is_visible_in_tree(),
-				data.get_instance_id() if data is Object else 0, _resource_revision(data),
-				node.get("vertex_spacing")])
-	for child in node.get_children():
-		_append_quick_signature(child, world, values)
-
-static func _watch_resource(resource: Resource) -> void:
-	_watch_object(resource)
-
-static func _watch_object(object_value: Object) -> void:
-	if object_value == null:
-		return
-	var now := Time.get_ticks_msec()
-	if now >= _next_resource_prune:
-		_prune_watched_objects()
-		_next_resource_prune = now + 10000
-	var id := object_value.get_instance_id()
-	if _watched_resources.has(id):
-		return
-	_watched_resources[id] = weakref(object_value)
-	_resource_revisions[id] = 0
-	if object_value.has_signal("changed"):
-		object_value.connect("changed", _on_object_changed.bind(id))
-	for signal_name in ["maps_changed", "region_map_changed", "height_maps_changed",
-			"control_maps_changed", "color_maps_changed", "surface_maps_changed"]:
-		if object_value.has_signal(signal_name):
-			object_value.connect(signal_name, _on_object_changed.bind(id))
-	if object_value.has_signal("maps_edited"):
-		object_value.connect("maps_edited", _on_object_area_changed.bind(id))
-
-static func _on_object_changed(id: int) -> void:
-	_resource_revisions[id] = int(_resource_revisions.get(id, 0)) + 1
-
-static func _on_object_area_changed(_area: AABB, id: int) -> void:
-	_resource_revisions[id] = int(_resource_revisions.get(id, 0)) + 1
-
-static func _resource_revision(object_value: Object) -> int:
-	if object_value == null:
-		return 0
-	var id := object_value.get_instance_id()
-	return int(_resource_revisions.get(id, 0))
-
-static func _prune_watched_objects() -> void:
-	for id in _watched_resources.keys():
-		var reference: WeakRef = _watched_resources[id]
-		if reference.get_ref() == null:
-			_watched_resources.erase(id)
-			_resource_revisions.erase(id)
+	return SceneTracker.quick_signature(volume)

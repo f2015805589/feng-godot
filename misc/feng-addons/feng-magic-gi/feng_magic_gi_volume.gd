@@ -8,7 +8,7 @@ const Baker = preload("feng_magic_gi_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
 const Viz = preload("feng_magic_gi_viz.gd")
 const Data = preload("feng_magic_gi_data.gd")
-const ZERO_TRANSFER_DIAGNOSTIC := "本次间接传输全为零，Magic GI 不会改变画面。纯间接 PRT 不烘焙直接光；请检查 Terrain 静态采样，并让 Volume 与 Bake Distance 覆盖可把光反弹到接收面的表面后重新烘焙。"
+const ZERO_TRANSFER_DIAGNOSTIC := "本次间接传输全为零，Magic GI 不会改变画面。太阳与环境直达光由引擎处理；若需间接光，请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新烘焙。"
 const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
 const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 
@@ -95,8 +95,9 @@ var _validity_instance_id := 0
 var _validity_bake_version := -1
 var _validity_checked := false
 var _cached_data_valid := false
-var _cached_has_nonzero_transfer := false
+var _cached_has_nonzero_indirect_transport := false
 var _scene_signature_checked := false
+var _last_emission_warning := ""
 
 func _enter_tree() -> void:
 	set_notify_transform(true)
@@ -116,6 +117,11 @@ func _process(_delta: float) -> void:
 		if quick_signature != _quick_scene_signature:
 			_quick_scene_signature = quick_signature
 			refresh_surface_points()
+		Runtime.refresh_emission_diagnostics(self)
+		var emission_warning := Runtime.emission_warning(self)
+		if emission_warning != _last_emission_warning:
+			_last_emission_warning = emission_warning
+			update_configuration_warnings()
 
 func has_bake() -> bool:
 	if not is_inside_tree() or bake_data == null or not _scene_signature_checked:
@@ -125,13 +131,13 @@ func has_bake() -> bool:
 		_validity_instance_id = identity
 		_validity_bake_version = bake_data.bake_version
 		_cached_data_valid = bake_data.is_valid()
-		_cached_has_nonzero_transfer = _cached_data_valid and bake_data.has_nonzero_transfer()
+		_cached_has_nonzero_indirect_transport = _cached_data_valid and bake_data.has_nonzero_transfer()
 		_validity_checked = true
 	if not _cached_data_valid:
 		return false
 	return bake_data.matches_layout(size, probe_spacing, surface_offset, global_transform,
 			bake_samples, bake_bounces, bake_distance, terrain_reflectance, fallback_material_reflectance) \
-		and bake_data.scene_signature == Baker.signature_for_geometry(_current_scene_signature)
+		and bake_data.scene_signature == Data.signature_for_geometry(_current_scene_signature)
 
 func has_legacy_sampler_signature() -> bool:
 	return bake_data != null and _scene_signature_checked \
@@ -151,7 +157,7 @@ func bake_staleness_reasons() -> PackedStringArray:
 	return reasons
 
 func has_nonzero_indirect_transfer() -> bool:
-	return has_bake() and _cached_has_nonzero_transfer
+	return has_bake() and _cached_has_nonzero_indirect_transport
 
 func probe_count() -> int:
 	return probe_positions.size()
@@ -188,6 +194,11 @@ func bake() -> bool:
 	refresh_surface_points()
 	Runtime.publish(self)
 	return has_bake()
+
+## Public bake-generation check used by the async Baker after yielding. The
+## generation remains private so callers cannot invalidate a bake themselves.
+func is_bake_request_current(generation: int) -> bool:
+	return is_inside_tree() and generation == _bake_generation
 
 func _rebuild_probes() -> void:
 	if not is_inside_tree() or _layout_queued:
@@ -236,7 +247,7 @@ func _sample_quality_changed() -> void:
 func _invalidate_data_cache() -> void:
 	_validity_checked = false
 	_cached_data_valid = false
-	_cached_has_nonzero_transfer = false
+	_cached_has_nonzero_indirect_transport = false
 
 func _on_data_changed() -> void:
 	_invalidate_data_cache()
@@ -250,8 +261,11 @@ func _get_configuration_warnings() -> PackedStringArray:
 	if bake_data != null and _scene_signature_checked:
 		if not has_bake():
 			warnings.append("Stale PRT bake: %s. Re-bake to update it." % "; ".join(bake_staleness_reasons()))
-		elif not _cached_has_nonzero_transfer:
+		elif not _cached_has_nonzero_indirect_transport:
 			warnings.append(ZERO_TRANSFER_DIAGNOSTIC)
+		var emission_warning := Runtime.emission_warning(self)
+		if not emission_warning.is_empty():
+			warnings.append(emission_warning)
 	if probe_count() >= Placement.MAX_PROBES:
 		warnings.append("Surface sample limit reached. Increase Probe Spacing or reduce the volume.")
 	if probe_count() == 0 and _scene_signature_checked:

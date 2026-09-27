@@ -7,21 +7,19 @@ extends RefCounted
 const Data = preload("feng_magic_gi_data.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
 const MAX_BAKE_PATHS := 20000000
-const SAMPLER_REVISION := 2
+const SAMPLER_REVISION := Data.SAMPLER_REVISION
 const QMC_PRIME_BASES := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]
 
 ## The persisted geometry signature also identifies the estimator that created it.
 ## This leaves the v2 transport layout intact while making older random bakes stale.
 static func signature_for_geometry(geometry_signature: int) -> int:
-	# Placement signatures are 32-bit hashes; keep their bits and reserve the
-	# high word for the estimator revision so legacy raw signatures cannot match.
-	return (SAMPLER_REVISION << 32) | (geometry_signature & 0xffffffff)
+	return Data.signature_for_geometry(geometry_signature)
 
 func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not volume.is_inside_tree():
 		return null
 	var geometry := Placement.new()
-	if not geometry.collect(volume, true):
+	if not geometry.collect(volume, true, true, true):
 		push_warning("FMagicGI: " + geometry.error_message)
 		return null
 	if geometry.positions.is_empty():
@@ -32,8 +30,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if rays < 1 or rays > 65536 or bounces < 1 or bounces > 8 or volume.bake_distance <= 0.0:
 		push_warning("FMagicGI: invalid bake sample, bounce, or distance settings.")
 		return null
-	if geometry.positions.size() * rays * (bounces + 1) > MAX_BAKE_PATHS:
-		push_warning("FMagicGI: requested bake exceeds the 20,000,000 ray-work limit; increase Probe Spacing or reduce samples/bounces.")
+	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitter_groups.size())
+	if geometry.positions.size() * rays * work_per_probe_sample > MAX_BAKE_PATHS:
+		push_warning("FMagicGI: PRT and emissive-source shadow rays exceed the 20,000,000 work limit; increase Probe Spacing or reduce samples, bounces, or emitter count.")
 		return null
 	var data := Data.new()
 	data.format_version = Data.FORMAT_VERSION
@@ -53,6 +52,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.positions = geometry.positions
 	data.normals = geometry.normals
 	data.transfer.resize(data.probe_count() * 27)
+	data.emitter_keys = geometry.emitter_keys
+	data.emitter_static_signatures = geometry.emitter_static_signatures
+	data.emitter_transport.resize(data.probe_count() * geometry.emitter_groups.size() * 6)
 	var epsilon: float = maxf(0.001, volume.surface_offset)
 	for p in data.probe_count():
 		# A per-probe Cranley-Patterson shift randomizes the low-discrepancy
@@ -63,13 +65,40 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 		shifts.resize((bounces + 1) * 2)
 		for dimension in shifts.size():
 			shifts[dimension] = shift_rng.randf()
+		var emitter_shifts := PackedFloat32Array()
+		emitter_shifts.resize((bounces + 1) * geometry.emitter_groups.size() * 3)
+		var emitter_shift_rng := RandomNumberGenerator.new()
+		emitter_shift_rng.seed = int(hash([geometry_signature, SAMPLER_REVISION, p, "emission"]))
+		for dimension in emitter_shifts.size():
+			emitter_shifts[dimension] = emitter_shift_rng.randf()
 		for sample_index in rays:
 			var origin := data.positions[p]
+			var vertex_position := data.positions[p] - data.normals[p] * volume.surface_offset
+			var vertex_normal := data.normals[p]
 			var direction := cosine_direction(data.normals[p],
 				qmc_sample(sample_index, rays, 0, shifts[0]),
 				qmc_sample(sample_index, rays, 1, shifts[1]))
 			var throughput := Vector3.ONE
 			for bounce in bounces + 1:
+				for emitter in geometry.emitter_groups.size():
+					var shift_index := (bounce * geometry.emitter_groups.size() + emitter) * 3
+					var source_sample := geometry.sample_emitter_connection(emitter,
+						vertex_position, vertex_normal,
+						qmc_sample(sample_index, rays, 0, emitter_shifts[shift_index]),
+						qmc_sample(sample_index, rays, 1, emitter_shifts[shift_index + 1]),
+						qmc_sample(sample_index, rays, 2, emitter_shifts[shift_index + 2]),
+						volume.bake_distance)
+					if not source_sample.is_empty() and float(source_sample.weight) > 0.0 \
+							and float(source_sample.ray_distance) > 0.0:
+						var blocked := geometry.trace(source_sample.ray_origin,
+							source_sample.direction, source_sample.ray_distance)
+						if blocked.is_empty():
+							var emitter_base := (emitter * data.probe_count() + p) * 6
+							var factor: float = float(source_sample.weight) / rays
+							var texture_rgb: Vector3 = source_sample.texture_rgb
+							for channel in 3:
+								data.emitter_transport[emitter_base + channel] += throughput[channel] * factor
+								data.emitter_transport[emitter_base + 3 + channel] += throughput[channel] * factor * texture_rgb[channel]
 				var hit := geometry.trace(origin, direction, volume.bake_distance)
 				if hit.is_empty():
 					# The initial escape is direct lighting and must not be baked:
@@ -86,6 +115,8 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 				if throughput.length_squared() < 0.00001:
 					break
 				var hit_normal: Vector3 = hit.normal
+				vertex_position = hit.position
+				vertex_normal = hit_normal
 				origin = hit.position + hit_normal * epsilon
 				var dimension := (bounce + 1) * 2
 				direction = cosine_direction(hit_normal,
@@ -93,15 +124,19 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 					qmc_sample(sample_index, rays, dimension + 1, shifts[dimension + 1]))
 		if p % 4 == 0:
 			await volume.get_tree().process_frame
-			if not is_instance_valid(volume) or not volume.is_inside_tree() or volume._bake_generation != generation:
+			if not is_instance_valid(volume) or not volume.is_inside_tree() \
+					or not volume.is_bake_request_current(generation):
 				return null
 	# Recollect after yielding so edits to static scene content invalidate this
 	# result even if the volume transform did not change.
 	var verification := Placement.new()
-	if not verification.collect(volume, true) or verification.scene_signature != geometry_signature:
+	if not verification.collect(volume, true, true, true) or verification.scene_signature != geometry_signature \
+			or verification.emitter_keys != geometry.emitter_keys \
+			or verification.emitter_static_signatures != geometry.emitter_static_signatures:
 		push_warning("FMagicGI: scene geometry changed during baking; discarded stale transfer.")
 		return null
-	if volume._bake_generation != generation or not data.matches_layout(
+	if not is_instance_valid(volume) or not volume.is_bake_request_current(generation) \
+			or not data.matches_layout(
 			volume.size, volume.probe_spacing, volume.surface_offset, volume.global_transform,
 			volume.bake_samples, volume.bake_bounces, volume.bake_distance,
 			volume.terrain_reflectance, volume.fallback_material_reflectance):

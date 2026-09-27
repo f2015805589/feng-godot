@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/debug-buffers/debug_buffe
 dest_files=["res://.godot/imported/debug_buffers.glsl-e4705187793089dc79743cf85699f802.res"]
 
 [params]
+
