@@ -1,0 +1,25 @@
+[gd_resource type="CompositorEffect" script_class="FengHeightFogPass" load_steps=5 format=3 uid="uid://comttle7lsk0c"]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/height_fog_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/height-fog/height_fog.glsl" id="3"]
+
+[sub_resource type="Resource" id="Color"]
+script = ExtResource("2")
+binding = 0
+source = 0
+binding_type = 1
+
+[sub_resource type="Resource" id="Depth"]
+script = ExtResource("2")
+binding = 1
+source = 1
+
+[resource]
+resource_name = "Height Fog"
+script = ExtResource("1")
+stage = 4
+shader_file = ExtResource("3")
+mode = 0
+parameters = Vector4(1, 1, 1, 1)
+inputs = Array[ExtResource("2")]([SubResource("Color"), SubResource("Depth")])

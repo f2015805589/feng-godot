@@ -670,33 +670,42 @@ func run() -> void:
 	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
-	# Manifest metadata seeds Color Grade, enabled Magic GI after Lighting, and
-	# disabled Debug Buffers after Post Process. Other effects remain opt-in.
+	# Manifest metadata seeds Color Grade, enabled Magic GI after Lighting, enabled
+	# Height Fog after Sky, and disabled Debug Buffers after Post Process. Other
+	# effects remain opt-in.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
 			library_entries.append(value)
-	require(library_entries.size() == 3, "the default pipeline must seed Color Grade, Magic GI and Debug Buffers, got %d library entries" % library_entries.size())
-	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 3,
-		"the default pipeline must have eight native and three seeded library entries, got %d" % unified_renderer.passes.size())
+	require(library_entries.size() == 4, "the default pipeline must seed Color Grade, Magic GI, Height Fog and Debug Buffers, got %d library entries" % library_entries.size())
+	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 4,
+		"the default pipeline must have eight native and four seeded library entries, got %d" % unified_renderer.passes.size())
 	var seeded_magic_index := -1
+	var seeded_fog_index := -1
 	var seeded_debug_index := -1
 	var seeded_lighting_index := -1
 	var seeded_sky_index := -1
+	var seeded_transparent_index := -1
 	var seeded_post_index := -1
 	for i in unified_renderer.passes.size():
 		var entry = unified_renderer.passes[i]
 		if _native_id(entry) == 3: seeded_lighting_index = i
 		if _native_id(entry) == 4: seeded_sky_index = i
+		if _native_id(entry) == 5: seeded_transparent_index = i
 		if _native_id(entry) == 7: seeded_post_index = i
 		if String(entry.stable_id) == "library:magic_gi":
 			seeded_magic_index = i
 			require(entry.enabled, "Magic GI must be enabled in the fresh default pipeline")
+		if String(entry.stable_id) == "library:height_fog":
+			seeded_fog_index = i
+			require(entry.enabled, "Height Fog must be enabled in the fresh default pipeline")
 		if String(entry.stable_id) == "library:debug_buffers":
 			seeded_debug_index = i
 			require(not entry.enabled, "Debug Buffers must be disabled in the fresh default pipeline")
 	require(seeded_lighting_index < seeded_magic_index and seeded_magic_index < seeded_sky_index,
 		"Magic GI must be anchored after Lighting and before Sky")
+	require(seeded_sky_index < seeded_fog_index and seeded_fog_index < seeded_transparent_index,
+		"Height Fog must be anchored after Sky and before Transparent")
 	require(seeded_debug_index > seeded_post_index, "Debug Buffers must be anchored after Post Process")
 	var default_debug = unified_renderer.passes[seeded_debug_index]
 	require(not default_debug.needs_motion_vectors, "the default diffuse debug selection must not request motion-vector attachments")

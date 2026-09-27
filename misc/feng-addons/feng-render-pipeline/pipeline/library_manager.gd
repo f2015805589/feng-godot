@@ -24,6 +24,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
 	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
+	{"id": "library:height_fog", "path": "height-fog/height_fog.tres", "name": "Height Fog", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Height Fog was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
 	{"id": "library:debug_buffers", "path": "debug-buffers/debug_buffers.tres", "name": "Debug Buffers", "default_enabled": false, "after_native": NativeSpec.PASS_POST_PROCESS},
 ]
 
@@ -32,6 +33,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:color_grade",
 	"library:magic_gi",
+	"library:height_fog",
 	"library:debug_buffers",
 ]
 
