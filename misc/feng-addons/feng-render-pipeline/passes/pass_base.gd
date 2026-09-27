@@ -295,6 +295,8 @@ func refresh_resource_flags() -> void:
 			depth_required = true
 		elif declaration.source == TextureInput.Source.NORMAL_ROUGHNESS:
 			normal_required = true
+		elif declaration.source == TextureInput.Source.MOTION_VECTORS:
+			needs_motion_vectors = true
 	if color_required:
 		access_resolved_color = true
 	if depth_required:

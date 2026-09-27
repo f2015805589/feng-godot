@@ -43,11 +43,9 @@ const NATIVE_PASS_SCRIPTS := {
 
 const NativePass = preload("passes/native/native_pass.gd")
 
-## Library entries a fresh pipeline seeds, placed directly before Post Process, so the
-## pipeline reads Shadow Precompute, VT, GBuffer, Lighting, Sky, Transparent, Temporal
-## AA, Color Grade, Post — the nine passes, in execution order.
-## A renderer's complete default list is native work with the library's
-## custom effects inserted at the history-copy/temporal-AA boundary.
+## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
+## Shadow Precompute, VT, GBuffer, Lighting, Magic GI, Sky, Transparent, Temporal AA,
+## Color Grade, Post Process, Debug Buffers.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
 
 ## The library entries a fresh pipeline seeds.
@@ -111,7 +109,7 @@ func _init() -> void:
 	# default-list read. Resource loading restores its serialized version later.
 	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 	# Seed on first use. Loading or duplicating a Renderer restores its own pass
-	# list: allocating nine throwaway default passes here needlessly loads shader
+	# list: allocating eleven throwaway default passes here needlessly loads shader
 	# templates and creates effect RIDs on every camera's first Volume entry.
 
 func _seed_default_passes() -> void:
@@ -125,22 +123,16 @@ func _seed_default_passes() -> void:
 	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 	_connect_passes()
 
-## The default pass set: every entry in seed order (the one optional entry, Temporal
-## AA, listed but disabled), with the library's authoring entries placed directly
-## before Post Process, i.e. after Temporal AA.
+## The default pass set: every native entry in seed order (Temporal AA is listed but
+## disabled), with library passes inserted at their declared native anchors.
 func _default_seed_list() -> Array[PassBase]:
 	var seeded: Array[PassBase] = []
-	var library_added := false
 	for native_id in NativeSpec.seed_order():
-		if not library_added and native_id == NativeSpec.PASS_POST_PROCESS:
-			library_added = true
-			_append_default_library(seeded)
 		var pass_entry := _make_native_pass(native_id)
 		if NativeSpec.is_optional_id(native_id):
 			pass_entry.enabled = false
 		seeded.append(pass_entry)
-	if not library_added:
-		_append_default_library(seeded)
+	_append_default_library(seeded)
 	return seeded
 
 func _append_default_library(seeded: Array[PassBase]) -> void:
@@ -152,11 +144,10 @@ func _append_default_library(seeded: Array[PassBase]) -> void:
 			continue
 		var instance := template.duplicate(true) as PassBase
 		LibraryManager.configure_library_pass(instance, entry)
-		# Color Grade is the pipeline's ninth pass, and like Temporal AA it is a
-		# quality/look switch: it ships disabled so a fresh renderer's frame is the
-		# engine's own passes until the project turns it on.
-		instance.enabled = false
-		seeded.append(instance)
+		# The manifest owns the default switch; synchronized resources retain the
+		# user's saved enabled value.
+		instance.enabled = bool(entry.get("default_enabled", false))
+		seeded.insert(LibraryManager.calculate_insert_index(seeded, instance.stable_id), instance)
 
 ## An entry for one engine pass: its id, the stable identity the schedule persists, and
 ## the addon's script for it as the implementation.
@@ -207,10 +198,12 @@ func _set_passes(value: Array, emit: bool) -> void:
 		emit_changed()
 		notify_property_list_changed()
 
-func _connect_passes() -> void:
+func _connect_passes() -> bool:
 	_disconnect_passes()
+	var changed := false
 	for pass_entry in _passes:
-		_observe_pass(pass_entry)
+		changed = _observe_pass(pass_entry) or changed
+	return changed
 
 ## Watches one authored pass and everything it carries. A carried pass (an entry's
 ## implementation, a native pass's overlay) is a resource of its own, so the inspector
@@ -218,9 +211,17 @@ func _connect_passes() -> void:
 ## it. Without observing them, editing an exposed parameter or switching the carried
 ## pass off would only reach the engine on the next unrelated change - and the entry's
 ## enabled state, which follows the chain, would look stale.
-func _observe_pass(pass_entry) -> void:
-	if pass_entry == null or _observed_passes.has(pass_entry):
-		return
+func _observe_pass(pass_entry) -> bool:
+	if pass_entry == null:
+		return false
+	var changed := false
+	# A persisted library pass may predate the current shader's texture bindings.
+	# Repair only that fixed contract while its renderer schedule is being observed
+	# on the main thread; never rewrite authored parameters or enabled state here.
+	if pass_entry.has_method("ensure_frp_contract"):
+		changed = bool(pass_entry.call("ensure_frp_contract"))
+	if _observed_passes.has(pass_entry):
+		return changed
 	if pass_entry.stable_id == &"":
 		# Persist an instance identity; a script path cannot distinguish two copies.
 		pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
@@ -235,7 +236,8 @@ func _observe_pass(pass_entry) -> void:
 		pass_entry.changed.connect(_on_pass_changed)
 	if pass_entry.has_method("carried_passes"):
 		for carried in pass_entry.carried_passes():
-			_observe_pass(carried)
+			changed = _observe_pass(carried) or changed
+	return changed
 
 func _disconnect_passes() -> void:
 	for pass_entry in _observed_passes:
@@ -275,7 +277,7 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
 	changed = _sync_library(false) or changed
-	_connect_passes()
+	changed = _connect_passes() or changed
 	_normalizing = false
 	if changed and emit:
 		emit_changed()

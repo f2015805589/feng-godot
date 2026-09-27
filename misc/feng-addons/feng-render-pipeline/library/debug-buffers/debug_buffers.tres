@@ -1,0 +1,10 @@
+[gd_resource type="CompositorEffect" script_class="FengDebugBuffersPass" load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/debug_buffers_pass.gd" id="1"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/debug-buffers/debug_buffers.glsl" id="2"]
+
+[resource]
+resource_name = "Debug Buffers"
+script = ExtResource("1")
+enabled = false
+shader_file = ExtResource("2")

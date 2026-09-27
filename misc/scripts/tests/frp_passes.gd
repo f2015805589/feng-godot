@@ -670,15 +670,62 @@ func run() -> void:
 	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
-	# The seeded library set is Color Grade only: the default pipeline is the engine's
-	# eight entries plus that ninth pass, and the other templates are opt-in.
+	# Manifest metadata seeds Color Grade, enabled Magic GI after Lighting, and
+	# disabled Debug Buffers after Post Process. Other effects remain opt-in.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
 			library_entries.append(value)
-	require(library_entries.size() == 1, "the default pipeline must seed only Color Grade, got %d library entries" % library_entries.size())
-	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 1,
-		"the default pipeline must be the engine's passes plus Color Grade, got %d entries" % unified_renderer.passes.size())
+	require(library_entries.size() == 3, "the default pipeline must seed Color Grade, Magic GI and Debug Buffers, got %d library entries" % library_entries.size())
+	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 3,
+		"the default pipeline must have eight native and three seeded library entries, got %d" % unified_renderer.passes.size())
+	var seeded_magic_index := -1
+	var seeded_debug_index := -1
+	var seeded_lighting_index := -1
+	var seeded_sky_index := -1
+	var seeded_post_index := -1
+	for i in unified_renderer.passes.size():
+		var entry = unified_renderer.passes[i]
+		if _native_id(entry) == 3: seeded_lighting_index = i
+		if _native_id(entry) == 4: seeded_sky_index = i
+		if _native_id(entry) == 7: seeded_post_index = i
+		if String(entry.stable_id) == "library:magic_gi":
+			seeded_magic_index = i
+			require(entry.enabled, "Magic GI must be enabled in the fresh default pipeline")
+		if String(entry.stable_id) == "library:debug_buffers":
+			seeded_debug_index = i
+			require(not entry.enabled, "Debug Buffers must be disabled in the fresh default pipeline")
+	require(seeded_lighting_index < seeded_magic_index and seeded_magic_index < seeded_sky_index,
+		"Magic GI must be anchored after Lighting and before Sky")
+	require(seeded_debug_index > seeded_post_index, "Debug Buffers must be anchored after Post Process")
+	var default_debug = unified_renderer.passes[seeded_debug_index]
+	require(not default_debug.needs_motion_vectors, "the default diffuse debug selection must not request motion-vector attachments")
+	unified_renderer.apply(compositor)
+	var default_output_names := PackedStringArray()
+	for output in unified_renderer._manager.collect_enabled_outputs():
+		default_output_names.append(String(output.name))
+	require(not default_output_names.has("debug_buffers"), "disabled Debug Buffers must not allocate its output texture")
+
+	# Script attachment runs its _init() while the .tres is being loaded. Keep the
+	# authored enabled value even when it is serialized before the script property.
+	var serialized_debug_path := "user://frp_debug_enabled_before_script_%s.tres" % Time.get_ticks_usec()
+	var serialized_debug_text := """[gd_resource type="CompositorEffect" script_class="FengDebugBuffersPass" load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/debug_buffers_pass.gd" id="1"]
+[ext_resource type="RDShaderFile" path="res://addons/feng-render-pipeline/library/debug-buffers/debug_buffers.glsl" id="2"]
+
+[resource]
+enabled = true
+script = ExtResource("1")
+shader_file = ExtResource("2")
+"""
+	var serialized_debug_file := FileAccess.open(serialized_debug_path, FileAccess.WRITE)
+	require(serialized_debug_file != null, "could not create Debug Buffers enabled-before-script resource")
+	serialized_debug_file.store_string(serialized_debug_text)
+	serialized_debug_file = null
+	var serialized_debug = ResourceLoader.load(serialized_debug_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	require(serialized_debug != null and serialized_debug.enabled,
+		"Debug Buffers script initialization overwrote serialized enabled=true")
 
 	# Save and load a renderer, then simulate an older resource whose final
 	# library entry was absent. Applying it must insert the missing template
@@ -742,8 +789,7 @@ func run() -> void:
 		if _native_id(entry) == 7:
 			post_index = i
 	require(surviving == loaded_values, "library sync reordered existing entries")
-	# Color Grade is the pipeline's ninth pass: sync has to put it back between
-	# Temporal AA and Post Process, not at the end of the list.
+	# Color Grade is anchored between Temporal AA and Post Process, not at the end.
 	require(inserted_index >= 0 and temporal_index < inserted_index and inserted_index < post_index,
 		"the re-synced Color Grade pass was not anchored between Temporal AA and Post Process (temporal %d, color grade %d, post %d)" % [temporal_index, inserted_index, post_index])
 	print("PASS unified native ids/names/order and saved library sync")
@@ -826,7 +872,90 @@ _synced_library = Array[String](["fxaa/fxaa.tres"])
 	require(migrated_blur_h == 0, "deleted legacy library pass was re-added during sync")
 	var deleted_manifest: Array = _read_property(legacy_renderer, "_deleted_library", [])
 	require(deleted_manifest.has("fxaa/fxaa.tres"), "legacy deleted library entry was not recorded")
-	print("PASS legacy renderer migration, names, library sync and deletion tombstone")
+	var migrated_magic = null
+	for value in legacy_renderer.passes:
+		if String(value.stable_id) == "library:magic_gi":
+			migrated_magic = value
+			break
+	require(migrated_magic != null and migrated_magic.enabled,
+			"an old Renderer must automatically acquire enabled Magic GI after Lighting")
+	migrated_magic.enabled = false
+	var without_magic: Array[FRP_BASE] = []
+	for value in legacy_renderer.passes:
+		if value != migrated_magic:
+			without_magic.append(value)
+	legacy_renderer.passes = without_magic
+	legacy_renderer.apply(compositor)
+	var magic_deleted := true
+	for value in legacy_renderer.passes:
+		if String(value.stable_id) == "library:magic_gi":
+			magic_deleted = false
+	var deleted_library_ids: Array = _read_property(legacy_renderer, "_deleted_library_ids", [])
+	require(magic_deleted and deleted_library_ids.has("library:magic_gi"),
+			"removing the migrated Magic GI entry must persist a tombstone instead of re-adding it")
+
+	# An all-native custom renderer intentionally has no Lighting anchor. Sync must
+	# skip the default GI seed without making the custom takeover schedule invalid.
+	var takeover_renderer = renderer_script2.new()
+	var takeover := FRP_BASE.new()
+	takeover.resource_name = "Complete Frame Takeover"
+	var takeover_provides: Array[int] = []
+	for native_id in EXPECTED_NATIVE_ORDER:
+		takeover_provides.append(native_id)
+	takeover.provides_native_ids = takeover_provides
+	var takeover_passes: Array[FRP_BASE] = [takeover]
+	takeover_renderer.passes = takeover_passes
+	var takeover_has_magic := false
+	for value in takeover_renderer.passes:
+		if String(value.stable_id) == "library:magic_gi":
+			takeover_has_magic = true
+	require(not takeover_has_magic and takeover_renderer.get_validation_warnings().is_empty(),
+			"a full-frame takeover without Lighting must skip default Magic GI without becoming invalid")
+	print("PASS legacy renderer migration, automatic Magic GI sync, preserved switch and deletion tombstone")
+
+	# A saved pre-v2 pass can have four serialized GBuffer inputs and no dedicated GI
+	# output. Load that actual resource into a Renderer and verify main-thread repair
+	# preserves author switches and strength parameters.
+	var magic_script = load("res://addons/feng-render-pipeline/passes/magic_gi_pass.gd")
+	var old_magic = magic_script.new()
+	old_magic.resource_name = "Magic GI"
+	old_magic.stable_id = "library:magic_gi"
+	old_magic.enabled = false
+	old_magic.parameters = Vector4(0.375, 1.0, 1.0, 1.0)
+	var four_inputs: Array[FRP_TEXTURE] = []
+	for index in 4:
+		four_inputs.append(old_magic.inputs[index])
+	old_magic.inputs = four_inputs
+	var old_magic_output := FRP_OUTPUT.new()
+	old_magic_output.name = &"magic_gi"
+	old_magic_output.usage = FRP_OUTPUT.Usage.SAMPLED | FRP_OUTPUT.Usage.COLOR_ATTACHMENT
+	var old_magic_outputs: Array[FRP_OUTPUT] = [old_magic_output]
+	old_magic.outputs = old_magic_outputs
+	var old_magic_path := "user://frp_legacy_magic_pass_%s.tres" % Time.get_ticks_usec()
+	require(ResourceSaver.save(old_magic, old_magic_path) == OK, "legacy Magic GI binding resource did not save")
+	var loaded_old_magic = ResourceLoader.load(old_magic_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	if loaded_old_magic == null or loaded_old_magic.inputs.size() != 4 \
+			or loaded_old_magic.outputs.size() != 1 or loaded_old_magic.outputs[0].usage != 3:
+		require(false, "legacy Magic GI .tres did not preserve its old four-input/old-output contract")
+		return
+	var compatibility_renderer = renderer_script2.new()
+	var compatibility_passes: Array[FRP_BASE] = compatibility_renderer.passes.duplicate()
+	var replaced_magic := false
+	for index in compatibility_passes.size():
+		if String(compatibility_passes[index].stable_id) == "library:magic_gi":
+			compatibility_passes[index] = loaded_old_magic
+			replaced_magic = true
+	require(replaced_magic, "could not substitute the saved old Magic GI pass in a fresh schedule")
+	compatibility_renderer.passes = compatibility_passes
+	compatibility_renderer.apply(compositor)
+	require(loaded_old_magic.inputs.size() == 6 and loaded_old_magic.outputs.size() == 1,
+		"Renderer did not normalize a saved four-input Magic GI pass")
+	require(loaded_old_magic.enabled == false and is_equal_approx(loaded_old_magic.parameters.x, 0.375),
+		"Magic GI normalization changed the authored enabled switch or strength")
+	require(loaded_old_magic.outputs[0].name == &"magic_gi" and loaded_old_magic.outputs[0].usage == 265,
+		"normalized Magic GI output did not restore the R16F sampled/storage/copy-to usage bits")
+	require(not loaded_old_magic.ensure_frp_contract(), "Magic GI contract normalization was not idempotent")
+	print("PASS saved legacy Magic GI binding and output contract normalization")
 
 	# A disabled custom pass remains in the compositor effect list on initial
 	# apply. Enabling its native CompositorEffect flag must make it run on the

@@ -20,6 +20,7 @@ enum Source {
 	# The engine's tone mapped image: what the deferred tone mapping step produced.
 	# Reading it is what makes an "after tonemap" effect a post-process effect.
 	TONEMAPPED,
+	MOTION_VECTORS,
 }
 
 const TONEMAPPER_SCOPE: StringName = NativeSpec.SCOPE_TONEMAPPER
@@ -39,7 +40,7 @@ static func required_native_pass(source: Source) -> int:
 	match source:
 		Source.COLOR:
 			return NativeSpec.PASS_LIGHTING
-		Source.DEPTH, Source.NORMAL_ROUGHNESS, Source.ALBEDO, Source.ORM, Source.EMISSION:
+		Source.DEPTH, Source.NORMAL_ROUGHNESS, Source.ALBEDO, Source.ORM, Source.EMISSION, Source.MOTION_VECTORS:
 			return NativeSpec.PASS_GBUFFER
 		Source.TONEMAPPED:
 			return NativeSpec.PASS_POST_PROCESS
@@ -84,6 +85,8 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 			return buffers.get_color_layer(view)
 		Source.DEPTH:
 			return buffers.get_depth_layer(view)
+		Source.MOTION_VECTORS:
+			return buffers.get_velocity_layer(view)
 		Source.NORMAL_ROUGHNESS:
 			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_NORMAL_ROUGHNESS, view)
 		Source.ALBEDO:

@@ -7,8 +7,8 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 ## 使用
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
-2. 创建 `FengRenderer`，默认包含下列 8 个引擎 Pass 和一个 `Color Grade` 库 Pass，
-   共 9 个条目；TAA 与 Color Grade 默认关闭，其余库效果按需添加。
+2. 创建 `FengRenderer`，默认包含 8 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Debug Buffers` 三个库 Pass，
+	共 11 个条目；TAA、Color Grade、Debug Buffers 默认关闭，Magic GI 默认开启（没有有效烘焙时不改画面）。
 3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment（或者用项目设置，
    见下文"项目级管线"）。
 4. 在 Inspector 的 Passes 数组中拖动排序，编辑条目的 Enabled。条目显示具体名称，
@@ -60,16 +60,17 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | 6 | Temporal AA | TAA（**打开该条目即开启**，视口 jitter 跟随该条目）；视口的时序上采样器（FSR 2 / MetalFX）也在这里运行（默认关闭） |
 | 7 | Post Process / Tonemap | 最终颜色/深度/运动矢量 resolve、引擎后处理与输出 |
 
-引擎侧只有这 8 条；管线里的第 9 条是库里的 `Color Grade` Pass，默认种子在 Temporal AA 与
-Post Process 之间，所以整条管线正好是 9 条、顺序为
-`0 Shadow → 1 VT → 2 GBuffer → 3 Lighting → 4 Sky → 5 Transparent → 6 TAA → 7 Color Grade → 8 Post`。
+引擎侧只有这 8 条；默认的三个库 Pass 按各自的 native 锚点插入，顺序为
+`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Transparent → TAA → Color Grade → Post Process → Debug Buffers`。
 SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP 的 pass**：FRP 不声明、
 不分配、也不合成它们，光照 shader 对这些附件始终用引擎默认（黑色）纹理。
 
 颜色分级不是引擎条目，而是库里的 `Color Grade` Pass——它的 shader 和参数因此可以随插件更新，
-不需要改引擎。**一个新 Renderer 的列表正好是这 9 条**：8 个引擎条目 + Color Grade。库里的其它
-模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
+不需要改引擎。**一个新 Renderer 的列表正好是这 11 条**：8 个引擎条目 + 三个默认库条目。
+库里的其它模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
 **Add Pass from Library** 添加；它们和 Color Grade 一样默认关闭，打开条目即生效。
+
+`Magic GI` 在 Lighting 后、Sky 前将 surface PRT 的传输系数与当前太阳/环境 SH 点积，作为漫反射间接光加回 HDR；它只使用当前视口匹配的最新有效烘焙，动态光照变化不需要重烘焙。没有有效烘焙或当前 viewport 不匹配时，该 pass 清零自己的诊断纹理并保持画面不变。`Debug Buffers` 默认关闭且不分配输出，可切换到 albedo、view-space normal、AO、roughness、metallic、motion vectors 或 Magic GI 贡献；启用时在 Post Process 后直接显示所选原始缓冲。
 
 这些条目执行真实的原生操作，但粒度是上述组合步骤，不是逐个 GPU draw/dispatch。
 "光照预计算"只指**绘制**阴影这一步；灯光/Cluster buffer 与体积雾属于 Lighting pass（它们在那
@@ -79,7 +80,7 @@ SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP
 （`passes/native/*.gd`），每个原生条目（`FengBuiltinPass`）通过 `implementation` 指向它。
 条目默认由脚本驱动——脚本调用 Core 原语执行该 pass 的 operation，并把该 pass 声明为
 "provided" 交给引擎，因此引擎不再为它发 token；把 `implementation` 清空该条目就退回引擎自带的
-pass（无插件项目的默认路径）。整条默认调度与引擎自带 pass **逐像素一致**（实测 changed=0）。
+pass（无插件项目的默认路径）。关闭其他库效果且没有有效 Magic GI 烘焙时，整条默认调度与引擎自带 pass **逐像素一致**（实测 changed=0）。
 要改某个 pass 的实现，复制/继承对应的 `passes/native/*.gd` 并覆盖 `_frp_execute()` 即可：
 可以只调其中几个 Core 原语，也可以加上自己的 `@export` 参数（检查器会显示）。
 
@@ -149,14 +150,14 @@ pass 里 `bake_cluster()` 算出的那份 cluster 灯光列表（和 `forward_cl
 所以"旧的 0 号"会顶掉现在的 0 号（Shadow Precompute）。插件不静默重排这种资源，而是把它报出来——
 某个条目的名字正好是引擎**另一条** pass 的名字（例如条目 0 叫 `VT Pass`，而引擎的 `VT Pass` 是 1），
 Inspector 就会提示"这是按旧 pass 集写的资源"。这种资源不能靠拖动修好（它连 Temporal AA 条目都没有），
-要在当前引擎上重新建一个 Renderer（新建的资源直接就是现在这 9 条），再把库效果从
+要在当前引擎上重新建一个 Renderer（新建的资源直接就是现在这 11 条），再把库效果从
 **Add Pass from Library** 加回去。
 
 `FengPass.provides_native_ids` 让自定义 pass 接管必需条目：声明 `[0, 1, 2, 3, 7]` 之后，该
 Renderer 可以只含这一个 pass——校验零告警，规范化也不会把条目补回来（引擎侧对这些条目只发
 一次警告）。不声明时，只含自定义 pass 的列表会被当作 schema < 5 的旧数组重新种子化（引擎条目
 全部补回），所以"漏掉条目"不会静默产生残缺帧。配合 `_frp_execute(ctx)` 的 Core 原语，整帧可以
-由脚本驱动，实测与引擎默认顺序逐像素一致。
+由脚本驱动；关闭其他库效果且没有有效 Magic GI 烘焙时，实测与引擎默认顺序逐像素一致。
 
 这个声明同时也是**接管**的开关：声明 6（Temporal AA）后引擎仍把该条目当成帧的一部分，
 视口 jitter 照常生效，插件 pass 的 `ctx.temporal_aa_and_upscale()` 才有抖动的历史可累积；
@@ -292,7 +293,7 @@ tonemap 过的图像"，把输入声明成 `FengPassTexture.Source.TONEMAPPED`�
 ```
 
 `DEFAULT_LIBRARY_SEEDED` 决定哪些条目**进入**新 Renderer 的默认列表：目前只有
-`library:color_grade`（管线的第 9 条）。其余是模板——它们不会自动推进任何已有 Renderer，
+`library:color_grade`、`library:magic_gi`、`library:debug_buffers`。其余是模板——它们不会自动推进任何已有 Renderer，
 也不会出现在新 Renderer 的列表里，只能从检查器的 **Add Pass from Library** 添加；添加后
 由 manifest（`_synced_library` / `_deleted_library`）记录身份与删除墓碑，不会重复插入，
 也不会把你删掉的条目加回来。Color Grade 缺失时会被同步回 Temporal AA 与 Post Process
@@ -320,8 +321,8 @@ Operation 承担，开关状态和自定义条目的相对位置都会被保留�
   在检查器里按新名字重设一次即可。
 - 在 FengRenderer 中，自定义效果按列表位置运行。`stage` 仅保留为回调参数及旧资源
   迁移提示；在普通 Compositor 中仍按原 Stage 调度。
-- 当前 `Color` 指内部 HDR 颜色；依赖它的效果应位于 Deferred Lighting 后、Tonemap 前
-  （默认库把库效果放在 Temporal AA 与 Post Process 之间，因此也在 Tonemap 之前）。
+- 当前 `Color` 指内部 HDR 颜色；依赖它的效果应位于 Deferred Lighting 后、Tonemap 前。
+  `Magic GI` 由 manifest 锚定在 Lighting 后，`Color Grade` 在 Temporal AA 后，`Debug Buffers` 在 Post Process 后。
   自定义纹理必须先生产再消费。同一 Pass 的 storage-image 输出绑定可以引用自身输出。
 
 禁用的自定义 Pass 仍保留在 effects 中，重新启用不再需要重新插入。FengCompositor

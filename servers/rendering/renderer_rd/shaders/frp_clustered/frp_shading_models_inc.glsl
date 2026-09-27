@@ -4,9 +4,6 @@
 #ifndef FRP_SHADING_MODELS_INC_GLSL
 #define FRP_SHADING_MODELS_INC_GLSL
 
-#define FRP_SHADING_MODEL_ID_MASK 0x0Fu
-#define FRP_SELECTIVE_OUTPUT_MASK 0xF0u
-
 #define FRP_SHADING_MODEL_UNLIT 0u
 #define FRP_SHADING_MODEL_DEFAULT_LIT 1u
 
@@ -45,16 +42,6 @@ FRPBxDFContext frp_init_bxdf_context(vec3 N, vec3 V, vec3 L, float area_bias) {
 	context.NoH = clamp(area_bias + (context.NoL + context.NoV) * inv_len_h, 0.0, 1.0);
 	context.VoH = clamp(inv_len_h + inv_len_h * context.VoL, 0.0, 1.0);
 	return context;
-}
-
-uint frp_decode_shading_model(float packed_alpha) {
-	uint packed_byte = uint(round(clamp(packed_alpha, 0.0, 1.0) * 255.0));
-	return packed_byte & FRP_SHADING_MODEL_ID_MASK;
-}
-
-float frp_encode_shading_model(uint shading_model_id, uint selective_output_mask) {
-	uint packed_byte = (shading_model_id & FRP_SHADING_MODEL_ID_MASK) | (selective_output_mask & FRP_SELECTIVE_OUTPUT_MASK);
-	return float(packed_byte) / 255.0;
 }
 
 uint frp_normalize_shading_model(uint id) {

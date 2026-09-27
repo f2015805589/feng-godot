@@ -33,9 +33,12 @@ const NODE_NAME := "FengProjectPipeline"
 
 # Resolving the setting means loading a resource, and both trees (the editor and the
 # game) ask for it repeatedly (every settings change, every WorldEnvironment change), so
-# the loaded pipeline is kept between calls and only reloaded when the path changes.
+# remember the path and weakly reuse a live compositor. Installed WorldEnvironments own
+# the compositor for as long as either tree needs it; this cache must not outlive them,
+# because compositor effects own RenderingDevice resources that need to be released
+# before the rendering server shuts down.
 static var _cached_path := ""
-static var _cached_compositor: Compositor = null
+static var _cached_compositor_ref: WeakRef = null
 static var _warned_unresolved := false
 
 var _installed: WorldEnvironment = null
@@ -121,37 +124,50 @@ static func clear(p_node: WorldEnvironment) -> void:
 static func resolve() -> Compositor:
 	var path := String(ProjectSettings.get_setting(SETTING, "")).strip_edges()
 	if path.is_empty():
+		_clear_cache()
 		return null
 	# The schedule is FRP's own: a project that switched rendering method (or fell back to
 	# another renderer) keeps the setting, but must not push an FRP pipeline into it. The
 	# active method is asked for, not the project setting, because the command line and
 	# the engine's fallbacks can override it.
 	if RenderingServer.get_current_rendering_method() != "frp":
+		_clear_cache()
 		return null
 	if path.begins_with("uid://"):
 		var resolved := resolve_path(path)
 		if resolved.is_empty():
+			_clear_cache()
 			if not _warned_unresolved:
 				_warned_unresolved = true
 				push_warning("FengProjectPipeline: '%s' is a UID this session cannot resolve (the editor's UID cache does not know it yet); pick the file again or restart the editor." % path)
 			return null
 		path = resolved
-	if path == _cached_path and _cached_compositor != null:
-		return _cached_compositor
+	if path == _cached_path and _cached_compositor_ref != null:
+		var cached := _cached_compositor_ref.get_ref() as Compositor
+		if is_instance_valid(cached):
+			return cached
 	_cached_path = path
-	_cached_compositor = null
+	_cached_compositor_ref = null
 	if not ResourceLoader.exists(path):
 		return null
 	var resource := ResourceLoader.load(path)
+	var compositor: Compositor = null
 	if resource is Compositor:
-		_cached_compositor = resource
+		compositor = resource
 	elif resource != null and resource.get("passes") != null:
 		# A pipeline resource on its own (a FengRenderer) is wrapped: the engine reads a
 		# schedule from a Compositor, and this is the wrapper the inspector shows too.
 		var wrapper = CompositorScript.new()
 		wrapper.renderer = resource
-		_cached_compositor = wrapper
-	return _cached_compositor
+		compositor = wrapper
+	if compositor != null:
+		_cached_compositor_ref = weakref(compositor)
+	return compositor
+
+
+static func _clear_cache() -> void:
+	_cached_path = ""
+	_cached_compositor_ref = null
 
 
 ## A resource path with a `uid://` reference resolved to the path behind it, or an empty

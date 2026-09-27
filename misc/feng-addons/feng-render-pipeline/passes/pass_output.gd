@@ -5,8 +5,9 @@ extends Resource
 
 enum Usage {
 	SAMPLED = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT,
-	STORAGE = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT,
 	COLOR_ATTACHMENT = RenderingDevice.TEXTURE_USAGE_COLOR_ATTACHMENT_BIT,
+	STORAGE = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT,
+	COPY_TO = RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT,
 }
 
 @export var name: StringName = &"":
@@ -21,7 +22,7 @@ enum Usage {
 			return
 		data_format = value
 		emit_changed()
-@export_flags("Sampled", "Storage", "Color Attachment") var usage: int = Usage.SAMPLED | Usage.STORAGE | Usage.COLOR_ATTACHMENT:
+@export_flags("Sampled:1", "Storage:8", "Color Attachment:2", "Copy To:256") var usage: int = Usage.SAMPLED | Usage.STORAGE | Usage.COLOR_ATTACHMENT:
 	set(value):
 		if usage == value:
 			return

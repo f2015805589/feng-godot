@@ -6,12 +6,10 @@ extends RefCounted
 ## Three layers, all children of one `_FMagicGIViz` node (kept out of the scene
 ## file by adding it as an internal child):
 ##   _Box    - line mesh of the volume's box.
-##   _Probes - one MultiMesh sphere per probe, tinted with the probe's SH
-##             average color (the DC term), gray before a bake.
-##   _SH     - per-probe radial reconstruction: a small mesh whose vertex at
-##             direction d sits at radius |E(d)| colored by max(E(d), 0), so the
-##             lobe shape and tint of each baked SH read at a glance. Capped -
-##             dense volumes get spheres only.
+##   _Probes - one MultiMesh sphere per surface sample, tinted by its response
+##             to a unit directional source from world +Y; gray before a bake.
+##   _Transport - radial visualization of geometry transport response, not
+##                stored or current light radiance. Capped at 256 samples.
 const MAX_SH_VIZ_PROBES := 256
 const SH_VIZ_SIDES := 12   # rings and sectors of the reconstruction mesh
 
@@ -82,15 +80,9 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 		# convert through the inverse transform.
 		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
 		var color := Color(0.35, 0.35, 0.35)
-		var s := 1.0
 		if data != null:
-			if data.is_live(i):
-				color = data.dc_color(i)
-			else:
-				# Culled probe (buried or far from geometry): small dark ghost.
-				color = Color(0.08, 0.10, 0.14)
-				s = 0.4
-		var scale_basis := Basis.from_scale(Vector3.ONE * s)
+			color = data.transport_preview_color(i)
+		var scale_basis := Basis.IDENTITY
 		mm.set_instance_transform(i, Transform3D(scale_basis, local))
 		mm.set_instance_color(i, color)
 	var node := MultiMeshInstance3D.new()
@@ -102,13 +94,12 @@ static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
 	var data := volume.bake_data
 	var count := mini(volume.probe_count(), MAX_SH_VIZ_PROBES)
 	var radius := _cell_extent(volume) * 0.45
+	var plot_basis := volume.global_basis.orthonormalized()
 	var holder := Node3D.new()
-	holder.name = "_SH"
+	holder.name = "_Transport"
 	root.add_child(holder)
 	for i in count:
-		if not data.is_live(i):
-			continue
-		var mesh := _sh_mesh(data, i, radius)
+		var mesh := _sh_mesh(data, i, radius, plot_basis)
 		var node := MeshInstance3D.new()
 		node.mesh = mesh
 		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
@@ -119,10 +110,10 @@ static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
 		node.material_override = material
 		holder.add_child(node)
 
-## Radial SH plot: vertex at direction d sits at d * max(E(d),0) * radius_scale,
-## vertex color is the evaluated radiance (a bright direction stretches and
-## brightens that side). |E| keeps negative lobes readable as a flip side.
-static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float) -> ArrayMesh:
+## Radial transfer plot: vertex at direction d sits at d * |T(d)| * radius_scale;
+## vertex color shows the positive RGB response to a unit directional source.
+static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float,
+		local_to_world: Basis) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	var verts := PackedVector3Array()
 	var colors := PackedColorArray()
@@ -134,16 +125,18 @@ static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float) -> Arr
 	for ring in rings + 1:
 		for sector in sectors:
 			var dir := _ring_dir(ring, rings, sector, sectors)
-			scale = maxf(scale, data.radiance(probe_index, dir).length())
+			var world_dir := (local_to_world * dir).normalized()
+			scale = maxf(scale, data.transport_response(probe_index, world_dir).length())
 	if scale <= 0.0:
 		scale = 1.0
 	for ring in rings + 1:
 		for sector in sectors:
 			var dir := _ring_dir(ring, rings, sector, sectors)
-			var e := data.radiance(probe_index, dir)
-			var magnitude := e.length() / scale
+			var world_dir := (local_to_world * dir).normalized()
+			var response := data.transport_response(probe_index, world_dir)
+			var magnitude := response.length() / scale
 			verts.append(dir * (radius * (0.25 + 0.75 * magnitude)))
-			colors.append(Color(maxf(e.x, 0.0), maxf(e.y, 0.0), maxf(e.z, 0.0)) / scale)
+			colors.append(Color(maxf(response.x, 0.0), maxf(response.y, 0.0), maxf(response.z, 0.0)) / scale)
 	for ring in rings:
 		for sector in sectors:
 			var a := ring * sectors + sector

@@ -23,13 +23,16 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_downsample", "path": "bloom-lite/bloom_downsample.tres", "name": "Bloom Downsample"},
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
-	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI"},
+	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
+	{"id": "library:debug_buffers", "path": "debug-buffers/debug_buffers.tres", "name": "Debug Buffers", "default_enabled": false, "after_native": NativeSpec.PASS_POST_PROCESS},
 ]
 
 ## The library entries a fresh pipeline seeds. The rest are templates the Library menu
 ## adds: they never enter a pipeline on their own.
 const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:color_grade",
+	"library:magic_gi",
+	"library:debug_buffers",
 ]
 
 static func load_template(entry: Dictionary) -> Variant:
@@ -95,9 +98,22 @@ static func _append_unique(values: Array, value: String) -> void:
 	if value != "" and not values.has(value):
 		values.append(value)
 
-## Calculates the ordered insert index for a library pass: placed before Post Process,
-## preserving relative order among library passes.
+## Calculates the ordered insert index for a library pass. The manifest's native anchor
+## keeps default placement and default state together; unanchored library effects retain
+## the usual before-tonemap/relative-library ordering.
 static func calculate_insert_index(passes: Array, stable_id: StringName) -> int:
+	var entry = manifest_entry(stable_id)
+	if entry != null and entry.has("after_native"):
+		var anchor_id := int(entry["after_native"])
+		for i in passes.size():
+			if passes[i] is BuiltinPass and passes[i].native_id == anchor_id:
+				return i + 1
+		var missing_anchor_warning: String = entry.get("missing_anchor_warning", "")
+		if missing_anchor_warning != "":
+			push_warning("FengLibraryManager: " + missing_anchor_warning)
+			return passes.size()
+		if anchor_id == NativeSpec.PASS_POST_PROCESS:
+			return passes.size()
 	var post_process_index := passes.size()
 	for i in passes.size():
 		var pass_entry = passes[i]
@@ -118,6 +134,9 @@ static func calculate_insert_index(passes: Array, stable_id: StringName) -> int:
 		var existing = passes[i]
 		if existing == null:
 			continue
+		var existing_manifest = manifest_entry(existing.stable_id)
+		if existing_manifest != null and existing_manifest.has("after_native"):
+			continue
 		var existing_order := default_library_order(existing.stable_id)
 		if existing_order < 0:
 			continue
@@ -133,6 +152,12 @@ static func calculate_insert_index(passes: Array, stable_id: StringName) -> int:
 	elif previous_default >= 0:
 		return previous_default + 1
 	return post_process_index
+
+static func manifest_entry(stable_id: StringName) -> Variant:
+	for entry in DEFAULT_LIBRARY_ENTRIES:
+		if entry["id"] == stable_id:
+			return entry
+	return null
 
 ## The custom pass an entry already has in the list: matched by stable id, or by the
 ## shader the template points at for a pass that predates stable ids.
@@ -204,9 +229,15 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 			continue
 		var existing = find_matching_library_pass(passes, entry, template)
 		if existing == null:
+			var anchor_id := int(entry.get("after_native", -1))
+			if bool(entry.get("default_enabled", false)) and anchor_id >= 0 and not _has_native_anchor(passes, anchor_id):
+				# A custom full-frame takeover may not expose native Lighting. Its valid
+				# schedule simply skips the automatic seed; an explicit Library add still
+				# reports the missing anchor from calculate_insert_index().
+				continue
 			var instance := template.duplicate(true) as PassBase
 			configure_library_pass(instance, entry)
-			instance.enabled = false
+			instance.enabled = bool(entry.get("default_enabled", false))
 			passes.insert(calculate_insert_index(passes, instance.stable_id), instance)
 			changed = true
 		else:
@@ -223,3 +254,9 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 ## as added. The other templates belong to the Library menu alone.
 static func is_managed(entry: Dictionary, synced: Array, synced_ids: Array) -> bool:
 	return DEFAULT_LIBRARY_SEEDED.has(entry["id"]) or is_synced(entry, synced, synced_ids)
+
+static func _has_native_anchor(passes: Array, native_id: int) -> bool:
+	for pass_entry in passes:
+		if pass_entry is BuiltinPass and pass_entry.native_id == native_id:
+			return true
+	return false

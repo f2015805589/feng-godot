@@ -1224,7 +1224,6 @@ void RenderFRPClustered::_fill_render_list(RenderListType p_render_list, const R
 							shader_data->uses_anisotropy ||
 							shader_data->uses_rim ||
 							shader_data->uses_backlight ||
-							shader_data->uses_ao_light_affect ||
 							shader_data->uses_custom_radiance ||
 							shader_data->uses_custom_irradiance ||
 							shader_data->uses_custom_fog ||

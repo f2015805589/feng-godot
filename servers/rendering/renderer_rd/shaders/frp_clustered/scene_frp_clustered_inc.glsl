@@ -2,6 +2,29 @@
 #define M_TAU 6.28318530718
 #define ROUGHNESS_MAX_LOD 5
 
+// FRP packs material metadata into the ORM target's alpha byte. The low
+// nibble is the shading model; the high nibble stores direct-light AO affect
+// at 4-bit precision. Keep packing/decoding shared by the geometry and
+// lighting shaders so their G-buffer contract cannot drift.
+#define FRP_SHADING_MODEL_ID_MASK 0x0Fu
+#define FRP_AO_LIGHT_AFFECT_MASK 0xF0u
+
+float frp_encode_gbuffer_metadata(uint shading_model_id, float ao_light_affect) {
+	uint affect = uint(round(clamp(ao_light_affect, 0.0, 1.0) * 15.0));
+	uint packed_byte = (shading_model_id & FRP_SHADING_MODEL_ID_MASK) | ((affect << 4u) & FRP_AO_LIGHT_AFFECT_MASK);
+	return float(packed_byte) / 255.0;
+}
+
+uint frp_decode_shading_model(float packed_alpha) {
+	uint packed_byte = uint(round(clamp(packed_alpha, 0.0, 1.0) * 255.0));
+	return packed_byte & FRP_SHADING_MODEL_ID_MASK;
+}
+
+float frp_decode_ao_light_affect(float packed_alpha) {
+	uint packed_byte = uint(round(clamp(packed_alpha, 0.0, 1.0) * 255.0));
+	return float((packed_byte & FRP_AO_LIGHT_AFFECT_MASK) >> 4u) / 15.0;
+}
+
 #define MAX_VIEWS 2
 
 #extension GL_KHR_shader_subgroup_ballot : enable

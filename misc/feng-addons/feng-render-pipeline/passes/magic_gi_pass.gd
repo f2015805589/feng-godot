@@ -1,165 +1,377 @@
 @tool
 class_name FengMagicGIPass
 extends FengShaderPass
-## Applies a FMagicGIVolume's baked probe field as diffuse GI.
+## Applies the current lighting to a baked surface PRT field.
 ##
-## The volume's SH table arrives as a one-row RGBA32F atlas, 7 texels per probe,
-## plus a small uniform block carrying the camera's inverse view-projection and
-## the volume's world->probe-grid transform. Both are created and filled on the
-## render thread by this pass from the snapshot FMagicGIRuntime publishes, so the
-## bake path never has to touch the renderer.
-##
-## The pass is a plain FengShaderPass in every other way: the .tres declares the
-## color/depth/normal/albedo inputs, and the compute shader adds
-## albedo * irradiance onto the resolved color.
+## Bake textures are cached by the immutable data identity and bake version. The
+## per-frame work only refreshes the camera and live-lighting uniform buffer.
 
-const RUNTIME_SCRIPT := "res://addons/feng-magic-gi/feng_magic_gi_runtime.gd"
-const UBO_FLOATS := 40  # inv_view_proj, world_to_grid, grid(dims,count), control
+const MAGIC_GI_OUTPUT: StringName = &"magic_gi"
+const UBO_BINDING := 9
+const UBO_SIZE := 336 # Three mat4, two vec4 and seven packed SH vec4s.
+const MAX_CACHED_BAKES := 8
+const RUNTIME_SCRIPT_PATH := "res://addons/feng-magic-gi/feng_magic_gi_runtime.gd"
 
-static var _runtime_script = null
-static var _runtime_looked_up := false
-
-var _scene_data = null
-var _sh_texture := RID()
-var _index_texture := RID()
-var _sh_version := -1
+var _runtime_script_checked := false
+var _runtime_script: Script
+var _frame_snapshot: Dictionary = {}
+var _frame_scene_data: RenderSceneData
 var _ubo := RID()
-var _frame_strength := 1.0
+var _bake_resources: Dictionary = {}
+var _cache_clock := 0
+
+func _init() -> void:
+	inputs = _make_inputs()
+	outputs = _make_outputs()
+
+## Saved pre-PRT-v2 resources carry only four inputs and no independent output.
+## FengRenderer calls this on the main thread after deserialization so old authored
+## passes are upgraded without changing their enabled state or strength settings.
+func ensure_frp_contract() -> bool:
+	var expected_inputs := _make_inputs()
+	var expected_outputs := _make_outputs()
+	var changed := false
+	if not _inputs_match(inputs, expected_inputs):
+		inputs = expected_inputs
+		changed = true
+	if not _outputs_match(outputs, expected_outputs):
+		outputs = expected_outputs
+		changed = true
+	return changed
+
+func _make_inputs() -> Array[TextureInput]:
+	var color := TextureInput.new()
+	color.binding = 0
+	color.source = TextureInput.Source.COLOR
+	color.binding_type = TextureInput.BindingType.STORAGE_IMAGE
+	var depth := TextureInput.new()
+	depth.binding = 1
+	depth.source = TextureInput.Source.DEPTH
+	var normal := TextureInput.new()
+	normal.binding = 2
+	normal.source = TextureInput.Source.NORMAL_ROUGHNESS
+	var albedo := TextureInput.new()
+	albedo.binding = 3
+	albedo.source = TextureInput.Source.ALBEDO
+	var orm := TextureInput.new()
+	orm.binding = 4
+	orm.source = TextureInput.Source.ORM
+	var contribution := TextureInput.new()
+	contribution.binding = 5
+	contribution.source = TextureInput.Source.CUSTOM
+	contribution.custom_scope = NativeSpec.SCOPE_PIPELINE
+	contribution.custom_name = MAGIC_GI_OUTPUT
+	contribution.binding_type = TextureInput.BindingType.STORAGE_IMAGE
+	return [color, depth, normal, albedo, orm, contribution]
+
+func _make_outputs() -> Array[OutputDeclaration]:
+	var output := OutputDeclaration.new()
+	output.name = MAGIC_GI_OUTPUT
+	output.data_format = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
+	output.usage = OutputDeclaration.Usage.SAMPLED | OutputDeclaration.Usage.STORAGE | OutputDeclaration.Usage.COPY_TO
+	return [output]
+
+func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for i in actual.size():
+		var left := actual[i]
+		var right := expected[i]
+		if left == null or left.binding != right.binding or left.source != right.source \
+				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
+				or left.custom_name != right.custom_name:
+			return false
+	return true
+
+func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for i in actual.size():
+		var left := actual[i]
+		var right := expected[i]
+		if left == null or left.name != right.name or left.data_format != right.data_format \
+				or left.usage != right.usage or left.scale != right.scale:
+			return false
+	return true
+
+func get_volume_parameter_names() -> PackedStringArray:
+	return PackedStringArray(["parameters"])
+
+func refresh_resource_flags() -> void:
+	# These are pass-owned inputs and requirements. Do not change FengPass's
+	# raise-only behavior for third-party passes which set flags manually.
+	access_resolved_color = true
+	access_resolved_depth = true
+	needs_normal_roughness = true
+	super.refresh_resource_flags()
 
 func _frp_execute(ctx: FRPPassContext) -> void:
-	var data := ctx.get_render_data()
-	_scene_data = data.get_render_scene_data() if data != null else null
+	_frame_snapshot = {}
+	_frame_scene_data = null
+	if ctx != null:
+		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+		_frame_snapshot = _snapshot_for_target(buffers)
+		var render_data := ctx.get_render_data()
+		if render_data != null:
+			_frame_scene_data = render_data.get_render_scene_data()
 	super._frp_execute(ctx)
-	_scene_data = null
+	_frame_snapshot = {}
+	_frame_scene_data = null
+
+func _snapshot_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
+	if buffers == null:
+		return {}
+	var runtime_script := _get_runtime_script()
+	if runtime_script == null:
+		return {}
+	var snapshots: Variant = runtime_script.call("snapshots")
+	if not snapshots is Array:
+		return {}
+	var target := buffers.get_render_target()
+	for snapshot in snapshots:
+		if not snapshot is Dictionary:
+			continue
+		var targets: Variant = snapshot.get("render_targets", [])
+		if targets is Array and targets.has(target):
+			return snapshot
+	return {}
+
+func _get_runtime_script() -> Script:
+	if not _runtime_script_checked:
+		_runtime_script_checked = true
+		if ResourceLoader.exists(RUNTIME_SCRIPT_PATH):
+			var loaded: Variant = load(RUNTIME_SCRIPT_PATH)
+			if loaded is Script:
+				_runtime_script = loaded
+	return _runtime_script
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
-	var snapshot := _read_snapshot()
-	if snapshot.is_empty():
+	var output: RID = inputs[5].get_texture(buffers, view)
+	if not output.is_valid():
 		return
-	var data = snapshot.get("data")
-	if data == null or not data.is_valid():
+	if _frame_snapshot.is_empty() or _frame_scene_data == null:
+		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
-	if not _ensure_resources(rd, data, int(snapshot.get("version", 0))):
+	var cache_key := str(_frame_snapshot.get("cache_key", ""))
+	var data: Variant = _frame_snapshot.get("data")
+	var version := int(_frame_snapshot.get("version", -1))
+	if cache_key == "" or data == null or not is_instance_valid(data):
+		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
-	_frame_strength = float(snapshot.get("strength", 1.0))
-	if not _fill_ubo(rd, data, view):
+	if not _ensure_bake_resources(cache_key, data, version, rd):
+		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
+	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
+		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		return
+	var cached: Dictionary = _bake_resources[cache_key]
+	_cache_clock += 1
+	cached["last_used"] = _cache_clock
+	_bake_resources[cache_key] = cached
 	super._render(buffers, view, rd)
 
-## The latest published bake, or {} when feng-magic-gi is not installed or no
-## baked volume is enabled. Loaded by path (cached after the first hit) so this
-## addon parses and runs without feng-magic-gi installed.
-func _read_snapshot() -> Dictionary:
-	if not _runtime_looked_up:
-		_runtime_looked_up = true
-		if ResourceLoader.exists(RUNTIME_SCRIPT):
-			_runtime_script = load(RUNTIME_SCRIPT)
-	if _runtime_script == null:
-		return {}
-	return _runtime_script.bake_snapshot
+func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd: RenderingDevice) -> bool:
+	if _bake_resources.has(cache_key):
+		var cached: Dictionary = _bake_resources[cache_key]
+		if cached.get("data_id", -1) == data.get_instance_id() \
+				and cached.get("version", -1) == version \
+				and cached.get("transfer", RID()).is_valid() \
+				and cached.get("geometry", RID()).is_valid() \
+				and cached.get("indices", RID()).is_valid():
+			return true
+		_release_bake_resources(cache_key, rd)
 
-func _ensure_resources(rd: RenderingDevice, data, version: int) -> bool:
-	if not _ubo.is_valid():
-		_ubo = rd.uniform_buffer_create(UBO_FLOATS * 4)
-		if not _ubo.is_valid():
-			_report("Could not create the GI parameter buffer.")
-			return false
-	if _sh_version != version:
-		var image: Image = data.make_atlas_image()
-		if image == null:
-			return false
-		if _sh_texture.is_valid():
-			rd.free_rid(_sh_texture)
-			_sh_texture = RID()
-		var format := RDTextureFormat.new()
-		format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
-		format.width = image.get_width()
-		format.height = 1
-		format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
-		var view := RDTextureView.new()
-		_sh_texture = rd.texture_create(format, view, [image.get_data()])
-		if not _sh_texture.is_valid():
-			_report("Could not upload the SH atlas texture.")
-			return false
-		if _index_texture.is_valid():
-			rd.free_rid(_index_texture)
-			_index_texture = RID()
-		var dims: Vector3i = data.grid_dims
-		var index_format := RDTextureFormat.new()
-		index_format.format = RenderingDevice.DATA_FORMAT_R32_SINT
-		index_format.width = dims.x
-		index_format.height = dims.y * dims.z
-		index_format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
-		_index_texture = rd.texture_create(index_format, view, [data.make_index_bytes()])
-		if not _index_texture.is_valid():
-			_report("Could not upload the probe index map.")
-			return false
-		_sh_version = version
-	return true
-
-func _fill_ubo(rd: RenderingDevice, data, view: int) -> bool:
-	if _scene_data == null:
+	# is_valid() traverses the full bake payload. Keep it on the cache-miss path
+	# only; unchanged frames are O(1) and never regenerate or reupload bake data.
+	if not data.has_method("is_valid") or not bool(data.call("is_valid")):
+		_report("The selected Magic GI bake is invalid or stale; rebake it with the current PRT format.")
 		return false
-	var inv_vp: Projection = _scene_data.get_view_projection(view).inverse()
-	var floats := PackedFloat32Array()
-	floats.resize(UBO_FLOATS)
-	for i in 4:
-		var c: Vector4 = inv_vp[i]
-		floats[i * 4] = c.x; floats[i * 4 + 1] = c.y
-		floats[i * 4 + 2] = c.z; floats[i * 4 + 3] = c.w
-	var w2g: Transform3D = data.world_to_grid
-	for i in 3:
-		floats[16 + i * 4] = w2g.basis[i].x
-		floats[16 + i * 4 + 1] = w2g.basis[i].y
-		floats[16 + i * 4 + 2] = w2g.basis[i].z
-		floats[16 + i * 4 + 3] = 0.0
-	floats[28] = w2g.origin.x; floats[29] = w2g.origin.y; floats[30] = w2g.origin.z
-	floats[31] = 1.0
-	var dims: Vector3i = data.grid_dims
-	floats[32] = dims.x; floats[33] = dims.y; floats[34] = dims.z
-	floats[35] = data.probe_count()
-	floats[36] = _frame_strength
-	floats[37] = 0.0; floats[38] = 0.0; floats[39] = 0.0
-	rd.buffer_update(_ubo, 0, floats.size() * 4, floats.to_byte_array())
+	var transfer_image: Image = data.call("make_atlas_image")
+	var geometry_image: Image = data.call("make_geometry_image")
+	var index_bytes: PackedByteArray = data.call("make_index_bytes")
+	if transfer_image == null or geometry_image == null or index_bytes.is_empty():
+		_report("The selected Magic GI bake could not create its PRT lookup textures.")
+		return false
+	var transfer_rid := _create_image_texture(rd, transfer_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
+	var geometry_rid := _create_image_texture(rd, geometry_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
+	var dims: Vector3i = data.get("grid_dims")
+	var index_rid := _create_index_texture(rd, dims, index_bytes)
+	if not transfer_rid.is_valid() or not geometry_rid.is_valid() or not index_rid.is_valid():
+		for rid in [transfer_rid, geometry_rid, index_rid]:
+			if rid.is_valid():
+				rd.free_rid(rid)
+		_report("RenderingDevice could not upload the Magic GI PRT atlas or index grid.")
+		return false
+	_bake_resources[cache_key] = {
+		"data_id": data.get_instance_id(),
+		"version": version,
+		"transfer": transfer_rid,
+		"geometry": geometry_rid,
+		"indices": index_rid,
+		"grid_dims": dims,
+		"spacing": float(data.get("spacing")),
+		"probe_count": int(data.call("probe_count")),
+		"last_used": _cache_clock,
+	}
+	_prune_bake_cache(rd)
 	return true
+
+func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int) -> RID:
+	var format := RDTextureFormat.new()
+	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
+	format.format = data_format
+	format.width = image.get_width()
+	format.height = image.get_height()
+	format.depth = 1
+	format.array_layers = 1
+	format.mipmaps = 1
+	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	var layer_data: Array[PackedByteArray] = [image.get_data()]
+	return rd.texture_create(format, RDTextureView.new(), layer_data)
+
+func _create_index_texture(rd: RenderingDevice, dims: Vector3i, bytes: PackedByteArray) -> RID:
+	var format := RDTextureFormat.new()
+	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
+	format.format = RenderingDevice.DATA_FORMAT_R32_SINT
+	format.width = dims.x * 8
+	format.height = dims.y * dims.z
+	format.depth = 1
+	format.array_layers = 1
+	format.mipmaps = 1
+	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	var layer_data: Array[PackedByteArray] = [bytes]
+	return rd.texture_create(format, RDTextureView.new(), layer_data)
+
+func _prune_bake_cache(rd: RenderingDevice) -> void:
+	while _bake_resources.size() > MAX_CACHED_BAKES:
+		var oldest_key: String = ""
+		var oldest := 0x7fffffff
+		for key in _bake_resources:
+			var last_used := int(_bake_resources[key].get("last_used", 0))
+			if last_used < oldest:
+				oldest = last_used
+				oldest_key = str(key)
+		if oldest_key == "":
+			return
+		_release_bake_resources(oldest_key, rd)
+
+func _release_bake_resources(cache_key: String, rd: RenderingDevice) -> void:
+	if not _bake_resources.has(cache_key):
+		return
+	var cached: Dictionary = _bake_resources[cache_key]
+	_bake_resources.erase(cache_key)
+	for name in ["transfer", "geometry", "indices"]:
+		var rid: RID = cached.get(name, RID())
+		if rid.is_valid():
+			rd.free_rid(rid)
+
+func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: int, rd: RenderingDevice) -> bool:
+	if scene_data == null or view >= scene_data.get_view_count():
+		return false
+	var cached: Dictionary = _bake_resources[str(snapshot.get("cache_key", ""))]
+	var inverse_view_projection: Projection = scene_data.get_view_projection(view).inverse()
+	var camera: Transform3D = scene_data.get_cam_transform()
+	var dimensions: Vector3i = cached["grid_dims"]
+	var lighting: Variant = snapshot.get("lighting", PackedFloat32Array())
+	if not lighting is PackedFloat32Array or lighting.size() != 27:
+		return false
+	var values := PackedFloat32Array()
+	_append_projection(values, inverse_view_projection)
+	var bake_data: Resource = snapshot["data"]
+	var world_to_grid: Transform3D = bake_data.get("world_to_grid")
+	_append_transform(values, world_to_grid)
+	_append_transform(values, Transform3D(camera.basis.orthonormalized(), camera.origin))
+	values.append_array(PackedFloat32Array([float(dimensions.x), float(dimensions.y), float(dimensions.z), float(cached["probe_count"])]))
+	values.append_array(PackedFloat32Array([float(snapshot.get("strength", 1.0)), float(cached["spacing"]), 0.0, 0.0]))
+	for i in 7:
+		for channel in 4:
+			var index := i * 4 + channel
+			values.append(float(lighting[index]) if index < lighting.size() else 0.0)
+	if values.size() * 4 != UBO_SIZE:
+		_report("Magic GI uniform layout does not match the shader block.")
+		return false
+	var bytes := values.to_byte_array()
+	# No bake or no runtime producer is a true no-op: only allocate GPU state
+	# after the matching, validated snapshot has made it all the way to the shader.
+	if not _ubo.is_valid():
+		_ubo = rd.uniform_buffer_create(UBO_SIZE)
+		if not _ubo.is_valid():
+			return false
+	return rd.buffer_update(_ubo, 0, bytes.size(), bytes) == OK
+
+func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
+	for column in 4:
+		var axis: Vector4 = projection[column]
+		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
+
+func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
+	var axes := [transform.basis.x, transform.basis.y, transform.basis.z]
+	for axis in axes:
+		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
+	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]))
 
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
 	var binding_data := super._collect_bindings(buffers, view, rd)
-	if _binding_error:
+	if _binding_error or _frame_snapshot.is_empty():
 		return binding_data
+	var cache_key := str(_frame_snapshot.get("cache_key", ""))
+	if not _bake_resources.has(cache_key) or not _ensure_sampler(rd):
+		_binding_error = true
+		return binding_data
+	var cached: Dictionary = _bake_resources[cache_key]
 	var uniforms: Array[RDUniform] = binding_data["uniforms"]
-	if _ensure_sampler(rd):
-		var atlas := RDUniform.new()
-		atlas.binding = 4
-		atlas.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		atlas.add_id(_sampler)
-		atlas.add_id(_sh_texture)
-		uniforms.append(atlas)
-		binding_data["textures"].append(_sh_texture)
-		var index := RDUniform.new()
-		index.binding = 6
-		index.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		index.add_id(_sampler)
-		index.add_id(_index_texture)
-		uniforms.append(index)
-		binding_data["textures"].append(_index_texture)
-	var params := RDUniform.new()
-	params.binding = 5
-	params.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	params.add_id(_ubo)
-	uniforms.append(params)
+	for spec in [
+		{"binding": 6, "texture": cached["transfer"]},
+		{"binding": 7, "texture": cached["geometry"]},
+		{"binding": 8, "texture": cached["indices"]},
+	]:
+		var uniform := RDUniform.new()
+		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		uniform.binding = int(spec["binding"])
+		uniform.add_id(_sampler)
+		uniform.add_id(spec["texture"])
+		uniforms.append(uniform)
+	var uniform_buffer := RDUniform.new()
+	uniform_buffer.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
+	uniform_buffer.binding = UBO_BINDING
+	uniform_buffer.add_id(_ubo)
+	uniforms.append(uniform_buffer)
+	binding_data["uniforms"] = uniforms
 	return binding_data
 
 func _cleanup(rd: RenderingDevice) -> void:
-	if rd != null:
-		if _sh_texture.is_valid():
-			rd.free_rid(_sh_texture)
-			_sh_texture = RID()
-		if _index_texture.is_valid():
-			rd.free_rid(_index_texture)
-			_index_texture = RID()
-		if _ubo.is_valid():
-			rd.free_rid(_ubo)
-			_ubo = RID()
-	_sh_version = -1
 	super._cleanup(rd)
+	if rd == null:
+		return
+	for key in _bake_resources.keys():
+		_release_bake_resources(str(key), rd)
+	if _ubo.is_valid():
+		rd.free_rid(_ubo)
+	_ubo = RID()
+
+func _notification(what: int) -> void:
+	if what != NOTIFICATION_PREDELETE:
+		return
+	# ShaderPass already captures its shader objects by value because its Resource
+	# may be gone by the time the render-thread callback runs. Do the same for the
+	# PRT uploads and UBO; a weak-self cleanup callback cannot own these RIDs.
+	var ubo := _ubo
+	var bake_rids: Array[RID] = []
+	for cached in _bake_resources.values():
+		for name in ["transfer", "geometry", "indices"]:
+			var rid: RID = cached.get(name, RID())
+			if rid.is_valid():
+				bake_rids.append(rid)
+	_bake_resources.clear()
+	_ubo = RID()
+	RenderingServer.call_on_render_thread(func():
+		var rd := RenderingServer.get_rendering_device()
+		if rd == null:
+			return
+		if ubo.is_valid():
+			rd.free_rid(ubo)
+		for rid in bake_rids:
+			rd.free_rid(rid)
+	)

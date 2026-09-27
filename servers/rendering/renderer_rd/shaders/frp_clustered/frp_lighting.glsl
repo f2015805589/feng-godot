@@ -168,9 +168,10 @@ void main() {
 	vec4 emission_alpha = textureLod(sampler2D(gbuffer_emission_buffer, SAMPLER_NEAREST_CLAMP), screen_uv, 0.0);
 #endif
 	vec3 emission = emission_alpha.rgb;
-	// GBufferB/ORM alpha is one packed byte: ShadingModelID in low 4 bits and
-	// selective-output flags in high 4 bits, matching Unreal's legacy contract.
+	// ORM alpha packs ShadingModelID in the low nibble and AO_LIGHT_AFFECT in
+	// the high nibble; the shared decoder keeps this aligned with the G-buffer pass.
 	uint shading_model_id = frp_normalize_shading_model(frp_decode_shading_model(orm.a));
+	float ao_light_affect = frp_decode_ao_light_affect(orm.a);
 	// The G-buffer carries the material specular in the emission target's alpha
 	// (see the MODE_RENDER_GBUFFER branch in scene_frp_clustered.glsl). Feeding
 	// it to F0() replaces the hardcoded dielectric 0.5, matching Unreal's
@@ -605,8 +606,9 @@ void main() {
 
 	// Combine.
 	diffuse_light *= albedo;
-	diffuse_light *= ao;
-	direct_specular_light *= ao;
+	float direct_ao = mix(1.0, ao, ao_light_affect);
+	diffuse_light *= direct_ao;
+	direct_specular_light *= direct_ao;
 	diffuse_light *= 1.0 - metallic;
 	ambient_light *= 1.0 - metallic;
 

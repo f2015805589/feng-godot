@@ -2828,11 +2828,10 @@ void fragment_shader(in SceneData scene_data) {
 	orm_output_buffer.r = ao;
 	orm_output_buffer.g = roughness;
 	orm_output_buffer.b = metallic;
-	// Unreal legacy GBufferB packs ShadingModelID in the low nibble of alpha;
-	// the high nibble is reserved for future selective-output flags.
-	// Pack a full byte so the low nibble is ShadingModelID and the high nibble
-	// remains available for selective-output flags, as in Unreal's legacy GBufferB.
-	orm_output_buffer.a = float(material_id & 15u) / 255.0;
+	// Pack the shading model and direct-light AO affect into the ORM alpha byte.
+	// Four bits for AO affect preserve the attachment footprint while matching
+	// AO_LIGHT_AFFECT behavior in deferred lighting.
+	orm_output_buffer.a = frp_encode_gbuffer_metadata(material_id, ao_light_affect);
 
 	emission_output_buffer.rgb = emission;
 	// The alpha channel of the emission target is free (it was a constant 0 and

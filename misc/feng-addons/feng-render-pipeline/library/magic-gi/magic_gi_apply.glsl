@@ -1,126 +1,177 @@
 #[compute]
 #version 450
 
-// FMagicGI apply: adds a baked SH probe field's diffuse irradiance onto the
-// resolved scene color. One baked volume is active at a time; its SH table is a
-// one-row RGBA32F atlas, 7 texels per probe (9 coefficients x RGB).
-
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(rgba16f, set = 0, binding = 0) uniform restrict image2D color_image;
+layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
 layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness;
 layout(set = 0, binding = 3) uniform sampler2D gbuffer_albedo;
-layout(set = 0, binding = 4) uniform sampler2D sh_atlas;
-// Dense probe index -> atlas slot (-1 = culled). dims.x wide, dims.y*dims.z
-// tall so probe p is texel (p % dims.x, p / dims.x).
-layout(set = 0, binding = 6) uniform usampler2D index_map;
+layout(set = 0, binding = 4) uniform sampler2D gbuffer_orm;
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D gi_output;
+layout(set = 0, binding = 6) uniform sampler2D transfer_atlas;
+layout(set = 0, binding = 7) uniform sampler2D geometry_atlas;
+layout(set = 0, binding = 8) uniform isampler2D index_map;
 
-layout(push_constant, std430) uniform Params {
-	vec4 extra; // x = authored strength multiplier (the .tres' parameters)
-} pc;
-
-layout(set = 0, binding = 5, std140) uniform GIParams {
-	mat4 inv_view_proj;   // clip -> world (z is the raw depth value)
-	mat4 world_to_grid;   // world -> probe-grid index space
-	vec4 grid;            // xyz = dims, w = probe_count
-	vec4 control;         // x = gi_strength
+layout(set = 0, binding = 9, std140) uniform GIParams {
+	mat4 inverse_projection;
+	mat4 world_to_grid;
+	mat4 view_to_world;
+	vec4 grid; // xyz = lookup grid dimensions; w = surface sample count.
+	vec4 control; // x = strength; y = world-space probe spacing.
+	vec4 lighting_sh[7]; // 27 world-space RGB SH floats, coefficient-major.
 } params;
 
-// Y_l,m in the same order the baker projects (l<=2):
-// Y0, Y1-1(y), Y10(z), Y11(x), Y2-2(xy), Y2-1(yz), Y20(3z2-1), Y21(xz), Y22(x2-y2).
-// Multiplied by the cosine-convolution band weights pi, 2pi/3, pi/4 so the sum
-// below evaluates diffuse irradiance E(n) directly.
-vec3 irradiance_of_probe(int probe, vec3 n) {
-	// Texel packing (coeff-major, 27 floats): t0=(c0,c1.r) t1=(c1.gb,c2.rg)
-	// t2=(c2.b,c3) t3=(c4,c5.r) t4=(c5.gb,c6.rg) t5=(c6.b,c7) t6=(c8,-).
-	vec4 t0 = texelFetch(sh_atlas, ivec2(probe * 7 + 0, 0), 0);
-	vec4 t1 = texelFetch(sh_atlas, ivec2(probe * 7 + 1, 0), 0);
-	vec4 t2 = texelFetch(sh_atlas, ivec2(probe * 7 + 2, 0), 0);
-	vec4 t3 = texelFetch(sh_atlas, ivec2(probe * 7 + 3, 0), 0);
-	vec4 t4 = texelFetch(sh_atlas, ivec2(probe * 7 + 4, 0), 0);
-	vec4 t5 = texelFetch(sh_atlas, ivec2(probe * 7 + 5, 0), 0);
-	vec4 t6 = texelFetch(sh_atlas, ivec2(probe * 7 + 6, 0), 0);
-	vec3 c0 = t0.rgb;
-	vec3 c1 = vec3(t0.a, t1.rg);   // * 0.488603 * n.y
-	vec3 c2 = vec3(t1.ba, t2.r);   // * 0.488603 * n.z
-	vec3 c3 = t2.gba;              // * 0.488603 * n.x
-	vec3 c4 = t3.rgb;              // * 1.092548 * n.x*n.y
-	vec3 c5 = vec3(t3.a, t4.rg);   // * 1.092548 * n.y*n.z
-	vec3 c6 = vec3(t4.ba, t5.r);   // * 0.315392 * (3z^2-1)
-	vec3 c7 = t5.gba;              // * 1.092548 * n.x*n.z
-	vec3 c8 = t6.rgb;              // * 0.546274 * (x^2-y^2)
-	vec3 e = c0 * 0.8862269255;    // pi * 0.282095
-	e += (c1 * n.y + c2 * n.z + c3 * n.x) * 1.0233267079;   // 2pi/3 * 0.488603
-	e += (c4 * (n.x * n.y) + c5 * (n.y * n.z) + c7 * (n.x * n.z)) * 0.8580862330; // pi/4 * 1.092548
-	e += c6 * (3.0 * n.z * n.z - 1.0) * 0.2477075583;       // pi/4 * 0.315392
-	e += c8 * (n.x * n.x - n.y * n.y) * 0.4290428065;       // pi/4 * 0.546274
-	return e;
+layout(push_constant, std430) uniform PassParameters {
+	vec4 parameters;
+} pc;
+
+vec3 unpack_sh(vec4 blocks[7], int coefficient) {
+	int first = coefficient * 3;
+	int block0 = first / 4;
+	int lane0 = first % 4;
+	int second = first + 1;
+	int third = first + 2;
+	return vec3(
+		blocks[block0][lane0],
+		blocks[second / 4][second % 4],
+		blocks[third / 4][third % 4]
+	);
+}
+
+vec3 evaluate_probe(int probe) {
+	vec4 transfer_blocks[7];
+	int atlas_x = (probe % 32) * 7;
+	int atlas_y = probe / 32;
+	for (int texel = 0; texel < 7; texel++) {
+		transfer_blocks[texel] = texelFetch(transfer_atlas, ivec2(atlas_x + texel, atlas_y), 0);
+	}
+	vec3 value = vec3(0.0);
+	for (int coefficient = 0; coefficient < 9; coefficient++) {
+		value += unpack_sh(transfer_blocks, coefficient)
+				* unpack_sh(params.lighting_sh, coefficient);
+	}
+	return max(value, vec3(0.0));
+}
+
+ivec2 index_texel(ivec3 cell, int slot, ivec3 dimensions) {
+	return ivec2(cell.x * 8 + slot, cell.y + cell.z * dimensions.y);
 }
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-	if (any(greaterThanEqual(pixel, imageSize(color_image)))) {
+	ivec2 extent = imageSize(color_image);
+	if (any(greaterThanEqual(pixel, extent))) {
 		return;
 	}
-	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(imageSize(color_image));
+	imageStore(gi_output, pixel, vec4(0.0));
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
-	if (depth <= 0.0) {
-		return; // sky: no surface to light.
-	}
-	vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
-	vec4 world4 = params.inv_view_proj * clip;
-	vec3 world = world4.xyz / world4.w;
-	vec3 normal = normalize(texelFetch(normal_roughness, pixel, 0).xyz * 2.0 - 1.0);
-	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
-
-	// Grid coordinates and the border fade (half a cell outside the volume;
-	// single-probe axes have no border).
-	vec3 g = (params.world_to_grid * vec4(world, 1.0)).xyz;
-	vec3 dims = params.grid.xyz;
-	vec3 edge = min(g + vec3(0.5), dims - vec3(0.5) - g);
-	edge = max(edge, step(dims, vec3(1.0)));
-	float weight = clamp(min(edge.x, min(edge.y, edge.z)), 0.0, 1.0);
-	if (weight <= 0.0) {
+	if (depth <= 0.0 || params.control.x <= 0.0 || params.grid.w <= 0.0) {
 		return;
 	}
-	// The normal is a direction: transform it with the grid basis (uniform-scale
-	// safe) and normalize; the SH itself was baked in this same local frame.
-	vec3 n_local = normalize(mat3(params.world_to_grid) * normal);
 
-	// Trilinear blend of the irradiance evaluated at the 8 surrounding probes.
-	// Culled probes (-1 slot) contribute nothing; the surviving weights are
-	// renormalized so surface cells keep full-strength light.
-	vec3 base = clamp(floor(g), vec3(0.0), max(dims - vec3(2.0), vec3(0.0)));
-	vec3 f = clamp(g - base, vec3(0.0), vec3(1.0));
-	ivec3 i0 = ivec3(base);
-	vec3 irradiance = vec3(0.0);
-	float weight_sum = 0.0;
-	for (int dz = 0; dz <= 1; dz++) {
-		for (int dy = 0; dy <= 1; dy++) {
-			for (int dx = 0; dx <= 1; dx++) {
-				ivec3 cell = i0 + ivec3(dx, dy, dz);
-				cell = clamp(cell, ivec3(0), ivec3(dims) - 1);
-				int probe = cell.x + cell.y * int(dims.x) + cell.z * int(dims.x * dims.y);
-				int slot = int(texelFetch(index_map,
-						ivec2(cell.x, cell.y + cell.z * int(dims.y)), 0).x);
-				if (slot < 0) {
+	vec2 screen_uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+	vec4 clip = vec4(screen_uv * 2.0 - 1.0, depth, 1.0);
+	vec4 view_h = params.inverse_projection * clip;
+	if (abs(view_h.w) < 1e-7) {
+		return;
+	}
+	vec3 view_position = view_h.xyz / view_h.w;
+	vec3 world = (params.view_to_world * vec4(view_position, 1.0)).xyz;
+	vec3 normal_view = normalize(texelFetch(normal_roughness, pixel, 0).xyz * 2.0 - 1.0);
+	vec3 normal_world = normalize(mat3(params.view_to_world) * normal_view);
+	vec4 orm = texelFetch(gbuffer_orm, pixel, 0);
+	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
+	float ao = clamp(orm.r, 0.0, 1.0);
+	float metallic = clamp(orm.b, 0.0, 1.0);
+	float spacing = max(params.control.y, 0.001);
+	vec3 dimensions = params.grid.xyz;
+	vec3 grid_position = (params.world_to_grid * vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(params.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+		length(world_to_grid_basis[0]),
+		max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	if (any(lessThan(grid_position, vec3(-grid_epsilon)))
+			|| any(greaterThan(grid_position, dimensions + vec3(grid_epsilon)))) {
+		return;
+	}
+	grid_position = clamp(grid_position, vec3(0.0), dimensions);
+
+	ivec3 grid_dims = ivec3(dimensions);
+	ivec3 center = clamp(ivec3(floor(grid_position)), ivec3(0), grid_dims - 1);
+	int selected[4];
+	float selected_score[4];
+	for (int i = 0; i < 4; i++) {
+		selected[i] = -1;
+		selected_score[i] = 3.402823e+38;
+	}
+	for (int dz = -1; dz <= 1; dz++) {
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				ivec3 cell = center + ivec3(dx, dy, dz);
+				if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, grid_dims))) {
 					continue;
 				}
-				vec3 e = irradiance_of_probe(slot, n_local);
-				float w = ((dx == 0) ? (1.0 - f.x) : f.x)
-						* ((dy == 0) ? (1.0 - f.y) : f.y)
-						* ((dz == 0) ? (1.0 - f.z) : f.z);
-				irradiance += e * w;
-				weight_sum += w;
+				for (int slot = 0; slot < 8; slot++) {
+					int probe = texelFetch(index_map, index_texel(cell, slot, grid_dims), 0).r;
+					if (probe < 0) {
+						break; // Build slots are dense; the remaining slots in this cell are empty.
+					}
+					if (float(probe) >= params.grid.w) {
+						continue;
+					}
+					ivec2 geometry_xy = ivec2((probe % 32) * 2, probe / 32);
+					vec3 sample_position = texelFetch(geometry_atlas, geometry_xy, 0).xyz;
+					vec3 sample_normal = normalize(texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz);
+					float normal_match = dot(normal_world, sample_normal);
+					if (normal_match < 0.25) {
+						continue;
+					}
+					vec3 delta = world - sample_position;
+					float sample_plane_distance = abs(dot(delta, sample_normal));
+					float receiver_plane_distance = abs(dot(delta, normal_world));
+					if (sample_plane_distance > spacing * 0.75) {
+						continue;
+					}
+					float asymmetry = abs(sample_plane_distance - receiver_plane_distance);
+					float normalized_asymmetry = asymmetry / (0.25 * spacing);
+					float score = dot(delta, delta)
+						+ sample_plane_distance * sample_plane_distance * 4.0
+						+ (1.0 - normal_match) * (1.0 - normal_match) * spacing * spacing
+						+ normalized_asymmetry * normalized_asymmetry * spacing * spacing;
+					for (int candidate = 0; candidate < 4; candidate++) {
+						if (score >= selected_score[candidate]) {
+						continue;
+					}
+						for (int move = 3; move > candidate; move--) {
+							selected[move] = selected[move - 1];
+							selected_score[move] = selected_score[move - 1];
+						}
+						selected[candidate] = probe;
+						selected_score[candidate] = score;
+						break;
+					}
+				}
 			}
 		}
 	}
-	if (weight_sum > 0.0) {
-		irradiance /= weight_sum;
-	}
 
-	vec4 color = imageLoad(color_image, pixel);
-	imageStore(color_image, pixel,
-			vec4(color.rgb + albedo * irradiance * params.control.x * pc.extra.x * weight, color.a));
+	vec3 indirect = vec3(0.0);
+	float interpolation_weight = 0.0;
+	for (int i = 0; i < 4; i++) {
+		if (selected[i] < 0) {
+			continue;
+		}
+		float weight = inversesqrt(0.01 + selected_score[i]);
+		indirect += evaluate_probe(selected[i]) * weight;
+		interpolation_weight += weight;
+	}
+	if (interpolation_weight <= 0.0) {
+		return;
+	}
+	vec3 contribution = indirect / interpolation_weight
+			* albedo * (1.0 - metallic) * ao * params.control.x * pc.parameters.x;
+	imageStore(gi_output, pixel, vec4(contribution, 1.0));
+	vec4 scene_color = imageLoad(color_image, pixel);
+	imageStore(color_image, pixel, vec4(scene_color.rgb + contribution, scene_color.a));
 }

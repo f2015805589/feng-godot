@@ -4,6 +4,7 @@ const PassBase = preload("res://addons/feng-render-pipeline/passes/pass_base.gd"
 const ViewState = preload("res://addons/feng-render-pipeline/pipeline/view_state.gd")
 const Evaluator = preload("res://addons/feng-render-pipeline/volume/volume_evaluator.gd")
 const TextureManager = preload("res://addons/feng-render-pipeline/passes/texture_manager.gd")
+const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 
 class SettingsSource extends RefCounted:
 	var revision := 0
@@ -79,7 +80,12 @@ func run() -> void:
 	var input := FengPassTexture.new()
 	source.inputs = [input]
 	var entries: Array[FengPass] = renderer.passes.duplicate()
-	entries.insert(entries.size() - 1, source)
+	var post_process_index := entries.size()
+	for index in entries.size():
+		if entries[index] is FengBuiltinPass and entries[index].native_id == NativeSpec.PASS_POST_PROCESS:
+			post_process_index = index
+			break
+	entries.insert(post_process_index, source)
 	renderer.passes = entries
 	var compositor := Compositor.new()
 	var view := ViewState.new()

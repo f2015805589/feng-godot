@@ -3,6 +3,7 @@ extends SceneTree
 ## independent parameters, enabled RIDs, textures and stateful plugin instances.
 const PassBase = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
 const ViewPass = preload("res://addons/feng-render-pipeline/pipeline/view_pass.gd")
+const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 
 class StatefulPass extends PassBase:
 	@export var amount := 0.0
@@ -49,9 +50,14 @@ func run() -> void:
 	output.name = &"view_probe"
 	stateful.outputs = [output]
 	var entries: Array[FengPass] = renderer.passes.duplicate()
-	entries.insert(entries.size() - 1, tint)
-	entries.insert(entries.size() - 1, stateful)
-	entries.insert(entries.size() - 1, explicitly_shareable)
+	var post_process_index := entries.size()
+	for index in entries.size():
+		if entries[index] is FengBuiltinPass and entries[index].native_id == NativeSpec.PASS_POST_PROCESS:
+			post_process_index = index
+			break
+	entries.insert(post_process_index, tint)
+	entries.insert(post_process_index + 1, stateful)
+	entries.insert(post_process_index + 2, explicitly_shareable)
 	renderer.passes = entries
 	assert(not renderer.is_view_shareable(stateful), "custom passes remain isolated by default")
 	assert(renderer.is_view_shareable(explicitly_shareable), "custom opt-in must reach the view policy")

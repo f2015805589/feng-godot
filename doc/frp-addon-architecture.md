@@ -38,10 +38,36 @@ flowchart TD
 | `volume/volume_resolver.gd` | 按稳定优先级一次采样，生成参数与 Pass 开关结果 | 写 Renderer、连接信号、调用 RenderingServer |
 | `editor/volume_preview.gd` | 编辑器视图相机选择、独立临时 compositor、退出时恢复 | 重写混合规则或修改作者资源 |
 | `editor/pass_library_controller.gd` | 库菜单、资源选择、条目操作与完整 UndoRedo 事务 | 安装项目管线或控制 Volume 预览 |
+| `passes/magic_gi_pass.gd` | 将有效 PRT v2 数据上传为传输/几何 atlas 与有符号格索引，应用当前帧灯光 | 烘焙、注册 Volume、持有太阳或跨 viewport 选择状态 |
+| `passes/debug_buffers_pass.gd` | 在末尾显示所选材质、运动或 GI 纹理 | 分配未启用的输出、改写来源 pass 或修改作者参数 |
 | `editor_plugin.gd` | 注册/卸载编辑器服务及项目管线桥接 | 实现库操作的重复算法 |
 
 `world_compositor.gd` 集中保存引擎世界 compositor 的选择规则；`project_pipeline.gd` 集中解析项目
 资源路径、UID 和默认世界安装。两者语义不同，不与检查器的“可编辑资源来源”查找混用。
+
+## Magic GI 与缓冲调试
+
+`library_manager.gd` 的 manifest 是库条目的单一事实源：`Magic GI` 的 `default_enabled` 与
+`after_native = Lighting` 让新 Renderer 和旧 Renderer 同步到同一个位置；`Debug Buffers` 锚定在
+`Post Process` 后并默认关闭。旧全帧自定义 Renderer 没有 Lighting 锚点时，自动同步跳过默认 GI，
+不改变其执行时机；作者仍可从 Library 菜单手动添加并自行排序。已保存的 Magic GI Pass 在
+Renderer 主线程建立监听时幂等补齐 v2 输入和 `magic_gi` 输出声明，作者启用状态、强度与稳定 ID不变。
+
+Magic GI Pass 不依赖 C++ 侧的新入口，也不静态引用可选的 `feng-magic-gi` 插件类型。它只在首次需要时
+加载 runtime 脚本，并按当前 `RenderSceneBuffersRD.get_render_target()` 匹配 runtime 快照的
+`render_targets`。没有匹配视口、有效烘焙或可用 runtime 时清零自己的贡献纹理，不更改 HDR 场景色。
+有效烘焙以 `cache_key + data identity + version` 缓存：数据改变时验证并上传 RGBA32F 传输/几何 atlas
+和 `R32_SINT` 索引纹理；太阳或环境变化只更新 SH lighting 与相机 UBO。着色器从 view-space 深度重建
+view position，再用相机完整 transform 得到 world position；法线也从 view space 变换到 world space。
+表面查询只检查附近 27 个格，每格最多 8 个样本，依据法线匹配、表面平面距离和最近四点插值，
+之后以 `albedo * (1 - metallic) * AO` 乘 transport 与当前 incident SH 的点积。Transfer 不含接收材质、
+直接光或当前环境项，所以相机移动不会漂移，动态光照无需重烘焙，也不会把 direct light 再加一遍。
+
+Debug Buffers 只有启用时才声明和分配 `debug_buffers` 纹理，关闭时没有采样 dispatch。buffer 选择决定
+输入纹理契约，不能作为运行时数值 override；`motion_scale` 与 `gi_exposure` 仍从
+`get_resolved_parameters()` 读取，可通过 Renderer 的 pass 参数覆盖，不导出为 Volume 字段。显示发生在 Post Process 后，
+原始 G-buffer 通道与 Magic GI contribution 不经过 Color Grade 或 tone mapping。缺少可选 GI pass 时，
+选择 Magic GI 的诊断画面为黑色，其他 FRP-only 回归不会加载或扫描 GI 插件。
 
 ## 必须保持的契约
 

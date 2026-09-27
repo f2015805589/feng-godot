@@ -15,16 +15,20 @@ func _run() -> void:
 	pipeline_plugin = PipelinePlugin.new()
 	add_child(pipeline_plugin)
 	var renderer := Renderer.new()
-	# A fresh renderer is the nine passes, and Color Grade is the one library entry it
-	# seeds; the other templates reach it only through the Library menu.
-	assert(renderer.passes.size() == 9, "a fresh renderer must list the nine passes, got %d" % renderer.passes.size())
+	# A fresh renderer has eight native and three seeded library entries.
+	assert(renderer.passes.size() == 11, "a fresh renderer must list eleven passes, got %d" % renderer.passes.size())
 	var entries = renderer.passes.duplicate()
-	var removed_seeded := false
+	var removed_debug := false
+	var removed_color_grade := false
 	for i in range(entries.size() - 1, -1, -1):
-		if entries[i].stable_id == &"library:color_grade":
+		if entries[i].stable_id == &"library:debug_buffers":
 			entries.remove_at(i)
-			removed_seeded = true
-	assert(removed_seeded, "the fresh renderer does not carry the seeded Color Grade pass")
+			removed_debug = true
+		elif entries[i].stable_id == &"library:color_grade":
+			entries.remove_at(i)
+			removed_color_grade = true
+	assert(removed_debug, "the fresh renderer does not carry the seeded Debug Buffers pass")
+	assert(removed_color_grade, "the fresh renderer does not carry the seeded Color Grade pass")
 	renderer.passes = entries
 	renderer.get_configuration_warnings()
 	EditorInterface.edit_resource(renderer)

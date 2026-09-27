@@ -12,6 +12,7 @@ extends SceneTree
 
 const SETTING := "rendering/renderer/compositor"
 const PIPELINE_PATH := "res://addons/feng-render-pipeline/project_pipeline.gd"
+const ProjectPipeline = preload("res://addons/feng-render-pipeline/project_pipeline.gd")
 const COMPOSITOR_PATH := "res://addons/feng-render-pipeline/compositor.gd"
 const RENDERER_PATH := "res://addons/feng-render-pipeline/renderer.gd"
 const NODE_NAME := "FengProjectPipeline"
@@ -86,6 +87,16 @@ func save_pipeline(resource, path: String) -> String:
 	return path
 
 
+func resolve_unowned_wrapper(path: String) -> WeakRef:
+	ProjectSettings.set_setting(SETTING, path)
+	var project_pipeline = load(PIPELINE_PATH)
+	var compositor: Compositor = project_pipeline.resolve()
+	require(compositor != null, "a bare Renderer path did not resolve to a Compositor")
+	var compositor_ref: WeakRef = weakref(compositor)
+	compositor = null
+	return compositor_ref
+
+
 func install_node():
 	var node = load(PIPELINE_PATH).new()
 	require(node != null, "project_pipeline.gd did not load")
@@ -157,6 +168,32 @@ func run() -> void:
 	compositor.renderer = taa_renderer
 	var compositor_path := save_pipeline(compositor, "user://project_pipeline_compositor.tres")
 
+	# Resolving a bare Renderer creates a wrapper, but a cache entry is not an owner.
+	# Once no editor/game WorldEnvironment holds it, the wrapper should be collectible.
+	# The next lookup for the same path must then load a fresh wrapper.
+	var probe_renderer = build_renderer(false)
+	var probe_path := save_pipeline(probe_renderer, "user://project_pipeline_weak_cache.tres")
+	probe_renderer = null
+	var transient_ref: WeakRef = resolve_unowned_wrapper(probe_path)
+	for i in 2:
+		await process_frame
+	require(transient_ref.get_ref() == null, "the static resolver cache kept an unowned wrapper alive")
+	var reloaded_wrapper: Compositor = ProjectPipeline.resolve()
+	require(reloaded_wrapper != null, "an expired weak cache entry was not reloaded")
+	require(reloaded_wrapper.get("renderer").resource_path == probe_path,
+		"reloading an expired entry selected the wrong Renderer")
+	ProjectSettings.set_setting(SETTING, "")
+	require(ProjectPipeline.resolve() == null, "clearing the setting returned a cached compositor")
+	reloaded_wrapper = null
+	ProjectSettings.set_setting(SETTING, plain_path)
+	var changed_wrapper: Compositor = ProjectPipeline.resolve()
+	require(changed_wrapper != null, "changing the setting path did not resolve a new Renderer")
+	require(changed_wrapper.get("renderer").resource_path == plain_path,
+		"changing the setting path reused the previous Renderer")
+	changed_wrapper = null
+	ProjectSettings.set_setting(SETTING, "")
+	require(ProjectPipeline.resolve() == null, "the resolver did not clear after switching back to an empty setting")
+
 	var node = install_node()
 
 	# Control: with no project pipeline the viewport decides, and it says no.
@@ -218,6 +255,15 @@ func run() -> void:
 	require(abs(mean_luma(cleared_image) - off_luma) < 0.05, "the cleared frame is not the baseline scene")
 
 	node.queue_free()
+	scene.queue_free()
+	scene_world = null
+	scene_compositor = null
+	compositor = null
+	taa_renderer = null
+	plain_renderer = null
+	off_image = null
+	lit_image = null
+	cleared_image = null
 	await frame()
 	print("PASS the project setting is the pipeline a running game renders, its Temporal AA entry is the switch, and a scene compositor wins")
 	quit(0)
