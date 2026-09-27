@@ -99,12 +99,19 @@ void main() {
 
 	ivec3 grid_dims = ivec3(dimensions);
 	ivec3 center = clamp(ivec3(floor(grid_position)), ivec3(0), grid_dims - 1);
-	int selected[4];
-	float selected_score[4];
-	for (int i = 0; i < 4; i++) {
+	const int SELECTED_COUNT = 6;
+	int selected[SELECTED_COUNT];
+	float selected_score[SELECTED_COUNT];
+	float selected_gate[SELECTED_COUNT];
+	for (int i = 0; i < SELECTED_COUNT; i++) {
 		selected[i] = -1;
 		selected_score[i] = 3.402823e+38;
+		selected_gate[i] = 0.0;
 	}
+	// Behind the sampled surface's tangent plane the receiver is on the other
+	// side of the geometry; those probes can only leak light, so their weight
+	// fades to zero across a narrow band instead of staying reachable.
+	float back_tolerance = max(spacing * 0.12, 0.02);
 	for (int dz = -1; dz <= 1; dz++) {
 		for (int dy = -1; dy <= 1; dy++) {
 			for (int dx = -1; dx <= 1; dx++) {
@@ -124,31 +131,33 @@ void main() {
 					vec3 sample_position = texelFetch(geometry_atlas, geometry_xy, 0).xyz;
 					vec3 sample_normal = normalize(texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz);
 					float normal_match = dot(normal_world, sample_normal);
-					if (normal_match < 0.25) {
-						continue;
-					}
 					vec3 delta = world - sample_position;
-					float sample_plane_distance = abs(dot(delta, sample_normal));
+					float signed_plane_distance = dot(delta, sample_normal);
 					float receiver_plane_distance = abs(dot(delta, normal_world));
-					if (sample_plane_distance > spacing * 0.75) {
+					float gate = smoothstep(-back_tolerance, -back_tolerance * 0.3, signed_plane_distance)
+							* (1.0 - smoothstep(spacing * 0.55, spacing * 0.85, signed_plane_distance))
+							* smoothstep(0.15, 0.5, normal_match);
+					if (gate <= 0.0) {
 						continue;
 					}
-					float asymmetry = abs(sample_plane_distance - receiver_plane_distance);
+					float asymmetry = abs(signed_plane_distance - receiver_plane_distance);
 					float normalized_asymmetry = asymmetry / (0.25 * spacing);
 					float score = dot(delta, delta)
-						+ sample_plane_distance * sample_plane_distance * 4.0
+						+ signed_plane_distance * signed_plane_distance * 4.0
 						+ (1.0 - normal_match) * (1.0 - normal_match) * spacing * spacing
 						+ normalized_asymmetry * normalized_asymmetry * spacing * spacing;
-					for (int candidate = 0; candidate < 4; candidate++) {
+					for (int candidate = 0; candidate < SELECTED_COUNT; candidate++) {
 						if (score >= selected_score[candidate]) {
-						continue;
-					}
-						for (int move = 3; move > candidate; move--) {
+							continue;
+						}
+						for (int move = SELECTED_COUNT - 1; move > candidate; move--) {
 							selected[move] = selected[move - 1];
 							selected_score[move] = selected_score[move - 1];
+							selected_gate[move] = selected_gate[move - 1];
 						}
 						selected[candidate] = probe;
 						selected_score[candidate] = score;
+						selected_gate[candidate] = gate;
 						break;
 					}
 				}
@@ -158,11 +167,14 @@ void main() {
 
 	vec3 indirect = vec3(0.0);
 	float interpolation_weight = 0.0;
-	for (int i = 0; i < 4; i++) {
+	// A spacing-scaled kernel radius keeps the blend distributed over the
+	// selected probes instead of collapsing onto the single nearest one.
+	float kernel_epsilon = max(spacing * spacing * 0.16, 0.0001);
+	for (int i = 0; i < SELECTED_COUNT; i++) {
 		if (selected[i] < 0) {
 			continue;
 		}
-		float weight = inversesqrt(0.01 + selected_score[i]);
+		float weight = selected_gate[i] * inversesqrt(kernel_epsilon + selected_score[i]);
 		indirect += evaluate_probe(selected[i]) * weight;
 		interpolation_weight += weight;
 	}
