@@ -3,6 +3,8 @@ class_name FMagicGIVolume
 extends Node3D
 ## Surface PRT volume. Samples lie on visible geometry; spacing is in world meters.
 
+signal bake_status_changed
+
 const Runtime = preload("feng_magic_gi_runtime.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
@@ -17,7 +19,7 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 		size = value if value.is_finite() else Vector3(10.0, 10.0, 10.0)
 		size = size.max(Vector3.ONE * 0.01)
 		_settings_changed()
-@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 1.0:
+@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 2.0:
 	set(value):
 		probe_spacing = clampf(value, 0.1, 4096.0)
 		_settings_changed()
@@ -126,6 +128,17 @@ func _process(_delta: float) -> void:
 func has_bake() -> bool:
 	if not is_inside_tree() or bake_data == null or not _scene_signature_checked:
 		return false
+	if not has_usable_bake():
+		return false
+	return bake_data.matches_layout(size, probe_spacing, surface_offset, global_transform,
+			bake_samples, bake_bounces, bake_distance, terrain_reflectance, fallback_material_reflectance) \
+		and bake_data.scene_signature == Data.signature_for_geometry(_current_scene_signature)
+
+## True when the saved resource is structurally sound and can still be sampled,
+## even if the current scene/layout no longer matches the bake.
+func has_usable_bake() -> bool:
+	if bake_data == null:
+		return false
 	var identity := bake_data.get_instance_id()
 	if not _validity_checked or identity != _validity_instance_id or bake_data.bake_version != _validity_bake_version:
 		_validity_instance_id = identity
@@ -133,11 +146,12 @@ func has_bake() -> bool:
 		_cached_data_valid = bake_data.is_valid()
 		_cached_has_nonzero_indirect_transport = _cached_data_valid and bake_data.has_nonzero_transfer()
 		_validity_checked = true
-	if not _cached_data_valid:
-		return false
-	return bake_data.matches_layout(size, probe_spacing, surface_offset, global_transform,
-			bake_samples, bake_bounces, bake_distance, terrain_reflectance, fallback_material_reflectance) \
-		and bake_data.scene_signature == Data.signature_for_geometry(_current_scene_signature)
+	return _cached_data_valid
+
+## Indicates that this volume has saved bake data but it no longer matches the
+## checked scene/layout. The valid old bake remains available for preview.
+func needs_rebake() -> bool:
+	return bake_data != null and _scene_signature_checked and not has_bake()
 
 func has_legacy_sampler_signature() -> bool:
 	return bake_data != null and _scene_signature_checked \
@@ -157,7 +171,7 @@ func bake_staleness_reasons() -> PackedStringArray:
 	return reasons
 
 func has_nonzero_indirect_transfer() -> bool:
-	return has_bake() and _cached_has_nonzero_indirect_transport
+	return has_usable_bake() and _cached_has_nonzero_indirect_transport
 
 func probe_count() -> int:
 	return probe_positions.size()
@@ -227,6 +241,7 @@ func refresh_surface_points() -> void:
 	_refresh_viz()
 	Runtime.publish(self)
 	update_configuration_warnings()
+	bake_status_changed.emit()
 
 func _settings_changed(rebuild := true) -> void:
 	_bake_generation += 1
@@ -243,6 +258,7 @@ func _sample_quality_changed() -> void:
 	_invalidate_data_cache()
 	Runtime.publish(self)
 	update_configuration_warnings()
+	bake_status_changed.emit()
 
 func _invalidate_data_cache() -> void:
 	_validity_checked = false
@@ -252,6 +268,8 @@ func _invalidate_data_cache() -> void:
 func _on_data_changed() -> void:
 	_invalidate_data_cache()
 	Runtime.publish(self)
+	update_configuration_warnings()
+	bake_status_changed.emit()
 
 func _get_configuration_warnings() -> PackedStringArray:
 	var warnings := PackedStringArray()
@@ -259,13 +277,16 @@ func _get_configuration_warnings() -> PackedStringArray:
 	if dims.x > Data.MAX_GRID_AXIS or dims.y > Data.MAX_GRID_AXIS or dims.z > Data.MAX_GRID_AXIS:
 		warnings.append("The lookup grid is limited to 64 cells per axis. Reduce the volume or increase Probe Spacing.")
 	if bake_data != null and _scene_signature_checked:
-		if not has_bake():
-			warnings.append("Stale PRT bake: %s. Re-bake to update it." % "; ".join(bake_staleness_reasons()))
+		if not has_usable_bake():
+			warnings.append("PRT bake data is invalid or incomplete. Re-bake to restore Magic GI.")
+		elif needs_rebake():
+			warnings.append("当前显示上次烘焙，仅供预览；场景或烘焙设置已变化，请重新 Bake。原因：%s" % "; ".join(bake_staleness_reasons()))
 		elif not _cached_has_nonzero_indirect_transport:
 			warnings.append(ZERO_TRANSFER_DIAGNOSTIC)
-		var emission_warning := Runtime.emission_warning(self)
-		if not emission_warning.is_empty():
-			warnings.append(emission_warning)
+		if has_usable_bake():
+			var emission_warning := Runtime.emission_warning(self)
+			if not emission_warning.is_empty():
+				warnings.append(emission_warning)
 	if probe_count() >= Placement.MAX_PROBES:
 		warnings.append("Surface sample limit reached. Increase Probe Spacing or reduce the volume.")
 	if probe_count() == 0 and _scene_signature_checked:

@@ -56,7 +56,11 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_dimensions = volume.grid_dimensions()
 	_bounds = AABB(-volume.size * 0.5, volume.size)
 	_world_bounds = volume.global_transform * _bounds
-	_bake_world_bounds = _world_bounds.grow(volume.bake_distance) if for_bake else _world_bounds
+	# Preview must include geometry that can intersect the short surface-offset
+	# segment, even before a bake exists. Bake collection already has the wider
+	# ray-tracing bounds and therefore also contains this local occupancy region.
+	_bake_world_bounds = _world_bounds.grow(volume.bake_distance) if for_bake \
+			else _world_bounds.grow(volume.surface_offset + BROADPHASE_EPSILON)
 	error_message = ""
 	faces.clear()
 	reflectance.clear()
@@ -85,12 +89,20 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_collect_node(_scene_root, for_bake)
 	if not error_message.is_empty():
 		return false
-	if for_bake and build_bvh and not faces.is_empty():
+	# Build once after all faces are collected. Placement filtering and the baker
+	# then share this same accelerated geometry instead of scanning triangles per
+	# sample. Preview also needs it to match the bake's accepted sample layout.
+	if not faces.is_empty():
 		bvh = TriangleMesh.new()
 		bvh_ready = bvh.create_from_faces(faces)
 		if not bvh_ready:
 			error_message = "Godot could not create the static PRT triangle BVH."
 			return false
+	if not _sample_collected_geometry():
+		return false
+	if not build_bvh:
+		bvh = null
+		bvh_ready = false
 	for entry in _cells.values():
 		positions.append(entry.position)
 		normals.append(entry.normal)
@@ -98,6 +110,32 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	emitter_static_signatures = _emitter_set.static_signatures
 	emitter_groups = _emitter_set.groups
 	scene_signature = hash([faces, reflectance, positions, normals])
+	return true
+
+func _sample_collected_geometry() -> bool:
+	for face_offset in range(0, faces.size(), 3):
+		var a: Vector3 = faces[face_offset]
+		var b: Vector3 = faces[face_offset + 1]
+		var c: Vector3 = faces[face_offset + 2]
+		var polygon := [_inverse * a, _inverse * b, _inverse * c]
+		polygon = _clip_polygon(polygon, 0, -_volume.size.x * 0.5, true)
+		polygon = _clip_polygon(polygon, 0, _volume.size.x * 0.5, false)
+		polygon = _clip_polygon(polygon, 1, -_volume.size.y * 0.5, true)
+		polygon = _clip_polygon(polygon, 1, _volume.size.y * 0.5, false)
+		polygon = _clip_polygon(polygon, 2, -_volume.size.z * 0.5, true)
+		polygon = _clip_polygon(polygon, 2, _volume.size.z * 0.5, false)
+		if polygon.size() < 3:
+			continue
+		var root: Vector3 = polygon[0]
+		for i in range(1, polygon.size() - 1):
+			var p0: Vector3 = _volume.global_transform * root
+			var p1: Vector3 = _volume.global_transform * polygon[i]
+			var p2: Vector3 = _volume.global_transform * polygon[i + 1]
+			var clipped_normal := (p2 - p0).cross(p1 - p0).normalized()
+			if clipped_normal.length_squared() < 0.5:
+				continue
+			if not _sample_triangle(p0, p1, p2, clipped_normal):
+				return false
 	return true
 
 func _collect_node(node: Node, for_bake: bool) -> void:
@@ -294,25 +332,6 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool,
 	if _triangle_emitter_index >= 0:
 		_emitter_set.append_triangle(_triangle_emitter_index, a, b, c, normal,
 				uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c)
-	var polygon := [_inverse * a, _inverse * b, _inverse * c]
-	polygon = _clip_polygon(polygon, 0, -_volume.size.x * 0.5, true)
-	polygon = _clip_polygon(polygon, 0, _volume.size.x * 0.5, false)
-	polygon = _clip_polygon(polygon, 1, -_volume.size.y * 0.5, true)
-	polygon = _clip_polygon(polygon, 1, _volume.size.y * 0.5, false)
-	polygon = _clip_polygon(polygon, 2, -_volume.size.z * 0.5, true)
-	polygon = _clip_polygon(polygon, 2, _volume.size.z * 0.5, false)
-	if polygon.size() < 3:
-		return true
-	var root: Vector3 = polygon[0]
-	for i in range(1, polygon.size() - 1):
-		var p0: Vector3 = _volume.global_transform * root
-		var p1: Vector3 = _volume.global_transform * polygon[i]
-		var p2: Vector3 = _volume.global_transform * polygon[i + 1]
-		var clipped_normal := (p2 - p0).cross(p1 - p0).normalized()
-		if clipped_normal.length_squared() < 0.5:
-			continue
-		if not _sample_triangle(p0, p1, p2, clipped_normal):
-			return false
 	return true
 
 func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3) -> bool:
@@ -347,7 +366,7 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 			or local.z < -_volume.size.z * 0.5 - epsilon or local.z > _volume.size.z * 0.5 + epsilon:
 		return
 	# Keep the authored surface density close to Probe Spacing even for highly
-	# tessellated/curved meshes. A 1x probe-spacing radius avoids filling a 1m
+	# tessellated/curved meshes. A 1x probe-spacing radius avoids filling a
 	# lookup cell with several near-duplicate triangle samples.
 	var min_separation: float = float(_volume.get("probe_spacing"))
 	var hash_cell := Vector3i(floori(surface.x / min_separation),
@@ -358,11 +377,12 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 				var nearby: Array = _spatial_hash.get(hash_cell + Vector3i(dx, dy, dz), [])
 				for existing in nearby:
 					# Treat nearby samples on a smooth curve as the same local
-					# surface while retaining genuinely different walls/faces at
 					# corners (orthogonal normals have dot=0).
 					if normal.dot(existing.normal) > 0.5 \
 							and surface.distance_squared_to(existing.position) < min_separation * min_separation:
 						return
+	if _probe_offset_is_occluded(surface, normal):
+		return
 	var grid: Vector3 = (local + _volume.size * 0.5) / _volume.size * Vector3(_dimensions)
 	var cell := Data.cell_coordinates(grid, _dimensions)
 	if cell.x < 0:
@@ -382,6 +402,15 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 	bucket.append(point_entry)
 	_spatial_hash[hash_cell] = bucket
 	_cells[_cells.size()] = {"position": surface + normal * _volume.surface_offset, "normal": normal}
+
+func _probe_offset_is_occluded(surface: Vector3, normal: Vector3) -> bool:
+	if not bvh_ready or normal.length_squared() < 0.5:
+		return false
+	var offset := float(_volume.surface_offset)
+	var epsilon := minf(offset * 0.25, BROADPHASE_EPSILON)
+	var start := surface + normal * epsilon
+	var end := surface + normal * offset
+	return not bvh.intersect_segment(start, end).is_empty()
 
 func _clip_polygon(polygon: Array, axis: int, boundary: float, keep_greater: bool) -> Array:
 	var output: Array = []

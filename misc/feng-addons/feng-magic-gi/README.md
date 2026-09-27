@@ -14,7 +14,7 @@ FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）数
 ## 使用与烘焙
 
 1. 启用 `Feng Render Pipeline` 与 `Feng Magic GI`，确保两个插件都链接到 `res://addons/`。
-2. 在场景中添加 `FMagicGIVolume`。默认布点间距为 1 米；按需要调整 `size`、`Probe Spacing` 和表面偏移。探针只布置在 Volume 内的可见受支持表面，不需要物理碰撞体；没有几何时不会在空气中生成探针。
+2. 在场景中添加 `FMagicGIVolume`。新建 Volume 的默认布点间距为 2 米；按需要调整 `size`、`Probe Spacing` 和表面偏移。已有场景可保留原间距，改变间距后需要重新 Bake。探针只布置在 Volume 内的可见受支持表面，不需要物理碰撞体；没有几何时不会在空气中生成探针。
 3. 在 Inspector 的 **Bake quality** 中选择 **Draft 256**、**Final 1024** 或 **High 2048** rays/point，再点击 **Bake PRT Transfer**。新建 Volume 的数值默认仍为 256；现有场景不会静默改用更多样本。也可用 `Bake Samples` 设置自定义数量。质量或其他烘焙参数变化后，Inspector 会显示旧数据的实际样本数、当前请求数及需重烘状态。烘焙在 CPU 上分批追踪路径，表面较密或采样较多时会花一些时间；`Bake Bounces` 和 `Bake Distance` 控制路径深度及传输距离。烘焙成功后编辑器会将场景标记为未保存。可用 **Refresh Surface Points** 立即刷新编辑器预览。
 4. 新建的 Feng Renderer 默认在 Lighting 后加入并启用 **Magic GI** pass。没有有效烘焙，或当前视口没有同一 World3D 的 Volume 时，pass 不改变场景颜色。独立的 **Debug Buffers** pass 默认关闭；启用后可检查反照率、view-space 法线、AO、roughness、metallic、运动向量或 Magic GI 贡献。
 

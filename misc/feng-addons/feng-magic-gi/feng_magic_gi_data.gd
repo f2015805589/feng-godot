@@ -24,6 +24,7 @@ const RUNTIME_ATLAS_FILTER_EPSILON := 0.00001
 @export_storage var volume_transform := Transform3D.IDENTITY
 @export_storage var world_to_grid := Transform3D.IDENTITY
 @export_storage var volume_size := Vector3.ZERO
+# Keep the legacy storage default: older 1 m bakes omit this field in .tscn files.
 @export_storage var spacing := 1.0
 @export_storage var surface_offset := 0.03
 @export_storage var bake_samples := 0

@@ -98,7 +98,7 @@ static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
 			_mutex.unlock()
 			return # The selected volume's warning was refreshed by _publish().
 	_mutex.unlock()
-	if not volume.has_bake():
+	if not volume.has_usable_bake():
 		state.emission_warning = ""
 		return
 	state.refresh_emission_diagnostics(volume, volume.bake_data)
@@ -153,7 +153,7 @@ static func _publish() -> void:
 			continue
 		if not volume.enabled:
 			continue
-		if not volume.has_bake():
+		if not volume.has_usable_bake():
 			state.emission_warning = ""
 			continue
 		var world := volume.get_world_3d()
