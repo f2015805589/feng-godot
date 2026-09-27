@@ -44,6 +44,8 @@ base = [str(binary), "--path", str(project),
 # it is unrelated to FRP and would otherwise fail every run.
 UNRELATED_ERRORS = (
     "Failed to read the root certificate store.",
+    # Hosts without an audio card report ALSA's open failure at startup.
+    'Condition "status < 0" is true. Returning: ERR_CANT_OPEN',
 )
 
 

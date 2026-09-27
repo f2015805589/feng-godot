@@ -1,6 +1,6 @@
 @tool
 class_name FengMagicGIPass
-extends FengShaderPass
+extends FengRuntimeSnapshotPass
 ## Applies the current lighting to a baked surface PRT field.
 ##
 ## Bake textures are cached by the immutable data identity and bake version. The
@@ -12,17 +12,15 @@ const UBO_SIZE := 336 # Three mat4, two vec4 and seven packed SH vec4s.
 const MAX_CACHED_BAKES := 8
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-magic-gi/feng_magic_gi_runtime.gd"
 
-var _runtime_script_checked := false
-var _runtime_script: Script
-var _frame_snapshot: Dictionary = {}
-var _frame_scene_data: RenderSceneData
-var _ubo := RID()
 var _bake_resources: Dictionary = {}
 var _cache_clock := 0
 
 func _init() -> void:
 	inputs = _make_inputs()
 	outputs = _make_outputs()
+
+func runtime_script_path() -> String:
+	return RUNTIME_SCRIPT_PATH
 
 ## Saved pre-PRT-v2 resources carry only four inputs and no independent output.
 ## FengRenderer calls this on the main thread after deserialization so old authored
@@ -71,29 +69,6 @@ func _make_outputs() -> Array[OutputDeclaration]:
 	output.usage = OutputDeclaration.Usage.SAMPLED | OutputDeclaration.Usage.STORAGE | OutputDeclaration.Usage.COPY_TO
 	return [output]
 
-func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.binding != right.binding or left.source != right.source \
-				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
-				or left.custom_name != right.custom_name:
-			return false
-	return true
-
-func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.name != right.name or left.data_format != right.data_format \
-				or left.usage != right.usage or left.scale != right.scale:
-			return false
-	return true
-
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["parameters"])
 
@@ -104,46 +79,6 @@ func refresh_resource_flags() -> void:
 	access_resolved_depth = true
 	needs_normal_roughness = true
 	super.refresh_resource_flags()
-
-func _frp_execute(ctx: FRPPassContext) -> void:
-	_frame_snapshot = {}
-	_frame_scene_data = null
-	if ctx != null:
-		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
-		_frame_snapshot = _snapshot_for_target(buffers)
-		var render_data := ctx.get_render_data()
-		if render_data != null:
-			_frame_scene_data = render_data.get_render_scene_data()
-	super._frp_execute(ctx)
-	_frame_snapshot = {}
-	_frame_scene_data = null
-
-func _snapshot_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
-	if buffers == null:
-		return {}
-	var runtime_script := _get_runtime_script()
-	if runtime_script == null:
-		return {}
-	var snapshots: Variant = runtime_script.call("snapshots")
-	if not snapshots is Array:
-		return {}
-	var target := buffers.get_render_target()
-	for snapshot in snapshots:
-		if not snapshot is Dictionary:
-			continue
-		var targets: Variant = snapshot.get("render_targets", [])
-		if targets is Array and targets.has(target):
-			return snapshot
-	return {}
-
-func _get_runtime_script() -> Script:
-	if not _runtime_script_checked:
-		_runtime_script_checked = true
-		if ResourceLoader.exists(RUNTIME_SCRIPT_PATH):
-			var loaded: Variant = load(RUNTIME_SCRIPT_PATH)
-			if loaded is Script:
-				_runtime_script = loaded
-	return _runtime_script
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	var output: RID = inputs[5].get_texture(buffers, view)
@@ -351,17 +286,9 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		for channel in 4:
 			var index := i * 4 + channel
 			values.append(float(lighting[index]) if index < lighting.size() else 0.0)
-	if values.size() * 4 != UBO_SIZE:
-		_report("Magic GI uniform layout does not match the shader block.")
-		return false
-	var bytes := values.to_byte_array()
 	# No bake or no runtime producer is a true no-op: only allocate GPU state
 	# after the matching, validated snapshot has made it all the way to the shader.
-	if not _ubo.is_valid():
-		_ubo = rd.uniform_buffer_create(UBO_SIZE)
-		if not _ubo.is_valid():
-			return false
-	return rd.buffer_update(_ubo, 0, bytes.size(), bytes) == OK
+	return _commit_frame_ubo(values, UBO_SIZE, rd)
 
 func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
 	for column in 4:
@@ -396,11 +323,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		uniform.add_id(_sampler)
 		uniform.add_id(spec["texture"])
 		uniforms.append(uniform)
-	var uniform_buffer := RDUniform.new()
-	uniform_buffer.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform_buffer.binding = UBO_BINDING
-	uniform_buffer.add_id(_ubo)
-	uniforms.append(uniform_buffer)
+	uniforms.append(_ubo_uniform(UBO_BINDING))
 	binding_data["uniforms"] = uniforms
 	return binding_data
 
@@ -410,31 +333,21 @@ func _cleanup(rd: RenderingDevice) -> void:
 		return
 	for key in _bake_resources.keys():
 		_release_bake_resources(str(key), rd)
-	if _ubo.is_valid():
-		rd.free_rid(_ubo)
-	_ubo = RID()
 
 func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
-	# ShaderPass already captures its shader objects by value because its Resource
-	# may be gone by the time the render-thread callback runs. Do the same for the
-	# PRT uploads and UBO; a weak-self cleanup callback cannot own these RIDs.
-	var ubo := _ubo
-	var bake_rids: Array[RID] = []
+	# Value-capture the RIDs: the instance is being torn down, so only local
+	# state is safe here (see FengRuntimeSnapshotPass._free_on_render_thread).
+	var rids: Array[RID] = []
+	if _ubo.is_valid():
+		rids.append(_ubo)
+	_ubo = RID()
 	for cached in _bake_resources.values():
 		for name in ["transfer", "geometry", "indices", "emission"]:
 			var rid: RID = cached.get(name, RID())
 			if rid.is_valid():
-				bake_rids.append(rid)
+				rids.append(rid)
 	_bake_resources.clear()
-	_ubo = RID()
-	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd == null:
-			return
-		if ubo.is_valid():
-			rd.free_rid(ubo)
-		for rid in bake_rids:
-			rd.free_rid(rid)
-	)
+	if not rids.is_empty():
+		_free_on_render_thread(rids)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated FRP + Magic GI GPU integration test; fixtures and logs stay under bin/."""
+"""Isolated FRP + Feng Height Fog GPU integration test; fixtures and logs stay under bin/."""
 import argparse
 import os
 from pathlib import Path
@@ -15,19 +15,19 @@ parser.add_argument("--binary", default=None,
                     help="editor binary to run (defaults to the in-tree editor for this platform)")
 parser.add_argument("--xvfb", action="store_true", help="run under xvfb-run (Linux headless)")
 args = parser.parse_args()
-project = Path(tempfile.mkdtemp(prefix="magic-gi-tests-", dir=ROOT / "bin"))
+project = Path(tempfile.mkdtemp(prefix="height-fog-tests-", dir=ROOT / "bin"))
 addons = project / "addons"
 addons.mkdir()
-for name in ("feng-render-pipeline", "feng-magic-gi"):
+for name in ("feng-render-pipeline", "feng-fog"):
     shutil.copytree(ROOT / "misc/feng-addons" / name, addons / name)
 for addon in (ROOT / "misc/feng-addons").iterdir():
-    if addon.name not in {"feng-render-pipeline", "feng-magic-gi"} and (addon / "plugin.cfg").is_file():
+    if addon.name not in {"feng-render-pipeline", "feng-fog"} and (addon / "plugin.cfg").is_file():
         placeholder = addons / addon.name
         placeholder.mkdir()
         (placeholder / ".gdignore").touch()
 
 (project / "project.godot").write_text(
-    'config_version=5\n[application]\nconfig/name="Magic GI GPU tests"\n'
+    'config_version=5\n[application]\nconfig/name="Height Fog GPU tests"\n'
     '[rendering]\nrenderer/rendering_method="frp"\n', encoding="utf-8"
 )
 env = dict(os.environ, APPDATA=str(project / "config"), LOCALAPPDATA=str(project / "cache"))
@@ -86,8 +86,6 @@ def run(name, extra, marker=None):
 
 
 run("import", ["--editor", "--recovery-mode", "--import"])
-run("prt", ["--script", str(ROOT / "misc/scripts/tests/magic_gi_prt.gd")],
-    "MAGIC_GI_PRT_RESULT failures=0")
-run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_magic_gi.gd")],
-    "PASS Magic GI dynamic lighting, camera transform, seven debug channels and viewport routing")
+run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_height_fog.gd")],
+    "PASS FRP Height Fog nodes, world isolation, height falloff, start/cutoff distance and sun inscattering")
 print("Logs:", project)
