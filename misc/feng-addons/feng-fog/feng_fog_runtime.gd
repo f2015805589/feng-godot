@@ -133,7 +133,9 @@ static func _publish() -> void:
 			# DirectionalInscatteringColor by the sun color's luminance.
 			snapshot["sun_direction"] = sun.global_transform.basis.z.normalized()
 			var sun_rgb := Vector3(sun.light_color.r, sun.light_color.g, sun.light_color.b) * sun.light_energy
-			var sun_luminance := sun_rgb.x * 0.3 + sun_rgb.y * 0.59 + sun_rgb.z * 0.11
+			# UE 5.7 defaults to the working color space's luminance factors;
+			# Godot's linear sRGB lights use the Rec.709 factors.
+			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
 			snapshot["inscattering_color"] = snapshot["inscattering_color"] * sun_luminance
 		snapshot["world_id"] = world_id
 		snapshot["fog_id"] = entry["id"]

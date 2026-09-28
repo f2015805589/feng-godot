@@ -2,7 +2,7 @@
 
 importer="glsl"
 type="RDShaderFile"
-uid="uid://gnovfbzqzotdk"
+uid="uid://csa0s83ighxls"
 path="res://.godot/imported/height_fog.glsl-9d1efc34d6b1766966aca2f789b352bb.res"
 
 [deps]
@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/height-fog/height_fog.gls
 dest_files=["res://.godot/imported/height_fog.glsl-9d1efc34d6b1766966aca2f789b352bb.res"]
 
 [params]
+

@@ -40,6 +40,9 @@ func sky_pixel(image_value: Image) -> Color:
 func luminance(color: Color) -> float:
 	return color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722
 
+func color_distance(a: Color, b: Color) -> float:
+	return Vector3(a.r - b.r, a.g - b.g, a.b - b.b).length()
+
 func run() -> void:
 	print("START FRP Height Fog tests")
 	root.msaa_3d = Viewport.MSAA_4X
@@ -117,6 +120,11 @@ func run() -> void:
 	# A strong red exponential fog: the sky saturates to the inscattering colour
 	# and the floor blends toward it.
 	_fog = FogNode.new()
+	if not check(_fog.fog_inscattering_color == Color.BLACK
+			and is_equal_approx(_fog.second_fog_height_falloff, 0.2)
+			and is_equal_approx(_fog.directional_inscattering_start_distance, 100.0),
+			"fresh fog defaults differ from UE 5.7"):
+		return
 	_fog.fog_density = 2.0
 	_fog.fog_inscattering_color = Color(1.0, 0.05, 0.05)
 	scene.add_child(_fog)
@@ -141,6 +149,41 @@ func run() -> void:
 	if not check(fogged_center.r > baseline_center.r * 1.5,
 			"the floor did not blend toward the fog colour: %s -> %s" % [baseline_center, fogged_center]):
 		return
+
+	# Use partially fogged geometry so a wrong reconstruction cannot pass by
+	# saturating every sample to the fog color.
+	_fog.fog_density = 0.4
+	await settle(12)
+	var moderate := await image()
+	var near_uv := Vector2i(moderate.get_width() / 2, moderate.get_height() - 35)
+	var moderate_center := moderate.get_pixelv(near_uv)
+	var baseline_near := baseline.get_pixelv(near_uv)
+	var fogged_near := fogged.get_pixelv(near_uv)
+	var moderate_pole := moderate.get_pixel(176, 45)
+	if not check(color_distance(moderate_center, baseline_near) > 0.05
+			and color_distance(moderate_center, fogged_near) > 0.05,
+			"translation probe needs a partially fogged receiver: %s" % moderate_center):
+		return
+	# The fog line integral uses world-space heights. Moving or yawing the
+	# entire scene preserves the camera's view and must preserve the fog image.
+	scene.position = Vector3(1000.0, 0.0, -700.0)
+	await settle(12)
+	var translated := await image()
+	if not check(color_distance(translated.get_pixelv(near_uv), moderate_center) < 0.04
+			and color_distance(translated.get_pixel(176, 45), moderate_pole) < 0.04,
+			"fog changed after a horizontal scene translation: %s -> %s" % [moderate_center, translated.get_pixelv(near_uv)]):
+		return
+	scene.rotation.y = PI * 0.5
+	await settle(12)
+	var rotated := await image()
+	if not check(color_distance(rotated.get_pixelv(near_uv), moderate_center) < 0.04
+			and color_distance(rotated.get_pixel(176, 45), moderate_pole) < 0.04,
+			"fog changed after a scene yaw: %s -> %s" % [moderate_center, rotated.get_pixelv(near_uv)]):
+		return
+	scene.rotation.y = 0.0
+	scene.position = Vector3.ZERO
+	_fog.fog_density = 2.0
+	await settle(8)
 
 	# Height falloff attenuates density with altitude: sampled down the pole's
 	# screen column, the fogged redness increases monotonically toward the
@@ -173,8 +216,6 @@ func run() -> void:
 
 	# Start Distance removes the fog up to the exclusion distance: the floor a
 	# few metres ahead of the camera unfogs while the sky keeps the full effect.
-	var near_uv := Vector2i(baseline.get_width() / 2, baseline.get_height() - 35)
-	var baseline_near := baseline.get_pixelv(near_uv)
 	_fog.start_distance = 40.0
 	await settle(12)
 	var near_image := await image()
@@ -207,8 +248,10 @@ func run() -> void:
 	_camera.look_at_from_position(_camera.position, _camera.position + Vector3(0.0, 0.0, -20.0), Vector3.UP)
 	await settle(14)
 	var sun_pixel := center(await image())
+	print("Directional inscattering pixel: ", sun_pixel)
 	_camera.global_transform = home_transform
-	if not check(luminance(sun_pixel) > 0.05, "directional inscattering did not brighten the sky toward the sun: %s" % sun_pixel):
+	if not check(luminance(sun_pixel) > 0.05 and luminance(sun_pixel) < 0.6,
+			"directional inscattering differs from UE's normalized default lobe: %s" % sun_pixel):
 		return
 	_fog.directional_inscattering_color = Color(0.0, 0.0, 0.0)
 	_fog.fog_inscattering_color = Color(1.0, 0.05, 0.05)

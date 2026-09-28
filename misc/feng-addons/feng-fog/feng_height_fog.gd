@@ -26,7 +26,7 @@ const UNIT_SCALE := 0.1
 		fog_density = maxf(value, 0.0)
 		_publish()
 ## Fog inscattering color, applied to all pixels covered by the fog. (Unreal: Fog Inscattering Color)
-@export var fog_inscattering_color := Color(0.447, 0.638, 1.0):
+@export var fog_inscattering_color := Color(0.0, 0.0, 0.0):
 	set(value):
 		fog_inscattering_color = value
 		_publish()
@@ -50,7 +50,7 @@ const UNIT_SCALE := 0.1
 		second_fog_density = maxf(value, 0.0)
 		_publish()
 ## Height density factor of the secondary fog layer. (Unreal: Second Fog Data → Fog Height Falloff)
-@export_range(0.001, 2.0, 0.001, "or_greater") var second_fog_height_falloff := 1.0:
+@export_range(0.001, 2.0, 0.001, "or_greater") var second_fog_height_falloff := 0.2:
 	set(value):
 		second_fog_height_falloff = maxf(value, 0.001)
 		_publish()
@@ -96,7 +96,7 @@ const UNIT_SCALE := 0.1
 		_publish()
 ## Controls the distance from the viewer at which the directional inscattering
 ## starts, in meters. (Unreal: Directional Inscattering Start Distance)
-@export_range(0.0, 5000.0, 1.0, "or_greater", "suffix:m") var directional_inscattering_start_distance := 0.0:
+@export_range(0.0, 5000.0, 1.0, "or_greater", "suffix:m") var directional_inscattering_start_distance := 100.0:
 	set(value):
 		directional_inscattering_start_distance = maxf(value, 0.0)
 		_publish()

@@ -8,7 +8,7 @@ extends FengRuntimeSnapshotPass
 ## camera-dependent UBO; the shader mirrors Unreal's HeightFogCommon.ush.
 
 const UBO_BINDING := 2
-const UBO_SIZE := 176 # mat4 + seven vec4.
+const UBO_SIZE := 240 # Two mat4s + seven vec4s.
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
 
 func _init() -> void:
@@ -52,7 +52,9 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: int, rd: RenderingDevice) -> bool:
 	if scene_data == null or view >= scene_data.get_view_count():
 		return false
-	var inverse_view_projection: Projection = scene_data.get_view_projection(view).inverse()
+	# Godot's view projection is the eye's projection matrix, not a combined
+	# world-to-clip matrix. The shader must apply the camera transform as well.
+	var inverse_projection: Projection = scene_data.get_view_projection(view).inverse()
 	var camera: Transform3D = scene_data.get_cam_transform()
 	var density := float(snapshot.get("fog_density", 0.0))
 	var falloff := float(snapshot.get("fog_height_falloff", 0.0))
@@ -69,8 +71,13 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
 	var values := PackedFloat32Array()
 	for column in 4:
-		var axis: Vector4 = inverse_view_projection[column]
+		var axis: Vector4 = inverse_projection[column]
 		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
+	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
+	for column in 3:
+		var axis: Vector3 = view_to_world.basis[column]
+		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
+	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
 	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
 	values.append_array(PackedFloat32Array([global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0))]))
 	values.append_array(PackedFloat32Array([global_density2, falloff2, density2, height2]))
@@ -87,7 +94,7 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, -1.0]))
 	if inscattering_color is Vector3:
 		values.append_array(PackedFloat32Array([inscattering_color.x, inscattering_color.y, inscattering_color.z,
-				float(snapshot.get("inscattering_exponent", 4.0))]))
+				clampf(float(snapshot.get("inscattering_exponent", 4.0)), 0.000001, 1000.0)]))
 	else:
 		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 4.0]))
 	return _commit_frame_ubo(values, UBO_SIZE, rd)

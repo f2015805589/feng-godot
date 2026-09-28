@@ -7,7 +7,8 @@ layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
 layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 
 layout(set = 0, binding = 2, std140) uniform FogParams {
-	mat4 inverse_view_projection;
+	mat4 inverse_projection;
+	mat4 view_to_world;
 	vec4 camera_position;
 	vec4 exponential_fog_parameters; // x = GlobalDensity, y = FogHeightFalloff, z = unused, w = StartDistance.
 	vec4 exponential_fog_parameters2; // x = GlobalDensitySecond, y = FogHeightFalloffSecond, z = FogDensitySecond, w = FogHeightSecond.
@@ -23,6 +24,22 @@ layout(push_constant, std430) uniform PassParameters {
 
 const float FLT_EPSILON2 = 0.01;
 const float SKY_DISTANCE = 1000000.0;
+// UE 5.7's default SkyAtmosphere-affects-height-fog branch uses a uniform
+// phase normalization with its cosine lobe (HeightFogCommon.ush).
+const float UNIFORM_PHASE_FUNCTION = 0.07957747154594767; // 1 / (4 * PI).
+
+float default_directional_phase(vec3 ray_direction, vec3 sun_direction, float exponent) {
+	return pow(clamp(dot(ray_direction, sun_direction), 0.0, 1.0), exponent) * UNIFORM_PHASE_FUNCTION;
+}
+
+// Reserved for UE's PROJECT_EXPFOG_MATCHES_VFOG path. That path also changes
+// the light source, start distance, and albedo, so do not select HG alone.
+// UE's PBRT convention takes cos(-ray_direction, sun_direction).
+float henyey_greenstein_phase(float g, float cos_theta) {
+	g = clamp(g, -0.99, 0.99);
+	float denominator = 1.0 + g * g + 2.0 * g * cos_theta;
+	return (1.0 - g * g) * UNIFORM_PHASE_FUNCTION / (denominator * sqrt(denominator));
+}
 
 // Line integral of d = GlobalDensity * exp2(-HeightFalloff * (y - Height)) along
 // the ray, expressed as the shared factor the caller multiplies by ray length.
@@ -40,8 +57,11 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	const float min_fog_opacity = params.exponential_fog_color.w;
 
 	float camera_to_receiver_length_sqr = dot(camera_to_receiver, camera_to_receiver);
-	float camera_to_receiver_length_inv = inversesqrt(camera_to_receiver_length_sqr);
+	float camera_to_receiver_length_inv = inversesqrt(max(camera_to_receiver_length_sqr, 1e-8));
 	float camera_to_receiver_length = camera_to_receiver_length_sqr * camera_to_receiver_length_inv;
+	if (camera_to_receiver_length <= params.exponential_fog_parameters.w) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
 	vec3 camera_to_receiver_normalized = camera_to_receiver * camera_to_receiver_length_inv;
 
 	float ray_origin_terms = params.exponential_fog_parameters.x;
@@ -76,11 +96,12 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	// InscatteringLightDirection.w is negative when the sun term is disabled.
 	if (params.inscattering_light_direction.w >= 0.0) {
 		float directional_inscattering_start_distance = params.inscattering_light_direction.w;
-		// Cosine lobe around the light direction approximating inscattering
-		// from the directional light off the ambient haze.
+		// UE's default branch uses the cosine lobe normalized by 1 / (4 * PI).
+		// Its additional SkyAtmosphere illuminance is unavailable in Godot;
+		// the authored directional luminance is the available light term.
 		vec3 directional_light_inscattering = params.directional_inscattering_color.rgb
-				* pow(clamp(dot(camera_to_receiver_normalized, params.inscattering_light_direction.xyz), 0.0, 1.0),
-						params.directional_inscattering_color.w);
+				* default_directional_phase(camera_to_receiver_normalized,
+						params.inscattering_light_direction.xyz, params.directional_inscattering_color.w);
 		// Line integral of the eye ray through the haze, using a special
 		// starting distance to limit the inscattering to the distance.
 		float dir_exponential_height_line_integral = exponential_height_line_integral_shared
@@ -103,11 +124,11 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 
 vec3 world_from_clip(vec2 uv, float depth) {
 	vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
-	vec4 world_h = params.inverse_view_projection * clip;
-	if (abs(world_h.w) < 1e-7) {
+	vec4 view_h = params.inverse_projection * clip;
+	if (abs(view_h.w) < 1e-7) {
 		return vec3(0.0);
 	}
-	return world_h.xyz / world_h.w;
+	return (params.view_to_world * vec4(view_h.xyz / view_h.w, 1.0)).xyz;
 }
 
 void main() {
@@ -122,11 +143,10 @@ void main() {
 	vec3 camera_to_receiver;
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
 	if (depth <= 0.0) {
-		// Sky pixel: fog along a very long ray, matching Unreal's treatment of
-		// the sky as a receiver at effectively infinite distance. The far plane
-		// sits at clip z = 0 under this projection; 0.5 lands near the guard
-		// region and reconstructs a degenerate point.
-		vec3 direction = normalize(world_from_clip(screen_uv, 0.0) - camera_position);
+		// Reverse-Z depth zero is the infinite far plane and cannot be divided
+		// by homogeneous w. Two finite depths define the view ray for both
+		// perspective and orthographic cameras.
+		vec3 direction = normalize(world_from_clip(screen_uv, 0.5) - world_from_clip(screen_uv, 1.0));
 		camera_to_receiver = direction * SKY_DISTANCE;
 	} else {
 		camera_to_receiver = world_from_clip(screen_uv, depth) - camera_position;
