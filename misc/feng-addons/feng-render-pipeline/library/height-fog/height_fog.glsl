@@ -9,12 +9,12 @@ layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 layout(set = 0, binding = 2, std140) uniform FogParams {
 	mat4 inverse_view_projection;
 	vec4 camera_position;
-	vec4 exponential_fog_parameters; // x = GlobalDensity, y = FogHeightFalloff, z = unused, w = StartDistance.
+	vec4 exponential_fog_parameters; // x = GlobalDensity, y = FogHeightFalloff, z = MaxObserverHeight, w = StartDistance.
 	vec4 exponential_fog_parameters2; // x = GlobalDensitySecond, y = FogHeightFalloffSecond, z = FogDensitySecond, w = FogHeightSecond.
 	vec4 exponential_fog_parameters3; // x = FogDensity, y = FogHeight, z = unused, w = FogCutoffDistance.
 	vec4 exponential_fog_color; // rgb = FogInscatteringColor, a = MinFogOpacity (1 - FogMaxOpacity).
 	vec4 inscattering_light_direction; // xyz = direction toward sun, w = DirectionalInscatteringStartDistance or -1 when disabled.
-	vec4 directional_inscattering_color; // rgb = inscattering color premultiplied by sun color, w = DirectionalInscatteringExponent.
+	vec4 directional_inscattering_color; // rgb = inscattering color premultiplied by sun luminance, w = DirectionalInscatteringExponent.
 } params;
 
 layout(push_constant, std430) uniform PassParameters {
@@ -35,8 +35,17 @@ float line_integral_shared(float height_falloff, float ray_delta_y, float origin
 }
 
 // Ported from Unreal's GetExponentialHeightFog: returns (fogged rgb, fog factor).
+// camera_to_receiver is (WorldPosition - camera) before the observer-height
+// compensation below.
 vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	const float min_fog_opacity = params.exponential_fog_color.w;
+	const float max_world_observer_height = params.exponential_fog_parameters.z;
+
+	// Unreal clamps the observer height (WorldObserverOrigin) relative to the
+	// fog height, then shifts CameraToReceiver.z to compensate: the fog stays
+	// world-anchored instead of thinning toward zero as the camera rises.
+	const float observer_y = min(params.camera_position.y, max_world_observer_height);
+	camera_to_receiver.y += params.camera_position.y - observer_y;
 
 	float camera_to_receiver_length_sqr = dot(camera_to_receiver, camera_to_receiver);
 	float camera_to_receiver_length_inv = inversesqrt(camera_to_receiver_length_sqr);
@@ -54,7 +63,7 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	if (exclude_distance > 0.0) {
 		float exclude_intersection_time = exclude_distance * camera_to_receiver_length_inv;
 		float camera_exclusion_intersection_y = exclude_intersection_time * camera_to_receiver.y;
-		float exclusion_intersection_world_y = params.camera_position.y + camera_exclusion_intersection_y;
+		float exclusion_intersection_world_y = observer_y + camera_exclusion_intersection_y;
 		float exclusion_intersection_to_receiver_y = camera_to_receiver.y - camera_exclusion_intersection_y;
 		ray_length = (1.0 - exclude_intersection_time) * camera_to_receiver_length;
 		ray_direction_y = exclusion_intersection_to_receiver_y;
