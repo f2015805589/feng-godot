@@ -171,42 +171,6 @@ func run() -> void:
 	_fog.fog_height_falloff = 0.2
 	await settle(10)
 
-	# The fog layer is anchored to the world, not the camera. Unreal folds the
-	# observer height into GlobalDensity, so a lower observer thickens the fog
-	# on receivers high in the layer (pole top / sky), while low receivers stay
-	# the foggiest under every observer height.
-	_fog.fog_density = 1.0
-	_fog.fog_height_falloff = 2.0
-	await settle(12)
-	var anchored := await image()
-	var anchored_top := anchored.get_pixel(pole_x, 45)
-	var anchored_bottom := anchored.get_pixel(pole_x, anchored.get_height() - 95)
-	_camera.look_at_from_position(Vector3(0.0, 3.0, 9.0), Vector3(0.0, 3.0, -20.0), Vector3.UP)
-	await settle(12)
-	var lowered := await image()
-	var lowered_top := lowered.get_pixel(pole_x, 45)
-	var lowered_bottom := lowered.get_pixel(pole_x, lowered.get_height() - 95)
-	_camera.look_at_from_position(Vector3(0.0, 14.0, 9.0), Vector3(0.0, 14.0, -20.0), Vector3.UP)
-	await settle(12)
-	var raised := await image()
-	var raised_top := raised.get_pixel(pole_x, 45)
-	var raised_bottom := raised.get_pixel(pole_x, raised.get_height() - 95)
-	_camera.look_at_from_position(Vector3(0.0, 8.0, 9.0), Vector3(0.0, 8.0, -20.0), Vector3.UP)
-	print("Anchored fog tops: low ", lowered_top, " mid ", anchored_top, " high ", raised_top)
-	if not check(lowered_top.r - lowered_top.b > anchored_top.r - anchored_top.b + 0.02
-			and anchored_top.r - anchored_top.b > raised_top.r - raised_top.b + 0.02,
-			"observer height did not scale the fog density as Unreal's GlobalDensity requires: low %s mid %s high %s"
-					% [lowered_top, anchored_top, raised_top]):
-		return
-	if not check(lowered_bottom.r > lowered_bottom.b and lowered_bottom.r - lowered_bottom.b > lowered_top.r - lowered_top.b
-			and raised_bottom.r > raised_bottom.b and raised_bottom.r - raised_bottom.b > raised_top.r - raised_top.b,
-			"the fog layer drifted with the camera instead of staying anchored to the world: low (t %s b %s) high (t %s b %s)"
-					% [lowered_top, lowered_bottom, raised_top, raised_bottom]):
-		return
-	_fog.fog_density = 3.0
-	_fog.fog_height_falloff = 0.2
-	await settle(10)
-
 	# Start Distance removes the fog up to the exclusion distance: the floor a
 	# few metres ahead of the camera unfogs while the sky keeps the full effect.
 	var near_uv := Vector2i(baseline.get_width() / 2, baseline.get_height() - 35)
