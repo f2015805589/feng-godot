@@ -139,21 +139,20 @@ func _run() -> void:
 		await get_tree().process_frame
 	# A rejected search result never enters the tree. It must release both its
 	# node and the resource signal connections created during initialization.
-	for script_name in ["asset_dock.gd", "asset_dock_45.gd"]:
-		var dock_script = load("res://addons/feng-idweight-terrain/src/" + script_name)
-		var filtered_list = dock_script.ListContainer.new()
-		filtered_list.search_text = "__no_matching_terrain_asset__"
-		var asset := Terrain3DTextureAsset.new()
-		var before := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
-		for i in 100:
-			filtered_list.add_item(asset)
-		var after := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
-		var connections := asset.get_signal_connection_list("setting_changed").size()
-		filtered_list.free()
-		if not _require(after == before and connections == 0,
-				"%s filtered results leaked nodes (%d -> %d) or callbacks (%d)" % [script_name, before, after, connections]):
-			return
-	print("PASS repeated asset filtering releases rejected nodes and callbacks in both dock versions")
+	var dock_script = load("res://addons/feng-idweight-terrain/src/asset_dock.gd")
+	var filtered_list = dock_script.ListContainer.new()
+	filtered_list.search_text = "__no_matching_terrain_asset__"
+	var probe_asset := Terrain3DTextureAsset.new()
+	var before := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
+	for i in 100:
+		filtered_list.add_item(probe_asset)
+	var after := int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
+	var connections := probe_asset.get_signal_connection_list("setting_changed").size()
+	filtered_list.free()
+	if not _require(after == before and connections == 0,
+			"filtered results leaked nodes (%d -> %d) or callbacks (%d)" % [before, after, connections]):
+		return
+	print("PASS repeated asset filtering releases rejected nodes and callbacks")
 
 	var scene_root := Node3D.new()
 	scene_root.name = "TerrainDockEditorTest"

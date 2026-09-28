@@ -59,15 +59,6 @@ func evaluation_key() -> Array:
 	return [get_instance_id(), global_transform, size, unbound, blend_distance, priority,
 			weight, enabled, profile.evaluation_key() if profile != null else null]
 
-## True when p_point (world space) is inside this volume's box.
-func contains_point(p_point: Vector3) -> bool:
-	if unbound:
-		return true
-	if size.x <= 0.0 or size.y <= 0.0 or size.z <= 0.0:
-		return false
-	var local := global_transform.affine_inverse() * p_point
-	return absf(local.x) <= size.x * 0.5 and absf(local.y) <= size.y * 0.5 and absf(local.z) <= size.z * 0.5
-
 ## Local-space size of the finite box's influence-0 boundary. The runtime influence
 ## reaches zero at these faces and is zero outside them.
 func get_influence_zero_size() -> Vector3:
@@ -118,16 +109,4 @@ func influence_at(p_point: Vector3) -> float:
 static func resolve_overrides(p_volumes: Array, p_base: Dictionary, p_point: Vector3, p_schema: Dictionary = {}, p_aliases: Dictionary = {}) -> Dictionary:
 	return Resolver.parameters(p_volumes, p_base, p_point, p_schema, p_aliases)
 
-static func resolve_pass_states(p_volumes: Array, p_point: Vector3) -> Dictionary:
-	return Resolver.pass_states(p_volumes, p_point)
 
-## Compatibility entry points. Registration and camera lifecycle belong to the
-## runtime service; the node owns only its authored region and spatial influence.
-static func evaluate_all() -> void:
-	Runtime.evaluate_all()
-
-static func evaluate_camera(p_volumes: Array, p_camera: Camera3D, p_compositor: FengCompositor) -> void:
-	Runtime.evaluate_camera(p_volumes, p_camera, p_compositor)
-
-static func get_scene_volumes(p_root: Node) -> Array:
-	return Runtime.get_scene_volumes(p_root)

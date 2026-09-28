@@ -75,17 +75,9 @@ func _remove_menu() -> void:
 	_library_entries.clear()
 
 
-## Compatibility accessors used by the main plugin and existing editor tests.
-func get_menu() -> PopupMenu:
-	return _menu
-
-
+## Compatibility accessor used by the main plugin and existing editor tests.
 func get_library_entries() -> Array[Dictionary]:
 	return _library_entries
-
-
-func refresh_library() -> void:
-	_refresh_library()
 
 
 func _refresh_library() -> void:
@@ -305,17 +297,9 @@ func find_selected_renderer():
 	return null
 
 
-func get_edited_object():
-	return _get_edited_object()
-
-
 func _get_edited_object():
 	var inspector := EditorInterface.get_inspector()
 	return inspector.get_edited_object() if inspector != null else null
-
-
-func refresh_inspector() -> void:
-	_refresh_inspector()
 
 
 func _refresh_inspector() -> void:

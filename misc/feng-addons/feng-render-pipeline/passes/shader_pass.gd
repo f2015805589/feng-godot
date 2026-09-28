@@ -111,9 +111,6 @@ func set_shader_keyword(constant_id: int, value) -> void:
 	shader_keywords[constant_id] = value
 	_keyword_signature = ""
 
-func get_shader_keyword(constant_id: int, default_value = false):
-	return shader_keywords.get(constant_id, default_value)
-
 func _keyword_signature_now() -> String:
 	var ids := shader_keywords.keys()
 	ids.sort()

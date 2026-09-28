@@ -1,31 +1,23 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Asset Dock for Terrain3D: the half both dock versions share.
+# Asset Dock for Terrain3D: everything except the EditorDock hosting.
 
-# The dock ships as two scripts because the editor hosts it differently before and after Godot
-# 4.6: asset_dock.gd puts itself in an EditorDock, asset_dock_45.gd creates its own slot and
-# window. Everything above that boundary is the same dock - the same signals, the same controls,
-# the same search, list switching, pin, highlight and window-focus handling - and it is here once.
-#
-# The two versions differ in three ways, and each overrides this file for all three:
-#   * hosting - initialize(), remove_dock(), update_dock() and update_layout()
-#   * which editor settings survive a session - load_editor_settings() and
-#     save_editor_settings(), which is why that one is an empty override at the bottom of this
-#     file rather than a shared body: 4.5 persists its slot, floating state and window geometry,
-#     and 4.6 persists the tile size and the pin while erasing the 4.5 keys an older project left
-#   * their own extras - 4.6 the Terrain management menu and the debug-view menu, 4.5 the slot,
-#     floating and window controls
+# asset_dock.gd puts itself in an EditorDock; everything else about the dock - the signals,
+# the controls, the search, list switching, pin, highlight and window-focus handling - lives
+# here once. The hosting split it overrides for is initialize(), remove_dock(), update_dock()
+# and update_layout(), plus which editor settings survive a session: the 4.6 dock persists the
+# tile size and the pin while erasing the 4.5 keys an older project left.
 @tool
 extends PanelContainer
 
-# `confirmation_closed` is the one signal both docks publish: the list container
+# `confirmation_closed` is the one signal the dock publishes: the list container
 # awaits it and then reads `_confirmed` for the answer.
 signal confirmation_closed
 
 const ES_DOCK_TILE_SIZE: String = "terrain3d/dock/tile_size"
 const ES_DOCK_PINNED: String = "terrain3d/dock/always_on_top"
 
-# The list and the tile live in their own scripts, shared with the other dock version. Both docks
-# inherit them, so they stay addressable as a dock's ListContainer / ListEntry.
+# The list and the tile live in their own scripts, so the dock stays addressable
+# as dock.ListContainer / dock.ListEntry.
 const ListContainer := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_container.gd")
 const ListEntry := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_entry.gd")
 
@@ -56,9 +48,9 @@ var _observed_assets: Terrain3DAssets
 
 
 func _enter_tree() -> void:
-	# 4.5 reparents this dock when its slot changes. Reparenting emits
-	# exit/enter notifications, so restore the source binding after the dock
-	# returns to the tree instead of relying on the next asset mutation.
+	# Reparenting emits exit/enter notifications, so restore the source binding
+	# after the dock returns to the tree instead of relying on the next asset
+	# mutation.
 	if not _initialized or not is_instance_valid(plugin) or not plugin.is_terrain_valid():
 		return
 	_bind_assets_signals(plugin.terrain.assets if plugin.terrain.assets else null)
@@ -66,9 +58,9 @@ func _enter_tree() -> void:
 
 ## Shared initialize() wiring
 #
-# Both docks build the same list controls, connect the same signals and add the same confirmation
-# dialog; each version calls these and keeps only what its own hosting adds (4.6 the EditorDock, the
-# management menu and the debug-view menu; 4.5 the slot, floating and window controls).
+# The dock builds its list controls, connects its signals and adds the confirmation dialog
+# here; the version-specific file keeps only what its hosting adds (the EditorDock, the
+# management menu and the debug-view menu).
 
 func _bind_common_controls() -> void:
 	pinned_btn = $Box/Buttons/Pinned

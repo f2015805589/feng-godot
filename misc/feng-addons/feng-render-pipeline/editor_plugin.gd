@@ -26,11 +26,8 @@ var _volume_preview: Node
 var _library_controller
 var _project_pipeline: WorldEnvironment = null
 
-## Compatibility views for existing editor integrations and regression tests. The
+## Compatibility view for regression tests. The
 ## Library state itself lives in PassLibraryController.
-var _menu: PopupMenu:
-	get:
-		return _library_controller.get_menu() if is_instance_valid(_library_controller) else null
 var _library_entries:
 	get:
 		return _library_controller.get_library_entries() if is_instance_valid(_library_controller) else []
@@ -160,22 +157,6 @@ func _detach_project_pipeline() -> void:
 	ProjectPipeline.clear(_project_pipeline)
 	_project_pipeline = null
 
-func _refresh_library() -> void:
-	if is_instance_valid(_library_controller):
-		_library_controller.refresh_library()
-
-func _add_library_entry(path: String, manifest: Dictionary) -> void:
-	# Kept as a compatibility entry point for editor integrations that refreshed
-	# individual entries in older versions; all actual work is controller-owned.
-	if is_instance_valid(_library_controller):
-		_library_controller._add_library_entry(path, manifest)
-
-func _make_unique_library_label(base: String, path: String) -> String:
-	return _library_controller._make_unique_library_label(base, path) if is_instance_valid(_library_controller) else base
-
-func _library_label_exists(label: String) -> bool:
-	return _library_controller._library_label_exists(label) if is_instance_valid(_library_controller) else false
-
 func _on_library_item(id: int) -> void:
 	if is_instance_valid(_library_controller):
 		_library_controller.on_library_item(id)
@@ -189,10 +170,3 @@ func move_pass(renderer, from_index: int, to_index: int) -> void:
 
 func _find_selected_renderer():
 	return _library_controller.find_selected_renderer() if is_instance_valid(_library_controller) else null
-
-func _get_edited_object():
-	return _library_controller.get_edited_object() if is_instance_valid(_library_controller) else null
-
-func _refresh_inspector() -> void:
-	if is_instance_valid(_library_controller):
-		_library_controller.refresh_inspector()

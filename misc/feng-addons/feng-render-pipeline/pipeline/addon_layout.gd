@@ -20,9 +20,6 @@ static func dir() -> String:
 		return CANONICAL_DIR
 	return script_path.get_base_dir().get_base_dir()
 
-static func pipeline_dir() -> String:
-	return dir() + "/pipeline"
-
 static func passes_dir() -> String:
 	return dir() + "/passes/"
 

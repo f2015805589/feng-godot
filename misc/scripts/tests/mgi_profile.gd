@@ -5,6 +5,7 @@ const Data = preload("res://addons/feng-magic-gi/feng_magic_gi_data.gd")
 const Baker = preload("res://addons/feng-magic-gi/feng_magic_gi_baker.gd")
 const Placement = preload("res://addons/feng-magic-gi/feng_magic_gi_placement.gd")
 const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
+const SceneTracker = preload("res://addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd")
 
 var _volume: Node3D
 var _camera: Camera3D
@@ -171,7 +172,7 @@ func run() -> void:
 		if s.get_volume() == _volume:
 			state = s
 	var world: World3D = _volume.get_world_3d()
-	print("MGI_PROFILE_QUICK_SIG_US %.0f" % timeit(50, func(): Placement.quick_signature(_volume)))
+	print("MGI_PROFILE_QUICK_SIG_US %.0f" % timeit(50, func(): SceneTracker.quick_signature(_volume)))
 	print("MGI_PROFILE_RENDER_TARGETS_US %.0f" % timeit(50, func(): Runtime._render_targets(world)))
 	print("MGI_PROFILE_PUBLISH_US %.0f" % timeit(20, func(): Runtime._publish()))
 	if state and state.lighting:
