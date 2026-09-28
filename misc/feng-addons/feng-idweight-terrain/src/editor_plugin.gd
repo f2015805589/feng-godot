@@ -7,7 +7,6 @@ extends EditorPlugin
 # Includes
 const Terrain3DUI: Script = preload("res://addons/feng-idweight-terrain/src/ui.gd")
 const ASSET_DOCK: String = "res://addons/feng-idweight-terrain/src/asset_dock.tscn"
-const ASSET_DOCK_45: String = "res://addons/feng-idweight-terrain/src/asset_dock_45.tscn"
 const VT_INSPECTOR_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/terrain_vt_inspector.gd")
 
 # Editor Plugin
@@ -16,7 +15,7 @@ var terrain_setup: Node
 var editor: Terrain3DEditor
 var editor_settings: EditorSettings
 var ui: Node # Terrain3DUI see Godot #75388
-var asset_dock: PanelContainer
+var asset_dock
 var vt_inspector_plugin: EditorInspectorPlugin
 var mouse_global_position: Vector3 = Vector3.ZERO
 var mouse_viewport_position: Vector2 = Vector2.ZERO
@@ -63,11 +62,7 @@ func _enter_tree() -> void:
 
 	scene_changed.connect(_on_scene_changed)
 
-	# Load Godot 4.6+ asset dock or pre-4.6
-	if Engine.get_version_info().hex >= 0x040600:
-		asset_dock = load(ASSET_DOCK).instantiate()
-	else:
-		asset_dock = load(ASSET_DOCK_45).instantiate()
+	asset_dock = load(ASSET_DOCK).instantiate()
 	asset_dock.initialize(self)
 	vt_inspector_plugin = VT_INSPECTOR_SCRIPT.new()
 	vt_inspector_plugin.editor_plugin = self

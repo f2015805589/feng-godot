@@ -7,7 +7,7 @@ shows up when the editor loads the script. The full suite would find it eventual
 sixteen minutes; this takes about a second per file:
 
     python native/check_scripts.py                       every .gd in the addon
-    python native/check_scripts.py asset_dock_45.gd      by file name, from anywhere in the addon
+    python native/check_scripts.py asset_dock.gd        by file name, from anywhere in the addon
 
 The script is checked *in a project context*, because the addon's `res://` paths (`addons/...`) only
 resolve where the addon is installed. `--project` defaults to the pass's test project, which has the

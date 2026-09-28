@@ -5,7 +5,6 @@ extends RefCounted
 
 const Data = preload("feng_magic_gi_data.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
-const EmitterBinding = preload("feng_magic_gi_emitter_binding.gd")
 const EmitterBakeSet = preload("feng_magic_gi_emitter_bake_set.gd")
 const MAX_PROBES := 65536
 const MAX_GEOMETRY_TRIANGLES := 250000
@@ -85,7 +84,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			or _dimensions.z > Data.MAX_GRID_AXIS:
 		error_message = "Lookup grid exceeds the supported 64 cells per axis."
 		return false
-	_scene_root = scene_root(volume)
+	_scene_root = SceneTracker.scene_root(volume)
 	_collect_node(_scene_root, for_bake)
 	if not error_message.is_empty():
 		return false
@@ -452,23 +451,3 @@ func sample_emitter_connection(emitter_index: int, receiver: Vector3, receiver_n
 		return {}
 	return _emitter_set.sample_connection(emitter_index, receiver, receiver_normal,
 			u_triangle, u_barycentric, u_edge, max_distance, _volume.surface_offset)
-
-static func scene_root(volume: Node) -> Node:
-	return SceneTracker.scene_root(volume)
-
-static func make_emitter_key(root: Node, node: Node, surface: int) -> String:
-	return EmitterBinding.make_key(root, node, surface)
-
-static func emitter_static_signature(node: MeshInstance3D, surface: int,
-		material: BaseMaterial3D) -> int:
-	return EmitterBinding.static_signature(node, surface, material)
-
-static func emitter_runtime_fingerprint(node: MeshInstance3D, surface: int,
-		material: BaseMaterial3D) -> int:
-	return EmitterBinding.runtime_fingerprint(node, surface, material)
-
-static func current_emitter_keys(volume: Node3D) -> PackedStringArray:
-	return EmitterBinding.current_keys(volume)
-
-static func quick_signature(volume: Node3D) -> int:
-	return SceneTracker.quick_signature(volume)

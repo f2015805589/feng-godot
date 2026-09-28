@@ -161,6 +161,3 @@ static func blend(previous: Variant, next: Variant, weight: float) -> Variant:
 	if typeof(previous) == typeof(next) and (previous is Vector2 or previous is Vector3 or previous is Vector4 or previous is Color):
 		return previous.lerp(next, weight)
 	return next if weight >= 0.5 else previous
-
-static func pass_states(volumes: Array, point: Vector3) -> Dictionary:
-	return evaluate(volumes, {}, point).pass_states

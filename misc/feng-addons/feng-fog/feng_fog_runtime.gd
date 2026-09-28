@@ -11,17 +11,28 @@ extends RefCounted
 ## array under the mutex instead of mutating a published one.
 
 const SUN_SCAN_MSEC := 500
+## The viewport/world/targets registry lives with the snapshot passes that
+## consume it; the same soft path-loading the passes use for producer runtimes
+## applies here, so a missing feng-render-pipeline addon degrades to nothing
+## consuming the snapshots anyway.
+const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
 static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
-static var _viewports: Dictionary = {} ## viewport id -> WeakRef
 static var _debanding_original: Dictionary = {} ## viewport id -> use_debanding before fog activated
 static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef}
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
 static var _sequence := 0
 static var _last_frame := -1
-static var _targets_version := 0
-static var _targets_cache: Dictionary = {}
+static var _worlds_queried := false
+static var _worlds: GDScript = null
+
+static func _snapshot_worlds() -> GDScript:
+	if not _worlds_queried:
+		_worlds_queried = true
+		if ResourceLoader.exists(SNAPSHOT_WORLDS_PATH):
+			_worlds = load(SNAPSHOT_WORLDS_PATH)
+	return _worlds
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -36,21 +47,17 @@ static func unregister(fog: FengHeightFog) -> void:
 	_publish()
 
 static func register_viewport(viewport: Viewport) -> void:
-	if viewport == null or not is_instance_valid(viewport):
-		return
-	var id := viewport.get_instance_id()
-	var existing: WeakRef = _viewports.get(id)
-	if existing != null and existing.get_ref() == viewport:
-		return
-	_viewports[id] = weakref(viewport)
-	_targets_version += 1
+	var worlds := _snapshot_worlds()
+	if worlds != null:
+		worlds.register_viewport(viewport)
 
 static func unregister_viewport(viewport: Viewport) -> void:
 	if viewport != null and is_instance_valid(viewport):
 		var id := viewport.get_instance_id()
 		_restore_debanding(id, viewport)
-		if _viewports.erase(id):
-			_targets_version += 1
+		var worlds := _snapshot_worlds()
+		if worlds != null:
+			worlds.unregister_viewport(viewport)
 		_publish()
 
 static func _restore_debanding(id: int, viewport: Viewport) -> void:
@@ -62,13 +69,17 @@ static func _restore_debanding(id: int, viewport: Viewport) -> void:
 ## immediately before quantization. Doing this in the HDR fog pass would use
 ## the wrong scale and can leave visible rings after tone mapping.
 static func _sync_debanding(selected: Dictionary) -> void:
-	for id in _viewports.keys():
-		var reference: WeakRef = _viewports[id]
+	var worlds := _snapshot_worlds()
+	if worlds == null:
+		return
+	var viewports: Dictionary = worlds.viewports()
+	for id in _debanding_original.keys():
+		if not viewports.has(id):
+			_debanding_original.erase(id)
+	for id in viewports.keys():
+		var reference: WeakRef = viewports[id]
 		var viewport: Viewport = reference.get_ref() if reference != null else null
 		if viewport == null:
-			_viewports.erase(id)
-			_debanding_original.erase(id)
-			_targets_version += 1
 			continue
 		var world := viewport.find_world_3d() if viewport.is_inside_tree() else null
 		var fog_active := world != null and selected.has(world.get_instance_id())
@@ -101,30 +112,8 @@ static func snapshots() -> Array[Dictionary]:
 	return result
 
 static func _render_targets(world: World3D) -> Array[RID]:
-	var targets: Array[RID] = []
-	if world == null:
-		return targets
-	var world_id := world.get_instance_id()
-	var cached: Dictionary = _targets_cache.get(world_id, {})
-	if not cached.is_empty() and int(cached.get("version", -1)) == _targets_version:
-		return cached["targets"]
-	for id in _viewports.keys():
-		var reference: WeakRef = _viewports[id]
-		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null:
-			_viewports.erase(id)
-			_targets_version += 1
-			continue
-		if not viewport.is_inside_tree() or viewport.find_world_3d() != world:
-			continue
-		var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
-		if target.is_valid() and not targets.has(target):
-			targets.append(target)
-	_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
-	if _targets_cache.size() > 32:
-		_targets_cache.clear()
-		_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
-	return targets
+	var worlds := _snapshot_worlds()
+	return worlds.targets_for(world) if worlds != null else []
 
 ## The sun for a world: the component's explicit light when set, otherwise the
 ## first enabled DirectionalLight3D on the same World3D — Unreal's equivalent is

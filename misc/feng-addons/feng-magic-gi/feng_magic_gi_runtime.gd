@@ -5,20 +5,31 @@ extends RefCounted
 
 const RuntimeState = preload("feng_magic_gi_runtime_state.gd")
 const VIEWPORT_SCAN_MSEC := 1000
+## The viewport/world/targets registry lives with the snapshot passes that
+## consume it; the same soft path-loading the passes use for producer runtimes
+## applies here, so a missing feng-render-pipeline addon degrades to nothing
+## consuming the snapshots anyway.
+const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
 # One per-volume entry owns its weak reference, lighting calculator, emission
 # helper/cache, data identity, and diagnostic state. Viewports and publication
 # are service-wide concerns and remain separate.
 static var _registry: Dictionary = {}
-static var _viewports: Dictionary = {}
 static var _emission_revision_sequence := 0
 static var _publish_sequence := 0
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
 static var _last_frame := -1
 static var _next_viewport_scan := 0
-static var _targets_version := 0
-static var _targets_cache: Dictionary = {}
+static var _worlds_queried := false
+static var _worlds: GDScript = null
+
+static func _snapshot_worlds() -> GDScript:
+	if not _worlds_queried:
+		_worlds_queried = true
+		if ResourceLoader.exists(SNAPSHOT_WORLDS_PATH):
+			_worlds = load(SNAPSHOT_WORLDS_PATH)
+	return _worlds
 
 static func register(volume: FMagicGIVolume) -> void:
 	var id := volume.get_instance_id()
@@ -38,19 +49,15 @@ static func unregister(volume: FMagicGIVolume) -> void:
 	_publish()
 
 static func register_viewport(viewport: Viewport) -> void:
-	if viewport == null or not is_instance_valid(viewport):
-		return
-	var id := viewport.get_instance_id()
-	var existing: WeakRef = _viewports.get(id)
-	if existing != null and existing.get_ref() == viewport:
-		return
-	_viewports[id] = weakref(viewport)
-	_targets_version += 1
+	var worlds := _snapshot_worlds()
+	if worlds != null:
+		worlds.register_viewport(viewport)
 
 static func unregister_viewport(viewport: Viewport) -> void:
 	if viewport != null and is_instance_valid(viewport):
-		if _viewports.erase(viewport.get_instance_id()):
-			_targets_version += 1
+		var worlds := _snapshot_worlds()
+		if worlds != null:
+			worlds.unregister_viewport(viewport)
 		_publish()
 
 static func publish(volume: FMagicGIVolume) -> void:
@@ -112,50 +119,24 @@ static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
 	state.refresh_emission_diagnostics(volume, volume.bake_data)
 
 static func _refresh_viewports() -> void:
+	var worlds := _snapshot_worlds()
 	for id in _registry.keys():
 		var state: RuntimeState = _registry.get(id)
 		var volume: FMagicGIVolume = state.get_volume() if state != null else null
 		if volume == null or not volume.is_inside_tree():
 			continue
-		register_viewport(volume.get_viewport())
-		var root: Node = volume
-		while root.get_parent() != null and not root.get_parent() is Viewport:
-			root = root.get_parent()
-		_scan_viewports(root)
-	for id in _viewports.keys():
-		var reference: WeakRef = _viewports[id]
-		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null:
-			_viewports.erase(id)
-			_targets_version += 1
-
-static func _scan_viewports(node: Node) -> void:
-	if node is Viewport:
-		register_viewport(node)
-	for child in node.get_children():
-		_scan_viewports(child)
+		if worlds != null:
+			worlds.register_viewport(volume.get_viewport())
+			var root: Node = volume
+			while root.get_parent() != null and not root.get_parent() is Viewport:
+				root = root.get_parent()
+			worlds.scan(root)
+	if worlds != null:
+		worlds.prune()
 
 static func _render_targets(world: World3D) -> Array[RID]:
-	var targets: Array[RID] = []
-	if world == null:
-		return targets
-	var world_id := world.get_instance_id()
-	var cached: Dictionary = _targets_cache.get(world_id, {})
-	if not cached.is_empty() and int(cached.get("version", -1)) == _targets_version:
-		return cached["targets"]
-	for id in _viewports.keys():
-		var reference: WeakRef = _viewports[id]
-		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null or not viewport.is_inside_tree() or viewport.find_world_3d() != world:
-			continue
-		var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
-		if target.is_valid() and not targets.has(target):
-			targets.append(target)
-	_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
-	if _targets_cache.size() > 32:
-		_targets_cache.clear()
-		_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
-	return targets
+	var worlds := _snapshot_worlds()
+	return worlds.targets_for(world) if worlds != null else []
 
 static func _publish() -> void:
 	var selected: Dictionary = {} # world instance id -> latest valid volume

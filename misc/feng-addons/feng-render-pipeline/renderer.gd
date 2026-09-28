@@ -24,7 +24,6 @@ const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
 ## is plugin-side code and the engine's own passes are the no-pipeline fallback.
 const PIPELINE_SCHEMA_VERSION := 6
-const MANAGER_TOKEN := -1
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -319,9 +318,6 @@ func _provided_native_ids() -> Dictionary:
 func _declared_provided_ids() -> Dictionary:
 	return ExecutionPlan.declared_provided_ids(_passes, _is_entry_enabled)
 
-func _declared_provides(pass_entry) -> Array:
-	return ExecutionPlan.declared_provides(pass_entry)
-
 ## True when custom passes declare every mandatory entry, so the list is a complete
 ## schedule without any engine entry. Such a list must not be treated as a legacy
 ## array: migration would seed back the entries the author removed on purpose.
@@ -354,14 +350,6 @@ func get_authored_pass_parameters() -> Dictionary:
 func get_volume_modules() -> Array[FengPass]:
 	_ensure_pipeline_initialized(false)
 	return ParameterResolver.volume_modules(_passes)
-
-func get_volume_parameter_schema() -> Dictionary:
-	_ensure_pipeline_initialized(false)
-	return ParameterResolver.volume_schema(_passes)
-
-func get_volume_parameter_aliases() -> Dictionary:
-	_ensure_pipeline_initialized(false)
-	return ParameterResolver.volume_aliases(_passes)
 
 func get_pass_parameters() -> Dictionary:
 	_ensure_pipeline_initialized(false)
@@ -624,21 +612,11 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 func is_view_shareable(entry: FengPass) -> bool:
 	return ViewExecutionPolicy.is_view_shareable(entry, NATIVE_PASS_SCRIPTS, FengAddonLayout.passes_dir())
 
-func _set_native_schedule(compositor: Compositor, tokens: PackedInt32Array, names: PackedStringArray) -> void:
-	# Passes a plugin runs itself are reported to the engine: the schedule dropped
-	# their engine entries, and the renderer's per-frame feature setup reads this list
-	# to know the pass is still part of the frame (it is what keeps the Temporal AA
-	# jitter running when a plugin pass owns that entry).
-	CompositorBinding.upload(compositor, tokens, names, get_provided_native_ids(), get_pass_parameters())
-
 ## The authored schedule exactly as the engine receives it: one token and one readable
 ## name per executed entry, in order, with the texture manager first. Both lists come
 ## from the same walk, so they cannot drift apart.
 func _build_schedule() -> Dictionary:
 	return ExecutionPlan.build(_passes, _manager, _is_scripted, _is_entry_enabled)
-
-func _schedule_name(pass_entry, index: int) -> String:
-	return ExecutionPlan.schedule_name(pass_entry, index)
 
 func get_execution_tokens() -> PackedInt32Array:
 	_ensure_pipeline_initialized(false)

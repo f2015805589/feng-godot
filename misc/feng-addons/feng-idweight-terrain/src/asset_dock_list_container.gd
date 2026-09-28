@@ -1,8 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Asset Dock list: the scrollable tile grid, its search filter, the selection
-# model and the resource add/remove/edit actions. Shared by the Godot 4.6 dock
-# (EditorDock) and the pre-4.6 dock, which differ only in how the dock itself is
-# hosted. Tile metrics and the pair-role hover labels follow the editor scale.
+# model and the resource add/remove/edit actions. Tile metrics and the
+# pair-role hover labels follow the editor scale.
 @tool
 class_name Terrain3DAssetDockContainer
 extends Container
@@ -23,9 +22,9 @@ var _observed_resources: Array[Resource] = []
 
 
 func _enter_tree() -> void:
-	# The pre-4.6 dock reparents this container while changing slots. Restore
-	# callbacks for entries that survived the reparent after _exit_tree cleared
-	# the old source connections.
+	# The dock reparents this container while changing slots. Restore callbacks
+	# for entries that survived the reparent after _exit_tree cleared the old
+	# source connections.
 	for entry in entries:
 		if is_instance_valid(entry) and entry.resource:
 			_observe_resource(entry.resource)

@@ -10,6 +10,7 @@ const Baker = preload("feng_magic_gi_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
 const Viz = preload("feng_magic_gi_viz.gd")
 const Data = preload("feng_magic_gi_data.gd")
+const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const ZERO_TRANSFER_DIAGNOSTIC := "本次间接传输全为零，Magic GI 不会改变画面。太阳与环境直达光由引擎处理；若需间接光，请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新烘焙。"
 const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
 const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
@@ -116,7 +117,7 @@ func _process(_delta: float) -> void:
 	var now := Time.get_ticks_msec()
 	if now >= _next_geometry_check and not _baking:
 		_next_geometry_check = now + 1000
-		var quick_signature := Placement.quick_signature(self)
+		var quick_signature := SceneTracker.quick_signature(self)
 		if quick_signature == _quick_scene_signature:
 			_pending_scene_signature = quick_signature
 		elif quick_signature == _pending_scene_signature:
@@ -244,7 +245,7 @@ func refresh_surface_points() -> void:
 		probe_normals = placement.normals
 		_current_scene_signature = placement.scene_signature
 		_scene_signature_checked = true
-	_quick_scene_signature = Placement.quick_signature(self)
+	_quick_scene_signature = SceneTracker.quick_signature(self)
 	_refresh_viz()
 	Runtime.publish(self)
 	update_configuration_warnings()

@@ -1,10 +1,9 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Asset Dock for Terrain3D: the Godot 4.6+ half.
+# Asset Dock for Terrain3D: the EditorDock hosting.
 
-# This half hosts itself in an EditorDock and adds the Terrain management menu and the debug-view
+# This script hosts itself in an EditorDock and adds the Terrain management menu and the debug-view
 # menu. The dock itself - signals, controls, search, list switching, pin, highlight and
-# window-focus handling - is asset_dock_common.gd, which this script extends; so is the pre-4.6
-# variant.
+# window-focus handling - is asset_dock_common.gd, which this script extends.
 @tool
 extends "res://addons/feng-idweight-terrain/src/asset_dock_common.gd"
 
@@ -27,9 +26,8 @@ var debug_menu: PopupMenu
 
 var vt_editor: Window
 
-# The pre-4.6 dock class reported a layout change through an engine callback carrying 1 vertical,
-# 2 horizontal, 4 window. Nothing here implements it: this dock calls update_layout() from `resized`
-# and from NOTIFICATION_ENTER_TREE instead. The class it belonged to is named at each call site below.
+# update_layout() is driven from `resized` and NOTIFICATION_ENTER_TREE rather than a
+# dedicated engine layout callback.
 var _dock: MarginContainer #DEPRECATED 4.5 - Use EdDock
 
 

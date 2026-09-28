@@ -7,7 +7,7 @@
 #
 # It is a base *script* rather than a helper object because both previews are Controls that own their
 # own visibility: a control that consulted a helper for `visible` would have two owners of one
-# property. `asset_dock_common.gd` is the same shape for the two dock versions.
+# property. `asset_dock_common.gd` is the same shape for the dock.
 @tool
 extends Control
 
