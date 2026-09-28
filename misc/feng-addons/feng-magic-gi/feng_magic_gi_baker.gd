@@ -56,6 +56,15 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.emitter_static_signatures = geometry.emitter_static_signatures
 	data.emitter_transport.resize(data.probe_count() * geometry.emitter_groups.size() * 6)
 	var epsilon: float = maxf(0.001, volume.surface_offset)
+	var qmc_dimension_count := (bounces + 1) * 2
+	var qmc_base_coordinates: Array[PackedFloat64Array] = []
+	qmc_base_coordinates.resize(qmc_dimension_count)
+	for dimension in qmc_dimension_count:
+		var coordinates := PackedFloat64Array()
+		coordinates.resize(rays)
+		for sample_index in rays:
+			coordinates[sample_index] = _qmc_base_coordinate(sample_index, rays, dimension)
+		qmc_base_coordinates[dimension] = coordinates
 	for p in data.probe_count():
 		# A per-probe Cranley-Patterson shift randomizes the low-discrepancy
 		# sequence without correlating the same ray directions across probes.
@@ -76,17 +85,17 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 			var vertex_position := data.positions[p] - data.normals[p] * volume.surface_offset
 			var vertex_normal := data.normals[p]
 			var direction := cosine_direction(data.normals[p],
-				qmc_sample(sample_index, rays, 0, shifts[0]),
-				qmc_sample(sample_index, rays, 1, shifts[1]))
+				fposmod(qmc_base_coordinates[0][sample_index] + shifts[0], 1.0),
+				fposmod(qmc_base_coordinates[1][sample_index] + shifts[1], 1.0))
 			var throughput := Vector3.ONE
 			for bounce in bounces + 1:
 				for emitter in geometry.emitter_groups.size():
 					var shift_index := (bounce * geometry.emitter_groups.size() + emitter) * 3
 					var source_sample := geometry.sample_emitter_connection(emitter,
 						vertex_position, vertex_normal,
-						qmc_sample(sample_index, rays, 0, emitter_shifts[shift_index]),
-						qmc_sample(sample_index, rays, 1, emitter_shifts[shift_index + 1]),
-						qmc_sample(sample_index, rays, 2, emitter_shifts[shift_index + 2]),
+						fposmod(qmc_base_coordinates[0][sample_index] + emitter_shifts[shift_index], 1.0),
+						fposmod(qmc_base_coordinates[1][sample_index] + emitter_shifts[shift_index + 1], 1.0),
+						fposmod(qmc_base_coordinates[2][sample_index] + emitter_shifts[shift_index + 2], 1.0),
 						volume.bake_distance)
 					if not source_sample.is_empty() and float(source_sample.weight) > 0.0 \
 							and float(source_sample.ray_distance) > 0.0:
@@ -120,8 +129,8 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 				origin = hit.position + hit_normal * epsilon
 				var dimension := (bounce + 1) * 2
 				direction = cosine_direction(hit_normal,
-					qmc_sample(sample_index, rays, dimension, shifts[dimension]),
-					qmc_sample(sample_index, rays, dimension + 1, shifts[dimension + 1]))
+					fposmod(qmc_base_coordinates[dimension][sample_index] + shifts[dimension], 1.0),
+					fposmod(qmc_base_coordinates[dimension + 1][sample_index] + shifts[dimension + 1], 1.0))
 		if p % 4 == 0:
 			await volume.get_tree().process_frame
 			if not is_instance_valid(volume) or not volume.is_inside_tree() \
@@ -166,6 +175,11 @@ static func qmc_sample(sample_index: int, sample_count: int, dimension: int, shi
 	else:
 		coordinate = _radical_inverse(sample_index, QMC_PRIME_BASES[dimension - 1])
 	return fposmod(coordinate + shift, 1.0)
+
+static func _qmc_base_coordinate(sample_index: int, sample_count: int, dimension: int) -> float:
+	if dimension == 0:
+		return (float(sample_index) + 0.5) / float(sample_count)
+	return _radical_inverse(sample_index, QMC_PRIME_BASES[dimension - 1])
 
 static func _radical_inverse(index: int, base: int) -> float:
 	var result := 0.0

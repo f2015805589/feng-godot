@@ -30,6 +30,7 @@ func _initialize() -> void:
 
 func _run() -> void:
 	_test_pure_contracts()
+	_test_probe_viz_contracts()
 	var scene := Node3D.new()
 	root.add_child(scene)
 	var density_volume := Volume.new()
@@ -92,19 +93,31 @@ func _run() -> void:
 	var max_face := MeshInstance3D.new()
 	max_face.mesh = _make_horizontal_plane(2.0, 1, white, 1.0)
 	scene.add_child(max_face)
+	var inward_max_face := MeshInstance3D.new()
+	inward_max_face.mesh = _make_horizontal_plane(2.0, 1, white, 1.0, true)
+	scene.add_child(inward_max_face)
 	var boundary_placement := Placement.new()
-	_check(boundary_placement.collect(boundary_volume, false), "planes on both volume Y faces collect successfully")
+	_check(boundary_placement.collect(boundary_volume, false), "planes on volume Y faces collect successfully")
 	_check(_surface_height_count(boundary_placement, boundary_volume, -1.0) > 0,
-			"plane on the exact minimum volume face is sampled")
-	_check(_surface_height_count(boundary_placement, boundary_volume, 1.0) > 0,
-			"plane on the exact maximum volume face is sampled")
+			"inward-offset plane on the exact minimum volume face is retained")
+	_check(_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.UP) == 0
+			and boundary_placement.rejected_center_outside_count > 0,
+			"outward offset from the exact maximum face is rejected when its probe center leaves the volume")
+	_check(_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.DOWN) > 0,
+			"inward offset from the exact maximum face remains inside and is retained")
+	print("MAGIC_GI_BOUNDARY_LAYOUT min_inward=%d max_outward=%d max_inward=%d center_outside_rejected=%d" % [
+		_surface_height_count(boundary_placement, boundary_volume, -1.0, Vector3.UP),
+		_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.UP),
+		_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.DOWN),
+		boundary_placement.rejected_center_outside_count])
 	min_face.queue_free()
 	max_face.queue_free()
+	inward_max_face.queue_free()
 	boundary_volume.queue_free()
 	await process_frame
 
 	var box_volume := Volume.new()
-	box_volume.size = Vector3.ONE * 2.0
+	box_volume.size = Vector3.ONE * 2.2
 	box_volume.probe_spacing = 1.0
 	scene.add_child(box_volume)
 	var box_instance := MeshInstance3D.new()
@@ -130,6 +143,99 @@ func _run() -> void:
 	_check(box_data.build_cell_indices(), "closed box stays within the 8-slot cell capacity")
 	box_volume.queue_free()
 	box_instance.queue_free()
+	await process_frame
+
+	var embedded_volume := Volume.new()
+	embedded_volume.size = Vector3.ONE * 4.0
+	embedded_volume.probe_spacing = 1.0
+	scene.add_child(embedded_volume)
+	var solid_instance := MeshInstance3D.new()
+	var solid_mesh := BoxMesh.new()
+	solid_mesh.size = Vector3.ONE * 2.0
+	solid_instance.mesh = solid_mesh
+	scene.add_child(solid_instance)
+	var embedded_plane := MeshInstance3D.new()
+	embedded_plane.mesh = _make_horizontal_plane(1.0, 1, white)
+	scene.add_child(embedded_plane)
+	var transparent_material := _make_material(Color(1.0, 1.0, 1.0, 0.5))
+	transparent_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	var transparent_box := MeshInstance3D.new()
+	var transparent_box_mesh := BoxMesh.new()
+	transparent_box_mesh.size = Vector3.ONE * 0.8
+	transparent_box_mesh.material = transparent_material
+	transparent_box.mesh = transparent_box_mesh
+	transparent_box.position.x = 1.4
+	scene.add_child(transparent_box)
+	var transparent_receiver := MeshInstance3D.new()
+	transparent_receiver.mesh = _make_horizontal_plane(0.5, 1, white)
+	transparent_receiver.position.x = 1.4
+	scene.add_child(transparent_receiver)
+	var embedded_placement := Placement.new()
+	_check(embedded_placement.collect(embedded_volume, false),
+			"closed-solid containment fixture collects successfully")
+	_check(embedded_placement._occlusion_volumes.size() == 1,
+			"watertight BoxMesh is registered for inside-volume rejection")
+	_check(_surface_height_count(embedded_placement, embedded_volume, 0.0, Vector3.UP, 1.1, 1.8) > 0,
+			"a transparent closed BoxMesh does not reject probes on an overlapping open receiver")
+	_check(_surface_height_count(embedded_placement, embedded_volume, 0.0, Vector3.UP, -0.9, 0.9) == 0
+			and embedded_placement.rejected_occluded_count > 0,
+			"open plane probes wholly inside another BoxMesh are rejected when both offset endpoints are inside")
+	_check(embedded_placement.positions.size() > 0
+			and _normal_count(embedded_placement, Vector3.UP) > 0,
+			"source BoxMesh keeps its own outward-offset probes while its solid interior rejects other sources")
+	print("MAGIC_GI_EMBEDDED_LAYOUT retained=%d rejected_inside_or_crossing=%d" % [
+		embedded_placement.positions.size(), embedded_placement.rejected_occluded_count])
+	embedded_volume.queue_free()
+	solid_instance.queue_free()
+	embedded_plane.queue_free()
+	transparent_box.queue_free()
+	transparent_receiver.queue_free()
+	await process_frame
+
+	var layered_volume := Volume.new()
+	layered_volume.size = Vector3(4.0, 2.0, 4.0)
+	layered_volume.probe_spacing = 1.0
+	scene.add_child(layered_volume)
+	var lower_plane := MeshInstance3D.new()
+	lower_plane.mesh = _make_horizontal_plane(0.8, 1, white, 0.0)
+	scene.add_child(lower_plane)
+	var upper_plane := MeshInstance3D.new()
+	upper_plane.mesh = _make_horizontal_plane(0.8, 1, white, 0.1)
+	scene.add_child(upper_plane)
+	var layered_placement := Placement.new()
+	_check(layered_placement.collect(layered_volume, false),
+			"thickness-separated parallel surfaces collect successfully")
+	_check(_surface_height_count(layered_placement, layered_volume, 0.0, Vector3.UP) > 0
+			and _surface_height_count(layered_placement, layered_volume, 0.1, Vector3.UP) > 0,
+			"parallel planes 10cm apart remain separate even when their gap is below Probe Spacing")
+	print("MAGIC_GI_PARALLEL_LAYOUT lower=%d upper=%d duplicates=%d" % [
+		_surface_height_count(layered_placement, layered_volume, 0.0, Vector3.UP),
+		_surface_height_count(layered_placement, layered_volume, 0.1, Vector3.UP),
+		layered_placement.rejected_duplicate_count])
+	layered_volume.queue_free()
+	lower_plane.queue_free()
+	upper_plane.queue_free()
+	await process_frame
+
+	var coplanar_volume := Volume.new()
+	coplanar_volume.size = Vector3(4.0, 2.0, 4.0)
+	coplanar_volume.probe_spacing = 1.0
+	scene.add_child(coplanar_volume)
+	var coplanar_a := MeshInstance3D.new()
+	coplanar_a.mesh = _make_horizontal_plane(0.8, 1, white, 0.0)
+	scene.add_child(coplanar_a)
+	var coplanar_b := MeshInstance3D.new()
+	coplanar_b.mesh = _make_horizontal_plane(0.8, 1, white, 0.0)
+	scene.add_child(coplanar_b)
+	var coplanar_placement := Placement.new()
+	_check(coplanar_placement.collect(coplanar_volume, false),
+			"coincident source surfaces collect successfully")
+	_check(coplanar_placement.rejected_duplicate_count > 0
+			and _surface_height_count(coplanar_placement, coplanar_volume, 0.0, Vector3.UP) > 0,
+			"truly coplanar surfaces from separate nodes still share near-duplicate probes")
+	coplanar_volume.queue_free()
+	coplanar_a.queue_free()
+	coplanar_b.queue_free()
 	await process_frame
 
 	var curved_volume := Volume.new()
@@ -160,6 +266,10 @@ func _run() -> void:
 	scene.add_child(cone_instance)
 	var curved_placement := Placement.new()
 	var curved_collected: bool = curved_placement.collect(curved_volume, false)
+	print("CURVED_PLACEMENT collected=%s error=%s probes=%d duplicates=%d rejected=%d cells=%d" % [
+		curved_collected, curved_placement.error_message, curved_placement.positions.size(),
+		curved_placement.rejected_duplicate_count, curved_placement.rejected_occluded_count,
+		curved_placement._cell_counts.size()])
 	_check(curved_collected, "1m sphere and cone placement fits the 8-slot grid")
 	_check(curved_placement.positions.size() > 0 and _max_cell_load(curved_placement) <= Data.CELL_CAPACITY,
 			"curved surfaces remain represented without lookup-cell overflow")
@@ -372,6 +482,11 @@ func _test_pure_contracts() -> void:
 	_check(Volume.BAKE_QUALITY_SAMPLES == [256, 1024, 2048],
 			"Draft, Final, and High quality presets have explicit ray counts")
 	var default_volume := Volume.new()
+	_check(is_equal_approx(default_volume.probe_spacing, 1.0),
+			"new Magic GI volumes default to one-meter probe spacing")
+	default_volume.probe_spacing = 2.0
+	_check(is_equal_approx(default_volume.probe_spacing, 2.0),
+			"probe spacing remains author-configurable after changing the default")
 	_check(default_volume.bake_samples == 256, "existing numerical bake-sample default remains 256")
 	default_volume.free()
 	_check(Baker.signature_for_geometry(12345) == Baker.signature_for_geometry(12345)
@@ -939,7 +1054,8 @@ func _warnings_contain(warnings: PackedStringArray, fragment: String) -> bool:
 			return true
 	return false
 
-func _make_horizontal_plane(extent: float, subdivisions: int, material: Material, y := 0.0) -> ArrayMesh:
+func _make_horizontal_plane(extent: float, subdivisions: int, material: Material,
+		y := 0.0, face_down := false) -> ArrayMesh:
 	var vertices := PackedVector3Array()
 	var half := extent * 0.5
 	for z in subdivisions:
@@ -952,7 +1068,10 @@ func _make_horizontal_plane(extent: float, subdivisions: int, material: Material
 			var b := Vector3(x1, y, z0)
 			var c := Vector3(x1, y, z1)
 			var d := Vector3(x0, y, z1)
-			vertices.append_array([a, b, c, a, c, d])
+			if face_down:
+				vertices.append_array([a, c, b, a, d, c])
+			else:
+				vertices.append_array([a, b, c, a, c, d])
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
@@ -1010,13 +1129,70 @@ func _max_cell_load(placement: RefCounted) -> int:
 		maximum = maxi(maximum, int(placement._cell_counts[key]))
 	return maximum
 
-func _surface_height_count(placement: RefCounted, volume: Node3D, y: float) -> int:
+func _surface_height_count(placement: RefCounted, volume: Node3D, y: float,
+		normal_filter := Vector3.ZERO, x_min := -INF, x_max := INF) -> int:
 	var count := 0
 	for index in placement.positions.size():
+		if normal_filter.length_squared() > 0.5 \
+				and placement.normals[index].dot(normal_filter) < 0.95:
+			continue
+		if placement.positions[index].x < x_min or placement.positions[index].x > x_max:
+			continue
 		var surface_y: float = placement.positions[index].y - placement.normals[index].y * volume.surface_offset
 		if is_equal_approx(surface_y, y):
 			count += 1
 	return count
+
+func _test_probe_viz_contracts() -> void:
+	var volume := Volume.new()
+	root.add_child(volume)
+	volume.size = Vector3.ONE * 4.0
+	volume.probe_spacing = 2.0
+	volume.surface_offset = 0.03
+	var radius := Viz._probe_gizmo_radius(volume)
+	var expected_radius := Viz._cell_extent(volume) * Viz.PROBE_GIZMO_CELL_RATIO
+	_check(is_equal_approx(radius, expected_radius) and radius * 2.0 > volume.surface_offset * 4.0,
+			"probe gizmos keep the established visible cell-relative radius")
+	var data := Data.new()
+	data.positions = PackedVector3Array([Vector3.ZERO])
+	data.normals = PackedVector3Array([Vector3.UP])
+	data.transfer.resize(27)
+	data.transfer.fill(0.0)
+	var zero_color: Color = Viz._baked_probe_color(data, 0)
+	_check(zero_color.b > 0.8 and zero_color.g > 0.5,
+			"valid zero-response probes have a visible diagnostic tint rather than appearing invalid")
+	data.transfer[0] = 0.001
+	var low_color: Color = Viz._baked_probe_color(data, 0)
+	_check(low_color == Viz.LOW_RESPONSE_COLOR and low_color != zero_color,
+			"weak positive transport has a distinct low-response tint")
+	volume.probe_positions = PackedVector3Array([Vector3.ZERO])
+	volume.probe_normals = PackedVector3Array([Vector3.UP])
+	volume.bake_data = data
+	var viz_root := Node3D.new()
+	Viz._build_box(volume, viz_root)
+	Viz._build_probes(volume, viz_root)
+	Viz._build_sh(volume, viz_root)
+	var off := GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var box := viz_root.get_node("_Box") as MeshInstance3D
+	var probes := viz_root.get_node("_Probes") as MultiMeshInstance3D
+	var transport := viz_root.get_node("_Transport") as Node3D
+	var transport_mesh := transport.get_child(0) as MeshInstance3D
+	var sphere := probes.multimesh.mesh as SphereMesh
+	var probe_material := sphere.material as StandardMaterial3D
+	_check(box.cast_shadow == off and probes.cast_shadow == off and transport_mesh.cast_shadow == off,
+			"volume box, MultiMesh probes, and transport meshes do not cast shadows")
+	_check(probes.visible and probes.multimesh.use_colors,
+			"probe spheres are visible and use per-instance diagnostic colors")
+	_check(is_equal_approx(sphere.radius, radius),
+			"probe sphere mesh keeps the established visible radius")
+	_check(probe_material != null
+			and probe_material.shading_mode == BaseMaterial3D.SHADING_MODE_UNSHADED
+			and probe_material.albedo_color == Color.WHITE
+			and probe_material.vertex_color_use_as_albedo,
+			"probe sphere material shows vertex colors without scene lighting")
+	viz_root.free()
+	data = null
+	volume.free()
 
 func _find_probe(data: Resource, target: Vector3, normal: Vector3) -> int:
 	var best := -1

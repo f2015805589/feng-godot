@@ -11,11 +11,17 @@ const MAX_GEOMETRY_TRIANGLES := 250000
 const MAX_TERRAIN_CELLS := 500000
 const MAX_SAMPLE_CANDIDATES := 2000000
 const MAX_TRIANGLE_STEPS := 512
+const MAX_OCCLUSION_TRIANGLES := 250000
+const OCCLUSION_MAX_CROSSINGS := 256
+const OCCLUSION_WELD_EPSILON := 0.00001
+const DUPLICATE_PLANE_EPSILON := 0.001
 const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 
 var faces := PackedVector3Array()
 var reflectance := PackedVector3Array()
 var face_emitter_indices := PackedInt32Array()
+var face_source_ids := PackedInt64Array()
+var face_surface_indices := PackedInt32Array()
 var emitter_keys := PackedStringArray()
 var emitter_static_signatures := PackedInt64Array()
 var emitter_groups: Array[Dictionary] = []
@@ -29,6 +35,8 @@ var bvh_ready := false
 var _cells: Dictionary = {}
 var _spatial_hash: Dictionary = {}
 var _cell_counts: Dictionary = {}
+var _occlusion_volumes: Array[Dictionary] = []
+var _occlusion_instance_ids: Dictionary = {}
 var _volume: Node3D
 var _world: World3D
 var _collect_emission := false
@@ -43,6 +51,13 @@ var _terrain_work := 0
 var _triangle_count := 0
 var _triangle_reflectance: Vector3
 var _triangle_emitter_index := -1
+var _triangle_source_id := 0
+var _triangle_surface_index := -1
+var _sample_source_id := 0
+var _sample_surface_index := -1
+var rejected_occluded_count := 0
+var rejected_duplicate_count := 0
+var rejected_center_outside_count := 0
 var _scene_root: Node
 var _emitter_set: EmitterBakeSet
 
@@ -64,6 +79,8 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	faces.clear()
 	reflectance.clear()
 	face_emitter_indices.clear()
+	face_source_ids.clear()
+	face_surface_indices.clear()
 	emitter_keys.clear()
 	emitter_static_signatures.clear()
 	emitter_groups.clear()
@@ -72,11 +89,20 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_cells.clear()
 	_spatial_hash.clear()
 	_cell_counts.clear()
+	_occlusion_volumes.clear()
+	_occlusion_instance_ids.clear()
 	_material_cache.clear()
 	_candidate_count = 0
 	_terrain_work = 0
 	_triangle_count = 0
 	_triangle_emitter_index = -1
+	_triangle_source_id = 0
+	_triangle_surface_index = -1
+	_sample_source_id = 0
+	_sample_surface_index = -1
+	rejected_occluded_count = 0
+	rejected_duplicate_count = 0
+	rejected_center_outside_count = 0
 	bvh = null
 	bvh_ready = false
 	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
@@ -113,6 +139,9 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 
 func _sample_collected_geometry() -> bool:
 	for face_offset in range(0, faces.size(), 3):
+		var source_face_index := int(face_offset / 3)
+		_sample_source_id = int(face_source_ids[source_face_index])
+		_sample_surface_index = int(face_surface_indices[source_face_index])
 		var a: Vector3 = faces[face_offset]
 		var b: Vector3 = faces[face_offset + 1]
 		var c: Vector3 = faces[face_offset + 2]
@@ -158,6 +187,7 @@ func _collect_mesh(node: MeshInstance3D, for_bake: bool) -> void:
 	var mesh_world_box: AABB = node.global_transform * mesh.get_aabb()
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(_bake_world_bounds.grow(BROADPHASE_EPSILON)):
 		return
+	_register_occlusion_volume(node, mesh, mesh_world_box)
 	if mesh is PrimitiveMesh:
 		var arrays: Array = mesh.get_mesh_arrays()
 		if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
@@ -179,10 +209,80 @@ func _collect_mesh(node: MeshInstance3D, for_bake: bool) -> void:
 		if not error_message.is_empty():
 			return
 
+func _register_occlusion_volume(node: MeshInstance3D, mesh: Mesh, mesh_world_box: AABB) -> void:
+	var instance_id := node.get_instance_id()
+	if _occlusion_instance_ids.has(instance_id):
+		return
+	_occlusion_instance_ids[instance_id] = true
+	var placement_box := _world_bounds.grow(float(_volume.surface_offset) + BROADPHASE_EPSILON)
+	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(placement_box):
+		return
+	if _mesh_has_transparent_surface(node, mesh):
+		return # Transparent faces are omitted from the static BVH, so they cannot define occupied volume.
+	var local_faces: PackedVector3Array = mesh.get_faces()
+	if local_faces.size() < 12 or local_faces.size() % 3 != 0 \
+			or local_faces.size() / 3 > MAX_OCCLUSION_TRIANGLES:
+		return
+	if not _mesh_faces_are_watertight(local_faces):
+		return # Open meshes and terrain are not interpreted as solid volumes.
+	var world_faces := PackedVector3Array()
+	world_faces.resize(local_faces.size())
+	for index in local_faces.size():
+		world_faces[index] = node.global_transform * local_faces[index]
+	var mesh_bvh := TriangleMesh.new()
+	if not mesh_bvh.create_from_faces(world_faces):
+		return
+	_occlusion_volumes.append({
+		"instance_id": instance_id,
+		"world_aabb": mesh_world_box,
+		"bvh": mesh_bvh,
+	})
+
+func _mesh_has_transparent_surface(node: MeshInstance3D, mesh: Mesh) -> bool:
+	for surface in mesh.get_surface_count():
+		var material: Material = node.get_active_material(surface)
+		if material is BaseMaterial3D \
+				and material.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
+			return true
+	return false
+
+func _mesh_faces_are_watertight(local_faces: PackedVector3Array) -> bool:
+	var vertex_ids: Dictionary = {}
+	var edge_counts: Dictionary = {}
+	for face_offset in range(0, local_faces.size(), 3):
+		var triangle_ids := PackedInt32Array()
+		for corner in 3:
+			var point: Vector3 = local_faces[face_offset + corner]
+			var vertex_key := Vector3i(
+					roundi(point.x / OCCLUSION_WELD_EPSILON),
+					roundi(point.y / OCCLUSION_WELD_EPSILON),
+					roundi(point.z / OCCLUSION_WELD_EPSILON))
+			if not vertex_ids.has(vertex_key):
+				vertex_ids[vertex_key] = vertex_ids.size()
+			triangle_ids.append(int(vertex_ids[vertex_key]))
+		if triangle_ids[0] == triangle_ids[1] or triangle_ids[1] == triangle_ids[2] \
+				or triangle_ids[2] == triangle_ids[0]:
+			return false
+		for edge_index in 3:
+			var first := triangle_ids[edge_index]
+			var second := triangle_ids[(edge_index + 1) % 3]
+			var low := mini(first, second)
+			var high := maxi(first, second)
+			var edge_key: int = (low << 32) | high
+			edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
+	if edge_counts.is_empty():
+		return false
+	for count in edge_counts.values():
+		if int(count) != 2:
+			return false # Boundary and non-manifold edges are not closed solids.
+	return true
+
 func _collect_faces_only_mesh(node: MeshInstance3D, mesh: Mesh, for_bake: bool) -> void:
 	var primitive_faces: PackedVector3Array = mesh.get_faces()
 	if primitive_faces.is_empty():
 		return
+	_triangle_source_id = node.get_instance_id()
+	_triangle_surface_index = 0
 	if not _prepare_surface(node, 0):
 		return
 	if _triangle_emitter_index >= 0:
@@ -217,6 +317,8 @@ func _collect_surface_triangles(node: MeshInstance3D, surface: int, arrays: Arra
 		if count % 3 != 0 or snapped_faces.size() != count:
 			error_message = "PrimitiveMesh face positions and array UV indices disagree; refusing unstable surface data."
 			return
+	_triangle_source_id = node.get_instance_id()
+	_triangle_surface_index = surface
 	if not _prepare_surface(node, surface, uv1, uv2, vertices.size()):
 		return
 	for i in range(0, count - 2, 3):
@@ -271,6 +373,8 @@ func _material_reflectance(material: Material) -> Vector3:
 
 func _collect_terrain(terrain: Node3D, for_bake: bool) -> void:
 	_triangle_emitter_index = -1
+	_triangle_source_id = terrain.get_instance_id()
+	_triangle_surface_index = -1
 	var data = terrain.get("data")
 	if not data.has_method("get_surface_height"):
 		error_message = "Terrain3D data is missing get_surface_height(); refusing raw height sampling."
@@ -328,6 +432,8 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool,
 	faces.append_array([a, b, c])
 	reflectance.append(_triangle_reflectance)
 	face_emitter_indices.append(_triangle_emitter_index)
+	face_source_ids.append(_triangle_source_id)
+	face_surface_indices.append(_triangle_surface_index)
 	if _triangle_emitter_index >= 0:
 		_emitter_set.append_triangle(_triangle_emitter_index, a, b, c, normal,
 				uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c)
@@ -375,12 +481,24 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 			for dx in range(-1, 2):
 				var nearby: Array = _spatial_hash.get(hash_cell + Vector3i(dx, dy, dz), [])
 				for existing in nearby:
-					# Treat nearby samples on a smooth curve as the same local
-					# corners (orthogonal normals have dot=0).
-					if normal.dot(existing.normal) > 0.5 \
-							and surface.distance_squared_to(existing.position) < min_separation * min_separation:
+					if _surfaces_are_duplicate(surface, normal, existing, min_separation):
+						rejected_duplicate_count += 1
 						return
 	if _probe_offset_is_occluded(surface, normal):
+		rejected_occluded_count += 1
+		return
+	var probe_center: Vector3 = surface + normal * float(_volume.surface_offset)
+	var center_local := _inverse * probe_center
+	if center_local.x < -_volume.size.x * 0.5 - epsilon \
+			or center_local.x > _volume.size.x * 0.5 + epsilon \
+			or center_local.y < -_volume.size.y * 0.5 - epsilon \
+			or center_local.y > _volume.size.y * 0.5 + epsilon \
+			or center_local.z < -_volume.size.z * 0.5 - epsilon \
+			or center_local.z > _volume.size.z * 0.5 + epsilon:
+		rejected_center_outside_count += 1
+		return
+	if _probe_center_is_inside_other_solid(probe_center):
+		rejected_occluded_count += 1
 		return
 	var grid: Vector3 = (local + _volume.size * 0.5) / _volume.size * Vector3(_dimensions)
 	var cell := Data.cell_coordinates(grid, _dimensions)
@@ -396,11 +514,38 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 		error_message = "Surface sampling exceeds the 65,536-probe limit; increase Probe Spacing or reduce the volume."
 		return
 	_cell_counts[cell_key] = count + 1
-	var point_entry := {"position": surface, "normal": normal}
+	var point_entry := {
+		"position": surface,
+		"normal": normal,
+		"source_id": _sample_source_id,
+		"surface_index": _sample_surface_index,
+	}
 	var bucket: Array = _spatial_hash.get(hash_cell, [])
 	bucket.append(point_entry)
 	_spatial_hash[hash_cell] = bucket
-	_cells[_cells.size()] = {"position": surface + normal * _volume.surface_offset, "normal": normal}
+	_cells[_cells.size()] = {"position": probe_center, "normal": normal}
+
+func _surfaces_are_duplicate(surface: Vector3, normal: Vector3,
+		existing: Dictionary, min_separation: float) -> bool:
+	var existing_normal: Vector3 = existing.normal
+	var alignment := normal.dot(existing_normal)
+	if alignment <= 0.5 or surface.distance_squared_to(existing.position) \
+			>= min_separation * min_separation:
+		return false
+	var same_surface_domain := int(existing.source_id) == _sample_source_id \
+			and int(existing.surface_index) == _sample_surface_index
+	var plane_tolerance := DUPLICATE_PLANE_EPSILON
+	if same_surface_domain:
+		# Curved meshes need a little slack across adjacent facets. The allowance
+		# vanishes as normals become parallel, so thickness-separated parallel
+		# sides of one shell still remain distinct.
+		plane_tolerance += min_separation * sqrt(maxf(0.0, 1.0 - alignment * alignment))
+	elif alignment < 0.995:
+		return false # Across source surfaces/nodes, only same-facing planes merge.
+	var separation := maxf(
+			absf((surface - existing.position).dot(normal)),
+			absf((surface - existing.position).dot(existing_normal)))
+	return separation <= plane_tolerance
 
 func _probe_offset_is_occluded(surface: Vector3, normal: Vector3) -> bool:
 	if not bvh_ready or normal.length_squared() < 0.5:
@@ -410,6 +555,60 @@ func _probe_offset_is_occluded(surface: Vector3, normal: Vector3) -> bool:
 	var start := surface + normal * epsilon
 	var end := surface + normal * offset
 	return not bvh.intersect_segment(start, end).is_empty()
+
+func _probe_center_is_inside_other_solid(point: Vector3) -> bool:
+	for solid in _occlusion_volumes:
+		# Do not treat the source mesh's own normal offset as an obstruction. The
+		# short BVH segment test above still rejects offsets that immediately cross
+		# the source surface; this skip only applies to whole-volume containment.
+		if int(solid.instance_id) == _sample_source_id:
+			continue
+		var solid_box: AABB = solid.world_aabb
+		if solid_box.has_point(point) and _point_inside_closed_mesh(
+				point, solid_box, solid.bvh):
+			return true
+	return false
+
+func _point_inside_closed_mesh(point: Vector3, bounds: AABB, mesh_bvh: TriangleMesh) -> bool:
+	var directions := [
+		Vector3(1.0, 0.371, 0.529).normalized(),
+		Vector3(-0.291, 1.0, 0.417).normalized(),
+		Vector3(0.613, -0.337, 1.0).normalized(),
+		Vector3(-1.0, 0.743, 0.263).normalized(),
+		Vector3(0.229, -1.0, 0.811).normalized(),
+	]
+	var ray_length := bounds.size.length() + 1.0
+	var ray_epsilon := maxf(0.00001, bounds.size.length() * 0.000001)
+	var valid_rays := 0
+	var inside_votes := 0
+	for direction in directions:
+		var crossings := _ray_crossing_count(point, direction, ray_length,
+				ray_epsilon, mesh_bvh)
+		if crossings < 0:
+			continue # A ray landed on the boundary; let the other directions decide.
+		valid_rays += 1
+		if crossings % 2 == 1:
+			inside_votes += 1
+	return valid_rays >= 3 and inside_votes >= 3
+
+func _ray_crossing_count(origin: Vector3, direction: Vector3, ray_length: float,
+		advance_epsilon: float, mesh_bvh: TriangleMesh) -> int:
+	var ray_end := origin + direction * ray_length
+	var ray_start := origin
+	var crossings := 0
+	for _hit_index in OCCLUSION_MAX_CROSSINGS:
+		var hit: Dictionary = mesh_bvh.intersect_segment(ray_start, ray_end)
+		if hit.is_empty():
+			return crossings
+		var hit_position: Vector3 = hit["position"]
+		var along_ray := (hit_position - origin).dot(direction)
+		if along_ray <= advance_epsilon * 4.0:
+			return -1 # The query lies on or too close to this mesh boundary.
+		crossings += 1
+		ray_start = hit_position + direction * (advance_epsilon * 4.0)
+		if ray_start.distance_squared_to(ray_end) <= advance_epsilon * advance_epsilon:
+			return crossings
+	return -1 # Avoid pathological work on malformed/intersecting topology.
 
 func _clip_polygon(polygon: Array, axis: int, boundary: float, keep_greater: bool) -> Array:
 	var output: Array = []

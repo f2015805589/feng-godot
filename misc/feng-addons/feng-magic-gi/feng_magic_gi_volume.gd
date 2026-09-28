@@ -20,7 +20,7 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 		size = value if value.is_finite() else Vector3(10.0, 10.0, 10.0)
 		size = size.max(Vector3.ONE * 0.01)
 		_settings_changed()
-@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 2.0:
+@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 1.0:
 	set(value):
 		probe_spacing = clampf(value, 0.1, 4096.0)
 		_settings_changed()

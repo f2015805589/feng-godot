@@ -6,12 +6,17 @@ extends RefCounted
 ## Three layers, all children of one `_FMagicGIViz` node (kept out of the scene
 ## file by adding it as an internal child):
 ##   _Box    - line mesh of the volume's box.
-##   _Probes - one MultiMesh sphere per surface sample, tinted by its response
-##             to a unit directional source from world +Y; gray before a bake.
+##   _Probes - one cell-relative MultiMesh sphere per surface sample. Gray
+##             means no current bake; blue means zero +Y response, amber means
+##             weak positive response, and stronger response keeps its RGB tint.
 ##   _Transport - radial visualization of geometry transport response, not
 ##                stored or current light radiance. Capped at 256 samples.
 const MAX_SH_VIZ_PROBES := 256
 const SH_VIZ_SIDES := 12   # rings and sectors of the reconstruction mesh
+const PROBE_GIZMO_CELL_RATIO := 0.12
+const LOW_RESPONSE_THRESHOLD := 0.025
+const ZERO_RESPONSE_COLOR := Color(0.08, 0.55, 0.95)
+const LOW_RESPONSE_COLOR := Color(0.95, 0.42, 0.06)
 
 static func build(volume: FMagicGIVolume) -> Node3D:
 	var root := Node3D.new()
@@ -52,21 +57,37 @@ static func _build_box(volume: FMagicGIVolume, root: Node3D) -> void:
 	instance.name = "_Box"
 	instance.mesh = mesh
 	instance.material_override = material
+	instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	root.add_child(instance)
 
 static func _cell_extent(volume: FMagicGIVolume) -> float:
 	var cell := volume.cell_size()
 	return minf(cell.x, minf(cell.y, cell.z))
 
+static func _probe_gizmo_radius(volume: FMagicGIVolume) -> float:
+	# Keep the established scene-scaled editor marker. It can overlap nearby
+	# surfaces; all visualization meshes explicitly stay out of shadow maps.
+	return _cell_extent(volume) * PROBE_GIZMO_CELL_RATIO
+
+static func _baked_probe_color(data: FMagicGIData, index: int) -> Color:
+	var response := data.transport_response(index, Vector3.UP).max(Vector3.ZERO)
+	var peak := maxf(response.x, maxf(response.y, response.z))
+	if peak <= 0.000001:
+		return ZERO_RESPONSE_COLOR
+	if peak < LOW_RESPONSE_THRESHOLD:
+		return LOW_RESPONSE_COLOR
+	return Color(response.x, response.y, response.z)
+
 static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 	var count := volume.probe_count()
 	if count == 0:
 		return
 	var sphere := SphereMesh.new()
-	sphere.radius = _cell_extent(volume) * 0.12
+	sphere.radius = _probe_gizmo_radius(volume)
 	sphere.height = sphere.radius * 2.0
 	var material := StandardMaterial3D.new()
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color.WHITE
 	material.vertex_color_use_as_albedo = true
 	sphere.material = material
 	var mm := MultiMesh.new()
@@ -81,13 +102,14 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
 		var color := Color(0.35, 0.35, 0.35)
 		if data != null:
-			color = data.transport_preview_color(i)
+			color = _baked_probe_color(data, i)
 		var scale_basis := Basis.IDENTITY
 		mm.set_instance_transform(i, Transform3D(scale_basis, local))
 		mm.set_instance_color(i, color)
 	var node := MultiMeshInstance3D.new()
 	node.name = "_Probes"
 	node.multimesh = mm
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	root.add_child(node)
 
 static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
@@ -108,6 +130,7 @@ static func _build_sh(volume: FMagicGIVolume, root: Node3D) -> void:
 		material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		material.vertex_color_use_as_albedo = true
 		node.material_override = material
+		node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		holder.add_child(node)
 
 ## Radial transfer plot: vertex at direction d sits at d * |T(d)| * radius_scale;
