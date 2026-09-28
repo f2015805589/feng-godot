@@ -14,6 +14,7 @@ const SUN_SCAN_MSEC := 500
 
 static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
 static var _viewports: Dictionary = {} ## viewport id -> WeakRef
+static var _debanding_original: Dictionary = {} ## viewport id -> use_debanding before fog activated
 static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef}
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
@@ -38,8 +39,35 @@ static func register_viewport(viewport: Viewport) -> void:
 
 static func unregister_viewport(viewport: Viewport) -> void:
 	if viewport != null and is_instance_valid(viewport):
-		_viewports.erase(viewport.get_instance_id())
+		var id := viewport.get_instance_id()
+		_restore_debanding(id, viewport)
+		_viewports.erase(id)
 		_publish()
+
+static func _restore_debanding(id: int, viewport: Viewport) -> void:
+	if _debanding_original.has(id):
+		viewport.use_debanding = _debanding_original[id]
+		_debanding_original.erase(id)
+
+## The viewport's final tonemap knows its output bit depth and applies dither
+## immediately before quantization. Doing this in the HDR fog pass would use
+## the wrong scale and can leave visible rings after tone mapping.
+static func _sync_debanding(selected: Dictionary) -> void:
+	for id in _viewports.keys():
+		var reference: WeakRef = _viewports[id]
+		var viewport: Viewport = reference.get_ref() if reference != null else null
+		if viewport == null:
+			_viewports.erase(id)
+			_debanding_original.erase(id)
+			continue
+		var world := viewport.find_world_3d() if viewport.is_inside_tree() else null
+		var fog_active := world != null and selected.has(world.get_instance_id())
+		if fog_active:
+			if not _debanding_original.has(id):
+				_debanding_original[id] = viewport.use_debanding
+				viewport.use_debanding = true
+		else:
+			_restore_debanding(id, viewport)
 
 static func publish(fog: FengHeightFog) -> void:
 	if fog.is_inside_tree():
@@ -117,6 +145,7 @@ static func _publish() -> void:
 		var world_id := world.get_instance_id()
 		if not selected.has(world_id) or int(entry["sequence"]) > int(selected[world_id]["sequence"]):
 			selected[world_id] = {"fog": fog, "sequence": entry["sequence"], "id": id, "world": world}
+	_sync_debanding(selected)
 	var result: Array[Dictionary] = []
 	for world_id in selected.keys():
 		var entry: Dictionary = selected[world_id]

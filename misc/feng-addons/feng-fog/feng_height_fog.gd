@@ -8,6 +8,8 @@ extends Node3D
 ## enabled node active. Parameters keep Unreal's names, defaults and shader
 ## semantics; density and falloff carry Unreal's authored units and are divided
 ## by ten for meters before upload (Unreal divides by 1000 in centimeters).
+## While active, the runtime temporarily enables debanding on affected viewports
+## so the directional fog gradient survives final 8-bit tone mapping.
 
 const Runtime = preload("feng_fog_runtime.gd")
 ## Unreal stores FogDensity/FogHeightFalloff per 1000 units in a centimeter

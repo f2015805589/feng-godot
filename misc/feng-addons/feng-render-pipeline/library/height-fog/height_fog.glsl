@@ -122,13 +122,13 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	return vec4(params.exponential_fog_color.rgb * (1.0 - exp_fog_factor) + directional_inscattering, exp_fog_factor);
 }
 
-vec3 world_from_clip(vec2 uv, float depth) {
+vec3 view_from_clip(vec2 uv, float depth) {
 	vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
 	vec4 view_h = params.inverse_projection * clip;
 	if (abs(view_h.w) < 1e-7) {
 		return vec3(0.0);
 	}
-	return (params.view_to_world * vec4(view_h.xyz / view_h.w, 1.0)).xyz;
+	return view_h.xyz / view_h.w;
 }
 
 void main() {
@@ -139,17 +139,20 @@ void main() {
 	}
 
 	vec2 screen_uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
-	vec3 camera_position = params.camera_position.xyz;
 	vec3 camera_to_receiver;
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
 	if (depth <= 0.0) {
 		// Reverse-Z depth zero is the infinite far plane and cannot be divided
-		// by homogeneous w. Two finite depths define the view ray for both
-		// perspective and orthographic cameras.
-		vec3 direction = normalize(world_from_clip(screen_uv, 0.5) - world_from_clip(screen_uv, 1.0));
+		// by homogeneous w. Subtract finite depths in view space before camera
+		// translation; subtracting nearby world positions loses ray precision
+		// when the camera is far from the world origin.
+		vec3 view_direction = normalize(view_from_clip(screen_uv, 0.5) - view_from_clip(screen_uv, 1.0));
+		vec3 direction = normalize(mat3(params.view_to_world) * view_direction);
 		camera_to_receiver = direction * SKY_DISTANCE;
 	} else {
-		camera_to_receiver = world_from_clip(screen_uv, depth) - camera_position;
+		// The fog integral takes a camera-relative ray, so no world-position
+		// reconstruction or large world-coordinate subtraction is needed.
+		camera_to_receiver = mat3(params.view_to_world) * view_from_clip(screen_uv, depth);
 	}
 
 	vec4 fog = get_exponential_height_fog(camera_to_receiver);

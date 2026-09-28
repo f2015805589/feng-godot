@@ -129,6 +129,8 @@ func run() -> void:
 	_fog.fog_inscattering_color = Color(1.0, 0.05, 0.05)
 	scene.add_child(_fog)
 	await settle(14)
+	if not check(root.use_debanding, "active height fog should enable viewport debanding"):
+		return
 	var target := RenderingServer.viewport_get_render_target(root.get_viewport_rid())
 	var matched := false
 	for snapshot in FogRuntime.snapshots():
@@ -247,8 +249,19 @@ func run() -> void:
 	var home_transform := _camera.global_transform
 	_camera.look_at_from_position(_camera.position, _camera.position + Vector3(0.0, 0.0, -20.0), Vector3.UP)
 	await settle(14)
-	var sun_pixel := center(await image())
+	var sun_image := await image()
+	var sun_pixel := center(sun_image)
 	print("Directional inscattering pixel: ", sun_pixel)
+	var sun_edge := sun_image.get_pixel(sun_image.get_width() * 3 / 4, sun_image.get_height() / 2)
+	scene.position = Vector3(100000.0, 0.0, -70000.0)
+	await settle(12)
+	var shifted_sun := await image()
+	if not check(color_distance(center(shifted_sun), sun_pixel) < 0.04
+			and color_distance(shifted_sun.get_pixel(shifted_sun.get_width() * 3 / 4,
+					shifted_sun.get_height() / 2), sun_edge) < 0.04,
+			"directional fog ray lost precision away from the world origin"):
+		return
+	scene.position = Vector3.ZERO
 	_camera.global_transform = home_transform
 	if not check(luminance(sun_pixel) > 0.05 and luminance(sun_pixel) < 0.6,
 			"directional inscattering differs from UE's normalized default lobe: %s" % sun_pixel):
@@ -261,6 +274,8 @@ func run() -> void:
 	# Disabling the component returns the frame to the baseline.
 	_fog.enabled = false
 	await settle(12)
+	if not check(not root.use_debanding, "disabling height fog should restore viewport debanding"):
+		return
 	var off_center := center(await image())
 	var off_sky := sky_pixel(await image())
 	if not check(off_sky.b > off_sky.r and absf(off_center.r - baseline_center.r) < 0.06,
@@ -268,6 +283,8 @@ func run() -> void:
 		return
 	_fog.enabled = true
 	await settle(10)
+	if not check(root.use_debanding, "reenabling height fog should restore viewport debanding"):
+		return
 
 	# A second viewport renders its own World3D with no FengHeightFog; the
 	# world-scoped snapshot must not leak into its target.
@@ -300,6 +317,8 @@ func run() -> void:
 	# Removing the node unpublishes the snapshot and unfogs the frame.
 	_fog.queue_free()
 	await settle(12)
+	if not check(not root.use_debanding, "removing height fog should restore viewport debanding"):
+		return
 	var removed := center(await image())
 	if not check(absf(removed.r - baseline_center.r) < 0.06, "removing the fog node left fog on screen: %s" % removed):
 		return
