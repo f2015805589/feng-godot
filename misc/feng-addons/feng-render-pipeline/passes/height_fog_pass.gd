@@ -10,6 +10,12 @@ extends FengRuntimeSnapshotPass
 const UBO_BINDING := 2
 const UBO_SIZE := 176 # mat4 + seven vec4.
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
+## Unreal's MaxObserverHeightDifference (65536 cm) in meters: the observer
+## height is clamped to this far above each active fog layer's height.
+const MAX_OBSERVER_HEIGHT_DIFFERENCE := 655.36
+## FLT_MAX placeholder used when no layer has density (matches Unreal's
+## MaxObserverHeight = FLT_MAX); kept below float32 max to avoid inf packing.
+const FLT_MAX := 3.0e38
 
 func _init() -> void:
 	inputs = _make_inputs()
@@ -60,9 +66,19 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	var density2 := float(snapshot.get("second_fog_density", 0.0))
 	var falloff2 := float(snapshot.get("second_fog_height_falloff", 0.0))
 	var height2 := float(snapshot.get("second_fog_height", 0.0))
-	# GlobalDensity = FogDensity * exp2(-FogHeightFalloff * (CameraZ - FogHeight)).
-	var global_density := density * pow(2.0, -falloff * (camera.origin.y - height))
-	var global_density2 := density2 * pow(2.0, -falloff2 * (camera.origin.y - height2))
+	# Unreal InitFogConstants: MaxObserverHeight is the lowest fog layer top
+	# (height + MaxObserverHeightDifference) among layers that have density,
+	# and the observer is clamped to it so fog stays world-anchored instead of
+	# riding the camera. The same clamped observer feeds every layer's
+	# CollapsedFogParameter, with the exponent bounded to [-125, 126].
+	var max_observer_height := FLT_MAX
+	if density > 0.0:
+		max_observer_height = minf(max_observer_height, height + MAX_OBSERVER_HEIGHT_DIFFERENCE)
+	if density2 > 0.0:
+		max_observer_height = minf(max_observer_height, height2 + MAX_OBSERVER_HEIGHT_DIFFERENCE)
+	var observer_y := minf(camera.origin.y, max_observer_height)
+	var global_density := density * pow(2.0, clampf(-falloff * (observer_y - height), -125.0, 126.0))
+	var global_density2 := density2 * pow(2.0, clampf(-falloff2 * (observer_y - height2), -125.0, 126.0))
 	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
 	var sun_direction: Variant = snapshot.get("sun_direction", Vector3.ZERO)
 	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
@@ -71,7 +87,7 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		var axis: Vector4 = inverse_view_projection[column]
 		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
 	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
-	values.append_array(PackedFloat32Array([global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0))]))
+	values.append_array(PackedFloat32Array([global_density, falloff, max_observer_height, float(snapshot.get("start_distance", 0.0))]))
 	values.append_array(PackedFloat32Array([global_density2, falloff2, density2, height2]))
 	values.append_array(PackedFloat32Array([density, height, 0.0, float(snapshot.get("cutoff_distance", 0.0))]))
 	if fog_color is Vector3:

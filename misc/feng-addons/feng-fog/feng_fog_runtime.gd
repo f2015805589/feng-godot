@@ -129,10 +129,12 @@ static func _publish() -> void:
 			snapshot["inscattering_start"] = -1.0
 		else:
 			# DirectionalLight3D shines along its -Z axis; the shader wants the
-			# direction toward the light.
+			# direction toward the light. Unreal multiplies the component's
+			# DirectionalInscatteringColor by the sun color's luminance.
 			snapshot["sun_direction"] = sun.global_transform.basis.z.normalized()
 			var sun_rgb := Vector3(sun.light_color.r, sun.light_color.g, sun.light_color.b) * sun.light_energy
-			snapshot["inscattering_color"] = snapshot["inscattering_color"] * sun_rgb
+			var sun_luminance := sun_rgb.x * 0.3 + sun_rgb.y * 0.59 + sun_rgb.z * 0.11
+			snapshot["inscattering_color"] = snapshot["inscattering_color"] * sun_luminance
 		snapshot["world_id"] = world_id
 		snapshot["fog_id"] = entry["id"]
 		snapshot["render_targets"] = _render_targets(entry["world"])
