@@ -70,14 +70,9 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	var sun_direction: Variant = snapshot.get("sun_direction", Vector3.ZERO)
 	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
 	var values := PackedFloat32Array()
-	for column in 4:
-		var axis: Vector4 = inverse_projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
+	_append_projection(values, inverse_projection)
 	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
-	for column in 3:
-		var axis: Vector3 = view_to_world.basis[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
+	_append_transform(values, view_to_world)
 	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
 	values.append_array(PackedFloat32Array([global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0))]))
 	values.append_array(PackedFloat32Array([global_density2, falloff2, density2, height2]))

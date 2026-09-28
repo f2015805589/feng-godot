@@ -390,10 +390,10 @@ func _test_pure_contracts() -> void:
 			"asymmetric panorama projects with Godot's non-mirrored equirectangular axes")
 	var env := Environment.new()
 	var lighting := Lighting.new()
-	lighting._watch_environment(env)
+	lighting._scan_environment(env)
 	var previous_signature: int = lighting._environment_signature
 	env.background_color = Color(0.1, 0.4, 0.8)
-	lighting._watch_environment(env)
+	lighting._scan_environment(env)
 	_check(lighting._environment_signature != previous_signature and lighting._sky_dirty,
 			"environment property changes invalidate cached sky SH")
 	var fake_data := FakeTerrainData.new()

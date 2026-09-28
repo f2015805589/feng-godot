@@ -290,17 +290,6 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	# after the matching, validated snapshot has made it all the way to the shader.
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
 
-func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-
-func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
-	var axes := [transform.basis.x, transform.basis.y, transform.basis.z]
-	for axis in axes:
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]))
-
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
 	var binding_data := super._collect_bindings(buffers, view, rd)
 	if _binding_error or _frame_snapshot.is_empty():

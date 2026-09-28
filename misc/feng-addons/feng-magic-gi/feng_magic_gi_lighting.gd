@@ -20,15 +20,18 @@ var _sky_dirty := true
 var _environment: Environment
 var _sky: Sky
 var _sky_material: Material
+var _cached_result := PackedFloat32Array()
+var _result_dirty := true
 
 func coefficients(volume: Node3D) -> PackedFloat32Array:
 	var now := Time.get_ticks_msec()
 	if now >= _next_scan:
 		_scan_scene(volume)
+		_scan_environment(_resolve_environment(volume))
 		_next_scan = now + SCENE_SCAN_MSEC
 
 	var environment := _resolve_environment(volume)
-	_watch_environment(environment)
+	_track_environment(environment)
 	var lights: Array[DirectionalLight3D] = []
 	var explicit_light = volume.get("sun")
 	if explicit_light is DirectionalLight3D and explicit_light.get_world_3d() == volume.get_world_3d():
@@ -38,13 +41,19 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 	var sky_sources := _lights.duplicate()
 	if explicit_light is DirectionalLight3D and not sky_sources.has(explicit_light):
 		sky_sources.append(explicit_light)
-	var current_source_signature := _source_fingerprint(sky_sources, _world)
+	var physical_units := bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false))
+	var current_source_signature := hash([_source_fingerprint(sky_sources, _world), physical_units])
 	if current_source_signature != _source_signature:
 		_source_signature = current_source_signature
 		_sky_dirty = true
+		_result_dirty = true
+	if environment != null and _update_sky(environment, now):
+		_result_dirty = true
+	if not _result_dirty:
+		return _cached_result
+	_result_dirty = false
 	var result := PackedFloat32Array()
 	result.resize(27)
-	var physical_units := bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false))
 	for light in lights:
 		if not is_instance_valid(light) or not light.is_inside_tree() or not light.is_visible_in_tree() \
 				or light.get_world_3d() != volume.get_world_3d():
@@ -66,12 +75,11 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 			result[k * 3 + 1] += color.g * energy * basis[k]
 			result[k * 3 + 2] += color.b * energy * basis[k]
 
-	if environment != null:
-		_update_sky(environment, now)
-		if _sky_sh.size() == 27:
-			for i in 27:
-				result[i] += _sky_sh[i]
-	return result
+	if _sky_sh.size() == 27:
+		for i in 27:
+			result[i] += _sky_sh[i]
+	_cached_result = result
+	return _cached_result
 
 func _resolve_environment(volume: Node3D) -> Environment:
 	var explicit: Environment = volume.get("lighting_environment")
@@ -102,7 +110,30 @@ func _scan(node: Node, world: World3D) -> void:
 	for child in node.get_children():
 		_scan(child, world)
 
-func _watch_environment(environment: Environment) -> void:
+## Cheap per-frame check: only object identities are compared and the `changed`
+## signal wiring is maintained. The deep property scan lives in
+## _scan_environment and runs at the scene-scan cadence instead.
+func _track_environment(environment: Environment) -> void:
+	var sky: Sky = environment.sky if environment != null else null
+	var material: Material = sky.sky_material if sky != null else null
+	if environment == _environment and sky == _sky and material == _sky_material:
+		return
+	for resource in [_environment, _sky, _sky_material]:
+		if resource != null and resource.changed.is_connected(_on_sky_changed):
+			resource.changed.disconnect(_on_sky_changed)
+	_environment = environment
+	_sky = sky
+	_sky_material = material
+	for resource in [_environment, _sky, _sky_material]:
+		if resource != null and not resource.changed.is_connected(_on_sky_changed):
+			resource.changed.connect(_on_sky_changed)
+	_sky_sh.clear()
+	_sky_dirty = true
+	_result_dirty = true
+
+## Deep environment signature; expensive material property reflection runs at
+## SCENE_SCAN_MSEC cadence rather than every frame.
+func _scan_environment(environment: Environment) -> void:
 	var sky: Sky = environment.sky if environment != null else null
 	var material: Material = sky.sky_material if sky != null else null
 	var material_state: Array = []
@@ -129,32 +160,23 @@ func _watch_environment(environment: Environment) -> void:
 	if signature != _environment_signature:
 		_environment_signature = signature
 		_sky_dirty = true
-	if environment == _environment and sky == _sky and material == _sky_material:
-		return
-	for resource in [_environment, _sky, _sky_material]:
-		if resource != null and resource.changed.is_connected(_on_sky_changed):
-			resource.changed.disconnect(_on_sky_changed)
-	_environment = environment
-	_sky = sky
-	_sky_material = material
-	for resource in [_environment, _sky, _sky_material]:
-		if resource != null and not resource.changed.is_connected(_on_sky_changed):
-			resource.changed.connect(_on_sky_changed)
-	_sky_sh.clear()
-	_sky_dirty = true
+		_result_dirty = true
 
-func _update_sky(environment: Environment, now: int) -> void:
+## Returns true when the sky SH changed, so callers can invalidate cached
+## coefficient results.
+func _update_sky(environment: Environment, now: int) -> bool:
 	if not _sky_dirty or now < _next_sky_update:
-		return
+		return false
 	_next_sky_update = now + SKY_REFRESH_MSEC
 	var image := RenderingServer.environment_bake_panorama(
 			environment.get_rid(), false, SKY_PANORAMA_SIZE)
 	if image == null or image.is_empty():
 		_sky_sh.clear()
 		_sky_dirty = false
-		return
+		return true
 	_sky_sh = project_panorama(image, Basis.from_euler(environment.sky_rotation))
 	_sky_dirty = false
+	return true
 
 func _on_sky_changed() -> void:
 	_sky_dirty = true
