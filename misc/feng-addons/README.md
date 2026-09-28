@@ -17,6 +17,11 @@ conflicting addon yourself. The engine does not delete or back up these files.
 Changes to scripts and assets are visible through the links immediately.
 Native DLLs still need their own build; close editors using them before rebuilding:
 
+On Windows, run `build-feng-godot.bat` from the repository root to build the
+x86_64 editor with D3D12 and both native debug DLLs in one step. Double-clicking
+keeps the result window open; use `--no-pause` from a terminal. GDScript addons
+use their source files directly.
+
 ```powershell
 scons -C misc/feng-addons/feng-idweight-terrain/native platform=windows target=template_debug arch=x86_64
 scons -C misc/feng-addons/feng-renderdoc-capture/native platform=windows target=template_debug arch=x86_64
