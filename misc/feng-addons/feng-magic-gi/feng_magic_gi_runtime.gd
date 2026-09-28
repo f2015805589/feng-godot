@@ -17,6 +17,8 @@ static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
 static var _last_frame := -1
 static var _next_viewport_scan := 0
+static var _targets_version := 0
+static var _targets_cache: Dictionary = {}
 
 static func register(volume: FMagicGIVolume) -> void:
 	var id := volume.get_instance_id()
@@ -38,11 +40,17 @@ static func unregister(volume: FMagicGIVolume) -> void:
 static func register_viewport(viewport: Viewport) -> void:
 	if viewport == null or not is_instance_valid(viewport):
 		return
-	_viewports[viewport.get_instance_id()] = weakref(viewport)
+	var id := viewport.get_instance_id()
+	var existing: WeakRef = _viewports.get(id)
+	if existing != null and existing.get_ref() == viewport:
+		return
+	_viewports[id] = weakref(viewport)
+	_targets_version += 1
 
 static func unregister_viewport(viewport: Viewport) -> void:
 	if viewport != null and is_instance_valid(viewport):
-		_viewports.erase(viewport.get_instance_id())
+		if _viewports.erase(viewport.get_instance_id()):
+			_targets_version += 1
 		_publish()
 
 static func publish(volume: FMagicGIVolume) -> void:
@@ -119,6 +127,7 @@ static func _refresh_viewports() -> void:
 		var viewport: Viewport = reference.get_ref() if reference != null else null
 		if viewport == null:
 			_viewports.erase(id)
+			_targets_version += 1
 
 static func _scan_viewports(node: Node) -> void:
 	if node is Viewport:
@@ -130,6 +139,10 @@ static func _render_targets(world: World3D) -> Array[RID]:
 	var targets: Array[RID] = []
 	if world == null:
 		return targets
+	var world_id := world.get_instance_id()
+	var cached: Dictionary = _targets_cache.get(world_id, {})
+	if not cached.is_empty() and int(cached.get("version", -1)) == _targets_version:
+		return cached["targets"]
 	for id in _viewports.keys():
 		var reference: WeakRef = _viewports[id]
 		var viewport: Viewport = reference.get_ref() if reference != null else null
@@ -138,6 +151,10 @@ static func _render_targets(world: World3D) -> Array[RID]:
 		var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
 		if target.is_valid() and not targets.has(target):
 			targets.append(target)
+	_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
+	if _targets_cache.size() > 32:
+		_targets_cache.clear()
+		_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
 	return targets
 
 static func _publish() -> void:

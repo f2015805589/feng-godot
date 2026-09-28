@@ -19,6 +19,9 @@ static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
 static var _sequence := 0
+static var _last_frame := -1
+static var _targets_version := 0
+static var _targets_cache: Dictionary = {}
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -35,13 +38,19 @@ static func unregister(fog: FengHeightFog) -> void:
 static func register_viewport(viewport: Viewport) -> void:
 	if viewport == null or not is_instance_valid(viewport):
 		return
-	_viewports[viewport.get_instance_id()] = weakref(viewport)
+	var id := viewport.get_instance_id()
+	var existing: WeakRef = _viewports.get(id)
+	if existing != null and existing.get_ref() == viewport:
+		return
+	_viewports[id] = weakref(viewport)
+	_targets_version += 1
 
 static func unregister_viewport(viewport: Viewport) -> void:
 	if viewport != null and is_instance_valid(viewport):
 		var id := viewport.get_instance_id()
 		_restore_debanding(id, viewport)
-		_viewports.erase(id)
+		if _viewports.erase(id):
+			_targets_version += 1
 		_publish()
 
 static func _restore_debanding(id: int, viewport: Viewport) -> void:
@@ -59,6 +68,7 @@ static func _sync_debanding(selected: Dictionary) -> void:
 		if viewport == null:
 			_viewports.erase(id)
 			_debanding_original.erase(id)
+			_targets_version += 1
 			continue
 		var world := viewport.find_world_3d() if viewport.is_inside_tree() else null
 		var fog_active := world != null and selected.has(world.get_instance_id())
@@ -75,8 +85,13 @@ static func publish(fog: FengHeightFog) -> void:
 	_publish()
 
 ## Called from each fog node's _process: republishes so a moving sun or an
-## animated parameter keeps its world snapshot current.
+## animated parameter keeps its world snapshot current. The frame guard keeps
+## several fog nodes from republishing the same snapshot set within one frame.
 static func tick() -> void:
+	var frame := Engine.get_process_frames()
+	if _last_frame == frame:
+		return
+	_last_frame = frame
 	_publish()
 
 static func snapshots() -> Array[Dictionary]:
@@ -89,17 +104,26 @@ static func _render_targets(world: World3D) -> Array[RID]:
 	var targets: Array[RID] = []
 	if world == null:
 		return targets
+	var world_id := world.get_instance_id()
+	var cached: Dictionary = _targets_cache.get(world_id, {})
+	if not cached.is_empty() and int(cached.get("version", -1)) == _targets_version:
+		return cached["targets"]
 	for id in _viewports.keys():
 		var reference: WeakRef = _viewports[id]
 		var viewport: Viewport = reference.get_ref() if reference != null else null
 		if viewport == null:
 			_viewports.erase(id)
+			_targets_version += 1
 			continue
 		if not viewport.is_inside_tree() or viewport.find_world_3d() != world:
 			continue
 		var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
 		if target.is_valid() and not targets.has(target):
 			targets.append(target)
+	_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
+	if _targets_cache.size() > 32:
+		_targets_cache.clear()
+		_targets_cache[world_id] = {"version": _targets_version, "targets": targets}
 	return targets
 
 ## The sun for a world: the component's explicit light when set, otherwise the

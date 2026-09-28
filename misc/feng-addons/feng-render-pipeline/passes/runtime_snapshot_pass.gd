@@ -103,6 +103,19 @@ func _ubo_uniform(binding: int) -> RDUniform:
 	uniform_buffer.add_id(_ubo)
 	return uniform_buffer
 
+## std430 packing helpers shared by snapshot passes' frame UBOs: a Projection is
+## four vec4 columns, a Transform3D is three basis vec4s plus an origin vec4.
+static func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
+	for column in 4:
+		var axis: Vector4 = projection[column]
+		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
+
+static func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
+	var axes := [transform.basis.x, transform.basis.y, transform.basis.z]
+	for axis in axes:
+		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
+	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]))
+
 func _cleanup(rd: RenderingDevice) -> void:
 	super._cleanup(rd)
 	if rd != null and _ubo.is_valid():

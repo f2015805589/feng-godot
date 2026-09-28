@@ -92,6 +92,7 @@ var _bake_assigning_data := false
 var _bake_generation := 0
 var _next_geometry_check := 0
 var _quick_scene_signature := 0
+var _pending_scene_signature := 0
 var _current_scene_signature := 0
 var _validity_instance_id := 0
 var _validity_bake_version := -1
@@ -116,9 +117,15 @@ func _process(_delta: float) -> void:
 	if now >= _next_geometry_check and not _baking:
 		_next_geometry_check = now + 1000
 		var quick_signature := Placement.quick_signature(self)
-		if quick_signature != _quick_scene_signature:
-			_quick_scene_signature = quick_signature
+		if quick_signature == _quick_scene_signature:
+			_pending_scene_signature = quick_signature
+		elif quick_signature == _pending_scene_signature:
+			# Geometry stayed identical for a full interval; resample once. While
+			# things keep moving the signature changes every check, and the heavy
+			# triangle collect + BVH rebuild is deferred until motion settles.
 			refresh_surface_points()
+		else:
+			_pending_scene_signature = quick_signature
 		Runtime.refresh_emission_diagnostics(self)
 		var emission_warning := Runtime.emission_warning(self)
 		if emission_warning != _last_emission_warning:
