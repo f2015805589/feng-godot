@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c8e3s7c2chn7k"
+path="res://.godot/imported/eye_adaptation_apply.glsl-bc6af4084851d9e9c2113e33340a7125.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation_apply.glsl"
+dest_files=["res://.godot/imported/eye_adaptation_apply.glsl-bc6af4084851d9e9c2113e33340a7125.res"]
+
+[params]
+

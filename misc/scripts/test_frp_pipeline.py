@@ -117,6 +117,11 @@ run("transparent", ["--script", str(ROOT / "misc/scripts/tests/frp_transparent.g
 # and signalled to the overlay shader as a shader keyword (specialization constant).
 run("post", ["--script", str(ROOT / "misc/scripts/tests/frp_post.gd")],
     "PASS post effects run before or after tone mapping, selected by a shader keyword")
+# The built-in Eye Adaptation pass meters the frame's luminance (64-bin log
+# histogram), adapts temporally and folds the colour buffer by scale / adapted,
+# the addon equivalent of UE's pre-exposure.
+run("eye_adaptation", ["--script", str(ROOT / "misc/scripts/tests/frp_eye_adaptation.gd")],
+    "PASS FRP eye adaptation pass meters, adapts and folds the frame in both directions")
 # The Core surface a plugin pass runs on: a scripted pass takes over an engine pass
 # and then drives a whole frame through the granular primitives.
 run("context", ["--script", str(ROOT / "misc/scripts/tests/frp_context.gd")],
