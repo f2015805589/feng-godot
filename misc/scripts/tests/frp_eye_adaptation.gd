@@ -58,6 +58,7 @@ func _make_scene(brightness: float) -> void:
 	var environment := Environment.new()
 	environment.background_mode = Environment.BG_COLOR
 	environment.background_color = Color(0.0, 0.0, 0.0)
+	environment.tonemap_mode = Environment.TONE_MAPPER_AGX
 	var world_environment := WorldEnvironment.new()
 	world_environment.environment = environment
 	scene.add_child(world_environment)
@@ -105,6 +106,8 @@ func run() -> void:
 			"bright scene must be exposed down: off=%s settled=%s" % [bright_off, bright_settled])
 	require(absf(bright_settled.get_luminance() - bright_first.get_luminance()) < 0.15,
 			"exposure must be temporally stable once converged: first=%s settled=%s" % [bright_first, bright_settled])
+	require(bright_settled.get_luminance() > 0.4,
+			"folded output must sit near the scale target, not black: settled=%s" % [bright_settled])
 
 	# Dark scene: exposure must fold the frame UP.
 	await _make_scene(0.02)
@@ -114,6 +117,22 @@ func run() -> void:
 	print("dark off=%s settled=%s" % [dark_off, dark_settled])
 	require(dark_settled.get_luminance() > dark_off.get_luminance() + 0.05,
 			"dark scene must be exposed up: off=%s settled=%s" % [dark_off, dark_settled])
+
+	# The defining property of pre-exposure: once converged, the same scene at
+	# wildly different absolute energies displays identically (UE's promise).
+	await _make_scene(6.0)
+	_enable_eye_adaptation()
+	await frame()
+	var energy6 := (await frame()).get_pixelv(CENTER)
+	await _make_scene(60000.0)
+	_enable_eye_adaptation()
+	await frame()
+	var energy60000 := (await frame()).get_pixelv(CENTER)
+	print("energy6=%s energy60000=%s" % [energy6, energy60000])
+	require(energy6.get_luminance() > 0.4 and energy6.get_luminance() < 0.99,
+			"converged output must sit near the scale target: %s" % [energy6])
+	require(absf(energy6.get_luminance() - energy60000.get_luminance()) < 0.08,
+			"converged output must be energy-invariant: 6=%s 60000=%s" % [energy6, energy60000])
 
 	print("PASS FRP eye adaptation pass meters, adapts and folds the frame in both directions")
 	quit()
