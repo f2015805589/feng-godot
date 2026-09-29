@@ -72,7 +72,6 @@ private:
 	uint32_t max_cluster_elements = 512;
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
 	RendererRD::VRS *vrs = nullptr;
-	float luminance_multiplier = -1.0f;
 	uint64_t auto_exposure_version = 1;
 	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
 
@@ -194,9 +193,6 @@ public:
 	void set_preferred_data_format(const RD::DataFormat p_preferred_data_format) { preferred_data_format = p_preferred_data_format; }
 	RD::DataFormat get_preferred_data_format() const { return preferred_data_format; }
 	RD::DataFormat get_base_data_format() const { return force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format; }
-	// Dynamic luminance multiplier driven by eye adaptation (UE-style
-	// OneOverPreExposure). <= 0 falls back to the static range fitter.
-	void set_luminance_multiplier(const float p_multiplier) { luminance_multiplier = p_multiplier; }
 	float get_luminance_multiplier() const;
 	void set_vrs(RendererRD::VRS *p_vrs) { vrs = p_vrs; }
 	RSE::ViewportVRSMode get_vrs_mode() { return vrs_mode; }

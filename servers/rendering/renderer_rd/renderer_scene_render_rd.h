@@ -117,11 +117,6 @@ protected:
 	// between them, or after the tone mapping when p_defer_present left the present
 	// step to the caller.
 	void _render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa = false);
-	// Auto exposure metering: stock implementation uses the Luminance mean
-	// reduction; a renderer may override to plug a different metering
-	// (e.g. UE-style histogram eye adaptation).
-	virtual void _update_auto_exposure(const RenderDataRD *p_render_data, float p_time_step);
-	virtual RID _auto_exposure_luminance_texture(Ref<RenderSceneBuffersRD> p_render_buffers);
 	void _render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present = false);
 	void _post_process_subpass(RID p_source_texture, RID p_framebuffer, const RenderDataRD *p_render_data);
 	void _disable_clear_request(const RenderDataRD *p_render_data);

@@ -859,9 +859,6 @@ uint32_t RenderSceneBuffersRD::get_vrs_usage_bits() {
 }
 
 float RenderSceneBuffersRD::get_luminance_multiplier() const {
-	if (luminance_multiplier > 0.0f) {
-		return luminance_multiplier;
-	}
 	// On mobile renderer when not using HDR2D we need to scale HDR values by two
 	// to fit 0-2 range color values into a UNORM buffer.
 	return (force_hdr || can_be_storage) ? 1.0 : 2.0;

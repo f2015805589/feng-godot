@@ -1716,28 +1716,6 @@ void RenderFRPClustered::_fill_missing_velocity(Ref<RenderSceneBuffersRD> p_rend
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderFRPClustered::_update_auto_exposure(const RenderDataRD *p_render_data, float p_time_step) {
-	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
-
-	Ref<RendererRD::EyeAdaptation::EyeAdaptationBuffers> buffers = eye_adaptation->get_buffers(rb);
-
-	uint64_t auto_exposure_version = RSG::camera_attributes->camera_attributes_get_auto_exposure_version(p_render_data->camera_attributes);
-	bool set_immediate = auto_exposure_version != rb->get_auto_exposure_version();
-	rb->set_auto_exposure_version(auto_exposure_version);
-
-	double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * p_time_step;
-	float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
-	float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
-
-	// Metered and adapted in luminance space (buffer luminance * multiplier);
-	// the 1x1 result is stored back in buffer space for the tonemap.
-	eye_adaptation->process(rb->get_internal_texture(), rb->get_internal_size(), buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, rb->get_luminance_multiplier(), set_immediate);
-}
-
-RID RenderFRPClustered::_auto_exposure_luminance_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
-	return eye_adaptation->get_current_luminance_buffer(p_render_buffers);
-}
-
 void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -1793,23 +1771,6 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	p_render_data->cluster_max_elements = current_cluster_builder->get_max_cluster_elements();
 
 	_update_vrs(rb);
-
-	// Pre-exposure (UE-style): fold last frame's adapted luminance into this
-	// frame's luminance multiplier so the HDR buffer stays near the middle-gray
-	// target. Reading back the 1x1 result here stalls on last frame's
-	// adaptation dispatch which finished long ago, so the cost is bounded.
-	if (!is_reflection_probe && rb.is_valid()) {
-		if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-			float adapted_b = eye_adaptation->read_adapted_luminance(rb);
-			if (adapted_b > 0.0f) {
-				float adapted = adapted_b * rb->get_luminance_multiplier(); // buffer space -> luminance space
-				float key = MAX(RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes), 0.0001f);
-				rb->set_luminance_multiplier(adapted / key);
-			}
-		} else {
-			rb->set_luminance_multiplier(-1.0f);
-		}
-	}
 
 	RENDER_TIMESTAMP("Setup 3D Scene");
 
@@ -2628,7 +2589,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 						RID exposure;
 						if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-							exposure = _auto_exposure_luminance_texture(rb);
+							exposure = luminance->get_current_luminance_buffer(rb);
 						}
 
 						RD::get_singleton()->draw_command_begin_label("FSR2");
@@ -2675,7 +2636,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 						RID exposure;
 						if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-							exposure = _auto_exposure_luminance_texture(rb);
+							exposure = luminance->get_current_luminance_buffer(rb);
 						}
 
 						RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
@@ -5031,7 +4992,6 @@ RenderFRPClustered::RenderFRPClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
-	eye_adaptation = memnew(RendererRD::EyeAdaptation);
 	{
 		Vector<String> modes;
 		modes.push_back("\n");
@@ -5059,11 +5019,6 @@ RenderFRPClustered::~RenderFRPClustered() {
 	if (fsr2_effect) {
 		memdelete(fsr2_effect);
 		fsr2_effect = nullptr;
-	}
-
-	if (eye_adaptation != nullptr) {
-		memdelete(eye_adaptation);
-		eye_adaptation = nullptr;
 	}
 
 #ifdef METAL_MFXTEMPORAL_ENABLED

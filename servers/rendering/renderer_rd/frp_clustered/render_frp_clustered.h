@@ -35,7 +35,6 @@
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/frp_clustered/scene_shader_frp_clustered.h"
-#include "servers/rendering/renderer_rd/effects/eye_adaptation.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
@@ -781,7 +780,6 @@ private:
 	RendererRD::TAA *taa = nullptr;
 	RendererRD::FSR2Effect *fsr2_effect = nullptr;
 	RendererRD::SSEffects *ss_effects = nullptr;
-	RendererRD::EyeAdaptation *eye_adaptation = nullptr;
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
@@ -840,8 +838,6 @@ protected:
 
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) override;
 	virtual void _render_buffers_debug_draw(const RenderDataRD *p_render_data) override;
-	virtual void _update_auto_exposure(const RenderDataRD *p_render_data, float p_time_step) override;
-	virtual RID _auto_exposure_luminance_texture(Ref<RenderSceneBuffersRD> p_render_buffers) override;
 
 	virtual void _render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region, float p_exposure_normalization) override;
 	virtual void _render_uv2(const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) override;
