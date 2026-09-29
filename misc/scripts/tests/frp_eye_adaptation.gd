@@ -76,6 +76,7 @@ func _enable_eye_adaptation() -> void:
 	var pass_script = load("res://addons/feng-render-pipeline/passes/eye_adaptation_pass.gd")
 	require(pass_script != null, "eye adaptation pass script did not load")
 	ea_pass = pass_script.new()
+	ea_pass.extend_luminance_range = true
 	ea_pass.resource_name = "Eye Adaptation"
 	# Place it before the native Post Process / Tonemap entry: metering happens on
 	# the lit HDR buffer and the folding acts as pre-exposure for everything after.
@@ -119,20 +120,38 @@ func run() -> void:
 			"dark scene must be exposed up: off=%s settled=%s" % [dark_off, dark_settled])
 
 	# The defining property of pre-exposure: once converged, the same scene at
-	# wildly different absolute energies displays identically (UE's promise).
+	# wildly different absolute energies displays identically (UE's promise)
+	# as long as the metered luminance stays inside the metering range.
 	await _make_scene(6.0)
 	_enable_eye_adaptation()
 	await frame()
 	var energy6 := (await frame()).get_pixelv(CENTER)
-	await _make_scene(60000.0)
+	await _make_scene(600.0)
 	_enable_eye_adaptation()
 	await frame()
-	var energy60000 := (await frame()).get_pixelv(CENTER)
-	print("energy6=%s energy60000=%s" % [energy6, energy60000])
+	var energy600 := (await frame()).get_pixelv(CENTER)
+	print("energy6=%s energy600=%s" % [energy6, energy600])
 	require(energy6.get_luminance() > 0.4 and energy6.get_luminance() < 0.99,
 			"converged output must sit near the scale target: %s" % [energy6])
-	require(absf(energy6.get_luminance() - energy60000.get_luminance()) < 0.08,
-			"converged output must be energy-invariant: 6=%s 60000=%s" % [energy6, energy60000])
+	require(absf(energy6.get_luminance() - energy600.get_luminance()) < 0.08,
+			"converged output must be energy-invariant: 6=%s 600=%s" % [energy6, energy600])
+
+	# UE's Extend toggle: with the default [0.0003, 64] metering range the same
+	# bright scene saturates the histogram and stays over-exposed.
+	await _make_scene(600.0)
+	var pass_script2 = load("res://addons/feng-render-pipeline/passes/eye_adaptation_pass.gd")
+	ea_pass = pass_script2.new()
+	ea_pass.extend_luminance_range = false
+	for i in renderer.passes.size():
+		if renderer.passes[i].get("native_id") != null and int(renderer.passes[i].native_id) == 7:
+			renderer.passes.insert(i, ea_pass)
+			break
+	renderer.apply(camera.compositor)
+	await frame()
+	var unextended := (await frame()).get_pixelv(CENTER)
+	print("unextended=%s extended=%s" % [unextended, energy600])
+	require(unextended.get_luminance() > energy600.get_luminance() + 0.02,
+			"without the extended range the frame must stay over-exposed: %s vs %s" % [unextended, energy600])
 
 	print("PASS FRP eye adaptation pass meters, adapts and folds the frame in both directions")
 	quit()
