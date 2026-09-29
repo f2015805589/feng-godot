@@ -1,6 +1,6 @@
 extends SceneTree
 
-# The built-in Eye Adaptation pass meters the frame's luminance with a 64-bin
+# The seeded Eye Adaptation pass meters the frame's luminance with a 64-bin
 # log histogram, adapts temporally, then folds the color buffer by
 # scale / adapted — the addon equivalent of UE's pre-exposure.
 #
@@ -72,22 +72,18 @@ func _make_scene(brightness: float) -> void:
 	require(renderer.get_validation_warnings().is_empty(), "the default pipeline must validate clean: %s" % [renderer.get_validation_warnings()])
 
 
-func _enable_eye_adaptation() -> void:
-	var pass_script = load("res://addons/feng-render-pipeline/passes/eye_adaptation_pass.gd")
-	require(pass_script != null, "eye adaptation pass script did not load")
-	ea_pass = pass_script.new()
-	ea_pass.extend_luminance_range = true
-	ea_pass.resource_name = "Eye Adaptation"
-	# Place it before the native Post Process / Tonemap entry: metering happens on
-	# the lit HDR buffer and the folding acts as pre-exposure for everything after.
-	var post_index := -1
-	for i in renderer.passes.size():
-		var entry = renderer.passes[i]
-		if entry.get("native_id") != null and int(entry.native_id) == 7:
-			post_index = i
+func _set_eye_adaptation(extend = null) -> void:
+	# The seeded pipeline already carries the library entry: drive it rather
+	# than stacking a second metering pass. extend == null disables the pass.
+	ea_pass = null
+	for pass_entry in renderer.passes:
+		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation":
+			ea_pass = pass_entry
 			break
-	require(post_index >= 0, "renderer does not expose the Post Process / Tonemap entry")
-	renderer.passes.insert(post_index, ea_pass)
+	require(ea_pass != null, "the seeded pipeline must carry the Eye Adaptation pass")
+	ea_pass.enabled = extend != null
+	if extend != null:
+		ea_pass.extend_luminance_range = extend
 	renderer.apply(camera.compositor)
 
 
@@ -98,8 +94,9 @@ func run() -> void:
 
 	# Bright scene: exposure must fold the frame DOWN towards the scale target.
 	await _make_scene(16.0)
+	_set_eye_adaptation()
 	var bright_off := (await frame()).get_pixelv(CENTER)
-	_enable_eye_adaptation()
+	_set_eye_adaptation(true)
 	var bright_first := (await frame()).get_pixelv(CENTER)
 	var bright_settled := (await frame()).get_pixelv(CENTER)
 	print("bright off=%s first=%s settled=%s" % [bright_off, bright_first, bright_settled])
@@ -112,8 +109,9 @@ func run() -> void:
 
 	# Dark scene: exposure must fold the frame UP.
 	await _make_scene(0.02)
+	_set_eye_adaptation()
 	var dark_off := (await frame()).get_pixelv(CENTER)
-	_enable_eye_adaptation()
+	_set_eye_adaptation(true)
 	var dark_settled := (await frame()).get_pixelv(CENTER)
 	print("dark off=%s settled=%s" % [dark_off, dark_settled])
 	require(dark_settled.get_luminance() > dark_off.get_luminance() + 0.05,
@@ -123,11 +121,11 @@ func run() -> void:
 	# wildly different absolute energies displays identically (UE's promise)
 	# as long as the metered luminance stays inside the metering range.
 	await _make_scene(6.0)
-	_enable_eye_adaptation()
+	_set_eye_adaptation(true)
 	await frame()
 	var energy6 := (await frame()).get_pixelv(CENTER)
 	await _make_scene(600.0)
-	_enable_eye_adaptation()
+	_set_eye_adaptation(true)
 	await frame()
 	var energy600 := (await frame()).get_pixelv(CENTER)
 	print("energy6=%s energy600=%s" % [energy6, energy600])
@@ -139,14 +137,7 @@ func run() -> void:
 	# UE's Extend toggle: with the default [0.0003, 64] metering range the same
 	# bright scene saturates the histogram and stays over-exposed.
 	await _make_scene(600.0)
-	var pass_script2 = load("res://addons/feng-render-pipeline/passes/eye_adaptation_pass.gd")
-	ea_pass = pass_script2.new()
-	ea_pass.extend_luminance_range = false
-	for i in renderer.passes.size():
-		if renderer.passes[i].get("native_id") != null and int(renderer.passes[i].native_id) == 7:
-			renderer.passes.insert(i, ea_pass)
-			break
-	renderer.apply(camera.compositor)
+	_set_eye_adaptation(false)
 	await frame()
 	var unextended := (await frame()).get_pixelv(CENTER)
 	print("unextended=%s extended=%s" % [unextended, energy600])

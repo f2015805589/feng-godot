@@ -119,6 +119,13 @@ func run() -> void:
 	var renderer_script = load("res://addons/feng-render-pipeline/renderer.gd")
 	require(renderer_script != null, "FRP renderer script did not load")
 	var renderer = renderer_script.new()
+	# This test asserts the colour balance a light produces. The seeded Eye
+	# Adaptation pass folds every scene towards the same display target, which
+	# would clip that balance under the default linear tonemap, so it is
+	# disabled here — transparent forward shading is what is being verified.
+	for pass_entry in renderer.passes:
+		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation":
+			pass_entry.enabled = false
 	var compositor := Compositor.new()
 	camera.compositor = compositor
 	renderer.apply(compositor)

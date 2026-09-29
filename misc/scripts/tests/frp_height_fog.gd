@@ -99,6 +99,10 @@ func run() -> void:
 	for pass_entry in _renderer.passes:
 		if pass_entry.stable_id == &"library:height_fog":
 			_fog_pass = pass_entry
+		if pass_entry.stable_id == &"library:eye_adaptation":
+			# The asserts below read inscatter colours; exposure folding would
+			# scale them, so the seeded metering pass stays out of this test.
+			pass_entry.enabled = false
 	if not check(_fog_pass != null and _fog_pass.enabled, "fresh renderer did not seed the enabled Height Fog pass"):
 		return
 	var compositor: Compositor = compositor_script.new()

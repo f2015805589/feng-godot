@@ -205,6 +205,11 @@ func _library_key(value: Object) -> String:
 	var shader = _read_property(value, "shader_file", null)
 	if shader is Resource:
 		return shader.resource_path
+	# Passes that own several shaders (Eye Adaptation) carry no shader_file:
+	# their seeded identity is the stable id the manifest recorded.
+	var stable = _read_property(value, "stable_id", "")
+	if str(stable).begins_with("library:"):
+		return str(stable)
 	return ""
 
 func _library_matches(value: Object, manifest_path: String) -> bool:
@@ -671,17 +676,18 @@ func run() -> void:
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
 	# Manifest metadata seeds Color Grade, enabled Magic GI after Lighting, enabled
-	# Height Fog after Sky, and disabled Debug Buffers after Post Process. Other
-	# effects remain opt-in.
+	# Height Fog after Sky, enabled Eye Adaptation before Post Process, and disabled
+	# Debug Buffers after Post Process. Other effects remain opt-in.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
 			library_entries.append(value)
-	require(library_entries.size() == 4, "the default pipeline must seed Color Grade, Magic GI, Height Fog and Debug Buffers, got %d library entries" % library_entries.size())
-	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 4,
-		"the default pipeline must have eight native and four seeded library entries, got %d" % unified_renderer.passes.size())
+	require(library_entries.size() == 5, "the default pipeline must seed Color Grade, Magic GI, Height Fog, Eye Adaptation and Debug Buffers, got %d library entries" % library_entries.size())
+	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 5,
+		"the default pipeline must have eight native and five seeded library entries, got %d" % unified_renderer.passes.size())
 	var seeded_magic_index := -1
 	var seeded_fog_index := -1
+	var seeded_eye_index := -1
 	var seeded_debug_index := -1
 	var seeded_lighting_index := -1
 	var seeded_sky_index := -1
@@ -699,6 +705,9 @@ func run() -> void:
 		if String(entry.stable_id) == "library:height_fog":
 			seeded_fog_index = i
 			require(entry.enabled, "Height Fog must be enabled in the fresh default pipeline")
+		if String(entry.stable_id) == "library:eye_adaptation":
+			seeded_eye_index = i
+			require(entry.enabled, "Eye Adaptation must be enabled in the fresh default pipeline")
 		if String(entry.stable_id) == "library:debug_buffers":
 			seeded_debug_index = i
 			require(not entry.enabled, "Debug Buffers must be disabled in the fresh default pipeline")
@@ -706,6 +715,8 @@ func run() -> void:
 		"Magic GI must be anchored after Lighting and before Sky")
 	require(seeded_sky_index < seeded_fog_index and seeded_fog_index < seeded_transparent_index,
 		"Height Fog must be anchored after Sky and before Transparent")
+	require(seeded_eye_index >= 0 and seeded_eye_index < seeded_post_index,
+		"Eye Adaptation must fold the lit HDR frame before Post Process")
 	require(seeded_debug_index > seeded_post_index, "Debug Buffers must be anchored after Post Process")
 	var default_debug = unified_renderer.passes[seeded_debug_index]
 	require(not default_debug.needs_motion_vectors, "the default diffuse debug selection must not request motion-vector attachments")
