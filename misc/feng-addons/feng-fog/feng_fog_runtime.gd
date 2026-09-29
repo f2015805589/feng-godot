@@ -180,7 +180,18 @@ static func _publish() -> void:
 			# direction toward the light. Unreal multiplies the component's
 			# DirectionalInscatteringColor by the sun color's luminance.
 			snapshot["sun_direction"] = sun.global_transform.basis.z.normalized()
-			var sun_rgb := Vector3(sun.light_color.r, sun.light_color.g, sun.light_color.b) * sun.light_energy
+			# Match DirectionalLightData in light_storage.cpp: non-physical
+			# lights carry PI in their energy, while physical directional lights
+			# multiply their artist energy by the authored illuminance in lux.
+			var sun_energy := sun.light_energy
+			if bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)):
+				sun_energy *= float(sun.get("light_intensity_lux"))
+			else:
+				sun_energy *= PI
+			if sun.light_negative:
+				sun_energy *= -1.0
+			var linear_sun_color := sun.light_color.srgb_to_linear()
+			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
 			# UE 5.7 defaults to the working color space's luminance factors;
 			# Godot's linear sRGB lights use the Rec.709 factors.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722

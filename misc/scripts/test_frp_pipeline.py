@@ -16,10 +16,11 @@ parser.add_argument("--binary", default=None,
 args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
 shutil.copytree(ROOT / "misc/feng-addons/feng-render-pipeline", project / "addons/feng-render-pipeline")
+shutil.copytree(ROOT / "misc/feng-addons/feng-fog", project / "addons/feng-fog")
 # The editor auto-links sibling addons. Keep this regression isolated from their
 # native DLL reloads, capture injection and editor tools, including concurrent runs.
 for addon in (ROOT / "misc/feng-addons").iterdir():
-    if addon.name != "feng-render-pipeline" and (addon / "plugin.cfg").is_file():
+    if addon.name not in ("feng-render-pipeline", "feng-fog") and (addon / "plugin.cfg").is_file():
         placeholder = project / "addons" / addon.name
         placeholder.mkdir()
         (placeholder / ".gdignore").touch()
@@ -113,6 +114,10 @@ run("toggles", ["--script", str(ROOT / "misc/scripts/tests/frp_lighting_toggles.
 # list: one draw call per object, no second geometry pass and no second lighting pass.
 run("transparent", ["--script", str(ROOT / "misc/scripts/tests/frp_transparent.gd")],
     "PASS transparent geometry is forward-shaded per object from the frame's light list")
+# The Sky-anchored full-screen pass stays in place; HeightFog's immutable
+# snapshot also reaches per-fragment transparent and opaque fallback shading.
+run("height_fog", ["--script", str(ROOT / "misc/scripts/tests/frp_height_fog.gd")],
+    "PASS FRP Height Fog nodes, world isolation, height falloff, start/cutoff distance, transparent/fallback fragments and sun radiance units")
 # Post effects run before or after the tone mapping, selected by a per-pass parameter
 # and signalled to the overlay shader as a shader keyword (specialization constant).
 run("post", ["--script", str(ROOT / "misc/scripts/tests/frp_post.gd")],

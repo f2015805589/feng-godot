@@ -1174,6 +1174,70 @@ vec4 fog_process(vec3 vertex) {
 	return vec4(fog_color, fog_amount);
 }
 
+// Mirrors FengHeightFog's compute pass for forward-only surfaces. Those
+// surfaces arrive after the Sky-anchored fullscreen pass, so use this
+// fragment's own camera-relative vertex position rather than the opaque depth.
+float frp_height_fog_line_integral_shared(float height_falloff, float ray_delta_y, float origin_terms) {
+	float falloff = max(-127.0, height_falloff * ray_delta_y);
+	float line_integral = (1.0 - exp2(-falloff)) / falloff;
+	float line_integral_taylor = log(2.0) - 0.5 * log(2.0) * log(2.0) * falloff;
+	return origin_terms * (abs(falloff) > 0.01 ? line_integral : line_integral_taylor);
+}
+
+float frp_height_fog_default_phase(vec3 ray_direction, vec3 sun_direction, float exponent) {
+	return pow(clamp(dot(ray_direction, sun_direction), 0.0, 1.0), exponent) * 0.07957747154594767;
+}
+
+vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y) {
+	vec4 parameters1 = implementation_data.height_fog_parameters[0];
+	vec4 parameters2 = implementation_data.height_fog_parameters[1];
+	vec4 parameters3 = implementation_data.height_fog_parameters[2];
+	vec4 fog_color = implementation_data.height_fog_parameters[3];
+	vec4 inscattering_direction = implementation_data.height_fog_parameters[4];
+	vec4 inscattering_color = implementation_data.height_fog_parameters[5];
+	float distance_squared = dot(camera_to_receiver, camera_to_receiver);
+	float distance_inverse = inversesqrt(max(distance_squared, 1e-8));
+	float distance = distance_squared * distance_inverse;
+	if (distance <= parameters1.w) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 ray_direction = camera_to_receiver * distance_inverse;
+	float ray_origin_terms = parameters3.x * exp2(clamp(-parameters1.y * (camera_position_y - parameters3.y), -125.0, 126.0));
+	float ray_origin_terms_second = parameters2.z * exp2(clamp(-parameters2.y * (camera_position_y - parameters2.w), -125.0, 126.0));
+	float ray_length = distance;
+	float ray_direction_y = camera_to_receiver.y;
+	float exclude_distance = parameters1.w;
+	if (exclude_distance > 0.0) {
+		float exclude_time = exclude_distance * distance_inverse;
+		float exclusion_intersection_y = exclude_time * camera_to_receiver.y;
+		float exclusion_world_y = camera_position_y + exclusion_intersection_y;
+		ray_direction_y = camera_to_receiver.y - exclusion_intersection_y;
+		ray_length = (1.0 - exclude_time) * distance;
+		float exponent = max(-127.0, parameters1.y * (exclusion_world_y - parameters3.y));
+		ray_origin_terms = parameters3.x * exp2(-exponent);
+		float exponent_second = max(-127.0, parameters2.y * (exclusion_world_y - parameters2.w));
+		ray_origin_terms_second = parameters2.z * exp2(-exponent_second);
+	}
+	float line_integral_shared = max(parameters3.z, 0.0) * (
+			frp_height_fog_line_integral_shared(parameters1.y, ray_direction_y, ray_origin_terms)
+			+ frp_height_fog_line_integral_shared(parameters2.y, ray_direction_y, ray_origin_terms_second));
+	float line_integral = line_integral_shared * ray_length;
+	vec3 directional_inscattering = vec3(0.0);
+	if (inscattering_direction.w >= 0.0) {
+		float directional_line_integral = line_integral_shared * max(ray_length - inscattering_direction.w, 0.0);
+		float directional_fog_factor = clamp(exp2(-directional_line_integral), 0.0, 1.0);
+		directional_inscattering = inscattering_color.rgb
+				* frp_height_fog_default_phase(ray_direction, inscattering_direction.xyz, inscattering_color.w)
+				* (1.0 - directional_fog_factor);
+	}
+	float fog_factor = max(clamp(exp2(-line_integral), 0.0, 1.0), fog_color.w);
+	if (parameters3.w > 0.0 && distance > parameters3.w) {
+		fog_factor = 1.0;
+		directional_inscattering = vec3(0.0);
+	}
+	return vec4(fog_color.rgb * (1.0 - fog_factor) + directional_inscattering, fog_factor);
+}
+
 #endif // !MODE_RENDER_DEPTH
 
 #if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_GBUFFER)
@@ -2891,6 +2955,18 @@ void fragment_shader(in SceneData scene_data) {
 	fog = vec4(unpackHalf2x16(fog_rg), unpackHalf2x16(fog_ba));
 #endif //!FOG_DISABLED
 
+	vec4 height_fog = vec4(0.0, 0.0, 0.0, 1.0);
+	if (implementation_data.height_fog_enabled != 0u) {
+		vec3 eye_offset_for_fog = vec3(0.0);
+#ifdef USE_MULTIVIEW
+		eye_offset_for_fog = scene_data.eye_offset[ViewIndex].xyz;
+#endif
+		float camera_y_for_fog = implementation_data.height_fog_camera_position.y
+				+ (mat3(inv_view_matrix) * eye_offset_for_fog).y;
+		vec3 camera_to_receiver = mat3(inv_view_matrix) * (vertex - eye_offset_for_fog);
+		height_fog = frp_height_fog_process(camera_to_receiver, camera_y_for_fog);
+	}
+
 #ifdef MODE_SEPARATE_SPECULAR
 
 #ifdef MODE_UNSHADED
@@ -2910,6 +2986,8 @@ void fragment_shader(in SceneData scene_data) {
 	diffuse_buffer.rgb = diffuse_buffer.rgb * fog.a + fog.rgb;
 	specular_buffer.rgb = specular_buffer.rgb * fog.a;
 #endif //!FOG_DISABLED
+	diffuse_buffer.rgb = diffuse_buffer.rgb * height_fog.a + height_fog.rgb;
+	specular_buffer.rgb *= height_fog.a;
 	diffuse_buffer.rgb *= implementation_data.pre_exposure;
 	specular_buffer.rgb *= implementation_data.pre_exposure;
 
@@ -2927,6 +3005,7 @@ void fragment_shader(in SceneData scene_data) {
 #ifndef FOG_DISABLED
 	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
 #endif //!FOG_DISABLED
+	frag_color.rgb = frag_color.rgb * height_fog.a + height_fog.rgb;
 	frag_color.rgb *= implementation_data.pre_exposure;
 
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)

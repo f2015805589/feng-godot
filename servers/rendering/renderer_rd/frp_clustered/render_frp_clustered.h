@@ -351,6 +351,11 @@ private:
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
 			float pre_exposure;
+
+			uint32_t height_fog_enabled;
+			uint32_t height_fog_pad[3];
+			float height_fog_camera_position[4];
+			float height_fog_parameters[6][4];
 		};
 
 		struct PushConstantUbershader {
@@ -480,6 +485,7 @@ private:
 	static RenderFRPClustered *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
+	void _setup_height_fog(uint32_t p_uniform_buffer_index, const PackedFloat32Array &p_parameters);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
 
 	struct RenderElementInfo {

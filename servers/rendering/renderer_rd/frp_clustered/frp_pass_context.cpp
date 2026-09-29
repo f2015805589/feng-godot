@@ -46,6 +46,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	pre_exposure_writer = p_pre_exposure_writer;
 	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
 	pass_parameters = p_pass_parameters;
+	height_fog_parameters.clear();
 }
 
 float FRPPassContext::get_pre_exposure(int p_view) const {
@@ -56,6 +57,18 @@ void FRPPassContext::set_next_pre_exposure(int p_view, float p_exposure) {
 	if (pre_exposure_writer) {
 		pre_exposure_writer(p_view, p_exposure);
 	}
+}
+
+void FRPPassContext::set_height_fog_parameters(const PackedFloat32Array &p_parameters) {
+	// The payload is camera position plus the six vec4s used by the existing
+	// Feng Height Fog compute pass. Keep the render-thread handoff typed and
+	// bounded instead of retaining a script resource or a general Dictionary.
+	if (p_parameters.is_empty()) {
+		height_fog_parameters.clear();
+		return;
+	}
+	ERR_FAIL_COND_MSG(p_parameters.size() != 28, "Height Fog parameters must contain 28 floats.");
+	height_fog_parameters = p_parameters;
 }
 
 void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
@@ -230,6 +243,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
+	ClassDB::bind_method(D_METHOD("set_height_fog_parameters", "parameters"), &FRPPassContext::set_height_fog_parameters);
+	ClassDB::bind_method(D_METHOD("get_height_fog_parameters"), &FRPPassContext::get_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("set_tonemap_exposure_texture", "texture"), &FRPPassContext::set_tonemap_exposure_texture);
 	ClassDB::bind_method(D_METHOD("request_next_pre_exposure", "buffer", "view", "offset_bytes"), &FRPPassContext::request_next_pre_exposure);
 

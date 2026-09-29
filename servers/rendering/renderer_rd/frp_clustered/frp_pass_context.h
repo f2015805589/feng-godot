@@ -61,6 +61,9 @@ class FRPPassContext : public RefCounted {
 	std::function<void(RID)> eye_exposure_texture_writer;
 	// Resolved frame parameters, keyed by native pass id or custom pass name.
 	Dictionary pass_parameters;
+	// Render-local Feng Height Fog snapshot. It is written by the Sky-anchored
+	// HeightFog pass and consumed by the later forward fallback/transparent ops.
+	PackedFloat32Array height_fog_parameters;
 
 	void _run_operation(int p_operation);
 	static void _finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view);
@@ -84,6 +87,8 @@ public:
 	Dictionary get_pass_parameters(const Variant &p_pass_id) const;
 	float get_pre_exposure(int p_view) const;
 	void set_next_pre_exposure(int p_view, float p_exposure);
+	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
+	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }
 	void set_tonemap_exposure_texture(RID p_texture);
 	Error request_next_pre_exposure(RID p_buffer, int p_view, int p_offset);
 

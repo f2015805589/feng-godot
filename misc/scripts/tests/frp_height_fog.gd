@@ -40,6 +40,12 @@ func sky_pixel(image_value: Image) -> Color:
 func luminance(color: Color) -> float:
 	return color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722
 
+func fog_snapshot() -> Dictionary:
+	for snapshot in FogRuntime.snapshots():
+		if int(snapshot.get("world_id", 0)) == _fog.get_world_3d().get_instance_id():
+			return snapshot
+	return {}
+
 func color_distance(a: Color, b: Color) -> float:
 	return Vector3(a.r - b.r, a.g - b.g, a.b - b.b).length()
 
@@ -275,7 +281,133 @@ func run() -> void:
 	_light.rotation_degrees = Vector3(-50.0, 30.0, 0.0)
 	await settle(10)
 
+	# Fog sun colour follows the same light units as DirectionalLightData: PI
+	# for non-physical energy, and authored lux for physical light units.
+	const PHYSICAL_LIGHT_UNITS := "rendering/lights_and_shadows/use_physical_light_units"
+	var old_physical_units: Variant = ProjectSettings.get_setting(PHYSICAL_LIGHT_UNITS, false)
+	_fog.sun_light = _light
+	_fog.directional_inscattering_color = Color(0.25, 0.25, 0.25)
+	_light.light_color = Color.WHITE
+	_light.light_energy = 2.0
+	ProjectSettings.set_setting(PHYSICAL_LIGHT_UNITS, false)
+	FogRuntime.publish(_fog)
+	var nonphysical_snapshot := fog_snapshot()
+	if not check(not nonphysical_snapshot.is_empty()
+			and absf(Vector3(nonphysical_snapshot.get("inscattering_color", Vector3.ZERO)).x - 0.5 * PI) < 0.01,
+			"non-physical fog sun radiance does not match the renderer's PI energy scale: %s" % [nonphysical_snapshot]):
+		return
+	ProjectSettings.set_setting(PHYSICAL_LIGHT_UNITS, true)
+	_light.set("light_intensity_lux", 60000.0)
+	FogRuntime.publish(_fog)
+	var physical_snapshot := fog_snapshot()
+	if not check(not physical_snapshot.is_empty()
+			and absf(Vector3(physical_snapshot.get("inscattering_color", Vector3.ZERO)).x - 30000.0) < 1.0,
+			"physical fog sun radiance did not include 60000 lux: %s" % [physical_snapshot]):
+		return
+	ProjectSettings.set_setting(PHYSICAL_LIGHT_UNITS, old_physical_units)
+	_fog.sun_light = null
+	_fog.directional_inscattering_color = Color(0.0, 0.0, 0.0)
+	await settle(4)
+
 	# Disabling the component returns the frame to the baseline.
+	var backdrop := MeshInstance3D.new()
+	var backdrop_quad := QuadMesh.new()
+	backdrop_quad.size = Vector2(100.0, 100.0)
+	backdrop.mesh = backdrop_quad
+	var backdrop_material := StandardMaterial3D.new()
+	backdrop_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	backdrop_material.albedo_color = Color(0.05, 0.1, 0.8)
+	backdrop.material_override = backdrop_material
+	backdrop.position = Vector3(0.0, 8.0, -40.0)
+	scene.add_child(backdrop)
+	var glass := MeshInstance3D.new()
+	var glass_quad := QuadMesh.new()
+	glass_quad.size = Vector2(8.0, 8.0)
+	glass.mesh = glass_quad
+	var glass_material := StandardMaterial3D.new()
+	glass_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	glass_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	glass_material.albedo_color = Color(0.0, 0.8, 0.1, 0.5)
+	glass.material_override = glass_material
+	glass.position = Vector3(0.0, 8.0, 0.0)
+	scene.add_child(glass)
+	_fog.enabled = false
+	await settle(8)
+	var glass_clear := center(await image())
+	_fog.enabled = true
+	_fog.fog_density = 2.5
+	_fog.fog_height_falloff = 0.2
+	_fog.start_distance = 0.0
+	_fog.fog_cutoff_distance = 0.0
+	_fog.fog_inscattering_color = Color(1.0, 0.0, 0.0)
+	await settle(12)
+	var glass_near := center(await image())
+	glass.position.z = -20.0
+	await settle(12)
+	var glass_far := center(await image())
+	print("Transparent Height Fog: clear ", glass_clear, " near ", glass_near, " far ", glass_far)
+	if not check(glass_near.r > glass_clear.r + 0.05 and glass_near.g < glass_clear.g - 0.05
+			and glass_far.g < glass_near.g - 0.02,
+			"transparent Height Fog did not tint the surface by its own distance: %s -> %s -> %s" % [glass_clear, glass_near, glass_far]):
+		return
+	# The transparent surface uses its fragment position. Moving the opaque depth
+	# behind a fully covering transparent draw must not change that fog result.
+	glass.position.z = 0.0
+	glass_material.albedo_color = Color(0.0, 0.8, 0.1, 1.0)
+	await settle(8)
+	var glass_before_backdrop_move := center(await image())
+	backdrop.position.z = -25.0
+	await settle(8)
+	var glass_after_backdrop_move := center(await image())
+	if not check(color_distance(glass_before_backdrop_move, glass_after_backdrop_move) < 0.03,
+			"transparent Height Fog followed opaque depth instead of the fragment position: %s -> %s" % [glass_before_backdrop_move, glass_after_backdrop_move]):
+		return
+	glass.queue_free()
+	glass_quad = null
+	glass_material = null
+	glass = null
+	backdrop.queue_free()
+	backdrop_quad = null
+	backdrop_material = null
+	backdrop = null
+	await process_frame
+
+	var fallback_mesh := MeshInstance3D.new()
+	var fallback_quad := QuadMesh.new()
+	fallback_quad.size = Vector2(8.0, 8.0)
+	fallback_mesh.mesh = fallback_quad
+	var fallback_material := StandardMaterial3D.new()
+	# FRP's render-list classifier routes unshaded opaque materials through
+	# RENDER_LIST_OPAQUE_FALLBACK (shader_data->unshaded).
+	fallback_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	fallback_material.albedo_color = Color(0.0, 0.8, 0.1)
+	fallback_mesh.material_override = fallback_material
+	fallback_mesh.position = Vector3(0.0, 8.0, 0.0)
+	scene.add_child(fallback_mesh)
+	_fog.enabled = false
+	await settle(8)
+	var fallback_clear := center(await image())
+	_fog.enabled = true
+	_fog.fog_density = 2.5
+	_fog.fog_height_falloff = 0.2
+	_fog.start_distance = 0.0
+	_fog.fog_cutoff_distance = 0.0
+	_fog.fog_inscattering_color = Color(1.0, 0.0, 0.0)
+	await settle(12)
+	var fallback_near := center(await image())
+	fallback_mesh.position.z = -20.0
+	await settle(12)
+	var fallback_far := center(await image())
+	print("Opaque fallback Height Fog: clear ", fallback_clear, " near ", fallback_near, " far ", fallback_far)
+	if not check(fallback_near.r > fallback_clear.r + 0.08 and fallback_far.g < fallback_near.g - 0.03,
+			"opaque forward fallback did not use its own fragment position for Height Fog: %s -> %s -> %s" % [fallback_clear, fallback_near, fallback_far]):
+		return
+	fallback_mesh.queue_free()
+	fallback_quad = null
+	fallback_material = null
+	fallback_mesh = null
+	await process_frame
+
 	_fog.enabled = false
 	await settle(12)
 	if not check(not root.use_debanding, "disabling height fog should restore viewport debanding"):
@@ -326,5 +458,5 @@ func run() -> void:
 	var removed := center(await image())
 	if not check(absf(removed.r - baseline_center.r) < 0.06, "removing the fog node left fog on screen: %s" % removed):
 		return
-	print("PASS FRP Height Fog nodes, world isolation, height falloff, start/cutoff distance and sun inscattering")
+	print("PASS FRP Height Fog nodes, world isolation, height falloff, start/cutoff distance, transparent/fallback fragments and sun radiance units")
 	quit(0)

@@ -14,8 +14,53 @@ var _pre_exposure := 1.0
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
+	if ctx != null:
+		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+		var snapshot := _snapshot_for_target(buffers)
+		var frame_parameters := PackedFloat32Array()
+		if not snapshot.is_empty():
+			var render_data := ctx.get_render_data()
+			var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
+			if scene_data != null:
+				var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
+				var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
+				frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(), fog_scale)
+		ctx.call("set_height_fog_parameters", frame_parameters)
 	super._frp_execute(ctx)
 	_pre_exposure = 1.0
+
+func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_scale: float) -> PackedFloat32Array:
+	var density := float(snapshot.get("fog_density", 0.0))
+	var falloff := float(snapshot.get("fog_height_falloff", 0.0))
+	var height := float(snapshot.get("fog_height", 0.0))
+	var density2 := float(snapshot.get("second_fog_density", 0.0))
+	var falloff2 := float(snapshot.get("second_fog_height_falloff", 0.0))
+	var height2 := float(snapshot.get("second_fog_height", 0.0))
+	var global_density := density * pow(2.0, clampf(-falloff * (camera.origin.y - height), -125.0, 126.0))
+	var global_density2 := density2 * pow(2.0, clampf(-falloff2 * (camera.origin.y - height2), -125.0, 126.0))
+	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
+	var sun_direction: Variant = snapshot.get("sun_direction", Vector3.ZERO)
+	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
+	var values := PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0,
+			global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0)),
+			global_density2, falloff2, density2, height2,
+			density, height, fog_scale, float(snapshot.get("cutoff_distance", 0.0))])
+	if fog_color is Vector3:
+		values.append_array(PackedFloat32Array([fog_color.x, fog_color.y, fog_color.z,
+				float(snapshot.get("min_opacity", 0.0))]))
+	else:
+		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, float(snapshot.get("min_opacity", 0.0))]))
+	if sun_direction is Vector3:
+		values.append_array(PackedFloat32Array([sun_direction.x, sun_direction.y, sun_direction.z,
+				float(snapshot.get("inscattering_start", -1.0))]))
+	else:
+		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, -1.0]))
+	if inscattering_color is Vector3:
+		values.append_array(PackedFloat32Array([inscattering_color.x, inscattering_color.y, inscattering_color.z,
+				clampf(float(snapshot.get("inscattering_exponent", 4.0)), 0.000001, 1000.0)]))
+	else:
+		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 4.0]))
+	return values
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters

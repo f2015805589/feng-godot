@@ -327,6 +327,13 @@ struct ImplementationData {
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
 	float pre_exposure;
+
+	uint height_fog_enabled;
+	uint height_fog_pad0;
+	uint height_fog_pad1;
+	uint height_fog_pad2;
+	vec4 height_fog_camera_position;
+	vec4 height_fog_parameters[6];
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
