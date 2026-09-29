@@ -11,12 +11,14 @@ extends "pass_base.gd"
 ## of UE's pre-exposure: downstream effects and tone mapping see luminance
 ## already folded around the middle-gray `scale` target.
 ##
-## `parameters`: x = exposure scale (middle-gray target), y = adaptation speed,
-## z/w = the histogram's log-luminance clamp range. The default range
-## (2^-13.3 .. 2^18) spans from candlelight to a 60000-energy directional
-## light, so adaptation converges to the same image no matter the absolute
-## energy — a range too narrow saturates the histogram and leaves the
-## frame over-exposed.
+## Parameters mirror UE's Auto Exposure settings and are resolvable per
+## FengVolume: `exposure_scale` (middle-gray target), `adaptation_speed`,
+## `min_luminance`/`max_luminance` clamp the adapted value (UE's
+## MinBrightness/MaxBrightness), and `extend_luminance_range` is UE's
+## "Extend default luminance range" toggle: off meters [0.0003, 64] like
+## UE's default, on meters [0.0001, 8192] like UE's extended range. A
+## scene brighter than the metering range saturates and stays over-exposed
+## — exactly what the UE toggle is for.
 
 const HISTOGRAM_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation_histogram.glsl"
 const ADAPT_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation.glsl"
@@ -24,9 +26,18 @@ const APPLY_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/
 const NUM_BINS := 64
 const PARAMS_BYTES := NUM_BINS * 4 + 16 # uint histogram[64] + float adapted + padding
 const STATE_PRUNE_LIMIT := 16
+## UE metering ranges (log2 luminance): AutoExposureExtendDefaultLuminanceRange
+## off uses the default pair, on the extended pair.
+const LOG_LUMINANCE_MIN := -11.7545 # log2(0.0003)
+const LOG_LUMINANCE_MAX := 6.0 # log2(64)
+const LOG_LUMINANCE_EXT_MIN := -13.2877 # log2(0.0001)
+const LOG_LUMINANCE_EXT_MAX := 13.0 # log2(8192)
 
-# x = exposure scale, y = adaptation speed, z/w = luminance clamp range.
-@export var parameters := Vector4(1.0, 5.0, 0.0001, 262144.0)
+@export var exposure_scale := 1.0
+@export var adaptation_speed := 3.0
+@export var min_luminance := 0.0001
+@export var max_luminance := 8192.0
+@export var extend_luminance_range := false
 
 var _histogram_pipeline := RID()
 var _adapt_pipeline := RID()
@@ -44,14 +55,15 @@ func _init() -> void:
 	color.binding_type = TextureInput.BindingType.STORAGE_IMAGE
 	inputs = [color]
 
-func get_frp_parameters() -> Dictionary:
-	return {"parameters": parameters}
-
 func get_volume_parameter_names() -> PackedStringArray:
-	return PackedStringArray(["parameters"])
+	return PackedStringArray([
+		"exposure_scale", "adaptation_speed",
+		"min_luminance", "max_luminance",
+		"extend_luminance_range",
+	])
 
 func _frp_execute(ctx: FRPPassContext) -> void:
-	_frame_parameters = get_resolved_parameters(ctx).get("parameters", parameters)
+	_frame_parameters = get_resolved_parameters(ctx)
 	super._frp_execute(ctx)
 	_frame_parameters = null
 
@@ -121,17 +133,22 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	if state.is_empty():
 		return
 	var params: RID = state["params"]
-	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
+	var values: Dictionary = _frame_parameters if _frame_parameters is Dictionary else {}
+	var extend := bool(values.get("extend_luminance_range", extend_luminance_range))
+	var exposure := float(values.get("exposure_scale", exposure_scale))
+	var speed := float(values.get("adaptation_speed", adaptation_speed))
+	var lum_min := float(values.get("min_luminance", min_luminance))
+	var lum_max := float(values.get("max_luminance", max_luminance))
 
 	var now_usec := Time.get_ticks_usec()
 	var last_usec: int = state["last_usec"]
 	state["last_usec"] = now_usec
 	var dt := clampf(float(now_usec - last_usec) / 1000000.0, 0.0, 0.5)
 	var set_immediate := last_usec == 0
-	var adjust := maxf(value.y * dt, 0.0)
+	var adjust := maxf(speed * dt, 0.0)
 
-	var log_min := log(maxf(value.z, 0.0001)) / log(2.0)
-	var log_max := log(maxf(value.w, value.z)) / log(2.0)
+	var log_min := LOG_LUMINANCE_EXT_MIN if extend else LOG_LUMINANCE_MIN
+	var log_max := LOG_LUMINANCE_EXT_MAX if extend else LOG_LUMINANCE_MAX
 
 	var params_uniform := RDUniform.new()
 	params_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
@@ -169,7 +186,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		_report("Eye adaptation bindings are invalid.")
 		return
 	var adapt_push := PackedFloat32Array([
-		adjust, log_min, log_max - log_min, value.z, value.w,
+		adjust, log_min, log_max - log_min, lum_min, lum_max,
 		float(size.x) * float(size.y), 1.0 if set_immediate else 0.0, 0.0,
 	]).to_byte_array()
 	rd.compute_list_bind_compute_pipeline(list, _adapt_pipeline)
@@ -187,7 +204,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	if not apply_set.is_valid() or not apply_params_set.is_valid():
 		_report("Eye adaptation apply bindings are invalid.")
 		return
-	var apply_push := PackedFloat32Array([value.x, 0.0, 0.0, 0.0]).to_byte_array()
+	var apply_push := PackedFloat32Array([exposure, 0.0, 0.0, 0.0]).to_byte_array()
 	var apply_list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(apply_list, _apply_pipeline)
 	rd.compute_list_bind_uniform_set(apply_list, apply_set, 0)
