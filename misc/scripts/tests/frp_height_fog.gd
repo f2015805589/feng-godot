@@ -273,7 +273,10 @@ func run() -> void:
 		return
 	scene.position = Vector3.ZERO
 	_camera.global_transform = home_transform
-	if not check(luminance(sun_pixel) > 0.05 and luminance(sun_pixel) < 0.6,
+	# Godot's non-physical DirectionalLight energy is converted by PI before
+	# FengHeightFog applies the normalized 1/(4*PI) phase lobe: the expected
+	# linear radiance is about 0.375 (sRGB about 0.647).
+	if not check(luminance(sun_pixel) > 0.05 and luminance(sun_pixel) < 0.7,
 			"directional inscattering differs from UE's normalized default lobe: %s" % sun_pixel):
 		return
 	_fog.directional_inscattering_color = Color(0.0, 0.0, 0.0)
