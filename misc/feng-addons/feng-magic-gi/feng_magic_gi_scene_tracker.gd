@@ -4,10 +4,12 @@ extends RefCounted
 ## Shared scene-boundary and resource-change tracking for Magic GI.
 
 const BROADPHASE_EPSILON := 0.001
+const SCENE_SCAN_TTL_MSEC := 250
 
 static var _watched_objects: Dictionary = {}
 static var _resource_revisions: Dictionary = {}
 static var _next_resource_prune := 0
+static var _scene_scans: Dictionary = {} ## "root_id:world_id" -> {checked_at, signature}
 
 static func scene_root(node: Node) -> Node:
 	var root := node
@@ -23,13 +25,31 @@ static func should_skip_world_boundary(node: Node, root: Node, world: World3D) -
 	return false
 
 ## Cheap editor/runtime polling fingerprint. This does not inspect mesh vertices.
+## The scene walk is shared per (root, world) for a short window so several
+## volumes in one scene amortize a single traversal across their 1s checks.
 static func quick_signature(volume: Node3D) -> int:
 	var values: Array = [volume.global_transform, volume.size, volume.probe_spacing,
 			volume.surface_offset, volume.bake_distance, volume.terrain_reflectance,
 			volume.fallback_material_reflectance]
-	var root := scene_root(volume)
-	_append_quick_signature(root, root, volume.get_world_3d(), values)
+	values.append(_scene_scan_signature(volume))
 	return hash(values)
+
+static func _scene_scan_signature(volume: Node3D) -> int:
+	var root := scene_root(volume)
+	var world := volume.get_world_3d()
+	var key := "%d:%d" % [root.get_instance_id(), world.get_instance_id() if world != null else 0]
+	var now := Time.get_ticks_msec()
+	var cached: Dictionary = _scene_scans.get(key, {})
+	if not cached.is_empty() and now - int(cached["checked_at"]) < SCENE_SCAN_TTL_MSEC:
+		return int(cached["signature"])
+	var values: Array = []
+	_append_quick_signature(root, root, world, values)
+	var signature := hash(values)
+	_scene_scans[key] = {"checked_at": now, "signature": signature}
+	if _scene_scans.size() > 16:
+		_scene_scans.clear()
+		_scene_scans[key] = {"checked_at": now, "signature": signature}
+	return signature
 
 static func _append_quick_signature(node: Node, root: Node, world: World3D, values: Array) -> void:
 	if should_skip_world_boundary(node, root, world):
