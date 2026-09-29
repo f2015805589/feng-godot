@@ -529,9 +529,24 @@ func _normalize_native_entries() -> bool:
 			if native.stable_id != "native:%d" % native.native_id:
 				native.stable_id = "native:%d" % native.native_id
 				changed = true
-			if native.resource_name == "":
-				native.resource_name = NativeSpec.pass_name(native.native_id)
+			var placeholder_name := "native id %d" % native.native_id
+			var pass_name := NativeSpec.pass_name(native.native_id)
+			if native.resource_name == "" or (native.resource_name == placeholder_name and pass_name != placeholder_name):
+				native.resource_name = pass_name
 				changed = true
+			# An older engine may have serialized the fallback name into both resources
+			# when it did not know this native id. Only restore the implementation label
+			# when its concrete native pass still agrees with the wrapper's id; an author
+			# may have replaced the implementation since the resource was saved.
+			if native.implementation is NativePass:
+				var implementation := native.implementation as NativePass
+				if NativeSpec.is_valid_id(implementation.native_id) \
+				and implementation.native_id == native.native_id \
+				and implementation._native_pass_id() == native.native_id \
+				and implementation.resource_name == placeholder_name \
+				and pass_name != placeholder_name:
+					implementation.resource_name = pass_name
+					changed = true
 		# Do not silently repair an invalid or duplicate native ID. The warning
 		# and last-valid-schedule behavior makes the authored error reviewable.
 	# A mandatory entry is re-added in seed order when a resource is missing one:

@@ -40,9 +40,9 @@ const PassBase = preload("../pass_base.gd")
 
 func _init() -> void:
 	native_id = _native_pass_id()
-	if native_id >= 0:
-		# The engine's spec owns the display name, so it cannot drift from the pass this
-		# script runs.
+	if native_id >= 0 and resource_name == "":
+		# Give new instances the engine's display name. Keep serialized custom labels and
+		# older-engine placeholders for FengRenderer to preserve or normalize.
 		resource_name = NativeSpec.pass_name(native_id)
 
 ## The engine pass this script implements. A concrete subclass returns its id; the

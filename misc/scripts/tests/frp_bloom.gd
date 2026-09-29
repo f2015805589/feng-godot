@@ -158,6 +158,59 @@ func _check_default_spec_and_schedule(renderer_script: Script) -> void:
 	renderer.passes = normal_passes
 
 
+func _check_native_name_recovery(renderer_script: Script) -> void:
+	var authored = renderer_script.new()
+	var bloom = _find_native(authored, 8)
+	var transparent = _find_native(authored, 5)
+	var temporal_aa = _find_native(authored, 6)
+	require(bloom != null and bloom.implementation != null, "Bloom name fixture has no implementation")
+	require(transparent != null and transparent.implementation != null, "Transparent name fixture has no implementation")
+	require(temporal_aa != null and temporal_aa.implementation != null, "Temporal AA name fixture has no implementation")
+
+	# Simulate names persisted by an engine build that did not recognize Bloom.
+	bloom.resource_name = "native id 8"
+	bloom.implementation.resource_name = "native id 8"
+	# Names authored by a project must survive normalization unchanged.
+	transparent.resource_name = "Project Transparent Label"
+	transparent.implementation.resource_name = "Project Transparent Implementation"
+	# A mismatched native implementation is not eligible for automatic relabeling.
+	var replacement_script = load("res://addons/feng-render-pipeline/passes/native/transparent_pass.gd") as Script
+	require(replacement_script != null, "could not load replacement native implementation script")
+	var replacement_implementation = replacement_script.new()
+	replacement_implementation.native_id = 6
+	replacement_implementation.resource_name = "native id 6"
+	temporal_aa.implementation = replacement_implementation
+	temporal_aa.resource_name = "native id 6"
+
+	authored.set("_normalizing", true)
+	var path := "user://frp_bloom_native_names_%d.tres" % Time.get_ticks_usec()
+	require(ResourceSaver.save(authored, path) == OK, "could not save native-name recovery fixture")
+	authored.set("_normalizing", false)
+	var loaded = ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	require(loaded != null, "native-name recovery fixture did not load")
+	var loaded_entries: Array = loaded.passes
+	var loaded_bloom = _find_native(loaded, 8)
+	var loaded_transparent = _find_native(loaded, 5)
+	var loaded_temporal_aa = _find_native(loaded, 6)
+	require(loaded_entries.size() > 0, "loading the name fixture produced no native schedule")
+	require(loaded_bloom != null and loaded_bloom.implementation != null, "reloaded Bloom entry has no implementation")
+	require(loaded_transparent != null and loaded_transparent.implementation != null,
+			"reloaded Transparent entry has no implementation")
+	require(loaded_temporal_aa != null and loaded_temporal_aa.implementation != null,
+			"reloaded Temporal AA entry has no implementation")
+	require(loaded_bloom.resource_name == "Bloom", "placeholder wrapper name did not recover to Bloom")
+	require(loaded_bloom.implementation.resource_name == "Bloom", "placeholder implementation name did not recover to Bloom")
+	require(loaded_transparent.resource_name == "Project Transparent Label", "custom wrapper name was changed")
+	require(loaded_transparent.implementation.resource_name == "Project Transparent Implementation",
+			"custom implementation name was changed")
+	require(loaded_temporal_aa.resource_name == "Temporal AA", "placeholder wrapper name did not recover for a valid native id")
+	require(loaded_temporal_aa.implementation.native_id == 6, "name recovery changed the authored implementation id")
+	require(loaded_temporal_aa.implementation._native_pass_id() == 5,
+			"mismatched implementation fixture no longer uses the replacement pass script")
+	require(loaded_temporal_aa.implementation.resource_name == "native id 6",
+			"mismatched implementation placeholder was relabeled")
+
+
 func _check_schema_migration(renderer_script: Script) -> void:
 	var migrating = renderer_script.new()
 	var legacy_passes: Array[FRP_BASE] = migrating.passes.duplicate()
@@ -290,6 +343,7 @@ func run() -> void:
 	var renderer_script = load("res://addons/feng-render-pipeline/renderer.gd")
 	require(renderer_script != null, "FRP renderer script did not load")
 	_check_default_spec_and_schedule(renderer_script)
+	_check_native_name_recovery(renderer_script)
 	_check_schema_migration(renderer_script)
 
 	_make_scene()
