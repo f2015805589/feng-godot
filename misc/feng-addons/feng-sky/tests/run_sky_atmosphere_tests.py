@@ -12,7 +12,7 @@ ADDON_SOURCE = REPO_ROOT / "misc/feng-addons/feng-sky"
 PIPELINE_ADDON_SOURCE = REPO_ROOT / "misc/feng-addons/feng-render-pipeline"
 
 
-def run(command: list[str], label: str) -> None:
+def run(command: list[str], label: str, expected_marker: str = "") -> None:
     print(f"== {label} ==", flush=True)
     result = subprocess.run(
         command,
@@ -29,6 +29,12 @@ def run(command: list[str], label: str) -> None:
         print(result.stderr, end="")
     if result.returncode:
         raise SystemExit(f"{label} failed with exit code {result.returncode}")
+    if expected_marker:
+        output = result.stdout + result.stderr
+        if "REGRESSION:" in output:
+            raise SystemExit(f"{label} reported a regression")
+        if expected_marker not in output:
+            raise SystemExit(f"{label} did not report expected marker: {expected_marker}")
 
 
 def main() -> None:
@@ -68,6 +74,7 @@ def main() -> None:
                 "res://addons/feng-sky/tests/test_sky_atmosphere.gd",
             ],
             "headless Sky component tests",
+            "feng_sky_atmosphere tests passed",
         )
 
 
