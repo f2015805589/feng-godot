@@ -2212,6 +2212,93 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		RD::get_singleton()->draw_command_end_label();
 	};
 
+	bool frp_temporal_stage_ran = false;
+	auto run_temporal_upscale = [&]() {
+		if (!rb_data.is_valid() || !using_upscaling) {
+			return;
+		}
+		resolve_frame_buffers();
+		if (scale_type == SCALE_FSR2) {
+			rb_data->ensure_fsr2(fsr2_effect);
+
+			RID exposure = get_tonemap_exposure_override();
+			if (!exposure.is_valid() && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+				exposure = luminance->get_current_luminance_buffer(rb);
+			}
+
+			RD::get_singleton()->draw_command_begin_label("FSR2");
+			RENDER_TIMESTAMP("FSR2");
+
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				real_t fov = p_render_data->scene_data->cam_projection.get_fov();
+				real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
+				real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
+				Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+				RendererRD::FSR2Effect::Parameters params;
+				params.context = rb_data->get_fsr2_context();
+				params.internal_size = rb->get_internal_size();
+				params.sharpness = CLAMP(1.0f - (rb->get_fsr_sharpness() / 2.0f), 0.0f, 1.0f);
+				params.color = rb->get_internal_texture(v);
+				params.depth = rb->get_depth_texture(v);
+				params.velocity = rb->get_velocity_buffer(false, v);
+				params.reactive = rb->get_internal_texture_reactive(v);
+				params.exposure = exposure;
+				params.output = rb->get_upscaled_texture(v);
+				params.z_near = p_render_data->scene_data->z_near;
+				params.z_far = p_render_data->scene_data->z_far;
+				params.fovy = fovy;
+				params.jitter = jitter;
+				params.delta_time = float(time_step);
+				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+
+				Projection correction;
+				correction.set_depth_correction(true, true, false);
+
+				const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
+				const Projection &cur_proj = p_render_data->scene_data->cam_projection;
+				const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
+				const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
+				params.reprojection = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
+
+				fsr2_effect->upscale(params);
+			}
+
+			RD::get_singleton()->draw_command_end_label();
+		} else if (scale_type == SCALE_MFX) {
+#ifdef METAL_MFXTEMPORAL_ENABLED
+			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+
+			RID exposure = get_tonemap_exposure_override();
+			if (!exposure.is_valid() && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+				exposure = luminance->get_current_luminance_buffer(rb);
+			}
+
+			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
+			// Scale to +/-0.5.
+			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
+			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
+
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				RendererRD::MFXTemporalEffect::Params params;
+				params.src = rb->get_internal_texture(v);
+				params.depth = rb->get_depth_texture(v);
+				params.motion = rb->get_velocity_buffer(false, v);
+				params.exposure = exposure;
+				params.dst = rb->get_upscaled_texture(v);
+				params.jitter_offset = jitter;
+				params.reset = reset;
+
+				mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
+			}
+
+			RD::get_singleton()->draw_command_end_label();
+#endif
+		}
+	};
+
+	bool frp_bloom_stage_ran = false;
+	bool frp_auto_exposure_prepared = false;
+
 	// One internal renderer operation. A user-facing pass expands to one or more of
 	// these; operations are implementation units and are not separately switchable
 	// (see FRPPipelineSpec).
@@ -2623,87 +2710,15 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 			} break;
 			case FRPPipelineSpec::OP_TEMPORAL_AA: { // Temporal AA and upscale.
-				// TAA and the temporal upscalers read resolved colour, depth and
-				// velocity, and this entry can run before the tone mapping entry.
-				resolve_frame_buffers();
+				if (!frp_temporal_stage_ran) {
+					// Keep the temporal entry idempotent when Bloom or Post Process had
+					// to prepare a viewport-requested upscaled source earlier.
+					frp_temporal_stage_ran = true;
+					resolve_frame_buffers();
 
-				if (rb_data.is_valid() && (using_upscaling || using_taa)) {
-					if (scale_type == SCALE_FSR2) {
-						rb_data->ensure_fsr2(fsr2_effect);
-
-						RID exposure;
-						if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-							exposure = luminance->get_current_luminance_buffer(rb);
-						}
-
-						RD::get_singleton()->draw_command_begin_label("FSR2");
-						RENDER_TIMESTAMP("FSR2");
-
-						for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-							real_t fov = p_render_data->scene_data->cam_projection.get_fov();
-							real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
-							real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
-							Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
-							RendererRD::FSR2Effect::Parameters params;
-							params.context = rb_data->get_fsr2_context();
-							params.internal_size = rb->get_internal_size();
-							params.sharpness = CLAMP(1.0f - (rb->get_fsr_sharpness() / 2.0f), 0.0f, 1.0f);
-							params.color = rb->get_internal_texture(v);
-							params.depth = rb->get_depth_texture(v);
-							params.velocity = rb->get_velocity_buffer(false, v);
-							params.reactive = rb->get_internal_texture_reactive(v);
-							params.exposure = exposure;
-							params.output = rb->get_upscaled_texture(v);
-							params.z_near = p_render_data->scene_data->z_near;
-							params.z_far = p_render_data->scene_data->z_far;
-							params.fovy = fovy;
-							params.jitter = jitter;
-							params.delta_time = float(time_step);
-							params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
-
-							Projection correction;
-							correction.set_depth_correction(true, true, false);
-
-							const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
-							const Projection &cur_proj = p_render_data->scene_data->cam_projection;
-							const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
-							const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
-							params.reprojection = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
-
-							fsr2_effect->upscale(params);
-						}
-
-						RD::get_singleton()->draw_command_end_label();
-					} else if (scale_type == SCALE_MFX) {
-#ifdef METAL_MFXTEMPORAL_ENABLED
-						bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
-
-						RID exposure;
-						if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-							exposure = luminance->get_current_luminance_buffer(rb);
-						}
-
-						RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-						// Scale to +/-0.5.
-						Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-						jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
-
-						for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-							RendererRD::MFXTemporalEffect::Params params;
-							params.src = rb->get_internal_texture(v);
-							params.depth = rb->get_depth_texture(v);
-							params.motion = rb->get_velocity_buffer(false, v);
-							params.exposure = exposure;
-							params.dst = rb->get_upscaled_texture(v);
-							params.jitter_offset = jitter;
-							params.reset = reset;
-
-							mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
-						}
-
-						RD::get_singleton()->draw_command_end_label();
-#endif
-					} else if (using_taa) {
+					if (using_upscaling) {
+						run_temporal_upscale();
+					} else if (rb_data.is_valid() && using_taa) {
 						// The temporal resolve reprojects every pixel, including the sky
 						// and the clear colour behind a silhouette, which the velocity
 						// attachment only has the engine's "no data" marker for. Filling
@@ -2718,8 +2733,47 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					}
 				}
 			} break;
-			case FRPPipelineSpec::OP_POST_PROCESS: { // Post-process stages: glow, DoF, auto exposure, AA prep.
+			case FRPPipelineSpec::OP_BLOOM: { // Gaussian glow preparation; Tonemap composites it later.
 				if (rb_data.is_valid()) {
+					if (using_upscaling && !frp_temporal_stage_ran) {
+						frp_temporal_stage_ran = true;
+						run_temporal_upscale();
+					}
+					frp_bloom_stage_ran = true;
+					if (p_render_data->environment.is_valid() && environment_get_glow_enabled(p_render_data->environment)) {
+						// Bloom reads the resolved HDR frame. TAA is optional, so make this
+						// explicit when the pipeline has no temporal resolve pass.
+						resolve_frame_buffers();
+
+						RID saved_camera_attributes = p_render_data->camera_attributes;
+						float auto_exposure_scale = 1.0f;
+						RID auto_exposure_texture;
+						if (current_eye_adaptation_enabled) {
+							// The FRP Eye Adaptation pass owns exposure in this frame; preserve
+							// its pre-exposure path and do not run CameraAttributes metering.
+							p_render_data->camera_attributes = RID();
+							auto_exposure_texture = get_tonemap_exposure_override();
+							auto_exposure_scale = rb->get_luminance_multiplier();
+						} else {
+							// Run the existing Environment auto exposure before its Glow consumer,
+							// then tell Post Process not to update it a second time.
+							frp_auto_exposure_prepared = true;
+							auto_exposure_scale = _render_buffers_auto_exposure(p_render_data);
+						}
+						// current_pre_exposure is the value already bound into this frame's
+						// scene UBO; the asynchronous value produced by Eye Adaptation is for
+						// the next frame and must not be used for Bloom here.
+						_render_buffers_bloom(p_render_data, auto_exposure_scale, auto_exposure_texture, current_pre_exposure);
+						p_render_data->camera_attributes = saved_camera_attributes;
+					}
+				}
+			} break;
+			case FRPPipelineSpec::OP_POST_PROCESS: { // DoF and auto exposure.
+				if (rb_data.is_valid()) {
+					if (using_upscaling && !frp_temporal_stage_ran) {
+						frp_temporal_stage_ran = true;
+						run_temporal_upscale();
+					}
 					_debug_draw_cluster(rb);
 
 					RENDER_TIMESTAMP("Post Process");
@@ -2728,7 +2782,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (current_eye_adaptation_enabled) {
 						p_render_data->camera_attributes = RID();
 					}
-					_render_buffers_post_process(p_render_data);
+					_render_buffers_post_process(p_render_data, false, !frp_auto_exposure_prepared);
 					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
@@ -2739,7 +2793,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (current_eye_adaptation_enabled) {
 						p_render_data->camera_attributes = RID();
 					}
-					_render_buffers_tonemap(p_render_data);
+					_render_buffers_tonemap(p_render_data, false, frp_bloom_stage_ran);
 					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
@@ -2754,7 +2808,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (current_eye_adaptation_enabled) {
 						p_render_data->camera_attributes = RID();
 					}
-					_render_buffers_tonemap(p_render_data, true);
+					_render_buffers_tonemap(p_render_data, true, frp_bloom_stage_ran);
 					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;

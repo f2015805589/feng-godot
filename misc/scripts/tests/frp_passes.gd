@@ -148,11 +148,10 @@ class ScreenPaintPass extends FRP_BASE:
 		rd.draw_list_end()
 		rd.free_rid(framebuffer)
 
-## Default native execution order. It is the engine's pass id order: shadow maps
-## first (drawing them reads no scene depth and no material page), then the virtual
-## textures, the G-buffer, lighting, sky, transparent, temporal AA and post.
-const EXPECTED_NATIVE_ORDER := [0, 1, 2, 3, 4, 5, 6, 7]
-const EXPECTED_NATIVE_COUNT := 8
+## Default execution order. Native ids remain stable, so Bloom (8) runs before
+## Post Process (7) after Transparent and the optional TAA entry.
+const EXPECTED_NATIVE_ORDER := [0, 1, 2, 3, 4, 5, 6, 8, 7]
+const EXPECTED_NATIVE_COUNT := 9
 
 func require(value: bool, message: String) -> void:
 	if not value:
@@ -636,7 +635,7 @@ func run() -> void:
 	require(native_values.size() == EXPECTED_NATIVE_COUNT, "renderer must expose all %d native FRP passes, got %d" % [EXPECTED_NATIVE_COUNT, native_values.size()])
 	var expected_native_names := [
 		"precompute", "vt pass", "gbuffer", "lighting", "sky", "transparent",
-		"temporal", "tonemap",
+		"temporal", "tonemap", "bloom",
 	]
 	var native_ids := {}
 	for value in native_values:
@@ -649,15 +648,15 @@ func run() -> void:
 		var label := _pass_label(native_ids[id]).to_lower()
 		require(not label.is_empty(), "native pass %d has no display name" % id)
 		require(label.contains(expected_native_names[id]), "native pass %d has wrong display name '%s'" % [id, label])
-	# Id order is execution order: the shadow maps first, then virtual textures, the
-	# G-buffer, lighting, sky, transparent, temporal AA and post.
+	# Native ids stay stable while the default execution order places Bloom (8)
+	# before Post Process (7).
 	require(native_values.size() == EXPECTED_NATIVE_ORDER.size(), "unexpected native pass count: %d" % native_values.size())
 	for i in native_values.size():
 		require(_native_id(native_values[i]) == EXPECTED_NATIVE_ORDER[i], "default native order changed at index %d: got %d, expected %d" % [i, _native_id(native_values[i]), EXPECTED_NATIVE_ORDER[i]])
 	# The engine's default order (used when no pipeline resource is configured) is the
 	# same list, so a project with and without the addon runs the same frame.
 	var spec_default_order: Array = spec.get("default_order", [])
-	require(spec_default_order == EXPECTED_NATIVE_ORDER, "the engine's default pass order is not the id order: %s" % [spec_default_order])
+	require(spec_default_order == EXPECTED_NATIVE_ORDER, "the engine's default pass order changed: %s" % [spec_default_order])
 	# The default enabled set is the default pass set: every non optional entry is
 	# enabled and the one optional entry (Temporal AA) ships disabled, so a fresh
 	# pipeline runs the default passes and the user opts into TAA by enabling it.
@@ -665,7 +664,7 @@ func run() -> void:
 	for value in native_values:
 		if value.enabled:
 			enabled_native_ids.append(_native_id(value))
-	require(enabled_native_ids == [0, 1, 2, 3, 4, 5, 7], "default enabled pass set changed: %s" % [enabled_native_ids])
+	require(enabled_native_ids == [0, 1, 2, 3, 4, 5, 8, 7], "default enabled pass set changed: %s" % [enabled_native_ids])
 
 	var manifest_property := ""
 	for candidate in ["_synced_library", "library_manifest", "_library_manifest"]:
@@ -676,7 +675,7 @@ func run() -> void:
 	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
-	# Manifest metadata seeds Eye Adaptation before Color Grade and Post Process,
+	# Manifest metadata seeds Eye Adaptation before Bloom and Color Grade,
 	# enabled Magic GI after Lighting, enabled Height Fog after Sky, and disabled
 	# Debug Buffers after Post Process. Other effects remain opt-in.
 	var library_entries := []
@@ -685,7 +684,7 @@ func run() -> void:
 			library_entries.append(value)
 	require(library_entries.size() == 5, "the default pipeline must seed Color Grade, Magic GI, Height Fog, Eye Adaptation and Debug Buffers, got %d library entries" % library_entries.size())
 	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 5,
-		"the default pipeline must have eight native and five seeded library entries, got %d" % unified_renderer.passes.size())
+		"the default pipeline must have nine native and five seeded library entries, got %d" % unified_renderer.passes.size())
 	var seeded_magic_index := -1
 	var seeded_fog_index := -1
 	var seeded_eye_index := -1
@@ -695,6 +694,7 @@ func run() -> void:
 	var seeded_sky_index := -1
 	var seeded_transparent_index := -1
 	var seeded_temporal_index := -1
+	var seeded_bloom_index := -1
 	var seeded_post_index := -1
 	for i in unified_renderer.passes.size():
 		var entry = unified_renderer.passes[i]
@@ -703,6 +703,9 @@ func run() -> void:
 		if _native_id(entry) == 5: seeded_transparent_index = i
 		if _native_id(entry) == 6: seeded_temporal_index = i
 		if _native_id(entry) == 7: seeded_post_index = i
+		if _native_id(entry) == 8:
+			seeded_bloom_index = i
+			require(entry.enabled, "native Bloom must be enabled in the fresh default pipeline")
 		if String(entry.stable_id) == "library:color_grade": seeded_grade_index = i
 		if String(entry.stable_id) == "library:magic_gi":
 			seeded_magic_index = i
@@ -720,14 +723,16 @@ func run() -> void:
 		"Magic GI must be anchored after Lighting and before Sky")
 	require(seeded_sky_index < seeded_fog_index and seeded_fog_index < seeded_transparent_index,
 		"Height Fog must be anchored after Sky and before Transparent")
-	require(seeded_temporal_index < seeded_eye_index and seeded_eye_index < seeded_grade_index and seeded_grade_index < seeded_post_index,
-		"exposure must follow Temporal AA and precede Color Grade and Post Process")
+	require(seeded_temporal_index < seeded_eye_index and seeded_eye_index < seeded_bloom_index and seeded_bloom_index < seeded_grade_index and seeded_grade_index < seeded_post_index,
+		"the default order must place Eye Adaptation, native Bloom, Color Grade and Post Process in sequence")
 	var bloom_insert_index := FRP_LIBRARY.calculate_insert_index(unified_renderer.passes, &"library:bloom_downsample")
-	require(seeded_eye_index < bloom_insert_index and bloom_insert_index <= seeded_grade_index,
-		"optional Bloom must be inserted after metering and before Color Grade")
+	require(seeded_bloom_index < bloom_insert_index and bloom_insert_index <= seeded_grade_index,
+		"optional Bloom-lite must be inserted after native Bloom and before Color Grade")
 	require(seeded_debug_index > seeded_post_index, "Debug Buffers must be anchored after Post Process")
 	var legacy_order_renderer = renderer_script2.new()
 	var legacy_entries: Array[FengPass] = legacy_order_renderer.passes.duplicate()
+	var legacy_native_bloom = _native_pass(legacy_order_renderer, 8)
+	legacy_entries.erase(legacy_native_bloom)
 	var legacy_eye: FengPass
 	for entry in legacy_entries:
 		if entry.stable_id == &"library:eye_adaptation":
@@ -841,9 +846,13 @@ shader_file = ExtResource("2")
 		if _native_id(entry) == 7:
 			post_index = i
 	require(surviving == loaded_values, "library sync reordered existing entries")
-	# Color Grade is anchored between Temporal AA and Post Process, not at the end.
-	require(inserted_index >= 0 and temporal_index < inserted_index and inserted_index < post_index,
-		"the re-synced Color Grade pass was not anchored between Temporal AA and Post Process (temporal %d, color grade %d, post %d)" % [temporal_index, inserted_index, post_index])
+	var bloom_index := -1
+	for i in loaded_renderer.passes.size():
+		if _native_id(loaded_renderer.passes[i]) == 8:
+			bloom_index = i
+	# Color Grade is anchored after native Bloom and before Post Process, not at the end.
+	require(inserted_index >= 0 and bloom_index >= 0 and bloom_index < inserted_index and inserted_index < post_index,
+		"the re-synced Color Grade pass was not anchored after Bloom and before Post Process (bloom %d, color grade %d, post %d)" % [bloom_index, inserted_index, post_index])
 	print("PASS unified native ids/names/order and saved library sync")
 
 	# A newly authored resource must persist native enabled state and the
@@ -878,8 +887,12 @@ shader_file = ExtResource("2")
 			reloaded_temporal_index = i
 		if _native_id(value) == 7:
 			reloaded_post_index = i
-	require(reloaded_grade_index >= 0 and reloaded_temporal_index >= 0 and reloaded_post_index >= 0, "could not locate the library pass or the temporal/post entries")
-	require(reloaded_temporal_index < reloaded_grade_index and reloaded_grade_index < reloaded_post_index, "the library pass position was not persisted between temporal AA and post")
+	var reloaded_bloom_index := -1
+	for i in reloaded_renderer.passes.size():
+		if _native_id(reloaded_renderer.passes[i]) == 8:
+			reloaded_bloom_index = i
+	require(reloaded_grade_index >= 0 and reloaded_temporal_index >= 0 and reloaded_bloom_index >= 0 and reloaded_post_index >= 0, "could not locate the library pass or the temporal/Bloom/Post entries")
+	require(reloaded_temporal_index < reloaded_bloom_index and reloaded_bloom_index < reloaded_grade_index and reloaded_grade_index < reloaded_post_index, "the library pass position was not persisted after Bloom and before Post")
 	print("PASS renderer save/load preserves native state and custom order")
 
 	# Load a hand-authored legacy .tres with no schema version, only one custom

@@ -1,7 +1,8 @@
 @tool
 extends "native_pass.gd"
-## Post Process / Tonemap: the frame's final resolve, the post-processing stages
-## (glow, depth of field, auto exposure, post AA prep) and the tone mapping.
+## Post Process / Tonemap: the frame's final resolve, depth of field, auto exposure
+## and tone mapping. The separate Bloom native entry prepares the Environment Glow
+## texture before this pass; Tonemap composites it here when that entry ran.
 ##
 ## Post-processing and tone mapping are two separate Core primitives, so this pass
 ## decides where its own overlay runs:

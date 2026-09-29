@@ -452,7 +452,40 @@ void RendererSceneRenderRD::_render_buffers_copy_depth_texture(const RenderDataR
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa) {
+float RendererSceneRenderRD::_render_buffers_auto_exposure(const RenderDataRD *p_render_data) {
+	ERR_FAIL_NULL_V(p_render_data, 1.0f);
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND_V(rb.is_null(), 1.0f);
+	ERR_FAIL_COND_V_MSG(p_render_data->reflection_probe.is_valid(), 1.0f, "Post processes should not be applied on reflection probes.");
+
+	Size2i target_size = rb->get_target_size();
+	bool can_use_effects = target_size.x >= 8 && target_size.y >= 8;
+	can_use_effects &= _debug_draw_can_use_effects(debug_draw);
+
+	float auto_exposure_scale = 1.0f;
+	if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+		RENDER_TIMESTAMP("Auto exposure");
+		RD::get_singleton()->draw_command_begin_label("Auto Exposure");
+
+		Ref<RendererRD::Luminance::LuminanceBuffers> luminance_buffers = luminance->get_luminance_buffers(rb);
+		uint64_t auto_exposure_version = RSG::camera_attributes->camera_attributes_get_auto_exposure_version(p_render_data->camera_attributes);
+		bool set_immediate = auto_exposure_version != rb->get_auto_exposure_version();
+		rb->set_auto_exposure_version(auto_exposure_version);
+
+		double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * time_step;
+		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
+		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
+		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+
+		// Swap final reduce with prev luminance.
+		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+		RenderingServerDefault::redraw_request(); // Redraw all the time if auto exposure rendering is on.
+		RD::get_singleton()->draw_command_end_label();
+	}
+	return auto_exposure_scale;
+}
+
+void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa, bool p_run_auto_exposure) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
@@ -551,134 +584,131 @@ void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_r
 		RD::get_singleton()->draw_command_end_label();
 	}
 
-	float auto_exposure_scale = 1.0;
-
-	if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-		RENDER_TIMESTAMP("Auto exposure");
-
-		RD::get_singleton()->draw_command_begin_label("Auto Exposure");
-
-		Ref<RendererRD::Luminance::LuminanceBuffers> luminance_buffers = luminance->get_luminance_buffers(rb);
-
-		uint64_t auto_exposure_version = RSG::camera_attributes->camera_attributes_get_auto_exposure_version(p_render_data->camera_attributes);
-		bool set_immediate = auto_exposure_version != rb->get_auto_exposure_version();
-		rb->set_auto_exposure_version(auto_exposure_version);
-
-		double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * time_step;
-		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
-		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
-		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
-
-		// Swap final reduce with prev luminance.
-
-		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
-
-		RenderingServerDefault::redraw_request(); // Redraw all the time if auto exposure rendering is on.
-		RD::get_singleton()->draw_command_end_label();
+	if (p_run_auto_exposure) {
+		_render_buffers_auto_exposure(p_render_data);
 	}
 
-	if (can_use_effects && p_render_data->environment.is_valid() && environment_get_glow_enabled(p_render_data->environment)) {
-		RENDER_TIMESTAMP("Glow");
+}
 
-		rb->allocate_blur_textures();
+void RendererSceneRenderRD::_render_buffers_bloom(const RenderDataRD *p_render_data, float p_auto_exposure_scale, RID p_auto_exposure_texture, float p_scene_pre_exposure) {
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	ERR_FAIL_NULL(p_render_data);
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	ERR_FAIL_COND_MSG(p_render_data->reflection_probe.is_valid(), "Post processes should not be applied on reflection probes.");
 
-		int mipmaps = int(rb->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1).mipmaps);
-		Vector<float> glow_levels = environment_get_glow_levels(p_render_data->environment);
-		bool use_debanding = rb->get_use_debanding() && !texture_storage->render_target_is_using_hdr(render_target);
+	Size2i target_size = rb->get_target_size();
+	bool can_use_effects = target_size.x >= 8 && target_size.y >= 8;
+	can_use_effects &= _debug_draw_can_use_effects(debug_draw);
+	if (!can_use_effects || !p_render_data->environment.is_valid() || !environment_get_glow_enabled(p_render_data->environment)) {
+		return;
+	}
+	bool can_use_storage = _render_buffers_can_be_storage();
+	RID render_target = rb->get_render_target();
 
-		int max_glow_index = -1;
-		int min_glow_level = RSE::MAX_GLOW_LEVELS;
-		for (int i = 0; i < RSE::MAX_GLOW_LEVELS; i++) {
-			if (glow_levels[i] > 0.01) {
-				max_glow_index = MAX(max_glow_index, i);
-				min_glow_level = MIN(min_glow_level, i);
+
+	RENDER_TIMESTAMP("Glow");
+
+	rb->allocate_blur_textures();
+
+	int mipmaps = int(rb->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1).mipmaps);
+	Vector<float> glow_levels = environment_get_glow_levels(p_render_data->environment);
+	bool use_debanding = rb->get_use_debanding() && !texture_storage->render_target_is_using_hdr(render_target);
+
+	int max_glow_index = -1;
+	int min_glow_level = RSE::MAX_GLOW_LEVELS;
+	for (int i = 0; i < RSE::MAX_GLOW_LEVELS; i++) {
+		if (glow_levels[i] > 0.01) {
+			max_glow_index = MAX(max_glow_index, i);
+			min_glow_level = MIN(min_glow_level, i);
+		}
+	}
+
+	max_glow_index = MIN(max_glow_index, mipmaps - 1);
+
+	float luminance_multiplier = rb->get_luminance_multiplier();
+	if (can_use_storage) {
+		RD::get_singleton()->draw_command_begin_label("Gaussian Glow");
+		RID luminance_texture = p_auto_exposure_texture;
+		if (!luminance_texture.is_valid() && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+			luminance_texture = luminance->get_current_luminance_buffer(rb); // this will return and empty RID if we don't have an auto exposure buffer
+		}
+		for (uint32_t l = 0; l < rb->get_view_count(); l++) {
+			Size2i vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, 0);
+			RID source = rb->get_internal_texture(l);
+			RID dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 0);
+			copy_effects->gaussian_glow(source, dest, vp_size, environment_get_glow_strength(p_render_data->environment), true, environment_get_glow_hdr_luminance_cap(p_render_data->environment), environment_get_exposure(p_render_data->environment), environment_get_glow_bloom(p_render_data->environment), environment_get_glow_hdr_bleed_threshold(p_render_data->environment), environment_get_glow_hdr_bleed_scale(p_render_data->environment), luminance_texture, p_auto_exposure_scale, p_scene_pre_exposure);
+
+			for (int i = 1; i < (max_glow_index + 1); i++) {
+				source = dest;
+				vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, i);
+				dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i);
+				copy_effects->gaussian_glow(source, dest, vp_size, environment_get_glow_strength(p_render_data->environment));
 			}
 		}
+		RD::get_singleton()->draw_command_end_label();
+	} else {
+		// For the mobile renderer we blur down and up the mip chain. Which works out to (2*level-1) passes. This
+		// allows us to gather our levels at low resolutions and ultimately save a lot of texture read bandwidth.
+		// The tradeoff is that we need to use single-pass blur to minimize the number of render passes.
 
-		max_glow_index = MIN(max_glow_index, mipmaps - 1);
+		RID source;
+		RID dest;
 
-		float luminance_multiplier = rb->get_luminance_multiplier();
-		if (can_use_storage) {
-			RD::get_singleton()->draw_command_begin_label("Gaussian Glow");
-			RID luminance_texture;
-			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-				luminance_texture = luminance->get_current_luminance_buffer(rb); // this will return and empty RID if we don't have an auto exposure buffer
-			}
-			for (uint32_t l = 0; l < rb->get_view_count(); l++) {
-				Size2i vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, 0);
-				RID source = rb->get_internal_texture(l);
-				RID dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 0);
-				copy_effects->gaussian_glow(source, dest, vp_size, environment_get_glow_strength(p_render_data->environment), true, environment_get_glow_hdr_luminance_cap(p_render_data->environment), environment_get_exposure(p_render_data->environment), environment_get_glow_bloom(p_render_data->environment), environment_get_glow_hdr_bleed_threshold(p_render_data->environment), environment_get_glow_hdr_bleed_scale(p_render_data->environment), luminance_texture, auto_exposure_scale);
+		for (uint32_t l = 0; l < rb->get_view_count(); l++) {
+			RD::get_singleton()->draw_command_begin_label("Gaussian Glow downsample");
 
-				for (int i = 1; i < (max_glow_index + 1); i++) {
-					source = dest;
-					vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, i);
-					dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i);
-					copy_effects->gaussian_glow(source, dest, vp_size, environment_get_glow_strength(p_render_data->environment));
-				}
+			Size2i source_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_COLOR, 0);
+
+			source = rb->get_internal_texture(l);
+			dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 1); // Level 1 is quarter res.
+
+			copy_effects->gaussian_glow_downsample_raster(source, dest, luminance_multiplier, source_size, environment_get_glow_strength(p_render_data->environment), true, environment_get_glow_hdr_luminance_cap(p_render_data->environment), environment_get_exposure(p_render_data->environment), environment_get_glow_bloom(p_render_data->environment), environment_get_glow_hdr_bleed_threshold(p_render_data->environment), environment_get_glow_hdr_bleed_scale(p_render_data->environment));
+
+			Size2i vp_size;
+			for (int i = 1; i < (max_glow_index + 1); i++) {
+				source = dest;
+				vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, i);
+				dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i + 1);
+
+				copy_effects->gaussian_glow_downsample_raster(source, dest, luminance_multiplier, vp_size, environment_get_glow_strength(p_render_data->environment));
 			}
 			RD::get_singleton()->draw_command_end_label();
-		} else {
-			// For the mobile renderer we blur down and up the mip chain. Which works out to (2*level-1) passes. This
-			// allows us to gather our levels at low resolutions and ultimately save a lot of texture read bandwidth.
-			// The tradeoff is that we need to use single-pass blur to minimize the number of render passes.
+			RD::get_singleton()->draw_command_begin_label("Gaussian Glow upsample");
 
-			RID source;
-			RID dest;
+			if (max_glow_index <= 0) {
+				// Only layer 1 is visible, just copy over.
+				source = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK); // Technically a waste, but oh well. I'm not optimizing for the case of only level 1.
+				vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, 2); // RB_TEX_BLUR_0 is double the size of RB_TEX_BLUR_1, so go up a mip level.
+				dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, l, 2);
+				RID blend_tex = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 1);
+				source_size = vp_size;
 
-			for (uint32_t l = 0; l < rb->get_view_count(); l++) {
-				RD::get_singleton()->draw_command_begin_label("Gaussian Glow downsample");
-
-				Size2i source_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_COLOR, 0);
-
-				source = rb->get_internal_texture(l);
-				dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 1); // Level 1 is quarter res.
-
-				copy_effects->gaussian_glow_downsample_raster(source, dest, luminance_multiplier, source_size, environment_get_glow_strength(p_render_data->environment), true, environment_get_glow_hdr_luminance_cap(p_render_data->environment), environment_get_exposure(p_render_data->environment), environment_get_glow_bloom(p_render_data->environment), environment_get_glow_hdr_bleed_threshold(p_render_data->environment), environment_get_glow_hdr_bleed_scale(p_render_data->environment));
-
-				Size2i vp_size;
-				for (int i = 1; i < (max_glow_index + 1); i++) {
-					source = dest;
-					vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, i);
-					dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i + 1);
-
-					copy_effects->gaussian_glow_downsample_raster(source, dest, luminance_multiplier, vp_size, environment_get_glow_strength(p_render_data->environment));
-				}
-				RD::get_singleton()->draw_command_end_label();
-				RD::get_singleton()->draw_command_begin_label("Gaussian Glow upsample");
-
-				if (max_glow_index <= 0) {
-					// Only layer 1 is visible, just copy over.
-					source = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK); // Technically a waste, but oh well. I'm not optimizing for the case of only level 1.
-					vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, 2); // RB_TEX_BLUR_0 is double the size of RB_TEX_BLUR_1, so go up a mip level.
-					dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, l, 2);
-					RID blend_tex = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 1);
-					source_size = vp_size;
-
-					copy_effects->gaussian_glow_upsample_raster(source, dest, blend_tex, luminance_multiplier, source_size, vp_size, glow_levels[0], 0.0, use_debanding);
-				}
-
-				for (int i = max_glow_index - 1; i >= 0; i--) {
-					source = dest;
-					source_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, i + 3);
-					vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, i + 2); // RB_TEX_BLUR_0 is double the size of RB_TEX_BLUR_1, so go up a mip level.
-					dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, l, i + 2);
-					RID blend_tex = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i + 1);
-
-					copy_effects->gaussian_glow_upsample_raster(source, dest, blend_tex, luminance_multiplier, source_size, vp_size, glow_levels[i], i == (max_glow_index - 1) ? glow_levels[i + 1] : 1.0, use_debanding);
-				}
-				RD::get_singleton()->draw_command_end_label();
+				copy_effects->gaussian_glow_upsample_raster(source, dest, blend_tex, luminance_multiplier, source_size, vp_size, glow_levels[0], 0.0, use_debanding);
 			}
+
+			for (int i = max_glow_index - 1; i >= 0; i--) {
+				source = dest;
+				source_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, i + 3);
+				vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, i + 2); // RB_TEX_BLUR_0 is double the size of RB_TEX_BLUR_1, so go up a mip level.
+				dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_0, l, i + 2);
+				RID blend_tex = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, i + 1);
+
+				copy_effects->gaussian_glow_upsample_raster(source, dest, blend_tex, luminance_multiplier, source_size, vp_size, glow_levels[i], i == (max_glow_index - 1) ? glow_levels[i + 1] : 1.0, use_debanding);
+			}
+			RD::get_singleton()->draw_command_end_label();
 		}
 	}
 }
 
 void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const RenderDataRD *p_render_data, bool p_use_msaa) {
 	_render_buffers_post_process(p_render_data, p_use_msaa);
+	float auto_exposure_scale = RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes) ? RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes) : 1.0f;
+	_render_buffers_bloom(p_render_data, auto_exposure_scale);
 	_render_buffers_tonemap(p_render_data);
 }
 
-void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present) {
+void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present, bool p_allow_glow) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
@@ -744,7 +774,7 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 			tonemap.exposure_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 		}
 
-		if (can_use_effects && p_render_data->environment.is_valid() && environment_get_glow_enabled(p_render_data->environment)) {
+		if (p_allow_glow && can_use_effects && p_render_data->environment.is_valid() && environment_get_glow_enabled(p_render_data->environment)) {
 			tonemap.use_glow = true;
 			tonemap.glow_mode = environment_get_glow_blend_mode(p_render_data->environment);
 			tonemap.glow_intensity = tonemap.glow_mode == RSE::ENV_GLOW_BLEND_MODE_MIX ? environment_get_glow_mix(p_render_data->environment) : environment_get_glow_intensity(p_render_data->environment);

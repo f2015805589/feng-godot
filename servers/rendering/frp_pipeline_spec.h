@@ -34,10 +34,10 @@
 
 // The FRP pass set is described exactly once, here.
 //
-// Ids, table order and execution order are the same thing: pass N runs after pass
-// N-1 unless the pipeline resource lists them in another order, and the resource's
-// order is what the renderer executes (see run_builtin_pass). There is no hidden
-// reorder and no second "execution order" table.
+// Native pass ids are stable identifiers, NATIVE_PASSES is listed by id, and the
+// resource's order is what the renderer executes (see run_builtin_pass). A fresh
+// resource and a frame without a pipeline use DEFAULT_PASS_ORDER, which can differ
+// from numeric id order when an established pass id must stay stable.
 //
 // A *pass* is what the user sees: one entry in the pipeline resource that can be
 // enabled, disabled and reordered. An *operation* is one grouped renderer step
@@ -46,8 +46,8 @@
 // history, specular merge) stopped being separately switchable passes without
 // changing any of the verified rendering code.
 //
-// The engine ships eight native passes; the pipeline's ninth entry (Color Grade) is
-// a pass the addon provides, seeded between Temporal AA and Post Process. Nothing
+// The engine ships nine native passes; Color Grade is a pass the addon provides,
+// seeded after Bloom and before Post Process. Nothing
 // outside that set exists: FRP has no screen space effects, no global illumination
 // and no debug geometry of its own.
 //
@@ -55,9 +55,9 @@
 // (through RenderingServer::get_frp_pipeline_spec()).
 namespace FRPPipelineSpec {
 
-// Internal renderer operations, in the order the default frame reaches them. These
-// are implementation units, not user-facing passes; a plugin pass reaches them
-// through FRPPassContext.
+// Internal renderer operations. Their numeric ids stay stable; the default frame
+// reaches them in pass order. These are implementation units, not user-facing passes;
+// a plugin pass reaches them through FRPPassContext.
 enum Operation {
 	// Pass 0: drawing the shadow maps. Pure drawing work, so it goes first: it reads
 	// no scene depth and no material page.
@@ -89,7 +89,10 @@ enum Operation {
 	OP_POST_PROCESS = 17,
 	OP_TONEMAP = 18,
 	OP_TONEMAP_DEFERRED = 19,
-	OP_MAX = 20,
+	// Appended to preserve existing operation values. It prepares Gaussian Glow after
+	// exposure measurement; the tone mapper performs the composite.
+	OP_BLOOM = 20,
+	OP_MAX = 21,
 };
 
 inline constexpr int MAX_OPERATIONS_PER_PASS = 6;
@@ -102,6 +105,7 @@ enum PassId {
 	PASS_VIRTUAL_TEXTURE = 1,
 	PASS_TEMPORAL_AA = 6,
 	PASS_POST_PROCESS = 7,
+	PASS_BLOOM = 8,
 };
 
 struct NativePass {
@@ -114,22 +118,22 @@ struct NativePass {
 	bool optional;
 };
 
-// The passes, in id order, which is also the order a fresh pipeline seeds and the
-// order a frame without a pipeline resource executes them in.
+// The native passes, in stable id order. DEFAULT_PASS_ORDER is the order a fresh
+// pipeline seeds and the order a frame without a pipeline resource executes them in.
 //
 // Why this order: the shadow maps are drawn first, because drawing them depends on
 // nothing else in the frame (see OP_SHADOW_PRECOMPUTE); virtual texture updates must
 // finish before the G-buffer reads material pages; the G-buffer writes depth; the
 // Lighting pass prepares the light and cluster data, lets the PRE_LIGHTING compositor
 // stage edit that G-buffer, and then runs deferred lighting; sky is drawn before
-// transparent geometry so the background exists behind it; temporal AA and colour
-// grading run on the resolved frame before the final tone mapping.
+// transparent geometry so the background exists behind it; Bloom runs after the
+// resolved frame and exposure measurement, before the final post-processing/tone mapping pass.
 //
 // "Light precompute" here means drawing, not every preparation step: the light and
 // cluster buffers stay with the Lighting pass, because they are consumed by it.
 //
 // Colour grading is not a native entry: it is a pass the addon provides, seeded
-// between Temporal AA and Post Process, which is what lets its shader and its
+// after Bloom and before Post Process, which is what lets its shader and its
 // parameters be replaced without an engine change.
 inline constexpr NativePass NATIVE_PASSES[] = {
 	{ 0, "Shadow Precompute", { OP_SHADOW_PRECOMPUTE }, 1, false },
@@ -141,16 +145,19 @@ inline constexpr NativePass NATIVE_PASSES[] = {
 	// Enabling this entry enables TAA: the viewport jitter follows it, so the entry is
 	// the switch and the project setting only decides for viewports without a
 	// pipeline. It ships disabled, the one pass a project opts into. The viewport's
-	// own temporal upscaler (FSR 2, MetalFX) always runs here too: an upscaler is
-	// requested by the viewport, not by the pipeline. The operation resolves the frame
-	// itself when MSAA is on, so the entry can be switched off without leaving an
-	// unresolved frame behind.
+	// own temporal upscaler (FSR 2, MetalFX) is requested independently; when this
+	// optional entry is disabled, the first consuming operation runs the upscaler.
+	// This operation resolves the frame itself when MSAA is on.
 	{ 6, "Temporal AA", { OP_TEMPORAL_AA }, 1, true },
 	// The frame always ends here, so the resolve and the history live with the tone
-	// mapping rather than with TAA. Post-processing and tone mapping are separate
-	// operations: a scripted pass can run its own effects between them, or after the
+	// mapping rather than with TAA. Bloom prepares the native glow texture in its own
+	// earlier pass; post-processing and tone mapping remain separate operations.
+	// A scripted pass can run its own effects between them, or after the
 	// tone mapping (see FRPPassContext::tonemap_deferred()/present()).
 	{ 7, "Post Process / Tonemap", { OP_FINAL_RESOLVE, OP_HISTORY_COPY, OP_POST_PROCESS, OP_TONEMAP }, 4, false },
+	// Glow preparation is a separate scheduled pass so it can run after exposure
+	// measurement while Tonemap keeps owning the final glow composite.
+	{ 8, "Bloom", { OP_BLOOM }, 1, false },
 };
 
 inline constexpr int PASS_COUNT = sizeof(NATIVE_PASSES) / sizeof(NATIVE_PASSES[0]);
@@ -173,12 +180,15 @@ inline constexpr int PASS_DEPENDENCIES[][2] = {
 	{ 3, 4 }, // Sky is drawn over the lit opaque result.
 	{ 4, 5 }, // Sky must exist before transparent geometry is blended over it.
 	{ 5, 6 },
-	{ 6, 7 },
+	{ 5, 8 }, // Bloom reads the resolved frame after transparent geometry.
+	{ 6, 8 },
+	{ 8, 7 },
 };
 
-// Execution order used when no pipeline resource is configured: id order, which is
-// the order a fresh pipeline resource seeds as well.
-inline constexpr int DEFAULT_PASS_ORDER[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+// Execution order used when no pipeline resource is configured; a fresh pipeline
+// resource seeds this same order. Post Process remains id 7 for compatibility, so
+// Bloom id 8 is deliberately scheduled before it.
+inline constexpr int DEFAULT_PASS_ORDER[] = { 0, 1, 2, 3, 4, 5, 6, 8, 7 };
 
 inline constexpr int MANDATORY_PASS_COUNT = sizeof(MANDATORY_PASSES) / sizeof(MANDATORY_PASSES[0]);
 inline constexpr int PASS_DEPENDENCY_COUNT = sizeof(PASS_DEPENDENCIES) / sizeof(PASS_DEPENDENCIES[0]);

@@ -113,11 +113,13 @@ protected:
 	void _render_buffers_ensure_depth_texture(const RenderDataRD *p_render_data);
 	void _render_buffers_copy_depth_texture(const RenderDataRD *p_render_data, bool p_use_msaa = false);
 	void _render_buffers_post_process_and_tonemap(const RenderDataRD *p_render_data, bool p_use_msaa = false);
-	// The two halves of the entry point above. A pass can run effects on the HDR image
-	// between them, or after the tone mapping when p_defer_present left the present
-	// step to the caller.
-	void _render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa = false);
-	void _render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present = false);
+	// Post processing, Bloom preparation and tone mapping are separate operations. Bloom
+	// prepares the glow texture; tone mapping still composites it with the Environment's
+	// blend mode and intensity.
+	float _render_buffers_auto_exposure(const RenderDataRD *p_render_data);
+	void _render_buffers_post_process(const RenderDataRD *p_render_data, bool p_use_msaa = false, bool p_run_auto_exposure = true);
+	void _render_buffers_bloom(const RenderDataRD *p_render_data, float p_auto_exposure_scale = 1.0f, RID p_auto_exposure_texture = RID(), float p_scene_pre_exposure = 1.0f);
+	void _render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present = false, bool p_allow_glow = true);
 	void _post_process_subpass(RID p_source_texture, RID p_framebuffer, const RenderDataRD *p_render_data);
 	void _disable_clear_request(const RenderDataRD *p_render_data);
 

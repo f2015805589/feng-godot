@@ -186,6 +186,10 @@ void FRPPassContext::temporal_aa_and_upscale() {
 	_run_operation(FRPPipelineSpec::OP_TEMPORAL_AA);
 }
 
+void FRPPassContext::prepare_bloom() {
+	_run_operation(FRPPipelineSpec::OP_BLOOM);
+}
+
 void FRPPassContext::resolve_final() {
 	_run_operation(FRPPipelineSpec::OP_FINAL_RESOLVE);
 }
@@ -262,6 +266,7 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("copy_screen_and_depth"), &FRPPassContext::copy_screen_and_depth);
 	ClassDB::bind_method(D_METHOD("draw_transparent"), &FRPPassContext::draw_transparent);
 	ClassDB::bind_method(D_METHOD("temporal_aa_and_upscale"), &FRPPassContext::temporal_aa_and_upscale);
+	ClassDB::bind_method(D_METHOD("prepare_bloom"), &FRPPassContext::prepare_bloom);
 	ClassDB::bind_method(D_METHOD("resolve_final"), &FRPPassContext::resolve_final);
 	ClassDB::bind_method(D_METHOD("copy_history"), &FRPPassContext::copy_history);
 	ClassDB::bind_method(D_METHOD("post_process"), &FRPPassContext::post_process);

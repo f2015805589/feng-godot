@@ -107,12 +107,13 @@ public:
 	void copy_screen_and_depth();
 	void draw_transparent();
 	void temporal_aa_and_upscale();
+	void prepare_bloom();
 	void resolve_final();
 	void copy_history();
-	// Post-processing (glow, DoF, auto exposure, AA prep) and tone mapping are separate
-	// steps, so a pass decides where its own effects run:
-	//   post_process(); <effects on the HDR image>; tonemap();
-	//   post_process(); tonemap_deferred(); <effects on the toned image>; present();
+	// Bloom preparation, post-processing (DoF and auto exposure), and tone mapping are
+	// separate operations. A pass decides where its HDR/LDR effects run:
+	//   prepare_bloom(); post_process(); <effects on HDR>; tonemap();
+	//   post_process(); tonemap_deferred(); <effects on LDR>; present();
 	void post_process();
 	void tonemap();
 	// Tone mapping that leaves the engine's present step to the caller: the toned image

@@ -122,6 +122,11 @@ run("height_fog", ["--script", str(ROOT / "misc/scripts/tests/frp_height_fog.gd"
 # and signalled to the overlay shader as a shader keyword (specialization constant).
 run("post", ["--script", str(ROOT / "misc/scripts/tests/frp_post.gd")],
     "PASS post effects run before or after tone mapping, selected by a shader keyword")
+# Native Bloom is an engine scheduled pass, but its Environment Glow parameters
+# and final composite remain on Environment/Tonemap. It must follow exposure and
+# Transparent even when TAA is disabled, and disabling it suppresses stale Glow.
+run("bloom", ["--script", str(ROOT / "misc/scripts/tests/frp_bloom.gd")],
+    "PASS FRP native Bloom schedule, migration, dependencies and glow switch")
 # The built-in Eye Adaptation pass meters the frame's luminance (64-bin log
 # histogram), adapts temporally and folds the colour buffer by scale / adapted,
 # the addon equivalent of UE's pre-exposure.

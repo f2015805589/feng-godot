@@ -7,12 +7,12 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 ## 使用
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
-2. 创建 `FengRenderer`，默认包含 8 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Height Fog`、`Eye Adaptation`、
-	`Debug Buffers` 五个库 Pass，共 13 个条目；TAA、Color Grade、Debug Buffers 默认关闭，其余默认开启（Magic GI 没有有效烘焙时不改画面）。
+2. 创建 `FengRenderer`，默认包含 9 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Height Fog`、`Eye Adaptation`、
+	`Debug Buffers` 五个库 Pass，共 14 个条目；TAA、Color Grade、Debug Buffers 默认关闭。Bloom 条目默认开启，具体 Glow 效果仍由 Environment 的 Glow 设置控制。
 3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment（或者用项目设置，
    见下文"项目级管线"）。
 4. 在 Inspector 的 Passes 数组中拖动排序，编辑条目的 Enabled。条目显示具体名称，
-   例如 `Lighting`、`Blur Horizontal`、`Bloom Composite`。
+	例如 `Lighting`、`Bloom`、`Blur Horizontal`、`Bloom Composite`。
 5. 在 Inspector 选中 Renderer 或 FengCompositor 后，使用工具菜单
    **Add Pass from Library** 添加库效果。添加和排序支持编辑器撤销、重做。
 
@@ -26,7 +26,7 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | `editor_plugin.gd` + `editor/` | 编辑器那一半：工具菜单、检查器告警、项目设置行、autoload 注册 |
 | `pipeline/` | `execution_plan`（纯调度计划）、`compositor_binding`（引擎绑定）、`parameter_resolver`（参数协议），以及`native_spec`（引擎 pass 表）、`library_manager`（内置库与同步）、`pipeline_migrator`（旧资源迁移）、`pipeline_validator`（校验）、`addon_layout`（插件自身路径） |
 | `passes/` | Pass 的类：`pass_base`（`FengPass`）、`builtin_pass`、`shader_pass`、`pass_texture`、`pass_output`、`texture_manager`（输出纹理分配） |
-| `passes/native/` | 8 个引擎 Pass 的默认实现脚本 |
+| `passes/native/` | 9 个引擎 Pass 的默认实现脚本 |
 | `volume/` | 空间节点与模块资源、`volume_runtime`（注册和相机生命周期）、`volume_resolver`（混合） |
 | `library/` | 内置效果模板（`*.tres` + `*.glsl`），从 **Add Pass from Library** 添加 |
 | `examples/` | 示例与测试用 shader / 资源 |
@@ -45,9 +45,9 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 的一个组合步骤。Pass 展开成一个或多个 Operation，所以 resolve、拷贝、历史帧、高光合并这类
 记账步骤不再是可独立开关的 Pass，而仍然照常执行。
 
-**ID 顺序就是执行顺序**：pass id 连续、按执行顺序编号，默认调度就是 `0,1,2,…,7`；渲染器按
-**资源里的条目顺序**逐个执行，所以你在 Inspector 里拖动条目就是在改执行顺序（和 URP 一样）。
-依赖约束只做校验（例如阴影必须在 Lighting 之前），不会替你重排。
+**Native ID 是稳定身份，执行顺序来自资源里的条目顺序**。Post Process 保留旧 ID 7，新增 Bloom 使用 ID 8，
+所以默认执行顺序是 `0,1,2,3,4,5,6,8,7`。渲染器按**资源里的条目顺序**逐个执行；在 Inspector 拖动条目就是改执行顺序。
+依赖约束只做校验（例如 Transparent 必须先于 Bloom，Bloom 必须先于 Post），不会替你重排。
 
 | ID | 名称 | 内容 |
 |---|---|---|
@@ -57,28 +57,31 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | 3 | Lighting | 灯光/Cluster buffer、decal、体积雾准备 → PRE_LIGHTING 阶段 → 全屏延迟光照、次表面散射与分离高光合并、不透明附件 resolve |
 | 4 | Sky | 天空及其后附件 resolve |
 | 5 | Transparent | 不适合 GBuffer 的前向材质、屏幕/深度副本、透明物体 |
-| 6 | Temporal AA | TAA（**打开该条目即开启**，视口 jitter 跟随该条目）；视口的时序上采样器（FSR 2 / MetalFX）也在这里运行（默认关闭） |
+| 6 | Temporal AA | TAA（**打开该条目即开启**，视口 jitter 跟随该条目）；FSR 2 / MetalFX 按视口请求运行，若该条目关闭则在 Bloom 或 Post Process 首次需要结果时运行 |
 | 7 | Post Process / Tonemap | 最终颜色/深度/运动矢量 resolve、引擎后处理与输出 |
+| 8 | Bloom | 根据 Environment 的 Glow 设置准备原生 Gaussian Glow 纹理；最终混合仍由 Post Process 中的 Tonemap 完成 |
 
-引擎侧只有这 8 条；默认的五个库 Pass 按各自的 native 锚点插入，顺序为
-`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent → TAA → Eye Adaptation → Color Grade → Post Process → Debug Buffers`。
+引擎侧有 9 条；默认的五个库 Pass 按各自的 native 锚点插入，顺序为
+`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent → TAA → Eye Adaptation → Bloom → Color Grade → Post Process → Debug Buffers`。
 SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP 的 pass**：FRP 不声明、
 不分配、也不合成它们，光照 shader 对这些附件始终用引擎默认（黑色）纹理。
 
 颜色分级不是引擎条目，而是库里的 `Color Grade` Pass——它的 shader 和参数因此可以随插件更新，
-不需要改引擎。**一个新 Renderer 的列表正好是这 13 条**：8 个引擎条目 + 五个默认库条目。
+不需要改引擎。**一个新 Renderer 的列表正好是这 14 条**：9 个引擎条目 + 五个默认库条目。
 库里的其它模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
 **Add Pass from Library** 添加；它们和 Color Grade 一样默认关闭，打开条目即生效。
 
 `Magic GI` 在 Lighting 后、Sky 前将 surface PRT 的传输系数与当前太阳/环境 SH 点积，作为漫反射间接光加回 HDR；它只使用当前视口匹配的最新有效烘焙，动态光照变化不需要重烘焙。没有有效烘焙或当前 viewport 不匹配时，该 pass 清零自己的诊断纹理并保持画面不变。`Debug Buffers` 默认关闭且不分配输出，可切换到 albedo、view-space normal、AO、roughness、metallic、motion vectors 或 Magic GI 贡献；启用时在 Post Process 后直接显示所选原始缓冲。
 
-`Eye Adaptation` 在 TAA 后测量 HDR 场景色，位于可选 Bloom 和 Color Grade 前；UE 也是先计算曝光，再做 Bloom，并在 Tonemap 中应用曝光和颜色分级。该 Pass 自身有两个全局开关：`extend_default_luminance_range` 切换 UE 的传统亮度范围与 EV100 范围，`pre_exposure` 用上一帧已完成的曝光值预缩放场景光照。相机曝光参数放在该 pass 的 Volume 模块中，包括 Histogram / Basic / Manual 测光、Low/High Percent、亮度或 EV100 上下限、Speed Up/Down、曝光补偿、补偿曲线、测光遮罩，以及手动模式的光圈、快门和 ISO。`CurveTexture` 的 X 轴 0 到 1 对应 UE 默认的 -10 到 20 EV100 曲线区间。开启项目的物理光照单位后，FRP 的点光、聚光与矩形光按 UE 的流明立体角和 π 系数换算。
+`Eye Adaptation` 在 TAA 后测量 HDR 场景色，位于 native Bloom 和 Color Grade 前；默认顺序及依赖校验都保证 Eye Adaptation 先于 Bloom。Bloom 条目负责执行 Environment Glow 的模糊准备，Environment 的 `glow_enabled`、levels、strength、blend mode、intensity 与 glow map 继续配置具体效果；关闭 Bloom 条目会禁用这帧的 Environment Glow 合成。FRP 默认在 Post Process 前准备 Bloom，因此 Glow 使用 DoF 处理前的 HDR 颜色；FRP 的无资源默认调度也使用这个顺序。其它渲染器的旧 Post Process helper 仍按 DoF 后 Glow 的顺序运行。没有 FRP 管线资源时，引擎原生 Glow 路径照常工作。UE 也是先计算曝光，再做 Bloom，并在 Tonemap 中应用曝光和颜色分级。该 Pass 自身有两个全局开关：`extend_default_luminance_range` 切换 UE 的传统亮度范围与 EV100 范围，`pre_exposure` 用上一帧已完成的曝光值预缩放场景光照。相机曝光参数放在该 pass 的 Volume 模块中，包括 Histogram / Basic / Manual 测光、Low/High Percent、亮度或 EV100 上下限、Speed Up/Down、曝光补偿、补偿曲线、测光遮罩，以及手动模式的光圈、快门和 ISO。`CurveTexture` 的 X 轴 0 到 1 对应 UE 默认的 -10 到 20 EV100 曲线区间。开启项目的物理光照单位后，FRP 的点光、聚光与矩形光按 UE 的流明立体角和 π 系数换算。
+
+Bloom 使用 Eye Adaptation 的当前曝光纹理准备 Glow，并将 firefly 压缩及逆变换的亮度上限按本帧 pre-exposure 同比例缩放，使阈值计算不受场景缓冲 pre-exposure 编码影响。因此 Eye Adaptation 的 `pre_exposure` 开关不会改变 Environment Glow threshold、bloom 与 exposure 参数的含义；它只改变 HDR 场景缓冲在 Tonemap 前的编码范围。
 
 这些条目执行真实的原生操作，但粒度是上述组合步骤，不是逐个 GPU draw/dispatch。
 "光照预计算"只指**绘制**阴影这一步；灯光/Cluster buffer 与体积雾属于 Lighting pass（它们在那
 被消费），没有单独拆成条目。反射探针和普通 Compositor 保留原有阶段调度。
 
-**默认的 pass 集是插件侧代码**（当前 schema 7）：上表每一条都有一个 `FengNativePass` 脚本
+**默认的 pass 集是插件侧代码**（当前 schema 8）：上表每一条都有一个 `FengNativePass` 脚本
 （`passes/native/*.gd`），每个原生条目（`FengBuiltinPass`）通过 `implementation` 指向它。
 条目默认由脚本驱动——脚本调用 Core 原语执行该 pass 的 operation，并把该 pass 声明为
 "provided" 交给引擎，因此引擎不再为它发 token；把 `implementation` 清空该条目就退回引擎自带的
@@ -120,17 +123,18 @@ GI buffer 混合、SSAO/SSIL/SSR 块、`scene_forward_gi_inc.glsl` 的引用与�
 与 `RB_SCOPE_GI` 的 `RenderBuffersGI` 存储对象（体积雾的 compute uniform set 无条件绑定它，
 FRP 的 voxel GI 计数恒为 0，所以雾的 GI 注入不会执行）。
 
-6（Temporal AA）与 7（Color Grade）默认关闭，打开条目即生效。**Temporal AA 条目就是 TAA 的开关**：
+Temporal AA 与库里的 Color Grade 默认关闭，打开条目即生效。Bloom 原生条目默认开启，但 Environment Glow 关闭时不做 Glow 工作。**Temporal AA 条目就是 TAA 的开关**：
 视口 jitter 跟随该条目（`RendererViewport` 在把相机的合成器管线读出来后决定 16 相位还是 0 相位），
 所以不会出现"条目开着却没有 jitter（糊）"或"条目关着却被抖动（闪）"。项目设置
 `rendering/anti_aliasing/quality/use_taa` 与 `Viewport.use_taa` 只对**没有配置 FRP 管线的视口**生效
 （例如未安装插件的项目、或引擎默认顺序路径）。视口的时序上采样器（FSR 2 / MetalFX）自带 jitter，
-不受该条目影响，也不与该条目同时启用 TAA。
+不受该条目影响，也不与该条目同时启用 TAA；其上采样结果仍会在 Bloom 或 Post Process 消费前生成。
 
 排序受数据依赖约束：Shadow 必须先于 Lighting（光照采样阴影贴图），VT Pass 必须先于 GBuffer，
 GBuffer 必须先于 Lighting（PRE_LIGHTING 阶段与光照都读 G-buffer），Lighting 必须先于 Sky，
-Sky 必须先于 Transparent，Transparent → Temporal AA → Post 依次成立。0、1、2、3、7 是完整输出
-必需 的条目，不能删除或禁用（除非由自定义 pass 声明接管，见下）；只有 Temporal AA 可以关闭。
+Sky 必须先于 Transparent，Transparent 必须先于 Bloom；如果启用 TAA，则 TAA 也必须先于 Bloom；Bloom 必须先于 Post。
+Eye Adaptation 也必须先于 Bloom。0、1、2、3、7 是完整输出必需的条目，不能删除或禁用
+（除非由自定义 pass 声明接管，见下）；Bloom 可关闭，TAA 默认关闭且可选。
 
 运动矢量由 GBuffer Pass 在**同一遍几何**里写出：该 Pass 的 framebuffer 带上速度附件，shader
 使用带 `MOTION_VECTORS` 的 G-buffer 变体，速度写在 4 个 G-buffer 附件之后的位置 4。TAA、3D 上采样与
@@ -298,8 +302,8 @@ tonemap 过的图像"，把输入声明成 `FengPassTexture.Source.TONEMAPPED`�
 `library:color_grade`、`library:magic_gi`、`library:height_fog`、`library:eye_adaptation`、`library:debug_buffers`。其余是模板——它们不会自动推进任何已有 Renderer，
 也不会出现在新 Renderer 的列表里，只能从检查器的 **Add Pass from Library** 添加；添加后
 由 manifest（`_synced_library` / `_deleted_library`）记录身份与删除墓碑，不会重复插入，
-也不会把你删掉的条目加回来。Color Grade 缺失时会被同步回 Temporal AA 与 Post Process
-之间（它的锚点）。
+也不会把你删掉的条目加回来。Eye Adaptation 缺失时会同步到 native Bloom 前；Color Grade
+缺失时会同步到 Bloom 与 Post Process 之间（它的锚点）。
 
 稳定 ID 应保持不变。同步补充身份与显示名，不会强行合并已实例化模板的参数改动。旧版只有
 自定义效果的 `.tres` 会迁移为完整列表，并按原 Stage 安排初始位置，保留旧的库删除记录。
@@ -324,7 +328,7 @@ Operation 承担，开关状态和自定义条目的相对位置都会被保留�
 - 在 FengRenderer 中，自定义效果按列表位置运行。`stage` 仅保留为回调参数及旧资源
   迁移提示；在普通 Compositor 中仍按原 Stage 调度。
 - 当前 `Color` 指内部 HDR 颜色；依赖它的效果应位于 Deferred Lighting 后、Tonemap 前。
-  `Magic GI` 由 manifest 锚定在 Lighting 后，`Color Grade` 在 Temporal AA 后，`Debug Buffers` 在 Post Process 后。
+  `Magic GI` 由 manifest 锚定在 Lighting 后，`Color Grade` 在 Bloom 后，`Debug Buffers` 在 Post Process 后。
   自定义纹理必须先生产再消费。同一 Pass 的 storage-image 输出绑定可以引用自身输出。
 
 禁用的自定义 Pass 仍保留在 effects 中，重新启用不再需要重新插入。FengCompositor

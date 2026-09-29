@@ -41,6 +41,7 @@ layout(push_constant, std430) uniform Params {
 	vec2 octmap_border_size;
 
 	vec4 set_color;
+	float glow_pre_exposure;
 }
 params;
 
@@ -107,7 +108,10 @@ void main() {
 #ifdef MODE_GLOW
 	if (bool(params.flags & FLAG_GLOW_FIRST_PASS)) {
 		// Tonemap initial samples to reduce weight of fireflies: https://graphicrants.blogspot.com/2013/12/tone-mapping.html
-		vec3 tonemap_col = vec3(0.299, 0.587, 0.114) / max(params.glow_luminance_cap, 6.0);
+		// Keep this nonlinear compression invariant under scene pre-exposure by
+		// scaling the cap by the same P used to render the current scene.
+		float glow_cap = max(params.glow_luminance_cap, 6.0) * max(params.glow_pre_exposure, 1e-12);
+		vec3 tonemap_col = vec3(0.299, 0.587, 0.114) / glow_cap;
 		local_cache[dest_index] /= 1.0 + dot(local_cache[dest_index].rgb, tonemap_col);
 		local_cache[dest_index + 1] /= 1.0 + dot(local_cache[dest_index + 1].rgb, tonemap_col);
 		local_cache[dest_index + 16] /= 1.0 + dot(local_cache[dest_index + 16].rgb, tonemap_col);
@@ -181,8 +185,9 @@ void main() {
 
 #ifdef MODE_GLOW
 	if (bool(params.flags & FLAG_GLOW_FIRST_PASS)) {
+		float glow_cap = max(params.glow_luminance_cap, 6.0) * max(params.glow_pre_exposure, 1e-12);
 		// Undo tonemap to restore range: https://graphicrants.blogspot.com/2013/12/tone-mapping.html
-		color /= 1.0 - dot(color.rgb, vec3(0.299, 0.587, 0.114) / max(params.glow_luminance_cap, 6.0));
+		color /= 1.0 - dot(color.rgb, vec3(0.299, 0.587, 0.114) / glow_cap);
 	}
 
 	color *= params.glow_strength;

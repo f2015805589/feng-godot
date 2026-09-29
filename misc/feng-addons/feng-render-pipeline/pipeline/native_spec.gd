@@ -25,6 +25,7 @@ const PASS_SKY := 4
 const PASS_TRANSPARENT := 5
 const PASS_TEMPORAL_AA := 6
 const PASS_POST_PROCESS := 7
+const PASS_BLOOM := 8
 
 ## Engine texture scopes and names the addon reads or writes.
 const SCOPE_FRP_CLUSTERED: StringName = &"frp_clustered"
@@ -55,10 +56,10 @@ static func pass_count() -> int:
 static func pass_definitions() -> Array:
 	return spec().get("passes", [])
 
-## Default execution order, which is the engine's pass id order: shadow maps first
-## (drawing them depends on nothing else in the frame), then virtual texture updates,
-## the G-buffer, lighting, sky, transparent, temporal AA and post. The pipeline resource
-## lists entries in this order and the renderer executes the list in order.
+## Default execution order: shadow maps first (drawing them depends on nothing else in
+## the frame), then virtual texture updates, the G-buffer, lighting, sky, transparent,
+## temporal AA, Bloom and Post Process. The pipeline resource lists entries in this
+## order and the renderer executes the list in order.
 static func seed_order() -> Array:
 	return spec().get("default_order", [])
 
@@ -70,8 +71,8 @@ static func order_edges() -> Array:
 static func mandatory_ids() -> Array:
 	return spec().get("mandatory", [])
 
-## Whether a pass ships disabled. Enabling its entry is what turns the effect on, and
-## Temporal AA is the one pass that does.
+## Whether a pass ships disabled. Enabling its entry is what turns the effect on; at
+## present Temporal AA is the only native entry that ships disabled.
 static func is_optional_id(p_native_id: int) -> bool:
 	for definition in pass_definitions():
 		if int(definition["id"]) == p_native_id:

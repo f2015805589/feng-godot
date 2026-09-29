@@ -811,7 +811,7 @@ void CopyEffects::gaussian_blur_raster(RID p_source_rd_texture, RID p_dest_textu
 	RD::get_singleton()->draw_list_end();
 }
 
-void CopyEffects::gaussian_glow(RID p_source_rd_texture, RID p_back_texture, const Size2i &p_size, float p_strength, bool p_first_pass, float p_luminance_cap, float p_exposure, float p_bloom, float p_hdr_bleed_threshold, float p_hdr_bleed_scale, RID p_auto_exposure, float p_auto_exposure_scale) {
+void CopyEffects::gaussian_glow(RID p_source_rd_texture, RID p_back_texture, const Size2i &p_size, float p_strength, bool p_first_pass, float p_luminance_cap, float p_exposure, float p_bloom, float p_hdr_bleed_threshold, float p_hdr_bleed_scale, RID p_auto_exposure, float p_auto_exposure_scale, float p_pre_exposure) {
 	ERR_FAIL_COND_MSG(raster_effects.has_flag(RASTER_EFFECT_GAUSSIAN_BLUR), "Can't use the compute version of the gaussian glow.");
 
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -836,6 +836,7 @@ void CopyEffects::gaussian_glow(RID p_source_rd_texture, RID p_back_texture, con
 	copy.push_constant.glow_luminance_cap = p_luminance_cap;
 
 	copy.push_constant.glow_auto_exposure_scale = p_auto_exposure_scale; //unused also
+	copy.push_constant.glow_pre_exposure = p_pre_exposure;
 
 	// setup our uniforms
 	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
