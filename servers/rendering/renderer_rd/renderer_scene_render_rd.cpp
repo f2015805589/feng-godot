@@ -729,8 +729,15 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 
 		bool using_hdr = texture_storage->render_target_is_using_hdr(render_target);
 
-		tonemap.exposure_texture = luminance->get_current_luminance_buffer(rb);
-		if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes) && tonemap.exposure_texture.is_valid()) {
+		RID exposure_override = get_tonemap_exposure_override();
+		tonemap.exposure_texture = exposure_override.is_valid() ? exposure_override : luminance->get_current_luminance_buffer(rb);
+		if (exposure_override.is_valid()) {
+			// FRP's Eye Adaptation computes exposure before Bloom and passes its
+			// GPU result to tonemapping, as UE does. The texture stores the
+			// reciprocal of the scale to apply to pre-exposed scene color.
+			tonemap.use_auto_exposure = true;
+			tonemap.auto_exposure_scale = rb->get_luminance_multiplier();
+		} else if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes) && tonemap.exposure_texture.is_valid()) {
 			tonemap.use_auto_exposure = true;
 			tonemap.auto_exposure_scale = auto_exposure_scale;
 		} else {

@@ -49,8 +49,10 @@ void main() {
 
 // Keep clustered light lookup/shadows from the shared renderer include, but
 // route every resolved light through FRP's own ShadingModelID/BxDF dispatcher.
-void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light);
+void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, vec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light);
 #define FRP_LIGHT_COMPUTE frp_light_compute
+#define FRP_LIGHT_COLOR(color) vec3(color)
+#define FRP_AREA_LIGHT_COLOR(color) hvec3(vec3(color) * implementation_data.pre_exposure)
 #include "../scene_forward_lights_inc.glsl"
 #include "frp_shading_models_inc.glsl"
 /* clang-format on */
@@ -106,8 +108,8 @@ layout(location = 1) out vec4 specular_color;
 uint frp_active_shading_model_id;
 FRPBRDFData frp_active_brdf;
 
-void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light) {
-	FRPDirectLighting lighting = frp_integrate_bxdf(frp_active_shading_model_id, frp_active_brdf, vec3(N), vec3(V), vec3(L), float(A), vec3(light_color), float(attenuation), float(specular_amount));
+void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, vec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light) {
+	FRPDirectLighting lighting = frp_integrate_bxdf(frp_active_shading_model_id, frp_active_brdf, vec3(N), vec3(V), vec3(L), float(A), vec3(light_color) * implementation_data.pre_exposure, float(attenuation), float(specular_amount));
 	diffuse_light += hvec3(lighting.diffuse + lighting.transmission);
 	specular_light += hvec3(lighting.specular);
 }
@@ -611,6 +613,8 @@ void main() {
 	direct_specular_light *= direct_ao;
 	diffuse_light *= 1.0 - metallic;
 	ambient_light *= 1.0 - metallic;
+	ambient_light *= implementation_data.pre_exposure;
+	indirect_specular_light *= implementation_data.pre_exposure;
 
 	vec3 color = frp_compose_bxdf(shading_model_id, brdf, ambient_light, diffuse_light, direct_specular_light, indirect_specular_light);
 

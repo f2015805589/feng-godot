@@ -103,6 +103,12 @@ hvec3 f0_Clear_Coat_To_Surface(hvec3 f0) {
 #ifndef FRP_LIGHT_COMPUTE
 #define FRP_LIGHT_COMPUTE light_compute
 #endif
+#ifndef FRP_LIGHT_COLOR
+#define FRP_LIGHT_COLOR(color) hvec3(color)
+#endif
+#ifndef FRP_AREA_LIGHT_COLOR
+#define FRP_AREA_LIGHT_COLOR(color) hvec3(color)
+#endif
 
 void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
@@ -735,7 +741,7 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 	}
 
 	vec3 light_rel_vec_norm = light_rel_vec / light_length;
-	FRP_LIGHT_COMPUTE(normal, hvec3(light_rel_vec_norm), eye_vec, size, hvec3(color), false, omni_attenuation * shadow, f0, roughness, metallic, half(omni_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
+	FRP_LIGHT_COMPUTE(normal, hvec3(light_rel_vec_norm), eye_vec, size, FRP_LIGHT_COLOR(color), false, omni_attenuation * shadow, f0, roughness, metallic, half(omni_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 			backlight,
 #endif
@@ -937,7 +943,7 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 		}
 	}
 
-	FRP_LIGHT_COMPUTE(normal, hvec3(light_rel_vec_norm), eye_vec, size, hvec3(color), false, spot_attenuation * shadow, f0, roughness, metallic, half(spot_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
+	FRP_LIGHT_COMPUTE(normal, hvec3(light_rel_vec_norm), eye_vec, size, FRP_LIGHT_COLOR(color), false, spot_attenuation * shadow, f0, roughness, metallic, half(spot_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 			backlight,
 #endif
@@ -1130,7 +1136,7 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #endif
 	light_attenuation_ltc = light_attenuation_ltc * shadow;
 	half light_attenuation = light_attenuation_raw * shadow;
-	hvec3 color = hvec3(area_lights.data[idx].color);
+	hvec3 color = FRP_AREA_LIGHT_COLOR(area_lights.data[idx].color);
 	float max_mipmap = area_lights.data[idx].cone_angle;
 
 	vec3 points[4];

@@ -1,77 +1,99 @@
 #[compute]
 #version 450
 
-// Weighted log-average of the luminance histogram + exponential temporal
-// adaptation, matching UE's PostProcessEyeAdaptation. The metered luminance is
-// the frame's true luminance (this addon pass runs before its own apply
-// dispatch, so the color buffer still holds unexposed values).
-
+// UE 5.7 PostProcessHistogramCommon.ush / PostProcessEyeAdaptation.usf.
 #define NUM_BINS 64
-
-layout(local_size_x = NUM_BINS, local_size_y = 1, local_size_z = 1) in;
-
-shared float shared_weighted[NUM_BINS];
+#define WEIGHT_SCALE 524288.0
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer restrict EyeAdaptationBuffer {
 	uint histogram[NUM_BINS];
-	float adapted_luminance;
+	uint histogram_overflow[NUM_BINS];
+	float adapted_exposure;
+	float exposure_scale;
 	float pad0;
 	float pad1;
-	float pad2;
-}
-params_buffer;
+} state;
+layout(set = 1, binding = 0) uniform sampler2D exposure_curve;
+layout(r32f, set = 2, binding = 0) uniform writeonly image2D tonemap_exposure;
 
 layout(push_constant, std430) uniform Params {
-	float exposure_adjust; // adaptation speed * frame dt
 	float log_min;
 	float log_range;
-	float min_luminance;
-	float max_luminance;
-	float pixel_count;
+	float min_white_luminance;
+	float max_white_luminance;
+	float low_percent;
+	float high_percent;
+	float speed_up;
+	float speed_down;
+	float delta_time;
+	float exposure_compensation;
+	float manual_white_luminance;
+	float force_target;
 	float set_immediate;
-	float pad;
-}
-params;
+	float metering_mode;
+	float use_exposure_curve;
+	float previous_pre_exposure;
+} params;
 
 void main() {
-	uint t = gl_LocalInvocationID.x;
-
-	float count = float(params_buffer.histogram[t]);
-	shared_weighted[t] = count * float(t);
-
-	groupMemoryBarrier();
-	barrier();
-
-	for (uint size = NUM_BINS >> 1; size > 0; size >>= 1) {
-		if (t < size) {
-			shared_weighted[t] += shared_weighted[t + size];
-		}
-		groupMemoryBarrier();
-		barrier();
+	float total = 0.0;
+	for (uint i = 0u; i < NUM_BINS; ++i) {
+		total += float(state.histogram[i]) / WEIGHT_SCALE + float(state.histogram_overflow[i]) * 8192.0;
 	}
-
-	if (t == 0) {
-		// Bin 0 holds pixels below the metering floor; exclude them.
-		float valid_count = max(params.pixel_count - float(params_buffer.histogram[0]), 1.0);
-		float weighted_log_average = shared_weighted[0] / valid_count - 1.0;
-		float measured = exp2(weighted_log_average / float(NUM_BINS - 2) * params.log_range + params.log_min);
-
-		float adapted = params_buffer.adapted_luminance;
-		// A wild divergence means the stored state came from another scene's
-		// buffer (stale metering) rather than a slow drift — reseed instead of
-		// exponentially crawling back for seconds.
-		if (params.set_immediate > 0.5 || adapted <= 0.0 ||
-				measured * 64.0 < adapted || measured > adapted * 64.0) {
-			adapted = measured;
-		} else {
-			adapted = adapted + (measured - adapted) * (1.0 - exp(-params.exposure_adjust));
-		}
-		adapted = clamp(adapted, params.min_luminance, params.max_luminance);
-		params_buffer.adapted_luminance = adapted;
+	float min_fraction_sum = total * params.low_percent;
+	float max_fraction_sum = total * params.high_percent;
+	float weighted_log_sum = 0.0;
+	float retained = 0.0;
+	for (uint i = 0u; i < NUM_BINS; ++i) {
+		float count = float(state.histogram[i]) / WEIGHT_SCALE + float(state.histogram_overflow[i]) * 8192.0;
+		float below = min(count, min_fraction_sum);
+		count -= below;
+		min_fraction_sum -= below;
+		max_fraction_sum -= below;
+		count = min(count, max_fraction_sum);
+		max_fraction_sum -= count;
+		weighted_log_sum += (params.log_min + float(i) / float(NUM_BINS - 1) * params.log_range) * count;
+		retained += count;
+		state.histogram[i] = 0u;
+		state.histogram_overflow[i] = 0u;
 	}
-
-	groupMemoryBarrier();
-	barrier();
-
-	params_buffer.histogram[t] = 0u; // clear for next frame
+	float measured = exp2(weighted_log_sum / max(retained, 0.0001));
+	float compensation = params.exposure_compensation;
+	if (params.use_exposure_curve > 0.5) {
+		float ev100 = log2(max(measured / 0.18, 0.0001));
+		// UE's 64-sample LUT maps its [-10, 20] EV100 domain to texel centers.
+		float lut_scale = 63.0 / (64.0 * 30.0);
+		float curve_u = clamp(ev100 * lut_scale + 0.5 / 64.0 + 10.0 * lut_scale, 0.0, 1.0);
+		compensation *= exp2(texture(exposure_curve, vec2(curve_u, 0.5)).r);
+	}
+	float min_average = min(params.min_white_luminance, params.max_white_luminance) * 0.18;
+	float max_average = max(params.min_white_luminance, params.max_white_luminance) * 0.18;
+	float target_exposure = clamp(measured, min_average, max_average) / 0.18;
+	if (params.metering_mode > 1.5) {
+		target_exposure = params.manual_white_luminance;
+	}
+	float old_exposure = compensation / max(state.exposure_scale, 1e-12);
+	if (params.set_immediate > 0.5 || params.force_target > 0.5 || state.exposure_scale <= 0.0) {
+		old_exposure = target_exposure;
+	}
+	float log_target = log2(max(target_exposure, 0.0001));
+	float log_old = log2(max(old_exposure, 0.0001));
+	float log_diff = log_target - log_old;
+	float speed = log_diff > 0.0 ? params.speed_up : params.speed_down;
+	float start_distance = 1.5;
+	float start_time = start_distance / max(speed, 0.001);
+	float exponential_m = (1.0 / 60.0) / ((1.0 - exp2(-speed / 60.0)) * start_time);
+	float exponential = log_old + log_diff * (1.0 - exp2(-params.delta_time * speed)) * exponential_m;
+	float linear = log_old + sign(log_diff) * min(abs(log_diff), params.delta_time * speed);
+	float adapted = exp2(abs(log_diff) > start_distance ? linear : exponential);
+	if (params.force_target > 0.5 || params.set_immediate > 0.5) {
+		adapted = target_exposure;
+	}
+	adapted = clamp(adapted, min_average / 0.18, max_average / 0.18);
+	state.adapted_exposure = adapted;
+	state.exposure_scale = compensation / max(adapted, 0.0001);
+	// Godot's Tonemap samples this reciprocal and multiplies the HDR color by
+	// current exposure / previous scene pre-exposure, like UE's Tonemap pass.
+	imageStore(tonemap_exposure, ivec2(0), vec4(params.previous_pre_exposure / max(state.exposure_scale, 1e-12), 0.0, 0.0, 0.0));
 }

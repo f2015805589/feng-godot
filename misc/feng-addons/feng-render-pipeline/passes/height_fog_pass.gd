@@ -10,6 +10,16 @@ extends FengRuntimeSnapshotPass
 const UBO_BINDING := 2
 const UBO_SIZE := 240 # Two mat4s + seven vec4s.
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
+var _pre_exposure := 1.0
+
+func _frp_execute(ctx: FRPPassContext) -> void:
+	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
+	super._frp_execute(ctx)
+	_pre_exposure = 1.0
+
+func _parameter_bytes() -> PackedByteArray:
+	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
+	return PackedFloat32Array([value.x, _pre_exposure, value.z, value.w]).to_byte_array()
 
 func _init() -> void:
 	inputs = _make_inputs()

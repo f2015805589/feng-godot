@@ -2833,7 +2833,8 @@ void fragment_shader(in SceneData scene_data) {
 	// AO_LIGHT_AFFECT behavior in deferred lighting.
 	orm_output_buffer.a = frp_encode_gbuffer_metadata(material_id, ao_light_affect);
 
-	emission_output_buffer.rgb = emission;
+	// Keep emissive within half-float range before the deferred lighting pass.
+	emission_output_buffer.rgb = emission * implementation_data.pre_exposure;
 	// The alpha channel of the emission target is free (it was a constant 0 and
 	// nothing read it), so it carries the material specular instead of wasting
 	// 16 bits per pixel. This mirrors Unreal's GBufferB, which stores specular
@@ -2909,6 +2910,8 @@ void fragment_shader(in SceneData scene_data) {
 	diffuse_buffer.rgb = diffuse_buffer.rgb * fog.a + fog.rgb;
 	specular_buffer.rgb = specular_buffer.rgb * fog.a;
 #endif //!FOG_DISABLED
+	diffuse_buffer.rgb *= implementation_data.pre_exposure;
+	specular_buffer.rgb *= implementation_data.pre_exposure;
 
 #else //MODE_SEPARATE_SPECULAR
 
@@ -2924,6 +2927,7 @@ void fragment_shader(in SceneData scene_data) {
 #ifndef FOG_DISABLED
 	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
 #endif //!FOG_DISABLED
+	frag_color.rgb *= implementation_data.pre_exposure;
 
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;

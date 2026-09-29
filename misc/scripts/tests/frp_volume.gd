@@ -121,6 +121,11 @@ func _run() -> void:
 	var probe := Probe.new()
 	probe.pass_parameters = {"strength": 4.0}
 	var entries: Array[FengPass] = renderer.passes.duplicate()
+	# This test checks Volume parameter delivery against a stable scene color.
+	# Exposure adapts over time and would change the sampled pixel independently.
+	for i in range(entries.size() - 1, -1, -1):
+		if entries[i].stable_id == &"library:eye_adaptation":
+			entries.remove_at(i)
 	entries.append(probe)
 	renderer.passes = entries
 	var key: Variant = probe.get_parameter_key()

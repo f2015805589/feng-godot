@@ -157,5 +157,5 @@ void main() {
 
 	vec4 fog = get_exponential_height_fog(camera_to_receiver);
 	vec4 scene_color = imageLoad(color_image, pixel);
-	imageStore(color_image, pixel, vec4(fog.rgb + scene_color.rgb * fog.a, scene_color.a));
+	imageStore(color_image, pixel, vec4(fog.rgb * pc.parameters.y + scene_color.rgb * fog.a, scene_color.a));
 }

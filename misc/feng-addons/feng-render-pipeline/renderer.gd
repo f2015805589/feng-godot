@@ -23,7 +23,9 @@ const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
 ## is plugin-side code and the engine's own passes are the no-pipeline fallback.
-const PIPELINE_SCHEMA_VERSION := 6
+## Schema 7 moves Eye Adaptation before Bloom and Color Grade, following UE's
+## exposure-before-bloom and tonemap/grade sequence.
+const PIPELINE_SCHEMA_VERSION := 7
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -44,7 +46,7 @@ const NativePass = preload("passes/native/native_pass.gd")
 
 ## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
 ## Shadow Precompute, VT, GBuffer, Lighting, Magic GI, Sky, Transparent, Temporal AA,
-## Color Grade, Eye Adaptation, Post Process, Debug Buffers.
+## Eye Adaptation, Color Grade, Post Process, Debug Buffers.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
 
 ## The library entries a fresh pipeline seeds.
@@ -266,12 +268,15 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 		_seed_pending = false
 		_seed_default_passes()
 	var changed := false
-	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION and not _has_native_schedule():
+	var previous_version := _pipeline_schema_version
+	if previous_version < 6 and not _has_native_schedule():
 		changed = _migrate_legacy_passes() or changed
-	elif _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
+	elif previous_version < 6:
 		changed = _migrate_native_pass_set() or changed
 	else:
 		changed = _normalize_native_entries() or changed
+	if previous_version < 7:
+		changed = _migrate_eye_adaptation_order() or changed
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
@@ -345,7 +350,7 @@ func get_provided_native_ids() -> PackedInt32Array:
 ## the authored state, without the runtime volume layer.
 func get_authored_pass_parameters() -> Dictionary:
 	_ensure_pipeline_initialized(false)
-	return ParameterResolver.authored(_passes)
+	return _with_eye_adaptation_state(ParameterResolver.authored(_passes), {})
 
 func get_volume_modules() -> Array[FengPass]:
 	_ensure_pipeline_initialized(false)
@@ -353,7 +358,21 @@ func get_volume_modules() -> Array[FengPass]:
 
 func get_pass_parameters() -> Dictionary:
 	_ensure_pipeline_initialized(false)
-	return ParameterResolver.resolve(_passes, _volume_parameters)
+	return _with_eye_adaptation_state(ParameterResolver.resolve(_passes, _volume_parameters))
+
+func _with_eye_adaptation_state(parameters: Dictionary, states: Variant = null) -> Dictionary:
+	var key := "library:eye_adaptation"
+	var eye_pass_enabled := false
+	var effective_states: Dictionary = _volume_pass_states if states == null else states
+	for pass_entry in _passes:
+		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation" and ExecutionPlan.is_entry_enabled(pass_entry, effective_states):
+			eye_pass_enabled = true
+			break
+	var exposure: Dictionary = parameters.get(key, {}).duplicate()
+	exposure["pre_exposure"] = bool(exposure.get("pre_exposure", false)) and eye_pass_enabled
+	exposure["frp_eye_adaptation_enabled"] = eye_pass_enabled
+	parameters[key] = exposure
+	return parameters
 
 ## Revision-cached authored snapshot for per-camera evaluation. Resource changes
 ## invalidate it; callers receive isolated dictionaries. Stationary Volume frames
@@ -418,6 +437,32 @@ func _migrate_native_pass_set() -> bool:
 		if p is PassBase:
 			migrated.append(p)
 	_set_passes(migrated, false)
+	return true
+
+## Schema 6 placed Color Grade and optional Bloom before exposure. UE meters
+## scene color after temporal AA and before Bloom, then grades during tonemapping.
+## Move only the managed Eye Adaptation entry, preserving every other pass's order.
+func _migrate_eye_adaptation_order() -> bool:
+	var eye_index := -1
+	var first_after_eye := _passes.size()
+	for i in _passes.size():
+		var pass_entry := _passes[i]
+		if pass_entry == null:
+			continue
+		if pass_entry.stable_id == &"library:eye_adaptation":
+			eye_index = i
+		elif pass_entry.stable_id in [
+			&"library:bloom_downsample", &"library:bloom_blur",
+			&"library:bloom_composite", &"library:color_grade",
+		]:
+			first_after_eye = mini(first_after_eye, i)
+	var temporal_index := _find_native_index(NativeSpec.PASS_TEMPORAL_AA)
+	var post_index := _find_native_index(NativeSpec.PASS_POST_PROCESS)
+	if eye_index < 0 or first_after_eye >= eye_index or (temporal_index >= 0 and first_after_eye <= temporal_index) or (post_index >= 0 and first_after_eye >= post_index):
+		return false
+	var eye_pass := _passes[eye_index]
+	_passes.remove_at(eye_index)
+	_passes.insert(first_after_eye, eye_pass)
 	return true
 
 func _normalize_native_entries() -> bool:
@@ -522,7 +567,7 @@ func apply(compositor: Compositor) -> void:
 		# computed pass defaults, even when a caller did not emit changed.
 		_volume_context_cache = {}
 		context = _initialized_volume_context()
-		parameters = ParameterResolver.resolve_context(_passes, _volume_parameters, context)
+		parameters = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, context))
 	var result := CompositorBinding.apply(
 		compositor,
 		_manager,
@@ -564,7 +609,7 @@ func apply_volume(compositor: Compositor, parameters: Dictionary, pass_states: D
 		# Fixed presets keep the same resolved upload across boundary crossings.
 		if _volume_binding.parameters != _volume_parameters:
 			_volume_binding.parameters = _volume_parameters.duplicate(true)
-			_volume_binding.resolved = ParameterResolver.resolve_context(_passes, _volume_parameters, _volume_binding.context)
+			_volume_binding.resolved = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, _volume_binding.context))
 		# Crossing a boundary switches between authored and runtime effect RIDs.
 		# Restore the cached binding even though neither renderer's author changed.
 		if compositor.compositor_effects != _volume_binding.effects:

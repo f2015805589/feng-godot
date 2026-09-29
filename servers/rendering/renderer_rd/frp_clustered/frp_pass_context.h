@@ -56,16 +56,20 @@ class FRPPassContext : public RefCounted {
 	// Presents a texture to the viewport's render target. Only the renderer can reach
 	// the render target, so the primitive goes through this callback.
 	std::function<void(const StringName &)> present_runner;
+	std::function<float(int)> pre_exposure_reader;
+	std::function<void(int, float)> pre_exposure_writer;
+	std::function<void(RID)> eye_exposure_texture_writer;
 	// Resolved frame parameters, keyed by native pass id or custom pass name.
 	Dictionary pass_parameters;
 
 	void _run_operation(int p_operation);
+	static void _finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view);
 
 protected:
 	static void _bind_methods();
 
 public:
-	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>());
+	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>());
 
 	// Frame state.
 	RenderDataRD *get_render_data() const { return render_data; }
@@ -78,6 +82,10 @@ public:
 	// own settings this way, so the pipeline resource is the single place a project
 	// configures a pass.
 	Dictionary get_pass_parameters(const Variant &p_pass_id) const;
+	float get_pre_exposure(int p_view) const;
+	void set_next_pre_exposure(int p_view, float p_exposure);
+	void set_tonemap_exposure_texture(RID p_texture);
+	Error request_next_pre_exposure(RID p_buffer, int p_view, int p_offset);
 
 	// Core primitives. One per engine operation, in execution order.
 	void precompute_shadows();

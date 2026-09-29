@@ -219,6 +219,9 @@ public:
 	_FORCE_INLINE_ bool is_using_physical_light_units() {
 		return use_physical_light_units;
 	}
+	virtual bool uses_frp_ue_light_units() const { return false; }
+	virtual bool uses_frp_eye_adaptation() const { return false; }
+	virtual RID get_tonemap_exposure_override() const { return RID(); }
 
 	/* REFLECTION PROBE */
 

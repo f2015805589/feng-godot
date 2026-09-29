@@ -326,7 +326,7 @@ struct ImplementationData {
 	bool volumetric_fog_enabled;
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
-	uint volumetric_fog_pad;
+	float pre_exposure;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {

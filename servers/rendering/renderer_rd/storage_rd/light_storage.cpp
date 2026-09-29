@@ -761,7 +761,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 					light_data.energy *= Math::PI;
 				}
 
-				if (p_render_data->camera_attributes.is_valid()) {
+				if (p_render_data->camera_attributes.is_valid() && !RendererSceneRenderRD::get_singleton()->uses_frp_eye_adaptation()) {
 					light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 				}
 
@@ -1003,7 +1003,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		float sign = light->negative ? -1 : 1;
 		Color linear_col = light->color.srgb_to_linear();
 
-		light_data.attenuation = light->param[RSE::LIGHT_PARAM_ATTENUATION];
+		// UE physical point/spot/rect lights use inverse-square distance falloff.
+		light_data.attenuation = RendererSceneRenderRD::get_singleton()->uses_frp_ue_light_units() && RendererSceneRenderRD::get_singleton()->is_using_physical_light_units() ? 2.0f : light->param[RSE::LIGHT_PARAM_ATTENUATION];
 
 		// Reuse fade begin, fade length and distance for shadow LOD determination later.
 		float fade_begin = 0.0;
@@ -1036,17 +1037,22 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 			if (type == RSE::LIGHT_OMNI) {
 				energy *= 1.0 / (Math::PI * 4.0);
 			} else if (type == RSE::LIGHT_AREA) {
-				energy *= 1.0 / (Math::PI * 2.0);
+				// UE RectLightComponent converts lumens with a cosine hemisphere (PI).
+				energy *= RendererSceneRenderRD::get_singleton()->uses_frp_ue_light_units() ? 1.0 / Math::PI : 1.0 / (Math::PI * 2.0);
 			} else {
-				// Spot Lights are not physically accurate, Luminous Intensity should change in relation to the cone angle.
-				// We make this assumption to keep them easy to control.
-				energy *= 1.0 / Math::PI;
+				// UE SpotLightComponent maps luminous flux over the cone solid angle.
+				if (RendererSceneRenderRD::get_singleton()->uses_frp_ue_light_units()) {
+					float cos_half_angle = Math::cos(Math::deg_to_rad(light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
+					energy *= 1.0 / (2.0 * Math::PI * MAX(1.0 - cos_half_angle, 0.001));
+				} else {
+					energy *= 1.0 / Math::PI;
+				}
 			}
 		} else {
 			energy *= Math::PI;
 		}
 
-		if (p_render_data->camera_attributes.is_valid()) {
+		if (p_render_data->camera_attributes.is_valid() && !RendererSceneRenderRD::get_singleton()->uses_frp_eye_adaptation()) {
 			energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
 

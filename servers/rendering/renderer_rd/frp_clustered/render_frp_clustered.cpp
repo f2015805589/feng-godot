@@ -811,7 +811,7 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 
 	float luminance_multiplier = rd.is_valid() ? rd->get_luminance_multiplier() : 1.0;
 
-	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier);
+	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, current_eye_adaptation_enabled ? RID() : p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier);
 
 	// now do implementation UBO
 
@@ -826,6 +826,7 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
+	scene_state.ubo.pre_exposure = current_pre_exposure;
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1793,6 +1794,23 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		pipeline_parameters = pipeline_storage->compositor_get_frp_pipeline_parameters(p_render_data->compositor);
 		pipeline_effects = pipeline_storage->compositor_get_compositor_effects(p_render_data->compositor, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY, false);
 	}
+	// UE uses the previous completed exposure to scale scene radiance before it
+	// reaches the HDR color target. The eye adaptation pass writes the next value
+	// asynchronously; the present frame keeps this factor throughout rendering.
+	current_pre_exposure = 1.0f;
+	current_eye_adaptation_enabled = false;
+	current_eye_adaptation_texture = RID();
+	const Variant eye_settings_value = pipeline_parameters.get(String("library:eye_adaptation"), Variant());
+	if (!is_reflection_probe && eye_settings_value.get_type() == Variant::DICTIONARY) {
+		const Dictionary eye_settings = eye_settings_value;
+		current_eye_adaptation_enabled = bool(eye_settings.get("frp_eye_adaptation_enabled", false));
+		if (bool(eye_settings.get("pre_exposure", false))) {
+			const float *last_exposure = pre_exposure_history->getptr(rb->get_instance_id());
+			if (last_exposure != nullptr) {
+				current_pre_exposure = *last_exposure;
+			}
+		}
+	}
 	// An empty schedule means the default order, which contains every operation. A
 	// pass a plugin runs itself (declared through the provided pass ids) counts as
 	// present: the schedule dropped its engine entry, so feature setup would
@@ -2035,16 +2053,17 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		bg_energy_multiplier *= environment_get_bg_intensity(p_render_data->environment);
 		RSE::EnvironmentReflectionSource reflection_source = environment_get_reflection_source(p_render_data->environment);
 
-		if (p_render_data->camera_attributes.is_valid()) {
+		if (p_render_data->camera_attributes.is_valid() && !current_eye_adaptation_enabled) {
 			bg_energy_multiplier *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
+		const float scene_bg_energy_multiplier = bg_energy_multiplier * current_pre_exposure;
 
 		switch (bg_mode) {
 			case RSE::ENV_BG_CLEAR_COLOR: {
 				clear_color = p_default_bg_color;
-				clear_color.r *= bg_energy_multiplier;
-				clear_color.g *= bg_energy_multiplier;
-				clear_color.b *= bg_energy_multiplier;
+				clear_color.r *= scene_bg_energy_multiplier;
+				clear_color.g *= scene_bg_energy_multiplier;
+				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
 					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(clear_color.srgb_to_linear()));
@@ -2052,9 +2071,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			} break;
 			case RSE::ENV_BG_COLOR: {
 				clear_color = environment_get_bg_color(p_render_data->environment);
-				clear_color.r *= bg_energy_multiplier;
-				clear_color.g *= bg_energy_multiplier;
-				clear_color.b *= bg_energy_multiplier;
+				clear_color.r *= scene_bg_energy_multiplier;
+				clear_color.g *= scene_bg_energy_multiplier;
+				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
 					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(clear_color.srgb_to_linear()));
@@ -2434,7 +2453,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_begin_label("Draw Sky");
 					RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0u, p_render_data->render_region);
 
-					sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier);
+					sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier * current_pre_exposure);
 
 					RD::get_singleton()->draw_list_end();
 					RD::get_singleton()->draw_command_end_label();
@@ -2680,14 +2699,23 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 					RENDER_TIMESTAMP("Post Process");
 
+					RID saved_camera_attributes = p_render_data->camera_attributes;
+					if (current_eye_adaptation_enabled) {
+						p_render_data->camera_attributes = RID();
+					}
 					_render_buffers_post_process(p_render_data);
+					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
 			case FRPPipelineSpec::OP_TONEMAP: { // Tone mapping, post AA and scaling, presented by the engine.
 				if (rb_data.is_valid()) {
 					RENDER_TIMESTAMP("Tonemap");
-
+					RID saved_camera_attributes = p_render_data->camera_attributes;
+					if (current_eye_adaptation_enabled) {
+						p_render_data->camera_attributes = RID();
+					}
 					_render_buffers_tonemap(p_render_data);
+					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
 			case FRPPipelineSpec::OP_TONEMAP_DEFERRED: { // Tone mapping into the engine's intermediate texture.
@@ -2697,7 +2725,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					// The engine's own present steps are skipped: the caller runs its
 					// post-tonemap effects on the toned image and presents it itself
 					// with present().
+					RID saved_camera_attributes = p_render_data->camera_attributes;
+					if (current_eye_adaptation_enabled) {
+						p_render_data->camera_attributes = RID();
+					}
 					_render_buffers_tonemap(p_render_data, true);
+					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
 		}
@@ -2723,7 +2756,14 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			[&](int p_operation) { run_builtin_operation(p_operation); },
 			[&](int p_stage) { stage_effects(RSE::CompositorEffectCallbackType(p_stage)); },
 			pipeline_parameters,
-			[&](const StringName &p_texture) { _present_frame(p_render_data, p_texture); });
+			[&](const StringName &p_texture) { _present_frame(p_render_data, p_texture); },
+			[this](int) { return current_pre_exposure; },
+			[history = pre_exposure_history, buffer_id = rb->get_instance_id()](int p_view, float p_exposure) {
+				if (p_view == 0 && Math::is_finite(p_exposure) && p_exposure > 0.0f) {
+					history->insert(buffer_id, CLAMP(p_exposure, 1e-12f, 1e12f));
+				}
+			},
+			[this](RID p_texture) { current_eye_adaptation_texture = p_texture; });
 
 	if (explicit_pipeline) {
 		for (int slot = 0; slot < pipeline.size(); slot++) {
@@ -3178,6 +3218,9 @@ void RenderFRPClustered::_render_particle_collider_heightfield(RID p_fb, const T
 }
 
 void RenderFRPClustered::_render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region, float p_exposure_normalization) {
+	current_eye_adaptation_enabled = false;
+	current_pre_exposure = 1.0f;
+	current_eye_adaptation_texture = RID();
 	RENDER_TIMESTAMP("Setup Rendering 3D Material");
 
 	RD::get_singleton()->draw_command_begin_label("Render 3D Material");
@@ -3240,6 +3283,9 @@ void RenderFRPClustered::_render_material(const Transform3D &p_cam_transform, co
 }
 
 void RenderFRPClustered::_render_uv2(const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) {
+	current_eye_adaptation_enabled = false;
+	current_pre_exposure = 1.0f;
+	current_eye_adaptation_texture = RID();
 	RENDER_TIMESTAMP("Setup Rendering UV2");
 
 	RD::get_singleton()->draw_command_begin_label("Render UV2");

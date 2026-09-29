@@ -19,23 +19,23 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:blur_horizontal", "path": "blur/blur_h.tres", "name": "Blur Horizontal"},
 	{"id": "library:blur_vertical", "path": "blur/blur_v.tres", "name": "Blur Vertical"},
 	{"id": "library:fxaa", "path": "fxaa/fxaa.tres", "name": "FXAA"},
-	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade"},
+	{"id": "library:eye_adaptation", "path": "eye-adaptation/eye_adaptation.tres", "name": "Eye Adaptation", "default_enabled": true},
 	{"id": "library:bloom_downsample", "path": "bloom-lite/bloom_downsample.tres", "name": "Bloom Downsample"},
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
+	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade"},
 	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
 	{"id": "library:height_fog", "path": "height-fog/height_fog.tres", "name": "Height Fog", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Height Fog was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
 	{"id": "library:debug_buffers", "path": "debug-buffers/debug_buffers.tres", "name": "Debug Buffers", "default_enabled": false, "after_native": NativeSpec.PASS_POST_PROCESS},
-	{"id": "library:eye_adaptation", "path": "eye-adaptation/eye_adaptation.tres", "name": "Eye Adaptation", "default_enabled": true},
 ]
 
 ## The library entries a fresh pipeline seeds. The rest are templates the Library menu
 ## adds: they never enter a pipeline on their own.
 const DEFAULT_LIBRARY_SEEDED: Array[String] = [
+	"library:eye_adaptation",
 	"library:color_grade",
 	"library:magic_gi",
 	"library:height_fog",
-	"library:eye_adaptation",
 	"library:debug_buffers",
 ]
 

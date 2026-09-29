@@ -7,7 +7,6 @@
 script = ExtResource("2")
 binding = 0
 source = 0
-binding_type = 1
 
 [resource]
 resource_name = "Eye Adaptation"

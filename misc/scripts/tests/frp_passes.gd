@@ -5,6 +5,7 @@ const FRP_BASE = preload("res://addons/feng-render-pipeline/passes/pass_base.gd"
 const FRP_TEXTURE = preload("res://addons/feng-render-pipeline/passes/pass_texture.gd")
 const FRP_OUTPUT = preload("res://addons/feng-render-pipeline/passes/pass_output.gd")
 const FRP_MANAGER = preload("res://addons/feng-render-pipeline/passes/texture_manager.gd")
+const FRP_LIBRARY = preload("res://addons/feng-render-pipeline/pipeline/library_manager.gd")
 
 class PaintPass extends FRP_BASE:
 	var color := Color.GREEN
@@ -675,8 +676,8 @@ func run() -> void:
 	var manifest: Array = _read_property(unified_renderer, manifest_property, [])
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
-	# Manifest metadata seeds Color Grade, enabled Magic GI after Lighting, enabled
-	# Height Fog after Sky, enabled Eye Adaptation before Post Process, and disabled
+	# Manifest metadata seeds Eye Adaptation before Color Grade and Post Process,
+	# enabled Magic GI after Lighting, enabled Height Fog after Sky, and disabled
 	# Debug Buffers after Post Process. Other effects remain opt-in.
 	var library_entries := []
 	for value in unified_renderer.passes:
@@ -688,17 +689,21 @@ func run() -> void:
 	var seeded_magic_index := -1
 	var seeded_fog_index := -1
 	var seeded_eye_index := -1
+	var seeded_grade_index := -1
 	var seeded_debug_index := -1
 	var seeded_lighting_index := -1
 	var seeded_sky_index := -1
 	var seeded_transparent_index := -1
+	var seeded_temporal_index := -1
 	var seeded_post_index := -1
 	for i in unified_renderer.passes.size():
 		var entry = unified_renderer.passes[i]
 		if _native_id(entry) == 3: seeded_lighting_index = i
 		if _native_id(entry) == 4: seeded_sky_index = i
 		if _native_id(entry) == 5: seeded_transparent_index = i
+		if _native_id(entry) == 6: seeded_temporal_index = i
 		if _native_id(entry) == 7: seeded_post_index = i
+		if String(entry.stable_id) == "library:color_grade": seeded_grade_index = i
 		if String(entry.stable_id) == "library:magic_gi":
 			seeded_magic_index = i
 			require(entry.enabled, "Magic GI must be enabled in the fresh default pipeline")
@@ -715,9 +720,36 @@ func run() -> void:
 		"Magic GI must be anchored after Lighting and before Sky")
 	require(seeded_sky_index < seeded_fog_index and seeded_fog_index < seeded_transparent_index,
 		"Height Fog must be anchored after Sky and before Transparent")
-	require(seeded_eye_index >= 0 and seeded_eye_index < seeded_post_index,
-		"Eye Adaptation must fold the lit HDR frame before Post Process")
+	require(seeded_temporal_index < seeded_eye_index and seeded_eye_index < seeded_grade_index and seeded_grade_index < seeded_post_index,
+		"exposure must follow Temporal AA and precede Color Grade and Post Process")
+	var bloom_insert_index := FRP_LIBRARY.calculate_insert_index(unified_renderer.passes, &"library:bloom_downsample")
+	require(seeded_eye_index < bloom_insert_index and bloom_insert_index <= seeded_grade_index,
+		"optional Bloom must be inserted after metering and before Color Grade")
 	require(seeded_debug_index > seeded_post_index, "Debug Buffers must be anchored after Post Process")
+	var legacy_order_renderer = renderer_script2.new()
+	var legacy_entries: Array[FengPass] = legacy_order_renderer.passes.duplicate()
+	var legacy_eye: FengPass
+	for entry in legacy_entries:
+		if entry.stable_id == &"library:eye_adaptation":
+			legacy_eye = entry
+			break
+	require(legacy_eye != null, "the schema migration test requires Eye Adaptation")
+	legacy_eye.pre_exposure = false
+	legacy_entries.erase(legacy_eye)
+	for i in legacy_entries.size():
+		if _native_id(legacy_entries[i]) == 7:
+			legacy_entries.insert(i, legacy_eye)
+			break
+	legacy_order_renderer.passes = legacy_entries
+	legacy_order_renderer.set("_pipeline_schema_version", 6)
+	var migrated_entries: Array[FengPass] = legacy_order_renderer.passes
+	var migrated_eye_index := migrated_entries.find(legacy_eye)
+	var migrated_grade_index := -1
+	for i in migrated_entries.size():
+		if migrated_entries[i].stable_id == &"library:color_grade":
+			migrated_grade_index = i
+	require(migrated_eye_index >= 0 and migrated_eye_index < migrated_grade_index and not legacy_eye.pre_exposure,
+			"schema 6 renderers must move Eye Adaptation before Color Grade without resetting its authored switches")
 	var default_debug = unified_renderer.passes[seeded_debug_index]
 	require(not default_debug.needs_motion_vectors, "the default diffuse debug selection must not request motion-vector attachments")
 	unified_renderer.apply(compositor)

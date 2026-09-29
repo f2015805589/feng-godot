@@ -30,16 +30,55 @@
 
 #include "frp_pass_context.h"
 
+#include "core/io/marshalls.h"
 #include "core/object/class_db.h"
+#include "core/object/callable_mp.h"
+#include "servers/rendering/rendering_device.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 
-void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner) {
+void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer) {
 	render_data = p_render_data;
 	operation_runner = p_operation_runner;
 	stage_runner = p_stage_runner;
 	present_runner = p_present_runner;
+	pre_exposure_reader = p_pre_exposure_reader;
+	pre_exposure_writer = p_pre_exposure_writer;
+	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
 	pass_parameters = p_pass_parameters;
+}
+
+float FRPPassContext::get_pre_exposure(int p_view) const {
+	return pre_exposure_reader ? pre_exposure_reader(p_view) : 1.0f;
+}
+
+void FRPPassContext::set_next_pre_exposure(int p_view, float p_exposure) {
+	if (pre_exposure_writer) {
+		pre_exposure_writer(p_view, p_exposure);
+	}
+}
+
+void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
+	if (eye_exposure_texture_writer) {
+		eye_exposure_texture_writer(p_texture);
+	}
+}
+
+void FRPPassContext::_finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view) {
+	if (p_data.size() < int(sizeof(float)) || p_context.is_null()) {
+		return;
+	}
+	const float exposure = decode_float(p_data.ptr());
+	if (Math::is_finite(exposure) && exposure > 0.0f) {
+		p_context->set_next_pre_exposure(p_view, exposure);
+	}
+}
+
+Error FRPPassContext::request_next_pre_exposure(RID p_buffer, int p_view, int p_offset) {
+	ERR_FAIL_COND_V(p_offset < 0 || !p_buffer.is_valid(), ERR_INVALID_PARAMETER);
+	RD *rd = RD::get_singleton();
+	ERR_FAIL_NULL_V(rd, ERR_UNAVAILABLE);
+	return rd->buffer_get_data_async(p_buffer, callable_mp_static(&FRPPassContext::_finish_pre_exposure_readback).bind(Ref<FRPPassContext>(this), p_view), p_offset, sizeof(float));
 }
 
 Dictionary FRPPassContext::get_pass_parameters(const Variant &p_pass_id) const {
@@ -189,6 +228,10 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pass_name", "pass_id"), &FRPPassContext::get_pass_name);
 	ClassDB::bind_method(D_METHOD("is_valid_pass_id", "pass_id"), &FRPPassContext::is_valid_pass_id);
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
+	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
+	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
+	ClassDB::bind_method(D_METHOD("set_tonemap_exposure_texture", "texture"), &FRPPassContext::set_tonemap_exposure_texture);
+	ClassDB::bind_method(D_METHOD("request_next_pre_exposure", "buffer", "view", "offset_bytes"), &FRPPassContext::request_next_pre_exposure);
 
 	ClassDB::bind_method(D_METHOD("precompute_shadows"), &FRPPassContext::precompute_shadows);
 	ClassDB::bind_method(D_METHOD("execute_virtual_texture_updates"), &FRPPassContext::execute_virtual_texture_updates);

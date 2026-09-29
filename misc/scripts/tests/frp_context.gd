@@ -245,6 +245,8 @@ func run() -> void:
 	scene.add_child(light)
 
 	# Baseline: the engine default order, no pipeline authored.
+	# An explicit empty Compositor overrides a project's default FRP pipeline.
+	camera.compositor = Compositor.new()
 	var baseline: Image = await frame()
 	var baseline_luma := mean_luma(baseline)
 	require(baseline_luma > 0.02, "baseline frame is not lit: %.4f" % baseline_luma)

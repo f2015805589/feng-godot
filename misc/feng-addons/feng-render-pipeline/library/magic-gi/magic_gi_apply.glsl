@@ -169,7 +169,7 @@ void main() {
 		return;
 	}
 	vec3 contribution = indirect / interpolation_weight
-			* albedo * (1.0 - metallic) * ao * params.control.x * pc.parameters.x;
+			* albedo * (1.0 - metallic) * ao * params.control.x * pc.parameters.x * pc.parameters.y;
 	imageStore(gi_output, pixel, vec4(contribution, 1.0));
 	vec4 scene_color = imageLoad(color_image, pixel);
 	imageStore(color_image, pixel, vec4(scene_color.rgb + contribution, scene_color.a));

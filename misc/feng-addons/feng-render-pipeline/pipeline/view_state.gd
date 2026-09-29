@@ -64,12 +64,12 @@ func apply(compositor: Compositor, renderer: FengRenderer, parameters: Dictionar
 			scripted.append(effect)
 		_manager.passes = scripted
 		_parameters = parameters.duplicate(true)
-		_resolved = Parameters.resolve_context([], parameters, candidate.context)
+		_resolved = renderer._with_eye_adaptation_state(Parameters.resolve_context([], parameters, candidate.context), states)
 		_valid = true
 		_revision = renderer.get_parameter_revision()
 	elif parameters != _parameters:
 		_parameters = parameters.duplicate(true)
-		_resolved = Parameters.resolve_context([], parameters, _plan.context)
+		_resolved = renderer._with_eye_adaptation_state(Parameters.resolve_context([], parameters, _plan.context), states)
 	if compositor.compositor_effects != _effects:
 		compositor.compositor_effects = _effects
 	Binding.upload(compositor, _plan.tokens, _plan.names, _plan.provided, _resolved)

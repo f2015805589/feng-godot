@@ -61,7 +61,7 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | 7 | Post Process / Tonemap | 最终颜色/深度/运动矢量 resolve、引擎后处理与输出 |
 
 引擎侧只有这 8 条；默认的五个库 Pass 按各自的 native 锚点插入，顺序为
-`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent → TAA → Color Grade → Eye Adaptation → Post Process → Debug Buffers`。
+`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent → TAA → Eye Adaptation → Color Grade → Post Process → Debug Buffers`。
 SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP 的 pass**：FRP 不声明、
 不分配、也不合成它们，光照 shader 对这些附件始终用引擎默认（黑色）纹理。
 
@@ -72,11 +72,13 @@ SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP
 
 `Magic GI` 在 Lighting 后、Sky 前将 surface PRT 的传输系数与当前太阳/环境 SH 点积，作为漫反射间接光加回 HDR；它只使用当前视口匹配的最新有效烘焙，动态光照变化不需要重烘焙。没有有效烘焙或当前 viewport 不匹配时，该 pass 清零自己的诊断纹理并保持画面不变。`Debug Buffers` 默认关闭且不分配输出，可切换到 albedo、view-space normal、AO、roughness、metallic、motion vectors 或 Magic GI 贡献；启用时在 Post Process 后直接显示所选原始缓冲。
 
+`Eye Adaptation` 在 TAA 后测量 HDR 场景色，位于可选 Bloom 和 Color Grade 前；UE 也是先计算曝光，再做 Bloom，并在 Tonemap 中应用曝光和颜色分级。该 Pass 自身有两个全局开关：`extend_default_luminance_range` 切换 UE 的传统亮度范围与 EV100 范围，`pre_exposure` 用上一帧已完成的曝光值预缩放场景光照。相机曝光参数放在该 pass 的 Volume 模块中，包括 Histogram / Basic / Manual 测光、Low/High Percent、亮度或 EV100 上下限、Speed Up/Down、曝光补偿、补偿曲线、测光遮罩，以及手动模式的光圈、快门和 ISO。`CurveTexture` 的 X 轴 0 到 1 对应 UE 默认的 -10 到 20 EV100 曲线区间。开启项目的物理光照单位后，FRP 的点光、聚光与矩形光按 UE 的流明立体角和 π 系数换算。
+
 这些条目执行真实的原生操作，但粒度是上述组合步骤，不是逐个 GPU draw/dispatch。
 "光照预计算"只指**绘制**阴影这一步；灯光/Cluster buffer 与体积雾属于 Lighting pass（它们在那
 被消费），没有单独拆成条目。反射探针和普通 Compositor 保留原有阶段调度。
 
-**默认的 pass 集是插件侧代码**（schema 6）：上表每一条都有一个 `FengNativePass` 脚本
+**默认的 pass 集是插件侧代码**（当前 schema 7）：上表每一条都有一个 `FengNativePass` 脚本
 （`passes/native/*.gd`），每个原生条目（`FengBuiltinPass`）通过 `implementation` 指向它。
 条目默认由脚本驱动——脚本调用 Core 原语执行该 pass 的 operation，并把该 pass 声明为
 "provided" 交给引擎，因此引擎不再为它发 token；把 `implementation` 清空该条目就退回引擎自带的

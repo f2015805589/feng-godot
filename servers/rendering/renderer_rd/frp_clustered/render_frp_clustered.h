@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
+#include "core/templates/hash_map.h"
 #include "servers/rendering/frp_pipeline_spec.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
@@ -44,6 +45,8 @@
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_integrate_dfg.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_velocity_fill.glsl.gen.h"
+
+#include <memory>
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
@@ -181,6 +184,12 @@ private:
 
 	RID render_base_uniform_set;
 	LocalVector<RD::Uniform> render_base_uniforms;
+	// GPU eye adaptation is read back asynchronously; each render buffer uses the
+	// last completed exposure at the start of its next frame, as UE does.
+	std::shared_ptr<HashMap<ObjectID, float>> pre_exposure_history = std::make_shared<HashMap<ObjectID, float>>();
+	float current_pre_exposure = 1.0f;
+	bool current_eye_adaptation_enabled = false;
+	RID current_eye_adaptation_texture;
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
@@ -341,7 +350,7 @@ private:
 			uint32_t volumetric_fog_enabled;
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
-			uint32_t volumetric_fog_pad;
+			float pre_exposure;
 		};
 
 		struct PushConstantUbershader {
@@ -846,6 +855,9 @@ protected:
 
 public:
 	static RenderFRPClustered *get_singleton() { return singleton; }
+	virtual bool uses_frp_ue_light_units() const override { return true; }
+	virtual bool uses_frp_eye_adaptation() const override { return current_eye_adaptation_enabled; }
+	virtual RID get_tonemap_exposure_override() const override { return current_eye_adaptation_enabled ? current_eye_adaptation_texture : RID(); }
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }

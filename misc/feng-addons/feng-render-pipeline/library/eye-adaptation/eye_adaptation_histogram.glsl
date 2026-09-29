@@ -1,25 +1,26 @@
 #[compute]
 #version 450
 
-// Histogram-based luminance metering for eye adaptation, matching UE's
-// PostProcessHistogram approach (64 log bins over the metering range).
-// Source: http://www.alextardif.com/HistogramLuminance.html
+// UE 5.7 PostProcessHistogram: 64 log bins with fractional neighbouring weights.
 
 #define BLOCK_SIZE 16
 #define NUM_BINS 64
+#define WEIGHT_SCALE 524288.0
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = BLOCK_SIZE, local_size_z = 1) in;
 
 shared uint shared_bins[NUM_BINS];
 
 layout(set = 0, binding = 0) uniform sampler2D source_texture;
+layout(set = 0, binding = 1) uniform sampler2D meter_mask;
 
 layout(set = 1, binding = 0, std430) buffer restrict EyeAdaptationBuffer {
 	uint histogram[NUM_BINS];
-	float adapted_luminance;
+	uint histogram_overflow[NUM_BINS];
+	float adapted_exposure;
+	float exposure_scale;
 	float pad0;
 	float pad1;
-	float pad2;
 }
 params_buffer;
 
@@ -27,7 +28,12 @@ layout(push_constant, std430) uniform Params {
 	ivec2 source_size;
 	float log_min;
 	float log_range_rcp;
-	vec4 pad;
+	float one_over_pre_exposure;
+	float luminance_min;
+	float black_bucket_influence;
+	float use_meter_mask;
+	float basic_mode;
+	float minimum_meter_weight;
 }
 params;
 
@@ -42,22 +48,34 @@ void main() {
 
 	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
 	if (all(lessThan(pos, params.source_size))) {
-		vec3 color = texelFetch(source_texture, pos, 0).rgb;
-		float luminance = dot(color, vec3(0.2127, 0.7152, 0.0722));
-
-		uint bin_index = 0;
-		if (luminance > 0.0001 && !isinf(luminance) && !isnan(luminance)) {
-			float log_luminance = clamp((log2(luminance) - params.log_min) * params.log_range_rcp, 0.0, 1.0);
-			bin_index = 1 + uint(log_luminance * float(NUM_BINS - 2));
+		vec3 color = texelFetch(source_texture, pos, 0).rgb * params.one_over_pre_exposure;
+		// UE's default r.AutoExposure.LuminanceMethod=0 uses uniform RGB weights.
+		float luminance = max(dot(color, vec3(1.0 / 3.0)), params.luminance_min);
+		float log_luminance = log2(luminance);
+		if (params.basic_mode > 0.5) {
+			log_luminance = clamp(log_luminance, -10.0, 20.0);
 		}
-
-		atomicAdd(shared_bins[bin_index], 1u);
+		float location = clamp((log_luminance - params.log_min) * params.log_range_rcp, 0.0, 1.0) * float(NUM_BINS - 1);
+		if (any(isnan(color)) || any(isinf(color))) {
+			location = 0.0;
+		}
+		uint lower = min(uint(location), NUM_BINS - 1u);
+		uint upper = min(lower + 1u, NUM_BINS - 1u);
+		float upper_weight = fract(location);
+		float screen_weight = params.use_meter_mask > 0.5 ? max(texture(meter_mask, (vec2(pos) + 0.5) / vec2(params.source_size)).r, params.minimum_meter_weight) : 1.0;
+		float lower_weight = (1.0 - upper_weight) * (lower == 0u ? params.black_bucket_influence : 1.0) * screen_weight;
+		upper_weight *= screen_weight;
+		atomicAdd(shared_bins[lower], uint(lower_weight * WEIGHT_SCALE));
+		atomicAdd(shared_bins[upper], uint(upper_weight * WEIGHT_SCALE));
 	}
 
 	groupMemoryBarrier();
 	barrier();
 
 	if (t < NUM_BINS) {
-		atomicAdd(params_buffer.histogram[t], shared_bins[t]);
+		uint old_value = atomicAdd(params_buffer.histogram[t], shared_bins[t]);
+		if (old_value > 0xffffffffu - shared_bins[t]) {
+			atomicAdd(params_buffer.histogram_overflow[t], 1u);
+		}
 	}
 }
