@@ -139,7 +139,13 @@ static func _sun_for(fog: FengHeightFog, world: World3D) -> DirectionalLight3D:
 				found = node
 				break
 			stack.append_array(node.get_children())
-	_sun_scans[world_id] = {"time": now, "light": weakref(found)}
+	_sun_scans[world_id] = {"time": now, "light": weakref(found), "world": weakref(world)}
+	if _sun_scans.size() > 16:
+		# Worlds churn with editor sub-viewports; drop entries whose world is gone.
+		for old_id in _sun_scans.keys():
+			var old_world: WeakRef = _sun_scans[old_id].get("world")
+			if old_world == null or old_world.get_ref() == null:
+				_sun_scans.erase(old_id)
 	return found
 
 static func _publish() -> void:
