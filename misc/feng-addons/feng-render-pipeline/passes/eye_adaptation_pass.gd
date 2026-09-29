@@ -12,7 +12,11 @@ extends "pass_base.gd"
 ## already folded around the middle-gray `scale` target.
 ##
 ## `parameters`: x = exposure scale (middle-gray target), y = adaptation speed,
-## z = minimum luminance, w = maximum luminance.
+## z/w = the histogram's log-luminance clamp range. The default range
+## (2^-13.3 .. 2^18) spans from candlelight to a 60000-energy directional
+## light, so adaptation converges to the same image no matter the absolute
+## energy — a range too narrow saturates the histogram and leaves the
+## frame over-exposed.
 
 const HISTOGRAM_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation_histogram.glsl"
 const ADAPT_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation.glsl"
@@ -22,7 +26,7 @@ const PARAMS_BYTES := NUM_BINS * 4 + 16 # uint histogram[64] + float adapted + p
 const STATE_PRUNE_LIMIT := 16
 
 # x = exposure scale, y = adaptation speed, z/w = luminance clamp range.
-@export var parameters := Vector4(1.0, 5.0, 0.005, 64.0)
+@export var parameters := Vector4(1.0, 5.0, 0.0001, 262144.0)
 
 var _histogram_pipeline := RID()
 var _adapt_pipeline := RID()

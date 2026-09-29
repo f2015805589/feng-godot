@@ -57,7 +57,11 @@ void main() {
 		float measured = exp2(weighted_log_average / float(NUM_BINS - 2) * params.log_range + params.log_min);
 
 		float adapted = params_buffer.adapted_luminance;
-		if (params.set_immediate > 0.5 || adapted <= 0.0) {
+		// A wild divergence means the stored state came from another scene's
+		// buffer (stale metering) rather than a slow drift — reseed instead of
+		// exponentially crawling back for seconds.
+		if (params.set_immediate > 0.5 || adapted <= 0.0 ||
+				measured * 64.0 < adapted || measured > adapted * 64.0) {
 			adapted = measured;
 		} else {
 			adapted = adapted + (measured - adapted) * (1.0 - exp(-params.exposure_adjust));

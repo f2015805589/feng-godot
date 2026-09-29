@@ -46,7 +46,7 @@ void main() {
 		float luminance = dot(color, vec3(0.2127, 0.7152, 0.0722));
 
 		uint bin_index = 0;
-		if (luminance > 0.0001) {
+		if (luminance > 0.0001 && !isinf(luminance) && !isnan(luminance)) {
 			float log_luminance = clamp((log2(luminance) - params.log_min) * params.log_range_rcp, 0.0, 1.0);
 			bin_index = 1 + uint(log_luminance * float(NUM_BINS - 2));
 		}
