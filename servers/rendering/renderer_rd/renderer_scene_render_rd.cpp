@@ -558,18 +558,7 @@ void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_r
 
 		RD::get_singleton()->draw_command_begin_label("Auto Exposure");
 
-		Ref<RendererRD::Luminance::LuminanceBuffers> luminance_buffers = luminance->get_luminance_buffers(rb);
-
-		uint64_t auto_exposure_version = RSG::camera_attributes->camera_attributes_get_auto_exposure_version(p_render_data->camera_attributes);
-		bool set_immediate = auto_exposure_version != rb->get_auto_exposure_version();
-		rb->set_auto_exposure_version(auto_exposure_version);
-
-		double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * time_step;
-		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
-		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
-		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
-
-		// Swap final reduce with prev luminance.
+		_update_auto_exposure(p_render_data, time_step);
 
 		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
 
@@ -602,7 +591,7 @@ void RendererSceneRenderRD::_render_buffers_post_process(const RenderDataRD *p_r
 			RD::get_singleton()->draw_command_begin_label("Gaussian Glow");
 			RID luminance_texture;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-				luminance_texture = luminance->get_current_luminance_buffer(rb); // this will return and empty RID if we don't have an auto exposure buffer
+				luminance_texture = _auto_exposure_luminance_texture(rb); // this will return and empty RID if we don't have an auto exposure buffer
 			}
 			for (uint32_t l = 0; l < rb->get_view_count(); l++) {
 				Size2i vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, 0);
@@ -678,6 +667,25 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	_render_buffers_tonemap(p_render_data);
 }
 
+void RendererSceneRenderRD::_update_auto_exposure(const RenderDataRD *p_render_data, float p_time_step) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+
+	Ref<RendererRD::Luminance::LuminanceBuffers> luminance_buffers = luminance->get_luminance_buffers(rb);
+
+	uint64_t auto_exposure_version = RSG::camera_attributes->camera_attributes_get_auto_exposure_version(p_render_data->camera_attributes);
+	bool set_immediate = auto_exposure_version != rb->get_auto_exposure_version();
+	rb->set_auto_exposure_version(auto_exposure_version);
+
+	double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * p_time_step;
+	float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
+	float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
+	luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+}
+
+RID RendererSceneRenderRD::_auto_exposure_luminance_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	return luminance->get_current_luminance_buffer(p_render_buffers);
+}
+
 void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -729,7 +737,7 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 
 		bool using_hdr = texture_storage->render_target_is_using_hdr(render_target);
 
-		tonemap.exposure_texture = luminance->get_current_luminance_buffer(rb);
+		tonemap.exposure_texture = _auto_exposure_luminance_texture(rb);
 		if (can_use_effects && RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes) && tonemap.exposure_texture.is_valid()) {
 			tonemap.use_auto_exposure = true;
 			tonemap.auto_exposure_scale = auto_exposure_scale;
@@ -1167,7 +1175,7 @@ void RendererSceneRenderRD::_render_buffers_debug_draw(const RenderDataRD *p_ren
 	}
 
 	if (debug_draw == RSE::VIEWPORT_DEBUG_DRAW_SCENE_LUMINANCE) {
-		RID luminance_texture = luminance->get_current_luminance_buffer(rb);
+		RID luminance_texture = _auto_exposure_luminance_texture(rb);
 		if (luminance_texture.is_valid()) {
 			Size2i rtsize = texture_storage->render_target_get_size(render_target);
 

@@ -81,4 +81,9 @@ struct SceneData {
 	float IBL_exposure_normalization;
 	uint camera_visible_layers;
 	float pass_alpha_multiplier;
+
+	float luminance_multiplier; // Pre-exposure compensation (UE OneOverPreExposure).
+	float pad_after_luminance_multiplier0;
+	float pad_after_luminance_multiplier1;
+	float pad_after_luminance_multiplier2;
 };
