@@ -45,6 +45,14 @@ PRT v3 会为不透明 `BaseMaterial3D` 自发光表面烘焙独立的间接传�
 
 `Show Probes`（默认开启）会显示采样到的表面点；未烘焙时为灰色，烘焙后按单位方向光从世界 +Y 入射时的几何传输响应着色。`Show SH Probes` 默认关闭；开启后以径向网格可视化几何传输响应，而不是烘焙的或当前的光照辐射，最多显示 256 个样本。预览会跟随 Volume 变换，并在场景几何或布点设置变化后更新。
 
+## Eye Adaptation GPU 回归
+
+`misc/scripts/tests/frp_exposure_balance.gd` 用真实 FRP 渲染一组带程序天空、Height Fog 和合成 PRT 传输的接收面，分别切换 Magic GI、Height Fog 与 Eye Adaptation 的 pre-exposure。可用 `python misc/scripts/tests/run_frp_exposure_balance.py --binary <Godot editor binary>` 在 GPU 上运行；默认选择 Vulkan，也可用 `--driver d3d12` 指定 D3D12。测试会在 `bin/` 下保留隔离项目、日志和可选 PNG。物理光照模式以 `light_energy=1`、`light_intensity_lux=60000` 运行，并要求 Sky、Fog、GI 的 PE on/off LDR 差不超过 0.01、曝光 scale 差不超过 2%；GI 与 Fog 开关也必须对各自采样点产生可见变化。非物理 `light_energy=60000` 保留作诊断模式；该强度下固定曝光的 GI 接收点及自动曝光的 Fog/接收点会剪裁，因此不作为 PE 数值断言。
+
+在 `test-1` 隔离副本里，原 `project.godot` 未启用物理光照单位，保存的 `DirectionalLight3D.light_energy` 是 6.0；场景没有 `WorldEnvironment`、`Environment` 或 `Sky`。以非物理 `light_energy=60000` 运行 Eye Adaptation 扩展范围（EV100 `-10..20`）时，PE on/off scale 为 `0.00014329/0.00014371`，地形采样的 LDR 差约一个 8-bit 码；GI 开关造成的地形采样差不超过 `0.004`。物理单位副本使用 `light_energy=1`、`light_intensity_lux=60000`，PE on/off scale 为 `0.00046034/0.00046197`，地形差不超过 `0.004`。原场景的黑色背景在 PE on/off 都保持黑色；Fog 关闭时同一背景是默认灰色，启用 Fog 后又变黑。
+
+加入 Physical Sky 并关闭 Fog 后，隔离副本可见天空；原太阳方向的 `basis.z.y=-0.32295` 位于 Physical Sky 的地平线下方。为避免方向对照被 LDR 剪裁，本次副本测试把 sky energy multiplier 设为 `0.0001`，并固定手动曝光（f/16、1/60、ISO 100）；将 `basis.z.y` 改为正值后左上天空 RGB 从约 `(0.078, 0.110, 0.086)` 增至 `(0.137, 0.161, 0.149)`。Fog 打开后两种太阳方向的天空都回到接近黑色。该强度和手动曝光仅用于方向诊断，没有写入用户项目。已测证据没有显示 GI/Fog/Sky 的 pre-exposure 单位不一致，因此不应通过任意调低 GI 或重复乘 PE 来补偿天空亮度。原场景的雾密度为 0.5、散射颜色固定为约 0.816；在强光适应后，它会显著衰减天空并压低固定辐射度的雾散射贡献。
+
 ## PRT v3 数据
 
 `FMagicGIData` 保存世界空间表面采样位置与法线、每个样本 27 个远场传输 float、发光源稳定键与各源每样本 6 个传输 float、Volume 布局元数据、持久化场景签名和查找索引。远场系数按“系数优先、RGB 分量连续”排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场传输图集每个样本 7 个 RGBA32F texel，几何图集每个样本 2 个 RGBA32F texel；每个网格单元保存 8 个有符号 32 位样本索引。发光传输按 source、probe、两种 RGB 基底排列：常量颜色响应与静态发光纹理调制响应。
