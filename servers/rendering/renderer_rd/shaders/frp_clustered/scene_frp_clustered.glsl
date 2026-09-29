@@ -2910,6 +2910,11 @@ void fragment_shader(in SceneData scene_data) {
 	specular_buffer.rgb = specular_buffer.rgb * fog.a;
 #endif //!FOG_DISABLED
 
+	// Pre-exposure: shading happens in true luminance; the buffer stores
+	// values divided by the luminance multiplier (UE PreExposure).
+	diffuse_buffer.rgb /= scene_data.luminance_multiplier;
+	specular_buffer.rgb /= scene_data.luminance_multiplier;
+
 #else //MODE_SEPARATE_SPECULAR
 
 	alpha *= scene_data.pass_alpha_multiplier;
@@ -2928,6 +2933,10 @@ void fragment_shader(in SceneData scene_data) {
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;
 #endif //PREMUL_ALPHA_USED
+
+	// Pre-exposure: shading happens in true luminance; the buffer stores
+	// values divided by the luminance multiplier (UE PreExposure).
+	frag_color.rgb /= scene_data.luminance_multiplier;
 
 #endif //MODE_SEPARATE_SPECULAR
 
