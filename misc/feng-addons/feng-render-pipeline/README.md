@@ -7,8 +7,8 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 ## 使用
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
-2. 创建 `FengRenderer`，默认包含 8 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Debug Buffers` 三个库 Pass，
-	共 11 个条目；TAA、Color Grade、Debug Buffers 默认关闭，Magic GI 默认开启（没有有效烘焙时不改画面）。
+2. 创建 `FengRenderer`，默认包含 8 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Height Fog`、`Eye Adaptation`、
+	`Debug Buffers` 五个库 Pass，共 13 个条目；TAA、Color Grade、Debug Buffers 默认关闭，其余默认开启（Magic GI 没有有效烘焙时不改画面）。
 3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment（或者用项目设置，
    见下文"项目级管线"）。
 4. 在 Inspector 的 Passes 数组中拖动排序，编辑条目的 Enabled。条目显示具体名称，
@@ -60,13 +60,13 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 | 6 | Temporal AA | TAA（**打开该条目即开启**，视口 jitter 跟随该条目）；视口的时序上采样器（FSR 2 / MetalFX）也在这里运行（默认关闭） |
 | 7 | Post Process / Tonemap | 最终颜色/深度/运动矢量 resolve、引擎后处理与输出 |
 
-引擎侧只有这 8 条；默认的三个库 Pass 按各自的 native 锚点插入，顺序为
-`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Transparent → TAA → Color Grade → Post Process → Debug Buffers`。
+引擎侧只有这 8 条；默认的五个库 Pass 按各自的 native 锚点插入，顺序为
+`Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent → TAA → Color Grade → Eye Adaptation → Post Process → Debug Buffers`。
 SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP 的 pass**：FRP 不声明、
 不分配、也不合成它们，光照 shader 对这些附件始终用引擎默认（黑色）纹理。
 
 颜色分级不是引擎条目，而是库里的 `Color Grade` Pass——它的 shader 和参数因此可以随插件更新，
-不需要改引擎。**一个新 Renderer 的列表正好是这 11 条**：8 个引擎条目 + 三个默认库条目。
+不需要改引擎。**一个新 Renderer 的列表正好是这 13 条**：8 个引擎条目 + 五个默认库条目。
 库里的其它模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
 **Add Pass from Library** 添加；它们和 Color Grade 一样默认关闭，打开条目即生效。
 
@@ -293,7 +293,7 @@ tonemap 过的图像"，把输入声明成 `FengPassTexture.Source.TONEMAPPED`�
 ```
 
 `DEFAULT_LIBRARY_SEEDED` 决定哪些条目**进入**新 Renderer 的默认列表：目前只有
-`library:color_grade`、`library:magic_gi`、`library:debug_buffers`。其余是模板——它们不会自动推进任何已有 Renderer，
+`library:color_grade`、`library:magic_gi`、`library:height_fog`、`library:eye_adaptation`、`library:debug_buffers`。其余是模板——它们不会自动推进任何已有 Renderer，
 也不会出现在新 Renderer 的列表里，只能从检查器的 **Add Pass from Library** 添加；添加后
 由 manifest（`_synced_library` / `_deleted_library`）记录身份与删除墓碑，不会重复插入，
 也不会把你删掉的条目加回来。Color Grade 缺失时会被同步回 Temporal AA 与 Post Process

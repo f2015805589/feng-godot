@@ -50,7 +50,8 @@ flowchart TD
 
 `library_manager.gd` 的 manifest 是库条目的单一事实源：`Magic GI` 的 `default_enabled` 与
 `after_native = Lighting` 让新 Renderer 和旧 Renderer 同步到同一个位置；`Debug Buffers` 锚定在
-`Post Process` 后并默认关闭。旧全帧自定义 Renderer 没有 Lighting 锚点时，自动同步跳过默认 GI，
+`Post Process` 后并默认关闭。`Eye Adaptation` 默认开启且不声明锚点：无锚条目落在 Post Process 前、
+其它无锚库条目之后，测光直方图因此在最终 HDR 颜色上、折叠（预曝光）在 tonemap 链前完成。旧全帧自定义 Renderer 没有 Lighting 锚点时，自动同步跳过默认 GI，
 不改变其执行时机；作者仍可从 Library 菜单手动添加并自行排序。已保存的 Magic GI Pass 在
 Renderer 主线程建立监听时幂等补齐 v2 输入和 `magic_gi` 输出声明，作者启用状态、强度与稳定 ID不变。
 
