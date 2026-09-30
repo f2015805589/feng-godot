@@ -201,6 +201,7 @@ func build_scene() -> bool:
 	MagicRuntime.publish(_volume)
 
 	_fog = FogNode.new()
+	_fog.fog_color_mode = FogNode.ColorMode.LEGACY_RADIANCE
 	_fog.fog_density = 0.8
 	_fog.fog_inscattering_color = Color(0.34, 0.16, 0.08)
 	_fog.fog_cutoff_distance = 100.0 # Keep the sky sample independent from fog.

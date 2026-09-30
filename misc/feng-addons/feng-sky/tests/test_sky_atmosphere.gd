@@ -337,6 +337,8 @@ func run_runtime_checks() -> void:
 		" ground_b=", ground_b, " ground_ratio=", ground_ratio)
 
 	var fog := FengHeightFog.new()
+	# Keep additive-provider assertions explicit; lit albedo has separate coverage.
+	fog.fog_color_mode = FengHeightFog.ColorMode.LEGACY_RADIANCE
 	fog.fog_inscattering_color = Color(0.1, 0.2, 0.3)
 	viewport_b.add_child(fog)
 	var authored_color := Vector3(0.1, 0.2, 0.3)

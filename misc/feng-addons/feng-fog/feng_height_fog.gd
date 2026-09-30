@@ -5,8 +5,9 @@ extends Node3D
 ##
 ## The node's world-space height is its global Y position (each fog layer's
 ## height offset is relative to it), and a world keeps the latest registered
-## enabled node active. Parameters keep Unreal's names, defaults and shader
-## semantics; density and falloff carry Unreal's authored units and are divided
+## enabled node active. Extinction parameters keep Unreal's shader semantics;
+## Lit colors describe a material, with Legacy Radiance as an explicit opt-out.
+## Density and falloff carry Unreal's authored units and are divided
 ## by ten for meters before upload (Unreal divides by 1000 in centimeters).
 ## While active, the runtime temporarily enables debanding on affected viewports
 ## so the directional fog gradient survives final 8-bit tone mapping.
@@ -15,6 +16,7 @@ const Runtime = preload("feng_fog_runtime.gd")
 ## Unreal stores FogDensity/FogHeightFalloff per 1000 units in a centimeter
 ## world; dividing by ten gives the same profile in a meter world.
 const UNIT_SCALE := 0.1
+enum ColorMode { LIT, LEGACY_RADIANCE }
 
 @export_group("高度指数雾")
 ## Turns the component's fog on or off.
@@ -27,8 +29,18 @@ const UNIT_SCALE := 0.1
 	set(value):
 		fog_density = maxf(value, 0.0)
 		_publish()
-## Fog inscattering color, applied to all pixels covered by the fog. (Unreal: Fog Inscattering Color)
-@export var fog_inscattering_color := Color(0.0, 0.0, 0.0):
+## Lit treats Fog Inscattering Color as a material's scattering albedo: sky
+## and sunlight illuminate it. Legacy Radiance keeps the old fixed, additive
+## scene-linear source for scenes authored with Unreal's color semantics.
+@export_enum("Lit", "Legacy Radiance") var fog_color_mode: int = ColorMode.LIT:
+	set(value):
+		fog_color_mode = value
+		_publish()
+## In Lit mode this is an sRGB material color, converted to linear albedo in
+## [0, 1]. White scatters incident light without tinting it. Black disables
+## the base source; the separately authored directional lobe is unaffected.
+## In Legacy Radiance mode it is the original scene-linear additive source.
+@export var fog_inscattering_color := Color.WHITE:
 	set(value):
 		fog_inscattering_color = value
 		_publish()
@@ -102,8 +114,10 @@ const UNIT_SCALE := 0.1
 	set(value):
 		directional_inscattering_start_distance = maxf(value, 0.0)
 		_publish()
-## Multiplier color on the sun's color for the directional inscattering.
-## Black disables the sun term. (Unreal: Directional Inscattering Color)
+## Independent artist color multiplied by sun luminance, never by the base
+## Fog Inscattering Color. Retains the original scene-linear RGB semantics.
+## Black disables only this optional lobe; Lit mode still has isotropic
+## sunlight. (Unreal: Directional Inscattering Color)
 @export var directional_inscattering_color := Color(0.0, 0.0, 0.0):
 	set(value):
 		directional_inscattering_color = value
@@ -126,7 +140,7 @@ func _notification(what: int) -> void:
 ## The camera-independent half of the pass's uniform block, in shader units.
 func snapshot_fields() -> Dictionary:
 	var height := global_position.y
-	return {
+	var fields := {
 		"fog_density": fog_density * UNIT_SCALE,
 		"fog_height_falloff": fog_height_falloff * UNIT_SCALE,
 		"fog_height": height + fog_height_offset,
@@ -143,6 +157,13 @@ func snapshot_fields() -> Dictionary:
 		"inscattering_start": directional_inscattering_start_distance,
 		"inscattering_exponent": directional_inscattering_exponent,
 	}
+	if fog_color_mode == ColorMode.LIT:
+		var albedo := fog_inscattering_color.clamp().srgb_to_linear()
+		fields["fog_albedo"] = Vector3(albedo.r, albedo.g, albedo.b)
+		# An unlit participating medium absorbs but does not emit. The runtime
+		# constructs its source from incident sky and sun radiance instead.
+		fields["fog_color"] = Vector3.ZERO
+	return fields
 
 func _publish() -> void:
 	if is_inside_tree():

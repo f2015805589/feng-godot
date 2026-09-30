@@ -2,9 +2,59 @@
 
 `FengHeightFog` provides exponential height fog with two density layers, a start distance, a cutoff distance, and optional directional inscattering. The Sky-anchored fullscreen pass fogs the opaque scene and sky. Forward-only opaque fallback and transparent materials use their own fragment position, so their fog follows the surface rather than the opaque depth buffer.
 
-Fog sources are scene-linear radiance and pre-exposure scales the combined source once with the rendered surface. When an active `FengSkyAtmosphere` uses the built-in atmosphere and `affect_height_fog` is enabled, the fog runtime adds `ambient_radiance * height_fog_contribution` to the authored `fog_inscattering_color`. `ambient_radiance` is the atmosphere model's direction-averaged Rayleigh/Mie single-scattered sky radiance, `(1 / 4π) ∫ L_sky(ω) dω`; it is scene-referred, has no exposure or pre-exposure applied, and is not solar lux. The scale defaults to 1. With no matching supported sky snapshot, the fog keeps its authored color unchanged. A high-energy sun can still make the authored fog contribution look dim after automatic exposure adapts to the bright scene. Directional inscattering remains a separate artistic sun lobe and keeps its existing selected `DirectionalLight3D` color and energy conversion (`PI` for non-physical units, authored lux for physical units). Sky transmittance does not modify the Godot light or automatically extinguish this lobe; the atmosphere's ground illuminance is not added to it a second time.
+## Lit fog color
 
-The sky-to-fog ambient contribution is computed by FengSkyAtmosphere's built-in Rayleigh/Mie single-scattering model and folded into the existing fog source on the main thread, scoped to the matching world. This is not a full Unreal `SkyAtmosphere` height-fog or atmosphere-light integration: it does not implement UE's full multi-scattering or distance-dependent aerial-perspective path, and it does not apply atmospheric transmittance to Godot's selected light or to the separate artist lobe. Custom sky providers that do not publish an atmospheric snapshot, including `PhysicalSkyMaterial`, retain the existing authored fog behavior.
+`fog_color_mode = Lit` is the default. `fog_inscattering_color` now behaves like
+an sRGB material color: it is converted to linear single-scattering albedo in
+[0, 1]. White scatters incident illumination without tinting it; black absorbs
+without emitting base light. The optional directional artist lobe is independent.
+The density, two height layers, opacity and distances still control the same
+extinction integral.
+
+The runtime constructs scene-linear sources before either fog rendering path:
+
+- Base: `albedo * (sky_mean_radiance * height_fog_contribution + sun_irradiance_rgb / (4 * PI))`
+- Additional directional artist lobe: `directional_color * luminance(sun_irradiance_rgb)`, followed by the existing `cos(angle)^exponent / (4 * PI)` shader phase
+
+Both sources follow light intensity, while their author colors stay independent.
+The base uses linear sRGB albedo; the directional color retains its original
+scene-linear artistic semantics and is never multiplied by the base albedo.
+Changing a physical sun from 6 to 60,000 lux no longer overwhelms a fixed, additive fog
+color. This does not bypass exposure or guarantee a fixed screen brightness:
+camera metering, the illuminant's color, and the scene still affect the result.
+The pass applies pre-exposure to the combined source exactly once.
+
+The isotropic direct-light phase is `1/(4π)`; the atmosphere's `ambient_radiance`
+is already `(1/(4π)) ∫ L_sky(ω) dω` and is not divided again. Sun irradiance is
+`light_energy * light_intensity_lux` in physical mode and `light_energy * PI`
+otherwise, with linear light color and physical color temperature. Both fog
+components use the same raw selected sun as scene surfaces. The sky
+snapshot's `sun_ground_illuminance` does not replace it: the renderer does not
+apply that atmospheric transmission to surface lighting, and the snapshot is
+zero at the horizon. Applying it only to fog erases its white base and lobe.
+Sky mean radiance remains a separately albedo-tinted ambient contribution.
+
+With no supported atmosphere provider, including custom skies, the selected sun
+still illuminates the fog. With neither sun nor atmosphere lighting, lit fog
+has extinction but no source. `height_fog_contribution = 0` removes only sky
+ambient; `affect_height_fog = false` disables the provider entirely, so fog then
+keeps its selected light and removes only that provider's sky ambient.
+
+The directional term remains an optional artistic addition. The combined
+isotropic-plus-lobe phase is not an energy-conserving volumetric model; this
+feature does not add multiple scattering, terrain occlusion, or distance-varying
+atmospheric aerial perspective.
+
+## Legacy scenes
+
+This is an intentional authoring change: the default color is now white, and
+saved colors are interpreted as lit sRGB albedo unless the mode is overridden.
+For an older scene that needs the exact previous appearance, select
+`Legacy Radiance` and keep its original color (black if the old scene omitted
+it). That mode preserves the fixed scene-linear authored RGB plus untinted sky
+ambient and the luminance-scaled raw-sun artist lobe. It is still expected to
+lose the relative contribution of a fixed color under much brighter lighting
+and automatic exposure. Legacy values are not clamped or converted to sRGB.
 
 ## Test
 
@@ -15,3 +65,17 @@ python misc/feng-addons/feng-fog/tests/run_late_sky_runtime_load.py --editor F:/
 ```
 
 It first queries fog with no `feng-sky` runtime, then makes a mock provider available in the same process and verifies that fog discovers and consumes its world-matched radiance snapshot.
+
+Run the lit-material tests (headless unit checks; optional real-renderer checks):
+
+```sh
+python misc/feng-addons/feng-fog/tests/run_lit_fog_tests.py --editor /path/to/godot --gpu-driver vulkan
+python misc/feng-addons/feng-fog/tests/run_lit_fog_tests.py --editor /path/to/godot --physical-units false --gpu-driver vulkan
+```
+
+The rendered test uses a fixed 320×240 viewport and covers a 10,000× lighting
+range, colored fog, deferred opaque/forward fallback/transparent surfaces,
+pre-exposure on/off, direct-only fog, the independent directional lobe, and black
+base albedo with the lobe disabled, white fog visibility at a horizontal sun
+in three viewing directions, and an orange lobe independent of base color. PNGs
+and source-value logs remain in the reported scratch project.

@@ -60,9 +60,10 @@ static func _sky_snapshot_for_world(world_id: int) -> Dictionary:
 		return {}
 	return result
 
-## Adds the sky model's isotropic single-scattered environment radiance to the
-## authored fog source. The height-fog pass applies pre-exposure to the
-## combined source once, exactly as it does when no sky provider is active.
+## Adds the sky model's mean incident radiance, tinted by the material albedo
+## in Lit mode. Direct illumination is resolved independently from the same
+## DirectionalLight3D used by scene surfaces.
+## Pre-exposure remains solely the height-fog pass's responsibility.
 static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 	var sky: Dictionary = _sky_snapshot_for_world(world_id)
 	if sky.is_empty() or (sky.has("affect_height_fog") and not bool(sky["affect_height_fog"])):
@@ -77,7 +78,8 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 		var authored_scale := float(scale_value)
 		if is_finite(authored_scale):
 			contribution_scale = maxf(authored_scale, 0.0)
-	snapshot["fog_color"] = fog_color + ambient * contribution_scale
+	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
+	snapshot["fog_color"] = fog_color + albedo * ambient * contribution_scale
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -245,13 +247,21 @@ static func _publish() -> void:
 			if use_physical_light_units:
 				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
-			# UE 5.7 defaults to the working color space's luminance factors;
-			# Godot's linear sRGB lights use the Rec.709 factors.
+			if snapshot.has("fog_albedo"):
+				# The base medium scatters the same selected light that illuminates
+				# scene surfaces. The atmosphere snapshot's ground irradiance must
+				# not replace this source: surfaces do not consume that transmission,
+				# and it is zero at the horizon, erasing white fog's body entirely.
+				# The sky mean is already phase-integrated; only direct light gets
+				# the isotropic 1/(4*PI) phase here.
+				var albedo: Vector3 = snapshot["fog_albedo"]
+				snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
+			# The directional lobe is an independent artist-authored color,
+			# not another material-albedo term. Preserve its original raw-sun
+			# luminance contract in both modes so changing the base color cannot
+			# recolor it or silently disable it (including a black base color).
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
-			# Keep the artist-authored sun lobe on its legacy light-energy path.
-			# Sky ambient is a separate source; ground illuminance/transmittance is
-			# not applied here or back to the selected DirectionalLight3D.
-			snapshot["inscattering_color"] = snapshot["inscattering_color"] * sun_luminance
+			snapshot["inscattering_color"] *= sun_luminance
 		snapshot["world_id"] = world_id
 		snapshot["fog_id"] = entry["id"]
 		snapshot["render_targets"] = _render_targets(entry["world"])

@@ -247,6 +247,7 @@ func run() -> void:
 	_scene.add_child(floor)
 
 	_fog = FengHeightFog.new()
+	_fog.fog_color_mode = FengHeightFog.ColorMode.LEGACY_RADIANCE
 	_fog.fog_density = 1.0
 	_fog.fog_height_falloff = 0.001
 	_fog.start_distance = 5.0

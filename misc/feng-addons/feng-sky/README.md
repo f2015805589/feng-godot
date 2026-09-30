@@ -28,9 +28,9 @@ matching the FRP renderer's normalized directional-light scale. The latter is
 not a lux measurement. Both modes use the same linear scattering equations.
 
 The default planet has a radius of 6360 km and a 60 km atmosphere. World units
-are metres; the default planet centre `(0, -6360000, 0)` places world origin at
+are meters; the default planet center `(0, -6360000, 0)` places world origin at
 sea level. Atmospheric distances and extinction/scattering coefficients are
-exposed in kilometres and inverse kilometres. The implementation evaluates
+exposed in kilometers and inverse kilometers. The implementation evaluates
 the spherical ray/sphere intersections and numerically integrates Rayleigh and
 Mie single scattering. For a view ray, the source term is
 
@@ -84,8 +84,12 @@ defined as `(1/(4π)) * ∫ L_sky(ω) dω`; the integration samples the upper sk
 treats the lower hemisphere as ground with no ground-bounce contribution. It
 includes sun-driven atmosphere scattering, not exposure or pre-exposure.
 `sun_ground_illuminance` is RGB lux when physical light units are enabled and
-FRP-normalized irradiance otherwise. The fog direction lobe should continue to
-use its existing raw sun source and must not multiply by this field again.
+FRP-normalized irradiance otherwise. Feng Fog does not substitute this field
+for the selected light: scene surfaces still use raw DirectionalLight3D
+irradiance, so applying atmospheric transmission only to fog would erase its
+base at the horizon. Lit fog uses raw RGB sunlight for its albedo-tinted base;
+the independent directional artist color keeps its raw-sun luminance scaling.
+See the Feng Fog README for color modes and the source-lighting contract.
 
 Ambient integration is cached per two-degree sun-zenith bins and linearly
 interpolated. Sun color and intensity scale the cached unit-source result;

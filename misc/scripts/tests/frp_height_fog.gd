@@ -106,7 +106,7 @@ func run() -> void:
 		if pass_entry.stable_id == &"library:height_fog":
 			_fog_pass = pass_entry
 		if pass_entry.stable_id == &"library:eye_adaptation":
-			# The asserts below read inscatter colours; exposure folding would
+			# The asserts below read inscatter colors; exposure folding would
 			# scale them, so the seeded metering pass stays out of this test.
 			pass_entry.enabled = false
 	if not check(_fog_pass != null and _fog_pass.enabled, "fresh renderer did not seed the enabled Height Fog pass"):
@@ -130,11 +130,14 @@ func run() -> void:
 	# A strong red exponential fog: the sky saturates to the inscattering colour
 	# and the floor blends toward it.
 	_fog = FogNode.new()
-	if not check(_fog.fog_inscattering_color == Color.BLACK
+	if not check(_fog.fog_color_mode == FogNode.ColorMode.LIT
+			and _fog.fog_inscattering_color == Color.WHITE
 			and is_equal_approx(_fog.second_fog_height_falloff, 0.2)
 			and is_equal_approx(_fog.directional_inscattering_start_distance, 100.0),
-			"fresh fog defaults differ from UE 5.7"):
+			"fresh fog defaults differ from the lit material contract"):
 		return
+	# This fixture exercises the unchanged legacy radiance/Unreal density path.
+	_fog.fog_color_mode = FogNode.ColorMode.LEGACY_RADIANCE
 	_fog.fog_density = 2.0
 	_fog.fog_inscattering_color = Color(1.0, 0.05, 0.05)
 	scene.add_child(_fog)
@@ -227,7 +230,7 @@ func run() -> void:
 	await settle(10)
 
 	# Start Distance removes the fog up to the exclusion distance: the floor a
-	# few metres ahead of the camera unfogs while the sky keeps the full effect.
+	# few meters ahead of the camera unfogs while the sky keeps the full effect.
 	_fog.start_distance = 40.0
 	await settle(12)
 	var near_image := await image()
