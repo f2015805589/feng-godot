@@ -1,6 +1,16 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "renderdoc_capture.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#endif
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/display_server.hpp>
@@ -17,17 +27,22 @@
 namespace godot {
 
 static RENDERDOC_API_1_6_0 *rdoc_api = nullptr;
+#ifdef _WIN32
 static wchar_t rdoc_module_path[MAX_PATH] = { 0 }; // POD only; no Godot objects at static init time.
+#else
+static char rdoc_module_path[PATH_MAX] = { 0 }; // POD only; no Godot objects at static init time.
+static void *rdoc_module_handle = nullptr; // Keep RenderDoc loaded for the lifetime of its API pointer.
+#endif
 
 RenderDocCapture::RenderDocCapture() {}
 
-// Probes the renderdoc.dll this process is already running under and returns its
-// in-application API. The engine loads RenderDoc before the graphics device is created,
-// so the DLL is present whenever a capture is possible at all.
+// Probes the RenderDoc library this process is already running under and returns its
+// in-application API. The engine module loads it before graphics-device creation.
 static RENDERDOC_API_1_6_0 *acquire_api() {
 	if (rdoc_api != nullptr) {
 		return rdoc_api;
 	}
+#ifdef _WIN32
 	HMODULE mod = GetModuleHandleW(L"renderdoc.dll");
 	if (mod == nullptr) {
 		return nullptr;
@@ -47,17 +62,59 @@ static RENDERDOC_API_1_6_0 *acquire_api() {
 	}
 	UtilityFunctions::print("[frd] renderdoc.dll hooked: ", String::utf16((const char16_t *)rdoc_module_path, (int)len));
 	return rdoc_api;
+#elif defined(__linux__)
+	// The engine module normally loads this with RTLD_GLOBAL before the graphics
+	// device is created. RTLD_DEFAULT also covers RenderDoc's LD_PRELOAD launch.
+	void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+	pRENDERDOC_GetAPI rdoc_get_api = mod != nullptr
+			? (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI")
+			: nullptr;
+	if (rdoc_get_api == nullptr) {
+		if (mod != nullptr) {
+			dlclose(mod);
+			mod = nullptr;
+		}
+		rdoc_get_api = (pRENDERDOC_GetAPI)dlsym(RTLD_DEFAULT, "RENDERDOC_GetAPI");
+	}
+	if (rdoc_get_api == nullptr || rdoc_get_api(eRENDERDOC_API_Version_1_6_0, (void **)&rdoc_api) != 1) {
+		if (mod != nullptr) {
+			dlclose(mod);
+		}
+		rdoc_api = nullptr;
+		return nullptr;
+	}
+	if (mod != nullptr) {
+		rdoc_module_handle = mod;
+	}
+	Dl_info module_info = {};
+	if (dladdr(reinterpret_cast<void *>(rdoc_get_api), &module_info) != 0 && module_info.dli_fname != nullptr) {
+		snprintf(rdoc_module_path, sizeof(rdoc_module_path), "%s", module_info.dli_fname);
+	}
+	UtilityFunctions::print("[frd] RenderDoc library hooked: ", String::utf8(rdoc_module_path));
+	return rdoc_api;
+#else
+	return nullptr;
+#endif
 }
 
 bool RenderDocCapture::is_loaded() {
-	return rdoc_api != nullptr;
+	return acquire_api() != nullptr;
 }
 
 String RenderDocCapture::get_renderdoc_module_path() {
+#ifdef _WIN32
 	if (acquire_api() == nullptr || rdoc_module_path[0] == 0) {
 		return String();
 	}
 	return String::utf16((const char16_t *)rdoc_module_path, (int)wcslen(rdoc_module_path));
+#elif defined(__linux__)
+	if (acquire_api() == nullptr || rdoc_module_path[0] == 0) {
+		return String();
+	}
+	return String::utf8(rdoc_module_path);
+#else
+	return String();
+#endif
 }
 
 bool RenderDocCapture::trigger_capture() {

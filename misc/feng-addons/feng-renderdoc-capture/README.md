@@ -1,7 +1,8 @@
 # RenderDoc Capture
 
 The 3D toolbar camera captures the next actual frame presented by the current
-editor window. It waits for the completed `.rdc` and opens it in `qrenderdoc.exe`.
+editor window. It waits for the completed `.rdc` and opens it in RenderDoc's GUI
+(`qrenderdoc.exe` on Windows or `qrenderdoc` on Linux).
 It never launches another Godot process, saves/reloads a scene, or restarts the
 editor to capture. Unsaved scene changes, the current viewport, editor overlays,
 and the editor's real GPU resources are included in the window frame.
@@ -14,8 +15,10 @@ headless tools and recovery mode do not load it. If the plugin is disabled at
 startup, the editor does not load it either.
 
 In Editor Settings, search for `renderdoc`, then set **RenderDoc > Capture >
-Executable Path** to `qrenderdoc.exe`. This file picker is visible without Advanced
-Settings. Empty means auto-detect. The matching `renderdoc.dll` accompanies the GUI.
+Executable Path** to the RenderDoc GUI (`qrenderdoc.exe` on Windows or `qrenderdoc`
+on Linux). This file picker is visible without Advanced Settings. Empty means
+auto-detect. Windows uses the matching `renderdoc.dll`; Linux loads the matching
+`librenderdoc.so` before graphics-device initialization.
 The path is cached in `.godot/renderdoc/editor.cfg` for early device initialization;
 changing the installation takes effect the next time this editor is started.
 It does not force an editor restart.
@@ -26,17 +29,24 @@ path is reported on the console. The capture button also shows the reason the la
 startup probe failed (`FengRenderDoc.get_mount_status()`) instead of only reporting
 that the device is not attached.
 
-The engine searches, in order: the configured executable's folder, `FENG_RENDERDOC_PATH`,
-this build's folder and `bin/tools/RenderDoc/` next to it, then the normal Windows
-Program Files installation. `bin/tools/RenderDoc/` is not part of this checkout; it
-exists only if a portable build was unpacked there (that path is ignored by git).
-Portable builds are available at https://renderdoc.org/builds.
+On Windows the engine searches, in order: the configured executable's folder,
+`FENG_RENDERDOC_PATH`, this build's folder and `bin/tools/RenderDoc/` next to it, then
+the normal Program Files installation. On Linux, it searches the configured GUI's
+folder and parent, `FENG_RENDERDOC_PATH` (including its `bin` directory), this build's
+`tools/RenderDoc/` directory, common system GUI locations, and standard library
+locations for `librenderdoc.so`; the dynamic loader's search path is the final fallback.
+Set `FENG_RENDERDOC_PATH` to a RenderDoc install root when using a portable package.
+The build-local `tools/RenderDoc/` path is not part of this checkout; it exists only if
+a portable build was unpacked there (that path is ignored by git). Portable builds are
+available at https://renderdoc.org/builds.
 
-The matching `renderdoc.dll` is searched through that same list, not only inside the
-configured folder: an executable that points at a folder without a usable DLL no longer
-hides the installed copy. If the DLL and the configured executable come from different
-folders, the mount reports both, so a version mismatch between capture and analyzer is
-visible instead of silent.
+On Windows, the matching `renderdoc.dll` is searched through that same list, not only
+inside the configured folder: an executable that points at a folder without a usable DLL
+no longer hides the installed copy. If the DLL and configured executable come from
+different folders, the mount reports both, so a version mismatch between capture and
+analyzer is visible instead of silent. On Linux, the engine opens `librenderdoc.so`
+with global symbol visibility and keeps it loaded for the editor lifetime; the native
+extension resolves the already-loaded API with `dlsym`.
 
 On this machine the capture itself then hit a RenderDoc/runtime incompatibility that is
 unrelated to the renderer: with `bin/D3D12Core.dll` (the Agility D3D12 runtime installed
@@ -47,7 +57,7 @@ pins no RenderDoc version and ships no RenderDoc.
 
 Each click requests one frame. F12 and the RenderDoc corner overlay are disabled.
 Closing the analyzer does not start further captures or restart the editor.
-**The DLL and graphics wrappers remain until editor exit.** RenderDoc cannot
+**The RenderDoc library and graphics wrappers remain until editor exit.** RenderDoc cannot
 safely remove them after graphics initialization; closing its window is not an
 unload operation. This is the accepted tradeoff for capturing the live editor
 without restarting it. No claim of zero instrumentation overhead is made.
@@ -90,8 +100,8 @@ only arms the queued trigger and lets the editor present normally. Ways out, bes
 ## Building
 
 The plugin script calls native statics (`RenderDocCapture.capture_frame()`), so a source
-change is only live once this addon's DLL is rebuilt. An editor started against a stale
-`bin/libfeng-renderdoc-capture.windows.debug.x86_64.dll` fails at plugin load with
+change is only live once this addon's native library is rebuilt. An editor started against
+a stale platform library fails at plugin load with
 
 ```
 ERROR: res://addons/feng-renderdoc-capture/src/editor_plugin.gd:84 - Parse Error:
@@ -107,8 +117,19 @@ cd misc/feng-addons/feng-renderdoc-capture/native
 scons platform=windows target=template_debug arch=x86_64 -j8
 ```
 
-The DLL is a build artifact and is not tracked by git, so a fresh checkout has to build it
-before the plugin loads. Projects that link this addon (the junctions under `bin/`) resolve
+On Linux, build the corresponding shared object with:
+
+```sh
+cd misc/feng-addons/feng-renderdoc-capture/native
+scons platform=linux target=template_debug arch=x86_64 -j8
+```
+
+The extension maps the result to `bin/libfeng-renderdoc-capture.linux.debug.x86_64.so`
+(and the corresponding `.release` name). The Linux build links against `libdl` for
+`dlopen`/`dlsym`; Windows continues to use the existing `.dll` mapping.
+
+The native library is a build artifact and is not tracked by git, so a fresh checkout has
+to build it before the plugin loads. Projects that link this addon (the junctions under `bin/`) resolve
 the library relative to the addon directory, so one rebuild fixes every one of them.
 
 ## Validation

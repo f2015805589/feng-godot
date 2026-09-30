@@ -1,35 +1,114 @@
 # Feng Sky
 
-`FengSkyAtmosphere` is a world-level sky component built on Godot's
-`WorldEnvironment`, `Environment`, and `Sky` resources. Enable the Feng Sky
-plugin, add a `FengSkyAtmosphere` node to a scene, then assign a `Sky` resource
-to its **Sky** property. A new node starts with a `PhysicalSkyMaterial` sky.
+`FengSkyAtmosphere` is a `WorldEnvironment` component with a GPU-rendered,
+spherical, Earth-like single-scattering atmosphere. New nodes use this model by
+default. Its atmosphere shader produces scene-linear radiance and leaves camera
+exposure and pre-exposure to the renderer.
 
-The **Sky** property accepts any `Sky` resource. Its `sky_material` can use
-`PhysicalSkyMaterial`, `PanoramaSkyMaterial`, `ProceduralSkyMaterial`, or a
-`ShaderMaterial` with a sky shader. A panorama is an equirectangular texture.
-To drive Godot's built-in physical sky with a chosen directional light, set
-that light's `sky_mode` to **Sky Only** and set other directional lights to
-**Light Only** as appropriate.
+FRP applies `Environment.background_intensity` to sky radiance, so the provider
+sets that nits-valued multiplier to `1.0` only while the built-in atmosphere is
+selected; it is otherwise a second exposure-scale multiplication on a source
+already driven by the sun's authored irradiance. The prior custom or legacy
+value is stored with the component and restored when the built-in atmosphere is
+disabled or replaced. Use `Environment.background_energy_multiplier` for an
+artistic sky gain; the same gain scales the atmosphere's fog ambient snapshot,
+and the shader lowers its HDR output ceiling to keep the native-gained sky under
+the RGBA16F limit. The fog snapshot also clamps its already averaged RGB value
+to 60,000 as a range guard; under extreme gain or sun intensity this is not the
+same as integrating the shader's per-ray radiance cap over the sky.
 
-The component keeps its `Environment.background_mode` at `BG_SKY`. It makes
-private copies of an assigned Environment, Sky, sky material, and Shader before
-using them, so editing one component does not change another world's shared
-settings. External texture assets remain shared. The `Sky` property is the
-component's saved sky slot; changes made to the underlying Environment's sky
-are reflected by that property.
+Add `FengSkyAtmosphere` to a scene and assign a visible `DirectionalLight3D` to
+**Sun Light**, or leave the field empty to select the first compatible sun in
+the same `World3D`. A light in **Sky Only** mode can drive the atmosphere;
+**Light Only** lights are ignored. Sun direction, authored sRGB color, optional
+physical temperature, and energy update the sky as the light changes. With
+`rendering/lights_and_shadows/use_physical_light_units` enabled, the source uses
+`light_intensity_lux * light_energy`; otherwise it uses `PI * light_energy`,
+matching the FRP renderer's normalized directional-light scale. The latter is
+not a lux measurement. Both modes use the same linear scattering equations.
 
-Godot applies the component through the normal WorldEnvironment rule: the
-first WorldEnvironment in each `World3D` provides that world's Environment.
-Additional environments do not replace it and receive a configuration warning.
-The scope is a `World3D`, so scene instances sharing a world also share its sky.
+The default planet has a radius of 6360 km and a 60 km atmosphere. World units
+are metres; the default planet centre `(0, -6360000, 0)` places world origin at
+sea level. Atmospheric distances and extinction/scattering coefficients are
+exposed in kilometres and inverse kilometres. The implementation evaluates
+the spherical ray/sphere intersections and numerically integrates Rayleigh and
+Mie single scattering. For a view ray, the source term is
 
-FRP draws this Environment through its native Sky pass. Its existing eye
-adaptation path applies pre-exposure to the background and sky, so the component
-does not multiply sky color by exposure itself. The built-in `PhysicalSkyMaterial`
-provides a sky background approximation; this addon does not implement UE's full
-atmospheric perspective or multi-scattering on scene geometry. Use Environment
-fog or the separate Feng height fog for scene fog effects.
+`βR ρR PR(μ) + βM,scatter ρM PHG(μ, g)`
+
+and each segment is attenuated by view-path and sun-path transmittance
+`T = exp(-∫(βR ρR + βM,extinction ρM) ds)`. Density falls exponentially with
+altitude. The Mie extinction coefficient is constrained to be at least its
+scattering coefficient, so the model cannot create energy from negative
+absorption. The GPU uses eight view segments and six sun-path samples, with
+more samples concentrated near the dense lower atmosphere. It also shades a
+Lambertian lower-sky ground disk from direct sunlight; that ground reflection is
+not included in the fog ambient snapshot.
+
+The same runtime sanitizer supplies GPU sky uniforms and CPU fog samples,
+including values assigned from code outside Inspector hints. It bounds planet
+radius to 6000–7000 km, atmosphere height to 1–120 km, Rayleigh and Mie scale
+heights to 1–30 km and 0.1–10 km, each scattering coefficient to 0–1 km⁻¹,
+and Mie extinction to at least its scattering coefficient. Non-finite scalar
+and vector inputs fall back to documented defaults.
+
+This is a single-scattering model. It does not implement ozone absorption,
+multiple scattering, terrain shadows, or atmospheric refraction. Godot stores
+sky radiance in an RGBA16F cubemap, whose finite range ends at 65504. To prevent
+solar-disk overflow and fireflies, the shader caps the disk and final sky
+radiance at 60000. The solar disk therefore keeps its angle and atmospheric
+color/transmission but is not an absolute physical luminance measurement.
+
+The component privately copies its Environment, Sky, material, and shader per
+scene instance. Assigning a non-atmosphere `Sky` switches to that custom sky and
+does not publish atmospheric fog lighting. Older scenes saved with
+`PhysicalSkyMaterial`, panoramas, procedural skies, or custom sky shaders keep
+their saved resource. Set **Atmosphere Enabled** to turn the model back on; the
+component retains the custom sky so disabling it restores that selection.
+
+Godot's normal first-`WorldEnvironment` rule still applies: only the first
+provider for a `World3D` renders there. Multiple viewports sharing a world share
+its sky, while separate worlds receive independent copies. `affect_height_fog`
+controls only the optional main-thread snapshot for Feng Fog; disabling it
+leaves sky rendering and sun updates active.
+
+Feng Fog can soft-load
+`res://addons/feng-sky/feng_sky_runtime.gd` and call
+`FengSkyRuntime.snapshot_for_world(world_id)` on the main thread. The copied
+snapshot is available only while this component is the active WorldEnvironment
+provider, its atmosphere model is enabled, and `affect_height_fog` is true. It
+contains `world_id`, `provider_id`, `sun_light_id`, `sun_direction`,
+`sun_ground_illuminance`, `sun_irradiance_unit`, `ambient_radiance`, and
+`height_fog_contribution`. `ambient_radiance` is a linear RGB isotropic source
+defined as `(1/(4π)) * ∫ L_sky(ω) dω`; the integration samples the upper sky and
+treats the lower hemisphere as ground with no ground-bounce contribution. It
+includes sun-driven atmosphere scattering, not exposure or pre-exposure.
+`sun_ground_illuminance` is RGB lux when physical light units are enabled and
+FRP-normalized irradiance otherwise. The fog direction lobe should continue to
+use its existing raw sun source and must not multiply by this field again.
+
+Ambient integration is cached per two-degree sun-zenith bins and linearly
+interpolated. Sun color and intensity scale the cached unit-source result;
+sun azimuth does not invalidate it. Atmosphere parameter changes clear the
+cache. Each cache miss evaluates 64 importance-sampled directions, including
+samples drawn from the Henyey–Greenstein distribution to cover its forward
+peak; the bounded cost is observable through
+`FengSkyAtmosphere.atmosphere_cache_stats()`.
+
+## Example
+
+Open and run `res://addons/feng-sky/examples/feng_sky_atmosphere_60k.tscn` in a
+project with Feng Sky, Feng Fog, and Feng Render Pipeline installed. Select the
+FRP rendering method before starting the project. The scene contains a 60,000
+lux sun, the built-in atmosphere and height fog, a camera, and simple near and
+far geometry. Its scene script attaches a camera-local FRP pipeline with Eye
+Adaptation enabled, extended luminance range, and pre-exposure enabled; Magic GI
+is disabled to keep the sample focused on atmosphere and fog.
+
+For the sun to use its authored 60,000 lux value, enable **Rendering → Lights
+and Shadows → Use Physical Light Units** in Project Settings and restart the
+project. This is a startup renderer setting; the scene warns when it is off.
+The sample does not change project-wide renderer settings or pipeline selection.
 
 ## Tests
 

@@ -21,10 +21,10 @@ public:
 	FengRenderDoc();
 	~FengRenderDoc();
 
-	// Probes renderdoc.dll and mounts it into the process. Must run before
+	// Probes the RenderDoc library and mounts it into the process. Must run before
 	// any graphics API is initialized, so Main calls it immediately before
 	// creating a graphical DisplayServer. Only editors with the capture plugin
-	// enabled attach. The DLL stays loaded until this editor exits.
+	// enabled attach. The RenderDoc library stays loaded until this editor exits.
 	void probe_and_mount();
 
 	static bool is_hooked();

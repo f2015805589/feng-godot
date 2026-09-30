@@ -11,6 +11,8 @@ extends RefCounted
 ## array under the mutex instead of mutating a published one.
 
 const SUN_SCAN_MSEC := 500
+const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
+const SKY_RUNTIME_PROBE_INTERVAL_MSEC := 500
 ## The viewport/world/targets registry lives with the snapshot passes that
 ## consume it; the same soft path-loading the passes use for producer runtimes
 ## applies here, so a missing feng-render-pipeline addon degrades to nothing
@@ -26,6 +28,8 @@ static var _sequence := 0
 static var _last_frame := -1
 static var _worlds_queried := false
 static var _worlds: GDScript = null
+static var _next_sky_runtime_probe_msec := 0
+static var _sky_runtime: GDScript = null
 
 static func _snapshot_worlds() -> GDScript:
 	if not _worlds_queried:
@@ -33,6 +37,47 @@ static func _snapshot_worlds() -> GDScript:
 		if ResourceLoader.exists(SNAPSHOT_WORLDS_PATH):
 			_worlds = load(SNAPSHOT_WORLDS_PATH)
 	return _worlds
+
+## FengSkyAtmosphere is an optional addon. Query its main-thread, world-scoped
+## radiance snapshot by soft path so fog remains usable when feng-sky is absent.
+static func _sky_snapshot_for_world(world_id: int) -> Dictionary:
+	if _sky_runtime == null:
+		var now := Time.get_ticks_msec()
+		if now < _next_sky_runtime_probe_msec:
+			return {}
+		_next_sky_runtime_probe_msec = now + SKY_RUNTIME_PROBE_INTERVAL_MSEC
+		if ResourceLoader.exists(SKY_RUNTIME_PATH):
+			var loaded: Variant = load(SKY_RUNTIME_PATH)
+			if loaded is GDScript and loaded.has_method("snapshot_for_world"):
+				_sky_runtime = loaded
+	if _sky_runtime == null:
+		return {}
+	var result: Variant = _sky_runtime.call("snapshot_for_world", world_id)
+	if not result is Dictionary or result.is_empty():
+		return {}
+	var result_world_id: Variant = result.get("world_id")
+	if not result_world_id is int or result_world_id != world_id:
+		return {}
+	return result
+
+## Adds the sky model's isotropic single-scattered environment radiance to the
+## authored fog source. The height-fog pass applies pre-exposure to the
+## combined source once, exactly as it does when no sky provider is active.
+static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
+	var sky: Dictionary = _sky_snapshot_for_world(world_id)
+	if sky.is_empty() or (sky.has("affect_height_fog") and not bool(sky["affect_height_fog"])):
+		return
+	var ambient: Variant = sky.get("ambient_radiance")
+	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
+	if not ambient is Vector3 or not fog_color is Vector3:
+		return
+	var scale_value: Variant = sky.get("height_fog_contribution", 1.0)
+	var contribution_scale := 1.0
+	if scale_value is int or scale_value is float:
+		var authored_scale := float(scale_value)
+		if is_finite(authored_scale):
+			contribution_scale = maxf(authored_scale, 0.0)
+	snapshot["fog_color"] = fog_color + ambient * contribution_scale
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -170,6 +215,7 @@ static func _publish() -> void:
 		var entry: Dictionary = selected[world_id]
 		var fog: FengHeightFog = entry["fog"]
 		var snapshot := fog.snapshot_fields()
+		_add_sky_ambient(snapshot, world_id)
 		var sun := _sun_for(fog, entry["world"])
 		if sun == null:
 			snapshot["sun_direction"] = Vector3.ZERO
@@ -184,17 +230,27 @@ static func _publish() -> void:
 			# lights carry PI in their energy, while physical directional lights
 			# multiply their artist energy by the authored illuminance in lux.
 			var sun_energy := sun.light_energy
-			if bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)):
+			var use_physical_light_units := bool(ProjectSettings.get_setting(
+					"rendering/lights_and_shadows/use_physical_light_units", false))
+			if use_physical_light_units:
 				sun_energy *= float(sun.get("light_intensity_lux"))
 			else:
 				sun_energy *= PI
 			if sun.light_negative:
 				sun_energy *= -1.0
 			var linear_sun_color := sun.light_color.srgb_to_linear()
+			# Godot applies correlated color temperature to physical lights only.
+			# Keep this conditional in step with Light3D so non-physical lights are
+			# byte-for-byte unchanged by the fog's directional lobe.
+			if use_physical_light_units:
+				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
 			# UE 5.7 defaults to the working color space's luminance factors;
 			# Godot's linear sRGB lights use the Rec.709 factors.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
+			# Keep the artist-authored sun lobe on its legacy light-energy path.
+			# Sky ambient is a separate source; ground illuminance/transmittance is
+			# not applied here or back to the selected DirectionalLight3D.
 			snapshot["inscattering_color"] = snapshot["inscattering_color"] * sun_luminance
 		snapshot["world_id"] = world_id
 		snapshot["fog_id"] = entry["id"]

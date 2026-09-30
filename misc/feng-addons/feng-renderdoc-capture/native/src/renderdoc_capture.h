@@ -17,7 +17,7 @@ public:
 
 	/// True when this process was launched with RenderDoc hooked in.
 	static bool is_loaded();
-	/// Returns renderdoc.dll path when hooked, empty otherwise.
+	/// Returns the RenderDoc library path when hooked, empty otherwise.
 	static String get_renderdoc_module_path();
 	/// Triggers a capture of the next frame. Returns true when issued.
 	static bool trigger_capture();

@@ -40,7 +40,7 @@ func _setup_settings() -> void:
 		"name": SETTING_EXE,
 		"type": TYPE_STRING,
 		"hint": PROPERTY_HINT_GLOBAL_FILE,
-		"hint_string": "*.exe",
+		"hint_string": "*" if OS.get_name() == "Linux" else "*.exe",
 	})
 	settings.set_basic(SETTING_EXE, true)
 	_settings_changed()
@@ -63,7 +63,8 @@ func _on_capture_pressed() -> void:
 		return
 	var gui := FengRenderDoc.get_gui_path(str(EditorInterface.get_editor_settings().get_setting(SETTING_EXE)))
 	if gui.is_empty():
-		_warning("Set RenderDoc > Capture > Executable Path to qrenderdoc.exe in Editor Settings.")
+		var gui_name := "qrenderdoc" if OS.get_name() == "Linux" else "qrenderdoc.exe"
+		_warning("Set RenderDoc > Capture > Executable Path to " + gui_name + " in Editor Settings.")
 		return
 	if not FengRenderDoc.is_hooked():
 		# RenderDoc attaches while the editor starts, so a stale or missing installation

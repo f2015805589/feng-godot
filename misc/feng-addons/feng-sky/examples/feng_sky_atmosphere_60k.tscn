@@ -1,0 +1,85 @@
+[gd_scene load_steps=12 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-sky/feng_sky_atmosphere.gd" id="1_atmosphere"]
+[ext_resource type="Script" path="res://addons/feng-fog/feng_height_fog.gd" id="2_fog"]
+[ext_resource type="Script" path="res://addons/feng-sky/examples/feng_sky_atmosphere_60k.gd" id="3_setup"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_ground"]
+size = Vector3(400, 0.25, 400)
+
+[sub_resource type="StandardMaterial3D" id="Material_ground"]
+albedo_color = Color(0.16, 0.18, 0.2, 1)
+roughness = 1.0
+
+[sub_resource type="BoxMesh" id="BoxMesh_near"]
+size = Vector3(1.4, 1.4, 1.4)
+
+[sub_resource type="StandardMaterial3D" id="Material_near"]
+albedo_color = Color(0.72, 0.12, 0.055, 1)
+roughness = 0.8
+
+[sub_resource type="BoxMesh" id="BoxMesh_mid"]
+size = Vector3(2.2, 2.2, 2.2)
+
+[sub_resource type="StandardMaterial3D" id="Material_mid"]
+albedo_color = Color(0.12, 0.42, 0.58, 1)
+roughness = 0.75
+
+[sub_resource type="BoxMesh" id="BoxMesh_far"]
+size = Vector3(52, 18, 0.5)
+
+[sub_resource type="StandardMaterial3D" id="Material_far"]
+albedo_color = Color(0.68, 0.62, 0.42, 1)
+roughness = 1.0
+
+[node name="FengSkyAtmosphere60k" type="Node3D"]
+script = ExtResource("3_setup")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-38, -24, 0)
+light_color = Color(1, 1, 1, 1)
+light_energy = 1.0
+light_intensity_lux = 60000.0
+shadow_enabled = true
+
+[node name="Atmosphere" type="WorldEnvironment" parent="." node_paths=PackedStringArray("sun_light")]
+script = ExtResource("1_atmosphere")
+sun_light = NodePath("../Sun")
+affect_height_fog = true
+height_fog_contribution = 1.0
+
+[node name="HeightFog" type="Node3D" parent="." node_paths=PackedStringArray("sun_light")]
+script = ExtResource("2_fog")
+fog_density = 0.025
+fog_inscattering_color = Color(0.12, 0.15, 0.2, 1)
+fog_height_falloff = 0.12
+start_distance = 5.0
+sun_light = NodePath("../Sun")
+directional_inscattering_color = Color(0.08, 0.13, 0.22, 1)
+directional_inscattering_start_distance = 18.0
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.999391, -0.0348995, 0, 0.0348995, 0.999391, 0, 1.7, 12)
+current = true
+fov = 70.0
+far = 500.0
+
+[node name="Ground" type="MeshInstance3D" parent="."]
+position = Vector3(0, -0.125, -70)
+mesh = SubResource("BoxMesh_ground")
+material_override = SubResource("Material_ground")
+
+[node name="NearBlock" type="MeshInstance3D" parent="."]
+position = Vector3(-2, 0.7, 3)
+mesh = SubResource("BoxMesh_near")
+material_override = SubResource("Material_near")
+
+[node name="MiddleBlock" type="MeshInstance3D" parent="."]
+position = Vector3(2.5, 1.1, -28)
+mesh = SubResource("BoxMesh_mid")
+material_override = SubResource("Material_mid")
+
+[node name="FarWall" type="MeshInstance3D" parent="."]
+position = Vector3(0, 8, -120)
+mesh = SubResource("BoxMesh_far")
+material_override = SubResource("Material_far")

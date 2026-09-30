@@ -16,6 +16,9 @@ env = SConscript(os.path.join(GODOT_CPP, "SConstruct"))
 
 env.Append(CPPPATH=["src/"])
 env.Append(CPPPATH=[os.path.join(GODOT_CPP, "gdextension")])
+if env["platform"] == "linux":
+    # RenderDoc's in-process API is resolved through dlopen/dlsym on Linux.
+    env.Append(LIBS=["dl"])
 sources = Glob("src/*.cpp")
 
 # Find gdextension path even if the directory or extension is renamed.

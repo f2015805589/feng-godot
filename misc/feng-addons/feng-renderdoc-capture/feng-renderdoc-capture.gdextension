@@ -7,3 +7,5 @@ compatibility_minimum = 4.5
 
 windows.debug.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.windows.debug.x86_64.dll"
 windows.release.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.windows.release.x86_64.dll"
+linux.debug.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.linux.debug.x86_64.so"
+linux.release.x86_64 = "res://addons/feng-renderdoc-capture/bin/libfeng-renderdoc-capture.linux.release.x86_64.so"
