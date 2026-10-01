@@ -60,6 +60,15 @@ solar-disk overflow and fireflies, the shader caps the disk and final sky
 radiance at 60000. The solar disk therefore keeps its angle and atmospheric
 color/transmission but is not an absolute physical luminance measurement.
 
+The solar edge is evaluated using squared chord distance rather than two
+cosines near one. This is the same angular profile, but keeps distinct edges at
+the supported 0.01° minimum disk radius in float32; the old cosine edges could
+round together at 0.01°–0.02° and make `smoothstep` undefined. Non-finite sun
+energy or color disables the source, and invalid/zero directions fall back to
+zenith before either CPU integration or GPU uniform publication. Finite sun
+directions are scaled before normalization to avoid squared-length overflow.
+These guards do not reduce valid sunlight or alter the fog lighting contract.
+
 The component privately copies its Environment, Sky, material, and shader per
 scene instance. Assigning a non-atmosphere `Sky` switches to that custom sky and
 does not publish atmospheric fog lighting. Older scenes saved with
@@ -181,3 +190,25 @@ python misc/feng-addons/feng-sky/tests/run_sky_atmosphere_tests.py --editor F:/p
 The test starts a temporary headless project and checks default and replaceable
 skies, per-world environment selection, isolation of shared resources, and
 handoff to an existing WorldEnvironment.
+
+`tests/test_sky_numerics.gd` checks finite source inputs and reproduces the old
+float32 disk-edge collapse. With `-- --gpu`, it dispatches the production sky
+shader's math as compute work and reads float32 values before tone mapping or
+RGBA16F storage. The 8,192 ray cases cover sun and camera motion, horizon and
+space views, tiny/large solar disks, zero/60,000/10,000,000 irradiance, phase
+extrema, zero/dense extinction, and both lookup/direct sun paths. It checks disk
+profile agreement, finite unclamped scattering, and transmission/radiance ranges.
+The Python runner includes the CPU checks and adds this GPU probe when
+`--gpu-driver` is provided. A RenderingDevice-capable display/driver is required
+for GPU checks; Godot's headless dummy renderer is not a GPU test.
+
+`tests/test_sky_motion_gpu.gd` exercises the complete default 13-enabled-pass FRP
+schedule while both the camera and sun move. An isolated 129 × 129 viewport
+tracks the solar disk across the image at 60,000 and 10,000,000 irradiance, with
+0.01°/default disk radii and pre-exposure/TAA combinations. It reads a 5 × 5
+sun-centered region every fourth moving frame (36 captures across 12 cases),
+checks for non-finite values/blackouts and invalid exposure, and saves one image
+per case. Eight cases keep all 13 passes enabled; four isolated control cases
+disable only the local native TAA entry (12 enabled passes). Exposure buffers
+are read from the active effect on the render thread. The full test runner
+includes this after the existing fog/sky GPU probe.

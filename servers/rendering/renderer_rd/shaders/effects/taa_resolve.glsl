@@ -86,7 +86,10 @@ vec3 reinhard(vec3 hdr) {
 	return hdr / (hdr + 1.0);
 }
 vec3 reinhard_inverse(vec3 sdr) {
-	return sdr / (1.0 - sdr);
+	// Compressing the largest finite half (65504) rounds to 1 - 2^-16 in
+	// FP32. Its inverse is 65535, which would overflow the RGBA16F output
+	// even though both source frames were finite. Respect the storage limit.
+	return min(sdr / (1.0 - sdr), vec3(65504.0));
 }
 
 float get_depth(ivec2 thread_id) {
@@ -176,8 +179,10 @@ void get_closest_pixel_velocity_3x3(in uvec2 group_pos, uvec2 group_top_left, ou
 	depth_test_min(group_pos + kOffsets3x3[7], min_depth, min_pos);
 	depth_test_min(group_pos + kOffsets3x3[8], min_depth, min_pos);
 
-	// Velocity out
-	velocity = imageLoad(velocity_buffer, ivec2(group_top_left + min_pos)).xy;
+	// Match the clamped depth texel, including neighbors in the tile's halo
+	// at viewport borders. min_pos is relative to the workgroup, not its halo.
+	ivec2 min_pixel = clamp(ivec2(group_top_left + min_pos), ivec2(0), ivec2(params.resolution) - ivec2(1));
+	velocity = imageLoad(velocity_buffer, min_pixel).xy;
 }
 
 /*------------------------------------------------------------------------------
@@ -333,6 +338,13 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 
 	// Get input color
 	vec3 color_input = load_color(pos_group);
+	// No history exists outside the viewport. Reject it before sampling the
+	// previous velocity image or attenuating the current-frame blend factor.
+	// A full blend followed by the flicker reduction is not a full rejection.
+	if (any(isnan(uv_reprojected)) || any(isinf(uv_reprojected)) ||
+			any(lessThan(uv_reprojected, vec2(0.0))) || any(greaterThanEqual(uv_reprojected, vec2(1.0)))) {
+		return color_input;
+	}
 
 	// Get history color (catmull-rom reduces a lot of the blurring that you get under motion)
 	bool valid_history;
@@ -355,14 +367,11 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 	// Compute blend factor
 	float blend_factor = RPC_16; // We want to be able to accumulate as many jitter samples as we generated, that is, 16.
 	{
-		// If re-projected UV is out of screen, converge to current color immediately.
-		float factor_screen = any(lessThan(uv_reprojected, vec2(0.0))) || any(greaterThan(uv_reprojected, vec2(1.0))) ? 1.0 : 0.0;
-
 		// Increase blend factor when there is disocclusion (fixes a lot of the remaining ghosting).
 		float factor_disocclusion = get_factor_disocclusion(uv_reprojected, velocity);
 
 		// Add to the blend factor
-		blend_factor = clamp(blend_factor + factor_screen + factor_disocclusion, 0.0, 1.0);
+		blend_factor = clamp(blend_factor + factor_disocclusion, 0.0, 1.0);
 	}
 
 	// Resolve
@@ -399,7 +408,7 @@ void main() {
 	}
 
 	const uvec2 pos_group = gl_LocalInvocationID.xy;
-	const uvec2 pos_group_top_left = gl_WorkGroupID.xy * kGroupSize - kBorderSize;
+	const uvec2 pos_group_top_left = gl_WorkGroupID.xy * kGroupSize;
 	const uvec2 pos_screen = gl_GlobalInvocationID.xy;
 	const vec2 uv = (gl_GlobalInvocationID.xy + 0.5f) / params.resolution;
 

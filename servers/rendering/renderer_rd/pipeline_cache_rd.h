@@ -67,7 +67,11 @@ public:
 	void update_specialization_constants(const Vector<RD::PipelineSpecializationConstant> &p_base_specialization_constants);
 	void update_shader(RID p_shader);
 
-	_FORCE_INLINE_ RID get_render_pipeline(RD::VertexFormatID p_vertex_format_id, RD::FramebufferFormatID p_framebuffer_format_id, bool p_wireframe = false, uint32_t p_render_pass = 0, uint32_t p_bool_specializations = 0) {
+	// Optionally report a successful synchronous cache miss for compilation metrics.
+	_FORCE_INLINE_ RID get_render_pipeline(RD::VertexFormatID p_vertex_format_id, RD::FramebufferFormatID p_framebuffer_format_id, bool p_wireframe = false, uint32_t p_render_pass = 0, uint32_t p_bool_specializations = 0, bool *r_created = nullptr) {
+		if (r_created) {
+			*r_created = false;
+		}
 #ifdef DEBUG_ENABLED
 		ERR_FAIL_COND_V_MSG(shader.is_null(), RID(),
 				"Attempted to use an unused shader variant (shader is null),");
@@ -85,6 +89,9 @@ public:
 			}
 		}
 		result = _generate_version(p_vertex_format_id, p_framebuffer_format_id, p_wireframe, p_render_pass, p_bool_specializations);
+		if (r_created) {
+			*r_created = result.is_valid();
+		}
 		spin_lock.unlock();
 		return result;
 	}

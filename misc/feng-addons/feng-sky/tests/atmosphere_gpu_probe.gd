@@ -14,7 +14,9 @@ var _sun: DirectionalLight3D
 var _fog: FengHeightFog
 var _far_wall_body: StaticBody3D
 var _exposure_pass
+var _compositor: Compositor
 var _samples: Dictionary = {}
+signal exposure_sample_ready(scale: float)
 
 
 func _initialize() -> void:
@@ -37,21 +39,33 @@ func settle(frames: int) -> void:
 func current_exposure_scale() -> float:
 	if _exposure_pass == null or not _exposure_pass.enabled:
 		return 1.0
+	RenderingServer.call_on_render_thread(_read_current_exposure_scale)
+	return await exposure_sample_ready
+
+
+func _read_current_exposure_scale() -> void:
+	# The plain Compositor binds this exact authored effect. Its GPU state must
+	# be read on the render thread, rather than from a dormant authored clone.
+	var scale := -1.0
 	var states: Dictionary = _exposure_pass.get("_state")
 	var rd := RenderingServer.get_rendering_device()
-	if rd == null:
-		return -1.0
-	for entry_value in states.values():
-		var views: Dictionary = entry_value.get("views", {})
-		if views.has(0):
+	if rd != null:
+		for entry_value in states.values():
+			var views: Dictionary = entry_value.get("views", {})
+			if not views.has(0):
+				continue
 			var params_rid: RID = views[0].get("params")
 			if not params_rid.is_valid():
 				continue
-			var bytes: PackedByteArray = rd.buffer_get_data(params_rid)
-			var values := bytes.to_float32_array()
+			var values := rd.buffer_get_data(params_rid).to_float32_array()
 			if values.size() > 129:
-				return values[129]
-	return -1.0
+				scale = values[129]
+				break
+	_deliver_exposure_scale.call_deferred(scale)
+
+
+func _deliver_exposure_scale(scale: float) -> void:
+	exposure_sample_ready.emit(scale)
 
 
 func luma(color: Color) -> float:
@@ -87,6 +101,9 @@ func measure_frame_metrics(label: String, frame_count: int) -> Dictionary:
 
 func sample(label: String, physical_units: bool, settle_frames := 64,
 		expect_atmosphere_snapshot := true) -> bool:
+	# Plain Compositor has no deferred authored-property rebinding. Apply every
+	# case so pre-exposure/metering edits reach both native and custom passes.
+	_renderer.apply(_compositor)
 	await settle(settle_frames)
 	var image := root.get_texture().get_image()
 	var width := image.get_width()
@@ -115,7 +132,7 @@ func sample(label: String, physical_units: bool, settle_frames := 64,
 		return false
 	var world_id := _scene.get_world_3d().get_instance_id()
 	var snapshot := FengSkyRuntime.snapshot_for_world(world_id)
-	var exposure_scale := current_exposure_scale()
+	var exposure_scale: float = await current_exposure_scale()
 	var material := _sky.sky.sky_material as ShaderMaterial
 	var solar_scale: float = material.get_shader_parameter("sun_irradiance")
 	var expected_solar_scale := _sun.light_energy * (_sun.light_intensity_lux if physical_units else PI)
@@ -256,7 +273,6 @@ func run() -> void:
 	_scene.add_child(_fog)
 
 	var renderer_script := load("res://addons/feng-render-pipeline/renderer.gd")
-	var compositor_script := load("res://addons/feng-render-pipeline/compositor.gd")
 	_renderer = renderer_script.new()
 	_exposure_pass = find_pass("library:eye_adaptation")
 	var fog_pass = find_pass("library:height_fog")
@@ -268,14 +284,13 @@ func run() -> void:
 	_exposure_pass.pre_exposure = true
 	_exposure_pass.speed_up = 100.0
 	_exposure_pass.speed_down = 100.0
-	var compositor: Compositor = compositor_script.new()
-	compositor.renderer = _renderer
-	_camera.compositor = compositor
+	_compositor = Compositor.new()
+	_camera.compositor = _compositor
 	if not _renderer.get_validation_warnings().is_empty():
 		push_error("FRP validation warnings: %s" % [_renderer.get_validation_warnings()])
 		quit(2)
 		return
-	_renderer.apply(compositor)
+	_renderer.apply(_compositor)
 	var physical_units := bool(ProjectSettings.get_setting(
 		"rendering/lights_and_shadows/use_physical_light_units", false))
 	if physical_units:

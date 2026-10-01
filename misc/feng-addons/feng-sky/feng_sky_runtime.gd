@@ -82,9 +82,7 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 	var beta_mie_scatter: float = sanitized["mie_scattering_per_km"]
 	var beta_mie_extinction: float = sanitized["mie_extinction_per_km"]
 	var mie_g: float = sanitized["mie_asymmetry"]
-	var sun_direction := sun_direction_world.normalized()
-	if sun_direction.length_squared() < 0.5:
-		sun_direction = Vector3.UP
+	var sun_direction := sanitize_sun_direction(sun_direction_world)
 	var planet_center_m: Vector3 = sanitized["planet_center_m"]
 	var surface_origin := -planet_center_m / 1000.0
 	var surface_radius := surface_origin.length()
@@ -152,8 +150,10 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 		beta_rayleigh,
 		beta_mie_extinction
 	)
-	var scaled_ambient := ambient_unit * maxf(sun_irradiance, 0.0) * sun_color_linear.max(Vector3.ZERO)
-	var ground_illuminance := sun_color_linear.max(Vector3.ZERO) * maxf(sun_irradiance, 0.0) * ground_transmittance
+	var irradiance := maxf(_finite_input_float(sun_irradiance, 0.0), 0.0)
+	var source_color := _finite_vector(sun_color_linear)
+	var scaled_ambient := ambient_unit * irradiance * source_color
+	var ground_illuminance := source_color * irradiance * ground_transmittance
 	return {
 		"ambient_unit_sun": ambient_unit,
 		"ambient_radiance": _finite_vector(scaled_ambient),
@@ -281,6 +281,17 @@ static func _sphere_exit_distance(origin: Vector3, direction: Vector3, radius: f
 	if discriminant < 0.0:
 		return -1.0
 	return maxf(-b + sqrt(discriminant), 0.0)
+
+
+static func sanitize_sun_direction(direction: Vector3) -> Vector3:
+	if not direction.is_finite():
+		return Vector3.UP
+	# Normalize after scaling to avoid overflow/underflow in length_squared
+	# for finite transforms authored through code.
+	var magnitude := direction.abs()[direction.abs().max_axis_index()]
+	if magnitude == 0.0:
+		return Vector3.UP
+	return (direction / magnitude).normalized()
 
 
 static func _finite_vector(value: Vector3) -> Vector3:

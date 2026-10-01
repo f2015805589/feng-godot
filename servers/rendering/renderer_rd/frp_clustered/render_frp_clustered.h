@@ -30,16 +30,17 @@
 
 #pragma once
 
-#include "core/templates/paged_allocator.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/paged_allocator.h"
+#include "core/templates/safe_refcount.h"
 #include "servers/rendering/frp_pipeline_spec.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
-#include "servers/rendering/renderer_rd/frp_clustered/scene_shader_frp_clustered.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
+#include "servers/rendering/renderer_rd/frp_clustered/scene_shader_frp_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/frp_clustered/frp_integrate_dfg.glsl.gen.h"
@@ -231,9 +232,13 @@ private:
 	struct FrpLighting {
 		FrpLightingShaderRD shader;
 		RID shader_version;
-		PipelineCacheRD pipelines[FRP_LIGHTING_MODE_MAX];
-		SceneShaderFRPClustered::ShaderSpecialization specialization = {};
-		bool specialization_initialized = false;
+		struct ViewVariant {
+			PipelineCacheRD pipelines[FRP_LIGHTING_MODE_MAX];
+			SceneShaderFRPClustered::ShaderSpecialization specialization = {};
+			bool specialization_initialized = false;
+		};
+		ViewVariant view_variants[SceneShaderFRPClustered::ShaderSpecialization::LIGHTING_VIEW_VARIANT_COUNT];
+		SafeNumeric<uint32_t> pipeline_compilations;
 	} frp_lighting;
 
 	enum PassMode {

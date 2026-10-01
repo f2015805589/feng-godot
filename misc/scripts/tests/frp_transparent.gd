@@ -126,6 +126,11 @@ func run() -> void:
 	for pass_entry in renderer.passes:
 		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation":
 			pass_entry.enabled = false
+		# This fixture compares immediate light-list changes and draw counts,
+		# not temporal accumulation. Viewport.use_taa does not control an
+		# explicitly configured FRP schedule; use its native TAA entry.
+		if pass_entry is FengBuiltinPass and pass_entry.native_id == 6:
+			pass_entry.enabled = false
 	var compositor := Compositor.new()
 	camera.compositor = compositor
 	renderer.apply(compositor)

@@ -185,6 +185,18 @@ vec3 integrate_atmosphere(vec3 origin, vec3 view_direction, out vec3 view_transm
 	return radiance * max(sun_irradiance, 0.0) * max(sun_color_linear, vec3(0.0));
 }
 
+float solar_disk_weight(vec3 view_direction, vec3 sun_dir, float angular_radius) {
+	// For small authored disks, both cos(radius * edge) values round to 1.0
+	// in float32 (including the valid 0.01/0.02 degree settings). smoothstep
+	// then has equal edges and its result is undefined. Squared chord length
+	// is 2 * (1 - cos(angle)), but stays precise at small angles. This is the
+	// same angular profile without subtracting nearly equal cosine values.
+	vec2 edge_chords = 2.0 * sin(angular_radius * vec2(0.425, 0.575));
+	vec2 edge_squared = edge_chords * edge_chords;
+	vec3 chord = view_direction - sun_dir;
+	return 1.0 - smoothstep(edge_squared.x, edge_squared.y, dot(chord, chord));
+}
+
 void sky() {
 	vec3 view_direction = normalize(EYEDIR);
 	vec3 origin = (POSITION - planet_center_m) / 1000.0;
@@ -211,8 +223,7 @@ void sky() {
 	}
 
 	float sun_radius = max(radians(sun_angular_radius_deg), 0.00001);
-	float sun_cosine = dot(view_direction, normalize(sun_direction));
-	float sun_edge = smoothstep(cos(sun_radius * 1.15), cos(sun_radius * 0.85), sun_cosine);
+	float sun_edge = solar_disk_weight(view_direction, normalize(sun_direction), sun_radius);
 	if (ground_distance < 0.0 && sun_edge > 0.0) {
 		float sun_solid_angle = PI * sin(sun_radius) * sin(sun_radius);
 		vec3 sun_radiance = min(

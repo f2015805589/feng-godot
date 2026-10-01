@@ -149,6 +149,9 @@ def main() -> None:
     env = dict(os.environ)
     env["APPDATA"] = str(project / "config")
     env["LOCALAPPDATA"] = str(project / "cache")
+    env["XDG_CONFIG_HOME"] = str(project / "config")
+    env["XDG_CACHE_HOME"] = str(project / "cache")
+    env["XDG_DATA_HOME"] = str(project / "data")
     print(f"Persistent scratch project: {project}")
     validate_scratch_tree(project)
     run(
@@ -175,11 +178,25 @@ def main() -> None:
     validate_scratch_tree(project)
     run(
         [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_sky_numerics.gd"],
+        "headless Sky numerical tests", project, env, "SKY NUMERICS PASS",
+    )
+    validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
          "res://addons/feng-sky/tests/test_sky_optimization.gd"],
         "headless Sky optimization tests", project, env, "SKY OPTIMIZATION PASS",
     )
     validate_scratch_tree(project)
     if args.gpu_driver:
+        run(
+            [str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "64x64",
+             "--position", "-10000,-10000", "--script",
+             "res://addons/feng-sky/tests/test_sky_numerics.gd", "--", "--gpu"],
+            "GPU Sky numerical tests", project, env, "SKY NUMERICS PASS",
+        )
+        validate_scratch_tree(project)
         startup = None
         if os.name == "nt":
             startup = subprocess.STARTUPINFO()
@@ -194,6 +211,8 @@ def main() -> None:
             "frp",
             "--rendering-driver",
             args.gpu_driver,
+            "--audio-driver",
+            "Dummy",
             "--resolution",
             "320x240",
             "--position",
@@ -220,6 +239,14 @@ def main() -> None:
             raise SystemExit(f"GPU probe reported an engine or script error; see {gpu_log}")
         if "SKY GPU PASS" not in output_text:
             raise SystemExit(f"GPU probe missed its success marker; see {gpu_log}")
+        validate_scratch_tree(project)
+        run(
+            [str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "160x160",
+             "--position", "-10000,-10000", "--script",
+             "res://addons/feng-sky/tests/test_sky_motion_gpu.gd"],
+            "GPU Sky motion tests", project, env, "SKY MOTION GPU PASS",
+        )
         validate_scratch_tree(project)
 
 

@@ -93,6 +93,8 @@ run("volume", ["--script", str(ROOT / "misc/scripts/tests/frp_volume.gd")],
     "PASS FRP author-defined Volume modules, typed fields, priority, persistence, custom frame parameters and compositor isolation")
 run("volume_metrics", ["--script", str(ROOT / "misc/scripts/tests/frp_volume_metrics.gd")],
     "PASS volume CPU monitors: frame totals, units, idle reset and registration lifetime")
+run("lighting_cache", ["--script", str(ROOT / "misc/scripts/tests/frp_lighting_cache.gd")],
+    "PASS FRP bounded lighting pipeline cache survives alternating camera fog, soft-shadow and area-light variants")
 run("architecture", ["--script", str(ROOT / "misc/scripts/tests/frp_architecture.gd")],
     "PASS FRP contract resource notifications, view invalidation and detached dependency lifetime")
 run("library_placement", ["--script", str(ROOT / "misc/scripts/tests/frp_library_placement.gd")],
@@ -151,6 +153,8 @@ run("eye_adaptation", ["--script", str(ROOT / "misc/scripts/tests/frp_eye_adapta
 run("exposure_history", ["--script", str(ROOT / "misc/scripts/tests/frp_exposure_history.gd")],
     "PASS FRP GPU exposure history rebasing and bounded adaptation")
 # Retired frame contexts must never update a reconfigured viewport's exposure.
+run("hdr_sun", ["--script", str(ROOT / "misc/scripts/tests/frp_hdr_sun.gd")],
+    "PASS FRP GPU moving HDR sun and post-process stability")
 run("exposure_lifecycle", ["--script", str(ROOT / "misc/scripts/tests/frp_exposure_lifecycle.gd")],
     "PASS FRP exposure readback retirement, pre-exposure toggle, TAA restart, resize and compositor switch")
 # The Core surface a plugin pass runs on: a scripted pass takes over an engine pass

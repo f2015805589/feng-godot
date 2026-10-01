@@ -2476,7 +2476,13 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						lighting_specialization.use_light_projector = true;
 						lighting_specialization.use_light_soft_shadows = true;
 						lighting_specialization.use_directional_soft_shadows = p_render_data->directional_light_soft_shadows;
-						if (!frp_lighting.specialization_initialized || frp_lighting.specialization.packed_0 != lighting_specialization.packed_0 || frp_lighting.specialization.packed_1 != lighting_specialization.packed_1) {
+						FrpLighting::ViewVariant &lighting_variant = frp_lighting.view_variants[lighting_specialization.get_lighting_view_variant()];
+						// The view-dependent flags have separate slots. A global quality
+						// change still invalidates a slot on its next use, but switching
+						// cameras must not free and synchronously rebuild its pipelines.
+						// Compare the complete two words consumed by the shader, not a
+						// struct hash (which could include padding or unused packed_2).
+						if (!lighting_variant.specialization_initialized || !lighting_variant.specialization.has_same_lighting_constants(lighting_specialization)) {
 							Vector<RD::PipelineSpecializationConstant> constants;
 							RD::PipelineSpecializationConstant constant;
 							constant.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_INT;
@@ -2487,10 +2493,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 							constant.int_value = lighting_specialization.packed_1;
 							constants.push_back(constant);
 							for (int i = 0; i < FRP_LIGHTING_MODE_MAX; i++) {
-								frp_lighting.pipelines[i].update_specialization_constants(constants);
+								lighting_variant.pipelines[i].update_specialization_constants(constants);
 							}
-							frp_lighting.specialization = lighting_specialization;
-							frp_lighting.specialization_initialized = true;
+							lighting_variant.specialization = lighting_specialization;
+							lighting_variant.specialization_initialized = true;
 						}
 						RID shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
 						// Descriptor layouts include shader-stage visibility, not just binding types.
@@ -2498,7 +2504,14 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
-						RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, frp_lighting.pipelines[lighting_mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(opaque_framebuffer)));
+						bool pipeline_created = false;
+						RID lighting_pipeline = lighting_variant.pipelines[lighting_mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(opaque_framebuffer), false, 0, 0, &pipeline_created);
+						if (pipeline_created) {
+							// Full-screen lighting bypasses the scene's PipelineHashMapRD,
+							// but its synchronous misses belong in the same draw counter.
+							frp_lighting.pipeline_compilations.increment();
+						}
+						RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, lighting_pipeline);
 
 						RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);
 						RD::get_singleton()->draw_list_end();
@@ -2839,6 +2852,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	// A pass is what the pipeline resource orders, enables and disables. It runs the
 	// operations its spec entry declares, in that order.
 	auto run_builtin_pass = [&](int p_pass, const String &p_name) {
+		RENDER_TIMESTAMP("> FRP " + p_name);
 		RD::get_singleton()->draw_command_begin_label(p_name.utf8().span());
 		RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
 		const FRPPipelineSpec::NativePass &definition = FRPPipelineSpec::native_pass(p_pass);
@@ -2846,6 +2860,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			run_builtin_operation(definition.operations[i]);
 		}
 		RD::get_singleton()->draw_command_end_label();
+		RENDER_TIMESTAMP("< FRP " + p_name);
 	};
 	// The Core surface a scripted pass runs on. It forwards every primitive to the
 	// same operations the built-in passes call, so a plugin pass and the engine's own
@@ -2884,6 +2899,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			if (!pipeline_storage->is_compositor_effect(effect) || !pipeline_storage->compositor_effect_get_enabled(effect)) {
 				continue;
 			}
+			RENDER_TIMESTAMP("> FRP " + pass_name);
 			RD::get_singleton()->draw_command_begin_label(pass_name.utf8().span());
 			RD::get_singleton()->driver_callback_add(_frp_pass_debug_marker, nullptr, VectorView<RD::CallbackResource>());
 			// Custom passes can move across built-in operations. Resolve requested
@@ -2918,6 +2934,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				copy_effects->copy_to_fb_rect(rb->get_internal_texture(), color_only_framebuffer, Rect2i(), false, false, false, false, RID(), rb->get_view_count() > 1);
 			}
 			RD::get_singleton()->draw_command_end_label();
+			RENDER_TIMESTAMP("< FRP " + pass_name);
 		}
 		RD::get_singleton()->draw_command_insert_ordering_barrier();
 	} else {
@@ -4917,7 +4934,7 @@ void RenderFRPClustered::mesh_generate_pipelines(RID p_mesh, bool p_background_c
 }
 
 uint32_t RenderFRPClustered::get_pipeline_compilations(RSE::PipelineSource p_source) {
-	return scene_shader.get_pipeline_compilations(p_source);
+	return scene_shader.get_pipeline_compilations(p_source) + (p_source == RSE::PIPELINE_SOURCE_DRAW ? frp_lighting.pipeline_compilations.get() : 0);
 }
 
 void RenderFRPClustered::enable_features(BitField<FeatureBits> p_feature_bits) {
@@ -5126,8 +5143,10 @@ RenderFRPClustered::RenderFRPClustered() {
 		for (int i = 0; i < FRP_LIGHTING_MODE_MAX; i++) {
 			RID shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, i);
 			ERR_FAIL_COND(shader.is_null());
-			// The lighting pass can render to color + separate specular + motion vectors (3 attachments).
-			frp_lighting.pipelines[i].setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(3));
+			for (FrpLighting::ViewVariant &variant : frp_lighting.view_variants) {
+				// Actual pipelines are created lazily for used view/framebuffer combinations.
+				variant.pipelines[i].setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(3));
+			}
 		}
 	}
 
@@ -5192,6 +5211,11 @@ RenderFRPClustered::~RenderFRPClustered() {
 	RD::get_singleton()->free_rid(dfg_lut.texture);
 	dfg_lut.shader.version_free(dfg_lut.shader_version);
 
+	for (FrpLighting::ViewVariant &variant : frp_lighting.view_variants) {
+		for (PipelineCacheRD &pipeline : variant.pipelines) {
+			pipeline.clear();
+		}
+	}
 	frp_lighting.shader.version_free(frp_lighting.shader_version);
 
 	if (ltc.lut1_texture.is_valid()) {

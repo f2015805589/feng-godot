@@ -137,6 +137,17 @@ public:
 		};
 
 		uint32_t packed_2;
+
+		// Only these three specialization flags vary between views. Keep their
+		// lighting pipelines in independent, bounded slots so alternating cameras
+		// (or an area light entering/leaving the cluster) can reuse warmed pipelines.
+		static constexpr uint32_t LIGHTING_VIEW_VARIANT_COUNT = 8;
+		uint32_t get_lighting_view_variant() const {
+			return uint32_t(use_depth_fog) | (uint32_t(use_directional_soft_shadows) << 1) | (uint32_t(cluster_has_area_light) << 2);
+		}
+		bool has_same_lighting_constants(const ShaderSpecialization &p_other) const {
+			return packed_0 == p_other.packed_0 && packed_1 == p_other.packed_1;
+		}
 	};
 
 	struct UbershaderConstants {

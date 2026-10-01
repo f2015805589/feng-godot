@@ -399,9 +399,7 @@ func _refresh_world_binding() -> void:
 	var sun_irradiance := 0.0
 	var sun_light_id := 0
 	if selected_sun != null:
-		sun_direction = selected_sun.global_transform.basis.z.normalized()
-		if sun_direction.length_squared() < 0.001:
-			sun_direction = Vector3.UP
+		sun_direction = FengSkyRuntime.sanitize_sun_direction(selected_sun.global_transform.basis.z)
 		sun_color = _sun_linear_color(selected_sun)
 		sun_irradiance = _sun_irradiance(selected_sun)
 		sun_light_id = selected_sun.get_instance_id()
@@ -489,14 +487,16 @@ func _sun_linear_color(light: DirectionalLight3D) -> Vector3:
 	var color := light.light_color.srgb_to_linear()
 	if _uses_physical_light_units():
 		color *= light.get_correlated_color().srgb_to_linear()
-	return Vector3(color.r, color.g, color.b).max(Vector3.ZERO)
+	return _finite_nonnegative(Vector3(color.r, color.g, color.b))
 
 
 func _sun_irradiance(light: DirectionalLight3D) -> float:
-	if light.light_negative:
+	if light.light_negative or not is_finite(light.light_energy):
 		return 0.0
 	var renderer_irradiance := NON_PHYSICAL_SUN_IRRADIANCE
 	if _uses_physical_light_units():
+		if not is_finite(light.light_intensity_lux):
+			return 0.0
 		renderer_irradiance = maxf(light.light_intensity_lux, 0.0)
 	# Keep the addon in the same normalized scale as FRP surface direct lighting
 	# when physical units are off; the 10 MLux-equivalent ceiling bounds HDR work.
@@ -637,7 +637,7 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 	var sky_radiance_limit := 0.0
 	if sky_gain > 0.0:
 		sky_radiance_limit = MAX_SKY_RADIANCE / maxf(sky_gain, 0.000001)
-	material.set_shader_parameter("sun_direction", sun_direction.normalized() if sun_direction.length_squared() > 0.001 else Vector3.UP)
+	material.set_shader_parameter("sun_direction", FengSkyRuntime.sanitize_sun_direction(sun_direction))
 	material.set_shader_parameter("sun_color_linear", sun_color.max(Vector3.ZERO))
 	material.set_shader_parameter("sun_irradiance", minf(maxf(sun_irradiance, 0.0), MAX_SOLAR_IRRADIANCE))
 	material.set_shader_parameter("sky_radiance_limit", sky_radiance_limit)
