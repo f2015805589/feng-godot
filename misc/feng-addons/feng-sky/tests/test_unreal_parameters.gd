@@ -22,6 +22,48 @@ func run() -> void:
 	near(settings["mie_scattering_coefficients"], Vector3.ONE * 0.003996, "Mie default scattering")
 	near(settings["mie_extinction_coefficients"], Vector3.ONE * 0.004440, "Mie extinction must include absorption")
 	near(settings["absorption_extinction_per_km"], Parameters.DEFAULT_ABSORPTION_PER_KM, "ozone default is independent of Mie absorption")
+	var legacy_effective := settings.duplicate(true)
+	sky.rayleigh_scattering_color = sky.rayleigh_scattering_color
+	sky.rayleigh_scattering_coefficient_scale = sky.rayleigh_scattering_coefficient_scale
+	sky.mie_scattering_color = sky.mie_scattering_color
+	sky.mie_scattering_coefficient_scale = sky.mie_scattering_coefficient_scale
+	sky.mie_absorption_color = sky.mie_absorption_color
+	sky.mie_absorption_coefficient_scale = sky.mie_absorption_coefficient_scale
+	sky.other_absorption_color = sky.other_absorption_color
+	sky.other_absorption_coefficient_scale = sky.other_absorption_coefficient_scale
+	settings = sky._atmosphere_settings()
+	require(settings["rayleigh_scattering_per_km"].is_equal_approx(legacy_effective["rayleigh_scattering_per_km"]), "Rayleigh normalized inspector view preserves old effective coefficient")
+	require(settings["mie_scattering_coefficients"].is_equal_approx(legacy_effective["mie_scattering_coefficients"]), "Mie scattering normalized inspector view preserves old effective coefficient")
+	require(settings["mie_extinction_coefficients"].is_equal_approx(legacy_effective["mie_extinction_coefficients"]), "Mie absorption normalized inspector view preserves old effective coefficient")
+	require(settings["absorption_extinction_per_km"].is_equal_approx(legacy_effective["absorption_extinction_per_km"]), "Other Absorption normalized inspector view preserves old effective coefficient")
+	require(is_equal_approx(sky.rayleigh_scattering_coefficient_scale, 0.0331), "Rayleigh UE coefficient basis")
+	require(sky.mie_scattering_color.is_equal_approx(Color.WHITE) and is_equal_approx(sky.mie_scattering_coefficient_scale, 0.003996), "Mie scattering UE color/scale basis")
+	require(sky.mie_absorption_color.is_equal_approx(Color.WHITE) and is_equal_approx(sky.mie_absorption_coefficient_scale, 0.000444), "Mie absorption UE color/scale basis")
+	require(is_equal_approx(sky.other_absorption_coefficient_scale, 0.001881), "Other Absorption UE coefficient basis")
+	sky.sun_source_angle_deg = 5.0
+	require(is_equal_approx(sky._atmosphere_settings()["sun_angular_radius_deg"], 2.5), "5 degree canonical source diameter maps to 2.5 degree shader radius")
+	sky.sun_source_angle_deg = 0.5357
+	var disabled_profile := sky._sanitize_current_settings()
+	sky.absorption_width = 0.0
+	disabled_profile = sky._sanitize_current_settings()
+	require(disabled_profile["absorption_extinction_per_km"].is_zero_approx(), "zero ozone tent width disables extinction")
+	for term in ["absorption_layer0_linear_term", "absorption_layer0_constant_term", "absorption_layer1_linear_term", "absorption_layer1_constant_term"]:
+		require(is_zero_approx(float(disabled_profile[term])), "zero ozone tent width clears %s" % term)
+	sky.absorption_width = 15.0
+	sky.absorption_tip_value = 0.0
+	require(sky._sanitize_current_settings()["absorption_extinction_per_km"].is_zero_approx(), "zero ozone tent tip value disables extinction")
+	sky.absorption_tip_value = 1.0
+	var limits := Parameters.sanitize_atmosphere_settings({
+		"mie_asymmetry": -0.8,
+		"trace_sample_count_scale": 9.0,
+		"aerial_perspective_start_depth_km": 0.0,
+		"sun_angular_radius_deg": 0.0,
+	})
+	require(is_equal_approx(limits["mie_asymmetry"], 0.0), "Mie HG g lower hard bound")
+	require(is_equal_approx(Parameters.sanitize_atmosphere_settings({"mie_asymmetry": 1.0})["mie_asymmetry"], 0.999), "Mie HG g upper hard bound")
+	require(is_equal_approx(limits["trace_sample_count_scale"], 8.0), "TraceSampleCountScale upper budget is 8")
+	require(is_equal_approx(limits["aerial_perspective_start_depth_km"], 0.001), "Aerial Perspective Start Depth minimum is 0.001km")
+	require(is_equal_approx(limits["sun_angular_radius_deg"], 0.0), "zero shader source radius remains valid")
 	sky.mie_scattering = Vector3(0.001, 0.002, 0.003)
 	sky.mie_scattering_scale = 2.0
 	sky.mie_absorption = Vector3(0.004, 0.005, 0.006)
@@ -62,15 +104,17 @@ func run() -> void:
 	near(settings["sky_only_luminance_factor"], Vector3(2.0, 3.0, 4.0), "sky-only gain is distinct")
 	near(settings["sky_luminance_factor"], Vector3(0.5, 0.6, 0.7), "combined sky/aerial gain")
 	var saved_names: Array[String] = []
-	var color_fields := ["ground_albedo", "rayleigh_scattering", "mie_scattering", "mie_absorption", "absorption"]
+	var color_fields := ["ground_albedo", "rayleigh_scattering", "mie_scattering", "mie_absorption", "absorption", "rayleigh_scattering_color", "mie_scattering_color", "mie_absorption_color", "other_absorption_color"]
 	for property in sky.get_property_list():
 		if property["name"] in color_fields:
 			require(property["type"] == TYPE_COLOR, "UE RGB field is an inspector color: " + property["name"])
 		if int(property["usage"]) & PROPERTY_USAGE_STORAGE:
 			saved_names.append(property["name"])
-	for canonical in ["ground_radius", "rayleigh_scattering", "mie_absorption", "multi_scattering_factor", "absorption", "transform_mode"]:
+	for canonical in ["ground_radius", "rayleigh_scattering", "mie_absorption", "multi_scattering_factor", "absorption", "transform_mode", "sun_source_angle_deg"]:
 		require(saved_names.has(canonical), "canonical property is persisted: " + canonical)
-	for legacy in ["planet_radius_km", "rayleigh_scattering_per_km", "mie_extinction_per_km", "mie_asymmetry", "planet_center_m"]:
+	for adapter in ["rayleigh_scattering_color", "rayleigh_scattering_coefficient_scale", "mie_scattering_color", "mie_scattering_coefficient_scale", "mie_absorption_color", "mie_absorption_coefficient_scale", "other_absorption_color", "other_absorption_coefficient_scale"]:
+		require(not saved_names.has(adapter), "editor coefficient view must not be serialized beside raw storage: " + adapter)
+	for legacy in ["planet_radius_km", "rayleigh_scattering_per_km", "mie_extinction_per_km", "mie_asymmetry", "planet_center_m", "sun_angular_radius_deg", "secondary_sun_angular_radius_deg"]:
 		require(not saved_names.has(legacy), "legacy alias must not overwrite canonical data on save: " + legacy)
 	var transform_parent := Node3D.new()
 	var transform_proxy := Node3D.new()
@@ -119,6 +163,8 @@ sun_angular_radius_deg = 0.3
 		return
 	var loaded := scene.instantiate() as SkyComponent
 	require(loaded.bottom_radius == 6500.0 and loaded.atmosphere_height == 80.0, "old radius/height migrate")
+	require(is_equal_approx(loaded.sun_angular_radius_deg, 0.3), "legacy source radius keeps getter semantics")
+	require(is_equal_approx(loaded.sun_source_angle_deg, 0.6), "legacy radius file populates canonical source diameter")
 	require(is_equal_approx(loaded.mie_anisotropy, 0.61), "old anisotropy migrates")
 	near(Parameters.finite_vector(loaded.mie_absorption, Vector3.ZERO), Vector3.ONE * 0.002, "old extinction becomes absorption")
 	near(loaded.planet_center_m, Vector3(100.0, -6500000.0, 200.0), "old planet center survives")
@@ -127,6 +173,9 @@ sun_angular_radius_deg = 0.3
 	require(repacked.pack(loaded) == OK, "migrated scene repacks")
 	var migrated_path := "user://canonical_atmosphere_migration.tscn"
 	require(ResourceSaver.save(repacked, migrated_path) == OK, "migrated scene saves")
+	var migrated_text := FileAccess.get_file_as_string(migrated_path)
+	require(migrated_text.contains("sun_source_angle_deg = 0.6"), "legacy radius saves as canonical diameter")
+	require(not migrated_text.contains("\nsun_angular_radius_deg = "), "legacy radius alias is not saved twice")
 	var migrated := load(migrated_path) as PackedScene
 	var roundtrip := migrated.instantiate() as SkyComponent
 	require(roundtrip._atmosphere_settings() == settings, "canonical save/reload preserves normalized settings")
