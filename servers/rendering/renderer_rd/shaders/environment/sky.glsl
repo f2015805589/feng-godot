@@ -313,4 +313,8 @@ void main() {
 #ifdef USE_DEBANDING
 	frag_color.rgb += interleaved_gradient_noise(gl_FragCoord.xy) * params.luminance_multiplier;
 #endif
+	// Protect the actual HDR attachment boundary after brightness, exposure,
+	// fog and debanding. Finite sky radiance can still overflow RGBA16F here.
+	frag_color.rgb = mix(frag_color.rgb, vec3(0.0), isnan(frag_color.rgb));
+	frag_color.rgb = clamp(frag_color.rgb, vec3(-65504.0), vec3(65504.0));
 }

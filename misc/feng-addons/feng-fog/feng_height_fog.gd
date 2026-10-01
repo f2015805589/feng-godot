@@ -123,6 +123,14 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 		directional_inscattering_color = value
 		_publish()
 
+@export_group("天空大气环境光")
+## Linear RGB scale applied only to Feng Sky atmosphere ambient added to this
+## fog. It does not tint the authored base source or directional lobe.
+@export var sky_atmosphere_ambient_contribution_color_scale := Color.WHITE:
+	set(value):
+		sky_atmosphere_ambient_contribution_color_scale = value
+		_publish()
+
 func _enter_tree() -> void:
 	set_notify_transform(true)
 	Runtime.register(self)
@@ -140,6 +148,13 @@ func _notification(what: int) -> void:
 ## The camera-independent half of the pass's uniform block, in shader units.
 func snapshot_fields() -> Dictionary:
 	var height := global_position.y
+	var ambient_scale := Vector3.ONE
+	var authored_ambient_scale := sky_atmosphere_ambient_contribution_color_scale
+	if is_finite(authored_ambient_scale.r) and is_finite(authored_ambient_scale.g) \
+			and is_finite(authored_ambient_scale.b):
+		ambient_scale = Vector3(sky_atmosphere_ambient_contribution_color_scale.r,
+				sky_atmosphere_ambient_contribution_color_scale.g,
+				sky_atmosphere_ambient_contribution_color_scale.b).max(Vector3.ZERO)
 	var fields := {
 		"fog_density": fog_density * UNIT_SCALE,
 		"fog_height_falloff": fog_height_falloff * UNIT_SCALE,
@@ -148,6 +163,7 @@ func snapshot_fields() -> Dictionary:
 		"second_fog_height_falloff": second_fog_height_falloff * UNIT_SCALE,
 		"second_fog_height": height + second_fog_height_offset,
 		"fog_color": Vector3(fog_inscattering_color.r, fog_inscattering_color.g, fog_inscattering_color.b),
+		"sky_atmosphere_ambient_contribution_color_scale": ambient_scale,
 		"min_opacity": 1.0 - fog_max_opacity,
 		"start_distance": start_distance,
 		"cutoff_distance": fog_cutoff_distance,

@@ -176,5 +176,8 @@ void main() {
 		frp_atmo_aerial(camera_to_receiver, vec3(0.0), atmospheric_radiance, atmospheric_transmission);
 		scene_color.rgb = scene_color.rgb * atmospheric_transmission + atmospheric_radiance * pc.parameters.y;
 	}
-	imageStore(color_image, pixel, vec4(fog.rgb * pc.parameters.y + scene_color.rgb * fog.a, scene_color.a));
+	vec3 fogged_rgb = fog.rgb * pc.parameters.y + scene_color.rgb * fog.a;
+	fogged_rgb = mix(fogged_rgb, vec3(0.0), isnan(fogged_rgb));
+	fogged_rgb = clamp(fogged_rgb, vec3(-65504.0), vec3(65504.0));
+	imageStore(color_image, pixel, vec4(fogged_rgb, scene_color.a));
 }

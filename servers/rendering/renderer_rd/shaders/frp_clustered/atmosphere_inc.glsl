@@ -2,6 +2,36 @@
 // ATMO_PARAMS is sixteen vec4s; texture macros resolve to sampler2D values.
 const float FRP_ATMO_PI = 3.141592653589793;
 
+float frp_atmo_mie_phase(float g, float mu) {
+	if (!(g >= 0.0)) {
+		g = 0.0;
+	} else {
+		g = min(g, 0.999);
+	}
+	if (!(mu >= -1.0)) {
+		mu = -1.0;
+	} else if (mu > 1.0) {
+		mu = 1.0;
+	}
+	float one_minus_g = 1.0 - g;
+	float denominator = max(one_minus_g * one_minus_g + 2.0 * g * (1.0 - mu), 0.000001);
+	return (1.0 - g * g) / (4.0 * FRP_ATMO_PI * pow(denominator, 1.5));
+}
+
+float frp_atmo_safe_radiance(float value) {
+	if (!(value > 0.0)) {
+		return 0.0;
+	}
+	return min(value, 60000.0);
+}
+
+float frp_atmo_safe_transmission(float value) {
+	if (!(value > 0.0)) {
+		return 0.0;
+	}
+	return min(value, 1.0);
+}
+
 float frp_atmo_absorption_density(float h) {
 	return h < ATMO_PARAMS[5].x
 			? clamp(ATMO_PARAMS[5].y * h + ATMO_PARAMS[5].z, 0.0, 1.0)
@@ -28,11 +58,15 @@ vec3 frp_atmo_transmittance(vec3 p, vec3 direction) {
 	float top = bottom + ATMO_PARAMS[4].w;
 	float b = dot(p, direction);
 	float discriminant = b * b - (radius - top) * (radius + top);
-	if (discriminant < 0.0 || -b + sqrt(discriminant) <= 0.0) {
+	if (!(discriminant >= 0.0)) {
 		return vec3(1.0);
 	}
-	float entry = radius > top ? max(-b - sqrt(discriminant), 0.0) : 0.0;
-	float path = max(-b + sqrt(discriminant) - entry, 0.0);
+	float root = sqrt(max(discriminant, 0.0));
+	if (-b + root <= 0.0) {
+		return vec3(1.0);
+	}
+	float entry = radius > top ? max(-b - root, 0.0) : 0.0;
+	float path = max(-b + root - entry, 0.0);
 	p += direction * entry;
 	radius = length(p);
 	vec3 columns = vec3(0.0);
@@ -58,7 +92,8 @@ vec3 frp_atmo_transmittance(vec3 p, vec3 direction) {
 			columns += frp_atmo_density(h) * ((z - a) * path);
 		}
 	}
-	return exp(-(ATMO_PARAMS[1].xyz * columns.x + ATMO_PARAMS[3].xyz * columns.y + ATMO_PARAMS[4].xyz * columns.z));
+	vec3 transmission = exp(-(ATMO_PARAMS[1].xyz * columns.x + ATMO_PARAMS[3].xyz * columns.y + ATMO_PARAMS[4].xyz * columns.z));
+	return vec3(frp_atmo_safe_transmission(transmission.x), frp_atmo_safe_transmission(transmission.y), frp_atmo_safe_transmission(transmission.z));
 }
 
 vec3 frp_atmo_surface_transmittance(vec3 camera_to_receiver_m, int slot) {
@@ -107,11 +142,12 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 	float top = bottom + ATMO_PARAMS[4].w;
 	float b = dot(origin, direction);
 	float discriminant = b * b - (radius - top) * (radius + top);
-	if (discriminant < 0.0) {
+	if (!(discriminant >= 0.0)) {
 		return;
 	}
-	float begin = max(ATMO_PARAMS[6].z, -b - sqrt(discriminant));
-	float end = min(receiver_distance, -b + sqrt(discriminant));
+	float top_sphere_root = sqrt(max(discriminant, 0.0));
+	float begin = max(ATMO_PARAMS[6].z, -b - top_sphere_root);
+	float end = min(receiver_distance, -b + top_sphere_root);
 	float ground_discriminant = b * b - (radius - bottom) * (radius + bottom);
 	if (ground_discriminant >= 0.0 && b < 0.0) {
 		end = min(end, -b - sqrt(ground_discriminant));
@@ -146,8 +182,7 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 			}
 			float mu = clamp(dot(direction, light.xyz), -1.0, 1.0);
 			float rayleigh_phase = 3.0 * (1.0 + mu * mu) / (16.0 * FRP_ATMO_PI);
-			float denom = max(1.0 + g * g - 2.0 * g * mu, 0.0001);
-			float mie_phase = 3.0 * (1.0 - g * g) * (1.0 + mu * mu) / (8.0 * FRP_ATMO_PI * (2.0 + g * g) * pow(denom, 1.5));
+			float mie_phase = frp_atmo_mie_phase(g, mu);
 			vec3 unit_source = (rayleigh * rayleigh_phase + mie * mie_phase) * frp_atmo_transmittance(p, light.xyz);
 			// UE 5.8 overview documents multiple scattering for the primary light only.
 			if (slot == 0 && ATMO_PARAMS[12].y > 0.5 && ATMO_PARAMS[6].y > 0.0) {
@@ -165,7 +200,9 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 		radiance += transmission * source * factor;
 		transmission *= segment_transmission;
 	}
-	radiance = clamp(radiance * ATMO_PARAMS[7].xyz, vec3(0.0), vec3(60000.0));
+	radiance *= ATMO_PARAMS[7].xyz;
+	radiance = vec3(frp_atmo_safe_radiance(radiance.x), frp_atmo_safe_radiance(radiance.y), frp_atmo_safe_radiance(radiance.z));
+	transmission = vec3(frp_atmo_safe_transmission(transmission.x), frp_atmo_safe_transmission(transmission.y), frp_atmo_safe_transmission(transmission.z));
 }
 
 #endif // ATMO_DIRECT_ONLY

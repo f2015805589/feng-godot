@@ -31,10 +31,12 @@ uniform vec3 sun_direction = vec3(0.0, 1.0, 0.0);
 uniform vec3 sun_color_linear = vec3(1.0);
 uniform float sun_irradiance = 0.0;
 uniform float sun_angular_radius_deg = 0.26785;
+uniform vec3 sun_disk_color_scale = vec3(1.0);
 uniform vec3 secondary_sun_direction = vec3(0.0, -1.0, 0.0);
 uniform vec3 secondary_sun_color_linear = vec3(1.0);
 uniform float secondary_sun_irradiance = 0.0;
 uniform float secondary_sun_angular_radius_deg = 0.26785;
+uniform vec3 secondary_sun_disk_color_scale = vec3(1.0);
 // FRP applies Environment.background_energy_multiplier after sampling the sky.
 // The component lowers this ceiling so the final value stays below RGBA16F max.
 uniform float sky_radiance_limit = 60000.0;
@@ -51,15 +53,77 @@ uniform sampler2D multi_scattering_lut : filter_linear, repeat_disable;
 uniform bool use_multi_scattering_lut = false;
 const float INV_PI = 0.3183098861837907;
 
+vec3 safe_normalize_direction(vec3 value, vec3 fallback) {
+	if (!(abs(value.x) < 1.0e30) || !(abs(value.y) < 1.0e30) || !(abs(value.z) < 1.0e30)) {
+		return fallback;
+	}
+	float scale = max(abs(value.x), max(abs(value.y), abs(value.z)));
+	if (!(scale > 0.000000000001)) {
+		return fallback;
+	}
+	vec3 scaled = value / scale;
+	float length_squared = dot(scaled, scaled);
+	if (!(length_squared > 0.0)) {
+		return fallback;
+	}
+	return scaled * inversesqrt(length_squared);
+}
+
+float effective_sky_radiance_limit() {
+	if (!(sky_radiance_limit > 0.0)) {
+		return 0.0;
+	}
+	return min(sky_radiance_limit, 65504.0);
+}
+
+float safe_radiance_component(float value, float limit) {
+	if (!(value > 0.0)) {
+		return 0.0;
+	}
+	if (value > limit) {
+		return limit;
+	}
+	return value;
+}
+
+float safe_disk_radiance_component(float irradiance, float light_color, float disk_tint, float solid_angle, float limit) {
+	if (!(irradiance > 0.0) || !(light_color > 0.0) || !(disk_tint > 0.0) || !(solid_angle > 0.0) || !(limit > 0.0)) {
+		return 0.0;
+	}
+	float maximum_irradiance = limit * solid_angle / light_color / disk_tint;
+	if (irradiance >= maximum_irradiance) {
+		return limit;
+	}
+	float smaller_scale = min(light_color, disk_tint);
+	float larger_scale = max(light_color, disk_tint);
+	float value = (irradiance * smaller_scale) * larger_scale / solid_angle;
+	return safe_radiance_component(value, limit);
+}
+
+float solar_disk_solid_angle(float angular_radius) {
+	if (!(angular_radius > 0.0) || !(angular_radius < PI)) {
+		return 0.0;
+	}
+	float sine_half_angle = sin(angular_radius * 0.5);
+	return 4.0 * PI * sine_half_angle * sine_half_angle;
+}
+
+float safe_sun_radius(float radius_degrees) {
+	if (!(radius_degrees > 0.0)) {
+		return 0.0;
+	}
+	return radians(min(radius_degrees, 2.5));
+}
+
 float ray_sphere_exit(vec3 origin, vec3 direction, float radius) {
 	float b = dot(origin, direction);
 	float origin_radius = length(origin);
 	float c = (origin_radius - radius) * (origin_radius + radius);
 	float discriminant = b * b - c;
-	if (discriminant < 0.0) {
+	if (!(discriminant >= 0.0)) {
 		return -1.0;
 	}
-	return max(-b + sqrt(discriminant), 0.0);
+	return max(-b + sqrt(max(discriminant, 0.0)), 0.0);
 }
 
 bool ray_hits_ground(vec3 point, vec3 direction) {
@@ -159,12 +223,12 @@ vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light
 		float b = dot(origin, view_direction);
 		float origin_radius = length(origin);
 		float discriminant = b * b - (origin_radius - atmosphere_radius) * (origin_radius + atmosphere_radius);
-		if (discriminant < 0.0) {
+		if (!(discriminant >= 0.0)) {
 			view_transmittance = vec3(1.0);
 			ground_distance = -1.0;
 			return vec3(0.0);
 		}
-		float root = sqrt(discriminant);
+		float root = sqrt(max(discriminant, 0.0));
 		float entry = -b - root;
 		float exit = -b + root;
 		if (exit <= 0.0) {
@@ -189,21 +253,19 @@ vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light
 		- (ray_origin_radius - planet_radius_km) * (ray_origin_radius + planet_radius_km);
 	ground_distance = -1.0;
 	if (ground_discriminant >= 0.0) {
-		float near_ground = -dot(ray_origin, view_direction) - sqrt(ground_discriminant);
+		float near_ground = -dot(ray_origin, view_direction) - sqrt(max(ground_discriminant, 0.0));
 		if (near_ground >= 0.0 && near_ground < atmosphere_distance) {
 			ground_distance = near_ground;
 			atmosphere_distance = near_ground;
 		}
 	}
 
-	vec3 sun_dir = normalize(light_direction);
+	vec3 sun_dir = safe_normalize_direction(light_direction, vec3(0.0, 1.0, 0.0));
 	float cosine_angle = clamp(dot(view_direction, sun_dir), -1.0, 1.0);
 	float rayleigh_phase = 3.0 * (1.0 + cosine_angle * cosine_angle) / (16.0 * PI);
-	float g = clamp(mie_asymmetry, -0.99, 0.99);
-	float mie_denom = max(1.0 + g * g - 2.0 * g * cosine_angle, 0.0001);
-	// Cornette-Shanks phase, as used by the public Unreal atmosphere reference.
-	float mie_phase = 3.0 * (1.0 - g * g) * (1.0 + cosine_angle * cosine_angle)
-		/ (8.0 * PI * (2.0 + g * g) * pow(mie_denom, 1.5));
+	float g = clamp(mie_asymmetry, 0.0, 0.999);
+	float mie_denom = max((1.0 - g) * (1.0 - g) + 2.0 * g * (1.0 - cosine_angle), 0.000001);
+	float mie_phase = (1.0 - g * g) / (4.0 * PI * pow(mie_denom, 1.5));
 
 	vec3 accumulated_transmittance = vec3(1.0);
 	vec3 radiance = vec3(0.0);
@@ -247,6 +309,9 @@ vec3 integrate_atmosphere(vec3 origin, vec3 view_direction, out vec3 view_transm
 }
 
 float solar_disk_weight(vec3 view_direction, vec3 sun_dir, float angular_radius) {
+	if (!(angular_radius > 0.0)) {
+		return 0.0;
+	}
 	// For small authored disks, both cos(radius * edge) values round to 1.0
 	// in float32 (including the valid 0.01/0.02 degree settings). smoothstep
 	// then has equal edges and its result is undefined. Squared chord length
@@ -259,8 +324,17 @@ float solar_disk_weight(vec3 view_direction, vec3 sun_dir, float angular_radius)
 }
 
 void sky() {
-	vec3 view_direction = normalize(EYEDIR);
-	vec3 origin = (POSITION - planet_center_m) / 1000.0;
+	vec3 origin_offset_m = POSITION - planet_center_m;
+	if (!(planet_radius_km > 0.0) || !(planet_radius_km < 1000000.0)
+			|| !(atmosphere_height_km > 0.0) || !(atmosphere_height_km < 1000000.0)
+			|| !(rayleigh_scale_height_km > 0.0) || !(rayleigh_scale_height_km < 1000000.0)
+			|| !(mie_scale_height_km > 0.0) || !(mie_scale_height_km < 1000000.0)
+			|| !(abs(origin_offset_m.x) < 1.0e13) || !(abs(origin_offset_m.y) < 1.0e13)
+			|| !(abs(origin_offset_m.z) < 1.0e13)) {
+		COLOR = vec3(0.0);
+	} else {
+	vec3 view_direction = safe_normalize_direction(EYEDIR, vec3(0.0, 1.0, 0.0));
+	vec3 origin = origin_offset_m / 1000.0;
 	float camera_radius = length(origin);
 	vec3 radial_up = camera_radius > 0.0001 ? origin / camera_radius : vec3(0.0, 1.0, 0.0);
 	// A 1 m surface epsilon makes downward rays produce a positive ground hit,
@@ -282,25 +356,39 @@ void sky() {
 			secondary_sun_color_linear, secondary_sun_irradiance, false, secondary_transmittance, secondary_ground, secondary_entry);
 	}
 
-	float sun_radius = max(radians(sun_angular_radius_deg), 0.00001);
-	float sun_edge = solar_disk_weight(view_direction, normalize(sun_direction), sun_radius);
+	float sun_radius = safe_sun_radius(sun_angular_radius_deg);
+	vec3 primary_sun_direction = safe_normalize_direction(sun_direction, vec3(0.0, 1.0, 0.0));
+	float sun_edge = solar_disk_weight(view_direction, primary_sun_direction, sun_radius);
 	if (ground_distance < 0.0 && sun_edge > 0.0) {
-		float sun_solid_angle = PI * sin(sun_radius) * sin(sun_radius);
-		vec3 sun_radiance = min(
-			max(sun_color_linear, vec3(0.0)) * max(sun_irradiance, 0.0) / max(sun_solid_angle, 0.0000001),
-			vec3(max(sky_radiance_limit, 0.0))
+		float sun_solid_angle = max(solar_disk_solid_angle(sun_radius), 0.000000000001);
+		float radiance_limit = effective_sky_radiance_limit();
+		vec3 sun_radiance = vec3(
+			safe_disk_radiance_component(sun_irradiance, sun_color_linear.r, sun_disk_color_scale.r, sun_solid_angle, radiance_limit),
+			safe_disk_radiance_component(sun_irradiance, sun_color_linear.g, sun_disk_color_scale.g, sun_solid_angle, radiance_limit),
+			safe_disk_radiance_component(sun_irradiance, sun_color_linear.b, sun_disk_color_scale.b, sun_solid_angle, radiance_limit)
 		);
 		radiance += sun_radiance * view_transmittance * sun_edge;
 	}
 
-	if (ground_distance < 0.0 && secondary_sun_irradiance > 0.0) {
-		float secondary_radius = max(radians(secondary_sun_angular_radius_deg), 0.00001);
-		float secondary_edge = solar_disk_weight(view_direction, normalize(secondary_sun_direction), secondary_radius);
-		float secondary_solid_angle = PI * sin(secondary_radius) * sin(secondary_radius);
-		vec3 secondary_radiance = min(max(secondary_sun_color_linear, vec3(0.0)) * secondary_sun_irradiance
-			/ max(secondary_solid_angle, 0.0000001), vec3(max(sky_radiance_limit, 0.0)));
+	float secondary_radius = safe_sun_radius(secondary_sun_angular_radius_deg);
+	if (ground_distance < 0.0 && secondary_sun_irradiance > 0.0 && secondary_radius > 0.0) {
+		vec3 secondary_direction = safe_normalize_direction(secondary_sun_direction, vec3(0.0, -1.0, 0.0));
+		float secondary_edge = solar_disk_weight(view_direction, secondary_direction, secondary_radius);
+		float secondary_solid_angle = max(solar_disk_solid_angle(secondary_radius), 0.000000000001);
+		float radiance_limit = effective_sky_radiance_limit();
+		vec3 secondary_radiance = vec3(
+			safe_disk_radiance_component(secondary_sun_irradiance, secondary_sun_color_linear.r, secondary_sun_disk_color_scale.r, secondary_solid_angle, radiance_limit),
+			safe_disk_radiance_component(secondary_sun_irradiance, secondary_sun_color_linear.g, secondary_sun_disk_color_scale.g, secondary_solid_angle, radiance_limit),
+			safe_disk_radiance_component(secondary_sun_irradiance, secondary_sun_color_linear.b, secondary_sun_disk_color_scale.b, secondary_solid_angle, radiance_limit)
+		);
 		radiance += secondary_radiance * view_transmittance * secondary_edge;
 	}
 
-	COLOR = clamp(radiance, vec3(0.0), vec3(max(sky_radiance_limit, 0.0)));
+	float radiance_limit = effective_sky_radiance_limit();
+	COLOR = vec3(
+		safe_radiance_component(radiance.r, radiance_limit),
+		safe_radiance_component(radiance.g, radiance_limit),
+		safe_radiance_component(radiance.b, radiance_limit)
+	);
+	}
 }

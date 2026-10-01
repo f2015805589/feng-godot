@@ -36,16 +36,44 @@ func test_density_and_phase() -> void:
 	var settings := Parameters.sanitize_atmosphere_settings({})
 	for pair in [[0.0, 0.0], [10.0, 0.0], [17.5, 0.5], [25.0, 1.0], [32.5, 0.5], [40.0, 0.0], [60.0, 0.0]]:
 		require(absf(Transport.absorption_density(pair[0], settings) - float(pair[1])) < 0.000001, "piecewise ozone tent differs from the 10/25/40 km reference")
-	for g in [-0.99, -0.8, 0.0, 0.8, 0.99]:
-		# Uniform theta quadrature resolves both narrow forward/backward lobes;
+	var zero_tip := Parameters.sanitize_atmosphere_settings({
+		"absorption_density_layer_width_km": 0.0,
+		"absorption_layer1_linear_term": -1.0 / 15.0,
+		"absorption_layer1_constant_term": 1.0,
+	})
+	require(absf(Transport.absorption_density(5.0, zero_tip) - 2.0 / 3.0) < 0.000001
+		and Transport.absorption_density(15.0, zero_tip) == 0.0,
+		"TipAltitude zero with nonzero profile width must retain its valid ozone tent")
+	var disabled_ozone := Parameters.sanitize_atmosphere_settings({
+		"absorption_layer0_linear_term": 0.0, "absorption_layer0_constant_term": 0.0,
+		"absorption_layer1_linear_term": 0.0, "absorption_layer1_constant_term": 0.0,
+	})
+	require(Transport.absorption_density(25.0, disabled_ozone) == 0.0,
+		"zero ozone profile coefficients did not disable absorption")
+	for g in [0.0, 0.8, 0.99, 0.999]:
+		# Uniform theta quadrature resolves the narrowest allowed forward peak;
 		# 2pi sin(theta) is the independently derived solid-angle Jacobian.
 		var integral := 0.0
 		const SAMPLES := 32768
 		for i in SAMPLES:
 			var theta := PI * (float(i) + 0.5) / float(SAMPLES)
 			integral += Transport.mie_phase(cos(theta), g) * sin(theta) * (2.0 * PI * PI / float(SAMPLES))
-		require(absf(integral - 1.0) < 0.001, "Cornette-Shanks phase is not normalized for g=" + str(g))
+		require(absf(integral - 1.0) < 0.001, "Henyey-Greenstein phase is not normalized for g=" + str(g))
 	require(Transport.mie_phase(1.0, 0.8) > Transport.mie_phase(-1.0, 0.8), "Mie forward direction is reversed")
+	require(is_equal_approx(Transport.mie_phase(0.4, -1.0), Transport.mie_phase(0.4, 0.0)), "negative g escaped the UE range clamp")
+	require(is_equal_approx(Transport.mie_phase(1.0, 1.0), Transport.mie_phase(1.0, 0.999)), "g=1 reached the singular HG limit")
+	require(is_finite(Transport.mie_phase(NAN, INF)), "non-finite HG inputs produced a non-finite phase")
+
+	for radius in [0.0, 1.0e-12, deg_to_rad(0.26785), deg_to_rad(2.0)]:
+		var solid_angle := Transport.solar_disk_solid_angle(radius)
+		require(is_finite(solid_angle) and solid_angle >= 0.0, "solar solid angle must remain finite and nonnegative")
+		if radius == 0.0:
+			require(solid_angle == 0.0, "zero source angle must disable the explicit solar disk")
+		else:
+			require(solid_angle > 0.0, "positive solar radius lost its stable solid angle")
+			if radius > 0.001:
+				require(absf(solid_angle - 2.0 * PI * (1.0 - cos(radius))) < 0.0000000001,
+					"stable solar solid angle differs from the exact spherical-cap formula")
 
 
 func test_rgb_transmission() -> void:

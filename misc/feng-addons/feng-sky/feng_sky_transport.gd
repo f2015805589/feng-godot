@@ -12,7 +12,12 @@ const MAX_VIEW_SAMPLES := 64
 
 
 static func absorption_density(altitude: float, settings: Dictionary) -> float:
-	if altitude < float(settings["absorption_density_layer_width_km"]):
+	if not is_finite(altitude):
+		return 0.0
+	var layer_width := float(settings["absorption_density_layer_width_km"])
+	if not is_finite(layer_width):
+		layer_width = 0.0
+	if altitude < layer_width:
 		return clampf(float(settings["absorption_layer0_linear_term"]) * altitude + float(settings["absorption_layer0_constant_term"]), 0.0, 1.0)
 	return clampf(float(settings["absorption_layer1_linear_term"]) * altitude + float(settings["absorption_layer1_constant_term"]), 0.0, 1.0)
 
@@ -22,9 +27,18 @@ static func view_sample_count(settings: Dictionary) -> int:
 
 
 static func mie_phase(cosine_angle: float, g: float) -> float:
-	# Cornette-Shanks, with directions both pointing away from the sample point.
-	var denominator := maxf(1.0 + g * g - 2.0 * g * cosine_angle, 0.0001)
-	return 3.0 * (1.0 - g * g) * (1.0 + cosine_angle * cosine_angle) / (8.0 * PI * (2.0 + g * g) * pow(denominator, 1.5))
+	# Match UE's HG convention for directions both pointing away from the sample.
+	var bounded_g := clampf(g if is_finite(g) else 0.0, 0.0, 0.999)
+	var cosine := clampf(cosine_angle if is_finite(cosine_angle) else 0.0, -1.0, 1.0)
+	var denominator := maxf((1.0 - bounded_g) * (1.0 - bounded_g) + 2.0 * bounded_g * (1.0 - cosine), 0.000001)
+	return (1.0 - bounded_g * bounded_g) / (4.0 * PI * pow(denominator, 1.5))
+
+
+static func solar_disk_solid_angle(angular_radius_radians: float) -> float:
+	if not is_finite(angular_radius_radians) or angular_radius_radians <= 0.0 or angular_radius_radians > PI:
+		return 0.0
+	var sine_half_angle := sin(angular_radius_radians * 0.5)
+	return 4.0 * PI * sine_half_angle * sine_half_angle
 
 
 static func transmittance_to_sun(point: Vector3, sun_direction: Vector3, settings: Dictionary) -> Vector3:

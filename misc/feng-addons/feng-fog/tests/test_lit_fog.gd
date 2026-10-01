@@ -94,7 +94,9 @@ func run() -> void:
 	var world_b_id := viewport_b.world_3d.get_instance_id()
 
 	require(fog.fog_color_mode == FengHeightFog.ColorMode.LIT
-		and fog.fog_inscattering_color == Color.WHITE, "new fog must default to lit white")
+		and fog.fog_inscattering_color == Color.WHITE
+		and fog.sky_atmosphere_ambient_contribution_color_scale == Color.WHITE,
+		"new fog must default to lit white and neutral sky-ambient scale")
 	var unlit := snapshot_for(unlit_fog)
 	require_vec(unlit.get("fog_color", Vector3.INF), Vector3.ZERO, "no sky or sun must not emit")
 	require_vec(unlit.get("inscattering_color", Vector3.INF), Vector3.ZERO, "no sun must disable its lobe")
@@ -162,6 +164,15 @@ func run() -> void:
 		"matching atmosphere must not apply transmission absent from scene surface lighting")
 	require_vec(matched.get("inscattering_color", Vector3.INF), tint * raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722)),
 		"matching atmosphere must not change the independent lobe")
+	var ambient_color_scale := Vector3(0.25, 0.5, 2.0)
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color(0.25, 0.5, 2.0)
+	var color_scaled_ambient := snapshot_for(fog)
+	require_vec(color_scaled_ambient.get("fog_color", Vector3.INF),
+		albedo * (ambient * 0.25 * ambient_color_scale + raw_sun * INV_FOUR_PI),
+		"sky atmosphere RGB scale must tint only sky ambient and leave author base/sun source alone")
+	require_vec(color_scaled_ambient.get("inscattering_color", Vector3.INF), matched["inscattering_color"],
+		"sky atmosphere RGB scale must not affect the independent directional lobe")
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color.WHITE
 	require_vec(snapshot_for(unlit_fog).get("fog_color", Vector3.INF), Vector3.ZERO,
 		"world A sky must not leak into world B")
 	publish_sky(provider_b, 0, Vector3(11.0, 13.0, 17.0), Vector3.ZERO)
@@ -206,6 +217,13 @@ func run() -> void:
 	var authored := Vector3(0.65, 0.4, 0.2)
 	var authored_tint := Vector3(0.3, 0.5, 0.8)
 	var luminance := raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722))
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color(0.25, 0.5, 2.0)
+	var scaled_legacy := snapshot_for(fog)
+	require_vec(scaled_legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25 * ambient_color_scale,
+		"sky atmosphere RGB scale must affect only the legacy mode's ambient contribution")
+	require_vec(scaled_legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance,
+		"sky atmosphere RGB scale must not tint the legacy directional lobe")
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color.WHITE
 	require(not legacy.has("fog_albedo"), "legacy snapshots must not be treated as material albedo")
 	require_vec(legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25,
 		"legacy source must remain raw authored RGB plus untinted sky")

@@ -71,7 +71,7 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 		return
 	var ambient: Variant = sky.get("ambient_radiance")
 	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
-	if not ambient is Vector3 or not fog_color is Vector3:
+	if not ambient is Vector3 or not fog_color is Vector3 or not ambient.is_finite() or not fog_color.is_finite():
 		return
 	var scale_value: Variant = sky.get("height_fog_contribution", 1.0)
 	var contribution_scale := 1.0
@@ -80,7 +80,18 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 		if is_finite(authored_scale):
 			contribution_scale = maxf(authored_scale, 0.0)
 	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
-	snapshot["fog_color"] = fog_color + albedo * ambient * contribution_scale
+	if not albedo.is_finite():
+		return
+	var ambient_scale: Vector3 = snapshot.get("sky_atmosphere_ambient_contribution_color_scale", Vector3.ONE)
+	if not ambient_scale.is_finite():
+		ambient_scale = Vector3.ONE
+	ambient_scale = ambient_scale.max(Vector3.ZERO)
+	var added_ambient: Vector3 = albedo * (ambient as Vector3) * ambient_scale * contribution_scale
+	if not added_ambient.is_finite():
+		return
+	var combined_fog_color: Vector3 = fog_color + added_ambient
+	if combined_fog_color.is_finite():
+		snapshot["fog_color"] = combined_fog_color
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
