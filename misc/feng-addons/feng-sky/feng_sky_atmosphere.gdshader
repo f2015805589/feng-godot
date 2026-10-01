@@ -100,11 +100,20 @@ float safe_disk_radiance_component(float irradiance, float light_color, float di
 	return safe_radiance_component(value, limit);
 }
 
+float stable_sin_small_angle(float angle) {
+	// D3D12 sin returned zero for an 8.7e-9-radian half angle in the GPU probe.
+	// The Taylor approximation has relative error below 8.4e-11 through 0.01 rad.
+	if (abs(angle) < 0.01) {
+		return angle;
+	}
+	return sin(angle);
+}
+
 float solar_disk_solid_angle(float angular_radius) {
 	if (!(angular_radius > 0.0) || !(angular_radius < PI)) {
 		return 0.0;
 	}
-	float sine_half_angle = sin(angular_radius * 0.5);
+	float sine_half_angle = stable_sin_small_angle(angular_radius * 0.5);
 	return 4.0 * PI * sine_half_angle * sine_half_angle;
 }
 
@@ -317,7 +326,8 @@ float solar_disk_weight(vec3 view_direction, vec3 sun_dir, float angular_radius)
 	// then has equal edges and its result is undefined. Squared chord length
 	// is 2 * (1 - cos(angle)), but stays precise at small angles. This is the
 	// same angular profile without subtracting nearly equal cosine values.
-	vec2 edge_chords = 2.0 * sin(angular_radius * vec2(0.425, 0.575));
+	vec2 edge_chords = 2.0 * vec2(stable_sin_small_angle(angular_radius * 0.425),
+		stable_sin_small_angle(angular_radius * 0.575));
 	vec2 edge_squared = edge_chords * edge_chords;
 	vec3 chord = view_direction - sun_dir;
 	return 1.0 - smoothstep(edge_squared.x, edge_squared.y, dot(chord, chord));
