@@ -1,9 +1,17 @@
 # Feng Sky
 
 `FengSkyAtmosphere` is a `WorldEnvironment` component with a GPU-rendered,
-spherical, Earth-like single-scattering atmosphere. New nodes use this model by
-default. Its atmosphere shader produces scene-linear radiance and leaves camera
+spherical atmosphere with RGB Rayleigh and Mie transport, ozone absorption,
+and an isotropic multiple-scattering approximation. New nodes use an Earth-like
+preset. Its atmosphere shader produces scene-linear radiance and leaves camera
 exposure and pre-exposure to the renderer.
+
+The API and rendering roles target Unreal Engine 5.8 Sky Atmosphere semantics.
+The numerical implementation is independent and informed by Sébastien Hillaire’s
+[public atmosphere reference](https://github.com/sebh/UnrealEngineSkyAtmosphere).
+It is not a copy of private UE 5.8 source, and no matching UE 5.8 render baseline
+has been available to establish pixel parity. Preset values below are explicit
+Feng defaults, not a claim that every value matches a verified UE 5.8 constructor.
 
 FRP applies `Environment.background_intensity` to sky radiance, so the provider
 sets that nits-valued multiplier to `1.0` only while the built-in atmosphere is
@@ -27,38 +35,83 @@ physical temperature, and energy update the sky as the light changes. With
 matching the FRP renderer's normalized directional-light scale. The latter is
 not a lux measurement. Both modes use the same linear scattering equations.
 
+## Parameters and transport
+
 The default planet has a radius of 6360 km and a 60 km atmosphere. World units
-are meters; the default planet center `(0, -6360000, 0)` places world origin at
-sea level. Atmospheric distances and extinction/scattering coefficients are
-exposed in kilometers and inverse kilometers. The implementation evaluates
-the spherical ray/sphere intersections and numerically integrates Rayleigh and
-Mie single scattering. For a view ray, the source term is
+are metres; the default planet center `(0, -6360000, 0)` places world origin at
+sea level. **Transform Mode**, **Planet Origin**, and an optional **Planet
+Transform** node support top-at-origin, top-at-component-position, and
+center-at-component-position authoring. `WorldEnvironment` itself has no spatial
+transform. The component converts author-facing controls into one normalized,
+renderer-independent parameter dictionary.
 
-`βR ρR PR(μ) + βM,scatter ρM PHG(μ, g)`
+- **Rayleigh Scattering** is RGB km⁻¹, multiplied by **Rayleigh Scattering Scale**.
+  **Rayleigh Exponential Distribution** is its density e-folding height in km
+- **Mie Scattering** and **Mie Absorption** are independent RGB km⁻¹ values with
+  independent scales. Extinction is their nonnegative sum, never a grayscale
+  substitute. **Mie Exponential Distribution** is the aerosol e-folding height
+- **Mie Anisotropy** controls the normalized Cornette–Shanks phase function.
+  Positive values produce a forward circumsolar lobe
+- **Absorption** is RGB km⁻¹ with its own scale. The tent profile is exposed
+  as **Tent / Tip Altitude**, **Tip Value**, and **Width**; two clamped linear
+  layers implement it. The default density is zero at 10 km, one at 25 km, and
+  zero again at 40 km. Default coefficients are `(0.000650, 0.001881, 0.000085)`
+- **Multi Scattering Factor** scales second-and-higher-order illumination. Zero
+  disables it. **Ground Albedo**, default linear `(0.4, 0.4, 0.4)`, contributes
+  only through that illumination. It does not paint a visible ground disk
+- **Sky Luminance Factor** changes sky scattering and its captured fog ambient.
+  **Sky And Aerial Perspective Luminance Factor** also controls the surface
+  aerial-perspective source. Neither changes extinction or the solar disk
+- **Transmittance Min Light Elevation Angle** clamps only the direction used to
+  evaluate direct-light transmittance. It does not move the visible sun or alter
+  sky scattering. Its default `-90°` leaves the physical direction unchanged
+- **Trace Sample Count Scale** controls the actual view-ray budget: eight
+  segments at `1`, from two to 32 within its supported `0.25–4` range
 
-and each segment is attenuated by view-path and sun-path transmittance
-`T = exp(-∫(βR ρR + βM,extinction ρM) ds)`. Density falls exponentially with
-altitude. The Mie extinction coefficient is constrained to be at least its
-scattering coefficient, so the model cannot create energy from negative
-absorption. The GPU keeps eight view segments, with more samples concentrated
-near the dense lower atmosphere. Six sun-path samples are preintegrated into a
-small optical-column lookup table, described below. It also shades a
-Lambertian lower-sky ground disk from direct sunlight; that ground reflection is
-not included in the fog ambient snapshot.
+The Earth preset uses Rayleigh `(0.005802, 0.013558, 0.0331)` with an 8 km scale
+height, Mie scattering `(0.003996, 0.003996, 0.003996)`, Mie absorption
+`(0.000444, 0.000444, 0.000444)`, a 1.2 km Mie scale height, anisotropy `0.8`,
+and multiple-scattering factor `1`. The solar angular radius defaults to
+`0.26785°`. An explicitly linked **Secondary Sun Light** supplies a second
+independent directional source and disk. Its transport is evaluated only when
+its irradiance is positive; it reuses both optical tables.
 
-The same runtime sanitizer supplies GPU sky uniforms and CPU fog samples,
-including values assigned from code outside Inspector hints. It bounds planet
-radius to 6000–7000 km, atmosphere height to 1–120 km, Rayleigh and Mie scale
-heights to 1–30 km and 0.1–10 km, each scattering coefficient to 0–1 km⁻¹,
-and Mie extinction to at least its scattering coefficient. Non-finite scalar
-and vector inputs fall back to documented defaults.
+Each view segment integrates the direct source
 
-This is a single-scattering model. It does not implement ozone absorption,
-multiple scattering, terrain shadows, or atmospheric refraction. Godot stores
-sky radiance in an RGBA16F cubemap, whose finite range ends at 65504. To prevent
-solar-disk overflow and fireflies, the shader caps the disk and final sky
-radiance at 60000. The solar disk therefore keeps its angle and atmospheric
-color/transmission but is not an absolute physical luminance measurement.
+`βR ρR PR(μ) + βM,scatter ρM PCS(μ, g)`
+
+with transmittance
+
+`T = exp(-∫(βR ρR + βM,extinction ρM + βabsorption ρabsorption) ds)`.
+
+The multiple-scattering source adds `(βR ρR + βM,scatter ρM) Ψms`, where `Ψms`
+is a cached isotropic incident-radiance field for unit solar irradiance. Its
+builder integrates first-order isotropic atmosphere scattering and sunlight
+reflected from the ground over the sphere, estimates the scattering feedback
+`fms`, then evaluates `Ψms = L2 / (1 - fms)`. Analytical constant-medium segment
+integration keeps the feedback bounded; a final per-channel `0.95` ceiling
+prevents divergence in extreme nearly conservative authored atmospheres. This
+is a lower-resolution Hillaire-style closure, not full directional path tracing.
+
+The virtual planet occludes sunlight and view rays. No direct Lambertian ground
+fill is drawn. Short atmosphere segments above the planet still scatter light,
+and high-altitude/space rays can traverse the limb. Terrain or cloud shadowing,
+atmospheric refraction, and a matching UE 5.8 sky-view LUT implementation are
+not part of this transport model.
+
+`feng_sky_parameters.gd` owns finite-input normalization; CPU and GPU consumers
+receive the same units and nonnegative coefficients. Numerical guard ranges are
+Feng implementation choices: radius 1–100000 km, atmosphere height 0.1–10000 km,
+density scale heights 0.001–1000 km, coefficients 0–100 km⁻¹, anisotropy
+`[-0.99, 0.99]`, and finite bounded artist gains. These guards are not claimed
+Unreal UI limits. Old `planet_radius_km`, scale-height, and scalar Mie properties
+remain loadable read/write aliases; newly saved scenes use the canonical fields.
+
+Godot stores sky radiance in an RGBA16F cubemap, whose finite range ends at 65504.
+To prevent solar-disk overflow and fireflies, the shader caps each disk and final
+sky radiance at 60000, reduced before native sky gain is applied. The solar disk
+therefore keeps its angle and atmospheric color/transmission but is not an
+absolute physical luminance measurement.
 
 The solar edge is evaluated using squared chord distance rather than two
 cosines near one. This is the same angular profile, but keeps distinct edges at
@@ -91,78 +144,89 @@ contains `world_id`, `provider_id`, `sun_light_id`, `sun_direction`,
 `sun_ground_illuminance`, `sun_irradiance_unit`, `ambient_radiance`, and
 `height_fog_contribution`. `ambient_radiance` is a linear RGB isotropic source
 defined as `(1/(4π)) * ∫ L_sky(ω) dω`; the integration samples the upper sky and
-treats the lower hemisphere as ground with no ground-bounce contribution. It
-includes sun-driven atmosphere scattering, not exposure or pre-exposure.
+treats the lower hemisphere as an occluder. Ground bounce contributes to the
+upper sky through multiple scattering. It includes both enabled light sources
+and authored sky-scattering gains, not exposure or pre-exposure.
 `sun_ground_illuminance` is RGB lux when physical light units are enabled and
-FRP-normalized irradiance otherwise. Feng Fog does not substitute this field
-for the selected light: scene surfaces still use raw DirectionalLight3D
-irradiance, so applying atmospheric transmission only to fog would erase its
-base at the horizon. Lit fog uses raw RGB sunlight for its albedo-tinted base;
-the independent directional artist color keeps its raw-sun luminance scaling.
-See the Feng Fog README for color modes and the source-lighting contract.
+FRP-normalized irradiance otherwise. The independent rendering snapshot remains available when **Affect Height Fog**
+is disabled. It carries normalized optics, both light sources, optical textures,
+and render-target identity for FRP aerial perspective and atmosphere-aware
+surface lighting. The fog ambient snapshot remains separately gated by
+**Affect Height Fog**. See `doc/frp-unreal-atmosphere.md` for the renderer mapping
+and integration limits.
 
 Ambient integration is cached per two-degree sun-zenith bins and linearly
 interpolated. Sun color and intensity scale the cached unit-source result;
 sun azimuth does not invalidate it. Atmosphere parameter changes clear the
 cache. Each cache miss evaluates 64 importance-sampled directions, including
-samples drawn from the Henyey–Greenstein distribution to cover its forward
-peak; the bounded cost is observable through
+samples drawn from a Henyey–Greenstein proposal distribution to cover the
+Cornette–Shanks forward peak, with the correct proposal-density weights. The
+bounded cost is observable through
 `FengSkyAtmosphere.atmosphere_cache_stats()`.
 
 ## Atmosphere performance
 
-The sun-path lookup contains Rayleigh and Mie density columns in kilometres,
-not baked light colors or already exponentiated transmittance. The shader applies
-current extinction coefficients to the interpolated columns and then evaluates
-Beer–Lambert transmission. Planet shadow remains an analytic ray/sphere test,
-so filtering cannot bleed daylight across the planet's shadow. A zero-length
-outward path at the exact atmosphere boundary has unit transmission.
+`feng_sky_runtime.gd` owns world publication and compatibility entry points;
+`feng_sky_transport.gd` owns pure CPU transport. `feng_sky_optical_lut.gd` and
+`feng_sky_multiscattering_lut.gd` build light-independent tables. Neither table
+contains sun color, intensity, exposure, or pre-exposure.
 
-The 128 × 64 `RGF` table takes 64 KiB. Its coordinates are altitude expressed as
-`rho / sqrt(top_radius² - planet_radius²)`, where `rho = sqrt(r² - planet_radius²)`,
-and distance-to-atmosphere-exit normalized between the vertical and ground-tangent
-rays. A quadratic warp concentrates distance samples toward the grazing horizon;
-texel-center mapping keeps all domain endpoints defined. The table uses the same
-six nonuniform midpoint sun samples as the original direct shader. Atmospheres
-whose height exceeds 64 times either density scale height use the direct
-six-sample path instead, preserving very thin authored layers without an
-undersampled lookup or an unbounded build.
+The optical table stores Rayleigh, Mie and absorption density columns in
+kilometres. The shader multiplies these by the current RGB extinction
+coefficients and evaluates Beer–Lambert transmission. Planet shadow remains an
+analytic ray/sphere test, so filtering cannot bleed daylight through the planet.
+Factored radial differences avoid subtracting large nearly equal squared radii;
+an outward zero-length ray exactly on the atmosphere boundary transmits vacuum.
 
-For the default atmosphere, each view segment replaces six square roots and
-12 density exponentials with a filtered texture lookup. View density is evaluated
-once for both scattering and extinction, and segment transmission is reused by
-its integral. Eight view segments, the solar disk, spherical intersections,
-space views, lower-sky ground shading and the physical/nonphysical light scale
-are preserved. The CPU fog ambient integration remains the independent direct
-reference, and the raw-sun fog contract is unchanged.
+The 128 × 64 `RGBF` table takes 96 KiB. Its coordinates are
+`rho / sqrt(top_radius² - planet_radius²)`, where
+`rho = sqrt((r - planet_radius) * (r + planet_radius))`, and normalized
+distance-to-atmosphere-exit. A quadratic distance warp concentrates samples near
+grazing paths, and texel-center mapping preserves the domain endpoints. Six
+nonuniform midpoint samples build each density column. Very thin exponential
+or absorption profiles fall back to the same direct six-step calculation rather
+than using a table that cannot resolve them. This is a bounded numerical
+approximation, especially for extremely thin authored profiles.
 
-Only changes to planet radius, atmosphere height or the two density scale heights
-rebuild optical columns. Sun motion/color/intensity, extinction and scattering
-coefficients, phase asymmetry, planet position, ground albedo, exposure and sky
-energy do not rebuild them. Each provider owns its texture; one bounded,
-copy-on-write CPU byte cache avoids repeating construction for identical worlds.
-Multiple property edits before the next update are coalesced into one rebuild.
+The 16 × 16 `RGBF` multiple-scattering table takes 3 KiB. It integrates 16
+uniform-solid-angle directions and 12 nonuniform path segments per texel, with
+six sun-path samples. Altitude uses a squared mapping; signed-square solar
+cosine mapping concentrates texels around twilight. Runtime lookups use the
+inverse mappings and texel centers. The field is computed per unit solar source,
+so moving either light only changes lookup coordinates. This table is not a
+screen-space history and does not add a frame of temporal lag.
 
-Exported setters invalidate sanitized settings. Shader `changed` notifications
-invalidate cached source identity, including nested shader edits. Static and
-sun-dependent material updates are separate, and an unchanged world snapshot is
-not republished. World ownership and resource identity are still checked every
-frame and at snapshot read time. Cache counters expose these operations through
-`atmosphere_cache_stats()`.
+Only geometry and density-profile changes rebuild optical columns. Changing
+RGB coefficients or ground albedo rebuilds the multiple-scattering table but not
+the optical columns. Changing multiple-scattering strength, sky artist gains,
+view quality, light direction/color/intensity, world position or exposure
+rebuilds neither table. Each provider owns its image and texture; the bounded
+shared CPU byte caches avoid repeating identical builds. Providers retain their
+CPU multiple-scattering image so sun-bin cache misses cannot trigger rebuilds
+when other worlds evict shared cache entries. Property edits within one update
+are coalesced. These builds can cause a one-time main-thread cost when an
+atmosphere profile changes; they are not performed every frame.
 
-`tests/test_sky_optimization.gd` checks direct/LUT transmission and integrated
-sky/ground agreement, ground shadow, zero extinction, atmosphere boundaries,
-extreme valid profiles, stable update counts, parameter invalidation, shader
-edits, same-frame world handoff/back, and per-world texture isolation. It runs
-with either a Feng editor or a stock Godot 4.6 project containing this addon;
-the Python test runner includes it after the existing component suite.
+On a Linux headless run, the new optical table built in roughly 30–47 ms and the
+multiple-scattering table in roughly 0.4–0.8 s, with exact-signature reuse taking
+only image creation/copy-on-write overhead. These are startup/profile-edit CPU
+measurements, not GPU timings. The 520 default-profile optical comparisons had
+maximum absolute RGB transmission error `0.00302` against direct transport.
 
-On one Linux stock Godot 4.6.3 headless run, table construction took 14–20 ms
-and identical-geometry reuse took 7–24 µs. The default-atmosphere test's 1,584
-sky/ground rays had 0.0914% maximum relative RGB error (excluding near-zero rays)
-and 0.0285% normalized RMS error against direct integration. These are numerical
-and CPU measurements, not a renderer/GPU timing guarantee; use the GPU probe
-for target-device frame measurements.
+`tests/test_unreal_transport.gd` also compares the multiple-scattering field
+against an independent 64-direction, 64-view-step, 32-sun-step implementation of
+the same isotropic closure at three altitudes and five solar elevations,
+including twilight. With the horizon-concentrated mapping, measured normalized
+RMS error was `2.81%`, maximum absolute unit-source radiance error `0.00203`.
+Relative error can be large in very dark twilight samples; this does not establish
+UE image parity, path-tracing accuracy, or target-device performance.
+
+Exported setters invalidate sanitized settings; shader `changed` notifications
+invalidate cached source identity. Static and light-dependent material updates
+are separate, and unchanged snapshots are not republished. World ownership and
+resource identity are checked every frame and at main-thread snapshot reads.
+Render-thread readers consume immutable arrays exchanged under a mutex, never
+scene-tree nodes. `atmosphere_cache_stats()` exposes rebuild and update counters.
 
 ## Example
 
@@ -212,3 +276,14 @@ per case. Eight cases keep all 13 passes enabled; four isolated control cases
 disable only the local native TAA entry (12 enabled passes). Exposure buffers
 are read from the active effect on the render thread. The full test runner
 includes this after the existing fog/sky GPU probe.
+
+`tests/test_unreal_transport.gd` checks the absorption tent, normalized phase
+function, analytic spectral Mie transmission, RGB optical-table accuracy,
+multiple-scattering reference error, ground-albedo monotonicity, zero-medium
+behavior, finite high-extinction profiles, cache/image isolation, artist gains,
+minimum light elevation and actual trace quality budgets. These checks are
+separate from real GPU rendering and the UE 5.8 visual comparison still needed.
+
+Secondary atmospheric light index 1 contributes single scattering and its disk;
+multiple scattering is evaluated only for index 0, matching the UE 5.8 documented
+secondary-light limitation. CPU fog ambient uses the same slot rule.

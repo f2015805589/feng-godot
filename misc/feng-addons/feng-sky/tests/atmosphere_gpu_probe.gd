@@ -7,6 +7,7 @@ const FengHeightFog = preload("res://addons/feng-fog/feng_height_fog.gd")
 const OUTPUT_DIR := "user://sky_probe"
 
 var _renderer
+var _viewport: SubViewport
 var _camera: Camera3D
 var _scene: Node3D
 var _sky: FengSkyAtmosphere
@@ -105,13 +106,19 @@ func sample(label: String, physical_units: bool, settle_frames := 64,
 	# case so pre-exposure/metering edits reach both native and custom passes.
 	_renderer.apply(_compositor)
 	await settle(settle_frames)
-	var image := root.get_texture().get_image()
+	var image := _viewport.get_texture().get_image()
 	var width := image.get_width()
 	var height := image.get_height()
-	var fog_x := width / 8
-	# This point lies on the far wall above the near wall. The near wall is
-	# inside start_distance and would not exercise the fog path.
-	var fog_y := height / 4
+	# Project a known far-wall surface point instead of assuming a 4:3 window.
+	# Desktop window managers may resize the requested 320x240 test window;
+	# a fixed UV can then leave the finite wall or sample the near occluder.
+	var fog_target := _far_wall_body.global_position + Vector3(-15.0, 15.0, 0.25)
+	var fog_screen := _camera.unproject_position(fog_target)
+	if not Rect2(Vector2.ZERO, Vector2(width, height)).has_point(fog_screen):
+		push_error("Projected far-wall probe is outside the viewport: %s / %sx%s" % [fog_screen, width, height])
+		return false
+	var fog_x := roundi(fog_screen.x)
+	var fog_y := roundi(fog_screen.y)
 	var mesh_x := width / 2
 	var mesh_y := height * 5 / 8
 	var fog_pixel := image.get_pixel(fog_x, fog_y)
@@ -191,6 +198,7 @@ func sample(label: String, physical_units: bool, settle_frames := 64,
 		" away_sun_fog_sdr_luma=", luma(fog_pixel),
 		" lit_mesh_pixel=", mesh_color,
 		" lit_mesh_luma=", luma(mesh_color),
+		" resolution=", image.get_size(),
 		" png=", ProjectSettings.globalize_path(image_path),
 		" save_error=", save_error)
 	return true
@@ -198,10 +206,16 @@ func sample(label: String, physical_units: bool, settle_frames := 64,
 
 func run() -> void:
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(OUTPUT_DIR))
-	root.msaa_3d = Viewport.MSAA_DISABLED
-	root.use_taa = false
+	# Keep measurement/image resolution independent of desktop window policies.
+	_viewport = SubViewport.new()
+	_viewport.size = Vector2i(320, 240)
+	_viewport.world_3d = World3D.new()
+	_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_viewport.msaa_3d = Viewport.MSAA_DISABLED
+	_viewport.use_taa = false
+	root.add_child(_viewport)
 	_scene = Node3D.new()
-	root.add_child(_scene)
+	_viewport.add_child(_scene)
 	_camera = Camera3D.new()
 	_camera.current = true
 	_camera.position = Vector3(0.0, 1.5, 4.0)
@@ -320,13 +334,19 @@ func run() -> void:
 			return
 		var fog_disabled_luma: float = _samples["atmosphere_60000_lux_fixed_exposure_height_fog_disabled"]["fog_luma"]
 		_fog.enabled = true
-		if absf(fog_disabled_luma - coupled_luma) < 0.08:
+		var coupled_color: Color = _samples["atmosphere_60000_lux_fixed_exposure_fog_on"]["fog_pixel"]
+		var disabled_color: Color = _samples["atmosphere_60000_lux_fixed_exposure_height_fog_disabled"]["fog_pixel"]
+		var fog_rgb_delta := Vector3(coupled_color.r, coupled_color.g, coupled_color.b).distance_to(
+			Vector3(disabled_color.r, disabled_color.g, disabled_color.b))
+		# Spectral atmosphere lighting can change hue strongly at similar luma.
+		# Test visible RGB contribution instead of requiring an arbitrary luma drop.
+		if fog_rgb_delta < 0.08:
 			push_error("Height fog did not visibly change the ray-hit far-wall pixel")
 			quit(2)
 			return
 		print("SKY GPU HEIGHT_FOG comparison enabled_sdr_luma=", coupled_luma,
 			" disabled_sdr_luma=", fog_disabled_luma,
-			" absolute_delta=", absf(fog_disabled_luma - coupled_luma))
+			" absolute_luma_delta=", absf(fog_disabled_luma - coupled_luma), " rgb_delta=", fog_rgb_delta)
 		_sky.affect_height_fog = false
 		var uncoupled_ok: bool = await sample(
 			"atmosphere_60000_lux_fixed_exposure_fog_off", true, 64, false)
@@ -377,7 +397,7 @@ func run() -> void:
 	_sky.atmosphere_enabled = true
 	await settle(60)
 	var atmosphere_repeat_metrics: Dictionary = await measure_frame_metrics("built_in_atmosphere_repeat", 120)
-	print("SKY GPU PASS resolution=", root.size,
+	print("SKY GPU PASS resolution=", _viewport.size,
 		" screen_ray_steps=", 8, " sun_path_mode=LUT_or_exact_extreme_fallback",
 		" atmosphere_cache=", _sky.atmosphere_cache_stats(),
 		" profile_frame_count=", 120,

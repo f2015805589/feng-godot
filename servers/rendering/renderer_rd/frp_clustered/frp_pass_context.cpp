@@ -47,6 +47,11 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
 	pass_parameters = p_pass_parameters;
 	height_fog_parameters.clear();
+	atmosphere_parameters.clear();
+	atmosphere_light_rids[0] = RID();
+	atmosphere_light_rids[1] = RID();
+	atmosphere_optical_texture = RID();
+	atmosphere_multiple_texture = RID();
 }
 
 float FRPPassContext::get_pre_exposure(int p_view) const {
@@ -69,6 +74,27 @@ void FRPPassContext::set_height_fog_parameters(const PackedFloat32Array &p_param
 	}
 	ERR_FAIL_COND_MSG(p_parameters.size() != 28, "Height Fog parameters must contain 28 floats.");
 	height_fog_parameters = p_parameters;
+}
+
+void FRPPassContext::set_atmosphere_parameters(const PackedFloat32Array &p_parameters, RID p_light, RID p_secondary_light, RID p_optical_texture, RID p_multiple_texture) {
+	// Clear first: an invalid payload must not leave an earlier world's state.
+	atmosphere_parameters.clear();
+	atmosphere_light_rids[0] = RID();
+	atmosphere_light_rids[1] = RID();
+	atmosphere_optical_texture = RID();
+	atmosphere_multiple_texture = RID();
+	if (p_parameters.is_empty()) {
+		return;
+	}
+	ERR_FAIL_COND_MSG(p_parameters.size() != 64, "Atmosphere parameters must contain sixteen vec4 values.");
+	for (float value : p_parameters) {
+		ERR_FAIL_COND_MSG(!Math::is_finite(value), "Atmosphere parameters must be finite.");
+	}
+	atmosphere_parameters = p_parameters;
+	atmosphere_light_rids[0] = p_light;
+	atmosphere_light_rids[1] = p_secondary_light;
+	atmosphere_optical_texture = p_optical_texture;
+	atmosphere_multiple_texture = p_multiple_texture;
 }
 
 void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
@@ -247,6 +273,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
+	ClassDB::bind_method(D_METHOD("set_atmosphere_parameters", "parameters", "light", "secondary_light", "optical_texture", "multiple_texture"), &FRPPassContext::set_atmosphere_parameters);
+	ClassDB::bind_method(D_METHOD("get_atmosphere_parameters"), &FRPPassContext::get_atmosphere_parameters);
 	ClassDB::bind_method(D_METHOD("set_height_fog_parameters", "parameters"), &FRPPassContext::set_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("get_height_fog_parameters"), &FRPPassContext::get_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("set_tonemap_exposure_texture", "texture"), &FRPPassContext::set_tonemap_exposure_texture);

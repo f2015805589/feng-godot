@@ -1,5 +1,6 @@
 extends SceneTree
-## Exact CPU packet contract: compute240-byte UBO and forward7×vec4 payload.
+## Exact CPU packet contract: 496-byte UBO, preserving the original 240-byte
+## camera/fog prefix and independent forward7×vec4 fog payload.
 const FogPass = preload("res://addons/feng-render-pipeline/passes/height_fog_pass.gd")
 
 class SceneData extends RenderSceneDataExtension:
@@ -11,6 +12,8 @@ class SceneData extends RenderSceneDataExtension:
 		return projection
 	func _get_view_count() -> int:
 		return 1
+	func _get_view_eye_offset(_view: int) -> Vector3:
+		return Vector3.ZERO
 	func _get_view_projection(_view: int) -> Projection:
 		return projection
 
@@ -93,15 +96,31 @@ func run() -> void:
 				scene.camera = camera
 				scene.projection = projection
 				check(fog._update_frame_ubo(settings, scene, 0, null), "compute packet builder failed")
-				check(fog.declared_bytes == 240 and fog.captured.size() == 60, "compute packet layout changed")
-				check(fog.captured.to_byte_array() == reference_packet(settings, camera, projection).to_byte_array(), "compute field values/order differ")
+				check(fog.declared_bytes == 496 and fog.captured.size() == 124, "compute packet layout changed")
+				check(fog.captured.slice(0, 60).to_byte_array() == reference_packet(settings, camera, projection).to_byte_array(), "original camera/fog fields/order differ")
+				var neutral_atmosphere := PackedFloat32Array()
+				neutral_atmosphere.resize(64)
+				check(fog.captured.slice(60).to_byte_array() == neutral_atmosphere.to_byte_array(), "absent atmosphere must append 64 neutral floats")
 				for scale in [-2.0, 0.0, 1.0, 2.75]:
 					var forward := fog._make_forward_parameters(settings, camera, scale)
 					check(forward.size() == 28 and forward[14] == scale, "forward packet scale/layout changed")
 					forward[14] = 0.0
-					check(forward.to_byte_array() == fog.captured.slice(32).to_byte_array(), "forward/compute packet fields differ")
-					snapshots.append(fog.captured.to_byte_array().hex_encode())
+					check(forward.to_byte_array() == fog.captured.slice(32, 60).to_byte_array(), "forward/compute packet fields differ")
+					snapshots.append(fog.captured.slice(0, 60).to_byte_array().hex_encode())
 					count += 1
+	# A live spectral atmosphere must not change independently authored fog
+	# colours, sun direction, start/cutoff depth, opacity, or the forward payload.
+	fog._atmosphere_snapshot = {"settings": {
+		"rayleigh_scattering_per_km": Vector3(0.005, 0.013, 0.033),
+		"mie_scattering_coefficients": Vector3(0.002, 0.003, 0.004),
+		"mie_extinction_coefficients": Vector3(0.003, 0.005, 0.007),
+		"sky_luminance_factor": Vector3(2.0, 3.0, 4.0)},
+		"sun_direction": Vector3.UP, "sun_color_linear": Vector3(0.7, 0.5, 0.2), "sun_irradiance": 60000.0}
+	for settings in cases:
+		check(fog._update_frame_ubo(settings, scene, 0, null), "atmosphere+fog packet builder failed")
+		check(fog.captured.slice(0, 60).to_byte_array() == reference_packet(settings, scene.camera, scene.projection).to_byte_array(), "atmosphere mutated original fog fields")
+		check(fog.captured[110] == 1.0 and fog.captured[95] == 60000.0, "live atmosphere packet lost source/active data")
+		check(fog._make_forward_parameters(settings, scene.camera, 0.0).to_byte_array() == fog.captured.slice(32, 60).to_byte_array(), "live atmosphere altered forward fog contract")
 	check(not fog._update_frame_ubo({}, null, 0, null) and not fog._update_frame_ubo({}, scene, 1, null), "invalid view guard changed")
 	scene.free()
 	var output := OS.get_environment("FRP_FOG_PACKET_SNAPSHOT")
@@ -113,5 +132,5 @@ func run() -> void:
 	if failed:
 		quit(1)
 	else:
-		print("PASS FRP fog packet equivalence: %d exact240-byte and scaledforward cases" % count)
+		print("PASS FRP fog packet equivalence: %d exact240-byte preserved fog prefixes within496-byte packets and scaledforward cases" % count)
 		quit(0)

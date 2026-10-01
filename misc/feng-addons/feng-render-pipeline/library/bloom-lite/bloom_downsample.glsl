@@ -15,7 +15,8 @@ void main() {
 		return;
 	}
 	vec2 src_size = vec2(textureSize(src_image, 0));
-	vec2 uv = (vec2(pixel) + 0.5) / src_size;
+	// Normalize by destination size: source and output may have different scales.
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 	vec4 color = texture(src_image, uv);
 	float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
 	vec4 bright = luma > params.threshold.x ? color : vec4(0.0);

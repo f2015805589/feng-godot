@@ -32,6 +32,10 @@ func _init(p_native_id: int = -1, p_resource_name: String = "") -> void:
 	if p_resource_name != "":
 		resource_name = p_resource_name
 
+func _frp_prepare(ctx: FRPPassContext) -> void:
+	if implementation != null and implementation.has_method("_frp_prepare"):
+		implementation.call("_frp_prepare", ctx)
+
 func _frp_execute(ctx: FRPPassContext) -> void:
 	# The scheduler has already resolved enabled through all parameter layers.
 	# Rechecking the authored source here would defeat a Volume enabling this pass.

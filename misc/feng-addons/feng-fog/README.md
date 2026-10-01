@@ -58,6 +58,15 @@ and automatic exposure. Legacy values are not clamped or converted to sRGB.
 
 ## Test
 
+World/render-target registrations are owned independently by each runtime and
+editor plugin. Disabling Magic GI or Fog cannot unregister the other addon's
+views. Node exit releases its registrations and restores the viewport's original
+debanding setting. The headless ownership/lighting regression is:
+
+```sh
+python misc/scripts/test_feng_runtime_contracts.py --editor /path/to/godot
+```
+
 With a built Godot editor available, run the optional-runtime late-load check:
 
 ```powershell

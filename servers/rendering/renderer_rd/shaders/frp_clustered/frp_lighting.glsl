@@ -47,6 +47,29 @@ void main() {
 #include "../half_inc.glsl"
 #include "scene_frp_clustered_inc.glsl"
 
+#ifndef MODE_RENDER_DEPTH
+#define ATMO_PARAMS implementation_data.atmosphere_parameters
+#define ATMO_OPTICAL sampler2D(atmosphere_optical_texture, SAMPLER_LINEAR_CLAMP)
+#define ATMO_MULTIPLE sampler2D(atmosphere_multiple_texture, SAMPLER_LINEAR_CLAMP)
+#include "atmosphere_inc.glsl"
+#undef ATMO_PARAMS
+#undef ATMO_OPTICAL
+#undef ATMO_MULTIPLE
+vec3 frp_atmospheric_light_factor(uint index, vec3 camera_to_receiver_m) {
+	if (implementation_data.atmosphere_enabled == 0u) {
+		return vec3(1.0);
+	}
+	if (index == implementation_data.atmosphere_light_index0) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 0);
+	}
+	if (index == implementation_data.atmosphere_light_index1) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 1);
+	}
+	return vec3(1.0);
+}
+#endif
+
+
 // Keep clustered light lookup/shadows from the shared renderer include, but
 // route every resolved light through FRP's own ShadingModelID/BxDF dispatcher.
 void frp_light_compute(hvec3 N, hvec3 L, hvec3 V, half A, vec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation, inout hvec3 diffuse_light, inout hvec3 specular_light);
@@ -494,7 +517,7 @@ void main() {
 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
 
 			frp_light_compute(normal, directional_lights.data[i].direction, view, size_A,
-					directional_lights.data[i].color * directional_lights.data[i].energy,
+					directional_lights.data[i].color * directional_lights.data[i].energy * frp_atmospheric_light_factor(i, mat3(scene_data.inv_view_matrix) * vertex),
 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
 					diffuse_light,
 					direct_specular_light);

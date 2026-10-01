@@ -63,12 +63,29 @@ static void test_indirection_lookup() {
 	CHECK_EQ(matched_y, 7u);
 	CHECK_EQ(matched_mip, 2u);
 
-	// Slot values are masked to 11 bits. 0xFFFE is not the invalid sentinel, so
-	// the lookup still hits and the stored slot keeps only 0x7FE.
-	auto wide = [](uint32_t, uint32_t, uint32_t) -> uint32_t { return 0xFFFEu; };
+	// Non-sentinel slot values are masked to 11 bits. 0xFFFE is now the
+	// planned-but-unproduced marker, so use 0xFFFD to test the high-bit mask.
+	auto wide = [](uint32_t, uint32_t, uint32_t) -> uint32_t { return 0xFFFDu; };
 	CHECK(try_match_indirection_slot({ 1, 1, 0, 1 }, 8, wide, slot, matched_x, matched_y,
 			matched_mip));
-	CHECK_EQ(slot, 0x7FEu);
+	CHECK_EQ(slot, 0x7FDu);
+
+	// A planned page has no physical slot. This generic residency walk skips
+	// it, resolving a ready parent when present; strict shader diagnostics are
+	// a separate policy and must not turn the marker into a valid slot here.
+	auto planned = [](uint32_t, uint32_t, uint32_t) -> uint32_t { return PLANNED_PHYSICAL_PAGE_SLOT; };
+	CHECK(!try_match_indirection_slot({ 1, 1, 0, 1 }, 8, planned, slot, matched_x, matched_y,
+			matched_mip));
+	CHECK_EQ(slot, INVALID_PHYSICAL_PAGE_SLOT);
+	auto planned_parent = [](uint32_t, uint32_t, uint32_t mip) -> uint32_t {
+		return mip == 2 ? 123u : PLANNED_PHYSICAL_PAGE_SLOT;
+	};
+	CHECK(try_match_indirection_slot({ 20, 28, 0, 1 }, 8, planned_parent, slot, matched_x, matched_y,
+			matched_mip));
+	CHECK_EQ(slot, 123u);
+	CHECK_EQ(matched_x, 5u);
+	CHECK_EQ(matched_y, 7u);
+	CHECK_EQ(matched_mip, 2u);
 
 	// Nothing resident anywhere in the chain.
 	auto empty = [](uint32_t, uint32_t, uint32_t) -> uint32_t { return INVALID_PHYSICAL_PAGE_SLOT; };

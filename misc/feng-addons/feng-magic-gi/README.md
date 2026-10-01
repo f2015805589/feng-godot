@@ -22,6 +22,11 @@ FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）数
 
 ## 动态光照
 
+显式 `Sun` 在已扫描方向光之间切换或清空时，直接光 SH 缓存立即失效；天空来源和显式直接光选择分别跟踪。
+物理光照模式同时使用 lux 和 Godot 的相关色温，非物理模式不应用色温。
+`python misc/scripts/test_feng_runtime_contracts.py --editor /path/to/godot`
+以无 GPU 测试覆盖这两个模式及 Fog/Magic GI 的独立视口注册生命周期。
+
 FMagicGI 每帧将匹配世界中的可见 `DirectionalLight3D` 与选定环境投影到世界空间 SH。可在 Volume 的 `Sun` 或 `Lighting Environment` 属性中指定来源；留空时使用同一 World3D 的环境或 fallback environment。太阳颜色、方向、能量和间接能量变化会实时更新光照系数，不改烘焙传输。非物理光照单位按 Godot 引擎的缩放处理；物理光照模式读取光源 lux 强度。环境全景使用 `RenderingServer.environment_bake_panorama` 的背景/ambient 混合语义；环境属性或方向光变化时，天空 SH 最多每秒刷新四次。
 
 当前只将远距离方向光和环境全景纳入动态 SH；点光源和聚光灯不投影到此 PRT 光照场。未修改材质属性的时间驱动天空 shader 动画不会被自动识别。共享世界光照系数没有套用相机专属曝光，因此物理光照模式下的 Magic GI 不匹配各相机曝光归一化。

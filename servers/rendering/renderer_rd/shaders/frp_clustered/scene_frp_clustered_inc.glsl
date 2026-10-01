@@ -334,6 +334,11 @@ struct ImplementationData {
 	uint height_fog_pad2;
 	vec4 height_fog_camera_position;
 	vec4 height_fog_parameters[6];
+	uint atmosphere_enabled;
+	uint atmosphere_light_index0;
+	uint atmosphere_light_index1;
+	uint atmosphere_pad;
+	vec4 atmosphere_parameters[16];
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -474,6 +479,9 @@ layout(set = 1, binding = 38) uniform texture2D gbuffer_orm_buffer;
 layout(set = 1, binding = 39) uniform texture2D gbuffer_emission_buffer;
 #endif // USE_MULTIVIEW
 #endif // MODE_FRP_LIGHTING
+
+layout(set = 1, binding = 40) uniform texture2D atmosphere_optical_texture;
+layout(set = 1, binding = 41) uniform texture2D atmosphere_multiple_texture;
 
 #endif
 

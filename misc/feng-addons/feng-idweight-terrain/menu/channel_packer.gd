@@ -16,6 +16,7 @@
 # plugin (see `pack_textures_popup`).
 extends RefCounted
 
+const PackerSupport = preload("res://addons/feng-idweight-terrain/menu/channel_packer_support.gd")
 const WINDOW_SCENE: String = "res://addons/feng-idweight-terrain/menu/channel_packer.tscn"
 const TEMPLATE_PATH: String = "res://addons/feng-idweight-terrain/menu/channel_packer_import_template.txt"
 const DRAG_DROP_SCRIPT: String = "res://addons/feng-idweight-terrain/menu/channel_packer_dragdrop.gd"
@@ -344,19 +345,29 @@ func _show_message(p_level: int, p_text: String) -> void:
 			status_label.add_theme_color_override("font_color", Color(0.9, 0, 0))
 
 
-func _create_import_file(png_path: String) -> void:
+func _create_import_file(png_path: String) -> Error:
 	var dst_import_path: String = png_path + ".import"
 	var file: FileAccess = FileAccess.open(TEMPLATE_PATH, FileAccess.READ)
+	if file == null:
+		return FileAccess.get_open_error()
 	var import_content: String = file.get_as_text()
+	var read_error := file.get_error()
 	file.close()
+	if read_error != OK and read_error != ERR_FILE_EOF:
+		return read_error
 	import_content = import_content.replace(
 		"$SOURCE_FILE", png_path).replace(
 		"$HIGH_QUALITY", str(high_quality_checkbox.button_pressed)).replace(
 		"$GENERATE_MIPMAPS", str(generate_mipmaps_checkbox.button_pressed)
 	)
 	file = FileAccess.open(dst_import_path, FileAccess.WRITE)
+	if file == null:
+		return FileAccess.get_open_error()
 	file.store_string(import_content)
+	file.flush()
+	var write_error := file.get_error()
 	file.close()
+	return write_error
 
 
 func _on_pack_button_pressed() -> void:
@@ -409,22 +420,10 @@ func _on_save_file_selected(p_dst_path) -> void:
 		save_file_dialog.call_deferred("grab_focus")
 
 
-## Rodrigues' rotation taking `normal` onto +Z, as a Basis. `_align_normals()` uses it to re-aim a
-## normal map whose average direction is off the UV plane.
+## Stable shortest-arc alignment with the existing row-vector convention.
+## `_align_normals()` right-multiplies this basis to take the mean normal onto +Z.
 func _alignment_basis(normal: Vector3) -> Basis:
-	var up: Vector3 = Vector3(0, 0, 1)
-	var v: Vector3 = normal.cross(up)
-	var c: float = normal.dot(up)
-	var k: float = 1.0 / (1.0 + c)
-	
-	var vxy: float = v.x * v.y * k
-	var vxz: float = v.x * v.z * k
-	var vyz: float = v.y * v.z * k
-	
-	return Basis(Vector3(v.x * v.x * k + c, vxy - v.z, vxz + v.y),
-		Vector3(vxy + v.z, v.y * v.y * k + c, vyz - v.x),
-		Vector3(vxz - v.y, vyz + v.x, v.z * v.z * k + c)
-	)
+	return PackerSupport.alignment_basis(normal)
 
 
 func _set_normal_vector(source: Image, quiet: bool = false) -> void:
@@ -506,8 +505,10 @@ func _pack_textures(p_rgb_image: Image, p_a_image: Image, p_ao_image: Image, p_d
 		if output_image.detect_alpha() != Image.ALPHA_BLEND:
 			_show_message(WARN, "Warning, Alpha channel empty")
 
-		output_image.save_png(p_dst_path)
-		_create_import_file(p_dst_path)
+		var save_error := PackerSupport.save_pair(output_image.save_png.bind(p_dst_path), _create_import_file.bind(p_dst_path))
+		if save_error != OK:
+			_show_message(ERROR, "Failed to save packed texture/import settings: " + error_string(save_error))
+			return save_error
 		_show_message(INFO, "Packed to " + p_dst_path + ".")
 		return OK
 	else:

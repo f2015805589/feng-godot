@@ -8,6 +8,7 @@ extends EditorPlugin
 const Terrain3DUI: Script = preload("res://addons/feng-idweight-terrain/src/ui.gd")
 const ASSET_DOCK: String = "res://addons/feng-idweight-terrain/src/asset_dock.tscn"
 const VT_INSPECTOR_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/terrain_vt_inspector.gd")
+const EDITOR_BINDING: Script = preload("res://addons/feng-idweight-terrain/src/terrain_editor_binding.gd")
 
 # Editor Plugin
 var debug: int = 0 # Set in _edit()
@@ -75,14 +76,18 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if debug:
 		print("Terrain3DEditorPlugin: _exit_tree")
-	_disconnect_assets_signal()
+	_clear()
+	EDITOR_BINDING.release(_last_terrain, editor, self)
+	_last_terrain = null
 	if vt_inspector_plugin != null:
 		remove_inspector_plugin(vt_inspector_plugin)
 		vt_inspector_plugin = null
 	asset_dock.remove_dock(true)
 	asset_dock.queue_free()
 	ui.queue_free()
-	editor.free()
+	if is_instance_valid(editor):
+		editor.free()
+	editor = null
 
 	scene_changed.disconnect(_on_scene_changed)
 	godot_editor_window.focus_entered.disconnect(_on_godot_focus_entered)
@@ -149,7 +154,7 @@ func _edit(p_object: Object) -> void:
 		if p_object == terrain:
 			_bind_assets_signal(p_object)
 			return
-		_disconnect_assets_signal()
+		_clear(false)
 		terrain = p_object
 		_last_terrain = terrain
 		terrain.set_plugin(self)
@@ -198,16 +203,21 @@ func _is_editing_terrain_asset() -> bool:
 	return obj is Terrain3DTextureAsset or obj is Terrain3DMeshAsset or obj is Terrain3DAssets
 
 
-func _clear() -> void:
+func _clear(p_reset_tool: bool = true) -> void:
 	_disconnect_assets_signal()
 	if is_instance_valid(asset_dock):
 		asset_dock.unbind_assets()
-	if is_terrain_valid():
+	# Picker cleanup still needs the old selection's assets. It also disconnects
+	# the frame callback if the selected terrain was already removed or freed.
+	if is_instance_valid(ui):
+		ui.clear_picking()
+	if p_reset_tool and is_terrain_valid() and is_instance_valid(editor):
 		editor.set_tool(Terrain3DEditor.TOOL_MAX)
 		editor.set_operation(Terrain3DEditor.OP_MAX)
-		terrain = null
+	EDITOR_BINDING.release(terrain, editor, self)
+	if is_instance_valid(editor):
 		editor.set_terrain(null)
-		ui.clear_picking()
+	terrain = null
 
 
 func _bind_assets_signal(p_terrain: Terrain3D) -> void:

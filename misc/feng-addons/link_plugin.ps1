@@ -3,7 +3,9 @@
 #   powershell -ExecutionPolicy Bypass -File link_plugin.ps1 -ProjectPath "C:\path\to\new_project"
 #   powershell -ExecutionPolicy Bypass -File link_plugin.ps1 -ProjectPath "C:\path\to\new_project" -SourcePath "E:\somewhere\feng-idweight-terrain"
 #
-# Replaces the project's addons\feng-idweight-terrain with a junction pointing
+# Links a missing project addons\feng-idweight-terrain to the source directory.
+# Existing files, ordinary directories and links elsewhere are never replaced.
+# Creates a junction pointing
 # to the single source copy. After this, edits and DLL rebuilds take effect
 # immediately (restart the Godot editor to reload the plugin).
 #
@@ -49,14 +51,17 @@ if (-not (Test-Path $AddonsDir)) {
     New-Item -ItemType Directory -Path $AddonsDir | Out-Null
 }
 
-if (Test-Path $Link) {
-    $item = Get-Item $Link -Force
-    if ($item.LinkType -eq "Junction") {
-        Write-Host "OK: already a junction, nothing to do: $Link" -ForegroundColor Green
+$item = Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
+if ($null -ne $item) {
+    $target = @($item.Target)[0]
+    if ($item.LinkType -eq "Junction" -and $target -and
+        [IO.Path]::GetFullPath($target) -eq [IO.Path]::GetFullPath($Source)) {
+        Write-Host "OK: already linked to the requested source: $Link" -ForegroundColor Green
         exit 0
     }
-    Write-Host "Old copy detected, replacing with junction..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force $Link
+    Write-Host "ERROR: keeping existing addon untouched: $Link" -ForegroundColor Red
+    Write-Host "Move local changes somewhere safe and remove the conflict yourself before linking." -ForegroundColor Yellow
+    exit 1
 }
 
 cmd /c mklink /J "`"$Link`"" "`"$Source`"" | Out-Null

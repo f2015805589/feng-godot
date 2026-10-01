@@ -20,7 +20,7 @@ const SKY_RUNTIME_PROBE_INTERVAL_MSEC := 500
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
 static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
-static var _debanding_original: Dictionary = {} ## viewport id -> use_debanding before fog activated
+static var _debanding_original: Dictionary = {} ## viewport id -> {viewport: WeakRef, enabled: bool}
 static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef}
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
@@ -28,6 +28,7 @@ static var _sequence := 0
 static var _last_frame := -1
 static var _worlds_queried := false
 static var _worlds: GDScript = null
+static var _viewport_owner := RefCounted.new() ## Lease for public calls without an explicit owner
 static var _next_sky_runtime_probe_msec := 0
 static var _sky_runtime: GDScript = null
 
@@ -87,29 +88,32 @@ static func register(fog: FengHeightFog) -> void:
 	if entry == null or entry["node"].get_ref() != fog:
 		_sequence += 1
 		_fogs[id] = {"node": weakref(fog), "sequence": _sequence}
-	register_viewport(fog.get_viewport())
+	register_viewport(fog.get_viewport(), fog)
 
 static func unregister(fog: FengHeightFog) -> void:
+	var worlds := _snapshot_worlds()
+	if worlds != null:
+		worlds.unregister_owner(fog)
 	_fogs.erase(fog.get_instance_id())
 	_publish()
 
-static func register_viewport(viewport: Viewport) -> void:
+static func register_viewport(viewport: Viewport, owner: Object = null) -> void:
 	var worlds := _snapshot_worlds()
 	if worlds != null:
-		worlds.register_viewport(viewport)
+		worlds.register_viewport(viewport, owner if owner != null else _viewport_owner)
 
-static func unregister_viewport(viewport: Viewport) -> void:
+static func unregister_viewport(viewport: Viewport, owner: Object = null) -> void:
 	if viewport != null and is_instance_valid(viewport):
 		var id := viewport.get_instance_id()
 		_restore_debanding(id, viewport)
 		var worlds := _snapshot_worlds()
 		if worlds != null:
-			worlds.unregister_viewport(viewport)
+			worlds.unregister_viewport(viewport, owner if owner != null else _viewport_owner)
 		_publish()
 
 static func _restore_debanding(id: int, viewport: Viewport) -> void:
 	if _debanding_original.has(id):
-		viewport.use_debanding = _debanding_original[id]
+		viewport.use_debanding = _debanding_original[id]["enabled"]
 		_debanding_original.erase(id)
 
 ## The viewport's final tonemap knows its output bit depth and applies dither
@@ -122,6 +126,9 @@ static func _sync_debanding(selected: Dictionary) -> void:
 	var viewports: Dictionary = worlds.viewports()
 	for id in _debanding_original.keys():
 		if not viewports.has(id):
+			var original_viewport: Viewport = _debanding_original[id]["viewport"].get_ref()
+			if original_viewport != null:
+				_restore_debanding(id, original_viewport)
 			_debanding_original.erase(id)
 	for id in viewports.keys():
 		var reference: WeakRef = viewports[id]
@@ -132,7 +139,7 @@ static func _sync_debanding(selected: Dictionary) -> void:
 		var fog_active := world != null and selected.has(world.get_instance_id())
 		if fog_active:
 			if not _debanding_original.has(id):
-				_debanding_original[id] = viewport.use_debanding
+				_debanding_original[id] = {"viewport": weakref(viewport), "enabled": viewport.use_debanding}
 				viewport.use_debanding = true
 		else:
 			_restore_debanding(id, viewport)

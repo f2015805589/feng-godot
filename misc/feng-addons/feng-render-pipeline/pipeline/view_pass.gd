@@ -23,6 +23,10 @@ func configure(pass_source: FengPass, executor: FengPass, active: bool) -> void:
 func get_contract_source() -> FengPass:
 	return execution.get_contract_source() if execution != null else source.get_contract_source()
 
+func _frp_prepare(ctx: FRPPassContext) -> void:
+	if execution != null and execution.has_method("_frp_prepare"):
+		execution.call("_frp_prepare", ctx)
+
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if execution != null:
 		execution._frp_execute(ctx)

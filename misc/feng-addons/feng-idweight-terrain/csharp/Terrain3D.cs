@@ -38,7 +38,7 @@ public partial class Terrain3D : Node3D
 #if DEBUG
 		var expectedType = typeof(Terrain3D);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 

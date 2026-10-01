@@ -71,6 +71,8 @@ SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP
 库里的其它模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
 **Add Pass from Library** 添加；它们默认关闭，打开条目即生效。
 
+Blur 和 Bloom-lite 的缩放纹理始终覆盖完整画面。FXAA 使用专用 `FengFXAAPass`，先把场景色复制到管线管理的临时纹理，再读取邻域，避免同一 dispatch 读写场景色产生反馈。该复制仅在启用 FXAA 时执行，不增加默认 Pass。旧资源中仍使用原始默认 shader 和纹理绑定的 `library:fxaa` 会在库同步时安全替换，保留参数、开关、稳定 ID 和顺序；自定义 shader、子类或修改过的绑定不会自动迁移。
+
 `Magic GI` 在 Lighting 后、Sky 前将 surface PRT 的传输系数与当前太阳/环境 SH 点积，作为漫反射间接光加回 HDR；它只使用当前视口匹配的最新有效烘焙，动态光照变化不需要重烘焙。没有有效烘焙或当前 viewport 不匹配时，该 pass 清零自己的诊断纹理并保持画面不变。`Debug Buffers` 默认关闭且不分配输出，可切换到 albedo、view-space normal、AO、roughness、metallic、motion vectors 或 Magic GI 贡献；启用时在 Post Process 后直接显示所选原始缓冲。
 
 `Eye Adaptation` 在 TAA 后测量 HDR 场景色，位于 native Bloom 和 Color Grade 前；默认顺序及依赖校验都保证 Eye Adaptation 先于 Bloom。Bloom 条目负责执行 Environment Glow 的模糊准备，Environment 的 `glow_enabled`、levels、strength、blend mode、intensity 与 glow map 继续配置具体效果；关闭 Bloom 条目会禁用这帧的 Environment Glow 合成。FRP 默认在 Post Process 前准备 Bloom，因此 Glow 使用 DoF 处理前的 HDR 颜色；FRP 的无资源默认调度也使用这个顺序。其它渲染器的旧 Post Process helper 仍按 DoF 后 Glow 的顺序运行。没有 FRP 管线资源时，引擎原生 Glow 路径照常工作。UE 也是先计算曝光，再做 Bloom，并在 Tonemap 中应用曝光和颜色分级。该 Pass 自身有两个全局开关：`extend_default_luminance_range` 切换 UE 的传统亮度范围与 EV100 范围，`pre_exposure` 用上一帧已完成的曝光值预缩放场景光照。相机曝光参数放在该 pass 的 Volume 模块中，包括 Histogram / Basic / Manual 测光、Low/High Percent、亮度或 EV100 上下限、Speed Up/Down、曝光补偿、补偿曲线、测光遮罩，以及手动模式的光圈、快门和 ISO。`CurveTexture` 的 X 轴 0 到 1 对应 UE 默认的 -10 到 20 EV100 曲线区间。开启项目的物理光照单位后，FRP 的点光、聚光与矩形光按 UE 的流明立体角和 π 系数换算。

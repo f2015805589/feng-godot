@@ -9,6 +9,28 @@
 
 #include "scene_frp_clustered_inc.glsl"
 
+// Per-vertex lighting uses bounded direct optical integration, avoiding
+// vertex-stage LUT bindings while retaining exact selected-light identity.
+#ifndef MODE_RENDER_DEPTH
+#define ATMO_PARAMS implementation_data.atmosphere_parameters
+#define ATMO_DIRECT_ONLY
+#include "atmosphere_inc.glsl"
+#undef ATMO_PARAMS
+#undef ATMO_DIRECT_ONLY
+vec3 frp_atmospheric_light_factor(uint index, vec3 camera_to_receiver_m) {
+	if (implementation_data.atmosphere_enabled == 0u) {
+		return vec3(1.0);
+	}
+	if (index == implementation_data.atmosphere_light_index0) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 0);
+	}
+	if (index == implementation_data.atmosphere_light_index1) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 1);
+	}
+	return vec3(1.0);
+}
+#endif
+
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
@@ -638,13 +660,13 @@ void vertex_shader(vec3 vertex_input,
 			}
 			if (i == 0) {
 				light_compute_vertex(normal, directional_lights.data[0].direction, view,
-						directional_lights.data[0].color * directional_lights.data[0].energy,
+						directional_lights.data[0].color * directional_lights.data[0].energy * frp_atmospheric_light_factor(0u, mat3(inv_view_matrix) * vertex),
 						true, roughness,
 						directional_diffuse,
 						directional_specular);
 			} else {
 				light_compute_vertex(normal, directional_lights.data[i].direction, view,
-						directional_lights.data[i].color * directional_lights.data[i].energy,
+						directional_lights.data[i].color * directional_lights.data[i].energy * frp_atmospheric_light_factor(i, mat3(inv_view_matrix) * vertex),
 						true, roughness,
 						diffuse_light_interp.rgb,
 						specular_light_interp.rgb);
@@ -879,6 +901,29 @@ void main() {
 #include "../half_inc.glsl"
 
 #include "scene_frp_clustered_inc.glsl"
+
+#ifndef MODE_RENDER_DEPTH
+#define ATMO_PARAMS implementation_data.atmosphere_parameters
+#define ATMO_OPTICAL sampler2D(atmosphere_optical_texture, SAMPLER_LINEAR_CLAMP)
+#define ATMO_MULTIPLE sampler2D(atmosphere_multiple_texture, SAMPLER_LINEAR_CLAMP)
+#include "atmosphere_inc.glsl"
+#undef ATMO_PARAMS
+#undef ATMO_OPTICAL
+#undef ATMO_MULTIPLE
+vec3 frp_atmospheric_light_factor(uint index, vec3 camera_to_receiver_m) {
+	if (implementation_data.atmosphere_enabled == 0u) {
+		return vec3(1.0);
+	}
+	if (index == implementation_data.atmosphere_light_index0) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 0);
+	}
+	if (index == implementation_data.atmosphere_light_index1) {
+		return frp_atmo_surface_transmittance(camera_to_receiver_m, 1);
+	}
+	return vec3(1.0);
+}
+#endif
+
 
 /* Varyings */
 
@@ -2544,9 +2589,9 @@ void fragment_shader(in SceneData scene_data) {
 
 			light_compute(normal, directional_lights.data[i].direction, normalize(view), size_A,
 #ifndef DEBUG_DRAW_PSSM_SPLITS
-					directional_lights.data[i].color * directional_lights.data[i].energy,
+					directional_lights.data[i].color * directional_lights.data[i].energy * frp_atmospheric_light_factor(i, mat3(inv_view_matrix) * vertex),
 #else
-					directional_lights.data[i].color * directional_lights.data[i].energy * tint,
+					directional_lights.data[i].color * directional_lights.data[i].energy * tint * frp_atmospheric_light_factor(i, mat3(inv_view_matrix) * vertex),
 #endif
 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
@@ -2955,6 +3000,15 @@ void fragment_shader(in SceneData scene_data) {
 	fog = vec4(unpackHalf2x16(fog_rg), unpackHalf2x16(fog_ba));
 #endif //!FOG_DISABLED
 
+	vec3 atmosphere_radiance = vec3(0.0);
+	vec3 atmosphere_transmission = vec3(1.0);
+	if (implementation_data.atmosphere_enabled != 0u) {
+		vec3 eye_offset = vec3(0.0);
+#ifdef USE_MULTIVIEW
+		eye_offset = scene_data.eye_offset[ViewIndex].xyz;
+#endif
+		frp_atmo_aerial(mat3(inv_view_matrix) * (vertex - eye_offset), mat3(inv_view_matrix) * eye_offset, atmosphere_radiance, atmosphere_transmission);
+	}
 	vec4 height_fog = vec4(0.0, 0.0, 0.0, 1.0);
 	if (implementation_data.height_fog_enabled != 0u) {
 		vec3 eye_offset_for_fog = vec3(0.0);
@@ -2986,6 +3040,8 @@ void fragment_shader(in SceneData scene_data) {
 	diffuse_buffer.rgb = diffuse_buffer.rgb * fog.a + fog.rgb;
 	specular_buffer.rgb = specular_buffer.rgb * fog.a;
 #endif //!FOG_DISABLED
+	diffuse_buffer.rgb = diffuse_buffer.rgb * atmosphere_transmission + atmosphere_radiance;
+	specular_buffer.rgb *= atmosphere_transmission;
 	diffuse_buffer.rgb = diffuse_buffer.rgb * height_fog.a + height_fog.rgb;
 	specular_buffer.rgb *= height_fog.a;
 	diffuse_buffer.rgb *= implementation_data.pre_exposure;
@@ -3005,6 +3061,7 @@ void fragment_shader(in SceneData scene_data) {
 #ifndef FOG_DISABLED
 	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
 #endif //!FOG_DISABLED
+	frag_color.rgb = frag_color.rgb * atmosphere_transmission + atmosphere_radiance;
 	frag_color.rgb = frag_color.rgb * height_fog.a + height_fog.rgb;
 	frag_color.rgb *= implementation_data.pre_exposure;
 

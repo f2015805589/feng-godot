@@ -831,6 +831,13 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
 	scene_state.ubo.pre_exposure = current_pre_exposure;
+	scene_state.ubo.atmosphere_enabled = 0;
+	scene_state.ubo.atmosphere_light_indices[0] = UINT32_MAX;
+	scene_state.ubo.atmosphere_light_indices[1] = UINT32_MAX;
+	scene_state.ubo.atmosphere_pad = 0;
+	memset(scene_state.ubo.atmosphere_parameters, 0, sizeof(scene_state.ubo.atmosphere_parameters));
+	current_atmosphere_optical_texture = RID();
+	current_atmosphere_multiple_texture = RID();
 	scene_state.ubo.height_fog_enabled = 0;
 	memset(scene_state.ubo.height_fog_pad, 0, sizeof(scene_state.ubo.height_fog_pad));
 	memset(scene_state.ubo.height_fog_camera_position, 0, sizeof(scene_state.ubo.height_fog_camera_position));
@@ -886,6 +893,44 @@ void RenderFRPClustered::_setup_height_fog(uint32_t p_uniform_buffer_index, cons
 	scene_state.ubo.height_fog_enabled = 1;
 	memcpy(scene_state.ubo.height_fog_camera_position, p_parameters.ptr(), sizeof(scene_state.ubo.height_fog_camera_position));
 	memcpy(scene_state.ubo.height_fog_parameters, p_parameters.ptr() + 4, sizeof(scene_state.ubo.height_fog_parameters));
+	RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+}
+
+void RenderFRPClustered::_setup_atmosphere(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data) {
+	const PackedFloat32Array parameters = p_context->get_atmosphere_parameters();
+	if (parameters.size() != 64) {
+		return;
+	}
+	ERR_FAIL_INDEX(p_uniform_buffer_index, scene_state.implementation_uniform_buffers.size());
+	scene_state.ubo.atmosphere_enabled = 1;
+	memcpy(scene_state.ubo.atmosphere_parameters, parameters.ptr(), sizeof(scene_state.ubo.atmosphere_parameters));
+	current_atmosphere_optical_texture = p_context->get_atmosphere_optical_texture();
+	current_atmosphere_multiple_texture = p_context->get_atmosphere_multiple_texture();
+	// Match the exact LightStorage::update_light_buffers directional filtering.
+	// A direction comparison is ambiguous when two authored lights align.
+	RendererRD::LightStorage *storage = RendererRD::LightStorage::get_singleton();
+	uint32_t directional_index = 0;
+	if (p_render_data->lights) {
+		for (uint32_t i = 0; i < p_render_data->lights->size(); i++) {
+			RID instance = (*p_render_data->lights)[i];
+			if (!storage->owns_light_instance(instance)) {
+				continue;
+			}
+			RID light = storage->light_instance_get_base_light(instance);
+			if (!storage->owns_light(light) || storage->light_get_type(light) != RSE::LIGHT_DIRECTIONAL || storage->light_directional_get_sky_mode(light) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+				continue;
+			}
+			if (directional_index >= storage->get_max_directional_lights()) {
+				break;
+			}
+			for (int slot = 0; slot < 2; slot++) {
+				if (light == p_context->get_atmosphere_light_rid(slot)) {
+					scene_state.ubo.atmosphere_light_indices[slot] = directional_index;
+				}
+			}
+			directional_index++;
+		}
+	}
 	RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
 }
 
@@ -2425,6 +2470,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				_update_render_base_uniform_set();
 
 				opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+				_setup_atmosphere(opaque_pass_uniform_buffer_index, pass_context, p_render_data);
 				opaque_pass_uniforms_ready = true;
 
 				{
@@ -2540,6 +2586,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RID fallback_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(fallback_color_pass_flags) : color_framebuffer;
 
 					uint32_t fallback_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+					_setup_atmosphere(fallback_pass_uniform_buffer_index, pass_context, p_render_data);
 					PackedFloat32Array height_fog_parameters = pass_context->get_height_fog_parameters();
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(fallback_pass_uniform_buffer_index, height_fog_parameters);
@@ -2714,6 +2761,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
 					uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+					_setup_atmosphere(transparent_pass_uniform_buffer_index, pass_context, p_render_data);
 					PackedFloat32Array height_fog_parameters = pass_context->get_height_fog_parameters();
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(transparent_pass_uniform_buffer_index, height_fog_parameters);
@@ -2880,6 +2928,25 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			[this](RID p_texture) { current_eye_adaptation_texture = p_texture; });
 
 	if (explicit_pipeline) {
+		// Optional metadata preparation runs before lighting without adding a
+		// rendering pass or changing authored operation order. Hooks must not draw.
+		for (int slot = 0; slot < pipeline.size(); slot++) {
+			const int token = pipeline[slot];
+			const int64_t index = -int64_t(token) - 1;
+			if (token >= 0 || index >= pipeline_effects.size()) {
+				continue;
+			}
+			RID effect = pipeline_effects[index];
+			if (!pipeline_storage->is_compositor_effect(effect) || !pipeline_storage->compositor_effect_get_enabled(effect)) {
+				continue;
+			}
+			Object *object = pipeline_storage->compositor_effect_get_callback(effect).get_object();
+			if (object && object->has_method("_frp_prepare")) {
+				Array arguments;
+				arguments.push_back(pass_context);
+				object->callv("_frp_prepare", arguments);
+			}
+		}
 		for (int slot = 0; slot < pipeline.size(); slot++) {
 			const int token = pipeline[slot];
 			const String pass_name = pipeline_names.size() == pipeline.size() && !pipeline_names[slot].is_empty() ? pipeline_names[slot] : (token >= 0 ? String(FRPPipelineSpec::native_pass_name(token)) : "Custom Pass " + itos(-int64_t(token) - 1));
@@ -3967,6 +4034,20 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 			vfog = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 		}
 		u.append_id(vfog);
+		uniforms.push_back(u);
+	}
+
+	// Shared atmospheric LUTs are frame-local and fall back to a valid black
+	// texture. Their enable lanes prevent fallback data affecting transport.
+	for (int slot = 0; slot < 2; slot++) {
+		RID texture = slot == 0 ? current_atmosphere_optical_texture : current_atmosphere_multiple_texture;
+		if (!texture.is_valid() || !RD::get_singleton()->texture_is_valid(texture)) {
+			texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		RD::Uniform u;
+		u.binding = 40 + slot;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(texture);
 		uniforms.push_back(u);
 	}
 

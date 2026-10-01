@@ -23,6 +23,7 @@ static var _last_frame := -1
 static var _next_viewport_scan := 0
 static var _worlds_queried := false
 static var _worlds: GDScript = null
+static var _viewport_owner := RefCounted.new() ## Lease for public calls without an explicit owner
 
 static func _snapshot_worlds() -> GDScript:
 	if not _worlds_queried:
@@ -41,23 +42,26 @@ static func register(volume: FMagicGIVolume) -> void:
 		_publish_sequence += 1
 		state.published_sequence = _publish_sequence
 		state.data_key = ""
-	register_viewport(volume.get_viewport())
+	register_viewport(volume.get_viewport(), volume)
 
 static func unregister(volume: FMagicGIVolume) -> void:
+	var worlds := _snapshot_worlds()
+	if worlds != null:
+		worlds.unregister_owner(volume)
 	var id := volume.get_instance_id()
 	_registry.erase(id)
 	_publish()
 
-static func register_viewport(viewport: Viewport) -> void:
+static func register_viewport(viewport: Viewport, owner: Object = null) -> void:
 	var worlds := _snapshot_worlds()
 	if worlds != null:
-		worlds.register_viewport(viewport)
+		worlds.register_viewport(viewport, owner if owner != null else _viewport_owner)
 
-static func unregister_viewport(viewport: Viewport) -> void:
+static func unregister_viewport(viewport: Viewport, owner: Object = null) -> void:
 	if viewport != null and is_instance_valid(viewport):
 		var worlds := _snapshot_worlds()
 		if worlds != null:
-			worlds.unregister_viewport(viewport)
+			worlds.unregister_viewport(viewport, owner if owner != null else _viewport_owner)
 		_publish()
 
 static func publish(volume: FMagicGIVolume) -> void:
@@ -126,11 +130,11 @@ static func _refresh_viewports() -> void:
 		if volume == null or not volume.is_inside_tree():
 			continue
 		if worlds != null:
-			worlds.register_viewport(volume.get_viewport())
+			worlds.register_viewport(volume.get_viewport(), volume)
 			var root: Node = volume
 			while root.get_parent() != null and not root.get_parent() is Viewport:
 				root = root.get_parent()
-			worlds.scan(root)
+			worlds.scan(root, volume)
 	if worlds != null:
 		worlds.prune()
 

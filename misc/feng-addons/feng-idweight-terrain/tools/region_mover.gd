@@ -14,6 +14,8 @@
 extends Terrain3D
 
 
+const MoveTransaction = preload("res://addons/feng-idweight-terrain/tools/region_move_transaction.gd")
+
 @export var offset: Vector2i
 @export_tool_button("Run") var run = start_rename
 
@@ -21,32 +23,28 @@ extends Terrain3D
 func start_rename() -> void:
 	if offset == Vector2i.ZERO:
 		return
-		
-	var dir_name: String = data_directory
-	data_directory = ""
-	var dir := DirAccess.open(dir_name)
-	if not dir:
-		print("An error occurred when trying to access the path: ", data_directory)
+	var directory := data_directory
+	var dir := DirAccess.open(directory)
+	if dir == null:
+		push_error("Cannot open terrain directory: " + directory)
 		return
-
-	var affected_files: PackedStringArray
-	var files: PackedStringArray = dir.get_files()
-	for file_name in files:
-		if file_name.match("terrain3d*.res") and not dir.current_is_dir():
-			var region_loc: Vector2i = Terrain3DUtil.filename_to_location(file_name)
-			var new_loc: Vector2i = region_loc + offset
-			if new_loc.x < -16 or new_loc.x > 15 or new_loc.y < -16 or new_loc.y > 15:
-				push_error("New location %.0v out of bounds for region %.0v. Aborting" % [ new_loc, region_loc ])
-				return
-			var new_name: String = "tmp_" + Terrain3DUtil.location_to_filename(new_loc)
-			dir.rename(file_name, new_name)
-			affected_files.push_back(new_name)
-			print("File: %s renamed to: %s" % [ file_name, new_name ])
-				
-	for file_name in affected_files:
-		var new_name: String = file_name.trim_prefix("tmp_")
-		dir.rename(file_name, new_name)
-		print("File: %s renamed to: %s" % [ file_name, new_name ])
-		
-	data_directory = dir_name
-	EditorInterface.get_resource_filesystem().scan()	
+	var exists := func(path: String) -> bool:
+		return dir.file_exists(path) or dir.dir_exists(path) or dir.is_link(path)
+	# Planning validates every filename, bound and collision before detaching
+	# the terrain or renaming any file. Existing files are never overwritten.
+	var plan := MoveTransaction.build_plan(dir.get_files(), offset,
+		Terrain3DUtil.filename_to_location, Terrain3DUtil.location_to_filename, exists)
+	if plan["error"] != OK:
+		push_error(plan["message"])
+		return
+	data_directory = ""
+	var result := MoveTransaction.execute(plan, dir.rename, exists)
+	# Restore the component even after a failed rename or incomplete rollback.
+	data_directory = directory
+	EditorInterface.get_resource_filesystem().scan()
+	if result["error"] != OK:
+		push_error(str(result["message"]) + ": " + error_string(result["error"]))
+		if not bool(result.get("rollback_complete", true)):
+			push_error("Rollback was incomplete. No files were deleted; recover these names before retrying: " + str(result["recovery"]))
+		return
+	print("Moved %d terrain region files in %s" % [result["moved"], directory])

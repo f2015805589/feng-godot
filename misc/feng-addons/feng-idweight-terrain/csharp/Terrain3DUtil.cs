@@ -38,7 +38,7 @@ public partial class Terrain3DUtil : GodotObject
 #if DEBUG
 		var expectedType = typeof(Terrain3DUtil);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 
@@ -246,14 +246,14 @@ public partial class Terrain3DUtil : GodotObject
 	public new static Vector2 GetMinMax(Image image) => 
 		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.GetMinMax, [image]).As<Vector2>();
 
-	public new static Image GetThumbnail(Image image, Vector2I size = default) => 
-		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.GetThumbnail, [image, size]).As<Image>();
+	public new static Image GetThumbnail(Image image, Vector2I? size = null) =>
+		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.GetThumbnail, [image, size ?? new Vector2I(256, 256)]).As<Image>();
 
 	public new static Image GetFilledImage(Vector2I size, Color color, bool createMipmaps, Image.Format format) => 
 		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.GetFilledImage, [size, color, createMipmaps, Variant.From(format)]).As<Image>();
 
-	public new static Image LoadImage(string fileName, long cacheMode = 0, Vector2 r16HeightRange = default, Vector2I r16Size = default) => 
-		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.LoadImage, [fileName, cacheMode, r16HeightRange, r16Size]).As<Image>();
+	public new static Image LoadImage(string fileName, long cacheMode = 0, Vector2? r16HeightRange = null, Vector2I r16Size = default) =>
+		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.LoadImage, [fileName, cacheMode, r16HeightRange ?? new Vector2(0, 255), r16Size]).As<Image>();
 
 	public new static Image PackImage(Image srcRgb, Image srcA, Image srcAo, bool invertGreen = false, bool invertAlpha = false, bool normalizeAlpha = false, long alphaChannel = 0, long aoChannel = 0) => 
 		ClassDB.ClassCallStatic(NativeName, GDExtensionMethodName.PackImage, [srcRgb, srcA, srcAo, invertGreen, invertAlpha, normalizeAlpha, alphaChannel, aoChannel]).As<Image>();

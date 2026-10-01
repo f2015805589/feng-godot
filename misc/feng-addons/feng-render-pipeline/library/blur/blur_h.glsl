@@ -16,7 +16,8 @@ void main() {
 	}
 	float radius = max(params.radius.x, 0.0);
 	vec2 src_size = vec2(textureSize(src_image, 0));
-	vec2 uv = (vec2(pixel) + 0.5) / src_size;
+	// Normalize by destination size: source and output may have different scales.
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 	vec2 texel = 1.0 / src_size;
 	vec4 sum = vec4(0.0);
 	float weight_sum = 0.0;

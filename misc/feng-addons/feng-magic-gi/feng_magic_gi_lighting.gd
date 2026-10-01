@@ -15,6 +15,7 @@ var _next_scan := 0
 var _next_sky_update := 0
 var _environment_signature := 0
 var _source_signature := 0
+var _lighting_signature := 0
 var _sky_sh := PackedFloat32Array()
 var _sky_dirty := true
 var _environment: Environment
@@ -47,6 +48,13 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 		_source_signature = current_source_signature
 		_sky_dirty = true
 		_result_dirty = true
+	# The panorama sees all scene lights, while an explicit sun selects only one
+	# direct SH source. Track that selection separately: switching between already
+	# scanned lights leaves the panorama fingerprint unchanged.
+	var current_lighting_signature := hash([_source_fingerprint(lights, volume.get_world_3d()), physical_units])
+	if current_lighting_signature != _lighting_signature:
+		_lighting_signature = current_lighting_signature
+		_result_dirty = true
 	if environment != null and _update_sky(environment, now):
 		_result_dirty = true
 	if not _result_dirty:
@@ -65,6 +73,7 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 		var energy := light.light_energy * light.light_indirect_energy
 		if physical_units:
 			energy *= float(light.get("light_intensity_lux"))
+			color *= light.get_correlated_color().srgb_to_linear()
 		else:
 			energy *= PI # Matches light_storage.cpp's non-physical DirectionalLightData scale.
 		if light.light_negative:
@@ -186,7 +195,7 @@ static func _source_fingerprint(lights: Array[DirectionalLight3D], world: World3
 	for light in lights:
 		if not is_instance_valid(light) or not light.is_inside_tree() or light.get_world_3d() != world:
 			continue
-		values.append([light.global_transform, light.light_color, light.light_energy,
+		values.append([light.global_transform, light.light_color, light.get_correlated_color(), light.light_energy,
 				light.light_indirect_energy, light.get("light_intensity_lux"), light.light_negative,
 				light.is_visible_in_tree()])
 	return hash(values)

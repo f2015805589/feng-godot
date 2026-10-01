@@ -38,7 +38,7 @@ public partial class Terrain3DAssets : Resource
 #if DEBUG
 		var expectedType = typeof(Terrain3DAssets);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 
@@ -292,8 +292,8 @@ public partial class Terrain3DAssets : Resource
 	public new long GetMeshCount() => 
 		Call(GDExtensionMethodName.GetMeshCount, []).As<long>();
 
-	public new void CreateMeshThumbnails(long id = -1, Vector2I size = default, bool force = false) => 
-		Call(GDExtensionMethodName.CreateMeshThumbnails, [id, size, force]);
+	public new void CreateMeshThumbnails(long id = -1, Vector2I? size = null, bool force = false) =>
+		Call(GDExtensionMethodName.CreateMeshThumbnails, [id, size ?? new Vector2I(512, 512), force]);
 
 	public new void UpdateMeshList() => 
 		Call(GDExtensionMethodName.UpdateMeshList, []);

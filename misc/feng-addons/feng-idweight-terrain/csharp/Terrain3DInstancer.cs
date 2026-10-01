@@ -38,7 +38,7 @@ public partial class Terrain3DInstancer : GodotObject
 #if DEBUG
 		var expectedType = typeof(Terrain3DInstancer);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 
@@ -162,8 +162,8 @@ public partial class Terrain3DInstancer : GodotObject
 	public new void RemoveInstances(Vector3 globalPosition, Godot.Collections.Dictionary @params) => 
 		Call(GDExtensionMethodName.RemoveInstances, [globalPosition, @params]);
 
-	public new void AddMultimesh(long meshId, MultiMesh multimesh, Transform3D transform = default, bool update = true) => 
-		Call(GDExtensionMethodName.AddMultimesh, [meshId, multimesh, transform, update]);
+	public new void AddMultimesh(long meshId, MultiMesh multimesh, Transform3D? transform = null, bool update = true) =>
+		Call(GDExtensionMethodName.AddMultimesh, [meshId, multimesh, transform ?? Transform3D.Identity, update]);
 
 	public new void AddTransforms(long meshId, Godot.Collections.Array transforms, Color[] colors = default, bool update = true) => 
 		Call(GDExtensionMethodName.AddTransforms, [meshId, transforms, colors, update]);
@@ -180,8 +180,8 @@ public partial class Terrain3DInstancer : GodotObject
 	public new long GetClosestMeshId(Vector3 globalPosition) => 
 		Call(GDExtensionMethodName.GetClosestMeshId, [globalPosition]).As<long>();
 
-	public new void UpdateMmis(long meshId = -1, Vector2I regionLocation = default, bool rebuildAll = false) => 
-		Call(GDExtensionMethodName.UpdateMmis, [meshId, regionLocation, rebuildAll]);
+	public new void UpdateMmis(long meshId = -1, Vector2I? regionLocation = null, bool rebuildAll = false) =>
+		Call(GDExtensionMethodName.UpdateMmis, [meshId, regionLocation ?? new Vector2I(int.MaxValue, int.MaxValue), rebuildAll]);
 
 	public new void SwapIds(long srcId, long destId) => 
 		Call(GDExtensionMethodName.SwapIds, [srcId, destId]);

@@ -3,6 +3,7 @@ extends RefCounted
 ## Immutable-by-convention optical columns, shared only as copy-on-write bytes.
 ## Each provider creates its own Image/Texture from these bytes. No sun, color,
 ## extinction, exposure or world state is part of the table.
+## RGB stores Rayleigh, Mie and piecewise-linear ozone density columns.
 
 const WIDTH := 128
 const HEIGHT := 64
@@ -16,12 +17,18 @@ const MAX_HEIGHT_TO_SCALE := 64.0
 
 
 static func supports_settings(settings: Dictionary) -> bool:
-	return float(settings["atmosphere_height_km"]) / minf(settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"]) <= MAX_HEIGHT_TO_SCALE
+	var height: float = settings["atmosphere_height_km"]
+	var exponential_supported := height / minf(settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"]) <= MAX_HEIGHT_TO_SCALE
+	var maximum_absorption_slope := maxf(absf(settings["absorption_layer0_linear_term"]), absf(settings["absorption_layer1_linear_term"]))
+	return exponential_supported and height * maximum_absorption_slope <= MAX_HEIGHT_TO_SCALE
 
 
 static func geometry_signature(settings: Dictionary) -> Array:
 	return [settings["planet_radius_km"], settings["atmosphere_height_km"],
-		settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"]]
+		settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"],
+		settings["absorption_density_layer_width_km"], settings["absorption_layer0_linear_term"],
+		settings["absorption_layer0_constant_term"], settings["absorption_layer1_linear_term"],
+		settings["absorption_layer1_constant_term"]]
 
 
 static func make_image(settings: Dictionary) -> Image:
@@ -30,7 +37,7 @@ static func make_image(settings: Dictionary) -> Image:
 		_cached_bytes = _build_columns(signature).to_byte_array()
 		_cached_signature = signature
 		_build_count += 1
-	return Image.create_from_data(WIDTH, HEIGHT, false, Image.FORMAT_RGF, _cached_bytes)
+	return Image.create_from_data(WIDTH, HEIGHT, false, Image.FORMAT_RGBF, _cached_bytes)
 
 
 static func _build_columns(signature: Array) -> PackedFloat32Array:
@@ -42,7 +49,7 @@ static func _build_columns(signature: Array) -> PackedFloat32Array:
 	var top_radius := radius + height
 	var horizon_length := sqrt(height * (2.0 * radius + height))
 	var columns := PackedFloat32Array()
-	columns.resize(WIDTH * HEIGHT * 2)
+	columns.resize(WIDTH * HEIGHT * 3)
 	for y in HEIGHT:
 		var rho := horizon_length * float(y) / float(HEIGHT - 1)
 		var r := sqrt(radius * radius + rho * rho)
@@ -56,6 +63,7 @@ static func _build_columns(signature: Array) -> PackedFloat32Array:
 				r_mu = ((top_radius - r) * (top_radius + r) - distance * distance) / (2.0 * distance)
 			var rayleigh_column := 0.0
 			var mie_column := 0.0
+			var absorption_column := 0.0
 			for i in SUN_SAMPLES:
 				var start := float(i) / float(SUN_SAMPLES)
 				var end := float(i + 1) / float(SUN_SAMPLES)
@@ -67,7 +75,10 @@ static func _build_columns(signature: Array) -> PackedFloat32Array:
 				var altitude := maxf(sample_radius - radius, 0.0)
 				rayleigh_column += exp(-altitude / rayleigh_height) * step_length
 				mie_column += exp(-altitude / mie_height) * step_length
-			var offset := (y * WIDTH + x) * 2
+				var absorption_density := float(signature[5]) * altitude + float(signature[6]) if altitude < float(signature[4]) else float(signature[7]) * altitude + float(signature[8])
+				absorption_column += clampf(absorption_density, 0.0, 1.0) * step_length
+			var offset := (y * WIDTH + x) * 3
 			columns[offset] = rayleigh_column
 			columns[offset + 1] = mie_column
+			columns[offset + 2] = absorption_column
 	return columns

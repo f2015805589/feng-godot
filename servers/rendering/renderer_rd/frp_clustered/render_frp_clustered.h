@@ -66,6 +66,8 @@
 #define RB_TEX_GBUFFER_EMISSION SNAME("gbuffer_emission")
 #define RB_TEX_GBUFFER_EMISSION_MSAA SNAME("gbuffer_emission_msaa")
 
+class FRPPassContext;
+
 namespace RendererSceneRenderImplementation {
 
 class RenderFRPClustered : public RendererSceneRenderRD {
@@ -194,6 +196,8 @@ private:
 	LocalVector<RD::Uniform> render_base_uniforms;
 	// Immutable throughout a frame, even if a previous GPU readback completes.
 	float current_pre_exposure = 1.0f;
+	RID current_atmosphere_optical_texture;
+	RID current_atmosphere_multiple_texture;
 	bool current_eye_adaptation_enabled = false;
 	RID current_eye_adaptation_texture;
 
@@ -366,6 +370,10 @@ private:
 			uint32_t height_fog_pad[3];
 			float height_fog_camera_position[4];
 			float height_fog_parameters[6][4];
+			uint32_t atmosphere_enabled;
+			uint32_t atmosphere_light_indices[2];
+			uint32_t atmosphere_pad;
+			float atmosphere_parameters[16][4];
 		};
 
 		struct PushConstantUbershader {
@@ -496,6 +504,7 @@ private:
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_height_fog(uint32_t p_uniform_buffer_index, const PackedFloat32Array &p_parameters);
+	void _setup_atmosphere(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
 
 	struct RenderElementInfo {

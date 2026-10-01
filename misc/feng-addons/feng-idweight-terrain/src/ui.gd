@@ -86,6 +86,7 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if plugin.debug:
 		print("Terrain3DUI: _exit_tree()")
+	clear_picking()
 	plugin.remove_control_from_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_SIDE_LEFT, toolbar)
 	plugin.remove_control_from_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_BOTTOM, tool_settings)
 	toolbar.queue_free()
@@ -453,13 +454,16 @@ func _update_picker_highlight() -> void:
 
 func clear_picking() -> void:
 	picking = Terrain3DEditor.TOOL_MAX
-	if get_tree().process_frame.is_connected(_update_picker_highlight):
-		get_tree().process_frame.disconnect(_update_picker_highlight)
-		for i: int in range(0,  plugin.terrain.assets.get_mesh_count()):
-			var ma: Terrain3DMeshAsset = plugin.terrain.assets.get_mesh_asset(i)
-			if ma:
-				ma.set_highlighted(false)
-		plugin.asset_dock.update_dock()
+	var tree := get_tree() if is_inside_tree() else null
+	if tree != null and tree.process_frame.is_connected(_update_picker_highlight):
+		tree.process_frame.disconnect(_update_picker_highlight)
+		if is_instance_valid(plugin.terrain) and is_instance_valid(plugin.terrain.assets):
+			for i: int in range(0, plugin.terrain.assets.get_mesh_count()):
+				var ma: Terrain3DMeshAsset = plugin.terrain.assets.get_mesh_asset(i)
+				if ma:
+					ma.set_highlighted(false)
+		if is_instance_valid(plugin.asset_dock):
+			plugin.asset_dock.update_dock()
 
 
 func is_picking() -> bool:

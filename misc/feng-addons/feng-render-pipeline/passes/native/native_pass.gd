@@ -54,6 +54,11 @@ func _native_pass_id() -> int:
 func get_parameter_key() -> Variant:
 	return native_id
 
+func _frp_prepare(ctx: FRPPassContext) -> void:
+	var active := active_overlay()
+	if active != null and active.has_method("_frp_prepare"):
+		active.call("_frp_prepare", ctx)
+
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
 		return

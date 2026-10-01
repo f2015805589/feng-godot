@@ -4,6 +4,7 @@ extends SceneTree
 ## tone mapper or half-float target can hide NaN/Inf as a black pixel.
 const FengSkyAtmosphere = preload("res://addons/feng-sky/feng_sky_atmosphere.gd")
 const FengSkyRuntime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
+const MultiScatteringLut = preload("res://addons/feng-sky/feng_sky_multiscattering_lut.gd")
 const OpticalLut = preload("res://addons/feng-sky/feng_sky_optical_lut.gd")
 var _failed := false
 
@@ -113,6 +114,8 @@ func gpu_source() -> String:
 	source = source.replace("shader_type sky;", "")
 	source = source.replace("uniform sampler2D optical_column_lut : filter_linear, repeat_disable;",
 		"layout(set = 0, binding = 2) uniform sampler2D optical_column_lut;")
+	source = source.replace("uniform sampler2D multi_scattering_lut : filter_linear, repeat_disable;",
+		"layout(set = 0, binding = 3) uniform sampler2D multi_scattering_lut;")
 	var declarations := RegEx.new()
 	declarations.compile("(?m)^uniform (float|vec3|bool) ")
 	source = declarations.sub(source, "$1 ", true)
@@ -129,7 +132,7 @@ vec3 COLOR;
 void main() {
 	uint index = gl_GlobalInvocationID.x;
 	if (index >= params.counts.x) { return; }
-	uint offset = index * 8;
+	uint offset = index * 13;
 	POSITION = rays[offset].xyz;
 	sun_angular_radius_deg = rays[offset].w;
 	EYEDIR = normalize(rays[offset + 1].xyz);
@@ -147,6 +150,17 @@ void main() {
 	mie_extinction_per_km = rays[offset + 6].x;
 	use_optical_column_lut = rays[offset + 6].y > 0.0;
 	ground_albedo = rays[offset + 7].xyz;
+	mie_scattering_coefficients = rays[offset + 8].xyz;
+	mie_extinction_coefficients = rays[offset + 9].xyz;
+	absorption_extinction_per_km = rays[offset + 10].xyz;
+	absorption_density_layer_width_km = rays[offset + 11].x;
+	absorption_layer0_linear_term = rays[offset + 11].y;
+	absorption_layer0_constant_term = rays[offset + 11].z;
+	absorption_layer1_linear_term = rays[offset + 11].w;
+	absorption_layer1_constant_term = rays[offset + 12].x;
+	multi_scattering_factor = rays[offset + 12].y;
+	trace_sample_count_scale = rays[offset + 12].z;
+	use_multi_scattering_lut = rays[offset + 12].w > 0.0;
 	planet_center_m = vec3(0.0, -1000.0 * planet_radius_km, 0.0);
 	sky();
 	values[index * 3] = vec4(COLOR, solar_disk_weight(EYEDIR, sun_direction, radians(sun_angular_radius_deg)));
@@ -186,6 +200,9 @@ func make_gpu_inputs(settings: Dictionary, use_lut: bool) -> Dictionary:
 				var view := (sun * cos(angle) + tangent * sin(angle)).normalized()
 				var color := Vector3.ONE if motion_index % 2 == 0 else Vector3(1.0, 0.2, 0.05)
 				var beta: Vector3 = settings["rayleigh_scattering_per_km"]
+				var mie: Vector3 = settings["mie_scattering_coefficients"]
+				var extinction: Vector3 = settings["mie_extinction_coefficients"]
+				var absorption: Vector3 = settings["absorption_extinction_per_km"]
 				rays.append_array(PackedFloat32Array([
 					camera.x, camera.y, camera.z, radius_deg,
 					view.x, view.y, view.z, [-0.95, 0.0, 0.95][motion_index % 3],
@@ -195,6 +212,11 @@ func make_gpu_inputs(settings: Dictionary, use_lut: bool) -> Dictionary:
 					beta.x, beta.y, beta.z, settings["mie_scattering_per_km"],
 					settings["mie_extinction_per_km"], 1.0 if use_lut else 0.0, 0.0, 0.0,
 					0.1, 0.1, 0.1, 0.0,
+					mie.x, mie.y, mie.z, 0.0,
+					extinction.x, extinction.y, extinction.z, 0.0,
+					absorption.x, absorption.y, absorption.z, 0.0,
+					settings["absorption_density_layer_width_km"], settings["absorption_layer0_linear_term"], settings["absorption_layer0_constant_term"], settings["absorption_layer1_linear_term"],
+					settings["absorption_layer1_constant_term"], settings["multi_scattering_factor"], settings["trace_sample_count_scale"], 1.0,
 				]))
 				expected_masks.append(reference_disk_weight(deg_to_rad(radius_deg), angle))
 	return {"rays": rays, "expected_masks": expected_masks}
@@ -237,12 +259,21 @@ func dispatch_gpu_checks(rd: RenderingDevice, shader: RID, pipeline: RID, settin
 	var input_buffer := rd.storage_buffer_create(rays.size() * 4, rays.to_byte_array())
 	var output_buffer := rd.storage_buffer_create(count * 12 * 4)
 	var image := OpticalLut.make_image(settings)
+	image.convert(Image.FORMAT_RGBAF)
 	var format := RDTextureFormat.new()
-	format.format = RenderingDevice.DATA_FORMAT_R32G32_SFLOAT
+	format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 	format.width = image.get_width()
 	format.height = image.get_height()
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	var texture := rd.texture_create(format, RDTextureView.new(), [image.get_data()])
+	var multi_image := MultiScatteringLut.make_image(settings)
+	multi_image.convert(Image.FORMAT_RGBAF)
+	var multi_format := RDTextureFormat.new()
+	multi_format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
+	multi_format.width = multi_image.get_width()
+	multi_format.height = multi_image.get_height()
+	multi_format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	var multi_texture := rd.texture_create(multi_format, RDTextureView.new(), [multi_image.get_data()])
 	var sampler_state := RDSamplerState.new()
 	sampler_state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
 	sampler_state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
@@ -260,6 +291,12 @@ func dispatch_gpu_checks(rd: RenderingDevice, shader: RID, pipeline: RID, settin
 	lut_uniform.add_id(sampler)
 	lut_uniform.add_id(texture)
 	uniforms.append(lut_uniform)
+	var multi_uniform := RDUniform.new()
+	multi_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+	multi_uniform.binding = 3
+	multi_uniform.add_id(sampler)
+	multi_uniform.add_id(multi_texture)
+	uniforms.append(multi_uniform)
 	var uniform_set := rd.uniform_set_create(uniforms, shader, 0)
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, pipeline)
@@ -278,7 +315,7 @@ func dispatch_gpu_checks(rd: RenderingDevice, shader: RID, pipeline: RID, settin
 			var value := output[index * 12 + component]
 			if component != 7 and not is_finite(value):
 				bad_values += 1
-			if component < 3 and (value < 0.0 or value > rays[index * 32 + 15]):
+			if component < 3 and (value < 0.0 or value > rays[index * 52 + 15]):
 				bad_values += 1
 			if component >= 8 and component <= 10 and (value < 0.0 or value > 1.0):
 				bad_values += 1
@@ -294,5 +331,5 @@ func dispatch_gpu_checks(rd: RenderingDevice, shader: RID, pipeline: RID, settin
 	print("SKY NUMERICS GPU rays=", count, " lut=", use_lut,
 		" profile=", OpticalLut.geometry_signature(settings), " bad_values=", bad_values,
 		" max_disk_weight_error=", maximum_mask_error, " legacy_disk_failures=", legacy_disk_failures)
-	for resource in [uniform_set, sampler, texture, output_buffer, input_buffer]:
+	for resource in [uniform_set, sampler, texture, multi_texture, output_buffer, input_buffer]:
 		rd.free_rid(resource)

@@ -479,7 +479,8 @@ Light3D::Light3D(RSE::LightType p_type) {
 		};
 	}
 
-	RS::get_singleton()->instance_set_base(get_instance(), light);
+	// Keep VisualInstance3D::get_base() consistent with the server instance.
+	set_base(light);
 
 	set_color(Color(1, 1, 1, 1));
 	set_shadow(false);

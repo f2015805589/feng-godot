@@ -11,6 +11,7 @@
 
 #include "terrain_3d.h"
 #include "terrain_3d_data.h"
+#include "terrain_region_resize.h"
 
 #include "logger.h"
 
@@ -96,26 +97,27 @@ void Terrain3DData::change_region_size(int p_new_size) {
 		return;
 	}
 
-	// Get current region corners expressed in new region_size coordinates
-	Dictionary new_region_locations;
+	// Preflight every destination before constructing replacements or changing
+	// deletion flags. A split can cross the fixed world bounds or slot limit.
+	std::vector<TerrainRegionResize::Location> sources;
 	Array region_locations = _regions.keys();
 	for (const Vector2i &region_loc : region_locations) {
 		const Terrain3DRegion *region = get_region_ptr(region_loc);
 		if (region && !region->is_deleted()) {
-			Vector2i region_position = region->get_location() * _region_size;
-			Rect2i location_bounds(V2I_DIVIDE_FLOOR(region_position, p_new_size), V2I_DIVIDE_CEIL(_region_sizev, p_new_size));
-			for (int y = location_bounds.position.y; y < location_bounds.get_end().y; y++) {
-				for (int x = location_bounds.position.x; x < location_bounds.get_end().x; x++) {
-					new_region_locations[Vector2i(x, y)] = 1;
-				}
-			}
+			const Vector2i location = region->get_location();
+			sources.emplace_back(location.x, location.y);
 		}
+	}
+	const auto plan = TerrainRegionResize::plan(sources, _region_size, p_new_size, REGION_MAP_SIZE, MAX_MAP_SLOTS);
+	if (plan.error != TerrainRegionResize::Error::NONE) {
+		LOG(ERROR, "Region resize would exceed world bounds or resident capacity; original data is unchanged.");
+		return;
 	}
 
 	// Make new regions to receive copied data
 	TypedArray<Terrain3DRegion> new_regions;
-	Array new_locations = new_region_locations.keys();
-	for (const Vector2i &region_loc : new_locations) {
+	for (const auto &location : plan.locations) {
+		const Vector2i region_loc(location.first, location.second);
 		Ref<Terrain3DRegion> new_region;
 		new_region.instantiate();
 		new_region->set_location(region_loc);
@@ -136,24 +138,40 @@ void Terrain3DData::change_region_size(int p_new_size) {
 		new_regions.push_back(new_region);
 	}
 
-	// Remove old data
-	_terrain->get_instancer()->destroy();
-	TypedArray<Terrain3DRegion> old_regions = get_regions_active();
+	// Keep references to the original data until every insertion succeeds.
+	const int old_size = _region_size;
+	const Dictionary old_table = _regions.duplicate();
+	const TypedArray<Vector2i> old_locations = _region_locations.duplicate();
+	const TypedArray<Terrain3DRegion> old_regions = get_regions_active();
+	std::vector<bool> old_deleted;
 	for (const Ref<Terrain3DRegion> &region : old_regions) {
-		remove_region(region, false);
+		old_deleted.push_back(region->is_deleted());
 	}
+	const bool committed = TerrainRegionResize::commit(new_regions.size(), [&]() {
+		_terrain->get_instancer()->destroy();
+		for (const Ref<Terrain3DRegion> &region : old_regions) {
+			remove_region(region, false);
+		}
+		_terrain->set_region_size((Terrain3D::RegionSize)p_new_size);
+	}, [&](std::size_t index) {
+		return add_region(new_regions[int(index)], false) == OK;
+	}, [&]() {
+		_regions = old_table;
+		_region_locations = old_locations;
+		for (int i = 0; i < old_regions.size(); ++i) {
+			Ref<Terrain3DRegion> region = old_regions[i];
+			region->set_deleted(old_deleted[size_t(i)]);
+		}
+		_terrain->set_region_size((Terrain3D::RegionSize)old_size);
+		_region_map_dirty = true;
+	});
 
-	// Change region size
-	_terrain->set_region_size((Terrain3D::RegionSize)p_new_size);
-
-	// Add new regions and rebuild
-	for (const Ref<Terrain3DRegion> &region : new_regions) {
-		add_region(region, false);
-	}
-
-	calc_height_range(true);
+	calc_height_range(committed);
 	update_maps(TYPE_MAX, true, true);
 	_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
+	if (!committed) {
+		LOG(ERROR, "Region resize failed; original regions were restored and will not be deleted on save.");
+	}
 }
 
 // Surface resolution is a terrain-wide setting: the region texture array is a single

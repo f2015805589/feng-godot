@@ -178,6 +178,18 @@ def main() -> None:
     validate_scratch_tree(project)
     run(
         [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_unreal_parameters.gd"],
+        "headless Unreal parameter and migration tests", project, env, "UNREAL ATMOSPHERE PARAMETERS PASS",
+    )
+    validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_unreal_transport.gd"],
+        "headless Unreal optical transport tests", project, env, "UNREAL TRANSPORT PASS",
+    )
+    validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
          "res://addons/feng-sky/tests/test_sky_numerics.gd"],
         "headless Sky numerical tests", project, env, "SKY NUMERICS PASS",
     )
@@ -188,7 +200,20 @@ def main() -> None:
         "headless Sky optimization tests", project, env, "SKY OPTIMIZATION PASS",
     )
     validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_aerial_packet.gd"],
+        "headless Aerial packet tests", project, env, "feng_aerial_packet tests passed",
+    )
+    validate_scratch_tree(project)
     if args.gpu_driver:
+        run(
+            [str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "96x96",
+             "--position", "-10000,-10000", "--script",
+             "res://addons/feng-sky/tests/test_aerial_perspective_gpu.gd"],
+            "GPU Aerial perspective tests", project, env, "AERIAL PERSPECTIVE GPU PASS",
+        )
         run(
             [str(editor), "--path", str(project), "--rendering-method", "frp",
              "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "64x64",

@@ -12,6 +12,8 @@ extends RefCounted
 const NativeSpec = preload("native_spec.gd")
 const PassBase = preload("../passes/pass_base.gd")
 const BuiltinPass = preload("../passes/builtin_pass.gd")
+const ShaderPass = preload("../passes/shader_pass.gd")
+const FXAAPass = preload("../passes/fxaa_pass.gd")
 
 ## The library's manifest of pre-packaged passes, in insertion order.
 const DEFAULT_LIBRARY_ENTRIES := [
@@ -244,7 +246,7 @@ static func _find_synced_library_pass(passes: Array, entry: Dictionary):
 ## and a template that is neither is left to the Library menu. Returns whether the list
 ## or the recorded state changed.
 static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array, deleted_ids: Array) -> bool:
-	var changed := false
+	var changed := _upgrade_legacy_fxaa(passes)
 	var missing_managed: Array[StringName] = []
 	for stable_id in MANAGED_BLOOM_PLACEMENT:
 		if _library_index(passes, stable_id) < 0:
@@ -301,6 +303,43 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 		# identity was just recovered, as well as entirely missing entries.
 		for stable_id in missing_managed:
 			_restore_managed_placement(passes, stable_id)
+	return changed
+
+## Repair only the released generic FXAA contract. The authored resource may be
+## shared by another renderer, so replace this list entry rather than changing
+## its script in place. Custom shaders, subclasses and altered texture contracts
+## remain author-owned; there is no generic ShaderPass filename special case.
+static func _upgrade_legacy_fxaa(passes: Array) -> bool:
+	var changed := false
+	var shader_path := FengAddonLayout.library_dir() + "/fxaa/fxaa.glsl"
+	for index in passes.size():
+		var old = passes[index]
+		if old == null or old.get_script() != ShaderPass or old.stable_id != &"library:fxaa":
+			continue
+		if old.shader_file == null or old.shader_file.resource_path != shader_path \
+				or old.mode != ShaderPass.Mode.COMPUTE or not old.outputs.is_empty() \
+				or old.raster_target != &"" or old.dispatch_target != &"" or old.target_name != &"" \
+				or old.inputs.size() != 2:
+			continue
+		var source = old.inputs[0]
+		var destination = old.inputs[1]
+		if source == null or destination == null \
+				or source.binding != 0 or destination.binding != 1 \
+				or source.source != PassBase.TextureInput.Source.COLOR \
+				or destination.source != PassBase.TextureInput.Source.COLOR \
+				or source.binding_type != PassBase.TextureInput.BindingType.SAMPLED_TEXTURE \
+				or destination.binding_type != PassBase.TextureInput.BindingType.STORAGE_IMAGE:
+			continue
+		var replacement := FXAAPass.new()
+		# Preserve every non-contract authored field that generic ShaderPass stores.
+		for property_name in ["resource_name", "resource_local_to_scene", "stable_id", "enabled", "stage",
+				"shader_file", "mode", "parameters", "workgroup_size", "shader_keywords", "pass_parameters",
+				"provides_native_ids", "access_resolved_color", "access_resolved_depth", "needs_motion_vectors",
+				"needs_normal_roughness", "needs_separate_specular"]:
+			var value: Variant = old.get(property_name)
+			replacement.set(property_name, value.duplicate(true) if value is Array or value is Dictionary else value)
+		passes[index] = replacement
+		changed = true
 	return changed
 
 ## Whether synchronization owns an entry: one a fresh pipeline seeds, or one it recorded

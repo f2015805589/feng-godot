@@ -21,9 +21,13 @@ FengGodotTracy *FengGodotTracy::singleton = nullptr;
 // that began it and scripts can open zones on worker threads.
 static Mutex _zone_mutex;
 static HashMap<uint64_t, Vector<TracyCZoneCtx>> _zone_stacks;
-// A source location is allocated by the client and stays valid for the lifetime
-// of the process, so one is allocated per distinct zone name.
-static HashMap<String, uint64_t> _zone_source_locations;
+
+// Named plots/frames retain the pointer as their identity and may query it long
+// after this call returns. Reuse the engine profiler's lifetime-owned interner;
+// a temporary CharString or an evictable cache cannot satisfy that contract.
+static const char *_intern_tracy_name(const String &p_name) {
+	return tracy::intern_source_location(nullptr, __FILE__, "FengGodotTracy", p_name, 0, false)->name;
+}
 
 static uint32_t _to_tracy_color(const Color &p_color) {
 	const uint32_t red = (uint32_t)CLAMP(int(p_color.r * 255.0f + 0.5f), 0, 255);
@@ -44,7 +48,6 @@ FengGodotTracy::~FengGodotTracy() {
 #if defined(GODOT_USE_TRACY)
 	MutexLock lock(_zone_mutex);
 	_zone_stacks.clear();
-	_zone_source_locations.clear();
 #endif
 }
 
@@ -130,21 +133,22 @@ Dictionary FengGodotTracy::get_status() const {
 void FengGodotTracy::message(const String &p_text) {
 #if defined(GODOT_USE_TRACY)
 	const CharString text = p_text.utf8();
-	___tracy_emit_messageL(text.get_data(), 0);
+	ERR_FAIL_COND_MSG(text.length() >= UINT16_MAX, "Tracy messages must contain fewer than 65535 UTF-8 bytes.");
+	___tracy_emit_message(text.get_data(), text.length(), 0);
 #endif
 }
 
 void FengGodotTracy::message_colored(const String &p_text, const Color &p_color) {
 #if defined(GODOT_USE_TRACY)
 	const CharString text = p_text.utf8();
-	___tracy_emit_messageLC(text.get_data(), _to_tracy_color(p_color), 0);
+	ERR_FAIL_COND_MSG(text.length() >= UINT16_MAX, "Tracy messages must contain fewer than 65535 UTF-8 bytes.");
+	___tracy_emit_messageC(text.get_data(), text.length(), _to_tracy_color(p_color), 0);
 #endif
 }
 
 void FengGodotTracy::plot(const String &p_name, double p_value) {
 #if defined(GODOT_USE_TRACY)
-	const CharString name = p_name.utf8();
-	___tracy_emit_plot(name.get_data(), p_value);
+	___tracy_emit_plot(_intern_tracy_name(p_name), p_value);
 #endif
 }
 
@@ -154,8 +158,7 @@ void FengGodotTracy::frame_mark(const String &p_name) {
 		___tracy_emit_frame_mark(nullptr);
 		return;
 	}
-	const CharString name = p_name.utf8();
-	___tracy_emit_frame_mark(name.get_data());
+	___tracy_emit_frame_mark(_intern_tracy_name(p_name));
 #endif
 }
 
@@ -174,12 +177,11 @@ void FengGodotTracy::begin_zone(const String &p_name) {
 	}
 	const CharString name = p_name.utf8();
 	MutexLock lock(_zone_mutex);
-	uint64_t *source_location = _zone_source_locations.getptr(p_name);
-	if (source_location == nullptr) {
-		_zone_source_locations.insert(p_name, ___tracy_alloc_srcloc_name(0, __FILE__, strlen(__FILE__), __func__, strlen(__func__), name.get_data(), name.length(), 0));
-		source_location = _zone_source_locations.getptr(p_name);
-	}
-	const TracyCZoneCtx zone = ___tracy_emit_zone_begin_alloc(*source_location, 1);
+	// Allocated locations transfer ownership on every emission. Tracy frees one
+	// immediately when disconnected, or after consumption when recording. Reusing
+	// a previous allocation is a use-after-free in either mode.
+	const uint64_t source_location = ___tracy_alloc_srcloc_name(0, __FILE__, strlen(__FILE__), __func__, strlen(__func__), name.get_data(), name.length(), 0);
+	const TracyCZoneCtx zone = ___tracy_emit_zone_begin_alloc(source_location, 1);
 	_zone_stacks[(uint64_t)Thread::get_caller_id()].push_back(zone);
 #endif
 }

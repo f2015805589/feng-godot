@@ -1,18 +1,87 @@
 @tool
 class_name FengHeightFogPass
 extends FengRuntimeSnapshotPass
-## Applies Unreal-style exponential height fog to the lit color.
-##
-## The pass is a no-op until a FengHeightFog node publishes a snapshot for this
-## render target through the feng-fog addon's runtime. Per-frame work is a single
-## camera-dependent UBO; the shader mirrors Unreal's HeightFogCommon.ush.
+## Applies independently published height fog and spherical aerial perspective.
+## Both providers are optional, world-scoped snapshots. Metadata preparation
+## supplies direct-light transport before Lighting; the existing Sky-anchored
+## dispatch applies aerial perspective and height fog to opaque scene color.
+## With neither provider, the pass is a no-op. Authoring/lifecycles stay outside it.
 
 const UBO_BINDING := 2
-const UBO_SIZE := 240 # Two mat4s + seven vec4s.
+const UBO_SIZE := 496 # Two mat4s + seven fog vec4s + sixteen atmosphere vec4s.
+const AtmospherePacket = preload("atmosphere_packet.gd")
+const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
 var _pre_exposure := 1.0
+var _sky_runtime: Script
+var _next_sky_runtime_probe_msec := 0
+var _atmosphere_snapshot: Dictionary = {}
+var _prepared_context_id := 0
+var _atmosphere_optical := RID()
+var _atmosphere_multiple := RID()
+var _empty_atmosphere_lut := RID()
+var _atmosphere_sampler := RID()
+
+func _atmosphere_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
+	if buffers == null:
+		return {}
+	if _sky_runtime == null:
+		var now := Time.get_ticks_msec()
+		if now < _next_sky_runtime_probe_msec:
+			return {}
+		_next_sky_runtime_probe_msec = now + 500
+		if ResourceLoader.exists(SKY_RUNTIME_PATH):
+			var script: Variant = load(SKY_RUNTIME_PATH)
+			if script is Script and script.has_method("rendering_snapshots"):
+				_sky_runtime = script
+	if _sky_runtime == null:
+		return {}
+	var snapshots: Variant = _sky_runtime.call("rendering_snapshots")
+	if snapshots is Array:
+		for snapshot in snapshots:
+			if snapshot is Dictionary and snapshot.get("render_targets", []).has(buffers.get_render_target()):
+				return snapshot
+	return {}
+
+func _prepare_atmosphere(ctx: FRPPassContext) -> PackedFloat32Array:
+	_atmosphere_snapshot = {}
+	_atmosphere_optical = RID()
+	_atmosphere_multiple = RID()
+	if ctx == null:
+		return PackedFloat32Array()
+	_atmosphere_snapshot = _atmosphere_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
+	var render_data := ctx.get_render_data()
+	var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
+	if _atmosphere_snapshot.is_empty() or scene_data == null:
+		return PackedFloat32Array()
+	var optical: Variant = _atmosphere_snapshot.get("optical_column_lut")
+	var multiple: Variant = _atmosphere_snapshot.get("multi_scattering_lut")
+	var settings: Dictionary = _atmosphere_snapshot.get("settings", {})
+	var lut_safe := float(settings.get("atmosphere_height_km", 60.0)) / maxf(minf(float(settings.get("rayleigh_scale_height_km", 8.0)), float(settings.get("mie_scale_height_km", 1.2))), 0.001) <= 64.0
+	if optical is Texture2D and lut_safe and bool(_atmosphere_snapshot.get("use_optical_column_lut", true)):
+		_atmosphere_optical = RenderingServer.texture_get_rd_texture(optical.get_rid())
+	if multiple is Texture2D:
+		_atmosphere_multiple = RenderingServer.texture_get_rd_texture(multiple.get_rid())
+	return AtmospherePacket.make(_atmosphere_snapshot, scene_data.get_cam_transform(), _atmosphere_optical.is_valid(), _atmosphere_multiple.is_valid())
+
+## Metadata only: publish before deferred lighting, while the actual compute
+## work retains the existing Sky-anchored pass position.
+func _frp_prepare(ctx: FRPPassContext) -> void:
+	_prepared_context_id = ctx.get_instance_id() if ctx != null else 0
+	var packet := _prepare_atmosphere(ctx)
+	if ctx != null and ctx.has_method("set_atmosphere_parameters"):
+		ctx.call("set_atmosphere_parameters", packet,
+			_atmosphere_snapshot.get("sun_light_rid", RID()),
+			_atmosphere_snapshot.get("secondary_sun_light_rid", RID()),
+			_atmosphere_optical, _atmosphere_multiple)
+
 
 func _frp_execute(ctx: FRPPassContext) -> void:
+	# Reuse one immutable frame lease from pre-lighting through opaque/forward
+	# work. Keep its Texture2D references alive until the next frame preparation.
+	# Older engines without the optional hook can still execute compute AP.
+	if ctx == null or _prepared_context_id != ctx.get_instance_id():
+		_prepare_atmosphere(ctx)
 	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
 	if ctx != null:
 		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
@@ -98,7 +167,7 @@ func get_volume_parameter_names() -> PackedStringArray:
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	# No fog node in this world: the pass is a true no-op — color is modified in
 	# place, so there is nothing to clear and no dispatch to schedule.
-	if _frame_snapshot.is_empty() or _frame_scene_data == null:
+	if (_frame_snapshot.is_empty() and _atmosphere_snapshot.is_empty()) or _frame_scene_data == null:
 		return
 	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
 		return
@@ -111,6 +180,7 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	# world-to-clip matrix. The shader must apply the camera transform as well.
 	var inverse_projection: Projection = scene_data.get_view_projection(view).inverse()
 	var camera: Transform3D = scene_data.get_cam_transform()
+	camera.origin += camera.basis.orthonormalized() * scene_data.get_view_eye_offset(view)
 	var values := PackedFloat32Array()
 	_append_projection(values, inverse_projection)
 	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
@@ -118,16 +188,51 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	# Both paths use the same seven vec4s. Compute applies the scale through
 	# its push constant, so its reserved packet lane remains zero.
 	values.append_array(_make_forward_parameters(snapshot, camera, 0.0))
+	values.append_array(AtmospherePacket.make(_atmosphere_snapshot, camera, _atmosphere_optical.is_valid(), _atmosphere_multiple.is_valid()))
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
 
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
 	var binding_data := super._collect_bindings(buffers, view, rd)
-	if _binding_error or _frame_snapshot.is_empty() or not _ubo.is_valid():
+	if _binding_error or not _ubo.is_valid():
 		return binding_data
 	var uniforms: Array[RDUniform] = binding_data["uniforms"]
 	uniforms.append(_ubo_uniform(UBO_BINDING))
+	if not _atmosphere_sampler.is_valid():
+		var state := RDSamplerState.new()
+		state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+		state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		_atmosphere_sampler = rd.sampler_create(state)
+	if not _empty_atmosphere_lut.is_valid():
+		var format := RDTextureFormat.new()
+		format.width = 1
+		format.height = 1
+		format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
+		format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+		_empty_atmosphere_lut = rd.texture_create(format, RDTextureView.new(), [PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array()])
+	for slot in 2:
+		var texture: RID = _atmosphere_optical if slot == 0 else _atmosphere_multiple
+		if not texture.is_valid() or not rd.texture_is_valid(texture):
+			texture = _empty_atmosphere_lut
+		var uniform := RDUniform.new()
+		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		uniform.binding = 3 + slot
+		uniform.add_id(_atmosphere_sampler)
+		uniform.add_id(texture)
+		uniforms.append(uniform)
 	binding_data["uniforms"] = uniforms
 	return binding_data
+
+func _cleanup(rd: RenderingDevice) -> void:
+	if rd != null and _empty_atmosphere_lut.is_valid():
+		rd.free_rid(_empty_atmosphere_lut)
+	_empty_atmosphere_lut = RID()
+	if rd != null and _atmosphere_sampler.is_valid():
+		rd.free_rid(_atmosphere_sampler)
+	_atmosphere_sampler = RID()
+	super._cleanup(rd)
 
 func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
@@ -135,6 +240,10 @@ func _notification(what: int) -> void:
 	# Value-capture the UBO: the instance is being torn down, so only local
 	# state is safe here (see FengRuntimeSnapshotPass._free_on_render_thread).
 	var ubo := _ubo
+	var empty_lut := _empty_atmosphere_lut
+	var atmosphere_sampler := _atmosphere_sampler
+	_atmosphere_sampler = RID()
+	_empty_atmosphere_lut = RID()
 	_ubo = RID()
-	if ubo.is_valid():
-		_free_on_render_thread([ubo])
+	if ubo.is_valid() or empty_lut.is_valid() or atmosphere_sampler.is_valid():
+		_free_on_render_thread([ubo, empty_lut, atmosphere_sampler])

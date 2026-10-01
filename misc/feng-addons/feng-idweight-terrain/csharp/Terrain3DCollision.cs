@@ -38,7 +38,7 @@ public partial class Terrain3DCollision : GodotObject
 #if DEBUG
 		var expectedType = typeof(Terrain3DCollision);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 
@@ -182,8 +182,8 @@ public partial class Terrain3DCollision : GodotObject
 	public new void Build() => 
 		Call(GDExtensionMethodName.Build, []);
 
-	public new void Update(Vector2I regionLocation = default, bool rebuild = false) => 
-		Call(GDExtensionMethodName.Update, [regionLocation, rebuild]);
+	public new void Update(Vector2I? regionLocation = null, bool rebuild = false) =>
+		Call(GDExtensionMethodName.Update, [regionLocation ?? new Vector2I(int.MaxValue, int.MaxValue), rebuild]);
 
 	public new void Destroy() => 
 		Call(GDExtensionMethodName.Destroy, []);

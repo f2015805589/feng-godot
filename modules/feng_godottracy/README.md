@@ -109,6 +109,26 @@ if Engine.has_singleton("FengGodotTracy"):
 	Engine.get_singleton("FengGodotTracy").call("message", "hello")
 ```
 
+Dynamic message text is copied into Tracy's queue (fewer than 65,535 UTF-8 bytes
+per message). An allocated zone source location transfers ownership on each
+begin, including when the client is disconnected; it must never be reused.
+Plot and named-frame categories use the engine profiler's persistent interner
+because Tracy retains their pointers. Keep these names stable, such as
+`terrain/cdlod_ms`; put per-frame values in the plot value or message text rather
+than generating a new category every frame. Names stay until profiler shutdown.
+
+Two complementary lifetime regressions are available:
+
+```sh
+python modules/feng_godottracy/tests/run_lifetime_tests.py
+python misc/scripts/test_feng_tracy_lifetime.py --editor /path/to/godot
+```
+
+The first compiles the actual module against deterministic API ownership
+doubles. The second requires a rebuilt editor and drains the real Tracy stream
+over a private loopback connection while repeated dynamic script zones,
+messages and categories are emitted. Neither launches the profiler GUI.
+
 ## Files
 
 - `config.py` - enables the engine's Tracy backend, maps the module options.
@@ -147,4 +167,3 @@ already the main thread and left `is_main_thread_assigned` unset, and
 counter, which is initialized on first use and therefore immune to the order of
 static initialization. Any library that starts a thread during static
 initialization would have hit the same problem.
-

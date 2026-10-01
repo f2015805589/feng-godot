@@ -64,6 +64,11 @@ class FRPPassContext : public RefCounted {
 	// Render-local Feng Height Fog snapshot. It is written by the Sky-anchored
 	// HeightFog pass and consumed by the later forward fallback/transparent ops.
 	PackedFloat32Array height_fog_parameters;
+	// Frame-local atmosphere handoff. No scene-node mutation or addon lookup.
+	PackedFloat32Array atmosphere_parameters;
+	RID atmosphere_light_rids[2];
+	RID atmosphere_optical_texture;
+	RID atmosphere_multiple_texture;
 
 	void _run_operation(int p_operation);
 	static void _finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view);
@@ -89,6 +94,11 @@ public:
 	void set_next_pre_exposure(int p_view, float p_exposure);
 	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
 	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }
+	void set_atmosphere_parameters(const PackedFloat32Array &p_parameters, RID p_light, RID p_secondary_light, RID p_optical_texture, RID p_multiple_texture);
+	PackedFloat32Array get_atmosphere_parameters() const { return atmosphere_parameters; }
+	RID get_atmosphere_light_rid(int p_index) const { return p_index >= 0 && p_index < 2 ? atmosphere_light_rids[p_index] : RID(); }
+	RID get_atmosphere_optical_texture() const { return atmosphere_optical_texture; }
+	RID get_atmosphere_multiple_texture() const { return atmosphere_multiple_texture; }
 	void set_tonemap_exposure_texture(RID p_texture);
 	Error request_next_pre_exposure(RID p_buffer, int p_view, int p_offset);
 

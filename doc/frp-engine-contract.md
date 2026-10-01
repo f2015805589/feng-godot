@@ -34,9 +34,11 @@ pass，`FRPPassContext` 也不暴露对应入口。渲染器内部同样没有�
 代码、附件与调试视图都不在 `frp_clustered` 里（只剩引擎纯虚接口要求的 no-op 重载与 SDFGI 的空实现）。
 
 pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass → operation 展开表，
-插件通过 `RenderingServer.get_frp_pipeline_spec()` 读回）。**pass id 连续且就是执行顺序**，
-资源里的条目顺序就是引擎的执行顺序（与 URP 的 RendererFeature 列表一致）。引擎侧 8 条，
-插件侧再补一条 Color Grade，管线共 9 条 —— 一个新 Renderer 的列表正好是这 9 条。
+插件通过 `RenderingServer.get_frp_pipeline_spec()` 读回）。**pass id 是稳定标识，默认执行顺序由 DEFAULT_PASS_ORDER 给出**，
+资源里的条目顺序就是引擎的执行顺序（与 URP 的 RendererFeature 列表一致）。当前引擎侧 9 条，
+插件默认再种入 Eye Adaptation、Color Grade、Magic GI、Height Fog、Debug Buffers 共 5 条，
+新 Renderer 共 14 条；Debug Buffers 默认关闭，正常默认启用 13 条。大气集成复用 Height Fog，
+没有增加独立大气 pass。
 
 **约定**：新增原语只能追加；已有原语的名字与语义不变。删除或改名属于破坏性变更，必须同时改
 `frp_pipeline_spec.h`、`FRPPassContext` 绑定与插件 `FengNativeSpec`。
@@ -59,6 +61,7 @@ pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass →
 | `servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.{h,cpp}` | **已回到上游形态**：FRP 的粗糙度布局不再向共享代码声明（FRP 不跑任何解码它的共享代码） | 0 行 |
 | `servers/rendering/renderer_rd/environment/gi.{h,cpp}` + `shaders/environment/gi.glsl` | **已删除 fork 的 split-roughness 机制**（FRP 不跑 GI，共享 GI 代码只保留打包布局） | −53 行 |
 | `servers/rendering/renderer_rd/renderer_scene_render_rd.{h,cpp}` | 后处理与 tonemap 拆成两段（FRP 需要分别执行；合并入口保留，其它渲染器行为不变） | ~20 行 |
+| `scene/3d/light_3d.cpp` | Light3D 构造时通过继承的 `set_base(light)` 同步公开 `get_base()` 身份，用于精确匹配大气灯光；不改能量/颜色 | 1 行 |
 | `scene/resources/environment.cpp`、`scene/3d/fog_volume.cpp`、`scene/3d/visual_instance_3d.cpp`、`editor/editor_node.cpp` | `frp` 加入渲染方法守卫 / 显示名 | 各 1–4 行 |
 
 除上表之外**没有**任何 FRP 痕迹；`forward_clustered/` 与
@@ -102,6 +105,31 @@ pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass →
   相位，1 = 冻结采样、16 = 默认）。插件侧的层次是：pass 脚本声明（`get_frp_parameters()`）<
   条目 `pass_parameters` 覆盖 < `FengVolume` 运行时覆盖。
 
+### 大气的帧内数据交接
+
+可选脚本钩子 `_frp_prepare(ctx)` 在显式调度执行前调用一次，仅准备元数据，不执行绘制或 dispatch；
+仅已启用、实际在调度中的自定义 pass 会收到此调用；ViewPass、BuiltinPass 和启用的 native overlay 必须转发钩子，保持 Volume 包装路径一致。`_frp_execute(ctx)` 仍在原来的条目位置执行。
+这样 Sky 后面的 Height Fog 可以在 Deferred Lighting 之前提交大气光透射数据，而不移动绘制顺序。
+
+`FRPPassContext.set_atmosphere_parameters(parameters, light, secondary_light, optical_texture,
+multiple_texture)` 接受恰好 64 个有限 float（16 个 vec4）、两个基础灯光 RID 及两个 RD 纹理 RID。
+空数组清空状态；非法数组拒绝并保持清空状态。上下文每帧新建，世界/目标匹配在插件端完成。
+引擎不保存节点、插件脚本或 World3D 注册表，不改用户 DirectionalLight3D 的能量和颜色。
+
+布局：0=相机相对行星中心位置 km 与地表半径；1=Rayleigh RGB/密度高度；2=Mie scattering RGB/密度高度；
+3=Mie extinction RGB/g；4=其他吸收 RGB/大气厚度；5–6=吸收两层线性项、多次散射倍率和 AP 起始/距离倍率；
+7=天空加 AP 的 RGB 亮度倍率/视线采样数；8–11=两盏光的世界方向、辐照度、RGB 与地表最小太阳高度；
+12=LUT 有效和启用标志；13–15 保留为零。所有距离 km，系数 km^-1；世界空间边界用米。
+
+- 原生 Deferred/Forward 光照用基础 RID 按 LightStorage 的同一过滤顺序匹配 GPU 槽位，仅该光的 BRDF 入射项乘 RGB 透射率
+- Height Fog 的原有 Sky 后 compute 对有深度的 opaque 像素合成 AP；不重复处理已经积分过的大气天空
+- Forward fallback 和透明材质按自身片元位置合成 AP，不使用其后方 opaque 深度。AP 先于已有高度雾，雾的独立艺术颜色和原始光源合同保留
+- `affect_height_fog=false` 只停用天空对高度雾的可选贡献，独立渲染快照仍供直接光和 AP 使用
+- 光学和多次散射纹理按世界拥有、发布后不原位改写；缺失时绑定有效黑纹理，光学查表可回退为有界直接积分
+- 原生 `atmosphere_inc.glsl` 与插件 `atmosphere_inc.glslinc` 内容完全一致；修改传输公式时一起更新并运行一致性测试
+
+这是有界采样的独立实现。与 Epic 5.8 概览说明一致，仅第一盏大气光参与多次散射；第二盏光保留单次散射和直接透射。当前不包含大气内地形/云阴影、折射，也不保证 UE 5.8 像素一致；反射探针没有目标匹配快照时不注入 AP。
+
 ## 4. 搬到新版本 Godot 的清单
 
 1. 带上 `frp_pipeline_spec.h` + `frp_clustered/`（渲染器与 shader）——这两个是 FRP 的全部实现。
@@ -136,10 +164,10 @@ pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass →
   未声明的同型调度被补回全部 5 个必需条目。
 * **Stage C（C1/C2 已落地）**：能力通道（C1）让插件 pass 声明 `provides_native_ids` 后，引擎把该 pass
   当作帧的一部分（附件/特性标志/jitter 全部照旧）；pass 脚本化（C2）让默认调度完全由插件实现——
-  8 个原生条目各持有 `implementation`（`passes/native/*.gd`，`FengNativePass`），脚本通过
+  9 个原生条目各持有 `implementation`（`passes/native/*.gd`，`FengNativePass`），脚本通过
   `ctx.run_pass(id)` 执行引擎的同一批 operation，条目因而以 provided 的形式上报、不再发引擎 token；
   清空 `implementation` 即回到引擎自带 pass（无插件项目的默认路径）。实测（`frp_context.gd`）：
-  默认调度 8 条全是脚本、provided=[0,1,2,3,4,5,7]、token 全为自定义，与清空 implementation 的同一
+  早期默认调度 8 条全是脚本、provided=[0,1,2,3,4,5,7]、token 全为自定义，与清空 implementation 的同一
   调度逐像素一致（changed=0）；引擎的"缺必需条目"警告现在把 provided 算作存在。
 * `params` 逐 pass 暴露：pass 脚本自己的 `@export` 参数随资源进检查器已经可用；但引擎内部 shader
   仍不可逐 pass 替换，Core 原语的 options/params 通道还没有接到检查器（这是 C 剩下的部分）。

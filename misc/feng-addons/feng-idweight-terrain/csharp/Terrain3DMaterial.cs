@@ -38,7 +38,7 @@ public partial class Terrain3DMaterial : Resource
 #if DEBUG
 		var expectedType = typeof(Terrain3DMaterial);
 		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(expectedType.Name, currentObjectClassName))
+		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
 			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
 #endif
 
@@ -565,7 +565,7 @@ public partial class Terrain3DMaterial : Resource
 	public new void SetShaderParam(StringName name, Variant value) => 
 		Call(GDExtensionMethodName.SetShaderParam, [name, value]);
 
-	public new void GetShaderParam(StringName name) => 
+	public new Variant GetShaderParam(StringName name) =>
 		Call(GDExtensionMethodName.GetShaderParam, [name]);
 
 	public new Error Save(string path = "") => 

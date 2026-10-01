@@ -2,6 +2,7 @@ extends SceneTree
 
 const Atmosphere = preload("res://addons/feng-sky/feng_sky_atmosphere.gd")
 const Runtime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
+const Transport = preload("res://addons/feng-sky/feng_sky_transport.gd")
 const OpticalLut = preload("res://addons/feng-sky/feng_sky_optical_lut.gd")
 var _failed := false
 
@@ -16,7 +17,7 @@ func require(condition: bool, message: String) -> void:
 		push_error("REGRESSION: " + message)
 
 
-func sample_columns(image: Image, point: Vector3, direction: Vector3, settings: Dictionary) -> Vector2:
+func sample_columns(image: Image, point: Vector3, direction: Vector3, settings: Dictionary) -> Vector3:
 	var radius: float = settings["planet_radius_km"]
 	var height: float = settings["atmosphere_height_km"]
 	var top := radius + height
@@ -36,7 +37,7 @@ func sample_columns(image: Image, point: Vector3, direction: Vector3, settings: 
 	var lower := image.get_pixel(x, y).lerp(image.get_pixel(next_x, y), xy.x - float(x))
 	var upper := image.get_pixel(x, next_y).lerp(image.get_pixel(next_x, next_y), xy.x - float(x))
 	var result := lower.lerp(upper, xy.y - float(y))
-	return Vector2(result.r, result.g)
+	return Vector3(result.r, result.g, result.b)
 
 
 func lut_transmittance(image: Image, point: Vector3, direction: Vector3, settings: Dictionary) -> Vector3:
@@ -46,11 +47,9 @@ func lut_transmittance(image: Image, point: Vector3, direction: Vector3, setting
 	if not OpticalLut.supports_settings(settings):
 		if Runtime._sphere_exit_distance(point, direction, radius + float(settings["atmosphere_height_km"])) <= 0.0:
 			return Vector3.ONE
-		return Runtime._transmittance_to_sun(point, direction, radius, radius + float(settings["atmosphere_height_km"]),
-			settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"],
-			settings["rayleigh_scattering_per_km"], settings["mie_extinction_per_km"])
+		return Transport.transmittance_to_sun(point, direction, settings)
 	var columns := sample_columns(image, point, direction, settings)
-	var depth: Vector3 = settings["rayleigh_scattering_per_km"] * columns.x + Vector3.ONE * float(settings["mie_extinction_per_km"]) * columns.y
+	var depth: Vector3 = settings["rayleigh_scattering_per_km"] * columns.x + settings["mie_extinction_coefficients"] * columns.y + settings["absorption_extinction_per_km"] * columns.z
 	return Runtime._exp_negative(depth)
 
 
@@ -76,7 +75,7 @@ func test_lut() -> void:
 		if image == null:
 			print("OPTICAL LUT exact fallback settings=", OpticalLut.geometry_signature(settings))
 		else:
-			require(image.get_format() == Image.FORMAT_RGF, "LUT must keep full precision optical columns")
+			require(image.get_format() == Image.FORMAT_RGBF, "LUT must keep full precision optical columns")
 			print("OPTICAL LUT build_usec=", elapsed, " bytes=", image.get_data().size(), " settings=", OpticalLut.geometry_signature(settings))
 		var radius: float = settings["planet_radius_km"]
 		var height: float = settings["atmosphere_height_km"]
@@ -94,9 +93,7 @@ func test_lut() -> void:
 				var mu := lerpf(minimum_mu, 1.0, pow(float(i) / 64.0, 2.0))
 				var direction := Vector3(sqrt(maxf(1.0 - mu * mu, 0.0)), mu, 0.0).normalized()
 				var point := Vector3(0.0, r, 0.0)
-				var reference := Runtime._transmittance_to_sun(point, direction, radius, radius + height,
-					settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"],
-					settings["rayleigh_scattering_per_km"], settings["mie_extinction_per_km"])
+				var reference := Transport.transmittance_to_sun(point, direction, settings)
 				var actual := lut_transmittance(image, point, direction, settings)
 				# An outward ray exactly on the atmosphere boundary traverses vacuum.
 				# The old helper returns zero for that zero-length path; the LUT fixes it.
@@ -144,7 +141,7 @@ func integrate_view(image: Image, settings: Dictionary, origin: Vector3, view: V
 	var cosine := clampf(view.dot(sun), -1.0, 1.0)
 	var rayleigh_phase := 3.0 * (1.0 + cosine * cosine) / (16.0 * PI)
 	var g: float = settings["mie_asymmetry"]
-	var mie_phase := (1.0 - g * g) / (4.0 * PI * pow(maxf(1.0 + g * g - 2.0 * g * cosine, 0.0001), 1.5))
+	var mie_phase := Transport.mie_phase(cosine, g)
 	var beta: Vector3 = settings["rayleigh_scattering_per_km"]
 	var radiance := Vector3.ZERO
 	var transmission := Vector3.ONE
@@ -163,21 +160,11 @@ func integrate_view(image: Image, settings: Dictionary, origin: Vector3, view: V
 		if use_lut:
 			sun_trans = lut_transmittance(image, point, sun, settings)
 		else:
-			sun_trans = Runtime._transmittance_to_sun(point, sun, radius, top,
-				settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"], beta, settings["mie_extinction_per_km"])
-		var source := beta * (rayleigh_density * rayleigh_phase) + Vector3.ONE * (float(settings["mie_scattering_per_km"]) * mie_density * mie_phase)
-		var extinction := beta * rayleigh_density + Vector3.ONE * (float(settings["mie_extinction_per_km"]) * mie_density)
+			sun_trans = Transport.transmittance_to_sun(point, sun, settings)
+		var source := beta * (rayleigh_density * rayleigh_phase) + (settings["mie_scattering_coefficients"] as Vector3) * (mie_density * mie_phase)
+		var extinction := beta * rayleigh_density + (settings["mie_extinction_coefficients"] as Vector3) * mie_density + (settings["absorption_extinction_per_km"] as Vector3) * Transport.absorption_density(altitude, settings)
 		radiance += transmission * sun_trans * source * Runtime._view_segment_factor(extinction, segment)
 		transmission *= Runtime._exp_negative(extinction * segment)
-	if ground >= 0.0:
-		var point := ray_origin + view * ground
-		var ground_trans: Vector3
-		if use_lut:
-			ground_trans = lut_transmittance(image, point, sun, settings)
-		else:
-			ground_trans = Runtime._transmittance_to_sun(point, sun, radius, top,
-				settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"], beta, settings["mie_extinction_per_km"])
-		radiance += transmission * (settings["ground_albedo"] as Vector3) * ground_trans * maxf(point.normalized().dot(sun), 0.0) / PI
 	return radiance
 
 
@@ -210,7 +197,7 @@ func test_view_equivalence() -> void:
 					comparisons += 1
 	print("SKY VIEW comparisons=", comparisons, " max_relative=", maximum_relative,
 		" max_absolute_unit_sun=", maximum_absolute, " normalized_rmse=", sqrt(squared_error / squared_reference))
-	require(maximum_relative < 0.01, "integrated LUT sky/ground differs from direct reference by over 1%")
+	require(maximum_relative < 0.01, "integrated LUT sky differs from direct reference by over 1%")
 
 
 func test_dirty_updates() -> void:
@@ -230,7 +217,7 @@ func test_dirty_updates() -> void:
 		sky._process(0.016)
 	var elapsed := Time.get_ticks_usec() - start
 	var after: Dictionary = sky.atmosphere_cache_stats()
-	for counter in ["settings_sanitizations", "shader_identity_checks", "optical_lut_updates", "snapshot_publications", "material_updates", "cache_misses"]:
+	for counter in ["settings_sanitizations", "shader_identity_checks", "optical_lut_updates", "multi_scattering_lut_updates", "snapshot_publications", "material_updates", "cache_misses"]:
 		require(before[counter] == after[counter], "stable update repeated " + counter)
 	print("ATMOSPHERE STABLE 1000_updates_usec=", elapsed, " counters=", after)
 	var material := sky.sky.sky_material as ShaderMaterial

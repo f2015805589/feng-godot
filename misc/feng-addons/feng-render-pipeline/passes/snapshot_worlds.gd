@@ -13,14 +13,22 @@ extends RefCounted
 ## without the passes.
 
 static var _viewports: Dictionary = {} ## viewport id -> WeakRef
+static var _viewport_owners: Dictionary = {} ## viewport id -> {owner id: WeakRef}; 0 is the legacy lease
 static var _viewport_world_ids: Dictionary = {} ## last observed live World3D identity
 static var _targets_version := 0
 static var _targets_cache: Dictionary = {} ## world id -> {version, targets}
 
-static func register_viewport(viewport: Viewport) -> void:
+## Registrations are idempotent per owner. The optional owner keeps independent
+## producers from removing each other's routes; it is held weakly. Calls without
+## an owner retain their original register/unregister behavior as one legacy lease.
+static func register_viewport(viewport: Viewport, owner: Object = null) -> void:
 	if viewport == null or not is_instance_valid(viewport):
 		return
 	var id := viewport.get_instance_id()
+	var owners: Dictionary = _viewport_owners.get(id, {})
+	var owner_id := owner.get_instance_id() if is_instance_valid(owner) else 0
+	owners[owner_id] = weakref(owner) if owner_id != 0 else null
+	_viewport_owners[id] = owners
 	var existing: WeakRef = _viewports.get(id)
 	if existing != null and existing.get_ref() == viewport:
 		return
@@ -28,10 +36,37 @@ static func register_viewport(viewport: Viewport) -> void:
 	_viewport_world_ids[id] = _world_id(viewport)
 	_targets_version += 1
 
-static func unregister_viewport(viewport: Viewport) -> void:
+static func unregister_viewport(viewport: Viewport, owner: Object = null) -> void:
 	if viewport == null or not is_instance_valid(viewport):
 		return
 	var id := viewport.get_instance_id()
+	var owners: Dictionary = _viewport_owners.get(id, {})
+	owners.erase(owner.get_instance_id() if is_instance_valid(owner) else 0)
+	_prune_owners(owners)
+	if not owners.is_empty():
+		return
+	_remove_viewport(id)
+
+## Release a producer's subtree scan as well as its directly registered viewport.
+## Nodes call this on tree exit; forgotten releases are pruned through WeakRef.
+static func unregister_owner(owner: Object) -> void:
+	if not is_instance_valid(owner):
+		return
+	var owner_id := owner.get_instance_id()
+	for id in _viewport_owners.keys():
+		var owners: Dictionary = _viewport_owners[id]
+		owners.erase(owner_id)
+		_prune_owners(owners)
+		if owners.is_empty():
+			_remove_viewport(id)
+
+static func _prune_owners(owners: Dictionary) -> void:
+	for owner_id in owners.keys():
+		if owner_id != 0 and owners[owner_id].get_ref() == null:
+			owners.erase(owner_id)
+
+static func _remove_viewport(id: int) -> void:
+	_viewport_owners.erase(id)
 	if _viewports.erase(id):
 		_viewport_world_ids.erase(id)
 		_targets_version += 1
@@ -46,10 +81,10 @@ static func prune() -> void:
 	for id in _viewports.keys():
 		var reference: WeakRef = _viewports[id]
 		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null:
-			_viewports.erase(id)
-			_viewport_world_ids.erase(id)
-			_targets_version += 1
+		var owners: Dictionary = _viewport_owners.get(id, {})
+		_prune_owners(owners)
+		if viewport == null or owners.is_empty():
+			_remove_viewport(id)
 		else:
 			var world_id := _world_id(viewport)
 			if _viewport_world_ids.get(id, -1) != world_id:
@@ -61,13 +96,13 @@ static func _world_id(viewport: Viewport) -> int:
 	return world.get_instance_id() if world != null else 0
 
 ## Registers every Viewport in the subtree rooted at node.
-static func scan(node: Node) -> void:
+static func scan(node: Node, owner: Object = null) -> void:
 	if node == null:
 		return
 	if node is Viewport:
-		register_viewport(node)
+		register_viewport(node, owner)
 	for child in node.get_children():
-		scan(child)
+		scan(child, owner)
 
 ## Render targets whose viewports draw the given world. Viewport edits bump the
 ## version so a published targets array is reused until the set actually changes.

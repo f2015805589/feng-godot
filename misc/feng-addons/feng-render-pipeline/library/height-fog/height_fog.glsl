@@ -16,7 +16,18 @@ layout(set = 0, binding = 2, std140) uniform FogParams {
 	vec4 exponential_fog_color; // rgb = FogInscatteringColor, a = MinFogOpacity (1 - FogMaxOpacity).
 	vec4 inscattering_light_direction; // xyz = direction toward sun, w = DirectionalInscatteringStartDistance or -1 when disabled.
 	vec4 directional_inscattering_color; // rgb = inscattering color premultiplied by sun luminance, w = DirectionalInscatteringExponent.
+	vec4 atmosphere_parameters[16];
 } params;
+
+layout(set = 0, binding = 3) uniform sampler2D atmosphere_optical_texture;
+layout(set = 0, binding = 4) uniform sampler2D atmosphere_multiple_texture;
+#define ATMO_PARAMS params.atmosphere_parameters
+#define ATMO_OPTICAL atmosphere_optical_texture
+#define ATMO_MULTIPLE atmosphere_multiple_texture
+#include "atmosphere_inc.glslinc"
+#undef ATMO_PARAMS
+#undef ATMO_OPTICAL
+#undef ATMO_MULTIPLE
 
 layout(push_constant, std430) uniform PassParameters {
 	vec4 parameters;
@@ -157,5 +168,13 @@ void main() {
 
 	vec4 fog = get_exponential_height_fog(camera_to_receiver);
 	vec4 scene_color = imageLoad(color_image, pixel);
+	// Background sky has already traversed the whole atmosphere. Only surfaces
+	// need aerial perspective; fog still retains its authored sky contribution.
+	if (depth > 0.0 && params.atmosphere_parameters[12].z > 0.5) {
+		vec3 atmospheric_radiance;
+		vec3 atmospheric_transmission;
+		frp_atmo_aerial(camera_to_receiver, vec3(0.0), atmospheric_radiance, atmospheric_transmission);
+		scene_color.rgb = scene_color.rgb * atmospheric_transmission + atmospheric_radiance * pc.parameters.y;
+	}
 	imageStore(color_image, pixel, vec4(fog.rgb * pc.parameters.y + scene_color.rgb * fog.a, scene_color.a));
 }
