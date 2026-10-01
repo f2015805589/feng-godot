@@ -176,7 +176,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		rayleigh_scattering = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 2.0, 0.01, "or_greater") var rayleigh_scattering_coefficient_scale: float:
+@export_range(0.0, 2.0, 0.000001, "or_greater") var rayleigh_scattering_coefficient_scale: float:
 	get:
 		return maxf(FengSkyParameters.finite_float(rayleigh_scattering_scale, 1.0), 0.0) * RAYLEIGH_COEFFICIENT_BASIS
 	set(value):
@@ -202,7 +202,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		mie_scattering = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 5.0, 0.01, "or_greater") var mie_scattering_coefficient_scale: float:
+@export_range(0.0, 5.0, 0.000001, "or_greater") var mie_scattering_coefficient_scale: float:
 	get:
 		return maxf(FengSkyParameters.finite_float(mie_scattering_scale, 1.0), 0.0) * MIE_SCATTERING_COEFFICIENT_BASIS
 	set(value):
@@ -222,7 +222,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		mie_absorption = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 5.0, 0.01, "or_greater") var mie_absorption_coefficient_scale: float:
+@export_range(0.0, 5.0, 0.000001, "or_greater") var mie_absorption_coefficient_scale: float:
 	get:
 		return maxf(FengSkyParameters.finite_float(mie_absorption_scale, 1.0), 0.0) * MIE_ABSORPTION_COEFFICIENT_BASIS
 	set(value):
@@ -253,7 +253,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		absorption = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 0.2, 0.001, "or_greater") var other_absorption_coefficient_scale: float:
+@export_range(0.0, 0.2, 0.000001, "or_greater") var other_absorption_coefficient_scale: float:
 	get:
 		return maxf(FengSkyParameters.finite_float(absorption_scale, 1.0), 0.0) * OTHER_ABSORPTION_COEFFICIENT_BASIS
 	set(value):
