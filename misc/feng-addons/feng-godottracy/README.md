@@ -7,19 +7,28 @@ own profiling zones to it.
 ## The menu item
 
 **Debug > Tracy Profiler** starts the profiler. One click, nothing to configure:
-the profiler ships in this addon's `bin` folder (`bin/tracy-profiler.exe`), and
+the Windows profiler ships in this addon's `bin` folder (`bin/tracy-profiler.exe`), and
 is started from there. When that file is missing - a fresh checkout, where the
 `bin` folder is not part of the repository - it is downloaded once from the Tracy
 release that matches the compiled-in client and installed in the same folder.
 
-Other copies are only used when the addon has none, in this order:
+Executable selection checks, in order:
 
 1. **Editor Settings > Tracy > Profiler > Executable Path**, for anyone who keeps
    a specific build somewhere else.
-2. `FENG_TRACY_PATH` (a folder or a file).
-3. Next to the editor.
-4. The downloads folder, including the versioned folder a Tracy release unpacks
+2. This addon's `bin/tracy-profiler.exe`.
+3. `FENG_TRACY_PATH` (a folder or a file).
+4. Next to the editor.
+5. The downloads folder, including the versioned folder a Tracy release unpacks
    into.
+
+Automatic installation uses the matching Windows release archive and is only
+offered on Windows. On Linux or macOS, set the executable setting (or
+`FENG_TRACY_PATH` as a full file path) to a compatible native profiler; the plugin
+does not download and attempt to run the Windows executable there.
+
+The menu item and its separator have separate owned IDs. Disabling or reloading
+the plugin removes only those items, even if another addon rearranges the menu.
 
 Everything else happens inside the profiler: it lists the running editors, and
 **Connect** attaches to the one you pick.

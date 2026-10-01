@@ -110,7 +110,8 @@ func _check_default_spec_and_schedule(renderer_script: Script) -> void:
 			"default Eye Adaptation/Bloom/Color Grade order is wrong")
 	require(renderer.get_validation_warnings().is_empty(), "default Bloom schedule must validate: %s" % [renderer.get_validation_warnings()])
 
-	# The dependency must still hold while TAA is disabled by default.
+	# The dependency must still hold when the author disables TAA.
+	_find_native(renderer, 6).enabled = false
 	var normal_passes: Array[FRP_BASE] = renderer.passes.duplicate()
 	var invalid: Array[FRP_BASE] = normal_passes.duplicate()
 	var moved_bloom = _find_native(renderer, 8)
@@ -325,6 +326,10 @@ func _make_scene() -> void:
 	var renderer_script = load("res://addons/feng-render-pipeline/renderer.gd")
 	require(renderer_script != null, "FRP renderer script did not load")
 	renderer = renderer_script.new()
+	# This fixture tests MSAA resolve and FSR2 with no native temporal pass.
+	# Fresh resources enable TAA, so disable it explicitly instead of relying on
+	# the old default; keep the disabled-TAA assertion in the upscaling branch.
+	_find_native(renderer, 6).enabled = false
 	renderer.apply(compositor)
 	require(renderer.get_validation_warnings().is_empty(), "default Glow pipeline must validate: %s" % [renderer.get_validation_warnings()])
 	bloom_entry = _find_native(renderer, 8)

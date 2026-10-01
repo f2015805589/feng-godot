@@ -280,6 +280,6 @@ private:
 	real_t _signature_density = 0;
 	std::map<std::pair<int, int>, uint32_t> _signatures;
 	uint64_t _cache_bytes = 0;
-	Result produce(const Request &request, const Snapshot &source);
-	void load_cells(const Request &request, const Snapshot &source, Result &result);
+	Result produce(const Request &request, const std::shared_ptr<const Snapshot> &p_source);
+	void load_cells(const Request &request, const std::shared_ptr<const Snapshot> &p_source, Result &result);
 };

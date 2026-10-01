@@ -657,14 +657,13 @@ func run() -> void:
 	# same list, so a project with and without the addon runs the same frame.
 	var spec_default_order: Array = spec.get("default_order", [])
 	require(spec_default_order == EXPECTED_NATIVE_ORDER, "the engine's default pass order changed: %s" % [spec_default_order])
-	# The default enabled set is the default pass set: every non optional entry is
-	# enabled and the one optional entry (Temporal AA) ships disabled, so a fresh
-	# pipeline runs the default passes and the user opts into TAA by enabling it.
+	# All native entries, including optional TAA, start enabled in a fresh resource.
+	# Optional means removable, not disabled by default.
 	var enabled_native_ids := []
 	for value in native_values:
 		if value.enabled:
 			enabled_native_ids.append(_native_id(value))
-	require(enabled_native_ids == [0, 1, 2, 3, 4, 5, 8, 7], "default enabled pass set changed: %s" % [enabled_native_ids])
+	require(enabled_native_ids == EXPECTED_NATIVE_ORDER, "default enabled pass set changed: %s" % [enabled_native_ids])
 
 	var manifest_property := ""
 	for candidate in ["_synced_library", "library_manifest", "_library_manifest"]:
@@ -677,7 +676,7 @@ func run() -> void:
 		"renderer library manifest lost Color Grade: %s" % [manifest])
 	# Manifest metadata seeds Eye Adaptation before Bloom and Color Grade,
 	# enabled Magic GI after Lighting, enabled Height Fog after Sky, and disabled
-	# Debug Buffers after Post Process. Other effects remain opt-in.
+	# Debug Buffers after Post Process. Only Debug starts disabled.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
@@ -698,6 +697,7 @@ func run() -> void:
 	var seeded_post_index := -1
 	for i in unified_renderer.passes.size():
 		var entry = unified_renderer.passes[i]
+		require(entry.enabled == (entry.stable_id != &"library:debug_buffers"), "only Debug Buffers may start disabled: %s" % entry.stable_id)
 		if _native_id(entry) == 3: seeded_lighting_index = i
 		if _native_id(entry) == 4: seeded_sky_index = i
 		if _native_id(entry) == 5: seeded_transparent_index = i
@@ -865,7 +865,10 @@ shader_file = ExtResource("2")
 			persisted_grade = value
 			break
 	require(persisted_grade != null, "could not find the library Color Grade pass in a new renderer")
-	persisted_grade.enabled = true
+	persisted_grade.enabled = false
+	persisted_grade.parameters = Vector4(0.8, 1.2, 1.4, 0.9)
+	_native_pass(persisted_renderer, 6).enabled = false
+	_native_pass(persisted_renderer, 6).implementation.enabled = false
 	var persisted_lighting = _native_pass(persisted_renderer, 4)
 	require(persisted_lighting != null, "could not find native sky pass for persistence test")
 	persisted_lighting.enabled = false
@@ -883,8 +886,12 @@ shader_file = ExtResource("2")
 		var value = reloaded_renderer.passes[i]
 		if _native_id(value) < 0 and _library_matches(value, "color-grade/color_grade.tres"):
 			reloaded_grade_index = i
+			require(not value.enabled, "loading must preserve deliberately disabled Color Grade")
+			require(value.parameters == Vector4(0.8, 1.2, 1.4, 0.9), "loading must preserve authored Color Grade parameters")
 		if _native_id(value) == 6:
 			reloaded_temporal_index = i
+			require(not value.enabled, "loading must preserve deliberately disabled TAA")
+			require(not value.implementation.enabled, "loading must preserve the nested TAA implementation switch")
 		if _native_id(value) == 7:
 			reloaded_post_index = i
 	var reloaded_bloom_index := -1
@@ -893,6 +900,14 @@ shader_file = ExtResource("2")
 			reloaded_bloom_index = i
 	require(reloaded_grade_index >= 0 and reloaded_temporal_index >= 0 and reloaded_bloom_index >= 0 and reloaded_post_index >= 0, "could not locate the library pass or the temporal/Bloom/Post entries")
 	require(reloaded_temporal_index < reloaded_bloom_index and reloaded_bloom_index < reloaded_grade_index and reloaded_grade_index < reloaded_post_index, "the library pass position was not persisted after Bloom and before Post")
+	# The implementation switch is independent of the wrapper. An enabled entry
+	# carrying a deliberately disabled implementation must remain effectively off.
+	_native_pass(persisted_renderer, 6).enabled = true
+	require(ResourceSaver.save(persisted_renderer, persisted_path) == OK, "nested-switch fixture did not save")
+	var nested_renderer = ResourceLoader.load(persisted_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	var nested_temporal = _native_pass(nested_renderer, 6)
+	require(nested_temporal.enabled and not nested_temporal.implementation.enabled and not nested_temporal.is_enabled(),
+		"new defaults replaced the saved disabled TAA implementation")
 	print("PASS renderer save/load preserves native state and custom order")
 
 	# Load a hand-authored legacy .tres with no schema version, only one custom

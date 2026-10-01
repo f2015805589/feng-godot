@@ -65,6 +65,13 @@ func run() -> void:
 	for entry in entries:
 		if entry is FengBuiltinPass and entry.native_id == 6:
 			taa = entry
+		elif entry.stable_id == &"library:eye_adaptation":
+			# Metering continues to settle between captures even without another
+			# camera. This test isolates view bindings, not exposure adaptation.
+			entry.enabled = false
+	# This isolation test explicitly authors TAA off, then enables it in one view.
+	# Fresh resources now enable TAA; the assertion below still verifies no mutation.
+	taa.enabled = false
 	var viewports: Array[SubViewport] = []
 	var compositors: Array[FengCompositor] = []
 	var volumes: Array[FengVolume] = []
@@ -123,11 +130,14 @@ func run() -> void:
 	var pixel_b := viewports[1].get_texture().get_image().get_pixel(48, 48)
 	assert(pixel_a.r < pixel_a.g * 0.6 and pixel_b.g < pixel_b.r * 0.6,
 			"shared shader must use each view's frame parameters")
+	print("VIEW_STATE baseline a=", pixel_a, " b=", pixel_b)
 	var shared_shader: RID = tint._shader
 	for index in 4:
 		volumes[0].enabled = index % 2 != 0
 		await settle()
 		var current_b := viewports[1].get_texture().get_image().get_pixel(48, 48)
+		if absf(current_b.g - pixel_b.g) >= 0.02:
+			print("VIEW_STATE crossing=", index, " a_volume=", volumes[0].enabled, " b=", current_b, " delta_g=", absf(current_b.g - pixel_b.g), " viewB parameters=", compositors[1]._view_state._resolved)
 		assert(absf(current_b.g - pixel_b.g) < 0.02, "enter/exit in another view changed this view")
 		assert(tint._shader == shared_shader, "boundary crossing recreated shared shader objects")
 	# Author edits rebuild the view plan and isolate new plugin instances.
@@ -176,6 +186,7 @@ func run() -> void:
 	assert(post_a.implementation.overlay != post_b.implementation.overlay)
 	var ldr := viewports[0].get_texture().get_image().get_pixel(48, 48)
 	var hdr := viewports[1].get_texture().get_image().get_pixel(48, 48)
+	print("VIEW_STATE overlay ldr=", ldr, " hdr=", hdr, " enabled=", post_a.enabled, "/", post_b.enabled, " keywords=", post_a.implementation.overlay.shader_keywords, "/", post_b.implementation.overlay.shader_keywords, " target=", post_a.implementation.overlay.raster_target, "/", post_b.implementation.overlay.raster_target, " placement=", compositors[0]._view_state._resolved.get(7), "/", compositors[1]._view_state._resolved.get(7))
 	assert(ldr.g > 0.9 and ldr.r < 0.1 and hdr.r > hdr.g + 0.15,
 			"per-view overlay placement/keywords must reach different GPU outputs")
 	assert(overlay.shader_keywords.is_empty(), "overlay execution wrote into shared author settings")

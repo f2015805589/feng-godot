@@ -16,7 +16,6 @@
 #include "terrain_3d_region.h"
 
 #include "logger.h"
-#include "terrain_3d.h"
 #include "terrain_3d_util.h"
 #include "terrain_surface_idweight.h"
 
@@ -238,12 +237,8 @@ Dictionary Terrain3DRegion::create_surface_conversion() const {
 	}
 	Ref<Terrain3DRegion> copy;
 	copy.instantiate();
-	Dictionary data = get_data();
-	data["height_map"] = _height_map.is_valid() ? _height_map->duplicate() : Ref<Resource>();
-	data["control_map"] = _control_map->duplicate();
-	data["color_map"] = _color_map.is_valid() ? _color_map->duplicate() : Ref<Resource>();
-	data["instances"] = _instances.duplicate(true);
-	copy->set_data(data);
+	// Conversion preserves all working flags, unlike an undo-oriented deep duplicate.
+	copy->set_data(_get_data_deep_copy(false));
 	// The converted payload is built at the region's own resolution and then
 	// replicated up to the copy's density, which set_data() carried over.
 	Ref<Image> surface = Image::create_from_data(_region_size, _region_size, false, IDWEIGHT_IMAGE_FORMAT, converted);

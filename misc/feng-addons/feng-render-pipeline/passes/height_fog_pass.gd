@@ -111,42 +111,13 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	# world-to-clip matrix. The shader must apply the camera transform as well.
 	var inverse_projection: Projection = scene_data.get_view_projection(view).inverse()
 	var camera: Transform3D = scene_data.get_cam_transform()
-	var density := float(snapshot.get("fog_density", 0.0))
-	var falloff := float(snapshot.get("fog_height_falloff", 0.0))
-	var height := float(snapshot.get("fog_height", 0.0))
-	var density2 := float(snapshot.get("second_fog_density", 0.0))
-	var falloff2 := float(snapshot.get("second_fog_height_falloff", 0.0))
-	var height2 := float(snapshot.get("second_fog_height", 0.0))
-	# GlobalDensity = FogDensity * exp2(-FogHeightFalloff * (CameraY - FogHeight))
-	# with Unreal's exponent bound [-125, 126].
-	var global_density := density * pow(2.0, clampf(-falloff * (camera.origin.y - height), -125.0, 126.0))
-	var global_density2 := density2 * pow(2.0, clampf(-falloff2 * (camera.origin.y - height2), -125.0, 126.0))
-	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
-	var sun_direction: Variant = snapshot.get("sun_direction", Vector3.ZERO)
-	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
 	var values := PackedFloat32Array()
 	_append_projection(values, inverse_projection)
 	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
 	_append_transform(values, view_to_world)
-	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0]))
-	values.append_array(PackedFloat32Array([global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0))]))
-	values.append_array(PackedFloat32Array([global_density2, falloff2, density2, height2]))
-	values.append_array(PackedFloat32Array([density, height, 0.0, float(snapshot.get("cutoff_distance", 0.0))]))
-	if fog_color is Vector3:
-		values.append_array(PackedFloat32Array([fog_color.x, fog_color.y, fog_color.z,
-				float(snapshot.get("min_opacity", 0.0))]))
-	else:
-		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, float(snapshot.get("min_opacity", 0.0))]))
-	if sun_direction is Vector3:
-		values.append_array(PackedFloat32Array([sun_direction.x, sun_direction.y, sun_direction.z,
-				float(snapshot.get("inscattering_start", -1.0))]))
-	else:
-		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, -1.0]))
-	if inscattering_color is Vector3:
-		values.append_array(PackedFloat32Array([inscattering_color.x, inscattering_color.y, inscattering_color.z,
-				clampf(float(snapshot.get("inscattering_exponent", 4.0)), 0.000001, 1000.0)]))
-	else:
-		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 4.0]))
+	# Both paths use the same seven vec4s. Compute applies the scale through
+	# its push constant, so its reserved packet lane remains zero.
+	values.append_array(_make_forward_parameters(snapshot, camera, 0.0))
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
 
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:

@@ -74,6 +74,7 @@ private:
 	bool _edited = false; // Marked for undo/redo storage
 	bool _modified = false; // Marked for saving
 	Vector2i _location = V2I_MAX;
+	Dictionary _get_data_deep_copy(bool p_copy_surface = true) const;
 
 public:
 	Terrain3DRegion() {}

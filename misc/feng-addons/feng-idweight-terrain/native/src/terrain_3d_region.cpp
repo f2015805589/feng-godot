@@ -12,7 +12,7 @@
 // and dump).
 
 #include "terrain_3d_region.h"
-#include "terrain_3d.h"
+#include "terrain_3d_data.h"
 
 #include "logger.h"
 #include "terrain_3d_util.h"

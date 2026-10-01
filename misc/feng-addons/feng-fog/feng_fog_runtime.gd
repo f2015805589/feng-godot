@@ -160,7 +160,10 @@ static func snapshots() -> Array[Dictionary]:
 
 static func _render_targets(world: World3D) -> Array[RID]:
 	var worlds := _snapshot_worlds()
-	return worlds.targets_for(world) if worlds != null else []
+	if worlds != null:
+		return worlds.targets_for(world)
+	var targets: Array[RID] = []
+	return targets
 
 ## The sun for a world: the component's explicit light when set, otherwise the
 ## first enabled DirectionalLight3D on the same World3D — Unreal's equivalent is

@@ -84,7 +84,11 @@ void main() {
 	float start_distance = 1.5;
 	float start_time = start_distance / max(speed, 0.001);
 	float exponential_m = (1.0 / 60.0) / ((1.0 - exp2(-speed / 60.0)) * start_time);
-	float exponential = log_old + log_diff * (1.0 - exp2(-params.delta_time * speed)) * exponential_m;
+	// The 60 Hz slope correction can exceed one at high adaptation speeds.
+	// Bound the interpolation weight, not just the final exposure limits: a
+	// long frame must approach the target EV without crossing it and oscillating.
+	float exponential_weight = clamp((1.0 - exp2(-params.delta_time * speed)) * exponential_m, 0.0, 1.0);
+	float exponential = log_old + log_diff * exponential_weight;
 	float linear = log_old + sign(log_diff) * min(abs(log_diff), params.delta_time * speed);
 	float adapted = exp2(abs(log_diff) > start_distance ? linear : exponential);
 	if (params.force_target > 0.5 || params.set_immediate > 0.5) {

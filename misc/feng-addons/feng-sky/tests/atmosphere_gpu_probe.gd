@@ -363,7 +363,7 @@ func run() -> void:
 	await settle(60)
 	var atmosphere_repeat_metrics: Dictionary = await measure_frame_metrics("built_in_atmosphere_repeat", 120)
 	print("SKY GPU PASS resolution=", root.size,
-		" screen_ray_steps=", 8, " sun_samples_per_step=", 6,
+		" screen_ray_steps=", 8, " sun_path_mode=LUT_or_exact_extreme_fallback",
 		" atmosphere_cache=", _sky.atmosphere_cache_stats(),
 		" profile_frame_count=", 120,
 		" atmosphere_process_ms=", atmosphere_metrics["process_ms"],

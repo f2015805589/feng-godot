@@ -8,6 +8,13 @@ func _initialize() -> void:
 
 
 func run() -> void:
+	# The pipeline addon is optional too. Its absence must yield a correctly
+	# typed empty target list rather than a runtime Array[RID] conversion error.
+	var targets: Array[RID] = FogRuntime._render_targets(World3D.new())
+	if not targets.is_empty():
+		_fail("an absent pipeline registry unexpectedly returned render targets")
+		return
+
 	var before_install := FogRuntime._sky_snapshot_for_world(42)
 	if not before_install.is_empty():
 		_fail("an absent Feng Sky runtime unexpectedly returned a snapshot")

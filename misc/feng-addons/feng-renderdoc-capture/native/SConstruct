@@ -14,6 +14,13 @@ GODOT_CPP = os.path.join(
 
 env = SConscript(os.path.join(GODOT_CPP, "SConstruct"))
 
+if env["platform"] == "linux":
+    # The shared godot-cpp checkout lies outside this SCons root. Its absolute
+    # object paths can exceed Linux's per-argument limit when archiving the
+    # bindings; let SCons spill the argument list into a GNU ar response file.
+    env["ARCOM_ORIG"] = env["ARCOM"]
+    env["ARCOM"] = "${TEMPFILE('$ARCOM_ORIG', '$ARCOMSTR')}"
+
 env.Append(CPPPATH=["src/"])
 env.Append(CPPPATH=[os.path.join(GODOT_CPP, "gdextension")])
 if env["platform"] == "linux":

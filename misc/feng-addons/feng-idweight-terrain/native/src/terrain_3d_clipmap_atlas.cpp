@@ -21,9 +21,8 @@
 // decides *what* those textures hold.
 
 #include "terrain_3d_clipmap_atlas.h"
+#include "terrain_3d_baked_texture_arrays.h"
 
-#include <godot_cpp/classes/rd_texture_format.hpp>
-#include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/math.hpp>
@@ -201,15 +200,21 @@ bool Terrain3DClipmapAtlas::_pack_quadtree(const std::vector<PackedItem> &p_item
 			const int h1 = MAX(1, node.h / 2);
 			const int w2 = node.w - w1;
 			const int h2 = node.h - h1;
-			if (node.w > size && w1 >= size) {
+			if (w1 >= size && h1 >= size) {
 				free_nodes.push_back({ node.x, node.y + h1, w1, h2 });
 				free_nodes.push_back({ node.x + w1, node.y, w2, node.h });
 				node.w = w1;
 				node.h = h1;
 				continue;
 			}
-			if (node.h > size && h1 >= size) {
-				free_nodes.push_back({ node.x + w1, node.y, w2, h1 });
+			// A rectangular node may fit a split on only one axis. Keep the other
+			// extent whole; a sibling cut out of it would overlap the placed block.
+			if (w1 >= size) {
+				free_nodes.push_back({ node.x + w1, node.y, w2, node.h });
+				node.w = w1;
+				continue;
+			}
+			if (h1 >= size) {
 				free_nodes.push_back({ node.x, node.y + h1, node.w, h2 });
 				node.h = h1;
 				continue;
@@ -587,40 +592,11 @@ void Terrain3DClipmapAtlas::_ensure_baked() {
 		// first moment a device is certain.
 		return;
 	}
-	_free_baked();
-	Ref<RDTextureFormat> format;
-	format.instantiate();
-	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
-	format->set_format(RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT);
-	format->set_width(uint32_t(_layout.width));
-	format->set_height(uint32_t(_layout.height));
-	format->set_depth(1);
-	format->set_array_layers(2);
-	format->set_mipmaps(1);
-	// Storage, so a producer writes a rect; sampling, so the arm reads it; update, because the
-	// producer's pass is issued against the same texture the material binds.
-	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
-			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT);
-	Ref<RDTextureView> view;
-	view.instantiate();
-	TypedArray<PackedByteArray> initial;
-	for (int channel = 0; channel < get_baked_channel_count(); channel++) {
-		RID device = rd->texture_create(format, view, initial);
-		RID shader = device.is_valid()
-				? server->texture_rd_create(device, RenderingServer::TEXTURE_LAYERED_2D_ARRAY)
-				: RID();
-		if (!shader.is_valid()) {
-			if (device.is_valid()) {
-				rd->free_rid(device);
-			}
-			LOG(ERROR, "Could not allocate clipmap atlas baked channel ", channel, " (", get_source_name(), ")");
-			_free_baked();
-			return;
-		}
-		rd->set_resource_name(device, "Terrain3D Clipmap atlas " + get_source_name() + " baked " +
-						String::num_int64(channel));
-		_baked_rd.push_back(device);
-		_baked_rs.push_back(shader);
+	const int failed = terrain_baked_arrays::create(server, rd, _layout.width, _layout.height,
+			2, get_baked_channel_count(), "Terrain3D Clipmap atlas " + get_source_name() + " baked ",
+			_baked_rd, _baked_rs);
+	if (failed >= 0) {
+		LOG(ERROR, "Could not allocate clipmap atlas baked channel ", failed, " (", get_source_name(), ")");
 	}
 }
 
@@ -630,18 +606,7 @@ void Terrain3DClipmapAtlas::_free_baked() {
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
 	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
-	for (const RID &rid : _baked_rs) {
-		if (rid.is_valid() && server != nullptr) {
-			server->free_rid(rid);
-		}
-	}
-	for (const RID &rid : _baked_rd) {
-		if (rid.is_valid() && rd != nullptr) {
-			rd->free_rid(rid);
-		}
-	}
-	_baked_rd.clear();
-	_baked_rs.clear();
+	terrain_baked_arrays::clear(server, rd, _baked_rd, _baked_rs);
 }
 
 RID Terrain3DClipmapAtlas::get_baked_device_rid(const int p_channel) const {

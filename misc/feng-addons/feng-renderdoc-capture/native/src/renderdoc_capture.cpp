@@ -200,17 +200,20 @@ int RenderDocCapture::relaunch_with_renderdoc(const String &p_renderdoc_cmd) {
 	PackedStringArray cmdline_parts;
 	// renderdoccmd launch <exe> <args...> starts the target hooked into
 	// RenderDoc without forcing a graphics API; the project renderer (e.g.
-	// D3D12) is preserved. argv[0] of get_cmdline_args() is the executable
-	// path; the rest carries the original editor/project arguments.
+	// D3D12) is preserved. Godot's argument list excludes the executable;
+	// user arguments after the separator are exposed by a separate API.
 	cmdline_parts.push_back("launch");
 	cmdline_parts.push_back(exe_path);
-	for (int i = 1; i < args.size(); i++) {
-		cmdline_parts.push_back(args[i]);
+	cmdline_parts.append_array(args);
+	const PackedStringArray user_args = OS::get_singleton()->get_cmdline_user_args();
+	if (!user_args.is_empty()) {
+		cmdline_parts.push_back("--");
+		cmdline_parts.append_array(user_args);
 	}
 	String full_cmd = p_renderdoc_cmd + String(" ") + String(" ").join(cmdline_parts);
 	UtilityFunctions::print("[frd] launching: ", full_cmd);
 	int32_t ok = OS::get_singleton()->create_process(p_renderdoc_cmd, cmdline_parts);
-	if (ok == 0) {
+	if (ok <= 0) {
 		UtilityFunctions::printerr("[frd] failed to launch renderdoccmd");
 		return -1;
 	}

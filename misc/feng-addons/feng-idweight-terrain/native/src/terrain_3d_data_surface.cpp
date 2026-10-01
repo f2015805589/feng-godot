@@ -23,6 +23,43 @@
 #include <unordered_map>
 #include <vector>
 
+// Region-layout changes copy the authored surface independently of legacy maps.
+// Density can differ between loaded regions or be capped by the destination size;
+// only nearest byte copies are valid for packed material IDs.
+void Terrain3DData::_copy_paste_surface_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect,
+		const Rect2i &p_dst_rect, Terrain3DRegion *p_dst_region) {
+	if (!p_src_region || !p_dst_region || p_src_region->get_surface_map().is_null()) {
+		return;
+	}
+	if (!p_dst_region->ensure_surface_map()) {
+		return;
+	}
+	const Ref<Image> source = p_src_region->get_surface_map();
+	const Ref<Image> target = p_dst_region->get_surface_map();
+	const int src_density = p_src_region->get_surface_density();
+	const int dst_density = p_dst_region->get_surface_density();
+	const Rect2i src_rect(p_src_rect.position * src_density, p_src_rect.size * src_density);
+	const Vector2i dst_origin = p_dst_rect.position * dst_density;
+	if (src_density == dst_density) {
+		target->blit_rect(source, src_rect, dst_origin);
+		return;
+	}
+	const PackedByteArray source_bytes = source->get_data();
+	PackedByteArray target_bytes = target->get_data();
+	const uint8_t *src = source_bytes.ptr();
+	uint8_t *dst = target_bytes.ptrw();
+	const Vector2i size = p_dst_rect.size * dst_density;
+	for (int y = 0; y < size.y; ++y) {
+		const int sy = src_rect.position.y + y * src_density / dst_density;
+		for (int x = 0; x < size.x; ++x) {
+			const int sx = src_rect.position.x + x * src_density / dst_density;
+			std::memcpy(dst + (int64_t(dst_origin.y + y) * target->get_width() + dst_origin.x + x) * 2,
+					src + (int64_t(sy) * source->get_width() + sx) * 2, 2);
+		}
+	}
+	target->set_data(target->get_width(), target->get_height(), false, IDWEIGHT_IMAGE_FORMAT, target_bytes);
+}
+
 // Virtual texture page production. Reads the region's R16 surface map once and
 // resamples it into every page of one local mip.
 //

@@ -8,7 +8,7 @@ FRP 使用一个 `FengRenderer` 资源编排引擎原生操作与自定义 Pass�
 
 1. 设置 `rendering/renderer/rendering_method = "frp"`，启用 Feng Render Pipeline 插件。
 2. 创建 `FengRenderer`，默认包含 9 个引擎 Pass 与 `Color Grade`、`Magic GI`、`Height Fog`、`Eye Adaptation`、
-	`Debug Buffers` 五个库 Pass，共 14 个条目；TAA、Color Grade、Debug Buffers 默认关闭。Bloom 条目默认开启，具体 Glow 效果仍由 Environment 的 Glow 设置控制。
+	`Debug Buffers` 五个库 Pass，共 14 个条目；仅 Debug Buffers 默认关闭，其余 13 个条目默认开启。Color Grade 使用中性参数（1, 1, 1, 1）；已保存资源的开关和参数不被覆盖。Bloom 条目默认开启，具体 Glow 效果仍由 Environment 的 Glow 设置控制。
 3. 创建 `FengCompositor`，设置 Renderer，赋给 Camera3D 或 WorldEnvironment（或者用项目设置，
    见下文"项目级管线"）。
 4. 在 Inspector 的 Passes 数组中拖动排序，编辑条目的 Enabled。条目显示具体名称，
@@ -69,11 +69,13 @@ SSAO、SSIL、SSR、全局光照（SDFGI / VoxelGI）与调试几何**不是 FRP
 颜色分级不是引擎条目，而是库里的 `Color Grade` Pass——它的 shader 和参数因此可以随插件更新，
 不需要改引擎。**一个新 Renderer 的列表正好是这 14 条**：9 个引擎条目 + 五个默认库条目。
 库里的其它模板（Tint / Blur H,V / FXAA / Bloom-lite×3）**不进默认列表**，只从检查器的
-**Add Pass from Library** 添加；它们和 Color Grade 一样默认关闭，打开条目即生效。
+**Add Pass from Library** 添加；它们默认关闭，打开条目即生效。
 
 `Magic GI` 在 Lighting 后、Sky 前将 surface PRT 的传输系数与当前太阳/环境 SH 点积，作为漫反射间接光加回 HDR；它只使用当前视口匹配的最新有效烘焙，动态光照变化不需要重烘焙。没有有效烘焙或当前 viewport 不匹配时，该 pass 清零自己的诊断纹理并保持画面不变。`Debug Buffers` 默认关闭且不分配输出，可切换到 albedo、view-space normal、AO、roughness、metallic、motion vectors 或 Magic GI 贡献；启用时在 Post Process 后直接显示所选原始缓冲。
 
 `Eye Adaptation` 在 TAA 后测量 HDR 场景色，位于 native Bloom 和 Color Grade 前；默认顺序及依赖校验都保证 Eye Adaptation 先于 Bloom。Bloom 条目负责执行 Environment Glow 的模糊准备，Environment 的 `glow_enabled`、levels、strength、blend mode、intensity 与 glow map 继续配置具体效果；关闭 Bloom 条目会禁用这帧的 Environment Glow 合成。FRP 默认在 Post Process 前准备 Bloom，因此 Glow 使用 DoF 处理前的 HDR 颜色；FRP 的无资源默认调度也使用这个顺序。其它渲染器的旧 Post Process helper 仍按 DoF 后 Glow 的顺序运行。没有 FRP 管线资源时，引擎原生 Glow 路径照常工作。UE 也是先计算曝光，再做 Bloom，并在 Tonemap 中应用曝光和颜色分级。该 Pass 自身有两个全局开关：`extend_default_luminance_range` 切换 UE 的传统亮度范围与 EV100 范围，`pre_exposure` 用上一帧已完成的曝光值预缩放场景光照。相机曝光参数放在该 pass 的 Volume 模块中，包括 Histogram / Basic / Manual 测光、Low/High Percent、亮度或 EV100 上下限、Speed Up/Down、曝光补偿、补偿曲线、测光遮罩，以及手动模式的光圈、快门和 ISO。`CurveTexture` 的 X 轴 0 到 1 对应 UE 默认的 -10 到 20 EV100 曲线区间。开启项目的物理光照单位后，FRP 的点光、聚光与矩形光按 UE 的流明立体角和 π 系数换算。
+
+TAA 的历史 HDR 颜色在裁剪和混合前按 `本帧 pre-exposure / 历史帧 pre-exposure` 重标定，避免自动曝光变化被误判为颜色变化。该历史因子随视口保存；关闭 TAA、切换 compositor 或重建视口缓冲会丢弃旧 TAA 历史。预曝光读回状态也随视口缓冲保存，resize、compositor 切换及预曝光开关变化会退休旧读回，不会将旧回调写进新状态。立体视图仍共用 view 0 的场景预曝光（现有引擎约定）。自动曝光的指数插值权重限制在 0 到 1，长帧及高速适应不会越过目标 EV 后来回振荡。单帧产生的 Inf/NaN 时序历史会被丢弃并使用当前颜色恢复，不会继续当作黑色参与混合；直方图把正向 FP16 溢出归到最亮桶，避免把过亮场景误当成黑色后进一步增加曝光。
 
 Bloom 使用 Eye Adaptation 的当前曝光纹理准备 Glow，并将 firefly 压缩及逆变换的亮度上限按本帧 pre-exposure 同比例缩放，使阈值计算不受场景缓冲 pre-exposure 编码影响。因此 Eye Adaptation 的 `pre_exposure` 开关不会改变 Environment Glow threshold、bloom 与 exposure 参数的含义；它只改变 HDR 场景缓冲在 Tonemap 前的编码范围。
 
@@ -123,7 +125,7 @@ GI buffer 混合、SSAO/SSIL/SSR 块、`scene_forward_gi_inc.glsl` 的引用与�
 与 `RB_SCOPE_GI` 的 `RenderBuffersGI` 存储对象（体积雾的 compute uniform set 无条件绑定它，
 FRP 的 voxel GI 计数恒为 0，所以雾的 GI 注入不会执行）。
 
-Temporal AA 与库里的 Color Grade 默认关闭，打开条目即生效。Bloom 原生条目默认开启，但 Environment Glow 关闭时不做 Glow 工作。**Temporal AA 条目就是 TAA 的开关**：
+Temporal AA 与库里的 Color Grade 默认开启，可以按需关闭。Bloom 原生条目默认开启，但 Environment Glow 关闭时不做 Glow 工作。**Temporal AA 条目就是 TAA 的开关**：
 视口 jitter 跟随该条目（`RendererViewport` 在把相机的合成器管线读出来后决定 16 相位还是 0 相位），
 所以不会出现"条目开着却没有 jitter（糊）"或"条目关着却被抖动（闪）"。项目设置
 `rendering/anti_aliasing/quality/use_taa` 与 `Viewport.use_taa` 只对**没有配置 FRP 管线的视口**生效
@@ -134,7 +136,7 @@ Temporal AA 与库里的 Color Grade 默认关闭，打开条目即生效。Bloo
 GBuffer 必须先于 Lighting（PRE_LIGHTING 阶段与光照都读 G-buffer），Lighting 必须先于 Sky，
 Sky 必须先于 Transparent，Transparent 必须先于 Bloom；如果启用 TAA，则 TAA 也必须先于 Bloom；Bloom 必须先于 Post。
 Eye Adaptation 也必须先于 Bloom。0、1、2、3、7 是完整输出必需的条目，不能删除或禁用
-（除非由自定义 pass 声明接管，见下）；Bloom 可关闭，TAA 默认关闭且可选。
+（除非由自定义 pass 声明接管，见下）；Bloom 可关闭，TAA 默认开启且可选。
 
 运动矢量由 GBuffer Pass 在**同一遍几何**里写出：该 Pass 的 framebuffer 带上速度附件，shader
 使用带 `MOTION_VECTORS` 的 G-buffer 变体，速度写在 4 个 G-buffer 附件之后的位置 4。TAA、3D 上采样与

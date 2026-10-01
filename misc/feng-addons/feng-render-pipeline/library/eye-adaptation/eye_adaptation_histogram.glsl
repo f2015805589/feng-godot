@@ -56,8 +56,14 @@ void main() {
 			log_luminance = clamp(log_luminance, -10.0, 20.0);
 		}
 		float location = clamp((log_luminance - params.log_min) * params.log_range_rcp, 0.0, 1.0) * float(NUM_BINS - 1);
-		if (any(isnan(color)) || any(isinf(color))) {
+		if (any(isnan(color))) {
 			location = 0.0;
+		} else if (any(isinf(color))) {
+			// Positive FP16 overflow is bright radiance, not the black bucket.
+			// Discarding it would drive exposure up and keep the scene overflowed.
+			bool positive_overflow = (isinf(color.r) && color.r > 0.0) ||
+					(isinf(color.g) && color.g > 0.0) || (isinf(color.b) && color.b > 0.0);
+			location = positive_overflow ? float(NUM_BINS - 1) : 0.0;
 		}
 		uint lower = min(uint(location), NUM_BINS - 1u);
 		uint upper = min(lower + 1u, NUM_BINS - 1u);

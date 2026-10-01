@@ -10,12 +10,11 @@
 // file publishes.
 
 #include "terrain_3d_material_clipmap_detail.h"
+#include "terrain_3d_baked_texture_arrays.h"
 
 #include "logger.h"
 
 #include <godot_cpp/classes/engine.hpp>
-#include <godot_cpp/classes/rd_texture_format.hpp>
-#include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/array.hpp>
@@ -366,47 +365,12 @@ void Terrain3DMaterialClipmapDetail::_ensure_baked() {
 		// again on the next tick, which is the first moment a device is certain.
 		return;
 	}
-	_free_baked();
-	Ref<RDTextureFormat> format;
-	format.instantiate();
-	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
-	// The bake shader writes `rgba16f` storage images, so a baked tile is half float: the same format
-	// the ring's baked channels carry, which is what lets one shader serve both producers.
-	format->set_format(RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT);
-	format->set_width(uint32_t(_stored_size));
-	format->set_height(uint32_t(_stored_size));
-	format->set_depth(1);
-	// At least two layers whatever the slot count: the renderer refuses to wrap a one-layer array as
-	// a layered texture, and the arm samples these as an array.
-	format->set_array_layers(uint32_t(MAX(_slot_count, 2)));
-	format->set_mipmaps(1);
-	// Storage, so a producer writes a tile; sampling, so the arm reads it; update, because the
-	// producer's pass is issued against the same texture the material binds.
-	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
-			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT);
-	Ref<RDTextureView> view;
-	view.instantiate();
-	// Created uninitialised: every texel belongs to a producer, and a tile is only ever read while
-	// its directory entry says a bake landed.
-	TypedArray<PackedByteArray> initial;
-	for (int channel = 0; channel < DETAIL_BAKED_CHANNELS; channel++) {
-		RID device = rd->texture_create(format, view, initial);
-		RID shader = device.is_valid()
-				? server->texture_rd_create(device, RenderingServer::TEXTURE_LAYERED_2D_ARRAY)
-				: RID();
-		if (!shader.is_valid()) {
-			if (device.is_valid()) {
-				rd->free_rid(device);
-			}
-			LOG(ERROR, "Could not allocate detail material baked channel ", channel, " at ", _stored_size,
-					"^2 x ", _slot_count, " layers; the detail layer stays unreadable and the coarse ring serves.");
-			_baked_unavailable = true;
-			_free_baked();
-			return;
-		}
-		rd->set_resource_name(device, "Terrain3D Detail Baked " + String::num_int64(channel));
-		_baked_rd.push_back(device);
-		_baked_rs.push_back(shader);
+	const int failed = terrain_baked_arrays::create(server, rd, _stored_size, _stored_size,
+			_slot_count, DETAIL_BAKED_CHANNELS, "Terrain3D Detail Baked ", _baked_rd, _baked_rs);
+	if (failed >= 0) {
+		LOG(ERROR, "Could not allocate detail material baked channel ", failed, " at ", _stored_size,
+				"^2 x ", _slot_count, " layers; the detail layer stays unreadable and the coarse ring serves.");
+		_baked_unavailable = true;
 	}
 }
 
@@ -416,20 +380,7 @@ void Terrain3DMaterialClipmapDetail::_free_baked() {
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
 	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
-	// The wrapper first and the device texture second: the wrapper is what a material holds, and it
-	// is the device texture's lifetime that has to outlast every reader of it.
-	for (const RID &rid : _baked_rs) {
-		if (rid.is_valid() && server != nullptr) {
-			server->free_rid(rid);
-		}
-	}
-	for (const RID &rid : _baked_rd) {
-		if (rid.is_valid() && rd != nullptr) {
-			rd->free_rid(rid);
-		}
-	}
-	_baked_rd.clear();
-	_baked_rs.clear();
+	terrain_baked_arrays::clear(server, rd, _baked_rd, _baked_rs);
 }
 
 RID Terrain3DMaterialClipmapDetail::get_baked_texture_rid(const int p_channel) const {

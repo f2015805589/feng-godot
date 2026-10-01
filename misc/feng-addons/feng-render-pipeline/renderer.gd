@@ -46,8 +46,8 @@ const NATIVE_PASS_SCRIPTS := {
 const NativePass = preload("passes/native/native_pass.gd")
 
 ## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
-## Shadow Precompute, VT, GBuffer, Lighting, Magic GI, Sky, Transparent, Temporal AA,
-## Eye Adaptation, Bloom, Color Grade, Post Process, Debug Buffers.
+## Shadow Precompute, VT, GBuffer, Lighting, Magic GI, Sky, Height Fog, Transparent,
+## Temporal AA, Eye Adaptation, Bloom, Color Grade, Post Process, Debug Buffers.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
 
 ## The library entries a fresh pipeline seeds.
@@ -111,7 +111,7 @@ func _init() -> void:
 	# default-list read. Resource loading restores its serialized version later.
 	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 	# Seed on first use. Loading or duplicating a Renderer restores its own pass
-	# list: allocating eleven throwaway default passes here needlessly loads shader
+	# list: allocating throwaway default passes here needlessly loads shader
 	# templates and creates effect RIDs on every camera's first Volume entry.
 
 func _seed_default_passes() -> void:
@@ -125,39 +125,15 @@ func _seed_default_passes() -> void:
 	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 	_connect_passes()
 
-## The default pass set: every native entry in seed order (Temporal AA is listed but
-## disabled), with library passes inserted at their declared native anchors.
+## The default pass set: every native entry enabled in seed order, with library
+## passes inserted at their declared anchors. Only Debug Buffers starts disabled.
 func _default_seed_list() -> Array[PassBase]:
 	var seeded: Array[PassBase] = []
 	for native_id in NativeSpec.seed_order():
 		var pass_entry := _make_native_pass(native_id)
-		if NativeSpec.is_optional_id(native_id):
-			pass_entry.enabled = false
 		seeded.append(pass_entry)
-	_append_default_library(seeded)
+	LibraryManager.append_defaults(seeded)
 	return seeded
-
-func _append_default_library(seeded: Array[PassBase]) -> void:
-	for entry in DEFAULT_LIBRARY_ENTRIES:
-		if not DEFAULT_LIBRARY_SEEDED.has(entry["id"]):
-			continue
-		var template = LibraryManager.load_template(entry)
-		if template == null or not template is PassBase:
-			continue
-		var instance := template.duplicate(true) as PassBase
-		LibraryManager.configure_library_pass(instance, entry)
-		# The manifest owns the default switch; synchronized resources retain the
-		# user's saved enabled value.
-		instance.enabled = bool(entry.get("default_enabled", false))
-		var insert_index := LibraryManager.calculate_insert_index(seeded, instance.stable_id)
-		var bloom_index := _find_native_index_in(seeded, NativeSpec.PASS_BLOOM)
-		if instance.stable_id == &"library:eye_adaptation":
-			if bloom_index >= 0:
-				insert_index = bloom_index
-		elif instance.stable_id == &"library:color_grade":
-			if bloom_index >= 0:
-				insert_index = bloom_index + 1
-		seeded.insert(insert_index, instance)
 
 ## An entry for one engine pass: its id, the stable identity the schedule persists, and
 ## the addon's script for it as the implementation.
@@ -576,13 +552,6 @@ func _seed_insert_index(native_id: int) -> int:
 			return i
 	return _passes.size()
 
-func _find_native_index_in(entries: Array, native_id: int) -> int:
-	for i in entries.size():
-		var pass_entry = entries[i]
-		if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == native_id:
-			return i
-	return -1
-
 func _migrate_legacy_passes() -> bool:
 	var migrated: Array[PassBase] = []
 	for p in PipelineMigrator.migrate_legacy_passes(_passes, NativeSpec.seed_order(), NativeSpec.is_optional_id, _make_native_pass):
@@ -592,42 +561,12 @@ func _migrate_legacy_passes() -> bool:
 	return true
 
 func _sync_library(emit: bool) -> bool:
-	var had_eye_adaptation := _find_library_index(&"library:eye_adaptation") >= 0
-	var had_color_grade := _find_library_index(&"library:color_grade") >= 0
 	var changed: bool = LibraryManager.sync(_passes, _synced_library, _synced_library_ids, _deleted_library, _deleted_library_ids)
 	if changed:
-		if not had_eye_adaptation:
-			changed = _position_library_entry(&"library:eye_adaptation", NativeSpec.PASS_BLOOM, false) or changed
-		if not had_color_grade:
-			changed = _position_library_entry(&"library:color_grade", NativeSpec.PASS_BLOOM, true) or changed
 		_connect_passes()
 	if changed and emit:
 		emit_changed()
 	return changed
-
-func _find_library_index(stable_id: StringName) -> int:
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry != null and pass_entry.stable_id == stable_id:
-			return i
-	return -1
-
-## Position a library pass that synchronization just restored around native Bloom.
-## Existing user-ordered library entries are left where the author put them.
-func _position_library_entry(stable_id: StringName, native_anchor: int, p_after: bool) -> bool:
-	var library_index := _find_library_index(stable_id)
-	var anchor_index := _find_native_index(native_anchor)
-	if library_index < 0 or anchor_index < 0:
-		return false
-	var target_index := anchor_index + (1 if p_after else 0)
-	if library_index == target_index:
-		return false
-	var entry := _passes[library_index]
-	_passes.remove_at(library_index)
-	anchor_index = _find_native_index(native_anchor)
-	target_index = anchor_index + (1 if p_after else 0)
-	_passes.insert(target_index, entry)
-	return true
 
 func _find_native_index(native_id: int) -> int:
 	for i in _passes.size():

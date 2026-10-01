@@ -173,6 +173,12 @@ def main() -> None:
         "feng_sky_atmosphere tests passed",
     )
     validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_sky_optimization.gd"],
+        "headless Sky optimization tests", project, env, "SKY OPTIMIZATION PASS",
+    )
+    validate_scratch_tree(project)
     if args.gpu_driver:
         startup = None
         if os.name == "nt":

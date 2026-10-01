@@ -4,11 +4,10 @@ extends EditorPlugin
 ## Starts the Tracy profiler from the editor's **Debug** menu, next to the
 ## deployment and debug-draw options. One click, no questions asked.
 ##
-## The profiler lives in this addon's `bin` folder, so it is simply started from
-## there and nothing has to be configured. Editor Settings > Tracy > Profiler >
-## Executable Path, `FENG_TRACY_PATH`, a copy next to the editor and the
-## downloads folder are only consulted when that file is missing, and a missing
-## profiler is downloaded once from the matching Tracy release.
+## An explicit executable setting takes priority over this addon's bundled
+## Windows profiler. FENG_TRACY_PATH, the editor folder and downloads are
+## fallbacks. Automatic installation uses the matching Windows release;
+## other platforms require a configured native profiler executable.
 ##
 ## If the Debug menu cannot be found (for example with a collapsed main menu),
 ## the same action is added as a toolbar button instead.
@@ -29,6 +28,7 @@ const FALLBACK_VERSION := "0.11.1"
 const MENU_LABEL := "Tracy Profiler"
 ## Private id: the Debug menu ignores ids it does not know.
 const MENU_ID := 0x7F700001
+const SEPARATOR_ID := MENU_ID - 1
 ## The main menu is named after its translated title.
 const DEBUG_MENU_NAME := "Debug"
 ## Menu order of this engine: Scene, Project, Debug, Editor, Help.
@@ -45,7 +45,7 @@ func _enter_tree() -> void:
 	_debug_menu = _find_debug_menu()
 	if _debug_menu != null:
 		if _debug_menu.item_count > 0:
-			_debug_menu.add_separator()
+			_debug_menu.add_separator("", SEPARATOR_ID)
 		_debug_menu.add_item(MENU_LABEL, MENU_ID)
 		_debug_menu.id_pressed.connect(_on_menu_id_pressed)
 		return
@@ -66,12 +66,10 @@ func _exit_tree() -> void:
 	if _debug_menu != null and is_instance_valid(_debug_menu):
 		if _debug_menu.id_pressed.is_connected(_on_menu_id_pressed):
 			_debug_menu.id_pressed.disconnect(_on_menu_id_pressed)
-		var index := _debug_menu.get_item_index(MENU_ID)
-		if index > 0 and _debug_menu.is_item_separator(index - 1):
-			_debug_menu.remove_item(index - 1)
-		index = _debug_menu.get_item_index(MENU_ID)
-		if index != -1:
-			_debug_menu.remove_item(index)
+		for id in [MENU_ID, SEPARATOR_ID]:
+			var index := _debug_menu.get_item_index(id)
+			if index != -1:
+				_debug_menu.remove_item(index)
 	_debug_menu = null
 	if is_instance_valid(_button):
 		remove_control_from_container(EditorPlugin.CONTAINER_TOOLBAR, _button)
@@ -155,6 +153,9 @@ func _client_version() -> String:
 
 func _download_profiler() -> void:
 	if _downloading:
+		return
+	if OS.get_name() != "Windows":
+		_warning("Automatic Tracy installation is Windows-only. Set Tracy > Profiler > Executable Path to a native profiler for this platform.")
 		return
 	if not _ensure_bin_dir():
 		_warning("Could not create " + _installed_path().get_base_dir() + ".")

@@ -40,8 +40,9 @@ and each segment is attenuated by view-path and sun-path transmittance
 `T = exp(-∫(βR ρR + βM,extinction ρM) ds)`. Density falls exponentially with
 altitude. The Mie extinction coefficient is constrained to be at least its
 scattering coefficient, so the model cannot create energy from negative
-absorption. The GPU uses eight view segments and six sun-path samples, with
-more samples concentrated near the dense lower atmosphere. It also shades a
+absorption. The GPU keeps eight view segments, with more samples concentrated
+near the dense lower atmosphere. Six sun-path samples are preintegrated into a
+small optical-column lookup table, described below. It also shades a
 Lambertian lower-sky ground disk from direct sunlight; that ground reflection is
 not included in the fog ambient snapshot.
 
@@ -98,6 +99,61 @@ cache. Each cache miss evaluates 64 importance-sampled directions, including
 samples drawn from the Henyey–Greenstein distribution to cover its forward
 peak; the bounded cost is observable through
 `FengSkyAtmosphere.atmosphere_cache_stats()`.
+
+## Atmosphere performance
+
+The sun-path lookup contains Rayleigh and Mie density columns in kilometres,
+not baked light colors or already exponentiated transmittance. The shader applies
+current extinction coefficients to the interpolated columns and then evaluates
+Beer–Lambert transmission. Planet shadow remains an analytic ray/sphere test,
+so filtering cannot bleed daylight across the planet's shadow. A zero-length
+outward path at the exact atmosphere boundary has unit transmission.
+
+The 128 × 64 `RGF` table takes 64 KiB. Its coordinates are altitude expressed as
+`rho / sqrt(top_radius² - planet_radius²)`, where `rho = sqrt(r² - planet_radius²)`,
+and distance-to-atmosphere-exit normalized between the vertical and ground-tangent
+rays. A quadratic warp concentrates distance samples toward the grazing horizon;
+texel-center mapping keeps all domain endpoints defined. The table uses the same
+six nonuniform midpoint sun samples as the original direct shader. Atmospheres
+whose height exceeds 64 times either density scale height use the direct
+six-sample path instead, preserving very thin authored layers without an
+undersampled lookup or an unbounded build.
+
+For the default atmosphere, each view segment replaces six square roots and
+12 density exponentials with a filtered texture lookup. View density is evaluated
+once for both scattering and extinction, and segment transmission is reused by
+its integral. Eight view segments, the solar disk, spherical intersections,
+space views, lower-sky ground shading and the physical/nonphysical light scale
+are preserved. The CPU fog ambient integration remains the independent direct
+reference, and the raw-sun fog contract is unchanged.
+
+Only changes to planet radius, atmosphere height or the two density scale heights
+rebuild optical columns. Sun motion/color/intensity, extinction and scattering
+coefficients, phase asymmetry, planet position, ground albedo, exposure and sky
+energy do not rebuild them. Each provider owns its texture; one bounded,
+copy-on-write CPU byte cache avoids repeating construction for identical worlds.
+Multiple property edits before the next update are coalesced into one rebuild.
+
+Exported setters invalidate sanitized settings. Shader `changed` notifications
+invalidate cached source identity, including nested shader edits. Static and
+sun-dependent material updates are separate, and an unchanged world snapshot is
+not republished. World ownership and resource identity are still checked every
+frame and at snapshot read time. Cache counters expose these operations through
+`atmosphere_cache_stats()`.
+
+`tests/test_sky_optimization.gd` checks direct/LUT transmission and integrated
+sky/ground agreement, ground shadow, zero extinction, atmosphere boundaries,
+extreme valid profiles, stable update counts, parameter invalidation, shader
+edits, same-frame world handoff/back, and per-world texture isolation. It runs
+with either a Feng editor or a stock Godot 4.6 project containing this addon;
+the Python test runner includes it after the existing component suite.
+
+On one Linux stock Godot 4.6.3 headless run, table construction took 14–20 ms
+and identical-geometry reuse took 7–24 µs. The default-atmosphere test's 1,584
+sky/ground rays had 0.0914% maximum relative RGB error (excluding near-zero rays)
+and 0.0285% normalized RMS error against direct integration. These are numerical
+and CPU measurements, not a renderer/GPU timing guarantee; use the GPU probe
+for target-device frame measurements.
 
 ## Example
 

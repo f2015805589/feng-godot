@@ -232,6 +232,10 @@ func _run_editor_preview_regression() -> void:
 	for entry in renderer.passes:
 		if entry != null and entry.get_parameter_key() is int and int(entry.get_parameter_key()) == 6:
 			entry.enabled = true
+		elif entry != null and entry.stable_id == &"library:eye_adaptation":
+			# Preview/TAA comparisons need fixed exposure: continuing metering can
+			# change identical frames and restored colors without a Volume edit.
+			entry.enabled = false
 
 	var source_compositor := CompositorScript.new()
 	source_compositor.renderer = renderer

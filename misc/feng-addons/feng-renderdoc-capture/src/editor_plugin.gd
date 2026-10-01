@@ -5,6 +5,7 @@ const SETTING_EXE := "renderdoc/capture/executable_path"
 
 var button: Button
 var _busy := false
+var _capture_generation := 0
 var _capture_forced_viewports: Array = []
 
 
@@ -24,8 +25,10 @@ func _exit_tree() -> void:
 	# A plugin can be disabled or hot-reloaded while the capture wait is still
 	# suspended. Restore the editor's original update modes before the nodes are
 	# detached so an interrupted capture cannot leave a viewport running forever.
-	_restore_capture_viewports(_capture_forced_viewports)
-	EditorInterface.get_editor_settings().settings_changed.disconnect(_settings_changed)
+	_finish_capture()
+	var settings := EditorInterface.get_editor_settings()
+	if settings.settings_changed.is_connected(_settings_changed):
+		settings.settings_changed.disconnect(_settings_changed)
 	if is_instance_valid(button):
 		remove_control_from_container(EditorPlugin.CONTAINER_SPATIAL_EDITOR_MENU, button)
 		button.queue_free()
@@ -76,12 +79,13 @@ func _on_capture_pressed() -> void:
 		_warning(reason + " Editing the path takes effect the next time the editor starts.")
 		return
 	_busy = true
+	_capture_generation += 1
+	var generation := _capture_generation
 	button.disabled = true
 	# The editor deliberately stops rendering unchanged viewports while it is idle, so
 	# keep the visible 3D editor viewports alive for this one capture: the capture renders
 	# the frame itself, and a stale SubViewport would put a stale scene into it.
-	var forced_viewports: Array = _prepare_capture_viewports()
-	_capture_forced_viewports = forced_viewports
+	_prepare_capture_viewports()
 	EditorInterface.get_base_control().queue_redraw()
 	# Render one frame and capture exactly that frame. Queuing "the next presented frame"
 	# instead can land on a UI-only update, which holds a handful of commands and none of
@@ -89,10 +93,9 @@ func _on_capture_pressed() -> void:
 	# Capture actual pending work and resident textures. Replaying every resident
 	# page here bypasses streaming budgets and can stall large terrain captures.
 	var capture := str(RenderDocCapture.capture_frame(button.get_window().get_window_id()))
-	_restore_capture_viewports(forced_viewports)
+	_restore_capture_viewports()
 	if not capture.is_empty() and FileAccess.file_exists(capture):
-		_busy = false
-		button.disabled = false
+		_finish_capture()
 		_open_capture(gui, capture)
 		return
 	# Nothing could be recorded explicitly: fall back to the queued trigger, which
@@ -100,23 +103,22 @@ func _on_capture_pressed() -> void:
 	var previous_count := FengRenderDoc.get_capture_count()
 	_prepare_capture_viewports()
 	if not FengRenderDoc.trigger_capture(button.get_window().get_window_id()):
-		_restore_capture_viewports(forced_viewports)
-		_busy = false
-		button.disabled = false
+		_finish_capture()
 		_warning("Could not trigger a capture in the current editor.")
 		return
 	EditorInterface.get_base_control().queue_redraw()
 	var deadline := Time.get_ticks_msec() + 10000
-	while is_inside_tree() and FengRenderDoc.get_capture_count() <= previous_count and Time.get_ticks_msec() < deadline:
+	while generation == _capture_generation and is_inside_tree() and FengRenderDoc.get_capture_count() <= previous_count and Time.get_ticks_msec() < deadline:
 		EditorInterface.get_base_control().queue_redraw()
 		await get_tree().create_timer(0.1).timeout
+	# A disabled/reloaded plugin retires this wait; it must not finish a newer capture.
+	if generation != _capture_generation:
+		return
 	if not is_inside_tree():
-		_restore_capture_viewports(forced_viewports)
+		_finish_capture()
 		return
 	var capture_count := FengRenderDoc.get_capture_count()
-	_restore_capture_viewports(forced_viewports)
-	_busy = false
-	button.disabled = false
+	_finish_capture()
 	if capture_count <= previous_count:
 		_warning("RenderDoc did not record a frame.")
 		return
@@ -143,8 +145,8 @@ func _warning(message: String) -> void:
 	EditorInterface.get_editor_toaster().push_toast(message, EditorToaster.SEVERITY_WARNING)
 
 
-func _prepare_capture_viewports() -> Array:
-	var forced: Array = []
+func _prepare_capture_viewports() -> void:
+	_restore_capture_viewports()
 	for index in range(4):
 		var viewport = EditorInterface.get_editor_viewport_3d(index)
 		if viewport == null or not is_instance_valid(viewport):
@@ -157,16 +159,23 @@ func _prepare_capture_viewports() -> Array:
 		var mode = viewport.get_update_mode()
 		if mode == SubViewport.UPDATE_ALWAYS:
 			continue
-		forced.append({"viewport": viewport, "mode": mode})
+		_capture_forced_viewports.append({"viewport": viewport, "mode": mode})
 		viewport.set_update_mode(SubViewport.UPDATE_ALWAYS)
-	return forced
 
 
-func _restore_capture_viewports(forced: Array) -> void:
-	for entry in forced:
+func _restore_capture_viewports() -> void:
+	for entry in _capture_forced_viewports:
 		var viewport = entry.get("viewport")
 		if viewport != null and is_instance_valid(viewport):
 			viewport.set_update_mode(entry.get("mode", SubViewport.UPDATE_WHEN_VISIBLE))
 	# Clearing the member makes restoration idempotent and releases stale node
 	# references after a completed or interrupted capture.
 	_capture_forced_viewports.clear()
+
+
+func _finish_capture() -> void:
+	_restore_capture_viewports()
+	_capture_generation += 1
+	_busy = false
+	if is_instance_valid(button):
+		button.disabled = false

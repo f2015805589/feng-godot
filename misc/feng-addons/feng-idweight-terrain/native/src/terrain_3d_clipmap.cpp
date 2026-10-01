@@ -6,6 +6,7 @@
 // rather than in this file.
 
 #include "terrain_3d_clipmap.h"
+#include "terrain_3d_baked_texture_arrays.h"
 
 #include <chrono>
 
@@ -52,12 +53,6 @@ static constexpr int CLIPMAP_MAX_CHANNELS = 16;
 // the exception and the reason the two are separate: its layer is a whole texel - albedo and height,
 // an octahedral normal and roughness, the parameters - so it carries four components and the shared
 // `TerrainClipmap::bytes_per_texel()` is where its bytes are counted.
-
-// The device format of a baked channel: the one the bake shader's `rgba16f` storage images write.
-// `configure()` accepts no other request, so there is nothing to translate.
-static RenderingDevice::DataFormat _clipmap_baked_data_format() {
-	return RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT;
-}
 
 // The world rect a rect of *logical* texels covers. Logical index (0,0)'s texel *centre* is
 // `center - world_size / 2 + texel_world / 2`, so a logical rect `[x0, x1) x [y0, y1)` starts half a
@@ -1063,48 +1058,11 @@ void Terrain3DClipmap::_ensure_baked() {
 		// calls this again on the first publish, which is the first moment a device is certain.
 		return;
 	}
-	_free_baked();
-	Ref<RDTextureFormat> format;
-	format.instantiate();
-	format->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D_ARRAY);
-	format->set_format(_clipmap_baked_data_format());
-	format->set_width(uint32_t(_config.size));
-	format->set_height(uint32_t(_config.size));
-	format->set_depth(1);
-	// At least two layers, whatever the ring's level count: the renderer refuses to wrap a one-layer
-	// array as a layered texture (`texture_rd_create()` fails on `array_layers == 1`), and the arm
-	// samples these as an array. A one-level ring therefore allocates one layer that is never written
-	// and never read - one layer of one level is cheaper than a second publish path for that shape.
-	format->set_array_layers(uint32_t(MAX(_levels.size(), size_t(2))));
-	format->set_mipmaps(1);
-	// Storage, so a producer writes a level; sampling, so the arm reads it; update, because the
-	// producer's pass is issued against the same texture the material binds. Neither copy direction
-	// is asked for: nothing moves a baked layer, because the CPU has no copy of one by construction.
-	format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
-			RenderingDevice::TEXTURE_USAGE_STORAGE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT);
-	Ref<RDTextureView> view;
-	view.instantiate();
-	// Created uninitialised: every texel of every layer belongs to a producer, and a level is only
-	// ever read while it is `baked`. Seeding a blank layer per level here would cost a transfer per
-	// configure and buy nothing a reader uses.
-	TypedArray<PackedByteArray> initial;
-	for (int channel = 0; channel < _config.baked_channels; channel++) {
-		RID device = rd->texture_create(format, view, initial);
-		RID shader = device.is_valid()
-				? server->texture_rd_create(device, RenderingServer::TEXTURE_LAYERED_2D_ARRAY)
-				: RID();
-		if (!shader.is_valid()) {
-			if (device.is_valid()) {
-				rd->free_rid(device);
-			}
-			LOG(ERROR, "Could not allocate clipmap baked channel ", channel, " (", get_source_name(), ")");
-			_free_baked();
-			return;
-		}
-		rd->set_resource_name(device, "Terrain3D Clipmap " + get_source_name() + " baked " +
-						String::num_int64(channel));
-		_baked_rd.push_back(device);
-		_baked_rs.push_back(shader);
+	const int failed = terrain_baked_arrays::create(server, rd, _config.size, _config.size,
+			int(_levels.size()), _config.baked_channels,
+			"Terrain3D Clipmap " + get_source_name() + " baked ", _baked_rd, _baked_rs);
+	if (failed >= 0) {
+		LOG(ERROR, "Could not allocate clipmap baked channel ", failed, " (", get_source_name(), ")");
 	}
 }
 
@@ -1114,20 +1072,7 @@ void Terrain3DClipmap::_free_baked() {
 	}
 	RenderingServer *server = RenderingServer::get_singleton();
 	RenderingDevice *rd = server != nullptr ? server->get_rendering_device() : nullptr;
-	// The wrapper first and the device texture second: the wrapper is what a material holds, and it
-	// is the device texture's lifetime that has to outlast every reader of it.
-	for (const RID &rid : _baked_rs) {
-		if (rid.is_valid() && server != nullptr) {
-			server->free_rid(rid);
-		}
-	}
-	for (const RID &rid : _baked_rd) {
-		if (rid.is_valid() && rd != nullptr) {
-			rd->free_rid(rid);
-		}
-	}
-	_baked_rd.clear();
-	_baked_rs.clear();
+	terrain_baked_arrays::clear(server, rd, _baked_rd, _baked_rs);
 }
 
 Array Terrain3DClipmap::get_level_reports() const {

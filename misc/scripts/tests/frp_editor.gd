@@ -15,8 +15,10 @@ func _run() -> void:
 	pipeline_plugin = PipelinePlugin.new()
 	add_child(pipeline_plugin)
 	var renderer := Renderer.new()
-	# A fresh renderer has eight native and five seeded library entries.
-	assert(renderer.passes.size() == 13, "a fresh renderer must list thirteen passes, got %d" % renderer.passes.size())
+	# A fresh renderer has nine native and five seeded library entries.
+	assert(renderer.passes.size() == 14, "a fresh renderer must list fourteen passes, got %d" % renderer.passes.size())
+	for entry in renderer.passes:
+		assert(entry.enabled == (entry.stable_id != &"library:debug_buffers"), "only Debug Buffers starts disabled")
 	var entries = renderer.passes.duplicate()
 	var removed_debug := false
 	var removed_color_grade := false

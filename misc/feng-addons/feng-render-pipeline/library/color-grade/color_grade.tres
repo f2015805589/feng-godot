@@ -22,5 +22,5 @@ script = ExtResource("1")
 stage = 4
 shader_file = ExtResource("3")
 mode = 0
-parameters = Vector4(1.1, 1.05, 1.02, 1.0)
+parameters = Vector4(1, 1, 1, 1)
 inputs = Array[ExtResource("2")]([SubResource("Src"), SubResource("Dst")])

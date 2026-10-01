@@ -15,20 +15,29 @@ parser.add_argument("--binary", default=None,
                     help="editor binary to run (defaults to the in-tree Windows editor)")
 args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
-shutil.copytree(ROOT / "misc/feng-addons/feng-render-pipeline", project / "addons/feng-render-pipeline")
-shutil.copytree(ROOT / "misc/feng-addons/feng-fog", project / "addons/feng-fog")
+# Fog's runtime/acceptance scripts use Sky's atmosphere types during import.
+# Keep their real dependency graph available instead of suppressing Sky as an
+# unrelated sibling plugin.
+selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky")
+for name in selected_addons:
+    shutil.copytree(ROOT / "misc/feng-addons" / name, project / "addons" / name)
 # The editor auto-links sibling addons. Keep this regression isolated from their
 # native DLL reloads, capture injection and editor tools, including concurrent runs.
 for addon in (ROOT / "misc/feng-addons").iterdir():
-    if addon.name not in ("feng-render-pipeline", "feng-fog") and (addon / "plugin.cfg").is_file():
+    if addon.name not in selected_addons and (addon / "plugin.cfg").is_file():
         placeholder = project / "addons" / addon.name
         placeholder.mkdir()
         (placeholder / ".gdignore").touch()
 (project / "project.godot").write_text(
     'config_version=5\n[application]\nconfig/name="Deferred tests"\n'
+    '[display]\nwindow/size/viewport_width=320\nwindow/size/viewport_height=240\n'
+    'window/size/resizable=false\nwindow/size/maximize_disabled=true\n'
+    'window/stretch/mode="viewport"\nwindow/stretch/aspect="keep"\n'
     '[rendering]\nrenderer/rendering_method="frp"\n', encoding="utf-8"
 )
-env = dict(os.environ, APPDATA=str(project / "config"), LOCALAPPDATA=str(project / "cache"))
+env = dict(os.environ, APPDATA=str(project / "config"), LOCALAPPDATA=str(project / "cache"),
+           XDG_DATA_HOME=str(project / "data"), XDG_CONFIG_HOME=str(project / "config"),
+           XDG_CACHE_HOME=str(project / "cache"), FRP_ENGINE_SOURCE_ROOT=str(ROOT))
 startup = None
 if os.name == "nt":
     startup = subprocess.STARTUPINFO()
@@ -86,6 +95,12 @@ run("volume_metrics", ["--script", str(ROOT / "misc/scripts/tests/frp_volume_met
     "PASS volume CPU monitors: frame totals, units, idle reset and registration lifetime")
 run("architecture", ["--script", str(ROOT / "misc/scripts/tests/frp_architecture.gd")],
     "PASS FRP contract resource notifications, view invalidation and detached dependency lifetime")
+run("library_placement", ["--script", str(ROOT / "misc/scripts/tests/frp_library_placement.gd")],
+    "PASS FRP managed-library placement matrix:")
+run("fog_packet", ["--script", str(ROOT / "misc/scripts/tests/frp_fog_packet.gd")],
+    "PASS FRP fog packet equivalence:")
+run("snapshot_world_switch", ["--script", str(ROOT / "misc/scripts/tests/frp_snapshot_world_switch.gd")],
+    "PASS FRP snapshot target cache follows live/inherited world switches, detach/reenter and weak removal")
 run("view_state", ["--script", str(ROOT / "misc/scripts/tests/frp_view_state.gd")],
     "PASS FRP shared view definitions, two-camera pixels, independent TAA switches, stateful plugin isolation and shader reuse")
 # Every frame that needs motion vectors without 3D upscaling: TAA, the motion
@@ -131,7 +146,13 @@ run("bloom", ["--script", str(ROOT / "misc/scripts/tests/frp_bloom.gd")],
 # histogram), adapts temporally and folds the colour buffer by scale / adapted,
 # the addon equivalent of UE's pre-exposure.
 run("eye_adaptation", ["--script", str(ROOT / "misc/scripts/tests/frp_eye_adaptation.gd")],
-    "PASS FRP eye adaptation pass meters, adapts and folds the frame in both directions")
+    "PASS FRP eye adaptation meters and tonemaps in both directions")
+# Production-shader numerical controls isolate exposure rebasing from the scene.
+run("exposure_history", ["--script", str(ROOT / "misc/scripts/tests/frp_exposure_history.gd")],
+    "PASS FRP GPU exposure history rebasing and bounded adaptation")
+# Retired frame contexts must never update a reconfigured viewport's exposure.
+run("exposure_lifecycle", ["--script", str(ROOT / "misc/scripts/tests/frp_exposure_lifecycle.gd")],
+    "PASS FRP exposure readback retirement, pre-exposure toggle, TAA restart, resize and compositor switch")
 # The Core surface a plugin pass runs on: a scripted pass takes over an engine pass
 # and then drives a whole frame through the granular primitives.
 run("context", ["--script", str(ROOT / "misc/scripts/tests/frp_context.gd")],

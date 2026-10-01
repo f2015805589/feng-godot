@@ -156,6 +156,10 @@ bool RenderFRPClustered::RenderBufferDataFRPClustered::ensure_mfx_temporal(Rende
 #endif
 
 void RenderFRPClustered::RenderBufferDataFRPClustered::free_data() {
+	pre_exposure = std::make_shared<float>(1.0f);
+	pre_exposure_enabled = false;
+	exposure_compositor = RID();
+	taa_history_pre_exposure = 1.0f;
 	// JIC, should already have been cleared
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_FRP_CLUSTERED);
@@ -1815,14 +1819,25 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	current_eye_adaptation_enabled = false;
 	current_eye_adaptation_texture = RID();
 	const Variant eye_settings_value = pipeline_parameters.get(String("library:eye_adaptation"), Variant());
+	bool pre_exposure_enabled = false;
 	if (!is_reflection_probe && eye_settings_value.get_type() == Variant::DICTIONARY) {
 		const Dictionary eye_settings = eye_settings_value;
 		current_eye_adaptation_enabled = bool(eye_settings.get("frp_eye_adaptation_enabled", false));
-		if (bool(eye_settings.get("pre_exposure", false))) {
-			const float *last_exposure = pre_exposure_history->getptr(rb->get_instance_id());
-			if (last_exposure != nullptr) {
-				current_pre_exposure = *last_exposure;
+		pre_exposure_enabled = current_eye_adaptation_enabled && bool(eye_settings.get("pre_exposure", false));
+	}
+	if (rb_data.is_valid()) {
+		if (rb_data->pre_exposure_enabled != pre_exposure_enabled || rb_data->exposure_compositor != p_render_data->compositor) {
+			rb_data->pre_exposure = std::make_shared<float>(1.0f);
+			rb_data->pre_exposure_enabled = pre_exposure_enabled;
+			// A different compositor can meter a different camera/pipeline. Its old
+			// pending readbacks and temporal colors must not leak into the new view.
+			if (rb_data->exposure_compositor != p_render_data->compositor) {
+				rb->clear_context(SNAME("taa"));
 			}
+			rb_data->exposure_compositor = p_render_data->compositor;
+		}
+		if (pre_exposure_enabled) {
+			current_pre_exposure = *rb_data->pre_exposure;
 		}
 	}
 	// An empty schedule means the default order, which contains every operation. A
@@ -1869,6 +1884,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	// TAA off, exactly as the viewport decided.
 	using_taa = scale_type != SCALE_FSR2 && scale_type != SCALE_MFX &&
 			(pipeline.is_empty() ? rb->get_use_taa() : schedule_has(FRPPipelineSpec::PASS_TEMPORAL_AA));
+
+	// A disabled temporal pass leaves no consecutive history. Re-enabling it
+	// starts from the current frame instead of reviving stale color and velocity.
+	if (!using_taa && rb->has_texture(SNAME("taa"), SNAME("history"))) {
+		rb->clear_context(SNAME("taa"));
+	}
 
 	// check if we need motion vectors
 	bool motion_vectors_required;
@@ -2728,7 +2749,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 						RD::get_singleton()->draw_command_begin_label("TAA");
 						RENDER_TIMESTAMP("TAA");
-						taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
+						taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far, current_pre_exposure / rb_data->taa_history_pre_exposure);
+						rb_data->taa_history_pre_exposure = current_pre_exposure;
 						RD::get_singleton()->draw_command_end_label();
 					}
 				}
@@ -2834,10 +2856,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			[&](int p_stage) { stage_effects(RSE::CompositorEffectCallbackType(p_stage)); },
 			pipeline_parameters,
 			[&](const StringName &p_texture) { _present_frame(p_render_data, p_texture); },
-			[this](int) { return current_pre_exposure; },
-			[history = pre_exposure_history, buffer_id = rb->get_instance_id()](int p_view, float p_exposure) {
-				if (p_view == 0 && Math::is_finite(p_exposure) && p_exposure > 0.0f) {
-					history->insert(buffer_id, CLAMP(p_exposure, 1e-12f, 1e12f));
+			[pre_exposure = current_pre_exposure](int) { return pre_exposure; },
+			[history = rb_data.is_valid() ? rb_data->pre_exposure : std::shared_ptr<float>()](int p_view, float p_exposure) {
+				if (history && p_view == 0 && Math::is_finite(p_exposure) && p_exposure > 0.0f) {
+					*history = CLAMP(p_exposure, 1e-12f, 1e12f);
 				}
 			},
 			[this](RID p_texture) { current_eye_adaptation_texture = p_texture; });

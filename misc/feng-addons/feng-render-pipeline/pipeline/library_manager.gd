@@ -23,7 +23,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_downsample", "path": "bloom-lite/bloom_downsample.tres", "name": "Bloom Downsample"},
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
-	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade"},
+	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade", "default_enabled": true},
 	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
 	{"id": "library:height_fog", "path": "height-fog/height_fog.tres", "name": "Height Fog", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Height Fog was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
 	{"id": "library:debug_buffers", "path": "debug-buffers/debug_buffers.tres", "name": "Debug Buffers", "default_enabled": false, "after_native": NativeSpec.PASS_POST_PROCESS},
@@ -38,6 +38,48 @@ const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:height_fog",
 	"library:debug_buffers",
 ]
+
+## Managed Eye Adaptation and Color Grade straddle native Bloom. This is
+## shared by fresh seeding and legacy/sync restoration; authored entries do not move.
+const MANAGED_BLOOM_PLACEMENT := {&"library:eye_adaptation": false, &"library:color_grade": true}
+
+static func append_defaults(passes: Array) -> void:
+	for entry in DEFAULT_LIBRARY_ENTRIES:
+		if not DEFAULT_LIBRARY_SEEDED.has(entry["id"]):
+			continue
+		var template = load_template(entry)
+		if not template is PassBase:
+			continue
+		var instance := _instantiate_default_pass(template, entry)
+		passes.insert(_managed_insert_index(passes, instance.stable_id), instance)
+
+static func _instantiate_default_pass(template: PassBase, entry: Dictionary) -> PassBase:
+	var instance := template.duplicate(true) as PassBase
+	configure_library_pass(instance, entry)
+	instance.enabled = bool(entry.get("default_enabled", false))
+	return instance
+
+static func _managed_insert_index(passes: Array, stable_id: StringName) -> int:
+	var bloom := _native_index(passes, NativeSpec.PASS_BLOOM)
+	if bloom >= 0 and MANAGED_BLOOM_PLACEMENT.has(stable_id):
+		return bloom + (1 if MANAGED_BLOOM_PLACEMENT[stable_id] else 0)
+	return calculate_insert_index(passes, stable_id)
+
+static func _library_index(passes: Array, stable_id: StringName) -> int:
+	for i in passes.size():
+		if passes[i] != null and passes[i].stable_id == stable_id:
+			return i
+	return -1
+
+static func _restore_managed_placement(passes: Array, stable_id: StringName) -> void:
+	var index := _library_index(passes, stable_id)
+	if index < 0 or _native_index(passes, NativeSpec.PASS_BLOOM) < 0:
+		return
+	var target := _managed_insert_index(passes, stable_id)
+	if index != target:
+		var entry = passes[index]
+		passes.remove_at(index)
+		passes.insert(_managed_insert_index(passes, stable_id), entry)
 
 static func load_template(entry: Dictionary) -> Variant:
 	return load(FengAddonLayout.library_dir() + "/" + entry["path"])
@@ -203,6 +245,10 @@ static func _find_synced_library_pass(passes: Array, entry: Dictionary):
 ## or the recorded state changed.
 static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array, deleted_ids: Array) -> bool:
 	var changed := false
+	var missing_managed: Array[StringName] = []
+	for stable_id in MANAGED_BLOOM_PLACEMENT:
+		if _library_index(passes, stable_id) < 0:
+			missing_managed.append(stable_id)
 
 	# A managed entry whose pass is gone was removed by hand: record the tombstone, so
 	# the pass below does not decide it is merely missing and add it back.
@@ -239,9 +285,7 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 				# schedule simply skips the automatic seed; an explicit Library add still
 				# reports the missing anchor from calculate_insert_index().
 				continue
-			var instance := template.duplicate(true) as PassBase
-			configure_library_pass(instance, entry)
-			instance.enabled = bool(entry.get("default_enabled", false))
+			var instance := _instantiate_default_pass(template, entry)
 			passes.insert(calculate_insert_index(passes, instance.stable_id), instance)
 			changed = true
 		else:
@@ -252,6 +296,11 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 				existing.resource_name = entry["name"]
 				changed = true
 		mark_synced(entry, synced, synced_ids, deleted, deleted_ids)
+	if changed:
+		# Preserve the legacy behavior for id-less shader resources whose managed
+		# identity was just recovered, as well as entirely missing entries.
+		for stable_id in missing_managed:
+			_restore_managed_placement(passes, stable_id)
 	return changed
 
 ## Whether synchronization owns an entry: one a fresh pipeline seeds, or one it recorded
@@ -260,7 +309,10 @@ static func is_managed(entry: Dictionary, synced: Array, synced_ids: Array) -> b
 	return DEFAULT_LIBRARY_SEEDED.has(entry["id"]) or is_synced(entry, synced, synced_ids)
 
 static func _has_native_anchor(passes: Array, native_id: int) -> bool:
-	for pass_entry in passes:
-		if pass_entry is BuiltinPass and pass_entry.native_id == native_id:
-			return true
-	return false
+	return _native_index(passes, native_id) >= 0
+
+static func _native_index(passes: Array, native_id: int) -> int:
+	for i in passes.size():
+		if passes[i] is BuiltinPass and passes[i].native_id == native_id:
+			return i
+	return -1

@@ -199,6 +199,7 @@ private:
 	// verdict instead of handling it because that is the one place the two callers differ.
 	RegionFileLoad _load_region_file(const String &p_path, const Vector2i &p_region_loc, const bool p_update);
 	void _copy_paste_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect, const Rect2i &p_dst_rect, const Terrain3DRegion *p_dst_region);
+	void _copy_paste_surface_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect, const Rect2i &p_dst_rect, Terrain3DRegion *p_dst_region);
 	Error _save_export_image(const MapType p_map_type, const Ref<Image> &p_img, const String &p_path, const String &p_ext) const;
 
 public:

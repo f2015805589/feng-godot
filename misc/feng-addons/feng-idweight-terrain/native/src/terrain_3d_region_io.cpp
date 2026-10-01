@@ -14,7 +14,7 @@
 #include "terrain_3d_region.h"
 
 #include "logger.h"
-#include "terrain_3d.h"
+#include "terrain_3d_data.h"
 
 #include <godot_cpp/classes/resource_saver.hpp>
 
@@ -40,10 +40,10 @@ Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit) {
 	LOG(MESG, "Writing", (p_16_bit) ? " 16-bit" : "", " region ", _location, " to ", get_path());
 	set_version(Terrain3DData::CURRENT_DATA_VERSION);
 	Error err = OK;
-	if (p_16_bit) {
-		Ref<Image> original_map;
-		original_map.instantiate();
-		original_map->copy_from(_height_map);
+	if (p_16_bit && _height_map.is_valid()) {
+		// Saving must not quantize a live image retained by shallow copies or callers.
+		Ref<Image> original_map = _height_map;
+		_height_map = original_map->duplicate();
 		_height_map->convert(Image::FORMAT_RH);
 		err = ResourceSaver::get_singleton()->save(this, get_path(), ResourceSaver::FLAG_COMPRESS);
 		_height_map = original_map;
@@ -101,33 +101,32 @@ Dictionary Terrain3DRegion::get_data() const {
 	return dict;
 }
 
+Dictionary Terrain3DRegion::_get_data_deep_copy(bool p_copy_surface) const {
+	Dictionary data = get_data();
+	// Keep one metadata schema. Only the mutable resources need independent owners;
+	// new and partially loaded regions may legitimately have absent legacy maps.
+	const char *map_names[] = { "height_map", "control_map", "color_map", "surface_map" };
+	// Conversion supplies a replacement surface and must not copy a discarded payload.
+	for (int i = 0; i < (p_copy_surface ? 4 : 3); ++i) {
+		const char *name = map_names[i];
+		Ref<Image> map = data[name];
+		if (map.is_valid()) {
+			data[name] = map->duplicate();
+		}
+	}
+	data["instances"] = _instances.duplicate(true);
+	return data;
+}
+
 Ref<Terrain3DRegion> Terrain3DRegion::duplicate(const bool p_deep) {
 	Ref<Terrain3DRegion> region;
 	region.instantiate();
-	if (!p_deep) {
-		region->set_data(get_data());
-	} else {
-		Dictionary dict;
-		// Native type copies
-		dict["version"] = _version;
-		dict["region_size"] = _region_size;
-		dict["vertex_spacing"] = _vertex_spacing;
-		dict["height_range"] = _height_range;
-		dict["modified"] = _modified;
-		dict["deleted"] = _deleted;
-		dict["location"] = _location;
-		// Resource duplicates
-		dict["height_map"] = _height_map->duplicate();
-		dict["control_map"] = _control_map->duplicate();
-		dict["color_map"] = _color_map->duplicate();
-		dict["surface_version"] = _surface_version;
-		dict["surface_density"] = _surface_density;
-		if (_surface_map.is_valid()) {
-			dict["surface_map"] = _surface_map->duplicate();
-		}
-		dict["instances"] = _instances.duplicate(true);
-		region->set_data(dict);
+	Dictionary data = p_deep ? _get_data_deep_copy() : get_data();
+	if (p_deep) {
+		// Undo backups start outside the current edit; shallow copies retain it.
+		data["edited"] = false;
 	}
+	region->set_data(data);
 	return region;
 }
 

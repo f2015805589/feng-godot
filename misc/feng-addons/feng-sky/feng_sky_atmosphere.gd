@@ -3,6 +3,7 @@ class_name FengSkyAtmosphere
 extends WorldEnvironment
 ## World-scoped spherical Earth-like single-scattering sky provider.
 
+const FengSkyOpticalLut = preload("res://addons/feng-sky/feng_sky_optical_lut.gd")
 const FengSkyRuntime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
 const NON_PHYSICAL_SUN_IRRADIANCE := PI
 const MAX_SOLAR_IRRADIANCE := 10000000.0
@@ -27,6 +28,21 @@ var _ambient_last_compute_usec := 0
 var _ambient_total_compute_usec := 0
 var _last_atmosphere_signature: Dictionary = {}
 var _last_material_signature: Array = []
+var _last_material_settings_signature: Array = []
+var _last_snapshot_signature: Array = []
+var _settings_dirty := true
+var _settings_revision := 0
+var _settings_sanitize_count := 0
+var _checked_shader: Shader
+var _reference_shader: Shader
+var _shader_identity_dirty := true
+var _shader_identity_matches := false
+var _shader_identity_check_count := 0
+var _optical_lut: ImageTexture
+var _optical_lut_signature: Array = []
+var _optical_lut_build_count := 0
+var _snapshot_publish_count := 0
+var _material_update_count := 0
 
 @export_group("Sky")
 ## New nodes use the integrated Earth-like model. Assigning a non-atmosphere Sky
@@ -71,17 +87,50 @@ var _last_material_signature: Array = []
 @export_group("Earth Atmosphere")
 ## All lengths and coefficients are in km and km^-1. `planet_center_m` is in
 ## Godot world metres; its default puts world origin at sea level.
-@export_range(6000.0, 7000.0, 1.0, "suffix:km") var planet_radius_km: float = 6360.0
-@export_range(1.0, 120.0, 1.0, "suffix:km") var atmosphere_height_km: float = 60.0
-@export_range(1.0, 30.0, 0.1, "suffix:km") var rayleigh_scale_height_km: float = 8.0
-@export_range(0.1, 10.0, 0.1, "suffix:km") var mie_scale_height_km: float = 1.2
-@export var rayleigh_scattering_per_km: Vector3 = Vector3(0.005802, 0.013558, 0.0331)
-@export_range(0.0, 1.0, 0.00001, "suffix:km^-1") var mie_scattering_per_km: float = 0.003996
-@export_range(0.0, 1.0, 0.00001, "suffix:km^-1") var mie_extinction_per_km: float = 0.00444
-@export_range(-0.95, 0.95, 0.01) var mie_asymmetry: float = 0.8
-@export var planet_center_m: Vector3 = Vector3(0.0, -6360000.0, 0.0)
-@export var ground_albedo: Vector3 = Vector3(0.1, 0.1, 0.1)
-@export_range(0.01, 2.0, 0.001, "suffix:deg") var sun_angular_radius_deg: float = 0.2666
+@export_range(6000.0, 7000.0, 1.0, "suffix:km") var planet_radius_km: float = 6360.0:
+	set(value):
+		planet_radius_km = value
+		_settings_dirty = true
+@export_range(1.0, 120.0, 1.0, "suffix:km") var atmosphere_height_km: float = 60.0:
+	set(value):
+		atmosphere_height_km = value
+		_settings_dirty = true
+@export_range(1.0, 30.0, 0.1, "suffix:km") var rayleigh_scale_height_km: float = 8.0:
+	set(value):
+		rayleigh_scale_height_km = value
+		_settings_dirty = true
+@export_range(0.1, 10.0, 0.1, "suffix:km") var mie_scale_height_km: float = 1.2:
+	set(value):
+		mie_scale_height_km = value
+		_settings_dirty = true
+@export var rayleigh_scattering_per_km: Vector3 = Vector3(0.005802, 0.013558, 0.0331):
+	set(value):
+		rayleigh_scattering_per_km = value
+		_settings_dirty = true
+@export_range(0.0, 1.0, 0.00001, "suffix:km^-1") var mie_scattering_per_km: float = 0.003996:
+	set(value):
+		mie_scattering_per_km = value
+		_settings_dirty = true
+@export_range(0.0, 1.0, 0.00001, "suffix:km^-1") var mie_extinction_per_km: float = 0.00444:
+	set(value):
+		mie_extinction_per_km = value
+		_settings_dirty = true
+@export_range(-0.95, 0.95, 0.01) var mie_asymmetry: float = 0.8:
+	set(value):
+		mie_asymmetry = value
+		_settings_dirty = true
+@export var planet_center_m: Vector3 = Vector3(0.0, -6360000.0, 0.0):
+	set(value):
+		planet_center_m = value
+		_settings_dirty = true
+@export var ground_albedo: Vector3 = Vector3(0.1, 0.1, 0.1):
+	set(value):
+		ground_albedo = value
+		_settings_dirty = true
+@export_range(0.01, 2.0, 0.001, "suffix:deg") var sun_angular_radius_deg: float = 0.2666:
+	set(value):
+		sun_angular_radius_deg = value
+		_settings_dirty = true
 
 
 func _init() -> void:
@@ -110,6 +159,7 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	FengSkyRuntime.remove_snapshot(self, _bound_world_id)
 	_bound_world_id = 0
+	_last_snapshot_signature.clear()
 	set_process(false)
 
 
@@ -280,7 +330,36 @@ func _is_atmosphere_sky(candidate: Sky) -> bool:
 	if candidate == null or not candidate.sky_material is ShaderMaterial:
 		return false
 	var material := candidate.sky_material as ShaderMaterial
-	return material.shader != null and material.shader.code == FengSkyRuntime.atmosphere_shader_code()
+	var shader := material.shader
+	if shader != _checked_shader:
+		if _checked_shader != null:
+			_checked_shader.changed.disconnect(_invalidate_shader_identity)
+		_checked_shader = shader
+		if _checked_shader != null:
+			_checked_shader.changed.connect(_invalidate_shader_identity)
+		_invalidate_shader_identity()
+	if _shader_identity_dirty:
+		if _reference_shader == null:
+			_reference_shader = FengSkyRuntime.atmosphere_shader()
+			if _reference_shader != null:
+				_reference_shader.changed.connect(_invalidate_reference_shader_identity)
+		_shader_identity_matches = shader != null and _reference_shader != null and shader.code == _reference_shader.code
+		_shader_identity_dirty = false
+		_shader_identity_check_count += 1
+	return _shader_identity_matches
+
+
+func _invalidate_reference_shader_identity() -> void:
+	# The editor may hot-reload the original asset while private scene copies
+	# stay alive. Its source is part of identity, just like the selected shader.
+	_invalidate_shader_identity()
+
+
+func _invalidate_shader_identity() -> void:
+	_shader_identity_dirty = true
+	_last_material_signature.clear()
+	_last_material_settings_signature.clear()
+	_last_snapshot_signature.clear()
 
 
 func _has_selected_atmosphere_sky() -> bool:
@@ -303,12 +382,14 @@ func _refresh_world_binding() -> void:
 	var active := world != null and environment != null and world.get_environment() == environment
 	if not active or not _has_selected_atmosphere_sky():
 		_last_material_signature.clear()
+		_last_snapshot_signature.clear()
 		FengSkyRuntime.remove_snapshot(self, _bound_world_id)
 		_bound_world_id = 0
 		return
 
 	var world_id := world.get_instance_id()
 	if _bound_world_id != world_id:
+		_last_snapshot_signature.clear()
 		FengSkyRuntime.remove_snapshot(self, _bound_world_id)
 		_bound_world_id = world_id
 
@@ -327,14 +408,20 @@ func _refresh_world_binding() -> void:
 
 	_update_sky_shader(sun_direction, sun_color, sun_irradiance)
 	if not affect_height_fog:
+		_last_snapshot_signature.clear()
 		FengSkyRuntime.remove_snapshot(self, _bound_world_id)
 		_bound_world_id = 0
+		return
+	var sky_gain := _background_energy_gain()
+	var physical_units := _uses_physical_light_units()
+	var snapshot_signature: Array = [world_id, sun_light_id, sun_direction, sun_color,
+		sun_irradiance, sky_gain, height_fog_contribution, physical_units, _settings_revision]
+	if snapshot_signature == _last_snapshot_signature:
 		return
 	var ambient := Vector3.ZERO
 	var ground_illuminance := Vector3.ZERO
 	if selected_sun != null and sun_irradiance > 0.0 and sun_color.max(Vector3.ZERO).length_squared() > 0.0:
 		var cache := _ambient_entry_for_sun(sun_direction)
-		var sky_gain := _background_energy_gain()
 		ambient = (cache["ambient_unit_sun"] as Vector3) * sun_irradiance * sun_color.max(Vector3.ZERO) * sky_gain
 		ambient = ambient.min(Vector3.ONE * MAX_SKY_RADIANCE)
 		ground_illuminance = (cache["ground_transmittance"] as Vector3) * sun_irradiance * sun_color.max(Vector3.ZERO)
@@ -344,10 +431,12 @@ func _refresh_world_binding() -> void:
 		"sun_light_id": sun_light_id,
 		"sun_direction": sun_direction,
 		"sun_ground_illuminance": _finite_nonnegative(ground_illuminance),
-		"sun_irradiance_unit": "lux" if _uses_physical_light_units() else "frp_normalized",
+		"sun_irradiance_unit": "lux" if physical_units else "frp_normalized",
 		"ambient_radiance": _finite_nonnegative(ambient),
 		"height_fog_contribution": maxf(height_fog_contribution, 0.0),
 	})
+	_last_snapshot_signature = snapshot_signature
+	_snapshot_publish_count += 1
 
 
 func _feng_sky_runtime_is_active(world_id: int) -> bool:
@@ -356,9 +445,13 @@ func _feng_sky_runtime_is_active(world_id: int) -> bool:
 		or not _has_selected_atmosphere_sky()
 		or not affect_height_fog
 	):
+		_last_snapshot_signature.clear()
 		return false
 	var world := _current_world()
-	return world != null and world.get_instance_id() == world_id and world.get_environment() == environment
+	var active := world != null and world.get_instance_id() == world_id and world.get_environment() == environment
+	if not active:
+		_last_snapshot_signature.clear()
+	return active
 
 
 func _resolve_sun(world: World3D) -> DirectionalLight3D:
@@ -415,13 +508,23 @@ func _uses_physical_light_units() -> bool:
 
 
 func _refresh_atmosphere_cache() -> void:
-	var signature := _atmosphere_settings()
+	if not _settings_dirty:
+		return
+	_settings_dirty = false
+	_settings_sanitize_count += 1
+	var signature := _sanitize_current_settings()
 	if signature != _last_atmosphere_signature:
 		_ambient_cache.clear()
-		_last_atmosphere_signature = signature.duplicate(true)
+		_last_atmosphere_signature = signature
+		_settings_revision += 1
 
 
 func _atmosphere_settings() -> Dictionary:
+	_refresh_atmosphere_cache()
+	return _last_atmosphere_signature
+
+
+func _sanitize_current_settings() -> Dictionary:
 	return FengSkyRuntime.sanitize_atmosphere_settings({
 		"planet_radius_km": planet_radius_km,
 		"atmosphere_height_km": atmosphere_height_km,
@@ -492,6 +595,11 @@ func atmosphere_cache_stats() -> Dictionary:
 		"last_miss_usec": _ambient_last_compute_usec,
 		"total_miss_usec": _ambient_total_compute_usec,
 		"rays_per_miss": FengSkyRuntime.AMBIENT_SAMPLE_COUNT,
+		"settings_sanitizations": _settings_sanitize_count,
+		"shader_identity_checks": _shader_identity_check_count,
+		"optical_lut_updates": _optical_lut_build_count,
+		"snapshot_publications": _snapshot_publish_count,
+		"material_updates": _material_update_count,
 	}
 
 
@@ -505,36 +613,36 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 	if not _has_selected_atmosphere_sky():
 		return
 	var material := environment.sky.sky_material as ShaderMaterial
-	if material == null or material.shader == null or material.shader.code != FengSkyRuntime.atmosphere_shader_code():
-		_last_material_signature.clear()
-		return
 	var settings := _atmosphere_settings()
+	var settings_signature: Array = [material.get_instance_id(), material.shader.get_instance_id(), _settings_revision]
+	if settings_signature != _last_material_settings_signature:
+		var lut_signature := FengSkyOpticalLut.geometry_signature(settings)
+		var use_lut := FengSkyOpticalLut.supports_settings(settings)
+		if use_lut and (_optical_lut == null or lut_signature != _optical_lut_signature):
+			# A fresh private image/texture cannot be edited through another world.
+			_optical_lut = ImageTexture.create_from_image(FengSkyOpticalLut.make_image(settings))
+			_optical_lut.resource_local_to_scene = true
+			_optical_lut_signature = lut_signature
+			_optical_lut_build_count += 1
+		for setting_name in settings:
+			material.set_shader_parameter(setting_name, settings[setting_name])
+		material.set_shader_parameter("optical_column_lut", _optical_lut)
+		material.set_shader_parameter("use_optical_column_lut", use_lut)
+		_last_material_settings_signature = settings_signature
 	var sky_gain := _background_energy_gain()
+	var material_signature: Array = [material.get_instance_id(), material.shader.get_instance_id(),
+		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain]
+	if material_signature == _last_material_signature:
+		return
 	var sky_radiance_limit := 0.0
 	if sky_gain > 0.0:
 		sky_radiance_limit = MAX_SKY_RADIANCE / maxf(sky_gain, 0.000001)
-	var material_signature: Array = [
-		material.get_instance_id(), material.shader.get_instance_id(), settings,
-		sun_direction, sun_color, sun_irradiance, sky_gain,
-	]
-	if material_signature == _last_material_signature:
-		return
-	material.set_shader_parameter("planet_radius_km", settings["planet_radius_km"])
-	material.set_shader_parameter("atmosphere_height_km", settings["atmosphere_height_km"])
-	material.set_shader_parameter("rayleigh_scale_height_km", settings["rayleigh_scale_height_km"])
-	material.set_shader_parameter("mie_scale_height_km", settings["mie_scale_height_km"])
-	material.set_shader_parameter("rayleigh_scattering_per_km", settings["rayleigh_scattering_per_km"])
-	material.set_shader_parameter("mie_scattering_per_km", settings["mie_scattering_per_km"])
-	material.set_shader_parameter("mie_extinction_per_km", settings["mie_extinction_per_km"])
-	material.set_shader_parameter("mie_asymmetry", settings["mie_asymmetry"])
-	material.set_shader_parameter("planet_center_m", settings["planet_center_m"])
-	material.set_shader_parameter("ground_albedo", settings["ground_albedo"])
-	material.set_shader_parameter("sun_angular_radius_deg", settings["sun_angular_radius_deg"])
 	material.set_shader_parameter("sun_direction", sun_direction.normalized() if sun_direction.length_squared() > 0.001 else Vector3.UP)
 	material.set_shader_parameter("sun_color_linear", sun_color.max(Vector3.ZERO))
 	material.set_shader_parameter("sun_irradiance", minf(maxf(sun_irradiance, 0.0), MAX_SOLAR_IRRADIANCE))
 	material.set_shader_parameter("sky_radiance_limit", sky_radiance_limit)
-	_last_material_signature = material_signature.duplicate(true)
+	_last_material_signature = material_signature
+	_material_update_count += 1
 
 
 func _finite_nonnegative(value: Vector3) -> Vector3:

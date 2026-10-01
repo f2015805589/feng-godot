@@ -141,8 +141,30 @@ func run() -> void:
 	# bounce into, so turning every one of them on has to leave the frame identical.
 	# SDFGI is in this set too: FRP no longer creates, updates or renders an SDFGI at
 	# all (it used to render cascades nothing consumed).
-	for removed_id in [8, 9, 10, 11, 12]:
+	# ID 8 was reused for native Bloom. Validate that current contract positively
+	# instead of mistaking it for one of the removed screen-space/GI entries.
+	var native_spec: Dictionary = RenderingServer.call("get_frp_pipeline_spec")
+	require(int(native_spec.get("pass_count", 0)) == 9, "FRP must expose only native ids 0..8")
+	var bloom_definition: Dictionary = {}
+	for definition in native_spec.get("passes", []):
+		if int(definition.get("id", -1)) == 8:
+			bloom_definition = definition
+		for removed_name in ["SSAO", "SSIL", "SSR", "SDFGI", "VoxelGI"]:
+			require(not String(definition.get("name", "")).contains(removed_name),
+					"renderer still exposes removed native effect %s" % removed_name)
+	require(entries.has(8) and entries[8].enabled and bloom_definition.get("name", "") == "Bloom",
+			"native id 8 must be the enabled Bloom entry")
+	require(native_spec.get("default_order", []) == [0, 1, 2, 3, 4, 5, 6, 8, 7],
+			"native Bloom must run between Temporal AA and Post Process")
+	for edge in [[5, 8], [6, 8], [8, 7]]:
+		require(native_spec.get("edges", []).has(edge), "native Bloom dependency is missing: %s" % [edge])
+	for removed_id in [9, 10, 11, 12]:
 		require(not entries.has(removed_id), "renderer still exposes removed native pass %d" % removed_id)
+
+	# Compare lighting switches without unrelated temporal jitter. Fresh renderers
+	# now enable native TAA, independently of the viewport's legacy use_taa flag.
+	require(entries.has(6), "renderer does not expose the Temporal AA control")
+	entries[6].enabled = false
 
 	environment.ssao_enabled = true
 	environment.ssao_radius = 2.0

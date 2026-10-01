@@ -71,15 +71,15 @@ static func order_edges() -> Array:
 static func mandatory_ids() -> Array:
 	return spec().get("mandatory", [])
 
-## Whether a pass ships disabled. Enabling its entry is what turns the effect on; at
-## present Temporal AA is the only native entry that ships disabled.
+## Whether legacy seeding treated a pass as optional. Modern fresh renderers
+## enable every native entry; this flag still preserves older migration semantics.
 static func is_optional_id(p_native_id: int) -> bool:
 	for definition in pass_definitions():
 		if int(definition["id"]) == p_native_id:
 			return bool(definition.get("optional", false))
 	return false
 
-## The ids a fresh pipeline enables: every non-optional pass, in seed order.
+## Non-optional legacy defaults used for normalization and migration, in seed order.
 static func default_ids() -> Array:
 	var ids: Array = []
 	for native_id in seed_order():

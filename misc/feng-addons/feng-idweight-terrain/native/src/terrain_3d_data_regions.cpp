@@ -120,6 +120,7 @@ void Terrain3DData::change_region_size(int p_new_size) {
 		new_region.instantiate();
 		new_region->set_location(region_loc);
 		new_region->set_region_size(p_new_size);
+		new_region->set_surface_density(_terrain->get_surface_density());
 		new_region->set_vertex_spacing(_vertex_spacing);
 		new_region->set_modified(true);
 		new_region->sanitize_maps();
@@ -129,6 +130,9 @@ void Terrain3DData::change_region_size(int p_new_size) {
 		area.position = region_loc * p_new_size;
 		area.size = V2I(p_new_size);
 		do_for_regions(area, callable_mp(this, &Terrain3DData::_copy_paste_dfr).bind(new_region.ptr()));
+		// Complete legacy controls first: a lazily created destination surface must
+		// include every unconverted source before authored packed-ID areas replace it.
+		do_for_regions(area, callable_mp(this, &Terrain3DData::_copy_paste_surface_dfr).bind(new_region.ptr()));
 		new_regions.push_back(new_region);
 	}
 

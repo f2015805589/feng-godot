@@ -516,10 +516,6 @@ void Terrain3DPagePipeline::run() {
 				continue;
 			}
 		}
-		if (job.request.svt && (_signature_source != job.source || _signature_materials != job.request.materials || _signature_density != job.request.density)) {
-			std::lock_guard<std::mutex> cache_lock(_cache_mutex);
-			_signature_source = job.source; _signature_materials = job.request.materials; _signature_density = job.request.density; _signatures.clear();
-		}
 		std::call_once(job.source->bounds_once, [&]() {
 			for (const auto &item : job.source->cells) {
 				const Cell &cell = item.second;
@@ -546,7 +542,7 @@ void Terrain3DPagePipeline::run() {
 			job.source->bounds_ready.store(true, std::memory_order_release);
 		});
 		const uint64_t produce_start = Time::get_singleton()->get_ticks_usec();
-		Result result = produce(job.request, *job.source);
+		Result result = produce(job.request, job.source);
 		_produced_usec.fetch_add(Time::get_singleton()->get_ticks_usec() - produce_start, std::memory_order_relaxed);
 		_produced_pages.fetch_add(1, std::memory_order_relaxed);
 		{
@@ -563,7 +559,8 @@ void Terrain3DPagePipeline::run() {
 		// queue for a lock the demand pass needed, once per finished page.
 	}
 }
-Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &request, const Snapshot &source) {
+Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &request, const std::shared_ptr<const Snapshot> &p_source) {
+	const Snapshot &source = *p_source;
 	const float world = source.region_size * source.spacing;
 	// Adjacent output samples overwhelmingly read the same source cell. Keep a
 	// tiny local lookup cache so producing a page does not perform hundreds of
@@ -638,7 +635,7 @@ Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &requ
 	}
 	Result result;
 	result.payload = Image::create_from_data(stored, stored, false, IDWEIGHT_IMAGE_FORMAT, payload);
-	if (request.svt) { load_cells(request, source, result); return result; }
+	if (request.svt) { load_cells(request, p_source, result); return result; }
 	PackedByteArray ids, heights; heights.resize(int64_t(stored) * stored * 4);
 	uint8_t *height_out = heights.ptrw();
 	int extent = stored;
@@ -665,7 +662,8 @@ Terrain3DPagePipeline::Result Terrain3DPagePipeline::produce(const Request &requ
 	return result;
 }
 
-void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &source, Result &result) {
+void Terrain3DPagePipeline::load_cells(const Request &request, const std::shared_ptr<const Snapshot> &p_source, Result &result) {
+	const Snapshot &source = *p_source;
 	const float world = source.region_size * source.spacing;
 	const float pixel = request.rect.size.x / request.size;
 	const Rect2 footprint = request.rect.grow(pixel * request.border);
@@ -677,6 +675,11 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const Snapshot &s
 		uint32_t hash = 0;
 		{
 			std::lock_guard<std::mutex> cache_lock(_cache_mutex);
+			// Validate the job's immutable context in the same critical section as its lookup.
+			// Another worker may still be finishing a different snapshot/material generation.
+			if (_signature_source != p_source || _signature_materials != request.materials || _signature_density != request.density) {
+				_signature_source = p_source; _signature_materials = request.materials; _signature_density = request.density; _signatures.clear();
+			}
 			auto cached_signature = _signatures.find(entry.first);
 			if (cached_signature == _signatures.end()) {
 				// The same signature the baker wrote; see terrain_vt_cell.h. Computed

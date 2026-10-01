@@ -150,7 +150,11 @@ func _replace_entry(renderer: Object, native_id: int, scripted) -> void:
 # otherwise the difference measured is the library look, not the taken-over pass.
 func _disable_library(renderer: Object) -> void:
 	for pass_entry in renderer.passes:
-		if pass_entry != null and pass_entry.get("native_id") == null:
+		if pass_entry == null:
+			continue
+		if pass_entry.get("native_id") == null or int(pass_entry.native_id) == 6:
+			# Match the bare viewport's non-jittered reference explicitly. New
+			# resources enable TAA, which would confound exact pixel equivalence.
 			pass_entry.enabled = false
 
 
@@ -409,12 +413,12 @@ func run() -> void:
 		if pass_entry.get("native_id") != null:
 			require(pass_entry.get("implementation") != null, "native pass %d has no addon pass script" % int(pass_entry.native_id))
 			scripted_entries += 1
-	require(scripted_entries == 8, "the default pipeline must implement all 8 engine passes in the addon, got %d" % scripted_entries)
+	require(scripted_entries == 9, "the default pipeline must implement all 9 engine passes in the addon, got %d" % scripted_entries)
 	var scripted_tokens: PackedInt32Array = default_renderer.get_execution_tokens()
 	for token in scripted_tokens:
 		require(token < 0, "the default pipeline still emits an engine token: %s" % [scripted_tokens])
 	var provided: PackedInt32Array = default_renderer.get_provided_native_ids()
-	for native_id in [0, 1, 2, 3, 4, 5, 7]:
+	for native_id in [0, 1, 2, 3, 4, 5, 8, 7]:
 		require(provided.has(native_id), "the scripted default does not report pass %d as provided: %s" % [native_id, provided])
 	var scripted_default: Image = await frame()
 

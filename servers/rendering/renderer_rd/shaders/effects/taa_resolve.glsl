@@ -54,6 +54,10 @@ layout(push_constant, std430) uniform Params {
 	vec2 resolution;
 	float disocclusion_threshold; // 0.1 / max(params.resolution.x, params.resolution.y)
 	float variance_dynamic;
+	float history_exposure_ratio;
+	float pad0;
+	float pad1;
+	float pad2;
 }
 params;
 
@@ -114,7 +118,13 @@ void store_color_depth(uvec2 group_thread_id, ivec2 thread_id) {
 	// out of bounds clamp
 	thread_id = clamp(thread_id, ivec2(0, 0), ivec2(params.resolution) - ivec2(1, 1));
 
-	store_color(group_thread_id, imageLoad(color_buffer, thread_id).rgb);
+	vec3 color = imageLoad(color_buffer, thread_id).rgb;
+	// A current-frame overflow also contaminates neighboring variance statistics,
+	// and Inf / (Inf + 1) becomes NaN during the resolve's temporary tonemap.
+	// Repair only invalid components; all finite HDR values remain unchanged.
+	color = mix(color, vec3(0.0), isnan(color));
+	color = mix(color, clamp(color, vec3(0.0), vec3(65504.0)), isinf(color));
+	store_color(group_thread_id, color);
 	store_depth(group_thread_id, get_depth(thread_id));
 }
 
@@ -174,7 +184,7 @@ void get_closest_pixel_velocity_3x3(in uvec2 group_pos, uvec2 group_top_left, ou
 							  HISTORY SAMPLING
 ------------------------------------------------------------------------------*/
 
-vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution) {
+vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution, out bool valid_history) {
 	// Source: https://gist.github.com/TheRealMJP/c83b8c0f46b63f3a88a5986f4fa982b1
 	// License: https://gist.github.com/TheRealMJP/bc503b0b87b643d3505d41eab8b332ae
 
@@ -224,6 +234,9 @@ vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution) {
 	result += textureLod(stex, vec2(texPos12.x, texPos3.y), 0.0).xyz * w12.x * w3.y;
 	result += textureLod(stex, vec2(texPos3.x, texPos3.y), 0.0).xyz * w3.x * w3.y;
 
+	// Detect invalid history before max(): some drivers turn max(NaN, 0)
+	// into zero, which would silently blend an overflowed frame as black.
+	valid_history = !any(isnan(result)) && !any(isinf(result));
 	return max(result, 0.0f);
 }
 
@@ -322,7 +335,17 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 	vec3 color_input = load_color(pos_group);
 
 	// Get history color (catmull-rom reduces a lot of the blurring that you get under motion)
-	vec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution).rgb;
+	bool valid_history;
+	vec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution, valid_history).rgb;
+	// History stores HDR radiance encoded with the previous frame's exposure.
+	// Rebase before variance clipping or nonlinear blending, otherwise a scalar
+	// exposure change can clip RGB channels differently and wash out the color.
+	if (valid_history) {
+		color_history *= params.history_exposure_ratio;
+	} else {
+		// An FP16 overflow or NaN from one frame must not poison later frames.
+		color_history = color_input;
+	}
 
 	// Clip history to the neighbourhood of the current sample (fixes a lot of the ghosting).
 	vec2 velocity_closest = vec2(0.0); // This is best done by using the velocity with the closest depth.

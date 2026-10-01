@@ -63,6 +63,15 @@ unload operation. This is the accepted tradeoff for capturing the live editor
 without restarting it. No claim of zero instrumentation overhead is made.
 Captures remain under `.godot/renderdoc/captures/`.
 
+The immediate and queued capture paths share one owned viewport-update snapshot.
+Success, failure, timeout and plugin disable restore the original update modes;
+an interrupted wait cannot clean up a newer capture after reload. The editor
+lifecycle regression covers this cleanup without requiring RenderDoc installation:
+
+```sh
+python misc/scripts/test_feng_tools_lifecycle.py --editor /path/to/feng-godot --driver vulkan
+```
+
 ## D3D12 capture and the Agility runtime
 
 The editor loads `D3D12Core.dll` from its own directory whenever that file exists (the

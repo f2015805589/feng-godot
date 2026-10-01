@@ -112,6 +112,13 @@ public:
 	public:
 		ClusterBuilderRD *cluster_builder = nullptr;
 
+		// A retired state remains alive only until its pending GPU readbacks finish.
+		// Replacing it prevents old callbacks from changing a reconfigured view.
+		std::shared_ptr<float> pre_exposure = std::make_shared<float>(1.0f);
+		bool pre_exposure_enabled = false;
+		RID exposure_compositor;
+		float taa_history_pre_exposure = 1.0f;
+
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
@@ -184,9 +191,7 @@ private:
 
 	RID render_base_uniform_set;
 	LocalVector<RD::Uniform> render_base_uniforms;
-	// GPU eye adaptation is read back asynchronously; each render buffer uses the
-	// last completed exposure at the start of its next frame, as UE does.
-	std::shared_ptr<HashMap<ObjectID, float>> pre_exposure_history = std::make_shared<HashMap<ObjectID, float>>();
+	// Immutable throughout a frame, even if a previous GPU readback completes.
 	float current_pre_exposure = 1.0f;
 	bool current_eye_adaptation_enabled = false;
 	RID current_eye_adaptation_texture;

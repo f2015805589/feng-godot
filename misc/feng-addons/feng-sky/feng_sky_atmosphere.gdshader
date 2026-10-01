@@ -23,7 +23,10 @@ uniform float sky_radiance_limit = 60000.0;
 uniform vec3 ground_albedo = vec3(0.1);
 
 const int VIEW_SAMPLES = 8;
-const int SUN_SAMPLES = 6;
+// Rayleigh and Mie density columns in km. The finite, non-ground-intersecting
+// sun-ray domain maps to texel centers; planet shadow is evaluated analytically.
+uniform sampler2D optical_column_lut : filter_linear, repeat_disable;
+uniform bool use_optical_column_lut = false;
 const float INV_PI = 0.3183098861837907;
 
 float ray_sphere_exit(vec3 origin, vec3 direction, float radius) {
@@ -43,28 +46,7 @@ bool ray_hits_ground(vec3 point, vec3 direction) {
 	return b < 0.0 && discriminant >= 0.0;
 }
 
-vec3 optical_depth(vec3 point, vec3 direction, float path_length) {
-	if (path_length <= 0.0) {
-		return vec3(0.0);
-	}
-	float rayleigh_column = 0.0;
-	float mie_column = 0.0;
-	for (int i = 0; i < SUN_SAMPLES; i++) {
-		float sample_start = pow(float(i) / float(SUN_SAMPLES), 2.0);
-		float sample_end = pow(float(i + 1) / float(SUN_SAMPLES), 2.0);
-		float step_length = (sample_end - sample_start) * path_length;
-		float sample_t = (sample_start + sample_end) * 0.5;
-		vec3 sample_point = point + direction * sample_t * path_length;
-		float altitude = max(length(sample_point) - planet_radius_km, 0.0);
-		rayleigh_column += exp(-altitude / max(rayleigh_scale_height_km, 0.001)) * step_length;
-		mie_column += exp(-altitude / max(mie_scale_height_km, 0.001)) * step_length;
-	}
-	return max(rayleigh_scattering_per_km, vec3(0.0)) * rayleigh_column
-		+ vec3(max(mie_extinction_per_km, 0.0) * mie_column);
-}
-
-vec3 view_segment_factor(vec3 extinction, float step_length) {
-	vec3 segment_transmittance = exp(-extinction * step_length);
+vec3 view_segment_factor(vec3 extinction, float step_length, vec3 segment_transmittance) {
 	vec3 factor = vec3(step_length);
 	if (extinction.x > 0.0000001) {
 		factor.x = (1.0 - segment_transmittance.x) / extinction.x;
@@ -78,30 +60,51 @@ vec3 view_segment_factor(vec3 extinction, float step_length) {
 	return factor;
 }
 
+vec2 direct_optical_columns(vec3 point, vec3 direction, float path_length) {
+	vec2 columns = vec2(0.0);
+	for (int i = 0; i < 6; i++) {
+		float sample_start = float(i) / 6.0;
+		float sample_end = float(i + 1) / 6.0;
+		sample_start *= sample_start;
+		sample_end *= sample_end;
+		float segment_length = (sample_end - sample_start) * path_length;
+		vec3 sample_point = point + direction * ((sample_start + sample_end) * 0.5 * path_length);
+		float altitude = max(length(sample_point) - planet_radius_km, 0.0);
+		columns += exp(-altitude / vec2(rayleigh_scale_height_km, mie_scale_height_km)) * segment_length;
+	}
+	return columns;
+}
+
 vec3 transmittance_to_sun(vec3 point, vec3 direction) {
 	if (ray_hits_ground(point, direction)) {
 		return vec3(0.0);
 	}
-	float path_length = ray_sphere_exit(point, direction, planet_radius_km + max(atmosphere_height_km, 0.001));
+	float radius = length(point);
+	float top_radius = planet_radius_km + atmosphere_height_km;
+	float r_mu = dot(point, direction);
+	float top_delta = max((top_radius - radius) * (top_radius + radius), 0.0);
+	float path_length = max(-r_mu + sqrt(max(r_mu * r_mu + top_delta, 0.0)), 0.0);
 	if (path_length <= 0.0) {
-		return vec3(0.0);
+		return vec3(1.0);
 	}
-	return exp(-optical_depth(point, direction, path_length));
+	if (!use_optical_column_lut) {
+		vec2 columns = direct_optical_columns(point, direction, path_length);
+		return exp(-(rayleigh_scattering_per_km * columns.x + vec3(mie_extinction_per_km * columns.y)));
+	}
+	float rho = sqrt(max((radius - planet_radius_km) * (radius + planet_radius_km), 0.0));
+	float horizon_length = sqrt(atmosphere_height_km * (2.0 * planet_radius_km + atmosphere_height_km));
+	float minimum_distance = max(top_radius - radius, 0.0);
+	float maximum_distance = rho + horizon_length;
+	vec2 unit_uv = clamp(vec2((path_length - minimum_distance) / max(maximum_distance - minimum_distance, 0.000001),
+		rho / horizon_length), vec2(0.0), vec2(1.0));
+	unit_uv.x = 1.0 - sqrt(1.0 - unit_uv.x);
+	vec2 lut_size = vec2(textureSize(optical_column_lut, 0));
+	vec2 uv = (vec2(0.5) + unit_uv * (lut_size - vec2(1.0))) / lut_size;
+	vec2 columns = textureLod(optical_column_lut, uv, 0.0).rg;
+	vec3 optical_depth = rayleigh_scattering_per_km * columns.x + vec3(mie_extinction_per_km * columns.y);
+	return exp(-optical_depth);
 }
 
-vec3 extinction_at(float altitude) {
-	float rayleigh_density = exp(-max(altitude, 0.0) / max(rayleigh_scale_height_km, 0.001));
-	float mie_density = exp(-max(altitude, 0.0) / max(mie_scale_height_km, 0.001));
-	return max(rayleigh_scattering_per_km, vec3(0.0)) * rayleigh_density
-		+ vec3(max(mie_extinction_per_km, 0.0) * mie_density);
-}
-
-vec3 scattering_at(float altitude, float rayleigh_phase, float mie_phase) {
-	float rayleigh_density = exp(-max(altitude, 0.0) / max(rayleigh_scale_height_km, 0.001));
-	float mie_density = exp(-max(altitude, 0.0) / max(mie_scale_height_km, 0.001));
-	return max(rayleigh_scattering_per_km, vec3(0.0)) * (rayleigh_density * rayleigh_phase)
-		+ vec3(max(mie_scattering_per_km, 0.0) * mie_density * mie_phase);
-}
 
 vec3 integrate_atmosphere(vec3 origin, vec3 view_direction, out vec3 view_transmittance, out float ground_distance, out float atmosphere_entry_distance) {
 	float atmosphere_radius = planet_radius_km + max(atmosphere_height_km, 0.001);
@@ -169,10 +172,13 @@ vec3 integrate_atmosphere(vec3 origin, vec3 view_direction, out vec3 view_transm
 		vec3 sample_point = ray_origin + view_direction * distance_along_ray;
 		float altitude = max(length(sample_point) - planet_radius_km, 0.0);
 		vec3 sun_trans = transmittance_to_sun(sample_point, sun_dir);
-		vec3 source = scattering_at(altitude, rayleigh_phase, mie_phase) * sun_trans;
-		vec3 extinction = extinction_at(altitude);
+		float rayleigh_density = exp(-altitude / rayleigh_scale_height_km);
+		float mie_density = exp(-altitude / mie_scale_height_km);
+		vec3 rayleigh = rayleigh_scattering_per_km * rayleigh_density;
+		vec3 source = (rayleigh * rayleigh_phase + vec3(mie_scattering_per_km * mie_density * mie_phase)) * sun_trans;
+		vec3 extinction = rayleigh + vec3(mie_extinction_per_km * mie_density);
 		vec3 segment_transmittance = exp(-extinction * segment_length);
-		radiance += accumulated_transmittance * source * view_segment_factor(extinction, segment_length);
+		radiance += accumulated_transmittance * source * view_segment_factor(extinction, segment_length, segment_transmittance);
 		accumulated_transmittance *= segment_transmittance;
 	}
 	view_transmittance = accumulated_transmittance;
