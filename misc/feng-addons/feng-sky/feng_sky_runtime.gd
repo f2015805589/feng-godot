@@ -145,7 +145,7 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 	## cache miss. It returns unit-sun ambient radiance and ground transmittance.
 	var sanitized := sanitize_atmosphere_settings(settings)
 	var radius: float = sanitized["planet_radius_km"]
-	var mie_g: float = sanitized["mie_asymmetry"]
+	var mie_g := clampf(float(sanitized["mie_asymmetry"]), 0.0, 0.999)
 	var sun_direction := sanitize_sun_direction(sun_direction_world)
 	var planet_center_m: Vector3 = sanitized["planet_center_m"]
 	var surface_origin := -planet_center_m / 1000.0
@@ -216,6 +216,7 @@ static func sanitize_atmosphere_settings(settings: Dictionary) -> Dictionary:
 
 
 static func _sample_henyey_greenstein_cosine(u: float, g: float) -> float:
+	g = clampf(g, 0.0, 0.999)
 	if absf(g) < 0.001:
 		return 1.0 - 2.0 * u
 	var term := (1.0 - g * g) / maxf(1.0 - g + 2.0 * g * u, 0.000001)
@@ -237,7 +238,7 @@ static func _legacy_transport_settings(radius: float, top_radius: float, rayleig
 static func _integrate_ray(origin: Vector3, view_direction: Vector3, sun_direction: Vector3, radius: float, top_radius: float, rayleigh_height: float, mie_height: float, beta_rayleigh: Vector3, beta_mie_scatter: float, beta_mie_extinction: float, mie_g: float) -> Vector3:
 	var settings := _legacy_transport_settings(radius, top_radius, rayleigh_height, mie_height, beta_rayleigh, beta_mie_extinction)
 	settings["mie_scattering_coefficients"] = Vector3.ONE * maxf(beta_mie_scatter, 0.0)
-	settings["mie_asymmetry"] = clampf(mie_g, -0.99, 0.99)
+	settings["mie_asymmetry"] = clampf(mie_g, 0.0, 0.999)
 	return FengSkyTransport.integrate_ray(origin, view_direction, sun_direction, settings)
 
 

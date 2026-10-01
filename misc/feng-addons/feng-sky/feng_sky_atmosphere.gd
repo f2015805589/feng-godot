@@ -7,14 +7,20 @@ const FengSkyParameters = preload("res://addons/feng-sky/feng_sky_parameters.gd"
 const FengSkyMultiScatteringLut = preload("res://addons/feng-sky/feng_sky_multiscattering_lut.gd")
 const FengSkyOpticalLut = preload("res://addons/feng-sky/feng_sky_optical_lut.gd")
 const FengSkyRuntime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
+const FengSkyLightRegistry = preload("res://addons/feng-sky/feng_sky_light_registry.gd")
 const NON_PHYSICAL_SUN_IRRADIANCE := PI
 const MAX_SOLAR_IRRADIANCE := 10000000.0
 const MAX_SKY_RADIANCE := 60000.0
 const AMBIENT_ZENITH_STEP_DEG := 2.0
+const RAYLEIGH_COEFFICIENT_BASIS := 0.0331
+const MIE_SCATTERING_COEFFICIENT_BASIS := 0.003996
+const MIE_ABSORPTION_COEFFICIENT_BASIS := 0.000444
+const OTHER_ABSORPTION_COEFFICIENT_BASIS := 0.001881
 # Exact released sources only. An edited/custom shader is never auto-upgraded.
 const LEGACY_ATMOSPHERE_SHADER_SHA256 := [
 	"c421870e65cb92a6db325cc6270fac8f906df016b0efe1a1007bd691cb644e6d", # aa96f5c
 	"0e4f8b56bc26ca577c5dfbb4ddea18e1a8a6f9a8324185153f3dba9062916020", # 9d41bde
+	"0f815fb7da56be15db13c180fa6a1de55d5f7383fe22764aa16c6f315ec166fb", # e002032f test-1 embedded default
 ]
 
 @export_storage var _owned_environment: Environment
@@ -26,8 +32,7 @@ var _atmosphere_sky: Sky
 var _atmosphere_enabled := true
 var _initializing := true
 var _bound_world_id := 0
-var _auto_sun: DirectionalLight3D
-var _next_auto_sun_scan_msec := 0
+var _light_registry: FengSkyLightRegistry
 var _ambient_cache: Dictionary = {}
 var _ambient_cache_miss_count := 0
 var _ambient_cache_evaluation_count := 0
@@ -44,6 +49,7 @@ var _settings_revision := 0
 var _settings_sanitize_count := 0
 var _checked_shader: Shader
 var _reference_shader: Shader
+var _reference_shader_revision := 0
 var _shader_identity_dirty := true
 var _shader_identity_matches := false
 var _shader_identity_check_count := 0
@@ -96,10 +102,32 @@ var _material_update_count := 0
 @export var sun_light: DirectionalLight3D
 ## Optional second atmospheric light (for example the moon), matching UE index 1.
 @export var secondary_sun_light: DirectionalLight3D
-@export_range(0.01, 2.0, 0.001, "suffix:deg") var secondary_sun_angular_radius_deg := 0.26785
+## UE-style source angle is the full angular diameter; zero disables the disk.
+@export_range(0.0, 5.0, 0.001, "or_greater", "suffix:deg") var sun_source_angle_deg: float = 0.5357:
+	set(value):
+		sun_source_angle_deg = clampf(FengSkyParameters.finite_float(value, 0.5357), 0.0, 5.0)
+		_settings_dirty = true
+@export_range(0.0, 5.0, 0.001, "or_greater", "suffix:deg") var secondary_sun_source_angle_deg: float = 0.5357:
+	set(value):
+		secondary_sun_source_angle_deg = clampf(FengSkyParameters.finite_float(value, 0.5357), 0.0, 5.0)
+		_settings_dirty = true
+## Disk tint only. This does not change direct illuminance or atmospheric scattering.
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var sun_disk_color_scale: Color = Color.WHITE
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var secondary_sun_disk_color_scale: Color = Color.WHITE
+## Deprecated radius aliases keep old .tscn and script semantics; saves use diameter fields.
+@export_storage var sun_angular_radius_deg: float:
+	get:
+		return sun_source_angle_deg * 0.5
+	set(value):
+		sun_source_angle_deg = clampf(FengSkyParameters.finite_float(value, 0.26785), 0.0, 2.0) * 2.0
+@export_storage var secondary_sun_angular_radius_deg: float:
+	get:
+		return secondary_sun_source_angle_deg * 0.5
+	set(value):
+		secondary_sun_source_angle_deg = clampf(FengSkyParameters.finite_float(value, 0.26785), 0.0, 2.0) * 2.0
 ## Publish atmosphere-derived ambient radiance to Feng Fog for this World3D.
 @export var affect_height_fog: bool = true
-@export_range(0.0, 8.0, 0.01, "or_greater") var height_fog_contribution: float = 1.0
+@export_range(0.0, 1.0, 0.01, "or_greater") var height_fog_contribution: float = 1.0
 
 enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONENT_TRANSFORM, PLANET_CENTER_AT_COMPONENT_TRANSFORM }
 
@@ -118,7 +146,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		planet_transform = value
 		_settings_dirty = true
-@export_range(1.0, 100000.0, 1.0, "suffix:km") var ground_radius: float = 6360.0:
+@export_range(1.0, 7000.0, 1.0, "or_greater", "suffix:km") var ground_radius: float = 6360.0:
 	set(value):
 		ground_radius = value
 		_settings_dirty = true
@@ -128,7 +156,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 		_settings_dirty = true
 
 @export_group("Atmosphere")
-@export_range(0.1, 10000.0, 0.1, "suffix:km") var atmosphere_height: float = 60.0:
+@export_range(1.0, 200.0, 0.1, "or_greater", "suffix:km") var atmosphere_height: float = 60.0:
 	set(value):
 		atmosphere_height = value
 		_settings_dirty = true
@@ -138,57 +166,107 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 		_settings_dirty = true
 
 @export_group("Atmosphere Rayleigh")
-@export_range(0.0, 10.0, 0.01, "or_greater") var rayleigh_scattering_scale: float = 1.0:
+# Keep the legacy raw coefficient and multiplier fields as their original serialized
+# storage. The editor views below normalize those values to UE's Color × coefficient scale.
+@export_storage var rayleigh_scattering_scale: float = 1.0:
 	set(value):
 		rayleigh_scattering_scale = value
 		_settings_dirty = true
-@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var rayleigh_scattering: Variant = Color(0.005802, 0.013558, 0.0331):
+@export_storage var rayleigh_scattering: Variant = Color(0.005802, 0.013558, 0.0331):
 	set(value):
 		rayleigh_scattering = _author_color(value)
 		_settings_dirty = true
-@export_range(0.001, 1000.0, 0.01, "suffix:km") var rayleigh_exponential_distribution: float = 8.0:
+@export_range(0.0, 2.0, 0.01, "or_greater") var rayleigh_scattering_coefficient_scale: float:
+	get:
+		return maxf(FengSkyParameters.finite_float(rayleigh_scattering_scale, 1.0), 0.0) * RAYLEIGH_COEFFICIENT_BASIS
+	set(value):
+		rayleigh_scattering_scale = maxf(FengSkyParameters.finite_float(value, RAYLEIGH_COEFFICIENT_BASIS), 0.0) / RAYLEIGH_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var rayleigh_scattering_color: Color:
+	get:
+		return _normalized_coefficient_color(rayleigh_scattering, RAYLEIGH_COEFFICIENT_BASIS, FengSkyParameters.DEFAULT_RAYLEIGH_PER_KM)
+	set(value):
+		rayleigh_scattering = Vector3(value.r, value.g, value.b) * RAYLEIGH_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_range(0.01, 20.0, 0.01, "or_greater", "suffix:km") var rayleigh_exponential_distribution: float = 8.0:
 	set(value):
 		rayleigh_exponential_distribution = value
 		_settings_dirty = true
 
 @export_group("Atmosphere Mie")
-@export_range(0.0, 10.0, 0.01, "or_greater") var mie_scattering_scale: float = 1.0:
+@export_storage var mie_scattering_scale: float = 1.0:
 	set(value):
 		mie_scattering_scale = value
 		_settings_dirty = true
-@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var mie_scattering: Variant = Color(0.003996, 0.003996, 0.003996):
+@export_storage var mie_scattering: Variant = Color(0.003996, 0.003996, 0.003996):
 	set(value):
 		mie_scattering = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 10.0, 0.01, "or_greater") var mie_absorption_scale: float = 1.0:
+@export_range(0.0, 5.0, 0.01, "or_greater") var mie_scattering_coefficient_scale: float:
+	get:
+		return maxf(FengSkyParameters.finite_float(mie_scattering_scale, 1.0), 0.0) * MIE_SCATTERING_COEFFICIENT_BASIS
+	set(value):
+		mie_scattering_scale = maxf(FengSkyParameters.finite_float(value, MIE_SCATTERING_COEFFICIENT_BASIS), 0.0) / MIE_SCATTERING_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var mie_scattering_color: Color:
+	get:
+		return _normalized_coefficient_color(mie_scattering, MIE_SCATTERING_COEFFICIENT_BASIS, Vector3.ONE * MIE_SCATTERING_COEFFICIENT_BASIS)
+	set(value):
+		mie_scattering = Vector3(value.r, value.g, value.b) * MIE_SCATTERING_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_storage var mie_absorption_scale: float = 1.0:
 	set(value):
 		mie_absorption_scale = value
 		_settings_dirty = true
-@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var mie_absorption: Variant = Color(0.000444, 0.000444, 0.000444):
+@export_storage var mie_absorption: Variant = Color(0.000444, 0.000444, 0.000444):
 	set(value):
 		mie_absorption = _author_color(value)
 		_settings_dirty = true
-@export_range(-0.99, 0.99, 0.01) var mie_anisotropy: float = 0.8:
+@export_range(0.0, 5.0, 0.01, "or_greater") var mie_absorption_coefficient_scale: float:
+	get:
+		return maxf(FengSkyParameters.finite_float(mie_absorption_scale, 1.0), 0.0) * MIE_ABSORPTION_COEFFICIENT_BASIS
+	set(value):
+		mie_absorption_scale = maxf(FengSkyParameters.finite_float(value, MIE_ABSORPTION_COEFFICIENT_BASIS), 0.0) / MIE_ABSORPTION_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var mie_absorption_color: Color:
+	get:
+		return _normalized_coefficient_color(mie_absorption, MIE_ABSORPTION_COEFFICIENT_BASIS, Vector3.ONE * MIE_ABSORPTION_COEFFICIENT_BASIS)
+	set(value):
+		mie_absorption = Vector3(value.r, value.g, value.b) * MIE_ABSORPTION_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_range(0.0, 0.999, 0.001) var mie_anisotropy: float = 0.8:
 	set(value):
 		mie_anisotropy = value
 		_settings_dirty = true
-@export_range(0.001, 1000.0, 0.01, "suffix:km") var mie_exponential_distribution: float = 1.2:
+@export_range(0.01, 10.0, 0.01, "or_greater", "suffix:km") var mie_exponential_distribution: float = 1.2:
 	set(value):
 		mie_exponential_distribution = value
 		_settings_dirty = true
 
 @export_group("Atmosphere Absorption")
 ## The UE 5.8 tent profile is zero at tip_altitude ± width and peaks at tip_value.
-@export_range(0.0, 10.0, 0.01, "or_greater") var absorption_scale: float = 1.0:
+@export_storage var absorption_scale: float = 1.0:
 	set(value):
 		absorption_scale = value
 		_settings_dirty = true
-@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var absorption: Variant = Color(0.000650, 0.001881, 0.000085):
+@export_storage var absorption: Variant = Color(0.000650, 0.001881, 0.000085):
 	set(value):
 		absorption = _author_color(value)
 		_settings_dirty = true
+@export_range(0.0, 0.2, 0.001, "or_greater") var other_absorption_coefficient_scale: float:
+	get:
+		return maxf(FengSkyParameters.finite_float(absorption_scale, 1.0), 0.0) * OTHER_ABSORPTION_COEFFICIENT_BASIS
+	set(value):
+		absorption_scale = maxf(FengSkyParameters.finite_float(value, OTHER_ABSORPTION_COEFFICIENT_BASIS), 0.0) / OTHER_ABSORPTION_COEFFICIENT_BASIS
+		_settings_dirty = true
+@export_custom(PROPERTY_HINT_COLOR_NO_ALPHA, "") var other_absorption_color: Color:
+	get:
+		return _normalized_coefficient_color(absorption, OTHER_ABSORPTION_COEFFICIENT_BASIS, FengSkyParameters.DEFAULT_ABSORPTION_PER_KM)
+	set(value):
+		absorption = Vector3(value.r, value.g, value.b) * OTHER_ABSORPTION_COEFFICIENT_BASIS
+		_settings_dirty = true
 @export_subgroup("Tent", "absorption_")
-@export_range(0.0, 10000.0, 0.1, "suffix:km") var absorption_tip_altitude: float = 25.0:
+@export_range(0.0, 60.0, 0.1, "or_greater", "suffix:km") var absorption_tip_altitude: float = 25.0:
 	set(value):
 		absorption_tip_altitude = value
 		_settings_dirty = true
@@ -196,7 +274,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		absorption_tip_value = value
 		_settings_dirty = true
-@export_range(0.001, 10000.0, 0.1, "suffix:km") var absorption_width: float = 15.0:
+@export_range(0.0, 20.0, 0.1, "or_greater", "suffix:km") var absorption_width: float = 15.0:
 	set(value):
 		absorption_width = value
 		_settings_dirty = true
@@ -211,11 +289,11 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		sky_and_aerial_perspective_luminance_factor = _author_color(value)
 		_settings_dirty = true
-@export_range(0.0, 10.0, 0.01, "or_greater") var aerial_perspective_distance_scale: float = 1.0:
+@export_range(0.0, 3.0, 0.01, "or_greater") var aerial_perspective_distance_scale: float = 1.0:
 	set(value):
 		aerial_perspective_distance_scale = value
 		_settings_dirty = true
-@export_range(0.0, 10000.0, 0.01, "suffix:km") var aerial_perspective_start_depth: float = 0.1:
+@export_range(0.001, 10.0, 0.01, "or_greater", "suffix:km") var aerial_perspective_start_depth: float = 0.1:
 	set(value):
 		aerial_perspective_start_depth = value
 		_settings_dirty = true
@@ -225,13 +303,9 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 		_settings_dirty = true
 
 @export_group("Rendering")
-@export_range(0.25, 4.0, 0.01) var trace_sample_count_scale: float = 1.0:
+@export_range(0.25, 8.0, 0.01, "or_greater") var trace_sample_count_scale: float = 1.0:
 	set(value):
 		trace_sample_count_scale = value
-		_settings_dirty = true
-@export_range(0.01, 2.0, 0.001, "suffix:deg") var sun_angular_radius_deg: float = 0.26785:
-	set(value):
-		sun_angular_radius_deg = value
 		_settings_dirty = true
 
 # Read/write compatibility aliases load old .tscn fields and old scripts.
@@ -306,9 +380,21 @@ static func _author_color(value: Variant) -> Color:
 	return Color.WHITE
 
 
+static func _normalized_coefficient_color(value: Variant, basis: float, fallback: Vector3) -> Color:
+	var coefficient := FengSkyParameters.finite_vector(value, fallback) / basis
+	return Color(coefficient.x, coefficient.y, coefficient.z, 1.0)
+
+
 func _validate_property(property: Dictionary) -> void:
-	if property["name"] in ["ground_albedo", "rayleigh_scattering", "mie_scattering", "mie_absorption", "absorption", "sky_luminance_factor", "sky_and_aerial_perspective_luminance_factor"]:
+	if property["name"] in ["ground_albedo", "rayleigh_scattering", "mie_scattering", "mie_absorption", "absorption", "rayleigh_scattering_color", "mie_scattering_color", "mie_absorption_color", "other_absorption_color", "sun_disk_color_scale", "secondary_sun_disk_color_scale", "sky_luminance_factor", "sky_and_aerial_perspective_luminance_factor"]:
 		property["type"] = TYPE_COLOR
+	if property["name"] in [
+		"rayleigh_scattering_coefficient_scale", "mie_scattering_coefficient_scale",
+		"mie_absorption_coefficient_scale", "other_absorption_coefficient_scale",
+		"rayleigh_scattering_color", "mie_scattering_color", "mie_absorption_color", "other_absorption_color",
+		"sun_angular_radius_deg", "secondary_sun_angular_radius_deg",
+	]:
+		property["usage"] = int(property["usage"]) & ~PROPERTY_USAGE_STORAGE
 
 
 var bottom_radius: float:
@@ -350,6 +436,7 @@ func _init() -> void:
 
 
 func _enter_tree() -> void:
+	_light_registry = FengSkyLightRegistry.attach(get_tree(), self) as FengSkyLightRegistry
 	var route_path := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 	if ResourceLoader.exists(route_path):
 		_snapshot_worlds = load(route_path) as Script
@@ -365,6 +452,9 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
+	if _light_registry != null:
+		_light_registry.detach(self)
+		_light_registry = null
 	if _snapshot_worlds != null:
 		_snapshot_worlds.call("unregister_owner", self)
 	if get_tree().node_added.is_connected(_on_scene_node_added):
@@ -568,7 +658,8 @@ func _is_atmosphere_sky(candidate: Sky) -> bool:
 			_reference_shader = FengSkyRuntime.atmosphere_shader()
 			if _reference_shader != null:
 				_reference_shader.changed.connect(_invalidate_reference_shader_identity)
-		_shader_identity_matches = shader != null and _reference_shader != null and (shader.code == _reference_shader.code or _is_released_legacy_shader(shader.code))
+		var matches_released_source := (candidate != _owned_sky or _reference_shader_revision == 0) and _is_released_legacy_shader(shader.code if shader != null else "")
+		_shader_identity_matches = shader != null and _reference_shader != null and (shader.code == _reference_shader.code or matches_released_source)
 		_shader_identity_dirty = false
 		_shader_identity_check_count += 1
 	return _shader_identity_matches
@@ -577,6 +668,7 @@ func _is_atmosphere_sky(candidate: Sky) -> bool:
 func _invalidate_reference_shader_identity() -> void:
 	# The editor may hot-reload the original asset while private scene copies
 	# stay alive. Its source is part of identity, just like the selected shader.
+	_reference_shader_revision += 1
 	_invalidate_shader_identity()
 
 
@@ -632,7 +724,7 @@ func _refresh_world_binding() -> void:
 	var sky_gain := _background_energy_gain()
 	var physical_units := _uses_physical_light_units()
 	var signature: Array = [world_id, source, second_source, sky_gain, physical_units,
-		_settings_revision, secondary_sun_angular_radius_deg]
+		_settings_revision, secondary_sun_source_angle_deg]
 	var render_targets: Array = _snapshot_worlds.call("targets_for", world) if _snapshot_worlds != null else []
 	var render_signature := signature + [render_targets]
 	if render_signature != _last_rendering_snapshot_signature:
@@ -650,7 +742,8 @@ func _refresh_world_binding() -> void:
 		_last_snapshot_signature.clear()
 		FengSkyRuntime.remove_snapshot(self, _bound_world_id)
 		return
-	var snapshot_signature := signature + [height_fog_contribution]
+	var fog_contribution := maxf(FengSkyParameters.finite_float(height_fog_contribution, 1.0), 0.0)
+	var snapshot_signature := signature + [fog_contribution]
 	if snapshot_signature == _last_snapshot_signature:
 		return
 	var ambient := Vector3.ZERO
@@ -670,7 +763,7 @@ func _refresh_world_binding() -> void:
 		"sun_ground_illuminance": _finite_nonnegative(ground_illuminance),
 		"sun_irradiance_unit": "lux" if physical_units else "frp_normalized",
 		"ambient_radiance": _finite_nonnegative(ambient),
-		"height_fog_contribution": maxf(height_fog_contribution, 0.0),
+		"height_fog_contribution": fog_contribution,
 	})
 	_last_snapshot_signature = snapshot_signature
 	_snapshot_publish_count += 1
@@ -705,32 +798,11 @@ func _feng_sky_runtime_is_active(world_id: int) -> bool:
 func _resolve_sun(world: World3D) -> DirectionalLight3D:
 	if sun_light != null:
 		return sun_light if _sun_is_compatible(sun_light, world) else null
-	var now := Time.get_ticks_msec()
-	if _auto_sun != secondary_sun_light and _sun_is_compatible(_auto_sun, world) and now < _next_auto_sun_scan_msec:
-		return _auto_sun
-	if now < _next_auto_sun_scan_msec:
-		return null
-	_next_auto_sun_scan_msec = now + 500
-	_auto_sun = null
-	var tree := get_tree()
-	if tree == null:
-		return null
-	for node in tree.root.find_children("*", "DirectionalLight3D", true, false):
-		if node is DirectionalLight3D and node != secondary_sun_light and _sun_is_compatible(node, world):
-			_auto_sun = node
-			break
-	return _auto_sun
+	return _light_registry.resolve(world, secondary_sun_light) if _light_registry != null else null
 
 
 func _sun_is_compatible(candidate: DirectionalLight3D, world: World3D) -> bool:
-	return (
-		candidate != null
-		and is_instance_valid(candidate)
-		and candidate.is_inside_tree()
-		and candidate.is_visible_in_tree()
-		and candidate.get_world_3d() == world
-		and candidate.sky_mode != DirectionalLight3D.SKY_MODE_LIGHT_ONLY
-	)
+	return FengSkyLightRegistry.compatible(candidate, world)
 
 
 func _sun_linear_color(light: DirectionalLight3D) -> Vector3:
@@ -790,10 +862,11 @@ func _resolved_planet_center() -> Vector3:
 
 
 func _sanitize_current_settings() -> Dictionary:
-	var width := maxf(FengSkyParameters.finite_float(absorption_width, 15.0), 0.001)
+	var width := clampf(FengSkyParameters.finite_float(absorption_width, 15.0), 0.0, 10000.0)
 	var tip := FengSkyParameters.finite_float(absorption_tip_altitude, 25.0)
 	var density := clampf(FengSkyParameters.finite_float(absorption_tip_value, 1.0), 0.0, 1.0)
-	var slope := density / width
+	var profile_enabled := width > 0.0 and density > 0.0
+	var slope := density / maxf(width, 0.001) if profile_enabled else 0.0
 	var scattering := FengSkyParameters.coefficient(mie_scattering, Vector3.ONE * 0.003996) * maxf(FengSkyParameters.finite_float(mie_scattering_scale, 1.0), 0.0)
 	var mie_absorption_coefficient := FengSkyParameters.coefficient(mie_absorption, Vector3.ONE * 0.000444) * maxf(FengSkyParameters.finite_float(mie_absorption_scale, 1.0), 0.0)
 	return FengSkyParameters.sanitize_atmosphere_settings({
@@ -805,15 +878,15 @@ func _sanitize_current_settings() -> Dictionary:
 		"mie_scattering_coefficients": scattering,
 		"mie_extinction_coefficients": scattering + mie_absorption_coefficient,
 		"mie_asymmetry": mie_anisotropy,
-		"absorption_extinction_per_km": FengSkyParameters.coefficient(absorption, FengSkyParameters.DEFAULT_ABSORPTION_PER_KM) * maxf(FengSkyParameters.finite_float(absorption_scale, 1.0), 0.0),
+		"absorption_extinction_per_km": FengSkyParameters.coefficient(absorption, FengSkyParameters.DEFAULT_ABSORPTION_PER_KM) * maxf(FengSkyParameters.finite_float(absorption_scale, 1.0), 0.0) if profile_enabled else Vector3.ZERO,
 		"absorption_density_layer_width_km": tip,
 		"absorption_layer0_linear_term": slope,
-		"absorption_layer0_constant_term": density - tip * slope,
+		"absorption_layer0_constant_term": density - tip * slope if profile_enabled else 0.0,
 		"absorption_layer1_linear_term": -slope,
-		"absorption_layer1_constant_term": density + tip * slope,
+		"absorption_layer1_constant_term": density + tip * slope if profile_enabled else 0.0,
 		"planet_center_m": _resolved_planet_center(),
 		"ground_albedo": ground_albedo,
-		"sun_angular_radius_deg": sun_angular_radius_deg,
+		"sun_angular_radius_deg": sun_source_angle_deg * 0.5,
 		"multi_scattering_factor": multi_scattering_factor,
 		"sky_luminance_factor": sky_and_aerial_perspective_luminance_factor,
 		"sky_only_luminance_factor": sky_luminance_factor,
@@ -931,8 +1004,11 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 		material.set_shader_parameter("use_optical_column_lut", use_lut)
 		_last_material_settings_signature = settings_signature
 	var sky_gain := _background_energy_gain()
+	var primary_disk_scale := _disk_color_vector(sun_disk_color_scale)
+	var secondary_disk_scale := _disk_color_vector(secondary_sun_disk_color_scale)
 	var material_signature: Array = [material.get_instance_id(), material.shader.get_instance_id(),
-		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain, secondary, secondary_sun_angular_radius_deg]
+		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain, secondary,
+		secondary_sun_source_angle_deg, primary_disk_scale, secondary_disk_scale]
 	if material_signature == _last_material_signature:
 		return
 	var sky_radiance_limit := 0.0
@@ -945,7 +1021,9 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 	material.set_shader_parameter("secondary_sun_direction", secondary.get("direction", Vector3.UP))
 	material.set_shader_parameter("secondary_sun_color_linear", secondary.get("color", Vector3.ZERO))
 	material.set_shader_parameter("secondary_sun_irradiance", secondary.get("irradiance", 0.0))
-	material.set_shader_parameter("secondary_sun_angular_radius_deg", clampf(FengSkyParameters.finite_float(secondary_sun_angular_radius_deg, 0.26785), 0.01, 2.0))
+	material.set_shader_parameter("secondary_sun_angular_radius_deg", clampf(FengSkyParameters.finite_float(secondary_sun_source_angle_deg * 0.5, 0.26785), 0.0, 2.5))
+	material.set_shader_parameter("sun_disk_color_scale", primary_disk_scale)
+	material.set_shader_parameter("secondary_sun_disk_color_scale", secondary_disk_scale)
 	_last_material_signature = material_signature
 	_material_update_count += 1
 
@@ -954,6 +1032,10 @@ func _finite_nonnegative(value: Vector3) -> Vector3:
 	if not is_finite(value.x) or not is_finite(value.y) or not is_finite(value.z):
 		return Vector3.ZERO
 	return value.max(Vector3.ZERO)
+
+
+func _disk_color_vector(value: Color) -> Vector3:
+	return FengSkyParameters.finite_vector(Vector3(value.r, value.g, value.b), Vector3.ONE).clamp(Vector3.ZERO, Vector3.ONE * 100.0)
 
 
 func _background_energy_gain() -> float:
