@@ -51,3 +51,21 @@ The D3D12 numerical probe ran four 3,072-ray configurations (12,288 rays total) 
 
 The corrected small-angle shader uses `x * (1 - x*x/6)` for `|x| < 0.01`; the Taylor truncation error is below `8.4e-11` over that interval. The measured D3D12 behavior that motivated this path was `sin(8.726646e-9) = 0` in the previous GPU implementation.
 
+
+## Independent final validation on main 9f5149
+
+The final source is main commit `9f5149db7a`, with sky shader SHA-256 `FECD4D6C7E913134CD27EFE95DAFBC5876E61C262620368FF701AA534D47863E`. A used the e002 backup with this final add-on source for the CPU base suite, Registry, exact e002 default-shader migration, and preservation of a user-modified custom shader. A used the new native `4.7.3.rc.custom_build.27def4b95` with the same source for GPU numerics, Fog, pre-TAA HDR stress, and the 1920×1080 profile.
+
+### Pre-TAA generic HDR stress
+
+A's 320×240 generic HDR stress captured the final HDR values before TAA. All 76,800 checked samples were finite and nonzero; `bad=0`; the saturation counter was 2; the center maximum was 65504. This is a generic output-boundary stress case. It is not an e002 before/after comparison and does not claim Feng's serialized default atmosphere reaches the cap.
+
+Log: `C:\Temp\ue_atmo_cpu_independent_9684a72c39cd45a7b93c7f318dc45624\final_hdr_literal_extreme_stats_capture.log`.
+
+### 1920×1080 mixed-bucket GPU profile
+
+The independent 1080p mixed-bucket profile reported `Setup Sky` samples of 0.0167/0.2488 ms and `Render Sky` samples of 0.2339/0.2840 ms. Wall-stage means were 5.50/5.54/5.54 ms in static, camera-motion, and sun-rotation order.
+
+Log: `C:\Temp\ue_atmo_cpu_independent_9684a72c39cd45a7b93c7f318dc45624\final_1080_profile.log`.
+
+The full test-1 terrain/editor default black mark remains unreproduced. These HDR stress results establish finite writes for the tested generic stimulus; they do not identify the screenshot's cause or establish that the default scene overflows.
