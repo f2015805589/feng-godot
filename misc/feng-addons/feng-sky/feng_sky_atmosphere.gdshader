@@ -104,7 +104,7 @@ float stable_sin_small_angle(float angle) {
 	// D3D12 sin returned zero for an 8.7e-9-radian half angle in the GPU probe.
 	// The Taylor approximation has relative error below 8.4e-11 through 0.01 rad.
 	if (abs(angle) < 0.01) {
-		return angle;
+		return angle * (1.0 - angle * angle / 6.0);
 	}
 	return sin(angle);
 }
