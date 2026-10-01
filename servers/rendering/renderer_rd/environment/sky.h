@@ -120,6 +120,7 @@ private:
 
 		bool uses_time = false;
 		bool uses_position = false;
+		bool radiance_position_independent = false;
 		bool uses_half_res = false;
 		bool uses_quarter_res = false;
 		bool uses_light = false;

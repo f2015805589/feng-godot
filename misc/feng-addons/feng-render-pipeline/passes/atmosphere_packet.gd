@@ -39,12 +39,12 @@ static func make(snapshot: Dictionary, camera: Transform3D, optical_valid: bool,
 		_f(s.get("aerial_perspective_view_distance_scale"), 1.0)]))
 	# sky_luminance_factor is the normalized combined sky+aerial factor.
 	# sky_only_luminance_factor and legacy background sky gain are excluded.
-	_append(values, _v(s.get("sky_luminance_factor"), Vector3.ONE), float(clampi(roundi(8.0 * _f(s.get("trace_sample_count_scale"), 1.0)), 2, 64)))
+	_append(values, _v(s.get("sky_luminance_factor"), Vector3.ONE), float(roundi(clampf(8.0 * _f(s.get("trace_sample_count_scale"), 1.0), 2.0, 64.0))))
 	for prefix in ["", "secondary_"]:
 		var direction := _v(snapshot.get(prefix + "sun_direction"), Vector3.UP)
 		direction = direction.normalized() if direction.length_squared() > 0.000001 else Vector3.UP
 		_append(values, direction, maxf(_f(snapshot.get(prefix + "sun_irradiance"), 0.0), 0.0))
 		_append(values, _v(snapshot.get(prefix + "sun_color_linear")), _f(s.get("minimum_light_elevation_deg"), -90.0) if prefix.is_empty() else 0.0)
-	values.append_array(PackedFloat32Array([float(optical_valid), float(multiple_valid), 1.0, 0.0]))
+	values.append_array(PackedFloat32Array([float(optical_valid), float(multiple_valid), 1.0, 0.0 if bool(snapshot.get("render_in_main_pass", true)) else 1.0]))
 	values.resize(64)
 	return values

@@ -37,7 +37,7 @@ static func sanitize_atmosphere_settings(settings: Dictionary) -> Dictionary:
 	var mie_scatter := coefficient(settings.get("mie_scattering_coefficients", Vector3.ONE * legacy_scatter), Vector3.ONE * 0.003996)
 	var mie_extinction := coefficient(settings.get("mie_extinction_coefficients", Vector3.ONE * legacy_extinction), Vector3.ONE * 0.004440).max(mie_scatter)
 	return {
-		"planet_radius_km": clampf(finite_float(settings.get("planet_radius_km", 6360.0), 6360.0), 1.0, 100000.0),
+		"planet_radius_km": clampf(finite_float(settings.get("planet_radius_km", 6360.0), 6360.0), 0.1, 10000.0),
 		"atmosphere_height_km": clampf(finite_float(settings.get("atmosphere_height_km", 60.0), 60.0), 0.1, 10000.0),
 		"rayleigh_scale_height_km": clampf(finite_float(settings.get("rayleigh_scale_height_km", 8.0), 8.0), 0.001, 1000.0),
 		"mie_scale_height_km": clampf(finite_float(settings.get("mie_scale_height_km", 1.2), 1.2), 0.001, 1000.0),
@@ -46,7 +46,7 @@ static func sanitize_atmosphere_settings(settings: Dictionary) -> Dictionary:
 		"mie_extinction_per_km": mie_extinction.x,
 		"mie_scattering_coefficients": mie_scatter,
 		"mie_extinction_coefficients": mie_extinction,
-		"mie_asymmetry": clampf(finite_float(settings.get("mie_asymmetry", 0.8), 0.8), -0.99, 0.99),
+		"mie_asymmetry": clampf(finite_float(settings.get("mie_asymmetry", 0.8), 0.8), 0.0, 0.999),
 		"absorption_extinction_per_km": coefficient(settings.get("absorption_extinction_per_km", DEFAULT_ABSORPTION_PER_KM), DEFAULT_ABSORPTION_PER_KM),
 		"absorption_density_layer_width_km": clampf(finite_float(settings.get("absorption_density_layer_width_km", 25.0), 25.0), 0.0, 10000.0),
 		"absorption_layer0_linear_term": clampf(finite_float(settings.get("absorption_layer0_linear_term", 1.0 / 15.0), 1.0 / 15.0), -1000.0, 1000.0),
@@ -60,7 +60,7 @@ static func sanitize_atmosphere_settings(settings: Dictionary) -> Dictionary:
 		"sky_luminance_factor": finite_vector(settings.get("sky_luminance_factor", Vector3.ONE), Vector3.ONE).clamp(Vector3.ZERO, Vector3.ONE * 100.0),
 		"sky_only_luminance_factor": finite_vector(settings.get("sky_only_luminance_factor", Vector3.ONE), Vector3.ONE).clamp(Vector3.ZERO, Vector3.ONE * 100.0),
 		"minimum_light_elevation_deg": clampf(finite_float(settings.get("minimum_light_elevation_deg", -90.0), -90.0), -90.0, 90.0),
-		"trace_sample_count_scale": clampf(finite_float(settings.get("trace_sample_count_scale", 1.0), 1.0), 0.25, 4.0),
+		"trace_sample_count_scale": maxf(finite_float(settings.get("trace_sample_count_scale", 1.0), 1.0), 0.25),
 		"aerial_perspective_view_distance_scale": clampf(finite_float(settings.get("aerial_perspective_view_distance_scale", 1.0), 1.0), 0.0, 100.0),
-		"aerial_perspective_start_depth_km": clampf(finite_float(settings.get("aerial_perspective_start_depth_km", 0.1), 0.1), 0.0, 10000.0),
+		"aerial_perspective_start_depth_km": clampf(finite_float(settings.get("aerial_perspective_start_depth_km", 0.1), 0.1), 0.001, 10000.0),
 	}

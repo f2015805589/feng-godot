@@ -90,13 +90,33 @@ func sample_sun(label: String, save_image: bool) -> void:
 	# None should become black as the sun, camera, TAA or exposure history moves.
 	require(minimum_luma > 0.01 and maximum_luma > 0.05,
 		"black solar framebuffer region in %s: min=%s max=%s" % [label, minimum_luma, maximum_luma])
+
+	# The default disk is tens of pixels wide in this microscope view. A center
+	# patch alone misses finite black rings at its anti-aliased contour.
+	var tangent := direction.cross(Vector3.UP).normalized()
+	var bitangent := direction.cross(tangent).normalized()
+	var contour_min := INF
+	var contour_samples := 0
+	for fraction in [0.8, 1.0, 1.2]:
+		var angle := deg_to_rad(_sky.sun_angular_radius_deg) * float(fraction)
+		for segment in 32:
+			var phi := TAU * float(segment) / 32.0
+			var rim := (direction * cos(angle) + (tangent * cos(phi) + bitangent * sin(phi)) * sin(angle)).normalized()
+			var screen := Vector2i(_camera.unproject_position(_camera.global_position + rim * 1000.0).floor())
+			if screen.x < 0 or screen.y < 0 or screen.x >= image.get_width() or screen.y >= image.get_height():
+				continue
+			var pixel := image.get_pixelv(screen)
+			require(is_finite(pixel.r) and is_finite(pixel.g) and is_finite(pixel.b), "non-finite solar contour: " + label)
+			contour_min = minf(contour_min,pixel.r * 0.2126 + pixel.g * 0.7152 + pixel.b * 0.0722)
+			contour_samples += 1
+	require(contour_samples > 0 and contour_min > 0.01, "black solar contour in %s: %s" % [label,contour_min])
 	var scale: float = await exposure_scale()
 	require(is_finite(scale) and scale > 0.0, "non-finite eye-adaptation scale in " + label)
 	if save_image or _failed:
 		require(image.save_png(OUTPUT_DIR.path_join(label + ".png")) == OK, "could not save motion probe image")
 	_captures += 1
 	print("SKY MOTION GPU ", label, " pixel=", sun_pixel, " luma_min=", minimum_luma,
-		" luma_max=", maximum_luma, " exposure=", scale)
+		" luma_max=", maximum_luma, " contour_min=",contour_min," contour_samples=",contour_samples," exposure=", scale)
 
 
 func run() -> void:
@@ -150,6 +170,10 @@ func run() -> void:
 		_viewport.free()
 		quit(1)
 		return
+	await run_cases(compositor, physical_units, temporal_aa, enabled_passes)
+
+
+func run_cases(compositor: Compositor, physical_units: bool, temporal_aa, enabled_passes: int) -> void:
 	var case_index := 0
 	# First eight cases retain all 13 enabled defaults. The last four are an
 	# isolated 12-pass control with only the local native TAA entry disabled.
@@ -186,7 +210,7 @@ func run() -> void:
 	await process_frame
 	if not _failed:
 		print("SKY MOTION GPU PASS cases=", case_index, " captures=", _captures,
-			" sampled_pixels_per_capture=", 25, " default_enabled_passes=", enabled_passes,
+			" center_pixels_per_capture=", 25," contour_samples_per_capture=",96, " default_enabled_passes=", enabled_passes,
 			" taa_disabled_control_enabled_passes=", enabled_passes - 1,
 			" image_dir=", ProjectSettings.globalize_path(OUTPUT_DIR))
 	quit(1 if _failed else 0)

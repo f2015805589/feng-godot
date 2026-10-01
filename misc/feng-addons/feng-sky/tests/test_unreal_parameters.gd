@@ -61,6 +61,17 @@ func run() -> void:
 	settings = sky._atmosphere_settings()
 	near(settings["sky_only_luminance_factor"], Vector3(2.0, 3.0, 4.0), "sky-only gain is distinct")
 	near(settings["sky_luminance_factor"], Vector3(0.5, 0.6, 0.7), "combined sky/aerial gain")
+
+	sky.ground_radius = 0.1
+	sky.mie_anisotropy = 0.999
+	sky.trace_sample_count_scale = 8.0
+	sky.aerial_perspective_start_depth = 0.0
+	var bounds := sky._atmosphere_settings()
+	require(bounds["planet_radius_km"] == 0.1, "UE small-planet minimum was clipped")
+	require(is_equal_approx(bounds["mie_asymmetry"], 0.999), "UE extreme Mie anisotropy was clipped")
+	require(bounds["trace_sample_count_scale"] == 8.0, "UE trace scale UI range was clipped")
+	require(bounds["aerial_perspective_start_depth_km"] == 0.001, "UE aerial start minimum was not applied")
+	sky.ground_radius = 2.0
 	var saved_names: Array[String] = []
 	var color_fields := ["ground_albedo", "rayleigh_scattering", "mie_scattering", "mie_absorption", "absorption"]
 	for property in sky.get_property_list():
@@ -68,7 +79,7 @@ func run() -> void:
 			require(property["type"] == TYPE_COLOR, "UE RGB field is an inspector color: " + property["name"])
 		if int(property["usage"]) & PROPERTY_USAGE_STORAGE:
 			saved_names.append(property["name"])
-	for canonical in ["ground_radius", "rayleigh_scattering", "mie_absorption", "multi_scattering_factor", "absorption", "transform_mode"]:
+	for canonical in ["ground_radius", "rayleigh_scattering", "mie_absorption", "multi_scattering_factor", "absorption", "transform_mode", "render_in_main_pass", "holdout"]:
 		require(saved_names.has(canonical), "canonical property is persisted: " + canonical)
 	for legacy in ["planet_radius_km", "rayleigh_scattering_per_km", "mie_extinction_per_km", "mie_asymmetry", "planet_center_m"]:
 		require(not saved_names.has(legacy), "legacy alias must not overwrite canonical data on save: " + legacy)
@@ -88,6 +99,7 @@ func run() -> void:
 	require((sky._atmosphere_settings()["planet_center_m"] as Vector3).is_finite(), "removed transform proxy has a finite fallback")
 	sky.free()
 	test_legacy_shader()
+	test_legacy_shader("e002032")
 	await test_legacy_scene()
 	if not failed:
 		print("UNREAL ATMOSPHERE PARAMETERS PASS")
@@ -133,8 +145,8 @@ sun_angular_radius_deg = 0.3
 	loaded.free()
 	roundtrip.free()
 
-func test_legacy_shader() -> void:
-	var original_code := FileAccess.get_file_as_string("res://addons/feng-sky/tests/fixtures/atmosphere_aa96f5c.gdshader.txt")
+func test_legacy_shader(revision: String = "aa96f5c") -> void:
+	var original_code := FileAccess.get_file_as_string("res://addons/feng-sky/tests/fixtures/atmosphere_%s.gdshader.txt" % revision)
 	require(SkyComponent._is_released_legacy_shader(original_code.replace("\n", "\r\n")), "Windows CRLF default shader also migrates")
 	var shader := Shader.new()
 	shader.code = original_code

@@ -115,6 +115,10 @@ func run() -> void:
 		var hazy: Color = await capture(mode + "_spectral_absorption")
 		require(clear.r > 0.05 and hazy.r < clear.r * 0.97, mode + " did not receive AP")
 		require(hazy.r > hazy.g and hazy.g > hazy.b, mode + " collapsed RGB extinction")
+		sky.render_in_main_pass = false
+		var main_disabled: Color = await capture(mode + "_main_pass_disabled")
+		require(absf(main_disabled.r - clear.r) < 0.025, mode + " main-pass gate left aerial transport active")
+		sky.render_in_main_pass = true
 		sky.aerial_perspective_start_depth = 6.0
 		var excluded: Color = await capture(mode + "_start_depth")
 		require(absf(excluded.r - clear.r) < 0.025, mode + " ignored AP start depth")
@@ -144,6 +148,10 @@ func run() -> void:
 		sky.atmosphere_enabled = true
 		var transmitted: Color = await capture(mode + "_direct_atmospheric_transmittance")
 		require(raw.r > 0.03 and transmitted.r < raw.r * 0.97, mode + " sunlight ignored atmosphere transmission")
+		sky.render_in_main_pass = false
+		var main_disabled_direct: Color = await capture(mode + "_main_disabled_direct_transmission")
+		require(absf(main_disabled_direct.r - transmitted.r) < 0.025, mode + " main-pass gate suppressed secondary direct-light transport")
+		sky.render_in_main_pass = true
 	# An actual active Volume uses ViewPass wrappers around the executor.
 	# Its preflight must still arrive before direct-light buffer consumption.
 	var fog_pass: FengPass

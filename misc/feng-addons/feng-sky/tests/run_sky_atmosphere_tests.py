@@ -147,6 +147,7 @@ def main() -> None:
         encoding="utf-8",
     )
     env = dict(os.environ)
+    env["FRP_ENGINE_SOURCE_ROOT"] = str(REPO_ROOT)
     env["APPDATA"] = str(project / "config")
     env["LOCALAPPDATA"] = str(project / "cache")
     env["XDG_CONFIG_HOME"] = str(project / "config")
@@ -175,6 +176,9 @@ def main() -> None:
         env,
         "feng_sky_atmosphere tests passed",
     )
+    run([str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_sky_light_registry.gd"],
+        "headless Sky light registry tests", project, env, "SKY LIGHT REGISTRY PASS")
     validate_scratch_tree(project)
     run(
         [str(editor), "--headless", "--path", str(project), "--script",
@@ -207,6 +211,18 @@ def main() -> None:
     )
     validate_scratch_tree(project)
     if args.gpu_driver:
+        run([str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "128x128",
+             "--position", "-10000,-10000", "--gpu-profile", "--script", "res://addons/feng-sky/tests/test_sky_capture_gpu.gd"],
+            "GPU Sky capture lifecycle tests", project, env, "SKY CAPTURE GPU PASS")
+        run([str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "128x128",
+             "--position", "-10000,-10000", "--script", "res://addons/feng-sky/tests/test_sky_hdr_pipeline_gpu.gd"],
+            "GPU Sky HDR pipeline tests", project, env, "SKY HDR PIPELINE GPU PASS")
+        run([str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "64x64",
+             "--position", "-10000,-10000", "--script", "res://addons/feng-sky/tests/test_sky_storage_gpu.gd"],
+            "GPU Sky HDR storage tests", project, env, "SKY STORAGE GPU PASS")
         run(
             [str(editor), "--path", str(project), "--rendering-method", "frp",
              "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "96x96",

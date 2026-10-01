@@ -7,12 +7,14 @@ const FengSkyParameters = preload("res://addons/feng-sky/feng_sky_parameters.gd"
 const FengSkyMultiScatteringLut = preload("res://addons/feng-sky/feng_sky_multiscattering_lut.gd")
 const FengSkyOpticalLut = preload("res://addons/feng-sky/feng_sky_optical_lut.gd")
 const FengSkyRuntime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
+const FengSkyLightRegistry = preload("res://addons/feng-sky/feng_sky_light_registry.gd")
 const NON_PHYSICAL_SUN_IRRADIANCE := PI
 const MAX_SOLAR_IRRADIANCE := 10000000.0
 const MAX_SKY_RADIANCE := 60000.0
 const AMBIENT_ZENITH_STEP_DEG := 2.0
 # Exact released sources only. An edited/custom shader is never auto-upgraded.
 const LEGACY_ATMOSPHERE_SHADER_SHA256 := [
+	"0f815fb7da56be15db13c180fa6a1de55d5f7383fe22764aa16c6f315ec166fb", # e002032
 	"c421870e65cb92a6db325cc6270fac8f906df016b0efe1a1007bd691cb644e6d", # aa96f5c
 	"0e4f8b56bc26ca577c5dfbb4ddea18e1a8a6f9a8324185153f3dba9062916020", # 9d41bde
 ]
@@ -26,8 +28,7 @@ var _atmosphere_sky: Sky
 var _atmosphere_enabled := true
 var _initializing := true
 var _bound_world_id := 0
-var _auto_sun: DirectionalLight3D
-var _next_auto_sun_scan_msec := 0
+var _light_registry := FengSkyLightRegistry.new()
 var _ambient_cache: Dictionary = {}
 var _ambient_cache_miss_count := 0
 var _ambient_cache_evaluation_count := 0
@@ -103,6 +104,21 @@ var _material_update_count := 0
 
 enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONENT_TRANSFORM, PLANET_CENTER_AT_COMPONENT_TRANSFORM }
 
+@export_group("Rendering")
+## Camera-visible sky and aerial perspective. Reflection captures and
+## atmospheric direct-light transmission remain independent secondary effects.
+@export var render_in_main_pass: bool = true
+## Camera sky becomes black with zero alpha; captures and lighting are retained.
+@export var holdout: bool = false
+## Global skylight radiance is captured here, independently of the viewing
+## camera. Visible sky and aerial perspective still use each camera position.
+@export var radiance_capture_position: Vector3 = Vector3.ZERO
+## Optional moving capture anchor. It may be a Camera3D for explicit tracking.
+@export var radiance_capture_anchor: Node3D
+## Compatibility option: capture at this environment viewport's active camera.
+## Moving that camera recaptures and filters the radiance map every frame.
+@export var radiance_follow_camera: bool = false
+
 @export_group("Planet")
 ## WorldEnvironment is not spatial. Component Transform uses planet_origin
 ## in world metres, or planet_transform.global_position when explicitly linked.
@@ -118,7 +134,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		planet_transform = value
 		_settings_dirty = true
-@export_range(1.0, 100000.0, 1.0, "suffix:km") var ground_radius: float = 6360.0:
+@export_range(0.1, 10000.0, 1.0, "suffix:km") var ground_radius: float = 6360.0:
 	set(value):
 		ground_radius = value
 		_settings_dirty = true
@@ -168,7 +184,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		mie_absorption = _author_color(value)
 		_settings_dirty = true
-@export_range(-0.99, 0.99, 0.01) var mie_anisotropy: float = 0.8:
+@export_range(0.0, 0.999, 0.001) var mie_anisotropy: float = 0.8:
 	set(value):
 		mie_anisotropy = value
 		_settings_dirty = true
@@ -215,7 +231,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 	set(value):
 		aerial_perspective_distance_scale = value
 		_settings_dirty = true
-@export_range(0.0, 10000.0, 0.01, "suffix:km") var aerial_perspective_start_depth: float = 0.1:
+@export_range(0.001, 10000.0, 0.01, "suffix:km") var aerial_perspective_start_depth: float = 0.1:
 	set(value):
 		aerial_perspective_start_depth = value
 		_settings_dirty = true
@@ -225,7 +241,7 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 		_settings_dirty = true
 
 @export_group("Rendering")
-@export_range(0.25, 4.0, 0.01) var trace_sample_count_scale: float = 1.0:
+@export_range(0.25, 8.0, 0.01, "or_greater") var trace_sample_count_scale: float = 1.0:
 	set(value):
 		trace_sample_count_scale = value
 		_settings_dirty = true
@@ -350,6 +366,7 @@ func _init() -> void:
 
 
 func _enter_tree() -> void:
+	_light_registry.attach(get_tree())
 	var route_path := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 	if ResourceLoader.exists(route_path):
 		_snapshot_worlds = load(route_path) as Script
@@ -365,6 +382,7 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
+	_light_registry.detach()
 	if _snapshot_worlds != null:
 		_snapshot_worlds.call("unregister_owner", self)
 	if get_tree().node_added.is_connected(_on_scene_node_added):
@@ -634,10 +652,11 @@ func _refresh_world_binding() -> void:
 	var signature: Array = [world_id, source, second_source, sky_gain, physical_units,
 		_settings_revision, secondary_sun_angular_radius_deg]
 	var render_targets: Array = _snapshot_worlds.call("targets_for", world) if _snapshot_worlds != null else []
-	var render_signature := signature + [render_targets]
+	var render_signature := signature + [render_targets, render_in_main_pass]
 	if render_signature != _last_rendering_snapshot_signature:
 		FengSkyRuntime.publish_rendering_snapshot(self, world_id, {
 			"settings": _atmosphere_settings().duplicate(true),
+			"render_in_main_pass": render_in_main_pass,
 			"sun_light_rid": source["rid"], "sun_direction": source["direction"],
 			"sun_color_linear": source["color"], "sun_irradiance": source["irradiance"],
 			"secondary_sun_light_rid": second_source["rid"], "secondary_sun_direction": second_source["direction"],
@@ -705,32 +724,11 @@ func _feng_sky_runtime_is_active(world_id: int) -> bool:
 func _resolve_sun(world: World3D) -> DirectionalLight3D:
 	if sun_light != null:
 		return sun_light if _sun_is_compatible(sun_light, world) else null
-	var now := Time.get_ticks_msec()
-	if _auto_sun != secondary_sun_light and _sun_is_compatible(_auto_sun, world) and now < _next_auto_sun_scan_msec:
-		return _auto_sun
-	if now < _next_auto_sun_scan_msec:
-		return null
-	_next_auto_sun_scan_msec = now + 500
-	_auto_sun = null
-	var tree := get_tree()
-	if tree == null:
-		return null
-	for node in tree.root.find_children("*", "DirectionalLight3D", true, false):
-		if node is DirectionalLight3D and node != secondary_sun_light and _sun_is_compatible(node, world):
-			_auto_sun = node
-			break
-	return _auto_sun
+	return _light_registry.resolve(world, secondary_sun_light)
 
 
 func _sun_is_compatible(candidate: DirectionalLight3D, world: World3D) -> bool:
-	return (
-		candidate != null
-		and is_instance_valid(candidate)
-		and candidate.is_inside_tree()
-		and candidate.is_visible_in_tree()
-		and candidate.get_world_3d() == world
-		and candidate.sky_mode != DirectionalLight3D.SKY_MODE_LIGHT_ONLY
-	)
+	return FengSkyLightRegistry.compatible(candidate, world)
 
 
 func _sun_linear_color(light: DirectionalLight3D) -> Vector3:
@@ -779,7 +777,7 @@ func _atmosphere_settings() -> Dictionary:
 
 
 func _resolved_planet_center() -> Vector3:
-	var radius := clampf(FengSkyParameters.finite_float(ground_radius, 6360.0), 1.0, 100000.0)
+	var radius := clampf(FengSkyParameters.finite_float(ground_radius, 6360.0), 0.1, 10000.0)
 	if transform_mode == TransformMode.PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN:
 		return Vector3.DOWN * radius * 1000.0
 	var origin := planet_origin
@@ -931,8 +929,9 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 		material.set_shader_parameter("use_optical_column_lut", use_lut)
 		_last_material_settings_signature = settings_signature
 	var sky_gain := _background_energy_gain()
+	var capture_position := _resolved_radiance_capture_position()
 	var material_signature: Array = [material.get_instance_id(), material.shader.get_instance_id(),
-		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain, secondary, secondary_sun_angular_radius_deg]
+		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain, secondary, secondary_sun_angular_radius_deg, render_in_main_pass, holdout, capture_position]
 	if material_signature == _last_material_signature:
 		return
 	var sky_radiance_limit := 0.0
@@ -942,12 +941,25 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 	material.set_shader_parameter("sun_color_linear", sun_color.max(Vector3.ZERO))
 	material.set_shader_parameter("sun_irradiance", minf(maxf(sun_irradiance, 0.0), MAX_SOLAR_IRRADIANCE))
 	material.set_shader_parameter("sky_radiance_limit", sky_radiance_limit)
+	material.set_shader_parameter("render_in_main_pass", render_in_main_pass)
+	material.set_shader_parameter("holdout", holdout)
+	material.set_shader_parameter("radiance_capture_position_m", capture_position)
 	material.set_shader_parameter("secondary_sun_direction", secondary.get("direction", Vector3.UP))
 	material.set_shader_parameter("secondary_sun_color_linear", secondary.get("color", Vector3.ZERO))
 	material.set_shader_parameter("secondary_sun_irradiance", secondary.get("irradiance", 0.0))
 	material.set_shader_parameter("secondary_sun_angular_radius_deg", clampf(FengSkyParameters.finite_float(secondary_sun_angular_radius_deg, 0.26785), 0.01, 2.0))
 	_last_material_signature = material_signature
 	_material_update_count += 1
+
+
+func _resolved_radiance_capture_position() -> Vector3:
+	if radiance_follow_camera and is_inside_tree():
+		var camera := get_viewport().get_camera_3d()
+		if camera != null and camera.get_world_3d() == _current_world():
+			return FengSkyParameters.finite_vector(camera.global_position, Vector3.ZERO)
+	if is_instance_valid(radiance_capture_anchor) and radiance_capture_anchor.is_inside_tree():
+		return FengSkyParameters.finite_vector(radiance_capture_anchor.global_position, Vector3.ZERO)
+	return FengSkyParameters.finite_vector(radiance_capture_position, Vector3.ZERO)
 
 
 func _finite_nonnegative(value: Vector3) -> Vector3:

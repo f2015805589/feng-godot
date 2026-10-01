@@ -1,5 +1,4 @@
 shader_type sky;
-render_mode radiance_position_independent;
 
 // Scene-linear spherical atmosphere: RGB Rayleigh/Mie, ozone absorption and
 // cached isotropic multiple scattering. Distances and
@@ -36,14 +35,9 @@ uniform vec3 secondary_sun_direction = vec3(0.0, -1.0, 0.0);
 uniform vec3 secondary_sun_color_linear = vec3(1.0);
 uniform float secondary_sun_irradiance = 0.0;
 uniform float secondary_sun_angular_radius_deg = 0.26785;
-// Legacy scene-linear/model ceiling, before native camera/pre-exposure.
-// The component compensates background gain only. This clips extreme physical
-// radiance for existing-scene compatibility; it is NOT a storage-range guarantee.
-// The engine separately guards the HDR write after all scaling/fog/debanding.
+// FRP applies Environment.background_energy_multiplier after sampling the sky.
+// The component lowers this ceiling so the final value stays below RGBA16F max.
 uniform float sky_radiance_limit = 60000.0;
-uniform bool render_in_main_pass = true;
-uniform bool holdout = false;
-uniform vec3 radiance_capture_position_m = vec3(0.0);
 // Ground albedo is used when building the multiple-scattering table only.
 uniform vec3 ground_albedo = vec3(0.4);
 
@@ -205,8 +199,8 @@ vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light
 	vec3 sun_dir = normalize(light_direction);
 	float cosine_angle = clamp(dot(view_direction, sun_dir), -1.0, 1.0);
 	float rayleigh_phase = 3.0 * (1.0 + cosine_angle * cosine_angle) / (16.0 * PI);
-	float g = clamp(mie_asymmetry, 0.0, 0.999);
-	float mie_denom = max((1.0 - g) * (1.0 - g) + g * dot(view_direction - sun_dir, view_direction - sun_dir), 0.000000000001);
+	float g = clamp(mie_asymmetry, -0.99, 0.99);
+	float mie_denom = max(1.0 + g * g - 2.0 * g * cosine_angle, 0.0001);
 	// Cornette-Shanks phase, as used by the public Unreal atmosphere reference.
 	float mie_phase = 3.0 * (1.0 - g * g) * (1.0 + cosine_angle * cosine_angle)
 		/ (8.0 * PI * (2.0 + g * g) * pow(mie_denom, 1.5));
@@ -266,8 +260,7 @@ float solar_disk_weight(vec3 view_direction, vec3 sun_dir, float angular_radius)
 
 void sky() {
 	vec3 view_direction = normalize(EYEDIR);
-	vec3 observer = AT_CUBEMAP_PASS ? radiance_capture_position_m : POSITION;
-	vec3 origin = (observer - planet_center_m) / 1000.0;
+	vec3 origin = (POSITION - planet_center_m) / 1000.0;
 	float camera_radius = length(origin);
 	vec3 radial_up = camera_radius > 0.0001 ? origin / camera_radius : vec3(0.0, 1.0, 0.0);
 	// A 1 m surface epsilon makes downward rays produce a positive ground hit,
@@ -310,8 +303,4 @@ void sky() {
 	}
 
 	COLOR = clamp(radiance, vec3(0.0), vec3(max(sky_radiance_limit, 0.0)));
-	if (!AT_CUBEMAP_PASS && (!render_in_main_pass || holdout)) {
-		COLOR = vec3(0.0);
-		ALPHA = 0.0;
-	}
 }

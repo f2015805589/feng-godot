@@ -505,6 +505,7 @@ ShaderTypes::ShaderTypes() {
 	// sky render modes
 	{
 		shader_modes[RSE::SHADER_SKY].modes.push_back({ PNAME("use_half_res_pass") });
+		shader_modes[RSE::SHADER_SKY].modes.push_back({ PNAME("radiance_position_independent") });
 		shader_modes[RSE::SHADER_SKY].modes.push_back({ PNAME("use_quarter_res_pass") });
 		shader_modes[RSE::SHADER_SKY].modes.push_back({ PNAME("disable_fog") });
 		shader_modes[RSE::SHADER_SKY].modes.push_back({ PNAME("use_debanding") });

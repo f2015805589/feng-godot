@@ -305,6 +305,14 @@ func run() -> void:
 		quit(2)
 		return
 	_renderer.apply(_compositor)
+	if "--pass-profile" in OS.get_cmdline_user_args():
+		await run_pass_profile()
+		quit(0)
+		return
+	if "--performance-only" in OS.get_cmdline_user_args() or "--capture-performance" in OS.get_cmdline_user_args():
+		await run_performance_modes()
+		quit(0)
+		return
 	var physical_units := bool(ProjectSettings.get_setting(
 		"rendering/lights_and_shadows/use_physical_light_units", false))
 	if physical_units:
@@ -323,6 +331,11 @@ func run() -> void:
 		var fixed_coupled_ok: bool = await sample(
 			"atmosphere_60000_lux_fixed_exposure_fog_on", true)
 		if not fixed_coupled_ok:
+			quit(2)
+			return
+		var fixed_scale: float = _samples["atmosphere_60000_lux_fixed_exposure_fog_on"]["exposure_scale"]
+		if absf(log(fixed_scale * 4096.0) / log(2.0)) > 0.01:
+			push_error("Fixed EV did not reach the active compositor parameters: %s" % fixed_scale)
 			quit(2)
 			return
 		var coupled_luma: float = _samples["atmosphere_60000_lux_fixed_exposure_fog_on"]["fog_luma"]
@@ -409,3 +422,112 @@ func run() -> void:
 		" atmosphere_repeat_wall_ms=", atmosphere_repeat_metrics["wall_ms_through_post_draw"],
 		" gpu_timer=unavailable_from_Performance_monitors")
 	quit(0)
+
+
+func performance_statistics(values: Array[float]) -> Dictionary:
+	values.sort()
+	return {"median_ms": values[values.size() / 2], "p95_ms": values[int(values.size() * 0.95)], "max_ms": values.back()}
+
+
+func run_performance_modes() -> void:
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	RenderingServer.viewport_set_measure_render_time(_viewport.get_viewport_rid(), true)
+	_sun.light_intensity_lux = 60000.0
+	_exposure_pass.metering_mode = 2
+	_exposure_pass.apply_physical_camera_exposure = false
+	_exposure_pass.exposure_compensation = -12.0
+	_renderer.apply(_compositor)
+	var count := 0
+	for entry in _renderer.passes:
+		if entry.enabled:
+			count += 1
+	assert(count == 13)
+	var capture_benchmark := "--capture-performance" in OS.get_cmdline_user_args()
+	for resolution in [Vector2i(320,240), Vector2i(640,360)]:
+		_viewport.size = resolution
+		for moving in ([true] if capture_benchmark else [false, true]):
+			# ABBA follow/fixed order checks thermal/load drift, then physical/disabled
+			# controls isolate atmosphere's cost without changing the 13-pass stack.
+			for variant in (["follow", "fixed", "fixed", "follow"] if capture_benchmark else ["follow", "fixed", "fixed", "follow", "physical", "disabled"]):
+				_sky.atmosphere_enabled = variant in ["follow", "fixed"]
+				_sky.radiance_follow_camera = variant == "follow"
+				_sky.environment.background_mode = Environment.BG_COLOR if variant == "disabled" else Environment.BG_SKY
+				_sky.environment.background_color = Color.BLACK
+				_camera.position = Vector3(0.0,1.5,4.0)
+				await settle(32)
+				var cpu: Array[float] = []
+				var gpu: Array[float] = []
+				var wall_samples: Array[float] = []
+				var before := int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_DRAW))
+				for i in 60:
+					if moving:
+						_camera.position.x = sin(float(i) * 0.07) * 10.0
+					var start := Time.get_ticks_usec()
+					await process_frame
+					await RenderingServer.frame_post_draw
+					wall_samples.append((Time.get_ticks_usec() - start) / 1000.0)
+					cpu.append(RenderingServer.viewport_get_measured_render_time_cpu(_viewport.get_viewport_rid()))
+					gpu.append(RenderingServer.viewport_get_measured_render_time_gpu(_viewport.get_viewport_rid()))
+				print("SKY MODE PERF ",JSON.stringify({"mode":variant,"moving":moving,"resolution":str(resolution),
+					"cpu":performance_statistics(cpu),"gpu":performance_statistics(gpu),"wall":performance_statistics(wall_samples),
+					"frames":60,"enabled_authored_passes":count,"new_draw_compiles":int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_DRAW))-before}))
+	print("SKY MODE PERF PASS")
+
+
+signal pass_profile_ready(frame: int, rows: Array)
+
+func _read_pass_profile() -> void:
+	var rd := RenderingServer.get_rendering_device()
+	var starts: Dictionary = {}
+	var rows: Array = []
+	for i in rd.get_captured_timestamps_count():
+		var name := rd.get_captured_timestamp_name(i)
+		var cpu := rd.get_captured_timestamp_cpu_time(i)
+		var gpu := rd.get_captured_timestamp_gpu_time(i)
+		if name.begins_with("> FRP "):
+			starts[name.substr(6)] = [cpu,gpu]
+		elif name.begins_with("< FRP ") and starts.has(name.substr(6)):
+			var first: Array = starts[name.substr(6)]
+			rows.append([name.substr(6), (cpu-first[0])/1000.0, (gpu-first[1])/1000000.0])
+		elif name.begins_with("Sky Radiance Update ") and i+1 < rd.get_captured_timestamps_count():
+			# The next marker is after SkyRD returns: this includes the map's
+			# generation/filtering and the remaining sky-setup GPU commands.
+			rows.append(["Radiance update/filter setup", (rd.get_captured_timestamp_cpu_time(i+1)-cpu)/1000.0,
+				(rd.get_captured_timestamp_gpu_time(i+1)-gpu)/1000000.0])
+	_deliver_pass_profile.call_deferred(rd.get_captured_timestamps_frame(), rows)
+
+func _deliver_pass_profile(frame: int, rows: Array) -> void:
+	pass_profile_ready.emit(frame,rows)
+
+func run_pass_profile() -> void:
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	_sun.light_intensity_lux = 60000.0
+	_exposure_pass.metering_mode = 2
+	_exposure_pass.apply_physical_camera_exposure = false
+	_exposure_pass.exposure_compensation = -12.0
+	_renderer.apply(_compositor)
+	for follow in [true,false]:
+		_sky.radiance_follow_camera = follow
+		await settle(24)
+		var observations: Dictionary = {}
+		var seen: Dictionary = {}
+		for frame in 24:
+			_camera.position.x = sin(frame * 0.1) * 10.0
+			await settle(1)
+			RenderingServer.call_on_render_thread(_read_pass_profile)
+			var sample: Array = await pass_profile_ready
+			if seen.has(sample[0]):
+				continue
+			seen[sample[0]] = true
+			for row in sample[1]:
+				if not observations.has(row[0]):
+					observations[row[0]] = {"cpu": [] as Array[float], "gpu": [] as Array[float]}
+				observations[row[0]]["cpu"].append(row[1])
+				observations[row[0]]["gpu"].append(row[2])
+		assert(not observations.is_empty(), "Pass profiling requires --gpu-profile")
+		for name in observations:
+			print("SKY PASS PROFILE ", JSON.stringify({"follow_camera":follow,"stage":name,
+				"cpu":performance_statistics(observations[name]["cpu"]),"gpu":performance_statistics(observations[name]["gpu"]),
+				"observed_frames":observations[name]["cpu"].size()}))
+		print("SKY PASS PROFILE radiance_update_observed=",observations.has("Radiance update/filter setup")," follow=",follow)
+	print("SKY PASS PROFILE PASS")

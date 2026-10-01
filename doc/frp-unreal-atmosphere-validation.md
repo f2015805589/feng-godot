@@ -1,5 +1,7 @@
 # UE 5.8 大气与插件架构改动：验证记录
 
+> 本记录为e002032之前的历史验证。新的捕获原点、HDR存储边界与实际GPU曝光比例断言见 [大气回归修复](frp-atmosphere-regression.md)。原sample()已按每组参数重新apply，原固定EV日志保持有效。
+
 日期：2026-10-01。基准提交：`aa96f5cea74859bfd4f441b66e9e7be747a078dc`，分支 `feng-godot`。本记录区分本次通过的测试、原有失败和未验证范围，不能理解成全部引擎测试全绿。
 
 参数与实现对应关系见 [UE 5.8 对照](frp-unreal-atmosphere.md)，全部插件审阅与剩余问题见 [架构复核](frp-addon-audit.md)。

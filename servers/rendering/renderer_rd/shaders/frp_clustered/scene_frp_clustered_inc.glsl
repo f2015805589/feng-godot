@@ -507,3 +507,10 @@ transforms;
 #endif
 
 /* Set 3 User Material */
+
+// Scene-linear shading is full precision; guard only at half-float attachment
+// writes, after pre-exposure and fog. Do not turn positive overflow into black.
+vec3 frp_hdr_storage(vec3 value) {
+	value = mix(value, vec3(0.0), isnan(value));
+	return clamp(value, vec3(-65504.0), vec3(65504.0));
+}

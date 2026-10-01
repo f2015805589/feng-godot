@@ -10,7 +10,6 @@ extends RefCounted
 ## dictionaries are immutable by convention: the producer replaces the whole
 ## array under the mutex instead of mutating a published one.
 
-const SUN_SCAN_MSEC := 500
 const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
 const SKY_RUNTIME_PROBE_INTERVAL_MSEC := 500
 ## The viewport/world/targets registry lives with the snapshot passes that
@@ -21,7 +20,8 @@ const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot
 
 static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
 static var _debanding_original: Dictionary = {} ## viewport id -> {viewport: WeakRef, enabled: bool}
-static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef}
+static var _light_tree: SceneTree
+static var _scene_lights: Dictionary = {} ## instance id -> WeakRef; membership follows tree signals
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
 static var _sequence := 0
@@ -83,6 +83,8 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 	snapshot["fog_color"] = fog_color + albedo * ambient * contribution_scale
 
 static func register(fog: FengHeightFog) -> void:
+	if fog.is_inside_tree():
+		_attach_light_tree(fog.get_tree())
 	var id := fog.get_instance_id()
 	var entry: Variant = _fogs.get(id)
 	if entry == null or entry["node"].get_ref() != fog:
@@ -95,6 +97,8 @@ static func unregister(fog: FengHeightFog) -> void:
 	if worlds != null:
 		worlds.unregister_owner(fog)
 	_fogs.erase(fog.get_instance_id())
+	if _fogs.is_empty():
+		_detach_light_tree()
 	_publish()
 
 static func register_viewport(viewport: Viewport, owner: Object = null) -> void:
@@ -176,33 +180,49 @@ static func _render_targets(world: World3D) -> Array[RID]:
 ## first enabled DirectionalLight3D on the same World3D — Unreal's equivalent is
 ## the directional light flagged "Atmosphere Sun Light", which Godot does not
 ## have, so a dedicated override on the component covers the multi-sun case.
+static func _attach_light_tree(tree: SceneTree) -> void:
+	if tree == _light_tree:
+		return
+	_detach_light_tree()
+	_light_tree = tree
+	if tree == null:
+		return
+	tree.node_added.connect(_light_added)
+	tree.node_removed.connect(_light_removed)
+	for light in tree.root.find_children("*", "DirectionalLight3D", true, false):
+		_light_added(light)
+
+static func _detach_light_tree() -> void:
+	if is_instance_valid(_light_tree):
+		if _light_tree.node_added.is_connected(_light_added):
+			_light_tree.node_added.disconnect(_light_added)
+		if _light_tree.node_removed.is_connected(_light_removed):
+			_light_tree.node_removed.disconnect(_light_removed)
+	_light_tree = null
+	_scene_lights.clear()
+
+static func _light_added(node: Node) -> void:
+	if node is DirectionalLight3D:
+		_scene_lights[node.get_instance_id()] = weakref(node)
+
+static func _light_removed(node: Node) -> void:
+	if node is DirectionalLight3D:
+		_scene_lights.erase(node.get_instance_id())
+
+static func _light_in_world(light: DirectionalLight3D, world: World3D) -> bool:
+	return is_instance_valid(light) and light.is_inside_tree() and light.is_visible_in_tree() and light.get_world_3d() == world
+
 static func _sun_for(fog: FengHeightFog, world: World3D) -> DirectionalLight3D:
 	var explicit_light := fog.sun_light
-	if explicit_light != null and explicit_light.visible:
-		return explicit_light
-	var world_id := world.get_instance_id() if world != null else 0
-	var now := Time.get_ticks_msec()
-	var scan: Variant = _sun_scans.get(world_id)
-	if scan != null and now - int(scan["time"]) < SUN_SCAN_MSEC:
-		var cached: DirectionalLight3D = scan["light"].get_ref()
-		return cached if cached != null and cached.visible else null
-	var found: DirectionalLight3D = null
-	var tree := fog.get_tree()
-	if tree != null:
-		var stack: Array = [tree.root]
-		while not stack.is_empty():
-			var node: Node = stack.pop_back()
-			if node is DirectionalLight3D and node.visible and node.get_world_3d() == world:
-				found = node
-				break
-			stack.append_array(node.get_children())
-	_sun_scans[world_id] = {"time": now, "light": weakref(found), "world": weakref(world)}
-	if _sun_scans.size() > 16:
-		# Worlds churn with editor sub-viewports; drop entries whose world is gone.
-		for old_id in _sun_scans.keys():
-			var old_world: WeakRef = _sun_scans[old_id].get("world")
-			if old_world == null or old_world.get_ref() == null:
-				_sun_scans.erase(old_id)
+	if explicit_light != null:
+		return explicit_light if _light_in_world(explicit_light, world) else null
+	var found: DirectionalLight3D
+	for reference: WeakRef in _scene_lights.values():
+		var candidate := reference.get_ref() as DirectionalLight3D
+		if not _light_in_world(candidate, world):
+			continue
+		if found == null or found.is_greater_than(candidate):
+			found = candidate
 	return found
 
 static func _publish() -> void:

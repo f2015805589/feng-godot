@@ -94,6 +94,11 @@ vec3 frp_atmo_multiple(vec3 p, vec3 light) {
 void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radiance, out vec3 transmission) {
 	radiance = vec3(0.0);
 	transmission = vec3(1.0);
+	// This gates only the camera aerial contribution, not solar transmission
+	// or captured sky lighting. Missing legacy flags default to enabled.
+	if (ATMO_PARAMS[12].w > 0.5) {
+		return;
+	}
 	float receiver_distance = length(camera_to_receiver_m) * 0.001 * ATMO_PARAMS[6].w;
 	if (receiver_distance <= ATMO_PARAMS[6].z || receiver_distance <= 0.000001) {
 		return;
@@ -146,7 +151,7 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 			}
 			float mu = clamp(dot(direction, light.xyz), -1.0, 1.0);
 			float rayleigh_phase = 3.0 * (1.0 + mu * mu) / (16.0 * FRP_ATMO_PI);
-			float denom = max(1.0 + g * g - 2.0 * g * mu, 0.0001);
+			float denom = max((1.0 - g) * (1.0 - g) + g * dot(direction - light.xyz, direction - light.xyz), 0.000000000001);
 			float mie_phase = 3.0 * (1.0 - g * g) * (1.0 + mu * mu) / (8.0 * FRP_ATMO_PI * (2.0 + g * g) * pow(denom, 1.5));
 			vec3 unit_source = (rayleigh * rayleigh_phase + mie * mie_phase) * frp_atmo_transmittance(p, light.xyz);
 			// UE 5.8 overview documents multiple scattering for the primary light only.

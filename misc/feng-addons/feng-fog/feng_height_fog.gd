@@ -6,7 +6,8 @@ extends Node3D
 ## The node's world-space height is its global Y position (each fog layer's
 ## height offset is relative to it), and a world keeps the latest registered
 ## enabled node active. Extinction parameters keep Unreal's shader semantics;
-## Lit colors describe a material, with Legacy Radiance as an explicit opt-out.
+## Lit colors follow the requested material-like mode; UE Analytic Radiance
+## preserves Exponential Height Fog's artistic scene-linear color semantics.
 ## Density and falloff carry Unreal's authored units and are divided
 ## by ten for meters before upload (Unreal divides by 1000 in centimeters).
 ## While active, the runtime temporarily enables debanding on affected viewports
@@ -30,16 +31,16 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 		fog_density = maxf(value, 0.0)
 		_publish()
 ## Lit treats Fog Inscattering Color as a material's scattering albedo: sky
-## and sunlight illuminate it. Legacy Radiance keeps the old fixed, additive
+## and sunlight illuminate it. UE Analytic Radiance keeps the fixed, additive
 ## scene-linear source for scenes authored with Unreal's color semantics.
-@export_enum("Lit", "Legacy Radiance") var fog_color_mode: int = ColorMode.LIT:
+@export_enum("Lit", "UE Analytic Radiance") var fog_color_mode: int = ColorMode.LIT:
 	set(value):
 		fog_color_mode = value
 		_publish()
 ## In Lit mode this is an sRGB material color, converted to linear albedo in
 ## [0, 1]. White scatters incident light without tinting it. Black disables
 ## the base source; the separately authored directional lobe is unaffected.
-## In Legacy Radiance mode it is the original scene-linear additive source.
+## In UE Analytic Radiance mode it is the original scene-linear additive source.
 @export var fog_inscattering_color := Color.WHITE:
 	set(value):
 		fog_inscattering_color = value
