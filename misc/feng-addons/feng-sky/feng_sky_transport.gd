@@ -18,12 +18,12 @@ static func absorption_density(altitude: float, settings: Dictionary) -> float:
 
 
 static func view_sample_count(settings: Dictionary) -> int:
-	return roundi(clampf(float(VIEW_SAMPLES) * float(settings["trace_sample_count_scale"]), 2.0, float(MAX_VIEW_SAMPLES)))
+	return clampi(roundi(float(VIEW_SAMPLES) * float(settings["trace_sample_count_scale"])), 2, MAX_VIEW_SAMPLES)
 
 
 static func mie_phase(cosine_angle: float, g: float) -> float:
 	# Cornette-Shanks, with directions both pointing away from the sample point.
-	var denominator := maxf((1.0 - g) * (1.0 - g) + 2.0 * g * (1.0 - clampf(cosine_angle, -1.0, 1.0)), 1e-12)
+	var denominator := maxf(1.0 + g * g - 2.0 * g * cosine_angle, 0.0001)
 	return 3.0 * (1.0 - g * g) * (1.0 + cosine_angle * cosine_angle) / (8.0 * PI * (2.0 + g * g) * pow(denominator, 1.5))
 
 
@@ -84,7 +84,7 @@ static func integrate_ray(origin: Vector3, view_direction: Vector3, sun_directio
 		path = minf(path, ground)
 	var cosine := clampf(view_direction.dot(sun_direction), -1.0, 1.0)
 	var rayleigh_phase := 3.0 * (1.0 + cosine * cosine) / (16.0 * PI)
-	var aerosol_phase := mie_phase(1.0 - 0.5 * view_direction.distance_squared_to(sun_direction), settings["mie_asymmetry"])
+	var aerosol_phase := mie_phase(cosine, settings["mie_asymmetry"])
 	var beta_rayleigh: Vector3 = settings["rayleigh_scattering_per_km"]
 	var beta_mie_scatter: Vector3 = settings["mie_scattering_coefficients"]
 	var beta_mie_extinction: Vector3 = settings["mie_extinction_coefficients"]

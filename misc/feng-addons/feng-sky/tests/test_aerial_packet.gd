@@ -37,10 +37,6 @@ func _init() -> void:
 	require(is_equal_approx(packet[31], 32.0), "View samples must follow transport scale")
 	require(is_equal_approx(packet[35], 60000.0) and is_equal_approx(packet[43], 0.3), "Two atmospheric light sources not preserved")
 	require(packet[48] == 1.0 and packet[49] == 0.0 and packet[50] == 1.0, "LUT/active flags do not match payload")
-	snapshot["render_in_main_pass"] = false
-	var secondary_only := Packet.make(snapshot, Transform3D.IDENTITY, true, false)
-	require(secondary_only[50] == 1.0 and secondary_only[51] == 1.0, "Main-pass gate must preserve active direct-light transport")
-	require(secondary_only[35] == packet[35] and secondary_only[43] == packet[43], "Main-pass gate modified authored light energy")
 	var absent: PackedFloat32Array = Packet.make({}, Transform3D.IDENTITY, false, false)
 	require(absent.size() == 64 and absent[50] == 0.0, "Absent sky must produce inert packet")
 	var pass_resource := load("res://addons/feng-render-pipeline/library/height-fog/height_fog.tres")

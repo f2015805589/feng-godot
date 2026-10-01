@@ -642,9 +642,9 @@ void main() {
 	vec3 color = frp_compose_bxdf(shading_model_id, brdf, ambient_light, diffuse_light, direct_specular_light, indirect_specular_light);
 
 #ifdef MODE_SEPARATE_SPECULAR
-	frag_color = vec4(frp_hdr_storage(color - (direct_specular_light + indirect_specular_light)), sss_strength);
-	specular_color = vec4(frp_hdr_storage(direct_specular_light + indirect_specular_light), metallic);
+	frag_color = vec4(color - (direct_specular_light + indirect_specular_light), sss_strength);
+	specular_color = vec4(direct_specular_light + indirect_specular_light, metallic);
 #else
-	frag_color = vec4(frp_hdr_storage(color), alpha);
+	frag_color = vec4(color, alpha);
 #endif
 }

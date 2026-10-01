@@ -176,9 +176,5 @@ void main() {
 		frp_atmo_aerial(camera_to_receiver, vec3(0.0), atmospheric_radiance, atmospheric_transmission);
 		scene_color.rgb = scene_color.rgb * atmospheric_transmission + atmospheric_radiance * pc.parameters.y;
 	}
-	vec3 result = fog.rgb * pc.parameters.y + scene_color.rgb * fog.a;
-	// Pre-exposure and additive atmosphere/fog can exceed half storage even
-	// when every source is finite. Bound before the store, not after tonemapping.
-	result = mix(result, vec3(0.0), isnan(result));
-	imageStore(color_image, pixel, vec4(clamp(result, vec3(0.0), vec3(65504.0)), scene_color.a));
+	imageStore(color_image, pixel, vec4(fog.rgb * pc.parameters.y + scene_color.rgb * fog.a, scene_color.a));
 }

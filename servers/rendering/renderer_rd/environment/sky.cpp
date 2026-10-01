@@ -73,12 +73,10 @@ void SkyRD::SkyShaderData::set_code(const String &p_code) {
 	uses_half_res = false;
 	uses_quarter_res = false;
 	uses_position = false;
-	radiance_position_independent = false;
 	uses_light = false;
 
 	actions.render_mode_flags["use_half_res_pass"] = &uses_half_res;
 	actions.render_mode_flags["use_quarter_res_pass"] = &uses_quarter_res;
-	actions.render_mode_flags["radiance_position_independent"] = &radiance_position_independent;
 
 	actions.usage_flag_pointers["TIME"] = &uses_time;
 	actions.usage_flag_pointers["POSITION"] = &uses_position;
@@ -1005,7 +1003,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 		if (sky_mode == RSE::SKY_MODE_AUTOMATIC) {
 			bool sun_scatter_enabled = RendererSceneRenderRD::get_singleton()->environment_get_fog_enabled(p_render_data->environment) && RendererSceneRenderRD::get_singleton()->environment_get_fog_sun_scatter(p_render_data->environment) > 0.001;
 
-			if ((shader_data->uses_time || (shader_data->uses_position && !shader_data->radiance_position_independent)) && sky->radiance_size == Sky::REAL_TIME_SIZE) {
+			if ((shader_data->uses_time || shader_data->uses_position) && sky->radiance_size == Sky::REAL_TIME_SIZE) {
 				sky_mode = RSE::SKY_MODE_REALTIME;
 			} else if (shader_data->uses_light || sun_scatter_enabled || shader_data->ubo_size > 0) {
 				sky_mode = RSE::SKY_MODE_INCREMENTAL;
@@ -1048,7 +1046,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 			sky->reflection.dirty = true;
 		}
 
-		if (!p_render_data->scene_data->cam_transform.origin.is_equal_approx(sky->prev_position) && shader_data->uses_position && !shader_data->radiance_position_independent) {
+		if (!p_render_data->scene_data->cam_transform.origin.is_equal_approx(sky->prev_position) && shader_data->uses_position) {
 			sky->prev_position = p_render_data->scene_data->cam_transform.origin;
 			sky->reflection.dirty = true;
 		}
@@ -1275,7 +1273,6 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	// Update radiance octmap
 	if (sky->reflection.dirty && (sky->processing_layer >= max_processing_layer || update_single_frame)) {
-		RENDER_TIMESTAMP("Sky Radiance Update " + itos(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_env).get_id()));
 		Projection cm;
 		cm.set_perspective(90, 1, 0.01, 10.0);
 		Projection correction;

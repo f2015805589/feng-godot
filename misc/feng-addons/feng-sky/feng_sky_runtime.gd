@@ -190,7 +190,7 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 		if view_direction.dot(up) <= 0.0:
 			continue # The virtual ground is dark; bounce reaches the sky through MS.
 		var cosine_angle := clampf(view_direction.dot(sun_direction), -1.0, 1.0)
-		var mie_denom := maxf((1.0 - mie_g) * (1.0 - mie_g) + mie_g * view_direction.distance_squared_to(sun_direction), 1e-12)
+		var mie_denom := maxf(1.0 + mie_g * mie_g - 2.0 * mie_g * cosine_angle, 0.0001)
 		var mie_phase_pdf := (1.0 - mie_g * mie_g) / (4.0 * PI * pow(mie_denom, 1.5))
 		var mixture_pdf := 0.5 * mie_uniform_pdf + 0.5 * mie_phase_pdf
 		var importance_weight := 1.0 / maxf(4.0 * PI * mixture_pdf, 0.000001)

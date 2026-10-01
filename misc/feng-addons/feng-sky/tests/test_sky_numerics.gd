@@ -111,7 +111,7 @@ func gpu_source() -> String:
 	# Reuse the production functions and sky() verbatim. Only replace the engine
 	# uniform/builtin declarations with compute inputs; no CPU reimplementation.
 	var source := FileAccess.get_file_as_string(FengSkyRuntime.ATMOSPHERE_SHADER_PATH)
-	source = source.replace("shader_type sky;", "").replace("render_mode radiance_position_independent;", "")
+	source = source.replace("shader_type sky;", "")
 	source = source.replace("uniform sampler2D optical_column_lut : filter_linear, repeat_disable;",
 		"layout(set = 0, binding = 2) uniform sampler2D optical_column_lut;")
 	source = source.replace("uniform sampler2D multi_scattering_lut : filter_linear, repeat_disable;",
@@ -128,8 +128,6 @@ const float PI = 3.14159265358979323846;
 vec3 POSITION;
 vec3 EYEDIR;
 vec3 COLOR;
-float ALPHA;
-bool AT_CUBEMAP_PASS;
 """ + source + """
 void main() {
 	uint index = gl_GlobalInvocationID.x;
@@ -164,9 +162,6 @@ void main() {
 	trace_sample_count_scale = rays[offset + 12].z;
 	use_multi_scattering_lut = rays[offset + 12].w > 0.0;
 	planet_center_m = vec3(0.0, -1000.0 * planet_radius_km, 0.0);
-	render_in_main_pass = (params.counts.z & 1u) == 0u;
-	holdout = (params.counts.z & 2u) != 0u;
-	AT_CUBEMAP_PASS = (params.counts.z & 4u) != 0u;
 	sky();
 	values[index * 3] = vec4(COLOR, solar_disk_weight(EYEDIR, sun_direction, radians(sun_angular_radius_deg)));
 	vec3 origin = (POSITION - planet_center_m) / 1000.0;
@@ -210,7 +205,7 @@ func make_gpu_inputs(settings: Dictionary, use_lut: bool) -> Dictionary:
 				var absorption: Vector3 = settings["absorption_extinction_per_km"]
 				rays.append_array(PackedFloat32Array([
 					camera.x, camera.y, camera.z, radius_deg,
-					view.x, view.y, view.z, [0.0, 0.95, 0.999][motion_index % 3],
+					view.x, view.y, view.z, [-0.95, 0.0, 0.95][motion_index % 3],
 					sun.x, sun.y, sun.z, [0.0, 60000.0, 10000000.0][motion_index % 3],
 					color.x, color.y, color.z, 60000.0 if motion_index % 2 == 0 else 6000.0,
 					settings["planet_radius_km"], settings["atmosphere_height_km"], settings["rayleigh_scale_height_km"], settings["mie_scale_height_km"],
@@ -336,25 +331,5 @@ func dispatch_gpu_checks(rd: RenderingDevice, shader: RID, pipeline: RID, settin
 	print("SKY NUMERICS GPU rays=", count, " lut=", use_lut,
 		" profile=", OpticalLut.geometry_signature(settings), " bad_values=", bad_values,
 		" max_disk_weight_error=", maximum_mask_error, " legacy_disk_failures=", legacy_disk_failures)
-
-	# Render flags affect the main camera only, never the captured sky used by
-	# reflections and indirect lighting. Exercise production sky() in both paths.
-	var capture_reference := PackedFloat32Array()
-	for flags in [1, 2, 4, 5, 6]:
-		list = rd.compute_list_begin()
-		rd.compute_list_bind_compute_pipeline(list, pipeline)
-		rd.compute_list_bind_uniform_set(list, uniform_set, 0)
-		rd.compute_list_set_push_constant(list, PackedInt32Array([count, 0, flags, 0]).to_byte_array(), 16)
-		rd.compute_list_dispatch(list, ceili(float(count) / 64.0), 1, 1)
-		rd.compute_list_end()
-		rd.submit()
-		rd.sync()
-		var flagged := rd.buffer_get_data(output_buffer).to_float32_array()
-		if flags == 4:
-			capture_reference = flagged
-		for index in count:
-			for channel in 3:
-				var expected := capture_reference[index * 12 + channel] if flags & 4 else 0.0
-				require(flagged[index * 12 + channel] == expected, "main/capture atmosphere rendering flags diverged")
 	for resource in [uniform_set, sampler, texture, multi_texture, output_buffer, input_buffer]:
 		rd.free_rid(resource)

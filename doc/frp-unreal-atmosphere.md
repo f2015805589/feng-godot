@@ -1,7 +1,5 @@
 # UE 5.8 Atmosphere 参数、传输与验证边界
 
-后续 CPU/GPU、HDR 存储及捕获原点修正见 [大气回归修复](frp-atmosphere-regression.md)。仍采用全分辨率精确天空积分；没有默认启用未经性能证明的降采样方案。
-
 本次目标版本由用户指定为 **Unreal Engine 5.8**。依据为 [5.8 官方属性文档](https://dev.epicgames.com/documentation/unreal-engine/sky-atmosphere-component-properties-in-unreal-engine?application_version=5.8)、[Sky Atmosphere 概览](https://dev.epicgames.com/documentation/en-us/unreal-engine/sky-atmosphere-component-in-unreal-engine) 与公开研究实现。不是把原单次散射参数改名：RGB Mie 吸收、臭氧、间接散射、地面反弹、物体空气透视和场景太阳透射都进入实际求值。
 
 ## 来源与未获得的基准
@@ -9,7 +7,7 @@
 - 已核实 Epic 官方 5.8 文档存在；本次连接读取 `EpicGames/UnrealEngine` 返回 404，无法访问其私有代码。这不表示该仓库不存在。未发现并验证可合法使用的公开 5.8 引擎 fork
 - 可访问的 [Hillaire 研究示例](https://github.com/sebh/UnrealEngineSkyAtmosphere/tree/183ead5bdacc701b3b626347a680a2f3cd3d4fbd) 为独立 MIT 项目，固定版本 `183ead5bdacc701b3b626347a680a2f3cd3d4fbd`（2022-09-11）。参考 `RenderSkyCommon.hlsl`、`RenderSkyRayMarching.hlsl` 的密度、相函数和双散射闭合思路；许可保存在 `feng-sky/THIRD_PARTY_NOTICES.md`
 - 未复制、重新许可或发布私有 UE shader；没有声称该示例就是 UE 5.8 源码
-- 属性概览未逐项提供当前构造函数值；后续补查 [USkyAtmosphereComponent API](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Engine/USkyAtmosphereComponent) 的公开元数据。因此下表默认值是明确的 Feng 地球预设；未获得 UE 5.8 CDO 导出和相同场景渲染前，不能称每一默认值、范围、LUT 精度、色调映射或最终像素完全相同
+- 官方说明未逐项提供当前构造函数值和元数据限制。因此下表默认值是明确的 Feng 地球预设；未获得 UE 5.8 CDO 导出和相同场景渲染前，不能称每一默认值、范围、LUT 精度、色调映射或最终像素完全相同
 
 ## 作者参数映射
 
@@ -37,8 +35,7 @@ RGB 系数由真正的 Color Inspector 控件编辑，数值直接表示线性 R
 | Aerial Perspective Start Depth | `aerial_perspective_start_depth` | .1 km；近处跳过积分 |
 | Height Fog Contribution | `height_fog_contribution` | 1；受 `affect_height_fog` 控制，关闭时不关闭独立天空/物体空气透视 |
 | Transmittance Min Light Elevation Angle | `transmittance_min_light_elevation_angle` | -90°；只限制地面/物体直射光透射方向，不移动天空太阳、不改变空气透视 |
-| Trace Sample Count Scale | `trace_sample_count_scale` | 1；作者值下限.25，UI上限8且允许更大；不把UIMax误作ClampMax。当前引擎积分预算仍为2–64段，不冒充UE scalability预算 |
-| Render in Main Pass / Holdout | `render_in_main_pass` / `holdout` | Render in Main Pass关闭可见天空与相机空气透视，保留直射透射和捕获；Holdout只验证天空primitive黑/alpha0，不冒充完整UE合成流程 |
+| Trace Sample Count Scale | `trace_sample_count_scale` | 1；当前8个视线段，缩放并夹紧；不是 UE scalability/CVar 的同一预算 |
 | Atmosphere Sun Light Index 0 / 1 | `sun_light` / `secondary_sun_light` | 每个按真实 light RID 对应；次光不被自动选为主光；依 UE5.8 已记录的限制，只有主光参与多次散射 |
 | Directional Light Source Angle | `sun_angular_radius_deg` / 次光对应字段 | Feng 保留半径控制 .26785°；换算直径 .5357°；这是兼容扩展，不谎称 Godot 灯光 Inspector 已变成 UE UI |
 
@@ -48,7 +45,7 @@ RGB 系数由真正的 Color Inspector 控件编辑，数值直接表示线性 R
 
 128×64 RGB32F 光学列包含 Rayleigh、Mie、臭氧。密度变化才重建；太阳、强度、曝光和系数变化不重建该表。过薄剖面回退到直接积分，不能把旧纹理传给空气透视。16×16 RGB32F 多次散射表使用16方向、12段及几何级数闭合，反馈上限 .95。它的生成约 .47 s，是明确的首次/光学参数修改成本；不能拿缓存命中帧掩盖它。每个 provider 保留自己的 CPU image 和 GPU texture，四项共享字节缓存只用于复用初次生成，不会使多世界的后续太阳移动再次生成表。
 
-数值保护范围是 Feng 实现的有限预算，不冒充 UE 的 Inspector ClampMin/Max：半径.1–10000 km、高度.1–10000 km、密度高度.001–1000 km、系数0–100 km⁻¹、g∈[0,.999]。太阳辐照上限10M，天空最终输出60000以避免RGBA16F溢出。极端预算和多次散射反馈限制有明确画面差异，不能用这些结果声称 UE 逐像素一致。
+数值保护范围是 Feng 实现的有限预算，不冒充 UE 的 Inspector ClampMin/Max：半径1–100000 km、高度.1–10000 km、密度高度.001–1000 km、系数0–100 km⁻¹、g∈[-.99,.99]。太阳辐照上限10M，天空最终输出60000以避免RGBA16F溢出。极端预算和多次散射反馈限制有明确画面差异，不能用这些结果声称 UE 逐像素一致。
 
 物理模式仍使用真实60,000 lux场景输入；非物理模式保持 PI×energy 的 FRP约定。曝光只在渲染链处理一次。Fog 的白色基础反照率与独立方向艺术色不被直接光透射逻辑覆盖；不改写用户灯光颜色/强度。引擎准备阶段上传数据后，使用同一过滤顺序匹配光源槽位，再由各表面着色路径求透射。
 
@@ -58,7 +55,7 @@ FRP 使用逐表面太阳透射；UE 的每灯光开关/CVar、云层阴影、�
 
 ## 迁移与稳定契约
 
-旧 `planet_radius_km`、高度字段、Rayleigh 系数、灰色 Mie scattering/extinction、`mie_asymmetry`、`planet_center_m` 都仍可加载/读写。旧消光换算为非负吸收；新存档只保存规范字段，避免别名重复回写。旧中心坐标自动选择显式中心模式。三个已发布内嵌默认 shader 通过精确SHA256迁移到当前源码；任意用户修改版本继续当作自定义天空，不进行宽泛字符串匹配或覆盖共享资源。
+旧 `planet_radius_km`、高度字段、Rayleigh 系数、灰色 Mie scattering/extinction、`mie_asymmetry`、`planet_center_m` 都仍可加载/读写。旧消光换算为非负吸收；新存档只保存规范字段，避免别名重复回写。旧中心坐标自动选择显式中心模式。两个已发布内嵌默认 shader 通过精确SHA256迁移到当前源码；任意用户修改版本继续当作自定义天空，不进行宽泛字符串匹配或覆盖共享资源。
 
 新 prepare hook 通过 ViewPass / BuiltinPass / NativePass 转发，Volume 相机不会失去空气透视数据。默认仍是9个原生条目+5个库条目，13个常规条目开启、Debug Buffers关闭；不添加第14个常规 pass，不改作者覆盖。空气透视随现有 Height Fog 条目的显式启停一起调度。
 
