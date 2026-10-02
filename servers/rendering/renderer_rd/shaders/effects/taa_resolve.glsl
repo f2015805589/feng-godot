@@ -352,16 +352,17 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 	// Get history color (catmull-rom reduces a lot of the blurring that you get under motion)
 	bool valid_history;
 	vec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution, valid_history).rgb;
-	// A non-finite or negative Catmull reconstruction is not usable history.
-	// Reject it fully before clipping or flicker suppression can reduce the
-	// current-frame contribution.
-	if (!valid_history) {
-		return color_input;
-	}
 	// History stores HDR radiance encoded with the previous frame's exposure.
-	// Rebase before variance clipping or nonlinear blending, otherwise a scalar
-	// exposure change can clip RGB channels differently and wash out the color.
-	color_history *= params.history_exposure_ratio;
+	// Rebase valid history before variance clipping or nonlinear blending,
+	// otherwise exposure changes can clip RGB channels differently.
+	if (valid_history) {
+		color_history *= params.history_exposure_ratio;
+	} else {
+		// An FP16 overflow, NaN or negative Catmull reconstruction must not poison
+		// later frames. Treat it as current history, then apply the same existing
+		// neighborhood clipping and flicker reduction as every valid sample.
+		color_history = color_input;
+	}
 
 	// Clip history to the neighbourhood of the current sample (fixes a lot of the ghosting).
 	vec2 velocity_closest = vec2(0.0); // This is best done by using the velocity with the closest depth.

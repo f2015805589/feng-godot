@@ -145,20 +145,36 @@ func check_catmull_history_rejection() -> void:
 		return
 	print("PASS GPU production Catmull reconstructs the synthetic bright edge as finite negative HDR: %s" % raw)
 
-	var repaired := resolve_motion(production, current, ringing_history, motion, motion).get_pixelv(center)
-	var expected := Color(60000.0, 30000.0, 12000.0, 1.0)
-	if not check(absf(repaired.r - expected.r) < 1.0 and absf(repaired.g - expected.g) < 1.0 and absf(repaired.b - expected.b) < 1.0,
-			"negative reconstructed history suppressed a bright current Sun pixel: got %s expected %s" % [repaired, expected]):
+	# A valid, uniform history texture colored like the current Sun center provides
+	# the fallback reference. Both cases must pass through the same existing
+	# neighborhood clipping and flicker reduction before reaching the output.
+	var current_center := Color(60000.0, 30000.0, 12000.0, 1.0)
+	var matching_history := solid_color_texture(current_center)
+	var edge_reference := resolve_motion(production, current, matching_history, motion, motion).get_pixelv(center)
+	if not check(is_finite(edge_reference.r) and is_finite(edge_reference.g) and is_finite(edge_reference.b) and
+			edge_reference.r > 1000.0 and edge_reference.g > 500.0 and edge_reference.b > 200.0 and
+			absf(edge_reference.g / edge_reference.r - 0.5) < 0.03 and absf(edge_reference.b / edge_reference.r - 0.2) < 0.03,
+			"valid colored-history reference is not a bright, hue-preserving resolve: %s" % edge_reference):
 		return
-	print("PASS GPU TAA rejects negative HDR history before clipping/flicker and retains the colored current Sun pixel")
+	var repaired := resolve_motion(production, current, ringing_history, motion, motion).get_pixelv(center)
+	if not check(absf(repaired.r - edge_reference.r) < 1.0 and absf(repaired.g - edge_reference.g) < 1.0 and absf(repaired.b - edge_reference.b) < 1.0,
+			"negative Catmull history differs from the valid current-colored history reference: got %s expected %s" % [repaired, edge_reference]):
+		return
+	print("PASS GPU TAA sends negative history through the ordinary clipped, colored-current resolve: %s" % repaired)
 
 	for invalid in [INF, -INF, NAN]:
 		var bad_history := solid_color_texture(Color(invalid, invalid, invalid, 1.0))
-		var recovered := resolve_motion(production, current, bad_history, motion, motion).get_pixelv(center)
-		if not check(absf(recovered.r - expected.r) < 1.0 and absf(recovered.g - expected.g) < 1.0 and absf(recovered.b - expected.b) < 1.0,
-				"invalid prior history did not fully reject to current radiance (%s): %s" % [invalid, recovered]):
+		var recovered_bad_history := resolve_motion(production, current, bad_history, motion, motion).get_pixelv(center)
+		if not check(absf(recovered_bad_history.r - edge_reference.r) < 1.0 and absf(recovered_bad_history.g - edge_reference.g) < 1.0 and absf(recovered_bad_history.b - edge_reference.b) < 1.0,
+				"non-finite prior history differs from the valid current-colored fallback reference (%s): %s" % [invalid, recovered_bad_history]):
 			return
-	print("PASS GPU TAA fully rejects NaN and infinite history before variance clipping")
+	for invalid_ratio in [INF, -INF, NAN]:
+		var recovered_bad_ratio := resolve_motion(production, current, ringing_history, motion, motion, invalid_ratio).get_pixelv(center)
+		if not check(is_finite(recovered_bad_ratio.r) and is_finite(recovered_bad_ratio.g) and is_finite(recovered_bad_ratio.b) and
+				absf(recovered_bad_ratio.r - edge_reference.r) < 1.0 and absf(recovered_bad_ratio.g - edge_reference.g) < 1.0 and absf(recovered_bad_ratio.b - edge_reference.b) < 1.0,
+				"rejected negative history used an invalid exposure ratio (%s): %s" % [invalid_ratio, recovered_bad_ratio]):
+			return
+	print("PASS GPU TAA routes NaN/Inf history and invalid exposure ratios through the clipped-current fallback")
 
 	var black := solid_color_texture(Color(0.0, 0.0, 0.0, 1.0))
 	var black_result := resolve_motion(production, black, black, Vector2.ZERO, Vector2.ZERO).get_pixelv(center)
@@ -173,10 +189,10 @@ func check_catmull_history_rejection() -> void:
 
 	var prior_exposure := color_texture(1.0)
 	var current_exposure := color_texture(32.0)
-	var reference := resolve_motion(production, current_exposure, current_exposure, Vector2.ZERO, Vector2.ZERO)
+	var rebase_reference := resolve_motion(production, current_exposure, current_exposure, Vector2.ZERO, Vector2.ZERO)
 	var rebased := resolve_motion(production, current_exposure, prior_exposure, Vector2.ZERO, Vector2.ZERO, 32.0)
-	if not check(image_error(reference, rebased, 1.0) < 0.004,
-			"valid colored history changed after exposure rebasing: error %.6f" % image_error(reference, rebased, 1.0)):
+	if not check(image_error(rebase_reference, rebased, 1.0) < 0.004,
+			"valid colored history changed after exposure rebasing: error %.6f" % image_error(rebase_reference, rebased, 1.0)):
 		return
 	print("PASS GPU TAA preserves black/dark controls and valid colored history after exposure rebasing")
 
