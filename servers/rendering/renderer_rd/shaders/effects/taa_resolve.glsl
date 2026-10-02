@@ -239,9 +239,12 @@ vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution, out bool val
 	result += textureLod(stex, vec2(texPos12.x, texPos3.y), 0.0).xyz * w12.x * w3.y;
 	result += textureLod(stex, vec2(texPos3.x, texPos3.y), 0.0).xyz * w3.x * w3.y;
 
-	// Detect invalid history before max(): some drivers turn max(NaN, 0)
-	// into zero, which would silently blend an overflowed frame as black.
+	// Catmull-Rom's negative lobes can reconstruct finite negative RGB from
+	// nonnegative texels near a sharp HDR edge. Radiance cannot be negative, so
+	// reject that history before max() erases the evidence. Some drivers also
+	// turn max(NaN, 0) into zero, which would silently blend invalid history.
 	valid_history = !any(isnan(result)) && !any(isinf(result));
+	valid_history = valid_history && all(greaterThanEqual(result, vec3(0.0f)));
 	return max(result, 0.0f);
 }
 
@@ -349,15 +352,16 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 	// Get history color (catmull-rom reduces a lot of the blurring that you get under motion)
 	bool valid_history;
 	vec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution, valid_history).rgb;
+	// A non-finite or negative Catmull reconstruction is not usable history.
+	// Reject it fully before clipping or flicker suppression can reduce the
+	// current-frame contribution.
+	if (!valid_history) {
+		return color_input;
+	}
 	// History stores HDR radiance encoded with the previous frame's exposure.
 	// Rebase before variance clipping or nonlinear blending, otherwise a scalar
 	// exposure change can clip RGB channels differently and wash out the color.
-	if (valid_history) {
-		color_history *= params.history_exposure_ratio;
-	} else {
-		// An FP16 overflow or NaN from one frame must not poison later frames.
-		color_history = color_input;
-	}
+	color_history *= params.history_exposure_ratio;
 
 	// Clip history to the neighbourhood of the current sample (fixes a lot of the ghosting).
 	vec2 velocity_closest = vec2(0.0); // This is best done by using the velocity with the closest depth.

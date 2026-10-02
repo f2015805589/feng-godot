@@ -37,8 +37,8 @@ func resolve_motion(fixture: Dictionary, current: RID, history: RID, velocity: V
 		uniform(RenderingDevice.UNIFORM_TYPE_IMAGE, 5, [output]),
 	]
 	var set := keep(rd.uniform_set_create(bindings, fixture.shader, 0))
-	var observe_velocity := 1.0 if fixture.get("observe_velocity", false) else 0.0
-	var push := PackedFloat32Array([SIZE, SIZE, 2.5, 1.0, ratio, observe_velocity, 0.0, 0.0]).to_byte_array()
+	var pad0 := float(fixture.get("pad0", 1.0 if fixture.get("observe_velocity", false) else 0.0))
+	var push := PackedFloat32Array([SIZE, SIZE, 2.5, 1.0, ratio, pad0, 0.0, 0.0]).to_byte_array()
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, fixture.pipeline)
 	rd.compute_list_bind_uniform_set(list, set, 0)
@@ -89,6 +89,96 @@ func closest_velocity_fixture() -> Dictionary:
 	fixture.pipeline = keep(rd.compute_pipeline_create(fixture.shader))
 	fixture.observe_velocity = true
 	return fixture
+
+func catmull_history_fixture() -> Dictionary:
+	var fixture := taa_fixture()
+	var path := source_root().path_join("servers/rendering/renderer_rd/shaders/effects/taa_resolve.glsl")
+	var text := FileAccess.get_file_as_string(path)
+	# Add a test-only observation through the unused push-constant pad. The Catmull
+	# function and its texture samples remain the production code; this fixture only
+	# exposes the raw result so the signed edge witness itself is verified on-GPU.
+	var result_line := "\treturn max(result, 0.0f);"
+	var sample_line := "\tvec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution, valid_history).rgb;"
+	require(text.contains(result_line), "production Catmull history return changed")
+	require(text.contains(sample_line), "production TAA history sample site changed")
+	text = text.replace(result_line, "\treturn params.pad0 == 1.0f ? result : max(result, 0.0f);")
+	text = text.replace(sample_line, sample_line + "\n\tif (params.pad0 == 1.0f) return color_history;")
+	var source := RDShaderSource.new()
+	source.source_compute = text.substr(text.find("#version")).replace("#VERSION_DEFINES", "").replace(
+			"layout(rgba16f, set = 0, binding = 5)", "layout(rgba32f, set = 0, binding = 5)")
+	var spirv := rd.shader_compile_spirv_from_source(source)
+	require(spirv.compile_error_compute.is_empty(), spirv.compile_error_compute)
+	fixture.shader = keep(rd.shader_create_from_spirv(spirv))
+	fixture.pipeline = keep(rd.compute_pipeline_create(fixture.shader))
+	fixture.pad0 = 1.0
+	return fixture
+
+func sun_edge_texture() -> RID:
+	var pixels := Image.create(SIZE, SIZE, false, Image.FORMAT_RGBAF)
+	pixels.fill(Color(0.02, 0.02, 0.02, 1.0))
+	pixels.set_pixel(SIZE / 2, SIZE / 2, Color(60000.0, 30000.0, 12000.0, 1.0))
+	pixels.convert(Image.FORMAT_RGBAH)
+	return texture(RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, SIZE, SIZE, pixels.get_data())
+
+func negative_catmull_history_texture() -> RID:
+	var pixels := Image.create(SIZE, SIZE, false, Image.FORMAT_RGBAF)
+	pixels.fill(Color(0.0, 0.0, 0.0, 1.0))
+	# A bright previous-frame texel lies on Catmull's negative outer x lobe when
+	# the current center reprojects half a texel right. The vertical stripe makes
+	# the negative result independent of y interpolation and image row orientation.
+	for y in SIZE:
+		pixels.set_pixel(SIZE / 2 + 2, y, Color(60000.0, 30000.0, 12000.0, 1.0))
+	pixels.convert(Image.FORMAT_RGBAH)
+	return texture(RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, SIZE, SIZE, pixels.get_data())
+
+func check_catmull_history_rejection() -> void:
+	var production := taa_fixture()
+	var diagnostic := catmull_history_fixture()
+	var current := sun_edge_texture()
+	var ringing_history := negative_catmull_history_texture()
+	var motion := Vector2(0.5 / float(SIZE), 0.0)
+	var center := Vector2i(SIZE / 2, SIZE / 2)
+	var raw := resolve_motion(diagnostic, current, ringing_history, motion, motion, 1.0, true).get_pixelv(center)
+	if not check(is_finite(raw.r) and is_finite(raw.g) and is_finite(raw.b) and
+			raw.r < -3000.0 and raw.g < -1500.0 and raw.b < -600.0,
+			"production Catmull sampling did not produce the expected finite negative HDR edge: %s" % raw):
+		return
+	print("PASS GPU production Catmull reconstructs the synthetic bright edge as finite negative HDR: %s" % raw)
+
+	var repaired := resolve_motion(production, current, ringing_history, motion, motion).get_pixelv(center)
+	var expected := Color(60000.0, 30000.0, 12000.0, 1.0)
+	if not check(absf(repaired.r - expected.r) < 1.0 and absf(repaired.g - expected.g) < 1.0 and absf(repaired.b - expected.b) < 1.0,
+			"negative reconstructed history suppressed a bright current Sun pixel: got %s expected %s" % [repaired, expected]):
+		return
+	print("PASS GPU TAA rejects negative HDR history before clipping/flicker and retains the colored current Sun pixel")
+
+	for invalid in [INF, -INF, NAN]:
+		var bad_history := solid_color_texture(Color(invalid, invalid, invalid, 1.0))
+		var recovered := resolve_motion(production, current, bad_history, motion, motion).get_pixelv(center)
+		if not check(absf(recovered.r - expected.r) < 1.0 and absf(recovered.g - expected.g) < 1.0 and absf(recovered.b - expected.b) < 1.0,
+				"invalid prior history did not fully reject to current radiance (%s): %s" % [invalid, recovered]):
+			return
+	print("PASS GPU TAA fully rejects NaN and infinite history before variance clipping")
+
+	var black := solid_color_texture(Color(0.0, 0.0, 0.0, 1.0))
+	var black_result := resolve_motion(production, black, black, Vector2.ZERO, Vector2.ZERO).get_pixelv(center)
+	if not check(black_result.r == 0.0 and black_result.g == 0.0 and black_result.b == 0.0,
+			"valid zero history changed a black current sample: %s" % black_result):
+		return
+	var dark := solid_color_texture(Color(0.02, 0.01, 0.005, 1.0))
+	var dark_result := resolve_motion(production, dark, dark, Vector2.ZERO, Vector2.ZERO).get_pixelv(center)
+	if not check(absf(dark_result.r - 0.02) < 0.0001 and absf(dark_result.g - 0.01) < 0.0001 and absf(dark_result.b - 0.005) < 0.0001,
+			"valid low-radiance history changed a dark current sample: %s" % dark_result):
+		return
+
+	var prior_exposure := color_texture(1.0)
+	var current_exposure := color_texture(32.0)
+	var reference := resolve_motion(production, current_exposure, current_exposure, Vector2.ZERO, Vector2.ZERO)
+	var rebased := resolve_motion(production, current_exposure, prior_exposure, Vector2.ZERO, Vector2.ZERO, 32.0)
+	if not check(image_error(reference, rebased, 1.0) < 0.004,
+			"valid colored history changed after exposure rebasing: error %.6f" % image_error(reference, rebased, 1.0)):
+		return
+	print("PASS GPU TAA preserves black/dark controls and valid colored history after exposure rebasing")
 
 func check_closest_velocity() -> void:
 	var fixture := closest_velocity_fixture()
@@ -243,17 +333,25 @@ func run() -> void:
 	rd = RenderingServer.create_local_rendering_device()
 	require(rd != null, "a native RenderingDevice is required")
 	var mode := OS.get_environment("FRP_HDR_SUN_TEST")
-	if mode == "velocity" or mode.is_empty():
-		check_closest_velocity()
-	if not failed and not mode.begins_with("grade") and mode != "velocity":
-		check_bright_motion()
-	if not failed and mode != "taa" and mode != "velocity":
-		check_color_grade(mode == "grade_invalid")
+	if mode == "reconstruction":
+		check_catmull_history_rejection()
+	else:
+		if mode == "velocity" or mode.is_empty():
+			check_closest_velocity()
+		if not failed and not mode.begins_with("grade") and mode != "velocity":
+			check_bright_motion()
+		if not failed and mode != "taa" and mode != "velocity":
+			check_color_grade(mode == "grade_invalid")
+		if not failed and mode.is_empty():
+			check_catmull_history_rejection()
 	for i in range(owned.size() - 1, -1, -1):
 		rd.free_rid(owned[i])
 	rd.free()
 	if failed:
 		quit(1)
 	else:
-		print("PASS FRP GPU moving HDR sun and post-process stability")
+		if mode == "reconstruction":
+			print("PASS GPU TAA production-shader history reconstruction regression")
+		else:
+			print("PASS FRP GPU moving HDR sun and post-process stability")
 		quit(0)
