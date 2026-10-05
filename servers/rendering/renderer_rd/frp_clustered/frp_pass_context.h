@@ -72,6 +72,10 @@ class FRPPassContext : public RefCounted {
 	RID atmosphere_light_rids[2];
 	RID atmosphere_optical_texture;
 	RID atmosphere_multiple_texture;
+	// Optional per-frame capture of the global SkyLight diffuse term for GI passes.
+	bool sky_light_diffuse_requested = false;
+	// Current scene exposure scale excluding pre-exposure, matching the FRP lighting UBO.
+	float scene_exposure_normalization = 1.0f;
 
 	void _run_operation(int p_operation);
 	static void _finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view);
@@ -94,7 +98,7 @@ public:
 	static void clear_all_sky_lighting_sources();
 	static bool get_sky_lighting_source(RID p_render_target, SkyLightingSource &r_source);
 
-	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>());
+	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>(), float p_scene_exposure_normalization = 1.0f);
 
 	// Frame state.
 	RenderDataRD *get_render_data() const { return render_data; }
@@ -108,11 +112,15 @@ public:
 	// configures a pass.
 	Dictionary get_pass_parameters(const Variant &p_pass_id) const;
 	float get_pre_exposure(int p_view) const;
+	float get_scene_exposure_normalization() const { return scene_exposure_normalization; }
 	void set_next_pre_exposure(int p_view, float p_exposure);
 	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
 	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }
 	void set_atmosphere_parameters(const PackedFloat32Array &p_parameters, RID p_light, RID p_secondary_light, RID p_optical_texture, RID p_multiple_texture);
 	PackedFloat32Array get_atmosphere_parameters() const { return atmosphere_parameters; }
+	// Requests the deferred opaque lighting pass to publish its global SkyLight diffuse contribution.
+	void request_sky_light_diffuse();
+	bool is_sky_light_diffuse_requested() const { return sky_light_diffuse_requested; }
 	RID get_atmosphere_light_rid(int p_index) const { return p_index >= 0 && p_index < 2 ? atmosphere_light_rids[p_index] : RID(); }
 	RID get_atmosphere_optical_texture() const { return atmosphere_optical_texture; }
 	RID get_atmosphere_multiple_texture() const { return atmosphere_multiple_texture; }

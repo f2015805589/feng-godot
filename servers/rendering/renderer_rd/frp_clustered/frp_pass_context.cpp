@@ -80,7 +80,7 @@ bool FRPPassContext::get_sky_lighting_source(RID p_render_target, SkyLightingSou
 	return true;
 }
 
-void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer) {
+void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization) {
 	render_data = p_render_data;
 	operation_runner = p_operation_runner;
 	stage_runner = p_stage_runner;
@@ -88,6 +88,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	pre_exposure_reader = p_pre_exposure_reader;
 	pre_exposure_writer = p_pre_exposure_writer;
 	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
+	scene_exposure_normalization = Math::is_finite(p_scene_exposure_normalization) && p_scene_exposure_normalization > 0.0f ? p_scene_exposure_normalization : 1.0f;
 	pass_parameters = p_pass_parameters;
 	height_fog_parameters.clear();
 	atmosphere_parameters.clear();
@@ -95,6 +96,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	atmosphere_light_rids[1] = RID();
 	atmosphere_optical_texture = RID();
 	atmosphere_multiple_texture = RID();
+	sky_light_diffuse_requested = false;
 }
 
 float FRPPassContext::get_pre_exposure(int p_view) const {
@@ -144,6 +146,11 @@ void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
 	if (eye_exposure_texture_writer) {
 		eye_exposure_texture_writer(p_texture);
 	}
+}
+
+void FRPPassContext::request_sky_light_diffuse() {
+	ERR_FAIL_NULL_MSG(render_data, "FRP pass context used outside of an FRP frame.");
+	sky_light_diffuse_requested = true;
 }
 
 void FRPPassContext::_finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view) {
@@ -315,9 +322,11 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_valid_pass_id", "pass_id"), &FRPPassContext::is_valid_pass_id);
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
+	ClassDB::bind_method(D_METHOD("get_scene_exposure_normalization"), &FRPPassContext::get_scene_exposure_normalization);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
 	ClassDB::bind_method(D_METHOD("set_atmosphere_parameters", "parameters", "light", "secondary_light", "optical_texture", "multiple_texture"), &FRPPassContext::set_atmosphere_parameters);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_parameters"), &FRPPassContext::get_atmosphere_parameters);
+	ClassDB::bind_method(D_METHOD("request_sky_light_diffuse"), &FRPPassContext::request_sky_light_diffuse);
 	ClassDB::bind_method(D_METHOD("set_height_fog_parameters", "parameters"), &FRPPassContext::set_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("get_height_fog_parameters"), &FRPPassContext::get_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("set_tonemap_exposure_texture", "texture"), &FRPPassContext::set_tonemap_exposure_texture);

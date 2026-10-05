@@ -107,6 +107,18 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_specular() {
 	}
 }
 
+void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_sky_light_diffuse() {
+	ERR_FAIL_NULL(render_buffers);
+
+	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RenderSceneBuffersRD::get_color_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE_MSAA, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RenderSceneBuffersRD::get_color_usage_bits(false, true, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
+}
+
 void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_normal_roughness_texture() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -812,7 +824,7 @@ void RenderFRPClustered::_render_list_with_draw_list(RenderListParameters *p_par
 	RD::get_singleton()->draw_list_end();
 }
 
-uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_pancake_shadows) {
+uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_pancake_shadows, bool p_isolate_environment_ibl) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
 	Ref<RenderSceneBuffersRD> rd = p_render_data->render_buffers;
@@ -833,13 +845,10 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 
 	float luminance_multiplier = rd.is_valid() ? rd->get_luminance_multiplier() : 1.0;
 	FRPPassContext::SkyLightingSource sky_lighting_source;
-	const bool use_sky_lighting_source = _frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source);
-	if (use_sky_lighting_source) {
-		p_render_data->scene_data->radiance_pixel_size = 1.0f / MAX(1, sky.sky_get_radiance_size(sky_lighting_source.sky));
-		p_render_data->scene_data->radiance_border_size = sky.sky_get_uv_border_size(sky_lighting_source.sky);
-	}
+	const bool use_sky_lighting_source = p_isolate_environment_ibl && !p_render_data->reflection_probe.is_valid() && _frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source);
 
-	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, current_eye_adaptation_enabled ? RID() : p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier, use_sky_lighting_source, sky_lighting_source.energy, sky_lighting_source.rotation, sky_lighting_source.captured_exposure);
+	const RID camera_attributes = current_eye_adaptation_enabled ? RID() : p_render_data->camera_attributes;
+	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier, use_sky_lighting_source, sky_lighting_source.energy, sky_lighting_source.rotation, sky_lighting_source.captured_exposure, p_isolate_environment_ibl);
 
 	// now do implementation UBO
 
@@ -860,6 +869,24 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 	scene_state.ubo.atmosphere_light_indices[1] = UINT32_MAX;
 	scene_state.ubo.atmosphere_pad = 0;
 	memset(scene_state.ubo.atmosphere_parameters, 0, sizeof(scene_state.ubo.atmosphere_parameters));
+	scene_state.ubo.sky_lighting_enabled = 0;
+	memset(scene_state.ubo.sky_lighting_pad, 0, sizeof(scene_state.ubo.sky_lighting_pad));
+	memset(scene_state.ubo.sky_lighting_parameters, 0, sizeof(scene_state.ubo.sky_lighting_parameters));
+	memset(scene_state.ubo.sky_lighting_inverse_xform, 0, sizeof(scene_state.ubo.sky_lighting_inverse_xform));
+	if (use_sky_lighting_source && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+		scene_state.ubo.sky_lighting_enabled = 1;
+		scene_state.ubo.sky_lighting_parameters[0] = sky_lighting_source.energy;
+		const float camera_exposure = camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(camera_attributes) : 1.0f;
+		const float current_exposure = Math::is_finite(camera_exposure) && camera_exposure > 0.0f ? camera_exposure : 1.0f;
+		const float captured_exposure = Math::is_finite(sky_lighting_source.captured_exposure) && sky_lighting_source.captured_exposure > 0.0f ? sky_lighting_source.captured_exposure : 1.0f;
+		const float valid_luminance_multiplier = Math::is_finite(luminance_multiplier) && luminance_multiplier > 0.0f ? luminance_multiplier : 1.0f;
+		scene_state.ubo.sky_lighting_parameters[1] = current_exposure / (MAX(1e-12f, captured_exposure) * MAX(1e-12f, valid_luminance_multiplier));
+		const int radiance_size = MAX(1, sky.sky_get_radiance_size(sky_lighting_source.sky));
+		scene_state.ubo.sky_lighting_parameters[2] = 1.0f / radiance_size;
+		scene_state.ubo.sky_lighting_parameters[3] = sky.sky_get_uv_border_size(sky_lighting_source.sky);
+		Basis sky_transform = sky_lighting_source.rotation.inverse() * p_render_data->scene_data->cam_transform.basis;
+		RendererRD::MaterialStorage::store_transform_3x3(sky_transform, scene_state.ubo.sky_lighting_inverse_xform);
+	}
 	current_atmosphere_optical_texture = RID();
 	current_atmosphere_multiple_texture = RID();
 	scene_state.ubo.height_fog_enabled = 0;
@@ -2077,7 +2104,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	RD::get_singleton()->draw_command_begin_label("Render Setup");
 
 	_setup_lightmaps(p_render_data, *p_render_data->lightmaps, p_render_data->scene_data->cam_transform);
-	uint32_t depth_prepass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+	uint32_t depth_prepass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false, false, false, !is_reflection_probe);
 
 	// May have changed due to the above (light buffer enlarged, as an example).
 	_update_render_base_uniform_set();
@@ -2162,6 +2189,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	_update_dirty_geometry_pipelines();
 
 	RID radiance_texture;
+	RID environment_radiance_texture;
 	bool draw_sky = false;
 	bool draw_sky_fog_only = false;
 	// We invert luminance_multiplier for sky so that we can combine it with exposure value.
@@ -2238,7 +2266,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			RID sky_rid = environment_get_sky(p_render_data->environment);
 			if (sky_rid.is_valid()) {
 				sky.update_radiance_buffers(rb, p_render_data->environment, p_render_data->scene_data->cam_transform.origin, time, sky_luminance_multiplier, sky_brightness_multiplier);
-				radiance_texture = sky.sky_get_radiance_texture_rd(sky_rid);
+				environment_radiance_texture = sky.sky_get_radiance_texture_rd(sky_rid);
 			} else {
 				// do not try to draw sky if invalid
 				draw_sky = false;
@@ -2258,8 +2286,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	// The environment's Sky remains the visible background and fog source. The
 	// selected FengSkyLight only replaces the radiance sampled by FRP materials.
 	FRPPassContext::SkyLightingSource sky_lighting_source;
-	if (_frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source)) {
+	const bool use_sky_lighting_source = !is_reflection_probe && _frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source);
+	if (use_sky_lighting_source) {
 		radiance_texture = sky.sky_get_radiance_texture_rd(sky_lighting_source.sky);
+	} else if (is_reflection_probe) {
+		// Preserve the Environment radiance path for capture-only reflection probes.
+		radiance_texture = environment_radiance_texture;
 	}
 
 	RSE::ViewportMSAA msaa = rb->get_msaa_3d();
@@ -2522,9 +2554,21 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				// Shadow pass can change the base uniform set samplers.
 				_update_render_base_uniform_set();
 
-				opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+				opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass, false, !is_reflection_probe);
 				_setup_atmosphere(opaque_pass_uniform_buffer_index, pass_context, p_render_data);
 				opaque_pass_uniforms_ready = true;
+				const bool sky_light_diffuse_requested = !is_reflection_probe && rb_data.is_valid() && pass_context->is_sky_light_diffuse_requested();
+				const bool write_sky_light_diffuse = sky_light_diffuse_requested && scene_state.ubo.sky_lighting_enabled != 0;
+				if (sky_light_diffuse_requested) {
+					rb_data->ensure_sky_light_diffuse();
+					RID diffuse_target = rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SKY_LIGHT_DIFFUSE_MSAA : RB_TEX_SKY_LIGHT_DIFFUSE);
+					RID diffuse_clear_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), diffuse_target);
+					Vector<Color> diffuse_clear_color;
+					diffuse_clear_color.push_back(Color(0, 0, 0, 0));
+					Rect2i full_diffuse_rect(Vector2i(), rb->get_internal_size());
+					RD::get_singleton()->draw_list_begin(diffuse_clear_framebuffer, RD::DRAW_CLEAR_COLOR_ALL, diffuse_clear_color, 0.0f, 0u, full_diffuse_rect);
+					RD::get_singleton()->draw_list_end();
+				}
 
 				{
 					Vector<Color> c;
@@ -2540,6 +2584,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 							c.push_back(Color(0, 0, 0, 0)); // Separate specular.
 							c.push_back(Color(0, 0, 0, 0)); // Motion vector. Pushed to the clear color vector even if the framebuffer isn't bound.
 						}
+						if (write_sky_light_diffuse) {
+							c.push_back(Color(0, 0, 0, 0)); // SkyLight diffuse MRT.
+						}
 					}
 
 					uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
@@ -2547,20 +2594,31 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 					if (is_reflection_probe) {
 						// Probe faces have no G-buffer; render their opaque geometry directly.
-						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
+							rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
 						RenderListParameters params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, true, p_render_data->directional_light_soft_shadows, rp_uniform_set, false, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, 1, 0, base_specialization);
 						_render_list_with_draw_list(&params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 					} else {
 						// Lighting samples depth; it must not also attach that texture for
 						// drawing. Keep only color outputs, including optional specular/MV.
 						RID lighting_color = use_msaa ? rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA) : rb->get_internal_texture();
-						RID lighting_specular = (opaque_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR) : RID();
+					RID lighting_specular = (opaque_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR) : RID();
+					RID lighting_sky_light_diffuse = write_sky_light_diffuse ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SKY_LIGHT_DIFFUSE_MSAA : RB_TEX_SKY_LIGHT_DIFFUSE) : RID();
 						// The full-screen lighting shader writes colour and, optionally,
 						// separate specular. The velocity texture must not be attached:
 						// it would give this framebuffer a colour output mask the shader
 						// does not declare, which fails pipeline creation. Motion vectors
 						// are produced by the Motion Vectors pass instead.
+					if (lighting_sky_light_diffuse.is_valid()) {
+						if (lighting_specular.is_valid()) {
+							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_sky_light_diffuse);
+						} else {
+							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_sky_light_diffuse);
+						}
+					} else if (lighting_specular.is_valid()) {
 						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular);
+					} else {
+						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color);
+					}
 						// FRP lighting pass: full-screen triangle that reads the G-buffer and computes lighting.
 						RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 						uint32_t lighting_mode = 0;
@@ -2569,6 +2627,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						}
 						if (p_render_data->scene_data->view_count > 1) {
 							lighting_mode |= 2;
+						}
+						if (write_sky_light_diffuse) {
+							lighting_mode |= 4;
 						}
 
 						SceneShaderFRPClustered::ShaderSpecialization lighting_specialization = base_specialization;
@@ -2600,7 +2661,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RID shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
 						// Descriptor layouts include shader-stage visibility, not just binding types.
 						RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
-						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader);
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
 						bool pipeline_created = false;
@@ -2614,6 +2675,11 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 						RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);
 						RD::get_singleton()->draw_list_end();
+						if (sky_light_diffuse_requested && use_msaa) {
+							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+								RD::get_singleton()->texture_resolve_multisample(rb_data->get_sky_light_diffuse_msaa(v), rb_data->get_sky_light_diffuse(v));
+							}
+						}
 					}
 				}
 
@@ -2638,13 +2704,13 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					uint32_t fallback_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
 					RID fallback_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(fallback_color_pass_flags) : color_framebuffer;
 
-					uint32_t fallback_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+					uint32_t fallback_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass, false, !is_reflection_probe);
 					_setup_atmosphere(fallback_pass_uniform_buffer_index, pass_context, p_render_data);
 					PackedFloat32Array height_fog_parameters = pass_context->get_height_fog_parameters();
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(fallback_pass_uniform_buffer_index, height_fog_parameters);
 					}
-					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, fallback_pass_uniform_buffer_index, true);
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, fallback_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
 
 					RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].element_info.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.size(), reverse_cull, PASS_MODE_COLOR, fallback_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 					// Fallback geometry skipped the G-buffer depth pass and must write its own depth.
@@ -2813,14 +2879,14 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 					RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
-					uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+					uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false, false, false, !is_reflection_probe);
 					_setup_atmosphere(transparent_pass_uniform_buffer_index, pass_context, p_render_data);
 					PackedFloat32Array height_fog_parameters = pass_context->get_height_fog_parameters();
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(transparent_pass_uniform_buffer_index, height_fog_parameters);
 					}
 
-					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
 
 					{
 						uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
@@ -2978,7 +3044,22 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					*history = CLAMP(p_exposure, 1e-12f, 1e12f);
 				}
 			},
-			[this](RID p_texture) { current_eye_adaptation_texture = p_texture; });
+			[this](RID p_texture) { current_eye_adaptation_texture = p_texture; },
+			[&]() {
+				float camera_exposure = 1.0f;
+				if (!current_eye_adaptation_enabled && p_render_data->camera_attributes.is_valid()) {
+					camera_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				}
+				if (!Math::is_finite(camera_exposure) || camera_exposure <= 0.0f) {
+					camera_exposure = 1.0f;
+				}
+				float luminance_multiplier = rb.is_valid() ? rb->get_luminance_multiplier() : 1.0f;
+				if (!Math::is_finite(luminance_multiplier) || luminance_multiplier <= 0.0f) {
+					luminance_multiplier = 1.0f;
+				}
+				const float normalization = camera_exposure / luminance_multiplier;
+				return Math::is_finite(normalization) && normalization > 0.0f ? normalization : 1.0f;
+			}());
 
 	if (explicit_pipeline) {
 		// Optional metadata preparation runs before lighting without adding a
@@ -3813,7 +3894,7 @@ void RenderFRPClustered::_update_render_base_uniform_set() {
 	}
 }
 
-RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader) {
+RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader, RID p_environment_radiance_texture) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -3841,6 +3922,17 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 		u.binding = 0;
 		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
 		u.append_id(scene_state.uniform_buffers[p_uniform_buffer_index]);
+		uniforms.push_back(u);
+	}
+	if (p_lighting_shader.is_null()) {
+		RID environment_radiance_texture = p_environment_radiance_texture;
+		if (!environment_radiance_texture.is_valid()) {
+			environment_radiance_texture = texture_storage->texture_rd_get_default(is_using_radiance_octmap_array() ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		RD::Uniform u;
+		u.binding = 8;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(environment_radiance_texture);
 		uniforms.push_back(u);
 	}
 	{
@@ -5270,6 +5362,10 @@ RenderFRPClustered::RenderFRPClustered() {
 		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR
 		modes.push_back(defines + "\n#define USE_MULTIVIEW\n"); // FRP_LIGHTING_MODE_MULTIVIEW
 		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW
+		modes.push_back(defines + "\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_SKY_LIGHT_DIFFUSE
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE
+		modes.push_back(defines + "\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE
 
 		frp_lighting.shader.initialize(modes);
 		frp_lighting.shader_version = frp_lighting.shader.version_create();

@@ -32,8 +32,11 @@ Magic GI 等插件效果使用独立数据路径。
 | 准备与 resolve | `precompute_shadows()`、`execute_virtual_texture_updates()`、`prepare_lighting()`、`merge_subsurface_and_specular()`、`resolve_opaque()`、`resolve_sky()`、`resolve_final()`、`copy_screen_and_depth()`、`copy_history()` |
 | 时域与后处理 | `temporal_aa_and_upscale()`、`prepare_bloom()`、`post_process()`、`tonemap()`、`tonemap_deferred()`、`present(texture)`、`post_process_and_tonemap()` |
 | 组合执行 | `run_pass(id)`、`stage_compositor_effects(type)` |
-| 曝光 | `get_pre_exposure(view)`、`set_next_pre_exposure(view, exposure)`、`request_next_pre_exposure(buffer, view, offset_bytes)`、`set_tonemap_exposure_texture(texture)` |
+| 曝光 | `get_pre_exposure(view)`、`get_scene_exposure_normalization()`、`set_next_pre_exposure(view, exposure)`、`request_next_pre_exposure(buffer, view, offset_bytes)`、`set_tonemap_exposure_texture(texture)` |
 | 雾与大气 | `set_height_fog_parameters(parameters)`、`get_height_fog_parameters()`、`set_atmosphere_parameters(parameters, light, secondary_light, optical_texture, multiple_texture)`、`get_atmosphere_parameters()` |
+| GI 输出 | `_frp_prepare(ctx)` 可调用 `request_sky_light_diffuse()`；在 `draw_deferred_lighting()` 后从 `ctx.get_render_scene_buffers().get_texture("frp_clustered", "sky_light_diffuse")` 读取本帧结果 |
+
+`get_scene_exposure_normalization()` 返回 FRP 当前帧的场景曝光归一化，不含 pre-exposure；FRP eye adaptation 接管曝光时使用 1，再除以 render buffer 的 luminance multiplier。SkyLight diffuse 仅在当前帧显式请求时分配或写入。输出是已经应用全局环境 diffuse、local reflection probe 覆盖权重、材质 AO/albedo/metallic 和 pre-exposure 的屏幕贡献；不含局部 probe、直接光、间接反射或 emission。没有 ready SkyLight 时该纹理为零，可供 GI 继续处理直接发光体和太阳光照。
 
 绘制原语调用与引擎原生 Pass 相同的 Operation。它们目前使用固定签名；逐 Pass 配置
 通过 `get_pass_parameters(key)` 读取。通用 `options` 字典、任意 render-list 提交和

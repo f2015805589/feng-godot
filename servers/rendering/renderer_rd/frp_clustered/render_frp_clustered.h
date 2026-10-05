@@ -57,6 +57,8 @@
 
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
+#define RB_TEX_SKY_LIGHT_DIFFUSE SNAME("sky_light_diffuse")
+#define RB_TEX_SKY_LIGHT_DIFFUSE_MSAA SNAME("sky_light_diffuse_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
@@ -138,6 +140,11 @@ public:
 		RID get_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR, p_layer, 0); }
 		RID get_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR_MSAA, p_layer, 0); }
 
+		void ensure_sky_light_diffuse();
+		RID get_sky_light_diffuse() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE); }
+		RID get_sky_light_diffuse(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE, p_layer, 0); }
+		RID get_sky_light_diffuse_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE_MSAA, p_layer, 0); }
+
 		void ensure_normal_roughness_texture();
 		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
 		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
@@ -204,7 +211,7 @@ private:
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
 	void _update_render_base_uniform_set();
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID());
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID());
 
 	struct BestFitNormal {
 		FrpBestFitNormalShaderRD shader;
@@ -230,6 +237,10 @@ private:
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR,
 		FRP_LIGHTING_MODE_MULTIVIEW,
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW,
+		FRP_LIGHTING_MODE_SKY_LIGHT_DIFFUSE,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE,
+		FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE,
 		FRP_LIGHTING_MODE_MAX
 	};
 
@@ -374,6 +385,10 @@ private:
 			uint32_t atmosphere_light_indices[2];
 			uint32_t atmosphere_pad;
 			float atmosphere_parameters[16][4];
+			uint32_t sky_lighting_enabled;
+			uint32_t sky_lighting_pad[3];
+			float sky_lighting_parameters[4]; // energy, exposure normalization, inverse pixel size, UV border size.
+			float sky_lighting_inverse_xform[12];
 		};
 
 		struct PushConstantUbershader {
@@ -502,7 +517,7 @@ private:
 
 	static RenderFRPClustered *singleton;
 
-	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
+	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false, bool p_isolate_environment_ibl = false);
 	void _setup_height_fog(uint32_t p_uniform_buffer_index, const PackedFloat32Array &p_parameters);
 	void _setup_atmosphere(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);

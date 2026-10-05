@@ -339,6 +339,12 @@ struct ImplementationData {
 	uint atmosphere_light_index1;
 	uint atmosphere_pad;
 	vec4 atmosphere_parameters[16];
+	uint sky_lighting_enabled;
+	uint sky_lighting_pad0;
+	uint sky_lighting_pad1;
+	uint sky_lighting_pad2;
+	vec4 sky_lighting_parameters; // energy, exposure normalization, inverse pixel size, UV border size.
+	mat3 sky_lighting_inverse_xform;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -390,6 +396,14 @@ layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 
 #ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 7) uniform texture2DArray lightmap_textures[MAX_LIGHTMAP_TEXTURES * 2];
+#endif
+
+#ifndef MODE_FRP_LIGHTING
+#ifdef USE_RADIANCE_OCTMAP_ARRAY
+layout(set = 1, binding = 8) uniform texture2DArray environment_radiance_octmap;
+#else
+layout(set = 1, binding = 8) uniform texture2D environment_radiance_octmap;
+#endif
 #endif
 
 layout(set = 1, binding = 9, std430) buffer restrict readonly ClusterBuffer {

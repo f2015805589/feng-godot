@@ -72,7 +72,7 @@ RID RenderSceneDataRD::create_uniform_buffer() {
 	return RD::get_singleton()->uniform_buffer_create(sizeof(UBODATA));
 }
 
-void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_sky_lighting_enabled, float p_sky_lighting_energy, const Basis &p_sky_lighting_rotation, float p_sky_lighting_exposure) {
+void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_sky_lighting_enabled, float p_sky_lighting_energy, const Basis &p_sky_lighting_rotation, float p_sky_lighting_exposure, bool p_frp_isolate_environment_ibl) {
 	RendererSceneRenderRD *render_scene_render = RendererSceneRenderRD::get_singleton();
 
 	UBODATA ubo_data;
@@ -169,43 +169,56 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 
 		float bg_energy_multiplier = render_scene_render->environment_get_bg_energy_multiplier(p_env);
 
-		ubo.ambient_light_color_energy[3] = bg_energy_multiplier;
-
-		ubo.ambient_color_sky_mix = render_scene_render->environment_get_ambient_sky_contribution(p_env);
-
-		//ambient
-		if (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && (env_bg == RSE::ENV_BG_CLEAR_COLOR || env_bg == RSE::ENV_BG_COLOR)) {
-			Color color = env_bg == RSE::ENV_BG_CLEAR_COLOR ? p_default_bg_color : render_scene_render->environment_get_bg_color(p_env);
-			color = color.srgb_to_linear();
-
-			ubo.ambient_light_color_energy[0] = color.r * bg_energy_multiplier;
-			ubo.ambient_light_color_energy[1] = color.g * bg_energy_multiplier;
-			ubo.ambient_light_color_energy[2] = color.b * bg_energy_multiplier;
+		if (p_frp_isolate_environment_ibl) {
+			// Keep the local ReflectionProbe traversal enabled, but do not use the
+			// Environment's ambient or reflection Sky as FRP's implicit global IBL.
 			ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT;
-		} else {
-			float energy = render_scene_render->environment_get_ambient_light_energy(p_env);
-			Color color = render_scene_render->environment_get_ambient_light(p_env);
-			color = color.srgb_to_linear();
-			ubo.ambient_light_color_energy[0] = color.r * energy;
-			ubo.ambient_light_color_energy[1] = color.g * energy;
-			ubo.ambient_light_color_energy[2] = color.b * energy;
+			ubo.ambient_light_color_energy[3] = 0.0f;
+			ubo.ambient_color_sky_mix = 0.0f;
 
-			bool use_ambient_cubemap = (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ambient_src == RSE::ENV_AMBIENT_SOURCE_SKY;
-			bool use_ambient_light = use_ambient_cubemap || ambient_src == RSE::ENV_AMBIENT_SOURCE_COLOR;
-			ubo.flags |= use_ambient_cubemap ? SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP : 0;
-			ubo.flags |= use_ambient_light ? SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT : 0;
-		}
-
-		//specular
-		RSE::EnvironmentReflectionSource ref_src = render_scene_render->environment_get_reflection_source(p_env);
-		if ((ref_src == RSE::ENV_REFLECTION_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ref_src == RSE::ENV_REFLECTION_SOURCE_SKY) {
-			ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
-		}
-
-		if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
+			// Sky/fog still use the Environment's radiance coordinates even though
+			// the Environment cubemap flags above are intentionally left clear.
 			Basis sky_transform = render_scene_render->environment_get_sky_orientation(p_env);
 			sky_transform = sky_transform.inverse() * cam_transform.basis;
 			RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
+		} else {
+			ubo.ambient_light_color_energy[3] = bg_energy_multiplier;
+			ubo.ambient_color_sky_mix = render_scene_render->environment_get_ambient_sky_contribution(p_env);
+
+			//ambient
+			if (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && (env_bg == RSE::ENV_BG_CLEAR_COLOR || env_bg == RSE::ENV_BG_COLOR)) {
+				Color color = env_bg == RSE::ENV_BG_CLEAR_COLOR ? p_default_bg_color : render_scene_render->environment_get_bg_color(p_env);
+				color = color.srgb_to_linear();
+
+				ubo.ambient_light_color_energy[0] = color.r * bg_energy_multiplier;
+				ubo.ambient_light_color_energy[1] = color.g * bg_energy_multiplier;
+				ubo.ambient_light_color_energy[2] = color.b * bg_energy_multiplier;
+				ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT;
+			} else {
+				float energy = render_scene_render->environment_get_ambient_light_energy(p_env);
+				Color color = render_scene_render->environment_get_ambient_light(p_env);
+				color = color.srgb_to_linear();
+				ubo.ambient_light_color_energy[0] = color.r * energy;
+				ubo.ambient_light_color_energy[1] = color.g * energy;
+				ubo.ambient_light_color_energy[2] = color.b * energy;
+
+				bool use_ambient_cubemap = (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ambient_src == RSE::ENV_AMBIENT_SOURCE_SKY;
+				bool use_ambient_light = use_ambient_cubemap || ambient_src == RSE::ENV_AMBIENT_SOURCE_COLOR;
+				ubo.flags |= use_ambient_cubemap ? SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP : 0;
+				ubo.flags |= use_ambient_light ? SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT : 0;
+			}
+
+			//specular
+			RSE::EnvironmentReflectionSource ref_src = render_scene_render->environment_get_reflection_source(p_env);
+			if ((ref_src == RSE::ENV_REFLECTION_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ref_src == RSE::ENV_REFLECTION_SOURCE_SKY) {
+				ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
+			}
+
+			if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
+				Basis sky_transform = render_scene_render->environment_get_sky_orientation(p_env);
+				sky_transform = sky_transform.inverse() * cam_transform.basis;
+				RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
+			}
 		}
 
 		ubo.flags |= render_scene_render->environment_get_fog_enabled(p_env) ? SCENE_DATA_FLAGS_USE_FOG : 0;
@@ -227,7 +240,10 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 
 		ubo.fog_sun_scatter = render_scene_render->environment_get_fog_sun_scatter(p_env);
 	} else {
-		if (!(p_reflection_probe_instance.is_valid() && RendererRD::LightStorage::get_singleton()->reflection_probe_is_interior(p_reflection_probe_instance))) {
+		if (p_frp_isolate_environment_ibl) {
+			// Keep local probe processing available while leaving the global base ambient black.
+			ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT;
+		} else if (!(p_reflection_probe_instance.is_valid() && RendererRD::LightStorage::get_singleton()->reflection_probe_is_interior(p_reflection_probe_instance))) {
 			ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT;
 			Color clear_color = p_default_bg_color;
 			clear_color = clear_color.srgb_to_linear();
@@ -246,10 +262,15 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		ubo.ambient_light_color_energy[0] = 0.0f;
 		ubo.ambient_light_color_energy[1] = 0.0f;
 		ubo.ambient_light_color_energy[2] = 0.0f;
-		ubo.ambient_light_color_energy[3] = p_sky_lighting_energy;
-		ubo.ambient_color_sky_mix = 1.0f;
-		Basis sky_transform = p_sky_lighting_rotation.inverse() * cam_transform.basis;
-		RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
+		if (p_frp_isolate_environment_ibl) {
+			ubo.ambient_light_color_energy[3] = 0.0f;
+			ubo.ambient_color_sky_mix = 0.0f;
+		} else {
+			ubo.ambient_light_color_energy[3] = p_sky_lighting_energy;
+			ubo.ambient_color_sky_mix = 1.0f;
+			Basis sky_transform = p_sky_lighting_rotation.inverse() * cam_transform.basis;
+			RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
+		}
 	}
 
 	if (p_camera_attributes.is_valid()) {
@@ -273,7 +294,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		ubo.emissive_exposure_normalization = 1.0;
 		ubo.IBL_exposure_normalization = 1.0;
 	}
-	if (p_sky_lighting_enabled && p_debug_mode != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+	if (p_sky_lighting_enabled && p_debug_mode != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED && !p_frp_isolate_environment_ibl) {
 		const float camera_exposure = p_camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) : 1.0f;
 		const float current_exposure = Math::is_finite(camera_exposure) && camera_exposure > 0.0f ? camera_exposure : 1.0f;
 		const float captured_exposure = Math::is_finite(p_sky_lighting_exposure) && p_sky_lighting_exposure > 0.0f ? p_sky_lighting_exposure : 1.0f;

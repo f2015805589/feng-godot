@@ -126,6 +126,14 @@ layout(location = 0) out vec4 frag_color;
 layout(location = 1) out vec4 specular_color;
 #endif
 
+#ifdef MODE_SKY_LIGHT_DIFFUSE
+#ifdef MODE_SEPARATE_SPECULAR
+layout(location = 2) out vec4 sky_light_diffuse_color;
+#else
+layout(location = 1) out vec4 sky_light_diffuse_color;
+#endif
+#endif
+
 // Per-pixel BxDF state selected from ORM alpha. The shared clustered traversal
 // calls frp_light_compute() for directional, omni and spot lights.
 uint frp_active_shading_model_id;
@@ -222,6 +230,15 @@ void main() {
 	vec3 indirect_specular_light = vec3(0.0, 0.0, 0.0);
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
+	vec3 global_sky_light_diffuse = vec3(0.0);
+#if !defined(MODE_RENDER_DEPTH)
+	bool use_frp_sky_lighting = implementation_data.sky_lighting_enabled != 0u;
+	mat3 frp_radiance_inverse_xform = use_frp_sky_lighting ? implementation_data.sky_lighting_inverse_xform : scene_data.radiance_inverse_xform;
+	float frp_radiance_pixel_size = use_frp_sky_lighting ? implementation_data.sky_lighting_parameters.z : scene_data_block.data.radiance_pixel_size;
+	float frp_radiance_border_size = use_frp_sky_lighting ? implementation_data.sky_lighting_parameters.w : scene_data_block.data.radiance_border_size;
+	float frp_ibl_exposure_normalization = use_frp_sky_lighting ? implementation_data.sky_lighting_parameters.y : scene_data.IBL_exposure_normalization;
+	float frp_ibl_energy = use_frp_sky_lighting ? implementation_data.sky_lighting_parameters.x : scene_data.ambient_light_color_energy.a;
+#endif
 
 	// Indirect lighting: ambient light and the reflection probes that the cluster
 	// light list carries. FRP has no GI or screen space effect buffers to blend in.
@@ -233,39 +250,43 @@ void main() {
 			ref_vec = mix(ref_vec, normal, roughness * roughness);
 
 			float horizon = min(1.0 + dot(ref_vec, normal), 1.0);
-			ref_vec = scene_data.radiance_inverse_xform * ref_vec;
+			ref_vec = frp_radiance_inverse_xform * ref_vec;
 
 			float roughness_lod = sqrt(roughness) * MAX_ROUGHNESS_LOD;
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 			float array_roughness_lod, blend;
 			blend = modf(sqrt(roughness) * MAX_ROUGHNESS_LOD, array_roughness_lod);
-			float ref_lod = vec3_to_oct_lod(dFdx(ref_vec), dFdy(ref_vec), scene_data_block.data.radiance_pixel_size);
-			vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+			float ref_lod = vec3_to_oct_lod(dFdx(ref_vec), dFdy(ref_vec), frp_radiance_pixel_size);
+			vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(frp_radiance_border_size, 1.0 - frp_radiance_border_size * 2.0));
 			vec3 indirect_sample_a = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, array_roughness_lod), ref_lod).rgb;
 			vec3 indirect_sample_b = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, array_roughness_lod + 1.0), ref_lod).rgb;
 			indirect_specular_light = mix(indirect_sample_a, indirect_sample_b, blend);
 #else
-			vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+			vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(frp_radiance_border_size, 1.0 - frp_radiance_border_size * 2.0));
 			indirect_specular_light = textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, roughness_lod).rgb;
 #endif
 
-			indirect_specular_light *= scene_data.IBL_exposure_normalization;
+			indirect_specular_light *= frp_ibl_exposure_normalization;
 			indirect_specular_light *= horizon * horizon;
-			indirect_specular_light *= scene_data.ambient_light_color_energy.a;
+			indirect_specular_light *= frp_ibl_energy;
 		}
 
 		if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP)) {
-			vec3 ambient_dir = scene_data.radiance_inverse_xform * normal;
+			vec3 ambient_dir = frp_radiance_inverse_xform * normal;
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
-			float ambient_lod = vec3_to_oct_lod(dFdx(ambient_dir), dFdy(ambient_dir), scene_data_block.data.radiance_pixel_size);
-			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+			float ambient_lod = vec3_to_oct_lod(dFdx(ambient_dir), dFdy(ambient_dir), frp_radiance_pixel_size);
+			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(frp_radiance_border_size, 1.0 - frp_radiance_border_size * 2.0));
 			vec3 cubemap_ambient = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ambient_uv, MAX_ROUGHNESS_LOD), ambient_lod).rgb;
 #else
-			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(frp_radiance_border_size, 1.0 - frp_radiance_border_size * 2.0));
 			vec3 cubemap_ambient = textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ambient_uv, MAX_ROUGHNESS_LOD).rgb;
 #endif
-			cubemap_ambient *= scene_data.IBL_exposure_normalization;
-			ambient_light = mix(ambient_light, cubemap_ambient * scene_data.ambient_light_color_energy.a, scene_data.ambient_color_sky_mix);
+			if (use_frp_sky_lighting) {
+				ambient_light = cubemap_ambient * frp_ibl_exposure_normalization * frp_ibl_energy;
+			} else {
+				cubemap_ambient *= frp_ibl_exposure_normalization;
+				ambient_light = mix(ambient_light, cubemap_ambient * frp_ibl_energy, scene_data.ambient_color_sky_mix);
+			}
 		}
 
 		// Reflection probes.
@@ -314,6 +335,10 @@ void main() {
 			if (ambient_accum.a < 1.0) {
 				ambient_accum.rgb = ambient_light * (1.0 - ambient_accum.a) + ambient_accum.rgb;
 			}
+			// Publish only the provider contribution left after local probe coverage.
+			if (use_frp_sky_lighting && frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+				global_sky_light_diffuse = ambient_light * (1.0 - ambient_accum.a);
+			}
 
 			if (reflection_accum.a < 1.0) {
 				reflection_accum.rgb = indirect_specular_light * (1.0 - reflection_accum.a) + reflection_accum.rgb;
@@ -329,6 +354,8 @@ void main() {
 		// Finalize ambient.
 		ambient_light *= ao;
 		ambient_light *= albedo.rgb;
+		global_sky_light_diffuse *= ao;
+		global_sky_light_diffuse *= albedo.rgb;
 
 		// Apply energy compensation and DFG to the indirect specular. The BxDF
 		// constructor computes the same DFG sample for energy compensation, but it
@@ -654,7 +681,9 @@ void main() {
 	direct_specular_light *= direct_ao;
 	diffuse_light *= 1.0 - metallic;
 	ambient_light *= 1.0 - metallic;
+	global_sky_light_diffuse *= 1.0 - metallic;
 	ambient_light *= implementation_data.pre_exposure;
+	global_sky_light_diffuse *= implementation_data.pre_exposure;
 	indirect_specular_light *= implementation_data.pre_exposure;
 
 	vec3 color = frp_compose_bxdf(shading_model_id, brdf, ambient_light, diffuse_light, direct_specular_light, indirect_specular_light);
@@ -664,5 +693,9 @@ void main() {
 	specular_color = vec4(direct_specular_light + indirect_specular_light, metallic);
 #else
 	frag_color = vec4(color, alpha);
+#endif
+
+#ifdef MODE_SKY_LIGHT_DIFFUSE
+	sky_light_diffuse_color = vec4(global_sky_light_diffuse, 0.0);
 #endif
 }
