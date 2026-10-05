@@ -169,7 +169,9 @@ The component takes an initial capture when it becomes the selected provider.
 With **Realtime Capture** off, press **Capture Now** to refresh it manually.
 When enabled, **Capture Interval** schedules periodic refreshes; the renderer
 captures faces over multiple frames, so the interval is not a promise that a
-whole six-face update completes in one frame. A completed capture remains
+whole six-face update completes in one frame. Requests that arrive during a
+capture coalesce into at most one follow-up, which starts after the current
+capture completes; they do not cancel its faces. A completed capture remains
 available while its replacement is being built. The capture probe is internal
 and capture-only: it does not add a local reflection probe or capture its own
 previous SkyLight output. **Capture Shadows** is on by default; turning it off

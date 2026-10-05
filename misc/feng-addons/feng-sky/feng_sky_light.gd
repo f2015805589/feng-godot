@@ -129,6 +129,9 @@ var _capture_environment_dirty := true
 var _capture_environment_snapshot_pending := true
 var _capture_native_config_dirty := true
 var _capture_request_pending := true
+var _capture_in_flight := false
+var _capture_submitted_revision := -1
+var _capture_snapshot_after_inflight := false
 var _capture_native_signature: Array = []
 var _provider_active := false
 var _external_radiance_enabled := false
@@ -187,6 +190,7 @@ func _process(_delta: float) -> void:
 	var current_world_id := _world_id()
 	if current_world_id != _current_world_id:
 		_current_world_id = current_world_id
+		_reset_capture_in_flight()
 		_capture_environment_dirty = true
 		_capture_native_config_dirty = true
 		_capture_request_pending = source_mode == SourceMode.CAPTURED_SCENE
@@ -212,9 +216,9 @@ func _process(_delta: float) -> void:
 		_sync_frp_sources()
 	if source_mode == SourceMode.CAPTURED_SCENE and realtime_capture \
 			and now >= _next_capture_msec:
-		_capture_request_pending = true
-		_capture_environment_snapshot_pending = true
-		_sync_active_source()
+		if not _capture_in_flight or not _capture_snapshot_after_inflight:
+			_queue_scene_capture()
+			_sync_active_source()
 	if now >= _next_radiance_poll_msec:
 		_next_radiance_poll_msec = now + NATIVE_POLL_MSEC
 		_poll_external_radiance()
@@ -229,8 +233,7 @@ func _process(_delta: float) -> void:
 
 func recapture() -> void:
 	if source_mode == SourceMode.CAPTURED_SCENE:
-		_capture_request_pending = true
-		_capture_environment_snapshot_pending = true
+		_queue_scene_capture()
 		if _provider_active:
 			_sync_active_source()
 	elif source_mode == SourceMode.SPECIFIED_CUBEMAP:
@@ -253,6 +256,9 @@ func _refresh_provider() -> void:
 
 func _mark_capture_dirty(request_capture: bool = true,
 		native_configuration: bool = true, environment_changed: bool = false) -> void:
+	if native_configuration or environment_changed \
+			or (request_capture and source_mode == SourceMode.CAPTURED_SCENE):
+		_reset_capture_in_flight()
 	if environment_changed:
 		_capture_environment_dirty = true
 	if native_configuration:
@@ -276,6 +282,7 @@ func _feng_sky_light_set_active(active: bool) -> void:
 		return
 	_provider_active = active
 	if active:
+		_reset_capture_in_flight()
 		_capture_environment_dirty = true
 		_capture_native_config_dirty = true
 		_capture_request_pending = source_mode == SourceMode.CAPTURED_SCENE
@@ -362,6 +369,11 @@ func _sync_active_source() -> void:
 		return
 	if not NativeAdapter.supports_scene_capture():
 		return
+	# A submitted capture owns its Environment snapshot and output Sky until the
+	# renderer publishes a newer complete radiance revision. Requests arriving
+	# meanwhile are merged into one follow-up request.
+	if _capture_in_flight:
+		return
 	if _capture_request_pending:
 		var refresh_environment := _capture_environment_snapshot_pending \
 				or _capture_environment_dirty or _capture_environment == null
@@ -387,8 +399,14 @@ func _sync_active_source() -> void:
 		_capture_native_config_dirty = false
 	if _capture_request_pending:
 		_update_probe_position()
+		var revision_before_capture := NativeAdapter.external_radiance_revision(_output_sky)
+		if revision_before_capture < 0:
+			return
 		if NativeAdapter.request_capture(_capture_probe):
 			_capture_request_pending = false
+			_capture_in_flight = true
+			_capture_submitted_revision = revision_before_capture
+			_capture_snapshot_after_inflight = false
 			_next_capture_msec = Time.get_ticks_msec() + int(capture_interval * 1000.0)
 
 
@@ -481,6 +499,7 @@ func _ensure_capture_probe() -> void:
 
 
 func _remove_capture_probe() -> void:
+	_reset_capture_in_flight()
 	if _capture_probe == null:
 		return
 	if is_instance_valid(_capture_probe):
@@ -506,6 +525,31 @@ func _force_cubemap_refresh() -> void:
 		_sync_frp_sources()
 
 
+func _queue_scene_capture() -> void:
+	_capture_request_pending = true
+	if _capture_in_flight:
+		_capture_snapshot_after_inflight = true
+	else:
+		_capture_environment_snapshot_pending = true
+
+
+func _reset_capture_in_flight() -> void:
+	_capture_in_flight = false
+	_capture_submitted_revision = -1
+	_capture_snapshot_after_inflight = false
+
+
+func _complete_inflight_capture(now_msec: int) -> void:
+	if not _capture_in_flight:
+		return
+	_capture_in_flight = false
+	_capture_submitted_revision = -1
+	_next_capture_msec = now_msec + int(capture_interval * 1000.0)
+	if _capture_request_pending and _capture_snapshot_after_inflight:
+		_capture_environment_snapshot_pending = true
+	_capture_snapshot_after_inflight = false
+
+
 func _poll_external_radiance() -> void:
 	if not _provider_active or _output_sky == null:
 		return
@@ -516,6 +560,8 @@ func _poll_external_radiance() -> void:
 	var revision := NativeAdapter.external_radiance_revision(_output_sky)
 	if revision < 0:
 		return
+	if _capture_in_flight and revision > _capture_submitted_revision:
+		_complete_inflight_capture(Time.get_ticks_msec())
 	var exposure := NativeAdapter.external_radiance_exposure(_output_sky)
 	_native_radiance_ready = true
 	_native_radiance_revision = revision
