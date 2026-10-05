@@ -1794,6 +1794,9 @@ void SkyRD::sky_external_radiance_begin_from_cubemap(RID p_sky, RID p_source_cub
 	RendererRD::CopyEffects *copy_effects = RendererRD::CopyEffects::get_singleton();
 	ERR_FAIL_NULL(copy_effects);
 	copy_effects->copy_cubemap_to_octmap(p_source_cubemap, sky->pending_reflection.layers[0].mipmaps[0].framebuffer, sky->pending_reflection.uv_border_size);
+	if (sky_use_octmap_array) {
+		sky->pending_reflection.update_reflection_mipmaps(0, 1);
+	}
 }
 
 bool SkyRD::sky_external_radiance_postprocess_step(RID p_sky) {
