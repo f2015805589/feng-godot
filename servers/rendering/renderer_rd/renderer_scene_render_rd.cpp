@@ -33,6 +33,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/image.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
+#include "servers/rendering/renderer_rd/frp_clustered/frp_pass_context.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/shaders/decal_data_inc.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/light_data_inc.glsl.gen.h"
@@ -73,6 +74,40 @@ void RendererSceneRenderRD::sky_set_mode(RID p_sky, RSE::SkyMode p_mode) {
 
 void RendererSceneRenderRD::sky_set_material(RID p_sky, RID p_material) {
 	sky.sky_set_material(p_sky, p_material);
+}
+
+void RendererSceneRenderRD::sky_set_external_radiance(RID p_sky, bool p_enabled) {
+	sky.sky_set_external_radiance(p_sky, p_enabled);
+}
+
+void RendererSceneRenderRD::sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap, float p_captured_exposure) {
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	ERR_FAIL_NULL(texture_storage);
+	// This is equivalent to source_color sampling: textures with an sRGB view
+	// decode once, while float/HDR formats simply return their linear RD texture.
+	RID cubemap_rd_texture = texture_storage->texture_get_rd_texture(p_cubemap, true);
+	ERR_FAIL_COND(cubemap_rd_texture.is_null());
+	sky.sky_set_external_radiance_cubemap(p_sky, cubemap_rd_texture, p_captured_exposure);
+}
+
+bool RendererSceneRenderRD::sky_is_external_radiance_ready(RID p_sky) const {
+	return sky.sky_is_external_radiance_ready(p_sky);
+}
+
+uint64_t RendererSceneRenderRD::sky_get_external_radiance_revision(RID p_sky) const {
+	return sky.sky_get_external_radiance_revision(p_sky);
+}
+
+float RendererSceneRenderRD::sky_get_external_radiance_exposure(RID p_sky) const {
+	return sky.sky_get_external_radiance_exposure(p_sky);
+}
+
+void RendererSceneRenderRD::frp_set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_source_revision) {
+	FRPPassContext::set_sky_lighting_source(p_render_target, p_owner_id, p_sky, p_energy, p_rotation, p_captured_exposure, p_source_revision);
+}
+
+void RendererSceneRenderRD::frp_clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id) {
+	FRPPassContext::clear_sky_lighting_source(p_render_target, p_owner_id);
 }
 
 Ref<Image> RendererSceneRenderRD::sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) {
@@ -1971,6 +2006,7 @@ void RendererSceneRenderRD::init() {
 }
 
 RendererSceneRenderRD::~RendererSceneRenderRD() {
+	FRPPassContext::clear_all_sky_lighting_sources();
 	if (forward_id_storage) {
 		memdelete(forward_id_storage);
 	}

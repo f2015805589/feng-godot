@@ -3507,6 +3507,45 @@
 				Sets the render reflection mask for this reflection probe. Only instances with a matching layer will have reflections applied from this probe. Equivalent to [member ReflectionProbe.reflection_mask].
 			</description>
 		</method>
+		<method name="reflection_probe_set_capture_environment">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="environment" type="RID" />
+			<description>
+				Sets a private environment used when capturing a capture-only reflection probe. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
+		<method name="reflection_probe_set_capture_only">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="capture_only" type="bool" />
+			<description>
+				Configures the probe to capture scene radiance for an external consumer instead of contributing a local reflection. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
+		<method name="reflection_probe_set_capture_output_sky">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="sky" type="RID" />
+			<description>
+				Sets the [Sky] that receives the completed scene capture. Passing an invalid RID detaches the current output. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
+		<method name="reflection_probe_set_capture_resolution">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="resolution" type="int" />
+			<description>
+				Sets the cubemap face resolution used by a capture-only probe. The value must be a power of two between 32 and 2048. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
+		<method name="reflection_probe_request_capture">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<description>
+				Requests a new capture from a capture-only probe. The previous complete output remains available while the new capture is processed. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
 		<method name="reflection_probe_set_resolution" deprecated="This method has not done anything since Godot 3.">
 			<return type="void" />
 			<param index="0" name="probe" type="RID" />
@@ -3754,9 +3793,68 @@
 			<param index="2" name="bake_irradiance" type="bool" />
 			<param index="3" name="size" type="Vector2i" />
 			<description>
-				Generates and returns an [Image] containing the radiance map for the specified [param sky] RID. This supports built-in sky material and custom sky shaders. If [param bake_irradiance] is [code]true[/code], the irradiance map is saved instead of the radiance map. The radiance map is used to render reflected light, while the irradiance map is used to render ambient light. See also [method environment_bake_panorama].
+				Generates and returns an [Image] containing the radiance map for the specified [param sky] RID. This supports built-in sky material, custom sky shaders, and ready external radiance sources. If [param bake_irradiance] is [code]true[/code], the irradiance map is saved instead of the radiance map. The radiance map is used to render reflected light, while the irradiance map is used to render ambient light. See also [method environment_bake_panorama].
 				[b]Note:[/b] The image is saved using linear encoding without any tonemapping performed, which means it will look too dark if viewed directly in an image editor. [param energy] values above [code]1.0[/code] can be used to brighten the resulting image.
 				[b]Note:[/b] [param size] should be a 2:1 aspect ratio for the generated panorama to have square pixels. For radiance maps, there is no point in using a height greater than [member Sky.radiance_size], as it won't increase detail. Irradiance maps only contain low-frequency data, so there is usually no point in going past a size of 128×64 pixels when saving an irradiance map.
+			</description>
+		</method>
+		<method name="sky_get_external_radiance_exposure" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="sky" type="RID" />
+			<description>
+				Returns the exposure normalization used by the last complete external radiance capture.
+			</description>
+		</method>
+		<method name="sky_get_external_radiance_revision" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="sky" type="RID" />
+			<description>
+				Returns the revision number of the last complete external radiance capture.
+			</description>
+		</method>
+		<method name="sky_is_external_radiance_ready" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="sky" type="RID" />
+			<description>
+				Returns [code]true[/code] if the sky has a complete external radiance source ready for sampling.
+			</description>
+		</method>
+		<method name="sky_set_external_radiance">
+			<return type="void" />
+			<param index="0" name="sky" type="RID" />
+			<param index="1" name="enabled" type="bool" />
+			<description>
+				Enables or disables externally supplied radiance for the sky. The RenderingDevice renderer filters external sources into the same radiance layout used by regular skies.
+			</description>
+		</method>
+		<method name="sky_set_external_radiance_cubemap">
+			<return type="void" />
+			<param index="0" name="sky" type="RID" />
+			<param index="1" name="cubemap" type="RID" />
+			<param index="2" name="captured_exposure" type="float" />
+			<description>
+				Sets a cubemap as the sky's external radiance source and filters it into the sky's native octahedral layout. The cubemap must be HDR or a texture with an sRGB sampling view. The [param captured_exposure] is stored with the completed result so it can be normalized for the current camera.
+			</description>
+		</method>
+		<method name="frp_clear_sky_lighting_source">
+			<return type="void" />
+			<param index="0" name="render_target" type="RID" />
+			<param index="1" name="owner_id" type="int" />
+			<description>
+				Clears the FRP sky-lighting source registered by [param owner_id] for the specified render target. A different owner cannot clear the registration.
+			</description>
+		</method>
+		<method name="frp_set_sky_lighting_source">
+			<return type="void" />
+			<param index="0" name="render_target" type="RID" />
+			<param index="1" name="owner_id" type="int" />
+			<param index="2" name="sky" type="RID" />
+			<param index="3" name="energy" type="float" />
+			<param index="4" name="rotation" type="Basis" />
+			<param index="5" name="captured_exposure" type="float" />
+			<param index="6" name="source_revision" type="int" />
+			<description>
+				Registers a sky as the FRP ambient and reflection radiance source for a render target. Registration is scoped to the target and protected by an owner ID. The source must be ready before it is sampled.
 			</description>
 		</method>
 		<method name="sky_create">

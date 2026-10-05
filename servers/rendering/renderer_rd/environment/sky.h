@@ -258,6 +258,19 @@ public:
 		RID material;
 		RID uniform_buffer;
 
+		// External radiance used by FengSkyLight. Captures are filtered into a
+		// second native Sky layout and swapped only after every roughness level is ready.
+		RID pending_radiance;
+		ReflectionData pending_reflection;
+		bool external_radiance = false;
+		bool external_radiance_ready = false;
+		bool external_capture_pending = false;
+		uint64_t external_radiance_revision = 0;
+		uint64_t pending_radiance_revision = 0;
+		float external_radiance_exposure = 1.0f;
+		float pending_radiance_exposure = 1.0f;
+		int pending_processing_layer = 1;
+
 		int radiance_size = REAL_TIME_SIZE;
 		float uv_border_size = 0.0; // Border size in UV space.
 
@@ -310,6 +323,9 @@ public:
 
 	void invalidate_sky(Sky *p_sky);
 	void update_dirty_skys();
+	void _create_external_radiance_storage(Sky *p_sky, RID &r_radiance, ReflectionData &r_reflection);
+	void _begin_external_radiance_update(Sky *p_sky, float p_captured_exposure, uint64_t p_revision);
+	void _commit_external_radiance_update(Sky *p_sky);
 
 	RID sky_get_material(RID p_sky) const;
 	RID sky_get_radiance_texture_rd(RID p_sky) const;
@@ -323,6 +339,13 @@ public:
 	int sky_get_radiance_size(RID p_sky) const;
 	void sky_set_mode(RID p_sky, RSE::SkyMode p_mode);
 	void sky_set_material(RID p_sky, RID p_material);
+	void sky_set_external_radiance(RID p_sky, bool p_enabled);
+	void sky_external_radiance_begin_from_cubemap(RID p_sky, RID p_source_cubemap, float p_captured_exposure, uint64_t p_revision);
+	bool sky_external_radiance_postprocess_step(RID p_sky);
+	void sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap_rd_texture, float p_captured_exposure);
+	bool sky_is_external_radiance_ready(RID p_sky) const;
+	uint64_t sky_get_external_radiance_revision(RID p_sky) const;
+	float sky_get_external_radiance_exposure(RID p_sky) const;
 	Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size);
 	float sky_get_uv_border_size(RID p_sky);
 };

@@ -119,6 +119,17 @@ public:
 
 	virtual void reflection_probe_set_update_mode(RID p_probe, RSE::ReflectionProbeUpdateMode p_mode) = 0;
 	virtual void reflection_probe_set_resolution(RID p_probe, int p_resolution) = 0;
+	virtual void reflection_probe_set_capture_environment(RID p_probe, RID p_environment) = 0;
+	virtual void reflection_probe_set_capture_only(RID p_probe, bool p_capture_only) = 0;
+	virtual void reflection_probe_set_capture_output_sky(RID p_probe, RID p_sky) = 0;
+	virtual void reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) = 0;
+	virtual void reflection_probe_set_capture_camera_exposure(RID p_probe, float p_exposure) = 0;
+	virtual RID reflection_probe_get_capture_camera_attributes(RID p_probe) const = 0;
+	virtual void reflection_probe_request_capture(RID p_probe) = 0;
+	virtual RID reflection_probe_get_capture_environment(RID p_probe) const = 0;
+	virtual bool reflection_probe_is_capture_only(RID p_probe) const = 0;
+	virtual RID reflection_probe_get_capture_output_sky(RID p_probe) const = 0;
+	virtual int reflection_probe_get_capture_resolution(RID p_probe) const = 0;
 	virtual void reflection_probe_set_intensity(RID p_probe, float p_intensity) = 0;
 	virtual void reflection_probe_set_blend_distance(RID p_probe, float p_blend_distance) = 0;
 	virtual void reflection_probe_set_ambient_mode(RID p_probe, RSE::ReflectionProbeAmbientMode p_mode) = 0;
@@ -159,6 +170,11 @@ public:
 	virtual bool reflection_probe_has_atlas_index(RID p_instance) = 0;
 	virtual void reflection_probe_release_atlas_index(RID p_instance) = 0;
 	virtual bool reflection_probe_instance_needs_redraw(RID p_instance) = 0;
+	virtual RID reflection_probe_instance_get_capture_atlas(RID p_instance, RID p_fallback_atlas) = 0;
+	virtual void reflection_probe_instance_cancel_capture(RID p_instance) = 0;
+	virtual RID reflection_probe_instance_get_capture_output_sky(RID p_instance) const = 0;
+	virtual void reflection_probe_instance_set_capture_environment(RID p_instance, RID p_environment) = 0;
+	virtual RID reflection_probe_instance_get_capture_environment(RID p_instance) const = 0;
 	virtual bool reflection_probe_instance_has_reflection(RID p_instance) = 0;
 	virtual bool reflection_probe_instance_begin_render(RID p_instance, RID p_reflection_atlas) = 0;
 	virtual bool reflection_probe_instance_end_render(RID p_instance, RID p_reflection_atlas) = 0;

@@ -122,7 +122,14 @@ public:
 	void sky_set_radiance_size(RID p_sky, int p_radiance_size) override {}
 	void sky_set_mode(RID p_sky, RSE::SkyMode p_samples) override {}
 	void sky_set_material(RID p_sky, RID p_material) override {}
+	void sky_set_external_radiance(RID p_sky, bool p_enabled) override {}
+	void sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap, float p_captured_exposure) override {}
+	bool sky_is_external_radiance_ready(RID p_sky) const override { return false; }
+	uint64_t sky_get_external_radiance_revision(RID p_sky) const override { return 0; }
+	float sky_get_external_radiance_exposure(RID p_sky) const override { return 1.0; }
 	Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) override { return Ref<Image>(); }
+	void frp_set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_source_revision) override {}
+	void frp_clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id) override {}
 
 	/* ENVIRONMENT API */
 

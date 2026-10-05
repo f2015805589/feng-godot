@@ -1191,7 +1191,14 @@ public:
 	PASS2(sky_set_radiance_size, RID, int)
 	PASS2(sky_set_mode, RID, RSE::SkyMode)
 	PASS2(sky_set_material, RID, RID)
+	PASS2(sky_set_external_radiance, RID, bool)
+	PASS3(sky_set_external_radiance_cubemap, RID, RID, float)
+	PASS1RC(bool, sky_is_external_radiance_ready, RID)
+	PASS1RC(uint64_t, sky_get_external_radiance_revision, RID)
+	PASS1RC(float, sky_get_external_radiance_exposure, RID)
 	PASS4R(Ref<Image>, sky_bake_panorama, RID, float, bool, const Size2i &)
+	PASS7(frp_set_sky_lighting_source, RID, uint64_t, RID, float, const Basis &, float, uint64_t)
+	PASS2(frp_clear_sky_lighting_source, RID, uint64_t)
 
 	// Compositor effect
 

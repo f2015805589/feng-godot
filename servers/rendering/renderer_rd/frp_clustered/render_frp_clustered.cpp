@@ -56,6 +56,24 @@ using namespace RendererSceneRenderImplementation;
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
 
+static bool _frp_get_ready_sky_lighting_source(const RenderDataRD *p_render_data, RendererRD::SkyRD &p_sky, FRPPassContext::SkyLightingSource &r_source) {
+	if (p_render_data == nullptr || p_render_data->reflection_probe.is_valid() || !p_render_data->render_buffers.is_valid()) {
+		return false;
+	}
+	const RID render_target = p_render_data->render_buffers->get_render_target();
+	if (render_target.is_null() || !FRPPassContext::get_sky_lighting_source(render_target, r_source)) {
+		return false;
+	}
+	if (r_source.sky.is_null() || !p_sky.get_sky(r_source.sky) || !p_sky.sky_is_external_radiance_ready(r_source.sky)) {
+		return false;
+	}
+	// Recaptures keep the previous complete Sky radiance active until the next
+	// filtered revision is committed. Read that active buffer's exposure here;
+	// the registry revision is only a source/cache token, not a readiness gate.
+	r_source.captured_exposure = p_sky.sky_get_external_radiance_exposure(r_source.sky);
+	return true;
+}
+
 // A pass label is only emitted by RenderingDeviceGraph when at least one graph
 // command belongs to it.  Keep configured FRP passes visible in captures even
 // when their actual operation has no work this frame.  This callback is
@@ -814,8 +832,14 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 	}
 
 	float luminance_multiplier = rd.is_valid() ? rd->get_luminance_multiplier() : 1.0;
+	FRPPassContext::SkyLightingSource sky_lighting_source;
+	const bool use_sky_lighting_source = _frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source);
+	if (use_sky_lighting_source) {
+		p_render_data->scene_data->radiance_pixel_size = 1.0f / MAX(1, sky.sky_get_radiance_size(sky_lighting_source.sky));
+		p_render_data->scene_data->radiance_border_size = sky.sky_get_uv_border_size(sky_lighting_source.sky);
+	}
 
-	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, current_eye_adaptation_enabled ? RID() : p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier);
+	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers[uniform_buffer_index], get_debug_draw_mode(), env, reflection_probe_instance, current_eye_adaptation_enabled ? RID() : p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, p_apply_alpha_multiplier, use_sky_lighting_source, sky_lighting_source.energy, sky_lighting_source.rotation, sky_lighting_source.captured_exposure);
 
 	// now do implementation UBO
 
@@ -2229,6 +2253,13 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 	} else {
 		clear_color = p_default_bg_color;
+	}
+
+	// The environment's Sky remains the visible background and fog source. The
+	// selected FengSkyLight only replaces the radiance sampled by FRP materials.
+	FRPPassContext::SkyLightingSource sky_lighting_source;
+	if (_frp_get_ready_sky_lighting_source(p_render_data, sky, sky_lighting_source)) {
+		radiance_texture = sky.sky_get_radiance_texture_rd(sky_lighting_source.sky);
 	}
 
 	RSE::ViewportMSAA msaa = rb->get_msaa_3d();

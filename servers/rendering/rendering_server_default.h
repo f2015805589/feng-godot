@@ -525,6 +525,11 @@ public:
 	FUNC2(reflection_probe_set_reflection_mask, RID, uint32_t)
 	FUNC2(reflection_probe_set_resolution, RID, int)
 	FUNC2(reflection_probe_set_mesh_lod_threshold, RID, float)
+	FUNC2(reflection_probe_set_capture_environment, RID, RID)
+	FUNC2(reflection_probe_set_capture_only, RID, bool)
+	FUNC2(reflection_probe_set_capture_output_sky, RID, RID)
+	FUNC2(reflection_probe_set_capture_resolution, RID, int)
+	FUNC1(reflection_probe_request_capture, RID)
 
 	/* LIGHTMAP */
 
@@ -839,7 +844,14 @@ public:
 	FUNC2(sky_set_radiance_size, RID, int)
 	FUNC2(sky_set_mode, RID, RSE::SkyMode)
 	FUNC2(sky_set_material, RID, RID)
+	FUNC2(sky_set_external_radiance, RID, bool)
+	FUNC3(sky_set_external_radiance_cubemap, RID, RID, float)
+	FUNC1RC(bool, sky_is_external_radiance_ready, RID)
+	FUNC1RC(uint64_t, sky_get_external_radiance_revision, RID)
+	FUNC1RC(float, sky_get_external_radiance_exposure, RID)
 	FUNC4R(Ref<Image>, sky_bake_panorama, RID, float, bool, const Size2i &)
+	FUNC7(frp_set_sky_lighting_source, RID, uint64_t, RID, float, const Basis &, float, uint64_t)
+	FUNC2(frp_clear_sky_lighting_source, RID, uint64_t)
 
 	/* ENVIRONMENT */
 

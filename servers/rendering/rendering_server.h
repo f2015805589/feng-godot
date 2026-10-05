@@ -375,6 +375,11 @@ public:
 	virtual void reflection_probe_set_reflection_mask(RID p_probe, uint32_t p_layers) = 0;
 	virtual void reflection_probe_set_resolution(RID p_probe, int p_resolution) = 0;
 	virtual void reflection_probe_set_mesh_lod_threshold(RID p_probe, float p_pixels) = 0;
+	virtual void reflection_probe_set_capture_environment(RID p_probe, RID p_environment) = 0;
+	virtual void reflection_probe_set_capture_only(RID p_probe, bool p_capture_only) = 0;
+	virtual void reflection_probe_set_capture_output_sky(RID p_probe, RID p_sky) = 0;
+	virtual void reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) = 0;
+	virtual void reflection_probe_request_capture(RID p_probe) = 0;
 
 	/* DECAL API */
 
@@ -634,7 +639,14 @@ public:
 	virtual void sky_set_radiance_size(RID p_sky, int p_radiance_size) = 0;
 	virtual void sky_set_mode(RID p_sky, RSE::SkyMode p_mode) = 0;
 	virtual void sky_set_material(RID p_sky, RID p_material) = 0;
+	virtual void sky_set_external_radiance(RID p_sky, bool p_enabled) = 0;
+	virtual void sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap, float p_captured_exposure) = 0;
+	virtual bool sky_is_external_radiance_ready(RID p_sky) const = 0;
+	virtual uint64_t sky_get_external_radiance_revision(RID p_sky) const = 0;
+	virtual float sky_get_external_radiance_exposure(RID p_sky) const = 0;
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
+	virtual void frp_set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_source_revision) = 0;
+	virtual void frp_clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id) = 0;
 
 	/* COMPOSITOR EFFECTS API */
 

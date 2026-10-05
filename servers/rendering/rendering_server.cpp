@@ -2707,6 +2707,11 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_reflection_mask", "probe", "layers"), &RenderingServer::reflection_probe_set_reflection_mask);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_resolution", "probe", "resolution"), &RenderingServer::reflection_probe_set_resolution);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_mesh_lod_threshold", "probe", "pixels"), &RenderingServer::reflection_probe_set_mesh_lod_threshold);
+	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_environment", "probe", "environment"), &RenderingServer::reflection_probe_set_capture_environment);
+	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_only", "probe", "capture_only"), &RenderingServer::reflection_probe_set_capture_only);
+	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_output_sky", "probe", "sky"), &RenderingServer::reflection_probe_set_capture_output_sky);
+	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_resolution", "probe", "resolution"), &RenderingServer::reflection_probe_set_capture_resolution);
+	ClassDB::bind_method(D_METHOD("reflection_probe_request_capture", "probe"), &RenderingServer::reflection_probe_request_capture);
 
 	BIND_ENUM_CONSTANT(RSE::REFLECTION_PROBE_UPDATE_ONCE);
 	BIND_ENUM_CONSTANT(RSE::REFLECTION_PROBE_UPDATE_ALWAYS);
@@ -3107,7 +3112,14 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("sky_set_radiance_size", "sky", "radiance_size"), &RenderingServer::sky_set_radiance_size);
 	ClassDB::bind_method(D_METHOD("sky_set_mode", "sky", "mode"), &RenderingServer::sky_set_mode);
 	ClassDB::bind_method(D_METHOD("sky_set_material", "sky", "material"), &RenderingServer::sky_set_material);
+	ClassDB::bind_method(D_METHOD("sky_set_external_radiance", "sky", "enabled"), &RenderingServer::sky_set_external_radiance);
+	ClassDB::bind_method(D_METHOD("sky_set_external_radiance_cubemap", "sky", "cubemap", "captured_exposure"), &RenderingServer::sky_set_external_radiance_cubemap);
+	ClassDB::bind_method(D_METHOD("sky_is_external_radiance_ready", "sky"), &RenderingServer::sky_is_external_radiance_ready);
+	ClassDB::bind_method(D_METHOD("sky_get_external_radiance_revision", "sky"), &RenderingServer::sky_get_external_radiance_revision);
+	ClassDB::bind_method(D_METHOD("sky_get_external_radiance_exposure", "sky"), &RenderingServer::sky_get_external_radiance_exposure);
 	ClassDB::bind_method(D_METHOD("sky_bake_panorama", "sky", "energy", "bake_irradiance", "size"), &RenderingServer::sky_bake_panorama);
+	ClassDB::bind_method(D_METHOD("frp_set_sky_lighting_source", "render_target", "owner_id", "sky", "energy", "rotation", "captured_exposure", "source_revision"), &RenderingServer::frp_set_sky_lighting_source);
+	ClassDB::bind_method(D_METHOD("frp_clear_sky_lighting_source", "render_target", "owner_id"), &RenderingServer::frp_clear_sky_lighting_source);
 
 	BIND_ENUM_CONSTANT(RSE::SKY_MODE_AUTOMATIC);
 	BIND_ENUM_CONSTANT(RSE::SKY_MODE_QUALITY);

@@ -30,6 +30,7 @@
 
 #include "render_scene_data_rd.h"
 
+#include "core/math/math_funcs.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -71,7 +72,7 @@ RID RenderSceneDataRD::create_uniform_buffer() {
 	return RD::get_singleton()->uniform_buffer_create(sizeof(UBODATA));
 }
 
-void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier) {
+void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_sky_lighting_enabled, float p_sky_lighting_energy, const Basis &p_sky_lighting_rotation, float p_sky_lighting_exposure) {
 	RendererSceneRenderRD *render_scene_render = RendererSceneRenderRD::get_singleton();
 
 	UBODATA ubo_data;
@@ -237,6 +238,20 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		}
 	}
 
+	if (p_sky_lighting_enabled && p_debug_mode != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+		// The selected source is already world-linear radiance. It replaces the
+		// Environment ambient base rather than adding on top of it.
+		ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
+		ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT | SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP;
+		ubo.ambient_light_color_energy[0] = 0.0f;
+		ubo.ambient_light_color_energy[1] = 0.0f;
+		ubo.ambient_light_color_energy[2] = 0.0f;
+		ubo.ambient_light_color_energy[3] = p_sky_lighting_energy;
+		ubo.ambient_color_sky_mix = 1.0f;
+		Basis sky_transform = p_sky_lighting_rotation.inverse() * cam_transform.basis;
+		RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
+	}
+
 	if (p_camera_attributes.is_valid()) {
 		ubo.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
 		ubo.IBL_exposure_normalization = 1.0;
@@ -244,7 +259,9 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			RID sky_rid = render_scene_render->environment_get_sky(p_env);
 			if (sky_rid.is_valid()) {
 				float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * render_scene_render->environment_get_bg_intensity(p_env) / p_luminance_multiplier;
-				ubo.IBL_exposure_normalization = current_exposure / MAX(0.001, render_scene_render->get_sky()->sky_get_baked_exposure(sky_rid));
+				const float baked_exposure = render_scene_render->get_sky()->sky_get_baked_exposure(sky_rid);
+				const float valid_baked_exposure = Math::is_finite(baked_exposure) && baked_exposure > 0.0f ? baked_exposure : 1.0f;
+				ubo.IBL_exposure_normalization = current_exposure / MAX(1e-12f, valid_baked_exposure);
 			}
 		}
 	} else if (emissive_exposure_normalization > 0.0) {
@@ -255,6 +272,13 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	} else {
 		ubo.emissive_exposure_normalization = 1.0;
 		ubo.IBL_exposure_normalization = 1.0;
+	}
+	if (p_sky_lighting_enabled && p_debug_mode != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+		const float camera_exposure = p_camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) : 1.0f;
+		const float current_exposure = Math::is_finite(camera_exposure) && camera_exposure > 0.0f ? camera_exposure : 1.0f;
+		const float captured_exposure = Math::is_finite(p_sky_lighting_exposure) && p_sky_lighting_exposure > 0.0f ? p_sky_lighting_exposure : 1.0f;
+		const float luminance_multiplier = Math::is_finite(p_luminance_multiplier) && p_luminance_multiplier > 0.0f ? p_luminance_multiplier : 1.0f;
+		ubo.IBL_exposure_normalization = current_exposure / (MAX(1e-12f, captured_exposure) * MAX(1e-12f, luminance_multiplier));
 	}
 
 	bool roughness_limiter_enabled = p_opaque_render_buffers && render_scene_render->screen_space_roughness_limiter_is_active();

@@ -31,6 +31,9 @@
 #pragma once
 
 #include "core/object/ref_counted.h"
+#include "core/math/basis.h"
+#include "core/os/mutex.h"
+#include "core/templates/hash_map.h"
 #include "servers/rendering/frp_pipeline_spec.h"
 
 #include <functional>
@@ -77,6 +80,20 @@ protected:
 	static void _bind_methods();
 
 public:
+	struct SkyLightingSource {
+		uint64_t owner_id = 0;
+		RID sky;
+		float energy = 1.0f;
+		Basis rotation;
+		float captured_exposure = 1.0f;
+		uint64_t revision = 0;
+	};
+
+	static void set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_revision);
+	static void clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id);
+	static void clear_all_sky_lighting_sources();
+	static bool get_sky_lighting_source(RID p_render_target, SkyLightingSource &r_source);
+
 	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>());
 
 	// Frame state.

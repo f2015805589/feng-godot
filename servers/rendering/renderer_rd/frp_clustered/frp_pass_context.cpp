@@ -37,6 +37,49 @@
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 
+namespace {
+Mutex sky_lighting_sources_mutex;
+HashMap<RID, FRPPassContext::SkyLightingSource> sky_lighting_sources;
+}
+
+void FRPPassContext::set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_revision) {
+	ERR_FAIL_COND(p_render_target.is_null());
+	ERR_FAIL_COND(p_owner_id == 0);
+	ERR_FAIL_COND(p_sky.is_null());
+	MutexLock lock(sky_lighting_sources_mutex);
+	SkyLightingSource source;
+	source.owner_id = p_owner_id;
+	source.sky = p_sky;
+	source.energy = p_energy;
+	source.rotation = p_rotation;
+	source.captured_exposure = Math::is_finite(p_captured_exposure) && p_captured_exposure > 0.0f ? p_captured_exposure : 1.0f;
+	source.revision = p_revision;
+	sky_lighting_sources.insert(p_render_target, source);
+}
+
+void FRPPassContext::clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id) {
+	MutexLock lock(sky_lighting_sources_mutex);
+	SkyLightingSource *source = sky_lighting_sources.getptr(p_render_target);
+	if (source && source->owner_id == p_owner_id) {
+		sky_lighting_sources.erase(p_render_target);
+	}
+}
+
+void FRPPassContext::clear_all_sky_lighting_sources() {
+	MutexLock lock(sky_lighting_sources_mutex);
+	sky_lighting_sources.clear();
+}
+
+bool FRPPassContext::get_sky_lighting_source(RID p_render_target, SkyLightingSource &r_source) {
+	MutexLock lock(sky_lighting_sources_mutex);
+	const SkyLightingSource *source = sky_lighting_sources.getptr(p_render_target);
+	if (!source) {
+		return false;
+	}
+	r_source = *source;
+	return true;
+}
+
 void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer) {
 	render_data = p_render_data;
 	operation_runner = p_operation_runner;

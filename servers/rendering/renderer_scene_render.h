@@ -80,7 +80,14 @@ public:
 	virtual void sky_set_radiance_size(RID p_sky, int p_radiance_size) = 0;
 	virtual void sky_set_mode(RID p_sky, RSE::SkyMode p_samples) = 0;
 	virtual void sky_set_material(RID p_sky, RID p_material) = 0;
+	virtual void sky_set_external_radiance(RID p_sky, bool p_enabled) = 0;
+	virtual void sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap, float p_captured_exposure) = 0;
+	virtual bool sky_is_external_radiance_ready(RID p_sky) const = 0;
+	virtual uint64_t sky_get_external_radiance_revision(RID p_sky) const = 0;
+	virtual float sky_get_external_radiance_exposure(RID p_sky) const = 0;
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
+	virtual void frp_set_sky_lighting_source(RID p_render_target, uint64_t p_owner_id, RID p_sky, float p_energy, const Basis &p_rotation, float p_captured_exposure, uint64_t p_source_revision) = 0;
+	virtual void frp_clear_sky_lighting_source(RID p_render_target, uint64_t p_owner_id) = 0;
 
 	/* COMPOSITOR EFFECT API */
 

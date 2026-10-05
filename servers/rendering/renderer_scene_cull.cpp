@@ -2952,7 +2952,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 							idata.flags &= ~InstanceData::FLAG_REFLECTION_PROBE_DIRTY;
 						}
 
-						if (RSG::light_storage->reflection_probe_instance_has_reflection(RID::from_uint64(idata.instance_data_rid))) {
+						if (!RSG::light_storage->reflection_probe_is_capture_only(idata.base_rid) && RSG::light_storage->reflection_probe_instance_has_reflection(RID::from_uint64(idata.instance_data_rid))) {
 							cull_result.reflections.push_back(RID::from_uint64(idata.instance_data_rid));
 						}
 					}
@@ -3780,10 +3780,36 @@ bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int 
 	ERR_FAIL_NULL_V(scenario, true);
 
 	RenderingServerDefault::redraw_request(); //update, so it updates in editor
+	const bool capture_only = RSG::light_storage->reflection_probe_is_capture_only(p_instance->base);
+	const RID capture_output_sky = RSG::light_storage->reflection_probe_get_capture_output_sky(p_instance->base);
+	if (capture_only && capture_output_sky.is_null()) {
+		RSG::light_storage->reflection_probe_instance_cancel_capture(reflection_probe->instance);
+		return true;
+	}
+	RID capture_environment = RSG::light_storage->reflection_probe_get_capture_environment(p_instance->base);
+	if (capture_environment.is_null()) {
+		capture_environment = scenario->environment.is_valid() ? scenario->environment : scenario->fallback_environment;
+	}
+	if (capture_only && p_step > 0 && RSG::light_storage->reflection_probe_instance_get_capture_output_sky(reflection_probe->instance) != capture_output_sky) {
+		RSG::light_storage->reflection_probe_instance_cancel_capture(reflection_probe->instance);
+		return true;
+	}
+	if (capture_only && p_step > 0 && RSG::light_storage->reflection_probe_instance_get_capture_environment(reflection_probe->instance) != capture_environment) {
+		RSG::light_storage->reflection_probe_instance_cancel_capture(reflection_probe->instance);
+		return true;
+	}
+	const RID reflection_atlas = RSG::light_storage->reflection_probe_instance_get_capture_atlas(reflection_probe->instance, scenario->reflection_atlas);
 
 	if (p_step == 0) {
-		if (!RSG::light_storage->reflection_probe_instance_begin_render(reflection_probe->instance, scenario->reflection_atlas)) {
+		if (capture_only) {
+			const float capture_exposure = scenario->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(scenario->camera_attributes) : 1.0f;
+			RSG::light_storage->reflection_probe_set_capture_camera_exposure(p_instance->base, capture_exposure);
+		}
+		if (!RSG::light_storage->reflection_probe_instance_begin_render(reflection_probe->instance, reflection_atlas)) {
 			return true; // All full, no atlas entry to render to.
+		}
+		if (capture_only) {
+			RSG::light_storage->reflection_probe_instance_set_capture_environment(reflection_probe->instance, capture_environment);
 		}
 	} else if (!RSG::light_storage->reflection_probe_has_atlas_index(reflection_probe->instance)) {
 		// We don't have an atlas to render to, just round off.
@@ -3792,7 +3818,17 @@ bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int 
 		return true;
 	}
 
-	if (p_step == 0) {
+	if (capture_only && p_step >= 6) {
+		RENDER_TIMESTAMP("Filter FengSkyLight capture, Step " + itos(p_step - 6));
+		return RSG::light_storage->reflection_probe_instance_postprocess_step(reflection_probe->instance);
+	}
+	if (!capture_only && p_step > 0) {
+		// Do roughness postprocess step until it believes it's done.
+		RENDER_TIMESTAMP("Post-Process ReflectionProbe, Step " + itos(p_step));
+		return RSG::light_storage->reflection_probe_instance_postprocess_step(reflection_probe->instance);
+	}
+
+	{
 		static const Vector3 view_normals[6] = {
 			Vector3(+1, 0, 0),
 			Vector3(-1, 0, 0),
@@ -3813,13 +3849,17 @@ bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int 
 		Vector3 probe_size = RSG::light_storage->reflection_probe_get_size(p_instance->base);
 		Vector3 origin_offset = RSG::light_storage->reflection_probe_get_origin_offset(p_instance->base);
 		float max_distance = RSG::light_storage->reflection_probe_get_origin_max_distance(p_instance->base);
-		float atlas_size = RSG::light_storage->reflection_atlas_get_size(scenario->reflection_atlas);
+		float atlas_size = RSG::light_storage->reflection_atlas_get_size(reflection_atlas);
 		float mesh_lod_threshold = RSG::light_storage->reflection_probe_get_mesh_lod_threshold(p_instance->base) / atlas_size;
 		bool use_shadows = RSG::light_storage->reflection_probe_renders_shadows(p_instance->base);
 		RID shadow_atlas = use_shadows ? scenario->reflection_probe_shadow_atlas : RID();
-		RID environment = scenario->environment.is_valid() ? scenario->environment : scenario->fallback_environment;
-		Ref<RenderSceneBuffers> render_buffers = RSG::light_storage->reflection_probe_atlas_get_render_buffers(scenario->reflection_atlas);
-		for (uint32_t face = 0; face < 6; face++) {
+		RID environment = capture_only ? RSG::light_storage->reflection_probe_instance_get_capture_environment(reflection_probe->instance) : capture_environment;
+		RID capture_camera_attributes = capture_only ? RSG::light_storage->reflection_probe_get_capture_camera_attributes(p_instance->base) : RID();
+		Ref<RenderSceneBuffers> render_buffers = RSG::light_storage->reflection_probe_atlas_get_render_buffers(reflection_atlas);
+		const uint32_t first_face = capture_only ? p_step : 0;
+		const uint32_t face_count = capture_only ? 1 : 6;
+		for (uint32_t face_offset = 0; face_offset < face_count; face_offset++) {
+			const uint32_t face = first_face + face_offset;
 			// Compute distance from origin offset to the actual view distance limit.
 			Vector3 edge = view_normals[face] * probe_size / 2;
 			float distance = Math::abs(view_normals[face].dot(edge) - view_normals[face].dot(origin_offset));
@@ -3837,14 +3877,12 @@ bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int 
 			camera_data.set_camera(xform, cm, false, false);
 
 			RENDER_TIMESTAMP("Render ReflectionProbe, Face " + itos(face));
-			_render_scene(&camera_data, render_buffers, environment, RID(), RID(), RSG::light_storage->reflection_probe_get_cull_mask(p_instance->base), p_instance->scenario->self, RID(), shadow_atlas, reflection_probe->instance, face, mesh_lod_threshold, use_shadows);
+			_render_scene(&camera_data, render_buffers, environment, capture_camera_attributes, RID(), RSG::light_storage->reflection_probe_get_cull_mask(p_instance->base), p_instance->scenario->self, RID(), shadow_atlas, reflection_probe->instance, face, mesh_lod_threshold, use_shadows);
 		}
 
-		RSG::light_storage->reflection_probe_instance_end_render(reflection_probe->instance, scenario->reflection_atlas);
-	} else {
-		// Do roughness postprocess step until it believes it's done.
-		RENDER_TIMESTAMP("Post-Process ReflectionProbe, Step " + itos(p_step));
-		return RSG::light_storage->reflection_probe_instance_postprocess_step(reflection_probe->instance);
+		if (!capture_only || p_step == 5) {
+			RSG::light_storage->reflection_probe_instance_end_render(reflection_probe->instance, reflection_atlas);
+		}
 	}
 
 	return false;

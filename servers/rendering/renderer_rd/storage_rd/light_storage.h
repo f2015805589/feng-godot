@@ -247,6 +247,14 @@ private:
 		uint32_t reflection_mask = (1 << 20) - 1;
 		float mesh_lod_threshold = 0.01;
 		float baked_exposure = 1.0;
+		float capture_exposure = 1.0;
+		RID capture_camera_attributes;
+		RID capture_environment;
+		RID capture_output_sky;
+		int capture_resolution = 256;
+		uint64_t capture_request_revision = 1;
+		uint64_t capture_completed_revision = 0;
+		bool capture_only = false;
 
 		Dependency dependency;
 	};
@@ -290,10 +298,17 @@ private:
 		RID probe;
 		int atlas_index = -1;
 		RID atlas;
+		RID capture_atlas;
 
 		bool dirty = true;
 		bool rendering = false;
 		int processing_layer = 1;
+		uint64_t capture_revision = 0;
+		uint64_t capture_completed_revision = 0;
+		float capture_exposure = 1.0;
+		RID capture_output_sky;
+		bool capture_source_started = false;
+		RID capture_environment;
 
 		uint64_t last_pass = 0;
 		uint32_t cull_mask = 0;
@@ -877,6 +892,17 @@ public:
 	virtual void reflection_probe_set_cull_mask(RID p_probe, uint32_t p_layers) override;
 	virtual void reflection_probe_set_reflection_mask(RID p_probe, uint32_t p_layers) override;
 	virtual void reflection_probe_set_resolution(RID p_probe, int p_resolution) override;
+	virtual void reflection_probe_set_capture_environment(RID p_probe, RID p_environment) override;
+	virtual void reflection_probe_set_capture_only(RID p_probe, bool p_capture_only) override;
+	virtual void reflection_probe_set_capture_output_sky(RID p_probe, RID p_sky) override;
+	virtual void reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) override;
+	virtual void reflection_probe_set_capture_camera_exposure(RID p_probe, float p_exposure) override;
+	virtual RID reflection_probe_get_capture_camera_attributes(RID p_probe) const override;
+	virtual void reflection_probe_request_capture(RID p_probe) override;
+	virtual RID reflection_probe_get_capture_environment(RID p_probe) const override;
+	virtual bool reflection_probe_is_capture_only(RID p_probe) const override;
+	virtual RID reflection_probe_get_capture_output_sky(RID p_probe) const override;
+	virtual int reflection_probe_get_capture_resolution(RID p_probe) const override;
 	virtual void reflection_probe_set_mesh_lod_threshold(RID p_probe, float p_ratio) override;
 
 	void reflection_probe_set_baked_exposure(RID p_probe, float p_exposure);
@@ -940,6 +966,11 @@ public:
 	virtual bool reflection_probe_has_atlas_index(RID p_instance) override;
 	virtual void reflection_probe_release_atlas_index(RID p_instance) override;
 	virtual bool reflection_probe_instance_needs_redraw(RID p_instance) override;
+	virtual RID reflection_probe_instance_get_capture_atlas(RID p_instance, RID p_fallback_atlas) override;
+	virtual void reflection_probe_instance_cancel_capture(RID p_instance) override;
+	virtual RID reflection_probe_instance_get_capture_output_sky(RID p_instance) const override;
+	virtual void reflection_probe_instance_set_capture_environment(RID p_instance, RID p_environment) override;
+	virtual RID reflection_probe_instance_get_capture_environment(RID p_instance) const override;
 	virtual bool reflection_probe_instance_has_reflection(RID p_instance) override;
 	virtual bool reflection_probe_instance_begin_render(RID p_instance, RID p_reflection_atlas) override;
 	virtual bool reflection_probe_instance_end_render(RID p_instance, RID p_reflection_atlas) override;

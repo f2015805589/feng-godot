@@ -35,5 +35,8 @@ params;
 
 void main() {
 	vec3 dir = oct_to_vec3_with_border(uv_interp * 0.5 + 0.5, params.border_size);
-	frag_color = vec4(texture(source_cube, dir).rgb, 1.0);
+	vec3 source_color = texture(source_cube, dir).rgb;
+	source_color = mix(source_color, vec3(0.0), isnan(source_color));
+	source_color = clamp(source_color, vec3(-65504.0), vec3(65504.0));
+	frag_color = vec4(source_color, 1.0);
 }

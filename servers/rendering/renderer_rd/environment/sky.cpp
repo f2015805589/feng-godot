@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_defs.h"
+#include "core/math/math_funcs.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
@@ -511,6 +512,11 @@ void SkyRD::Sky::free() {
 		radiance = RID();
 	}
 	reflection.clear_reflection_data();
+	if (pending_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(pending_radiance);
+		pending_radiance = RID();
+	}
+	pending_reflection.clear_reflection_data();
 
 	if (uniform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(uniform_buffer);
@@ -600,6 +606,13 @@ bool SkyRD::Sky::set_radiance_size(int p_radiance_size) {
 		radiance = RID();
 	}
 	reflection.clear_reflection_data();
+	if (pending_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(pending_radiance);
+		pending_radiance = RID();
+	}
+	pending_reflection.clear_reflection_data();
+	external_radiance_ready = false;
+	external_capture_pending = false;
 
 	return true;
 }
@@ -625,6 +638,13 @@ bool SkyRD::Sky::set_mode(RSE::SkyMode p_mode) {
 		radiance = RID();
 	}
 	reflection.clear_reflection_data();
+	if (pending_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(pending_radiance);
+		pending_radiance = RID();
+	}
+	pending_reflection.clear_reflection_data();
+	external_radiance_ready = false;
+	external_capture_pending = false;
 
 	return true;
 }
@@ -1237,6 +1257,9 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	Sky *sky = get_sky(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_env));
 	ERR_FAIL_NULL(sky);
+	if (sky->external_radiance) {
+		return;
+	}
 
 	RID sky_material = sky_get_material(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_env));
 
@@ -1598,7 +1621,7 @@ void SkyRD::update_dirty_skys() {
 			}
 		}
 
-		sky->reflection.dirty = true;
+		sky->reflection.dirty = !sky->external_radiance;
 		sky->processing_layer = 0;
 
 		Sky *next = sky->dirty_list;
@@ -1608,6 +1631,73 @@ void SkyRD::update_dirty_skys() {
 	}
 
 	dirty_sky_list = nullptr;
+}
+
+void SkyRD::_create_external_radiance_storage(Sky *p_sky, RID &r_radiance, ReflectionData &r_reflection) {
+	ERR_FAIL_NULL(p_sky);
+	RendererRD::CopyEffects *copy_effects = RendererRD::CopyEffects::get_singleton();
+	ERR_FAIL_NULL(copy_effects);
+
+	int mipmaps = Image::get_image_required_mipmaps(p_sky->radiance_size, p_sky->radiance_size, Image::FORMAT_RGBAH) + 1;
+	const int layers = roughness_layers;
+	if (sky_use_octmap_array) {
+		mipmaps -= 2;
+	} else {
+		mipmaps = MIN(mipmaps, layers);
+	}
+	ERR_FAIL_COND(mipmaps < 1);
+
+	const uint32_t padding_pixels = 1u << (MIN(mipmaps, sky_use_octmap_array ? mipmaps : layers) - 1);
+	const uint32_t width = p_sky->radiance_size * 2 + padding_pixels * 2;
+	const float border_size = float(padding_pixels) / float(width);
+	const bool use_storage = !copy_effects->get_raster_effects().has_flag(RendererRD::CopyEffects::RASTER_EFFECT_OCTMAP);
+
+	if (r_radiance.is_null()) {
+		RD::TextureFormat tf;
+		tf.format = texture_format;
+		tf.width = width;
+		tf.height = width;
+		tf.mipmaps = mipmaps;
+		tf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
+		if (sky_use_octmap_array) {
+			tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+			tf.array_layers = layers;
+		} else {
+			tf.array_layers = 1;
+		}
+		if (use_storage) {
+			tf.usage_bits |= RD::TEXTURE_USAGE_STORAGE_BIT;
+		}
+		r_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		RD::get_singleton()->set_resource_name(r_radiance, "FengSkyLight External Radiance");
+	}
+
+	r_reflection.clear_reflection_data();
+	r_reflection.update_reflection_data(width, mipmaps, sky_use_octmap_array, r_radiance, 0, false, roughness_layers, texture_format, border_size);
+}
+
+void SkyRD::_begin_external_radiance_update(Sky *p_sky, float p_captured_exposure, uint64_t p_revision) {
+	ERR_FAIL_NULL(p_sky);
+	ERR_FAIL_COND_MSG(!p_sky->external_radiance, "External radiance update requested for a regular Sky.");
+	update_dirty_skys();
+	_create_external_radiance_storage(p_sky, p_sky->pending_radiance, p_sky->pending_reflection);
+	p_sky->pending_radiance_exposure = Math::is_finite(p_captured_exposure) && p_captured_exposure > 0.0f ? p_captured_exposure : 1.0f;
+	p_sky->pending_radiance_revision = MAX(p_revision, p_sky->external_radiance_revision + 1);
+	p_sky->pending_processing_layer = 1;
+	p_sky->external_capture_pending = true;
+}
+
+void SkyRD::_commit_external_radiance_update(Sky *p_sky) {
+	ERR_FAIL_NULL(p_sky);
+	ERR_FAIL_COND(!p_sky->external_capture_pending);
+	SWAP(p_sky->radiance, p_sky->pending_radiance);
+	SWAP(p_sky->reflection, p_sky->pending_reflection);
+	p_sky->external_radiance_exposure = p_sky->pending_radiance_exposure;
+	p_sky->external_radiance_revision = p_sky->pending_radiance_revision;
+	p_sky->baked_exposure = p_sky->external_radiance_exposure;
+	p_sky->uv_border_size = p_sky->reflection.uv_border_size;
+	p_sky->external_radiance_ready = true;
+	p_sky->external_capture_pending = false;
 }
 
 RID SkyRD::sky_get_material(RID p_sky) const {
@@ -1678,13 +1768,108 @@ void SkyRD::sky_set_material(RID p_sky, RID p_material) {
 	}
 }
 
+void SkyRD::sky_set_external_radiance(RID p_sky, bool p_enabled) {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL(sky);
+	if (sky->external_radiance == p_enabled) {
+		return;
+	}
+	sky->external_radiance = p_enabled;
+	sky->external_capture_pending = false;
+	sky->external_radiance_ready = false;
+	if (sky->pending_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(sky->pending_radiance);
+		sky->pending_radiance = RID();
+	}
+	sky->pending_reflection.clear_reflection_data();
+	invalidate_sky(sky);
+}
+
+void SkyRD::sky_external_radiance_begin_from_cubemap(RID p_sky, RID p_source_cubemap, float p_captured_exposure, uint64_t p_revision) {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL(sky);
+	ERR_FAIL_COND(p_source_cubemap.is_null());
+	_begin_external_radiance_update(sky, p_captured_exposure, p_revision);
+	ERR_FAIL_COND(sky->pending_reflection.layers.is_empty());
+	RendererRD::CopyEffects *copy_effects = RendererRD::CopyEffects::get_singleton();
+	ERR_FAIL_NULL(copy_effects);
+	copy_effects->copy_cubemap_to_octmap(p_source_cubemap, sky->pending_reflection.layers[0].mipmaps[0].framebuffer, sky->pending_reflection.uv_border_size);
+}
+
+bool SkyRD::sky_external_radiance_postprocess_step(RID p_sky) {
+	Sky *sky = get_sky(p_sky);
+	if (!sky || !sky->external_capture_pending || sky->pending_reflection.layers.is_empty()) {
+		// A source may be detached while a capture or filter sequence is in flight.
+		return true;
+	}
+	const int max_processing_layer = sky_use_octmap_array ? sky->pending_reflection.layers.size() : sky->pending_reflection.layers[0].mipmaps.size();
+	if (max_processing_layer <= 1) {
+		if (sky_use_octmap_array) {
+			sky->pending_reflection.update_reflection_mipmaps(0, sky->pending_reflection.layers.size());
+		}
+		_commit_external_radiance_update(sky);
+		return true;
+	}
+	const int layer = sky->pending_processing_layer;
+	if (layer < max_processing_layer) {
+		sky->pending_reflection.create_reflection_importance_sample(sky_use_octmap_array, layer, sky_ggx_samples_quality);
+		if (sky_use_octmap_array) {
+			sky->pending_reflection.update_reflection_mipmaps(layer, layer + 1);
+		}
+		sky->pending_processing_layer++;
+	}
+	if (sky->pending_processing_layer >= max_processing_layer) {
+		_commit_external_radiance_update(sky);
+		return true;
+	}
+	return false;
+}
+
+void SkyRD::sky_set_external_radiance_cubemap(RID p_sky, RID p_cubemap_rd_texture, float p_captured_exposure) {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL(sky);
+	ERR_FAIL_COND_MSG(!sky->external_radiance, "Cubemap source requires external radiance mode.");
+	ERR_FAIL_COND(p_cubemap_rd_texture.is_null());
+	RD::TextureFormat cube_format = RD::get_singleton()->texture_get_format(p_cubemap_rd_texture);
+	ERR_FAIL_COND_MSG(cube_format.texture_type != RD::TEXTURE_TYPE_CUBE, "SkyLight source texture must be a cubemap.");
+
+	sky_external_radiance_begin_from_cubemap(p_sky, p_cubemap_rd_texture, p_captured_exposure, sky->external_radiance_revision + 1);
+	const int max_processing_layer = sky_use_octmap_array ? sky->pending_reflection.layers.size() : sky->pending_reflection.layers.is_empty() ? 0 : sky->pending_reflection.layers[0].mipmaps.size();
+	for (int i = 0; i <= max_processing_layer && sky->external_capture_pending; i++) {
+		sky_external_radiance_postprocess_step(p_sky);
+	}
+	ERR_FAIL_COND_MSG(sky->external_capture_pending, "Cubemap radiance filtering did not complete.");
+}
+
+bool SkyRD::sky_is_external_radiance_ready(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, false);
+	return sky->external_radiance && sky->external_radiance_ready;
+}
+
+uint64_t SkyRD::sky_get_external_radiance_revision(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 0);
+	return sky->external_radiance_revision;
+}
+
+float SkyRD::sky_get_external_radiance_exposure(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 1.0f);
+	return sky->external_radiance_exposure;
+}
+
 Ref<Image> SkyRD::sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) {
 	Sky *sky = get_sky(p_sky);
 	ERR_FAIL_NULL_V(sky, Ref<Image>());
 
 	update_dirty_skys();
-
-	return sky->bake_panorama(p_energy, p_bake_irradiance ? roughness_layers : 0, p_size);
+	if (sky->external_radiance && !sky->external_radiance_ready) {
+		return Ref<Image>();
+	}
+	const float exposure = Math::is_finite(sky->external_radiance_exposure) && sky->external_radiance_exposure > 0.0f ? sky->external_radiance_exposure : 1.0f;
+	const float energy = sky->external_radiance ? p_energy / MAX(exposure, 1e-12f) : p_energy;
+	return sky->bake_panorama(energy, p_bake_irradiance ? roughness_layers : 0, p_size);
 }
 
 RID SkyRD::sky_get_radiance_texture_rd(RID p_sky) const {

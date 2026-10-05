@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/geometry_3d.h"
+#include "core/math/math_funcs.h"
 #include "core/os/os.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -1279,6 +1280,9 @@ void LightStorage::reflection_probe_initialize(RID p_reflection_probe) {
 
 void LightStorage::reflection_probe_free(RID p_rid) {
 	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_rid);
+	if (reflection_probe->capture_camera_attributes.is_valid()) {
+		RSG::camera_attributes->camera_attributes_free(reflection_probe->capture_camera_attributes);
+	}
 	reflection_probe->dependency.deleted_notify(p_rid);
 	reflection_probe_owner.free(p_rid);
 }
@@ -1395,6 +1399,100 @@ void LightStorage::reflection_probe_set_reflection_mask(RID p_probe, uint32_t p_
 
 void LightStorage::reflection_probe_set_resolution(RID p_probe, int p_resolution) {
 	WARN_PRINT_ONCE("reflection_probe_set_resolution is not available in Godot 4. ReflectionProbe size is configured in the project settings with the rendering/reflections/reflection_atlas/reflection_size setting.");
+}
+
+void LightStorage::reflection_probe_set_capture_environment(RID p_probe, RID p_environment) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	if (reflection_probe->capture_environment == p_environment) {
+		return;
+	}
+	reflection_probe->capture_environment = p_environment;
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+void LightStorage::reflection_probe_set_capture_only(RID p_probe, bool p_capture_only) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	if (reflection_probe->capture_only == p_capture_only) {
+		return;
+	}
+	reflection_probe->capture_only = p_capture_only;
+	if (p_capture_only) {
+		reflection_probe->update_mode = RSE::REFLECTION_PROBE_UPDATE_ONCE;
+	}
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+void LightStorage::reflection_probe_set_capture_output_sky(RID p_probe, RID p_sky) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	if (reflection_probe->capture_output_sky == p_sky) {
+		return;
+	}
+	reflection_probe->capture_output_sky = p_sky;
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+void LightStorage::reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	ERR_FAIL_COND_MSG(p_resolution < 32 || p_resolution > 2048 || !Math::is_power_of_2(p_resolution), "Capture resolution must be a power of two between 32 and 2048.");
+	if (reflection_probe->capture_resolution == p_resolution) {
+		return;
+	}
+	reflection_probe->capture_resolution = p_resolution;
+	reflection_probe->capture_request_revision++;
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+void LightStorage::reflection_probe_set_capture_camera_exposure(RID p_probe, float p_exposure) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	if (reflection_probe->capture_camera_attributes.is_null()) {
+		reflection_probe->capture_camera_attributes = RSG::camera_attributes->camera_attributes_allocate();
+		RSG::camera_attributes->camera_attributes_initialize(reflection_probe->capture_camera_attributes);
+	}
+	reflection_probe->capture_exposure = Math::is_finite(p_exposure) && p_exposure > 0.0f ? p_exposure : 1.0f;
+	reflection_probe->baked_exposure = reflection_probe->capture_exposure;
+	RSG::camera_attributes->camera_attributes_set_exposure(reflection_probe->capture_camera_attributes, 1.0f, reflection_probe->capture_exposure);
+}
+
+RID LightStorage::reflection_probe_get_capture_camera_attributes(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, RID());
+	return reflection_probe->capture_camera_attributes;
+}
+
+void LightStorage::reflection_probe_request_capture(RID p_probe) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	reflection_probe->capture_request_revision++;
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+RID LightStorage::reflection_probe_get_capture_environment(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, RID());
+	return reflection_probe->capture_environment;
+}
+
+bool LightStorage::reflection_probe_is_capture_only(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, false);
+	return reflection_probe->capture_only;
+}
+
+RID LightStorage::reflection_probe_get_capture_output_sky(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, RID());
+	return reflection_probe->capture_output_sky;
+}
+
+int LightStorage::reflection_probe_get_capture_resolution(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, 0);
+	return reflection_probe->capture_resolution;
 }
 
 void LightStorage::reflection_probe_set_mesh_lod_threshold(RID p_probe, float p_ratio) {
@@ -1620,6 +1718,10 @@ int LightStorage::reflection_atlas_get_size(RID p_ref_atlas) const {
 RID LightStorage::reflection_probe_instance_create(RID p_probe) {
 	ReflectionProbeInstance rpi;
 	rpi.probe = p_probe;
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	if (reflection_probe) {
+		rpi.capture_completed_revision = reflection_probe->capture_completed_revision;
+	}
 	rpi.forward_id = ForwardIDStorage::get_singleton()->allocate_forward_id(FORWARD_ID_TYPE_REFLECTION_PROBE);
 
 	return reflection_probe_instance_owner.make_rid(rpi);
@@ -1629,6 +1731,9 @@ void LightStorage::reflection_probe_instance_free(RID p_instance) {
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ForwardIDStorage::get_singleton()->free_forward_id(FORWARD_ID_TYPE_REFLECTION_PROBE, rpi->forward_id);
 	reflection_probe_release_atlas_index(p_instance);
+	if (rpi->capture_atlas.is_valid()) {
+		reflection_atlas_free(rpi->capture_atlas);
+	}
 	reflection_probe_instance_owner.free(p_instance);
 }
 
@@ -1688,11 +1793,70 @@ bool LightStorage::reflection_probe_instance_needs_redraw(RID p_instance) {
 		return true;
 	}
 
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	if (probe && probe->capture_only) {
+		return rpi->capture_completed_revision < probe->capture_request_revision;
+	}
+
 	if (LightStorage::get_singleton()->reflection_probe_get_update_mode(rpi->probe) == RSE::REFLECTION_PROBE_UPDATE_ALWAYS) {
 		return true;
 	}
 
 	return rpi->atlas_index == -1;
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_atlas(RID p_instance, RID p_fallback_atlas) {
+	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, p_fallback_atlas);
+	ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	ERR_FAIL_NULL_V(probe, p_fallback_atlas);
+	if (!probe->capture_only) {
+		return p_fallback_atlas;
+	}
+	if (rpi->capture_atlas.is_null()) {
+		rpi->capture_atlas = reflection_atlas_create();
+		reflection_atlas_set_size(rpi->capture_atlas, probe->capture_resolution, 1);
+	} else if (reflection_atlas_get_size(rpi->capture_atlas) != probe->capture_resolution) {
+		reflection_probe_release_atlas_index(p_instance);
+		reflection_atlas_set_size(rpi->capture_atlas, probe->capture_resolution, 1);
+	}
+	return rpi->capture_atlas;
+}
+
+void LightStorage::reflection_probe_instance_cancel_capture(RID p_instance) {
+	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(rpi);
+	ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	uint64_t cancelled_revision = rpi->capture_revision;
+	if (probe) {
+		cancelled_revision = probe->capture_request_revision;
+		probe->capture_completed_revision = cancelled_revision;
+	}
+	rpi->capture_completed_revision = cancelled_revision;
+	rpi->capture_source_started = false;
+	rpi->rendering = false;
+	rpi->dirty = false;
+	if (rpi->atlas.is_valid()) {
+		reflection_probe_release_atlas_index(p_instance);
+	}
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_output_sky(RID p_instance) const {
+	const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, RID());
+	return rpi->capture_output_sky;
+}
+
+void LightStorage::reflection_probe_instance_set_capture_environment(RID p_instance, RID p_environment) {
+	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(rpi);
+	rpi->capture_environment = p_environment;
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_environment(RID p_instance) const {
+	const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, RID());
+	return rpi->capture_environment;
 }
 
 bool LightStorage::reflection_probe_instance_has_reflection(RID p_instance) {
@@ -1712,6 +1876,14 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
+	ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	if (!probe) {
+		rpi->rendering = false;
+		return true;
+	}
+	if (rpi->atlas.is_valid() && rpi->atlas != p_reflection_atlas) {
+		reflection_probe_release_atlas_index(p_instance);
+	}
 
 	if (atlas->render_buffers.is_null()) {
 		atlas->render_buffers.instantiate();
@@ -1826,6 +1998,13 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 	rpi->rendering = true;
 	rpi->dirty = false;
 	rpi->processing_layer = 1;
+	if (probe->capture_only) {
+		rpi->capture_revision = probe->capture_request_revision;
+		rpi->capture_exposure = Math::is_finite(probe->capture_exposure) && probe->capture_exposure > 0.0f ? probe->capture_exposure : 1.0f;
+		rpi->capture_output_sky = probe->capture_output_sky;
+		rpi->capture_source_started = false;
+		rpi->capture_environment = probe->capture_environment;
+	}
 
 	RD::get_singleton()->draw_command_end_label();
 
@@ -1841,6 +2020,13 @@ bool LightStorage::reflection_probe_instance_end_render(RID p_instance, RID p_re
 
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	if (!probe) {
+		return true;
+	}
+	if (probe->capture_only) {
+		return true; // Capture-only consumers convert the completed cubemap into their own Sky layout.
+	}
 
 	RD::get_singleton()->draw_command_begin_label("Convert reflection probe to octahedral");
 	copy_effects->copy_cubemap_to_octmap(atlas->color_buffer, atlas->reflections.write[rpi->atlas_index].data.layers[0].mipmaps[0].framebuffer, atlas->uv_border_size);
@@ -1866,6 +2052,36 @@ bool LightStorage::reflection_probe_instance_postprocess_step(RID p_instance) {
 		// Does not belong to an atlas anymore, cancel (was removed from atlas or atlas changed while rendering).
 		rpi->rendering = false;
 		return false;
+	}
+
+	ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	if (!probe) {
+		rpi->rendering = false;
+		return true;
+	}
+	if (probe->capture_only) {
+		if (probe->capture_output_sky.is_null() || probe->capture_output_sky != rpi->capture_output_sky) {
+			reflection_probe_instance_cancel_capture(p_instance);
+			return true;
+		}
+		RendererRD::SkyRD *sky_rd = RendererSceneRenderRD::get_singleton()->get_sky();
+		RendererRD::SkyRD::Sky *output_sky = sky_rd->get_sky(rpi->capture_output_sky);
+		if (!output_sky || !output_sky->external_radiance) {
+			reflection_probe_instance_cancel_capture(p_instance);
+			return true;
+		}
+		if (!rpi->capture_source_started) {
+			sky_rd->sky_external_radiance_begin_from_cubemap(rpi->capture_output_sky, atlas->color_buffer, rpi->capture_exposure, rpi->capture_revision);
+			rpi->capture_source_started = true;
+		}
+		const bool complete = sky_rd->sky_external_radiance_postprocess_step(rpi->capture_output_sky);
+		if (complete) {
+			rpi->rendering = false;
+			rpi->processing_layer = 1;
+			rpi->capture_completed_revision = rpi->capture_revision;
+			probe->capture_completed_revision = MAX(probe->capture_completed_revision, rpi->capture_revision);
+		}
+		return complete;
 	}
 
 	if (LightStorage::get_singleton()->reflection_probe_get_update_mode(rpi->probe) == RSE::REFLECTION_PROBE_UPDATE_ALWAYS) {
@@ -2028,8 +2244,11 @@ void LightStorage::update_reflection_probe_buffer(RenderDataRD *p_render_data, c
 		reflection_ubo.exposure_normalization = 1.0;
 
 		if (p_render_data->camera_attributes.is_valid()) {
-			float exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
-			reflection_ubo.exposure_normalization = exposure / probe->baked_exposure;
+			const float camera_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+			const float baked_exposure = probe->baked_exposure;
+			const float valid_camera_exposure = Math::is_finite(camera_exposure) && camera_exposure > 0.0f ? camera_exposure : 1.0f;
+			const float valid_baked_exposure = Math::is_finite(baked_exposure) && baked_exposure > 0.0f ? baked_exposure : 1.0f;
+			reflection_ubo.exposure_normalization = valid_camera_exposure / MAX(1e-12f, valid_baked_exposure);
 		}
 
 		Color ambient_linear = probe->ambient_color.srgb_to_linear();
