@@ -5,6 +5,7 @@ extends RefCounted
 ## remains immutable; camera-specific exposure is outside this world snapshot.
 
 const Data = preload("feng_magic_gi_data.gd")
+const SKY_LIGHT_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_light_runtime.gd"
 const SKY_PANORAMA_SIZE := Vector2i(64, 32)
 const SKY_REFRESH_MSEC := 250
 const SCENE_SCAN_MSEC := 500
@@ -17,12 +18,20 @@ var _environment_signature := 0
 var _source_signature := 0
 var _lighting_signature := 0
 var _sky_sh := PackedFloat32Array()
+var _environment_sky_sh := PackedFloat32Array()
+var _sky_light_signature: Array = []
 var _sky_dirty := true
 var _environment: Environment
 var _sky: Sky
 var _sky_material: Material
 var _cached_result := PackedFloat32Array()
 var _result_dirty := true
+var _sky_light_runtime: Script
+
+
+func _init() -> void:
+	if ResourceLoader.exists(SKY_LIGHT_RUNTIME_PATH):
+		_sky_light_runtime = load(SKY_LIGHT_RUNTIME_PATH) as Script
 
 func coefficients(volume: Node3D) -> PackedFloat32Array:
 	var now := Time.get_ticks_msec()
@@ -55,8 +64,39 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 	if current_lighting_signature != _lighting_signature:
 		_lighting_signature = current_lighting_signature
 		_result_dirty = true
-	if environment != null and _update_sky(environment, now):
-		_result_dirty = true
+	var world := volume.get_world_3d()
+	var sky_light: Dictionary = {}
+	if _sky_light_runtime != null and world != null:
+		var snapshot: Variant = _sky_light_runtime.call(
+				"snapshot_for_world", world.get_instance_id())
+		if snapshot is Dictionary:
+			sky_light = snapshot
+	var sky_light_coefficients: PackedFloat32Array = sky_light.get(
+			"radiance_sh", PackedFloat32Array())
+	var sky_light_ready := bool(sky_light.get("ready", false)) \
+			and sky_light_coefficients.size() == 27
+	if sky_light_ready:
+		var active_sky_signature: Array = [
+			int(sky_light.get("provider_id", 0)),
+			int(sky_light.get("source_revision", -1)),
+			int(sky_light.get("source_mode", -1)),
+			float(sky_light.get("captured_exposure", 1.0)),
+			float(sky_light.get("energy", 1.0)),
+			sky_light.get("rotation", Basis.IDENTITY),
+		]
+		if active_sky_signature != _sky_light_signature:
+			_sky_light_signature = active_sky_signature
+			_sky_sh = sky_light_coefficients
+			_result_dirty = true
+	else:
+		if not _sky_light_signature.is_empty():
+			_sky_light_signature.clear()
+			_result_dirty = true
+		if environment != null and _update_sky(environment, now):
+			_result_dirty = true
+		if _sky_sh != _environment_sky_sh:
+			_sky_sh = _environment_sky_sh
+			_result_dirty = true
 	if not _result_dirty:
 		return _cached_result
 	_result_dirty = false
@@ -136,7 +176,7 @@ func _track_environment(environment: Environment) -> void:
 	for resource in [_environment, _sky, _sky_material]:
 		if resource != null and not resource.changed.is_connected(_on_sky_changed):
 			resource.changed.connect(_on_sky_changed)
-	_sky_sh.clear()
+	_environment_sky_sh.clear()
 	_sky_dirty = true
 	_result_dirty = true
 
@@ -180,10 +220,10 @@ func _update_sky(environment: Environment, now: int) -> bool:
 	var image := RenderingServer.environment_bake_panorama(
 			environment.get_rid(), false, SKY_PANORAMA_SIZE)
 	if image == null or image.is_empty():
-		_sky_sh.clear()
+		_environment_sky_sh.clear()
 		_sky_dirty = false
 		return true
-	_sky_sh = project_panorama(image, Basis.from_euler(environment.sky_rotation))
+	_environment_sky_sh = project_panorama(image, Basis.from_euler(environment.sky_rotation))
 	_sky_dirty = false
 	return true
 

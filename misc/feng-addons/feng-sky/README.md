@@ -144,6 +144,56 @@ Feng Fog soft-loads the runtime from `res://addons/feng-sky/feng_sky_runtime.gd`
 See [`doc/frp-unreal-atmosphere.md`](../../../doc/frp-unreal-atmosphere.md) for the
 renderer mapping and integration limits.
 
+## FengSkyLight global radiance
+
+Add `FengSkyLight` as a `Node3D` in the target world. It is independent of the
+visible `WorldEnvironment`: the captured scene can use the current World3D sky
+as its background, or **Capture Sky** can select another `Sky` resource. An
+empty **Capture Sky** uses the active world's sky. The component never replaces
+the displayed sky or edits the shared Environment.
+
+**Source Mode** selects a full-scene capture or a supplied `Cubemap`. A captured
+scene includes direct-lit and emissive geometry within **Capture Distance**;
+the selected sky is used for rays that miss scene geometry. The private capture
+Environment disables ambient and reflection sources so it does not fold in the
+previous global IBL or MagicGI result. It captures scene radiance, not post-GI
+output. **Capture Position Anchor** and the world-space **Capture Offset** set
+the capture origin. Without an anchor, the
+component's global position is used. The default offset is `(0, 100, 0)` metres.
+Captured faces use world axes, so rotating the component does not rotate a scene
+capture. A supplied Cubemap follows the component's rotation. The captured cube
+is a global far-field approximation; it does not provide parallax or
+position-accurate GI for nearby buildings.
+
+The component takes an initial capture when it becomes the selected provider.
+With **Realtime Capture** off, press **Capture Now** to refresh it manually.
+When enabled, **Capture Interval** schedules periodic refreshes; the renderer
+captures faces over multiple frames, so the interval is not a promise that a
+whole six-face update completes in one frame. A completed capture remains
+available while its replacement is being built. The capture probe is internal
+and capture-only: it does not add a local reflection probe or capture its own
+previous SkyLight output. **Capture Shadows** is on by default; turning it off
+can reduce the cost of repeated full-scene captures. **Capture Resolution** is
+rounded to the nearest supported power of two from 32 to 2048 pixels; the default
+is 128. **Capture Distance** defaults to 4000 metres and limits scene geometry
+visible to the six capture faces. **Cull Mask** selects which render layers enter
+the capture. Use a smaller distance, lower resolution, or disabled capture
+shadows when frequent full-scene updates are too costly.
+
+Only one provider is active in a `World3D`: higher **Priority** wins and the
+earlier registered provider wins ties. Disabling or removing it hands off to the
+next candidate. The same completed radiance feeds FRP's world IBL/ambient path
+and `FengMagicGI`'s sky SH term; MagicGI keeps its existing directional-light
+transport contribution. **Radiance Energy** is applied once to both consumers.
+MagicGI reads the provider's cached SH projection instead of baking another
+panorama for each volume. If FengSky is not installed, MagicGI keeps its normal
+Environment sky path.
+
+Captured radiance uses the Environment exposure recorded for the capture.
+`FengSkyLight` keeps its capture Environment private and refreshes it for each
+manual or scheduled capture, so Environment property changes are included even
+when that resource does not emit `changed`.
+
 ## Example and tests
 
 Run `res://addons/feng-sky/examples/feng_sky_atmosphere_60k.tscn` with Feng Sky,
@@ -170,3 +220,6 @@ FRP, tiny/default disks, 60,000/10,000,000 irradiance and pre-exposure/TAA
 combinations. GPU checks require a RenderingDevice-capable display/driver;
 headless dummy rendering covers CPU contracts only. Logs and captured images
 remain in the reported scratch project.
+
+`res://addons/feng-sky/examples/feng_sky_light_capture.tscn` wraps the atmosphere
+scene with a `FengSkyLight` using the full-scene source and manual refresh.
