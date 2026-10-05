@@ -303,6 +303,11 @@ enum TransformMode { PLANET_TOP_AT_ABSOLUTE_WORLD_ORIGIN, PLANET_TOP_AT_COMPONEN
 		_settings_dirty = true
 
 @export_group("Rendering")
+## Enables Environment Glow/Bloom for the whole HDR scene. The renderer's Bloom pass must also be enabled.
+@export var bloom_enabled := true:
+	set(value):
+		bloom_enabled = value
+		_update_bloom_enabled()
 @export_range(0.25, 8.0, 0.01, "or_greater") var trace_sample_count_scale: float = 1.0:
 	set(value):
 		trace_sample_count_scale = value
@@ -432,6 +437,7 @@ func _init() -> void:
 	environment.sky = _owned_sky
 	environment.background_mode = Environment.BG_SKY
 	_update_background_intensity_mode()
+	_update_bloom_enabled()
 	_initializing = false
 
 
@@ -477,15 +483,14 @@ func _process(_delta: float) -> void:
 	# The inherited environment has no setter hook. Keep the editor workflow
 	# compatible with direct Inspector edits while runtime values are polled only
 	# to detect changes; the CPU atmosphere integration itself is cached.
-	if Engine.is_editor_hint() and (
-		environment != _owned_environment
-		or (
-			environment != null
-			and (environment.sky != _owned_sky or environment.background_mode != Environment.BG_SKY)
-		)
+	if environment != _owned_environment or (
+		Engine.is_editor_hint()
+		and environment != null
+		and (environment.sky != _owned_sky or environment.background_mode != Environment.BG_SKY)
 	):
 		_sync_environment()
 	_update_background_intensity_mode()
+	_update_bloom_enabled()
 	_refresh_atmosphere_cache()
 	_refresh_world_binding()
 
@@ -550,6 +555,16 @@ func _apply_selected_sky() -> void:
 	environment.sky = _owned_sky
 	_enforce_sky_background()
 	_update_background_intensity_mode()
+	_update_bloom_enabled()
+
+
+func _update_bloom_enabled() -> void:
+	# Only mutate this component's private Environment. A scene's shared source is
+	# copied by _ensure_private_environment() before this setting is applied.
+	if environment == null or environment != _owned_environment:
+		return
+	if environment.glow_enabled != bloom_enabled:
+		environment.glow_enabled = bloom_enabled
 
 
 func _update_background_intensity_mode() -> void:
