@@ -1072,6 +1072,17 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 		}
 	}
 
+	// FengSkyLight captures already apply camera exposure through the Sky's
+	// background brightness multiplier. Keep the built-in LIGHT*_ENERGY inputs
+	// scene-linear for those captures so their sun contribution is not exposed twice.
+	bool capture_only_feng_sky_light = false;
+	if (p_render_data->reflection_probe.is_valid() && light_storage->owns_reflection_probe_instance(p_render_data->reflection_probe)) {
+		RID probe = light_storage->reflection_probe_instance_get_probe(p_render_data->reflection_probe);
+		capture_only_feng_sky_light = probe.is_valid() &&
+				light_storage->reflection_probe_is_capture_only(probe) &&
+				light_storage->reflection_probe_get_capture_output_sky(probe).is_valid();
+	}
+
 	bool sun_scatter_enabled = RendererSceneRenderRD::get_singleton()->environment_get_fog_enabled(p_render_data->environment) && RendererSceneRenderRD::get_singleton()->environment_get_fog_sun_scatter(p_render_data->environment) > 0.001;
 	sky_scene_state.ubo.directional_light_count = 0;
 	if (shader_data->uses_light || sun_scatter_enabled) {
@@ -1104,7 +1115,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 					sky_light_data.energy *= light_storage->light_get_param(base, RSE::LIGHT_PARAM_INTENSITY);
 				}
 
-				if (p_render_data->camera_attributes.is_valid()) {
+				if (p_render_data->camera_attributes.is_valid() && !capture_only_feng_sky_light) {
 					sky_light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 				}
 
