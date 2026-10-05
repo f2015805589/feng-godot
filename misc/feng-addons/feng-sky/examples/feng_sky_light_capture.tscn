@@ -1,0 +1,14 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="PackedScene" path="res://addons/feng-sky/examples/feng_sky_atmosphere_60k.tscn" id="1_atmosphere_scene"]
+[ext_resource type="Script" path="res://addons/feng-sky/feng_sky_light.gd" id="2_sky_light"]
+
+[node name="FengSkyLightCaptureExample" type="Node3D"]
+
+[node name="AtmosphereWorld" parent="." instance=ExtResource("1_atmosphere_scene")]
+
+[node name="SkyLight" type="Node3D" parent="."]
+script = ExtResource("2_sky_light")
+capture_offset = Vector3(0, 100, 0)
+capture_resolution = 128
+capture_distance = 4000.0
