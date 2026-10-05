@@ -1,16 +1,19 @@
 @tool
 class_name FMagicGIData
 extends Resource
-## Immutable v3 surface PRT transport. Far-field illumination and receiver
-## albedo remain separate; fixed emissive surfaces add runtime-composed transport.
+## Immutable v4 surface PRT transport. Primary sky visibility stays separate
+## from secondary transport so a current SkyLight can be replaced without
+## baking its radiance into the geometry response.
 
-const FORMAT_VERSION := 3
+const FORMAT_VERSION := 4
+const EMITTER_FORMAT_VERSION := 3
 const LEGACY_FORMAT_VERSION := 2
 const SAMPLER_REVISION := 2
 const MAX_GRID_AXIS := 64
 const MAX_EMITTERS := 32
 const ATLAS_COLUMNS := 32
 const TRANSFER_TEXELS_PER_POINT := 7
+const PRIMARY_SKY_TEXELS_PER_POINT := 3
 const GEOMETRY_TEXELS_PER_POINT := 2
 const CELL_CAPACITY := 8
 const CELL_BOUNDARY_EPSILON := 0.00001
@@ -36,6 +39,9 @@ const RUNTIME_ATLAS_FILTER_EPSILON := 0.00001
 @export_storage var positions := PackedVector3Array()
 @export_storage var normals := PackedVector3Array()
 @export_storage var transfer := PackedFloat32Array()
+## Probe-major SH9 coefficients for the first-ray sky visibility/irradiance.
+## These are independent of radiance and are populated only in v4 bakes.
+@export_storage var primary_sky_visibility := PackedFloat32Array()
 ## Stable root-relative NodePath + surface-index bindings, in transport order.
 @export_storage var emitter_keys := PackedStringArray()
 ## Static texture/UV/geometry mapping fingerprints; live emission values are excluded.
@@ -78,6 +84,9 @@ func has_nonzero_transfer() -> bool:
 	for value in transfer:
 		if value != 0.0:
 			return true
+	for value in primary_sky_visibility:
+		if value != 0.0:
+			return true
 	for value in emitter_transport:
 		if value != 0.0:
 			return true
@@ -87,7 +96,9 @@ func emitter_count() -> int:
 	return emitter_keys.size()
 
 func supports_format() -> bool:
-	return format_version == LEGACY_FORMAT_VERSION or format_version == FORMAT_VERSION
+	return format_version == LEGACY_FORMAT_VERSION \
+		or format_version == EMITTER_FORMAT_VERSION \
+		or format_version == FORMAT_VERSION
 
 ## Full validation is O(points + grid cells). Volumes cache the result by
 ## resource identity and bake_version; render-frame layout checks stay O(1).
@@ -100,7 +111,8 @@ func is_valid() -> bool:
 		return false
 	if format_version == LEGACY_FORMAT_VERSION:
 		# v2 has only far-field SH transport. It remains a valid legacy bake.
-		if not emitter_keys.is_empty() or not emitter_static_signatures.is_empty() or not emitter_transport.is_empty():
+		if not emitter_keys.is_empty() or not emitter_static_signatures.is_empty() \
+				or not emitter_transport.is_empty() or not primary_sky_visibility.is_empty():
 			return false
 	else:
 		var source_count := emitter_count()
@@ -115,6 +127,14 @@ func is_valid() -> bool:
 		for value in emitter_transport:
 			if not is_finite(value) or value < 0.0:
 				return false
+		if format_version == FORMAT_VERSION:
+			if primary_sky_visibility.size() != probe_count() * 9:
+				return false
+			for value in primary_sky_visibility:
+				if not is_finite(value):
+					return false
+		elif not primary_sky_visibility.is_empty():
+			return false
 	if grid_dims.x <= 0 or grid_dims.y <= 0 or grid_dims.z <= 0:
 		return false
 	if grid_dims.x > MAX_GRID_AXIS or grid_dims.y > MAX_GRID_AXIS or grid_dims.z > MAX_GRID_AXIS:
@@ -227,13 +247,19 @@ static func _transform_is_finite(value: Transform3D) -> bool:
 		and value.basis.y.is_finite() \
 		and value.basis.z.is_finite()
 
-func evaluate(index: int, lighting: PackedFloat32Array) -> Vector3:
+func evaluate(index: int, lighting: PackedFloat32Array,
+		sky_lighting: PackedFloat32Array = PackedFloat32Array()) -> Vector3:
 	if index < 0 or index >= probe_count() or lighting.size() != 27:
 		return Vector3.ZERO
 	var result := Vector3.ZERO
 	for k in 9:
 		for channel in 3:
 			result[channel] += transfer[index * 27 + k * 3 + channel] * lighting[k * 3 + channel]
+	if format_version == FORMAT_VERSION and primary_sky_visibility.size() == probe_count() * 9 \
+			and sky_lighting.size() == 27:
+		for k in 9:
+			for channel in 3:
+				result[channel] += primary_sky_visibility[index * 9 + k] * sky_lighting[k * 3 + channel]
 	return result.max(Vector3.ZERO)
 
 ## Evaluates the baked geometry response to a unit directional source.
@@ -268,14 +294,16 @@ func make_render_upload() -> Dictionary:
 	if not is_valid():
 		return {}
 	var transfer_image := _pack_atlas_image(true)
+	var primary_sky_image := _pack_primary_sky_image()
 	var geometry_image := _pack_geometry_image()
 	var index_bytes := _pack_index_bytes()
 	var emission_image := make_emission_atlas_image(PackedFloat32Array())
-	if transfer_image == null or geometry_image == null or index_bytes.is_empty() \
+	if transfer_image == null or primary_sky_image == null or geometry_image == null or index_bytes.is_empty() \
 			or emission_image == null:
 		return {}
 	return {
 		"transfer_image": transfer_image,
+		"primary_sky_image": primary_sky_image,
 		"geometry_image": geometry_image,
 		"index_bytes": index_bytes,
 		"emission_image": emission_image
@@ -353,6 +381,22 @@ func _pack_atlas_image(regularize_transport: bool) -> Image:
 						value *= high_band_scale[coefficient % 3]
 					texel[channel] = value
 			image.set_pixel(x0 + t, y, texel)
+	return image
+
+func _pack_primary_sky_image() -> Image:
+	var image := Image.create_empty(ATLAS_COLUMNS * PRIMARY_SKY_TEXELS_PER_POINT,
+			ceili(float(probe_count()) / ATLAS_COLUMNS), false, Image.FORMAT_RGBAF)
+	for probe in probe_count():
+		var x0 := (probe % ATLAS_COLUMNS) * PRIMARY_SKY_TEXELS_PER_POINT
+		var y := probe / ATLAS_COLUMNS
+		for texel_index in PRIMARY_SKY_TEXELS_PER_POINT:
+			var texel := Color(0.0, 0.0, 0.0, 0.0)
+			for lane in 4:
+				var coefficient := texel_index * 4 + lane
+				if coefficient < 9 and format_version == FORMAT_VERSION \
+						and primary_sky_visibility.size() == probe_count() * 9:
+					texel[lane] = primary_sky_visibility[probe * 9 + coefficient]
+			image.set_pixel(x0 + texel_index, y, texel)
 	return image
 
 func _runtime_high_band_scale(probe: int) -> Vector3:

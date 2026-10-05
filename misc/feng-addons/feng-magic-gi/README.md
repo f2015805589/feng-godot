@@ -1,8 +1,8 @@
 # Feng Magic GI
 
-FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）。烘焙保存几何传输，每个接收表面点有 9 个 RGB 球谐系数；运行时与世界空间光照系数点积，再由渲染 pass 乘以接收材质反照率、非金属比例、AO 和 GI 强度。太阳或环境光变化无需重烘几何。
+FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）。烘焙保存几何传输；每个接收表面点的次级传输为 9 个 RGB 球谐系数，格式 4 另存首段天空可见性的 9 个标量系数。运行时再与世界空间光照相乘，由渲染 pass 应用接收材质反照率、非金属比例、AO、GI 强度和 SkyLight 替换权重。太阳、SkyLight 内容或能量变化无需重烘几何。
 
-远场传输从接收表面沿余弦分布发射 CPU 路径，至少经过一次漫反射反弹后逃逸才计入烘焙。每个探针使用独立随机移位的低差异序列；首段直接逃逸由引擎直射光处理。自发光面另行保存源到接收面的间接响应。
+远场传输从接收表面沿余弦分布发射 CPU 路径。首段逃逸记录为 v4 的 primary SkyLight 可见性；经过漫反射反弹后逃逸的路径仍保存在独立的 secondary transport 中，不会把当前天空辐射烘进几何数据。每个探针使用独立随机移位的低差异序列。自发光面另行保存源到接收面的间接响应。
 
 ## 使用与烘焙
 
@@ -15,11 +15,11 @@ FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）。
 
 ## 动态光照与自发光
 
-每帧将同世界可见方向光投影到 SH；Volume 的 `Sun` 和 `Lighting Environment` 可覆盖自动选择。太阳方向、颜色、能量和间接能量实时更新。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。显式 Sun 切换或清空会立即使直接光 SH 缓存失效。
+每帧将同世界可见方向光投影到 SH；Volume 的 `Sun` 可覆盖自动选择。`FengSkyLight` 是天空全局照明的提供者：Magic GI 单独接收 SkyLight SH，并将其与方向光合并后的 SH 仅用于 secondary transport。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。显式 Sun 切换或清空会立即使直接光 SH 缓存失效。Volume 上保留的 `Lighting Environment` 仅用于旧场景序列化兼容，不再隐式投影 Environment 天空；没有 ready 的 FengSkyLight 时，FRP 的 SkyLight 漫反射基底为零，太阳和发光源 PRT 仍可工作。
 
-环境通过 `RenderingServer.environment_bake_panorama` 的背景/ambient 混合语义投影。环境属性或方向光变化时，天空 SH 最多每秒刷新四次。未改变材质属性的时间驱动天空 shader 动画不会自动触发刷新。世界共享光照没有相机专属曝光归一化；物理模式下应结合实际相机曝光检查结果。
+有效且当前匹配的 v4 Bake 在 Volume 覆盖的 opaque 像素按强度权重替换全局 SkyLight 漫反射；SkyLight 镜面反射、局部反射探针和 Volume 外像素保持不变。透明材质不在本 pass 的替换范围内。格式 2/3 Bake 保持旧的 additive 行为，Inspector 会提示重新 Bake 为 v4；加载旧资源不会自动改写或失效。
 
-PRT v3 为不透明 `BaseMaterial3D` 发光表面保存独立传输，每个 Volume 最多 32 个发光材质表面。启用发光源后先重新烘焙；随后可实时改变颜色、强度、`emission_enabled` 和 Add/Multiply 运算符。物理模式还会乘以 `emission_intensity`。
+PRT v3/v4 为不透明 `BaseMaterial3D` 发光表面保存独立传输，每个 Volume 最多 32 个发光材质表面。启用发光源后先重新烘焙；随后可实时改变颜色、强度、`emission_enabled` 和 Add/Multiply 运算符。物理模式还会乘以 `emission_intensity`。
 
 - 发光纹理、UV 映射或剔除模式改变时，仅该源暂时停止贡献并提示重烘；方向光和天空传输继续可用
 - 发光源移动或静态几何改变会使整体几何传输过期
@@ -46,11 +46,11 @@ PRT v3 为不透明 `BaseMaterial3D` 发光表面保存独立传输，每个 Vol
 - `FMagicGIRuntime` 选择 Volume 并发布世界/视口快照；每个 `RuntimeState` 持有光照和发光缓存。warning getter 只读，显式诊断刷新更新警告
 - `FengMagicGIPass` 通过可选 Runtime 路径消费快照，管理 RD 纹理、UBO 和释放。Inspector/Viz 负责编辑器操作与预览
 
-`FMagicGIData` 保存世界空间位置/法线、布局、场景签名及查找索引。每个样本远场传输为 27 个 float，按系数优先、RGB 连续排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场图集每样本 7 个 RGBA32F texel，几何图集 2 个；每网格单元含 8 个有符号 32 位样本索引。
+`FMagicGIData` 保存世界空间位置/法线、布局、场景签名及查找索引。每个样本远场次级传输为 27 个 float，按系数优先、RGB 连续排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场图集每样本 7 个 RGBA32F texel；v4 primary SkyLight 可见性另存 9 个可能带正负号的标量系数，每样本用 3 个 RGBA32F texel 打包。几何图集每样本 2 个 texel；每网格单元含 8 个有符号 32 位样本索引。
 
-v3 额外保存发光源稳定键、静态签名及每源每样本 6 个 float，顺序为 source、probe、常量 RGB 响应和纹理 RGB 响应。动态 SH 与发光参数独立于烘焙资源。组合函数始终返回每探针一个有限 RGB 值；非法输入或溢出返回零响应。
+v3/v4 额外保存发光源稳定键、静态签名及每源每样本 6 个 float，顺序为 source、probe、常量 RGB 响应和纹理 RGB 响应。动态 SH 与发光参数独立于烘焙资源。组合函数始终返回每探针一个有限 RGB 值；非法输入或溢出返回零响应。
 
-当前支持 v2/v3 格式。旧随机采样器的 v2 数据需要使用低差异采样器 r2 重烘；更早的纯辐射值资源也需重烘。调整质量只改变请求值，不改写旧烘焙的样本数。
+当前支持 v2、v3、v4 格式。v2/v3 保持 additive SkyLight 行为；要启用 v4 SkyLight 漫反射替换需显式重新 Bake。旧随机采样器的 v2 数据需要使用低差异采样器 r2 重烘；更早的纯辐射值资源也需重烘。调整质量只改变请求值，不改写旧烘焙的样本数。
 
 ## 测试
 

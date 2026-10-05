@@ -11,7 +11,7 @@ const Placement = preload("feng_magic_gi_placement.gd")
 const Viz = preload("feng_magic_gi_viz.gd")
 const Data = preload("feng_magic_gi_data.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
-const ZERO_TRANSFER_DIAGNOSTIC := "本次间接传输全为零，Magic GI 不会改变画面。太阳与环境直达光由引擎处理；若需间接光，请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新烘焙。"
+const ZERO_TRANSFER_DIAGNOSTIC := "本次几何间接传输与天空可见性均为零。请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新 Bake。"
 const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
 const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 
@@ -56,6 +56,8 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 @export_range(0.0, 8.0, 0.01) var gi_strength := 1.0
 ## Optional explicit distant light/environment; otherwise the matching World3D is scanned.
 @export var sun: DirectionalLight3D
+## Legacy scene compatibility. Sky diffuse is supplied by FengSkyLight; this
+## Environment is no longer projected implicitly into Magic GI lighting.
 @export var lighting_environment: Environment
 @export var show_probes := true:
 	set(value):
@@ -289,9 +291,11 @@ func _get_configuration_warnings() -> PackedStringArray:
 			warnings.append("PRT bake data is invalid or incomplete. Re-bake to restore Magic GI.")
 		elif needs_rebake():
 			warnings.append("当前显示上次烘焙，仅供预览；场景或烘焙设置已变化，请重新 Bake。原因：%s" % "; ".join(bake_staleness_reasons()))
-		elif not _cached_has_nonzero_indirect_transport:
-			warnings.append(ZERO_TRANSFER_DIAGNOSTIC)
 		if has_usable_bake():
+			if bake_data.format_version < Data.FORMAT_VERSION:
+				warnings.append("此格式 2/3 Bake 保持旧的 additive SkyLight 行为。重新 Bake 为格式 4 后，Magic GI 才会在有效覆盖区域替换 SkyLight 漫反射。")
+			if not _cached_has_nonzero_indirect_transport:
+				warnings.append(ZERO_TRANSFER_DIAGNOSTIC)
 			var emission_warning := Runtime.emission_warning(self)
 			if not emission_warning.is_empty():
 				warnings.append(emission_warning)

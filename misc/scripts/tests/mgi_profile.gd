@@ -52,6 +52,8 @@ func make_bake() -> Resource:
 	data.positions = _volume.probe_positions.duplicate()
 	data.normals = _volume.probe_normals.duplicate()
 	data.transfer.resize(data.positions.size() * 27)
+	data.primary_sky_visibility.resize(data.positions.size() * 9)
+	data.primary_sky_visibility.fill(0.0)
 	for probe in data.positions.size():
 		data.transfer[probe * 27] = 0.28
 		data.transfer[probe * 27 + 1] = 0.28

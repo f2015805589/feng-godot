@@ -52,6 +52,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.positions = geometry.positions
 	data.normals = geometry.normals
 	data.transfer.resize(data.probe_count() * 27)
+	data.primary_sky_visibility.resize(data.probe_count() * 9)
 	data.emitter_keys = geometry.emitter_keys
 	data.emitter_static_signatures = geometry.emitter_static_signatures
 	data.emitter_transport.resize(data.probe_count() * geometry.emitter_groups.size() * 6)
@@ -109,10 +110,14 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 								data.emitter_transport[emitter_base + 3 + channel] += throughput[channel] * factor * texture_rgb[channel]
 				var hit := geometry.trace(origin, direction, volume.bake_distance)
 				if hit.is_empty():
-					# The initial escape is direct lighting and must not be baked:
-					# the engine's direct-light pass already handles it.
-					if bounce > 0:
-						var basis := Data.sh_basis(direction)
+					var basis := Data.sh_basis(direction)
+					if bounce == 0:
+						# The cosine sampler's pdf is cos(theta)/PI. These SH9
+						# coefficients integrate primary sky irradiance without
+						# mixing the current sky radiance into secondary transport.
+						for k in 9:
+							data.primary_sky_visibility[p * 9 + k] += PI * basis[k] / rays
+					elif bounce > 0:
 						for k in 9:
 							for channel in 3:
 								data.transfer[p * 27 + k * 3 + channel] += throughput[channel] * basis[k] / rays

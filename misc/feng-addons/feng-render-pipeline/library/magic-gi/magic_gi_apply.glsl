@@ -13,14 +13,17 @@ layout(set = 0, binding = 6) uniform sampler2D transfer_atlas;
 layout(set = 0, binding = 7) uniform sampler2D geometry_atlas;
 layout(set = 0, binding = 8) uniform isampler2D index_map;
 layout(set = 0, binding = 10) uniform sampler2D emission_atlas;
+layout(set = 0, binding = 11) uniform sampler2D primary_sky_atlas;
+layout(set = 0, binding = 12) uniform sampler2D sky_light_diffuse_buffer;
 
 layout(set = 0, binding = 9, std140) uniform GIParams {
 	mat4 inverse_projection;
 	mat4 world_to_grid;
 	mat4 view_to_world;
 	vec4 grid; // xyz = lookup grid dimensions; w = surface sample count.
-	vec4 control; // x = strength; y = world-space probe spacing.
-	vec4 lighting_sh[7]; // 27 world-space RGB SH floats, coefficient-major.
+	vec4 control; // x = volume strength; y = world-space probe spacing; z = exact SkyLight replacement enabled.
+	vec4 lighting_sh[7]; // 27 combined SkyLight + Directional SH floats for secondary transport.
+	vec4 sky_lighting_sh[7]; // 27 SkyLight-only SH floats for primary v4 transport.
 } params;
 
 layout(push_constant, std430) uniform PassParameters {
@@ -52,6 +55,19 @@ vec3 evaluate_probe(int probe) {
 		value += unpack_sh(transfer_blocks, coefficient)
 				* unpack_sh(params.lighting_sh, coefficient);
 	}
+	if (params.control.z > 0.5) {
+		vec4 primary_blocks[3];
+		int primary_x = (probe % 32) * 3;
+		for (int texel = 0; texel < 3; texel++) {
+			primary_blocks[texel] = texelFetch(primary_sky_atlas, ivec2(primary_x + texel, atlas_y), 0);
+		}
+		for (int coefficient = 0; coefficient < 9; coefficient++) {
+			int block = coefficient / 4;
+			int lane = coefficient % 4;
+			value += primary_blocks[block][lane]
+					* unpack_sh(params.sky_lighting_sh, coefficient);
+		}
+	}
 	vec3 emission = texelFetch(emission_atlas, ivec2(probe % 32, probe / 32), 0).rgb;
 	return max(value, vec3(0.0)) + max(emission, vec3(0.0));
 }
@@ -68,8 +84,14 @@ void main() {
 	}
 	imageStore(gi_output, pixel, vec4(0.0));
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
-	if (depth <= 0.0 || params.control.x <= 0.0 || params.grid.w <= 0.0) {
+	if (depth <= 0.0 || params.control.x <= 0.0 || pc.parameters.x <= 0.0 || params.grid.w <= 0.0) {
 		return;
+	}
+	vec4 orm = texelFetch(gbuffer_orm, pixel, 0);
+	uint packed_metadata = uint(round(clamp(orm.a, 0.0, 1.0) * 255.0));
+	uint shading_model_id = packed_metadata & 0x0Fu;
+	if (shading_model_id == 0u) {
+		return; // Unlit G-buffer pixels have no SkyLight diffuse term to replace.
 	}
 
 	vec2 screen_uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
@@ -82,7 +104,6 @@ void main() {
 	vec3 world = (params.view_to_world * vec4(view_position, 1.0)).xyz;
 	vec3 normal_view = normalize(texelFetch(normal_roughness, pixel, 0).xyz * 2.0 - 1.0);
 	vec3 normal_world = normalize(mat3(params.view_to_world) * normal_view);
-	vec4 orm = texelFetch(gbuffer_orm, pixel, 0);
 	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
 	float ao = clamp(orm.r, 0.0, 1.0);
 	float metallic = clamp(orm.b, 0.0, 1.0);
@@ -168,9 +189,15 @@ void main() {
 	if (interpolation_weight <= 0.0) {
 		return;
 	}
+	float total_strength = max(params.control.x * pc.parameters.x, 0.0);
+	float ownership_weight = params.control.z > 0.5 ? clamp(total_strength, 0.0, 1.0) : 0.0;
 	vec3 contribution = indirect / interpolation_weight
-			* albedo * (1.0 - metallic) * ao * params.control.x * pc.parameters.x * pc.parameters.y;
-	imageStore(gi_output, pixel, vec4(contribution, 1.0));
+			* albedo * (1.0 - metallic) * ao * total_strength * pc.parameters.y;
+	imageStore(gi_output, pixel, vec4(contribution, ownership_weight));
 	vec4 scene_color = imageLoad(color_image, pixel);
+	if (ownership_weight > 0.0) {
+		vec3 sky_light_diffuse = texelFetch(sky_light_diffuse_buffer, pixel, 0).rgb;
+		scene_color.rgb -= sky_light_diffuse * ownership_weight;
+	}
 	imageStore(color_image, pixel, vec4(scene_color.rgb + contribution, scene_color.a));
 }
