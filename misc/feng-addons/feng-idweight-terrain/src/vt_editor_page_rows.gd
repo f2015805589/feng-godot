@@ -61,9 +61,11 @@ static func snapshot(p_terrain: Object, p_data: Object, p_baked_mip: int) -> Sna
 	shot.settings = TerrainVTBridge.vt_settings(p_terrain)
 	shot.region_world = region_world_size(p_terrain)
 	shot.locations = TerrainVTBridge.region_locations(p_data)
-	shot.all_pages = TerrainVTBridge.resident_pages(p_terrain, "")
-	shot.avt_pages = TerrainVTBridge.resident_pages(p_terrain, "AVT")
-	shot.svt_pages = TerrainVTBridge.resident_pages(p_terrain, "SVT")
+	shot.all_pages = TerrainVTBridge.resident_pages(p_terrain)
+	for record: Dictionary in shot.all_pages:
+		match TerrainVTBridge.record_kind(record):
+			"AVT": shot.avt_pages.append(record)
+			"SVT": shot.svt_pages.append(record)
 	shot.baked_pages = TerrainVTBridge.baked_pages(p_terrain)
 	shot.avt_stats = TerrainVTBridge.view_stats(p_terrain, "AVT")
 	shot.svt_stats = TerrainVTBridge.view_stats(p_terrain, "SVT")

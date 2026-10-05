@@ -6,11 +6,10 @@ own profiling zones to it.
 
 ## The menu item
 
-**Debug > Tracy Profiler** starts the profiler. One click, nothing to configure:
-the Windows profiler ships in this addon's `bin` folder (`bin/tracy-profiler.exe`), and
-is started from there. When that file is missing - a fresh checkout, where the
-`bin` folder is not part of the repository - it is downloaded once from the Tracy
-release that matches the compiled-in client and installed in the same folder.
+**Debug > Tracy Profiler** starts the profiler. On Windows, a missing profiler is
+downloaded from the release matching the compiled-in client and installed in
+this addon's `bin/tracy-profiler.exe` (an untracked build artifact). On Linux and
+macOS, configure a compatible native executable.
 
 Executable selection checks, in order:
 
@@ -22,10 +21,8 @@ Executable selection checks, in order:
 5. The downloads folder, including the versioned folder a Tracy release unpacks
    into.
 
-Automatic installation uses the matching Windows release archive and is only
-offered on Windows. On Linux or macOS, set the executable setting (or
-`FENG_TRACY_PATH` as a full file path) to a compatible native profiler; the plugin
-does not download and attempt to run the Windows executable there.
+On Linux and macOS, use the executable setting or a full file path in
+`FENG_TRACY_PATH`. Automatic installation is Windows-only.
 
 The menu item and its separator have separate owned IDs. Disabling or reloading
 the plugin removes only those items, even if another addon rearranges the menu.
@@ -33,10 +30,9 @@ the plugin removes only those items, even if another addon rearranges the menu.
 Everything else happens inside the profiler: it lists the running editors, and
 **Connect** attaches to the one you pick.
 
-The plugin never refers to `FengGodotTracy` directly, so it also loads in an
-editor that was built without the module; starting the profiler then warns that
-this editor has no Tracy client. If the main menu is collapsed or its Debug menu
-cannot be found, the same action is added as a **Tracy** toolbar button instead.
+The plugin loads with or without the engine module. Without it, launching the
+profiler warns that the editor has no Tracy client. If the Debug menu is
+unavailable, the action appears as a **Tracy** toolbar button.
 
 ## Enabling it
 
@@ -49,13 +45,9 @@ python misc/scripts/install_tracy.py   # only needed if thirdparty/tracy is miss
 scons platform=windows target=editor arch=x86_64
 ```
 
-An editor built with `module_feng_godottracy_enabled=no` has no Tracy client;
-starting the profiler then warns about it.
-
 ## Using it
 
-1. Use **Debug > Tracy Profiler**. The profiler window opens, downloading itself
-   first if this machine has no copy yet.
+1. Use **Debug > Tracy Profiler**.
 2. Press **Connect** in that window and pick the editor. The engine already marks
    every frame, so a timeline appears as soon as it attaches.
 
@@ -81,6 +73,6 @@ if Engine.has_singleton("FengGodotTracy"):
 
 `python misc/scripts/test_feng_godottracy.py` checks the extension API, the
 script API, the menu item (including which menu it landed in, and that the
-profiler is installed next to the editor) and the Tracy protocol handshake
+profiler is installed in the addon) and the Tracy protocol handshake
 against a running editor. It needs an editor built with the module and never
 starts the profiler itself.

@@ -97,8 +97,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 						fposmod(qmc_base_coordinates[1][sample_index] + emitter_shifts[shift_index + 1], 1.0),
 						fposmod(qmc_base_coordinates[2][sample_index] + emitter_shifts[shift_index + 2], 1.0),
 						volume.bake_distance)
-					if not source_sample.is_empty() and float(source_sample.weight) > 0.0 \
-							and float(source_sample.ray_distance) > 0.0:
+					if not source_sample.is_empty():
 						var blocked := geometry.trace(source_sample.ray_origin,
 							source_sample.direction, source_sample.ray_distance)
 						if blocked.is_empty():
@@ -169,12 +168,7 @@ static func qmc_sample(sample_index: int, sample_count: int, dimension: int, shi
 	if sample_count <= 0 or sample_index < 0 or sample_index >= sample_count \
 			or dimension < 0 or dimension > QMC_PRIME_BASES.size():
 		return 0.0
-	var coordinate: float
-	if dimension == 0:
-		coordinate = (float(sample_index) + 0.5) / float(sample_count)
-	else:
-		coordinate = _radical_inverse(sample_index, QMC_PRIME_BASES[dimension - 1])
-	return fposmod(coordinate + shift, 1.0)
+	return fposmod(_qmc_base_coordinate(sample_index, sample_count, dimension) + shift, 1.0)
 
 static func _qmc_base_coordinate(sample_index: int, sample_count: int, dimension: int) -> float:
 	if dimension == 0:

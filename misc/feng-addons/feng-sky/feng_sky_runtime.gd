@@ -32,7 +32,7 @@ static func publish_rendering_snapshot(provider: Object, world_id: int, snapshot
 	var value := snapshot.duplicate(true)
 	value["world_id"] = world_id
 	value["provider_id"] = provider.get_instance_id()
-	value["render_targets"] = snapshot.get("render_targets", []).duplicate()
+	value["render_targets"] = value.get("render_targets", [])
 	_rendering_providers[world_id] = weakref(provider)
 	_rendering_by_world[world_id] = value
 	_publish_rendering_array()
@@ -195,9 +195,9 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 		var mixture_pdf := 0.5 * mie_uniform_pdf + 0.5 * mie_phase_pdf
 		var importance_weight := 1.0 / maxf(4.0 * PI * mixture_pdf, 0.000001)
 		ambient_unit += FengSkyTransport.integrate_ray(ray_origin, view_direction, sun_direction, sanitized, multi_scattering_image) * (importance_weight / float(AMBIENT_SAMPLE_COUNT))
-	ambient_unit *= (sanitized["sky_luminance_factor"] as Vector3) * (sanitized.get("sky_only_luminance_factor", Vector3.ONE) as Vector3)
+	ambient_unit *= (sanitized["sky_luminance_factor"] as Vector3) * (sanitized["sky_only_luminance_factor"] as Vector3)
 	var ground_transmittance := FengSkyTransport.ground_sun_transmittance(up, sun_direction, sanitized)
-	var irradiance := maxf(_finite_input_float(sun_irradiance, 0.0), 0.0)
+	var irradiance := maxf(FengSkyParameters.finite_float(sun_irradiance, 0.0), 0.0)
 	var source_color := _finite_vector(sun_color_linear)
 	var scaled_ambient := ambient_unit * irradiance * source_color
 	var ground_illuminance := source_color * irradiance * ground_transmittance
@@ -270,23 +270,9 @@ static func sanitize_sun_direction(direction: Vector3) -> Vector3:
 
 
 static func _finite_vector(value: Vector3) -> Vector3:
-	if not is_finite(value.x) or not is_finite(value.y) or not is_finite(value.z):
+	if not value.is_finite():
 		return Vector3.ZERO
 	return value.max(Vector3.ZERO)
-
-
-static func _finite_input_float(value: Variant, fallback: float) -> float:
-	var number := float(value)
-	return number if is_finite(number) else fallback
-
-
-static func _finite_input_vector(value: Variant, fallback: Vector3) -> Vector3:
-	if not value is Vector3:
-		return fallback
-	var vector: Vector3 = value
-	if not is_finite(vector.x) or not is_finite(vector.y) or not is_finite(vector.z):
-		return fallback
-	return vector
 
 
 static func _exp_negative(value: Vector3) -> Vector3:

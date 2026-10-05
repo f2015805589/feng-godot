@@ -1,65 +1,76 @@
 # Feng Magic GI
 
-FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）数据。烘焙只保存几何传输，与当前光照分离：每个接收表面点保存 9 个 RGB 球谐系数。运行时将传输系数与当前世界空间光照系数点积，再由渲染 pass 乘以接收材质的反照率、非金属比例、AO 和 GI 强度。因此改变太阳或环境光不用重烘焙几何。
+FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）。烘焙保存几何传输，每个接收表面点有 9 个 RGB 球谐系数；运行时与世界空间光照系数点积，再由渲染 pass 乘以接收材质反照率、非金属比例、AO 和 GI 强度。太阳或环境光变化无需重烘几何。
 
-烘焙从真实接收表面按余弦分布发射 CPU 路径；路径至少经过一次漫反射几何反弹，并在之后逃逸到光源方向时才计入传输。方向由每探针独立随机移位的低差异序列产生，再经余弦半球映射；首段直接逃逸不写进烘焙，以免与引擎 direct-light pass 重复；也不额外做余弦卷积或乘 π。
-
-## 模块边界
-
-- `FMagicGIVolume` 保存作者设置、判断烘焙是否匹配当前布局，并协调布点、异步烘焙和编辑器预览。
-- `FMagicGIPlacement` 负责几何、表面点与 BVH；`FMagicGIEmitterBakeSet` 负责发光面、纹理与 CDF 采样；`FMagicGIEmitterBinding` 共享稳定键、签名和源解析；`FMagicGISceneTracker` 跟踪场景边界与资源变化。`FMagicGIBaker` 积分路径，`FMagicGIData` 持有持久化格式、验证和运行时上传打包。
-- `FMagicGIRuntime` 负责每个 World3D 的有效 Volume 选择、视口目标路由与快照发布。`RuntimeState` 持有单个 Volume 的动态光照、发光响应缓存和诊断状态；warning 查询只读取缓存，显式诊断刷新负责更新它。
-- `FengMagicGIPass` 通过可选 Runtime 脚本路径读取只读约定的快照，并独自管理 RD 纹理、UBO 与释放；FRP 不依赖 Magic GI 的类。Inspector 与 Viz 只处理编辑器操作和预览。
+远场传输从接收表面沿余弦分布发射 CPU 路径，至少经过一次漫反射反弹后逃逸才计入烘焙。每个探针使用独立随机移位的低差异序列；首段直接逃逸由引擎直射光处理。自发光面另行保存源到接收面的间接响应。
 
 ## 使用与烘焙
 
-1. 启用 `Feng Render Pipeline` 与 `Feng Magic GI`，确保两个插件都链接到 `res://addons/`。
-2. 在场景中添加 `FMagicGIVolume`。新建 Volume 的默认布点间距为 1 米；按需要调整 `size`、`Probe Spacing` 和表面偏移。场景里已保存的间距值会保留；未显式保存该属性的 Volume 会采用新默认。改变间距后需要重新 Bake。探针只布置在 Volume 内的可见受支持表面，不需要物理碰撞体；没有几何时不会在空气中生成探针。
-3. 在 Inspector 的 **Bake quality** 中选择 **Draft 256**、**Final 1024** 或 **High 2048** rays/point，再点击 **Bake PRT Transfer**。新建 Volume 的数值默认仍为 256；现有场景不会静默改用更多样本。也可用 `Bake Samples` 设置自定义数量。质量或其他烘焙参数变化后，Inspector 会显示旧数据的实际样本数、当前请求数及需重烘状态。烘焙在 CPU 上分批追踪路径，表面较密或采样较多时会花一些时间；`Bake Bounces` 和 `Bake Distance` 控制路径深度及传输距离。烘焙成功后编辑器会将场景标记为未保存。可用 **Refresh Surface Points** 立即刷新编辑器预览。
-4. 新建的 Feng Renderer 默认在 Lighting 后加入并启用 **Magic GI** pass。没有有效烘焙，或当前视口没有同一 World3D 的 Volume 时，pass 不改变场景颜色。独立的 **Debug Buffers** pass 默认关闭；启用后可检查反照率、view-space 法线、AO、roughness、metallic、运动向量或 Magic GI 贡献。
+1. 启用 `Feng Render Pipeline` 和 `Feng Magic GI`，将两个插件链接到 `res://addons/`
+2. 添加 `FMagicGIVolume`，调整 `size`、`Probe Spacing` 和表面偏移。默认间距为 1 米，探针布置在 Volume 内可见的受支持表面上，无需碰撞体；无几何时不生成探针
+3. 在 Inspector 的 **Bake quality** 选择 **Draft 256**、**Final 1024** 或 **High 2048** rays/point，或通过 `Bake Samples` 自定义。默认 256。点击 **Bake PRT Transfer**；`Bake Bounces` 和 `Bake Distance` 控制路径深度和距离。烘焙在 CPU 分批执行，完成后场景标记为未保存
+4. 新建 Feng Renderer 默认在 Lighting 后启用 **Magic GI** pass。无有效烘焙或同世界 Volume 时，pass 保持场景颜色不变。启用 **Debug Buffers** 可检查材质、法线、AO、运动向量和 Magic GI 贡献
 
-每个 World3D 只选择最新的有效启用 Volume，不混合多个 Volume。Pass 只使用注册到当前 World3D 和视口渲染目标的 Volume，避免编辑器或游戏 SubViewport 串用另一个世界的烘焙。
+每个 World3D 选择最新有效且启用的 Volume，不混合多个 Volume。快照按世界和视口渲染目标路由。已有场景保留已保存的设置；修改布局、几何或烘焙参数后需要重烘，Inspector 显示实际/请求样本数及过期原因。**Refresh Surface Points** 可立即刷新预览。
 
-## 动态光照
+## 动态光照与自发光
 
-显式 `Sun` 在已扫描方向光之间切换或清空时，直接光 SH 缓存立即失效；天空来源和显式直接光选择分别跟踪。
-物理光照模式同时使用 lux 和 Godot 的相关色温，非物理模式不应用色温。
-`python misc/scripts/test_feng_runtime_contracts.py --editor /path/to/godot`
-以无 GPU 测试覆盖这两个模式及 Fog/Magic GI 的独立视口注册生命周期。
+每帧将同世界可见方向光投影到 SH；Volume 的 `Sun` 和 `Lighting Environment` 可覆盖自动选择。太阳方向、颜色、能量和间接能量实时更新。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。显式 Sun 切换或清空会立即使直接光 SH 缓存失效。
 
-FMagicGI 每帧将匹配世界中的可见 `DirectionalLight3D` 与选定环境投影到世界空间 SH。可在 Volume 的 `Sun` 或 `Lighting Environment` 属性中指定来源；留空时使用同一 World3D 的环境或 fallback environment。太阳颜色、方向、能量和间接能量变化会实时更新光照系数，不改烘焙传输。非物理光照单位按 Godot 引擎的缩放处理；物理光照模式读取光源 lux 强度。环境全景使用 `RenderingServer.environment_bake_panorama` 的背景/ambient 混合语义；环境属性或方向光变化时，天空 SH 最多每秒刷新四次。
+环境通过 `RenderingServer.environment_bake_panorama` 的背景/ambient 混合语义投影。环境属性或方向光变化时，天空 SH 最多每秒刷新四次。未改变材质属性的时间驱动天空 shader 动画不会自动触发刷新。世界共享光照没有相机专属曝光归一化；物理模式下应结合实际相机曝光检查结果。
 
-当前只将远距离方向光和环境全景纳入动态 SH；点光源和聚光灯不投影到此 PRT 光照场。未修改材质属性的时间驱动天空 shader 动画不会被自动识别。共享世界光照系数没有套用相机专属曝光，因此物理光照模式下的 Magic GI 不匹配各相机曝光归一化。
+PRT v3 为不透明 `BaseMaterial3D` 发光表面保存独立传输，每个 Volume 最多 32 个发光材质表面。启用发光源后先重新烘焙；随后可实时改变颜色、强度、`emission_enabled` 和 Add/Multiply 运算符。物理模式还会乘以 `emission_intensity`。
 
-## 材质自发光
+- 发光纹理、UV 映射或剔除模式改变时，仅该源暂时停止贡献并提示重烘；方向光和天空传输继续可用
+- 发光源移动或静态几何改变会使整体几何传输过期
+- v2 数据保留方向光与天空贡献；场景存在发光材质时提示重烘以加入发光传输
 
-PRT v3 会为不透明 `BaseMaterial3D` 自发光表面烘焙独立的间接传输；每个 Volume 最多支持 32 个发光材质表面，发光路径受 CPU 烘焙工作预算限制。场景启用发光源后需先重新烘焙，CPU 烘焙会为它们保存传输；之后发光颜色、强度以及 `emission_enabled` 开关在运行时读取，无需重烘，`Add` 与 `Multiply` 运算符也可实时切换。启用物理光照单位时，发光强度还会乘以材质的 `emission_intensity`。自发光纹理内容、纹理资源、UV 映射或表面剔除模式发生变化时，仅该源的烘焙传输会被标为过期并暂不贡献，其他方向光/天空烘焙仍可使用；重新烘焙后恢复该源。移动发光源或场景几何变化会使整体静态传输过期，需重新烘焙。发光间接光只支持漫反射传输；镜面反射、动态点光源/聚光灯、`ShaderMaterial` 发光和透明表面不受支持。
+动态光照支持远场方向光、环境全景和已烘焙发光面；不包括点光源、聚光灯、镜面传输、透明表面或 `ShaderMaterial` 自发光。
 
-旧 PRT v2 资源继续提供已有的方向光与天空间接光，但没有发光面传输。场景中存在发光材质时，Volume 会提示重新烘焙以加入自发光贡献；加载旧数据不会把整份 GI 关闭。
+## 几何、材质与容量
 
-## 表面与材质支持
+- `ArrayMesh` 从各三角形表面采样。单材质非 `ArrayMesh` 通过 `PrimitiveMesh.get_mesh_arrays()` 或 `Mesh.get_faces()` 采样；无法还原各面材质的多材质非 `ArrayMesh` 拒绝烘焙
+- Terrain3D 通过支持洞孔的 `get_surface_height()` 采样。CPU 不执行地形分层 shader，使用 `Terrain Reflectance` 作为漫反射反照率
+- `BaseMaterial3D` 使用 albedo tint 和 metallic，不读取 albedo 贴图像素。`ShaderMaterial` 使用 `Fallback Material Reflectance`。透明表面跳过
+- 上限为每轴 64 个网格单元、每格 8 个样本、65,536 个样本、32 个发光表面、250,000 个网格三角形，以及 20,000,000 的 CPU 路径工作预算。超过容量会报错
 
-- `ArrayMesh` 的三角形表面从真实网格采样。单材质表面的非 `ArrayMesh`（例如 `BoxMesh`）从 `PrimitiveMesh.get_mesh_arrays()` 或 `Mesh.get_faces()` 采样；由于这些路径无法还原每面的材质，多材质面的非 `ArrayMesh` 会拒绝烘焙。
-- Terrain3D 从支持洞孔的 `get_surface_height()` 高度数据采样，不依赖碰撞形状。烘焙器不会运行 Terrain3D 分层 shader，请用 `Terrain Reflectance` 指定 CPU 烘焙使用的漫反射反照率。
-- `BaseMaterial3D` 使用 albedo tint 与 metallic 参数；不会读取 albedo 贴图像素，存在贴图时仍使用材质 tint。`ShaderMaterial` 使用 `Fallback Material Reflectance`。透明表面会跳过。
-- 烘焙表示漫反射间接传输，不包含镜面反射、动态点/聚光灯或任意 shader 反照率。只有可见支持的几何会参与。
+## 编辑器预览
 
-网格与查找容量有明确上限：每轴最多 64 个网格单元、每个查找格最多 8 个表面样本、最多 65,536 个样本、最多 32 个发光表面、250,000 个网格三角形，CPU 路径工作量也有上限。超过限制或不能表示场景时烘焙会报错，不会静默丢弃几何。旧版只保存辐射的资源不符合 v2，必须重新烘焙。
+**Show Probes** 默认开启：未烘焙表面点为灰色，烘焙后显示世界 +Y 单位方向光下的几何传输响应。**Show SH Probes** 默认关闭，开启后用径向网格显示传输响应，最多 256 个样本。预览跟随 Volume 变换，并在几何或布点设置改变后刷新。
 
-## 编辑器可视化
+## 模块与数据契约
 
-`Show Probes`（默认开启）会显示采样到的表面点；未烘焙时为灰色，烘焙后按单位方向光从世界 +Y 入射时的几何传输响应着色。`Show SH Probes` 默认关闭；开启后以径向网格可视化几何传输响应，而不是烘焙的或当前的光照辐射，最多显示 256 个样本。预览会跟随 Volume 变换，并在场景几何或布点设置变化后更新。
+- `FMagicGIVolume` 管理设置、布局匹配、异步烘焙和预览
+- `FMagicGIPlacement` 管理几何、布点和 BVH；`FMagicGIEmitterBakeSet` 管理发光面与面积采样；`FMagicGIEmitterBinding` 管理稳定键和签名；`FMagicGISceneTracker` 跟踪场景/资源变化
+- `FMagicGIBaker` 积分路径；`FMagicGIData` 验证持久化资源、组合发光响应并打包上传数据
+- `FMagicGIRuntime` 选择 Volume 并发布世界/视口快照；每个 `RuntimeState` 持有光照和发光缓存。warning getter 只读，显式诊断刷新更新警告
+- `FengMagicGIPass` 通过可选 Runtime 路径消费快照，管理 RD 纹理、UBO 和释放。Inspector/Viz 负责编辑器操作与预览
 
-## Eye Adaptation GPU 回归
+`FMagicGIData` 保存世界空间位置/法线、布局、场景签名及查找索引。每个样本远场传输为 27 个 float，按系数优先、RGB 连续排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场图集每样本 7 个 RGBA32F texel，几何图集 2 个；每网格单元含 8 个有符号 32 位样本索引。
 
-`misc/scripts/tests/frp_exposure_balance.gd` 用真实 FRP 渲染一组带程序天空、Height Fog 和合成 PRT 传输的接收面，分别切换 Magic GI、Height Fog 与 Eye Adaptation 的 pre-exposure。可用 `python misc/scripts/tests/run_frp_exposure_balance.py --binary <Godot editor binary>` 在 GPU 上运行；默认选择 Vulkan，也可用 `--driver d3d12` 指定 D3D12。测试会在 `bin/` 下保留隔离项目、日志和可选 PNG。物理光照模式以 `light_energy=1`、`light_intensity_lux=60000` 运行，并要求 Sky、Fog、GI 的 PE on/off LDR 差不超过 0.01、曝光 scale 差不超过 2%；GI 与 Fog 开关也必须对各自采样点产生可见变化。非物理 `light_energy=60000` 保留作诊断模式；该强度下固定曝光的 GI 接收点及自动曝光的 Fog/接收点会剪裁，因此不作为 PE 数值断言。
+v3 额外保存发光源稳定键、静态签名及每源每样本 6 个 float，顺序为 source、probe、常量 RGB 响应和纹理 RGB 响应。动态 SH 与发光参数独立于烘焙资源。组合函数始终返回每探针一个有限 RGB 值；非法输入或溢出返回零响应。
 
-在 `test-1` 隔离副本里，原 `project.godot` 未启用物理光照单位，保存的 `DirectionalLight3D.light_energy` 是 6.0；场景没有 `WorldEnvironment`、`Environment` 或 `Sky`。以非物理 `light_energy=60000` 运行 Eye Adaptation 扩展范围（EV100 `-10..20`）时，PE on/off scale 为 `0.00014329/0.00014371`，地形采样的 LDR 差约一个 8-bit 码；GI 开关造成的地形采样差不超过 `0.004`。物理单位副本使用 `light_energy=1`、`light_intensity_lux=60000`，PE on/off scale 为 `0.00046034/0.00046197`，地形差不超过 `0.004`。原场景的黑色背景在 PE on/off 都保持黑色；Fog 关闭时同一背景是默认灰色，启用 Fog 后又变黑。
+当前支持 v2/v3 格式。旧随机采样器的 v2 数据需要使用低差异采样器 r2 重烘；更早的纯辐射值资源也需重烘。调整质量只改变请求值，不改写旧烘焙的样本数。
 
-加入 Physical Sky 并关闭 Fog 后，隔离副本可见天空；原太阳方向的 `basis.z.y=-0.32295` 位于 Physical Sky 的地平线下方。为避免方向对照被 LDR 剪裁，本次副本测试把 sky energy multiplier 设为 `0.0001`，并固定手动曝光（f/16、1/60、ISO 100）；将 `basis.z.y` 改为正值后左上天空 RGB 从约 `(0.078, 0.110, 0.086)` 增至 `(0.137, 0.161, 0.149)`。Fog 打开后两种太阳方向的天空都回到接近黑色。该强度和手动曝光仅用于方向诊断，没有写入用户项目。已测证据没有显示 GI/Fog/Sky 的 pre-exposure 单位不一致，因此不应通过任意调低 GI 或重复乘 PE 来补偿天空亮度。原场景的雾密度为 0.5、散射颜色固定为约 0.816；在强光适应后，它会显著衰减天空并压低固定辐射度的雾散射贡献。
+## 测试
 
-## PRT v3 数据
+无 GPU 的世界/视口所有权和物理/非物理光照检查：
 
-`FMagicGIData` 保存世界空间表面采样位置与法线、每个样本 27 个远场传输 float、发光源稳定键与各源每样本 6 个传输 float、Volume 布局元数据、持久化场景签名和查找索引。远场系数按“系数优先、RGB 分量连续”排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场传输图集每个样本 7 个 RGBA32F texel，几何图集每个样本 2 个 RGBA32F texel；每个网格单元保存 8 个有符号 32 位样本索引。发光传输按 source、probe、两种 RGB 基底排列：常量颜色响应与静态发光纹理调制响应。
+```sh
+python misc/scripts/test_feng_runtime_contracts.py --editor /path/to/godot
+```
 
-方向光和环境光仍独立保存在 27 个动态 SH 系数中；实时发光参数只重组已有的发光传输，不会改写烘焙资源。几何、发光纹理/UV 映射、Volume 布局或烘焙设置不再匹配时，相关传输会提示重新烘焙。format-2 旧数据仍可提供远场光照；只有早期仅保存辐射值、不能表示几何传输的资源需要重新烘焙。旧随机采样器生成的 format-2 资源仍会被标记为过期，必须使用当前低差异采样器 r2 重新烘焙。Inspector 显示本次实际使用的 rays/point，切换质量只更新 Volume 的请求值，不会改写旧烘焙的数据或样本数。本次模块整理不改变 v2/v3 持久化布局，也不改变采样器 r2 的数值序列。
+在已导入上述插件的隔离项目中，运行无界面契约测试：
+
+```sh
+/path/to/godot --headless --path /path/to/project --script res://addons/feng-magic-gi/tests/test_runtime_state.gd
+```
+
+完整 PRT 与 GPU 集成：
+
+```sh
+python misc/scripts/test_magic_gi.py --binary /path/to/godot --driver vulkan
+python misc/scripts/tests/run_frp_exposure_balance.py --binary /path/to/godot
+```
+
+`test_magic_gi.py` 覆盖布点、烘焙、持久化格式、发光源变化、相机变换和视口路由；Linux 无显示器时可加 `--xvfb`。曝光测试使用程序天空、Height Fog 和合成 PRT，在 60,000 lux 物理模式下检查 GI/Fog 可见贡献，以及 pre-exposure 开关的 LDR 差 ≤ 0.01、曝光 scale 差 ≤ 2%。日志、隔离项目和可选 PNG 保留在 `bin/` 下。

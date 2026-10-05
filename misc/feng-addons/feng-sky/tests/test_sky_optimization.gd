@@ -276,7 +276,34 @@ func test_dirty_updates() -> void:
 	other_viewport.free()
 
 
+class SnapshotProvider extends RefCounted:
+	func _feng_sky_rendering_is_active(_world_id: int) -> bool:
+		return true
+
+
+func test_snapshot_copy_boundary() -> void:
+	var provider := SnapshotProvider.new()
+	var world_id := provider.get_instance_id()
+	var input := {"settings": {"gain": Vector3.ONE}, "render_targets": [RID()]}
+	Runtime.publish_rendering_snapshot(provider, world_id, input)
+	input["settings"]["gain"] = Vector3.ZERO
+	input["render_targets"].clear()
+	var published := Runtime.rendering_snapshot_for_world(world_id)
+	require(published["settings"]["gain"] == Vector3.ONE and published["render_targets"].size() == 1,
+		"publication must own deep copies of source settings and targets")
+	published["settings"].clear()
+	published["render_targets"].clear()
+	var reread := Runtime.rendering_snapshot_for_world(world_id)
+	require(reread["settings"]["gain"] == Vector3.ONE and reread["render_targets"].size() == 1,
+		"main-thread readers must receive isolated snapshot copies")
+	Runtime.publish_rendering_snapshot(provider, world_id, {})
+	require(Runtime.rendering_snapshot_for_world(world_id)["render_targets"].is_empty(),
+		"an omitted render-target list must retain its empty default")
+	Runtime.remove_rendering_snapshot(provider, world_id)
+
+
 func run() -> void:
+	test_snapshot_copy_boundary()
 	test_lut()
 	test_view_equivalence()
 	await test_dirty_updates()

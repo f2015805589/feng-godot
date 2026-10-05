@@ -1,43 +1,45 @@
 # Source addons
 
-The source-built editor in `bin/` links each directory containing `plugin.cfg`
-here into a project's `addons/` directory before scanning project resources.
-Windows uses directory junctions through the Windows API; other platforms use
-symbolic links. No administrator rights, PowerShell script, or build-time copy
-is needed on Windows. Keep the editor in this checkout's `bin/` directory.
+Run the source-built editor from this checkout's `bin/` directory. Before the
+project resource scan, it links each addon directory containing `plugin.cfg`
+into the project's `addons/`: directory junctions on Windows, symbolic links on
+other platforms. Windows junctions use the Windows API and need no administrator
+rights or setup script.
 
-Both new and existing projects receive missing addons. Newly linked plugins
-are enabled without replacing the project's existing enabled-plugin list.
-Later launches preserve disabled plugins. Recovery mode does not create links.
-Links made by the old editor into this checkout's `bin/addons/` are migrated.
-Existing ordinary directories and links to other locations are kept, with a
-warning; move any local modifications somewhere safe before removing a
-conflicting addon yourself. The engine does not delete or back up these files.
+## Project setup
 
-Changes to scripts and assets are visible through the links immediately.
-Native DLLs still need their own build; close editors using them before rebuilding:
+New and existing projects receive missing addons. Newly linked plugins are
+added to the enabled-plugin list; later launches preserve enabled/disabled
+choices. Recovery mode skips link creation.
 
-On Windows, run `build-feng-godot.bat` from the repository root to build the
-x86_64 editor with D3D12 and both native debug DLLs in one step. Double-clicking
-keeps the result window open; use `--no-pause` from a terminal. GDScript addons
-use their source files directly.
+Existing directories and links to other locations are preserved with a warning.
+To replace a conflicting local copy, first save any local changes, then remove
+the conflict yourself and reopen the project. Links previously created into
+this checkout's `bin/addons/` are migrated automatically, preserving plugin state.
+
+Scripts and assets update immediately through the links. Projects using them
+depend on the source checkout. For standalone distribution, include real copies
+of runtime addons and native libraries for the destination platform.
+
+## Native builds
+
+On Windows, `build-feng-godot.bat` in the repository root builds the x86_64 D3D12
+editor and both native debug extensions. Double-clicking keeps the result window
+open; use `--no-pause` from a terminal. To build the extensions separately:
 
 ```powershell
 scons -C misc/feng-addons/feng-idweight-terrain/native platform=windows target=template_debug arch=x86_64
 scons -C misc/feng-addons/feng-renderdoc-capture/native platform=windows target=template_debug arch=x86_64
 ```
 
-Restart the editor to reload a rebuilt DLL. `native/.gdignore` keeps compiler
-sources out of Godot's resource scan. For release exports, also build the native
-extensions with `target=template_release` (and the appropriate target platform).
+Close editors using a DLL before rebuilding, then restart to load it.
+`native/.gdignore` keeps compiler sources out of the resource scan. Release
+exports also need `target=template_release` libraries for their target platform.
 
-These projects depend on the source checkout while using links. To distribute
-a project independently, include real copies of its runtime addons and the
-native libraries for the destination platform. The legacy `link_plugin.ps1`
-is unnecessary with this editor.
+## Verification
 
 After building the Windows editor and both debug extensions, run
-`python misc/scripts/test_feng_addons.py` to verify startup links, preservation
-of existing addons and disabled plugins, recovery mode, legacy link migration,
-and full editor import with both native classes. Fixtures and logs stay in
-`bin/feng-addons-test-*`; editor settings are isolated from your user profile.
+`python misc/scripts/test_feng_addons.py`. It checks startup links, existing addon
+and disabled-plugin preservation, recovery mode, legacy link migration, and
+editor import with both native classes. Fixtures and logs stay in
+`bin/feng-addons-test-*`; editor settings are isolated from the user profile.

@@ -121,7 +121,7 @@ static func _validate_custom_contracts(
 			if output_producers.has(output.name):
 				warnings.append("Output texture '%s' is produced by more than one pass." % output.name)
 			else:
-				output_producers[output.name] = {"index": i, "enabled": is_entry_enabled_fn.call(pass_entry)}
+				output_producers[output.name] = i
 
 	for i in passes.size():
 		var pass_entry = passes[i]
@@ -134,10 +134,8 @@ static func _validate_custom_contracts(
 				if not output_producers.has(input.custom_name):
 					warnings.append("Pass '%s' references pipeline texture '%s', but no pass produces it." % [_pass_display_name(pass_entry), input.custom_name])
 				else:
-					var producer: Dictionary = output_producers[input.custom_name]
-					if not producer["enabled"]:
-						warnings.append("Pass '%s' reads pipeline texture '%s' from a disabled producer." % [_pass_display_name(pass_entry), input.custom_name])
-					elif producer["index"] >= i and not (producer["index"] == i and input.binding_type == PassTexture.BindingType.STORAGE_IMAGE):
+					var producer_index: int = output_producers[input.custom_name]
+					if producer_index >= i and not (producer_index == i and input.binding_type == PassTexture.BindingType.STORAGE_IMAGE):
 						warnings.append("Pass '%s' reads pipeline texture '%s' before its producer; reorder the authored list." % [_pass_display_name(pass_entry), input.custom_name])
 
 			var required_native := PassTexture.required_native_pass(input.source)
@@ -156,10 +154,8 @@ static func _validate_custom_contracts(
 
 	return warnings
 
-static func _pass_display_name(pass_entry: Object) -> String:
-	if pass_entry == null:
-		return ""
-	if pass_entry.get("resource_name") != null and pass_entry.resource_name != "":
+static func _pass_display_name(pass_entry: FengPass) -> String:
+	if not pass_entry.resource_name.is_empty():
 		return pass_entry.resource_name
 	return pass_entry.get_class()
 

@@ -10,8 +10,8 @@ const Data = preload("feng_magic_gi_data.gd")
 var volume_ref: WeakRef
 var published_sequence := 0
 var data_key := ""
-var lighting: FMagicGILighting
-var emission_helper: FMagicGIEmission
+var lighting := Lighting.new()
+var emission_helper := Emission.new()
 var emission_identity := ""
 var emission_source_values := PackedFloat32Array()
 var emission_payload := PackedFloat32Array()
@@ -20,10 +20,6 @@ var emission_warning := ""
 
 func attach(volume: FMagicGIVolume) -> void:
 	volume_ref = weakref(volume)
-	if lighting == null or not is_instance_valid(lighting):
-		lighting = Lighting.new()
-	if emission_helper == null or not is_instance_valid(emission_helper):
-		emission_helper = Emission.new()
 
 func get_volume() -> FMagicGIVolume:
 	return volume_ref.get_ref() as FMagicGIVolume if volume_ref != null else null
@@ -45,36 +41,18 @@ func update_emission_snapshot(volume: FMagicGIVolume, data: Data, bake_version: 
 	if identity == emission_identity and source_values == emission_source_values:
 		return false
 
-	var payload := _zero_emission_payload(data.probe_count())
-	var composed: PackedFloat32Array = data.compose_emission(source_values)
-	if composed.size() == data.probe_count() * 3:
-		var finite := true
-		for value in composed:
-			if not is_finite(value):
-				finite = false
-				break
-		if finite:
-			payload = composed
-		else:
-			emission_warning = "Magic GI emissive response contains non-finite values; rebake the volume."
-	else:
-		emission_warning = "Magic GI emissive response does not match the baked probe count; rebake the volume."
+	# Data owns composition validation and returns finite RGB for every probe.
+	emission_payload = data.compose_emission(source_values)
 
 	emission_identity = identity
 	emission_source_values = source_values
-	emission_payload = payload
 	return true
 
 func _read_emission_sources(volume: FMagicGIVolume, data: Data) -> PackedFloat32Array:
-	if emission_helper == null or not is_instance_valid(emission_helper):
-		emission_helper = Emission.new()
 	var source_values := emission_helper.read_source_values(volume, data)
 	emission_warning = emission_helper.get_warning()
-	var emitter_count := data.emitter_count()
-	if source_values.size() != emitter_count * 6:
-		source_values.resize(emitter_count * 6)
-		source_values.fill(0.0)
-		emission_warning += " Magic GI emissive values do not match the saved source bindings."
+	# The helper fixes the array shape. Check the packed values because a finite
+	# GDScript float can overflow when stored as float32.
 	var finite := true
 	for value in source_values:
 		if not is_finite(value):
@@ -84,9 +62,3 @@ func _read_emission_sources(volume: FMagicGIVolume, data: Data) -> PackedFloat32
 		source_values.fill(0.0)
 		emission_warning += " Magic GI emissive values were non-finite and have been disabled."
 	return source_values
-
-func _zero_emission_payload(probe_count: int) -> PackedFloat32Array:
-	var payload := PackedFloat32Array()
-	payload.resize(maxi(0, probe_count) * 3)
-	payload.fill(0.0)
-	return payload

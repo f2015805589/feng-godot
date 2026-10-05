@@ -21,7 +21,7 @@ static func clear(compositor: Compositor) -> void:
 ## candidate has warnings. Callers retain ownership of last_valid_schedule.
 static func apply(
 	compositor: Compositor,
-	manager,
+	manager: FengTextureManager,
 	passes: Array,
 	plan: Dictionary,
 	warnings: PackedStringArray,
@@ -41,7 +41,7 @@ static func apply(
 				if effect == manager or effect is BuiltinPass:
 					continue
 				RenderingServer.compositor_effect_set_enabled(effect.get_rid(), false)
-			_clear_manager(manager)
+			manager.passes.clear()
 		for warning in warnings:
 			push_warning("FengRenderer: " + warning)
 		return {"applied": false, "tokens": PackedInt32Array()}
@@ -60,13 +60,12 @@ static func apply(
 			pass_entry.needs_separate_specular = contract.needs_separate_specular
 		RenderingServer.compositor_effect_set_enabled(pass_entry.get_rid(), is_entry_enabled_fn.call(pass_entry))
 
-	var effects: Array = plan.get("effects", [])
-	var scripted_effects: Array = plan.get("scripted_effects", [])
-	_set_manager_passes(manager, scripted_effects)
-	compositor.compositor_effects = effects
+	if manager != null:
+		manager.passes = plan.scripted_effects
+	compositor.compositor_effects = plan.effects
 
-	var tokens := PackedInt32Array(plan.get("tokens", PackedInt32Array()))
-	var names := PackedStringArray(plan.get("names", PackedStringArray()))
+	var tokens: PackedInt32Array = plan.tokens
+	var names: PackedStringArray = plan.names
 	# Resolve immediately before upload: dynamic pass fields and Volume overrides must
 	# not be served from a cached execution plan.
 	var provided := PackedInt32Array(get_provided_native_ids_fn.call())
@@ -89,17 +88,3 @@ static func upload(
 		provided_native_ids,
 		parameters
 	)
-
-static func _clear_manager(manager) -> void:
-	if manager == null:
-		return
-	var current = manager.get("passes")
-	if current is Array:
-		current.clear()
-	else:
-		manager.set("passes", [])
-
-static func _set_manager_passes(manager, scripted_effects: Array) -> void:
-	if manager == null:
-		return
-	manager.set("passes", scripted_effects)

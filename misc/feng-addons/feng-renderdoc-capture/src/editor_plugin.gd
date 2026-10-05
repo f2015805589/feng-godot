@@ -6,7 +6,7 @@ const SETTING_EXE := "renderdoc/capture/executable_path"
 var button: Button
 var _busy := false
 var _capture_generation := 0
-var _capture_forced_viewports: Array = []
+var _capture_forced_viewports: Array[Dictionary] = []
 
 
 func _enter_tree() -> void:
@@ -149,7 +149,7 @@ func _prepare_capture_viewports() -> void:
 	_restore_capture_viewports()
 	for index in range(4):
 		var viewport = EditorInterface.get_editor_viewport_3d(index)
-		if viewport == null or not is_instance_valid(viewport):
+		if not is_instance_valid(viewport):
 			continue
 		# SubViewport is a Node rather than a CanvasItem, so visibility must be
 		# checked on its container when that container exposes CanvasItem's API.
@@ -165,9 +165,9 @@ func _prepare_capture_viewports() -> void:
 
 func _restore_capture_viewports() -> void:
 	for entry in _capture_forced_viewports:
-		var viewport = entry.get("viewport")
-		if viewport != null and is_instance_valid(viewport):
-			viewport.set_update_mode(entry.get("mode", SubViewport.UPDATE_WHEN_VISIBLE))
+		var viewport = entry["viewport"]
+		if is_instance_valid(viewport):
+			viewport.set_update_mode(entry["mode"])
 	# Clearing the member makes restoration idempotent and releases stale node
 	# references after a completed or interrupted capture.
 	_capture_forced_viewports.clear()

@@ -720,7 +720,7 @@ func _refresh_world_binding() -> void:
 		secondary = null # One light cannot contribute twice through the two slots.
 	var source := _light_source(selected_sun)
 	var second_source := _light_source(secondary)
-	_update_sky_shader(source["direction"], source["color"], source["irradiance"], second_source)
+	_update_sky_shader(source, second_source)
 	var sky_gain := _background_energy_gain()
 	var physical_units := _uses_physical_light_units()
 	var signature: Array = [world_id, source, second_source, sky_gain, physical_units,
@@ -729,7 +729,7 @@ func _refresh_world_binding() -> void:
 	var render_signature := signature + [render_targets]
 	if render_signature != _last_rendering_snapshot_signature:
 		FengSkyRuntime.publish_rendering_snapshot(self, world_id, {
-			"settings": _atmosphere_settings().duplicate(true),
+			"settings": _atmosphere_settings(),
 			"sun_light_rid": source["rid"], "sun_direction": source["direction"],
 			"sun_color_linear": source["color"], "sun_irradiance": source["irradiance"],
 			"secondary_sun_light_rid": second_source["rid"], "secondary_sun_direction": second_source["direction"],
@@ -758,7 +758,6 @@ func _refresh_world_binding() -> void:
 				ground_illuminance = (cache["ground_transmittance"] as Vector3) * irradiance * color
 	ambient = ambient.min(Vector3.ONE * MAX_SKY_RADIANCE)
 	FengSkyRuntime.publish_snapshot(self, world_id, {
-		"world_id": world_id, "provider_id": get_instance_id(),
 		"sun_light_id": source["id"], "sun_direction": source["direction"],
 		"sun_ground_illuminance": _finite_nonnegative(ground_illuminance),
 		"sun_irradiance_unit": "lux" if physical_units else "frp_normalized",
@@ -941,7 +940,7 @@ func _ambient_cache_bin(zenith_bin: int, up: Vector3, include_multiple_scatterin
 	_ambient_last_compute_usec = Time.get_ticks_usec() - compute_start_usec
 	_ambient_total_compute_usec += _ambient_last_compute_usec
 	_ambient_cache_miss_count += 1
-	_ambient_cache_evaluation_count += int(computed.get("ambient_sample_count", 0))
+	_ambient_cache_evaluation_count += int(computed["ambient_sample_count"])
 	var entry := {
 		"ambient_unit_sun": computed["ambient_unit_sun"],
 		"ground_transmittance": computed["ground_transmittance"],
@@ -974,7 +973,7 @@ func _surface_up() -> Vector3:
 	return surface_origin.normalized() if surface_origin.length_squared() > 0.001 else Vector3.UP
 
 
-func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradiance: float, secondary: Dictionary = {}) -> void:
+func _update_sky_shader(primary: Dictionary, secondary: Dictionary) -> void:
 	if not _has_selected_atmosphere_sky():
 		return
 	var material := environment.sky.sky_material as ShaderMaterial
@@ -1007,20 +1006,21 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 	var primary_disk_scale := _disk_color_vector(sun_disk_color_scale)
 	var secondary_disk_scale := _disk_color_vector(secondary_sun_disk_color_scale)
 	var material_signature: Array = [material.get_instance_id(), material.shader.get_instance_id(),
-		_settings_revision, sun_direction, sun_color, sun_irradiance, sky_gain, secondary,
+		_settings_revision, primary["direction"], primary["color"], primary["irradiance"], sky_gain, secondary,
 		secondary_sun_source_angle_deg, primary_disk_scale, secondary_disk_scale]
 	if material_signature == _last_material_signature:
 		return
 	var sky_radiance_limit := 0.0
 	if sky_gain > 0.0:
 		sky_radiance_limit = MAX_SKY_RADIANCE / maxf(sky_gain, 0.000001)
-	material.set_shader_parameter("sun_direction", FengSkyRuntime.sanitize_sun_direction(sun_direction))
-	material.set_shader_parameter("sun_color_linear", sun_color.max(Vector3.ZERO))
-	material.set_shader_parameter("sun_irradiance", minf(maxf(sun_irradiance, 0.0), MAX_SOLAR_IRRADIANCE))
+	# _light_source() supplies the same normalized contract for both slots.
+	material.set_shader_parameter("sun_direction", primary["direction"])
+	material.set_shader_parameter("sun_color_linear", primary["color"])
+	material.set_shader_parameter("sun_irradiance", primary["irradiance"])
 	material.set_shader_parameter("sky_radiance_limit", sky_radiance_limit)
-	material.set_shader_parameter("secondary_sun_direction", secondary.get("direction", Vector3.UP))
-	material.set_shader_parameter("secondary_sun_color_linear", secondary.get("color", Vector3.ZERO))
-	material.set_shader_parameter("secondary_sun_irradiance", secondary.get("irradiance", 0.0))
+	material.set_shader_parameter("secondary_sun_direction", secondary["direction"])
+	material.set_shader_parameter("secondary_sun_color_linear", secondary["color"])
+	material.set_shader_parameter("secondary_sun_irradiance", secondary["irradiance"])
 	material.set_shader_parameter("secondary_sun_angular_radius_deg", clampf(FengSkyParameters.finite_float(secondary_sun_source_angle_deg * 0.5, 0.26785), 0.0, 2.5))
 	material.set_shader_parameter("sun_disk_color_scale", primary_disk_scale)
 	material.set_shader_parameter("secondary_sun_disk_color_scale", secondary_disk_scale)
@@ -1029,7 +1029,7 @@ func _update_sky_shader(sun_direction: Vector3, sun_color: Vector3, sun_irradian
 
 
 func _finite_nonnegative(value: Vector3) -> Vector3:
-	if not is_finite(value.x) or not is_finite(value.y) or not is_finite(value.z):
+	if not value.is_finite():
 		return Vector3.ZERO
 	return value.max(Vector3.ZERO)
 

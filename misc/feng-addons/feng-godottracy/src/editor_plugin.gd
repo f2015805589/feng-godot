@@ -1,20 +1,11 @@
 @tool
 extends EditorPlugin
 
-## Starts the Tracy profiler from the editor's **Debug** menu, next to the
-## deployment and debug-draw options. One click, no questions asked.
-##
-## An explicit executable setting takes priority over this addon's bundled
-## Windows profiler. FENG_TRACY_PATH, the editor folder and downloads are
-## fallbacks. Automatic installation uses the matching Windows release;
-## other platforms require a configured native profiler executable.
-##
-## If the Debug menu cannot be found (for example with a collapsed main menu),
-## the same action is added as a toolbar button instead.
-##
-## The engine module that provides the client is optional, so the singleton is
-## looked up at runtime. Naming `FengGodotTracy` directly would stop this script
-## from parsing in an editor that was built without the module.
+## Starts Tracy from the Debug menu, or a toolbar button when that menu is absent.
+## Executable selection: editor setting, addon bin, FENG_TRACY_PATH, editor folder,
+## downloads. Automatic installation uses the matching Windows release.
+## Resolve the optional FengGodotTracy singleton at runtime so this plugin also
+## parses in editors built without the module.
 
 const SETTING_PATH := "tracy/profiler/executable_path"
 const ENV_PATH := "FENG_TRACY_PATH"
@@ -63,7 +54,7 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
-	if _debug_menu != null and is_instance_valid(_debug_menu):
+	if is_instance_valid(_debug_menu):
 		if _debug_menu.id_pressed.is_connected(_on_menu_id_pressed):
 			_debug_menu.id_pressed.disconnect(_on_menu_id_pressed)
 		for id in [MENU_ID, SEPARATOR_ID]:
@@ -82,7 +73,7 @@ func _on_menu_id_pressed(p_id: int) -> void:
 		_launch_or_install()
 
 
-## Starts the profiler, installing it next to the editor first if needed.
+## Starts the profiler, installing it in the addon first if needed.
 func _launch_or_install() -> void:
 	var path := _profiler_path()
 	if not path.is_empty():
@@ -111,8 +102,9 @@ func _profiler_path() -> String:
 		var stored := str(settings.get_setting(SETTING_PATH))
 		if not stored.is_empty() and FileAccess.file_exists(stored):
 			return stored
-	if FileAccess.file_exists(_installed_path()):
-		return _installed_path()
+	var installed := _installed_path()
+	if FileAccess.file_exists(installed):
+		return installed
 	var from_env := OS.get_environment(ENV_PATH)
 	if not from_env.is_empty():
 		var candidate := from_env.path_join(EXECUTABLE) if DirAccess.dir_exists_absolute(from_env) else from_env
@@ -122,8 +114,9 @@ func _profiler_path() -> String:
 	if FileAccess.file_exists(beside_editor):
 		return beside_editor
 	var downloads := OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
-	if FileAccess.file_exists(downloads.path_join(EXECUTABLE)):
-		return downloads.path_join(EXECUTABLE)
+	var downloaded := downloads.path_join(EXECUTABLE)
+	if FileAccess.file_exists(downloaded):
+		return downloaded
 	# Tracy releases unpack into a versioned folder inside the downloads folder.
 	var dir := DirAccess.open(downloads)
 	if dir != null:
@@ -136,7 +129,7 @@ func _profiler_path() -> String:
 	return ""
 
 
-## The profiler ships in this addon's bin folder.
+## The bundled or downloaded profiler lives in this addon's bin folder.
 func _installed_path() -> String:
 	var script_path: String = get_script().resource_path
 	var addon_dir := script_path.get_base_dir().get_base_dir()

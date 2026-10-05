@@ -5,10 +5,7 @@ extends RefCounted
 
 const RuntimeState = preload("feng_magic_gi_runtime_state.gd")
 const VIEWPORT_SCAN_MSEC := 1000
-## The viewport/world/targets registry lives with the snapshot passes that
-## consume it; the same soft path-loading the passes use for producer runtimes
-## applies here, so a missing feng-render-pipeline addon degrades to nothing
-## consuming the snapshots anyway.
+## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
 # One per-volume entry owns its weak reference, lighting calculator, emission
@@ -113,7 +110,7 @@ static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
 		return
 	_mutex.lock()
 	for snapshot in _snapshots:
-		if int(snapshot.get("volume_id", 0)) == volume.get_instance_id():
+		if int(snapshot["volume_id"]) == volume.get_instance_id():
 			_mutex.unlock()
 			return # The selected volume's warning was refreshed by _publish().
 	_mutex.unlock()
@@ -125,8 +122,8 @@ static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
 static func _refresh_viewports() -> void:
 	var worlds := _snapshot_worlds()
 	for id in _registry.keys():
-		var state: RuntimeState = _registry.get(id)
-		var volume: FMagicGIVolume = state.get_volume() if state != null else null
+		var state: RuntimeState = _registry[id]
+		var volume := state.get_volume()
 		if volume == null or not volume.is_inside_tree():
 			continue
 		if worlds != null:
@@ -145,8 +142,8 @@ static func _render_targets(world: World3D) -> Array[RID]:
 static func _publish() -> void:
 	var selected: Dictionary = {} # world instance id -> latest valid volume
 	for id in _registry.keys():
-		var state: RuntimeState = _registry.get(id)
-		var volume: FMagicGIVolume = state.get_volume() if state != null else null
+		var state: RuntimeState = _registry[id]
+		var volume := state.get_volume()
 		if volume == null:
 			_registry.erase(id)
 			continue
@@ -185,7 +182,7 @@ static func _publish() -> void:
 			"lighting": state.lighting.coefficients(volume),
 			"emission_payload": state.emission_payload,
 			"emission_revision": state.emission_revision,
-			"emission_identity": state.emission_identity if not state.emission_identity.is_empty() else cache_key,
+			"emission_identity": state.emission_identity,
 			"world_id": world_id,
 			"volume_id": id,
 			"render_targets": _render_targets(entry.world),

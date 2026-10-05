@@ -1,190 +1,170 @@
-# FRP 引擎契约（升级引擎时的最小改动面）
+# FRP 引擎契约
 
-本文回答一个问题：**把 FRP 搬到新版本 Godot 上，需要动哪些地方？**
-它列出引擎侧必须保留的 Core 表面、FRP 在共享文件里的全部触点、以及双方的数据契约。
+本文列出插件使用的引擎接口、帧数据布局和升级 Godot 时要检查的集成点。
+管线使用方式见 [插件说明](../misc/feng-addons/feng-render-pipeline/README.md)，
+插件内部职责见 [插件架构](frp-addon-architecture.md)。
 
-## 硬边界：优先与引擎解耦
+## 所有权
 
-能在插件侧完成就必须放在插件侧，保持低耦合、高内聚。参数声明、Volume 模块及字段权限、混合、检查器和范围
-Gizmo 都属于插件。仅在现有 Core 无法提供必要的底层能力，或确认缺陷位于引擎时，才做最小引擎改动；
-不为添加效果、模块或编辑器界面扩大引擎策略层。
+引擎拥有渲染原语、原生 ID/依赖表、帧缓冲与底层执行。
+插件拥有 Pass 实现选择、资源顺序、参数声明、Volume 混合、库同步和编辑器界面。
+新增效果先使用现有 Core 原语；新增底层能力或修复引擎缺陷时，再扩展最小接口。
 
-参数快照的键支持原生整数 id 和自定义稳定字符串 id；`FRPPassContext.get_pass_parameters(key)` 接受 Variant。
-这只扩展现有数据通道和入口键校验，不把 Volume 注册表或混合逻辑放进引擎。原生整数键保持兼容。
+`servers/rendering/frp_pipeline_spec.h` 定义原生 Pass、Operation 和依赖。
+`RenderingServer.get_frp_pipeline_spec()` 将它交给插件 `pipeline/native_spec.gd`。
+ID 是稳定身份；默认顺序由 `DEFAULT_PASS_ORDER` 定义，显式资源按自身顺序执行。
+默认库条目和启用状态由插件的 `library_manager.gd` 与 `renderer.gd` 定义。
 
-## 1. Core 表面（脚本可见，尽量不改）
+引擎保留原生 Pass 调度和无插件 fallback；插件默认实现通过同一套原语执行这些工作。
+原生 SSAO、SSIL、SSR、SDFGI、VoxelGI 和调试几何不在 FRP 的渲染范围内。
+Magic GI 等插件效果使用独立数据路径。
 
-`FRPPassContext`（`servers/rendering/renderer_rd/frp_clustered/frp_pass_context.{h,cpp}`）是插件
-pass 唯一依赖的引擎接口。它的每个方法都转发到引擎内置 pass 调用的同一个 operation：
+## 脚本可见的 Core
 
-| 类别 | 原语 |
-| --- | --- |
-| 帧状态 | `get_render_data()`、`get_render_scene_buffers()`、`get_view_count()`、`get_internal_size()`、`get_pass_name(id)`、`is_valid_pass_id(id)`、`get_pass_parameters(id)` |
-| 提交与绘制 | `draw_gbuffer()`、`draw_motion_vectors()`、`draw_deferred_lighting()`、`draw_sky()`、`draw_transparent()`、`draw_opaque_fallback()` |
-| 准备与收尾 | `precompute_shadows()`、`execute_virtual_texture_updates()`、`prepare_lighting()`、`merge_subsurface_and_specular()`、`resolve_opaque()`、`resolve_sky()`、`resolve_final()`、`copy_screen_and_depth()`、`copy_history()` |
-| 时域与后处理 | `temporal_aa_and_upscale()`、`post_process()`、`tonemap()`、`tonemap_deferred()`、`present(texture)`、`post_process_and_tonemap()` |
-| 组合 | `run_pass(id)`、`stage_compositor_effects(type)` |
+`FRPPassContext` 位于 `servers/rendering/renderer_rd/frp_clustered/frp_pass_context.{h,cpp}`。
+渲染器为当前帧创建上下文，脚本在渲染线程通过 `_frp_execute(ctx)` 使用它。
 
-`precompute_shadows()` 是 pass 0：绘制所有投影阴影的 shadow map。它是唯一与帧内其它工作无关的准备
-步骤（从光源视角绘制，不读场景深度、G-buffer 或材质页），所以排在 VT 与 G-buffer 之前。
-`prepare_lighting()` 属于 Lighting pass：灯光/Cluster buffer、decal 与体积雾在那被消费。
+| 类别 | 当前绑定的方法 |
+|---|---|
+| 帧状态 | `get_render_data()`、`get_render_scene_buffers()`、`get_view_count()`、`get_internal_size()` |
+| Pass 查询 | `get_pass_name(id)`、`is_valid_pass_id(id)`、`get_pass_parameters(key)` |
+| 绘制 | `draw_gbuffer()`、`draw_motion_vectors()`、`draw_deferred_lighting()`、`draw_sky()`、`draw_opaque_fallback()`、`draw_transparent()` |
+| 准备与 resolve | `precompute_shadows()`、`execute_virtual_texture_updates()`、`prepare_lighting()`、`merge_subsurface_and_specular()`、`resolve_opaque()`、`resolve_sky()`、`resolve_final()`、`copy_screen_and_depth()`、`copy_history()` |
+| 时域与后处理 | `temporal_aa_and_upscale()`、`prepare_bloom()`、`post_process()`、`tonemap()`、`tonemap_deferred()`、`present(texture)`、`post_process_and_tonemap()` |
+| 组合执行 | `run_pass(id)`、`stage_compositor_effects(type)` |
+| 曝光 | `get_pre_exposure(view)`、`set_next_pre_exposure(view, exposure)`、`request_next_pre_exposure(buffer, view, offset_bytes)`、`set_tonemap_exposure_texture(texture)` |
+| 雾与大气 | `set_height_fog_parameters(parameters)`、`get_height_fog_parameters()`、`set_atmosphere_parameters(parameters, light, secondary_light, optical_texture, multiple_texture)`、`get_atmosphere_parameters()` |
 
-FRP 没有屏幕空间效果（SSAO/SSIL/SSR）、全局光照（SDFGI/VoxelGI）与调试几何原语：它们不是 FRP 的
-pass，`FRPPassContext` 也不暴露对应入口。渲染器内部同样没有它们的位置——SSAO/SSIL/SSR/GI 的生成
-代码、附件与调试视图都不在 `frp_clustered` 里（只剩引擎纯虚接口要求的 no-op 重载与 SDFGI 的空实现）。
+绘制原语调用与引擎原生 Pass 相同的 Operation。它们目前使用固定签名；逐 Pass 配置
+通过 `get_pass_parameters(key)` 读取。通用 `options` 字典、任意 render-list 提交和
+framebuffer 构造 API 尚未提供。
 
-pass 集与顺序约束来自 `servers/rendering/frp_pipeline_spec.h`（pass → operation 展开表，
-插件通过 `RenderingServer.get_frp_pipeline_spec()` 读回）。**pass id 是稳定标识，默认执行顺序由 DEFAULT_PASS_ORDER 给出**，
-资源里的条目顺序就是引擎的执行顺序（与 URP 的 RendererFeature 列表一致）。当前引擎侧 9 条，
-插件默认再种入 Eye Adaptation、Color Grade、Magic GI、Height Fog、Debug Buffers 共 5 条，
-新 Renderer 共 14 条；Debug Buffers 默认关闭，正常默认启用 13 条。大气集成复用 Height Fog，
-没有增加独立大气 pass。
+`draw_motion_vectors()` 保留操作入口；GBuffer 的几何绘制已同时写入速度附件。
+`precompute_shadows()` 绘制阴影贴图；灯光/Cluster、decal 与体积雾由 `prepare_lighting()` 准备。
 
-**约定**：新增原语只能追加；已有原语的名字与语义不变。删除或改名属于破坏性变更，必须同时改
-`frp_pipeline_spec.h`、`FRPPassContext` 绑定与插件 `FengNativeSpec`。
+`tonemap()` 完成色调映射和输出。`tonemap_deferred()` 将结果留在中间纹理，供 LDR 效果
+处理后调用 `present(texture)`；空名称呈现引擎 tonemap 结果，命名纹理来自管线 scope。
 
-## 2. FRP 在共享文件里的全部触点
+接口变更须同步 ClassDB 绑定、插件调用和契约测试，已有 ID、名字与参数语义保持兼容。
 
-| 文件 | 为什么必须改 | 规模 |
-| --- | --- | --- |
-| `servers/rendering/frp_pipeline_spec.h` | pass/operation 表（新增文件，FRP 自有） | 全文件 |
-| `servers/rendering/renderer_rd/frp_clustered/*` | 渲染器本体（FRP 自有目录） | 目录 |
-| `servers/rendering/renderer_rd/shaders/frp_clustered/*` | FRP 自有 shader | 目录 |
-| `servers/register_server_types.cpp` | 注册 `FRPPassContext` | +2 行 |
-| `servers/rendering/renderer_rd/renderer_compositor_rd.cpp` | 把 `frp` 注册为渲染方法 | ~4 行 |
-| `servers/rendering/rendering_server.{h,cpp}` + `rendering_server_default.h` | `get_frp_pipeline_spec()` + `compositor_set_frp_pipeline()`（第 4 个参数为插件提供的 pass id 集、第 5 个为逐 pass 参数）等绑定，以及默认服务器的转发签名 | ~60 行 |
-| `servers/rendering/renderer_scene_render.{h,cpp}` | 调度校验（id/重复/依赖 + 提供 id 合法性 + 缺必需条目的警告按 provided 判定）；**pass 表本身改从 `frp_pipeline_spec.h` 读**（原先在这里被复制了一遍：0..16 的 id、必需集与 34 条依赖） | ~50 行 |
-| `servers/rendering/storage/compositor_storage.{h,cpp}` | 合成器上保存 FRP 调度 + 插件提供的 pass id 集 | ~30 行 |
-| `servers/rendering/renderer_viewport.{h,cpp}` | TAA 条目决定 jitter（`jitter_owned_by_upscaler` + 派生；含"插件提供的 6"）；渲染器侧的 `using_taa` 用同一条规则（有条目时以条目为准），所以"条目关掉"不会留下没有 jitter 的时序 resolve | ~20 行 |
-| `servers/rendering/renderer_scene_cull.h` | `render_get_compositor()` 覆写 | +2 行 |
-| `servers/rendering/rendering_method.h` | 上述访问器的基类声明 | +3 行 |
-| `servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.{h,cpp}` | **已回到上游形态**：FRP 的粗糙度布局不再向共享代码声明（FRP 不跑任何解码它的共享代码） | 0 行 |
-| `servers/rendering/renderer_rd/environment/gi.{h,cpp}` + `shaders/environment/gi.glsl` | **已删除 fork 的 split-roughness 机制**（FRP 不跑 GI，共享 GI 代码只保留打包布局） | −53 行 |
-| `servers/rendering/renderer_rd/renderer_scene_render_rd.{h,cpp}` | 后处理与 tonemap 拆成两段（FRP 需要分别执行；合并入口保留，其它渲染器行为不变） | ~20 行 |
-| `scene/3d/light_3d.cpp` | Light3D 构造时通过继承的 `set_base(light)` 同步公开 `get_base()` 身份，用于精确匹配大气灯光；不改能量/颜色 | 1 行 |
-| `scene/resources/environment.cpp`、`scene/3d/fog_volume.cpp`、`scene/3d/visual_instance_3d.cpp`、`editor/editor_node.cpp` | `frp` 加入渲染方法守卫 / 显示名 | 各 1–4 行 |
+## 调度与参数
 
-除上表之外**没有**任何 FRP 痕迹；`forward_clustered/` 与
-`shaders/forward_clustered/` 必须保持与上游逐字节一致（这是硬约束，也是双向回归的一部分）。
+`RenderingServer.compositor_set_frp_pipeline(compositor, pipeline, names, provided, parameters)`
+接收五部分：
 
-## 3. 数据契约（插件读得到的东西）
+- compositor RID
+- 按执行顺序排列的 token；非负值为原生 ID，负值 `-(effect_index + 1)` 引用 compositor effect
+- 与 token 对应的显示名称
+- 脚本提供的原生 ID 集合
+- 按原生整数 ID 或自定义稳定字符串键索引的参数字典
 
-* G-buffer（scope `RB_SCOPE_FRP_CLUSTERED`）：`normal_roughness`（10:10:10 直接法线 + 动态标记
-  在 alpha）、`albedo`、`orm`（**粗糙度在 `orm.g`**）、`emission`（specular 在 alpha）、
-  `orm.a`（按 Unreal legacy GBufferB 约定，低 4 位保存 ShadingModelID，高 4 位预留 selective-output flags）。
-  当前 `orm` 仍是 RGBA8，ID 0=Unlit、1=DefaultLit，未知非零 ID 归一化到 DefaultLit；这是接入接口，
-  现阶段仅实现默认 BxDF。ID 是 G-buffer 像素语义，不能与 CPU render-list 的 sort material ID 混用。
-  普通 G-buffer 仍为 4 个颜色附件；开启运动矢量时 velocity 为 shader location 4。
-* 颜色 framebuffer 变体由 `separate_specular × motion_vectors` 决定，插件通过 Core 原语间接使用，
-  不自己拼附件。
-* 运动矢量在 GBuffer pass 内产生（同一遍几何）；`frp_taa.gd` 的 draw call 守卫保证不会回退成两遍。
-  该附件只有这一遍写：没被它画到的像素保留 clear 值 `(-1, -1)`（引擎的"无数据"标记，调试视图与
-  FSR2 都会为它回退到按深度推导）。TAA 必须看到**有效**速度才能重投影，所以在时序 resolve 前，
-  FRP 用自己的一遍 `shaders/frp_clustered/frp_velocity_fill.glsl` 把标记像素按深度补上
-  （只改带标记的像素，逐物体速度原样保留；排在 MSAA resolve 之后，所以 MSAA 也成立）。
-  共享的 `effects/motion_vectors_store.*` 保持上游形态，forward_plus 与 MetalFX 都不受影响；
-  `frp_taa_background.gd` 守卫它：静态帧必须收敛（色背景 changed 0/76800、细节天空 changed 0/76800，
-  修复前分别是 156 与 1631），转动相机时天空的位移要跟得上无 TAA 的位移（0.1718 vs 0.1739）。
-* 时序：TAA 的开关是管线里的 Temporal AA 条目，视口 jitter 跟随它；项目设置
-  `rendering/anti_aliasing/quality/use_taa` 只对**没有 FRP 管线**的视口生效。
-* 调度除了 token 列表，还带一份**插件提供的 pass id 集**（`compositor_set_frp_pipeline` 的第 4 个
-  参数）。引擎的逐帧特性查询（`schedule_has`：6）与视口 jitter 都把它当作"该 pass 在帧里"，
-  所以插件可以删掉引擎条目而由自己的 pass 完成工作。空调度（无合成器/无管线）仍然是"默认顺序"。
-  FRP 不运行的特性（SSAO/SSIL/SSR/GI）连 shader 代码都没有：`_setup_environment` 的
-  `ss_effects_flags` 恒为 0，而且 `frp_clustered` 的 shader 已不再声明 SSAO/SSIL/SSR/GI 的附件
-  binding（那 10 个 binding 已从 uniform set 与 shader 中一并删除）。
-  实测：插件 pass 声明 4 并调用 `ctx.run_pass(4)` 跑 Sky 时与内置条目**逐像素一致**（toggles：
-  control delta 0.6561，takeover delta 0.0000）；声明 6 时视口 jitter 照常生效
-  （taa：同一 pass 声明前后帧不同）。
-* 插件侧的调度模型（schema 6）：每个原生条目（`FengBuiltinPass`）可以带一个 `implementation`
-  pass 脚本。带实现时条目按自定义条目派发（自定义 token + provided id），不带实现时发引擎 token。
-  因此引擎侧的契约只有两条：token 列表 + provided id 集；"谁执行这个 pass"完全由插件决定。
-* 逐 pass 参数：调度还带一份 `{native_pass_id: {参数名: 值}}`（`compositor_set_frp_pipeline` 的
-  第 5 个参数，`Dictionary`）。pass 脚本用 `FRPPassContext.get_pass_parameters(id)` 读自己的参数；
-  引擎自己消费的目前只有 Temporal AA 条目的 `jitter_phases`（`RendererViewport` 用它决定 jitter
-  相位，1 = 冻结采样、16 = 默认）。插件侧的层次是：pass 脚本声明（`get_frp_parameters()`）<
-  条目 `pass_parameters` 覆盖 < `FengVolume` 运行时覆盖。
+插件 Texture Manager 占 effect index 0。关闭的脚本 Pass 保留效果槽，执行由其 enabled
+状态控制；这保持 token 与 effects 数组对应。原生条目带 implementation 时使用脚本 token
+并声明 provided ID，清空 implementation 时使用原生 token。
 
-### 大气的帧内数据交接
+必需工作为 ID `0,1,2,3,7`，可由原生条目或声明接管的脚本提供。
+provided 也参与帧特性查询：例如 ID 6 控制 TAA 和 jitter。无显式调度时使用原生默认顺序。
+插件先校验顺序、身份、必需工作和纹理依赖；无效候选不上传，保留上一次有效调度并暂停
+不安全的自定义效果。引擎还会校验接收到的调度。
 
-可选脚本钩子 `_frp_prepare(ctx)` 在显式调度执行前调用一次，仅准备元数据，不执行绘制或 dispatch；
-仅已启用、实际在调度中的自定义 pass 会收到此调用；ViewPass、BuiltinPass 和启用的 native overlay 必须转发钩子，保持 Volume 包装路径一致。`_frp_execute(ctx)` 仍在原来的条目位置执行。
-这样 Sky 后面的 Height Fog 可以在 Deferred Lighting 之前提交大气光透射数据，而不移动绘制顺序。
+参数优先级为 Pass 声明值、条目覆盖、Volume 结果。引擎传递最终快照，插件负责字段权限、
+别名和混合。`RendererViewport` 读取 ID 6 的 `jitter_phases`，范围 1–64、默认 16。
+只有当前渲染方法为 `frp` 且视口未由时序上采样器拥有 jitter 时，FRP 调度才接管 jitter。
 
-`FRPPassContext.set_atmosphere_parameters(parameters, light, secondary_light, optical_texture,
-multiple_texture)` 接受恰好 64 个有限 float（16 个 vec4）、两个基础灯光 RID 及两个 RD 纹理 RID。
-空数组清空状态；非法数组拒绝并保持清空状态。上下文每帧新建，世界/目标匹配在插件端完成。
-引擎不保存节点、插件脚本或 World3D 注册表，不改用户 DirectionalLight3D 的能量和颜色。
+## 缓冲与时域数据
 
-布局：0=相机相对行星中心位置 km 与地表半径；1=Rayleigh RGB/密度高度；2=Mie scattering RGB/密度高度；
-3=Mie extinction RGB/g；4=其他吸收 RGB/大气厚度；5–6=吸收两层线性项、多次散射倍率和 AP 起始/距离倍率；
-7=天空加 AP 的 RGB 亮度倍率/视线采样数；8–11=两盏光的世界方向、辐照度、RGB 与地表最小太阳高度；
-12=LUT 有效和启用标志；13–15 保留为零。所有距离 km，系数 km^-1；世界空间边界用米。
+`frp_clustered` scope 提供：
 
-- 原生 Deferred/Forward 光照用基础 RID 按 LightStorage 的同一过滤顺序匹配 GPU 槽位，仅该光的 BRDF 入射项乘 RGB 透射率
-- Height Fog 的原有 Sky 后 compute 对有深度的 opaque 像素合成 AP；不重复处理已经积分过的大气天空
-- Forward fallback 和透明材质按自身片元位置合成 AP，不使用其后方 opaque 深度。AP 先于已有高度雾，雾的独立艺术颜色和原始光源合同保留
-- `affect_height_fog=false` 只停用天空对高度雾的可选贡献，独立渲染快照仍供直接光和 AP 使用
-- 光学和多次散射纹理按世界拥有、发布后不原位改写；缺失时绑定有效黑纹理，光学查表可回退为有界直接积分
-- 原生 `atmosphere_inc.glsl` 与插件 `atmosphere_inc.glslinc` 内容完全一致；修改传输公式时一起更新并运行一致性测试
+| 纹理 | 数据 |
+|---|---|
+| `normal_roughness` | 10:10:10 法线，alpha 保存动态标记 |
+| `gbuffer_albedo` | 材质 albedo |
+| `gbuffer_orm` | AO、roughness、metallic；alpha 低 4 位为 ShadingModelID，高 4 位预留 selective-output flags |
+| `gbuffer_emission` | emission，alpha 为 specular |
 
-这是有界采样的独立实现。与 Epic 5.8 概览说明一致，仅第一盏大气光参与多次散射；第二盏光保留单次散射和直接透射。当前不包含大气内地形/云阴影、折射，也不保证 UE 5.8 像素一致；反射探针没有目标匹配快照时不注入 AP。
+ORM 为 RGBA8；ShadingModelID 0 表示 Unlit，1 表示 DefaultLit，未知非零值归一化为
+DefaultLit。当前实现默认 BxDF。像素 shading model 与 CPU render-list 的材质排序 ID 独立。
 
-## 4. 搬到新版本 Godot 的清单
+普通 GBuffer 有四个颜色附件，需要运动矢量时在 location 4 增加 velocity。
+深度、场景色与 velocity 通过 RenderSceneBuffersRD 的相应接口读取。
+framebuffer 变体与 MSAA resolve 由引擎管理，插件声明附件需求后使用 Core 原语。
 
-1. 带上 `frp_pipeline_spec.h` + `frp_clustered/`（渲染器与 shader）——这两个是 FRP 的全部实现。
-2. 按第 2 节表格重放触点；每处都是小块、机械的补丁。
-3. 跑 `python misc/scripts/test_frp_pipeline.py --driver d3d12`（import / gpu / taa / taa_background /
-   project_pipeline / toggles /
-   transparent / context / editor / forward_plus），双向都必须绿。forward_plus 那一项是本轮新增的探针：它在
-   forward_plus 下挂一个带 FRP 调度的合成器，要求 forward_plus 仍然按自己的 jitter 抖动
-   （即 jitter 规则留在渲染方法守卫之内），并记录 4 种配置的亮度。
-4. 若上游改了 shader 变体索引、`RenderSceneBuffersRD` 命名或 CompositorEffect 回调枚举，
-   只需同步 `scene_shader_frp_clustered.*`、`frp_pass_context.cpp` 的枚举绑定与插件
-   `FengNativeSpec`——插件 pass 脚本本身不动。
+未被 GBuffer 绘制的像素保留速度标记 `(-1,-1)`。FRP 在 TAA 前、MSAA resolve 后用
+`frp_velocity_fill.glsl` 按深度补全这些像素，保留已有逐物体速度。
+TAA 历史按当前/历史 pre-exposure 比例重标定；关闭 TAA、切换 compositor 或重建缓冲时清理历史。
+曝光读回也绑定视口缓冲生命周期，旧读回不能写入新状态。立体视图共用 view 0 的场景 pre-exposure。
 
-## 5. 尚未打通的部分（诚实清单）
+共享 TAA shader 的邻域速度选择仍使用最小深度；在 reverse-Z 下这会选择较远样本，
+影响深度边缘的自适应历史裁剪。修改此选择规则需要同时验证 FRP 与 forward_plus。
 
-* **上游 TAA 的深度方向（已发现，故意不动）**：`shaders/effects/taa_resolve.glsl` 的
-  `depth_test_min`（注释写 "velocity with closest depth"）是 2022 年按"深度越小越近"写的，而
-  2024-02 上游改成 reverse-Z（`d950f5f838`：`Projection::set_depth_correction` 默认
-  `p_reverse_z = true`、几何 pass 用 `COMPARE_OP_GREATER_OR_EQUAL`、清屏深度 0 = 远）时没同步改它，
-  于是它取到的是邻域里**最远**的像素（天空）。这个速度只喂给自适应方差盒的 `box_size`，所以它只在
-  深度不连续处出错：物体在静止背景前移动时，盒子按背景速度取到"最宽"，正是那次 "greatly reduces
-  ghosting" 的改动想消除的拖影又回来了。FRP 的边界修复不依赖它（静态相机下所有运动矢量都是 0，
-  两种取法给出同一个盒子），而改它必须动 forward_plus 也在用的这份 shader，所以**保持与上游逐字节
-  一致**：想修的话是一处 12 行的改动，或者让 FRP 走自己的 resolve。
+## 雾与大气的帧内交接
 
-* **整帧完全脚本化已打通**：引擎侧对缺失的必需条目只 `WARN_PRINT_ONCE`
-  （`RendererSceneRender::_validate_frp_pipeline`），addon 侧由自定义 pass 的 `provides_native_ids`
-  声明它接管了哪些必需 pass。声明齐全时校验零告警、`_normalize_native_entries()` 不再补条目；
-  不声明时，不含任何引擎条目的列表按旧格式数组处理（重新种子化，引擎条目全部补回），因此不会
-  静默产生残缺帧。实测（`misc/scripts/tests/frp_context.gd`）：单条目调度的 tokens 为 `[-1, -2]`、
-  帧 0.4160 与引擎默认顺序 0.4160 一致，直接上传 `PackedInt32Array([-1])` 的裸路径同样 0.4160；
-  未声明的同型调度被补回全部 5 个必需条目。
-* **Stage C（C1/C2 已落地）**：能力通道（C1）让插件 pass 声明 `provides_native_ids` 后，引擎把该 pass
-  当作帧的一部分（附件/特性标志/jitter 全部照旧）；pass 脚本化（C2）让默认调度完全由插件实现——
-  9 个原生条目各持有 `implementation`（`passes/native/*.gd`，`FengNativePass`），脚本通过
-  `ctx.run_pass(id)` 执行引擎的同一批 operation，条目因而以 provided 的形式上报、不再发引擎 token；
-  清空 `implementation` 即回到引擎自带 pass（无插件项目的默认路径）。实测（`frp_context.gd`）：
-  早期默认调度 8 条全是脚本、provided=[0,1,2,3,4,5,7]、token 全为自定义，与清空 implementation 的同一
-  调度逐像素一致（changed=0）；引擎的"缺必需条目"警告现在把 provided 算作存在。
-* `params` 逐 pass 暴露：pass 脚本自己的 `@export` 参数随资源进检查器已经可用；但引擎内部 shader
-  仍不可逐 pass 替换，Core 原语的 options/params 通道还没有接到检查器（这是 C 剩下的部分）。
-* **GI 的现状（已清空）**：SDFGI 与 VoxelGI 都不在 FRP 里。SDFGI：`sdfgi_update()` /
-  `sdfgi_get_pending_region_count/bounds/cascade()` / `_render_sdfgi()` 是空的纯虚重载（返回"没有待
-  更新区域"），引擎侧不会请求 SDFGI 区域渲染，Environment 里的 SDFGI 开关对 FRP 既不改画面也不再
-  产生 GPU 工作。VoxelGI：G-buffer 的 voxel-GI 附件、`ensure_voxelgi()`、实例与探针配对、
-  `use_voxelgi` 管线变体、`pair_voxel_gi_instances()` 的配对体全部删除（后者按引擎纯虚契约保留为
-  空实现）。FRP 自己的 shader 里已经**没有** GI/SS 代码：SDFGI/VoxelGI 的采样块、GI buffer 混合、
-  SSAO/SSIL/SSR 块、`#include "../scene_forward_gi_inc.glsl"` 与对应 uniform 声明（set 0 binding 14、
-  set 1 binding 8/27/28/29/30/31/32/34/35/36）全部删除，uniform set 里也不再绑这些默认值。
-  残留只有两处**引擎契约**要求的：`RendererRD::GI gi`（`RendererSceneRenderRD` 的基类成员，所有 RD
-  渲染器都有）与 `RB_SCOPE_GI` 的 `RenderBuffersGI` 存储对象（体积雾的 compute uniform set 无条件
-  绑定它，否则建不出 set；FRP 的 voxel GI 计数恒为 0，雾的 GI 注入不会执行）。
-* **后处理的 tonemap 前后（已打通）**：`renderer_scene_render_rd.cpp` 里后处理与 tonemap 拆成了两段
-  （`_render_buffers_post_process()` / `_render_buffers_tonemap(p_defer_present)`，合并入口保留），
-  FRP 因此能暴露 `post_process()` / `tonemap()` / `tonemap_deferred()` / `present(texture)` 四个原语：
-  pass 可以把自己的效果放在 tonemap 之前（写 HDR 帧缓冲）或之后（推迟 present、写自己的纹理、
-  再 `present()`），并用 shader 关键字（specialization 常量）告诉 shader 自己在哪一侧。这是上游
-  文件里的**一个**小触点（一次函数拆分），其它渲染器的行为不变。
+显式调度执行前，引擎对启用且参与调度的脚本调用一次可选 `_frp_prepare(ctx)`。
+该钩子用于元数据准备；绘制和 dispatch 留在原位置的 `_frp_execute(ctx)`。
+ViewPass、BuiltinPass 和启用的 native overlay 转发准备钩子。
+Height Fog 因此可在 Sky 后绘制，同时在 Deferred Lighting 前提交大气数据。
+
+高度雾快照为 28 个 float；空数组清除。大气快照为恰好 64 个有限 float、两个基础灯光 RID
+和两个 RD 纹理 RID；空数组清除，非法大气数组被拒绝并保持清空状态。
+世界/render target 匹配由插件完成，上下文只持有当前帧数据。
+
+大气的 16 个 vec4 布局：
+
+| 索引 | 内容 |
+|---|---|
+| 0 | 相机相对行星中心位置与地表半径 |
+| 1–3 | Rayleigh、Mie scattering、Mie extinction、密度高度和各向异性 |
+| 4–6 | 其他吸收、大气厚度、两层吸收项、多次散射倍率、AP 起始/距离倍率 |
+| 7 | 天空/AP RGB 亮度倍率和视线采样数 |
+| 8–11 | 两盏光的世界方向、辐照度、RGB 与最小太阳高度 |
+| 12 | LUT 有效与启用标志 |
+| 13–15 | 保留为零 |
+
+数据中的距离为 km、系数为 km⁻¹；世界空间边界使用米。
+
+- 原生光照按基础灯光 RID 匹配 GPU 槽位，仅对该光的 BRDF 入射项应用 RGB 透射率
+- Height Fog 在 Sky 后为有深度的 opaque 像素合成 AP；天空的大气积分由天空路径负责
+- 前向 fallback 和透明材质按自己的片元位置合成 AP，再应用高度雾
+- `affect_height_fog=false` 停止天空对高度雾的可选贡献，独立快照仍可供直接光与 AP 使用
+- 光学/多次散射纹理按世界持有，发布后保持只读；缺失光学 LUT 时使用有界直接积分
+- 原生 `atmosphere_inc.glsl` 与插件 `atmosphere_inc.glslinc` 的公式保持一致
+
+第一盏大气光参与多次散射；第二盏参与单次散射与直接透射。当前范围不含大气内地形/云阴影
+和折射；无匹配快照的反射探针不注入 AP。实现与 UE 的参数概念对应，像素结果不承诺一致。
+
+## 升级时的集成检查
+
+FRP 自有实现位于 `servers/rendering/frp_pipeline_spec.h`、
+`servers/rendering/renderer_rd/frp_clustered/` 和 `servers/rendering/renderer_rd/shaders/frp_clustered/`。
+共享代码按职责检查以下触点，具体补丁以目标上游版本的 diff 为准：
+
+| 触点 | 保留的合同 |
+|---|---|
+| `servers/register_server_types.cpp`、`renderer_compositor_rd.cpp` | FRPPassContext 注册与 `frp` 渲染器创建 |
+| `rendering_server.{h,cpp}`、`rendering_server_default.h`、`storage/compositor_storage.{h,cpp}` | spec 查询、调度/provided/参数存储与转发、VT producer 接口 |
+| `renderer_scene_render.{h,cpp}` | 原生 spec 驱动的调度校验 |
+| `renderer_viewport.cpp`、`renderer_scene_cull.h`、`rendering_method.h` | compositor 查询、FRP TAA/jitter 选择及渲染方法守卫 |
+| `renderer_rd/renderer_scene_render_rd.{h,cpp}` | 后处理/Bloom/Tonemap 分段，曝光纹理覆盖、保留其它渲染器的合并入口 |
+| `renderer_rd/effects/taa.{h,cpp}`、`shaders/effects/taa_resolve.glsl` | 历史曝光比例、边界采样及有限 HDR 历史处理 |
+| `renderer_rd/effects/copy_effects.{h,cpp}`、`shaders/effects/copy.glsl` | Bloom 的 pre-exposure 一致性 |
+| `renderer_rd/storage_rd/light_storage.cpp` | FRP 物理灯光单位与曝光处理 |
+| `scene/3d/light_3d.cpp` | `set_base(light)` 使公开基础 RID 可用于精确大气灯光匹配 |
+| `shader_types.cpp`、`shader_language.cpp`、`shader_preprocessor.cpp` | shading-model 输入与渲染方法能力识别 |
+| `main/main.cpp`、`rendering_device.cpp`、编辑器项目创建/构建设置 | 渲染方法选择、名称与项目能力 |
+| `scene/resources/environment.cpp`、`scene/3d/fog_volume.cpp`、`scene/3d/visual_instance_3d.cpp`、`storage/environment_storage.cpp`、`editor/editor_node.cpp` | 功能守卫与编辑器显示 |
+
+表中的短路径相对 `servers/rendering/`，显式 `scene/`、`main/`、`editor/` 路径相对仓库根。
+FRP 的 Volume、项目默认 compositor 和可选插件查找均留在插件。
+共享 GI 的 split-roughness 扩展已移除；FRP 保留基类要求的空 GI 接口和体积雾所需的
+RenderBuffersGI 存储对象，voxel GI 注入计数为零。
+
+升级顺序：
+
+1. 移植自有目录和 spec，再核对共享集成点、ClassDB 签名、shader 布局与回调枚举
+2. 核对插件 NativeSpec 常量、默认实现表、纹理名称与新引擎 spec
+3. 运行 `python misc/scripts/test_frp_pipeline.py --driver d3d12` 和 `--driver vulkan`
+4. 验证 `context` 的脚本接管、TAA/曝光/Bloom、MSAA、大气、项目管线及 Volume；
+   同时运行 `forward_plus` 对照，确认共享代码的默认路径与 jitter 未受影响
+
+图形测试需要真实 RenderingDevice。历史像素和性能结果保留在对应验证记录中，
+升级是否通过以新构建的测试结果为准。

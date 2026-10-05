@@ -172,7 +172,21 @@ func run() -> void:
 		"sky atmosphere RGB scale must tint only sky ambient and leave author base/sun source alone")
 	require_vec(color_scaled_ambient.get("inscattering_color", Vector3.INF), matched["inscattering_color"],
 		"sky atmosphere RGB scale must not affect the independent directional lobe")
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color(INF, -5.0, NAN)
+	require_vec(snapshot_for(fog)["fog_color"], matched["fog_color"],
+		"snapshot_fields must normalize a non-finite author ambient scale before runtime consumption")
+	fog.sky_atmosphere_ambient_contribution_color_scale = Color(-1.0, 0.5, 2.0)
+	require_vec(snapshot_for(fog)["fog_color"], albedo * (ambient * 0.25 * Vector3(0.0, 0.5, 2.0) + raw_sun * INV_FOUR_PI),
+		"snapshot_fields must clamp negative author ambient scale")
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color.WHITE
+	for invalid_ambient in ["invalid", Vector3(NAN, 1.0, 1.0), Vector3(INF, 1.0, 1.0)]:
+		FengSkyRuntime.publish_snapshot(provider_a, world_a_id, {"ambient_radiance": invalid_ambient})
+		require_vec(snapshot_for(fog)["fog_color"], albedo * raw_sun * INV_FOUR_PI,
+			"malformed optional-provider ambient must leave direct lighting intact")
+	publish_sky(provider_a, sun.get_instance_id(), Vector3.ONE * 1.0e30, ground, 1.0e30)
+	require_vec(snapshot_for(fog)["fog_color"], albedo * raw_sun * INV_FOUR_PI,
+		"finite ambient inputs that overflow during composition must be ignored")
+	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.25)
 	require_vec(snapshot_for(unlit_fog).get("fog_color", Vector3.INF), Vector3.ZERO,
 		"world A sky must not leak into world B")
 	publish_sky(provider_b, 0, Vector3(11.0, 13.0, 17.0), Vector3.ZERO)

@@ -18,6 +18,5 @@ There is no `bin/addons/` copy to refresh and no linker script to run. Restart
 the editor after rebuilding a loaded DLL. The `native/.gdignore` file excludes
 compiler sources from project resource scanning.
 
-Repository consolidation does not complete the rendering migration.
-The R16 contract and conversion code are present; rendering and editor integration
-must be validated separately before release.
+Validate R16 rendering and editor integration before release using the relevant
+checks in [`tests/README.md`](tests/README.md).

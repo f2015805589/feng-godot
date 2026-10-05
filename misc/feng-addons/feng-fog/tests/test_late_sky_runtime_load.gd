@@ -1,6 +1,7 @@
 extends SceneTree
 
 const FogRuntime = preload("res://addons/feng-fog/feng_fog_runtime.gd")
+const HeightFog = preload("res://addons/feng-fog/feng_height_fog.gd")
 
 
 func _initialize() -> void:
@@ -46,17 +47,21 @@ func run() -> void:
 		_fail("the fog runtime did not discover Feng Sky after the retry interval")
 		return
 
-	var fog_snapshot := {"fog_color": Vector3.ONE}
+	var fog := HeightFog.new()
+	fog.fog_color_mode = HeightFog.ColorMode.LEGACY_RADIANCE
+	root.add_child(fog)
+	var fog_snapshot := fog.snapshot_fields()
 	FogRuntime._add_sky_ambient(fog_snapshot, 42)
 	if fog_snapshot["fog_color"] != Vector3(2.0, 2.5, 3.0):
 		_fail("the fog consumer rejected the provider's gated snapshot or applied its scale incorrectly")
 		return
-	var nonfinite_scale_snapshot := {"fog_color": Vector3.ONE}
+	var nonfinite_scale_snapshot := fog.snapshot_fields()
 	FogRuntime._add_sky_ambient(nonfinite_scale_snapshot, 43)
 	if nonfinite_scale_snapshot["fog_color"] != Vector3(3.0, 4.0, 5.0):
 		_fail("a non-finite sky contribution scale contaminated the linear fog source")
 		return
 
+	fog.free()
 	print("feng_fog late sky runtime load test passed")
 	quit()
 

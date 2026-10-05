@@ -13,10 +13,7 @@ extends RefCounted
 const SUN_SCAN_MSEC := 500
 const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
 const SKY_RUNTIME_PROBE_INTERVAL_MSEC := 500
-## The viewport/world/targets registry lives with the snapshot passes that
-## consume it; the same soft path-loading the passes use for producer runtimes
-## applies here, so a missing feng-render-pipeline addon degrades to nothing
-## consuming the snapshots anyway.
+## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
 static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
@@ -67,11 +64,10 @@ static func _sky_snapshot_for_world(world_id: int) -> Dictionary:
 ## Pre-exposure remains solely the height-fog pass's responsibility.
 static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 	var sky: Dictionary = _sky_snapshot_for_world(world_id)
-	if sky.is_empty() or (sky.has("affect_height_fog") and not bool(sky["affect_height_fog"])):
+	if sky.is_empty() or not bool(sky.get("affect_height_fog", true)):
 		return
 	var ambient: Variant = sky.get("ambient_radiance")
-	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
-	if not ambient is Vector3 or not fog_color is Vector3 or not ambient.is_finite() or not fog_color.is_finite():
+	if not ambient is Vector3 or not ambient.is_finite():
 		return
 	var scale_value: Variant = sky.get("height_fog_contribution", 1.0)
 	var contribution_scale := 1.0
@@ -79,17 +75,11 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 		var authored_scale := float(scale_value)
 		if is_finite(authored_scale):
 			contribution_scale = maxf(authored_scale, 0.0)
+	# snapshot_fields() owns the local schema and normalizes ambient_scale.
+	# Albedo is absent in Legacy Radiance mode, which receives untinted ambient.
 	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
-	if not albedo.is_finite():
-		return
-	var ambient_scale: Vector3 = snapshot.get("sky_atmosphere_ambient_contribution_color_scale", Vector3.ONE)
-	if not ambient_scale.is_finite():
-		ambient_scale = Vector3.ONE
-	ambient_scale = ambient_scale.max(Vector3.ZERO)
-	var added_ambient: Vector3 = albedo * (ambient as Vector3) * ambient_scale * contribution_scale
-	if not added_ambient.is_finite():
-		return
-	var combined_fog_color: Vector3 = fog_color + added_ambient
+	var ambient_scale: Vector3 = snapshot["sky_atmosphere_ambient_contribution_color_scale"]
+	var combined_fog_color: Vector3 = snapshot["fog_color"] + albedo * ambient * ambient_scale * contribution_scale
 	if combined_fog_color.is_finite():
 		snapshot["fog_color"] = combined_fog_color
 
@@ -256,31 +246,22 @@ static func _publish() -> void:
 			var use_physical_light_units := bool(ProjectSettings.get_setting(
 					"rendering/lights_and_shadows/use_physical_light_units", false))
 			if use_physical_light_units:
-				sun_energy *= float(sun.get("light_intensity_lux"))
+				sun_energy *= sun.light_intensity_lux
 			else:
 				sun_energy *= PI
 			if sun.light_negative:
 				sun_energy *= -1.0
 			var linear_sun_color := sun.light_color.srgb_to_linear()
 			# Godot applies correlated color temperature to physical lights only.
-			# Keep this conditional in step with Light3D so non-physical lights are
-			# byte-for-byte unchanged by the fog's directional lobe.
 			if use_physical_light_units:
 				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
 			if snapshot.has("fog_albedo"):
-				# The base medium scatters the same selected light that illuminates
-				# scene surfaces. The atmosphere snapshot's ground irradiance must
-				# not replace this source: surfaces do not consume that transmission,
-				# and it is zero at the horizon, erasing white fog's body entirely.
-				# The sky mean is already phase-integrated; only direct light gets
-				# the isotropic 1/(4*PI) phase here.
+				# Lit fog uses the selected source light. Sky ambient is already
+				# phase-integrated; direct light gets the isotropic phase.
 				var albedo: Vector3 = snapshot["fog_albedo"]
 				snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
-			# The directional lobe is an independent artist-authored color,
-			# not another material-albedo term. Preserve its original raw-sun
-			# luminance contract in both modes so changing the base color cannot
-			# recolor it or silently disable it (including a black base color).
+			# Both modes use an independent artist lobe scaled by sun luminance.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
 			snapshot["inscattering_color"] *= sun_luminance
 		snapshot["world_id"] = world_id

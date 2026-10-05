@@ -17,7 +17,7 @@ const MANAGER_TOKEN := -1
 ## A native entry with an implementation is dispatched as a compositor effect. A
 ## plain custom FengPass is also dispatched as a compositor effect; a BuiltinPass
 ## without an implementation is the engine's native token.
-static func is_scripted(pass_entry) -> bool:
+static func is_scripted(pass_entry: FengPass) -> bool:
 	if pass_entry == null:
 		return false
 	if pass_entry is BuiltinPass:
@@ -25,36 +25,24 @@ static func is_scripted(pass_entry) -> bool:
 	return true
 
 ## Read a pass's declared native ownership without mutating the declaration.
-static func declared_provides(pass_entry) -> Array:
-	if pass_entry == null:
-		return []
-	var declared = pass_entry.get("provides_native_ids")
-	if declared == null:
-		return []
-	return declared
+static func declared_provides(pass_entry: FengPass) -> Array[int]:
+	return pass_entry.provides_native_ids if pass_entry != null else []
 
 ## Resolve the effective enabled state for one frame. A Volume may address either
 ## the authored entry key or the carried source key (custom stable key or native
 ## id); the explicit key wins before the legacy native/provided-id aliases.
-static func is_entry_enabled(pass_entry, volume_pass_states: Dictionary = {}) -> bool:
+static func is_entry_enabled(pass_entry: FengPass, volume_pass_states: Dictionary = {}) -> bool:
 	if pass_entry == null:
 		return false
 
-	var entry_key: Variant = null
-	if pass_entry.has_method("get_parameter_key"):
-		entry_key = pass_entry.get_parameter_key()
+	var entry_key: Variant = pass_entry.get_parameter_key()
 	if entry_key != null and volume_pass_states.has(entry_key):
 		return bool(volume_pass_states[entry_key])
 
-	var source = pass_entry
-	if pass_entry.has_method("get_parameter_source"):
-		var resolved = pass_entry.get_parameter_source()
-		if resolved != null:
-			source = resolved
-	if source != null and source.has_method("get_parameter_key"):
-		var source_key: Variant = source.get_parameter_key()
-		if source_key != null and volume_pass_states.has(source_key):
-			return bool(volume_pass_states[source_key])
+	var source := pass_entry.get_parameter_source()
+	var source_key: Variant = source.get_parameter_key()
+	if source_key != null and volume_pass_states.has(source_key):
+		return bool(volume_pass_states[source_key])
 
 	var enabled := bool(pass_entry.is_enabled())
 	# `enabled` follows the same authored layering as every other pass parameter:
@@ -62,15 +50,12 @@ static func is_entry_enabled(pass_entry, volume_pass_states: Dictionary = {}) ->
 	# dictionary, then the containing entry's dictionary. Only a pass that actually
 	# exposes a boolean enabled parameter participates; the CompositorEffect base
 	# property alone is not an FRP parameter.
-	if source != null and source.has_method("get_frp_parameters"):
-		var authored: Dictionary = source.get_frp_parameters()
-		if authored.has("enabled") and authored["enabled"] is bool:
-			var source_parameters = source.get("pass_parameters")
-			if source_parameters is Dictionary and source_parameters.get("enabled") is bool:
-				enabled = bool(source_parameters["enabled"])
-			var entry_parameters = pass_entry.get("pass_parameters")
-			if entry_parameters is Dictionary and entry_parameters.get("enabled") is bool:
-				enabled = bool(entry_parameters["enabled"])
+	var authored := source.get_frp_parameters()
+	if authored.get("enabled") is bool:
+		if source.pass_parameters.get("enabled") is bool:
+			enabled = source.pass_parameters["enabled"]
+		if pass_entry.pass_parameters.get("enabled") is bool:
+			enabled = pass_entry.pass_parameters["enabled"]
 
 	if pass_entry is BuiltinPass:
 		var native := pass_entry as BuiltinPass
@@ -146,7 +131,7 @@ static func build(passes: Array, manager, is_scripted_fn: Callable, is_entry_ena
 		"names": names,
 	}
 
-static func schedule_name(pass_entry, index: int) -> String:
+static func schedule_name(pass_entry: FengPass, index: int) -> String:
 	var display_name: String = pass_entry.resource_name
 	if display_name.is_empty():
 		display_name = str(pass_entry.stable_id) if not pass_entry.stable_id.is_empty() else "Custom Pass"

@@ -1,5 +1,15 @@
 # Terrain integration tests
 
+## Editor helpers without the native extension
+
+```sh
+python misc/feng-addons/feng-idweight-terrain/native/tests/editor_vt_helpers_runner.py --editor /path/to/feng-godot
+```
+
+Checks native-API fallbacks, single-read resident-page snapshots, material preview
+filtering and repeated directory-picker opening in an isolated headless editor.
+No terrain native library or graphics driver is required.
+
 ## Stopped TAA camera regression
 
 `python misc/feng-addons/feng-idweight-terrain/native/tests/vt_motion_decay_runner.py`

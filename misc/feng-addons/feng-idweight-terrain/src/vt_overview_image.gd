@@ -39,8 +39,6 @@ static func region_world_bounds(p_locations: Array, p_region_world: Vector2) -> 
 
 # The baked pages published at one mip, with a usable preview image.
 static func material_pages(p_pages: Array, p_mip: int) -> Array:
-	if p_pages.is_empty():
-		return []
 	var result: Array = []
 	for record in p_pages:
 		if typeof(record) == TYPE_DICTIONARY and int(record.get("mip", 0)) == p_mip and TerrainVTBridge.is_valid_image(record.get("preview", null)):

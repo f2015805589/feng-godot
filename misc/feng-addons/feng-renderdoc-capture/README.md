@@ -1,11 +1,9 @@
 # RenderDoc Capture
 
-The 3D toolbar camera captures the next actual frame presented by the current
-editor window. It waits for the completed `.rdc` and opens it in RenderDoc's GUI
-(`qrenderdoc.exe` on Windows or `qrenderdoc` on Linux).
-It never launches another Godot process, saves/reloads a scene, or restarts the
-editor to capture. Unsaved scene changes, the current viewport, editor overlays,
-and the editor's real GPU resources are included in the window frame.
+The 3D toolbar camera draws and captures the current editor frame, then opens
+the completed `.rdc` in RenderDoc (`qrenderdoc.exe` on Windows or `qrenderdoc` on
+Linux). The capture includes unsaved scene changes, the current viewport, editor
+overlays and live GPU resources. The editor stays open throughout.
 
 ## Setup and lifetime
 
@@ -48,20 +46,14 @@ analyzer is visible instead of silent. On Linux, the engine opens `librenderdoc.
 with global symbol visibility and keeps it loaded for the editor lifetime; the native
 extension resolves the already-loaded API with `dlsym`.
 
-On this machine the capture itself then hit a RenderDoc/runtime incompatibility that is
-unrelated to the renderer: with `bin/D3D12Core.dll` (the Agility D3D12 runtime installed
-in this checkout) present, RenderDoc 1.39 killed the editor inside the forced draw for
-both the FRP and the `forward_plus` renderer. Renaming that one file away made the exact
-same capture succeed. See "D3D12 capture and the Agility runtime" below. This checkout
-pins no RenderDoc version and ships no RenderDoc.
+Install RenderDoc separately; this checkout does not pin or bundle it. For the
+recorded RenderDoc 1.39/D3D12 incompatibility, see the Agility section below.
 
 Each click requests one frame. F12 and the RenderDoc corner overlay are disabled.
 Closing the analyzer does not start further captures or restart the editor.
-**The RenderDoc library and graphics wrappers remain until editor exit.** RenderDoc cannot
-safely remove them after graphics initialization; closing its window is not an
-unload operation. This is the accepted tradeoff for capturing the live editor
-without restarting it. No claim of zero instrumentation overhead is made.
-Captures remain under `.godot/renderdoc/captures/`.
+**The RenderDoc library and graphics wrappers remain until editor exit**, including
+their instrumentation overhead. They cannot be safely unloaded after graphics
+initialization. Captures remain under `.godot/renderdoc/captures/`.
 
 The immediate and queued capture paths share one owned viewport-update snapshot.
 Success, failure, timeout and plugin disable restore the original update modes;
@@ -87,9 +79,8 @@ one mesh, `--rendering-driver d3d12`:
 | Windows runtime, `agility_sdk_version=0` | `forward_plus` | `capture: complete in 515 ms`, 47 MB `.rdc` |
 | Windows runtime, `D3D12Core.dll` renamed away | `forward_plus` | `capture: complete in 639 ms`, 47 MB `.rdc` |
 
-The failure therefore follows the Agility runtime, not the renderer and not this addon.
-Any frame RenderDoc records from that runtime kills the editor, including a capture that
-only arms the queued trigger and lets the editor present normally. Ways out, best first:
+Both renderers failed with Agility in this probe, including with the queued
+capture path. Workarounds, in order of scope:
 
 - **Per project, no files touched:** set
   `rendering/rendering_device/d3d12/agility_sdk_version = 0` (Project Settings >
@@ -108,18 +99,9 @@ only arms the queued trigger and lets the editor present normally. Ways out, bes
 
 ## Building
 
-The plugin script calls native statics (`RenderDocCapture.capture_frame()`), so a source
-change is only live once this addon's native library is rebuilt. An editor started against
-a stale platform library fails at plugin load with
-
-```
-ERROR: res://addons/feng-renderdoc-capture/src/editor_plugin.gd:84 - Parse Error:
-Static function "capture_frame()" not found in base "GDScriptNativeClass".
-ERROR: Failed to load script "res://addons/feng-renderdoc-capture/src/editor_plugin.gd"
-with error "Parse error".
-```
-
-and the whole plugin (button, capture, analyzer launch) is unavailable for that session.
+Build the native library before first use and after changing its C++ API. A stale
+library can prevent the plugin from loading with a missing `capture_frame()`
+error. Restart the editor after rebuilding a loaded library.
 
 ```powershell
 cd misc/feng-addons/feng-renderdoc-capture/native
@@ -143,11 +125,9 @@ the library relative to the addon directory, so one rebuild fixes every one of t
 
 ## Validation
 
-The toolbar captures resident textures and naturally pending work. It does not
-call terrain `prepare_vt_capture()` or regenerate the entire resident cache.
-The previous forced replay bypassed normal page budgets and concentrated all
-resident AVT bakes/SVT uploads into one capture. The explicit native diagnostic
-API remains available to callers that deliberately want that extra workload.
+The toolbar captures resident textures and naturally pending work within normal
+page budgets. To deliberately replay the resident cache, use the separate native
+`prepare_vt_capture()` diagnostic API.
 
 The native capture helper logs begin, viewport drawing, resource/command saving,
 and completion with elapsed milliseconds. If a driver or capture-library stall

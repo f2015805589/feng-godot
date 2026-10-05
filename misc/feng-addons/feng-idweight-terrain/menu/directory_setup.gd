@@ -1,10 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Directory Setup for Terrain3D: the editor's data-directory wizard.
 
-# `_init()` builds the file dialog once and keeps it as a child; `directory_setup_popup()` builds the
-# confirmation dialog each time it is opened and frees it when it closes. The wizard itself is a Node
-# because the menu adds it as a child; the file dialog it drives is only ever opened in directory mode,
-# which is why the filter set below (a file-mode setting) is inert here.
+# Reuse one directory picker; recreate the confirmation dialog for each opening.
 extends Node
 
 const DIRECTORY_SETUP: String = "res://addons/feng-idweight-terrain/menu/directory_setup.tscn"
@@ -18,11 +15,10 @@ var editor_file_dialog: EditorFileDialog
 
 func _init() -> void:
 	editor_file_dialog = EditorFileDialog.new()
-	editor_file_dialog.set_filters(PackedStringArray(["*.res"]))
-	editor_file_dialog.set_file_mode(EditorFileDialog.FILE_MODE_SAVE_FILE)
+	editor_file_dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_DIR
 	editor_file_dialog.access = EditorFileDialog.ACCESS_RESOURCES
 	editor_file_dialog.ok_button_text = "Open"
-	editor_file_dialog.title = "Open a folder or file"
+	editor_file_dialog.title = "Open a folder"
 	editor_file_dialog.dir_selected.connect(_on_dir_selected)
 	editor_file_dialog.size = Vector2i(850, 550)
 	editor_file_dialog.transient = false
@@ -46,7 +42,7 @@ func directory_setup_popup() -> void:
 	plugin.ui.set_button_editor_icon(select_dir_btn, "Folder")
 	
 	#Signals
-	select_dir_btn.pressed.connect(_on_select_file_pressed.bind(EditorFileDialog.FILE_MODE_OPEN_DIR))
+	select_dir_btn.pressed.connect(_on_select_file_pressed)
 	dialog.confirmed.connect(_on_close_requested)
 	dialog.canceled.connect(_on_close_requested)
 	dialog.get_ok_button().pressed.connect(_on_ok_pressed)
@@ -60,8 +56,7 @@ func _on_close_requested() -> void:
 	dialog = null
 
 
-func _on_select_file_pressed(file_mode: EditorFileDialog.FileMode) -> void:
-	editor_file_dialog.file_mode = file_mode
+func _on_select_file_pressed() -> void:
 	editor_file_dialog.popup_centered()
 
 

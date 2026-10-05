@@ -13,13 +13,13 @@ extends RefCounted
 
 # Calls p_method when the target has it, otherwise returns null.
 static func call_method(p_target: Object, p_method: StringName, p_args: Array = []) -> Variant:
-	if p_target == null or not is_instance_valid(p_target) or not p_target.has_method(p_method):
+	if not is_instance_valid(p_target) or not p_target.has_method(p_method):
 		return null
 	return p_target.callv(p_method, p_args)
 
 
 static func has_property(p_target: Object, p_property: StringName) -> bool:
-	if p_target == null or not is_instance_valid(p_target):
+	if not is_instance_valid(p_target):
 		return false
 	for property_info: Dictionary in p_target.get_property_list():
 		if StringName(property_info.get("name", "")) == p_property:
@@ -40,8 +40,6 @@ static func vt_settings(p_terrain: Object) -> Dictionary:
 # The property is the documented API; the getter is the fallback for a build that
 # only exposes the method.
 static func svt_auto_bake(p_terrain: Object, p_property: StringName) -> bool:
-	if p_terrain == null or not is_instance_valid(p_terrain):
-		return true
 	if has_property(p_terrain, p_property):
 		return bool(p_terrain.get(p_property))
 	var getter := call_method(p_terrain, "is_svt_auto_bake")

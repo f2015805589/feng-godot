@@ -85,7 +85,7 @@ var _passes: Array[PassBase] = []
 ## A zero version lets migration run after serialized properties are restored.
 @export_storage var _pipeline_schema_version: int = 0
 
-var _manager: CompositorEffect
+var _manager := TextureManager.new()
 var _observed_passes: Array[PassBase] = []
 var _last_valid_schedule := PackedInt32Array()
 var _last_validation_warnings := PackedStringArray()
@@ -106,7 +106,6 @@ var _view_plans: Array[Dictionary] = []
 
 func _init() -> void:
 	changed.connect(_invalidate_volume_context)
-	_manager = TextureManager.new()
 	# Fresh custom schedules are current too, even when assigned before the first
 	# default-list read. Resource loading restores its serialized version later.
 	_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
@@ -624,7 +623,7 @@ func apply(compositor: Compositor) -> void:
 		func(): return provided,
 		func(): return parameters
 	)
-	if result.get("applied", false):
+	if result.applied:
 		_last_valid_schedule = result["tokens"]
 		_volume_binding = {
 			"revision": _parameter_revision,
