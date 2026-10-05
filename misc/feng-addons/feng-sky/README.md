@@ -178,7 +178,9 @@ previous SkyLight output. **Capture Shadows** is on by default; turning it off
 can reduce the cost of repeated full-scene captures. **Capture Resolution** is
 rounded to the nearest supported power of two from 32 to 2048 pixels; the default
 is 128. **Capture Distance** defaults to 4000 metres and limits scene geometry
-visible to the six capture faces. **Cull Mask** selects which render layers enter
+visible to the six capture faces. The output Sky's filtering resolution follows
+this value for scene captures; a specified Cubemap uses its width normalized to
+the same supported range. **Cull Mask** selects which render layers enter
 the capture. Use a smaller distance, lower resolution, or disabled capture
 shadows when frequent full-scene updates are too costly.
 

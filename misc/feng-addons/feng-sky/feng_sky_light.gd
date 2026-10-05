@@ -39,6 +39,7 @@ enum SourceMode { CAPTURED_SCENE, SPECIFIED_CUBEMAP }
 		_bind_source_signals()
 		if source_mode == SourceMode.SPECIFIED_CUBEMAP:
 			_cubemap_dirty = true
+		_configure_output_sky_radiance_size()
 		_mark_capture_dirty(true, true, source_mode == SourceMode.CAPTURED_SCENE)
 @export_range(0.0, 64.0, 0.01, "or_greater") var radiance_energy := 1.0:
 	set(value):
@@ -60,6 +61,7 @@ enum SourceMode { CAPTURED_SCENE, SPECIFIED_CUBEMAP }
 @export_range(32, 2048, 32, "or_greater", "suffix:px") var capture_resolution := 128:
 	set(value):
 		capture_resolution = _normalize_capture_resolution(value)
+		_configure_output_sky_radiance_size()
 		_mark_capture_dirty(true, true)
 @export_range(0.1, 262144.0, 0.1, "or_greater", "suffix:m") var capture_distance := 4000.0:
 	set(value):
@@ -95,6 +97,7 @@ enum SourceMode { CAPTURED_SCENE, SPECIFIED_CUBEMAP }
 		_bind_source_signals()
 		if source_mode == SourceMode.SPECIFIED_CUBEMAP:
 			_cubemap_dirty = true
+			_configure_output_sky_radiance_size()
 			_refresh_provider()
 ## Optional position anchor. Offset is added in world metres, independent of the
 ## anchor's rotation. Empty uses this component's global position.
@@ -155,6 +158,7 @@ func _enter_tree() -> void:
 	if _output_sky == null or not is_instance_valid(_output_sky):
 		_output_sky = Sky.new()
 		_output_source_mode = source_mode
+	_configure_output_sky_radiance_size()
 	if _snapshot_worlds == null and ResourceLoader.exists(SnapshotWorldsPath):
 		_snapshot_worlds = load(SnapshotWorldsPath) as Script
 	_bind_source_signals()
@@ -247,6 +251,37 @@ func _normalize_capture_resolution(value: int) -> int:
 		lower *= 2
 	var upper := mini(lower * 2, 2048)
 	return lower if clamped_value - lower <= upper - clamped_value else upper
+
+
+func _configure_output_sky_radiance_size() -> void:
+	if _output_sky == null or not is_instance_valid(_output_sky):
+		return
+	var source_pixels := capture_resolution
+	if source_mode == SourceMode.SPECIFIED_CUBEMAP and cubemap != null \
+			and is_instance_valid(cubemap) and cubemap.get_width() > 0:
+		source_pixels = cubemap.get_width()
+	var requested_size := _sky_radiance_size_enum(source_pixels)
+	if _output_sky.radiance_size != requested_size:
+		_output_sky.radiance_size = requested_size
+
+
+func _sky_radiance_size_enum(source_pixels: int) -> int:
+	match _normalize_capture_resolution(source_pixels):
+		32:
+			return Sky.RADIANCE_SIZE_32
+		64:
+			return Sky.RADIANCE_SIZE_64
+		128:
+			return Sky.RADIANCE_SIZE_128
+		256:
+			return Sky.RADIANCE_SIZE_256
+		512:
+			return Sky.RADIANCE_SIZE_512
+		1024:
+			return Sky.RADIANCE_SIZE_1024
+		2048:
+			return Sky.RADIANCE_SIZE_2048
+	return Sky.RADIANCE_SIZE_256
 
 
 func _refresh_provider() -> void:
@@ -421,6 +456,7 @@ func _replace_output_sky_for_source_change() -> void:
 		NativeAdapter.enable_external_radiance(old_output, false)
 	_output_sky = Sky.new()
 	_output_source_mode = source_mode
+	_configure_output_sky_radiance_size()
 	_external_radiance_enabled = false
 	_native_radiance_ready = false
 	_native_radiance_revision = -1
@@ -764,4 +800,6 @@ func _on_source_changed() -> void:
 		_mark_capture_dirty(true, true, true)
 	else:
 		_cubemap_dirty = true
+		if source_mode == SourceMode.SPECIFIED_CUBEMAP:
+			_configure_output_sky_radiance_size()
 		_refresh_provider()
