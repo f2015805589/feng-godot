@@ -802,6 +802,7 @@ private:
 	struct VelocityFill {
 		struct PushConstant {
 			float reprojection_matrix[16];
+			float sky_translation_clip_offset[4];
 			float resolution[2];
 			uint32_t pad[2];
 		};

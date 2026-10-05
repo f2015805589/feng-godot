@@ -1750,10 +1750,32 @@ void RenderFRPClustered::_fill_missing_velocity(Ref<RenderSceneBuffersRD> p_rend
 	VelocityFill::PushConstant push_constant;
 	push_constant.resolution[0] = internal_size.width;
 	push_constant.resolution[1] = internal_size.height;
+	push_constant.pad[0] = 0;
+	push_constant.pad[1] = 0;
 	{
 		Projection correction;
 		correction.set_depth_correction(true, true, false);
 		Projection reprojection = (correction * p_render_data->scene_data->prev_cam_projection) * p_render_data->scene_data->prev_cam_transform.affine_inverse() * p_render_data->scene_data->cam_transform * (correction * p_render_data->scene_data->cam_projection).inverse();
+		Projection previous_projection = correction * p_render_data->scene_data->prev_cam_projection;
+		Projection current_projection = correction * p_render_data->scene_data->cam_projection;
+		Transform3D current_to_previous = p_render_data->scene_data->prev_cam_transform.affine_inverse() * p_render_data->scene_data->cam_transform;
+		Transform3D background_current_to_previous = current_to_previous;
+		background_current_to_previous.origin = Vector3();
+
+		Projection background_reprojection = previous_projection * background_current_to_previous * current_projection.inverse();
+
+		// Treat clear-depth background as a direction at infinity for screen-space
+		// reprojection, so camera translation must not shift the history lookup. The
+		// finite far plane adds a small translation term to the full camera reprojection.
+		// For standard perspective, frustum, and orthographic projections, this term is
+		// constant over the clear plane, so store one clip-space offset and subtract it
+		// only for clear depth. Altitude-dependent atmosphere radiance remains a color
+		// change in the current frame.
+		const Vector4 clear_clip_position(0.0, 0.0, -1.0, 1.0);
+		Vector4 sky_translation_clip_offset = reprojection.xform(clear_clip_position) - background_reprojection.xform(clear_clip_position);
+		for (int i = 0; i < 4; i++) {
+			push_constant.sky_translation_clip_offset[i] = sky_translation_clip_offset[i];
+		}
 		RendererRD::MaterialStorage::store_camera(reprojection, push_constant.reprojection_matrix);
 	}
 
