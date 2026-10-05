@@ -305,6 +305,17 @@ vec3 clip_history_3x3(uvec2 group_pos, vec3 color_history, vec2 velocity_closest
 
 	// Variance clipping
 	vec3 color = clip_aabb(color_min, color_max, clamp(color_avg, color_min, color_max), color_history);
+	if (load_depth(group_pos) == 0.0f) {
+		// Prevent background history from leaving the current neighborhood's
+		// actual radiance range without changing the variance clip's color direction.
+		vec3 neighborhood_min = min(min(s1, s2), min(s3, s4));
+		neighborhood_min = min(neighborhood_min, min(min(s5, s6), min(s7, s8)));
+		neighborhood_min = min(neighborhood_min, s9);
+		vec3 neighborhood_max = max(max(s1, s2), max(s3, s4));
+		neighborhood_max = max(neighborhood_max, max(max(s5, s6), max(s7, s8)));
+		neighborhood_max = max(neighborhood_max, s9);
+		color = clamp(color, neighborhood_min, neighborhood_max);
+	}
 
 	// Clamp to prevent NaNs
 	color = clamp(color, FLT_MIN, FLT_MAX);
