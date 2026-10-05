@@ -426,6 +426,31 @@ func run_runtime_checks() -> void:
 		"the near-horizon twilight case lost its upper-atmosphere scattering")
 	print("ATMOSPHERE TWILIGHT sun_direction=", twilight_direction,
 		" ambient=", twilight_ambient, " ground_illuminance=", twilight_ground)
+	sun_a.rotation_degrees = Vector3(-0.25, 0.0, 0.0)
+	await process_frame
+	snapshot_a = await wait_for_snapshot(world_a_id, true)
+	var near_horizon_direction: Vector3 = snapshot_a.get("sun_direction", Vector3.ZERO)
+	var near_horizon_ground: Vector3 = snapshot_a.get("sun_ground_illuminance", Vector3.ZERO)
+	var near_horizon_top := sky_a._sun_linear_color(sun_a) * sky_a._sun_irradiance(sun_a)
+	var near_horizon_transmission := vec3_luma(near_horizon_ground) / maxf(vec3_luma(near_horizon_top), 0.000001)
+	var near_horizon_shader: ShaderMaterial = sky_a.sky.sky_material as ShaderMaterial
+	require(near_horizon_direction.y > 0.0 and near_horizon_direction.y < 0.01,
+		"the low-sun test did not put the source just above the horizon")
+	require(finite_vec3(near_horizon_ground) and vec3_luma(near_horizon_ground) > 0.0
+		and near_horizon_transmission < 0.5,
+		"the near-horizon ground source did not retain a finite, strongly attenuated illuminance")
+	require(is_equal_approx(float(near_horizon_shader.get_shader_parameter("sun_irradiance")),
+		sky_a._sun_irradiance(sun_a)),
+		"ground attenuation incorrectly changed the sky shader's top-of-atmosphere source")
+	require_vec3_near(FengFogRuntime._fog_sun_illuminance(sun_a, snapshot_a, near_horizon_top),
+		near_horizon_ground, maxf(near_horizon_ground.length() * 0.00001, 0.000001),
+		"fog did not select the matching atmosphere light's ground illuminance")
+	require_vec3_near(FengFogRuntime._fog_sun_illuminance(sun_b, snapshot_a, near_horizon_top),
+		near_horizon_top, maxf(near_horizon_top.length() * 0.00001, 0.000001),
+		"fog attenuated a different-world directional light")
+	print("ATMOSPHERE LOW_SUN elevation_sine=", near_horizon_direction.y,
+		" top_illuminance=", near_horizon_top, " ground_illuminance=", near_horizon_ground,
+		" transmission_luma_ratio=", near_horizon_transmission)
 
 	var custom_sky := make_shared_sky()
 	sky_b.sky = custom_sky

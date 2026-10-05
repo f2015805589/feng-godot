@@ -45,6 +45,9 @@ func capture(label: String) -> Array[Color]:
 func distance(a: Color, b: Color) -> float:
 	return Vector3(a.r - b.r, a.g - b.g, a.b - b.b).length()
 
+func finite_color(color: Color) -> bool:
+	return is_finite(color.r) and is_finite(color.g) and is_finite(color.b)
+
 func red(colors: Array[Color], label: String) -> void:
 	for color in colors:
 		require(color.r > 0.25 and color.r > color.g * 2.0 and color.r > color.b * 2.0,
@@ -155,38 +158,86 @@ func run() -> void:
 	var black := await capture("lit_black_albedo")
 	require(black[0].r < 0.03 and black[0].g < 0.03 and black[0].b < 0.03,
 		"black albedo emitted light")
-	# White body regression at the actual failing sun direction: horizontal.
-	# The atmosphere publishes zero ground irradiance here. Check brightness,
-	# neutral color and a no-fog baseline, not only colored-fog chromaticity.
+	# Capture the actual sky near a low sun at the same fixed exposure, once as
+	# atmosphere-only and once with the default-height fog enabled. The sun disk
+	# and the adjacent horizon sample make solar-profile clipping visible without
+	# allowing eye adaptation to normalize it away.
 	sky.affect_height_fog = true
-	sun.rotation_degrees = Vector3.ZERO
+	sun.rotation_degrees = Vector3(-0.25, 0.0, 0.0)
+	sun.light_intensity_lux = 60000.0
+	sun.light_energy = 1.0 if physical else 60000.0 / PI
 	fog.fog_inscattering_color = Color.WHITE
-	for yaw in [0.0, 90.0, 180.0]:
-		camera.rotation_degrees = Vector3(0.0, yaw, 0.0)
-		var white_low: Array[Color] = []
-		for high_light in [false, true]:
-			sun.light_intensity_lux = 60000.0 if high_light else 6.0
-			sun.light_energy = (10000.0 if high_light else 1.0) if not physical else 1.0
-			var label := "white_%s_%s" % [60000 if high_light else 6, int(yaw)]
-			var white := await capture(label)
-			var c := white[0]
-			require(minf(c.r, minf(c.g, c.b)) > 0.3,
-				label + " lost visible white fog body: " + str(c))
-			require(maxf(c.r, maxf(c.g, c.b)) - minf(c.r, minf(c.g, c.b)) < 0.1,
-				label + " turned the white base into colored haze: " + str(c))
-			if not high_light:
-				white_low = white
-			else:
-				require(distance(white_low[0], white[0]) < 0.08,
-					"white fog changed over the 10000x lighting range")
+	fog.directional_inscattering_color = Color.BLACK
+	fog.fog_density = 0.02
+	fog.fog_height_falloff = 0.2
+	exposure.metering_mode = 2
+	exposure.apply_physical_camera_exposure = false
+	exposure.pre_exposure = false
+	exposure.exposure_compensation = -12.0
+	camera.rotation_degrees = Vector3(0.0, 180.0, 0.0)
+	await process_frame
+	var world_sun_direction := sun.global_transform.basis.z.normalized()
+	var sun_screen_position := camera.unproject_position(camera.global_position + world_sun_direction * 1000.0)
+	var sun_pixel := Vector2i(roundi(sun_screen_position.x), roundi(sun_screen_position.y))
+	var horizon_pixel := Vector2i(160, 122)
+	points = [sun_pixel, horizon_pixel]
+	fog.enabled = false
+	var low_sun_sky_only := await capture("low_sun_sky_only_fixed_exposure")
+	fog.enabled = true
+	var low_sun_with_fog := await capture("low_sun_fog_on_fixed_exposure")
+	var low_sun_world_id := scene.get_world_3d().get_instance_id()
+	var low_sun_snapshot := FengSkyRuntime.snapshot_for_world(low_sun_world_id)
+	var low_sun_ground: Vector3 = low_sun_snapshot.get("sun_ground_illuminance", Vector3.ZERO)
+	var low_sun_top := sky._sun_linear_color(sun) * sky._sun_irradiance(sun)
+	var low_sun_transmission := (low_sun_ground.dot(Vector3(0.2126, 0.7152, 0.0722))
+		/ maxf(low_sun_top.dot(Vector3(0.2126, 0.7152, 0.0722)), 0.000001))
+	var horizon_direction := camera.project_ray_normal(Vector2(horizon_pixel))
+	var horizon_sun_separation := acos(clampf(horizon_direction.dot(world_sun_direction), -1.0, 1.0))
+	var sky_horizon_peak := maxf(low_sun_sky_only[1].r,
+		maxf(low_sun_sky_only[1].g, low_sun_sky_only[1].b))
+	var fog_horizon_peak := maxf(low_sun_with_fog[1].r,
+		maxf(low_sun_with_fog[1].g, low_sun_with_fog[1].b))
+	require(sun_screen_position.x >= 0.0 and sun_screen_position.x < viewport.size.x
+		and sun_screen_position.y >= 0.0 and sun_screen_position.y < viewport.size.y,
+		"low-sun disk projected outside the fixed GPU viewport")
+	require(finite_color(low_sun_sky_only[0]) and finite_color(low_sun_sky_only[1])
+		and finite_color(low_sun_with_fog[0]) and finite_color(low_sun_with_fog[1]),
+		"fixed-exposure low-sun sky/fog samples contain non-finite display values")
+	require(world_sun_direction.y > 0.0 and world_sun_direction.y < 0.01
+		and low_sun_transmission > 0.0 and low_sun_transmission < 0.5,
+		"GPU low-sun case did not preserve top source with attenuated ground illumination")
+	require(horizon_sun_separation > deg_to_rad(sky.sun_angular_radius_deg * 1.5),
+		"horizon sample fell inside the solar disk rather than measuring adjacent sky")
+	require(sky_horizon_peak < 0.99,
+		"fixed-exposure sky-only horizon adjacent to the solar disk saturated")
+	require(fog_horizon_peak < 0.99,
+		"fixed-exposure low-sun Fog-on horizon saturated; check post-transmittance source")
+	print("LOW SUN GPU physical_units=", physical,
+		" direction=", world_sun_direction,
+		" sun_pixel=", sun_pixel, " horizon_pixel=", horizon_pixel,
+		" disk_rgb_sky_only=", low_sun_sky_only[0], " disk_rgb_fog_on=", low_sun_with_fog[0],
+		" adjacent_rgb_sky_only=", low_sun_sky_only[1], " adjacent_rgb_fog_on=", low_sun_with_fog[1],
+		" adjacent_to_sun_deg=", rad_to_deg(horizon_sun_separation),
+		" top_source=", low_sun_top, " ground_source=", low_sun_ground,
+		" ground_to_top_luma=", low_sun_transmission, " exposure=manual_2^-12 pre_exposure=false")
 	# Center card is black, so removing the fog must remove the visible body.
 	camera.rotation_degrees = Vector3.ZERO
+	points = [Vector2i(160, 120)]
 	fog.enabled = false
 	var no_fog := await capture("white_no_fog_control")
 	require(no_fog[0].r < 0.03 and no_fog[0].g < 0.03 and no_fog[0].b < 0.03,
 		"white body test did not isolate fog from its surface")
 	fog.enabled = true
 	# Independent orange lobe overlays the white body only toward the sun.
+	exposure.metering_mode = 0
+	exposure.pre_exposure = true
+	exposure.exposure_compensation = -1.0
+	fog.fog_density = 2.0
+	fog.fog_height_falloff = 0.001
+	# This independent artistic-lobe control covers the explicit raw-light
+	# fallback path; atmosphere-matched attenuation is covered above/CPU-side.
+	sky.affect_height_fog = false
+	sun.rotation_degrees = Vector3.ZERO
 	camera.rotation_degrees.y = 180.0
 	fog.directional_inscattering_color = Color(0.9, 0.33, 0.0)
 	var orange_low: Array[Color] = []
@@ -209,5 +260,5 @@ func run() -> void:
 				"white base plus orange lobe changed over the 10000x lighting range")
 
 	if not failed:
-		print("PASS lit fog GPU: 6/60000 intensity, hue, deferred/fallback/transparent, pre-exposure, no-sky, white horizon body and independent orange lobe")
+		print("PASS lit fog GPU: 6/60000 intensity, hue, deferred/fallback/transparent, pre-exposure, low-sun sky/Fog comparison and independent orange lobe")
 	quit(1 if failed else 0)

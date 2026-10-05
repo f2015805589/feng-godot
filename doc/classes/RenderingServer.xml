@@ -3531,6 +3531,21 @@
 				Sets the [Sky] that receives the completed scene capture. Passing an invalid RID detaches the current output. This is supported by the RenderingDevice renderer.
 			</description>
 		</method>
+		<method name="reflection_probe_set_capture_fog_effect">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="effect" type="RID" />
+			<description>
+				Sets one capture-only [CompositorEffect] that is executed after the captured Sky and before transparent objects. The effect receives the active cubemap face color and depth textures. Passing an invalid RID clears the effect. This is supported by the RenderingDevice renderer.
+			</description>
+		</method>
+		<method name="reflection_probe_get_capture_fog_effect">
+			<return type="RID" />
+			<param index="0" name="probe" type="RID" />
+			<description>
+				Returns the capture-only effect configured with [method reflection_probe_set_capture_fog_effect], or an invalid RID.
+			</description>
+		</method>
 		<method name="reflection_probe_set_capture_resolution">
 			<return type="void" />
 			<param index="0" name="probe" type="RID" />

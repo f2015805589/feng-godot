@@ -173,6 +173,12 @@ private:
 	// Data buffers
 	mutable HashMap<StringName, Ref<RenderBufferCustomDataRD>> data_buffers;
 
+	// A capture-only reflection probe temporarily exposes its active cube face to
+	// FRP compute effects. These RIDs are borrowed from ReflectionAtlas and are
+	// cleared immediately after the callback; they are never owned by this buffer.
+	RID reflection_capture_color;
+	RID reflection_capture_depth;
+
 	// Samplers.
 	RendererRD::MaterialStorage::Samplers samplers;
 
@@ -200,6 +206,14 @@ public:
 	void cleanup();
 	virtual void configure(const RenderSceneBuffersConfiguration *p_config) override;
 	void configure_for_reflections(const Size2i p_reflection_size);
+	void set_reflection_capture_textures(RID p_color, RID p_depth) {
+		reflection_capture_color = p_color;
+		reflection_capture_depth = p_depth;
+	}
+	void clear_reflection_capture_textures() {
+		reflection_capture_color = RID();
+		reflection_capture_depth = RID();
+	}
 	virtual void set_fsr_sharpness(float p_fsr_sharpness) override;
 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) override;
 	virtual void set_anisotropic_filtering_level(RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) override;
@@ -374,6 +388,8 @@ private:
 			} else {
 				return RID();
 			}
+		} else if (reflection_capture_color.is_valid()) {
+			return reflection_capture_color;
 		} else if (has_internal_texture()) {
 			return get_internal_texture();
 		} else {
@@ -388,6 +404,8 @@ private:
 			} else {
 				return RID();
 			}
+		} else if (reflection_capture_color.is_valid()) {
+			return p_layer == 0 ? reflection_capture_color : RID();
 		} else if (has_internal_texture()) {
 			return get_internal_texture(p_layer);
 		} else {
@@ -402,6 +420,8 @@ private:
 			} else {
 				return RID();
 			}
+		} else if (reflection_capture_depth.is_valid()) {
+			return reflection_capture_depth;
 		} else if (has_depth_texture()) {
 			return get_depth_texture();
 		} else {
@@ -416,6 +436,8 @@ private:
 			} else {
 				return RID();
 			}
+		} else if (reflection_capture_depth.is_valid()) {
+			return p_layer == 0 ? reflection_capture_depth : RID();
 		} else if (has_depth_texture()) {
 			return get_depth_texture(p_layer);
 		} else {

@@ -27,6 +27,7 @@ static func supports_scene_capture() -> bool:
 		&"reflection_probe_set_capture_only",
 		&"reflection_probe_set_capture_output_sky",
 		&"reflection_probe_set_capture_resolution",
+		&"reflection_probe_set_capture_fog_effect",
 		&"reflection_probe_request_capture",
 	]:
 		if not RenderingServer.has_method(method_name):
@@ -49,7 +50,7 @@ static func enable_external_radiance(output_sky: Sky, enabled: bool) -> bool:
 
 static func set_capture_probe(probe: ReflectionProbe, capture_environment: Environment,
 		output_sky: Sky, resolution: int, capture_distance: float, cull_mask: int,
-		capture_shadows: bool) -> bool:
+		capture_shadows: bool, capture_fog_effect: CompositorEffect = null) -> bool:
 	if probe == null or not is_instance_valid(probe) or capture_environment == null \
 			or output_sky == null or not supports_scene_capture():
 		return false
@@ -60,6 +61,9 @@ static func set_capture_probe(probe: ReflectionProbe, capture_environment: Envir
 	RenderingServer.call(&"reflection_probe_set_capture_only", probe_rid, true)
 	RenderingServer.call(&"reflection_probe_set_capture_output_sky", probe_rid, output_sky.get_rid())
 	RenderingServer.call(&"reflection_probe_set_capture_resolution", probe_rid, resolution)
+	var fog_effect_rid := capture_fog_effect.get_rid() \
+			if capture_fog_effect != null and is_instance_valid(capture_fog_effect) else RID()
+	RenderingServer.call(&"reflection_probe_set_capture_fog_effect", probe_rid, fog_effect_rid)
 	if not is_equal_approx(probe.max_distance, capture_distance):
 		probe.max_distance = capture_distance
 	var capture_size := Vector3.ONE * (capture_distance * 2.0)

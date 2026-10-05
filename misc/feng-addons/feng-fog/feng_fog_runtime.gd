@@ -62,8 +62,12 @@ static func _sky_snapshot_for_world(world_id: int) -> Dictionary:
 ## in Lit mode. Direct illumination is resolved independently from the same
 ## DirectionalLight3D used by scene surfaces.
 ## Pre-exposure remains solely the height-fog pass's responsibility.
-static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
-	var sky: Dictionary = _sky_snapshot_for_world(world_id)
+static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: Variant = null) -> void:
+	var sky: Dictionary
+	if sky_snapshot is Dictionary:
+		sky = sky_snapshot
+	else:
+		sky = _sky_snapshot_for_world(world_id)
 	if sky.is_empty() or not bool(sky.get("affect_height_fog", true)):
 		return
 	var ambient: Variant = sky.get("ambient_radiance")
@@ -82,6 +86,24 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int) -> void:
 	var combined_fog_color: Vector3 = snapshot["fog_color"] + albedo * ambient * ambient_scale * contribution_scale
 	if combined_fog_color.is_finite():
 		snapshot["fog_color"] = combined_fog_color
+
+## Built-in atmosphere skies publish post-transmittance illuminance for their
+## selected directional lights. Use it only when the fog's chosen light is the
+## exact same node; custom skies and unrelated lights retain scene lighting.
+static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallback: Vector3) -> Vector3:
+	if sun.light_negative or sky.is_empty() or not bool(sky.get("affect_height_fog", true)):
+		return fallback
+	var sun_id := sun.get_instance_id()
+	var value: Variant
+	if int(sky.get("sun_light_id", 0)) == sun_id:
+		value = sky.get("sun_ground_illuminance")
+	elif int(sky.get("secondary_sun_light_id", 0)) == sun_id:
+		value = sky.get("secondary_sun_ground_illuminance")
+	else:
+		return fallback
+	if not value is Vector3 or not value.is_finite():
+		return fallback
+	return value.max(Vector3.ZERO)
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -228,7 +250,8 @@ static func _publish() -> void:
 		var entry: Dictionary = selected[world_id]
 		var fog: FengHeightFog = entry["fog"]
 		var snapshot := fog.snapshot_fields()
-		_add_sky_ambient(snapshot, world_id)
+		var sky_snapshot := _sky_snapshot_for_world(world_id)
+		_add_sky_ambient(snapshot, world_id, sky_snapshot)
 		var sun := _sun_for(fog, entry["world"])
 		if sun == null:
 			snapshot["sun_direction"] = Vector3.ZERO
@@ -256,6 +279,7 @@ static func _publish() -> void:
 			if use_physical_light_units:
 				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
+			sun_rgb = _fog_sun_illuminance(sun, sky_snapshot, sun_rgb)
 			if snapshot.has("fog_albedo"):
 				# Lit fog uses the selected source light. Sky ambient is already
 				# phase-integrated; direct light gets the isotropic phase.

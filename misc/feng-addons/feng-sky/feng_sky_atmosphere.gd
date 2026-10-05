@@ -763,6 +763,7 @@ func _refresh_world_binding() -> void:
 		return
 	var ambient := Vector3.ZERO
 	var ground_illuminance := Vector3.ZERO
+	var secondary_ground_illuminance := Vector3.ZERO
 	for light_source in [source, second_source]:
 		var irradiance: float = light_source["irradiance"]
 		var color: Vector3 = light_source["color"]
@@ -771,10 +772,14 @@ func _refresh_world_binding() -> void:
 			ambient += (cache["ambient_unit_sun"] as Vector3) * irradiance * color * sky_gain
 			if light_source == source:
 				ground_illuminance = (cache["ground_transmittance"] as Vector3) * irradiance * color
+			elif light_source == second_source:
+				secondary_ground_illuminance = (cache["ground_transmittance"] as Vector3) * irradiance * color
 	ambient = ambient.min(Vector3.ONE * MAX_SKY_RADIANCE)
 	FengSkyRuntime.publish_snapshot(self, world_id, {
 		"sun_light_id": source["id"], "sun_direction": source["direction"],
 		"sun_ground_illuminance": _finite_nonnegative(ground_illuminance),
+		"secondary_sun_light_id": second_source["id"],
+		"secondary_sun_ground_illuminance": _finite_nonnegative(secondary_ground_illuminance),
 		"sun_irradiance_unit": "lux" if physical_units else "frp_normalized",
 		"ambient_radiance": _finite_nonnegative(ambient),
 		"height_fog_contribution": fog_contribution,

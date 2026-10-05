@@ -1434,6 +1434,23 @@ void LightStorage::reflection_probe_set_capture_output_sky(RID p_probe, RID p_sk
 	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
 }
 
+void LightStorage::reflection_probe_set_capture_fog_effect(RID p_probe, RID p_effect) {
+	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(reflection_probe);
+	if (reflection_probe->capture_fog_effect == p_effect) {
+		return;
+	}
+	reflection_probe->capture_fog_effect = p_effect;
+	reflection_probe->capture_request_revision++;
+	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
+RID LightStorage::reflection_probe_get_capture_fog_effect(RID p_probe) const {
+	const ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL_V(reflection_probe, RID());
+	return reflection_probe->capture_fog_effect;
+}
+
 void LightStorage::reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) {
 	ReflectionProbe *reflection_probe = reflection_probe_owner.get_or_null(p_probe);
 	ERR_FAIL_NULL(reflection_probe);
@@ -1660,6 +1677,23 @@ void LightStorage::reflection_atlas_free(RID p_ref_atlas) {
 }
 
 void LightStorage::_reflection_atlas_clear(ReflectionAtlas *p_reflection_atlas) {
+	// The six face framebuffers depend on the shared views and depth texture;
+	// release dependents before their attachments and cube texture.
+	for (int i = 0; i < 6; i++) {
+		if (p_reflection_atlas->color_fbs[i].is_valid()) {
+			RD::get_singleton()->free_rid(p_reflection_atlas->color_fbs[i]);
+			p_reflection_atlas->color_fbs[i] = RID();
+		}
+	}
+	for (int i = 0; i < 6; i++) {
+		if (p_reflection_atlas->color_views[i].is_valid()) {
+			RD::get_singleton()->free_rid(p_reflection_atlas->color_views[i]);
+			p_reflection_atlas->color_views[i] = RID();
+		}
+	}
+	RD::get_singleton()->free_rid(p_reflection_atlas->color_buffer);
+	p_reflection_atlas->color_buffer = RID();
+
 	RD::get_singleton()->free_rid(p_reflection_atlas->reflection);
 	p_reflection_atlas->reflection = RID();
 
@@ -1834,6 +1868,7 @@ void LightStorage::reflection_probe_instance_cancel_capture(RID p_instance) {
 	}
 	rpi->capture_completed_revision = cancelled_revision;
 	rpi->capture_source_started = false;
+	rpi->capture_fog_effect = RID();
 	rpi->rendering = false;
 	rpi->dirty = false;
 	if (rpi->atlas.is_valid()) {
@@ -1920,7 +1955,10 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 		atlas->reflection_texture_size = atlas->size * 2 + padding_pixels * 2;
 		atlas->uv_border_size = float(padding_pixels) / float(atlas->reflection_texture_size);
 
-		bool use_storage = !copy_effects->get_raster_effects().has_flag(CopyEffects::RASTER_EFFECT_OCTMAP);
+		// Capture-only faces are also the storage-image target for the dedicated
+		// HeightFog compute stage. The atlas is private to this probe; ordinary
+		// reflection atlases keep their existing usage flags.
+		bool use_storage = probe->capture_only || !copy_effects->get_raster_effects().has_flag(CopyEffects::RASTER_EFFECT_OCTMAP);
 		{
 			RD::TextureFormat tf;
 			tf.array_layers = atlas->count;
@@ -2002,6 +2040,7 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 		rpi->capture_revision = probe->capture_request_revision;
 		rpi->capture_exposure = Math::is_finite(probe->capture_exposure) && probe->capture_exposure > 0.0f ? probe->capture_exposure : 1.0f;
 		rpi->capture_output_sky = probe->capture_output_sky;
+		rpi->capture_fog_effect = probe->capture_fog_effect;
 		rpi->capture_source_started = false;
 		rpi->capture_environment = probe->capture_environment;
 	}
@@ -2080,6 +2119,7 @@ bool LightStorage::reflection_probe_instance_postprocess_step(RID p_instance) {
 			rpi->processing_layer = 1;
 			rpi->capture_completed_revision = rpi->capture_revision;
 			probe->capture_completed_revision = MAX(probe->capture_completed_revision, rpi->capture_revision);
+			rpi->capture_fog_effect = RID();
 		}
 		return complete;
 	}
@@ -2133,6 +2173,35 @@ RID LightStorage::reflection_probe_instance_get_depth_framebuffer(RID p_instance
 	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
 	ERR_FAIL_NULL_V(atlas, RID());
 	return atlas->depth_fb;
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_color_view(RID p_instance, int p_index) {
+	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, RID());
+	ERR_FAIL_INDEX_V(p_index, 6, RID());
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	ERR_FAIL_NULL_V(probe, RID());
+	ERR_FAIL_COND_V(!probe->capture_only, RID());
+	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
+	ERR_FAIL_NULL_V(atlas, RID());
+	return atlas->color_views[p_index];
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_depth_texture(RID p_instance) {
+	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, RID());
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	ERR_FAIL_NULL_V(probe, RID());
+	ERR_FAIL_COND_V(!probe->capture_only, RID());
+	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
+	ERR_FAIL_NULL_V(atlas, RID());
+	return atlas->depth_buffer;
+}
+
+RID LightStorage::reflection_probe_instance_get_capture_fog_effect(RID p_instance) const {
+	const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, RID());
+	return rpi->capture_fog_effect;
 }
 
 ClusterBuilderRD *LightStorage::reflection_probe_instance_get_cluster_builder(RID p_instance, ClusterBuilderSharedDataRD *p_cluster_builder_shared) {

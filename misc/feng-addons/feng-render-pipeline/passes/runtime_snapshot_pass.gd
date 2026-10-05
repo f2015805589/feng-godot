@@ -33,6 +33,19 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_snapshot = {}
 	_frame_scene_data = null
 
+## Dedicated off-screen capture path. The caller supplies a frozen world snapshot
+## because reflection captures have no viewport render target to route by.
+func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> void:
+	_frame_snapshot = snapshot.duplicate(true)
+	_frame_scene_data = null
+	if ctx != null:
+		var render_data := ctx.get_render_data()
+		if render_data != null:
+			_frame_scene_data = render_data.get_render_scene_data()
+	super._frp_execute(ctx)
+	_frame_snapshot = {}
+	_frame_scene_data = null
+
 func _snapshot_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
 	if buffers == null:
 		return {}

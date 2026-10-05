@@ -2710,6 +2710,8 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_environment", "probe", "environment"), &RenderingServer::reflection_probe_set_capture_environment);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_only", "probe", "capture_only"), &RenderingServer::reflection_probe_set_capture_only);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_output_sky", "probe", "sky"), &RenderingServer::reflection_probe_set_capture_output_sky);
+	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_fog_effect", "probe", "effect"), &RenderingServer::reflection_probe_set_capture_fog_effect);
+	ClassDB::bind_method(D_METHOD("reflection_probe_get_capture_fog_effect", "probe"), &RenderingServer::reflection_probe_get_capture_fog_effect);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_capture_resolution", "probe", "resolution"), &RenderingServer::reflection_probe_set_capture_resolution);
 	ClassDB::bind_method(D_METHOD("reflection_probe_request_capture", "probe"), &RenderingServer::reflection_probe_request_capture);
 

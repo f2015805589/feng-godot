@@ -152,37 +152,45 @@ as its background, or **Capture Sky** can select another `Sky` resource. An
 empty **Capture Sky** uses the active world's sky. The component never replaces
 the displayed sky or edits the shared Environment.
 
-**Source Mode** selects a full-scene capture or a supplied `Cubemap`. A captured
-scene includes direct-lit and emissive geometry within **Capture Distance**;
-the selected sky is used for rays that miss scene geometry. The private capture
-Environment disables ambient and reflection sources so it does not fold in the
-previous global IBL or MagicGI result. It captures scene radiance, not post-GI
-output. **Capture Position Anchor** and the world-space **Capture Offset** set
-the capture origin. Without an anchor, the
-component's global position is used. The default offset is `(0, 100, 0)` metres.
-Captured faces use world axes, so rotating the component does not rotate a scene
-capture. A supplied Cubemap follows the component's rotation. The captured cube
-is a global far-field approximation; it does not provide parallax or
-position-accurate GI for nearby buildings.
+**Source Mode** selects **Captured Scene**, **Specified Cubemap**, or
+**Specified Sky**. A captured scene includes direct-lit and emissive geometry
+within **Capture Distance**; **Capture Sky** supplies the background for rays
+that miss scene geometry. The capture also applies the active Feng Height Fog
+snapshot. **Specified Cubemap** uses the supplied HDR cubemap as the radiance
+source. **Specified Sky** renders only the selected `Sky` resource, with no
+scene geometry or capture fog. The private scene-capture Environment disables
+ambient and reflection sources so it does not fold in previous global IBL or
+MagicGI output. It captures scene radiance, not post-GI output. **Capture
+Position Anchor** and the world-space **Capture Offset** set the capture origin.
+Without an anchor, the component's global position is used. The default offset
+is `(0, 100, 0)` metres. Captured faces use world axes, so rotating the component
+does not rotate a scene capture. A supplied Cubemap follows the component's
+rotation. A captured cube is a global far-field approximation; it does not
+provide parallax or position-accurate GI for nearby buildings.
 
-The component takes an initial capture when it becomes the selected provider.
-With **Realtime Capture** off, press **Capture Now** to refresh it manually.
-When enabled, **Capture Interval** schedules periodic refreshes; the renderer
-captures faces over multiple frames, so the interval is not a promise that a
-whole six-face update completes in one frame. Requests that arrive during a
-capture coalesce into at most one follow-up, which starts after the current
-capture completes; they do not cancel its faces. A completed capture remains
-available while its replacement is being built. The capture probe is internal
-and capture-only: it does not add a local reflection probe or capture its own
-previous SkyLight output. **Capture Shadows** is on by default; turning it off
-can reduce the cost of repeated full-scene captures. **Capture Resolution** is
-rounded to the nearest supported power of two from 32 to 2048 pixels; the default
-is 128. **Capture Distance** defaults to 4000 metres and limits scene geometry
-visible to the six capture faces. The output Sky's filtering resolution follows
-this value for scene captures; a specified Cubemap uses its width normalized to
-the same supported range. **Cull Mask** selects which render layers enter
-the capture. Use a smaller distance, lower resolution, or disabled capture
-shadows when frequent full-scene updates are too costly.
+**Realtime Capture** is on by default. **Capture Interval** schedules periodic
+refreshes; the renderer captures faces over multiple frames, so the interval is
+not a promise that a whole six-face update completes in one frame. Requests that
+arrive during a capture coalesce into at most one follow-up, which starts after
+the current capture completes; they do not cancel its faces. A completed capture
+remains available while its replacement is being built. With **Realtime Capture**
+off, the initial result stays fixed until **Capture Now** or **Bake Now** is
+pressed. Assign a valid **Bake Data** resource to load saved radiance in this
+mode. Use **Bake Path** and **Bake Now** to save a reusable `.res` or `.tres`
+resource; the bake stores world-linear HDR radiance and capture metadata, not
+camera exposure or **Radiance Energy**. Changes to position, source, or capture
+settings do not replace a fixed result until an explicit capture or bake request.
+
+The capture probe is internal and capture-only: it does not add a local reflection
+probe or capture its own previous SkyLight output. **Capture Shadows** is on by
+default; turning it off can reduce the cost of repeated full-scene captures.
+**Capture Resolution** is rounded to the nearest supported power of two from 32
+to 2048 pixels; the default is 128. **Capture Distance** defaults to 4000 metres
+and limits scene geometry visible to the six capture faces. The output Sky's
+filtering resolution follows this value for scene captures; a specified Cubemap
+uses its width normalized to the same supported range. **Cull Mask** selects
+which render layers enter the capture. Use a smaller distance, lower resolution,
+or disabled capture shadows when frequent full-scene updates are too costly.
 
 Only one provider is active in a `World3D`: higher **Priority** wins and the
 earlier registered provider wins ties. Disabling or removing it hands off to the
@@ -226,4 +234,6 @@ headless dummy rendering covers CPU contracts only. Logs and captured images
 remain in the reported scratch project.
 
 `res://addons/feng-sky/examples/feng_sky_light_capture.tscn` wraps the atmosphere
-scene with a `FengSkyLight` using the full-scene source and manual refresh.
+scene with a `FengSkyLight` using the full-scene source and realtime capture.
+Use its **Capture Now** button for a one-off refresh or **Bake Now** to save
+reusable world-linear HDR radiance.

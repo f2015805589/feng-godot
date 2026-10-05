@@ -528,6 +528,8 @@ public:
 	FUNC2(reflection_probe_set_capture_environment, RID, RID)
 	FUNC2(reflection_probe_set_capture_only, RID, bool)
 	FUNC2(reflection_probe_set_capture_output_sky, RID, RID)
+	FUNC2(reflection_probe_set_capture_fog_effect, RID, RID)
+	FUNC1RC(RID, reflection_probe_get_capture_fog_effect, RID)
 	FUNC2(reflection_probe_set_capture_resolution, RID, int)
 	FUNC1(reflection_probe_request_capture, RID)
 

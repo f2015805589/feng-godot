@@ -125,6 +125,7 @@ void RenderSceneBuffersRD::update_samplers() {
 }
 
 void RenderSceneBuffersRD::cleanup() {
+	clear_reflection_capture_textures();
 	// Free our data buffers (but don't destroy them)
 	for (KeyValue<StringName, Ref<RenderBufferCustomDataRD>> &E : data_buffers) {
 		E.value->free_data();
@@ -153,6 +154,7 @@ void RenderSceneBuffersRD::cleanup() {
 }
 
 void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_config) {
+	clear_reflection_capture_textures();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	render_target = p_config->get_render_target();

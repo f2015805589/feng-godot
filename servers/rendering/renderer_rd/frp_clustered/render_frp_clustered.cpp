@@ -81,6 +81,22 @@ static bool _frp_get_ready_sky_lighting_source(const RenderDataRD *p_render_data
 static void _frp_pass_debug_marker(RDD *, RDD::CommandBufferID, void *) {
 }
 
+struct ReflectionCaptureTextureScope {
+	Ref<RenderSceneBuffersRD> buffers;
+
+	explicit ReflectionCaptureTextureScope(const Ref<RenderSceneBuffersRD> &p_buffers, RID p_color, RID p_depth) :
+			buffers(p_buffers) {
+		if (buffers.is_valid()) {
+			buffers->set_reflection_capture_textures(p_color, p_depth);
+		}
+	}
+	~ReflectionCaptureTextureScope() {
+		if (buffers.is_valid()) {
+			buffers->clear_reflection_capture_textures();
+		}
+	}
+};
+
 // A GPU capture tool needs every pass label to own the work it names. The default pass
 // order has no user-authored boundaries, so the command graph is normally free to move
 // work between passes; in a capture that shows up as pass labels running empty while the
@@ -1869,6 +1885,13 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		rb_data = rb->get_custom_data(RB_SCOPE_FRP_CLUSTERED);
 	}
 	bool is_reflection_probe = p_render_data->reflection_probe.is_valid();
+	RID capture_fog_effect;
+	if (is_reflection_probe) {
+		const RID capture_probe = light_storage->reflection_probe_instance_get_probe(p_render_data->reflection_probe);
+		if (light_storage->reflection_probe_is_capture_only(capture_probe)) {
+			capture_fog_effect = light_storage->reflection_probe_instance_get_capture_fog_effect(p_render_data->reflection_probe);
+		}
+	}
 
 	static const int texture_multisamples[RSE::VIEWPORT_MSAA_MAX] = { 1, 2, 4, 8 };
 
@@ -2336,6 +2359,28 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	RID rp_uniform_set;
 	Ref<FRPPassContext> pass_context;
 	pass_context.instantiate();
+	auto run_capture_fog_effect = [&]() {
+		if (capture_fog_effect.is_null()) {
+			return;
+		}
+		if (!pipeline_storage->is_compositor_effect(capture_fog_effect) || !pipeline_storage->compositor_effect_get_enabled(capture_fog_effect)) {
+			return;
+		}
+		const int face = p_render_data->reflection_probe_pass;
+		RID color_view = light_storage->reflection_probe_instance_get_capture_color_view(p_render_data->reflection_probe, face);
+		RID depth_texture = light_storage->reflection_probe_instance_get_capture_depth_texture(p_render_data->reflection_probe);
+		if (color_view.is_null() || depth_texture.is_null()) {
+			return;
+		}
+		ReflectionCaptureTextureScope capture_textures(rb, color_view, depth_texture);
+		Callable callback = pipeline_storage->compositor_effect_get_callback(capture_fog_effect);
+		Object *callback_object = callback.get_object();
+		if (callback_object != nullptr && callback_object->has_method("_frp_execute")) {
+			Array arguments;
+			arguments.push_back(pass_context);
+			callback_object->callv("_frp_execute", arguments);
+		}
+	};
 	// Resolves the frame's colour, depth and velocity once per frame. Both the
 	// temporal AA operation and the tone mapping operation need resolved inputs, and
 	// either of them can be the first to run.
@@ -2793,6 +2838,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RENDER_TIMESTAMP("Process Post Sky Compositor Effects");
 					// Don't need to check for depth or color resolve here, we've already triggered it.
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_SKY);
+				}
+				// A capture-only FengSkyLight probe runs only its frozen HeightFog
+				// effect here. The effect sees this face's borrowed color/depth RIDs;
+				// ordinary probes and viewport compositor schedules are unchanged.
+				if (is_reflection_probe) {
+					run_capture_fog_effect();
 				}
 			} break;
 			case FRPPipelineSpec::OP_SUBSURFACE_AND_SPECULAR: { // Subsurface and specular.

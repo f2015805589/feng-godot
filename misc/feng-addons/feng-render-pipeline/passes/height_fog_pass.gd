@@ -21,6 +21,22 @@ var _atmosphere_optical := RID()
 var _atmosphere_multiple := RID()
 var _empty_atmosphere_lut := RID()
 var _atmosphere_sampler := RID()
+var _capture_snapshot_active := false
+var _capture_fog_snapshot: Dictionary = {}
+var _capture_atmosphere_snapshot: Dictionary = {}
+var _capture_exposure_normalization := 1.0
+
+## The capture-only effect is a private duplicate of this resource. These value
+## snapshots and their texture references stay frozen for the six-face capture.
+func set_capture_snapshots(fog_snapshot: Dictionary, atmosphere_snapshot: Dictionary) -> void:
+	_capture_fog_snapshot = fog_snapshot.duplicate(true)
+	_capture_atmosphere_snapshot = atmosphere_snapshot.duplicate(true)
+	_capture_snapshot_active = true
+
+func clear_capture_snapshots() -> void:
+	_capture_snapshot_active = false
+	_capture_fog_snapshot = {}
+	_capture_atmosphere_snapshot = {}
 
 func _atmosphere_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
 	if buffers == null:
@@ -49,7 +65,8 @@ func _prepare_atmosphere(ctx: FRPPassContext) -> PackedFloat32Array:
 	_atmosphere_multiple = RID()
 	if ctx == null:
 		return PackedFloat32Array()
-	_atmosphere_snapshot = _atmosphere_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
+	_atmosphere_snapshot = _capture_atmosphere_snapshot.duplicate(true) if _capture_snapshot_active \
+			else _atmosphere_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
 	var render_data := ctx.get_render_data()
 	var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
 	if _atmosphere_snapshot.is_empty() or scene_data == null:
@@ -77,6 +94,32 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 
 
 func _frp_execute(ctx: FRPPassContext) -> void:
+	if _capture_snapshot_active:
+		if ctx == null:
+			return
+		_prepared_context_id = ctx.get_instance_id()
+		var packet := _prepare_atmosphere(ctx)
+		if ctx.has_method("set_atmosphere_parameters"):
+			ctx.call("set_atmosphere_parameters", packet,
+				_atmosphere_snapshot.get("sun_light_rid", RID()),
+				_atmosphere_snapshot.get("secondary_sun_light_rid", RID()),
+				_atmosphere_optical, _atmosphere_multiple)
+		_pre_exposure = ctx.get_pre_exposure(0)
+		_capture_exposure_normalization = ctx.get_scene_exposure_normalization() \
+				if ctx.has_method("get_scene_exposure_normalization") else 1.0
+		var frame_snapshot := _capture_fog_snapshot.duplicate(true)
+		var render_data := ctx.get_render_data()
+		var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
+		var frame_parameters := PackedFloat32Array()
+		if not frame_snapshot.is_empty() and scene_data != null:
+			var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
+			var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
+			frame_parameters = _make_forward_parameters(frame_snapshot, scene_data.get_cam_transform(), fog_scale)
+		ctx.call("set_height_fog_parameters", frame_parameters)
+		super._frp_execute_with_snapshot(ctx, frame_snapshot)
+		_pre_exposure = 1.0
+		_capture_exposure_normalization = 1.0
+		return
 	# Reuse one immutable frame lease from pre-lighting through opaque/forward
 	# work. Keep its Texture2D references alive until the next frame preparation.
 	# Older engines without the optional hook can still execute compute AP.
@@ -133,7 +176,8 @@ func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_sca
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
-	return PackedFloat32Array([value.x, _pre_exposure, value.z, value.w]).to_byte_array()
+	var exposure := _pre_exposure * (_capture_exposure_normalization if _capture_snapshot_active else 1.0)
+	return PackedFloat32Array([value.x, exposure, value.z, value.w]).to_byte_array()
 
 func _init() -> void:
 	inputs = _make_inputs()

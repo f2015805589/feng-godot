@@ -9,6 +9,7 @@
 
 [node name="SkyLight" type="Node3D" parent="."]
 script = ExtResource("2_sky_light")
+realtime_capture = true
 capture_offset = Vector3(0, 100, 0)
 capture_resolution = 128
 capture_distance = 4000.0

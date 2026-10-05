@@ -65,12 +65,15 @@ func snapshot_for(fog: FengHeightFog) -> Dictionary:
 
 
 func publish_sky(provider: SkyProvider, sun_id: int, ambient: Vector3,
-		ground: Vector3, contribution: float = 1.0, affect_fog: bool = true) -> void:
+		ground: Vector3, contribution: float = 1.0, affect_fog: bool = true,
+		secondary_sun_id: int = 0, secondary_ground: Vector3 = Vector3.ZERO) -> void:
 	FengSkyRuntime.publish_snapshot(provider, provider.world_id, {
 		"ambient_radiance": ambient,
 		"height_fog_contribution": contribution,
 		"sun_light_id": sun_id,
 		"sun_ground_illuminance": ground,
+		"secondary_sun_light_id": secondary_sun_id,
+		"secondary_sun_ground_illuminance": secondary_ground,
 		"affect_height_fog": affect_fog,
 	})
 
@@ -157,26 +160,26 @@ func run() -> void:
 	var provider_b := SkyProvider.new()
 	provider_b.world_id = world_b_id
 	var ambient := Vector3(2.0, 4.0, 8.0)
-	var ground := Vector3(3.0, 5.0, 7.0)
+	var ground := raw_sun * 0.2
 	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.25)
 	var matched := snapshot_for(fog)
-	require_vec(matched.get("fog_color", Vector3.INF), albedo * (ambient * 0.25 + raw_sun * INV_FOUR_PI),
-		"matching atmosphere must not apply transmission absent from scene surface lighting")
-	require_vec(matched.get("inscattering_color", Vector3.INF), tint * raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722)),
-		"matching atmosphere must not change the independent lobe")
+	require_vec(matched.get("fog_color", Vector3.INF), albedo * (ambient * 0.25 + ground * INV_FOUR_PI),
+		"matching atmosphere must use post-transmittance illuminance for direct fog lighting")
+	require_vec(matched.get("inscattering_color", Vector3.INF), tint * ground.dot(Vector3(0.2126, 0.7152, 0.0722)),
+		"matching atmosphere must scale the independent lobe by ground illuminance")
 	var ambient_color_scale := Vector3(0.25, 0.5, 2.0)
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color(0.25, 0.5, 2.0)
 	var color_scaled_ambient := snapshot_for(fog)
 	require_vec(color_scaled_ambient.get("fog_color", Vector3.INF),
-		albedo * (ambient * 0.25 * ambient_color_scale + raw_sun * INV_FOUR_PI),
-		"sky atmosphere RGB scale must tint only sky ambient and leave author base/sun source alone")
+		albedo * (ambient * 0.25 * ambient_color_scale + ground * INV_FOUR_PI),
+		"sky atmosphere RGB scale must tint only sky ambient and preserve attenuated direct source")
 	require_vec(color_scaled_ambient.get("inscattering_color", Vector3.INF), matched["inscattering_color"],
 		"sky atmosphere RGB scale must not affect the independent directional lobe")
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color(INF, -5.0, NAN)
 	require_vec(snapshot_for(fog)["fog_color"], matched["fog_color"],
 		"snapshot_fields must normalize a non-finite author ambient scale before runtime consumption")
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color(-1.0, 0.5, 2.0)
-	require_vec(snapshot_for(fog)["fog_color"], albedo * (ambient * 0.25 * Vector3(0.0, 0.5, 2.0) + raw_sun * INV_FOUR_PI),
+	require_vec(snapshot_for(fog)["fog_color"], albedo * (ambient * 0.25 * Vector3(0.0, 0.5, 2.0) + ground * INV_FOUR_PI),
 		"snapshot_fields must clamp negative author ambient scale")
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color.WHITE
 	for invalid_ambient in ["invalid", Vector3(NAN, 1.0, 1.0), Vector3(INF, 1.0, 1.0)]:
@@ -184,7 +187,7 @@ func run() -> void:
 		require_vec(snapshot_for(fog)["fog_color"], albedo * raw_sun * INV_FOUR_PI,
 			"malformed optional-provider ambient must leave direct lighting intact")
 	publish_sky(provider_a, sun.get_instance_id(), Vector3.ONE * 1.0e30, ground, 1.0e30)
-	require_vec(snapshot_for(fog)["fog_color"], albedo * raw_sun * INV_FOUR_PI,
+	require_vec(snapshot_for(fog)["fog_color"], albedo * ground * INV_FOUR_PI,
 		"finite ambient inputs that overflow during composition must be ignored")
 	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.25)
 	require_vec(snapshot_for(unlit_fog).get("fog_color", Vector3.INF), Vector3.ZERO,
@@ -201,8 +204,13 @@ func run() -> void:
 		"a different atmosphere sun must not attenuate the selected fog light")
 	require_vec(mismatched.get("inscattering_color", Vector3.INF), tint * raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722)),
 		"a different atmosphere sun must not replace the lobe irradiance")
+	publish_sky(provider_a, 0, ambient, Vector3.ZERO, 1.0, true, sun.get_instance_id(), ground)
+	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), albedo * (ambient + ground * INV_FOUR_PI),
+		"a matching secondary atmosphere sun must provide its ground illuminance")
+	require_vec(snapshot_for(fog).get("inscattering_color", Vector3.INF), tint * ground.dot(Vector3(0.2126, 0.7152, 0.0722)),
+		"the secondary sun must use ground luminance for the artist lobe")
 	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.0)
-	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), albedo * raw_sun * INV_FOUR_PI,
+	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), albedo * ground * INV_FOUR_PI,
 		"zero sky contribution must suppress only ambient, retaining the selected scene light")
 	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 1.0, false)
 	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), albedo * raw_sun * INV_FOUR_PI,
@@ -214,10 +222,10 @@ func run() -> void:
 	publish_sky(provider_a, sun.get_instance_id(), ambient, Vector3.ZERO)
 	fog.fog_inscattering_color = Color.WHITE
 	var horizon := snapshot_for(fog)
-	require_vec(horizon.get("fog_color", Vector3.INF), ambient + raw_sun * INV_FOUR_PI,
-		"zero horizon ground irradiance must retain the white direct-scattering body")
-	require_vec(horizon.get("inscattering_color", Vector3.INF), high["inscattering_color"],
-		"changing base color to white must not recolor the artist lobe")
+	require_vec(horizon.get("fog_color", Vector3.INF), ambient,
+		"zero horizon ground illuminance must remove direct fog lighting while retaining sky ambient")
+	require_vec(horizon.get("inscattering_color", Vector3.INF), Vector3.ZERO,
+		"zero horizon ground illuminance must remove the sun-scaled artist lobe")
 	fog.directional_inscattering_color = Color.BLACK
 	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), horizon["fog_color"],
 		"disabling the directional lobe must leave the base body unchanged")
@@ -230,7 +238,7 @@ func run() -> void:
 	var legacy := snapshot_for(fog)
 	var authored := Vector3(0.65, 0.4, 0.2)
 	var authored_tint := Vector3(0.3, 0.5, 0.8)
-	var luminance := raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722))
+	var luminance := ground.dot(Vector3(0.2126, 0.7152, 0.0722))
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color(0.25, 0.5, 2.0)
 	var scaled_legacy := snapshot_for(fog)
 	require_vec(scaled_legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25 * ambient_color_scale,
@@ -242,7 +250,7 @@ func run() -> void:
 	require_vec(legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25,
 		"legacy source must remain raw authored RGB plus untinted sky")
 	require_vec(legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance,
-		"legacy lobe must use raw artist tint and unattenuated sun luminance")
+		"legacy lobe must use raw artist tint and atmosphere-attenuated sun luminance")
 	FengSkyRuntime.remove_snapshot(provider_a, world_a_id)
 	sun.visible = false
 	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), authored,

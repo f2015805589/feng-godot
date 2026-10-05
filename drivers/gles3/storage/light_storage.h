@@ -656,6 +656,8 @@ public:
 	virtual void reflection_probe_set_capture_only(RID p_probe, bool p_capture_only) override {}
 	virtual void reflection_probe_set_capture_output_sky(RID p_probe, RID p_sky) override {}
 	virtual void reflection_probe_set_capture_resolution(RID p_probe, int p_resolution) override {}
+	virtual void reflection_probe_set_capture_fog_effect(RID p_probe, RID p_effect) override {}
+	virtual RID reflection_probe_get_capture_fog_effect(RID p_probe) const override { return RID(); }
 	virtual void reflection_probe_set_capture_camera_exposure(RID p_probe, float p_exposure) override {}
 	virtual RID reflection_probe_get_capture_camera_attributes(RID p_probe) const override { return RID(); }
 	virtual void reflection_probe_request_capture(RID p_probe) override {}
