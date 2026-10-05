@@ -95,6 +95,8 @@ func make_test_bake() -> Resource:
 	data.normals = _volume.probe_normals.duplicate()
 	data.transfer.resize(data.positions.size() * 27)
 	data.transfer.fill(0.0)
+	data.primary_sky_visibility.resize(data.positions.size() * 9)
+	data.primary_sky_visibility.fill(0.0)
 	for probe in data.positions.size():
 		# DC-only transport makes the live-lighting and exposure path deterministic.
 		data.transfer[probe * 27] = 0.28
@@ -214,6 +216,19 @@ func run() -> void:
 	root.msaa_3d = Viewport.MSAA_DISABLED
 	root.use_taa = false
 	if not await build_scene():
+		return
+	# Check the actual GI push-parameter packer with a fixed camera normalization.
+	# Keep the very small positive scale to ensure it is not silently floored.
+	var prior_pre_exposure := float(_magic_pass.get("_pre_exposure"))
+	var prior_scene_normalization := float(_magic_pass.get("_scene_exposure_normalization"))
+	_magic_pass.set("_pre_exposure", 0.5)
+	_magic_pass.set("_scene_exposure_normalization", 0.0000002)
+	var radiance_parameters: PackedFloat32Array = _magic_pass.call("_parameter_bytes").to_float32_array()
+	_magic_pass.set("_pre_exposure", prior_pre_exposure)
+	_magic_pass.set("_scene_exposure_normalization", prior_scene_normalization)
+	if not check(radiance_parameters.size() == 4
+			and absf(radiance_parameters[1] - 0.0000001) <= 1e-12,
+			"Magic GI keeps the exact fixed camera-normalization × pre-exposure scale"):
 		return
 	print("LIGHT mode=", "physical lux" if _physical_light_mode else "non-physical energy",
 			"; project physical units=", ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units"),

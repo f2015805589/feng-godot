@@ -4,6 +4,7 @@ extends RefCounted
 ## Main-thread lighting publishes immutable, world-scoped PRT snapshots.
 
 const RuntimeState = preload("feng_magic_gi_runtime_state.gd")
+const Data = preload("feng_magic_gi_data.gd")
 const VIEWPORT_SCAN_MSEC := 1000
 ## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
@@ -171,6 +172,9 @@ static func _publish() -> void:
 		var data := volume.bake_data
 		var bake_version: int = data.bake_version
 		var cache_key := "%d:%d" % [id, bake_version]
+		var lighting_sets: Dictionary = state.lighting.coefficient_sets(volume)
+		var replacement_enabled := data.format_version == Data.FORMAT_VERSION \
+				and volume.has_bake()
 		if state.update_emission_snapshot(volume, data, bake_version):
 			_emission_revision_sequence += 1
 			state.emission_revision = _emission_revision_sequence
@@ -179,7 +183,9 @@ static func _publish() -> void:
 			"version": bake_version,
 			"cache_key": cache_key,
 			"strength": volume.gi_strength,
-			"lighting": state.lighting.coefficients(volume),
+			"lighting": lighting_sets.get("lighting", PackedFloat32Array()),
+			"sky_lighting": lighting_sets.get("sky_lighting", PackedFloat32Array()),
+			"replacement_enabled": replacement_enabled,
 			"emission_payload": state.emission_payload,
 			"emission_revision": state.emission_revision,
 			"emission_identity": state.emission_identity,

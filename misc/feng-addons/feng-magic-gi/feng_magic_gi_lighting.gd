@@ -1,30 +1,21 @@
 @tool
 class_name FMagicGILighting
 extends RefCounted
-## Projects dynamic distant sources into world-space SH. Geometry transport
-## remains immutable; camera-specific exposure is outside this world snapshot.
+## Projects dynamic distant sources into world-space SH. Primary SkyLight
+## radiance is published separately from the combined secondary lighting.
 
 const Data = preload("feng_magic_gi_data.gd")
 const SKY_LIGHT_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_light_runtime.gd"
-const SKY_PANORAMA_SIZE := Vector2i(64, 32)
-const SKY_REFRESH_MSEC := 250
 const SCENE_SCAN_MSEC := 500
 
 var _lights: Array[DirectionalLight3D] = []
 var _world: World3D
 var _next_scan := 0
-var _next_sky_update := 0
-var _environment_signature := 0
-var _source_signature := 0
 var _lighting_signature := 0
 var _sky_sh := PackedFloat32Array()
-var _environment_sky_sh := PackedFloat32Array()
 var _sky_light_signature: Array = []
-var _sky_dirty := true
-var _environment: Environment
-var _sky: Sky
-var _sky_material: Material
 var _cached_result := PackedFloat32Array()
+var _cached_sky_result := PackedFloat32Array()
 var _result_dirty := true
 var _sky_light_runtime: Script
 
@@ -34,77 +25,42 @@ func _init() -> void:
 		_sky_light_runtime = load(SKY_LIGHT_RUNTIME_PATH) as Script
 
 func coefficients(volume: Node3D) -> PackedFloat32Array:
-	var now := Time.get_ticks_msec()
-	if now >= _next_scan:
-		_scan_scene(volume)
-		_scan_environment(_resolve_environment(volume))
-		_next_scan = now + SCENE_SCAN_MSEC
+	return coefficient_sets(volume).get("lighting", PackedFloat32Array())
 
-	var environment := _resolve_environment(volume)
-	_track_environment(environment)
+## Returns secondary lighting (SkyLight + DirectionalLight) and the SkyLight-only
+## source SH used by v4 primary transport. Both are cached from one world snapshot.
+func coefficient_sets(volume: Node3D) -> Dictionary:
+	if volume == null or not is_instance_valid(volume):
+		return {"lighting": _zero_sh(), "sky_lighting": _zero_sh()}
+	var world := volume.get_world_3d()
+	var now := Time.get_ticks_msec()
+	if world != _world or now >= _next_scan:
+		_scan_scene(volume)
+		_next_scan = now + SCENE_SCAN_MSEC
+		_result_dirty = true
+
 	var lights: Array[DirectionalLight3D] = []
-	var explicit_light = volume.get("sun")
-	if explicit_light is DirectionalLight3D and explicit_light.get_world_3d() == volume.get_world_3d():
+	var explicit_light: Variant = volume.get("sun")
+	if explicit_light is DirectionalLight3D and explicit_light.get_world_3d() == world:
 		lights.append(explicit_light)
 	else:
 		lights = _lights
-	var sky_sources := _lights.duplicate()
-	if explicit_light is DirectionalLight3D and not sky_sources.has(explicit_light):
-		sky_sources.append(explicit_light)
 	var physical_units := bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false))
-	var current_source_signature := hash([_source_fingerprint(sky_sources, _world), physical_units])
-	if current_source_signature != _source_signature:
-		_source_signature = current_source_signature
-		_sky_dirty = true
-		_result_dirty = true
-	# The panorama sees all scene lights, while an explicit sun selects only one
-	# direct SH source. Track that selection separately: switching between already
-	# scanned lights leaves the panorama fingerprint unchanged.
-	var current_lighting_signature := hash([_source_fingerprint(lights, volume.get_world_3d()), physical_units])
+	var current_lighting_signature := hash([_source_fingerprint(lights, world), physical_units])
 	if current_lighting_signature != _lighting_signature:
 		_lighting_signature = current_lighting_signature
 		_result_dirty = true
-	var world := volume.get_world_3d()
-	var sky_light: Dictionary = {}
-	if _sky_light_runtime != null and world != null:
-		var snapshot: Variant = _sky_light_runtime.call(
-				"snapshot_for_world", world.get_instance_id())
-		if snapshot is Dictionary:
-			sky_light = snapshot
-	var sky_light_coefficients: PackedFloat32Array = sky_light.get(
-			"radiance_sh", PackedFloat32Array())
-	var sky_light_ready := bool(sky_light.get("ready", false)) \
-			and sky_light_coefficients.size() == 27
-	if sky_light_ready:
-		var active_sky_signature: Array = [
-			int(sky_light.get("provider_id", 0)),
-			int(sky_light.get("source_revision", -1)),
-			int(sky_light.get("source_mode", -1)),
-			float(sky_light.get("captured_exposure", 1.0)),
-			float(sky_light.get("energy", 1.0)),
-			sky_light.get("rotation", Basis.IDENTITY),
-		]
-		if active_sky_signature != _sky_light_signature:
-			_sky_light_signature = active_sky_signature
-			_sky_sh = sky_light_coefficients
-			_result_dirty = true
-	else:
-		if not _sky_light_signature.is_empty():
-			_sky_light_signature.clear()
-			_result_dirty = true
-		if environment != null and _update_sky(environment, now):
-			_result_dirty = true
-		if _sky_sh != _environment_sky_sh:
-			_sky_sh = _environment_sky_sh
-			_result_dirty = true
+	if _refresh_sky_light(world):
+		_result_dirty = true
 	if not _result_dirty:
-		return _cached_result
-	_result_dirty = false
+		return {"lighting": _cached_result, "sky_lighting": _cached_sky_result}
+
+	var sky_only := _sky_sh if _sky_sh.size() == 27 else _zero_sh()
 	var result := PackedFloat32Array()
 	result.resize(27)
 	for light in lights:
 		if not is_instance_valid(light) or not light.is_inside_tree() or not light.is_visible_in_tree() \
-				or light.get_world_3d() != volume.get_world_3d():
+				or light.get_world_3d() != world:
 			continue
 		# Godot's renderer uses local +Z as the source direction, which is also
 		# the receiver-to-source direction expected by the transport SH.
@@ -123,23 +79,39 @@ func coefficients(volume: Node3D) -> PackedFloat32Array:
 			result[k * 3] += color.r * energy * basis[k]
 			result[k * 3 + 1] += color.g * energy * basis[k]
 			result[k * 3 + 2] += color.b * energy * basis[k]
-
-	if _sky_sh.size() == 27:
-		for i in 27:
-			result[i] += _sky_sh[i]
+	for i in 27:
+		result[i] += sky_only[i]
 	_cached_result = result
-	return _cached_result
+	_cached_sky_result = sky_only
+	_result_dirty = false
+	return {"lighting": _cached_result, "sky_lighting": _cached_sky_result}
 
-func _resolve_environment(volume: Node3D) -> Environment:
-	var explicit: Environment = volume.get("lighting_environment")
-	if explicit != null:
-		return explicit
-	var world := volume.get_world_3d()
-	if world != null:
-		if world.environment != null:
-			return world.environment
-		return world.get_fallback_environment()
-	return null
+func _refresh_sky_light(world: World3D) -> bool:
+	var sky_light: Dictionary = {}
+	if _sky_light_runtime != null and world != null:
+		var snapshot: Variant = _sky_light_runtime.call("snapshot_for_world", world.get_instance_id())
+		if snapshot is Dictionary:
+			sky_light = snapshot
+	var coefficients: Variant = sky_light.get("radiance_sh", PackedFloat32Array())
+	var ready: bool = bool(sky_light.get("ready", false)) \
+			and coefficients is PackedFloat32Array and coefficients.size() == 27
+	var signature: Array = []
+	var next_sky_sh := _zero_sh()
+	if ready:
+		signature = [
+			int(sky_light.get("provider_id", 0)),
+			int(sky_light.get("source_revision", -1)),
+			int(sky_light.get("source_mode", -1)),
+			float(sky_light.get("captured_exposure", 1.0)),
+			float(sky_light.get("energy", 1.0)),
+			sky_light.get("rotation", Basis.IDENTITY),
+		]
+		next_sky_sh = coefficients
+	if signature == _sky_light_signature and next_sky_sh == _sky_sh:
+		return false
+	_sky_light_signature = signature
+	_sky_sh = next_sky_sh
+	return true
 
 func _scan_scene(volume: Node3D) -> void:
 	_lights.clear()
@@ -159,77 +131,6 @@ func _scan(node: Node, world: World3D) -> void:
 	for child in node.get_children():
 		_scan(child, world)
 
-## Cheap per-frame check: only object identities are compared and the `changed`
-## signal wiring is maintained. The deep property scan lives in
-## _scan_environment and runs at the scene-scan cadence instead.
-func _track_environment(environment: Environment) -> void:
-	var sky: Sky = environment.sky if environment != null else null
-	var material: Material = sky.sky_material if sky != null else null
-	if environment == _environment and sky == _sky and material == _sky_material:
-		return
-	for resource in [_environment, _sky, _sky_material]:
-		if resource != null and resource.changed.is_connected(_on_sky_changed):
-			resource.changed.disconnect(_on_sky_changed)
-	_environment = environment
-	_sky = sky
-	_sky_material = material
-	for resource in [_environment, _sky, _sky_material]:
-		if resource != null and not resource.changed.is_connected(_on_sky_changed):
-			resource.changed.connect(_on_sky_changed)
-	_environment_sky_sh.clear()
-	_sky_dirty = true
-	_result_dirty = true
-
-## Deep environment signature; expensive material property reflection runs at
-## SCENE_SCAN_MSEC cadence rather than every frame.
-func _scan_environment(environment: Environment) -> void:
-	var sky: Sky = environment.sky if environment != null else null
-	var material: Material = sky.sky_material if sky != null else null
-	var material_state: Array = []
-	if material != null:
-		for property in material.get_property_list():
-			if int(property.usage) & PROPERTY_USAGE_STORAGE:
-				if property.name in ["resource_name", "resource_path", "resource_local_to_scene"]:
-					continue
-			material_state.append([property.name, material.get(property.name)])
-	var signature := hash([
-		environment.get_instance_id() if environment != null else 0,
-		environment.ambient_light_source if environment != null else -1,
-		environment.background_mode if environment != null else -1,
-		environment.ambient_light_color if environment != null else Color.BLACK,
-		environment.ambient_light_energy if environment != null else 0.0,
-		environment.ambient_light_sky_contribution if environment != null else 0.0,
-		environment.background_color if environment != null else Color.BLACK,
-		environment.background_energy_multiplier if environment != null else 0.0,
-		environment.sky_rotation if environment != null else Vector3.ZERO,
-		sky.get_instance_id() if sky != null else 0,
-		material.get_instance_id() if material != null else 0,
-		material_state,
-	])
-	if signature != _environment_signature:
-		_environment_signature = signature
-		_sky_dirty = true
-		_result_dirty = true
-
-## Returns true when the sky SH changed, so callers can invalidate cached
-## coefficient results.
-func _update_sky(environment: Environment, now: int) -> bool:
-	if not _sky_dirty or now < _next_sky_update:
-		return false
-	_next_sky_update = now + SKY_REFRESH_MSEC
-	var image := RenderingServer.environment_bake_panorama(
-			environment.get_rid(), false, SKY_PANORAMA_SIZE)
-	if image == null or image.is_empty():
-		_environment_sky_sh.clear()
-		_sky_dirty = false
-		return true
-	_environment_sky_sh = project_panorama(image, Basis.from_euler(environment.sky_rotation))
-	_sky_dirty = false
-	return true
-
-func _on_sky_changed() -> void:
-	_sky_dirty = true
-
 static func _source_fingerprint(lights: Array[DirectionalLight3D], world: World3D) -> int:
 	var values: Array = []
 	for light in lights:
@@ -239,6 +140,11 @@ static func _source_fingerprint(lights: Array[DirectionalLight3D], world: World3
 				light.light_indirect_energy, light.get("light_intensity_lux"), light.light_negative,
 				light.is_visible_in_tree()])
 	return hash(values)
+
+static func _zero_sh() -> PackedFloat32Array:
+	var values := PackedFloat32Array()
+	values.resize(27)
+	return values
 
 static func project_panorama(image: Image, local_to_world := Basis.IDENTITY) -> PackedFloat32Array:
 	var result := PackedFloat32Array()

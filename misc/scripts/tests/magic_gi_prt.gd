@@ -72,13 +72,19 @@ func _run() -> void:
 	await process_frame
 	var zero_baked: bool = await zero_volume.bake()
 	_check(zero_baked and zero_volume.bake_data.is_valid(),
-			"an isolated plane produces a valid bake even when it has no indirect transport")
-	_check(not zero_volume.bake_data.has_nonzero_transfer()
-			and not zero_volume.has_nonzero_indirect_transfer(),
-			"a single flat receiver correctly stores zero indirect transport")
+			"an isolated plane produces a valid bake without secondary surface transport")
+	var primary_visibility_l1 := 0.0
+	for coefficient in zero_volume.bake_data.primary_sky_visibility:
+		primary_visibility_l1 += absf(coefficient)
+	_check(_packed_values_all_zero(zero_volume.bake_data.transfer)
+			and _packed_values_all_zero(zero_volume.bake_data.emitter_transport)
+			and primary_visibility_l1 > 0.0
+			and zero_volume.bake_data.has_nonzero_transfer()
+			and zero_volume.has_nonzero_indirect_transfer(),
+			"an isolated flat receiver stores no secondary/emitter transfer but preserves primary sky visibility")
 	var zero_warnings: PackedStringArray = zero_volume._get_configuration_warnings()
-	_check(zero_warnings.has(Volume.ZERO_TRANSFER_DIAGNOSTIC),
-			"a valid all-zero bake exposes a persistent no-indirect-light warning")
+	_check(not zero_warnings.has(Volume.ZERO_TRANSFER_DIAGNOSTIC),
+			"a valid primary-visibility bake is not diagnosed as an all-zero bake")
 	isolated_ground.queue_free()
 	zero_volume.queue_free()
 	await process_frame
@@ -504,13 +510,24 @@ func _test_pure_contracts() -> void:
 	_check(sky_sh[9] < 0.0 and sky_sh[6] < 0.0,
 			"asymmetric panorama projects with Godot's non-mirrored equirectangular axes")
 	var env := Environment.new()
+	env.background_mode = Environment.BG_SKY
+	env.sky = Sky.new()
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+	var no_provider_scene := Node3D.new()
+	root.add_child(no_provider_scene)
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = env
+	no_provider_scene.add_child(world_environment)
+	var no_provider_volume := Volume.new()
+	no_provider_volume.lighting_environment = env
+	no_provider_scene.add_child(no_provider_volume)
 	var lighting := Lighting.new()
-	lighting._scan_environment(env)
-	var previous_signature: int = lighting._environment_signature
-	env.background_color = Color(0.1, 0.4, 0.8)
-	lighting._scan_environment(env)
-	_check(lighting._environment_signature != previous_signature and lighting._sky_dirty,
-			"environment property changes invalidate cached sky SH")
+	var light_sets: Dictionary = lighting.coefficient_sets(no_provider_volume)
+	_check(_packed_values_all_zero(light_sets.sky_lighting),
+			"WorldEnvironment Sky is not an implicit Magic GI source without a ready FengSkyLight")
+	_check(_packed_values_all_zero(light_sets.lighting),
+			"no-provider SkyLight contributes zero to secondary lighting coefficients")
+	no_provider_scene.free()
 	var fake_data := FakeTerrainData.new()
 	SceneTracker.watch_object(fake_data)
 	var revision_before := SceneTracker.resource_revision(fake_data)
@@ -523,10 +540,10 @@ func _test_pure_contracts() -> void:
 func _test_emission_data_contracts() -> void:
 	var data: Resource = _make_emission_contract_data()
 	_check(data.is_valid() and data.format_version == Data.FORMAT_VERSION,
-			"synthetic v3 emitter bake validates with zero far-field SH transport")
+			"synthetic v4 emitter bake validates with separate primary Sky visibility")
 	_test_render_upload_package(data)
 	_check(data.emitter_count() == 1 and data.has_nonzero_transfer(),
-			"synthetic emission-only data counts emitter transport as real indirect transport")
+			"synthetic v4 data counts emitter transport as real indirect transport")
 	var raw_transfer: PackedByteArray = data.transfer.to_byte_array()
 	var raw_emitter_transport: PackedByteArray = data.emitter_transport.to_byte_array()
 	var source_values := PackedFloat32Array([0.5, 0.25, 0.125, 1.0, 1.0, 1.0])
@@ -556,20 +573,48 @@ func _test_emission_data_contracts() -> void:
 	legacy_v2.emitter_keys = PackedStringArray()
 	legacy_v2.emitter_static_signatures = PackedInt64Array()
 	legacy_v2.emitter_transport = PackedFloat32Array()
+	legacy_v2.primary_sky_visibility = PackedFloat32Array()
 	_check(legacy_v2.is_valid() and legacy_v2.emitter_count() == 0,
 			"legacy v2 surface-transport bakes remain valid without emitter arrays")
+	var legacy_v3: Resource = data.duplicate(true)
+	legacy_v3.format_version = Data.EMITTER_FORMAT_VERSION
+	legacy_v3.primary_sky_visibility.clear()
+	_check(legacy_v3.is_valid() and legacy_v3.emitter_count() == 1,
+			"legacy v3 emitter bakes remain valid without primary Sky visibility")
+	var primary_only: Resource = data.duplicate(true)
+	primary_only.transfer.fill(0.0)
+	primary_only.emitter_keys.clear()
+	primary_only.emitter_static_signatures.clear()
+	primary_only.emitter_transport.clear()
+	primary_only.primary_sky_visibility.fill(0.0)
+	primary_only.primary_sky_visibility[0] = 0.25
+	var sky_only_lighting := PackedFloat32Array()
+	sky_only_lighting.resize(27)
+	sky_only_lighting.fill(0.0)
+	sky_only_lighting[0] = 2.0
+	sky_only_lighting[1] = 3.0
+	sky_only_lighting[2] = 4.0
+	var no_secondary_lighting := PackedFloat32Array()
+	no_secondary_lighting.resize(27)
+	no_secondary_lighting.fill(0.0)
+	_check(primary_only.is_valid() and primary_only.has_nonzero_transfer()
+			and primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting) == Vector3(0.5, 0.75, 1.0),
+			"v4 primary Sky visibility remains valid transport and evaluates only against Sky-only SH")
 	var bad_shape: Resource = data.duplicate(true)
 	bad_shape.emitter_transport.resize(bad_shape.emitter_transport.size() - 1)
-	_check(not bad_shape.is_valid(), "v3 rejects an emitter payload with the wrong probe shape")
+	_check(not bad_shape.is_valid(), "v4 rejects an emitter payload with the wrong probe shape")
 	var bad_count: Resource = data.duplicate(true)
 	bad_count.emitter_static_signatures.clear()
-	_check(not bad_count.is_valid(), "v3 rejects mismatched emitter key/static-signature counts")
+	_check(not bad_count.is_valid(), "v4 rejects mismatched emitter key/static-signature counts")
 	var bad_negative: Resource = data.duplicate(true)
 	bad_negative.emitter_transport[0] = -0.001
-	_check(not bad_negative.is_valid(), "v3 rejects negative emitter transport")
+	_check(not bad_negative.is_valid(), "v4 rejects negative emitter transport")
 	var bad_nan: Resource = data.duplicate(true)
 	bad_nan.emitter_transport[0] = NAN
-	_check(not bad_nan.is_valid(), "v3 rejects non-finite emitter transport")
+	_check(not bad_nan.is_valid(), "v4 rejects non-finite emitter transport")
+	var bad_primary_shape: Resource = data.duplicate(true)
+	bad_primary_shape.primary_sky_visibility.resize(bad_primary_shape.primary_sky_visibility.size() - 1)
+	_check(not bad_primary_shape.is_valid(), "v4 rejects primary Sky visibility with the wrong probe shape")
 	var unsupported: Resource = data.duplicate(true)
 	unsupported.format_version = Data.FORMAT_VERSION + 1
 	_check(not unsupported.is_valid(), "unsupported future PRT versions fail closed")
@@ -578,14 +623,15 @@ func _test_emission_data_contracts() -> void:
 
 func _test_render_upload_package(data: Resource) -> void:
 	var upload: Dictionary = data.make_render_upload()
-	var expected_keys := ["transfer_image", "geometry_image", "index_bytes", "emission_image"]
+	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "index_bytes", "emission_image"]
 	var has_contract_fields := upload.size() == expected_keys.size()
 	for key in expected_keys:
 		has_contract_fields = has_contract_fields and upload.has(key)
-	_check(has_contract_fields, "render upload returns the atomic four-field package")
+	_check(has_contract_fields, "render upload returns the atomic five-field package")
 	if not has_contract_fields:
 		return
 	var transfer_image: Image = upload["transfer_image"]
+	var primary_sky_image: Image = upload["primary_sky_image"]
 	var geometry_image: Image = upload["geometry_image"]
 	var emission_image: Image = upload["emission_image"]
 	var index_bytes: PackedByteArray = upload["index_bytes"]
@@ -595,6 +641,9 @@ func _test_render_upload_package(data: Resource) -> void:
 	_check(transfer_image != null and expected_transfer != null
 			and transfer_image.get_data() == expected_transfer.get_data(),
 			"atomic transfer image is byte-identical to the existing runtime packer")
+	_check(primary_sky_image != null and primary_sky_image.get_width() == Data.ATLAS_COLUMNS * Data.PRIMARY_SKY_TEXELS_PER_POINT
+			and is_equal_approx(primary_sky_image.get_pixel(0, 0).r, data.primary_sky_visibility[0]),
+			"atomic upload includes the v4 primary Sky visibility atlas")
 	_check(geometry_image != null and expected_geometry != null
 			and geometry_image.get_data() == expected_geometry.get_data(),
 			"atomic geometry image is byte-identical to the existing geometry packer")
@@ -873,6 +922,9 @@ func _make_emission_contract_data(data: Resource = null) -> Resource:
 	data.normals = PackedVector3Array([Vector3.UP, Vector3.UP])
 	data.transfer.resize(data.probe_count() * 27)
 	data.transfer.fill(0.0)
+	data.primary_sky_visibility.resize(data.probe_count() * 9)
+	data.primary_sky_visibility.fill(0.0)
+	data.primary_sky_visibility[0] = 0.25
 	data.emitter_keys = PackedStringArray(["EmissionFixture/Panel#surface=0"])
 	data.emitter_static_signatures = PackedInt64Array([1234])
 	data.emitter_transport = PackedFloat32Array([
@@ -981,6 +1033,8 @@ func _make_filter_test_data() -> Resource:
 	data.normals = PackedVector3Array([Vector3.UP])
 	data.transfer.resize(27)
 	data.transfer.fill(0.0)
+	data.primary_sky_visibility.resize(9)
+	data.primary_sky_visibility.fill(0.0)
 	var coefficients := [
 		Vector3(1.0, 2.0, 0.0),
 		Vector3(3.0, -1.5, 4.0),

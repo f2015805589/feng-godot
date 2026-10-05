@@ -72,6 +72,8 @@ func make_test_bake() -> Resource:
 	data.normals = _volume.probe_normals.duplicate()
 	data.transfer.resize(data.positions.size() * 27)
 	data.transfer.fill(0.0)
+	data.primary_sky_visibility.resize(data.positions.size() * 9)
+	data.primary_sky_visibility.fill(0.0)
 	for probe in data.positions.size():
 		# A stable DC-only fixture isolates the live SH lighting, receiver material,
 		# world reconstruction and GPU lookup from the CPU baker's ray variance.
@@ -203,12 +205,12 @@ func run() -> void:
 		return
 
 	var data := make_test_bake()
-	if not check(data != null and data.is_valid(), "synthetic v2 surface transfer fixture failed validation"):
+	if not check(data != null and data.is_valid(), "synthetic v4 surface transfer fixture failed validation"):
 		return
 	_volume.bake_data = data
 	_volume.refresh_surface_points()
 	data.scene_signature = Baker.signature_for_geometry(_volume._current_scene_signature)
-	if not check(_volume.has_bake(), "volume rejected the v2 surface bake layout or scene signature"):
+	if not check(_volume.has_bake(), "volume rejected the v4 surface bake layout or scene signature"):
 		return
 	Runtime.publish(_volume)
 	await settle(16)
@@ -238,18 +240,17 @@ func run() -> void:
 	if not check(data.bake_version == transfer_version, "dynamic lighting unexpectedly rebaked the PRT data"):
 		return
 
-	# Remove the explicit sun and vary the actual sky material. Runtime projects the
-	# refreshed panorama into lighting SH while preserving the same PRT bake.
+	# Without a ready FengSkyLight, WorldEnvironment Sky remains display/fog input
+	# only and must not silently become Magic GI illumination.
 	_volume.sun = null
 	_light.visible = false
 	var sky_blue := center(await image())
 	sky_material.sky_top_color = Color(1.0, 0.05, 0.02)
-	await create_timer(0.4).timeout # The environment panorama cache refreshes at 250 ms.
-	await settle(4)
+	await settle(24)
 	var sky_red := center(await image())
-	print("Live environment changed GI pixel: ", sky_blue, " -> ", sky_red)
-	if not check(max_channel(sky_blue) > 0.03 and sky_red.r > sky_red.b * 1.3,
-			"changing the World3D sky did not update the GI colour"):
+	print("No-provider Environment Sky GI pixel: ", sky_blue, " -> ", sky_red)
+	if not check(color_delta(sky_red, sky_blue) < 0.02,
+			"changing WorldEnvironment Sky implicitly changed Magic GI without a SkyLight provider"):
 		return
 
 	# At the center the ray remains aimed at the same floor point while the camera
@@ -345,7 +346,7 @@ func run() -> void:
 		return
 
 	# Consume a bake produced by the CPU baker through the real D3D12 pass as well.
-	# This also exercises cache replacement (synthetic fixture -> persisted PRT v3)
+	# This also exercises cache replacement (synthetic fixture -> persisted PRT v4)
 	# before the process exits and releases the pass-owned GPU resources.
 	var red_wall := MeshInstance3D.new()
 	var wall_mesh := BoxMesh.new()
@@ -378,7 +379,7 @@ func run() -> void:
 	_volume.refresh_surface_points()
 	await settle(4)
 	var real_bake_succeeded: bool = await _volume.bake()
-	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v3 resource for the GPU pass"):
+	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v4 resource for the GPU pass"):
 		return
 	var actual_data: Resource = _volume.bake_data
 	var actual_transfer_energy := 0.0
