@@ -2219,6 +2219,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	float sky_luminance_multiplier = 1.0 / rb->get_luminance_multiplier();
 	float sky_brightness_multiplier = 1.0;
 
+	// The fog Sky shader applies the environment brightness; the framebuffer clear needs it now.
+	Color fog_clear_color;
 	Color clear_color;
 	bool load_color = false;
 
@@ -2237,23 +2239,25 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 		switch (bg_mode) {
 			case RSE::ENV_BG_CLEAR_COLOR: {
-				clear_color = p_default_bg_color;
+				fog_clear_color = p_default_bg_color.srgb_to_linear();
+				clear_color = fog_clear_color;
 				clear_color.r *= scene_bg_energy_multiplier;
 				clear_color.g *= scene_bg_energy_multiplier;
 				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
-					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(clear_color.srgb_to_linear()));
+					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(fog_clear_color));
 				}
 			} break;
 			case RSE::ENV_BG_COLOR: {
-				clear_color = environment_get_bg_color(p_render_data->environment);
+				fog_clear_color = environment_get_bg_color(p_render_data->environment).srgb_to_linear();
+				clear_color = fog_clear_color;
 				clear_color.r *= scene_bg_energy_multiplier;
 				clear_color.g *= scene_bg_energy_multiplier;
 				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
-					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(clear_color.srgb_to_linear()));
+					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(fog_clear_color));
 				}
 			} break;
 			case RSE::ENV_BG_SKY: {
@@ -2303,7 +2307,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			RD::get_singleton()->draw_command_end_label();
 		}
 	} else {
-		clear_color = p_default_bg_color;
+		clear_color = p_default_bg_color.srgb_to_linear();
+		clear_color.r *= current_pre_exposure;
+		clear_color.g *= current_pre_exposure;
+		clear_color.b *= current_pre_exposure;
 	}
 
 	// The environment's Sky remains the visible background and fog source. The
@@ -2618,7 +2625,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				{
 					Vector<Color> c;
 					if (!load_color) {
-						Color cc = clear_color.srgb_to_linear();
+						Color cc = clear_color;
 						if (using_separate_specular || rb_data.is_valid()) {
 							// Effects that rely on separate specular, like subsurface scattering, must clear the alpha to zero.
 							cc.a = 0;
