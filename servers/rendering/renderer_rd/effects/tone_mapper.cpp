@@ -111,7 +111,7 @@ ToneMapper::ToneMapper(bool p_use_mobile_version) {
 
 ToneMapper::~ToneMapper() {
 	if (ue_film_lut.is_valid() && RD::get_singleton()) {
-		RD::get_singleton()->free(ue_film_lut);
+		RD::get_singleton()->free_rid(ue_film_lut);
 	}
 	if (using_mobile_version) {
 		tonemap_mobile.shader.version_free(tonemap_mobile.shader_version);

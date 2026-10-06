@@ -142,7 +142,7 @@ static UEFilmVec3 ue_film_tone_map(const UEFilmVec3 &p_input_ap1) {
 
 	double hue = 0.0;
 	if (!(color_ap0.x == color_ap0.y && color_ap0.y == color_ap0.z)) {
-		hue = (180.0 / Math_PI) * std::atan2(std::sqrt(3.0) * (color_ap0.y - color_ap0.z), 2.0 * color_ap0.x - color_ap0.y - color_ap0.z);
+		hue = (180.0 / Math::PI) * std::atan2(std::sqrt(3.0) * (color_ap0.y - color_ap0.z), 2.0 * color_ap0.x - color_ap0.y - color_ap0.z);
 		if (hue < 0.0) {
 			hue += 360.0;
 		}
