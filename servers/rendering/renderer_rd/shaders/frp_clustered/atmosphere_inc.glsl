@@ -157,6 +157,17 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 	}
 	int samples = int(clamp(ATMO_PARAMS[7].w, 2.0, 64.0));
 	float g = ATMO_PARAMS[3].w;
+	vec2 light_phase[2];
+	for (int slot = 0; slot < 2; slot++) {
+		vec4 light = ATMO_PARAMS[8 + slot * 2];
+		light_phase[slot] = vec2(0.0);
+		if (light.w <= 0.0) {
+			continue;
+		}
+		float mu = clamp(dot(direction, light.xyz), -1.0, 1.0);
+		light_phase[slot].x = 3.0 * (1.0 + mu * mu) / (16.0 * FRP_ATMO_PI);
+		light_phase[slot].y = frp_atmo_mie_phase(g, mu);
+	}
 	vec3 ray_origin = origin + direction * begin;
 	float path = end - begin;
 	bool downward = dot(ray_origin, direction) < 0.0;
@@ -180,10 +191,7 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 			if (light.w <= 0.0) {
 				continue;
 			}
-			float mu = clamp(dot(direction, light.xyz), -1.0, 1.0);
-			float rayleigh_phase = 3.0 * (1.0 + mu * mu) / (16.0 * FRP_ATMO_PI);
-			float mie_phase = frp_atmo_mie_phase(g, mu);
-			vec3 unit_source = (rayleigh * rayleigh_phase + mie * mie_phase) * frp_atmo_transmittance(p, light.xyz);
+			vec3 unit_source = (rayleigh * light_phase[slot].x + mie * light_phase[slot].y) * frp_atmo_transmittance(p, light.xyz);
 			// UE 5.8 overview documents multiple scattering for the primary light only.
 			if (slot == 0 && ATMO_PARAMS[12].y > 0.5 && ATMO_PARAMS[6].y > 0.0) {
 				unit_source += (rayleigh + mie) * frp_atmo_multiple(p, light.xyz) * ATMO_PARAMS[6].y;

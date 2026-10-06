@@ -167,6 +167,7 @@ var _capture_snapshot_after_inflight := false
 var _capture_native_signature: Array = []
 var _capture_fog_effect: CompositorEffect
 var _capture_fog_effect_prepared := false
+var _capture_fog_effect_active := false
 var _capture_fog_effect_leases: Array[CompositorEffect] = []
 var _provider_active := false
 var _external_radiance_enabled := false
@@ -592,7 +593,7 @@ func _feng_sky_light_refresh_active() -> void:
 
 
 func _feng_sky_light_runtime_snapshot() -> Dictionary:
-	if not _provider_active or _radiance_sh.size() != 27 or _last_projected_revision < 0:
+	if not _provider_active or not _ensure_radiance_sh():
 		return {}
 	return {
 		"ready": true,
@@ -673,14 +674,16 @@ func _sync_active_source() -> void:
 	var desired_signature: Array = [
 		_capture_environment.get_instance_id(), _output_sky.get_instance_id(),
 		capture_resolution, capture_distance, effective_cull_mask, capture_shadows,
-		_capture_fog_effect.get_instance_id() if _capture_fog_effect != null else 0]
+		_capture_fog_effect.get_instance_id() if _capture_fog_effect_active \
+				and _capture_fog_effect != null else 0]
 	if _capture_native_config_dirty or desired_signature != _capture_native_signature:
 		if _capture_native_signature.size() > 0:
 			NativeAdapter.detach_capture_output(_capture_probe)
 		var configured := NativeAdapter.set_capture_probe(_capture_probe,
 				_capture_environment, _output_sky, capture_resolution,
 				capture_distance, effective_cull_mask, capture_shadows,
-				_capture_fog_effect if source_mode == SourceMode.CAPTURED_SCENE else null)
+				_capture_fog_effect if _capture_fog_effect_active \
+						and source_mode == SourceMode.CAPTURED_SCENE else null)
 		if not configured:
 			return
 		_capture_native_signature = desired_signature
@@ -800,28 +803,34 @@ func _snapshot_capture_sky(source: Sky) -> Sky:
 
 func _prepare_capture_fog_effect() -> void:
 	_capture_fog_effect_prepared = true
+	_capture_fog_effect_active = false
 	var world := get_world_3d()
 	if source_mode != SourceMode.CAPTURED_SCENE or world == null:
-		_capture_fog_effect = null
+		_clear_cached_capture_fog_snapshots()
 		return
 	var world_id := world.get_instance_id()
 	var fog_snapshot := _fog_snapshot_for_world(world_id)
 	var atmosphere_snapshot := _atmosphere_snapshot_for_world(world_id)
 	if fog_snapshot.is_empty() and atmosphere_snapshot.is_empty():
-		_capture_fog_effect = null
+		_clear_cached_capture_fog_snapshots()
 		return
 	if not ResourceLoader.exists(HeightFogEffectPath):
-		_capture_fog_effect = null
+		_clear_cached_capture_fog_snapshots()
 		return
-	if _capture_fog_effect != null and is_instance_valid(_capture_fog_effect):
-		_capture_fog_effect_leases.append(_capture_fog_effect)
-	var effect := load(HeightFogEffectPath) as CompositorEffect
-	if effect == null:
-		_capture_fog_effect = null
-		return
-	_capture_fog_effect = effect.duplicate(true) as CompositorEffect
+	if _capture_fog_effect == null or not is_instance_valid(_capture_fog_effect):
+		var effect := load(HeightFogEffectPath) as CompositorEffect
+		if effect == null:
+			return
+		_capture_fog_effect = effect.duplicate(true) as CompositorEffect
 	if _capture_fog_effect != null and _capture_fog_effect.has_method("set_capture_snapshots"):
 		_capture_fog_effect.call("set_capture_snapshots", fog_snapshot, atmosphere_snapshot)
+		_capture_fog_effect_active = true
+
+
+func _clear_cached_capture_fog_snapshots() -> void:
+	if _capture_fog_effect != null and is_instance_valid(_capture_fog_effect) \
+			and _capture_fog_effect.has_method("clear_capture_snapshots"):
+		_capture_fog_effect.call("clear_capture_snapshots")
 
 
 func _fog_snapshot_for_world(world_id: int) -> Dictionary:
@@ -888,6 +897,7 @@ func _retire_capture_fog_effects() -> void:
 		effects.append(_capture_fog_effect)
 	_capture_fog_effect = null
 	_capture_fog_effect_prepared = false
+	_capture_fog_effect_active = false
 	Runtime.retain_capture_effects_until_rendered(effects)
 
 
@@ -946,28 +956,39 @@ func _poll_external_radiance() -> void:
 	_native_radiance_ready = true
 	_native_radiance_revision = revision
 	_native_radiance_exposure = exposure
-	var signature: Array = [revision, radiance_energy, _radiance_rotation()]
-	if signature == _last_projected_signature:
-		return
-	if revision != _last_projected_revision:
-		_cached_panorama = NativeAdapter.bake_world_linear_panorama(_output_sky, PANORAMA_SIZE)
-		if _cached_panorama == null or _cached_panorama.is_empty():
-			return
+
+
+func _ensure_radiance_sh() -> bool:
+	# MagicGI is the only consumer of this CPU SH snapshot. Keep the synchronous
+	# panorama readback out of the capture/poll path and pay for it only when a
+	# consumer requests the current completed radiance.
+	var revision := _native_radiance_revision if _native_radiance_ready else _last_projected_revision
+	if revision < 0:
+		return false
+	var rotation := _radiance_rotation()
+	var signature: Array = [revision, radiance_energy, rotation]
+	if signature == _last_projected_signature and _radiance_sh.size() == 27:
+		return true
+	if revision != _last_projected_revision or _cached_panorama == null \
+			or _cached_panorama.is_empty():
+		if not _native_radiance_ready or _output_sky == null:
+			return false
+		var panorama := NativeAdapter.bake_world_linear_panorama(_output_sky, PANORAMA_SIZE)
+		if panorama == null or panorama.is_empty():
+			return false
+		_cached_panorama = panorama
 		_last_projected_revision = revision
-		_projected_exposure = exposure
+		_projected_exposure = _native_radiance_exposure
 	_radiance_sh = CubemapAdapter.project_world_linear_panorama(
-			_cached_panorama, _radiance_rotation(), radiance_energy)
+			_cached_panorama, rotation, radiance_energy)
 	_last_projected_signature = signature
+	return _radiance_sh.size() == 27
 
 
 func _project_cached_panorama() -> void:
-	if _cached_panorama == null or _cached_panorama.is_empty():
-		_last_projected_signature.clear()
-		return
-	_radiance_sh = CubemapAdapter.project_world_linear_panorama(
-			_cached_panorama, _radiance_rotation(), radiance_energy)
-	_last_projected_signature = [
-		_last_projected_revision, radiance_energy, _radiance_rotation()]
+	# Invalidate the projected value without doing CPU work here. If MagicGI is
+	# active, its next snapshot request will reproject the cached panorama.
+	_last_projected_signature.clear()
 
 
 func _connect_tree_signals() -> void:

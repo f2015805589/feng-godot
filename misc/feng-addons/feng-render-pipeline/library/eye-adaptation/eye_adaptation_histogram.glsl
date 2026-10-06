@@ -79,9 +79,12 @@ void main() {
 	barrier();
 
 	if (t < NUM_BINS) {
-		uint old_value = atomicAdd(params_buffer.histogram[t], shared_bins[t]);
-		if (old_value > 0xffffffffu - shared_bins[t]) {
-			atomicAdd(params_buffer.histogram_overflow[t], 1u);
+		uint bin_sum = shared_bins[t];
+		if (bin_sum != 0u) {
+			uint old_value = atomicAdd(params_buffer.histogram[t], bin_sum);
+			if (old_value > 0xffffffffu - bin_sum) {
+				atomicAdd(params_buffer.histogram_overflow[t], 1u);
+			}
 		}
 	}
 }
