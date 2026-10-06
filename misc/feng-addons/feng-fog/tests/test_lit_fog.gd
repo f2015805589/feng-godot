@@ -89,6 +89,10 @@ func run() -> void:
 	sun.light_intensity_lux = 6.0
 	viewport_a.add_child(sun)
 	var fog := FengHeightFog.new()
+	# Keep this file's original Lit Albedo coverage explicit as the component's
+	# default now follows Unreal Radiance semantics.
+	fog.fog_color_mode = FengHeightFog.ColorMode.LIT
+	fog.fog_inscattering_color = Color.WHITE
 	fog.sun_light = sun
 	viewport_a.add_child(fog)
 	var unlit_fog := FengHeightFog.new()
@@ -96,16 +100,29 @@ func run() -> void:
 	var world_a_id := viewport_a.world_3d.get_instance_id()
 	var world_b_id := viewport_b.world_3d.get_instance_id()
 
+	require(unlit_fog.fog_color_mode == FengHeightFog.ColorMode.LEGACY_RADIANCE
+		and unlit_fog.fog_inscattering_color == Color.BLACK
+		and unlit_fog.sky_atmosphere_ambient_contribution_color_scale == Color.WHITE,
+		"new fog must default to black Unreal Radiance and neutral sky-ambient scale")
+	var unlit := snapshot_for(unlit_fog)
+	require_vec(unlit.get("fog_color", Vector3.INF), Vector3.ZERO, "default black authored source must remain black")
+	require(not unlit.has("fog_albedo"), "default Unreal Radiance must not publish a material albedo")
+	require_vec(unlit.get("inscattering_color", Vector3.INF), Vector3.ZERO, "no sun must disable its lobe")
+	require(float(unlit.get("fog_density", 0.0)) > 0.0
+		and is_zero_approx(float(unlit.get("min_opacity", -1.0)))
+		and float(unlit.get("inscattering_start", 0.0)) < 0.0,
+		"black default source must retain fog extinction/transmission while disabling the sun lobe")
+	unlit_fog.fog_inscattering_color = Color(1.5, -0.25, 0.5)
+	var authored_radiance := snapshot_for(unlit_fog)
+	require_vec(authored_radiance.get("fog_color", Vector3.INF), Vector3(1.5, -0.25, 0.5),
+		"default Unreal Radiance must preserve authored scene-linear RGB without clamp or sRGB conversion")
+	require(not authored_radiance.has("fog_albedo"),
+		"authored Unreal Radiance must remain independent from Lit Albedo")
+	unlit_fog.fog_inscattering_color = Color.BLACK
 	require(fog.fog_color_mode == FengHeightFog.ColorMode.LIT
 		and fog.fog_inscattering_color == Color.WHITE
 		and fog.sky_atmosphere_ambient_contribution_color_scale == Color.WHITE,
-		"new fog must default to lit white and neutral sky-ambient scale")
-	var unlit := snapshot_for(unlit_fog)
-	require_vec(unlit.get("fog_color", Vector3.INF), Vector3.ZERO, "no sky or sun must not emit")
-	require_vec(unlit.get("inscattering_color", Vector3.INF), Vector3.ZERO, "no sun must disable its lobe")
-	require(float(unlit.get("fog_density", 0.0)) > 0.0
-		and float(unlit.get("inscattering_start", 0.0)) < 0.0,
-		"unlit fog must retain extinction while disabling the sun lobe")
+		"Lit Albedo remains available as an explicit opt-in with a neutral sky-ambient scale")
 
 	fog.fog_inscattering_color = Color(0.65, 0.4, 0.2)
 	fog.directional_inscattering_color = Color(0.3, 0.5, 0.8)
@@ -275,22 +292,58 @@ func run() -> void:
 	var authored := Vector3(0.65, 0.4, 0.2)
 	var authored_tint := Vector3(0.3, 0.5, 0.8)
 	var luminance := ground.dot(Vector3(0.2126, 0.7152, 0.0722))
+	var unreal_atmosphere_direct := ground * 0.25
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color(0.25, 0.5, 2.0)
 	var scaled_legacy := snapshot_for(fog)
 	require_vec(scaled_legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25 * ambient_color_scale,
-		"sky atmosphere RGB scale must affect only the legacy mode's ambient contribution")
-	require_vec(scaled_legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance,
+		"sky atmosphere RGB scale must affect only the Unreal Radiance ambient contribution")
+	require_vec(scaled_legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance + unreal_atmosphere_direct,
 		"sky atmosphere RGB scale must not tint the legacy directional lobe")
 	fog.sky_atmosphere_ambient_contribution_color_scale = Color.WHITE
 	require(not legacy.has("fog_albedo"), "legacy snapshots must not be treated as material albedo")
 	require_vec(legacy.get("fog_color", Vector3.INF), authored + ambient * 0.25,
-		"legacy source must remain raw authored RGB plus untinted sky")
-	require_vec(legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance,
-		"legacy lobe must use raw artist tint and atmosphere-attenuated sun luminance")
+		"Unreal Radiance source must remain raw authored RGB plus untinted sky")
+	require_vec(legacy.get("inscattering_color", Vector3.INF), authored_tint * luminance + unreal_atmosphere_direct,
+		"Unreal Radiance must combine raw artist tint and matched atmosphere sunlight in the directional lobe")
 	FengSkyRuntime.remove_snapshot(provider_a, world_a_id)
 	sun.visible = false
 	require_vec(snapshot_for(fog).get("fog_color", Vector3.INF), authored,
 		"legacy source must remain visible without any incident light")
+
+	# Unreal Radiance keeps author color, atmosphere ambient, atmosphere direct
+	# sunlight, and the optional artist lobe as separate source terms.
+	sun.visible = true
+	fog.fog_inscattering_color = Color(1.5, -0.25, 0.5)
+	var radiance_author := Vector3(1.5, -0.25, 0.5)
+	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.25)
+	var radiance_matched := snapshot_for(fog)
+	require(not radiance_matched.has("fog_albedo"),
+		"default Unreal Radiance must not reinterpret its authored RGB as albedo")
+	require_vec(radiance_matched.get("fog_color", Vector3.INF), radiance_author + ambient * 0.25,
+		"matched atmosphere adds ambient to the independent authored base, not direct sun")
+	require_vec(radiance_matched.get("inscattering_color", Vector3.INF),
+		authored_tint * luminance + ground * 0.25,
+		"matched atmosphere direct sunlight uses the directional source beside the independent artist lobe")
+	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 0.0)
+	var zero_radiance_contribution := snapshot_for(fog)
+	require_vec(zero_radiance_contribution.get("fog_color", Vector3.INF), radiance_author,
+		"zero atmosphere contribution must retain the authored Radiance base")
+	require_vec(zero_radiance_contribution.get("inscattering_color", Vector3.INF), authored_tint * luminance,
+		"zero atmosphere contribution must remove physical sun while retaining artist direction")
+	publish_sky(provider_a, sun.get_instance_id(), ambient, ground, 1.0, false)
+	var disabled_atmosphere_contribution := snapshot_for(fog)
+	require_vec(disabled_atmosphere_contribution.get("fog_color", Vector3.INF), radiance_author,
+		"Affect Height Fog off must preserve base Radiance without adding sky ambient")
+	require_vec(disabled_atmosphere_contribution.get("inscattering_color", Vector3.INF),
+		authored_tint * raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722)),
+		"Affect Height Fog off must preserve the scene-light-scaled artist direction")
+	FengSkyRuntime.remove_snapshot(provider_a, world_a_id)
+	var no_atmosphere := snapshot_for(fog)
+	require_vec(no_atmosphere.get("fog_color", Vector3.INF), radiance_author,
+		"without an atmosphere provider Unreal Radiance remains the authored base only")
+	require_vec(no_atmosphere.get("inscattering_color", Vector3.INF),
+		authored_tint * raw_sun.dot(Vector3(0.2126, 0.7152, 0.0722)),
+		"without an atmosphere provider only the independent scene-light artist lobe remains")
 	FengSkyRuntime.remove_snapshot(provider_b, world_b_id)
 	viewport_a.free()
 	viewport_b.free()

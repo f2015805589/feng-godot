@@ -75,7 +75,7 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: 
 		return
 	var contribution_scale := _sky_height_fog_contribution_scale(sky)
 	# snapshot_fields() owns the local schema and normalizes ambient_scale.
-	# Albedo is absent in Legacy Radiance mode, which receives untinted ambient.
+	# Albedo is absent in Unreal Radiance mode, which receives untinted ambient.
 	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
 	var ambient_scale: Vector3 = snapshot["sky_atmosphere_ambient_contribution_color_scale"]
 	var combined_fog_color: Vector3 = snapshot["fog_color"] + albedo * ambient * ambient_scale * contribution_scale
@@ -292,17 +292,18 @@ static func _publish() -> void:
 			if matched_atmosphere_sun is Vector3:
 				sun_rgb = matched_atmosphere_sun
 			if snapshot.has("fog_albedo"):
-				# Custom/unmatched scene lights retain the Lit isotropic source.
-				# A matched atmosphere sun is added to the directional source below.
+				# The optional Lit Albedo mode keeps its scene-light fallback.
+				# Unreal Radiance has no isotropic direct-sun contribution.
 				var albedo: Vector3 = snapshot["fog_albedo"]
 				if not matched_atmosphere_sun is Vector3:
 					snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
 			# Both modes use an independent artist lobe scaled by sun luminance.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
 			var inscattering_color: Vector3 = snapshot["inscattering_color"] * sun_luminance
-			if snapshot.has("fog_albedo") and matched_atmosphere_sun is Vector3:
+			if matched_atmosphere_sun is Vector3:
 				var contribution_scale := _sky_height_fog_contribution_scale(sky_snapshot)
-				var atmosphere_sun_lobe: Vector3 = snapshot["fog_albedo"] * matched_atmosphere_sun * contribution_scale
+				var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
+				var atmosphere_sun_lobe: Vector3 = albedo * matched_atmosphere_sun * contribution_scale
 				if atmosphere_sun_lobe.is_finite():
 					var combined_inscattering := inscattering_color + atmosphere_sun_lobe
 					if combined_inscattering.is_finite():

@@ -5,8 +5,9 @@ extends Node3D
 ##
 ## The node's world-space height is its global Y position (each fog layer's
 ## height offset is relative to it), and a world keeps the latest registered
-## enabled node active. Extinction parameters keep Unreal's shader semantics;
-## Lit colors describe a material, with Legacy Radiance as an explicit opt-out.
+## enabled node active. Extinction parameters and the default authored source
+## follow Unreal's exponential height fog semantics. Lit Albedo is an opt-in
+## physically lit material mode.
 ## Density and falloff carry Unreal's authored units and are divided
 ## by ten for meters before upload (Unreal divides by 1000 in centimeters).
 ## While active, the runtime temporarily enables debanding on affected viewports
@@ -29,18 +30,18 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 	set(value):
 		fog_density = maxf(value, 0.0)
 		_publish()
-## Lit treats Fog Inscattering Color as a material's scattering albedo: sky
-## and sunlight illuminate it. Legacy Radiance keeps the old fixed, additive
-## scene-linear source for scenes authored with Unreal's color semantics.
-@export_enum("Lit", "Legacy Radiance") var fog_color_mode: int = ColorMode.LIT:
+## Unreal Radiance keeps Fog Inscattering Color as an independent, additive
+## scene-linear source. Lit Albedo instead interprets it as a material color
+## illuminated by sky and sunlight; this is an optional physical model.
+@export_enum("Lit Albedo", "Unreal Radiance") var fog_color_mode: int = ColorMode.LEGACY_RADIANCE:
 	set(value):
 		fog_color_mode = value
 		_publish()
-## In Lit mode this is an sRGB material color, converted to linear albedo in
-## [0, 1]. White scatters incident light without tinting it. Black disables
-## the base source; the separately authored directional lobe is unaffected.
-## In Legacy Radiance mode it is the original scene-linear additive source.
-@export var fog_inscattering_color := Color.WHITE:
+## In Unreal Radiance mode this is an independent scene-linear source: it is
+## not multiplied by sunlight, converted from sRGB, or clamped. In Lit Albedo
+## mode it is an sRGB material color converted to linear albedo in [0, 1].
+## Black is the Unreal-compatible default authored source.
+@export var fog_inscattering_color := Color.BLACK:
 	set(value):
 		fog_inscattering_color = value
 		_publish()
@@ -116,8 +117,9 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 		_publish()
 ## Independent artist color multiplied by sun luminance, never by the base
 ## Fog Inscattering Color. Retains the original scene-linear RGB semantics.
-## Black disables only this optional lobe; Lit mode still has isotropic
-## sunlight. (Unreal: Directional Inscattering Color)
+## Black disables only this optional artist lobe. Matched atmosphere sunlight
+## remains a separate directional source; Lit Albedo retains its optional
+## isotropic fallback for unmatched scene lights. (Unreal: Directional Inscattering Color)
 @export var directional_inscattering_color := Color(0.0, 0.0, 0.0):
 	set(value):
 		directional_inscattering_color = value

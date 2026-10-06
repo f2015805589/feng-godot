@@ -12,6 +12,7 @@ var fog: FengHeightFog
 var sky: FengSkyAtmosphere
 var exposure: FengEyeAdaptationPass
 var points: Array[Vector2i] = []
+var material_path_points: Array[Vector2i] = []
 var failed := false
 
 func _initialize() -> void:
@@ -75,6 +76,9 @@ func run() -> void:
 	scene.add_child(sun)
 	sky.sun_light = sun
 	fog = Fog.new()
+	# Preserve the Lit Albedo comparison coverage after the component default
+	# switches to Unreal Radiance.
+	fog.fog_color_mode = Fog.ColorMode.LIT
 	fog.fog_inscattering_color = Color(0.8, 0.08, 0.03)
 	fog.fog_density = 2.0
 	fog.fog_height_falloff = 0.001
@@ -98,7 +102,9 @@ func run() -> void:
 			material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		card.material_override = material
 		scene.add_child(card)
-		points.append(Vector2i(camera.unproject_position(card.global_position)))
+		var point := Vector2i(camera.unproject_position(card.global_position))
+		points.append(point)
+		material_path_points.append(point)
 	var renderer := FengRenderer.new()
 	for entry in renderer.passes:
 		if entry.stable_id == &"library:eye_adaptation":
@@ -259,6 +265,41 @@ func run() -> void:
 			require(distance(orange_low[0], white_with_orange[0]) < 0.08,
 				"white base plus orange lobe changed over the 10000x lighting range")
 
+	# The default Unreal Radiance path keeps an authored source visible when
+	# atmosphere contributions are explicitly zero, across the same receiver
+	# rendering paths and at fixed exposure.
+	fog.fog_color_mode = Fog.ColorMode.LEGACY_RADIANCE
+	fog.fog_inscattering_color = Color(0.8, 0.08, 0.03)
+	fog.directional_inscattering_color = Color.BLACK
+	fog.fog_density = 2.0
+	fog.fog_height_falloff = 0.001
+	sky.affect_height_fog = true
+	sky.height_fog_contribution = 0.0
+	camera.rotation_degrees = Vector3.ZERO
+	points = material_path_points
+	exposure.metering_mode = 2
+	exposure.apply_physical_camera_exposure = false
+	exposure.pre_exposure = false
+	exposure.exposure_compensation = 0.0
+	var unreal_radiance := await capture("unreal_radiance_zero_atmosphere_contribution")
+	red(unreal_radiance, "default Unreal Radiance with zero atmosphere contribution")
+	for i in range(1, unreal_radiance.size()):
+		require(distance(unreal_radiance[0], unreal_radiance[i]) < 0.04,
+			"Unreal Radiance differs between deferred, unshaded, and transparent fog paths")
+	var unreal_source: Dictionary = {}
+	for snapshot in FogRuntime.snapshots():
+		if snapshot.get("world_id") == scene.get_world_3d().get_instance_id():
+			unreal_source = snapshot
+	var unreal_base: Vector3 = unreal_source.get("fog_color", Vector3.INF)
+	require(unreal_source.has("fog_color")
+		and unreal_base.distance_to(Vector3(0.8, 0.08, 0.03)) < 0.00001,
+		"zero atmosphere contribution changed the authored scene-linear base")
+	require(not unreal_source.has("fog_albedo"),
+		"default Unreal Radiance was incorrectly uploaded as Lit Albedo")
+	var unreal_lobe: Vector3 = unreal_source.get("inscattering_color", Vector3.INF)
+	require(unreal_lobe == Vector3.ZERO,
+		"black artist lobe with zero atmosphere contribution must add no directional source")
+
 	if not failed:
-		print("PASS lit fog GPU: 6/60000 intensity, hue, deferred/fallback/transparent, pre-exposure, low-sun sky/Fog comparison and independent orange lobe")
+		print("PASS lit fog GPU: Lit Albedo lighting, Unreal Radiance defaults, deferred/fallback/transparent, pre-exposure, low-sun sky/Fog comparison and independent orange lobe")
 	quit(1 if failed else 0)
