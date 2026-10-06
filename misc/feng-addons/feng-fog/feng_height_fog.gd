@@ -37,9 +37,9 @@ const UNIT_SCALE := 0.1
 		_publish()
 ## Height density factor; controls how the density increases as height
 ## decreases. Smaller values make the visible transition larger. (Unreal: Fog Height Falloff)
-@export_range(0.001, 2.0, 0.001, "or_greater") var fog_height_falloff := 0.2:
+@export_range(0.001, 2.0, 0.001, "or_greater", "or_less") var fog_height_falloff := 0.2:
 	set(value):
-		fog_height_falloff = maxf(value, 0.001)
+		fog_height_falloff = maxf(value, 0.0)
 		_publish()
 ## Height offset of the primary fog layer, relative to the node's height. (Unreal: Fog Height Offset)
 @export var fog_height_offset := 0.0:
@@ -55,9 +55,9 @@ const UNIT_SCALE := 0.1
 		second_fog_density = maxf(value, 0.0)
 		_publish()
 ## Height density factor of the secondary fog layer. (Unreal: Second Fog Data → Fog Height Falloff)
-@export_range(0.001, 2.0, 0.001, "or_greater") var second_fog_height_falloff := 0.2:
+@export_range(0.001, 2.0, 0.001, "or_greater", "or_less") var second_fog_height_falloff := 0.2:
 	set(value):
-		second_fog_height_falloff = maxf(value, 0.001)
+		second_fog_height_falloff = maxf(value, 0.0)
 		_publish()
 ## Height offset of the secondary fog layer, relative to the node's height. (Unreal: Second Fog Data → Fog Height Offset)
 @export var second_fog_height_offset := 0.0:

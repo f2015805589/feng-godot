@@ -127,11 +127,29 @@ func run() -> void:
 		"the fog component must expose one Unreal path without color-mode, albedo, or sun override properties")
 	require(fog.fog_inscattering_color == Color.BLACK,
 		"the authored Unreal Fog Inscattering Color default must be black")
+	require(fog.fog_height_falloff == 0.2 and fog.second_fog_height_falloff == 0.2,
+		"both Unreal fog-layer falloff defaults must remain 0.2")
 	require_vec(fog.snapshot_fields().get("fog_color", Vector3.INF), Vector3.ZERO,
 		"default black source must stay raw black")
 	require(fog.fog_density > 0.0 and is_zero_approx(float(fog.snapshot_fields()["min_opacity"]))
 		and is_equal_approx(fog.directional_inscattering_start_distance, 100.0),
 		"black source must retain default extinction, opacity, and directional start settings")
+	fog.fog_height_falloff = 0.0
+	fog.second_fog_height_falloff = 0.0
+	var zero_falloff := snapshot_for(fog)
+	require(fog.fog_height_falloff == 0.0 and fog.second_fog_height_falloff == 0.0
+		and float(zero_falloff["fog_height_falloff"]) == 0.0
+		and float(zero_falloff["second_fog_height_falloff"]) == 0.0,
+		"zero falloff must be preserved for both authored layers and the runtime snapshot")
+	fog.fog_height_falloff = -0.25
+	fog.second_fog_height_falloff = -0.5
+	var negative_falloff := snapshot_for(fog)
+	require(fog.fog_height_falloff == 0.0 and fog.second_fog_height_falloff == 0.0
+		and float(negative_falloff["fog_height_falloff"]) == 0.0
+		and float(negative_falloff["second_fog_height_falloff"]) == 0.0,
+		"negative falloff inputs must clamp to zero rather than a positive lower bound")
+	fog.fog_height_falloff = 0.2
+	fog.second_fog_height_falloff = 0.2
 
 	# Authored source is linear RGB exactly as entered, without conversion,
 	# clamping, albedo tint, or dependence on sunlight.

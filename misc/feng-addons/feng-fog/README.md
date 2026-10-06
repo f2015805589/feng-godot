@@ -41,6 +41,8 @@ world (Unreal divides by `1000` in centimeters). Perspective observers are
 capped at 655.36 m above the lowest active fog-layer height, matching Unreal's
 default ray-origin guard. Orthographic cameras retain their actual height;
 Unreal's separate ViewTarget-distance adjustment has no direct Godot equivalent.
+A layer falloff of `0` is valid and makes that layer's density independent of
+height.
 Sky ambient is a sampled mean from Feng Sky rather than Unreal's
 distant-sky-light LUT, so the results are not promised to be pixel-identical.
 
