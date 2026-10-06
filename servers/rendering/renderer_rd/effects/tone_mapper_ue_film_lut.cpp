@@ -258,6 +258,15 @@ static void ue_film_store_half(uint8_t *p_pixels, int p_index, float p_value) {
 	std::memcpy(p_pixels + p_index * int(sizeof(value)), &value, sizeof(value));
 }
 
+// UE's default SDR film LUT is stored as 10-bit UNORM after scaling its
+// encoded sRGB values to preserve the 1.05 display headroom.
+static float ue_film_encode_unorm10(float p_value) {
+	constexpr float inverse_headroom = 1.0f / 1.05f;
+	constexpr double unorm_max = 1023.0;
+	const float scaled = CLAMP(p_value * inverse_headroom, 0.0f, 1.0f);
+	return float(std::round(double(scaled) * unorm_max) / unorm_max);
+}
+
 static Vector<uint8_t> ue_film_build_lut_data() {
 	Vector<uint8_t> data;
 	data.resize(UE_FILM_LUT_SIZE * UE_FILM_LUT_SIZE * UE_FILM_LUT_SIZE * 4 * sizeof(uint16_t));
@@ -268,9 +277,11 @@ static Vector<uint8_t> ue_film_build_lut_data() {
 				const UEFilmVec3 log_color = { double(r) / (UE_FILM_LUT_SIZE - 1), double(g) / (UE_FILM_LUT_SIZE - 1), double(b) / (UE_FILM_LUT_SIZE - 1) };
 				const UEFilmVec3 out = ue_film_generate_entry(log_color);
 				const int offset = ((b * UE_FILM_LUT_SIZE + g) * UE_FILM_LUT_SIZE + r) * 4;
-				ue_film_store_half(pixels, offset + 0, float(out.x));
-				ue_film_store_half(pixels, offset + 1, float(out.y));
-				ue_film_store_half(pixels, offset + 2, float(out.z));
+				// RGBA16F carries UE's scaled 10-bit UNORM payload so existing LUT
+				// allocation and sampling stay unchanged.
+				ue_film_store_half(pixels, offset + 0, ue_film_encode_unorm10(float(out.x)));
+				ue_film_store_half(pixels, offset + 1, ue_film_encode_unorm10(float(out.y)));
+				ue_film_store_half(pixels, offset + 2, ue_film_encode_unorm10(float(out.z)));
 				ue_film_store_half(pixels, offset + 3, 1.0f);
 			}
 		}
