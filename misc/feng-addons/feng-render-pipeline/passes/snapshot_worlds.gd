@@ -4,8 +4,9 @@ extends RefCounted
 ## snapshot contract that runtime_snapshot_pass.gd defines.
 ##
 ## Producer runtimes register the viewports they render to. World changes update
-## only the affected buckets; queries still validate the requested bucket's
-## weak references and live World3D identity before returning any route.
+## only the affected buckets; each query validates unique owner leases in the
+## requested bucket. Legacy viewports without the signal refresh their live
+## World3D identity on each query.
 
 const REGISTRY_SWEEP_BUDGET := 32
 
@@ -16,6 +17,9 @@ static var _viewports_by_world: Dictionary = {} ## world id -> {viewport id: tru
 static var _world_generations: Dictionary = {} ## world id -> route generation
 static var _next_world_generation := 0
 static var _targets_cache: Dictionary = {} ## world id -> {generation, targets}
+static var _owner_lease_version := 0
+static var _world_owner_ids_cache: Dictionary = {} ## world id -> {generation, lease_version, owner_ids}
+static var _world_viewports_cache: Dictionary = {} ## world id -> {generation, viewport weak refs}
 static var _viewport_world_callbacks: Dictionary = {} ## viewport id -> callback; captures only the id
 static var _legacy_viewports: Dictionary = {} ## viewports without world_3d_changed need old full validation
 static var _owner_refs: Dictionary = {} ## owner id -> WeakRef
@@ -90,12 +94,14 @@ static func _add_owner_lease(viewport_id: int, owner_id: int, owner: Object) -> 
 		var owned_viewports: Dictionary = _owner_viewports.get(owner_id, {})
 		owned_viewports[viewport_id] = true
 		_owner_viewports[owner_id] = owned_viewports
+	_owner_lease_version += 1
 
 static func _remove_owner_lease(viewport_id: int, owner_id: int) -> void:
 	var owners: Dictionary = _viewport_owners.get(viewport_id, {})
 	if not owners.has(owner_id):
 		return
 	owners.erase(owner_id)
+	_owner_lease_version += 1
 	if owner_id != 0:
 		_unindex_owner_viewport(owner_id, viewport_id)
 
@@ -111,6 +117,8 @@ static func _unindex_owner_viewport(owner_id: int, viewport_id: int) -> void:
 static func _unregister_owner_id(owner_id: int) -> void:
 	var owned_viewports: Dictionary = _owner_viewports.get(owner_id, {})
 	var viewport_ids: Array = owned_viewports.keys()
+	if not viewport_ids.is_empty():
+		_owner_lease_version += 1
 	_owner_viewports.erase(owner_id)
 	_owner_refs.erase(owner_id)
 	for viewport_id in viewport_ids:
@@ -124,8 +132,9 @@ static func _unregister_owner_id(owner_id: int) -> void:
 static func _prune_owners_for_viewport(viewport_id: int) -> void:
 	_prune_owners_for_viewport_with_cache(viewport_id, {})
 
-## The caller owns this cache for one synchronous operation only. Holding each
-## live owner strongly until that operation returns keeps its weak lease stable.
+## The caller owns this cache for one synchronous operation only, so repeated
+## leases resolve each owner ID once. RefCounted owners stay referenced locally
+## until return; this does not own Nodes or extend their tree lifetime.
 static func _prune_owners_for_viewport_with_cache(viewport_id: int, validated_owners: Dictionary) -> void:
 	var owners: Dictionary = _viewport_owners.get(viewport_id, {})
 	for owner_id in owners.keys():
@@ -267,6 +276,8 @@ static func _remove_viewport(viewport_id: int) -> void:
 	var viewport := _registered_viewport_without_removal(viewport_id)
 	_disconnect_viewport_world_changed(viewport_id, viewport)
 	var owners: Dictionary = _viewport_owners.get(viewport_id, {})
+	if not owners.is_empty():
+		_owner_lease_version += 1
 	for owner_id in owners.keys():
 		if owner_id != 0:
 			_unindex_owner_viewport(owner_id, viewport_id)
@@ -311,11 +322,72 @@ static func _invalidate_world(world_id: int) -> void:
 	if bucket.is_empty():
 		_world_generations.erase(world_id)
 		_targets_cache.erase(world_id)
+		_world_owner_ids_cache.erase(world_id)
+		_world_viewports_cache.erase(world_id)
 	else:
 		_next_world_generation += 1
 		_world_generations[world_id] = _next_world_generation
 		_targets_cache.erase(world_id)
+		_world_owner_ids_cache.erase(world_id)
+		_world_viewports_cache.erase(world_id)
 	_targets_version += 1
+
+## Build or reuse the distinct live producer IDs for one world route. Viewport
+## membership changes invalidate by generation; lease edits invalidate through
+## the global version, including an owner added to an existing viewport.
+static func _owner_ids_for_world(world_id: int, generation: int) -> Array[int]:
+	var world_bucket: Dictionary = _viewports_by_world.get(world_id, {})
+	if world_bucket.is_empty():
+		_world_owner_ids_cache.erase(world_id)
+		return []
+	var cached: Dictionary = _world_owner_ids_cache.get(world_id, {})
+	if int(cached.get("generation", -1)) == generation \
+			and int(cached.get("lease_version", -1)) == _owner_lease_version:
+		var cached_value: Variant = cached.get("owner_ids", null)
+		if cached_value is Array:
+			var cached_ids: Array[int] = cached_value
+			return cached_ids
+	var seen: Dictionary = {}
+	var owner_ids: Array[int] = []
+	for viewport_id_variant in world_bucket.keys():
+		var owners: Dictionary = _viewport_owners.get(int(viewport_id_variant), {})
+		for owner_id_variant in owners.keys():
+			var owner_id := int(owner_id_variant)
+			if owner_id != 0 and not seen.has(owner_id):
+				seen[owner_id] = true
+				owner_ids.append(owner_id)
+	if _world_owner_ids_cache.size() >= 32:
+		_world_owner_ids_cache.clear()
+	_world_owner_ids_cache[world_id] = {
+		"generation": generation,
+		"lease_version": _owner_lease_version,
+		"owner_ids": owner_ids,
+	}
+	return owner_ids
+
+## Prepare a world query without walking every event-backed viewport. Native
+## world events keep membership current; legacy viewports are refreshed below.
+## Its local cache memoizes owner resolution; RefCounted values are referenced
+## until return, but Node lifetime remains controlled by its owner/tree.
+static func _prepare_world_query(world: World3D, validated_owners: Dictionary) -> int:
+	if world == null or not is_instance_valid(world):
+		return 0
+	_sweep_dead_owners_budgeted(validated_owners)
+	_sweep_dead_viewports_budgeted(validated_owners)
+	_refresh_legacy_world_ids(validated_owners)
+	var world_id := world.get_instance_id()
+	var owners_stable := false
+	while not owners_stable:
+		var generation := int(_world_generations.get(world_id, 0))
+		var lease_version := _owner_lease_version
+		var owner_ids := _owner_ids_for_world(world_id, generation)
+		for owner_id in owner_ids:
+			if _query_owner(owner_id, validated_owners) == null:
+				# A dead owner may lease several viewports. Remove every lease now;
+				# the changed lease version makes this route's owner list rebuild.
+				_unregister_owner_id(owner_id)
+		owners_stable = lease_version == _owner_lease_version
+	return world_id
 
 ## Live viewport registrations as id -> WeakRef. Returned as a copy so producers
 ## may keep per-viewport bookkeeping keyed by id without racing the registry.
@@ -331,50 +403,57 @@ static func viewports() -> Dictionary:
 	return _viewports.duplicate()
 
 ## World-scoped weak references for consumers that only need one World3D.
-## Each requested bucket validates weak leases and tree membership. Signal-backed
-## world identities come from synchronous events; legacy viewports are refreshed
-## from the live tree before looking up the bucket.
+## Each query validates every distinct owner in the requested route. Native
+## signal-backed membership is cached; legacy viewports refresh their live world
+## before the bucket lookup. Returned dictionaries remain caller-owned copies.
 static func viewports_for_world(world: World3D) -> Dictionary:
-	if world == null or not is_instance_valid(world):
-		return {}
-	# Reap a bounded number of forgotten weak leases/viewport nodes once per
-	# engine frame, then validate the requested world bucket in full below.
 	var validated_owners: Dictionary = {}
-	_sweep_dead_owners_budgeted(validated_owners)
-	_sweep_dead_viewports_budgeted(validated_owners)
-	_refresh_legacy_world_ids(validated_owners)
-	var world_id := world.get_instance_id()
-	var result: Dictionary = {}
-	var world_bucket: Dictionary = _viewports_by_world.get(world_id, {})
-	for viewport_id in world_bucket.keys():
-		var viewport := _viewport_for_world(viewport_id, world_id, validated_owners)
-		if viewport != null:
-			result[viewport_id] = _viewports[viewport_id]
-	return result
+	var world_id := _prepare_world_query(world, validated_owners)
+	if world_id == 0:
+		return {}
+	return _viewports_for_prepared_world(world_id)
+
+static func _viewports_for_prepared_world(world_id: int) -> Dictionary:
+	while true:
+		var generation := int(_world_generations.get(world_id, 0))
+		var cached: Dictionary = _world_viewports_cache.get(world_id, {})
+		if int(cached.get("generation", -1)) == generation:
+			var cached_value: Variant = cached.get("viewports", null)
+			if cached_value is Dictionary:
+				var cached_viewports: Dictionary = cached_value
+				return cached_viewports.duplicate()
+		var result: Dictionary = {}
+		var world_bucket: Dictionary = _viewports_by_world.get(world_id, {})
+		for viewport_id_variant in world_bucket.keys():
+			var viewport_id := int(viewport_id_variant)
+			var viewport := _registered_viewport(viewport_id)
+			if viewport == null:
+				continue
+			if not viewport.is_inside_tree():
+				_set_viewport_world(viewport_id, 0)
+				continue
+			if int(_viewport_world_ids.get(viewport_id, 0)) != world_id:
+				continue
+			var reference: WeakRef = _viewports.get(viewport_id)
+			if reference != null:
+				result[viewport_id] = reference
+		if int(_world_generations.get(world_id, 0)) != generation:
+			continue
+		if result.is_empty():
+			_world_viewports_cache.erase(world_id)
+			return {}
+		if _world_viewports_cache.size() >= 32:
+			_world_viewports_cache.clear()
+		_world_viewports_cache[world_id] = {"generation": generation, "viewports": result}
+		return result.duplicate()
+	return {}
 
 ## Per-world route generation changes only when a viewport enters/leaves that
 ## world's bucket. Consumers may use it to avoid rebuilding world-local state.
 static func generation_for_world(world: World3D) -> int:
-	if world == null or not is_instance_valid(world):
-		return 0
-	viewports_for_world(world)
-	return int(_world_generations.get(world.get_instance_id(), 0))
-
-static func _viewport_for_world(viewport_id: int, world_id: int, validated_owners: Dictionary) -> Viewport:
-	var viewport := _registered_viewport(viewport_id)
-	if viewport == null:
-		return null
-	_prune_owners_for_viewport_with_cache(viewport_id, validated_owners)
-	if not _viewports.has(viewport_id):
-		return null
-	if not viewport.is_inside_tree():
-		_set_viewport_world(viewport_id, 0)
-		return null
-	# Native world_3d_changed updates this cache synchronously. Legacy views were
-	# refreshed from the live tree before the bucket was read above.
-	if int(_viewport_world_ids.get(viewport_id, 0)) != world_id:
-		return null
-	return viewport
+	var validated_owners: Dictionary = {}
+	var world_id := _prepare_world_query(world, validated_owners)
+	return int(_world_generations.get(world_id, 0)) if world_id != 0 else 0
 
 static func _refresh_legacy_world_ids(validated_owners: Dictionary) -> void:
 	if _legacy_viewports.is_empty():
@@ -408,33 +487,42 @@ static func scan(node: Node, owner: Object = null) -> void:
 	for child in node.get_children():
 		scan(child, owner)
 
-## Render targets whose viewports draw the given world. The cache is per-world;
-## viewport membership is validated before a generation-matched cache hit.
+## Render targets whose viewports draw the given world. A stable generation hit
+## validates distinct owners but does not materialize or walk the viewport map.
 static func targets_for(world: World3D) -> Array[RID]:
-	if world == null or not is_instance_valid(world):
+	var validated_owners: Dictionary = {}
+	var world_id := _prepare_world_query(world, validated_owners)
+	if world_id == 0:
 		return []
-	var world_id := world.get_instance_id()
-	var viewports_for_requested_world := viewports_for_world(world)
-	var generation := int(_world_generations.get(world_id, 0))
-	var cached: Dictionary = _targets_cache.get(world_id, {})
-	if int(cached.get("generation", -1)) == generation:
-		var cached_value: Variant = cached.get("targets", null)
-		if cached_value is Array:
-			var cached_targets: Array[RID] = cached_value
-			return cached_targets
-	var targets: Array[RID] = []
-	for viewport_id in viewports_for_requested_world.keys():
-		var reference: WeakRef = viewports_for_requested_world[viewport_id]
-		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null or not is_instance_valid(viewport):
+	while true:
+		var generation := int(_world_generations.get(world_id, 0))
+		var cached: Dictionary = _targets_cache.get(world_id, {})
+		if int(cached.get("generation", -1)) == generation:
+			var cached_value: Variant = cached.get("targets", null)
+			if cached_value is Array:
+				var cached_targets: Array[RID] = cached_value
+				return cached_targets
+		var viewports_for_requested_world := _viewports_for_prepared_world(world_id)
+		if int(_world_generations.get(world_id, 0)) != generation:
 			continue
-		# RendererViewport creates one render-target RID per viewport; resize and
-		# screen/XR changes update that RID until the viewport itself is freed.
-		var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
-		if target.is_valid() and not targets.has(target):
-			targets.append(target)
-	_targets_cache[world_id] = {"generation": generation, "targets": targets}
-	if _targets_cache.size() > 32:
-		_targets_cache.clear()
+		var targets: Array[RID] = []
+		for viewport_id_variant in viewports_for_requested_world.keys():
+			var viewport_id := int(viewport_id_variant)
+			var reference: WeakRef = viewports_for_requested_world[viewport_id]
+			var viewport: Viewport = reference.get_ref() if reference != null else null
+			if viewport == null or not is_instance_valid(viewport):
+				_remove_viewport(viewport_id)
+				continue
+			# RendererViewport creates one render-target RID per viewport; resize and
+			# screen/XR changes update that RID until the viewport itself is freed.
+			var target := RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
+			if target.is_valid() and not targets.has(target):
+				targets.append(target)
+		if int(_world_generations.get(world_id, 0)) != generation:
+			continue
 		_targets_cache[world_id] = {"generation": generation, "targets": targets}
-	return targets
+		if _targets_cache.size() > 32:
+			_targets_cache.clear()
+			_targets_cache[world_id] = {"generation": generation, "targets": targets}
+		return targets
+	return []
