@@ -119,20 +119,32 @@ static func _unregister_owner_id(owner_id: int) -> void:
 		if owners.is_empty():
 			_remove_viewport(viewport_id)
 
-## Remove dead leases only in the requested viewport bucket. RefCounted owners
-## have no tree-exit event, so an occasional unique-owner sweep cleans forgotten
-## registrations that were not queried.
+## Prune leases for this viewport. A dead producer is unregistered across all
+## of its routes immediately; the budgeted sweep catches owners not queried.
 static func _prune_owners_for_viewport(viewport_id: int) -> void:
+	_prune_owners_for_viewport_with_cache(viewport_id, {})
+
+## The caller owns this cache for one synchronous operation only. Holding each
+## live owner strongly until that operation returns keeps its weak lease stable.
+static func _prune_owners_for_viewport_with_cache(viewport_id: int, validated_owners: Dictionary) -> void:
 	var owners: Dictionary = _viewport_owners.get(viewport_id, {})
 	for owner_id in owners.keys():
 		if owner_id == 0:
 			continue
-		var owner_ref: WeakRef = owners.get(owner_id)
-		if owner_ref == null or owner_ref.get_ref() == null:
-			owners.erase(owner_id)
-			_unindex_owner_viewport(owner_id, viewport_id)
+		if _query_owner(owner_id, validated_owners) == null:
+			# A dead owner may lease several viewports. Drop all of its leases now
+			# so every affected world's route generation is invalidated together.
+			_unregister_owner_id(owner_id)
 	if owners.is_empty() and _viewports.has(viewport_id):
 		_remove_viewport(viewport_id)
+
+static func _query_owner(owner_id: int, validated_owners: Dictionary) -> Object:
+	if validated_owners.has(owner_id):
+		return validated_owners[owner_id]
+	var owner_ref: WeakRef = _owner_refs.get(owner_id)
+	var owner: Object = owner_ref.get_ref() if owner_ref != null else null
+	validated_owners[owner_id] = owner
+	return owner
 
 static func _queue_owner_sweep(owner_id: int) -> void:
 	if _owner_sweep_queued.has(owner_id):
@@ -166,7 +178,7 @@ static func _compact_viewport_sweep_ids() -> void:
 	_viewport_sweep_ids = live_ids
 	_viewport_sweep_cursor = 0
 
-static func _sweep_dead_owners_budgeted() -> void:
+static func _sweep_dead_owners_budgeted(validated_owners: Dictionary) -> void:
 	var frame := Engine.get_process_frames()
 	if frame == _owner_sweep_frame:
 		return
@@ -179,13 +191,12 @@ static func _sweep_dead_owners_budgeted() -> void:
 	for offset in checked:
 		var owner_id := _owner_sweep_ids[_owner_sweep_cursor]
 		_owner_sweep_cursor += 1
-		var owner_ref: WeakRef = _owner_refs.get(owner_id)
-		if owner_ref == null or owner_ref.get_ref() == null:
+		if _query_owner(owner_id, validated_owners) == null:
 			_unregister_owner_id(owner_id)
 	if _owner_sweep_cursor >= _owner_sweep_ids.size():
 		_compact_owner_sweep_ids()
 
-static func _sweep_dead_viewports_budgeted() -> void:
+static func _sweep_dead_viewports_budgeted(validated_owners: Dictionary) -> void:
 	var frame := Engine.get_process_frames()
 	if frame == _viewport_sweep_frame:
 		return
@@ -200,7 +211,7 @@ static func _sweep_dead_viewports_budgeted() -> void:
 		_viewport_sweep_cursor += 1
 		var viewport := _registered_viewport(viewport_id)
 		if viewport != null:
-			_prune_owners_for_viewport(viewport_id)
+			_prune_owners_for_viewport_with_cache(viewport_id, validated_owners)
 	if _viewport_sweep_cursor >= _viewport_sweep_ids.size():
 		_compact_viewport_sweep_ids()
 
@@ -308,7 +319,8 @@ static func _invalidate_world(world_id: int) -> void:
 
 ## Live viewport registrations as id -> WeakRef. Returned as a copy so producers
 ## may keep per-viewport bookkeeping keyed by id without racing the registry.
-## Full enumeration is reserved for callers that actually need every viewport.
+## Full enumeration refreshes every live world identity; use the world query
+## when only one route bucket is needed.
 static func viewports() -> Dictionary:
 	for viewport_id in _viewports.keys():
 		var viewport := _registered_viewport(viewport_id)
@@ -319,20 +331,23 @@ static func viewports() -> Dictionary:
 	return _viewports.duplicate()
 
 ## World-scoped weak references for consumers that only need one World3D.
-## Each requested bucket validates its leases and live world before returning.
+## Each requested bucket validates weak leases and tree membership. Signal-backed
+## world identities come from synchronous events; legacy viewports are refreshed
+## from the live tree before looking up the bucket.
 static func viewports_for_world(world: World3D) -> Dictionary:
 	if world == null or not is_instance_valid(world):
 		return {}
 	# Reap a bounded number of forgotten weak leases/viewport nodes once per
 	# engine frame, then validate the requested world bucket in full below.
-	_sweep_dead_owners_budgeted()
-	_sweep_dead_viewports_budgeted()
-	_refresh_legacy_world_ids()
+	var validated_owners: Dictionary = {}
+	_sweep_dead_owners_budgeted(validated_owners)
+	_sweep_dead_viewports_budgeted(validated_owners)
+	_refresh_legacy_world_ids(validated_owners)
 	var world_id := world.get_instance_id()
 	var result: Dictionary = {}
 	var world_bucket: Dictionary = _viewports_by_world.get(world_id, {})
 	for viewport_id in world_bucket.keys():
-		var viewport := _viewport_for_world(viewport_id, world_id)
+		var viewport := _viewport_for_world(viewport_id, world_id, validated_owners)
 		if viewport != null:
 			result[viewport_id] = _viewports[viewport_id]
 	return result
@@ -345,39 +360,40 @@ static func generation_for_world(world: World3D) -> int:
 	viewports_for_world(world)
 	return int(_world_generations.get(world.get_instance_id(), 0))
 
-static func _viewport_for_world(viewport_id: int, world_id: int) -> Viewport:
+static func _viewport_for_world(viewport_id: int, world_id: int, validated_owners: Dictionary) -> Viewport:
 	var viewport := _registered_viewport(viewport_id)
 	if viewport == null:
 		return null
-	_prune_owners_for_viewport(viewport_id)
+	_prune_owners_for_viewport_with_cache(viewport_id, validated_owners)
 	if not _viewports.has(viewport_id):
 		return null
 	if not viewport.is_inside_tree():
 		_set_viewport_world(viewport_id, 0)
 		return null
-	var live_world_id := _world_id(viewport)
-	if live_world_id != world_id:
-		_set_viewport_world(viewport_id, live_world_id)
+	# Native world_3d_changed updates this cache synchronously. Legacy views were
+	# refreshed from the live tree before the bucket was read above.
+	if int(_viewport_world_ids.get(viewport_id, 0)) != world_id:
 		return null
 	return viewport
 
-static func _refresh_legacy_world_ids() -> void:
+static func _refresh_legacy_world_ids(validated_owners: Dictionary) -> void:
 	if _legacy_viewports.is_empty():
 		return
 	for viewport_id in _legacy_viewports.keys():
 		var viewport := _registered_viewport(viewport_id)
 		if viewport == null:
 			continue
-		_prune_owners_for_viewport(viewport_id)
+		_prune_owners_for_viewport_with_cache(viewport_id, validated_owners)
 		if _viewports.has(viewport_id):
 			_set_viewport_world(viewport_id, _world_id(viewport))
 
 ## Reap a bounded set of missed weak releases. World lookups also validate every
 ## lease in their requested bucket immediately.
 static func prune() -> void:
-	_sweep_dead_owners_budgeted()
-	_sweep_dead_viewports_budgeted()
-	_refresh_legacy_world_ids()
+	var validated_owners: Dictionary = {}
+	_sweep_dead_owners_budgeted(validated_owners)
+	_sweep_dead_viewports_budgeted(validated_owners)
+	_refresh_legacy_world_ids(validated_owners)
 
 static func _world_id(viewport: Viewport) -> int:
 	var world := viewport.find_world_3d() if viewport.is_inside_tree() else null
