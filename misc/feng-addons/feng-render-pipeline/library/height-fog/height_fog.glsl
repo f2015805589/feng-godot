@@ -10,7 +10,7 @@ layout(set = 0, binding = 2, std140) uniform FogParams {
 	mat4 inverse_projection;
 	mat4 view_to_world;
 	vec4 camera_position;
-	vec4 exponential_fog_parameters; // x = GlobalDensity, y = FogHeightFalloff, z = unused, w = StartDistance.
+	vec4 exponential_fog_parameters; // x = GlobalDensity at ObserverY, y = FogHeightFalloff, z = ObserverY, w = StartDistance.
 	vec4 exponential_fog_parameters2; // x = GlobalDensitySecond, y = FogHeightFalloffSecond, z = FogDensitySecond, w = FogHeightSecond.
 	vec4 exponential_fog_parameters3; // x = FogDensity, y = FogHeight, z = unused, w = FogCutoffDistance.
 	vec4 exponential_fog_color; // rgb = FogInscatteringColor, a = MinFogOpacity (1 - FogMaxOpacity).
@@ -66,6 +66,11 @@ float line_integral_shared(float height_falloff, float ray_delta_y, float origin
 // camera_to_receiver is (WorldPosition - camera).
 vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	const float min_fog_opacity = params.exponential_fog_color.w;
+	float observer_y = params.exponential_fog_parameters.z;
+	// Unreal caps perspective observers above the active fog layers. Rebase the
+	// ray before distance, phase, start-distance, and extinction calculations;
+	// the endpoint remains fixed, including for the depth-zero sky ray.
+	camera_to_receiver.y += params.camera_position.y - observer_y;
 
 	float camera_to_receiver_length_sqr = dot(camera_to_receiver, camera_to_receiver);
 	float camera_to_receiver_length_inv = inversesqrt(max(camera_to_receiver_length_sqr, 1e-8));
@@ -86,7 +91,7 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	if (exclude_distance > 0.0) {
 		float exclude_intersection_time = exclude_distance * camera_to_receiver_length_inv;
 		float camera_exclusion_intersection_y = exclude_intersection_time * camera_to_receiver.y;
-		float exclusion_intersection_world_y = params.camera_position.y + camera_exclusion_intersection_y;
+		float exclusion_intersection_world_y = observer_y + camera_exclusion_intersection_y;
 		float exclusion_intersection_to_receiver_y = camera_to_receiver.y - camera_exclusion_intersection_y;
 		ray_length = (1.0 - exclude_intersection_time) * camera_to_receiver_length;
 		ray_direction_y = exclusion_intersection_to_receiver_y;
@@ -108,8 +113,8 @@ vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
 	if (params.inscattering_light_direction.w >= 0.0) {
 		float directional_inscattering_start_distance = params.inscattering_light_direction.w;
 		// UE's default branch uses the cosine lobe normalized by 1 / (4 * PI).
-		// Its additional SkyAtmosphere illuminance is unavailable in Godot;
-		// the authored directional luminance is the available light term.
+		// The published RGB combines the artist light term with matching
+		// SkyAtmosphere ground illuminance; both use this directional phase.
 		vec3 directional_light_inscattering = params.directional_inscattering_color.rgb
 				* default_directional_phase(camera_to_receiver_normalized,
 						params.inscattering_light_direction.xyz, params.directional_inscattering_color.w);

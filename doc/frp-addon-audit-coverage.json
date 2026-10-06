@@ -102,7 +102,7 @@
       "sha256": "4732fb299288906a0112f44782e2cc1cc5821b4276d990ceec78e75936dbe050"
     },
     {
-      "path": "misc/feng-addons/feng-fog/tests/run_lit_fog_tests.py",
+      "path": "misc/feng-addons/feng-fog/tests/run_height_fog_tests.py",
       "category": "source",
       "scope": "implementation_body_read",
       "lines": 100,
@@ -123,28 +123,28 @@
       "sha256": "d797d4245bd90884b42c56775e81f9c23d04ed7fee9dc729520dec7e876b33a4"
     },
     {
-      "path": "misc/feng-addons/feng-fog/tests/test_lit_fog.gd",
+      "path": "misc/feng-addons/feng-fog/tests/test_height_fog.gd",
       "category": "source",
       "scope": "implementation_body_read",
       "lines": 225,
       "sha256": "71b6e9370d55228446acf4dcced47f843a4e6932ce4fa93ac4457ffaeec6b6e2"
     },
     {
-      "path": "misc/feng-addons/feng-fog/tests/test_lit_fog.gd.uid",
+      "path": "misc/feng-addons/feng-fog/tests/test_height_fog.gd.uid",
       "category": "asset/generated/metadata",
       "scope": "excluded_vendor_generated_or_assets",
       "lines": 1,
       "sha256": "b01b90e183718b3e048ee502407c95a36db9ff3ac44e7ef89f451e722f83edc6"
     },
     {
-      "path": "misc/feng-addons/feng-fog/tests/test_lit_fog_gpu.gd",
+      "path": "misc/feng-addons/feng-fog/tests/test_height_fog_gpu.gd",
       "category": "source",
       "scope": "implementation_body_read",
       "lines": 213,
       "sha256": "f3ffe22885608cf023d7599ce5b768e189f9246e90b114512e599f74683a3147"
     },
     {
-      "path": "misc/feng-addons/feng-fog/tests/test_lit_fog_gpu.gd.uid",
+      "path": "misc/feng-addons/feng-fog/tests/test_height_fog_gpu.gd.uid",
       "category": "asset/generated/metadata",
       "scope": "excluded_vendor_generated_or_assets",
       "lines": 1,

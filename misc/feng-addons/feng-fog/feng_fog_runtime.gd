@@ -58,9 +58,8 @@ static func _sky_snapshot_for_world(world_id: int) -> Dictionary:
 		return {}
 	return result
 
-## Adds the sky model's mean incident radiance, tinted by the material albedo
-## in Lit mode. Direct illumination is resolved independently from the same
-## DirectionalLight3D used by scene surfaces.
+## Adds the sky model's mean incident radiance independently of the authored
+## Fog Inscattering Color and directional sunlight terms.
 ## Pre-exposure remains solely the height-fog pass's responsibility.
 static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: Variant = null) -> void:
 	var sky: Dictionary
@@ -75,10 +74,8 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: 
 		return
 	var contribution_scale := _sky_height_fog_contribution_scale(sky)
 	# snapshot_fields() owns the local schema and normalizes ambient_scale.
-	# Albedo is absent in Unreal Radiance mode, which receives untinted ambient.
-	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
 	var ambient_scale: Vector3 = snapshot["sky_atmosphere_ambient_contribution_color_scale"]
-	var combined_fog_color: Vector3 = snapshot["fog_color"] + albedo * ambient * ambient_scale * contribution_scale
+	var combined_fog_color: Vector3 = snapshot["fog_color"] + ambient * ambient_scale * contribution_scale
 	if combined_fog_color.is_finite():
 		snapshot["fog_color"] = combined_fog_color
 
@@ -90,26 +87,23 @@ static func _sky_height_fog_contribution_scale(sky: Dictionary) -> float:
 			return maxf(authored_scale, 0.0)
 	return 1.0
 
-## Returns post-transmittance illuminance only for the exact atmosphere light
-## selected by the fog node. Null means the normal scene-light fallback applies.
+## Returns post-transmittance illuminance only for the active atmosphere's
+## primary sun. Other scene lights still drive the artist directional lobe,
+## but do not receive an atmosphere-derived physical-light term.
 static func _matched_atmosphere_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary) -> Variant:
 	if sun.light_negative or sky.is_empty() or not bool(sky.get("affect_height_fog", true)):
 		return null
 	var sun_id := sun.get_instance_id()
-	var value: Variant
-	if int(sky.get("sun_light_id", 0)) == sun_id:
-		value = sky.get("sun_ground_illuminance")
-	elif int(sky.get("secondary_sun_light_id", 0)) == sun_id:
-		value = sky.get("secondary_sun_ground_illuminance")
-	else:
+	if int(sky.get("sun_light_id", 0)) != sun_id:
 		return null
+	var value: Variant = sky.get("sun_ground_illuminance")
 	if not value is Vector3 or not value.is_finite():
 		return null
 	return value.max(Vector3.ZERO)
 
-## Built-in atmosphere skies publish post-transmittance illuminance for their
-## selected directional lights. Use it only when the fog's chosen light is the
-## exact same node; custom skies and unrelated lights retain scene lighting.
+## Built-in atmosphere skies publish post-transmittance illuminance for the
+## primary sun. Custom skies and unrelated lights retain their authored scene
+## light color for the artist directional lobe.
 static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallback: Vector3) -> Vector3:
 	var matched: Variant = _matched_atmosphere_sun_illuminance(sun, sky)
 	return matched if matched is Vector3 else fallback
@@ -204,31 +198,45 @@ static func _render_targets(world: World3D) -> Array[RID]:
 	var targets: Array[RID] = []
 	return targets
 
-## The sun for a world: the component's explicit light when set, otherwise the
-## first enabled DirectionalLight3D on the same World3D — Unreal's equivalent is
-## the directional light flagged "Atmosphere Sun Light", which Godot does not
-## have, so a dedicated override on the component covers the multi-sun case.
-static func _sun_for(fog: FengHeightFog, world: World3D) -> DirectionalLight3D:
-	var explicit_light := fog.sun_light
-	if explicit_light != null and explicit_light.visible:
-		return explicit_light
+## Prefer the active Feng Sky Atmosphere's primary sun when it is still a
+## visible light in this world. Otherwise use the cached scene-light fallback.
+static func _sun_for(fog: FengHeightFog, world: World3D, sky: Dictionary = {}) -> DirectionalLight3D:
+	if world != null and not sky.is_empty():
+		var primary_id := int(sky.get("sun_light_id", 0))
+		if primary_id > 0:
+			var primary := instance_from_id(primary_id)
+			if is_instance_valid(primary) and primary is DirectionalLight3D and primary.is_inside_tree() \
+					and primary.is_visible_in_tree() and primary.get_world_3d() == world:
+				return primary
 	var world_id := world.get_instance_id() if world != null else 0
 	var now := Time.get_ticks_msec()
 	var scan: Variant = _sun_scans.get(world_id)
 	if scan != null and now - int(scan["time"]) < SUN_SCAN_MSEC:
 		var cached: DirectionalLight3D = scan["light"].get_ref()
-		return cached if cached != null and cached.visible else null
+		if is_instance_valid(cached) and cached.is_inside_tree() \
+				and cached.is_visible_in_tree() and cached.get_world_3d() == world:
+			return cached
+		if not bool(scan.get("had_light", false)):
+			return null
+		# A previously selected light that was removed, hidden, or moved between
+		# worlds invalidates the cache immediately. Truly empty worlds keep their
+		# TTL so they do not trigger a scene-tree scan every frame.
 	var found: DirectionalLight3D = null
 	var tree := fog.get_tree()
 	if tree != null:
 		var stack: Array = [tree.root]
 		while not stack.is_empty():
 			var node: Node = stack.pop_back()
-			if node is DirectionalLight3D and node.visible and node.get_world_3d() == world:
+			if node is DirectionalLight3D and node.is_visible_in_tree() and node.get_world_3d() == world:
 				found = node
 				break
 			stack.append_array(node.get_children())
-	_sun_scans[world_id] = {"time": now, "light": weakref(found), "world": weakref(world)}
+	_sun_scans[world_id] = {
+		"time": now,
+		"light": weakref(found),
+		"world": weakref(world),
+		"had_light": found != null,
+	}
 	if _sun_scans.size() > 16:
 		# Worlds churn with editor sub-viewports; drop entries whose world is gone.
 		for old_id in _sun_scans.keys():
@@ -261,7 +269,7 @@ static func _publish() -> void:
 		var snapshot := fog.snapshot_fields()
 		var sky_snapshot := _sky_snapshot_for_world(world_id)
 		_add_sky_ambient(snapshot, world_id, sky_snapshot)
-		var sun := _sun_for(fog, entry["world"])
+		var sun := _sun_for(fog, entry["world"], sky_snapshot)
 		if sun == null:
 			snapshot["sun_direction"] = Vector3.ZERO
 			snapshot["inscattering_color"] = Vector3.ZERO
@@ -289,21 +297,13 @@ static func _publish() -> void:
 				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
 			var matched_atmosphere_sun: Variant = _matched_atmosphere_sun_illuminance(sun, sky_snapshot)
-			if matched_atmosphere_sun is Vector3:
-				sun_rgb = matched_atmosphere_sun
-			if snapshot.has("fog_albedo"):
-				# The optional Lit Albedo mode keeps its scene-light fallback.
-				# Unreal Radiance has no isotropic direct-sun contribution.
-				var albedo: Vector3 = snapshot["fog_albedo"]
-				if not matched_atmosphere_sun is Vector3:
-					snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
-			# Both modes use an independent artist lobe scaled by sun luminance.
+			# Unreal's artist lobe uses the selected light's raw scene color,
+			# independent from the atmosphere's post-transmittance solar input.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
 			var inscattering_color: Vector3 = snapshot["inscattering_color"] * sun_luminance
 			if matched_atmosphere_sun is Vector3:
 				var contribution_scale := _sky_height_fog_contribution_scale(sky_snapshot)
-				var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
-				var atmosphere_sun_lobe: Vector3 = albedo * matched_atmosphere_sun * contribution_scale
+				var atmosphere_sun_lobe: Vector3 = matched_atmosphere_sun * contribution_scale
 				if atmosphere_sun_lobe.is_finite():
 					var combined_inscattering := inscattering_color + atmosphere_sun_lobe
 					if combined_inscattering.is_finite():

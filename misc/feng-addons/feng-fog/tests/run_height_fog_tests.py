@@ -1,4 +1,4 @@
-"""Run lit-fog unit and optional rendered regressions in an isolated project."""
+"""Run Unreal-style height-fog unit and optional rendered regressions."""
 
 import argparse
 import os
@@ -24,7 +24,7 @@ def main():
             raise SystemExit("Scratch project must be outside the repository")
         project.mkdir(parents=True, exist_ok=False)
     else:
-        project = Path(tempfile.mkdtemp(prefix="feng-lit-fog-"))
+        project = Path(tempfile.mkdtemp(prefix="feng-height-fog-"))
     print("Scratch project:", project, flush=True)
     selected = {"feng-render-pipeline", "feng-sky", "feng-fog"}
     for addon in (ROOT / "misc/feng-addons").iterdir():
@@ -39,7 +39,7 @@ def main():
             target.mkdir(parents=True)
             (target / ".gdignore").touch()
     (project / "project.godot").write_text(
-        'config_version=5\n[application]\nconfig/name="Lit fog regression"\n'
+        'config_version=5\n[application]\nconfig/name="Unreal height fog regression"\n'
         '[rendering]\nrenderer/rendering_method="frp"\n'
         f"lights_and_shadows/use_physical_light_units={args.physical_units}\n",
         encoding="utf-8",
@@ -71,7 +71,7 @@ def main():
         print("PASS", label, flush=True)
 
     run("import", ["--headless", "--editor", "--recovery-mode", "--import"])
-    run("lit_fog_unit", ["--headless", "--script", "res://addons/feng-fog/tests/test_lit_fog.gd"], "PASS lit fog")
+    run("height_fog_unit", ["--headless", "--script", "res://addons/feng-fog/tests/test_height_fog.gd"], "PASS Unreal height fog")
     run(
         "sky_unit",
         ["--headless", "--script", "res://addons/feng-sky/tests/test_sky_atmosphere.gd"],
@@ -79,7 +79,7 @@ def main():
     )
     if args.gpu_driver:
         run(
-            "lit_fog_gpu",
+            "height_fog_gpu",
             [
                 "--rendering-method",
                 "frp",
@@ -90,9 +90,9 @@ def main():
                 "--position",
                 "-10000,-10000",
                 "--script",
-                "res://addons/feng-fog/tests/test_lit_fog_gpu.gd",
+                "res://addons/feng-fog/tests/test_height_fog_gpu.gd",
             ],
-            "PASS lit fog GPU",
+            "PASS Unreal height fog GPU",
         )
 
 

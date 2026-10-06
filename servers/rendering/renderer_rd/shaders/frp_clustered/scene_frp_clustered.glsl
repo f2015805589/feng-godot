@@ -1234,12 +1234,18 @@ float frp_height_fog_default_phase(vec3 ray_direction, vec3 sun_direction, float
 }
 
 vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y) {
+	// Packet vec4 0: density at ObserverY, falloff, ObserverY, StartDistance.
 	vec4 parameters1 = implementation_data.height_fog_parameters[0];
 	vec4 parameters2 = implementation_data.height_fog_parameters[1];
 	vec4 parameters3 = implementation_data.height_fog_parameters[2];
 	vec4 fog_color = implementation_data.height_fog_parameters[3];
 	vec4 inscattering_direction = implementation_data.height_fog_parameters[4];
 	vec4 inscattering_color = implementation_data.height_fog_parameters[5];
+	float observer_y = parameters1.z;
+	// Rebase to the capped perspective observer before all ray calculations.
+	// parameters1.x and parameters2.x were published at this observer height.
+	camera_to_receiver.y += camera_position_y - observer_y;
+	camera_position_y = observer_y;
 	float distance_squared = dot(camera_to_receiver, camera_to_receiver);
 	float distance_inverse = inversesqrt(max(distance_squared, 1e-8));
 	float distance = distance_squared * distance_inverse;

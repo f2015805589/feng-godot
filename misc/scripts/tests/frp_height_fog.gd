@@ -130,14 +130,11 @@ func run() -> void:
 	# A strong red exponential fog: the sky saturates to the inscattering colour
 	# and the floor blends toward it.
 	_fog = FogNode.new()
-	if not check(_fog.fog_color_mode == FogNode.ColorMode.LIT
-			and _fog.fog_inscattering_color == Color.WHITE
+	if not check(_fog.fog_inscattering_color == Color.BLACK
 			and is_equal_approx(_fog.second_fog_height_falloff, 0.2)
 			and is_equal_approx(_fog.directional_inscattering_start_distance, 100.0),
-			"fresh fog defaults differ from the lit material contract"):
+			"fresh fog defaults differ from the Unreal height fog contract"):
 		return
-	# This fixture exercises the unchanged legacy radiance/Unreal density path.
-	_fog.fog_color_mode = FogNode.ColorMode.LEGACY_RADIANCE
 	_fog.fog_density = 2.0
 	_fog.fog_inscattering_color = Color(1.0, 0.05, 0.05)
 	scene.add_child(_fog)
@@ -291,7 +288,6 @@ func run() -> void:
 	# for non-physical energy, and authored lux for physical light units.
 	const PHYSICAL_LIGHT_UNITS := "rendering/lights_and_shadows/use_physical_light_units"
 	var old_physical_units: Variant = ProjectSettings.get_setting(PHYSICAL_LIGHT_UNITS, false)
-	_fog.sun_light = _light
 	_fog.directional_inscattering_color = Color(0.25, 0.25, 0.25)
 	_light.light_color = Color.WHITE
 	_light.light_energy = 2.0
@@ -311,7 +307,6 @@ func run() -> void:
 			"physical fog sun radiance did not include 60000 lux: %s" % [physical_snapshot]):
 		return
 	ProjectSettings.set_setting(PHYSICAL_LIGHT_UNITS, old_physical_units)
-	_fog.sun_light = null
 	_fog.directional_inscattering_color = Color(0.0, 0.0, 0.0)
 	await settle(4)
 

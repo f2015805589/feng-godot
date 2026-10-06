@@ -1,69 +1,58 @@
 # Feng Fog
 
-`FengHeightFog` provides exponential height fog with two density layers, start
-and cutoff distances, and optional directional inscattering. The Sky-anchored
-fullscreen pass fogs the opaque scene and sky. Forward-only opaque fallback and
-transparent materials evaluate fog at their own fragment position.
+`FengHeightFog` implements the supported part of Unreal Engine 5.8's
+exponential height fog. It has two density layers, height falloff and offsets,
+maximum opacity, start distance, sky cutoff distance, and directional
+inscattering. The fullscreen path fogs opaque geometry and the sky; forward-only
+opaque and transparent materials evaluate fog at their fragment position.
 
-## Lighting and color
+## Source and light contract
 
-`fog_color_mode = Unreal Radiance` is the default. `fog_inscattering_color`
-defaults to black and is an independent scene-linear source, matching Unreal's
-separate authored fog source. It is not clamped, sRGB-converted, or multiplied
-by sunlight. A nonblack value therefore remains visible when atmosphere lighting
-is disabled. The directional artist lobe has its own color.
+`fog_inscattering_color` is the authored Fog Inscattering Color. Its default is
+black; entered RGB is used as scene-linear radiance without sRGB conversion,
+clamping, albedo interpretation, or multiplication by sunlight. It remains a
+separate base source when atmosphere lighting is disabled. Fog still attenuates
+the scene when every source is black.
 
-The runtime constructs scene-linear sources for both rendering paths:
+The runtime combines independent sources:
 
-- Authored base source: `fog_inscattering_color`, unchanged.
-- Base sky source, when a supported Feng Sky atmosphere contributes to fog:
-  `sky_mean_radiance * height_fog_contribution * sky_ambient_color_scale`.
-- When the selected sun exactly matches a supported Feng Sky atmosphere light,
-  its post-transmittance ground illuminance is routed through the existing
-  directional phase: `sun_ground_illuminance * height_fog_contribution * cos(angle)^exponent / (4 * PI)`.
-- The artist lobe is an independent addition:
-  `directional_color * luminance(selected_sun_irradiance_rgb)`, followed by the
-  same directional phase.
+- Authored source: `fog_inscattering_color` unchanged.
+- Sky ambient: the active Feng Sky atmosphere's sampled mean radiance multiplied
+  by `height_fog_contribution` and `sky_atmosphere_ambient_contribution_color_scale`.
+- Physical atmosphere sun: for the same World's visible primary sun selected by
+  Feng Sky, post-transmittance `sun_ground_illuminance` multiplied by
+  `height_fog_contribution`. It enters the directional phase, not the isotropic
+  base source.
+- Artist directional lobe: `directional_inscattering_color` multiplied by the
+  raw selected scene light RGB luminance, then evaluated by the same directional
+  phase. It stays independent of the physical atmosphere term and base source.
 
-`sky_atmosphere_ambient_contribution_color_scale` tints only the sky ambient.
-The directional artist color is authored in scene-linear RGB and is independent
-of the authored base. The pass applies pre-exposure once to the combined source.
+`Affect Height Fog` and a zero `height_fog_contribution` remove the atmosphere
+ambient and physical sun terms. They leave the authored source and artist lobe
+active. The active atmosphere's primary sun is preferred when it is visible in
+the same World; otherwise a cached search selects a visible scene directional
+light. The Fog component has no separate sun picker. The artist term uses the
+selected light's scene-linear RGB and the existing Godot light-unit conversion;
+the atmosphere term uses the atmosphere's already attenuated ground
+illuminance. The pass applies pre-exposure once to the combined source.
 
-Sun irradiance uses `light_energy * light_intensity_lux` in physical mode and
-`light_energy * PI` otherwise, with linear light color and physical-mode color
-temperature. For a matching atmosphere light, its directional direct term uses
-post-transmittance ground illuminance; the artist lobe keeps the selected
-light's luminance scaling. Sky mean radiance is already phase-integrated and
-needs no additional `1/(4π)` factor.
+Density and falloff use Unreal-authored units scaled by `0.1` for the meter
+world (Unreal divides by `1000` in centimeters). Perspective observers are
+capped at 655.36 m above the lowest active fog-layer height, matching Unreal's
+default ray-origin guard. Orthographic cameras retain their actual height;
+Unreal's separate ViewTarget-distance adjustment has no direct Godot equivalent.
+Sky ambient is a sampled mean from Feng Sky rather than Unreal's
+distant-sky-light LUT, so the results are not promised to be pixel-identical.
 
-Without a supported atmosphere provider, Unreal Radiance consists of the
-authored base plus the optional artist directional lobe; it does not add an
-isotropic direct-sun source. With no authored or atmosphere source, and with no
-active artist directional lobe, fog still attenuates scene color but has black
-in-scattering. `height_fog_contribution = 0`
-removes atmosphere-provided ambient and matched-atmosphere direct light; the
-authored base and independent artist lobe remain. **Affect Height Fog** off
-disables the atmosphere contribution while keeping the authored base and the
-selected scene-light artist lobe. Camera exposure still determines final screen
-brightness.
-
-## Optional Lit Albedo mode
-
-Set `fog_color_mode = Lit Albedo` to opt into the previous physical material
-model. In this mode `fog_inscattering_color` is converted from sRGB to linear
-albedo in `[0, 1]`: sky and a matching atmosphere sun are tinted by this albedo,
-and an unmatched scene sun contributes the isotropic fallback
-`albedo * sun_irradiance_rgb / (4 * PI)`. Black albedo absorbs without a base
-source. This mode is deliberately distinct from Unreal Radiance; switch back to
-Unreal Radiance when the color should be an independent authored source.
-
-The fog model does not include multiple scattering, terrain occlusion or
-distance-varying atmospheric aerial perspective.
+This component does not implement Unreal's fog cubemap/texture, volumetric fog,
+multiple-scattering controls, nonzero optional EndDistance, fog contribution to
+SkyLight captures, or dual-sun directional fog lobes. This documents the
+supported subset, not full Unreal feature parity.
 
 ## Lifecycle and tests
 
 Each runtime/editor plugin owns its world/render-target registrations. Disabling
-Fog or Magic GI leaves the other addon’s views registered. Fog enables viewport
+Fog or Magic GI leaves the other addon's views registered. Fog enables viewport
 debanding while active and restores the original value when its use ends.
 
 Run ownership/lighting contracts and the optional Sky late-load check:
@@ -76,16 +65,19 @@ python misc/feng-addons/feng-fog/tests/run_late_sky_runtime_load.py --editor /pa
 The late-load check starts without Feng Sky, then loads a mock provider in the
 same process and verifies discovery and world-matched radiance.
 
+Run the CPU contracts with either light-unit setting:
+
 ```sh
-python misc/feng-addons/feng-fog/tests/run_lit_fog_tests.py --editor /path/to/godot
-python misc/feng-addons/feng-fog/tests/run_lit_fog_tests.py --editor /path/to/godot --physical-units false
+python misc/feng-addons/feng-fog/tests/run_height_fog_tests.py --editor /path/to/godot
+python misc/feng-addons/feng-fog/tests/run_height_fog_tests.py --editor /path/to/godot --physical-units false
 ```
 
-The headless CPU test covers default Unreal Radiance, independent authored RGB,
-matched atmosphere direction, zero contribution, and explicit Lit Albedo
-behavior. Add `--gpu-driver vulkan` (or a supported driver) for rendered checks.
-The 320 × 240 GPU test checks default Radiance at fixed exposure with zero
-atmosphere contribution across deferred opaque, unshaded, and transparent
-surfaces, plus a 10,000× lighting range, pre-exposure on/off, direct-only
-lighting, low-sun sky/Fog comparison, and the independent directional lobe
-including a horizontal sun. Logs and PNGs remain in the reported scratch project.
+The CPU test covers raw authored RGB, atmosphere ambient and ground-sun routing,
+primary-sun precedence and world checks, `Affect Height Fog`, zero contribution,
+scene-light fallback, signed artist light, and finite-value guards. Add
+`--gpu-driver vulkan` (or another supported driver) for rendered checks. The
+fixed-exposure GPU test checks authored-source independence from direct light,
+black-source transmission, pre-exposure, deferred/unshaded/transparent paths,
+and the low-sun atmosphere ground-illuminance case. It does not use auto
+exposure to conceal changes in source units. Logs and PNGs stay in the reported
+scratch project.

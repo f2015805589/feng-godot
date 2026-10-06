@@ -6,8 +6,7 @@ extends Node3D
 ## The node's world-space height is its global Y position (each fog layer's
 ## height offset is relative to it), and a world keeps the latest registered
 ## enabled node active. Extinction parameters and the default authored source
-## follow Unreal's exponential height fog semantics. Lit Albedo is an opt-in
-## physically lit material mode.
+## follow Unreal's exponential height fog semantics.
 ## Density and falloff carry Unreal's authored units and are divided
 ## by ten for meters before upload (Unreal divides by 1000 in centimeters).
 ## While active, the runtime temporarily enables debanding on affected viewports
@@ -17,7 +16,6 @@ const Runtime = preload("feng_fog_runtime.gd")
 ## Unreal stores FogDensity/FogHeightFalloff per 1000 units in a centimeter
 ## world; dividing by ten gives the same profile in a meter world.
 const UNIT_SCALE := 0.1
-enum ColorMode { LIT, LEGACY_RADIANCE }
 
 @export_group("高度指数雾")
 ## Turns the component's fog on or off.
@@ -30,16 +28,8 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 	set(value):
 		fog_density = maxf(value, 0.0)
 		_publish()
-## Unreal Radiance keeps Fog Inscattering Color as an independent, additive
-## scene-linear source. Lit Albedo instead interprets it as a material color
-## illuminated by sky and sunlight; this is an optional physical model.
-@export_enum("Lit Albedo", "Unreal Radiance") var fog_color_mode: int = ColorMode.LEGACY_RADIANCE:
-	set(value):
-		fog_color_mode = value
-		_publish()
-## In Unreal Radiance mode this is an independent scene-linear source: it is
-## not multiplied by sunlight, converted from sRGB, or clamped. In Lit Albedo
-## mode it is an sRGB material color converted to linear albedo in [0, 1].
+## Unreal's authored Fog Inscattering Color is an independent scene-linear
+## source. It is not multiplied by sunlight, converted from sRGB, or clamped.
 ## Black is the Unreal-compatible default authored source.
 @export var fog_inscattering_color := Color.BLACK:
 	set(value):
@@ -96,13 +86,8 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 		_publish()
 
 @export_subgroup("定向内散射")
-## Directional light the inscattering lobe follows. When unset, the first
-## enabled DirectionalLight3D on the same World3D is used — Unreal's equivalent
-## is the directional light flagged "Atmosphere Sun Light".
-@export var sun_light: DirectionalLight3D:
-	set(value):
-		sun_light = value
-		_publish()
+## The directional lobe follows the active Feng Sky atmosphere's primary sun;
+## when none is available, it follows a visible directional light in this World3D.
 ## Controls the size of the directional inscattering cone, used to approximate
 ## inscattering from the sun off the ambient haze. (Unreal: Directional Inscattering Exponent)
 @export_range(2.0, 64.0, 0.1) var directional_inscattering_exponent := 4.0:
@@ -118,8 +103,7 @@ enum ColorMode { LIT, LEGACY_RADIANCE }
 ## Independent artist color multiplied by sun luminance, never by the base
 ## Fog Inscattering Color. Retains the original scene-linear RGB semantics.
 ## Black disables only this optional artist lobe. Matched atmosphere sunlight
-## remains a separate directional source; Lit Albedo retains its optional
-## isotropic fallback for unmatched scene lights. (Unreal: Directional Inscattering Color)
+## remains a separate physical directional source. (Unreal: Directional Inscattering Color)
 @export var directional_inscattering_color := Color(0.0, 0.0, 0.0):
 	set(value):
 		directional_inscattering_color = value
@@ -175,12 +159,6 @@ func snapshot_fields() -> Dictionary:
 		"inscattering_start": directional_inscattering_start_distance,
 		"inscattering_exponent": directional_inscattering_exponent,
 	}
-	if fog_color_mode == ColorMode.LIT:
-		var albedo := fog_inscattering_color.clamp().srgb_to_linear()
-		fields["fog_albedo"] = Vector3(albedo.r, albedo.g, albedo.b)
-		# An unlit participating medium absorbs but does not emit. The runtime
-		# constructs its source from incident sky and sun radiance instead.
-		fields["fog_color"] = Vector3.ZERO
 	return fields
 
 func _publish() -> void:

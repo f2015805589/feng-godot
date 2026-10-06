@@ -114,7 +114,8 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		if not frame_snapshot.is_empty() and scene_data != null:
 			var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
 			var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
-			frame_parameters = _make_forward_parameters(frame_snapshot, scene_data.get_cam_transform(), fog_scale)
+			frame_parameters = _make_forward_parameters(frame_snapshot, scene_data.get_cam_transform(),
+				fog_scale, scene_data.get_view_projection(0))
 		ctx.call("set_height_fog_parameters", frame_parameters)
 		super._frp_execute_with_snapshot(ctx, frame_snapshot)
 		_pre_exposure = 1.0
@@ -136,25 +137,28 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 			if scene_data != null:
 				var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
 				var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
-				frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(), fog_scale)
+				frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(),
+					fog_scale, scene_data.get_view_projection(0))
 		ctx.call("set_height_fog_parameters", frame_parameters)
 	super._frp_execute(ctx)
 	_pre_exposure = 1.0
 
-func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_scale: float) -> PackedFloat32Array:
+func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_scale: float,
+		projection: Projection) -> PackedFloat32Array:
 	var density := float(snapshot.get("fog_density", 0.0))
 	var falloff := float(snapshot.get("fog_height_falloff", 0.0))
 	var height := float(snapshot.get("fog_height", 0.0))
 	var density2 := float(snapshot.get("second_fog_density", 0.0))
 	var falloff2 := float(snapshot.get("second_fog_height_falloff", 0.0))
 	var height2 := float(snapshot.get("second_fog_height", 0.0))
-	var global_density := density * pow(2.0, clampf(-falloff * (camera.origin.y - height), -125.0, 126.0))
-	var global_density2 := density2 * pow(2.0, clampf(-falloff2 * (camera.origin.y - height2), -125.0, 126.0))
+	var observer_y := _observer_height(camera.origin.y, density, height, density2, height2, projection)
+	var global_density := density * pow(2.0, clampf(-falloff * (observer_y - height), -125.0, 126.0))
+	var global_density2 := density2 * pow(2.0, clampf(-falloff2 * (observer_y - height2), -125.0, 126.0))
 	var fog_color: Variant = snapshot.get("fog_color", Vector3.ZERO)
 	var sun_direction: Variant = snapshot.get("sun_direction", Vector3.ZERO)
 	var inscattering_color: Variant = snapshot.get("inscattering_color", Vector3.ZERO)
 	var values := PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0,
-			global_density, falloff, 0.0, float(snapshot.get("start_distance", 0.0)),
+			global_density, falloff, observer_y, float(snapshot.get("start_distance", 0.0)),
 			global_density2, falloff2, density2, height2,
 			density, height, fog_scale, float(snapshot.get("cutoff_distance", 0.0))])
 	if fog_color is Vector3:
@@ -173,6 +177,21 @@ func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_sca
 	else:
 		values.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 4.0]))
 	return values
+
+
+func _observer_height(camera_y: float, density: float, height: float, density2: float,
+		height2: float, projection: Projection) -> float:
+	# Unreal caps the observer for perspective rays to 65536 cm above each
+	# nonzero fog layer. Orthographic cameras use ViewTarget distance instead;
+	# Godot exposes no equivalent target distance, so retain their actual height.
+	if projection.is_orthogonal() or not is_finite(camera_y):
+		return camera_y
+	var cap := INF
+	if density > 0.0 and is_finite(density) and is_finite(height):
+		cap = minf(cap, height + 655.36)
+	if density2 > 0.0 and is_finite(density2) and is_finite(height2):
+		cap = minf(cap, height2 + 655.36)
+	return minf(camera_y, cap) if is_finite(cap) else camera_y
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
@@ -222,16 +241,17 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		return false
 	# Godot's view projection is the eye's projection matrix, not a combined
 	# world-to-clip matrix. The shader must apply the camera transform as well.
-	var inverse_projection: Projection = scene_data.get_view_projection(view).inverse()
+	var projection: Projection = scene_data.get_view_projection(view)
+	var inverse_projection: Projection = projection.inverse()
 	var camera: Transform3D = scene_data.get_cam_transform()
 	camera.origin += camera.basis.orthonormalized() * scene_data.get_view_eye_offset(view)
 	var values := PackedFloat32Array()
 	_append_projection(values, inverse_projection)
 	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
 	_append_transform(values, view_to_world)
-	# Both paths use the same seven vec4s. Compute applies the scale through
-	# its push constant, so its reserved packet lane remains zero.
-	values.append_array(_make_forward_parameters(snapshot, camera, 0.0))
+	# Both paths use the same seven vec4s. Compute applies strength through its
+	# push constant, so its reserved packet lane remains zero.
+	values.append_array(_make_forward_parameters(snapshot, camera, 0.0, projection))
 	values.append_array(AtmospherePacket.make(_atmosphere_snapshot, camera, _atmosphere_optical.is_valid(), _atmosphere_multiple.is_valid()))
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
 

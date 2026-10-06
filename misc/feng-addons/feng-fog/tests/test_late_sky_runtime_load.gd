@@ -48,7 +48,6 @@ func run() -> void:
 		return
 
 	var fog := HeightFog.new()
-	fog.fog_color_mode = HeightFog.ColorMode.LEGACY_RADIANCE
 	root.add_child(fog)
 	var fog_snapshot := fog.snapshot_fields()
 	FogRuntime._add_sky_ambient(fog_snapshot, 42)

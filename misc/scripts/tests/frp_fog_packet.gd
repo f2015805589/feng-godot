@@ -1,6 +1,7 @@
 extends SceneTree
 ## Exact CPU packet contract: 496-byte UBO, preserving the original 240-byte
-## camera/fog prefix and independent forward7×vec4 fog payload.
+## camera/fog prefix and independent forward7×vec4 fog payload. The former
+## unused p1.z now carries the perspective observer height for both paths.
 const FogPass = preload("res://addons/feng-render-pipeline/passes/height_fog_pass.gd")
 
 class SceneData extends RenderSceneDataExtension:
@@ -37,6 +38,21 @@ func _initialize() -> void:
 	call_deferred("run")
 
 ## Kept independently expanded from the pre-refactor field contract.
+func reference_observer_y(s: Dictionary, camera: Transform3D, projection: Projection) -> float:
+	var camera_y := camera.origin.y
+	if projection.is_orthogonal():
+		return camera_y
+	var cap := INF
+	var density := float(s.get("fog_density", 0.0))
+	var height := float(s.get("fog_height", 0.0))
+	var density2 := float(s.get("second_fog_density", 0.0))
+	var height2 := float(s.get("second_fog_height", 0.0))
+	if density > 0.0 and is_finite(density) and is_finite(height):
+		cap = minf(cap, height + 655.36)
+	if density2 > 0.0 and is_finite(density2) and is_finite(height2):
+		cap = minf(cap, height2 + 655.36)
+	return minf(camera_y, cap) if is_finite(cap) else camera_y
+
 func reference_packet(s: Dictionary, camera: Transform3D, projection: Projection) -> PackedFloat32Array:
 	var values := PackedFloat32Array()
 	for column in 4:
@@ -52,9 +68,10 @@ func reference_packet(s: Dictionary, camera: Transform3D, projection: Projection
 	var density2 := float(s.get("second_fog_density", 0.0))
 	var falloff2 := float(s.get("second_fog_height_falloff", 0.0))
 	var height2 := float(s.get("second_fog_height", 0.0))
+	var observer_y := reference_observer_y(s, camera, projection)
 	values.append_array([camera.origin.x, camera.origin.y, camera.origin.z, 1.0])
-	values.append_array([density * pow(2.0, clampf(-falloff * (camera.origin.y - height), -125.0, 126.0)), falloff, 0.0, float(s.get("start_distance", 0.0))])
-	values.append_array([density2 * pow(2.0, clampf(-falloff2 * (camera.origin.y - height2), -125.0, 126.0)), falloff2, density2, height2])
+	values.append_array([density * pow(2.0, clampf(-falloff * (observer_y - height), -125.0, 126.0)), falloff, observer_y, float(s.get("start_distance", 0.0))])
+	values.append_array([density2 * pow(2.0, clampf(-falloff2 * (observer_y - height2), -125.0, 126.0)), falloff2, density2, height2])
 	values.append_array([density, height, 0.0, float(s.get("cutoff_distance", 0.0))])
 	var color: Variant = s.get("fog_color", Vector3.ZERO)
 	var sun: Variant = s.get("sun_direction", Vector3.ZERO)
@@ -102,7 +119,7 @@ func run() -> void:
 				neutral_atmosphere.resize(64)
 				check(fog.captured.slice(60).to_byte_array() == neutral_atmosphere.to_byte_array(), "absent atmosphere must append 64 neutral floats")
 				for scale in [-2.0, 0.0, 1.0, 2.75]:
-					var forward := fog._make_forward_parameters(settings, camera, scale)
+					var forward := fog._make_forward_parameters(settings, camera, scale, projection)
 					check(forward.size() == 28 and forward[14] == scale, "forward packet scale/layout changed")
 					forward[14] = 0.0
 					check(forward.to_byte_array() == fog.captured.slice(32, 60).to_byte_array(), "forward/compute packet fields differ")
@@ -120,7 +137,46 @@ func run() -> void:
 		check(fog._update_frame_ubo(settings, scene, 0, null), "atmosphere+fog packet builder failed")
 		check(fog.captured.slice(0, 60).to_byte_array() == reference_packet(settings, scene.camera, scene.projection).to_byte_array(), "atmosphere mutated original fog fields")
 		check(fog.captured[110] == 1.0 and fog.captured[95] == 60000.0, "live atmosphere packet lost source/active data")
-		check(fog._make_forward_parameters(settings, scene.camera, 0.0).to_byte_array() == fog.captured.slice(32, 60).to_byte_array(), "live atmosphere altered forward fog contract")
+		check(fog._make_forward_parameters(settings, scene.camera, 0.0, scene.projection).to_byte_array() == fog.captured.slice(32, 60).to_byte_array(), "live atmosphere altered forward fog contract")
+	# Both density layers independently cap perspective observers; the minimum
+	# cap wins. Compute's reserved strength lane must not affect observerY or the
+	# camera-density terms. Orthographic projection has no UE target-distance
+	# equivalent and therefore retains the true camera height.
+	var high_camera := Transform3D.IDENTITY
+	high_camera.origin.y = 1200.0
+	var layered := {
+		"fog_density": 0.002, "fog_height_falloff": 0.02, "fog_height": 3.0,
+		"second_fog_density": 0.004, "second_fog_height_falloff": 0.12, "second_fog_height": -2.0}
+	var perspective := Projection.create_perspective(70.0, 1.6, 0.05, 4000.0)
+	var forward_cap := fog._make_forward_parameters(layered, high_camera, 1.0, perspective)
+	var compute_cap := fog._make_forward_parameters(layered, high_camera, 0.0, perspective)
+	check(is_equal_approx(forward_cap[6], 653.36) and is_equal_approx(compute_cap[6], 653.36), "two-layer perspective observer cap diverged by packet scale")
+	check(is_equal_approx(forward_cap[4], compute_cap[4]) and is_equal_approx(forward_cap[8], compute_cap[8]), "compute/forward camera-density terms differ")
+	check(forward_cap[1] == high_camera.origin.y and compute_cap[1] == high_camera.origin.y, "observer cap replaced the actual camera position")
+	for i in forward_cap.size():
+		if i != 14:
+			check(is_equal_approx(forward_cap[i], compute_cap[i]), "packet scale changed non-scale field %d" % i)
+	check(forward_cap[14] == 1.0 and compute_cap[14] == 0.0, "compute/forward strength lanes changed")
+	var one_active_layer := layered.duplicate()
+	one_active_layer["second_fog_density"] = 0.0
+	var one_layer_packet := fog._make_forward_parameters(one_active_layer, high_camera, 1.0, perspective)
+	check(is_equal_approx(one_layer_packet[6], 658.36), "inactive second layer affected the perspective observer cap")
+	var ordinary_camera := Transform3D.IDENTITY
+	ordinary_camera.origin.y = 120.0
+	var ordinary_packet := fog._make_forward_parameters(layered, ordinary_camera, 1.0, perspective)
+	check(ordinary_packet[1] == ordinary_camera.origin.y and ordinary_packet[6] == ordinary_camera.origin.y, "camera below the cap was moved")
+	var orthographic := Projection.create_orthogonal(-6.4, 6.4, -4.0, 4.0, 0.05, 4000.0)
+	var orthographic_packet := fog._make_forward_parameters(layered, high_camera, 1.0, orthographic)
+	check(orthographic_packet[6] == high_camera.origin.y, "orthographic fog unexpectedly applied perspective observer cap")
+	var no_density := fog._make_forward_parameters({}, high_camera, 1.0, perspective)
+	check(no_density[6] == high_camera.origin.y, "empty fog layers unexpectedly applied observer cap")
+	scene.camera = high_camera
+	scene.projection = perspective
+	check(fog._update_frame_ubo(layered, scene, 0, null), "capped perspective UBO build failed")
+	var capped_ubo_fog := fog.captured.slice(32, 60)
+	check(capped_ubo_fog[1] == high_camera.origin.y and is_equal_approx(capped_ubo_fog[6], 653.36), "compute UBO camera/observer fields do not match contract")
+	check(is_equal_approx(capped_ubo_fog[4], compute_cap[4]) and is_equal_approx(capped_ubo_fog[8], compute_cap[8]), "compute UBO density terms disagree with the shared packet")
+	check(capped_ubo_fog[14] == 0.0, "compute UBO no longer reserves the strength lane")
 	check(not fog._update_frame_ubo({}, null, 0, null) and not fog._update_frame_ubo({}, scene, 1, null), "invalid view guard changed")
 	scene.free()
 	var output := OS.get_environment("FRP_FOG_PACKET_SNAPSHOT")

@@ -48,13 +48,12 @@ sun_light = NodePath("../Sun")
 affect_height_fog = true
 height_fog_contribution = 1.0
 
-[node name="HeightFog" type="Node3D" parent="." node_paths=PackedStringArray("sun_light")]
+[node name="HeightFog" type="Node3D" parent="."]
 script = ExtResource("2_fog")
 fog_density = 0.025
 fog_inscattering_color = Color(0.12, 0.15, 0.2, 1)
 fog_height_falloff = 0.12
 start_distance = 5.0
-sun_light = NodePath("../Sun")
 directional_inscattering_color = Color(0.08, 0.13, 0.22, 1)
 directional_inscattering_start_distance = 18.0
 
