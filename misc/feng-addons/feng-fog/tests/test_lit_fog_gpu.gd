@@ -96,6 +96,8 @@ func run() -> void:
 		card.position = Vector3((i - 1) * 10.0, 2.0, -40.0)
 		var material := StandardMaterial3D.new()
 		material.albedo_color = Color.BLACK
+		# Remove default specular reflection so this fixture isolates fog scattering.
+		material.metallic_specular = 0.0
 		if i > 0:
 			material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		if i == 2:
