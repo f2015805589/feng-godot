@@ -743,7 +743,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	_render_buffers_tonemap(p_render_data);
 }
 
-void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present, bool p_allow_glow) {
+void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render_data, bool p_defer_present, bool p_allow_glow, int p_tonemap_mode_override) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
@@ -793,6 +793,10 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 		RendererRD::ToneMapper::TonemapSettings tonemap;
 
 		bool using_hdr = texture_storage->render_target_is_using_hdr(render_target);
+		const bool use_ue_film = p_tonemap_mode_override == 5;
+		const bool has_native_tonemap_override = p_tonemap_mode_override >= RSE::ENV_TONE_MAPPER_LINEAR && p_tonemap_mode_override <= RSE::ENV_TONE_MAPPER_AGX;
+		const bool limit_agx_white = rb->get_base_data_format() == RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
+		const float max_value = using_hdr ? p_render_data->window_output_max_value : 1.0f;
 
 		RID exposure_override = get_tonemap_exposure_override();
 		tonemap.exposure_texture = exposure_override.is_valid() ? exposure_override : luminance->get_current_luminance_buffer(rb);
@@ -811,8 +815,8 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 
 		if (p_allow_glow && can_use_effects && p_render_data->environment.is_valid() && environment_get_glow_enabled(p_render_data->environment)) {
 			tonemap.use_glow = true;
-			tonemap.glow_mode = environment_get_glow_blend_mode(p_render_data->environment);
-			tonemap.glow_intensity = tonemap.glow_mode == RSE::ENV_GLOW_BLEND_MODE_MIX ? environment_get_glow_mix(p_render_data->environment) : environment_get_glow_intensity(p_render_data->environment);
+			tonemap.glow_mode = use_ue_film ? RSE::ENV_GLOW_BLEND_MODE_ADDITIVE : environment_get_glow_blend_mode(p_render_data->environment);
+			tonemap.glow_intensity = !use_ue_film && tonemap.glow_mode == RSE::ENV_GLOW_BLEND_MODE_MIX ? environment_get_glow_mix(p_render_data->environment) : environment_get_glow_intensity(p_render_data->environment);
 			for (int i = 0; i < RSE::MAX_GLOW_LEVELS; i++) {
 				tonemap.glow_levels[i] = environment_get_glow_levels(p_render_data->environment)[i];
 			}
@@ -845,28 +849,26 @@ void RendererSceneRenderRD::_render_buffers_tonemap(const RenderDataRD *p_render
 		tonemap.texture_size = Vector2i(color_size.x, color_size.y);
 
 		if (p_render_data->environment.is_valid()) {
-			// When we are using RGB10A2 render buffer format, our scene
-			// is limited to a maximum of 2.0. In this case we should limit
-			// the max white of tonemappers, specifically AgX which defaults
-			// to a high white value.
-			bool limit_agx_white = rb->get_base_data_format() == RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
-
-			// When using HDR 2D, we use the parent window's output max value.
-			// Otherwise, we're tonemapping to an SDR low bit depth buffer, so
-			// we need to use SDR range with a max value of 1.0.
-			float max_value = using_hdr ? p_render_data->window_output_max_value : 1.0;
-
-			tonemap.tonemap_mode = environment_get_tone_mapper(p_render_data->environment);
-			RendererEnvironmentStorage::TonemapParameters params = environment_get_tonemap_parameters(p_render_data->environment, limit_agx_white, max_value);
+			tonemap.exposure = environment_get_exposure(p_render_data->environment);
+		}
+		if (p_render_data->environment.is_valid() || has_native_tonemap_override || use_ue_film) {
+			tonemap.max_value = max_value;
+		}
+		if (!use_ue_film && (p_render_data->environment.is_valid() || has_native_tonemap_override)) {
+			const RID tonemap_environment = p_render_data->environment.is_valid() ? p_render_data->environment : RID();
+			const int mode_override = has_native_tonemap_override ? p_tonemap_mode_override : -1;
+			tonemap.tonemap_mode = has_native_tonemap_override ? RSE::EnvironmentToneMapper(p_tonemap_mode_override) : environment_get_tone_mapper(tonemap_environment);
+			RendererEnvironmentStorage::TonemapParameters params = environment_get_tonemap_parameters(tonemap_environment, limit_agx_white, max_value, mode_override);
 			tonemap.tonemapper_params[0] = params.tonemapper_params[0];
 			tonemap.tonemapper_params[1] = params.tonemapper_params[1];
 			tonemap.tonemapper_params[2] = params.tonemapper_params[2];
 			tonemap.tonemapper_params[3] = params.tonemapper_params[3];
-			tonemap.white = environment_get_white(p_render_data->environment, limit_agx_white, max_value);
-			tonemap.exposure = environment_get_exposure(p_render_data->environment);
-			tonemap.max_value = max_value;
+			tonemap.white = environment_get_white(tonemap_environment, limit_agx_white, max_value, mode_override);
 		}
-
+		if (use_ue_film) {
+			tonemap.use_ue_film_lut = true;
+			tonemap.glow_mode = RSE::ENV_GLOW_BLEND_MODE_ADDITIVE;
+		}
 		tonemap.use_color_correction = false;
 		tonemap.use_1d_color_correction = false;
 		tonemap.color_correction_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);

@@ -54,6 +54,7 @@ layout(set = 3, binding = 0) uniform sampler2D source_color_correction;
 #else
 layout(set = 3, binding = 0) uniform sampler3D source_color_correction;
 #endif
+layout(set = 3, binding = 1) uniform sampler3D source_ue_film_lut;
 
 #define FLAG_USE_BCS (1 << 0)
 #define FLAG_USE_GLOW (1 << 1)
@@ -62,6 +63,7 @@ layout(set = 3, binding = 0) uniform sampler3D source_color_correction;
 #define FLAG_USE_FXAA (1 << 4)
 #define FLAG_USE_8_BIT_DEBANDING (1 << 5)
 #define FLAG_CONVERT_TO_SRGB (1 << 6)
+#define FLAG_USE_UE_FILM_LUT (1 << 7)
 
 layout(push_constant, std430) uniform Params {
 	vec3 bcs;
@@ -237,6 +239,8 @@ vec3 srgb_to_linear(vec3 color) {
 	return mix(pow((color.rgb + a) * (1.0f / (vec3(1.0f) + a)), vec3(2.4f)), color.rgb * (1.0f / 12.92f), lessThan(color.rgb, vec3(0.04045f)));
 }
 
+#include "tonemap_ue_film_lut_inc.glsl"
+
 #define TONEMAPPER_LINEAR 0
 #define TONEMAPPER_REINHARD 1
 #define TONEMAPPER_FILMIC 2
@@ -244,6 +248,9 @@ vec3 srgb_to_linear(vec3 color) {
 #define TONEMAPPER_AGX 4
 
 vec3 apply_tonemapping(vec3 color) { // inputs are LINEAR
+	if (bool(params.flags & FLAG_USE_UE_FILM_LUT)) {
+		return sample_ue_film_lut(source_ue_film_lut, max(vec3(0.0), color));
+	}
 	if (params.tonemapper == TONEMAPPER_LINEAR) {
 		return color;
 	}
@@ -879,6 +886,10 @@ void main() {
 		vec3 glow = gather_glow(source_glow, uv_interp) * params.glow_intensity;
 		if (params.glow_map_strength > 0.001) {
 			glow = mix(glow, texture(glow_map, uv_interp).rgb * glow, params.glow_map_strength);
+		}
+		if (bool(params.flags & FLAG_USE_UE_FILM_LUT)) {
+			// UE's film path exposes scene color and bloom together before the LUT.
+			glow *= exposure;
 		}
 
 		if (params.glow_mode == GLOW_MODE_MIX) {

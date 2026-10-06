@@ -30,6 +30,10 @@ func require(value: bool, message: String) -> void:
 		assert(value, message)
 
 
+func pixel_delta(a: Color, b: Color) -> float:
+	return maxf(maxf(absf(a.r - b.r), absf(a.g - b.g)), maxf(absf(a.b - b.b), absf(a.a - b.a)))
+
+
 func frame() -> Image:
 	for i in 8:
 		await process_frame
@@ -70,6 +74,7 @@ func run() -> void:
 	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	environment.ambient_light_color = Color.WHITE
 	environment.ambient_light_energy = 1.0
+	environment.tonemap_exposure = 1.0
 	# A non-identity tone mapper: with the default Linear one an HDR 1.0 is already
 	# screen white, so "the overlay's write was tone mapped" would not be measurable.
 	environment.tonemap_mode = Environment.TONE_MAPPER_AGX
@@ -82,6 +87,10 @@ func run() -> void:
 	var renderer = renderer_script.new()
 	var compositor := Compositor.new()
 	camera.compositor = compositor
+	renderer.apply(compositor)
+	for pass_entry in renderer.passes:
+		if String(pass_entry.stable_id) == "library:eye_adaptation":
+			pass_entry.enabled = false
 	renderer.apply(compositor)
 	require(renderer.get_validation_warnings().is_empty(), "the default pipeline must validate clean: %s" % [renderer.get_validation_warnings()])
 
@@ -127,6 +136,36 @@ func run() -> void:
 	print("Post overlay before tone mapping: %s" % [before_pixel])
 	require(before_pixel.r > 0.3 and before_pixel.r > before_pixel.g + 0.15, "an overlay before tone mapping did not reach the frame: %s" % [before_pixel])
 	require(before_pixel.g > 0.02 or before_pixel.r < 0.95, "the overlay's write skipped the tone mapping (AgX would have moved it): %s" % [before_pixel])
+
+	# The pass mode is an effective per-volume override: inherited AGX must match
+	# explicit AGX, and explicit Filmic must ignore a different Environment mode.
+	post_script.tonemap_mode = -1
+	renderer.apply(compositor)
+	var inherited_agx := (await frame()).get_pixelv(CENTER)
+	post_script.tonemap_mode = 4
+	renderer.apply(compositor)
+	var explicit_agx := (await frame()).get_pixelv(CENTER)
+	require(pixel_delta(inherited_agx, explicit_agx) < 0.005,
+			"Inherit Environment and explicit AGX produced different pixels: %s vs %s" % [inherited_agx, explicit_agx])
+
+	post_script.tonemap_mode = 2
+	environment.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+	renderer.apply(compositor)
+	var filmic_with_linear_environment := (await frame()).get_pixelv(CENTER)
+	environment.tonemap_mode = Environment.TONE_MAPPER_AGX
+	renderer.apply(compositor)
+	var filmic_with_agx_environment := (await frame()).get_pixelv(CENTER)
+	require(pixel_delta(filmic_with_linear_environment, filmic_with_agx_environment) < 0.005,
+			"explicit Filmic inherited the Environment's different tonemapper: %s vs %s" % [filmic_with_linear_environment, filmic_with_agx_environment])
+
+	scene.remove_child(world_environment)
+	renderer.apply(compositor)
+	var filmic_without_environment := (await frame()).get_pixelv(CENTER)
+	require(pixel_delta(filmic_with_agx_environment, filmic_without_environment) < 0.005,
+			"explicit Filmic without an Environment changed its authored-default white/exposure: %s vs %s" % [filmic_with_agx_environment, filmic_without_environment])
+	scene.add_child(world_environment)
+	post_script.tonemap_mode = 5
+	renderer.apply(compositor)
 
 	# 3. The keyword follows the parameter, so the same shader serves both positions.
 	require(after_pixel.g - before_pixel.g > 0.3, "the position keyword did not change the overlay shader: %s vs %s" % [before_pixel, after_pixel])

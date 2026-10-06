@@ -75,6 +75,7 @@ private:
 		TONEMAP_FLAG_USE_FXAA = (1 << 4),
 		TONEMAP_FLAG_USE_8_BIT_DEBANDING = (1 << 5),
 		TONEMAP_FLAG_CONVERT_TO_SRGB = (1 << 6),
+		TONEMAP_FLAG_USE_UE_FILM_LUT = (1 << 7),
 	};
 
 	enum FlagsMobile {
@@ -98,7 +99,8 @@ private:
 		TONEMAP_MOBILE_FLAG_GLOW_MODE_SOFTLIGHT = (1 << 15),
 		TONEMAP_MOBILE_FLAG_GLOW_MODE_REPLACE = (1 << 16),
 		TONEMAP_MOBILE_FLAG_GLOW_MODE_MIX = (1 << 17),
-		TONEMAP_MOBILE_ADRENO_BUG = (1 << 18), // Needs to be last so we force the pipeline cache to specify specializations for all variants.
+		TONEMAP_MOBILE_FLAG_UE_FILM_LUT = (1 << 18),
+		TONEMAP_MOBILE_ADRENO_BUG = (1 << 19), // Keep this last so the pipeline cache specializes every preceding shader constant.
 	};
 
 	struct TonemapPushConstant {
@@ -159,11 +161,18 @@ private:
 		PipelineCacheRD pipelines[TONEMAP_MOBILE_MODE_MAX];
 	} tonemap_mobile;
 
+	RID ue_film_lut;
+	bool ue_film_lut_attempted = false;
+	RID _ensure_ue_film_lut();
+
 public:
 	ToneMapper(bool p_use_mobile_version);
 	~ToneMapper();
 
 	struct TonemapSettings {
+		bool use_ue_film_lut = false;
+		// Internal FRP-only fixed SDR film profile; it does not change Environment's
+		// public tone-mapper enum or the native renderer's legacy tone modes.
 		bool use_glow = false;
 		RSE::EnvironmentGlowBlendMode glow_mode = RSE::ENV_GLOW_BLEND_MODE_SCREEN;
 		float glow_intensity = 0.3;

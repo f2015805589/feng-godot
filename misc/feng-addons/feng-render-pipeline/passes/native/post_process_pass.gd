@@ -27,6 +27,15 @@ extends "native_pass.gd"
 ## `layout(constant_id = 0) const bool POST_AFTER_TONEMAP = false;`
 const POST_AFTER_TONEMAP_KEYWORD := 0
 
+## The FRP tone mapper for this pass. -1 keeps the current Environment choice;
+## Unreal Filmic uses the fixed UE 5.8 SDR/Rec.709 profile.
+@export_enum("Inherit Environment:-1", "Linear:0", "Reinhard:1", "Filmic:2", "ACES:3", "AgX:4", "Unreal Filmic (ACES):5") var tonemap_mode: int = 5:
+	set(value):
+		if tonemap_mode == value:
+			return
+		tonemap_mode = value
+		emit_changed()
+
 ## Which side of the tone mapping this pass runs its overlay on. It is an exposed
 ## parameter, so the setter notifies (an `@export` member does not emit on its own) and
 ## the overlay's shader keyword follows the authored value.
@@ -38,14 +47,19 @@ const POST_AFTER_TONEMAP_KEYWORD := 0
 		emit_changed()
 
 func get_frp_parameters() -> Dictionary:
-	return {"overlay_after_tonemap": overlay_after_tonemap}
+	return {"overlay_after_tonemap": overlay_after_tonemap, "tonemap_mode": tonemap_mode}
 
 func get_volume_parameter_names() -> PackedStringArray:
-	return PackedStringArray(["overlay_after_tonemap"])
+	return PackedStringArray(["overlay_after_tonemap", "tonemap_mode"])
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
 		return
+	var resolved_parameters := get_resolved_parameters(ctx)
+	var resolved_mode := int(resolved_parameters.get("tonemap_mode", tonemap_mode))
+	if resolved_mode < -1 or resolved_mode > 5:
+		resolved_mode = 5
+	ctx.set_tonemap_mode_override(resolved_mode)
 
 	ctx.resolve_final()
 	ctx.copy_history()
@@ -59,7 +73,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		return
 
 	var ldr_target := _overlay_ldr_target()
-	if bool(get_resolved_parameters(ctx).get("overlay_after_tonemap", overlay_after_tonemap)):
+	if bool(resolved_parameters.get("overlay_after_tonemap", overlay_after_tonemap)):
 		if ldr_target == &"":
 			# An after-tonemap overlay has to own its output: the pass presents what it
 			# wrote, so it cannot write into the frame's colour buffer.

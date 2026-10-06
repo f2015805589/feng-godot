@@ -97,6 +97,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	atmosphere_optical_texture = RID();
 	atmosphere_multiple_texture = RID();
 	sky_light_diffuse_requested = false;
+	tonemap_mode_override = -1;
 }
 
 float FRPPassContext::get_pre_exposure(int p_view) const {
@@ -146,6 +147,11 @@ void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
 	if (eye_exposure_texture_writer) {
 		eye_exposure_texture_writer(p_texture);
 	}
+}
+
+void FRPPassContext::set_tonemap_mode_override(int p_mode) {
+	ERR_FAIL_COND(p_mode < -1 || p_mode > 5);
+	tonemap_mode_override = p_mode;
 }
 
 void FRPPassContext::request_sky_light_diffuse() {
@@ -330,6 +336,7 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_height_fog_parameters", "parameters"), &FRPPassContext::set_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("get_height_fog_parameters"), &FRPPassContext::get_height_fog_parameters);
 	ClassDB::bind_method(D_METHOD("set_tonemap_exposure_texture", "texture"), &FRPPassContext::set_tonemap_exposure_texture);
+	ClassDB::bind_method(D_METHOD("set_tonemap_mode_override", "mode"), &FRPPassContext::set_tonemap_mode_override);
 	ClassDB::bind_method(D_METHOD("request_next_pre_exposure", "buffer", "view", "offset_bytes"), &FRPPassContext::request_next_pre_exposure);
 
 	ClassDB::bind_method(D_METHOD("precompute_shadows"), &FRPPassContext::precompute_shadows);
