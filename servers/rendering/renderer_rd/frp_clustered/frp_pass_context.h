@@ -76,6 +76,9 @@ class FRPPassContext : public RefCounted {
 	bool sky_light_diffuse_requested = false;
 	// Current scene exposure scale excluding pre-exposure, matching the FRP lighting UBO.
 	float scene_exposure_normalization = 1.0f;
+	// Optional mode selected by the FRP Post Process pass for this frame only.
+	// -1 leaves the Environment's renderer mode untouched; 5 is FRP's UE film LUT.
+	int tonemap_mode_override = -1;
 
 	void _run_operation(int p_operation);
 	static void _finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view);
@@ -125,6 +128,8 @@ public:
 	RID get_atmosphere_optical_texture() const { return atmosphere_optical_texture; }
 	RID get_atmosphere_multiple_texture() const { return atmosphere_multiple_texture; }
 	void set_tonemap_exposure_texture(RID p_texture);
+	void set_tonemap_mode_override(int p_mode);
+	int get_tonemap_mode_override() const { return tonemap_mode_override; }
 	Error request_next_pre_exposure(RID p_buffer, int p_view, int p_offset);
 
 	// Core primitives. One per engine operation, in execution order.

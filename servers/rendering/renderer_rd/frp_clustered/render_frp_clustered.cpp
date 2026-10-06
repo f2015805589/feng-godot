@@ -3046,7 +3046,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (current_eye_adaptation_enabled) {
 						p_render_data->camera_attributes = RID();
 					}
-					_render_buffers_tonemap(p_render_data, false, frp_bloom_stage_ran);
+					_render_buffers_tonemap(p_render_data, false, frp_bloom_stage_ran, pass_context->get_tonemap_mode_override());
 					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;
@@ -3061,7 +3061,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (current_eye_adaptation_enabled) {
 						p_render_data->camera_attributes = RID();
 					}
-					_render_buffers_tonemap(p_render_data, true, frp_bloom_stage_ran);
+					_render_buffers_tonemap(p_render_data, true, frp_bloom_stage_ran, pass_context->get_tonemap_mode_override());
 					p_render_data->camera_attributes = saved_camera_attributes;
 				}
 			} break;

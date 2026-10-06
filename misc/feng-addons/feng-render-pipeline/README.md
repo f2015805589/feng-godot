@@ -100,6 +100,18 @@ Bloom 条目控制 Glow 准备，Environment 的 Glow 开关、levels、strength
 intensity 和 glow map 配置效果。默认在 DoF 前准备 Glow，并在 Tonemap 合成。
 关闭 Bloom 条目会关闭该帧的 Glow 合成。
 
+### UE Film Tonemap
+
+FRP 的现有 **Post Process / Tonemap** pass 默认使用 **Unreal Filmic (ACES)**：固定的 UE 5.8
+SDR/Rec.709 Film 曲线（ACES 派生），不增加 Pass ID 或改变执行顺序。可在该 pass 或 Volume
+中选择 `Inherit Environment`（`-1`）恢复 Environment 色调映射，或显式选择原生 Linear、
+Reinhard、Filmic、ACES、AgX。该选项是 SDR Film 输出变换；它不提供 PQ/HLG 或 UE HDR Display ODT。
+即使目标纹理以线性 HDR 格式存储，也仍应用这套 SDR Film 曲线。
+
+Film 曲线使用按需生成并缓存的 32³ LUT；HDR 高光 headroom 保留在 LUT texel 中。采样后解码回
+线性空间，交给现有输出编码路径做一次最终 gamma 转换。启用 Bloom 时，此模式在曲线前以
+Additive 方式合成 Bloom；Bloom 生成、强度和其它 pass 的设置仍由现有配置控制。
+
 TAA 按当前/历史 pre-exposure 比例重标定历史颜色；Bloom 的亮度阈值也使用一致的曝光空间。
 切换 pre-exposure 只改变 HDR 缓冲编码范围，Glow 参数含义保持一致。时序历史、异步曝光读回
 随视口缓冲管理；resize、compositor 切换与相关开关变化会使旧状态失效。立体视图使用 view 0
