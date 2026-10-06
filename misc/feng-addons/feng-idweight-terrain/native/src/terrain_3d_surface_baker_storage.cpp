@@ -553,6 +553,25 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 	// have to travel back through the CPU, which is what costs the frames until they are
 	// uploaded; the readback below stays as that path.
 	const bool direct_store = FengRDGpuCopy::available(_rd);
+	// Direct stores write disjoint ring-page/channel regions and consume them only after this
+	// compute list ends. When every active encoder descriptor is ready, keep the dispatches in one
+	// list and let the resource tracker order the later copies. Preserve the old barriers if a
+	// descriptor is missing, since that recovery path may issue a partial batch.
+	bool batch_direct_store = direct_store;
+	if (batch_direct_store) {
+		for (int tier = 0; tier < TIER_COUNT && batch_direct_store; ++tier) {
+			if (!_tier_uses_sampled(tier)) {
+				continue;
+			}
+			for (int channel = 0; channel < ENCODE_CHANNELS; ++channel) {
+				if (_tier_channel_uses_sampled(tier, channel) &&
+						!_resources.encode_uniform[channel].is_valid()) {
+					batch_direct_store = false;
+					break;
+				}
+			}
+		}
+	}
 	struct PendingStore {
 		int tier = 0;
 		int channel = 0;
@@ -661,9 +680,13 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 			_rd->compute_list_bind_uniform_set(compute_list, _resources.encode_uniform[channel], 0);
 			_rd->compute_list_set_push_constant(compute_list, push, uint32_t(push.size()));
 			_rd->compute_list_dispatch(compute_list, uint32_t((blocks * blocks + 63) / 64), 1, 1);
-			// The encoder reads the staging layer this frame's bake or cell copy wrote, so
-			// this dispatch has to be ordered after that write, not merely recorded after it.
-			_rd->compute_list_add_barrier(compute_list);
+			// The encoder reads the staging layer this frame's bake or cell copy wrote. The
+			// producer/consumer dependency is tracked on the texture resource; DirectStore's
+			// disjoint buffer writes need no inter-dispatch barrier. The CPU-readback fallback
+			// still records readbacks between dispatches, so it keeps the original barrier.
+			if (!batch_direct_store) {
+				_rd->compute_list_add_barrier(compute_list);
+			}
 			const uint32_t offset = uint32_t(region * _encode_region_bytes);
 			if (direct_store) {
 				// The blocks stay on the GPU: the copy into the sampling array is recorded
