@@ -48,6 +48,8 @@ framebuffer 构造 API 尚未提供。
 `tonemap()` 完成色调映射和输出。`tonemap_deferred()` 将结果留在中间纹理，供 LDR 效果
 处理后调用 `present(texture)`；空名称呈现引擎 tonemap 结果，命名纹理来自管线 scope。
 
+FRP 的 tonemap override 使用 `-1` 继承环境，`0–4` 对应引擎 Linear、Reinhard、Filmic、ACES、AgX；`5` 是现有 UE Filmic（ACES 派生）LUT 路径，FRP Post Process/Tonemap 默认使用它。模式 5 不新增 Pass，也不表示 HDR 显示输出。
+
 接口变更须同步 ClassDB 绑定、插件调用和契约测试，已有 ID、名字与参数语义保持兼容。
 
 ## 调度与参数
@@ -81,9 +83,15 @@ provided 也参与帧特性查询：例如 ID 6 控制 TAA 和 jitter。无显�
 | 纹理 | 数据 |
 |---|---|
 | `normal_roughness` | 10:10:10 法线，alpha 保存动态标记 |
-| `gbuffer_albedo` | 材质 albedo |
-| `gbuffer_orm` | AO、roughness、metallic；alpha 低 4 位为 ShadingModelID，高 4 位预留 selective-output flags |
+| `gbuffer_albedo` | 8-bit BaseColor；采样接口提供线性 Rec.709 值，公共纹理使用 sRGB 视图时由硬件完成存储编码与采样解码 |
+| `gbuffer_orm` | AO、roughness、metallic；alpha 低 4 位为 ShadingModelID，高 4 位为量化后的 `ao_light_affect` |
 | `gbuffer_emission` | emission，alpha 为 specular |
+
+BaseColor 的 `Source.ALBEDO` 按绑定类型选择纹理：采样绑定使用公共 `gbuffer_albedo`；存储图像绑定自动使用私有 `gbuffer_albedo_storage`。存储底图始终是 UNORM。设备支持无复制的 sRGB 共享视图时，公共视图为 sRGB，采样结果为线性 Rec.709；设备不支持所需视图 usage 时，公共视图退回线性 UNORM，仍保留 8-bit 精度。调用方应以公共纹理的实际格式区分这两种合同。
+
+在 sRGB 公共视图路径中，存储图像读写的是未解码的 sRGB 字节码，shader 必须在读取后手动解码、在写入前手动编码；线性 UNORM fallback 不做该转换。MSAA 仍按原深度选择同一个样本；sRGB 路径的 resolve 对 RGB 做一次 OETF 后写入 UNORM 底图，alpha 保持原值且不做 gamma。Fallback 保持线性 UNORM resolve。ORM、法线/粗糙度和 emission 的格式与转换不变。
+
+在 3D ShaderMaterial 的 uniform Variant 上传路径中，MaterialStorage 的 `p_use_linear_color` 转换会把 `Color` 值转为线性空间。已经是线性空间的 uniform 数据应使用 `Vector3`/`Vector4` 传递，避免重复颜色转换。
 
 ORM 为 RGBA8；ShadingModelID 0 表示 Unlit，1 表示 DefaultLit，未知非零值归一化为
 DefaultLit。当前实现默认 BxDF。像素 shading model 与 CPU render-list 的材质排序 ID 独立。
