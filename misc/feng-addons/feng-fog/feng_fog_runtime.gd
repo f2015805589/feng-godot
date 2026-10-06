@@ -73,12 +73,7 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: 
 	var ambient: Variant = sky.get("ambient_radiance")
 	if not ambient is Vector3 or not ambient.is_finite():
 		return
-	var scale_value: Variant = sky.get("height_fog_contribution", 1.0)
-	var contribution_scale := 1.0
-	if scale_value is int or scale_value is float:
-		var authored_scale := float(scale_value)
-		if is_finite(authored_scale):
-			contribution_scale = maxf(authored_scale, 0.0)
+	var contribution_scale := _sky_height_fog_contribution_scale(sky)
 	# snapshot_fields() owns the local schema and normalizes ambient_scale.
 	# Albedo is absent in Legacy Radiance mode, which receives untinted ambient.
 	var albedo: Vector3 = snapshot.get("fog_albedo", Vector3.ONE)
@@ -87,12 +82,19 @@ static func _add_sky_ambient(snapshot: Dictionary, world_id: int, sky_snapshot: 
 	if combined_fog_color.is_finite():
 		snapshot["fog_color"] = combined_fog_color
 
-## Built-in atmosphere skies publish post-transmittance illuminance for their
-## selected directional lights. Use it only when the fog's chosen light is the
-## exact same node; custom skies and unrelated lights retain scene lighting.
-static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallback: Vector3) -> Vector3:
+static func _sky_height_fog_contribution_scale(sky: Dictionary) -> float:
+	var scale_value: Variant = sky.get("height_fog_contribution", 1.0)
+	if scale_value is int or scale_value is float:
+		var authored_scale := float(scale_value)
+		if is_finite(authored_scale):
+			return maxf(authored_scale, 0.0)
+	return 1.0
+
+## Returns post-transmittance illuminance only for the exact atmosphere light
+## selected by the fog node. Null means the normal scene-light fallback applies.
+static func _matched_atmosphere_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary) -> Variant:
 	if sun.light_negative or sky.is_empty() or not bool(sky.get("affect_height_fog", true)):
-		return fallback
+		return null
 	var sun_id := sun.get_instance_id()
 	var value: Variant
 	if int(sky.get("sun_light_id", 0)) == sun_id:
@@ -100,10 +102,17 @@ static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallb
 	elif int(sky.get("secondary_sun_light_id", 0)) == sun_id:
 		value = sky.get("secondary_sun_ground_illuminance")
 	else:
-		return fallback
+		return null
 	if not value is Vector3 or not value.is_finite():
-		return fallback
+		return null
 	return value.max(Vector3.ZERO)
+
+## Built-in atmosphere skies publish post-transmittance illuminance for their
+## selected directional lights. Use it only when the fog's chosen light is the
+## exact same node; custom skies and unrelated lights retain scene lighting.
+static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallback: Vector3) -> Vector3:
+	var matched: Variant = _matched_atmosphere_sun_illuminance(sun, sky)
+	return matched if matched is Vector3 else fallback
 
 static func register(fog: FengHeightFog) -> void:
 	var id := fog.get_instance_id()
@@ -279,15 +288,26 @@ static func _publish() -> void:
 			if use_physical_light_units:
 				linear_sun_color *= sun.get_correlated_color().srgb_to_linear()
 			var sun_rgb := Vector3(linear_sun_color.r, linear_sun_color.g, linear_sun_color.b) * sun_energy
-			sun_rgb = _fog_sun_illuminance(sun, sky_snapshot, sun_rgb)
+			var matched_atmosphere_sun: Variant = _matched_atmosphere_sun_illuminance(sun, sky_snapshot)
+			if matched_atmosphere_sun is Vector3:
+				sun_rgb = matched_atmosphere_sun
 			if snapshot.has("fog_albedo"):
-				# Lit fog uses the selected source light. Sky ambient is already
-				# phase-integrated; direct light gets the isotropic phase.
+				# Custom/unmatched scene lights retain the Lit isotropic source.
+				# A matched atmosphere sun is added to the directional source below.
 				var albedo: Vector3 = snapshot["fog_albedo"]
-				snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
+				if not matched_atmosphere_sun is Vector3:
+					snapshot["fog_color"] += albedo * sun_rgb.max(Vector3.ZERO) / (4.0 * PI)
 			# Both modes use an independent artist lobe scaled by sun luminance.
 			var sun_luminance := sun_rgb.x * 0.2126 + sun_rgb.y * 0.7152 + sun_rgb.z * 0.0722
-			snapshot["inscattering_color"] *= sun_luminance
+			var inscattering_color: Vector3 = snapshot["inscattering_color"] * sun_luminance
+			if snapshot.has("fog_albedo") and matched_atmosphere_sun is Vector3:
+				var contribution_scale := _sky_height_fog_contribution_scale(sky_snapshot)
+				var atmosphere_sun_lobe: Vector3 = snapshot["fog_albedo"] * matched_atmosphere_sun * contribution_scale
+				if atmosphere_sun_lobe.is_finite():
+					var combined_inscattering := inscattering_color + atmosphere_sun_lobe
+					if combined_inscattering.is_finite():
+						inscattering_color = combined_inscattering
+			snapshot["inscattering_color"] = inscattering_color
 		snapshot["world_id"] = world_id
 		snapshot["fog_id"] = entry["id"]
 		snapshot["render_targets"] = _render_targets(entry["world"])

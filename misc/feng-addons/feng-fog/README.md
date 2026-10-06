@@ -14,29 +14,39 @@ without a base light source. The directional artist lobe has its own color.
 
 The runtime constructs scene-linear sources for both rendering paths:
 
-- Base: `albedo * (sky_mean_radiance * height_fog_contribution * sky_ambient_color_scale + sun_irradiance_rgb / (4 * PI))`
-- Directional artist lobe: `directional_color * luminance(sun_irradiance_rgb)`,
-  followed by the shader’s `cos(angle)^exponent / (4 * PI)` phase
+- Base sky source: `albedo * sky_mean_radiance * height_fog_contribution * sky_ambient_color_scale`.
+- An unmatched/custom scene sun remains an isotropic source:
+  `albedo * sun_irradiance_rgb / (4 * PI)`.
+- When the selected sun exactly matches a supported Feng Sky atmosphere light,
+  its post-transmittance ground illuminance is routed through the existing
+  directional phase: `albedo * sun_ground_illuminance * height_fog_contribution * cos(angle)^exponent / (4 * PI)`.
+- The artist lobe remains independent of albedo:
+  `directional_color * luminance(selected_sun_irradiance_rgb)`, followed by the
+  same directional phase.
 
 `sky_atmosphere_ambient_contribution_color_scale` tints only the sky ambient.
-The directional color is authored in scene-linear RGB and is independent of
-base albedo. The pass applies pre-exposure once to the combined source.
+The directional artist color is authored in scene-linear RGB and is independent
+of base albedo. The pass applies pre-exposure once to the combined source.
 
 Sun irradiance uses `light_energy * light_intensity_lux` in physical mode and
 `light_energy * PI` otherwise, with linear light color and physical-mode color
-temperature. Fog uses the selected source light’s authored irradiance. Atmospheric surface
-transmittance and the sky snapshot’s ground illuminance do not alter this fog
-source. Sky mean radiance
-is already phase-integrated and needs no additional `1/(4π)` factor.
+temperature. For a matching atmosphere light, its directional direct term uses
+post-transmittance ground illuminance; the artist lobe keeps the selected
+light's luminance scaling. Sky mean radiance is already phase-integrated and
+needs no additional `1/(4π)` factor.
 
 Without a supported atmosphere provider, the selected sun still lights the fog.
 With neither source, Lit fog has extinction only. `height_fog_contribution = 0`
-or **Affect Height Fog** off removes sky ambient while retaining direct sunlight.
-Camera exposure and light color still determine the final screen brightness.
+removes atmosphere-provided ambient and matched-atmosphere direct light; the
+independent artist lobe remains. **Affect Height Fog** off disables the
+atmosphere contribution while retaining the selected scene sun's fallback
+lighting. Camera exposure and light color still determine final screen brightness.
 
-The optional directional lobe is an artistic addition to isotropic scattering.
-This model does not include multiple scattering, terrain occlusion or
-distance-varying atmospheric aerial perspective.
+The optional directional color remains an artistic addition. For a matched
+atmosphere sun it shares the existing directional phase with that atmosphere's
+albedo-tinted direct source; for an unmatched sun, the direct source remains
+isotropic. This model does not include multiple scattering, terrain occlusion
+or distance-varying atmospheric aerial perspective.
 
 ## Legacy scenes
 
