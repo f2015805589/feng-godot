@@ -45,8 +45,8 @@ Sky ambient is a sampled mean from Feng Sky rather than Unreal's
 distant-sky-light LUT, so the results are not promised to be pixel-identical.
 
 This component does not implement Unreal's fog cubemap/texture, volumetric fog,
-multiple-scattering controls, nonzero optional EndDistance, fog contribution to
-SkyLight captures, or dual-sun directional fog lobes. This documents the
+multiple-scattering controls, nonzero optional EndDistance, SkyLight-capture
+contribution to height fog, or dual-sun directional fog lobes. This documents the
 supported subset, not full Unreal feature parity.
 
 ## Lifecycle and tests
