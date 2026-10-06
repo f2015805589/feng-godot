@@ -762,10 +762,8 @@ void main() {
 		if (use_glow_map) {
 			glow = mix(glow, texture(glow_map, uv_interp).rgb * glow, params.glow_map_strength);
 		}
-		if (use_ue_film_lut) {
-			// UE's film path exposes scene color and bloom together before the LUT.
-			glow *= params.exposure;
-		}
+		// In UE film mode, the first-pass glow producer has already applied exposure.
+		// Scene color was exposed above, so combine them without exposing glow again.
 
 		if (glow_mode_mix) {
 			color.rgb = color.rgb * (1.0 - params.glow_intensity) + glow;
