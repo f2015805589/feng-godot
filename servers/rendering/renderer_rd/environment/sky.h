@@ -103,8 +103,11 @@ private:
 		float border_size[2]; // 8 - 88
 		float luminance_multiplier; // 4 - 92
 		float brightness_multiplier; // 4 - 96
-		// 128 is the max size of a push constant. We can replace "pad" but we can't add any more.
+		float fog_source_pre_exposure; // 4 - 100, applied only to fixed fog source terms.
+		// 128 is the max size of a push constant.
 	};
+	static_assert(sizeof(SkyPushConstant) == 100, "Sky push constant layout changed.");
+	static_assert(sizeof(SkyPushConstant) <= 128, "Sky push constant exceeds the 128-byte limit.");
 
 	struct SkyShaderData : public RendererRD::MaterialStorage::ShaderData {
 		bool valid = false;
@@ -134,7 +137,7 @@ private:
 		virtual ~SkyShaderData();
 	};
 
-	void _render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_modifier, float p_border_size = 0.0);
+	void _render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_modifier, float p_border_size = 0.0, float p_fog_source_pre_exposure = 1.0f);
 
 public:
 	struct SkySceneState {
@@ -319,7 +322,7 @@ public:
 	void setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_size);
 	void update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, const Vector3 &p_global_pos, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0);
 	void update_res_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0);
-	void draw_sky(RD::DrawListID p_draw_list, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, RID p_fb, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0);
+	void draw_sky(RD::DrawListID p_draw_list, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, RID p_fb, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0, float p_fog_source_pre_exposure = 1.0f);
 
 	void invalidate_sky(Sky *p_sky);
 	void update_dirty_skys();

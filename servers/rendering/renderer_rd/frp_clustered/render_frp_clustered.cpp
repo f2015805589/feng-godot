@@ -2246,7 +2246,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
-					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(fog_clear_color));
+					// Material user Color parameters are sRGB-decoded by MaterialStorage; pass this already-linear value as a Vector4.
+					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(Vector4(fog_clear_color.r, fog_clear_color.g, fog_clear_color.b, fog_clear_color.a)));
 				}
 			} break;
 			case RSE::ENV_BG_COLOR: {
@@ -2257,7 +2258,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				clear_color.b *= scene_bg_energy_multiplier;
 				if (!p_render_data->transparent_bg && (rb->has_custom_data(RB_SCOPE_FOG) || environment_get_fog_enabled(p_render_data->environment))) {
 					draw_sky_fog_only = true;
-					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(fog_clear_color));
+					// Material user Color parameters are sRGB-decoded by MaterialStorage; pass this already-linear value as a Vector4.
+					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(Vector4(fog_clear_color.r, fog_clear_color.g, fog_clear_color.b, fog_clear_color.a)));
 				}
 			} break;
 			case RSE::ENV_BG_SKY: {
@@ -2813,7 +2815,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					RD::get_singleton()->draw_command_begin_label("Draw Sky");
 					RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0u, p_render_data->render_region);
 
-					sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier * current_pre_exposure);
+					sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier * current_pre_exposure, current_pre_exposure);
 
 					RD::get_singleton()->draw_list_end();
 					RD::get_singleton()->draw_command_end_label();

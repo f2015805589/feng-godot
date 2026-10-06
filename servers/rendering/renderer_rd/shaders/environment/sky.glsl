@@ -14,6 +14,7 @@ layout(push_constant, std430) uniform Params {
 	vec2 pad;
 	float luminance_multiplier;
 	float brightness_multiplier;
+	float fog_source_pre_exposure;
 }
 params;
 
@@ -48,6 +49,7 @@ layout(push_constant, std430) uniform Params {
 	vec2 border_size;
 	float luminance_multiplier;
 	float brightness_multiplier;
+	float fog_source_pre_exposure;
 }
 params;
 
@@ -159,13 +161,14 @@ vec4 volumetric_fog_process(vec2 screen_uv) {
 }
 
 vec4 fog_process(vec3 view, vec3 sky_color) {
-	vec3 fog_color = mix(sky_scene_data.fog_light_color, sky_color, sky_scene_data.fog_aerial_perspective);
+	// sky_color already includes the sky draw's brightness/pre-exposure; apply this factor only to fixed fog source terms.
+	vec3 fog_color = mix(sky_scene_data.fog_light_color * params.fog_source_pre_exposure, sky_color, sky_scene_data.fog_aerial_perspective);
 
 	if (sky_scene_data.fog_sun_scatter > 0.001) {
 		vec4 sun_scatter = vec4(0.0);
 		float sun_total = 0.0;
 		for (uint i = 0; i < sky_scene_data.directional_light_count; i++) {
-			vec3 light_color = directional_lights.data[i].color_size.xyz * directional_lights.data[i].direction_energy.w;
+			vec3 light_color = directional_lights.data[i].color_size.xyz * directional_lights.data[i].direction_energy.w * params.fog_source_pre_exposure;
 			float light_amount = pow(max(dot(view, directional_lights.data[i].direction_energy.xyz), 0.0), 8.0) * M_PI;
 			fog_color += light_color * light_amount * sky_scene_data.fog_sun_scatter;
 		}
