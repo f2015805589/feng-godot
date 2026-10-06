@@ -51,13 +51,19 @@ func run() -> void:
 	root.add_child(fog)
 	var fog_snapshot := fog.snapshot_fields()
 	FogRuntime._add_sky_ambient(fog_snapshot, 42)
-	if fog_snapshot["fog_color"] != Vector3(2.0, 2.5, 3.0):
+	if fog_snapshot["fog_color"] != Vector3(1.0, 1.5, 2.0):
 		_fail("the fog consumer rejected the provider's gated snapshot or applied its scale incorrectly")
 		return
 	var nonfinite_scale_snapshot := fog.snapshot_fields()
 	FogRuntime._add_sky_ambient(nonfinite_scale_snapshot, 43)
-	if nonfinite_scale_snapshot["fog_color"] != Vector3(3.0, 4.0, 5.0):
+	if nonfinite_scale_snapshot["fog_color"] != Vector3(2.0, 3.0, 4.0):
 		_fail("a non-finite sky contribution scale contaminated the linear fog source")
+		return
+	fog.fog_inscattering_color = Color(1.5, 0.25, 2.0)
+	var authored_source_snapshot := fog.snapshot_fields()
+	FogRuntime._add_sky_ambient(authored_source_snapshot, 42)
+	if authored_source_snapshot["fog_color"] != Vector3(2.5, 1.75, 4.0):
+		_fail("the provider's ambient radiance must add independently to authored linear source")
 		return
 
 	fog.free()
