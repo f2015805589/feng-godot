@@ -2296,6 +2296,20 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 	uint32_t block_size = get_compressed_image_format_block_byte_size(texture->format);
 
 	uint32_t region_size = texture_upload_region_size_px;
+	uint32_t region_width = region_size;
+	// A 64-pixel R16 row occupies 256 bytes on a 256-byte-pitch device even though
+	// it contains only 128 bytes of texels. Here the configured 64 remains the tile
+	// height; the x span intentionally reaches 128 to merge adjacent halves, using
+	// the same per-region staging allocation and avoiding the unused half-row.
+	// This is deliberately limited to the Terrain source-ID layout; other formats,
+	// dimensions, pitch steps, and configured region sizes retain the original tiling.
+	if (texture->format == DATA_FORMAT_R16_UNORM &&
+			(texture->type == TEXTURE_TYPE_2D || texture->type == TEXTURE_TYPE_2D_ARRAY) &&
+			texture->depth == 1 && region_size == 64 && pixel_size == 2 &&
+			block_w == 1 && block_h == 1 && pixel_rshift == 0 &&
+			driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP) == 256) {
+		region_width = 128;
+	}
 
 	const uint8_t *read_ptr = p_data.ptr();
 
@@ -2320,11 +2334,11 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 		for (uint32_t z = 0; z < depth; z++) {
 			const uint8_t *read_ptr_mipmap_layer = read_ptr_mipmap + (tight_mip_size / depth) * z;
 			for (uint32_t y = 0; y < height; y += region_size) {
-				for (uint32_t x = 0; x < width; x += region_size) {
-					uint32_t region_w = MIN(region_size, width - x);
+				for (uint32_t x = 0; x < width; x += region_width) {
+					uint32_t region_w = MIN(region_width, width - x);
 					uint32_t region_h = MIN(region_size, height - y);
 
-					uint32_t region_logic_w = MIN(region_size, logic_width - x);
+					uint32_t region_logic_w = MIN(region_width, logic_width - x);
 					uint32_t region_logic_h = MIN(region_size, logic_height - y);
 
 					uint32_t region_pitch = (region_w * pixel_size * block_w) >> pixel_rshift;
