@@ -73,7 +73,7 @@ public:
 	Resolve(bool p_prefer_raster_effects);
 	~Resolve();
 
-	void resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples, const Vector<RID> &p_source_gbuffer = Vector<RID>(), const Vector<RID> &p_dest_gbuffer = Vector<RID>());
+	void resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples, const Vector<RID> &p_source_gbuffer = Vector<RID>(), const Vector<RID> &p_dest_gbuffer = Vector<RID>(), bool p_encode_gbuffer_albedo_srgb = false);
 	void resolve_depth(RID p_source_depth, RID p_dest_depth, Vector2i p_screen_size, int p_samples);
 	void resolve_depth_raster(RID p_source_rd_texture, RID p_dest_framebuffer, int p_samples);
 };

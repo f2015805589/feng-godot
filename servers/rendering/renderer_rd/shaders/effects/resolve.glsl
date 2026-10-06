@@ -229,7 +229,15 @@ void main() {
 #endif
 #ifdef GBUFFER_RESOLVE
 	// Copy all material channels from the same sample as depth and normal.
-	imageStore(dest_albedo, pos, texelFetch(source_albedo, pos, best_index));
+	vec4 albedo = texelFetch(source_albedo, pos, best_index);
+	if (params.pad != 0u) {
+		// The multisampled source view decodes sRGB on sampling. The resolved storage image
+		// is UNORM, so encode only RGB when FRP selected the sRGB attachment path.
+		vec3 low = albedo.rgb * 12.92;
+		vec3 high = 1.055 * pow(max(albedo.rgb, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+		albedo.rgb = mix(low, high, greaterThan(albedo.rgb, vec3(0.0031308)));
+	}
+	imageStore(dest_albedo, pos, albedo);
 	imageStore(dest_orm, pos, texelFetch(source_orm, pos, best_index));
 	imageStore(dest_emission, pos, texelFetch(source_emission, pos, best_index));
 #endif

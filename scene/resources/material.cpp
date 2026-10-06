@@ -935,11 +935,16 @@ void BaseMaterial3D::_update_shader() {
 	}
 
 	// Generate list of uniforms.
+	// The forced decode below is a manual sRGB-to-linear conversion. Suppress the
+	// sampler's automatic source_color conversion only when that branch will run.
+	const bool manual_force_decode = flags[FLAG_ALBEDO_TEXTURE_FORCE_SRGB] &&
+			!(flags[FLAG_ALBEDO_TEXTURE_MSDF] && !flags[FLAG_UV1_USE_TRIPLANAR]);
+	const String albedo_texture_color_hint = manual_force_decode ? String() : String("source_color, ");
 	code += vformat(R"(
 uniform vec4 albedo : source_color;
-uniform sampler2D texture_albedo : source_color, %s;
+uniform sampler2D texture_albedo : %s%s;
 )",
-			texfilter_str);
+			albedo_texture_color_hint, texfilter_str);
 
 	if (grow_enabled) {
 		code += "uniform float grow : hint_range(-16.0, 16.0, 0.001);\n";

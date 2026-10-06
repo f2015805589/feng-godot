@@ -2427,6 +2427,7 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	tex_info->vk_view = vk_image_view;
 	tex_info->rd_format = p_format.format;
 	tex_info->vk_create_info = create_info;
+	image_view_create_info.pNext = nullptr;
 	tex_info->vk_view_create_info = image_view_create_info;
 	tex_info->allocation.handle = allocation;
 	tex_info->is_subsampled = (create_info.flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) != 0;
@@ -2472,11 +2473,82 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_from_extension(uint64
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->vk_view = vk_image_view;
 	tex_info->rd_format = p_format;
+	image_view_create_info.pNext = nullptr;
 	tex_info->vk_view_create_info = image_view_create_info;
 #ifdef DEBUG_ENABLED
 	tex_info->created_from_extension = true;
 #endif
 	return TextureID(tex_info);
+}
+
+bool RenderingDeviceDriverVulkan::_shared_view_usage_override_supported() const {
+	const uint32_t effective_api_version = MIN(context_driver->instance_api_version_get(), physical_device_properties.apiVersion);
+	return effective_api_version >= VK_API_VERSION_1_1 || enabled_device_extension_names.has(VK_KHR_MAINTENANCE_2_EXTENSION_NAME);
+}
+
+VkImageUsageFlags RenderingDeviceDriverVulkan::_shared_view_usage_for_format(const TextureInfo *p_texture, DataFormat p_format) const {
+	ERR_FAIL_NULL_V(p_texture, 0);
+	VkImageUsageFlags usage = p_texture->vk_create_info.usage;
+	if (usage == 0) {
+		return 0;
+	}
+
+	VkFormatProperties properties = {};
+	vkGetPhysicalDeviceFormatProperties(physical_device, RD_TO_VK_FORMAT[p_format], &properties);
+	const VkFormatFeatureFlags &supported_flags = p_texture->vk_create_info.tiling == VK_IMAGE_TILING_LINEAR ? properties.linearTilingFeatures : properties.optimalTilingFeatures;
+
+	if ((usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !(supported_flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_SAMPLED_BIT);
+	}
+	if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(supported_flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_STORAGE_BIT);
+	}
+	if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(supported_flags & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+	}
+	if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && !(supported_flags & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+	}
+	if ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) && !(supported_flags & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+	}
+	if ((usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) && !(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+	}
+	if (p_format != DATA_FORMAT_R8_UINT && p_format != DATA_FORMAT_R8G8_UNORM) {
+		usage &= ~uint32_t(VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
+		usage &= ~uint32_t(VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT);
+	}
+	return usage;
+}
+
+bool RenderingDeviceDriverVulkan::_configure_shared_view_create_info(const TextureInfo *p_texture, DataFormat p_format, VkImageViewCreateInfo &r_view_info, VkImageViewUsageCreateInfo &r_usage_info, VkImageViewASTCDecodeModeEXT &r_astc_decode_info) const {
+	r_view_info.pNext = nullptr;
+	const VkImageUsageFlags original_usage = p_texture->vk_create_info.usage;
+	const bool format_changed = r_view_info.format != p_texture->vk_view_create_info.format;
+	if (original_usage != 0 && format_changed) {
+		const VkImageUsageFlags view_usage = _shared_view_usage_for_format(p_texture, p_format);
+		const bool usage_override_supported = _shared_view_usage_override_supported();
+		if (view_usage == 0 || (view_usage != original_usage && !usage_override_supported)) {
+			return false;
+		}
+		if (usage_override_supported) {
+			r_usage_info = {};
+			r_usage_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+			r_usage_info.usage = view_usage;
+			r_view_info.pNext = &r_usage_info;
+		}
+	}
+
+	if (enabled_device_extension_names.has(VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME) &&
+			r_view_info.format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && r_view_info.format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {
+		r_astc_decode_info = {};
+		r_astc_decode_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT;
+		r_astc_decode_info.pNext = r_view_info.pNext;
+		r_astc_decode_info.decodeMode = VK_FORMAT_R8G8B8A8_UNORM;
+		r_view_info.pNext = &r_astc_decode_info;
+	}
+	return true;
 }
 
 RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared(TextureID p_original_texture, const TextureView &p_view) {
@@ -2491,31 +2563,9 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared(TextureID p_or
 	image_view_create_info.components.b = (VkComponentSwizzle)p_view.swizzle_b;
 	image_view_create_info.components.a = (VkComponentSwizzle)p_view.swizzle_a;
 
-	if (enabled_device_extension_names.has(VK_KHR_MAINTENANCE_2_EXTENSION_NAME)) {
-		// May need to make VK_KHR_maintenance2 mandatory and thus has Vulkan 1.1 be our minimum supported version
-		// if we require setting this information. Vulkan 1.0 may simply not care.
-		if (image_view_create_info.format != owner_tex_info->vk_view_create_info.format) {
-			VkImageViewUsageCreateInfo *usage_info = ALLOCA_SINGLE(VkImageViewUsageCreateInfo);
-			*usage_info = {};
-			usage_info->sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
-			usage_info->usage = owner_tex_info->vk_create_info.usage;
-
-			// Certain features may not be available for the format of the view.
-			{
-				VkFormatProperties properties = {};
-				vkGetPhysicalDeviceFormatProperties(physical_device, RD_TO_VK_FORMAT[p_view.format], &properties);
-				const VkFormatFeatureFlags &supported_flags = owner_tex_info->vk_create_info.tiling == VK_IMAGE_TILING_LINEAR ? properties.linearTilingFeatures : properties.optimalTilingFeatures;
-				if ((usage_info->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(supported_flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
-					usage_info->usage &= ~uint32_t(VK_IMAGE_USAGE_STORAGE_BIT);
-				}
-				if ((usage_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(supported_flags & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
-					usage_info->usage &= ~uint32_t(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-				}
-			}
-
-			image_view_create_info.pNext = usage_info;
-		}
-	}
+	VkImageViewUsageCreateInfo usage_info = {};
+	VkImageViewASTCDecodeModeEXT astc_decode_info = {};
+	ERR_FAIL_COND_V_MSG(!_configure_shared_view_create_info(owner_tex_info, p_view.format, image_view_create_info, usage_info, astc_decode_info), TextureID(), "Shared image view format cannot represent the source image usage.");
 
 	VkImageView new_vk_image_view = VK_NULL_HANDLE;
 	VkResult err = vkCreateImageView(vk_device, &image_view_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_IMAGE_VIEW), &new_vk_image_view);
@@ -2526,6 +2576,8 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared(TextureID p_or
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	*tex_info = *owner_tex_info;
 	tex_info->vk_view = new_vk_image_view;
+	tex_info->rd_format = p_view.format;
+	image_view_create_info.pNext = nullptr;
 	tex_info->vk_view_create_info = image_view_create_info;
 	tex_info->allocation = {};
 
@@ -2569,6 +2621,9 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared_from_slice(Tex
 	image_view_create_info.subresourceRange.levelCount = p_mipmaps;
 	image_view_create_info.subresourceRange.baseArrayLayer = p_layer;
 	image_view_create_info.subresourceRange.layerCount = p_layers;
+	VkImageViewUsageCreateInfo usage_info = {};
+	VkImageViewASTCDecodeModeEXT astc_decode_info = {};
+	ERR_FAIL_COND_V_MSG(!_configure_shared_view_create_info(owner_tex_info, p_view.format, image_view_create_info, usage_info, astc_decode_info), TextureID(), "Shared image slice format cannot represent the source image usage.");
 
 	VkImageView new_vk_image_view = VK_NULL_HANDLE;
 	VkResult err = vkCreateImageView(vk_device, &image_view_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_IMAGE_VIEW), &new_vk_image_view);
@@ -2579,6 +2634,8 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared_from_slice(Tex
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	*tex_info = *owner_tex_info;
 	tex_info->vk_view = new_vk_image_view;
+	tex_info->rd_format = p_view.format;
+	image_view_create_info.pNext = nullptr;
 	tex_info->vk_view_create_info = image_view_create_info;
 	tex_info->allocation = {};
 
@@ -2736,7 +2793,23 @@ BitField<RDD::TextureUsageBits> RenderingDeviceDriverVulkan::texture_get_usages_
 
 bool RenderingDeviceDriverVulkan::texture_can_make_shared_with_format(TextureID p_texture, DataFormat p_format, bool &r_raw_reinterpretation) {
 	r_raw_reinterpretation = false;
-	return true;
+	const TextureInfo *texture_info = (const TextureInfo *)p_texture.id;
+	if (texture_info == nullptr) {
+		return false;
+	}
+
+	// External textures do not provide their image usage to RenderingDevice. Preserve
+	// their existing view behavior rather than manufacturing an empty usage override.
+	const VkImageUsageFlags original_usage = texture_info->vk_create_info.usage;
+	if (original_usage == 0) {
+		return true;
+	}
+
+	const VkImageUsageFlags view_usage = _shared_view_usage_for_format(texture_info, p_format);
+	if (view_usage == 0) {
+		return false;
+	}
+	return view_usage == original_usage || _shared_view_usage_override_supported();
 }
 
 /*****************/

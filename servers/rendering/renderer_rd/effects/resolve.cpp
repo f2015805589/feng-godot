@@ -71,7 +71,7 @@ Resolve::~Resolve() {
 	}
 }
 
-void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples, const Vector<RID> &p_source_gbuffer, const Vector<RID> &p_dest_gbuffer) {
+void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples, const Vector<RID> &p_source_gbuffer, const Vector<RID> &p_dest_gbuffer, bool p_encode_gbuffer_albedo_srgb) {
 	ERR_FAIL_COND_MSG(prefer_raster_effects, "Can't use the compute shader resolve with the mobile renderer.");
 
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -83,6 +83,7 @@ void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID 
 	push_constant.screen_size[0] = p_screen_size.x;
 	push_constant.screen_size[1] = p_screen_size.y;
 	push_constant.samples = p_samples;
+	push_constant.pad = p_encode_gbuffer_albedo_srgb ? 1u : 0u;
 
 	// setup our uniforms
 	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
@@ -144,6 +145,7 @@ void Resolve::resolve_depth(RID p_source_depth, RID p_dest_depth, Vector2i p_scr
 	push_constant.screen_size[0] = p_screen_size.x;
 	push_constant.screen_size[1] = p_screen_size.y;
 	push_constant.samples = p_samples;
+	push_constant.pad = 0;
 
 	// setup our uniforms
 	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);

@@ -151,10 +151,44 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_gbuffer() {
 	ERR_FAIL_NULL(render_buffers);
 
 	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO)) {
+		gbuffer_albedo_srgb = false;
 		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
-		render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, get_gbuffer_albedo_format(), get_gbuffer_albedo_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+
+		// Keep the write/read image as UNORM for storage-image resolves and compute passes.
+		// The public GBuffer name is a no-copy sRGB view when the device supports it.
+		RD::TextureFormat albedo_storage_format;
+		albedo_storage_format.format = get_gbuffer_albedo_format();
+		albedo_storage_format.width = render_buffers->get_internal_size().x;
+		albedo_storage_format.height = render_buffers->get_internal_size().y;
+		albedo_storage_format.depth = 1;
+		albedo_storage_format.array_layers = render_buffers->get_view_count();
+		albedo_storage_format.texture_type = render_buffers->get_view_count() > 1 ? RD::TEXTURE_TYPE_2D_ARRAY : RD::TEXTURE_TYPE_2D;
+		albedo_storage_format.mipmaps = 1;
+		albedo_storage_format.samples = RD::TEXTURE_SAMPLES_1;
+		albedo_storage_format.usage_bits = get_gbuffer_albedo_usage_bits(msaa, false, render_buffers->get_can_be_storage());
+		albedo_storage_format.shareable_formats.push_back(RD::DATA_FORMAT_R8G8B8A8_UNORM);
+		albedo_storage_format.shareable_formats.push_back(RD::DATA_FORMAT_R8G8B8A8_SRGB);
+		RID albedo_storage = render_buffers->create_texture_from_format(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_STORAGE, albedo_storage_format);
+		ERR_FAIL_COND(albedo_storage.is_null());
+
+		RD *rd = RD::get_singleton();
+		const uint32_t public_albedo_usage = get_gbuffer_albedo_usage_bits(false, false, false);
+		const uint32_t msaa_albedo_usage = get_gbuffer_albedo_usage_bits(false, true, false);
+		gbuffer_albedo_srgb = rd->texture_can_create_shared_with_format(albedo_storage, RD::DATA_FORMAT_R8G8B8A8_SRGB) &&
+				rd->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R8G8B8A8_SRGB, public_albedo_usage) &&
+				(!msaa || rd->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R8G8B8A8_SRGB, msaa_albedo_usage));
+
+		RD::TextureView albedo_view;
+		if (gbuffer_albedo_srgb) {
+			albedo_view.format_override = RD::DATA_FORMAT_R8G8B8A8_SRGB;
+		}
+		RID public_albedo = render_buffers->create_texture_view(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_STORAGE, RB_TEX_GBUFFER_ALBEDO, albedo_view);
+		ERR_FAIL_COND(public_albedo.is_null());
+
 		if (msaa) {
-			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, get_gbuffer_albedo_format(), get_gbuffer_albedo_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+			const RD::DataFormat msaa_albedo_format = gbuffer_albedo_srgb ? RD::DATA_FORMAT_R8G8B8A8_SRGB : get_gbuffer_albedo_format();
+			const uint32_t msaa_albedo_usage_bits = get_gbuffer_albedo_usage_bits(false, msaa, gbuffer_albedo_srgb ? false : render_buffers->get_can_be_storage());
+			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, msaa_albedo_format, msaa_albedo_usage_bits, render_buffers->get_texture_samples());
 		}
 	}
 	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM)) {
@@ -2550,7 +2584,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RD::get_singleton()->draw_command_begin_label("Resolve Depth Pre-Pass (MSAA)");
 						if (depth_pass_mode == PASS_MODE_GBUFFER) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), RID(), rb->get_internal_size(), texture_multisamples[msaa], Vector<RID>({ rb_data->get_gbuffer_albedo_msaa(v), rb_data->get_gbuffer_orm_msaa(v), rb_data->get_gbuffer_emission_msaa(v) }), Vector<RID>({ rb_data->get_gbuffer_albedo(v), rb_data->get_gbuffer_orm(v), rb_data->get_gbuffer_emission(v) }));
+								resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), RID(), rb->get_internal_size(), texture_multisamples[msaa], Vector<RID>({ rb_data->get_gbuffer_albedo_msaa(v), rb_data->get_gbuffer_orm_msaa(v), rb_data->get_gbuffer_emission_msaa(v) }), Vector<RID>({ rb_data->get_gbuffer_albedo_storage(v), rb_data->get_gbuffer_orm(v), rb_data->get_gbuffer_emission(v) }), rb_data->is_gbuffer_albedo_srgb());
 							}
 						} else if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {

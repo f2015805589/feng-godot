@@ -290,6 +290,10 @@ public:
 #endif
 	};
 
+	bool _shared_view_usage_override_supported() const;
+	VkImageUsageFlags _shared_view_usage_for_format(const TextureInfo *p_texture, DataFormat p_format) const;
+	bool _configure_shared_view_create_info(const TextureInfo *p_texture, DataFormat p_format, VkImageViewCreateInfo &r_view_info, VkImageViewUsageCreateInfo &r_usage_info, VkImageViewASTCDecodeModeEXT &r_astc_decode_info) const;
+
 	VkSampleCountFlagBits _ensure_supported_sample_count(TextureSamples p_requested_sample_count);
 
 public:

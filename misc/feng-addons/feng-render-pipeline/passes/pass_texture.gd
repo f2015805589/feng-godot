@@ -90,7 +90,8 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 		Source.NORMAL_ROUGHNESS:
 			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_NORMAL_ROUGHNESS, view)
 		Source.ALBEDO:
-			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_ALBEDO, view)
+			var albedo_name: StringName = &"gbuffer_albedo_storage" if binding_type == BindingType.STORAGE_IMAGE else NativeSpec.TEX_GBUFFER_ALBEDO
+			return _get_named_texture(buffers, FRP_SCOPE, albedo_name, view, true)
 		Source.ORM:
 			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_ORM, view)
 		Source.EMISSION:
@@ -103,7 +104,7 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 			return _get_named_texture(buffers, custom_scope, custom_name, view)
 	return RID()
 
-func _get_named_texture(buffers: RenderSceneBuffersRD, scope: StringName, texture_name: StringName, view: int) -> RID:
+func _get_named_texture(buffers: RenderSceneBuffersRD, scope: StringName, texture_name: StringName, view: int, explicit_format_view: bool = false) -> RID:
 	if scope == &"" or texture_name == &"" or not buffers.has_texture(scope, texture_name):
 		return RID()
 	var texture_format = buffers.get_texture_format(scope, texture_name)
@@ -111,6 +112,14 @@ func _get_named_texture(buffers: RenderSceneBuffersRD, scope: StringName, textur
 		if view == 0:
 			return buffers.get_texture(scope, texture_name)
 		return RID()
+	if texture_format.array_layers == 1 and view == 0:
+		return buffers.get_texture(scope, texture_name)
+	if explicit_format_view:
+		# RD slice creation resolves a shared view to its backing texture. Reapply the
+		# named view's actual format so sRGB sampling remains explicit per array layer.
+		var texture_view := RDTextureView.new()
+		texture_view.format_override = texture_format.format
+		return buffers.get_texture_slice_view(scope, texture_name, view, 0, 1, 1, texture_view)
 	return buffers.get_texture_slice(scope, texture_name, view, 0, 1, 1)
 
 func get_configuration_warnings() -> PackedStringArray:

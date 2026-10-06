@@ -174,6 +174,7 @@ public:
 	};
 
 	VkInstance instance_get() const;
+	uint32_t instance_api_version_get() const { return instance_api_version; }
 	VkPhysicalDevice physical_device_get(uint32_t p_device_index) const;
 	uint32_t queue_family_get_count(uint32_t p_device_index) const;
 	VkQueueFamilyProperties queue_family_get(uint32_t p_device_index, uint32_t p_queue_family_index) const;

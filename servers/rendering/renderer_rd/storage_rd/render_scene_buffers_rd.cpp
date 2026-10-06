@@ -96,7 +96,7 @@ void RenderSceneBuffersRD::update_sizes(NamedTexture &p_named_texture) {
 }
 
 void RenderSceneBuffersRD::free_named_texture(NamedTexture &p_named_texture) {
-	if (p_named_texture.texture.is_valid()) {
+	if (p_named_texture.texture.is_valid() && RD::get_singleton()->texture_is_valid(p_named_texture.texture)) {
 		RD::get_singleton()->free_rid(p_named_texture.texture);
 	}
 	p_named_texture.texture = RID();
@@ -381,11 +381,15 @@ RID RenderSceneBuffersRD::create_texture_view(const StringName &p_context, const
 	view_texture.is_unique = named_texture.is_unique;
 
 	view_texture.texture = RD::get_singleton()->texture_create_shared(p_view, named_texture.texture);
+	if (view_texture.texture.is_valid()) {
+		// A shared view can have a different format and supported-usage mask than its backing texture.
+		view_texture.format = RD::get_singleton()->texture_get_format(view_texture.texture);
+	}
 
 	Array arr = { p_context, p_view_name };
 	RD::get_singleton()->set_resource_name(view_texture.texture, String("RenderBuffer View {0}/{1}").format(arr));
 
-	update_sizes(named_texture);
+	update_sizes(view_texture);
 
 	return view_texture.texture;
 }

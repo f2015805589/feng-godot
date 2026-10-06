@@ -1836,6 +1836,9 @@ RID RenderingDevice::texture_create_shared(const TextureView &p_view, RID p_with
 	}
 
 	ERR_FAIL_COND_V(!texture.driver_id, RID());
+	if (create_shared && texture.format != tv.format) {
+		_texture_apply_shared_view_format(&texture, tv.format);
+	}
 
 	if (texture.draw_tracker != nullptr) {
 		texture.draw_tracker->reference_count++;
@@ -1849,6 +1852,34 @@ RID RenderingDevice::texture_create_shared(const TextureView &p_view, RID p_with
 	_add_dependency(id, p_with_texture);
 
 	return id;
+}
+
+void RenderingDevice::_texture_apply_shared_view_format(Texture *p_texture, DataFormat p_format) {
+	ERR_FAIL_NULL(p_texture);
+	const bool cpu_readable = p_texture->usage_flags & TEXTURE_USAGE_CPU_READ_BIT;
+	p_texture->format = p_format;
+	p_texture->usage_flags &= uint32_t(driver->texture_get_usages_supported_by_format(p_format, cpu_readable));
+}
+
+bool RenderingDevice::texture_can_create_shared_with_format(RID p_texture, DataFormat p_format) {
+	ERR_RENDER_THREAD_GUARD_V(false);
+	Texture *texture = texture_owner.get_or_null(p_texture);
+	ERR_FAIL_NULL_V(texture, false);
+	ERR_FAIL_INDEX_V(p_format, DATA_FORMAT_MAX, false);
+
+	if (texture->owner.is_valid()) {
+		texture = texture_owner.get_or_null(texture->owner);
+		ERR_FAIL_NULL_V(texture, false);
+	}
+	if (p_format == texture->format) {
+		return true;
+	}
+	if (!texture->allowed_shared_formats.has(p_format)) {
+		return false;
+	}
+
+	bool raw_reinterpretation = false;
+	return driver->texture_can_make_shared_with_format(texture->driver_id, p_format, raw_reinterpretation);
 }
 
 RID RenderingDevice::texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps) {
@@ -2016,6 +2047,9 @@ RID RenderingDevice::texture_create_shared_from_slice(const TextureView &p_view,
 	}
 
 	ERR_FAIL_COND_V(!texture.driver_id, RID());
+	if (create_shared && texture.format != tv.format) {
+		_texture_apply_shared_view_format(&texture, tv.format);
+	}
 
 	const Rect2i slice_rect(p_mipmap, p_layer, p_mipmaps, slice_layers);
 	texture.owner = p_with_texture;

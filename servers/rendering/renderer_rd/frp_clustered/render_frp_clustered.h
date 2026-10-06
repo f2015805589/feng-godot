@@ -62,6 +62,7 @@
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
+#define RB_TEX_GBUFFER_ALBEDO_STORAGE SNAME("gbuffer_albedo_storage")
 #define RB_TEX_GBUFFER_ALBEDO_MSAA SNAME("gbuffer_albedo_msaa")
 #define RB_TEX_GBUFFER_ORM SNAME("gbuffer_orm")
 #define RB_TEX_GBUFFER_ORM_MSAA SNAME("gbuffer_orm_msaa")
@@ -109,6 +110,7 @@ public:
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
+		bool gbuffer_albedo_srgb = false;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
@@ -155,7 +157,16 @@ public:
 		void ensure_gbuffer();
 		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
 		RID get_gbuffer_albedo() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO); }
-		RID get_gbuffer_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, p_layer, 0); }
+		RID get_gbuffer_albedo(uint32_t p_layer) {
+			RD::TextureView view;
+			if (gbuffer_albedo_srgb) {
+				view.format_override = RD::DATA_FORMAT_R8G8B8A8_SRGB;
+			}
+			return render_buffers->get_texture_slice_view(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO, p_layer, 0, 1, 1, view);
+		}
+		RID get_gbuffer_albedo_storage() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_STORAGE); }
+		RID get_gbuffer_albedo_storage(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_STORAGE, p_layer, 0); }
+		bool is_gbuffer_albedo_srgb() const { return gbuffer_albedo_srgb; }
 		RID get_gbuffer_albedo_msaa() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA); }
 		RID get_gbuffer_albedo_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ALBEDO_MSAA, p_layer, 0); }
 		RID get_gbuffer_orm() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_GBUFFER_ORM); }
