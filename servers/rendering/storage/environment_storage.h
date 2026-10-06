@@ -86,6 +86,7 @@ private:
 		RSE::EnvironmentToneMapper tone_mapper;
 		float exposure = 1.0;
 		float white = 1.0;
+		float agx_white = 1.0;
 		float tonemap_agx_contrast = 1.25; // Default to approximately Blender's AgX contrast
 		float max_value = 1.0;
 
@@ -226,6 +227,7 @@ public:
 
 	// Tonemap
 	void environment_set_tonemap(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white);
+	void environment_set_tonemap_with_authored_whites(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white, float p_agx_white);
 	RSE::EnvironmentToneMapper environment_get_tone_mapper(RID p_env) const;
 	float environment_get_exposure(RID p_env) const;
 	float environment_get_white(RID p_env, bool p_limit_agx_white, float p_output_max_value, int p_tonemap_mode_override = -1) const;

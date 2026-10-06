@@ -429,6 +429,10 @@ void RendererSceneRender::environment_set_tonemap(RID p_env, RSE::EnvironmentTon
 	environment_storage.environment_set_tonemap(p_env, p_tone_mapper, p_exposure, p_white);
 }
 
+void RendererSceneRender::environment_set_tonemap_with_authored_whites(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white, float p_agx_white) {
+	environment_storage.environment_set_tonemap_with_authored_whites(p_env, p_tone_mapper, p_exposure, p_white, p_agx_white);
+}
+
 RSE::EnvironmentToneMapper RendererSceneRender::environment_get_tone_mapper(RID p_env) const {
 	return environment_storage.environment_get_tone_mapper(p_env);
 }

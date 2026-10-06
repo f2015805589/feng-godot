@@ -64,16 +64,14 @@ func run() -> void:
 	sphere.height = 2.0
 	mesh.mesh = sphere
 	var material := StandardMaterial3D.new()
-	material.albedo_color = Color(0.8, 0.8, 0.8)
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color(0.4, 0.4, 0.4)
 	mesh.material_override = material
 	scene.add_child(mesh)
 
 	environment = Environment.new()
 	environment.background_mode = Environment.BG_COLOR
 	environment.background_color = Color(0.05, 0.1, 0.15)
-	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	environment.ambient_light_color = Color.WHITE
-	environment.ambient_light_energy = 1.0
 	environment.tonemap_exposure = 1.0
 	# A non-identity tone mapper: with the default Linear one an HDR 1.0 is already
 	# screen white, so "the overlay's write was tone mapped" would not be measurable.
@@ -88,9 +86,17 @@ func run() -> void:
 	var compositor := Compositor.new()
 	camera.compositor = compositor
 	renderer.apply(compositor)
+	var native_taa_disabled := false
+	var eye_adaptation_disabled := false
 	for pass_entry in renderer.passes:
 		if String(pass_entry.stable_id) == "library:eye_adaptation":
 			pass_entry.enabled = false
+			eye_adaptation_disabled = true
+		if pass_entry.get("native_id") != null and int(pass_entry.native_id) == 6:
+			pass_entry.enabled = false
+			native_taa_disabled = true
+	require(native_taa_disabled, "renderer does not expose native TAA entry 6")
+	require(eye_adaptation_disabled, "renderer does not expose Eye Adaptation")
 	renderer.apply(compositor)
 	require(renderer.get_validation_warnings().is_empty(), "the default pipeline must validate clean: %s" % [renderer.get_validation_warnings()])
 
@@ -184,7 +190,7 @@ func run() -> void:
 	var restored_pixel := restored.get_pixelv(CENTER)
 	require(restored_pixel.r > 0.3 and restored_pixel.r > restored_pixel.g + 0.15, "switching the overlay back on did not restore its effect: %s" % [restored_pixel])
 
-	# 5. Removing the overlay restores the engine's own frame: the lit sphere again,
+	# 5. Removing the overlay restores the engine's own frame: the gray sphere again,
 	#    neither the toned red nor the presented green.
 	post_script.overlay = null
 	renderer.apply(compositor)

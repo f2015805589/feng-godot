@@ -85,6 +85,45 @@ TEST_CASE("[Rendering] Explicit native tonemap overrides use their own parameter
 	storage.environment_free(source_env);
 }
 
+TEST_CASE("[Rendering] Explicit native overrides select the authored white for their effective mode") {
+	RendererEnvironmentStorage storage;
+	RID source_env = storage.environment_allocate();
+	storage.environment_initialize(source_env);
+	storage.environment_set_tonemap_with_authored_whites(source_env, RSE::ENV_TONE_MAPPER_AGX, 1.0f, 1.0f, 16.29f);
+
+	for (int mode = RSE::ENV_TONE_MAPPER_LINEAR; mode <= RSE::ENV_TONE_MAPPER_AGX; mode++) {
+		const RSE::EnvironmentToneMapper effective_mode = RSE::EnvironmentToneMapper(mode);
+		const float expected_authored_white = effective_mode == RSE::ENV_TONE_MAPPER_AGX ? 16.29f : 1.0f;
+
+		RID matching_env = storage.environment_allocate();
+		storage.environment_initialize(matching_env);
+		storage.environment_set_tonemap(matching_env, effective_mode, 1.0f, expected_authored_white);
+
+		const RendererEnvironmentStorage::TonemapParameters overridden = storage.environment_get_tonemap_parameters(source_env, false, 1.0f, mode);
+		const RendererEnvironmentStorage::TonemapParameters expected = storage.environment_get_tonemap_parameters(matching_env, false, 1.0f);
+		check_tonemap_parameters_equal(overridden, expected);
+		CHECK_EQ(storage.environment_get_white(source_env, false, 1.0f, mode), storage.environment_get_white(matching_env, false, 1.0f));
+
+		storage.environment_free(matching_env);
+	}
+
+	// Inherit mode continues to use the current Environment mapper and its authored white.
+	const RendererEnvironmentStorage::TonemapParameters inherited = storage.environment_get_tonemap_parameters(source_env, false, 1.0f);
+	const RendererEnvironmentStorage::TonemapParameters inherited_expected = storage.environment_get_tonemap_parameters(source_env, false, 1.0f, RSE::ENV_TONE_MAPPER_AGX);
+	check_tonemap_parameters_equal(inherited, inherited_expected);
+	CHECK_EQ(storage.environment_get_white(source_env, false, 1.0f), 16.29f);
+
+	// No Environment keeps the legacy authored-white fallback of 1.0 (AgX's existing minimum still applies).
+	CHECK_EQ(storage.environment_get_white(RID(), false, 1.0f, RSE::ENV_TONE_MAPPER_AGX), 2.0f);
+
+	// A storage Environment not synchronized from a scene Resource also defaults to white 1.0.
+	RID default_storage_env = storage.environment_allocate();
+	storage.environment_initialize(default_storage_env);
+	CHECK_EQ(storage.environment_get_white(default_storage_env, false, 1.0f, RSE::ENV_TONE_MAPPER_AGX), 2.0f);
+	storage.environment_free(default_storage_env);
+	storage.environment_free(source_env);
+}
+
 TEST_CASE("[Rendering] UE 5.8 SDR film LUT keeps highlight headroom and finite texels") {
 	const Vector<uint8_t> lut = RendererRD::ToneMapperUEFilmLUT::build_data();
 	const int expected_size = RendererRD::ToneMapperUEFilmLUT::SIZE * RendererRD::ToneMapperUEFilmLUT::SIZE * RendererRD::ToneMapperUEFilmLUT::SIZE * 4 * int(sizeof(uint16_t));
@@ -92,18 +131,21 @@ TEST_CASE("[Rendering] UE 5.8 SDR film LUT keeps highlight headroom and finite t
 
 	const uint8_t *bytes = lut.ptr();
 	bool all_finite = true;
-	bool has_encoded_headroom = false;
+	bool rgb_payload_in_range = true;
+	bool has_restored_headroom = false;
 	for (int i = 0; i < expected_size / int(sizeof(uint16_t)); i++) {
 		uint16_t half_value;
 		std::memcpy(&half_value, bytes + i * int(sizeof(uint16_t)), sizeof(half_value));
 		const float value = Math::half_to_float(half_value);
 		all_finite &= std::isfinite(value);
 		if ((i % 4) != 3) {
-			has_encoded_headroom |= value > 1.0f;
+			rgb_payload_in_range &= value >= 0.0f && value <= 1.0f;
+			has_restored_headroom |= value * 1.05f > 1.0f;
 		}
 	}
 	CHECK(all_finite);
-	CHECK(has_encoded_headroom);
+	CHECK(rgb_payload_in_range);
+	CHECK(has_restored_headroom);
 
 	auto read_gray = [&](int p_index) {
 		const int texel = ((p_index * RendererRD::ToneMapperUEFilmLUT::SIZE + p_index) * RendererRD::ToneMapperUEFilmLUT::SIZE + p_index) * 4;
@@ -113,10 +155,11 @@ TEST_CASE("[Rendering] UE 5.8 SDR film LUT keeps highlight headroom and finite t
 		std::memcpy(&red, bytes + (texel + 0) * int(sizeof(uint16_t)), sizeof(red));
 		std::memcpy(&green, bytes + (texel + 1) * int(sizeof(uint16_t)), sizeof(green));
 		std::memcpy(&blue, bytes + (texel + 2) * int(sizeof(uint16_t)), sizeof(blue));
-		return (Math::half_to_float(red) + Math::half_to_float(green) + Math::half_to_float(blue)) / 3.0f;
+		return ((Math::half_to_float(red) + Math::half_to_float(green) + Math::half_to_float(blue)) * 1.05f) / 3.0f;
 	};
+	// Sampling restores the 1.05 scale after 10-bit UNORM-emulated storage.
 	// Log-lattice samples near 18% gray, diffuse white, and a highlight across
-	// the shoulder must remain ordered after sRGB-encoded LUT quantization.
+	// the shoulder must remain ordered after that scale is restored.
 	CHECK_LE(read_gray(14), read_gray(19));
 	CHECK_LE(read_gray(19), read_gray(23));
 }

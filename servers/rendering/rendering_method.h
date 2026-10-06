@@ -197,6 +197,7 @@ public:
 
 	// Tonemap
 	virtual void environment_set_tonemap(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white) = 0;
+	virtual void environment_set_tonemap_with_authored_whites(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white, float p_agx_white) = 0;
 	virtual void environment_set_tonemap_agx_contrast(RID p_env, float p_agx_contrast) = 0;
 
 	virtual RSE::EnvironmentToneMapper environment_get_tone_mapper(RID p_env) const = 0;

@@ -251,11 +251,12 @@ float Environment::get_tonemap_agx_contrast() const {
 }
 
 void Environment::_update_tonemap() {
-	RS::get_singleton()->environment_set_tonemap(
+	RS::get_singleton()->environment_set_tonemap_with_authored_whites(
 			environment,
 			RSE::EnvironmentToneMapper(tone_mapper),
 			tonemap_exposure,
-			tone_mapper == TONE_MAPPER_AGX ? tonemap_agx_white : tonemap_white);
+			tonemap_white,
+			tonemap_agx_white);
 }
 
 // SSR

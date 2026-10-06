@@ -208,11 +208,16 @@ int RendererEnvironmentStorage::environment_get_camera_feed_id(RID p_env) const 
 // Tonemap
 
 void RendererEnvironmentStorage::environment_set_tonemap(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white) {
+	environment_set_tonemap_with_authored_whites(p_env, p_tone_mapper, p_exposure, p_white, p_white);
+}
+
+void RendererEnvironmentStorage::environment_set_tonemap_with_authored_whites(RID p_env, RSE::EnvironmentToneMapper p_tone_mapper, float p_exposure, float p_white, float p_agx_white) {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 	env->exposure = p_exposure;
 	env->tone_mapper = p_tone_mapper;
 	env->white = p_white;
+	env->agx_white = p_agx_white;
 }
 
 RSE::EnvironmentToneMapper RendererEnvironmentStorage::environment_get_tone_mapper(RID p_env) const {
@@ -268,7 +273,7 @@ float RendererEnvironmentStorage::environment_get_white(RID p_env, bool p_limit_
 	ERR_FAIL_COND_V(!env && !has_override, 1.0);
 
 	const RSE::EnvironmentToneMapper tone_mapper = has_override ? RSE::EnvironmentToneMapper(p_tonemap_mode_override) : env->tone_mapper;
-	const float authored_white = env ? env->white : 1.0;
+	const float authored_white = env ? (tone_mapper == RSE::ENV_TONE_MAPPER_AGX ? env->agx_white : env->white) : 1.0;
 	return get_tonemap_white(tone_mapper, authored_white, p_limit_agx_white, p_output_max_value);
 }
 
