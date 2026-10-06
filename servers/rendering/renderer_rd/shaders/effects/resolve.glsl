@@ -16,7 +16,12 @@ layout(set = 0, binding = 0) uniform sampler2DMS source_depth;
 layout(set = 0, binding = 1) uniform sampler2DMS source_normal_roughness;
 
 layout(r32f, set = 1, binding = 0) uniform restrict writeonly image2D dest_depth;
+#ifdef GBUFFER_RESOLVE
+// FRP's normal_roughness storage image uses A2B10G10R10_UNORM_PACK32.
+layout(rgb10_a2, set = 1, binding = 1) uniform restrict writeonly image2D dest_normal_roughness;
+#else
 layout(rgba8, set = 1, binding = 1) uniform restrict writeonly image2D dest_normal_roughness;
+#endif
 
 #ifdef VOXEL_GI_RESOLVE
 layout(set = 2, binding = 0) uniform usampler2DMS source_voxel_gi;
