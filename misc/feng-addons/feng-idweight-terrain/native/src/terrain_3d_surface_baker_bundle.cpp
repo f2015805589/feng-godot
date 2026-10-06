@@ -62,14 +62,19 @@ void Terrain3DSurfaceBaker::_collect_bundle_rids(const ResourceBundle &p_resourc
 			r_rd_rids.push_back(p_resources.encode_uniform[channel]);
 		}
 	}
-	for (const RID &rid : { p_resources.encode_pipeline, p_resources.encode_shader }) {
+	if (p_resources.source_upload_uniform.is_valid()) {
+		r_rd_rids.push_back(p_resources.source_upload_uniform);
+	}
+	for (const RID &rid : { p_resources.source_upload_pipeline, p_resources.source_upload_shader,
+			 p_resources.encode_pipeline, p_resources.encode_shader }) {
 		if (rid.is_valid()) {
 			r_rd_rids.push_back(rid);
 		}
 	}
 	for (const RID &rid : { p_resources.output_albedo_rd, p_resources.output_normal_rd, p_resources.output_params_rd,
 				 p_resources.source_id_rd, p_resources.source_height_rd, p_resources.material_buffer,
-				 p_resources.job_buffer, p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
+				 p_resources.job_buffer, p_resources.source_upload_buffer,
+				 p_resources.dummy_albedo_rd, p_resources.dummy_normal_rd,
 				 p_resources.sampler_nearest, p_resources.sampler_linear, p_resources.encode_buffer }) {
 		if (rid.is_valid()) {
 			r_rd_rids.push_back(rid);
@@ -444,10 +449,36 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	const uint64_t source_storage_usage = sampled_usage | RenderingDevice::TEXTURE_USAGE_STORAGE_BIT;
+	const bool source_storage_supported =
+			_rd->texture_is_format_supported_for_usage(RenderingDevice::DATA_FORMAT_R16_UNORM, source_storage_usage) &&
+			_rd->texture_is_format_supported_for_usage(RenderingDevice::DATA_FORMAT_R32_SFLOAT, source_storage_usage);
+	const uint64_t source_usage = source_storage_supported ? source_storage_usage : sampled_usage;
 	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
-			_staging_layers, sampled_usage);
+			_staging_layers, source_usage);
 	r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
-			_staging_layers, sampled_usage);
+			_staging_layers, source_usage);
+	// A format query is necessary but some devices can still reject an array allocation with
+	// storage usage. Retain the established sampled/updateable arrays in that case.
+	bool source_upload_storage_available = source_storage_supported;
+	if (source_upload_storage_available && (!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid())) {
+		if (r_next.source_id_rd.is_valid()) {
+			_rd->free_rid(r_next.source_id_rd);
+			r_next.source_id_rd = RID();
+		}
+		if (r_next.source_height_rd.is_valid()) {
+			_rd->free_rid(r_next.source_height_rd);
+			r_next.source_height_rd = RID();
+		}
+		source_upload_storage_available = false;
+		r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
+				_staging_layers, sampled_usage);
+		r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
+				_staging_layers, sampled_usage);
+	}
+	if (source_upload_storage_available && r_next.source_id_rd.is_valid() && r_next.source_height_rd.is_valid()) {
+		_compile_source_upload_pipeline(r_next, p_stored_size, p_page_count);
+	}
 	r_next.output_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
 			p_stored_size, _staging_layers, output_usage);
 	r_next.output_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,

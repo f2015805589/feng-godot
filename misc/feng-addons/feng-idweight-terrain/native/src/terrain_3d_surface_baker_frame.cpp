@@ -105,12 +105,13 @@ bool Terrain3DSurfaceBaker::_record_jobs(std::vector<PendingJob> &p_jobs, uint64
 	PackedByteArray job_bytes;
 	SurfaceVTLabel batch_label(_rd, "Surface VT Page Updates - " + String::num_int64(p_jobs.size()) + " pages");
 	job_bytes.resize(int64_t(p_jobs.size()) * JOB_STRIDE);
+	_upload_source_pages(p_jobs, p_material_count);
 	for (size_t index = 0; index < p_jobs.size(); index++) {
 		PendingJob &job = p_jobs[index];
 		const int64_t offset = int64_t(index) * JOB_STRIDE;
 		const int layer = job.staging_layer >= 0 ? job.staging_layer : job.slot;
 		uint32_t mode = 0u;
-		if (job.kind == PENDING_BAKE && p_material_count > 0 && _upload_source_page(job, layer)) {
+		if (job.kind == PENDING_BAKE && p_material_count > 0) {
 			mode = 1u;
 		} else if (job.kind == PENDING_BAKE) {
 			job.kind = PENDING_INVALIDATE;
@@ -1096,6 +1097,13 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	stats["migrated_pages"] = int64_t(_migrated_pages);
 	stats["invalidated_pages"] = int64_t(_invalidated_pages);
 	stats["source_uploads"] = int64_t(_source_uploads);
+	stats["source_upload_payload_bytes"] = int64_t(_source_upload_payload_bytes);
+	stats["source_upload_buffer_bytes"] = int64_t(_source_upload_buffer_bytes);
+	stats["source_upload_texture_calls"] = int64_t(_source_upload_texture_calls);
+	stats["source_upload_buffer_calls"] = int64_t(_source_upload_buffer_calls);
+	stats["source_upload_scatter_dispatches"] = int64_t(_source_upload_scatter_dispatches);
+	stats["source_upload_scatter_pages"] = int64_t(_source_upload_scatter_pages);
+	stats["source_upload_fallback_pages"] = int64_t(_source_upload_fallback_pages);
 	stats["dispatch_count"] = int64_t(_dispatch_count);
 	// The ring's own dispatches, recorded rather than acknowledged: a rect the ring later refuses (its
 	// lease moved before the bake landed) is counted here and re-queued there, so the two numbers

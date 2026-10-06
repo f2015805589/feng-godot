@@ -67,6 +67,14 @@ STATIC_ASSERT_INCOMPLETE_TYPE(class, RenderingServer);
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/world_environment.h"
 #include "scene/resources/3d/world_3d.h"
+
+static int64_t get_viewport_world_3d_instance_id(const Viewport *p_viewport) {
+	if (!p_viewport->is_inside_tree()) {
+		return 0;
+	}
+	const Ref<World3D> world = p_viewport->find_world_3d();
+	return world.is_valid() ? static_cast<int64_t>(world->get_instance_id()) : 0;
+}
 #endif // _3D_DISABLED
 
 #ifndef PHYSICS_2D_DISABLED
@@ -606,6 +614,7 @@ void Viewport::_notification(int p_what) {
 #ifndef _3D_DISABLED
 			RenderingServer::get_singleton()->viewport_set_scenario(viewport, find_world_3d()->get_scenario());
 			_update_audio_listener_3d();
+			emit_signal(SNAME("world_3d_changed"), get_viewport_world_3d_instance_id(this));
 #endif // _3D_DISABLED
 
 			add_to_group("_viewports");
@@ -669,6 +678,7 @@ void Viewport::_notification(int p_what) {
 			_gui_cancel_tooltip();
 
 			RenderingServer::get_singleton()->viewport_set_scenario(viewport, RID());
+			emit_signal(SNAME("world_3d_changed"), int64_t(0));
 			RenderingServer::get_singleton()->viewport_remove_canvas(viewport, current_canvas);
 #ifndef PHYSICS_2D_DISABLED
 			if (contact_2d_debug.is_valid()) {
@@ -4899,6 +4909,7 @@ void Viewport::set_world_3d(const Ref<World3D> &p_world_3d) {
 	}
 
 	_update_audio_listener_3d();
+	emit_signal(SNAME("world_3d_changed"), get_viewport_world_3d_instance_id(this));
 }
 
 void Viewport::_own_world_3d_changed() {
@@ -4920,6 +4931,7 @@ void Viewport::_own_world_3d_changed() {
 	}
 
 	_update_audio_listener_3d();
+	emit_signal(SNAME("world_3d_changed"), get_viewport_world_3d_instance_id(this));
 }
 
 void Viewport::set_use_own_world_3d(bool p_use_own_world_3d) {
@@ -4955,6 +4967,7 @@ void Viewport::set_use_own_world_3d(bool p_use_own_world_3d) {
 	}
 
 	_update_audio_listener_3d();
+	emit_signal(SNAME("world_3d_changed"), get_viewport_world_3d_instance_id(this));
 }
 
 bool Viewport::is_using_own_world_3d() const {
@@ -4976,6 +4989,7 @@ void Viewport::_propagate_enter_world_3d(Node *p_node) {
 				if (v->world_3d.is_valid() || v->own_world_3d.is_valid()) {
 					return;
 				}
+				v->emit_signal(SNAME("world_3d_changed"), get_viewport_world_3d_instance_id(v));
 			}
 		}
 	}
@@ -5417,6 +5431,7 @@ void Viewport::_bind_methods() {
 
 	ADD_SIGNAL(MethodInfo("size_changed"));
 	ADD_SIGNAL(MethodInfo("gui_focus_changed", PropertyInfo(Variant::OBJECT, "node", PROPERTY_HINT_RESOURCE_TYPE, Control::get_class_static())));
+	ADD_SIGNAL(MethodInfo("world_3d_changed", PropertyInfo(Variant::INT, "world_id")));
 
 	BIND_ENUM_CONSTANT(SHADOW_ATLAS_QUADRANT_SUBDIV_DISABLED);
 	BIND_ENUM_CONSTANT(SHADOW_ATLAS_QUADRANT_SUBDIV_1);

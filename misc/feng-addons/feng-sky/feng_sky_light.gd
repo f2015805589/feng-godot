@@ -1039,7 +1039,6 @@ func _sync_viewport_routes(force_scan: bool = false) -> void:
 		return
 	if force_scan:
 		_snapshot_worlds.call("scan", tree.root, self)
-	_snapshot_worlds.call("prune")
 	var world := get_world_3d()
 	if world == null:
 		return

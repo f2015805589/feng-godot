@@ -281,6 +281,14 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 	if (_terrain) {
 		p_region->ensure_surface_density(_terrain->get_surface_density());
 	}
+	// Reserve the slot before publishing any part of the region. At capacity, failure must
+	// leave an existing region at this location and every public map unchanged. An overwrite
+	// gets its already-owned slot from _acquire_slot().
+	const int slot = _acquire_slot(region_loc);
+	if (slot < 0) {
+		LOG(ERROR, "No free map slot for region ", region_loc);
+		return FAILED;
+	}
 	p_region->set_deleted(false);
 	if (!_region_locations.has(region_loc)) {
 		_region_locations.push_back(region_loc);
@@ -289,12 +297,7 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 	}
 	_regions[region_loc] = p_region;
 	// Publish the region in the map immediately so get_region_id() and has_region()
-	// are correct before the next update_maps(), and give it a stable layer slot.
-	const int slot = _acquire_slot(region_loc);
-	if (slot < 0) {
-		LOG(ERROR, "No free map slot for region ", region_loc);
-		return FAILED;
-	}
+	// are correct before the next update_maps().
 	LOG(DEBUG, "Storing region ", region_loc, " version ", vformat("%.3f", p_region->get_version()), " slot: ", slot);
 	if (p_update) {
 		update_maps(TYPE_MAX, false, false);

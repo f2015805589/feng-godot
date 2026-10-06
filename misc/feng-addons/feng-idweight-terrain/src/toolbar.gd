@@ -151,7 +151,7 @@ func add_tool_button(p_params: Dictionary) -> void:
 		button2 = button.duplicate()
 	button2.set_button_group(p_params.get("group", sub_tool_group))
 	add_child(button2, true)
-	buttons[button2.get_name()] = button
+	buttons[button2.get_name()] = button2
 
 
 func get_button(p_name: String) -> Button:

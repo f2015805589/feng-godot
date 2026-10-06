@@ -514,6 +514,12 @@
 		</member>
 	</members>
 	<signals>
+		<signal name="world_3d_changed">
+			<param index="0" name="world_id" type="int" />
+			<description>
+				Emitted when this viewport's effective [World3D] changes, including when an ancestor viewport's world is inherited. The argument is the instance ID of the effective [World3D], or [code]0[/code] when the viewport leaves the scene tree or has no active 3D world.
+			</description>
+		</signal>
 		<signal name="gui_focus_changed">
 			<param index="0" name="node" type="Control" />
 			<description>

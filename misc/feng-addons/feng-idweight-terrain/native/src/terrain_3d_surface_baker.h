@@ -12,6 +12,7 @@
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>
@@ -98,6 +99,11 @@ public:
 	};
 
 private:
+	// Source pages are gathered in a bounded reusable upload buffer. Larger pages or devices
+	// without the required storage-image formats keep the original per-texture upload path.
+	static constexpr uint32_t SOURCE_UPLOAD_MAX_BYTES = 16u * 1024u * 1024u;
+	static constexpr uint32_t SOURCE_UPLOAD_MAX_PAGES = 16u;
+
 	enum PendingKind {
 		PENDING_BAKE = 0,
 		PENDING_INVALIDATE = 1,
@@ -126,6 +132,13 @@ private:
 		Vector3 source_grid;
 		uint64_t generation = 0;
 		uint64_t sequence = 0;
+	};
+
+	struct SourceUploadPage {
+		int job_index = -1;
+		int layer = -1;
+		PackedByteArray id_bytes;
+		PackedByteArray height_bytes;
 	};
 
 	// One tier's sampling arrays: each channel is optional. A raw channel samples the canonical
@@ -162,6 +175,17 @@ private:
 		// One uniform set per channel: the staging array of that channel plus the output
 		// buffer. Rebuilt with the bundle because it names the staging textures.
 		RID encode_uniform[3];
+		// Optional packed CPU-source uploader. It copies exact R16/RF source bytes through one
+		// bounded storage buffer and scatters them into the same source array layers. Unsupported
+		// formats or failed allocations leave the original texture_update path active.
+		RID source_upload_shader;
+		RID source_upload_pipeline;
+		RID source_upload_buffer;
+		RID source_upload_uniform;
+		uint32_t source_upload_capacity_bytes = 0;
+		uint32_t source_upload_max_pages = 0;
+		bool source_upload_enabled = false;
+		PackedByteArray source_upload_scratch;
 		RID source_id_rd;
 		RID source_height_rd;
 		RID material_buffer;
@@ -661,6 +685,14 @@ private:
 	uint64_t _migrated_pages = 0;
 	uint64_t _invalidated_pages = 0;
 	uint64_t _source_uploads = 0;
+	uint64_t _source_upload_payload_bytes = 0;
+	uint64_t _source_upload_buffer_bytes = 0;
+	uint64_t _source_upload_texture_calls = 0;
+	uint64_t _source_upload_buffer_calls = 0;
+	uint64_t _source_upload_scatter_dispatches = 0;
+	uint64_t _source_upload_scatter_pages = 0;
+	uint64_t _source_upload_fallback_pages = 0;
+	std::vector<SourceUploadPage> _source_upload_batch;
 
 	// A replaced bundle is released on the render thread. Its RIDs are collected into two
 	// lists instead of being threaded through a bound-argument list, so a new resource does
@@ -705,8 +737,11 @@ private:
 			const RID &p_normal_array_rs);
 	bool _compile_pipeline(ResourceBundle &r_resources);
 	bool _compile_encode_pipeline(ResourceBundle &r_resources);
+	bool _compile_source_upload_pipeline(ResourceBundle &r_resources, int p_stored_size, int p_page_count);
 	bool _upload_materials(const PackedByteArray &p_material_bytes);
-	bool _upload_source_page(const PendingJob &p_job, int p_layer);
+	void _upload_source_pages(std::vector<PendingJob> &p_jobs, int p_material_count);
+	bool _upload_source_page(const PendingJob &p_job, int p_layer, const PackedByteArray &p_id_bytes,
+			const PackedByteArray &p_height_bytes, bool p_fallback);
 	bool _upload_cached_page(const PendingJob &p_job);
 	bool _copy_cell_page(const PendingJob &p_job, Terrain3DCellStore *p_store);
 	PackedByteArray _image_bytes(const Ref<godot::Image> &p_image, godot::Image::Format p_expected_format,

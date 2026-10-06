@@ -28,6 +28,7 @@
 #include <godot_cpp/variant/rect2i.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 // The codec vocabulary, the shared constants and the small helpers of the four halves; see
@@ -305,28 +306,186 @@ PackedByteArray Terrain3DSurfaceBaker::_image_bytes(const Ref<Image> &p_image,
 	return PackedByteArray();
 }
 
-bool Terrain3DSurfaceBaker::_upload_source_page(const PendingJob &p_job, int p_layer) {
-	if (!_rd || !_resources.source_id_rd.is_valid() || !_resources.source_height_rd.is_valid()) {
+bool Terrain3DSurfaceBaker::_upload_source_page(const PendingJob &p_job, const int p_layer,
+		const PackedByteArray &p_id_bytes, const PackedByteArray &p_height_bytes, const bool p_fallback) {
+	if (!_rd || !_resources.source_id_rd.is_valid() || !_resources.source_height_rd.is_valid() ||
+			p_layer < 0 || p_layer >= _staging_layers || p_id_bytes.is_empty() || p_height_bytes.is_empty()) {
 		return false;
 	}
 	SurfaceVTLabel label(_rd, "VT Source Upload - slot " + String::num_int64(p_job.slot));
-	PackedByteArray id_bytes = _image_bytes(p_job.idweights, IDWEIGHT_IMAGE_FORMAT, 2);
-	PackedByteArray height_bytes = _image_bytes(p_job.height, Image::FORMAT_RF, 4);
-	if (id_bytes.is_empty() || height_bytes.is_empty()) {
-		LOG(WARN, "Skipping invalid surface bake source page ", p_job.slot,
-				"; expected ", _stored_size, "x", _stored_size, " R16/RF images");
-		return false;
-	}
-	if (_rd->texture_update(_resources.source_id_rd, uint32_t(p_layer), id_bytes) != OK ||
-			_rd->texture_update(_resources.source_height_rd, uint32_t(p_layer), height_bytes) != OK) {
-		LOG(WARN, "Could not upload surface bake source page ", p_job.slot);
-		return false;
+	const Error id_error = _rd->texture_update(_resources.source_id_rd, uint32_t(p_layer), p_id_bytes);
+	Error height_error = ERR_UNAVAILABLE;
+	if (id_error == OK) {
+		height_error = _rd->texture_update(_resources.source_height_rd, uint32_t(p_layer), p_height_bytes);
 	}
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_source_uploads++;
+		_source_upload_texture_calls += id_error == OK ? 2u : 1u;
+		if (p_fallback) {
+			_source_upload_fallback_pages++;
+		}
+		if (id_error == OK && height_error == OK) {
+			_source_uploads++;
+			_source_upload_payload_bytes += uint64_t(p_id_bytes.size()) + uint64_t(p_height_bytes.size());
+		}
+	}
+	if (id_error != OK || height_error != OK) {
+		LOG(WARN, "Could not upload surface bake source page ", p_job.slot);
+		return false;
 	}
 	return true;
+}
+
+void Terrain3DSurfaceBaker::_upload_source_pages(std::vector<PendingJob> &p_jobs, const int p_material_count) {
+	_source_upload_batch.clear();
+	bool can_scatter = _resources.source_upload_enabled && _resources.source_upload_capacity_bytes > 0 &&
+			_resources.source_upload_uniform.is_valid() && _resources.source_upload_pipeline.is_valid() &&
+			_resources.source_upload_buffer.is_valid();
+	auto page_data_size = [](const SourceUploadPage &p_page) -> uint64_t {
+		const uint64_t id_size = uint64_t(p_page.id_bytes.size());
+		const uint64_t height_size = uint64_t(p_page.height_bytes.size());
+		return ((id_size + 3u) & ~uint64_t(3u)) + height_size;
+	};
+	auto flush_batch = [&]() {
+		if (_source_upload_batch.empty()) {
+			return;
+		}
+		bool scattered = false;
+		const uint32_t page_count = uint32_t(_source_upload_batch.size());
+		uint64_t required_bytes = uint64_t(page_count) * 16u;
+		for (const SourceUploadPage &page : _source_upload_batch) {
+			required_bytes = (required_bytes + 3u) & ~uint64_t(3u);
+			required_bytes += uint64_t(page.id_bytes.size());
+			required_bytes = (required_bytes + 3u) & ~uint64_t(3u);
+			required_bytes += uint64_t(page.height_bytes.size());
+		}
+		if (can_scatter && page_count <= _resources.source_upload_max_pages &&
+				required_bytes <= _resources.source_upload_capacity_bytes &&
+				required_bytes <= uint64_t(_resources.source_upload_scratch.size())) {
+			PackedByteArray &scratch = _resources.source_upload_scratch;
+			uint8_t *scratch_data = scratch.ptrw();
+			uint32_t cursor = page_count * 16u;
+			for (uint32_t index = 0; index < page_count; ++index) {
+				const SourceUploadPage &page = _source_upload_batch[index];
+				cursor = (cursor + 3u) & ~3u;
+				const uint32_t id_word_offset = cursor / 4u;
+				std::memcpy(scratch_data + cursor, page.id_bytes.ptr(), size_t(page.id_bytes.size()));
+				cursor += uint32_t(page.id_bytes.size());
+				cursor = (cursor + 3u) & ~3u;
+				const uint32_t height_word_offset = cursor / 4u;
+				std::memcpy(scratch_data + cursor, page.height_bytes.ptr(), size_t(page.height_bytes.size()));
+				cursor += uint32_t(page.height_bytes.size());
+				const int64_t header_offset = int64_t(index) * 16;
+				scratch.encode_u32(header_offset + 0, id_word_offset);
+				scratch.encode_u32(header_offset + 4, height_word_offset);
+				scratch.encode_u32(header_offset + 8, uint32_t(page.layer));
+				scratch.encode_u32(header_offset + 12, 0u);
+			}
+			const uint32_t upload_bytes = cursor;
+			Error buffer_error = _rd->buffer_update(_resources.source_upload_buffer, 0, upload_bytes,
+					scratch);
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				_source_upload_buffer_calls++;
+				_source_upload_buffer_bytes += upload_bytes;
+			}
+			if (buffer_error != OK) {
+				_resources.source_upload_enabled = false;
+				can_scatter = false;
+			}
+			if (buffer_error == OK) {
+				PackedByteArray push;
+				push.resize(16);
+				push.encode_u32(0, uint32_t(_stored_size));
+				push.encode_u32(4, page_count);
+				push.encode_u32(8, 0u);
+				push.encode_u32(12, 0u);
+				SurfaceVTLabel label(_rd, "VT Packed Source Scatter - " + String::num_uint64(page_count) + " pages");
+				const int64_t list = _rd->compute_list_begin();
+				if (list >= 0) {
+					_rd->compute_list_bind_compute_pipeline(list, _resources.source_upload_pipeline);
+					_rd->compute_list_bind_uniform_set(list, _resources.source_upload_uniform, 0);
+					_rd->compute_list_set_push_constant(list, push, uint32_t(push.size()));
+					_rd->compute_list_dispatch(list, uint32_t((_stored_size + 7) / 8),
+							uint32_t((_stored_size + 7) / 8), page_count);
+					_rd->compute_list_end();
+					scattered = true;
+					uint64_t payload_bytes = 0;
+					for (const SourceUploadPage &page : _source_upload_batch) {
+						payload_bytes += uint64_t(page.id_bytes.size()) + uint64_t(page.height_bytes.size());
+					}
+					std::lock_guard<std::mutex> lock(_mutex);
+					_source_uploads += page_count;
+					_source_upload_payload_bytes += payload_bytes;
+					_source_upload_scatter_dispatches++;
+					_source_upload_scatter_pages += page_count;
+				} else {
+					_resources.source_upload_enabled = false;
+					can_scatter = false;
+				}
+			}
+		}
+		if (!scattered) {
+			for (const SourceUploadPage &page : _source_upload_batch) {
+				PendingJob &job = p_jobs[size_t(page.job_index)];
+				if (!_upload_source_page(job, page.layer, page.id_bytes, page.height_bytes, true)) {
+					job.kind = PENDING_INVALIDATE;
+				}
+			}
+		}
+		_source_upload_batch.clear();
+	};
+
+	for (int index = 0; index < int(p_jobs.size()); ++index) {
+		PendingJob &job = p_jobs[size_t(index)];
+		if (job.kind != PENDING_BAKE) {
+			continue;
+		}
+		if (p_material_count <= 0) {
+			job.kind = PENDING_INVALIDATE;
+			continue;
+		}
+		SourceUploadPage page;
+		page.job_index = index;
+		page.layer = job.staging_layer >= 0 ? job.staging_layer : job.slot;
+		page.id_bytes = _image_bytes(job.idweights, IDWEIGHT_IMAGE_FORMAT, 2);
+		page.height_bytes = _image_bytes(job.height, Image::FORMAT_RF, 4);
+		if (page.id_bytes.is_empty() || page.height_bytes.is_empty()) {
+			LOG(WARN, "Skipping invalid surface bake source page ", job.slot,
+					"; expected ", _stored_size, "x", _stored_size, " R16/RF images");
+			job.kind = PENDING_INVALIDATE;
+			continue;
+		}
+		if (page.layer < 0 || page.layer >= _staging_layers) {
+			LOG(WARN, "Skipping surface bake source page ", job.slot, " with invalid staging layer ", page.layer);
+			job.kind = PENDING_INVALIDATE;
+			continue;
+		}
+		if (!can_scatter) {
+			if (!_upload_source_page(job, page.layer, page.id_bytes, page.height_bytes, true)) {
+				job.kind = PENDING_INVALIDATE;
+			}
+			continue;
+		}
+		uint64_t projected_bytes = uint64_t(_source_upload_batch.size() + 1u) * 16u + page_data_size(page);
+		for (const SourceUploadPage &queued : _source_upload_batch) {
+			projected_bytes += page_data_size(queued);
+		}
+		if (!_source_upload_batch.empty() &&
+				(_source_upload_batch.size() >= _resources.source_upload_max_pages ||
+				projected_bytes > _resources.source_upload_capacity_bytes)) {
+			flush_batch();
+		}
+		const uint64_t single_page_bytes = 16u + page_data_size(page);
+		if (single_page_bytes > _resources.source_upload_capacity_bytes) {
+			if (!_upload_source_page(job, page.layer, page.id_bytes, page.height_bytes, true)) {
+				job.kind = PENDING_INVALIDATE;
+			}
+			continue;
+		}
+		_source_upload_batch.push_back(std::move(page));
+	}
+	flush_batch();
 }
 
 bool Terrain3DSurfaceBaker::_upload_cached_page(const PendingJob &p_job) {

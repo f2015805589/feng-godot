@@ -149,26 +149,32 @@ static func _sync_debanding(selected: Dictionary) -> void:
 	var worlds := _snapshot_worlds()
 	if worlds == null:
 		return
-	var viewports: Dictionary = worlds.viewports()
-	for id in _debanding_original.keys():
-		if not viewports.has(id):
-			var original_viewport: Viewport = _debanding_original[id]["viewport"].get_ref()
-			if original_viewport != null:
-				_restore_debanding(id, original_viewport)
-			_debanding_original.erase(id)
-	for id in viewports.keys():
-		var reference: WeakRef = viewports[id]
-		var viewport: Viewport = reference.get_ref() if reference != null else null
-		if viewport == null:
+	var active_viewports: Dictionary = {}
+	for selected_world_id in selected:
+		var entry: Dictionary = selected[selected_world_id]
+		var world: World3D = entry.get("world")
+		if world == null or not is_instance_valid(world):
 			continue
-		var world := viewport.find_world_3d() if viewport.is_inside_tree() else null
-		var fog_active := world != null and selected.has(world.get_instance_id())
-		if fog_active:
+		var viewports: Dictionary = worlds.viewports_for_world(world)
+		for id in viewports:
+			var reference: WeakRef = viewports[id]
+			var viewport: Viewport = reference.get_ref() if reference != null else null
+			if viewport == null or not is_instance_valid(viewport):
+				continue
+			active_viewports[id] = true
 			if not _debanding_original.has(id):
 				_debanding_original[id] = {"viewport": weakref(viewport), "enabled": viewport.use_debanding}
+			if not viewport.use_debanding:
 				viewport.use_debanding = true
+	for id in _debanding_original.keys():
+		if active_viewports.has(id):
+			continue
+		var reference: WeakRef = _debanding_original[id]["viewport"]
+		var original_viewport: Viewport = reference.get_ref() if reference != null else null
+		if original_viewport != null and is_instance_valid(original_viewport):
+			_restore_debanding(id, original_viewport)
 		else:
-			_restore_debanding(id, viewport)
+			_debanding_original.erase(id)
 
 static func publish(fog: FengHeightFog) -> void:
 	if fog.is_inside_tree():

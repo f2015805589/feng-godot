@@ -23,6 +23,8 @@
 #include <godot_cpp/classes/rd_shader_spirv.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 
+#include <algorithm>
+
 // The codec vocabulary, the shared constants and the small helpers of the halves; see
 // terrain_3d_surface_baker_internal.h for what it holds and why it is a header.
 using namespace terrain_surface_baker;
@@ -95,6 +97,44 @@ layout(push_constant, std430) uniform BakePushConstants {
 static const char *SURFACE_ENCODE_SHADER =
 #include "shaders/bc_encode.glsl"
 		;
+
+// Pack exact R16/float32 CPU source pages into the existing ID and height arrays. The per-page
+// header contains word offsets and the destination layer; page texels are copied bit-for-bit
+// except that R16_UNORM is written from its exact normalized integer value.
+static const char *SURFACE_SOURCE_UPLOAD_SHADER = R"(#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SourceUploadBuffer {
+	uint words[];
+} source_upload;
+layout(set = 0, binding = 1, r16) uniform writeonly image2DArray source_id_image;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2DArray source_height_image;
+
+layout(push_constant, std430) uniform SourceUploadPushConstants {
+	uvec4 dims; // stored size, page count, reserved, reserved
+} source_upload_push;
+
+void main() {
+	const uvec3 invocation = gl_GlobalInvocationID;
+	const uint size = source_upload_push.dims.x;
+	const uint page_count = source_upload_push.dims.y;
+	if (invocation.x >= size || invocation.y >= size || invocation.z >= page_count) {
+		return;
+	}
+	const uint header = invocation.z * 4u;
+	const uint id_base = source_upload.words[header + 0u];
+	const uint height_base = source_upload.words[header + 1u];
+	const uint layer = source_upload.words[header + 2u];
+	const uint pixel = invocation.y * size + invocation.x;
+	const uint packed_ids = source_upload.words[id_base + pixel / 2u];
+	const uint id_value = (packed_ids >> ((pixel & 1u) * 16u)) & 0xFFFFu;
+	const float id_normalized = float(id_value) * (1.0 / 65535.0);
+	const float height_value = uintBitsToFloat(source_upload.words[height_base + pixel]);
+	const ivec3 target = ivec3(ivec2(invocation.xy), int(layer));
+	imageStore(source_id_image, target, vec4(id_normalized, 0.0, 0.0, 1.0));
+	imageStore(source_height_image, target, vec4(height_value, 0.0, 0.0, 1.0));
+}
+)";
 
 ///////////////////////////
 // GPU setup
@@ -189,6 +229,76 @@ bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources
 			return false;
 		}
 	}
+	return true;
+}
+
+bool Terrain3DSurfaceBaker::_compile_source_upload_pipeline(ResourceBundle &r_resources,
+		const int p_stored_size, const int p_page_count) {
+	if (!_rd || p_stored_size <= 0 || p_page_count <= 0 || !r_resources.source_id_rd.is_valid() ||
+			!r_resources.source_height_rd.is_valid()) {
+		return false;
+	}
+	const uint64_t texels = uint64_t(p_stored_size) * uint64_t(p_stored_size);
+	const uint64_t id_bytes = texels * 2u;
+	const uint64_t height_bytes = texels * 4u;
+	const uint64_t id_padded = (id_bytes + 3u) & ~uint64_t(3u);
+	const uint64_t bytes_per_page = 16u + id_padded + height_bytes;
+	if (bytes_per_page > SOURCE_UPLOAD_MAX_BYTES) {
+		return false;
+	}
+	const uint32_t max_pages = uint32_t(std::min<uint64_t>(
+			std::min<uint32_t>(uint32_t(p_page_count), SOURCE_UPLOAD_MAX_PAGES),
+			SOURCE_UPLOAD_MAX_BYTES / bytes_per_page));
+	if (max_pages == 0) {
+		return false;
+	}
+	const uint64_t capacity = uint64_t(max_pages) * (16u + id_padded + height_bytes);
+	if (capacity == 0 || capacity > SOURCE_UPLOAD_MAX_BYTES || capacity > UINT32_MAX) {
+		return false;
+	}
+
+	Ref<RDShaderSource> source;
+	source.instantiate();
+	source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
+	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, SURFACE_SOURCE_UPLOAD_SHADER);
+	Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
+	if (spirv.is_null()) {
+		LOG(WARN, "Surface source upload shader could not compile; using texture_update");
+		return false;
+	}
+	const String compile_error = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
+	if (!compile_error.is_empty()) {
+		LOG(WARN, "Surface source upload shader compile error; using texture_update: ", compile_error);
+		return false;
+	}
+	r_resources.source_upload_shader = _rd->shader_create_from_spirv(spirv, "terrain3d_surface_source_upload");
+	if (!r_resources.source_upload_shader.is_valid()) {
+		return false;
+	}
+	r_resources.source_upload_pipeline = _rd->compute_pipeline_create(r_resources.source_upload_shader);
+	if (!r_resources.source_upload_pipeline.is_valid()) {
+		return false;
+	}
+	r_resources.source_upload_buffer = _rd->storage_buffer_create(uint32_t(capacity));
+	if (!r_resources.source_upload_buffer.is_valid()) {
+		return false;
+	}
+	_rd->set_resource_name(r_resources.source_upload_buffer, "Surface VT Packed Source Upload");
+	TypedArray<Ref<RDUniform>> uniforms;
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER, 0,
+			r_resources.source_upload_buffer);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 1, r_resources.source_id_rd);
+	append_uniform(uniforms, RenderingDevice::UNIFORM_TYPE_IMAGE, 2, r_resources.source_height_rd);
+	r_resources.source_upload_uniform = _rd->uniform_set_create(uniforms, r_resources.source_upload_shader, 0);
+	if (!r_resources.source_upload_uniform.is_valid()) {
+		return false;
+	}
+	r_resources.source_upload_capacity_bytes = uint32_t(capacity);
+	r_resources.source_upload_max_pages = max_pages;
+	r_resources.source_upload_scratch.resize(int64_t(capacity));
+	_source_upload_batch.clear();
+	_source_upload_batch.reserve(max_pages);
+	r_resources.source_upload_enabled = true;
 	return true;
 }
 
