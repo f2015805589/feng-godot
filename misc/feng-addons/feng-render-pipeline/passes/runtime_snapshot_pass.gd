@@ -52,10 +52,13 @@ func _snapshot_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
 	var runtime_script := _get_runtime_script()
 	if runtime_script == null:
 		return {}
+	var target := buffers.get_render_target()
+	if runtime_script.has_method("snapshot_for_target"):
+		var matched: Variant = runtime_script.call("snapshot_for_target", target)
+		return matched if matched is Dictionary else {}
 	var snapshots: Variant = runtime_script.call("snapshots")
 	if not snapshots is Array:
 		return {}
-	var target := buffers.get_render_target()
 	for snapshot in snapshots:
 		if not snapshot is Dictionary:
 			continue

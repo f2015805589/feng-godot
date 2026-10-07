@@ -95,7 +95,32 @@ static func validate_schedule(
 			warnings.append("Native pass '%s' must precede '%s'; authored order was retained and the previous valid schedule remains active." % [NativeSpec.pass_name(before_id), NativeSpec.pass_name(after_id)])
 
 	warnings.append_array(_validate_custom_contracts(passes, native_positions, native_states, declared_provided_ids, is_entry_enabled_fn))
+	warnings.append_array(_validate_cloud_fog_order(passes, is_entry_enabled_fn))
 	return _unique_warnings(warnings)
+
+static func _validate_cloud_fog_order(passes: Array, is_entry_enabled_fn: Callable) -> PackedStringArray:
+	var warnings := PackedStringArray()
+	var trace_index := -1
+	var fog_index := -1
+	var trace_count := 0
+	var fog_count := 0
+	var trace_enabled := false
+	var fog_enabled := false
+	for i in passes.size():
+		var pass_entry = passes[i]
+		if pass_entry == null:
+			continue
+		if pass_entry.stable_id == &"library:cloud_trace":
+			trace_count += 1
+			trace_index = i
+			trace_enabled = bool(is_entry_enabled_fn.call(pass_entry))
+		elif pass_entry.stable_id == &"library:height_fog":
+			fog_count += 1
+			fog_index = i
+			fog_enabled = bool(is_entry_enabled_fn.call(pass_entry))
+	if trace_count == 1 and fog_count == 1 and trace_enabled and fog_enabled and trace_index < fog_index:
+		warnings.append("Height Fog must precede Volumetric Cloud Trace so the cloud composite receives its fog parameters; reorder the authored schedule.")
+	return warnings
 
 ## Checks what a custom pass declared about itself against the schedule it was placed
 ## in: one producer per output texture, every pipeline input produced before it is read,

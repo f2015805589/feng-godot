@@ -17,6 +17,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #ifndef FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS
 #define FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS 80
 #endif
+#ifndef FENG_CLOUD_SAFE_SELF_SHADOW_SATURATION_BREAK
+#define FENG_CLOUD_SAFE_SELF_SHADOW_SATURATION_BREAK 0
+#endif
 
 FENG_CLOUD_DECLARE_FRAME;
 FENG_CLOUD_DECLARE_MATERIAL;
@@ -30,6 +33,7 @@ FENG_CLOUD_DECLARE_CURL_TEXTURE;
 FENG_CLOUD_DECLARE_ATMOSPHERE_TEXTURES;
 FENG_CLOUD_DECLARE_NATIVE_SHADOW_DEPTH;
 FENG_CLOUD_DECLARE_NATIVE_SHADOW_DATA;
+FENG_CLOUD_DECLARE_BLUE_NOISE;
 FENG_CLOUD_DECLARE_SCENE_DEPTH;
 FENG_CLOUD_DECLARE_SKY_AMBIENT_INPUT;
 FENG_CLOUD_DECLARE_PROJECTION_CONTROL;
@@ -226,6 +230,11 @@ vec3 feng_cloud_trace_self_shadow_with_context(
 		}
 		optical_depth = min(optical_depth + feng_cloud_extinction_for_sampling(material_sample, grayscale_extinction)
 			* (trace_length_km * delta_norm_t), vec3(80.0));
+#if FENG_CLOUD_SAFE_SELF_SHADOW_SATURATION_BREAK
+		if (all(greaterThanEqual(optical_depth, vec3(80.0)))) {
+			break;
+		}
+#endif
 	}
 	return exp(-feng_cloud_positive_finite3(optical_depth));
 }
@@ -335,6 +344,16 @@ void main() {
 	ivec2 source_pixel = clamp(ivec2(full_pixel), ivec2(0), ivec2(viewport_size) - ivec2(1));
 	bool orthographic = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_ORTHOGRAPHIC) != 0u;
 	bool capture = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_CAPTURE) != 0u;
+	float first_sample_offset = 0.5;
+	if (!capture) {
+		uint frame_index_mod8 = cloud_frame.view_index_frame_index_flags_vrt_mode.y & 7u;
+		// UE builds SvPos at DispatchThread + 0.5 before scaling to full resolution.
+		ivec2 full_res_noise_pixel = ivec2((vec2(trace_pixel) + vec2(0.5)) * trace_scale);
+		ivec2 noise_coordinate = ivec2(full_res_noise_pixel.x & 127,
+			int(frame_index_mod8) * 128 + (full_res_noise_pixel.y & 127));
+		first_sample_offset = clamp(feng_cloud_finite_or_zero(
+			texelFetch(cloud_blue_noise_texture, noise_coordinate, 0).r), 0.0, 1.0);
+	}
 	
 	FengCloudRay ray = feng_cloud_ray_from_uv(uv, orthographic);
 	vec2 uv_x = clamp(uv + vec2(cloud_frame.viewport_size_xy_inv_xy.z * trace_scale.x, 0.0), vec2(0.0), vec2(1.0));
@@ -403,7 +422,8 @@ void main() {
 		FengCloudAdvancedSample pixel_advanced;
 		bool has_pixel_advanced = false;
 		for (int step_index = 0; step_index < trace_steps; ++step_index) {
-			float sample_distance_km = span.start_km + (float(step_index) + 0.5) * step_length_km;
+			float sample_distance_km = span.start_km
+				+ (float(step_index) + first_sample_offset) * step_length_km;
 			vec3 sample_position_km = ray_origin_km + ray_direction * sample_distance_km;
 			vec3 sample_ddx_km = (ray_x.origin_world_m + ray_x.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M)
 				- (ray.origin_world_m + ray.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M))) * FENG_CLOUD_M_TO_KM;
@@ -473,6 +493,7 @@ void main() {
 			}
 			// Higher scattering orders are integrated first with their own extinction
 			// coefficients. Only the base order advances view transmittance.
+			vec3 base_step_transmittance = vec3(1.0);
 			for (int order = octave_count; order >= 0; --order) {
 				vec3 order_extinction;
 				vec3 order_scattering;
@@ -486,13 +507,16 @@ void main() {
 				vec3 source_per_meter = feng_cloud_finite_or_zero3(ambient_order + direct0 + direct1 + emission_per_meter);
 				FengCloudSegmentResult order_segment = feng_cloud_integrate_homogeneous_segment(order_extinction, source_per_meter, step_length_km);
 				state.radiance += pre_sample_transmittance * order_segment.radiance;
+				if (order == 0) {
+					base_step_transmittance = order_segment.transmittance;
+				}
 				if (contributes_closest) {
 					closest_radiance += pre_sample_transmittance * order_segment.radiance;
 				}
 			}
-			state.transmittance *= exp(-min(base_extinction * step_length_km, vec3(80.0)));
+			state.transmittance *= base_step_transmittance;
 			if (contributes_closest) {
-				closest_transmittance *= exp(-min(base_extinction * step_length_km, vec3(80.0)));
+				closest_transmittance *= base_step_transmittance;
 			}
 			state.radiance = feng_cloud_finite_or_zero3(state.radiance);
 			state.transmittance = clamp(feng_cloud_finite_or_zero3(state.transmittance), vec3(0.0), vec3(1.0));

@@ -13,6 +13,7 @@ const ENTRYPOINTS := [
 	"cloud_shadow.glslinc",
 ]
 const CloudMaterialScript = preload("feng_cloud_material.gd")
+const CloudRuntime = preload("feng_cloud_runtime.gd")
 
 var _include_pattern := RegEx.new()
 var _packaged_paths: Dictionary = {}
@@ -32,6 +33,7 @@ func _export_begin(_features: PackedStringArray, _is_debug: bool, _path: String,
 		_add_shader_tree(SHADER_ROOT.path_join(filename), 0)
 	_add_shader_tree(CloudMaterialScript.DEFAULT_UE58_KERNEL_SOURCE_PATH, 0)
 	for path in [
+		CloudRuntime.BLUE_NOISE_TEXTURE_PATH,
 		CloudMaterialScript.DEFAULT_MATERIAL_RESOURCE_PATH,
 		CloudMaterialScript.DEFAULT_SHAPE_DENSITY_TEXTURE_PATH,
 		CloudMaterialScript.DEFAULT_LAYOUT_PATTERN_TEXTURE_PATH,

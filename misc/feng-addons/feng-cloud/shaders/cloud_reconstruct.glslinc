@@ -17,6 +17,9 @@ FENG_CLOUD_DECLARE_SECONDARY_OUTPUTS;
 #endif
 
 const float FENG_CLOUD_VRT_FAR_DEPTH_M = 65504000.0;
+const ivec2 FENG_CLOUD_VRT_NEIGHBOR_OFFSETS[8] = ivec2[8](
+	ivec2(1, 0), ivec2(1, 1), ivec2(0, 1), ivec2(-1, 1),
+	ivec2(-1, 0), ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1));
 
 struct FengCloudRayForReconstruction {
 	vec3 origin_world_m;
@@ -107,22 +110,18 @@ void feng_cloud_reproject_history_depth(
 	vec4 previous_depth,
 	vec3 previous_point_world_m,
 	FengCloudRayForReconstruction current_ray,
-	vec2 current_opaque_bounds_m,
 	out vec4 reprojected_depth,
 	out bool valid) {
 	vec3 previous_direction = feng_cloud_previous_view_ray_direction(previous_point_world_m);
 	vec3 previous_origin = feng_cloud_previous_view_ray_origin(previous_point_world_m, previous_direction, valid);
 	if (!valid) {
-		reprojected_depth = vec4(FENG_CLOUD_VRT_FAR_DEPTH_M, FENG_CLOUD_VRT_FAR_DEPTH_M,
-			current_opaque_bounds_m);
+		reprojected_depth = vec4(FENG_CLOUD_VRT_FAR_DEPTH_M, previous_depth.y, previous_depth.zw);
 		return;
 	}
-	vec3 wind_delta_m = cloud_frame.wind_delta_km_dt_time.xyz * FENG_CLOUD_KM_TO_M;
-	vec3 current_front_world_m = previous_origin + previous_direction * previous_depth.x + wind_delta_m;
-	vec3 current_mean_world_m = previous_origin + previous_direction * previous_depth.y + wind_delta_m;
+	vec3 current_front_world_m = previous_origin + previous_direction * previous_depth.x;
 	float front_distance_m = feng_cloud_distance_on_current_ray(current_ray, current_front_world_m);
-	float mean_distance_m = feng_cloud_distance_on_current_ray(current_ray, current_mean_world_m);
-	reprojected_depth = vec4(front_distance_m, mean_distance_m, current_opaque_bounds_m);
+	// The public tAP and opaque-bound channels keep the accepted UE history sample.
+	reprojected_depth = vec4(front_distance_m, previous_depth.y, previous_depth.zw);
 }
 
 void feng_cloud_sample_current(
@@ -278,16 +277,46 @@ void main() {
 		&& (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_CAMERA_CUT) == 0u
 		&& (vrt_mode == 0u || vrt_mode == 2u);
 	vec2 phase = cloud_frame.trace_phase_xy_trace_size_xy.xy;
-	bool use_current = feng_cloud_checkerboard_current_sample(pixel, vrt_mode, phase) || !history_valid;
+	bool checkerboard_sample = feng_cloud_checkerboard_current_sample(pixel, vrt_mode, phase);
+	bool use_current = checkerboard_sample || !history_valid;
+	bool use_mode0_center_sample = vrt_mode == 0u && history_valid && checkerboard_sample;
 	float scene_distance_m = feng_cloud_scene_distance_m(uv, feng_cloud_reconstruction_ray(uv));
+	ivec2 center_trace_pixel = ivec2(0);
+	float history_representative_depth_m = current_depth.y;
+	vec4 center_trace_radiance = vec4(0.0);
+	vec4 center_trace_transmittance = vec4(1.0, 1.0, 1.0, 0.0);
+	vec4 center_trace_secondary_radiance = vec4(0.0);
+	vec4 center_trace_secondary_transmittance = vec4(1.0, 1.0, 1.0, 0.0);
+	vec4 history_current_depth = current_depth;
+	if (vrt_mode == 0u || vrt_mode == 2u) {
+		int trace_downsample = vrt_mode == 0u ? 2 : 4;
+		center_trace_pixel = clamp(pixel / trace_downsample, ivec2(0), trace_size - ivec2(1));
+		ivec3 center_trace_coord = ivec3(center_trace_pixel, view_layer);
+		vec4 center_trace_depth = texelFetch(cloud_current_depth, center_trace_coord, 0);
+		center_trace_radiance = texelFetch(cloud_current_radiance, center_trace_coord, 0);
+		center_trace_transmittance = texelFetch(cloud_current_transmittance, center_trace_coord, 0);
+		history_representative_depth_m = clamp(feng_cloud_finite_or_zero(center_trace_depth.y),
+			0.0, FENG_CLOUD_VRT_FAR_DEPTH_M);
+		if (vrt_mode == 0u && history_valid) {
+			history_current_depth = center_trace_depth;
+#if FENG_CLOUD_VRT_SECONDARY
+			center_trace_secondary_radiance = texelFetch(cloud_current_secondary_radiance, center_trace_coord, 0);
+			center_trace_secondary_transmittance = texelFetch(cloud_current_secondary_transmittance, center_trace_coord, 0);
+#endif
+		}
+	}
 	if (vrt_mode == 2u) {
 		// Non-MMD history/composition uses the opaque depth on this output ray,
 		// not the quarter-resolution trace pixel's neighboring depth.
 		current_depth.zw = vec2(scene_distance_m);
+		history_current_depth.zw = vec2(scene_distance_m);
 	}
-	bool current_mmd_edge = vrt_mode == 0u && current_depth.w - current_depth.z > 2000.0
-		&& abs(current_depth.z - scene_distance_m) < abs(current_depth.w - scene_distance_m);
-	use_current = use_current || current_mmd_edge;
+	// Keep UE's near/far-vs-scene test on the center trace sample. Feng maps the
+	// opaque SceneDepth to w, so do not substitute this output pixel's ray depth.
+	bool current_mmd_edge = vrt_mode == 0u && history_valid
+		&& history_current_depth.w - history_current_depth.z > 2000.0
+		&& abs(history_current_depth.z - history_current_depth.w)
+			< abs(history_current_depth.w - history_current_depth.w);
 
 	vec4 selected_radiance = current_radiance;
 	vec4 selected_transmittance = current_transmittance;
@@ -298,8 +327,13 @@ void main() {
 	// current cloud alpha. Mode 0 has its separate min/max-depth acceptance path.
 	if (!use_current) {
 		FengCloudRayForReconstruction ray = feng_cloud_reconstruction_ray(uv);
-		vec3 current_world_m = ray.origin_world_m + ray.direction_world * current_depth.y;
-		vec3 previous_world_m = current_world_m - cloud_frame.wind_delta_km_dt_time.xyz * FENG_CLOUD_KM_TO_M;
+		// UE reprojects at its tAP representative depth, stored in Feng's y
+		// channel; its temporal path does not advect history by cloud wind.
+		float view_depth_per_ray_meter = max(feng_cloud_finite_or_zero(
+			-(mat3(cloud_frame.world_to_view) * ray.direction_world).z), 1e-5);
+		float representative_ray_distance_m = history_representative_depth_m / view_depth_per_ray_meter;
+		vec3 current_world_m = ray.origin_world_m + ray.direction_world * representative_ray_distance_m;
+		vec3 previous_world_m = current_world_m;
 		vec4 previous_clip = cloud_frame.previous_view_projection * vec4(previous_world_m, 1.0);
 		if (previous_clip.w > 1e-7 && !isnan(previous_clip.w) && !isinf(previous_clip.w)) {
 			vec3 previous_ndc = previous_clip.xyz / previous_clip.w;
@@ -313,27 +347,29 @@ void main() {
 				vec3 previous_direction = feng_cloud_previous_view_ray_direction(previous_world_m);
 				vec3 previous_origin = feng_cloud_previous_view_ray_origin(
 					previous_world_m, previous_direction, previous_ray_origin_valid);
-				float previous_reprojected_distance_m = dot(
-					previous_world_m - previous_origin, previous_direction);
 				bool previous_cloud_depth_finite = old_depth.x >= 0.0 && old_depth.y >= 0.0
 					&& !isnan(old_depth.x) && !isinf(old_depth.x)
 					&& !isnan(old_depth.y) && !isinf(old_depth.y);
+				bool previous_opaque_bounds_finite = old_depth.z >= 0.0 && old_depth.w >= 0.0
+					&& !isnan(old_depth.z) && !isinf(old_depth.z)
+					&& !isnan(old_depth.w) && !isinf(old_depth.w);
 				// UE's MMD path rejects a near-bound change over 1 km and newly
 				// revealed/covered 2 km far-bound changes. Mode 2 has no MMD packet.
 				bool mode0_mmd = vrt_mode == 0u;
-				bool scene_bounds_match = !mode0_mmd || abs(old_depth.z - current_depth.z) <= 1000.0;
-				bool newly_exposed_or_covered = mode0_mmd && (abs(old_depth.w - current_depth.w) > 2000.0
-					|| (old_depth.z < current_depth.z - 2000.0)
-					|| (old_depth.z > current_depth.z + 2000.0));
-				bool previous_mean_matches = !mode0_mmd || (previous_reprojected_distance_m >= 0.0
-					&& !isnan(previous_reprojected_distance_m) && !isinf(previous_reprojected_distance_m)
-					&& abs(old_depth.y - previous_reprojected_distance_m)
-						<= max(1000.0, previous_reprojected_distance_m * 0.05));
+				bool scene_bounds_match = !mode0_mmd || abs(old_depth.z - history_current_depth.z) <= 1000.0;
+				// UE applies MMD disocclusion only when either frame's opaque scene
+				// depth or min/max bounds are within 5 km. Feng stores those in z/w.
+				bool apply_mode0_disocclusion = mode0_mmd
+					&& (history_current_depth.z < 5000.0 || history_current_depth.w < 5000.0
+						|| old_depth.z < 5000.0 || old_depth.w < 5000.0);
+				bool newly_exposed_or_covered = apply_mode0_disocclusion
+					&& abs(old_depth.w - history_current_depth.w) > 2000.0;
 				bool old_transport_finite = all(not(isnan(old_radiance))) && all(not(isinf(old_radiance)))
 					&& all(not(isnan(old_transmittance))) && all(not(isinf(old_transmittance)));
-				bool valid_history = previous_ray_origin_valid && previous_cloud_depth_finite && old_transport_finite
+				bool valid_history = previous_ray_origin_valid && previous_cloud_depth_finite
+					&& previous_opaque_bounds_finite && old_transport_finite
 					&& scene_bounds_match && !newly_exposed_or_covered
-					&& previous_mean_matches;
+					&& !(apply_mode0_disocclusion && current_mmd_edge);
 				if (valid_history) {
 					float current_scale = cloud_frame.radiance_scales_current_previous_norm_P.x;
 					float previous_scale = cloud_frame.radiance_scales_current_previous_norm_P.y;
@@ -343,10 +379,35 @@ void main() {
 						selected_transmittance = old_transmittance;
 						bool reprojected_depth_valid = false;
 						feng_cloud_reproject_history_depth(old_depth, previous_world_m, ray,
-							vrt_mode == 0u ? current_depth.zw : vec2(scene_distance_m),
 							selected_depth, reprojected_depth_valid);
 						if (!reprojected_depth_valid) {
 							use_current = true;
+							use_mode0_center_sample = vrt_mode == 0u;
+						}
+						if (!use_current && vrt_mode == 2u
+								&& abs(scene_distance_m - old_depth.z) > scene_distance_m * 0.1) {
+							// UE's no-MMD history path replaces disoccluded history
+							// with the current trace sample whose opaque depth best
+							// matches this full-resolution pixel.
+							ivec2 center_sample = center_trace_pixel;
+							float closest_depth_delta_m = FENG_CLOUD_VRT_FAR_DEPTH_M;
+							bool found_neighbor = false;
+							for (int neighbor_index = 0; neighbor_index < 8; ++neighbor_index) {
+								ivec2 neighbor_pixel = clamp(center_sample + FENG_CLOUD_VRT_NEIGHBOR_OFFSETS[neighbor_index],
+									ivec2(0), trace_size - ivec2(1));
+								ivec3 neighbor_coord = ivec3(neighbor_pixel, view_layer);
+								vec4 neighbor_depth = texelFetch(cloud_current_depth, neighbor_coord, 0);
+								float depth_delta_m = abs(scene_distance_m
+									- feng_cloud_finite_or_zero(neighbor_depth.z));
+								if (depth_delta_m < closest_depth_delta_m) {
+									closest_depth_delta_m = depth_delta_m;
+									selected_radiance = texelFetch(cloud_current_radiance, neighbor_coord, 0);
+									selected_transmittance = texelFetch(cloud_current_transmittance, neighbor_coord, 0);
+									selected_depth = neighbor_depth;
+									found_neighbor = true;
+								}
+							}
+							use_current = !found_neighbor;
 						}
 #if FENG_CLOUD_VRT_SECONDARY
 						if (!use_current) {
@@ -358,9 +419,11 @@ void main() {
 #endif
 					} else {
 						use_current = true;
+						use_mode0_center_sample = vrt_mode == 0u;
 					}
 				} else {
 					use_current = true;
+					use_mode0_center_sample = vrt_mode == 0u;
 				}
 			} else {
 				use_current = true;
@@ -370,11 +433,19 @@ void main() {
 		}
 	}
 	if (use_current) {
-		selected_radiance = current_radiance;
-		selected_transmittance = current_transmittance;
-		selected_depth = current_depth;
-		selected_secondary_radiance = current_secondary_radiance;
-		selected_secondary_transmittance = current_secondary_transmittance;
+		if (use_mode0_center_sample) {
+			selected_radiance = center_trace_radiance;
+			selected_transmittance = center_trace_transmittance;
+			selected_depth = history_current_depth;
+			selected_secondary_radiance = center_trace_secondary_radiance;
+			selected_secondary_transmittance = center_trace_secondary_transmittance;
+		} else {
+			selected_radiance = current_radiance;
+			selected_transmittance = current_transmittance;
+			selected_depth = current_depth;
+			selected_secondary_radiance = current_secondary_radiance;
+			selected_secondary_transmittance = current_secondary_transmittance;
+		}
 	}
 
 	ivec3 output_coordinate = ivec3(pixel, view_layer);

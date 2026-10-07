@@ -168,6 +168,8 @@ struct FengCloudNativeShadowData {
 #endif
 #define FENG_CLOUD_DECLARE_NATIVE_SHADOW_DEPTH \
 	layout(set = 0, binding = 12) uniform sampler2DShadow cloud_native_shadow_depth
+#define FENG_CLOUD_DECLARE_BLUE_NOISE \
+	layout(set = 0, binding = 39) uniform sampler2D cloud_blue_noise_texture
 #define FENG_CLOUD_DECLARE_SCENE_DEPTH \
 	layout(set = 0, binding = 13) uniform sampler2D cloud_scene_depth
 #define FENG_CLOUD_DECLARE_MOTION \

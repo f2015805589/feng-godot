@@ -1,6 +1,33 @@
 {
   "schema": "feng-cloud-ue58-conversion-v1",
   "note": "Direct Godot resources preserve their decoded Unreal source payloads and were verified by reload/GPU readback. The 256-wide runtime Pattern resource is derived separately from the pinned CPU Blur1 reference chain; it is not a direct source-payload match or UE cooker/DDC output.",
+  "runtime_assets": [
+    {
+      "kind": "UE BlueNoiseScalar atlas",
+      "package": "/Engine/EngineMaterials/FastBlueNoise_scalar_128x128x64",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineMaterials/FastBlueNoise_scalar_128x128x64.uasset",
+      "source_uasset_bytes": 1061152,
+      "source_uasset_sha1": "E88C74A31E9A4C72C16D3265995C9D02F5D8ED16",
+      "source_uasset_sha256": "B7942616FAF1B08633B3D3D8C7544F7AA789853351CF0B555F121DCAEEAEC643",
+      "decoded_texture_dimensions": [
+        128,
+        128,
+        64
+      ],
+      "decoded_format": "R8_UNORM",
+      "decoded_texel_sha256": "B135DD62C73CDEE1920885D28BAF2B71643A0577934A77CDA6D584C35162DE0B",
+      "runtime_image": "misc/feng-addons/feng-cloud/resources/ue58/converted/FastBlueNoise_scalar_128x128x64.png",
+      "runtime_image_sha256": "02A613CAA2BC37231AE715536030678147EE8564516FA5D90763B46CACB321AB",
+      "runtime_image_dimensions": [
+        128,
+        8192
+      ],
+      "runtime_image_format": "grayscale8",
+      "runtime_image_decoded_texels_byte_exact": true,
+      "addressing": "UE coordinates are masked by 127,127,63 and the 128x128x64 texels are addressed in the 2D atlas as (x, slice*128+y); temporal input is frame index modulo 8. Reflection captures keep the midpoint offset.",
+      "limitations": "This records the source asset payload and coordinate mapping. It does not claim the Unreal cooker/DDC output or cross-platform cooked texture identity."
+    }
+  ],
   "tool": {
     "scope": "These tool details record conversion and GPU-readback checks for the direct source-payload resources above; the derived runtime Pattern build is recorded on its own texture entry.",
     "godot_version": "4.7.3.rc.custom_build.1e28d1f2e",

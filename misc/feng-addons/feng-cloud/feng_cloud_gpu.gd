@@ -16,6 +16,10 @@ const NATIVE_SHADOW_BYTES := 624
 const PROJECTION_BYTES := 560
 const CLOUD_ATMOSPHERE_VISIBILITY_BYTES := 32
 const MAX_BUFFER_STATES := 8
+const PURE_UE58_KERNEL_SHA256 := [
+	"1fca2733bbf40247374a16b71510c1bd45bdb83978c15af89ea997fbc624df10",
+	"84a48a812c126c163dc5f21c94637787df37bb41fc03f178350ac72f10d88f9b",
+]
 const VRT_MODE0_PHASE_ORDER := [0, 2, 3, 1]
 const VRT_MODE2_PHASE_ORDER := [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
 
@@ -106,7 +110,7 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if state.is_empty() or not _ensure_shadow_neutral_resources(rd,
 			map_enabled0 or map_enabled1, ao_enabled):
 		return false
-	if not _update_ubo(state, "material_ubo", packets.material, MATERIAL_BYTES, rd):
+	if not _update_ubo(state, "material_ubo", packets.material, MATERIAL_BYTES, rd, true):
 		return false
 	state.capture = ctx.has_method("is_cloud_capture") and bool(ctx.call("is_cloud_capture"))
 	var projection_data := _make_projection_parameters(snapshot, packets.lighting, packets.material, scene_data, 0, state)
@@ -216,7 +220,8 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		_release_buffer(buffers, rd)
 		_release_trace_branch_resources(rd)
 		return true
-	var mode := 3 if capture else clampi(vrt_mode, 0, 3)
+	var orthographic_view := scene_data.get_cam_projection().is_orthogonal()
+	var mode := 3 if capture or orthographic_view else clampi(vrt_mode, 0, 3)
 	var buffers_size := buffers.get_internal_size()
 	if buffers_size.x <= 0 or buffers_size.y <= 0:
 		return false
@@ -232,8 +237,11 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	var layout_inputs := _material_layout_inputs(ctx, snapshot, rd)
 	if not bool(layout_inputs.get("ok", false)):
 		return false
+	var blue_noise := _neutral_lut if capture else _blue_noise_texture(snapshot, rd)
+	if not blue_noise.is_valid():
+		return false
 	var source_signature := _source_signature(snapshot, material, inputs, layout_inputs.textures,
-		packets.lighting, packets.atmosphere, mode)
+		blue_noise, packets.lighting, packets.atmosphere, mode)
 	var now_usec := Time.get_ticks_usec()
 	if view == 0:
 		_begin_cloud_frame(ctx, state, snapshot, scene_data, buffers_size, source_signature, now_usec, mode, capture)
@@ -273,10 +281,19 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 			return false
 		state.ambient_signature = ambient_signature
 	var kernel_source := str(snapshot.get("material", {}).get("kernel_source", ""))
+	var material_snapshot: Dictionary = snapshot.get("material", {})
+	var kernel_layout := str(material_snapshot.get("kernel_layout", snapshot.get("kernel_layout", "builtin")))
+	var kernel_hash := kernel_source.sha256_text() if not kernel_source.is_empty() else ""
+	var pure_kernel := kernel_source.is_empty()
+	if kernel_layout == "ue58_default" \
+			and PURE_UE58_KERNEL_SHA256.has(kernel_hash):
+		pure_kernel = true
 	var secondary_enabled := mode == 0
 	var layout_defines: Dictionary = layout_inputs.get("defines", {}).duplicate()
 	layout_defines["FENG_CLOUD_VRT_SECONDARY"] = 1 if secondary_enabled else 0
-	var trace_pipeline := _ensure_pipeline(rd, "cloud_trace.glslinc", layout_defines, kernel_source)
+	layout_defines["FENG_CLOUD_SAFE_SELF_SHADOW_SATURATION_BREAK"] = 1 if pure_kernel else 0
+	var trace_pipeline := _ensure_pipeline(rd, "cloud_trace.glslinc", layout_defines,
+		kernel_source, kernel_hash)
 	var reconstruct_pipeline := _ensure_pipeline(rd, "cloud_reconstruct.glslinc", {"FENG_CLOUD_VRT_SECONDARY": 1 if secondary_enabled else 0})
 	var scene_format_layer := buffers.get_color_layer(view, false)
 	var composite_format := _scene_format_variant(rd, scene_format_layer)
@@ -295,6 +312,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	_add_uniform_buffer(trace_uniforms, 4, state.fog_ubo)
 	_add_uniform_buffer(trace_uniforms, 23, state.ubos.get("cloud_projection_ubo", RID()))
 	_add_uniform_buffer(trace_uniforms, 34, state.ubos.get("cloud_atmosphere_visibility_ubo", RID()))
+	_add_sampled(trace_uniforms, 39, _sampler, blue_noise)
 	_add_sampled(trace_uniforms, 5, _material_sampler, inputs[0])
 	_add_sampled(trace_uniforms, 6, _material_sampler, inputs[1])
 	_add_sampled(trace_uniforms, 7, _material_sampler, inputs[2])
@@ -948,8 +966,8 @@ func _packets_valid(packets: Dictionary) -> bool:
 
 
 func _update_shared_ubos(state: Dictionary, rd: RenderingDevice, packets: Dictionary) -> bool:
-	if not _update_ubo(state, "material_ubo", packets.material, MATERIAL_BYTES, rd) \
-			or not _update_ubo(state, "lighting_ubo", packets.lighting, LIGHTING_BYTES, rd):
+	if not _update_ubo(state, "material_ubo", packets.material, MATERIAL_BYTES, rd, true) \
+			or not _update_ubo(state, "lighting_ubo", packets.lighting, LIGHTING_BYTES, rd, true):
 		return false
 	var atmosphere: PackedFloat32Array = packets.atmosphere
 	var fog: PackedFloat32Array = packets.fog
@@ -963,9 +981,9 @@ func _update_shared_ubos(state: Dictionary, rd: RenderingDevice, packets: Dictio
 	if native_shadow.size() != 156:
 		native_shadow = PackedFloat32Array()
 		native_shadow.resize(156)
-	return _update_ubo(state, "atmosphere_ubo", atmosphere, ATMOSPHERE_BYTES, rd) \
-		and _update_ubo(state, "fog_ubo", fog, FOG_BYTES, rd) \
-		and _update_ubo(state, "native_shadow_ubo", native_shadow, NATIVE_SHADOW_BYTES, rd)
+	return _update_ubo(state, "atmosphere_ubo", atmosphere, ATMOSPHERE_BYTES, rd, true) \
+		and _update_ubo(state, "fog_ubo", fog, FOG_BYTES, rd, true) \
+		and _update_ubo(state, "native_shadow_ubo", native_shadow, NATIVE_SHADOW_BYTES, rd, true)
 
 
 func _update_cloud_atmosphere_ubos(ctx: FRPPassContext, state: Dictionary,
@@ -989,21 +1007,38 @@ func _update_cloud_atmosphere_ubos(ctx: FRPPassContext, state: Dictionary,
 
 
 func _update_ubo(state: Dictionary, key: String, values: PackedFloat32Array,
-		byte_count: int, rd: RenderingDevice) -> bool:
+		byte_count: int, rd: RenderingDevice, cache_identical: bool = false) -> bool:
 	if values.size() * 4 != byte_count:
 		_report("Cloud %s packet has %d bytes; expected %d." % [key, values.size() * 4, byte_count])
 		return false
 	var ubos: Dictionary = state.ubos
 	var buffer: RID = ubos.get(key, RID())
 	if not buffer.is_valid():
+		state.erase("ubo_cache_rid_" + key)
+		state.erase("ubo_cache_values_" + key)
 		buffer = rd.uniform_buffer_create(byte_count)
 		if not buffer.is_valid():
 			return false
 		ubos[key] = buffer
 		state.ubos = ubos
 	state[key] = buffer
+	var cached_rid: RID = state.get("ubo_cache_rid_" + key, RID())
+	var cached_values: Variant = state.get("ubo_cache_values_" + key, PackedFloat32Array())
+	if cache_identical and cached_rid == buffer and cached_values is PackedFloat32Array \
+			and cached_values == values:
+		return true
 	var bytes := values.to_byte_array()
-	return rd.buffer_update(buffer, 0, bytes.size(), bytes) == OK
+	if rd.buffer_update(buffer, 0, bytes.size(), bytes) != OK:
+		state.erase("ubo_cache_rid_" + key)
+		state.erase("ubo_cache_values_" + key)
+		return false
+	if cache_identical:
+		state["ubo_cache_rid_" + key] = buffer
+		state["ubo_cache_values_" + key] = values.duplicate()
+	else:
+		state.erase("ubo_cache_rid_" + key)
+		state.erase("ubo_cache_values_" + key)
+	return true
 
 
 func _update_ubo_bytes(state: Dictionary, key: String, bytes: PackedByteArray,
@@ -1357,7 +1392,7 @@ func _make_frame_packet(ctx: FRPPassContext, snapshot: Dictionary, scene_data: R
 
 
 func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textures: Array[RID],
-		layout_textures: Array, lighting: PackedFloat32Array,
+		layout_textures: Array, blue_noise: RID, lighting: PackedFloat32Array,
 		atmosphere: PackedFloat32Array, mode: int) -> int:
 	var appearance := material.duplicate()
 	if appearance.size() >= 28:
@@ -1386,10 +1421,28 @@ func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textu
 		snapshot.get("shadow_tracing_distance_m", 0.0),
 		snapshot.get("sky_rendering_signature", []), snapshot.get("cloud_shadow", {}),
 		snapshot.get("sky_ao", {}), snapshot.get("sun_inputs", []),
-		lighting, history_atmosphere, appearance, ids, mode,
+		lighting, history_atmosphere, appearance, ids, _rid_id(blue_noise), mode,
 		layout_ids, str(snapshot.get("material", {}).get("kernel_layout", snapshot.get("kernel_layout", "builtin"))),
 		str(snapshot.get("material", {}).get("kernel_source", "")),
 	])
+
+
+func _blue_noise_texture(snapshot: Dictionary, rd: RenderingDevice) -> RID:
+	var resource: Variant = snapshot.get("blue_noise_texture")
+	if not resource is Texture2D or not is_instance_valid(resource):
+		_report("UE cloud tracing requires the published BlueNoiseScalar texture.")
+		return RID()
+	var texture := RenderingServer.texture_get_rd_texture(resource.get_rid())
+	if not _valid_texture(rd, texture):
+		_report("UE cloud BlueNoiseScalar has no live RenderingDevice texture.")
+		return RID()
+	var texture_format: RDTextureFormat = rd.texture_get_format(texture)
+	if texture_format == null or texture_format.texture_type != RenderingDevice.TEXTURE_TYPE_2D \
+			or texture_format.width != 128 or texture_format.height != 8192 \
+			or texture_format.format != RenderingDevice.DATA_FORMAT_R8_UNORM:
+		_report("UE cloud BlueNoiseScalar must be an R8 128x8192 2D texture.")
+		return RID()
+	return texture
 
 
 func _make_projection_parameters(snapshot: Dictionary, lighting: PackedFloat32Array,
@@ -1685,14 +1738,15 @@ func _rid_id(rid: RID) -> int:
 
 
 func _ensure_pipeline(rd: RenderingDevice, filename: String, defines: Dictionary = {},
-		material_kernel_source: String = "") -> Dictionary:
+		material_kernel_source: String = "", material_kernel_hash: String = "") -> Dictionary:
 	var define_keys := defines.keys()
 	define_keys.sort()
 	var key_parts := PackedStringArray([filename])
 	for define_key in define_keys:
 		key_parts.append("%s=%s" % [str(define_key), str(defines[define_key])])
 	if not material_kernel_source.is_empty():
-		key_parts.append("kernel=" + material_kernel_source.sha256_text())
+		key_parts.append("kernel=" + (material_kernel_hash if not material_kernel_hash.is_empty()
+				else material_kernel_source.sha256_text()))
 	var key := "|".join(key_parts)
 	if _pipelines.has(key):
 		return _pipelines[key]

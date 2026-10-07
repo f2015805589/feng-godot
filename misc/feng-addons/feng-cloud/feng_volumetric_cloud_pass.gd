@@ -39,7 +39,9 @@ func _render(_buffers: RenderSceneBuffersRD, _view: int, _rd: RenderingDevice) -
 
 
 func _frp_prepare(ctx: FRPPassContext) -> void:
-	var snapshot := _frame_snapshot.duplicate(true)
+	# Runtime target routing already gives this pass its private snapshot copy;
+	# capture routing owns the frozen copy installed by _frp_prepare_with_snapshot.
+	var snapshot: Dictionary = _frame_snapshot
 	if snapshot.is_empty() and ctx != null:
 		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 		snapshot = _snapshot_for_target(buffers)
@@ -58,7 +60,8 @@ func _frp_prepare_with_snapshot(ctx: FRPPassContext, frozen_snapshot: Dictionary
 func _publish_snapshot(ctx: FRPPassContext, source_snapshot: Dictionary) -> void:
 	if ctx == null or not ctx.has_method("set_cloud_snapshot"):
 		return
-	var snapshot := source_snapshot.duplicate(true)
+	# This packet builder only reads the pass-owned immutable snapshot.
+	var snapshot: Dictionary = source_snapshot
 	if snapshot.is_empty():
 		ctx.call("clear_cloud_snapshot")
 		return

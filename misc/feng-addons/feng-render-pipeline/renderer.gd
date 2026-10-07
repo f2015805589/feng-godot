@@ -24,8 +24,10 @@ const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
 ## is plugin-side code and the engine's own passes are the no-pipeline fallback.
 ## Schema 7 moved Eye Adaptation before the post-tonemap library effects. Schema 8 adds
-## the engine's native Bloom entry after Eye Adaptation and before Color Grade.
-const PIPELINE_SCHEMA_VERSION := 8
+## the engine's native Bloom entry after Eye Adaptation and before Color Grade. Schema 9
+## moves only the released contiguous Sky/Cloud/Trace/Fog stock sequence so cloud
+## composition receives the fog packet before it runs.
+const PIPELINE_SCHEMA_VERSION := 9
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -263,6 +265,8 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 		changed = _migrate_eye_adaptation_order() or changed
 	if previous_version < 8:
 		changed = _migrate_bloom_pass() or changed
+	if previous_version < 9:
+		changed = _migrate_legacy_cloud_fog_order() or changed
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
@@ -493,6 +497,99 @@ func _migrate_bloom_pass() -> bool:
 
 	_passes.insert(insert_index, _make_native_pass(NativeSpec.PASS_BLOOM))
 	return true
+
+## Schema 9 repairs only the released contiguous stock order. Projects that have
+## moved, replaced, duplicated, or interleaved any of these entries keep their order.
+func _migrate_legacy_cloud_fog_order() -> bool:
+	var cloud_template_script := _stock_library_script("cloud/volumetric_cloud.tres")
+	var trace_template_script := _stock_library_script("cloud/cloud_trace.tres")
+	var fog_template_script := _stock_library_script("height-fog/height_fog.tres")
+	if cloud_template_script == null or trace_template_script == null or fog_template_script == null:
+		return false
+	var cloud_script_indices := _pass_indices_for_script(cloud_template_script)
+	var trace_script_indices := _pass_indices_for_script(trace_template_script)
+	var fog_script_indices := _pass_indices_for_script(fog_template_script)
+	if cloud_script_indices.size() != 1 or trace_script_indices.size() != 1 or fog_script_indices.size() != 1:
+		return false
+
+	var sky_index := -1
+	var cloud_index := -1
+	var trace_index := -1
+	var fog_index := -1
+	for i in _passes.size():
+		var pass_entry := _passes[i]
+		if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_SKY:
+			if sky_index >= 0:
+				return false
+			sky_index = i
+		elif pass_entry == null:
+			continue
+		elif pass_entry.stable_id == &"library:volumetric_cloud":
+			if cloud_index >= 0:
+				return false
+			cloud_index = i
+		elif pass_entry.stable_id == &"library:cloud_trace":
+			if trace_index >= 0:
+				return false
+			trace_index = i
+		elif pass_entry.stable_id == &"library:height_fog":
+			if fog_index >= 0:
+				return false
+			fog_index = i
+	if sky_index < 0 or cloud_index < 0 or trace_index < 0 or fog_index < 0:
+		return false
+	if cloud_index != sky_index + 1 or trace_index != cloud_index + 1 or fog_index != trace_index + 1:
+		return false
+
+	var sky_entry := _passes[sky_index] as BuiltinPass
+	if sky_entry.stable_id != "native:%d" % NativeSpec.PASS_SKY or sky_entry.implementation == null:
+		return false
+	var sky_script := sky_entry.implementation.get_script() as Script
+	if sky_script == null or sky_script.resource_path != FengAddonLayout.passes_dir() + "native/sky_pass.gd":
+		return false
+	if sky_entry.implementation.get("overlay") != null:
+		return false
+	if not _matches_stock_library_script(_passes[cloud_index], "cloud/volumetric_cloud.tres"):
+		return false
+	if not _matches_stock_library_script(_passes[trace_index], "cloud/cloud_trace.tres"):
+		return false
+	if not _matches_stock_library_script(_passes[fog_index], "height-fog/height_fog.tres"):
+		return false
+	if cloud_index != cloud_script_indices[0] or trace_index != trace_script_indices[0] \
+			or fog_index != fog_script_indices[0]:
+		return false
+
+	var trace_pass: PassBase = _passes[trace_index]
+	_passes[trace_index] = _passes[fog_index]
+	_passes[fog_index] = trace_pass
+	return true
+
+func _matches_stock_library_script(pass_entry: PassBase, template_path: String) -> bool:
+	var template_script := _stock_library_script(template_path)
+	if template_script == null:
+		return false
+	var pass_script: Script = null
+	if pass_entry != null:
+		pass_script = pass_entry.get_script() as Script
+	return pass_script != null and pass_script.resource_path == template_script.resource_path
+
+func _stock_library_script(template_path: String) -> Script:
+	var template: Variant = load(FengAddonLayout.library_dir() + "/" + template_path)
+	if not template is Resource:
+		return null
+	var template_script := template.get_script() as Script
+	return template_script
+
+func _pass_indices_for_script(target_script: Script) -> Array[int]:
+	var indices: Array[int] = []
+	for i in _passes.size():
+		var pass_entry := _passes[i]
+		if pass_entry == null:
+			continue
+		var pass_script := pass_entry.get_script() as Script
+		if pass_script != null and pass_script.resource_path == target_script.resource_path:
+			indices.append(i)
+	return indices
 
 func _normalize_native_entries() -> bool:
 	var changed := false

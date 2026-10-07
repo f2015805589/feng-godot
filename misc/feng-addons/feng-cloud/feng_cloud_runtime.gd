@@ -9,10 +9,13 @@ extends RefCounted
 
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
+const BLUE_NOISE_TEXTURE_PATH := "res://addons/feng-cloud/resources/ue58/converted/FastBlueNoise_scalar_128x128x64.png"
 
 static var _providers_by_world: Dictionary = {} # world id -> Array[Dictionary]
 static var _published_by_world: Dictionary = {} # render-thread-safe copied snapshots; no Node access.
 static var _published_mutex := Mutex.new()
+static var _blue_noise_texture: Texture2D
+static var _blue_noise_load_attempted := false
 static var _next_sequence := 0
 static var _snapshot_worlds_queried := false
 static var _snapshot_worlds: GDScript
@@ -65,6 +68,11 @@ static func publish_cloud(cloud: FengVolumetricCloud, world_id: int, snapshot: D
 		var entry: Dictionary = entries[index]
 		if int(entry.get("owner_id", 0)) == owner_id:
 			var published := snapshot.duplicate(true)
+			var blue_noise := _load_blue_noise_texture()
+			if blue_noise != null and is_instance_valid(blue_noise):
+				published["blue_noise_texture"] = blue_noise
+			else:
+				published.erase("blue_noise_texture")
 			var world := cloud.get_world_3d()
 			var worlds := _get_snapshot_worlds()
 			if world != null and is_instance_valid(world) and worlds != null and worlds.has_method("targets_for"):
@@ -77,6 +85,33 @@ static func publish_cloud(cloud: FengVolumetricCloud, world_id: int, snapshot: D
 			_providers_by_world[world_id] = entries
 			_refresh_published_world(world_id)
 			return
+
+
+## Load once on the main thread and keep a strong reference while snapshots are
+## published. The render callback only borrows this texture's RenderingDevice RID.
+static func _load_blue_noise_texture() -> Texture2D:
+	if _blue_noise_load_attempted:
+		return _blue_noise_texture
+	_blue_noise_load_attempted = true
+	var png_bytes := FileAccess.get_file_as_bytes(BLUE_NOISE_TEXTURE_PATH)
+	if png_bytes.is_empty():
+		push_error("Feng Cloud could not read the UE blue-noise texture at its expected 128x8192 size.")
+		return null
+	var image := Image.new()
+	var decode_error := image.load_png_from_buffer(png_bytes)
+	if decode_error != OK or image.is_empty() or image.get_width() != 128 or image.get_height() != 8192:
+		push_error("Feng Cloud could not load the UE blue-noise texture at its expected 128x8192 size.")
+		return null
+	if image.get_format() != Image.FORMAT_R8 and image.get_format() != Image.FORMAT_L8:
+		push_error("Feng Cloud UE blue-noise source must decode as a single-channel 8-bit image.")
+		return null
+	if image.get_format() != Image.FORMAT_R8:
+		image.convert(Image.FORMAT_R8)
+	_blue_noise_texture = ImageTexture.create_from_image(image)
+	if _blue_noise_texture == null or not is_instance_valid(_blue_noise_texture):
+		push_error("Feng Cloud could not create its UE blue-noise texture.")
+		return null
+	return _blue_noise_texture
 
 
 static func snapshot_for_world(world_id: int) -> Dictionary:
@@ -113,6 +148,25 @@ static func snapshots() -> Array[Dictionary]:
 			result.append(snapshot.duplicate(true))
 	_published_mutex.unlock()
 	return result
+
+
+## Returns a private copy of only the cloud snapshot routed to this render target.
+## Render callbacks read the published value data under the same mutex used by
+## the main-thread publisher; no Node or World3D access occurs here.
+static func snapshot_for_target(target: RID) -> Dictionary:
+	if not target.is_valid():
+		return {}
+	var matched_snapshot: Dictionary = {}
+	_published_mutex.lock()
+	for snapshot in _published_by_world.values():
+		if not snapshot is Dictionary or snapshot.is_empty():
+			continue
+		var targets: Variant = snapshot.get("render_targets", [])
+		if targets is Array and targets.has(target):
+			matched_snapshot = snapshot
+			break
+	_published_mutex.unlock()
+	return matched_snapshot.duplicate(true) if not matched_snapshot.is_empty() else {}
 
 
 ## Called on the main thread after a provider publishes or leaves. Render callbacks
