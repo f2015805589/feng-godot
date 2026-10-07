@@ -1,0 +1,114 @@
+{
+  "schema": "feng_cloud_ue58_default_kernel_source_map/v1",
+  "source_asset": "/Engine/EngineSky/VolumetricClouds/m_SimpleVolumetricCloud_Inst",
+  "source_material": "/Engine/EngineSky/VolumetricClouds/m_SimpleVolumetricCloud",
+  "source_active_path": "UE 5.8 desktop Deferred; all four ShadingPathSwitch inputs[0] selected",
+  "source_ast": {
+    "path": "C:/Temp/feng-cloud-ue58-20261007/active-deferred-ast/active_deferred_material_ast.json",
+    "sha256": "D6821214559A8F43B95EA001479A8C07801E51479E2ADBA8FDD3522F6EC5E358"
+  },
+  "conservative_density_closure": {
+    "path": "C:/Temp/feng-cloud-ue58-20261007/active-deferred-ast/conservative_density_active_paths.json",
+    "sha256": "DF7EBCB491B2A149AF3DE0ED7097A97598A2B0CC2715FB28BC07C8A5E8A70B3C",
+    "active_default_rgba": {
+      "r": "max(pattern.R, pattern.G, pattern.B)",
+      "g": "max(pattern.R, pattern.G, pattern.B)",
+      "b": "max(profile.R(normAlt,pattern.R), profile.G(normAlt,pattern.G), profile.B(normAlt,pattern.B)) - 0.5",
+      "a": "0.8 * (noiseSample.G - 0.5 - 0.2)"
+    }
+  },
+  "subsurface_formula": {
+    "source_extract": "C:/Temp/feng-cloud-ue58-20261007/active-deferred-ast/conservative-density-formulas.md",
+    "source_extract_sha256": "F004CC4A397130BB5A884E470241EA20FC0A5D4F912A1FD3D98E74FF57E9CD40",
+    "expression": "saturate(If(normAlt,0.5,0,1,0,threshold=0.4799999893) * 0.008 * saturate(length(cameraRelativePositionCm) * 1.99999995e-5) * (CD.g * (CD.b + CD.a) + dot(mask.rgb * (1,1,1), (0,0,0)) * 0.001))",
+    "units": "UE integrates SubsurfaceColor as extinction per meter; kernel converts to per-kilometer once for Feng transport."
+  },
+  "coordinates": {
+    "input": "Godot absolute world position in kilometers",
+    "basis": "UE = (Godot.x, -Godot.z, Godot.y), preserving right-handedness; wind_offset_km is added in Godot world space before basis conversion and only affects material coordinates.",
+    "global_scale_km": 256.0,
+    "global_texture_placement_default_rgba": [0.0, 0.0, 0.0, 0.0],
+    "global_placement_evidence": "VectorParameter_18 has no serialized DefaultValue; parent material and instance have no override; VectorParameter CDO remains zero-initialized. It drives both placement and Rotator time, so the default rotation is zero.",
+    "truncate_lwc": "Source graph applies TruncateLWC after the world-position-to-global-scale division. Kernel receives float-kilometer coordinates and treats that conversion as identity."
+  },
+  "texture_sampling": {
+    "pattern": "T_CloudPattern; linear; shared Wrap sampler; the material node is TMVM_None, but UE cloud view, reflection, shadow, and SkyAO paths force mip 0 (USE_FORCE_TEXTURE_MIP=1). The kernel uses textureLod(...,0) to preserve that renderer contract; RGB drives ConservativeDensity R/G and profile coordinates.",
+    "cloud_mask": "T_CloudMask; linear; shared Wrap sampler; sample at mip 0 to match UE's forced cloud-view, shadow, and SkyAO mip; RGB enters the graph mask expression.",
+    "height_profile": "T_Profile_08; linear; shared Wrap sampler; explicit MipLevel=0; three samples at (normalized altitude, matching pattern R/G/B), selecting corresponding R/G/B.",
+    "shape_noise": "VT_PerlinWorley_Balanced; linear; shared Wrap sampler; sample12 uses R at explicit mip0 to warp sample9 coordinates; sample9 uses G at explicit mip0 for ConservativeDensity A.",
+    "pattern_runtime_mip_chain": {
+      "resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/T_CloudPattern_UE58_Runtime256.res",
+      "resource_sha256": "E136C45B3D908E8E3A107700E0D97D5D1FC2C96610D3E6E8755E0BFFB2948A46",
+      "reference_chain_sha256": "D16495060F3A038739847FA384DCAAEF97EC35AEE363707E98CA5E6948C77287",
+      "reference_chain_bytes": 1398096,
+      "godot_rgba_image_data_byte_exact_to_reference": true,
+      "ue_cooker_or_ddc_output": false,
+      "description": "Pinned source-order float32 CPU reference of legacy TMGS_Blur1, from the 1024 source through the 256 size cap and full 256-to-1 mip chain; Godot save/reload preserves the uncompressed RGBAF mip payload. This is not platform-cooked UE texture output."
+    },
+    "time_texture_size": "TextureProperty_1 defaults to TMTM_TextureSize; kernel uses textureSize(pattern,0).x for the Time divisor so the actual runtime texture extent drives the same graph input."
+  },
+  "forced_mip_source": {
+    "file": "Engine/Source/Runtime/Renderer/Private/VolumetricCloudRendering.cpp",
+    "view_pixel_shader_define": "853-854",
+    "view_compute_shader_define": "973-974",
+    "empty_space_compute_shader_define": "1056-1057",
+    "cloud_shadow_pixel_shader_define": "1378-1403",
+    "contract": "These stages set USE_FORCE_TEXTURE_MIP=1; MaterialTemplate.ush applies forced level 0 when the graph node has no explicit mip. The same kernel sample at mip 0 is used by cloud trace, cloud shadow, and SkyAO dispatches."
+  },
+  "serialized_material_defaults": {
+    "layout_cloud_type": [1.0, 1.0, 1.0, 2.0],
+    "layout_cloud_type_mask": [0.0, 0.0, 0.0, 1.0],
+    "layout_cloud_per_type_scale": [1.0, 1.0, 1.0, 1.0],
+    "layout_wind_controls": [1.0, 1.0, 0.5, 0.33333298563957214],
+    "noise1_coordinates": [4.166999816894531, 4.443999767303467, 9.090999603271484, 7.0],
+    "noise2_coordinates": [60.0, 60.0, 75.0, -6.0],
+    "noise_strength": [0.800000011920929, 0.07999999821186066, 0.029999999329447746, 2.5],
+    "noise_bias": [0.5, 0.800000011920929, 0.5, 0.0],
+    "global_coverage": -0.20000000298023224,
+    "global_density": 0.00800000037997961,
+    "base_color": [0.98, 0.98, 0.98],
+    "emission": [0.0, 0.0, 0.0],
+    "ambient_occlusion": 0.5,
+    "storm_clouds_cdo_default": 0.0,
+    "use_noise3_cdo_default": false,
+    "time_period_seconds": 9999999.0,
+    "phase_g_g2_blend": [0.8, 0.166667, 0.575],
+    "multiscatter_octaves_contribution_occlusion_eccentricity": [2, 0.666667, 0.25, 0.18]
+  },
+  "constructor_and_pin_defaults": {
+    "source_headers": [
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionAdd.h:27-31 (ConstA=0, ConstB=1)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionMultiply.h:27-31 (ConstA=0, ConstB=1)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionSubtract.h:27-31 (ConstA=1, ConstB=1)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDivide.h:27-31 (ConstA=1, ConstB=2)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionLinearInterpolate.h:29-37 (ConstA=0, ConstB=1, ConstAlpha=0.5)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionIf.h:40 (ConstB=0); serialized input pins and threshold override are used where present",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionRotator.h:24-30 (center=(0.5,0.5), speed=0.25)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureProperty.h:29 (default property TMTM_TextureSize)",
+      "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionWorldPosition.h:20-24 (default WPT_Default: absolute world position including material offsets)",
+      "Engine/Source/Runtime/Core/Public/Math/Color.h:126 (FLinearColor defaulted constructor); MaterialExpressionVectorParameter CDO constructor at MaterialExpressions.cpp:8014-8028 does not assign DefaultValue"
+    ],
+    "unserialized_constants": "MaterialExpressionConstant_3 and _6 have no serialized R; MaterialExpressions.cpp:5057-5063 does not assign R, so their zero-initialized CDO value makes the connected noise mip inputs explicit LOD 0. Constant_5 is likewise CDO-zero for both If greater/less branches. Constant3Vector_2 is serialized as (0.5,0.5,0).",
+    "output_index_coercions": {
+      "texture_sample": "0=RGB, 1=R, 2=G, 3=B, 4=A (MaterialExpressions.cpp:2570-2579)",
+      "vector_parameter": "0=RGB, 1=R, 2=G, 3=B, 4=A (MaterialExpressions.cpp:8018-8024)",
+      "append_vector_1": "A receives WindControls.rgb * WindControls.a; B receives Time / (PatternTextureSize.x * 256 km * 1000), yielding RGB wind and A time before masks select them."
+    }
+  },
+  "generic_material_parameters_not_consumed_by_this_graph": [
+    "density_scale",
+    "extinction_per_km resource value",
+    "albedo_linear resource value",
+    "emission_per_km resource value",
+    "coverage",
+    "detail_texture and detail_strength",
+    "weather_texture and weather_strength",
+    "curl_noise_texture and curl_strength",
+    "conservative_density resource value"
+  ],
+  "known_scope_limits": [
+    "This implements the serialized default MI active Deferred graph, not UE Forward/Mobile shading paths or arbitrary material graph editing.",
+    "T_CloudPattern source is 1024x1024 with MaxTextureSize 256; UE TextureProperty resolves the built runtime resource size (256x256 for this asset), and the kernel uses textureSize(pattern,0).x for that same input. The runtime RGBAF texture uses the pinned source-order float32 CPU reference chain for legacy TMGS_Blur1 from mip 256 through mip 1; Godot image save/reload preserves that chain byte-for-byte. This reference is not UE cooker/DDC output, so platform-cooked texel identity is not claimed; GPU output parity remains unvalidated.",
+    "The shader language/kernel is specialized for the supplied UE default texture set; custom kernels remain a separate path."
+  ]
+}

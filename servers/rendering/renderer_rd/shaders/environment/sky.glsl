@@ -117,6 +117,14 @@ layout(set = 2, binding = 2) uniform texture2D quarter_res;
 #endif
 
 layout(set = 3, binding = 0) uniform texture3D volumetric_fog_texture;
+layout(set = 3, binding = 1, std140) uniform CloudVisibilityData {
+	vec4 projection[35];
+	vec4 sun_mapping; // atmosphere sun 0/1 -> cloud slot, then cloud-map validity.
+	vec4 flags; // raw AO validity, reserved.
+} cloud_visibility;
+layout(set = 3, binding = 2) uniform texture2D cloud_shadow0_texture;
+layout(set = 3, binding = 3) uniform texture2D cloud_shadow1_texture;
+layout(set = 3, binding = 4) uniform texture2D cloud_raw_ao_texture;
 
 #ifdef USE_CUBEMAP_PASS
 #define AT_CUBEMAP_PASS true
@@ -135,6 +143,74 @@ layout(set = 3, binding = 0) uniform texture3D volumetric_fog_texture;
 #else
 #define AT_QUARTER_RES_PASS false
 #endif
+
+bool frp_sky_cloud_project(vec3 p_world_position_m, int p_matrix_index, float p_far_depth_km, out vec2 r_uv, out float r_depth_km) {
+	int base = p_matrix_index * 4;
+	mat4 world_to_cloud = mat4(
+		cloud_visibility.projection[base + 0], cloud_visibility.projection[base + 1],
+		cloud_visibility.projection[base + 2], cloud_visibility.projection[base + 3]);
+	vec4 projected = world_to_cloud * vec4(p_world_position_m, 1.0);
+	if (!(projected.w > 0.0) || isnan(projected.w) || isinf(projected.w)) {
+		return false;
+	}
+	vec3 ndc = projected.xyz / projected.w;
+	if (any(lessThan(ndc.xy, vec2(-1.0))) || any(greaterThan(ndc.xy, vec2(1.0))) || ndc.z < 0.0 || ndc.z > 1.0) {
+		return false;
+	}
+	r_uv = ndc.xy * 0.5 + 0.5;
+	r_depth_km = clamp(1.0 - ndc.z, 0.0, 1.0) * max(p_far_depth_km, 0.0);
+	return true;
+}
+
+float frp_sky_cloud_shadow_visibility(vec3 p_world_position_m, int p_atmo_sun_slot) {
+	if (p_atmo_sun_slot < 0 || p_atmo_sun_slot > 1) {
+		return 1.0;
+	}
+	float cloud_slot_value = p_atmo_sun_slot == 0 ? cloud_visibility.sun_mapping.x : cloud_visibility.sun_mapping.y;
+	if (cloud_slot_value < 0.0 || cloud_slot_value > 1.0) {
+		return 1.0;
+	}
+	int cloud_slot = int(cloud_slot_value + 0.5);
+	float map_valid = cloud_slot == 0 ? cloud_visibility.sun_mapping.z : cloud_visibility.sun_mapping.w;
+	if (map_valid <= 0.5) {
+		return 1.0;
+	}
+	float far_depth_km = cloud_slot == 0 ? cloud_visibility.projection[24].x : cloud_visibility.projection[24].y;
+	vec2 uv;
+	float surface_depth_km;
+	if (!frp_sky_cloud_project(p_world_position_m, cloud_slot, far_depth_km, uv, surface_depth_km)) {
+		return 1.0;
+	}
+	vec4 shadow = cloud_slot == 0
+			? textureLod(sampler2D(cloud_shadow0_texture, SAMPLER_LINEAR_CLAMP), uv, 0.0)
+			: textureLod(sampler2D(cloud_shadow1_texture, SAMPLER_LINEAR_CLAMP), uv, 0.0);
+	if (!(shadow.a > 0.0) || any(isnan(shadow)) || any(isinf(shadow)) || any(lessThan(shadow.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(shadow.r, 0.0)) * 1000.0);
+	float optical_depth = min(max(shadow.b, 0.0), distance_after_cloud_m * max(shadow.g, 0.0));
+	float visibility = exp(-min(optical_depth, 80.0));
+	float strength = cloud_slot == 0 ? cloud_visibility.projection[26].z : cloud_visibility.projection[26].w;
+	return mix(1.0, visibility, clamp(strength, 0.0, 1.0));
+}
+
+float frp_sky_cloud_multiple_visibility(vec3 p_world_position_m) {
+	if (cloud_visibility.flags.x <= 0.5) {
+		return 1.0;
+	}
+	vec2 uv;
+	float surface_depth_km;
+	if (!frp_sky_cloud_project(p_world_position_m, 4, cloud_visibility.projection[31].x, uv, surface_depth_km)) {
+		return 1.0;
+	}
+	vec4 ao = textureLod(sampler2D(cloud_raw_ao_texture, SAMPLER_LINEAR_CLAMP), uv, 0.0);
+	if (!(ao.a > 0.0) || any(isnan(ao)) || any(isinf(ao)) || any(lessThan(ao.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(ao.r, 0.0)) * 1000.0);
+	float optical_depth = min(max(ao.b, 0.0), distance_after_cloud_m * max(ao.g, 0.0));
+	return exp(-min(optical_depth, 80.0));
+}
 
 #GLOBALS
 

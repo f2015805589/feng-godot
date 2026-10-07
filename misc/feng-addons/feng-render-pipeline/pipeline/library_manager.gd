@@ -27,7 +27,10 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
 	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade", "default_enabled": true},
 	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
+	{"id": "library:cloud_shadow", "path": "cloud/cloud_shadow.tres", "name": "Cloud Shadows", "default_enabled": true, "after_native": NativeSpec.PASS_GBUFFER, "missing_anchor_warning": "Cloud Shadows was not seeded because this pipeline has no native G-buffer entry."},
+	{"id": "library:cloud_trace", "path": "cloud/cloud_trace.tres", "name": "Volumetric Cloud Trace", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Volumetric Cloud Trace was not seeded because this pipeline has no native Sky entry."},
 	{"id": "library:height_fog", "path": "height-fog/height_fog.tres", "name": "Height Fog", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Height Fog was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
+	{"id": "library:volumetric_cloud", "path": "cloud/volumetric_cloud.tres", "name": "Volumetric Cloud", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Volumetric Cloud was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
 	{"id": "library:debug_buffers", "path": "debug-buffers/debug_buffers.tres", "name": "Debug Buffers", "default_enabled": false, "after_native": NativeSpec.PASS_POST_PROCESS},
 ]
 
@@ -38,6 +41,9 @@ const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:color_grade",
 	"library:magic_gi",
 	"library:height_fog",
+	"library:volumetric_cloud",
+	"library:cloud_shadow",
+	"library:cloud_trace",
 	"library:debug_buffers",
 ]
 

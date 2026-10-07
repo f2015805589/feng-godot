@@ -1,0 +1,167 @@
+#ifndef FENG_CLOUD_ATMOSPHERE_TRANSPORT_GLSLINC
+#define FENG_CLOUD_ATMOSPHERE_TRANSPORT_GLSLINC
+
+#define ATMO_PARAMS cloud_atmosphere_block.lane
+#define ATMO_OPTICAL cloud_atmosphere_optical_texture
+#define ATMO_MULTIPLE cloud_atmosphere_multiple_texture
+#include "../../feng-render-pipeline/library/height-fog/atmosphere_inc.glslinc"
+#undef ATMO_PARAMS
+#undef ATMO_OPTICAL
+#undef ATMO_MULTIPLE
+
+// The cached distant-sky estimate deliberately excludes cloud visibility to
+// avoid feeding the cloud's own shadow/AO outputs back into its ambient input.
+// Keep the pre-visibility four-argument call used by that estimator working;
+// the shared transport macros above default to neutral visibility.
+void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radiance, out vec3 transmission) {
+	frp_atmo_aerial(camera_to_receiver_m, eye_offset_m, vec3(0.0), radiance, transmission);
+}
+
+struct FengCloudAtmosphereComponents {
+	vec3 rayleigh_radiance;
+	vec3 mie_radiance;
+	vec3 rayleigh_transmittance;
+	vec3 mie_transmittance;
+};
+
+float feng_cloud_atmosphere_integral_factor(float sigma_per_km, float distance_km) {
+	float sigma = max(feng_cloud_finite_or_zero(sigma_per_km), 0.0);
+	float distance = max(feng_cloud_finite_or_zero(distance_km), 0.0);
+	float tau = sigma * distance;
+	if (tau < 1e-3) {
+		float tau2 = tau * tau;
+		return distance * (1.0 - 0.5 * tau + tau2 * (1.0 / 6.0 - tau / 24.0));
+	}
+	if (tau >= 80.0 || isinf(tau)) {
+		return 1.0 / max(sigma, 1e-20);
+	}
+	return (1.0 - exp(-tau)) / sigma;
+}
+
+// Split Rayleigh and Mie AP using the same FRP packet, density curves, optical
+// LUT, multi-scatter LUT, and integration sampling as the shared atmosphere.
+// This is needed because UE applies independent Rayleigh and Mie fade ranges to
+// clouds. The existing combined FRP helper cannot represent that material API.
+FengCloudAtmosphereComponents feng_cloud_atmosphere_aerial_components(vec3 camera_to_receiver_m, vec3 camera_world_position_m) {
+	FengCloudAtmosphereComponents result;
+	result.rayleigh_radiance = vec3(0.0);
+	result.mie_radiance = vec3(0.0);
+	result.rayleigh_transmittance = vec3(1.0);
+	result.mie_transmittance = vec3(1.0);
+
+	float receiver_distance_km = length(camera_to_receiver_m) * FENG_CLOUD_M_TO_KM * cloud_atmosphere_block.lane[6].w;
+	if (!(receiver_distance_km > cloud_atmosphere_block.lane[6].z) || !(receiver_distance_km > 1e-6)) {
+		return result;
+	}
+	vec3 direction = feng_cloud_safe_normalize3(camera_to_receiver_m, vec3(0.0, 0.0, -1.0));
+	vec3 origin = cloud_atmosphere_block.lane[0].xyz;
+	float bottom = max(cloud_atmosphere_block.lane[0].w, 0.0);
+	float radius = length(origin);
+	origin = (radius > 1e-5 ? origin / radius : vec3(0.0, 1.0, 0.0)) * max(radius, bottom + 0.001);
+	radius = length(origin);
+	float top = bottom + max(cloud_atmosphere_block.lane[4].w, 0.0);
+	float b = dot(origin, direction);
+	float discriminant = b * b - (radius - top) * (radius + top);
+	if (!(discriminant >= 0.0)) {
+		return result;
+	}
+	float top_root = sqrt(max(discriminant, 0.0));
+	float begin_km = max(cloud_atmosphere_block.lane[6].z, -b - top_root);
+	float end_km = min(receiver_distance_km, -b + top_root);
+	float ground_discriminant = b * b - (radius - bottom) * (radius + bottom);
+	if (ground_discriminant >= 0.0 && b < 0.0) {
+		end_km = min(end_km, -b - sqrt(ground_discriminant));
+	}
+	if (!(end_km > begin_km)) {
+		return result;
+	}
+
+	int samples = int(clamp(cloud_atmosphere_block.lane[7].w, 2.0, 64.0));
+	float mie_g = cloud_atmosphere_block.lane[3].w;
+	vec2 phase[2];
+	for (int slot = 0; slot < 2; ++slot) {
+		vec4 light = cloud_atmosphere_block.lane[8 + slot * 2];
+		phase[slot] = vec2(0.0);
+		if (light.w <= 0.0) {
+			continue;
+		}
+		float mu = clamp(dot(direction, light.xyz), -1.0, 1.0);
+		phase[slot].x = 3.0 * (1.0 + mu * mu) / (16.0 * FRP_ATMO_PI);
+		phase[slot].y = frp_atmo_mie_phase(mie_g, mu);
+	}
+	vec3 ray_origin = origin + direction * begin_km;
+	// The atmosphere packet stores camera-relative-to-planet coordinates, while
+	// cloud visibility matrices are in absolute renderer world coordinates.
+	vec3 planet_center_world_m = camera_world_position_m - cloud_atmosphere_block.lane[0].xyz * FENG_CLOUD_KM_TO_M;
+	float path_km = end_km - begin_km;
+	bool downward = dot(ray_origin, direction) < 0.0;
+	for (int i = 0; i < 64; ++i) {
+		if (i >= samples) {
+			break;
+		}
+		float a = float(i) / float(samples);
+		float z = float(i + 1) / float(samples);
+		a = downward ? 1.0 - (1.0 - a) * (1.0 - a) : a * a;
+		z = downward ? 1.0 - (1.0 - z) * (1.0 - z) : z * z;
+		float ds_km = (z - a) * path_km;
+		vec3 p = ray_origin + direction * ((a + z) * 0.5 * path_km);
+		vec3 sample_world_position_m = planet_center_world_m + p * FENG_CLOUD_KM_TO_M;
+		vec3 density = frp_atmo_density(max(length(p) - bottom, 0.0));
+		vec3 rayleigh = cloud_atmosphere_block.lane[1].xyz * density.x;
+		vec3 mie = cloud_atmosphere_block.lane[2].xyz * density.y;
+		vec3 ozone = cloud_atmosphere_block.lane[4].xyz * density.z;
+		vec3 rayleigh_extinction = rayleigh + ozone;
+		vec3 mie_extinction = cloud_atmosphere_block.lane[3].xyz * density.y + ozone;
+		vec3 rayleigh_source = vec3(0.0);
+		vec3 mie_source = vec3(0.0);
+		for (int slot = 0; slot < 2; ++slot) {
+			vec4 light = cloud_atmosphere_block.lane[8 + slot * 2];
+			if (light.w <= 0.0) {
+				continue;
+			}
+			vec3 light_transmission = frp_atmo_transmittance(p, light.xyz);
+			vec3 scale = light.w * cloud_atmosphere_block.lane[9 + slot * 2].xyz;
+			vec3 rayleigh_unit_source = rayleigh * phase[slot].x * light_transmission;
+			vec3 mie_unit_source = mie * phase[slot].y * light_transmission;
+			float cloud_visibility = FRP_ATMO_CLOUD_SHADOW_VISIBILITY(sample_world_position_m, slot);
+			rayleigh_unit_source *= cloud_visibility;
+			mie_unit_source *= cloud_visibility;
+			if (slot == 0 && cloud_atmosphere_block.lane[12].y > 0.5 && cloud_atmosphere_block.lane[6].y > 0.0) {
+				vec3 multiple_source = (rayleigh + mie) * frp_atmo_multiple(p, light.xyz) * cloud_atmosphere_block.lane[6].y;
+				vec3 scattering_total = max(rayleigh + mie, vec3(1e-20));
+				multiple_source *= FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY(sample_world_position_m);
+				rayleigh_unit_source += multiple_source * (rayleigh / scattering_total);
+				mie_unit_source += multiple_source * (mie / scattering_total);
+			}
+			rayleigh_source += rayleigh_unit_source * scale;
+			mie_source += mie_unit_source * scale;
+		}
+		vec3 rayleigh_segment_t = exp(-rayleigh_extinction * ds_km);
+		vec3 mie_segment_t = exp(-mie_extinction * ds_km);
+		result.rayleigh_radiance += result.rayleigh_transmittance * rayleigh_source
+			* vec3(
+				feng_cloud_atmosphere_integral_factor(rayleigh_extinction.r, ds_km),
+				feng_cloud_atmosphere_integral_factor(rayleigh_extinction.g, ds_km),
+				feng_cloud_atmosphere_integral_factor(rayleigh_extinction.b, ds_km));
+		result.mie_radiance += result.mie_transmittance * mie_source
+			* vec3(
+				feng_cloud_atmosphere_integral_factor(mie_extinction.r, ds_km),
+				feng_cloud_atmosphere_integral_factor(mie_extinction.g, ds_km),
+				feng_cloud_atmosphere_integral_factor(mie_extinction.b, ds_km));
+		result.rayleigh_transmittance *= rayleigh_segment_t;
+		result.mie_transmittance *= mie_segment_t;
+	}
+	result.rayleigh_radiance = vec3(
+		frp_atmo_safe_radiance(result.rayleigh_radiance.r * cloud_atmosphere_block.lane[7].x),
+		frp_atmo_safe_radiance(result.rayleigh_radiance.g * cloud_atmosphere_block.lane[7].y),
+		frp_atmo_safe_radiance(result.rayleigh_radiance.b * cloud_atmosphere_block.lane[7].z));
+	result.mie_radiance = vec3(
+		frp_atmo_safe_radiance(result.mie_radiance.r * cloud_atmosphere_block.lane[7].x),
+		frp_atmo_safe_radiance(result.mie_radiance.g * cloud_atmosphere_block.lane[7].y),
+		frp_atmo_safe_radiance(result.mie_radiance.b * cloud_atmosphere_block.lane[7].z));
+	result.rayleigh_transmittance = clamp(feng_cloud_finite_or_zero3(result.rayleigh_transmittance), vec3(0.0), vec3(1.0));
+	result.mie_transmittance = clamp(feng_cloud_finite_or_zero3(result.mie_transmittance), vec3(0.0), vec3(1.0));
+	return result;
+}
+
+#endif // FENG_CLOUD_ATMOSPHERE_TRANSPORT_GLSLINC

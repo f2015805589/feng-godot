@@ -923,6 +923,13 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 	memset(scene_state.ubo.sky_lighting_pad, 0, sizeof(scene_state.ubo.sky_lighting_pad));
 	memset(scene_state.ubo.sky_lighting_parameters, 0, sizeof(scene_state.ubo.sky_lighting_parameters));
 	memset(scene_state.ubo.sky_lighting_inverse_xform, 0, sizeof(scene_state.ubo.sky_lighting_inverse_xform));
+	memset(scene_state.ubo.cloud_sun_light_indices_flags, 0, sizeof(scene_state.ubo.cloud_sun_light_indices_flags));
+	memset(scene_state.ubo.cloud_projection_parameters, 0, sizeof(scene_state.ubo.cloud_projection_parameters));
+	scene_state.ubo.atmosphere_cloud_mapping[0] = -1.0f;
+	scene_state.ubo.atmosphere_cloud_mapping[1] = -1.0f;
+	scene_state.ubo.atmosphere_cloud_mapping[2] = 0.0f;
+	scene_state.ubo.atmosphere_cloud_mapping[3] = 0.0f;
+	memset(scene_state.ubo.cloud_transparency_parameters, 0, sizeof(scene_state.ubo.cloud_transparency_parameters));
 	if (use_sky_lighting_source && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
 		scene_state.ubo.sky_lighting_enabled = 1;
 		scene_state.ubo.sky_lighting_parameters[0] = sky_lighting_source.energy;
@@ -1033,6 +1040,101 @@ void RenderFRPClustered::_setup_atmosphere(uint32_t p_uniform_buffer_index, cons
 		}
 	}
 	RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+}
+
+void RenderFRPClustered::_setup_cloud_lighting_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context) {
+	ERR_FAIL_INDEX(p_uniform_buffer_index, scene_state.implementation_uniform_buffers.size());
+
+	memset(scene_state.ubo.cloud_sun_light_indices_flags, 0, sizeof(scene_state.ubo.cloud_sun_light_indices_flags));
+	memset(scene_state.ubo.cloud_projection_parameters, 0, sizeof(scene_state.ubo.cloud_projection_parameters));
+	scene_state.ubo.cloud_sun_light_indices_flags[0] = -1.0f;
+	scene_state.ubo.cloud_sun_light_indices_flags[1] = -1.0f;
+	if (!p_context.is_valid()) {
+		RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+		return;
+	}
+
+	const PackedFloat32Array projection = p_context->get_cloud_projection_parameters();
+	const PackedFloat32Array lighting = p_context->get_cloud_lighting_parameters();
+	if (projection.size() != 140 || lighting.size() != 48) {
+		RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+		return;
+	}
+	const PackedFloat32Array atmosphere_cloud = p_context->get_cloud_atmosphere_parameters();
+	if (atmosphere_cloud.size() == 148) {
+		memcpy(scene_state.ubo.atmosphere_cloud_mapping, atmosphere_cloud.ptr() + 140, sizeof(scene_state.ubo.atmosphere_cloud_mapping));
+	}
+	// Capture-only cloud providers are explicit leases and use the capture's
+	// Environment radiance as their global diffuse source. Keep that source gate
+	// separate from ordinary FengSkyLight routing in sky_lighting_enabled.
+	if (p_context->is_cloud_capture() && lighting[47] > 0.5f) {
+		scene_state.ubo.sky_lighting_pad[0] = 1;
+	}
+
+	RD *rd = RD::get_singleton();
+	const RID shadow0 = p_context->get_cloud_output(3);
+	const RID shadow1 = p_context->get_cloud_output(4);
+	const RID sky_ao = p_context->get_cloud_output(5);
+	const RID raw_ao_statistics = p_context->get_cloud_output(7);
+	const bool shadow0_valid = shadow0.is_valid() && rd->texture_is_valid(shadow0);
+	const bool shadow1_valid = shadow1.is_valid() && rd->texture_is_valid(shadow1);
+	const bool sky_ao_valid = sky_ao.is_valid() && rd->texture_is_valid(sky_ao);
+	const bool raw_ao_statistics_valid = raw_ao_statistics.is_valid() && rd->texture_is_valid(raw_ao_statistics);
+
+	const float light_index0 = lighting[27];
+	const float light_index1 = lighting[39];
+	const bool shadow0_enabled = shadow0_valid && projection[27 * 4 + 0] > 0.5f && Math::is_finite(light_index0) && light_index0 >= 0.0f;
+	const bool shadow1_enabled = shadow1_valid && projection[27 * 4 + 1] > 0.5f && Math::is_finite(light_index1) && light_index1 >= 0.0f;
+	const bool has_cloud_sky_provider = scene_state.ubo.sky_lighting_enabled != 0 || scene_state.ubo.sky_lighting_pad[0] != 0;
+	const bool cloud_ao_requested = projection[27 * 4 + 2] > 0.5f;
+	const bool sky_ao_enabled = sky_ao_valid && has_cloud_sky_provider && cloud_ao_requested;
+	const bool atmosphere_ao_enabled = raw_ao_statistics_valid && cloud_ao_requested;
+	if (!shadow0_enabled && !shadow1_enabled && !sky_ao_enabled && !atmosphere_ao_enabled) {
+		RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+		return;
+	}
+
+	scene_state.ubo.cloud_sun_light_indices_flags[0] = shadow0_enabled ? light_index0 : -1.0f;
+	scene_state.ubo.cloud_sun_light_indices_flags[1] = shadow1_enabled ? light_index1 : -1.0f;
+	scene_state.ubo.cloud_sun_light_indices_flags[2] = shadow0_enabled ? 1.0f : 0.0f;
+	scene_state.ubo.cloud_sun_light_indices_flags[3] = shadow1_enabled ? 1.0f : 0.0f;
+	memcpy(scene_state.ubo.cloud_projection_parameters, projection.ptr(), sizeof(scene_state.ubo.cloud_projection_parameters));
+	if (!shadow0_enabled) {
+		scene_state.ubo.cloud_projection_parameters[27][0] = 0.0f;
+	}
+	if (!shadow1_enabled) {
+		scene_state.ubo.cloud_projection_parameters[27][1] = 0.0f;
+	}
+	if (!sky_ao_enabled) {
+		scene_state.ubo.cloud_projection_parameters[27][2] = 0.0f;
+	}
+	// Projection lane 27.w is reserved by the addon packet. Native FRP uses it
+	// to gate the raw statistics texture independently of the filtered AO map:
+	// FengSkyLight diffuse needs output 5, while aerial multiple scattering needs
+	// output 7 and does not require a FengSkyLight provider.
+	scene_state.ubo.cloud_projection_parameters[27][3] = atmosphere_ao_enabled ? 1.0f : 0.0f;
+
+	rd->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+}
+
+void RenderFRPClustered::_setup_cloud_transparency_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context) {
+	ERR_FAIL_INDEX(p_uniform_buffer_index, scene_state.implementation_uniform_buffers.size());
+	memset(scene_state.ubo.cloud_transparency_parameters, 0, sizeof(scene_state.ubo.cloud_transparency_parameters));
+	scene_state.ubo.cloud_transparency_parameters[1] = 0.5f;
+	if (!p_context.is_valid() || !p_context->has_cloud_outputs()) {
+		RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	for (int slot = 0; slot < 3; slot++) {
+		const RID output = p_context->get_cloud_output(slot);
+		if (!output.is_valid() || !rd->texture_is_valid(output)) {
+			rd->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+			return;
+		}
+	}
+	scene_state.ubo.cloud_transparency_parameters[0] = 1.0f;
+	rd->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
 }
 
 void RenderFRPClustered::SceneState::grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append) {
@@ -1907,6 +2009,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	scene_state.used_uniform_buffer_count = 0;
 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
 
@@ -1920,10 +2023,29 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	}
 	bool is_reflection_probe = p_render_data->reflection_probe.is_valid();
 	RID capture_fog_effect;
+	RID capture_input_environment;
+	RID capture_input_sky;
+	RID capture_output_sky;
+	bool capture_environment_is_explicit = false;
 	if (is_reflection_probe) {
 		const RID capture_probe = light_storage->reflection_probe_instance_get_probe(p_render_data->reflection_probe);
 		if (light_storage->reflection_probe_is_capture_only(capture_probe)) {
 			capture_fog_effect = light_storage->reflection_probe_instance_get_capture_fog_effect(p_render_data->reflection_probe);
+			// A cloud capture may sample only the explicit, frozen FengSkyLight
+			// input environment attached to this capture-only probe. In particular,
+			// do not use the scenario Environment fallback for arbitrary probes.
+			const RID configured_environment = light_storage->reflection_probe_get_capture_environment(capture_probe);
+			const RID instance_environment = light_storage->reflection_probe_instance_get_capture_environment(p_render_data->reflection_probe);
+			capture_output_sky = light_storage->reflection_probe_instance_get_capture_output_sky(p_render_data->reflection_probe);
+			if (configured_environment.is_valid() && configured_environment == instance_environment &&
+					instance_environment == p_render_data->environment && capture_output_sky.is_valid()) {
+				capture_environment_is_explicit = true;
+				const RID candidate_input_sky = environment_get_sky(instance_environment);
+				if (candidate_input_sky.is_valid() && candidate_input_sky != capture_output_sky) {
+					capture_input_environment = instance_environment;
+					capture_input_sky = candidate_input_sky;
+				}
+			}
 		}
 	}
 
@@ -2402,7 +2524,212 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	RID rp_uniform_set;
 	Ref<FRPPassContext> pass_context;
 	pass_context.instantiate();
-	auto run_capture_fog_effect = [&]() {
+	bool lighting_prepared = false;
+	auto prepare_lighting_once = [&]() {
+		if (lighting_prepared) {
+			return;
+		}
+		_prepare_lighting(p_render_data);
+		lighting_prepared = true;
+		if (!pass_context->has_cloud_snapshot()) {
+			// A missing cloud snapshot cancels this probe's own cached batch, but
+			// ordinary viewports and unrelated probes must not break its six faces.
+			if (is_reflection_probe && cloud_capture_lighting_cache.valid && cloud_capture_lighting_cache.probe_instance == p_render_data->reflection_probe) {
+				cloud_capture_lighting_cache.valid = false;
+			}
+			pass_context->clear_cloud_native_inputs();
+			return;
+		}
+		const bool cloud_capture_active_for_frame = pass_context->is_cloud_capture();
+
+		PackedFloat32Array cloud_lighting;
+		cloud_lighting.resize(48);
+		float *cloud_lighting_write = cloud_lighting.ptrw();
+		for (int i = 0; i < cloud_lighting.size(); i++) {
+			cloud_lighting_write[i] = 0.0f;
+		}
+		Basis sky_rotation;
+		RID cloud_sky_rid;
+		float sky_energy = 1.0f;
+		float sky_captured_scale = 0.0f;
+		if (use_sky_lighting_source) {
+			sky_rotation = sky_lighting_source.rotation;
+			cloud_sky_rid = sky_lighting_source.sky;
+			sky_energy = Math::is_finite(sky_lighting_source.energy) ? MAX(0.0f, sky_lighting_source.energy) : 1.0f;
+			const float captured_exposure = Math::is_finite(sky_lighting_source.captured_exposure) && sky_lighting_source.captured_exposure > 0.0f ? sky_lighting_source.captured_exposure : 1.0f;
+			const float luminance = Math::is_finite(rb->get_luminance_multiplier()) && rb->get_luminance_multiplier() > 0.0f ? rb->get_luminance_multiplier() : 1.0f;
+			sky_captured_scale = 1.0f / MAX(captured_exposure * luminance, 1e-12f);
+		} else if (capture_input_environment.is_valid() && capture_input_sky.is_valid()) {
+			cloud_sky_rid = capture_input_sky;
+			sky_rotation = environment_get_sky_orientation(capture_input_environment);
+			float camera_exposure = 1.0f;
+			if (cloud_sky_rid.is_valid() && !current_eye_adaptation_enabled && p_render_data->camera_attributes.is_valid()) {
+				camera_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+			}
+			if (!Math::is_finite(camera_exposure) || camera_exposure <= 0.0f) {
+				camera_exposure = 1.0f;
+			}
+			// This is only the explicitly frozen capture input Sky. Its octahedral
+			// radiance already includes Environment background energy and
+			// `sky_luminance_multiplier`; remove only frame exposure normalization
+			// here. The cloud composite applies it with P exactly once.
+			const float sky_luminance = Math::is_finite(sky_luminance_multiplier) && sky_luminance_multiplier > 0.0f ? sky_luminance_multiplier : 1.0f;
+			if (cloud_sky_rid.is_valid()) {
+				sky_captured_scale = 1.0f / MAX(sky_luminance * camera_exposure, 1e-12f);
+			}
+		}
+
+		const Basis sky_inverse_rotation = sky_rotation.inverse();
+		for (int column = 0; column < 3; column++) {
+			for (int row = 0; row < 3; row++) {
+				cloud_lighting_write[column * 4 + row] = sky_inverse_rotation.rows[row][column];
+			}
+		}
+		cloud_lighting_write[15] = 1.0f;
+
+		PackedFloat32Array native_shadow;
+		native_shadow.resize(156);
+		float *native_shadow_write = native_shadow.ptrw();
+		for (int i = 0; i < native_shadow.size(); i++) {
+			native_shadow_write[i] = 0.0f;
+		}
+		RID directional_shadow_atlas = light_storage->directional_shadow_get_texture();
+		const bool has_directional_shadow_atlas = directional_shadow_atlas.is_valid() && RD::get_singleton()->texture_is_valid(directional_shadow_atlas);
+		const int directional_shadow_size = has_directional_shadow_atlas ? light_storage->directional_shadow_get_size() : 0;
+		const float inv_directional_shadow_size = directional_shadow_size > 0 ? 1.0f / directional_shadow_size : 0.0f;
+		native_shadow_write[152] = directional_shadow_size;
+		native_shadow_write[153] = directional_shadow_size;
+		native_shadow_write[154] = inv_directional_shadow_size;
+		native_shadow_write[155] = inv_directional_shadow_size;
+
+		for (int sun_slot = 0; sun_slot < 2; sun_slot++) {
+			const RID sun_rid = pass_context->get_cloud_sun(sun_slot);
+			if (sun_rid.is_null()) {
+				continue;
+			}
+			Vector3 world_direction;
+			Vector3 top_irradiance;
+			int32_t directional_index = -1;
+			PackedFloat32Array shadow_packet;
+			if (!light_storage->get_cloud_directional_light_data(sun_rid, world_direction, top_irradiance, directional_index, shadow_packet)) {
+				continue;
+			}
+			const int base = sun_slot == 0 ? 16 : 28;
+			const Vector3 ground_transmittance = pass_context->get_cloud_sun_ground_transmittance(sun_slot);
+			const Vector3 ground_irradiance = top_irradiance * ground_transmittance;
+			const bool has_cloud_shadow = pass_context->get_cloud_sun_cast_shadows_on_clouds(sun_slot) && directional_index >= 0 && shadow_packet.size() == 76 && shadow_packet[75] > 0.5f && has_directional_shadow_atlas;
+			cloud_lighting_write[base + 0] = world_direction.x;
+			cloud_lighting_write[base + 1] = world_direction.y;
+			cloud_lighting_write[base + 2] = world_direction.z;
+			cloud_lighting_write[base + 3] = 1.0f;
+			cloud_lighting_write[base + 4] = top_irradiance.x;
+			cloud_lighting_write[base + 5] = top_irradiance.y;
+			cloud_lighting_write[base + 6] = top_irradiance.z;
+			cloud_lighting_write[base + 7] = has_cloud_shadow ? 1.0f : 0.0f;
+			cloud_lighting_write[base + 8] = ground_irradiance.x;
+			cloud_lighting_write[base + 9] = ground_irradiance.y;
+			cloud_lighting_write[base + 10] = ground_irradiance.z;
+			cloud_lighting_write[base + 11] = float(directional_index);
+			if (has_cloud_shadow) {
+				const int shadow_base = sun_slot * 76;
+				for (int i = 0; i < 76; i++) {
+					native_shadow_write[shadow_base + i] = shadow_packet[i];
+				}
+			}
+		}
+
+		bool sky_octmap_array = is_using_radiance_octmap_array();
+		float sky_border = 0.0f;
+		float last_roughness_layer = 0.0f;
+		float last_texture_mip = 0.0f;
+		RID sky_octmap;
+		if (cloud_sky_rid.is_valid()) {
+			RendererRD::SkyRD::Sky *source_sky = sky.get_sky(cloud_sky_rid);
+			if (source_sky != nullptr && (!source_sky->external_radiance || source_sky->external_radiance_ready)) {
+				const RID source_radiance = sky.sky_get_radiance_texture_rd(cloud_sky_rid);
+				if (source_radiance.is_valid() && RD::get_singleton()->texture_is_valid(source_radiance)) {
+					const RD::TextureFormat source_format = RD::get_singleton()->texture_get_format(source_radiance);
+					sky_octmap_array = source_format.texture_type == RD::TEXTURE_TYPE_2D_ARRAY;
+					last_roughness_layer = source_format.array_layers > 0 ? float(source_format.array_layers - 1) : 0.0f;
+					last_texture_mip = source_format.mipmaps > 0 ? float(source_format.mipmaps - 1) : 0.0f;
+					sky_border = sky.sky_get_uv_border_size(cloud_sky_rid);
+					sky_octmap = source_radiance;
+				}
+			}
+		}
+		if (is_reflection_probe && cloud_sky_rid.is_valid() && cloud_sky_rid == light_storage->reflection_probe_instance_get_capture_output_sky(p_render_data->reflection_probe)) {
+			// A probe's own output is never a cloud ambient input.
+			sky_octmap = RID();
+		}
+		if (sky_octmap.is_null()) {
+			sky_captured_scale = 0.0f;
+			sky_octmap = texture_storage->texture_rd_get_default(sky_octmap_array ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		cloud_lighting_write[40] = Math::is_finite(sky_border) ? MAX(0.0f, sky_border) : 0.0f;
+		cloud_lighting_write[41] = last_roughness_layer;
+		cloud_lighting_write[42] = last_texture_mip;
+		cloud_lighting_write[43] = sky_octmap_array ? 1.0f : 0.0f;
+		cloud_lighting_write[44] = Math::is_finite(sky_energy) ? MAX(0.0f, sky_energy) : 1.0f;
+		cloud_lighting_write[45] = Math::is_finite(sky_captured_scale) ? MAX(0.0f, sky_captured_scale) : 0.0f;
+		cloud_lighting_write[46] = last_texture_mip;
+		cloud_lighting_write[47] = sky_captured_scale > 0.0f ? 1.0f : 0.0f;
+
+		if (cloud_capture_active_for_frame) {
+			CloudCaptureLightingCache &cache = cloud_capture_lighting_cache;
+			const RID capture_probe = p_render_data->reflection_probe;
+			const uint64_t capture_batch = pass_context->get_cloud_capture_batch_id();
+			const int64_t source_signature = pass_context->get_cloud_snapshot_source_signature();
+			const RID current_sun0 = pass_context->get_cloud_sun(0);
+			const RID current_sun1 = pass_context->get_cloud_sun(1);
+			const bool cache_octmap_matches = cache.input_octmap == sky_octmap &&
+					(cache.input_octmap.is_null() || RD::get_singleton()->texture_is_valid(cache.input_octmap));
+			const bool source_key_matches = cache.valid &&
+					cache.probe_instance == capture_probe &&
+					cache.batch_id == capture_batch &&
+					cache.source_signature == source_signature &&
+					cache.capture_environment == capture_input_environment &&
+					cache.input_sky == capture_input_sky &&
+					cache.output_sky == capture_output_sky &&
+					cache.suns[0] == current_sun0 && cache.suns[1] == current_sun1 &&
+					cache.directional_shadow_atlas == directional_shadow_atlas &&
+					cache_octmap_matches &&
+					cache.lighting.size() == 48;
+			if (source_key_matches) {
+				// Raw sun direction/irradiance and ambient source are fixed for the
+				// submitted six-face batch. CSM matrices, their validity, and native
+				// directional indices remain current-face data.
+				const float face_sun0_csm_valid = cloud_lighting[23];
+				const float face_sun0_directional_index = cloud_lighting[27];
+				const float face_sun1_csm_valid = cloud_lighting[35];
+				const float face_sun1_directional_index = cloud_lighting[39];
+				cloud_lighting = cache.lighting;
+				cloud_lighting_write = cloud_lighting.ptrw();
+				cloud_lighting_write[23] = face_sun0_csm_valid;
+				cloud_lighting_write[27] = face_sun0_directional_index;
+				cloud_lighting_write[35] = face_sun1_csm_valid;
+				cloud_lighting_write[39] = face_sun1_directional_index;
+			} else {
+				// Only one active batch is retained. The key includes the probe's native
+				// capture revision, frozen provider snapshot, and explicit input/output
+				// skies, so a new request or source change starts with fresh values.
+				cache.valid = false;
+				cache.probe_instance = capture_probe;
+				cache.batch_id = capture_batch;
+				cache.source_signature = source_signature;
+				cache.capture_environment = capture_input_environment;
+				cache.input_sky = capture_input_sky;
+				cache.output_sky = capture_output_sky;
+				cache.suns[0] = current_sun0;
+				cache.suns[1] = current_sun1;
+				cache.directional_shadow_atlas = directional_shadow_atlas;
+				cache.input_octmap = sky_octmap;
+				cache.lighting = cloud_lighting;
+				cache.valid = true;
+			}
+		}
+		pass_context->set_cloud_native_inputs(cloud_lighting, native_shadow, sky_octmap, directional_shadow_atlas, shadow_sampler);
+	};
+	auto run_capture_effect_phase = [&](const StringName &p_phase_method, const StringName &p_fallback_method) {
 		if (capture_fog_effect.is_null()) {
 			return;
 		}
@@ -2418,10 +2745,37 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		ReflectionCaptureTextureScope capture_textures(rb, color_view, depth_texture);
 		Callable callback = pipeline_storage->compositor_effect_get_callback(capture_fog_effect);
 		Object *callback_object = callback.get_object();
-		if (callback_object != nullptr && callback_object->has_method("_frp_execute")) {
+		if (callback_object == nullptr) {
+			return;
+		}
+		StringName method = callback_object->has_method(p_phase_method) ? p_phase_method : p_fallback_method;
+		if (method == StringName() || !callback_object->has_method(method)) {
+			return;
+		}
+		Array arguments;
+		arguments.push_back(pass_context);
+		callback_object->callv(method, arguments);
+	};
+	auto run_capture_fog_effect = [&]() {
+		run_capture_effect_phase("_frp_capture_fog", "_frp_execute");
+	};
+	auto run_capture_shadow_effect = [&]() {
+		run_capture_effect_phase("_frp_capture_shadow", StringName());
+	};
+	auto run_capture_cloud_effect = [&]() {
+		run_capture_effect_phase("_frp_capture_cloud", StringName());
+	};
+	auto prepare_capture_fog_effect = [&]() {
+		if (capture_fog_effect.is_null() || !pipeline_storage->is_compositor_effect(capture_fog_effect) ||
+				!pipeline_storage->compositor_effect_get_enabled(capture_fog_effect) || pipeline_effects.has(capture_fog_effect)) {
+			return;
+		}
+		Callable callback = pipeline_storage->compositor_effect_get_callback(capture_fog_effect);
+		Object *callback_object = callback.get_object();
+		if (callback_object != nullptr && callback_object->has_method("_frp_prepare")) {
 			Array arguments;
 			arguments.push_back(pass_context);
-			callback_object->callv("_frp_execute", arguments);
+			callback_object->callv("_frp_prepare", arguments);
 		}
 	};
 	// Resolves the frame's colour, depth and velocity once per frame. Both the
@@ -2619,14 +2973,18 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 			} break;
 			case FRPPipelineSpec::OP_LIGHTING_PREPARE: { // Light/cluster data, decals, volumetric fog.
-				_prepare_lighting(p_render_data);
+				prepare_lighting_once();
 			} break;
 			case FRPPipelineSpec::OP_PRE_LIGHTING_STAGE: { // PRE_LIGHTING compositor stage.
 				if (current_cluster_builder) {
 					base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 				}
 
-				if (!is_reflection_probe) {
+				if (is_reflection_probe) {
+					// Capture-only probes bypass the viewport compositor schedule. Their
+					// frozen cloud shadow maps must still exist before opaque lighting.
+					run_capture_shadow_effect();
+				} else {
 					stage_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_LIGHTING);
 				}
 			} break;
@@ -2644,6 +3002,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 				opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass, false, !is_reflection_probe);
 				_setup_atmosphere(opaque_pass_uniform_buffer_index, pass_context, p_render_data);
+				_setup_cloud_lighting_ubo(opaque_pass_uniform_buffer_index, pass_context);
 				opaque_pass_uniforms_ready = true;
 				const bool sky_light_diffuse_requested = !is_reflection_probe && rb_data.is_valid() && pass_context->is_sky_light_diffuse_requested();
 				const bool write_sky_light_diffuse = sky_light_diffuse_requested && scene_state.ubo.sky_lighting_enabled != 0;
@@ -2682,7 +3041,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 
 					if (is_reflection_probe) {
 						// Probe faces have no G-buffer; render their opaque geometry directly.
-							rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, RID(), environment_radiance_texture, pass_context);
 						RenderListParameters params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, true, p_render_data->directional_light_soft_shadows, rp_uniform_set, false, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, 1, 0, base_specialization);
 						_render_list_with_draw_list(&params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 					} else {
@@ -2749,7 +3108,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RID shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
 						// Descriptor layouts include shader-stage visibility, not just binding types.
 						RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
-						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture);
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, lighting_base_uniform_set, SCENE_UNIFORM_SET);
 						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, rp_uniform_set, RENDER_PASS_UNIFORM_SET);
 						bool pipeline_created = false;
@@ -2798,7 +3157,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(fallback_pass_uniform_buffer_index, height_fog_parameters);
 					}
-					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, fallback_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
+					_setup_cloud_lighting_ubo(fallback_pass_uniform_buffer_index, pass_context);
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, fallback_pass_uniform_buffer_index, true, RID(), environment_radiance_texture, pass_context);
 
 					RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].element_info.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.size(), reverse_cull, PASS_MODE_COLOR, fallback_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 					// Fallback geometry skipped the G-buffer depth pass and must write its own depth.
@@ -2845,6 +3205,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			case FRPPipelineSpec::OP_SKY: { // Sky.
 				if (draw_sky || draw_sky_fog_only) {
 					RENDER_TIMESTAMP("Render Sky");
+					sky.prepare_cloud_visibility(rb, pass_context);
 
 					RD::get_singleton()->draw_command_begin_label("Draw Sky");
 					RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0u, p_render_data->render_region);
@@ -2968,6 +3329,11 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 			} break;
 			case FRPPipelineSpec::OP_TRANSPARENT: { // Transparent.
+				if (is_reflection_probe) {
+					// Capture-only clouds composite after HeightFog/AP and before
+					// transparent geometry, matching the viewport schedule.
+					run_capture_cloud_effect();
+				}
 				if (!render_list[RENDER_LIST_ALPHA].elements.is_empty()) {
 					RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
@@ -2979,8 +3345,10 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					if (!height_fog_parameters.is_empty()) {
 						_setup_height_fog(transparent_pass_uniform_buffer_index, height_fog_parameters);
 					}
+					_setup_cloud_lighting_ubo(transparent_pass_uniform_buffer_index, pass_context);
+					_setup_cloud_transparency_ubo(transparent_pass_uniform_buffer_index, pass_context);
 
-					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true, RID(), environment_radiance_texture);
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true, RID(), environment_radiance_texture, pass_context);
 
 					{
 						uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
@@ -3154,6 +3522,21 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				const float normalization = camera_exposure / luminance_multiplier;
 				return Math::is_finite(normalization) && normalization > 0.0f ? normalization : 1.0f;
 			}());
+	// Publish immutable per-face metadata only for the explicitly configured
+	// FengSkyLight capture source. The native generation changes at each actual
+	// capture start, while all six faces in one batch share it.
+	const uint64_t cloud_capture_batch_id = is_reflection_probe ? light_storage->reflection_probe_instance_get_capture_batch_id(p_render_data->reflection_probe) : 0;
+	const bool cloud_capture_active = cloud_capture_batch_id != 0 && capture_environment_is_explicit;
+	pass_context->set_cloud_capture_context(cloud_capture_active, cloud_capture_batch_id,
+		cloud_capture_active ? p_render_data->reflection_probe_pass : -1,
+		cloud_capture_active ? 6 : 0,
+		cloud_capture_active ? p_render_data->scene_data->cam_transform.origin : Vector3(),
+		pass_context->get_scene_exposure_normalization());
+	// Capture-only probes do not run the viewport's ordinary _frp_prepare hooks.
+	// Prepare their leased effect now, after ctx.setup() and before any builtin
+	// operation can call prepare_lighting_once(). A capture adapter can therefore
+	// publish the frozen cloud packets consumed by that first lighting stage.
+	prepare_capture_fog_effect();
 
 	if (explicit_pipeline) {
 		// Optional metadata preparation runs before lighting without adding a
@@ -3988,7 +4371,7 @@ void RenderFRPClustered::_update_render_base_uniform_set() {
 	}
 }
 
-RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader, RID p_environment_radiance_texture) {
+RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader, RID p_environment_radiance_texture, const Ref<FRPPassContext> &p_cloud_context) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -4289,6 +4672,58 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
+	// FRP's native consumers share the same per-frame cloud projection and
+	// per-sun maps across deferred lighting, forward/capture geometry, and the
+	// aerial-perspective shader path.
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		RID texture = p_cloud_context.is_valid() ? p_cloud_context->get_cloud_output(3 + slot) : RID();
+		if (!texture.is_valid() || !RD::get_singleton()->texture_is_valid(texture)) {
+			texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		RD::Uniform u;
+		u.binding = 42 + slot;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		RID texture = p_cloud_context.is_valid() ? p_cloud_context->get_cloud_output(5) : RID();
+		if (!texture.is_valid() || !RD::get_singleton()->texture_is_valid(texture)) {
+			texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+		}
+		RD::Uniform u;
+		u.binding = 44;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		RID texture = p_cloud_context.is_valid() ? p_cloud_context->get_cloud_output(7) : RID();
+		if (!texture.is_valid() || !RD::get_singleton()->texture_is_valid(texture)) {
+			texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		RD::Uniform u;
+		u.binding = 48;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	if (p_lighting_shader.is_null()) {
+		// The scene shader's optional transparent cloud fog samples whole-array
+		// outputs, including for a single view. Bind typed defaults when no cloud
+		// trace published outputs so the ordinary transparent path stays inert.
+		for (int slot = 0; slot < 3; slot++) {
+			RID texture = p_cloud_context.is_valid() ? p_cloud_context->get_cloud_output(slot) : RID();
+			if (!texture.is_valid() || !RD::get_singleton()->texture_is_valid(texture)) {
+				texture = texture_storage->texture_rd_get_default(slot == 1 ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
+			}
+			RD::Uniform u;
+			u.binding = 45 + slot;
+			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			u.append_id(texture);
+			uniforms.push_back(u);
+		}
+	}
 
 	// Geometry passes do not declare the lighting-only G-buffer bindings.
 	if (p_lighting_shader.is_null()) {
@@ -4320,7 +4755,6 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
-
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(p_lighting_shader, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 

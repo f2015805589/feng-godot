@@ -10,7 +10,8 @@ const NativeAdapter = preload("res://addons/feng-sky/feng_sky_light_native_adapt
 const CubemapAdapter = preload("res://addons/feng-sky/feng_sky_light_cubemap_adapter.gd")
 const SnapshotWorldsPath := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 const FogRuntimePath := "res://addons/feng-fog/feng_fog_runtime.gd"
-const HeightFogEffectPath := "res://addons/feng-render-pipeline/library/height-fog/height_fog.tres"
+const CloudRuntimePath := "res://addons/feng-cloud/feng_cloud_runtime.gd"
+const CaptureEffectPath := "res://addons/feng-sky/feng_sky_light_capture_effect.gd"
 const PANORAMA_SIZE := Vector2i(64, 32)
 const ROUTE_REFRESH_MSEC := 500
 const NATIVE_POLL_MSEC := 100
@@ -811,20 +812,34 @@ func _prepare_capture_fog_effect() -> void:
 	var world_id := world.get_instance_id()
 	var fog_snapshot := _fog_snapshot_for_world(world_id)
 	var atmosphere_snapshot := _atmosphere_snapshot_for_world(world_id)
-	if fog_snapshot.is_empty() and atmosphere_snapshot.is_empty():
-		_clear_cached_capture_fog_snapshots()
-		return
-	if not ResourceLoader.exists(HeightFogEffectPath):
+	var cloud_snapshot := _cloud_snapshot_for_world(world_id)
+	if fog_snapshot.is_empty() and atmosphere_snapshot.is_empty() and cloud_snapshot.is_empty():
 		_clear_cached_capture_fog_snapshots()
 		return
 	if _capture_fog_effect == null or not is_instance_valid(_capture_fog_effect):
-		var effect := load(HeightFogEffectPath) as CompositorEffect
-		if effect == null:
+		if not ResourceLoader.exists(CaptureEffectPath):
 			return
-		_capture_fog_effect = effect.duplicate(true) as CompositorEffect
+		var capture_script: Variant = load(CaptureEffectPath)
+		if not capture_script is Script:
+			return
+		var instance: Variant = capture_script.new()
+		_capture_fog_effect = instance if instance is CompositorEffect else null
 	if _capture_fog_effect != null and _capture_fog_effect.has_method("set_capture_snapshots"):
-		_capture_fog_effect.call("set_capture_snapshots", fog_snapshot, atmosphere_snapshot)
+		_capture_fog_effect.call("set_capture_snapshots", fog_snapshot, atmosphere_snapshot, cloud_snapshot)
 		_capture_fog_effect_active = true
+
+
+func _cloud_snapshot_for_world(world_id: int) -> Dictionary:
+	if not ResourceLoader.exists(CloudRuntimePath):
+		return {}
+	var runtime: Variant = load(CloudRuntimePath)
+	if not runtime is Script or not runtime.has_method("snapshot_for_world"):
+		return {}
+	var snapshot: Variant = runtime.call("snapshot_for_world", world_id)
+	if not snapshot is Dictionary or snapshot.is_empty() \
+			or not bool(snapshot.get("visible_in_realtime_sky_captures", true)):
+		return {}
+	return snapshot.duplicate(true)
 
 
 func _clear_cached_capture_fog_snapshots() -> void:

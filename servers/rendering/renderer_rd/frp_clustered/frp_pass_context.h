@@ -76,6 +76,35 @@ class FRPPassContext : public RefCounted {
 	bool sky_light_diffuse_requested = false;
 	// Current scene exposure scale excluding pre-exposure, matching the FRP lighting UBO.
 	float scene_exposure_normalization = 1.0f;
+	// Immutable cloud inputs for this frame. The pass supplies only value packets and
+	// renderer texture/light RIDs; native cloud stages consume them before the context
+	// is released. No Node or Resource is retained across frames.
+	PackedFloat32Array cloud_material_parameters;
+	int64_t cloud_snapshot_source_signature = 0;
+	RID cloud_textures[4]; // shape, detail, weather, curl.
+	RID cloud_layout_textures[3]; // borrowed UE layout inputs: pattern, mask, height profile.
+	RID cloud_suns[2]; // primary and secondary DirectionalLight base RIDs.
+	bool cloud_sun_cast_shadows_on_clouds[2] = { false, false };
+	Vector3 cloud_sun_ground_transmittance[2] = { Vector3(1, 1, 1), Vector3(1, 1, 1) };
+	// Native renderer inputs are published after LightStorage has prepared this
+	// frame. These are bounded std140 packets plus borrowed renderer-owned RIDs.
+	PackedFloat32Array cloud_lighting_parameters; // 48 floats / 192 bytes.
+	PackedFloat32Array cloud_native_shadow_parameters; // 156 floats / 624 bytes.
+	PackedFloat32Array cloud_projection_parameters; // 140 floats / 560 bytes, authored by the addon.
+	RID cloud_sky_octmap;
+	RID cloud_directional_shadow_atlas;
+	RID cloud_shadow_sampler;
+	// GPU outputs are borrowed from the pass' RenderSceneBuffersRD textures. The
+	// context only exposes them to later native consumers in this same frame.
+	RID cloud_outputs[8]; // radiance, T, depth, sun0 shadow, sun1 shadow, AO, ambient, raw AO.
+	// Reflection capture metadata is per face; immutable source snapshots are held
+	// by the capture-effect lease, while camera matrices come from current RenderData.
+	bool cloud_capture_active = false;
+	uint64_t cloud_capture_batch_id = 0;
+	int cloud_capture_face_index = -1;
+	int cloud_capture_face_count = 0;
+	Vector3 cloud_capture_origin_world_m;
+	float cloud_capture_exposure_normalization = 1.0f;
 	// Optional mode selected by the FRP Post Process pass for this frame only.
 	// -1 leaves the Environment's renderer mode untouched; 5 is FRP's UE film LUT.
 	int tonemap_mode_override = -1;
@@ -124,6 +153,55 @@ public:
 	// Requests the deferred opaque lighting pass to publish its global SkyLight diffuse contribution.
 	void request_sky_light_diffuse();
 	bool is_sky_light_diffuse_requested() const { return sky_light_diffuse_requested; }
+	void set_cloud_snapshot(const PackedFloat32Array &p_material_parameters, RID p_shape_texture, RID p_detail_texture, RID p_weather_texture, RID p_curl_texture, RID p_primary_sun, RID p_secondary_sun, int64_t p_source_signature = 0);
+	void clear_cloud_snapshot();
+	void set_cloud_layout_textures(RID p_pattern_texture, RID p_cloud_mask_texture, RID p_height_profile_texture);
+	bool has_cloud_snapshot() const { return !cloud_material_parameters.is_empty(); }
+	PackedFloat32Array get_cloud_material_parameters() const { return cloud_material_parameters; }
+	int64_t get_cloud_snapshot_source_signature() const { return cloud_snapshot_source_signature; }
+	RID get_cloud_texture(int p_index) const { return p_index >= 0 && p_index < 4 ? cloud_textures[p_index] : RID(); }
+	RID get_cloud_layout_texture(int p_index) const { return p_index >= 0 && p_index < 3 ? cloud_layout_textures[p_index] : RID(); }
+	RID get_cloud_sun(int p_index) const { return p_index >= 0 && p_index < 2 ? cloud_suns[p_index] : RID(); }
+	void set_cloud_sun_ground_transmittance(int p_index, const Vector3 &p_transmittance);
+	Vector3 get_cloud_sun_ground_transmittance(int p_index) const { return p_index >= 0 && p_index < 2 ? cloud_sun_ground_transmittance[p_index] : Vector3(1, 1, 1); }
+	void set_cloud_sun_cast_shadows_on_clouds(int p_index, bool p_enabled);
+	bool get_cloud_sun_cast_shadows_on_clouds(int p_index) const { return p_index >= 0 && p_index < 2 && cloud_sun_cast_shadows_on_clouds[p_index]; }
+	// Set by RenderFRPClustered after native light/shadow state is ready. These
+	// setters are C++ only; the addon consumes the read-only typed getters.
+	void set_cloud_native_inputs(const PackedFloat32Array &p_lighting, const PackedFloat32Array &p_native_shadow, RID p_sky_octmap, RID p_directional_shadow_atlas, RID p_shadow_sampler);
+	void clear_cloud_native_inputs();
+	PackedFloat32Array get_cloud_lighting_parameters() const { return cloud_lighting_parameters; }
+	PackedFloat32Array get_cloud_native_shadow_parameters() const { return cloud_native_shadow_parameters; }
+	void set_cloud_projection_parameters(const PackedFloat32Array &p_projection);
+	void clear_cloud_projection_parameters();
+	PackedFloat32Array get_cloud_projection_parameters() const { return cloud_projection_parameters; }
+	// 148 floats: addon cloud projection (140), atmosphere-to-cloud sun/map mapping (4), and flags (4).
+	PackedFloat32Array get_cloud_atmosphere_parameters() const;
+	RID get_cloud_sky_octmap() const { return cloud_sky_octmap; }
+	RID get_cloud_directional_shadow_atlas() const { return cloud_directional_shadow_atlas; }
+	RID get_cloud_shadow_sampler() const { return cloud_shadow_sampler; }
+	// Output slots are 0 radiance, 1 transmittance, 2 front/mean depth, 3/4
+	// per-sun cloud shadow maps, 5 final AO, 6 ambient, and 7 raw AO statistics.
+	void set_cloud_outputs(RID p_radiance, RID p_transmittance, RID p_depth, RID p_ambient);
+	void set_cloud_shadow_outputs(RID p_sun0_shadow, RID p_sun1_shadow, RID p_ambient_occlusion, RID p_raw_ao_statistics);
+	void clear_cloud_outputs();
+	bool has_cloud_outputs() const { return cloud_outputs[0].is_valid() && cloud_outputs[1].is_valid() && cloud_outputs[2].is_valid(); }
+	bool has_cloud_shadow_outputs() const { return cloud_outputs[3].is_valid() || cloud_outputs[4].is_valid() || cloud_outputs[5].is_valid(); }
+	RID get_cloud_output(int p_index) const { return p_index >= 0 && p_index < 8 ? cloud_outputs[p_index] : RID(); }
+	// Set by the renderer for each face of a reflection capture. No source Node,
+	// Environment, or Sky resource is retained by this per-frame context.
+	void set_cloud_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization);
+	bool is_cloud_capture() const { return cloud_capture_active; }
+	uint64_t get_cloud_capture_batch_id() const { return cloud_capture_batch_id; }
+	int get_cloud_capture_face_index() const { return cloud_capture_face_index; }
+	int get_cloud_capture_face_count() const { return cloud_capture_face_count; }
+	Vector3 get_cloud_capture_origin_world_m() const { return cloud_capture_origin_world_m; }
+	float get_cloud_capture_exposure_normalization() const { return cloud_capture_exposure_normalization; }
+	float get_cloud_time_seconds() const;
+	Vector2 get_taa_jitter() const;
+	// Alpha holdout is meaningful only for transparent render targets. Reflection
+	// captures use an opaque cubemap target and never publish cloud holdout alpha.
+	bool supports_cloud_holdout() const;
 	RID get_atmosphere_light_rid(int p_index) const { return p_index >= 0 && p_index < 2 ? atmosphere_light_rids[p_index] : RID(); }
 	RID get_atmosphere_optical_texture() const { return atmosphere_optical_texture; }
 	RID get_atmosphere_multiple_texture() const { return atmosphere_multiple_texture; }

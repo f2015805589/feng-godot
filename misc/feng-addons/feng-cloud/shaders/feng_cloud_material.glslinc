@@ -1,0 +1,187 @@
+#ifndef FENG_CLOUD_MATERIAL_GLSLINC
+#define FENG_CLOUD_MATERIAL_GLSLINC
+
+#include "feng_cloud_types.glslinc"
+
+float feng_cloud_finite_or_zero(float v) {
+	return (isnan(v) || isinf(v)) ? 0.0 : v;
+}
+
+vec3 feng_cloud_finite_or_zero3(vec3 v) {
+	return vec3(
+		feng_cloud_finite_or_zero(v.x),
+		feng_cloud_finite_or_zero(v.y),
+		feng_cloud_finite_or_zero(v.z));
+}
+
+vec2 feng_cloud_finite_or_zero2(vec2 v) {
+	return vec2(feng_cloud_finite_or_zero(v.x), feng_cloud_finite_or_zero(v.y));
+}
+
+float feng_cloud_positive_finite(float v) {
+	return max(0.0, feng_cloud_finite_or_zero(v));
+}
+
+vec3 feng_cloud_positive_finite3(vec3 v) {
+	return max(vec3(0.0), feng_cloud_finite_or_zero3(v));
+}
+
+vec3 feng_cloud_safe_normalize3(vec3 v, vec3 fallback) {
+	vec3 finite_value = feng_cloud_finite_or_zero3(v);
+	float length_sqr = dot(finite_value, finite_value);
+	return length_sqr > 1e-12 ? finite_value * inversesqrt(length_sqr) : fallback;
+}
+
+float feng_cloud_saturate_finite(float v) {
+	return clamp(feng_cloud_finite_or_zero(v), 0.0, 1.0);
+}
+
+float feng_cloud_density_from_textures(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	float lod) {
+	if (!parameters.shape_texture_valid) {
+		return 0.0;
+	}
+	vec3 p = context.world_position_km * feng_cloud_finite_or_zero3(parameters.shape_uv_scale)
+		+ feng_cloud_finite_or_zero3(parameters.wind_offset_km);
+	if (parameters.use_curl && parameters.curl_strength != 0.0) {
+		vec3 curl_uv = context.world_position_km * feng_cloud_finite_or_zero3(parameters.curl_uv_scale)
+			+ feng_cloud_finite_or_zero3(parameters.wind_offset_km);
+		vec3 curl = feng_cloud_finite_or_zero3(textureLod(curl_noise_texture, curl_uv, max(lod, 0.0)).rgb * 2.0 - 1.0);
+		p += curl * feng_cloud_finite_or_zero(parameters.curl_strength);
+	}
+	float shape = feng_cloud_saturate_finite(textureLod(shape_density_texture, p, max(lod, 0.0)).r);
+	float density = clamp((shape - feng_cloud_saturate_finite(parameters.coverage)) / max(1.0 - feng_cloud_saturate_finite(parameters.coverage), 1e-5), 0.0, 1.0);
+
+	if (parameters.use_detail) {
+		vec3 detail_p = context.world_position_km * feng_cloud_finite_or_zero3(parameters.detail_uv_scale)
+			+ feng_cloud_finite_or_zero3(parameters.wind_offset_km);
+		if (parameters.use_curl && parameters.curl_strength != 0.0) {
+			detail_p += (p - (context.world_position_km * feng_cloud_finite_or_zero3(parameters.shape_uv_scale)
+				+ feng_cloud_finite_or_zero3(parameters.wind_offset_km)))
+				* feng_cloud_finite_or_zero3(parameters.detail_uv_scale);
+		}
+		float detail = feng_cloud_saturate_finite(textureLod(detail_density_texture, detail_p, max(lod, 0.0)).r);
+		density = clamp(density - (1.0 - detail) * feng_cloud_saturate_finite(parameters.detail_strength), 0.0, 1.0);
+	}
+	if (parameters.use_weather) {
+		vec2 weather_uv = context.world_position_km.xz * feng_cloud_finite_or_zero2(parameters.weather_uv_scale)
+			+ feng_cloud_finite_or_zero2(parameters.wind_offset_km.xz);
+		float weather = feng_cloud_saturate_finite(textureLod(weather_texture, weather_uv, max(lod, 0.0)).r);
+		float weather_strength = feng_cloud_saturate_finite(parameters.weather_strength);
+		density *= mix(1.0, weather, weather_strength);
+	}
+	return feng_cloud_saturate_finite(density);
+}
+
+float feng_cloud_density_constant_kernel(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	float lod) {
+	return feng_cloud_positive_finite(parameters.density_constant);
+}
+
+#ifndef FENG_CLOUD_DENSITY_KERNEL
+#define FENG_CLOUD_DENSITY_KERNEL feng_cloud_density_from_textures
+#endif
+
+FengCloudMaterialSample feng_cloud_sample_material_default(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	float lod) {
+	FengCloudMaterialSample s = feng_cloud_empty_material_sample();
+	if (context.normalized_altitude_in_layer <= 0.0 || context.normalized_altitude_in_layer >= 1.0) {
+		return s;
+	}
+	float density = FENG_CLOUD_DENSITY_KERNEL(shape_density_texture, detail_density_texture, weather_texture, curl_noise_texture, context, parameters, lod);
+	density = feng_cloud_positive_finite(density * feng_cloud_positive_finite(parameters.density_scale));
+	s.density = density;
+	s.extinction_per_km = feng_cloud_positive_finite3(parameters.extinction_per_km) * density;
+	s.albedo = clamp(feng_cloud_finite_or_zero3(parameters.albedo), vec3(0.0), vec3(1.0));
+	s.emission_per_km = feng_cloud_positive_finite3(parameters.emission_per_km) * density;
+	// The default density material has no per-sample AO output. A custom
+	// FENG_CLOUD_ADVANCED_KERNEL may provide one when the override is enabled.
+	s.ambient_occlusion = 1.0;
+	s.conservative_density = feng_cloud_positive_finite(parameters.conservative_density);
+	return s;
+}
+
+#ifndef FENG_CLOUD_MATERIAL_KERNEL
+#define FENG_CLOUD_MATERIAL_KERNEL feng_cloud_sample_material_default
+#endif
+
+FengCloudMaterialSample feng_cloud_sample_material(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	float lod) {
+	if (context.normalized_altitude_in_layer <= 0.0 || context.normalized_altitude_in_layer >= 1.0) {
+		return feng_cloud_empty_material_sample();
+	}
+	return FENG_CLOUD_MATERIAL_KERNEL(shape_density_texture, detail_density_texture, weather_texture, curl_noise_texture, context, parameters, lod);
+}
+
+vec3 feng_cloud_extinction_for_sampling(FengCloudMaterialSample material_sample, bool grayscale_extinction) {
+	vec3 extinction = feng_cloud_positive_finite3(material_sample.extinction_per_km);
+	if (grayscale_extinction) {
+		float grey = extinction.r;
+		return vec3(grey);
+	}
+	return extinction;
+}
+
+bool feng_cloud_sample_is_empty(FengCloudMaterialSample s) {
+	return all(lessThanEqual(s.extinction_per_km, vec3(0.0))) && all(lessThanEqual(s.emission_per_km, vec3(0.0)));
+}
+
+FengCloudAdvancedSample feng_cloud_advanced_sample_default(
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	FengCloudMaterialSample material,
+	FengCloudAdvancedMaterial base) {
+	FengCloudAdvancedSample s;
+	s.phase_g = base.phase_g;
+	s.phase_g2 = base.phase_g2;
+	s.phase_blend = base.phase_blend;
+	s.multiscatter_octaves = base.multiscatter_octaves;
+	s.multiscatter_contribution = base.multiscatter_contribution;
+	s.multiscatter_occlusion = base.multiscatter_occlusion;
+	s.multiscatter_eccentricity = base.multiscatter_eccentricity;
+	s.ambient_occlusion = material.ambient_occlusion;
+	s.ambient_occlusion_override = parameters.ao_override;
+	s.clamp_multiscatter_contribution = base.clamp_multiscatter_contribution;
+	s.ground_contribution = base.ground_contribution;
+	s.grayscale_extinction = base.grayscale_extinction;
+	s.raymarch_shadow = base.raymarch_shadow;
+	return s;
+}
+
+#ifndef FENG_CLOUD_ADVANCED_KERNEL
+#define FENG_CLOUD_ADVANCED_KERNEL feng_cloud_advanced_sample_default
+#endif
+
+FengCloudAdvancedSample feng_cloud_sample_advanced(
+	FengCloudSampleContext context,
+	FengCloudMaterialParameters parameters,
+	FengCloudMaterialSample material,
+	FengCloudAdvancedMaterial base) {
+	return FENG_CLOUD_ADVANCED_KERNEL(context, parameters, material, base);
+}
+
+#endif // FENG_CLOUD_MATERIAL_GLSLINC

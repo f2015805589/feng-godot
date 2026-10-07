@@ -1,0 +1,208 @@
+{
+  "schema": "feng-cloud-ue58-conversion-v1",
+  "note": "Direct Godot resources preserve their decoded Unreal source payloads and were verified by reload/GPU readback. The 256-wide runtime Pattern resource is derived separately from the pinned CPU Blur1 reference chain; it is not a direct source-payload match or UE cooker/DDC output.",
+  "tool": {
+    "scope": "These tool details record conversion and GPU-readback checks for the direct source-payload resources above; the derived runtime Pattern build is recorded on its own texture entry.",
+    "godot_version": "4.7.3.rc.custom_build.1e28d1f2e",
+    "godot_binary_sha256": "521189E2C6F4EF7FD1914DB4FD44ACD6ECDC5F5533C0EF52B9E81B8C9AF7F25E",
+    "builder_renderer": "D3D12 12_0 / Forward+ on NVIDIA GeForce RTX 3080 Ti",
+    "decoder_name": "Oodle Texture SDK 2.9.8-compatible oo2core_8_win64.dll",
+    "decoder_sha256": "FA3C031EFF7DCDEF9CEA0AB4BF78BCDE53AA22B97EE6FAD420FABB87DCDECB6D",
+    "decoder_script_sha256": "B5F5024B20E915D7F99F260E4B77BA60890C81733DAF1E854BE377A97FA66D2E",
+    "decode_stdout": "C:/Temp/feng-cloud-ue58-20261007/decode/decode_default_mi_textures.stdout.log",
+    "builder_stdout": "C:/Temp/feng-cloud-ue58-20261007/convert/build_textures_d3d12.stdout.log",
+    "roundtrip_stdout": "C:/Temp/feng-cloud-ue58-20261007/convert/verify_textures_d3d12.stdout.log"
+  },
+  "textures": [
+    {
+      "package": "/Engine/EngineSky/VolumetricClouds/T_CloudMask",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/T_CloudMask.uasset",
+      "source_uasset_sha256": "12A258CD0F3BDB22F7370352580389BA266A213FA45408CAD7D7F3494D75E51C",
+      "source_dimensions": [
+        1024,
+        1024,
+        1
+      ],
+      "source_format": "TSF_RGBA32F",
+      "source_srgb": {
+        "kind": "bool",
+        "value": false
+      },
+      "bulk": {
+        "storage": "local",
+        "payload_offset": 13570,
+        "method": 3,
+        "compressor": 3,
+        "block_count": 64,
+        "compressed_bytes": 8284739,
+        "compressed_buffer_crc32": "1F459428",
+        "header_crc32": "E1A23FF8",
+        "header_crc32_verified": true,
+        "raw_bytes": 16777216,
+        "raw_blake3_160": "DE27386D0203B316A3A2886B523E99E49748C93D",
+        "decoded_sha256": "1E744172A1616A5930D75AA4DB7BA1C311E7B6B48FD684A7E5CB46B58D2BF9DB",
+        "decoded_blake3_matches_header": true
+      },
+      "converted_resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/T_CloudMask_UE58.res",
+      "converted_sha256": "3BD9D174DF93481E3944877DBCD8DD382C4344EE7A0298963F8BCA5A9D676D72",
+      "converted_bytes": 10338462,
+      "godot_image_format": "RGBAF",
+      "dimensions": [
+        1024,
+        1024,
+        1
+      ],
+      "mipmaps": false,
+      "roundtrip_payload_byte_exact": true
+    },
+    {
+      "package": "/Engine/EngineSky/VolumetricClouds/T_CloudPattern",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/T_CloudPattern.uasset",
+      "source_uasset_sha256": "0A8225097AD44C42EA9F5D5D7CBA61FF0576EC43FBB328458DD357C1B3D70225",
+      "source_dimensions": [
+        1024,
+        1024,
+        1
+      ],
+      "source_format": "TSF_RGBA32F",
+      "source_srgb": {
+        "kind": "bool",
+        "value": false
+      },
+      "bulk": {
+        "storage": "local",
+        "payload_offset": 21879,
+        "method": 3,
+        "compressor": 3,
+        "block_count": 64,
+        "compressed_bytes": 10020197,
+        "compressed_buffer_crc32": "7CD75399",
+        "header_crc32": "5EEB4D2D",
+        "header_crc32_verified": true,
+        "raw_bytes": 16777216,
+        "raw_blake3_160": "6FB6B7010517F6C3794B385DE5BDF08A11D1888C",
+        "decoded_sha256": "5A019BDD4F232DA9CB417F16CC231604D33528F8E7E3E2D53C46AF83FABA5700",
+        "decoded_blake3_matches_header": true
+      },
+      "converted_resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/T_CloudPattern_Source_UE58.res",
+      "converted_sha256": "5A09AB7ED46AF8CF85E70F1D44581A43B36815FEE0CF4E8BB64EC60848021539",
+      "converted_bytes": 12929309,
+      "godot_image_format": "RGBAF",
+      "dimensions": [
+        1024,
+        1024,
+        1
+      ],
+      "mipmaps": false,
+      "roundtrip_payload_byte_exact": true
+    },
+    {
+      "package": "/Engine/EngineSky/VolumetricClouds/T_Profile_08",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/T_Profile_08.uasset",
+      "source_uasset_sha256": "25334827F0073977519A189BBB3DC784BAF1AAA99F97B4CAFC20F321B837EF15",
+      "source_dimensions": [
+        256,
+        256,
+        1
+      ],
+      "source_format": "TSF_RGBA16F",
+      "source_srgb": {
+        "kind": "bool",
+        "value": false
+      },
+      "bulk": {
+        "storage": "local",
+        "payload_offset": 8773,
+        "method": 3,
+        "compressor": 3,
+        "block_count": 2,
+        "compressed_bytes": 197718,
+        "compressed_buffer_crc32": "D6D1AA07",
+        "header_crc32": "4522A4D3",
+        "header_crc32_verified": true,
+        "raw_bytes": 524288,
+        "raw_blake3_160": "4B4746E5F6A40B0FDAC7404226841468C27080AB",
+        "decoded_sha256": "F9B1085BB9C309F422A6642D5E28C098E3B37AA1A4BD8397B9A407864E475E5F",
+        "decoded_blake3_matches_header": true
+      },
+      "converted_resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/T_Profile_08_UE58.res",
+      "converted_sha256": "4ADB91C58910EA2F43A0372431D7E2197E68325D8732E0EE326A633034BEE36A",
+      "converted_bytes": 385515,
+      "godot_image_format": "RGBAH",
+      "dimensions": [
+        256,
+        256,
+        1
+      ],
+      "mipmaps": false,
+      "roundtrip_payload_byte_exact": true
+    },
+    {
+      "package": "/Engine/EngineSky/VolumetricClouds/VT_PerlinWorley_Balanced",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/VT_PerlinWorley_Balanced.uasset",
+      "source_uasset_sha256": "89542FBE266D8F0D6D01ED3861CF72311C756D3A30D19C7C555041D44893C007",
+      "source_dimensions": [
+        128,
+        128,
+        128
+      ],
+      "source_format": "TSF_RGBA16F",
+      "source_srgb": null,
+      "bulk": {
+        "storage": "local",
+        "payload_offset": 14535,
+        "method": 3,
+        "compressor": 3,
+        "block_count": 64,
+        "compressed_bytes": 13579616,
+        "compressed_buffer_crc32": "46228BCF",
+        "header_crc32": "1E2300D0",
+        "header_crc32_verified": true,
+        "raw_bytes": 16777216,
+        "raw_blake3_160": "8FED183BDDEE483A6A3EE23365359C485383A52D",
+        "decoded_sha256": "AB0CB1097F624B34F98F2EBBE7DE7CC06CB3F7C7ED05918156600415632D7260",
+        "decoded_blake3_matches_header": true
+      },
+      "converted_resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/VT_PerlinWorley_Balanced_UE58.res",
+      "converted_sha256": "71EBEBFD46B0C00ADA7EC6230778AF338442593584EB62A3455EBA3B1139DAFF",
+      "converted_bytes": 13843724,
+      "godot_image_format": "RGBAH",
+      "dimensions": [
+        128,
+        128,
+        128
+      ],
+      "mipmaps": false,
+      "roundtrip_payload_byte_exact": true
+    },
+    {
+      "package": "/Engine/EngineSky/VolumetricClouds/T_CloudPattern",
+      "source_uasset": "misc/feng-addons/feng-cloud/resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/T_CloudPattern.uasset",
+      "converted_resource": "misc/feng-addons/feng-cloud/resources/ue58/converted/T_CloudPattern_UE58_Runtime256.res",
+      "converted_sha256": "E136C45B3D908E8E3A107700E0D97D5D1FC2C96610D3E6E8755E0BFFB2948A46",
+      "converted_bytes": 1398566,
+      "godot_image_format": "RGBAF",
+      "dimensions": [
+        256,
+        256,
+        1
+      ],
+      "mipmaps": true,
+      "roundtrip_payload_byte_exact": false,
+      "roundtrip_reference_chain_byte_exact": true,
+      "derivation": "The UE 1024x1024 decoded source is reduced with the pinned source-order float32 CPU reference of the legacy TMGS_Blur1 4x4 accumulation to the UE MaxTextureSize=256, then through the full 256-to-1 mip chain. Godot Image.create_from_data and the saved/reloaded RGBAF ImageTexture preserve all 1,398,096 mip payload bytes exactly.",
+      "reference_chain": {
+        "path": "C:/Temp/feng-cloud-ue58-20261007/source-parity-followup/blur1-cpu-reference/mips_256_to_1.rgba32f.chain",
+        "sha256": "D16495060F3A038739847FA384DCAAEF97EC35AEE363707E98CA5E6948C77287",
+        "bytes": 1398096,
+        "report_sha256": "5B095F17826AEC9C57F2017A1566E6B1CD9F575E3ACDD3DB1FD337C4594479F9",
+        "cooker_or_ddc_run": false
+      },
+      "resource_build": {
+        "godot_version": "4.7.3.rc.custom_build.76df24c63",
+        "conversion_log": "C:/Temp/feng-cloud-pattern-blur1-convert-20261007/godot-convert.stdout.log",
+        "conversion_script_sha256": "0275E1CFFDA77B320C0BE3C5712FB809BABC9CC2ACEA8A89DE0581C4AAB21401"
+      }
+    }
+  ]
+}

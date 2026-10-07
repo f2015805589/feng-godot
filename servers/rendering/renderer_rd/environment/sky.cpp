@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/frp_clustered/frp_pass_context.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -48,6 +49,7 @@
 using namespace RendererRD;
 
 #define RB_SCOPE_SKY SNAME("sky_buffers")
+#define RB_SCOPE_SKY_CLOUD_VISIBILITY SNAME("sky_cloud_visibility")
 #define RB_HALF_TEXTURE SNAME("half_texture")
 #define RB_QUARTER_TEXTURE SNAME("quarter_texture")
 
@@ -198,6 +200,57 @@ bool SkyRD::SkyMaterialData::update_parameters(const HashMap<StringName, Variant
 
 SkyRD::SkyMaterialData::~SkyMaterialData() {
 	free_parameters_uniform_set(uniform_set);
+}
+
+void SkyCloudVisibilityBuffers::free_data() {
+	if (uniform_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(uniform_buffer);
+	}
+	uniform_buffer = RID();
+}
+
+RID SkyRD::_get_cloud_fog_uniform_set(RID p_fog_texture, RID p_visibility_buffer, RID p_shadow0, RID p_shadow1, RID p_raw_ao) {
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	if (!p_fog_texture.is_valid() || !RD::get_singleton()->texture_is_valid(p_fog_texture)) {
+		p_fog_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+	}
+	if (!p_visibility_buffer.is_valid()) {
+		p_visibility_buffer = sky_scene_state.cloud_visibility_uniform_buffer;
+	}
+	const RID black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+	if (!p_shadow0.is_valid() || !RD::get_singleton()->texture_is_valid(p_shadow0)) {
+		p_shadow0 = black;
+	}
+	if (!p_shadow1.is_valid() || !RD::get_singleton()->texture_is_valid(p_shadow1)) {
+		p_shadow1 = black;
+	}
+	if (!p_raw_ao.is_valid() || !RD::get_singleton()->texture_is_valid(p_raw_ao)) {
+		p_raw_ao = black;
+	}
+
+	RD::Uniform fog_uniform;
+	fog_uniform.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	fog_uniform.binding = 0;
+	fog_uniform.append_id(p_fog_texture);
+	RD::Uniform visibility_uniform;
+	visibility_uniform.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+	visibility_uniform.binding = 1;
+	visibility_uniform.append_id(p_visibility_buffer);
+	RD::Uniform shadow0_uniform;
+	shadow0_uniform.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	shadow0_uniform.binding = 2;
+	shadow0_uniform.append_id(p_shadow0);
+	RD::Uniform shadow1_uniform;
+	shadow1_uniform.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	shadow1_uniform.binding = 3;
+	shadow1_uniform.append_id(p_shadow1);
+	RD::Uniform raw_ao_uniform;
+	raw_ao_uniform.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	raw_ao_uniform.binding = 4;
+	raw_ao_uniform.append_id(p_raw_ao);
+	return UniformSetCacheRD::get_singleton()->get_cache(
+			sky_shader.default_shader_rd, SKY_SET_FOG,
+			fog_uniform, visibility_uniform, shadow0_uniform, shadow1_uniform, raw_ao_uniform);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -781,6 +834,8 @@ void SkyRD::init() {
 		actions.renames["QUARTER_RES_COLOR"] = "quarter_res_color";
 		actions.renames["RADIANCE"] = "radiance";
 		actions.renames["FOG"] = "custom_fog";
+		actions.renames["feng_cloud_shadow_visibility"] = "frp_sky_cloud_shadow_visibility";
+		actions.renames["feng_cloud_multiple_visibility"] = "frp_sky_cloud_multiple_visibility";
 		actions.renames["LIGHT0_ENABLED"] = "directional_lights.data[0].enabled";
 		actions.renames["LIGHT0_DIRECTION"] = "directional_lights.data[0].direction_energy.xyz";
 		actions.renames["LIGHT0_ENERGY"] = "directional_lights.data[0].direction_energy.w";
@@ -846,6 +901,11 @@ void sky() {
 		sky_shader.default_shader_rd = sky_shader.shader.version_get_shader(md->shader_data->version, SKY_VERSION_BACKGROUND);
 
 		sky_scene_state.uniform_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SkySceneState::UBO));
+		SkyCloudVisibilityUBO neutral_cloud_visibility = {};
+		neutral_cloud_visibility.sun_mapping[0] = -1.0f;
+		neutral_cloud_visibility.sun_mapping[1] = -1.0f;
+		sky_scene_state.cloud_visibility_uniform_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SkyCloudVisibilityUBO));
+		RD::get_singleton()->buffer_update(sky_scene_state.cloud_visibility_uniform_buffer, 0, sizeof(SkyCloudVisibilityUBO), &neutral_cloud_visibility);
 
 		Vector<RD::Uniform> uniforms;
 
@@ -886,6 +946,21 @@ void sky() {
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			RID vfog = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 			u.append_id(vfog);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.binding = 1;
+			u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+			u.append_id(sky_scene_state.cloud_visibility_uniform_buffer);
+			uniforms.push_back(u);
+		}
+		const RID black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		for (uint32_t binding = 2; binding <= 4; binding++) {
+			RD::Uniform u;
+			u.binding = binding;
+			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			u.append_id(black);
 			uniforms.push_back(u);
 		}
 
@@ -966,6 +1041,9 @@ SkyRD::~SkyRD() {
 	if (RD::get_singleton()->uniform_set_is_valid(sky_scene_state.default_fog_uniform_set)) {
 		RD::get_singleton()->free_rid(sky_scene_state.default_fog_uniform_set);
 	}
+	if (sky_scene_state.cloud_visibility_uniform_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(sky_scene_state.cloud_visibility_uniform_buffer);
+	}
 
 	if (RD::get_singleton()->uniform_set_is_valid(sky_scene_state.fog_only_texture_uniform_set)) {
 		RD::get_singleton()->free_rid(sky_scene_state.fog_only_texture_uniform_set);
@@ -976,6 +1054,8 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	ERR_FAIL_COND(p_render_data->environment.is_null());
+	sky_scene_state.volumetric_fog_texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+	sky_scene_state.fog_uniform_set = sky_scene_state.default_fog_uniform_set;
 
 	ERR_FAIL_COND(p_render_data->render_buffers.is_null());
 
@@ -1185,6 +1265,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 	if (p_render_data->render_buffers->has_custom_data(RB_SCOPE_FOG)) {
 		Ref<RendererRD::Fog::VolumetricFog> fog = p_render_data->render_buffers->get_custom_data(RB_SCOPE_FOG);
 		sky_scene_state.ubo.volumetric_fog_enabled = true;
+		sky_scene_state.volumetric_fog_texture = fog->fog_map;
 
 		float fog_end = fog->length;
 		if (fog_end > 0.0) {
@@ -1200,8 +1281,8 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 			sky_scene_state.ubo.volumetric_fog_detail_spread = 1.0;
 		}
 
-		sky_scene_state.fog_uniform_set = fog->sky_uniform_set;
 	}
+	sky_scene_state.fog_uniform_set = _get_cloud_fog_uniform_set(sky_scene_state.volumetric_fog_texture, sky_scene_state.cloud_visibility_uniform_buffer, RID(), RID(), RID());
 
 	sky_scene_state.view_count = p_render_data->scene_data->view_count;
 	sky_scene_state.cam_transform = p_render_data->scene_data->cam_transform;
@@ -1493,6 +1574,56 @@ void SkyRD::update_res_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p
 	}
 
 	RD::get_singleton()->draw_command_end_label(); // Setup Sky resolution buffers
+}
+
+void SkyRD::prepare_cloud_visibility(Ref<RenderSceneBuffersRD> p_render_buffers, const Ref<FRPPassContext> &p_context) {
+	RID visibility_buffer = sky_scene_state.cloud_visibility_uniform_buffer;
+	RID shadow0;
+	RID shadow1;
+	RID raw_ao;
+	bool has_cloud_visibility = false;
+
+	if (p_render_buffers.is_valid() && p_context.is_valid()) {
+		const PackedFloat32Array parameters = p_context->get_cloud_atmosphere_parameters();
+		if (parameters.size() == 148) {
+			const bool map0_valid = parameters[142] > 0.5f;
+			const bool map1_valid = parameters[143] > 0.5f;
+			const bool raw_ao_valid = parameters[144] > 0.5f;
+			has_cloud_visibility = map0_valid || map1_valid || raw_ao_valid;
+			if (has_cloud_visibility) {
+				Ref<SkyCloudVisibilityBuffers> cloud_buffers;
+				if (p_render_buffers->has_custom_data(RB_SCOPE_SKY_CLOUD_VISIBILITY)) {
+					cloud_buffers = p_render_buffers->get_custom_data(RB_SCOPE_SKY_CLOUD_VISIBILITY);
+				}
+				if (cloud_buffers.is_null()) {
+					cloud_buffers.instantiate();
+					p_render_buffers->set_custom_data(RB_SCOPE_SKY_CLOUD_VISIBILITY, cloud_buffers);
+				}
+				if (!cloud_buffers->uniform_buffer.is_valid()) {
+					cloud_buffers->uniform_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SkyCloudVisibilityUBO));
+				}
+				SkyCloudVisibilityUBO visibility_data = {};
+				memcpy(visibility_data.projection, parameters.ptr(), sizeof(visibility_data.projection));
+				memcpy(visibility_data.sun_mapping, parameters.ptr() + 140, sizeof(visibility_data.sun_mapping));
+				memcpy(visibility_data.flags, parameters.ptr() + 144, sizeof(visibility_data.flags));
+				RD::get_singleton()->buffer_update(cloud_buffers->uniform_buffer, 0, sizeof(visibility_data), &visibility_data);
+				visibility_buffer = cloud_buffers->uniform_buffer;
+				if (map0_valid) {
+					shadow0 = p_context->get_cloud_output(3);
+				}
+				if (map1_valid) {
+					shadow1 = p_context->get_cloud_output(4);
+				}
+				if (raw_ao_valid) {
+					raw_ao = p_context->get_cloud_output(7);
+				}
+			}
+		}
+	}
+
+	sky_scene_state.fog_uniform_set = has_cloud_visibility
+			? _get_cloud_fog_uniform_set(sky_scene_state.volumetric_fog_texture, visibility_buffer, shadow0, shadow1, raw_ao)
+			: _get_cloud_fog_uniform_set(sky_scene_state.volumetric_fog_texture, sky_scene_state.cloud_visibility_uniform_buffer, RID(), RID(), RID());
 }
 
 void SkyRD::draw_sky(RD::DrawListID p_draw_list, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, RID p_fb, double p_time, float p_luminance_multiplier, float p_brightness_multiplier, float p_fog_source_pre_exposure) {

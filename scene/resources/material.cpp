@@ -863,6 +863,9 @@ void BaseMaterial3D::_update_shader() {
 	if (flags[FLAG_DISABLE_FOG]) {
 		code += ", fog_disabled";
 	}
+	if (flags[FLAG_CLOUD_FOGGING] && transparency != TRANSPARENCY_DISABLED && OS::get_singleton()->get_current_rendering_method() == "frp") {
+		code += ", cloud_fogging";
+	}
 	if (flags[FLAG_DISABLE_SPECULAR_OCCLUSION]) {
 		code += ", specular_occlusion_disabled";
 	}
@@ -2550,6 +2553,10 @@ BaseMaterial3D::TextureFilter BaseMaterial3D::get_texture_filter() const {
 }
 
 void BaseMaterial3D::_validate_property(PropertyInfo &p_property) const {
+	if (p_property.name == "cloud_fogging" && (transparency == TRANSPARENCY_DISABLED || OS::get_singleton()->get_current_rendering_method() != "frp")) {
+		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+	}
+
 	if (p_property.name == "emission_intensity" && !GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/use_physical_light_units")) {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
@@ -3562,6 +3569,7 @@ void BaseMaterial3D::_bind_methods() {
 
 	ADD_GROUP("Transparency", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "transparency", PROPERTY_HINT_ENUM, "Disabled,Alpha,Alpha Scissor,Alpha Hash,Depth Pre-Pass"), "set_transparency", "get_transparency");
+	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "cloud_fogging"), "set_flag", "get_flag", FLAG_CLOUD_FOGGING);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "alpha_scissor_threshold", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_alpha_scissor_threshold", "get_alpha_scissor_threshold");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "alpha_hash_scale", PROPERTY_HINT_RANGE, "0,2,0.01"), "set_alpha_hash_scale", "get_alpha_hash_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "alpha_antialiasing_mode", PROPERTY_HINT_ENUM, "Disabled,Alpha Edge Blend,Alpha Edge Clip"), "set_alpha_antialiasing", "get_alpha_antialiasing");
@@ -3862,6 +3870,7 @@ void BaseMaterial3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(FLAG_DISABLE_SPECULAR_OCCLUSION);
 	BIND_ENUM_CONSTANT(FLAG_USE_Z_CLIP_SCALE);
 	BIND_ENUM_CONSTANT(FLAG_USE_FOV_OVERRIDE);
+	BIND_ENUM_CONSTANT(FLAG_CLOUD_FOGGING);
 	BIND_ENUM_CONSTANT(FLAG_MAX);
 
 	BIND_ENUM_CONSTANT(DIFFUSE_BURLEY);

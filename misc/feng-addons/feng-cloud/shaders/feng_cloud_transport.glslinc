@@ -1,0 +1,341 @@
+#ifndef FENG_CLOUD_TRANSPORT_GLSLINC
+#define FENG_CLOUD_TRANSPORT_GLSLINC
+
+#include "feng_cloud_types.glslinc"
+#include "feng_cloud_material.glslinc"
+
+float feng_cloud_henyey_greenstein(float g, float forward_cos_theta) {
+	g = clamp(feng_cloud_finite_or_zero(g), -0.999, 0.999);
+	float c = clamp(feng_cloud_finite_or_zero(forward_cos_theta), -1.0, 1.0);
+	float denominator = max(1.0 + g * g - 2.0 * g * c, 1e-6);
+	return max(0.0, (1.0 - g * g) / (4.0 * FENG_CLOUD_PI * denominator * sqrt(denominator)));
+}
+
+float feng_cloud_dual_hg_phase(FengCloudAdvancedSample advanced, float forward_cos_theta) {
+	float g = clamp(feng_cloud_finite_or_zero(advanced.phase_g), -0.999, 0.999);
+	float g2 = clamp(feng_cloud_finite_or_zero(advanced.phase_g2), -0.999, 0.999);
+	float blend = feng_cloud_saturate_finite(advanced.phase_blend);
+	return mix(feng_cloud_henyey_greenstein(g, forward_cos_theta), feng_cloud_henyey_greenstein(g2, forward_cos_theta), blend);
+}
+
+float feng_cloud_multiscatter_phase(FengCloudAdvancedSample advanced, float base_phase, int order) {
+	if (order <= 0) {
+		return max(0.0, feng_cloud_finite_or_zero(base_phase));
+	}
+	float phase_factor = feng_cloud_saturate_finite(advanced.multiscatter_eccentricity);
+	for (int i = 1; i < order; ++i) {
+		phase_factor *= phase_factor;
+	}
+	return mix(FENG_CLOUD_INV_FOUR_PI, max(0.0, feng_cloud_finite_or_zero(base_phase)), phase_factor);
+}
+
+float feng_cloud_multiscatter_extinction_factor(FengCloudAdvancedSample advanced, int order) {
+	float extinction_base = feng_cloud_saturate_finite(advanced.multiscatter_occlusion);
+	float extinction_factor = 1.0;
+	for (int i = 0; i < order; ++i) {
+		extinction_factor *= extinction_base;
+		extinction_base *= extinction_base;
+	}
+	return extinction_factor;
+}
+
+void feng_cloud_multiscatter_coefficients(
+	FengCloudAdvancedSample advanced,
+	int order,
+	vec3 base_extinction_per_km,
+	vec3 base_albedo,
+	out vec3 extinction_per_km,
+	out vec3 scattering_per_km) {
+	float scattering_base = feng_cloud_finite_or_zero(advanced.multiscatter_contribution);
+	if (advanced.clamp_multiscatter_contribution) {
+		scattering_base = feng_cloud_saturate_finite(scattering_base);
+	}
+	float extinction_factor = feng_cloud_multiscatter_extinction_factor(advanced, order);
+	float scattering_factor = 1.0;
+	for (int i = 0; i < order; ++i) {
+		scattering_factor *= scattering_base;
+		scattering_base *= scattering_base;
+	}
+	vec3 base_extinction = feng_cloud_positive_finite3(base_extinction_per_km);
+	extinction_per_km = base_extinction * extinction_factor;
+	// UE recurrence scales extinction and scattering independently: S[n] is
+	// (baseSigma * albedo) times its S sequence, not E[n] times that sequence.
+	scattering_per_km = base_extinction * clamp(feng_cloud_finite_or_zero3(base_albedo), vec3(0.0), vec3(1.0)) * scattering_factor;
+}
+
+float feng_cloud_phase_dot(vec3 direction_to_light, vec3 view_ray_direction) {
+	// This is the forward-scattering cosine. UE negates its phase cosine because
+	// its view ray direction points into the volume.
+	vec3 light = feng_cloud_safe_normalize3(direction_to_light, vec3(0.0, 1.0, 0.0));
+	vec3 view = feng_cloud_safe_normalize3(view_ray_direction, vec3(0.0, 0.0, 1.0));
+	return clamp(dot(light, view), -1.0, 1.0);
+}
+
+vec3 feng_cloud_sun_irradiance(FengCloudSun sun, bool per_sample_atmosphere) {
+	if (!sun.enabled) {
+		return vec3(0.0);
+	}
+	vec3 irradiance = per_sample_atmosphere
+		? feng_cloud_positive_finite3(sun.top_irradiance) * clamp(feng_cloud_finite_or_zero3(sun.atmosphere_transmittance), vec3(0.0), vec3(1.0))
+		: feng_cloud_positive_finite3(sun.ground_irradiance);
+	return irradiance * clamp(feng_cloud_finite_or_zero3(sun.opaque_shadow), vec3(0.0), vec3(1.0))
+		* clamp(feng_cloud_finite_or_zero3(sun.cloud_shadow), vec3(0.0), vec3(1.0));
+}
+
+float feng_cloud_shadow_map_transmittance(vec4 shadow_record, float receiver_depth01, float far_depth_km) {
+	// UE-compatible record: R=front depth km, G=mean grey extinction per meter,
+	// B=max grey optical depth, A=1. This is a depth-dependent scalar multiplier
+	// for the matching sun's direct RGB, not a full RGB cloud-shadow texture.
+	if (!(shadow_record.a > 0.0)) {
+		return 1.0;
+	}
+	vec3 record = feng_cloud_positive_finite3(shadow_record.rgb);
+	float receiver_distance_km = (1.0 - clamp(feng_cloud_finite_or_zero(receiver_depth01), 0.0, 1.0)) * feng_cloud_positive_finite(far_depth_km);
+	float distance_m = max(0.0, receiver_distance_km - record.r) * FENG_CLOUD_KM_TO_M;
+	float optical_depth = min(record.b, record.g * distance_m);
+	return exp(-min(optical_depth, 80.0));
+}
+
+float feng_cloud_shadow_record_transmittance(vec4 shadow_record, float receiver_depth_km) {
+	if (!(shadow_record.a > 0.0)) {
+		return 1.0;
+	}
+	vec3 record = feng_cloud_positive_finite3(shadow_record.rgb);
+	float distance_m = max(0.0, feng_cloud_finite_or_zero(receiver_depth_km) - record.r) * FENG_CLOUD_KM_TO_M;
+	float optical_depth = min(record.b, record.g * distance_m);
+	return exp(-min(optical_depth, 80.0));
+}
+
+vec3 feng_cloud_ground_contribution_from_optical_depth(
+	FengCloudSun sun0,
+	FengCloudSun sun1,
+	vec3 sun0_atmosphere_transmittance,
+	vec3 sun1_atmosphere_transmittance,
+	bool per_sample_atmosphere,
+	vec3 ground_normal,
+	vec3 ground_albedo,
+	vec3 optical_depth,
+	float max_view_transmittance) {
+	if (!(max_view_transmittance > 0.01)) {
+		return vec3(0.0);
+	}
+	vec3 normal = feng_cloud_safe_normalize3(ground_normal, vec3(0.0, 1.0, 0.0));
+	float ndotl = max(dot(sun0.direction_to_light, normal), 0.0);
+	vec3 irradiance0 = per_sample_atmosphere
+		? feng_cloud_positive_finite3(sun0.top_irradiance) * clamp(feng_cloud_finite_or_zero3(sun0_atmosphere_transmittance), vec3(0.0), vec3(1.0))
+		: feng_cloud_positive_finite3(sun0.ground_irradiance);
+	vec3 irradiance1 = per_sample_atmosphere
+		? feng_cloud_positive_finite3(sun1.top_irradiance) * clamp(feng_cloud_finite_or_zero3(sun1_atmosphere_transmittance), vec3(0.0), vec3(1.0))
+		: feng_cloud_positive_finite3(sun1.ground_irradiance);
+	vec3 enabled_irradiance = (sun0.enabled ? irradiance0 : vec3(0.0))
+		+ (sun1.enabled ? irradiance1 : vec3(0.0));
+	vec3 transmission = exp(-min(feng_cloud_positive_finite3(optical_depth), vec3(80.0)));
+	return enabled_irradiance * ndotl * feng_cloud_positive_finite3(ground_albedo)
+		* (0.5 / FENG_CLOUD_PI) * transmission;
+}
+
+float feng_cloud_integral_factor(float extinction_per_km, float segment_length_km) {
+	float sigma_per_meter = feng_cloud_positive_finite(extinction_per_km) * FENG_CLOUD_M_TO_KM;
+	float length_m = feng_cloud_positive_finite(segment_length_km) * FENG_CLOUD_KM_TO_M;
+	float tau = sigma_per_meter * length_m;
+	if (tau < 1e-3) {
+		float tau2 = tau * tau;
+		return length_m * (1.0 - 0.5 * tau + tau2 * (1.0 / 6.0 - tau / 24.0));
+	}
+	if (tau >= 80.0 || isinf(tau)) {
+		return 1.0 / sigma_per_meter;
+	}
+	return length_m * (1.0 - exp(-tau)) / tau;
+}
+
+FengCloudSegmentResult feng_cloud_integrate_homogeneous_segment(
+	vec3 extinction_per_km,
+	vec3 source_radiance_per_meter,
+	float segment_length_km) {
+	FengCloudSegmentResult result;
+	vec3 sigma_km = feng_cloud_positive_finite3(extinction_per_km);
+	vec3 source_m = feng_cloud_finite_or_zero3(source_radiance_per_meter);
+	float length_km = feng_cloud_positive_finite(segment_length_km);
+	vec3 optical_depth = sigma_km * length_km;
+	result.transmittance = exp(-min(optical_depth, vec3(80.0)));
+	result.radiance = vec3(
+		source_m.r * feng_cloud_integral_factor(sigma_km.r, length_km),
+		source_m.g * feng_cloud_integral_factor(sigma_km.g, length_km),
+		source_m.b * feng_cloud_integral_factor(sigma_km.b, length_km));
+	result.radiance = feng_cloud_finite_or_zero3(result.radiance);
+	return result;
+}
+
+vec3 feng_cloud_total_source_per_meter(vec3 scattering_source_per_meter, vec3 emission_per_km) {
+	return feng_cloud_finite_or_zero3(scattering_source_per_meter)
+		+ feng_cloud_positive_finite3(emission_per_km) * FENG_CLOUD_M_TO_KM;
+}
+
+void feng_cloud_transport_add_sample(
+	inout FengCloudTransportState state,
+	FengCloudMaterialSample material,
+	vec3 source_radiance_per_meter,
+	bool grayscale_extinction,
+	float sample_distance_km,
+	float segment_length_km) {
+	vec3 sigma = feng_cloud_extinction_for_sampling(material, grayscale_extinction);
+	vec3 source = feng_cloud_total_source_per_meter(source_radiance_per_meter, material.emission_per_km);
+	float pre_sample_weight = min(state.transmittance.r, min(state.transmittance.g, state.transmittance.b));
+	vec3 scattering_coefficient = sigma * clamp(feng_cloud_finite_or_zero3(material.albedo), vec3(0.0), vec3(1.0));
+	bool contributes_medium = any(greaterThan(sigma, vec3(0.0)))
+		|| any(greaterThan(feng_cloud_positive_finite3(material.emission_per_km), vec3(0.0)));
+	if (contributes_medium && !state.has_front_depth) {
+		state.front_depth_km = max(0.0, feng_cloud_finite_or_zero(sample_distance_km));
+		state.has_front_depth = true;
+	}
+	if (any(greaterThan(scattering_coefficient, vec3(0.0)))) {
+		state.weighted_depth_sum_km += max(0.0, feng_cloud_finite_or_zero(sample_distance_km)) * pre_sample_weight;
+		state.weighted_depth_weight += pre_sample_weight;
+	}
+	FengCloudSegmentResult segment = feng_cloud_integrate_homogeneous_segment(sigma, source, segment_length_km);
+	state.radiance += state.transmittance * segment.radiance;
+	state.transmittance *= segment.transmittance;
+	state.radiance = feng_cloud_finite_or_zero3(state.radiance);
+	state.transmittance = clamp(feng_cloud_finite_or_zero3(state.transmittance), vec3(0.0), vec3(1.0));
+}
+
+float feng_cloud_weighted_mean_depth_km(FengCloudTransportState state, float fallback_depth_km) {
+	return state.weighted_depth_weight > 0.0
+		? state.weighted_depth_sum_km / state.weighted_depth_weight
+		: max(0.0, feng_cloud_finite_or_zero(fallback_depth_km));
+}
+
+float feng_cloud_sky_ambient_visibility(float material_ao, float sky_bottom_visibility, float normalized_altitude, bool material_ao_override, float ao_strength) {
+	if (material_ao_override) {
+		return mix(1.0, feng_cloud_saturate_finite(material_ao), feng_cloud_saturate_finite(ao_strength));
+	}
+	return feng_cloud_saturate_finite(sky_bottom_visibility + normalized_altitude);
+}
+
+vec3 feng_cloud_sample_sky_ambient(vec3 sky_radiance, float material_ao, float sky_bottom_visibility, float normalized_altitude, bool material_ao_override, float ao_strength) {
+	return feng_cloud_positive_finite3(sky_radiance)
+		* feng_cloud_sky_ambient_visibility(material_ao, sky_bottom_visibility, normalized_altitude, material_ao_override, ao_strength);
+}
+
+vec3 feng_cloud_sun_scattering_source_per_meter(
+	FengCloudAdvancedSample advanced,
+	FengCloudMaterialSample material,
+	FengCloudSun sun,
+	vec3 view_ray_direction,
+	int multiscatter_order,
+	bool per_sample_atmosphere) {
+	vec3 extinction_order;
+	vec3 scattering_order;
+	int order = max(0, multiscatter_order);
+	vec3 base_extinction = feng_cloud_positive_finite3(material.extinction_per_km);
+	if (advanced.grayscale_extinction) {
+		base_extinction = vec3(base_extinction.r);
+	}
+	feng_cloud_multiscatter_coefficients(advanced, order, base_extinction, material.albedo, extinction_order, scattering_order);
+	float phase = feng_cloud_multiscatter_phase(advanced, feng_cloud_dual_hg_phase(advanced, feng_cloud_phase_dot(sun.direction_to_light, view_ray_direction)), order);
+	vec3 irradiance = per_sample_atmosphere
+		? feng_cloud_positive_finite3(sun.top_irradiance) * clamp(feng_cloud_finite_or_zero3(sun.atmosphere_transmittance), vec3(0.0), vec3(1.0))
+		: feng_cloud_positive_finite3(sun.ground_irradiance);
+	float extinction_factor = feng_cloud_multiscatter_extinction_factor(advanced, order);
+	irradiance *= clamp(feng_cloud_finite_or_zero3(sun.opaque_shadow), vec3(0.0), vec3(1.0));
+	irradiance *= pow(clamp(feng_cloud_finite_or_zero3(sun.cloud_shadow), vec3(0.0), vec3(1.0)), vec3(extinction_factor));
+	return feng_cloud_finite_or_zero3(irradiance * phase * scattering_order * FENG_CLOUD_M_TO_KM);
+}
+
+vec3 feng_cloud_trace_self_shadow(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudMaterialParameters material_parameters,
+	vec3 world_position_km,
+	vec3 shell_center_km,
+	float bottom_radius_km,
+	float top_radius_km,
+	bool grayscale_extinction,
+	vec3 direction_to_light,
+	float trace_distance_km,
+	int sample_count,
+	float lod) {
+	int count = clamp(sample_count, 0, 128);
+	if (count == 0) {
+		return vec3(1.0);
+	}
+	float direction_length_sqr = dot(direction_to_light, direction_to_light);
+	if (!(direction_length_sqr > 1e-12)) {
+		return vec3(1.0);
+	}
+	vec3 direction = feng_cloud_finite_or_zero3(direction_to_light) * inversesqrt(direction_length_sqr);
+	float trace_length_km = feng_cloud_positive_finite(trace_distance_km);
+	vec3 optical_depth = vec3(0.0);
+	float previous_norm_t = 0.0;
+	for (int i = 1; i <= 128; ++i) {
+		if (i > count) {
+			break;
+		}
+		float shadow_t = float(i) / float(count);
+		float current_norm_t = shadow_t * shadow_t;
+		float delta_norm_t = current_norm_t - previous_norm_t;
+		float t_km = trace_length_km * (previous_norm_t + 0.5 * delta_norm_t);
+		previous_norm_t = current_norm_t;
+		vec3 sample_position_km = world_position_km + direction * t_km;
+		float radius_km = length(sample_position_km - shell_center_km);
+		if (radius_km <= bottom_radius_km || radius_km >= top_radius_km) {
+			break;
+		}
+		FengCloudSampleContext context = feng_cloud_sample_context(sample_position_km, shell_center_km, bottom_radius_km, top_radius_km - bottom_radius_km, t_km, t_km, vec3(0.0), vec3(0.0));
+		FengCloudMaterialSample material_sample = feng_cloud_sample_material(shape_density_texture, detail_density_texture, weather_texture, curl_noise_texture, context, material_parameters, lod);
+		if (material_sample.conservative_density <= 0.0) {
+			continue;
+		}
+		optical_depth += feng_cloud_extinction_for_sampling(material_sample, grayscale_extinction) * (trace_length_km * delta_norm_t);
+	}
+	return exp(-min(optical_depth, vec3(80.0)));
+}
+
+vec3 feng_cloud_ground_contribution(
+	sampler3D shape_density_texture,
+	sampler3D detail_density_texture,
+	sampler2D weather_texture,
+	sampler3D curl_noise_texture,
+	FengCloudMaterialParameters material_parameters,
+	vec3 sample_position_km,
+	vec3 planet_center_km,
+	float altitude_in_layer_km,
+	float bottom_radius_km,
+	float layer_height_km,
+	FengCloudSun sun0,
+	FengCloudSun sun1,
+	vec3 sun0_transmittance_to_ground,
+	vec3 sun1_transmittance_to_ground,
+	bool per_sample_atmosphere,
+	bool grayscale_extinction,
+	vec3 ground_albedo,
+	float max_view_transmittance,
+	float lod) {
+	vec3 center_to_sample = feng_cloud_finite_or_zero3(sample_position_km - planet_center_km);
+	float radial_length = length(center_to_sample);
+	vec3 ground_normal = radial_length > 1e-6 ? center_to_sample / radial_length : vec3(0.0, 1.0, 0.0);
+	vec3 ground_direction = -ground_normal;
+	float shadow_length_km = min(5.0, feng_cloud_positive_finite(altitude_in_layer_km));
+	vec3 optical_depth = vec3(0.0);
+	float previous_norm_t = 0.0;
+	for (int i = 1; i <= 5; ++i) {
+		float norm_t = float(i) / 5.0;
+		float current_norm_t = norm_t * norm_t;
+		float delta_norm_t = current_norm_t - previous_norm_t;
+		float sample_distance_km = shadow_length_km * (current_norm_t - 0.5 * delta_norm_t);
+		vec3 shadow_position_km = sample_position_km + ground_direction * sample_distance_km;
+		FengCloudSampleContext context = feng_cloud_sample_context(shadow_position_km, planet_center_km, bottom_radius_km, layer_height_km, sample_distance_km, sample_distance_km, vec3(0.0), vec3(0.0));
+		FengCloudMaterialSample material_sample = feng_cloud_sample_material(shape_density_texture, detail_density_texture, weather_texture, curl_noise_texture, context, material_parameters, lod);
+		if (material_sample.conservative_density > 0.0) {
+			optical_depth += feng_cloud_extinction_for_sampling(material_sample, grayscale_extinction) * shadow_length_km * delta_norm_t;
+		}
+		previous_norm_t = current_norm_t;
+	}
+	return feng_cloud_ground_contribution_from_optical_depth(
+		sun0, sun1, sun0_transmittance_to_ground, sun1_transmittance_to_ground,
+		per_sample_atmosphere, ground_normal, ground_albedo, optical_depth, max_view_transmittance);
+}
+
+#endif // FENG_CLOUD_TRANSPORT_GLSLINC

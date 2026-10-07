@@ -1,0 +1,37 @@
+#[compute]
+#version 450
+
+#include "cloud_gpu_layout.glslinc"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+FENG_CLOUD_DECLARE_SHADOW_FILTER_SOURCE;
+FENG_CLOUD_DECLARE_SHADOW_FILTER_OUTPUT;
+
+void main() {
+	ivec2 destination_pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 destination_size = imageSize(cloud_out_shadow_filter);
+	if (any(greaterThanEqual(destination_pixel, destination_size))) {
+		return;
+	}
+
+	ivec2 source_origin = destination_pixel * 2;
+	vec4 data0 = texelFetch(cloud_shadow_filter_source, source_origin + ivec2(0, 0), 0);
+	vec4 data1 = texelFetch(cloud_shadow_filter_source, source_origin + ivec2(1, 0), 0);
+	vec4 data2 = texelFetch(cloud_shadow_filter_source, source_origin + ivec2(1, 1), 0);
+	vec4 data3 = texelFetch(cloud_shadow_filter_source, source_origin + ivec2(0, 1), 0);
+
+	float depth_sum = data0.r + data1.r + data2.r + data3.r;
+	float depth_deviation = (abs(data0.r - depth_sum) + abs(data1.r - depth_sum)
+		+ abs(data2.r - depth_sum) + abs(data3.r - depth_sum)) * 0.25;
+	float filtered_front_depth = depth_sum - depth_deviation;
+	float filtered_mean_extinction = (data0.g + data1.g + data2.g + data3.g) * 0.25;
+	float filtered_max_optical_depth = (data0.b + data1.b + data2.b + data3.b) * 0.25;
+	float valid = max(max(data0.a, data1.a), max(data2.a, data3.a));
+
+	imageStore(cloud_out_shadow_filter, destination_pixel, vec4(
+		feng_cloud_storage_safe_half(filtered_front_depth),
+		feng_cloud_storage_safe_half(filtered_mean_extinction),
+		feng_cloud_storage_safe_half(filtered_max_optical_depth),
+		valid > 0.0 ? 1.0 : 0.0));
+}

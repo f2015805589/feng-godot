@@ -1,0 +1,15 @@
+# UE 5.8 cloud source snapshot
+
+This is a bounded source-package snapshot for the default cloud material closure, not an Unreal Engine installation backup. The `.uasset` files are provenance/input data and are not read by the addon at runtime.
+
+- 25 packages are preserved: 17 cloud-directory packages and 8 imported engine/function dependencies; 51,992,833 bytes total.
+- Independent source-to-plugin SHA-256 verification passed for all 25 packages.
+- The UE 5.8 package audit parsed all 25 packages and 223 ImportMap rows with no parser errors. All 17 hard `/Engine` package references resolve inside this snapshot; the 4 `/Script` references are code packages.
+- The default material instance resolves four texture overrides and its parent material graph. The graph audit reports 280 nodes and 349 direct expression-input edges. See `manifest/default-resource-audit.md` and `manifest/default-resource-decode.json`.
+- The audit found 18 texture exports with no texture-property parse errors. It records their `TextureSource` dimensions/formats and the instance's texture bindings; it does not perform the Godot resource conversion.
+- The follow-up active-Deferred expansion resolves 28/28 function inputs and the default CDO branches. Its `ConservativeDensity.r/g` are the Pattern RGB maximum; `.b` is the maximum of the three altitude/profile samples minus 0.5; `.a` is `0.8 * (Noise3(sample9.G) - 0.5 - 0.2)`. The `Noise_Strength.g=0.08` and `Noise_Bias.g=0.8` values only perturb the sample coordinates. See `manifest/conservative-density-formulas.md` and its machine evidence below; this supersedes the earlier profile/channel interpretation in `manifest/default-resource-audit.md`.
+- `T_CloudPattern` has a 1024×1024 `TextureSource`, but its UE `MaxTextureSize=256` yields a 256-wide built texture. The graph's `TextureSize` node reads that built resource size, so the default kernel uses runtime `textureSize(pattern, 0)`; 1024 is source provenance, not the sampling width.
+- The formula report is serialized graph/CDO analysis, not UE material compilation or numerical evaluation of texture pixels. It does not claim platform shader parity.
+- All 18 bulk payloads are local to their copied `.uasset` packages (11 legacy in-file offsets and 7 package-trailer ranges). No `.uexp`, `.ubulk`, `.uptnl`, `.m.ubulk`, or `.upayload` sidecars were found.
+
+The raw source subtree has `.gdignore`. Relative package, ImportMap, bulk-locality, and material-audit evidence is stored under `manifest/`. The corresponding Godot conversions are adjacent at `../converted/` (see `../converted/conversion_manifest.json`); the runtime default material is `../../feng_cloud_default_material.tres`, with its graph kernel at `../material/feng_cloud_ue58_default_kernel.glslinc`.

@@ -1,0 +1,557 @@
+#[compute]
+#version 450
+
+#include "cloud_gpu_layout.glslinc"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifndef FENG_CLOUD_TRACE_STEPS
+#define FENG_CLOUD_TRACE_STEPS 96
+#endif
+#ifndef FENG_CLOUD_TRACE_MAX_STEPS
+#define FENG_CLOUD_TRACE_MAX_STEPS 768
+#endif
+#ifndef FENG_CLOUD_TRACE_DISTANCE_TO_MAX_KM
+#define FENG_CLOUD_TRACE_DISTANCE_TO_MAX_KM 15.0
+#endif
+#ifndef FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS
+#define FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS 80
+#endif
+
+FENG_CLOUD_DECLARE_FRAME;
+FENG_CLOUD_DECLARE_MATERIAL;
+FENG_CLOUD_DECLARE_LIGHTING;
+FENG_CLOUD_DECLARE_ATMOSPHERE;
+FENG_CLOUD_DECLARE_HEIGHT_FOG;
+FENG_CLOUD_DECLARE_SHAPE_TEXTURE;
+FENG_CLOUD_DECLARE_DETAIL_TEXTURE;
+FENG_CLOUD_DECLARE_WEATHER_TEXTURE;
+FENG_CLOUD_DECLARE_CURL_TEXTURE;
+FENG_CLOUD_DECLARE_ATMOSPHERE_TEXTURES;
+FENG_CLOUD_DECLARE_NATIVE_SHADOW_DEPTH;
+FENG_CLOUD_DECLARE_NATIVE_SHADOW_DATA;
+FENG_CLOUD_DECLARE_SCENE_DEPTH;
+FENG_CLOUD_DECLARE_SKY_AMBIENT_INPUT;
+FENG_CLOUD_DECLARE_PROJECTION_CONTROL;
+FENG_CLOUD_DECLARE_CLOUD_SHADOW_TEXTURES;
+FENG_CLOUD_DECLARE_CLOUD_AO_STATS_TEXTURE;
+FENG_CLOUD_DECLARE_CLOUD_ATMOSPHERE_VISIBILITY;
+FENG_CLOUD_DECLARE_TRACE_OUTPUTS;
+#if FENG_CLOUD_VRT_SECONDARY
+FENG_CLOUD_DECLARE_SECONDARY_OUTPUTS;
+#endif
+
+#include "feng_cloud_height_fog.glslinc"
+#include "feng_cloud_atmosphere.glslinc"
+
+struct FengCloudRay {
+	vec3 origin_world_m;
+	vec3 direction_world;
+};
+
+FengCloudRay feng_cloud_ray_from_uv(vec2 uv, bool orthographic) {
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 near_h = cloud_frame.inverse_view_projection * vec4(ndc, 1.0, 1.0);
+	vec4 far_h = cloud_frame.inverse_view_projection * vec4(ndc, 0.0, 1.0);
+	vec3 near_world = abs(near_h.w) > 1e-7 ? near_h.xyz / near_h.w : near_h.xyz;
+	vec3 far_world = abs(far_h.w) > 1e-7 ? far_h.xyz / far_h.w : far_h.xyz;
+	FengCloudRay ray;
+	if (orthographic) {
+		ray.origin_world_m = near_world;
+		vec3 direction = abs(far_h.w) > 1e-7 ? far_world - near_world : far_h.xyz;
+		ray.direction_world = feng_cloud_safe_normalize3(direction, vec3(0.0, 0.0, -1.0));
+	} else {
+		ray.origin_world_m = cloud_frame.camera_world_position_m.xyz;
+		vec3 direction = abs(far_h.w) > 1e-7 ? far_world - ray.origin_world_m : far_h.xyz;
+		ray.direction_world = feng_cloud_safe_normalize3(direction, vec3(0.0, 0.0, -1.0));
+	}
+	return ray;
+}
+
+const float FENG_CLOUD_VRT_FAR_DEPTH_M = 65504000.0;
+
+float feng_cloud_distance_from_device_depth(vec2 uv, float device_depth, FengCloudRay ray) {
+	if (!(device_depth > 0.0) || isnan(device_depth) || isinf(device_depth)) {
+		return FENG_CLOUD_VRT_FAR_DEPTH_M;
+	}
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 world_h = cloud_frame.inverse_view_projection * vec4(ndc, device_depth, 1.0);
+	if (abs(world_h.w) <= 1e-7 || isnan(world_h.w) || isinf(world_h.w)) {
+		return FENG_CLOUD_VRT_FAR_DEPTH_M;
+	}
+	vec3 world_position_m = world_h.xyz / world_h.w;
+	float distance_m = dot(world_position_m - ray.origin_world_m, ray.direction_world);
+	return clamp(feng_cloud_finite_or_zero(distance_m), 0.0, FENG_CLOUD_VRT_FAR_DEPTH_M);
+}
+
+vec2 feng_cloud_scene_depth_bounds(ivec2 source_pixel, vec2 uv, ivec2 viewport_size,
+		uint vrt_mode, FengCloudRay ray, out bool has_geometry) {
+	has_geometry = false;
+	float device_depth = texelFetch(cloud_scene_depth, source_pixel, 0).r;
+	if (vrt_mode != 0u) {
+		float distance_m = feng_cloud_distance_from_device_depth(uv, device_depth, ray);
+		has_geometry = device_depth > 0.0 && distance_m < FENG_CLOUD_VRT_FAR_DEPTH_M;
+		return vec2(distance_m);
+	}
+	// UE's min/max depth texture reduces each 2x2 source DeviceZ block before
+	// unprojecting its nearest and farthest endpoints on the current cloud ray.
+	ivec2 depth_size = textureSize(cloud_scene_depth, 0);
+	ivec2 block_min = (source_pixel / 2) * 2;
+	float nearest_device_z = 0.0;
+	float farthest_device_z = 1.0;
+	bool has_sky = false;
+	for (int y = 0; y < 2; ++y) {
+		for (int x = 0; x < 2; ++x) {
+			ivec2 depth_pixel = clamp(block_min + ivec2(x, y), ivec2(0), depth_size - ivec2(1));
+			float sample_device_z = texelFetch(cloud_scene_depth, depth_pixel, 0).r;
+			if (!(sample_device_z > 0.0) || isnan(sample_device_z) || isinf(sample_device_z)) {
+				has_sky = true;
+				continue;
+			}
+			has_geometry = true;
+			nearest_device_z = max(nearest_device_z, sample_device_z);
+			farthest_device_z = min(farthest_device_z, sample_device_z);
+		}
+	}
+	if (!has_geometry) {
+		return vec2(FENG_CLOUD_VRT_FAR_DEPTH_M);
+	}
+	float near_m = feng_cloud_distance_from_device_depth(uv, nearest_device_z, ray);
+	float far_m = has_sky ? FENG_CLOUD_VRT_FAR_DEPTH_M
+		: feng_cloud_distance_from_device_depth(uv, farthest_device_z, ray);
+	return vec2(min(near_m, far_m), max(near_m, far_m));
+}
+
+vec3 feng_cloud_world_at_distance_km(FengCloudRay ray, float distance_km) {
+	return ray.origin_world_m * FENG_CLOUD_M_TO_KM + ray.direction_world * distance_km;
+}
+
+float feng_cloud_sample_native_shadow(int sun_slot, vec3 world_position_m, vec3 direction_to_sun_world, bool enabled) {
+	if (!enabled) {
+		return 1.0;
+	}
+	int slot = clamp(sun_slot, 0, 1);
+	vec3 position_view = (cloud_frame.world_to_view * vec4(world_position_m, 1.0)).xyz;
+	float view_depth = max(-position_view.z, 0.0);
+	vec4 splits = slot == 0 ? cloud_native_shadow_data.cascade_splits : cloud_native_shadow_data.cascade_splits1;
+	vec4 shadow_bias = slot == 0 ? cloud_native_shadow_data.shadow_bias : cloud_native_shadow_data.shadow_bias1;
+	vec4 fade_data = slot == 0 ? cloud_native_shadow_data.opacity_fade_start_end_valid : cloud_native_shadow_data.opacity_fade_start_end_valid1;
+	if (!(fade_data.w > 0.5) || !(fade_data.x > 0.0)) {
+		return 1.0;
+	}
+	int cascade = 0;
+	if (view_depth > splits.x) cascade = 1;
+	if (view_depth > splits.y) cascade = 2;
+	if (view_depth > splits.z) cascade = 3;
+	if (view_depth > splits.w) {
+		return 1.0;
+	}
+	mat4 atlas_transform;
+	float bias;
+	if (slot == 0) {
+		atlas_transform = cloud_native_shadow_data.atlas_transform[cascade];
+	} else {
+		atlas_transform = cloud_native_shadow_data.atlas_transform1[cascade];
+	}
+	if (cascade == 0) bias = shadow_bias.x;
+	else if (cascade == 1) bias = shadow_bias.y;
+	else if (cascade == 2) bias = shadow_bias.z;
+	else bias = shadow_bias.w;
+	vec3 to_sun_view = mat3(cloud_frame.world_to_view) * direction_to_sun_world;
+	vec3 biased_position_view = position_view + to_sun_view * feng_cloud_finite_or_zero(bias);
+	vec4 shadow_clip = atlas_transform * vec4(biased_position_view, 1.0);
+	if (abs(shadow_clip.w) < 1e-7) {
+		return 1.0;
+	}
+	vec3 shadow_coord = shadow_clip.xyz / shadow_clip.w;
+	if (any(lessThan(shadow_coord.xy, vec2(0.0))) || any(greaterThan(shadow_coord.xy, vec2(1.0)))
+			|| shadow_coord.z < 0.0 || shadow_coord.z > 1.0) {
+		return 1.0;
+	}
+	float shadow = texture(cloud_native_shadow_depth, shadow_coord);
+	float fade = 1.0;
+	float fade_start = max(fade_data.y, 0.0);
+	float fade_end = max(fade_data.z, fade_start);
+	if (fade_end > fade_start && view_depth > fade_start) {
+		fade = 1.0 - smoothstep(fade_start, fade_end, view_depth);
+	}
+	return mix(1.0, clamp(shadow, 0.0, 1.0), clamp(fade_data.x * fade, 0.0, 1.0));
+}
+
+vec3 feng_cloud_trace_self_shadow_with_context(
+		FengCloudSampleContext primary_context,
+		FengCloudMaterialParameters material_parameters,
+		vec3 shell_center_km,
+		float bottom_radius_km,
+		float top_radius_km,
+		bool grayscale_extinction,
+		vec3 direction_to_light,
+		float trace_distance_km,
+		int sample_count) {
+	int count = clamp(sample_count, 0, 128);
+	float direction_length_squared = dot(direction_to_light, direction_to_light);
+	if (!(direction_length_squared > 1e-12)) {
+		return vec3(1.0);
+	}
+	vec3 direction = feng_cloud_safe_normalize3(direction_to_light, vec3(0.0, 1.0, 0.0));
+	float trace_length_km = feng_cloud_positive_finite(trace_distance_km);
+	if (count == 0 || !(trace_length_km > 0.0)) {
+		return vec3(1.0);
+	}
+	vec3 optical_depth = vec3(0.0);
+	float previous_norm_t = 0.0;
+	for (int i = 1; i <= 128; ++i) {
+		if (i > count) {
+			break;
+		}
+		float shadow_t = float(i) / float(count);
+		float current_norm_t = shadow_t * shadow_t;
+		float delta_norm_t = current_norm_t - previous_norm_t;
+		float t_km = trace_length_km * (previous_norm_t + 0.5 * delta_norm_t);
+		previous_norm_t = current_norm_t;
+		vec3 sample_position_km = primary_context.world_position_km + direction * t_km;
+		float radius_km = length(sample_position_km - shell_center_km);
+		if (radius_km <= bottom_radius_km || radius_km >= top_radius_km) {
+			break;
+		}
+		FengCloudSampleContext context = feng_cloud_sample_context(
+			sample_position_km, shell_center_km, bottom_radius_km, top_radius_km - bottom_radius_km,
+			primary_context.ray_distance_km + t_km, t_km,
+			primary_context.world_position_ddx_km, primary_context.world_position_ddy_km);
+		FengCloudMaterialSample material_sample = feng_cloud_sample_material(
+			cloud_shape_density_texture, cloud_detail_density_texture, cloud_weather_texture, cloud_curl_texture,
+			context, material_parameters, 0.0);
+		if (material_sample.conservative_density <= 0.0) {
+			continue;
+		}
+		optical_depth = min(optical_depth + feng_cloud_extinction_for_sampling(material_sample, grayscale_extinction)
+			* (trace_length_km * delta_norm_t), vec3(80.0));
+	}
+	return exp(-feng_cloud_positive_finite3(optical_depth));
+}
+
+vec3 feng_cloud_ground_contribution_with_context(
+		FengCloudSampleContext primary_context,
+		FengCloudMaterialParameters material_parameters,
+		FengCloudShellParameters shell,
+		FengCloudSun sun0,
+		FengCloudSun sun1,
+		bool per_sample_atmosphere,
+		bool grayscale_extinction,
+		vec3 ground_albedo,
+		float max_view_transmittance) {
+	if (!(max_view_transmittance > 0.01)) {
+		return vec3(0.0);
+	}
+	vec3 center_to_sample = feng_cloud_finite_or_zero3(primary_context.world_position_km - shell.planet_center_km);
+	float radial_length = length(center_to_sample);
+	vec3 ground_normal = radial_length > 1e-6 ? center_to_sample / radial_length : vec3(0.0, 1.0, 0.0);
+	vec3 ground_direction = -ground_normal;
+	float shadow_length_km = min(5.0, feng_cloud_positive_finite(primary_context.altitude_in_layer_km));
+	vec3 optical_depth = vec3(0.0);
+	float previous_norm_t = 0.0;
+	for (int i = 1; i <= 5; ++i) {
+		float norm_t = float(i) / 5.0;
+		float current_norm_t = norm_t * norm_t;
+		float delta_norm_t = current_norm_t - previous_norm_t;
+		float sample_distance_km = shadow_length_km * (current_norm_t - 0.5 * delta_norm_t);
+		vec3 shadow_position_km = primary_context.world_position_km + ground_direction * sample_distance_km;
+		FengCloudSampleContext context = feng_cloud_sample_context(
+			shadow_position_km, shell.planet_center_km,
+			shell.planet_radius_km + shell.layer_bottom_km,
+			shell.layer_height_km,
+			length(shadow_position_km * FENG_CLOUD_KM_TO_M - cloud_frame.camera_world_position_m.xyz) * FENG_CLOUD_M_TO_KM,
+			sample_distance_km,
+			primary_context.world_position_ddx_km, primary_context.world_position_ddy_km);
+		FengCloudMaterialSample material_sample = feng_cloud_sample_material(
+			cloud_shape_density_texture, cloud_detail_density_texture, cloud_weather_texture, cloud_curl_texture,
+			context, material_parameters, 0.0);
+		if (material_sample.conservative_density > 0.0) {
+			optical_depth = min(optical_depth + feng_cloud_extinction_for_sampling(material_sample, grayscale_extinction)
+				* (shadow_length_km * delta_norm_t), vec3(80.0));
+		}
+		previous_norm_t = current_norm_t;
+	}
+	return feng_cloud_ground_contribution_from_optical_depth(
+		sun0, sun1, sun0.atmosphere_transmittance, sun1.atmosphere_transmittance,
+		per_sample_atmosphere, ground_normal, ground_albedo, optical_depth, max_view_transmittance);
+}
+
+FengCloudSun feng_cloud_make_sun(
+	int slot,
+	FengCloudAdvancedSample advanced,
+	FengCloudMaterialParameters material_parameters,
+	FengCloudShellParameters shell,
+	FengCloudSampleContext sample_context,
+		vec3 camera_world_m,
+		int self_shadow_sample_count) {
+	FengCloudSun sun;
+	if (slot == 0) {
+		sun = feng_cloud_sun_from_lighting(cloud_lighting.sun0_direction_enabled, cloud_lighting.sun0_top_irradiance_cast, cloud_lighting.sun0_ground_illuminance_shadow_index);
+	} else {
+		sun = feng_cloud_sun_from_lighting(cloud_lighting.sun1_direction_enabled, cloud_lighting.sun1_top_irradiance_cast, cloud_lighting.sun1_ground_illuminance_shadow_index);
+	}
+	if (!sun.enabled) {
+		return sun;
+	}
+	vec3 sample_world_m = sample_context.world_position_km * FENG_CLOUD_KM_TO_M;
+	vec3 camera_to_sample_m = sample_world_m - camera_world_m;
+	bool per_sample_atmosphere = shell.per_sample_atmosphere > 0.5;
+	sun.atmosphere_transmittance = feng_cloud_sample_atmosphere_transmittance(camera_to_sample_m, slot, per_sample_atmosphere);
+	float cast_shadow = slot == 0 ? cloud_lighting.sun0_top_irradiance_cast.w : cloud_lighting.sun1_top_irradiance_cast.w;
+	sun.opaque_shadow = vec3(feng_cloud_sample_native_shadow(slot, sample_world_m, sun.direction_to_light, cast_shadow > 0.5));
+	if (advanced.raymarch_shadow && shell.shadow_distance_km > 0.0) {
+		float layer_bottom_radius_km = shell.planet_radius_km + shell.layer_bottom_km;
+		float top_radius_km = layer_bottom_radius_km + shell.layer_height_km;
+		sun.cloud_shadow = feng_cloud_trace_self_shadow_with_context(
+			sample_context, material_parameters,
+			shell.planet_center_km,
+			layer_bottom_radius_km, top_radius_km, advanced.grayscale_extinction,
+			sun.direction_to_light, shell.shadow_distance_km, self_shadow_sample_count);
+	} else {
+		sun.cloud_shadow = vec3(1.0);
+	}
+	return sun;
+}
+
+void main() {
+	ivec2 trace_pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 trace_extent = imageSize(cloud_out_radiance).xy;
+	if (any(greaterThanEqual(trace_pixel, trace_extent))) {
+		return;
+	}
+	int view_layer = int(cloud_frame.view_index_frame_index_flags_vrt_mode.x);
+	if (view_layer < 0 || view_layer >= imageSize(cloud_out_radiance).z) {
+		return;
+	}
+	vec2 viewport_size = max(cloud_frame.viewport_size_xy_inv_xy.xy, vec2(1.0));
+	vec2 phase = cloud_frame.trace_phase_xy_trace_size_xy.xy;
+	uint vrt_mode = min(cloud_frame.view_index_frame_index_flags_vrt_mode.w, 3u);
+	int trace_downsample = vrt_mode == 1u ? 2 : (vrt_mode == 3u ? 1 : 4);
+	vec2 trace_scale = vec2(float(trace_downsample));
+	vec2 full_pixel = vec2(trace_pixel) * trace_scale + phase + vec2(0.5);
+	full_pixel = clamp(full_pixel, vec2(0.5), viewport_size - vec2(0.5));
+	vec2 uv = full_pixel / viewport_size;
+	ivec2 source_pixel = clamp(ivec2(full_pixel), ivec2(0), ivec2(viewport_size) - ivec2(1));
+	bool orthographic = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_ORTHOGRAPHIC) != 0u;
+	bool capture = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_CAPTURE) != 0u;
+	
+	FengCloudRay ray = feng_cloud_ray_from_uv(uv, orthographic);
+	vec2 uv_x = clamp(uv + vec2(cloud_frame.viewport_size_xy_inv_xy.z * trace_scale.x, 0.0), vec2(0.0), vec2(1.0));
+	vec2 uv_y = clamp(uv + vec2(0.0, cloud_frame.viewport_size_xy_inv_xy.w * trace_scale.y), vec2(0.0), vec2(1.0));
+	FengCloudRay ray_x = feng_cloud_ray_from_uv(uv_x, orthographic);
+	FengCloudRay ray_y = feng_cloud_ray_from_uv(uv_y, orthographic);
+	vec3 ray_origin_km = ray.origin_world_m * FENG_CLOUD_M_TO_KM;
+	vec3 ray_direction = ray.direction_world;
+	vec4 material_lanes[19];
+	for (int i = 0; i < 19; ++i) {
+		material_lanes[i] = cloud_material_block.lane[i];
+	}
+	FengCloudMaterialParameters material_parameters = feng_cloud_material_from_lanes(material_lanes);
+	FengCloudAdvancedMaterial advanced_material = feng_cloud_advanced_from_lanes(material_lanes);
+	FengCloudShellParameters shell = feng_cloud_shell_from_lanes(material_lanes);
+	if ((!capture && shell.render_main <= 0.5) || (capture && shell.visible_in_capture <= 0.5)) {
+		imageStore(cloud_out_radiance, ivec3(trace_pixel, view_layer), vec4(0.0));
+		imageStore(cloud_out_transmittance, ivec3(trace_pixel, view_layer), vec4(1.0, 1.0, 1.0, 0.0));
+		imageStore(cloud_out_depth, ivec3(trace_pixel, view_layer), vec4(FENG_CLOUD_VRT_FAR_DEPTH_M));
+#if FENG_CLOUD_VRT_SECONDARY
+		imageStore(cloud_out_secondary_radiance, ivec3(trace_pixel, view_layer), vec4(0.0));
+		imageStore(cloud_out_secondary_transmittance, ivec3(trace_pixel, view_layer), vec4(1.0, 1.0, 1.0, 0.0));
+#endif
+		return;
+	}
+	float bottom_radius_km = shell.planet_radius_km + shell.layer_bottom_km;
+	float top_radius_km = bottom_radius_km + shell.layer_height_km;
+	float configured_shadow_scale = capture ? shell.reflection_shadow_sample_scale : shell.shadow_view_sample_scale;
+	int self_shadow_sample_count = capture
+		? clamp(int(round(10.0 * max(feng_cloud_finite_or_zero(configured_shadow_scale), 0.0))), 2, 24)
+		: clamp(int(round(10.0 * max(feng_cloud_finite_or_zero(configured_shadow_scale), 0.0))), 2, 80);
+	bool has_opaque_geometry = false;
+	vec2 opaque_bounds_m = feng_cloud_scene_depth_bounds(source_pixel, uv, ivec2(viewport_size),
+		vrt_mode, ray, has_opaque_geometry);
+	float opaque_near_km = opaque_bounds_m.x * FENG_CLOUD_M_TO_KM;
+	float opaque_far_km = opaque_bounds_m.y * FENG_CLOUD_M_TO_KM;
+	float opaque_depth_km = opaque_far_km;
+	// Mode 2 follows UE's no-opaque-intersection quarter trace; captures still
+	// clip against opaque geometry so the captured cloud cannot cover objects.
+	int opaque_intersection_mode = (!capture && vrt_mode == 2u) ? 0 : 2;
+	FengCloudShellSpan span = feng_cloud_build_shell_span(
+		ray_origin_km, ray_direction, shell.planet_center_km, bottom_radius_km, top_radius_km,
+		shell.trace_start_max_km, shell.trace_start_from_camera_km, shell.trace_max_km,
+		shell.trace_max_mode, opaque_intersection_mode, opaque_depth_km, orthographic, shell.trace_max_km);
+	FengCloudTransportState state = feng_cloud_transport_state_init();
+	vec3 closest_radiance = vec3(0.0);
+	vec3 closest_transmittance = vec3(1.0);
+	float closest_weighted_depth_sum_km = 0.0;
+	float closest_weighted_depth_weight = 0.0;
+	bool closest_has_front_depth = false;
+	vec4 ambient_source_sample = textureLod(cloud_sky_ambient, vec2(0.5), 0.0);
+	vec3 sky_ambient_radiance = ambient_source_sample.a > 0.5
+		? feng_cloud_positive_finite3(ambient_source_sample.rgb)
+		: vec3(0.0);
+	if (span.valid) {
+		float total_length_km = span.end_km - span.start_km;
+		float configured_scale = capture ? shell.reflection_view_sample_scale : shell.view_sample_scale;
+		configured_scale = max(feng_cloud_finite_or_zero(configured_scale), 0.01);
+		float max_trace_steps = min(float(FENG_CLOUD_TRACE_STEPS) * configured_scale,
+			capture ? float(FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS) : float(FENG_CLOUD_TRACE_MAX_STEPS));
+		float distance_ramp = clamp(total_length_km / FENG_CLOUD_TRACE_DISTANCE_TO_MAX_KM, 0.0, 1.0);
+		// Match UE's SampleCountMin/max-distance ramp and the view/reflection caps.
+		int trace_steps = clamp(int(max(2.0, max_trace_steps * distance_ramp)),
+			2, capture ? FENG_CLOUD_TRACE_REFLECTION_MAX_STEPS : FENG_CLOUD_TRACE_MAX_STEPS);
+		float step_length_km = total_length_km / float(trace_steps);
+		FengCloudAdvancedSample pixel_advanced;
+		bool has_pixel_advanced = false;
+		for (int step_index = 0; step_index < trace_steps; ++step_index) {
+			float sample_distance_km = span.start_km + (float(step_index) + 0.5) * step_length_km;
+			vec3 sample_position_km = ray_origin_km + ray_direction * sample_distance_km;
+			vec3 sample_ddx_km = (ray_x.origin_world_m + ray_x.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M)
+				- (ray.origin_world_m + ray.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M))) * FENG_CLOUD_M_TO_KM;
+			vec3 sample_ddy_km = (ray_y.origin_world_m + ray_y.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M)
+				- (ray.origin_world_m + ray.direction_world * (sample_distance_km * FENG_CLOUD_KM_TO_M))) * FENG_CLOUD_M_TO_KM;
+			FengCloudSampleContext context = feng_cloud_sample_context(
+				sample_position_km, shell.planet_center_km, bottom_radius_km, shell.layer_height_km,
+				sample_distance_km, 0.0, sample_ddx_km, sample_ddy_km);
+			FengCloudMaterialSample material = feng_cloud_sample_material(
+				cloud_shape_density_texture, cloud_detail_density_texture, cloud_weather_texture, cloud_curl_texture,
+				context, material_parameters, 0.0);
+			if (feng_cloud_sample_is_empty(material)) {
+				continue;
+			}
+			FengCloudAdvancedSample advanced = feng_cloud_sample_advanced(context, material_parameters, material, advanced_material);
+			if (!has_pixel_advanced) {
+				pixel_advanced = advanced;
+				has_pixel_advanced = true;
+			}
+			if (!advanced_material.phase_per_sample) {
+				advanced.phase_g = pixel_advanced.phase_g;
+				advanced.phase_g2 = pixel_advanced.phase_g2;
+				advanced.phase_blend = pixel_advanced.phase_blend;
+			}
+			FengCloudSun sun0 = feng_cloud_make_sun(
+				0, advanced, material_parameters, shell, context, cloud_frame.camera_world_position_m.xyz, self_shadow_sample_count);
+			FengCloudSun sun1 = feng_cloud_make_sun(
+				1, advanced, material_parameters, shell, context, cloud_frame.camera_world_position_m.xyz, self_shadow_sample_count);
+			if (!advanced.raymarch_shadow || shell.shadow_distance_km <= 0.0) {
+				sun0.cloud_shadow = vec3(1.0);
+				sun1.cloud_shadow = vec3(1.0);
+			}
+			float ambient_visibility = feng_cloud_sky_ambient_visibility(
+				advanced.ambient_occlusion, shell.bottom_sky_ao, context.normalized_altitude_in_layer,
+				advanced.ambient_occlusion_override, material_parameters.ao_strength);
+			vec3 ambient_source = sky_ambient_radiance * ambient_visibility;
+			vec3 ground_source = vec3(0.0);
+			float max_view_transmittance = max(state.transmittance.r, max(state.transmittance.g, state.transmittance.b));
+			if (advanced.ground_contribution) {
+				vec3 cloud_up = feng_cloud_safe_normalize3(sample_position_km - shell.planet_center_km, vec3(0.0, 1.0, 0.0));
+				ground_source = feng_cloud_ground_contribution_with_context(
+					context, material_parameters, shell, sun0, sun1,
+					shell.per_sample_atmosphere > 0.5,
+					advanced.grayscale_extinction, feng_cloud_finite_or_zero3(material_lanes[13].rgb), max_view_transmittance);
+			}
+			int octave_count = clamp(advanced.multiscatter_octaves, 0, 2);
+			vec3 base_extinction = feng_cloud_extinction_for_sampling(material, advanced.grayscale_extinction);
+			vec3 base_scattering = base_extinction * clamp(feng_cloud_finite_or_zero3(material.albedo), vec3(0.0), vec3(1.0));
+			vec3 pre_sample_transmittance = state.transmittance;
+			bool contributes_closest = sample_distance_km <= opaque_near_km;
+			if ((any(greaterThan(base_extinction, vec3(0.0))) || any(greaterThan(material.emission_per_km, vec3(0.0)))) && !state.has_front_depth) {
+				state.front_depth_km = max(0.0, sample_distance_km);
+				state.has_front_depth = true;
+			}
+			if (contributes_closest && (any(greaterThan(base_extinction, vec3(0.0)))
+					|| any(greaterThan(material.emission_per_km, vec3(0.0))))) {
+				closest_has_front_depth = true;
+			}
+			if (any(greaterThan(base_extinction, vec3(0.0)))) {
+				float depth_weight = min(pre_sample_transmittance.r, min(pre_sample_transmittance.g, pre_sample_transmittance.b));
+				state.weighted_depth_sum_km += max(0.0, sample_distance_km) * depth_weight;
+				state.weighted_depth_weight += depth_weight;
+				if (contributes_closest) {
+					closest_weighted_depth_sum_km += max(0.0, sample_distance_km) * depth_weight;
+					closest_weighted_depth_weight += depth_weight;
+				}
+			}
+			// Higher scattering orders are integrated first with their own extinction
+			// coefficients. Only the base order advances view transmittance.
+			for (int order = octave_count; order >= 0; --order) {
+				vec3 order_extinction;
+				vec3 order_scattering;
+				feng_cloud_multiscatter_coefficients(advanced, order, base_extinction, material.albedo, order_extinction, order_scattering);
+				vec3 ambient_order = order == 0
+					? order_scattering * (ambient_source + ground_source) * FENG_CLOUD_M_TO_KM
+					: vec3(0.0);
+				vec3 direct0 = feng_cloud_sun_scattering_source_per_meter(advanced, material, sun0, ray_direction, order, shell.per_sample_atmosphere > 0.5);
+				vec3 direct1 = feng_cloud_sun_scattering_source_per_meter(advanced, material, sun1, ray_direction, order, shell.per_sample_atmosphere > 0.5);
+				vec3 emission_per_meter = feng_cloud_positive_finite3(material.emission_per_km) * FENG_CLOUD_M_TO_KM;
+				vec3 source_per_meter = feng_cloud_finite_or_zero3(ambient_order + direct0 + direct1 + emission_per_meter);
+				FengCloudSegmentResult order_segment = feng_cloud_integrate_homogeneous_segment(order_extinction, source_per_meter, step_length_km);
+				state.radiance += pre_sample_transmittance * order_segment.radiance;
+				if (contributes_closest) {
+					closest_radiance += pre_sample_transmittance * order_segment.radiance;
+				}
+			}
+			state.transmittance *= exp(-min(base_extinction * step_length_km, vec3(80.0)));
+			if (contributes_closest) {
+				closest_transmittance *= exp(-min(base_extinction * step_length_km, vec3(80.0)));
+			}
+			state.radiance = feng_cloud_finite_or_zero3(state.radiance);
+			state.transmittance = clamp(feng_cloud_finite_or_zero3(state.transmittance), vec3(0.0), vec3(1.0));
+			if (shell.stop_transmittance > 0.0 && all(lessThan(state.transmittance, vec3(shell.stop_transmittance)))) {
+				break;
+			}
+		}
+	}
+	bool valid_cloud = state.has_front_depth;
+	float fallback_depth_km = span.valid ? span.end_km : max(shell.trace_max_km, 1e6);
+	float mean_depth_km = feng_cloud_weighted_mean_depth_km(state, fallback_depth_km);
+	if (valid_cloud) {
+		mean_depth_km = clamp(mean_depth_km, state.front_depth_km, max(span.end_km, state.front_depth_km));
+		vec3 cloud_world_m = feng_cloud_world_at_distance_km(ray, mean_depth_km) * FENG_CLOUD_KM_TO_M;
+		vec3 camera_to_cloud_m = cloud_world_m - cloud_frame.camera_world_position_m.xyz;
+		vec3 radiance = state.radiance;
+		vec3 transmittance = state.transmittance;
+		bool alpha_holdout_supported = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_ALPHA_HOLDOUT_SUPPORTED) != 0u;
+		bool use_holdout = !capture && alpha_holdout_supported && shell.holdout > 0.5;
+		if (use_holdout) {
+			radiance = vec3(0.0);
+		}
+		float holdout_mask;
+		feng_cloud_apply_atmosphere_and_height_fog(camera_to_cloud_m, shell, capture, radiance, transmittance, use_holdout, holdout_mask);
+		float exposure_scale = max(feng_cloud_finite_or_zero(cloud_frame.radiance_scales_current_previous_norm_P.x), 0.0);
+		vec3 exposed_radiance = feng_cloud_storage_safe_half3(radiance * exposure_scale);
+		imageStore(cloud_out_radiance, ivec3(trace_pixel, view_layer), vec4(exposed_radiance, 1.0));
+		imageStore(cloud_out_transmittance, ivec3(trace_pixel, view_layer), vec4(clamp(transmittance, vec3(0.0), vec3(1.0)), holdout_mask));
+		imageStore(cloud_out_depth, ivec3(trace_pixel, view_layer), vec4(
+			state.front_depth_km * FENG_CLOUD_KM_TO_M, mean_depth_km * FENG_CLOUD_KM_TO_M,
+			opaque_bounds_m.x, opaque_bounds_m.y));
+#if FENG_CLOUD_VRT_SECONDARY
+		if (closest_has_front_depth) {
+			float closest_mean_depth_km = closest_weighted_depth_weight > 0.0
+				? closest_weighted_depth_sum_km / closest_weighted_depth_weight
+				: fallback_depth_km;
+			closest_mean_depth_km = clamp(closest_mean_depth_km, state.front_depth_km, max(opaque_near_km, state.front_depth_km));
+			vec3 closest_world_m = feng_cloud_world_at_distance_km(ray, closest_mean_depth_km) * FENG_CLOUD_KM_TO_M;
+			vec3 closest_to_cloud_m = closest_world_m - cloud_frame.camera_world_position_m.xyz;
+			float closest_holdout_mask;
+			feng_cloud_apply_atmosphere_and_height_fog(closest_to_cloud_m, shell, capture,
+				closest_radiance, closest_transmittance, use_holdout, closest_holdout_mask);
+			imageStore(cloud_out_secondary_radiance, ivec3(trace_pixel, view_layer),
+				vec4(feng_cloud_storage_safe_half3(closest_radiance * exposure_scale), 1.0));
+			imageStore(cloud_out_secondary_transmittance, ivec3(trace_pixel, view_layer),
+				vec4(clamp(closest_transmittance, vec3(0.0), vec3(1.0)), closest_holdout_mask));
+		} else {
+			imageStore(cloud_out_secondary_radiance, ivec3(trace_pixel, view_layer), vec4(0.0));
+			imageStore(cloud_out_secondary_transmittance, ivec3(trace_pixel, view_layer), vec4(1.0, 1.0, 1.0, 0.0));
+		}
+#endif
+	} else {
+		imageStore(cloud_out_radiance, ivec3(trace_pixel, view_layer), vec4(0.0));
+		imageStore(cloud_out_transmittance, ivec3(trace_pixel, view_layer), vec4(1.0, 1.0, 1.0, 0.0));
+		imageStore(cloud_out_depth, ivec3(trace_pixel, view_layer),
+			vec4(FENG_CLOUD_VRT_FAR_DEPTH_M, FENG_CLOUD_VRT_FAR_DEPTH_M, opaque_bounds_m));
+#if FENG_CLOUD_VRT_SECONDARY
+		imageStore(cloud_out_secondary_radiance, ivec3(trace_pixel, view_layer), vec4(0.0));
+		imageStore(cloud_out_secondary_transmittance, ivec3(trace_pixel, view_layer), vec4(1.0, 1.0, 1.0, 0.0));
+#endif
+	}
+}

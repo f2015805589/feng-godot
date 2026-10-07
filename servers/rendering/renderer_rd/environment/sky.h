@@ -34,6 +34,7 @@
 #include "servers/rendering/renderer_rd/pipeline_cache_rd.h"
 #include "servers/rendering/renderer_rd/shaders/environment/sky.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -43,8 +44,26 @@
 class RendererSceneRenderRD;
 class RenderDataRD;
 class RenderSceneBuffersRD;
+class FRPPassContext;
 
 namespace RendererRD {
+
+class SkyCloudVisibilityBuffers : public RenderBufferCustomDataRD {
+	GDCLASS(SkyCloudVisibilityBuffers, RenderBufferCustomDataRD)
+
+public:
+	RID uniform_buffer;
+
+	virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
+	virtual void free_data() override;
+};
+
+struct SkyCloudVisibilityUBO {
+	float projection[35][4];
+	float sun_mapping[4]; // atmosphere sun 0/1 -> cloud slot 0/1, then map-valid flags.
+	float flags[4]; // raw AO validity, reserved.
+};
+static_assert(sizeof(SkyCloudVisibilityUBO) == 592, "Sky cloud visibility UBO must match set 3 binding 1.");
 
 class SkyRD {
 public:
@@ -138,6 +157,7 @@ private:
 	};
 
 	void _render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_modifier, float p_border_size = 0.0, float p_fog_source_pre_exposure = 1.0f);
+	RID _get_cloud_fog_uniform_set(RID p_fog_texture, RID p_visibility_buffer, RID p_shadow0, RID p_shadow1, RID p_raw_ao);
 
 public:
 	struct SkySceneState {
@@ -180,6 +200,8 @@ public:
 		RID uniform_buffer;
 		RID fog_uniform_set;
 		RID default_fog_uniform_set;
+		RID volumetric_fog_texture;
+		RID cloud_visibility_uniform_buffer;
 
 		RID fog_shader;
 		RID fog_material;
@@ -320,6 +342,7 @@ public:
 	~SkyRD();
 
 	void setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_size);
+	void prepare_cloud_visibility(Ref<RenderSceneBuffersRD> p_render_buffers, const Ref<FRPPassContext> &p_context);
 	void update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, const Vector3 &p_global_pos, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0);
 	void update_res_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0);
 	void draw_sky(RD::DrawListID p_draw_list, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, RID p_fb, double p_time, float p_luminance_multiplier = 1.0, float p_brightness_multiplier = 1.0, float p_fog_source_pre_exposure = 1.0f);

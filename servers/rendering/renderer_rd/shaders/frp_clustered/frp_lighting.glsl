@@ -46,6 +46,7 @@ void main() {
 /* clang-format off */
 #include "../half_inc.glsl"
 #include "scene_frp_clustered_inc.glsl"
+#include "frp_cloud_inc.glsl"
 
 #ifndef MODE_RENDER_DEPTH
 #define ATMO_PARAMS implementation_data.atmosphere_parameters
@@ -68,7 +69,6 @@ vec3 frp_atmospheric_light_factor(uint index, vec3 camera_to_receiver_m) {
 	return vec3(1.0);
 }
 #endif
-
 
 // Keep clustered light lookup/shadows from the shared renderer include, but
 // route every resolved light through FRP's own ShadingModelID/BxDF dispatcher.
@@ -163,6 +163,13 @@ void main() {
 	vec4 view_pos = inv_projection_matrix * ndc;
 	view_pos /= view_pos.w;
 	vec3 vertex = view_pos.xyz;
+	bool cloud_sun0_active = implementation_data.cloud_sun_light_indices_flags.z > 0.5 && implementation_data.cloud_projection_parameters[27].x > 0.5;
+	bool cloud_sun1_active = implementation_data.cloud_sun_light_indices_flags.w > 0.5 && implementation_data.cloud_projection_parameters[27].y > 0.5;
+	bool cloud_sky_ao_active = (implementation_data.sky_lighting_enabled != 0u || implementation_data.sky_lighting_pad0 != 0u) && implementation_data.cloud_projection_parameters[27].z > 0.5;
+	vec3 cloud_world_position = vec3(0.0);
+	if (cloud_sun0_active || cloud_sun1_active || cloud_sky_ao_active) {
+		cloud_world_position = frp_cloud_world_position(vertex, scene_data);
+	}
 
 	vec3 view = projection_matrix[3][3] == 1.0 ? vec3(0.0, 0.0, 1.0) : -normalize(vertex);
 
@@ -287,6 +294,11 @@ void main() {
 				cubemap_ambient *= frp_ibl_exposure_normalization;
 				ambient_light = mix(ambient_light, cubemap_ambient * frp_ibl_energy, scene_data.ambient_color_sky_mix);
 			}
+		}
+		if (cloud_sky_ao_active) {
+			// The cloud AO filter has already applied its configured strength.
+			// Attenuate only the FengSkyLight provider term before local probes blend in.
+			ambient_light *= frp_cloud_provider_ao_visibility(cloud_world_position);
 		}
 
 		// Reflection probes.
@@ -558,6 +570,7 @@ void main() {
 			}
 
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);
+			shadow *= frp_cloud_directional_shadow_visibility(cloud_world_position, i);
 
 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
 

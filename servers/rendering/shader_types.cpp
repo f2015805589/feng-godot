@@ -260,6 +260,7 @@ ShaderTypes::ShaderTypes() {
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("alpha_to_coverage_and_one") });
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("debug_shadow_splits") });
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("fog_disabled") });
+		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("cloud_fogging") });
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("specular_occlusion_disabled") });
 		shader_modes[RSE::SHADER_SPATIAL].stencil_modes.push_back({ PNAME("read") });
 		shader_modes[RSE::SHADER_SPATIAL].stencil_modes.push_back({ PNAME("write") });
@@ -501,6 +502,18 @@ ShaderTypes::ShaderTypes() {
 	shader_modes[RSE::SHADER_SKY].functions["sky"].built_ins["QUARTER_RES_COLOR"] = constt(ShaderLanguage::TYPE_VEC4);
 	shader_modes[RSE::SHADER_SKY].functions["sky"].built_ins["FOG"] = ShaderLanguage::TYPE_VEC4;
 	shader_modes[RSE::SHADER_SKY].functions["sky"].main_function = true;
+	{
+		ShaderLanguage::StageFunctionInfo cloud_shadow_visibility;
+		cloud_shadow_visibility.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("world_position_m", ShaderLanguage::TYPE_VEC3));
+		cloud_shadow_visibility.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("atmo_sun_slot", ShaderLanguage::TYPE_INT));
+		cloud_shadow_visibility.return_type = ShaderLanguage::TYPE_FLOAT;
+		shader_modes[RSE::SHADER_SKY].functions["sky"].stage_functions["feng_cloud_shadow_visibility"] = cloud_shadow_visibility;
+
+		ShaderLanguage::StageFunctionInfo cloud_multiple_visibility;
+		cloud_multiple_visibility.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("world_position_m", ShaderLanguage::TYPE_VEC3));
+		cloud_multiple_visibility.return_type = ShaderLanguage::TYPE_FLOAT;
+		shader_modes[RSE::SHADER_SKY].functions["sky"].stage_functions["feng_cloud_multiple_visibility"] = cloud_multiple_visibility;
+	}
 
 	// sky render modes
 	{

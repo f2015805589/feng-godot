@@ -1,0 +1,80 @@
+#ifndef FENG_CLOUD_HEIGHT_FOG_GLSLINC
+#define FENG_CLOUD_HEIGHT_FOG_GLSLINC
+
+const float FENG_CLOUD_FOG_FLT_EPSILON2 = 0.01;
+
+float feng_cloud_fog_line_integral_shared(float height_falloff, float ray_delta_y, float origin_terms) {
+	float falloff = max(-127.0, height_falloff * ray_delta_y);
+	float line_integral = (1.0 - exp2(-falloff)) / falloff;
+	float line_integral_taylor = log(2.0) - 0.5 * log(2.0) * log(2.0) * falloff;
+	return origin_terms * (abs(falloff) > FENG_CLOUD_FOG_FLT_EPSILON2 ? line_integral : line_integral_taylor);
+}
+
+vec4 feng_cloud_height_fog(vec3 camera_to_receiver_m) {
+	vec4 camera = cloud_height_fog_block.lane[0];
+	vec4 fog0 = cloud_height_fog_block.lane[1];
+	vec4 fog1 = cloud_height_fog_block.lane[2];
+	vec4 fog2 = cloud_height_fog_block.lane[3];
+	vec4 fog_color = cloud_height_fog_block.lane[4];
+	vec4 light_direction = cloud_height_fog_block.lane[5];
+	vec4 directional_color = cloud_height_fog_block.lane[6];
+	float min_fog_opacity = clamp(fog_color.a, 0.0, 1.0);
+	float observer_y = fog0.z;
+	vec3 ray = feng_cloud_finite_or_zero3(camera_to_receiver_m);
+	// Match the existing FRP packet's UE perspective observer-height rebasing.
+	ray.y += camera.y - observer_y;
+	float ray_length_sqr = dot(ray, ray);
+	float ray_length_inv = inversesqrt(max(ray_length_sqr, 1e-8));
+	float ray_length = ray_length_sqr * ray_length_inv;
+	if (ray_length <= fog0.w) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 ray_direction = ray * ray_length_inv;
+	float ray_origin_terms0 = fog0.x;
+	float ray_origin_terms1 = fog1.x;
+	float ray_length_after_start = ray_length;
+	float ray_direction_y = ray.y;
+	float start_distance = max(fog0.w, 0.0);
+	if (start_distance > 0.0) {
+		float exclude_time = start_distance * ray_length_inv;
+		float camera_exclusion_y = exclude_time * ray.y;
+		float exclusion_world_y = observer_y + camera_exclusion_y;
+		float remaining_y = ray.y - camera_exclusion_y;
+		ray_length_after_start = (1.0 - exclude_time) * ray_length;
+		ray_direction_y = remaining_y;
+		float exponent0 = max(-127.0, fog0.y * (exclusion_world_y - fog2.y));
+		ray_origin_terms0 = fog2.x * exp2(-exponent0);
+		float exponent1 = max(-127.0, fog1.y * (exclusion_world_y - fog1.w));
+		ray_origin_terms1 = fog1.z * exp2(-exponent1);
+	}
+	// The packet's first density terms already contain density at the observer.
+	// StartDistance recomputes them from authored density/height at the exclusion point.
+	if (start_distance <= 0.0) {
+		ray_origin_terms0 = fog0.x;
+		ray_origin_terms1 = fog1.x;
+	} else {
+		ray_origin_terms0 = ray_origin_terms0;
+		ray_origin_terms1 = ray_origin_terms1;
+	}
+	float line_shared = feng_cloud_fog_line_integral_shared(fog0.y, ray_direction_y, ray_origin_terms0)
+		+ feng_cloud_fog_line_integral_shared(fog1.y, ray_direction_y, ray_origin_terms1);
+	float line_integral = max(line_shared, 0.0) * ray_length_after_start;
+	vec3 directional_inscattering = vec3(0.0);
+	if (light_direction.w >= 0.0) {
+		float phase = pow(clamp(dot(ray_direction, feng_cloud_safe_normalize3(light_direction.xyz, vec3(0.0, 1.0, 0.0))), 0.0, 1.0), max(directional_color.w, 0.0)) * FENG_CLOUD_INV_FOUR_PI;
+		float directional_line = line_shared * max(ray_length_after_start - light_direction.w, 0.0);
+		float directional_transmission = clamp(exp2(-directional_line), 0.0, 1.0);
+		directional_inscattering = directional_color.rgb * phase * (1.0 - directional_transmission);
+	}
+	float fog_transmission = max(clamp(exp2(-line_integral), 0.0, 1.0), min_fog_opacity);
+	float cutoff_distance = max(fog2.w, 0.0);
+	if (cutoff_distance > 0.0 && ray_length > cutoff_distance) {
+		fog_transmission = 1.0;
+		directional_inscattering = vec3(0.0);
+	}
+	vec3 fog_radiance = fog_color.rgb * (1.0 - fog_transmission) + directional_inscattering;
+	fog_radiance = feng_cloud_storage_safe_half3(fog_radiance);
+	return vec4(fog_radiance, fog_transmission);
+}
+
+#endif // FENG_CLOUD_HEIGHT_FOG_GLSLINC

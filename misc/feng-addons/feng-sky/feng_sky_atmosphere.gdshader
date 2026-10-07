@@ -223,7 +223,7 @@ vec3 transmittance_to_sun(vec3 point, vec3 direction) {
 }
 
 
-vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light_direction, vec3 light_color, float light_irradiance, bool include_multiple_scattering, out vec3 view_transmittance, out float ground_distance, out float atmosphere_entry_distance) {
+vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light_direction, vec3 light_color, float light_irradiance, bool include_multiple_scattering, int atmo_sun_slot, out vec3 view_transmittance, out float ground_distance, out float atmosphere_entry_distance) {
 	float atmosphere_radius = planet_radius_km + max(atmosphere_height_km, 0.001);
 	vec3 ray_origin = origin;
 	atmosphere_entry_distance = 0.0;
@@ -297,9 +297,12 @@ vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light
 		float mie_density = exp(-altitude / mie_scale_height_km);
 		vec3 rayleigh = rayleigh_scattering_per_km * rayleigh_density;
 		vec3 mie_scattering = mie_scattering_coefficients * mie_density;
-		vec3 source = (rayleigh * rayleigh_phase + mie_scattering * mie_phase) * sun_trans;
+		vec3 sample_world_m = planet_center_m + sample_point * 1000.0;
+		float cloud_sun_visibility = feng_cloud_shadow_visibility(sample_world_m, atmo_sun_slot);
+		vec3 source = (rayleigh * rayleigh_phase + mie_scattering * mie_phase) * sun_trans * cloud_sun_visibility;
 		if (include_multiple_scattering) {
-			source += (rayleigh + mie_scattering) * multiple_scattered_radiance(sample_point, sun_dir);
+			float cloud_multiple_visibility = atmo_sun_slot == 0 ? feng_cloud_multiple_visibility(sample_world_m) : 1.0;
+			source += (rayleigh + mie_scattering) * multiple_scattered_radiance(sample_point, sun_dir) * cloud_multiple_visibility;
 		}
 		vec3 extinction = rayleigh + mie_extinction_coefficients * mie_density + absorption_extinction_per_km * absorption_density(altitude);
 		vec3 segment_transmittance = exp(-extinction * segment_length);
@@ -313,7 +316,7 @@ vec3 integrate_atmosphere_for_light(vec3 origin, vec3 view_direction, vec3 light
 
 // Compatibility entry point for probes and older custom sky materials.
 vec3 integrate_atmosphere(vec3 origin, vec3 view_direction, out vec3 view_transmittance, out float ground_distance, out float atmosphere_entry_distance) {
-	return integrate_atmosphere_for_light(origin, view_direction, sun_direction, sun_color_linear, sun_irradiance, true,
+	return integrate_atmosphere_for_light(origin, view_direction, sun_direction, sun_color_linear, sun_irradiance, true, 0,
 		view_transmittance, ground_distance, atmosphere_entry_distance);
 }
 
@@ -363,7 +366,7 @@ void sky() {
 		float secondary_ground;
 		float secondary_entry;
 		radiance += integrate_atmosphere_for_light(origin, view_direction, secondary_sun_direction,
-			secondary_sun_color_linear, secondary_sun_irradiance, false, secondary_transmittance, secondary_ground, secondary_entry);
+			secondary_sun_color_linear, secondary_sun_irradiance, false, 1, secondary_transmittance, secondary_ground, secondary_entry);
 	}
 
 	float sun_radius = safe_sun_radius(sun_angular_radius_deg);

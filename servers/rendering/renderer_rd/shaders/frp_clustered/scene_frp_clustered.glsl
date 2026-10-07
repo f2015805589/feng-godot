@@ -8,6 +8,7 @@
 #include "../half_inc.glsl"
 
 #include "scene_frp_clustered_inc.glsl"
+#include "frp_cloud_inc.glsl"
 
 // Per-vertex lighting uses bounded direct optical integration, avoiding
 // vertex-stage LUT bindings while retaining exact selected-light identity.
@@ -649,6 +650,10 @@ void vertex_shader(vec3 vertex_input,
 		// We process the first directional light separately as it may have shadows.
 		vec3 directional_diffuse = vec3(0.0);
 		vec3 directional_specular = vec3(0.0);
+		vec3 cloud_world_position = vec3(0.0);
+		if (implementation_data.cloud_sun_light_indices_flags.z > 0.5 || implementation_data.cloud_sun_light_indices_flags.w > 0.5) {
+			cloud_world_position = frp_cloud_world_position(vertex, scene_data);
+		}
 
 		for (uint i = 0; i < scene_data.directional_light_count; i++) {
 			if (!bool(directional_lights.data[i].mask & instances.data[instance_index].layer_mask)) {
@@ -665,11 +670,20 @@ void vertex_shader(vec3 vertex_input,
 						directional_diffuse,
 						directional_specular);
 			} else {
+				vec3 light_diffuse = vec3(0.0);
+				vec3 light_specular = vec3(0.0);
 				light_compute_vertex(normal, directional_lights.data[i].direction, view,
 						directional_lights.data[i].color * directional_lights.data[i].energy * frp_atmospheric_light_factor(i, mat3(inv_view_matrix) * vertex),
 						true, roughness,
-						diffuse_light_interp.rgb,
-						specular_light_interp.rgb);
+						light_diffuse,
+						light_specular);
+#ifndef SHADOWS_DISABLED
+				float cloud_shadow = frp_cloud_directional_shadow_visibility(cloud_world_position, i);
+				light_diffuse *= cloud_shadow;
+				light_specular *= cloud_shadow;
+#endif
+				diffuse_light_interp.rgb += light_diffuse;
+				specular_light_interp.rgb += light_specular;
 			}
 		}
 
@@ -901,6 +915,43 @@ void main() {
 #include "../half_inc.glsl"
 
 #include "scene_frp_clustered_inc.glsl"
+#include "frp_cloud_inc.glsl"
+
+layout(set = 1, binding = 45) uniform texture2DArray frp_cloud_radiance;
+layout(set = 1, binding = 46) uniform texture2DArray frp_cloud_transmittance;
+layout(set = 1, binding = 47) uniform texture2DArray frp_cloud_depth;
+
+#ifdef FRP_CLOUD_FOGGING
+bool frp_sample_cloud_fog(vec2 p_screen_uv, float p_view_index, vec3 p_view_position, vec3 p_eye_offset, out vec3 r_soft_transmittance, out vec3 r_radiance_before_pre_exposure) {
+	if (implementation_data.cloud_transparency_parameters.x <= 0.5) {
+		return false;
+	}
+	vec3 cloud_layer = vec3(p_screen_uv, p_view_index);
+	vec4 cloud_radiance = textureLod(sampler2DArray(frp_cloud_radiance, SAMPLER_LINEAR_CLAMP), cloud_layer, 0.0);
+	if (!(cloud_radiance.a > 0.0) || any(isnan(cloud_radiance)) || any(isinf(cloud_radiance))) {
+		return false;
+	}
+	// UE's CloudFrontDepth is transmittance-weighted mean depth; Feng stores it in y and keeps first-hit depth in x.
+	vec4 front_depth_taps = textureGather(sampler2DArray(frp_cloud_depth, SAMPLER_NEAREST_CLAMP), cloud_layer, 1);
+	float cloud_front_depth_m = min(min(front_depth_taps.x, front_depth_taps.y), min(front_depth_taps.z, front_depth_taps.w));
+	if (isnan(cloud_front_depth_m) || isinf(cloud_front_depth_m)) {
+		return false;
+	}
+	float cloud_front_depth_km = max(cloud_front_depth_m, 0.0) * 0.001;
+	float fragment_depth_km = length(p_view_position - p_eye_offset) * 0.001;
+	float soft_distance_km = max(implementation_data.cloud_transparency_parameters.y, 0.0001);
+	float cloud_coverage = clamp((fragment_depth_km - cloud_front_depth_km) / soft_distance_km, 0.0, 1.0);
+	vec3 cloud_transmittance = textureLod(sampler2DArray(frp_cloud_transmittance, SAMPLER_LINEAR_CLAMP), cloud_layer, 0.0).rgb;
+	if (any(isnan(cloud_transmittance)) || any(isinf(cloud_transmittance))) {
+		return false;
+	}
+	r_soft_transmittance = mix(vec3(1.0), clamp(cloud_transmittance, vec3(0.0), vec3(1.0)), cloud_coverage);
+	// Cloud radiance carries scene-exposure-normalization * P. Material lighting
+	// is still un-pre-exposed here, so remove P once and let the final stage add it.
+	r_radiance_before_pre_exposure = cloud_radiance.rgb * cloud_coverage / max(implementation_data.pre_exposure, 1e-6);
+	return true;
+}
+#endif
 
 #ifndef MODE_RENDER_DEPTH
 #define ATMO_PARAMS implementation_data.atmosphere_parameters
@@ -1443,6 +1494,10 @@ void fragment_shader(in SceneData scene_data) {
 			scene_data.inv_view_matrix[1],
 			scene_data.inv_view_matrix[2],
 			vec4(0.0, 0.0, 0.0, 1.0)));
+	vec3 cloud_world_position = vec3(0.0);
+	if (implementation_data.cloud_sun_light_indices_flags.z > 0.5 || implementation_data.cloud_sun_light_indices_flags.w > 0.5 || implementation_data.cloud_projection_parameters[27].z > 0.5) {
+		cloud_world_position = frp_cloud_world_position(vertex, scene_data);
+	}
 	mat4 read_model_matrix = transpose(mat4(instances.data[instance_index].transform[0],
 			instances.data[instance_index].transform[1],
 			instances.data[instance_index].transform[2],
@@ -1894,6 +1949,11 @@ void fragment_shader(in SceneData scene_data) {
 				cubemap_ambient *= frp_ibl_exposure_normalization;
 				ambient_light = mix(ambient_light, cubemap_ambient * frp_ibl_energy, scene_data.ambient_color_sky_mix);
 			}
+		}
+		if ((use_frp_sky_lighting || implementation_data.sky_lighting_pad0 != 0u) && implementation_data.cloud_projection_parameters[27].z > 0.5) {
+			// Attenuate only the FengSkyLight diffuse provider before local probes
+			// and custom irradiance are added. IBL specular remains unchanged.
+			ambient_light *= frp_cloud_provider_ao_visibility(cloud_world_position);
 		}
 	}
 #endif // USE_LIGHTMAP
@@ -2486,6 +2546,13 @@ void fragment_shader(in SceneData scene_data) {
 #undef BIAS_FUNC
 				} // shadows
 
+				float cloud_visibility = frp_cloud_directional_shadow_visibility(cloud_world_position, i);
+				shadow *= cloud_visibility;
+#ifdef USE_VERTEX_LIGHTING
+				diffuse_light *= mix(1.0, cloud_visibility, diffuse_light_interp.a);
+				direct_specular_light *= mix(1.0, cloud_visibility, specular_light_interp.a);
+#endif
+
 				if (i < 4) {
 					shadow0 |= uint(clamp(shadow * 255.0, 0.0, 255.0)) << (i * 8);
 				} else {
@@ -2495,6 +2562,8 @@ void fragment_shader(in SceneData scene_data) {
 
 #ifdef USE_LIGHTMAP
 		} else { // shadowmask_mode == LIGHTMAP_SHADOWMASK_MODE_ONLY
+			float cloud_visibility = frp_cloud_directional_shadow_visibility(cloud_world_position, 0u);
+			shadowmask *= cloud_visibility;
 
 #ifdef USE_VERTEX_LIGHTING
 			diffuse_light *= mix(1.0, shadowmask, diffuse_light_interp.a);
@@ -3023,7 +3092,8 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef USE_MULTIVIEW
 		eye_offset = scene_data.eye_offset[ViewIndex].xyz;
 #endif
-		frp_atmo_aerial(mat3(inv_view_matrix) * (vertex - eye_offset), mat3(inv_view_matrix) * eye_offset, atmosphere_radiance, atmosphere_transmission);
+		frp_atmo_aerial(mat3(inv_view_matrix) * (vertex - eye_offset), mat3(inv_view_matrix) * eye_offset,
+				frp_cloud_world_position(vec3(0.0), scene_data), atmosphere_radiance, atmosphere_transmission);
 	}
 	vec4 height_fog = vec4(0.0, 0.0, 0.0, 1.0);
 	if (implementation_data.height_fog_enabled != 0u) {
@@ -3060,6 +3130,24 @@ void fragment_shader(in SceneData scene_data) {
 	specular_buffer.rgb *= atmosphere_transmission;
 	diffuse_buffer.rgb = diffuse_buffer.rgb * height_fog.a + height_fog.rgb;
 	specular_buffer.rgb *= height_fog.a;
+#if defined(FRP_CLOUD_FOGGING) && !defined(MODE_RENDER_DEPTH)
+	vec3 cloud_transmittance;
+	vec3 cloud_radiance_before_pre_exposure;
+	if (frp_sample_cloud_fog(screen_uv, float(ViewIndex), vertex, eye_offset, cloud_transmittance, cloud_radiance_before_pre_exposure)) {
+#if defined(FRP_CLOUD_BLEND_ADD) || defined(FRP_CLOUD_BLEND_SUB)
+		diffuse_buffer.rgb *= cloud_transmittance;
+		specular_buffer.rgb *= cloud_transmittance;
+#elif defined(FRP_CLOUD_BLEND_MUL)
+		float mean_transmittance = dot(cloud_transmittance, vec3(1.0 / 3.0));
+		float cloud_mul_visibility = mean_transmittance * mean_transmittance;
+		diffuse_buffer.rgb = mix(vec3(1.0), diffuse_buffer.rgb, cloud_mul_visibility);
+		specular_buffer.rgb = mix(vec3(1.0), specular_buffer.rgb, cloud_mul_visibility);
+#else
+		diffuse_buffer.rgb = cloud_transmittance * diffuse_buffer.rgb + cloud_radiance_before_pre_exposure;
+		specular_buffer.rgb *= cloud_transmittance;
+#endif
+	}
+#endif
 	diffuse_buffer.rgb *= implementation_data.pre_exposure;
 	specular_buffer.rgb *= implementation_data.pre_exposure;
 
@@ -3079,6 +3167,20 @@ void fragment_shader(in SceneData scene_data) {
 #endif //!FOG_DISABLED
 	frag_color.rgb = frag_color.rgb * atmosphere_transmission + atmosphere_radiance;
 	frag_color.rgb = frag_color.rgb * height_fog.a + height_fog.rgb;
+#if defined(FRP_CLOUD_FOGGING) && !defined(MODE_RENDER_DEPTH)
+	vec3 cloud_transmittance;
+	vec3 cloud_radiance_before_pre_exposure;
+	if (frp_sample_cloud_fog(screen_uv, float(ViewIndex), vertex, eye_offset, cloud_transmittance, cloud_radiance_before_pre_exposure)) {
+#if defined(FRP_CLOUD_BLEND_ADD) || defined(FRP_CLOUD_BLEND_SUB)
+		frag_color.rgb *= cloud_transmittance;
+#elif defined(FRP_CLOUD_BLEND_MUL)
+		float mean_transmittance = dot(cloud_transmittance, vec3(1.0 / 3.0));
+		frag_color.rgb = mix(vec3(1.0), frag_color.rgb, mean_transmittance * mean_transmittance);
+#else
+		frag_color.rgb = cloud_transmittance * frag_color.rgb + cloud_radiance_before_pre_exposure;
+#endif
+	}
+#endif
 	frag_color.rgb *= implementation_data.pre_exposure;
 
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)

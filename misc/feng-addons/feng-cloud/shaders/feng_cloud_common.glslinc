@@ -1,0 +1,9 @@
+#ifndef FENG_CLOUD_COMMON_GLSLINC
+#define FENG_CLOUD_COMMON_GLSLINC
+
+#include "feng_cloud_types.glslinc"
+#include "feng_cloud_material.glslinc"
+#include "feng_cloud_shell.glslinc"
+#include "feng_cloud_transport.glslinc"
+
+#endif // FENG_CLOUD_COMMON_GLSLINC

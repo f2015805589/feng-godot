@@ -1,0 +1,247 @@
+#[compute]
+#version 450
+
+#include "cloud_gpu_layout.glslinc"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+FENG_CLOUD_DECLARE_FRAME;
+FENG_CLOUD_DECLARE_CURRENT_RESULTS;
+FENG_CLOUD_DECLARE_SCENE_DEPTH;
+FENG_CLOUD_DECLARE_SCENE_OUTPUT;
+#if FENG_CLOUD_VRT_SECONDARY
+FENG_CLOUD_DECLARE_SECONDARY_TRACE_INPUTS;
+#endif
+
+const float FENG_CLOUD_VRT_FAR_DEPTH_M = 65504000.0;
+
+struct FengCloudCompositeRay {
+	vec3 origin_world_m;
+	vec3 direction_world;
+};
+
+FengCloudCompositeRay feng_cloud_composite_ray(vec2 uv) {
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 near_h = cloud_frame.inverse_view_projection * vec4(ndc, 1.0, 1.0);
+	vec4 far_h = cloud_frame.inverse_view_projection * vec4(ndc, 0.0, 1.0);
+	vec3 near_world = abs(near_h.w) > 1e-7 ? near_h.xyz / near_h.w : near_h.xyz;
+	vec3 far_world = abs(far_h.w) > 1e-7 ? far_h.xyz / far_h.w : far_h.xyz;
+	bool orthographic = (cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_ORTHOGRAPHIC) != 0u;
+	FengCloudCompositeRay ray;
+	ray.origin_world_m = orthographic ? near_world : cloud_frame.camera_world_position_m.xyz;
+	ray.direction_world = feng_cloud_safe_normalize3(
+		abs(far_h.w) > 1e-7 ? far_world - ray.origin_world_m : far_h.xyz,
+		vec3(0.0, 0.0, -1.0));
+	return ray;
+}
+
+float feng_cloud_composite_scene_distance_m(ivec2 pixel, ivec2 output_size, out bool has_geometry) {
+	ivec2 depth_size = textureSize(cloud_scene_depth, 0);
+	ivec2 depth_pixel = clamp(
+		ivec2((vec2(pixel) + vec2(0.5)) * vec2(depth_size) / vec2(max(output_size, ivec2(1)))),
+		ivec2(0), depth_size - ivec2(1));
+	float device_depth = texelFetch(cloud_scene_depth, depth_pixel, 0).r;
+	has_geometry = device_depth > 0.0 && !isnan(device_depth) && !isinf(device_depth);
+	if (!has_geometry) {
+		return FENG_CLOUD_VRT_FAR_DEPTH_M;
+	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(max(output_size, ivec2(1)));
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 world_h = cloud_frame.inverse_view_projection * vec4(ndc, device_depth, 1.0);
+	if (abs(world_h.w) < 1e-7 || isnan(world_h.w) || isinf(world_h.w)) {
+		has_geometry = false;
+		return FENG_CLOUD_VRT_FAR_DEPTH_M;
+	}
+	vec3 world_position_m = world_h.xyz / world_h.w;
+	FengCloudCompositeRay ray = feng_cloud_composite_ray(uv);
+	return clamp(dot(world_position_m - ray.origin_world_m, ray.direction_world), 0.0, FENG_CLOUD_VRT_FAR_DEPTH_M);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 output_size = imageSize(cloud_out_scene);
+	int view_layer = int(cloud_frame.view_index_frame_index_flags_vrt_mode.x);
+	if (any(greaterThanEqual(pixel, output_size))
+			|| view_layer < 0 || view_layer >= textureSize(cloud_current_radiance, 0).z) {
+		return;
+	}
+	ivec2 cloud_size = textureSize(cloud_current_radiance, 0).xy;
+	ivec2 full_size = ivec2(max(cloud_frame.viewport_size_xy_inv_xy.xy, vec2(1.0)));
+	uint vrt_mode = min(cloud_frame.view_index_frame_index_flags_vrt_mode.w, 3u);
+	vec2 full_pixel = (vec2(pixel) + vec2(0.5)) * vec2(full_size) / vec2(max(output_size, ivec2(1)));
+	float upsample_scale = (vrt_mode == 0u || vrt_mode == 1u) ? 2.0 : 1.0;
+	vec2 source_position = (full_pixel - vec2(0.5 * upsample_scale)) / upsample_scale;
+	ivec2 source_base = ivec2(floor(source_position));
+	vec2 fraction = fract(source_position);
+	float spatial_weights[4] = float[4](
+		(1.0 - fraction.x) * (1.0 - fraction.y),
+		fraction.x * (1.0 - fraction.y),
+		(1.0 - fraction.x) * fraction.y,
+		fraction.x * fraction.y);
+	float tap_weights[4];
+	float tap_scene_depth_m[4];
+	ivec2 offsets[4] = ivec2[4](ivec2(0), ivec2(1, 0), ivec2(0, 1), ivec2(1));
+	bool has_geometry = false;
+	// Mode 2 disables opaque intersection while tracing, but its composition
+	// still performs the simple on/off scene-depth rejection used by UE.
+	float scene_distance_m = feng_cloud_composite_scene_distance_m(pixel, output_size, has_geometry);
+	float maximum_tap_scene_depth_m = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		tap_weights[i] = spatial_weights[i];
+		ivec2 sample_pixel = clamp(source_base + offsets[i], ivec2(0), cloud_size - ivec2(1));
+		vec4 sample_depth = texelFetch(cloud_current_depth, ivec3(sample_pixel, view_layer), 0);
+		// Non-MMD upsampling maps UE's scene-distance channel to Feng z/w.
+		// Mode 1 stores one opaque distance in both lanes; y remains cloud mean.
+		tap_scene_depth_m[i] = clamp(feng_cloud_finite_or_zero(sample_depth.z),
+			0.0, FENG_CLOUD_VRT_FAR_DEPTH_M);
+		maximum_tap_scene_depth_m = max(maximum_tap_scene_depth_m, tap_scene_depth_m[i]);
+	}
+	if (vrt_mode == 1u) {
+		// UE's non-MMD VRT mode 1 uses depth-directed weights only when the
+		// four trace scene depths differ by more than 10% of the pixel distance.
+		float pixel_distance_m = min(scene_distance_m, maximum_tap_scene_depth_m);
+		float maximum_depth_delta_m = 0.0;
+		for (int i = 0; i < 4; ++i) {
+			maximum_depth_delta_m = max(maximum_depth_delta_m,
+				abs(pixel_distance_m - tap_scene_depth_m[i]));
+		}
+		if (maximum_depth_delta_m > pixel_distance_m * 0.1) {
+			for (int i = 0; i < 4; ++i) {
+				float depth_delta_m = abs(pixel_distance_m - tap_scene_depth_m[i]);
+				// UE computes 1/(delta_km*1000+1), equal to this meter form.
+				tap_weights[i] = 1.0 / (depth_delta_m + 1.0);
+			}
+		}
+	}
+	float nearest_front_m = FENG_CLOUD_VRT_FAR_DEPTH_M;
+	ivec2 nearest_pixel = ivec2(0);
+	bool has_visible_cloud = false;
+	float min_scene_bound_m = FENG_CLOUD_VRT_FAR_DEPTH_M;
+	float max_scene_bound_m = 0.0;
+	float best_bound_delta_m = FENG_CLOUD_VRT_FAR_DEPTH_M;
+	ivec2 best_bound_pixel = ivec2(0);
+	bool best_bound_is_near = false;
+	bool all_cloud_in_front_of_near = true;
+	bool all_bounds_far_from_camera = true;
+	for (int i = 0; i < 4; ++i) {
+		float weight = tap_weights[i];
+		if (weight <= 0.0) {
+			continue;
+		}
+		ivec2 sample_pixel = clamp(source_base + offsets[i], ivec2(0), cloud_size - ivec2(1));
+		vec4 sample_radiance = texelFetch(cloud_current_radiance, ivec3(sample_pixel, view_layer), 0);
+		vec4 sample_depth = texelFetch(cloud_current_depth, ivec3(sample_pixel, view_layer), 0);
+		min_scene_bound_m = min(min_scene_bound_m, sample_depth.z);
+		max_scene_bound_m = max(max_scene_bound_m, sample_depth.w);
+		if (!(sample_radiance.a > 0.5)) {
+			continue;
+		}
+		if (has_geometry && sample_depth.x > scene_distance_m + 1.0) {
+			continue;
+		}
+		if (sample_depth.x < nearest_front_m) {
+			nearest_front_m = sample_depth.x;
+			nearest_pixel = sample_pixel;
+		}
+		has_visible_cloud = true;
+		all_cloud_in_front_of_near = all_cloud_in_front_of_near && sample_depth.x <= sample_depth.z;
+		all_bounds_far_from_camera = all_bounds_far_from_camera
+			&& min(sample_depth.z, sample_depth.w) >= 2000.0;
+#if FENG_CLOUD_VRT_SECONDARY
+		float near_delta = abs(scene_distance_m - sample_depth.z);
+		if (near_delta < best_bound_delta_m) {
+			best_bound_delta_m = near_delta;
+			best_bound_pixel = sample_pixel;
+			best_bound_is_near = true;
+		}
+#endif
+		float far_delta = abs(scene_distance_m - sample_depth.w);
+		if (far_delta < best_bound_delta_m) {
+			best_bound_delta_m = far_delta;
+			best_bound_pixel = sample_pixel;
+			best_bound_is_near = false;
+		}
+	}
+	if (!has_visible_cloud) {
+		// An unchanged pixel in the same storage image is a deliberate no-op.
+		return;
+	}
+	bool use_bilateral = vrt_mode != 0u;
+#if FENG_CLOUD_VRT_SECONDARY
+	float scene_bound_range_m = max_scene_bound_m - min_scene_bound_m;
+	use_bilateral = use_bilateral || (vrt_mode == 0u
+		&& all_cloud_in_front_of_near
+		&& (scene_bound_range_m < 1000.0 || all_bounds_far_from_camera));
+#endif
+	float total_weight = 0.0;
+	vec3 radiance_sum = vec3(0.0);
+	vec3 transmittance_sum = vec3(0.0);
+	float holdout_mask_sum = 0.0;
+	ivec2 selected_pixel = best_bound_pixel;
+	bool selected_secondary = best_bound_is_near;
+	if (use_bilateral) {
+		for (int i = 0; i < 4; ++i) {
+			float weight = tap_weights[i];
+			if (weight <= 0.0) {
+				continue;
+			}
+			ivec2 sample_pixel = clamp(source_base + offsets[i], ivec2(0), cloud_size - ivec2(1));
+			vec4 sample_radiance = texelFetch(cloud_current_radiance, ivec3(sample_pixel, view_layer), 0);
+			vec4 sample_depth = texelFetch(cloud_current_depth, ivec3(sample_pixel, view_layer), 0);
+			bool sample_has_cloud = sample_radiance.a > 0.5;
+			bool sample_behind = sample_has_cloud && has_geometry
+				&& sample_depth.x > scene_distance_m + 1.0;
+			bool mode0_depth_unsafe = sample_has_cloud && vrt_mode == 0u &&
+				(sample_depth.x > sample_depth.z || !all_cloud_in_front_of_near);
+			vec4 sample_trans = texelFetch(cloud_current_transmittance, ivec3(sample_pixel, view_layer), 0);
+			bool reject_cloud = sample_behind || mode0_depth_unsafe;
+			// A clear, occluded, or depth-unsafe tap contributes the bilinear
+			// identity (L=0, T=1); retaining its weight prevents edge overfill.
+			vec3 tap_radiance = vec3(0.0);
+			vec3 tap_transmittance = vec3(1.0);
+			float tap_holdout = 0.0;
+			if (sample_has_cloud && !reject_cloud) {
+				tap_radiance = feng_cloud_finite_or_zero3(sample_radiance.rgb);
+				tap_transmittance = clamp(feng_cloud_finite_or_zero3(sample_trans.rgb), vec3(0.0), vec3(1.0));
+				tap_holdout = feng_cloud_saturate_finite(sample_trans.a);
+			}
+			radiance_sum += tap_radiance * weight;
+			transmittance_sum += tap_transmittance * weight;
+			holdout_mask_sum += tap_holdout * weight;
+			total_weight += weight;
+		}
+	}
+	vec3 cloud_radiance;
+	vec3 cloud_transmittance;
+	float holdout_mask;
+	if (use_bilateral && total_weight > 1e-8) {
+		cloud_radiance = radiance_sum / total_weight;
+		cloud_transmittance = clamp(transmittance_sum / total_weight, vec3(0.0), vec3(1.0));
+		holdout_mask = feng_cloud_saturate_finite(holdout_mask_sum / total_weight);
+	} else {
+		ivec3 selected_coord = ivec3(selected_pixel, view_layer);
+		vec4 selected_cloud = texelFetch(cloud_current_radiance, selected_coord, 0);
+		vec4 selected_trans = texelFetch(cloud_current_transmittance, selected_coord, 0);
+#if FENG_CLOUD_VRT_SECONDARY
+		if (vrt_mode == 0u && selected_secondary) {
+			vec4 near_cloud = texelFetch(cloud_current_secondary_radiance, selected_coord, 0);
+			vec4 near_trans = texelFetch(cloud_current_secondary_transmittance, selected_coord, 0);
+			// Alpha zero is a valid clear near layer (L=0,T=1), not a
+			// signal to reveal the primary/far cloud behind it.
+			selected_cloud = near_cloud;
+			selected_trans = near_trans;
+		}
+#endif
+		cloud_radiance = feng_cloud_finite_or_zero3(selected_cloud.rgb);
+		cloud_transmittance = clamp(feng_cloud_finite_or_zero3(selected_trans.rgb), vec3(0.0), vec3(1.0));
+		holdout_mask = feng_cloud_saturate_finite(selected_trans.a);
+	}
+	vec4 opaque = imageLoad(cloud_out_scene, pixel);
+	vec3 composed = feng_cloud_finite_or_zero3(cloud_radiance)
+		+ cloud_transmittance * feng_cloud_finite_or_zero3(opaque.rgb);
+	float output_alpha = opaque.a;
+	if ((cloud_frame.view_index_frame_index_flags_vrt_mode.z & FENG_CLOUD_FRAME_ALPHA_HOLDOUT_SUPPORTED) != 0u) {
+		output_alpha = clamp(opaque.a - holdout_mask, 0.0, 1.0);
+	}
+	imageStore(cloud_out_scene, pixel, vec4(composed, output_alpha));
+}

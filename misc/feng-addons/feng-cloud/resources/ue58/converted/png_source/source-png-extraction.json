@@ -1,0 +1,82 @@
+[
+  {
+    "package": "/Engine/EngineSky/VolumetricClouds/CloudGradientTexture",
+    "source_package": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\source\\Engine\\Content\\EngineSky\\VolumetricClouds\\CloudGradientTexture.uasset",
+    "source_payload_offset": 4743,
+    "raw_bytes": 293,
+    "raw_sha256": "76B80FE0AE27A5F5E214B397AC5F821F452DC27182E1ABCFD526643A16915308",
+    "converted_path": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\converted\\png_source\\CloudGradientTexture.png",
+    "converted_sha256": "76B80FE0AE27A5F5E214B397AC5F821F452DC27182E1ABCFD526643A16915308",
+    "dimensions": [
+      32,
+      16
+    ],
+    "png_mode": "RGBA",
+    "ue_source_format": "TSF_BGRA8",
+    "ue_srgb_override": null
+  },
+  {
+    "package": "/Engine/EngineSky/VolumetricClouds/CloudWeatherTexture",
+    "source_package": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\source\\Engine\\Content\\EngineSky\\VolumetricClouds\\CloudWeatherTexture.uasset",
+    "source_payload_offset": 8916,
+    "raw_bytes": 283178,
+    "raw_sha256": "1DD472AC3E51C65F6D7295FB9807271C0F2893F8C1BD076ACDE153D6959052AA",
+    "converted_path": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\converted\\png_source\\CloudWeatherTexture.png",
+    "converted_sha256": "1DD472AC3E51C65F6D7295FB9807271C0F2893F8C1BD076ACDE153D6959052AA",
+    "dimensions": [
+      512,
+      512
+    ],
+    "png_mode": "RGBA",
+    "ue_source_format": "TSF_BGRA8",
+    "ue_srgb_override": null
+  },
+  {
+    "package": "/Engine/EngineSky/VolumetricClouds/T_NoiseErosion",
+    "source_package": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\source\\Engine\\Content\\EngineSky\\VolumetricClouds\\T_NoiseErosion.uasset",
+    "source_payload_offset": 4651,
+    "raw_bytes": 36964,
+    "raw_sha256": "2F3B41C3582175D7E12DD8D8E3EFE9EA9B0F63D524112D29548F1892E7D15EA9",
+    "converted_path": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\converted\\png_source\\T_NoiseErosion.png",
+    "converted_sha256": "2F3B41C3582175D7E12DD8D8E3EFE9EA9B0F63D524112D29548F1892E7D15EA9",
+    "dimensions": [
+      1024,
+      32
+    ],
+    "png_mode": "RGBA",
+    "ue_source_format": "TSF_BGRA8",
+    "ue_srgb_override": null
+  },
+  {
+    "package": "/Engine/EngineSky/VolumetricClouds/T_NoiseShape64",
+    "source_package": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\source\\Engine\\Content\\EngineSky\\VolumetricClouds\\T_NoiseShape64.uasset",
+    "source_payload_offset": 4605,
+    "raw_bytes": 258525,
+    "raw_sha256": "A85CD6183B31F5BDBCBF20D72FC7255903A1E420D75C59769C6D58AA613FC139",
+    "converted_path": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\converted\\png_source\\T_NoiseShape64.png",
+    "converted_sha256": "A85CD6183B31F5BDBCBF20D72FC7255903A1E420D75C59769C6D58AA613FC139",
+    "dimensions": [
+      4096,
+      64
+    ],
+    "png_mode": "RGBA",
+    "ue_source_format": "TSF_BGRA8",
+    "ue_srgb_override": null
+  },
+  {
+    "package": "/Engine/EngineResources/DefaultVolumeTexture2D",
+    "source_package": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\source\\Engine\\Content\\EngineResources\\DefaultVolumeTexture2D.uasset",
+    "source_payload_offset": 4104,
+    "raw_bytes": 122,
+    "raw_sha256": "FE23A9745A0E08201D350F96288264FA59779753A1BD2F2EBD2C9B0B5584ED3C",
+    "converted_path": "F:\\godot\\worktrees\\auto-feng-cloud\\misc\\feng-addons\\feng-cloud\\resources\\ue58\\converted\\png_source\\DefaultVolumeTexture2D.png",
+    "converted_sha256": "FE23A9745A0E08201D350F96288264FA59779753A1BD2F2EBD2C9B0B5584ED3C",
+    "dimensions": [
+      8,
+      8
+    ],
+    "png_mode": "RGBA",
+    "ue_source_format": "TSF_BGRA8",
+    "ue_srgb_override": null
+  }
+]

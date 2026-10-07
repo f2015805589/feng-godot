@@ -1,0 +1,72 @@
+#[compute]
+#version 450
+
+#include "cloud_gpu_layout.glslinc"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+FENG_CLOUD_DECLARE_MATERIAL;
+FENG_CLOUD_DECLARE_PROJECTION_CONTROL;
+FENG_CLOUD_DECLARE_CLOUD_AO_STATS_TEXTURE;
+FENG_CLOUD_DECLARE_AO_OUTPUT;
+
+const int FENG_CLOUD_AO_HEMISPHERE_SAMPLES = 16;
+
+vec2 feng_cloud_ao_hemisphere_sample(uint index, float aperture_scale) {
+	uint u_index = index >> 2u;
+	uint v_index = index & 3u;
+	float u = (float(u_index) + 0.125) * 0.25;
+	float v = (float(v_index) + 0.125) * 0.25;
+	float aperture_v = 1.0 - aperture_scale + aperture_scale * v;
+	return vec2(u, aperture_v);
+}
+
+float feng_cloud_ao_record_visibility(vec2 uv) {
+	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+		return 1.0;
+	}
+	vec4 record = textureLod(cloud_raw_ao_stats, uv, 0.0);
+	if (!(record.a > 0.0)) {
+		return 1.0;
+	}
+	return exp(-min(max(feng_cloud_finite_or_zero(record.b), 0.0), 80.0));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 output_size = imageSize(cloud_out_ao);
+	if (any(greaterThanEqual(pixel, output_size))) {
+		return;
+	}
+	vec4 ao_data = cloud_projection_control.ao_far_depth_km_strength_aperture_samples;
+	if (cloud_projection_control.shadow_enabled0_enabled1_aoEnabled_reserved.z <= 0.5 || !(ao_data.y > 0.0)) {
+		imageStore(cloud_out_ao, pixel, vec4(1.0));
+		return;
+	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(output_size);
+	vec4 lane1 = cloud_material_block.lane[1];
+	float cloud_layer_start_height_m = max(feng_cloud_finite_or_zero(lane1.x), 0.0);
+	float aperture_scale = clamp(feng_cloud_finite_or_zero(ao_data.z), 0.0, 1.0);
+	mat4 world_to_clip = cloud_projection_control.world_to_cloud_ao_clip;
+	vec3 clip_x_world = feng_cloud_finite_or_zero3((cloud_projection_control.cloud_ao_clip_to_world * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
+	vec3 clip_y_world = feng_cloud_finite_or_zero3((cloud_projection_control.cloud_ao_clip_to_world * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
+	vec3 axis_x = feng_cloud_safe_normalize3(clip_x_world, vec3(1.0, 0.0, 0.0));
+	vec3 axis_y = feng_cloud_safe_normalize3(clip_y_world, vec3(0.0, 0.0, 1.0));
+	float visibility_sum = 0.0;
+	for (uint i = 0u; i < FENG_CLOUD_AO_HEMISPHERE_SAMPLES; ++i) {
+		vec2 sample_uv = feng_cloud_ao_hemisphere_sample(i, aperture_scale);
+		float phi = 2.0 * FENG_CLOUD_PI * sample_uv.x;
+		float cos_theta = clamp(sample_uv.y, 0.0, 1.0);
+		float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+		vec2 direction_xy = sin_theta * vec2(cos(phi), sin(phi));
+		vec2 world_offset_km = direction_xy * (cloud_layer_start_height_m * FENG_CLOUD_M_TO_KM / max(cos_theta, 1e-7));
+		vec3 world_offset_m = (axis_x * world_offset_km.x + axis_y * world_offset_km.y) * FENG_CLOUD_KM_TO_M;
+		vec4 clip_offset = world_to_clip * vec4(world_offset_m, 0.0);
+		vec2 offset_uv = clip_offset.xy * 0.5;
+		// Outside the projected AO map is unoccluded sky, not an edge-clamped sample.
+		vec2 sample_coord = uv + offset_uv;
+		visibility_sum += feng_cloud_ao_record_visibility(sample_coord);
+	}
+	float visibility = clamp(visibility_sum / float(FENG_CLOUD_AO_HEMISPHERE_SAMPLES), 0.0, 1.0);
+	imageStore(cloud_out_ao, pixel, vec4(visibility));
+}

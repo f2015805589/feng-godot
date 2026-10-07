@@ -1,0 +1,122 @@
+#ifndef FENG_CLOUD_SHELL_GLSLINC
+#define FENG_CLOUD_SHELL_GLSLINC
+
+#include "feng_cloud_material.glslinc"
+
+bool feng_cloud_ray_sphere_roots(vec3 ray_origin_km, vec3 ray_direction, vec3 sphere_center_km, float sphere_radius_km, out vec2 roots_km) {
+	precise vec3 direction = normalize(ray_direction);
+	precise vec3 origin_to_center = ray_origin_km - sphere_center_km;
+	precise float a = dot(direction, direction);
+	precise float b = 2.0 * dot(origin_to_center, direction);
+	precise float origin_squared = dot(origin_to_center, origin_to_center);
+	precise float radius_squared = sphere_radius_km * sphere_radius_km;
+	precise float c = origin_squared - radius_squared;
+	precise float b_squared = b * b;
+	precise float four_a_c = 4.0 * a * c;
+	precise float discriminant = b_squared - four_a_c;
+	if (!(a > 0.0) || !(discriminant >= 0.0) || isnan(discriminant) || isinf(discriminant)) {
+		roots_km = vec2(-1.0);
+		return false;
+	}
+	precise float root = sqrt(max(discriminant, 0.0));
+	precise float inverse_2a = 0.5 / a;
+	precise float near_root = (-b - root) * inverse_2a;
+	precise float far_root = (-b + root) * inverse_2a;
+	roots_km = vec2(near_root, far_root);
+	return true;
+}
+
+// Mirrors UE VolumetricCloud.usf shell root selection. Scene depth is an explicit
+// reconstructed camera-ray distance in km; no separate planet-radius clipping is added.
+FengCloudShellSpan feng_cloud_build_shell_span(
+	vec3 ray_origin_km,
+	vec3 ray_direction,
+	vec3 shell_center_km,
+	float bottom_radius_km,
+	float top_radius_km,
+	float tracing_start_max_km,
+	float tracing_start_camera_km,
+	float tracing_max_km,
+	int tracing_max_mode,
+	int opaque_intersection_mode,
+	float opaque_depth_km,
+	bool orthographic_projection,
+	float orthographic_far_km) {
+	FengCloudShellSpan span;
+	span.start_km = 0.0;
+	span.end_km = 0.0;
+	span.outer_near_km = 0.0;
+	span.outer_far_km = 0.0;
+	span.inner_near_km = 0.0;
+	span.inner_far_km = 0.0;
+	span.intersects_outer = false;
+	span.intersects_inner = false;
+	span.valid = false;
+
+	vec2 top_roots;
+	if (!feng_cloud_ray_sphere_roots(ray_origin_km, ray_direction, shell_center_km, top_radius_km, top_roots)) {
+		return span;
+	}
+	span.intersects_outer = true;
+	span.outer_near_km = top_roots.x;
+	span.outer_far_km = top_roots.y;
+
+	vec2 bottom_roots;
+	span.intersects_inner = feng_cloud_ray_sphere_roots(ray_origin_km, ray_direction, shell_center_km, bottom_radius_km, bottom_roots);
+	if (span.intersects_inner) {
+		span.inner_near_km = bottom_roots.x;
+		span.inner_far_km = bottom_roots.y;
+		float temp_top = all(greaterThan(top_roots, vec2(0.0))) ? min(top_roots.x, top_roots.y) : max(top_roots.x, top_roots.y);
+		float temp_bottom = all(greaterThan(bottom_roots, vec2(0.0))) ? min(bottom_roots.x, bottom_roots.y) : max(bottom_roots.x, bottom_roots.y);
+		if (all(greaterThan(bottom_roots, vec2(0.0)))) {
+			temp_top = max(0.0, min(top_roots.x, top_roots.y));
+		}
+		span.start_km = min(temp_bottom, temp_top);
+		span.end_km = max(temp_bottom, temp_top);
+	} else {
+		span.start_km = top_roots.x;
+		span.end_km = top_roots.y;
+	}
+
+	span.start_km = max(0.0, span.start_km);
+	span.end_km = max(0.0, span.end_km);
+	float start_max = feng_cloud_positive_finite(tracing_start_max_km);
+	if (!(span.end_km > span.start_km) || span.start_km > start_max) {
+		return span;
+	}
+
+	bool do_depth_test = opaque_intersection_mode >= 2;
+	if (orthographic_projection && do_depth_test && length(ray_origin_km - shell_center_km) < top_radius_km && opaque_depth_km > 0.0) {
+		return span;
+	}
+	float depth_km = feng_cloud_positive_finite(opaque_depth_km);
+	if ((!orthographic_projection || span.end_km < orthographic_far_km) && do_depth_test) {
+		if (depth_km < span.start_km) {
+			return span;
+		}
+		span.end_km = min(span.end_km, depth_km);
+	}
+
+	float max_trace = feng_cloud_positive_finite(tracing_max_km);
+	if (tracing_max_mode == 0) {
+		span.end_km = span.start_km + min(max_trace, span.end_km - span.start_km);
+	} else {
+		span.start_km = min(max_trace, span.start_km);
+		if (span.intersects_inner && all(greaterThan(bottom_roots, vec2(0.0))) && max(bottom_roots.x, bottom_roots.y) <= max_trace) {
+			span.end_km = min(max_trace, max(top_roots.x, top_roots.y));
+			span.end_km = min(span.end_km, depth_km);
+		} else {
+			span.end_km = min(span.end_km, max_trace);
+		}
+	}
+	if (!(span.end_km > span.start_km)) {
+		return span;
+	}
+
+	span.start_km = max(span.start_km, feng_cloud_positive_finite(tracing_start_camera_km));
+	span.end_km = max(span.start_km, span.end_km);
+	span.valid = span.end_km > span.start_km;
+	return span;
+}
+
+#endif // FENG_CLOUD_SHELL_GLSLINC

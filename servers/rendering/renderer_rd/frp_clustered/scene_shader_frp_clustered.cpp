@@ -90,6 +90,7 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 	uses_non_default_specular = false;
 	uses_vertex_lighting = false;
 	uses_custom_light_code = false;
+	bool uses_cloud_fogging = false;
 	uses_time = false;
 	writes_modelview_or_projection = false;
 	uses_world_coordinates = false;
@@ -133,6 +134,7 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 	actions.render_mode_flags["wireframe"] = &wireframe;
 	actions.render_mode_flags["particle_trails"] = &uses_particle_trails;
 	actions.render_mode_flags["world_vertex_coords"] = &uses_world_coordinates;
+	actions.render_mode_flags["cloud_fogging"] = &uses_cloud_fogging;
 
 	actions.usage_flag_pointers["ALPHA"] = &uses_alpha;
 	actions.usage_flag_pointers["ALPHA_SCISSOR_THRESHOLD"] = &uses_alpha_clip;
@@ -210,6 +212,25 @@ void SceneShaderFRPClustered::ShaderData::set_code(const String &p_code) {
 
 	if (version.is_null()) {
 		version = SceneShaderFRPClustered::singleton->shader.version_create(false);
+	}
+
+	// Cloud fogging is opt-in and only has meaning for alpha/blended materials.
+	// Keep ordinary material shaders free of the cloud texture bindings.
+	if (uses_cloud_fogging && (uses_alpha || blend_mode_uses_blend_alpha(BlendMode(blend_mode)))) {
+		gen_code.defines.push_back("#define FRP_CLOUD_FOGGING\n");
+		switch (BlendMode(blend_mode)) {
+			case BLEND_MODE_ADD:
+				gen_code.defines.push_back("#define FRP_CLOUD_BLEND_ADD\n");
+				break;
+			case BLEND_MODE_SUB:
+				gen_code.defines.push_back("#define FRP_CLOUD_BLEND_SUB\n");
+				break;
+			case BLEND_MODE_MUL:
+				gen_code.defines.push_back("#define FRP_CLOUD_BLEND_MUL\n");
+				break;
+			default:
+				break;
+		}
 	}
 
 	depth_draw = DepthDraw(depth_drawi);

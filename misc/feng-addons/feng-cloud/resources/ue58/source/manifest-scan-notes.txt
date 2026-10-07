@@ -1,0 +1,11 @@
+# Evidence map and scope
+
+- `manifest.csv` lists the canonical package files using paths relative to this snapshot.
+- `manifest/importmap-audit.json` and `manifest/importmap-records.csv` contain the UE package/import closure audit.
+- `manifest/package-payload-final-summary.md`, `manifest/package-payload-final.csv`, and `manifest/package-bulk-final.csv` record the local bulk-payload checks.
+- `manifest/final-asset-acceptance.md` records package-closure and source-preservation acceptance.
+- `manifest/default-resource-audit.md` and `manifest/default-resource-decode.json` record the UE 5.8 texture-source, default material-instance, and parent-graph audit. Their SHA-256 values are `F4A94AF2FD4B918E1D94FED7185830457BEC66AC09C8BA7E290185D59B9B0B4C` and `D000C7D19588B93387CD624B5E7045D57A5AD3F07362F4C54BB79E42C25D9FB7`.
+- `manifest/conservative-density-formulas.md` is the corrected active-Deferred channel/formula report (SHA-256 `F004CC4A397130BB5A884E470241EA20FC0A5D4F912A1FD3D98E74FF57E9CD40`). Its machine evidence is `manifest/active_deferred_material_ast.json` (SHA-256 `D6821214559A8F43B95EA001479A8C07801E51479E2ADBA8FDD3522F6EC5E358`) and `manifest/conservative_density_active_paths.json` (SHA-256 `DF7EBCB491B2A149AF3DE0ED7097A97598A2B0CC2715FB28BC07C8A5E8A70B3C`). These supersede the earlier ConservativeDensity/profile interpretation in `default-resource-audit.md`.
+- The Pattern graph's `TextureSize` input reflects UE's built texture resource after `MaxTextureSize`/LOD bias. The source image is 1024×1024, the built/default runtime width is 256; do not substitute the SourceData dimension in the kernel.
+
+The older `manifest-package-refs.csv` and `manifest-package-closure.csv` were produced by raw string scans. They are retained as historical leads; the parsed ImportMap and package-bulk reports are authoritative for the claims above. The audit does not compile the UE material or prove its runtime density result. Godot-native texture and material conversion is not included in this source snapshot.

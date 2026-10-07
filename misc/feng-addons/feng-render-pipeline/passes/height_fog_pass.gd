@@ -9,6 +9,7 @@ extends FengRuntimeSnapshotPass
 
 const UBO_BINDING := 2
 const UBO_SIZE := 496 # Two mat4s + seven fog vec4s + sixteen atmosphere vec4s.
+const CLOUD_VISIBILITY_UBO_SIZE := 592 # 35 projection vec4s + sun mapping + validity flags.
 const AtmospherePacket = preload("atmosphere_packet.gd")
 const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
@@ -25,6 +26,11 @@ var _capture_snapshot_active := false
 var _capture_fog_snapshot: Dictionary = {}
 var _capture_atmosphere_snapshot: Dictionary = {}
 var _capture_exposure_normalization := 1.0
+var _cloud_visibility_parameters := PackedFloat32Array()
+var _cloud_shadow0 := RID()
+var _cloud_shadow1 := RID()
+var _cloud_raw_ao := RID()
+var _cloud_visibility_ubo := RID()
 
 ## The capture-only effect is a private duplicate of this resource. These value
 ## snapshots and their texture references stay frozen for the six-face capture.
@@ -81,6 +87,30 @@ func _prepare_atmosphere(ctx: FRPPassContext) -> PackedFloat32Array:
 		_atmosphere_multiple = RenderingServer.texture_get_rd_texture(multiple.get_rid())
 	return AtmospherePacket.make(_atmosphere_snapshot, scene_data.get_cam_transform(), _atmosphere_optical.is_valid(), _atmosphere_multiple.is_valid())
 
+func _capture_cloud_visibility(ctx: FRPPassContext) -> void:
+	_cloud_visibility_parameters = PackedFloat32Array()
+	_cloud_shadow0 = RID()
+	_cloud_shadow1 = RID()
+	_cloud_raw_ao = RID()
+	if ctx == null or not ctx.has_method("get_cloud_atmosphere_parameters"):
+		return
+	var parameters: Variant = ctx.call("get_cloud_atmosphere_parameters")
+	if not parameters is PackedFloat32Array or parameters.size() != 148:
+		return
+	_cloud_visibility_parameters = parameters
+	if parameters[142] > 0.5 and ctx.has_method("get_cloud_output"):
+		_cloud_shadow0 = ctx.call("get_cloud_output", 3)
+	if parameters[143] > 0.5 and ctx.has_method("get_cloud_output"):
+		_cloud_shadow1 = ctx.call("get_cloud_output", 4)
+	if parameters[144] > 0.5 and ctx.has_method("get_cloud_output"):
+		_cloud_raw_ao = ctx.call("get_cloud_output", 7)
+
+func _clear_cloud_visibility() -> void:
+	_cloud_visibility_parameters = PackedFloat32Array()
+	_cloud_shadow0 = RID()
+	_cloud_shadow1 = RID()
+	_cloud_raw_ao = RID()
+
 ## Metadata only: publish before deferred lighting, while the actual compute
 ## work retains the existing Sky-anchored pass position.
 func _frp_prepare(ctx: FRPPassContext) -> void:
@@ -104,6 +134,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 				_atmosphere_snapshot.get("sun_light_rid", RID()),
 				_atmosphere_snapshot.get("secondary_sun_light_rid", RID()),
 				_atmosphere_optical, _atmosphere_multiple)
+		_capture_cloud_visibility(ctx)
 		_pre_exposure = ctx.get_pre_exposure(0)
 		_capture_exposure_normalization = ctx.get_scene_exposure_normalization() \
 				if ctx.has_method("get_scene_exposure_normalization") else 1.0
@@ -118,6 +149,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 				fog_scale, scene_data.get_view_projection(0))
 		ctx.call("set_height_fog_parameters", frame_parameters)
 		super._frp_execute_with_snapshot(ctx, frame_snapshot)
+		_clear_cloud_visibility()
 		_pre_exposure = 1.0
 		_capture_exposure_normalization = 1.0
 		return
@@ -140,7 +172,9 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 				frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(),
 					fog_scale, scene_data.get_view_projection(0))
 		ctx.call("set_height_fog_parameters", frame_parameters)
+		_capture_cloud_visibility(ctx)
 	super._frp_execute(ctx)
+	_clear_cloud_visibility()
 	_pre_exposure = 1.0
 
 func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_scale: float,
@@ -286,6 +320,40 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		uniform.add_id(_atmosphere_sampler)
 		uniform.add_id(texture)
 		uniforms.append(uniform)
+	var cloud_parameters := _cloud_visibility_parameters
+	if cloud_parameters.size() != 148:
+		cloud_parameters.resize(148)
+		cloud_parameters[140] = -1.0
+		cloud_parameters[141] = -1.0
+		cloud_parameters[142] = 0.0
+		cloud_parameters[143] = 0.0
+		cloud_parameters[144] = 0.0
+		cloud_parameters[145] = 0.0
+		cloud_parameters[146] = 0.0
+		cloud_parameters[147] = 0.0
+	if not _cloud_visibility_ubo.is_valid():
+		_cloud_visibility_ubo = rd.uniform_buffer_create(CLOUD_VISIBILITY_UBO_SIZE)
+	if not _cloud_visibility_ubo.is_valid() or rd.buffer_update(_cloud_visibility_ubo, 0,
+			CLOUD_VISIBILITY_UBO_SIZE, cloud_parameters.to_byte_array()) != OK:
+		_binding_error = true
+		_report("Cannot update the cloud atmosphere visibility UBO.")
+		return binding_data
+	var cloud_visibility_uniform := RDUniform.new()
+	cloud_visibility_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
+	cloud_visibility_uniform.binding = 5
+	cloud_visibility_uniform.add_id(_cloud_visibility_ubo)
+	uniforms.append(cloud_visibility_uniform)
+	var cloud_textures: Array[RID] = [_cloud_shadow0, _cloud_shadow1, _cloud_raw_ao]
+	for slot in cloud_textures.size():
+		var texture: RID = cloud_textures[slot]
+		if not texture.is_valid() or not rd.texture_is_valid(texture):
+			texture = _empty_atmosphere_lut
+		var uniform := RDUniform.new()
+		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		uniform.binding = 6 + slot
+		uniform.add_id(_atmosphere_sampler)
+		uniform.add_id(texture)
+		uniforms.append(uniform)
 	binding_data["uniforms"] = uniforms
 	return binding_data
 
@@ -296,6 +364,9 @@ func _cleanup(rd: RenderingDevice) -> void:
 	if rd != null and _atmosphere_sampler.is_valid():
 		rd.free_rid(_atmosphere_sampler)
 	_atmosphere_sampler = RID()
+	if rd != null and _cloud_visibility_ubo.is_valid():
+		rd.free_rid(_cloud_visibility_ubo)
+	_cloud_visibility_ubo = RID()
 	super._cleanup(rd)
 
 func _notification(what: int) -> void:
@@ -306,8 +377,10 @@ func _notification(what: int) -> void:
 	var ubo := _ubo
 	var empty_lut := _empty_atmosphere_lut
 	var atmosphere_sampler := _atmosphere_sampler
+	var cloud_visibility_ubo := _cloud_visibility_ubo
 	_atmosphere_sampler = RID()
 	_empty_atmosphere_lut = RID()
+	_cloud_visibility_ubo = RID()
 	_ubo = RID()
-	if ubo.is_valid() or empty_lut.is_valid() or atmosphere_sampler.is_valid():
-		_free_on_render_thread([ubo, empty_lut, atmosphere_sampler])
+	if ubo.is_valid() or empty_lut.is_valid() or atmosphere_sampler.is_valid() or cloud_visibility_ubo.is_valid():
+		_free_on_render_thread([ubo, empty_lut, atmosphere_sampler, cloud_visibility_ubo])

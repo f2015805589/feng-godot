@@ -98,6 +98,17 @@ layout(std140) uniform MaterialUniforms{ //ubo:3
 };
 #endif
 /* clang-format on */
+
+// Cloud visibility is provided by the clustered FRP renderer. Keep the shared
+// Sky shader API neutral on GLES3, which does not expose FRP cloud descriptors.
+float frp_sky_cloud_shadow_visibility(vec3 world_position_m, int atmo_sun_slot) {
+	return 1.0;
+}
+
+float frp_sky_cloud_multiple_visibility(vec3 world_position_m) {
+	return 1.0;
+}
+
 #GLOBALS
 
 #ifdef USE_CUBEMAP_PASS

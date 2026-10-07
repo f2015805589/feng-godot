@@ -1,0 +1,9 @@
+[gd_resource type="CompositorEffect" script_class="FengVolumetricCloudPass" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-cloud/feng_volumetric_cloud_pass.gd" id="1"]
+
+[resource]
+resource_name = "Volumetric Cloud"
+script = ExtResource("1")
+stage = 3
+stable_id = "library:volumetric_cloud"

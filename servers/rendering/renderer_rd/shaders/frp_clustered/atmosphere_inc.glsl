@@ -126,7 +126,7 @@ vec3 frp_atmo_multiple(vec3 p, vec3 light) {
 	return textureLod(ATMO_MULTIPLE, (vec2(0.5) + uv * (size - vec2(1.0))) / size, 0.0).rgb;
 }
 
-void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radiance, out vec3 transmission) {
+void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, vec3 camera_world_position_m, out vec3 radiance, out vec3 transmission) {
 	radiance = vec3(0.0);
 	transmission = vec3(1.0);
 	float receiver_distance = length(camera_to_receiver_m) * 0.001 * ATMO_PARAMS[6].w;
@@ -169,6 +169,9 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 		light_phase[slot].y = frp_atmo_mie_phase(g, mu);
 	}
 	vec3 ray_origin = origin + direction * begin;
+	// The packet stores camera-relative-to-planet position. Reconstruct the
+	// authored world-space planet center so cloud maps use their world matrices.
+	vec3 atmosphere_planet_center_world_m = camera_world_position_m - ATMO_PARAMS[0].xyz * 1000.0;
 	float path = end - begin;
 	bool downward = dot(ray_origin, direction) < 0.0;
 	for (int i = 0; i < 64; i++) {
@@ -181,6 +184,7 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 		z = downward ? 1.0 - (1.0 - z) * (1.0 - z) : z * z;
 		float ds = (z - a) * path;
 		vec3 p = ray_origin + direction * ((a + z) * 0.5 * path);
+		vec3 sample_world_position_m = atmosphere_planet_center_world_m + p * 1000.0;
 		vec3 density = frp_atmo_density(max(length(p) - bottom, 0.0));
 		vec3 rayleigh = ATMO_PARAMS[1].xyz * density.x;
 		vec3 mie = ATMO_PARAMS[2].xyz * density.y;
@@ -192,9 +196,10 @@ void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radi
 				continue;
 			}
 			vec3 unit_source = (rayleigh * light_phase[slot].x + mie * light_phase[slot].y) * frp_atmo_transmittance(p, light.xyz);
+			unit_source *= frp_cloud_atmosphere_slot_visibility(sample_world_position_m, slot);
 			// UE 5.8 overview documents multiple scattering for the primary light only.
 			if (slot == 0 && ATMO_PARAMS[12].y > 0.5 && ATMO_PARAMS[6].y > 0.0) {
-				unit_source += (rayleigh + mie) * frp_atmo_multiple(p, light.xyz) * ATMO_PARAMS[6].y;
+				unit_source += (rayleigh + mie) * frp_atmo_multiple(p, light.xyz) * ATMO_PARAMS[6].y * frp_cloud_atmosphere_multiple_scattering_visibility(sample_world_position_m);
 			}
 			source += unit_source * light.w * ATMO_PARAMS[9 + slot * 2].xyz;
 		}

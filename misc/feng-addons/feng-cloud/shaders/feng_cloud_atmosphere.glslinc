@@ -1,0 +1,161 @@
+#ifndef FENG_CLOUD_ATMOSPHERE_GLSLINC
+#define FENG_CLOUD_ATMOSPHERE_GLSLINC
+
+bool feng_cloud_project_visibility_position(vec3 world_position_m, int matrix_index, float far_depth_km, out vec2 uv, out float depth_km) {
+	mat4 world_to_cloud;
+	if (matrix_index >= 0 && matrix_index < 2) {
+		world_to_cloud = cloud_projection_control.world_to_cloud_shadow_clip[matrix_index];
+	} else if (matrix_index == 4) {
+		world_to_cloud = cloud_projection_control.world_to_cloud_ao_clip;
+	} else {
+		return false;
+	}
+	vec4 projected = world_to_cloud * vec4(world_position_m, 1.0);
+	if (!(projected.w > 0.0) || isnan(projected.w) || isinf(projected.w)) {
+		return false;
+	}
+	vec3 ndc = projected.xyz / projected.w;
+	if (any(isnan(ndc)) || any(isinf(ndc)) || any(lessThan(ndc.xy, vec2(-1.0))) || any(greaterThan(ndc.xy, vec2(1.0))) || ndc.z < 0.0 || ndc.z > 1.0) {
+		return false;
+	}
+	uv = ndc.xy * 0.5 + 0.5;
+	depth_km = clamp(1.0 - ndc.z, 0.0, 1.0) * max(far_depth_km, 0.0);
+	return true;
+}
+
+float feng_cloud_visibility_at_sample(vec3 world_position_m, int sun_slot) {
+	if (sun_slot < 0 || sun_slot > 1) {
+		return 1.0;
+	}
+	float cloud_slot_value = sun_slot == 0
+			? cloud_atmosphere_visibility.cloud_atmosphere_sun_mapping.x
+			: cloud_atmosphere_visibility.cloud_atmosphere_sun_mapping.y;
+	if (cloud_slot_value < 0.0 || cloud_slot_value > 1.0) {
+		return 1.0;
+	}
+	int cloud_slot = int(cloud_slot_value + 0.5);
+	float map_valid = cloud_slot == 0
+			? cloud_atmosphere_visibility.cloud_atmosphere_sun_mapping.z
+			: cloud_atmosphere_visibility.cloud_atmosphere_sun_mapping.w;
+	float producer_enabled = cloud_slot == 0
+			? cloud_projection_control.shadow_enabled0_enabled1_aoEnabled_reserved.x
+			: cloud_projection_control.shadow_enabled0_enabled1_aoEnabled_reserved.y;
+	if (map_valid <= 0.5 || producer_enabled <= 0.5) {
+		return 1.0;
+	}
+	float far_depth_km = cloud_projection_control.shadow_far_depth_km_sun0_sun1_resolution0_resolution1[cloud_slot];
+	vec2 uv;
+	float sample_depth_km;
+	if (!feng_cloud_project_visibility_position(world_position_m, cloud_slot, far_depth_km, uv, sample_depth_km)) {
+		return 1.0;
+	}
+	vec4 shadow = cloud_slot == 0 ? textureLod(cloud_shadow_map0, uv, 0.0) : textureLod(cloud_shadow_map1, uv, 0.0);
+	if (!(shadow.a > 0.0) || shadow.a > 1.0 || any(isnan(shadow)) || any(isinf(shadow)) || any(lessThan(shadow.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (sample_depth_km - max(shadow.r, 0.0)) * FENG_CLOUD_KM_TO_M);
+	float optical_depth = min(max(shadow.b, 0.0), distance_after_cloud_m * max(shadow.g, 0.0));
+	float visibility = exp(-min(optical_depth, 80.0));
+	float strength = cloud_projection_control.surface_strength0_strength1_atmosphere_strength0_strength1[2 + cloud_slot];
+	return mix(1.0, visibility, clamp(strength, 0.0, 1.0));
+}
+
+float feng_cloud_multiple_visibility_at_sample(vec3 world_position_m) {
+	if (cloud_atmosphere_visibility.cloud_atmosphere_visibility_flags.x <= 0.5 || cloud_projection_control.shadow_enabled0_enabled1_aoEnabled_reserved.z <= 0.5) {
+		return 1.0;
+	}
+	float far_depth_km = cloud_projection_control.ao_far_depth_km_strength_aperture_samples.x;
+	vec2 uv;
+	float sample_depth_km;
+	if (!feng_cloud_project_visibility_position(world_position_m, 4, far_depth_km, uv, sample_depth_km)) {
+		return 1.0;
+	}
+	vec4 raw_ao = textureLod(cloud_raw_ao_stats, uv, 0.0);
+	if (!(raw_ao.a > 0.0) || raw_ao.a > 1.0 || any(isnan(raw_ao)) || any(isinf(raw_ao)) || any(lessThan(raw_ao.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (sample_depth_km - max(raw_ao.r, 0.0)) * FENG_CLOUD_KM_TO_M);
+	float optical_depth = min(max(raw_ao.b, 0.0), distance_after_cloud_m * max(raw_ao.g, 0.0));
+	return exp(-min(optical_depth, 80.0));
+}
+
+#define FRP_ATMO_CLOUD_SHADOW_VISIBILITY(world_position_m, atmo_sun_slot) feng_cloud_visibility_at_sample(world_position_m, atmo_sun_slot)
+#define FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY(world_position_m) feng_cloud_multiple_visibility_at_sample(world_position_m)
+#include "feng_cloud_atmosphere_transport.glslinc"
+#undef FRP_ATMO_CLOUD_SHADOW_VISIBILITY
+#undef FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY
+
+float feng_cloud_ap_material_weight(float distance_m, float global_start_km, float material_start_m, float fade_m) {
+	float d = max(feng_cloud_finite_or_zero(distance_m), 0.0);
+	float start = max(max(feng_cloud_finite_or_zero(global_start_km) * FENG_CLOUD_KM_TO_M,
+		max(feng_cloud_finite_or_zero(material_start_m), 0.0)), 0.0);
+	// UE treats a zero fade distance as a tiny 0.00001 km transition.
+	float fade = max(feng_cloud_finite_or_zero(fade_m), 0.01);
+	return clamp((d - start) / fade, 0.0, 1.0);
+}
+
+vec3 feng_cloud_sample_atmosphere_transmittance(vec3 camera_to_sample_m, int sun_slot, bool enabled) {
+	if (!enabled || cloud_atmosphere_block.lane[12].z <= 0.5) {
+		return vec3(1.0);
+	}
+	return frp_atmo_surface_transmittance(camera_to_sample_m, clamp(sun_slot, 0, 1));
+}
+
+void feng_cloud_apply_atmosphere_and_height_fog(
+	vec3 camera_to_cloud_m,
+	FengCloudShellParameters shell,
+	bool capture,
+	inout vec3 radiance,
+	inout vec3 transmittance,
+	bool holdout,
+	out float holdout_mask) {
+	vec3 cloud_radiance = feng_cloud_finite_or_zero3(radiance);
+	vec3 cloud_transmission = clamp(feng_cloud_finite_or_zero3(transmittance), vec3(0.0), vec3(1.0));
+	float cloud_mean_transmission = clamp(dot(cloud_transmission, vec3(1.0 / 3.0)), 0.0, 1.0);
+	float cloud_coverage = 1.0 - cloud_mean_transmission;
+	holdout_mask = holdout ? cloud_coverage : 0.0;
+	float distance_m = length(camera_to_cloud_m);
+
+	if (cloud_atmosphere_block.lane[12].z > 0.5) {
+		vec3 ap_radiance;
+		float ap_transmission;
+		bool use_split_ap = !capture && (shell.rayleigh_ap_start_m + shell.mie_ap_start_m) > 0.0;
+		if (use_split_ap) {
+			FengCloudAtmosphereComponents atmosphere = feng_cloud_atmosphere_aerial_components(camera_to_cloud_m, cloud_frame.camera_world_position_m.xyz);
+			float global_ap_start_km = cloud_atmosphere_block.lane[6].z;
+			float rayleigh_weight = feng_cloud_ap_material_weight(
+				distance_m, global_ap_start_km, shell.rayleigh_ap_start_m, shell.rayleigh_ap_fade_m);
+			float mie_weight = feng_cloud_ap_material_weight(
+				distance_m, global_ap_start_km, shell.mie_ap_start_m, shell.mie_ap_fade_m);
+			ap_radiance = atmosphere.rayleigh_radiance * rayleigh_weight
+				+ atmosphere.mie_radiance * mie_weight;
+			float rayleigh_t = dot(atmosphere.rayleigh_transmittance, vec3(1.0 / 3.0));
+			float mie_t = dot(atmosphere.mie_transmittance, vec3(1.0 / 3.0));
+			ap_transmission = mix(1.0, clamp(rayleigh_t, 0.0, 1.0), rayleigh_weight)
+				* mix(1.0, clamp(mie_t, 0.0, 1.0), mie_weight);
+		} else {
+			vec3 combined_ap_transmission;
+			frp_atmo_aerial(camera_to_cloud_m, vec3(0.0), cloud_frame.camera_world_position_m.xyz, ap_radiance, combined_ap_transmission);
+			ap_transmission = dot(clamp(combined_ap_transmission, vec3(0.0), vec3(1.0)), vec3(1.0 / 3.0));
+		}
+		holdout_mask *= ap_transmission;
+		// Match UE's cloud AP composition: AP radiance contributes over cloud
+		// coverage, while AP transmission attenuates cloud radiance only. Cloud
+		// transmittance remains unchanged for composition over the already-AP sky.
+		cloud_radiance = ap_radiance * cloud_coverage + ap_transmission * cloud_radiance;
+	}
+
+	vec4 fog = feng_cloud_height_fog(camera_to_cloud_m);
+	cloud_radiance = fog.rgb * cloud_coverage + clamp(fog.a, 0.0, 1.0) * cloud_radiance;
+	holdout_mask *= clamp(fog.a, 0.0, 1.0);
+	// Holdout reserves the background through the fog/AP transmission, but the
+	// cloud layer itself contributes no RGB in the holdout pass.
+	if (holdout) {
+		cloud_radiance = vec3(0.0);
+	}
+	radiance = feng_cloud_finite_or_zero3(cloud_radiance);
+	transmittance = cloud_transmission;
+	holdout_mask = feng_cloud_saturate_finite(holdout_mask);
+}
+
+#endif // FENG_CLOUD_ATMOSPHERE_GLSLINC

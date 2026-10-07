@@ -1,0 +1,145 @@
+#[compute]
+#version 450
+
+#include "cloud_gpu_layout.glslinc"
+
+// One cached sky-only radiance value for the cloud trace. This follows UE 5.8's
+// DistantSkyLightLut pass: 8x8 directions, sampled at 6 km above the ground,
+// then averaged over solid angle. It deliberately excludes cloud output.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+FENG_CLOUD_DECLARE_LIGHTING;
+FENG_CLOUD_DECLARE_ATMOSPHERE;
+FENG_CLOUD_DECLARE_ATMOSPHERE_TEXTURES;
+FENG_CLOUD_DECLARE_SKY_RADIANCE;
+FENG_CLOUD_DECLARE_SKY_AMBIENT_OUTPUT;
+
+#include "feng_cloud_atmosphere_transport.glslinc"
+
+#define CLOUD_ATMO_PARAMS cloud_atmosphere_block.lane
+
+const uint FENG_CLOUD_UE_SKY_SAMPLE_SEED = 0xDE4DC0DEu;
+const float FENG_CLOUD_UE_SKY_REFERENCE_ALTITUDE_KM = 6.0;
+const uint FENG_CLOUD_UE_SKY_SAMPLE_COUNT = 64u;
+
+shared vec3 feng_cloud_sky_radiance_samples[64];
+
+uint feng_cloud_ue_random_advance(uint seed, uint count) {
+	uint accumulated_multiplier = 1u;
+	uint accumulated_increment = 0u;
+	uint multiplier = 196314165u;
+	uint increment = 907633515u;
+	while (count > 0u) {
+		if ((count & 1u) != 0u) {
+			accumulated_multiplier *= multiplier;
+			accumulated_increment = accumulated_increment * multiplier + increment;
+		}
+		increment = (multiplier + 1u) * increment;
+		multiplier *= multiplier;
+		count >>= 1u;
+	}
+	return accumulated_multiplier * seed + accumulated_increment;
+}
+
+float feng_cloud_ue_random_fraction(uint seed) {
+	return uintBitsToFloat(0x3F800000u | (seed >> 9u)) - 1.0;
+}
+
+vec3 feng_cloud_ue_sphere_sample(uint linear_index) {
+	// Match FUniformSphereSamplesBuffer's nested i/j order and output index j*8+i.
+	uint i = linear_index & 7u;
+	uint j = linear_index >> 3u;
+	uint element = i * 8u + j;
+	uint seed_u0 = feng_cloud_ue_random_advance(FENG_CLOUD_UE_SKY_SAMPLE_SEED, element * 2u + 1u);
+	uint seed_u1 = feng_cloud_ue_random_advance(FENG_CLOUD_UE_SKY_SAMPLE_SEED, element * 2u + 2u);
+	float u0 = (float(i) + feng_cloud_ue_random_fraction(seed_u0)) * (1.0 / 8.0);
+	float u1 = (float(j) + feng_cloud_ue_random_fraction(seed_u1)) * (1.0 / 8.0);
+	float z = 1.0 - 2.0 * u0;
+	float radial = sqrt(max(1.0 - z * z, 0.0));
+	float phi = 2.0 * FENG_CLOUD_PI * u1;
+	return vec3(radial * cos(phi), radial * sin(phi), z);
+}
+
+vec2 feng_cloud_direction_to_octahedron(vec3 direction) {
+	vec3 n = direction / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-8);
+	if (n.z < 0.0) {
+		vec2 signs = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+		n.xy = (1.0 - abs(n.yx)) * signs;
+	}
+	return n.xy * 0.5 + 0.5;
+}
+
+vec3 feng_cloud_sample_explicit_sky(vec3 world_direction) {
+	if (!(cloud_lighting.sky_energy_captured_scale_max_mip_valid.w > 0.5)) {
+		return vec3(0.0);
+	}
+#if FENG_CLOUD_SKY_OCTMAP_ARRAY
+	if (!(cloud_lighting.sky_octmap_parameters.w > 0.5)) {
+		return vec3(0.0);
+	}
+#else
+	if (cloud_lighting.sky_octmap_parameters.w > 0.5) {
+		return vec3(0.0);
+	}
+#endif
+	vec3 sky_local_direction = mat3(cloud_lighting.sky_inverse_rotation) * world_direction;
+	vec2 oct_uv = feng_cloud_direction_to_octahedron(feng_cloud_safe_normalize3(sky_local_direction, vec3(0.0, 1.0, 0.0)));
+	float border = max(cloud_lighting.sky_octmap_parameters.x, 0.0);
+	oct_uv = oct_uv * max(1.0 - 2.0 * border, 0.0) + border;
+	// Integrate the raw octahedral radiance at layer 0/mip 0 over the same
+	// spherical directions. Averaging an octahedral mip is not a solid-angle mean.
+	vec3 radiance;
+#if FENG_CLOUD_SKY_OCTMAP_ARRAY
+	radiance = textureLod(cloud_sky_radiance, vec3(oct_uv, 0.0), 0.0).rgb;
+#else
+	radiance = textureLod(cloud_sky_radiance, oct_uv, 0.0).rgb;
+#endif
+	float source_scale = max(feng_cloud_finite_or_zero(cloud_lighting.sky_energy_captured_scale_max_mip_valid.x), 0.0)
+		* max(feng_cloud_finite_or_zero(cloud_lighting.sky_energy_captured_scale_max_mip_valid.y), 0.0);
+	return feng_cloud_positive_finite3(radiance) * source_scale;
+}
+
+vec3 feng_cloud_sample_atmosphere_sky(vec3 direction) {
+	float bottom_radius_km = max(feng_cloud_finite_or_zero(CLOUD_ATMO_PARAMS[0].w), 0.0);
+	float atmosphere_height_km = max(feng_cloud_finite_or_zero(CLOUD_ATMO_PARAMS[4].w), 0.0);
+	vec3 camera_from_planet_km = feng_cloud_finite_or_zero3(CLOUD_ATMO_PARAMS[0].xyz);
+	// Godot's atmosphere packet uses Y-up. Rebase the current camera origin onto
+	// the fixed planet-local reference point so normal camera motion cannot alter
+	// the cached distant-sky source.
+	vec3 reference_position_km = vec3(0.0, bottom_radius_km + FENG_CLOUD_UE_SKY_REFERENCE_ALTITUDE_KM, 0.0);
+	vec3 eye_offset_m = (reference_position_km - camera_from_planet_km) * FENG_CLOUD_KM_TO_M;
+	float desired_path_km = max(2.0 * (bottom_radius_km + atmosphere_height_km) + 1.0, 1.0);
+	float view_distance_scale = max(feng_cloud_finite_or_zero(CLOUD_ATMO_PARAMS[6].w), 1e-6);
+	vec3 camera_to_receiver_m = direction * (desired_path_km / view_distance_scale) * FENG_CLOUD_KM_TO_M;
+	vec3 radiance;
+	vec3 transmission;
+	frp_atmo_aerial(camera_to_receiver_m, eye_offset_m, radiance, transmission);
+	return feng_cloud_positive_finite3(radiance);
+}
+
+void main() {
+	if (any(notEqual(gl_WorkGroupID, uvec3(0u)))) {
+		return;
+	}
+	uint lane = gl_LocalInvocationIndex;
+	vec3 direction = feng_cloud_ue_sphere_sample(lane);
+	bool atmosphere_enabled = CLOUD_ATMO_PARAMS[12].z > 0.5;
+	bool explicit_sky_valid = cloud_lighting.sky_energy_captured_scale_max_mip_valid.w > 0.5;
+	vec3 radiance = atmosphere_enabled
+		? feng_cloud_sample_atmosphere_sky(direction)
+		: feng_cloud_sample_explicit_sky(direction);
+	feng_cloud_sky_radiance_samples[lane] = feng_cloud_finite_or_zero3(radiance);
+	barrier();
+	for (uint stride = FENG_CLOUD_UE_SKY_SAMPLE_COUNT / 2u; stride > 0u; stride >>= 1u) {
+		if (lane < stride) {
+			feng_cloud_sky_radiance_samples[lane] += feng_cloud_sky_radiance_samples[lane + stride];
+		}
+		barrier();
+	}
+	if (lane == 0u) {
+		vec3 mean_radiance = feng_cloud_positive_finite3(feng_cloud_sky_radiance_samples[0] / float(FENG_CLOUD_UE_SKY_SAMPLE_COUNT));
+		imageStore(cloud_out_sky_ambient, ivec2(0), vec4(mean_radiance, (atmosphere_enabled || explicit_sky_valid) ? 1.0 : 0.0));
+	}
+}
+
+#undef CLOUD_ATMO_PARAMS

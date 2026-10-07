@@ -94,6 +94,12 @@ func get_frp_parameters() -> Dictionary:
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["parameters"])
 
+## Indicates whether this pass is configured through an RDShaderFile. Addon
+## passes that own their shader compilation can override this without assigning
+## a placeholder resource.
+func requires_shader_file() -> bool:
+	return true
+
 func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_parameters = get_resolved_parameters(ctx).get("parameters", parameters)
 	super._frp_execute(ctx)
@@ -409,7 +415,7 @@ func _notification(what: int) -> void:
 
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()
-	if shader_file == null:
+	if requires_shader_file() and shader_file == null:
 		warnings.append("Shader file is not assigned.")
 	if mode == Mode.COMPUTE:
 		if workgroup_size.x <= 0 or workgroup_size.y <= 0:

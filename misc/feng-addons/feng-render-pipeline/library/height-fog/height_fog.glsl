@@ -21,10 +21,87 @@ layout(set = 0, binding = 2, std140) uniform FogParams {
 
 layout(set = 0, binding = 3) uniform sampler2D atmosphere_optical_texture;
 layout(set = 0, binding = 4) uniform sampler2D atmosphere_multiple_texture;
+layout(set = 0, binding = 5, std140) uniform CloudVisibilityData {
+	vec4 projection[35];
+	vec4 sun_mapping; // atmosphere sun 0/1 -> cloud slot, then cloud-map validity.
+	vec4 flags; // raw AO validity, reserved.
+} cloud_visibility;
+layout(set = 0, binding = 6) uniform sampler2D cloud_shadow0_texture;
+layout(set = 0, binding = 7) uniform sampler2D cloud_shadow1_texture;
+layout(set = 0, binding = 8) uniform sampler2D cloud_raw_ao_texture;
+
+bool frp_height_fog_cloud_project(vec3 world_position_m, int matrix_index, float far_depth_km, out vec2 uv, out float depth_km) {
+	int base = matrix_index * 4;
+	mat4 world_to_cloud = mat4(cloud_visibility.projection[base], cloud_visibility.projection[base + 1],
+			cloud_visibility.projection[base + 2], cloud_visibility.projection[base + 3]);
+	vec4 projected = world_to_cloud * vec4(world_position_m, 1.0);
+	if (!(projected.w > 0.0) || isnan(projected.w) || isinf(projected.w)) {
+		return false;
+	}
+	vec3 ndc = projected.xyz / projected.w;
+	if (any(lessThan(ndc.xy, vec2(-1.0))) || any(greaterThan(ndc.xy, vec2(1.0))) || ndc.z < 0.0 || ndc.z > 1.0) {
+		return false;
+	}
+	uv = ndc.xy * 0.5 + 0.5;
+	depth_km = clamp(1.0 - ndc.z, 0.0, 1.0) * max(far_depth_km, 0.0);
+	return true;
+}
+
+float frp_height_fog_cloud_shadow_visibility(vec3 world_position_m, int atmo_sun_slot) {
+	if (atmo_sun_slot < 0 || atmo_sun_slot > 1) {
+		return 1.0;
+	}
+	float cloud_slot_value = atmo_sun_slot == 0 ? cloud_visibility.sun_mapping.x : cloud_visibility.sun_mapping.y;
+	if (cloud_slot_value < 0.0 || cloud_slot_value > 1.0) {
+		return 1.0;
+	}
+	int cloud_slot = int(cloud_slot_value + 0.5);
+	float map_valid = cloud_slot == 0 ? cloud_visibility.sun_mapping.z : cloud_visibility.sun_mapping.w;
+	if (map_valid <= 0.5) {
+		return 1.0;
+	}
+	float far_depth_km = cloud_slot == 0 ? cloud_visibility.projection[24].x : cloud_visibility.projection[24].y;
+	vec2 uv;
+	float surface_depth_km;
+	if (!frp_height_fog_cloud_project(world_position_m, cloud_slot, far_depth_km, uv, surface_depth_km)) {
+		return 1.0;
+	}
+	vec4 shadow = cloud_slot == 0 ? textureLod(cloud_shadow0_texture, uv, 0.0) : textureLod(cloud_shadow1_texture, uv, 0.0);
+	if (!(shadow.a > 0.0) || any(isnan(shadow)) || any(isinf(shadow)) || any(lessThan(shadow.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(shadow.r, 0.0)) * 1000.0);
+	float optical_depth = min(max(shadow.b, 0.0), distance_after_cloud_m * max(shadow.g, 0.0));
+	float strength = cloud_slot == 0 ? cloud_visibility.projection[26].z : cloud_visibility.projection[26].w;
+	return mix(1.0, exp(-min(optical_depth, 80.0)), clamp(strength, 0.0, 1.0));
+}
+
+float frp_height_fog_cloud_multiple_visibility(vec3 world_position_m) {
+	if (cloud_visibility.flags.x <= 0.5) {
+		return 1.0;
+	}
+	vec2 uv;
+	float surface_depth_km;
+	if (!frp_height_fog_cloud_project(world_position_m, 4, cloud_visibility.projection[31].x, uv, surface_depth_km)) {
+		return 1.0;
+	}
+	vec4 ao = textureLod(cloud_raw_ao_texture, uv, 0.0);
+	if (!(ao.a > 0.0) || any(isnan(ao)) || any(isinf(ao)) || any(lessThan(ao.rgb, vec3(0.0)))) {
+		return 1.0;
+	}
+	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(ao.r, 0.0)) * 1000.0);
+	float optical_depth = min(max(ao.b, 0.0), distance_after_cloud_m * max(ao.g, 0.0));
+	return exp(-min(optical_depth, 80.0));
+}
+
+#define FRP_ATMO_CLOUD_SHADOW_VISIBILITY(world_position_m, atmo_sun_slot) frp_height_fog_cloud_shadow_visibility(world_position_m, atmo_sun_slot)
+#define FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY(world_position_m) frp_height_fog_cloud_multiple_visibility(world_position_m)
 #define ATMO_PARAMS params.atmosphere_parameters
 #define ATMO_OPTICAL atmosphere_optical_texture
 #define ATMO_MULTIPLE atmosphere_multiple_texture
 #include "atmosphere_inc.glslinc"
+#undef FRP_ATMO_CLOUD_SHADOW_VISIBILITY
+#undef FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY
 #undef ATMO_PARAMS
 #undef ATMO_OPTICAL
 #undef ATMO_MULTIPLE
@@ -178,7 +255,7 @@ void main() {
 	if (depth > 0.0 && params.atmosphere_parameters[12].z > 0.5) {
 		vec3 atmospheric_radiance;
 		vec3 atmospheric_transmission;
-		frp_atmo_aerial(camera_to_receiver, vec3(0.0), atmospheric_radiance, atmospheric_transmission);
+		frp_atmo_aerial(camera_to_receiver, vec3(0.0), params.camera_position.xyz, atmospheric_radiance, atmospheric_transmission);
 		scene_color.rgb = scene_color.rgb * atmospheric_transmission + atmospheric_radiance * pc.parameters.y;
 	}
 	vec3 fogged_rgb = fog.rgb * pc.parameters.y + scene_color.rgb * fog.a;

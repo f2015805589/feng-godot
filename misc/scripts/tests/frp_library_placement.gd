@@ -7,7 +7,7 @@ const Renderer = preload("res://addons/feng-render-pipeline/renderer.gd")
 const Base = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
 const Library = preload("res://addons/feng-render-pipeline/pipeline/library_manager.gd")
 const MANAGED := [&"library:eye_adaptation", &"library:color_grade"]
-const FRESH_IDS := ["native:0", "native:1", "native:2", "native:3", "library:magic_gi", "native:4", "library:height_fog", "native:5", "native:6", "library:eye_adaptation", "native:8", "library:color_grade", "native:7", "library:debug_buffers"]
+const FRESH_IDS := ["native:0", "native:1", "native:2", "library:cloud_shadow", "native:3", "library:magic_gi", "native:4", "library:volumetric_cloud", "library:height_fog", "library:cloud_trace", "native:5", "native:6", "library:eye_adaptation", "native:8", "library:color_grade", "native:7", "library:debug_buffers"]
 var results: Array = []
 var failed := false
 

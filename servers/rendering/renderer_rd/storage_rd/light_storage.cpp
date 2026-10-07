@@ -658,6 +658,19 @@ void LightStorage::free_light_data() {
 		memdelete_arr(directional_lights);
 		directional_lights = nullptr;
 	}
+	if (directional_light_base_rids != nullptr) {
+		memdelete_arr(directional_light_base_rids);
+		directional_light_base_rids = nullptr;
+	}
+	if (directional_light_world_directions != nullptr) {
+		memdelete_arr(directional_light_world_directions);
+		directional_light_world_directions = nullptr;
+	}
+	if (directional_light_raw_energies != nullptr) {
+		memdelete_arr(directional_light_raw_energies);
+		directional_light_raw_energies = nullptr;
+	}
+	current_directional_light_count = 0;
 
 	if (omni_lights != nullptr) {
 		memdelete_arr(omni_lights);
@@ -709,6 +722,9 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 	max_directional_lights = RendererSceneRender::MAX_DIRECTIONAL_LIGHTS;
 	uint32_t directional_light_buffer_size = max_directional_lights * sizeof(DirectionalLightData);
 	directional_lights = memnew_arr(DirectionalLightData, max_directional_lights);
+	directional_light_base_rids = memnew_arr(RID, max_directional_lights);
+	directional_light_world_directions = memnew_arr(Vector3, max_directional_lights);
+	directional_light_raw_energies = memnew_arr(float, max_directional_lights);
 	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size);
 }
 
@@ -719,6 +735,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	Transform3D inverse_transform = p_camera_transform.affine_inverse();
 
 	r_directional_light_count = 0;
+	current_directional_light_count = 0;
+	cloud_sky_only_lights.clear();
 	r_positional_light_count = 0;
 
 	omni_light_count = 0;
@@ -738,15 +756,35 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 		switch (light->type) {
 			case RSE::LIGHT_DIRECTIONAL: {
-				if (r_directional_light_count >= max_directional_lights || light->directional_sky_mode == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+				Transform3D light_transform = light_instance->transform;
+				const Vector3 world_direction = light_transform.basis.xform(Vector3(0, 0, 1)).normalized();
+				if (light->directional_sky_mode == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+					// Sky-only lights are excluded from the surface-light UBO, but cloud
+					// transport still needs the renderer-resolved physical source.
+					float raw_energy = (light->negative ? -1.0f : 1.0f) * light->param[RSE::LIGHT_PARAM_ENERGY];
+					if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
+						raw_energy *= light->param[RSE::LIGHT_PARAM_INTENSITY];
+					} else {
+						raw_energy *= Math::PI;
+					}
+					const Color linear_color = light->color.srgb_to_linear();
+					CloudSkyOnlyLightData cloud_light;
+					cloud_light.base_light = light_instance->light;
+					cloud_light.world_direction = world_direction;
+					cloud_light.raw_irradiance = Vector3(linear_color.r, linear_color.g, linear_color.b) * raw_energy;
+					cloud_sky_only_lights.push_back(cloud_light);
+					continue;
+				}
+				if (r_directional_light_count >= max_directional_lights) {
 					continue;
 				}
 
 				DirectionalLightData &light_data = directional_lights[r_directional_light_count];
-
-				Transform3D light_transform = light_instance->transform;
+				const uint32_t directional_index = r_directional_light_count;
 
 				Vector3 direction = inverse_transform.basis.xform(light_transform.basis.xform(Vector3(0, 0, 1))).normalized();
+				directional_light_base_rids[directional_index] = light_instance->light;
+				directional_light_world_directions[directional_index] = world_direction;
 
 				light_data.direction[0] = direction.x;
 				light_data.direction[1] = direction.y;
@@ -761,6 +799,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				} else {
 					light_data.energy *= Math::PI;
 				}
+				directional_light_raw_energies[directional_index] = light_data.energy;
 
 				if (p_render_data->camera_attributes.is_valid() && !RendererSceneRenderRD::get_singleton()->uses_frp_eye_adaptation()) {
 					light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
@@ -1250,6 +1289,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		r_positional_light_count++;
 	}
 
+	current_directional_light_count = r_directional_light_count;
+
 	//update without barriers
 	if (omni_light_count) {
 		RD::get_singleton()->buffer_update(omni_light_buffer, 0, sizeof(LightData) * omni_light_count, omni_lights);
@@ -1266,6 +1307,61 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	if (r_directional_light_count) {
 		RD::get_singleton()->buffer_update(directional_light_buffer, 0, sizeof(DirectionalLightData) * r_directional_light_count, directional_lights);
 	}
+}
+
+bool LightStorage::get_cloud_directional_light_data(RID p_base_light, Vector3 &r_world_direction, Vector3 &r_raw_irradiance, int32_t &r_directional_index, PackedFloat32Array &r_shadow_packet) const {
+	if (p_base_light.is_null()) {
+		return false;
+	}
+	if (directional_lights != nullptr && directional_light_base_rids != nullptr && directional_light_world_directions != nullptr && directional_light_raw_energies != nullptr) {
+		for (uint32_t i = 0; i < current_directional_light_count; i++) {
+			if (directional_light_base_rids[i] != p_base_light) {
+				continue;
+			}
+			const DirectionalLightData &light_data = directional_lights[i];
+			r_directional_index = int32_t(i);
+			r_world_direction = directional_light_world_directions[i];
+			r_raw_irradiance = Vector3(light_data.color[0], light_data.color[1], light_data.color[2]) * directional_light_raw_energies[i];
+
+			const bool has_shadow = light_data.shadow_opacity > 0.001f;
+			r_shadow_packet.resize(76);
+			float *shadow_packet_write = r_shadow_packet.ptrw();
+			for (int j = 0; j < 76; j++) {
+				shadow_packet_write[j] = 0.0f;
+			}
+			if (has_shadow) {
+				for (int cascade = 0; cascade < 4; cascade++) {
+					for (int element = 0; element < 16; element++) {
+						shadow_packet_write[cascade * 16 + element] = light_data.shadow_matrices[cascade][element];
+					}
+					shadow_packet_write[64 + cascade] = light_data.shadow_split_offsets[cascade];
+					shadow_packet_write[68 + cascade] = light_data.shadow_bias[cascade];
+				}
+				shadow_packet_write[72] = light_data.shadow_opacity;
+				// DirectionalLightData stores these as negative view-Z values. The
+				// cloud shader compares positive view depth, so normalize the sign here.
+				shadow_packet_write[73] = -light_data.fade_from;
+				shadow_packet_write[74] = -light_data.fade_to;
+				shadow_packet_write[75] = 1.0f;
+			}
+			return true;
+		}
+	}
+	for (const CloudSkyOnlyLightData &cloud_light : cloud_sky_only_lights) {
+		if (cloud_light.base_light != p_base_light) {
+			continue;
+		}
+		r_directional_index = -1;
+		r_world_direction = cloud_light.world_direction;
+		r_raw_irradiance = cloud_light.raw_irradiance;
+		r_shadow_packet.resize(76);
+		float *shadow_packet_write = r_shadow_packet.ptrw();
+		for (int i = 0; i < 76; i++) {
+			shadow_packet_write[i] = 0.0f;
+		}
+		return true;
+	}
+	return false;
 }
 
 /* REFLECTION PROBE */
@@ -2037,6 +2133,8 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 	rpi->dirty = false;
 	rpi->processing_layer = 1;
 	if (probe->capture_only) {
+		// capture_revision advances with each submitted request on this probe,
+		// while remaining stable across all six faces of the batch.
 		rpi->capture_revision = probe->capture_request_revision;
 		rpi->capture_exposure = Math::is_finite(probe->capture_exposure) && probe->capture_exposure > 0.0f ? probe->capture_exposure : 1.0f;
 		rpi->capture_output_sky = probe->capture_output_sky;
@@ -2202,6 +2300,17 @@ RID LightStorage::reflection_probe_instance_get_capture_fog_effect(RID p_instanc
 	const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, RID());
 	return rpi->capture_fog_effect;
+}
+
+uint64_t LightStorage::reflection_probe_instance_get_capture_batch_id(RID p_instance) const {
+	const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(rpi, 0);
+	if (!rpi->rendering) {
+		return 0;
+	}
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	ERR_FAIL_NULL_V(probe, 0);
+	return probe->capture_only ? rpi->capture_revision : 0;
 }
 
 ClusterBuilderRD *LightStorage::reflection_probe_instance_get_cluster_builder(RID p_instance, ClusterBuilderSharedDataRD *p_cluster_builder_shared) {

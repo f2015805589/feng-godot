@@ -345,6 +345,10 @@ struct ImplementationData {
 	uint sky_lighting_pad2;
 	vec4 sky_lighting_parameters; // energy, exposure normalization, inverse pixel size, UV border size.
 	mat3 sky_lighting_inverse_xform;
+	vec4 cloud_sun_light_indices_flags; // sun light indices, then active shadow-map flags.
+	vec4 cloud_projection_parameters[35]; // addon-owned world-to-cloud projection packet.
+	vec4 cloud_transparency_parameters; // enabled, cloud depth soft distance in km, padding.
+	vec4 atmosphere_cloud_mapping; // atmosphere sun 0/1 -> cloud slot, then map-valid flags (Sky-only included).
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {

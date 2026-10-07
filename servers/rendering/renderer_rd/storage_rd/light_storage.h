@@ -224,8 +224,21 @@ private:
 		float uv_scale4[2];
 	};
 
+	struct CloudSkyOnlyLightData {
+		RID base_light;
+		Vector3 world_direction;
+		Vector3 raw_irradiance;
+	};
+
 	uint32_t max_directional_lights;
 	DirectionalLightData *directional_lights = nullptr;
+	// Parallel, frame-local source data for systems which must use the renderer's
+	// resolved directional light values without reaching back into scene Nodes.
+	RID *directional_light_base_rids = nullptr;
+	Vector3 *directional_light_world_directions = nullptr;
+	float *directional_light_raw_energies = nullptr;
+	uint32_t current_directional_light_count = 0;
+	Vector<CloudSkyOnlyLightData> cloud_sky_only_lights;
 	RID directional_light_buffer;
 
 	/* REFLECTION PROBE */
@@ -870,6 +883,11 @@ public:
 		return false;
 	}
 	void update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows);
+	// Returns the current camera's resolved directional entry by base light RID.
+	// Irradiance excludes camera exposure normalization; shadow matrices remain in
+	// the renderer's current view-space/atlas convention.
+	// Sky-only entries return directional index -1 and a zero shadow packet.
+	bool get_cloud_directional_light_data(RID p_base_light, Vector3 &r_world_direction, Vector3 &r_raw_irradiance, int32_t &r_directional_index, PackedFloat32Array &r_shadow_packet) const;
 
 	/* REFLECTION PROBE */
 
@@ -987,6 +1005,7 @@ public:
 	RID reflection_probe_instance_get_capture_color_view(RID p_instance, int p_index);
 	RID reflection_probe_instance_get_capture_depth_texture(RID p_instance);
 	RID reflection_probe_instance_get_capture_fog_effect(RID p_instance) const;
+	uint64_t reflection_probe_instance_get_capture_batch_id(RID p_instance) const;
 
 	_FORCE_INLINE_ RID reflection_probe_instance_get_probe(RID p_instance) {
 		ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);

@@ -1,0 +1,223 @@
+#ifndef FENG_CLOUD_TYPES_GLSLINC
+#define FENG_CLOUD_TYPES_GLSLINC
+
+const float FENG_CLOUD_PI = 3.14159265358979323846;
+const float FENG_CLOUD_INV_FOUR_PI = 0.07957747154594766788;
+const float FENG_CLOUD_KM_TO_M = 1000.0;
+const float FENG_CLOUD_M_TO_KM = 0.001;
+
+// All positions and distances in these math-only structures are world kilometers.
+// Extinction and authored emission coefficients are per kilometer; helpers
+// convert to per-meter units only at the per-meter source interface.
+struct FengCloudMaterialParameters {
+	vec3 extinction_per_km;
+	vec3 albedo;
+	vec3 emission_per_km;
+	vec3 shape_uv_scale;
+	vec3 detail_uv_scale;
+	vec3 curl_uv_scale;
+	vec2 weather_uv_scale;
+	vec3 wind_offset_km;
+	float density_scale;
+	float conservative_density;
+	float coverage;
+	float detail_strength;
+	float weather_strength;
+	float curl_strength;
+	float density_constant;
+	float ao_strength;
+	bool ao_override;
+	bool shape_texture_valid;
+	bool use_detail;
+	bool use_weather;
+	bool use_curl;
+};
+
+struct FengCloudAdvancedMaterial {
+	float phase_g;
+	float phase_g2;
+	float phase_blend;
+	bool phase_per_sample;
+	int multiscatter_octaves;
+	float multiscatter_contribution;
+	float multiscatter_occlusion;
+	float multiscatter_eccentricity;
+	bool clamp_multiscatter_contribution;
+	bool ground_contribution;
+	bool grayscale_extinction;
+	bool raymarch_shadow;
+};
+
+struct FengCloudAdvancedSample {
+	float phase_g;
+	float phase_g2;
+	float phase_blend;
+	int multiscatter_octaves;
+	float multiscatter_contribution;
+	float multiscatter_occlusion;
+	float multiscatter_eccentricity;
+	float ambient_occlusion;
+	bool ambient_occlusion_override;
+	bool clamp_multiscatter_contribution;
+	bool ground_contribution;
+	bool grayscale_extinction;
+	bool raymarch_shadow;
+};
+
+struct FengCloudMaterialSample {
+	vec3 extinction_per_km;
+	vec3 albedo;
+	vec3 emission_per_km;
+	float density;
+	float ambient_occlusion;
+	float conservative_density;
+};
+
+struct FengCloudSampleContext {
+	vec3 world_position_km;
+	float altitude_in_layer_km;
+	float normalized_altitude_in_layer;
+	float ray_distance_km;
+	float shadow_sample_distance_km;
+	vec3 world_position_ddx_km;
+	vec3 world_position_ddy_km;
+};
+
+struct FengCloudShellSpan {
+	float start_km;
+	float end_km;
+	float outer_near_km;
+	float outer_far_km;
+	float inner_near_km;
+	float inner_far_km;
+	bool intersects_outer;
+	bool intersects_inner;
+	bool valid;
+};
+
+struct FengCloudSun {
+	// Direction from a cloud sample toward the light source.
+	vec3 direction_to_light;
+	vec3 top_irradiance;
+	vec3 ground_irradiance;
+	vec3 atmosphere_transmittance;
+	vec3 opaque_shadow;
+	vec3 cloud_shadow;
+	bool enabled;
+};
+
+struct FengCloudTransportState {
+	// Unexposed scene-linear intermediate. Apply AP/height fog at weighted depth,
+	// then scene exposure normalization and pre-exposure once before output storage.
+	vec3 radiance;
+	vec3 transmittance;
+	float front_depth_km;
+	float weighted_depth_sum_km;
+	float weighted_depth_weight;
+	bool has_front_depth;
+};
+
+struct FengCloudSegmentResult {
+	vec3 radiance;
+	vec3 transmittance;
+};
+
+FengCloudAdvancedMaterial feng_cloud_advanced_defaults() {
+	FengCloudAdvancedMaterial p;
+	p.phase_g = 0.0;
+	p.phase_g2 = 0.0;
+	p.phase_blend = 0.0;
+	p.phase_per_sample = false;
+	p.multiscatter_octaves = 0;
+	p.multiscatter_contribution = 0.5;
+	p.multiscatter_occlusion = 0.5;
+	p.multiscatter_eccentricity = 0.5;
+	p.clamp_multiscatter_contribution = true;
+	p.ground_contribution = false;
+	p.grayscale_extinction = false;
+	p.raymarch_shadow = true;
+	return p;
+}
+
+FengCloudSun feng_cloud_sun_defaults() {
+	FengCloudSun s;
+	s.direction_to_light = vec3(0.0, 1.0, 0.0);
+	s.top_irradiance = vec3(0.0);
+	s.ground_irradiance = vec3(0.0);
+	s.atmosphere_transmittance = vec3(1.0);
+	s.opaque_shadow = vec3(1.0);
+	s.cloud_shadow = vec3(1.0);
+	s.enabled = false;
+	return s;
+}
+
+FengCloudMaterialParameters feng_cloud_material_defaults() {
+	FengCloudMaterialParameters p;
+	p.extinction_per_km = vec3(0.0);
+	p.albedo = vec3(1.0);
+	p.emission_per_km = vec3(0.0);
+	p.shape_uv_scale = vec3(1.0);
+	p.detail_uv_scale = vec3(4.0);
+	p.curl_uv_scale = vec3(1.0);
+	p.weather_uv_scale = vec2(0.1);
+	p.wind_offset_km = vec3(0.0);
+	p.density_scale = 1.0;
+	p.conservative_density = 1.0;
+	p.coverage = 0.0;
+	p.detail_strength = 0.0;
+	p.weather_strength = 0.0;
+	p.curl_strength = 0.0;
+	p.density_constant = 0.0;
+	p.ao_strength = 0.0;
+	p.ao_override = false;
+	p.shape_texture_valid = true;
+	p.use_detail = false;
+	p.use_weather = false;
+	p.use_curl = false;
+	return p;
+}
+
+FengCloudMaterialSample feng_cloud_empty_material_sample() {
+	FengCloudMaterialSample s;
+	s.extinction_per_km = vec3(0.0);
+	s.albedo = vec3(1.0);
+	s.emission_per_km = vec3(0.0);
+	s.density = 0.0;
+	s.ambient_occlusion = 1.0;
+	s.conservative_density = 0.0;
+	return s;
+}
+
+FengCloudTransportState feng_cloud_transport_state_init() {
+	FengCloudTransportState s;
+	s.radiance = vec3(0.0);
+	s.transmittance = vec3(1.0);
+	s.front_depth_km = 0.0;
+	s.weighted_depth_sum_km = 0.0;
+	s.weighted_depth_weight = 0.0;
+	s.has_front_depth = false;
+	return s;
+}
+
+FengCloudSampleContext feng_cloud_sample_context(
+	vec3 world_position_km,
+	vec3 shell_center_km,
+	float bottom_radius_km,
+	float layer_height_km,
+	float ray_distance_km,
+	float shadow_sample_distance_km,
+	vec3 world_position_ddx_km,
+	vec3 world_position_ddy_km) {
+	FengCloudSampleContext context;
+	context.world_position_km = world_position_km;
+	float altitude = length(world_position_km - shell_center_km) - bottom_radius_km;
+	context.altitude_in_layer_km = altitude;
+	context.normalized_altitude_in_layer = altitude / max(abs(layer_height_km), 1e-6);
+	context.ray_distance_km = ray_distance_km;
+	context.shadow_sample_distance_km = shadow_sample_distance_km;
+	context.world_position_ddx_km = world_position_ddx_km;
+	context.world_position_ddy_km = world_position_ddy_km;
+	return context;
+}
+
+#endif // FENG_CLOUD_TYPES_GLSLINC

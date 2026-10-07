@@ -1,0 +1,9 @@
+[gd_resource type="CompositorEffect" script_class="FengCloudTracePass" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-cloud/feng_cloud_trace_pass.gd" id="1"]
+
+[resource]
+resource_name = "Volumetric Cloud Trace"
+script = ExtResource("1")
+stage = 4
+stable_id = "library:cloud_trace"

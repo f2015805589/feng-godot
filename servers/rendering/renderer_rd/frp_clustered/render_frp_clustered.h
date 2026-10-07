@@ -221,8 +221,24 @@ private:
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
+	// The capture adapter freezes source values for one six-face cloud batch.
+	// Camera-dependent CSM packets remain per-face and are not stored here.
+	struct CloudCaptureLightingCache {
+		bool valid = false;
+		RID probe_instance;
+		uint64_t batch_id = 0;
+		int64_t source_signature = 0;
+		RID capture_environment;
+		RID input_sky;
+		RID output_sky;
+		RID suns[2];
+		RID directional_shadow_atlas;
+		RID input_octmap;
+		PackedFloat32Array lighting;
+	} cloud_capture_lighting_cache;
+
 	void _update_render_base_uniform_set();
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID());
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID(), const Ref<FRPPassContext> &p_cloud_context = Ref<FRPPassContext>());
 
 	struct BestFitNormal {
 		FrpBestFitNormalShaderRD shader;
@@ -400,7 +416,12 @@ private:
 			uint32_t sky_lighting_pad[3];
 			float sky_lighting_parameters[4]; // energy, exposure normalization, inverse pixel size, UV border size.
 			float sky_lighting_inverse_xform[12];
+			float cloud_sun_light_indices_flags[4]; // sun light indices, then active shadow-map flags.
+			float cloud_projection_parameters[35][4]; // addon-owned world-to-cloud projection packet.
+			float cloud_transparency_parameters[4]; // enabled, transparent cloud depth soft distance in km, padding.
+			float atmosphere_cloud_mapping[4]; // atmosphere sun 0/1 -> cloud slot, then map-valid flags (Sky-only included).
 		};
+		static_assert(sizeof(UBO) == 1232, "FRP implementation UBO must match the std140 scene and cloud data layout.");
 
 		struct PushConstantUbershader {
 			SceneShaderFRPClustered::ShaderSpecialization specialization;
@@ -531,6 +552,8 @@ private:
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false, bool p_isolate_environment_ibl = false);
 	void _setup_height_fog(uint32_t p_uniform_buffer_index, const PackedFloat32Array &p_parameters);
 	void _setup_atmosphere(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data);
+	void _setup_cloud_lighting_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context);
+	void _setup_cloud_transparency_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
 
 	struct RenderElementInfo {
