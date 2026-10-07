@@ -161,6 +161,9 @@ static func calculate_insert_index(passes: Array, stable_id: StringName) -> int:
 		var anchor_id := int(entry["after_native"])
 		for i in passes.size():
 			if passes[i] is BuiltinPass and passes[i].native_id == anchor_id:
+				var cloud_rank := _cloud_composite_rank(stable_id) if anchor_id == NativeSpec.PASS_SKY else -1
+				if cloud_rank >= 0:
+					return _cloud_composite_insert_index(passes, i + 1, cloud_rank)
 				return i + 1
 		var missing_anchor_warning: String = entry.get("missing_anchor_warning", "")
 		if missing_anchor_warning != "":
@@ -347,6 +350,44 @@ static func _upgrade_legacy_fxaa(passes: Array) -> bool:
 		passes[index] = replacement
 		changed = true
 	return changed
+
+## Keep system-added cloud passes in their render dependency order without moving any
+## pass already authored in the list. Only the three stock scripts participate; custom
+## replacements and interleaved passes remain boundaries.
+static func _cloud_composite_insert_index(passes: Array, start_index: int, rank: int) -> int:
+	var index := start_index
+	while index < passes.size():
+		var existing_rank := _cloud_composite_rank_for_pass(passes[index])
+		if existing_rank < 0:
+			break
+		if existing_rank > rank:
+			return index
+		index += 1
+	return index
+
+static func _cloud_composite_rank(stable_id: StringName) -> int:
+	match stable_id:
+		&"library:volumetric_cloud":
+			return 0
+		&"library:height_fog":
+			return 1
+		&"library:cloud_trace":
+			return 2
+	return -1
+
+static func _cloud_composite_rank_for_pass(pass_entry: Variant) -> int:
+	if pass_entry == null or pass_entry is BuiltinPass:
+		return -1
+	var rank := _cloud_composite_rank(pass_entry.stable_id)
+	if rank < 0:
+		return -1
+	var manifest: Variant = manifest_entry(pass_entry.stable_id)
+	if manifest == null:
+		return -1
+	var template: Variant = load_template(manifest)
+	if not template is PassBase or pass_entry.get_script() != template.get_script():
+		return -1
+	return rank
 
 ## Whether synchronization owns an entry: one a fresh pipeline seeds, or one it recorded
 ## as added. The other templates belong to the Library menu alone.

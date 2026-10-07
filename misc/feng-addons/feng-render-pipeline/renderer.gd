@@ -23,11 +23,11 @@ const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
 ## is plugin-side code and the engine's own passes are the no-pipeline fallback.
-## Schema 7 moved Eye Adaptation before the post-tonemap library effects. Schema 8 adds
-## the engine's native Bloom entry after Eye Adaptation and before Color Grade. Schema 9
-## moves only the released contiguous Sky/Cloud/Trace/Fog stock sequence so cloud
-## composition receives the fog packet before it runs.
-const PIPELINE_SCHEMA_VERSION := 9
+## Schema 7 moved Eye Adaptation before post-tonemap library effects. Schema 8 adds
+## native Bloom after Eye Adaptation and before Color Grade. Schema 9 originally shipped
+## Sky/Cloud/Trace/Fog in the wrong relative order; schema 10 repairs only that exact
+## released stock sequence and keeps later authored schedules unchanged.
+const PIPELINE_SCHEMA_VERSION := 10
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -265,12 +265,14 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 		changed = _migrate_eye_adaptation_order() or changed
 	if previous_version < 8:
 		changed = _migrate_bloom_pass() or changed
-	if previous_version < 9:
+	changed = _sync_library(false) or changed
+	# Synchronize missing managed passes first so legacy schedules that lacked one of
+	# the stock cloud entries can be recognized after the dependency-aware insertion.
+	if previous_version < 10:
 		changed = _migrate_legacy_cloud_fog_order() or changed
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
-	changed = _sync_library(false) or changed
 	changed = _connect_passes() or changed
 	_normalizing = false
 	if changed and emit:
@@ -498,7 +500,7 @@ func _migrate_bloom_pass() -> bool:
 	_passes.insert(insert_index, _make_native_pass(NativeSpec.PASS_BLOOM))
 	return true
 
-## Schema 9 repairs only the released contiguous stock order. Projects that have
+## Schema 10 repairs only the released contiguous stock order. Projects that have
 ## moved, replaced, duplicated, or interleaved any of these entries keep their order.
 func _migrate_legacy_cloud_fog_order() -> bool:
 	var cloud_template_script := _stock_library_script("cloud/volumetric_cloud.tres")
