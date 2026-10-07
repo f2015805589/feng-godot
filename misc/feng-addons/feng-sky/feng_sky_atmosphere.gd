@@ -21,6 +21,7 @@ const LEGACY_ATMOSPHERE_SHADER_SHA256 := [
 	"c421870e65cb92a6db325cc6270fac8f906df016b0efe1a1007bd691cb644e6d", # aa96f5c
 	"0e4f8b56bc26ca577c5dfbb4ddea18e1a8a6f9a8324185153f3dba9062916020", # 9d41bde
 	"0f815fb7da56be15db13c180fa6a1de55d5f7383fe22764aa16c6f315ec166fb", # e002032f test-1 embedded default
+	"fecd4d6c7e913134cd27efe95dafbc5876e61c262620368ff701aa534d47863e", # 76df24c released canonical
 ]
 
 @export_storage var _owned_environment: Environment
