@@ -8,7 +8,6 @@ class BlendField:
 	var value: Variant
 	var discrete: bool
 	var switch: bool
-	var module_key: Variant
 
 class BlendLayer:
 	extends RefCounted
@@ -25,7 +24,7 @@ class BlendProgram:
 
 ## Compile permissions, aliases and field metadata only when the profile changes.
 ## Slots replace nested schema/default dictionary lookups during camera motion.
-static func compile(prepared: Dictionary) -> BlendProgram:
+static func compile(prepared: Dictionary, enforce_schema: bool = true) -> BlendProgram:
 	var program := BlendProgram.new()
 	var context: Dictionary = prepared.context
 	var schema: Dictionary = context.get("schema", {})
@@ -42,7 +41,7 @@ static func compile(prepared: Dictionary) -> BlendProgram:
 			var ids = volume.profile.enabled_passes if enabled else volume.profile.disabled_passes
 			for pass_id in ids:
 				var key: Variant = aliases.get(int(pass_id), int(pass_id))
-				if int(schema.get(key, {}).get("enabled", {}).get("type", TYPE_NIL)) == TYPE_BOOL:
+				if not enforce_schema or int(schema.get(key, {}).get("enabled", {}).get("type", TYPE_NIL)) == TYPE_BOOL:
 					layer.switches[key] = enabled
 		var settings: Dictionary = prepared.settings[id]
 		for profile_key in settings:
@@ -52,7 +51,7 @@ static func compile(prepared: Dictionary) -> BlendProgram:
 			var fields: Dictionary = schema.get(module_key, {})
 			var module_slots: Dictionary = slots.get(module_key, {})
 			for key in settings[profile_key]:
-				if not fields.has(key):
+				if enforce_schema and not fields.has(key):
 					continue
 				if not module_slots.has(key):
 					module_slots[key] = program.defaults.size()
@@ -62,9 +61,9 @@ static func compile(prepared: Dictionary) -> BlendProgram:
 				var field := BlendField.new()
 				field.slot = module_slots[key]
 				field.value = settings[profile_key][key]
-				field.discrete = int(fields[key].get("hint", PROPERTY_HINT_NONE)) in [PROPERTY_HINT_ENUM, PROPERTY_HINT_FLAGS]
-				field.switch = key == "enabled" and int(fields[key].get("type", TYPE_NIL)) == TYPE_BOOL
-				field.module_key = module_key
+				var info: Dictionary = fields.get(key, {})
+				field.discrete = int(info.get("hint", PROPERTY_HINT_NONE)) in [PROPERTY_HINT_ENUM, PROPERTY_HINT_FLAGS]
+				field.switch = key == "enabled" and int(info.get("type", TYPE_NIL)) == TYPE_BOOL
 				layer.fields.append(field)
 			slots[module_key] = module_slots
 		program.layers.append(layer)
@@ -87,7 +86,7 @@ static func evaluate_compiled(program: BlendProgram, influences: Dictionary) -> 
 			values[field.slot] = value
 			touched[field.slot] = 1
 			if field.switch and value is bool:
-				states[field.module_key] = value
+				states[program.modules[field.slot]] = value
 	var parameters := {}
 	for slot in values.size():
 		if touched[slot] == 0:
@@ -110,45 +109,19 @@ static func ordered(volumes: Array) -> Array:
 
 ## Parameters and switches use one ordered sample of the same spatial influences.
 static func evaluate(volumes: Array, base: Dictionary, point: Vector3, schema: Dictionary = {}, aliases: Dictionary = {}, enforce_schema: bool = false, prepared: Dictionary = {}) -> Dictionary:
-	var result := {}
-	var states := {}
-	var ordered_volumes: Array = prepared.ordered if not prepared.is_empty() else ordered(volumes)
-	for volume in ordered_volumes:
-		var influence: float = prepared.influences[volume.get_instance_id()] if not prepared.is_empty() else volume.influence_at(point)
-		if influence <= 0.0:
-			continue
-		if influence >= 0.5:
-			for pass_id in volume.profile.disabled_passes:
-				var state_key: Variant = aliases.get(int(pass_id), int(pass_id))
-				if not enforce_schema or int(schema.get(state_key, {}).get("enabled", {}).get("type", TYPE_NIL)) == TYPE_BOOL:
-					states[state_key] = false
-			for pass_id in volume.profile.enabled_passes:
-				var state_key: Variant = aliases.get(int(pass_id), int(pass_id))
-				if not enforce_schema or int(schema.get(state_key, {}).get("enabled", {}).get("type", TYPE_NIL)) == TYPE_BOOL:
-					states[state_key] = true
-		var settings: Dictionary = prepared.settings[volume.get_instance_id()] if not prepared.is_empty() else volume.profile.get_parameters()
-		for profile_key in settings:
-			if not settings[profile_key] is Dictionary:
-				continue
-			var module_key: Variant = aliases.get(profile_key, profile_key)
-			var target: Dictionary = result.get(module_key, {})
-			var defaults: Dictionary = base.get(module_key, {})
-			for key in settings[profile_key]:
-				if enforce_schema and not schema.get(module_key, {}).has(key):
-					continue
-				var previous: Variant = target.get(key, defaults.get(key))
-				var next: Variant = settings[profile_key][key]
-				var info: Dictionary = schema.get(module_key, {}).get(key, {})
-				if int(info.get("hint", PROPERTY_HINT_NONE)) in [PROPERTY_HINT_ENUM, PROPERTY_HINT_FLAGS]:
-					target[key] = next if influence >= 0.5 else previous
-				else:
-					target[key] = blend(previous, next, influence)
-				# Only author-declared boolean fields can control scheduling.
-				if key == "enabled" and int(info.get("type", TYPE_NIL)) == TYPE_BOOL and target[key] is bool:
-					states[module_key] = target[key]
-			if not target.is_empty():
-				result[module_key] = target
-	return {"parameters": result, "pass_states": states}
+	var sample := prepared.duplicate()
+	sample.context = {"base": base, "schema": schema, "aliases": aliases}
+	if prepared.is_empty():
+		sample.ordered = ordered(volumes)
+		sample.settings = {}
+		sample.influences = {}
+		for volume in sample.ordered:
+			var id: int = volume.get_instance_id()
+			var influence: float = volume.influence_at(point)
+			sample.influences[id] = influence
+			if influence > 0.0:
+				sample.settings[id] = volume.profile.get_parameters()
+	return evaluate_compiled(compile(sample, enforce_schema), sample.influences)
 
 static func parameters(volumes: Array, base: Dictionary, point: Vector3, schema: Dictionary = {}, aliases: Dictionary = {}) -> Dictionary:
 	return evaluate(volumes, base, point, schema, aliases).parameters

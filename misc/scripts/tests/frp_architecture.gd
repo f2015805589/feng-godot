@@ -89,21 +89,28 @@ func run() -> void:
 	renderer.passes = entries
 	var compositor := Compositor.new()
 	var view := ViewState.new()
+	view.apply(compositor, renderer, {}, {source.get_parameter_key(): false})
+	assert(view._bindings[source].execution == null, "disabled views must not allocate executors")
 	view.apply(compositor, renderer, {}, {})
-	var executor: FengPass = view._executors[source]
+	var executor: FengPass = view._bindings[source].execution
 	assert(executor != source)
 	assert(executor.outputs[0].scale == Vector2.ONE)
+	view.apply(compositor, renderer, {}, {source.get_parameter_key(): false})
+	assert(not view._bindings[source].enabled and view._bindings[source].execution == executor)
+	view.apply(compositor, renderer, {}, {})
+	assert(view._bindings[source].enabled and view._bindings[source].execution == executor,
+			"disabling a view binding must keep its executor warm")
 	var revision := renderer.get_parameter_revision()
 	output.scale = Vector2(0.5, 0.5)
 	assert(renderer.get_parameter_revision() > revision, "output edits must invalidate the renderer's view snapshots")
 	view.apply(compositor, renderer, {}, {})
-	assert(view._executors[source] != executor)
-	assert(view._executors[source].outputs[0].scale == Vector2(0.5, 0.5))
+	assert(view._bindings[source].execution != executor)
+	assert(view._bindings[source].execution.outputs[0].scale == Vector2(0.5, 0.5))
 	revision = renderer.get_parameter_revision()
 	input.source = FengPassTexture.Source.DEPTH
 	assert(renderer.get_parameter_revision() > revision, "input edits must propagate attachment contract changes")
 	view.apply(compositor, renderer, {}, {})
-	assert(view._executors[source].inputs[0].source == FengPassTexture.Source.DEPTH)
+	assert(view._bindings[source].execution.inputs[0].source == FengPassTexture.Source.DEPTH)
 	revision = renderer.get_parameter_revision()
 	input.source = FengPassTexture.Source.DEPTH
 	output.scale = Vector2(0.5, 0.5)

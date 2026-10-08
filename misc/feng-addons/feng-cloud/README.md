@@ -82,6 +82,8 @@ In an isolated imported project containing Feng Cloud and FRP, use a rebuilt Fen
 /path/to/godot --path /path/to/project --rendering-method frp --rendering-driver vulkan --script res://addons/feng-cloud/tests/test_cloud_contract.gd -- --gpu
 ```
 
-The headless gate checks native atmosphere packet/LUT access and clearing. The GPU gate
-also checks pass-owned resources, cleanup and destruction. The dated parity report lists
-separate transport/image tests and the remaining cross-mode validation scope.
+The headless gate checks cloud selection, immutable publication, shared material-texture
+subscriptions and native atmosphere packet/LUT access. The GPU gate exercises all VRT
+attachment layouts, each mode-0 allocation failure, retry, resize, context loss, 14 shader
+variants, pass-owned cleanup and destruction. The dated parity report lists separate
+transport/image tests and the remaining cross-mode validation scope.

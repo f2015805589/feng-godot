@@ -43,7 +43,7 @@ PRT v3/v4 为不透明 `BaseMaterial3D` 发光表面保存独立传输，每个 
 - `FMagicGIVolume` 管理设置、布局匹配、异步烘焙和预览
 - `FMagicGIPlacement` 管理几何、布点和 BVH；`FMagicGIEmitterBakeSet` 管理发光面与面积采样；`FMagicGIEmitterBinding` 管理稳定键和签名；`FMagicGISceneTracker` 跟踪场景/资源变化
 - `FMagicGIBaker` 积分路径；`FMagicGIData` 验证持久化资源、组合发光响应并打包上传数据
-- `FMagicGIRuntime` 选择 Volume 并发布世界/视口快照；每个 `RuntimeState` 持有光照和发光缓存。warning getter 只读，显式诊断刷新更新警告
+- `FMagicGIRuntime` 选择 Volume 并发布世界/视口快照；每个 `RuntimeState` 只持有注册信息和独立的光照/发光对象；`FMagicGIEmission` 独占源参数、响应缓存和警告，诊断刷新不改写已发布响应。warning getter 只读
 - `FengMagicGIPass` 通过可选 Runtime 路径消费快照，管理 RD 纹理、UBO 和释放。Inspector/Viz 负责编辑器操作与预览
 
 `FMagicGIData` 保存世界空间位置/法线、布局、场景签名及查找索引。每个样本远场次级传输为 27 个 float，按系数优先、RGB 连续排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场图集每样本 7 个 RGBA32F texel；v4 primary SkyLight 可见性另存 9 个可能带正负号的标量系数，每样本用 3 个 RGBA32F texel 打包。几何图集每样本 2 个 texel；每网格单元含 8 个有符号 32 位样本索引。

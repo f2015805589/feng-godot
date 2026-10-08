@@ -1,21 +1,8 @@
-// Source page production: the worker side of the virtual texture.
-//
-// A page's payload - the three channels a material page carries - is assembled here from an
-// immutable `Snapshot` of the region maps, off the main thread, and handed back through `poll()`.
-// The workers never touch the scene, the terrain node or the renderer. What they may read is the
-// snapshot's own bytes, the far-field bake files on disk (read-only, through FileAccess) and the
-// decode caches below, which are shared between workers and therefore guarded by `_cache_mutex`.
-//
-// The queue's shape is documented on its members in the header - why the entries are a flat array,
-// why the claim order is a FIFO, and why the wanted set is an open-addressed table. This file is the
-// threading and the assembly around it: `retain` decides what may stay queued, `prime` fills the
-// window, `poll` hands a finished page to the demand pass, and `produce` with `load_cells` is the
-// assembly of one page.
-//
-// Indentation note: this pair of files was written with four spaces while every other file in this
-// directory uses tabs. It is normalized to tabs, so a multi-file edit keeps one convention; there is
-// no other change in that conversion.
+// Source workers assemble immutable region snapshots and read-only baked cells.
+// Queue state and shared decode caches have independent mutexes; scene and renderer
+// access stays outside the source workers.
 #include "terrain_3d_page_pipeline.h"
+#include "terrain_3d_data.h"
 #include "terrain_3d_vt_visibility.h"
 #include "terrain_vt_cell.h"
 #include <godot_cpp/classes/file_access.hpp>
@@ -167,16 +154,14 @@ Vector2 Terrain3DPagePipeline::Snapshot::bounds(const Rect2 &rect, Vector2 fallb
 // what decides how many pages a tick may hand over, and a pool deeper than the batch can feed
 // is throughput the batch is supposed to bound rather than a mechanism. Raising it to eight was
 // measured as a rate change, not a coverage change.
-static int default_page_workers() {
+int Terrain3DPagePipeline::default_worker_count() {
 	const unsigned int hardware = std::thread::hardware_concurrency();
 	const int threads = hardware > 0 ? int(hardware) : 4;
 	return CLAMP(threads / 2, 1, 4);
 }
 
-int Terrain3DPagePipeline::default_worker_count() { return default_page_workers(); }
-
 Terrain3DPagePipeline::Terrain3DPagePipeline(const int p_workers) {
-	const int workers = p_workers > 0 ? CLAMP(p_workers, 1, 16) : default_page_workers();
+	const int workers = p_workers > 0 ? CLAMP(p_workers, 1, 16) : default_worker_count();
 	_workers.reserve(size_t(workers));
 	for (int i = 0; i < workers; ++i) { _workers.emplace_back(&Terrain3DPagePipeline::run, this); }
 }
@@ -251,10 +236,11 @@ int Terrain3DPagePipeline::_count_claimable() const {
 	return count;
 }
 void Terrain3DPagePipeline::_erase_at(int p_index) {
-	_defer_result_release(_entries[size_t(p_index)].result);
-	_entries[size_t(p_index)] = std::move(_entries.back());
+	Entry &entry = _entries[size_t(p_index)];
+	if (!entry.running && !entry.ready) { _claimable_count.fetch_sub(1, std::memory_order_relaxed); }
+	_defer_result_release(entry.result);
+	if (size_t(p_index) + 1 != _entries.size()) { entry = std::move(_entries.back()); }
 	_entries.pop_back();
-	_claimable_count.store(_count_claimable(), std::memory_order_relaxed);
 }
 void Terrain3DPagePipeline::cancel(const Key &key) {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -266,39 +252,9 @@ void Terrain3DPagePipeline::discard(const Key &key) {
 	const int index = _index_of(key);
 	if (index >= 0 && _entries[size_t(index)].ready) { _erase_at(index); _stat_discarded.fetch_add(1, std::memory_order_relaxed); }
 }
-void Terrain3DPagePipeline::_lock_queue(std::unique_lock<std::mutex> &r_lock) {
-	// Deliberately a plain lock. Spinning for the queue before blocking was tried against the
-	// measurement that motivated it - `prime` reading 0.13 ms for a dozen inserts - and it made the
-	// reading no better: the spin does not shorten the wait, it *is* the wait, with the same
-	// magnitude as the wake latency it was meant to avoid (2000 `try_lock` calls is ~40 us). The
-	// queue is taken once per batch and the critical sections are microseconds; blocking on it is
-	// what the operating system already does well.
-	r_lock.lock();
-}
-// One queue slot is a prepared payload of a few hundred kilobytes, so the window stays at
-// 32 entries - but a slot must never be held by a result nobody is going to poll. Every
-// page whose slot the producer is already filling leaves its entry behind, and without
-// this the window fills with dead results and the workers run out of work to do.
-void Terrain3DPagePipeline::_make_room() {
-	if (int(_entries.size()) < _queue_limit.load(std::memory_order_relaxed)) { return; }
-	int oldest = -1;
-	for (size_t i = 0; i < _entries.size(); ++i) {
-		if (!_entries[i].ready) { continue; }
-		if (oldest < 0 || _entries[i].token < _entries[size_t(oldest)].token) { oldest = int(i); }
-	}
-	// Only a finished result is ever evicted, and a finished result is not claimable, so the
-	// claimable count does not move here.
-	if (oldest >= 0) {
-		_defer_result_release(_entries[size_t(oldest)].result);
-		_entries[size_t(oldest)] = std::move(_entries.back());
-		_entries.pop_back();
-		_stat_evicted.fetch_add(1, std::memory_order_relaxed);
-	}
-}
 void Terrain3DPagePipeline::retain(const std::vector<Request> &requests) {
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
-	std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
-	_lock_queue(lock);
+	std::unique_lock<std::mutex> lock(_mutex);
 	const uint64_t locked = Time::get_singleton()->get_ticks_usec();
 	// Build the wanted set as a flat open-addressed table keyed by the entry's own key, then ask
 	// each entry whether it is in it. The table is built in place and keeps its capacity, so a
@@ -306,48 +262,29 @@ void Terrain3DPagePipeline::retain(const std::vector<Request> &requests) {
 	// comparison needs on a hit.
 	size_t wanted = 16;
 	while (wanted < requests.size() * 2) { wanted <<= 1; }
-	if (wanted > _retain_capacity) {
-		_retain_capacity = wanted;
-		_retain_keys.resize(wanted);
-		_retain_slots.resize(wanted);
-	}
-	const size_t mask = _retain_capacity - 1;
-	std::fill(_retain_slots.begin(), _retain_slots.begin() + _retain_capacity, RETAIN_EMPTY);
+	if (wanted > _retain_slots.size()) { _retain_slots.resize(wanted); }
+	const size_t mask = _retain_slots.size() - 1;
+	std::fill(_retain_slots.begin(), _retain_slots.end(), RETAIN_EMPTY);
 	const KeyHash hash_key;
 	for (size_t i = 0; i < requests.size(); ++i) {
 		size_t at = hash_key(requests[i].key) & mask;
 		while (_retain_slots[at] != RETAIN_EMPTY) { at = (at + 1) & mask; }
 		_retain_slots[at] = uint32_t(i);
-		_retain_keys[at] = requests[i].key;
 	}
-	for (Entry &entry : _entries) {
+	for (int i = int(_entries.size()) - 1; i >= 0; --i) {
+		const Entry &entry = _entries[size_t(i)];
 		size_t at = hash_key(entry.request.key) & mask;
 		uint32_t index = RETAIN_EMPTY;
 		while (_retain_slots[at] != RETAIN_EMPTY) {
-			if (_retain_keys[at] == entry.request.key) { index = _retain_slots[at]; break; }
+			if (requests[_retain_slots[at]].key == entry.request.key) { index = _retain_slots[at]; break; }
 			at = (at + 1) & mask;
 		}
 		const Request *found = index == RETAIN_EMPTY ? nullptr : &requests[index];
-		entry.retained = found && found->rect == entry.request.rect &&
-				found->size == entry.request.size && found->border == entry.request.border;
+		if (!found || found->rect != entry.request.rect ||
+				found->size != entry.request.size || found->border != entry.request.border) {
+			_erase_at(i);
+		}
 	}
-	const uint64_t indexed = Time::get_singleton()->get_ticks_usec();
-	// The claimable count is settled once for the whole compaction rather than once per erase:
-	// `_erase_at` rescans the queue to recount, which is the same quadratic shape one level down.
-	for (int i = int(_entries.size()) - 1; i >= 0; --i) {
-		if (_entries[size_t(i)].retained) { continue; }
-		const size_t last = _entries.size() - 1;
-		// The dropped entry's prepared images go to the workers: this loop runs inside the queue's
-		// critical section, and destroying them here is what made one call of this function
-		// measure 0.67 ms while every other stage of the tick measured tens of microseconds.
-		_defer_result_release(_entries[size_t(i)].result);
-		// Not `_erase_at`: it moves the last entry onto itself when the entry being dropped is
-		// already the last one, and an entry that is being erased is the only place a damaged
-		// self-move could hide.
-		if (size_t(i) != last) { _entries[size_t(i)] = std::move(_entries[last]); }
-		_entries.pop_back();
-	}
-	_claimable_count.store(_count_claimable(), std::memory_order_relaxed);
 	const uint64_t finished = Time::get_singleton()->get_ticks_usec();
 	_retain_lock_us.store(locked - started, std::memory_order_relaxed);
 	_retain_index_us.store(finished - locked, std::memory_order_relaxed);
@@ -357,8 +294,7 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 	int wakes = 0;
 	const uint64_t started = Time::get_singleton()->get_ticks_usec();
 	{
-		std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
-		_lock_queue(lock);
+		std::unique_lock<std::mutex> lock(_mutex);
 		for (const Request &request : requests) {
 			if (_index_of(request.key) >= 0) { continue; }
 			// Retain already removed obsolete demand. A full batch contains work
@@ -372,7 +308,7 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 			_claim_order.push_back(request.key);
 			++inserted;
 		}
-		if (inserted > 0) { _claimable_count.store(_count_claimable(), std::memory_order_relaxed); }
+		if (inserted > 0) { _claimable_count.fetch_add(inserted, std::memory_order_relaxed); }
 		// A wake is a syscall and it is only useful for a worker that is parked. Waking one
 		// worker per entry added cost thirty-two of them on every demand pass, and the pass
 		// refills the queue on every tick whether or not anybody is asleep.
@@ -381,9 +317,7 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 	const uint64_t inserted_at = Time::get_singleton()->get_ticks_usec();
 	// Owed, not sent: `flush_wakes()` sends them when the pass that submitted this work is over.
 	if (wakes > 0) { _pending_wakes.fetch_add(wakes, std::memory_order_relaxed); }
-	const uint64_t woken_at = inserted_at;
 	_prime_insert_us.store(inserted_at - started, std::memory_order_relaxed);
-	_prime_wake_us.store(woken_at - inserted_at, std::memory_order_relaxed);
 	_prime_inserted.store(inserted, std::memory_order_relaxed);
 	_prime_wakes.store(wakes, std::memory_order_relaxed);
 }
@@ -400,8 +334,7 @@ Terrain3DPagePipeline::ReadyKeys Terrain3DPagePipeline::ready_keys() {
 }
 
 bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const Snapshot> source, Result &result) {
-	std::unique_lock<std::mutex> lock(_mutex, std::defer_lock);
-	_lock_queue(lock);
+	std::unique_lock<std::mutex> lock(_mutex);
 	const int index = _index_of(request.key);
 	if (index >= 0) {
 		Entry &entry = _entries[size_t(index)];
@@ -424,7 +357,7 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 		const uint64_t token = ++_token;
 		_entries.push_back(Entry{request, std::move(source), {}, token});
 		_claim_order.push_back(request.key);
-		_claimable_count.store(_count_claimable(), std::memory_order_relaxed);
+		_claimable_count.fetch_add(1, std::memory_order_relaxed);
 		if (_waiters > 0) { _pending_wakes.fetch_add(1, std::memory_order_relaxed); }
 	}
 	return false;
@@ -443,7 +376,7 @@ void Terrain3DPagePipeline::_drain_released() {
 
 // The stage itself: no lock, because only the demanding thread calls this and it is called from
 // inside the queue's own critical section. Publishing is `flush_releases()`.
-bool Terrain3DPagePipeline::_stage_release(const Ref<Image> &p_payload) {
+bool Terrain3DPagePipeline::defer_release(const Ref<Image> &p_payload) {
 	if (p_payload.is_null()) { return true; }
 	if (_release_staging.size() >= RELEASE_QUEUE_LIMIT) { return false; }
 	_release_staging.push_back(p_payload);
@@ -460,10 +393,6 @@ void Terrain3DPagePipeline::flush_releases() {
 	// queue, and a queue no worker drained is not allowed to grow.
 	_release_staging.clear();
 	_released_count.store(int(_released.size()), std::memory_order_relaxed);
-}
-
-bool Terrain3DPagePipeline::defer_release(const Ref<Image> &p_payload) {
-	return _stage_release(p_payload);
 }
 
 void Terrain3DPagePipeline::_defer_result_release(Result &r_result) {

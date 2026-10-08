@@ -1,15 +1,5 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The shared page pool's translation unit: format support, lifecycle, the slot allocator
-// (reserve / commit / abort), the reverse owner index, and page content access.
-//
-// Read terrain_3d_vt_page_pool.h first: it states the three contracts these functions rely on.
-// What is here is only the mechanics of them - the free list and slot recency, the per-slot arrays
-// that all have the pool's page count, and the counters the diagnostics report. The per-view
-// half is terrain_3d_virtual_texture.cpp, and this file calls into it in exactly one place: an
-// eviction invalidates the indirection entry that published the page, through
-// Terrain3DVirtualTexture::_invalidate_pool_owner() and the friendship declared on that class.
-
 #include "terrain_3d_vt_page_pool.h"
 
 #include "constants.h"
@@ -75,9 +65,6 @@ bool Terrain3DVTPagePool::initialize(const int p_page_size, const int p_page_bor
 	recency_counter = 0;
 	slot_used.assign(page_count, 0);
 	authored_pages.resize(page_count);
-	slot_protected.assign(page_count, 0);
-	slot_reserved.assign(page_count, 0);
-	slot_evict_on_commit.assign(page_count, 0);
 	slot_protect_refs.assign(page_count, 0);
 	slot_demand_epoch.assign(page_count, 0);
 	slot_owners.assign(page_count, std::vector<Terrain3DVTPageOwner>());
@@ -97,19 +84,16 @@ bool Terrain3DVTPagePool::grow(int p_count) {
 	if (!is_initialized() || p_count <= page_count) { return p_count == page_count; }
 	// The atlas is rebuilt from blank layers on the next write (`ensure_layers()`
 	// frees the RID and recreates every layer), so no resident page survives a
-	// resize. Drop residency explicitly: evict_slot() walks the reverse owner index
+	// resize. Drop residency explicitly: _evict_slot() walks the reverse owner index
 	// and clears each published indirection entry, which is what makes the demand
 	// passes re-produce these pages instead of sampling zeroed layers forever.
 	int released = 0;
 	for (uint32_t slot = 0; slot < uint32_t(page_count); ++slot) {
-		if (slot_used[slot]) { evict_slot(slot); ++released; }
+		if (slot_used[slot]) { _evict_slot(slot); ++released; }
 	}
 	slot_recency.assign(p_count, 0);
 	slot_used.resize(p_count, 0);
 	authored_pages.resize(p_count);
-	slot_protected.assign(p_count, 0);
-	slot_reserved.assign(p_count, 0);
-	slot_evict_on_commit.assign(p_count, 0);
 	slot_protect_refs.assign(p_count, 0);
 	slot_demand_epoch.assign(p_count, 0);
 	slot_owners.assign(p_count, std::vector<Terrain3DVTPageOwner>());
@@ -141,9 +125,6 @@ void Terrain3DVTPagePool::clear() {
 	slot_recency.clear();
 	slot_used.clear();
 	authored_pages.clear();
-	slot_protected.clear();
-	slot_reserved.clear();
-	slot_evict_on_commit.clear();
 	slot_protect_refs.clear();
 	slot_demand_epoch.clear();
 	demand_epoch = 0;
@@ -160,7 +141,7 @@ void Terrain3DVTPagePool::clear() {
 }
 
 ///////////////////////////
-// Slot reservation
+// Slot allocation
 ///////////////////////////
 
 void Terrain3DVTPagePool::touch_slot(const uint32_t p_slot) {
@@ -174,13 +155,11 @@ void Terrain3DVTPagePool::touch_slot(const uint32_t p_slot) {
 	slot_recency[p_slot] = ++recency_counter;
 }
 
-int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
-	(void)p_requester;
+int Terrain3DVTPagePool::acquire_slot() {
 	if (!is_initialized() || allocation_budget == 0) {
 		return -1;
 	}
 	uint32_t slot = INVALID_PHYSICAL_PAGE_SLOT;
-	bool evict_on_commit = false;
 	bool saw_reserved_victim = false;
 	if (!free_slots.empty()) {
 		slot = free_slots.back();
@@ -192,7 +171,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 		// are skipped on `slot_used` the same way stale list entries were.
 		uint64_t oldest_stamp = UINT64_MAX;
 		for (uint32_t candidate = 0; candidate < uint32_t(page_count); ++candidate) {
-			if (!slot_used[candidate] || slot_protected[candidate] || slot_reserved[candidate]) {
+			if (!slot_used[candidate] || slot_protect_refs[candidate]) {
 				continue;
 			}
 			// A page the addressing reserved is not a victim at any pressure. The fallback tier's
@@ -213,16 +192,10 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 					demand_epoch - slot_demand_epoch[candidate] <= 1) {
 				continue;
 			}
-			// The victim is only *chosen* here. Evicting it now would destroy a
-			// resident page even when the caller fails before publishing the
-			// replacement; commit_slot() makes it final.
 			if (slot_recency[candidate] < oldest_stamp) {
 				oldest_stamp = slot_recency[candidate];
 				slot = candidate;
 			}
-		}
-		if (slot != INVALID_PHYSICAL_PAGE_SLOT) {
-			evict_on_commit = true;
 		}
 		if (slot == INVALID_PHYSICAL_PAGE_SLOT) {
 			protected_block_count++;
@@ -230,12 +203,9 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 			return -1;
 		}
 	}
-	slot_reserved[slot] = 1;
-	slot_evict_on_commit[slot] = evict_on_commit ? 1 : 0;
-	if (!evict_on_commit) {
-		slot_used[slot] = 1;
-		touch_slot(slot);
-	}
+	_evict_slot(slot);
+	slot_used[slot] = 1;
+	touch_slot(slot);
 	alloc_count++;
 	if (allocation_budget > 0) {
 		allocation_budget--;
@@ -243,49 +213,7 @@ int Terrain3DVTPagePool::acquire_slot(Terrain3DVirtualTexture *p_requester) {
 	return int(slot);
 }
 
-void Terrain3DVTPagePool::commit_slot(const uint32_t p_slot) {
-	if (p_slot >= uint32_t(page_count) || !slot_reserved[p_slot]) {
-		return;
-	}
-	const bool evict_victim = slot_evict_on_commit[p_slot] != 0;
-	slot_reserved[p_slot] = 0;
-	slot_evict_on_commit[p_slot] = 0;
-	if (!evict_victim) {
-		return;
-	}
-	// The replacement is published (or about to be), so the page this slot used to serve
-	// can go. evict_slot() invalidates exactly the owners that still name this slot and
-	// leaves it free; take it for the new page in the same step.
-	evict_slot(p_slot);
-	slot_used[p_slot] = 1;
-	touch_slot(p_slot);
-}
-
-void Terrain3DVTPagePool::abort_slot(const uint32_t p_slot) {
-	if (p_slot >= uint32_t(page_count) || !slot_reserved[p_slot]) {
-		return;
-	}
-	const bool evict_victim = slot_evict_on_commit[p_slot] != 0;
-	slot_reserved[p_slot] = 0;
-	slot_evict_on_commit[p_slot] = 0;
-	if (!evict_victim) {
-		// A slot taken from the free list simply goes back to it.
-		authored_pages[p_slot].unref();
-		slot_used[p_slot] = 0;
-		slot_protected[p_slot] = 0;
-		slot_protect_refs[p_slot] = 0;
-		slot_demand_epoch[p_slot] = 0;
-		free_slots.push_back(p_slot);
-	}
-	// Nothing was produced by this acquisition, so the counters go back too. The victim's
-	// content, owners and indirection entries were never touched.
-	alloc_count = MAX(0, alloc_count - 1);
-	if (allocation_budget > 0) {
-		allocation_budget++;
-	}
-}
-
-void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {
+void Terrain3DVTPagePool::_evict_slot(const uint32_t p_slot) {
 	if (p_slot >= uint32_t(page_count) || !slot_used[p_slot]) {
 		return;
 	}
@@ -293,8 +221,7 @@ void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {
 	// for a no-op eviction would invalidate the callers' "nothing changed since this
 	// revision" fast paths for nothing.
 	++residency_revision;
-	const std::vector<Terrain3DVTPageOwner> owners = slot_owners[p_slot];
-	for (const Terrain3DVTPageOwner &owner : owners) {
+	for (const Terrain3DVTPageOwner &owner : slot_owners[p_slot]) {
 		if (owner.texture) {
 			owner.texture->_invalidate_pool_owner(p_slot, owner);
 		}
@@ -303,6 +230,15 @@ void Terrain3DVTPagePool::evict_slot(const uint32_t p_slot) {
 	authored_pages[p_slot].unref();
 	slot_used[p_slot] = 0;
 	evict_count++;
+}
+
+void Terrain3DVTPagePool::_release_slot(const uint32_t p_slot) {
+	if (!slot_used[p_slot]) { return; }
+	authored_pages[p_slot].unref();
+	slot_used[p_slot] = 0;
+	slot_protect_refs[p_slot] = 0;
+	slot_demand_epoch[p_slot] = 0;
+	free_slots.push_back(p_slot);
 }
 
 ///////////////////////////
@@ -338,14 +274,7 @@ bool Terrain3DVTPagePool::remove_owner(const uint32_t p_slot,
 		if (it->texture == p_texture && it->virtual_x == p_virtual_x &&
 				it->virtual_y == p_virtual_y && it->mip == p_mip) {
 			owners.erase(it);
-			if (owners.empty() && slot_used[p_slot]) {
-				authored_pages[p_slot].unref();
-				slot_used[p_slot] = 0;
-				slot_protected[p_slot] = 0;
-				slot_protect_refs[p_slot] = 0;
-				slot_demand_epoch[p_slot] = 0;
-				free_slots.push_back(p_slot);
-			}
+			if (owners.empty()) { _release_slot(p_slot); }
 			return true;
 		}
 	}
@@ -383,17 +312,7 @@ void Terrain3DVTPagePool::detach_texture(Terrain3DVirtualTexture *p_texture) {
 				[p_texture](const Terrain3DVTPageOwner &owner) {
 					return owner.texture == p_texture;
 				}), owners.end());
-		if (owners.empty() && slot_used[slot]) {
-			// Unref the authored page with the slot. Leaving it behind would let a
-			// later read upload the previous owner's raw IDs into whichever page
-			// takes this slot next.
-			authored_pages[slot].unref();
-			slot_used[slot] = 0;
-			slot_protected[slot] = 0;
-			slot_protect_refs[slot] = 0;
-			slot_demand_epoch[slot] = 0;
-			free_slots.push_back(slot);
-		}
+		if (owners.empty()) { _release_slot(slot); }
 	}
 }
 

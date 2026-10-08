@@ -10,21 +10,20 @@ var keys := PackedStringArray()
 var static_signatures := PackedInt64Array()
 var groups: Array[Dictionary] = []
 var error_message := ""
-var _key_to_index: Dictionary = {}
 
 func clear() -> void:
 	keys.clear()
 	static_signatures.clear()
 	groups.clear()
 	error_message = ""
-	_key_to_index.clear()
 
 func register_surface(root: Node, node: MeshInstance3D, surface: int,
 		material: BaseMaterial3D, uv1: PackedVector2Array, uv2: PackedVector2Array,
 		vertex_count: int) -> int:
 	var key := Binding.make_key(root, node, surface)
-	if _key_to_index.has(key):
-		return int(_key_to_index[key])
+	var existing := keys.find(key)
+	if existing >= 0:
+		return existing
 	if keys.size() >= Data.MAX_EMITTERS:
 		error_message = "PRT supports at most %d emissive surface bindings per volume." % Data.MAX_EMITTERS
 		return -1
@@ -51,9 +50,6 @@ func register_surface(root: Node, node: MeshInstance3D, surface: int,
 	keys.append(key)
 	static_signatures.append(signature)
 	groups.append({
-		"key": key,
-		"material": material,
-		"texture": texture,
 		"texture_image": texture_image,
 		"use_uv2": use_uv2,
 		"uv_scale": material.uv2_scale if use_uv2 else material.uv1_scale,
@@ -64,7 +60,6 @@ func register_surface(root: Node, node: MeshInstance3D, surface: int,
 		"area": 0.0,
 		"triangles": []
 	})
-	_key_to_index[key] = index
 	return index
 
 func append_triangle(emitter_index: int, a: Vector3, b: Vector3, c: Vector3,
@@ -79,13 +74,11 @@ func append_triangle(emitter_index: int, a: Vector3, b: Vector3, c: Vector3,
 	source["area"] = float(source["area"]) + area
 	var source_triangles: Array = source["triangles"]
 	source_triangles.append({
-		"a": a, "b": b, "c": c, "normal": normal, "area": area,
+		"a": a, "b": b, "c": c, "normal": normal,
 		"cumulative_area": source["area"],
 		"uv1_a": uv1_a, "uv1_b": uv1_b, "uv1_c": uv1_c,
 		"uv2_a": uv2_a, "uv2_b": uv2_b, "uv2_c": uv2_c
 	})
-	source["triangles"] = source_triangles
-	groups[emitter_index] = source
 
 ## Uniform-area next-event sample for one fixed emissive surface binding.
 ## Returns the geometric estimator weight and texture sample, but no live color.

@@ -190,3 +190,22 @@ static func _unique_warnings(warnings: PackedStringArray) -> PackedStringArray:
 		seen[warning] = true
 		result.append(warning)
 	return result
+
+static func with_bloom_eye_order_warning(passes: Array, warnings: PackedStringArray, is_enabled_fn: Callable) -> PackedStringArray:
+	var eye_index := -1
+	var bloom_index := -1
+	var eye_enabled := false
+	var bloom_enabled := false
+	for i in passes.size():
+		var pass_entry: FengPass = passes[i]
+		if pass_entry == null:
+			continue
+		if pass_entry.stable_id == &"library:eye_adaptation":
+			eye_index = i
+			eye_enabled = is_enabled_fn.call(pass_entry)
+		elif pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_BLOOM:
+			bloom_index = i
+			bloom_enabled = is_enabled_fn.call(pass_entry)
+	if eye_enabled and bloom_enabled and eye_index > bloom_index:
+		warnings.append("Eye Adaptation must precede native Bloom; authored order was retained and the previous valid schedule remains active.")
+	return warnings

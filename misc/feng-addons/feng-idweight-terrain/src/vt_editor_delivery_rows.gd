@@ -1,21 +1,11 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# The delivery matrix of the Surface VT editor: two distance bands by two channel groups, one
-# OptionButton a cell, and the hint that spells out what the four choices mean together.
-#
-# The cells are not a second copy of the native rule. `get_vt_settings()` publishes
-# `delivery_supported` - the methods this build can deliver for each group - and
-# `delivery_unsupported`, the sentence for each one it cannot, so an option with no arm behind it is
-# disabled with the setter's own words as its tooltip, and the setter refuses the same pair. A write
-# the setter refuses leaves the cell where it was: the refresh after it re-reads the cells rather
-# than the widget's own selection, so a method that was somehow chosen while disabled snaps back to
-# the one the terrain actually holds instead of showing a value nothing stored.
+# Two distance bands by two channel groups. Native capabilities determine enabled
+# choices; refresh reads accepted values back after each property write.
 @tool
 class_name TerrainVTEditorDeliveryRows
 extends RefCounted
 
-# The delivery methods in the order of the native `TerrainVT::Delivery` enum, which is also the
-# item id the OptionButtons store: the widget, the property and the C++ value are one number, so a
-# method added natively appears here as one more string and no mapping has to be kept in step.
+# Item IDs match TerrainVT::Delivery.
 const DELIVERY_METHODS: Array[String] = ["Direct (pure RVT)", "AVT", "Clipmap", "SVT"]
 const DELIVERY_BANDS: Array[String] = ["near", "far"]
 const DELIVERY_GROUPS: Array[String] = ["material", "height"]
@@ -23,16 +13,13 @@ const DELIVERY_GROUP_LABELS: Dictionary = {"material": "Diffuse + normal", "heig
 
 ## The terrain the cells read and write. The window owns it and hands it over on every refresh.
 var terrain: Object
-## The one sentence under the grid, which the window keeps a reference to as `delivery_hint`.
+## Explanation of the current delivery capabilities.
 var hint: Label
 ## The window's own refresh after a cell was written, so an edit re-reads the panel it changed.
 var changed: Callable
 
-## A cell's widget by band and group. The window aliases the four into the members its own tests and
-## its own layout read (`delivery_near_material` and so on), so the grid has one owner either way.
+## Cell widgets keyed by band and channel group.
 var rows: Dictionary = {}
-## True while this grid writes its own selection, so the write does not bounce straight back.
-var _updating: bool = false
 
 
 func build(p_panel: VBoxContainer) -> void:
@@ -65,15 +52,11 @@ func option(p_band: String, p_group: String) -> OptionButton:
 	return rows.get("%s_%s" % [p_band, p_group], null)
 
 
-# Reads the four cells from the settings dictionary the native side publishes rather than from four
-# separate getters: one call, one snapshot, and a widget cannot show a state the rest of the panel
-# was not read with. A native build that predates the matrix has no keys and no property, and the
-# rows disable themselves instead of offering a choice the build cannot honour.
+# Refresh all cells from one settings report. Missing native properties disable the grid.
 func refresh(p_settings: Dictionary) -> void:
 	var supported := TerrainVTBridge.has_property(terrain, &"vt_delivery_near_material")
 	var allowed: Dictionary = p_settings.get("delivery_supported", {})
 	var refused: Dictionary = p_settings.get("delivery_unsupported", {})
-	_updating = true
 	for band in DELIVERY_BANDS:
 		for group in DELIVERY_GROUPS:
 			var cell := option(band, group)
@@ -87,14 +70,11 @@ func refresh(p_settings: Dictionary) -> void:
 			var index := cell.get_item_index(value)
 			if index >= 0:
 				cell.select(index)
-	_updating = false
 	if hint != null:
 		hint.text = _hint_text(refused)
 
 
-# Disables the items this build cannot deliver for the group, with the setter's own sentence as the
-# tooltip. A build that publishes no `delivery_supported` key (an older binary) keeps every item
-# enabled: the grid has nothing to say about it then, and the setter remains the authority.
+# Missing capability keys leave validation to the native setter.
 func _apply_availability(p_option: OptionButton, p_group: String, p_allowed: Dictionary, p_refused: Dictionary) -> void:
 	if not p_allowed.has(p_group):
 		return
@@ -122,11 +102,9 @@ func _hint_text(p_refused: Dictionary) -> String:
 	return text
 
 
-# One cell written. The property is the cell's own name, so the widget, the property and the native
-# value stay one number; the write goes through the terrain's setter, which is what refuses a pair
-# this build cannot deliver.
+# Cell names match native properties; setters validate supported combinations.
 func select(p_index: int, p_band: String, p_group: String) -> void:
-	if _updating or terrain == null or not is_instance_valid(terrain):
+	if terrain == null or not is_instance_valid(terrain):
 		return
 	var cell := option(p_band, p_group)
 	if cell == null or p_index < 0 or p_index >= cell.item_count:

@@ -64,7 +64,7 @@ A later table can supersede an earlier inference. In particular, overlap counter
 establish level instability, and ring ceilings were not proof that the ring limited actual
 throughput. Timings are fixture wall-time observations, not general CPU/GPU guarantees.
 
-### 7.2 Three motion profiles, and a correction
+### Motion profiles
 
 | Profile | The far field's own demand | The shared pool | A fixed distant point |
 | --- | --- | --- | --- |
@@ -72,14 +72,14 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | Teleport walk (85 m per frame) | arrivals; `served` falls back coarser | grows | `4>5`, `3>5` |
 | Cruise (3.33 m per frame) | **about one miss per frame** (`miss` 58 -> 324 over 300 frames), 97% hit rate | **churns**: `alloc` 151 -> 1825, `evict` 516, `free` 210 -> 0, `pool_gen` 1, peak `fade_active` 136 | at the end **`3>8` and `4>8`** |
 
-### 7.4 Attribution (measured)
+### Demand counters
 
 | View | Its own hits | Its own misses | Reading |
 | --- | --- | --- | --- |
 | Far field, `get_surface_svt()` | 9675 | 324 | 97% hit rate: it asks for a page, and usually finds it already published |
 | Near field, `get_surface_vt()` | **0** | **1636** | not a hit rate at all - see below |
 
-### 7.4 Attribution (measured)
+### Near/far pool attribution
 
 | 100 cruise frames | Near field on (phase C) | Near field off (phase D) |
 | --- | --- | --- |
@@ -88,7 +88,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | `evict` | 189 and 252 | **4** |
 | The far field's own `miss` | about 65 per leg | **11** |
 
-### 7.5 The reproduced defect: a saturated plan and a thrashing pool
+### Plan saturation and residency
 
 | Reading | Value | What it means |
 | --- | --- | --- |
@@ -101,7 +101,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | Pages mid-fade | `fade_active` **90-100 continuously** | About a hundred pages are ramping at all times, which is what a visitor sees as pages updating in the distance |
 | The far field | served level collapses to `2>8`, `3>8`, `4>8` | Kilometre-scale pages answering points whose rule wants mip 2-4 |
 
-### 7.6 The mechanism: the plan's unsampled pages take the residency its sampled pages need
+### Plan composition
 
 | Part | Pages | Note |
 | --- | --- | --- |
@@ -113,9 +113,9 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | Producer waits | `avt_slot_wait = 0`, `avt_source_wait = 0`, `avt_denied = 0`, `avt_mip_bias = 0` | **the producer is not blocked by anything** |
 | The pool | `free = 0`; `alloc` and `evict` both advance by about **6 a frame, equal** | every production takes an LRU victim, and there is no victim to spare |
 
-### 7.7.1 The demand-aware split, measured and rejected
+### Demand-aware budget split
 
-| Reading | Even split, rate term (7.7.2) | Demand-aware split (`avt_allowance=14`) | Change |
+| Reading | Even split with rate-limited plan tail | Demand-aware split (`avt_allowance=14`) | Change |
 | --- | --- | --- | --- |
 | `avt_missing` peak | 91 | 82 | -10% |
 | `n_miss` (near-field misses, whole run) | 3588 | **5053** | **+41%** |
@@ -125,9 +125,9 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | `fade_active` | 88 | 90 (peaks 159) | worse |
 | far field served | `3>8`, `4>8` | `3>8`, `4>8` | unchanged |
 
-### 7.7.2 The rate term, landed
+### Rate-limited plan tail
 
-| Reading | Baseline (section 7.5) | With the rate term | Change |
+| Reading | Saturated-plan baseline | With the rate term | Change |
 | --- | --- | --- | --- |
 | Plan size, peak | 384 (its whole budget) | **202** | -47% |
 | Pages the image never samples | ~237 | **56** (`avt_apron` 28 + `avt_retained_reqs` 28) | -76% |
@@ -140,7 +140,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | `free` at the end | 0 | 0 | unchanged |
 | far field served | `2>8`, `3>8`, `4>8` | `3>8`, `4>8` | marginal |
 
-### 7.7.3 P0e: what the churn is, measured
+### Churn counters
 
 | Counter | Meaning |
 | --- | --- |
@@ -151,7 +151,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | `plan_new_sector` | no page of that owner was in the previous plan at all. |
 | `plan_dropped` | the other direction: addresses the previous plan named that this one does not. |
 
-### 7.7.3 P0e: what the churn is, measured
+### Churn by generation
 
 | Generation | New addresses | Capacity | `avt_missing` |
 | --- | --- | --- | --- |
@@ -163,7 +163,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | cruise 4 (`sel` 144) | **110** | ~50 | **80** |
 | cruise 4 (`sel` 128) | 37 | ~50 | 20 |
 
-### 7.7.10 Step 2 closed structurally: this renderer cannot preserve a page across its own capacity change
+### Capacity growth comparison
 
 | Reading at "F settled" | `auto_capacity=true` | `false` | Change |
 | --- | --- | --- | --- |
@@ -176,7 +176,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | `max_mip`, `root_page_world` before phase G | 9, 16384 | 9, 16384 | unchanged |
 | `served_level_changes` (whole run) | 52 | 48 | -4 |
 
-### 7.7.11 The shared page budget: the ceiling came off, and what the rate actually buys
+### Page budget comparison
 
 | Reading | 16 | 32 | 64 |
 | --- | --- | --- | --- |
@@ -192,7 +192,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | plan size `avt_sel` | 144 | 172 | 191 |
 | worst far-field pass `svt_worst_ms` | 236.9 | 307.3 | 291.7 |
 
-### 7.7.12 What the rate actually is: the ring is the ceiling, and the producer sits under it
+### Encoder admission and observed rate
 
 | Reading | 16 | 32 | 64 |
 | --- | --- | --- | --- |
@@ -205,7 +205,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | near field `n_miss` | 4457 | 6490 | 6846 |
 | far field `miss` | 481 | 356 | 318 |
 
-### 7.7.13 Three fixes: the ring's allocation, the rate ceiling, and the root pyramid's one-pass scan
+### Root probing and ring allocation
 
 | Reading | before | after |
 | --- | --- | --- |
@@ -222,7 +222,7 @@ throughput. Timings are fixture wall-time observations, not general CPU/GPU guar
 | pool `alloc` / `evict` / `free` at the end | 172 / 0 / 852 | 172 / 0 / 852 |
 | session pages per frame at a budget of 16 | 7.55 | 7.56 |
 
-### 7.7.14 The near field's reach default moved from 512 m to 384 m
+### Near-field reach
 
 | Reading | 512 | 384 | 256 |
 | --- | --- | --- | --- |

@@ -1,13 +1,6 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# CDLOD settings panel of the Surface VT editor.
-#
-# CDLOD is terrain geometry, not virtual texturing, so nothing here talks about
-# pages: one toggle, the LOD distance scale, and the backend label that says which
-# geometry the terrain is actually drawing. The window owns the container and when
-# the panel is on screen; this owns the controls inside it.
-#
-# The extension is loaded at runtime, so every read is guarded: a build without
-# get_cdlod_stats() predates CDLOD and must say so rather than break the panel.
+# Owns CDLOD controls and backend status; the VT window owns the panel container.
+# Missing native CDLOD support is displayed as unavailable.
 @tool
 class_name TerrainVTEditorCdlodPanel
 extends RefCounted

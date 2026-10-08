@@ -96,10 +96,10 @@ page dimensions reduces that extent. Read the editor's bounds and actual resolve
 
 ## Physical residency and readiness
 
-Both paged fields share slots, LRU and protection. Acquisition reserves a free slot or
-selects a victim; commit replaces ownership and invalidates the victim's still-matching
-reverse entries. Abort preserves the old page. Reserved/protected pages are excluded
-from eviction; demand epochs preserve currently sampled work.
+Both paged fields share slots, LRU and pin counts. After address validation, allocation
+and page-table publication run synchronously on the scene thread. Reusing a slot clears
+the previous owners' still-matching entries before publishing its new owner. Pinned and
+coarse-reserved pages are excluded from eviction; demand epochs protect sampled work.
 
 Mappings and ready content are distinct. A mapped slot can still be queued, encoding or
 invalidated. Demand checks producer readiness, retries stale production and verifies the

@@ -37,11 +37,8 @@ var align_normals_checkbox: CheckBox
 var resize_toggle_checkbox: CheckBox
 var resize_option_box: SpinBox
 var height_channel: Array[Button]
-var height_channel_selected: int = 0
 var roughness_channel: Array[Button]
-var roughness_channel_selected: int = 0
 var occlusion_channel: Array[Button]
-var occlusion_channel_selected: int = 0
 var last_opened_directory: String
 var last_saved_directory: String
 var packing_albedo: bool = false
@@ -113,20 +110,6 @@ func pack_textures_popup() -> void:
 		window.get_node("%AOChannelA") as Button
 	]
 	
-	height_channel[0].pressed.connect(func() -> void: height_channel_selected = 0)
-	height_channel[1].pressed.connect(func() -> void: height_channel_selected = 1)
-	height_channel[2].pressed.connect(func() -> void: height_channel_selected = 2)
-	height_channel[3].pressed.connect(func() -> void: height_channel_selected = 3)
-	
-	roughness_channel[0].pressed.connect(func() -> void: roughness_channel_selected = 0)
-	roughness_channel[1].pressed.connect(func() -> void: roughness_channel_selected = 1)
-	roughness_channel[2].pressed.connect(func() -> void: roughness_channel_selected = 2)
-	roughness_channel[3].pressed.connect(func() -> void: roughness_channel_selected = 3)
-	
-	occlusion_channel[0].pressed.connect(func() -> void: occlusion_channel_selected = 0)
-	occlusion_channel[1].pressed.connect(func() -> void: occlusion_channel_selected = 1)
-	occlusion_channel[2].pressed.connect(func() -> void: occlusion_channel_selected = 2)
-	occlusion_channel[3].pressed.connect(func() -> void: occlusion_channel_selected = 3)
 	
 	plugin.add_child(window)
 	_init_file_dialogs()
@@ -193,21 +176,15 @@ func _init_texture_picker(p_parent: Node, p_image_index: int) -> void:
 			Image.USED_CHANNELS_LA, Image.USED_CHANNELS_RG: channel_count = 2
 			Image.USED_CHANNELS_RGB: channel_count = 3
 			Image.USED_CHANNELS_RGBA: channel_count = 4
-		if p_image_index == IMAGE_HEIGHT:
-			for i in 4:
-				height_channel[i].visible = i < channel_count
-			height_channel[0].button_pressed = true
-			height_channel[0].pressed.emit()
-		elif p_image_index == IMAGE_ROUGHNESS:
-			for i in 4:
-				roughness_channel[i].visible = i < channel_count
-			roughness_channel[0].button_pressed = true
-			roughness_channel[0].pressed.emit()
-		elif p_image_index == IMAGE_AO:
-			for i in 4:
-				occlusion_channel[i].visible = i < channel_count
-			occlusion_channel[0].button_pressed = true
-			occlusion_channel[0].pressed.emit()
+		var channels: Array[Button] = {
+			IMAGE_HEIGHT: height_channel,
+			IMAGE_ROUGHNESS: roughness_channel,
+			IMAGE_AO: occlusion_channel,
+		}.get(p_image_index, [])
+		for i in channels.size():
+			channels[i].visible = i < channel_count
+		if not channels.is_empty():
+			channels[0].button_pressed = true
 	
 	var load_image_fn: Callable = func(path: String):
 		var image: Image = Image.new()
@@ -370,16 +347,20 @@ func _on_pack_button_pressed() -> void:
 		save_file_dialog.popup_centered_ratio()
 
 
+func _selected_channel(p_channels: Array[Button]) -> int:
+	return p_channels.find(p_channels[0].button_group.get_pressed_button())
+
+
 func _on_save_file_selected(p_dst_path) -> void:
 	last_saved_directory = p_dst_path.get_base_dir() + "/"
 	var error: int
 	if packing_albedo:
 		error = _pack_textures(images[IMAGE_ALBEDO], images[IMAGE_HEIGHT], null, p_dst_path, false,
-		invert_height_checkbox.button_pressed, false, normalize_height_checkbox.button_pressed, height_channel_selected)
+		invert_height_checkbox.button_pressed, false, normalize_height_checkbox.button_pressed, _selected_channel(height_channel))
 	else:
 		error = _pack_textures(images[IMAGE_NORMAL], images[IMAGE_ROUGHNESS], images[IMAGE_AO], p_dst_path,
 			invert_green_checkbox.button_pressed, invert_smooth_checkbox.button_pressed,
-			align_normals_checkbox.button_pressed, false, roughness_channel_selected, occlusion_channel_selected)
+			align_normals_checkbox.button_pressed, false, _selected_channel(roughness_channel), _selected_channel(occlusion_channel))
 	
 	if error == OK:
 		EditorInterface.get_resource_filesystem().scan()

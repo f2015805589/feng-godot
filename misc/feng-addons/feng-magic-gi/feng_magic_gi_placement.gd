@@ -32,15 +32,12 @@ var scene_signature := 0
 var error_message := ""
 var bvh_ready := false
 
-var _cells: Dictionary = {}
 var _spatial_hash: Dictionary = {}
 var _cell_counts: Dictionary = {}
 var _occlusion_volumes: Array[Dictionary] = []
-var _occlusion_instance_ids: Dictionary = {}
 var _volume: Node3D
 var _world: World3D
 var _collect_emission := false
-var _bounds: AABB
 var _world_bounds: AABB
 var _bake_world_bounds: AABB
 var _inverse := Transform3D.IDENTITY
@@ -48,7 +45,6 @@ var _dimensions := Vector3i.ONE
 var _material_cache: Dictionary = {}
 var _candidate_count := 0
 var _terrain_work := 0
-var _triangle_count := 0
 var _triangle_reflectance: Vector3
 var _triangle_emitter_index := -1
 var _triangle_source_id := 0
@@ -68,8 +64,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_emitter_set = EmitterBakeSet.new()
 	_inverse = volume.global_transform.affine_inverse()
 	_dimensions = volume.grid_dimensions()
-	_bounds = AABB(-volume.size * 0.5, volume.size)
-	_world_bounds = volume.global_transform * _bounds
+	_world_bounds = volume.global_transform * AABB(-volume.size * 0.5, volume.size)
 	# Preview must include geometry that can intersect the short surface-offset
 	# segment, even before a bake exists. Bake collection already has the wider
 	# ray-tracing bounds and therefore also contains this local occupancy region.
@@ -86,15 +81,12 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	emitter_groups.clear()
 	positions.clear()
 	normals.clear()
-	_cells.clear()
 	_spatial_hash.clear()
 	_cell_counts.clear()
 	_occlusion_volumes.clear()
-	_occlusion_instance_ids.clear()
 	_material_cache.clear()
 	_candidate_count = 0
 	_terrain_work = 0
-	_triangle_count = 0
 	_triangle_emitter_index = -1
 	_triangle_source_id = 0
 	_triangle_surface_index = -1
@@ -111,7 +103,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 		error_message = "Lookup grid exceeds the supported 64 cells per axis."
 		return false
 	_scene_root = SceneTracker.scene_root(volume)
-	_collect_node(_scene_root, for_bake)
+	_collect_node(_scene_root)
 	if not error_message.is_empty():
 		return false
 	# Build once after all faces are collected. Placement filtering and the baker
@@ -124,13 +116,12 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			error_message = "Godot could not create the static PRT triangle BVH."
 			return false
 	if not _sample_collected_geometry():
+		positions.clear()
+		normals.clear()
 		return false
 	if not build_bvh:
 		bvh = null
 		bvh_ready = false
-	for entry in _cells.values():
-		positions.append(entry.position)
-		normals.append(entry.normal)
 	emitter_keys = _emitter_set.keys
 	emitter_static_signatures = _emitter_set.static_signatures
 	emitter_groups = _emitter_set.groups
@@ -166,7 +157,7 @@ func _sample_collected_geometry() -> bool:
 				return false
 	return true
 
-func _collect_node(node: Node, for_bake: bool) -> void:
+func _collect_node(node: Node) -> void:
 	if not error_message.is_empty():
 		return
 	# A nested SubViewport with its own World3D is a hard scene boundary. Geometry
@@ -174,15 +165,15 @@ func _collect_node(node: Node, for_bake: bool) -> void:
 	if SceneTracker.should_skip_world_boundary(node, _scene_root, _world):
 		return
 	if node is MeshInstance3D and node.mesh != null and node.is_visible_in_tree():
-		_collect_mesh(node, for_bake)
+		_collect_mesh(node)
 	elif node.is_class("Terrain3D") and node.get("data") != null and node.is_visible_in_tree():
-		_collect_terrain(node, for_bake)
+		_collect_terrain(node)
 	for child in node.get_children():
-		_collect_node(child, for_bake)
+		_collect_node(child)
 		if not error_message.is_empty():
 			return
 
-func _collect_mesh(node: MeshInstance3D, for_bake: bool) -> void:
+func _collect_mesh(node: MeshInstance3D) -> void:
 	var mesh: Mesh = node.mesh
 	var mesh_world_box: AABB = node.global_transform * mesh.get_aabb()
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(_bake_world_bounds.grow(BROADPHASE_EPSILON)):
@@ -191,29 +182,26 @@ func _collect_mesh(node: MeshInstance3D, for_bake: bool) -> void:
 	if mesh is PrimitiveMesh:
 		var arrays: Array = mesh.get_mesh_arrays()
 		if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
-			_collect_primitive_surface(node, mesh, arrays, for_bake)
+			_collect_surface_triangles(node, 0, arrays, mesh)
 			return
-		_collect_faces_only_mesh(node, mesh, for_bake)
+		_collect_faces_only_mesh(node, mesh)
 		return
 	if not mesh is ArrayMesh:
 		if mesh.get_surface_count() > 1:
 			error_message = "Non-ArrayMesh resources with multiple material surfaces cannot provide per-face reflectance."
 			return
-		_collect_faces_only_mesh(node, mesh, for_bake)
+		_collect_faces_only_mesh(node, mesh)
 		return
 	for surface in mesh.get_surface_count():
 		if mesh.surface_get_primitive_type(surface) != Mesh.PRIMITIVE_TRIANGLES:
 			continue
 		var arrays := mesh.surface_get_arrays(surface)
-		_collect_array_surface(node, surface, arrays, for_bake)
+		_collect_surface_triangles(node, surface, arrays)
 		if not error_message.is_empty():
 			return
 
 func _register_occlusion_volume(node: MeshInstance3D, mesh: Mesh, mesh_world_box: AABB) -> void:
 	var instance_id := node.get_instance_id()
-	if _occlusion_instance_ids.has(instance_id):
-		return
-	_occlusion_instance_ids[instance_id] = true
 	var placement_box := _world_bounds.grow(float(_volume.surface_offset) + BROADPHASE_EPSILON)
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(placement_box):
 		return
@@ -277,7 +265,7 @@ func _mesh_faces_are_watertight(local_faces: PackedVector3Array) -> bool:
 			return false # Boundary and non-manifold edges are not closed solids.
 	return true
 
-func _collect_faces_only_mesh(node: MeshInstance3D, mesh: Mesh, for_bake: bool) -> void:
+func _collect_faces_only_mesh(node: MeshInstance3D, mesh: Mesh) -> void:
 	var primitive_faces: PackedVector3Array = mesh.get_faces()
 	if primitive_faces.is_empty():
 		return
@@ -292,18 +280,11 @@ func _collect_faces_only_mesh(node: MeshInstance3D, mesh: Mesh, for_bake: bool) 
 		var a: Vector3 = node.global_transform * primitive_faces[i]
 		var b: Vector3 = node.global_transform * primitive_faces[i + 1]
 		var c: Vector3 = node.global_transform * primitive_faces[i + 2]
-		if not _triangle(a, b, c, for_bake):
+		if not _triangle(a, b, c):
 			return
 
-func _collect_primitive_surface(node: MeshInstance3D, mesh: PrimitiveMesh,
-		arrays: Array, for_bake: bool) -> void:
-	_collect_surface_triangles(node, 0, arrays, for_bake, mesh)
-
-func _collect_array_surface(node: MeshInstance3D, surface: int, arrays: Array, for_bake: bool) -> void:
-	_collect_surface_triangles(node, surface, arrays, for_bake)
-
 func _collect_surface_triangles(node: MeshInstance3D, surface: int, arrays: Array,
-		for_bake: bool, primitive_mesh: PrimitiveMesh = null) -> void:
+		primitive_mesh: PrimitiveMesh = null) -> void:
 	if arrays.is_empty() or arrays[Mesh.ARRAY_VERTEX] == null:
 		return
 	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
@@ -336,7 +317,7 @@ func _collect_surface_triangles(node: MeshInstance3D, surface: int, arrays: Arra
 		var t2a := uv2[ia] if uv2.size() == vertices.size() else Vector2.ZERO
 		var t2b := uv2[ib] if uv2.size() == vertices.size() else Vector2.ZERO
 		var t2c := uv2[ic] if uv2.size() == vertices.size() else Vector2.ZERO
-		if not _triangle(a, b, c, for_bake, ta, tb, tc, t2a, t2b, t2c):
+		if not _triangle(a, b, c, ta, tb, tc, t2a, t2b, t2c):
 			return
 
 func _prepare_surface(node: MeshInstance3D, surface: int,
@@ -371,7 +352,7 @@ func _material_reflectance(material: Material) -> Vector3:
 		_material_cache[material] = color
 	return color
 
-func _collect_terrain(terrain: Node3D, for_bake: bool) -> void:
+func _collect_terrain(terrain: Node3D) -> void:
 	_triangle_emitter_index = -1
 	_triangle_source_id = terrain.get_instance_id()
 	_triangle_surface_index = -1
@@ -413,10 +394,10 @@ func _collect_terrain(terrain: Node3D, for_bake: bool) -> void:
 			var c := Vector3(start.x + x * step, h01, start.y + (z + 1) * step)
 			var d := Vector3(start.x + (x + 1) * step, h11, start.y + (z + 1) * step)
 			_triangle_reflectance = color
-			if not _triangle(a, b, c, for_bake) or not _triangle(b, d, c, for_bake):
+			if not _triangle(a, b, c) or not _triangle(b, d, c):
 				return
 
-func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool,
+func _triangle(a: Vector3, b: Vector3, c: Vector3,
 		uv1_a := Vector2.ZERO, uv1_b := Vector2.ZERO, uv1_c := Vector2.ZERO,
 		uv2_a := Vector2.ZERO, uv2_b := Vector2.ZERO, uv2_c := Vector2.ZERO) -> bool:
 	var triangle_box := AABB(a, Vector3.ZERO).expand(b).expand(c)
@@ -425,8 +406,7 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3, for_bake: bool,
 	var normal := (c - a).cross(b - a).normalized() # Godot triangle surfaces use clockwise front faces.
 	if normal.length_squared() < 0.5:
 		return true
-	_triangle_count += 1
-	if _triangle_count > MAX_GEOMETRY_TRIANGLES:
+	if reflectance.size() >= MAX_GEOMETRY_TRIANGLES:
 		error_message = "PRT geometry exceeds the 250,000-triangle sampling/signature budget."
 		return false
 	faces.append_array([a, b, c])
@@ -510,7 +490,7 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 	if count >= Data.CELL_CAPACITY:
 		error_message = "More than 8 surface samples occupy one lookup cell; increase Probe Spacing or reduce surface detail."
 		return
-	if _cells.size() >= MAX_PROBES:
+	if positions.size() >= MAX_PROBES:
 		error_message = "Surface sampling exceeds the 65,536-probe limit; increase Probe Spacing or reduce the volume."
 		return
 	_cell_counts[cell_key] = count + 1
@@ -523,7 +503,8 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 	var bucket: Array = _spatial_hash.get(hash_cell, [])
 	bucket.append(point_entry)
 	_spatial_hash[hash_cell] = bucket
-	_cells[_cells.size()] = {"position": probe_center, "normal": normal}
+	positions.append(probe_center)
+	normals.append(normal)
 
 func _surfaces_are_duplicate(surface: Vector3, normal: Vector3,
 		existing: Dictionary, min_separation: float) -> bool:

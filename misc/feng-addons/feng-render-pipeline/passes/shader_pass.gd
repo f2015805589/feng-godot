@@ -15,12 +15,11 @@ const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 	set(value):
 		if shader_file == value:
 			return
-		if _observed_shader_file != null and _observed_shader_file.changed.is_connected(_on_shader_file_changed):
-			_observed_shader_file.changed.disconnect(_on_shader_file_changed)
+		if shader_file != null and shader_file.changed.is_connected(_on_shader_file_changed):
+			shader_file.changed.disconnect(_on_shader_file_changed)
 		shader_file = value
-		_observed_shader_file = shader_file
-		if _observed_shader_file != null and not _observed_shader_file.changed.is_connected(_on_shader_file_changed):
-			_observed_shader_file.changed.connect(_on_shader_file_changed)
+		if shader_file != null and not shader_file.changed.is_connected(_on_shader_file_changed):
+			shader_file.changed.connect(_on_shader_file_changed)
 		emit_changed()
 @export var mode: Mode = Mode.COMPUTE:
 	set(value):
@@ -75,7 +74,6 @@ var _compute_pipeline := RID()
 var _sampler := RID()
 var _spirv: RDShaderSPIRV
 var _shader_resource: RDShaderFile
-var _observed_shader_file: RDShaderFile
 var _shader_mode := -1
 var _keyword_signature := ""
 var _raster_pipelines := {}

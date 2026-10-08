@@ -264,8 +264,8 @@ func check_dock_order() -> void:
 	# refreshes it.
 	window.call("open_vt_page_view")
 	await process_frame
-	var height_row: OptionButton = window.delivery_near_height
-	var material_row: OptionButton = window.delivery_near_material
+	var height_row: OptionButton = window._delivery.option("near", "height")
+	var material_row: OptionButton = window._delivery.option("near", "material")
 	require(height_row != null and material_row != null, "the window has no delivery rows for both groups")
 	if height_row == null or material_row == null:
 		return

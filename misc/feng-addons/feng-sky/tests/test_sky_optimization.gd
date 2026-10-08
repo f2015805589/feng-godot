@@ -42,15 +42,15 @@ func sample_columns(image: Image, point: Vector3, direction: Vector3, settings: 
 
 func lut_transmittance(image: Image, point: Vector3, direction: Vector3, settings: Dictionary) -> Vector3:
 	var radius: float = settings["planet_radius_km"]
-	if Runtime._ray_hits_ground(point, direction, radius):
+	if Transport.ray_hits_ground(point, direction, radius):
 		return Vector3.ZERO
 	if not OpticalLut.supports_settings(settings):
-		if Runtime._sphere_exit_distance(point, direction, radius + float(settings["atmosphere_height_km"])) <= 0.0:
+		if Transport.sphere_exit_distance(point, direction, radius + float(settings["atmosphere_height_km"])) <= 0.0:
 			return Vector3.ONE
 		return Transport.transmittance_to_sun(point, direction, settings)
 	var columns := sample_columns(image, point, direction, settings)
 	var depth: Vector3 = settings["rayleigh_scattering_per_km"] * columns.x + settings["mie_extinction_coefficients"] * columns.y + settings["absorption_extinction_per_km"] * columns.z
-	return Runtime._exp_negative(depth)
+	return Transport.exp_negative(depth)
 
 
 func test_lut() -> void:
@@ -97,7 +97,7 @@ func test_lut() -> void:
 				var actual := lut_transmittance(image, point, direction, settings)
 				# An outward ray exactly on the atmosphere boundary traverses vacuum.
 				# The old helper returns zero for that zero-length path; the LUT fixes it.
-				if Runtime._sphere_exit_distance(point, direction, radius + height) <= 0.0 and not Runtime._ray_hits_ground(point, direction, radius):
+				if Transport.sphere_exit_distance(point, direction, radius + height) <= 0.0 and not Transport.ray_hits_ground(point, direction, radius):
 					reference = Vector3.ONE
 				var error := (actual - reference).abs().max_axis_index()
 				var absolute_error := (actual - reference).abs()[error]
@@ -119,7 +119,7 @@ func integrate_view(image: Image, settings: Dictionary, origin: Vector3, view: V
 	var radius: float = settings["planet_radius_km"]
 	var top := radius + float(settings["atmosphere_height_km"])
 	var ray_origin := origin
-	var path := Runtime._sphere_exit_distance(origin, view, top)
+	var path := Transport.sphere_exit_distance(origin, view, top)
 	if origin.length() > top:
 		var b := origin.dot(view)
 		var discriminant := b * b - (origin.length_squared() - top * top)
@@ -163,8 +163,8 @@ func integrate_view(image: Image, settings: Dictionary, origin: Vector3, view: V
 			sun_trans = Transport.transmittance_to_sun(point, sun, settings)
 		var source := beta * (rayleigh_density * rayleigh_phase) + (settings["mie_scattering_coefficients"] as Vector3) * (mie_density * mie_phase)
 		var extinction := beta * rayleigh_density + (settings["mie_extinction_coefficients"] as Vector3) * mie_density + (settings["absorption_extinction_per_km"] as Vector3) * Transport.absorption_density(altitude, settings)
-		radiance += transmission * sun_trans * source * Runtime._view_segment_factor(extinction, segment)
-		transmission *= Runtime._exp_negative(extinction * segment)
+		radiance += transmission * sun_trans * source * Transport.view_segment_factor(extinction, segment)
+		transmission *= Transport.exp_negative(extinction * segment)
 	return radiance
 
 
@@ -277,8 +277,11 @@ func test_dirty_updates() -> void:
 
 
 class SnapshotProvider extends RefCounted:
+	var active := true
 	func _feng_sky_rendering_is_active(_world_id: int) -> bool:
-		return true
+		return active
+	func _feng_sky_runtime_is_active(_world_id: int) -> bool:
+		return active
 
 
 func test_snapshot_copy_boundary() -> void:
@@ -299,7 +302,20 @@ func test_snapshot_copy_boundary() -> void:
 	Runtime.publish_rendering_snapshot(provider, world_id, {})
 	require(Runtime.rendering_snapshot_for_world(world_id)["render_targets"].is_empty(),
 		"an omitted render-target list must retain its empty default")
+	var replacement := SnapshotProvider.new()
+	Runtime.publish_rendering_snapshot(replacement, world_id, input)
+	Runtime.publish_snapshot(replacement, world_id, input)
 	Runtime.remove_rendering_snapshot(provider, world_id)
+	Runtime.remove_snapshot(provider, world_id)
+	require(Runtime.rendering_snapshot_for_world(world_id).get("provider_id") == replacement.get_instance_id()
+		and Runtime.snapshot_for_world(world_id).get("provider_id") == replacement.get_instance_id(), "Prior owner removed its replacement's snapshots")
+	replacement.active = false
+	require(Runtime.rendering_snapshot_for_world(world_id).is_empty() and Runtime.rendering_snapshots().is_empty()
+		and Runtime.snapshot_for_world(world_id).is_empty(), "Inactive ownership retained atmosphere publications")
+	Runtime.publish_rendering_snapshot(replacement, world_id, input)
+	Runtime.publish_snapshot(replacement, world_id, input)
+	replacement = null
+	require(Runtime.rendering_snapshot_for_world(world_id).is_empty() and Runtime.snapshot_for_world(world_id).is_empty(), "Snapshot records retained expired providers")
 
 
 func run() -> void:

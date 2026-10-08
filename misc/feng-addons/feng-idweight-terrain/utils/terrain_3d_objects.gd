@@ -24,7 +24,6 @@ var _undo_redo = null
 var _terrain_id: int
 var _observed_terrain_data = null
 var _offsets: Dictionary # Object ID -> Vector3(X, Y offset relative to terrain height, Z)
-var _child_transform_callbacks: Dictionary = {}
 var _ignore_transform_change: bool = false
 
 
@@ -49,7 +48,6 @@ func _exit_tree() -> void:
 	
 	for child in get_children():
 		_on_child_exiting_tree(child)
-	_child_transform_callbacks.clear()
 
 
 # Called by the plugin once, with itself: transform tracking registers its changes
@@ -122,13 +120,11 @@ func _on_child_entered_tree(p_node: Node) -> void:
 
 
 func _setup_child_signal(p_node: Node, helper: TransformChangedNotifier) -> void:
-	if not is_instance_valid(p_node) or not p_node.is_inside_tree():
+	if not is_instance_valid(p_node) or p_node.get_parent() != self or not p_node.is_inside_tree():
 		return
-	var child_id := p_node.get_instance_id()
-	var callback: Callable = _child_transform_callbacks.get(child_id, Callable())
-	if not callback.is_valid():
-		callback = _on_child_transform_changed.bind(p_node)
-		_child_transform_callbacks[child_id] = callback
+	if not is_instance_valid(helper) or helper.is_queued_for_deletion():
+		return
+	var callback := _on_child_transform_changed.bind(p_node)
 	if not helper.transform_changed.is_connected(callback):
 		helper.transform_changed.connect(callback)
 	_update_child_offset(p_node)
@@ -137,17 +133,14 @@ func _setup_child_signal(p_node: Node, helper: TransformChangedNotifier) -> void
 func _on_child_exiting_tree(p_node: Node) -> void:
 	if not p_node is Node3D:
 		return
-	var child_id := p_node.get_instance_id()
-	
 	var helper: TransformChangedNotifier = p_node.get_node_or_null(CHILD_HELPER_PATH)
 	if helper:
-		var callback: Callable = _child_transform_callbacks.get(child_id, _on_child_transform_changed.bind(p_node))
+		var callback := _on_child_transform_changed.bind(p_node)
 		if helper.transform_changed.is_connected(callback):
 			helper.transform_changed.disconnect(callback)
 		p_node.remove_child(helper)
 		helper.queue_free()
 	
-	_child_transform_callbacks.erase(child_id)
 	_offsets.erase(p_node.get_instance_id())
 
 

@@ -9,9 +9,6 @@ const VIEWPORT_SCAN_MSEC := 1000
 ## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
-# One per-volume entry owns its weak reference, lighting calculator, emission
-# helper/cache, data identity, and diagnostic state. Viewports and publication
-# are service-wide concerns and remain separate.
 static var _registry: Dictionary = {}
 static var _emission_revision_sequence := 0
 static var _publish_sequence := 0
@@ -39,7 +36,6 @@ static func register(volume: FMagicGIVolume) -> void:
 		_registry[id] = state
 		_publish_sequence += 1
 		state.published_sequence = _publish_sequence
-		state.data_key = ""
 	register_viewport(volume.get_viewport(), volume)
 
 static func unregister(volume: FMagicGIVolume) -> void:
@@ -98,7 +94,7 @@ static func emission_warning(volume: FMagicGIVolume) -> String:
 	if volume == null or not is_instance_valid(volume):
 		return ""
 	var state: RuntimeState = _registry.get(volume.get_instance_id())
-	return state.emission_warning if state != null else ""
+	return state.emission.warning if state != null else ""
 
 ## Refreshes warnings for a volume that may not currently be selected for a
 ## viewport. This explicit, throttled path keeps configuration warnings useful
@@ -116,9 +112,9 @@ static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
 			return # The selected volume's warning was refreshed by _publish().
 	_mutex.unlock()
 	if not volume.has_usable_bake():
-		state.emission_warning = ""
+		state.emission.warning = ""
 		return
-	state.refresh_emission_diagnostics(volume, volume.bake_data)
+	state.emission.read_source_values(volume, volume.bake_data)
 
 static func _refresh_viewports() -> void:
 	var worlds := _snapshot_worlds()
@@ -149,35 +145,33 @@ static func _publish() -> void:
 			_registry.erase(id)
 			continue
 		if not volume.is_inside_tree():
-			state.emission_warning = ""
+			state.emission.warning = ""
 			continue
 		if not volume.enabled:
 			continue
 		if not volume.has_usable_bake():
-			state.emission_warning = ""
+			state.emission.warning = ""
 			continue
 		var world := volume.get_world_3d()
 		if world == null:
 			continue
 		var world_id := world.get_instance_id()
-		if not selected.has(world_id) or state.published_sequence > int(selected[world_id].sequence):
-			selected[world_id] = {"volume": volume, "state": state,
-					"sequence": state.published_sequence, "id": id, "world": world}
+		if not selected.has(world_id) or state.published_sequence > selected[world_id].published_sequence:
+			selected[world_id] = state
 	var result: Array[Dictionary] = []
 	for world_id in selected.keys():
-		var entry: Dictionary = selected[world_id]
-		var volume: FMagicGIVolume = entry.volume
-		var state: RuntimeState = entry.state
-		var id: int = entry.id
+		var state: RuntimeState = selected[world_id]
+		var volume := state.get_volume()
+		var id := volume.get_instance_id()
 		var data := volume.bake_data
 		var bake_version: int = data.bake_version
 		var cache_key := "%d:%d" % [id, bake_version]
 		var lighting_sets: Dictionary = state.lighting.coefficient_sets(volume)
 		var replacement_enabled := data.format_version == Data.FORMAT_VERSION \
 				and volume.has_bake()
-		if state.update_emission_snapshot(volume, data, bake_version):
+		if state.emission.update_snapshot(volume, data):
 			_emission_revision_sequence += 1
-			state.emission_revision = _emission_revision_sequence
+			state.emission.revision = _emission_revision_sequence
 		result.append({
 			"data": data,
 			"version": bake_version,
@@ -186,12 +180,12 @@ static func _publish() -> void:
 			"lighting": lighting_sets.get("lighting", PackedFloat32Array()),
 			"sky_lighting": lighting_sets.get("sky_lighting", PackedFloat32Array()),
 			"replacement_enabled": replacement_enabled,
-			"emission_payload": state.emission_payload,
-			"emission_revision": state.emission_revision,
-			"emission_identity": state.emission_identity,
+			"emission_payload": state.emission.payload,
+			"emission_revision": state.emission.revision,
+			"emission_identity": state.emission.identity,
 			"world_id": world_id,
 			"volume_id": id,
-			"render_targets": _render_targets(entry.world),
+			"render_targets": _render_targets(volume.get_world_3d()),
 		})
 	_mutex.lock()
 	_snapshots = result

@@ -5,6 +5,7 @@ extends RefCounted
 ## radiance is published separately from the combined secondary lighting.
 
 const Data = preload("feng_magic_gi_data.gd")
+const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const SKY_LIGHT_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_light_runtime.gd"
 const SCENE_SCAN_MSEC := 500
 
@@ -13,10 +14,7 @@ var _world: World3D
 var _next_scan := 0
 var _lighting_signature := 0
 var _sky_sh := PackedFloat32Array()
-var _sky_light_signature: Array = []
 var _cached_result := PackedFloat32Array()
-var _cached_sky_result := PackedFloat32Array()
-var _result_dirty := true
 var _sky_light_runtime: Script
 
 
@@ -37,7 +35,6 @@ func coefficient_sets(volume: Node3D) -> Dictionary:
 	if world != _world or now >= _next_scan:
 		_scan_scene(volume)
 		_next_scan = now + SCENE_SCAN_MSEC
-		_result_dirty = true
 
 	var lights: Array[DirectionalLight3D] = []
 	var explicit_light: Variant = volume.get("sun")
@@ -47,15 +44,12 @@ func coefficient_sets(volume: Node3D) -> Dictionary:
 		lights = _lights
 	var physical_units := bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false))
 	var current_lighting_signature := hash([_source_fingerprint(lights, world), physical_units])
-	if current_lighting_signature != _lighting_signature:
-		_lighting_signature = current_lighting_signature
-		_result_dirty = true
-	if _refresh_sky_light(world):
-		_result_dirty = true
-	if not _result_dirty:
-		return {"lighting": _cached_result, "sky_lighting": _cached_sky_result}
+	var sky_only := _read_sky_light(world)
+	if current_lighting_signature == _lighting_signature and sky_only == _sky_sh and not _cached_result.is_empty():
+		return {"lighting": _cached_result, "sky_lighting": _sky_sh}
+	_lighting_signature = current_lighting_signature
+	_sky_sh = sky_only
 
-	var sky_only := _sky_sh if _sky_sh.size() == 27 else _zero_sh()
 	var result := PackedFloat32Array()
 	result.resize(27)
 	for light in lights:
@@ -82,44 +76,21 @@ func coefficient_sets(volume: Node3D) -> Dictionary:
 	for i in 27:
 		result[i] += sky_only[i]
 	_cached_result = result
-	_cached_sky_result = sky_only
-	_result_dirty = false
-	return {"lighting": _cached_result, "sky_lighting": _cached_sky_result}
+	return {"lighting": _cached_result, "sky_lighting": _sky_sh}
 
-func _refresh_sky_light(world: World3D) -> bool:
-	var sky_light: Dictionary = {}
+func _read_sky_light(world: World3D) -> PackedFloat32Array:
 	if _sky_light_runtime != null and world != null:
 		var snapshot: Variant = _sky_light_runtime.call("snapshot_for_world", world.get_instance_id())
-		if snapshot is Dictionary:
-			sky_light = snapshot
-	var coefficients: Variant = sky_light.get("radiance_sh", PackedFloat32Array())
-	var ready: bool = bool(sky_light.get("ready", false)) \
-			and coefficients is PackedFloat32Array and coefficients.size() == 27
-	var signature: Array = []
-	var next_sky_sh := _zero_sh()
-	if ready:
-		signature = [
-			int(sky_light.get("provider_id", 0)),
-			int(sky_light.get("source_revision", -1)),
-			int(sky_light.get("source_mode", -1)),
-			float(sky_light.get("captured_exposure", 1.0)),
-			float(sky_light.get("energy", 1.0)),
-			sky_light.get("rotation", Basis.IDENTITY),
-		]
-		next_sky_sh = coefficients
-	if signature == _sky_light_signature and next_sky_sh == _sky_sh:
-		return false
-	_sky_light_signature = signature
-	_sky_sh = next_sky_sh
-	return true
+		if snapshot is Dictionary and bool(snapshot.get("ready", false)):
+			var coefficients: Variant = snapshot.get("radiance_sh")
+			if coefficients is PackedFloat32Array and coefficients.size() == 27:
+				return coefficients
+	return _zero_sh()
 
 func _scan_scene(volume: Node3D) -> void:
 	_lights.clear()
 	_world = volume.get_world_3d()
-	var root: Node = volume
-	while root.get_parent() != null and not root.get_parent() is Viewport:
-		root = root.get_parent()
-	_scan(root, _world)
+	_scan(SceneTracker.scene_root(volume), _world)
 
 func _scan(node: Node, world: World3D) -> void:
 	if node is Viewport and node.find_world_3d() != world:

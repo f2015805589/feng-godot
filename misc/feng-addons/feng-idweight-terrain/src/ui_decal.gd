@@ -1,17 +1,7 @@
 @tool
 extends Node
-## The editor's cursor decal.
-##
-## Owns every shader parameter that draws the brush cursor: the cursor quad itself,
-## its brush/reticle texture, the two gradient markers, the fade-out after the mouse
-## stops, and the region directory preview the region tool overlays on the terrain
-## material. Nothing here decides *which* tool is active - the host `Terrain3DUI`
-## keeps owning tool, brush and pointer state, and this node turns that state into
-## one `update_decal()` pass.
-##
-## `ui.gd` creates this as a child and forwards `update_decal()` / `hide_decal()` /
-## `set_decal_rotation()`, because the editor plugin and `Terrain3DEditor` reach the
-## decal through the UI node.
+## Owns brush/reticle and gradient-marker shader state, cursor fading and the
+## temporary region-directory texture. Terrain3DUI supplies tool and pointer state.
 
 # Cursor colours per tool and operation. See docs/ for the role colours.
 const COLOR_RAISE := Color(1., 1., 1.) # White
@@ -51,17 +41,12 @@ var editor_decal_part: Array[bool] = [true, true] # Decal[0] cursor components: 
 var editor_decal_timer: Timer
 # The region tool draws a flat quad, so it samples a 1x1 white brush texture.
 var region_texture: ImageTexture
-# The shader samples the chunk -> layer directory as a texture, not a uniform int
-# array. The region tool preview writes a negative "dummy" slot for the hovered
-# chunk, which needs its own texture: the directory Terrain3DData owns must stay
-# pristine. Reused so a mouse move costs one 64 KB texel update, not an allocation.
+# The region tool uses a private directory texture for its negative dummy slot.
+# Reuse it for mouse-motion updates; the terrain's live directory stays untouched.
 var region_preview_texture: ImageTexture
 var editor_decal_fade: float :
 	set(value):
-		# This assignment is the property's storage, not a re-entry: in Godot 4 an assignment to the
-		# property inside its own setter writes the backing field directly, so `update_decal()` setting
-		# the fade from the cursor colour, and the timer's tween fading it to 0, both run this body
-		# exactly once. A separate backer variable is not needed.
+		# Godot setters write their backing field directly; the tween uses this same path.
 		editor_decal_fade = value
 		if editor_decal_color.size() > 0:
 			editor_decal_color[0].a = value

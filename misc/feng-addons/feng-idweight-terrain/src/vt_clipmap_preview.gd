@@ -1,40 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-#
-# The clipmap's debug view: what the one delivery holds, where it holds it, and which units it is
-# still producing. One control with two hosts - the Inspector's Surface VT / VT Page section and the
-# Surface VT window's VT Page view - because it is a picture of the layer rather than of either
-# window.
-#
-# **It draws nothing, and asks for nothing, while no layer exists.** The native preview refuses a
-# terrain with no layer, so a view that kept asking would spend a call per interval to be told there is
-# no layout; this one asks for one boolean instead (`has_vt_clipmap_layer()`) and hides itself. That
-# boolean is cheap enough to keep polling while the view is hidden - a layer can be built while a
-# section is folded - and the expensive `get_clipmap_layout_preview()` call waits for visibility,
-# which is the rule the AVT preview follows for its scan.
-#
-# The gate is "is there a layer" rather than "does a cell select the method", and in a build that
-# cannot deliver Clipmap for any group the two are the same answer for a user: no cell may name the
-# method, so no layer exists and this view never appears. A layer built to measure the mechanism
-# (`Terrain3D::debug_update_vt_clipmap()`, which is what the native suites drive) is a layer this view
-# draws, because a picture of a layer is a picture of the layer that exists - not of the setting that
-# asked for it.
-#
-# The view follows the *implementation* the delivery has selected (`vt_clipmap_implementation`), not a
-# fixed storage: the LOD level array and the packed block atlas are two pictures of the same layer, and
-# `get_clipmap_layout_preview()` reports which one it is. Both pictures are drawn over the *same*
-# coverage plot, because density and reach belong to the shared ladder rather than to either storage -
-# that plot is what says whether the units actually cover the distances the focus needs.
-#
-# The LOD picture answers the two questions the level array raises, and neither half replaces the
-# other:
-#   * the *level strip* is the layer assembled from units: one square per level, each cut into
-#     the texel blocks it is addressed in, coloured by level and drawn solid only while the level is
-#     valid. It is the same readable picture whatever the ratio between the coarsest and the finest
-#     level is - and that ratio is `2^levels`, which no single world map can show.
-#   * the *map* is where those levels stand in the world. Every level's square is snapped to its own
-#     texel size, so a level that is current sits on the focus and one that still holds the level it
-#     replaces is offset from it by what it has not produced; the rects still queued are drawn on top,
-#     because the strips a moving focus has just cost are the only part of the layer that changes.
+# Shared Inspector/window Clipmap preview. Availability follows the live layer;
+# layout reads run only while visible. LOD shows level blocks and world coverage;
+# Atlas shows packed rects and per-unit 3x3 cells. Both include the density ladder.
 @tool
 extends "res://addons/feng-idweight-terrain/src/vt_layout_preview.gd"
 
@@ -45,13 +12,9 @@ const STRIP_LABEL := 11.0
 const STRIP_GAP := 6.0
 const LEGEND_LINE := 11.0
 const MIN_HEIGHT := 330.0
-## How many blocks a level's square is cut into, at most. The step is `ceil(size / this)`, so a
-## 256-texel level draws 16-texel blocks; a per-texel grid would be a quarter of a million rectangles
-## an axis on a 4096-texel level.
+## Bound the grid to 16 blocks per axis, using ceil(size / limit) texels per block.
 const MAX_BLOCKS_PER_AXIS := 16
-## Levels drawn in the strip. The shipped ladder is eleven units (1024 -> 1 texels a metre) and the
-## palette below has a colour for each, so the whole ladder is drawn rather than the first eight: a
-## picture that stopped at eight could not show the 1 texel/m outer unit the ladder is measured by.
+## Draw the full shipped eleven-unit ladder within this twelve-colour palette.
 const MAX_SCHEMATIC_LEVELS := 12
 const LEVEL_PALETTE: Array[Color] = [
 	Color("55d6be"), Color("5cc8ef"), Color("6f9df5"), Color("8d7cf2"),
@@ -62,10 +25,7 @@ const VALID_FILL_ALPHA := 0.16
 const INVALID_FILL_ALPHA := 0.05
 const BLOCK_LINE_ALPHA := 0.35
 const PENDING_COLOR := Color("ff9f43")
-## The atlas view's own constants. The atlas is drawn as two squares: the *region* - every rect the
-## packer placed, at its real position and size in the texture - and the *grid* - each unit's own 3x3
-## arrangement of blocks, coloured by the unit that owns each one and marked with the atlas index it
-## reads this frame. The user asked for exactly this: "the debug should show the atlas's region".
+## Atlas panels show packed texture rects and each unit's current-frame cell indices.
 const ATLAS_GAP := 10.0
 const GLOBAL_COLOR := Color("f3d28a")
 const SPARE_ALPHA := 0.45
@@ -78,9 +38,7 @@ const DENSITY_GAP := 8.0
 const AXIS_COLOR := Color("3b4b56")
 
 var _snapshot: Dictionary = {}
-## The layer entry the picture is of, which is the first entry `get_clipmap_layout_preview()` returns.
-## A terrain may carry a layer for each channel group, but a debug view is a picture of one thing, and
-## the first entry is the group the report lists first.
+## The first non-empty channel layer in the native preview report.
 var _layer: Dictionary = {}
 var _status := ""
 
@@ -125,17 +83,13 @@ func _process(_p_delta: float) -> void:
 
 
 func _gate(p_terrain: Object) -> bool:
-	# A terrain that cannot answer is not gated: the layer's existence is what says a view has something
-	# to draw, and a stub (or a build that predates the query) has nothing to conclude from. The real
-	# terrain always has the method, so the gate is exact where it matters.
+	# Older native builds without the availability query remain eligible for preview.
 	if not p_terrain.has_method("has_vt_clipmap_layer"):
 		return true
 	return bool(p_terrain.call("has_vt_clipmap_layer"))
 
 
-# One payload, one layer: the preview reports every layer that exists, and the drawing is of the first
-# entry. Which *storage* that layer uses is the entry's own `implementation` / `impl["storage"]`, so the
-# picture is chosen from the payload rather than from a second question that could disagree with it.
+# The first layer's implementation selects the drawing from the same payload.
 func _refresh_preview(p_terrain: Object) -> void:
 	var layout: Dictionary = {}
 	if p_terrain.has_method("get_clipmap_layout_preview"):
@@ -246,9 +200,7 @@ func _draw_lod(p_font: Font, p_font_size: int, p_text_color: Color) -> void:
 	_draw_legend(Vector2(MAP_MARGIN, size.y - legend_height), legend, p_font, p_font_size)
 
 
-# The assembled layer, one square per unit: each square is the unit's own storage cut into the blocks
-# it is addressed in, so a strip the budget cut short is visible as the part of the square it left
-# untouched.
+# Draw one square per unit, subdivided into storage blocks.
 func _draw_level_strip(p_units: Array, p_font: Font, p_font_size: int, p_text_color: Color) -> void:
 	var count := mini(p_units.size(), MAX_SCHEMATIC_LEVELS)
 	if count <= 0:
@@ -268,9 +220,7 @@ func _draw_level_blocks(p_square: Rect2, p_unit: Dictionary, p_index: int) -> vo
 	var valid := bool(p_unit.get("valid", false))
 	var color := _level_color(p_index)
 	draw_rect(p_square, Color(color.r, color.g, color.b, VALID_FILL_ALPHA if valid else INVALID_FILL_ALPHA), true)
-	# The queued rects go under the grid, not over it: the blocks are what the picture is of, and a
-	# solid fill drawn last would hide the very thing it is made of. This is the one place the
-	# ordering of two draws is a decision.
+	# Draw pending work under the grid so block boundaries remain visible.
 	for value: Variant in p_unit.get("pending_rects", []):
 		var fraction := _fraction_of_unit(value, p_unit)
 		if fraction.has_area():
@@ -313,9 +263,7 @@ func _draw_map(p_map: Rect2, p_units: Array) -> void:
 		var valid := bool(unit.get("valid", false))
 		draw_rect(canvas, Color(color.r, color.g, color.b, 0.10 if valid else 0.03), true)
 		draw_rect(canvas, Color(color.r, color.g, color.b, 0.85 if valid else 0.40), false, 1.2)
-	# The queued work last, and translucent: a unit that has lost a strip is still drawn under it, and
-	# an opaque fill at the coarsest unit would cover the whole map - which is exactly the state a
-	# teleport produces, and exactly when the picture is most useful.
+	# Translucent pending strips preserve the underlying coverage, including teleport jobs.
 	for unit: Dictionary in p_units:
 		for value: Variant in unit.get("pending_rects", []):
 			if not value is Rect2:
@@ -352,15 +300,7 @@ func _lod_legend_lines(p_units: Array) -> Array[String]:
 	return lines
 
 
-# ---- The atlas's own picture ---------------------------------------------------------------------
-#
-# Two squares, because the atlas raises two questions the level array does not. The left one is the
-# **region**: the texture the packer laid out, drawn to scale, every rect at its own position and
-# size, coloured by the unit whose block it is, with the spare rects outlined and the one-time global
-# block in its own colour. The right one is the **grid**: every unit's own 3x3 arrangement of blocks,
-# laid side by side, each cell coloured by its unit and marked with the atlas index it reads this
-# frame. "Which rect does this cell read" is the current-frame atlas index, and it is the arrow
-# between the two squares.
+# Atlas texture rects and per-unit cells share current-frame slot indices.
 func _draw_atlas(p_font: Font, p_font_size: int, p_text_color: Color) -> void:
 	var impl: Dictionary = _layer.get("impl", {})
 	var layout: Dictionary = impl.get("layout", {})
@@ -430,18 +370,13 @@ func _draw_atlas_region(p_panel: Rect2, p_layout: Dictionary, p_font: Font, p_fo
 				HORIZONTAL_ALIGNMENT_LEFT, p_panel.size.x, p_font_size - 1, p_text_color)
 
 
-# Every unit is a 3x3 arrangement of its own blocks, so the grid panel lays the units side by side
-# and draws each one's own square of cells. The old `(2 * rings + 1)^2` shell is gone: a cell's
-# `gx`/`gy` now spans only `-1..1` for *its* unit, and stacking them all in one 3x3 square would draw
-# every unit over the others.
+# Lay out each unit's local 3x3 cells separately; gx/gy span -1..1 within a unit.
 func _draw_atlas_grid(p_panel: Rect2, p_layout: Dictionary, p_font: Font, p_font_size: int,
 		p_text_color: Color) -> void:
 	var side := maxi(1, int(p_layout.get("grid_side", 3)))
 	var rings := maxi(1, int(p_layout.get("rings", 1)))
 	var half := (side - 1) / 2
-	# The shipped ladder is eleven units, so one row of eleven 3x3 squares would draw sub-pixel cells.
-	# The units wrap into a near-square block of rows instead, which keeps every cell readable and still
-	# reads as the nested arrangement it is.
+	# Wrap units into a near-square grid to keep their cells readable.
 	var per_row := maxi(1, int(ceil(sqrt(float(rings)))))
 	var rows := int(ceil(float(rings) / float(per_row)))
 	var columns := side * per_row
@@ -498,7 +433,7 @@ func _atlas_legend_lines(p_impl: Dictionary, p_layout: Dictionary) -> Array[Stri
 	return lines
 
 
-# ---- The coverage reading, drawn for both implementations ----------------------------------------
+# Both implementations use the layer's density/reach ladder.
 
 # The shared ladder's density against the reach of the unit that serves it. `unit_reach` and
 # `unit_density` are the *layer's* arrays - one function of the ladder - so the plot is the same
@@ -543,11 +478,7 @@ func _draw_density(p_rect: Rect2, p_pairs: Array, p_font: Font, p_font_size: int
 
 
 func _density_pairs() -> Array:
-	# The x is the unit's **coverage outer radius** - the distance at which the unit's density stops
-	# being the one a fragment gets - because that is the reading "density against distance" means.
-	# The payload publishes it directly as `unit_radius` beside `unit_density`; the layer's own
-	# `density_curve` / `density_distance` pair is the same curve and is read by the service report,
-	# not by this plot.
+	# Plot outer coverage radius (metres) against unit density (texels/metre).
 	var reach := _float_series("unit_radius")
 	var density := _float_series("unit_density")
 	var count := mini(reach.size(), density.size())
@@ -578,9 +509,7 @@ func _draw_legend(p_origin: Vector2, p_lines: Array[String], p_font: Font, p_fon
 				Color("b7c6ce"))
 
 
-## The strip's label for a unit. It names the *density* rather than the world size, because the density
-## is the ladder's own reading and the sizes span four orders of magnitude (0.25 m to 256 m) in the same
-## row: "L0 1024/m ... L10 1/m" is the ladder at a glance, and `*` marks a unit that is not current.
+## Label by level and density; * marks stale content.
 func _unit_label(p_unit: Dictionary, p_index: int) -> String:
 	return "L%d %.0f/m%s" % [p_index, float(p_unit.get("density", 0.0)),
 			"" if bool(p_unit.get("valid", false)) else "*"]
@@ -590,9 +519,7 @@ func _level_color(p_level: int) -> Color:
 	return LEVEL_PALETTE[clampi(p_level, 0, LEVEL_PALETTE.size() - 1)]
 
 
-# A world rect as the fraction of its unit's own square. The map keeps every unit inside one extent;
-# the strip keeps every unit inside its own square, which is why the pending rects have to be
-# projected per unit rather than drawn in world units.
+# Map a pending world rect into its own unit's normalized square.
 func _fraction_of_unit(p_value: Variant, p_unit: Dictionary) -> Rect2:
 	if not p_value is Rect2:
 		return Rect2()
@@ -612,8 +539,6 @@ func _vector2(p_value: Variant) -> Vector2:
 	return p_value if p_value is Vector2 else Vector2.ZERO
 
 
-# A `Rect2` out of a payload value, the way `_vector2()` is a `Vector2` out of one. The native side
-# publishes `Rect2` for a slot's rect, so the guard is what keeps a payload a stub or an older build
-# answers with from being a hard failure in the drawing code.
+# Unsupported payload types have no drawable rectangle.
 func _rect2(p_value: Variant) -> Rect2:
 	return p_value if p_value is Rect2 else Rect2()

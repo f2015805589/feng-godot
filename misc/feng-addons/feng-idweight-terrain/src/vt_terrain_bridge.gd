@@ -1,11 +1,5 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Duck-typed access to the native Terrain3D API.
-#
-# The VT window is a @tool script in an addon that can be linked against a
-# different build of the extension, so every native call is guarded: a method or
-# property that is missing must read as "unavailable" rather than break the
-# editor. Keeping that knowledge here is what lets the window be ordinary UI code,
-# and it is the one place to touch when a native API is renamed.
+# Optional native APIs are normalized here for editor builds using older extensions.
 @tool
 class_name TerrainVTBridge
 extends RefCounted
@@ -89,9 +83,7 @@ static func stats_text(p_stats: Dictionary) -> String:
 		int(p_stats.get("evict_count", 0)), int(p_stats.get("free_count", 0))]
 
 
-# The SVT bake's state as one sentence, read from the native report's own keys. The window's status
-# label and the node inspector's both show it and used to spell the same states out separately, which
-# is how the two drifted apart in wording. `p_auto_bake` is the fallback the report omits.
+# Shared bake-status formatter; p_auto_bake supplies an omitted report value.
 static func svt_bake_status(p_settings: Dictionary, p_auto_bake: bool = true) -> String:
 	var auto_enabled := bool(p_settings.get("auto_bake", p_auto_bake))
 	var regions := int(p_settings.get("auto_pending_regions", 0))

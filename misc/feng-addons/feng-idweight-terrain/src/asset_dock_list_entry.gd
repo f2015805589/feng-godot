@@ -132,10 +132,7 @@ func setup_buttons() -> void:
 	button_row.add_child(button_clear, true)
 	
 
-# The row owns the controls: every button below is added to `button_row`, so freeing the row frees
-# them, and a freed child reads as false in the guards that used to be here. Those five guarded
-# `free()` calls could never run - the only state with a live control also has a live row - and they
-# left the member references dangling instead of clearing them.
+# Freeing the button row releases all controls; clear the cached child references.
 func destroy_buttons() -> void:
 	if button_row:
 		button_row.free()

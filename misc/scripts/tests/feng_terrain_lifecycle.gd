@@ -10,9 +10,11 @@ extends EditorPlugin
 
 const ListEntry := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_entry.gd")
 const ListContainer := preload("res://addons/feng-idweight-terrain/src/asset_dock_list_container.gd")
-const Dock := preload("res://addons/feng-idweight-terrain/src/asset_dock_common.gd")
+const Dock := preload("res://addons/feng-idweight-terrain/src/asset_dock.gd")
 const TerrainObjects := preload("res://addons/feng-idweight-terrain/utils/terrain_3d_objects.gd")
 const TerrainSetup := preload("res://addons/feng-idweight-terrain/src/terrain_setup.gd")
+const LayoutPreview := preload("res://addons/feng-idweight-terrain/src/vt_layout_preview.gd")
+const ChannelPacker := preload("res://addons/feng-idweight-terrain/menu/channel_packer.gd")
 const VTEditor := preload("res://addons/feng-idweight-terrain/src/vt_editor.gd")
 
 
@@ -38,6 +40,7 @@ class TestPlugin extends EditorPlugin:
 	var terrain: TestTerrain
 	var valid := true
 	var debug := 0
+	var editor_settings = EditorInterface.get_editor_settings()
 	var ui := SelectionUI.new()
 
 	func is_terrain_valid(_terrain = null) -> bool:
@@ -51,29 +54,71 @@ class SelectionUI extends RefCounted:
 	func _on_setting_changed() -> void:
 		pass
 
+	func set_button_editor_icon(_button: Button, _icon: String) -> void:
+		pass
 
-class OverviewProbe extends VTEditor:
+
+class TestDock extends Dock:
+	func update_layout() -> void:
+		pass
+
+
+class OverviewSource extends RefCounted:
 	var settings_reads := 0
 	var pages: Array = []
 
-	func _vt_settings() -> Dictionary:
+	func get_data() -> Object:
+		return self
+
+	func get_vt_settings() -> Dictionary:
 		settings_reads += 1
 		return {"border": 0}
 
-	func _region_locations(_source: Object) -> Array:
+	func get_region_locations() -> Array:
 		return [Vector2i.ZERO]
 
-	func _region_world_size() -> Vector2:
-		return Vector2.ONE
+	func get_region_size() -> int:
+		return 1
 
-	func _baked_pages() -> Array:
+	func get_vertex_spacing() -> float:
+		return 1.0
+
+	func get_svt_baked_pages() -> Array:
 		return pages
 
-	func _overview_image_size(_bounds: Rect2) -> Vector2i:
-		return Vector2i(8, 8)
 
+class OverviewProbe extends VTEditor:
 	func _make_height_thumbnail(_bounds: Rect2, image_size: Vector2i) -> Image:
 		return Image.create_empty(image_size.x, image_size.y, false, Image.FORMAT_RGBA8)
+
+
+class BandSource extends RefCounted:
+	var surface_svt_mip_distances := PackedFloat32Array()
+	var max_mip := 2
+	var page_world := 64.0
+	var writes := 0
+
+	func get_surface_svt_max_mip() -> int: return max_mip
+	func get_surface_svt_page_world() -> float: return page_world
+	func get_surface_svt_mip_distances() -> PackedFloat32Array: return surface_svt_mip_distances
+	func set_surface_svt_mip_distances(value: PackedFloat32Array) -> void:
+		writes += 1
+		surface_svt_mip_distances = value.duplicate()
+		for i in value.size():
+			surface_svt_mip_distances[i] = maxf(1.0, value[i])
+
+
+class PreviewProbe extends LayoutPreview:
+	func _gate(_terrain: Object) -> bool: return true
+
+
+class PackerProbe extends ChannelPacker:
+	var packed_channels := Vector2i(-1, -1)
+	func _pack_textures(_rgb: Image, _alpha: Image, _ao: Image, _path: String,
+			_green: bool, _smooth: bool, _align: bool, _normalize: bool,
+			alpha_channel: int, ao_channel: int = 0) -> Error:
+		packed_channels = Vector2i(alpha_channel, ao_channel)
+		return FAILED
 
 
 class TestTerrainObjects extends TerrainObjects:
@@ -88,6 +133,7 @@ class TestTerrainObjects extends TerrainObjects:
 
 
 var failed := false
+var checks := 0
 
 
 func _enter_tree() -> void:
@@ -95,6 +141,7 @@ func _enter_tree() -> void:
 
 
 func expect(value: bool, message: String) -> bool:
+	checks += 1
 	if value:
 		return true
 	push_error("REGRESSION: " + message)
@@ -116,6 +163,10 @@ func run() -> void:
 	get_tree().root.add_child(harness)
 	_test_asset_selection_bounds(harness)
 	_test_overview_settings_snapshot()
+	_test_detail_dispatch()
+	_test_band_controls(harness)
+	_test_preview_weak_lifetime()
+	_test_packer_channels()
 
 	await _test_list_entry(harness)
 	await _test_list_container(harness)
@@ -127,7 +178,7 @@ func run() -> void:
 	if failed:
 		get_tree().quit(1)
 		return
-	print("PASS Terrain editor lifecycle behaviour: resource signals, dock reparent, objects and dismissed weakrefs")
+	print("PASS Terrain editor lifecycle behaviour: %d checks" % checks)
 	get_tree().quit(0)
 
 
@@ -166,7 +217,8 @@ func _test_asset_selection_bounds(harness: Node) -> void:
 
 func _test_overview_settings_snapshot() -> void:
 	var window := OverviewProbe.new()
-	window.terrain = RefCounted.new()
+	var source := OverviewSource.new()
+	window.set_terrain(source)
 	window._built = true
 	window.overview = TerrainVTWorldOverview.new()
 	window.overview_label = Label.new()
@@ -175,14 +227,95 @@ func _test_overview_settings_snapshot() -> void:
 	for index in 4:
 		var image := Image.create_empty(2, 2, false, Image.FORMAT_RGBA8)
 		image.fill(Color.WHITE)
-		window.pages.append({"mip": 0, "preview": image,
+		source.pages.append({"mip": 0, "preview": image,
 				"world_rect": Rect2(Vector2(index % 2, index / 2) * 0.5, Vector2.ONE * 0.5)})
 	window._refresh_overview()
-	expect(window.settings_reads == 1, "overview reread the native settings report for each material page")
+	expect(source.settings_reads == 1, "overview reread the native settings report for each material page")
 	var stitched: Image = window.overview.overview_texture.get_image()
-	for point in [Vector2i(1, 1), Vector2i(6, 1), Vector2i(1, 6), Vector2i(6, 6)]:
+	for point in [Vector2i(1, 1), Vector2i(766, 1), Vector2i(1, 766), Vector2i(766, 766)]:
 		expect(stitched.get_pixelv(point).is_equal_approx(Color.WHITE), "overview lost a stitched material page")
 	window.free()
+
+
+func _test_detail_dispatch() -> void:
+	var source := OverviewSource.new()
+	var window := VTEditor.new()
+	window.initialize(null)
+	window.terrain = source
+	window._selected_hierarchy_kind = "cdlod"
+	window._refresh_page_details()
+	expect(source.settings_reads == 0, "CDLOD details unnecessarily read the VT page snapshot")
+	expect(window.cdlod_panel.visible and not window.settings_panel.visible,
+			"details dispatch showed the wrong panel")
+	window.free()
+
+
+func _test_band_controls(harness: Node) -> void:
+	var source := BandSource.new()
+	var panel := VBoxContainer.new()
+	harness.add_child(panel)
+	var bands := TerrainVTEditorSvtBands.new()
+	bands.build(panel)
+	bands.refresh(source)
+	expect(bands.spins.size() == 3 and bands.spins[2].value == 512.0,
+			"automatic bands changed their world-distance rule")
+	var first := bands.spins[0]
+	bands.refresh(source)
+	expect(bands.spins[0] == first and source.writes == 0,
+			"unchanged band refresh rebuilt controls or wrote back")
+	bands.spins[0].value = 200.0
+	expect(source.writes == 1 and source.surface_svt_mip_distances == PackedFloat32Array([200, 256, 512]),
+			"editing one band did not pin exactly one complete table")
+	bands.automatic()
+	expect(source.writes == 2 and source.surface_svt_mip_distances.is_empty() and bands.spins[0].value == 128.0,
+			"automatic did not clear the explicit table and restore distances")
+	source.page_world = 32.0
+	bands.refresh(source)
+	bands.fit_to_page_size()
+	expect(source.writes == 3 and source.surface_svt_mip_distances == PackedFloat32Array([64, 128, 256]),
+			"pinning automatic bands ignored the current page size")
+	source.max_mip = 0
+	bands.refresh(source)
+	expect(bands.spins.size() == 1 and bands.grid.get_child_count() == 2,
+			"shrinking the band table left old controls attached")
+	panel.free()
+
+
+func _test_preview_weak_lifetime() -> void:
+	var preview := PreviewProbe.new()
+	var changes: Array[bool] = []
+	preview.availability_changed.connect(func(value: bool): changes.append(value))
+	var terrain := RefCounted.new()
+	preview.set_terrain(terrain)
+	expect(preview._get_terrain() == terrain and preview.visible, "preview did not bind its terrain")
+	terrain = null
+	expect(preview._get_terrain() == null, "preview retained its released terrain")
+	preview.set_terrain(null)
+	expect(not preview.visible and changes == [true, false], "preview availability changed incorrectly on release")
+	preview.free()
+
+
+func _test_packer_channels() -> void:
+	var plugin := TestPlugin.new()
+	var packer := PackerProbe.new()
+	packer.plugin = plugin
+	for iteration in 2:
+		packer.pack_textures_popup()
+		for channel in 4:
+			packer.height_channel[channel].button_pressed = true
+			packer.height_channel[channel].pressed.emit()
+			packer.packing_albedo = true
+			packer._on_save_file_selected("user://channel-test.png")
+			expect(packer.packed_channels.x == channel, "packer ignored the selected height channel")
+			packer.roughness_channel[channel].button_pressed = true
+			packer.roughness_channel[channel].pressed.emit()
+			packer.occlusion_channel[3 - channel].button_pressed = true
+			packer.occlusion_channel[3 - channel].pressed.emit()
+			packer.packing_albedo = false
+			packer._on_save_file_selected("user://channel-test.png")
+			expect(packer.packed_channels == Vector2i(channel, 3 - channel), "packer ignored the selected material channels")
+		packer._on_close_requested()
+	plugin.free()
 
 
 func _test_list_entry(harness: Node) -> void:
@@ -314,7 +447,7 @@ func _test_dock_reparent(harness: Node) -> void:
 
 	var texture_list := TestListContainer.new()
 	var mesh_list := TestListContainer.new()
-	var dock := Dock.new()
+	var dock := TestDock.new()
 	dock.plugin = plugin
 	dock._initialized = true
 	dock.texture_list = texture_list
@@ -409,15 +542,11 @@ func _test_terrain_objects(harness: Node) -> void:
 	if is_instance_valid(helper):
 		expect(helper.transform_changed.get_connections().size() == 1,
 			"TerrainObjects connected more than one child transform callback")
-	expect(objects._child_transform_callbacks.size() == 1,
-			"TerrainObjects did not retain exactly one child callback")
 	objects.remove_child(child)
-	await get_tree().process_frame
-	expect(objects._child_transform_callbacks.is_empty(),
-			"TerrainObjects retained a callback after child exit")
 	if is_instance_valid(helper):
 		expect(helper.transform_changed.get_connections().is_empty(),
 			"TerrainObjects retained helper signal connection after child exit")
+	await get_tree().process_frame
 	objects.add_child(child)
 	await get_tree().process_frame
 	helper = child.get_node_or_null(^"TransformChangedSignaller")
@@ -425,11 +554,20 @@ func _test_terrain_objects(harness: Node) -> void:
 	if is_instance_valid(helper):
 		expect(helper.transform_changed.get_connections().size() == 1,
 			"TerrainObjects duplicated child callback after re-entry")
-	expect(objects._child_transform_callbacks.size() == 1,
-			"TerrainObjects did not restore exactly one child callback")
 	objects.remove_child(child)
 	await get_tree().process_frame
 	child.free()
+
+	var moved := Node3D.new()
+	objects.add_child(moved)
+	objects.remove_child(moved)
+	harness.add_child(moved)
+	await get_tree().process_frame
+	expect(not objects._offsets.has(moved.get_instance_id()),
+			"deferred setup retained a child already reparented elsewhere")
+	expect(moved.get_node_or_null(^"TransformChangedSignaller") == null,
+			"rapid reparent left an orphan transform helper")
+	moved.free()
 
 	harness.remove_child(objects)
 	expect(not data_b.maps_edited.is_connected(objects._on_maps_edited),

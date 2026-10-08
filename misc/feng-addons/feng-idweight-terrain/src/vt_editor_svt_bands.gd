@@ -1,13 +1,6 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Mip distance bands of the Surface VT editor: one spin box per world mip level,
-# holding the furthest camera distance still sampled at that level.
-#
-# Both the page producer and the shader resolve a level through this table, so a
-# value here is where the level boundary sits for the whole far field, not a hint.
-# The table is stored on the terrain as surface_svt_mip_distances, and an empty
-# table is not "no bands": it means derive one band per doubling of the page size.
-# Those two states are what the Automatic and From page size buttons switch
-# between, so this editor owns the table's representation as well as its widgets.
+# One maximum camera distance per world mip, shared by producer and shader.
+# An empty native table selects the automatic page-size-doubling rule.
 @tool
 class_name TerrainVTEditorSvtBands
 extends RefCounted
@@ -20,10 +13,7 @@ var spins: Array[SpinBox] = []
 # Rebuilding a grid of spin boxes while the user types in one of them would drop
 # the edit, so a refresh compares this signature of (level count, stored table,
 # page size) first and returns when nothing it displays has changed.
-var _signature: String = ""
-# True while this editor writes its own controls, so their value_changed does not
-# bounce straight back into the terrain.
-var _updating: bool = false
+var _signature: Array = []
 
 
 # Creates the controls in display order: header, live hint, the per level grid and
@@ -60,7 +50,7 @@ func build(p_panel: VBoxContainer) -> void:
 
 # Makes the next refresh rebuild, for when something else changed the table.
 func invalidate() -> void:
-	_signature = ""
+	_signature.clear()
 
 
 func refresh(p_terrain: Object) -> void:
@@ -70,10 +60,7 @@ func refresh(p_terrain: Object) -> void:
 	if not TerrainVTBridge.has_property(terrain, &"surface_svt_mip_distances"):
 		return
 	var view := TerrainVTBridge.call_method(terrain, "get_surface_svt")
-	# A terrain with no far view - the delivery matrix makes "no cell selects SVT" a live
-	# configuration, and this panel is refreshed for it like any other - has no view to ask for its
-	# world mip reach. Asking through it was a null call that logged a script error on every refresh;
-	# without a view the configured ceiling is the number, which is what the table is built from.
+	# Without an SVT view, use the configured mip ceiling.
 	var max_mip := -1
 	var reach: Variant = TerrainVTBridge.call_method(view, "get_world_max_mip")
 	if reach != null:
@@ -84,14 +71,14 @@ func refresh(p_terrain: Object) -> void:
 	var configured_value: Variant = TerrainVTBridge.call_method(terrain, "get_surface_svt_mip_distances")
 	var configured: PackedFloat32Array = configured_value if configured_value is PackedFloat32Array else PackedFloat32Array()
 	var page_world := maxf(0.001, float(TerrainVTBridge.call_method(terrain, "get_surface_svt_page_world")))
-	var signature := "%d|%s|%s" % [levels, str(configured), str(page_world)]
+	var signature := [levels, configured, page_world]
 	if signature == _signature:
 		return
 	_signature = signature
 	var rebuilding := spins.size() != levels
-	_updating = true
 	if rebuilding:
 		for child in grid.get_children():
+			grid.remove_child(child)
 			child.queue_free()
 		spins.clear()
 		for mip in levels:
@@ -99,7 +86,7 @@ func refresh(p_terrain: Object) -> void:
 			var spin := TerrainVTEditorWidgets.make_spin(1.0, 100000000.0, 1.0)
 			spin.name = "SVTBandMip%d" % mip
 			spin.tooltip_text = "Furthest camera distance in metres sampled at world mip %d" % mip
-			spin.value_changed.connect(value_changed.bind(mip))
+			spin.value_changed.connect(value_changed.unbind(1))
 			grid.add_child(spin)
 			spins.append(spin)
 	for mip in spins.size():
@@ -107,7 +94,6 @@ func refresh(p_terrain: Object) -> void:
 		# boxes always read as real distances.
 		var automatic_edge := maxf(1.0, page_world * 2.0) * pow(2.0, float(mip))
 		spins[mip].set_value_no_signal(float(configured[mip]) if mip < configured.size() else automatic_edge)
-	_updating = false
 	var parts: PackedStringArray = []
 	var previous := 0.0
 	for mip in spins.size():
@@ -120,25 +106,16 @@ func refresh(p_terrain: Object) -> void:
 
 # Any edit pins the whole chain, so what is stored is every box, not just the one
 # the user touched.
-func value_changed(_p_value: float, _p_mip: int) -> void:
-	if _updating or terrain == null or not is_instance_valid(terrain):
-		return
+func value_changed() -> void:
 	var distances := PackedFloat32Array()
 	for spin in spins:
 		distances.append(float(spin.value))
-	TerrainVTBridge.call_method(terrain, "set_surface_svt_mip_distances", [distances])
-	invalidate()
-	# The setter normalises the table, so read back what it stored.
-	refresh(terrain)
+	_set_distances(distances)
 
 
 # Back to the automatic rule: an empty table.
 func automatic() -> void:
-	if terrain == null or not is_instance_valid(terrain):
-		return
-	TerrainVTBridge.call_method(terrain, "set_surface_svt_mip_distances", [PackedFloat32Array()])
-	invalidate()
-	refresh(terrain)
+	_set_distances(PackedFloat32Array())
 
 
 # Writes the automatic rule out as explicit distances, as a starting point to edit.
@@ -149,8 +126,15 @@ func fit_to_page_size() -> void:
 	var distances := PackedFloat32Array()
 	for mip in maxi(1, spins.size()):
 		distances.append(maxf(1.0, page_world * 2.0) * pow(2.0, float(mip)))
-	TerrainVTBridge.call_method(terrain, "set_surface_svt_mip_distances", [distances])
+	_set_distances(distances)
+
+
+func _set_distances(p_distances: PackedFloat32Array) -> void:
+	if not is_instance_valid(terrain):
+		return
+	TerrainVTBridge.call_method(terrain, "set_surface_svt_mip_distances", [p_distances])
 	invalidate()
+	# The setter normalizes the complete table; display the accepted values.
 	refresh(terrain)
 
 

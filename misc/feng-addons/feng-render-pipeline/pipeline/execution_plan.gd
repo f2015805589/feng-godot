@@ -151,4 +151,4 @@ static func validation_warnings(
 		is_entry_enabled_fn
 	)
 	warnings.append_array(ParameterResolver.warnings(passes))
-	return warnings
+	return PipelineValidator.with_bloom_eye_order_warning(passes, warnings, is_entry_enabled_fn)

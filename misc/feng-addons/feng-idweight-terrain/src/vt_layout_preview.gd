@@ -1,29 +1,15 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-#
-# The plumbing the two VT layout previews share: the terrain they describe (held weakly), the one
-# boolean that says whether there is anything to draw, and the poll interval that decides when to ask.
-# What a preview does with that - the AVT sector scan, or the clipmap's two panels - stays in its own
-# script, because that is the half that differs.
-#
-# It is a base *script* rather than a helper object because both previews are Controls that own their
-# own visibility: a control that consulted a helper for `visible` would have two owners of one
-# property. `asset_dock_common.gd` is the same shape for the dock.
+# Shared weak terrain reference, availability and polling policy for VT layout previews.
 @tool
 extends Control
 
-## Emitted when the view starts or stops having something to draw. The host hides the heading and the
-## description around this control with it; the host hides the *panel* the control lives in, never the
-## control itself, because the control owns its own visibility.
+## Hosts follow availability for their surrounding panel; this control owns its visibility.
 signal availability_changed(p_available: bool)
 
-## How long one poll's answer is trusted. The gate is one cheap question - whether a cell selects the
-## method, or whether a ring exists - so polling it is affordable even while the view is hidden, while
-## the expensive call each preview makes (a grid scan, a ring walk) waits for visibility inside the
-## preview itself.
+## Poll cheap availability queries while hidden; subclasses defer layout reads until visible.
 const POLL_INTERVAL_SEC := 0.20
 
 var _terrain_ref: WeakRef
-var _terrain_instance_id: int = 0
 var _available := false
 var _last_poll_sec := -INF
 
@@ -39,10 +25,8 @@ func is_available() -> bool:
 func set_terrain(p_terrain: Object) -> void:
 	if p_terrain != null and is_instance_valid(p_terrain):
 		_terrain_ref = weakref(p_terrain)
-		_terrain_instance_id = p_terrain.get_instance_id()
 	else:
 		_terrain_ref = null
-		_terrain_instance_id = 0
 	_reset_preview_state()
 	_last_poll_sec = -INF
 	# The gate is answered once here as well, so a host that builds the control and hands it a terrain
@@ -54,12 +38,7 @@ func set_terrain(p_terrain: Object) -> void:
 func _get_terrain() -> Object:
 	if _terrain_ref == null:
 		return null
-	var terrain: Object = _terrain_ref.get_ref()
-	if terrain == null or not is_instance_valid(terrain):
-		return null
-	if _terrain_instance_id != 0 and terrain.get_instance_id() != _terrain_instance_id:
-		return null
-	return terrain
+	return _terrain_ref.get_ref()
 
 
 func _set_available(p_available: bool) -> void:
@@ -72,9 +51,7 @@ func _set_available(p_available: bool) -> void:
 	availability_changed.emit(p_available)
 
 
-## Whether there is anything to draw for this terrain, which is the question each preview answers for
-## itself and the one its host's heading depends on. Every subclass implements it, and the default
-## refuses: a gate nobody wrote is a view with nothing behind it.
+## Subclasses decide whether a layout exists; the default hides the preview.
 func _gate(_p_terrain: Object) -> bool:
 	return false
 

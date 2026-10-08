@@ -107,11 +107,9 @@ func _configure_overlay(ldr_target: StringName, after_tonemap: bool) -> void:
 ## The overlay's own output texture, taken from its declarations: it has to be a named
 ## pipeline texture for the pass to present it.
 func _overlay_ldr_target() -> StringName:
-	var declarations = overlay.get("outputs")
-	if declarations is Array:
-		for declaration in declarations:
-			if declaration != null and declaration.get("name") != null and declaration.name != &"":
-				return declaration.name
+	for declaration in overlay.outputs:
+		if declaration != null and declaration.name != &"":
+			return declaration.name
 	return &""
 
 func _native_pass_id() -> int:

@@ -4,8 +4,8 @@
 
 // One of three files that define a view. This one owns the view's own state and the table every
 // lookup reads: the hand-built indirection mip chain (`_read_level()` / `_write_level()` and the
-// dirty-tile set they feed), the page-slot reservation the pool hands out (`_acquire_slot()` and
-// the reverse-owner invalidation the pool calls back into), the settings with `initialize()` /
+// dirty-tile set they feed), the page-slot allocation and
+// the reverse-owner invalidation the pool calls back into, the settings with `initialize()` /
 // `clear()` and the shared-pool binding, the upload `commit()` performs, the page I/O and slot
 // queries the demand passes and the tests call, the counters `get_stats()` reports, and the
 // ClassDB bindings.
@@ -112,19 +112,6 @@ void Terrain3DVirtualTexture::clear_planned_levels() {
 	for (const uint64_t key : previous) {
 		_refresh_planned_level(int((key >> 16) & 0xffff), int(key & 0xffff), int(key >> 32));
 	}
-}
-
-void Terrain3DVirtualTexture::_touch_slot(const uint32_t p_slot) {
-	if (_page_pool) {
-		_page_pool->touch_slot(p_slot);
-	}
-}
-
-int Terrain3DVirtualTexture::_acquire_slot() {
-	if (!_page_pool) {
-		return -1;
-	}
-	return _page_pool->acquire_slot(this);
 }
 
 void Terrain3DVirtualTexture::_invalidate_pool_owner(const uint32_t p_slot,
@@ -390,14 +377,13 @@ void Terrain3DVirtualTexture::protect_page(const int p_slot, const bool p_protec
 	} else if (refs > 0) {
 		--refs;
 	}
-	_page_pool->slot_protected[p_slot] = refs > 0 ? 1 : 0;
 }
 
 bool Terrain3DVirtualTexture::is_page_protected(const int p_slot) const {
 	if (!_page_pool || p_slot < 0 || p_slot >= _page_pool->page_count) {
 		return false;
 	}
-	return _page_pool->slot_protected[p_slot] != 0;
+	return _page_pool->slot_protect_refs[p_slot] != 0;
 }
 
 bool Terrain3DVirtualTexture::is_page_used(const int p_slot) const {
@@ -496,8 +482,8 @@ Dictionary Terrain3DVirtualTexture::get_stats() const {
 	stats["commit_count"] = _commit_count;
 	stats["page_write_count"] = _page_write_count;
 	stats["free_count"] = _page_pool ? int(_page_pool->free_slots.size()) : 0;
-	stats["protected_count"] = _page_pool ? int(std::count(_page_pool->slot_protected.begin(),
-			_page_pool->slot_protected.end(), uint8_t(1))) : 0;
+	stats["protected_count"] = _page_pool ? int(std::count_if(_page_pool->slot_protect_refs.begin(),
+			_page_pool->slot_protect_refs.end(), [](uint8_t refs) { return refs != 0; })) : 0;
 	stats["allocation_budget"] = _page_pool ? _page_pool->allocation_budget : -1;
 	stats["shared_pool"] = _page_pool != nullptr;
 	stats["virtual_atlas_nodes"] = _virtual_atlas ? _virtual_atlas->allocated_node_count() : 0;

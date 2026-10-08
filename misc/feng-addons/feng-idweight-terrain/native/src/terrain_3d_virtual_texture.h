@@ -146,8 +146,6 @@ private:
 	// that leaves the plan keeps whatever content it holds (the retention window and the pool
 	// own that decision), and a level that enters it is marked only while it has no slot.
 	void _refresh_planned_level(int p_x, int p_y, int p_mip);
-	void _touch_slot(uint32_t p_slot);
-	int _acquire_slot();
 	void _invalidate_pool_owner(uint32_t p_slot, const Terrain3DVTPageOwner &p_owner);
 	// Shared by the sector and world-space paths: allocate on a miss, publish the
 	// entry and report whether the page had to be produced.

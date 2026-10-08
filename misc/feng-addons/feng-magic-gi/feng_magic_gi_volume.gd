@@ -255,7 +255,6 @@ func refresh_surface_points() -> void:
 
 func _settings_changed(rebuild := true) -> void:
 	_bake_generation += 1
-	_invalidate_data_cache()
 	_scene_signature_checked = false
 	if rebuild:
 		_rebuild_probes()
@@ -265,7 +264,6 @@ func _settings_changed(rebuild := true) -> void:
 func _sample_quality_changed() -> void:
 	# Ray count affects the bake but not the surface layout/signature.
 	_bake_generation += 1
-	_invalidate_data_cache()
 	Runtime.publish(self)
 	update_configuration_warnings()
 	bake_status_changed.emit()

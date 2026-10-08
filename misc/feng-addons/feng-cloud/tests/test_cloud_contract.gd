@@ -2,6 +2,20 @@ extends SceneTree
 ## Run headlessly for the native packet contract, or add -- --gpu for RD ownership.
 
 const CloudGPU = preload("res://addons/feng-cloud/feng_cloud_gpu.gd")
+
+class FaultCloudGPU extends CloudGPU:
+	var remaining_allocations := -1
+
+	func _create_named_texture(buffers: RenderSceneBuffersRD, state: Dictionary, name: String,
+			format: int, size: Vector2i, layers: int, array_texture: bool, rd: RenderingDevice,
+			scope_override: StringName = &"") -> bool:
+		if remaining_allocations == 0:
+			remaining_allocations = -1
+			return false
+		if remaining_allocations > 0:
+			remaining_allocations -= 1
+		return super._create_named_texture(buffers, state, name, format, size, layers, array_texture, rd, scope_override)
+
 var failures := 0
 var gpu_done := Semaphore.new()
 var passes: Array[FengVolumetricCloudPass] = []
@@ -19,6 +33,7 @@ func _initialize() -> void:
 
 
 func run() -> void:
+	test_registry_and_material()
 	var ctx := FRPPassContext.new()
 	var optical := RenderingServer.texture_2d_placeholder_create()
 	var multiple := RenderingServer.texture_2d_placeholder_create()
@@ -42,12 +57,73 @@ func run() -> void:
 	quit(0 if failures == 0 else 1)
 
 
+func test_registry_and_material() -> void:
+	var texture := GradientTexture2D.new()
+	var material := FengCloudMaterial.new()
+	material.weather_texture = texture
+	material.layout_cloud_mask_texture = texture
+	var revision := material.get_revision()
+	texture.emit_changed()
+	require(material.get_revision() == revision + 1, "Shared texture changes must touch its material exactly once")
+	material.weather_texture = null
+	revision = material.get_revision()
+	texture.emit_changed()
+	require(material.get_revision() == revision + 1, "Removing one texture input disconnected another input")
+	var copy := material.duplicate() as FengCloudMaterial
+	material.layout_cloud_mask_texture = null
+	revision = material.get_revision()
+	var copy_revision := copy.get_revision()
+	texture.emit_changed()
+	require(material.get_revision() == revision and copy.get_revision() == copy_revision + 1, "Texture subscriptions did not follow independent material ownership")
+	copy.layout_cloud_mask_texture = null
+	copy_revision = copy.get_revision()
+	texture.emit_changed()
+	require(copy.get_revision() == copy_revision, "Removing the final texture input retained its subscription")
+	var viewport := SubViewport.new()
+	viewport.world_3d = World3D.new()
+	root.add_child(viewport)
+	var older := FengVolumetricCloud.new()
+	var newer := FengVolumetricCloud.new()
+	viewport.add_child(older)
+	viewport.add_child(newer)
+	var runtime := FengCloudRuntime
+	var world_id := viewport.world_3d.get_instance_id()
+	runtime.register_cloud(older, viewport.world_3d)
+	require(runtime.snapshot_for_world(world_id).get("provider_id") == newer.get_instance_id(), "Repeated registration reordered cloud precedence")
+	var input := {"provider_id": newer.get_instance_id(), "nested": {"value": 7}}
+	runtime.publish_cloud(newer, world_id, input)
+	input["nested"]["value"] = 0
+	var published := runtime.snapshot_for_world(world_id)
+	require(published["nested"]["value"] == 7, "Cloud publication borrowed mutable input")
+	published["nested"].clear()
+	var rendered := runtime.snapshots()
+	require(rendered.size() == 1 and rendered[0]["nested"].get("value") == 7, "Main-thread cloud reads mutated render publication")
+	rendered[0]["nested"].clear()
+	require(runtime.snapshot_for_world(world_id)["nested"].get("value") == 7, "Render snapshot reads mutated stored cloud state")
+	newer.enabled = false
+	require(runtime.snapshot_for_world(world_id).get("provider_id") == older.get_instance_id(), "Disabling newest cloud did not restore its predecessor")
+	newer.enabled = true
+	require(runtime.snapshot_for_world(world_id).get("provider_id") == newer.get_instance_id(), "Re-enabled cloud did not regain newest registration")
+	viewport.free()
+	require(runtime.snapshot_for_world(world_id).is_empty() and runtime.snapshots().is_empty(), "World removal retained a cloud publication")
+
+
 func run_gpu() -> void:
 	var rd := RenderingServer.get_rendering_device()
 	if rd == null:
 		require(false, "GPU checks require a RenderingDevice renderer")
 		gpu_done.post()
 		return
+	var fault := FaultCloudGPU.new()
+	for allocation in 16: # Five stereo channels, two history banks, one ambient texture.
+		var retry_buffers := RenderSceneBuffersRD.new()
+		fault.remaining_allocations = allocation
+		require(fault._ensure_buffer_state(retry_buffers, rd, 103, Vector2i(17, 19), 2, 0, false).is_empty(), "Texture allocation failure did not abort the state")
+		var retry := fault._ensure_buffer_state(retry_buffers, rd, 103, Vector2i(17, 19), 2, 0, false)
+		require(not retry.is_empty() and fault._buffer_state_textures_valid(retry_buffers, rd, retry, 0), "Partial texture state did not rebuild after allocation failure")
+		fault.cleanup(rd)
+		fault.cleanup(rd)
+
 	var gpu := CloudGPU.new()
 	require(gpu._ensure_neutral_resources(rd), "Neutral texture allocation failed")
 	var neutral: RID = gpu._neutral_lut
@@ -61,6 +137,8 @@ func run_gpu() -> void:
 	require(state.trace_radiance != original and gpu._buffer_state_textures_valid(buffers, rd, state, 0), "Cleared named textures were not rebuilt")
 	state = gpu._ensure_buffer_state(buffers, rd, 101, Vector2i(16, 16), 2, 2, false)
 	require(state.full_secondary_radiance.is_empty() and gpu._buffer_state_textures_valid(buffers, rd, state, 2), "Mode-2 retained mode-0 secondary textures")
+	state = gpu._ensure_buffer_state(buffers, rd, 101, Vector2i(17, 19), 2, 1, false)
+	require(state.trace_size == Vector2i(9, 10) and state.full_radiance.is_empty() and gpu._buffer_state_textures_valid(buffers, rd, state, 1), "Resized mode-1 retained temporal textures or used the wrong ceil size")
 	var other_state: Dictionary = gpu._ensure_buffer_state(other, rd, 102, Vector2i(8, 8), 1, 3, false)
 	gpu._release_buffer(buffers, rd)
 	gpu._release_idle_resources(rd)

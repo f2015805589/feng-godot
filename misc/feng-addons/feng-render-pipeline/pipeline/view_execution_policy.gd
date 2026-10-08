@@ -24,12 +24,8 @@ static func is_view_shareable(
 		return false
 	if entry.get_script() == ShaderPass:
 		return true
-	if entry is BuiltinPass:
-		if entry.get_script() == BuiltinPass:
-			return _is_stock_builtin(entry as FengBuiltinPass, stock_native_pass_scripts, stock_passes_dir)
-		# A custom BuiltinPass is allowed to opt in only at the entry level. This keeps
-		# an implementation's opt-in from silently sharing a mutable overlay graph.
-		return entry.can_share_view_execution()
+	if entry.get_script() == BuiltinPass:
+		return _is_stock_builtin(entry as FengBuiltinPass, stock_native_pass_scripts, stock_passes_dir)
 	return entry.can_share_view_execution()
 
 static func _is_stock_builtin(

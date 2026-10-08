@@ -55,7 +55,7 @@ static func create_default() -> FengCloudMaterial:
 	return default_material
 
 var _revision := 1
-var _watched_textures: Dictionary = {} # resource instance id -> {weak: WeakRef, count: int}
+var _watched_textures: Dictionary = {} # texture instance id -> number of material inputs
 
 @export_group("Density Sources")
 @export var shape_density_texture: Texture3D:
@@ -361,35 +361,23 @@ func _watch_texture(texture: Resource) -> void:
 	if texture == null:
 		return
 	var id := texture.get_instance_id()
-	var entry: Dictionary = _watched_textures.get(id, {})
-	entry["weak"] = weakref(texture)
-	entry["count"] = int(entry.get("count", 0)) + 1
-	_watched_textures[id] = entry
-	if int(entry["count"]) == 1 and not texture.changed.is_connected(_on_input_texture_changed):
-		texture.changed.connect(_on_input_texture_changed)
+	_watched_textures[id] = int(_watched_textures.get(id, 0)) + 1
+	if _watched_textures[id] == 1 and not texture.changed.is_connected(_touch):
+		texture.changed.connect(_touch)
 
 
 func _unwatch_texture(texture: Resource) -> void:
 	if texture == null:
 		return
 	var id := texture.get_instance_id()
-	if not _watched_textures.has(id):
-		return
-	var entry: Dictionary = _watched_textures[id]
-	var count := int(entry.get("count", 0)) - 1
+	var count := int(_watched_textures.get(id, 0)) - 1
 	if count <= 0:
-		var reference: WeakRef = entry.get("weak")
-		var watched: Resource = reference.get_ref() if reference != null else null
-		if watched != null and is_instance_valid(watched) and watched.changed.is_connected(_on_input_texture_changed):
-			watched.changed.disconnect(_on_input_texture_changed)
+		if texture.changed.is_connected(_touch):
+			texture.changed.disconnect(_touch)
 		_watched_textures.erase(id)
 	else:
-		entry["count"] = count
-		_watched_textures[id] = entry
+		_watched_textures[id] = count
 
-
-func _on_input_texture_changed() -> void:
-	_touch()
 
 
 func _touch() -> void:

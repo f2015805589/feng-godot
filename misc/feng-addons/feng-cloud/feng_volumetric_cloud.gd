@@ -584,10 +584,6 @@ func _source_settings_revision(source: FengSkyAtmosphere) -> int:
 
 
 func _sky_rendering_signature(snapshot: Dictionary, atmosphere: FengSkyAtmosphere = null) -> Array:
-	return _sky_rendering_signature_for_source(snapshot, atmosphere)
-
-
-func _sky_rendering_signature_for_source(snapshot: Dictionary, atmosphere: FengSkyAtmosphere) -> Array:
 	if snapshot.is_empty() and (atmosphere == null or not is_instance_valid(atmosphere)):
 		return []
 	var settings: Dictionary = snapshot.get("settings", {})

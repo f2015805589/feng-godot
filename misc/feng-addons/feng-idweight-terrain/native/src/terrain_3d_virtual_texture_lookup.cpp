@@ -3,7 +3,7 @@
 // Terrain3DVirtualTexture, part 3 of 3: addressing - the mip-chain walk and the request entry points.
 
 // One of three files that define a view. `_request_virtual()` is the shared core of both
-// addressing modes: a hit only touches the LRU, a miss reserves a slot, publishes it at that
+// addressing modes: a hit only touches the LRU, a miss allocates a slot, publishes it at that
 // exact level and records the reverse mapping, so eviction can invalidate precisely the entries
 // that still point at it. Around it are the two coordinate systems - the near field's sector-local
 // pages, whose block origin lives in the sector half, and the far field's world grid, which needs
@@ -46,28 +46,21 @@ int Terrain3DVirtualTexture::_request_virtual(const int p_virtual_x, const int p
 	const uint32_t existing = _read_level(p_virtual_x, p_virtual_y, p_local_mip);
 	if (existing != INVALID_SLOT && existing != TerrainVT::PLANNED_PHYSICAL_PAGE_SLOT) {
 		_hit_count++;
-		_touch_slot(uint32_t(existing));
+		if (_page_pool) { _page_pool->touch_slot(uint32_t(existing)); }
 		return existing;
 	}
 	_miss_count++;
-	const int slot = _acquire_slot();
+	const int slot = _page_pool ? _page_pool->acquire_slot() : -1;
 	if (slot < 0) {
 		return -1;
 	}
 	_write_level(p_virtual_x, p_virtual_y, p_local_mip, uint32_t(slot));
-	// The entry that names this slot now exists, so the reservation becomes final: only here
-	// is a chosen LRU victim evicted. A failure before this point leaves it resident.
-	if (_page_pool) {
-		_page_pool->commit_slot(uint32_t(slot));
-	}
 	Terrain3DVTPageOwner owner = p_owner;
 	owner.texture = this;
 	owner.virtual_x = p_virtual_x;
 	owner.virtual_y = p_virtual_y;
 	owner.mip = p_local_mip;
-	if (_page_pool) {
-		_page_pool->publish_owner(uint32_t(slot), owner);
-	}
+	_page_pool->publish_owner(uint32_t(slot), owner);
 	if (r_miss) {
 		*r_miss = true;
 	}

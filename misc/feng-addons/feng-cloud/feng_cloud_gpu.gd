@@ -531,114 +531,78 @@ func _ensure_buffer_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice, ow
 		_buffers[key] = state
 		if not shadow_only:
 			var array_count := maxi(view_count, 1)
-			for pair in [["trace_radiance", RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, trace_size],
-					["trace_transmittance", RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, trace_size],
-					["trace_depth", RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, trace_size]]:
-				if not _create_named_texture(buffers, state, pair[0], pair[1], pair[2], array_count, true, rd):
+			state.trace_secondary_radiance = RID()
+			state.trace_secondary_transmittance = RID()
+			state.full_secondary_radiance = []
+			state.full_secondary_transmittance = []
+			var layout := _cloud_texture_layout(mode)
+			for channel in layout:
+				var spec: Array = layout[channel]
+				var trace_key := "trace_" + str(channel)
+				var texture := _create_cloud_texture(buffers, state, rd, trace_key,
+						spec[0], trace_size, array_count, true, spec[1])
+				if not texture.is_valid():
 					return {}
-			var has_reconstruction_history := mode == 0 or mode == 2
-			if has_reconstruction_history:
-				for index in 2:
-					if not _create_named_texture(buffers, state, "full_radiance_%d" % index,
-							RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, reconstruct_size, array_count, true, rd) \
-							or not _create_named_texture(buffers, state, "full_transmittance_%d" % index,
-							RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, reconstruct_size, array_count, true, rd) \
-							or not _create_named_texture(buffers, state, "full_depth_%d" % index,
-							RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, reconstruct_size, array_count, true, rd):
-						return {}
-				if mode == 0:
-					if not _create_named_texture(buffers, state, "trace_secondary_radiance",
-							RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, trace_size, array_count, true, rd) \
-							or not _create_named_texture(buffers, state, "trace_secondary_transmittance",
-							RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, trace_size, array_count, true, rd):
-						return {}
+				state[trace_key] = texture
+				var history: Array[RID] = []
+				state["full_" + str(channel)] = history
+				if mode == 0 or mode == 2:
 					for index in 2:
-						if not _create_named_texture(buffers, state, "full_secondary_radiance_%d" % index,
-								RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, reconstruct_size, array_count, true, rd) \
-								or not _create_named_texture(buffers, state, "full_secondary_transmittance_%d" % index,
-								RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, reconstruct_size, array_count, true, rd):
+						texture = _create_cloud_texture(buffers, state, rd,
+								"full_%s_%d" % [channel, index], spec[0], reconstruct_size,
+								array_count, true, spec[1])
+						if not texture.is_valid():
 							return {}
-			if not _create_named_texture(buffers, state, "sky_ambient", RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
-					Vector2i.ONE, 1, false, rd):
+						history.append(texture)
+			state.sky_ambient = _create_cloud_texture(buffers, state, rd, "sky_ambient",
+					RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, Vector2i.ONE,
+					1, false, Color(0.0, 0.0, 0.0, 0.0))
+			if not state.sky_ambient.is_valid():
 				return {}
-			state.trace_radiance = _named(buffers, state, "trace_radiance")
-			state.trace_transmittance = _named(buffers, state, "trace_transmittance")
-			state.trace_depth = _named(buffers, state, "trace_depth")
-			state.full_radiance = [_named(buffers, state, "full_radiance_0"), _named(buffers, state, "full_radiance_1")] if has_reconstruction_history else []
-			state.full_transmittance = [_named(buffers, state, "full_transmittance_0"), _named(buffers, state, "full_transmittance_1")] if has_reconstruction_history else []
-			state.full_depth = [_named(buffers, state, "full_depth_0"), _named(buffers, state, "full_depth_1")] if has_reconstruction_history else []
-			if mode == 0:
-				state.trace_secondary_radiance = _named(buffers, state, "trace_secondary_radiance")
-				state.trace_secondary_transmittance = _named(buffers, state, "trace_secondary_transmittance")
-				state.full_secondary_radiance = [_named(buffers, state, "full_secondary_radiance_0"), _named(buffers, state, "full_secondary_radiance_1")]
-				state.full_secondary_transmittance = [_named(buffers, state, "full_secondary_transmittance_0"), _named(buffers, state, "full_secondary_transmittance_1")]
-			else:
-				state.trace_secondary_radiance = RID()
-				state.trace_secondary_transmittance = RID()
-				state.full_secondary_radiance = []
-				state.full_secondary_transmittance = []
-			state.sky_ambient = _named(buffers, state, "sky_ambient")
-			var clear_textures: Array[RID] = [state.trace_radiance, state.trace_depth]
-			if has_reconstruction_history:
-				clear_textures.append_array([state.full_radiance[0], state.full_radiance[1], state.full_depth[0], state.full_depth[1]])
-			if mode == 0:
-				clear_textures.append_array([state.trace_secondary_radiance,
-					state.full_secondary_radiance[0], state.full_secondary_radiance[1]])
-			for texture in clear_textures:
-				rd.texture_clear(texture, Color(0.0, 0.0, 0.0, 0.0), 0, 1, 0, array_count)
-			var clear_transmittance: Array[RID] = [state.trace_transmittance]
-			if has_reconstruction_history:
-				clear_transmittance.append_array([state.full_transmittance[0], state.full_transmittance[1]])
-			if mode == 0:
-				clear_transmittance.append_array([state.trace_secondary_transmittance,
-					state.full_secondary_transmittance[0], state.full_secondary_transmittance[1]])
-			for texture in clear_transmittance:
-				rd.texture_clear(texture, Color(1.0, 1.0, 1.0, 0.0), 0, 1, 0, array_count)
-			rd.texture_clear(state.sky_ambient, Color(0.0, 0.0, 0.0, 0.0), 0, 1, 0, 1)
 		_buffers[key] = state
 		_prune_buffers(key, rd)
 	return state
 
 
+func _cloud_texture_layout(mode: int) -> Dictionary:
+	var radiance := [RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, Color(0.0, 0.0, 0.0, 0.0)]
+	var transmittance := [RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, Color(1.0, 1.0, 1.0, 0.0)]
+	var layout := {
+		"radiance": radiance,
+		"transmittance": transmittance,
+		"depth": [RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, Color(0.0, 0.0, 0.0, 0.0)],
+	}
+	if mode == 0:
+		layout["secondary_radiance"] = radiance
+		layout["secondary_transmittance"] = transmittance
+	return layout
+
+
+func _create_cloud_texture(buffers: RenderSceneBuffersRD, state: Dictionary,
+		rd: RenderingDevice, name: String, format: int, size: Vector2i, layers: int,
+		array_texture: bool, clear_color: Color) -> RID:
+	if not _create_named_texture(buffers, state, name, format, size, layers, array_texture, rd):
+		return RID()
+	var texture := _named(buffers, state, name)
+	rd.texture_clear(texture, clear_color, 0, 1, 0, layers)
+	return texture
+
+
 func _buffer_state_textures_valid(buffers: RenderSceneBuffersRD, rd: RenderingDevice,
 		state: Dictionary, mode: int) -> bool:
-	var scope: StringName = state.get("scope", &"")
-	var required: Array = [
-		["trace_radiance", state.get("trace_radiance", RID())],
-		["trace_transmittance", state.get("trace_transmittance", RID())],
-		["trace_depth", state.get("trace_depth", RID())],
-		["sky_ambient", state.get("sky_ambient", RID())],
-	]
-	if mode == 0 or mode == 2:
-		for history_group in [
-			["full_radiance", "full_radiance_%d"],
-			["full_transmittance", "full_transmittance_%d"],
-			["full_depth", "full_depth_%d"],
-		]:
-			var cached_history_textures: Array = state.get(history_group[0], [])
-			if cached_history_textures.size() != 2:
+	var required := {"sky_ambient": state.get("sky_ambient", RID())}
+	for channel in _cloud_texture_layout(mode):
+		var trace_key := "trace_" + str(channel)
+		required[trace_key] = state.get(trace_key, RID())
+		if mode == 0 or mode == 2:
+			var history: Array = state.get("full_" + str(channel), [])
+			if history.size() != 2:
 				return false
-			for history_index in 2:
-				required.append([history_group[1] % history_index, cached_history_textures[history_index]])
-		if mode == 0:
-			required.append(["trace_secondary_radiance", state.get("trace_secondary_radiance", RID())])
-			required.append(["trace_secondary_transmittance", state.get("trace_secondary_transmittance", RID())])
-			for secondary_group in [
-				["full_secondary_radiance", "full_secondary_radiance_%d"],
-				["full_secondary_transmittance", "full_secondary_transmittance_%d"],
-			]:
-				var cached_secondary_textures: Array = state.get(secondary_group[0], [])
-				if cached_secondary_textures.size() != 2:
-					return false
-				for secondary_index in 2:
-					required.append([secondary_group[1] % secondary_index, cached_secondary_textures[secondary_index]])
-	for required_pair in required:
-		var name := StringName(required_pair[0])
-		if not buffers.has_texture(scope, name):
-			return false
-		var current: RID = buffers.get_texture(scope, name)
-		var cached: RID = required_pair[1]
-		if current != cached or not _valid_texture(rd, current):
+			for index in 2:
+				required["full_%s_%d" % [channel, index]] = history[index]
+	for name in required:
+		var current := _named(buffers, state, name)
+		if current != required[name] or not _valid_texture(rd, current):
 			return false
 	return true
 

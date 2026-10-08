@@ -1,15 +1,6 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Page tree rows for the Surface VT editor: the builders behind every node of the
-# window's hierarchy - "settings", "surface", "avt", "svt", "pages" and
-# "baked_pages".
-#
-# The window owns the widget, which view is shown and what the user selected;
-# these are pure functions over a Snapshot of the live terrain, so the shape of
-# the tree can be reasoned about - and exercised - without a window or a scene.
-#
-# TreeItem metadata is the interface back to the window: "location" selects a
-# terrain region, "slot" and "kind" a physical page, "baked" and "preview" a
-# stored cell source the inspector can show.
+# Builds page-tree rows from a terrain snapshot. Metadata selects a region
+# (location), physical page (slot/kind), or baked source (baked/preview).
 @tool
 class_name TerrainVTEditorPageRows
 extends RefCounted
@@ -23,9 +14,7 @@ const MAX_ROWS: int = 512
 const CLIPMAP: int = 2
 
 
-# Unit l covers `base * 2^l` metres and serves `size / (base * 2^l)` texels a metre, so the shape's
-# density ladder has exactly two endpoints and both follow from its three settings. The shape row here
-# and the window's clipmap hint both print them; the arithmetic used to be spelled out in each.
+# Unit l covers base * 2^l metres at size / (base * 2^l) texels per metre.
 static func shape_finest_density(p_settings: Dictionary) -> float:
 	var base := float(p_settings.get("clipmap_base_world", 0.0))
 	return (float(int(p_settings.get("clipmap_size", 0))) / base) if base > 0.0 else 0.0
@@ -36,9 +25,7 @@ static func shape_coarsest_density(p_settings: Dictionary) -> float:
 	return shape_finest_density(p_settings) / pow(2.0, float(units))
 
 
-# One read of the live terrain for one details refresh. The window gathers it so
-# that filling the tree never reaches back into the scene midway, and so every
-# builder below takes data instead of a terrain.
+# One immutable input for a details refresh; row builders never query the scene.
 class Snapshot extends RefCounted:
 	var settings: Dictionary = {}
 	var region_world: Vector2 = Vector2.ONE
@@ -121,12 +108,7 @@ static func add_settings_summary(p_tree: Tree, p_root: TreeItem, p_shot: Snapsho
 	add_row(p_tree, p_root, "Producer", "Active" if settings.has("producer") else "Unavailable", "", "Material pages are produced by the Surface VT baker")
 
 
-# The clipmap is not paged, so it has no slot for the residency list and nothing to read back from
-# the GPU. What it has is one square per unit, which the window draws, and the rows here are the
-# readings that make that drawing checkable: the addressing a unit is snapped to, whether it is
-# current, which storage answers, and what the layer cost. With no layer there is nothing to report
-# but the state itself - the height cell is deliverable, so "no layer" means no cell names it, which
-# the row says rather than reading as a build that cannot do it.
+# Clipmap rows report per-channel units, addressing and update costs.
 static func add_clipmap_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) -> void:
 	var settings := p_shot.settings
 	var layers: Dictionary = settings.get("clipmap", {})
@@ -160,9 +142,7 @@ static func add_clipmap_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot
 					"%.1f m an axis · %.3f m a texel · centre %.1f, %.1f" % [
 							float(unit.get("world_size", 0.0)), float(unit.get("texel_world", 0.0)),
 							center.x, center.y])
-	# One row a group, because "this group is not delivered by the clipmap" is a state of its own cell:
-	# the height group may name `Clipmap` and simply not have, and the diffuse+normal group may not name
-	# it at all until a source carries that channel. Both sentences come from the report.
+	# Report unconfigured channel groups separately from unsupported delivery methods.
 	var supported: Dictionary = settings.get("delivery_supported", {})
 	var unsupported: Dictionary = settings.get("delivery_unsupported", {})
 	for group in ["material", "height"]:
@@ -214,9 +194,7 @@ static func add_svt_details(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) ->
 	var region_world := p_shot.region_world
 	add_row(p_tree, p_root, "SVT persisted material", "Runtime", "", "One baked source with a full mip chain per terrain block; GPU copies runtime cache pages")
 	add_row(p_tree, p_root, "Resident", str(p_shot.svt_pages.size()), "", TerrainVTBridge.stats_text(p_shot.svt_stats))
-	# The artist-facing answer to "how much material does one terrain block
-	# carry": the addressable extent at the configured density, and how many
-	# internal pages that extent is cut into. It is not a page count.
+	# Per-block source resolution and internal page grid at the configured density.
 	var resolution := Vector2i(ceil(region_world.x * p_shot.svt_density), ceil(region_world.y * p_shot.svt_density))
 	var page_edge := maxi(1, int(p_shot.settings.get("page_size", 256)))
 	var page_grid := Vector2i(ceili(float(resolution.x) / page_edge), ceili(float(resolution.y) / page_edge))
@@ -261,9 +239,7 @@ static func add_resident_page_rows(p_tree: Tree, p_root: TreeItem, p_shot: Snaps
 		count += 1
 
 
-# Baked sources are listed per terrain block, because that is the unit the artist
-# bakes and the unit the mip chain belongs to. A coarse tile that covers more than
-# one block is listed once as shared coverage.
+# Group sources by terrain block; larger coarse tiles appear as shared coverage.
 static func add_baked_page_rows(p_tree: Tree, p_root: TreeItem, p_shot: Snapshot) -> void:
 	var pages := p_shot.baked_pages
 	var filtered: Array = []

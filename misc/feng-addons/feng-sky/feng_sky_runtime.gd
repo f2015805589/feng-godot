@@ -17,11 +17,9 @@ const DEFAULT_RAYLEIGH_PER_KM := Vector3(0.005802, 0.013558, 0.0331)
 const DEFAULT_PLANET_CENTER_M := Vector3(0.0, -6360000.0, 0.0)
 const MAX_SCATTER_COEFFICIENT_PER_KM := FengSkyParameters.MAX_SCATTER_COEFFICIENT_PER_KM
 
-static var _providers_by_world: Dictionary = {} # world instance id -> WeakRef
-static var _snapshots_by_world: Dictionary = {} # world instance id -> immutable value dictionary
+static var _snapshots_by_world: Dictionary = {} # world id -> {provider: WeakRef, snapshot}
 
-static var _rendering_providers: Dictionary = {}
-static var _rendering_by_world: Dictionary = {}
+static var _rendering_by_world: Dictionary = {} # world id -> {provider: WeakRef, snapshot}
 static var _rendering_snapshots: Array[Dictionary] = []
 static var _rendering_mutex := Mutex.new()
 
@@ -33,18 +31,16 @@ static func publish_rendering_snapshot(provider: Object, world_id: int, snapshot
 	value["world_id"] = world_id
 	value["provider_id"] = provider.get_instance_id()
 	value["render_targets"] = value.get("render_targets", [])
-	_rendering_providers[world_id] = weakref(provider)
-	_rendering_by_world[world_id] = value
+	_rendering_by_world[world_id] = {"provider": weakref(provider), "snapshot": value}
 	_publish_rendering_array()
 
 
 static func remove_rendering_snapshot(provider: Object, world_id: int) -> void:
-	var reference: WeakRef = _rendering_providers.get(world_id)
+	var reference: WeakRef = _rendering_by_world.get(world_id, {}).get("provider")
 	if reference == null:
 		return
 	var current := reference.get_ref()
 	if current == provider or current == null or not is_instance_valid(current):
-		_rendering_providers.erase(world_id)
 		_rendering_by_world.erase(world_id)
 		_publish_rendering_array()
 
@@ -52,17 +48,16 @@ static func remove_rendering_snapshot(provider: Object, world_id: int) -> void:
 static func rendering_snapshot_for_world(world_id: int) -> Dictionary:
 	# Main-thread accessor validates ownership immediately, matching fog reads.
 	refresh_rendering_snapshots()
-	return (_rendering_by_world.get(world_id, {}) as Dictionary).duplicate(true)
+	return (_rendering_by_world.get(world_id, {}).get("snapshot", {}) as Dictionary).duplicate(true)
 
 
 static func refresh_rendering_snapshots() -> void:
 	# Main-thread only. The component owns viewport routing and publishes targets.
 	var changed := false
-	for world_id in _rendering_providers.keys():
-		var reference: WeakRef = _rendering_providers[world_id]
+	for world_id in _rendering_by_world.keys():
+		var reference: WeakRef = _rendering_by_world[world_id]["provider"]
 		var provider := reference.get_ref()
 		if provider == null or not is_instance_valid(provider) or not provider.has_method("_feng_sky_rendering_is_active") or not provider.call("_feng_sky_rendering_is_active", world_id):
-			_rendering_providers.erase(world_id)
 			_rendering_by_world.erase(world_id)
 			changed = true
 			continue
@@ -72,8 +67,8 @@ static func refresh_rendering_snapshots() -> void:
 
 static func _publish_rendering_array() -> void:
 	var values: Array[Dictionary] = []
-	for value in _rendering_by_world.values():
-		values.append(value)
+	for entry in _rendering_by_world.values():
+		values.append(entry["snapshot"])
 	_rendering_mutex.lock()
 	_rendering_snapshots = values
 	_rendering_mutex.unlock()
@@ -93,42 +88,33 @@ static func publish_snapshot(provider: Object, world_id: int, snapshot: Dictiona
 	var value := snapshot.duplicate(true)
 	value["world_id"] = world_id
 	value["provider_id"] = provider.get_instance_id()
-	_providers_by_world[world_id] = weakref(provider)
-	_snapshots_by_world[world_id] = value
+	_snapshots_by_world[world_id] = {"provider": weakref(provider), "snapshot": value}
 
 
 static func remove_snapshot(provider: Object, world_id: int) -> void:
 	if world_id == 0:
 		return
-	var provider_ref: WeakRef = _providers_by_world.get(world_id)
+	var provider_ref: WeakRef = _snapshots_by_world.get(world_id, {}).get("provider")
 	if provider_ref == null:
 		return
 	var current := provider_ref.get_ref()
 	if current == provider or current == null or not is_instance_valid(current):
-		_providers_by_world.erase(world_id)
 		_snapshots_by_world.erase(world_id)
 
 
 static func snapshot_for_world(world_id: int) -> Dictionary:
-	var provider_ref: WeakRef = _providers_by_world.get(world_id)
+	var provider_ref: WeakRef = _snapshots_by_world.get(world_id, {}).get("provider")
 	if provider_ref == null:
 		return {}
 	var provider := provider_ref.get_ref()
-	if provider == null or not is_instance_valid(provider):
-		_providers_by_world.erase(world_id)
+	# Revalidate on main-thread reads so same-frame environment handoffs cannot
+	# expose the previous provider's atmosphere before its next _process().
+	if provider == null or not is_instance_valid(provider) \
+			or not provider.has_method("_feng_sky_runtime_is_active") \
+			or not provider.call("_feng_sky_runtime_is_active", world_id):
 		_snapshots_by_world.erase(world_id)
 		return {}
-	# Fog calls this from its main-thread runtime. Validate the current provider
-	# identity here as well as in FengSkyAtmosphere._process(), so a World3D
-	# environment handoff cannot expose a stale snapshot for one frame.
-	if not provider.has_method("_feng_sky_runtime_is_active") or not provider.call("_feng_sky_runtime_is_active", world_id):
-		_providers_by_world.erase(world_id)
-		_snapshots_by_world.erase(world_id)
-		return {}
-	var snapshot: Dictionary = _snapshots_by_world.get(world_id, {})
-	if snapshot.is_empty():
-		return {}
-	return snapshot.duplicate(true)
+	return (_snapshots_by_world[world_id]["snapshot"] as Dictionary).duplicate(true)
 
 
 static func atmosphere_shader() -> Shader:
@@ -223,41 +209,6 @@ static func _sample_henyey_greenstein_cosine(u: float, g: float) -> float:
 	return clampf((1.0 + g * g - term * term) / (2.0 * g), -1.0, 1.0)
 
 
-static func _legacy_transport_settings(radius: float, top_radius: float, rayleigh_height: float, mie_height: float, beta_rayleigh: Vector3, beta_mie_extinction: float) -> Dictionary:
-	# Preserve scalar diagnostic APIs without silently adding the new ozone/MS
-	# terms to callers that have supplied no such coefficients.
-	return sanitize_atmosphere_settings({
-		"planet_radius_km": radius, "atmosphere_height_km": top_radius - radius,
-		"rayleigh_scale_height_km": rayleigh_height, "mie_scale_height_km": mie_height,
-		"rayleigh_scattering_per_km": beta_rayleigh,
-		"mie_scattering_per_km": 0.0, "mie_extinction_per_km": beta_mie_extinction,
-		"absorption_extinction_per_km": Vector3.ZERO, "multi_scattering_factor": 0.0,
-	})
-
-
-static func _integrate_ray(origin: Vector3, view_direction: Vector3, sun_direction: Vector3, radius: float, top_radius: float, rayleigh_height: float, mie_height: float, beta_rayleigh: Vector3, beta_mie_scatter: float, beta_mie_extinction: float, mie_g: float) -> Vector3:
-	var settings := _legacy_transport_settings(radius, top_radius, rayleigh_height, mie_height, beta_rayleigh, beta_mie_extinction)
-	settings["mie_scattering_coefficients"] = Vector3.ONE * maxf(beta_mie_scatter, 0.0)
-	settings["mie_asymmetry"] = clampf(mie_g, 0.0, 0.999)
-	return FengSkyTransport.integrate_ray(origin, view_direction, sun_direction, settings)
-
-
-static func _transmittance_to_sun(point: Vector3, sun_direction: Vector3, radius: float, top_radius: float, rayleigh_height: float, mie_height: float, beta_rayleigh: Vector3, beta_mie_extinction: float) -> Vector3:
-	return FengSkyTransport.transmittance_to_sun(point, sun_direction, _legacy_transport_settings(radius, top_radius, rayleigh_height, mie_height, beta_rayleigh, beta_mie_extinction))
-
-
-static func _ground_sun_transmittance(up: Vector3, sun_direction: Vector3, radius: float, top_radius: float, rayleigh_height: float, mie_height: float, beta_rayleigh: Vector3, beta_mie_extinction: float) -> Vector3:
-	return FengSkyTransport.ground_sun_transmittance(up, sun_direction, _legacy_transport_settings(radius, top_radius, rayleigh_height, mie_height, beta_rayleigh, beta_mie_extinction))
-
-
-static func _ray_hits_ground(point: Vector3, direction: Vector3, radius: float) -> bool:
-	return FengSkyTransport.ray_hits_ground(point, direction, radius)
-
-
-static func _sphere_exit_distance(origin: Vector3, direction: Vector3, radius: float) -> float:
-	return FengSkyTransport.sphere_exit_distance(origin, direction, radius)
-
-
 static func sanitize_sun_direction(direction: Vector3) -> Vector3:
 	if not direction.is_finite():
 		return Vector3.UP
@@ -273,11 +224,3 @@ static func _finite_vector(value: Vector3) -> Vector3:
 	if not value.is_finite():
 		return Vector3.ZERO
 	return value.max(Vector3.ZERO)
-
-
-static func _exp_negative(value: Vector3) -> Vector3:
-	return FengSkyTransport.exp_negative(value)
-
-
-static func _view_segment_factor(extinction: Vector3, step_length: float) -> Vector3:
-	return FengSkyTransport.view_segment_factor(extinction, step_length)

@@ -11,7 +11,6 @@ extends Resource
 const PassBase = preload("passes/pass_base.gd")
 const BuiltinPass = preload("passes/builtin_pass.gd")
 const TextureManager = preload("passes/texture_manager.gd")
-const PipelineValidator = preload("pipeline/pipeline_validator.gd")
 const PipelineMigrator = preload("pipeline/pipeline_migrator.gd")
 const LibraryManager = preload("pipeline/library_manager.gd")
 const NativeSpec = preload("pipeline/native_spec.gd")
@@ -247,15 +246,18 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 	var changed := false
 	var previous_version := _pipeline_schema_version
 	if previous_version < 6 and not _has_native_schedule():
-		changed = _migrate_legacy_passes() or changed
+		_set_passes(PipelineMigrator.migrate_legacy_passes(
+			_passes, NativeSpec.seed_order(), NativeSpec.is_optional_id, _make_native_pass), false)
+		changed = true
 	elif previous_version < 6:
-		changed = _migrate_native_pass_set() or changed
+		_set_passes(PipelineMigrator.migrate_native_pass_set(_passes, NativeSpec.seed_order(), _make_native_pass), false)
+		changed = true
 	else:
 		changed = _normalize_native_entries() or changed
 	if previous_version < 7:
-		changed = _migrate_eye_adaptation_order() or changed
+		changed = PipelineMigrator.migrate_eye_adaptation_order(_passes) or changed
 	if previous_version < 8:
-		changed = _migrate_bloom_pass() or changed
+		changed = PipelineMigrator.migrate_bloom_pass(_passes, _make_native_pass) or changed
 	changed = _sync_library(false) or changed
 	# Synchronize missing managed passes first so legacy schedules that lacked one of
 	# the stock cloud entries can be recognized after the dependency-aware insertion.
@@ -392,85 +394,6 @@ func get_volume_pass_states() -> Dictionary:
 func _is_entry_enabled(pass_entry) -> bool:
 	return ExecutionPlan.is_entry_enabled(pass_entry, _volume_pass_states)
 
-## Resources authored before schema 5 carry the pre-collapse native ids. Every entry
-## that still exists keeps its enabled state, entries that became internal
-## operations of another entry are dropped (their behaviour survives inside the
-## entry they map to), and custom passes keep their position relative to the entry
-## they followed.
-func _migrate_native_pass_set() -> bool:
-	var had_temporal_aa := false
-	for pass_entry in _passes:
-		if pass_entry is BuiltinPass:
-			var mapped_id: int = PipelineMigrator.LEGACY_NATIVE_ID_MAP.get((pass_entry as BuiltinPass).native_id, -1)
-			if mapped_id == NativeSpec.PASS_TEMPORAL_AA:
-				had_temporal_aa = true
-				break
-	var migrated := PipelineMigrator.migrate_native_pass_set(_passes, NativeSpec.seed_order(), _make_native_pass)
-	if not had_temporal_aa:
-		for pass_entry in migrated:
-			if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_TEMPORAL_AA:
-				pass_entry.enabled = false
-				break
-	_set_passes(migrated, false)
-	return true
-
-## Schema 6 placed Color Grade and optional Bloom before exposure. UE meters
-## scene color after temporal AA and before Bloom, then grades during tonemapping.
-## Move only the managed Eye Adaptation entry, preserving every other pass's order.
-func _migrate_eye_adaptation_order() -> bool:
-	var eye_index := -1
-	var first_after_eye := _passes.size()
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry == null:
-			continue
-		if pass_entry.stable_id == &"library:eye_adaptation":
-			eye_index = i
-		elif pass_entry.stable_id in [
-			&"library:bloom_downsample", &"library:bloom_blur",
-			&"library:bloom_composite", &"library:color_grade",
-		]:
-			first_after_eye = mini(first_after_eye, i)
-		elif pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_BLOOM:
-			first_after_eye = mini(first_after_eye, i)
-	var temporal_index := _find_native_index(NativeSpec.PASS_TEMPORAL_AA)
-	var post_index := _find_native_index(NativeSpec.PASS_POST_PROCESS)
-	if eye_index < 0 or first_after_eye >= eye_index or (temporal_index >= 0 and first_after_eye <= temporal_index) or (post_index >= 0 and first_after_eye >= post_index):
-		return false
-	var eye_pass := _passes[eye_index]
-	_passes.remove_at(eye_index)
-	_passes.insert(first_after_eye, eye_pass)
-	return true
-
-## Schema 8 adds the engine-owned Bloom preparation pass. Insert it after the existing
-## Eye Adaptation entry (or before Color Grade/Post when no exposure pass exists) while
-## leaving every authored entry in the same relative order.
-func _migrate_bloom_pass() -> bool:
-	if _find_native_index(NativeSpec.PASS_BLOOM) >= 0:
-		return false
-
-	var insert_index := -1
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation":
-			insert_index = i + 1
-			break
-	if insert_index < 0:
-		for i in _passes.size():
-			var pass_entry := _passes[i]
-			if pass_entry == null:
-				continue
-			if pass_entry.stable_id == &"library:color_grade":
-				insert_index = i
-				break
-		if insert_index < 0:
-			insert_index = _find_native_index(NativeSpec.PASS_POST_PROCESS)
-	if insert_index < 0:
-		insert_index = _seed_insert_index(NativeSpec.PASS_BLOOM)
-
-	_passes.insert(insert_index, _make_native_pass(NativeSpec.PASS_BLOOM))
-	return true
-
 func _normalize_native_entries() -> bool:
 	var changed := false
 	for pass_entry in _passes:
@@ -507,31 +430,13 @@ func _normalize_native_entries() -> bool:
 	var provided := _provided_native_ids()
 	var mandatory := NativeSpec.mandatory_ids()
 	for native_id in NativeSpec.default_ids():
-		if not mandatory.has(native_id) or _find_native_index(native_id) >= 0:
+		if not mandatory.has(native_id) or PipelineMigrator.native_index(_passes, native_id) >= 0:
 			continue
 		if provided.has(native_id):
 			continue
-		_passes.insert(_seed_insert_index(native_id), _make_native_pass(native_id))
+		_passes.insert(PipelineMigrator.seed_insert_index(_passes, native_id), _make_native_pass(native_id))
 		changed = true
 	return changed
-
-## Position the seed order gives an entry, relative to the entries already present.
-func _seed_insert_index(native_id: int) -> int:
-	var seed_ids := NativeSpec.default_ids()
-	var target: int = seed_ids.find(native_id)
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if not pass_entry is BuiltinPass:
-			continue
-		var existing_pos: int = seed_ids.find((pass_entry as BuiltinPass).native_id)
-		if existing_pos >= 0 and existing_pos > target:
-			return i
-	return _passes.size()
-
-func _migrate_legacy_passes() -> bool:
-	_set_passes(PipelineMigrator.migrate_legacy_passes(
-		_passes, NativeSpec.seed_order(), NativeSpec.is_optional_id, _make_native_pass), false)
-	return true
 
 func _sync_library(emit: bool) -> bool:
 	var changed: bool = LibraryManager.sync(_passes, _synced_library, _synced_library_ids, _deleted_library, _deleted_library_ids)
@@ -540,13 +445,6 @@ func _sync_library(emit: bool) -> bool:
 	if changed and emit:
 		emit_changed()
 	return changed
-
-func _find_native_index(native_id: int) -> int:
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == native_id:
-			return i
-	return -1
 
 ## Records a library entry as already present in this pipeline, so synchronization
 ## neither adds it again nor reads its removal as an accident. The editor menu marks the
@@ -646,7 +544,6 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 	var provided := ExecutionPlan.provided_native_ids(_passes, enabled_fn)
 	var declared := ExecutionPlan.declared_provided_ids(_passes, enabled_fn)
 	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn)
-	warnings = _with_bloom_eye_order_warning(warnings, enabled_fn)
 	if not warnings.is_empty():
 		return {"warnings": warnings}
 	# Effect slot zero belongs to each view's texture manager. Build keeps custom
@@ -692,32 +589,12 @@ func get_validation_warnings() -> PackedStringArray:
 	return _last_validation_warnings
 
 func _validate_schedule() -> PackedStringArray:
-	var warnings := ExecutionPlan.validation_warnings(
+	return ExecutionPlan.validation_warnings(
 		_passes,
 		_provided_native_ids(),
 		_declared_provided_ids(),
 		_is_entry_enabled
 	)
-	return _with_bloom_eye_order_warning(warnings, _is_entry_enabled)
-
-func _with_bloom_eye_order_warning(warnings: PackedStringArray, is_enabled_fn: Callable) -> PackedStringArray:
-	var eye_index := -1
-	var bloom_index := -1
-	var eye_enabled := false
-	var bloom_enabled := false
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry == null:
-			continue
-		if pass_entry.stable_id == &"library:eye_adaptation":
-			eye_index = i
-			eye_enabled = is_enabled_fn.call(pass_entry)
-		elif pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_BLOOM:
-			bloom_index = i
-			bloom_enabled = is_enabled_fn.call(pass_entry)
-	if eye_enabled and bloom_enabled and eye_index > bloom_index:
-		warnings.append("Eye Adaptation must precede native Bloom; authored order was retained and the previous valid schedule remains active.")
-	return warnings
 
 func get_configuration_warnings() -> PackedStringArray:
 	_ensure_pipeline_initialized(false)

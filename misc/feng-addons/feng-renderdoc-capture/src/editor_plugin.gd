@@ -22,9 +22,7 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
-	# A plugin can be disabled or hot-reloaded while the capture wait is still
-	# suspended. Restore the editor's original update modes before the nodes are
-	# detached so an interrupted capture cannot leave a viewport running forever.
+	# Retire pending waits and restore viewport modes before detaching.
 	_finish_capture()
 	var settings := EditorInterface.get_editor_settings()
 	if settings.settings_changed.is_connected(_settings_changed):
@@ -70,9 +68,7 @@ func _on_capture_pressed() -> void:
 		_warning("Set RenderDoc > Capture > Executable Path to " + gui_name + " in Editor Settings.")
 		return
 	if not FengRenderDoc.is_hooked():
-		# RenderDoc attaches while the editor starts, so a stale or missing installation
-		# cannot be fixed from inside the running editor. Report what went wrong at
-		# startup instead of only saying that the device is not attached.
+		# Attachment happens before graphics-device creation.
 		var reason := str(FengRenderDoc.get_mount_status())
 		if reason.is_empty():
 			reason = "RenderDoc was not mounted when this editor started."
@@ -82,16 +78,10 @@ func _on_capture_pressed() -> void:
 	_capture_generation += 1
 	var generation := _capture_generation
 	button.disabled = true
-	# The editor deliberately stops rendering unchanged viewports while it is idle, so
-	# keep the visible 3D editor viewports alive for this one capture: the capture renders
-	# the frame itself, and a stale SubViewport would put a stale scene into it.
+	# Keep visible scene viewports current during the capture.
 	_prepare_capture_viewports()
 	EditorInterface.get_base_control().queue_redraw()
-	# Render one frame and capture exactly that frame. Queuing "the next presented frame"
-	# instead can land on a UI-only update, which holds a handful of commands and none of
-	# the scene passes.
-	# Capture actual pending work and resident textures. Replaying every resident
-	# page here bypasses streaming budgets and can stall large terrain captures.
+	# Draw the scene synchronously while honoring normal terrain streaming budgets.
 	var capture := str(RenderDocCapture.capture_frame(button.get_window().get_window_id()))
 	if not capture.is_empty() and FileAccess.file_exists(capture):
 		_finish_capture()
@@ -148,8 +138,7 @@ func _prepare_capture_viewports() -> void:
 		var viewport = EditorInterface.get_editor_viewport_3d(index)
 		if not is_instance_valid(viewport):
 			continue
-		# SubViewport is a Node rather than a CanvasItem, so visibility must be
-		# checked on its container when that container exposes CanvasItem's API.
+		# SubViewport visibility belongs to its CanvasItem container.
 		var container = viewport.get_parent()
 		if container is CanvasItem and not container.is_visible_in_tree():
 			continue
@@ -165,8 +154,7 @@ func _restore_capture_viewports() -> void:
 		var viewport = entry["viewport"]
 		if is_instance_valid(viewport):
 			viewport.set_update_mode(entry["mode"])
-	# Clearing the member makes restoration idempotent and releases stale node
-	# references after a completed or interrupted capture.
+	# Release the snapshot after restoration.
 	_capture_forced_viewports.clear()
 
 

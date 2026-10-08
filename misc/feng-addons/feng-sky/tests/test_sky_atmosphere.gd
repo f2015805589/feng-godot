@@ -440,11 +440,10 @@ func run_runtime_checks() -> void:
 	require(is_equal_approx(float(near_horizon_shader.get_shader_parameter("sun_irradiance")),
 		sky_a._sun_irradiance(sun_a)),
 		"ground attenuation incorrectly changed the sky shader's top-of-atmosphere source")
-	require_vec3_near(FengFogRuntime._fog_sun_illuminance(sun_a, snapshot_a, near_horizon_top),
+	require_vec3_near(FengFogRuntime._matched_atmosphere_sun_illuminance(sun_a, snapshot_a),
 		near_horizon_ground, maxf(near_horizon_ground.length() * 0.00001, 0.000001),
 		"fog did not select the matching atmosphere light's ground illuminance")
-	require_vec3_near(FengFogRuntime._fog_sun_illuminance(sun_b, snapshot_a, near_horizon_top),
-		near_horizon_top, maxf(near_horizon_top.length() * 0.00001, 0.000001),
+	require(FengFogRuntime._matched_atmosphere_sun_illuminance(sun_b, snapshot_a) == null,
 		"fog attenuated a different-world directional light")
 	print("ATMOSPHERE LOW_SUN elevation_sine=", near_horizon_direction.y,
 		" top_illuminance=", near_horizon_top, " ground_illuminance=", near_horizon_ground,

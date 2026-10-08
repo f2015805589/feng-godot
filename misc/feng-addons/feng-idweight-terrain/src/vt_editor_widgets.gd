@@ -1,10 +1,5 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Widget factories shared by the Surface VT editor's panels.
-#
-# Three panels in the window (settings, SVT bands, CDLOD) lay out the same label
-# and spin box, and the two things that matter about them are that a settings
-# label is vertically centred next to its control and that a spin box is the same
-# width everywhere. Both live here once instead of in each builder.
+# Shared VT panel label alignment and spin-box metrics.
 @tool
 class_name TerrainVTEditorWidgets
 extends RefCounted
@@ -21,9 +16,7 @@ static func make_setting_label(p_text: String) -> Label:
 	return label
 
 
-# A spin box that never accepts a value outside its range: these controls write
-# straight into the terrain, so clamping in the widget is what keeps a typed
-# out-of-range number from reaching it.
+# Clamp edits to the supplied range; callers may opt into a soft limit.
 static func make_spin(p_min: float, p_max: float, p_step: float) -> SpinBox:
 	var spin := SpinBox.new()
 	spin.min_value = p_min

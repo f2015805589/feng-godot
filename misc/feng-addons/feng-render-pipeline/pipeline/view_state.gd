@@ -10,7 +10,6 @@ const Parameters = preload("parameter_resolver.gd")
 
 var _manager := TextureManager.new()
 var _bindings: Dictionary = {}
-var _executors: Dictionary = {}
 var _effects: Array[CompositorEffect] = []
 var _plan: Dictionary = {}
 var _parameters: Dictionary = {}
@@ -24,7 +23,6 @@ func apply(compositor: Compositor, renderer: FengRenderer, parameters: Dictionar
 	var changed_definition := _renderer_id != renderer.get_instance_id() or _revision != renderer.get_parameter_revision()
 	if changed_definition:
 		_bindings = {}
-		_executors = {}
 		_plan = {}
 		_valid = false
 		_renderer_id = renderer.get_instance_id()
@@ -56,10 +54,10 @@ func apply(compositor: Compositor, renderer: FengRenderer, parameters: Dictionar
 			var active: bool = candidate.enabled[index]
 			if not _bindings.has(source):
 				_bindings[source] = ViewPass.new()
-			if active and not _executors.has(source):
-				_executors[source] = source if renderer.is_view_shareable(source) else source.duplicate(true)
-			var effect = _bindings[source]
-			effect.configure(source, _executors.get(source), active)
+			var effect: ViewPass = _bindings[source]
+			if active and effect.execution == null:
+				effect.execution = source if renderer.is_view_shareable(source) else source.duplicate(true)
+			effect.configure(source, effect.execution, active)
 			_effects.append(effect)
 			scripted.append(effect)
 		_manager.passes = scripted

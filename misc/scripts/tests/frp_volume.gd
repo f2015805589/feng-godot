@@ -61,7 +61,7 @@ func settle() -> void:
 		await RenderingServer.frame_post_draw
 
 func _run() -> void:
-	# Compare the compiled hot path with the independent generic resolver.
+	# Check numeric/color/enum/switch semantics against explicit expected values.
 	var layer_a := Volume.new()
 	var layer_b := Volume.new()
 	layer_a.profile = Profile.new()
@@ -77,9 +77,18 @@ func _run() -> void:
 	for a in [0.0, 0.2, 0.49, 0.5, 0.8, 1.0]:
 		for b in [0.0, 0.2, 0.49, 0.5, 0.8, 1.0]:
 			prepared.influences = {layer_a.get_instance_id(): a, layer_b.get_instance_id(): b}
-			assert(VolumeResolver.evaluate_compiled(program, prepared.influences) ==
-					VolumeResolver.evaluate([], blend_base, Vector3.ZERO, blend_schema, {}, true, prepared),
-					"compiled numeric/color/enum/switch blends must preserve generic semantics")
+			var expected := {}
+			if a > 0.0:
+				expected = {"amount": lerpf(2.0, 8.0, a), "mode": 2 if a >= 0.5 else 0,
+					"tint": Color.BLACK.lerp(Color.RED, a)}
+			if b > 0.0:
+				expected.amount = lerpf(expected.get("amount", 2.0), 4.0, b)
+				expected.enabled = true
+			var result := {"parameters": {} if expected.is_empty() else {6: expected},
+					"pass_states": {6: true} if b > 0.0 else {}}
+			assert(VolumeResolver.evaluate_compiled(program, prepared.influences) == result)
+			assert(VolumeResolver.evaluate([], blend_base, Vector3.ZERO, blend_schema, {}, true, prepared) == result)
+
 	layer_a.free()
 	layer_b.free()
 	var dynamic := DynamicSchemaPass.new()

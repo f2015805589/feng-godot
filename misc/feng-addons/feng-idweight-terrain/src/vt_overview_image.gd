@@ -118,11 +118,8 @@ static func blit_material_preview(p_image: Image, p_record: Dictionary, p_bounds
 	p_image.blit_rect(tile, Rect2i(Vector2i.ZERO, tile.get_size()), position)
 
 
-# The stitched height overview: each region's CPU height image is read once and
-# downsampled in memory. The previous implementation called
-# Terrain3DData.get_height() for every thumbnail pixel, which made an explicit
-# 768px overview issue hundreds of thousands of native calls. Sampling is capped
-# at 128x128 per region and the small image is then enlarged into the stitch.
+# Read each region's height image once, sample at up to 128x128, then scale
+# into the stitched overview. All per-pixel work stays on the CPU images.
 static func height_thumbnail(p_bounds: Rect2, p_size: Vector2i, p_locations: Array,
 		p_region_world: Vector2, p_global_range: Vector2, p_get_region: Callable) -> Image:
 	var image := Image.create(p_size.x, p_size.y, false, Image.FORMAT_RGBA8)

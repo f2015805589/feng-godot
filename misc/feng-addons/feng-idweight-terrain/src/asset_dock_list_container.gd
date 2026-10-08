@@ -121,21 +121,12 @@ func add_item(p_resource: Resource = null) -> void:
 
 
 func _on_role_selected(p_role: int, p_entry: ListEntry) -> void:
-	# IdWeight pair painting. p_role 0 is the left mouse button and 1 is
-	# the right one. The packed chain writes the left-clicked layer into the
-	# Background pair field (the base layer) and the right-clicked layer into
-	# the Overlay field (the layer the Weight slider fades in), so a left click
-	# carries background_id and a right click overlay_id. The displayed naming
-	# is the other way round on purpose, and this dock keeps that reversed
-	# naming for its markers, so assert the fields, not the labels.
-	# The clicked entry carries the role; the pair state lives in the UI.
+	# Left/white maps to packed Background; right/blue maps to packed Overlay.
+	# Display labels retain the opposite convention; the UI owns the pair values.
 	if not is_instance_valid(p_entry):
 		return
-	# Read the clicked asset before change_tool(): that call reaches the dock's
-	# _on_textures_pressed() -> update_asset_list(), which frees every entry in
-	# this list. Looking p_entry up afterwards returns -1, and the old code then
-	# skipped set_selected_id() entirely, leaving the brush data on the previous
-	# pair while the dock displayed the new one.
+	# Capture the resource before change_tool() can rebuild and free this list
+	# through the dock's _show_asset_list().
 	var res_id: int = p_entry.get_resource_id()
 	var clicked_resource: Resource = p_entry.resource
 	if plugin.ui:
@@ -178,15 +169,7 @@ func _index_of_asset(p_res_id: int) -> int:
 	return -1
 
 
-# IdWeight pair roles. p_role is 0 for the left mouse button and 1 for the right
-# one.
-#
-# The packed chain writes the left-clicked layer into the Background pair field
-# (the base layer) and the right-clicked layer into the Overlay field (the layer
-# the Weight slider fades in), so role 0 writes the background field and role 1
-# writes the overlay field. The displayed layer-grid label names the two roles
-# the other way round on purpose, and this dock keeps that reversed naming for
-# its markers and for the brush-bar readout. Assert the fields, not the labels.
+# Role 0 (left) writes Background; role 1 (right) writes Overlay.
 static func role_writes_overlay_field(p_role: int) -> bool:
 	return p_role != 0
 
@@ -246,11 +229,7 @@ func _restore_role_highlights() -> void:
 	redraw()
 
 
-# The layer grid marks the left-click role white and the right-click role blue,
-# and the packed chain writes those clicks into the Background and Overlay pair
-# fields respectively. Bind the marker bits to the mouse button rather than to
-# the field name so the dock keeps matching the rendered result.
-# Bit 1 = white (left click), bit 2 = blue (right click).
+# Marker bits follow mouse roles: 1 = white/Background, 2 = blue/Overlay.
 func _role_flags_for(p_res_id: int) -> int:
 	var flags: int = 0
 	if p_res_id == plugin.ui.pair_background_id:

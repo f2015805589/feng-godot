@@ -10,7 +10,7 @@
 // Movement relabels resident blocks and queues entering edges. Toroidal offsets
 // preserve each block's content between block crossings. Optional per-ring spare
 // slots allow replacements to finish before previous storage is recycled.
-// Production is bounded by blocks_per_frame: coarse-first fill, fine-first scroll.
+// Production is bounded by blocks_per_frame; missing blocks queue finest-ring first.
 //
 // The grid is world-XZ aligned. A coarse global block provides outer coverage.
 // Workers pack block rectangles; the render thread publishes device copies.
@@ -102,7 +102,6 @@ public:
 		int ring = 0;
 		int gx = 0;
 		int gy = 0;
-		int chebyshev = 0;
 		int slot = -1;
 		// The toroidal offset in the ring's own texels.
 		Vector2i offset;
@@ -371,7 +370,6 @@ private:
 	// Block-sized staging textures, one per channel.
 	std::vector<RID> _staging_rd;
 	std::vector<PendingUpload> _pending_uploads;
-	std::vector<RID> _staging_rs;
 	// One device texture per baked channel, sized to the whole atlas, plus its RenderingServer
 	// wrapper. The producer writes rects of the device texture as storage images and the arm samples
 	// the wrapper; the two are created and freed together, exactly like the ring's baked arrays.
@@ -387,7 +385,6 @@ private:
 
 	Vector2 _last_focus;
 	bool _has_focus = false;
-	Vector2i _grid_step;
 	// One entry a ring: its start point (a whole number of blocks from the frame origin), its phase
 	// inside the block in its own texels, and the block step the last relabelling was done at.
 	std::vector<Vector2> _ring_origin;

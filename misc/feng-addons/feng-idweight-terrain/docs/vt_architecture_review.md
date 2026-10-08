@@ -16,7 +16,7 @@ owns the state transitions behind its public operations. The source is grouped b
 | `terrain_3d_vt_state.h` | Node-owned VT configuration and coordinated state: pool generation, plans, fades, bake jobs and Clipmap layers |
 | `terrain_vt.h` | Engine-independent page coordinates, mip lookup and POT virtual-block allocation |
 | `terrain_3d_virtual_texture*`, `terrain_3d_vt_indirection*` | Per-view addressing, virtual blocks and dirty page-table uploads |
-| `terrain_3d_vt_page_pool*` | Shared physical slots, acquisition/commit/abort, LRU, protection and reverse ownership |
+| `terrain_3d_vt_page_pool*` | Shared physical slots, synchronous allocation, LRU, pin counts and reverse ownership |
 | `terrain_3d_sector_avt*`, `terrain_3d_avt_plan*`, `terrain_3d_avt_produce.cpp` | Near-field motion prediction, sector hierarchy, immutable planning input and page production schedule |
 | `terrain_3d_surface_views*` | Delivery selection, view configuration, near/far demand and SVT root/visible-page planning |
 | `terrain_3d_page_pipeline*`, `terrain_3d_surface_source.cpp` | Bounded worker requests and immutable source snapshots |
@@ -35,9 +35,9 @@ same complete configuration on initial setup and pool rebuild.
 On the editor side, `vt_editor.gd` owns the window and selection; `vt_terrain_bridge.gd`
 performs its guarded native calls. Overview/image math and page rows are data helpers;
 SVT bands and CDLOD controls own their panels. Inspector and plugin callers guard their
-own optional native methods. `asset_dock_common.gd` owns shared dock behavior, with
-version-specific hosts in `asset_dock.gd` / `asset_dock_45.gd`; `ui_decal.gd` owns cursor
-visuals. Signals and temporary resources are released by the object that registered them.
+own optional native methods. `asset_dock.gd` owns EditorDock hosting, asset-source
+bindings and list selection; list containers and entries own their resource subscriptions.
+`ui_decal.gd` owns cursor visuals. Signals and temporary resources are released by the object that registered them.
 Node resource replacement disconnects the old material/assets graph before uninitializing it;
 asset-list membership owns each asset subscription. Bulk and single sector remaps use the
 same ownership transitions; public nearest-surface queries share the region-boundary sampler.

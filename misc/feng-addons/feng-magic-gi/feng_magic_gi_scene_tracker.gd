@@ -7,7 +7,6 @@ const BROADPHASE_EPSILON := 0.001
 const SCENE_SCAN_TTL_MSEC := 250
 
 static var _watched_objects: Dictionary = {}
-static var _resource_revisions: Dictionary = {}
 static var _next_resource_prune := 0
 static var _scene_scans: Dictionary = {} ## "root_id:world_id" -> {checked_at, signature}
 
@@ -110,8 +109,7 @@ static func watch_object(object_value: Object) -> void:
 	var id := object_value.get_instance_id()
 	if _watched_objects.has(id):
 		return
-	_watched_objects[id] = weakref(object_value)
-	_resource_revisions[id] = 0
+	_watched_objects[id] = {"reference": weakref(object_value), "revision": 0}
 	if object_value.has_signal("changed"):
 		object_value.connect("changed", _on_object_changed.bind(id))
 	for signal_name in ["maps_changed", "region_map_changed", "height_maps_changed",
@@ -124,17 +122,16 @@ static func watch_object(object_value: Object) -> void:
 static func resource_revision(object_value: Object) -> int:
 	if object_value == null:
 		return 0
-	return int(_resource_revisions.get(object_value.get_instance_id(), 0))
+	return int(_watched_objects.get(object_value.get_instance_id(), {}).get("revision", 0))
 
 static func _on_object_changed(id: int) -> void:
-	_resource_revisions[id] = int(_resource_revisions.get(id, 0)) + 1
+	_watched_objects[id].revision += 1
 
 static func _on_object_area_changed(_area: AABB, id: int) -> void:
-	_resource_revisions[id] = int(_resource_revisions.get(id, 0)) + 1
+	_on_object_changed(id)
 
 static func _prune_watched_objects() -> void:
 	for id in _watched_objects.keys():
-		var reference: WeakRef = _watched_objects[id]
+		var reference: WeakRef = _watched_objects[id].reference
 		if reference.get_ref() == null:
 			_watched_objects.erase(id)
-			_resource_revisions.erase(id)

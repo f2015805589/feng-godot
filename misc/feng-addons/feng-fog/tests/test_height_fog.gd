@@ -111,6 +111,17 @@ func run() -> void:
 	viewport_a.add_child(fog)
 	var fog_b := FengHeightFog.new()
 	viewport_b.add_child(fog_b)
+	var later_fog := FengHeightFog.new()
+	viewport_a.add_child(later_fog)
+	FengFogRuntime.register(fog)
+	require(snapshot_for(later_fog).get("fog_id") == later_fog.get_instance_id(), "Repeated registration changed fog precedence")
+	later_fog.enabled = false
+	require(snapshot_for(fog).get("fog_id") == fog.get_instance_id(), "Disabled newest fog did not restore its predecessor")
+	later_fog.enabled = true
+	require(snapshot_for(later_fog).get("fog_id") == later_fog.get_instance_id(), "Re-enabled newest fog lost its precedence")
+	later_fog.free()
+	require(snapshot_for(fog).get("fog_id") == fog.get_instance_id(), "Removing newest fog retained a stale publication")
+
 	var provider_a := SkyProvider.new()
 	provider_a.world_id = world_a_id
 	var provider_b := SkyProvider.new()

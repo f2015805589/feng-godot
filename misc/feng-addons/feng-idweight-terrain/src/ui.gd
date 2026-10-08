@@ -29,24 +29,15 @@ var _selected_operation: Terrain3DEditor.Operation = Terrain3DEditor.OP_MAX
 var _tool_state_initialized: bool = false
 var inverted_input: bool = false
 
-# IdWeight pair painting state: which role the next stroke paints.
-# 0 = the left-mouse role, 1 = the right-mouse role. The dock labels them the
-# opposite way round from the packed fields ("Left click: Overlay    Right
-# click: Background"), because that on-screen naming is deliberately reversed
-# against the field order, so the left-click role writes pair_background_id (the
-# base layer) and the right-click role writes pair_overlay_id (the layer the
-# Weight slider fades in). Border colours follow the same convention:
-# left = white, right = blue.
+# Last dock click: 0 = left/white, 1 = right/blue. Display labels are reversed
+# from packed fields: left writes Background; right writes Overlay.
 var pair_active_role: int = 0
 # The packed R16 pair fields. pair_overlay_id is the layer the Weight slider
 # fades in; pair_background_id is the layer it fades over.
 var pair_overlay_id: int = 0
 var pair_background_id: int = 0
 
-# 3 Editor decals live in `ui_decal.gd`: the cursor quad, its brush texture, the
-# gradient markers and the shader parameters that draw them. `decal` reads the tool,
-# brush and pointer state this node owns and turns it into one shader update, so the
-# UI is the only place that knows about tools and the dock keeps drawing them.
+# The child decal renderer owns cursor, brush and gradient-marker shader state.
 var decal: TerrainUIDecal
 
 
@@ -186,11 +177,8 @@ func _on_tool_changed(p_tool: Terrain3DEditor.Tool, p_operation: Terrain3DEditor
 			to_show.push_back("slope_based_damp")
 			to_show.push_back("slope_based_normal_damp")
 			to_show.push_back("slope")
-			# The IdWeight R16 contract stores no per-texel UV rotation or
-			# scale (Overlay:5 | Background:5 | Mode:2 | Weight:3 | UV:1, and UV
-			# variant 0 is the only valid value), so the legacy Angle/Scale brush
-			# controls have nothing left to write. Per-material UV scale comes
-			# from the texture asset instead (edit it in the asset dock).
+			# R16 carries Overlay:5 | Background:5 | Mode:2 | Weight:3 | UV:1.
+			# UV variant is zero; texture assets own material UV scale.
 
 		Terrain3DEditor.COLOR:
 			to_show.push_back("brush")
@@ -273,11 +261,7 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 	# IdWeight pair painting: keep the selected overlay/background roles
 	# stable across asset selection changes, and apply the current role's asset.
 	if plugin.editor and plugin.editor.get_tool() == Terrain3DEditor.TEXTURE:
-		# pair_active_role is the role of the last dock click: 0 = left mouse,
-		# 1 = right mouse. The packed chain writes the left-clicked layer into the
-		# Background pair field (the base) and the right-clicked layer into the
-		# Overlay field (the layer the Weight slider fades in), so the
-		# button-to-field mapping is the mirror of the role names the dock shows.
+		# Left-click selection writes Background; right-click selection writes Overlay.
 		if pair_active_role == 1:
 			pair_overlay_id = brush_data["asset_id"]
 		else:
@@ -287,13 +271,7 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 		brush_data["pair_mode"] = tool_settings.get_setting("pair_mode")
 		brush_data["pair_weight_level"] = tool_settings.get_setting("pair_weight_level")
 		_update_pair_role_readout()
-		# Each slope parameter belongs to a pair ROLE, not to whichever asset
-		# is selected: the shader reads blendSharpness from the Background
-		# (Horizontal) material and both damps from the Overlay (Vertical)
-		# material, so the brush edits exactly backgroundSettings.blendSharpness
-		# plus overlaySettings.slopeBasedDamp.
-		# Writing all three to the selected asset silently edited the parameter of
-		# whichever role was not selected, so the edit never reached the shader.
+		# Background owns blend sharpness; Overlay owns the colour and normal damps.
 		_sync_slope_setting("slope_blend_sharpness", pair_background_id, p_setting)
 		_sync_slope_setting("slope_based_damp", pair_overlay_id, p_setting)
 		_sync_slope_setting("slope_based_normal_damp", pair_overlay_id, p_setting)
@@ -309,14 +287,7 @@ func _on_setting_changed(p_setting: Variant = null) -> void:
 	update_decal()
 
 
-# IdWeight pair role readout for the brush bar. The layer grid names the active
-# role ("Current Pair Selection: <slot> · <id>: <name>"), but the asset dock
-# only draws role borders, so which material was the overlay and which was the
-# background was invisible while painting. The slots name the packed pair
-# fields: the
-# Overlay slot is the layer the Weight slider fades in and the Background slot is
-# the layer it fades over. Role ids index the texture asset list, and id 0 is a
-# valid material, so a slot only reports as missing when no asset exists.
+# Describe the packed pair fields. Asset ID zero is valid.
 func _update_pair_role_readout() -> void:
 	if not tool_settings:
 		return
@@ -333,12 +304,7 @@ func _describe_pair_role(p_asset_id: int) -> String:
 	return "%d: %s" % [ tex.id, tex.get_name() ]
 
 
-# Keeps one slope slider bound to the pair role that owns it. The shader reads
-# blendSharpness from the Background material and slopeBasedDamp /
-# slopeBasedNormalDamp from the Overlay material, so a slider edit must land on
-# that role's asset and the slider must display that role's value. Editing the
-# selected asset instead let a change silently miss the shader whenever the
-# selected asset held the other role.
+# Bind each slope control to its owning pair asset; unrelated edits only refresh it.
 func _sync_slope_setting(p_key: String, p_asset_id: int, p_changed: Variant) -> void:
 	var control: Object = tool_settings.settings.get(p_key)
 	if not control is Range:

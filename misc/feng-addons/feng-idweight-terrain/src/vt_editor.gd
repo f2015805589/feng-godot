@@ -1,14 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
-# Surface VT editor. The editor intentionally keeps all expensive work behind
-# explicit buttons: page previews are GPU readbacks only when requested, and the
-# world thumbnail is stitched only when Refresh overview is pressed.
-#
-# The window is the shell: it owns the widgets, the selection state and which view
-# is shown. Everything with rules of its own lives in a sibling script - the page
-# rows in vt_editor_page_rows.gd, the mip distance bands in vt_editor_svt_bands.gd,
-# the delivery matrix in vt_editor_delivery_rows.gd, the CDLOD controls in
-# vt_editor_cdlod_panel.gd, the duck-typed native API in vt_terrain_bridge.gd and the
-# world/image maths in vt_overview_image.gd.
+# Surface VT window: selection and panel routing. Page rows, image math and
+# panel controls live in sibling scripts; optional native calls go through the bridge.
+# GPU page previews are explicit; overview images rebuild only when dirty or requested.
 @tool
 extends Window
 class_name TerrainVTEditor
@@ -16,23 +9,16 @@ class_name TerrainVTEditor
 const OVERVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_world_overview.gd")
 const CLIPMAP_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd")
 const OVERVIEW_EDGE: int = 768
-const INVALID_LOCATION := Vector2i(2147483647, 2147483647)
 const SVT_AUTO_BAKE_PROPERTY: StringName = &"surface_svt_auto_bake"
 const BAKE_STATUS_POLL_INTERVAL: float = 0.25
-# The one clipmap delivery's two storages, in the order of the native `TerrainClipmap::Implementation`
-# enum, which is also the item id the OptionButton stores. They are not deliveries: the matrix selects
-# `Clipmap` once and this chooses how that one layer stores its units.
+# Item IDs match TerrainClipmap::Implementation.
 const CLIPMAP_IMPLEMENTATIONS: Array[String] = ["LOD", "Atlas"]
 const CLIPMAP_QUALITIES: Array[String] = ["Standard", "Performance"]
-# The matrix's own vocabulary - the methods, the bands, the channel groups and the cell labels - lives
-# with the rows in vt_editor_delivery_rows.gd, and the hint below reads it from there.
-# The method these rows are about, by the native enum's value (`Clipmap`): the rows read the published
-# capability rather than keeping a list of their own.
+# TerrainVT::Delivery::Clipmap; supported channel groups come from the native report.
 const DELIVERY_CLIPMAP: int = 2
 
 var plugin: EditorPlugin
 var terrain: Object
-var _data: Object
 
 var hierarchy: Tree
 var page_tree: Tree
@@ -56,8 +42,6 @@ var clipmap_quality_option: OptionButton
 var clipmap_implementation_option: OptionButton
 var clipmap_hint: Label
 var _clipmap_preview: Control
-## The delivery matrix: its four OptionButtons are aliased into the members below, which the
-## window's own layout, refreshes and editor tests read.
 var _delivery: TerrainVTEditorDeliveryRows
 var cdlod_panel: VBoxContainer
 var svt_panel: VBoxContainer
@@ -78,30 +62,18 @@ var avt_band_grid: GridContainer
 var avt_band_spins: Array[SpinBox] = []
 var avt_density_hint: Label
 var avt_mode_option: OptionButton
-# The delivery matrix: one row per distance band, one column per channel group. Each cell is an
-# OptionButton whose item id is the native delivery value, so the widget stores the same number the
-# property does and no name lookup has to be kept in step. The four rows replace the old
-# "AVT runtime material" / "SVT persisted material" check boxes, which could only express one
-# method per tier for both groups at once.
-var delivery_near_material: OptionButton
-var delivery_near_height: OptionButton
-var delivery_far_material: OptionButton
-var delivery_far_height: OptionButton
 var svt_auto_bake_button: CheckButton
 var auto_bake_hint: Label
 var bake_button: Button
 var bake_status: Label
 var _svt_bands: TerrainVTEditorSvtBands
 
-var _overview_texture: Texture2D
 var _overview_dirty: bool = true
 var _selected_slot: int = -1
-var _selected_location: Vector2i = INVALID_LOCATION
 var _selected_kind: String = ""
 var _selected_hierarchy_kind: String = "surface"
 var _selected_baked_mip: int = 0
 var _updating_settings: bool = false
-var _updating_mip: bool = false
 var _bake_status_elapsed: float = 0.0
 var _last_bake_refresh_generation: int = -1
 var _built: bool = false
@@ -146,9 +118,7 @@ func open_for_terrain(p_terrain: Object) -> void:
 	_refresh_all()
 
 
-## Entry point used by the Terrain3D Inspector's VT Page foldout. Selecting
-## the hierarchy row keeps the window useful even when no baked pages exist;
-## the overview then shows the explicit height fallback or stitched SVT data.
+## Opens the VT Page hierarchy, including the height fallback when no bake exists.
 func open_vt_page_view() -> void:
 	if not _built:
 		_build_ui()
@@ -179,9 +149,7 @@ func set_terrain(p_terrain: Object) -> void:
 	if p_terrain != null and not is_instance_valid(p_terrain):
 		p_terrain = null
 	terrain = p_terrain
-	_data = _get_data(terrain)
 	_selected_slot = -1
-	_selected_location = INVALID_LOCATION
 	_selected_kind = ""
 	_overview_dirty = true
 	_last_bake_refresh_generation = -1
@@ -413,9 +381,7 @@ func _build_ui() -> void:
 
 func _build_hierarchy() -> void:
 	hierarchy.clear()
-	# Keep an invisible Tree root so the visible hierarchy has one explicit
-	# Surface VT node. This also makes get_root().get_first_child() stable for
-	# editor integrations that inspect the dock tree.
+	# The first visible child is the Surface VT root.
 	var tree_root := hierarchy.create_item()
 	var surface := hierarchy.create_item(tree_root)
 	surface.set_text(0, "Surface VT")
@@ -432,9 +398,7 @@ func _build_hierarchy() -> void:
 	settings_child.set_text(0, "Atlas config")
 	settings_child.set_metadata(0, "settings")
 
-	# The methods, in the order the assembly rule reads them: the matrix is what selects a method and
-	# the layer's own shape sits directly after the settings that select it, ahead of the two views it
-	# shares the page pool with. The tree the user reads is the order the layer assembles in.
+	# Delivery configuration precedes its storage and addressing views.
 	var clipmap := hierarchy.create_item(surface)
 	clipmap.set_text(0, "Clipmap")
 	clipmap.set_metadata(0, "clipmap")
@@ -483,9 +447,7 @@ func _build_hierarchy() -> void:
 	var baked_all := hierarchy.create_item(pages)
 	baked_all.set_text(0, "Baked cell sources")
 	baked_all.set_metadata(0, "baked_pages")
-	# The layer is not paged, so it has no slot to list and nothing to preview from the GPU. What it
-	# has is its units and the strips still queued, which is the one debug view that belongs beside
-	# the physical residency: both answer "what does this VT layer hold right now".
+	# Clipmap diagnostics show units and pending strips alongside page residency.
 	var clipmap_page := hierarchy.create_item(pages)
 	clipmap_page.set_text(0, "Clipmap ring")
 	clipmap_page.set_metadata(0, "clipmap_debug")
@@ -503,57 +465,52 @@ func _build_settings_panel() -> VBoxContainer:
 	grid.name = "SettingsGrid"
 	grid.columns = 2
 	panel.add_child(grid)
-	grid.add_child(_make_setting_label("Physical page edge (texels)"))
-	page_size_spin = _make_spin(16, 1024, 16)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Physical page edge (texels)"))
+	page_size_spin = TerrainVTEditorWidgets.make_spin(16, 1024, 16)
 	page_size_spin.name = "PageSize"
 	page_size_spin.tooltip_text = "Texture cache page dimensions in texels, not terrain metres. At 1024 texels/metre, a 256-texel page covers 0.25 metres per edge."
 	page_size_spin.value_changed.connect(_on_setting_value_changed.bind("page_size"))
 	grid.add_child(page_size_spin)
-	grid.add_child(_make_setting_label("Border (texels)"))
-	page_border_spin = _make_spin(1, 16, 1)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Border (texels)"))
+	page_border_spin = TerrainVTEditorWidgets.make_spin(1, 16, 1)
 	page_border_spin.name = "PageBorder"
-	page_border_spin.tooltip_text = "Gutter each page carries, in texels. It bounds the near field's anisotropic filtering, which can only sample inside it: a gutter of n supports n - 0.5, so the near anisotropy setting needs a gutter of request + 1. Both views share the number."
+	page_border_spin.tooltip_text = "Shared gutter in texels on each side of a page. Near-field anisotropy is bounded by 2 * border - 1 and the viewport sampler; a 5-texel border supports an 8x request."
 	page_border_spin.value_changed.connect(_on_setting_value_changed.bind("border"))
 	grid.add_child(page_border_spin)
-	# The request the gutter above bounds. It sits here rather than in a page of its own because
-	# the two numbers are one decision: the gutter admits `border - 0.5` and the request is what a
-	# grazing view needs, so a caller who moves one has to see the other. A setting with no control
-	# was the state that made a 3.5x ceiling silent in the first place.
-	grid.add_child(_make_setting_label("Anisotropy (near field)"))
-	anisotropy_spin = _make_spin(0, 16, 1)
+	# The request is bounded by the viewport sampler and 2 * border - 1.
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Anisotropy (near field)"))
+	anisotropy_spin = TerrainVTEditorWidgets.make_spin(0, 16, 1)
 	anisotropy_spin.name = "Anisotropy"
-	anisotropy_spin.tooltip_text = "Anisotropic filtering the near field asks for: 2, 4, 8 or 16 times, or 0 to follow the viewport's filtering level. The border above is the hard bound, so a request wider than border - 0.5 is filtered at the border. The effective value is Terrain3D.get_vt_settings()[\"avt_anisotropy_effective\"]."
+	anisotropy_spin.tooltip_text = "Anisotropic filtering the near field asks for: 2, 4, 8 or 16 times, or 0 to follow the viewport's filtering level. The effective request is bounded by the viewport sampler and 2 * border - 1. The effective value is Terrain3D.get_vt_settings()[\"avt_anisotropy_effective\"]."
 	anisotropy_spin.value_changed.connect(_on_setting_value_changed.bind("anisotropy"))
 	grid.add_child(anisotropy_spin)
-	# This count chooses the virtual image resolution tier for each fixed 64 m
-	# world sector. Every allocated sector still carries its complete local page
-	# mip chain, so this setting is not a local-chain truncation.
-	grid.add_child(_make_setting_label("AVT resolution tiers"))
-	mip_levels_spin = _make_spin(2, 16, 1)
+	# Resolution tiers select each fixed 64 m sector's virtual image size.
+	# Each allocation retains its complete local page mip chain.
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("AVT resolution tiers"))
+	mip_levels_spin = TerrainVTEditorWidgets.make_spin(2, 16, 1)
 	mip_levels_spin.name = "MipLevels"
 	mip_levels_spin.tooltip_text = "Resolution tiers per fixed 64 m world sector (default 3: 64k/32k/16k, 1024/512/256 texels/m). Ten tiers extend to a 128x128 sector image (2 texels/m). Each allocated sector keeps its complete local page mip chain; cold sectors need not expose every tier immediately."
 	mip_levels_spin.value_changed.connect(_on_setting_value_changed.bind("mip_levels"))
 	grid.add_child(mip_levels_spin)
-	grid.add_child(_make_setting_label("Shared page count"))
-	page_count_spin = _make_spin(8, 1024, 1)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Shared page count"))
+	page_count_spin = TerrainVTEditorWidgets.make_spin(8, 1024, 1)
 	page_count_spin.name = "PageCount"
 	page_count_spin.value_changed.connect(_on_setting_value_changed.bind("page_count"))
 	grid.add_child(page_count_spin)
-	grid.add_child(_make_setting_label("Automatic cache capacity"))
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Automatic cache capacity"))
 	auto_capacity_button = CheckButton.new()
 	auto_capacity_button.name = "AutoCapacity"
 	auto_capacity_button.tooltip_text = "Reserve Shared page count for visible demand and camera transitions, up to 1024 pages. Uses more video memory; texel density and the 16-page generation limit stay unchanged."
 	auto_capacity_button.toggled.connect(_on_auto_capacity_toggled)
 	grid.add_child(auto_capacity_button)
-	grid.add_child(_make_setting_label("Pages per update"))
-	# The native property has no ceiling, so the widget must not invent one: `allow_greater` lets a
-	# typed value past the spin's soft range instead of clamping the setting behind the user's back.
-	pages_per_update_spin = _make_spin(1, 32, 1)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Pages per update"))
+	# The native value is positive and unbounded; 32 is only the slider's soft maximum.
+	pages_per_update_spin = TerrainVTEditorWidgets.make_spin(1, 32, 1)
 	pages_per_update_spin.allow_greater = true
 	pages_per_update_spin.name = "PagesPerUpdate"
 	pages_per_update_spin.value_changed.connect(_on_setting_value_changed.bind("pages_per_update"))
 	grid.add_child(pages_per_update_spin)
-	grid.add_child(_make_setting_label("AVT coverage"))
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("AVT coverage"))
 	avt_mode_option = OptionButton.new()
 	avt_mode_option.name = "AVTCoverage"
 	avt_mode_option.add_item("Camera range / coarse base + 64m sectors", 2)
@@ -561,25 +518,25 @@ func _build_settings_panel() -> VBoxContainer:
 	avt_mode_option.add_item("Legacy target grid", 1)
 	avt_mode_option.item_selected.connect(_on_avt_mode_selected)
 	grid.add_child(avt_mode_option)
-	grid.add_child(_make_setting_label("Fine max density (texels / metre)"))
-	avt_density_spin = _make_spin(1, 8192, 1)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Fine max density (texels / metre)"))
+	avt_density_spin = TerrainVTEditorWidgets.make_spin(1, 8192, 1)
 	avt_density_spin.name = "AVTTexelsPerMeter"
 	avt_density_spin.value_changed.connect(_on_density_changed.bind("vt"))
 	grid.add_child(avt_density_spin)
-	grid.add_child(_make_setting_label("SVT texels / metre"))
-	svt_density_spin = _make_spin(0.01, 8192, 0.01)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("SVT texels / metre"))
+	svt_density_spin = TerrainVTEditorWidgets.make_spin(0.01, 8192, 0.01)
 	svt_density_spin.name = "SVTTexelsPerMeter"
 	svt_density_spin.value_changed.connect(_on_density_changed.bind("svt"))
 	grid.add_child(svt_density_spin)
 	avt_density_hint = Label.new()
 	avt_density_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	panel.add_child(avt_density_hint)
-	panel.add_child(_make_setting_label("AVT resolution tier density ceilings (texels / metre)"))
+	panel.add_child(TerrainVTEditorWidgets.make_setting_label("AVT resolution tier density ceilings (texels / metre)"))
 	avt_band_grid = GridContainer.new()
 	avt_band_grid.columns = 2
 	panel.add_child(avt_band_grid)
-	grid.add_child(_make_setting_label("AVT range (metres)"))
-	avt_distance_spin = _make_spin(64, 65536, 64)
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("AVT range (metres)"))
+	avt_distance_spin = TerrainVTEditorWidgets.make_spin(64, 65536, 64)
 	avt_distance_spin.name = "AVTRange"
 	avt_distance_spin.tooltip_text = "Camera-centred AVT radius across fixed 64 m sectors and the coarse base. Outside this radius uses SVT; page count stays bounded."
 	avt_distance_spin.value_changed.connect(_on_avt_range_changed)
@@ -609,7 +566,7 @@ func _build_clipmap_panel() -> VBoxContainer:
 	grid.name = "ClipmapGrid"
 	grid.columns = 2
 	panel.add_child(grid)
-	grid.add_child(_make_setting_label("Implementation"))
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Implementation"))
 	clipmap_implementation_option = OptionButton.new()
 	clipmap_implementation_option.name = "ClipmapImplementation"
 	clipmap_implementation_option.tooltip_text = "How the one clipmap delivery stores its units: LOD is the toroidal level array, Atlas packs each unit's blocks into a block atlas. The switch replaces the storage and rebuilds the shader arm."
@@ -617,7 +574,7 @@ func _build_clipmap_panel() -> VBoxContainer:
 		clipmap_implementation_option.add_item(CLIPMAP_IMPLEMENTATIONS[implementation], implementation)
 	clipmap_implementation_option.item_selected.connect(_on_clipmap_implementation_selected)
 	grid.add_child(clipmap_implementation_option)
-	grid.add_child(_make_setting_label("Quality"))
+	grid.add_child(TerrainVTEditorWidgets.make_setting_label("Quality"))
 	clipmap_quality_option = OptionButton.new()
 	clipmap_quality_option.name = "ClipmapQuality"
 	clipmap_quality_option.tooltip_text = "Standard keeps the shipped 1024 texel/m near material detail and 64 texel/m height shape. Performance uses smaller ring storage; near detail remains 1024 texel/m."
@@ -632,9 +589,7 @@ func _build_clipmap_panel() -> VBoxContainer:
 	return panel
 
 
-# The VT Page's clipmap view, which is the same control the Inspector's VT Page section hosts: one
-# picture of the layer, two windows. The control hides itself when no layer exists, so the panel needs
-# no gate of its own.
+# Shared with the Inspector; the preview owns its availability gate.
 func _build_clipmap_debug_panel() -> VBoxContainer:
 	var panel := VBoxContainer.new()
 	panel.name = "ClipmapDebug"
@@ -678,22 +633,10 @@ func _build_svt_panel() -> VBoxContainer:
 	return panel
 
 
-func _make_setting_label(p_text: String) -> Label:
-	return TerrainVTEditorWidgets.make_setting_label(p_text)
-
-
-func _make_spin(p_min: float, p_max: float, p_step: float) -> SpinBox:
-	return TerrainVTEditorWidgets.make_spin(p_min, p_max, p_step)
-
-
 func _build_delivery_rows(p_panel: VBoxContainer) -> void:
 	_delivery = TerrainVTEditorDeliveryRows.new()
 	_delivery.changed = _on_delivery_cell_changed
 	_delivery.build(p_panel)
-	delivery_near_material = _delivery.option("near", "material")
-	delivery_near_height = _delivery.option("near", "height")
-	delivery_far_material = _delivery.option("far", "material")
-	delivery_far_height = _delivery.option("far", "height")
 
 
 # The matrix wrote a cell: mark the scene and re-read the panel the write changed, the same two things
@@ -728,14 +671,14 @@ func _refresh_header() -> void:
 	if terrain == null or not is_instance_valid(terrain):
 		summary_label.text = "No Terrain3D selected"
 		return
-	var data := _get_data(terrain)
-	var regions := int(_call(data, "get_region_count"))
-	var locations := _region_locations(data)
-	var region_size := int(_call(terrain, "get_region_size"))
-	var spacing := float(_call(terrain, "get_vertex_spacing"))
+	var data := TerrainVTBridge.data_of(terrain)
+	var regions := int(TerrainVTBridge.call_method(data, "get_region_count"))
+	var locations := TerrainVTBridge.region_locations(data)
+	var region_size := int(TerrainVTBridge.call_method(terrain, "get_region_size"))
+	var spacing := float(TerrainVTBridge.call_method(terrain, "get_vertex_spacing"))
 	if spacing <= 0.0:
 		spacing = 1.0
-	var density := int(_call(terrain, "get_surface_density"))
+	var density := int(TerrainVTBridge.call_method(terrain, "get_surface_density"))
 	if density <= 0:
 		density = 1
 	var settings := _vt_settings()
@@ -800,7 +743,7 @@ func _refresh_settings_controls() -> void:
 	_refresh_clipmap_controls(settings)
 	var auto_bake_enabled := _get_svt_auto_bake()
 	svt_auto_bake_button.button_pressed = auto_bake_enabled
-	svt_auto_bake_button.disabled = not _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY)
+	svt_auto_bake_button.disabled = not TerrainVTBridge.has_property(terrain, SVT_AUTO_BAKE_PROPERTY)
 	svt_auto_bake_button.tooltip_text = "Automatically rebake changed SVT cells incrementally after editing has been idle for 500 ms" if not svt_auto_bake_button.disabled else "Auto Bake is unavailable in this Terrain3D build"
 	auto_bake_hint.text = "Changed regions are merged and rebaked incrementally 500 ms after editing stops." if auto_bake_enabled else "Auto Bake is off. When enabled, changed regions merge and rebake incrementally 500 ms after editing stops. Use Bake All SVT Cells to refresh all cell sources and their mip chains."
 	if bool(settings.get("editor_preview_active", false)):
@@ -809,20 +752,17 @@ func _refresh_settings_controls() -> void:
 	_updating_settings = false
 
 
-# The layer's storage, shape and what it cost. Like the delivery rows, this reads the one snapshot the
-# rest of the panel was refreshed from, so a control cannot show a state the panel was not read with,
-# and a native build that predates the layer disables the controls instead of offering a shape it
-# cannot build.
+# Refresh from the panel snapshot; disable selectors absent from the native build.
 func _refresh_clipmap_controls(p_settings: Dictionary) -> void:
 	if clipmap_panel == null or clipmap_quality_option == null:
 		return
-	var quality_supported := _has_object_property(terrain, &"vt_clipmap_quality")
+	var quality_supported := TerrainVTBridge.has_property(terrain, &"vt_clipmap_quality")
 	clipmap_quality_option.disabled = not quality_supported
 	if quality_supported:
 		var quality := int(p_settings.get("clipmap_quality", 0))
 		clipmap_quality_option.select(clipmap_quality_option.get_item_index(quality))
 	# The implementation setting arrives by name; the native implementation table owns that vocabulary.
-	var implementation_supported := _has_object_property(terrain, &"vt_clipmap_implementation")
+	var implementation_supported := TerrainVTBridge.has_property(terrain, &"vt_clipmap_implementation")
 	if clipmap_implementation_option != null:
 		clipmap_implementation_option.disabled = not implementation_supported
 		if implementation_supported:
@@ -836,13 +776,9 @@ func _refresh_clipmap_controls(p_settings: Dictionary) -> void:
 	clipmap_hint.text = _clipmap_hint_text(p_settings)
 
 
-# The layer's consequence, in the panel that configures it: what a unit is, which group carries one,
-# which storage answers it, and what the last update cost. Every number is read from the report rather
-# than recomputed here, so the hint and `get_vt_settings()` cannot disagree. The first thing it has to
-# say is whether a layer can exist at all: a layer is built the first time a cell selects `Clipmap` for
-# a group, and the implementation selector above chooses how that one layer stores its units.
+# Describe storage, resolved shapes and update costs from the native report.
 func _clipmap_hint_text(p_settings: Dictionary) -> String:
-	if not _has_object_property(terrain, &"vt_clipmap_quality"):
+	if not TerrainVTBridge.has_property(terrain, &"vt_clipmap_quality"):
 		return "This Terrain3D build has no clipmap layer."
 	var quality_name := str(p_settings.get("clipmap_quality_name", "Standard"))
 	var text := "%s profile. Standard preserves the shipped material detail density and height ladder; Performance uses smaller ring storage while keeping the same near detail cache." % quality_name
@@ -899,17 +835,15 @@ func _on_clipmap_setting_changed(p_value: float, p_key: String) -> void:
 		"quality": ["vt_clipmap_quality", "set_vt_clipmap_quality"],
 		"implementation": ["vt_clipmap_implementation", "set_vt_clipmap_implementation"],
 	}.get(p_key, [])
-	if setting.is_empty() or not _has_object_property(terrain, setting[0]):
+	if setting.is_empty() or not TerrainVTBridge.has_property(terrain, setting[0]):
 		return
 	var argument := int(round(p_value))
-	_call(terrain, setting[1], [argument])
+	TerrainVTBridge.call_method(terrain, setting[1], [argument])
 	_refresh_header()
 	_refresh_settings_controls()
 
 
-# An OptionButton passes the item's index, while the probe table above takes the value the native
-# property stores; the item ids are that value, so the index is translated through the widget rather
-# than assumed to match.
+# Item IDs hold native enum values; selection signals pass item indexes.
 func _on_clipmap_implementation_selected(p_index: int) -> void:
 	if clipmap_implementation_option == null or p_index < 0 or p_index >= clipmap_implementation_option.item_count:
 		return
@@ -935,16 +869,14 @@ func _refresh_bake_status(p_settings: Dictionary = {}) -> void:
 		return
 	if p_settings.is_empty():
 		p_settings = _vt_settings()
-	# The sentence is the bridge's (vt_terrain_bridge.gd), which the node inspector's status label
-	# reads too: one reading of the report, so the two surfaces cannot describe the same state
-	# differently.
+	# Inspector and window share the same bake-status formatter.
 	bake_status.text = TerrainVTBridge.svt_bake_status(p_settings, _get_svt_auto_bake())
 
 
 func _on_auto_capacity_toggled(p_enabled: bool) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	_call(terrain, "set_vt_auto_capacity", [p_enabled])
+	TerrainVTBridge.call_method(terrain, "set_vt_auto_capacity", [p_enabled])
 	_refresh_settings_controls()
 
 
@@ -961,7 +893,7 @@ func _on_setting_value_changed(p_value: float, p_key: String) -> void:
 	}.get(p_key, "")
 	if method.is_empty():
 		return
-	_call(terrain, method, [int(round(p_value))])
+	TerrainVTBridge.call_method(terrain, method, [int(round(p_value))])
 	_overview_dirty = true
 	_refresh_header()
 	_refresh_baked_mip_selector()
@@ -971,7 +903,7 @@ func _on_setting_value_changed(p_value: float, p_key: String) -> void:
 func _on_avt_mode_selected(p_index: int) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	_call(terrain, "set_surface_vt_selection_mode", [avt_mode_option.get_item_id(p_index)])
+	TerrainVTBridge.call_method(terrain, "set_surface_vt_selection_mode", [avt_mode_option.get_item_id(p_index)])
 	_overview_dirty = true
 	_refresh_header()
 	_refresh_settings_controls()
@@ -980,7 +912,7 @@ func _on_avt_mode_selected(p_index: int) -> void:
 func _on_density_changed(p_value: float, p_view: String) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	_call(terrain, "set_surface_%s_texels_per_meter" % p_view, [p_value])
+	TerrainVTBridge.call_method(terrain, "set_surface_%s_texels_per_meter" % p_view, [p_value])
 	# A density change moves the automatic band edges, so the table has to rebuild.
 	if _svt_bands != null:
 		_svt_bands.invalidate()
@@ -997,8 +929,8 @@ func _refresh_avt_bands(settings: Dictionary) -> void:
 			child.queue_free()
 		avt_band_spins.clear()
 		for mip in levels:
-			avt_band_grid.add_child(_make_setting_label("tier %d max texel/m" % mip))
-			var spin := _make_spin(1.0 / pow(2.0, mip), 8192.0 / pow(2.0, mip), 1.0 / pow(2.0, mip))
+			avt_band_grid.add_child(TerrainVTEditorWidgets.make_setting_label("tier %d max texel/m" % mip))
+			var spin := TerrainVTEditorWidgets.make_spin(1.0 / pow(2.0, mip), 8192.0 / pow(2.0, mip), 1.0 / pow(2.0, mip))
 			spin.name = "AVTBandMip%d" % mip
 			spin.tooltip_text = "Maximum density for virtual resolution tier %d. Tiers are selected per fixed 64 m sector from projected density; they do not truncate that sector's local page mip chain." % mip
 			spin.value_changed.connect(_on_avt_band_changed.bind(mip))
@@ -1018,19 +950,19 @@ func _on_avt_band_changed(value: float, mip: int) -> void:
 func _on_adaptive_toggled(p_enabled: bool) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	_call(terrain, "set_vt_adaptive_enabled", [p_enabled])
+	TerrainVTBridge.call_method(terrain, "set_vt_adaptive_enabled", [p_enabled])
 	_refresh_header()
 
 
 func _on_avt_range_changed(value: float) -> void:
 	if _updating_settings: return
-	_call(terrain, "set_surface_vt_distance", [value])
+	TerrainVTBridge.call_method(terrain, "set_surface_vt_distance", [value])
 	_refresh_header()
 
 
 func _on_editor_preview_toggled(enabled: bool) -> void:
 	if _updating_settings: return
-	_call(terrain, "set_vt_editor_preview", [enabled])
+	TerrainVTBridge.call_method(terrain, "set_vt_editor_preview", [enabled])
 	_refresh_header()
 	_refresh_settings_controls()
 
@@ -1038,7 +970,7 @@ func _on_editor_preview_toggled(enabled: bool) -> void:
 func _on_svt_auto_bake_toggled(p_enabled: bool) -> void:
 	if _updating_settings or terrain == null or not is_instance_valid(terrain):
 		return
-	if not _has_object_property(terrain, SVT_AUTO_BAKE_PROPERTY):
+	if not TerrainVTBridge.has_property(terrain, SVT_AUTO_BAKE_PROPERTY):
 		return
 	terrain.set(SVT_AUTO_BAKE_PROPERTY, p_enabled)
 	if Engine.is_editor_hint() and plugin != null and is_instance_valid(plugin):
@@ -1050,7 +982,7 @@ func _on_svt_auto_bake_toggled(p_enabled: bool) -> void:
 func _on_bake_svt_pressed() -> void:
 	if terrain == null or not is_instance_valid(terrain):
 		return
-	var queued := int(_call(terrain, "bake_svt"))
+	var queued := int(TerrainVTBridge.call_method(terrain, "bake_svt"))
 	_refresh_header()
 	_refresh_baked_mip_selector()
 	if queued > 0:
@@ -1066,7 +998,7 @@ func _on_refresh_pages_pressed() -> void:
 
 
 func _on_baked_mip_selected(p_index: int) -> void:
-	if _updating_mip or baked_mip_selector == null:
+	if baked_mip_selector == null:
 		return
 	_selected_baked_mip = baked_mip_selector.get_item_id(p_index)
 	_refresh_page_details()
@@ -1088,7 +1020,6 @@ func _refresh_baked_mip_selector() -> void:
 	mips.sort()
 	if mips.is_empty():
 		mips.append(0)
-	_updating_mip = true
 	baked_mip_selector.clear()
 	var selected_index := 0
 	for index in mips.size():
@@ -1101,7 +1032,6 @@ func _refresh_baked_mip_selector() -> void:
 		selected_index = mips.find(_selected_baked_mip)
 	baked_mip_selector.select(selected_index)
 	baked_mip_selector.disabled = pages.is_empty()
-	_updating_mip = false
 
 
 func _on_hierarchy_item_selected() -> void:
@@ -1126,86 +1056,48 @@ func _refresh_page_details() -> void:
 	var root := page_tree.create_item()
 	if terrain == null or not is_instance_valid(terrain):
 		details_label.text = "No Terrain3D selected"
-		_add_page_row(root, "Surface VT", "Unavailable", "", "Select a valid Terrain3D")
+		TerrainVTEditorPageRows.add_row(page_tree, root, "Surface VT", "Unavailable", "", "Select a valid Terrain3D")
 		return
+	if _selected_hierarchy_kind == "cdlod":
+		details_label.text = "CDLOD · terrain geometry"
+		_refresh_cdlod_panel()
+		return
+	var snapshot := TerrainVTEditorPageRows.snapshot(terrain, TerrainVTBridge.data_of(terrain), _selected_baked_mip)
 	match _selected_hierarchy_kind:
-		"cdlod":
-			details_label.text = "CDLOD · terrain geometry"
-			_refresh_cdlod_panel()
 		"settings":
 			details_label.text = "VT Setting · shared Surface VT atlas"
 			settings_panel.visible = true
 			_refresh_settings_controls()
-			_add_settings_summary(root)
+			TerrainVTEditorPageRows.add_settings_summary(page_tree, root, snapshot)
 		"clipmap":
 			details_label.text = "Clipmap · one layer, two implementations"
 			clipmap_panel.visible = true
 			_refresh_settings_controls()
-			_add_clipmap_details(root)
+			TerrainVTEditorPageRows.add_clipmap_details(page_tree, root, snapshot)
 		"clipmap_debug":
 			details_label.text = "VT Page · clipmap layer"
 			clipmap_debug_panel.visible = true
 			_refresh_settings_controls()
-			_add_clipmap_details(root)
+			TerrainVTEditorPageRows.add_clipmap_details(page_tree, root, snapshot)
 		"avt", "avt_pages":
 			details_label.text = "AVT · runtime material view"
-			_add_avt_details(root)
+			TerrainVTEditorPageRows.add_avt_details(page_tree, root, snapshot)
 		"svt", "svt_pages":
 			details_label.text = "SVT · persisted material view"
 			svt_panel.visible = true
 			_refresh_settings_controls()
-			_add_svt_details(root)
+			TerrainVTEditorPageRows.add_svt_details(page_tree, root, snapshot)
 		"baked_pages":
 			details_label.text = "SVT baked cell sources · mip %d" % _selected_baked_mip
 			svt_panel.visible = true
 			_refresh_settings_controls()
-			_add_baked_page_rows(root)
+			TerrainVTEditorPageRows.add_baked_page_rows(page_tree, root, snapshot)
 		"pages", "all_pages":
 			details_label.text = "VT Page · shared physical residency"
-			_add_all_page_details(root)
+			TerrainVTEditorPageRows.add_all_page_details(page_tree, root, snapshot)
 		_:
 			details_label.text = "Surface VT · shared residency"
-			_add_surface_details(root)
-
-
-# The rows themselves are built by TerrainVTEditorPageRows, which reads one
-# snapshot of the terrain instead of a live scene, so the window keeps only the
-# dispatch above and the panel visibility. These stay as methods because the
-# window's own refresh paths and the editor regression suite drive them by name.
-func _page_snapshot() -> TerrainVTEditorPageRows.Snapshot:
-	return TerrainVTEditorPageRows.snapshot(terrain, _data, _selected_baked_mip)
-
-
-func _add_settings_summary(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_settings_summary(page_tree, p_root, _page_snapshot())
-
-
-func _add_clipmap_details(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_clipmap_details(page_tree, p_root, _page_snapshot())
-
-
-func _add_surface_details(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_surface_details(page_tree, p_root, _page_snapshot())
-
-
-func _add_avt_details(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_avt_details(page_tree, p_root, _page_snapshot())
-
-
-func _add_svt_details(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_svt_details(page_tree, p_root, _page_snapshot())
-
-
-func _add_all_page_details(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_all_page_details(page_tree, p_root, _page_snapshot())
-
-
-func _add_baked_page_rows(p_root: TreeItem) -> void:
-	TerrainVTEditorPageRows.add_baked_page_rows(page_tree, p_root, _page_snapshot())
-
-
-func _add_page_row(p_parent: TreeItem, p_name: String, p_state: String, p_address: String, p_details: String) -> TreeItem:
-	return TerrainVTEditorPageRows.add_row(page_tree, p_parent, p_name, p_state, p_address, p_details)
+			TerrainVTEditorPageRows.add_surface_details(page_tree, root, snapshot)
 
 
 func _on_page_item_selected() -> void:
@@ -1216,15 +1108,14 @@ func _on_page_item_selected() -> void:
 	if typeof(value) != TYPE_DICTIONARY:
 		return
 	if value.has("location"):
-		_selected_location = value.location
-		_inspect_region(_selected_location)
+		_inspect_region(value.location)
 	if value.has("slot"):
 		_selected_slot = int(value.slot)
 		_selected_kind = str(value.get("kind", ""))
 		refresh_preview_button.disabled = _selected_slot < 0
 		preview_label.text = "Slot %d · %s selected. Press Refresh preview for an explicit GPU readback." % [_selected_slot, _selected_kind]
-	if value.get("baked", false) and _is_valid_image(value.get("preview", null)):
-		preview_texture.texture = _display_preview_texture(value.preview)
+	if value.get("baked", false) and TerrainVTBridge.is_valid_image(value.get("preview", null)):
+		preview_texture.texture = TerrainVTOverviewImage.display_texture(value.preview)
 		preview_label.text = "Persisted SVT cell preview · mip %d" % int(value.get("mip", _selected_baked_mip))
 
 
@@ -1233,9 +1124,9 @@ func _refresh_page_preview() -> void:
 		return
 	# This is the sole call site for the GPU page readback API. It is never run
 	# from _process, a timer, or a redraw callback.
-	var image = _call(terrain, "get_vt_page_preview", [_selected_slot])
-	if _is_valid_image(image):
-		preview_texture.texture = _display_preview_texture(image)
+	var image = TerrainVTBridge.call_method(terrain, "get_vt_page_preview", [_selected_slot])
+	if TerrainVTBridge.is_valid_image(image):
+		preview_texture.texture = TerrainVTOverviewImage.display_texture(image)
 		preview_label.text = "Slot %d · %s · GPU preview refreshed" % [_selected_slot, _selected_kind]
 	else:
 		preview_label.text = "Slot %d has no material preview available" % _selected_slot
@@ -1261,17 +1152,17 @@ func _refresh_overview() -> void:
 		overview_label.text = "Terrain height overview (material VT bake unavailable)"
 		_overview_dirty = false
 		return
-	var locations := _region_locations(_data)
+	var locations := TerrainVTBridge.region_locations(TerrainVTBridge.data_of(terrain))
 	if locations.is_empty():
 		overview.clear_overview()
 		overview_label.text = "Terrain height overview (no terrain regions)"
 		_overview_dirty = false
 		return
 	var region_world := _region_world_size()
-	var bounds := _region_world_bounds(locations, region_world)
+	var bounds := TerrainVTOverviewImage.region_world_bounds(locations, region_world)
 	var baked := _baked_pages()
-	var material_pages := _overview_material_pages(baked)
-	var image_size := _overview_image_size(bounds)
+	var material_pages := TerrainVTOverviewImage.material_pages(baked, _selected_baked_mip)
+	var image_size := TerrainVTOverviewImage.overview_size(bounds, OVERVIEW_EDGE)
 	var image := _make_height_thumbnail(bounds, image_size)
 	var border := int(_vt_settings().get("border", 4))
 	for record in material_pages:
@@ -1280,12 +1171,11 @@ func _refresh_overview() -> void:
 	for location in locations:
 		var has_material := false
 		for record in material_pages:
-			if typeof(record) == TYPE_DICTIONARY and Rect2(record.get("world_rect", Rect2())).intersects(_region_rect_world(location, region_world)):
+			if typeof(record) == TYPE_DICTIONARY and Rect2(record.get("world_rect", Rect2())).intersects(TerrainVTOverviewImage.region_rect_world(location, region_world)):
 				has_material = true
 				break
 		entries.append({"location": location, "has_height": true, "has_material": has_material})
-	_overview_texture = ImageTexture.create_from_image(image)
-	overview.set_overview(entries, bounds, region_world, _overview_texture)
+	overview.set_overview(entries, bounds, region_world, ImageTexture.create_from_image(image))
 	if material_pages.is_empty():
 		overview_label.text = "Terrain height overview (material VT bake unavailable) · click a region to inspect terrain data"
 	else:
@@ -1293,31 +1183,12 @@ func _refresh_overview() -> void:
 	_overview_dirty = false
 
 
-func _overview_material_pages(p_pages: Array) -> Array:
-	return TerrainVTOverviewImage.material_pages(p_pages, _selected_baked_mip)
-
-
 func _make_height_thumbnail(p_bounds: Rect2, p_size: Vector2i) -> Image:
-	var global_range: Vector2 = _call(_data, "get_height_range")
-	return TerrainVTOverviewImage.height_thumbnail(p_bounds, p_size, _region_locations(_data),
+	var data := TerrainVTBridge.data_of(terrain)
+	var global_range: Vector2 = TerrainVTBridge.call_method(data, "get_height_range")
+	return TerrainVTOverviewImage.height_thumbnail(p_bounds, p_size, TerrainVTBridge.region_locations(data),
 			_region_world_size(), global_range,
-			func(p_location: Vector2i) -> Object: return _call(_data, "get_region", [p_location]))
-
-
-func _display_preview_texture(p_value: Variant) -> Texture2D:
-	return TerrainVTOverviewImage.display_texture(p_value)
-
-
-func _overview_image_size(p_bounds: Rect2) -> Vector2i:
-	return TerrainVTOverviewImage.overview_size(p_bounds, OVERVIEW_EDGE)
-
-
-func _region_world_bounds(p_locations: Array, p_region_world: Vector2) -> Rect2:
-	return TerrainVTOverviewImage.region_world_bounds(p_locations, p_region_world)
-
-
-func _region_rect_world(p_location: Vector2i, p_region_world: Vector2) -> Rect2:
-	return TerrainVTOverviewImage.region_rect_world(p_location, p_region_world)
+			func(p_location: Vector2i) -> Object: return TerrainVTBridge.call_method(data, "get_region", [p_location]))
 
 
 func _region_world_size() -> Vector2:
@@ -1329,7 +1200,6 @@ func _location_for_world_rect(p_rect: Rect2) -> Vector2i:
 
 
 func _on_overview_region_clicked(p_location: Vector2i) -> void:
-	_selected_location = p_location
 	_inspect_region(p_location)
 	if overview:
 		overview.set_selected_location(p_location)
@@ -1338,8 +1208,8 @@ func _on_overview_region_clicked(p_location: Vector2i) -> void:
 func _inspect_region(p_location: Vector2i) -> void:
 	if terrain == null or not is_instance_valid(terrain):
 		return
-	var data := _get_data(terrain)
-	var region := _call(data, "get_region", [p_location])
+	var data := TerrainVTBridge.data_of(terrain)
+	var region := TerrainVTBridge.call_method(data, "get_region", [p_location])
 	if region != null and is_instance_valid(region):
 		EditorInterface.inspect_object(region)
 
@@ -1353,18 +1223,13 @@ func _on_close_requested() -> void:
 	hide()
 
 
-func _get_data(p_terrain: Object) -> Object:
-	return TerrainVTBridge.data_of(p_terrain)
-
-
 func _vt_settings() -> Dictionary:
 	return TerrainVTBridge.vt_settings(terrain)
 
 
 func _fine_density(p_settings: Dictionary) -> float:
-	# The native report's effective_texels_per_meter is the fine target density
-	# in the new contract. Keep the requested property as a fallback for a
-	# partially upgraded binary, rather than displaying the coarse density here.
+	# Use the effective fine density, falling back to the requested density
+	# when an older native report omits it.
 	var density := float(p_settings.get("avt_effective_texels_per_meter",
 			p_settings.get("avt_texels_per_meter", 1024.0)))
 	return density if density > 0.0 else float(p_settings.get("avt_texels_per_meter", 1024.0))
@@ -1397,10 +1262,6 @@ func _get_svt_auto_bake() -> bool:
 	return TerrainVTBridge.svt_auto_bake(terrain, SVT_AUTO_BAKE_PROPERTY)
 
 
-func _has_object_property(p_target: Object, p_property: StringName) -> bool:
-	return TerrainVTBridge.has_property(p_target, p_property)
-
-
 func _resident_pages(p_kind: String = "") -> Array:
 	return TerrainVTBridge.resident_pages(terrain, p_kind)
 
@@ -1409,21 +1270,7 @@ func _baked_pages() -> Array:
 	return TerrainVTBridge.baked_pages(terrain)
 
 
-func _region_locations(p_data: Object) -> Array:
-	return TerrainVTBridge.region_locations(p_data)
-
-
-func _is_valid_image(p_value: Variant) -> bool:
-	return TerrainVTBridge.is_valid_image(p_value)
-
-
-func _call(p_target: Object, p_method: StringName, p_args: Array = []) -> Variant:
-	return TerrainVTBridge.call_method(p_target, p_method, p_args)
-
-
-# The CDLOD controls are terrain geometry rather than virtual texturing, so they
-# live in their own panel module. The window keeps the container, when it is on
-# screen, and the delegations below.
+# CDLOD panel ownership stays separate from virtual-texture controls.
 func _refresh_cdlod_panel() -> void:
 	if _cdlod == null:
 		return

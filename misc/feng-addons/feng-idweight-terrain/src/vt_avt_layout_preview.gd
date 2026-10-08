@@ -77,10 +77,7 @@ func _process(_p_delta: float) -> void:
 		_set_available(false)
 		_clear_preview("Terrain unavailable")
 		return
-	# The gate is one boolean and runs whether or not the view is on screen, because the matrix can
-	# select AVT while the section is folded and a gate that stopped would never notice. The *scan* -
-	# the half that walks the visible grid and builds a record per sector - still waits for
-	# visibility, which is the rule this preview has always followed.
+	# Poll availability while hidden; defer the sector scan until the control is visible.
 	_set_available(_gate(terrain))
 	if not _available:
 		if not _snapshot.is_empty():

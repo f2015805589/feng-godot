@@ -25,8 +25,6 @@ static func migrate_native_pass_set(
 	var carried := {}
 	var carried_before := []
 	var legacy_enabled := {}
-	var legacy_seen := {}
-	var legacy_order: Array = []
 	var last_anchor := -1
 
 	for pass_entry in passes:
@@ -36,9 +34,7 @@ static func migrate_native_pass_set(
 				continue
 			var new_id: int = LEGACY_NATIVE_ID_MAP[old_id]
 			last_anchor = new_id
-			if not legacy_seen.has(new_id):
-				legacy_seen[new_id] = true
-				legacy_order.append(new_id)
+			if not legacy_enabled.has(new_id):
 				legacy_enabled[new_id] = pass_entry.enabled
 			continue
 		if pass_entry == null:
@@ -57,16 +53,16 @@ static func migrate_native_pass_set(
 
 	var emitted := {}
 	for native_id in native_default_ids:
-		migrated.append(_make_migrated_native(native_id, legacy_seen, legacy_enabled, make_native_pass_fn))
+		migrated.append(_make_migrated_native(native_id, legacy_enabled, make_native_pass_fn))
 		emitted[native_id] = true
 		for pass_entry in carried.get(native_id, []):
 			migrated.append(pass_entry)
 
 	# Optional entries the resource had are kept, in the order it had them.
-	for native_id in legacy_order:
+	for native_id in legacy_enabled:
 		if emitted.has(native_id):
 			continue
-		migrated.append(_make_migrated_native(native_id, legacy_seen, legacy_enabled, make_native_pass_fn))
+		migrated.append(_make_migrated_native(native_id, legacy_enabled, make_native_pass_fn))
 		emitted[native_id] = true
 		for pass_entry in carried.get(native_id, []):
 			migrated.append(pass_entry)
@@ -150,13 +146,14 @@ static func ensure_custom_identity(pass_entry: PassBase, ordinal: int) -> void:
 
 static func _make_migrated_native(
 	native_id: int,
-	legacy_seen: Dictionary,
 	legacy_enabled: Dictionary,
 	make_native_pass_fn: Callable
 ) -> PassBase:
 	var pass_entry: PassBase = make_native_pass_fn.call(native_id)
-	if legacy_seen.has(native_id):
+	if legacy_enabled.has(native_id):
 		pass_entry.enabled = legacy_enabled[native_id]
+	elif native_id == NativeSpec.PASS_TEMPORAL_AA:
+		pass_entry.enabled = false
 	return pass_entry
 
 ## Schema 10 repairs the released Sky → Cloud → Trace → Fog sequence.
@@ -207,3 +204,80 @@ static func migrate_cloud_fog_order(passes: Array[PassBase]) -> bool:
 	passes[sky_index + 2] = passes[sky_index + 3]
 	passes[sky_index + 3] = trace
 	return true
+
+## Schema 6 placed Color Grade and optional Bloom before exposure. UE meters
+## scene color after temporal AA and before Bloom, then grades during tonemapping.
+## Move only the managed Eye Adaptation entry, preserving every other pass's order.
+static func migrate_eye_adaptation_order(passes: Array[PassBase]) -> bool:
+	var eye_index := -1
+	var first_after_eye := passes.size()
+	for i in passes.size():
+		var pass_entry: FengPass = passes[i]
+		if pass_entry == null:
+			continue
+		if pass_entry.stable_id == &"library:eye_adaptation":
+			eye_index = i
+		elif pass_entry.stable_id in [
+			&"library:bloom_downsample", &"library:bloom_blur",
+			&"library:bloom_composite", &"library:color_grade",
+		]:
+			first_after_eye = mini(first_after_eye, i)
+		elif pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_BLOOM:
+			first_after_eye = mini(first_after_eye, i)
+	var temporal_index := native_index(passes, NativeSpec.PASS_TEMPORAL_AA)
+	var post_index := native_index(passes, NativeSpec.PASS_POST_PROCESS)
+	if eye_index < 0 or first_after_eye >= eye_index or (temporal_index >= 0 and first_after_eye <= temporal_index) or (post_index >= 0 and first_after_eye >= post_index):
+		return false
+	var eye_pass := passes[eye_index]
+	passes.remove_at(eye_index)
+	passes.insert(first_after_eye, eye_pass)
+	return true
+
+## Schema 8 adds the engine-owned Bloom preparation pass. Insert it after the existing
+## Eye Adaptation entry (or before Color Grade/Post when no exposure pass exists) while
+## leaving every authored entry in the same relative order.
+static func migrate_bloom_pass(passes: Array[PassBase], make_native_pass_fn: Callable) -> bool:
+	if native_index(passes, NativeSpec.PASS_BLOOM) >= 0:
+		return false
+
+	var insert_index := -1
+	for i in passes.size():
+		var pass_entry: FengPass = passes[i]
+		if pass_entry != null and pass_entry.stable_id == &"library:eye_adaptation":
+			insert_index = i + 1
+			break
+	if insert_index < 0:
+		for i in passes.size():
+			var pass_entry: FengPass = passes[i]
+			if pass_entry == null:
+				continue
+			if pass_entry.stable_id == &"library:color_grade":
+				insert_index = i
+				break
+		if insert_index < 0:
+			insert_index = native_index(passes, NativeSpec.PASS_POST_PROCESS)
+	if insert_index < 0:
+		insert_index = seed_insert_index(passes, NativeSpec.PASS_BLOOM)
+
+	passes.insert(insert_index, make_native_pass_fn.call(NativeSpec.PASS_BLOOM))
+	return true
+
+## Position the seed order gives an entry, relative to the entries already present.
+static func seed_insert_index(passes: Array, native_id: int) -> int:
+	var seed_ids := NativeSpec.default_ids()
+	var target: int = seed_ids.find(native_id)
+	for i in passes.size():
+		var pass_entry: FengPass = passes[i]
+		if not pass_entry is BuiltinPass:
+			continue
+		var existing_pos: int = seed_ids.find((pass_entry as BuiltinPass).native_id)
+		if existing_pos >= 0 and existing_pos > target:
+			return i
+	return passes.size()
+
+static func native_index(passes: Array, native_id: int) -> int:
+	for i in passes.size():
+		var pass_entry: FengPass = passes[i]
+		if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == native_id:
+			return i
+	return -1

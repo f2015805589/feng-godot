@@ -16,12 +16,11 @@ const SKY_RUNTIME_PROBE_INTERVAL_MSEC := 500
 ## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
-static var _fogs: Dictionary = {} ## instance id -> {node: WeakRef, sequence: int}
+static var _fogs: Dictionary = {} ## registration-ordered instance id -> WeakRef
 static var _debanding_original: Dictionary = {} ## viewport id -> {viewport: WeakRef, enabled: bool}
 static var _sun_scans: Dictionary = {} ## world id -> {time: int, light: WeakRef}
 static var _snapshots: Array[Dictionary] = []
 static var _mutex := Mutex.new()
-static var _sequence := 0
 static var _last_frame := -1
 static var _worlds_queried := false
 static var _worlds: GDScript = null
@@ -101,19 +100,9 @@ static func _matched_atmosphere_sun_illuminance(sun: DirectionalLight3D, sky: Di
 		return null
 	return value.max(Vector3.ZERO)
 
-## Built-in atmosphere skies publish post-transmittance illuminance for the
-## primary sun. Custom skies and unrelated lights retain their authored scene
-## light color for the artist directional lobe.
-static func _fog_sun_illuminance(sun: DirectionalLight3D, sky: Dictionary, fallback: Vector3) -> Vector3:
-	var matched: Variant = _matched_atmosphere_sun_illuminance(sun, sky)
-	return matched if matched is Vector3 else fallback
-
 static func register(fog: FengHeightFog) -> void:
-	var id := fog.get_instance_id()
-	var entry: Variant = _fogs.get(id)
-	if entry == null or entry["node"].get_ref() != fog:
-		_sequence += 1
-		_fogs[id] = {"node": weakref(fog), "sequence": _sequence}
+	# Replacing an existing key keeps its original registration order.
+	_fogs[fog.get_instance_id()] = weakref(fog)
 	register_viewport(fog.get_viewport(), fog)
 
 static func unregister(fog: FengHeightFog) -> void:
@@ -151,8 +140,8 @@ static func _sync_debanding(selected: Dictionary) -> void:
 		return
 	var active_viewports: Dictionary = {}
 	for selected_world_id in selected:
-		var entry: Dictionary = selected[selected_world_id]
-		var world: World3D = entry.get("world")
+		var fog: FengHeightFog = selected[selected_world_id]
+		var world := fog.get_world_3d()
 		if world == null or not is_instance_valid(world):
 			continue
 		var viewports: Dictionary = worlds.viewports_for_world(world)
@@ -254,8 +243,7 @@ static func _sun_for(fog: FengHeightFog, world: World3D, sky: Dictionary = {}) -
 static func _publish() -> void:
 	var selected: Dictionary = {} ## world id -> latest registered enabled fog
 	for id in _fogs.keys():
-		var entry: Dictionary = _fogs[id]
-		var fog: FengHeightFog = entry["node"].get_ref()
+		var fog: FengHeightFog = _fogs[id].get_ref()
 		if fog == null:
 			_fogs.erase(id)
 			continue
@@ -265,17 +253,16 @@ static func _publish() -> void:
 		if world == null:
 			continue
 		var world_id := world.get_instance_id()
-		if not selected.has(world_id) or int(entry["sequence"]) > int(selected[world_id]["sequence"]):
-			selected[world_id] = {"fog": fog, "sequence": entry["sequence"], "id": id, "world": world}
+		selected[world_id] = fog
 	_sync_debanding(selected)
 	var result: Array[Dictionary] = []
 	for world_id in selected.keys():
-		var entry: Dictionary = selected[world_id]
-		var fog: FengHeightFog = entry["fog"]
+		var fog: FengHeightFog = selected[world_id]
+		var world := fog.get_world_3d()
 		var snapshot := fog.snapshot_fields()
 		var sky_snapshot := _sky_snapshot_for_world(world_id)
 		_add_sky_ambient(snapshot, world_id, sky_snapshot)
-		var sun := _sun_for(fog, entry["world"], sky_snapshot)
+		var sun := _sun_for(fog, world, sky_snapshot)
 		if sun == null:
 			snapshot["sun_direction"] = Vector3.ZERO
 			snapshot["inscattering_color"] = Vector3.ZERO
@@ -316,8 +303,8 @@ static func _publish() -> void:
 						inscattering_color = combined_inscattering
 			snapshot["inscattering_color"] = inscattering_color
 		snapshot["world_id"] = world_id
-		snapshot["fog_id"] = entry["id"]
-		snapshot["render_targets"] = _render_targets(entry["world"])
+		snapshot["fog_id"] = fog.get_instance_id()
+		snapshot["render_targets"] = _render_targets(world)
 		result.append(snapshot)
 	_mutex.lock()
 	_snapshots = result

@@ -10,7 +10,8 @@ const Resolver = preload("volume_resolver.gd")
 
 var _signature: Array = []
 var _recent: Array = []
-var _prepared: Dictionary = {}
+var _configuration: Array = []
+var _program: Resolver.BlendProgram
 
 ## Evaluate one view. `renderer` is intentionally untyped: only the renderer
 ## protocol (`get_instance_id`, `get_parameter_revision`, and
@@ -37,7 +38,7 @@ func evaluate(volumes: Array, point: Vector3, renderer) -> Dictionary:
 		return {}
 
 	# Two recent influence states cover fixed-preset enter/exit while bounding
-	# the cache. `prepared` is one mutable dictionary reused for camera motion.
+	# the cache. The compiled program is reused for camera motion.
 	var resolved: Dictionary = {}
 	var found := false
 	for cached in _recent:
@@ -57,21 +58,18 @@ func evaluate(volumes: Array, point: Vector3, renderer) -> Dictionary:
 			# Camera motion changes weights, not module fields or priority order.
 			# Rebuild the preparation only when the renderer/volume configuration
 			# changes; no context query is made on the stationary hot path.
-			if _prepared.is_empty() or _prepared.configuration != configuration:
+			if _program == null or _configuration != configuration:
 				var settings := {}
 				for volume in volumes:
 					if influences[volume.get_instance_id()] > 0.0:
 						settings[volume.get_instance_id()] = volume.profile.get_parameters()
-				_prepared = {
-					"configuration": configuration,
+				_configuration = configuration
+				_program = Resolver.compile({
 					"context": renderer.get_volume_context() if renderer != null else {},
 					"ordered": Resolver.ordered(volumes),
 					"settings": settings,
-				}
-				_prepared.program = Resolver.compile(_prepared)
-			# Update the single prepared dictionary in place for this sample.
-			_prepared.influences = influences
-			resolved = Resolver.evaluate_compiled(_prepared.program, influences)
+				})
+			resolved = Resolver.evaluate_compiled(_program, influences)
 		if _recent.size() == 2:
 			_recent.pop_front()
 		_recent.append({"signature": signature, "resolved": resolved})
@@ -82,4 +80,5 @@ func evaluate(volumes: Array, point: Vector3, renderer) -> Dictionary:
 func clear() -> void:
 	_signature.clear()
 	_recent.clear()
-	_prepared.clear()
+	_configuration.clear()
+	_program = null

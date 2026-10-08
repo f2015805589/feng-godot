@@ -212,7 +212,8 @@ func run() -> void:
 	window.set_terrain(terrain)
 	window.page_tree.clear()
 	var tree_root: TreeItem = window.page_tree.create_item()
-	window._add_baked_page_rows(tree_root)
+	TerrainVTEditorPageRows.add_baked_page_rows(window.page_tree, tree_root,
+			TerrainVTEditorPageRows.snapshot(terrain, terrain.data, window._selected_baked_mip))
 	var row := tree_root.get_first_child()
 	var grouped := false
 	while row:

@@ -36,7 +36,7 @@ levels; the earlier fallback-only assertions below describe the stages when they
 Original before/after tables follow. Their test status and ownership attributions apply
 only to the compared revisions; no historical red is waived for a later build.
 
-### 6.1 P1: the fallback tier is resident by construction
+### Coarse residency
 
 | Reading | Result |
 | --- | --- |
@@ -45,7 +45,7 @@ only to the compared revisions; no historical red is waived for a later build.
 | Near-field phase mean, warm / slow / cold | 0.484 / 0.282 / 0.436 ms, unchanged from 0.496 / 0.279 / 0.383 within this suite's documented run-to-run variance |
 | 180-degree settled turn, far field off | still 0 diagnostic pixels |
 
-### 6.4 The per-cell blur: the plan's walk was depth-first on one cell
+### Span-first planning
 
 | Reading | Before | After |
 | --- | --- | --- |
@@ -54,7 +54,7 @@ only to the compared revisions; no historical red is waived for a later build.
 | `plan_level_mips` | bimodal: fine cluster + 36 roots | unimodal: `[0, 0, 0, 0, 0, 58, 35, 1, 1, ...]` |
 | `vt_avt_dense`, `vt_cap_probe`, `vt_root_coverage` | green | **green** |
 
-### 6.4 The per-cell blur: the plan's walk was depth-first on one cell
+### Deficit ordering
 
 | `vt_near_density` reading | span order | deficit order |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ only to the compared revisions; no historical red is waived for a later build.
 | Ready fine pages at 4-8 texels/m (the outer cells) | 29 | 25 |
 | `visible_missing_pages` / fallback tier | 0 / 84 of 84 | 0 / 84 of 84 |
 
-### 6.4 The per-cell blur: the plan's walk was depth-first on one cell
+### Capacity floor
 
 | Reading | pool/2 ceiling | quarter floor |
 | --- | --- | --- |
@@ -77,14 +77,14 @@ only to the compared revisions; no historical red is waived for a later build.
 | Near-field phase mean, warm / slow turn | 0.47 / 0.30 ms | **0.16 / 0.15 ms** |
 | `vt_turn_budget` budget assertions failing | 6 | **4** (warm and slow section means now inside budget) |
 
-### 6.6 The grazing shimmer: the level math assumed taps the sampler does not have
+### Matched anisotropy
 
 | Grazing reading (3 x 51 window, D3D12, 4x viewport) | Bound to 8 (the old assumption) | Bound to 4 (the sampler) |
 | --- | ---: | ---: |
 | Window mean absolute deviation | 0.0677 | **0.0362** |
 | Ratio | 1.87x | - |
 
-### 6.7 What the deficit order actually changed in the red set
+### Regression comparison
 
 | Test | `REGRESSION` lines | Deficit order vs `HEAD` |
 | --- | --- | --- |
@@ -96,14 +96,14 @@ only to the compared revisions; no historical red is waived for a later build.
 | `vt_adaptive:ownership` | 6 distinct, 14 lines | **one more**: `camera movement retains automatic coverage` (15) |
 | `vt_adaptive:sectors` | edit phase fails 3 of 7 runs | edit phase fails 3 of 11 runs; see below |
 
-### 6.7 What the deficit order actually changed in the red set
+### Failure attribution
 
 | Test | Owner | Evidence |
 | --- | --- | --- |
-| `vt_adaptive:scale`, `metric`, `filtering`, `rotation`, `strict_coverage` | this redesign's earlier revisions, not the ordering | byte-identical A/B above; `rotation` is 6.5, and the `2026-09-17` baseline in `bin/terrain-adaptive-baseline.json` already records `scale`, `metric`, `ownership`, `filtering`, `navigation`, `blend` and `sectors` as failures with the same text |
+| `vt_adaptive:scale`, `metric`, `filtering`, `rotation`, `strict_coverage` | this redesign's earlier revisions, not the ordering | byte-identical A/B above; the `2026-09-17` baseline in `bin/terrain-adaptive-baseline.json` already records `scale`, `metric`, `ownership`, `filtering`, `navigation`, `blend` and `sectors` as failures with the same text |
 | `vt_adaptive:ownership`, `blend` | the delivery/assembly work in the tree (`far/material=SVT`) | `blend`'s remaining line is `missing AVT cannot fall back to available SVT in blend band`; its other assertion was fixed by that work |
 | `vt_render`, `vt_visibility`, `vt_transition_parent` | same | all three assert the pre-delivery model (a fresh fixture with no SVT requests, and a near-field toggle that restores the array path); `vt_visibility` fails on `fresh fixture unexpectedly has SVT requests` and `one-page SVT budget should create one SVT record, got 7` |
-| `vt_turn_budget` | the CPU phase budgets, pre-existing | red in both directions of a dedicated A/B (2 runs each): warm 0.158 / 0.166 ms at `HEAD` against 0.171 / 0.235 ms with the deficit order, slow 0.116-0.156 against 0.126-0.165, all against a 0.10 ms per-phase budget - the ranges overlap and 6.6 records 0.21 ms for the same phase on the pre-change tree, so the misses are not attributable to the ordering, though the sample is small and the warm phase is the one a denser plan could touch |
+| `vt_turn_budget` | the CPU phase budgets, pre-existing | red in both directions of a dedicated A/B (2 runs each): warm 0.158 / 0.166 ms at `HEAD` against 0.171 / 0.235 ms with the deficit order, slow 0.116-0.156 against 0.126-0.165, all against a 0.10 ms per-phase budget - the ranges overlap; the earlier sampling record measured 0.21 ms for the same phase, so the misses are not attributable to the ordering, though the sample is small and the warm phase is the one a denser plan could touch |
 | `texture_compression` | the material/baker uniform-set path, not the VT plan | 2 engine errors per run (`Parameter "uniform_set" is null.`, `Uniforms were never supplied for set (0) at the time of drawing`) while the test's own assertion passes - the class `terrain_vt_and_streaming.md` section 6 records as fixed once already, reproducible in 2 of 2 runs on this tree |
 
 ## Test corrections and remaining evidence

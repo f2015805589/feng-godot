@@ -1,24 +1,10 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The clipmap atlas's implementation. Read terrain_3d_clipmap_atlas.h first: it states the ring
-// structure and why the four rings tile the 9x9 grid exactly, what rolling does to a slot's *index*
-// rather than to its content, how a spare slot and a per-frame bound remove the unload/load flash,
-// and why the upload is a block rect rather than a layer.
-//
-// The one derivation worth repeating here, because every formula below is a consequence of it. A
-// block's nominal square is `[b*W - W/2, b*W + W/2)` for an integer block coordinate `b`, and its
-// texel `s` has its centre at `b*W - W/2 + (s+0.5)*texel_r`. Ring `r`'s grid origin is the focus
-// snapped to the ring's *own* texel (`O_r`), and the ring's **start point** is `m_r * W` with
-// `m_r = round(O_r / W)`. A cell `(gx, gy)` of that ring then wants the block
-// `(m_r + gx, m_r + gy)`, and the phase `(O_r - m_r*W) / texel_r` is the same whole number of texels
-// for every cell of the ring. That is why one start point a ring and a fixed block size are all a
-// block's rect lookup and its matrix need - the user's "store only one origin" simplification - and
-// why a block's content is a pure function of its coordinate, which is what lets a slot be
-// reassigned between cells instead of re-produced.
-//
-// The texture half - the atlas's own Texture2DArray, its block-sized staging textures and their
-// lifetimes - is terrain_3d_clipmap_atlas_texture.cpp; everything below is the arrangement that
-// decides *what* those textures hold.
+// Each octave ring has nine blocks with the same texel resolution. World-space
+// block width doubles per ring; each ring snaps and relabels independently.
+// Slots retain content by ring and block coordinate, while per-cell offsets track
+// the toroidal phase. Texture allocation and staging lifetime live in
+// terrain_3d_clipmap_atlas_texture.cpp.
 
 #include "terrain_3d_clipmap_atlas.h"
 #include "terrain_3d_baked_texture_arrays.h"
@@ -459,7 +445,6 @@ void Terrain3DClipmapAtlas::_rebuild_cells() {
 				Cell cell;
 				cell.gx = gx;
 				cell.gy = gy;
-				cell.chebyshev = MAX(Math::abs(gx), Math::abs(gy));
 				cell.ring = ring;
 				_cells.push_back(cell);
 			}
@@ -531,7 +516,6 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	_global_origin = Vector2();
 	_has_focus = false;
 	_last_focus = Vector2();
-	_grid_step = Vector2i();
 	_state_stamp++;
 }
 
@@ -960,11 +944,8 @@ void Terrain3DClipmapAtlas::_relabel_ring(const int p_ring, const bool p_first) 
 			retained++;
 		}
 	}
-	// Pass two: the coordinate moved between cells. The slot that holds it is reassigned, which is
-	// the whole of what rolling costs for the 64 blocks that did not enter at the edge. Ownership is
-	// deliberately not consulted: a block's content *is* its coordinate, so handing cell `(i,j)` the
-	// slot that held cell `(i-1,j)`'s block is the relabelling, not a conflict - and two cells of one
-	// ring never want the same coordinate, so each slot goes to exactly one cell.
+	// Pass two: reassign resident blocks that moved between cells. Each cell in a
+	// ring wants a distinct coordinate, so matching by content gives it one slot.
 	for (Cell &cell : _cells) {
 		if (cell.ring != p_ring || cell.pending_slot >= 0 || cell.current) {
 			continue;
@@ -998,12 +979,8 @@ void Terrain3DClipmapAtlas::_relabel_ring(const int p_ring, const bool p_first) 
 // ever left with nothing to read: it keeps its old slot, marked not current, until the new one lands.
 void Terrain3DClipmapAtlas::_reconcile_cells() {
 	uint64_t loaded = 0;
-	// The dependency order, and it is the ring's own rule with the atlas's structure: **finest ring
-	// first**, so the ground under the camera is the first to be right, and the coarse shells - whose
-	// blocks are the small ones - fill afterwards while the fragment falls back to the one-time global
-	// block. The alternative, coarsest first, would make the near field the *last* thing to arrive,
-	// which is the opposite of what the mechanism is for. Rings are walked in order and each ring's
-	// cells in index order, so the sequence is deterministic and the timeline is readable.
+	// Queue finest rings first, in stable cell order. Every ring uses block_size
+	// texels per block; coarse rings cover more world area at lower density.
 	for (int ring = 0; ring < _config.rings; ring++) {
 		for (Cell &cell : _cells) {
 			if (cell.ring != ring || cell.current || cell.pending_slot >= 0) {
@@ -1044,9 +1021,8 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 	}
 	_ensure_texture();
 	_last_focus = p_focus;
-	// A ring whose start point moved by a whole block relabels; a ring whose start point did not is
-	// a phase turn and costs one uniform rebind. The two are told apart by the block step, which is
-	// what the user's "9x9 blocks have their own ordering index" is for.
+	// A whole-block step relabels the ring's 3x3 grid. Movement within the same
+	// block only changes its toroidal phase.
 	const bool first = !_has_focus;
 	bool relabelled = false;
 	for (int ring = 0; ring < _config.rings; ring++) {
@@ -1071,7 +1047,6 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 				_last_scroll_retained = 0;
 			}
 			_ring_step[size_t(ring)] = step;
-			_grid_step = step;
 			_relabel_ring(ring, first);
 			relabelled = true;
 		} else if (phase_changed) {
