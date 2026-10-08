@@ -59,29 +59,6 @@ func _reset_preview_state() -> void:
 	_status = ""
 
 
-func _process(_p_delta: float) -> void:
-	var terrain := _get_terrain()
-	if terrain == null:
-		_set_available(false)
-		return
-	var now_sec := float(Time.get_ticks_msec()) / 1000.0
-	if now_sec - _last_poll_sec < POLL_INTERVAL_SEC:
-		return
-	_last_poll_sec = now_sec
-	# The gate is one boolean and runs whether or not this view is on screen, because a layer can come
-	# into existence while the section is folded and a gate that stopped would never notice.
-	_set_available(_gate(terrain))
-	if not _available:
-		if not _snapshot.is_empty() or not _layer.is_empty():
-			_snapshot.clear()
-			_layer.clear()
-			queue_redraw()
-		return
-	if not is_visible_in_tree():
-		return
-	_refresh_preview(terrain)
-
-
 func _gate(p_terrain: Object) -> bool:
 	# Older native builds without the availability query remain eligible for preview.
 	if not p_terrain.has_method("has_vt_clipmap_layer"):

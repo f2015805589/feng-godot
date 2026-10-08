@@ -67,27 +67,6 @@ func _reset_preview_state() -> void:
 	_status = "Terrain unavailable"
 
 
-func _process(_p_delta: float) -> void:
-	var now_sec := float(Time.get_ticks_msec()) / 1000.0
-	if now_sec - _last_poll_sec < POLL_INTERVAL_SEC:
-		return
-	_last_poll_sec = now_sec
-	var terrain := _get_terrain()
-	if terrain == null:
-		_set_available(false)
-		_clear_preview("Terrain unavailable")
-		return
-	# Poll availability while hidden; defer the sector scan until the control is visible.
-	_set_available(_gate(terrain))
-	if not _available:
-		if not _snapshot.is_empty():
-			_clear_preview("")
-		return
-	if not is_visible_in_tree():
-		return
-	_refresh_preview()
-
-
 func _gate(p_terrain: Object) -> bool:
 	# A terrain that cannot answer is not gated: the delivery matrix is what says a method is unused,
 	# and a stub (or a build that predates the matrix) has nothing to conclude from.
@@ -96,11 +75,7 @@ func _gate(p_terrain: Object) -> bool:
 	return bool(p_terrain.call("is_vt_delivery_used", DELIVERY_AVT))
 
 
-func _refresh_preview() -> void:
-	var terrain := _get_terrain()
-	if terrain == null:
-		_clear_preview("Terrain unavailable")
-		return
+func _refresh_preview(terrain: Object) -> void:
 	if not terrain.has_method("get_avt_layout_preview"):
 		_clear_preview("AVT layout preview requires a newer native Terrain3D")
 		return

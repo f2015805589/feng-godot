@@ -742,17 +742,12 @@ func _refresh_world_binding() -> void:
 	var signature: Array = [world_id, source, second_source, sky_gain, physical_units,
 		_settings_revision, secondary_sun_source_angle_deg]
 	var render_targets: Array = _snapshot_worlds.call("targets_for", world) if _snapshot_worlds != null else []
-	var render_signature := signature + [render_targets]
+	var render_signature := signature + [render_targets,
+		_optical_lut, _optical_lut.get_rid() if _optical_lut != null else RID(),
+		_multi_scattering_lut, _multi_scattering_lut.get_rid() if _multi_scattering_lut != null else RID()]
 	if render_signature != _last_rendering_snapshot_signature:
-		FengSkyRuntime.publish_rendering_snapshot(self, world_id, {
-			"settings": _atmosphere_settings(),
-			"sun_light_rid": source["rid"], "sun_direction": source["direction"],
-			"sun_color_linear": source["color"], "sun_irradiance": source["irradiance"],
-			"secondary_sun_light_rid": second_source["rid"], "secondary_sun_direction": second_source["direction"],
-			"secondary_sun_color_linear": second_source["color"], "secondary_sun_irradiance": second_source["irradiance"],
-			"sky_gain": sky_gain, "render_targets": render_targets,
-			"optical_column_lut": _optical_lut if FengSkyOpticalLut.supports_settings(_atmosphere_settings()) else null, "multi_scattering_lut": _multi_scattering_lut,
-		})
+		FengSkyRuntime.publish_rendering_snapshot(self, world_id,
+				_make_rendering_snapshot(world, source, second_source, render_targets))
 		_last_rendering_snapshot_signature = render_signature
 	if not affect_height_fog:
 		_last_snapshot_signature.clear()
@@ -789,8 +784,50 @@ func _refresh_world_binding() -> void:
 	_snapshot_publish_count += 1
 
 
-func _light_source(light: DirectionalLight3D) -> Dictionary:
-	if light == null:
+## Main-thread value snapshot for an explicitly selected same-world source. It
+## does not require this provider to own the visible Environment. Authored suns
+## retain the explicit-source contract, including Light Only directional lights.
+func rendering_snapshot(world: World3D) -> Dictionary:
+	if not is_inside_tree() or world == null or world != _current_world():
+		return {}
+	var primary := sun_light if sun_light != null else _resolve_sun(world)
+	return _make_rendering_snapshot(world, _light_source(primary, world),
+			_light_source(secondary_sun_light, world), [])
+
+
+func _make_rendering_snapshot(world: World3D, primary: Dictionary,
+		secondary: Dictionary, render_targets: Array) -> Dictionary:
+	var settings := _atmosphere_settings()
+	# Inactive explicit sources may not have rebuilt their private shader tables.
+	# Lease only tables matching these settings; absent tables use exact transport.
+	var optical: ImageTexture = _optical_lut if FengSkyOpticalLut.supports_settings(settings) \
+			and _optical_lut_signature == FengSkyOpticalLut.geometry_signature(settings) else null
+	var multiple: ImageTexture = _multi_scattering_lut if _multi_scattering_signature \
+			== FengSkyMultiScatteringLut.signature(settings) else null
+	var result := {
+		"world_id": world.get_instance_id(), "provider_id": get_instance_id(),
+		"settings": settings.duplicate(true), "settings_revision": _settings_revision,
+		"sky_gain": _background_energy_gain(), "render_targets": render_targets,
+		"optical_column_lut": optical, "multi_scattering_lut": multiple,
+		"optical_lut_revision": _optical_lut_signature + [optical.get_rid()] if optical != null else [],
+		"multi_scattering_lut_revision": _multi_scattering_signature + [multiple.get_rid()] if multiple != null else [],
+	}
+	for index in 2:
+		var source: Dictionary = primary if index == 0 else secondary
+		var prefix := "sun_" if index == 0 else "secondary_sun_"
+		result[prefix + "light_instance_id"] = source["id"]
+		result[prefix + "light_rid"] = source["rid"]
+		result[prefix + "direction"] = source["direction"]
+		result[prefix + "color_linear"] = source["color"]
+		result[prefix + "irradiance"] = source["irradiance"]
+		result[prefix + "ground_transmittance"] = _ambient_entry_for_sun(
+				source["direction"], false, true)["ground_transmittance"] if source["id"] != 0 else Vector3.ONE
+	return result
+
+
+func _light_source(light: DirectionalLight3D, world: World3D = null) -> Dictionary:
+	if light == null or (world != null and (not is_instance_valid(light) \
+			or not light.is_inside_tree() or not light.is_visible_in_tree() or light.get_world_3d() != world)):
 		return {"direction": Vector3.UP, "color": Vector3.ZERO, "irradiance": 0.0, "id": 0, "rid": RID()}
 	return {"direction": FengSkyRuntime.sanitize_sun_direction(light.global_transform.basis.z),
 		"color": _sun_linear_color(light), "irradiance": _sun_irradiance(light),
@@ -917,7 +954,7 @@ func _sanitize_current_settings() -> Dictionary:
 	})
 
 
-func _ambient_entry_for_sun(sun_direction: Vector3, include_multiple_scattering: bool = true) -> Dictionary:
+func _ambient_entry_for_sun(sun_direction: Vector3, include_multiple_scattering: bool = true, ground_only: bool = false) -> Dictionary:
 	var up := _surface_up()
 	var normalized_sun := sun_direction.normalized()
 	var sun_elevation_cosine := up.dot(normalized_sun)
@@ -926,10 +963,10 @@ func _ambient_entry_for_sun(sun_direction: Vector3, include_multiple_scattering:
 	var lower_bin := floori(position)
 	var upper_bin := mini(lower_bin + 1, int(180.0 / AMBIENT_ZENITH_STEP_DEG))
 	var blend := position - float(lower_bin)
-	var lower := _ambient_cache_bin(lower_bin, up, include_multiple_scattering)
+	var lower := _ambient_cache_bin(lower_bin, up, include_multiple_scattering, ground_only)
 	var result := lower
 	if upper_bin != lower_bin:
-		var upper := _ambient_cache_bin(upper_bin, up, include_multiple_scattering)
+		var upper := _ambient_cache_bin(upper_bin, up, include_multiple_scattering, ground_only)
 		result = {
 			"ambient_unit_sun": (lower["ambient_unit_sun"] as Vector3).lerp(upper["ambient_unit_sun"], blend),
 			"ground_transmittance": (lower["ground_transmittance"] as Vector3).lerp(upper["ground_transmittance"], blend),
@@ -942,16 +979,19 @@ func _ambient_entry_for_sun(sun_direction: Vector3, include_multiple_scattering:
 	return result
 
 
-func _ambient_cache_bin(zenith_bin: int, up: Vector3, include_multiple_scattering: bool = true) -> Dictionary:
-	var key := Vector2i(zenith_bin, int(include_multiple_scattering))
+func _ambient_cache_bin(zenith_bin: int, up: Vector3, include_multiple_scattering: bool = true, ground_only: bool = false) -> Dictionary:
+	var key := Vector2i(zenith_bin, 2 if ground_only else int(include_multiple_scattering))
 	if _ambient_cache.has(key):
 		return _ambient_cache[key]
 	var zenith_rad := deg_to_rad(float(zenith_bin) * AMBIENT_ZENITH_STEP_DEG)
 	var east := Vector3.RIGHT - up * up.dot(Vector3.RIGHT)
 	if east.length_squared() < 0.001:
 		east = Vector3.FORWARD - up * up.dot(Vector3.FORWARD)
-	east = east.normalized()
-	var representative_sun := (up * cos(zenith_rad) + east * sin(zenith_rad)).normalized()
+	var representative_sun := (up * cos(zenith_rad) + east.normalized() * sin(zenith_rad)).normalized()
+	if ground_only:
+		var sample := FengSkyRuntime.compute_atmosphere_sample(_atmosphere_settings(), representative_sun, 1.0, Vector3.ONE, null, true)
+		_ambient_cache[key] = sample
+		return sample
 	var compute_start_usec := Time.get_ticks_usec()
 	var sample_settings := _atmosphere_settings()
 	if not include_multiple_scattering:

@@ -104,7 +104,7 @@ func _render_case(p_width: int, p_filename: String) -> bool:
 	var terrain := FakeTerrain.new()
 	terrain.camera = Camera3D.new()
 	preview.set_terrain(terrain)
-	preview.call("_refresh_preview")
+	preview.call("_refresh_preview", terrain)
 	await get_tree().process_frame
 	await RenderingServer.frame_post_draw
 

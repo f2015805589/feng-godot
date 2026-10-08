@@ -6,6 +6,24 @@ into the project's `addons/`: directory junctions on Windows, symbolic links on
 other platforms. Windows junctions use the Windows API and need no administrator
 rights or setup script.
 
+## Addon boundaries
+
+| Addon | Responsibility | Integration |
+| --- | --- | --- |
+| Render Pipeline | Pass declarations, scheduling, per-view execution and Volumes | Native FRP Core; optional producer snapshots |
+| Sky | Atmosphere optics, world snapshots and SkyLight capture | FRP; optional Fog/Cloud capture inputs |
+| Cloud | Cloud settings, materials, shadows, tracing and composition | FRP; Sky-owned atmosphere snapshots |
+| Fog | Height-fog settings, light selection and world routing | FRP consumer; optional Sky lighting |
+| Magic GI | Surface placement, PRT baking, emitter response and lighting snapshots | FRP consumer; optional SkyLight and terrain geometry |
+| IDWeight Terrain | Terrain data, VT residency/production and editor tools | Native terrain extension and engine VT hooks |
+| RenderDoc Capture | Editor frame capture and analyzer launch | Native capture integration |
+| GodotTracy | Profiler setup and launch | Optional engine Tracy singleton |
+
+Producers own world data; render passes consume value snapshots and own only their
+RD allocations. New effects extend the Pass contract and library manifest, rather
+than adding branches to scheduling or Volume evaluation. See the
+[FRP architecture](../../doc/frp-addon-architecture.md) for these contracts.
+
 ## Project setup
 
 New and existing projects receive missing addons. Newly linked plugins are

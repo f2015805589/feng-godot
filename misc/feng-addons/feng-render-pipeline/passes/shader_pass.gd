@@ -361,38 +361,28 @@ func _get_raster_pipeline(rd: RenderingDevice, framebuffer: RID) -> RID:
 func _destroy_shader_objects(rd: RenderingDevice) -> void:
 	if rd == null:
 		return
-	for pipeline in _raster_pipelines.values():
-		if pipeline.is_valid():
-			rd.free_rid(pipeline)
+	_free_rids(rd, _take_shader_rids())
+
+## Hot reload replaces shader-dependent objects while retaining the sampler.
+func _take_shader_rids() -> Array[RID]:
+	var rids: Array[RID] = []
+	rids.append_array(_raster_pipelines.values())
+	rids.append_array([_compute_pipeline, _shader])
 	_raster_pipelines.clear()
-	if _compute_pipeline.is_valid():
-		rd.free_rid(_compute_pipeline)
 	_compute_pipeline = RID()
-	if _shader.is_valid():
-		rd.free_rid(_shader)
 	_shader = RID()
 	_shader_resource = null
 	_spirv = null
 	_shader_mode = -1
 	_keyword_signature = ""
+	return rids
 
-func _cleanup(rd: RenderingDevice) -> void:
-	_destroy_shader_objects(rd)
-	if rd != null and _sampler.is_valid():
-		rd.free_rid(_sampler)
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
+	rids.append_array(super.call("_take_shader_rids"))
+	rids.append(_sampler)
 	_sampler = RID()
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	# Resource destruction can happen on the main thread while these RIDs were
-	# created on the rendering thread. Capture only value types and free them on
-	# the render thread; keeping a callback to this Resource would be too late at
-	# NOTIFICATION_PREDELETE time.
-	var rids: Array[RID] = []
-	rids.append_array(_raster_pipelines.values())
-	rids.append_array([_compute_pipeline, _shader, _sampler])
-	_free_on_render_thread(rids)
+	return rids
 
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()

@@ -1,6 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Shared weak terrain reference, availability and polling policy for VT layout previews.
 @tool
+class_name TerrainVTLayoutPreview
 extends Control
 
 ## Hosts follow availability for their surrounding panel; this control owns its visibility.
@@ -41,6 +42,19 @@ func _get_terrain() -> Object:
 	return _terrain_ref.get_ref()
 
 
+func _process(_p_delta: float) -> void:
+	var now_sec := float(Time.get_ticks_msec()) / 1000.0
+	if now_sec - _last_poll_sec < POLL_INTERVAL_SEC:
+		return
+	_last_poll_sec = now_sec
+	var terrain := _get_terrain()
+	# Availability keeps polling while a host is folded or this view hides itself.
+	# Only a visible, available view may request the more expensive layout.
+	_set_available(terrain != null and _gate(terrain))
+	if _available and is_visible_in_tree():
+		_refresh_preview(terrain)
+
+
 func _set_available(p_available: bool) -> void:
 	# `visible` is synced on every call rather than only on a change: a control whose initial state is
 	# already "unavailable" has to be hidden by the first reading too, and it starts visible.
@@ -48,6 +62,9 @@ func _set_available(p_available: bool) -> void:
 	if _available == p_available:
 		return
 	_available = p_available
+	if not _available:
+		_reset_preview_state()
+		queue_redraw()
 	availability_changed.emit(p_available)
 
 
@@ -56,7 +73,10 @@ func _gate(_p_terrain: Object) -> bool:
 	return false
 
 
-## Drops what the subclass holds from the previous terrain. Called when a new one is handed over, so a
-## host never draws the old terrain's layout over the new one's name.
+## Drops the previous layout when the terrain changes or becomes unavailable.
 func _reset_preview_state() -> void:
+	pass
+
+
+func _refresh_preview(_p_terrain: Object) -> void:
 	pass

@@ -3,6 +3,20 @@ extends SceneTree
 
 const CloudGPU = preload("res://addons/feng-cloud/feng_cloud_gpu.gd")
 
+class OwnedPass extends FengPass:
+	var owned := RID()
+	var borrowed := RID()
+	func _setup(rd: RenderingDevice) -> void:
+		var format := RDTextureFormat.new()
+		format.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
+		format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+		owned = rd.texture_create(format, RDTextureView.new())
+	func _take_owned_rids() -> Array[RID]:
+		var rids := super._take_owned_rids()
+		rids.append(owned)
+		owned = RID()
+		return rids
+
 class FaultCloudGPU extends CloudGPU:
 	var remaining_allocations := -1
 
@@ -20,6 +34,8 @@ var failures := 0
 var gpu_done := Semaphore.new()
 var passes: Array[FengVolumetricCloudPass] = []
 var pass_textures: Array[RID] = []
+var custom_pass: OwnedPass
+var borrowed_texture := RID()
 
 
 func require(condition: bool, message: String) -> void:
@@ -34,6 +50,7 @@ func _initialize() -> void:
 
 func run() -> void:
 	test_registry_and_material()
+	test_atmosphere_sources()
 	var ctx := FRPPassContext.new()
 	var optical := RenderingServer.texture_2d_placeholder_create()
 	var multiple := RenderingServer.texture_2d_placeholder_create()
@@ -48,13 +65,139 @@ func run() -> void:
 	RenderingServer.free_rid(multiple)
 	if "--gpu" in OS.get_cmdline_user_args():
 		passes.assign([FengCloudShadowPass.new(), FengCloudTracePass.new()])
+		custom_pass = OwnedPass.new()
 		RenderingServer.call_on_render_thread(run_gpu)
 		gpu_done.wait()
 		passes.clear()
+		var reference := weakref(custom_pass)
+		custom_pass = null
+		require(reference.get_ref() == null, "Cleanup retained the dying custom pass")
 		RenderingServer.call_on_render_thread(check_destructors)
 		gpu_done.wait()
 	print("CLOUD CONTRACT PASS" if failures == 0 else "CLOUD CONTRACT FAIL")
 	quit(0 if failures == 0 else 1)
+
+
+func test_atmosphere_sources() -> void:
+	var viewport := SubViewport.new()
+	viewport.world_3d = World3D.new()
+	root.add_child(viewport)
+	var world := viewport.world_3d
+	var primary := DirectionalLight3D.new()
+	primary.rotation_degrees.x = -35.5
+	viewport.add_child(primary)
+	var secondary := DirectionalLight3D.new()
+	secondary.rotation_degrees.x = -15.25
+	viewport.add_child(secondary)
+	var sky := FengSkyAtmosphere.new()
+	sky.sun_light = primary
+	sky.secondary_sun_light = secondary
+	viewport.add_child(sky)
+	sky._process(0.0)
+	var cloud := FengVolumetricCloud.new()
+	viewport.add_child(cloud)
+	var source := sky.rendering_snapshot(world)
+	for selected in [null, sky]:
+		cloud.planet_source = selected
+		var snapshot := cloud._build_snapshot(world)
+		snapshot["atmosphere_snapshot"]["render_targets"] = []
+		require(snapshot["atmosphere_snapshot"] == source and snapshot["sun_inputs"] == cloud._resolve_sun_inputs(source),
+			"Automatic, explicit and direct consumers must share Sky's source schema")
+	require(source["optical_column_lut"] != null and source["multi_scattering_lut"] != null,
+		"Current supported atmosphere tables must remain leased by the snapshot")
+	var cache_misses: int = sky.atmosphere_cache_stats()["cache_misses"]
+	for index in 5:
+		sky.rendering_snapshot(world)
+	require(sky.atmosphere_cache_stats()["cache_misses"] == cache_misses,
+		"Consumer snapshots must not integrate ambient radiance")
+	for elevation in [-20.0, -0.1, 0.0, 0.1, 35.5, 90.0]:
+		var angle := deg_to_rad(elevation)
+		var direction := Vector3(cos(angle), sin(angle), 0.0)
+		var expected: Vector3 = sky._ambient_entry_for_sun(direction, false)["ground_transmittance"]
+		require((sky._ambient_entry_for_sun(direction, false, true)["ground_transmittance"] as Vector3).is_equal_approx(expected),
+			"Published ground transport must preserve ambient-cache interpolation and horizon clipping")
+	var radius: float = source["settings"]["planet_radius_km"]
+	source["settings"]["planet_radius_km"] = 1.0
+	source["optical_lut_revision"].clear()
+	var reread := sky.rendering_snapshot(world)
+	require(reread["settings"]["planet_radius_km"] == radius \
+			and not reread["optical_lut_revision"].is_empty(),
+		"Direct consumer reads must not mutate provider settings or revision arrays")
+	require(cloud._snapshot_signature() == cloud._snapshot_signature(),
+		"Unchanged atmosphere snapshots must preserve cloud cache identity")
+	if primary.get_base().is_valid(): # Native light RIDs are absent in the headless dummy renderer.
+		var override_sun := DirectionalLight3D.new()
+		viewport.add_child(override_sun)
+		for light in [override_sun, primary]:
+			cloud.primary_sun = light
+			var expected: Vector3 = reread["sun_ground_transmittance"] if light == primary else Vector3.ONE
+			require(cloud._build_snapshot(world)["sun_inputs"][0]["ground_transmittance"] == expected,
+				"Only a matching cloud sun may receive atmospheric ground transmittance")
+		cloud.primary_sun = null
+		primary.hide()
+		sky._process(0.0)
+		var secondary_only := cloud._build_snapshot(world)
+		require(secondary_only["sun_inputs"][0].is_empty() \
+				and secondary_only["sun_inputs"][1]["light_rid"] == secondary.get_base(),
+			"A secondary-only atmosphere must retain its cloud sun slot")
+		primary.show()
+		sky._process(0.0)
+
+	# Explicit same-world sources remain usable without owning the Environment.
+	world.environment = Environment.new()
+	sky._process(0.0)
+	cloud.planet_source = null
+	require(cloud._build_snapshot(world)["atmosphere_snapshot"].is_empty(),
+		"An automatic cloud source must stop when the atmosphere loses world ownership")
+	cloud.planet_source = sky
+	var inactive := cloud._build_snapshot(world)
+	require(inactive["planet_source_id"] == sky.get_instance_id() \
+			and inactive["atmosphere_snapshot"]["sun_light_instance_id"] == primary.get_instance_id(),
+		"An explicit inactive same-world source must retain its optics and authored suns")
+	primary.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_ONLY
+	require(cloud._build_snapshot(world)["atmosphere_snapshot"]["sun_light_instance_id"] == primary.get_instance_id(),
+		"Explicit inactive source selection must retain Light Only compatibility")
+	primary.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_AND_SKY
+	var prior_settings: Dictionary = inactive["atmosphere_snapshot"]["settings"].duplicate(true)
+	sky.rayleigh_exponential_distribution += 0.5
+	var changed := cloud._build_snapshot(world)
+	require(changed["atmosphere_revision"] > inactive["atmosphere_revision"],
+		"Inactive source edits must advance the consumer revision")
+	require(changed["atmosphere_snapshot"]["optical_column_lut"] == null \
+			and changed["atmosphere_snapshot"]["multi_scattering_lut"] == null,
+		"Changed inactive optics must not lease stale shader tables")
+	require(inactive["atmosphere_snapshot"]["settings"] == prior_settings,
+		"Changing source settings must not mutate an earlier cloud snapshot")
+	world.environment = sky.environment
+	sky._process(0.0)
+	require(cloud._build_snapshot(world)["atmosphere_snapshot"]["optical_column_lut"] != null,
+		"Restoring the provider must publish rebuilt supported tables")
+	sky.mie_exponential_distribution = 0.001
+	sky._process(0.0)
+	require(cloud._build_snapshot(world)["atmosphere_snapshot"]["optical_column_lut"] == null,
+		"Unsupported thin profiles must retain exact transport without an optical LUT")
+
+	var foreign := SubViewport.new()
+	foreign.world_3d = World3D.new()
+	root.add_child(foreign)
+	sky.reparent(foreign)
+	require(sky.rendering_snapshot(world).is_empty(), "A source must reject foreign-world reads")
+	var fallback := cloud._build_snapshot(world)
+	require(fallback["atmosphere_snapshot"].is_empty() and fallback["planet_source_id"] == 0 \
+			and fallback["planet_radius_m"] == cloud.planet_radius_km * 1000.0,
+		"An explicit foreign-world source must preserve authored planet fallback")
+	sky.free()
+	cloud.planet_source = null
+	require(cloud._build_snapshot(world)["atmosphere_snapshot"].is_empty(),
+		"Removing a provider must clear its consumer publication")
+	var late_sky := FengSkyAtmosphere.new()
+	late_sky.multi_scattering_factor = 0.0
+	viewport.add_child(late_sky)
+	late_sky._process(0.0)
+	require(cloud._build_snapshot(world)["planet_source_id"] == late_sky.get_instance_id(),
+		"A later atmosphere provider must be picked up without reloading the cloud")
+	viewport.free()
+	foreign.free()
 
 
 func test_registry_and_material() -> void:
@@ -170,6 +313,21 @@ func run_gpu() -> void:
 	for resource in passes:
 		require(resource._cloud_gpu._ensure_neutral_resources(rd), "Pass-owned neutral texture allocation failed")
 		pass_textures.append(resource._cloud_gpu._neutral_lut)
+	# The fixture owns the first texture; the pass borrows it and owns the next.
+	custom_pass._setup(rd)
+	borrowed_texture = custom_pass.owned
+	custom_pass.borrowed = borrowed_texture
+	custom_pass._setup(rd)
+	var owned := custom_pass.owned
+	require(rd.texture_is_valid(owned), "Custom pass texture allocation failed")
+	custom_pass._setup_complete = true
+	custom_pass._cleanup(rd)
+	custom_pass._cleanup(rd)
+	require(not rd.texture_is_valid(owned) and not custom_pass.owned.is_valid() and not custom_pass._setup_complete, "Custom pass cleanup must drain ownership and permit setup again")
+	require(rd.texture_is_valid(borrowed_texture), "Explicit cleanup freed a borrowed texture")
+	custom_pass._setup(rd)
+	require(rd.texture_is_valid(custom_pass.owned), "Custom pass could not allocate after cleanup")
+	pass_textures.append(custom_pass.owned)
 	gpu_done.post()
 
 
@@ -177,5 +335,7 @@ func check_destructors() -> void:
 	var rd := RenderingServer.get_rendering_device()
 	if rd != null:
 		for texture in pass_textures:
-			require(not rd.texture_is_valid(texture), "Inherited cloud pass destructor retained a texture")
+			require(not rd.texture_is_valid(texture), "Pass destructor retained an owned texture")
+		require(rd.texture_is_valid(borrowed_texture), "Deferred destruction freed a borrowed texture")
+		rd.free_rid(borrowed_texture)
 	gpu_done.post()

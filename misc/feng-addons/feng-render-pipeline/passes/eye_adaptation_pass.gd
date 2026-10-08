@@ -365,43 +365,18 @@ func _image_uniform(texture: RID) -> RDUniform:
 	uniform.add_id(texture)
 	return uniform
 
-func _cleanup(rd: RenderingDevice) -> void:
-	super._cleanup(rd)
-	if rd == null:
-		return
-	for entry in _state.values():
-		for view_state in entry["views"].values():
-			rd.free_rid(view_state["params"])
-			rd.free_rid(view_state["exposure_texture"])
-	_state.clear()
-	for rid in [_histogram_pipeline, _adapt_pipeline, _sampler, _linear_sampler]:
-		if rid.is_valid():
-			rd.free_rid(rid)
-	for shader in _shaders:
-		if shader.is_valid():
-			rd.free_rid(shader)
-	_histogram_pipeline = RID()
-	_adapt_pipeline = RID()
-	_sampler = RID()
-	_linear_sampler = RID()
-	_shaders.clear()
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	# Value-capture the RIDs: the resource is being torn down, so only local
-	# state is safe to touch (see FengPass._free_on_render_thread).
-	var rids: Array[RID] = [_histogram_pipeline, _adapt_pipeline, _sampler, _linear_sampler]
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
 	for entry in _state.values():
 		for view_state in entry["views"].values():
 			rids.append(view_state["params"])
 			rids.append(view_state["exposure_texture"])
-	for shader in _shaders:
-		rids.append(shader)
+	rids.append_array([_histogram_pipeline, _adapt_pipeline, _sampler, _linear_sampler])
+	rids.append_array(_shaders)
 	_histogram_pipeline = RID()
 	_adapt_pipeline = RID()
 	_sampler = RID()
 	_linear_sampler = RID()
 	_state.clear()
 	_shaders.clear()
-	_free_on_render_thread(rids)
+	return rids

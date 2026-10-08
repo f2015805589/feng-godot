@@ -123,8 +123,8 @@ static func _append_transform(values: PackedFloat32Array, transform: Transform3D
 		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
 	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]))
 
-func _cleanup(rd: RenderingDevice) -> void:
-	super._cleanup(rd)
-	if rd != null and _ubo.is_valid():
-		rd.free_rid(_ubo)
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
+	rids.append(_ubo)
 	_ubo = RID()
+	return rids

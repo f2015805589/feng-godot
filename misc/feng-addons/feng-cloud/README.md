@@ -15,8 +15,11 @@ Cloud lighting uses the active `FengSkyAtmosphere` snapshot for the same world;
 an explicitly selected same-world atmosphere can be used as well. Directional
 light inputs can come from the atmosphere or be selected on the cloud
 component. Without an atmosphere source, the component uses its authored planet
-fallback. There is no `WorldEnvironment` fallback. Only the FRP renderer runs
-the cloud passes.
+fallback. There is no `WorldEnvironment` fallback. Sky owns the normalized optics, sun
+transport and LUT leases in this snapshot; cloud adds its own light overrides
+and rendering controls. An explicit inactive source falls back to exact transport
+when its shader tables no longer match its current settings. Only the FRP
+renderer runs the cloud passes.
 
 Cloud-shadow casting and Sky AO are opt-in and off by default. SkyLight scene
 captures trace at full resolution without temporal history. Their cloud, sky,
@@ -83,7 +86,8 @@ In an isolated imported project containing Feng Cloud and FRP, use a rebuilt Fen
 ```
 
 The headless gate checks cloud selection, immutable publication, shared material-texture
-subscriptions and native atmosphere packet/LUT access. The GPU gate exercises all VRT
+subscriptions, automatic/explicit atmosphere sources, immutable optics and sun
+transport, stale-LUT fallback, and native atmosphere packet/LUT access. The GPU gate exercises all VRT
 attachment layouts, each mode-0 allocation failure, retry, resize, context loss, 14 shader
 variants, pass-owned cleanup and destruction. The dated parity report lists separate
 transport/image tests and the remaining cross-mode validation scope.

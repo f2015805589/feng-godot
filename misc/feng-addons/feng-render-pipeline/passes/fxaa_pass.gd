@@ -50,8 +50,9 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		return
 	super._render(buffers, view, rd)
 
-func _cleanup(rd: RenderingDevice) -> void:
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
 	if _copy_pass != null:
-		_copy_pass._cleanup(rd)
+		rids.append_array(_copy_pass._take_owned_rids())
 		_copy_pass = null
-	super._cleanup(rd)
+	return rids

@@ -126,7 +126,7 @@ static func atmosphere_shader_code() -> String:
 	return shader.code if shader != null else ""
 
 
-static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world: Vector3, sun_irradiance: float, sun_color_linear: Vector3, cached_multi_scattering_image: Image = null) -> Dictionary:
+static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world: Vector3, sun_irradiance: float, sun_color_linear: Vector3, cached_multi_scattering_image: Image = null, ground_only: bool = false) -> Dictionary:
 	## Public for deterministic diagnostics; called by the provider only on a
 	## cache miss. It returns unit-sun ambient radiance and ground transmittance.
 	var sanitized := sanitize_atmosphere_settings(settings)
@@ -137,6 +137,9 @@ static func compute_atmosphere_sample(settings: Dictionary, sun_direction_world:
 	var surface_origin := -planet_center_m / 1000.0
 	var surface_radius := surface_origin.length()
 	var up := sanitize_sun_direction(surface_origin) if surface_radius > 0.001 else Vector3.UP
+	if ground_only:
+		return {"ambient_unit_sun": Vector3.ZERO,
+			"ground_transmittance": FengSkyTransport.ground_sun_transmittance(up, sun_direction, sanitized)}
 	var reference_altitude := maxf(surface_radius - radius, 0.0)
 	var ray_origin := up * (radius + reference_altitude)
 

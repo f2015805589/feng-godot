@@ -79,7 +79,10 @@ Renderer 的 `get_volume_context()` 按参数版本缓存作者值、元数据�
 
 每个 FengCompositor 的 ViewState 持有独立参数、开关、效果 RID 和 TextureManager。
 纹理由各自 RenderSceneBuffers 持有。相机可共享 Renderer 作者资源，运行时结果保持独立。
-Pass 自有 RD 资源通过统一的渲染线程释放入口清理；借用的帧/producer RID 仍由原所有者释放。
+Pass 自有 RD 资源通过 `_take_owned_rids()` 逐层转移并清空，显式清理与析构共用同一份
+所有权声明；延迟释放只捕获 RID，不依赖已销毁的 Pass。Shader 热重载只转移依赖 shader
+的对象，保留 sampler；Cloud 的命名纹理 scope 仍由 FengCloudGPU 的清理包管理。
+借用的帧/producer RID 仍由原所有者释放。
 
 ViewExecutionPolicy 允许精确类型的标准 FengShaderPass、无 overlay 的标准原生实现共享
 执行对象。自定义 Pass 默认隔离；顶层条目通过 `can_share_view_execution()` 显式承担

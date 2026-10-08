@@ -15,7 +15,7 @@ FMagicGI 为 Feng Render Pipeline 提供表面 PRT（预计算辐射传输）。
 
 ## 动态光照与自发光
 
-每帧将同世界可见方向光投影到 SH；Volume 的 `Sun` 可覆盖自动选择。`FengSkyLight` 是天空全局照明的提供者：Magic GI 单独接收 SkyLight SH，并将其与方向光合并后的 SH 仅用于 secondary transport。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。显式 Sun 切换或清空会立即使直接光 SH 缓存失效。Volume 上保留的 `Lighting Environment` 仅用于旧场景序列化兼容，不再隐式投影 Environment 天空；没有 ready 的 FengSkyLight 时，FRP 的 SkyLight 漫反射基底为零，太阳和发光源 PRT 仍可工作。
+每帧将同世界可见方向光投影到 SH；Volume 的 `Sun` 可覆盖自动选择，切换或清空会使直接光缓存失效。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。天空照明由 ready 的 `FengSkyLight` 提供，缺省为零；其 SH 独立用于 primary visibility，与方向光合并后用于 secondary transport。太阳和发光源独立工作。`Lighting Environment` 保留为旧场景序列化字段。
 
 有效且当前匹配的 v4 Bake 在 Volume 覆盖的 opaque 像素按强度权重替换全局 SkyLight 漫反射；SkyLight 镜面反射、局部反射探针和 Volume 外像素保持不变。透明材质不在本 pass 的替换范围内。格式 2/3 Bake 保持旧的 additive 行为，Inspector 会提示重新 Bake 为 v4；加载旧资源不会自动改写或失效。
 

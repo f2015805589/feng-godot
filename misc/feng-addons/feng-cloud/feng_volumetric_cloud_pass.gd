@@ -215,14 +215,5 @@ func _cleanup(rd: RenderingDevice) -> void:
 func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
-	var pass_rids: Array[RID] = [_shader, _compute_pipeline, _sampler, _ubo]
-	for pipeline in _raster_pipelines.values():
-		if pipeline is RID:
-			pass_rids.append(pipeline)
-	var payload := _cloud_gpu.take_cleanup_payload(pass_rids)
-	_shader = RID()
-	_compute_pipeline = RID()
-	_sampler = RID()
-	_ubo = RID()
-	_raster_pipelines.clear()
+	var payload := _cloud_gpu.take_cleanup_payload(super.call("_take_owned_rids"))
 	FengCloudGPU.release_cleanup_payload(payload)

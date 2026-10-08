@@ -11,10 +11,6 @@ var editor_plugin: EditorPlugin
 
 const AVT_LAYOUT_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_avt_layout_preview.gd")
 const CLIPMAP_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd")
-## `TerrainVT::Delivery::AVT`, which is also the value of the property that selects it. Named so the
-## block below says which method it describes rather than carrying a bare number; the clipmap's block
-## has no constant here because its gate is the layer's existence rather than a delivery value.
-const DELIVERY_AVT := 1
 
 
 func _can_handle(p_object: Object) -> bool:
@@ -104,9 +100,9 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 	clipmap_note.text = "One clipmap delivery, two storages: the LOD level array and the packed block atlas. A unit is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
 	clipmap_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	clipmap_block.add_child(clipmap_note)
-	_connect_debug_block(clipmap_preview, clipmap_block, p_object, &"has_vt_clipmap_layer")
+	_connect_debug_block(clipmap_preview, clipmap_block)
 
-	_connect_debug_block(avt_preview, avt_block, p_object, &"is_vt_delivery_used", DELIVERY_AVT)
+	_connect_debug_block(avt_preview, avt_block)
 
 	var open_button := Button.new()
 	open_button.name = "TerrainVTPageOpenOverview"
@@ -164,20 +160,11 @@ func _parse_property(
 	return false
 
 
-# Ties a debug block's visibility to whether its view has something to draw: a cell selecting the
-# method for AVT, a ring existing for the clipmap. The synchronous read keeps the block from flashing
-# before the control's first poll and answers correctly on a terrain that has no matrix to ask; the
-# signal keeps it in step afterwards, because that answer can change while the section is open and
-# this group is not rebuilt when it does. `p_argument` is what the query takes, for the one gate that
-# is a question about a method rather than about an object.
-func _connect_debug_block(p_preview: Control, p_block: Control, p_object: Object, p_query: StringName, p_argument: Variant = null) -> void:
-	if p_preview == null or p_block == null:
-		return
-	if p_preview.has_signal("availability_changed"):
-		p_preview.connect("availability_changed", func(p_available: bool) -> void: p_block.visible = p_available)
-	if p_object != null and p_object.has_method(p_query):
-		var answer: Variant = p_object.call(p_query, p_argument) if p_argument != null else p_object.call(p_query)
-		p_block.visible = bool(answer)
+# The preview answers its gate during set_terrain(), before the host connects.
+# Read that answer once, then follow it without querying the native API again.
+func _connect_debug_block(p_preview: TerrainVTLayoutPreview, p_block: Control) -> void:
+	p_preview.availability_changed.connect(func(p_available: bool) -> void: p_block.visible = p_available)
+	p_block.visible = p_preview.is_available()
 
 
 func _open_vt_page_overview(p_terrain: Object) -> void:

@@ -331,40 +331,22 @@ func _build_snapshot(world: World3D) -> Dictionary:
 	if material_snapshot.is_empty():
 		return {}
 	var world_id := world.get_instance_id()
-	var radius_km := planet_radius_km
 	var sky_snapshot := _effective_sky_snapshot(world)
-	var atmosphere := _resolve_atmosphere_source(world, sky_snapshot)
-	var planet_source_id := atmosphere.get_instance_id() if atmosphere != null else 0
-	var has_source_center := false
-	var planet_center := Vector3.ZERO
-	var atmosphere_revision := -1
-	var atmosphere_snapshot: Dictionary = sky_snapshot
-	if atmosphere != null:
-		var source_radius: Variant = atmosphere.get("ground_radius")
-		if source_radius is float or source_radius is int:
-			radius_km = _finite_range(float(source_radius), radius_km, 1.0, 100000.0)
-		var source_center: Variant = atmosphere.get("planet_center_m")
-		if source_center is Vector3 and source_center.is_finite():
-			planet_center = source_center
-			has_source_center = true
-		atmosphere_revision = _source_settings_revision(atmosphere)
-		if sky_snapshot.is_empty():
-			atmosphere_snapshot = _make_selected_atmosphere_snapshot(atmosphere, world)
-	if not has_source_center:
-		planet_center = Vector3(fallback_planet_ground_origin_m.x,
-				fallback_planet_ground_origin_m.y - radius_km * 1000.0,
-				fallback_planet_ground_origin_m.z)
-	var suns := _resolve_sun_inputs(sky_snapshot, atmosphere)
+	var settings: Dictionary = sky_snapshot.get("settings", {})
+	var radius_km := float(settings.get("planet_radius_km", planet_radius_km))
+	var fallback_center := fallback_planet_ground_origin_m - Vector3.UP * radius_km * 1000.0
+	var planet_center: Vector3 = settings.get("planet_center_m", fallback_center)
+	var suns := _resolve_sun_inputs(sky_snapshot)
 	return {
 		"provider_id": get_instance_id(),
 		"world_id": world_id,
 		"component_transform": global_transform,
 		"planet_center_m": planet_center,
 		"planet_radius_m": radius_km * 1000.0,
-		"planet_source_id": planet_source_id,
-		"atmosphere_revision": atmosphere_revision,
-		"sky_rendering_signature": _sky_rendering_signature(sky_snapshot, atmosphere),
-		"atmosphere_snapshot": atmosphere_snapshot,
+		"planet_source_id": int(sky_snapshot.get("provider_id", 0)),
+		"atmosphere_revision": int(sky_snapshot.get("settings_revision", -1)),
+		"sky_rendering_signature": [sky_snapshot],
+		"atmosphere_snapshot": sky_snapshot,
 		"layer_bottom_m": layer_bottom_altitude_km * 1000.0,
 		"layer_height_m": layer_height_km * 1000.0,
 		"tracing_start_max_distance_m": tracing_start_max_distance_km * 1000.0,
@@ -403,34 +385,22 @@ func _build_snapshot(world: World3D) -> Dictionary:
 	}
 
 
-func _resolve_sun_inputs(sky_snapshot: Dictionary, atmosphere: FengSkyAtmosphere) -> Array[Dictionary]:
+func _resolve_sun_inputs(sky_snapshot: Dictionary) -> Array[Dictionary]:
 	# Preserve the sun slot indices even when only the secondary light is active;
 	# cloud shadow map controls are per-sun.
 	var result: Array[Dictionary] = []
-	result.append({})
-	result.append({})
-	var primary := _sun_from_light(primary_sun)
-	var secondary := _sun_from_light(secondary_sun)
-	var source_snapshot_matches := atmosphere != null \
-			and int(sky_snapshot.get("provider_id", 0)) == atmosphere.get_instance_id()
-	var primary_from_atmosphere := _sun_from_atmosphere(sky_snapshot, false) if source_snapshot_matches else {}
-	var secondary_from_atmosphere := _sun_from_atmosphere(sky_snapshot, true) if source_snapshot_matches else {}
-	if atmosphere != null and not source_snapshot_matches:
-		primary_from_atmosphere = _sun_from_light(_selected_atmosphere_sun(atmosphere, false))
-		secondary_from_atmosphere = _sun_from_light(_selected_atmosphere_sun(atmosphere, true))
-	if primary.is_empty():
-		primary = primary_from_atmosphere
-	if secondary.is_empty():
-		secondary = secondary_from_atmosphere
-	if not primary.is_empty():
-		result[0] = _build_sun_input(primary, 0, sky_snapshot, atmosphere)
-	if not secondary.is_empty() and (primary.is_empty() or secondary.get("light_rid") != primary.get("light_rid")):
-		result[1] = _build_sun_input(secondary, 1, sky_snapshot, atmosphere)
+	for index in 2:
+		var sun := _sun_from_light(primary_sun if index == 0 else secondary_sun)
+		if sun.is_empty():
+			sun = _sun_from_atmosphere(sky_snapshot, index == 1)
+		if index == 1 and not result[0].is_empty() and sun.get("light_rid", RID()) == result[0].get("light_rid", RID()):
+			sun = {} # One directional light cannot occupy both slots.
+		result.append(_build_sun_input(sun, index, sky_snapshot) if not sun.is_empty() else {})
 	return result
 
 
-func _build_sun_input(sun: Dictionary, index: int, sky_snapshot: Dictionary, atmosphere: FengSkyAtmosphere) -> Dictionary:
-	var result := _attach_ground_transmittance(sun, sky_snapshot, atmosphere)
+func _build_sun_input(sun: Dictionary, index: int, sky_snapshot: Dictionary) -> Dictionary:
+	var result := _attach_ground_transmittance(sun, sky_snapshot)
 	result["cast_shadows_on_clouds"] = primary_sun_cast_shadows_on_clouds if index == 0 else secondary_sun_cast_shadows_on_clouds
 	result["cast_cloud_shadows"] = primary_sun_cast_cloud_shadows if index == 0 else secondary_sun_cast_cloud_shadows
 	var override_settings := primary_sun_cloud_shadow_settings if index == 0 else secondary_sun_cloud_shadow_settings
@@ -477,162 +447,40 @@ func _sun_from_atmosphere(snapshot: Dictionary, secondary: bool) -> Dictionary:
 	}
 
 
-func _attach_ground_transmittance(sun: Dictionary, sky_snapshot: Dictionary, atmosphere: FengSkyAtmosphere) -> Dictionary:
+func _attach_ground_transmittance(sun: Dictionary, sky_snapshot: Dictionary) -> Dictionary:
 	var result := sun.duplicate()
 	result["ground_transmittance"] = Vector3.ONE
-	if atmosphere == null or not is_instance_valid(atmosphere):
-		return result
 	var light_rid: Variant = result.get("light_rid", RID())
 	if not light_rid is RID or not light_rid.is_valid():
 		return result
-	var matches_atmosphere_sun := false
-	if int(sky_snapshot.get("provider_id", 0)) == atmosphere.get_instance_id():
-		matches_atmosphere_sun = light_rid == sky_snapshot.get("sun_light_rid", RID()) \
-				or light_rid == sky_snapshot.get("secondary_sun_light_rid", RID())
-	else:
-		for secondary in [false, true]:
-			var source_light := _selected_atmosphere_sun(atmosphere, secondary)
-			if source_light != null and is_instance_valid(source_light) and source_light.get_base() == light_rid:
-				matches_atmosphere_sun = true
-				break
-	if not matches_atmosphere_sun or not atmosphere.has_method("_ambient_entry_for_sun"):
-		return result
-	var direction := _vector3(result.get("direction_world", Vector3.UP), Vector3.UP).normalized()
-	var entry: Variant = atmosphere.call("_ambient_entry_for_sun", direction, false)
-	if entry is Dictionary:
-		var transmittance: Variant = entry.get("ground_transmittance", Vector3.ONE)
+	for prefix in ["sun_", "secondary_sun_"]:
+		if light_rid != sky_snapshot.get(prefix + "light_rid", RID()):
+			continue
+		var transmittance: Variant = sky_snapshot.get(prefix + "ground_transmittance", Vector3.ONE)
 		if transmittance is Vector3 and transmittance.is_finite():
 			result["ground_transmittance"] = transmittance.max(Vector3.ZERO).min(Vector3.ONE)
+		break
 	return result
-
-
-func _selected_atmosphere_sun(atmosphere: FengSkyAtmosphere, secondary: bool) -> DirectionalLight3D:
-	if atmosphere == null or not is_instance_valid(atmosphere):
-		return null
-	if secondary:
-		return atmosphere.secondary_sun_light
-	if atmosphere.sun_light != null:
-		return atmosphere.sun_light
-	var world := get_world_3d()
-	if world == null or not atmosphere.has_method("_resolve_sun"):
-		return null
-	var resolved: Variant = atmosphere.call("_resolve_sun", world)
-	return resolved as DirectionalLight3D
 
 
 func _effective_sky_snapshot(world: World3D) -> Dictionary:
 	var snapshot := Runtime.sky_rendering_snapshot_for_world(world.get_instance_id())
 	if planet_source == null:
 		return snapshot
-	if not is_instance_valid(planet_source) or not planet_source.is_inside_tree():
+	if not is_instance_valid(planet_source):
 		return {}
-	var viewport := planet_source.get_viewport()
-	if viewport == null or viewport.find_world_3d() != world:
-		return {}
-	return snapshot if int(snapshot.get("provider_id", 0)) == planet_source.get_instance_id() else {}
-
-
-func _make_selected_atmosphere_snapshot(atmosphere: FengSkyAtmosphere, world: World3D) -> Dictionary:
-	if atmosphere == null or not is_instance_valid(atmosphere):
-		return {}
-	var settings: Dictionary = atmosphere.call("_atmosphere_settings") \
-			if atmosphere.has_method("_atmosphere_settings") else {}
-	if settings.is_empty():
-		return {}
-	# Keep the explicitly selected source's atmosphere parameters and LUT leases.
-	# Native resolves live renderer irradiance from the sun RIDs in sun_inputs.
-	return {
-		"provider_id": atmosphere.get_instance_id(),
-		"world_id": world.get_instance_id(),
-		"settings": settings,
-		"optical_column_lut": atmosphere.get("_optical_lut"),
-		"multi_scattering_lut": atmosphere.get("_multi_scattering_lut"),
-		"use_optical_column_lut": true,
-		"sun_light_rid": _selected_light_rid(atmosphere, world, false),
-		"secondary_sun_light_rid": _selected_light_rid(atmosphere, world, true),
-	}
-
-
-func _selected_light_rid(atmosphere: FengSkyAtmosphere, _world: World3D, secondary: bool) -> RID:
-	var light := _selected_atmosphere_sun(atmosphere, secondary)
-	return light.get_base() if light != null and is_instance_valid(light) else RID()
-
-
-func _resolve_atmosphere_source(world: World3D, sky_snapshot: Dictionary) -> FengSkyAtmosphere:
-	if planet_source != null and is_instance_valid(planet_source) and planet_source.is_inside_tree():
-		var viewport := planet_source.get_viewport()
-		if viewport != null and viewport.find_world_3d() == world:
-			return planet_source
-		return null
-	var provider_id := int(sky_snapshot.get("provider_id", 0))
-	if provider_id == 0:
-		return null
-	var candidate := instance_from_id(provider_id) as FengSkyAtmosphere
-	if candidate == null or not is_instance_valid(candidate) or not candidate.is_inside_tree():
-		return null
-	if not candidate.has_method("_feng_sky_rendering_is_active") \
-			or not bool(candidate.call("_feng_sky_rendering_is_active", world.get_instance_id())):
-		return null
-	return candidate
-
-
-func _source_settings_revision(source: FengSkyAtmosphere) -> int:
-	if source == null or not is_instance_valid(source):
-		return -1
-	var revision: Variant = source.get("_settings_revision")
-	return int(revision) if revision is int else -1
-
-
-func _sky_rendering_signature(snapshot: Dictionary, atmosphere: FengSkyAtmosphere = null) -> Array:
-	if snapshot.is_empty() and (atmosphere == null or not is_instance_valid(atmosphere)):
-		return []
-	var settings: Dictionary = snapshot.get("settings", {})
-	var settings_revision := int(snapshot.get("settings_revision", -1))
-	var optical_lut: Variant = snapshot.get("optical_column_lut")
-	var multi_scattering_lut: Variant = snapshot.get("multi_scattering_lut")
-	var optical_lut_revision: Variant = snapshot.get("optical_lut_revision", [])
-	var multi_scattering_lut_revision: Variant = snapshot.get("multi_scattering_lut_revision", [])
-	if atmosphere != null and is_instance_valid(atmosphere):
-		settings_revision = _source_settings_revision(atmosphere)
-		if settings.is_empty() and atmosphere.has_method("_atmosphere_settings"):
-			settings = atmosphere.call("_atmosphere_settings")
-		if optical_lut == null:
-			optical_lut = atmosphere.get("_optical_lut")
-		if multi_scattering_lut == null:
-			multi_scattering_lut = atmosphere.get("_multi_scattering_lut")
-		optical_lut_revision = atmosphere.get("_optical_lut_signature")
-		multi_scattering_lut_revision = atmosphere.get("_multi_scattering_signature")
-	return [
-		int(snapshot.get("provider_id", atmosphere.get_instance_id() if atmosphere != null and is_instance_valid(atmosphere) else 0)),
-		settings_revision, settings,
-		_texture_revision_signature(optical_lut), optical_lut_revision,
-		_texture_revision_signature(multi_scattering_lut), multi_scattering_lut_revision,
-		settings.get("planet_center_m", Vector3.ZERO),
-		settings.get("planet_radius_km", 0.0),
-		snapshot.get("sun_light_rid", RID()), snapshot.get("sun_direction", Vector3.ZERO),
-		snapshot.get("sun_irradiance", 0.0), snapshot.get("sun_color_linear", Vector3.ZERO),
-		snapshot.get("secondary_sun_light_rid", RID()),
-		snapshot.get("secondary_sun_direction", Vector3.ZERO),
-		snapshot.get("secondary_sun_irradiance", 0.0),
-		snapshot.get("secondary_sun_color_linear", Vector3.ZERO),
-	]
-
-
-func _texture_revision_signature(texture: Variant) -> Array:
-	if texture is Texture2D and is_instance_valid(texture):
-		return [texture.get_instance_id(), texture.get_rid()]
-	return [0, RID()]
+	if int(snapshot.get("provider_id", 0)) == planet_source.get_instance_id():
+		return snapshot
+	return planet_source.rendering_snapshot(world)
 
 
 func _snapshot_signature() -> Array:
 	var world := get_world_3d()
 	var sky_snapshot := _effective_sky_snapshot(world) \
 			if world != null and is_instance_valid(world) else {}
-	var atmosphere := _resolve_atmosphere_source(world, sky_snapshot) \
-			if world != null and is_instance_valid(world) else null
 	var signature: Array = [
-		enabled, world, global_transform, planet_source, _source_settings_revision(planet_source),
-		_sky_rendering_signature(sky_snapshot, atmosphere), Runtime.viewport_generation_for_world(world) if world != null else -1,
+		enabled, world, global_transform, planet_source,
+		sky_snapshot, Runtime.viewport_generation_for_world(world) if world != null else -1,
 		planet_radius_km, fallback_planet_ground_origin_m,
 		layer_bottom_altitude_km, layer_height_km,
 		tracing_start_max_distance_km, tracing_start_distance_from_camera_km,

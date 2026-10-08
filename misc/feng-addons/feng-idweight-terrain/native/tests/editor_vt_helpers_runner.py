@@ -25,6 +25,9 @@ def main() -> int:
             "src/vt_terrain_bridge.gd",
             "src/vt_editor_page_rows.gd",
             "src/vt_overview_image.gd",
+            "src/vt_layout_preview.gd",
+            "src/vt_avt_layout_preview.gd",
+            "src/vt_clipmap_preview.gd",
         ):
             destination = target / relative
             destination.parent.mkdir(parents=True, exist_ok=True)

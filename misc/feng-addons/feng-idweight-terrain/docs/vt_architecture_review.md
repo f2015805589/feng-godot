@@ -44,6 +44,11 @@ same ownership transitions; public nearest-surface queries share the region-boun
 The asset list derives its selectable limit from the actual trailing empty tile. Channel
 packing cancellation/closure clears queued follow-on work.
 
+`vt_layout_preview.gd` owns the weak terrain reference, availability polling and stale-layout
+cleanup; AVT and Clipmap subclasses own their native gate, layout read and drawing.
+Inspector blocks follow the preview's initial availability and change signal, so hidden
+views keep checking availability without duplicate native queries or layout reads.
+
 ## Defaults and units
 
 | Setting | Default / meaning |

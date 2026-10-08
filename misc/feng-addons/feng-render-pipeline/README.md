@@ -133,7 +133,21 @@ Environment 的 SSAO、SSIL、SSR、SDFGI、VoxelGI 以及原生调试几何不�
 ### 执行与纹理
 
 - 继承 `FengPass`，实现 `_frp_execute(ctx: FRPPassContext)` 调用 Core 原语，或实现
-  `_setup(rd)`、`_render(buffers, view, rd)`、`_cleanup(rd)` 编写 RenderingDevice 效果。
+  `_setup(rd)`、`_render(buffers, view, rd)` 编写 RenderingDevice 效果。
+- 自有 RID 在 `_take_owned_rids()` 中追加到 `super` 的结果并清空原字段；基类负责显式
+  `_cleanup(rd)` 和析构时的渲染线程释放。已有自定义 Pass 应将 `_cleanup` 中的 RID
+  所有权列表迁入此方法；`_cleanup` 仍可在渲染线程显式调用，析构不再调用该扩展钩子。
+  收集方法读取字段并调用 `super`；调用本实例的辅助方法时使用 `super.call("方法名")`，
+  保持引用计数归零后仍可用的原生调用路径。
+
+```gdscript
+func _take_owned_rids() -> Array[RID]:
+    var rids := super._take_owned_rids()
+    rids.append(_scratch_buffer)
+    _scratch_buffer = RID()
+    return rids
+```
+
 - `FengShaderPass` 支持 Compute 和全屏 Raster，可配置 `shader_file`、vec4 `parameters`、
   工作组、纹理输入输出及目标。
 - `FengPassTexture` 声明 Color、Depth、GBuffer、Motion Vectors、Tonemapped、管线纹理或

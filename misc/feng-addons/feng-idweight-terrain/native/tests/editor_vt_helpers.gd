@@ -54,6 +54,27 @@ class AutoBakeGetter extends RefCounted:
 		return false
 
 
+class PreviewSource extends Node:
+	var enabled := false
+	var gates := 0
+	var reads := 0
+
+	func is_vt_delivery_used(_method: int) -> bool:
+		gates += 1
+		return enabled
+
+	func has_vt_clipmap_layer() -> bool:
+		return is_vt_delivery_used(0)
+
+	func get_avt_layout_preview(_camera: Camera3D) -> Dictionary:
+		reads += 1
+		return {"bounds": Rect2(0, 0, 64, 64)}
+
+	func get_clipmap_layout_preview() -> Dictionary:
+		reads += 1
+		return {"layers": [{"implementation": "LOD"}]}
+
+
 func _enter_tree() -> void:
 	run.call_deferred()
 
@@ -73,6 +94,7 @@ func run() -> void:
 	test_page_snapshot()
 	test_material_pages()
 	test_directory_picker()
+	test_preview_polling()
 	if failures == 0:
 		print("PASS terrain editor VT helpers: %d checks" % checks)
 	get_tree().quit(1 if failures else 0)
@@ -125,3 +147,51 @@ func test_directory_picker() -> void:
 		require(picker.visible and picker.file_mode == EditorFileDialog.FILE_MODE_OPEN_DIR, "reopening the picker changed its mode")
 		picker.hide()
 	wizard.free()
+
+
+func test_preview_polling() -> void:
+	for script in ["vt_avt_layout_preview.gd", "vt_clipmap_preview.gd"]:
+		var host := Control.new()
+		EditorInterface.get_base_control().add_child(host)
+		var preview = load("res://addons/feng-idweight-terrain/src/" + script).new()
+		host.add_child(preview)
+		preview.set_process(false)
+		var availability: Array[bool] = []
+		preview.availability_changed.connect(func(value: bool): availability.append(value))
+		var source := PreviewSource.new()
+		preview.set_terrain(source)
+		require(source.gates == 1 and not preview.is_available() and not preview.visible, script + ": assignment must answer the gate once")
+		poll_preview(preview)
+		require(source.reads == 0, script + ": unavailable views must not request layouts")
+		host.hide()
+		source.enabled = true
+		poll_preview(preview)
+		require(preview.is_available() and source.reads == 0, script + ": hidden hosts must poll availability without layouts")
+		host.show()
+		poll_preview(preview)
+		require(source.reads == 1 and not (preview.get("_snapshot") as Dictionary).is_empty(), script + ": shown views must read one layout")
+		preview._process(0.0)
+		require(source.reads == 1, script + ": repeated frames must respect the poll interval")
+		source.enabled = false
+		poll_preview(preview)
+		require(not preview.visible and (preview.get("_snapshot") as Dictionary).is_empty(), script + ": disabling the method must clear its layout")
+		source.enabled = true
+		poll_preview(preview)
+		require(preview.visible and source.reads == 2, script + ": re-enabling must resume layout reads")
+		source.free()
+		poll_preview(preview)
+		require(not preview.is_available() and (preview.get("_snapshot") as Dictionary).is_empty(), script + ": freed terrains must hide and clear their layout")
+		require(availability == [true, false, true, false], script + ": hosts must receive each availability change exactly once")
+		if script == "vt_clipmap_preview.gd":
+			require((preview.get("_layer") as Dictionary).is_empty(), "freed terrain must clear the selected clipmap layer")
+		var old_build := RefCounted.new()
+		preview.set_terrain(old_build)
+		require(preview.is_available(), script + ": missing optional gate must preserve older-native fallback")
+		preview.set_terrain(null)
+		require(not preview.is_available(), script + ": clearing selection must hide immediately")
+		host.free()
+
+
+func poll_preview(preview: Control) -> void:
+	preview.set("_last_poll_sec", -INF)
+	preview.call("_process", 0.0)

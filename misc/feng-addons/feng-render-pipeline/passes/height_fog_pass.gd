@@ -310,30 +310,10 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	binding_data["uniforms"] = uniforms
 	return binding_data
 
-func _cleanup(rd: RenderingDevice) -> void:
-	if rd != null and _empty_atmosphere_lut.is_valid():
-		rd.free_rid(_empty_atmosphere_lut)
-	_empty_atmosphere_lut = RID()
-	if rd != null and _atmosphere_sampler.is_valid():
-		rd.free_rid(_atmosphere_sampler)
-	_atmosphere_sampler = RID()
-	if rd != null and _cloud_visibility_ubo.is_valid():
-		rd.free_rid(_cloud_visibility_ubo)
-	_cloud_visibility_ubo = RID()
-	super._cleanup(rd)
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	# Value-capture the UBO: the instance is being torn down, so only local
-	# state is safe here (see FengPass._free_on_render_thread).
-	var ubo := _ubo
-	var empty_lut := _empty_atmosphere_lut
-	var atmosphere_sampler := _atmosphere_sampler
-	var cloud_visibility_ubo := _cloud_visibility_ubo
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
+	rids.append_array([_empty_atmosphere_lut, _atmosphere_sampler, _cloud_visibility_ubo])
 	_atmosphere_sampler = RID()
 	_empty_atmosphere_lut = RID()
 	_cloud_visibility_ubo = RID()
-	_ubo = RID()
-	if ubo.is_valid() or empty_lut.is_valid() or atmosphere_sampler.is_valid() or cloud_visibility_ubo.is_valid():
-		_free_on_render_thread([ubo, empty_lut, atmosphere_sampler, cloud_visibility_ubo])
+	return rids

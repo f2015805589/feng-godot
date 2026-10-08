@@ -9,10 +9,8 @@ opaque and transparent materials evaluate fog at their fragment position.
 ## Source and light contract
 
 `fog_inscattering_color` is the authored Fog Inscattering Color. Its default is
-black; entered RGB is used as scene-linear radiance without sRGB conversion,
-clamping, albedo interpretation, or multiplication by sunlight. It remains a
-separate base source when atmosphere lighting is disabled. Fog still attenuates
-the scene when every source is black.
+black; RGB is scene-linear radiance and supplies an independent base source.
+Black sources still attenuate the scene.
 
 The runtime combines independent sources:
 
@@ -46,10 +44,8 @@ height.
 Sky ambient is a sampled mean from Feng Sky rather than Unreal's
 distant-sky-light LUT, so the results are not promised to be pixel-identical.
 
-This component does not implement Unreal's fog cubemap/texture, volumetric fog,
-multiple-scattering controls, nonzero optional EndDistance, SkyLight-capture
-contribution to height fog, or dual-sun directional fog lobes. This documents the
-supported subset, not full Unreal feature parity.
+Unsupported Unreal features are fog cubemaps, volumetric fog, multiple-scattering
+controls, nonzero EndDistance, SkyLight-capture contribution and dual-sun lobes.
 
 ## Lifecycle and tests
 
@@ -80,6 +76,5 @@ scene-light fallback, signed artist light, and finite-value guards. Add
 `--gpu-driver vulkan` (or another supported driver) for rendered checks. The
 fixed-exposure GPU test checks authored-source independence from direct light,
 black-source transmission, pre-exposure, deferred/unshaded/transparent paths,
-and the low-sun atmosphere ground-illuminance case. It does not use auto
-exposure to conceal changes in source units. Logs and PNGs stay in the reported
+and low-sun atmosphere ground illuminance. Logs and PNGs stay in the reported
 scratch project.

@@ -137,9 +137,13 @@ lower hemisphere as an occluder; ground bounce reaches the upper sky through
 multiple scattering. `sun_ground_illuminance` is RGB lux in physical mode and
 FRP-normalized irradiance otherwise. Neither field includes exposure.
 
-The separate rendering snapshot carries normalized optics, both sources,
-optical textures and render-target identity for FRP aerial perspective and
-surface lighting. It remains available when **Affect Height Fog** is off.
+The separate rendering snapshot carries normalized optics, both sources and
+their ground transmittance, matching optical textures, revision identity and
+render targets for FRP aerial perspective, surface lighting and cloud consumers.
+It remains available when **Affect Height Fog** is off. The component's main-thread
+`rendering_snapshot(world)` provides the same source schema for an explicitly
+selected same-world atmosphere, even when it does not own the visible Environment.
+Returned value data is copied; private LUTs are leased only while their settings match.
 Feng Fog soft-loads the runtime from `res://addons/feng-sky/feng_sky_runtime.gd`.
 See [`doc/frp-unreal-atmosphere.md`](../../../doc/frp-unreal-atmosphere.md) for the
 renderer mapping and integration limits.

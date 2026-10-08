@@ -304,14 +304,19 @@ func _prune_bake_cache(rd: RenderingDevice) -> void:
 		_release_bake_resources(oldest_key, rd)
 
 func _release_bake_resources(cache_key: String, rd: RenderingDevice) -> void:
+	_free_rids(rd, _take_bake_rids(cache_key))
+
+func _take_bake_rids(cache_key: String) -> Array[RID]:
+	var rids: Array[RID] = []
 	if not _bake_resources.has(cache_key):
-		return
+		return rids
 	var cached: Dictionary = _bake_resources[cache_key]
 	_bake_resources.erase(cache_key)
 	for name in ["transfer", "primary_sky", "geometry", "indices", "emission"]:
 		var rid: RID = cached.get(name, RID())
 		if rid.is_valid():
-			rd.free_rid(rid)
+			rids.append(rid)
+	return rids
 
 func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: int, rd: RenderingDevice) -> bool:
 	if scene_data == null or view >= scene_data.get_view_count():
@@ -403,33 +408,10 @@ func _ensure_zero_sky_diffuse(rd: RenderingDevice) -> RID:
 	_zero_sky_diffuse = rd.texture_create(format, RDTextureView.new(), layer_data)
 	return _zero_sky_diffuse
 
-func _cleanup(rd: RenderingDevice) -> void:
-	super._cleanup(rd)
-	if rd == null:
-		return
+func _take_owned_rids() -> Array[RID]:
+	var rids := super._take_owned_rids()
 	for key in _bake_resources.keys():
-		_release_bake_resources(str(key), rd)
-	if _zero_sky_diffuse.is_valid():
-		rd.free_rid(_zero_sky_diffuse)
-		_zero_sky_diffuse = RID()
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	# Value-capture the RIDs: the instance is being torn down, so only local
-	# state is safe here (see FengPass._free_on_render_thread).
-	var rids: Array[RID] = []
-	if _ubo.is_valid():
-		rids.append(_ubo)
-	_ubo = RID()
-	for cached in _bake_resources.values():
-		for name in ["transfer", "primary_sky", "geometry", "indices", "emission"]:
-			var rid: RID = cached.get(name, RID())
-			if rid.is_valid():
-				rids.append(rid)
-	_bake_resources.clear()
-	if _zero_sky_diffuse.is_valid():
-		rids.append(_zero_sky_diffuse)
+		rids.append_array(super.call("_take_bake_rids", str(key)))
+	rids.append(_zero_sky_diffuse)
 	_zero_sky_diffuse = RID()
-	if not rids.is_empty():
-		_free_on_render_thread(rids)
+	return rids

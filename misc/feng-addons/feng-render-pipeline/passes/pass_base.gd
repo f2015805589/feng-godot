@@ -19,13 +19,8 @@ const OutputDeclaration = preload("pass_output.gd")
 		effect_callback_type = stage
 		emit_changed()
 
-## The declarations the renderer and the engine read at apply time are authored
-## properties, and an `@export` member of a GDScript does not emit Resource.changed on
-## its own: the inspector and UndoRedo set it through Object.set(), which for a script
-## member is a plain assignment. So the state the schedule collects - the texture
-## contract, the provided ids, the parameters - notifies from its own setter, which is
-## what makes an edit in the inspector reach the engine instead of waiting for the next
-## unrelated change.
+## Authored declarations emit changed so Inspector and UndoRedo edits rebuild the
+## schedule. Nested declaration resources forward their changes through this pass.
 @export var inputs: Array[TextureInput] = []:
 	set(value):
 		inputs = value
@@ -36,23 +31,18 @@ const OutputDeclaration = preload("pass_output.gd")
 		outputs = value
 		_observe_contract_resources()
 		emit_changed()
-## Native FRP passes this pass takes over, by id. Declaring an id tells the
-## renderer that a schedule without the matching built-in entry is complete: the
-## pass runs that entry's work itself through the FRPPassContext primitives, so
-## the entry is neither re-added during normalization nor reported as missing.
-## Declare only what the pass actually does - a declaration without the work
-## produces an incomplete frame rather than a validation error.
+## Native FRP work implemented by this pass through FRPPassContext primitives.
+## These ids satisfy the schedule's native requirements; the implementation must
+## perform that work for the frame to be complete.
 @export var provides_native_ids: Array[int] = []:
 	set(value):
 		provides_native_ids = value
 		emit_changed()
-## Stable identity used by the renderer's persisted library and migration
-## bookkeeping.  It is storage-only because it is an implementation detail,
-## while Resource.resource_name is the readable name shown in the inspector.
+## Persisted identity for library synchronization and migration. The Inspector
+## displays Resource.resource_name; this identifier is storage-only.
 @export_storage var stable_id: StringName = &""
 
 var _setup_complete := false
-var _cleanup_scheduled := false
 var _last_error := ""
 var _parameter_layout_ready := false
 var _parameter_properties: Dictionary = {}
@@ -118,8 +108,15 @@ func _setup(_rd: RenderingDevice) -> void:
 func _render(_buffers: RenderSceneBuffersRD, _view: int, _rd: RenderingDevice) -> void:
 	pass
 
-func _cleanup(_rd: RenderingDevice) -> void:
-	pass
+## Transfer only owned RIDs and clear their fields before returning. Subclasses
+## append to super's result; borrowed frame/producer resources never belong here.
+## Both explicit cleanup and destruction use this one ownership inventory.
+func _take_owned_rids() -> Array[RID]:
+	_setup_complete = false
+	return []
+
+func _cleanup(rd: RenderingDevice) -> void:
+	_free_rids(rd, _take_owned_rids())
 
 func _report(message: String) -> void:
 	if message != _last_error:
@@ -344,27 +341,25 @@ func get_configuration_warnings() -> PackedStringArray:
 	return warnings
 
 func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE or not _setup_complete or _cleanup_scheduled:
+	if what != NOTIFICATION_PREDELETE:
 		return
-	_cleanup_scheduled = true
-	var weak_self: Variant = weakref(self)
-	RenderingServer.call_on_render_thread(func():
-		var reference = weak_self.get_ref()
-		if reference != null:
-			reference._cleanup(RenderingServer.get_rendering_device())
-	)
+	# RefCounted is already at zero: normal virtual calls construct a null self
+	# Variant. Native Object.call dispatches through the still-live ScriptInstance.
+	_free_on_render_thread(super.call("_take_owned_rids"))
 
-## Frees RIDs created on the render thread. Subclasses call this from their
-## own PREDELETE _notification with value-captured RIDs. It must be static and
-## self-contained: the dying instance is already torn down when the callback runs.
-## Each class releases its own RIDs; notification propagation handles base classes.
+static func _free_rids(rd: RenderingDevice, rids: Array[RID]) -> void:
+	if rd == null:
+		return
+	for rid in rids:
+		if rid.is_valid():
+			rd.free_rid(rid)
+
+## Only detached values cross the thread boundary: the dying pass no longer
+## exists when a deferred render-thread callback runs.
 static func _free_on_render_thread(rids: Array[RID]) -> void:
+	if rids.is_empty():
+		return
 	var owned := rids.duplicate()
 	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd == null:
-			return
-		for rid in owned:
-			if rid.is_valid():
-				rd.free_rid(rid)
+		_free_rids(RenderingServer.get_rendering_device(), owned)
 	)
