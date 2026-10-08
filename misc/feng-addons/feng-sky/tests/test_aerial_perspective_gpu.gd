@@ -103,8 +103,8 @@ func run() -> void:
 			pass_entry.pre_exposure = true
 			pass_entry.speed_up = 100.0
 			pass_entry.speed_down = 100.0
-	require(enabled_count == 13, "AP regression must preserve 13 enabled default passes")
-	require(renderer.passes.size() == 14, "AP must not add a new default pass")
+	require(enabled_count == 16, "AP regression must preserve 16 enabled default passes")
+	require(renderer.passes.size() == 17, "AP must not add a new default pass")
 	compositor = Compositor.new()
 	camera.compositor = compositor
 	for mode in ["opaque", "fallback", "transparent"]:

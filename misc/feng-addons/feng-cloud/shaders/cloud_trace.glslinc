@@ -452,10 +452,6 @@ void main() {
 				0, advanced, material_parameters, shell, context, cloud_frame.camera_world_position_m.xyz, self_shadow_sample_count);
 			FengCloudSun sun1 = feng_cloud_make_sun(
 				1, advanced, material_parameters, shell, context, cloud_frame.camera_world_position_m.xyz, self_shadow_sample_count);
-			if (!advanced.raymarch_shadow || shell.shadow_distance_km <= 0.0) {
-				sun0.cloud_shadow = vec3(1.0);
-				sun1.cloud_shadow = vec3(1.0);
-			}
 			float ambient_visibility = feng_cloud_sky_ambient_visibility(
 				advanced.ambient_occlusion, shell.bottom_sky_ao, context.normalized_altitude_in_layer,
 				advanced.ambient_occlusion_override, material_parameters.ao_strength);
@@ -463,7 +459,6 @@ void main() {
 			vec3 ground_source = vec3(0.0);
 			float max_view_transmittance = max(state.transmittance.r, max(state.transmittance.g, state.transmittance.b));
 			if (advanced.ground_contribution) {
-				vec3 cloud_up = feng_cloud_safe_normalize3(sample_position_km - shell.planet_center_km, vec3(0.0, 1.0, 0.0));
 				ground_source = feng_cloud_ground_contribution_with_context(
 					context, material_parameters, shell, sun0, sun1,
 					shell.per_sample_atmosphere > 0.5,
@@ -471,7 +466,6 @@ void main() {
 			}
 			int octave_count = clamp(advanced.multiscatter_octaves, 0, 2);
 			vec3 base_extinction = feng_cloud_extinction_for_sampling(material, advanced.grayscale_extinction);
-			vec3 base_scattering = base_extinction * clamp(feng_cloud_finite_or_zero3(material.albedo), vec3(0.0), vec3(1.0));
 			vec3 pre_sample_transmittance = state.transmittance;
 			bool contributes_closest = sample_distance_km <= opaque_near_km;
 			if ((any(greaterThan(base_extinction, vec3(0.0))) || any(greaterThan(material.emission_per_km, vec3(0.0)))) && !state.has_front_depth) {

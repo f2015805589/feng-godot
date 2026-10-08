@@ -293,7 +293,7 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
                     shots: bool = False, timeout_import: float = 180, timeout_run: float = 300,
                     followups: Sequence[Followup] = (),
                     script_args: Sequence[str] = (),
-                    native_library: Path | None = None) -> int:
+                    native_library: Path | None = None, headless: bool = False) -> int:
     """Runs one test script in a fresh project and returns its verdict.
 
     `editor` and `driver` default to the runner's own command line, so a runner only names its
@@ -326,16 +326,20 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
     (fixture / "project.godot").write_text(
         f'config_version=5\n[application]\nconfig/name="{project_name}"\n', encoding="utf-8")
     if native_library is not None:
+        library_name = ("libfeng-idweight-terrain.linux.debug.x86_64.so"
+                        if native_library.suffix == ".so" else
+                        "libfeng-idweight-terrain.windows.debug.x86_64.dll")
         shutil.copy2(native_library.resolve(),
-                     fixture / "addons" / "feng-idweight-terrain" / "bin"
-                     / "libfeng-idweight-terrain.windows.debug.x86_64.dll")
+                     fixture / "addons" / "feng-idweight-terrain" / "bin" / library_name)
     shots_directory = fixture / "shots"
     if any(phase[3] for phase in phases):
         shots_directory.mkdir()
     environment = os.environ.copy()
     environment.update(env or {})
-    for key, folder in [("APPDATA", "config"), ("LOCALAPPDATA", "cache")]:
-        (fixture / folder).mkdir()
+    for key, folder in [("APPDATA", "config"), ("LOCALAPPDATA", "cache"),
+                        ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),
+                        ("XDG_CACHE_HOME", "cache")]:
+        (fixture / folder).mkdir(exist_ok=True)
         environment[key] = str(fixture / folder)
     log = fixture / log_name
     print(f"FIXTURE={fixture}", flush=True)
@@ -345,7 +349,8 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
     try:
         with log.open("w", encoding="utf-8") as out:
             result_code = run_with_offscreen_window(
-                base + ["--headless", "--editor", "--import"], env=environment, stream=out,
+                base + ["--headless", "--editor", "--recovery-mode", "--import"],
+                env=environment, stream=out,
                 timeout=timeout_import)
             if result_code is None:
                 print(f"TIMEOUT LOG={log}")
@@ -353,10 +358,10 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
             for phase_script, phase_args, phase_timeout, shotted in phases:
                 if result_code != 0:
                     break
-                run = base + ["--rendering-method", "frp", "--rendering-driver", driver,
-                              "--resolution", resolution, "--position", "-10000,-10000",
-                              "--script",
-                              str((Path(__file__).parent / phase_script).resolve())]
+                display = ["--headless"] if headless else [
+                    "--rendering-method", "frp", "--rendering-driver", driver,
+                    "--resolution", resolution, "--position", "-10000,-10000"]
+                run = base + display + ["--script", str((Path(__file__).parent / phase_script).resolve())]
                 if shotted:
                     run += ["--", "", str(shots_directory), *phase_args]
                 result_code = run_with_offscreen_window(run, env=environment, stream=out,

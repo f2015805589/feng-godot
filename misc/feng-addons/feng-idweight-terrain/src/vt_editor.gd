@@ -1273,8 +1273,9 @@ func _refresh_overview() -> void:
 	var material_pages := _overview_material_pages(baked)
 	var image_size := _overview_image_size(bounds)
 	var image := _make_height_thumbnail(bounds, image_size)
+	var border := int(_vt_settings().get("border", 4))
 	for record in material_pages:
-		_blit_material_preview(image, record, bounds)
+		TerrainVTOverviewImage.blit_material_preview(image, record, bounds, border)
 	var entries: Array = []
 	for location in locations:
 		var has_material := false
@@ -1301,11 +1302,6 @@ func _make_height_thumbnail(p_bounds: Rect2, p_size: Vector2i) -> Image:
 	return TerrainVTOverviewImage.height_thumbnail(p_bounds, p_size, _region_locations(_data),
 			_region_world_size(), global_range,
 			func(p_location: Vector2i) -> Object: return _call(_data, "get_region", [p_location]))
-
-
-func _blit_material_preview(p_image: Image, p_record: Dictionary, p_bounds: Rect2) -> void:
-	var border := int(_vt_settings().get("border", 4))
-	TerrainVTOverviewImage.blit_material_preview(p_image, p_record, p_bounds, border)
 
 
 func _display_preview_texture(p_value: Variant) -> Texture2D:

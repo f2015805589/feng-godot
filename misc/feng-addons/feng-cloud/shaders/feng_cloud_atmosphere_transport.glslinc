@@ -9,14 +9,6 @@
 #undef ATMO_OPTICAL
 #undef ATMO_MULTIPLE
 
-// The cached distant-sky estimate deliberately excludes cloud visibility to
-// avoid feeding the cloud's own shadow/AO outputs back into its ambient input.
-// Keep the pre-visibility four-argument call used by that estimator working;
-// the shared transport macros above default to neutral visibility.
-void frp_atmo_aerial(vec3 camera_to_receiver_m, vec3 eye_offset_m, out vec3 radiance, out vec3 transmission) {
-	frp_atmo_aerial(camera_to_receiver_m, eye_offset_m, vec3(0.0), radiance, transmission);
-}
-
 struct FengCloudAtmosphereComponents {
 	vec3 rayleigh_radiance;
 	vec3 mie_radiance;

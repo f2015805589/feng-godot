@@ -1,5 +1,9 @@
 # Windows atmosphere validation (2026-10-02)
 
+Historical record: results and open findings apply to the builds and environments named below.
+Current contracts are in [addon architecture](frp-addon-architecture.md) and
+[engine contract](frp-engine-contract.md).
+
 This record contains the Windows D3D12 checks run for the Atmosphere repair. The test projects were disposable copies under `C:\Temp`; neither `F:\godot\project\test-1` nor `test-2` was edited.
 
 ## Binaries and source

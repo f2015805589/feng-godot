@@ -154,7 +154,7 @@ static func resolve() -> Compositor:
 	var compositor: Compositor = null
 	if resource is Compositor:
 		compositor = resource
-	elif resource != null and resource.get("passes") != null:
+	elif resource is FengRenderer:
 		# A pipeline resource on its own (a FengRenderer) is wrapped: the engine reads a
 		# schedule from a Compositor, and this is the wrapper the inspector shows too.
 		var wrapper = CompositorScript.new()

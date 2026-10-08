@@ -146,8 +146,8 @@ int Terrain3DData::produce_surface_page_set(const Vector2i &p_region_loc, const 
 						// A border texel belongs to a neighbouring region, so sample it by
 						// world position rather than replicating this region's edge. The
 						// near and far fields then fill their borders the same way.
-						value = _sample_payload_world(region_origin_x + real_t(region_x) * payload_texel,
-								region_origin_z + real_t(region_y) * payload_texel);
+						value = get_surface_texel_nearest(Vector2(region_origin_x + real_t(region_x) * payload_texel,
+								region_origin_z + real_t(region_y) * payload_texel));
 					}
 					out[x * 2] = uint8_t(value & 0xFF);
 					out[x * 2 + 1] = uint8_t(value >> 8);
@@ -297,38 +297,34 @@ Ref<Image> Terrain3DData::make_sparse_surface_page(const int p_page_x, const int
 	return page;
 }
 
-// One payload texel, by nearest, in the form the shader's own corner read takes it
-// (`get_surface_texel()`): the grid is the *stored payload's*, so the index is
-// `floor(world * density / vertex_spacing)` on the region's own density - the one the image was
-// written at - and is reduced into that image. A region with no surface map, or an image that cannot
-// hold the texel, reads 0 - the value an array sample outside a filled layer gives, so a hole and a
-// region blend stay decisions of whoever reads the ring rather than of the source.
+// Samples the payload of whichever region owns a world position, on that region's own
+// density grid. Returns 0 when no region covers it.
 uint32_t Terrain3DData::get_surface_texel_nearest(const Vector2 &p_world_xz) const {
-	const real_t spacing = MAX(0.0001f, _vertex_spacing);
-	// The region first, on the vertex grid: the payload's grid belongs to the region that owns it
-	// (its image is `region_size * that region's density` texels an axis), so the density is not known
-	// until the region is.
-	const Vector2i vgrid = world_to_vgrid_xz(p_world_xz.x, p_world_xz.y, spacing);
-	const Terrain3DRegion *region = get_region_ptr(V2I_DIVIDE_FLOOR(vgrid, _region_size));
-	if (region == nullptr || region->is_deleted()) {
-		return 0u;
+	if (_region_size <= 0) {
+		return 0;
 	}
-	const Ref<Image> map = region->get_surface_map();
-	if (map.is_null()) {
-		return 0u;
-	}
-	const int size = map->get_width();
-	if (size <= 0) {
-		return 0u;
+	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
+	const real_t region_world = real_t(_region_size) * vertex_spacing;
+	const Vector2i region_loc(int(Math::floor(p_world_xz.x / region_world)),
+			int(Math::floor(p_world_xz.y / region_world)));
+	const Terrain3DRegion *region = get_region_ptr(region_loc);
+	if (!region || region->is_deleted() || region->get_surface_map().is_null()) {
+		return 0;
 	}
 	const int density = MAX(1, region->get_surface_density());
-	const Vector2i payload(int(Math::floor(p_world_xz.x * real_t(density) / spacing)),
-			int(Math::floor(p_world_xz.y * real_t(density) / spacing)));
-	const Vector2i texel(Math::posmod(payload.x, size), Math::posmod(payload.y, size));
-	const PackedByteArray bytes = map->get_data();
-	if (bytes.size() < int64_t(size) * int64_t(size) * 2) {
-		return 0u;
+	const real_t payload_texel = vertex_spacing / real_t(density);
+	const int size = region->get_surface_map()->get_width();
+	if (size <= 0) {
+		return 0;
 	}
-	const uint8_t *packed = bytes.ptr() + (int64_t(texel.y) * int64_t(size) + int64_t(texel.x)) * 2;
-	return load_u16_le(packed);
+	const int x = CLAMP(int(Math::floor((p_world_xz.x - real_t(region_loc.x) * region_world) / payload_texel)), 0, size - 1);
+	const int y = CLAMP(int(Math::floor((p_world_xz.y - real_t(region_loc.y) * region_world) / payload_texel)), 0, size - 1);
+	// `get_data()` shares the image's buffer rather than copying it, so reading the two
+	// bytes through a pointer costs one call instead of one per texel.
+	const PackedByteArray payload = region->get_surface_map()->get_data();
+	if (payload.size() < int64_t(size) * size * 2) {
+		return 0;
+	}
+	const uint8_t *texel = payload.ptr() + (int64_t(y) * size + x) * 2;
+	return load_u16_le(texel);
 }

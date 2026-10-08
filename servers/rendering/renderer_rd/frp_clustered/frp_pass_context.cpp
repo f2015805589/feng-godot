@@ -549,6 +549,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
 	ClassDB::bind_method(D_METHOD("set_atmosphere_parameters", "parameters", "light", "secondary_light", "optical_texture", "multiple_texture"), &FRPPassContext::set_atmosphere_parameters);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_parameters"), &FRPPassContext::get_atmosphere_parameters);
+	ClassDB::bind_method(D_METHOD("get_atmosphere_optical_texture"), &FRPPassContext::get_atmosphere_optical_texture);
+	ClassDB::bind_method(D_METHOD("get_atmosphere_multiple_texture"), &FRPPassContext::get_atmosphere_multiple_texture);
 	ClassDB::bind_method(D_METHOD("request_sky_light_diffuse"), &FRPPassContext::request_sky_light_diffuse);
 	ClassDB::bind_method(D_METHOD("set_cloud_snapshot", "material_parameters", "shape_texture", "detail_texture", "weather_texture", "curl_texture", "primary_sun", "secondary_sun", "source_signature"), &FRPPassContext::set_cloud_snapshot, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("clear_cloud_snapshot"), &FRPPassContext::clear_cloud_snapshot);

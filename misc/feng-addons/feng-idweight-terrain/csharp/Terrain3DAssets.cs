@@ -302,15 +302,3 @@ public partial class Terrain3DAssets : Resource
 		Call(GDExtensionMethodName.Save, [path]).As<Error>();
 
 }
-
-file static class AssetTypeExtensions
-{
-public static int SafeAsInt32(this Terrain3DAssets.AssetType enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DAssets.AssetType enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DAssets.AssetType? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

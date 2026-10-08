@@ -71,7 +71,7 @@ func _prepare_atmosphere(ctx: FRPPassContext) -> PackedFloat32Array:
 	_atmosphere_multiple = RID()
 	if ctx == null:
 		return PackedFloat32Array()
-	_atmosphere_snapshot = _capture_atmosphere_snapshot.duplicate(true) if _capture_snapshot_active \
+	_atmosphere_snapshot = _capture_atmosphere_snapshot if _capture_snapshot_active \
 			else _atmosphere_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
 	var render_data := ctx.get_render_data()
 	var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
@@ -88,22 +88,19 @@ func _prepare_atmosphere(ctx: FRPPassContext) -> PackedFloat32Array:
 	return AtmospherePacket.make(_atmosphere_snapshot, scene_data.get_cam_transform(), _atmosphere_optical.is_valid(), _atmosphere_multiple.is_valid())
 
 func _capture_cloud_visibility(ctx: FRPPassContext) -> void:
-	_cloud_visibility_parameters = PackedFloat32Array()
-	_cloud_shadow0 = RID()
-	_cloud_shadow1 = RID()
-	_cloud_raw_ao = RID()
-	if ctx == null or not ctx.has_method("get_cloud_atmosphere_parameters"):
+	_clear_cloud_visibility()
+	if ctx == null:
 		return
-	var parameters: Variant = ctx.call("get_cloud_atmosphere_parameters")
-	if not parameters is PackedFloat32Array or parameters.size() != 148:
+	var parameters: PackedFloat32Array = ctx.get_cloud_atmosphere_parameters()
+	if parameters.size() != 148:
 		return
 	_cloud_visibility_parameters = parameters
-	if parameters[142] > 0.5 and ctx.has_method("get_cloud_output"):
-		_cloud_shadow0 = ctx.call("get_cloud_output", 3)
-	if parameters[143] > 0.5 and ctx.has_method("get_cloud_output"):
-		_cloud_shadow1 = ctx.call("get_cloud_output", 4)
-	if parameters[144] > 0.5 and ctx.has_method("get_cloud_output"):
-		_cloud_raw_ao = ctx.call("get_cloud_output", 7)
+	if parameters[142] > 0.5:
+		_cloud_shadow0 = ctx.get_cloud_output(3)
+	if parameters[143] > 0.5:
+		_cloud_shadow1 = ctx.get_cloud_output(4)
+	if parameters[144] > 0.5:
+		_cloud_raw_ao = ctx.get_cloud_output(7)
 
 func _clear_cloud_visibility() -> void:
 	_cloud_visibility_parameters = PackedFloat32Array()
@@ -116,66 +113,37 @@ func _clear_cloud_visibility() -> void:
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	_prepared_context_id = ctx.get_instance_id() if ctx != null else 0
 	var packet := _prepare_atmosphere(ctx)
-	if ctx != null and ctx.has_method("set_atmosphere_parameters"):
-		ctx.call("set_atmosphere_parameters", packet,
+	if ctx != null:
+		ctx.set_atmosphere_parameters(packet,
 			_atmosphere_snapshot.get("sun_light_rid", RID()),
 			_atmosphere_snapshot.get("secondary_sun_light_rid", RID()),
 			_atmosphere_optical, _atmosphere_multiple)
 
 
 func _frp_execute(ctx: FRPPassContext) -> void:
-	if _capture_snapshot_active:
-		if ctx == null:
-			return
-		_prepared_context_id = ctx.get_instance_id()
-		var packet := _prepare_atmosphere(ctx)
-		if ctx.has_method("set_atmosphere_parameters"):
-			ctx.call("set_atmosphere_parameters", packet,
-				_atmosphere_snapshot.get("sun_light_rid", RID()),
-				_atmosphere_snapshot.get("secondary_sun_light_rid", RID()),
-				_atmosphere_optical, _atmosphere_multiple)
-		_capture_cloud_visibility(ctx)
-		_pre_exposure = ctx.get_pre_exposure(0)
-		_capture_exposure_normalization = ctx.get_scene_exposure_normalization() \
-				if ctx.has_method("get_scene_exposure_normalization") else 1.0
-		var frame_snapshot := _capture_fog_snapshot.duplicate(true)
-		var render_data := ctx.get_render_data()
-		var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
-		var frame_parameters := PackedFloat32Array()
-		if not frame_snapshot.is_empty() and scene_data != null:
-			var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
-			var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
-			frame_parameters = _make_forward_parameters(frame_snapshot, scene_data.get_cam_transform(),
-				fog_scale, scene_data.get_view_projection(0))
-		ctx.call("set_height_fog_parameters", frame_parameters)
-		super._frp_execute_with_snapshot(ctx, frame_snapshot)
-		_clear_cloud_visibility()
-		_pre_exposure = 1.0
-		_capture_exposure_normalization = 1.0
+	if ctx == null:
 		return
-	# Reuse one immutable frame lease from pre-lighting through opaque/forward
-	# work. Keep its Texture2D references alive until the next frame preparation.
-	# Older engines without the optional hook can still execute compute AP.
-	if ctx == null or _prepared_context_id != ctx.get_instance_id():
-		_prepare_atmosphere(ctx)
-	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
-	if ctx != null:
-		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
-		var snapshot := _snapshot_for_target(buffers)
-		var frame_parameters := PackedFloat32Array()
-		if not snapshot.is_empty():
-			var render_data := ctx.get_render_data()
-			var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
-			if scene_data != null:
-				var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
-				var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
-				frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(),
-					fog_scale, scene_data.get_view_projection(0))
-		ctx.call("set_height_fog_parameters", frame_parameters)
-		_capture_cloud_visibility(ctx)
-	super._frp_execute(ctx)
+	# Reuse the pre-lighting lease; captures supply a frozen snapshot per face.
+	if _capture_snapshot_active or _prepared_context_id != ctx.get_instance_id():
+		_frp_prepare(ctx)
+	var snapshot := _capture_fog_snapshot if _capture_snapshot_active \
+			else _snapshot_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
+	var render_data := ctx.get_render_data()
+	var scene_data: RenderSceneData = render_data.get_render_scene_data() if render_data != null else null
+	var frame_parameters := PackedFloat32Array()
+	if not snapshot.is_empty() and scene_data != null:
+		var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
+		var fog_scale := float(resolved.x) if resolved is Vector4 else 1.0
+		frame_parameters = _make_forward_parameters(snapshot, scene_data.get_cam_transform(),
+			fog_scale, scene_data.get_view_projection(0))
+	ctx.set_height_fog_parameters(frame_parameters)
+	_capture_cloud_visibility(ctx)
+	_pre_exposure = ctx.get_pre_exposure(0)
+	_capture_exposure_normalization = ctx.get_scene_exposure_normalization() if _capture_snapshot_active else 1.0
+	super._frp_execute_with_snapshot(ctx, snapshot)
 	_clear_cloud_visibility()
 	_pre_exposure = 1.0
+	_capture_exposure_normalization = 1.0
 
 func _make_forward_parameters(snapshot: Dictionary, camera: Transform3D, fog_scale: float,
 		projection: Projection) -> PackedFloat32Array:
@@ -310,27 +278,11 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 		format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 		_empty_atmosphere_lut = rd.texture_create(format, RDTextureView.new(), [PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array()])
-	for slot in 2:
-		var texture: RID = _atmosphere_optical if slot == 0 else _atmosphere_multiple
-		if not texture.is_valid() or not rd.texture_is_valid(texture):
-			texture = _empty_atmosphere_lut
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		uniform.binding = 3 + slot
-		uniform.add_id(_atmosphere_sampler)
-		uniform.add_id(texture)
-		uniforms.append(uniform)
 	var cloud_parameters := _cloud_visibility_parameters
 	if cloud_parameters.size() != 148:
 		cloud_parameters.resize(148)
 		cloud_parameters[140] = -1.0
 		cloud_parameters[141] = -1.0
-		cloud_parameters[142] = 0.0
-		cloud_parameters[143] = 0.0
-		cloud_parameters[144] = 0.0
-		cloud_parameters[145] = 0.0
-		cloud_parameters[146] = 0.0
-		cloud_parameters[147] = 0.0
 	if not _cloud_visibility_ubo.is_valid():
 		_cloud_visibility_ubo = rd.uniform_buffer_create(CLOUD_VISIBILITY_UBO_SIZE)
 	if not _cloud_visibility_ubo.is_valid() or rd.buffer_update(_cloud_visibility_ubo, 0,
@@ -343,14 +295,15 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	cloud_visibility_uniform.binding = 5
 	cloud_visibility_uniform.add_id(_cloud_visibility_ubo)
 	uniforms.append(cloud_visibility_uniform)
-	var cloud_textures: Array[RID] = [_cloud_shadow0, _cloud_shadow1, _cloud_raw_ao]
-	for slot in cloud_textures.size():
-		var texture: RID = cloud_textures[slot]
+	var textures: Array[RID] = [_atmosphere_optical, _atmosphere_multiple, _cloud_shadow0, _cloud_shadow1, _cloud_raw_ao]
+	var bindings := [3, 4, 6, 7, 8]
+	for slot in textures.size():
+		var texture := textures[slot]
 		if not texture.is_valid() or not rd.texture_is_valid(texture):
 			texture = _empty_atmosphere_lut
 		var uniform := RDUniform.new()
 		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		uniform.binding = 6 + slot
+		uniform.binding = bindings[slot]
 		uniform.add_id(_atmosphere_sampler)
 		uniform.add_id(texture)
 		uniforms.append(uniform)
@@ -373,7 +326,7 @@ func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
 	# Value-capture the UBO: the instance is being torn down, so only local
-	# state is safe here (see FengRuntimeSnapshotPass._free_on_render_thread).
+	# state is safe here (see FengPass._free_on_render_thread).
 	var ubo := _ubo
 	var empty_lut := _empty_atmosphere_lut
 	var atmosphere_sampler := _atmosphere_sampler

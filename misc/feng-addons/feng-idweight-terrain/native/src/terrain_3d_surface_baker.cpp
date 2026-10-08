@@ -125,7 +125,13 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 			_free_bundle(_rd, old);
 		}
 	}
-	ResourceBundle next;
+	// The candidate owns every RID until adoption, including partial allocations. Build
+	// stages never free or forget its handles; every failed stage rolls back here.
+	struct PendingBundle : ResourceBundle {
+		RenderingDevice *rd;
+		explicit PendingBundle(RenderingDevice *p_rd) : rd(p_rd) {}
+		~PendingBundle() { _free_bundle(rd, *this); }
+	} next(_rd);
 	if (!_create_bake_core_resources(next, p_material_bytes, p_page_count)) {
 		return false;
 	}
@@ -153,7 +159,6 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 				next.output_params_rd, RenderingServer::TEXTURE_LAYERED_2D_ARRAY);
 		if (!next.output_albedo_rs.is_valid() || !next.output_normal_rs.is_valid() ||
 				!next.output_params_rs.is_valid()) {
-			_free_bundle(_rd, next);
 			LOG(ERROR, "Could not wrap surface bake arrays as RS textures");
 			return false;
 		}
@@ -164,23 +169,12 @@ bool Terrain3DSurfaceBaker::_ensure_resources(uint64_t p_generation,
 		// is worse than the memory the codec would have saved.
 		if (_any_tier_uses_sampled(true) && !_compile_encode_pipeline(next)) {
 			for (int tier = 0; tier < TIER_COUNT; ++tier) {
-				_tiers[tier].applied.store(0);
-				_tiers[tier].normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
-				_tiers[tier].params_encoded.store(false);
-				_tiers[tier].effective.store(0);
-				_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
-				_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-				_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-				_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
-				_tiers[tier].params_format.store(RenderingDevice::DATA_FORMAT_MAX);
-				next.sampled[tier] = SampledSet();
+				_tiers[tier].disable_compression();
 			}
-			_free_bundle(_rd, next);
 			LOG(WARN, "Could not build the surface block encoder; keeping every page uncompressed");
 			return false;
 		}
 		if (!_rebuild_uniform_set(next, p_albedo_array_rs, p_normal_array_rs)) {
-			_free_bundle(_rd, next);
 			LOG(ERROR, "Could not create the surface bake uniform set");
 			return false;
 		}

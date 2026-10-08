@@ -21,7 +21,7 @@ static func migrate_native_pass_set(
 	passes: Array,
 	native_default_ids: Array,
 	make_native_pass_fn: Callable
-) -> Array:
+) -> Array[PassBase]:
 	var carried := {}
 	var carried_before := []
 	var legacy_enabled := {}
@@ -81,7 +81,7 @@ static func migrate_legacy_passes(
 	native_seed_ids: Array,
 	is_optional_fn: Callable,
 	make_native_pass_fn: Callable
-) -> Array:
+) -> Array[PassBase]:
 	var legacy: Array[PassBase] = []
 	for p in passes:
 		if p is PassBase:
@@ -158,3 +158,52 @@ static func _make_migrated_native(
 	if legacy_seen.has(native_id):
 		pass_entry.enabled = legacy_enabled[native_id]
 	return pass_entry
+
+## Schema 10 repairs the released Sky → Cloud → Trace → Fog sequence.
+## Require unique stock identities and scripts so authored replacements keep their order.
+static func migrate_cloud_fog_order(passes: Array[PassBase]) -> bool:
+	var sky_index := -1
+	for i in passes.size():
+		if passes[i] is BuiltinPass and passes[i].native_id == NativeSpec.PASS_SKY:
+			if sky_index >= 0:
+				return false
+			sky_index = i
+	if sky_index < 0 or sky_index + 3 >= passes.size():
+		return false
+	var sky := passes[sky_index] as BuiltinPass
+	if sky.stable_id != "native:%d" % NativeSpec.PASS_SKY or sky.implementation == null:
+		return false
+	var sky_script := sky.implementation.get_script() as Script
+	if sky_script == null or sky_script.resource_path != FengAddonLayout.passes_dir() + "native/sky_pass.gd" \
+			or sky.implementation.get("overlay") != null:
+		return false
+
+	var stock := {
+		&"library:volumetric_cloud": "cloud/volumetric_cloud.tres",
+		&"library:cloud_trace": "cloud/cloud_trace.tres",
+		&"library:height_fog": "height-fog/height_fog.tres",
+	}
+	var expected_index := sky_index
+	for stable_id in stock:
+		expected_index += 1
+		var template := load(FengAddonLayout.library_dir() + "/" + stock[stable_id])
+		var target_script: Script = template.get_script() if template != null else null
+		if target_script == null:
+			return false
+		var found := false
+		for i in passes.size():
+			var entry := passes[i]
+			if entry == null:
+				continue
+			var script: Script = entry.get_script()
+			var matches_script := script != null and script.resource_path == target_script.resource_path
+			if entry.stable_id == stable_id or matches_script:
+				if i != expected_index or entry.stable_id != stable_id or not matches_script:
+					return false
+				found = true
+		if not found:
+			return false
+	var trace := passes[sky_index + 2]
+	passes[sky_index + 2] = passes[sky_index + 3]
+	passes[sky_index + 3] = trace
+	return true

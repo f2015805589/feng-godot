@@ -944,27 +944,3 @@ public partial class Terrain3D : Node3D
 		Call(GDExtensionMethodName.GenerateNavMeshSourceGeometry, [globalAabb, requireNav]).As<Vector3[]>();
 
 }
-
-file static class DebugLevelEnumExtensions
-{
-public static int SafeAsInt32(this Terrain3D.DebugLevelEnum enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3D.DebugLevelEnum enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3D.DebugLevelEnum? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}
-
-file static class RegionSizeEnumExtensions
-{
-public static int SafeAsInt32(this Terrain3D.RegionSizeEnum enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3D.RegionSizeEnum enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3D.RegionSizeEnum? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

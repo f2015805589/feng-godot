@@ -81,6 +81,8 @@ private:
 	RID _fill_light_instance;
 	RID _mesh_instance;
 
+	void _set_asset_signals(AssetType p_type, const Ref<Terrain3DAssetResource> &p_asset, bool p_connected);
+	void _clear_asset_list(AssetType p_type);
 	void _swap_ids(const AssetType p_type, const int p_src_id, const int p_dst_id);
 	void _set_asset_list(const AssetType p_type, const TypedArray<Terrain3DAssetResource> &p_list);
 	void _set_asset(const AssetType p_type, const int p_id, const Ref<Terrain3DAssetResource> &p_asset);

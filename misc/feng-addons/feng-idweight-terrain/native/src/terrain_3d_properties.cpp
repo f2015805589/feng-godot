@@ -53,7 +53,14 @@ void Terrain3D::set_data_directory(String p_dir) {
 }
 
 void Terrain3D::set_assets(const Ref<Terrain3DAssets> &p_assets) {
-	SET_IF_DIFF(_assets, p_assets);
+	if (_assets == p_assets) {
+		return;
+	}
+	_set_resource_signals(false);
+	if (_assets.is_valid()) {
+		_assets->uninitialize();
+	}
+	_assets = p_assets;
 	LOG(INFO, "Setting asset list");
 	_initialized = false;
 	_initialize();
@@ -289,7 +296,14 @@ void Terrain3D::snap() {
 }
 
 void Terrain3D::set_material(const Ref<Terrain3DMaterial> &p_material) {
-	SET_IF_DIFF(_material, p_material);
+	if (_material == p_material) {
+		return;
+	}
+	_set_resource_signals(false);
+	if (_material.is_valid()) {
+		_material->uninitialize();
+	}
+	_material = p_material;
 	LOG(INFO, "Setting material");
 	_initialized = false;
 	_initialize();

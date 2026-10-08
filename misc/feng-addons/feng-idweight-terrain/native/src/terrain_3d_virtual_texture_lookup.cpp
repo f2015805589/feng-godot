@@ -251,3 +251,30 @@ bool Terrain3DVirtualTexture::release_world_page(const int p_page_x, const int p
 	_write_level(virtual_x, virtual_y, p_local_mip, INVALID_SLOT);
 	return _page_pool && _page_pool->remove_owner(slot, this, virtual_x, virtual_y, p_local_mip);
 }
+
+// Every published indirection entry has a reverse owner. Scanning those owners
+// bounds edit work by physical residency, even at extreme texels-per-metre.
+void Terrain3DVirtualTexture::release_world_region(const Rect2 &p_region, real_t p_page_world) {
+	if (!_page_pool || !_world_space) {
+		return;
+	}
+	const int half = _indirection_size >> 1;
+	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
+		// Releasing an entry mutates its owner list.
+		const auto owners = _page_pool->slot_owners[slot];
+		for (const Terrain3DVTPageOwner &owner : owners) {
+			if (owner.texture != this || !owner.world_space) {
+				continue;
+			}
+			const int scale = 1 << owner.mip;
+			const real_t world = p_page_world * scale;
+			const Vector2i page(owner.virtual_x - (half >> owner.mip), owner.virtual_y - (half >> owner.mip));
+			// Preserve the existing inclusive bounds and one coarse-page border margin.
+			const Vector2 first = (p_region.position / world).floor() - Vector2(1, 1);
+			const Vector2 last = (p_region.get_end() / world).floor() + Vector2(1, 1);
+			if (page.x >= first.x && page.y >= first.y && page.x <= last.x && page.y <= last.y) {
+				release_world_page(page.x * scale, page.y * scale, owner.mip);
+			}
+		}
+	}
+}

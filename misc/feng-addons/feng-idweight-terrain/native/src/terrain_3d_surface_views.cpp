@@ -294,41 +294,14 @@ void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_fo
 	_invalidate_vt_region(p_region_loc);
 	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
 	const real_t region_world = real_t(_region_size) * vertex_spacing;
-	// Near field: the sector is the region, so every page of every level is stale.
-	if (!is_sector_avt() && _vt.surface_vt && _vt.surface_vt->is_initialized() && _vt.surface_vt->has_sector(p_region_loc)) {
-		const int block = _vt.surface_vt->get_sector_block_size(p_region_loc);
-		const int max_mip = block > 0 ? TerrainVT::log2_power_of_two(block) : 0;
-		for (int mip = 0; mip <= max_mip; mip++) {
-			const int pages = MAX(1, block >> mip);
-			for (int py = 0; py < pages; py++) {
-				for (int px = 0; px < pages; px++) {
-					_vt.surface_vt->release_page(p_region_loc, mip, px, py);
-				}
-			}
-		}
+	// Diagnostic/publicly requested pages may have no PageRecord. Invalidate their
+	// published owners too, without walking the potentially enormous virtual grid.
+	if (!is_sector_avt() && _vt.surface_vt && _vt.surface_vt->is_initialized()) {
+		_vt.surface_vt->release_sectors_pages({ p_region_loc });
 	}
-	// Far field: every page of every level that overlaps the region, plus one page of
-	// margin because a page's border texels are filled from its neighbours.
 	if (_vt.surface_svt && _vt.surface_svt->is_initialized()) {
-		const real_t page_world = MAX(0.001f, _vt.surface_svt_page_world);
-		const real_t x0 = real_t(p_region_loc.x) * region_world;
-		const real_t z0 = real_t(p_region_loc.y) * region_world;
-		const int max_mip = _vt.surface_svt->get_world_max_mip();
-		for (int mip = 0; mip <= max_mip; mip++) {
-			const real_t mip_world = page_world * real_t(1 << mip);
-			const int px0 = int(Math::floor(x0 / mip_world)) - 1;
-			const int px1 = int(Math::floor((x0 + region_world) / mip_world)) + 1;
-			const int pz0 = int(Math::floor(z0 / mip_world)) - 1;
-			const int pz1 = int(Math::floor((z0 + region_world) / mip_world)) + 1;
-			for (int pz = pz0; pz <= pz1; pz++) {
-				for (int px = px0; px <= px1; px++) {
-					// release_world_page takes a mip 0 page coordinate, so shift the
-					// level's page back up; any mip 0 page inside it maps to the same
-					// indirection texel.
-					_vt.surface_svt->release_world_page(px << mip, pz << mip, mip);
-				}
-			}
-		}
+		_vt.surface_svt->release_world_region(Rect2(Vector2(p_region_loc) * region_world,
+				Vector2(region_world, region_world)), MAX(0.001f, _vt.surface_svt_page_world));
 	}
 }
 

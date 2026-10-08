@@ -444,10 +444,6 @@ void Terrain3DClipmapAtlas::_assign_slots(const std::vector<PackedItem> &p_items
 		}
 		_slots.push_back(slot);
 	}
-	if (!_spare_slots.empty()) {
-		// A spare is a real slot of its ring, so a replacement can be produced into it before the
-		// block it replaces is released. Nothing else to do here: the slot table is complete.
-	}
 }
 
 void Terrain3DClipmapAtlas::_rebuild_cells() {
@@ -536,7 +532,6 @@ void Terrain3DClipmapAtlas::configure(const Config &p_config) {
 	_has_focus = false;
 	_last_focus = Vector2();
 	_grid_step = Vector2i();
-	_shape_serial++;
 	_state_stamp++;
 }
 
@@ -562,7 +557,6 @@ void Terrain3DClipmapAtlas::clear() {
 	_ladder = TerrainClipmap::Ladder();
 	_has_focus = false;
 	_last_focus = Vector2();
-	_shape_serial++;
 	_state_stamp++;
 }
 
@@ -815,7 +809,7 @@ void Terrain3DClipmapAtlas::_fill_job_row(const Job &p_job, const int p_channel,
 
 // A block is produced *whole*: it is the unit of work rather than a fraction of one, which is what
 // makes "a frame loads a block" the mechanism's own shape rather than a budget's side effect.
-bool Terrain3DClipmapAtlas::_produce_job(Job &p_job) {
+void Terrain3DClipmapAtlas::_produce_job(const Job &p_job) {
 	const Slot &slot = _slots[size_t(p_job.slot)];
 	const int texels = slot.texels;
 	for (int channel = 0; channel < _config.channels; channel++) {
@@ -825,8 +819,6 @@ bool Terrain3DClipmapAtlas::_produce_job(Job &p_job) {
 		}
 		_upload_rect(p_job.ring * _config.channels + channel, slot.rect, texels, channel, _block_values);
 	}
-	p_job.cursor_row = texels;
-	return true;
 }
 
 // The global block: one minimal-resolution square covering everything outside the grid, produced
@@ -921,7 +913,7 @@ int Terrain3DClipmapAtlas::_take_free_slot(const int p_ring) {
 
 void Terrain3DClipmapAtlas::_queue_block(const int p_cell, const int p_slot) {
 	Cell &cell = _cells[size_t(p_cell)];
-	Job job(p_slot, cell.ring, cell.want_x, cell.want_y, cell.offset.x);
+	Job job(p_slot, cell.ring, cell.want_x, cell.want_y);
 	_jobs.push_back(job);
 	cell.pending_slot = p_slot;
 	cell.current = false;
@@ -1119,10 +1111,7 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 		Job job = _jobs.front();
 		_jobs.erase(_jobs.begin());
 		const uint64_t before = _produced_texels;
-		if (!_produce_job(job)) {
-			_jobs.insert(_jobs.begin(), job);
-			break;
-		}
+		_produce_job(job);
 		produced += int(_produced_texels - before);
 		drained++;
 		// The block landed: the slot describes the coordinate, and every cell waiting on it flips to
@@ -1131,7 +1120,6 @@ int Terrain3DClipmapAtlas::update(const Vector2 &p_focus, const int p_budget_tex
 		Slot &slot = _slots[size_t(job.slot)];
 		slot.block_x = job.block_x;
 		slot.block_y = job.block_y;
-		slot.phase = job.phase;
 		slot.serial = _serial();
 		slot.resident = true;
 		slot.baked = false;
@@ -1287,8 +1275,6 @@ real_t Terrain3DClipmapAtlas::sample(const Vector2 &p_world, const int p_channel
 		const Vector2 origin(block.x - 0.5f * block_world, block.y - 0.5f * block_world);
 		const int logical_x = int(Math::floor((p_world.x - origin.x) / texel));
 		const int logical_y = int(Math::floor((p_world.y - origin.y) / texel));
-		const int stored_x = TerrainClipmap::wrap_texel(logical_x + cell.offset.x, texels);
-		const int stored_y = TerrainClipmap::wrap_texel(logical_y + cell.offset.y, texels);
 		// The world position the *logical* texel names, which is what the cell's block was produced
 		// from - the content, not the view. Reading the source here is exact because a block's texels
 		// are the source's values at exactly these positions.
@@ -1302,8 +1288,6 @@ real_t Terrain3DClipmapAtlas::sample(const Vector2 &p_world, const int p_channel
 		row.size = texels;
 		row.texel_world = texel;
 		row.origin = named;
-		(void)stored_x;
-		(void)stored_y;
 		_source->fill_row(row, _row_values.data());
 		return _row_values[0];
 	}

@@ -198,8 +198,8 @@ next candidate. The same completed radiance feeds FRP's world IBL/ambient path
 and `FengMagicGI`'s sky SH term; MagicGI keeps its existing directional-light
 transport contribution. **Radiance Energy** is applied once to both consumers.
 MagicGI reads the provider's cached SH projection instead of baking another
-panorama for each volume. If FengSky is not installed, MagicGI keeps its normal
-Environment sky path.
+panorama for each volume. Without a ready FengSkyLight, MagicGI uses zero sky SH;
+its directional-light and baked-emitter contributions remain available.
 
 Captured radiance uses the Environment exposure recorded for the capture.
 `FengSkyLight` keeps its capture Environment private and refreshes it for each

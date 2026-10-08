@@ -320,10 +320,6 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 			ui.live_info_panel.update(mouse_global_position)
 
 		if _input_mode != -1: # Not cam rotation
-			## Update region highlight
-			var region_position: Vector2 = ( Vector2(mouse_global_position.x, mouse_global_position.z) \
-				/ (terrain.get_region_size() * terrain.get_vertex_spacing()) ).floor()
-
 			if _input_mode > 0 and editor.is_operating():
 				# Inject pressure - Relies on C++ set_brush_data() using same dictionary instance
 				ui.brush_data["mouse_pressure"] = p_event.pressure
@@ -369,11 +365,6 @@ func _forward_3d_gui_input(p_viewport_camera: Camera3D, p_event: InputEvent) -> 
 			editor.operate(mouse_global_position, p_viewport_camera.rotation.y)
 			return AFTER_GUI_INPUT_STOP
 		
-		# Left button released: close the stroke, which stores the undo data
-		elif editor.is_operating():
-			editor.stop_operation()
-			return AFTER_GUI_INPUT_STOP
-
 	return AFTER_GUI_INPUT_PASS
 
 

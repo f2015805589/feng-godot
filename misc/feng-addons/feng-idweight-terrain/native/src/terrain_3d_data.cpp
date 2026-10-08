@@ -262,112 +262,45 @@ Ref<Image> Terrain3DData::_get_blank_slot_map(const int p_slot_map) {
 	if (blank.is_valid() && blank->get_width() == _region_size) {
 		return blank;
 	}
-	switch (p_slot_map) {
-		case SLOT_MAP_HEIGHT:
-			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_HEIGHT], false,
-					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_HEIGHT]);
-			break;
-		case SLOT_MAP_CONTROL:
-			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_CONTROL], false,
-					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_CONTROL]);
-			break;
-		case SLOT_MAP_COLOR:
-			blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[Terrain3DRegion::TYPE_COLOR], true,
-					Terrain3DRegion::FORMAT[Terrain3DRegion::TYPE_COLOR]);
-			break;
-		case SLOT_MAP_SURFACE: {
-			// A blank R16 layer is all-zero packed values = single material 0.
-			PackedByteArray zeros;
-			zeros.resize(int64_t(_region_size) * _region_size * 2);
-			blank = Image::create_from_data(_region_size, _region_size, false, IDWEIGHT_IMAGE_FORMAT, zeros);
-			break;
-		}
-		default:
-			break;
+	static_assert(int(SLOT_MAP_HEIGHT) == int(TYPE_HEIGHT) && int(SLOT_MAP_CONTROL) == int(TYPE_CONTROL) &&
+			int(SLOT_MAP_COLOR) == int(TYPE_COLOR), "legacy maps share their slot indices");
+	if (p_slot_map == SLOT_MAP_SURFACE) {
+		// Blank packed R16 values encode single material 0.
+		PackedByteArray zeros;
+		zeros.resize(int64_t(_region_size) * _region_size * 2);
+		blank = Image::create_from_data(_region_size, _region_size, false, IDWEIGHT_IMAGE_FORMAT, zeros);
+	} else {
+		blank = Util::get_filled_image(_region_sizev, Terrain3DRegion::COLOR[p_slot_map],
+				p_slot_map == SLOT_MAP_COLOR, Terrain3DRegion::FORMAT[p_slot_map]);
 	}
 	return blank;
-}
-
-// Samples the payload of whichever region owns a world position, on that region's own
-// density grid. Returns 0 when no region covers it.
-uint16_t Terrain3DData::_sample_payload_world(const real_t p_world_x, const real_t p_world_z) const {
-	if (_region_size <= 0) {
-		return 0;
-	}
-	const real_t vertex_spacing = MAX(0.0001f, _vertex_spacing);
-	const real_t region_world = real_t(_region_size) * vertex_spacing;
-	const Vector2i region_loc(int(Math::floor(p_world_x / region_world)),
-			int(Math::floor(p_world_z / region_world)));
-	const Terrain3DRegion *region = get_region_ptr(region_loc);
-	if (!region || region->is_deleted() || region->get_surface_map().is_null()) {
-		return 0;
-	}
-	const int density = MAX(1, region->get_surface_density());
-	const real_t payload_texel = vertex_spacing / real_t(density);
-	const int size = region->get_surface_map()->get_width();
-	const int x = CLAMP(int(Math::floor((p_world_x - real_t(region_loc.x) * region_world) / payload_texel)), 0, size - 1);
-	const int y = CLAMP(int(Math::floor((p_world_z - real_t(region_loc.y) * region_world) / payload_texel)), 0, size - 1);
-	// `get_data()` shares the image's buffer rather than copying it, so reading the two
-	// bytes through a pointer costs one call instead of one per texel.
-	const PackedByteArray payload = region->get_surface_map()->get_data();
-	if (payload.size() < int64_t(size) * size * 2) {
-		return 0;
-	}
-	const uint8_t *texel = payload.ptr() + (int64_t(y) * size + x) * 2;
-	return load_u16_le(texel);
 }
 
 Ref<Image> Terrain3DData::_get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const {
 	if (!p_region) {
 		return Ref<Image>();
 	}
-	switch (p_slot_map) {
-		case SLOT_MAP_HEIGHT:
-			return p_region->get_height_map();
-		case SLOT_MAP_CONTROL:
-			return p_region->get_control_map();
-		case SLOT_MAP_COLOR:
-			return p_region->get_color_map();
-		case SLOT_MAP_SURFACE:
-			// The array layer stays at region_size even when the region's stored
-			// payload is denser; the virtual texture serves the extra detail.
-			return p_region->get_surface_map_array_image();
-		default:
-			return Ref<Image>();
-	}
+	// Stored payloads can be denser; the array fallback stays at region_size.
+	return p_slot_map == SLOT_MAP_SURFACE ? p_region->get_surface_map_array_image() :
+			p_region->get_map(MapType(p_slot_map));
 }
 
 // Uploads one of the four slot maps. Only layers that are actually stale are
 // touched, unless the whole map was marked full (capacity change, bulk rebuild, or
 // an explicit update_maps(all_regions = true)). Returns true if anything changed.
 bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
-	GeneratedTexture *gen = nullptr;
-	TypedArray<Image> *images = nullptr;
-	const char *signal = nullptr;
-	switch (p_slot_map) {
-		case SLOT_MAP_HEIGHT:
-			gen = &_generated_height_maps;
-			images = &_height_maps;
-			signal = "height_maps_changed";
-			break;
-		case SLOT_MAP_CONTROL:
-			gen = &_generated_control_maps;
-			images = &_control_maps;
-			signal = "control_maps_changed";
-			break;
-		case SLOT_MAP_COLOR:
-			gen = &_generated_color_maps;
-			images = &_color_maps;
-			signal = "color_maps_changed";
-			break;
-		case SLOT_MAP_SURFACE:
-			gen = &_generated_surface_maps;
-			images = &_surface_maps;
-			signal = "surface_maps_changed";
-			break;
-		default:
-			return false;
-	}
+	struct MapBinding {
+		GeneratedTexture *texture;
+		TypedArray<Image> *images;
+		const char *signal;
+	};
+	const MapBinding bindings[] = {
+		{ &_generated_height_maps, &_height_maps, "height_maps_changed" },
+		{ &_generated_control_maps, &_control_maps, "control_maps_changed" },
+		{ &_generated_color_maps, &_color_maps, "color_maps_changed" },
+		{ &_generated_surface_maps, &_surface_maps, "surface_maps_changed" },
+	};
+	const auto [gen, images, signal] = bindings[p_slot_map];
 	if (_slot_capacity <= 0) {
 		gen->clear();
 		images->clear();
@@ -396,7 +329,7 @@ bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
 	const uint8_t bit = uint8_t(1 << p_slot_map);
 	const bool use_surface_payload = p_slot_map != SLOT_MAP_SURFACE || !_terrain ||
 			_terrain->is_surface_array_upload_needed();
-	bool changed = false;
+	bool changed = created;
 	for (int slot = 0; slot < _slot_capacity; slot++) {
 		if (_slot_locations[slot] == V2I_MAX) {
 			// Free slot: release the unloaded region's image so streaming actually
@@ -434,23 +367,6 @@ bool Terrain3DData::_sync_slot_map(const int p_slot_map) {
 		emit_signal(signal);
 	}
 	return changed;
-}
-
-// Maps a public MapType request onto the internal slot maps. The surface map has no
-// MapType of its own and is only refreshed by a full TYPE_MAX pass, as before.
-bool Terrain3DData::_slot_map_requested(const MapType p_map_type, const int p_slot_map) {
-	switch (p_slot_map) {
-		case SLOT_MAP_HEIGHT:
-			return p_map_type == TYPE_HEIGHT || p_map_type == TYPE_MAX;
-		case SLOT_MAP_CONTROL:
-			return p_map_type == TYPE_CONTROL || p_map_type == TYPE_MAX;
-		case SLOT_MAP_COLOR:
-			return p_map_type == TYPE_COLOR || p_map_type == TYPE_MAX;
-		case SLOT_MAP_SURFACE:
-			return p_map_type == TYPE_MAX;
-		default:
-			return false;
-	}
 }
 
 int Terrain3DData::_slot_map_mask(const MapType p_map_type) {

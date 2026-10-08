@@ -1,5 +1,8 @@
 # VT lifetime and page-arrival review
 
+Current lifetime ownership is summarized in [the architecture guide](vt_architecture_review.md).
+The reproduction and measured results below are historical Windows/D3D12 evidence.
+
 ## Reproduction and measurement
 
 The reported project is `F:/godot/project/test-1`, scene `render/test.tscn`,
@@ -73,7 +76,8 @@ These operations run on changes or teardown, not by adding per-frame scans.
 RenderDoc's temporary viewport list is already bounded; Tracy uses one download
 request; this review did not establish an unbounded leak in either plugin.
 
-The native audit also found bounded current-work containers: source jobs (32),
+The native audit also found bounded current-work containers: source jobs (then 32;
+current queues admit a bounded burst up to 256),
 SVT decoded cells (64 / 256 MiB), one active refinement plan, capped retention,
 and demand-age entries cleared when there are no misses (also guarded at 8192).
 Map-slot capacity can grow to its historical maximum of 1024; that can produce a

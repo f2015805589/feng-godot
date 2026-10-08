@@ -1,227 +1,136 @@
 # Surface VT architecture
 
-## Module map
+This is the current ownership and frame-flow guide. Addressing and streaming are in
+[terrain_vt_and_streaming.md](terrain_vt_and_streaming.md); channel selection and
+Clipmap configuration are in [vt_delivery_assembly.md](vt_delivery_assembly.md).
+Historical measurements are indexed separately in [README.md](README.md).
 
-The native side is a `Terrain3D` node plus the subsystems it owns. `Terrain3D`
-itself is the façade: the properties the editor and scripts see, region
-streaming, geometry, collision, instancing and the physics-tick scheduler. Its
-definitions live in nine files, grouped by concern -- `terrain_3d.cpp` (lifecycle,
-the physics tick, the render-geometry invalidation and the notifications),
-`terrain_3d_wiring.cpp` (the subsystem nodes and GPU objects the node creates and
-releases), `terrain_3d_monitors.cpp` (its custom `Performance` monitors),
-`terrain_3d_surface_views.cpp` with `terrain_3d_surface_views_far.cpp` and `terrain_3d_surface_views_near.cpp`
-(the virtual texture service: its views and settings, the far field's demand pass,
-and the near field's demand pass with its sector machinery),
-`terrain_3d_properties.cpp`, `terrain_3d_queries.cpp` and
-`terrain_3d_bindings.cpp` -- so a concern can be read without the others. Its two
-longest passes are written as named phases rather than locals: `update_surface_vt`
-is one loop over the helpers that rebuild the block tables, decide sector sizes,
-resolve each sector's pages and publish the result, and `_produce_sector_avt_pages`
-is one pass over `_avt_classify_plan`, `_avt_retain_visible`, `_avt_prime_sources`,
-`_avt_produce_visible`, `_avt_produce_prefetch` and `_avt_finish_produce`, whose
-per-pass state is `Terrain3DAVTProducePass`. The virtual texture machinery itself
-lives in these files, and each one owns one thing:
+## Ownership
 
-| File | Owns |
+`Terrain3D` owns authoring settings, subsystem lifetime and scheduling. Each subsystem
+owns the state transitions behind its public operations. The source is grouped by concern:
+
+| Owner | Responsibility |
 | --- | --- |
-| `terrain_vt.h` | The addressing contract only: page IDs, virtual-image kinds, the block allocator. Header-only, no Godot dependency, no runtime state. |
-| `terrain_3d_vt_state.h` | Every VT field `Terrain3D` owns, grouped in the same order as the passes that use them: the shared service, the near-field AVT and the far-field SVT. The groups whose fields are one fact are small structs with the operations that change them - `Terrain3DVTFade` (the per-slot ramps and the texture built from them), `Terrain3DVTPool` (published capacity, rebuild generation, the growth wait), `Terrain3DVTBoundMaterial` (the array bundle the material samples) and `Terrain3DSVTRootPlan` (the pinned root pyramid) - so an invariant like "a matching key on an unsettled plan is not a cache hit" is enforced by `matches()` rather than described. No algorithms beyond those, and no cross-field initializers. The node's own fields stay in `terrain_3d.h`. |
-| `terrain_3d_virtual_texture.{h,cpp}` | One view's indirection texture, the mip-chain walk and its virtual blocks. No terrain data, no demand, and no residency: the atlas it publishes into belongs to the pool below. One of three files defining the view; `terrain_3d_virtual_texture_sector.cpp` owns the near field's `VirtualImageAtlas` blocks (register / resize / unregister, the block origin, and moving resident pages a whole mip per doubling so a page keeps its world footprint), and `terrain_3d_virtual_texture_lookup.cpp` owns addressing (`_request_virtual()`, the sector-local and world-grid entry points, the walk, and the releases). |
-| `terrain_3d_vt_page_pool.{h,cpp}` | The physical side both views share: the `Texture2DArray` atlas, the global slot allocator (reserve / commit / abort), LRU and protection, the reverse owner index, and page read/write. |
-| `terrain_3d_avt.h` | Plain records of the near-field demand: page requests, the asynchronous plan result, cached addresses, sectors and the working set. No algorithms. |
-| `terrain_3d_sector_avt.cpp` | The near field's driver and its configuration: `_update_sector_avt()` (predict the lead, derive the plan key, reuse-or-rebuild, submit), the plan key and the install-or-reuse decision, the tier settings the sector size is derived from, and `_report_avt()` (the near field's keys of `get_vt_settings()`). One of five files that own the near field; the other four are `terrain_3d_sector_avt_motion.cpp` (the lead — the eye and the gaze — and the quantized plan key), `terrain_3d_sector_avt_hierarchy.cpp` (the 64 m sector scan, the coarse hierarchy, the address directory and its publication), `terrain_3d_avt_plan.cpp` (the plan worker) and `terrain_3d_avt_produce.cpp` (the production pass), with `terrain_3d_sector_avt_internal.h` the prologue two of them read. |
-| `terrain_3d_avt_plan.{h,cpp}` | The near field's plan worker and the immutable `PlanInput` it reads: the page selection runs beside the main thread that installs, retains and produces, so everything it may look at arrives in that one record. No scene, no renderer, no node state. |
-| `terrain_3d_avt_produce.cpp` | The near field's one production pass per tick: classify the standing plan, retain the source queue, prime the workers, publish what fits the budget, commit and report what it cost. |
-| `terrain_3d_page_pipeline.{h,cpp}` | The worker and planner threads, the immutable region snapshot they read, raw-ID page payload production, and `.vtcell` reads. |
-| `terrain_vt_cell.h` | The `.vtcell` on-disk contract: format version, file name and the source signature. Shared by the baker that writes the files and the runtime reader that consumes them, because the two must agree exactly. |
-| `terrain_3d_vt_cells.{h,cpp}` | The resident far-field cell sources: three GPU arrays (one layer per cell, full mip chain), the cell registry, the memory budget with its LRU eviction, and the per-(channel, layer, mip) views the page copy shader binds. A cell published here is what makes far-field page assembly a device-to-device copy with no file and no CPU work. |
-| `terrain_3d_vt_service.cpp` | The VT service's settings and lifetime: page size, border, count, workers, the motion lead, the resolution preset, both tiers' storage format, the feedback toggles and the editor preview, plus `_configure_vt_service()` / `_update_vt_service()` / `_destroy_vt_service()`. One of four files defining the service. |
-| `terrain_3d_vt_service_pages.cpp` | Page plumbing: invalidation of one slot, one region or every material; the queue that turns a produced payload into a material page; the resident far-field cell store; and the two helpers that decide whether a far page can be assembled from cells at all. |
-| `terrain_3d_vt_service_report.cpp` | The diagnostics the dock, the inspector and the tests read: `get_vt_settings()` (the telemetry every performance test in `native/tests` is written against), `get_vt_pages()`, the page and material previews, and the compression probe. Read-only. `get_vt_settings()` is one flat dictionary assembled by owner: `_report_vt_service()` here, `_report_avt()` in `terrain_3d_sector_avt.cpp`, `_report_svt()` in `terrain_3d_surface_views_far_walk.cpp` and `_report_vt_fade()` in `terrain_3d_vt_fade.cpp`, so a key is written beside the field it reads. Key names are a compatibility surface: 112 keys, unchanged by the split. |
-| `terrain_3d_vt_service_bake.cpp` | The far field's bake and its cell files: `bake_svt()`, the automatic pass behind it, the queue that serializes the two, the `.vtcell` signature and reader, and the browser of what is baked. The only half of the service that touches the filesystem. |
-| `terrain_3d_vt_service_internal.h` | The prologue the four service halves share: `baker()`, the one way the stored `Ref` becomes the producer, and `bake_source_grid()`, so a bake and a runtime page built from the same payload agree on where its corners are. |
-| `terrain_3d_surface_views.cpp` | Both views' setup and teardown and every setting the dock, the inspector and scripts write, plus `invalidate_surface_pages()`. One of four files defining the two views and their demand passes. |
-| `terrain_3d_surface_views_far.cpp` | The far field's demand pass entry point: `update_surface_svt()` in both of its modes, the one distance -> level rule it walks (`get_surface_svt_mip_for_distance()`, `get_surface_svt_mip_reach()`) and the diagnostic page writer. |
-| `terrain_3d_surface_views_far_walk.cpp` | What that pass delegates to with the material pipeline on: `_svt_plan_roots()` (the pinned root pyramid the fallback resolves through), `_svt_walk_visible_pages()` (visible footprints to pages, nearest first) and `_update_visible_svt()` (the page budget over them), with the shared capacity floor. Also `_report_svt()`, the far field's keys of `get_vt_settings()`. |
-| `terrain_3d_surface_views_near.cpp` | The near field's demand pass: `update_surface_vt()`, the GPU projection feedback pass, the camera-visible region query and the sector machinery (`_prepare_vt_sector()`, `_compute_adaptive_sector_sizes()`, `_vt_page_requests_for_sector()`, `_produce_missing_vt_pages()`, `_publish_vt_block_tables()`). |
-| `terrain_3d_surface_views_internal.h` | The one prologue symbol the service's halves share: `SourceWakeFlush`, the guard that wakes the page pipeline's workers once a demand pass is over rather than in the middle of it. |
-| `terrain_3d_surface_baker.cpp` | The device and the objects on it: the RenderingDevice lookup, texture and sampler creation, the resident-resource check and the material table upload. One of six files defining `Terrain3DSurfaceBaker`. |
-| `terrain_3d_surface_baker_bundle.cpp` | The `ResourceBundle`'s lifetime: the inventory `_collect_bundle_rids()` every path uses, creation, growth, adoption as the live bundle, and the free (at once, or deferred until the renderer has stopped drawing the old one). |
-| `terrain_3d_surface_baker_pipelines.cpp` | The two GPU programs: the bake pipeline and the block encoder, the GLSL both are compiled from, and the uniform sets they read. |
-| `terrain_3d_surface_baker_storage.cpp` | What a page is stored in and the block encoder: the per-tier codec resolver and the formats it applies, the ring of in-flight encode pages, the encoder dispatches, and the readbacks that publish them as sampled layers. |
-| `terrain_3d_surface_baker_queue.cpp` | The caller-facing queue: capacity, budget and the material snapshot, `queue_page()` / `queue_cached_page()` / `queue_cell_page()`, and the uploads that drain them. None of it runs on the render thread. |
-| `terrain_3d_surface_baker_frame.cpp` | One frame of production: `render_pending()`, the job list it builds, dispatch, the retirement of bundles the material stopped sampling, and the read-only state and bindings the caller and the editor read. |
-| `terrain_3d_surface_baker_internal.h` | The prologue the six halves share — the codec vocabulary, the shared constants and the small helpers — because each is read by two or three of them and a second copy would be a second vocabulary. No class member lives here. |
-| `terrain_3d_data_surface.cpp` | The region payload -> page resampler both tiers call: `produce_surface_page_set` for a sector block at one local mip, `produce_surface_rect_page` for a world-space page rectangle. One of five files defining `Terrain3DData`. |
-| `terrain_3d_data.cpp` | The stable layer slots, the chunk -> layer directory texture, the per-map-type blank layers and the slot-map upload. One of five files defining `Terrain3DData`. |
-| `terrain_3d_data_regions.cpp` | Region lifecycle and the region table: `add_region*()` / `remove_region*()` / `unload_region()`, `change_region_size()`, `change_surface_density()`, the modified and deleted flags, and `do_for_regions()`. It never touches a slot index directly; it goes through `_acquire_slot()` / `_release_slot()`. |
-| `terrain_3d_data_maps.cpp` | The map arrays, their GPU upload and their read side: `get_maps()`, `update_maps()`, `update_surface_region()`, `set_pixel()` and the height / normal / blend / slope / texture-id queries. |
-| `terrain_3d_data_edit.cpp` | `add_edited_area()` (what an edit tells the data so the virtual texture republishes the regions it touched), `calc_height_range()` and the master height range the mesher reads, `dump()`, and `_bind_methods()` — the whole script-facing surface of the class. |
-| `terrain_3d_vt_indirection.{h,cpp}` | Render-thread upload of the CPU-authored page table, coalesced into 16x16 tile patches. |
-| `terrain_3d_vt_visibility.h` | Camera-visible terrain footprint queries shared by both fields. Header-only, camera-only dependency. |
-| `main.glsl` | Sampling: the shader resolves a fragment's payload texel to a virtual page and walks up the mip chain. Address arithmetic here must match the C++ side exactly. |
+| `terrain_3d.cpp`, `_wiring`, `_properties`, `_queries`, `_bindings`, `_monitors` | Node lifecycle, subsystem wiring, public API and monitor lifetime |
+| `terrain_3d_vt_state.h` | Node-owned VT configuration and coordinated state: pool generation, plans, fades, bake jobs and Clipmap layers |
+| `terrain_vt.h` | Engine-independent page coordinates, mip lookup and POT virtual-block allocation |
+| `terrain_3d_virtual_texture*`, `terrain_3d_vt_indirection*` | Per-view addressing, virtual blocks and dirty page-table uploads |
+| `terrain_3d_vt_page_pool*` | Shared physical slots, acquisition/commit/abort, LRU, protection and reverse ownership |
+| `terrain_3d_sector_avt*`, `terrain_3d_avt_plan*`, `terrain_3d_avt_produce.cpp` | Near-field motion prediction, sector hierarchy, immutable planning input and page production schedule |
+| `terrain_3d_surface_views*` | Delivery selection, view configuration, near/far demand and SVT root/visible-page planning |
+| `terrain_3d_page_pipeline*`, `terrain_3d_surface_source.cpp` | Bounded worker requests and immutable source snapshots |
+| `terrain_3d_vt_service*` | Shared service lifetime, invalidation, source routing, diagnostics and offline cell baking |
+| `terrain_3d_vt_cells*`, `terrain_vt_cell.h` | GPU-resident SVT cell sources and the versioned `.vtcell` format |
+| `terrain_3d_surface_baker*` | GPU resources, candidate/live/retired bundles, queues, material bake/copy and block encoding |
+| `terrain_3d_clipmap*`, `terrain_3d_material_clipmap_detail*` | Per-channel Clipmap storage/source interfaces and material detail residency |
+| `terrain_3d_data*`, `terrain_3d_region*`, `terrain_3d_streamer*` | Region persistence, stable GPU slots, map edits and chunk residency |
+| `terrain_3d_material*`, `native/src/shaders/` | Resource properties, selected shader variants, bindings and sampling |
+| `terrain_3d_mesher*`, `terrain_3d_cdlod*`, `terrain_3d_instancer*` | Geometry, optional CDLOD and mesh-instance lifetime |
 
-### `get_vt_settings()` keys by owner
+Multi-file implementations share constants/helpers through their internal headers.
+CPU and shader addressing change together. `_configure_surface_view()` applies the
+same complete configuration on initial setup and pool rebuild.
 
-The dictionary is flat and 112 keys wide, and it is a compatibility surface: the tests, the dock and
-the inspector read it by name. Each key is written by the file that owns the field behind it, so a
-new reading belongs with its subsystem, not in the report file:
+On the editor side, `vt_editor.gd` owns the window and selection; `vt_terrain_bridge.gd`
+performs its guarded native calls. Overview/image math and page rows are data helpers;
+SVT bands and CDLOD controls own their panels. Inspector and plugin callers guard their
+own optional native methods. `asset_dock_common.gd` owns shared dock behavior, with
+version-specific hosts in `asset_dock.gd` / `asset_dock_45.gd`; `ui_decal.gd` owns cursor
+visuals. Signals and temporary resources are released by the object that registered them.
+Node resource replacement disconnects the old material/assets graph before uninitializing it;
+asset-list membership owns each asset subscription. Bulk and single sector remaps use the
+same ownership transitions; public nearest-surface queries share the region-boundary sampler.
+The asset list derives its selectable limit from the actual trailing empty tile. Channel
+packing cancellation/closure clears queued follow-on work.
 
-| Owner (definition) | Keys |
+## Defaults and units
+
+| Setting | Default / meaning |
 | --- | --- |
-| `terrain_3d_vt_service_report.cpp` (`_report_vt_service`) | `page_size`, `border`, `page_count`, `effective_page_count`, `pool_generation`, `auto_capacity`, `pages_per_update`, `page_workers`, `shared_pool`, the `physical_cache_bytes*` / `material_*_bytes` / `surface_*_compression_*` group, `vt_cpu_ms`, `vt_cpu_peak_ms`, `vt_phases`, `svt_cells`, `editor_preview*`, `callback_registered`, `material_signature`, the `bake_*` / `auto_bake` / `cells_baked` / `svt_source_pending` group, `producer`, `residency` |
-| `terrain_3d_sector_avt.cpp` (`_report_avt`) | `motion_lead_ms`, `motion_lead_m`, `motion_speed`, `motion_turn_deg_s`, `motion_turn_lead_deg`, `visible_late_pages`, `visible_late_worst_ms`, `visible_retained_pages`, `adaptive`, `avt_feedback`, `avt_texels_per_pixel`, `avt_resolution`, `avt_distance`, `avt_texels_per_meter`, `avt_virtual_resolution`, `avt_base_block_size`, `avt_sector_world`, `avt_sector_stats`, `avt_peak_stats`, `avt_peak_age_ms`, `avt_selection_mode`, `avt_region_grid`, `avt_region_offset`, `avt_forward_regions`, `avt_region_rect` |
-| `terrain_3d_surface_views_far_walk.cpp` (`_report_svt`) | `svt_texels_per_meter`, `svt_world_extent`, `svt_effective_max_mip`, `svt_feedback`, `svt_root_*`, `svt_requeues`, `svt_floor_level`, `svt_visible_pages`, `svt_stats`, `svt_worst_ms`, `svt_worst_frames_ago`, `svt_cpu_ms` |
-| `terrain_3d_vt_fade.cpp` (`_report_vt_fade`) | `vt_page_fade_frames`, `vt_page_fade_active_slots`, `vt_page_fade_pending_slots`, `vt_page_fade_held_slots`, `vt_page_fade_starts`, `vt_page_fade_starts_peak`, `vt_page_fade_ticks_max`, `vt_page_fade_queue_size`, `vt_page_fade_queue_capacity` |
+| Region geometry | 512 samples at 1 m spacing; existing region files retain their dimensions |
+| Delivery | Near Material AVT, Far Material SVT, both Height cells Direct |
+| AVT sector | Fixed 64 × 64 m world cell, independent of region and virtual-image size |
+| AVT density / reach | 1024 texels/m / 384 m; projected demand chooses resolution and local mip |
+| SVT density | 1 texel/m; distance bands choose world-page mips |
+| Shared pool | 256 slots, 256-texel core, 5-texel border; automatic growth up to 1024 slots |
+| Material compression | Uncompressed per tier; BC7 and BC3 are optional |
+| Coarse recovery | AVT and SVT feedback enabled |
+| Arrival ramp | `vt_page_fade_frames = 12` ticks; zero disables it |
+| AVT batch | Default 16, maximum 64; the motion/unserved-view governor selects the live allowance |
+| Editor preview | Enabled; direct live material display with runtime VT and auto-bake paused |
 
-The same one-file-one-job convention now covers two classes outside the VT machinery.
-`Terrain3DEditor` is four files: `terrain_3d_editor.cpp` (the object's state and public API, and the
-region tool), `terrain_3d_editor_paint.cpp` (the map brush loop and what runs after it),
-`terrain_3d_editor_texel.cpp` (one brush texel: the three map handlers, the two neighbourhood samples
-and the R16 surface path) and `terrain_3d_editor_undo.cpp` (the undo and redo snapshots).
-`Terrain3DMaterial` is four as well: `terrain_3d_material_shader.cpp` (the GLSL assembly),
-`terrain_3d_material.cpp` (the shader and its uniforms), `terrain_3d_material_resource.cpp` (the
-lifecycle, the setters and `save()`) and `terrain_3d_material_reflect.cpp` (the property list and the
-ClassDB bindings).
+A 64 m sector at 1024 texels/m names a 65,536² virtual image, not a resident texture.
+Physical slots, virtual-address capacity, screen footprint and source detail bound output.
+Changing physical page dimensions preserves the metric density settings.
+The anisotropy limit is shared by CPU/shader footprint selection and bounded by the
+viewport sampler and `2 * border - 1`; the default border supports the requested 8×.
 
-Three rules keep the split honest, and all three are load-bearing:
+## Frame flow
 
-1. **`Terrain3D` owns configuration and the frame schedule; the VT files own the
-   algorithms.** A change to how pages are chosen belongs in the demand file for
-   that field, not in `terrain_3d.cpp`.
-2. **Addressing is computed in exactly one place per field.** The near field
-   publishes a hashed sector directory the shader reads; the far field's page
-   address is a pure function of world coordinates on both sides. Any new
-   addressing rule has to be added to the C++ side and `main.glsl` together.
-3. **A view is configured by one function.** `_configure_surface_view()` applies
-   page dimensions, format and the mode-specific addressing; both the initial
-   setup and a shared-pool rebuild call it, so neither path depends on settings a
-   previous configuration happened to leave on the object.
-4. **A class split across files shares its prologue through one header, never by
-   copying it.** `terrain_3d_surface_baker_internal.h` holds the codec vocabulary,
-   the shared constants and the small helpers of the surface baker's six halves;
-   `terrain_3d_vt_service_internal.h` holds the two helpers the VT service's four
-   halves share. A helper that two halves need becomes an `inline` one there —
-   including one that used to sit in an anonymous namespace, which carries internal
-   linkage with no keyword to convert, so leaving it as it was makes the linker
-   report one definition per half. A second definition of the page-codec list would
-   be a second vocabulary, and the two `static_assert`s that keep the page list
-   inside the array list would stop constraining anything.
+1. Main-thread region updates publish immutable source bytes. Delivery selection chooses
+   active services and shader arms. A never-selected service allocates no runtime resources;
+   a deselected service can retain its cache while its work and bindings are stopped.
+2. AVT predicts eye/gaze motion, derives or reuses a bounded sector plan, retains useful
+   ready pages and submits source requests. SVT plans protected roots and visible footprints.
+3. Separate bounded AVT/SVT worker queues prepare source payloads. Workers use snapshots,
+   with tokens/generations rejecting cancelled or superseded results. Teardown joins them
+   before destroying their owners; normal demand updates do not wait for worker completion.
+4. Main-thread publication owns slots and page-table state. Dirty 16×16 table tiles are
+   queued to the render thread; failed submissions remain retryable. Pending work keeps
+   the editor drawing even if the page baker itself is idle.
+5. The native FRP **VT Pass** (ID 1) executes the registered main-RenderingDevice producer
+   before GBuffer. It evaluates material pages, copies/composes SVT cells and encodes blocks.
+   The render graph orders direct buffer-to-texture copies before sampling.
+6. Readiness and bindings publish coherently. Replaced GPU bundles retire after the material
+   acknowledges newer outputs. Reused slots clear readiness; lost content is retried.
 
-On the GDScript side the same rule applies to the VT window: `vt_editor.gd` owns
-the widgets, the selection state and which view is shown, and every part with rules
-of its own is a sibling script. `vt_terrain_bridge.gd` owns the VT window's
-duck-typed calls into the extension (a missing native method must read as
-"unavailable", not break the editor - `vt_editor.gd` keeps one-line delegations to it
-so the window's data layer is the only place that knows the native API), and
-`vt_overview_image.gd` owns the world/image maths and the per-pixel stitching, as pure
-functions over data passed in. `vt_editor_page_rows.gd` builds the Page tree's rows as
-pure functions over one `Snapshot` of the terrain, and defines the TreeItem metadata the
-window reads back when a row is selected; `vt_editor_svt_bands.gd` owns the mip distance
-band table - its spin boxes, the automatic rule and the hint that describes both;
-`vt_editor_cdlod_panel.gd` owns the CDLOD controls, which are terrain geometry rather
-than virtual texturing; `vt_editor_widgets.gd` is the settings label and spin box the
-panels share. Each moved method stayed on the window as a one-line delegation, so call
-sites and the editor regression did not move with the code. Two other scripts guard their own native calls rather
-than going through the bridge: `terrain_vt_inspector.gd` (`has_method` + `call` around
-`get_vt_settings` and `bake_svt`) and `editor_plugin.gd` (around the VT window's
-`open_vt_page_view` and the dock's `_open_vt_editor`); the bridge is where the *VT
-window* talks to the extension, not the only place in the addon that duck-types. The asset dock's list
-and tile widgets are shared by both dock versions in `asset_dock_list_*.gd`, and the
-dock's own half - signals, controls, search, list switching, pin, highlight and
-window-focus handling - is `asset_dock_common.gd`, which `asset_dock.gd` (4.6+, hosted
-in an `EditorDock`) and `asset_dock_45.gd` (pre-4.6, its own slot and window) both
-extend; each keeps only its hosting, its editor-settings keys and its own extras. The
-editor cursor decal is `ui_decal.gd`: the tool bar (`ui.gd`) keeps tool, brush
-and pointer state and forwards `update_decal()`, while the decal module owns the
-shader parameters, the decal arrays, the fade tween and the region-directory
-preview.
+The live AVT allowance feeds production, worker-window sizing and encoding capacity.
+`vt_pages_per_update` is positive; CPU deadlines are soft and checked between work units.
+Pool size is residency capacity, not work per frame. Cold views, edits and capacity changes
+can require several frames; no fixed all-frame CPU latency is guaranteed.
 
-## Dimensions and controls
+## Sampling and missing pages
 
-A new terrain region is 512 samples at 1 metre spacing: **512 x 512 metres of geometry**. Existing region files keep their dimensions. Bulk initialization accepts X/Z region counts; 20 x 20 spans 10.24 x 10.24 km.
+AVT samples a flat sector directory plus a mip-carrying page table. CPU projected demand
+and shader derivatives use matching footprints. The explicit plan distinguishes an
+unrequested level from a planned page whose content is late. SVT uses a world grid and
+its distance-selected mip/coarseness floor. Each field's feedback toggle permits coarser
+resident recovery within that field; disabling it exposes selected-page misses.
 
-Procedural AVT partitions material addressing into **64 x 64 metre sectors** (8 x 8 per default region). The AVT indirection atlas has 2048 x 2048 R32F entries and a manual mip chain. The default shared pool has 256 physical slots, each with a 256 x 256 texel core and 5-texel borders (266 x 266 storage). The gutter is the anisotropic kernel's own bound - a ratio of n spans about n texels along the major axis and bilinear adds half a texel, so `n <= 2 * border - 1` - and five is the smallest value that admits the near field's 8x default. It was nine while the rule was read as `border - 0.5`, which bought a bound three times larger than any request the setting can name, for 7.7% more texels on every page of both views; correcting the arithmetic gave that memory back. Both views share the number; see [`vt_sampling_review.md`](vt_sampling_review.md).
+The outer 25% of AVT reach blends to SVT. In that transition band a ready side can serve
+while the other arrives; outside it the selected tier owns the sample. Arrival ramps
+blend ready detail against available ancestors. A complete material-cache miss uses the
+diagnostic path. Direct author-material evaluation is selected explicitly by delivery,
+editor preview or the direct-material diagnostic mode. Legacy raw-ID tests have their
+own source-sampling path.
 
-| Density | Virtual image per 64 m sector | Logical entries per axis | Allocator block |
-| --- | --- | --- | --- |
-| 768 texels/m | 49152 x 49152 | 192 | 256 x 256 |
-| 1024 texels/m (default) | 65536 x 65536 | 256 | 256 x 256 |
-| 2048 texels/m | 131072 x 131072 | 512 | 512 x 512 |
+## Source and editor lifetime
 
-Allocator padding does not change logical density. These virtual images are not fully resident textures. Physical capacity, address capacity, screen footprint and original material detail all constrain visible quality. Changing physical page size preserves metric densities.
+SVT material sources come from GPU-resident cells, valid `.vtcell` files or resident
+region payloads. Runtime disk read/decompression/cropping runs on its worker queue;
+offline bake/export and editor previews are separate operations. The decoded mip cache
+is bounded at 256 MiB / 64 entries, allowing one oversized mip alone.
 
-`surface_vt_texels_per_meter` and `surface_svt_texels_per_meter` are independent. The AVT resolution dropdown and fixed mip-distance controls have been removed. Fixed-distance compatibility setters are no-ops; the legacy distance array remains for legacy/diagnostic APIs. Sector AVT uses automatic screen-footprint mip selection. The UI shows three half-density levels (1024/512/256 by default); editing one scales the standard chain, which continues beyond these three levels. SVT keeps its separate distance table.
+A default 512 m cell at 1 texel/m stores three 512² material sources and complete mips;
+source resolution is capped at 8192. Signatures include density, material/source revisions
+and neighboring height data. Save-terrain and bake-SVT are separate operations.
+Auto Bake debounces edits by 500 ms; explicit Bake regenerates all cells. Old `.vtpage`
+files require rebaking to `.vtcell` and are left untouched.
 
-## Ownership and frame flow
+Editor preview combines dirty invalidations until it closes; manual Bake remains available.
+Built-in shader variants include only selected delivery resources. Custom shader overrides
+retain their declared interface. Height stays RF; region Surface Maps stay packed R16.
+Geometry displacement and lighting remain draw-time work, separate from cached materials.
 
-- `terrain_3d_vt_service.cpp` (settings and lifetime), `terrain_3d_vt_service_pages.cpp` (invalidation, the material page queue and the cell store), `terrain_3d_vt_service_report.cpp` (the diagnostics) and `terrain_3d_vt_service_bake.cpp` (the `.vtcell` bake) configure the shared services, invalidate them and own their source lifetime. `Terrain3DVTPagePool` (`terrain_3d_vt_page_pool.{h,cpp}`) owns physical allocation, LRU, protection and reverse ownership; the view that published an evicted slot is called back so its indirection entry goes with it.
-- `terrain_3d_sector_avt.cpp` (the driver), `terrain_3d_sector_avt_motion.cpp` (the lead and the plan key) and `terrain_3d_sector_avt_hierarchy.cpp` (the scan, the hierarchy and the address directory) build visible and idle sector demand and retain address blocks, `terrain_3d_avt_plan.cpp` derives the page selection on the worker and `terrain_3d_avt_produce.cpp` spends the tick's budget on it. `terrain_3d_surface_views_far.cpp` with `terrain_3d_surface_views_far_walk.cpp` schedules visible SVT footprints with a common capacity floor. Both tiers point into the shared physical arrays.
-- `terrain_3d_vt_indirection.cpp` owns RD indirection initialization and dirty-tile uploads. CPU updates coalesce by mip/tile; the render thread copies 16 x 16 tiles. Failed initial/patch submissions remain available for retry. Encoded page IDs remain exact R32F values. The upload is queued into the render thread, so it only runs while frames are drawn: while a view still owes one, `Terrain3D::_update_vt_service()` keeps asking the editor for a redraw even when the baker has nothing pending.
-- The native **VT Pass** (id 1, from `FengNativeSpec.PASS_VIRTUAL_TEXTURE`) runs the registered main-RenderingDevice baker before GBuffer. AVT evaluates material pages; SVT copies/composites baked cell source regions. Runtime production does not use a local-device submit/sync or material readback.
-- Terrain shading resolves albedo/height, world-normal/roughness and normal-depth/AO/AO-affect/valid outputs. Lighting, color-map wetness and macro variation remain in the draw. Custom terrain vertex displacement remains in GBuffer.
+## Diagnostics and verification
 
-Missing detail resolves through ready parents. A complete cache miss uses explicit diagnostics rather than evaluating original materials. Original evaluation remains available with VT disabled, editor preview or explicit direct-material diagnostics. Legacy region/target-grid AVT and raw-ID diagnostic APIs remain reachable and were not deleted as dead code.
+`get_vt_settings()` is a flat compatibility API assembled by subsystem owners. Read actual
+capacity, formats, live services, producer readiness, source queues and phase times together.
+Peak snapshots include their age; they are distinct from the latest pass. The detailed
+Clipmap report separates resolved settings from allocated runtime layers.
 
-## Coverage, mip filtering and camera turns
-
-With both tiers enabled, AVT covers a camera-centred XZ radius of 384 m by default, requesting visible resident terrain across region boundaries. Its outer 25% blends into SVT; a sector-sized margin retains coarse coverage. SVT skips only footprints entirely inside the AVT interior (`0.75 * surface_vt_distance`, so 288 m at the default). With SVT disabled, AVT supplies the whole visible world. Region Grid, Offset and Forward controls are hidden compatibility state and do not control sector coverage.
-
-The planner retains compatible nearby sector address blocks and ready pages across turns. Visible requests have priority. Idle surrounding prefetch uses only free physical slots and cannot evict visible work. Offscreen blocks can be reclaimed under pressure; terrain beyond the active range is released when SVT provides the far field. This avoids repeatedly rebuilding warmed headings without lowering foreground target density or enlarging the default pool.
-
-CPU refinement uses projected pixel density; the shader uses world-position derivatives and fractional mip blending. Parents remain resident during refinement, including the world hierarchy above 64 m sectors. Missing/coarser neighbours feather into a ready parent, while equal-detail neighbours stay sharp. New ready pages fade from their parent over 200 ms. Non-power-of-two densities use actual world texel sizes across sector/world transitions. Sector AVT now uses matching CPU/shader anisotropic footprints and explicit-gradient hardware filtering, capped by the viewport sampler and page gutter. Demand remains CPU based; see [`vt_sampling_review.md`](vt_sampling_review.md) for the footprint, camera-cut scheduling and source-queue contracts.
-
-AVT page production obeys the shared page budget and an approximately 3 ms CPU soft limit checked between pages. A single page can exceed that limit. Cold starts, newly visited regions, edits and insufficient cache capacity still need generation and can expose refinement. Prefetch exchanges idle warm-up work for later reuse; it is not a zero-cost guarantee for arbitrary turns.
-
-## Baked SVT sources
-
-SVT defaults to **1 texel/metre**. A 512 m cell bakes three 512 x 512 RGBA16F material sources with complete mip chains. At 8 texels/m the cell source is 4096 x 4096. Source resolution is limited to 8192 per axis; unsupported larger requests fail rather than silently reduce density.
-
-`svt_cells/<x>_<z>_0.vtcell` stores metadata, a preview and indexed, independently Zstandard-compressed channel/mip chunks. Distant requests seek directly to a coarse mip. Writes use temporary files and rename. Source signatures include density, materials, spacing, surface/control maps and neighbouring height data; physical page size/border changes do not invalidate sources. Old `.vtpage` files are not read or generated and remain untouched; old projects need a rebake.
-
-Runtime caches selected source mips (256 MiB / 64 entries, allowing one oversized mip), extracts required rectangles, and queues GPU copy/composition into physical slots. One runtime page may combine several cells. Baking by cell does not imply one physical slot per cell. Runtime SVT assembly does not generate unused height inputs or retain height-byte copies in page records. A cell that was baked in the running session (or imported) is also published into the resident cell store, and page assembly for it reads no file at all; a page whose cell is neither resident nor persisted is produced from the resident region payloads, so the far field never depends on a bake file to render.
-
-SVT's fixed centred world address grid has a smaller world extent at higher density; the window displays its bounds. Distance selection supplies requested mips. If they exceed capacity, a shared coarseness floor merges pages canonically in mip-0 coordinates using the destination mip, including negative coordinates. Shader page-table fetches use integer mip `texelFetch`, avoiding sampler LOD clamping.
-
-Auto Bake is enabled by default for saved terrain, with a 500 ms edit debounce. It queues dirty cell sources and advances incremental baking/export; explicit Bake regenerates all source cells. The browser distinguishes baked cells from resident physical pages and reads small metadata/previews. Disk reads, source extraction and offline GPU readback/serialization are still main-thread work, not a background streaming worker.
-
-## Editor and shader specialization
-
-`vt_editor_preview` defaults on and is editor-only. It shows live material evaluation and the surface array, pauses runtime VT requests and automatic SVT baking, and combines dirty invalidation until preview closes. Manual Bake remains available. Saving terrain does not update its offline SVT sources; bake explicitly or let auto-bake finish with preview off. Direct preview may differ from coarse cached output.
-
-For the built-in material, preview or both VT tiers disabled generates a shader without VT samplers/uniform resources and lookup/filter functions. Eight VT samplers disappear in preview and return on resume. A dedicated uniform helper also skips constructing VT state for this variant. Custom shader overrides retain the full interface; generated overrides are not frozen into preview mode. Displacement still uses its required material snippets. The assembly that decides this lives in `terrain_3d_material_shader.cpp` (insert loading, editor/debug injection, comment stripping, `_needs_vt_shader`), while `terrain_3d_material.cpp` owns the shader and its uniforms and `terrain_3d_material_resource.cpp` / `terrain_3d_material_reflect.cpp` the resource's properties, save, property list and bindings.
-
-The main and bake shaders no longer calculate the initial linear material selection that pair-aware slope selection overwrote. Shared layout exclusions avoid duplicated shader-generation rules. Debug/editor builds include only selected debug views; Release excludes debug-view source.
-
-## Geometry, data and deleted work
-
-Clipmap construction shares seven unique grids instead of ten duplicated resources. Five ordered native instance groups replace nested Variant containers, and cached transforms avoid unchanged server submissions. Vertex/index order, instance geometry, seam meshes and displacement/background bounds remain intact. MultiMesh uploads use one packed transform/color buffer; append operations retain writable arrays per cell/region and write back once.
-
-The cleanup also removes unreachable non-diagnostic SVT scheduling branches, unused baker helpers/arguments, overwritten shader calculations, unused editor average mode/state and unconsumed VT height copies. RF height extrema scan base-level bytes directly. Array synchronization checks whether a payload is needed before resampling it. Streamer ring traversal preserves ordering and failed saves retain resident ownership. Filtered asset entries are freed immediately instead of leaking unparented nodes and callbacks.
-
-## Evidence and limits
-
-The [optimization audit](terrain_optimization_audit.md) records the full source inventory, preserved DLL/image fixtures, measured CPU/GPU/draw values and individual regressions. Debug and Release native builds pass. Tests cover material baking/reload, cell composition, pressure addressing, mip filtering, metric density, large worlds, editor painting/preview, instancer output and allocator contracts.
-
-In the fixed D3D12 camera-turn fixture, warmed CPU AVT updates fell from about 3.6–4.1 ms to 0.27–0.32 ms. Four warm turns generated zero pages and sampled image differences were zero; settled images match the preserved baseline. This is not an overall FPS/GPU speedup claim. Cold output still differs until ready.
-
-Draw calls and overdraw were measured, not reduced by deleting required seam geometry or tightening unsafe bounds. The hilly-scene diagnostic preserves terrain vertex deformation and measures potential front-face overlap, not actual early-Z fragment cost. Built-in FRP overdraw substitutes a vertex shader and cannot validate displaced terrain. Arbitrary custom shaders, all shadow configurations, GPU allocation failure injection and complete Godot 4.5 docking are outside the demonstrated regression scope. Whole-world moving demand and synchronous SVT source I/O remain performance limits.
-
-Demand is CPU footprint based; see `terrain_vt_and_streaming.md` for the addressing contract and
-`terrain_3d_vt_feedback.cpp` for the optional GPU projection pass. This is not a claim of exact
-per-fragment GPU page feedback.
-
-
-## Optional geometry backend and capture
-
-The CDLOD foldout after SVT enables a quadtree/MultiMesh backend for finite built-in terrain. See [CDLOD and capture](cdlod_and_capture.md) for controls, compatibility, measured draw scope and the removal of forced all-page work from normal RenderDoc capture.
-
-
-
-## History
-
-The tuning passes that produced the current behaviour -- measured frame costs,
-the hill-residency investigation, the cache-growth policy and the stationary
-editor wakeup -- are recorded chronologically in
-[`history/vt_tuning_log.md`](history/vt_tuning_log.md). They are not a
-description of the code: later entries supersede earlier ones.
+Use [native/tests/README.md](../native/tests/README.md) for current commands and assertion
+scope. CPU contracts, native lifecycle tests, GPU images and editor integration are
+separate gates. Historical D3D12 timings and preserved-image comparisons in the
+[optimization audit](terrain_optimization_audit.md) apply only to their recorded builds.

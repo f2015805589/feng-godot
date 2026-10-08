@@ -26,6 +26,39 @@
 // Private Functions
 ///////////////////////////
 
+// Asset subscriptions follow list membership, including single-slot replacements
+// and clear_textures(), not only whole-list loads from the inspector.
+void Terrain3DAssets::_set_asset_signals(AssetType p_type, const Ref<Terrain3DAssetResource> &p_asset, bool p_connected) {
+	if (p_asset.is_null()) {
+		return;
+	}
+	auto set = [&](const StringName &signal, const Callable &target) {
+		if (p_asset->is_connected(signal, target) == p_connected) {
+			return;
+		}
+		if (p_connected) {
+			p_asset->connect(signal, target);
+		} else {
+			p_asset->disconnect(signal, target);
+		}
+	};
+	set("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids));
+	if (p_type == TYPE_TEXTURE) {
+		set("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files));
+		set("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings));
+	} else {
+		set("instancer_setting_changed", callable_mp(this, &Terrain3DAssets::_update_mesh));
+	}
+}
+
+void Terrain3DAssets::_clear_asset_list(AssetType p_type) {
+	Array list = p_type == TYPE_TEXTURE ? Array(_texture_list) : Array(_mesh_list);
+	for (const Ref<Terrain3DAssetResource> &asset : list) {
+		_set_asset_signals(p_type, asset, false);
+	}
+	list.clear();
+}
+
 void Terrain3DAssets::_swap_ids(const AssetType p_type, const int p_src_id, const int p_dst_id) {
 	LOG(INFO, "Swapping asset ID: ", p_src_id, " and ID: ", p_dst_id);
 	Array list;
@@ -85,26 +118,23 @@ void Terrain3DAssets::_swap_ids(const AssetType p_type, const int p_src_id, cons
  * But if an ID is invalid or already taken, the new ID is changed to the next available one
  */
 void Terrain3DAssets::_set_asset_list(const AssetType p_type, const TypedArray<Terrain3DAssetResource> &p_list) {
-	Array list;
-	int max_size;
-	switch (p_type) {
-		case TYPE_TEXTURE:
-			list = _texture_list;
-			max_size = MAX_TEXTURES;
-			break;
-		case TYPE_MESH:
-			list = _mesh_list;
-			max_size = MAX_MESHES;
-			break;
-		default:
-			return;
-	}
-	int array_size = CLAMP(p_list.size(), 0, max_size);
+	// Snapshot before clearing: the incoming array may share our backing storage.
+	const TypedArray<Terrain3DAssetResource> source = p_list.duplicate();
+	_clear_asset_list(p_type);
+	Array list = p_type == TYPE_TEXTURE ? Array(_texture_list) : Array(_mesh_list);
+	const int max_size = p_type == TYPE_TEXTURE ? MAX_TEXTURES : MAX_MESHES;
+	const int array_size = MIN(source.size(), max_size);
 	list.resize(array_size);
 	int filled_id = -1;
 	// For all provided textures up to MAX SIZE
 	for (int i = 0; i < array_size; i++) {
-		Ref<Terrain3DAssetResource> res = p_list[i];
+		Ref<Terrain3DAssetResource> res = source[i];
+		if (res.is_null() && p_type == TYPE_TEXTURE) {
+			Ref<Terrain3DTextureAsset> placeholder;
+			placeholder.instantiate();
+			placeholder->_id = i;
+			res = placeholder;
+		}
 		if (res.is_null()) {
 			LOG(ERROR, "Asset ID: ", i, " is null");
 			continue;
@@ -127,11 +157,8 @@ void Terrain3DAssets::_set_asset_list(const AssetType p_type, const TypedArray<T
 				}
 			}
 		}
-		if (!res->is_connected("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids))) {
-			LOG(DEBUG, "Connecting to id_changed, ID: ", id);
-			res->connect("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids));
-		}
 		res->initialize();
+		_set_asset_signals(p_type, res, true);
 	}
 	if (Terrain3D::debug_level >= DEBUG) {
 		for (int i = 0; i < list.size(); i++) {
@@ -145,31 +172,17 @@ void Terrain3DAssets::_set_asset_list(const AssetType p_type, const TypedArray<T
 
 void Terrain3DAssets::_set_asset(const AssetType p_type, const int p_id, const Ref<Terrain3DAssetResource> &p_asset) {
 	LOG(INFO, "Setting asset type: ", p_type, ", ID: ", p_id, ", asset: ", p_asset);
-	Array list;
-	int max_size;
-	switch (p_type) {
-		case TYPE_TEXTURE:
-			list = _texture_list;
-			max_size = MAX_TEXTURES;
-			break;
-		case TYPE_MESH:
-			list = _mesh_list;
-			max_size = MAX_MESHES;
-			break;
-		default:
-			return;
-	}
-
-	if (p_id < 0 || p_id >= max_size) {
-		LOG(ERROR, "Invalid asset id: ", p_id, " range is 0-", max_size);
-		return;
-	}
+	Array list = p_type == TYPE_TEXTURE ? Array(_texture_list) : Array(_mesh_list);
 	int id = CLAMP(p_id, 0, list.size());
 	// Delete asset if null
 	if (p_asset.is_null()) {
+		if (id == list.size()) {
+			return;
+		}
 		// If final asset, remove it
 		if (id == list.size() - 1) {
 			LOG(DEBUG, "Deleting asset id: ", id);
+			_set_asset_signals(p_type, list[id], false);
 			list.pop_back();
 		} else {
 			// Else just clear it
@@ -184,14 +197,12 @@ void Terrain3DAssets::_set_asset(const AssetType p_type, const int p_id, const R
 			list.push_back(p_asset);
 		} else {
 			// Else overwrite an existing slot
+			_set_asset_signals(p_type, list[id], false);
 			p_asset->_id = id;
 			list[id] = p_asset;
 		}
-		if (!p_asset->is_connected("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids))) {
-			LOG(DEBUG, "Connecting to id_changed");
-			p_asset->connect("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids));
-		}
 		p_asset->initialize();
+		_set_asset_signals(p_type, p_asset, true);
 	}
 }
 
@@ -226,8 +237,8 @@ void Terrain3DAssets::destroy() {
 	_terrain = nullptr;
 	_generated_albedo_textures.clear();
 	_generated_normal_textures.clear();
-	_texture_list.clear();
-	_mesh_list.clear();
+	_clear_asset_list(TYPE_TEXTURE);
+	_clear_asset_list(TYPE_MESH);
 	_texture_colors.clear();
 	_texture_normal_depths.clear();
 	_texture_ao_strengths.clear();

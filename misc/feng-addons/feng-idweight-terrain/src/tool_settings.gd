@@ -135,22 +135,6 @@ func _ready() -> void:
 	add_setting({ "name":"slope", "type":SettingType.DOUBLE_SLIDER, "list":main_list, "default":Vector2(0, 90),
 							"unit":"°", "range":Vector3(0, 90, 1), "flags":ADD_SEPARATOR })
 	
-	add_setting({ "name":"enable_angle", "label":"Angle", "type":SettingType.CHECKBOX, 
-							"list":main_list, "default":true, "flags":ADD_SEPARATOR })
-	add_setting({ "name":"angle", "type":SettingType.SLIDER, "list":main_list, "default":0,
-							"unit":"%", "range":Vector3(0, 337.5, 22.5), "flags":NO_LABEL })
-	add_setting({ "name":"angle_picker", "type":SettingType.PICKER, "list":main_list, "default":Terrain3DEditor.ANGLE,
-							"flags":NO_LABEL, "tooltip":"Pick Angle from the terrain." })
-	add_setting({ "name":"dynamic_angle", "label":"Dynamic", "type":SettingType.CHECKBOX, 
-							"list":main_list, "default":false, "flags":ADD_SPACER })
-	
-	add_setting({ "name":"enable_scale", "label":"Scale", "type":SettingType.CHECKBOX, 
-							"list":main_list, "default":true, "flags":ADD_SEPARATOR })
-	add_setting({ "name":"scale", "label":"±", "type":SettingType.SLIDER, "list":main_list, "default":0,
-							"unit":"%", "range":Vector3(-60, 80, 20), "flags":NO_LABEL })
-	add_setting({ "name":"scale_picker", "type":SettingType.PICKER, "list":main_list, "default":Terrain3DEditor.SCALE,
-							"flags":NO_LABEL, "tooltip":"Pick Scale from the terrain." })
-
 	## Slope sculpting brush
 	add_setting({ "name":"gradient_points", "type":SettingType.MULTI_PICKER, "label":"Points", 
 							"list":main_list, "default":Terrain3DEditor.SCULPT, "flags":ADD_SEPARATOR })
@@ -397,10 +381,6 @@ func _on_picked(p_type: Terrain3DEditor.Tool, p_color: Color, p_global_position:
 			# This converts 0,1 to -100,100
 			# It also quantizes explicitly so picked values matches painted values
 			settings["roughness"].value = round(200. * float(int(p_color.a * 255.) / 255. - .5)) if not is_nan(p_color.r) else 0.
-		Terrain3DEditor.ANGLE:
-			settings["angle"].value = p_color.r
-		Terrain3DEditor.SCALE:
-			settings["scale"].value = p_color.r
 		Terrain3DEditor.INSTANCER:
 			if p_color.r < 0:
 				return

@@ -15,10 +15,9 @@ parser.add_argument("--binary", default=None,
                     help="editor binary to run (defaults to the in-tree Windows editor)")
 args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
-# Fog's runtime/acceptance scripts use Sky's atmosphere types during import.
-# Keep their real dependency graph available instead of suppressing Sky as an
-# unrelated sibling plugin.
-selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky")
+# Exercise the complete stock manifest, including the optional cloud templates.
+# Fog's acceptance scripts also reference Sky's atmosphere types during import.
+selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky", "feng-cloud")
 for name in selected_addons:
     shutil.copytree(ROOT / "misc/feng-addons" / name, project / "addons" / name)
 # The editor auto-links sibling addons. Keep this regression isolated from their

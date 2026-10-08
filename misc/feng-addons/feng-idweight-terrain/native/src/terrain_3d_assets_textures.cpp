@@ -364,37 +364,13 @@ void Terrain3DAssets::set_texture_list(const TypedArray<Terrain3DTextureAsset> &
 	if (!differs(_texture_list, p_texture_list)) {
 		return;
 	}
-	// Inspector edits replace the list. Build from a snapshot before clearing
-	// occupied slots, otherwise a replacement is ignored as a duplicate ID.
-	TypedArray<Terrain3DTextureAsset> source = p_texture_list.duplicate();
-	for (const Ref<Terrain3DTextureAsset> &asset : _texture_list) {
-		if (asset.is_null()) { continue; }
-		if (asset->is_connected("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids))) {
-			asset->disconnect("id_changed", callable_mp(this, &Terrain3DAssets::_swap_ids));
-		}
-		if (asset->is_connected("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files))) {
-			asset->disconnect("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files));
-		}
-		if (asset->is_connected("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings))) {
-			asset->disconnect("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings));
-		}
-	}
-	for (int i = 0; i < source.size(); i++) {
-		if (source[i].get_type() == Variant::NIL || Ref<Terrain3DTextureAsset>(source[i]).is_null()) {
-			Ref<Terrain3DTextureAsset> placeholder;
-			placeholder.instantiate();
-			placeholder->_id = i;
-			source[i] = placeholder;
-		}
-	}
-	_texture_list.clear();
-	_set_asset_list(TYPE_TEXTURE, source);
+	_set_asset_list(TYPE_TEXTURE, p_texture_list);
 	update_texture_list();
 }
 
 void Terrain3DAssets::clear_textures(const bool p_update) {
 	LOG(INFO, "Clearing texture list");
-	_texture_list.clear();
+	_clear_asset_list(TYPE_TEXTURE);
 	if (p_update) {
 		update_texture_list();
 	}
@@ -407,14 +383,7 @@ void Terrain3DAssets::update_texture_list() {
 			LOG(ERROR, "Null TextureAsset found at index: ", _texture_list.find(ta));
 			continue;
 		}
-		if (!ta->is_connected("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files))) {
-			LOG(DEBUG, "Connecting file_changed signal");
-			ta->connect("file_changed", callable_mp(this, &Terrain3DAssets::_update_texture_files));
-		}
-		if (!ta->is_connected("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings))) {
-			LOG(DEBUG, "Connecting setting_changed signal");
-			ta->connect("setting_changed", callable_mp(this, &Terrain3DAssets::_update_texture_settings));
-		}
+		_set_asset_signals(TYPE_TEXTURE, ta, true);
 	}
 	_update_texture_files();
 	_update_texture_settings();

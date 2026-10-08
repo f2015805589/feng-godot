@@ -81,15 +81,10 @@ func probe_count() -> int:
 ## Reports whether any geometry transport coefficient contributes. Volumes
 ## cache this O(coefficients) scan alongside full resource validation.
 func has_nonzero_transfer() -> bool:
-	for value in transfer:
-		if value != 0.0:
-			return true
-	for value in primary_sky_visibility:
-		if value != 0.0:
-			return true
-	for value in emitter_transport:
-		if value != 0.0:
-			return true
+	for coefficients in [transfer, primary_sky_visibility, emitter_transport]:
+		for value in coefficients:
+			if value != 0.0:
+				return true
 	return false
 
 func emitter_count() -> int:
@@ -143,7 +138,7 @@ func is_valid() -> bool:
 		return false
 	if not volume_size.is_finite() or minf(volume_size.x, minf(volume_size.y, volume_size.z)) <= 0.0:
 		return false
-	if not _transform_is_finite(volume_transform) or not _transform_is_finite(world_to_grid):
+	if not volume_transform.is_finite() or not world_to_grid.is_finite():
 		return false
 	if absf(volume_transform.basis.determinant()) < 0.00000001 or absf(world_to_grid.basis.determinant()) < 0.00000001:
 		return false
@@ -225,9 +220,6 @@ func build_cell_indices() -> bool:
 	for i in probe_count():
 		var surface := positions[i] - normals[i] * surface_offset
 		var grid := world_to_grid * surface
-		if not grid.is_finite():
-			cell_indices.clear()
-			return false
 		var cell_coord := cell_coordinates(grid, grid_dims)
 		if cell_coord.x < 0:
 			cell_indices.clear()
@@ -240,12 +232,6 @@ func build_cell_indices() -> bool:
 		cell_indices[cell * CELL_CAPACITY + slot] = i
 		cell_counts[cell] = slot + 1
 	return true
-
-static func _transform_is_finite(value: Transform3D) -> bool:
-	return value.origin.is_finite() \
-		and value.basis.x.is_finite() \
-		and value.basis.y.is_finite() \
-		and value.basis.z.is_finite()
 
 func evaluate(index: int, lighting: PackedFloat32Array,
 		sky_lighting: PackedFloat32Array = PackedFloat32Array()) -> Vector3:
@@ -296,7 +282,7 @@ func make_render_upload() -> Dictionary:
 	var transfer_image := _pack_atlas_image(true)
 	var primary_sky_image := _pack_primary_sky_image()
 	var geometry_image := _pack_geometry_image()
-	var index_bytes := _pack_index_bytes()
+	var index_bytes := cell_indices.to_byte_array()
 	var emission_image := make_emission_atlas_image(PackedFloat32Array())
 	if transfer_image == null or primary_sky_image == null or geometry_image == null or index_bytes.is_empty() \
 			or emission_image == null:
@@ -386,6 +372,8 @@ func _pack_atlas_image(regularize_transport: bool) -> Image:
 func _pack_primary_sky_image() -> Image:
 	var image := Image.create_empty(ATLAS_COLUMNS * PRIMARY_SKY_TEXELS_PER_POINT,
 			ceili(float(probe_count()) / ATLAS_COLUMNS), false, Image.FORMAT_RGBAF)
+	if format_version != FORMAT_VERSION:
+		return image
 	for probe in probe_count():
 		var x0 := (probe % ATLAS_COLUMNS) * PRIMARY_SKY_TEXELS_PER_POINT
 		var y := probe / ATLAS_COLUMNS
@@ -393,8 +381,7 @@ func _pack_primary_sky_image() -> Image:
 			var texel := Color(0.0, 0.0, 0.0, 0.0)
 			for lane in 4:
 				var coefficient := texel_index * 4 + lane
-				if coefficient < 9 and format_version == FORMAT_VERSION \
-						and primary_sky_visibility.size() == probe_count() * 9:
+				if coefficient < 9:
 					texel[lane] = primary_sky_visibility[probe * 9 + coefficient]
 			image.set_pixel(x0 + texel_index, y, texel)
 	return image
@@ -444,7 +431,4 @@ func _pack_geometry_image() -> Image:
 func make_index_bytes() -> PackedByteArray:
 	if not is_valid():
 		return PackedByteArray()
-	return _pack_index_bytes()
-
-func _pack_index_bytes() -> PackedByteArray:
 	return cell_indices.to_byte_array()

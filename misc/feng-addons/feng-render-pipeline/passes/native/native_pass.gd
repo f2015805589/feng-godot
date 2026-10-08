@@ -56,8 +56,8 @@ func get_parameter_key() -> Variant:
 
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	var active := active_overlay()
-	if active != null and active.has_method("_frp_prepare"):
-		active.call("_frp_prepare", ctx)
+	if active != null:
+		active._frp_prepare(ctx)
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:

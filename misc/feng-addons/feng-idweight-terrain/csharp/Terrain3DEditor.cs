@@ -191,27 +191,3 @@ public partial class Terrain3DEditor : GodotObject
 		Call(GDExtensionMethodName.ApplyUndo, [data]);
 
 }
-
-file static class OperationExtensions
-{
-public static int SafeAsInt32(this Terrain3DEditor.Operation enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DEditor.Operation enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DEditor.Operation? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}
-
-file static class ToolExtensions
-{
-public static int SafeAsInt32(this Terrain3DEditor.Tool enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DEditor.Tool enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DEditor.Tool? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

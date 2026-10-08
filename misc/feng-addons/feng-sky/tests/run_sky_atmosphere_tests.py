@@ -105,11 +105,12 @@ def main() -> None:
     addons = project / "addons"
     addons.mkdir(exist_ok=True)
     assert_scratch_addon_target(project, addons, addons / "feng-sky")
-    selected = {"feng-sky", "feng-render-pipeline", "feng-fog"}
+    selected = {"feng-sky", "feng-render-pipeline", "feng-fog", "feng-cloud"}
     for name, source in (
         ("feng-sky", ADDON_SOURCE),
         ("feng-render-pipeline", PIPELINE_ADDON_SOURCE),
         ("feng-fog", FOG_ADDON_SOURCE),
+        ("feng-cloud", REPO_ROOT / "misc/feng-addons/feng-cloud"),
     ):
         destination = addons / name
         validate_scratch_tree(project)
@@ -207,6 +208,12 @@ def main() -> None:
     )
     validate_scratch_tree(project)
     if args.gpu_driver:
+        run(
+            [str(editor), "--path", str(project), "--rendering-method", "frp",
+             "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--script",
+             "res://addons/feng-sky/tests/test_sky_light_routes.gd"],
+            "GPU SkyLight route tests", project, env, "SKY LIGHT ROUTES PASS",
+        )
         run(
             [str(editor), "--path", str(project), "--rendering-method", "frp",
              "--rendering-driver", args.gpu_driver, "--audio-driver", "Dummy", "--resolution", "96x96",

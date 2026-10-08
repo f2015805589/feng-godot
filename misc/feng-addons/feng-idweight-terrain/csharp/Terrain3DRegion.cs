@@ -313,15 +313,3 @@ public partial class Terrain3DRegion : Resource
 		Call(GDExtensionMethodName.Dump, [verbose]);
 
 }
-
-file static class MapTypeExtensions
-{
-public static int SafeAsInt32(this Terrain3DRegion.MapType enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DRegion.MapType enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DRegion.MapType? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

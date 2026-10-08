@@ -176,13 +176,6 @@ void Terrain3DEditor::set_brush_data(const Dictionary &p_data) {
 	_brush_data["pair_mode"] = CLAMP(int(p_data.get("pair_mode", 0)), 0, 3);
 	_brush_data["pair_weight_level"] = CLAMP(int(p_data.get("pair_weight_level", 8)), 1, 8);
 
-	_brush_data["enable_angle"] = p_data.get("enable_angle", true);
-	_brush_data["dynamic_angle"] = p_data.get("dynamic_angle", false);
-	_brush_data["angle"] = CLAMP(real_t(p_data.get("angle", 0.f)), 0.f, 337.5f);
-
-	_brush_data["enable_scale"] = p_data.get("enable_scale", true);
-	_brush_data["scale"] = CLAMP(real_t(p_data.get("scale", 0.f)), -60.f, 80.f);
-
 	_brush_data["auto_regions"] = bool(p_data.get("auto_regions", true));
 	_brush_data["align_to_view"] = bool(p_data.get("align_to_view", true));
 	_brush_data["gamma"] = CLAMP(real_t(p_data.get("gamma", 1.f)), 0.1f, 2.f);

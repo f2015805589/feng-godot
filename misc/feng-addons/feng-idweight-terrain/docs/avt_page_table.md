@@ -16,9 +16,9 @@ default three tiers are:
 | 2 | 16k x 16k | 256 texels/m |
 
 With ten tiers, the sequence continues through 2 texels per metre and a
-128 x 128 sector image. Each sector chooses one tier from projected density,
-which naturally decreases with distance. Explicit `surface_vt_mip_distances`
-can override that distance selection. The setting counts these sector image
+128 x 128 sector image. Each sector chooses one tier from projected density. Saved
+`surface_vt_mip_distances` may override perspective tier selection; orthographic
+views retain their position-independent projected footprint. The setting counts these sector image
 tiers; it does not truncate a sector's local page-table mip chain.
 
 The visible sector candidates are prioritized from the camera view and its
@@ -49,9 +49,8 @@ is drawn separately from the colored 64 m sectors. Reducing coarse density or
 coarse residency does not change the sector grid or the available fine
 resolution tiers. Under pressure, a sector can fall back to a ready page; that
 is a residency result, not a change to its selected virtual image definition.
-A coarse page is also not evictable: once the tier has produced it, the pool
-never chooses its slot as a victim, so the base a sector falls back to does not
-depend on what the fine sectors are asking for. The counters `fallback_ready_pages`
+The coarse owner reserves its pages against ordinary pool eviction while selected.
+Pool rebuilds still require cold production. The counters `fallback_ready_pages`
 and `fallback_reserved_pages` report that tier's residency against its plan.
 
 `surface_vt_distance`, default **384 metres**, is the horizontal radius the near

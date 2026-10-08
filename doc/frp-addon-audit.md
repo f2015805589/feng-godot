@@ -1,5 +1,8 @@
 # Feng 七个插件架构复核
 
+历史记录：结论、问题清单与通过状态限于下文记录的源码、二进制和环境；当前契约见
+[插件架构](frp-addon-architecture.md)与[引擎契约](frp-engine-contract.md)。
+
 日期：2026-10-01。范围：`misc/feng-addons` 七个插件、自有构建/检查工具，以及相关编辑器、渲染与 Tracy 模块接口。
 
 ## 结论与覆盖范围

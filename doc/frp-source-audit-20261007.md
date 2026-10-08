@@ -1,5 +1,9 @@
 # FRP Source Audit and Color-Pipeline Contract (2026-10-07)
 
+Historical record: results and open findings apply to the builds and environments named below.
+Current contracts are in [addon architecture](frp-addon-architecture.md) and
+[engine contract](frp-engine-contract.md).
+
 **Evidence scope:** This report records snapshot-bounded source review and focused gates. It does not claim a full engine audit or complete cross-device acceptance. Supporting relative artifact paths are rooted at `C:\Temp\feng-frp-ue-tonemap-perf-20261006` unless a full path is shown.
 
 ## Source and build identity

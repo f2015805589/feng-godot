@@ -201,15 +201,3 @@ public partial class Terrain3DCollision : GodotObject
 		Call(GDExtensionMethodName.GetRid, []).As<Rid>();
 
 }
-
-file static class CollisionModeExtensions
-{
-public static int SafeAsInt32(this Terrain3DCollision.CollisionMode enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DCollision.CollisionMode enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DCollision.CollisionMode? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

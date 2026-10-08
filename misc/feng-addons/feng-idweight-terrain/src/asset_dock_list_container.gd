@@ -213,12 +213,12 @@ func clicked_id(p_id: int) -> void:
 	set_selected_id(p_id)
 
 
-# The last entry that can hold an asset. The "Add new" tile is the final entry, and it only exists
-# while the search box is blank - so a filtered list has no selectable slot at its end, and an
-# unfiltered one has exactly one. `set_selected_id()` and `get_selected_asset_id()` have to agree on
-# this bound: the first clamps the selection to it, the second reads the selection back through it.
+# The optional final "Add new" tile has no resource. A full asset list has no empty tile.
 func _max_selectable_id() -> int:
-	return max(0, entries.size() - (1 if search_text else 2))
+	var last := entries.size() - 1
+	if last >= 0 and entries[last].resource == null:
+		last -= 1
+	return maxi(0, last)
 
 
 func set_selected_id(p_id: int) -> void:

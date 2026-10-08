@@ -706,7 +706,7 @@ void Terrain3DSurfaceBaker::_request_encodes() {
 			const uint32_t layer_bytes = uint32_t(blocks * blocks * codec.block_words * int(sizeof(uint32_t)));
 			requested = _rd->buffer_get_data_async(_resources.encode_buffer,
 							   callable_mp(this, &Terrain3DSurfaceBaker::_on_encode_readback)
-									   .bind(int(slot), channel, tier, ring_page, generation, sequence),
+									   .bind(int(slot), channel, tier, ring_page, generation, sequence, _resources.encode_buffer),
 							   offset, layer_bytes) == OK;
 			if (requested) {
 				++outstanding;
@@ -798,26 +798,24 @@ void Terrain3DSurfaceBaker::_hold_encode_page(const int p_page, const int p_outs
 	_encode_ring_held[size_t(p_page)] = uint8_t(CLAMP(p_outstanding, 0, ENCODE_CHANNELS));
 }
 
-// Releases one ring page's regions. Only the completion callback calls this, and it never
-// holds the world mutex, so the ring is released under the encode mutex alone.
-void Terrain3DSurfaceBaker::_release_encode_page(const int p_page) {
-	std::lock_guard<std::mutex> lock(_encode_mutex);
-	if (p_page < 0 || p_page >= int(_encode_ring_held.size()) || _encode_ring_held[size_t(p_page)] == 0) {
-		// The ring was rebuilt under this callback, so the count belongs to a bundle that no
-		// longer exists.
-		return;
-	}
-	_encode_ring_held[size_t(p_page)]--;
-}
-
 void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, const int p_slot,
 		const int p_channel, const int p_tier, const int p_page, const uint64_t p_generation,
-		const uint64_t p_sequence) {
-	_release_encode_page(p_page);
+		const uint64_t p_sequence, const RID &p_buffer) {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
 	bool stale = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		// Growth can replace the encoder without changing the page generation. A late
+		// callback must never release a ring position now owned by that replacement.
+		if (p_buffer != _resources.encode_buffer) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> encode_lock(_encode_mutex);
+			if (p_page >= 0 && p_page < int(_encode_ring_held.size()) && _encode_ring_held[size_t(p_page)] > 0) {
+				_encode_ring_held[size_t(p_page)]--;
+			}
+		}
 		stale = _generation != p_generation || p_slot < 0 || p_slot >= int(_slot_sequence.size()) ||
 				_slot_sequence[size_t(p_slot)] != p_sequence;
 	}
@@ -851,13 +849,15 @@ void Terrain3DSurfaceBaker::_on_encode_readback(const PackedByteArray &p_data, c
 	layer.data = p_data;
 	{
 		std::lock_guard<std::mutex> lock(_encode_mutex);
-		if (_encoded_layers.size() >= size_t(MAX(4, _page_count) * 3)) {
-			_encode_failures++;
-			_mark_encode_failed(p_slot, p_generation, p_sequence);
+		if (_encoded_layers.size() < size_t(MAX(4, _page_count) * 3)) {
+			_encoded_layers.push_back(std::move(layer));
 			return;
 		}
-		_encoded_layers.push_back(std::move(layer));
 	}
+	// Do not acquire _mutex while holding _encode_mutex: adoption and clear take
+	// those locks in the opposite order.
+	_encode_failures++;
+	_mark_encode_failed(p_slot, p_generation, p_sequence);
 }
 
 // Compresses and decodes one image through the codec a tier resolved to, reporting the error

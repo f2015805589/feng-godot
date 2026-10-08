@@ -97,33 +97,21 @@ func _refresh_library() -> void:
 		if ResourceLoader.exists(path):
 			_add_library_entry(path, manifest)
 
-	var directories: Array[String] = []
 	var root := DirAccess.open(lib_dir)
 	if root == null:
 		return
-	root.list_dir_begin()
-	var directory_name := root.get_next()
-	while directory_name != "":
-		if root.current_is_dir() and not directory_name.begins_with("."):
-			directories.append(directory_name)
-		directory_name = root.get_next()
-	root.list_dir_end()
-	directories.sort()
-
-	for directory in directories:
-		var sub := DirAccess.open(lib_dir + "/" + directory)
+	root.include_hidden = true
+	for directory in root.get_directories():
+		if directory.begins_with("."):
+			continue
+		var sub := DirAccess.open(lib_dir.path_join(directory))
 		if sub == null:
 			continue
-		var files: Array[String] = []
-		sub.list_dir_begin()
-		var file_name := sub.get_next()
-		while file_name != "":
-			if not sub.current_is_dir() and file_name.ends_with(".tres"):
-				files.append(file_name)
-			file_name = sub.get_next()
-		sub.list_dir_end()
-		files.sort()
+		sub.include_hidden = true
+		var files := sub.get_files()
 		for file in files:
+			if not file.ends_with(".tres"):
+				continue
 			var path := lib_dir + "/%s/%s" % [directory, file]
 			if not manifest_paths.has(path):
 				_add_library_entry(path, {})
@@ -134,9 +122,7 @@ func _add_library_entry(path: String, manifest: Dictionary) -> void:
 	if template == null or not template is PassBase:
 		return
 
-	var label := ""
-	if template is Resource:
-		label = String(template.resource_name).strip_edges()
+	var label := String(template.resource_name).strip_edges()
 	if label == "" and not manifest.is_empty():
 		label = String(manifest.get("name", "")).strip_edges()
 	if label == "":
@@ -273,10 +259,6 @@ func _metadata_after_library_add(renderer, path: String) -> Dictionary:
 		LibraryManager.mark_synced(manifest, synced_paths, synced_ids, deleted_paths, deleted_ids)
 	else:
 		_append_unique(synced_paths, LibraryManager.normalize_library_path(path))
-	metadata["_synced_library"] = synced_paths
-	metadata["_synced_library_ids"] = synced_ids
-	metadata["_deleted_library"] = deleted_paths
-	metadata["_deleted_library_ids"] = deleted_ids
 	return metadata
 
 

@@ -1,121 +1,71 @@
-# Engine patch surface
+# Terrain engine interfaces
 
-This addon builds on the Feng Godot fork, but everything that is specific to it lives here, under
-`misc/feng-addons/`. This file lists the **only** places where the fork's engine source differs
-from upstream for the terrain's sake, so an engine upgrade can be re-applied mechanically instead
-of diffing a whole tree.
+Terrain production code lives under `misc/feng-addons/feng-idweight-terrain`.
+The two fork interfaces below connect it to the renderer. Keep engine changes additive,
+bind signatures explicitly and verify the FRP integration after an upstream upgrade.
+Other FRP integration points are documented in [the engine contract](../../../../doc/frp-engine-contract.md).
 
-Rule for anything added here: **additive, one file, no build-file change.** A new `.cpp` under
-`servers/rendering/` is compiled by the `*.cpp` glob in `servers/rendering/SCsub`, so nothing has
-to be registered; and the body of a fork-local method is kept out of the engine's own translation
-units so an upstream merge never conflicts inside them.
+## GPU buffer-to-texture copy
 
-## 1. `RenderingDevice::texture_copy_from_buffer` - GPU side page storage
+`RenderingDevice::texture_copy_from_buffer` records GPU-produced block data directly
+into a sampled texture. Its patch surface is:
 
-**What it does.** Copies a texture region straight from a device buffer. `texture_update()` takes
-CPU bytes, so content produced on the GPU (an encoded virtual texture page) has to be read back to
-the CPU and uploaded again, and the page cannot be published as resident until that round trip has
-happened - measured at two frames, and up to 96 across a pool rebuild. With this call the copy is
-recorded in the same submission as the passes that produced the content, so a page is resident on
-the frame it is produced in.
+- Declaration in `servers/rendering/rendering_device.h`
+- ClassDB binding in `servers/rendering/rendering_device.cpp`
+- Implementation in `servers/rendering/rendering_device_gpu_buffer_copy.cpp`
 
-**Patch surface (three spots, ~200 lines total):**
+`servers/rendering/SCsub` includes the implementation through its source glob.
+The method records `RDG::TYPE_TEXTURE_UPDATE` with the source buffer's resource tracker,
+so Vulkan/D3D12 render-graph dependencies order the copy after encoding and before sampling.
 
-| file | change |
-|---|---|
-| `servers/rendering/rendering_device.h` | declaration of `texture_copy_from_buffer` (~14 lines of comment + 1 signature), next to `texture_update` |
-| `servers/rendering/rendering_device.cpp` | one `ClassDB::bind_method` line in `_bind_methods()` (~line 9066) so a GDExtension can resolve it |
-| `servers/rendering/rendering_device_gpu_buffer_copy.cpp` | **new file**, the whole implementation |
+Requirements:
 
-The implementation records `RDG::TYPE_TEXTURE_UPDATE` - the same buffer-to-image copy the upload
-path already records, and which both the Vulkan and D3D12 backends implement - with the producing
-buffer as the source and **its resource tracker** attached, so the render graph orders the copy
-after the command that wrote the buffer and barriers the two. Nothing in `drivers/` changes.
+- Destination usage includes CAN_COPY_TO or CAN_UPDATE; compressed D3D12 arrays use the
+  supported update usage rather than requesting an unsupported UAV flag
+- Source offset and byte row pitch satisfy backend alignment: D3D12 uses 512-byte offsets
+  and 256-byte rows. Block formats also require block-aligned source/region geometry
+- `p_row_pitch` is bytes; `p_region` is texels
+- Draw/compute lists are closed before recording the copy
 
-**Requirements it enforces**, all of which already hold for the page arrays:
+`native/src/rd_gpu_copy.{h,cpp}` resolves the optional method by name and exact signature
+hash, without linking to fork-only C++ symbols. Refresh the hash only when the signature changes:
 
-* the destination needs `TEXTURE_USAGE_CAN_COPY_TO_BIT` or `TEXTURE_USAGE_CAN_UPDATE_BIT` (on
-  Vulkan both map to `VK_IMAGE_USAGE_TRANSFER_DST_BIT`; D3D12 needs no resource flag to be a copy
-  target, and `CAN_COPY_TO` would only add `ALLOW_UNORDERED_ACCESS`, which block formats do not
-  support anyway);
-* the source buffer must satisfy the driver's copy alignment - 256 byte rows and 512 byte offsets
-  on D3D12. A storage buffer is created with `BUFFER_USAGE_TRANSFER_FROM_BIT` already
-  (`storage_buffer_create`), so it is a legal source on Vulkan with no flag change;
-* `p_row_pitch` is the **byte** pitch of one source row and the region is in texels. For a block
-  compressed destination both are block aligned, and the backends convert the pitch to the
-  block-relative row length themselves;
-* it must not be called with a draw or compute list open - the same rule `texture_update()` has.
+```powershell
+bin\godot.windows.editor.x86_64.exe --headless --dump-extension-api --path <tmp>
+# RenderingDevice.texture_copy_from_buffer: hash 1147505037
+```
 
-## 2. `RenderingServer::virtual_texture_set_update_callback` - the render-thread page producer
+When the method or hash is unavailable, the baker uses asynchronous block readback plus
+render-callback upload. Direct copying avoids that round trip; `encode_readbacks`,
+`encode_ring_pages` and `ready_latency_frames_mean/max` describe the actual path.
+The fallback changes latency, while retaining page-content and readiness checks.
 
-**What it does.** Registers a callable the renderer invokes on the render thread, once per frame, as
-one pass of the frame. The terrain registers the VT baker's `render_pending()` there, because page
-encoding, composition and readback are GPU work that has to be recorded inside a frame - a demand
-pass on the main thread can only queue what that pass will do. Without the hook no material page is
-ever baked, and the node prints one warning and renders from the region texture array instead.
+## Render-thread production callback
 
-**Patch surface (two spots):**
+`RenderingServer.virtual_texture_set_update_callback(id, callable)` registers the producer;
+`virtual_texture_remove_update_callback(id)` releases it. The registry and mutex live in
+`servers/rendering/rendering_server.{h,cpp}`, together with their ClassDB bindings and
+`execute_virtual_texture_updates()`.
 
-| file | change |
-|---|---|
-| `servers/rendering/rendering_server.h` | two declarations, the callback map and its mutex |
-| `servers/rendering/rendering_server.cpp` | the two bodies, `execute_virtual_texture_updates()`, and the `ClassDB::bind_method` lines that expose all three |
+`FRPPassContext::execute_virtual_texture_updates()` executes callbacks in the native
+**VT Pass** (ID 1), before GBuffer. Main-thread demand queues jobs; the callback records
+bake/copy/encode work on the main RenderingDevice inside the render frame. Installing
+the API alone is insufficient: the active renderer must execute the callback.
 
-**Who runs it.** The FRP pass context: `FRPPassContext::execute_virtual_texture_updates()`
-(`servers/rendering/renderer_rd/frp_clustered/frp_pass_context.cpp`) invokes the registered callables
-as one pass, reached from `render_frp_clustered.cpp` and listed in `doc/frp-engine-contract.md`
-beside `precompute_shadows()` and `prepare_lighting()`. This half is the fork's own pipeline rather
-than a terrain patch, but the terrain cannot produce a page without it: a project that does not run
-FRP leaves every VT page unproduced, which is the failure the addon's warning names.
+The addon probes the methods at runtime and reports `callback_registered` through
+`get_vt_settings()`. A missing hook emits one warning and leaves material-page production
+unavailable; rebuild the engine from this checkout. Explicit direct/editor paths remain
+separate from cached-material rendering. Teardown unregisters the producer before releasing
+its owner, and pending work respects the producer's frame budget.
 
-**Addon side.** `terrain_3d_vt_service.cpp` resolves both methods with `has_method()` and calls them
-through `RS->call(...)`, so a stock engine resolves to no method, prints one `WARN_PRINT`, and the
-terrain keeps rendering from the region texture array. `get_vt_settings()` reports the state as
-`callback_registered` (and `editor_preview_active` for the editor-only preview path that pauses
-production).
+## Upgrade checklist
 
-## 3. Addon side - how the extension uses it without depending on it
+1. Verify declarations, ClassDB signatures and the buffer-copy implementation in the new tree
+2. Verify registry/removal and the FRP VT operation still execute at the required frame position
+3. Rebuild the engine: `scons platform=windows target=editor arch=x86_64`
+4. If the copy signature changed, refresh `TEXTURE_COPY_FROM_BUFFER_HASH` from the dumped API
+5. Rebuild from the addon's `native/`: `scons platform=windows target=template_debug arch=x86_64`
+6. Run `native/tests/vt_material_runner.py` with that engine; require callback registration
+   and actual material-page production, then test direct-copy/fallback readiness as applicable
 
-`native/src/rd_gpu_copy.{h,cpp}` resolves the method **by name at runtime** and caches the method
-bind, so nothing links against the fork:
-
-* `RenderingDevice::has_method("texture_copy_from_buffer")` decides availability. On a stock engine
-  (or a fork that has moved on) the answer is no, no engine error is printed, and the baker keeps
-  its readback path - the terrain still works, with the extra frames of latency.
-* The method bind is looked up with the signature hash the engine compares against, taken from this
-  fork's own `--dump-extension-api`:
-
-  ```powershell
-  bin\godot.windows.editor.x86_64.exe --headless --dump-extension-api --path <tmp>
-  # RenderingDevice.texture_copy_from_buffer -> "hash": 1147505037
-  ```
-
-  **If the engine-side signature is ever changed, refresh that number** in
-  `native/src/rd_gpu_copy.cpp` (`TEXTURE_COPY_FROM_BUFFER_HASH`). Until it is refreshed the lookup
-  resolves to no method and the extension uses the readback path again - a performance regression,
-  never a wrong call.
-
-`native/src/terrain_3d_surface_baker.cpp` then stores a page two ways from one place: the direct
-copy when the capability is present (`direct_store`), the readback and upload when it is not. The
-statistic that shows which one ran is in the producer stats:
-`encode_readbacks` (zero on the direct path), `encode_ring_pages`, and
-`ready_latency_frames_mean` / `ready_latency_frames_max` - the frames between producing a page and
-its encoded layers being resident, which the direct path makes zero.
-
-## Re-applying after an engine upgrade
-
-1. Search the new engine source for `texture_copy_from_buffer`. If it is absent, re-apply the three
-   spots above (the file is self-contained; the two edits outside it are one declaration and one
-   binding line).
-2. Search for `virtual_texture_set_update_callback`. If it is absent, re-apply section 2: two
-   declarations, the callback map with its mutex, `execute_virtual_texture_updates()` and its
-   bindings. Then check that the new engine's FRP pass context still calls
-   `execute_virtual_texture_updates()` once per frame; without that call the patch is present and
-   the pages still never bake.
-3. Rebuild the engine: `scons platform=windows target=editor arch=x86_64`.
-4. Refresh `TEXTURE_COPY_FROM_BUFFER_HASH` from `--dump-extension-api` **only if the signature
-   changed**.
-5. Rebuild the addon from `misc/feng-addons/feng-idweight-terrain/native`:
-   `scons platform=windows target=template_debug arch=x86_64`.
-6. `native/tests/vt_material_runner.py` is the check that the hook is live end to end: it requires
-   `callback_registered` and a page produced by the render-thread pass.
+See [native tests](../native/tests/README.md) for drivers, isolated fixtures and image gates.

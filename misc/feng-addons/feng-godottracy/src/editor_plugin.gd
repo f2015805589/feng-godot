@@ -98,25 +98,20 @@ func _configure_setting() -> void:
 ## The profiler executable, or an empty string when it has to be installed.
 func _profiler_path() -> String:
 	var settings := EditorInterface.get_editor_settings()
-	if settings.has_setting(SETTING_PATH):
-		var stored := str(settings.get_setting(SETTING_PATH))
-		if not stored.is_empty() and FileAccess.file_exists(stored):
-			return stored
-	var installed := _installed_path()
-	if FileAccess.file_exists(installed):
-		return installed
 	var from_env := OS.get_environment(ENV_PATH)
-	if not from_env.is_empty():
-		var candidate := from_env.path_join(EXECUTABLE) if DirAccess.dir_exists_absolute(from_env) else from_env
+	if DirAccess.dir_exists_absolute(from_env):
+		from_env = from_env.path_join(EXECUTABLE)
+	var downloads := OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
+	var candidates := [
+		str(settings.get_setting(SETTING_PATH)),
+		_installed_path(),
+		from_env,
+		OS.get_executable_path().get_base_dir().path_join(EXECUTABLE),
+		downloads.path_join(EXECUTABLE),
+	]
+	for candidate in candidates:
 		if FileAccess.file_exists(candidate):
 			return candidate
-	var beside_editor := OS.get_executable_path().get_base_dir().path_join(EXECUTABLE)
-	if FileAccess.file_exists(beside_editor):
-		return beside_editor
-	var downloads := OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
-	var downloaded := downloads.path_join(EXECUTABLE)
-	if FileAccess.file_exists(downloaded):
-		return downloaded
 	# Tracy releases unpack into a versioned folder inside the downloads folder.
 	var dir := DirAccess.open(downloads)
 	if dir != null:

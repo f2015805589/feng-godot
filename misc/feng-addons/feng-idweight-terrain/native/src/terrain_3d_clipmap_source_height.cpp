@@ -1,9 +1,6 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The height channel's production: one height-map texel per clipmap texel. The per-texel cost is the
-// data lookup (vertex descale, region resolution, pixel read), which is exactly what the row
-// granularity of `Terrain3DClipmapSource` exists to amortise; if a measurement ever says the region
-// resolution in the loop matters, resolving it once per row is the change - the ring does not care.
+// Read one nearest height-map sample per logical texel.
 
 #include "terrain_3d_clipmap_source_height.h"
 

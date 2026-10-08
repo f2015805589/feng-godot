@@ -286,7 +286,8 @@ void Terrain3DCDLOD::_snap_impl() {
 			// of the batch's packing - not only the RenderingServer calls `_upload` would skip on
 			// its own. A classification can flip and flip back, and a flip in one batch does not
 			// move the other.
-			const bool unchanged = batch.previous_instances.size() == lists[i].size() &&
+			// Region grids keep a separate cache in _upload(), including empty-batch RID cleanup.
+			const bool unchanged = _adaptive && batch.bounds == bounds[i] && batch.previous_instances.size() == lists[i].size() &&
 					(lists[i].empty() ||
 							std::equal(batch.previous_instances.begin(), batch.previous_instances.end(), lists[i].begin()));
 			if (unchanged) { continue; }

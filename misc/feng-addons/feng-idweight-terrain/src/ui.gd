@@ -486,10 +486,6 @@ func pick(p_global_position: Vector3) -> void:
 				color = plugin.terrain.data.get_pixel(Terrain3DRegion.TYPE_COLOR, p_global_position)
 			Terrain3DEditor.COLOR:
 				color = plugin.terrain.data.get_color(p_global_position)
-			Terrain3DEditor.ANGLE:
-				color = Color(plugin.terrain.data.get_control_angle(p_global_position), 0., 0., 1.)
-			Terrain3DEditor.SCALE:
-				color = Color(plugin.terrain.data.get_control_scale(p_global_position), 0., 0., 1.)
 			Terrain3DEditor.INSTANCER:
 				var mesh_asset_id: int = plugin.terrain.instancer.get_closest_mesh_id(p_global_position)
 				color = Color(mesh_asset_id, 0., 0., 1.)

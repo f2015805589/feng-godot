@@ -1,167 +1,94 @@
-# CDLOD geometry and VT frame capture
+# CDLOD geometry and VT capture
 
-## Controls and behavior
+## Geometry modes
 
-`Terrain3D > Surface VT > CDLOD` is a native foldout immediately after SVT.
-The Surface VT window also places CDLOD after SVT. AVT, SVT and CDLOD are enabled by default for new terrain nodes. New materials
-use finite background (NONE), allowing CDLOD to activate. Explicit saved switches
-and background settings are respected when loading existing scenes.
+`Terrain3D > Surface VT > CDLOD` follows SVT in the Inspector and Surface VT window.
+New nodes enable CDLOD and use finite background (`None`); saved settings remain authoritative.
 
-- `cdlod_patch_size`: internal grid size, hidden from both editor panels; the stored property remains readable for existing scenes. It does not control batching.
-- `cdlod_lod_scale`: default 8, range 8–32. A leaf's morph ends at its world width times this scale; the last quarter is its morph band. Larger values keep fine geometry farther away.
-- `get_cdlod_stats()`: active state, visible/selected/shadow-only patch counts and main batch count.
-- Profiling: the pass runs from the rendering server's `frame_pre_draw` rather than from the node's
-  tick, so it publishes its own `terrain/cdlod` zone with `terrain/cdlod_select`, `terrain/cdlod_cull`,
-  `terrain/cdlod_pack` and `terrain/cdlod_upload` inside it, the plots `terrain/cdlod_ms`,
-  `terrain/cdlod_patches` and `terrain/cdlod_visible`, and the `terrain/cdlod_cpu` monitor that the
-  editor's monitor graph groups with `terrain/vt_cpu`, `terrain/avt_cpu` and `terrain/svt_cpu`.
+| Setting / query | Contract |
+| --- | --- |
+| `cdlod_lod_scale` | Default 8, range 8–32; morph ends at patch-world width × scale, with the last quarter as the morph band |
+| `cdlod_patch_size` | Hidden stored grid-size compatibility property; independent of draw batching |
+| `get_cdlod_stats()` | Active state, selected/visible/shadow-only patches and main batch count |
 
-The backend selects nonoverlapping quadtree leaves for loaded terrain regions,
-continuously collapses odd grid vertices onto the next dyadic grid, and submits
-one regular grid through a MultiMesh. The main view's visible terrain uses one
-batch; offscreen patches needed for shadows use a separate shadows-only batch.
-Shadow cascades, depth passes, additional lights and other objects are separate
-draw calls. One terrain batch is not a promise of one draw for the whole frame.
+For finite terrain using the built-in shader, CDLOD selects nonoverlapping quadtree leaves.
+A shared regular grid is submitted through a visible MultiMesh batch and a separate
+shadow-only batch. Odd vertices collapse continuously to the next dyadic grid.
+Shadows, depth passes, additional lights and other objects contribute their own draw calls.
 
-With CDLOD disabled, finite built-in terrain now uses the same grid resource
-owner with individual region instances in fixed-grid mode instead of returning to clipmaps. At tessellation zero,
-each 512-cell region is one 512-by-512 grid with 513-by-513 vertices. Higher
-explicit tessellation subdivides regions into uniform grids to preserve spacing.
-There are no EDGE/FILL/TRIM draws in this mode. Full-resolution geometry can cost
-more triangles than distant clipmap rings; reduced draw count does not establish
-a net GPU performance improvement. Infinite backgrounds, custom shader overrides
-and the ocean retain the compatible clipmap path.
+With CDLOD off, the same finite built-in path uses individual region-grid submissions.
+At tessellation 0 a 512-cell region has a 512×512-cell grid with 513×513 vertices; higher
+explicit tessellation subdivides it to preserve spacing. One-instance draw resources
+keep each region separate even when FRP merges identical ordinary mesh surfaces.
+Infinite backgrounds, custom shader overrides and the ocean use their compatible clipmap paths.
 
-### Shared cell boundaries
+## Shared edges and update lifetime
 
-CDLOD creates only regular grid triangles, with no skirts, FILL or TRIM strip
-meshes. All patches resolve height and ID samples using world coordinates and
-the same region lookup. A boundary sample belongs to the adjacent region's
-first row/column; there is no independently editable duplicate on either side.
-Thus 512 cells have 513 logical corner positions without changing the existing
-512-wide on-disk region maps into padded maps. Texture padding is unrelated to
-geometry stitching. Mixed LOD edges use vertex morphing onto the shared coarse
-grid, not extra triangles around the cell. Explicit infinite backgrounds or
-custom shaders still select the compatible legacy clipmap backend.
+Height/ID reads use world coordinates and the same region lookup. A boundary belongs to
+the adjacent region's first row/column, so 512-wide stored maps describe 513 logical corner
+positions without duplicate editable borders. Mixed LOD edges morph onto a shared coarse
+grid. CDLOD/fixed-grid terrain adds no skirt, FILL or TRIM seam geometry.
 
-This implementation uses a shared horizontal distance function for selection and
-vertex morphing. It follows the quadtree/continuous-morph approach described in
-[Filip Strugar's CDLOD reference](https://github.com/fstrugar/CDLOD), but is not an
-exact port of its 3D-distance selection, partial-quadrant indexing or streaming
-system. The horizontal metric preserves a simple bound for crack-free shared
-edges and keeps the finest grid at the terrain's existing vertex spacing and
-tessellation level. High-altitude views can therefore retain more detail than a
-3D-distance selector. AVT/SVT density and material generation are unchanged.
+Selection and morphing share horizontal distance. The implementation follows the
+quadtree/continuous-morph approach in [Filip Strugar's reference](https://github.com/fstrugar/CDLOD),
+with its own metric and region storage. High-altitude views can retain more detail than
+3D-distance selection. Geometry LOD can change distant silhouettes; material density is
+configured independently.
 
-A region root does not morph beyond its available coarsest level. Selection
-uses conservative height bounds including neighbouring layers and displacement
-margin. Camera/projection, region bounds and relevant settings form an exact
-selection cache; unchanged views do not rebuild/upload instance lists. Changed
-lists use one packed transform/custom-data upload per batch and retain capacity.
+Region roots stop at their available coarsest level. Conservative bounds include neighboring
+heights and displacement margin. `RenderingServer.frame_pre_draw` updates geometry after
+camera processing; the callback disconnects on exit. Pure rotation reuses distance selection
+and recomputes frustum classification. Changed maps, bounds, camera projection or settings
+invalidate the relevant cache. Batch reuse requires matching instances and bounds; empty
+region-grid batches release their draw resources. Changed batches use packed
+transform/custom-data buffers.
 
-CDLOD currently supports finite terrain (`World Background=None`) and the
-built-in terrain shader. Infinite backgrounds and custom vertex overrides retain
-the existing clipmap backend even if the option is checked; the Inspector and
-window describe this requirement. Ocean meshes remain on their own clipmap.
-The selection is driven by Terrain3D's assigned camera; arbitrary simultaneous
-secondary-camera/VR views have not been validated. Geometry LOD can change the
-far-field silhouette relative to clipmaps; this is not a bit-identical mesh mode.
+The assigned Terrain3D camera drives selection. Arbitrary simultaneous secondary-camera/VR
+views and all custom displacement/shadow combinations require separate validation.
 
-## Frame capture correction
+## Frame capture
 
-The RenderDoc toolbar previously requeued every resident terrain page before
-forcing a frame, bypassing runtime page budgets. Normal capture now records
-current cache resources and actually pending updates. No VT resolution or cache
-precision is reduced to make capture cheaper. Native capture stage messages
-separate beginning, drawing, saving and completion for further diagnostics.
+The RenderDoc toolbar records current resources and pending work under normal page budgets.
+`prepare_vt_capture()` is a separate explicit replay diagnostic. Capture-stage messages
+identify begin, drawing, saving and completion. Captures serialize GPU resources and may
+pause; driver/library stalls remain possible.
+See the [capture addon](../../feng-renderdoc-capture/README.md) for setup, Agility guidance,
+builds and analyzer lifecycle tests.
 
-The installed test projects use D3D12 and the portable RenderDoc configured under
-`bin/tools/RenderDoc`. A copied `test-1` scene with its authored materials, terrain
-and current cell cache completed capture without regenerating resident pages.
-The original project's files were read only. The reported indefinite freeze was
-not reproduced in the tested camera state, so eliminating all driver/library
-hangs is not claimed; captures still serialize GPU resources and can pause.
+## Verification
 
-## Validation
+After rebuilding the editor and native extensions, run from the repository root:
 
-`native/tests/vt_adaptive_runner.py --cdlod` checks an actual GPU frame: multiple
-patches add exactly one main-view terrain draw, four-region coverage, patch-size
-rebuild, turning, material VT, background fallback/resume, original clipmap image
-restoration, a hilly interior without visible background cracks, painted holes,
-region removal/reload, LOD scale and offscreen shadow-batch retention. The hole
-render test disables collision; the existing Godot Physics all-hole tile error
-is outside this geometry change. This is not a full shadow-image or arbitrary
-custom displacement equivalence certification.
+```sh
+python misc/feng-addons/feng-idweight-terrain/native/tests/vt_adaptive_runner.py --cdlod --driver d3d12
+python misc/feng-addons/feng-idweight-terrain/native/tests/editor_dock_runner.py --test dock --driver d3d12
+python misc/feng-addons/feng-renderdoc-capture/tests/run_capture.py
+```
 
-`native/tests/editor_dock_runner.py --test dock` checks native group order,
-foldout placement and the Surface VT window's CDLOD toggle alongside existing
-bake/editor workflows. RenderDoc's integration runner checks capture contents,
-resident production counters, analyzer closure and original-editor survival.
+The geometry fixture covers multiple regions, draws, shared boundaries, hills, holes,
+patch rebuild, turning, VT, background/mode changes, unload/reload and offscreen shadow
+retention. Physics-paused rotation exercises render-frame updates at tessellation 0/1.
+The hole image fixture disables collision; it does not certify the physics all-hole case.
+The current draw assertion distinguishes four ordinary regions from one CDLOD main batch.
+Editor tests cover group order and controls; capture tests cover resources, unchanged resident
+production counters, analyzer closure and survival of the original editor.
 
-Validated builds: terrain and capture extensions, Windows x86_64 Debug and
-Release. Final GPU fixtures:
+## Historical Windows/D3D12 evidence
 
-- `terrain-vtadaptive-nkpvoz8i`: CDLOD checks passed; 178 visible patches added
-  exactly one main-view terrain draw.
-- `feng-editor-dock-clean-hby03kfb`: editor checks passed.
-- `renderdoc-smoke-bx02pc4q`: copied authored project captured in 1623 ms;
-  resident page production counters stayed unchanged and analyzer lifecycle
-  checks passed.
-- `terrain-vtadaptive-tfaar22_`: original AVT rotation/control regression passed;
-  all five rotation images matched `terrain-vtadaptive-tn_caows` pixel for pixel.
+These are past fixtures, not fresh validation of later revisions:
 
-After enabling the new defaults, `terrain-vtadaptive-oxega1u0` passed the CDLOD
-and VT controls checks with zero errors, including moving the camera across both
-shared boundary axes on the hilly four-region terrain. Debug/Release builds
-passed. The subsequent editor GUI run `feng-editor-dock-clean-6j6aclj5` failed
-because its synthetic mouse click did not reach MeshesBtn (hovered object null);
-that run does not certify the editor interaction checks.
+- `terrain-vtadaptive-nkpvoz8i`:178 visible patches added one main terrain draw
+- `feng-editor-dock-clean-hby03kfb`: editor checks passed
+- `renderdoc-smoke-bx02pc4q`: copied authored scene captured in 1623 ms with unchanged
+  resident production counters; original project files remained untouched
+- `terrain-vtadaptive-tfaar22_`: five AVT rotation images matched `terrain-vtadaptive-tn_caows`
+- `terrain-vtadaptive-oxega1u0`: defaults/shared-boundary checks passed; subsequent editor
+  fixture `feng-editor-dock-clean-6j6aclj5` failed to deliver its synthetic MeshesBtn click
+- `terrain-vtadaptive-oung84ug`: the former batched fixed-grid off-mode passed; its one-draw
+  result predates the current separate-region submissions
+- `terrain-vtadaptive-qujlebic`: render-frame rotation means 0.116/0.085 ms, peaks 0.281/0.130 ms
+- `terrain-vtadaptive-qtdsc4xt`: VT producing peak 4.549 ms, warm peaks 0.185–1.585 ms
 
-Fixed-grid validation: `terrain-vtadaptive-oung84ug` passed ordinary four-region
-mesh count, one main draw without strip draws, moving boundary checks with CDLOD
-off and on, holes and mode restoration, with zero errors.
-
-CDLOD controls now synchronize the displayed switch and backend status. The
-ordinary grid shader path has its own `_region_grid_enabled` flag; the separate
-`_cdlod_enabled` flag is false when adaptive geometry is disabled. The explanatory
-paragraph above the Inspector switch and both Patch Size controls were removed.
-With CDLOD off, region grids now use individual mesh instances and individual
-draw submissions. With CDLOD on, visible patches use a MultiMesh batch. This
-makes the switch observable in frame-capture draw counts as well as geometry LOD.
-
-The earlier fixed-grid one-draw validation describes the superseded batched
-off-mode; the current regression requires four main draws for four ordinary
-regions and one main draw for CDLOD. No seam strip draws are added.
-
-Ordinary regions use one-instance draw resources sharing the grid mesh, because
-FRP automatically merges ordinary Mesh instances with identical surfaces. This
-preserves distinct per-region submissions without duplicating vertex buffers.
-A capture may still name the API call DrawIndexedInstanced, but its instance
-count is one and each region has a separate call; CDLOD combines many patches.
-
-## Render-frame geometry updates
-
-Terrain mesh snapping now runs from RenderingServer.frame_pre_draw, after camera
-processing, rather than depending on physics ticks or displacement-buffer
-position changes. The callback disconnects when the terrain exits the tree.
-Pure camera rotation reuses cached distance-selected quadtree leaves; only
-frustum classification and changed instance lists are updated. Map changes
-invalidate selection, including region reloads and changed height bounds. Plane
-coefficients and instance-list storage are reused to avoid per-node Variant
-conversion and repeated list allocation. Source precision and seam morph rules
-are unchanged.
-
-The GPU test pauses physics and rotates 360 degrees with tessellation 0 and 1.
-It verifies current-frame terrain coverage and that rotation does not rebuild
-selection. `terrain-vtadaptive-qujlebic` passes, including existing holes,
-shared-region boundaries, mode switches and region reload tests. Measured CDLOD
-rotation means were 0.116 / 0.085 ms, with peaks 0.281 / 0.130 ms. This does not
-meet a strict all-frame 0.1 ms target. Reserving both GPU buffers for all selected
-patches increased padded uploads and was not retained.
-
-VT rotation timing now records peaks in addition to averages. In
-`terrain-vtadaptive-qtdsc4xt`, the producing phase peaked at 4.549 ms and warm
-phase peaks ranged from 0.185 to 1.585 ms. A previous 0.91 ms average therefore
-cannot rule out visible stalls. Moving VT source generation off the main thread
-or GPU-side geometry compaction would be further architectural work; neither is
-claimed by these changes.
+The original Debug/Release builds and focused image gates were recorded separately.
+The timings did not meet a strict every-frame 0.1 ms target and do not establish a total
+GPU improvement. Background source work and later VT changes have their own records.

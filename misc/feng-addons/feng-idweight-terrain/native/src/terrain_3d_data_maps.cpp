@@ -88,6 +88,10 @@ TypedArray<Image> Terrain3DData::get_maps(const MapType p_map_type) const {
 }
 
 void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regions, const bool p_generate_mipmaps) {
+	if (p_map_type < TYPE_HEIGHT || p_map_type > TYPE_MAX) {
+		LOG(ERROR, "Specified map type out of range");
+		return;
+	}
 	// Generate region color mipmaps
 	if (p_generate_mipmaps && (p_map_type == TYPE_COLOR || p_map_type == TYPE_MAX)) {
 		LOG(EXTREME, "Regenerating color mipmaps");
@@ -100,27 +104,13 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 		}
 	}
 
-	// p_all_regions means "assume every region changed". It no longer throws the GPU
-	// arrays away: the layer layout belongs to the slot table, so the arrays are only
-	// recreated when the slot capacity changes.
+	const int edit_mask = _slot_map_mask(p_map_type);
 	if (p_all_regions) {
-		LOG(EXTREME, "Marking dirty maps of type: ", p_map_type);
-		switch (p_map_type) {
-			case TYPE_HEIGHT:
-				_slot_map_full[SLOT_MAP_HEIGHT] = true;
-				break;
-			case TYPE_CONTROL:
-				_slot_map_full[SLOT_MAP_CONTROL] = true;
-				break;
-			case TYPE_COLOR:
-				_slot_map_full[SLOT_MAP_COLOR] = true;
-				break;
-			default:
-				for (int i = 0; i < SLOT_MAP_MAX; i++) {
-					_slot_map_full[i] = true;
-				}
-				_region_map_dirty = true;
-				break;
+		for (int i = 0; i < SLOT_MAP_MAX; ++i) {
+			_slot_map_full[i] |= (edit_mask & (1 << i)) != 0;
+		}
+		if (edit_mask == SLOT_MAP_ALL) {
+			_region_map_dirty = true;
 		}
 	}
 
@@ -128,13 +118,7 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 	// capacity change) has to reach the material, because the array RIDs and the
 	// region/layer mapping it holds may have moved. Content edits do not, and the old
 	// code relied on a full rebuild to tell the two apart.
-	bool structural = _region_map_dirty || _region_map_signal_dirty;
-	for (int i = 0; i < SLOT_MAP_MAX && !structural; i++) {
-		structural = _slot_map_full[i];
-	}
-	for (int slot = 0; slot < (int)_slot_dirty.size() && !structural; slot++) {
-		structural = _slot_dirty[slot] != 0;
-	}
+	const bool structural = _region_map_dirty || _region_map_signal_dirty;
 
 	if (_region_map_dirty) {
 		_rebuild_region_map();
@@ -143,7 +127,6 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 	// Fold content edits into the slot dirtiness so one upload pass covers both
 	// structural and edited changes: a region can be edited in the same call that
 	// adds or unloads another one.
-	const int edit_mask = _slot_map_mask(p_map_type);
 	for (const Vector2i &region_loc : _region_locations) {
 		const Terrain3DRegion *region = get_region_ptr(region_loc);
 		if (region && region->is_edited()) {
@@ -153,7 +136,7 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 
 	bool any_changed = false;
 	for (int slot_map = 0; slot_map < SLOT_MAP_MAX; slot_map++) {
-		if (!_slot_map_requested(p_map_type, slot_map)) {
+		if (!(edit_mask & (1 << slot_map))) {
 			continue;
 		}
 		const bool changed = _sync_slot_map(slot_map);
@@ -409,15 +392,7 @@ Vector3 Terrain3DData::get_texture_id(const Vector3 &p_global_position) const {
 	// map. Picking and live info must read the same data as the shader.
 	Ref<Terrain3DRegion> region = get_regionp(p_global_position);
 	if (region.is_valid() && region->get_surface_map().is_valid()) {
-		// The stored payload is region_size * surface_density squared, while vgrid
-		// is in region texels.
-		const int density = MAX(1, region->get_surface_density());
-		Vector2i pixel = (vgrid - region->get_location() * region->get_region_size()) * density;
-		const int surface_size = region->get_surface_map()->get_width();
-		pixel.x = CLAMP(pixel.x, 0, surface_size - 1);
-		pixel.y = CLAMP(pixel.y, 0, surface_size - 1);
-		float value = region->get_surface_map()->get_pixelv(pixel).r;
-		uint16_t packed = uint16_t(CLAMP(Math::round(value * 65535.0f), 0.0f, 65535.0f));
+		const uint16_t packed = uint16_t(get_surface_texel_nearest(v3v2(p_global_position)));
 		TerrainSurfaceIdWeight::Pair pair = TerrainSurfaceIdWeight::decode(packed);
 		return Vector3(pair.background, pair.overlay, TerrainSurfaceIdWeight::contribution(packed));
 	}

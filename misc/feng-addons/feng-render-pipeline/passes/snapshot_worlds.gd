@@ -314,22 +314,17 @@ static func _set_viewport_world(viewport_id: int, new_world_id: int) -> void:
 		_invalidate_world(old_world_id)
 	if new_world_id != 0:
 		_invalidate_world(new_world_id)
-	if old_world_id == 0 and new_world_id == 0:
-		_targets_version += 1
 
 static func _invalidate_world(world_id: int) -> void:
 	var bucket: Dictionary = _viewports_by_world.get(world_id, {})
 	if bucket.is_empty():
 		_world_generations.erase(world_id)
-		_targets_cache.erase(world_id)
-		_world_owner_ids_cache.erase(world_id)
-		_world_viewports_cache.erase(world_id)
 	else:
 		_next_world_generation += 1
 		_world_generations[world_id] = _next_world_generation
-		_targets_cache.erase(world_id)
-		_world_owner_ids_cache.erase(world_id)
-		_world_viewports_cache.erase(world_id)
+	_targets_cache.erase(world_id)
+	_world_owner_ids_cache.erase(world_id)
+	_world_viewports_cache.erase(world_id)
 	_targets_version += 1
 
 ## Build or reuse the distinct live producer IDs for one world route. Viewport
@@ -343,10 +338,7 @@ static func _owner_ids_for_world(world_id: int, generation: int) -> Array[int]:
 	var cached: Dictionary = _world_owner_ids_cache.get(world_id, {})
 	if int(cached.get("generation", -1)) == generation \
 			and int(cached.get("lease_version", -1)) == _owner_lease_version:
-		var cached_value: Variant = cached.get("owner_ids", null)
-		if cached_value is Array:
-			var cached_ids: Array[int] = cached_value
-			return cached_ids
+		return cached.owner_ids
 	var seen: Dictionary = {}
 	var owner_ids: Array[int] = []
 	for viewport_id_variant in world_bucket.keys():
@@ -418,10 +410,7 @@ static func _viewports_for_prepared_world(world_id: int) -> Dictionary:
 		var generation := int(_world_generations.get(world_id, 0))
 		var cached: Dictionary = _world_viewports_cache.get(world_id, {})
 		if int(cached.get("generation", -1)) == generation:
-			var cached_value: Variant = cached.get("viewports", null)
-			if cached_value is Dictionary:
-				var cached_viewports: Dictionary = cached_value
-				return cached_viewports.duplicate()
+			return cached.viewports.duplicate()
 		var result: Dictionary = {}
 		var world_bucket: Dictionary = _viewports_by_world.get(world_id, {})
 		for viewport_id_variant in world_bucket.keys():
@@ -498,10 +487,7 @@ static func targets_for(world: World3D) -> Array[RID]:
 		var generation := int(_world_generations.get(world_id, 0))
 		var cached: Dictionary = _targets_cache.get(world_id, {})
 		if int(cached.get("generation", -1)) == generation:
-			var cached_value: Variant = cached.get("targets", null)
-			if cached_value is Array:
-				var cached_targets: Array[RID] = cached_value
-				return cached_targets
+			return cached.targets
 		var viewports_for_requested_world := _viewports_for_prepared_world(world_id)
 		if int(_world_generations.get(world_id, 0)) != generation:
 			continue

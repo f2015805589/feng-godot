@@ -6,8 +6,7 @@ extends RefCounted
 ##
 ## The pass list and the runtime state behind it (a volume can switch an entry on or off
 ## for the camera inside it) are owned by the renderer, so they are passed in: the
-## dictionaries it built, and the renderer's own predicates for "runs this frame",
-## "owns this resource contract" and "is dispatched by a pass script".
+## dictionaries it built and the predicate for "runs this frame".
 
 const NativeSpec = preload("native_spec.gd")
 const PassTexture = preload("../passes/pass_texture.gd")
@@ -19,9 +18,7 @@ static func validate_schedule(
 	passes: Array,
 	provided_native_ids: Dictionary,
 	declared_provided_ids: Dictionary,
-	is_entry_enabled_fn: Callable,
-	contract_source_fn: Callable,
-	is_scripted_fn: Callable
+	is_entry_enabled_fn: Callable
 ) -> PackedStringArray:
 	var warnings := PackedStringArray()
 	var native_positions := {}
@@ -39,8 +36,8 @@ static func validate_schedule(
 			for warning in pass_entry.get_configuration_warnings():
 				warnings.append(warning)
 
-			var contract = contract_source_fn.call(pass_entry)
-			if contract != null and contract != pass_entry:
+			var contract: FengPass = pass_entry.get_contract_source()
+			if contract != pass_entry:
 				for warning in contract.get_configuration_warnings():
 					warnings.append("Pass '%s': %s" % [_pass_display_name(pass_entry), warning])
 
@@ -64,7 +61,7 @@ static func validate_schedule(
 			else:
 				native_positions[native.native_id] = i
 				native_states[native.native_id] = enabled
-				if enabled and not is_scripted_fn.call(native):
+				if enabled and native.implementation == null:
 					native_tokens[native.native_id] = true
 
 	# Mandatory passes must either be in the schedule or provided by a pass script.

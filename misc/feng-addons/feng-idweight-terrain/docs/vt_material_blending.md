@@ -1,25 +1,18 @@
-# VT material blending correction
+# VT material blending
 
-AVT and SVT material arrays already use linear filtering. Packed R16 IDs and
-indirection entries intentionally use nearest reads; interpolating packed IDs
-would corrupt material identities.
+AVT/SVT material arrays use linear filtering. Packed R16 IDs and indirection entries
+use nearest reads so interpolation preserves material identities.
 
-The bake shader previously computed triangle weights from output pixel positions.
-Their fractional coordinates were always (0.5, 0.5), even when dozens of output
-pixels covered one source ID cell. Nearest-resampled IDs consequently produced
-material blocks instead of the direct shader's triangle gradient.
+For output pixels no larger than the source-ID spacing, production supplies a world-aligned
+corner grid with its own origin/spacing. The bake shader derives triangle barycentric weights
+on that grid while material texture footprints use the output-page texel size.
+AVT and offline SVT share the same source-rectangle helper and staging layout.
+Larger pixels use the existing minified-source path.
 
-For output pixels no larger than the source ID spacing, production now supplies a
-world-aligned corner grid and its origin/spacing separately from the output page.
-The shader computes barycentric weights in that grid, while material texture
-footprints retain the output texel size. Only the needed source rectangle is
-sampled, then copied into the existing staging allocation. AVT and offline SVT
-use the same helper. The existing minified source path remains for pixels larger
-than the source spacing; this change is not a new anisotropic/minification filter.
+The SVT source signature includes the corner-interpolation revision. Stale cells must
+rebake, through Auto Bake or manual Bake SVT.
 
-The SVT source signature now includes the corner-interpolation revision. Existing
-cell caches are treated as stale and must be rebaked (automatically when auto
-bake is enabled, otherwise through Bake SVT).
+## Historical regression evidence
 
 GPU regression: `vt_adaptive_runner.py --blend` compares a two-material gradient
 against direct shading and replaces source albedo bindings after caching to rule

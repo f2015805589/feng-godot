@@ -23,9 +23,11 @@ def main():
     args = parser.parse_args()
     project = args.work_dir or Path(tempfile.mkdtemp(prefix="frp-optional-", dir=ROOT / "bin"))
     project.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ADDON, project / "addons/feng-render-pipeline", dirs_exist_ok=True)
+    selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky", "feng-cloud")
+    for name in selected_addons:
+        shutil.copytree(ADDON.parent / name, project / "addons" / name, dirs_exist_ok=True)
     for addon in ADDON.parent.iterdir():
-        if addon != ADDON and (addon / "plugin.cfg").is_file():
+        if addon.name not in selected_addons and (addon / "plugin.cfg").is_file():
             placeholder = project / "addons" / addon.name
             placeholder.mkdir(parents=True, exist_ok=True)
             (placeholder / ".gdignore").touch()

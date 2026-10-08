@@ -1,6 +1,8 @@
 # UE 5.8 cloud parity and performance
 
-Updated 2026-10-08. This note compares the current default desktop cloud path with the local Unreal Engine 5.8 source and records CPU-side profiling. It is a source-parity review, not a claim of a complete Unreal renderer or pixel identity.
+Recorded 2026-10-08, before the subsequent architecture simplification. Source comparisons and
+results below apply to the named candidates/builds; they are historical evidence. Current usage
+is in [the addon README](../README.md). UE pixel identity remains unverified.
 
 ## Source comparison
 
@@ -49,7 +51,7 @@ A separate editor VT-preview attribution run forced VT preview on for measuremen
 
 Source records for the paired summaries are local diagnostic artifacts under `C:\Temp\feng-heightfog-repro-1dca-20261007\project\perf_data_baseline_42586_20261007`, `perf_data_cpu_candidate_3files_20261007`, `perf_data_cpu_candidate_4files_20261007`, and `perf_data_final_42586_20261008`. `Performance.TIME_PROCESS` is not used here as CPU thread time; the table keeps viewport CPU, viewport GPU, and wall-frame measurements separate.
 
-## Validation status
+## Recorded validation status
 
 | Gate | Status |
 | --- | --- |

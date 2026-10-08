@@ -21,22 +21,13 @@ func runtime_script_path() -> String:
 	return ""
 
 func _frp_execute(ctx: FRPPassContext) -> void:
-	_frame_snapshot = {}
-	_frame_scene_data = null
-	if ctx != null:
-		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
-		_frame_snapshot = _snapshot_for_target(buffers)
-		var render_data := ctx.get_render_data()
-		if render_data != null:
-			_frame_scene_data = render_data.get_render_scene_data()
-	super._frp_execute(ctx)
-	_frame_snapshot = {}
-	_frame_scene_data = null
+	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD if ctx != null else null
+	_frp_execute_with_snapshot(ctx, _snapshot_for_target(buffers))
 
 ## Dedicated off-screen capture path. The caller supplies a frozen world snapshot
 ## because reflection captures have no viewport render target to route by.
 func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> void:
-	_frame_snapshot = snapshot.duplicate(true)
+	_frame_snapshot = snapshot
 	_frame_scene_data = null
 	if ctx != null:
 		var render_data := ctx.get_render_data()
@@ -137,20 +128,3 @@ func _cleanup(rd: RenderingDevice) -> void:
 	if rd != null and _ubo.is_valid():
 		rd.free_rid(_ubo)
 	_ubo = RID()
-
-## Frees RIDs created on the render thread. Subclasses call this from their
-## own PREDELETE _notification with value-captured RIDs. It must be static and
-## self-contained: the subclass part of the dying instance is already torn down
-## during the notification, so a virtual call on it would dispatch into a null
-## instance. FengShaderPass's own RIDs are freed by engine teardown; do NOT call
-## super._notification from the subclass handler.
-static func _free_on_render_thread(rids: Array[RID]) -> void:
-	var owned := rids.duplicate()
-	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd == null:
-			return
-		for rid in owned:
-			if rid.is_valid():
-				rd.free_rid(rid)
-	)

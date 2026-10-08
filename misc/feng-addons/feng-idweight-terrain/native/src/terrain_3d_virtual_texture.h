@@ -13,6 +13,7 @@
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/rect2.hpp>
 
 #include "constants.h"
 #include "generated_texture.h"
@@ -148,9 +149,6 @@ private:
 	void _touch_slot(uint32_t p_slot);
 	int _acquire_slot();
 	void _invalidate_pool_owner(uint32_t p_slot, const Terrain3DVTPageOwner &p_owner);
-	void _release_sector_pages(const Vector2i &p_sector, const TerrainVT::ImageInfo &p_info);
-	bool _remap_sector_pages(const Vector2i &p_sector, const TerrainVT::ImageInfo &p_old_info,
-			const TerrainVT::ImageInfo &p_new_info);
 	// Shared by the sector and world-space paths: allocate on a miss, publish the
 	// entry and report whether the page had to be produced.
 	int _request_virtual(int p_virtual_x, int p_virtual_y, int p_local_mip, int p_max_local_mip,
@@ -279,6 +277,7 @@ public:
 	bool release_page(const Vector2i &p_sector, const int p_local_mip, const int p_page_x,
 			const int p_page_y);
 	bool release_world_page(const int p_page_x, const int p_page_y, const int p_local_mip);
+	void release_world_region(const Rect2 &p_region, real_t p_page_world);
 
 	// Page content
 	void set_material_cache_mode(bool p_enabled) { _material_cache_mode = p_enabled; }

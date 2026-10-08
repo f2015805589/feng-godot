@@ -1,5 +1,8 @@
 # UE 5.8 大气与插件架构改动：验证记录
 
+历史记录：结论、问题清单与通过状态限于下文记录的源码、二进制和环境；当前契约见
+[插件架构](frp-addon-architecture.md)与[引擎契约](frp-engine-contract.md)。
+
 日期：2026-10-01。基准提交：`aa96f5cea74859bfd4f441b66e9e7be747a078dc`，分支 `feng-godot`。本记录区分本次通过的测试、原有失败和未验证范围，不能理解成全部引擎测试全绿。
 
 参数与实现对应关系见 [UE 5.8 对照](frp-unreal-atmosphere.md)，全部插件审阅与剩余问题见 [架构复核](frp-addon-audit.md)。

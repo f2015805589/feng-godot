@@ -6,7 +6,15 @@ const Plan = preload("res://addons/feng-render-pipeline/pipeline/execution_plan.
 const Validator = preload("res://addons/feng-render-pipeline/pipeline/pipeline_validator.gd")
 const Binding = preload("res://addons/feng-render-pipeline/pipeline/compositor_binding.gd")
 const TextureManager = preload("res://addons/feng-render-pipeline/passes/texture_manager.gd")
+const NativePass = preload("res://addons/feng-render-pipeline/passes/native/native_pass.gd")
+const ViewPass = preload("res://addons/feng-render-pipeline/pipeline/view_pass.gd")
+const FogPass = preload("res://addons/feng-render-pipeline/passes/height_fog_pass.gd")
 const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
+
+class PreparePass extends PassBase:
+	var calls := 0
+	func _frp_prepare(_ctx: FRPPassContext) -> void:
+		calls += 1
 
 class SettingsPass extends PassBase:
 	var defaults := {"enabled": true, "amount": 1.0}
@@ -36,12 +44,48 @@ func _initialize() -> void:
 	run.call_deferred()
 
 func run() -> void:
+	_test_pass_hooks()
 	_test_enabled_layers()
 	_test_schedule_slots()
 	_test_texture_dependencies()
 	_test_binding_fallback()
 	print("PASS FRP fixed schedule contracts, custom parameter layers, texture dependencies and binding fallback")
 	quit()
+
+func _test_pass_hooks() -> void:
+	var plain := PassBase.new()
+	plain._frp_prepare(null)
+	assert(not plain.ensure_frp_contract())
+	var prepared := PreparePass.new()
+	var entry := BuiltinPass.new(NativeSpec.PASS_SKY)
+	entry.implementation = prepared
+	entry._frp_prepare(null)
+	var native := NativePass.new()
+	native.overlay = prepared
+	native._frp_prepare(null)
+	prepared.enabled = false
+	native._frp_prepare(null)
+	assert(prepared.calls == 2, "preparation delegates through the typed hook and honors overlay state")
+	var view := ViewPass.new()
+	view.configure(prepared, prepared, true)
+	view._frp_prepare(null)
+	assert(prepared.calls == 3, "view execution uses the scheduled executor")
+	view.configure(prepared, null, false)
+	view._frp_prepare(null)
+	assert(prepared.calls == 3, "disabled views need no executor")
+	var fog := FogPass.new()
+	var fog_snapshot := {"fog_color": Vector3.ONE}
+	var atmosphere := {"settings": {"height": 60.0}}
+	fog.set_capture_snapshots(fog_snapshot, atmosphere)
+	fog_snapshot.fog_color = Vector3.ZERO
+	atmosphere.settings.height = 0.0
+	assert(fog._capture_fog_snapshot.fog_color == Vector3.ONE and fog._capture_atmosphere_snapshot.settings.height == 60.0,
+			"capture owns its frozen snapshot at the boundary")
+	fog._frp_execute_with_snapshot(null, fog_snapshot)
+	assert(fog._frame_snapshot.is_empty() and fog._frame_scene_data == null,
+			"snapshot execution releases its frame lease even without render data")
+	fog.clear_capture_snapshots()
+	assert(not fog._capture_snapshot_active and fog._capture_fog_snapshot.is_empty() and fog._capture_atmosphere_snapshot.is_empty())
 
 func _test_enabled_layers() -> void:
 	assert(not Plan.is_scripted(null) and not Plan.is_entry_enabled(null))
@@ -100,16 +144,16 @@ func _test_schedule_slots() -> void:
 	var last := PassBase.new()
 	last.stable_id = &"last-custom"
 	var entries := [first, null, token, carried, last]
-	var schedule := Plan.build(entries, manager, Plan.is_scripted, Plan.is_entry_enabled)
+	var schedule := Plan.build(entries, manager, Plan.is_entry_enabled)
 	assert(schedule.effects == [manager, first, carried, last])
 	assert(schedule.scripted_effects == [first, carried, last])
 	assert(schedule.tokens == PackedInt32Array([-1, -2, NativeSpec.PASS_SKY, -3, -4]),
 			"disabled script effects must retain their token slots")
 	assert(schedule.names == PackedStringArray(["Texture Preparation", "00 Disabled custom", "02 Native token", "03 Disabled implementation", "04 last-custom"]))
-	var view_schedule := Plan.build(entries, null, Plan.is_scripted, Plan.is_entry_enabled)
+	var view_schedule := Plan.build(entries, null, Plan.is_entry_enabled)
 	assert(view_schedule.tokens == schedule.tokens and view_schedule.effects == schedule.scripted_effects)
 	token.enabled = false
-	assert(Plan.build(entries, manager, Plan.is_scripted, Plan.is_entry_enabled).tokens == PackedInt32Array([-1, -2, -3, -4]))
+	assert(Plan.build(entries, manager, Plan.is_entry_enabled).tokens == PackedInt32Array([-1, -2, -3, -4]))
 	carried.enabled = true
 	carried.implementation.provides_native_ids = [NativeSpec.PASS_GBUFFER]
 	last.provides_native_ids = [NativeSpec.PASS_TRANSPARENT]
@@ -166,24 +210,23 @@ func _test_binding_fallback() -> void:
 	var native := BuiltinPass.new(NativeSpec.PASS_SKY)
 	native.implementation = PassBase.new()
 	var entries := [custom, native]
-	var schedule := Plan.build(entries, manager, Plan.is_scripted, Plan.is_entry_enabled)
-	var contract_source := func(entry: FengPass): return entry.get_contract_source()
-	var provided := func(): return PackedInt32Array([NativeSpec.PASS_SKY])
-	var parameters := func(): return {"custom": {"amount": 3.0}}
+	var schedule := Plan.build(entries, manager, Plan.is_entry_enabled)
+	var provided := PackedInt32Array([NativeSpec.PASS_SKY])
+	var parameters := {"custom": {"amount": 3.0}}
 	# Include every required native operation while exercising two effect slots.
 	for native_id in NativeSpec.seed_order():
 		if native_id != NativeSpec.PASS_SKY:
 			schedule.tokens.append(native_id)
 			schedule.names.append(NativeSpec.pass_name(native_id))
 	var result := Binding.apply(compositor, manager, entries, schedule, PackedStringArray(),
-			contract_source, Plan.is_entry_enabled, provided, parameters)
+			Plan.is_entry_enabled, provided, parameters)
 	assert(result.applied and result.tokens == schedule.tokens)
 	assert(manager.passes == schedule.scripted_effects and compositor.compositor_effects == schedule.effects)
 	var original_effects := compositor.compositor_effects.duplicate()
 	# Invalid candidates intentionally have no plan fields, so they must return
 	# before fixed plan reads and leave the previously attached effect list intact.
 	result = Binding.apply(compositor, manager, entries, {}, PackedStringArray(["expected invalid candidate"]),
-			contract_source, Plan.is_entry_enabled, provided, parameters)
+			Plan.is_entry_enabled, provided, parameters)
 	assert(not result.applied and result.tokens.is_empty())
 	assert(compositor.compositor_effects == original_effects and manager.passes.is_empty())
 	assert(custom.is_enabled() and native.is_enabled(), "execution fallback must not edit authored enabled flags")
@@ -192,7 +235,7 @@ func _test_binding_fallback() -> void:
 	var unrelated_effect := PassBase.new()
 	unrelated.compositor_effects = [unrelated_effect]
 	Binding.apply(unrelated, manager, entries, {}, PackedStringArray(["expected unrelated candidate"]),
-			contract_source, Plan.is_entry_enabled, provided, parameters)
+			Plan.is_entry_enabled, provided, parameters)
 	assert(unrelated_effect.is_enabled() and unrelated.compositor_effects == [unrelated_effect])
 	Binding.clear(compositor)
 	Binding.clear(unrelated)

@@ -1,5 +1,9 @@
 # FRP Runtime and Terrain Performance (2026-10-07)
 
+Historical record: results and open findings apply to the builds and environments named below.
+Current contracts are in [addon architecture](frp-addon-architecture.md) and
+[engine contract](frp-engine-contract.md).
+
 **Evidence status:** The validated code/build baseline is built. Focused `1e28` GBuffer, array-slice, material-hint, FRP post, exposure-lifecycle, and final editor/game performance windows completed. The performance windows are short matched workload captures, not a general cold-streaming or all-platform guarantee. Broader platform/feature coverage remains unverified. The 45b measurements below are historical and are not measurements of current HEAD. Supporting relative artifact paths are rooted at `C:\Temp\feng-frp-ue-tonemap-perf-20261006` unless a full path is shown.
 
 ## Validated source and build
@@ -55,17 +59,26 @@ The stdout contains `RESULT=PASS` and the capture completed naturally, but the w
 
 The native predicate is `is_vt_editor_preview_active() = IS_EDITOR && vt_editor_preview` (`terrain_3d_vt_service.cpp:315-316`). In `terrain_3d.cpp` lines 193–202, active preview enters an explicit bake-only branch and returns; near/far VT surface updates return early (`terrain_3d_surface_views_near.cpp:198`, `terrain_3d_surface_views_far.cpp:83`), and material setup disables VT (`terrain_3d_material.cpp:284`). In normal game runtime, editor preview is inactive and the normal VT path continues. Thus the preview-ON editor row changes the workload and residency state; it must not be presented as a performance improvement that preserves runtime rendering quality.
 
-## Source and feature interpretation
+## Source interpretation and correctness evidence
 
-The 45b public per-world viewport registry maintains an event-generation world-to-viewport map and unique-owner handles across queries. Each synchronous query still checks each distinct owner's weak reference for liveness; the legacy viewport path refreshes live-world identity. The route map is bounded to 32 worlds. Event-backed viewport identity changes invalidate the corresponding route entries. Fog debanding and SkyLight routing use the shared per-world registry instead of maintaining independent whole-tree scans. The 45b benchmark measures this source snapshot on the 6ee executable and includes other code paths, so it is not an isolated microbenchmark of the registry alone.
+The [dated source audit](frp-source-audit-20261007.md) records the registry, upload,
+BaseColor storage, material-uniform and MSAA resolve changes, their exact build identities,
+correctness gates and limits. Current interfaces are in [the engine contract](frp-engine-contract.md).
+The performance rows here compare complete workload/build packages, so they do not isolate
+those individual changes. Preview ON additionally changes the editor's rendering workload.
 
-The delivered terrain uploader packs up to 16 R16_UNORM or R32_SFLOAT page payloads into scratch storage, then GPU-scatters them into the existing texture-array layers. It keeps the prior formats, layer routing, page budgets, and source values. A prior producer snapshot recorded 863 packed upload/scatter calls for 12,266 pages and 5,207,358,576 payload bytes; BC7 was active, with zero encode failures and zero encode readbacks. The older two-layer 266×266 comparison at `C:\Temp\feng-frp-ue-tonemap-perf-20261006\vt-gpu-codec-95d5\scatter-updatebit.stdout.log` records zero mismatches against direct region updates for R16_UNORM and R32_SFLOAT. It ran `4.7.3.rc.custom_build.95d5fda70` on D3D12 / NVIDIA RTX 3080 Ti, so this is an older fixture artifact, not a current-candidate validation. These establish path activity and sampled data equivalence, not a standalone timing gain.
+A historical producer snapshot recorded 863 packed upload/scatter calls for 12,266 pages and
+5,207,358,576 payload bytes, with BC7 active and zero encode failures/readbacks. The two-layer
+266×266 R16/R32F comparison at
+`C:\Temp\feng-frp-ue-tonemap-perf-20261006\vt-gpu-codec-95d5\scatter-updatebit.stdout.log`
+reported zero mismatches on the older 95d5 D3D12/RTX 3080 Ti build. These establish sampled
+content and path activity, not an isolated throughput gain or current-build acceptance.
 
-The new BaseColor sRGB storage path is a color-storage alignment, not a throughput optimization claim. It changes BaseColor's 8-bit storage encoding; emission and scene-HDR storage are unchanged. Lighting continues to consume linear Rec.709 values, and non-color GBuffer channels and the MSAA depth-selected sample rule remain unchanged. The public sampled binding `gbuffer_albedo` returns linear values on an sRGB-view route; `gbuffer_albedo_storage` is the raw UNORM storage view, where `imageStore` needs explicit OETF encoding. On a device that cannot express the required sRGB view usage, the no-copy fallback remains same-format linear UNORM. The version-related inability to restrict the required view usage occurs only when neither Vulkan core 1.1 nor enabled `VK_KHR_maintenance2` is available; this does not remove the format and usage-feature requirements for a valid view. Consumers should query the actual public view format. In the 3D `MaterialStorage` `p_use_linear_color` path, a GDScript `Color` Variant is sRGB-authored and decoded even without a `source_color` hint; already-linear values should be passed as `Vector3` or `Vector4`. This finding is scoped to that 3D material-storage path. The previous `rgba8` storage-image qualifier for FRP's packed normal/roughness target was a source/spec mismatch: Khronos maps SPIR-V `Rgba8` to `VK_FORMAT_R8G8B8A8_UNORM` and `Rgb10A2` to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, and requires storage-image format compatibility ([mapping](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#_compatibility_between_spir_v_image_formats_and_vulkan_formats), [storage-image rules](https://docs.vulkan.org/guide/latest/storage_image_and_texel_buffers.html#format-compatibility-requirements)). The `1e28` fix selects `rgb10_a2` only for `GBUFFER_RESOLVE`, retaining generic `rgba8`; this identifies a contract defect, not proof of a visible RTX failure.
-
-C's current `1e28` 2× MSAA runs passed on D3D12 and Vulkan: each captured 67/67 color cases, 3/3 exact raw storage cases, and six auxiliary captures with zero delta. The strict color oracle maximum was 0.24675 sRGB code (≤1 code). Logs: `C:\Temp\feng-gbuf-color-20261007\logs\eb6d_1e28_d3d12_msaa2.stdout.log` and `...\eb6d_1e28_vulkan_msaa2.stdout.log`. This validates resolved output for these runs, not the selected source sample or every device/VR. The earlier EB D3D12 2× run was preliminary and is not the final result. The prior EB no-MSAA strict 67-case oracle (`...\logs\retry7_oetf_code_analysis.json`) also reported max 0.24675 code, exact raw codes. Current D3D12/Vulkan array-slice gates passed; the focused Forward+/Forward Mobile material-hint variants, FRP post, and exposure-lifecycle GPU smokes also passed. Their logs and exact outputs are in the source audit report. Broader platform/feature coverage remains unverified. The separate 55-case force-sRGB baseline is in `C:\Temp\feng-gbuf-color-20261007\reports\gbuf-color-baseline-6ee.md` and its machine-readable table in `...\gbuf-color-baseline-6ee.json`: 55 total cases span several input/material classes; only 9 are RGBA8 texture force-on, with 2 mismatches (gray 0.18 and 0.5). The RGBA8 force-off group is 9/9 within one output code, and float-texture force-off/on totals 10/10 within one code. This is old-material-branch evidence, not current GBuffer acceptance.
-
-Earlier gates on 6ee include the product FRP post test and authored-white Volume test. The latter covered native modes 2/4/inherit −1, regular/AgX whites 1.0/16.29, enable/removal transitions, and zero all-pixel output delta. The b866 tone-LUT numerical reference reported max difference 0.0021742 versus UE's 10-bit SDR LUT after output clamp. These gates predate the current GBuffer commit and do not replace its GPU tests. The 6ee fixed-Sky Fog pre-exposure check verified the raw Fog/sun contribution is pre-exposed once; no full UE Fog parity is claimed.
+Earlier 6ee gates covered FRP post and authored-white Volume modes 2/4/inherit−1, whites 1.0/16.29,
+enable/removal and zero pixel delta. The b866 tone-LUT reference reported maximum difference
+0.0021742 versus UE's 10-bit SDR LUT after output clamp. A 6ee fixed-Sky Fog probe checked a
+single pre-exposure application. These are earlier feature checks, separate from the 1e28
+GBuffer gates and the workload measurements above.
 
 ## Artifacts, warnings, and scene state
 

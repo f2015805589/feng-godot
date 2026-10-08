@@ -88,7 +88,7 @@ func run() -> void:
 	for entry in renderer.passes:
 		if entry.enabled:
 			enabled_count += 1
-	require(renderer.passes.size() == 14 and enabled_count == 13, "default 13 non-debug passes changed")
+	require(renderer.passes.size() == 17 and enabled_count == 16, "default 16 non-debug passes changed")
 	for index in 2:
 		make_view(index, renderer)
 	# Exercise every combination repeatedly, allowing async scene-shader jobs to settle.

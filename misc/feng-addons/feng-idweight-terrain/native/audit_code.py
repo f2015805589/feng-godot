@@ -1,68 +1,20 @@
-"""Read-through helpers for the addon's own source.
+"""Read-only, heuristic audits of the addon's native source; not a compiler or test suite.
 
-Not part of the test suite and not run by anything: this is the tool the architecture pass uses to
-answer its questions mechanically instead of by eye, so the answers do not depend on reading thirty
-thousand lines carefully.
+    python audit_code.py dead                  declarations with few or no references (default)
+    python audit_code.py undefined             header declarations without matching definitions
+    python audit_code.py sections              .cpp banners versus header access specifiers
+    python audit_code.py comments              comments naming absent identifiers
+    python audit_code.py params                unread parameters in short definitions
+    python audit_code.py indent                indentation runs, first statements and comments
+    python audit_code.py shape                 file sizes and long definition spans
+    python audit_code.py structure <function>  one matching function's top-level statements
+    python audit_code.py dupes                 repeated normalized definition spans
 
-    python audit_code.py dead                    declarations nothing in src/ references
-    python audit_code.py undefined               header declarations nothing implements
-    python audit_code.py sections                .cpp banners vs the header's access specifiers
-    python audit_code.py comments                comments naming identifiers that no longer exist
-    python audit_code.py params                  parameters a definition never reads
-    python audit_code.py indent                  mis-indented runs, and bodies a level too deep
-    python audit_code.py shape                   what each file holds, and what outgrew it
-    python audit_code.py structure <function>    one function's top-level statements
-    python audit_code.py dupes                   definitions written more than once
-
-`dead` is what found the experimental distance-mip controls and the unused `get_warnings()` accessor:
-a symbol that appears only where it is declared is dead, while a symbol used from an inline accessor
-in the same header, or named by an `ADD_PROPERTY` binding string, is not - so the binding names are
-part of the search. It reports candidates, not verdicts: a property getter named only from its
-binding is live, and the report says which case each candidate is.
-
-`undefined` is the check that catches `Terrain3DVTPagePool::get_atlas_image()`, declared beside the
-live `Terrain3DVirtualTexture::get_atlas_image()` and written nowhere. Matching by name cannot see
-it - the name is defined, just not for that class - so this one attributes each declaration to the
-class that encloses it and asks for that qualified definition. Nothing else reports it: the compiler
-is silent because nothing calls it, and `dead` counts the name as used because the other class has a
-method by the same name.
-
-`sections` is the one check about the *file* rather than the code: a definition under a "Private
-Functions" banner whose declaration in the paired header says `public:` is a file that reads as if
-that function were callable from outside, and the compiler never objects. It found thirteen of them
-in four files - eight private streamer helpers under a "Public Functions" banner, three public
-`Terrain3DAssets` array setters under "Private Functions", and two single cases - which are moves,
-not rewrites, once the header says where they belong.
-
-`comments` is the prose half: a comment that names an identifier the code no longer contains, which
-is the same kind of lie as a stale banner and cannot be found by reading the code. It found
-`_lod_rids` (a comment beside `_clipmap_rids`), `Terrain3D::_process_physics()`, `_operate()` and
-`_get_undo_data()`, all four of which name something that no longer exists under that name. Most of
-what it reports is *not* a defect - engine internals (`Node::_process()`,
-`RenderingDeviceGraph::_execute_frame()`, `std::mutex::try_lock()`), GDScript reachable through
-`call()`, prose that happens to be underscored - so it reports candidates and this file names the
-forgiven ones.
-
-`params` is the one the compiler could make and does not. An unused parameter needs
-`-Wunused-parameter`, and a parameter *dropped* on the way to the call it forwards to is not reported
-at all - the function works, it just ignores what it was handed. It found
-`Terrain3DData::add_region_blankp()`, bound to Godot with `update` exposed and forwarded without it,
-and `Terrain3D::_svt_page_path()`'s `p_mip`, hard-coded to 0 in the body. Two of its own traps are
-worth knowing: a declaration whose `;` precedes the brace made the *next* function its body, and raw
-strings span lines, so the embedded shaders' `layout(set = 0, binding = 0)` lines were read as this
-addon's definitions until raw strings were handled.
-
-`shape` is what found `_update_visible_svt()`, which had grown to 484 lines with six stages in it and
-no way to find one of them; extracting the root pyramid into `_svt_plan_roots()` took it to 283. Two
-hundred lines is a reasonable ceiling for a function that runs stages in order, and this is the only
-cheap way to notice which ones crossed it. It also found
-`Terrain3DSurfaceBaker::render_pending()` at 272 lines.
-
-`structure` is the other half of that: once a function is known to be too big, this prints what it
-does at its top level, so the stages to extract can be named before anything is moved. It tracks brace
-depth with comments and string literals skipped, which a plain brace count cannot do here - this
-codebase quotes shader code and braces inside comments, and a naive counter reports a function ending
-in the middle of its own explanation.
+Reports are review candidates. Name searches include binding strings and can conflate unrelated
+symbols; external callers are not visible. Source scanners assume this addon's formatting and do
+not implement C++ syntax. Shape/duplicate spans end at the next detected definition, so they may
+include trailing declarations or comments. Parameter checks require a complete body within a
+12-line window. All commands read files without modifying them.
 """
 import re
 import sys
@@ -86,9 +38,7 @@ def read(name: str) -> str:
     return FILES[SRC / name]
 
 
-# Lines that start a definition: column 0, not a comment, not a preprocessor line, not a closing
-# brace, and not one of the things that open a scope without being a function. Continuation lines of
-# a multi-line signature are indented, so the signature's *first* line is what this finds.
+# Definitions begin at column 0; indented continuation lines and non-function scopes are excluded.
 UNQUALIFIED = ("namespace", "using", "struct", "class", "enum", "template", "extern", "typedef",
                "return", "if", "for", "while", "switch", "static const", "#")
 SIGNATURE = re.compile(r"^[A-Za-z_~][\w:<>,*&\s]*[\s*&:]([A-Za-z_]\w*)\s*\(")
@@ -96,13 +46,7 @@ RAW_STRING = re.compile(r'R"(\w*)\(', re.S)
 
 
 def mask_literals(text: str) -> str:
-    """Blank out comments and raw string literals, keeping every offset and newline.
-
-    This codebase embeds its shaders as `R"( ... )"`. The GLSL inside sits at column 0 and looks
-    exactly like a definition - `vec4 encode_vec4(...) {`, `void main() {` - so a line-based scan that
-    does not mask them reports shader functions, with the spans between them, as the addon's largest
-    definitions. It reported `encode_vec4` at 1699 lines, which is how this was noticed.
-    """
+    """Blank line comments and raw string literals, preserving offsets and newlines."""
     out = list(text)
     for match in re.finditer(r"//[^\n]*", text):
         for index in range(match.start(), match.end()):
@@ -123,13 +67,10 @@ def mask_literals(text: str) -> str:
 
 
 def definitions(text: str):
-    """Every C++ definition in a translation unit, as (offset, name), member or namespace scope.
+    """Return (offset, name) for detected column-0 C++ definitions.
 
-    A span is measured from one of these to the next, so anything this misses is silently *added* to
-    its predecessor rather than going unreported. That happened twice: a namespace-scope `static`
-    function following a nine-line setter made the setter read as 229 lines (member-only matching
-    cannot see free functions), and the fix for that read the embedded shaders as definitions until
-    they were masked.
+    Member and free functions are included; raw embedded shaders are masked. Missed definitions
+    extend the preceding span, so reported lengths are approximate.
     """
     masked = mask_literals(text)
     starts = []
@@ -197,7 +138,7 @@ def shape() -> None:
 
 
 def structure(needle: str) -> None:
-    """Print one function's top-level statements, so a 300-line body can be planned before editing it."""
+    """Print a matching function's top-level statements using a simple brace scan."""
     for path, text in FILES.items():
         if needle not in text:
             continue
@@ -235,12 +176,9 @@ def structure(needle: str) -> None:
 
 
 def dupes(minimum: int = 6) -> None:
-    """Definitions whose bodies are identical once comments and indentation are dropped.
+    """Compare definition spans after masking line comments/raw strings and trimming lines.
 
-    The complement of `dead`: that finds code nothing reads, this finds code written twice. Bodies are
-    compared as line sequences with whitespace stripped, so a copy that has been reformatted still
-    matches, while a copy whose identifiers were renamed does not - which under-reports rather than
-    producing pairs a reader has to reject one by one.
+    Braces on their own lines are ignored; identifiers are not normalized.
     """
     groups = {}
     for path, text in FILES.items():
@@ -264,10 +202,7 @@ def dupes(minimum: int = 6) -> None:
         print(f"   first line: {body[0][:88]}")
 
 
-# A declaration inside a class body: an indented type and name, ending in `);`, possibly wrapped
-# over several lines. `[^;{}]` lets the argument list span lines but not run past a body, so an
-# inline accessor's `{` stops the match, and `= 0` / `= default` never match at all because the
-# pattern wants the `;` right after the parameter list.
+# Match indented declarations across lines, excluding inline, pure-virtual and defaulted bodies.
 DECLARATION = re.compile(
     r"^[ \t]+(?:virtual\s+|static\s+|inline\s+|explicit\s+|constexpr\s+)*"
     r"[A-Za-z_~][\w:<>,*&\s]*?[\s*&]([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?;", re.M)
@@ -278,14 +213,9 @@ NOT_A_METHOD = {"GDCLASS", "CLASS_NAME", "CLASS_NAME_STATIC", "ADD_PROPERTY", "A
 
 
 def enclosing_classes(text: str):
-    """(scope per line, brace depth per line): the innermost class open, and how deep we are.
+    """Return the innermost class scope and brace depth for each line.
 
-    Depth is tracked per line rather than per declaration, because a nested struct, an inline
-    accessor's body, or a free function after the closing brace all have to be placed correctly:
-    a declaration attributed to the wrong class reads as unimplemented, and one attributed to no
-    class at all would be checked against the wrong definition. The depth is what tells a
-    declaration in the class body from a local variable inside an inline body - `Vector2i loc(a, b);`
-    is not a method, and reporting it was the first version of this check's whole output.
+    Declaration depth distinguishes class members from locals in inline bodies.
     """
     scopes = []
     depths = []
@@ -304,14 +234,7 @@ def enclosing_classes(text: str):
 
 
 def undefined() -> None:
-    """Declarations in a header that no translation unit implements.
-
-    The complement of `dead`: that finds a name nothing *calls*, this finds a name nothing
-    *defines* - a promise in a header with no body anywhere. A name-based search cannot do it,
-    which is why this exists: `Terrain3DVTPagePool::get_atlas_image()` was invisible to both the
-    compiler (nothing calls it) and `dead` (the name is used, by the other class that declares a
-    method with it), so only asking for the *qualified* definition finds it.
-    """
+    """Find header declarations without a matching class-qualified or file-scope definition."""
     qualified = set()
     plain = set()
     for path, text in FILES.items():
@@ -346,16 +269,11 @@ def undefined() -> None:
     report("declared at file scope and defined nowhere", sorted(file_scope))
 
 
-# A definition the .cpp owns: `Type Class::name(` on a column-0 line. The banner pattern takes any
-# `// Words` line, so a file's own sub-banners ("Settings", "Bindings") end the section they follow
-# instead of being misread as one of the two access banners.
+# Any title-case banner ends the previous section, including non-access sub-banners.
 ACCESS = re.compile(r"^(public|private|protected)\s*:")
 BANNER = re.compile(r"^//\s*([A-Z][A-Za-z ]*?)\s*$")
 DEFINITION = re.compile(r"^[A-Za-z_][\w:<>,*&\s]*?\b(\w+)::([A-Za-z_]\w*)\s*\(")
-# Looser than DECLARATION on purpose: an inline accessor in a header (`bool is_ready() const { ... }`)
-# is a declaration this has to see, and so is a signature whose default arguments push the `;` past
-# the line the name sits on. The first version reused DECLARATION and reported eight methods that
-# were declared inline in the very header it was reading.
+# Include inline accessors and signatures whose closing semicolon falls on another line.
 HEADER_NAME = re.compile(
     r"^[ \t]+(?:virtual\s+|static\s+|inline\s+|explicit\s+|constexpr\s+)*"
     r"[A-Za-z_~][\w:<>,*&\s]*?[\s*&]([A-Za-z_]\w*)\s*\(")
@@ -394,17 +312,9 @@ def definition_sections(text: str):
 
 
 def sections() -> None:
-    """.cpp section banners that disagree with the header's access specifiers.
+    """Compare access banners with declarations in the paired or included class header.
 
-    The defect is a file that reads as if a private helper were callable from outside, or as if a
-    public setter were internal. Only files carrying both banners are checked - a file with no banner
-    makes no claim - and a definition under "Public Functions" that no header declares is listed
-    separately, because one free function there is legal but a pattern of them is not.
-
-    A split half has no header of its own, so the header it is checked against is the one it includes
-    that declares the class its definitions belong to. That resolution was added after the asset
-    library split made the gap visible: eight halves from earlier splits were being skipped, so their
-    banners had never been checked at all.
+    Files without access banners are skipped; unmatched public definitions are listed separately.
     """
     disagreement = []
     undeclared = []
@@ -414,11 +324,7 @@ def sections() -> None:
             continue
         header = FILES.get(path.with_suffix(".h"))
         if header is None:
-            # A split half has no header of its own: it includes the class header it belongs to, and
-            # that is the header whose access specifiers its banners have to agree with. Without this
-            # the halves of every class split in this pass were silently skipped. The class header is
-            # the include that declares the class the definitions belong to - not simply the first
-            # include, which is `logger.h` in most of these files.
+            # Split implementations use the included header declaring their class, not the first include.
             classes = set(re.findall(r"\b(\w+)::\w+\s*\(", text))
             for candidate in re.findall(r'^#include "([^"]+\.h)"', text, re.M):
                 candidate_text = FILES.get(SRC / candidate)
@@ -444,24 +350,17 @@ def sections() -> None:
     report("defined under Public Functions and declared in no header", sorted(undeclared))
 
 
-# Comment shapes that name code: backticked (`name`, `Class::name`), an empty parameter list
-# (`name()`), and this codebase's private prefix (`_name`). Ordinary prose is not collected unless it
-# wears one of those shapes, which is what keeps the report short: underscores used for emphasis are
-# the one false-positive class left, and they read as such.
+# Inspect backticked names, empty calls and private-prefixed identifiers, not ordinary prose.
 COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.S)
 COMMENT_LINE = re.compile(r"//[^\n]*")
 BACKTICKED = re.compile(r"`([A-Za-z_]\w*(?:::\w+)*)(?:\(\))?`")
 CALLED = re.compile(r"\b([a-z_]\w{3,})\s*\(\)")
 PRIVATE = re.compile(r"\b(_[a-z]\w{3,})\b")
-# Names this addon does not define and a comment is right to use anyway: engine and standard-library
-# members. Kept here rather than in a data file so the check's forgiveness is visible in the check.
+# Known engine and standard-library names allowed in comments.
 FOREIGN = {"_process", "_physics_process", "_process_message", "_execute_frame", "_notification",
            "is_in_tree", "try_lock", "strip", "decode_u16", "encode_u16", "get_format_pixel_size",
            "get_sample_view"}
-# The corpus is wider than src/: a comment that names a GDScript method or a test script is naming
-# something that exists. Only src/'s comments are read, though. It is rooted at the addon, not at
-# native/ - rooting it where this file lives made `tool_settings.gd:_on_picked()` report as stale,
-# because the editor scripts are one directory above.
+# Read comments in src/, but resolve names against the whole addon, including scripts and tests.
 CORPUS = (".cpp", ".h", ".glsl", ".gdshader", ".gd", ".py", ".tres")
 SKIP_DIRS = ("bin", "godot-cpp", ".git")
 ADDON = SRC.parent.parent
@@ -481,11 +380,9 @@ def comment_spans(text: str):
 
 
 def comments() -> None:
-    """Comment references to identifiers that exist nowhere in the addon.
+    """Find comment identifiers absent from addon code, except known external names.
 
-    Raw string literals are deliberately *not* masked here, unlike everywhere else in this file: the
-    shaders live inside them, so masking made this report every shader parameter (`p_world`,
-    `p_surface_texel`, `projectionAxis`) as stale - sixteen of its first twenty-nine candidates.
+    Keep raw strings visible because embedded shader identifiers belong to the corpus.
     """
     code_words = set()
     for path in ADDON.rglob("*"):
@@ -505,8 +402,7 @@ def comments() -> None:
                     name = match.group(1).split("::")[-1]
                     if name in code_words or name in FOREIGN:
                         continue
-                    # `*_sum_ms` in the cost banner is a glob over the field names that end in it,
-                    # not a name, and it is the only place a leading `*` reaches this check.
+                    # Ignore wildcard suffixes such as `*_sum_ms`.
                     if match.start() and body[match.start() - 1] == "*":
                         continue
                     line = first_line + body[:match.start()].count("\n")
@@ -518,8 +414,7 @@ def comments() -> None:
             [(name, ", ".join(sorted(hits[name])[:4])) for name in sorted(hits)])
 
 
-# A column-0 definition, and the keywords that also start a column-0 line inside a flush namespace
-# body but declare nothing.
+# Distinguish column-0 definitions from control flow and declarations in flush namespaces.
 DEFINITION_HEAD = re.compile(r"^[A-Za-z_][\w:<>,*&\s]*?(?:\w+::)?([A-Za-z_]\w*)\s*\(")
 NOT_A_FUNCTION = {"if", "for", "while", "switch", "return", "else", "do", "catch", "case", "break",
                   "continue", "class", "struct", "enum", "union", "typedef", "using", "template",
@@ -528,11 +423,9 @@ PARAMETER_NAME = re.compile(r"([A-Za-z_]\w*)\s*(?:\[\s*\])?\s*$")
 
 
 def code_only(text: str) -> str:
-    """Text with comments and string/character literals blanked, offsets and newlines kept.
+    """Blank comments and literals in one pass, preserving offsets and newlines.
 
-    One left-to-right pass rather than a chain of regexes, because the order matters: blanking `//`
-    first turns `"http://x"` into an unterminated string, and blanking quotes first lets a comment
-    that quotes something swallow the code below it.
+    Left-to-right scanning keeps comment markers inside strings from becoming comments.
     """
     out = []
     index = 0
@@ -545,9 +438,7 @@ def code_only(text: str) -> str:
             end = text.find("*/", index + 2)
             end = len(text) if end < 0 else end + 2
         elif text.startswith("R\"", index) and "(" in text[index:index + 18]:
-            # A raw string is not a literal the other branches can read: it spans lines, so stopping
-            # at the first newline left the embedded shaders in place, and the GLSL at column 0 -
-            # `layout(set = 0, binding = 0)` and friends - was read as this addon's definitions.
+            # Raw strings can contain multiline shaders; scan to the matching delimiter.
             paren = text.index("(", index)
             closing = ")" + text[index + 2:paren] + "\""
             found = text.find(closing, paren)
@@ -599,16 +490,7 @@ def split_parameters(text: str):
 
 
 def params() -> None:
-    """Parameters a definition accepts and never reads.
-
-    The compiler reports an unused parameter only under `-Wunused-parameter`, and a parameter that is
-    *dropped* on the way to the call it forwards to is not reported at all - the function works, it
-    just ignores what it was handed. `Terrain3DData::add_region_blankp()` was that: it took
-    `p_update`, exposed it to Godot as `update`, and forwarded the location without it, so
-    `add_region_blankp(pos, false)` rebuilt every map anyway. `Terrain3D::_svt_page_path()`'s `p_mip`
-    is the other shape - a parameter hard-coded to 0 in the body, which is a trap for the next caller
-    rather than information, and the compiler is happy with it too.
-    """
+    """Find unread parameters in definitions whose complete body fits a 12-line window."""
     reported = 0
     for path, text in sorted(FILES.items()):
         if path.suffix != ".cpp":
@@ -627,9 +509,7 @@ def params() -> None:
             open_at = joined.find("(")
             close_at = matching(joined, open_at, "(", ")")
             body_at = joined.find("{", close_at)
-            # A declaration ends in `;` before the brace, and the brace that follows belongs to the
-            # next definition: `Layout layout(...)` was read as a function whose body was the
-            # function after it, and every parameter name in it was then reported.
+            # A semicolon before the brace ends a declaration, not this function's signature.
             if ";" in joined[close_at:body_at]:
                 continue
             body_end = matching(joined, body_at, "{", "}") if body_at >= 0 else -1
@@ -652,49 +532,22 @@ def params() -> None:
 
 # A `namespace` or `extern "C"` body is written flush with the keyword, so its brace adds no level.
 FLUSH_BRACE = re.compile(r"\s*(namespace|extern)\b")
-# A line continues the previous one when the previous line left a parenthesis open or ended on an
-# operator. The parenthesis half alone reported every `a + b +` wrap in this tree as mis-indented.
+# Open parentheses and trailing operators permit continuation indentation.
 CONTINUATION = ("+", "-", "|", "&", ",", "=", "?", ":", "\\")
 BODY_HEAD = re.compile(r"^[A-Za-z_][\w:<>,*&\s]*?(?:\w+::)?([A-Za-z_]\w*)\s*\(")
 
 
 def indent() -> None:
-    """Mis-indented runs, bodies whose first statement is a level too deep, and misplaced comments.
+    """Report long indentation mismatches, misplaced first statements and column-0 comments.
 
-    Three checks in one pass, because each cannot see what the others do. The run check tolerates a
-    line at `expected + 1` when it continues the previous one - which is right, and is exactly why it
-    cannot see a body indented one level too deep: every one of its lines sits at `expected + 1`, and
-    the defect reads as a wrap. `_svt_walk_visible_pages()` was written that way for fifty-one lines
-    after being extracted from `_update_visible_svt()`, and the compiler has no opinion about it.
-
-    So the second check looks at the one line with a unique expected depth, the first statement of a
-    body, and the first check keeps looking everywhere else.
-
-    The third exists because comments are invisible to both: they read `code_only()`, where every
-    comment is blank. A comment left at column 0 inside an indented body is not a cosmetic detail -
-    it reads as if it belonged to the file rather than to the function around it - and one was
-    introduced by this pass's own comment rewrite in `terrain_3d_region.cpp`: three lines became two,
-    and the first lost its indentation. A column-0 `//` line whose nearest neighbour above *and* below
-    is indented is reported. Requiring both sides is what keeps the embedded-shader files clean, where
-    a column-0 comment sits between a column-0 `#include` and a column-0 `static const char *`.
-
-    A body written entirely on its opening line (`{ return x; }`) is skipped: it has no line of its
-    own to measure, and walking past it reported the *next* definition's column-0 signature instead.
-    An empty body's closing brace is skipped for the same reason.
+    Continuation lines may use one extra level. First statements are checked separately;
+    inline and empty bodies have no separate statement to measure. Comments are checked
+    against their nearest nonblank neighbors because code_only() masks them.
     """
     runs = []
     deep = []
     misplaced = []
-    # Comments are invisible to the two checks below by construction - both read `code_only()`, where
-    # every comment is blank - so a comment left at column 0 inside an indented body was unmeasurable.
-    # terrain_3d_region.cpp had one after a comment rewrite: three lines of explanation became two, and
-    # the first landed at column 0 while the code around it stayed two tabs in. The rule here is
-    # positional rather than syntactic: a comment at column 0 whose nearest neighbour above *and* below
-    # is indented is inside a body while written as if it were outside one. Requiring both sides is what
-    # keeps the embedded-shader files out of the report: there a column-0 comment sits between a
-    # column-0 `#include` line and a column-0 `static const char *`, which is where the preprocessor
-    # makes it belong. A namespace's members are flush with the keyword, so their comments follow a
-    # column-0 line too.
+    # Requiring indented neighbors on both sides excludes file/namespace-level shader comments.
     for path, text in sorted(FILES.items()):
         if path.suffix not in (".cpp", ".h"):
             continue
@@ -744,8 +597,7 @@ def indent() -> None:
                         stack.pop()
             parens = max(0, parens + code.count("(") - code.count(")"))
             carry = parens > 0 or code.rstrip().endswith(CONTINUATION)
-            # Part two: the first statement after a definition's opening brace. Only column-0 lines
-            # reach here, so this is a definition rather than a declaration inside a class body.
+            # Check the first statement of column-0 definitions separately from continuation runs.
             head = BODY_HEAD.match(code)
             if head and head.group(1) not in NOT_A_FUNCTION:
                 if code.split("::")[0].split() and code.split("::")[0].split()[0] in NOT_A_FUNCTION:
@@ -756,9 +608,7 @@ def indent() -> None:
                 body_at = window.find("{", close_at) if close_at >= 0 else -1
                 if body_at < 0 or ";" in window[close_at:body_at]:
                     continue
-                # The first statement may share the opening brace's line (`{ return x; }`). There is
-                # no separate line to measure, and continuing past it read the *next* definition's
-                # signature - a column-0 line - as this body's first statement.
+                # Inline bodies have no separate first-statement line to measure.
                 tail_at = window.find("\n", body_at)
                 tail = window[body_at + 1:tail_at if tail_at >= 0 else len(window)]
                 if tail.strip():

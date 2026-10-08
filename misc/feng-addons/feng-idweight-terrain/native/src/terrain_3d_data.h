@@ -163,12 +163,10 @@ private:
 	Ref<Image> _get_blank_slot_map(const int p_slot_map);
 	Ref<Image> _get_slot_map_image(const Terrain3DRegion *p_region, const int p_slot_map) const;
 	bool _sync_slot_map(const int p_slot_map);
-	static bool _slot_map_requested(const MapType p_map_type, const int p_slot_map);
 	static int _slot_map_mask(const MapType p_map_type);
 	// Samples whichever region owns a world position, on that region's density grid.
 	// Page border texels belong to the neighbouring regions, so this is what keeps a
 	// page seam reading real data instead of a copy of the page's own edge.
-	uint16_t _sample_payload_world(const real_t p_world_x, const real_t p_world_z) const;
 
 	// Editing occurs on the Image arrays above, which are converted to Texture arrays
 	// below for the shader.

@@ -5,6 +5,7 @@ extends Node3D
 ## records scene geometry around the chosen position; capture_sky supplies only
 ## the infinitely distant capture background.
 
+const AtmosphereRuntime = preload("res://addons/feng-sky/feng_sky_runtime.gd")
 const Runtime = preload("res://addons/feng-sky/feng_sky_light_runtime.gd")
 const NativeAdapter = preload("res://addons/feng-sky/feng_sky_light_native_adapter.gd")
 const CubemapAdapter = preload("res://addons/feng-sky/feng_sky_light_cubemap_adapter.gd")
@@ -13,7 +14,6 @@ const FogRuntimePath := "res://addons/feng-fog/feng_fog_runtime.gd"
 const CloudRuntimePath := "res://addons/feng-cloud/feng_cloud_runtime.gd"
 const CaptureEffectPath := "res://addons/feng-sky/feng_sky_light_capture_effect.gd"
 const PANORAMA_SIZE := Vector2i(64, 32)
-const ROUTE_REFRESH_MSEC := 500
 const NATIVE_POLL_MSEC := 100
 const ENVIRONMENT_CHECK_MSEC := 250
 
@@ -169,14 +169,12 @@ var _capture_native_signature: Array = []
 var _capture_fog_effect: CompositorEffect
 var _capture_fog_effect_prepared := false
 var _capture_fog_effect_active := false
-var _capture_fog_effect_leases: Array[CompositorEffect] = []
 var _provider_active := false
 var _external_radiance_enabled := false
 var _native_radiance_ready := false
 var _native_radiance_revision := -1
 var _native_radiance_exposure := 1.0
 var _next_capture_msec := 0
-var _next_route_scan_msec := 0
 var _next_environment_check_msec := 0
 var _next_radiance_poll_msec := 0
 var _last_projected_revision := -1
@@ -259,10 +257,6 @@ func _process(_delta: float) -> void:
 				_mark_capture_dirty(true, true, true)
 	if not _provider_active:
 		return
-	if now >= _next_route_scan_msec:
-		_next_route_scan_msec = now + ROUTE_REFRESH_MSEC
-		_sync_viewport_routes()
-		_sync_frp_sources()
 	if _uses_probe_capture() and realtime_capture \
 			and now >= _next_capture_msec:
 		if not _capture_in_flight or not _capture_snapshot_after_inflight:
@@ -286,11 +280,7 @@ func _process(_delta: float) -> void:
 
 func recapture() -> void:
 	_explicit_capture_authorized = true
-	if source_mode == SourceMode.CAPTURED_SCENE:
-		_queue_scene_capture()
-		if _provider_active:
-			_sync_active_source()
-	elif source_mode == SourceMode.SPECIFIED_CUBEMAP:
+	if source_mode == SourceMode.SPECIFIED_CUBEMAP:
 		_force_cubemap_refresh()
 	else:
 		_queue_scene_capture()
@@ -558,9 +548,9 @@ func _feng_sky_light_set_active(active: bool) -> void:
 		_capture_environment_snapshot_pending = _capture_request_pending
 		_cubemap_dirty = source_mode == SourceMode.SPECIFIED_CUBEMAP
 		_next_capture_msec = 0
-		_next_route_scan_msec = 0
 		_connect_tree_signals()
-		_sync_viewport_routes(true)
+		if _snapshot_worlds != null:
+			_snapshot_worlds.call("scan", get_tree().root, self)
 		_sync_active_source()
 		_poll_external_radiance()
 		_sync_frp_sources()
@@ -588,7 +578,6 @@ func _feng_sky_light_refresh_active() -> void:
 	if not _provider_active:
 		return
 	_sync_active_source()
-	_sync_viewport_routes()
 	_poll_external_radiance()
 	_sync_frp_sources()
 
@@ -811,7 +800,7 @@ func _prepare_capture_fog_effect() -> void:
 		return
 	var world_id := world.get_instance_id()
 	var fog_snapshot := _fog_snapshot_for_world(world_id)
-	var atmosphere_snapshot := _atmosphere_snapshot_for_world(world_id)
+	var atmosphere_snapshot := AtmosphereRuntime.rendering_snapshot_for_world(world_id)
 	var cloud_snapshot := _cloud_snapshot_for_world(world_id)
 	if fog_snapshot.is_empty() and atmosphere_snapshot.is_empty() and cloud_snapshot.is_empty():
 		_clear_cached_capture_fog_snapshots()
@@ -863,17 +852,6 @@ func _fog_snapshot_for_world(world_id: int) -> Dictionary:
 	return {}
 
 
-func _atmosphere_snapshot_for_world(world_id: int) -> Dictionary:
-	var path := "res://addons/feng-sky/feng_sky_runtime.gd"
-	if not ResourceLoader.exists(path):
-		return {}
-	var runtime: Variant = load(path)
-	if not runtime is Script or not runtime.has_method("rendering_snapshot_for_world"):
-		return {}
-	var snapshot: Variant = runtime.call("rendering_snapshot_for_world", world_id)
-	return snapshot.duplicate(true) if snapshot is Dictionary else {}
-
-
 func _ensure_capture_probe() -> void:
 	if _capture_probe != null and is_instance_valid(_capture_probe):
 		return
@@ -906,8 +884,7 @@ func _remove_capture_probe() -> void:
 
 
 func _retire_capture_fog_effects() -> void:
-	var effects := _capture_fog_effect_leases.duplicate()
-	_capture_fog_effect_leases.clear()
+	var effects: Array[CompositorEffect] = []
 	if _capture_fog_effect != null and is_instance_valid(_capture_fog_effect):
 		effects.append(_capture_fog_effect)
 	_capture_fog_effect = null
@@ -948,7 +925,6 @@ func _complete_inflight_capture(now_msec: int) -> void:
 		return
 	_capture_in_flight = false
 	_capture_submitted_revision = -1
-	_capture_fog_effect_leases.clear()
 	_next_capture_msec = now_msec + int(capture_interval * 1000.0)
 	if _capture_request_pending and _capture_snapshot_after_inflight:
 		_capture_environment_snapshot_pending = true
@@ -1031,7 +1007,7 @@ func _on_scene_node_added(node: Node) -> void:
 	if not _provider_active or _snapshot_worlds == null or not node is Viewport:
 		return
 	_snapshot_worlds.call("register_viewport", node, self)
-	_next_route_scan_msec = 0
+	_next_radiance_poll_msec = 0
 
 
 func _on_scene_node_removed(node: Node) -> void:
@@ -1043,44 +1019,21 @@ func _on_scene_node_removed(node: Node) -> void:
 		NativeAdapter.clear_frp_source(target, get_instance_id())
 		_registered_targets.erase(target)
 	_snapshot_worlds.call("unregister_viewport", viewport, self)
-	_next_route_scan_msec = 0
-
-
-func _sync_viewport_routes(force_scan: bool = false) -> void:
-	if not _provider_active or _snapshot_worlds == null:
-		return
-	var tree := get_tree()
-	if tree == null:
-		return
-	if force_scan:
-		_snapshot_worlds.call("scan", tree.root, self)
-	var world := get_world_3d()
-	if world == null:
-		return
-	var targets: Variant = _snapshot_worlds.call("targets_for", world)
-	var desired: Array[RID] = []
-	if targets is Array:
-		for target in targets:
-			if target is RID and target.is_valid() and not desired.has(target):
-				desired.append(target)
-	for target in _registered_targets.duplicate():
-		if not desired.has(target):
-			NativeAdapter.clear_frp_source(target, get_instance_id())
-			_registered_targets.erase(target)
-			_last_registration_signature.clear()
+	_next_radiance_poll_msec = 0
 
 
 func _sync_frp_sources() -> void:
-	if not _provider_active or not _native_radiance_ready \
-			or _native_radiance_revision < 0 or not NativeAdapter.supports_frp_registration():
+	if not _provider_active:
 		return
 	var world := get_world_3d()
-	if world == null:
-		_clear_render_target_routes()
-		return
-	var targets: Variant = _snapshot_worlds.call("targets_for", world) \
-			if _snapshot_worlds != null else []
-	if not targets is Array:
+	var targets: Array[RID] = _snapshot_worlds.call("targets_for", world) \
+			if _snapshot_worlds != null and world != null else []
+	for target in _registered_targets.duplicate():
+		if not targets.has(target):
+			NativeAdapter.clear_frp_source(target, get_instance_id())
+			_registered_targets.erase(target)
+	if not _native_radiance_ready or _native_radiance_revision < 0 \
+			or not NativeAdapter.supports_frp_registration():
 		return
 	var signature: Array = [
 		_native_radiance_revision, _native_radiance_exposure,
@@ -1088,8 +1041,6 @@ func _sync_frp_sources() -> void:
 	var needs_all_targets := signature != _last_registration_signature
 	var all_registered := true
 	for target in targets:
-		if not target is RID or not target.is_valid():
-			continue
 		if not needs_all_targets and _registered_targets.has(target):
 			continue
 		if NativeAdapter.register_frp_source(target, get_instance_id(), _output_sky,

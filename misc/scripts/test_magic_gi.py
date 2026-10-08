@@ -18,10 +18,11 @@ args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="magic-gi-tests-", dir=ROOT / "bin"))
 addons = project / "addons"
 addons.mkdir()
-for name in ("feng-render-pipeline", "feng-magic-gi"):
+selected_addons = ("feng-render-pipeline", "feng-magic-gi", "feng-fog", "feng-sky", "feng-cloud")
+for name in selected_addons:
     shutil.copytree(ROOT / "misc/feng-addons" / name, addons / name)
 for addon in (ROOT / "misc/feng-addons").iterdir():
-    if addon.name not in {"feng-render-pipeline", "feng-magic-gi"} and (addon / "plugin.cfg").is_file():
+    if addon.name not in selected_addons and (addon / "plugin.cfg").is_file():
         placeholder = addons / addon.name
         placeholder.mkdir()
         (placeholder / ".gdignore").touch()
@@ -45,9 +46,9 @@ if args.binary:
 elif os.name == "nt":
     binary = ROOT / "bin/godot.windows.editor.x86_64.exe"
 else:
-    binary = ROOT / "bin/godot.linuxbsd.editor.dev.x86_64"
+    binary = ROOT / "bin/godot.linuxbsd.editor.x86_64"
 base = [str(binary), "--path", str(project), "--rendering-method", "frp",
-        "--rendering-driver", args.driver, "--resolution", "320x240",
+        "--rendering-driver", args.driver, "--audio-driver", "Dummy", "--resolution", "320x240",
         "--position", "-10000,-10000"]
 if args.xvfb:
     base = ["xvfb-run", "-a"] + base

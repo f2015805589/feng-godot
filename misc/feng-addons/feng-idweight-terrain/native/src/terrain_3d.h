@@ -202,6 +202,7 @@ private:
 	Node3D *_label_parent;
 
 	void _initialize();
+	void _set_resource_signals(bool p_connected);
 	void __physics_process(const double p_delta);
 	void _update_render_geometry();
 	void _invalidate_render_geometry();

@@ -151,13 +151,8 @@ struct FengCloudNativeShadowData {
 	layout(set = 0, binding = 7) uniform sampler2D cloud_weather_texture
 #define FENG_CLOUD_DECLARE_CURL_TEXTURE \
 	layout(set = 0, binding = 8) uniform sampler3D cloud_curl_texture
-#if FENG_CLOUD_UE58_LAYOUT_INPUTS
 #define FENG_CLOUD_DECLARE_UE58_LAYOUT_TEXTURES
 #define FENG_CLOUD_DECLARE_UE58_TIME
-#else
-#define FENG_CLOUD_DECLARE_UE58_LAYOUT_TEXTURES
-#define FENG_CLOUD_DECLARE_UE58_TIME
-#endif
 #define FENG_CLOUD_DECLARE_ATMOSPHERE_TEXTURES \
 	layout(set = 0, binding = 9) uniform sampler2D cloud_atmosphere_optical_texture; \
 	layout(set = 0, binding = 10) uniform sampler2D cloud_atmosphere_multiple_texture

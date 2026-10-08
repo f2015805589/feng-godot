@@ -154,59 +154,23 @@ String Terrain3DMaterial::_apply_inserts(const String &p_shader, const Array &p_
 }
 
 void Terrain3DMaterial::_append_layout_excludes(Array &excludes) const {
-	switch (_max_regions) {
-		case MAX_REGIONS_64:
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_128:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_256:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_512");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_512:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_1024");
-			break;
-		case MAX_REGIONS_1024:
-			excludes.push_back("MAX_REGIONS_64");
-			excludes.push_back("MAX_REGIONS_128");
-			excludes.push_back("MAX_REGIONS_256");
-			excludes.push_back("MAX_REGIONS_512");
-			break;
+	for (int size : { 64, 128, 256, 512, 1024 }) {
+		if (size != _max_regions) {
+			excludes.push_back("MAX_REGIONS_" + String::num_int64(size));
+		}
 	}
-	switch (_texture_filtering) {
-		case LINEAR_ANISOTROPIC:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			break;
-		case LINEAR:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
-		case NEAREST_ANISOTROPIC:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
-		case NEAREST:
-			excludes.push_back("TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR");
-			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
-			break;
+	const char *samplers[] = {
+		"TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC",
+		"TEXTURE_SAMPLERS_LINEAR",
+		"TEXTURE_SAMPLERS_NEAREST_ANISOTROPIC",
+		"TEXTURE_SAMPLERS_NEAREST",
+	};
+	if (_texture_filtering >= LINEAR_ANISOTROPIC && _texture_filtering <= NEAREST) {
+		for (int mode = LINEAR_ANISOTROPIC; mode <= NEAREST; ++mode) {
+			if (mode != _texture_filtering) {
+				excludes.push_back(samplers[mode]);
+			}
+		}
 	}
 }
 

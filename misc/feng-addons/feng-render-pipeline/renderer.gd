@@ -161,14 +161,10 @@ func _make_default_implementation(native_id: int) -> PassBase:
 	fallback.resource_name = NativeSpec.pass_name(native_id)
 	return fallback
 
-func _set_passes(value: Array, emit: bool) -> void:
+func _set_passes(value: Array[PassBase], emit: bool) -> void:
 	_seed_pending = false
-	var next: Array[PassBase] = []
-	for value_pass in value:
-		if value_pass == null or value_pass is PassBase:
-			next.append(value_pass)
 	_disconnect_passes()
-	_passes = next
+	_passes = value.duplicate()
 	# The loader can read exported defaults before restoring the old pass
 	# array. Discard constructor-seed migration state for a legacy array;
 	# serialized manifest/schema properties are restored after this setter.
@@ -198,15 +194,11 @@ func _connect_passes() -> bool:
 ## it. Without observing them, editing an exposed parameter or switching the carried
 ## pass off would only reach the engine on the next unrelated change - and the entry's
 ## enabled state, which follows the chain, would look stale.
-func _observe_pass(pass_entry) -> bool:
+func _observe_pass(pass_entry: PassBase) -> bool:
 	if pass_entry == null:
 		return false
-	var changed := false
-	# A persisted library pass may predate the current shader's texture bindings.
-	# Repair only that fixed contract while its renderer schedule is being observed
-	# on the main thread; never rewrite authored parameters or enabled state here.
-	if pass_entry.has_method("ensure_frp_contract"):
-		changed = bool(pass_entry.call("ensure_frp_contract"))
+	# Repair persisted shader bindings on the main thread before observing changes.
+	var changed := pass_entry.ensure_frp_contract()
 	if _observed_passes.has(pass_entry):
 		return changed
 	if pass_entry.stable_id == &"":
@@ -219,16 +211,15 @@ func _observe_pass(pass_entry) -> bool:
 			pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
 			break
 	_observed_passes.append(pass_entry)
-	if pass_entry.has_signal("changed") and not pass_entry.changed.is_connected(_on_pass_changed):
+	if not pass_entry.changed.is_connected(_on_pass_changed):
 		pass_entry.changed.connect(_on_pass_changed)
-	if pass_entry.has_method("carried_passes"):
-		for carried in pass_entry.carried_passes():
-			changed = _observe_pass(carried) or changed
+	for carried in pass_entry.carried_passes():
+		changed = _observe_pass(carried) or changed
 	return changed
 
 func _disconnect_passes() -> void:
 	for pass_entry in _observed_passes:
-		if pass_entry != null and pass_entry.has_signal("changed") and pass_entry.changed.is_connected(_on_pass_changed):
+		if pass_entry.changed.is_connected(_on_pass_changed):
 			pass_entry.changed.disconnect(_on_pass_changed)
 	_observed_passes.clear()
 
@@ -269,7 +260,7 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 	# Synchronize missing managed passes first so legacy schedules that lacked one of
 	# the stock cloud entries can be recognized after the dependency-aware insertion.
 	if previous_version < 10:
-		changed = _migrate_legacy_cloud_fog_order() or changed
+		changed = PipelineMigrator.migrate_cloud_fog_order(_passes) or changed
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
@@ -284,23 +275,6 @@ func _has_native_entries() -> bool:
 		if pass_entry is BuiltinPass:
 			return true
 	return false
-
-## The object that owns a pass entry's resource contract (see FengPass and
-## FengBuiltinPass): the pass script that implements the entry, or the overlay it
-## delegates to.
-func _contract_source(pass_entry):
-	if pass_entry == null:
-		return null
-	if pass_entry.has_method("get_contract_source"):
-		var resolved = pass_entry.get_contract_source()
-		if resolved != null:
-			return resolved
-	return pass_entry
-
-## A pass the addon runs: a custom pass, or a native entry whose implementation is a
-## pass script. Everything else is executed by the engine's own token.
-func _is_scripted(pass_entry) -> bool:
-	return ExecutionPlan.is_scripted(pass_entry)
 
 ## Native passes the authored list provides through pass scripts, i.e. the passes the
 ## engine has no token for. A pass that runs an engine entry's work itself declares
@@ -431,10 +405,7 @@ func _migrate_native_pass_set() -> bool:
 			if mapped_id == NativeSpec.PASS_TEMPORAL_AA:
 				had_temporal_aa = true
 				break
-	var migrated: Array[PassBase] = []
-	for p in PipelineMigrator.migrate_native_pass_set(_passes, NativeSpec.seed_order(), _make_native_pass):
-		if p is PassBase:
-			migrated.append(p)
+	var migrated := PipelineMigrator.migrate_native_pass_set(_passes, NativeSpec.seed_order(), _make_native_pass)
 	if not had_temporal_aa:
 		for pass_entry in migrated:
 			if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_TEMPORAL_AA:
@@ -500,99 +471,6 @@ func _migrate_bloom_pass() -> bool:
 	_passes.insert(insert_index, _make_native_pass(NativeSpec.PASS_BLOOM))
 	return true
 
-## Schema 10 repairs only the released contiguous stock order. Projects that have
-## moved, replaced, duplicated, or interleaved any of these entries keep their order.
-func _migrate_legacy_cloud_fog_order() -> bool:
-	var cloud_template_script := _stock_library_script("cloud/volumetric_cloud.tres")
-	var trace_template_script := _stock_library_script("cloud/cloud_trace.tres")
-	var fog_template_script := _stock_library_script("height-fog/height_fog.tres")
-	if cloud_template_script == null or trace_template_script == null or fog_template_script == null:
-		return false
-	var cloud_script_indices := _pass_indices_for_script(cloud_template_script)
-	var trace_script_indices := _pass_indices_for_script(trace_template_script)
-	var fog_script_indices := _pass_indices_for_script(fog_template_script)
-	if cloud_script_indices.size() != 1 or trace_script_indices.size() != 1 or fog_script_indices.size() != 1:
-		return false
-
-	var sky_index := -1
-	var cloud_index := -1
-	var trace_index := -1
-	var fog_index := -1
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry is BuiltinPass and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_SKY:
-			if sky_index >= 0:
-				return false
-			sky_index = i
-		elif pass_entry == null:
-			continue
-		elif pass_entry.stable_id == &"library:volumetric_cloud":
-			if cloud_index >= 0:
-				return false
-			cloud_index = i
-		elif pass_entry.stable_id == &"library:cloud_trace":
-			if trace_index >= 0:
-				return false
-			trace_index = i
-		elif pass_entry.stable_id == &"library:height_fog":
-			if fog_index >= 0:
-				return false
-			fog_index = i
-	if sky_index < 0 or cloud_index < 0 or trace_index < 0 or fog_index < 0:
-		return false
-	if cloud_index != sky_index + 1 or trace_index != cloud_index + 1 or fog_index != trace_index + 1:
-		return false
-
-	var sky_entry := _passes[sky_index] as BuiltinPass
-	if sky_entry.stable_id != "native:%d" % NativeSpec.PASS_SKY or sky_entry.implementation == null:
-		return false
-	var sky_script := sky_entry.implementation.get_script() as Script
-	if sky_script == null or sky_script.resource_path != FengAddonLayout.passes_dir() + "native/sky_pass.gd":
-		return false
-	if sky_entry.implementation.get("overlay") != null:
-		return false
-	if not _matches_stock_library_script(_passes[cloud_index], "cloud/volumetric_cloud.tres"):
-		return false
-	if not _matches_stock_library_script(_passes[trace_index], "cloud/cloud_trace.tres"):
-		return false
-	if not _matches_stock_library_script(_passes[fog_index], "height-fog/height_fog.tres"):
-		return false
-	if cloud_index != cloud_script_indices[0] or trace_index != trace_script_indices[0] \
-			or fog_index != fog_script_indices[0]:
-		return false
-
-	var trace_pass: PassBase = _passes[trace_index]
-	_passes[trace_index] = _passes[fog_index]
-	_passes[fog_index] = trace_pass
-	return true
-
-func _matches_stock_library_script(pass_entry: PassBase, template_path: String) -> bool:
-	var template_script := _stock_library_script(template_path)
-	if template_script == null:
-		return false
-	var pass_script: Script = null
-	if pass_entry != null:
-		pass_script = pass_entry.get_script() as Script
-	return pass_script != null and pass_script.resource_path == template_script.resource_path
-
-func _stock_library_script(template_path: String) -> Script:
-	var template: Variant = load(FengAddonLayout.library_dir() + "/" + template_path)
-	if not template is Resource:
-		return null
-	var template_script := template.get_script() as Script
-	return template_script
-
-func _pass_indices_for_script(target_script: Script) -> Array[int]:
-	var indices: Array[int] = []
-	for i in _passes.size():
-		var pass_entry := _passes[i]
-		if pass_entry == null:
-			continue
-		var pass_script := pass_entry.get_script() as Script
-		if pass_script != null and pass_script.resource_path == target_script.resource_path:
-			indices.append(i)
-	return indices
-
 func _normalize_native_entries() -> bool:
 	var changed := false
 	for pass_entry in _passes:
@@ -651,11 +529,8 @@ func _seed_insert_index(native_id: int) -> int:
 	return _passes.size()
 
 func _migrate_legacy_passes() -> bool:
-	var migrated: Array[PassBase] = []
-	for p in PipelineMigrator.migrate_legacy_passes(_passes, NativeSpec.seed_order(), NativeSpec.is_optional_id, _make_native_pass):
-		if p is PassBase:
-			migrated.append(p)
-	_set_passes(migrated, false)
+	_set_passes(PipelineMigrator.migrate_legacy_passes(
+		_passes, NativeSpec.seed_order(), NativeSpec.is_optional_id, _make_native_pass), false)
 	return true
 
 func _sync_library(emit: bool) -> bool:
@@ -717,10 +592,9 @@ func apply(compositor: Compositor) -> void:
 		_passes,
 		schedule,
 		candidate_warnings,
-		_contract_source,
 		_is_entry_enabled,
-		func(): return provided,
-		func(): return parameters
+		provided,
+		parameters
 	)
 	if result.applied:
 		_last_valid_schedule = result["tokens"]
@@ -771,13 +645,13 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 	var enabled_fn := func(entry): return ExecutionPlan.is_entry_enabled(entry, states)
 	var provided := ExecutionPlan.provided_native_ids(_passes, enabled_fn)
 	var declared := ExecutionPlan.declared_provided_ids(_passes, enabled_fn)
-	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn, _contract_source, _is_scripted)
+	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn)
 	warnings = _with_bloom_eye_order_warning(warnings, enabled_fn)
 	if not warnings.is_empty():
 		return {"warnings": warnings}
 	# Effect slot zero belongs to each view's texture manager. Build keeps custom
 	# token indices based at one even when the manager is omitted here.
-	var schedule := ExecutionPlan.build(_passes, null, _is_scripted, enabled_fn)
+	var schedule := ExecutionPlan.build(_passes, null, enabled_fn)
 	var provided_ids := PackedInt32Array()
 	for native_id in provided:
 		provided_ids.append(native_id)
@@ -805,7 +679,7 @@ func is_view_shareable(entry: FengPass) -> bool:
 ## name per executed entry, in order, with the texture manager first. Both lists come
 ## from the same walk, so they cannot drift apart.
 func _build_schedule() -> Dictionary:
-	return ExecutionPlan.build(_passes, _manager, _is_scripted, _is_entry_enabled)
+	return ExecutionPlan.build(_passes, _manager, _is_entry_enabled)
 
 func get_execution_tokens() -> PackedInt32Array:
 	_ensure_pipeline_initialized(false)
@@ -822,9 +696,7 @@ func _validate_schedule() -> PackedStringArray:
 		_passes,
 		_provided_native_ids(),
 		_declared_provided_ids(),
-		_is_entry_enabled,
-		_contract_source,
-		_is_scripted
+		_is_entry_enabled
 	)
 	return _with_bloom_eye_order_warning(warnings, _is_entry_enabled)
 

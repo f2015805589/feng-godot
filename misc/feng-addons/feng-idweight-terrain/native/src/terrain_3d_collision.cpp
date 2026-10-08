@@ -249,7 +249,7 @@ void Terrain3DCollision::update(const Vector2i &p_region_loc, const bool p_rebui
 		LOG(EXTREME, "Updating collision at ", snapped_pos);
 
 		// Return if target hasn't moved to next grid slot
-		if (!p_rebuild && (_last_snapped_pos - snapped_pos).length_squared() == 0) {
+		if (!p_rebuild && _last_snapped_pos == snapped_pos) {
 			return;
 		}
 

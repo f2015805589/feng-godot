@@ -37,8 +37,7 @@ material option applies to FRP.
 | 2 — Quarter trace + full temporal resolve | Quarter-resolution tracing with full-resolution temporal reconstruction. |
 | 3 — Full trace | Full-resolution tracing without temporal history; used for SkyLight captures. |
 
-These modes trade tracing and reconstruction work; they are not claims of
-pixel-identical UE output. The FRP shadow pass supplies cloud shadows and Sky AO
+These modes trade tracing and reconstruction work. The FRP shadow pass supplies cloud shadows and Sky AO
 to their supported lighting consumers. Cloud rendering keeps radiance,
 transmittance, and depth data separate so opaque composition and eligible
 transparent surfaces can use the cloud depth.
@@ -66,19 +65,23 @@ the source's pixel coordinates and 8-frame phase; SkyLight captures use the
 midpoint sample. This records the source payload and addressing contract, not
 an across-platform UE cooked-pixel identity claim.
 
-This README describes implemented paths, not a claim that every configuration
-has passed independent validation or matches UE pixel for pixel.
-
-The final matched performance pair shows a lower moving cloud-on CPU median
-than the earlier baseline, while GPU median and p95 are effectively unchanged;
-it does not establish a GPU speedup or that editor stalls are resolved. The
-D3D12 mode-0 core smoke, targeted mode-2 history and orthographic fallback
-smokes, PCK resource closure, and schema CPU gate passed. The broader
-cross-mode/view/scene matrix remains pending; see the parity report.
-
 The editor export plugin explicitly packages the runtime shader source and its
 recursive include files, along with the default material and converted texture
 resources.
 
-For the checked UE 5.8 source comparison and performance measurements, see
+UE pixel equivalence is unverified. For dated source comparisons, measured performance
+and the tested/pending validation matrix, see
 [UE 5.8 parity and performance](docs/ue58-parity-performance.md).
+
+## Contract tests
+
+In an isolated imported project containing Feng Cloud and FRP, use a rebuilt Feng editor:
+
+```sh
+/path/to/godot --headless --path /path/to/project --script res://addons/feng-cloud/tests/test_cloud_contract.gd
+/path/to/godot --path /path/to/project --rendering-method frp --rendering-driver vulkan --script res://addons/feng-cloud/tests/test_cloud_contract.gd -- --gpu
+```
+
+The headless gate checks native atmosphere packet/LUT access and clearing. The GPU gate
+also checks pass-owned resources, cleanup and destruction. The dated parity report lists
+separate transport/image tests and the remaining cross-mode validation scope.

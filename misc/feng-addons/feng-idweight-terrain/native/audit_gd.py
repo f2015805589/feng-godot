@@ -1,69 +1,30 @@
-"""Read-through helpers for the addon's GDScript half.
+"""Read-only, heuristic audits of addon GDScript; not a parser or test suite.
 
-The companion to audit_code.py, and it exists for the same reason: the architecture pass has to answer
-questions about eight thousand lines of script without reading all of them twice by eye. It is not part
-of the test suite and nothing runs it.
+    python audit_gd.py shape              script sizes and long functions
+    python audit_gd.py outline <file.gd>  function names, line numbers and sizes
+    python audit_gd.py dead               functions and signals without references
+    python audit_gd.py state              unused, read-only or write-only members
+    python audit_gd.py params             parameters without body references
+    python audit_gd.py dupes              repeated normalized function text
+    python audit_gd.py comments           comments naming absent identifiers
+    python audit_gd.py indent             mixed tabs and spaces
 
-    python audit_gd.py shape                  what each script holds, and what outgrew it
-    python audit_gd.py outline <file.gd>      one script's functions, with line numbers and sizes
-    python audit_gd.py dead                   functions and signals nothing references
-    python audit_gd.py state                  members read but never assigned, or the other way round
-    python audit_gd.py params                 parameters a body never reads
-    python audit_gd.py dupes                  function bodies written more than once
-    python audit_gd.py comments               comments naming identifiers that no longer exist
-    python audit_gd.py indent                 indentation that mixes tabs and spaces, or skips a level
-
-Three things about GDScript make the checks in here harder than their C++ counterparts, and each one is
-the reason for a rule:
-
-* A method can be reached without its name appearing in any expression. The engine calls `_ready()`,
-  `_process()` and every `_on_*` a scene connects; `call("name")`, `has_method("name")` and
-  `connect("name", ...)` reach a method through a *string*; and a property's accessor is named by the
-  `var x: set = set_x` that declares it. `dead` therefore counts string literals and the addon's
-  `.tscn` / `.tres` files as references, and skips anything whose name starts with `_`.
-* GDScript has no unused-parameter warning either, and signal handlers are *required* to take the
-  arguments their signal carries. The convention that distinguishes "unused because the signature
-  requires it" from "unused because nobody checked" is the leading underscore, so `params` reports only
-  parameters that are neither read nor `_`-prefixed.
-* Comments are prose. `comments` checks only the three forms that are unambiguously about code - a
-  backticked name, a `name()` call, and a `_private_name` - because checking every word reports the
-  English language.
-
-`dead` reports candidates, not verdicts. A function called only through `Callable` built from a
-concatenated string, or only from a project outside this addon, is live and looks dead here.
-
-What it found on the first run, and what each answer turned out to be worth:
-
-* `dupes` reported nine functions written twice - all of them in `asset_dock.gd` and `asset_dock_45.gd`,
-  the two dock versions. That is the finding this tool was written for, and it is fixed: the twelve
-  duplicated functions are now `src/asset_dock_common.gd`, and this mode is empty.
-* `comments` found `_input_apply` in `editor_plugin.gd` (no such method) and the commented-out
-  `class EdDock` block in `asset_dock.gd`. Both are fixed; the two false-positive rules above came from
-  the same run.
-* `dead` found four unreferenced accessors - `DoubleSlider.get_min()` / `get_max()` / `get_step()` and
-  `Terrain3DAssetDockContainer.get_entry_width()` - and they are *kept*: each is the read half of a
-  setter the addon calls, on a `class_name`d widget that ships to users. Unreferenced by the addon is not
-  the same as unreachable.
-* `params`, `indent` and the rest of `dupes` are clean, which is itself the answer: the script half had
-  not been drifting in any other way.
-* `state` found `last_opened_directory` in `menu/channel_packer.gd` (read once, assigned nowhere) and two
-  members that were declared and used nowhere at all, `current_region_position` in `editor_plugin.gd` and
-  `setting_has_changed` in `ui.gd`. The two declarations are deleted; the first is recorded, because
-  either fix - removing the read or adding the writer the line implies - changes what the dialog does.
+Reports are review candidates. Dynamic/external calls and shadowed names can defeat name-based
+checks. Dead-symbol searches count strings, scenes, resources and native/test references, but skip
+underscore-prefixed names. State checks skip exported members and count member access or quoted
+names as usage. The parameter scan includes the signature, so it can miss unused parameters.
+Duplicate matching includes signatures and masks string contents; inspect candidates before editing.
+Scanners assume this addon's formatting and do not fully parse multiline strings or expressions.
 """
 import re
 import sys
 from pathlib import Path
 
 ADDON = Path(__file__).parent.parent
-# `native/tests` is the pass's own suite, not the addon's script half, and its assertions and
-# thresholds are frozen - so it is not audited. It *is* searched for references, because a method only
-# a test calls is not dead. `extras/3rd_party` is vendored example code, not this addon's to clean.
+# Tests and vendored examples supply references but are not audited.
 SKIP_DIRS = ("bin", "godot-cpp", ".git", "csharp")
 AUDITED_SKIP = ("bin", "godot-cpp", ".git", "csharp", "tests", "3rd_party")
-# The pass's own readers are prose about the code, and their prose names what they are looking for:
-# counting them as references made this file's own finding - "get_min() is unreferenced" - the reason
-# get_min() stopped being reported as unreferenced.
+# Exclude audit prose so naming an unused symbol here does not make it appear used.
 TOOL_FILES = {"audit_gd.py", "audit_code.py", "check_scripts.py"}
 GD = {}
 REFERENCES = ""
@@ -73,8 +34,7 @@ for path in sorted(ADDON.rglob("*")):
     if path.suffix == ".gd" and not any(part in AUDITED_SKIP for part in path.parts):
         GD[path] = path.read_text(encoding="utf-8", errors="replace")
     elif path.suffix in (".tscn", ".tres", ".cfg", ".cs", ".cpp", ".h", ".glsl", ".py", ".gd"):
-        # The C++ half reaches script methods through `call("name")` and `has_method("name")`, and the
-        # suite reaches them directly, so both are reference sources for `dead`.
+        # Native dynamic calls and test calls are valid references.
         REFERENCES += path.read_text(encoding="utf-8", errors="replace") + "\n"
 
 FUNCTION_CEILING = 60
@@ -85,12 +45,9 @@ NAMED = re.compile(r"^(?:[ \t]*)(?:class_name|var|const|enum)\s+([A-Za-z_]\w*)")
 
 
 def code_only(text: str, strings: bool = True) -> str:
-    """Blank comments and string bodies, keeping every offset and newline.
+    """Blank comments and string bodies in one pass, preserving offsets and newlines.
 
-    A `#` inside a string is not a comment and a quote inside a comment is not a string, so this is one
-    left-to-right pass rather than two regexes in either order. With `strings=False` the string
-    *contents* survive and only comments are blanked, which is how `comments` collects the names the
-    code reaches through a string.
+    With strings=False, keep string contents available for dynamic-name searches.
     """
     out = list(text)
     index = 0
@@ -103,7 +60,7 @@ def code_only(text: str, strings: bool = True) -> str:
                 out[i] = " "
             index = end
         elif char in "\"'":
-            # GDScript has no escapes beyond \\ and \", and both are handled by skipping one char.
+            # Skip escaped characters while searching for the closing quote.
             quote = char
             index += 1
             while index < len(text):
@@ -166,8 +123,7 @@ def symbols():
     return names
 
 
-# What a comment may legitimately name without the addon declaring it: engine API, GDScript builtins and
-# vocabulary that happens to be underscored. Every entry here is a false positive that was checked.
+# Known engine, native-addon and GDScript names allowed in comments.
 FOREIGN = {
     "call_deferred", "callv", "set_deferred", "get_node", "add_child", "queue_free", "is_instance_valid",
     "instantiate", "get_tree", "create_tween", "connect", "disconnect", "is_connected", "emit_signal",
@@ -196,8 +152,7 @@ COMMENT_FORMS = (
     re.compile(r"\b([a-z_]\w{3,})\s*\(\)"),
     re.compile(r"\b(_[a-z]\w{3,})\b"),
 )
-# A backticked token is often a file, not an identifier - `Terrain3DParticles.tscn` - and taking the
-# last dot-segment of one reports "tscn" as a stale name.
+# Recognize file suffixes before interpreting dotted tokens as identifiers.
 FILE_SUFFIXES = (".gd", ".tscn", ".tres", ".res", ".cfg", ".json", ".md", ".glsl", ".gdshader",
                  ".cpp", ".h", ".py", ".png", ".svg", ".import")
 
@@ -280,24 +235,10 @@ ASSIGNMENT = re.compile(r"\s*(?:[-+*/%&|^]|\*\*)?=(?!=)")
 
 
 def state():
-    """Class members that are read but never assigned, assigned but never read, or used nowhere.
+    """Find unused, read-only or write-only column-0 members across the script corpus.
 
-    `last_opened_directory` in `menu/channel_packer.gd` is the case this exists for: it is read once
-    (to set a file dialog's path) and written nowhere, so the only thing that line can do is reset the
-    dialog. The C++ half's `dead` mode reports the same class of finding for member fields.
-
-    Three rules, each of which suppresses a class of false positive rather than reporting it:
-
-    * Only column-0 `var`s are members; an indented `var` is a local, and a local's assignment is its
-      own declaration, which this walk skips.
-    * The search is over the whole corpus, because a member declared in a base script is written by the
-      subclass that extends it - `asset_dock_common.gd` declares `_confirmed` and only the two docks
-      assign it.
-    * A name followed by `.` counts as both a read and a write, because a collection is filled by
-      `push_back()` rather than by `=`; a name appearing inside a string literal counts as both too,
-      because a property can be reached by path - `tween_property(self, "editor_decal_fade", ...)` is
-      what uses `ui_decal.gd`'s fade field. An `@export` is assigned by the inspector, so it is skipped.
-      That under-reports (a shadowed name looks used) and never over-reports.
+    Skip exports; dotted access counts as both reading and writing, and quoted names are
+    considered used. Cross-file matches include subclasses but can conflate shadowed names.
     """
     code = {path: code_only(text) for path, text in GD.items()}
     lines_by_path = {path: text.split("\n") for path, text in code.items()}
@@ -391,10 +332,7 @@ def comments():
         if path.suffix in (".gd", ".tscn", ".tres", ".cfg", ".cs", ".cpp", ".h"):
             text = path.read_text(encoding="utf-8", errors="replace")
             words.update(re.findall(r"[A-Za-z_]\w*", code_only(text)))
-            # A name the code reaches by string is still a name the addon contains: a node name
-            # (`TransformChangedSignaller`), a property path (`tween_property(self, "editor_decal_fade")`)
-            # or a `call()` target. String contents only, never the surrounding comments - otherwise one
-            # comment naming a dead identifier would teach the check that the identifier exists.
+            # Include dynamic names from strings, without counting surrounding comments as code.
             for literal in re.findall(r"\"([^\"\n]*)\"|'([^'\n]*)'", code_only(text, strings=False)):
                 words.update(re.findall(r"[A-Za-z_]\w*", literal[0] + literal[1]))
     entries = []
@@ -408,8 +346,7 @@ def comments():
                     token = match.group(1)
                     if token.endswith(FILE_SUFFIXES):
                         continue
-                    # Prose emphasis - "changes its transform _after_ reparenting it" - is not a name:
-                    # no identifier ends with an underscore.
+                    # Treat trailing underscores as prose emphasis.
                     if token.endswith("_"):
                         continue
                     name = token.split(".")[-1]

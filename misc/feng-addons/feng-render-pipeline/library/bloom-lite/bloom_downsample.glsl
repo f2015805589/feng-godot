@@ -14,7 +14,6 @@ void main() {
 	if (any(greaterThanEqual(pixel, size))) {
 		return;
 	}
-	vec2 src_size = vec2(textureSize(src_image, 0));
 	// Normalize by destination size: source and output may have different scales.
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 	vec4 color = texture(src_image, uv);

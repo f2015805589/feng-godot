@@ -505,6 +505,19 @@ private:
 		std::atomic<bool> params_encoded{ false };
 		godot::String reason;
 		godot::String normal_reason;
+
+		// Refuse a failed compressed allocation without touching the bundle's RID inventory.
+		void disable_compression() {
+			effective.store(SURFACE_PAGE_UNCOMPRESSED);
+			applied.store(SURFACE_PAGE_UNCOMPRESSED);
+			normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
+			normal_applied.store(SURFACE_NORMAL_UNCOMPRESSED);
+			params_encoded.store(false);
+			format.store(RenderingDevice::DATA_FORMAT_MAX);
+			format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
+			normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
+			params_format.store(RenderingDevice::DATA_FORMAT_MAX);
+		}
 	};
 	TierState _tiers[TIER_COUNT];
 	void _resolve_tier_compression(int p_tier);
@@ -662,18 +675,15 @@ private:
 			uint64_t p_material_version, int p_page_count, int p_page_size, int p_border,
 			int p_stored_size, int p_material_count, bool p_invalidate_all,
 			Terrain3DCellStore *p_cell_store);
-	// Decrements the outstanding readback count of one ring page. Called from the completion
-	// callback, which takes the encode mutex alone; the caller checks the page's generation
-	// and sequence against the world state in its own scope.
-	// Sets one ring page's outstanding readback count, and releases one on completion.
+	// Sets one ring page's outstanding readback count. Completion releases it only
+	// while its encoder buffer still belongs to the current bundle.
 	void _hold_encode_page(int p_page, int p_outstanding);
-	void _release_encode_page(int p_page);
 	// Takes a free ring page for a page about to be produced, or -1 when all of them are held.
 	// Under the scratch regime this also reserves the scratch layer the production writes to,
 	// because a produced page's half-float content only exists until its blocks arrive.
 	int _take_staging_layer(int p_slot);
 	void _on_encode_readback(const PackedByteArray &p_data, int p_slot, int p_channel, int p_tier,
-			int p_page, uint64_t p_generation, uint64_t p_sequence);
+			int p_page, uint64_t p_generation, uint64_t p_sequence, const RID &p_buffer);
 	void _mark_encode_failed(int p_slot, uint64_t p_generation, uint64_t p_sequence);
 	bool _upload_encoded_layer(int p_tier, int p_channel, int p_slot, uint64_t p_generation,
 			uint64_t p_sequence, const godot::PackedByteArray &p_data);
@@ -724,7 +734,7 @@ private:
 	// paged tier is selected; a ring-only bundle never allocates any of it.
 	bool _create_page_resources(ResourceBundle &r_next, int p_stored_size, int p_page_count);
 	// Carries a grown pool's finished pages into the bundle replacing it, and queues the old bundle for
-	// retirement. Returns false - with `p_next` freed - when a copy fails.
+	// retirement. A failed copy leaves both bundles owned by the caller.
 	bool _adopt_grown_pages(const ResourceBundle &p_old, ResourceBundle &p_next, int p_old_count,
 			const std::vector<uint8_t> &p_ready, uint64_t p_old_generation, int p_stored_size);
 	// Adopts a finished bundle as the one this baker produces into, resizing everything indexed by the
@@ -735,6 +745,8 @@ private:
 			const PackedByteArray &p_material_bytes);
 	bool _rebuild_uniform_set(ResourceBundle &r_resources, const RID &p_albedo_array_rs,
 			const RID &p_normal_array_rs);
+	bool _compile_compute_pipeline(const char *p_source, const String &p_name, RID &r_shader,
+			RID &r_pipeline, bool p_optional = false);
 	bool _compile_pipeline(ResourceBundle &r_resources);
 	bool _compile_encode_pipeline(ResourceBundle &r_resources);
 	bool _compile_source_upload_pipeline(ResourceBundle &r_resources, int p_stored_size, int p_page_count);

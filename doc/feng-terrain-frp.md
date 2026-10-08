@@ -66,7 +66,8 @@ Material Weight 和 Slope。
 材质笔刷和吸管使用 Surface Maps，权重已编码在其中。Albedo Alpha 的材质微观高度与
 Height Maps 的几何高度独立。
 
-**Surface Density** 为 1/2/4/8 texel·m⁻¹，默认 1，控制 R16 Surface Maps 存储密度。
+**Surface Density** 为每个地形采样间距的 1/2/4/8 texel，默认 1，控制 R16 Surface Maps
+存储密度；`vertex_spacing = 1` 时单位为 texel·m⁻¹。
 每块存储边长为 `region_size × density`：region 256、density 4 时为 2 MiB，
 region 1024、density 4 时为 32 MiB，撤销快照也承担相应成本。
 修改密度会按块最近邻重采样现有 Surface Maps。直接材质路径的 GPU 数组保留每个密度块的

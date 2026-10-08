@@ -101,7 +101,7 @@ static func declared_provided_ids(passes: Array, is_entry_enabled_fn: Callable) 
 ## Build effects and the native token/name arrays in one traversal. Keeping these
 ## products together is what preserves compositor effect indices for disabled
 ## scripted passes.
-static func build(passes: Array, manager, is_scripted_fn: Callable, is_entry_enabled_fn: Callable) -> Dictionary:
+static func build(passes: Array, manager, is_entry_enabled_fn: Callable) -> Dictionary:
 	var tokens: Array[int] = [MANAGER_TOKEN]
 	var names := PackedStringArray(["Texture Preparation"])
 	var effects: Array[CompositorEffect] = []
@@ -113,7 +113,7 @@ static func build(passes: Array, manager, is_scripted_fn: Callable, is_entry_ena
 		var pass_entry = passes[i]
 		if pass_entry == null:
 			continue
-		if is_scripted_fn.call(pass_entry):
+		if is_scripted(pass_entry):
 			scripted_effects.append(pass_entry)
 			effects.append(pass_entry)
 			tokens.append(-(effect_index + 1))
@@ -142,17 +142,13 @@ static func validation_warnings(
 	passes: Array,
 	provided: Dictionary,
 	declared: Dictionary,
-	is_entry_enabled_fn: Callable,
-	contract_source_fn: Callable,
-	is_scripted_fn: Callable
+	is_entry_enabled_fn: Callable
 ) -> PackedStringArray:
 	var warnings := PipelineValidator.validate_schedule(
 		passes,
 		provided,
 		declared,
-		is_entry_enabled_fn,
-		contract_source_fn,
-		is_scripted_fn
+		is_entry_enabled_fn
 	)
 	warnings.append_array(ParameterResolver.warnings(passes))
 	return warnings

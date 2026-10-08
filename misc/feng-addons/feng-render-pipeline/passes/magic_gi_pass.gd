@@ -34,11 +34,11 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_replacement_enabled = false
 
 func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
-	if ctx == null or not ctx.has_method("get_scene_exposure_normalization"):
+	if ctx == null:
 		return 1.0
-	var value: Variant = ctx.call("get_scene_exposure_normalization")
-	if (value is float or value is int) and is_finite(float(value)) and float(value) > 0.0:
-		return float(value)
+	var value: float = ctx.get_scene_exposure_normalization()
+	if is_finite(value) and value > 0.0:
+		return value
 	return 1.0
 
 ## Prepare runs before the native lighting operation. It opts this frame into
@@ -53,10 +53,7 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 	var pass_strength := float(resolved.x) if resolved is Vector4 else float(parameters.x)
 	if not _replacement_requested(snapshot, pass_strength):
 		return
-	if not ctx.has_method("request_sky_light_diffuse"):
-		_warn_missing_replacement_bridge()
-		return
-	ctx.call("request_sky_light_diffuse")
+	ctx.request_sky_light_diffuse()
 	_replacement_request_prepared = true
 
 func _replacement_requested(snapshot: Dictionary, pass_strength := 1.0) -> bool:
@@ -153,22 +150,13 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var output: RID = inputs[5].get_texture(buffers, view)
 	if not output.is_valid():
 		return
-	if _frame_snapshot.is_empty() or _frame_scene_data == null:
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		return
 	var cache_key := str(_frame_snapshot.get("cache_key", ""))
 	var data: Variant = _frame_snapshot.get("data")
 	var version := int(_frame_snapshot.get("version", -1))
-	if cache_key == "" or data == null or not is_instance_valid(data):
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		return
-	if not _ensure_bake_resources(cache_key, data, version, rd):
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		return
-	if not _update_emission_texture(cache_key, _frame_snapshot, data, rd):
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		return
-	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
+	if _frame_scene_data == null or cache_key.is_empty() or not is_instance_valid(data) \
+			or not _ensure_bake_resources(cache_key, data, version, rd) \
+			or not _update_emission_texture(cache_key, _frame_snapshot, data, rd) \
+			or not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
 	var cached: Dictionary = _bake_resources[cache_key]
@@ -275,10 +263,8 @@ func _update_emission_texture(cache_key: String, snapshot: Dictionary, data: Res
 		return true
 	var image := _make_emission_image(data, snapshot)
 	if image == null:
-		_report("Magic GI could not create the emissive atlas; clearing only emissive contribution.")
-		image = data.call("make_emission_atlas_image", PackedFloat32Array())
-		if image == null:
-			return false
+		_report("Magic GI could not create the emissive atlas.")
+		return false
 	var emission_rid: RID = cached.get("emission", RID())
 	if not emission_rid.is_valid() or rd.texture_update(emission_rid, 0, image.get_data()) != OK:
 		_report("RenderingDevice could not update the Magic GI emission atlas.")
@@ -289,32 +275,20 @@ func _update_emission_texture(cache_key: String, snapshot: Dictionary, data: Res
 	return true
 
 func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int, extra_usage_bits := 0) -> RID:
+	return _create_texture(rd, image.get_size(), data_format, image.get_data(), extra_usage_bits)
+
+func _create_index_texture(rd: RenderingDevice, dims: Vector3i, bytes: PackedByteArray) -> RID:
+	return _create_texture(rd, Vector2i(dims.x * 8, dims.y * dims.z), RenderingDevice.DATA_FORMAT_R32_SINT, bytes)
+
+func _create_texture(rd: RenderingDevice, size: Vector2i, data_format: int, bytes: PackedByteArray,
+		extra_usage_bits := 0) -> RID:
 	var format := RDTextureFormat.new()
 	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
 	format.format = data_format
-	format.width = image.get_width()
-	format.height = image.get_height()
-	format.depth = 1
-	format.array_layers = 1
-	format.mipmaps = 1
-	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
+	format.width = size.x
+	format.height = size.y
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | extra_usage_bits
-	var layer_data: Array[PackedByteArray] = [image.get_data()]
-	return rd.texture_create(format, RDTextureView.new(), layer_data)
-
-func _create_index_texture(rd: RenderingDevice, dims: Vector3i, bytes: PackedByteArray) -> RID:
-	var format := RDTextureFormat.new()
-	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
-	format.format = RenderingDevice.DATA_FORMAT_R32_SINT
-	format.width = dims.x * 8
-	format.height = dims.y * dims.z
-	format.depth = 1
-	format.array_layers = 1
-	format.mipmaps = 1
-	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
-	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
-	var layer_data: Array[PackedByteArray] = [bytes]
-	return rd.texture_create(format, RDTextureView.new(), layer_data)
+	return rd.texture_create(format, RDTextureView.new(), [bytes])
 
 func _prune_bake_cache(rd: RenderingDevice) -> void:
 	while _bake_resources.size() > MAX_CACHED_BAKES:
@@ -366,14 +340,9 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		1.0 if _frame_replacement_enabled else 0.0,
 		0.0,
 	]))
-	for i in 7:
-		for channel in 4:
-			var index := i * 4 + channel
-			values.append(float(lighting[index]) if index < lighting.size() else 0.0)
-	for i in 7:
-		for channel in 4:
-			var index := i * 4 + channel
-			values.append(float(sky_lighting[index]) if index < sky_lighting.size() else 0.0)
+	for coefficients in [lighting, sky_lighting]:
+		values.append_array(coefficients)
+		values.append(0.0) # SH9 RGB occupies seven vec4s, with one padding lane.
 	# No bake or no runtime producer is a true no-op: only allocate GPU state
 	# after the matching, validated snapshot has made it all the way to the shader.
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
@@ -388,12 +357,6 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		return binding_data
 	var cached: Dictionary = _bake_resources[cache_key]
 	var uniforms: Array[RDUniform] = binding_data["uniforms"]
-	var primary_sky := RDUniform.new()
-	primary_sky.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	primary_sky.binding = 11
-	primary_sky.add_id(_sampler)
-	primary_sky.add_id(cached["primary_sky"])
-	uniforms.append(primary_sky)
 	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
 	if not sky_diffuse.is_valid():
 		sky_diffuse = _ensure_zero_sky_diffuse(rd)
@@ -401,17 +364,13 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		_binding_error = true
 		_report("Cannot create the zero SkyLight diffuse fallback texture.")
 		return binding_data
-	var sky_diffuse_uniform := RDUniform.new()
-	sky_diffuse_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	sky_diffuse_uniform.binding = 12
-	sky_diffuse_uniform.add_id(_sampler)
-	sky_diffuse_uniform.add_id(sky_diffuse)
-	uniforms.append(sky_diffuse_uniform)
 	for spec in [
 		{"binding": 6, "texture": cached["transfer"]},
 		{"binding": 7, "texture": cached["geometry"]},
 		{"binding": 8, "texture": cached["indices"]},
 		{"binding": 10, "texture": cached["emission"]},
+		{"binding": 11, "texture": cached["primary_sky"]},
+		{"binding": 12, "texture": sky_diffuse},
 	]:
 		var uniform := RDUniform.new()
 		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
@@ -458,7 +417,7 @@ func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
 	# Value-capture the RIDs: the instance is being torn down, so only local
-	# state is safe here (see FengRuntimeSnapshotPass._free_on_render_thread).
+	# state is safe here (see FengPass._free_on_render_thread).
 	var rids: Array[RID] = []
 	if _ubo.is_valid():
 		rids.append(_ubo)

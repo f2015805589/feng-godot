@@ -113,10 +113,6 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 	op.pair_weight_level = int(_brush_data.get("pair_weight_level", 8)); // 1..8
 
 	op.slope_range = _brush_data["slope"];
-	// enable_angle / dynamic_angle / angle / enable_scale / scale are still
-	// sanitized by set_brush_data() for the decal and the pickers, but nothing in
-	// this function consumes them any more: the IdWeight R16 contract has
-	// no per-texel UV rotation or scale field (see _paint_surface_pair).
 
 	op.gamma = _brush_data["gamma"];
 	op.gradient_points = _brush_data["gradient_points"];

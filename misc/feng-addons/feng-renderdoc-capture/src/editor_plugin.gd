@@ -93,15 +93,12 @@ func _on_capture_pressed() -> void:
 	# Capture actual pending work and resident textures. Replaying every resident
 	# page here bypasses streaming budgets and can stall large terrain captures.
 	var capture := str(RenderDocCapture.capture_frame(button.get_window().get_window_id()))
-	_restore_capture_viewports()
 	if not capture.is_empty() and FileAccess.file_exists(capture):
 		_finish_capture()
 		_open_capture(gui, capture)
 		return
-	# Nothing could be recorded explicitly: fall back to the queued trigger, which
-	# captures the next frame the editor presents.
+	# Keep the same viewport lease for the queued fallback until completion.
 	var previous_count := FengRenderDoc.get_capture_count()
-	_prepare_capture_viewports()
 	if not FengRenderDoc.trigger_capture(button.get_window().get_window_id()):
 		_finish_capture()
 		_warning("Could not trigger a capture in the current editor.")

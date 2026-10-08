@@ -4,8 +4,6 @@ extends FengVolumetricCloudPass
 ## Traces/reconstructs the cloud volume and composites it after opaque fog/AP
 ## while the resolved eye color is still available in linear HDR.
 
-const FengCloudGPU = preload("feng_cloud_gpu.gd")
-
 @export_enum("Quarter trace + temporal half resolve", "Half trace", "Quarter trace + full temporal resolve", "Full trace") var vrt_mode: int = 0:
 	set(value):
 		var next_mode := clampi(value, 0, 3)
@@ -14,7 +12,6 @@ const FengCloudGPU = preload("feng_cloud_gpu.gd")
 		vrt_mode = next_mode
 		emit_changed()
 
-var _cloud_gpu = FengCloudGPU.new()
 var _active_context: FRPPassContext
 var _frame_vrt_mode := 0
 
@@ -62,24 +59,3 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 func _resolved_vrt_mode(ctx: FRPPassContext) -> int:
 	var parameters := get_resolved_parameters(ctx)
 	return clampi(int(parameters.get("vrt_mode", vrt_mode)), 0, 3)
-
-
-func _cleanup(rd: RenderingDevice) -> void:
-	_cloud_gpu.cleanup(rd)
-	super._cleanup(rd)
-
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	var pass_rids: Array[RID] = [_shader, _compute_pipeline, _sampler, _ubo]
-	for pipeline in _raster_pipelines.values():
-		if pipeline is RID:
-			pass_rids.append(pipeline)
-	var payload := _cloud_gpu.take_cleanup_payload(pass_rids)
-	_shader = RID()
-	_compute_pipeline = RID()
-	_sampler = RID()
-	_ubo = RID()
-	_raster_pipelines.clear()
-	FengCloudGPU.release_cleanup_payload(payload)

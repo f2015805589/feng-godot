@@ -28,7 +28,7 @@ flowchart TD
 | `renderer.gd` | 作者资源、嵌套变更观察、延迟初始化、迁移/同步入口和兼容查询 API |
 | `pipeline/native_spec.gd` | 读取引擎原生规范，集中纹理 scope、名字和必要的 ID 常量 |
 | `pipeline/library_manager.gd` | 库清单、默认开关、锚点、实例身份和删除记录 |
-| `pipeline/pipeline_migrator.gd` | 旧资源格式及原生 ID 迁移 |
+| `pipeline/pipeline_migrator.gd` | 旧资源格式、原生 ID 及严格匹配的默认云/雾顺序迁移 |
 | `pipeline/execution_plan.gd`、`pipeline_validator.gd` | 从已初始化条目构造 effects/token/provided，检查调度与纹理依赖 |
 | `pipeline/compositor_binding.gd` | 附件需求、效果绑定、RenderingServer 上传及无效计划保护 |
 | `pipeline/parameter_resolver.gd` | 作者参数、稳定键/别名和代码声明的 Volume 字段权限 |
@@ -44,6 +44,7 @@ flowchart TD
 | `editor_plugin.gd`、`project_pipeline.gd` | 编辑器服务、项目路径/UID 解析与默认世界安装 |
 | `world_compositor.gd` | 世界 compositor 选择规则，包括引擎 WorldEnvironment 分组约定 |
 
+ExecutionPlan、校验器和绑定直接消费 FengPass 的类型化契约（准备、契约来源、参数与开关）。
 ExecutionPlan 和 VolumeResolver 根据输入生成结果，不改作者资源或调用 RenderingServer。
 VolumeEvaluator 只依赖位置、Volume 配置以及设置来源的 `get_instance_id()`、
 `get_parameter_revision()`、`get_volume_context()` 协议，可独立于相机和 compositor 测试。
@@ -78,6 +79,7 @@ Renderer 的 `get_volume_context()` 按参数版本缓存作者值、元数据�
 
 每个 FengCompositor 的 ViewState 持有独立参数、开关、效果 RID 和 TextureManager。
 纹理由各自 RenderSceneBuffers 持有。相机可共享 Renderer 作者资源，运行时结果保持独立。
+Pass 自有 RD 资源通过统一的渲染线程释放入口清理；借用的帧/producer RID 仍由原所有者释放。
 
 ViewExecutionPolicy 允许精确类型的标准 FengShaderPass、无 overlay 的标准原生实现共享
 执行对象。自定义 Pass 默认隔离；顶层条目通过 `can_share_view_execution()` 显式承担
@@ -113,7 +115,18 @@ Magic GI 在数据 identity、cache key 或版本变化时验证并上传 PRT �
 格索引；太阳/环境变化只更新 SH 和相机数据。查询在世界空间进行，检查附近 27 个格、
 每格最多 8 个样本，用法线和平面距离选取最近四点插值，最后乘接收表面的
 `albedo * (1 - metallic) * AO`。传输不包含接收材质和当前直接光。
-无匹配有效烘焙时贡献纹理清零，场景 HDR 保持原值。
+v4 烘焙将 primary SkyLight 可见性与 secondary transport 分开，按覆盖权重替换全局漫反射；
+v2/v3 保留 additive 行为。无匹配有效烘焙时贡献纹理清零，场景 HDR 保持原值。
+
+`FengVolumetricCloudPass` 统一拥有 FengCloudGPU 及清理生命周期；Shadow、Trace 和
+Composite 保留各自阶段行为。即时清理与渲染线程延迟清理共用资源释放入口。
+FengCloudGPU 使用已绑定的 FRPPassContext 类型化接口；外部快照长度、有限值、RID 和
+材质身份仍在边界校验。Height Fog 的普通视口与冻结捕获共用执行流程，输入快照和
+捕获曝光归一化由各自来源提供。
+
+FengSkyLight 在原生捕获状态同步时统一更新 render-target 路由，持有自己的注册并在
+目标消失或节点退出时释放。Fog、Cloud 等跨插件来源保持可选加载；同插件内部接口
+按明确类型调用。
 
 Debug Buffers 的输入契约由 buffer 选择决定，因此选择项属于作者配置。
 `motion_scale` 与 `gi_exposure` 从最终参数读取，但不开放给 Volume。

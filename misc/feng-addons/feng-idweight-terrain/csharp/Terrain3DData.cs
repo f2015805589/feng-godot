@@ -780,27 +780,3 @@ public partial class Terrain3DData : GodotObject
 		Call(GDExtensionMethodName.Dump, [verbose]);
 
 }
-
-file static class HeightFilterExtensions
-{
-public static int SafeAsInt32(this Terrain3DData.HeightFilter enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DData.HeightFilter enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DData.HeightFilter? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}
-
-file static class ExportModeExtensions
-{
-public static int SafeAsInt32(this Terrain3DData.ExportMode enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DData.ExportMode enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DData.ExportMode? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

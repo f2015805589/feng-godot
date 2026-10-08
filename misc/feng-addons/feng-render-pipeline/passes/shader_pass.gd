@@ -391,27 +391,10 @@ func _notification(what: int) -> void:
 	# created on the rendering thread. Capture only value types and free them on
 	# the render thread; keeping a callback to this Resource would be too late at
 	# NOTIFICATION_PREDELETE time.
-	var shader := _shader
-	var compute_pipeline := _compute_pipeline
-	var sampler := _sampler
-	var raster_pipelines: Array[RID] = []
-	for pipeline in _raster_pipelines.values():
-		if pipeline is RID:
-			raster_pipelines.append(pipeline)
-	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd == null:
-			return
-		for pipeline in raster_pipelines:
-			if pipeline.is_valid():
-				rd.free_rid(pipeline)
-		if compute_pipeline.is_valid():
-			rd.free_rid(compute_pipeline)
-		if shader.is_valid():
-			rd.free_rid(shader)
-		if sampler.is_valid():
-			rd.free_rid(sampler)
-	)
+	var rids: Array[RID] = []
+	rids.append_array(_raster_pipelines.values())
+	rids.append_array([_compute_pipeline, _shader, _sampler])
+	_free_on_render_thread(rids)
 
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()

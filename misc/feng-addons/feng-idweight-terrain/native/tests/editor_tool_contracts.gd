@@ -45,6 +45,7 @@ func run() -> void:
 	test_editor_binding_lifetime()
 	test_alignment()
 	test_save_failures()
+	test_packer_queue()
 	fixture_root = "user://region_move_contract_" + str(Time.get_ticks_usec())
 	DirAccess.make_dir_recursive_absolute(fixture_root)
 	test_region_plan()
@@ -146,6 +147,46 @@ func test_save_failures() -> void:
 	var failure_return := source.find("return save_error", failure_branch)
 	var success_message := source.find('_show_message(INFO, "Packed to "', failure_branch)
 	require(failure_branch >= 0 and failure_return > failure_branch and success_message > failure_return, "packer UI claims success before returning the save failure")
+
+
+func test_packer_queue() -> void:
+	# Execute the production handlers with a dialog stub, without loading editor UI.
+	var source := FileAccess.get_file_as_string("res://addons/feng-idweight-terrain/menu/channel_packer.gd")
+	var script := GDScript.new()
+	script.source_code = """extends RefCounted
+const IMAGE_ALBEDO = 0
+const IMAGE_HEIGHT = 1
+const IMAGE_NORMAL = 2
+const IMAGE_ROUGHNESS = 3
+const WARN = 1
+var packing_albedo = false
+var queue_pack_normal_roughness = false
+var images = [null, null, null, null, null]
+var last_saved_directory = ""
+var no_op = func(): pass
+var last_file_selected_fn = no_op
+var window = Node.new()
+var save_file_dialog = Dialog.new()
+class Dialog extends RefCounted:
+	var current_path = ""
+	var title = ""
+	func popup_centered_ratio(): pass
+func _show_message(_level, _text): pass
+"""
+	for name in ["_on_pack_button_pressed", "_on_close_requested"]:
+		script.source_code += "\nfunc " + name + source.get_slice("func " + name, 1).get_slice("\n\nfunc ", 0) + "\n"
+	require(script.reload() == OK, "packer queue handlers did not compile")
+	var packer = script.new()
+	packer.images = [true, true, true, true, null]
+	packer._on_pack_button_pressed()
+	require(packer.queue_pack_normal_roughness, "both pairs did not queue the second save")
+	packer.images = [true, true, null, null, null]
+	packer._on_pack_button_pressed()
+	require(not packer.queue_pack_normal_roughness, "single pair retained a previous second save")
+	packer.queue_pack_normal_roughness = true
+	packer._on_close_requested()
+	require(not packer.queue_pack_normal_roughness and packer.images == [null, null, null, null, null], "closing retained the previous packing session")
+	require(source.contains("save_file_dialog.canceled.connect(func() -> void: queue_pack_normal_roughness = false)"), "cancel does not clear the queued save")
 
 
 func encode(location: Vector2i) -> String:

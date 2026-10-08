@@ -13,8 +13,7 @@ const BuiltinPass = preload("../passes/builtin_pass.gd")
 static func clear(compositor: Compositor) -> void:
 	if compositor == null:
 		return
-	if RenderingServer.has_method("compositor_set_frp_pipeline"):
-		RenderingServer.call("compositor_set_frp_pipeline", compositor.get_rid(), PackedInt32Array())
+	RenderingServer.compositor_set_frp_pipeline(compositor.get_rid(), PackedInt32Array())
 	compositor.compositor_effects = []
 
 ## Apply a valid plan or preserve the engine's last valid native schedule when the
@@ -25,10 +24,9 @@ static func apply(
 	passes: Array,
 	plan: Dictionary,
 	warnings: PackedStringArray,
-	contract_source_fn: Callable,
 	is_entry_enabled_fn: Callable,
-	get_provided_native_ids_fn: Callable,
-	get_pass_parameters_fn: Callable
+	provided_native_ids: PackedInt32Array,
+	parameters: Dictionary
 ) -> Dictionary:
 	if compositor == null:
 		return {"applied": false, "tokens": PackedInt32Array()}
@@ -50,7 +48,7 @@ static func apply(
 	for pass_entry in passes:
 		if pass_entry == null:
 			continue
-		var contract = contract_source_fn.call(pass_entry)
+		var contract: FengPass = pass_entry.get_contract_source()
 		contract.refresh_resource_flags()
 		if contract != pass_entry:
 			pass_entry.access_resolved_color = contract.access_resolved_color
@@ -60,17 +58,12 @@ static func apply(
 			pass_entry.needs_separate_specular = contract.needs_separate_specular
 		RenderingServer.compositor_effect_set_enabled(pass_entry.get_rid(), is_entry_enabled_fn.call(pass_entry))
 
-	if manager != null:
-		manager.passes = plan.scripted_effects
+	manager.passes = plan.scripted_effects
 	compositor.compositor_effects = plan.effects
 
 	var tokens: PackedInt32Array = plan.tokens
 	var names: PackedStringArray = plan.names
-	# Resolve immediately before upload: dynamic pass fields and Volume overrides must
-	# not be served from a cached execution plan.
-	var provided := PackedInt32Array(get_provided_native_ids_fn.call())
-	var parameters: Dictionary = get_pass_parameters_fn.call()
-	upload(compositor, tokens, names, provided, parameters)
+	upload(compositor, tokens, names, provided_native_ids, parameters)
 	return {"applied": true, "tokens": tokens}
 
 ## Keep the only direct compositor_set_frp_pipeline call in this adapter.

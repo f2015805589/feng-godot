@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Parse-check every addon script with the engine, without running the test suite.
+"""Parse-check addon scripts with the engine's --check-only mode, outside the test suite.
 
-A GDScript parse error - a typo in a `preload` path, a base class that does not resolve, a call to a
-method no class in the chain defines - is invisible to every static reader in this directory and only
-shows up when the editor loads the script. The full suite would find it eventually, but it takes
-sixteen minutes; this takes about a second per file:
+    python native/check_scripts.py                every addon .gd except test fixtures
+    python native/check_scripts.py asset_dock.gd  select by basename or addon-relative path
 
-    python native/check_scripts.py                       every .gd in the addon
-    python native/check_scripts.py asset_dock.gd        by file name, from anywhere in the addon
-
-The script is checked *in a project context*, because the addon's `res://` paths (`addons/...`) only
-resolve where the addon is installed. `--project` defaults to the pass's test project, which has the
-addon as a junction; `--engine` defaults to the checkout's editor console binary.
+Use --project for an imported disposable project with the addon installed so res:// paths resolve.
+The default is F:/godot/project/test-1; --engine defaults to the checkout's Windows editor console
+binary. Native test scripts are excluded because their runners use different resource paths.
 """
 from __future__ import annotations
 
@@ -22,15 +17,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ADDON = HERE.parent
-# native/ sits four levels below the checkout, the same depth run_all.py computes its ROOT from.
+# native/ sits four levels below the checkout.
 CHECKOUT = HERE.parents[3]
 
 DEFAULT_PROJECT = Path(r"F:\godot\project\test-1")
 DEFAULT_ENGINE = CHECKOUT / "bin" / "godot.windows.editor.x86_64.console.exe"
 RES_ROOT = "res://addons/feng-idweight-terrain"
-# `native/tests` is skipped on purpose: its scripts are copied into a fixture project root by the
-# runner before they run, so their `res://` paths do not resolve under the addon and every one of them
-# would report a parse error that is not one.
+# Test runners relocate scripts into fixture roots, with different res:// paths.
 SKIP_DIRS = ("godot-cpp", "bin", ".git", "tests")
 
 
@@ -70,7 +63,7 @@ def main() -> int:
             [str(args.engine), "--headless", "--check-only", "--script", res_path],
             cwd=args.project, capture_output=True, text=True, errors="replace")
         output = (result.stdout + result.stderr).strip()
-        # The banner every run prints is the only expected output; anything else is the parse.
+        # Treat all output except the engine banner as a failure.
         noise = [line for line in output.splitlines()
                  if line.strip() and not line.startswith("Godot Engine v")]
         if result.returncode != 0 or noise:

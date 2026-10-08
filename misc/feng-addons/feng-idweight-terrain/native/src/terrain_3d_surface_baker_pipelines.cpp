@@ -140,66 +140,50 @@ void main() {
 // GPU setup
 ///////////////////////////
 
-bool Terrain3DSurfaceBaker::_compile_pipeline(ResourceBundle &r_resources) {
+// All three programs share compilation and RID creation. The bundle keeps partial
+// results for its owner to release; the optional uploader can fall back to texture_update.
+bool Terrain3DSurfaceBaker::_compile_compute_pipeline(const char *p_source, const String &p_name,
+		RID &r_shader, RID &r_pipeline, const bool p_optional) {
 	if (!_rd) {
 		return false;
 	}
+	[[maybe_unused]] const auto level = p_optional ? WARN : ERROR;
 	Ref<RDShaderSource> source;
 	source.instantiate();
 	source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
-	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, SURFACE_BAKE_SHADER);
+	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, p_source);
 	Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
 	if (spirv.is_null()) {
-		LOG(ERROR, "Surface bake shader did not compile");
+		LOG(level, p_name, " shader did not compile");
 		return false;
 	}
 	const String compile_error = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
 	if (!compile_error.is_empty()) {
-		LOG(ERROR, "Surface bake shader compile error: ", compile_error);
+		LOG(level, p_name, " shader compile error: ", compile_error);
 		return false;
 	}
-	r_resources.shader = _rd->shader_create_from_spirv(spirv, "terrain3d_surface_bake");
-	if (!r_resources.shader.is_valid()) {
-		LOG(ERROR, "Could not create the surface bake shader");
-		return false;
+	r_shader = _rd->shader_create_from_spirv(spirv, p_name);
+	if (r_shader.is_valid()) {
+		r_pipeline = _rd->compute_pipeline_create(r_shader);
 	}
-	r_resources.pipeline = _rd->compute_pipeline_create(r_resources.shader);
-	if (!r_resources.pipeline.is_valid()) {
-		LOG(ERROR, "Could not create the surface bake compute pipeline");
+	if (!r_pipeline.is_valid()) {
+		LOG(level, "Could not create ", p_name, " compute pipeline");
 		return false;
 	}
 	return true;
+}
+
+bool Terrain3DSurfaceBaker::_compile_pipeline(ResourceBundle &r_resources) {
+	return _compile_compute_pipeline(SURFACE_BAKE_SHADER, "terrain3d_surface_bake",
+			r_resources.shader, r_resources.pipeline);
 }
 
 // Compiles the block encoder into its own pipeline. It is only needed when at least one tier
 // resolved to a compressed format, and a build whose encoder cannot compile has to say so
 // once: without it a compressed tier would produce pages no encoder ever fills.
 bool Terrain3DSurfaceBaker::_compile_encode_pipeline(ResourceBundle &r_resources) {
-	if (!_rd) {
-		return false;
-	}
-	Ref<RDShaderSource> source;
-	source.instantiate();
-	source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
-	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, SURFACE_ENCODE_SHADER);
-	Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
-	if (spirv.is_null()) {
-		LOG(ERROR, "Surface block encoder shader did not compile");
-		return false;
-	}
-	const String compile_error = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
-	if (!compile_error.is_empty()) {
-		LOG(ERROR, "Surface block encoder compile error: ", compile_error);
-		return false;
-	}
-	r_resources.encode_shader = _rd->shader_create_from_spirv(spirv, "terrain3d_surface_encode");
-	if (!r_resources.encode_shader.is_valid()) {
-		LOG(ERROR, "Could not create the surface block encoder shader");
-		return false;
-	}
-	r_resources.encode_pipeline = _rd->compute_pipeline_create(r_resources.encode_shader);
-	if (!r_resources.encode_pipeline.is_valid()) {
-		LOG(ERROR, "Could not create the surface block encoder compute pipeline");
+	if (!_compile_compute_pipeline(SURFACE_ENCODE_SHADER, "terrain3d_surface_encode",
+				r_resources.encode_shader, r_resources.encode_pipeline)) {
 		return false;
 	}
 	// One region per channel of every page that may be in flight at once. The buffer is a
@@ -257,26 +241,8 @@ bool Terrain3DSurfaceBaker::_compile_source_upload_pipeline(ResourceBundle &r_re
 		return false;
 	}
 
-	Ref<RDShaderSource> source;
-	source.instantiate();
-	source->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
-	source->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, SURFACE_SOURCE_UPLOAD_SHADER);
-	Ref<RDShaderSPIRV> spirv = _rd->shader_compile_spirv_from_source(source);
-	if (spirv.is_null()) {
-		LOG(WARN, "Surface source upload shader could not compile; using texture_update");
-		return false;
-	}
-	const String compile_error = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
-	if (!compile_error.is_empty()) {
-		LOG(WARN, "Surface source upload shader compile error; using texture_update: ", compile_error);
-		return false;
-	}
-	r_resources.source_upload_shader = _rd->shader_create_from_spirv(spirv, "terrain3d_surface_source_upload");
-	if (!r_resources.source_upload_shader.is_valid()) {
-		return false;
-	}
-	r_resources.source_upload_pipeline = _rd->compute_pipeline_create(r_resources.source_upload_shader);
-	if (!r_resources.source_upload_pipeline.is_valid()) {
+	if (!_compile_compute_pipeline(SURFACE_SOURCE_UPLOAD_SHADER, "terrain3d_surface_source_upload",
+				r_resources.source_upload_shader, r_resources.source_upload_pipeline, true)) {
 		return false;
 	}
 	r_resources.source_upload_buffer = _rd->storage_buffer_create(uint32_t(capacity));
@@ -338,10 +304,7 @@ bool Terrain3DSurfaceBaker::_rebuild_uniform_set(ResourceBundle &r_resources,
 	// Freeing a resource makes the device drop every uniform set that depended on it, so this
 	// one may already be gone when an array the set bound was freed with its asset. Asking the
 	// device first keeps that from being reported as freeing an invalid ID.
-	if (r_resources.uniform_set.is_valid() && _rd->uniform_set_is_valid(r_resources.uniform_set)) {
-		_rd->free_rid(r_resources.uniform_set);
-	}
-	r_resources.uniform_set = RID();
+	free_bake_set(_rd, r_resources.uniform_set);
 	RID albedo_rd;
 	RID normal_rd;
 	_resolve_material_rd(r_resources, albedo_rd, normal_rd, p_albedo_array_rs, p_normal_array_rs);

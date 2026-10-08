@@ -1,9 +1,6 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The clipmap layer's facade. Read terrain_3d_clipmap_layer.h first: it states why there is one
-// clipmap delivery with two implementations, what the facade owns and what it deliberately does not,
-// and how the one debug schema is assembled. This file is the forwarding and the assembly, and it has
-// no addressing arithmetic of its own beyond the shared ladder.
+// Clipmap ownership, async handoff and shared debug report assembly.
 
 #include "terrain_3d_clipmap_layer.h"
 
@@ -93,14 +90,11 @@ bool Terrain3DClipmapLayer::schedule_async_update(const Vector2 &p_focus, const 
 }
 
 bool Terrain3DClipmapLayer::_build() {
-	// The channel's source is asked for *now*, not kept from a previous build: a source is a thin
-	// reading of the channel (`Terrain3DClipmapSource`), the implementation takes ownership of it, and
-	// asking again is what lets the implementation be replaced without moving ownership back out.
+	// Each rebuilt implementation owns a fresh source.
 	const TerrainClipmap::Implementation implementation = _settings.implementation;
 	std::unique_ptr<Terrain3DClipmapSource> source = _source_factory != nullptr ? _source_factory() : nullptr;
 	if (source == nullptr) {
-		// The registry's own answer: this build has no source for the channel. The caller refuses the
-		// cell with a sentence rather than handing back a layer nothing could produce.
+		// The registry has no source for this channel.
 		_impl.reset();
 		return false;
 	}
@@ -119,8 +113,7 @@ bool Terrain3DClipmapLayer::configure(const Settings &p_settings) {
 	const bool switched = _impl != nullptr && _impl->get_implementation() != p_settings.implementation;
 	_settings = p_settings;
 	if (switched) {
-		// A different implementation is different storage: there is no state to carry across, and a
-		// layer that kept the old arrays alive would hold two memories for one delivery.
+		// Release the previous storage before switching implementations.
 		_destroy();
 	}
 	if (_impl == nullptr && !_build()) {
@@ -129,9 +122,7 @@ bool Terrain3DClipmapLayer::configure(const Settings &p_settings) {
 	const TerrainClipmap::Shape &shape = _settings.shape;
 	if (_settings.implementation == TerrainClipmap::Implementation::Atlas) {
 		Terrain3DClipmapAtlas::Config config;
-		// The block is the shared `size` texels of the shared `base_world` metres, so the atlas's
-		// finest ring has exactly the density the LOD ring's finest level has: the settings that shape
-		// one shape the other, and a user who tuned one has tuned the other.
+		// Both implementations use the shared finest density.
 		config.block_size = shape.size;
 		config.rings = shape.units;
 		config.base_world = shape.base_world;
@@ -162,12 +153,7 @@ void Terrain3DClipmapLayer::clear() {
 	}
 }
 
-// The channel's own declaration, asked of a *temporary* source when no implementation exists yet.
-// This is the "the shape travels with the channel" rule the ring followed, one level up: the layer is
-// configured from what the channel says a texel is, so the facade must be able to answer before it has
-// built anything. A source is a thin reading of the channel (it holds the reader and the shape and no
-// storage), so asking for one and letting it go is cheaper than the shape living in two places - and it
-// is what keeps the channel registry the single answer to "what does this group carry".
+// Probe channel metadata before an implementation exists.
 std::unique_ptr<Terrain3DClipmapSource> Terrain3DClipmapLayer::_probe_source() const {
 	return _source_factory != nullptr ? _source_factory() : nullptr;
 }
@@ -238,11 +224,7 @@ const Terrain3DClipmapAtlas *Terrain3DClipmapLayer::atlas_impl() const {
 			: nullptr;
 }
 
-// The one debug schema. Everything above `"impl"` is the shared contract's answer and is the same on
-// both sides; `"impl"` is what only the selected implementation can say. The density and coverage
-// arrays are the *layer's* - one function of the shared ladder - so a view that plots
-// "density against distance" reads the same keys whichever implementation is selected, and a view that
-// draws the storage draws the implementation's own picture.
+// Common report fields plus the selected storage's "impl" payload.
 Dictionary Terrain3DClipmapLayer::get_debug_layout(const String &p_group) const {
 	wait_for_async_update();
 	Dictionary result;
@@ -277,17 +259,12 @@ Dictionary Terrain3DClipmapLayer::get_debug_layout(const String &p_group) const 
 		entries.push_back(TerrainClipmap::unit_report_to_dictionary(report));
 		density.push_back(report.density);
 		reach.push_back(_impl->get_unit_world_size(unit));
-		// The **coverage outer radius**: the distance from the focus at which the unit stops serving,
-		// half the square it spans. It is the x the acceptance's "density - distance" curve is read at,
-		// and it is half on both sides because a unit is centred on the focus in both storages.
+		// Coverage radius is half the unit's world width.
 		radius.push_back(_impl->get_unit_world_size(unit) * 0.5f);
 		texel_world.push_back(report.texel_world);
 	}
 	result["unit_reports"] = entries;
-	// The layer's own curve, in the unit the acceptance reads it in: the density a fragment is served
-	// at a distance, from the shared ladder rather than from either storage. `density_distance` is the
-	// **coverage outer radius** of each entry - the distance at which that unit's density is the one a
-	// fragment gets - so a reader can plot one against the other.
+	// Publish ladder density against each unit's coverage radius.
 	PackedFloat32Array density_curve;
 	PackedFloat32Array density_distance;
 	for (int unit = 0; unit < units; unit++) {
@@ -298,11 +275,7 @@ Dictionary Terrain3DClipmapLayer::get_debug_layout(const String &p_group) const 
 	result["unit_reach"] = reach;
 	result["unit_radius"] = radius;
 	result["unit_texel_world"] = texel_world;
-	// The shared ladder's own reading, published beside the numbers it is derived from: the endpoints
-	// this shape presents and the unit count its own finest density needs to reach the coarsest one. A
-	// reader - the acceptance, or the dock - compares `units` with `ladder_units_required` instead of
-	// re-deriving the halving rule, so "is this the shipping 1024 -> 1 span" is one key and a clamp that
-	// shortened it is visible rather than implied.
+	// Expose configured density endpoints and the units needed to span them.
 	result["ladder_finest_density"] = ladder.finest_density();
 	result["ladder_coarsest_density"] = ladder.density_at_unit_count(units);
 	result["ladder_units_required"] = ladder.units_for_density();

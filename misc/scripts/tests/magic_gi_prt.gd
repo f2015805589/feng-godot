@@ -542,6 +542,14 @@ func _test_emission_data_contracts() -> void:
 	_check(data.is_valid() and data.format_version == Data.FORMAT_VERSION,
 			"synthetic v4 emitter bake validates with separate primary Sky visibility")
 	_test_render_upload_package(data)
+	for invalid in [NAN, INF]:
+		var bad_transform: Resource = data.duplicate(true)
+		bad_transform.volume_transform.origin.x = invalid
+		_check(not bad_transform.is_valid(), "non-finite volume transforms remain invalid")
+		var bad_grid: Resource = data.duplicate(true)
+		bad_grid.world_to_grid.basis.x.y = invalid
+		_check(not bad_grid.is_valid() and not bad_grid.build_cell_indices() and bad_grid.cell_indices.is_empty(),
+				"non-finite lookup transforms fail validation and clear their index payload")
 	_check(data.emitter_count() == 1 and data.has_nonzero_transfer(),
 			"synthetic v4 data counts emitter transport as real indirect transport")
 	var raw_transfer: PackedByteArray = data.transfer.to_byte_array()
@@ -581,6 +589,10 @@ func _test_emission_data_contracts() -> void:
 	legacy_v3.primary_sky_visibility.clear()
 	_check(legacy_v3.is_valid() and legacy_v3.emitter_count() == 1,
 			"legacy v3 emitter bakes remain valid without primary Sky visibility")
+	for legacy_data in [legacy_v2, legacy_v3]:
+		var legacy_upload: Dictionary = legacy_data.make_render_upload()
+		_check(not legacy_upload.is_empty() and _packed_values_all_zero(legacy_upload.primary_sky_image.get_data().to_float32_array()),
+				"legacy upload keeps a correctly sized black primary-sky atlas")
 	var primary_only: Resource = data.duplicate(true)
 	primary_only.transfer.fill(0.0)
 	primary_only.emitter_keys.clear()

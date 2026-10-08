@@ -1,19 +1,7 @@
 # Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 # Channel Packer for Terrain3D: the editor's Pack Textures tool.
 
-# Five jobs, in the order a session meets them: build the window and wire its controls
-# (`pack_textures_popup`), give each of the five texture slots a picker (`_init_texture_picker`), run
-# the two file dialogs (`_init_file_dialogs`), orthogonalize and pack the selected images
-# (`_set_normal_vector`, `_align_normals`, `_pack_textures`), and write the `.import` sidecar that makes
-# Godot re-import the packed PNG with the quality and mipmap choices the user made
-# (`_create_import_file`).
-#
-# The accepted image extensions are a contract with two other places: the open dialog's filter list in
-# `_init_file_dialogs()` and `_can_drop_data()` in `channel_packer_dragdrop.gd`, which decides whether
-# a drag is accepted. All three have to name the same set.
-#
-# This is a RefCounted helper, not a node: the menu creates it and it adds its own window to the
-# plugin (see `pack_textures_popup`).
+# Owns the packing window, image selection and PNG import settings.
 extends RefCounted
 
 const PackerSupport = preload("res://addons/feng-idweight-terrain/menu/channel_packer_support.gd")
@@ -160,6 +148,7 @@ func pack_textures_popup() -> void:
 
 
 func _on_close_requested() -> void:
+	queue_pack_normal_roughness = false
 	last_file_selected_fn = no_op
 	images = [null, null, null, null, null]
 	window.queue_free()
@@ -172,6 +161,7 @@ func _init_file_dialogs() -> void:
 	save_file_dialog.set_file_mode(EditorFileDialog.FILE_MODE_SAVE_FILE)
 	save_file_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
 	save_file_dialog.file_selected.connect(_on_save_file_selected)
+	save_file_dialog.canceled.connect(func() -> void: queue_pack_normal_roughness = false)
 	save_file_dialog.ok_button_text = "Save"
 	save_file_dialog.size = Vector2i(550, 550)
 	
@@ -318,17 +308,8 @@ func _init_texture_picker(p_parent: Node, p_image_index: int) -> void:
 
 
 func _set_wh_labels(p_image_index: int, width: int, height: int) -> void:
-	match p_image_index:
-		0:
-			window.get_node("%AlbedoSize").text = "(%d, %d)" % [ width, height ]
-		1:
-			window.get_node("%HeightSize").text = "(%d, %d)" % [ width, height ]
-		2:
-			window.get_node("%NormalSize").text = "(%d, %d)" % [ width, height ]
-		3:
-			window.get_node("%RoughnessSize").text = "(%d, %d)" % [ width, height ]
-		4:
-			window.get_node("%AOSize").text = "(%d, %d)" % [ width, height ]
+	const SIZE_LABELS = ["%AlbedoSize", "%HeightSize", "%NormalSize", "%RoughnessSize", "%AOSize"]
+	window.get_node(SIZE_LABELS[p_image_index]).text = "(%d, %d)" % [width, height]
 
 
 func _show_message(p_level: int, p_text: String) -> void:
@@ -373,6 +354,7 @@ func _create_import_file(png_path: String) -> Error:
 func _on_pack_button_pressed() -> void:
 	packing_albedo = images[IMAGE_ALBEDO] != null and images[IMAGE_HEIGHT] != null
 	var packing_normal_roughness: bool = images[IMAGE_NORMAL] != null and images[IMAGE_ROUGHNESS] != null
+	queue_pack_normal_roughness = packing_albedo and packing_normal_roughness
 	
 	if not packing_albedo and not packing_normal_roughness:
 		_show_message(WARN, "Please select an albedo and height texture or a normal and roughness texture")
@@ -381,8 +363,6 @@ func _on_pack_button_pressed() -> void:
 		save_file_dialog.current_path = last_saved_directory + "packed_albedo_height"
 		save_file_dialog.title = "Save Packed Albedo/Height Texture"
 		save_file_dialog.popup_centered_ratio()
-		if packing_normal_roughness:
-			queue_pack_normal_roughness = true
 		return
 	if packing_normal_roughness:
 		save_file_dialog.current_path = last_saved_directory + "packed_normal_roughness"
@@ -420,12 +400,6 @@ func _on_save_file_selected(p_dst_path) -> void:
 		save_file_dialog.call_deferred("grab_focus")
 
 
-## Stable shortest-arc alignment with the existing row-vector convention.
-## `_align_normals()` right-multiplies this basis to take the mean normal onto +Z.
-func _alignment_basis(normal: Vector3) -> Basis:
-	return PackerSupport.alignment_basis(normal)
-
-
 func _set_normal_vector(source: Image, quiet: bool = false) -> void:
 	# Calculate texture normal sum direction
 	var normal: Image = source
@@ -444,7 +418,7 @@ func _set_normal_vector(source: Image, quiet: bool = false) -> void:
 
 func _align_normals(source: Image, iteration: int = 0) -> void:
 	# generate matrix to re-align the normalmap
-	var mat3: Basis = _alignment_basis(normal_vector)
+	var mat3: Basis = PackerSupport.alignment_basis(normal_vector)
 	# re-align the normal map pixels
 	for x in source.get_width():
 		for y in source.get_height():
@@ -464,15 +438,7 @@ func _align_normals(source: Image, iteration: int = 0) -> void:
 		_align_normals(source, iteration)
 
 
-## Packs two or three source images into the Terrain3D material layout, writes the PNG and writes the
-## `.import` sidecar beside it.
-##
-## Every parameter is positional and six of them are bools at the two call sites, so their order is part
-## of the interface: (rgb, a, ao, dst_path, invert_green, invert_smooth, align_normals,
-## normalize_height, alpha_channel, occlusion_channel). The albedo/height call passes
-## (albedo, height, null, path, false, invert_height, false, normalize_height, height_channel) and the
-## normal/roughness call passes (normal, roughness, ao, path, invert_green, invert_smooth,
-## align_normals, false, roughness_channel, occlusion_channel).
+## Packs material channels and writes the PNG with its import settings.
 func _pack_textures(p_rgb_image: Image, p_a_image: Image, p_ao_image: Image, p_dst_path: String, p_invert_green: bool,
 	p_invert_smooth: bool, p_align_normals: bool, p_normalize_height: bool, p_alpha_channel: int, p_occlusion_channel: int = 0) -> Error:
 	if p_rgb_image and p_a_image:

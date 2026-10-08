@@ -47,15 +47,6 @@ vec4 feng_cloud_height_fog(vec3 camera_to_receiver_m) {
 		float exponent1 = max(-127.0, fog1.y * (exclusion_world_y - fog1.w));
 		ray_origin_terms1 = fog1.z * exp2(-exponent1);
 	}
-	// The packet's first density terms already contain density at the observer.
-	// StartDistance recomputes them from authored density/height at the exclusion point.
-	if (start_distance <= 0.0) {
-		ray_origin_terms0 = fog0.x;
-		ray_origin_terms1 = fog1.x;
-	} else {
-		ray_origin_terms0 = ray_origin_terms0;
-		ray_origin_terms1 = ray_origin_terms1;
-	}
 	float line_shared = feng_cloud_fog_line_integral_shared(fog0.y, ray_direction_y, ray_origin_terms0)
 		+ feng_cloud_fog_line_integral_shared(fog1.y, ray_direction_y, ray_origin_terms1);
 	float line_integral = max(line_shared, 0.0) * ray_length_after_start;

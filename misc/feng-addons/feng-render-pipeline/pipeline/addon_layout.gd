@@ -9,16 +9,9 @@ extends RefCounted
 ## modules, the native pass scripts, the library templates) is addressed through here,
 ## so the layout is stated in exactly one place.
 
-const CANONICAL_DIR := "res://addons/feng-render-pipeline"
-
 static func dir() -> String:
 	var script: Script = FengAddonLayout
-	var script_path := script.resource_path if script != null else ""
-	if script_path.is_empty():
-		# Only reachable for a script with no file behind it (never true for the addon);
-		# the canonical location is the best guess and keeps the paths well formed.
-		return CANONICAL_DIR
-	return script_path.get_base_dir().get_base_dir()
+	return script.resource_path.get_base_dir().get_base_dir()
 
 static func passes_dir() -> String:
 	return dir() + "/passes/"

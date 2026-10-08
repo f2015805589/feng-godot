@@ -1,27 +1,37 @@
-# UE 5.8 Atmosphere 参数、传输与验证边界
+# UE 5.8 Atmosphere 参数与传输契约
 
-本次目标版本由用户指定为 **Unreal Engine 5.8**。属性与默认值依据 [5.8 官方属性文档](https://dev.epicgames.com/documentation/unreal-engine/sky-atmosphere-component-properties-in-unreal-engine?application_version=5.8)、[Sky Atmosphere 概览](https://dev.epicgames.com/documentation/en-us/unreal-engine/sky-atmosphere-component-in-unreal-engine)，并对照本机只读源码 `F:\ue\ue\UnrealEngine-5.8` 复核。实现包含 RGB Mie 吸收、臭氧、间接散射、地面反弹、物体空气透视和场景太阳透射。
+Feng Sky 对应 UE 5.8 的作者参数语义，提供 RGB Mie 吸收、臭氧、多次散射、地面反弹、
+物体空气透视和逐表面太阳透射。使用方式与参数单位见
+[Feng Sky](../misc/feng-addons/feng-sky/README.md)，FRP 数据布局见[引擎契约](frp-engine-contract.md)。
 
-## 来源与未获得的基准
+## 来源与比较范围
 
-- 本地核对的接口元数据位于 `Engine/Source/Runtime/Engine/Classes/Components/SkyAtmosphereComponent.h`；CDO 构造默认值和组件 setter 位于 `Engine/Source/Runtime/Engine/Private/Components/SkyAtmosphereComponent.cpp`
-- Mie 相函数位于 `Engine/Shaders/Private/SkyAtmosphere.usf`，使用标准 Henyey–Greenstein 相函数并按 `-dot(Light, WorldDir)` 取余弦
-- 高度雾环境光和方向大气光的注入位于 `Engine/Shaders/Private/HeightFogCommon.ush`；`HeightFogPixelShader.usf` 先计算高度雾、合并体积雾，然后在最终 RGB 合成处乘一次 `View.PreExposure`。Aerial Perspective 替换路径传入 `OneOverPreExposure`，以免重复预曝光
-- UE 源码路径只用于核对属性、默认值和渲染链；这里没有复制 UE shader，也不声称 Godot 与 UE 最终像素完全相同
-- 可访问的 [Hillaire 研究示例](https://github.com/sebh/UnrealEngineSkyAtmosphere/tree/183ead5bdacc701b3b626347a680a2f3cd3d4fbd) 为独立 MIT 项目，固定版本 `183ead5bdacc701b3b626347a680a2f3cd3d4fbd`（2022-09-11）。参考 `RenderSkyCommon.hlsl`、`RenderSkyRayMarching.hlsl` 的密度、相函数和双散射闭合思路；许可保存在 `feng-sky/THIRD_PARTY_NOTICES.md`
-- 未复制、重新许可或发布私有 UE shader；没有声称该示例就是 UE 5.8 源码
-- 官方网页没有列出所有构造值和元数据限制；表中默认值、属性范围与 setter 行为已按本机 UE 5.8 CDO 构造函数、头文件元数据和运行代码交叉核对。尚未获得的是相同场景的 UE 线性 HDR 图像，因此没有 LUT 精度、色调映射或最终像素一致性的对照基准
+参数依据 [UE 5.8 属性文档](https://dev.epicgames.com/documentation/unreal-engine/sky-atmosphere-component-properties-in-unreal-engine?application_version=5.8)
+和 [Sky Atmosphere 概览](https://dev.epicgames.com/documentation/en-us/unreal-engine/sky-atmosphere-component-in-unreal-engine)，
+并曾对照本机只读 `F:\ue\ue\UnrealEngine-5.8` 的组件头文件、CDO 构造与 setter：
+`SkyAtmosphereComponent.{h,cpp}`、`SkyAtmosphere.usf`、`HeightFogCommon.ush` 和 `HeightFogPixelShader.usf`。
 
-## 作者参数映射
+数值模型参考 Sébastien Hillaire 的独立 MIT
+[研究示例](https://github.com/sebh/UnrealEngineSkyAtmosphere/tree/183ead5bdacc701b3b626347a680a2f3cd3d4fbd)，
+固定版本 `183ead5bdacc701b3b626347a680a2f3cd3d4fbd`。许可保存在
+[THIRD_PARTY_NOTICES.md](../misc/feng-addons/feng-sky/THIRD_PARTY_NOTICES.md)。
+UE 私有 shader 仅用于核对接口与链路，没有复制、重新许可或发布。
 
-RGB 系数的 Inspector 适配层显示 UE 风格的归一化线性 Color 与物理系数 scale；Color 不做 sRGB 转换。为兼容旧场景和脚本，旧 raw RGB 和 multiplier 的存储/API 含义不变，唯一保存的仍是这组旧 storage，适配字段不会另存一份。编辑新视图时反向换算到原 storage，因此系数有效乘积 `raw RGB × multiplier` 保持兼容。四种归一化基准分别是 Rayleigh `.0331`、Mie scattering `.003996`、Mie absorption `.000444` 和 Other absorption `.001881 km⁻¹`。Godot 世界单位是米，物理积分统一使用 km / km⁻¹。UE 世界坐标通常为 cm，迁移位置需除以 100，不能直接照抄位置数字。
+尚无同场景 UE 线性 HDR 基准；参数映射与数值测试支持功能对齐，像素等价仍待验证。
+Feng 的采样预算、曝光和材质路径独立。
+
+## 作者参数
+
+Godot 世界单位为米；物理积分用 km / km⁻¹。UE 位置通常为 cm，迁移位置需除以100。
+Inspector 的线性 Color × 系数 scale 是旧 raw RGB × multiplier 的适配视图；
+存储只保留 canonical 字段，有效乘积和旧脚本语义保持兼容。
 
 | UE 语义 / UI | Feng 作者字段 | 默认值及执行路径 |
 | --- | --- | --- |
 | Transform Mode | `transform_mode` | 三模式：世界原点海平面、组件位置海平面、组件位置行星中心 |
 | Component Transform | `planet_origin` / `planet_transform` | WorldEnvironment 非空间节点；指定世界米坐标，或链接 Node3D 的 global_position；跟随父级移动通过该空间节点实现 |
 | Ground Radius / API BottomRadius | `ground_radius`，别名 `bottom_radius` | 6360 km；Inspector 为1–7000 km软滑块。Feng 保留1–100000 km数值安全范围；UE头文件的ClampMax=10000是编辑器约束，setter/render路径不把它当物理上限 |
-| Ground Albedo | `ground_albedo` | 线性 RGB .4；只参与多次散射反弹，不再绘制虚假的朗伯地面半球 |
+| Ground Albedo | `ground_albedo` | 线性 RGB .4；参与多次散射反弹；虚拟地面仅遮挡视线 |
 | Atmosphere Height | `atmosphere_height` | 60 km；Inspector为1–200 km软滑块，运行时仍用原0.1–10000 km安全范围 |
 | MultiScattering | `multi_scattering_factor` | 1；只放大二阶及后续贡献，0 关闭 |
 | Rayleigh Scattering / Scale | `rayleigh_scattering_color` / `rayleigh_scattering_coefficient_scale` | Inspector显示归一化Color×系数：(.175286,.409607,1) × .0331 km⁻¹。旧 `rayleigh_scattering` 和 `rayleigh_scattering_scale` 原样保留为隐藏存储/API |
@@ -42,30 +52,50 @@ RGB 系数的 Inspector 适配层显示 UE 风格的归一化线性 Color 与物
 | Atmosphere Sun Light Index 0 / 1 | `sun_light` / `secondary_sun_light` | 每个按真实 light RID 对应；次光不被自动选为主光；依 UE5.8 已记录的限制，只有主光参与多次散射 |
 | Directional Light Source Angle / Disk Tint | `sun_source_angle_deg` / `secondary_sun_source_angle_deg`；`sun_disk_color_scale` / `secondary_sun_disk_color_scale` | 角度为圆盘直径，主/次默认.5357°；旧 `*_angular_radius_deg` 脚本和场景别名仍表示半径.26785°，保存只写新直径字段，内部 shader uniform 仍接收半径。独立白色默认 disk scale 只改太阳盘，不改太阳直射能量或大气散射 |
 
-## 模型、精度与性能
+## 模块与数值边界
 
-`feng_sky_parameters.gd` 只负责有限数值合同；`feng_sky_transport.gd` 是纯 CPU 光学；两个 LUT 模块只负责有界采样与缓存；Runtime 负责弱引用的世界发布，不再承担完整光学模型。组件负责资源所有权、作者参数、光源选择和缓存失效。FRP 的 `atmosphere_packet.gd` 是 normalized snapshot → GPU 数据包的唯一适配器。
+`feng_sky_parameters.gd` 归一化有限输入；`feng_sky_transport.gd` 负责纯 CPU 光学；
+LUT 模块负责有界采样/缓存；组件负责资源与光源所有权，Runtime 发布世界快照。
+FRP `atmosphere_packet.gd` 将归一化快照适配为 GPU 数据。
 
-128×64 RGB32F 光学列包含 Rayleigh、Mie、臭氧。密度变化才重建；太阳、强度、曝光和系数变化不重建该表。过薄剖面回退到直接积分，不能把旧纹理传给空气透视。16×16 RGB32F 多次散射表使用16方向、12段及几何级数闭合，反馈上限 .95。它的生成约 .47 s，是明确的首次/光学参数修改成本；不能拿缓存命中帧掩盖它。每个 provider 保留自己的 CPU image 和 GPU texture，四项共享字节缓存只用于复用初次生成，不会使多世界的后续太阳移动再次生成表。
+光学列为128×64 RGB32F，存储 Rayleigh/Mie/臭氧密度积分；几何或密度改变才重建。
+薄剖面采用直接积分。多次散射为16×16 RGB32F，采用16方向、12段和几何级数闭合，
+反馈上限0.95。每个 provider 拥有 CPU image/GPU texture，有界共享字节缓存复用同参构建。
+光源移动、能量与曝光复用光学表；首次生成和光学参数修改有独立成本。
 
-数值保护范围是 Feng 实现的有限预算，不冒充 UE 的 Inspector ClampMin/Max：行星半径1–100000 km、大气高度.1–10000 km、密度高度.001–1000 km、系数0–100 km⁻¹、`g` 为0–.999、太阳圆盘角半径0–2.5°。多次散射系数有限，反馈权重上限.95；太阳辐照输入上限10M，天空源值上限60000。60000上限发生在预曝光之前，亮度增益与 PreExposure 仍可能放大最终像素，因此它不是 RGBA16F 写入安全界；最终 HDR 写入由 native finite/range guard 限制到65504。Trace Sample Scale 暴露 UE 的.25–8软范围，Feng当前仍以8作为计算预算上限；UE另受 scalability CVar 限制，二者不是同一预算。Height Fog Contribution 的 Inspector 滑块为0–1，但大于1的存档值保持有效，只作有限、非负保护。数值预算有明确画面差异，不能用这些结果声称 UE 逐像素一致。
+运行时有限预算：半径1–100000 km，大气高度0.1–10000 km，密度高度0.001–1000 km，
+系数0–100 km⁻¹，g为0–0.999，太阳圆盘角半径0–2.5°，输入辐照上限10M。
+天空/圆盘源值上限60000；最终原生 HDR 写入另有有限值和65504范围保护。
+Inspector 软滑块、Feng 硬预算和 UE scalability 限制分别生效。
+Height Fog Contribution 允许有限非负且大于1的值。
 
-物理模式仍使用真实60,000 lux场景输入；非物理模式保持 PI×energy 的 FRP约定。UE 源码显示天空环境光和方向大气光先进入 Height Fog 源项，Height Fog 最后合成时对 RGB 乘一次 PreExposure；本项目的FRP高度雾 pass 也把当前 pre-exposure 交给 native 合成路径。该证据说明预曝光的位置与责任，不等价于两边 HDR 像素已逐点验证。太阳圆盘的独立 tint 不参与大气散射、太阳辐照或场景直射光。引擎准备阶段上传数据后，使用同一过滤顺序匹配光源槽位，再由各表面着色路径求透射。
+物理模式保留场景 lux；非物理模式采用 FRP 的 PI×energy 约定。Height Fog 在组合源项后
+施加一次 pre-exposure。太阳盘 tint 仅调整盘面；主光参与多次散射，两盏光都参与单次散射
+与直接透射。太阳候选按 SceneTree 共享事件缓存，逐帧检查同世界、可见性和天空模式。
 
-太阳自动选择使用按 `SceneTree` 共享的事件缓存：新 provider 只触发一次初始候选枚举，之后通过节点加入/移除信号维护候选；每帧只检查缓存中的方向光候选及其当前可见性、World3D、天空模式和次光排除条件，不再每个组件重复扫全场景树。CPU 微基准在5,000个普通节点上测得每次旧式全树 `find_children` 约1.02 ms，中位数；新 registry 无太阳时每次 resolve 约0.5 μs，64个方向光候选时约77 μs。初始 seed 为1.43 ms，每个后续 provider attach 约29 μs。这是合成 CPU 基准，不包含渲染线程、GPU、NativePass、Shader 首编译或真实 test-1 场景开销，不能用来解释原生 `run_pass` 的 inclusive 耗时。
+FRP 空气透视和逐表面太阳透射经现有 Height Fog 条目准备/执行。Forward+ 可显示天空
+材质；该组件没有实现 UE 的全部每灯光开关、体积阴影、折射、3D AP froxel LUT 或材质图
+表达式。FengSkyLight 的独立捕获功能见组件 README。
 
-## 有意保留的实现边界
+## 兼容与验证
 
-FRP 使用逐表面太阳透射；UE 的每灯光开关/CVar、云层阴影、地形参与的大气体积阴影、折射、SkyLight 捕获系统、空中透视3D froxel LUT以及材质图专用表达式没有被逐项克隆。Godot Forward+可渲染该天空材质，但本次物体空气透视与太阳透射接入属于FRP，要求当前管线启用现有Height Fog条目。`sun_source_angle_deg` 表示太阳角直径并转换为 shader 半径；旧 `sun_angular_radius_deg` API 继续表示半径。渲染步骤、采样预算、曝光状态和材质路径不同，所以参数与相函数的对应不构成同像素承诺。
+旧半径、高度、Rayleigh、标量 Mie scattering/extinction、`mie_asymmetry` 和
+`planet_center_m` 可加载/读写。旧消光转为非负吸收；旧中心选择显式中心模式。
+旧 `*_angular_radius_deg` 继续表示半径，新 `*_source_angle_deg` 保存直径。
+只有精确命中迁移白名单的已发布默认 shader 源会更新；用户修改的 shader 保留。
+具体历史 hash 与二进制证据见 [Windows 验证](frp-unreal-atmosphere-windows-validation.md)。
 
-## 迁移与稳定契约
+```sh
+python misc/feng-addons/feng-sky/tests/run_sky_atmosphere_tests.py --editor /path/to/godot
+```
 
-旧 `planet_radius_km`、高度字段、Rayleigh 系数、灰色 Mie scattering/extinction、`mie_asymmetry`、`planet_center_m` 都仍可加载/读写。旧 raw coefficient、颜色乘数的组合与有效系数保持原意；新的 UE 风格 Color/scale 只作为 Inspector 视图，保存不双写。旧消光换算为非负吸收；旧中心坐标自动选择显式中心模式。旧太阳半径属性保留半径语义并可双向赋值，新规范属性 `sun_source_angle_deg` / `secondary_sun_source_angle_deg` 保存直径。两个已发布 shader 默认源和 test-1 中未修改的 e002 内嵌默认 shader 均列入精确 SHA256 迁移白名单；test-1 旧源码的 LF 规范化 SHA256 为 `0f815fb7da56be15db13c180fa6a1de55d5f7383fe22764aa16c6f315ec166fb`。仅精确命中的旧源会迁移到当前 shader；任意用户修改版本继续保留为自定义天空。A 在 main `9f5149db7a` 独立验证了 e002 默认内嵌 shader 迁移至 SHA256 `FECD4D6C7E913134CD27EFE95DAFBC5876E61C262620368FF701AA534D47863E` 的当前源，并确认自定义 shader 被保留。
+CPU 检查覆盖参数/别名往返、资源和世界生命周期、太阳候选、光学传输与缓存。
+追加 `--gpu-driver d3d12` 或 `--gpu-driver vulkan` 覆盖 GPU 数值、雾、空气透视和移动场景。
+图形结果需要真实驱动；headless 只验证 CPU 契约。
 
-新 prepare hook 通过 ViewPass / BuiltinPass / NativePass 转发，Volume 相机不会失去空气透视数据。默认仍是9个原生条目+5个库条目，13个常规条目开启、Debug Buffers关闭；不添加第14个常规 pass，不改作者覆盖。空气透视随现有 Height Fog 条目的显式启停一起调度。
+[Linux 历史记录](frp-unreal-atmosphere-validation.md)、[Windows 历史记录](frp-unreal-atmosphere-windows-validation.md)
+保存各构建的通过项目、HDR 压力与性能范围。test-1 完整地形/编辑器默认黑斑在这些记录中
+未复现；通用 HDR 压力结果不能归因或替代该场景复现。
 
-## 验证说明
-
-可复现入口为 `misc/feng-addons/feng-sky/tests/run_sky_atmosphere_tests.py`。组件/世界生命周期、UE 参数与迁移、CPU optical transport、Sky numerics、优化与 GPU tests 均已通过。A 使用 e002 备份和最终 FECD shader/add-on source 完成 CPU 基础套件、Registry 与迁移/自定义 shader 保留检查；GPU numerics、Fog、TAA 前 HDR 压力和 1920×1080 profile 则使用新 native `27def4b95` 与同一最终 source 完成。HDR stress 检查 76,800 个 finite/nonzero 项、`bad=0`、饱和值计数2、中心最大值65504；它不是 e002 对比，也不代表 Feng 默认场景会溢出。test-1 完整地形/编辑器默认黑斑仍未复现，不能据这些压力值声称它已被证明或解决。具体二进制、HDR 和 profile 数据见 [Windows D3D12 验证记录](frp-unreal-atmosphere-windows-validation.md)。参数契约探针验证旧 raw 有效系数 round-trip、角度 alias、canonical 存储、臭氧关闭条件和硬范围；Registry CPU 探针覆盖无太阳、大量节点、多 provider、候选加入/删除/排序、world/reparent 与多 viewport 生命周期。历史 Linux 验证原文保存在 [历史验证记录](frp-unreal-atmosphere-validation.md)，不代表 Windows 最终运行；架构审查见 [七插件复核](frp-addon-audit.md)。
-
-准确比较下一步需要：同一UE5.8构造默认值导出、同一地球/相机位置和姿态、同一线性太阳色与lux、相同曝光/白平衡/tonemapper、关闭未实现云和额外天空项、线性HDR截图及天空/物体区域误差。当前没有这套UE图像，因此本提交提供可检验的参数语义与传输功能对齐，不声称渲染器完全等价。
+UE 图像比较需要匹配构造默认值、地球/相机姿态、线性太阳色/lux、曝光、白平衡和
+色调映射，并对共同实现范围的线性 HDR 天空/物体区域计算误差。

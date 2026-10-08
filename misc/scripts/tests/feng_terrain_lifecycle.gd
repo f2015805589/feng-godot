@@ -13,6 +13,7 @@ const ListContainer := preload("res://addons/feng-idweight-terrain/src/asset_doc
 const Dock := preload("res://addons/feng-idweight-terrain/src/asset_dock_common.gd")
 const TerrainObjects := preload("res://addons/feng-idweight-terrain/utils/terrain_3d_objects.gd")
 const TerrainSetup := preload("res://addons/feng-idweight-terrain/src/terrain_setup.gd")
+const VTEditor := preload("res://addons/feng-idweight-terrain/src/vt_editor.gd")
 
 
 class TestListContainer extends ListContainer:
@@ -36,9 +37,43 @@ class TestPlugin extends EditorPlugin:
 
 	var terrain: TestTerrain
 	var valid := true
+	var debug := 0
+	var ui := SelectionUI.new()
 
 	func is_terrain_valid(_terrain = null) -> bool:
 		return valid and is_instance_valid(terrain) and is_instance_valid(terrain.assets)
+
+
+class SelectionUI extends RefCounted:
+	var pair_background_id := -1
+	var pair_overlay_id := -1
+
+	func _on_setting_changed() -> void:
+		pass
+
+
+class OverviewProbe extends VTEditor:
+	var settings_reads := 0
+	var pages: Array = []
+
+	func _vt_settings() -> Dictionary:
+		settings_reads += 1
+		return {"border": 0}
+
+	func _region_locations(_source: Object) -> Array:
+		return [Vector2i.ZERO]
+
+	func _region_world_size() -> Vector2:
+		return Vector2.ONE
+
+	func _baked_pages() -> Array:
+		return pages
+
+	func _overview_image_size(_bounds: Rect2) -> Vector2i:
+		return Vector2i(8, 8)
+
+	func _make_height_thumbnail(_bounds: Rect2, image_size: Vector2i) -> Image:
+		return Image.create_empty(image_size.x, image_size.y, false, Image.FORMAT_RGBA8)
 
 
 class TestTerrainObjects extends TerrainObjects:
@@ -79,6 +114,8 @@ func run() -> void:
 	var harness := Node.new()
 	harness.name = "TerrainLifecycleHarness"
 	get_tree().root.add_child(harness)
+	_test_asset_selection_bounds(harness)
+	_test_overview_settings_snapshot()
 
 	await _test_list_entry(harness)
 	await _test_list_container(harness)
@@ -92,6 +129,60 @@ func run() -> void:
 		return
 	print("PASS Terrain editor lifecycle behaviour: resource signals, dock reparent, objects and dismissed weakrefs")
 	get_tree().quit(0)
+
+
+func _test_asset_selection_bounds(harness: Node) -> void:
+	var plugin := TestPlugin.new()
+	var list := ListContainer.new()
+	list.plugin = plugin
+	harness.add_child(list)
+	for index in Terrain3DAssets.MAX_TEXTURES:
+		var entry := ListEntry.new()
+		var asset := _new_texture()
+		asset.id = index
+		entry.set_edited_resource(asset)
+		list.add_child(entry)
+		list.entries.append(entry)
+	var last_asset := Terrain3DAssets.MAX_TEXTURES - 1
+	for query in ["", "matching filter"]:
+		list.search_text = query
+		list.set_selected_id(last_asset)
+		expect(list.selected_id == last_asset and list.get_selected_asset_id() == last_asset,
+				"full asset list excluded its last actual asset (search '%s')" % query)
+	var empty := ListEntry.new()
+	list.add_child(empty)
+	list.entries.append(empty)
+	for query in ["", "matching filter"]:
+		list.search_text = query
+		list.set_selected_id(last_asset + 1)
+		expect(list.selected_id == last_asset and list.get_selected_asset_id() == last_asset,
+				"empty add tile became an asset selection (search '%s')" % query)
+	list.clear()
+	expect(list._max_selectable_id() == 0 and list.get_selected_asset_id() == 0,
+			"empty asset list lost its safe selection sentinel")
+	list.free()
+	plugin.free()
+
+
+func _test_overview_settings_snapshot() -> void:
+	var window := OverviewProbe.new()
+	window.terrain = RefCounted.new()
+	window._built = true
+	window.overview = TerrainVTWorldOverview.new()
+	window.overview_label = Label.new()
+	window.add_child(window.overview)
+	window.add_child(window.overview_label)
+	for index in 4:
+		var image := Image.create_empty(2, 2, false, Image.FORMAT_RGBA8)
+		image.fill(Color.WHITE)
+		window.pages.append({"mip": 0, "preview": image,
+				"world_rect": Rect2(Vector2(index % 2, index / 2) * 0.5, Vector2.ONE * 0.5)})
+	window._refresh_overview()
+	expect(window.settings_reads == 1, "overview reread the native settings report for each material page")
+	var stitched: Image = window.overview.overview_texture.get_image()
+	for point in [Vector2i(1, 1), Vector2i(6, 1), Vector2i(1, 6), Vector2i(6, 6)]:
+		expect(stitched.get_pixelv(point).is_equal_approx(Color.WHITE), "overview lost a stitched material page")
+	window.free()
 
 
 func _test_list_entry(harness: Node) -> void:

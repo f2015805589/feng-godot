@@ -33,11 +33,12 @@ autoload 注册保留在项目中，可在不需要插件运行时服务时手�
 
 ## 默认管线
 
-新 Renderer 包含 **9 个原生条目和 5 个库条目，共 14 个**。
+新 Renderer 包含 **9 个原生条目和 8 个库条目，共 17 个**。
 仅 Debug Buffers 默认关闭，其余条目默认开启；已保存资源保留自己的开关和参数。
 
 ```text
-Shadow → VT → GBuffer → Lighting → Magic GI → Sky → Height Fog → Transparent
+Shadow → VT → GBuffer → Cloud Shadows → Lighting → Magic GI → Sky
+       → Volumetric Cloud Trace → Height Fog → Volumetric Cloud → Transparent
        → Temporal AA → Eye Adaptation → Bloom → Color Grade → Post Process → Debug Buffers
 ```
 
@@ -79,6 +80,10 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 - **Magic GI**：在 Lighting 后把有效 surface PRT 烘焙与当前太阳/环境 SH 组合为漫反射间接光。
   按当前 render target 匹配快照；没有匹配的有效烘焙时保持场景色不变，贡献纹理清零。
   光照变化更新 SH，无需重烘焙。烘焙由可选的 feng-magic-gi 插件提供。
+- **Cloud Shadows**：在 GBuffer 后准备云阴影与 Sky AO；组件上的两项功能默认关闭。
+- **Volumetric Cloud Trace**：在 Sky 后追踪云辐射、透射和深度；**Volumetric Cloud** 在
+  Height Fog 后合成，透明表面可通过材质的 Cloud Fogging 参与深度相关云传输。
+  三个阶段消费可选 feng-cloud 的同世界快照，缺少有效云源时跳过。
 - **Height Fog**：位于 Sky 后，消费匹配世界的雾与大气快照。大气的准备数据通过帧前钩子
   交给原生光照；天空后的 compute 处理 opaque 像素，前向材质使用自身片元位置合成。
 - **Eye Adaptation**：在 TAA 后、Bloom 前测量 HDR 场景色。支持 Histogram、Basic、Manual，
@@ -240,11 +245,11 @@ TAA 开放 `enabled` 与 `jitter_phases`。添加模块本身不会打开作者�
 ## 库同步与旧资源
 
 `pipeline/library_manager.gd` 的 manifest 定义库身份、模板、默认开关和插入位置。
-`DEFAULT_LIBRARY_SEEDED` 控制自动加入的五个库条目；其它模板只通过 Library 菜单添加。
-同步保留作者参数、已识别条目的顺序和显式删除记录。缺少 Lighting/Sky 锚点的自定义整帧
-管线不会自动插入 Magic GI/Height Fog，可手动添加并放在自定义光照/天空之后。
+`DEFAULT_LIBRARY_SEEDED` 控制默认管线中的库条目；其它模板只通过 Library 菜单添加。
+同步保留作者参数、已识别条目的顺序和显式删除记录。缺少对应 GBuffer/Lighting/Sky 锚点时，
+依赖该锚点的库效果由作者手动添加并放在对应工作之后。
 
-当前 Renderer schema 为 8。迁移处理旧原生 ID、合并后的 Operation、默认实现和 Bloom 位置，
+当前 Renderer schema 为 10。迁移处理旧原生 ID、合并后的 Operation、默认实现和 Bloom 位置，
 并尽量保留开关与自定义条目的相对位置。仅含旧阶段效果的资源会补齐原生调度。
 若 Inspector 仍报告原生 ID/名称不匹配，创建当前 Renderer 并迁入自定义效果和参数。
 

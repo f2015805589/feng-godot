@@ -3,58 +3,17 @@
 #ifndef TERRAIN3D_CLIPMAP_H
 #define TERRAIN3D_CLIPMAP_H
 
-// The clipmap delivery: a toroidal ring of power-of-two levels in one `Texture2DArray`, addressed by
-// arithmetic rather than by an indirection page table.
+// Toroidal power-of-two levels in a Texture2DArray, filled by a channel source.
+// Level l covers base_world * 2^l metres in size texels. Sampling chooses the
+// finest covering level; the shared ladder defines density.
 //
-// It is the fourth method of the delivery matrix (`terrain_3d_vt_delivery.h`) and the simplest of
-// them by construction: no indirection texture, no allocator, no page table, no LRU. Level `l`
-// covers `base_world * 2^l` metres in `size` texels, so its texel is `base_world * 2^l / size`
-// metres wide, and a world position is answered by the finest level whose coverage contains it.
-// The shipped shape's eleven levels are the task's ladder: `size / base_world = 1024` texels a metre
-// at level 0 falling by half per level to `1` at level 10 (see `LADDER_UNITS` in
-// `terrain_3d_clipmap_common.h`), which is why level 10 is a 256 m square and level 0 a 0.25 m one.
+// Centres snap to texels. Physical = (logical + ring) mod size preserves stored
+// content while moving coverage queues only entering strips. Production is
+// budgeted in channel texels; readers fall back while a level is incomplete.
 //
-// **The ring is channel-agnostic, and that is the point.** This class is the *mechanism*: the
-// levels, the addressing, the strips, the budget and the upload. What a texel holds is a
-// `Terrain3DClipmapSource` (`terrain_3d_clipmap_source.h`) - the height source, the material
-// source, and whatever comes next - so a second channel group selecting Clipmap is a new source
-// object, not a second copy of this file, and the ring's own addressing tests run with no terrain
-// and no channel at all.
-//
-// **The ring, and why content never moves.** A level's centre is snapped to its own texel size, so
-// a stationary camera writes nothing and a moving one writes only the strips that its own coverage
-// lost and gained. The stored texels do not move: the level carries a `ring` offset and the mapping
-// is `physical = (logical + ring) mod size`, so a centre that moved `d` texels only turns the ring
-// by `d` while a *logical* index keeps naming the same world position. Deriving a world position
-// from the *physical* index without undoing the ring is the classic failure of this design, which is
-// why `logical_of_physical()` is the only way a reader gets from a stored texel to a world position
-// and why the deterministic tests drive every axis and both signs of wrap through it.
-//
-// **The budget.** A strip is at most `2 * size * |d|` texels, but a level that moved past its own
-// coverage - or that has never been produced - is a full `size * size`, so production is queued as
-// rect jobs and drained under a per-call budget. A level is `valid` only while every job that names
-// it has drained; a level that is not valid still holds the level it replaces, which is what a
-// caller that has not been switched to the ring yet reads anyway. The budget is counted in
-// *channel texels* - one logical texel of one channel - so a multi-channel source pays for what it
-// produces rather than for the texel it lands in.
-//
-// **`valid` is a rendering input, not a diagnostic.** A reader that samples the ring - the shader
-// arm - serves a level only while it is `valid` and falls back to the source it can still trust
-// otherwise, so a level that is mid-fill, mid-strip or mid-invalidation never reaches a fragment.
-// That is what makes `invalidate_rect()` safe to be cheap: an edit turns the levels that cover it
-// not-current, the fallback answers for the few ticks the re-production takes, and the ring takes
-// over again when the rect has drained.
-//
-// **Uploading.** The GPU copy is published per produced *rect*, not per level: a produced rect is
-// split into the level's stored frame (at most four pieces through the wrap), packed per channel on
-// the producing thread, and landed by `RenderingDevice::texture_copy()` out of a staging texture
-// sized to the piece. `texture_update()` writes a whole layer only when the piece *is* the layer;
-// a strip pays its own texels rather than the square the old whole-layer republish paid. The device
-// calls run in `publish_pending_uploads()`, which the facade invokes on the caller's thread after
-// every update - the block atlas's own split, mirrored - so the worker never touches the device.
-// The byte count is reported (`get_upload_bytes()`): the CPU side is incremental and now the
-// transfer is too, and the number is published so it stays a measurement rather than an assumption.
-// See docs/vt_delivery_assembly.md section 6.
+// Uploads and bakes use produced rectangles in physical storage coordinates.
+// Workers pack bytes; publish_pending_uploads performs device copies on the
+// render thread. Bake leases reject results for replaced content.
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/array.hpp>
@@ -74,27 +33,16 @@
 #include "terrain_3d_clipmap_impl.h"
 #include "terrain_3d_clipmap_source.h"
 
-// The **LOD implementation** of the one clipmap layer: the shared contract is
-// `terrain_3d_clipmap_impl.h`, the shared vocabulary is `terrain_3d_clipmap_common.h`, and what this
-// file adds is the toroidal level ring's storage, strips, upload and rolling. The facade
-// (`terrain_3d_clipmap_layer.h`) selects between this and the block atlas; nothing above either class
-// names which one it holds.
+// LOD storage implementation selected by Terrain3DClipmapLayer.
 class Terrain3DClipmap : public Terrain3DClipmapImpl {
 	// The ring is not a Godot class, so it has to name itself for the log macro the way the baked
 	// channel storage does.
 	CLASS_NAME_STATIC("Terrain3DClipmap");
 
 public:
-	// The most levels a ring can hold, and therefore the fixed size of the shader's per-level arrays
-	// and of the dictionaries that bind them. One number for the clamp, the publish and the
-	// declaration, so a ring that grew past the shader's arrays is not expressible. It is above the
-	// eleven units the shipping 1024 -> 1 ladder needs, so the ceiling can never truncate that span.
+	// Shared limit for configuration and shader arrays.
 	static constexpr int MAX_LEVELS = TerrainClipmap::MAX_LEVELS;
-	// The shape of the ring. `size`, `levels` and `channels` are clamped by `configure()`.
-	// `channels` is how many values a texel holds, one texture array layer each (slice
-	// `level * channels + channel`); `format` is one *value's* format - `FORMAT_RF` (float32) or
-	// `FORMAT_R8` (normalised) - because a layer holds exactly one value per texel. A channel that
-	// needs several components is a different publish path, not a different ring.
+	// One texture-array layer per channel per level: level * channels + channel.
 	struct Config {
 		// Filled from the facade's shared Shape. Zero means a caller did not resolve a shape.
 		int size = 0;
@@ -102,15 +50,7 @@ public:
 		real_t base_world = 0.f;
 		int channels = 1;
 		Image::Format format = Image::FORMAT_RF;
-		// The *baked* channels: this many arrays of `baked_format`, one layer per level, that a
-		// compute producer writes through storage images and a reader samples whole. They exist
-		// because a value with several components - baked material is albedo and height, an
-		// octahedral normal and roughness, and the parameters - is not expressible as `channels`
-		// values in `format`, and because the producer is a pass, not a row filler: it reads the
-		// level's own texels and writes the level's own layer, so nothing travels through the CPU.
-		// The ring owns the storage rather than the producer because the shape is the ring's - one
-		// layer per level, at the ring's size, following its centres and its rings - and the producer
-		// is handed the levels. Zero means a ring whose content is only what its source fills.
+		// Optional GPU-produced arrays, one layer per level and one array per channel.
 		int baked_channels = 0;
 		Image::Format baked_format = Image::FORMAT_RGBAH;
 	};
@@ -125,27 +65,14 @@ public:
 		// The toroidal offset, in texels, always reduced into [0, size).
 		Vector2i ring;
 		std::vector<float> texels;
-		// Whether every texel of this level matches `center` and `ring` right now. False covers all
-		// three reasons a level is not current - never filled, a strip queued, an edited rect queued -
-		// because a reader's answer to all three is the same: read the source instead.
+		// All source texels match the current centre and ring.
 		bool valid = false;
-		// Whether the level's *baked* layers have been written for the content the level holds. A
-		// separate flag because the two producers are separate passes over the same rect: the source
-		// fills the strips from the CPU, the bake follows them on the device, and a reader that samples
-		// the baked layers needs both - the rect the CPU side now holds and the layers the device side
-		// wrote for it. It is derived from the ring's *bake rect queue* (`_refresh_baked()`): a level
-		// with a produced rect no bake has covered is not baked, and one whose queue is empty has had
-		// every rect of its content written. Cleared beside `valid` wherever the content starts moving,
-		// because a level the CPU side is replacing is not a level the device side describes either.
+		// All produced rectangles have been baked for the current content.
+		// Cleared with valid when production begins; refreshed from the bake queue.
 		bool baked = false;
 	};
 
-	// A rect of *logical* texels to produce, half-open on both axes. A rect is always a rect: a
-	// column strip is `[size - d, size) x [0, size)` and every one of its rows is produced, which is
-	// why where production stopped is separate state rather than a second shape. `cursor_*` names
-	// the next value to produce - row, channel and column inside the rect - so a job the budget cut
-	// short resumes at exactly the value after the last one it wrote, and a job that has not started
-	// has its cursor at the rect's origin (what the constructor sets).
+	// Half-open logical rectangle with a row/channel/column cursor for budgeted resume.
 	struct Job {
 		int level = 0;
 		int x0 = 0;
@@ -169,10 +96,7 @@ public:
 	// destructor of its own.
 	~Terrain3DClipmap();
 
-	// Sizes the ring from `p_config`: `size` texels an axis over `levels` levels, the finest covering
-	// `base_world` metres, carrying `channels` values a texel in `format`. Reconfigures in place:
-	// content cannot survive a different shape, so every level is invalidated and rebuilt from the
-	// next update. A no-op when nothing changed.
+	// Reconfigure changed shapes in place, invalidating old content; unchanged shapes are a no-op.
 	void configure(const Config &p_config);
 	void clear() override;
 
@@ -185,10 +109,7 @@ public:
 	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot) override {
 		if (_source != nullptr) { _source->set_source_snapshot(p_snapshot); }
 	}
-	// ---- The shared contract this implementation answers ----------------------------------------
-	// The density ladder is the *shared* one, built from the shape the settings asked for, so a
-	// caller's "what density is 40 m away" is answered identically whichever implementation is
-	// selected - the ladder is the layer's, not the storage's.
+	// Shared clipmap identity and sampling contract.
 	TerrainClipmap::Implementation get_implementation() const override {
 		return TerrainClipmap::Implementation::LOD;
 	}
@@ -213,76 +134,31 @@ public:
 	real_t sample(const Vector2 &p_world, const int p_channel = 0) const override;
 	String get_source_name() const override;
 
-	// ---- The baked channels: what a compute producer fills --------------------------------------
-	// The ring carries the storage and the shader's copy of it; the pass that fills it belongs to
-	// whoever can bake, and it is handed the ring rather than the other way round. Nothing here
-	// dispatches, and a ring with no baked channels answers with invalid RIDs rather than refusing.
-	//
-	// **The producer's work is the ring's own rects, one rect at a time.** A level is produced as
-	// rects (a fill, a strip, an invalidated area), and the same rect is what a bake has to cover:
-	// baking the level whole for every strip would throw away the strip model the whole mechanism is
-	// built around. `_bake_rects` is therefore the queue: every rect this ring has produced and no bake
-	// has covered yet, in the level's *stored* frame - the frame the payload layer is in, and the one
-	// that keeps naming the same world position as the level turns - merged per level as it is produced.
-	// A producer copies what it will dispatch and reports each rect back when its bake lands; the ring
-	// keeps a rect whose lease moved, so "the level is baked" is a statement about what the device wrote
-	// rather than about what was asked for.
-	// The **shared** bake-queue entry (`TerrainClipmap::BakeRect`), not a second shape: a rect of one
-	// level tagged with the lease that says the level's content still matches what the producer read.
-	// `unit` is the level here. Keeping the shared type is what lets one producer queue serve both
-	// implementations instead of one queue per storage layout.
+	// Produced rectangles awaiting GPU baking, oldest first. Coordinates are physical
+	// storage texels; unit names the level and lease identifies its content revision.
 	using BakeRect = TerrainClipmap::BakeRect;
-	// The rects this ring has produced and a producer has not yet covered, oldest first. The producer
-	// copies what it will dispatch - with each rect's own lease, because that is what the bake reads -
-	// and reports each rect back when its dispatch lands.
+	// The producer copies each queued rectangle and acknowledges it after dispatch.
 	int get_pending_bake_count() const override { return int(_bake_rects.size()); }
 	const BakeRect &get_pending_bake(const int p_index) const override { return _bake_rects[size_t(p_index)]; }
 	int get_baked_channel_count() const override { return _config.baked_channels; }
 	Image::Format get_baked_format() const override { return _config.baked_format; }
-	// One device texture per baked channel, `levels` layers, layer `l` the level `l`'s. The layer is
-	// indexed exactly the way the level's payload layer is - by the *stored* texel, the one
-	// `physical_of_logical()` names - so a reader samples a level's baked layer with the same addressing
-	// it samples the payload with, and a producer writes a rect of stored texels. That frame is the one
-	// that keeps naming the same world position as the level turns; see `_queue_bake_rect()` and
-	// `shaders/surface_bake.glsl`.
+	// One device array per baked channel, indexed by the same physical texels as the source.
 	RID get_baked_device_rid(const int p_channel) const override;
 	// The same texture as a shader samples it, i.e. the `RenderingServer` wrapper of the above. What
 	// the material's arm binds; a producer would bind the device RID instead.
 	RID get_baked_texture_rid(const int p_channel) const override;
-	// How many disjoint rects of one level a reader can be told about. A level under a moving focus
-	// queues one strip per movement, and the arm's gate is per rect, so the table has to cover what a
-	// tick's own production can leave outstanding; beyond it the ring answers with the level's whole
-	// square, which can only make a reader fall back more.
+	// Outstanding-rectangle table limit; overflow conservatively covers the full level.
 	static constexpr int MAX_OUTSTANDING_RECTS = TerrainClipmap::MAX_OUTSTANDING_RECTS;
-	// The rects of *stored* texels a reader must not serve from this ring's baked layers right now, for
-	// one level: the rects no bake has covered yet and the rects the CPU side is still producing. The
-	// second kind is why this is a reading rather than a mirror of `_bake_rects`: between a job being
-	// queued and the bake that follows it, the level's stored texels are being replaced and the layers
-	// describe world positions the level no longer covers. Returns how many entries were written, up to
-	// `p_max`; more than that is answered with one rect covering the level, because a reader that falls
-	// back too much is correct while one that serves a texel the device has not written is not.
+	// Physical rectangles still being produced or awaiting baking. If they exceed
+	// p_max, return one full-level rectangle so readers conservatively fall back.
 	int get_outstanding_rects(const int p_level, BakeRect *r_rects, const int p_max) const;
-	// A dispatch for `p_rect` landed. The ring says whether it still describes the level - the shape
-	// and the level's content both have to match the lease the producer took - and forgets the rect
-	// when it does. Returns whether the bake counted, so the producer's accounting is the ring's
-	// answer too. `p_rect.unit` is the level, which is the shared schema's spelling of it.
+	// Acknowledge a dispatched rectangle only while its content lease still matches.
 	bool acknowledge_bake(const TerrainClipmap::BakeRect &p_rect) override;
-	// Every level's baked layers are stale, which is what a change to the material the bake evaluates
-	// against is: the payload is untouched, so the levels stay current - only the layers produced from
-	// it are. Each level is queued whole. See `Terrain3DSurfaceBaker::set_materials()`.
+	// Queue every baked level again after material changes; source texels stay valid.
 	void mark_baked_stale() override;
-	// A producer that is about to dispatch a rect takes the rect's lease - which the queue stored when it
-	// queued it - and reports it back with the rect, and the ring accepts the bake only if the rect still
-	// carries that lease: the shape, because a reconfigured ring has different layers (and clears its
-	// queue), and the rect's content, because a rect that grew over new texels holds texels the bake
-	// never read. A bake is dispatched on one thread and lands while another ticks, so the ring - not the
-	// producer - is what says whether what the bake wrote still describes the rect. A lease that is not
-	// current is dropped: the rect stays queued and is dispatched again.
+	// Lease combines shape and per-level content revisions. Stale completions leave work queued.
 	uint64_t take_bake_lease(const int p_level) const;
-	// The world rect one level's whole stored square covers, which is the rect a producer dispatches
-	// over: `size` texels of `texel_world`, its first texel *centre* half a texel inside the origin.
-	// The same rect the source fills from, so a producer that reads a level's texels reads exactly
-	// the world the level it writes describes.
+	// World bounds of the level; the first texel centre lies half a texel inside.
 	Rect2 get_level_world_bounds(const int p_level) const;
 	real_t get_texel_world(const int p_level) const;
 	// The gate above is declared beside the shared contract (`covers()`), because it *is* part of it:
@@ -300,12 +176,7 @@ public:
 	// from this focus. The owner uses this to avoid dispatching an idle worker task between texel moves.
 	bool needs_update_at(const Vector2 &p_focus) const override;
 
-	// The source changed under a world rect: mark every level the rect touches not-current and queue
-	// the texels that cover it for re-production. Returns how many rect jobs were queued, and costs
-	// the ring nothing when a level is already being produced whole (the values it has not written
-	// yet are read from the source as it stands, edit included). Content outside the rect is
-	// untouched, which is the difference between this and a whole-ring refresh: a brush stroke pays
-	// for the texels it covers rather than for every level.
+	// Invalidate intersecting texels and queue their reproduction; existing full fills cover edits.
 	int invalidate_rect(const Rect2 &p_world) override;
 
 	// ---- Addressing: the mirror of the shader's arm -------------------------------------------
@@ -313,12 +184,7 @@ public:
 	int level_for_world(const Vector2 &p_world) const;
 
 	Vector2i physical_of_logical(const int p_level, const Vector2i &p_logical) const;
-	// ---- Readings ------------------------------------------------------------------------------
-	// A counter that moves whenever something a *reader's addressing* depends on changed: the shape,
-	// any level's snapped centre and toroidal offset, and any level's validity. The shader arm binds
-	// that state, so this is what lets the node rebind it once per change instead of once per tick -
-	// a ring that produced nothing reports the same stamp and costs one integer comparison. See
-	// `Terrain3D::_update_vt_clipmap_arm()`.
+	// Addressing stamp changes with shape, centre, ring or validity.
 	uint64_t get_state_stamp() const override { return _state_stamp; }
 	RID get_texture_rid() const override { return _texture_rid; }	// renderer wrapper of `_texture_rd`.
 	int get_texture_layer_count() const override { return _texture_layers; }
@@ -383,10 +249,7 @@ private:
 	bool _produce_rect(Job &p_job, int &r_budget);
 	// Asks the source for one row segment of one channel and scatters it to its ring position.
 	void _fill_row(const Job &p_job, const int p_channel, const int p_y, const int p_x0, const int p_x1);
-	// The stored pieces one *logical* rect lands in, through `physical = (logical + ring) mod size`:
-	// at most four rects through `r_rects`, one for a rect that is the whole level. Every reader that
-	// maps a produced rect into stored space - the bake queue, the outstanding table, the upload - goes
-	// through this one function, so the wrap's arithmetic lives in exactly one place.
+	// Split a logical rectangle through the toroidal wrap into at most four physical rectangles.
 	int _stored_rects_of_logical(const int p_level, const int p_x0, const int p_y0, const int p_x1,
 			const int p_y1, Rect2i *r_rects) const;
 	// Packs the produced rect's channel bytes and queues them for `publish_pending_uploads()` - one
@@ -416,10 +279,7 @@ private:
 	// One rect of *stored* texels joins its level's queue, merged with what is already there: a level
 	// that turned twice before its first strip was baked is one rect, not two.
 	void _queue_stored_bake_rect(const int p_level, const int p_x0, const int p_y0, const int p_x1, const int p_y1);
-	// Re-derives one level's `baked` from its queue. Every mutation of the queue goes through here, so
-	// "is this level baked" is the queue's answer; a level whose content starts being replaced is
-	// cleared directly beside `valid` as well, because that is the same statement - the layers no
-	// longer describe what the level is being filled with - and the queue has not heard about it yet.
+	// Refresh baked from the queue; starting source production also clears it directly.
 	void _refresh_baked(const int p_level);
 
 	Config _config;
@@ -429,16 +289,12 @@ private:
 	std::vector<Job> _jobs;
 	// One row of source values, reused so a production does not allocate.
 	std::vector<float> _row_values;
-	// The ring's `Texture2DArray` as the device knows it (`levels * channels` layers, at least two),
-	// plus the `RenderingServer` wrapper the material arm binds. It is a device texture rather than a
-	// `RenderingServer` one for one flag: `TEXTURE_USAGE_CAN_COPY_TO`, which is what a `texture_copy()`
-	// destination must declare and what makes the per-rect upload possible at all.
+	// Device array (levels * channels, at least two) and its renderer wrapper.
+	// CAN_COPY_TO enables rectangle uploads.
 	RID _texture_rd;
 	RID _texture_rid;
 	int _texture_layers = 0;
-	// The staging pool the rect uploads pass through, keyed by `width << 20 | height`, and the packed
-	// uploads waiting on it. One produced *logical* rect is up to four stored pieces; each piece is
-	// one entry per channel, its bytes already packed so the publish does no CPU work of its own.
+	// Staging textures keyed by width << 20 | height, plus packed per-channel uploads.
 	std::map<uint64_t, RID> _staging_rd;
 	struct PendingUpload {
 		int layer = 0;
@@ -466,9 +322,7 @@ private:
 	// One counter per level, bumped whenever the level stops being current, which is what makes a
 	// lease taken before the bump stale. See `BakeRect::lease`.
 	std::vector<uint64_t> _content_serial;
-	// The rects of logical texels produced and not yet baked, oldest first, merged per level as they
-	// are produced. One queue for the whole ring rather than one per level, because a producer drains
-	// it in the order the ring produced, and the level is a field of the entry.
+	// Produced physical rectangles awaiting baking, oldest first and merged per level.
 	std::vector<BakeRect> _bake_rects;
 	// What a producer has written, in channel texels and dispatches. The same unit the production
 	// budget is charged in, so the two halves of a ring's cost are one column in a report.

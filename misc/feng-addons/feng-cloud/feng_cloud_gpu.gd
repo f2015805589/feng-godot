@@ -44,21 +44,8 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		return false
 	if view != 0:
 		return true
-	if snapshot.is_empty():
-		if ctx.has_method("set_cloud_shadow_outputs"):
-			ctx.call("set_cloud_shadow_outputs", RID(), RID(), RID(), RID())
-		if ctx.has_method("clear_cloud_projection_parameters"):
-			ctx.call("clear_cloud_projection_parameters")
-		_release_buffer(buffers, rd)
-		_release_shadow_branch_resources(rd)
-		return true
-	if not ctx.has_method("has_cloud_snapshot") or not bool(ctx.call("has_cloud_snapshot")):
-		if ctx.has_method("set_cloud_shadow_outputs"):
-			ctx.call("set_cloud_shadow_outputs", RID(), RID(), RID(), RID())
-		if ctx.has_method("clear_cloud_projection_parameters"):
-			ctx.call("clear_cloud_projection_parameters")
-		_release_buffer(buffers, rd)
-		_release_shadow_branch_resources(rd)
+	if snapshot.is_empty() or not ctx.has_cloud_snapshot():
+		_clear_shadow(ctx, buffers, rd)
 		return true
 	var shadow_settings := _effective_shadow_settings(snapshot)
 	var ao_settings: Dictionary = snapshot.get("sky_ao", {})
@@ -68,15 +55,9 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 				and float(settings.get("producer_strength", 0.0)) > 0.0)
 	var ao_requested := bool(ao_settings.get("enabled", false)) and float(ao_settings.get("strength", 0.0)) > 0.0
 	if not shadow_requested and not ao_requested:
-		if ctx.has_method("set_cloud_shadow_outputs"):
-			ctx.call("set_cloud_shadow_outputs", RID(), RID(), RID(), RID())
-		if ctx.has_method("clear_cloud_projection_parameters"):
-			ctx.call("clear_cloud_projection_parameters")
-		_release_buffer(buffers, rd)
-		_release_shadow_branch_resources(rd)
+		_clear_shadow(ctx, buffers, rd)
 		return true
-	if ctx.has_method("prepare_lighting"):
-		ctx.call("prepare_lighting")
+	ctx.prepare_lighting()
 	var packets := _read_packets(ctx)
 	if not _packets_valid(packets):
 		return false
@@ -99,12 +80,7 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		_release_pipeline_family(rd, "cloud_ao_filter.glslinc")
 		_release_clamp_sampler(rd)
 	if not map_enabled0 and not map_enabled1 and not ao_enabled:
-		if ctx.has_method("set_cloud_shadow_outputs"):
-			ctx.call("set_cloud_shadow_outputs", RID(), RID(), RID(), RID())
-		if ctx.has_method("clear_cloud_projection_parameters"):
-			ctx.call("clear_cloud_projection_parameters")
-		_release_buffer(buffers, rd)
-		_release_shadow_branch_resources(rd)
+		_clear_shadow(ctx, buffers, rd)
 		return true
 	var state := _ensure_buffer_state(buffers, rd, owner_id, Vector2i.ONE, 1, 0, true)
 	if state.is_empty() or not _ensure_shadow_neutral_resources(rd,
@@ -112,18 +88,16 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		return false
 	if not _update_ubo(state, "material_ubo", packets.material, MATERIAL_BYTES, rd, true):
 		return false
-	state.capture = ctx.has_method("is_cloud_capture") and bool(ctx.call("is_cloud_capture"))
-	var projection_data := _make_projection_parameters(snapshot, packets.lighting, packets.material, scene_data, 0, state)
+	state.capture = ctx.is_cloud_capture()
+	var projection_data := _make_projection_parameters(snapshot, packets.lighting, packets.material, scene_data)
 	if projection_data.size() != 140 or not _update_ubo(state, "projection_ubo", projection_data, PROJECTION_BYTES, rd):
 		return false
-	if ctx.has_method("set_cloud_projection_parameters"):
-		ctx.call("set_cloud_projection_parameters", projection_data)
+	ctx.set_cloud_projection_parameters(projection_data)
 	var ao_size := _resolution(ao_settings.get("resolution", 512)) if ao_enabled else 1
 	if not _ensure_shadow_textures(buffers, rd, state, shadow_size0, shadow_size1, ao_size,
 			map_enabled0, map_enabled1, ao_enabled, filter_count0, filter_count1):
 		return false
-	var material: PackedFloat32Array = packets.material
-	var inputs: Array[RID] = _material_textures(ctx, packets.material, rd)
+	var inputs: Array[RID] = _material_textures(ctx, rd)
 	var layout_inputs := _material_layout_inputs(ctx, snapshot, rd)
 	if not bool(layout_inputs.get("ok", false)):
 		return false
@@ -159,8 +133,8 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		var output: RID = state.shadow0 if slot == 0 else state.shadow1
 		var settings: Dictionary = shadow_settings[slot]
 		var shadow_uniforms := material_uniforms.duplicate()
-		var set0 := _uniform_set(rd, shadow_pipeline.shader, 0, shadow_uniforms)
-		var set1 := _uniform_set(rd, shadow_pipeline.shader, 1, _image_uniforms(3, output))
+		var set0 := _uniform_set(shadow_pipeline.shader, 0, shadow_uniforms)
+		var set1 := _uniform_set(shadow_pipeline.shader, 1, _image_uniforms(3, output))
 		var push := PackedInt32Array([slot, 0, 0, 0]).to_byte_array()
 		var res := Vector2i(_shadow_resolution(settings), _shadow_resolution(settings))
 		if not _dispatch(rd, shadow_pipeline.pipeline, [set0, set1], res, 1, push):
@@ -174,25 +148,30 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 			filtered_outputs[slot] = filtered
 	if ao_enabled:
 		var ao_uniforms := material_uniforms.duplicate()
-		var ao_set0 := _uniform_set(rd, ao_pipeline.shader, 0, ao_uniforms)
-		var ao_set1 := _uniform_set(rd, ao_pipeline.shader, 1, _image_uniforms(7, state.ao_stats))
+		var ao_set0 := _uniform_set(ao_pipeline.shader, 0, ao_uniforms)
+		var ao_set1 := _uniform_set(ao_pipeline.shader, 1, _image_uniforms(7, state.ao_stats))
 		if not _dispatch(rd, ao_pipeline.pipeline, [ao_set0, ao_set1], Vector2i(ao_size, ao_size)):
 			return false
 		var filter_uniforms: Array[RDUniform] = []
 		_add_uniform_buffer(filter_uniforms, 1, state.material_ubo)
 		_add_uniform_buffer(filter_uniforms, 23, state.projection_ubo)
 		_add_sampled(filter_uniforms, 28, _sampler, state.ao_stats)
-		var filter_set0 := _uniform_set(rd, ao_filter_pipeline.shader, 0, filter_uniforms)
-		var filter_set1 := _uniform_set(rd, ao_filter_pipeline.shader, 1, _image_uniforms(5, state.ao_final))
+		var filter_set0 := _uniform_set(ao_filter_pipeline.shader, 0, filter_uniforms)
+		var filter_set1 := _uniform_set(ao_filter_pipeline.shader, 1, _image_uniforms(5, state.ao_final))
 		if not _dispatch(rd, ao_filter_pipeline.pipeline, [filter_set0, filter_set1], Vector2i(ao_size, ao_size)):
 			return false
-	if ctx.has_method("set_cloud_shadow_outputs"):
-		ctx.call("set_cloud_shadow_outputs", filtered_outputs[0] if map_enabled0 else RID(),
+	ctx.set_cloud_shadow_outputs(filtered_outputs[0] if map_enabled0 else RID(),
 			filtered_outputs[1] if map_enabled1 else RID(), state.ao_final if ao_enabled else RID(),
 			state.ao_stats if ao_enabled else RID())
-	state.shadow_signature = hash([shadow_settings, ao_settings, material, inputs])
 	_buffers[buffers.get_instance_id()] = state
 	return true
+
+
+func _clear_shadow(ctx: FRPPassContext, buffers: RenderSceneBuffersRD, rd: RenderingDevice) -> void:
+	ctx.set_cloud_shadow_outputs(RID(), RID(), RID(), RID())
+	ctx.clear_cloud_projection_parameters()
+	_release_buffer(buffers, rd)
+	_release_idle_resources(rd)
 
 
 func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: RenderSceneData,
@@ -202,23 +181,20 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		_release_buffer(buffers, rd)
 		return false
 	if snapshot.is_empty():
-		if ctx.has_method("set_cloud_outputs"):
-			ctx.call("set_cloud_outputs", RID(), RID(), RID(), RID())
+		ctx.set_cloud_outputs(RID(), RID(), RID(), RID())
 		_release_buffer(buffers, rd)
-		_release_trace_branch_resources(rd)
+		_release_idle_resources(rd)
 		return true
-	if not ctx.has_method("has_cloud_snapshot") or not bool(ctx.call("has_cloud_snapshot")):
-		if ctx.has_method("set_cloud_outputs"):
-			ctx.call("set_cloud_outputs", RID(), RID(), RID(), RID())
+	if not ctx.has_cloud_snapshot():
+		ctx.set_cloud_outputs(RID(), RID(), RID(), RID())
 		_release_buffer(buffers, rd)
-		_release_trace_branch_resources(rd)
+		_release_idle_resources(rd)
 		return false
-	var capture := ctx.has_method("is_cloud_capture") and bool(ctx.call("is_cloud_capture"))
+	var capture := ctx.is_cloud_capture()
 	if not capture and not bool(snapshot.get("render_in_main_pass", true)):
-		if ctx.has_method("set_cloud_outputs"):
-			ctx.call("set_cloud_outputs", RID(), RID(), RID(), RID())
+		ctx.set_cloud_outputs(RID(), RID(), RID(), RID())
 		_release_buffer(buffers, rd)
-		_release_trace_branch_resources(rd)
+		_release_idle_resources(rd)
 		return true
 	var orthographic_view := scene_data.get_cam_projection().is_orthogonal()
 	var mode := 3 if capture or orthographic_view else clampi(vrt_mode, 0, 3)
@@ -233,7 +209,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if not _packets_valid(packets):
 		return false
 	var material: PackedFloat32Array = packets.material
-	var inputs: Array[RID] = _material_textures(ctx, material, rd)
+	var inputs: Array[RID] = _material_textures(ctx, rd)
 	var layout_inputs := _material_layout_inputs(ctx, snapshot, rd)
 	if not bool(layout_inputs.get("ok", false)):
 		return false
@@ -244,8 +220,8 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		blue_noise, packets.lighting, packets.atmosphere, mode)
 	var now_usec := Time.get_ticks_usec()
 	if view == 0:
-		_begin_cloud_frame(ctx, state, snapshot, scene_data, buffers_size, source_signature, now_usec, mode, capture)
-	var frame_packet := _make_frame_packet(ctx, snapshot, scene_data, buffers, state, view, mode, capture, now_usec)
+		_begin_cloud_frame(ctx, state, scene_data, buffers_size, source_signature, now_usec, mode, capture)
+	var frame_packet := _make_frame_packet(ctx, snapshot, scene_data, buffers, state, view, mode, capture)
 	var frame_key := "frame_ubo_%d" % view
 	if frame_packet.bytes.size() != FRAME_BYTES or not _update_ubo_bytes(state, frame_key, frame_packet.bytes, FRAME_BYTES, rd):
 		return false
@@ -256,9 +232,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if bool(layout_inputs.get("enabled", false)):
 		if not _update_ue58_time_ubo(ctx, snapshot, state, rd, scene_data, view).is_valid():
 			return false
-	var sky_ambient := _ensure_ambient_texture(buffers, rd, state)
-	if not sky_ambient.is_valid():
-		return false
+	var sky_ambient: RID = state.sky_ambient
 	var lighting: PackedFloat32Array = packets.lighting
 	var ambient_lighting := PackedFloat32Array()
 	if lighting.size() >= 48:
@@ -272,8 +246,8 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	var ambient_signature := hash([
 		snapshot.get("provider_id", 0), snapshot.get("world_id", 0),
 		snapshot.get("sky_rendering_signature", []), snapshot.get("atmosphere_revision", -1),
-		int(ctx.call("get_cloud_capture_batch_id")) if capture and ctx.has_method("get_cloud_capture_batch_id") else 0,
-		ambient_lighting, ambient_atmosphere, _rid_id(_get_context_rid(ctx, "get_cloud_sky_octmap")),
+		ctx.get_cloud_capture_batch_id() if capture else 0,
+		ambient_lighting, ambient_atmosphere, _rid_id(ctx.get_cloud_sky_octmap()),
 		float(snapshot.get("planet_radius_m", 0.0)), snapshot.get("planet_center_m", Vector3.ZERO)
 	])
 	if ambient_signature != state.ambient_signature:
@@ -320,12 +294,12 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	_add_material_layout_uniforms(trace_uniforms, layout_inputs)
 	if bool(layout_inputs.get("enabled", false)):
 		_add_uniform_buffer(trace_uniforms, 32, state.ubos.get("ue58_time_ubo", RID()))
-	_add_sampled(trace_uniforms, 9, _sampler, _packet_texture(ctx, "get_atmosphere_optical_texture", 0, rd))
-	_add_sampled(trace_uniforms, 10, _sampler, _packet_texture(ctx, "get_atmosphere_multiple_texture", 1, rd))
-	var native_shadow_depth := _get_context_rid(ctx, "get_cloud_shadow_sampler")
+	_add_sampled(trace_uniforms, 9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut))
+	_add_sampled(trace_uniforms, 10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut))
+	var native_shadow_depth := ctx.get_cloud_shadow_sampler()
 	if not native_shadow_depth.is_valid():
 		native_shadow_depth = _shadow_sampler
-	var native_shadow_atlas := _context_rid_or(ctx, "get_cloud_directional_shadow_atlas", _neutral_depth, rd)
+	var native_shadow_atlas := _texture_or(rd, ctx.get_cloud_directional_shadow_atlas(), _neutral_depth)
 	_add_sampled(trace_uniforms, 12, native_shadow_depth, native_shadow_atlas)
 	var scene_depth := buffers.get_depth_layer(view)
 	if not _valid_texture(rd, scene_depth):
@@ -333,9 +307,9 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	_add_sampled(trace_uniforms, 13, _sampler, scene_depth)
 	_add_uniform_buffer(trace_uniforms, 22, state.native_shadow_ubo)
 	_add_sampled(trace_uniforms, 27, _sampler, sky_ambient)
-	var cloud_shadow0 := _context_rid_or(ctx, "get_cloud_output", _neutral_lut, rd, 3)
-	var cloud_shadow1 := _context_rid_or(ctx, "get_cloud_output", _neutral_lut, rd, 4)
-	var cloud_ao_stats := _context_rid_or(ctx, "get_cloud_output", _neutral_lut, rd, 7)
+	var cloud_shadow0 := _texture_or(rd, ctx.get_cloud_output(3), _neutral_lut)
+	var cloud_shadow1 := _texture_or(rd, ctx.get_cloud_output(4), _neutral_lut)
+	var cloud_ao_stats := _texture_or(rd, ctx.get_cloud_output(7), _neutral_lut)
 	_add_sampled(trace_uniforms, 24, _sampler, cloud_shadow0)
 	_add_sampled(trace_uniforms, 25, _sampler, cloud_shadow1)
 	_add_sampled(trace_uniforms, 28, _sampler, cloud_ao_stats)
@@ -344,8 +318,8 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	]
 	if secondary_enabled:
 		trace_output_items.append_array([[9, state.trace_secondary_radiance], [10, state.trace_secondary_transmittance]])
-	var trace_set0 := _uniform_set(rd, trace_pipeline.shader, 0, trace_uniforms)
-	var trace_set1 := _uniform_set(rd, trace_pipeline.shader, 1, _image_uniforms3(trace_output_items))
+	var trace_set0 := _uniform_set(trace_pipeline.shader, 0, trace_uniforms)
+	var trace_set1 := _uniform_set(trace_pipeline.shader, 1, _image_uniforms3(trace_output_items))
 	var trace_size: Vector2i = state.trace_size
 	if not _dispatch(rd, trace_pipeline.pipeline, [trace_set0, trace_set1], trace_size):
 		return false
@@ -371,7 +345,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 			_add_sampled(reconstruct_uniforms, 36, _sampler, state.trace_secondary_transmittance)
 			_add_sampled(reconstruct_uniforms, 37, _sampler, state.full_secondary_radiance[previous_index])
 			_add_sampled(reconstruct_uniforms, 38, _sampler, state.full_secondary_transmittance[previous_index])
-		var reconstruct_set0 := _uniform_set(rd, reconstruct_pipeline.shader, 0, reconstruct_uniforms)
+		var reconstruct_set0 := _uniform_set(reconstruct_pipeline.shader, 0, reconstruct_uniforms)
 		var reconstruct_output_items: Array = [
 			[0, state.full_radiance[write_index]], [1, state.full_transmittance[write_index]], [2, state.full_depth[write_index]]
 		]
@@ -380,7 +354,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 				[9, state.full_secondary_radiance[write_index]],
 				[10, state.full_secondary_transmittance[write_index]]
 			])
-		var reconstruct_set1 := _uniform_set(rd, reconstruct_pipeline.shader, 1, _image_uniforms3(reconstruct_output_items))
+		var reconstruct_set1 := _uniform_set(reconstruct_pipeline.shader, 1, _image_uniforms3(reconstruct_output_items))
 		if not _dispatch(rd, reconstruct_pipeline.pipeline, [reconstruct_set0, reconstruct_set1], state.reconstruct_size):
 			return false
 		current_radiance = state.full_radiance[write_index]
@@ -402,12 +376,11 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if secondary_enabled:
 		_add_sampled(composite_uniforms, 35, _sampler, current_secondary_radiance)
 		_add_sampled(composite_uniforms, 36, _sampler, current_secondary_transmittance)
-	var composite_set0 := _uniform_set(rd, composite_pipeline.shader, 0, composite_uniforms)
-	var composite_set1 := _uniform_set(rd, composite_pipeline.shader, 1, _image_uniforms(4, color_layer))
+	var composite_set0 := _uniform_set(composite_pipeline.shader, 0, composite_uniforms)
+	var composite_set1 := _uniform_set(composite_pipeline.shader, 1, _image_uniforms(4, color_layer))
 	if not _dispatch(rd, composite_pipeline.pipeline, [composite_set0, composite_set1], buffers_size):
 		return false
-	if ctx.has_method("set_cloud_outputs"):
-		ctx.call("set_cloud_outputs", current_radiance, current_transmittance, current_depth, sky_ambient)
+	ctx.set_cloud_outputs(current_radiance, current_transmittance, current_depth, sky_ambient)
 	if not capture and (mode == 0 or mode == 2):
 		state.view_history[view] = {
 			"view_projection": frame_packet.view_projection,
@@ -425,33 +398,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 
 
 func cleanup(rd: RenderingDevice) -> void:
-	for key in _buffers.keys():
-		var state: Dictionary = _buffers[key]
-		var reference: Variant = state.get("weak")
-		var buffers: RenderSceneBuffersRD = reference.get_ref() if reference is WeakRef else null
-		if buffers != null:
-			for scope in state.get("owned_scopes", [state.get("scope", BUFFER_SCOPE)]):
-				buffers.clear_context(scope)
-		_free_state_buffers(state, rd)
-	_buffers.clear()
-	for entry in _pipelines.values():
-		if entry.get("pipeline", RID()).is_valid():
-			rd.free_rid(entry.pipeline)
-		if entry.get("shader", RID()).is_valid():
-			rd.free_rid(entry.shader)
-	_pipelines.clear()
-	for rid in [_sampler, _material_sampler, _shadow_sampler, _neutral_shape, _neutral_weather, _neutral_lut, _neutral_depth, _neutral_sky_2d, _neutral_sky_array]:
-		if rid.is_valid():
-			rd.free_rid(rid)
-	_sampler = RID()
-	_material_sampler = RID()
-	_shadow_sampler = RID()
-	_neutral_shape = RID()
-	_neutral_weather = RID()
-	_neutral_lut = RID()
-	_neutral_depth = RID()
-	_neutral_sky_2d = RID()
-	_neutral_sky_array = RID()
+	_release_payload(rd, take_cleanup_payload())
 
 
 func _release_pipeline_family(rd: RenderingDevice, filename: String) -> void:
@@ -479,49 +426,9 @@ func _release_clamp_sampler(rd: RenderingDevice) -> void:
 	_sampler = RID()
 
 
-func _release_shadow_branch_resources(rd: RenderingDevice) -> void:
-	if not _buffers.is_empty():
-		return
-	_release_pipeline_family(rd, "cloud_shadow.glslinc")
-	_release_pipeline_family(rd, "cloud_shadow_filter.glslinc")
-	_release_pipeline_family(rd, "cloud_ao.glslinc")
-	_release_pipeline_family(rd, "cloud_ao_filter.glslinc")
-	_release_shadow_neutral_resources(rd)
-
-
-func _release_trace_branch_resources(rd: RenderingDevice) -> void:
-	if not _buffers.is_empty():
-		return
-	for filename in ["cloud_trace.glslinc", "cloud_reconstruct.glslinc", "cloud_composite.glslinc", "cloud_sky_ambient.glslinc"]:
-		_release_pipeline_family(rd, filename)
-	if rd != null:
-		for rid in [_sampler, _material_sampler, _shadow_sampler, _neutral_shape, _neutral_weather,
-				_neutral_lut, _neutral_depth, _neutral_sky_2d, _neutral_sky_array]:
-			if rid.is_valid():
-				rd.free_rid(rid)
-	_sampler = RID()
-	_material_sampler = RID()
-	_shadow_sampler = RID()
-	_neutral_shape = RID()
-	_neutral_weather = RID()
-	_neutral_lut = RID()
-	_neutral_depth = RID()
-	_neutral_sky_2d = RID()
-	_neutral_sky_array = RID()
-
-
-func _release_shadow_neutral_resources(rd: RenderingDevice) -> void:
-	if not _buffers.is_empty():
-		return
-	if rd != null:
-		for rid in [_sampler, _material_sampler, _neutral_shape, _neutral_weather]:
-			if rid.is_valid():
-				rd.free_rid(rid)
-	_sampler = RID()
-	_material_sampler = RID()
-	_neutral_shape = RID()
-	_neutral_weather = RID()
-	_release_native_shadow_sampler(rd)
+func _release_idle_resources(rd: RenderingDevice) -> void:
+	if _buffers.is_empty():
+		cleanup(rd)
 
 
 func take_cleanup_payload(extra_rids: Array[RID] = []) -> Dictionary:
@@ -563,22 +470,19 @@ func take_cleanup_payload(extra_rids: Array[RID] = []) -> Dictionary:
 
 
 static func release_cleanup_payload(payload: Dictionary) -> void:
-	# Capture value data before the pass Resource is destroyed. RenderSceneBuffers
-	# contexts own the named textures; the helper owns only its UBOs and pipelines.
-	var captured_contexts: Array = payload.get("contexts", []).duplicate()
-	var captured_rids: Array = payload.get("rids", []).duplicate()
 	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd == null:
-			return
-		for context in captured_contexts:
-			var buffers: RenderSceneBuffersRD = context.get("buffers")
-			if buffers != null:
-				buffers.clear_context(context.get("scope", BUFFER_SCOPE))
-		for rid in captured_rids:
-			if rid.is_valid():
-				rd.free_rid(rid)
+		_release_payload(RenderingServer.get_rendering_device(), payload)
 	)
+
+
+static func _release_payload(rd: RenderingDevice, payload: Dictionary) -> void:
+	if rd == null:
+		return
+	# Scene buffers own named textures; the payload owns only standalone RIDs.
+	for context in payload.contexts:
+		context.buffers.clear_context(context.scope)
+	for rid in payload.rids:
+		rd.free_rid(rid)
 
 
 func _ensure_buffer_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice, owner_id: int,
@@ -610,7 +514,6 @@ func _ensure_buffer_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice, ow
 			"trace_size": trace_size,
 			"reconstruct_size": reconstruct_size,
 			"mode": mode,
-			"owner_id": owner_id,
 			"ubos": {},
 			"view_history": {},
 			"history_valid": false,
@@ -620,8 +523,6 @@ func _ensure_buffer_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice, ow
 			"last_frame_usec": 0,
 			"source_signature": -1,
 			"ambient_signature": -1,
-			"shadow_signature": -1,
-			"last_wind": Vector3.ZERO,
 			"ue58_time_key": [],
 			"ue58_time_seconds": 0.0,
 			"ue58_camera_world_m": Vector3.ZERO,
@@ -813,9 +714,9 @@ func _dispatch_shadow_filter_chain(rd: RenderingDevice, pipeline: Dictionary,
 	for stage in stages:
 		var uniforms: Array[RDUniform] = []
 		_add_sampled(uniforms, 33, _material_sampler, current_source)
-		var set0 := _uniform_set(rd, pipeline.shader, 0, uniforms)
+		var set0 := _uniform_set(pipeline.shader, 0, uniforms)
 		var destination: RID = stage.get("texture", RID())
-		var set1 := _uniform_set(rd, pipeline.shader, 1, _image_uniforms(8, destination))
+		var set1 := _uniform_set(pipeline.shader, 1, _image_uniforms(8, destination))
 		var size: Vector2i = stage.get("size", Vector2i.ZERO)
 		if not _dispatch(rd, pipeline.pipeline, [set0, set1], size):
 			return RID()
@@ -932,30 +833,13 @@ func _named(buffers: RenderSceneBuffersRD, state: Dictionary, name: String,
 
 
 func _read_packets(ctx: FRPPassContext) -> Dictionary:
-	var result := {
-		"material": PackedFloat32Array(),
-		"lighting": PackedFloat32Array(),
-		"atmosphere": PackedFloat32Array(),
-		"fog": PackedFloat32Array(),
-		"native_shadow": PackedFloat32Array(),
+	return {
+		"material": ctx.get_cloud_material_parameters(),
+		"lighting": ctx.get_cloud_lighting_parameters(),
+		"atmosphere": ctx.get_atmosphere_parameters(),
+		"fog": ctx.get_height_fog_parameters(),
+		"native_shadow": ctx.get_cloud_native_shadow_parameters(),
 	}
-	for method_name in ["get_cloud_material_parameters", "get_cloud_lighting_parameters"]:
-		if not ctx.has_method(method_name):
-			_report("FRP context is missing %s." % method_name)
-			return result
-	var material: Variant = ctx.call("get_cloud_material_parameters")
-	var lighting: Variant = ctx.call("get_cloud_lighting_parameters")
-	if material is PackedFloat32Array:
-		result.material = material
-	if lighting is PackedFloat32Array:
-		result.lighting = lighting
-	for pair in [["get_atmosphere_parameters", "atmosphere"], ["get_height_fog_parameters", "fog"],
-			["get_cloud_native_shadow_parameters", "native_shadow"]]:
-		if ctx.has_method(pair[0]):
-			var value: Variant = ctx.call(pair[0])
-			if value is PackedFloat32Array:
-				result[pair[1]] = value
-	return result
 
 
 func _packets_valid(packets: Dictionary) -> bool:
@@ -988,56 +872,28 @@ func _update_shared_ubos(state: Dictionary, rd: RenderingDevice, packets: Dictio
 
 func _update_cloud_atmosphere_ubos(ctx: FRPPassContext, state: Dictionary,
 		rd: RenderingDevice) -> bool:
-	var packet := PackedFloat32Array()
-	if ctx.has_method("get_cloud_atmosphere_parameters"):
-		var value: Variant = ctx.call("get_cloud_atmosphere_parameters")
-		if value is PackedFloat32Array and value.size() == 148:
-			packet = value
-		else:
-			_report("Cloud atmosphere packet must contain 148 floats; using its disabled default.")
+	var packet := ctx.get_cloud_atmosphere_parameters()
 	if packet.size() != 148:
+		_report("Cloud atmosphere packet must contain 148 floats; using its disabled default.")
+		packet = PackedFloat32Array()
 		packet.resize(148)
 		packet[140] = -1.0
 		packet[141] = -1.0
-	var projection_values := packet.slice(0, 140)
-	var visibility_values := packet.slice(140, 148)
-	return _update_ubo(state, "cloud_projection_ubo", projection_values, PROJECTION_BYTES, rd) \
-		and _update_ubo(state, "cloud_atmosphere_visibility_ubo", visibility_values,
+	return _update_ubo(state, "cloud_projection_ubo", packet.slice(0, 140), PROJECTION_BYTES, rd) \
+		and _update_ubo(state, "cloud_atmosphere_visibility_ubo", packet.slice(140, 148),
 		CLOUD_ATMOSPHERE_VISIBILITY_BYTES, rd)
 
 
 func _update_ubo(state: Dictionary, key: String, values: PackedFloat32Array,
 		byte_count: int, rd: RenderingDevice, cache_identical: bool = false) -> bool:
-	if values.size() * 4 != byte_count:
-		_report("Cloud %s packet has %d bytes; expected %d." % [key, values.size() * 4, byte_count])
-		return false
-	var ubos: Dictionary = state.ubos
-	var buffer: RID = ubos.get(key, RID())
-	if not buffer.is_valid():
-		state.erase("ubo_cache_rid_" + key)
-		state.erase("ubo_cache_values_" + key)
-		buffer = rd.uniform_buffer_create(byte_count)
-		if not buffer.is_valid():
-			return false
-		ubos[key] = buffer
-		state.ubos = ubos
-	state[key] = buffer
-	var cached_rid: RID = state.get("ubo_cache_rid_" + key, RID())
-	var cached_values: Variant = state.get("ubo_cache_values_" + key, PackedFloat32Array())
-	if cache_identical and cached_rid == buffer and cached_values is PackedFloat32Array \
-			and cached_values == values:
+	var buffer: RID = state.ubos.get(key, RID())
+	if cache_identical and buffer.is_valid() \
+			and state.get("ubo_cache_values_" + key) == values:
 		return true
-	var bytes := values.to_byte_array()
-	if rd.buffer_update(buffer, 0, bytes.size(), bytes) != OK:
-		state.erase("ubo_cache_rid_" + key)
-		state.erase("ubo_cache_values_" + key)
+	if not _update_ubo_bytes(state, key, values.to_byte_array(), byte_count, rd):
 		return false
 	if cache_identical:
-		state["ubo_cache_rid_" + key] = buffer
 		state["ubo_cache_values_" + key] = values.duplicate()
-	else:
-		state.erase("ubo_cache_rid_" + key)
-		state.erase("ubo_cache_values_" + key)
 	return true
 
 
@@ -1046,6 +902,7 @@ func _update_ubo_bytes(state: Dictionary, key: String, bytes: PackedByteArray,
 	if bytes.size() != byte_count:
 		_report("Cloud %s packet has %d bytes; expected %d." % [key, bytes.size(), byte_count])
 		return false
+	state.erase("ubo_cache_values_" + key)
 	var ubos: Dictionary = state.ubos
 	var buffer: RID = ubos.get(key, RID())
 	if not buffer.is_valid():
@@ -1058,10 +915,10 @@ func _update_ubo_bytes(state: Dictionary, key: String, bytes: PackedByteArray,
 	return rd.buffer_update(buffer, 0, bytes.size(), bytes) == OK
 
 
-func _material_textures(ctx: FRPPassContext, material: PackedFloat32Array, rd: RenderingDevice) -> Array[RID]:
+func _material_textures(ctx: FRPPassContext, rd: RenderingDevice) -> Array[RID]:
 	var textures: Array[RID] = []
 	for index in 4:
-		var texture := _context_rid_or(ctx, "get_cloud_texture", RID(), rd, index)
+		var texture := _texture_or(rd, ctx.get_cloud_texture(index), RID())
 		if not texture.is_valid():
 			texture = _neutral_shape if index == 0 or index == 1 or index == 3 else _neutral_weather
 		textures.append(texture)
@@ -1082,14 +939,11 @@ func _material_layout_inputs(ctx: FRPPassContext, snapshot: Dictionary,
 	if not material is Dictionary or str(material.get("kernel_source", "")).is_empty():
 		_report("UE 5.8 cloud layout requires its generated material kernel source.")
 		return {"ok": false, "enabled": true, "textures": [], "defines": {}}
-	if ctx == null or not ctx.has_method("get_cloud_layout_texture"):
-		_report("UE 5.8 cloud layout textures are unavailable in FRPPassContext.")
-		return {"ok": false, "enabled": true, "textures": [], "defines": {}}
 	var textures: Array[RID] = []
 	var labels := ["Pattern", "Mask", "Height Profile"]
 	for index in 3:
-		var value: Variant = ctx.call("get_cloud_layout_texture", index)
-		if not value is RID or not _valid_texture(rd, value):
+		var value := ctx.get_cloud_layout_texture(index)
+		if not _valid_texture(rd, value):
 			_report("UE 5.8 cloud %s texture is missing or invalid." % labels[index])
 			return {"ok": false, "enabled": true, "textures": [], "defines": {}}
 		var texture_format: RDTextureFormat = rd.texture_get_format(value)
@@ -1109,8 +963,6 @@ func _add_material_layout_uniforms(uniforms: Array[RDUniform], layout_inputs: Di
 	if not bool(layout_inputs.get("enabled", false)):
 		return
 	var textures: Array = layout_inputs.get("textures", [])
-	if textures.size() != 3:
-		return
 	_add_sampled(uniforms, 29, _material_sampler, textures[0])
 	_add_sampled(uniforms, 30, _material_sampler, textures[1])
 	_add_sampled(uniforms, 31, _material_sampler, textures[2])
@@ -1118,20 +970,11 @@ func _add_material_layout_uniforms(uniforms: Array[RDUniform], layout_inputs: Di
 
 func _update_ue58_time_ubo(ctx: FRPPassContext, snapshot: Dictionary,
 		state: Dictionary, rd: RenderingDevice, scene_data: RenderSceneData, view: int) -> RID:
-	if ctx == null or scene_data == null or not ctx.has_method("get_cloud_time_seconds"):
-		_report("UE 5.8 cloud layout requires renderer time and camera inputs.")
-		return RID()
-	var capture := ctx.has_method("is_cloud_capture") and bool(ctx.call("is_cloud_capture"))
+	var capture := ctx.is_cloud_capture()
 	var seconds := 0.0
 	var camera_world_m := Vector3.ZERO
 	if capture:
-		if not ctx.has_method("get_cloud_capture_origin_world_m"):
-			_report("UE 5.8 cloud capture requires its frozen batch camera origin.")
-			return RID()
-		var capture_origin: Variant = ctx.call("get_cloud_capture_origin_world_m")
-		if not capture_origin is Vector3:
-			_report("UE 5.8 cloud capture camera origin is invalid.")
-			return RID()
+		var capture_origin := ctx.get_cloud_capture_origin_world_m()
 		if not capture_origin.is_finite():
 			_report("UE 5.8 cloud capture camera origin is invalid.")
 			return RID()
@@ -1141,20 +984,20 @@ func _update_ue58_time_ubo(ctx: FRPPassContext, snapshot: Dictionary,
 			int(snapshot.get("planet_source_id", 0)), int(snapshot.get("atmosphere_revision", -1)),
 			snapshot.get("sky_rendering_signature", []), int(material.get("revision", -1)),
 			str(material.get("kernel_source", "")),
-			int(ctx.call("get_cloud_capture_batch_id")) if ctx.has_method("get_cloud_capture_batch_id") else 0,
+			ctx.get_cloud_capture_batch_id(),
 		]
 		if bool(state.get("ue58_time_valid", false)) and state.get("ue58_time_key", []) == cache_key:
 			seconds = float(state.get("ue58_time_seconds", 0.0))
 			camera_world_m = state.get("ue58_camera_world_m", capture_origin)
 		else:
-			seconds = float(ctx.call("get_cloud_time_seconds"))
+			seconds = float(ctx.get_cloud_time_seconds())
 			camera_world_m = capture_origin
 			state.ue58_time_key = cache_key
 			state.ue58_time_seconds = seconds
 			state.ue58_camera_world_m = camera_world_m
 			state.ue58_time_valid = true
 	else:
-		seconds = float(ctx.call("get_cloud_time_seconds"))
+		seconds = float(ctx.get_cloud_time_seconds())
 		var camera := scene_data.get_cam_transform().orthonormalized()
 		camera.origin += camera.basis * scene_data.get_view_eye_offset(view)
 		camera_world_m = camera.origin
@@ -1277,7 +1120,7 @@ func _dispatch_ambient(ctx: FRPPassContext, state: Dictionary, packets: Dictiona
 		rd: RenderingDevice) -> bool:
 	var lighting: PackedFloat32Array = packets.lighting
 	var sky_is_array := lighting.size() >= 44 and lighting[43] > 0.5
-	var sky := _context_rid_or(ctx, "get_cloud_sky_octmap", RID(), rd)
+	var sky := _texture_or(rd, ctx.get_cloud_sky_octmap(), RID())
 	if not _valid_texture(rd, sky):
 		sky = _neutral_sky_array if sky_is_array else _neutral_sky_2d
 	var variant := {"FENG_CLOUD_SKY_OCTMAP_ARRAY": 1 if sky_is_array else 0}
@@ -1287,16 +1130,15 @@ func _dispatch_ambient(ctx: FRPPassContext, state: Dictionary, packets: Dictiona
 	var uniforms: Array[RDUniform] = []
 	_add_uniform_buffer(uniforms, 2, state.lighting_ubo)
 	_add_uniform_buffer(uniforms, 3, state.atmosphere_ubo)
-	_add_sampled(uniforms, 9, _sampler, _packet_texture(ctx, "get_atmosphere_optical_texture", 0, rd))
-	_add_sampled(uniforms, 10, _sampler, _packet_texture(ctx, "get_atmosphere_multiple_texture", 1, rd))
+	_add_sampled(uniforms, 9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut))
+	_add_sampled(uniforms, 10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut))
 	_add_sampled(uniforms, 11, _sampler, sky)
-	_add_image(uniforms, 6, state.sky_ambient)
-	var set0 := _uniform_set(rd, ambient_pipeline.shader, 0, uniforms)
-	var set1 := _uniform_set(rd, ambient_pipeline.shader, 1, _image_uniforms(6, state.sky_ambient))
+	var set0 := _uniform_set(ambient_pipeline.shader, 0, uniforms)
+	var set1 := _uniform_set(ambient_pipeline.shader, 1, _image_uniforms(6, state.sky_ambient))
 	return _dispatch(rd, ambient_pipeline.pipeline, [set0, set1], Vector2i(8, 8))
 
 
-func _begin_cloud_frame(ctx: FRPPassContext, state: Dictionary, snapshot: Dictionary, scene_data: RenderSceneData,
+func _begin_cloud_frame(ctx: FRPPassContext, state: Dictionary, scene_data: RenderSceneData,
 		viewport_size: Vector2i, source_signature: int, now_usec: int, mode: int, capture: bool) -> void:
 	var previous_frame_usec: int = state.last_frame_usec
 	var dt := float(now_usec - previous_frame_usec) / 1000000.0 if previous_frame_usec > 0 else 0.0
@@ -1322,13 +1164,11 @@ func _begin_cloud_frame(ctx: FRPPassContext, state: Dictionary, snapshot: Dictio
 	state.mode = mode
 	state.capture = capture
 	state.dt = clampf(dt, 0.0, 1.0)
-	state.frame_started_usec = now_usec
-	state.cloud_snapshot = snapshot
 
 
 func _make_frame_packet(ctx: FRPPassContext, snapshot: Dictionary, scene_data: RenderSceneData,
 		buffers: RenderSceneBuffersRD, state: Dictionary, view: int, mode: int,
-		capture: bool, now_usec: int) -> Dictionary:
+		capture: bool) -> Dictionary:
 	var full_size := buffers.get_internal_size()
 	var trace_size: Vector2i = state.trace_size
 	var base_camera: Transform3D = scene_data.get_cam_transform().orthonormalized()
@@ -1368,11 +1208,11 @@ func _make_frame_packet(ctx: FRPPassContext, snapshot: Dictionary, scene_data: R
 	if bool(state.history_valid) and not capture and (mode == 0 or mode == 2) and not previous.is_empty(): flags |= 2
 	if not previous.is_empty() and _camera_cut(previous.camera, camera, previous.projection, camera_projection_unjittered, full_size): flags |= 4
 	if camera_projection.is_orthogonal(): flags |= 8
-	if not capture and ctx.has_method("supports_cloud_holdout") and bool(ctx.call("supports_cloud_holdout")): flags |= 16
+	if not capture and ctx.supports_cloud_holdout(): flags |= 16
 	var floats := PackedFloat32Array()
 	_append_projection(floats, view_projection.inverse())
 	_append_projection(floats, previous_projection)
-	_append_transform(floats, Projection(base_camera.affine_inverse()))
+	_append_projection(floats, Projection(base_camera.affine_inverse()))
 	_append4(floats, camera.origin.x, camera.origin.y, camera.origin.z, 1.0)
 	_append4(floats, previous_camera.origin.x, previous_camera.origin.y, previous_camera.origin.z, 1.0)
 	_append4(floats, full_size.x, full_size.y, 1.0 / maxf(float(full_size.x), 1.0), 1.0 / maxf(float(full_size.y), 1.0))
@@ -1446,7 +1286,7 @@ func _blue_noise_texture(snapshot: Dictionary, rd: RenderingDevice) -> RID:
 
 
 func _make_projection_parameters(snapshot: Dictionary, lighting: PackedFloat32Array,
-		material: PackedFloat32Array, scene_data: RenderSceneData, view: int, state: Dictionary) -> PackedFloat32Array:
+		material: PackedFloat32Array, scene_data: RenderSceneData) -> PackedFloat32Array:
 	var settings := _effective_shadow_settings(snapshot)
 	var ao_settings: Dictionary = snapshot.get("sky_ao", {})
 	var center := _vector3(snapshot.get("planet_center_m", Vector3.ZERO), Vector3.ZERO)
@@ -1640,16 +1480,6 @@ func _scene_format_variant(rd: RenderingDevice, scene_layer: RID) -> Dictionary:
 	return {}
 
 
-func _ensure_ambient_texture(buffers: RenderSceneBuffersRD, rd: RenderingDevice, state: Dictionary) -> RID:
-	if not buffers.has_texture(state.scope, &"sky_ambient"):
-		if not _create_named_texture(buffers, state, "sky_ambient", RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
-				Vector2i.ONE, 1, false, rd):
-			return RID()
-		state.sky_ambient = _named(buffers, state, "sky_ambient")
-		rd.texture_clear(state.sky_ambient, Color(0, 0, 0, 0), 0, 1, 0, 1)
-	return state.get("sky_ambient", RID())
-
-
 func _projection_changed(a: Projection, b: Projection, viewport_size := Vector2i.ONE) -> bool:
 	var jitter_tolerance := Vector2(1.0 / maxf(float(viewport_size.x), 1.0), 1.0 / maxf(float(viewport_size.y), 1.0))
 	for column in 4:
@@ -1665,13 +1495,8 @@ func _projection_changed(a: Projection, b: Projection, viewport_size := Vector2i
 
 
 func _taa_jitter(ctx: FRPPassContext) -> Vector2:
-	if ctx != null and ctx.has_method("get_taa_jitter"):
-		var value: Variant = ctx.call("get_taa_jitter")
-		if value is Vector2:
-			var jitter: Vector2 = value
-			if jitter.is_finite():
-				return jitter
-	return Vector2.ZERO
+	var jitter := ctx.get_taa_jitter()
+	return jitter if jitter.is_finite() else Vector2.ZERO
 
 
 func _projection_without_jitter(value: Projection, jitter: Vector2) -> Projection:
@@ -1693,40 +1518,17 @@ func _camera_cut(previous: Transform3D, current: Transform3D, previous_projectio
 
 
 func _scene_exposure_normalization(ctx: FRPPassContext) -> float:
-	if ctx != null and ctx.has_method("get_scene_exposure_normalization"):
-		var value := float(ctx.call("get_scene_exposure_normalization"))
-		if is_finite(value) and value > 0.0:
-			return value
-	return 1.0
+	var value := ctx.get_scene_exposure_normalization()
+	return value if is_finite(value) and value > 0.0 else 1.0
 
 
 func _pre_exposure(ctx: FRPPassContext, view: int) -> float:
-	if ctx != null and ctx.has_method("get_pre_exposure"):
-		var value := float(ctx.call("get_pre_exposure", view))
-		if is_finite(value) and value > 0.0:
-			return value
-	return 1.0
+	var value := ctx.get_pre_exposure(view)
+	return value if is_finite(value) and value > 0.0 else 1.0
 
 
-func _packet_texture(ctx: FRPPassContext, method_name: String, index: int, rd: RenderingDevice) -> RID:
-	var texture := _context_rid_or(ctx, method_name, _neutral_lut, rd, index)
-	return texture if _valid_texture(rd, texture) else _neutral_lut
-
-
-func _context_rid_or(ctx: Object, method_name: String, fallback: RID, rd: RenderingDevice, index := -1) -> RID:
-	if ctx == null or not ctx.has_method(method_name):
-		return fallback
-	var value: Variant = ctx.call(method_name, index) if index >= 0 else ctx.call(method_name)
-	if value is RID and _valid_texture(rd, value):
-		return value
-	return fallback
-
-
-func _get_context_rid(ctx: Object, method_name: String, index := -1) -> RID:
-	if ctx == null or not ctx.has_method(method_name):
-		return RID()
-	var value: Variant = ctx.call(method_name, index) if index >= 0 else ctx.call(method_name)
-	return value if value is RID and value.is_valid() else RID()
+func _texture_or(rd: RenderingDevice, texture: RID, fallback: RID) -> RID:
+	return texture if _valid_texture(rd, texture) else fallback
 
 
 func _valid_texture(rd: RenderingDevice, rid: RID) -> bool:
@@ -1818,7 +1620,7 @@ func _expand_shader(path: String, depth: int) -> String:
 	return "\n".join(output)
 
 
-func _uniform_set(rd: RenderingDevice, shader: RID, index: int, uniforms: Array[RDUniform]) -> RID:
+func _uniform_set(shader: RID, index: int, uniforms: Array[RDUniform]) -> RID:
 	if uniforms.is_empty():
 		return RID()
 	return UniformSetCacheRD.get_cache(shader, index, uniforms)
@@ -1860,12 +1662,6 @@ func _image_uniforms3(items: Array) -> Array[RDUniform]:
 	for item in items:
 		_add_image(result, int(item[0]), item[1])
 	return result
-
-
-func _push_image_placeholder(_texture: RID, _binding: int) -> Array[RDUniform]:
-	# The output image is already present in the shader's set 1; this helper keeps
-	# the shadow set construction symmetrical while preserving exact binding IDs.
-	return []
 
 
 func _dispatch(rd: RenderingDevice, pipeline: RID, uniform_sets: Array,
@@ -1952,10 +1748,6 @@ func _append_projection(values: PackedFloat32Array, projection: Projection) -> v
 		_append4(values, axis.x, axis.y, axis.z, axis.w)
 
 
-func _append_transform(values: PackedFloat32Array, transform: Projection) -> void:
-	_append_projection(values, transform)
-
-
 func _append4(values: PackedFloat32Array, x: float, y: float, z: float, w: float) -> void:
 	values.append_array(PackedFloat32Array([x, y, z, w]))
 
@@ -1964,7 +1756,3 @@ func _report(message: String) -> void:
 	if message != _last_error:
 		push_error("FengCloudGPU: " + message)
 		_last_error = message
-
-
-func _clear_report() -> void:
-	_last_error = ""

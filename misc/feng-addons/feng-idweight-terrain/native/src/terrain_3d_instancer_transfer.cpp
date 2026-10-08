@@ -44,13 +44,7 @@ void Terrain3DInstancer::copy_paste_dfr(const Terrain3DRegion *p_src_region, con
 
 	// Get all Cell locations in rect, which is already in region space.
 	Vector2i cell_start = p_src_rect.get_position() / CELL_SIZE;
-	Vector2i steps = p_src_rect.get_size() / CELL_SIZE;
-	Dictionary cells_to_copy;
-	for (int x = cell_start.x; x < cell_start.x + steps.x; x++) {
-		for (int y = cell_start.y; y < cell_start.y + steps.y; y++) {
-			cells_to_copy[Vector2i(x, y)] = 0;
-		}
-	}
+	Rect2i cells_to_copy(cell_start, p_src_rect.get_size() / CELL_SIZE);
 
 	// For each mesh, for each cell, if in rect, convert xforms to target region space, append to target region.
 	Dictionary mesh_inst_dict = p_src_region->get_instances();
@@ -61,7 +55,7 @@ void Terrain3DInstancer::copy_paste_dfr(const Terrain3DRegion *p_src_region, con
 		Dictionary cell_inst_dict = p_src_region->get_instances()[mesh_id];
 		Array cell_locs = cell_inst_dict.keys();
 		for (const Vector2i &cell : cell_locs) {
-			if (cells_to_copy.has(cell)) {
+			if (cells_to_copy.has_point(cell)) {
 				Array triple = cell_inst_dict[cell];
 				TypedArray<Transform3D> cell_xforms = triple[0];
 				PackedColorArray cell_colors = triple[1];

@@ -3,35 +3,8 @@
 #ifndef TERRAIN3D_CLIPMAP_COMMON_H
 #define TERRAIN3D_CLIPMAP_COMMON_H
 
-// The clipmap layer's **shared vocabulary**: everything the two implementations (`LOD` and `Atlas`) and
-// the facade above them (`terrain_3d_clipmap_layer.h`) must agree on, in one header with no
-// implementation-specific state and no engine dependency beyond the variant types.
-//
-// There is one clipmap *delivery*. What a user chooses inside it is an *implementation*: the toroidal
-// level ring (`Terrain3DClipmap`) or the block atlas (`Terrain3DClipmapAtlas`). The two differ in
-// storage, upload unit, rolling and layout - and in nothing else. That "nothing else" is this file:
-//
-//   * `Implementation` - the selector, its names and its validation, so the property, the dock, the
-//     reports and the debug view spell the two the same way.
-//   * `Shape` - the numbers a layer is built from. Both implementations are configured from this one
-//     struct, so a setting cannot exist for one of them and not the other.
-	//   * `Ladder` - the *sampling contract*: `unit_world_size(unit) = base_world * 2^unit` and
-	//     `texel_world(unit) = unit_world_size(unit) / size`. Both implementations address by this ladder; the
-//     atlas merely stores its units as shells of blocks instead of whole squares. Writing it once is
-//     what makes the density a fragment is served a property of the layer rather than of the storage.
-//     The material group's recommended endpoints are stated once below
-//     (`LADDER_FINEST_DENSITY` / `LADDER_COARSEST_DENSITY` / `LADDER_UNITS`): 1024 texels a metre at
-//     the finest unit, 1 at the coarsest, with each unit halving. Other groups may choose a lower
-//     finest density while using the same ladder formula and preserving the 1 texel/metre outer end.
-//   * `BakeRect` - the producer's queue entry. The ring queued a rect of a level, the atlas a rect of
-//     a slot; a producer only ever needs "which unit, which rect of it, and the lease that says the
-//     content still matches", so that is the shape both publish.
-//   * `UnitReport` - the debug/report schema, one entry per unit, filled by each implementation and
-//     assembled by the facade. A debug view or a test reads one schema whichever implementation is
-//     selected; only what is genuinely private to an implementation travels beside it.
-//
-// `docs/vt_delivery_assembly.md` section 6 is the long form of the layer; this header is the part of
-// it that is shared code rather than prose.
+// Shared shape, sampling ladder, bake leases and debug schema for LOD and Atlas.
+// Storage-specific state belongs to each implementation.
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/array.hpp>
@@ -53,45 +26,24 @@ namespace TerrainClipmap {
 inline constexpr int MAX_LEVELS = 16;
 inline constexpr int MAX_OUTSTANDING_RECTS = 4;
 
-// How a clipmap layer stores and uploads what it holds. The int values are the property values the
-// dock and scripts write, so they are part of the API and must not be renumbered; `LOD` is 0 because
-// it is the shipped behaviour and therefore the default of an unset property.
+// Persisted property values; keep their numeric identities stable.
 enum class Implementation : uint8_t {
-	// One toroidal square per level in a `Texture2DArray`, addressed by arithmetic. Level `l` covers
-	// `base_world * 2^l` metres in `size` texels. The update unit is a level: a movement re-publishes
-	// the whole square of every level it moved.
+	// Toroidal Texture2DArray levels; uploads replace each changed level.
 	LOD = 0,
-	// The same ladder stored as discrete blocks packed into one texture per channel. Ring `r` is a
-	// shell of blocks, each `base_world` metres of `size >> r` texels. The update unit is a block: a
-	// movement re-publishes the rects that changed.
+	// Blocks packed into per-channel atlases; uploads replace changed rectangles.
 	Atlas = 1,
 };
 
 inline constexpr int IMPLEMENTATION_COUNT = 2;
 
-// ---- The shipping ladder's two endpoints ----------------------------------------------------------
-//
-// The material group's recommended density endpoints are 1024 texels a metre at the finest unit and
-// 1 at the coarsest, with every unit between them half the density of the one inside (`1024 -> ... ->
-// 1`). These constants name that target once for its defaults, hint and acceptance. A different group
-// may intentionally begin at lower density; `Ladder` remains the same shared arithmetic and reports
-// the actual endpoints the configured shape reaches.
-//
-// `1024 / 2^10 == 1`, so the material span is eleven units. Every ceiling an implementation clamps
-// `units` to is at least this, and the layer reports how many units a shape needs to reach 1
-// (`units_for_density()`), so a clamp that shortens the chosen shape is visible rather than silent.
+// Default material density spans 1024 to 1 texels/metre over eleven octave units.
+// Other channel groups may choose a lower finest density.
 inline constexpr real_t LADDER_FINEST_DENSITY = 1024.f; // texels a metre at unit 0
 inline constexpr real_t LADDER_COARSEST_DENSITY = 1.f; // texels a metre at the outermost unit
 inline constexpr int LADDER_UNITS = 11; // log2(1024 / 1) + 1
 
-// ---- The block atlas's shape ----------------------------------------------------------------------
-//
-// The numbers a `ClipmapAtlas` arm's tables are sized from: the units one atlas may hold, the cells
-// one unit is (`9 * rings`: the centre block and its eight neighbours, which is what nests), and the
-// slots those cells need (one a cell, one spare a unit, one global block and room for a layout that
-// leaves a hole). They live in the shared vocabulary rather than on the atlas class because the
-// *material* owns the numeric tables and the shader defines sized from them, and a material that had
-// to name the implementation to size its own uniforms would be reaching across the delivery.
+// Atlas table capacities shared with material uniforms and shader defines.
+// Allow nine cells, one spare per ring, a global block and layout padding.
 inline constexpr int ATLAS_MAX_RINGS = 12;
 inline constexpr int ATLAS_MAX_CELLS = 9 * ATLAS_MAX_RINGS;
 inline constexpr int ATLAS_MAX_SLOTS = ATLAS_MAX_CELLS + ATLAS_MAX_RINGS + 8;
@@ -105,81 +57,59 @@ inline Implementation implementation_from_int(const int p_implementation,
 	return is_valid_implementation(p_implementation) ? Implementation(p_implementation) : p_fallback;
 }
 
-// The token a property, a report and a log line use. "LOD" and "Atlas" are the two the dock offers.
+// Names shared by properties, reports and logs.
 inline const char *implementation_name(const Implementation p_implementation) {
 	return p_implementation == Implementation::Atlas ? "Atlas" : "LOD";
 }
 
-// The same value as the *setting* the dock's enum hint spells: one list, so the property hint and the
-// panel cannot disagree about the order.
+// Inspector enum order matches Implementation.
 inline const char *implementation_hint() {
 	return "LOD,Atlas";
 }
 
-// The shape. One struct configures either implementation, which is the whole reason a new clipmap
-// setting is one field here rather than one field per implementation.
+// Configuration shared by both storage implementations.
 struct Shape {
-	// Ring 0's resolution in texels an axis. The LOD ring's level size and the atlas's block size are
-	// the same number, so a user who tuned one has tuned the other: it is the layer's finest density
-	// together with `base_world` (`size / base_world` texels a metre).
+	// Finest level/block resolution; density is size / base_world.
 	int size = 256;
-	// How many units the layer holds: LOD levels, or atlas rings. Clamped by each implementation to
-	// its own ceiling, because the shader's per-unit arrays are sized from it - and the ceilings are
-	// all at least `LADDER_UNITS`, so the shipped 1024 -> 1 span is never clamped short.
+	// LOD levels or atlas rings, clamped to the implementation capacity.
 	int units = LADDER_UNITS;
-	// The world size of the finest unit, and therefore the ladder's octave: unit `l` is twice as
-	// coarse as unit `l - 1`. Together with `size` it is the finest endpoint: the defaults
-	// (256 texels over 0.25 m) are 1024 texels a metre, and eleven units of it reach 1.
+	// Finest unit width in metres; each later unit doubles it.
 	real_t base_world = 0.25f;
-	// Values a texel holds, one texture array layer each, and one value's format. The channel's own
-	// declaration (`Terrain3DClipmapSource`), carried here so `configure()` is one call.
+	// Channel count and formats come from Terrain3DClipmapSource.
 	int channels = 1;
 	Image::Format format = Image::FORMAT_RF;
 	int baked_channels = 0;
 	Image::Format baked_format = Image::FORMAT_RGBAH;
-	// The atlas's out-of-grid resource and its per-frame production bound. They are part of the shared
-	// shape because they are *settings of the layer*; the LOD implementation declares they do not
-	// apply to it (`uses_global_block()` / `uses_block_pacing()`), rather than the facade hiding them.
+	// Atlas-only global block and production pacing settings.
 	int global_texels = 64;
 	int blocks_per_frame = 1;
 	bool spares = true;
 };
 
-// The sampling contract, derived from the shape and nothing else. Both implementations address by this
-// ladder; the atlas stores a unit as a shell of blocks rather than as one square, which changes where a
-// texel *lives* and not which texel a world position gets.
+// Shared world-space sampling ladder, independent of storage layout.
 struct Ladder {
-	// A neutral empty ladder until `ladder_of(shape)` supplies the configured layer's values.
+	// Neutral values until ladder_of(shape) configures the ladder.
 	int size = 1;
 	real_t base_world = 1.f;
 	// The world side length of one unit: `base_world * 2^unit` metres.
 	real_t unit_world_size(const int p_unit) const {
 		return base_world * real_t(int64_t(1) << CLAMP(p_unit, 0, 30));
 	}
-	// The world size of one texel of a unit: its shared world size divided by `size`. The density a
-	// fragment is served at a distance is the reciprocal, which is why the "density - distance" curve
-	// is this function sampled by `unit_for_distance()`.
+	// World-space texel width at this unit.
 	real_t texel_world(const int p_unit) const {
 		return unit_world_size(p_unit) / real_t(MAX(1, size));
 	}
-	// The density a fragment is served by one unit, in texels a metre. It is the reciprocal of the
-	// texel size, and it is the number the acceptance's "density - distance" curve is made of: a curve
-	// that reads it per unit and measures the distance in the unit's own reach is a property of the
-	// *layer*, which is why every implementation answers it identically.
+	// Texels per metre at this unit.
 	real_t density_of_unit(const int p_unit) const {
 		return 1.f / texel_world(p_unit);
 	}
-	// The density the ladder's innermost unit serves: the shape's `size / base_world`, i.e. the finest
-	// endpoint a shape with this ladder presents.
+	// Finest density: size / base_world.
 	real_t finest_density() const { return density_of_unit(0); }
-	// The density the ladder reaches when it holds `p_units` units: the outermost endpoint a layer of
-	// that many units presents. `density_at_unit_count(1)` is the finest unit's own density.
+	// Density at the last of p_units units.
 	real_t density_at_unit_count(const int p_units) const {
 		return density_of_unit(MAX(1, p_units) - 1);
 	}
-	// How many units *this* ladder needs to fall from its own finest density to `p_coarsest`. A shape
-	// whose settings ask for fewer units than this presents a truncated ladder, which is the number
-	// the layer's debug schema publishes (`ladder_units_required`) rather than hiding behind a clamp.
+	// Unit count needed to reach the requested coarsest density.
 	int units_for_density(const real_t p_coarsest = LADDER_COARSEST_DENSITY) const {
 		int units = 1;
 		while (units < 31 && density_of_unit(units - 1) > p_coarsest) {
@@ -187,8 +117,7 @@ struct Ladder {
 		}
 		return units;
 	}
-	// Whether `p_units` units of this ladder present both shipping endpoints. The comparison is a
-	// relative one because a shape's fields are floats and `size / base_world` is a division.
+	// Compare the default density endpoints with a relative tolerance.
 	bool spans_endpoints(const int p_units) const {
 		const real_t finest = finest_density();
 		const real_t coarsest = density_at_unit_count(p_units);
@@ -204,11 +133,8 @@ inline Ladder ladder_of(const Shape &p_shape) {
 	return ladder;
 }
 
-// One entry of a producer's bake queue, in the one shape both implementations publish. `unit` is what
-// the implementation calls the storage - a level for the LOD ring, an atlas slot for the atlas - and
-// `lease` is whatever makes the entry still describe current content (the ring's content serial, the
-// atlas's slot serial). A producer copies the entry, dispatches a bake over `rect`, and hands the copy
-// back: the implementation is the one that decides whether it still counts.
+// A produced rectangle awaiting baking. Unit is a LOD level or Atlas slot;
+// lease identifies its content revision. Acknowledge only after dispatch succeeds.
 struct BakeRect {
 	int unit = 0;
 	int x0 = 0;
@@ -220,10 +146,7 @@ struct BakeRect {
 	Rect2i rect() const { return Rect2i(x0, y0, x1 - x0, y1 - y0); }
 };
 
-// One unit's debug/report entry, in the one schema the facade assembles and the debug view and the
-// tests read. Every field is answerable by either implementation: the LOD ring's level and the atlas's
-// ring both have a texel size, a world size, a "is it readable now" bit, a queued rect list and a
-// density. What an implementation cannot answer it leaves at its default.
+// Shared per-unit report. Unsupported fields retain their defaults.
 struct UnitReport {
 	int index = 0;
 	// "level" for the LOD ring's levels, "ring" for the atlas's shells.
@@ -231,20 +154,16 @@ struct UnitReport {
 	int texels = 0;
 	real_t world_size = 0.f;
 	real_t texel_world = 0.f;
-	// The density a fragment is served by this unit, in texels a metre. The same number on both sides,
-	// because both address by the shared ladder.
+	// Texels per metre from the shared ladder.
 	real_t density = 0.f;
-	// Whether the unit is readable *right now*: the LOD ring's `valid`, the atlas's "every cell of the
-	// shell current". A unit that is not readable falls back, which is what the debug view colours.
+	// Readable now: valid LOD level or fully current Atlas shell.
 	bool valid = false;
-	// Whether the unit's *baked* content is readable too (the material arm's gate). Equal to `valid`
-	// for a channel with no bake.
+	// Baked content is readable; equals valid for unbaked sources.
 	bool baked = false;
 	int pending = 0;
 	// The world rects still queued for this unit, so a moving focus is drawn rather than claimed.
 	std::vector<Rect2> pending_rects;
-	// Where the unit stands, when the implementation has one square per unit. The atlas's shell has no
-	// single centre, so it publishes its own grid instead.
+	// Single-square addressing for LOD; Atlas publishes its grid separately.
 	Vector2 center;
 	Vector2i offset;
 	// How many resident pieces of content the unit holds (atlas: slots; LOD: 1 when valid, else 0).
@@ -277,10 +196,7 @@ inline Dictionary unit_report_to_dictionary(const UnitReport &p_report) {
 	return entry;
 }
 
-// ---- Shared addressing arithmetic -----------------------------------------------------------------
-//
-// Reduces a signed texel index into `[0, size)`. The ring's `physical = (logical + ring) mod size` and
-// the atlas's per-block offset both go through this one function.
+// Wrap a signed texel index into [0, size).
 inline int wrap_texel(const int p_value, const int p_size) {
 	if (p_size <= 0) {
 		return 0;
@@ -289,9 +205,7 @@ inline int wrap_texel(const int p_value, const int p_size) {
 	return reduced < 0 ? reduced + p_size : reduced;
 }
 
-// Bytes one stored value occupies, which is the channel's format: one value per texel per layer, and a
-// baked channel's layer is a whole texel (four components), so both implementations count the same
-// bytes for the same format. One spelling, so an upload's byte count cannot differ from the atlas's.
+// Bytes per stored channel texel, shared by both upload implementations.
 inline int bytes_per_texel(const Image::Format p_format) {
 	switch (p_format) {
 		case Image::FORMAT_R8:

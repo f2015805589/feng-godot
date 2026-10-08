@@ -49,7 +49,7 @@ def main() -> int:
         base += ["--rendering-method", "frp", "--rendering-driver", args.driver]
     else:
         base += ["--headless"]
-    for stage, extra in (("import", ["--import"]), ("lifecycle", [])):
+    for stage, extra in (("import", ["--recovery-mode", "--import"]), ("lifecycle", [])):
         if stage == "lifecycle":
             config = project / "project.godot"
             config.write_text(config.read_text().replace('enabled=PackedStringArray()',

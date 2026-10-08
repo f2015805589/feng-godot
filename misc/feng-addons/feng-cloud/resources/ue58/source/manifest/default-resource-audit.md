@@ -1,6 +1,6 @@
 # UE 5.8 default volumetric-cloud resource audit
 
-> **Follow-up correction:** The earlier ConservativeDensity/profile interpretation in this first-pass audit is superseded by [`conservative-density-formulas.md`](conservative-density-formulas.md), backed by `active_deferred_material_ast.json` (SHA-256 `D6821214559A8F43B95EA001479A8C07801E51479E2ADBA8FDD3522F6EC5E358`) and `conservative_density_active_paths.json` (SHA-256 `DF7EBCB491B2A149AF3DE0ED7097A97598A2B0CC2715FB28BC07C8A5E8A70B3C`). Use that follow-up for the active Deferred graph formulas and channel reachability below.
+Active Deferred formulas and channel reachability are defined in [`conservative-density-formulas.md`](conservative-density-formulas.md), backed by `active_deferred_material_ast.json` (SHA-256 `D6821214559A8F43B95EA001479A8C07801E51479E2ADBA8FDD3522F6EC5E358`) and `conservative_density_active_paths.json` (SHA-256 `DF7EBCB491B2A149AF3DE0ED7097A97598A2B0CC2715FB28BC07C8A5E8A70B3C`). This file records the package/property inventory.
 
 Generated UTC: 2026-10-07T03:33:26.867396+00:00
 
@@ -88,7 +88,6 @@ Serialized parameter defaults (as stored in the parent material graph):
 Important advanced-output wiring:
 
 - `MaterialExpressionVolumetricAdvancedMaterialOutput_0` is serialized as the material’s advanced volume output. `PhaseG`, `PhaseG2`, and `PhaseBlend` are the R/G/B components of `Phase_Controls=(0.8, 0.166667, 0.575, 1)`; `MultiScatteringContribution`, `MultiScatteringOcclusion`, and `MultiScatteringEccentricity` are the R/G/B components of `Multiscatter_Controls=(0.666667, 0.25, 0.18, 1)`. `ConservativeDensity` comes from a `MakeFloat4` function-call node with channels named `ConservativeDensity.r/g/b/a`. The follow-up report expands each active channel and its default branch.
-- The parent material’s serialized graph defaults include `Cloud_GlobalCoverage=-0.2`, `Cloud_GlobalDensity=0.008`, `Cloud_AlbedoColor=(0.98,0.98,0.98,0.5)`, `Layout_CloudType=(1,1,1,2)`, `Layout_CloudGlobalScale=256`, `Layout_WindControls=(1,1,0.5,0.333333)`, `Noise1_Coordinates=(4.167,4.444,9.091,7)`, `Noise2_Coordinates=(60,60,75,-6)`, `Noise3_Coordinates=(30,40,25,8)`, `Noise_Bias=(0.5,0.8,0.5,0)`, and `Noise_Strength=(0.8,0.08,0.03,2.5)`. Other serialized parent-graph defaults are listed in the parameter table. The follow-up resolves `StormClouds` to the class default zero and `UseNoise3` to its class default false for this default instance.
 - The initial direct-edge scan did not expand the material-function closure, so its statements about which profile samples were active and whether the profile affected a material output were incomplete. The follow-up closure establishes the active `.b` profile formula and also expands the `.a` noise branch and SubsurfaceColor dependencies. See `conservative-density-formulas.md`; this graph/CDO analysis still does not compile the UE material or evaluate its texture pixels.
 - The 2D noise/detail textures packaged alongside the material are not all the actual default instance bindings. The default 3D noise input is `VT_PerlinWorley_Balanced` (128³ RGBA16F; its per-asset sRGB property is not serialized in this export); `T_VolumeNoiseShape64/128` and `T_VolumeNoiseErosion32` are additional source assets, not the instance’s `Noise_Texture3D` override.
 
@@ -103,7 +102,9 @@ CloudSampleAltitudeInLayer = CloudSampleAltitude - BottomRadius
 CloudSampleNormAltitudeInLayer = saturate(CloudSampleAltitudeInLayer / (TopRadius - BottomRadius))
 ```
 
-The normalized layer coordinate is available to the volumetric material graph. The first-pass report did not resolve the profile/noise function closure; its statements about the `.b` branch not reaching a complete material formula are superseded by `conservative-density-formulas.md`. That follow-up records the active default Deferred expressions and CDO branches. It remains serialized graph analysis, not UE material compilation or numerical evaluation of source texture pixels.
+The normalized coordinate feeds the active Deferred expressions in
+[`conservative-density-formulas.md`](conservative-density-formulas.md). That file records
+serialized graph/CDO analysis; shader compilation and numerical source-texture evaluation are separate checks.
 
 ## Evidence files and limits
 

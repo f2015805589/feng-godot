@@ -3,27 +3,8 @@
 #ifndef TERRAIN3D_CLIPMAP_LAYER_H
 #define TERRAIN3D_CLIPMAP_LAYER_H
 
-// The **one clipmap layer**: a facade over the two implementations, and the only clipmap object the
-// rest of the addon names.
-//
-// There is one clipmap *delivery*. What a user chooses inside it is an *implementation* - the
-// toroidal level ring (`LOD`) or the block atlas (`Atlas`) - and this class is where that choice
-// lives:
-//
-//   * it owns exactly one implementation at a time, built from the shared `TerrainClipmap::Shape`
-//     (`configure()`), and frees the other when the choice moves, so the two can never disagree about
-//     the shape of the layer;
-//   * it forwards the whole of the shared contract (`terrain_3d_clipmap_impl.h`) without branching on
-//     which implementation is selected, so the tick, the assembly rule, the bake offer, the reports
-//     and the debug view have one call each;
-//   * it assembles the one **debug schema** (`get_debug_layout()`) from the contract's per-unit
-//     entries plus whatever the implementation adds privately, so a debug view or a test reads the
-//     same keys whichever implementation is selected.
-//
-// What is *not* here is the point of the layer: no storage, no upload, no rolling, no layout, no
-// addressing arithmetic beyond the shared ladder. Those are the implementations'. The shared half - the
-// ladder, the rect math, the bake-queue entry and the per-unit schema - is in
-// `terrain_3d_clipmap_common.h`, once.
+// Owns one LOD or Atlas implementation and forwards the shared clipmap contract.
+// Configuration selects storage; get_debug_layout assembles the common report.
 
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/rect2.hpp>
@@ -48,34 +29,27 @@ class Terrain3DClipmapLayer {
 	CLASS_NAME_STATIC("Terrain3DClipmapLayer");
 
 public:
-	// Everything the layer is built from. One struct for both implementations: the shared `Shape`
-	// carries the numbers, and `implementation` says which storage answers them.
+	// Storage choice and shared configuration.
 	struct Settings {
 		TerrainClipmap::Implementation implementation = TerrainClipmap::Implementation::LOD;
 		TerrainClipmap::Shape shape;
 	};
 
-	// The channel's source, made fresh for each build: a source holds the channel's shape and its
-	// reader (`Terrain3DClipmapSource`), and an implementation takes ownership of it. The facade asks
-	// for one when it builds an implementation, so switching does not have to move ownership back out
-	// of the one being replaced - and a channel is one line in the owner's factory, unchanged.
+	// Creates an owned source for each implementation build.
 	using SourceFactory = std::function<std::unique_ptr<Terrain3DClipmapSource>()>;
 
 	explicit Terrain3DClipmapLayer(SourceFactory p_factory);
 	~Terrain3DClipmapLayer();
 
-	// Applies the settings. A change of implementation frees the selected one's storage and builds the
-	// other; a shape change reconfigures the selected one in place. Returns whether a layer exists
-	// afterwards, which is what the caller's debug entry reports as "-1 rather than produced nothing".
+	// Rebuilds on storage changes; reconfigures shape in place. Returns configured state.
 	bool configure(const Settings &p_settings);
 	// Frees the selected implementation's storage. The layer can be configured again afterwards.
 	void clear();
 	// An immutable snapshot is installed before the worker can call the source. It is also the input
 	// snapshot already used by page and detail production.
 	void set_source_snapshot(const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot);
-	// Schedule changed work on the existing source planner, and treat unchanged mappings as handled
-	// without a worker task. Each implementation answers its own pending-work and movement check and
-	// retains its own production pacing. True means the caller should skip sync update.
+	// Queue changed work on the source planner. True skips the synchronous update;
+	// unchanged mappings need no worker task.
 	bool schedule_async_update(const Vector2 &p_focus, int p_budget_texels,
 			const std::shared_ptr<const Terrain3DPagePipeline::Snapshot> &p_snapshot,
 			Terrain3DPagePipeline *p_pipeline);
@@ -111,14 +85,12 @@ public:
 		return _impl != nullptr ? _impl->get_implementation() : _settings.implementation;
 	}
 	const Settings &get_settings() const { wait_for_async_update(); return _settings; }
-	// The shape the implementation was actually configured with, which is the shared ladder a report or
-	// a test measures against - clamped by the implementation, not by the settings.
+	// Actual configured ladder, including implementation clamps.
 	TerrainClipmap::Ladder get_ladder() const {
 		wait_for_async_update();
 		return _impl != nullptr ? _impl->get_ladder() : TerrainClipmap::ladder_of(_settings.shape);
 	}
-	// The source's shape, asked before an implementation exists so the owner can configure one from the
-	// channel's own declaration (the same rule the ring followed).
+	// Source shape is available before storage is built.
 	int get_source_channel_count() const;
 	Image::Format get_source_format() const;
 	int get_source_baked_channel_count() const;
@@ -141,9 +113,7 @@ public:
 		wait_for_async_update();
 		return _impl != nullptr ? _impl->get_texel_world_at(p_world) : 0.f;
 	}
-	// The density a fragment is served at a world point, in texels a metre: the shared ladder's
-	// reciprocal. Both implementations answer it through the one function, which is what makes the
-	// "density - distance" curve a reading of the layer rather than of the storage.
+	// Texels per metre at this world point; zero outside coverage.
 	real_t get_density_at(const Vector2 &p_world) const {
 		const real_t texel = get_texel_world_at(p_world);
 		return texel > 0.f ? 1.f / texel : 0.f;
@@ -211,19 +181,12 @@ public:
 	// Empty when no layer is configured, which is the gate the material's arm uses.
 	Dictionary get_arm() const { wait_for_async_update(); return _impl != nullptr ? _impl->get_arm() : Dictionary(); }
 	Dictionary get_address_arm() const { wait_for_async_update(); return _impl != nullptr ? _impl->get_address_arm() : Dictionary(); }
-	// The selected implementation as its own type. It exists for the **one** consumer whose plumbing is
-	// genuinely per-storage - the bake producer's descriptor sets name either a level array or a rect
-	// array, and the shader it dispatches is the same - so that consumer has one branch instead of the
-	// whole addon. Null when the *other* implementation is selected, so the wrong one cannot be used by
-	// accident, and the shared contract above stays the only door everything else goes through.
+	// Storage-specific access for bake descriptor construction; null for the other type.
 	Terrain3DClipmap *lod_impl();
 	const Terrain3DClipmap *lod_impl() const;
 	Terrain3DClipmapAtlas *atlas_impl();
 	const Terrain3DClipmapAtlas *atlas_impl() const;
-	// The **one debug schema**: the shared per-unit entries every implementation answers, the layer's
-	// own shape and coverage curve, and the implementation's private payload nested under `"impl"`.
-	// A debug view draws the implementation's picture from `"impl"` and the coverage/density numbers
-	// from the shared keys, so neither has to know which implementation is selected to be correct.
+	// Common shape and per-unit reports, with storage-specific data under "impl".
 	Dictionary get_debug_layout(const String &p_group) const;
 
 private:

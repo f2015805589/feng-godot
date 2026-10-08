@@ -26,6 +26,7 @@
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 
 #include <algorithm>
+#include <utility>
 
 // The codec vocabulary, the shared constants and the small helpers of the halves; see
 // terrain_3d_surface_baker_internal.h for what it holds and why it is a header.
@@ -215,8 +216,8 @@ void Terrain3DSurfaceBaker::clear() {
 // Under the scratch regime there is nothing to copy: a page's half-float content only ever lives in
 // the ring, and the compressed layers cannot be copied at all (a block format cannot carry the
 // unordered-access flag `texture_copy` needs on D3D12). Every page is re-produced instead, which is
-// what the caller already marked not ready. Returns false - with `p_next` freed - when a copy fails,
-// in which case the caller has nothing to adopt.
+// what the caller already marked not ready. A failed copy leaves the candidate for the
+// caller to release; the live bundle is retained until migration succeeds.
 bool Terrain3DSurfaceBaker::_adopt_grown_pages(const ResourceBundle &p_old, ResourceBundle &p_next,
 		const int p_old_count, const std::vector<uint8_t> &p_ready, const uint64_t p_old_generation,
 		const int p_stored_size) {
@@ -228,7 +229,7 @@ bool Terrain3DSurfaceBaker::_adopt_grown_pages(const ResourceBundle &p_old, Reso
 			if (_rd->texture_copy(p_old.output_albedo_rd, p_next.output_albedo_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
 					_rd->texture_copy(p_old.output_normal_rd, p_next.output_normal_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK ||
 					_rd->texture_copy(p_old.output_params_rd, p_next.output_params_rd, Vector3(), Vector3(), extent, 0, 0, slot, slot) != OK) {
-				_free_bundle(_rd, p_next); return false;
+				return false;
 			}
 			++copied;
 		}
@@ -253,7 +254,7 @@ bool Terrain3DSurfaceBaker::_adopt_grown_pages(const ResourceBundle &p_old, Reso
 void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t p_generation,
 		const int p_page_count) {
 	std::lock_guard<std::mutex> lock(_mutex);
-	_resources = p_next;
+	_resources = std::exchange(p_next, ResourceBundle());
 	_resource_generation = p_generation;
 	_resource_page_count = p_page_count;
 	_page_count = p_page_count;
@@ -266,8 +267,7 @@ void Terrain3DSurfaceBaker::_adopt_bundle(ResourceBundle &p_next, const uint64_t
 	_encode_pending.assign(size_t(p_page_count), 0);
 	{
 		// The ring is the encoder's own state, so it is guarded by the encode mutex. Lock order is
-		// _mutex then _encode_mutex everywhere; the readback callback takes them in separate scopes
-		// and never holds one while taking the other.
+		// _mutex then _encode_mutex, including the readback callback's buffer check and release.
 		std::lock_guard<std::mutex> encode_lock(_encode_mutex);
 		_encode_ring_held.assign(ENCODE_PAGES_MAX, 0);
 	}
@@ -323,7 +323,6 @@ bool Terrain3DSurfaceBaker::_create_bake_core_resources(ResourceBundle &r_next,
 			!r_next.sampler_nearest.is_valid() || !r_next.sampler_linear.is_valid() ||
 			!r_next.material_buffer.is_valid() || !r_next.job_buffer.is_valid() ||
 			!_compile_pipeline(r_next)) {
-		_free_bundle(_rd, r_next);
 		LOG(ERROR, "Could not allocate the surface bake core resources");
 		return false;
 	}
@@ -363,12 +362,7 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 			continue;
 		}
 		if (want_params && params_format == RenderingDevice::DATA_FORMAT_MAX) {
-			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
-			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
-			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_free_bundle(_rd, r_next);
+			_tiers[tier].disable_compression();
 			LOG(WARN, "Parameter codec format is unavailable; keeping ", tier == TIER_SVT ? "SVT" : "AVT", " pages canonical");
 			return false;
 		}
@@ -386,12 +380,7 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 		const bool allocated = (!want_albedo || set.albedo_rd.is_valid()) &&
 				(!want_normal || set.normal_rd.is_valid()) && (!want_params || set.params_rd.is_valid());
 		if (!allocated) {
-			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
-			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
-			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_free_bundle(_rd, r_next);
+			_tiers[tier].disable_compression();
 			LOG(WARN, "Could not allocate the compressed surface arrays; keeping ", tier_name, " pages canonical");
 			return false;
 		}
@@ -411,12 +400,7 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 		const bool wrapped = (!want_albedo || set.albedo_rs.is_valid()) &&
 				(!want_normal || set.normal_rs.is_valid()) && (!want_params || set.params_rs.is_valid());
 		if (!wrapped) {
-			_tiers[tier].effective.store(SURFACE_PAGE_UNCOMPRESSED);
-			_tiers[tier].normal_effective.store(SURFACE_NORMAL_UNCOMPRESSED);
-			_tiers[tier].format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].format_srgb.store(RenderingDevice::DATA_FORMAT_MAX);
-			_tiers[tier].normal_format.store(RenderingDevice::DATA_FORMAT_MAX);
-			_free_bundle(_rd, r_next);
+			_tiers[tier].disable_compression();
 			LOG(WARN, "Could not wrap the compressed surface arrays; keeping ", tier_name, " pages canonical");
 			return false;
 		}
@@ -488,7 +472,6 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 	if (!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid() ||
 			!r_next.output_albedo_rd.is_valid() || !r_next.output_normal_rd.is_valid() ||
 			!r_next.output_params_rd.is_valid()) {
-		_free_bundle(_rd, r_next);
 		LOG(ERROR, "Could not allocate surface bake textures");
 		return false;
 	}

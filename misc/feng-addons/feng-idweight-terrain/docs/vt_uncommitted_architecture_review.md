@@ -1,4 +1,7 @@
-# Uncommitted terrain architecture review
+# Terrain architecture review: historical working-tree snapshot
+
+Historical record: the findings and results apply to the working-tree stage described below.
+Current ownership is maintained in [the architecture guide](vt_architecture_review.md).
 
 Scope: the terrain addon's tracked diff and new source/test files, including native
 VT planning, production, compression, shader sampling, diagnostics, editor resource

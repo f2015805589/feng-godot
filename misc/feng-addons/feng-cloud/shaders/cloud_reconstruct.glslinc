@@ -160,7 +160,6 @@ void feng_cloud_sample_current(
 	float nearest_front = FENG_CLOUD_VRT_FAR_DEPTH_M;
 	float min_scene_depth = FENG_CLOUD_VRT_FAR_DEPTH_M;
 	float max_scene_depth = 0.0;
-	ivec2 nearest_pixel = ivec2(0);
 	bool has_cloud = false;
 	bool has_secondary = false;
 	ivec3 nearest_coord = ivec3(0);
@@ -186,7 +185,6 @@ void feng_cloud_sample_current(
 			has_cloud = true;
 			if (sample_depth.x < nearest_front) {
 				nearest_front = sample_depth.x;
-				nearest_pixel = sample_pixel;
 				nearest_coord = sample_coord;
 			}
 			sum_mean_depth += sample_depth.y * weight;

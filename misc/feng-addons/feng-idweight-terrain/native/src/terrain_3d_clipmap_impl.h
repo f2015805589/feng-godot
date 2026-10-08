@@ -3,24 +3,8 @@
 #ifndef TERRAIN3D_CLIPMAP_IMPL_H
 #define TERRAIN3D_CLIPMAP_IMPL_H
 
-// The **one contract** a clipmap implementation answers, and the reason there is one clipmap delivery
-// with two implementations rather than two deliveries.
-//
-// Everything that reaches a fragment, a producer or a debug view is asked through this interface:
-// `Terrain3DClipmap` (the toroidal level ring, "LOD") and `Terrain3DClipmapAtlas` (the block atlas)
-// both implement it, and nothing above them - the tick, the assembly rule, the material's uniform
-// binding, the reports, the debug payload - names either class. What differs between the two is
-// storage, upload unit, rolling and layout, and that difference is private to each: no method here is
-// "the ring way" or "the atlas way".
-//
-// The shared half of the contract is not re-declared per implementation, it is *inherited*:
-//   * the density ladder and the sampling contract, from `TerrainClipmap::Ladder`;
-//   * the bake-queue entry shape, from `TerrainClipmap::BakeRect`;
-//   * the per-unit debug schema, from `TerrainClipmap::UnitReport`.
-// An implementation supplies the numbers and the storage; it never re-spells the vocabulary.
-//
-// `terrain_3d_clipmap_layer.h` is the facade that selects one, configures it from the shared
-// `TerrainClipmap::Shape` and forwards. Call sites therefore branch nowhere.
+// Storage-independent clipmap contract implemented by LOD and Atlas.
+// Shared shape, ladder, bake leases and reports are defined in clipmap_common.h.
 
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
@@ -50,9 +34,7 @@ public:
 	// The channel's own name ("height", "material"), which is what a report shows beside the shape.
 	virtual String get_source_name() const = 0;
 	virtual bool is_configured() const = 0;
-	// Frees the implementation's storage while keeping it usable: the layer stays configurable and a
-	// reconfigure rebuilds what this released. The facade's `clear()` is this, and the facade's
-	// `configure()` is what builds it again.
+	// Release storage; configure can rebuild it.
 	virtual void clear() = 0;
 	virtual int get_channel_count() const = 0;
 	virtual Image::Format get_format() const = 0;
@@ -62,18 +44,13 @@ public:
 	// "what is the density at 40 m" needs only this.
 	virtual TerrainClipmap::Ladder get_ladder() const = 0;
 	virtual int get_unit_count() const = 0;
-	// The finest unit's resolution in texels an axis: the LOD ring's level size, the atlas's block
-	// size. It is the number `base_world` is divided by, so it is half of the layer's density.
+	// Finest level/block resolution in texels per axis.
 	virtual int get_size() const = 0;
-	// The world size one unit covers: the shared ladder's answer, which an implementation states for
-	// the units it actually holds (the atlas's unit is a shell of blocks, so its reach is its grid's).
+	// World width covered by a level or atlas shell.
 	virtual real_t get_unit_world_size(const int p_unit) const = 0;
 
 	// ---- The sampling contract ------------------------------------------------------------------
-	// The unit that serves a world position, or -1 when the layer does not reach it (the LOD ring
-	// outside its coarsest square; the atlas outside its grid and its global block). `sample()` answers
-	// the stored value through the implementation's own addressing, and `get_texel_world_at()` the
-	// density a fragment would be served there - 0 outside.
+	// Sampling outside coverage returns unit -1 and texel width 0.
 	virtual int get_unit_for_world(const Vector2 &p_world) const = 0;
 	virtual real_t get_texel_world_at(const Vector2 &p_world) const = 0;
 	virtual real_t sample(const Vector2 &p_world, const int p_channel = 0) const = 0;
@@ -101,16 +78,11 @@ public:
 	virtual RID get_baked_device_rid(const int p_channel) const = 0;
 
 	// ---- The bake queue -------------------------------------------------------------------------
-	// The shared `BakeRect` schema: one entry per produced, un-covered rect. The producer copies what
-	// it will dispatch and reports each entry back; the implementation decides whether the lease still
-	// describes current content.
+	// Produced rectangles awaiting baking; acknowledge with their content lease.
 	virtual int get_pending_bake_count() const = 0;
 	virtual const TerrainClipmap::BakeRect &get_pending_bake(const int p_index) const = 0;
 	virtual bool acknowledge_bake(const TerrainClipmap::BakeRect &p_rect) = 0;
-	// Every unit's baked content is stale, which is what a change to the material list the bake
-	// evaluates against is: the payload is untouched, so the units stay readable - only the layers
-	// produced from them are. Both implementations answer it, so a material change reaches whichever
-	// one is selected.
+	// Invalidate derived material layers while retaining the readable source payload.
 	virtual void mark_baked_stale() = 0;
 
 	// ---- Readings -------------------------------------------------------------------------------
@@ -126,13 +98,9 @@ public:
 	// ---- Debug / report -------------------------------------------------------------------------
 	// One unit's entry in the shared schema. Filled by the implementation, assembled by the facade.
 	virtual void get_unit_report(const int p_unit, TerrainClipmap::UnitReport &r_report) const = 0;
-	// What only this implementation can say: the atlas's rect array, cells and layout schemes; the
-	// LOD ring publishes its own per-level addressing here when a *drawing* needs it. The facade nests
-	// it under one key, so the shared schema above is not widened by it.
+	// Storage-specific debug data, nested under "impl" by the facade.
 	virtual Dictionary get_impl_payload() const = 0;
-	// The shader's copy of this implementation's addressing, in this implementation's own uniform
-	// names. The material binds it through one path (`arm["implementation"]` decides which names), so
-	// the two arms are plumbing rather than two owners.
+	// Shader bindings for this implementation; the material selects names from "implementation".
 	virtual Dictionary get_arm() const = 0;
 	// Address-only view for a moving arm. Implementations may override this to avoid building their
 	// storage and content tables when only centre/offset/validity changed.

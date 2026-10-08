@@ -7,6 +7,7 @@ extends FengRuntimeSnapshotPass
 ## shadow passes, and the renderer's bounded cloud consumers, read this packet
 ## when the corresponding resources are available.
 
+const FengCloudGPU = preload("feng_cloud_gpu.gd")
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-cloud/feng_cloud_runtime.gd"
 const MATERIAL_FLOAT_COUNT := 76
 const SHADER_CONFIGURATION_PROPERTIES := [
@@ -15,15 +16,16 @@ const SHADER_CONFIGURATION_PROPERTIES := [
 ]
 
 
+var _cloud_gpu = FengCloudGPU.new()
+
+
 func requires_shader_file() -> bool:
 	return false
 
 
 func _validate_property(property: Dictionary) -> void:
 	if str(property.get("name", "")) in SHADER_CONFIGURATION_PROPERTIES:
-		# Cloud passes compile and bind their own compute pipelines. Preserve the
-		# inherited storage fields for old resources, but do not expose a second,
-		# inactive shader/binding configuration surface.
+		# Cloud passes own their compute shaders and descriptor bindings.
 		property["usage"] = PROPERTY_USAGE_STORAGE
 
 
@@ -32,9 +34,7 @@ func runtime_script_path() -> String:
 
 
 func _render(_buffers: RenderSceneBuffersRD, _view: int, _rd: RenderingDevice) -> void:
-	# This resource is a metadata stage; the shadow and trace subclasses own
-	# their GPU work. A no-op prevents the ShaderPass fallback from reporting a
-	# missing RDShaderFile for this intentionally non-shader base pass.
+	# The base publishes metadata; subclasses dispatch GPU work.
 	return
 
 
@@ -58,16 +58,15 @@ func _frp_prepare_with_snapshot(ctx: FRPPassContext, frozen_snapshot: Dictionary
 
 
 func _publish_snapshot(ctx: FRPPassContext, source_snapshot: Dictionary) -> void:
-	if ctx == null or not ctx.has_method("set_cloud_snapshot"):
+	if ctx == null:
 		return
-	# This packet builder only reads the pass-owned immutable snapshot.
-	var snapshot: Dictionary = source_snapshot
+	var snapshot := source_snapshot
 	if snapshot.is_empty():
-		ctx.call("clear_cloud_snapshot")
+		ctx.clear_cloud_snapshot()
 		return
 	var cloud_material: Dictionary = snapshot.get("material", {})
 	if cloud_material.is_empty():
-		ctx.call("clear_cloud_snapshot")
+		ctx.clear_cloud_snapshot()
 		return
 	var textures: Array[RID] = [
 		_texture_rid(cloud_material.get("shape_density_texture")),
@@ -82,22 +81,18 @@ func _publish_snapshot(ctx: FRPPassContext, source_snapshot: Dictionary) -> void
 	]
 	var kernel_layout := str(cloud_material.get("kernel_layout", "builtin"))
 	if kernel_layout != "builtin" and kernel_layout != "ue58_default":
-		ctx.call("clear_cloud_snapshot")
+		ctx.clear_cloud_snapshot()
 		_report("Unknown cloud kernel layout '%s'." % kernel_layout)
 		return
 	if kernel_layout == "ue58_default":
-		if not ctx.has_method("set_cloud_layout_textures"):
-			ctx.call("clear_cloud_snapshot")
-			_report("The native FRP context does not expose the UE 5.8 layout texture API.")
-			return
 		for layout_texture in layout_textures:
 			if not layout_texture.is_valid():
-				ctx.call("clear_cloud_snapshot")
+				ctx.clear_cloud_snapshot()
 				_report("UE 5.8 cloud layout requires valid Pattern, Mask, and Height Profile textures.")
 				return
 	var parameters := _pack_material_snapshot(snapshot, cloud_material, textures)
 	if parameters.size() != MATERIAL_FLOAT_COUNT:
-		ctx.call("clear_cloud_snapshot")
+		ctx.clear_cloud_snapshot()
 		_report("Cloud material snapshot did not match the native 19-vec4 contract.")
 		return
 	var sun_inputs: Variant = snapshot.get("sun_inputs", [])
@@ -106,15 +101,15 @@ func _publish_snapshot(ctx: FRPPassContext, source_snapshot: Dictionary) -> void
 	# Native reflection captures use this value together with probe RID and batch
 	# revision to keep raw cloud lighting immutable across all six faces.
 	var source_signature := int(hash(snapshot))
-	ctx.call("set_cloud_snapshot", parameters,
+	ctx.set_cloud_snapshot(parameters,
 		textures[0], textures[1], textures[2], textures[3],
 		primary_sun, secondary_sun, source_signature)
 	if kernel_layout == "ue58_default":
-		ctx.call("set_cloud_layout_textures", layout_textures[0], layout_textures[1], layout_textures[2])
-	ctx.call("set_cloud_sun_ground_transmittance", 0, _sun_ground_transmittance(sun_inputs, 0))
-	ctx.call("set_cloud_sun_ground_transmittance", 1, _sun_ground_transmittance(sun_inputs, 1))
-	ctx.call("set_cloud_sun_cast_shadows_on_clouds", 0, _sun_cast_shadows_on_clouds(sun_inputs, 0))
-	ctx.call("set_cloud_sun_cast_shadows_on_clouds", 1, _sun_cast_shadows_on_clouds(sun_inputs, 1))
+		ctx.set_cloud_layout_textures(layout_textures[0], layout_textures[1], layout_textures[2])
+	ctx.set_cloud_sun_ground_transmittance(0, _sun_ground_transmittance(sun_inputs, 0))
+	ctx.set_cloud_sun_ground_transmittance(1, _sun_ground_transmittance(sun_inputs, 1))
+	ctx.set_cloud_sun_cast_shadows_on_clouds(0, _sun_cast_shadows_on_clouds(sun_inputs, 0))
+	ctx.set_cloud_sun_cast_shadows_on_clouds(1, _sun_cast_shadows_on_clouds(sun_inputs, 1))
 
 
 func _pack_material_snapshot(snapshot: Dictionary, material: Dictionary, textures: Array[RID]) -> PackedFloat32Array:
@@ -210,3 +205,24 @@ func _vector2(value: Variant, fallback: Vector2) -> Vector2:
 
 func _vector3(value: Variant, fallback: Vector3) -> Vector3:
 	return value if value is Vector3 and value.is_finite() else fallback
+
+
+func _cleanup(rd: RenderingDevice) -> void:
+	_cloud_gpu.cleanup(rd)
+	super._cleanup(rd)
+
+
+func _notification(what: int) -> void:
+	if what != NOTIFICATION_PREDELETE:
+		return
+	var pass_rids: Array[RID] = [_shader, _compute_pipeline, _sampler, _ubo]
+	for pipeline in _raster_pipelines.values():
+		if pipeline is RID:
+			pass_rids.append(pipeline)
+	var payload := _cloud_gpu.take_cleanup_payload(pass_rids)
+	_shader = RID()
+	_compute_pipeline = RID()
+	_sampler = RID()
+	_ubo = RID()
+	_raster_pipelines.clear()
+	FengCloudGPU.release_cleanup_payload(payload)

@@ -4,9 +4,6 @@ extends FengVolumetricCloudPass
 ## Builds the optional cloud shadow maps and sky-occlusion texture before
 ## deferred lighting. The pass is inert when no cloud snapshot is routed.
 
-const FengCloudGPU = preload("feng_cloud_gpu.gd")
-
-var _cloud_gpu = FengCloudGPU.new()
 var _active_context: FRPPassContext
 
 
@@ -41,27 +38,6 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		return
 	_cloud_gpu.render_shadow(_active_context, _frame_snapshot, _frame_scene_data,
 		view, buffers, rd, get_instance_id())
-
-
-func _cleanup(rd: RenderingDevice) -> void:
-	_cloud_gpu.cleanup(rd)
-	super._cleanup(rd)
-
-
-func _notification(what: int) -> void:
-	if what != NOTIFICATION_PREDELETE:
-		return
-	var pass_rids: Array[RID] = [_shader, _compute_pipeline, _sampler, _ubo]
-	for pipeline in _raster_pipelines.values():
-		if pipeline is RID:
-			pass_rids.append(pipeline)
-	var payload := _cloud_gpu.take_cleanup_payload(pass_rids)
-	_shader = RID()
-	_compute_pipeline = RID()
-	_sampler = RID()
-	_ubo = RID()
-	_raster_pipelines.clear()
-	FengCloudGPU.release_cleanup_payload(payload)
 
 
 func _capture_snapshot_for_prepare(ctx: FRPPassContext, snapshot: Dictionary) -> void:

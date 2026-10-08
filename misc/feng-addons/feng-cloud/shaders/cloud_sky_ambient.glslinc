@@ -113,7 +113,7 @@ vec3 feng_cloud_sample_atmosphere_sky(vec3 direction) {
 	vec3 camera_to_receiver_m = direction * (desired_path_km / view_distance_scale) * FENG_CLOUD_KM_TO_M;
 	vec3 radiance;
 	vec3 transmission;
-	frp_atmo_aerial(camera_to_receiver_m, eye_offset_m, radiance, transmission);
+	frp_atmo_aerial(camera_to_receiver_m, eye_offset_m, vec3(0.0), radiance, transmission);
 	return feng_cloud_positive_finite3(radiance);
 }
 

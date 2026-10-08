@@ -73,35 +73,7 @@ void Terrain3D::_initialize() {
 	// configuration whose four cells are all `Direct` owns no view, no page table, no array family
 	// and no VT shader arm. See docs/vt_delivery_assembly.md.
 	_resolve_vt_delivery(false);
-	// Connect signals
-	// Any region was changed, update region labels
-	if (!_data->is_connected("region_map_changed", callable_mp(this, &Terrain3D::update_region_labels))) {
-		LOG(DEBUG, "Connecting _data::region_map_changed signal to set_show_region_locations()");
-		_data->connect("region_map_changed", callable_mp(this, &Terrain3D::update_region_labels));
-	}
-	// Any region was changed, regenerate collision if enabled
-	if (!_data->is_connected("region_map_changed", callable_mp(_collision, &Terrain3DCollision::build))) {
-		LOG(DEBUG, "Connecting _data::region_map_changed signal to build()");
-		_data->connect("region_map_changed", callable_mp(_collision, &Terrain3DCollision::build));
-	}
-	// Any map was regenerated or regions changed, update material uniforms without rebuilding shaders
-	if (!_data->is_connected("maps_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::REGION_ARRAYS))) {
-		LOG(DEBUG, "Connecting _data::maps_changed signal to _material->_update()");
-		_data->connect("maps_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::REGION_ARRAYS));
-	}
-	if (!_data->is_connected("maps_changed", callable_mp(this, &Terrain3D::_invalidate_render_geometry))) {
-		_data->connect("maps_changed", callable_mp(this, &Terrain3D::_invalidate_render_geometry));
-	}
-	// Height map was regenerated, update aabbs
-	if (!_data->is_connected("height_maps_changed", callable_mp(this, &Terrain3D::_update_mesher_aabbs))) {
-		LOG(DEBUG, "Connecting _data::height_maps_changed signal to update_aabbs()");
-		_data->connect("height_maps_changed", callable_mp(this, &Terrain3D::_update_mesher_aabbs));
-	}
-	// Texture assets changed, update material uniforms without rebuilding shaders
-	if (!_assets->is_connected("textures_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::TEXTURE_ARRAYS))) {
-		LOG(DEBUG, "Connecting _assets.textures_changed to _material->update()");
-		_assets->connect("textures_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::TEXTURE_ARRAYS));
-	}
+	_set_resource_signals(true);
 	// Initialize the system
 	if (!_initialized && _is_inside_world && is_inside_tree()) {
 		LOG(INFO, "Initializing main subsystems");
@@ -119,6 +91,30 @@ void Terrain3D::_initialize() {
 		snap();
 	}
 	update_configuration_warnings();
+}
+
+// This node owns the data/assets -> material subscriptions. Replacing either
+// resource disconnects the old graph before its references are released.
+void Terrain3D::_set_resource_signals(bool p_connected) {
+	if (!_data || !_collision || _material.is_null() || _assets.is_null()) {
+		return;
+	}
+	auto set = [p_connected](Object *source, const StringName &signal, const Callable &target) {
+		if (source->is_connected(signal, target) == p_connected) {
+			return;
+		}
+		if (p_connected) {
+			source->connect(signal, target);
+		} else {
+			source->disconnect(signal, target);
+		}
+	};
+	set(_data, "region_map_changed", callable_mp(this, &Terrain3D::update_region_labels));
+	set(_data, "region_map_changed", callable_mp(_collision, &Terrain3DCollision::build));
+	set(_data, "maps_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::REGION_ARRAYS));
+	set(_data, "maps_changed", callable_mp(this, &Terrain3D::_invalidate_render_geometry));
+	set(_data, "height_maps_changed", callable_mp(this, &Terrain3D::_update_mesher_aabbs));
+	set(_assets.ptr(), "textures_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::TEXTURE_ARRAYS));
 }
 
 void Terrain3D::_invalidate_render_geometry() {
@@ -722,6 +718,7 @@ void Terrain3D::_notification(const int p_what) {
 			/// Shut down notifications
 
 		case NOTIFICATION_EXIT_TREE: {
+			_set_resource_signals(false);
 			if (RS->is_connected("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry))) {
 				RS->disconnect("frame_pre_draw", callable_mp(this, &Terrain3D::_update_render_geometry));
 			}
@@ -760,6 +757,7 @@ void Terrain3D::_notification(const int p_what) {
 		}
 
 		case NOTIFICATION_PREDELETE: {
+			_set_resource_signals(false);
 			// The monitors call back into this node, so they go before anything else does.
 			_unregister_debug_monitors();
 			_destroy_vt_service();

@@ -49,13 +49,10 @@ func test_capture() -> void:
 		original.append(viewport.render_target_update_mode)
 		viewport.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
 
-	# Immediate capture restores first; the fallback owns a fresh snapshot.
+	# Immediate and queued capture share one snapshot until completion.
 	subject._prepare_capture_viewports()
 	require_modes(viewports, SubViewport.UPDATE_ALWAYS, "capture did not force the visible viewport")
-	subject._restore_capture_viewports()
-	require_modes(viewports, SubViewport.UPDATE_WHEN_VISIBLE, "immediate capture did not restore modes")
-	subject._prepare_capture_viewports()
-	require(subject._capture_forced_viewports.size() == viewports.size(), "fallback lost ownership of its snapshot")
+	require(subject._capture_forced_viewports.size() == viewports.size(), "capture lost ownership of its snapshot")
 	subject._busy = true
 	subject.button.disabled = true
 	subject._finish_capture()

@@ -187,15 +187,3 @@ public partial class Terrain3DInstancer : GodotObject
 		Call(GDExtensionMethodName.SwapIds, [srcId, destId]);
 
 }
-
-file static class InstancerModeExtensions
-{
-public static int SafeAsInt32(this Terrain3DInstancer.InstancerMode enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DInstancer.InstancerMode enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DInstancer.InstancerMode? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

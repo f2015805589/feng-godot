@@ -105,6 +105,13 @@ func _ensure_parameter_layout() -> void:
 		_parameter_exports.append(key)
 	_parameter_layout_ready = true
 
+## Optional frame preparation and persisted-contract repair hooks.
+func _frp_prepare(_ctx: FRPPassContext) -> void:
+	pass
+
+func ensure_frp_contract() -> bool:
+	return false
+
 func _setup(_rd: RenderingDevice) -> void:
 	pass
 
@@ -345,4 +352,19 @@ func _notification(what: int) -> void:
 		var reference = weak_self.get_ref()
 		if reference != null:
 			reference._cleanup(RenderingServer.get_rendering_device())
+	)
+
+## Frees RIDs created on the render thread. Subclasses call this from their
+## own PREDELETE _notification with value-captured RIDs. It must be static and
+## self-contained: the dying instance is already torn down when the callback runs.
+## Each class releases its own RIDs; notification propagation handles base classes.
+static func _free_on_render_thread(rids: Array[RID]) -> void:
+	var owned := rids.duplicate()
+	RenderingServer.call_on_render_thread(func():
+		var rd := RenderingServer.get_rendering_device()
+		if rd == null:
+			return
+		for rid in owned:
+			if rid.is_valid():
+				rd.free_rid(rid)
 	)

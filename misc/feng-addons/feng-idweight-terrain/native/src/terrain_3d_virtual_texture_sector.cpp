@@ -66,83 +66,6 @@ int Terrain3DVirtualTexture::_sector_max_local_mip(const int p_sector_x, const i
 	return log2_power_of_two(info.size);
 }
 
-void Terrain3DVirtualTexture::_release_sector_pages(const Vector2i &p_sector,
-		const ImageInfo &p_info) {
-	if (!_page_pool) {
-		return;
-	}
-	// Traverse resident owners, not the potentially millions of virtual addresses.
-	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
-		const auto owners = _page_pool->slot_owners[slot];
-		for (const Terrain3DVTPageOwner &owner : owners) {
-			if (owner.texture != this || owner.sector_x != p_sector.x || owner.sector_y != p_sector.y) { continue; }
-			_write_level(owner.virtual_x, owner.virtual_y, owner.mip, INVALID_SLOT);
-			_page_pool->remove_owner(slot, this, owner.virtual_x, owner.virtual_y, owner.mip);
-		}
-	}
-}
-
-bool Terrain3DVirtualTexture::_remap_sector_pages(const Vector2i &p_sector,
-		const ImageInfo &p_old_info, const ImageInfo &p_new_info) {
-	if (!_page_pool) {
-		return false;
-	}
-	struct CachedPage {
-		uint32_t slot = INVALID_SLOT;
-		int virtual_x = 0;
-		int virtual_y = 0;
-		int mip = 0;
-		int local_x = 0;
-		int local_y = 0;
-	};
-	std::vector<CachedPage> cached;
-	const int old_max_mip = log2_power_of_two(p_old_info.size);
-	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
-		for (const Terrain3DVTPageOwner &owner : _page_pool->slot_owners[slot]) {
-			if (owner.texture != this || owner.sector_x != p_sector.x || owner.sector_y != p_sector.y) { continue; }
-			cached.push_back({slot, owner.virtual_x, owner.virtual_y, owner.mip,
-					owner.virtual_x - (p_old_info.origin_x >> owner.mip), owner.virtual_y - (p_old_info.origin_y >> owner.mip)});
-		}
-	}
-
-	// Remove every old exact entry first. This also handles an allocator that
-	// happens to return the same virtual block for the resized image.
-	for (const CachedPage &page : cached) {
-		_write_level(page.virtual_x, page.virtual_y, page.mip, INVALID_SLOT);
-	}
-
-	const int new_max_mip = log2_power_of_two(p_new_info.size);
-	const TerrainVT::VirtualImageKind kind = _world_space ? VirtualImageKind::SVT : VirtualImageKind::AVT;
-	for (const CachedPage &page : cached) {
-		// A page represents a fixed world footprint, not a fixed mip number.
-		// Doubling the virtual image moves the same payload from mip L to L+1.
-		// Keeping L would reinterpret its contents over a quarter of the area.
-		const int new_mip = page.mip + new_max_mip - old_max_mip;
-		const bool overlaps = new_mip >= 0 && new_mip <= new_max_mip;
-		if (!overlaps) {
-			_page_pool->remove_owner(page.slot, this, page.virtual_x, page.virtual_y, page.mip);
-			continue;
-		}
-		const int new_virtual_x = (p_new_info.origin_x >> new_mip) + page.local_x;
-		const int new_virtual_y = (p_new_info.origin_y >> new_mip) + page.local_y;
-		_write_level(new_virtual_x, new_virtual_y, new_mip, page.slot);
-		if (!_page_pool->move_owner(page.slot, this, page.virtual_x, page.virtual_y,
-				page.mip, new_virtual_x, new_virtual_y, new_mip)) {
-			Terrain3DVTPageOwner owner;
-			owner.texture = this;
-			owner.kind = kind;
-			owner.sector_x = p_sector.x;
-			owner.sector_y = p_sector.y;
-			owner.virtual_x = new_virtual_x;
-			owner.virtual_y = new_virtual_y;
-			owner.mip = new_mip;
-			owner.world_space = _world_space;
-			_page_pool->publish_owner(page.slot, owner);
-		}
-	}
-	return true;
-}
-
 ///////////////////////////
 // Public Functions
 ///////////////////////////
@@ -189,7 +112,11 @@ bool Terrain3DVirtualTexture::resize_sector(const Vector2i &p_sector,
 	if (old_info.size == new_info.size) {
 		return true;
 	}
-	return _remap_sector_pages(p_sector, old_info, new_info);
+	if (!_page_pool) {
+		return false;
+	}
+	remap_sectors_pages({ { p_sector, old_info, new_info } });
+	return true;
 }
 
 bool Terrain3DVirtualTexture::resize_sector_block(const Vector2i &p_sector,
@@ -297,24 +224,11 @@ void Terrain3DVirtualTexture::remap_sectors_pages(const std::vector<SectorRemap>
 }
 
 bool Terrain3DVirtualTexture::unregister_sector(const Vector2i &p_sector) {
-	if (!_virtual_atlas) {
+	if (!unregister_sector_block(p_sector)) {
 		return false;
 	}
-	const auto found = _sector_owners.find(_sector_key(p_sector));
-	if (found == _sector_owners.end()) {
-		return false;
-	}
-	ImageInfo info;
-	if (_virtual_atlas->try_get_avt_image_info(p_sector.x, p_sector.y, info)) {
-		_release_sector_pages(p_sector, info);
-	}
-	// Present the owner the atlas actually created; a reconstructed one has the wrong
-	// generation and would never match.
-	const bool removed = _virtual_atlas->remove_image(found->second);
-	if (removed) {
-		_sector_owners.erase(found);
-	}
-	return removed;
+	release_sectors_pages({ p_sector });
+	return true;
 }
 
 bool Terrain3DVirtualTexture::unregister_sector_block(const Vector2i &p_sector) {
@@ -340,9 +254,7 @@ void Terrain3DVirtualTexture::release_sectors_pages(const std::unordered_set<Vec
 	if (!_page_pool || p_sectors.empty()) {
 		return;
 	}
-	// One owner-index scan for the whole released set: releasing N sectors inside
-	// one address pass is O(pool) once, where _release_sector_pages() per sector
-	// made it O(pool) per sector.
+	// Scan resident owners once for the whole released set.
 	for (uint32_t slot = 0; slot < _page_pool->slot_owners.size(); ++slot) {
 		const auto owners = _page_pool->slot_owners[slot];
 		for (const Terrain3DVTPageOwner &owner : owners) {

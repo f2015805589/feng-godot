@@ -390,7 +390,7 @@ func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
 	# Value-capture the RIDs: the resource is being torn down, so only local
-	# state is safe to touch (see FengRuntimeSnapshotPass._free_on_render_thread).
+	# state is safe to touch (see FengPass._free_on_render_thread).
 	var rids: Array[RID] = [_histogram_pipeline, _adapt_pipeline, _sampler, _linear_sampler]
 	for entry in _state.values():
 		for view_state in entry["views"].values():
@@ -404,10 +404,4 @@ func _notification(what: int) -> void:
 	_linear_sampler = RID()
 	_state.clear()
 	_shaders.clear()
-	RenderingServer.call_on_render_thread(func():
-		var rd := RenderingServer.get_rendering_device()
-		if rd != null:
-			for rid in rids:
-				if rid is RID and rid.is_valid():
-					rd.free_rid(rid)
-	)
+	_free_on_render_thread(rids)

@@ -33,8 +33,8 @@ func _init(p_native_id: int = -1, p_resource_name: String = "") -> void:
 		resource_name = p_resource_name
 
 func _frp_prepare(ctx: FRPPassContext) -> void:
-	if implementation != null and implementation.has_method("_frp_prepare"):
-		implementation.call("_frp_prepare", ctx)
+	if implementation != null:
+		implementation._frp_prepare(ctx)
 
 func _frp_execute(ctx: FRPPassContext) -> void:
 	# The scheduler has already resolved enabled through all parameter layers.

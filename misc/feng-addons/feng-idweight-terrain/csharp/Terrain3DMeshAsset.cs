@@ -534,15 +534,3 @@ public partial class Terrain3DMeshAsset : Resource
 		Call(GDExtensionMethodName.GetInstanceCount, []).As<long>();
 
 }
-
-file static class GenTypeExtensions
-{
-public static int SafeAsInt32(this Terrain3DMeshAsset.GenType enumValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DMeshAsset.GenType enumValue, int defaultValue) =>
-Convert.ToInt32(enumValue);
-
-public static int SafeAsInt32(this Terrain3DMeshAsset.GenType? enumValue, int defaultValue = 0) =>
-enumValue.HasValue ? Convert.ToInt32(enumValue.Value) : defaultValue;
-}

@@ -438,7 +438,7 @@ Ref<Image> Terrain3DUtil::pack_image(const Ref<Image> &p_src_rgb, const Ref<Imag
 			Color col = p_src_rgb->get_pixel(x, y);
 			col.a = p_src_a->get_pixel(x, y)[p_alpha_channel];
 			if (p_normalize_alpha) {
-				col.a = CLAMP((col.a * contrast - a_min), 0.0f, 1.0f);
+				col.a = CLAMP((col.a - a_min) * contrast, 0.0f, 1.0f);
 			}
 			if (p_invert_green) {
 				col.g = 1.0f - col.g;
@@ -487,7 +487,7 @@ Ref<Image> Terrain3DUtil::luminance_to_height(const Ref<Image> &p_src_rgb) {
 		for (int x = 0; x < p_src_rgb->get_width(); x++) {
 			Color col = p_src_rgb->get_pixel(x, y);
 			real_t lum = 0.299f * col.r + 0.587f * col.g + 0.114f * col.b;
-			lum = CLAMP((lum * lum_contrast - l_min), 0.0f, 1.0f);
+			lum = CLAMP((lum - l_min) * lum_contrast, 0.0f, 1.0f);
 			// some shaping
 			col.r = 0.5f - sin(asin(1.0f - 2.0f * lum) / 3.0f);
 			col.g = col.r;

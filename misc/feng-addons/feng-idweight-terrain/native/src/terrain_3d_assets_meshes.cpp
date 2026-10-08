@@ -211,10 +211,7 @@ void Terrain3DAssets::update_mesh_list() {
 			LOG(ERROR, "Terrain3DMeshAsset has null mesh at index ", _mesh_list.find(ma));
 			continue;
 		}
-		if (!ma->is_connected("instancer_setting_changed", callable_mp(this, &Terrain3DAssets::_update_mesh))) {
-			LOG(DEBUG, "Connecting instancer_setting_changed signal to _update_mesh");
-			ma->connect("instancer_setting_changed", callable_mp(this, &Terrain3DAssets::_update_mesh));
-		}
+		_set_asset_signals(TYPE_MESH, ma, true);
 	}
 	LOG(DEBUG, "Emitting meshes_changed");
 	emit_signal("meshes_changed");
