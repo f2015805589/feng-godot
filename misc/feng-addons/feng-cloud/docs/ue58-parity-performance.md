@@ -1,8 +1,7 @@
-# UE 5.8 cloud parity and performance
+# UE 5.8 cloud behavior and measurements
 
-Recorded 2026-10-08. Source comparisons, line numbers and measurements below apply to the
-named candidates/builds. Current usage
-is in [the addon README](../README.md). UE pixel identity remains unverified.
+Recorded 2026-10-08. Source comparisons and measurements apply to the named source/build
+snapshots. Current usage is in [the addon README](../README.md).
 
 ## Source comparison
 
@@ -18,40 +17,32 @@ is in [the addon README](../README.md). UE pixel identity remains unverified.
 | UE’s SkyAtmosphere applies cloud Sky AO to the first sun’s multiple-scattered term, and cloud transmittance to matching atmosphere-light direct terms (`SkyAtmosphere.usf:736-748, 776-778`). Cloud shadow and Sky AO have separate producers and consumers (`VolumetricCloudRendering.cpp:2059-2080, 2084-2110`). | Feng has separate cloud-shadow and Sky AO outputs and applies them to their supported FRP direct-light / global diffuse / atmosphere consumers. Both features are off by default. | This records the implemented consumer split; tested consumers and remaining mode coverage are listed below. |
 | The supplied UE default instance overrides Pattern, Cloud Mask, height profile, and 3D noise inputs; its serialized active path uses Base Color 0.98, zero Emission, AO 0.5, phase `(0.8, 0.166667, 0.575)`, and multiscatter `(2, 0.666667, 0.25, 0.18)` (source asset under `resources/ue58/source/Engine/Content/EngineSky/VolumetricClouds/`; extracted graph map `resources/ue58/material/feng_cloud_ue58_default_kernel.source.json`). | Feng has a specialized kernel for that audited default material instance plus a separate built-in layout and user kernel hook. The kernel maps its Pattern/Mask/Profile/Noise inputs and the audited graph outputs; the source-to-kernel mapping is recorded beside it in `resources/ue58/material/`. | This is not a general Unreal material graph importer. Other UE materials, RHI backends, and cooked texture outputs can differ. |
 
-## CPU and viewport measurements
+## Editor measurements
 
-The paired runs use the same saved scene (`1569×839`), Godot `4.7.3.rc.custom_build.1dca21024`, D3D12 on an RTX 3080 Ti, VSync off, and unlimited FPS. “Baseline”, “3-file”, and “4-file” name the tested source candidates. The changed candidates were CPU-path experiments; the viewport GPU column is overall viewport time, not a per-cloud-pass timer. Values are p50 / p95 milliseconds.
+The baseline and final addon snapshots use the same saved scene (`1569×839`), Godot
+`4.7.3.rc.custom_build.1dca21024`, D3D12 on an RTX 3080 Ti, VSync off, and unlimited
+FPS. Values are p50 / p95 milliseconds. Final frame counts use each summary's
+`all_frames` population, including capture-busy frames. Viewport GPU time is the whole
+viewport, not an individual cloud-pass timer.
 
-| Candidate | Cloud / camera | Viewport CPU | Viewport GPU | Wall frame |
-| --- | --- | ---: | ---: | ---: |
-| Baseline | On, static | 1.581 / 1.859 | 2.836 / 2.872 | 3.383 / 3.901 |
-| 3-file | On, static | 1.587 / 1.848 | 2.852 / 2.877 | 3.467 / 3.740 |
-| 4-file | On, static | 1.478 / 1.742 | 2.830 / 2.861 | 3.363 / 3.624 |
-| Baseline | On, moving | 1.817 / 4.251 | 3.056 / 9.730 | 3.960 / 10.167 |
-| 3-file | On, moving | 1.809 / 4.267 | 3.065 / 9.744 | 3.968 / 10.282 |
-| 4-file | On, moving | 1.655 / 4.175 | 3.054 / 9.716 | 3.755 / 10.194 |
-| Baseline | Off, moving control | 0.805 / 3.163 | 1.790 / 8.428 | 2.568 / 8.969 |
-| 3-file | Off, moving control | 0.835 / 3.391 | 1.809 / 8.468 | 2.645 / 8.935 |
-| 4-file | Off, moving control | 0.764 / 3.217 | 1.801 / 8.438 | 2.497 / 8.934 |
+| Condition | Snapshot | Frames | CPU p50 / p95 ms | GPU p50 / p95 ms | Wall p50 / p95 ms |
+| --- | --- | ---: | --- | --- | --- |
+| Cloud on, static | Baseline | — | 1.581 / 1.859 | 2.836 / 2.872 | 3.383 / 3.901 |
+| Cloud on, static | Final | 2,323 | 1.504 / 1.734 | 2.836 / 2.873 | 3.384 / 3.661 |
+| Cloud on, moving | Baseline | — | 1.817 / 4.251 | 3.056 / 9.730 | 3.960 / 10.167 |
+| Cloud on, moving | Final | 1,550 | 1.709 / 4.190 | 3.070 / 9.738 | 3.804 / 10.168 |
+| Cloud off, static | Final | 3,821 | 0.614 / 0.740 | 1.609 / 1.630 | 2.055 / 2.248 |
+| Cloud off, moving | Baseline | — | 0.805 / 3.163 | 1.790 / 8.428 | 2.568 / 8.969 |
+| Cloud off, moving | Final | 2,078 | 0.769 / 3.215 | 1.814 / 8.479 | 2.499 / 8.934 |
 
-These runs do not show a consistent overall performance gain. The 4-file candidate has lower cloud-on static medians, while the moving cloud-on GPU medians are effectively unchanged; the cloud-off moving control also has similar high p95 GPU and wall times. The captures report zero named `library:cloud_*` GPU intervals, so they do not isolate individual cloud pass cost.
+The moving cloud-on CPU p50 is about 5.9% lower in the final snapshot; GPU medians and p95
+are effectively unchanged.
 
-The final matched pair below uses each summary’s `all_frames` population, including capture-busy frames (not `capture_idle_frames`). It uses the same scene and hardware described above.
+The paired summaries are under `C:\Temp\feng-heightfog-repro-1dca-20261007\project`:
+`perf_data_baseline_42586_20261007` and `perf_data_final_42586_20261008`. CPU, viewport
+GPU, and wall-frame metrics are reported separately.
 
-| Final condition (`all_frames`) | Frames | Viewport CPU p50 / p95 (ms) | Viewport GPU p50 / p95 (ms) | Wall frame p50 / p95 (ms) |
-| --- | ---: | ---: | ---: | ---: |
-| Cloud on, static | 2,323 | 1.504 / 1.734 | 2.836 / 2.873 | 3.384 / 3.661 |
-| Cloud on, moving | 1,550 | 1.709 / 4.190 | 3.070 / 9.738 | 3.804 / 10.168 |
-| Cloud off, static | 3,821 | 0.614 / 0.740 | 1.609 / 1.630 | 2.055 / 2.248 |
-| Cloud off, moving | 2,078 | 0.769 / 3.215 | 1.814 / 8.479 | 2.499 / 8.934 |
-
-Against the earlier cloud-on moving baseline (viewport CPU p50 1.817 ms), the final CPU median is about 5.9% lower. Moving GPU median and p95 are effectively unchanged (3.056 / 9.730 ms baseline versus 3.070 / 9.738 ms final); this is not evidence of significant GPU acceleration, and it does not establish that editor stalls are resolved.
-
-A separate editor VT-preview attribution run forced VT preview on for measurement; the saved setting before that override was off. It recorded 580 static and 563 moving frames. Its moving p95 was 2.634 ms viewport CPU, 1.921 ms viewport GPU, and 8.512 ms wall frame. A VT producer snapshot reported cumulative boundary counters of 1,217 source uploads / 516.7 MB of upload-buffer traffic; these counters include startup and warmup and are not timestamped to the measured moving interval. The independent cloud-off moving control above also shows p95 spikes. These observations do not identify every cause of editor stalls or establish that VT work alone accounts for them.
-
-Source records for the paired summaries are local diagnostic artifacts under `C:\Temp\feng-heightfog-repro-1dca-20261007\project\perf_data_baseline_42586_20261007`, `perf_data_cpu_candidate_3files_20261007`, `perf_data_cpu_candidate_4files_20261007`, and `perf_data_final_42586_20261008`. `Performance.TIME_PROCESS` is not used here as CPU thread time; the table keeps viewport CPU, viewport GPU, and wall-frame measurements separate.
-
-## Recorded validation status
+## Focused validation
 
 | Gate | Status |
 | --- | --- |
@@ -64,6 +55,16 @@ Source records for the paired summaries are local diagnostic artifacts under `C:
 | Schema CPU gate: canonical schema 8-to-9 stock-order migration swaps Fog/Trace while preserving parameters; custom-order and duplicate-ID cases | Pass |
 | Broader cross-mode, view, and scene matrix | Pending |
 
-The targeted mode-2 and orthographic runs exited successfully with finite outputs; they do not establish full matrix coverage or pixel identity. Cloud-enabled formal shutdown still reports 4 Compute, 11 UniformBuffer, 4 Shader, 4 Sampler, and 7 Texture RID leak warnings. The cloud-off shutdown control reports 2 UniformBuffer, 1 Sampler, and 1 Texture warning. The difference is associated with the cloud-enabled path, but exact RID ownership remains undiagnosed; the cloud-enabled counts match the existing baseline, so this is not evidence of a new regression. Logs: `C:\Temp\feng-cloud-ue58-20261007\final-42586-20261008\formal-pair.stderr.log` and `C:\Temp\feng-cloud-ue58-20261007\final-42586-20261008\shutdown-off.stderr.log`.
+## Measurement and validation limits
 
-Coverage is limited to the listed source contracts and builds; arbitrary material graphs, other RHIs and UE cooked-texture/LUT pixel parity remain unverified.
+The captures contain no named `library:cloud_*` GPU intervals, so they do not isolate
+cloud-pass cost or explain editor stalls. Preview-on and normal VT workloads differ.
+`Performance.TIME_PROCESS` is not CPU thread time; viewport CPU, viewport GPU and
+wall-frame metrics are separate. These runs are workload measurements, not a general
+performance guarantee or a complete material, RHI, cooked-texture or LUT parity matrix.
+
+Cloud-enabled shutdown recorded 4 Compute, 11 UniformBuffer, 4 Shader, 4 Sampler and 7
+Texture RID warnings; cloud-off shutdown recorded 2 UniformBuffer, 1 Sampler and 1 Texture
+warning. These counts match the earlier cloud-enabled baseline; exact ownership was not
+identified. Logs are `C:\Temp\feng-cloud-ue58-20261007\final-42586-20261008\formal-pair.stderr.log`
+and `shutdown-off.stderr.log`.

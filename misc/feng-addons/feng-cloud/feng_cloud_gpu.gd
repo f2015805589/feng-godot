@@ -16,6 +16,8 @@ const NATIVE_SHADOW_BYTES := 624
 const PROJECTION_BYTES := 560
 const CLOUD_ATMOSPHERE_VISIBILITY_BYTES := 32
 const VOLUME_SAMPLING_BYTES := 96
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
 const MAX_BUFFER_STATES := 8
 const PURE_UE58_KERNEL_SHA256 := [
 	"1fca2733bbf40247374a16b71510c1bd45bdb83978c15af89ea997fbc624df10",
@@ -104,18 +106,18 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if not bool(layout_inputs.get("ok", false)):
 		return false
 	var material_uniforms: Array[RDUniform] = []
-	_add_uniform_buffer(material_uniforms, 1, state.material_ubo)
-	_add_uniform_buffer(material_uniforms, 23, state.projection_ubo)
-	_add_sampled(material_uniforms, 5, _material_sampler, inputs[0])
-	_add_sampled(material_uniforms, 6, _material_sampler, inputs[1])
-	_add_sampled(material_uniforms, 7, _material_sampler, inputs[2])
-	_add_sampled(material_uniforms, 8, _material_sampler, inputs[3])
+	material_uniforms.append(RDUniforms.uniform_buffer(1, state.material_ubo))
+	material_uniforms.append(RDUniforms.uniform_buffer(23, state.projection_ubo))
+	material_uniforms.append(RDUniforms.sampled(5, _material_sampler, inputs[0]))
+	material_uniforms.append(RDUniforms.sampled(6, _material_sampler, inputs[1]))
+	material_uniforms.append(RDUniforms.sampled(7, _material_sampler, inputs[2]))
+	material_uniforms.append(RDUniforms.sampled(8, _material_sampler, inputs[3]))
 	_add_material_layout_uniforms(material_uniforms, layout_inputs)
 	if bool(layout_inputs.get("enabled", false)):
 		var ue58_time_ubo := _update_ue58_time_ubo(ctx, snapshot, state, rd, scene_data, 0)
 		if not ue58_time_ubo.is_valid():
 			return false
-		_add_uniform_buffer(material_uniforms, 32, ue58_time_ubo)
+		material_uniforms.append(RDUniforms.uniform_buffer(32, ue58_time_ubo))
 	var kernel_source := str(snapshot.get("material", {}).get("kernel_source", ""))
 	var layout_defines: Dictionary = layout_inputs.get("defines", {})
 	var shadow_pipeline: Dictionary = _ensure_pipeline(rd, "cloud_shadow.glslinc", layout_defines, kernel_source) if map_enabled0 or map_enabled1 else {}
@@ -136,7 +138,8 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		var settings: Dictionary = shadow_settings[slot]
 		var shadow_uniforms := material_uniforms.duplicate()
 		var set0 := _uniform_set(shadow_pipeline.shader, 0, shadow_uniforms)
-		var set1 := _uniform_set(shadow_pipeline.shader, 1, _image_uniforms(3, output))
+		var shadow_output_uniforms: Array[RDUniform] = [RDUniforms.image(3, output)]
+		var set1 := _uniform_set(shadow_pipeline.shader, 1, shadow_output_uniforms)
 		var push := PackedInt32Array([slot, 0, 0, 0]).to_byte_array()
 		var res := Vector2i(_shadow_resolution(settings), _shadow_resolution(settings))
 		if not _dispatch(rd, shadow_pipeline.pipeline, [set0, set1], res, 1, push):
@@ -151,15 +154,17 @@ func render_shadow(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if ao_enabled:
 		var ao_uniforms := material_uniforms.duplicate()
 		var ao_set0 := _uniform_set(ao_pipeline.shader, 0, ao_uniforms)
-		var ao_set1 := _uniform_set(ao_pipeline.shader, 1, _image_uniforms(7, state.ao_stats))
+		var ao_output_uniforms: Array[RDUniform] = [RDUniforms.image(7, state.ao_stats)]
+		var ao_set1 := _uniform_set(ao_pipeline.shader, 1, ao_output_uniforms)
 		if not _dispatch(rd, ao_pipeline.pipeline, [ao_set0, ao_set1], Vector2i(ao_size, ao_size)):
 			return false
 		var filter_uniforms: Array[RDUniform] = []
-		_add_uniform_buffer(filter_uniforms, 1, state.material_ubo)
-		_add_uniform_buffer(filter_uniforms, 23, state.projection_ubo)
-		_add_sampled(filter_uniforms, 28, _sampler, state.ao_stats)
+		filter_uniforms.append(RDUniforms.uniform_buffer(1, state.material_ubo))
+		filter_uniforms.append(RDUniforms.uniform_buffer(23, state.projection_ubo))
+		filter_uniforms.append(RDUniforms.sampled(28, _sampler, state.ao_stats))
 		var filter_set0 := _uniform_set(ao_filter_pipeline.shader, 0, filter_uniforms)
-		var filter_set1 := _uniform_set(ao_filter_pipeline.shader, 1, _image_uniforms(5, state.ao_final))
+		var filter_output_uniforms: Array[RDUniform] = [RDUniforms.image(5, state.ao_final)]
+		var filter_set1 := _uniform_set(ao_filter_pipeline.shader, 1, filter_output_uniforms)
 		if not _dispatch(rd, ao_filter_pipeline.pipeline, [filter_set0, filter_set1], Vector2i(ao_size, ao_size)):
 			return false
 	ctx.set_cloud_shadow_outputs(filtered_outputs[0] if map_enabled0 else RID(),
@@ -304,47 +309,50 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		return false
 	var trace_ubo: RID = state.ubos.get(frame_key, RID())
 	var trace_uniforms: Array[RDUniform] = []
-	_add_uniform_buffer(trace_uniforms, 0, trace_ubo)
-	_add_uniform_buffer(trace_uniforms, 1, state.material_ubo)
-	_add_uniform_buffer(trace_uniforms, 2, state.lighting_ubo)
-	_add_uniform_buffer(trace_uniforms, 3, state.atmosphere_ubo)
-	_add_uniform_buffer(trace_uniforms, 4, state.fog_ubo)
-	_add_uniform_buffer(trace_uniforms, 23, state.ubos.get("cloud_projection_ubo", RID()))
-	_add_uniform_buffer(trace_uniforms, 34, state.ubos.get("cloud_atmosphere_visibility_ubo", RID()))
-	_add_sampled(trace_uniforms, 39, _sampler, blue_noise)
-	_add_sampled(trace_uniforms, 5, _material_sampler, inputs[0])
-	_add_sampled(trace_uniforms, 6, _material_sampler, inputs[1])
-	_add_sampled(trace_uniforms, 7, _material_sampler, inputs[2])
-	_add_sampled(trace_uniforms, 8, _material_sampler, inputs[3])
+	trace_uniforms.append(RDUniforms.uniform_buffer(0, trace_ubo))
+	trace_uniforms.append(RDUniforms.uniform_buffer(1, state.material_ubo))
+	trace_uniforms.append(RDUniforms.uniform_buffer(2, state.lighting_ubo))
+	trace_uniforms.append(RDUniforms.uniform_buffer(3, state.atmosphere_ubo))
+	trace_uniforms.append(RDUniforms.uniform_buffer(4, state.fog_ubo))
+	trace_uniforms.append(RDUniforms.uniform_buffer(23, state.ubos.get("cloud_projection_ubo", RID())))
+	trace_uniforms.append(RDUniforms.uniform_buffer(34, state.ubos.get("cloud_atmosphere_visibility_ubo", RID())))
+	trace_uniforms.append(RDUniforms.sampled(39, _sampler, blue_noise))
+	trace_uniforms.append(RDUniforms.sampled(5, _material_sampler, inputs[0]))
+	trace_uniforms.append(RDUniforms.sampled(6, _material_sampler, inputs[1]))
+	trace_uniforms.append(RDUniforms.sampled(7, _material_sampler, inputs[2]))
+	trace_uniforms.append(RDUniforms.sampled(8, _material_sampler, inputs[3]))
 	_add_material_layout_uniforms(trace_uniforms, layout_inputs)
 	if bool(layout_inputs.get("enabled", false)):
-		_add_uniform_buffer(trace_uniforms, 32, state.ubos.get("ue58_time_ubo", RID()))
-	_add_sampled(trace_uniforms, 9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut))
-	_add_sampled(trace_uniforms, 10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut))
+		trace_uniforms.append(RDUniforms.uniform_buffer(32, state.ubos.get("ue58_time_ubo", RID())))
+	trace_uniforms.append(RDUniforms.sampled(9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut)))
+	trace_uniforms.append(RDUniforms.sampled(10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut)))
 	var native_shadow_depth := ctx.get_cloud_shadow_sampler()
 	if not native_shadow_depth.is_valid():
 		native_shadow_depth = _shadow_sampler
 	var native_shadow_atlas := _texture_or(rd, ctx.get_cloud_directional_shadow_atlas(), _neutral_depth)
-	_add_sampled(trace_uniforms, 12, native_shadow_depth, native_shadow_atlas)
+	trace_uniforms.append(RDUniforms.sampled(12, native_shadow_depth, native_shadow_atlas))
 	var scene_depth := buffers.get_depth_layer(view)
 	if not _valid_texture(rd, scene_depth):
 		scene_depth = _neutral_depth
-	_add_sampled(trace_uniforms, 13, _sampler, scene_depth)
-	_add_uniform_buffer(trace_uniforms, 22, state.native_shadow_ubo)
-	_add_sampled(trace_uniforms, 27, _sampler, sky_ambient)
+	trace_uniforms.append(RDUniforms.sampled(13, _sampler, scene_depth))
+	trace_uniforms.append(RDUniforms.uniform_buffer(22, state.native_shadow_ubo))
+	trace_uniforms.append(RDUniforms.sampled(27, _sampler, sky_ambient))
 	var cloud_shadow0 := _texture_or(rd, ctx.get_cloud_output(3), _neutral_lut)
 	var cloud_shadow1 := _texture_or(rd, ctx.get_cloud_output(4), _neutral_lut)
 	var cloud_ao_stats := _texture_or(rd, ctx.get_cloud_output(7), _neutral_lut)
-	_add_sampled(trace_uniforms, 24, _sampler, cloud_shadow0)
-	_add_sampled(trace_uniforms, 25, _sampler, cloud_shadow1)
-	_add_sampled(trace_uniforms, 28, _sampler, cloud_ao_stats)
-	var trace_output_items: Array = [
-		[0, state.trace_radiance], [1, state.trace_transmittance], [2, state.trace_depth]
+	trace_uniforms.append(RDUniforms.sampled(24, _sampler, cloud_shadow0))
+	trace_uniforms.append(RDUniforms.sampled(25, _sampler, cloud_shadow1))
+	trace_uniforms.append(RDUniforms.sampled(28, _sampler, cloud_ao_stats))
+	var trace_output_uniforms: Array[RDUniform] = [
+		RDUniforms.image(0, state.trace_radiance),
+		RDUniforms.image(1, state.trace_transmittance),
+		RDUniforms.image(2, state.trace_depth),
 	]
 	if secondary_enabled:
-		trace_output_items.append_array([[9, state.trace_secondary_radiance], [10, state.trace_secondary_transmittance]])
+		trace_output_uniforms.append(RDUniforms.image(9, state.trace_secondary_radiance))
+		trace_output_uniforms.append(RDUniforms.image(10, state.trace_secondary_transmittance))
 	var trace_set0 := _uniform_set(trace_pipeline.shader, 0, trace_uniforms)
-	var trace_set1 := _uniform_set(trace_pipeline.shader, 1, _image_uniforms3(trace_output_items))
+	var trace_set1 := _uniform_set(trace_pipeline.shader, 1, trace_output_uniforms)
 	var trace_size: Vector2i = state.trace_size
 	if not _dispatch(rd, trace_pipeline.pipeline, [trace_set0, trace_set1], trace_size):
 		return false
@@ -357,29 +365,31 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	var current_secondary_transmittance: RID = RID()
 	if mode == 0 or mode == 2:
 		var reconstruct_uniforms: Array[RDUniform] = []
-		_add_uniform_buffer(reconstruct_uniforms, 0, trace_ubo)
-		_add_sampled(reconstruct_uniforms, 15, _sampler, state.full_radiance[previous_index])
-		_add_sampled(reconstruct_uniforms, 16, _sampler, state.full_transmittance[previous_index])
-		_add_sampled(reconstruct_uniforms, 17, _sampler, state.full_depth[previous_index])
-		_add_sampled(reconstruct_uniforms, 18, _sampler, state.trace_radiance)
-		_add_sampled(reconstruct_uniforms, 19, _sampler, state.trace_transmittance)
-		_add_sampled(reconstruct_uniforms, 20, _sampler, state.trace_depth)
-		_add_sampled(reconstruct_uniforms, 13, _sampler, scene_depth)
+		reconstruct_uniforms.append(RDUniforms.uniform_buffer(0, trace_ubo))
+		reconstruct_uniforms.append(RDUniforms.sampled(15, _sampler, state.full_radiance[previous_index]))
+		reconstruct_uniforms.append(RDUniforms.sampled(16, _sampler, state.full_transmittance[previous_index]))
+		reconstruct_uniforms.append(RDUniforms.sampled(17, _sampler, state.full_depth[previous_index]))
+		reconstruct_uniforms.append(RDUniforms.sampled(18, _sampler, state.trace_radiance))
+		reconstruct_uniforms.append(RDUniforms.sampled(19, _sampler, state.trace_transmittance))
+		reconstruct_uniforms.append(RDUniforms.sampled(20, _sampler, state.trace_depth))
+		reconstruct_uniforms.append(RDUniforms.sampled(13, _sampler, scene_depth))
 		if secondary_enabled:
-			_add_sampled(reconstruct_uniforms, 35, _sampler, state.trace_secondary_radiance)
-			_add_sampled(reconstruct_uniforms, 36, _sampler, state.trace_secondary_transmittance)
-			_add_sampled(reconstruct_uniforms, 37, _sampler, state.full_secondary_radiance[previous_index])
-			_add_sampled(reconstruct_uniforms, 38, _sampler, state.full_secondary_transmittance[previous_index])
+			reconstruct_uniforms.append(RDUniforms.sampled(35, _sampler, state.trace_secondary_radiance))
+			reconstruct_uniforms.append(RDUniforms.sampled(36, _sampler, state.trace_secondary_transmittance))
+			reconstruct_uniforms.append(RDUniforms.sampled(37, _sampler, state.full_secondary_radiance[previous_index]))
+			reconstruct_uniforms.append(RDUniforms.sampled(38, _sampler, state.full_secondary_transmittance[previous_index]))
 		var reconstruct_set0 := _uniform_set(reconstruct_pipeline.shader, 0, reconstruct_uniforms)
-		var reconstruct_output_items: Array = [
-			[0, state.full_radiance[write_index]], [1, state.full_transmittance[write_index]], [2, state.full_depth[write_index]]
+		var reconstruct_output_uniforms: Array[RDUniform] = [
+			RDUniforms.image(0, state.full_radiance[write_index]),
+			RDUniforms.image(1, state.full_transmittance[write_index]),
+			RDUniforms.image(2, state.full_depth[write_index]),
 		]
 		if secondary_enabled:
-			reconstruct_output_items.append_array([
-				[9, state.full_secondary_radiance[write_index]],
-				[10, state.full_secondary_transmittance[write_index]]
-			])
-		var reconstruct_set1 := _uniform_set(reconstruct_pipeline.shader, 1, _image_uniforms3(reconstruct_output_items))
+			reconstruct_output_uniforms.append(
+				RDUniforms.image(9, state.full_secondary_radiance[write_index]))
+			reconstruct_output_uniforms.append(
+				RDUniforms.image(10, state.full_secondary_transmittance[write_index]))
+		var reconstruct_set1 := _uniform_set(reconstruct_pipeline.shader, 1, reconstruct_output_uniforms)
 		if not _dispatch(rd, reconstruct_pipeline.pipeline, [reconstruct_set0, reconstruct_set1], state.reconstruct_size):
 			return false
 		current_radiance = state.full_radiance[write_index]
@@ -393,11 +403,11 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		_report("The current eye color layer is unavailable for cloud composition.")
 		return false
 	var composite_uniforms: Array[RDUniform] = []
-	_add_uniform_buffer(composite_uniforms, 0, trace_ubo)
-	_add_sampled(composite_uniforms, 18, _sampler, current_radiance)
-	_add_sampled(composite_uniforms, 19, _sampler, current_transmittance)
-	_add_sampled(composite_uniforms, 20, _sampler, current_depth)
-	_add_sampled(composite_uniforms, 13, _sampler, scene_depth)
+	composite_uniforms.append(RDUniforms.uniform_buffer(0, trace_ubo))
+	composite_uniforms.append(RDUniforms.sampled(18, _sampler, current_radiance))
+	composite_uniforms.append(RDUniforms.sampled(19, _sampler, current_transmittance))
+	composite_uniforms.append(RDUniforms.sampled(20, _sampler, current_depth))
+	composite_uniforms.append(RDUniforms.sampled(13, _sampler, scene_depth))
 	var volume_packet := PackedFloat32Array()
 	var volume_texture := RID()
 	if ctx.has_method("get_volume_sampling_parameters") and ctx.has_method("get_volume_texture"):
@@ -425,27 +435,28 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	var volume_ubo_key := "volume_sampling_ubo_%d" % view
 	if not _update_ubo(state, volume_ubo_key, volume_packet, VOLUME_SAMPLING_BYTES, rd):
 		return false
-	_add_sampled(composite_uniforms, 40, _sampler,
-			_texture_or(rd, volume_texture, _neutral_volume))
-	_add_uniform_buffer(composite_uniforms, 41, state.ubos[volume_ubo_key])
+	composite_uniforms.append(RDUniforms.sampled(40, _sampler, _texture_or(rd, volume_texture, _neutral_volume)))
+	composite_uniforms.append(RDUniforms.uniform_buffer(41, state.ubos[volume_ubo_key]))
 	if secondary_enabled:
-		_add_sampled(composite_uniforms, 35, _sampler, current_secondary_radiance)
-		_add_sampled(composite_uniforms, 36, _sampler, current_secondary_transmittance)
+		composite_uniforms.append(RDUniforms.sampled(35, _sampler, current_secondary_radiance))
+		composite_uniforms.append(RDUniforms.sampled(36, _sampler, current_secondary_transmittance))
 	var composite_set0 := _uniform_set(composite_pipeline.shader, 0, composite_uniforms)
-	var composite_output_items: Array = [[4, color_layer]]
+	var composite_output_uniforms: Array[RDUniform] = [RDUniforms.image(4, color_layer)]
 	if composition_deferred:
-		composite_output_items.append_array([
-			[11, volume_sidecar_radiance], [12, volume_sidecar_transmittance]])
-	var composite_set1 := _uniform_set(composite_pipeline.shader, 1,
-			_image_uniforms3(composite_output_items))
+		composite_output_uniforms.append(RDUniforms.image(11, volume_sidecar_radiance))
+		composite_output_uniforms.append(RDUniforms.image(12, volume_sidecar_transmittance))
+	var composite_set1 := _uniform_set(composite_pipeline.shader, 1, composite_output_uniforms)
 	if not _dispatch(rd, composite_pipeline.pipeline, [composite_set0, composite_set1], buffers_size):
 		return false
 	ctx.set_cloud_outputs(current_radiance, current_transmittance, current_depth, sky_ambient)
 	if composition_deferred and view == view_count - 1:
-		var frame_inputs: Variant = ctx.call("get_volume_frame_inputs", 0) \
-				if ctx.has_method("get_volume_frame_inputs") else {}
-		var frame_generation := int(frame_inputs.get("frame_generation", -1)) \
-				if frame_inputs is Dictionary and bool(frame_inputs.get("valid", false)) else -1
+		var frame_generation := -1
+		if ctx.has_method("get_volume_frame_generation"):
+			frame_generation = int(ctx.call("get_volume_frame_generation", 0))
+		elif ctx.has_method("get_volume_frame_inputs"):
+			var frame_inputs: Variant = ctx.call("get_volume_frame_inputs", 0)
+			if frame_inputs is Dictionary and bool(frame_inputs.get("valid", false)):
+				frame_generation = int(frame_inputs.get("frame_generation", -1))
 		var history_material_snapshot: Dictionary = snapshot.get("material", {})
 		var material_revision := int(history_material_snapshot.get("revision", -1))
 		var material_layout := str(history_material_snapshot.get("kernel_layout",
@@ -785,10 +796,11 @@ func _dispatch_shadow_filter_chain(rd: RenderingDevice, pipeline: Dictionary,
 	var current_source := source
 	for stage in stages:
 		var uniforms: Array[RDUniform] = []
-		_add_sampled(uniforms, 33, _material_sampler, current_source)
+		uniforms.append(RDUniforms.sampled(33, _material_sampler, current_source))
 		var set0 := _uniform_set(pipeline.shader, 0, uniforms)
 		var destination: RID = stage.get("texture", RID())
-		var set1 := _uniform_set(pipeline.shader, 1, _image_uniforms(8, destination))
+		var output_uniforms: Array[RDUniform] = [RDUniforms.image(8, destination)]
+		var set1 := _uniform_set(pipeline.shader, 1, output_uniforms)
 		var size: Vector2i = stage.get("size", Vector2i.ZERO)
 		if not _dispatch(rd, pipeline.pipeline, [set0, set1], size):
 			return RID()
@@ -1035,9 +1047,9 @@ func _add_material_layout_uniforms(uniforms: Array[RDUniform], layout_inputs: Di
 	if not bool(layout_inputs.get("enabled", false)):
 		return
 	var textures: Array = layout_inputs.get("textures", [])
-	_add_sampled(uniforms, 29, _material_sampler, textures[0])
-	_add_sampled(uniforms, 30, _material_sampler, textures[1])
-	_add_sampled(uniforms, 31, _material_sampler, textures[2])
+	uniforms.append(RDUniforms.sampled(29, _material_sampler, textures[0]))
+	uniforms.append(RDUniforms.sampled(30, _material_sampler, textures[1]))
+	uniforms.append(RDUniforms.sampled(31, _material_sampler, textures[2]))
 
 
 func _update_ue58_time_ubo(ctx: FRPPassContext, snapshot: Dictionary,
@@ -1205,13 +1217,14 @@ func _dispatch_ambient(ctx: FRPPassContext, state: Dictionary, packets: Dictiona
 	if ambient_pipeline.is_empty():
 		return false
 	var uniforms: Array[RDUniform] = []
-	_add_uniform_buffer(uniforms, 2, state.lighting_ubo)
-	_add_uniform_buffer(uniforms, 3, state.atmosphere_ubo)
-	_add_sampled(uniforms, 9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut))
-	_add_sampled(uniforms, 10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut))
-	_add_sampled(uniforms, 11, _sampler, sky)
+	uniforms.append(RDUniforms.uniform_buffer(2, state.lighting_ubo))
+	uniforms.append(RDUniforms.uniform_buffer(3, state.atmosphere_ubo))
+	uniforms.append(RDUniforms.sampled(9, _sampler, _texture_or(rd, ctx.get_atmosphere_optical_texture(), _neutral_lut)))
+	uniforms.append(RDUniforms.sampled(10, _sampler, _texture_or(rd, ctx.get_atmosphere_multiple_texture(), _neutral_lut)))
+	uniforms.append(RDUniforms.sampled(11, _sampler, sky))
 	var set0 := _uniform_set(ambient_pipeline.shader, 0, uniforms)
-	var set1 := _uniform_set(ambient_pipeline.shader, 1, _image_uniforms(6, state.sky_ambient))
+	var output_uniforms: Array[RDUniform] = [RDUniforms.image(6, state.sky_ambient)]
+	var set1 := _uniform_set(ambient_pipeline.shader, 1, output_uniforms)
 	return _dispatch(rd, ambient_pipeline.pipeline, [set0, set1], Vector2i(8, 8))
 
 
@@ -1643,7 +1656,7 @@ func _ensure_pipeline(rd: RenderingDevice, filename: String, defines: Dictionary
 	if _pipelines.has(key):
 		return _pipelines[key]
 	var source_path := SHADER_ROOT.path_join(filename)
-	var source_text := _expand_shader(source_path, 0)
+	var source_text := ShaderSource.expand(source_path)
 	if source_text == "":
 		_report("Cannot load cloud shader source %s." % source_path)
 		return {}
@@ -1696,70 +1709,10 @@ func _assemble_shader_source(source_text: String, defines: Dictionary) -> String
 	return assembled.substr(0, version_end) + "\n" + "\n".join(macro_lines) + assembled.substr(version_end)
 
 
-func _expand_shader(path: String, depth: int) -> String:
-	if depth > 32 or not FileAccess.file_exists(path):
-		return ""
-	var text := FileAccess.get_file_as_string(path)
-	var output := PackedStringArray()
-	for line in text.split("\n"):
-		var trimmed := line.strip_edges()
-		if trimmed.begins_with("#include"):
-			var first := trimmed.find("\"")
-			var last := trimmed.rfind("\"")
-			if first < 0 or last <= first:
-				return ""
-			var include_name := trimmed.substr(first + 1, last - first - 1)
-			var included := _expand_shader(path.get_base_dir().path_join(include_name), depth + 1)
-			if included == "":
-				return ""
-			output.append(included)
-		else:
-			output.append(line)
-	return "\n".join(output)
-
-
 func _uniform_set(shader: RID, index: int, uniforms: Array[RDUniform]) -> RID:
 	if uniforms.is_empty():
 		return RID()
 	return UniformSetCacheRD.get_cache(shader, index, uniforms)
-
-
-func _add_uniform_buffer(uniforms: Array[RDUniform], binding: int, buffer: RID) -> void:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(buffer)
-	uniforms.append(uniform)
-
-
-func _add_sampled(uniforms: Array[RDUniform], binding: int, sampler: RID, texture: RID) -> void:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	uniforms.append(uniform)
-
-
-func _add_image(uniforms: Array[RDUniform], binding: int, texture: RID) -> void:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	uniforms.append(uniform)
-
-
-func _image_uniforms(binding: int, texture: RID) -> Array[RDUniform]:
-	var result: Array[RDUniform] = []
-	_add_image(result, binding, texture)
-	return result
-
-
-func _image_uniforms3(items: Array) -> Array[RDUniform]:
-	var result: Array[RDUniform] = []
-	for item in items:
-		_add_image(result, int(item[0]), item[1])
-	return result
 
 
 func _dispatch(rd: RenderingDevice, pipeline: RID, uniform_sets: Array,

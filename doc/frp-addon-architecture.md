@@ -27,6 +27,7 @@ flowchart TD
 |---|---|
 | `renderer.gd` | 作者资源、嵌套变更观察、延迟初始化、迁移/同步入口和兼容查询 API |
 | `pipeline/native_spec.gd` | 读取引擎原生规范，集中纹理 scope、名字和必要的 ID 常量 |
+| `rd/owned_rids.gd`、`rd/shader_source.gd`、`rd/uniforms.gd` | 无状态低层值操作：有序 RID 去重、相对 shader include 展开、标准 RDUniform 构造；不依赖 Pass、Fog 或 Cloud |
 | `pipeline/library_manager.gd` | 库清单、默认开关、锚点、实例身份和删除记录 |
 | `pipeline/pipeline_migrator.gd` | 旧资源格式、原生 ID 及严格匹配的默认云/雾顺序迁移 |
 | `pipeline/execution_plan.gd`、`pipeline_validator.gd` | 从已初始化条目构造 effects/token/provided，检查调度与纹理依赖 |
@@ -137,6 +138,8 @@ Debug Buffers 的输入契约由 buffer 选择决定，因此选择项属于作�
 缺少 Magic GI 时其诊断图为黑色。
 
 ## 扩展与验证
+
+当前固定 D3D12 运行样本的条件、结果和限制见 [FRP runtime performance (2026-10-10)](frp-performance-20261010.md)。
 
 新增效果添加 Pass 脚本、资源及需要的库清单项。字段权限写在 Pass；空间混合写在
 VolumeResolver；编辑器操作写在对应 controller。现有 Core 无法表达底层工作时，

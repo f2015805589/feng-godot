@@ -11,6 +11,9 @@ const LightExtensionLayout = preload("res://addons/feng-fog/rendering/lighting/l
 const LightExtensionProviderScript = preload("res://addons/feng-fog/rendering/lighting/light_extensions/fog_light_extension_provider.gd")
 const EnvironmentVisibilityProviderScript = preload("res://addons/feng-fog/rendering/lighting/environment_visibility/fog_volume_environment_visibility_provider.gd")
 const RTVolumeBridgeScript = preload("fog_rt_volume_bridge.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const SkySHProviderScript = preload("res://addons/feng-fog/rendering/lighting/fog_sky_sh_provider.gd")
 const BakedLightingProviderScript = preload("res://addons/feng-fog/rendering/baked_lighting/fog_baked_lighting_provider.gd")
 const VolumetricLightmapProviderScript = preload("res://addons/feng-fog/rendering/baked_lighting/volumetric_lightmap/fog_volumetric_lightmap_provider.gd")
@@ -350,36 +353,36 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var rids: Array[RID] = []
 	var seen: Dictionary = {}
 	for state in _states.values():
-		_append_owned_rids(rids, seen, _state_rids(state))
+		OwnedRids.append_all(rids, seen, _state_rids(state))
 	for entry in _pipelines.values():
-		_append_owned_rid(rids, seen, entry.pipeline)
-		_append_owned_rid(rids, seen, entry.shader)
+		OwnedRids.append(rids, seen, entry.pipeline)
+		OwnedRids.append(rids, seen, entry.shader)
 	for rid in [_sampler_nearest, _sampler_linear, _sampler_compare,
 			_fallback_texture_2d, _fallback_texture_array, _fallback_shadow,
 			_fallback_density_3d, _fallback_depth_2d, _fallback_directional_buffer,
 			_fallback_local_buffer, _fallback_cluster_buffer, _fallback_sky_sh_buffer]:
-		_append_owned_rid(rids, seen, rid)
+		OwnedRids.append(rids, seen, rid)
 	for rid_value in _fallback_baked_buffers.values():
 		if rid_value is RID:
-			_append_owned_rid(rids, seen, rid_value)
+			OwnedRids.append(rids, seen, rid_value)
 	var provider_rids: Array[RID] = _sky_sh_provider.take_owned_rids() if p_clear \
 			else _sky_sh_provider.get_owned_rids()
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	provider_rids = _baked_lighting_provider.take_owned_rids() if p_clear \
 			else _baked_lighting_provider.get_owned_rids()
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	provider_rids = _volumetric_lightmap_provider.call("take_owned_rids") if p_clear \
 			else _volumetric_lightmap_provider.call("get_owned_rids")
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	provider_rids = _light_extension_provider.call("take_owned_rids") if p_clear \
 			else _light_extension_provider.call("get_owned_rids")
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	provider_rids = _environment_visibility_provider.call("take_owned_rids") if p_clear \
 			else _environment_visibility_provider.call("get_owned_rids")
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	provider_rids = _rt_volume_bridge.take_owned_rids() if p_clear \
 			else _rt_volume_bridge.get_owned_rids()
-	_append_owned_rids(rids, seen, provider_rids)
+	OwnedRids.append_all(rids, seen, provider_rids)
 	if p_clear:
 		_states.clear()
 		_pipelines.clear()
@@ -402,18 +405,6 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 		_fallback_vlm_inputs.clear()
 		_vlm_rendering_device = null
 	return rids
-
-
-static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
-	if p_rid.is_valid() and not p_seen.has(p_rid):
-		p_seen[p_rid] = true
-		p_target.append(p_rid)
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:
@@ -457,9 +448,9 @@ func _dispatch_view(ctx: FRPPassContext, rd: RenderingDevice, state: Dictionary,
 	var conservative_current: RID = state.depth_history[history_write_index]
 	var conservative_previous: RID = state.depth_history[history_read_index]
 	var conservative_set := _uniform_set(conservative_depth_pipeline.shader, [
-		_uniform_buffer(0, frame_ubo),
-		_sampled(1, _sampler_nearest, _texture(current_depth_layer, _fallback_depth_2d, rd)),
-		_image(2, conservative_current),
+		RDUniforms.uniform_buffer(0, frame_ubo),
+		RDUniforms.sampled(1, _sampler_nearest, _texture(current_depth_layer, _fallback_depth_2d, rd)),
+		RDUniforms.image(2, conservative_current),
 	])
 	if not _dispatch(rd, conservative_depth_pipeline.pipeline, conservative_set,
 			Vector3i(grid.x, grid.y, 1), WORKGROUP_DEPTH, "conservative-depth/view%d" % view):
@@ -476,15 +467,15 @@ func _dispatch_view(ctx: FRPPassContext, rd: RenderingDevice, state: Dictionary,
 			return false
 		var density_textures: Array = batch.get("textures", [])
 		var medium_uniforms: Array[RDUniform] = [
-			_uniform_buffer(0, frame_ubo), _image(1, state.medium), _image(2, state.emissive),
-			_storage_buffer(3, state.local_volume_buffer),
+			RDUniforms.uniform_buffer(0, frame_ubo), RDUniforms.image(1, state.medium), RDUniforms.image(2, state.emissive),
+			RDUniforms.storage_buffer(3, state.local_volume_buffer),
 		]
 		for texture_index in MAX_LOCAL_VOLUMES:
 			var texture_rid: RID = density_textures[texture_index] \
 					if texture_index < density_textures.size() else RID()
-			medium_uniforms.append(_sampled(4 + texture_index, _sampler_linear,
+			medium_uniforms.append(RDUniforms.sampled(4 + texture_index, _sampler_linear,
 					_texture(texture_rid, _fallback_density_3d, rd)))
-		medium_uniforms.append(_sampled(20, _sampler_nearest,
+		medium_uniforms.append(RDUniforms.sampled(20, _sampler_nearest,
 				_texture(current_depth_layer, _fallback_depth_2d, rd)))
 		var medium_set := _uniform_set(medium_pipeline.shader, medium_uniforms)
 		# Each batch is a separate ordered compute dispatch. Batch zero initializes
@@ -537,24 +528,24 @@ func _dispatch_view(ctx: FRPPassContext, rd: RenderingDevice, state: Dictionary,
 		_set_failure("lighting", "could not update the light UBO with RT/sample state")
 		return false
 	var light_uniforms: Array[RDUniform] = [
-		_uniform_buffer(0, frame_ubo), _uniform_buffer(1, light_ubo),
-		_uniform_buffer(2, _directional_buffer(frame, rd)),
-		_storage_buffer(3, _local_buffer(frame, "omni_light_buffer", "omni_light_count", rd)),
-		_storage_buffer(4, _local_buffer(frame, "spot_light_buffer", "spot_light_count", rd)),
-		_storage_buffer(5, _local_buffer(frame, "area_light_buffer", "area_light_count", rd)),
-		_storage_buffer(6, _cluster_buffer(frame, rd)),
-		_sampled(7, shadow_sampler, _shadow_texture(frame, "shadow_atlas", rd)),
-		_sampled(8, shadow_sampler, _shadow_texture(frame, "directional_shadow_atlas", rd)),
-		_sampled(9, area_profile_sampler, _texture(frame.get("area_profile_atlas", RID()), _fallback_texture_2d, rd)),
-		_storage_buffer(10, state.get("sky_sh_buffer", _fallback_sky_sh_buffer)),
-		_sampled(13, _sampler_nearest, state.medium), _sampled(14, _sampler_nearest, state.emissive),
-		_image(15, state.injected),
-		_sampled(16, _sampler_nearest, _texture(current_depth_layer, _fallback_depth_2d, rd)),
-		_storage_buffer(11, rt_visibility_buffer),
-		_storage_buffer(12, rt_slot_map_buffer),
-		_storage_buffer(17, _history_work_mask_buffer(state)),
-		_sampled(18, _sampler_nearest, conservative_current),
-		_sampled(19, _sampler_nearest, conservative_previous),
+		RDUniforms.uniform_buffer(0, frame_ubo), RDUniforms.uniform_buffer(1, light_ubo),
+		RDUniforms.uniform_buffer(2, _directional_buffer(frame, rd)),
+		RDUniforms.storage_buffer(3, _local_buffer(frame, "omni_light_buffer", "omni_light_count", rd)),
+		RDUniforms.storage_buffer(4, _local_buffer(frame, "spot_light_buffer", "spot_light_count", rd)),
+		RDUniforms.storage_buffer(5, _local_buffer(frame, "area_light_buffer", "area_light_count", rd)),
+		RDUniforms.storage_buffer(6, _cluster_buffer(frame, rd)),
+		RDUniforms.sampled(7, shadow_sampler, _shadow_texture(frame, "shadow_atlas", rd)),
+		RDUniforms.sampled(8, shadow_sampler, _shadow_texture(frame, "directional_shadow_atlas", rd)),
+		RDUniforms.sampled(9, area_profile_sampler, _texture(frame.get("area_profile_atlas", RID()), _fallback_texture_2d, rd)),
+		RDUniforms.storage_buffer(10, state.get("sky_sh_buffer", _fallback_sky_sh_buffer)),
+		RDUniforms.sampled(13, _sampler_nearest, state.medium), RDUniforms.sampled(14, _sampler_nearest, state.emissive),
+		RDUniforms.image(15, state.injected),
+		RDUniforms.sampled(16, _sampler_nearest, _texture(current_depth_layer, _fallback_depth_2d, rd)),
+		RDUniforms.storage_buffer(11, rt_visibility_buffer),
+		RDUniforms.storage_buffer(12, rt_slot_map_buffer),
+		RDUniforms.storage_buffer(17, _history_work_mask_buffer(state)),
+		RDUniforms.sampled(18, _sampler_nearest, conservative_current),
+		RDUniforms.sampled(19, _sampler_nearest, conservative_previous),
 	]
 	var baked_set := _uniform_set(light_pipeline.shader,
 			_baked_uniforms(baked_inputs), 2)
@@ -568,9 +559,9 @@ func _dispatch_view(ctx: FRPPassContext, rd: RenderingDevice, state: Dictionary,
 	var extension_cookie_array: RID = extension_inputs.get("cookie_texture_array", RID())
 	var extension_header: RID = extension_inputs.get("header_buffer", RID())
 	var extension_uniforms: Array[RDUniform] = [
-		_storage_buffer(0, extension_records),
-		_sampled(1, extension_cookie_sampler, extension_cookie_array),
-		_uniform_buffer(2, extension_header),
+		RDUniforms.storage_buffer(0, extension_records),
+		RDUniforms.sampled(1, extension_cookie_sampler, extension_cookie_array),
+		RDUniforms.uniform_buffer(2, extension_header),
 	]
 	var extension_set := _uniform_set(light_pipeline.shader, extension_uniforms, 3)
 	var environment_uniforms: Array[RDUniform] = environment_inputs.get("uniforms", [])
@@ -582,17 +573,17 @@ func _dispatch_view(ctx: FRPPassContext, rd: RenderingDevice, state: Dictionary,
 		return false
 	var previous: RID = state.history[history_read_index]
 	var reproject_set := _uniform_set(reproject_pipeline.shader, [
-		_uniform_buffer(0, frame_ubo), _sampled(1, _sampler_nearest, state.injected),
-		_sampled(2, _sampler_linear, previous), _image(3, state.history[history_write_index]),
-		_sampled(4, _sampler_nearest, conservative_current),
-		_sampled(5, _sampler_nearest, state.depth_history[history_read_index]),
+		RDUniforms.uniform_buffer(0, frame_ubo), RDUniforms.sampled(1, _sampler_nearest, state.injected),
+		RDUniforms.sampled(2, _sampler_linear, previous), RDUniforms.image(3, state.history[history_write_index]),
+		RDUniforms.sampled(4, _sampler_nearest, conservative_current),
+		RDUniforms.sampled(5, _sampler_nearest, state.depth_history[history_read_index]),
 	])
 	if not _dispatch(rd, reproject_pipeline.pipeline, reproject_set, grid, WORKGROUP_3D,
 			"reprojection/view%d" % view):
 		return false
 	var integrate_set := _uniform_set(integrate_pipeline.shader, [
-		_uniform_buffer(0, frame_ubo),
-		_sampled(1, _sampler_nearest, state.history[history_write_index]), _image(2, state.integrated),
+		RDUniforms.uniform_buffer(0, frame_ubo),
+		RDUniforms.sampled(1, _sampler_nearest, state.history[history_write_index]), RDUniforms.image(2, state.integrated),
 	])
 	return _dispatch(rd, integrate_pipeline.pipeline, integrate_set, Vector3i(grid.x, grid.y, 1),
 			WORKGROUP_INTEGRATE, "integration/view%d" % view)
@@ -652,10 +643,10 @@ func _dispatch_history_work_mask(rd: RenderingDevice, state: Dictionary,
 	var current_depth: RID = state.depth_history[1 - int(state.history_index)]
 	var previous_depth: RID = state.depth_history[int(state.history_index)]
 	var set := _uniform_set(pipeline.shader, [
-		_uniform_buffer(0, frame_ubo), _uniform_buffer(1, work_mask_ubo),
-		_storage_buffer(2, mask),
-		_sampled(3, _sampler_nearest, current_depth),
-		_sampled(4, _sampler_nearest, previous_depth),
+		RDUniforms.uniform_buffer(0, frame_ubo), RDUniforms.uniform_buffer(1, work_mask_ubo),
+		RDUniforms.storage_buffer(2, mask),
+		RDUniforms.sampled(3, _sampler_nearest, current_depth),
+		RDUniforms.sampled(4, _sampler_nearest, previous_depth),
 	])
 	return _dispatch(rd, pipeline.pipeline, set, grid, WORKGROUP_3D,
 			"history-work-mask/view%d" % view)
@@ -1038,7 +1029,7 @@ func _ensure_pipelines(rd: RenderingDevice) -> bool:
 			"volumetric_fog_reproject.glslinc", "volumetric_fog_integrate.glslinc"]:
 		if _pipelines.has(filename):
 			continue
-		var expanded_source: String = _expand_shader(SHADER_ROOT.path_join(filename), 0)
+		var expanded_source: String = ShaderSource.expand(SHADER_ROOT.path_join(filename))
 		if expanded_source.is_empty():
 			_last_error = "Cannot load or expand volumetric fog shader %s." % filename
 			return false
@@ -1081,28 +1072,6 @@ func _compile_pipeline(rd: RenderingDevice, filename: String, source: String) ->
 		_last_error = "Cannot create volumetric compute pipeline for %s." % filename
 		return {}
 	return {"shader": shader, "pipeline": pipeline}
-
-
-func _expand_shader(path: String, depth: int) -> String:
-	if depth > 32 or not FileAccess.file_exists(path):
-		return ""
-	var source := FileAccess.get_file_as_string(path)
-	var result := PackedStringArray()
-	for line in source.split("\n"):
-		var trimmed := line.strip_edges()
-		if not trimmed.begins_with("#include"):
-			result.append(line)
-			continue
-		var first := trimmed.find("\"")
-		var last := trimmed.rfind("\"")
-		if first < 0 or last <= first:
-			return ""
-		var include_path := path.get_base_dir().path_join(trimmed.substr(first + 1, last - first - 1))
-		var included := _expand_shader(include_path, depth + 1)
-		if included.is_empty():
-			return ""
-		result.append(included)
-	return "\n".join(result)
 
 
 func _ensure_fallbacks(rd: RenderingDevice) -> bool:
@@ -1222,8 +1191,8 @@ func _baked_uniforms(baked_inputs: Dictionary) -> Array[RDUniform]:
 		var rid: Variant = baked_inputs.get(buffer_name, RID())
 		if not _valid_buffer_rid(rid):
 			rid = _fallback_baked_buffers.get(buffer_name, RID())
-		uniforms.append(_uniform_buffer(binding, rid) if binding == 4
-				else _storage_buffer(binding, rid))
+		uniforms.append(RDUniforms.uniform_buffer(binding, rid) if binding == 4
+				else RDUniforms.storage_buffer(binding, rid))
 	return uniforms
 
 
@@ -1314,39 +1283,6 @@ func _valid_buffer_rid(value: Variant) -> bool:
 
 func _uniform_set(shader: RID, uniforms: Array[RDUniform], set_index: int = 0) -> RID:
 	return UniformSetCacheRD.get_cache(shader, set_index, uniforms) if not uniforms.is_empty() else RID()
-
-
-func _uniform_buffer(binding: int, rid: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(rid)
-	return uniform
-
-
-func _storage_buffer(binding: int, rid: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	uniform.binding = binding
-	uniform.add_id(rid)
-	return uniform
-
-
-func _sampled(binding: int, sampler: RID, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	return uniform
-
-
-func _image(binding: int, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	return uniform
 
 
 func _dispatch(rd: RenderingDevice, pipeline: RID, uniform_set: RID,

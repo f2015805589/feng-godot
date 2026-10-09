@@ -152,7 +152,7 @@ and mip filtering. It remains opt-in and is not part of the 3D medium packet.
 | Screen-space FSSS | Independent opt-in 2D path with separated source energy and mip filtering | Core fixture read an unsaturated HDR source (max 3.0) and the zero-fog W=0 no-write case |
 | Rect, Spot, and other advanced light extensions | Rect irradiance, optional source atlas, barn doors, Spot mapping, cookies, and capsule extensions are implemented | Fixed D3D12 fixture completed 20 finite captures; the Spot half-angle/cookie case passed with the corrected 45-degree mapping. This run used raster fallback for shadows; it is not hardware RT evidence |
 | Sky SH and baked GI | Explicit FengSky source, tetrahedral LightmapGI probes, and a separate UE-style VLM brick Set 5 consumer are implemented | VLM main consumer passed 16 numeric paths plus disabled cleanup on a fixed D3D12 fixture; tetrahedral LightmapGI GPU path remains unverified |
-| Hardware ray-traced shadows | Optional Vulkan provider; requires ray-tracing-pipeline and buffer-device-address support, a complete supported caster snapshot, and per-batch capacity. Unsupported devices/casters, invalid inputs, or overflow select complete raster fallback | Standalone Vulkan provider fixture passed all 13 binary-visibility cases. A separate real FRP Vulkan end-to-end fixture passed 3 cases: blocked sun (0), moved caster (1), and full-mask mismatch (1). These fixtures are bounded; the provider caps a batch at 128 MiB and 1<<24 rays |
+| Hardware ray-traced shadows | Optional Vulkan provider; see the [ray-tracing guide](rendering/raytracing/README.md) for device requirements, raster fallback, and caster limits | Provider and FRP integration coverage are recorded in that guide |
 | Cloud and transparent composition | Shared integrated volume sampling and delayed composition | Core D3D12 fixture used a real cloud sidecar plus transparent/refraction content; sidecar radiance/transmittance were non-neutral and reported closure error 1.1162 |
 
 The core D3D12 result used the fixed source snapshot `67C57…` in
@@ -162,30 +162,11 @@ record is under `evidence\gpu_cloud_visible_20261009_01`; stdout SHA-256 is
 empty stderr. The VLM consumer run used source manifest
 `354daf180bf88c9929cdca4c425cd4cdd8d9d5306a8b182e4202051c76edd16d`.
 
-The standalone RT run record is
-`C:\Temp\feng-rt-anyhit-13case-20261009-01\evidence\gpu_13case_20261009T032512Z\run.json`;
-all 13 expected binary visibility values passed with natural exit 0. Its log
-contains non-fatal SPIR-V unsupported-operation notices, so stderr is not
-empty. The real FRP RT end-to-end record is
-`C:\Temp\feng-volumetric-rt-e2e-observer-schema-20261009-01\evidence\gpu_e2e_observer_schema_corrected_wrapper_20261009T034734Z\run.json`;
-it passed 3 cases with natural exit 0: blocked sun, moved caster, and full-mask
-mismatch. The injected volume RGB was zero for the blocked case and
-`(238.625,224.75,236.75)` for the clear and mask-mismatch cases. The E2E run
-also emitted non-fatal SPIR-V unsupported-operation notices.
-
-These bounded fixtures do not establish pixel-identical UE output or universal
-scene coverage. Hardware RT is used only when the active device has both
-ray-tracing-pipeline and buffer-device-address support and the active caster
-snapshot is fully supported. Unsupported devices/casters, invalid inputs, or
-overflow use complete raster fallback; batches are limited to 128 MiB and
-1<<24 rays. The 20-capture Spot fixture described above used D3D12 raster
-fallback, not hardware RT. The LightmapGI probe adapter does not reproduce UE's
-native volumetric-lightmap bricks; the decoded-brick importer supports
-UE-style runtime sampling but does not read `.uasset` files or run a
-Lightmass/VLM bake. The LightmapGI probe GPU path remains unverified. Stereo
-currently has 7 CPU checks only, with no XR hardware run. The fixed-fixture
-results above do not by themselves verify another merged build or project
-test1/test2.
+The LightmapGI probe adapter does not reproduce UE's native volumetric-lightmap
+bricks. The decoded-brick importer supports UE-style runtime sampling but does
+not read `.uasset` files or run a Lightmass/VLM bake. Stereo has CPU contracts
+only; no XR hardware run is recorded. Fixed fixtures describe their named
+sources and projects, not pixel identity across arbitrary projects.
 
 Other unsupported height-fog features are fog cubemaps, nonzero EndDistance,
 SkyLight-capture contribution and dual-sun lobes.

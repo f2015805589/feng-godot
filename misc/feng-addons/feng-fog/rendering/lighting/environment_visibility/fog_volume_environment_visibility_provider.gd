@@ -14,6 +14,8 @@ const CLOUD_RAW_AO_BINDING := 4
 const GROUND_UBO_BYTES := 48
 const CLOUD_VISIBILITY_FLOATS := 148
 const CLOUD_VISIBILITY_UBO_BYTES := CLOUD_VISIBILITY_FLOATS * 4
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 
 var _rd: RenderingDevice
 var _ground_and_sun_slots_ubo := RID()
@@ -119,11 +121,8 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	for rid in [_ground_and_sun_slots_ubo, _cloud_visibility_ubo, _sampler,
-			_neutral_cloud_texture]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+	OwnedRids.append_all(result, seen, [_ground_and_sun_slots_ubo,
+			_cloud_visibility_ubo, _sampler, _neutral_cloud_texture])
 	if p_clear:
 		_rd = null
 		_ground_and_sun_slots_ubo = RID()
@@ -272,25 +271,12 @@ func _make_cloud_packet(p_ctx: FRPPassContext, p_rd: RenderingDevice,
 
 func _make_uniforms(p_cloud_packet: Dictionary) -> Array[RDUniform]:
 	var uniforms: Array[RDUniform] = []
-	var ground_uniform := RDUniform.new()
-	ground_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	ground_uniform.binding = GROUND_BINDING
-	ground_uniform.add_id(_ground_and_sun_slots_ubo)
-	uniforms.append(ground_uniform)
-	var cloud_uniform := RDUniform.new()
-	cloud_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	cloud_uniform.binding = CLOUD_VISIBILITY_BINDING
-	cloud_uniform.add_id(_cloud_visibility_ubo)
-	uniforms.append(cloud_uniform)
+	uniforms.append(RDUniforms.uniform_buffer(GROUND_BINDING, _ground_and_sun_slots_ubo))
+	uniforms.append(RDUniforms.uniform_buffer(CLOUD_VISIBILITY_BINDING, _cloud_visibility_ubo))
 	var textures: Array = p_cloud_packet.get("textures", [_neutral_cloud_texture, _neutral_cloud_texture, _neutral_cloud_texture])
 	var texture_bindings := [CLOUD_SHADOW0_BINDING, CLOUD_SHADOW1_BINDING, CLOUD_RAW_AO_BINDING]
 	for index in 3:
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		uniform.binding = texture_bindings[index]
-		uniform.add_id(_sampler)
-		uniform.add_id(textures[index])
-		uniforms.append(uniform)
+		uniforms.append(RDUniforms.sampled(texture_bindings[index], _sampler, textures[index]))
 	return uniforms
 
 

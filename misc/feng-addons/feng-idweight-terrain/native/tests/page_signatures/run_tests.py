@@ -1,8 +1,8 @@
-"""Exercise the production signature-cache sections with deterministic job interleaving.
+"""Exercise the production signature and decoded-cell cache sections.
 
-Extracts the worker's optional pre-production context setup and load_cells' complete
-signature critical section unchanged. Small value/hash doubles replace Godot and file
-I/O, so this tests cache identity/locking boundaries, not disk decoding or scheduling.
+Extracts cache-admission code unchanged. Small value/hash doubles replace Godot and file
+I/O; deterministic job interleaving checks signature identity while bounded size cases
+check decoded-cell cache retention without allocating image-sized payloads.
 """
 from pathlib import Path
 import argparse
@@ -39,15 +39,27 @@ def main() -> None:
     end = load.index("const String path =", start)
     section = load[start:end]
     assert "_signatures.find(entry.first)" in section
+    bytes_start = load.index("const uint64_t bytes =")
+    limit_start = load.index("constexpr uint64_t cell_cache_limit_bytes", bytes_start)
+    limit_end = load.index("\n", limit_start)
+    admission_start = load.index("if (bytes <= cell_cache_limit_bytes)", limit_end)
+    admission = load[limit_start:limit_end] + "\n" + block(load, admission_start)
+    assert "_cell_cache[cache_key] = channels" in admission
+    assert "_cache_bytes + bytes > cell_cache_limit_bytes" in admission
     with tempfile.TemporaryDirectory(prefix="feng-page-signatures-") as temporary:
         root = Path(temporary)
         (root / "prepare.inc").write_text(prepare)
         (root / "signature.inc").write_text(section)
-        binary = root / "signature_test"
-        subprocess.run([
-            os.environ.get("CXX", "c++"), "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-            "-I", str(root), str(here / "signature_test.cpp"), "-o", str(binary),
-        ], check=True)
+        (root / "admission.inc").write_text(admission)
+        compiler = os.environ.get("CXX", "c++")
+        if Path(compiler).name.lower() in {"cl", "cl.exe"}:
+            binary = root / "signature_test.exe"
+            command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", f"/I{root}", str(here / "signature_test.cpp"), f"/Fe:{binary}"]
+        else:
+            binary = root / "signature_test"
+            command = [compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+                       "-I", str(root), str(here / "signature_test.cpp"), "-o", str(binary)]
+        subprocess.run(command, check=True)
         subprocess.run([str(binary)], check=True)
 
 

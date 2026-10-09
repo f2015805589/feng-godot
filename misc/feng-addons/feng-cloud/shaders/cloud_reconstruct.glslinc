@@ -309,13 +309,6 @@ void main() {
 		current_depth.zw = vec2(scene_distance_m);
 		history_current_depth.zw = vec2(scene_distance_m);
 	}
-	// Keep UE's near/far-vs-scene test on the center trace sample. Feng maps the
-	// opaque SceneDepth to w, so do not substitute this output pixel's ray depth.
-	bool current_mmd_edge = vrt_mode == 0u && history_valid
-		&& history_current_depth.w - history_current_depth.z > 2000.0
-		&& abs(history_current_depth.z - history_current_depth.w)
-			< abs(history_current_depth.w - history_current_depth.w);
-
 	vec4 selected_radiance = current_radiance;
 	vec4 selected_transmittance = current_transmittance;
 	vec4 selected_depth = current_depth;
@@ -366,8 +359,7 @@ void main() {
 					&& all(not(isnan(old_transmittance))) && all(not(isinf(old_transmittance)));
 				bool valid_history = previous_ray_origin_valid && previous_cloud_depth_finite
 					&& previous_opaque_bounds_finite && old_transport_finite
-					&& scene_bounds_match && !newly_exposed_or_covered
-					&& !(apply_mode0_disocclusion && current_mmd_edge);
+					&& scene_bounds_match && !newly_exposed_or_covered;
 				if (valid_history) {
 					float current_scale = cloud_frame.radiance_scales_current_previous_norm_P.x;
 					float previous_scale = cloud_frame.radiance_scales_current_previous_norm_P.y;

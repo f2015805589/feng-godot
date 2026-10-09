@@ -18,6 +18,7 @@ const FLAG_CONTAINS_SURFACE_DIRECT_RADIANCE := 2
 const FLAG_SOURCE_INTERIOR := 4
 const FLAG_INCLUDES_PROBE_ORIGIN_DIRECT_LIGHTING := 8
 const BakedVolume = preload("res://addons/feng-fog/rendering/baked_lighting/fog_baked_lighting_volume.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
 
 var _rendering_device: RenderingDevice
 var _snapshots: Dictionary = {} # Resource instance ID -> weak resource/revision/immutable snapshot.
@@ -173,7 +174,7 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var seen: Dictionary = {}
 	for entry_value in _gpu_entries.values():
 		if entry_value is Dictionary:
-			_append_owned_rids(result, seen, _entry_owned_rids(entry_value))
+			OwnedRids.append_all(result, seen, _entry_owned_rids(entry_value))
 	if p_clear:
 		_gpu_entries.clear()
 		_snapshots.clear()
@@ -183,19 +184,12 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 
 static func _entry_owned_rids(p_entry: Dictionary) -> Array[RID]:
 	var result: Array[RID] = []
+	var seen: Dictionary = {}
 	var buffers: Dictionary = p_entry.get("buffers", {})
 	for value in buffers.values():
-		if value is RID and value.is_valid() and not result.has(value):
-			result.append(value)
+		if value is RID:
+			OwnedRids.append(result, seen, value)
 	return result
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		if rid.is_valid() and not p_seen.has(rid):
-			p_seen[rid] = true
-			p_target.append(rid)
 
 
 static func resolve_source_usage(p_sample_valid: bool, p_includes_environment_radiance: bool,

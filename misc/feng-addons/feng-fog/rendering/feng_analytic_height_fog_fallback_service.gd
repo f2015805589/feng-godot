@@ -4,6 +4,9 @@ extends RefCounted
 ## Color/depth layers are borrowed from the current FRP callback and never freed.
 
 const SHADER_ROOT := "res://addons/feng-fog/rendering/shaders/"
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const FRAME_BYTES := 256
 const WORKGROUP := 8
 
@@ -48,9 +51,9 @@ func composite_analytic_near(rd: RenderingDevice, color_layers: Array[RID],
 			_last_error = "Analytic fallback preflight failed at view %d: frame data or UBO update is invalid." % view
 			return false
 		var uniforms: Array[RDUniform] = [
-			_image(0, color),
-			_sampled(1, _sampler, depth),
-			_uniform_buffer(2, _frame_ubos[view]),
+			RDUniforms.image(0, color),
+			RDUniforms.sampled(1, _sampler, depth),
+			RDUniforms.uniform_buffer(2, _frame_ubos[view]),
 		]
 		var uniform_set := UniformSetCacheRD.get_cache(_shader, 0, uniforms)
 		if not uniform_set.is_valid():
@@ -87,10 +90,10 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	_append_owned_rid(result, seen, _pipeline)
-	_append_owned_rid(result, seen, _shader)
-	_append_owned_rid(result, seen, _sampler)
-	_append_owned_rids(result, seen, _frame_ubos)
+	OwnedRids.append(result, seen, _pipeline)
+	OwnedRids.append(result, seen, _shader)
+	OwnedRids.append(result, seen, _sampler)
+	OwnedRids.append_all(result, seen, _frame_ubos)
 	if p_clear:
 		_pipeline = RID()
 		_shader = RID()
@@ -101,17 +104,6 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	return result
 
 
-static func _append_owned_rid(target: Array[RID], seen: Dictionary, rid: RID) -> void:
-	if rid.is_valid() and not seen.has(rid):
-		seen[rid] = true
-		target.append(rid)
-
-
-static func _append_owned_rids(target: Array[RID], seen: Dictionary, rids: Array[RID]) -> void:
-	for rid in rids:
-		_append_owned_rid(target, seen, rid)
-
-
 func _ensure_pipeline(rd: RenderingDevice) -> bool:
 	if _pipeline.is_valid() and _shader.is_valid():
 		return true
@@ -119,7 +111,7 @@ func _ensure_pipeline(rd: RenderingDevice) -> bool:
 	if not FileAccess.file_exists(path):
 		_last_error = "Analytic fallback shader source is missing."
 		return false
-	var expanded := _expand_includes(path, FileAccess.get_file_as_string(path), 0)
+	var expanded := ShaderSource.expand(path, FileAccess.get_file_as_string(path))
 	if expanded.is_empty():
 		_last_error = "Analytic fallback shader includes could not be expanded."
 		return false
@@ -153,29 +145,6 @@ func _ensure_pipeline(rd: RenderingDevice) -> bool:
 		_failed_pipeline_error = _last_error
 		return false
 	return true
-
-
-func _expand_includes(path: String, source: String, depth: int) -> String:
-	if depth > 32:
-		return ""
-	var result := PackedStringArray()
-	for line in source.split("\n"):
-		var trimmed := line.strip_edges()
-		if not trimmed.begins_with("#include"):
-			result.append(line)
-			continue
-		var first := trimmed.find("\"")
-		var last := trimmed.rfind("\"")
-		if first < 0 or last <= first:
-			return ""
-		var child_path := path.get_base_dir().path_join(trimmed.substr(first + 1, last - first - 1))
-		if not FileAccess.file_exists(child_path):
-			return ""
-		var child := _expand_includes(child_path, FileAccess.get_file_as_string(child_path), depth + 1)
-		if child.is_empty():
-			return ""
-		result.append(child)
-	return "\n".join(result)
 
 
 func _ensure_sampler(rd: RenderingDevice) -> bool:
@@ -257,28 +226,3 @@ func _update_ubo(rid: RID, values: PackedFloat32Array, rd: RenderingDevice) -> b
 
 func _valid_texture(rd: RenderingDevice, rid: RID) -> bool:
 	return rid.is_valid() and rd.texture_is_valid(rid)
-
-
-func _image(binding: int, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	return uniform
-
-
-func _sampled(binding: int, sampler: RID, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	return uniform
-
-
-func _uniform_buffer(binding: int, buffer: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(buffer)
-	return uniform

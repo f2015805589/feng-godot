@@ -8,6 +8,8 @@ extends RefCounted
 
 const SHADER_DIR := "res://addons/feng-fog/rendering/raytracing"
 const GeometryRegistryScript = preload("res://addons/feng-fog/rendering/raytracing/fog_rt_geometry_registry.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const RAY_INPUT_STRIDE_BYTES := 48 # origin_min_t, direction_max_t, cone_words; three 16-byte std430 records
 const RAY_INPUT_ABI_VERSION := 2
 const VISIBILITY_STRIDE_BYTES := 4 # uint32, 1 visible / 0 blocked
@@ -187,23 +189,11 @@ func trace_shadow_batch(p_rd: RenderingDevice, p_geometry_snapshot: Dictionary,
 	acceleration_uniform.binding = 0
 	acceleration_uniform.add_id(_tlas)
 	uniforms.append(acceleration_uniform)
-	var input_uniform := RDUniform.new()
-	input_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	input_uniform.binding = 1
-	input_uniform.add_id(p_ray_input_buffer)
-	uniforms.append(input_uniform)
+	uniforms.append(RDUniforms.storage_buffer(1, p_ray_input_buffer))
 	# Any-hit must use a stage-specific alias for this borrowed input buffer.
 	# This adds no copy and does not change the external ray record ABI.
-	var any_hit_input_uniform := RDUniform.new()
-	any_hit_input_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	any_hit_input_uniform.binding = 10
-	any_hit_input_uniform.add_id(p_ray_input_buffer)
-	uniforms.append(any_hit_input_uniform)
-	var output_uniform := RDUniform.new()
-	output_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	output_uniform.binding = 2
-	output_uniform.add_id(_output_buffer)
-	uniforms.append(output_uniform)
+	uniforms.append(RDUniforms.storage_buffer(10, p_ray_input_buffer))
+	uniforms.append(RDUniforms.storage_buffer(2, _output_buffer))
 	var alpha_bindings := [
 		[3, _alpha_triangle_buffer],
 		[4, _alpha_surface_buffer],
@@ -214,11 +204,7 @@ func trace_shadow_batch(p_rd: RenderingDevice, p_geometry_snapshot: Dictionary,
 		[9, _alpha_texture_bytes_buffer],
 	]
 	for binding in alpha_bindings:
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-		uniform.binding = int(binding[0])
-		uniform.add_id(binding[1])
-		uniforms.append(uniform)
+		uniforms.append(RDUniforms.storage_buffer(int(binding[0]), binding[1]))
 	var uniform_set := p_rd.uniform_set_create(uniforms, _ray_shader, 0)
 	if not uniform_set.is_valid():
 		return _invalid_result("Could not bind TLAS and shadow ray buffers.", p_frame_generation)
@@ -284,23 +270,14 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var seen: Dictionary = {}
 	# Keep teardown in dependency order: TLAS before its BLAS, then the SBT,
 	# pipeline and ray shader, followed by each BLAS before its backing buffers.
-	for rid in [_tlas, _hit_sbt, _pipeline, _ray_shader]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+	OwnedRids.append_all(result, seen, [_tlas, _hit_sbt, _pipeline, _ray_shader])
 	for cache_value in _blas_cache.values():
 		if cache_value is Dictionary:
-			for rid in _blas_owned_rids(cache_value):
-				if rid.is_valid() and not seen.has(rid):
-					seen[rid] = true
-					result.append(rid)
-	for rid in [_output_buffer, _alpha_triangle_buffer, _alpha_surface_buffer,
+			OwnedRids.append_all(result, seen, _blas_owned_rids(cache_value))
+	OwnedRids.append_all(result, seen, [_output_buffer, _alpha_triangle_buffer, _alpha_surface_buffer,
 			_alpha_instance_buffer, _alpha_material_ids_buffer,
 			_alpha_material_params_buffer, _alpha_texture_meta_buffer,
-			_alpha_texture_bytes_buffer]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+			_alpha_texture_bytes_buffer])
 	if p_clear:
 		_rd = null
 		_blas_cache.clear()

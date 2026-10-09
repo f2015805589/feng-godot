@@ -662,10 +662,13 @@ void Terrain3DPagePipeline::load_cells(const Request &request, const std::shared
 			// The decode above deliberately runs outside the lock: it is file I/O and a
 			// zstd decompress, which would serialize every worker behind one page.
 			const uint64_t bytes = uint64_t(size) * size * 24;
-			std::lock_guard<std::mutex> cache_lock(_cache_mutex);
-			if (!_cell_cache.has(cache_key)) {
-				if (_cache_bytes + bytes > 256 * 1024 * 1024 || _cell_cache.size() >= 64) { _cell_cache.clear(); _cache_bytes = 0; }
-				_cell_cache[cache_key] = channels; _cache_bytes += bytes;
+			constexpr uint64_t cell_cache_limit_bytes = 256ull * 1024 * 1024;
+			if (bytes <= cell_cache_limit_bytes) {
+				std::lock_guard<std::mutex> cache_lock(_cache_mutex);
+				if (!_cell_cache.has(cache_key)) {
+					if (_cache_bytes + bytes > cell_cache_limit_bytes || _cell_cache.size() >= 64) { _cell_cache.clear(); _cache_bytes = 0; }
+					_cell_cache[cache_key] = channels; _cache_bytes += bytes;
+				}
 			}
 		}
 		Dictionary piece; piece["cell_rect"] = rect;

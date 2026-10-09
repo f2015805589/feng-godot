@@ -2,6 +2,8 @@ extends SceneTree
 ## Run headlessly for the native packet contract, or add -- --gpu for RD ownership.
 
 const CloudGPU = preload("res://addons/feng-cloud/feng_cloud_gpu.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
 const HeightFogPassScript = preload("res://addons/feng-render-pipeline/passes/height_fog_pass.gd")
 
 class OwnedPass extends FengPass:
@@ -53,6 +55,8 @@ func run() -> void:
 	test_registry_and_material()
 	test_atmosphere_sources()
 	test_cloud_fog_view_depth()
+	test_owned_rid_dedupe()
+	test_shader_source_boundaries()
 	test_cloud_volume_composition_shader_assembly()
 	test_cloud_volume_composition_revision_domains()
 	var ctx := FRPPassContext.new()
@@ -111,7 +115,7 @@ func test_cloud_volume_composition_shader_assembly() -> void:
 	var loader_source := FileAccess.get_file_as_string("res://addons/feng-cloud/feng_cloud_gpu.gd")
 	require(loader_source.contains("source_text = _assemble_shader_source(source_text, defines)"),
 		"Pipeline compilation must use the source assembly path exercised by this CPU gate")
-	var expanded := gpu._expand_shader(path, 0)
+	var expanded := ShaderSource.expand(path)
 	require(not expanded.is_empty(), "Cloud composite source and includes must expand through the runtime loader")
 	for deferred in [0, 1]:
 		var assembled := gpu._assemble_shader_source(expanded, {
@@ -132,6 +136,74 @@ func test_cloud_volume_composition_shader_assembly() -> void:
 	require(main_start >= 0 and bounds_end > main_start and uv_declaration > bounds_end
 		and first_apply > uv_declaration and second_apply > uv_declaration,
 		"Main composite must define viewport-local UV after bounds validation and before both volume samples")
+
+
+func test_owned_rid_dedupe() -> void:
+	var first := RenderingServer.texture_2d_placeholder_create()
+	var second := RenderingServer.texture_2d_placeholder_create()
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	OwnedRids.append(result, seen, first)
+	OwnedRids.append_all(result, seen, [second, first, RID()])
+	require(result == [first, second],
+		"Owned RID collection must preserve order, omit invalid values and dedupe repeated RIDs")
+	RenderingServer.free_rid(first)
+	RenderingServer.free_rid(second)
+
+
+func test_shader_source_boundaries() -> void:
+	var root := "user://feng_shader_source_contract_%d" % Time.get_ticks_usec()
+	var absolute_root := ProjectSettings.globalize_path(root)
+	require(DirAccess.make_dir_recursive_absolute(absolute_root) == OK,
+		"Could not create the shader-source test directory")
+	var include_path := root.path_join("nested.glslinc")
+	var entry_path := root.path_join("entry.glslinc")
+	require(_write_test_file(include_path, "included"), "Could not write nested shader include")
+	require(_write_test_file(entry_path, "before\n#include \"nested.glslinc\"\nafter"),
+		"Could not write shader include entry")
+	require(ShaderSource.expand(entry_path) == "before\nincluded\nafter",
+		"Shader include expansion changed relative-path order or line joining")
+	require(ShaderSource.expand(root.path_join("missing.glslinc")).is_empty(),
+		"A missing shader root must fail expansion")
+	var empty_path := root.path_join("empty.glslinc")
+	require(_write_test_file(empty_path, "") and ShaderSource.expand(empty_path).is_empty(),
+		"An empty shader source must fail expansion")
+	var malformed_path := root.path_join("malformed.glslinc")
+	require(_write_test_file(malformed_path, "#include nested.glslinc"),
+		"Could not write malformed shader include")
+	require(ShaderSource.expand(malformed_path).is_empty(),
+		"A malformed include must fail expansion")
+	for index in 34:
+		var text := "leaf" if index == 33 else "#include \"depth_%d.glslinc\"" % (index + 1)
+		require(_write_test_file(root.path_join("depth_%d.glslinc" % index), text),
+			"Could not write shader depth fixture %d" % index)
+	require(ShaderSource.expand(root.path_join("depth_0.glslinc")).is_empty(),
+		"Shader include expansion must reject nesting beyond depth 32")
+	_remove_test_directory(root)
+
+
+func _write_test_file(path: String, text: String) -> bool:
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return false
+	file.store_string(text)
+	file.close()
+	return true
+
+
+func _remove_test_directory(path: String) -> void:
+	var directory := DirAccess.open(path)
+	if directory == null:
+		return
+	directory.list_dir_begin()
+	while true:
+		var entry := directory.get_next()
+		if entry.is_empty():
+			break
+		if not directory.current_is_dir():
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(path.path_join(entry)))
+	directory.list_dir_end()
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 
 
 func test_cloud_volume_composition_revision_domains() -> void:

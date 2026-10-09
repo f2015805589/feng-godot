@@ -4,6 +4,9 @@ extends RefCounted
 ## pyramid. It shares only the frame-input codec with volumetric fog.
 
 const Codec = preload("feng_volumetric_fog_codec.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const SHADER_ROOT := "res://addons/feng-fog/rendering/shaders/"
 const FRAME_BYTES := 288
 const ANALYTIC_BYTES := 96
@@ -163,16 +166,16 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var rids: Array[RID] = []
 	var seen: Dictionary = {}
 	for state in _states.values():
-		_append_owned_rids(rids, seen, _state_rids(state))
+		OwnedRids.append_all(rids, seen, _state_rids(state))
 	for entry in _pipelines.values():
-		_append_owned_rid(rids, seen, entry.pipeline)
-		_append_owned_rid(rids, seen, entry.shader)
-	_append_owned_rid(rids, seen, _sampler_nearest)
-	_append_owned_rid(rids, seen, _sampler_linear)
-	_append_owned_rid(rids, seen, _empty_volume_texture)
-	_append_owned_rid(rids, seen, _empty_fsss_texture)
-	_append_owned_rid(rids, seen, _empty_cloud_radiance)
-	_append_owned_rid(rids, seen, _empty_cloud_transmittance)
+		OwnedRids.append(rids, seen, entry.pipeline)
+		OwnedRids.append(rids, seen, entry.shader)
+	OwnedRids.append(rids, seen, _sampler_nearest)
+	OwnedRids.append(rids, seen, _sampler_linear)
+	OwnedRids.append(rids, seen, _empty_volume_texture)
+	OwnedRids.append(rids, seen, _empty_fsss_texture)
+	OwnedRids.append(rids, seen, _empty_cloud_radiance)
+	OwnedRids.append(rids, seen, _empty_cloud_transmittance)
 	if p_clear:
 		_states.clear()
 		_pipelines.clear()
@@ -184,18 +187,6 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 		_empty_cloud_radiance = RID()
 		_empty_cloud_transmittance = RID()
 	return rids
-
-
-static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
-	if p_rid.is_valid() and not p_seen.has(p_rid):
-		p_seen[p_rid] = true
-		p_target.append(p_rid)
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:
@@ -289,21 +280,21 @@ func _dispatch_view(rd: RenderingDevice, state: Dictionary, view: int,
 	if not _valid_texture(rd, cloud_ao):
 		cloud_ao = _empty_fsss_texture
 	var reproject_set := _uniform_set(reproject.shader, [
-		_uniform_buffer(0, frame_ubo), _sampled(1, _sampler_nearest, scene_color),
-		_sampled(2, _sampler_nearest, depth), _sampled(3, _sampler_linear, previous),
-		_image(4, output_mips[0]), _uniform_buffer(5, analytic_ubo),
-		_sampled(6, _sampler_nearest, previous_depth), _image(7, output_depth),
-		_sampled(9, _sampler_nearest, volume_texture),
-		_sampled(10, _sampler_linear, _empty_fsss_texture),
-		_uniform_buffer(11, sampling_ubo), _sampled(12, _sampler_nearest, cloud_radiance),
-		_sampled(13, _sampler_nearest, cloud_transmittance),
-		_uniform_buffer(14, atmosphere_ubo),
-		_sampled(15, _sampler_linear, optical_texture),
-		_sampled(16, _sampler_linear, multiple_texture),
-		_uniform_buffer(17, cloud_visibility_ubo),
-		_sampled(18, _sampler_linear, shadow0),
-		_sampled(19, _sampler_linear, shadow1),
-		_sampled(20, _sampler_linear, cloud_ao),
+		RDUniforms.uniform_buffer(0, frame_ubo), RDUniforms.sampled(1, _sampler_nearest, scene_color),
+		RDUniforms.sampled(2, _sampler_nearest, depth), RDUniforms.sampled(3, _sampler_linear, previous),
+		RDUniforms.image(4, output_mips[0]), RDUniforms.uniform_buffer(5, analytic_ubo),
+		RDUniforms.sampled(6, _sampler_nearest, previous_depth), RDUniforms.image(7, output_depth),
+		RDUniforms.sampled(9, _sampler_nearest, volume_texture),
+		RDUniforms.sampled(10, _sampler_linear, _empty_fsss_texture),
+		RDUniforms.uniform_buffer(11, sampling_ubo), RDUniforms.sampled(12, _sampler_nearest, cloud_radiance),
+		RDUniforms.sampled(13, _sampler_nearest, cloud_transmittance),
+		RDUniforms.uniform_buffer(14, atmosphere_ubo),
+		RDUniforms.sampled(15, _sampler_linear, optical_texture),
+		RDUniforms.sampled(16, _sampler_linear, multiple_texture),
+		RDUniforms.uniform_buffer(17, cloud_visibility_ubo),
+		RDUniforms.sampled(18, _sampler_linear, shadow0),
+		RDUniforms.sampled(19, _sampler_linear, shadow1),
+		RDUniforms.sampled(20, _sampler_linear, cloud_ao),
 	])
 	if not _dispatch(rd, reproject.pipeline, reproject_set, size):
 		return false
@@ -313,13 +304,13 @@ func _dispatch_view(rd: RenderingDevice, state: Dictionary, view: int,
 		var source_view: RID = output_mips[0] if mip == 1 else downsample_mips[mip - 1]
 		var target_view: RID = downsample_mips[mip]
 		var source_set := _uniform_set(downsample.shader, [
-			_sampled(0, _sampler_linear, source_view), _image(1, target_view),
+			RDUniforms.sampled(0, _sampler_linear, source_view), RDUniforms.image(1, target_view),
 		])
 		var mip_size := Vector2i(maxi(size.x >> mip, 1), maxi(size.y >> mip, 1))
 		if not _dispatch(rd, downsample.pipeline, source_set, mip_size):
 			return false
 		var filter_set := _uniform_set(filter.shader, [
-			_sampled(0, _sampler_linear, target_view), _image(1, blur_mips[mip]),
+			RDUniforms.sampled(0, _sampler_linear, target_view), RDUniforms.image(1, blur_mips[mip]),
 		])
 		if not _dispatch(rd, filter.pipeline, filter_set, mip_size):
 			return false
@@ -334,9 +325,9 @@ func _dispatch_view(rd: RenderingDevice, state: Dictionary, view: int,
 		if rd.buffer_update(upsample_ubo, 0, control_bytes.size(), control_bytes) != OK:
 			return false
 		var upsample_set := _uniform_set(upsample.shader, [
-			_sampled(0, _sampler_linear, blur_mips[mip]),
-			_sampled(1, _sampler_linear, coarser_view),
-			_image(2, output_mips[mip]), _uniform_buffer(3, upsample_ubo),
+			RDUniforms.sampled(0, _sampler_linear, blur_mips[mip]),
+			RDUniforms.sampled(1, _sampler_linear, coarser_view),
+			RDUniforms.image(2, output_mips[mip]), RDUniforms.uniform_buffer(3, upsample_ubo),
 		])
 		var mip_size := Vector2i(maxi(size.x >> mip, 1), maxi(size.y >> mip, 1))
 		if not _dispatch(rd, upsample.pipeline, upsample_set, mip_size):
@@ -542,7 +533,7 @@ func _ensure_pipelines(rd: RenderingDevice) -> bool:
 			"fsss_filter.glslinc", "fsss_upsample.glslinc"]:
 		if _pipelines.has(filename):
 			continue
-		var expanded_source: String = _expand_shader(SHADER_ROOT.path_join(filename), 0)
+		var expanded_source: String = ShaderSource.expand(SHADER_ROOT.path_join(filename))
 		if expanded_source.is_empty():
 			_last_error = "Cannot load or expand FSSS shader %s." % filename
 			return false
@@ -584,28 +575,6 @@ func _compile_pipeline(rd: RenderingDevice, filename: String, source: String) ->
 		_last_error = "Cannot create FSSS compute pipeline for %s." % filename
 		return {}
 	return {"shader": shader, "pipeline": pipeline}
-
-
-func _expand_shader(path: String, depth: int) -> String:
-	if depth > 32 or not FileAccess.file_exists(path):
-		return ""
-	var source := FileAccess.get_file_as_string(path)
-	var result := PackedStringArray()
-	for line in source.split("\n"):
-		var trimmed := line.strip_edges()
-		if not trimmed.begins_with("#include"):
-			result.append(line)
-			continue
-		var first := trimmed.find("\"")
-		var last := trimmed.rfind("\"")
-		if first < 0 or last <= first:
-			return ""
-		var included := _expand_shader(path.get_base_dir().path_join(
-				trimmed.substr(first + 1, last - first - 1)), depth + 1)
-		if included.is_empty():
-			return ""
-		result.append(included)
-	return "\n".join(result)
 
 
 func _ensure_samplers(rd: RenderingDevice) -> bool:
@@ -678,31 +647,6 @@ func _create_sampler(rd: RenderingDevice, linear: bool) -> RID:
 
 func _uniform_set(shader: RID, uniforms: Array[RDUniform]) -> RID:
 	return UniformSetCacheRD.get_cache(shader, 0, uniforms)
-
-
-func _uniform_buffer(binding: int, rid: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(rid)
-	return uniform
-
-
-func _sampled(binding: int, sampler: RID, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	return uniform
-
-
-func _image(binding: int, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	return uniform
 
 
 func _dispatch(rd: RenderingDevice, pipeline: RID, uniform_set: RID, size: Vector2i) -> bool:

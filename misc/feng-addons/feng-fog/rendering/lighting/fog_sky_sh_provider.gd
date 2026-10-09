@@ -5,6 +5,8 @@ extends RefCounted
 ## owned and must be treated as borrowed by the caller.
 
 const SHADER_DIR := "res://addons/feng-fog/rendering/lighting"
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const SH_LAYOUT_VERSION := 1
 const SH_COEFFICIENT_COUNT := 7
 const SH_BYTES := SH_COEFFICIENT_COUNT * 16
@@ -234,12 +236,9 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	for rid in [_partial_buffer, _packed_buffer, _neutral_buffer, _sampler,
+	OwnedRids.append_all(result, seen, [_partial_buffer, _packed_buffer, _neutral_buffer, _sampler,
 			_project_pipeline_2d, _project_pipeline_array, _pack_pipeline,
-			_project_shader_2d, _project_shader_array, _pack_shader]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+			_project_shader_2d, _project_shader_array, _pack_shader])
 	if p_clear:
 		_rd = null
 		_sampler = RID()
@@ -317,38 +316,17 @@ func _project_source(p_rd: RenderingDevice, p_texture: RID, p_border: float,
 		_last_error = "Could not allocate the sky SH projection parameters."
 		return false
 	var project_uniforms: Array[RDUniform] = []
-	var texture_uniform := RDUniform.new()
-	texture_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	texture_uniform.binding = 0
-	texture_uniform.add_id(_sampler)
-	texture_uniform.add_id(p_texture)
-	project_uniforms.append(texture_uniform)
-	var partial_uniform := RDUniform.new()
-	partial_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	partial_uniform.binding = 1
-	partial_uniform.add_id(_partial_buffer)
-	project_uniforms.append(partial_uniform)
-	var parameter_uniform := RDUniform.new()
-	parameter_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	parameter_uniform.binding = 2
-	parameter_uniform.add_id(parameter_buffer)
-	project_uniforms.append(parameter_uniform)
+	project_uniforms.append(RDUniforms.sampled(0, _sampler, p_texture))
+	project_uniforms.append(RDUniforms.storage_buffer(1, _partial_buffer))
+	project_uniforms.append(RDUniforms.uniform_buffer(2, parameter_buffer))
 	var project_set := p_rd.uniform_set_create(project_uniforms, project_shader, 0)
 	if not project_set.is_valid():
 		_free_rid(p_rd, parameter_buffer)
 		_last_error = "Could not bind the explicit sky source for SH projection."
 		return false
 	var pack_uniforms: Array[RDUniform] = []
-	var pack_partial := RDUniform.new()
-	pack_partial.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	pack_partial.binding = 0
-	pack_partial.add_id(_partial_buffer)
-	pack_uniforms.append(pack_partial)
-	var pack_output := RDUniform.new()
-	pack_output.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	pack_output.binding = 1
-	pack_output.add_id(_packed_buffer)
-	pack_uniforms.append(pack_output)
+	pack_uniforms.append(RDUniforms.storage_buffer(0, _partial_buffer))
+	pack_uniforms.append(RDUniforms.storage_buffer(1, _packed_buffer))
 	var pack_set := p_rd.uniform_set_create(pack_uniforms, _pack_shader, 0)
 	if not pack_set.is_valid():
 		_free_rid(p_rd, project_set)

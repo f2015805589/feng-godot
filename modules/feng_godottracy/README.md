@@ -1,20 +1,14 @@
 # Feng Godot Tracy
 
-Tracy Profiler support for this engine, adapted from
+Tracy profiler support for this engine, adapted from
 [GodotTracy](https://github.com/Pineapple/GodotTracy) (MIT, Pineapple Works).
+The module vendors Tracy, selects the engine backend, exposes a script API, and
+adds the Debug menu entry in `misc/feng-addons/feng-godottracy`.
 
-The [Tracy profiler](https://github.com/wolfpld/tracy) samples the running
-process and shows a frame timeline, per-zone timings, plots, messages and,
-optionally, memory and call stacks. This module bundles the Tracy client and
-selects the engine's Tracy backend, so the `GodotProfileZone` instrumentation
-that already exists throughout the engine turns into real Tracy zones, and the
-platform main loop already marks every frame.
-
-In the original module the client had to be added as a git submodule and the
-Tracy backend had to be wired up by hand; here the module vendors the client in
-`thirdparty/tracy`, drives `core/profiling` itself, and adds a script-facing API
-plus a Debug menu entry that starts the profiler
-(`misc/feng-addons/feng-godottracy`).
+The [Tracy profiler](https://github.com/wolfpld/tracy) shows frame timelines,
+zones, plots, messages and, optionally, memory and call stacks. Existing
+`GodotProfileZone` instrumentation becomes Tracy zones when this backend is
+enabled, and the platform main loop marks each frame.
 
 ## Building
 
@@ -89,20 +83,16 @@ since those also compile without a profiler.
 
 ### GDScript
 
-The module registers the `FengGodotTracy` class and singleton, so scripts can
-send markers and open zones for code that cannot use a scope:
+The module registers the `FengGodotTracy` class and singleton for script markers
+and plots. The VM records script functions and native calls automatically:
 
 ```gdscript
 FengGodotTracy.message("streaming a new sector")
 FengGodotTracy.plot("terrain/cdlod_ms", peak_ms)
-FengGodotTracy.begin_zone("terrain_rebuild")
-# ... work ...
-FengGodotTracy.end_zone()
 ```
 
-Every `begin_zone()` must be paired with an `end_zone()` on the same thread;
-`end_all_zones()` closes whatever is still open. In scripts that must also run
-on an engine built without the module, look the singleton up at runtime:
+For scripts that must also run on an engine built without the module, look the
+singleton up at runtime:
 
 ```gdscript
 if Engine.has_singleton("FengGodotTracy"):

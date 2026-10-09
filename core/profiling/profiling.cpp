@@ -91,7 +91,7 @@ const StringInternData *_intern_name(const StringName &p_name) {
 	StringInternData *_data = TracyInternTable::string_table[idx];
 
 	while (_data) {
-		if (_data->hash == hash) {
+		if (_data->hash == hash && _data->name == p_name) {
 			return _data;
 		}
 		_data = _data->next;
@@ -100,6 +100,7 @@ const StringInternData *_intern_name(const StringName &p_name) {
 	_data = TracyInternTable::string_allocator.alloc();
 	_data->name = p_name;
 	_data->name_utf8 = p_name.operator String().utf8();
+	_data->hash = hash;
 
 	_data->next = TracyInternTable::string_table[idx];
 	_data->prev = nullptr;

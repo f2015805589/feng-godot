@@ -118,7 +118,7 @@ float FRPPassContext::get_pre_exposure(int p_view) const {
 
 void FRPPassContext::set_volume_frame_input(int p_view, const Dictionary &p_inputs) {
 	ERR_FAIL_INDEX(p_view, RendererSceneRender::MAX_RENDER_VIEWS);
-	volume_frame_inputs[p_view] = p_inputs.duplicate(true);
+	volume_frame_inputs[p_view] = p_inputs;
 	volume_frame_view_count = MAX(volume_frame_view_count, p_view + 1);
 }
 
@@ -135,6 +135,21 @@ Dictionary FRPPassContext::get_volume_frame_inputs(int p_view) const {
 		return Dictionary();
 	}
 	return volume_frame_inputs[p_view].duplicate(true);
+}
+
+int64_t FRPPassContext::get_volume_frame_generation(int p_view) const {
+	if (p_view < 0 || p_view >= RendererSceneRender::MAX_RENDER_VIEWS || p_view >= volume_frame_view_count) {
+		return -1;
+	}
+	const Dictionary &inputs = volume_frame_inputs[p_view];
+	const Variant valid = inputs.get("valid", false);
+	const Variant abi_version = inputs.get("abi_version", 0);
+	const Variant generation = inputs.get("frame_generation", Variant());
+	if (valid.get_type() != Variant::BOOL || !bool(valid) || abi_version.get_type() != Variant::INT || int64_t(abi_version) != 1 || generation.get_type() != Variant::INT) {
+		return -1;
+	}
+	const int64_t frame_generation = int64_t(generation);
+	return frame_generation >= 0 ? frame_generation : -1;
 }
 
 void FRPPassContext::clear_volume_output() {
@@ -700,6 +715,7 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
 	ClassDB::bind_method(D_METHOD("get_scene_exposure_normalization"), &FRPPassContext::get_scene_exposure_normalization);
 	ClassDB::bind_method(D_METHOD("get_volume_frame_inputs", "view"), &FRPPassContext::get_volume_frame_inputs, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_volume_frame_generation", "view"), &FRPPassContext::get_volume_frame_generation, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_volume_output", "texture", "sample_parameters", "rgb_pre_exposure"), &FRPPassContext::set_volume_output);
 	ClassDB::bind_method(D_METHOD("get_volume_texture"), &FRPPassContext::get_volume_texture);
 	ClassDB::bind_method(D_METHOD("get_volume_sampling_parameters"), &FRPPassContext::get_volume_sampling_parameters);

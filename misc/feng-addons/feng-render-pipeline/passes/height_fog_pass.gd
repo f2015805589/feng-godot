@@ -10,6 +10,7 @@ extends FengRuntimeSnapshotPass
 const UBO_BINDING := 2
 const UBO_SIZE := 496 # Two mat4s + seven fog vec4s + sixteen atmosphere vec4s.
 const CLOUD_VISIBILITY_UBO_SIZE := 592 # 35 projection vec4s + sun mapping + validity flags.
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
 const AtmospherePacket = preload("atmosphere_packet.gd")
 const FOG_RENDERER_ENTRY_PATH := "res://addons/feng-fog/rendering/feng_fog_renderer_entry.gd"
 const OP_LIGHTING_PREPARE := FRPPassContext.OP_LIGHTING_PREPARE
@@ -1288,10 +1289,7 @@ func _refresh_fog_renderer_owned_rids() -> void:
 	var inventory: Array[RID] = _fog_renderer.call("get_owned_rids")
 	var next_inventory: Array[RID] = []
 	var seen: Dictionary = {}
-	for rid in inventory:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			next_inventory.append(rid)
+	OwnedRids.append_all(next_inventory, seen, inventory)
 	_fog_renderer_owned_rids = next_inventory
 	_sync_owned_rid_snapshot()
 
@@ -1302,11 +1300,11 @@ func _current_owned_rids() -> Array[RID]:
 	# Keep the established release order: pass shader objects are returned by
 	# super first, then local atmosphere resources, renderer/service dependencies,
 	# per-view sampling buffers, and the fallback textures they reference.
-	_append_unique_owned_rids(rids, seen,
+	OwnedRids.append_all(rids, seen,
 			[_empty_atmosphere_lut, _atmosphere_sampler, _cloud_visibility_ubo])
-	_append_unique_owned_rids(rids, seen, _fog_renderer_owned_rids)
-	_append_unique_owned_rids(rids, seen, _volume_sampling_ubos)
-	_append_unique_owned_rids(rids, seen, [_empty_volume_texture, _empty_fsss_texture])
+	OwnedRids.append_all(rids, seen, _fog_renderer_owned_rids)
+	OwnedRids.append_all(rids, seen, _volume_sampling_ubos)
+	OwnedRids.append_all(rids, seen, [_empty_volume_texture, _empty_fsss_texture])
 	return rids
 
 
@@ -1331,13 +1329,5 @@ func _take_owned_rids() -> Array[RID]:
 	for rid in rids:
 		if rid.is_valid():
 			seen[rid] = true
-	_append_unique_owned_rids(rids, seen, fog_rids)
+	OwnedRids.append_all(rids, seen, fog_rids)
 	return rids
-
-
-static func _append_unique_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_values: Array[RID]) -> void:
-	for rid in p_values:
-		if rid.is_valid() and not p_seen.has(rid):
-			p_seen[rid] = true
-			p_target.append(rid)

@@ -28,6 +28,13 @@ line counts, mechanical split scripts and successive header rewrites are not API
 Shared helpers were retained only where used; legacy diagnostic/selection modes, manual tools,
 serialized fields and third-party algorithms remained part of their own compatibility surface.
 
+The recorded cleanup unified the public VT tier while keeping legacy setters side-effect-free,
+centralized codec selection without changing explicit-channel APIs, named the fixed-size plan-key
+layout and shared distance threshold, removed a duplicated visibility-bound condition, and added
+the priority regression to the default test build. It added no per-frame callbacks, ref-counted
+resources, dictionaries, dynamic policy containers or heap-backed policy objects. Current ownership
+and compatibility contracts are in the architecture guide; this list describes that historical diff.
+
 ## Recorded correctness outcomes
 
 | Area | Outcome and regression |
@@ -65,6 +72,28 @@ They do not establish a general GPU/FPS gain or an all-frame latency bound.
 The overlap instrument disables depth and preserves terrain vertex deformation. It measures
 potential front-face overlap, not actual opaque fragments surviving early-Z. The built-in
 FRP overdraw override cannot substitute for displaced-terrain validation.
+
+### Sequential plan-key helper cleanup
+
+The Windows Debug/Release change named the existing plan-key sections and shared one
+distance threshold; it retained the sequential writer and added no runtime allocations.
+Addressing, 100,000 arrival-queue churn operations, 20,000 Jacobian-bound samples,
+priority ordering, format selection, snap/displacement refresh and anisotropic D3D12
+sampling passed in the recorded fixtures. The repeated-motion comparison used the
+pre-change unified-compression DLL from `terrain-project-lifetime-ke6fwkn0` and a
+1920×1080 test-1 copy, with runs serialized.
+
+| Recorded run | VT CPU mean | Viewport GPU mean |
+| --- | ---: | ---: |
+| First comparison, pre-change → final | 0.739 → 0.754 ms | 0.981 → 0.937 ms |
+| Reverse-order intermediate/final vs. old | 0.756 vs. 0.717 ms | 0.803 vs. 0.810 ms |
+| Final sequential-writer run | 0.678 ms | 1.015 ms |
+
+The first three runs had per-window object counts `[2728, 3077, 3116, 2987, 3059, 2963]`;
+the reverse-order old run differed by 24 objects in one intermediate window and settled
+at 2963. The measurements vary and do not establish a general CPU or GPU improvement.
+The refreshed snap/displacement fixture is `terrain-snap-turn-jr8_wphq`; copied-project
+logs use `architecture_perf_*.log`.
 
 The recorded final native Debug/Release builds passed after SVT parent canonicalization.
 The subsequent graphical dock fixture `feng-editor-dock-clean-o77sn_ch` passed with zero

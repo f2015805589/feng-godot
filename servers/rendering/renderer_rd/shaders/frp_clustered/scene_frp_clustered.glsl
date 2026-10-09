@@ -3121,7 +3121,6 @@ void fragment_shader(in SceneData scene_data) {
 	// normal_roughness.a remains the dynamic/static marker.
 	normal_roughness_output_buffer.rgb = normal * 0.5 + 0.5;
 	normal_roughness_output_buffer.a = bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC) ? 1.0 : 0.0;
-	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w;
 
 #endif //MODE_RENDER_NORMAL_ROUGHNESS
 

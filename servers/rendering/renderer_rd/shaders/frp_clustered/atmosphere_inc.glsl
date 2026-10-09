@@ -1,4 +1,3 @@
-// Keep this file byte-identical to the addon height-fog transport include.
 // ATMO_PARAMS is sixteen vec4s; texture macros resolve to sampler2D values.
 const float FRP_ATMO_PI = 3.141592653589793;
 

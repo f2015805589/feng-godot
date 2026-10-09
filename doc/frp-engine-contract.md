@@ -15,6 +15,8 @@
 ID 是稳定身份；默认顺序由 `DEFAULT_PASS_ORDER` 定义，显式资源按自身顺序执行。
 默认库条目和启用状态由插件的 `library_manager.gd` 与 `renderer.gd` 定义。
 
+Forward+ 与 FRP 共用 `RendererSceneRenderRDClustered::_render_shadow_pass()` 的聚簇阴影选择、atlas 区域和 light-instance 路由。两个 renderer 子类分别提供 framebuffer append、cubemap 处理及 pass 生命周期回调；修改共用阴影策略时，应保留两条渲染路径的这些实现边界。
+
 引擎保留原生 Pass 调度和无插件 fallback；插件默认实现通过同一套原语执行这些工作。
 原生 SSAO、SSIL、SSR、SDFGI、VoxelGI 和调试几何不在 FRP 的渲染范围内。
 Magic GI 等插件效果使用独立数据路径。
@@ -27,6 +29,7 @@ Magic GI 等插件效果使用独立数据路径。
 | 类别 | 当前绑定的方法 |
 |---|---|
 | 帧状态 | `get_render_data()`、`get_render_scene_buffers()`、`get_view_count()`、`get_internal_size()` |
+| 轻量帧代次 | `get_volume_frame_generation(view = 0)` |
 | Pass 查询 | `get_pass_name(id)`、`is_valid_pass_id(id)`、`get_pass_parameters(key)` |
 | 绘制 | `draw_gbuffer()`、`draw_motion_vectors()`、`draw_deferred_lighting()`、`draw_sky()`、`draw_opaque_fallback()`、`draw_transparent()` |
 | 准备与 resolve | `precompute_shadows()`、`execute_virtual_texture_updates()`、`prepare_lighting()`、`merge_subsurface_and_specular()`、`resolve_opaque()`、`resolve_sky()`、`resolve_final()`、`copy_screen_and_depth()`、`copy_history()` |
@@ -37,6 +40,9 @@ Magic GI 等插件效果使用独立数据路径。
 | GI 输出 | `_frp_prepare(ctx)` 可调用 `request_sky_light_diffuse()`；在 `draw_deferred_lighting()` 后从 `ctx.get_render_scene_buffers().get_texture("frp_clustered", "sky_light_diffuse")` 读取本帧结果 |
 
 `get_scene_exposure_normalization()` 返回 FRP 当前帧的场景曝光归一化，不含 pre-exposure；FRP eye adaptation 接管曝光时使用 1，再除以 render buffer 的 luminance multiplier。SkyLight diffuse 仅在当前帧显式请求时分配或写入。输出是已经应用全局环境 diffuse、local reflection probe 覆盖权重、材质 AO/albedo/metallic 和 pre-exposure 的屏幕贡献；不含局部 probe、直接光、间接反射或 emission。没有 ready SkyLight 时该纹理为零，可供 GI 继续处理直接发光体和太阳光照。
+
+有效 ABI 1 体积帧的代次 getter 返回该视图的 generation；缺失或无效帧、无效 view 返回 -1。
+完整帧 getter 仍返回隔离副本，供需要其他字段的调用方使用。
 
 绘制原语调用与引擎原生 Pass 相同的 Operation。它们目前使用固定签名；逐 Pass 配置
 通过 `get_pass_parameters(key)` 读取。通用 `options` 字典、任意 render-list 提交和

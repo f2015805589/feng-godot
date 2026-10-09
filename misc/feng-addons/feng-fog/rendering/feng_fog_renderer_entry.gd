@@ -9,6 +9,7 @@ const VolumeGPUService = preload("feng_volumetric_fog_gpu_service.gd")
 const VolumeCompositeService = preload("feng_volumetric_fog_composite_service.gd")
 const AnalyticHeightFogFallbackService = preload("feng_analytic_height_fog_fallback_service.gd")
 const FsssGPUService = preload("feng_fsss_gpu_service.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
 
 var _volume := VolumeGPUService.new()
 var _composite := VolumeCompositeService.new()
@@ -104,20 +105,12 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var seen: Dictionary = {}
 	var child_rids: Array[RID] = _volume.take_owned_rids() if p_clear \
 			else _volume.get_owned_rids()
-	_append_unique_rids(result, seen, child_rids)
+	OwnedRids.append_all(result, seen, child_rids)
 	child_rids = _composite.take_owned_rids() if p_clear else _composite.get_owned_rids()
-	_append_unique_rids(result, seen, child_rids)
+	OwnedRids.append_all(result, seen, child_rids)
 	child_rids = _analytic_fallback.take_owned_rids() if p_clear \
 			else _analytic_fallback.get_owned_rids()
-	_append_unique_rids(result, seen, child_rids)
+	OwnedRids.append_all(result, seen, child_rids)
 	child_rids = _fsss.take_owned_rids() if p_clear else _fsss.get_owned_rids()
-	_append_unique_rids(result, seen, child_rids)
+	OwnedRids.append_all(result, seen, child_rids)
 	return result
-
-
-static func _append_unique_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_values: Array[RID]) -> void:
-	for rid in p_values:
-		if rid.is_valid() and not p_seen.has(rid):
-			p_seen[rid] = true
-			p_target.append(rid)

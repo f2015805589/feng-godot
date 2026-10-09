@@ -20,6 +20,8 @@ const FLAG_HAS_DIRECTIONAL_SHADOW := 8
 const FLAG_STATIC_LIGHT_KEY_MATCH := 16
 const FLAG_HAS_SKY_BENT_NORMAL := 32
 const Volume = preload("fog_volumetric_lightmap.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 
 var _rd: RenderingDevice
 var _entries: Dictionary = {} # resource_id -> revision/device/owned texture and UBO RIDs.
@@ -88,11 +90,7 @@ static func make_set5_uniforms(p_inputs: Dictionary) -> Array[RDUniform]:
 	var uniforms: Array[RDUniform] = []
 	if not bool(p_inputs.get("valid", false)):
 		return uniforms
-	var params := RDUniform.new()
-	params.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	params.binding = PARAMS_BINDING
-	params.add_id(p_inputs["params_buffer"])
-	uniforms.append(params)
+	uniforms.append(RDUniforms.uniform_buffer(PARAMS_BINDING, p_inputs["params_buffer"]))
 	var bindings := [INDIRECTION_BINDING, AMBIENT_BINDING,
 		SH_BINDING_FIRST, SH_BINDING_FIRST + 1, SH_BINDING_FIRST + 2,
 		SH_BINDING_FIRST + 3, SH_BINDING_FIRST + 4, SH_BINDING_FIRST + 5,
@@ -100,12 +98,7 @@ static func make_set5_uniforms(p_inputs: Dictionary) -> Array[RDUniform]:
 	var textures: Array = p_inputs["textures"]
 	for index in textures.size():
 		var item: Dictionary = textures[index]
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		uniform.binding = bindings[index]
-		uniform.add_id(item["sampler"])
-		uniform.add_id(item["texture"])
-		uniforms.append(uniform)
+		uniforms.append(RDUniforms.sampled(bindings[index], item["sampler"], item["texture"]))
 	return uniforms
 
 
@@ -140,10 +133,10 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var seen: Dictionary = {}
 	for entry_value in _entries.values():
 		if entry_value is Dictionary:
-			_append_owned_rids(result, seen, _entry_owned_rids(entry_value))
-	_append_owned_rids(result, seen, _entry_owned_rids(_neutral_entry))
-	_append_owned_rid(result, seen, _linear_sampler)
-	_append_owned_rid(result, seen, _nearest_sampler)
+			OwnedRids.append_all(result, seen, _entry_owned_rids(entry_value))
+	OwnedRids.append_all(result, seen, _entry_owned_rids(_neutral_entry))
+	OwnedRids.append(result, seen, _linear_sampler)
+	OwnedRids.append(result, seen, _nearest_sampler)
 	if p_clear:
 		_rd = null
 		_entries.clear()
@@ -158,30 +151,13 @@ static func _entry_owned_rids(p_entry: Dictionary) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
 	for texture in p_entry.get("textures", []):
-		if texture is RID and texture.is_valid() and not seen.has(texture):
-			seen[texture] = true
-			result.append(texture)
+		if texture is RID:
+			OwnedRids.append(result, seen, texture)
 	var params_neutral: RID = p_entry.get("params_neutral", RID())
 	var params_match: RID = p_entry.get("params_match", RID())
-	if params_neutral.is_valid() and not seen.has(params_neutral):
-		seen[params_neutral] = true
-		result.append(params_neutral)
-	if params_match.is_valid() and not seen.has(params_match):
-		seen[params_match] = true
-		result.append(params_match)
+	OwnedRids.append(result, seen, params_neutral)
+	OwnedRids.append(result, seen, params_match)
 	return result
-
-
-static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
-	if p_rid.is_valid() and not p_seen.has(p_rid):
-		p_seen[p_rid] = true
-		p_target.append(p_rid)
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:

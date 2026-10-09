@@ -145,9 +145,24 @@ in the architecture guide; engine hooks are in [engine_patch_surface.md](engine_
 ## Material layout and compression
 
 Canonical material pages contain albedo/height, signed world-normal/roughness and parameters
-(normal depth, AO, AO affect, validity). Baking uses source-corner triangle weights with
-output-page texture footprints. Height geometry remains RF and separate from material height.
-Packed R16 IDs and table entries use nearest reads; material channels use their filter rules.
+(normal depth, AO, AO affect, validity). Height geometry remains RF and separate from material
+height. Packed R16 IDs and table entries use nearest reads; material channels use their filter
+rules.
+
+When the output texel spacing is no larger than the source-ID spacing, the producer samples
+a world-aligned corner grid using that grid's origin and spacing. The bake shader derives
+triangle barycentric weights from the corners; texture footprints still use the output-page
+texel size. AVT and offline SVT use the same source-rectangle helper and staging layout.
+Larger output pixels use the minified-source path. The SVT source signature includes the
+corner-interpolation revision, so cells created with an older rule must be rebaked through
+Auto Bake or Bake SVT.
+
+The historical `vt_adaptive_runner.py --blend` regression compared a two-material gradient
+with direct shading and replaced cached source albedo bindings to exclude direct-shader
+fallback. The old DLL failed 8 sample checks; the corrected DLL passed AVT and SVT gradients
+and controls. The check covered flat triangle gradients, not every slope, triplanar projection
+or low-density SVT configuration. Its recorded runs are `terrain-vtadaptive-ir9jhz9y`,
+`terrain-vtadaptive-by60z00q` and `terrain-vtadaptive-ahhnupgn`.
 
 Each paged tier selects Uncompressed, BC7 or BC3. Albedo uses sRGB block storage; other
 channels remain linear. Compressed world normals use full-sphere octahedral encoding,

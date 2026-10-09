@@ -5,6 +5,8 @@ extends RefCounted
 ## thread by FFogLightExtensionRegistry; this provider receives only values/RIDs.
 
 const Layout = preload("fog_light_extension_layout.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const SHADER_PATH := "res://addons/feng-fog/rendering/lighting/light_extensions/fog_light_function_resample.glslinc"
 const RESAMPLE_EDGE := Layout.COOKIE_SIZE
 const RESAMPLE_GROUP_EDGE := 8
@@ -152,11 +154,8 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	for rid in [_records_buffer, _header_buffer, _sampler, _resample_pipeline,
-			_resample_shader, _cookie_array, _neutral_cookie_array]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+	OwnedRids.append_all(result, seen, [_records_buffer, _header_buffer, _sampler,
+			_resample_pipeline, _resample_shader, _cookie_array, _neutral_cookie_array])
 	if p_clear:
 		_rd = null
 		_records_buffer = RID()
@@ -409,23 +408,11 @@ func _prepare_resample_sets(p_rd: RenderingDevice, p_destination: RID,
 		if not params.is_valid():
 			_cleanup_resample_arrays(p_rd, sets, parameter_buffers)
 			return {"valid": false, "reason": "Could not allocate cookie resampling parameters."}
-		var uniforms: Array[RDUniform] = []
-		var source_uniform := RDUniform.new()
-		source_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		source_uniform.binding = 0
-		source_uniform.add_id(_sampler)
-		source_uniform.add_id(item.texture)
-		uniforms.append(source_uniform)
-		var destination_uniform := RDUniform.new()
-		destination_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-		destination_uniform.binding = 1
-		destination_uniform.add_id(p_destination)
-		uniforms.append(destination_uniform)
-		var params_uniform := RDUniform.new()
-		params_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-		params_uniform.binding = 2
-		params_uniform.add_id(params)
-		uniforms.append(params_uniform)
+		var uniforms: Array[RDUniform] = [
+			RDUniforms.sampled(0, _sampler, item.texture),
+			RDUniforms.image(1, p_destination),
+			RDUniforms.uniform_buffer(2, params),
+		]
 		var uniform_set := p_rd.uniform_set_create(uniforms, _resample_shader, 0)
 		if not uniform_set.is_valid():
 			p_rd.free_rid(params)

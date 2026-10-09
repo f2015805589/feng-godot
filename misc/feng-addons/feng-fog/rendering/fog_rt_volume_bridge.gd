@@ -7,6 +7,7 @@ const Codec = preload("feng_volumetric_fog_codec.gd")
 const LightExtensionLayout = preload("res://addons/feng-fog/rendering/lighting/light_extensions/fog_light_extension_layout.gd")
 const RayInputGeneratorScript = preload("res://addons/feng-fog/rendering/raytracing/fog_rt_ray_input_generator.gd")
 const RayTracingShadowProviderScript = preload("res://addons/feng-fog/rendering/raytracing/fog_rt_shadow_provider.gd")
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
 const MAX_VISIBILITY_BYTES := 128 * 1024 * 1024
 
 var _ray_input_generator: RefCounted = RayInputGeneratorScript.new()
@@ -244,30 +245,18 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var seen: Dictionary = {}
 	var child_rids: Array[RID] = _ray_input_generator.take_owned_rids() if p_clear \
 			else _ray_input_generator.get_owned_rids()
-	_append_owned_rids(result, seen, child_rids)
+	OwnedRids.append_all(result, seen, child_rids)
 	child_rids = _ray_tracing_shadow_provider.call("take_owned_rids") if p_clear \
 			else _ray_tracing_shadow_provider.call("get_owned_rids")
-	_append_owned_rids(result, seen, child_rids)
-	_append_owned_rid(result, seen, _visibility_buffer)
-	_append_owned_rid(result, seen, _slot_map_buffer)
+	OwnedRids.append_all(result, seen, child_rids)
+	OwnedRids.append(result, seen, _visibility_buffer)
+	OwnedRids.append(result, seen, _slot_map_buffer)
 	if p_clear:
 		_visibility_buffer = RID()
 		_visibility_capacity_bytes = 0
 		_slot_map_buffer = RID()
 		_slot_map_capacity_bytes = 0
 	return result
-
-
-static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
-	if p_rid.is_valid() and not p_seen.has(p_rid):
-		p_seen[p_rid] = true
-		p_target.append(p_rid)
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		_append_owned_rid(p_target, p_seen, rid)
 
 
 func _depth_options(ctx: FRPPassContext, rd: RenderingDevice,

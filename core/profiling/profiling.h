@@ -75,10 +75,31 @@ const SourceLocationData *intern_source_location(const void *p_function_ptr, con
 	new (&__godot_tracy_zone_##m_group_name) tracy::ScopedZone(&TracyConcat(__tracy_source_location, TracyLine), TRACY_CALLSTACK, true)
 #endif
 
+#ifdef TRACY_ON_DEMAND
+namespace tracy {
+
+struct GodotProfileScriptZone {
+	const bool active;
+	ScopedZone zone;
+
+	GodotProfileScriptZone(const void *p_function_ptr, const StringName &p_file, const StringName &p_function,
+			const StringName &p_name, uint32_t p_line, bool p_is_script) :
+			active(GetProfiler().IsConnected()),
+			zone(active ? intern_source_location(p_function_ptr, p_file, p_function, p_name, p_line, p_is_script) : nullptr, active) {}
+};
+
+} // namespace tracy
+
+#define GodotProfileZoneScript(m_ptr, m_file, m_function, m_name, m_line) \
+	tracy::GodotProfileScriptZone __godot_tracy_script(m_ptr, m_file, m_function, m_name, m_line, true)
+#define GodotProfileZoneScriptSystemCall(m_ptr, m_file, m_function, m_name, m_line) \
+	tracy::GodotProfileScriptZone __godot_tracy_zone_system_call(m_ptr, m_file, m_function, m_name, m_line, false)
+#else
 #define GodotProfileZoneScript(m_ptr, m_file, m_function, m_name, m_line) \
 	tracy::ScopedZone __godot_tracy_script(tracy::intern_source_location(m_ptr, m_file, m_function, m_name, m_line, true))
 #define GodotProfileZoneScriptSystemCall(m_ptr, m_file, m_function, m_name, m_line) \
 	tracy::ScopedZone __godot_tracy_zone_system_call(tracy::intern_source_location(m_ptr, m_file, m_function, m_name, m_line, false))
+#endif
 
 // Memory allocation
 #ifdef GODOT_PROFILER_TRACK_MEMORY
@@ -142,7 +163,7 @@ static HashSet<StringName> __tracing_system_call;
 struct PerfettoScriptTracer {
 	StringName name;
 	bool is_system_call;
-	bool tracing;
+	bool tracing = false;
 
 	PerfettoScriptTracer(const StringName &p_file, const StringName &p_function, const StringName &p_name, int p_line, bool p_system_call) : name(p_name), is_system_call(p_system_call) {
 		if (is_system_call || !__tracing_system_call.erase(name)) {

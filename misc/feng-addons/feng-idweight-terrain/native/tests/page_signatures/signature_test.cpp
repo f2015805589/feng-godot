@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -68,6 +69,78 @@ public:
 		return hash;
 	}
 };
+
+using DecodedChannels = std::map<std::string, std::shared_ptr<int>>;
+
+struct CellCache {
+	std::map<std::string, DecodedChannels> entries;
+	bool has(const std::string &key) const { return entries.find(key) != entries.end(); }
+	DecodedChannels &operator[](const std::string &key) { return entries[key]; }
+	void clear() { entries.clear(); }
+	std::size_t size() const { return entries.size(); }
+};
+
+class CellAdmission {
+public:
+	std::mutex _cache_mutex;
+	CellCache _cell_cache;
+	uint64_t _cache_bytes = 0;
+
+	DecodedChannels retain(const std::string &key, uint64_t bytes, const DecodedChannels &decoded) {
+		const std::string cache_key = key;
+		DecodedChannels channels = decoded;
+#include "admission.inc"
+		return channels;
+	}
+};
+
+bool test_cell_cache_admission() {
+	const auto image = std::make_shared<int>(17);
+	const DecodedChannels decoded = { { "albedo_height", image }, { "normal_roughness", image }, { "params", image } };
+	constexpr uint64_t limit = 256ull * 1024 * 1024;
+
+	CellAdmission normal;
+	const DecodedChannels normal_result = normal.retain("normal", 1024, decoded);
+	if (!normal._cell_cache.has("normal") || normal._cache_bytes != 1024 || normal_result.at("params") != image) {
+		std::cerr << "FAIL normal decoded-cell cache admission\n";
+		return false;
+	}
+
+	CellAdmission exact;
+	const DecodedChannels exact_result = exact.retain("exact", limit, decoded);
+	if (!exact._cell_cache.has("exact") || exact._cache_bytes != limit || exact_result.at("normal_roughness") != image) {
+		std::cerr << "FAIL exact-budget decoded-cell admission\n";
+		return false;
+	}
+
+	CellAdmission aggregate;
+	aggregate.retain("old", limit - 8, decoded);
+	const DecodedChannels aggregate_result = aggregate.retain("new", 16, decoded);
+	if (aggregate._cell_cache.size() != 1 || aggregate._cell_cache.has("old") || !aggregate._cell_cache.has("new") ||
+			aggregate._cache_bytes != 16 || aggregate_result.at("albedo_height") != image) {
+		std::cerr << "FAIL aggregate decoded-cell cache eviction\n";
+		return false;
+	}
+
+	CellAdmission oversized;
+	oversized.retain("kept", 10, decoded);
+	const DecodedChannels oversized_result = oversized.retain("too-large", limit + 1, decoded);
+	if (oversized._cell_cache.size() != 1 || !oversized._cell_cache.has("kept") || oversized._cell_cache.has("too-large") ||
+			oversized._cache_bytes != 10 || oversized_result.at("params") != image) {
+		std::cerr << "FAIL oversized decoded cell must bypass retention and preserve current channels\n";
+		return false;
+	}
+
+	CellAdmission entries;
+	for (int i = 0; i < 64; ++i) { entries.retain("entry-" + std::to_string(i), 1, decoded); }
+	entries.retain("entry-64", 1, decoded);
+	if (entries._cell_cache.size() != 1 || !entries._cell_cache.has("entry-64") || entries._cache_bytes != 1) {
+		std::cerr << "FAIL 64-entry decoded-cell cache eviction\n";
+		return false;
+	}
+
+	return true;
+}
 
 // Every transition is a condition-variable handoff. No sleeps, timing races or
 // probabilistic stress are needed to hold old/new jobs in flight at once.
@@ -167,6 +240,7 @@ bool concurrent_stress(const Entry *jobs, int count) {
 }
 
 int main() {
+	if (!test_cell_cache_admission()) { return 1; }
 	auto first = std::make_shared<Snapshot>();
 	first->cells[{0, 0}] = {{11}, {12}, {13}};
 	first->cells[{1, 0}] = {{21}, {22}, {23}};
@@ -184,5 +258,5 @@ int main() {
 	}
 	if (failed) { std::cerr << failed << "/6 signature scenarios failed\n"; return 1; }
 	if (!concurrent_stress(jobs, 6)) { return 1; }
-	std::cout << "PASS 6 deterministic two-worker scenarios (24 lookups/cache reuse), 6000 concurrent lookups\n";
+	std::cout << "PASS decoded-cell cache budget boundaries, 6 deterministic two-worker scenarios (24 lookups/cache reuse), 6000 concurrent lookups\n";
 }

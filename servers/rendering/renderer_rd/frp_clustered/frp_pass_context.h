@@ -177,10 +177,13 @@ public:
 	void set_next_pre_exposure(int p_view, float p_exposure);
 	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
 	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }
-	// C++ frame publisher; scripts receive an isolated deep copy from the getter.
+	// The publisher supplies a fresh per-view dictionary and does not mutate it afterwards;
+	// scripts receive an isolated deep copy from the getter.
 	void set_volume_frame_input(int p_view, const Dictionary &p_inputs);
 	void clear_volume_frame_inputs();
 	Dictionary get_volume_frame_inputs(int p_view = 0) const;
+	// Returns -1 when this view has no valid v1 frame packet.
+	int64_t get_volume_frame_generation(int p_view = 0) const;
 	// Borrowed addon output: one RGBA16F 3D X-tiled view atlas and the v1 20-float
 	// sampling packet. Its five vec4 slots are (B,O,S,froxel_pixel_size),
 	// (gridX,gridY,gridZ,viewCount), (atlasW,atlasH,atlasD,viewStrideX),

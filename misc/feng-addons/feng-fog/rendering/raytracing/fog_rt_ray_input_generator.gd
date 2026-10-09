@@ -6,6 +6,8 @@ extends RefCounted
 const SHADER_DIR := "res://addons/feng-fog/rendering/raytracing"
 const NATIVE_LIGHT_ABI_PATH := "res://addons/feng-fog/rendering/shaders/native_light_inputs.glslinc"
 const LIGHT_EXTENSION_ABI_PATH := "res://addons/feng-fog/rendering/lighting/light_extensions/fog_light_extension.glslinc"
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const FRAME_INPUT_ABI_VERSION := 1
 const RAY_INPUT_ABI_VERSION := 2
 const LIGHT_EXTENSION_ABI_VERSION := 2
@@ -278,15 +280,12 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	for rid in [_ray_buffer, _frame_buffer, _light_slot_buffer,
+	OwnedRids.append_all(result, seen, [_ray_buffer, _frame_buffer, _light_slot_buffer,
 			_depth_parameters_buffer, _work_mask_parameters_buffer,
 			_neutral_extension_records_buffer, _neutral_extension_header_buffer,
 			_neutral_extension_cookie_array, _neutral_extension_sampler,
 			_depth_sampler, _fallback_depth_texture,
-			_neutral_storage_buffer, _neutral_directional_buffer, _pipeline, _shader]:
-		if rid.is_valid() and not seen.has(rid):
-			seen[rid] = true
-			result.append(rid)
+			_neutral_storage_buffer, _neutral_directional_buffer, _pipeline, _shader])
 	if p_clear:
 		_rd = null
 		_shader = RID()
@@ -734,27 +733,25 @@ func _make_uniforms(p_rd: RenderingDevice, p_frame: Dictionary,
 			return []
 		local_rids.append(source)
 	var uniforms: Array[RDUniform] = []
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER, 0, _frame_buffer)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER, 1, directionals)
+	uniforms.append(RDUniforms.uniform_buffer(0, _frame_buffer))
+	uniforms.append(RDUniforms.uniform_buffer(1, directionals))
 	for index in 3:
-		_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER, 2 + index, local_rids[index])
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER, 5, _light_slot_buffer)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER, 6, _ray_buffer)
+		uniforms.append(RDUniforms.storage_buffer(2 + index, local_rids[index]))
+	uniforms.append(RDUniforms.storage_buffer(5, _light_slot_buffer))
+	uniforms.append(RDUniforms.storage_buffer(6, _ray_buffer))
 	var depth_texture: RID = p_depth_input.get("texture", RID())
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE,
-			RAY_DEPTH_SAMPLER_BINDING, _depth_sampler, depth_texture)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER,
-			RAY_DEPTH_PARAMETERS_BINDING, _depth_parameters_buffer)
+	uniforms.append(RDUniforms.sampled(RAY_DEPTH_SAMPLER_BINDING, _depth_sampler, depth_texture))
+	uniforms.append(RDUniforms.uniform_buffer(RAY_DEPTH_PARAMETERS_BINDING,
+			_depth_parameters_buffer))
 	var work_mask_buffer: RID = p_work_mask.get("mask_buffer", RID())
 	if not bool(p_work_mask.get("enabled", false)):
 		work_mask_buffer = _ensure_neutral_storage(p_rd)
 	if not work_mask_buffer.is_valid():
 		_last_error = "The borrowed work-mask storage buffer is invalid."
 		return []
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER,
-			WORK_MASK_STORAGE_BINDING, work_mask_buffer)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER,
-			WORK_MASK_PARAMETERS_BINDING, _work_mask_parameters_buffer)
+	uniforms.append(RDUniforms.storage_buffer(WORK_MASK_STORAGE_BINDING, work_mask_buffer))
+	uniforms.append(RDUniforms.uniform_buffer(WORK_MASK_PARAMETERS_BINDING,
+			_work_mask_parameters_buffer))
 	return uniforms
 
 
@@ -788,12 +785,10 @@ func _make_light_extension_uniform_set(p_rd: RenderingDevice,
 		cookie_sampler = _neutral_extension_sampler
 		header = _neutral_extension_header_buffer
 	var uniforms: Array[RDUniform] = []
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER,
-			LIGHT_EXTENSION_RECORD_BINDING, records)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE,
-			LIGHT_EXTENSION_COOKIE_BINDING, cookie_sampler, cookie_texture)
-	_append_uniform(uniforms, RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER,
-			LIGHT_EXTENSION_HEADER_BINDING, header)
+	uniforms.append(RDUniforms.storage_buffer(LIGHT_EXTENSION_RECORD_BINDING, records))
+	uniforms.append(RDUniforms.sampled(LIGHT_EXTENSION_COOKIE_BINDING,
+			cookie_sampler, cookie_texture))
+	uniforms.append(RDUniforms.uniform_buffer(LIGHT_EXTENSION_HEADER_BINDING, header))
 	var result := p_rd.uniform_set_create(uniforms, _shader, LIGHT_EXTENSION_SET)
 	if not result.is_valid():
 		_last_error = "Could not bind the borrowed set-3 light-extension provider output."
@@ -842,17 +837,6 @@ func _ensure_neutral_light_extension_resources(p_rd: RenderingDevice,
 			and _neutral_extension_header_buffer.is_valid() \
 			and _neutral_extension_cookie_array.is_valid() \
 			and _neutral_extension_sampler.is_valid()
-
-
-func _append_uniform(p_uniforms: Array[RDUniform], p_type: int,
-		p_binding: int, p_rid: RID, p_second_rid: RID = RID()) -> void:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = p_type
-	uniform.binding = p_binding
-	uniform.add_id(p_rid)
-	if p_second_rid.is_valid():
-		uniform.add_id(p_second_rid)
-	p_uniforms.append(uniform)
 
 
 func _prepare_depth_input(p_rd: RenderingDevice, p_frame: Dictionary,

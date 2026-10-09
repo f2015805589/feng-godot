@@ -4,6 +4,9 @@ extends RefCounted
 ## This owns only its pipeline and sampler; FRP textures and the pass UBO are borrowed.
 
 const SHADER_ROOT := "res://addons/feng-fog/rendering/shaders/"
+const OwnedRids = preload("res://addons/feng-render-pipeline/rd/owned_rids.gd")
+const ShaderSource = preload("res://addons/feng-render-pipeline/rd/shader_source.gd")
+const RDUniforms = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const FRAME_BYTES := 256
 const WORKGROUP := 8
 
@@ -78,14 +81,14 @@ func composite_volume_and_fsss(rd: RenderingDevice, color_layers: Array[RID],
 			_last_error = "Late volume composite preflight failed at view %d: frame UBO update failed." % view
 			return false
 		var uniforms: Array[RDUniform] = [
-			_image(0, color),
-			_sampled(1, _sampler, depth),
-			_uniform_buffer(2, _frame_ubos[view]),
-			_sampled(9, _sampler, volume),
-			_sampled(10, _sampler, fsss),
-			_uniform_buffer(11, ubo),
-			_sampled(12, _sampler, cloud_radiance),
-			_sampled(13, _sampler, cloud_transmittance),
+			RDUniforms.image(0, color),
+			RDUniforms.sampled(1, _sampler, depth),
+			RDUniforms.uniform_buffer(2, _frame_ubos[view]),
+			RDUniforms.sampled(9, _sampler, volume),
+			RDUniforms.sampled(10, _sampler, fsss),
+			RDUniforms.uniform_buffer(11, ubo),
+			RDUniforms.sampled(12, _sampler, cloud_radiance),
+			RDUniforms.sampled(13, _sampler, cloud_transmittance),
 		]
 		var uniform_set := UniformSetCacheRD.get_cache(_shader, 0, uniforms)
 		if not uniform_set.is_valid():
@@ -117,14 +120,14 @@ func take_owned_rids() -> Array[RID]:
 func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
 	var seen: Dictionary = {}
-	_append_owned_rid(result, seen, _pipeline)
-	_append_owned_rid(result, seen, _shader)
-	_append_owned_rid(result, seen, _sampler)
-	_append_owned_rid(result, seen, _empty_volume_texture)
-	_append_owned_rid(result, seen, _empty_fsss_texture)
-	_append_owned_rid(result, seen, _empty_cloud_radiance)
-	_append_owned_rid(result, seen, _empty_cloud_transmittance)
-	_append_owned_rids(result, seen, _frame_ubos)
+	OwnedRids.append(result, seen, _pipeline)
+	OwnedRids.append(result, seen, _shader)
+	OwnedRids.append(result, seen, _sampler)
+	OwnedRids.append(result, seen, _empty_volume_texture)
+	OwnedRids.append(result, seen, _empty_fsss_texture)
+	OwnedRids.append(result, seen, _empty_cloud_radiance)
+	OwnedRids.append(result, seen, _empty_cloud_transmittance)
+	OwnedRids.append_all(result, seen, _frame_ubos)
 	if p_clear:
 		_pipeline = RID()
 		_shader = RID()
@@ -139,18 +142,6 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	return result
 
 
-static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
-	if p_rid.is_valid() and not p_seen.has(p_rid):
-		p_seen[p_rid] = true
-		p_target.append(p_rid)
-
-
-static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
-		p_rids: Array[RID]) -> void:
-	for rid in p_rids:
-		_append_owned_rid(p_target, p_seen, rid)
-
-
 func get_last_error() -> String:
 	return _last_error
 
@@ -163,7 +154,7 @@ func _ensure_pipeline(rd: RenderingDevice) -> bool:
 		_last_error = "Cannot load volume composite shader."
 		return false
 	var source := FileAccess.get_file_as_string(path)
-	var expanded := _expand_includes(path, source, 0)
+	var expanded := ShaderSource.expand(path, source)
 	if expanded.is_empty():
 		_last_error = "Cannot expand volume composite shader includes."
 		return false
@@ -197,29 +188,6 @@ func _ensure_pipeline(rd: RenderingDevice) -> bool:
 		_failed_pipeline_error = _last_error
 		return false
 	return true
-
-
-func _expand_includes(path: String, source: String, depth: int) -> String:
-	if depth > 32:
-		return ""
-	var result := PackedStringArray()
-	for line in source.split("\n"):
-		var trimmed := line.strip_edges()
-		if not trimmed.begins_with("#include"):
-			result.append(line)
-			continue
-		var first := trimmed.find("\"")
-		var last := trimmed.rfind("\"")
-		if first < 0 or last <= first:
-			return ""
-		var child_path := path.get_base_dir().path_join(trimmed.substr(first + 1, last - first - 1))
-		if not FileAccess.file_exists(child_path):
-			return ""
-		var child := _expand_includes(child_path, FileAccess.get_file_as_string(child_path), depth + 1)
-		if child.is_empty():
-			return ""
-		result.append(child)
-	return "\n".join(result)
 
 
 func _ensure_sampler(rd: RenderingDevice) -> bool:
@@ -354,28 +322,3 @@ func _empty_cloud_texture_format() -> RDTextureFormat:
 
 func _valid_texture(rd: RenderingDevice, rid: RID) -> bool:
 	return rid.is_valid() and rd.texture_is_valid(rid)
-
-
-func _image(binding: int, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	return uniform
-
-
-func _sampled(binding: int, sampler: RID, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	return uniform
-
-
-func _uniform_buffer(binding: int, buffer: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(buffer)
-	return uniform

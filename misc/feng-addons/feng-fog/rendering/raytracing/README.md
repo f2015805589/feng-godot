@@ -1,29 +1,15 @@
 # Volumetric shadow ray provider
 
-## Verified integration snapshot
-
-The standalone CPU contracts pass 71 ray-input checks and 13 any-hit checks.
-A separate Vulkan end-to-end fixture on Godot 4.7.3 (`7180b8114`) exercised
-the native frame input, generated 48-byte ray records, provider slot mapping,
-and volume injection/integration for three cases: blocked visibility `0`,
-moved-out visibility `1`, and full-width mask-mismatch visibility `1`. The
-sampled injected RGB was zero for the blocked case and `(238.625, 224.75,
-236.75)` for the two visible cases. Integrated RGB changed from
-`(1201, 1131, 1192)` to `(1602, 1509, 1590)`; transmittance alpha remained
-`0.664062`.
-
-The generator's GLSL local named `active` was renamed `ray_active` because
-`active` is reserved by the shader compiler. Raygen reads the borrowed ray
-buffer at set 0, binding 1; any-hit reads the same RID at set 0, binding 10.
-The 48-byte input layout and visibility output remain unchanged. These results
-cover the listed fixture and do not establish pixel-level or complete UE
-feature parity. Device, caster, capacity, and incomplete-build failures still
-require the complete raster fallback described below.
+## Runtime integration
 
 `FFogRayTracingShadowProvider` traces batched shadow rays through the main
 RenderingDevice ray-tracing pipeline. `FFogRayTracingGeometryRegistry` builds
 immutable main-thread scene snapshots and receives SceneTree membership changes;
 it does not rescan the whole scene each frame.
+
+Raygen reads the borrowed 48-byte input buffer at set 0, binding 1; any-hit reads
+the same RID at set 0, binding 10. The shader stages use a 32-bit visibility
+payload, separate from the ray record. The current volume service uses ABI 2.
 
 The raygen, miss, closest-hit, and any-hit stages are raw `RDShaderSource`
 inputs with `#version` and ray-tracing extensions. They use the `.glslinc`
@@ -237,3 +223,25 @@ mesh data is unsupported, the full raster batch is required.
 Arbitrary vertex shader deformation and exact screen-LOD parity are not
 represented. Unsupported visible shadow casters always force complete raster
 fallback rather than silently leaving holes in the RT result.
+
+## Recorded validation
+
+The CPU contracts cover ray-input generation and any-hit branch rules. The
+production Vulkan provider fixture passed 13 binary-visibility cases with
+natural exit 0. Its run record is
+`C:\Temp\feng-rt-anyhit-13case-20261009-01\evidence\gpu_13case_20261009T032512Z\run.json`;
+the log contains non-fatal SPIR-V unsupported-operation notices.
+
+A Godot 4.7.3 (`7180b8114`) Vulkan FRP fixture exercised native frame input,
+48-byte ray generation, provider slots, volume injection and integration in
+three cases: blocked visibility `0`, moved-caster visibility `1`, and full-mask
+mismatch visibility `1`. Injected RGB was zero for the blocked case and
+`(238.625, 224.75, 236.75)` for the two visible cases. Integrated RGB changed
+from `(1201, 1131, 1192)` to `(1602, 1509, 1590)`; transmittance alpha remained
+`0.664062`. The run record is
+`C:\Temp\feng-volumetric-rt-e2e-observer-schema-20261009-01\evidence\gpu_e2e_observer_schema_corrected_wrapper_20261009T034734Z\run.json`;
+it also emitted non-fatal SPIR-V unsupported-operation notices.
+
+These results apply to the named fixtures and source/build identities. They do
+not establish pixel identity or support for arbitrary casters and devices; the
+fallback and geometry limits above define the current boundary.
