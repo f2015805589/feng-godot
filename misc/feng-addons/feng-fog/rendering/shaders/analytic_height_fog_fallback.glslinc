@@ -1,0 +1,85 @@
+#[compute]
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
+layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
+layout(set = 0, binding = 2, std140) uniform AnalyticFallbackFrame {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 camera_position_pre_exposure;
+	vec4 height_fog_parameters[6];
+	vec4 volume_control; // far distance in meters, remaining lanes reserved.
+} fallback_frame;
+
+#include "../../../feng-render-pipeline/library/height-fog/exponential_height_fog.glslinc"
+
+vec3 fallback_view_position(vec2 uv, float device_depth) {
+	vec4 view_h = fallback_frame.inverse_projection
+			* vec4(uv * 2.0 - 1.0, device_depth, 1.0);
+	return abs(view_h.w) > 1.0e-8 ? view_h.xyz / view_h.w : vec3(0.0);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 extent = imageSize(color_image);
+	if (any(greaterThanEqual(pixel, extent))) {
+		return;
+	}
+	vec4 scene = imageLoad(color_image, pixel);
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+	float device_depth = texelFetch(depth_buffer, pixel, 0).r;
+	vec3 view_position;
+	float view_ray_cosine;
+	if (device_depth > 0.0) {
+		view_position = fallback_view_position(uv, device_depth);
+		view_ray_cosine = abs(view_position.z) / max(length(view_position), 1.0e-6);
+	} else {
+		vec3 near_position = fallback_view_position(uv, 1.0);
+		vec3 middle_position = fallback_view_position(uv, 0.5);
+		vec3 view_direction = normalize(middle_position - near_position);
+		view_position = view_direction * 1000000.0;
+		view_ray_cosine = abs(view_direction.z);
+	}
+	vec3 camera_to_receiver = mat3(fallback_frame.view_to_world) * view_position;
+	float fog_scale = fallback_frame.height_fog_parameters[2].z;
+	vec4 full_fog = frp_evaluate_exponential_height_fog(camera_to_receiver,
+			view_ray_cosine, fallback_frame.camera_position_pre_exposure.xyz,
+			fallback_frame.height_fog_parameters[0],
+			fallback_frame.height_fog_parameters[1],
+			fallback_frame.height_fog_parameters[2],
+			fallback_frame.height_fog_parameters[3],
+			fallback_frame.height_fog_parameters[4],
+			fallback_frame.height_fog_parameters[5], fog_scale, 0.0, 0.0);
+	vec4 far_fog = frp_evaluate_exponential_height_fog(camera_to_receiver,
+			view_ray_cosine, fallback_frame.camera_position_pre_exposure.xyz,
+			fallback_frame.height_fog_parameters[0],
+			fallback_frame.height_fog_parameters[1],
+			fallback_frame.height_fog_parameters[2],
+			fallback_frame.height_fog_parameters[3],
+			fallback_frame.height_fog_parameters[4],
+			fallback_frame.height_fog_parameters[5], fog_scale, 1.0,
+			fallback_frame.volume_control.x);
+	if (any(isnan(full_fog.rgb)) || any(isinf(full_fog.rgb)) || isnan(full_fog.a) \
+			|| isinf(full_fog.a) || any(isnan(far_fog.rgb)) || any(isinf(far_fog.rgb)) \
+			|| isnan(far_fog.a) || isinf(far_fog.a)) {
+		imageStore(color_image, pixel, scene);
+		return;
+	}
+	float far_transmittance = clamp(far_fog.a, 0.0, 1.0);
+	float near_transmittance = 0.0;
+	vec3 near_radiance = full_fog.rgb;
+	if (far_transmittance > 1.0e-6) {
+		near_transmittance = full_fog.a / far_transmittance;
+		near_radiance = full_fog.rgb - near_transmittance * far_fog.rgb;
+	}
+	vec3 result = fallback_frame.camera_position_pre_exposure.w * near_radiance
+			+ near_transmittance * scene.rgb;
+	if (any(isnan(result)) || any(isinf(result))) {
+		imageStore(color_image, pixel, scene);
+		return;
+	}
+	result = clamp(result, vec3(-65504.0), vec3(65504.0));
+	imageStore(color_image, pixel, vec4(result, scene.a));
+}

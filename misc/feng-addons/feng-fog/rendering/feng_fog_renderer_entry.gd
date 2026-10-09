@@ -7,10 +7,12 @@ extends RefCounted
 const Codec = preload("feng_volumetric_fog_codec.gd")
 const VolumeGPUService = preload("feng_volumetric_fog_gpu_service.gd")
 const VolumeCompositeService = preload("feng_volumetric_fog_composite_service.gd")
+const AnalyticHeightFogFallbackService = preload("feng_analytic_height_fog_fallback_service.gd")
 const FsssGPUService = preload("feng_fsss_gpu_service.gd")
 
 var _volume := VolumeGPUService.new()
 var _composite := VolumeCompositeService.new()
+var _analytic_fallback := AnalyticHeightFogFallbackService.new()
 var _fsss := FsssGPUService.new()
 
 
@@ -57,8 +59,20 @@ func composite_volume_and_fsss(rd: RenderingDevice,
 			fog_parameters_by_view, size, cloud_composition)
 
 
+func composite_analytic_near_fallback(rd: RenderingDevice,
+		color_layers: Array[RID], depth_layers: Array[RID], frames: Array[Dictionary],
+		fog_parameters_by_view: Array[PackedFloat32Array], size: Vector2i,
+		pre_exposure: float) -> bool:
+	return _analytic_fallback.composite_analytic_near(rd, color_layers,
+			depth_layers, frames, fog_parameters_by_view, size, pre_exposure)
+
+
 func get_last_error() -> String:
 	return _composite.get_last_error()
+
+
+func get_analytic_fallback_error() -> String:
+	return _analytic_fallback.get_last_error()
 
 
 func get_fsss_error() -> String:
@@ -77,9 +91,33 @@ func is_volume_inactive() -> bool:
 	return _volume.is_volume_inactive()
 
 
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
 func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
-	result.append_array(_volume.take_owned_rids())
-	result.append_array(_composite.take_owned_rids())
-	result.append_array(_fsss.take_owned_rids())
+	var seen: Dictionary = {}
+	var child_rids: Array[RID] = _volume.take_owned_rids() if p_clear \
+			else _volume.get_owned_rids()
+	_append_unique_rids(result, seen, child_rids)
+	child_rids = _composite.take_owned_rids() if p_clear else _composite.get_owned_rids()
+	_append_unique_rids(result, seen, child_rids)
+	child_rids = _analytic_fallback.take_owned_rids() if p_clear \
+			else _analytic_fallback.get_owned_rids()
+	_append_unique_rids(result, seen, child_rids)
+	child_rids = _fsss.take_owned_rids() if p_clear else _fsss.get_owned_rids()
+	_append_unique_rids(result, seen, child_rids)
 	return result
+
+
+static func _append_unique_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_values: Array[RID]) -> void:
+	for rid in p_values:
+		if rid.is_valid() and not p_seen.has(rid):
+			p_seen[rid] = true
+			p_target.append(rid)

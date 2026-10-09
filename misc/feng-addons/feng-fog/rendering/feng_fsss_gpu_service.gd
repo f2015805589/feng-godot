@@ -151,26 +151,51 @@ func render(ctx: FRPPassContext, snapshot: Dictionary, buffers: RenderSceneBuffe
 	}
 
 
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
 func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var rids: Array[RID] = []
+	var seen: Dictionary = {}
 	for state in _states.values():
-		rids.append_array(_state_rids(state))
-	_states.clear()
+		_append_owned_rids(rids, seen, _state_rids(state))
 	for entry in _pipelines.values():
-		rids.append(entry.pipeline)
-		rids.append(entry.shader)
-	_pipelines.clear()
-	_failed_pipeline_sources.clear()
-	rids.append_array([_sampler_nearest, _sampler_linear])
-	rids.append_array([_empty_volume_texture, _empty_fsss_texture,
-			_empty_cloud_radiance, _empty_cloud_transmittance])
-	_sampler_nearest = RID()
-	_sampler_linear = RID()
-	_empty_volume_texture = RID()
-	_empty_fsss_texture = RID()
-	_empty_cloud_radiance = RID()
-	_empty_cloud_transmittance = RID()
+		_append_owned_rid(rids, seen, entry.pipeline)
+		_append_owned_rid(rids, seen, entry.shader)
+	_append_owned_rid(rids, seen, _sampler_nearest)
+	_append_owned_rid(rids, seen, _sampler_linear)
+	_append_owned_rid(rids, seen, _empty_volume_texture)
+	_append_owned_rid(rids, seen, _empty_fsss_texture)
+	_append_owned_rid(rids, seen, _empty_cloud_radiance)
+	_append_owned_rid(rids, seen, _empty_cloud_transmittance)
+	if p_clear:
+		_states.clear()
+		_pipelines.clear()
+		_failed_pipeline_sources.clear()
+		_sampler_nearest = RID()
+		_sampler_linear = RID()
+		_empty_volume_texture = RID()
+		_empty_fsss_texture = RID()
+		_empty_cloud_radiance = RID()
+		_empty_cloud_transmittance = RID()
 	return rids
+
+
+static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
+	if p_rid.is_valid() and not p_seen.has(p_rid):
+		p_seen[p_rid] = true
+		p_target.append(p_rid)
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:

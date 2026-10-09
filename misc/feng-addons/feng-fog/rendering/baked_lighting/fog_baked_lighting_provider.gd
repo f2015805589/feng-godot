@@ -153,11 +153,49 @@ func release_resource(p_resource_id: int) -> void:
 
 
 func release() -> void:
-	for resource_id in _gpu_entries.keys():
-		_free_entry(_gpu_entries[resource_id])
-	_gpu_entries.clear()
-	_snapshots.clear()
-	_rendering_device = null
+	var rd := _rendering_device
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			rd.free_rid(rid)
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for entry_value in _gpu_entries.values():
+		if entry_value is Dictionary:
+			_append_owned_rids(result, seen, _entry_owned_rids(entry_value))
+	if p_clear:
+		_gpu_entries.clear()
+		_snapshots.clear()
+		_rendering_device = null
+	return result
+
+
+static func _entry_owned_rids(p_entry: Dictionary) -> Array[RID]:
+	var result: Array[RID] = []
+	var buffers: Dictionary = p_entry.get("buffers", {})
+	for value in buffers.values():
+		if value is RID and value.is_valid() and not result.has(value):
+			result.append(value)
+	return result
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		if rid.is_valid() and not p_seen.has(rid):
+			p_seen[rid] = true
+			p_target.append(rid)
 
 
 static func resolve_source_usage(p_sample_valid: bool, p_includes_environment_radiance: bool,
@@ -326,10 +364,8 @@ func _free_entry(p_entry: Dictionary) -> void:
 	var rd: RenderingDevice = p_entry.get("rendering_device")
 	if rd == null:
 		return
-	var buffers: Dictionary = p_entry.get("buffers", {})
-	for rid in buffers.values():
-		if rid is RID and rid.is_valid():
-			rd.free_rid(rid)
+	for rid in _entry_owned_rids(p_entry):
+		rd.free_rid(rid)
 
 
 func _invalid_result(p_reason: String) -> Dictionary:

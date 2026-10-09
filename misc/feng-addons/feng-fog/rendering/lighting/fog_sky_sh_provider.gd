@@ -215,24 +215,46 @@ static func project_samples_to_raw_sh(p_directions: PackedVector3Array,
 
 
 func release() -> void:
-	if _rd != null:
-		for rid in [_partial_buffer, _packed_buffer, _neutral_buffer, _sampler,
-				_project_pipeline_2d, _project_pipeline_array, _pack_pipeline,
-				_project_shader_2d, _project_shader_array, _pack_shader]:
-			_free_rid(_rd, rid)
-	_rd = null
-	_sampler = RID()
-	_project_shader_2d = RID()
-	_project_pipeline_2d = RID()
-	_project_shader_array = RID()
-	_project_pipeline_array = RID()
-	_pack_shader = RID()
-	_pack_pipeline = RID()
-	_partial_buffer = RID()
-	_packed_buffer = RID()
-	_neutral_buffer = RID()
-	_source_key.clear()
+	var rd := _rd
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			_free_rid(rd, rid)
 	_last_error = ""
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in [_partial_buffer, _packed_buffer, _neutral_buffer, _sampler,
+			_project_pipeline_2d, _project_pipeline_array, _pack_pipeline,
+			_project_shader_2d, _project_shader_array, _pack_shader]:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	if p_clear:
+		_rd = null
+		_sampler = RID()
+		_project_shader_2d = RID()
+		_project_pipeline_2d = RID()
+		_project_shader_array = RID()
+		_project_pipeline_array = RID()
+		_pack_shader = RID()
+		_pack_pipeline = RID()
+		_partial_buffer = RID()
+		_packed_buffer = RID()
+		_neutral_buffer = RID()
+		_source_key.clear()
+		_last_error = ""
+	return result
 
 
 func _ensure_resources(p_rd: RenderingDevice) -> bool:

@@ -19,6 +19,7 @@ const OP_GBUFFER_NAME := &"OP_GBUFFER"
 const SKY_RUNTIME_PATH := "res://addons/feng-sky/feng_sky_runtime.gd"
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-fog/feng_fog_runtime.gd"
 const VOLUME_SAMPLING_UBO_BYTES := 128
+const CAPTURE_INLINE_SNAPSHOT_KEY := &"_feng_capture_inline_composite"
 const OP_PRE_LIGHTING_STAGE := FRPPassContext.OP_PRE_LIGHTING_STAGE
 var _pre_exposure := 1.0
 var _sky_runtime: Script
@@ -39,11 +40,22 @@ var _cloud_shadow1 := RID()
 var _cloud_raw_ao := RID()
 var _cloud_visibility_ubo := RID()
 var _fog_renderer: RefCounted
+var _fog_renderer_owned_rids: Array[RID] = []
 var _volume_result: Dictionary = {}
 var _fsss_result: Dictionary = {}
 var _late_fsss_snapshot: Dictionary = {}
 var _late_analytic_snapshot: Dictionary = {}
 var _late_fog_scale := 1.0
+var _late_fallback_context_id := 0
+var _late_fallback_buffers_id := 0
+var _late_fallback_internal_size := Vector2i.ZERO
+var _late_fallback_view_count := 0
+var _late_fallback_world_id := 0
+var _late_fallback_generation := -1
+var _late_fallback_frames: Array[Dictionary] = []
+var _late_fallback_fog_parameters_by_view: Array[PackedFloat32Array] = []
+var _late_fallback_pre_exposure := 1.0
+var _late_fallback_capture_error := ""
 var _frame_inputs: Array[Dictionary] = []
 var _volume_sampling_ubos: Array[RID] = []
 var _empty_volume_texture := RID()
@@ -70,6 +82,7 @@ func _ensure_fog_renderer() -> bool:
 	if not instance is RefCounted:
 		return false
 	_fog_renderer = instance
+	_fog_renderer_owned_rids.clear()
 	return true
 
 
@@ -89,6 +102,11 @@ func clear_capture_snapshots() -> void:
 	_capture_snapshot_active = false
 	_capture_fog_snapshot = {}
 	_capture_atmosphere_snapshot = {}
+	_volume_composite_deferred = false
+	_fsss_composite_deferred = false
+	_late_fsss_snapshot.clear()
+	_late_analytic_snapshot.clear()
+	_late_fog_scale = 1.0
 
 func _atmosphere_for_target(buffers: RenderSceneBuffersRD) -> Dictionary:
 	if buffers == null:
@@ -157,6 +175,11 @@ func _clear_cloud_visibility() -> void:
 ## Metadata only: publish before deferred lighting, while the actual compute
 ## work retains the existing Sky-anchored pass position.
 func _frp_prepare(ctx: FRPPassContext) -> void:
+	_clear_late_fallback_snapshot()
+	_fsss_composite_deferred = false
+	_late_fsss_snapshot.clear()
+	_late_analytic_snapshot.clear()
+	_late_fog_scale = 1.0
 	_prepared_context_id = ctx.get_instance_id() if ctx != null else 0
 	_prepared_snapshot = {}
 	_lighting_callback_queued = false
@@ -182,12 +205,15 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 		var volume_clear_rd: RenderingDevice = RenderingServer.get_rendering_device()
 		if volume_clear_rd != null and _fog_renderer.has_method("clear_volume"):
 			_fog_renderer.call("clear_volume", ctx, buffers, volume_clear_rd)
+			_refresh_fog_renderer_owned_rids()
 			volume_service_cleared = true
 	if not volume_service_cleared and ctx != null and ctx.has_method("clear_volume_output"):
 		ctx.call("clear_volume_output")
 	if ctx != null:
 		ctx.set_meta(&"frp_fsss_deferred_composition", false)
 		ctx.set_meta(&"frp_cloud_fog_composition", {})
+	var capture_volume_deferred := _is_capture_context(ctx) and _volume_requested(snapshot)
+	_volume_composite_deferred = capture_volume_deferred
 	if ctx != null and ctx.has_method("set_volume_deferred_composition"):
 		ctx.call("set_volume_deferred_composition", false)
 	var pre_lighting_operation := _frp_operation_value(OP_PRE_LIGHTING_STAGE_NAME)
@@ -227,6 +253,10 @@ func _render_volume_after_lighting(ctx: FRPPassContext, cloud_inputs_ready: bool
 	if _fog_renderer == null or buffers == null or frames.is_empty():
 		if not frames.is_empty() or not _volume_requested(_prepared_snapshot):
 			return
+		if _is_capture_context(ctx):
+			_volume_composite_deferred = false
+			if ctx.has_method("set_volume_deferred_composition"):
+				ctx.call("set_volume_deferred_composition", false)
 		_report_volume_failure(_prepared_snapshot,
 				"native frame inputs were unavailable after lighting preparation")
 		return
@@ -251,6 +281,7 @@ func _render_volume_after_lighting(ctx: FRPPassContext, cloud_inputs_ready: bool
 	render_snapshot["volume_cloud_maps_current"] = cloud_inputs_ready
 	_volume_result = _fog_renderer.call("render_volume", ctx, render_snapshot, buffers,
 			RenderingServer.get_rendering_device(), frames)
+	_refresh_fog_renderer_owned_rids()
 	if _volume_result.is_empty():
 		_report_volume_failure(_prepared_snapshot)
 	else:
@@ -264,9 +295,11 @@ func _render_volume_after_lighting(ctx: FRPPassContext, cloud_inputs_ready: bool
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
 		return
-	# Reuse the pre-lighting lease; captures supply a frozen snapshot per face.
-	if _capture_snapshot_active or _prepared_context_id != ctx.get_instance_id():
+	# Captures already ran _frp_prepare for this context before lighting. Re-running
+	# it here would discard that face's integrated volume and cloud-shadow lease.
+	if _prepared_context_id != ctx.get_instance_id():
 		_frp_prepare(ctx)
+	var capture_inline := _is_capture_context(ctx)
 	var snapshot := _capture_fog_snapshot if _capture_snapshot_active \
 			else _snapshot_for_target(ctx.get_render_scene_buffers() as RenderSceneBuffersRD)
 	var render_data := ctx.get_render_data()
@@ -303,6 +336,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 					_volume_cloud_ready_generation == current_frame_generation
 			_volume_result = _fog_renderer.call("render_volume", ctx, render_snapshot, buffers,
 					RenderingServer.get_rendering_device(), _frame_inputs)
+			_refresh_fog_renderer_owned_rids()
 			if _volume_result.is_empty():
 				_report_volume_failure(snapshot)
 			else:
@@ -311,21 +345,91 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 				if not _volume_result.is_empty() else -1
 		if not _volume_result.is_empty():
 			_prepare_late_composite(ctx, snapshot)
-	if _fsss_composite_deferred:
+	var capture_targets: Dictionary = {"ok": true} if capture_inline else {}
+	if capture_inline:
+		capture_targets = _capture_inline_targets(ctx, buffers,
+				RenderingServer.get_rendering_device())
+		if not bool(capture_targets.get("ok", false)):
+			_report_capture_inline_skip(capture_targets)
+			_fsss_result = {}
+			_clear_late_composite_state(ctx)
+			_clear_cloud_visibility()
+			return
+	if _fsss_composite_deferred and not capture_inline:
 		_fsss_result = {}
 	else:
 		_fsss_result = _render_fsss_inline(ctx, snapshot, buffers,
 				RenderingServer.get_rendering_device(), _frame_inputs)
-	super._frp_execute_with_snapshot(ctx, snapshot)
+	var render_snapshot := snapshot
+	if capture_inline and (not snapshot.is_empty() or not _atmosphere_snapshot.is_empty()):
+		render_snapshot = snapshot.duplicate(false)
+		render_snapshot[CAPTURE_INLINE_SNAPSHOT_KEY] = true
+	super._frp_execute_with_snapshot(ctx, render_snapshot)
 	_frame_inputs.clear()
-	if not _volume_composite_deferred and not _fsss_composite_deferred:
-		_clear_late_composite_state()
+	if capture_inline or (not _volume_composite_deferred and not _fsss_composite_deferred):
+		_clear_late_composite_state(ctx)
 	_clear_cloud_visibility()
 	_pre_exposure = 1.0
 	_capture_exposure_normalization = 1.0
 
 
+func _is_capture_context(ctx: FRPPassContext) -> bool:
+	if _capture_snapshot_active:
+		return true
+	return ctx != null and ctx.has_method("is_cloud_capture") \
+			and bool(ctx.call("is_cloud_capture"))
+
+
+func _capture_inline_targets(ctx: FRPPassContext, buffers: RenderSceneBuffersRD,
+		rd: RenderingDevice) -> Dictionary:
+	if ctx == null or buffers == null or rd == null:
+		return {"ok": false, "stage": "capture buffers", "view": -1,
+			"reason": "the scoped capture context, buffers, or RenderingDevice is unavailable"}
+	var size := buffers.get_internal_size()
+	var view_count := buffers.get_view_count()
+	if size.x <= 0 or size.y <= 0 or view_count <= 0 \
+			or ctx.get_view_count() != view_count:
+		return {"ok": false, "stage": "capture dimensions", "view": -1,
+			"reason": "the scoped capture size or view count is invalid"}
+	if inputs.size() < 2 or inputs[0] == null or inputs[1] == null:
+		return {"ok": false, "stage": "capture inputs", "view": -1,
+			"reason": "the height-fog color/depth inputs are unavailable"}
+	if not _frame_inputs.is_empty() and _frame_inputs.size() != view_count:
+		return {"ok": false, "stage": "capture frame inputs", "view": -1,
+			"reason": "the current frame input count does not match the scoped capture views"}
+	for view in view_count:
+		var color_layer: RID = inputs[0].get_texture(buffers, view)
+		if not color_layer.is_valid() or not rd.texture_is_valid(color_layer):
+			return {"ok": false, "stage": "capture color layer", "view": view,
+				"reason": "the scoped reflection-capture color layer is invalid"}
+		var color_format: RDTextureFormat = rd.texture_get_format(color_layer)
+		if color_format.width != size.x or color_format.height != size.y \
+				or (color_format.usage_bits & RenderingDevice.TEXTURE_USAGE_STORAGE_BIT) == 0:
+			return {"ok": false, "stage": "capture color layer", "view": view,
+				"reason": "the scoped color layer does not match the active size or storage-image usage"}
+		var depth_layer: RID = inputs[1].get_texture(buffers, view)
+		if not depth_layer.is_valid() or not rd.texture_is_valid(depth_layer):
+			return {"ok": false, "stage": "capture depth layer", "view": view,
+				"reason": "the scoped reflection-capture depth layer is invalid"}
+		var depth_format: RDTextureFormat = rd.texture_get_format(depth_layer)
+		if depth_format.width != size.x or depth_format.height != size.y \
+				or (depth_format.usage_bits & RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT) == 0:
+			return {"ok": false, "stage": "capture depth layer", "view": view,
+				"reason": "the scoped depth layer does not match the active size or sampling usage"}
+	return {"ok": true}
+
+
+func _report_capture_inline_skip(details: Dictionary) -> void:
+	var stage := str(details.get("stage", "capture preflight"))
+	var view := int(details.get("view", -1))
+	var location := stage if view < 0 else "%s view %d" % [stage, view]
+	var reason := str(details.get("reason", "capture layers are unavailable"))
+	_report("Height Fog capture inline composition skipped at %s: %s." % [location, reason])
+
+
 func _prepare_late_composite(ctx: FRPPassContext, snapshot: Dictionary) -> void:
+	_clear_late_fallback_snapshot()
+	_late_analytic_snapshot.clear()
 	_volume_composite_deferred = false
 	_fsss_composite_deferred = false
 	_volume_cloud_ready_generation = -1
@@ -337,6 +441,21 @@ func _prepare_late_composite(ctx: FRPPassContext, snapshot: Dictionary) -> void:
 	var fsss: Dictionary = _fog_renderer.call("normalize_screen_space_scattering",
 			snapshot.get("screen_space_scattering", {})) \
 			if _fog_renderer != null else {}
+	if _is_capture_context(ctx):
+		# The native capture path exposes borrowed color/depth only while its
+		# synchronous capture callback is running. Keep opaque sampling disabled
+		# until that scoped callback composites Fog inline; never enqueue it.
+		_volume_composite_deferred = output_valid
+		_fsss_composite_deferred = not fsss.is_empty()
+		if _fsss_composite_deferred:
+			_late_fsss_snapshot = {"screen_space_scattering": fsss}
+			var capture_resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
+			_late_fog_scale = float(capture_resolved.x) if capture_resolved is Vector4 else 1.0
+			_late_analytic_snapshot = _late_analytic_fields(snapshot)
+		if ctx.has_method("set_volume_deferred_composition"):
+			ctx.call("set_volume_deferred_composition", _volume_composite_deferred)
+		ctx.set_meta(&"frp_fsss_deferred_composition", _fsss_composite_deferred)
+		return
 	var callback_queued := false
 	if (output_valid or not fsss.is_empty()) and ctx.has_method("enqueue_after_operation"):
 		callback_queued = bool(ctx.call("enqueue_after_operation", OP_SCREEN_AND_DEPTH_COPY,
@@ -348,6 +467,8 @@ func _prepare_late_composite(ctx: FRPPassContext, snapshot: Dictionary) -> void:
 		var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
 		_late_fog_scale = float(resolved.x) if resolved is Vector4 else 1.0
 		_late_analytic_snapshot = _late_analytic_fields(snapshot)
+		if _volume_composite_deferred:
+			_capture_late_fallback_snapshot(ctx)
 	if ctx.has_method("set_volume_deferred_composition"):
 		ctx.call("set_volume_deferred_composition", _volume_composite_deferred)
 	ctx.set_meta(&"frp_fsss_deferred_composition", _fsss_composite_deferred)
@@ -359,10 +480,109 @@ func _late_analytic_fields(snapshot: Dictionary) -> Dictionary:
 			"second_fog_density", "second_fog_height_falloff", "second_fog_height",
 			"fog_color", "sun_direction", "inscattering_color", "start_distance",
 			"cutoff_distance", "min_opacity", "inscattering_start", "inscattering_exponent",
-			"volumetric_fog"]:
+			"volumetric_fog", "world_id", "fog_id"]:
 		if snapshot.has(key):
 			result[key] = snapshot[key]
 	return result
+
+
+func _capture_late_fallback_snapshot(ctx: FRPPassContext) -> void:
+	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD if ctx != null else null
+	if ctx == null or buffers == null:
+		_late_fallback_capture_error = "same-frame context or render buffers are unavailable"
+		return
+	var size := buffers.get_internal_size()
+	var view_count := buffers.get_view_count()
+	if size.x <= 0 or size.y <= 0 or view_count <= 0 \
+			or _frame_inputs.size() != view_count \
+			or _volume_result_frame_generation < 0:
+		_late_fallback_capture_error = "same-frame dimensions, views, or volume generation are invalid"
+		return
+	var frames: Array[Dictionary] = []
+	var parameters_by_view: Array[PackedFloat32Array] = []
+	for view in view_count:
+		var source: Dictionary = _frame_inputs[view]
+		var camera: Variant = source.get("camera_transform")
+		var projection: Variant = source.get("projection")
+		var inverse_projection: Variant = source.get("inverse_projection")
+		var frame_size: Variant = source.get("internal_size")
+		var generation := int(source.get("frame_generation", -1))
+		if not camera is Transform3D or not projection is Projection \
+				or not inverse_projection is Projection or frame_size != size \
+				or int(source.get("view_index", -1)) != view \
+				or int(source.get("view_count", -1)) != view_count \
+				or generation != _volume_result_frame_generation \
+				or int(source.get("world_id", 0)) != int(_late_analytic_snapshot.get("world_id", 0)):
+			_late_fallback_capture_error = "normalized frame metadata is inconsistent at view %d" % view
+			return
+		var camera_transform: Transform3D = camera
+		var camera_projection: Projection = projection
+		var inverse_projection_matrix: Projection = inverse_projection
+		for column in 4:
+			var projection_axis: Vector4 = camera_projection[column]
+			var inverse_projection_axis: Vector4 = inverse_projection_matrix[column]
+			if not projection_axis.is_finite() or not inverse_projection_axis.is_finite():
+				_late_fallback_capture_error = "projection metadata is non-finite at view %d" % view
+				return
+		var pre_exposure := float(source.get("pre_exposure", 0.0))
+		if _capture_snapshot_active:
+			var scene_normalization := float(source.get("scene_normalization", 0.0))
+			if not is_finite(scene_normalization) or scene_normalization <= 0.0:
+				_late_fallback_capture_error = "capture scene normalization is invalid at view %d" % view
+				return
+			pre_exposure *= scene_normalization
+		if not is_finite(pre_exposure) or pre_exposure <= 0.0:
+			_late_fallback_capture_error = "pre-exposure is invalid at view %d" % view
+			return
+		# Keep only immutable transforms and scalar identity data. Native frame,
+		# sky, cloud, color, and depth RIDs remain borrowed and are never retained.
+		frames.append({
+			"view_index": view,
+			"view_count": view_count,
+			"internal_size": size,
+			"frame_generation": generation,
+			"world_id": int(source.get("world_id", 0)),
+			"camera_transform": camera_transform,
+			"projection": camera_projection,
+			"inverse_projection": inverse_projection_matrix,
+			"pre_exposure": pre_exposure,
+		})
+		var fog_parameters := _make_forward_parameters(_late_analytic_snapshot,
+				camera_transform, _late_fog_scale, camera_projection)
+		if fog_parameters.size() != 28:
+			_late_fallback_capture_error = "analytic fog packet is incomplete at view %d" % view
+			return
+		var volume_packet_value: Variant = _volume_result.get("sample_parameters", PackedFloat32Array())
+		if not volume_packet_value is PackedFloat32Array \
+				or volume_packet_value.size() != 20:
+			_late_fallback_capture_error = "integrated volume far distance is invalid at view %d" % view
+			return
+		var volume_packet: PackedFloat32Array = volume_packet_value
+		for value in volume_packet:
+			if not is_finite(value):
+				_late_fallback_capture_error = "integrated volume packet is non-finite at view %d" % view
+				return
+		if volume_packet[13] < 0.0:
+			_late_fallback_capture_error = "integrated volume far distance is invalid at view %d" % view
+			return
+		# Match the same validated volume packet used by analytic_control in the
+		# normal early pass; authored settings can be normalized independently.
+		fog_parameters[3] = float(volume_packet[13])
+		for value in fog_parameters:
+			if not is_finite(value):
+				_late_fallback_capture_error = "analytic fog packet is non-finite at view %d" % view
+				return
+		parameters_by_view.append(fog_parameters)
+	_late_fallback_context_id = ctx.get_instance_id()
+	_late_fallback_buffers_id = buffers.get_instance_id()
+	_late_fallback_internal_size = size
+	_late_fallback_view_count = view_count
+	_late_fallback_world_id = int(_late_analytic_snapshot.get("world_id", 0))
+	_late_fallback_generation = _volume_result_frame_generation
+	_late_fallback_frames = frames
+	_late_fallback_fog_parameters_by_view = parameters_by_view
+	_late_fallback_pre_exposure = float(frames[0].pre_exposure)
+	_late_fallback_capture_error = ""
 
 
 func _render_fsss_inline(ctx: FRPPassContext, snapshot: Dictionary,
@@ -391,7 +611,7 @@ func _render_fsss_inline(ctx: FRPPassContext, snapshot: Dictionary,
 		atmosphere_parameters_by_view.append(AtmospherePacket.make(_atmosphere_snapshot,
 				frames[view].camera_transform, _atmosphere_optical.is_valid(),
 				_atmosphere_multiple.is_valid()))
-		if not _update_volume_sampling_ubo(view, rd):
+		if not _update_volume_sampling_ubo(view, rd, false, _is_capture_context(ctx), snapshot):
 			return {}
 	var source_options := {
 		"source_mode": 0,
@@ -412,6 +632,7 @@ func _render_fsss_inline(ctx: FRPPassContext, snapshot: Dictionary,
 	}
 	var result: Dictionary = _fog_renderer.call("render_fsss", ctx, snapshot, buffers, rd,
 			color_textures, depth_textures, frames, source_options)
+	_refresh_fog_renderer_owned_rids()
 	if result.is_empty():
 		_report_fsss_failure()
 	return result
@@ -419,24 +640,42 @@ func _render_fsss_inline(ctx: FRPPassContext, snapshot: Dictionary,
 
 func _on_after_screen_depth_copy(ctx: FRPPassContext) -> void:
 	if ctx == null or (not _volume_composite_deferred and not _fsss_composite_deferred):
-		_clear_late_composite_state()
+		_clear_late_composite_state(ctx)
 		return
 	if _volume_composite_deferred and not _volume_result.get("texture", RID()).is_valid():
-		_clear_late_composite_state()
+		_handle_late_composition_failure(ctx, "volume output", "the integrated volume texture RID became invalid")
 		return
 	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	var rd := RenderingServer.get_rendering_device()
 	var frames := _read_volume_frame_inputs(ctx, buffers,
 			int(_late_analytic_snapshot.get("world_id", 0)))
 	if _fog_renderer == null or buffers == null or rd == null or frames.is_empty():
-		_report("Late volumetric fog composition could not read the current frame inputs.")
-		_clear_late_composite_state()
+		_handle_late_composition_failure(ctx, "frame inputs",
+				"current FRP context, buffers, device, or frame inputs are unavailable")
 		return
-	if _volume_composite_deferred \
-			and int(frames[0].frame_generation) != _volume_result_frame_generation:
-		_report("Late volumetric fog callback belongs to an older frame.")
-		_clear_late_composite_state()
+	var observed_generation := int(frames[0].get("frame_generation", -1))
+	if _volume_composite_deferred:
+		for view in frames.size():
+			if int(frames[view].get("frame_generation", -1)) != _volume_result_frame_generation:
+				_handle_late_composition_failure(ctx, "frame generation",
+						"late volume callback frame generation does not match the integrated output", view,
+						observed_generation)
+				return
+	if frames.size() != buffers.get_view_count():
+		_handle_late_composition_failure(ctx, "view validation",
+				"normalized frame count does not match the current render buffers", -1,
+				observed_generation)
 		return
+	for view in frames.size():
+		if int(frames[view].get("view_index", -1)) != view \
+				or int(frames[view].get("view_count", -1)) != buffers.get_view_count() \
+				or frames[view].get("internal_size", Vector2i.ZERO) != buffers.get_internal_size() \
+				or int(frames[view].get("world_id", 0)) \
+				!= int(_late_analytic_snapshot.get("world_id", 0)):
+			_handle_late_composition_failure(ctx, "view validation",
+					"normalized frame metadata does not match current buffers", view,
+					observed_generation)
+			return
 	var color_layers: Array[RID] = []
 	var depth_layers: Array[RID] = []
 	for view in buffers.get_view_count():
@@ -453,8 +692,9 @@ func _on_after_screen_depth_copy(ctx: FRPPassContext) -> void:
 		fog_parameters_by_view.append(_make_forward_parameters(_late_analytic_snapshot,
 				frames[view].camera_transform, _late_fog_scale, frames[view].projection))
 		if not _update_volume_sampling_ubo(view, rd, true):
-			_report("Cannot prepare volumetric fog sampling parameters for late composition.")
-			_clear_late_composite_state()
+			_handle_late_composition_failure(ctx, "sampling UBO",
+					"volumetric sampling parameters could not be prepared", view,
+					observed_generation)
 			return
 	if not fsss_settings.is_empty():
 		var source_options := {
@@ -469,14 +709,16 @@ func _on_after_screen_depth_copy(ctx: FRPPassContext) -> void:
 		}
 		_fsss_result = _fog_renderer.call("render_fsss", ctx, fsss_snapshot, buffers, rd,
 				color_layers, depth_layers, frames, source_options)
+		_refresh_fog_renderer_owned_rids()
 	else:
 		_fsss_result = {}
 	if not fsss_settings.is_empty() and _fsss_result.is_empty():
 		_report_fsss_failure()
 	for view in buffers.get_view_count():
 		if not _update_volume_sampling_ubo(view, rd, true):
-			_report("Cannot enable FSSS sampling for late volumetric composition.")
-			_clear_late_composite_state()
+			_handle_late_composition_failure(ctx, "composite UBO",
+					"late composite parameters could not be prepared", view,
+					observed_generation)
 			return
 	var fsss_textures: Array = _fsss_result.get("textures_by_view", [])
 	var volume_texture: RID = _volume_result.get("texture", RID())
@@ -486,10 +728,88 @@ func _on_after_screen_depth_copy(ctx: FRPPassContext) -> void:
 			depth_layers, volume_texture, fsss_textures,
 			_volume_sampling_ubos, frames, fog_parameters_by_view, buffers.get_internal_size(),
 			cloud_composition)):
+		_refresh_fog_renderer_owned_rids()
 		var reason := str(_fog_renderer.call("get_last_error"))
-		_report("Late volumetric fog composition failed%s." % \
-				(": " + reason if not reason.is_empty() else ""))
-	_clear_late_composite_state()
+		_handle_late_composition_failure(ctx, "composite service",
+				reason if not reason.is_empty() else "composite service rejected the current views",
+				-1, observed_generation)
+		return
+	else:
+		_refresh_fog_renderer_owned_rids()
+	_clear_late_composite_state(ctx)
+
+
+func _handle_late_composition_failure(ctx: FRPPassContext, stage: String,
+		reason: String, view: int = -1, observed_generation: int = -1) -> void:
+	var location := stage if view < 0 else "%s view %d" % [stage, view]
+	if not _volume_composite_deferred:
+		_report("Late volumetric fog composition failed at %s: %s." % [location, reason])
+		_clear_late_composite_state(ctx)
+		return
+	var fallback_result := _apply_late_analytic_fallback(ctx, observed_generation)
+	var restored := bool(fallback_result.get("success", false))
+	var fallback_error := str(fallback_result.get("error", ""))
+	if restored:
+		_report("Late volumetric fog composition failed at %s: %s; analytic near-height-fog fallback was applied for this frame." \
+				% [location, reason])
+	else:
+		_report("Late volumetric fog composition failed at %s: %s; analytic near-height-fog fallback also failed: %s." \
+				% [location, reason, fallback_error])
+	_clear_late_composite_state(ctx)
+
+
+func _apply_late_analytic_fallback(ctx: FRPPassContext,
+		observed_generation: int) -> Dictionary:
+	if not _late_fallback_capture_error.is_empty():
+		return {"success": false, "error": _late_fallback_capture_error}
+	if ctx == null or ctx.get_instance_id() != _late_fallback_context_id:
+		return {"success": false, "error": "the late callback context does not match the frozen frame"}
+	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+	if buffers == null or buffers.get_instance_id() != _late_fallback_buffers_id \
+			or buffers.get_internal_size() != _late_fallback_internal_size \
+			or buffers.get_view_count() != _late_fallback_view_count:
+		return {"success": false, "error": "the late callback buffers, size, or view count do not match the frozen frame"}
+	if _late_fallback_generation < 0 \
+			or _late_fallback_generation != _volume_result_frame_generation \
+			or (observed_generation >= 0 and observed_generation != _late_fallback_generation):
+		return {"success": false, "error": "the frozen volume generation does not match the callback"}
+	if _late_fallback_frames.size() != _late_fallback_view_count \
+			or _late_fallback_fog_parameters_by_view.size() != _late_fallback_view_count:
+		return {"success": false, "error": "the frozen per-view analytic inputs are incomplete"}
+	var color_layers: Array[RID] = []
+	var depth_layers: Array[RID] = []
+	for view in _late_fallback_view_count:
+		var frame: Dictionary = _late_fallback_frames[view]
+		if int(frame.get("view_index", -1)) != view \
+				or int(frame.get("view_count", -1)) != _late_fallback_view_count \
+				or frame.get("internal_size", Vector2i.ZERO) != _late_fallback_internal_size \
+				or int(frame.get("frame_generation", -1)) != _late_fallback_generation \
+				or int(frame.get("world_id", 0)) != _late_fallback_world_id:
+			return {"success": false, "error": "frozen analytic metadata does not match view %d" % view}
+		var fog_parameters: PackedFloat32Array = _late_fallback_fog_parameters_by_view[view]
+		if fog_parameters.size() != 28 or not is_finite(fog_parameters[3]) \
+				or fog_parameters[3] < 0.0:
+			return {"success": false, "error": "frozen analytic packet is invalid at view %d" % view}
+		color_layers.append(buffers.get_color_layer(view))
+		depth_layers.append(buffers.get_depth_layer(view))
+	var rd := RenderingServer.get_rendering_device()
+	if rd == null:
+		return {"success": false, "error": "the current RenderingDevice is unavailable"}
+	if _fog_renderer == null and not _ensure_fog_renderer():
+		return {"success": false, "error": "the Feng Fog renderer entry could not be loaded"}
+	if not _fog_renderer.has_method("composite_analytic_near_fallback"):
+		return {"success": false, "error": "the Feng Fog renderer has no analytic fallback service"}
+	var restored := bool(_fog_renderer.call("composite_analytic_near_fallback", rd,
+			color_layers, depth_layers, _late_fallback_frames,
+			_late_fallback_fog_parameters_by_view, _late_fallback_internal_size,
+			_late_fallback_pre_exposure))
+	_refresh_fog_renderer_owned_rids()
+	if not restored:
+		var fallback_error := str(_fog_renderer.call("get_analytic_fallback_error"))
+		if fallback_error.is_empty():
+			fallback_error = "fallback service rejected its preflight"
+		return {"success": false, "error": fallback_error}
+	return {"success": true, "error": ""}
 
 
 func _fsss_history_signature(snapshot: Dictionary, fog_scale: float) -> Dictionary:
@@ -567,7 +887,11 @@ func _validated_cloud_composition(ctx: FRPPassContext, frames: Array[Dictionary]
 	return value
 
 
-func _clear_late_composite_state() -> void:
+func _clear_late_composite_state(ctx: FRPPassContext = null) -> void:
+	if ctx != null:
+		if ctx.has_method("set_volume_deferred_composition"):
+			ctx.call("set_volume_deferred_composition", false)
+		ctx.set_meta(&"frp_fsss_deferred_composition", false)
 	_frame_inputs.clear()
 	_volume_result.clear()
 	_volume_result_frame_generation = -1
@@ -577,8 +901,22 @@ func _clear_late_composite_state() -> void:
 	_volume_composite_deferred = false
 	_fsss_composite_deferred = false
 	_late_fog_scale = 1.0
+	_clear_late_fallback_snapshot()
 	_pre_exposure = 1.0
 	_capture_exposure_normalization = 1.0
+
+
+func _clear_late_fallback_snapshot() -> void:
+	_late_fallback_context_id = 0
+	_late_fallback_buffers_id = 0
+	_late_fallback_internal_size = Vector2i.ZERO
+	_late_fallback_view_count = 0
+	_late_fallback_world_id = 0
+	_late_fallback_generation = -1
+	_late_fallback_frames.clear()
+	_late_fallback_fog_parameters_by_view.clear()
+	_late_fallback_pre_exposure = 1.0
+	_late_fallback_capture_error = ""
 
 
 func _read_volume_frame_inputs(ctx: FRPPassContext, buffers: RenderSceneBuffersRD,
@@ -740,13 +1078,15 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		return
 	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
 		return
-	if not _update_volume_sampling_ubo(view, rd):
+	var capture_inline := bool(_frame_snapshot.get(CAPTURE_INLINE_SNAPSHOT_KEY, false))
+	if not _update_volume_sampling_ubo(view, rd, false, capture_inline, _frame_snapshot):
 		return
 	super._render(buffers, view, rd)
 
 
 func _update_volume_sampling_ubo(view: int, rd: RenderingDevice,
-		for_late_composite: bool = false) -> bool:
+		for_late_composite: bool = false, capture_inline: bool = false,
+		fsss_snapshot_override: Dictionary = {}) -> bool:
 	if not _ensure_volume_sampling_resources(rd):
 		_binding_error = true
 		_report("Cannot create volumetric fog sampling resources.")
@@ -756,6 +1096,7 @@ func _update_volume_sampling_ubo(view: int, rd: RenderingDevice,
 		if not ubo.is_valid():
 			return false
 		_volume_sampling_ubos.append(ubo)
+		_sync_owned_rid_snapshot()
 	var packet: PackedFloat32Array = _volume_result.get("sample_parameters", PackedFloat32Array())
 	var volume_texture: RID = _volume_result.get("texture", RID())
 	var volume_valid := packet.size() == 20 and volume_texture.is_valid()
@@ -776,10 +1117,12 @@ func _update_volume_sampling_ubo(view: int, rd: RenderingDevice,
 		current_exposure = float(_frame_inputs[view].get("pre_exposure", _pre_exposure))
 	var textures_by_view: Array = _fsss_result.get("textures_by_view", [])
 	var fsss_texture: RID = textures_by_view[view] if view < textures_by_view.size() else RID()
-	var composite_enabled := for_late_composite or not _volume_composite_deferred
+	var composite_enabled := for_late_composite or capture_inline or not _volume_composite_deferred
 	var fsss_enabled := fsss_texture.is_valid() and composite_enabled
 	var fsss: Dictionary = {}
-	var fsss_snapshot: Dictionary = _late_fsss_snapshot if for_late_composite else _frame_snapshot
+	var fsss_snapshot: Dictionary = fsss_snapshot_override \
+			if not fsss_snapshot_override.is_empty() \
+			else (_late_fsss_snapshot if for_late_composite else _frame_snapshot)
 	if _fsss_requested(fsss_snapshot) and _fog_renderer != null:
 		fsss = _fog_renderer.call("normalize_screen_space_scattering",
 				fsss_snapshot.get("screen_space_scattering", {}))
@@ -807,8 +1150,10 @@ func _update_volume_sampling_ubo(view: int, rd: RenderingDevice,
 func _ensure_volume_sampling_resources(rd: RenderingDevice) -> bool:
 	if not _empty_volume_texture.is_valid():
 		_empty_volume_texture = _create_empty_volume_texture(rd)
+		_sync_owned_rid_snapshot()
 	if not _empty_fsss_texture.is_valid():
 		_empty_fsss_texture = _create_empty_fsss_texture(rd)
+		_sync_owned_rid_snapshot()
 	return _empty_volume_texture.is_valid() and _empty_fsss_texture.is_valid()
 
 
@@ -874,6 +1219,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
 		state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
 		_atmosphere_sampler = rd.sampler_create(state)
+		_sync_owned_rid_snapshot()
 	if not _empty_atmosphere_lut.is_valid():
 		var format := RDTextureFormat.new()
 		format.width = 1
@@ -881,6 +1227,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 		format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 		_empty_atmosphere_lut = rd.texture_create(format, RDTextureView.new(), [PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array()])
+		_sync_owned_rid_snapshot()
 	var cloud_parameters := _cloud_visibility_parameters
 	if cloud_parameters.size() != 148:
 		cloud_parameters.resize(148)
@@ -888,6 +1235,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		cloud_parameters[141] = -1.0
 	if not _cloud_visibility_ubo.is_valid():
 		_cloud_visibility_ubo = rd.uniform_buffer_create(CLOUD_VISIBILITY_UBO_SIZE)
+		_sync_owned_rid_snapshot()
 	if not _cloud_visibility_ubo.is_valid() or rd.buffer_update(_cloud_visibility_ubo, 0,
 			CLOUD_VISIBILITY_UBO_SIZE, cloud_parameters.to_byte_array()) != OK:
 		_binding_error = true
@@ -932,18 +1280,64 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	binding_data["uniforms"] = uniforms
 	return binding_data
 
+func _refresh_fog_renderer_owned_rids() -> void:
+	if _fog_renderer == null:
+		_fog_renderer_owned_rids.clear()
+		_sync_owned_rid_snapshot()
+		return
+	var inventory: Array[RID] = _fog_renderer.call("get_owned_rids")
+	var next_inventory: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in inventory:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			next_inventory.append(rid)
+	_fog_renderer_owned_rids = next_inventory
+	_sync_owned_rid_snapshot()
+
+
+func _current_owned_rids() -> Array[RID]:
+	var rids: Array[RID] = []
+	var seen: Dictionary = {}
+	# Keep the established release order: pass shader objects are returned by
+	# super first, then local atmosphere resources, renderer/service dependencies,
+	# per-view sampling buffers, and the fallback textures they reference.
+	_append_unique_owned_rids(rids, seen,
+			[_empty_atmosphere_lut, _atmosphere_sampler, _cloud_visibility_ubo])
+	_append_unique_owned_rids(rids, seen, _fog_renderer_owned_rids)
+	_append_unique_owned_rids(rids, seen, _volume_sampling_ubos)
+	_append_unique_owned_rids(rids, seen, [_empty_volume_texture, _empty_fsss_texture])
+	return rids
+
+
+func _sync_owned_rid_snapshot() -> void:
+	_replace_owned_rid_snapshot(_current_owned_rids())
+
+
 func _take_owned_rids() -> Array[RID]:
-	var rids := super._take_owned_rids()
-	rids.append_array([_empty_atmosphere_lut, _atmosphere_sampler, _cloud_visibility_ubo])
-	if _fog_renderer != null:
-		rids.append_array(_fog_renderer.call("take_owned_rids"))
-		_fog_renderer = null
-	rids.append_array(_volume_sampling_ubos)
-	rids.append_array([_empty_volume_texture, _empty_fsss_texture])
+	var fog_rids: Array[RID] = super.call("_current_owned_rids")
+	# The renderer and its child services may no longer be callable from PREDELETE.
+	# Their last detached inventory is retained by PassBase until cleanup consumes it.
+	_fog_renderer = null
+	_fog_renderer_owned_rids.clear()
 	_volume_sampling_ubos.clear()
 	_empty_volume_texture = RID()
 	_empty_fsss_texture = RID()
 	_atmosphere_sampler = RID()
 	_empty_atmosphere_lut = RID()
 	_cloud_visibility_ubo = RID()
+	var rids: Array[RID] = super._take_owned_rids()
+	var seen: Dictionary = {}
+	for rid in rids:
+		if rid.is_valid():
+			seen[rid] = true
+	_append_unique_owned_rids(rids, seen, fog_rids)
 	return rids
+
+
+static func _append_unique_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_values: Array[RID]) -> void:
+	for rid in p_values:
+		if rid.is_valid() and not p_seen.has(rid):
+			p_seen[rid] = true
+			p_target.append(rid)

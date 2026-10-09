@@ -10,6 +10,12 @@ extends CompositorEffect
 const TextureInput = preload("pass_texture.gd")
 const OutputDeclaration = preload("pass_output.gd")
 
+## RefCounted may stop dispatching derived script fields during PREDELETE. Keep
+## only detached, owned RID values here so the base notification can still
+## release them without retaining a pass, Resource, or callable.
+static var _owned_rid_snapshots: Dictionary = {}
+static var _owned_rid_snapshots_mutex := Mutex.new()
+
 @export_enum("Pre Opaque", "Post Opaque", "Post Sky", "Pre Transparent", "Post Transparent", "Pre GBuffer", "Post GBuffer", "Pre Lighting", "Post Lighting") var stage: int = EFFECT_CALLBACK_TYPE_POST_TRANSPARENT:
 	set(value):
 		var next_stage := clampi(value, 0, EFFECT_CALLBACK_TYPE_MAX - 1)
@@ -115,8 +121,54 @@ func _take_owned_rids() -> Array[RID]:
 	_setup_complete = false
 	return []
 
+## Subclasses publish their current owned-only RID inventory while they are
+## alive. This registry is not Object metadata, so it cannot be serialized or
+## copied with a Resource. Borrowed frame and producer RIDs must be excluded.
+func _replace_owned_rid_snapshot(p_rids: Array[RID]) -> void:
+	var snapshot: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in p_rids:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			snapshot.append(rid)
+	_replace_owned_rid_snapshot_for_id(get_instance_id(), snapshot)
+
+static func _replace_owned_rid_snapshot_for_id(p_instance_id: int,
+		p_snapshot: Array[RID]) -> void:
+	_owned_rid_snapshots_mutex.lock()
+	if p_snapshot.is_empty():
+		_owned_rid_snapshots.erase(p_instance_id)
+	else:
+		_owned_rid_snapshots[p_instance_id] = p_snapshot
+	_owned_rid_snapshots_mutex.unlock()
+
+static func _take_owned_rid_snapshot(p_instance_id: int,
+		p_primary: Array[RID]) -> Array[RID]:
+	var snapshot: Array[RID] = []
+	_owned_rid_snapshots_mutex.lock()
+	var stored: Variant = _owned_rid_snapshots.get(p_instance_id, [])
+	_owned_rid_snapshots.erase(p_instance_id)
+	_owned_rid_snapshots_mutex.unlock()
+	if stored is Array:
+		for value in stored:
+			if value is RID and value.is_valid():
+				snapshot.append(value)
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in p_primary:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	for rid in snapshot:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	return result
+
 func _cleanup(rd: RenderingDevice) -> void:
-	_free_rids(rd, _take_owned_rids())
+	var instance_id := get_instance_id()
+	var rids := _take_owned_rids()
+	_free_rids(rd, _take_owned_rid_snapshot(instance_id, rids))
 
 func _report(message: String) -> void:
 	if message != _last_error:
@@ -343,9 +395,12 @@ func get_configuration_warnings() -> PackedStringArray:
 func _notification(what: int) -> void:
 	if what != NOTIFICATION_PREDELETE:
 		return
-	# RefCounted is already at zero: normal virtual calls construct a null self
-	# Variant. Native Object.call dispatches through the still-live ScriptInstance.
-	_free_on_render_thread(super.call("_take_owned_rids"))
+	# Capture the native ObjectID before any script dispatch. Derived state may no
+	# longer be available at RefCounted zero, so merge its last live snapshot using
+	# only the base registry and native Object identity.
+	var instance_id := int(super.call("get_instance_id"))
+	var rids: Array[RID] = super.call("_take_owned_rids")
+	_free_on_render_thread(_take_owned_rid_snapshot(instance_id, rids))
 
 static func _free_rids(rd: RenderingDevice, rids: Array[RID]) -> void:
 	if rd == null:

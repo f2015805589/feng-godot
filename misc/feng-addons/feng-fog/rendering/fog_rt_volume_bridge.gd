@@ -231,19 +231,43 @@ func get_last_error() -> String:
 			+ str(_ray_tracing_shadow_provider.call("get_last_error"))
 
 
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
 func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
-	if _visibility_buffer.is_valid():
-		result.append(_visibility_buffer)
-	if _slot_map_buffer.is_valid():
-		result.append(_slot_map_buffer)
-	_visibility_buffer = RID()
-	_visibility_capacity_bytes = 0
-	_slot_map_buffer = RID()
-	_slot_map_capacity_bytes = 0
-	_ray_input_generator.release()
-	_ray_tracing_shadow_provider.release()
+	var seen: Dictionary = {}
+	var child_rids: Array[RID] = _ray_input_generator.take_owned_rids() if p_clear \
+			else _ray_input_generator.get_owned_rids()
+	_append_owned_rids(result, seen, child_rids)
+	child_rids = _ray_tracing_shadow_provider.call("take_owned_rids") if p_clear \
+			else _ray_tracing_shadow_provider.call("get_owned_rids")
+	_append_owned_rids(result, seen, child_rids)
+	_append_owned_rid(result, seen, _visibility_buffer)
+	_append_owned_rid(result, seen, _slot_map_buffer)
+	if p_clear:
+		_visibility_buffer = RID()
+		_visibility_capacity_bytes = 0
+		_slot_map_buffer = RID()
+		_slot_map_capacity_bytes = 0
 	return result
+
+
+static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
+	if p_rid.is_valid() and not p_seen.has(p_rid):
+		p_seen[p_rid] = true
+		p_target.append(p_rid)
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		_append_owned_rid(p_target, p_seen, rid)
 
 
 func _depth_options(ctx: FRPPassContext, rd: RenderingDevice,

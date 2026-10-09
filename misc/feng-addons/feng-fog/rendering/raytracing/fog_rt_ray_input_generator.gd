@@ -259,33 +259,55 @@ func generate_batch(p_rd: RenderingDevice, p_frame_inputs: Dictionary,
 
 
 func release() -> void:
-	if _rd != null:
-		for rid in [_ray_buffer, _frame_buffer, _light_slot_buffer,
-				_depth_parameters_buffer, _work_mask_parameters_buffer,
-				_neutral_extension_records_buffer, _neutral_extension_header_buffer,
-				_neutral_extension_cookie_array, _neutral_extension_sampler,
-				_depth_sampler, _fallback_depth_texture,
-				_neutral_storage_buffer, _neutral_directional_buffer, _pipeline, _shader]:
-			_free_rid(_rd, rid)
-	_rd = null
-	_shader = RID()
-	_pipeline = RID()
-	_ray_buffer = RID()
-	_ray_capacity_bytes = 0
-	_frame_buffer = RID()
-	_depth_parameters_buffer = RID()
-	_work_mask_parameters_buffer = RID()
-	_neutral_extension_records_buffer = RID()
-	_neutral_extension_header_buffer = RID()
-	_neutral_extension_cookie_array = RID()
-	_neutral_extension_sampler = RID()
-	_depth_sampler = RID()
-	_fallback_depth_texture = RID()
-	_light_slot_buffer = RID()
-	_light_slot_capacity_bytes = 0
-	_neutral_storage_buffer = RID()
-	_neutral_directional_buffer = RID()
+	var rd := _rd
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			_free_rid(rd, rid)
 	_last_error = ""
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in [_ray_buffer, _frame_buffer, _light_slot_buffer,
+			_depth_parameters_buffer, _work_mask_parameters_buffer,
+			_neutral_extension_records_buffer, _neutral_extension_header_buffer,
+			_neutral_extension_cookie_array, _neutral_extension_sampler,
+			_depth_sampler, _fallback_depth_texture,
+			_neutral_storage_buffer, _neutral_directional_buffer, _pipeline, _shader]:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	if p_clear:
+		_rd = null
+		_shader = RID()
+		_pipeline = RID()
+		_ray_buffer = RID()
+		_ray_capacity_bytes = 0
+		_frame_buffer = RID()
+		_depth_parameters_buffer = RID()
+		_work_mask_parameters_buffer = RID()
+		_neutral_extension_records_buffer = RID()
+		_neutral_extension_header_buffer = RID()
+		_neutral_extension_cookie_array = RID()
+		_neutral_extension_sampler = RID()
+		_depth_sampler = RID()
+		_fallback_depth_texture = RID()
+		_light_slot_buffer = RID()
+		_light_slot_capacity_bytes = 0
+		_neutral_storage_buffer = RID()
+		_neutral_directional_buffer = RID()
+		_last_error = ""
+	return result
 
 
 static func pack_ray_frame_uniform(p_frame_inputs: Dictionary, p_grid: Vector3i,

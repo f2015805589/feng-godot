@@ -119,18 +119,69 @@ func release_resource(p_resource_id: int) -> void:
 
 
 func release() -> void:
-	if _rd != null:
-		for entry in _entries.values():
-			_free_entry(_rd, entry)
-		_free_entry(_rd, _neutral_entry)
-		_free_rid(_rd, _linear_sampler)
-		_free_rid(_rd, _nearest_sampler)
-	_rd = null
-	_entries.clear()
-	_neutral_entry.clear()
-	_linear_sampler = RID()
-	_nearest_sampler = RID()
+	var rd := _rd
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			rd.free_rid(rid)
 	_last_error = ""
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for entry_value in _entries.values():
+		if entry_value is Dictionary:
+			_append_owned_rids(result, seen, _entry_owned_rids(entry_value))
+	_append_owned_rids(result, seen, _entry_owned_rids(_neutral_entry))
+	_append_owned_rid(result, seen, _linear_sampler)
+	_append_owned_rid(result, seen, _nearest_sampler)
+	if p_clear:
+		_rd = null
+		_entries.clear()
+		_neutral_entry.clear()
+		_linear_sampler = RID()
+		_nearest_sampler = RID()
+		_last_error = ""
+	return result
+
+
+static func _entry_owned_rids(p_entry: Dictionary) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for texture in p_entry.get("textures", []):
+		if texture is RID and texture.is_valid() and not seen.has(texture):
+			seen[texture] = true
+			result.append(texture)
+	var params_neutral: RID = p_entry.get("params_neutral", RID())
+	var params_match: RID = p_entry.get("params_match", RID())
+	if params_neutral.is_valid() and not seen.has(params_neutral):
+		seen[params_neutral] = true
+		result.append(params_neutral)
+	if params_match.is_valid() and not seen.has(params_match):
+		seen[params_match] = true
+		result.append(params_match)
+	return result
+
+
+static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
+	if p_rid.is_valid() and not p_seen.has(p_rid):
+		p_seen[p_rid] = true
+		p_target.append(p_rid)
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:
@@ -462,14 +513,8 @@ static func _pack_half4(p_value: Vector4) -> PackedByteArray:
 
 
 func _free_entry(p_rd: RenderingDevice, p_entry: Dictionary) -> void:
-	if p_entry.is_empty():
-		return
-	for texture in p_entry.get("textures", []):
-		_free_rid(p_rd, texture)
-	_free_rid(p_rd, p_entry.get("params_neutral", RID()))
-	var params_match: RID = p_entry.get("params_match", RID())
-	if params_match != p_entry.get("params_neutral", RID()):
-		_free_rid(p_rd, params_match)
+	for rid in _entry_owned_rids(p_entry):
+		_free_rid(p_rd, rid)
 
 
 func _free_rid(p_rd: RenderingDevice, p_rid: RID) -> void:

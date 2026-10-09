@@ -28,27 +28,35 @@ func composite_volume_and_fsss(rd: RenderingDevice, color_layers: Array[RID],
 	_last_error = ""
 	if rd == null or size.x <= 0 or size.y <= 0 \
 			or color_layers.is_empty() or color_layers.size() != depth_layers.size() \
-			or color_layers.size() != sampling_ubos.size() \
+			or sampling_ubos.size() < color_layers.size() \
 			or color_layers.size() != frames.size() \
 			or color_layers.size() != fog_parameters_by_view.size():
+		_last_error = "Late volume composite inputs have inconsistent view counts or size."
 		return false
 	if not _ensure_pipeline(rd) or not _ensure_sampler(rd):
+		if _last_error.is_empty():
+			_last_error = "Late volume composite pipeline or sampler is unavailable."
 		return false
 	if not _ensure_frame_ubos(rd, frames.size()):
+		_last_error = "Late volume composite frame UBO allocation failed."
 		return false
+	var uniform_sets: Array[RID] = []
 	for view in color_layers.size():
 		var color: RID = color_layers[view]
 		var depth: RID = depth_layers[view]
 		var ubo: RID = sampling_ubos[view]
 		if not _valid_texture(rd, color) or not _valid_texture(rd, depth) or not ubo.is_valid():
+			_last_error = "Late volume composite preflight failed at view %d: color, depth, or sampling UBO is invalid." % view
 			return false
 		var volume := volume_texture if _valid_texture(rd, volume_texture) else _empty_volume(rd)
 		if not volume.is_valid():
+			_last_error = "Late volume composite preflight failed at view %d: volume placeholder allocation failed." % view
 			return false
 		var fsss: RID = fsss_textures[view] if view < fsss_textures.size() else RID()
 		if not _valid_texture(rd, fsss):
 			fsss = _empty_fsss(rd)
 		if not fsss.is_valid():
+			_last_error = "Late volume composite preflight failed at view %d: FSSS placeholder allocation failed." % view
 			return false
 		var raw_cloud_radiance: Variant = cloud_composition.get("radiance", RID())
 		var raw_cloud_transmittance: Variant = cloud_composition.get("transmittance", RID())
@@ -62,10 +70,12 @@ func composite_volume_and_fsss(rd: RenderingDevice, color_layers: Array[RID],
 			cloud_radiance = _ensure_empty_cloud_radiance(rd)
 			cloud_transmittance = _ensure_empty_cloud_transmittance(rd)
 		if not cloud_radiance.is_valid() or not cloud_transmittance.is_valid():
+			_last_error = "Late volume composite preflight failed at view %d: cloud placeholder allocation failed." % view
 			return false
 		var frame_values := _pack_frame(frames[view], fog_parameters_by_view[view], view, cloud_valid)
 		if frame_values.size() * 4 != FRAME_BYTES \
 				or not _update_ubo(_frame_ubos[view], frame_values, rd):
+			_last_error = "Late volume composite preflight failed at view %d: frame UBO update failed." % view
 			return false
 		var uniforms: Array[RDUniform] = [
 			_image(0, color),
@@ -78,29 +88,67 @@ func composite_volume_and_fsss(rd: RenderingDevice, color_layers: Array[RID],
 			_sampled(13, _sampler, cloud_transmittance),
 		]
 		var uniform_set := UniformSetCacheRD.get_cache(_shader, 0, uniforms)
-		if not uniform_set.is_valid() or not _dispatch(rd, uniform_set, size):
+		if not uniform_set.is_valid():
+			_last_error = "Late volume composite preflight failed at view %d: uniform set creation failed." % view
 			return false
+		uniform_sets.append(uniform_set)
+	# No color is written until every view has valid inputs and a ready uniform set.
+	var list := rd.compute_list_begin()
+	if list < 0:
+		_last_error = "Late volume composite dispatch could not begin after all-view preflight."
+		return false
+	rd.compute_list_bind_compute_pipeline(list, _pipeline)
+	for view in uniform_sets.size():
+		rd.compute_list_bind_uniform_set(list, uniform_sets[view], 0)
+		rd.compute_list_dispatch(list, ceili(float(size.x) / WORKGROUP),
+				ceili(float(size.y) / WORKGROUP), 1)
+	rd.compute_list_end()
 	return true
 
 
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
 func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var result: Array[RID] = []
-	for rid in [_pipeline, _shader, _sampler, _empty_volume_texture, _empty_fsss_texture,
-			_empty_cloud_radiance, _empty_cloud_transmittance]:
-		if rid.is_valid():
-			result.append(rid)
-	_pipeline = RID()
-	_shader = RID()
-	_failed_pipeline_fingerprint = ""
-	_failed_pipeline_error = ""
-	_sampler = RID()
-	_empty_volume_texture = RID()
-	_empty_fsss_texture = RID()
-	_empty_cloud_radiance = RID()
-	_empty_cloud_transmittance = RID()
-	result.append_array(_frame_ubos)
-	_frame_ubos.clear()
+	var seen: Dictionary = {}
+	_append_owned_rid(result, seen, _pipeline)
+	_append_owned_rid(result, seen, _shader)
+	_append_owned_rid(result, seen, _sampler)
+	_append_owned_rid(result, seen, _empty_volume_texture)
+	_append_owned_rid(result, seen, _empty_fsss_texture)
+	_append_owned_rid(result, seen, _empty_cloud_radiance)
+	_append_owned_rid(result, seen, _empty_cloud_transmittance)
+	_append_owned_rids(result, seen, _frame_ubos)
+	if p_clear:
+		_pipeline = RID()
+		_shader = RID()
+		_failed_pipeline_fingerprint = ""
+		_failed_pipeline_error = ""
+		_sampler = RID()
+		_empty_volume_texture = RID()
+		_empty_fsss_texture = RID()
+		_empty_cloud_radiance = RID()
+		_empty_cloud_transmittance = RID()
+		_frame_ubos.clear()
 	return result
+
+
+static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
+	if p_rid.is_valid() and not p_seen.has(p_rid):
+		p_seen[p_rid] = true
+		p_target.append(p_rid)
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:
@@ -302,20 +350,6 @@ func _empty_cloud_texture_format() -> RDTextureFormat:
 	format.format = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	return format
-
-
-func _dispatch(rd: RenderingDevice, uniform_set: RID, size: Vector2i) -> bool:
-	if not _pipeline.is_valid() or not uniform_set.is_valid():
-		return false
-	var list := rd.compute_list_begin()
-	if list < 0:
-		return false
-	rd.compute_list_bind_compute_pipeline(list, _pipeline)
-	rd.compute_list_bind_uniform_set(list, uniform_set, 0)
-	rd.compute_list_dispatch(list, ceili(float(size.x) / WORKGROUP),
-			ceili(float(size.y) / WORKGROUP), 1)
-	rd.compute_list_end()
-	return true
 
 
 func _valid_texture(rd: RenderingDevice, rid: RID) -> bool:

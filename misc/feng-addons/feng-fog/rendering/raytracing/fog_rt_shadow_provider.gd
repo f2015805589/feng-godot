@@ -263,42 +263,80 @@ func trace_shadow_batch(p_rd: RenderingDevice, p_geometry_snapshot: Dictionary,
 
 
 func release() -> void:
-	if _rd != null:
-		_release_pipeline_variant(_rd)
-		for mesh_id in _blas_cache:
-			_release_blas(_rd, _blas_cache[mesh_id])
-		_blas_cache.clear()
-		_free_rid(_rd, _output_buffer)
-		_free_rid(_rd, _alpha_triangle_buffer)
-		_free_rid(_rd, _alpha_surface_buffer)
-		_free_rid(_rd, _alpha_instance_buffer)
-		_free_rid(_rd, _alpha_material_ids_buffer)
-		_free_rid(_rd, _alpha_material_params_buffer)
-		_free_rid(_rd, _alpha_texture_meta_buffer)
-		_free_rid(_rd, _alpha_texture_bytes_buffer)
-	_blas_cache.clear()
-	_rd = null
-	_tlas = RID()
-	_tlas_capacity = 0
-	_output_buffer = RID()
-	_hit_sbt = RID()
-	_hit_sbt_range = 0
-	_pipeline = RID()
-	_ray_shader = RID()
-	_active_pipeline_abi = 0
-	_output_capacity_bytes = 0
-	_alpha_triangle_buffer = RID()
-	_alpha_surface_buffer = RID()
-	_alpha_instance_buffer = RID()
-	_alpha_material_ids_buffer = RID()
-	_alpha_material_params_buffer = RID()
-	_alpha_texture_meta_buffer = RID()
-	_alpha_texture_bytes_buffer = RID()
-	_alpha_payload_revision = -1
-	_active_world_generation = -1
-	_active_snapshot_revision = -1
+	var rd := _rd
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			_free_rid(rd, rid)
 	_last_error = ""
-	_reported_unsupported = false
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	# Keep teardown in dependency order: TLAS before its BLAS, then the SBT,
+	# pipeline and ray shader, followed by each BLAS before its backing buffers.
+	for rid in [_tlas, _hit_sbt, _pipeline, _ray_shader]:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	for cache_value in _blas_cache.values():
+		if cache_value is Dictionary:
+			for rid in _blas_owned_rids(cache_value):
+				if rid.is_valid() and not seen.has(rid):
+					seen[rid] = true
+					result.append(rid)
+	for rid in [_output_buffer, _alpha_triangle_buffer, _alpha_surface_buffer,
+			_alpha_instance_buffer, _alpha_material_ids_buffer,
+			_alpha_material_params_buffer, _alpha_texture_meta_buffer,
+			_alpha_texture_bytes_buffer]:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	if p_clear:
+		_rd = null
+		_blas_cache.clear()
+		_tlas = RID()
+		_tlas_capacity = 0
+		_output_buffer = RID()
+		_hit_sbt = RID()
+		_hit_sbt_range = 0
+		_pipeline = RID()
+		_ray_shader = RID()
+		_active_pipeline_abi = 0
+		_output_capacity_bytes = 0
+		_alpha_triangle_buffer = RID()
+		_alpha_surface_buffer = RID()
+		_alpha_instance_buffer = RID()
+		_alpha_material_ids_buffer = RID()
+		_alpha_material_params_buffer = RID()
+		_alpha_texture_meta_buffer = RID()
+		_alpha_texture_bytes_buffer = RID()
+		_alpha_payload_revision = -1
+		_active_world_generation = -1
+		_active_snapshot_revision = -1
+		_last_error = ""
+		_reported_unsupported = false
+	return result
+
+
+static func _blas_owned_rids(p_cache: Dictionary) -> Array[RID]:
+	var result: Array[RID] = []
+	var blas: RID = p_cache.get("blas", RID())
+	if blas.is_valid():
+		result.append(blas)
+	for value in p_cache.get("buffers", []):
+		if value is RID and value.is_valid() and not result.has(value):
+			result.append(value)
+	return result
 
 
 func get_last_error() -> String:
@@ -718,8 +756,7 @@ func _release_tlas(p_rd: RenderingDevice) -> void:
 
 
 func _release_blas(p_rd: RenderingDevice, p_cache: Dictionary) -> void:
-	_free_rid(p_rd, p_cache.get("blas", RID()))
-	for rid in p_cache.get("buffers", []):
+	for rid in _blas_owned_rids(p_cache):
 		_free_rid(p_rd, rid)
 
 

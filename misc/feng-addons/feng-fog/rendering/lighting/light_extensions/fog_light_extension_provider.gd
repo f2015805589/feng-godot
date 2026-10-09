@@ -133,24 +133,44 @@ func get_last_error() -> String:
 
 
 func release() -> void:
-	if _rd != null:
-		for rid in [_records_buffer, _header_buffer, _sampler, _resample_pipeline,
-				_resample_shader, _cookie_array]:
-			_free_rid(_rd, rid)
-		if _cookie_array != _neutral_cookie_array:
-			_free_rid(_rd, _neutral_cookie_array)
-	_rd = null
-	_records_buffer = RID()
-	_records_capacity_bytes = 0
-	_header_buffer = RID()
-	_sampler = RID()
-	_resample_shader = RID()
-	_resample_pipeline = RID()
-	_cookie_array = RID()
-	_neutral_cookie_array = RID()
-	_cookie_source_key.clear()
-	_cookie_array_generation = 0
+	var rd := _rd
+	var owned := take_owned_rids()
+	if rd != null:
+		for rid in owned:
+			_free_rid(rd, rid)
 	_last_error = ""
+
+
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
+func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
+	var result: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in [_records_buffer, _header_buffer, _sampler, _resample_pipeline,
+			_resample_shader, _cookie_array, _neutral_cookie_array]:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			result.append(rid)
+	if p_clear:
+		_rd = null
+		_records_buffer = RID()
+		_records_capacity_bytes = 0
+		_header_buffer = RID()
+		_sampler = RID()
+		_resample_shader = RID()
+		_resample_pipeline = RID()
+		_cookie_array = RID()
+		_neutral_cookie_array = RID()
+		_cookie_source_key.clear()
+		_cookie_array_generation = 0
+		_last_error = ""
+	return result
 
 
 ## Pure validation used by CPU tests and by source collection.

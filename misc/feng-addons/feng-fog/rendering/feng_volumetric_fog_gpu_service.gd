@@ -338,47 +338,82 @@ func clear(ctx: FRPPassContext, buffers: RenderSceneBuffersRD, rd: RenderingDevi
 	_release_state_for(buffers, rd)
 
 
+func get_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(false)
+
+
 func take_owned_rids() -> Array[RID]:
+	return _collect_owned_rids(true)
+
+
+func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 	var rids: Array[RID] = []
+	var seen: Dictionary = {}
 	for state in _states.values():
-		rids.append_array(_state_rids(state))
-	_states.clear()
+		_append_owned_rids(rids, seen, _state_rids(state))
 	for entry in _pipelines.values():
-		rids.append(entry.pipeline)
-		rids.append(entry.shader)
-	_pipelines.clear()
-	_failed_pipeline_sources.clear()
-	rids.append_array([_sampler_nearest, _sampler_linear, _sampler_compare,
+		_append_owned_rid(rids, seen, entry.pipeline)
+		_append_owned_rid(rids, seen, entry.shader)
+	for rid in [_sampler_nearest, _sampler_linear, _sampler_compare,
 			_fallback_texture_2d, _fallback_texture_array, _fallback_shadow,
-			_fallback_density_3d, _fallback_depth_2d, _fallback_directional_buffer, _fallback_local_buffer,
-			_fallback_cluster_buffer, _fallback_sky_sh_buffer])
-	for rid in _fallback_baked_buffers.values():
-		if rid is RID:
-			rids.append(rid)
-	_sampler_nearest = RID()
-	_sampler_linear = RID()
-	_sampler_compare = RID()
-	_fallback_texture_2d = RID()
-	_fallback_texture_array = RID()
-	_fallback_density_3d = RID()
-	_fallback_depth_2d = RID()
-	_fallback_shadow = RID()
-	_fallback_directional_buffer = RID()
-	_fallback_local_buffer = RID()
-	_fallback_cluster_buffer = RID()
-	_fallback_sky_sh_buffer = RID()
-	_fallback_baked_buffers.clear()
-	_tracked_baked_probe_resource_ids.clear()
-	_tracked_vlm_resource_ids.clear()
-	_sky_sh_provider.release()
-	_baked_lighting_provider.release()
-	_volumetric_lightmap_provider.release()
-	_fallback_vlm_inputs.clear()
-	_vlm_rendering_device = null
-	_light_extension_provider.release()
-	_environment_visibility_provider.release()
-	rids.append_array(_rt_volume_bridge.take_owned_rids())
+			_fallback_density_3d, _fallback_depth_2d, _fallback_directional_buffer,
+			_fallback_local_buffer, _fallback_cluster_buffer, _fallback_sky_sh_buffer]:
+		_append_owned_rid(rids, seen, rid)
+	for rid_value in _fallback_baked_buffers.values():
+		if rid_value is RID:
+			_append_owned_rid(rids, seen, rid_value)
+	var provider_rids: Array[RID] = _sky_sh_provider.take_owned_rids() if p_clear \
+			else _sky_sh_provider.get_owned_rids()
+	_append_owned_rids(rids, seen, provider_rids)
+	provider_rids = _baked_lighting_provider.take_owned_rids() if p_clear \
+			else _baked_lighting_provider.get_owned_rids()
+	_append_owned_rids(rids, seen, provider_rids)
+	provider_rids = _volumetric_lightmap_provider.call("take_owned_rids") if p_clear \
+			else _volumetric_lightmap_provider.call("get_owned_rids")
+	_append_owned_rids(rids, seen, provider_rids)
+	provider_rids = _light_extension_provider.call("take_owned_rids") if p_clear \
+			else _light_extension_provider.call("get_owned_rids")
+	_append_owned_rids(rids, seen, provider_rids)
+	provider_rids = _environment_visibility_provider.call("take_owned_rids") if p_clear \
+			else _environment_visibility_provider.call("get_owned_rids")
+	_append_owned_rids(rids, seen, provider_rids)
+	provider_rids = _rt_volume_bridge.take_owned_rids() if p_clear \
+			else _rt_volume_bridge.get_owned_rids()
+	_append_owned_rids(rids, seen, provider_rids)
+	if p_clear:
+		_states.clear()
+		_pipelines.clear()
+		_failed_pipeline_sources.clear()
+		_sampler_nearest = RID()
+		_sampler_linear = RID()
+		_sampler_compare = RID()
+		_fallback_texture_2d = RID()
+		_fallback_texture_array = RID()
+		_fallback_shadow = RID()
+		_fallback_density_3d = RID()
+		_fallback_depth_2d = RID()
+		_fallback_directional_buffer = RID()
+		_fallback_local_buffer = RID()
+		_fallback_cluster_buffer = RID()
+		_fallback_sky_sh_buffer = RID()
+		_fallback_baked_buffers.clear()
+		_tracked_baked_probe_resource_ids.clear()
+		_tracked_vlm_resource_ids.clear()
+		_fallback_vlm_inputs.clear()
+		_vlm_rendering_device = null
 	return rids
+
+
+static func _append_owned_rid(p_target: Array[RID], p_seen: Dictionary, p_rid: RID) -> void:
+	if p_rid.is_valid() and not p_seen.has(p_rid):
+		p_seen[p_rid] = true
+		p_target.append(p_rid)
+
+
+static func _append_owned_rids(p_target: Array[RID], p_seen: Dictionary,
+		p_rids: Array[RID]) -> void:
+	for rid in p_rids:
+		_append_owned_rid(p_target, p_seen, rid)
 
 
 func get_last_error() -> String:
