@@ -29,70 +29,7 @@ layout(set = 0, binding = 5, std140) uniform CloudVisibilityData {
 layout(set = 0, binding = 6) uniform sampler2D cloud_shadow0_texture;
 layout(set = 0, binding = 7) uniform sampler2D cloud_shadow1_texture;
 layout(set = 0, binding = 8) uniform sampler2D cloud_raw_ao_texture;
-
-bool frp_height_fog_cloud_project(vec3 world_position_m, int matrix_index, float far_depth_km, out vec2 uv, out float depth_km) {
-	int base = matrix_index * 4;
-	mat4 world_to_cloud = mat4(cloud_visibility.projection[base], cloud_visibility.projection[base + 1],
-			cloud_visibility.projection[base + 2], cloud_visibility.projection[base + 3]);
-	vec4 projected = world_to_cloud * vec4(world_position_m, 1.0);
-	if (!(projected.w > 0.0) || isnan(projected.w) || isinf(projected.w)) {
-		return false;
-	}
-	vec3 ndc = projected.xyz / projected.w;
-	if (any(lessThan(ndc.xy, vec2(-1.0))) || any(greaterThan(ndc.xy, vec2(1.0))) || ndc.z < 0.0 || ndc.z > 1.0) {
-		return false;
-	}
-	uv = ndc.xy * 0.5 + 0.5;
-	depth_km = clamp(1.0 - ndc.z, 0.0, 1.0) * max(far_depth_km, 0.0);
-	return true;
-}
-
-float frp_height_fog_cloud_shadow_visibility(vec3 world_position_m, int atmo_sun_slot) {
-	if (atmo_sun_slot < 0 || atmo_sun_slot > 1) {
-		return 1.0;
-	}
-	float cloud_slot_value = atmo_sun_slot == 0 ? cloud_visibility.sun_mapping.x : cloud_visibility.sun_mapping.y;
-	if (cloud_slot_value < 0.0 || cloud_slot_value > 1.0) {
-		return 1.0;
-	}
-	int cloud_slot = int(cloud_slot_value + 0.5);
-	float map_valid = cloud_slot == 0 ? cloud_visibility.sun_mapping.z : cloud_visibility.sun_mapping.w;
-	if (map_valid <= 0.5) {
-		return 1.0;
-	}
-	float far_depth_km = cloud_slot == 0 ? cloud_visibility.projection[24].x : cloud_visibility.projection[24].y;
-	vec2 uv;
-	float surface_depth_km;
-	if (!frp_height_fog_cloud_project(world_position_m, cloud_slot, far_depth_km, uv, surface_depth_km)) {
-		return 1.0;
-	}
-	vec4 shadow = cloud_slot == 0 ? textureLod(cloud_shadow0_texture, uv, 0.0) : textureLod(cloud_shadow1_texture, uv, 0.0);
-	if (!(shadow.a > 0.0) || any(isnan(shadow)) || any(isinf(shadow)) || any(lessThan(shadow.rgb, vec3(0.0)))) {
-		return 1.0;
-	}
-	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(shadow.r, 0.0)) * 1000.0);
-	float optical_depth = min(max(shadow.b, 0.0), distance_after_cloud_m * max(shadow.g, 0.0));
-	float strength = cloud_slot == 0 ? cloud_visibility.projection[26].z : cloud_visibility.projection[26].w;
-	return mix(1.0, exp(-min(optical_depth, 80.0)), clamp(strength, 0.0, 1.0));
-}
-
-float frp_height_fog_cloud_multiple_visibility(vec3 world_position_m) {
-	if (cloud_visibility.flags.x <= 0.5) {
-		return 1.0;
-	}
-	vec2 uv;
-	float surface_depth_km;
-	if (!frp_height_fog_cloud_project(world_position_m, 4, cloud_visibility.projection[31].x, uv, surface_depth_km)) {
-		return 1.0;
-	}
-	vec4 ao = textureLod(cloud_raw_ao_texture, uv, 0.0);
-	if (!(ao.a > 0.0) || any(isnan(ao)) || any(isinf(ao)) || any(lessThan(ao.rgb, vec3(0.0)))) {
-		return 1.0;
-	}
-	float distance_after_cloud_m = max(0.0, (surface_depth_km - max(ao.r, 0.0)) * 1000.0);
-	float optical_depth = min(max(ao.b, 0.0), distance_after_cloud_m * max(ao.g, 0.0));
-	return exp(-min(optical_depth, 80.0));
-}
+#include "height_fog_cloud_visibility.glslinc"
 
 #define FRP_ATMO_CLOUD_SHADOW_VISIBILITY(world_position_m, atmo_sun_slot) frp_height_fog_cloud_shadow_visibility(world_position_m, atmo_sun_slot)
 #define FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY(world_position_m) frp_height_fog_cloud_multiple_visibility(world_position_m)
@@ -132,87 +69,19 @@ float henyey_greenstein_phase(float g, float cos_theta) {
 // Line integral of d = GlobalDensity * exp2(-HeightFalloff * (y - Height)) along
 // the ray, expressed as the shared factor the caller multiplies by ray length.
 // Ported from Unreal's HeightFogCommon.ush CalculateLineIntegralShared.
-float line_integral_shared(float height_falloff, float ray_delta_y, float origin_terms) {
-	float falloff = max(-127.0, height_falloff * ray_delta_y);
-	float line_integral = (1.0 - exp2(-falloff)) / falloff;
-	float line_integral_taylor = log(2.0) - 0.5 * log(2.0) * log(2.0) * falloff;
-	return origin_terms * (abs(falloff) > FLT_EPSILON2 ? line_integral : line_integral_taylor);
-}
+#include "volumetric_fog_sampling.glslinc"
+#include "exponential_height_fog.glslinc"
 
 // Ported from Unreal's GetExponentialHeightFog: returns (fogged rgb, fog factor).
 // camera_to_receiver is (WorldPosition - camera).
-vec4 get_exponential_height_fog(vec3 camera_to_receiver) {
-	const float min_fog_opacity = params.exponential_fog_color.w;
-	float observer_y = params.exponential_fog_parameters.z;
-	// Unreal caps perspective observers above the active fog layers. Rebase the
-	// ray before distance, phase, start-distance, and extinction calculations;
-	// the endpoint remains fixed, including for the depth-zero sky ray.
-	camera_to_receiver.y += params.camera_position.y - observer_y;
-
-	float camera_to_receiver_length_sqr = dot(camera_to_receiver, camera_to_receiver);
-	float camera_to_receiver_length_inv = inversesqrt(max(camera_to_receiver_length_sqr, 1e-8));
-	float camera_to_receiver_length = camera_to_receiver_length_sqr * camera_to_receiver_length_inv;
-	if (camera_to_receiver_length <= params.exponential_fog_parameters.w) {
-		return vec4(0.0, 0.0, 0.0, 1.0);
-	}
-	vec3 camera_to_receiver_normalized = camera_to_receiver * camera_to_receiver_length_inv;
-
-	float ray_origin_terms = params.exponential_fog_parameters.x;
-	float ray_origin_terms_second = params.exponential_fog_parameters2.x;
-	float ray_length = camera_to_receiver_length;
-	float ray_direction_y = camera_to_receiver.y;
-
-	// Factor in StartDistance: fog starts accumulating only past the exclusion
-	// plane, so the line integral is restarted at the exclusion point.
-	float exclude_distance = params.exponential_fog_parameters.w;
-	if (exclude_distance > 0.0) {
-		float exclude_intersection_time = exclude_distance * camera_to_receiver_length_inv;
-		float camera_exclusion_intersection_y = exclude_intersection_time * camera_to_receiver.y;
-		float exclusion_intersection_world_y = observer_y + camera_exclusion_intersection_y;
-		float exclusion_intersection_to_receiver_y = camera_to_receiver.y - camera_exclusion_intersection_y;
-		ray_length = (1.0 - exclude_intersection_time) * camera_to_receiver_length;
-		ray_direction_y = exclusion_intersection_to_receiver_y;
-
-		float exponent = max(-127.0, params.exponential_fog_parameters.y * (exclusion_intersection_world_y - params.exponential_fog_parameters3.y));
-		ray_origin_terms = params.exponential_fog_parameters3.x * exp2(-exponent);
-		float exponent_second = max(-127.0, params.exponential_fog_parameters2.y * (exclusion_intersection_world_y - params.exponential_fog_parameters2.w));
-		ray_origin_terms_second = params.exponential_fog_parameters2.z * exp2(-exponent_second);
-	}
-
-	// Sum of the two fog layers' shared line integrals.
-	float exponential_height_line_integral_shared = max(pc.parameters.x, 0.0) * (
-		line_integral_shared(params.exponential_fog_parameters.y, ray_direction_y, ray_origin_terms)
-		+ line_integral_shared(params.exponential_fog_parameters2.y, ray_direction_y, ray_origin_terms_second));
-	float exponential_height_line_integral = exponential_height_line_integral_shared * ray_length;
-
-	vec3 directional_inscattering = vec3(0.0);
-	// InscatteringLightDirection.w is negative when the sun term is disabled.
-	if (params.inscattering_light_direction.w >= 0.0) {
-		float directional_inscattering_start_distance = params.inscattering_light_direction.w;
-		// UE's default branch uses the cosine lobe normalized by 1 / (4 * PI).
-		// The published RGB combines the artist light term with matching
-		// SkyAtmosphere ground illuminance; both use this directional phase.
-		vec3 directional_light_inscattering = params.directional_inscattering_color.rgb
-				* default_directional_phase(camera_to_receiver_normalized,
-						params.inscattering_light_direction.xyz, params.directional_inscattering_color.w);
-		// Line integral of the eye ray through the haze, using a special
-		// starting distance to limit the inscattering to the distance.
-		float dir_exponential_height_line_integral = exponential_height_line_integral_shared
-				* max(ray_length - directional_inscattering_start_distance, 0.0);
-		float directional_inscattering_fog_factor = clamp(exp2(-dir_exponential_height_line_integral), 0.0, 1.0);
-		directional_inscattering = directional_light_inscattering * (1.0 - directional_inscattering_fog_factor);
-	}
-
-	float exp_fog_factor = max(clamp(exp2(-exponential_height_line_integral), 0.0, 1.0), min_fog_opacity);
-
-	// FogCutoffDistance removes fog (and the sun lobe) past a fixed distance.
-	float cutoff_distance = params.exponential_fog_parameters3.w;
-	if (cutoff_distance > 0.0 && camera_to_receiver_length > cutoff_distance) {
-		exp_fog_factor = 1.0;
-		directional_inscattering = vec3(0.0);
-	}
-
-	return vec4(params.exponential_fog_color.rgb * (1.0 - exp_fog_factor) + directional_inscattering, exp_fog_factor);
+vec4 get_exponential_height_fog(vec3 camera_to_receiver, float view_ray_cosine) {
+	return frp_evaluate_exponential_height_fog(camera_to_receiver, view_ray_cosine,
+			params.camera_position.xyz, params.exponential_fog_parameters,
+			params.exponential_fog_parameters2, params.exponential_fog_parameters3,
+			params.exponential_fog_color, params.inscattering_light_direction,
+			params.directional_inscattering_color, pc.parameters.x,
+			feng_volume_sampling.analytic_control.x,
+			feng_volume_sampling.analytic_control.y);
 }
 
 vec3 view_from_clip(vec2 uv, float depth) {
@@ -233,6 +102,7 @@ void main() {
 
 	vec2 screen_uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
 	vec3 camera_to_receiver;
+	float view_ray_cosine;
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
 	if (depth <= 0.0) {
 		// Reverse-Z depth zero is the infinite far plane and cannot be divided
@@ -242,13 +112,16 @@ void main() {
 		vec3 view_direction = normalize(view_from_clip(screen_uv, 0.5) - view_from_clip(screen_uv, 1.0));
 		vec3 direction = normalize(mat3(params.view_to_world) * view_direction);
 		camera_to_receiver = direction * SKY_DISTANCE;
+		view_ray_cosine = abs(view_direction.z);
 	} else {
 		// The fog integral takes a camera-relative ray, so no world-position
 		// reconstruction or large world-coordinate subtraction is needed.
-		camera_to_receiver = mat3(params.view_to_world) * view_from_clip(screen_uv, depth);
+		vec3 view_position = view_from_clip(screen_uv, depth);
+		view_ray_cosine = abs(view_position.z) / max(length(view_position), 1.0e-6);
+		camera_to_receiver = mat3(params.view_to_world) * view_position;
 	}
 
-	vec4 fog = get_exponential_height_fog(camera_to_receiver);
+	vec4 fog = get_exponential_height_fog(camera_to_receiver, view_ray_cosine);
 	vec4 scene_color = imageLoad(color_image, pixel);
 	// Background sky has already traversed the whole atmosphere. Only surfaces
 	// need aerial perspective; fog still retains its authored sky contribution.
@@ -258,7 +131,44 @@ void main() {
 		frp_atmo_aerial(camera_to_receiver, vec3(0.0), params.camera_position.xyz, atmospheric_radiance, atmospheric_transmission);
 		scene_color.rgb = scene_color.rgb * atmospheric_transmission + atmospheric_radiance * pc.parameters.y;
 	}
-	vec3 fogged_rgb = fog.rgb * pc.parameters.y + scene_color.rgb * fog.a;
+	float scene_view_depth_m = depth > 0.0
+			? max(-view_from_clip(screen_uv, depth).z, 0.0)
+			: SKY_DISTANCE * view_ray_cosine;
+	vec4 volume_fog = feng_sample_integrated_volume(screen_uv, scene_view_depth_m,
+			vec2(extent));
+	float combined_transmittance = clamp(fog.a * volume_fog.a, 0.0, 1.0);
+	// UE's default path applies volumetric fog in front of the analytic height
+	// fog result: L = Lv + Tv * Lh, T = Tv * Th.
+	float fsss_amount = 0.0;
+	vec3 fsss_scattering = vec3(0.0);
+	float fsss_width = feng_fsss_blur_width(combined_transmittance, scene_view_depth_m);
+	bool fsss_requested = feng_volume_sampling.frame_control.z > 0.5;
+	if (fsss_requested && !(fsss_width > 0.0)) {
+		// UE's W<=0 path clips the FSSS composite pixel. Preserve the input
+		// scene exactly, including a cloud already present in the color buffer.
+		imageStore(color_image, pixel, scene_color);
+		return;
+	}
+	bool use_fsss = fsss_requested;
+	if (use_fsss) {
+		fsss_amount = feng_fsss_scene_scattering_amount(combined_transmittance);
+		float maximum_mip = max(float(textureQueryLevels(feng_fsss_scattering_mips) - 1), 1.0);
+		float final_transmittance = combined_transmittance * (1.0 - fsss_amount);
+		float fsss_mip = feng_fsss_blur_mip(combined_transmittance,
+				final_transmittance, scene_view_depth_m, maximum_mip);
+		fsss_scattering = textureLod(feng_fsss_scattering_mips, screen_uv, fsss_mip).rgb;
+		fsss_scattering *= clamp(fsss_width, 0.0, 1.0);
+	}
+	vec3 fogged_rgb;
+	if (use_fsss) {
+		// The FSSS pyramid stores the UE source term L + T*A*C. Keep only
+		// its unblurred remainder here; adding L again would double-scatter it.
+		fogged_rgb = fsss_scattering
+				+ scene_color.rgb * combined_transmittance * (1.0 - fsss_amount);
+	} else {
+		vec3 combined_inscattering = volume_fog.rgb + volume_fog.a * fog.rgb * pc.parameters.y;
+		fogged_rgb = combined_inscattering + scene_color.rgb * combined_transmittance;
+	}
 	fogged_rgb = mix(fogged_rgb, vec3(0.0), isnan(fogged_rgb));
 	fogged_rgb = clamp(fogged_rgb, vec3(-65504.0), vec3(65504.0));
 	imageStore(color_image, pixel, vec4(fogged_rgb, scene_color.a));

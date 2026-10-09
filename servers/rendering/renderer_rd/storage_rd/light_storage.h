@@ -40,6 +40,8 @@
 #include "servers/rendering/storage/light_storage.h"
 #include "servers/rendering/storage/utilities.h"
 
+#include <cstddef>
+
 class RenderDataRD;
 
 namespace RendererRD {
@@ -167,6 +169,8 @@ private:
 		uint32_t bake_mode;
 		float projector_rect[4];
 	};
+	static_assert(sizeof(LightData) == 224, "FRP volume light SSBO ABI must stay 224 bytes.");
+	static_assert(offsetof(LightData, atlas_rect) == 96 && offsetof(LightData, shadow_matrix) == 112 && offsetof(LightData, projector_rect) == 208, "FRP volume light SSBO offsets changed; update the addon ABI first.");
 
 	struct LightInstanceDepthSort {
 		float depth;
@@ -223,6 +227,8 @@ private:
 		float uv_scale3[2];
 		float uv_scale4[2];
 	};
+	static_assert(sizeof(DirectionalLightData) == 464, "FRP volume directional UBO ABI must stay 464 bytes.");
+	static_assert(offsetof(DirectionalLightData, shadow_bias) == 80 && offsetof(DirectionalLightData, shadow_matrices) == 176 && offsetof(DirectionalLightData, uv_scale1) == 432, "FRP volume directional UBO offsets changed; update the addon ABI first.");
 
 	struct CloudSkyOnlyLightData {
 		RID base_light;
@@ -863,6 +869,13 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_directional_light_buffer() { return directional_light_buffer; }
+	uint32_t get_omni_light_count() const { return omni_light_count; }
+	uint32_t get_spot_light_count() const { return spot_light_count; }
+	uint32_t get_area_light_count() const { return area_light_count; }
+	RID get_omni_light_base_rid(uint32_t p_index) const { return p_index < omni_light_count && omni_light_sort != nullptr && omni_light_sort[p_index].light_instance != nullptr ? omni_light_sort[p_index].light_instance->light : RID(); }
+	RID get_spot_light_base_rid(uint32_t p_index) const { return p_index < spot_light_count && spot_light_sort != nullptr && spot_light_sort[p_index].light_instance != nullptr ? spot_light_sort[p_index].light_instance->light : RID(); }
+	RID get_area_light_base_rid(uint32_t p_index) const { return p_index < area_light_count && area_light_sort != nullptr && area_light_sort[p_index].light_instance != nullptr ? area_light_sort[p_index].light_instance->light : RID(); }
+	RID get_directional_light_base_rid(uint32_t p_index) const { return p_index < current_directional_light_count ? directional_light_base_rids[p_index] : RID(); }
 	uint32_t get_max_directional_lights() { return max_directional_lights; }
 	uint32_t get_directional_light_blend_splits(uint32_t p_directional_light_count) const {
 		uint32_t blend_splits = 0;

@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct FogShadowRay {
+	vec4 origin_min_t;
+	vec4 direction_max_t;
+	uvec4 cone_words;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT fog_scene_tlas;
+layout(set = 0, binding = 1, std430) readonly buffer FogShadowRayInputs {
+	FogShadowRay rays[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer FogShadowVisibility {
+	uint visible[];
+};
+
+layout(location = 0) rayPayloadEXT uint visibility;
+
+void main() {
+	uint ray_index = gl_LaunchIDEXT.x;
+	FogShadowRay ray = rays[ray_index];
+	visibility = 1u;
+	#if FENG_FOG_RAY_ABI == 2
+		uint light_mask = ray.cone_words.z;
+		if (uintBitsToFloat(ray.cone_words.w) < 0.5 || light_mask == 0u) {
+			visible[ray_index] = 1u;
+			return;
+		}
+	#endif
+	traceRayEXT(
+		fog_scene_tlas,
+		0u,
+		0xff,
+		0,
+		0,
+		0,
+		ray.origin_min_t.xyz,
+		ray.origin_min_t.w,
+		ray.direction_max_t.xyz,
+		ray.direction_max_t.w,
+		0);
+	visible[ray_index] = visibility;
+}

@@ -1,0 +1,52 @@
+#[compute]
+#version 450
+
+#include "volumetric_fog_frame.glslinc"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 1) uniform sampler2D current_scene_depth;
+layout(r32f, set = 0, binding = 2) uniform image2D conservative_depth_output;
+
+void main() {
+	ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 grid = ivec2(fog_frame.grid_view.xy);
+	if (any(greaterThanEqual(cell, grid))) {
+		return;
+	}
+	int view_index = int(fog_frame.grid_view.w);
+	ivec2 atlas_cell = ivec2(view_index * grid.x + cell.x, cell.y);
+	if (fog_frame.log_z_params.w <= 0.5) {
+		imageStore(conservative_depth_output, atlas_cell, vec4(0.0));
+		return;
+	}
+	ivec2 source_size = textureSize(current_scene_depth, 0);
+	if (any(lessThanEqual(source_size, ivec2(0)))) {
+		imageStore(conservative_depth_output, atlas_cell, vec4(0.0));
+		return;
+	}
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	vec2 source_scale = vec2(source_size) / internal_size;
+	// Match UE's conservative-depth footprint: expand the froxel's screen tile
+	// by half a tile on each edge, clip to the current depth image, then take
+	// the minimum reverse-Z depth. Without an HZB this scans the exact footprint.
+	ivec2 begin_pixel = ivec2(floor((vec2(cell) - vec2(0.5)) * pixel_size * source_scale));
+	ivec2 end_pixel = ivec2(ceil((vec2(cell) + vec2(1.5)) * pixel_size * source_scale));
+	begin_pixel = clamp(begin_pixel, ivec2(0), source_size);
+	end_pixel = clamp(end_pixel, ivec2(0), source_size);
+	if (any(greaterThanEqual(begin_pixel, end_pixel))) {
+		imageStore(conservative_depth_output, atlas_cell, vec4(0.0));
+		return;
+	}
+	float furthest_reverse_z = 1.0;
+	for (int y = begin_pixel.y; y < end_pixel.y; ++y) {
+		for (int x = begin_pixel.x; x < end_pixel.x; ++x) {
+			float depth = texelFetch(current_scene_depth, ivec2(x, y), 0).r;
+			if (isnan(depth) || isinf(depth)) {
+				depth = 0.0;
+			}
+			furthest_reverse_z = min(furthest_reverse_z, clamp(depth, 0.0, 1.0));
+		}
+	}
+	imageStore(conservative_depth_output, atlas_cell, vec4(furthest_reverse_z));
+}

@@ -1,0 +1,37 @@
+#[compute]
+#version 450
+
+#include "volumetric_fog_frame.glslinc"
+#include "volumetric_fog_history.glslinc"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 1, std140) uniform WorkMaskParameters {
+	uvec4 controls; // requested miss samples, remaining lanes reserved.
+} work_mask_parameters;
+
+layout(set = 0, binding = 2, std430) writeonly buffer HistoryWorkMask {
+	uint sample_count[];
+} history_work_mask;
+layout(set = 0, binding = 3) uniform sampler2D current_conservative_depth;
+layout(set = 0, binding = 4) uniform sampler2D previous_conservative_depth;
+
+void main() {
+	uvec3 cell = gl_GlobalInvocationID;
+	ivec3 grid = ivec3(fog_frame.grid_view.xyz);
+	if (any(greaterThanEqual(ivec3(cell), grid))) {
+		return;
+	}
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	float depth = feng_fog_depth_from_slice(float(cell.z) + 0.5);
+	vec2 viewport_uv = (vec2(cell.xy) + vec2(0.5)) * pixel_size / internal_size;
+	vec3 view_position = feng_fog_view_position(viewport_uv, depth);
+	uint requested = clamp(work_mask_parameters.controls.x, 1u,
+			uint(FENG_FOG_MAX_HISTORY_MISS_SUPERSAMPLE_COUNT));
+	uint result = feng_volume_requested_sample_count(view_position, ivec3(cell), grid,
+			int(fog_frame.grid_view.w), current_conservative_depth,
+			previous_conservative_depth, requested);
+	uint index = cell.x + uint(grid.x) * (cell.y + uint(grid.y) * cell.z);
+	history_work_mask.sample_count[index] = result;
+}

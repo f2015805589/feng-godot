@@ -10,6 +10,20 @@ float feng_cloud_fog_line_integral_shared(float height_falloff, float ray_delta_
 	return origin_terms * (abs(falloff) > FENG_CLOUD_FOG_FLT_EPSILON2 ? line_integral : line_integral_taylor);
 }
 
+float feng_cloud_height_fog_view_ray_cosine(vec3 camera_to_receiver_m) {
+	if ((cloud_frame.view_index_frame_index_flags_vrt_mode.z
+			& FENG_CLOUD_FRAME_ORTHOGRAPHIC) != 0u) {
+		return 1.0;
+	}
+	vec4 far_h = cloud_frame.inverse_view_projection * vec4(0.0, 0.0, 0.0, 1.0);
+	vec3 camera_forward = abs(far_h.w) > 1.0e-7
+			? far_h.xyz / far_h.w - cloud_frame.camera_world_position_m.xyz
+			: far_h.xyz;
+	float cosine = abs(dot(feng_cloud_safe_normalize3(camera_to_receiver_m,
+			camera_forward), feng_cloud_safe_normalize3(camera_forward, vec3(0.0, 0.0, -1.0))));
+	return max(cosine, 1.0e-4);
+}
+
 vec4 feng_cloud_height_fog(vec3 camera_to_receiver_m) {
 	vec4 camera = cloud_height_fog_block.lane[0];
 	vec4 fog0 = cloud_height_fog_block.lane[1];
@@ -26,7 +40,10 @@ vec4 feng_cloud_height_fog(vec3 camera_to_receiver_m) {
 	float ray_length_sqr = dot(ray, ray);
 	float ray_length_inv = inversesqrt(max(ray_length_sqr, 1e-8));
 	float ray_length = ray_length_sqr * ray_length_inv;
-	if (ray_length <= fog0.w) {
+	float volume_exclude_distance = max(camera.w, 0.0) > 0.0
+			? camera.w / feng_cloud_height_fog_view_ray_cosine(camera_to_receiver_m) : 0.0;
+	float exclude_distance = max(max(fog0.w, 0.0), volume_exclude_distance);
+	if (ray_length <= exclude_distance) {
 		return vec4(0.0, 0.0, 0.0, 1.0);
 	}
 	vec3 ray_direction = ray * ray_length_inv;
@@ -34,7 +51,7 @@ vec4 feng_cloud_height_fog(vec3 camera_to_receiver_m) {
 	float ray_origin_terms1 = fog1.x;
 	float ray_length_after_start = ray_length;
 	float ray_direction_y = ray.y;
-	float start_distance = max(fog0.w, 0.0);
+	float start_distance = exclude_distance;
 	if (start_distance > 0.0) {
 		float exclude_time = start_distance * ray_length_inv;
 		float camera_exclusion_y = exclude_time * ray.y;

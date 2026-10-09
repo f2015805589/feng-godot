@@ -1,0 +1,179 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct FogShadowRay {
+	vec4 origin_min_t;
+	vec4 direction_max_t;
+	uvec4 cone_words;
+};
+
+struct FogShadowMaterial {
+	uvec4 ids; // mode, alpha texture index + 1, flags, texture repeat
+	vec4 params0; // base alpha, scissor threshold, hash scale, texture filter enum
+	vec4 params1; // UV scale XY, UV offset XY
+};
+
+layout(set = 0, binding = 10, std430) readonly buffer FogShadowRayInputs {
+	FogShadowRay rays[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer FogShadowTriangleData {
+	vec4 triangle_vertex[]; // (uv.x, uv.y, vertex alpha, 0), three records per triangle
+};
+layout(set = 0, binding = 4, std430) readonly buffer FogShadowSurfaceData {
+	uvec4 surface_data[]; // triangle vec4 offset, triangle count, source surface, reserved
+};
+layout(set = 0, binding = 5, std430) readonly buffer FogShadowInstanceData {
+	uvec4 instance_data[]; // material offset, surface metadata offset, surface count, full layer mask
+};
+layout(set = 0, binding = 6, std430) readonly buffer FogShadowMaterialIds {
+	uvec4 material_ids[];
+};
+layout(set = 0, binding = 7, std430) readonly buffer FogShadowMaterialParams {
+	vec4 material_params[]; // two vec4 records for each material
+};
+layout(set = 0, binding = 8, std430) readonly buffer FogShadowAlphaTextureMeta {
+	uvec4 texture_meta[]; // width, height, alpha-word offset, texel count
+};
+layout(set = 0, binding = 9, std430) readonly buffer FogShadowAlphaTextureBytes {
+	uint alpha_words[]; // four 8-bit alpha samples per uint
+};
+
+layout(location = 0) rayPayloadInEXT uint visibility;
+hitAttributeEXT vec2 hit_barycentrics;
+
+void fog_shadow_accept_occluder() {
+	visibility = 0u;
+	terminateRayEXT;
+}
+
+float fog_shadow_hash_2d(vec2 p_position) {
+	return fract(1.0e4 * sin(17.0 * p_position.x + 0.1 * p_position.y)
+			* (0.1 + abs(sin(13.0 * p_position.y + p_position.x))));
+}
+
+float fog_shadow_hash_3d(vec3 p_position) {
+	return fog_shadow_hash_2d(vec2(fog_shadow_hash_2d(p_position.xy), p_position.z));
+}
+
+float fog_shadow_alpha_hash_threshold(vec3 p_object_position, float p_hash_scale, float p_footprint) {
+	float pixel_scale = 1.0 / (max(p_hash_scale, 1e-6) * max(p_footprint, 1e-6));
+	float log_pixel_scale = log2(max(pixel_scale, 1e-6));
+	vec2 pixel_scales = vec2(exp2(floor(log_pixel_scale)), exp2(ceil(log_pixel_scale)));
+	vec2 thresholds = vec2(
+			fog_shadow_hash_3d(floor(pixel_scales.x * p_object_position)),
+			fog_shadow_hash_3d(floor(pixel_scales.y * p_object_position)));
+	float lerp_factor = fract(log_pixel_scale);
+	float interpolated = mix(thresholds.x, thresholds.y, lerp_factor);
+	float minimum_lerp = min(lerp_factor, 1.0 - lerp_factor);
+	float safe_lerp = max(minimum_lerp, 1e-6);
+	float safe_complement = max(1.0 - minimum_lerp, 1e-6);
+	vec3 cases = vec3(
+			interpolated * interpolated / (2.0 * safe_lerp * safe_complement),
+			(interpolated - 0.5 * minimum_lerp) / safe_complement,
+			1.0 - ((1.0 - interpolated) * (1.0 - interpolated) / (2.0 * safe_lerp * safe_complement)));
+	float threshold = interpolated < (1.0 - minimum_lerp)
+			? (interpolated < minimum_lerp ? cases.x : cases.y)
+			: cases.z;
+	return clamp(threshold, 1e-5, 1.0);
+}
+
+int fog_shadow_wrap_index(int p_coordinate, int p_size, bool p_repeat) {
+	if (p_repeat) {
+		int wrapped = p_coordinate % p_size;
+		return wrapped < 0 ? wrapped + p_size : wrapped;
+	}
+	return clamp(p_coordinate, 0, p_size - 1);
+}
+
+float fog_shadow_fetch_alpha(uint p_texture_index, ivec2 p_coordinate, bool p_repeat) {
+	uvec4 meta = texture_meta[p_texture_index];
+	int width = int(meta.x);
+	int height = int(meta.y);
+	int x = fog_shadow_wrap_index(p_coordinate.x, width, p_repeat);
+	int y = fog_shadow_wrap_index(p_coordinate.y, height, p_repeat);
+	uint texel_index = uint(y * width + x);
+	uint word = alpha_words[meta.z + texel_index / 4u];
+	uint alpha = (word >> ((texel_index & 3u) * 8u)) & 255u;
+	return float(alpha) * (1.0 / 255.0);
+}
+
+float fog_shadow_sample_alpha(uint p_texture_index, vec2 p_uv, bool p_repeat, bool p_nearest) {
+	uvec4 meta = texture_meta[p_texture_index];
+	vec2 pixel_position = p_uv * vec2(meta.xy) - 0.5;
+	ivec2 pixel_base = ivec2(floor(pixel_position));
+	if (p_nearest) {
+		return fog_shadow_fetch_alpha(p_texture_index, ivec2(floor(pixel_position + 0.5)), p_repeat);
+	}
+	vec2 weight = fract(pixel_position);
+	float a00 = fog_shadow_fetch_alpha(p_texture_index, pixel_base, p_repeat);
+	float a10 = fog_shadow_fetch_alpha(p_texture_index, pixel_base + ivec2(1, 0), p_repeat);
+	float a01 = fog_shadow_fetch_alpha(p_texture_index, pixel_base + ivec2(0, 1), p_repeat);
+	float a11 = fog_shadow_fetch_alpha(p_texture_index, pixel_base + ivec2(1, 1), p_repeat);
+	return mix(mix(a00, a10, weight.x), mix(a01, a11, weight.x), weight.y);
+}
+
+void main() {
+	uvec4 instance = instance_data[gl_InstanceCustomIndexEXT];
+	// gl_LaunchIDEXT is inherited unchanged by any-hit from the raygen invocation;
+	// it directly indexes the same one-dimensional input batch.
+	FogShadowRay ray = rays[gl_LaunchIDEXT.x];
+	// RD TLAS instance masks are only 8-bit. Keep each caster's actual Godot
+	// 32-bit layers value in instance_data.w and filter here. BLAS geometries
+	// are intentionally non-opaque, so any-hit runs for opaque and alpha hits.
+	#if FENG_FOG_RAY_ABI == 2
+		uint light_mask = ray.cone_words.z;
+		if (light_mask == 0u || (instance.w & light_mask) == 0u) {
+			ignoreIntersectionEXT;
+		}
+	#endif
+	uint geometry_index = gl_GeometryIndexEXT;
+	if (geometry_index >= instance.z) {
+		// Missing surface metadata is conservative: this intersection still blocks.
+		fog_shadow_accept_occluder();
+		return;
+	}
+	FogShadowMaterial material;
+	material.ids = material_ids[instance.x + geometry_index];
+	material.params0 = material_params[(instance.x + geometry_index) * 2u];
+	material.params1 = material_params[(instance.x + geometry_index) * 2u + 1u];
+	uint mode = material.ids.x;
+	if (mode == 0u) {
+		fog_shadow_accept_occluder();
+		return;
+	}
+	uvec4 surface = surface_data[instance.y + geometry_index];
+	uint triangle_offset = surface.x + uint(gl_PrimitiveID) * 3u;
+	vec3 barycentric = vec3(1.0 - hit_barycentrics.x - hit_barycentrics.y,
+			hit_barycentrics.x, hit_barycentrics.y);
+	vec4 vertex0 = triangle_vertex[triangle_offset];
+	vec4 vertex1 = triangle_vertex[triangle_offset + 1u];
+	vec4 vertex2 = triangle_vertex[triangle_offset + 2u];
+	float vertex_alpha = (material.ids.z & 1u) != 0u
+			? dot(vec3(vertex0.z, vertex1.z, vertex2.z), barycentric) : 1.0;
+	float alpha = material.params0.x * vertex_alpha;
+	if (material.ids.y > 0u) {
+		vec2 uv = vertex0.xy * barycentric.x + vertex1.xy * barycentric.y + vertex2.xy * barycentric.z;
+		uv = uv * material.params1.xy + material.params1.zw;
+		int filter_mode = int(material.params0.w);
+		bool nearest = filter_mode == 0 || filter_mode == 2 || filter_mode == 4;
+		alpha *= fog_shadow_sample_alpha(material.ids.y - 1u, uv,
+				material.ids.w != 0u, nearest);
+	}
+	float threshold = material.params0.y;
+	if (mode == 2u) {
+		float hit_distance = gl_HitTEXT;
+		vec3 world_position = gl_WorldRayOriginEXT + hit_distance * gl_WorldRayDirectionEXT;
+		vec3 object_position = (gl_WorldToObjectEXT * vec4(world_position, 1.0)).xyz;
+		mat3 world_to_object = mat3(gl_WorldToObjectEXT);
+		float inverse_scale = max(length(world_to_object[0]),
+				max(length(world_to_object[1]), length(world_to_object[2])));
+		float cone_radius = uintBitsToFloat(ray.cone_words.x);
+		float cone_growth = uintBitsToFloat(ray.cone_words.y);
+		float hit_footprint = max(2.0 * (cone_radius + hit_distance * cone_growth) * inverse_scale, 1e-6);
+		threshold = fog_shadow_alpha_hash_threshold(object_position, material.params0.z, hit_footprint);
+	}
+	if (alpha < threshold) {
+		ignoreIntersectionEXT;
+	}
+	fog_shadow_accept_occluder();
+}

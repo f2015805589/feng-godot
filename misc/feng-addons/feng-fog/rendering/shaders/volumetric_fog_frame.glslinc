@@ -1,0 +1,93 @@
+// Must match FengVolumetricFogCodec.pack_frame_uniform() in bytes and order.
+layout(set = 0, binding = 0, std140) uniform VolumetricFogFrame {
+	mat4 inverse_projection; // Unjittered inverse projection for stable froxel positions.
+	mat4 view_to_world;
+	mat4 previous_projection; // Unjittered previous projection for history reprojection.
+	mat4 previous_world_to_view;
+	mat4 current_depth_projection; // Current corrected projection including TAA jitter.
+	mat4 current_depth_inverse_projection; // Inverse of the same jittered projection.
+	vec4 camera_position_orthographic;
+	vec4 eye_offset_center_view; // local eye offset; native light buffers/shadows use center-camera view space.
+	vec4 fog_layer0; // density, falloff, world height, camera far plane.
+	vec4 fog_layer1;
+	vec4 material; // linear albedo.rgb, extinction scale.
+	vec4 emissive_and_phase; // scene-linear emissive.rgb, Henyey-Greenstein g.
+	vec4 grid_view; // grid x, grid y, grid z, view index.
+	vec4 log_z_params; // B, O, S, reserved.
+	vec4 previous_log_z_params; // previous frame B, O, S, reserved.
+	vec4 distance_exposure; // start distance, far distance, near fade, current pre-exposure.
+	vec4 history_frame_size; // previous pre-exposure, local frame index, view width, view height.
+	vec4 history_control; // history weight, history valid, current scene normalization, froxel pixel size.
+} fog_frame;
+
+const float FENG_FOG_PI = 3.14159265358979323846;
+const float FENG_FOG_HALF_MAX = 65504.0;
+const float FENG_FOG_FROXEL_PIXEL_SIZE = 16.0;
+const int FENG_FOG_MAX_HISTORY_MISS_SUPERSAMPLE_COUNT = 16;
+
+float feng_fog_halton(uint index, uint radix) {
+	float inverse_radix = 1.0 / float(radix);
+	float factor = inverse_radix;
+	float value = 0.0;
+	while (index > 0u) {
+		value += float(index % radix) * factor;
+		index /= radix;
+		factor *= inverse_radix;
+	}
+	return value;
+}
+
+vec3 feng_fog_frame_jitter(float frame_number) {
+	// UE subtracts sample indices from a uint frame counter; negative values
+	// wrap before the 1023 mask (e.g. frame 0, sample 1 -> index 1023).
+	uint index = uint(int(floor(frame_number))) & 1023u;
+	return vec3(feng_fog_halton(index, 2u), feng_fog_halton(index, 3u),
+			feng_fog_halton(index, 5u));
+}
+
+float feng_fog_finite_nonnegative(float value) {
+	return isnan(value) || isinf(value) ? 0.0 : clamp(value, 0.0, FENG_FOG_HALF_MAX);
+}
+
+float feng_fog_depth_from_slice(float slice) {
+	float exponent = clamp(slice / max(fog_frame.log_z_params.z, 1.0e-6), -120.0, 120.0);
+	return max((exp2(exponent) - fog_frame.log_z_params.y) / max(fog_frame.log_z_params.x, 1.0e-12), 0.0);
+}
+
+float feng_fog_previous_depth_from_slice(float slice) {
+	float exponent = clamp(slice / max(fog_frame.previous_log_z_params.z, 1.0e-6), -120.0, 120.0);
+	return max((exp2(exponent) - fog_frame.previous_log_z_params.y) / max(fog_frame.previous_log_z_params.x, 1.0e-12), 0.0);
+}
+
+vec3 feng_fog_view_ray(vec2 uv) {
+	vec4 near_h = fog_frame.inverse_projection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+	vec4 far_h = fog_frame.inverse_projection * vec4(uv * 2.0 - 1.0, 0.5, 1.0);
+	vec3 near_p = abs(near_h.w) > 1.0e-8 ? near_h.xyz / near_h.w : near_h.xyz;
+	vec3 far_p = abs(far_h.w) > 1.0e-8 ? far_h.xyz / far_h.w : far_h.xyz;
+	vec3 ray = normalize(far_p - near_p);
+	return any(isnan(ray)) || any(isinf(ray)) ? vec3(0.0, 0.0, -1.0) : ray;
+}
+
+vec3 feng_fog_view_position(vec2 uv, float view_depth) {
+	vec4 near_h = fog_frame.inverse_projection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+	vec3 near_p = abs(near_h.w) > 1.0e-8 ? near_h.xyz / near_h.w : near_h.xyz;
+	vec3 ray = feng_fog_view_ray(uv);
+	if (fog_frame.camera_position_orthographic.w > 0.5) {
+		return vec3(near_p.xy, -view_depth);
+	}
+	return ray * (view_depth / max(-ray.z, 1.0e-6));
+}
+
+vec3 feng_fog_world_position(vec2 uv, float view_depth) {
+	return (fog_frame.view_to_world * vec4(feng_fog_view_position(uv, view_depth), 1.0)).xyz;
+}
+
+float feng_fog_henyey_greenstein(float g, float cosine_theta) {
+	g = clamp(g, -0.99, 0.99);
+	float denominator = max(1.0 + g * g - 2.0 * g * clamp(cosine_theta, -1.0, 1.0), 1.0e-6);
+	return (1.0 - g * g) / (4.0 * FENG_FOG_PI * denominator * sqrt(denominator));
+}
+
+float feng_fog_atlas_x(float local_x) {
+	return local_x + fog_frame.grid_view.w * fog_frame.grid_view.x;
+}

@@ -15,6 +15,7 @@ const FOG_BYTES := 112
 const NATIVE_SHADOW_BYTES := 624
 const PROJECTION_BYTES := 560
 const CLOUD_ATMOSPHERE_VISIBILITY_BYTES := 32
+const VOLUME_SAMPLING_BYTES := 96
 const MAX_BUFFER_STATES := 8
 const PURE_UE58_KERNEL_SHA256 := [
 	"1fca2733bbf40247374a16b71510c1bd45bdb83978c15af89ea997fbc624df10",
@@ -31,6 +32,7 @@ var _shadow_sampler := RID()
 var _neutral_shape := RID()
 var _neutral_weather := RID()
 var _neutral_lut := RID()
+var _neutral_volume := RID()
 var _neutral_depth := RID()
 var _neutral_sky_2d := RID()
 var _neutral_sky_array := RID()
@@ -177,6 +179,13 @@ func _clear_shadow(ctx: FRPPassContext, buffers: RenderSceneBuffersRD, rd: Rende
 func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: RenderSceneData,
 		view: int, buffers: RenderSceneBuffersRD, rd: RenderingDevice, owner_id: int,
 		vrt_mode: int) -> bool:
+	var volume_deferred := ctx != null and ctx.has_method("is_volume_deferred_composition") \
+			and bool(ctx.call("is_volume_deferred_composition"))
+	var fsss_deferred := ctx != null \
+			and bool(ctx.get_meta(&"frp_fsss_deferred_composition", false))
+	var composition_deferred := volume_deferred or fsss_deferred
+	if ctx != null and view == 0:
+		ctx.set_meta(&"frp_cloud_fog_composition", {})
 	if buffers == null or rd == null or ctx == null or scene_data == null:
 		_release_buffer(buffers, rd)
 		return false
@@ -205,6 +214,21 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	var state := _ensure_buffer_state(buffers, rd, owner_id, buffers_size, view_count, mode, false)
 	if state.is_empty() or not _ensure_neutral_resources(rd):
 		return false
+	var volume_sidecar_radiance := RID()
+	var volume_sidecar_transmittance := RID()
+	if composition_deferred:
+		if not _ensure_volume_composition_outputs(buffers, state, buffers_size, view_count, rd):
+			return false
+		volume_sidecar_radiance = _named(buffers, state, "volume_composition_radiance")
+		volume_sidecar_transmittance = _named(buffers, state, "volume_composition_transmittance")
+		if not _valid_texture(rd, volume_sidecar_radiance) \
+				or not _valid_texture(rd, volume_sidecar_transmittance):
+			return false
+		if view == 0:
+			rd.texture_clear(volume_sidecar_radiance, Color(0.0, 0.0, 0.0, 0.0),
+				0, 1, 0, view_count)
+			rd.texture_clear(volume_sidecar_transmittance, Color(1.0, 1.0, 1.0, 1.0),
+				0, 1, 0, view_count)
 	var packets := _read_packets(ctx)
 	if not _packets_valid(packets):
 		return false
@@ -274,6 +298,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	if not composite_format.has("FENG_CLOUD_SCENE_RGBA32"):
 		return false
 	composite_format["FENG_CLOUD_VRT_SECONDARY"] = 1 if secondary_enabled else 0
+	composite_format["FENG_CLOUD_VOLUME_DEFERRED"] = 1 if composition_deferred else 0
 	var composite_pipeline := _ensure_pipeline(rd, "cloud_composite.glslinc", composite_format)
 	if trace_pipeline.is_empty() or reconstruct_pipeline.is_empty() or composite_pipeline.is_empty():
 		return false
@@ -373,14 +398,80 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	_add_sampled(composite_uniforms, 19, _sampler, current_transmittance)
 	_add_sampled(composite_uniforms, 20, _sampler, current_depth)
 	_add_sampled(composite_uniforms, 13, _sampler, scene_depth)
+	var volume_packet := PackedFloat32Array()
+	var volume_texture := RID()
+	if ctx.has_method("get_volume_sampling_parameters") and ctx.has_method("get_volume_texture"):
+		var packet_value: Variant = ctx.call("get_volume_sampling_parameters")
+		if packet_value is PackedFloat32Array:
+			volume_packet = packet_value
+		volume_texture = ctx.call("get_volume_texture")
+	var volume_valid := volume_deferred and volume_packet.size() == 20 and volume_packet[19] > 0.5 \
+			and _valid_texture(rd, volume_texture)
+	if volume_packet.size() != 20:
+		volume_packet = PackedFloat32Array([
+			1.0, 0.0, 32.0, 1.0,
+			1.0, 1.0, 1.0, 1.0,
+			1.0, 1.0, 1.0, 1.0,
+			0.0, 1.0, 0.05, 1.0,
+			1.0, 1.0, 1.0, 0.0,
+		])
+	else:
+		volume_packet = volume_packet.duplicate()
+		if not volume_valid:
+			volume_packet[19] = 0.0
+	volume_packet.append_array(PackedFloat32Array([
+		float(view), _pre_exposure(ctx, view), 1.0 if volume_valid else 0.0, 0.0,
+	]))
+	var volume_ubo_key := "volume_sampling_ubo_%d" % view
+	if not _update_ubo(state, volume_ubo_key, volume_packet, VOLUME_SAMPLING_BYTES, rd):
+		return false
+	_add_sampled(composite_uniforms, 40, _sampler,
+			_texture_or(rd, volume_texture, _neutral_volume))
+	_add_uniform_buffer(composite_uniforms, 41, state.ubos[volume_ubo_key])
 	if secondary_enabled:
 		_add_sampled(composite_uniforms, 35, _sampler, current_secondary_radiance)
 		_add_sampled(composite_uniforms, 36, _sampler, current_secondary_transmittance)
 	var composite_set0 := _uniform_set(composite_pipeline.shader, 0, composite_uniforms)
-	var composite_set1 := _uniform_set(composite_pipeline.shader, 1, _image_uniforms(4, color_layer))
+	var composite_output_items: Array = [[4, color_layer]]
+	if composition_deferred:
+		composite_output_items.append_array([
+			[11, volume_sidecar_radiance], [12, volume_sidecar_transmittance]])
+	var composite_set1 := _uniform_set(composite_pipeline.shader, 1,
+			_image_uniforms3(composite_output_items))
 	if not _dispatch(rd, composite_pipeline.pipeline, [composite_set0, composite_set1], buffers_size):
 		return false
 	ctx.set_cloud_outputs(current_radiance, current_transmittance, current_depth, sky_ambient)
+	if composition_deferred and view == view_count - 1:
+		var frame_inputs: Variant = ctx.call("get_volume_frame_inputs", 0) \
+				if ctx.has_method("get_volume_frame_inputs") else {}
+		var frame_generation := int(frame_inputs.get("frame_generation", -1)) \
+				if frame_inputs is Dictionary and bool(frame_inputs.get("valid", false)) else -1
+		var history_material_snapshot: Dictionary = snapshot.get("material", {})
+		var material_revision := int(history_material_snapshot.get("revision", -1))
+		var material_layout := str(history_material_snapshot.get("kernel_layout",
+				snapshot.get("kernel_layout", "builtin")))
+		var history_identity := var_to_str([
+			int(snapshot.get("provider_id", 0)), int(snapshot.get("world_id", 0)),
+			int(snapshot.get("planet_source_id", 0)), material_revision,
+			material_layout, view_count,
+		]).sha256_text()
+		var native_snapshot_signature := _read_native_cloud_snapshot_signature(ctx)
+		if bool(native_snapshot_signature.get("valid", false)):
+			ctx.set_meta(&"frp_cloud_fog_composition", {
+				"radiance": volume_sidecar_radiance,
+				"transmittance": volume_sidecar_transmittance,
+				"native_snapshot_source_signature": int(native_snapshot_signature.signature),
+				"gpu_source_signature": source_signature,
+				"history_identity": history_identity,
+				"view_count": view_count,
+				"frame_generation": frame_generation,
+				"buffer_id": buffers.get_instance_id(),
+				"internal_size": buffers_size,
+			})
+		else:
+			# No verifiable current native snapshot means the sidecar must not be
+			# consumed by the later Height Fog callback.
+			ctx.set_meta(&"frp_cloud_fog_composition", {})
 	if not capture and (mode == 0 or mode == 2):
 		state.view_history[view] = {
 			"view_projection": frame_packet.view_projection,
@@ -449,7 +540,7 @@ func take_cleanup_payload(extra_rids: Array[RID] = []) -> Dictionary:
 			if rid.is_valid():
 				rids.append(rid)
 	for rid in [_sampler, _material_sampler, _shadow_sampler, _neutral_shape, _neutral_weather,
-			_neutral_lut, _neutral_depth, _neutral_sky_2d, _neutral_sky_array]:
+			_neutral_lut, _neutral_volume, _neutral_depth, _neutral_sky_2d, _neutral_sky_array]:
 		if rid.is_valid():
 			rids.append(rid)
 	for rid in extra_rids:
@@ -463,6 +554,7 @@ func take_cleanup_payload(extra_rids: Array[RID] = []) -> Dictionary:
 	_neutral_shape = RID()
 	_neutral_weather = RID()
 	_neutral_lut = RID()
+	_neutral_volume = RID()
 	_neutral_depth = RID()
 	_neutral_sky_2d = RID()
 	_neutral_sky_array = RID()
@@ -576,6 +668,22 @@ func _cloud_texture_layout(mode: int) -> Dictionary:
 		layout["secondary_radiance"] = radiance
 		layout["secondary_transmittance"] = transmittance
 	return layout
+
+
+func _ensure_volume_composition_outputs(buffers: RenderSceneBuffersRD, state: Dictionary,
+		size: Vector2i, view_count: int, rd: RenderingDevice) -> bool:
+	for texture_name in ["volume_composition_radiance", "volume_composition_transmittance"]:
+		var texture := _named(buffers, state, texture_name)
+		if _valid_texture(rd, texture):
+			continue
+		if not _create_named_texture(buffers, state, texture_name,
+				RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, size,
+				view_count, true, rd):
+			return false
+		texture = _named(buffers, state, texture_name)
+		if not _valid_texture(rd, texture):
+			return false
+	return true
 
 
 func _create_cloud_texture(buffers: RenderSceneBuffersRD, state: Dictionary,
@@ -998,6 +1106,10 @@ func _ensure_neutral_resources(rd: RenderingDevice) -> bool:
 	if not _neutral_lut.is_valid():
 		_neutral_lut = _create_neutral_texture(rd, RenderingDevice.TEXTURE_TYPE_2D,
 			RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array(), 1, 1, 1)
+	if not _neutral_volume.is_valid():
+		_neutral_volume = _create_neutral_texture(rd, RenderingDevice.TEXTURE_TYPE_3D,
+			RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
+			PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0x3c]), 1, 1, 1)
 	if not _neutral_depth.is_valid():
 		_neutral_depth = _create_neutral_depth_texture(rd)
 	if not _neutral_sky_2d.is_valid():
@@ -1006,7 +1118,8 @@ func _ensure_neutral_resources(rd: RenderingDevice) -> bool:
 	if not _neutral_sky_array.is_valid():
 		_neutral_sky_array = _create_neutral_texture(rd, RenderingDevice.TEXTURE_TYPE_2D_ARRAY,
 			RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0]), 1, 1, 1)
-	return _neutral_lut.is_valid() and _neutral_depth.is_valid() and _neutral_sky_2d.is_valid() \
+	return _neutral_lut.is_valid() and _neutral_volume.is_valid() \
+		and _neutral_depth.is_valid() and _neutral_sky_2d.is_valid() \
 		and _neutral_sky_array.is_valid()
 
 
@@ -1229,6 +1342,19 @@ func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textu
 		layout_ids, str(snapshot.get("material", {}).get("kernel_layout", snapshot.get("kernel_layout", "builtin"))),
 		str(snapshot.get("material", {}).get("kernel_source", "")),
 	])
+
+
+func _read_native_cloud_snapshot_signature(ctx: Object) -> Dictionary:
+	if ctx == null or not ctx.has_method("has_cloud_snapshot") \
+			or not ctx.has_method("get_cloud_snapshot_source_signature"):
+		return {"valid": false}
+	var has_snapshot: Variant = ctx.call("has_cloud_snapshot")
+	if typeof(has_snapshot) != TYPE_BOOL or not bool(has_snapshot):
+		return {"valid": false}
+	var signature: Variant = ctx.call("get_cloud_snapshot_source_signature")
+	if typeof(signature) != TYPE_INT:
+		return {"valid": false}
+	return {"valid": true, "signature": int(signature)}
 
 
 func _blue_noise_texture(snapshot: Dictionary, rd: RenderingDevice) -> RID:
@@ -1531,17 +1657,10 @@ func _ensure_pipeline(rd: RenderingDevice, filename: String, defines: Dictionary
 			return {}
 		var injected := "#define FENG_CLOUD_MATERIAL_KERNEL feng_cloud_custom_material_sample\n" + material_kernel_source + "\n"
 		source_text = source_text.replace(material_marker, injected + material_marker)
-	source_text = source_text.replace("#[compute]", "")
-	var version_end := source_text.find("#version 450")
-	if version_end < 0:
+	source_text = _assemble_shader_source(source_text, defines)
+	if source_text.is_empty():
 		_report("Cloud shader is missing #version 450: %s" % filename)
 		return {}
-	version_end += String("#version 450").length()
-	var macro_lines := PackedStringArray()
-	for define_key in define_keys:
-		macro_lines.append("#define %s %s" % [str(define_key), str(defines[define_key])])
-	if not macro_lines.is_empty():
-		source_text = source_text.substr(0, version_end) + "\n" + "\n".join(macro_lines) + source_text.substr(version_end)
 	var shader_source := RDShaderSource.new()
 	shader_source.source_compute = source_text
 	var spirv: RDShaderSPIRV = rd.shader_compile_spirv_from_source(shader_source)
@@ -1560,6 +1679,21 @@ func _ensure_pipeline(rd: RenderingDevice, filename: String, defines: Dictionary
 	var entry := {"shader": shader, "pipeline": pipeline}
 	_pipelines[key] = entry
 	return entry
+
+
+func _assemble_shader_source(source_text: String, defines: Dictionary) -> String:
+	var assembled := source_text.replace("#[compute]", "")
+	if assembled.find("#version 450") < 0:
+		return ""
+	var define_keys := defines.keys()
+	define_keys.sort()
+	var macro_lines := PackedStringArray()
+	for define_key in define_keys:
+		macro_lines.append("#define %s %s" % [str(define_key), str(defines[define_key])])
+	if macro_lines.is_empty():
+		return assembled
+	var version_end := assembled.find("#version 450") + String("#version 450").length()
+	return assembled.substr(0, version_end) + "\n" + "\n".join(macro_lines) + assembled.substr(version_end)
 
 
 func _expand_shader(path: String, depth: int) -> String:

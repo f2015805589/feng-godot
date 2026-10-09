@@ -1,0 +1,373 @@
+#[compute]
+#version 450
+
+// FRP_NATIVE_LIGHT_ABI_INSERT
+
+// Reuse the same per-light extension records bound by the volume light stage.
+// Only explicit SourceLength metadata is consumed here; cookie and barn-door
+// fields remain the volume-light stage's responsibility.
+// FRP_LIGHT_EXTENSION_ABI_INSERT
+
+// This RayFrame layout is owned by the RT input generator, independent of the
+// addon Fog service's evolving volume-frame layout. It is exactly 256 bytes.
+layout(set = 0, binding = 0, std140) uniform RayFrame {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 eye_offset_center_view;
+	vec4 camera_position_orthographic;
+	vec4 grid_jitter_y; // grid x/y/z, shared froxel sample offset y in [0,1].
+	vec4 viewport_pixel_jitter_x; // internal width/height, pixel size, shared offset x.
+	vec4 log_depth_near; // B/O/S, near plane in meters.
+	vec4 ray_limits_far; // min t, max ray t, frame far plane, shared within-froxel Z offset.
+	uvec4 light_counts;
+	uvec4 batch;
+} ray_frame;
+
+layout(set = 0, binding = 1, std140) uniform DirectionalLightBuffer {
+	FRPVolumeDirectionalLightData data[8];
+} directional_lights;
+layout(set = 0, binding = 2, std430) readonly buffer OmniLightBuffer {
+	FRPVolumeLightData data[];
+} omni_lights;
+layout(set = 0, binding = 3, std430) readonly buffer SpotLightBuffer {
+	FRPVolumeLightData data[];
+} spot_lights;
+layout(set = 0, binding = 4, std430) readonly buffer AreaLightBuffer {
+	FRPVolumeLightData data[];
+} area_lights;
+
+struct RayLightSlot {
+	uint type;
+	uint index;
+};
+layout(set = 0, binding = 5, std430) readonly buffer RayLightSlots {
+	RayLightSlot data[];
+} ray_light_slots;
+
+struct FogShadowRay {
+	vec4 origin_min_t;
+	vec4 direction_max_t;
+	uvec4 cone_words;
+};
+layout(set = 0, binding = 6, std430) writeonly buffer FogShadowRayInputs {
+	FogShadowRay data[];
+} fog_shadow_rays;
+layout(set = 0, binding = 7) uniform sampler2D current_scene_depth;
+layout(set = 0, binding = 8, std140) uniform RayDepthParameters {
+	mat4 current_depth_projection;
+	mat4 current_depth_inverse_projection;
+	vec4 control; // available, grid center offset, accept-depth threshold, reserved.
+} ray_depth;
+layout(set = 0, binding = 9, std430) readonly buffer FogRayWorkMask {
+	uint requested_sample_count[];
+} fog_ray_work_mask;
+layout(set = 0, binding = 10, std140) uniform RayWorkMaskParameters {
+	uvec4 values; // sample index, enabled, low frame generation, reserved.
+} ray_work_mask_parameters;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint FENG_RAY_LIGHT_DIRECTIONAL = 0u;
+const uint FENG_RAY_LIGHT_OMNI = 1u;
+const uint FENG_RAY_LIGHT_SPOT = 2u;
+const uint FENG_RAY_LIGHT_AREA = 3u;
+const float FENG_RAY_EPSILON = 1.0e-6;
+
+uint feng_ray_hash(uint p_value) {
+	p_value ^= p_value >> 16;
+	p_value *= 0x7feb352du;
+	p_value ^= p_value >> 15;
+	p_value *= 0x846ca68bu;
+	p_value ^= p_value >> 16;
+	return p_value;
+}
+
+float feng_ray_random(inout uint p_seed) {
+	p_seed = feng_ray_hash(p_seed + 0x9e3779b9u);
+	return float(p_seed >> 8) * (1.0 / 16777216.0);
+}
+
+vec3 feng_ray_safe_normalize(vec3 p_value, vec3 p_fallback) {
+	float length_squared = dot(p_value, p_value);
+	return !isnan(length_squared) && !isinf(length_squared) && length_squared > FENG_RAY_EPSILON
+			? p_value * inversesqrt(length_squared) : p_fallback;
+}
+
+float feng_ray_depth_from_slice(float p_slice) {
+	float exponent = clamp(max(p_slice, 0.0) / max(ray_frame.log_depth_near.z, FENG_RAY_EPSILON), -120.0, 120.0);
+	return max((exp2(exponent) - ray_frame.log_depth_near.y) / max(ray_frame.log_depth_near.x, FENG_RAY_EPSILON), 0.0);
+}
+
+vec3 feng_ray_view_position(vec2 p_uv, float p_depth) {
+	vec4 near_h = ray_frame.inverse_projection * vec4(p_uv * 2.0 - 1.0, 1.0, 1.0);
+	vec4 far_h = ray_frame.inverse_projection * vec4(p_uv * 2.0 - 1.0, 0.5, 1.0);
+	vec3 near_position = abs(near_h.w) > FENG_RAY_EPSILON ? near_h.xyz / near_h.w : near_h.xyz;
+	vec3 far_position = abs(far_h.w) > FENG_RAY_EPSILON ? far_h.xyz / far_h.w : far_h.xyz;
+	if (ray_frame.camera_position_orthographic.w > 0.5) {
+		return vec3(near_position.xy, -p_depth);
+	}
+	vec3 view_ray = feng_ray_safe_normalize(far_position - near_position, vec3(0.0, 0.0, -1.0));
+	return view_ray * (p_depth / max(-view_ray.z, FENG_RAY_EPSILON));
+}
+
+float feng_ray_depth_constrained_slice(ivec3 p_cell, inout vec3 p_sample_offset,
+		vec2 p_unjittered_uv) {
+	float sample_slice = float(p_cell.z) + p_sample_offset.z;
+	if (ray_depth.control.x <= 0.5) {
+		return sample_slice;
+	}
+	float sample_depth = feng_ray_depth_from_slice(sample_slice);
+	vec3 sample_view = feng_ray_view_position(p_unjittered_uv, sample_depth);
+	vec4 sample_clip = ray_depth.current_depth_projection * vec4(sample_view, 1.0);
+	if (!(sample_clip.w > 1.0e-7) || isnan(sample_clip.w) || isinf(sample_clip.w)) {
+		return sample_slice;
+	}
+	vec2 projected_uv = sample_clip.xy / sample_clip.w * 0.5 + 0.5;
+	ivec2 depth_size = textureSize(current_scene_depth, 0);
+	if (any(lessThanEqual(depth_size, ivec2(0)))) {
+		return sample_slice;
+	}
+	vec2 half_texel = 0.5 / vec2(depth_size);
+	vec2 depth_uv = clamp(projected_uv, half_texel, vec2(1.0) - half_texel);
+	ivec2 depth_pixel = clamp(ivec2(floor(depth_uv * vec2(depth_size))),
+			ivec2(0), depth_size - ivec2(1));
+	float device_depth = texelFetch(current_scene_depth, depth_pixel, 0).r;
+	if (isnan(device_depth) || isinf(device_depth)) {
+		return sample_slice;
+	}
+	vec4 scene_view_h = ray_depth.current_depth_inverse_projection
+			* vec4(depth_uv * 2.0 - 1.0, device_depth, 1.0);
+	if (abs(scene_view_h.w) <= 1.0e-8 || isnan(scene_view_h.w) || isinf(scene_view_h.w)) {
+		return sample_slice;
+	}
+	float scene_view_depth = max(-scene_view_h.z / scene_view_h.w, 0.0);
+	float scene_slice = log2(max(scene_view_depth * ray_frame.log_depth_near.x
+			+ ray_frame.log_depth_near.y, 1.0e-12)) * ray_frame.log_depth_near.z;
+	float depth_slice_with_offset = scene_slice - ray_depth.control.y;
+	float delta_to_front = depth_slice_with_offset - sample_slice;
+	if (delta_to_front < 0.0 && -delta_to_front < ray_depth.control.z) {
+		p_sample_offset.z += delta_to_front;
+	}
+	// Keep the signed, unclamped sample_slice for the front-depth delta above,
+	// but clamp the final sample to the first nonnegative froxel slice like the
+	// medium/light service does.
+	return max(float(p_cell.z) + p_sample_offset.z, 0.0);
+}
+
+vec3 feng_ray_froxel_position(ivec3 p_cell, out vec2 p_unjittered_uv) {
+	vec2 sample_xy = vec2(ray_frame.viewport_pixel_jitter_x.w, ray_frame.grid_jitter_y.w);
+	vec2 pixel_center = (vec2(p_cell.xy) + sample_xy) * ray_frame.viewport_pixel_jitter_x.z;
+	p_unjittered_uv = pixel_center / max(ray_frame.viewport_pixel_jitter_x.xy, vec2(1.0));
+	vec3 sample_offset = vec3(sample_xy, ray_frame.ray_limits_far.w);
+	float sample_slice = feng_ray_depth_constrained_slice(p_cell, sample_offset,
+			p_unjittered_uv);
+	float depth = feng_ray_depth_from_slice(sample_slice);
+	return feng_ray_view_position(p_unjittered_uv, depth);
+}
+
+vec2 feng_ray_froxel_cone(ivec2 p_cell, float p_depth) {
+	float pixel_size = ray_frame.viewport_pixel_jitter_x.z;
+	vec2 internal_size = max(ray_frame.viewport_pixel_jitter_x.xy, vec2(1.0));
+	vec2 sample_offset = vec2(ray_frame.viewport_pixel_jitter_x.w, ray_frame.grid_jitter_y.w);
+	vec2 uv = (vec2(p_cell) + sample_offset) * pixel_size / internal_size;
+	vec2 duv = vec2(pixel_size, 0.0) / internal_size;
+	vec2 dvv = vec2(0.0, pixel_size) / internal_size;
+	float depth = max(p_depth, FENG_RAY_EPSILON);
+	vec3 center = feng_ray_view_position(uv, depth);
+	vec3 dx = feng_ray_view_position(uv + duv, depth) - center;
+	vec3 dy = feng_ray_view_position(uv + dvv, depth) - center;
+	float radius = 0.5 * sqrt(dot(dx, dx) + dot(dy, dy));
+	float growth = ray_frame.camera_position_orthographic.w > 0.5 ? 0.0 : radius / depth;
+	return vec2(max(radius, 0.0), max(growth, 0.0));
+}
+
+void feng_ray_basis(vec3 p_direction, out vec3 p_tangent, out vec3 p_bitangent) {
+	vec3 axis = abs(p_direction.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	p_tangent = feng_ray_safe_normalize(cross(axis, p_direction), vec3(1.0, 0.0, 0.0));
+	p_bitangent = feng_ray_safe_normalize(cross(p_direction, p_tangent), vec3(0.0, 1.0, 0.0));
+}
+
+vec3 feng_ray_sample_disk(vec3 p_direction, float p_radius, float p_u, float p_v) {
+	vec3 tangent;
+	vec3 bitangent;
+	feng_ray_basis(p_direction, tangent, bitangent);
+	float radial = sqrt(clamp(p_u, 0.0, 1.0)) * max(p_radius, 0.0);
+	float angle = 6.28318530717958647692 * p_v;
+	return tangent * (radial * cos(angle)) + bitangent * (radial * sin(angle));
+}
+
+vec3 feng_ray_extension_axis_center_view(FFogLightExtensionRecord p_record) {
+	vec3 world_axis = ffog_light_capsule_axis_world(p_record);
+	vec3 center_view_axis = transpose(mat3(ray_frame.view_to_world)) * world_axis;
+	return feng_ray_safe_normalize(center_view_axis, vec3(0.0, 1.0, 0.0));
+}
+
+bool feng_ray_extension_record(uint p_native_type, uint p_native_index,
+		out FFogLightExtensionRecord p_record) {
+	p_record = FFogLightExtensionRecord(mat4(1.0), vec4(0.0), vec4(0.0),
+			vec4(1.0, 0.0, 0.0, 0.0), uvec4(0u), vec4(0.0));
+	if (ray_frame.batch.w == 0u ||
+			ffog_light_extension_header.x != FFogLightExtensionABIVersion ||
+			ffog_light_extension_header.w != ray_frame.batch.y) {
+		return false;
+	}
+	uint extension_kind = p_native_type == FENG_RAY_LIGHT_DIRECTIONAL ? 3u
+			: p_native_type == FENG_RAY_LIGHT_OMNI ? 0u
+			: p_native_type == FENG_RAY_LIGHT_SPOT ? 1u : 2u;
+	uvec4 extension_counts = uvec4(ray_frame.light_counts.y,
+			ray_frame.light_counts.z, ray_frame.light_counts.w,
+			ray_frame.light_counts.x);
+	uint record_index = ffog_light_extension_record_index(extension_kind,
+			p_native_index, extension_counts);
+	if (record_index == 0xffffffffu || record_index >= ffog_light_extension_header.y) {
+		return false;
+	}
+	p_record = ffog_light_extension_records[record_index];
+	return true;
+}
+
+vec3 feng_ray_sample_directional(vec3 p_center_direction, float p_angular_radius,
+		float p_u, float p_v) {
+	float cosine_radius = cos(clamp(p_angular_radius, 0.0, 1.5533430342749532));
+	float cosine_theta = mix(1.0, cosine_radius, clamp(p_u, 0.0, 1.0));
+	float sine_theta = sqrt(max(1.0 - cosine_theta * cosine_theta, 0.0));
+	vec3 tangent;
+	vec3 bitangent;
+	feng_ray_basis(p_center_direction, tangent, bitangent);
+	float angle = 6.28318530717958647692 * p_v;
+	return feng_ray_safe_normalize(p_center_direction * cosine_theta
+			+ tangent * (sine_theta * cos(angle))
+			+ bitangent * (sine_theta * sin(angle)), p_center_direction);
+}
+
+void feng_ray_make_directional(FRPVolumeDirectionalLightData p_light,
+		vec3 p_center_view, float p_random_u, float p_random_v,
+		out vec3 p_direction_center_view, out float p_max_t, out uint p_mask, out bool p_active) {
+	vec3 base_direction = feng_ray_safe_normalize(p_light.direction, vec3(0.0, 1.0, 0.0));
+	// LightStorage stores 1-cos(authored angular size) in `size`.
+	float angular_radius = acos(clamp(1.0 - max(p_light.size, 0.0), -1.0, 1.0));
+	p_direction_center_view = feng_ray_sample_directional(base_direction,
+			angular_radius, p_random_u, p_random_v);
+	p_max_t = ray_frame.ray_limits_far.y;
+	p_mask = p_light.mask;
+	p_active = p_light.shadow_opacity > 0.001 && p_light.volumetric_fog_energy > 0.0 && p_mask != 0u;
+}
+
+void feng_ray_make_local(FRPVolumeLightData p_light, uint p_type, vec3 p_center_view,
+		float p_random_u, float p_random_v, float p_random_line,
+		bool p_has_extension, FFogLightExtensionRecord p_extension,
+		out vec3 p_direction_center_view,
+		out float p_max_t, out uint p_mask, out bool p_active) {
+	vec3 source_position = p_light.position;
+	if (p_has_extension) {
+		float source_length = ffog_light_capsule_source_length_m(p_extension);
+		if (source_length > FENG_RAY_EPSILON) {
+			vec3 axis_center_view = feng_ray_extension_axis_center_view(p_extension);
+			source_position += axis_center_view * ((clamp(p_random_line, 0.0, 1.0) - 0.5)
+					* source_length);
+		}
+	}
+	if (p_type == FENG_RAY_LIGHT_AREA) {
+		// area_width/height are the renderer's center-view source axes; sample the
+		// native rectangular emitter before tracing from the froxel to the source.
+		source_position += p_light.area_width * (p_random_u - 0.5)
+				+ p_light.area_height * (p_random_v - 0.5);
+	} else if (p_light.size > 0.0) {
+		vec3 to_center = feng_ray_safe_normalize(source_position - p_center_view,
+				vec3(0.0, 0.0, 1.0));
+		source_position += feng_ray_sample_disk(to_center, p_light.size, p_random_u, p_random_v);
+	}
+	vec3 to_source = source_position - p_center_view;
+	float distance_to_source = length(to_source);
+	p_direction_center_view = distance_to_source > FENG_RAY_EPSILON
+			? to_source / distance_to_source : vec3(0.0, 0.0, 1.0);
+	p_max_t = min(ray_frame.ray_limits_far.y,
+			max(distance_to_source - ray_frame.ray_limits_far.x, 0.0));
+	p_mask = p_light.mask;
+	p_active = p_light.shadow_opacity > 0.001 && p_light.volumetric_fog_energy > 0.0
+			&& p_mask != 0u && p_max_t > ray_frame.ray_limits_far.x;
+}
+
+void main() {
+	// Keep the shared set-3 cookie sampler in the pipeline layout even though
+	// the ray generator only consumes capsule fields. Valid frame flags are 0/1,
+	// so this ABI-layout probe is never reached during a normal dispatch.
+	if (ray_frame.batch.w == 0xffffffffu) {
+		vec3 extension_layout_probe = ffog_light_function_color(0u, vec3(0.0));
+		if (extension_layout_probe.x < -1.0) {
+			return;
+		}
+	}
+	uint ray_index = gl_GlobalInvocationID.x;
+	uint slot_count = ray_frame.batch.x;
+	uint froxel_count = uint(ray_frame.grid_jitter_y.x * ray_frame.grid_jitter_y.y * ray_frame.grid_jitter_y.z);
+	uint ray_count = slot_count * froxel_count;
+	if (ray_index >= ray_count) {
+		return;
+	}
+	uint slot_index = ray_index / froxel_count;
+	uint froxel_index = ray_index - slot_index * froxel_count;
+	bool work_mask_matches_frame = ray_work_mask_parameters.values.z == ray_frame.batch.y;
+	if (ray_work_mask_parameters.values.y != 0u && work_mask_matches_frame
+			&& ray_work_mask_parameters.values.x >= fog_ray_work_mask.requested_sample_count[froxel_index]) {
+		FogShadowRay inactive_ray;
+		inactive_ray.origin_min_t = vec4(0.0);
+		inactive_ray.direction_max_t = vec4(0.0);
+		inactive_ray.cone_words = uvec4(0u);
+		fog_shadow_rays.data[ray_index] = inactive_ray;
+		return;
+	}
+	uvec3 grid = uvec3(ray_frame.grid_jitter_y.xyz);
+	uint xy_index = froxel_index % (grid.x * grid.y);
+	ivec3 cell = ivec3(int(xy_index % grid.x), int(xy_index / grid.x), int(froxel_index / (grid.x * grid.y)));
+	vec2 unjittered_uv;
+	vec3 view_position = feng_ray_froxel_position(cell, unjittered_uv);
+	vec3 center_view_position = view_position + ray_frame.eye_offset_center_view.xyz;
+	float depth = max(-view_position.z, ray_frame.ray_limits_far.x);
+	vec2 cone = feng_ray_froxel_cone(cell.xy, depth);
+	RayLightSlot slot = ray_light_slots.data[slot_index];
+	uint seed = feng_ray_hash(ray_index ^ ray_frame.batch.y
+			^ (slot.type * 0x85ebca6bu)
+			^ (ray_work_mask_parameters.values.x * 0xc2b2ae35u));
+	float random_u = feng_ray_random(seed);
+	float random_v = feng_ray_random(seed);
+	float random_line = feng_ray_random(seed);
+	vec3 direction_center_view = vec3(0.0, 0.0, 1.0);
+	float maximum_t = 0.0;
+	uint light_mask = 0u;
+	bool ray_active = false;
+	if (slot.type == FENG_RAY_LIGHT_DIRECTIONAL && slot.index < ray_frame.light_counts.x) {
+		feng_ray_make_directional(directional_lights.data[slot.index], center_view_position,
+				random_u, random_v, direction_center_view, maximum_t, light_mask, ray_active);
+	} else if (slot.type == FENG_RAY_LIGHT_OMNI && slot.index < ray_frame.light_counts.y) {
+		FFogLightExtensionRecord extension_record;
+		bool has_extension = feng_ray_extension_record(slot.type, slot.index,
+				extension_record);
+		feng_ray_make_local(omni_lights.data[slot.index], slot.type, center_view_position,
+				random_u, random_v, random_line, has_extension, extension_record,
+				direction_center_view, maximum_t, light_mask, ray_active);
+	} else if (slot.type == FENG_RAY_LIGHT_SPOT && slot.index < ray_frame.light_counts.z) {
+		FFogLightExtensionRecord extension_record;
+		bool has_extension = feng_ray_extension_record(slot.type, slot.index,
+				extension_record);
+		feng_ray_make_local(spot_lights.data[slot.index], slot.type, center_view_position,
+				random_u, random_v, random_line, has_extension, extension_record,
+				direction_center_view, maximum_t, light_mask, ray_active);
+	} else if (slot.type == FENG_RAY_LIGHT_AREA && slot.index < ray_frame.light_counts.w) {
+		FFogLightExtensionRecord extension_record;
+		bool has_extension = feng_ray_extension_record(slot.type, slot.index,
+				extension_record);
+		feng_ray_make_local(area_lights.data[slot.index], slot.type, center_view_position,
+				random_u, random_v, random_line, has_extension, extension_record,
+				direction_center_view, maximum_t, light_mask, ray_active);
+	}
+	vec3 world_origin = (ray_frame.view_to_world * vec4(view_position, 1.0)).xyz;
+	vec3 world_direction = feng_ray_safe_normalize(
+			mat3(ray_frame.view_to_world) * direction_center_view, vec3(0.0, 1.0, 0.0));
+	FogShadowRay ray;
+	ray.origin_min_t = vec4(world_origin, ray_frame.ray_limits_far.x);
+	ray.direction_max_t = vec4(world_direction, maximum_t);
+	ray.cone_words = uvec4(floatBitsToUint(cone.x), floatBitsToUint(cone.y),
+			light_mask, floatBitsToUint(ray_active ? 1.0 : 0.0));
+	fog_shadow_rays.data[ray_index] = ray;
+}

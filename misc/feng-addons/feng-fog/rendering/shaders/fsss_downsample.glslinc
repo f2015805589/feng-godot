@@ -1,0 +1,31 @@
+#[compute]
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source_mip;
+layout(rgba16f, set = 0, binding = 1) uniform image2D target_mip;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 destination_extent = imageSize(target_mip);
+	if (any(greaterThanEqual(pixel, destination_extent))) {
+		return;
+	}
+	vec2 destination_size = vec2(destination_extent);
+	const float gaussian_blur_scale = 1.0;
+	const vec2 offsets[4] = vec2[4](
+		vec2(-1.0, -1.0), vec2(-1.0, 1.0),
+		vec2(1.0, 1.0), vec2(1.0, -1.0));
+	vec2 uv_scale = 1.0 / (destination_size * 2.0);
+	vec2 source_coord = (vec2(pixel) + vec2(0.5)) * 2.0;
+	vec3 accumulator = vec3(0.0);
+	for (int index = 0; index < 4; ++index) {
+		vec2 uv = (source_coord + offsets[index] * gaussian_blur_scale) * uv_scale;
+		accumulator += textureLod(source_mip, uv, 0.0).rgb;
+	}
+	ivec2 source_extent = textureSize(source_mip, 0);
+	ivec2 source_center = clamp(pixel * 2 + ivec2(1), ivec2(0), source_extent - ivec2(1));
+	float final_transmittance = texelFetch(source_mip, source_center, 0).a;
+	imageStore(target_mip, pixel, vec4(accumulator * 0.25, final_transmittance));
+}

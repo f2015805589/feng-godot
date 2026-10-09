@@ -89,6 +89,23 @@ static func snapshot_for_world(world_id: int) -> Dictionary:
 	return snapshot
 
 
+## Returns only the explicit active FengSkyLight's plain volumetric metadata.
+## Unlike snapshot_for_world(), this does not ask the provider to create or
+## read back CPU radiance SH data.
+static func volumetric_metadata_for_world(world_id: int) -> Dictionary:
+	var provider := _active_provider(world_id)
+	if provider == null or not is_instance_valid(provider) \
+			or not provider.has_method("_feng_sky_light_volumetric_metadata"):
+		return {}
+	var value: Variant = provider.call("_feng_sky_light_volumetric_metadata")
+	if not value is Dictionary or value.is_empty():
+		return {}
+	var metadata: Dictionary = value.duplicate()
+	metadata["world_id"] = world_id
+	metadata["provider_id"] = provider.get_instance_id()
+	return metadata
+
+
 static func is_active(provider: Object, world_id: int) -> bool:
 	return provider != null and is_instance_valid(provider) \
 			and _active_provider(world_id) == provider

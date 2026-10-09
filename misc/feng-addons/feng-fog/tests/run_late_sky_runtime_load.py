@@ -14,6 +14,11 @@ FOG_ADDON_SOURCE = REPO_ROOT / "misc/feng-addons/feng-fog"
 TEST_SCRIPT = "res://addons/feng-fog/tests/test_late_sky_runtime_load.gd"
 MOCK_RUNTIME_RELATIVE_PATH = Path("addons/feng-sky/feng_sky_runtime.gd")
 MOCK_REQUEST_RELATIVE_PATH = Path(".late_sky_runtime_mock_requested")
+LEGACY_RAW_SHADER_SOURCE_RELATIVE_PATHS = {
+	Path("rendering/lighting/fog_sky_sh_project.glsl"),
+	Path("rendering/lighting/fog_sky_sh_pack.glsl"),
+	Path("rendering/raytracing/fog_rt_ray_input_generate.glsl"),
+}
 WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 GODOT_ERROR_MARKERS = ("REGRESSION:", "SCRIPT ERROR:", "Parse Error:", "ERROR:")
 
@@ -118,6 +123,20 @@ def create_scratch_mock_runtime(project: Path) -> None:
 		raise SystemExit(f"Mock runtime was unexpectedly linked: {target}")
 
 
+def ignore_excluded_raw_shader_sources(directory: str, names: list[str]) -> list[str]:
+	"""Omit the three legacy sources excluded from the candidate snapshot."""
+	current = Path(directory)
+	try:
+		relative_directory = current.relative_to(FOG_ADDON_SOURCE)
+	except ValueError:
+		return []
+	ignored: list[str] = []
+	for name in names:
+		if relative_directory / name in LEGACY_RAW_SHADER_SOURCE_RELATIVE_PATHS:
+			ignored.append(name)
+	return ignored
+
+
 def main() -> None:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--editor", type=Path, required=True, help="Path to a Godot editor executable")
@@ -130,7 +149,8 @@ def main() -> None:
 	print(f"Persistent scratch project and full logs: {project}")
 	addons = project / "addons"
 	addons.mkdir()
-	shutil.copytree(FOG_ADDON_SOURCE, addons / "feng-fog")
+	shutil.copytree(FOG_ADDON_SOURCE, addons / "feng-fog",
+			ignore=ignore_excluded_raw_shader_sources)
 	selected_addons = {"feng-fog"}
 	for addon in sorted((REPO_ROOT / "misc/feng-addons").iterdir()):
 		if addon.is_dir() and addon.name not in selected_addons and (addon / "plugin.cfg").is_file():

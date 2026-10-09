@@ -1,0 +1,78 @@
+#ifndef FFOG_VOLUME_ENVIRONMENT_VISIBILITY_GLSLINC
+#define FFOG_VOLUME_ENVIRONMENT_VISIBILITY_GLSLINC
+
+// Descriptor set 4 is owned by FFogVolumeEnvironmentVisibilityProvider.
+// Ground RGB is already the source sky provider's sun->ground transmission;
+// it contains no light energy, exposure, or pre-exposure.
+layout(set = 4, binding = 0, std140) uniform FFogVolumeEnvironmentVisibility {
+	vec4 sun_ground_transmittance[2]; // RGB transmission, W = source-RID match valid.
+	ivec4 sun_slots; // native directional indices 0/1, current cloud maps, metadata valid.
+} ffog_volume_environment_visibility;
+
+layout(set = 4, binding = 1, std140) uniform FFogVolumeCloudVisibility {
+	vec4 projection[35];
+	vec4 sun_mapping;
+	vec4 flags;
+} cloud_visibility;
+layout(set = 4, binding = 2) uniform sampler2D cloud_shadow0_texture;
+layout(set = 4, binding = 3) uniform sampler2D cloud_shadow1_texture;
+layout(set = 4, binding = 4) uniform sampler2D cloud_raw_ao_texture;
+
+#include "../../../../feng-render-pipeline/library/height-fog/height_fog_cloud_visibility.glslinc"
+
+int ffog_volume_atmosphere_slot_for_directional(int native_directional_index) {
+	if (native_directional_index < 0) {
+		return -1;
+	}
+	if (native_directional_index == ffog_volume_environment_visibility.sun_slots.x) {
+		return 0;
+	}
+	if (native_directional_index == ffog_volume_environment_visibility.sun_slots.y) {
+		return 1;
+	}
+	return -1;
+}
+
+// FRP directional light buffers contain raw source sunlight. Apply the
+// planet-top ground transmission once for the matching FengSky sun only.
+// Other directionals and missing/mismatched metadata remain unattenuated.
+vec3 ffog_volume_sun_ground_transmittance(int native_directional_index) {
+	int slot = ffog_volume_atmosphere_slot_for_directional(native_directional_index);
+	if (slot < 0 || ffog_volume_environment_visibility.sun_slots.w == 0
+			|| ffog_volume_environment_visibility.sun_ground_transmittance[slot].w <= 0.5) {
+		return vec3(1.0);
+	}
+	return clamp(ffog_volume_environment_visibility.sun_ground_transmittance[slot].rgb,
+			vec3(0.0), vec3(1.0));
+}
+
+// Cloud shadowing is sampled per froxel and is separate from the once-per-sun
+// ground transmission. A non-shadowed directional never samples cloud maps.
+float ffog_volume_cloud_shadow_visibility(vec3 world_position_m,
+		int native_directional_index, bool native_shadowing_enabled) {
+	if (!native_shadowing_enabled || ffog_volume_environment_visibility.sun_slots.z == 0) {
+		return 1.0;
+	}
+	int atmosphere_slot = ffog_volume_atmosphere_slot_for_directional(native_directional_index);
+	return atmosphere_slot < 0 ? 1.0
+			: frp_height_fog_cloud_shadow_visibility(world_position_m, atmosphere_slot);
+}
+
+vec3 ffog_volume_directional_transmittance(vec3 world_position_m,
+		int native_directional_index, bool native_shadowing_enabled) {
+	float cloud_visibility_value = ffog_volume_cloud_shadow_visibility(world_position_m,
+			native_directional_index, native_shadowing_enabled);
+	return ffog_volume_sun_ground_transmittance(native_directional_index)
+			* cloud_visibility_value;
+}
+
+// Only attenuates Sky multiple-scattering contribution. Do not apply it to
+// emissive, baked probe, local-light, or direct-sun terms.
+float ffog_volume_sky_cloud_visibility(vec3 world_position_m) {
+	if (ffog_volume_environment_visibility.sun_slots.z == 0) {
+		return 1.0;
+	}
+	return frp_height_fog_cloud_multiple_visibility(world_position_m);
+}
+
+#endif // FFOG_VOLUME_ENVIRONMENT_VISIBILITY_GLSLINC

@@ -349,6 +349,11 @@ struct ImplementationData {
 	vec4 cloud_projection_parameters[35]; // addon-owned world-to-cloud projection packet.
 	vec4 cloud_transparency_parameters; // enabled, cloud depth soft distance in km, padding.
 	vec4 atmosphere_cloud_mapping; // atmosphere sun 0/1 -> cloud slot, then map-valid flags (Sky-only included).
+	uint frp_volume_output_enabled;
+	uint frp_volume_output_pad0;
+	uint frp_volume_output_pad1;
+	uint frp_volume_output_pad2;
+	vec4 frp_volume_sampling_parameters[5]; // ABI v1: (B,O,S,pixelSize), grid, atlas, (start,far,near,P0), inverseAtlas/valid.
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -485,6 +490,7 @@ layout(set = 1, binding = 26) uniform texture2D normal_roughness_buffer;
 
 #ifndef MODE_FRP_LIGHTING
 layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
+layout(set = 1, binding = 34) uniform texture3D frp_volume_output_texture;
 #endif
 #ifdef MODE_FRP_LIGHTING
 #ifdef USE_MULTIVIEW

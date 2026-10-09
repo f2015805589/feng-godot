@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+#include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -72,6 +73,20 @@ static bool _frp_get_ready_sky_lighting_source(const RenderDataRD *p_render_data
 	// the registry revision is only a source/cache token, not a readiness gate.
 	r_source.captured_exposure = p_sky.sky_get_external_radiance_exposure(r_source.sky);
 	return true;
+}
+
+static bool _frp_validate_volume_output(RID p_texture, const PackedFloat32Array &p_parameters) {
+	if (!p_texture.is_valid() || p_parameters.size() != 20 || !RD::get_singleton()->texture_is_valid(p_texture)) {
+		return false;
+	}
+	const RD::TextureFormat format = RD::get_singleton()->texture_get_format(p_texture);
+	if (format.texture_type != RD::TEXTURE_TYPE_3D || format.format != RD::DATA_FORMAT_R16G16B16A16_SFLOAT || !(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT)) {
+		return false;
+	}
+	const int width = int(Math::round(p_parameters[8]));
+	const int height = int(Math::round(p_parameters[9]));
+	const int depth = int(Math::round(p_parameters[10]));
+	return width > 0 && height > 0 && depth > 0 && format.width == uint32_t(width) && format.height == uint32_t(height) && format.depth == uint32_t(depth);
 }
 
 // A pass label is only emitted by RenderingDeviceGraph when at least one graph
@@ -914,6 +929,9 @@ uint32_t RenderFRPClustered::_setup_environment(const RenderDataRD *p_render_dat
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
 	scene_state.ubo.pre_exposure = current_pre_exposure;
+	scene_state.ubo.frp_volume_output_enabled = 0;
+	memset(scene_state.ubo.frp_volume_output_pad, 0, sizeof(scene_state.ubo.frp_volume_output_pad));
+	memset(scene_state.ubo.frp_volume_sampling_parameters, 0, sizeof(scene_state.ubo.frp_volume_sampling_parameters));
 	scene_state.ubo.atmosphere_enabled = 0;
 	scene_state.ubo.atmosphere_light_indices[0] = UINT32_MAX;
 	scene_state.ubo.atmosphere_light_indices[1] = UINT32_MAX;
@@ -1001,6 +1019,27 @@ void RenderFRPClustered::_setup_height_fog(uint32_t p_uniform_buffer_index, cons
 	scene_state.ubo.height_fog_enabled = 1;
 	memcpy(scene_state.ubo.height_fog_camera_position, p_parameters.ptr(), sizeof(scene_state.ubo.height_fog_camera_position));
 	memcpy(scene_state.ubo.height_fog_parameters, p_parameters.ptr() + 4, sizeof(scene_state.ubo.height_fog_parameters));
+	RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
+}
+
+void RenderFRPClustered::_setup_volume_sampling_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, bool p_enable_sampling) {
+	ERR_FAIL_INDEX(p_uniform_buffer_index, scene_state.implementation_uniform_buffers.size());
+	scene_state.ubo.frp_volume_output_enabled = 0;
+	memset(scene_state.ubo.frp_volume_output_pad, 0, sizeof(scene_state.ubo.frp_volume_output_pad));
+	memset(scene_state.ubo.frp_volume_sampling_parameters, 0, sizeof(scene_state.ubo.frp_volume_sampling_parameters));
+
+	if (p_context.is_valid() && p_context->has_volume_output()) {
+		const PackedFloat32Array parameters = p_context->get_volume_sampling_parameters();
+		if (_frp_validate_volume_output(p_context->get_volume_texture(), parameters)) {
+			memcpy(scene_state.ubo.frp_volume_sampling_parameters, parameters.ptr(), sizeof(scene_state.ubo.frp_volume_sampling_parameters));
+			// Packet validity is also consumed by analytic Height Fog to exclude
+			// the integrated-volume depth range. Sampling may be disabled here
+			// because composition is queued for the late fullscreen stage.
+			scene_state.ubo.frp_volume_output_enabled = p_enable_sampling ? 1 : 0;
+		} else {
+			ERR_PRINT_ONCE("FRP volume output must be a sampleable RGBA16F 3D texture whose dimensions match its 20-float sampling packet.");
+		}
+	}
 	RD::get_singleton()->buffer_update(scene_state.implementation_uniform_buffers[p_uniform_buffer_index], 0, sizeof(SceneState::UBO), &scene_state.ubo);
 }
 
@@ -1877,6 +1916,239 @@ void RenderFRPClustered::_prepare_lighting(RenderDataRD *p_render_data) {
 	}
 }
 
+void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data, bool p_depth_prepass_enabled) {
+	if (!p_context.is_valid()) {
+		return;
+	}
+	p_context->clear_volume_frame_inputs();
+	if (p_render_data == nullptr || p_render_data->scene_data == nullptr || p_render_data->render_buffers.is_null()) {
+		return;
+	}
+
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	Ref<RenderSceneBuffersRD> render_buffers = p_render_data->render_buffers;
+	const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+	const Size2i internal_size = render_buffers->get_internal_size();
+	const int view_count = CLAMP(int(scene_data->view_count), 1, RendererSceneRender::MAX_RENDER_VIEWS);
+	const uint32_t cluster_tile_size = p_render_data->cluster_size;
+	const uint32_t cluster_width = cluster_tile_size > 0 ? (uint32_t(internal_size.x) + cluster_tile_size - 1) / cluster_tile_size : 0;
+	const uint32_t cluster_height = cluster_tile_size > 0 ? (uint32_t(internal_size.y) + cluster_tile_size - 1) / cluster_tile_size : 0;
+	const uint32_t cluster_max_elements_per_cell = p_render_data->cluster_max_elements;
+	const uint32_t cluster_type_count = 5; // omni, spot, area, decal, reflection probe.
+	const uint32_t cluster_header_words = 32;
+	const uint32_t max_cluster_element_count_div_32 = cluster_max_elements_per_cell / 32;
+	const uint64_t cluster_type_stride_words = uint64_t(cluster_width) * cluster_height * (max_cluster_element_count_div_32 + cluster_header_words);
+	const uint64_t frame_generation = RSG::rasterizer->get_frame_number();
+	const int64_t camera_generation = int64_t(render_buffers->get_instance_id());
+	const RID render_target = render_buffers->get_render_target();
+	const RID shadow_atlas_texture = light_storage->owns_shadow_atlas(p_render_data->shadow_atlas) ? light_storage->shadow_atlas_get_texture(p_render_data->shadow_atlas) : RID();
+	const RID directional_shadow_atlas_texture = light_storage->directional_shadow_get_texture();
+	const RID area_profile_atlas_texture = texture_storage->area_light_atlas_get_texture();
+
+	FRPPassContext::SkyLightingSource sky_source;
+	bool sky_source_valid = _frp_get_ready_sky_lighting_source(p_render_data, sky, sky_source);
+	RID sky_radiance_texture;
+	RD::TextureFormat sky_format;
+	if (sky_source_valid) {
+		sky_radiance_texture = sky.sky_get_radiance_texture_rd(sky_source.sky);
+		if (!sky_radiance_texture.is_valid() || !RD::get_singleton()->texture_is_valid(sky_radiance_texture)) {
+			sky_source_valid = false;
+			sky_radiance_texture = RID();
+		} else {
+			sky_format = RD::get_singleton()->texture_get_format(sky_radiance_texture);
+		}
+	}
+	if (!sky_source_valid) {
+		sky_source = FRPPassContext::SkyLightingSource();
+	}
+	const float sky_energy = sky_source_valid && Math::is_finite(sky_source.energy) ? MAX(0.0f, sky_source.energy) : 0.0f;
+	const uint64_t sky_revision = sky_source_valid ? sky.sky_get_external_radiance_revision(sky_source.sky) : 0;
+	const float sky_uv_border_size = sky_source_valid ? sky.sky_get_uv_border_size(sky_source.sky) : 0.0f;
+	const int sky_radiance_size = sky_source_valid ? MAX(1, sky.sky_get_radiance_size(sky_source.sky)) : 0;
+	float camera_exposure_normalization = 1.0f;
+	if (p_render_data->camera_attributes.is_valid()) {
+		camera_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+	}
+	if (!Math::is_finite(camera_exposure_normalization) || camera_exposure_normalization <= 0.0f) {
+		camera_exposure_normalization = 1.0f;
+	}
+	const float luminance_multiplier = Math::is_finite(render_buffers->get_luminance_multiplier()) && render_buffers->get_luminance_multiplier() > 0.0f ? render_buffers->get_luminance_multiplier() : 1.0f;
+	const float scene_normalization = p_context->get_scene_exposure_normalization();
+	const float light_buffer_exposure_normalization = current_eye_adaptation_enabled ? 1.0f : camera_exposure_normalization;
+
+	Array directional_light_base_rids;
+	directional_light_base_rids.resize(p_render_data->directional_light_count);
+	for (uint32_t i = 0; i < p_render_data->directional_light_count; i++) {
+		directional_light_base_rids[i] = light_storage->get_directional_light_base_rid(i);
+	}
+	Array omni_light_base_rids;
+	const uint32_t omni_light_count = light_storage->get_omni_light_count();
+	omni_light_base_rids.resize(omni_light_count);
+	for (uint32_t i = 0; i < omni_light_count; i++) {
+		omni_light_base_rids[i] = light_storage->get_omni_light_base_rid(i);
+	}
+	Array spot_light_base_rids;
+	const uint32_t spot_light_count = light_storage->get_spot_light_count();
+	spot_light_base_rids.resize(spot_light_count);
+	for (uint32_t i = 0; i < spot_light_count; i++) {
+		spot_light_base_rids[i] = light_storage->get_spot_light_base_rid(i);
+	}
+	Array area_light_base_rids;
+	const uint32_t area_light_count = light_storage->get_area_light_count();
+	area_light_base_rids.resize(area_light_count);
+	for (uint32_t i = 0; i < area_light_count; i++) {
+		area_light_base_rids[i] = light_storage->get_area_light_base_rid(i);
+	}
+	int cloud_primary_sun_directional_index = -1;
+	int cloud_secondary_sun_directional_index = -1;
+	for (uint32_t i = 0; i < p_render_data->directional_light_count; i++) {
+		const RID base_light = light_storage->get_directional_light_base_rid(i);
+		if (base_light.is_valid() && base_light == p_context->get_cloud_sun(0)) {
+			cloud_primary_sun_directional_index = int(i);
+		}
+		if (base_light.is_valid() && base_light == p_context->get_cloud_sun(1)) {
+			cloud_secondary_sun_directional_index = int(i);
+		}
+	}
+
+	for (int view = 0; view < view_count; view++) {
+		Dictionary inputs;
+		const Vector3 eye_offset = scene_data->view_eye_offset[view];
+		// RenderSceneDataRD's per-view projection includes the center-to-eye
+		// translation. The frame transform below already moves its origin to the
+		// eye, so remove only that translation here; any relative eye rotation
+		// remains in the projection. Inverse projection then returns a position
+		// relative to the eye origin in the center camera basis.
+		const Projection remove_eye_translation(Transform3D(Basis(), eye_offset));
+		const Projection current_projection = scene_data->get_view_projection(view) * remove_eye_translation;
+		Projection current_unjittered_projection_correction;
+		current_unjittered_projection_correction.set_depth_correction(scene_data->flip_y);
+		const Projection current_unjittered_projection = current_unjittered_projection_correction *
+				scene_data->view_projection[view] * remove_eye_translation;
+		Projection previous_projection_correction;
+		previous_projection_correction.set_depth_correction(scene_data->flip_y);
+		previous_projection_correction.add_jitter_offset(scene_data->prev_taa_jitter);
+		const Projection previous_projection = previous_projection_correction *
+				scene_data->prev_view_projection[view] * remove_eye_translation;
+		Projection previous_unjittered_projection_correction;
+		previous_unjittered_projection_correction.set_depth_correction(scene_data->flip_y);
+		const Projection previous_unjittered_projection = previous_unjittered_projection_correction *
+				scene_data->prev_view_projection[view] * remove_eye_translation;
+		Transform3D current_camera_transform = scene_data->cam_transform;
+		current_camera_transform.origin += current_camera_transform.basis.xform(eye_offset);
+		Transform3D previous_camera_transform = scene_data->prev_cam_transform;
+		previous_camera_transform.origin += previous_camera_transform.basis.xform(eye_offset);
+
+		inputs["abi_version"] = 1;
+		inputs["valid"] = true;
+		inputs["frame_generation"] = int64_t(frame_generation);
+		inputs["camera_generation"] = camera_generation;
+		inputs["render_target_id"] = int64_t(render_target.get_id());
+		// Identity metadata only. This is not read as an Environment/Sky fallback.
+		inputs["environment_id"] = int64_t(p_render_data->environment.get_id());
+		inputs["view_index"] = view;
+		inputs["view_count"] = view_count;
+		inputs["internal_size"] = internal_size;
+		inputs["depth_prepass_enabled"] = p_depth_prepass_enabled;
+		// camera_transform is at the eye origin and retains the center camera basis.
+		// The projection has had its eye translation removed, so its inverse returns
+		// positions relative to that origin in the center basis. Addons must not apply
+		// eye_offset a second time. The renderer does not retain a previous eye offset;
+		// history owners must invalidate when this value changes between frames.
+		inputs["projection_contract"] = String("per_eye_origin_center_basis_v1");
+		inputs["eye_offset"] = eye_offset;
+		inputs["previous_eye_offset"] = eye_offset; // No previous per-view offset is retained by RenderSceneDataRD.
+		inputs["projection"] = current_projection;
+		inputs["inverse_projection"] = current_projection.inverse();
+		inputs["projection_unjittered"] = current_unjittered_projection;
+		inputs["inverse_projection_unjittered"] = current_unjittered_projection.inverse();
+		inputs["previous_projection"] = previous_projection;
+		inputs["previous_inverse_projection"] = previous_projection.inverse();
+		inputs["previous_projection_unjittered"] = previous_unjittered_projection;
+		inputs["previous_inverse_projection_unjittered"] = previous_unjittered_projection.inverse();
+		inputs["taa_jitter"] = scene_data->taa_jitter;
+		inputs["previous_taa_jitter"] = scene_data->prev_taa_jitter;
+		inputs["camera_transform"] = current_camera_transform;
+		inputs["previous_camera_transform"] = previous_camera_transform;
+		inputs["camera_origin"] = current_camera_transform.origin;
+		inputs["near_plane_m"] = scene_data->z_near;
+		inputs["far_plane_m"] = scene_data->z_far;
+		inputs["pre_exposure"] = p_context->get_pre_exposure(view);
+		inputs["scene_normalization"] = scene_normalization;
+		inputs["luminance_multiplier"] = luminance_multiplier;
+		inputs["camera_exposure_normalization"] = camera_exposure_normalization;
+		// LightStorage bakes camera exposure into direct-light buffers only when
+		// FRP eye adaptation is off. Keep that source-domain factor separate from
+		// scene_normalization (which also removes the luminance multiplier).
+		inputs["light_buffer_exposure_normalization"] = light_buffer_exposure_normalization;
+
+		inputs["directional_light_buffer"] = light_storage->get_directional_light_buffer();
+		inputs["directional_light_count"] = int(p_render_data->directional_light_count);
+		inputs["directional_light_buffer_capacity"] = int(light_storage->get_max_directional_lights());
+		inputs["directional_light_stride_bytes"] = 464;
+		inputs["directional_light_buffer_usage"] = String("uniform_buffer");
+		inputs["directional_light_base_rids"] = directional_light_base_rids;
+		inputs["omni_light_buffer"] = light_storage->get_omni_light_buffer();
+		inputs["omni_light_count"] = int(omni_light_count);
+		inputs["omni_light_base_rids"] = omni_light_base_rids;
+		inputs["omni_light_stride_bytes"] = 224;
+		inputs["omni_light_buffer_usage"] = String("storage_buffer");
+		inputs["spot_light_buffer"] = light_storage->get_spot_light_buffer();
+		inputs["spot_light_count"] = int(spot_light_count);
+		inputs["spot_light_base_rids"] = spot_light_base_rids;
+		inputs["spot_light_stride_bytes"] = 224;
+		inputs["spot_light_buffer_usage"] = String("storage_buffer");
+		inputs["area_light_buffer"] = light_storage->get_area_light_buffer();
+		inputs["area_light_count"] = int(area_light_count);
+		inputs["area_light_base_rids"] = area_light_base_rids;
+		inputs["area_light_stride_bytes"] = 224;
+		inputs["area_light_buffer_usage"] = String("storage_buffer");
+		inputs["selected_volume_directional_index"] = -1; // Light selection is addon-owned; the matching base RIDs above are authoritative.
+		inputs["cloud_primary_sun_directional_index"] = cloud_primary_sun_directional_index;
+		inputs["cloud_secondary_sun_directional_index"] = cloud_secondary_sun_directional_index;
+
+		inputs["cluster_buffer"] = p_render_data->cluster_buffer;
+		inputs["cluster_layout_version"] = 1;
+		inputs["cluster_tile_size"] = int(cluster_tile_size);
+		inputs["cluster_width"] = int(cluster_width);
+		inputs["cluster_height"] = int(cluster_height);
+		inputs["cluster_max_elements"] = int(cluster_max_elements_per_cell);
+		inputs["cluster_type_count"] = int(cluster_type_count);
+		inputs["cluster_header_words"] = int(cluster_header_words);
+		inputs["cluster_z_bucket_count"] = 32;
+		inputs["cluster_type_stride_words"] = int64_t(cluster_type_stride_words);
+		PackedInt32Array cluster_type_order;
+		cluster_type_order.resize(5);
+		for (int i = 0; i < 5; i++) {
+			cluster_type_order.set(i, i); // omni, spot, area, decal, reflection probe.
+		}
+		inputs["cluster_type_order"] = cluster_type_order;
+
+		inputs["shadow_atlas_source"] = p_render_data->shadow_atlas;
+		inputs["shadow_atlas"] = shadow_atlas_texture;
+		inputs["directional_shadow_atlas"] = directional_shadow_atlas_texture;
+		inputs["shadow_sampler"] = shadow_sampler;
+		inputs["area_profile_atlas"] = area_profile_atlas_texture;
+		inputs["area_profile_sampler"] = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+
+		inputs["sky_light_source_valid"] = sky_source_valid;
+		inputs["sky_light_source"] = sky_source_valid ? sky_source.sky : RID();
+		inputs["sky_radiance_texture"] = sky_source_valid ? sky_radiance_texture : RID();
+		inputs["sky_light_source_owner_id"] = sky_source_valid ? int64_t(sky_source.owner_id) : int64_t(0);
+		inputs["sky_light_source_revision"] = sky_source_valid ? int64_t(sky_source.revision) : int64_t(0);
+		inputs["sky_light_rotation"] = sky_source_valid ? sky_source.rotation : Basis();
+		inputs["sky_light_energy"] = sky_energy;
+		inputs["sky_captured_exposure"] = sky_source_valid && Math::is_finite(sky_source.captured_exposure) && sky_source.captured_exposure > 0.0f ? sky_source.captured_exposure : 1.0f;
+		inputs["sky_light_revision"] = int64_t(sky_revision);
+		inputs["sky_radiance_is_array"] = sky_source_valid && sky_format.texture_type == RD::TEXTURE_TYPE_2D_ARRAY;
+		inputs["sky_uv_border_size"] = sky_uv_border_size;
+		inputs["sky_radiance_size"] = sky_radiance_size;
+
+		p_context->set_volume_frame_input(view, inputs);
+	}
+}
+
 // FRP has no global illumination. SDFGI is never created, so the engine's SDFGI
 // queries report "nothing pending" and its render entry point is never reached.
 // The overrides have to exist: RendererSceneRender declares them pure virtual, and
@@ -2531,6 +2803,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 		}
 		_prepare_lighting(p_render_data);
 		lighting_prepared = true;
+		_publish_volume_frame_inputs(pass_context, p_render_data, depth_pre_pass);
 		if (!pass_context->has_cloud_snapshot()) {
 			// A missing cloud snapshot cancels this probe's own cached batch, but
 			// ordinary viewports and unrelated probes must not break its six faces.
@@ -3158,6 +3431,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						_setup_height_fog(fallback_pass_uniform_buffer_index, height_fog_parameters);
 					}
 					_setup_cloud_lighting_ubo(fallback_pass_uniform_buffer_index, pass_context);
+					const bool volume_composited_after_screen_copy = pass_context->has_volume_output() &&
+							pass_context->is_volume_deferred_composition();
+					_setup_volume_sampling_ubo(fallback_pass_uniform_buffer_index, pass_context, !volume_composited_after_screen_copy);
 					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE_FALLBACK, p_render_data, radiance_texture, samplers, fallback_pass_uniform_buffer_index, true, RID(), environment_radiance_texture, pass_context);
 
 					RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].element_info.ptr(), render_list[RENDER_LIST_OPAQUE_FALLBACK].elements.size(), reverse_cull, PASS_MODE_COLOR, fallback_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
@@ -3347,6 +3623,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					}
 					_setup_cloud_lighting_ubo(transparent_pass_uniform_buffer_index, pass_context);
 					_setup_cloud_transparency_ubo(transparent_pass_uniform_buffer_index, pass_context);
+					_setup_volume_sampling_ubo(transparent_pass_uniform_buffer_index, pass_context, true);
 
 					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true, RID(), environment_radiance_texture, pass_context);
 
@@ -3477,6 +3754,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 			} break;
 		}
+		if (pass_context.is_valid()) {
+			pass_context->dispatch_after_operation_callbacks(p_operation);
+		}
 	};
 	// A pass is what the pipeline resource orders, enables and disables. It runs the
 	// operations its spec entry declares, in that order.
@@ -3494,6 +3774,33 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	// The Core surface a scripted pass runs on. It forwards every primitive to the
 	// same operations the built-in passes call, so a plugin pass and the engine's own
 	// pass execute identical code.
+	uint8_t scheduled_operations[FRPPipelineSpec::OP_MAX] = {};
+	auto mark_pass_operations = [&](int p_pass_id) {
+		if (!FRPPipelineSpec::is_valid_pass_id(p_pass_id)) {
+			return;
+		}
+		const FRPPipelineSpec::NativePass &definition = FRPPipelineSpec::native_pass(p_pass_id);
+		for (int i = 0; i < definition.operation_count; i++) {
+			const int operation = definition.operations[i];
+			if (operation >= 0 && operation < FRPPipelineSpec::OP_MAX) {
+				scheduled_operations[operation] = 1;
+			}
+		}
+	};
+	if (pipeline.is_empty()) {
+		for (int i = 0; i < FRPPipelineSpec::DEFAULT_PASS_ORDER_COUNT; i++) {
+			mark_pass_operations(FRPPipelineSpec::DEFAULT_PASS_ORDER[i]);
+		}
+	} else {
+		for (int i = 0; i < pipeline.size(); i++) {
+			if (pipeline[i] >= 0) {
+				mark_pass_operations(pipeline[i]);
+			}
+		}
+		for (int i = 0; i < pipeline_provided.size(); i++) {
+			mark_pass_operations(pipeline_provided[i]);
+		}
+	}
 	pass_context->setup(
 			const_cast<RenderDataRD *>(p_render_data),
 			[&](int p_operation) { run_builtin_operation(p_operation); },
@@ -3521,7 +3828,23 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 				const float normalization = camera_exposure / luminance_multiplier;
 				return Math::is_finite(normalization) && normalization > 0.0f ? normalization : 1.0f;
-			}());
+			}(),
+			[&](int p_operation) {
+				if (p_operation < 0 || p_operation >= FRPPipelineSpec::OP_MAX || scheduled_operations[p_operation] == 0) {
+					return false;
+				}
+				// Capture-only probes still execute the default transparent pass
+				// boundary, but can lack both a screen/depth copy and transparent
+				// draws. In that case the late scene-color phase is not useful; the
+				// owning effect should keep its existing inline fallback.
+				if (is_reflection_probe && p_operation == FRPPipelineSpec::OP_SCREEN_AND_DEPTH_COPY &&
+						render_list[RENDER_LIST_ALPHA].elements.is_empty() &&
+						!scene_state.used_screen_texture && !global_surface_data.screen_texture_used &&
+						!scene_state.used_depth_texture && !global_surface_data.depth_texture_used) {
+					return false;
+				}
+				return true;
+			});
 	// Publish immutable per-face metadata only for the explicitly configured
 	// FengSkyLight capture source. The native generation changes at each actual
 	// capture start, while all six faces in one batch share it.
@@ -3635,6 +3958,12 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 	if (rb_data.is_valid()) {
 		_render_buffers_debug_draw(p_render_data);
 
+	}
+	if (pass_context.is_valid()) {
+		if (pass_context->has_pending_after_operation_callbacks()) {
+			WARN_PRINT_ONCE("An FRP after-operation callback was queued for an operation that did not execute; the frame-local callback was discarded.");
+		}
+		pass_context->clear_after_operation_callbacks();
 	}
 }
 
@@ -4636,9 +4965,9 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 
 	{
 		// Binding 27 (ambient occlusion), 28/29 (GI ambient/reflection), 30/31 (SDFGI
-		// lightprobe/occlusion), 32 (VoxelGI instances) and 34/35/36 (SSIL/SSR) are
-		// intentionally absent: FRP has no screen space effects and no global
-		// illumination, and its shaders no longer declare those bindings.
+		// lightprobe/occlusion), 32 (VoxelGI instances), and 35/36 (SSIL/SSR) remain
+		// absent: FRP has no screen space effects or generic GI. Binding 34 is the
+		// addon-owned integrated volume sample for forward fallback/transparent draws.
 	}
 
 	if (p_lighting_shader.is_null()) {
@@ -4656,6 +4985,24 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 			vfog = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 		}
 		u.append_id(vfog);
+		uniforms.push_back(u);
+	}
+	if (p_lighting_shader.is_null()) {
+		RD::Uniform u;
+		u.binding = 34;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID volume_output;
+		const bool volume_sample_list = p_render_list == RENDER_LIST_OPAQUE_FALLBACK || p_render_list == RENDER_LIST_ALPHA;
+		if (volume_sample_list && p_cloud_context.is_valid() && p_cloud_context->has_volume_output()) {
+			const PackedFloat32Array parameters = p_cloud_context->get_volume_sampling_parameters();
+			if (_frp_validate_volume_output(p_cloud_context->get_volume_texture(), parameters)) {
+				volume_output = p_cloud_context->get_volume_texture();
+			}
+		}
+		if (!volume_output.is_valid()) {
+			volume_output = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+		}
+		u.append_id(volume_output);
 		uniforms.push_back(u);
 	}
 

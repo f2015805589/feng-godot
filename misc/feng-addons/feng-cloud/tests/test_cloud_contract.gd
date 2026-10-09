@@ -2,6 +2,7 @@ extends SceneTree
 ## Run headlessly for the native packet contract, or add -- --gpu for RD ownership.
 
 const CloudGPU = preload("res://addons/feng-cloud/feng_cloud_gpu.gd")
+const HeightFogPassScript = preload("res://addons/feng-render-pipeline/passes/height_fog_pass.gd")
 
 class OwnedPass extends FengPass:
 	var owned := RID()
@@ -51,6 +52,9 @@ func _initialize() -> void:
 func run() -> void:
 	test_registry_and_material()
 	test_atmosphere_sources()
+	test_cloud_fog_view_depth()
+	test_cloud_volume_composition_shader_assembly()
+	test_cloud_volume_composition_revision_domains()
 	var ctx := FRPPassContext.new()
 	var optical := RenderingServer.texture_2d_placeholder_create()
 	var multiple := RenderingServer.texture_2d_placeholder_create()
@@ -76,6 +80,114 @@ func run() -> void:
 		gpu_done.wait()
 	print("CLOUD CONTRACT PASS" if failures == 0 else "CLOUD CONTRACT FAIL")
 	quit(0 if failures == 0 else 1)
+
+
+func test_cloud_fog_view_depth() -> void:
+	var perspective_ray := Vector3(0.8, 0.3, -1.0).normalized()
+	var perspective_distance := 120.0
+	var perspective_point := perspective_ray * perspective_distance
+	var perspective_view_depth := maxf(-perspective_point.z, 0.0)
+	require(perspective_view_depth < perspective_distance
+		and is_equal_approx(perspective_view_depth, -perspective_ray.z * perspective_distance),
+		"Off-axis cloud tAP distance must be converted to camera view depth before froxel-Z sampling")
+	var orthographic_near_origin := Vector3(0.0, 0.0, -0.2)
+	var orthographic_direction := Vector3(0.0, 0.0, -1.0)
+	var orthographic_ray_distance := 45.0
+	var orthographic_point := orthographic_near_origin \
+			+ orthographic_direction * orthographic_ray_distance
+	var orthographic_view_depth := maxf(-orthographic_point.z, 0.0)
+	require(is_equal_approx(orthographic_view_depth, 45.2),
+		"Orthographic cloud distance must retain the near-plane origin offset")
+	var shader := FileAccess.get_file_as_string(
+			"res://addons/feng-cloud/shaders/cloud_composite.glslinc")
+	require(shader.contains("cloud_frame.world_to_view * vec4(representative_world, 1.0)")
+		and shader.contains("feng_cloud_sample_integrated_volume(uv, cloud_view_depth_m"),
+		"Cloud volume sampling must use the ray representative's reconstructed view-Z")
+
+
+func test_cloud_volume_composition_shader_assembly() -> void:
+	var gpu := CloudGPU.new()
+	var path := "res://addons/feng-cloud/shaders/cloud_composite.glslinc"
+	var loader_source := FileAccess.get_file_as_string("res://addons/feng-cloud/feng_cloud_gpu.gd")
+	require(loader_source.contains("source_text = _assemble_shader_source(source_text, defines)"),
+		"Pipeline compilation must use the source assembly path exercised by this CPU gate")
+	var expanded := gpu._expand_shader(path, 0)
+	require(not expanded.is_empty(), "Cloud composite source and includes must expand through the runtime loader")
+	for deferred in [0, 1]:
+		var assembled := gpu._assemble_shader_source(expanded, {
+			"FENG_CLOUD_VOLUME_DEFERRED": deferred,
+			"FENG_CLOUD_VRT_SECONDARY": 0,
+		})
+		require(not assembled.is_empty(), "Cloud composite assembly failed for deferred mode %d" % deferred)
+		require(assembled.contains("#define FENG_CLOUD_VOLUME_DEFERRED %d" % deferred)
+			and not assembled.contains("#include"),
+			"Cloud composite assembly must inject mode defines after expanding includes")
+		require(assembled.contains("#if FENG_CLOUD_VOLUME_DEFERRED\nFENG_CLOUD_DECLARE_VOLUME_COMPOSITION_OUTPUTS;\n#endif"),
+			"Volume output declaration must be preprocessor guarded in both assembly modes")
+	var main_start := expanded.find("void main()")
+	var bounds_end := expanded.find("\n\t}\n", expanded.find("if (any(greaterThanEqual(pixel, output_size))", main_start))
+	var uv_declaration := expanded.find("vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(max(output_size, ivec2(1)));", main_start)
+	var first_apply := expanded.find("feng_cloud_apply_volume_at_depth(tap_radiance", main_start)
+	var second_apply := expanded.find("feng_cloud_apply_volume_at_depth(cloud_radiance", main_start)
+	require(main_start >= 0 and bounds_end > main_start and uv_declaration > bounds_end
+		and first_apply > uv_declaration and second_apply > uv_declaration,
+		"Main composite must define viewport-local UV after bounds validation and before both volume samples")
+
+
+func test_cloud_volume_composition_revision_domains() -> void:
+	var context := FRPPassContext.new()
+	var native_signature := 0x19283746
+	var gpu_signature := 0x56473829
+	var cloud_packet := PackedFloat32Array()
+	cloud_packet.resize(76)
+	context.set_cloud_snapshot(cloud_packet, RID(), RID(), RID(), RID(),
+			RID(), RID(), native_signature)
+	var gpu := CloudGPU.new()
+	var native_identity: Dictionary = gpu._read_native_cloud_snapshot_signature(context)
+	require(bool(native_identity.get("valid", false))
+		and int(native_identity.get("signature", 0)) == native_signature,
+		"Cloud sidecar publisher must read the exact signature of the current native snapshot")
+	var metadata := {
+		"native_snapshot_source_signature": native_signature,
+		"gpu_source_signature": gpu_signature,
+		"frame_generation": 17,
+		"buffer_id": 91,
+		"view_count": 2,
+		"internal_size": Vector2i(641, 359),
+	}
+	require(gpu_signature != native_signature
+		and HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+			context, metadata, 17, 91, 2, Vector2i(641, 359)),
+		"A current sidecar must validate against native snapshot identity, independently of the GPU cache signature")
+	var mismatch := metadata.duplicate()
+	mismatch["native_snapshot_source_signature"] = native_signature + 1
+	require(not HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+			context, mismatch, 17, 91, 2, Vector2i(641, 359)),
+		"A sidecar from a different native snapshot must be rejected")
+	for field in ["frame_generation", "buffer_id", "view_count", "internal_size"]:
+		mismatch = metadata.duplicate()
+		match field:
+			"frame_generation": mismatch[field] = 18
+			"buffer_id": mismatch[field] = 92
+			"view_count": mismatch[field] = 1
+			"internal_size": mismatch[field] = Vector2i(640, 359)
+		require(not HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+				context, mismatch, 17, 91, 2, Vector2i(641, 359)),
+			"A sidecar with mismatched %s must be rejected" % field)
+	context.set_cloud_snapshot(cloud_packet, RID(), RID(), RID(), RID(),
+			RID(), RID(), native_signature + 2)
+	require(not HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+			context, metadata, 17, 91, 2, Vector2i(641, 359)),
+		"A sidecar from the previous native cloud snapshot must be rejected")
+	context.clear_cloud_snapshot()
+	require(not HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+			context, metadata, 17, 91, 2, Vector2i(641, 359))
+		and not bool(gpu._read_native_cloud_snapshot_signature(context).get("valid", false)),
+		"Clearing the native cloud snapshot must invalidate its sidecar and publisher identity")
+	require(not HeightFogPassScript.cloud_composition_metadata_matches_current_frame(
+			RefCounted.new(), metadata, 17, 91, 2, Vector2i(641, 359))
+		and not bool(gpu._read_native_cloud_snapshot_signature(RefCounted.new()).get("valid", false)),
+		"Unsupported contexts must fail closed without calling missing native getters")
 
 
 func test_atmosphere_sources() -> void:

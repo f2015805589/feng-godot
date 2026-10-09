@@ -1,0 +1,115 @@
+#[compute]
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
+layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
+layout(set = 0, binding = 2, std140) uniform CompositeFrame {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 camera_position;
+	vec4 height_fog_parameters[6];
+	vec4 cloud_control; // view index, sidecar valid, reserved.
+} composite_frame;
+layout(set = 0, binding = 12) uniform sampler2DArray cloud_fog_radiance;
+layout(set = 0, binding = 13) uniform sampler2DArray cloud_fog_transmittance;
+
+#include "../../../feng-render-pipeline/library/height-fog/volumetric_fog_sampling.glslinc"
+#include "../../../feng-render-pipeline/library/height-fog/exponential_height_fog.glslinc"
+
+vec3 volume_composite_view_position(vec2 uv, float device_depth) {
+	vec4 view_h = composite_frame.inverse_projection * vec4(uv * 2.0 - 1.0, device_depth, 1.0);
+	return abs(view_h.w) > 1.0e-8 ? view_h.xyz / view_h.w : vec3(0.0);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 extent = imageSize(color_image);
+	if (any(greaterThanEqual(pixel, extent))) {
+		return;
+	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+	float device_depth = texelFetch(depth_buffer, pixel, 0).r;
+	vec3 view_position;
+	float view_ray_cosine;
+	if (device_depth > 0.0) {
+		view_position = volume_composite_view_position(uv, device_depth);
+		view_ray_cosine = abs(view_position.z) / max(length(view_position), 1.0e-6);
+	} else {
+		vec3 near_position = volume_composite_view_position(uv, 1.0);
+		vec3 middle_position = volume_composite_view_position(uv, 0.5);
+		view_position = normalize(middle_position - near_position) * 1000000.0;
+		view_ray_cosine = abs(normalize(middle_position - near_position).z);
+	}
+	float view_depth_m = max(-view_position.z, 0.0);
+	vec3 camera_to_receiver = mat3(composite_frame.view_to_world) * view_position;
+	vec4 volume = feng_sample_integrated_volume(uv, view_depth_m, vec2(extent));
+	vec4 scene = imageLoad(color_image, pixel);
+	float transmittance = clamp(volume.a, 0.0, 1.0);
+	vec4 analytic_fog = frp_evaluate_exponential_height_fog(camera_to_receiver,
+			view_ray_cosine, composite_frame.camera_position.xyz,
+			composite_frame.height_fog_parameters[0],
+			composite_frame.height_fog_parameters[1],
+			composite_frame.height_fog_parameters[2],
+			composite_frame.height_fog_parameters[3],
+			composite_frame.height_fog_parameters[4],
+			composite_frame.height_fog_parameters[5],
+			composite_frame.height_fog_parameters[2].z,
+			feng_volume_sampling.analytic_control.x,
+			feng_volume_sampling.analytic_control.y);
+	float analytic_transmittance = analytic_fog.a;
+	vec3 analytic_source = analytic_fog.rgb
+			* max(feng_volume_sampling.frame_control.y, 1.0e-8);
+	float fsss_amount = 0.0;
+	vec3 fsss_radiance = vec3(0.0);
+	float fsss_width = feng_fsss_blur_width(transmittance * analytic_transmittance,
+			view_depth_m);
+	bool fsss_requested = feng_volume_sampling.frame_control.z > 0.5;
+	if (fsss_requested && !(fsss_width > 0.0)) {
+		// W<=0 is UE's clip/no-write case. This also keeps cloud radiance and
+		// opacity untouched when the fog contributes no scattering width.
+		imageStore(color_image, pixel, scene);
+		return;
+	}
+	bool use_fsss = fsss_requested;
+	if (use_fsss) {
+		float maximum_mip = max(float(textureQueryLevels(feng_fsss_scattering_mips) - 1), 1.0);
+		float combined_fog_transmittance = transmittance * analytic_transmittance;
+		fsss_amount = feng_fsss_scene_scattering_amount(combined_fog_transmittance);
+		float final_transmittance = combined_fog_transmittance * (1.0 - fsss_amount);
+		float fsss_mip = feng_fsss_blur_mip(combined_fog_transmittance,
+				final_transmittance, view_depth_m, maximum_mip);
+		fsss_radiance = textureLod(feng_fsss_scattering_mips, uv, fsss_mip).rgb;
+		fsss_radiance *= clamp(fsss_width, 0.0, 1.0);
+	}
+	vec3 result;
+	if (composite_frame.cloud_control.y > 0.5) {
+		ivec3 cloud_coord = ivec3(pixel, int(composite_frame.cloud_control.x));
+		vec3 cloud_radiance = texelFetch(cloud_fog_radiance, cloud_coord, 0).rgb;
+		vec3 cloud_transmittance = clamp(texelFetch(
+				cloud_fog_transmittance, cloud_coord, 0).rgb, vec3(0.0), vec3(1.0));
+		if (use_fsss) {
+			vec3 cloud_and_height_source = cloud_radiance
+					+ cloud_transmittance * analytic_source;
+			vec3 scene_residual = scene.rgb - cloud_and_height_source;
+			result = fsss_radiance + transmittance * (1.0 - fsss_amount)
+					* scene_residual;
+		} else {
+			result = cloud_transmittance * volume.rgb
+					+ transmittance * scene.rgb
+					+ (1.0 - transmittance) * cloud_radiance;
+		}
+	} else {
+		if (use_fsss) {
+			vec3 scene_residual = scene.rgb - analytic_source;
+			result = fsss_radiance + transmittance * (1.0 - fsss_amount)
+					* scene_residual;
+		} else {
+			result = volume.rgb + transmittance * scene.rgb;
+		}
+	}
+	result = mix(result, vec3(0.0), isnan(result));
+	result = clamp(result, vec3(-65504.0), vec3(65504.0));
+	imageStore(color_image, pixel, vec4(result, scene.a));
+}

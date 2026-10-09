@@ -1,0 +1,45 @@
+// UE VolumetricFog.usf::ApplyDepthConstraintsToOffset defaults:
+// GridCenterOffsetFromDepthBuffer=0.5, OffsetThresholdToAcceptDepthBufferOffset=1.
+float feng_fog_depth_constrained_slice(sampler2D scene_depth_texture,
+		vec3 cell, inout vec3 sample_offset, vec2 unjittered_viewport_uv) {
+	float sample_slice = cell.z + sample_offset.z;
+	if (fog_frame.log_z_params.w <= 0.5) {
+		return max(sample_slice, 0.0);
+	}
+	float sample_depth = feng_fog_depth_from_slice(max(sample_slice, 0.0));
+	vec3 sample_view = feng_fog_view_position(unjittered_viewport_uv, sample_depth);
+	vec4 sample_clip = fog_frame.current_depth_projection * vec4(sample_view, 1.0);
+	if (!(sample_clip.w > 1.0e-7) || isnan(sample_clip.w) || isinf(sample_clip.w)) {
+		return max(sample_slice, 0.0);
+	}
+	vec2 projected_uv = sample_clip.xy / sample_clip.w * 0.5 + 0.5;
+	ivec2 depth_size = textureSize(scene_depth_texture, 0);
+	if (any(lessThanEqual(depth_size, ivec2(0)))) {
+		return max(sample_slice, 0.0);
+	}
+	vec2 half_texel = 0.5 / vec2(depth_size);
+	vec2 depth_uv = clamp(projected_uv, half_texel, vec2(1.0) - half_texel);
+	ivec2 depth_pixel = clamp(ivec2(floor(depth_uv * vec2(depth_size))),
+			ivec2(0), depth_size - ivec2(1));
+	float device_depth = texelFetch(scene_depth_texture, depth_pixel, 0).r;
+	if (isnan(device_depth) || isinf(device_depth)) {
+		return max(sample_slice, 0.0);
+	}
+	vec4 scene_view_h = fog_frame.current_depth_inverse_projection
+			* vec4(depth_uv * 2.0 - 1.0, device_depth, 1.0);
+	if (abs(scene_view_h.w) <= 1.0e-8 || isnan(scene_view_h.w) || isinf(scene_view_h.w)) {
+		return max(sample_slice, 0.0);
+	}
+	float scene_view_depth = max(-scene_view_h.z / scene_view_h.w, 0.0);
+	float scene_slice = log2(max(scene_view_depth * fog_frame.log_z_params.x
+			+ fog_frame.log_z_params.y, 1.0e-12)) * fog_frame.log_z_params.z;
+	float depth_slice_with_offset = scene_slice - 0.5;
+	float delta_to_front = depth_slice_with_offset - sample_slice;
+	if (delta_to_front < 0.0 && -delta_to_front < 1.0) {
+		sample_offset.z += delta_to_front;
+	}
+	// UE clamps GridCoordinate.z + LocalFrameJitterOffset.z to the near slice
+	// before ComputeDepthFromZSlice. Keep the signed offset itself untouched so
+	// the matching light/RT sample applies the same near-plane clamp.
+	return max(cell.z + sample_offset.z, 0.0);
+}

@@ -1,0 +1,84 @@
+#ifndef FENG_VOLUMETRIC_FOG_SAMPLING_GLSLINC
+#define FENG_VOLUMETRIC_FOG_SAMPLING_GLSLINC
+
+layout(set = 0, binding = 9) uniform sampler3D feng_integrated_volumetric_fog;
+layout(set = 0, binding = 10) uniform sampler2D feng_fsss_scattering_mips;
+layout(set = 0, binding = 11, std140) uniform FengVolumeSamplingData {
+	vec4 sample_packet[5]; // Stable FRPVolumeFrameInputs output packet, 20 floats.
+	vec4 frame_control; // view index, current pre-exposure, FSSS enabled, volume valid.
+	vec4 fsss_control; // amount scale, amount power, spread scale, blur control.
+	vec4 analytic_control; // volume exclusion active, volume far distance in meters, reserved.
+} feng_volume_sampling;
+
+vec3 feng_volume_grid_size() {
+	return feng_volume_sampling.sample_packet[1].xyz;
+}
+
+bool feng_volume_output_valid() {
+	return feng_volume_sampling.sample_packet[4].w > 0.5
+			&& feng_volume_sampling.frame_control.w > 0.5;
+}
+
+vec4 feng_sample_integrated_volume(vec2 viewport_uv, float scene_view_depth_m,
+		vec2 viewport_size) {
+	if (!feng_volume_output_valid() || scene_view_depth_m <= feng_volume_sampling.sample_packet[3].x) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec4 depth_params = feng_volume_sampling.sample_packet[0];
+	vec3 grid = feng_volume_grid_size();
+	vec4 atlas = feng_volume_sampling.sample_packet[2];
+	scene_view_depth_m = clamp(scene_view_depth_m,
+			feng_volume_sampling.sample_packet[3].x,
+			max(feng_volume_sampling.sample_packet[3].y,
+				feng_volume_sampling.sample_packet[3].x + 1.0e-4));
+	float depth_argument = max(scene_view_depth_m * depth_params.x + depth_params.y, 1.0e-12);
+	float slice = log2(depth_argument) * depth_params.z;
+	if (isnan(slice) || isinf(slice) || slice < 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	float view_index = max(feng_volume_sampling.frame_control.x, 0.0);
+	float pixel_size = max(depth_params.w, 1.0);
+	vec2 xy_cell = clamp(viewport_uv, vec2(0.0), vec2(1.0))
+			* max(viewport_size, vec2(1.0)) / pixel_size;
+	xy_cell = clamp(xy_cell, vec2(0.5), grid.xy - vec2(0.5));
+	float local_x = view_index * atlas.w + xy_cell.x;
+	vec3 uvw = vec3(local_x / max(atlas.x, 1.0), xy_cell.y / max(atlas.y, 1.0),
+			clamp(slice, 0.5, grid.z - 0.5) / max(atlas.z, 1.0));
+	vec4 integrated = textureLod(feng_integrated_volumetric_fog, uvw, 0.0);
+	float stored_pre_exposure = max(feng_volume_sampling.sample_packet[3].w, 1.0e-8);
+	float exposure_ratio = max(feng_volume_sampling.frame_control.y, 1.0e-8) / stored_pre_exposure;
+	integrated.rgb = clamp(integrated.rgb * exposure_ratio, vec3(0.0), vec3(65504.0));
+	integrated.a = clamp(integrated.a, 0.0, 1.0);
+	return integrated;
+}
+
+float feng_fsss_scene_scattering_amount(float transmittance) {
+	float coverage = clamp(1.0 - transmittance, 0.0, 1.0);
+	float scaled = clamp(coverage * max(feng_volume_sampling.fsss_control.x, 0.0), 0.0, 1.0);
+	float power_value = max(feng_volume_sampling.fsss_control.y, 0.0);
+	return pow(scaled, power_value);
+}
+
+float feng_fsss_blur_width(float transmittance, float scene_depth_m) {
+	float optical_depth = -log(max(transmittance, 1.0e-7));
+	// UE's FSSS PSF width for Albedo=1, Absorption=0, g=0.
+	return sqrt(max(0.375 * scene_depth_m * scene_depth_m * optical_depth, 0.0));
+}
+
+float feng_fsss_blur_mip(float fog_transmittance, float final_transmittance,
+		float scene_depth_m, float maximum_mip) {
+	// UE stores FinalT = FogT * (1 - SceneColorAmount) for mip coverage,
+	// while W and its fade still come from the original, unblurred FogT.
+	float coverage = clamp(1.0 - final_transmittance, 0.0, 1.0);
+	float width_m = feng_fsss_blur_width(fog_transmittance, scene_depth_m);
+	float mip_span = clamp(log2(max(width_m * 0.5, 1.0e-6)), 1.0,
+			max(maximum_mip, 1.0));
+	return clamp(coverage * max(feng_volume_sampling.fsss_control.z, 0.0)
+			* mip_span, 0.0, max(maximum_mip, 0.0));
+}
+
+float feng_fsss_blur_fade(float transmittance, float scene_depth_m) {
+	return clamp(feng_fsss_blur_width(transmittance, scene_depth_m), 0.0, 1.0);
+}
+
+#endif

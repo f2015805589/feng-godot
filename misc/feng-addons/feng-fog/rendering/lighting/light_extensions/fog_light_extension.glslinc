@@ -1,0 +1,150 @@
+#ifndef FENG_FOG_LIGHT_EXTENSION_GLSLINC
+#define FENG_FOG_LIGHT_EXTENSION_GLSLINC
+
+// Set 3 ABI v2. The provider owns all bound output RIDs; consumers borrow
+// them until the next provider update. Record order is omni, spot, area,
+// directional, exactly matching the FRP frame's native base-RID arrays.
+
+const uint FFogLightExtensionABIVersion = 2u;
+const uint FFogLightCookieFeature = 1u;
+const uint FFogCookieMappingDirectional = 1u;
+const uint FFogCookieMappingSpot = 2u;
+const uint FFogCookieMappingOmni = 3u;
+const uint FFogCookieMappingArea = 4u;
+const uint FFogShadowInheritNative = 0u;
+const uint FFogShadowDisabled = 1u;
+const uint FFogShadowHardwareRTOptIn = 2u;
+
+// Native light-buffer indices are type-local. Convert them to the extension
+// record's flattened [omni, spot, area, directional] order with same-frame
+// light counts from the FRP frame input.
+uint ffog_light_extension_record_index(uint native_kind, uint native_index,
+		uvec4 native_type_counts) {
+	if (native_kind == 0u && native_index < native_type_counts.x) {
+		return native_index;
+	}
+	if (native_kind == 1u && native_index < native_type_counts.y) {
+		return native_type_counts.x + native_index;
+	}
+	if (native_kind == 2u && native_index < native_type_counts.z) {
+		return native_type_counts.x + native_type_counts.y + native_index;
+	}
+	if (native_kind == 3u && native_index < native_type_counts.w) {
+		return native_type_counts.x + native_type_counts.y + native_type_counts.z + native_index;
+	}
+	return 0xffffffffu;
+}
+
+struct FFogLightExtensionRecord {
+	mat4 world_to_light;
+	vec4 mapping_data; // range_m, tan_half_spot_angle, area_half_width_m, area_half_height_m
+	vec4 mapping_scale_offset; // scale.xy, offset.xy
+	vec4 barn_door; // cos_angle, length_m, enabled, cookie_strength
+	uvec4 mode_flags; // mapping_type, cookie layer (0xffffffff = none), shadow policy, feature bits
+	vec4 capsule_source_shape; // source_length_m, local_axis_index (0=X,1=Y,2=Z), reserved, reserved
+};
+
+layout(std430, set = 3, binding = 0) readonly buffer FFogLightExtensionRecords {
+	FFogLightExtensionRecord ffog_light_extension_records[];
+};
+layout(set = 3, binding = 1) uniform sampler2DArray ffog_light_cookie_array;
+layout(std140, set = 3, binding = 2) uniform FFogLightExtensionHeader {
+	uvec4 ffog_light_extension_header; // ABI, record count, cookie layer count, frame generation low32
+};
+
+bool ffog_light_extension_project_cookie(FFogLightExtensionRecord record,
+		vec3 world_position, out vec2 uv) {
+	vec3 local_position = (record.world_to_light * vec4(world_position, 1.0)).xyz;
+	uint mapping_type = record.mode_flags.x;
+	float range_m = record.mapping_data.x;
+	if (range_m <= 1e-6) {
+		return false;
+	}
+	if (mapping_type == FFogCookieMappingDirectional) {
+		uv = local_position.xy / (2.0 * range_m) + vec2(0.5);
+	} else if (mapping_type == FFogCookieMappingSpot) {
+		float depth = -local_position.z;
+		float tangent = record.mapping_data.y;
+		if (depth <= 1e-4 || depth > range_m || tangent <= 1e-6) {
+			return false;
+		}
+		uv = local_position.xy / (2.0 * depth * tangent) + vec2(0.5);
+	} else if (mapping_type == FFogCookieMappingOmni) {
+		float distance_to_light = length(local_position);
+		if (distance_to_light <= 1e-4 || distance_to_light > range_m) {
+			return false;
+		}
+		vec3 direction = local_position / distance_to_light;
+		uv = direction.xy / (1.0 + abs(direction.z)) * 0.5 + vec2(0.5);
+	} else if (mapping_type == FFogCookieMappingArea) {
+		vec2 half_size = record.mapping_data.zw;
+		float depth = -local_position.z;
+		if (depth <= 0.0 || depth > range_m ||
+				any(lessThanEqual(half_size, vec2(1e-6)))) {
+			return false;
+		}
+		uv = vec2(local_position.x / (2.0 * half_size.x),
+				-local_position.y / (2.0 * half_size.y)) + vec2(0.5);
+	} else {
+		return false;
+	}
+	uv = uv * record.mapping_scale_offset.xy + record.mapping_scale_offset.zw;
+	return all(greaterThanEqual(uv, vec2(0.0))) &&
+			all(lessThanEqual(uv, vec2(1.0)));
+}
+
+// Missing or disabled cookies deliberately return neutral white. The caller
+// multiplies this value into the native light color exactly once.
+vec3 ffog_light_function_color(uint light_record_index, vec3 world_position) {
+	if (ffog_light_extension_header.x != FFogLightExtensionABIVersion ||
+			light_record_index >= ffog_light_extension_header.y) {
+		return vec3(1.0);
+	}
+	FFogLightExtensionRecord record = ffog_light_extension_records[light_record_index];
+	uint layer = record.mode_flags.y;
+	if ((record.mode_flags.w & FFogLightCookieFeature) == 0u ||
+			layer == 0xffffffffu || layer >= ffog_light_extension_header.z ||
+			record.barn_door.w <= 0.0) {
+		return vec3(1.0);
+	}
+	vec2 uv;
+	if (!ffog_light_extension_project_cookie(record, world_position, uv)) {
+		return vec3(1.0);
+	}
+	vec3 sampled = textureLod(ffog_light_cookie_array, vec3(uv, float(layer)), 0.0).rgb;
+	return mix(vec3(1.0), sampled, clamp(record.barn_door.w, 0.0, 1.0));
+}
+
+float ffog_light_capsule_source_length_m(FFogLightExtensionRecord record) {
+	return ffog_light_extension_header.x == FFogLightExtensionABIVersion
+			? max(record.capsule_source_shape.x, 0.0) : 0.0;
+}
+
+vec3 ffog_light_capsule_axis_world(FFogLightExtensionRecord record) {
+	if (ffog_light_extension_header.x != FFogLightExtensionABIVersion) {
+		return vec3(0.0, 1.0, 0.0);
+	}
+	uint axis_index = uint(clamp(round(record.capsule_source_shape.y), 0.0, 2.0));
+	vec3 local_axis = axis_index == 0u ? vec3(1.0, 0.0, 0.0)
+			: axis_index == 1u ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+	// world_to_light is orthonormalized by the main-thread snapshot; transpose
+	// therefore maps the explicit local axis back into world space.
+	vec3 world_axis = transpose(mat3(record.world_to_light)) * local_axis;
+	float axis_length_squared = dot(world_axis, world_axis);
+	return axis_length_squared > 1.0e-8 && !isnan(axis_length_squared)
+			&& !isinf(axis_length_squared)
+			? world_axis * inversesqrt(axis_length_squared) : vec3(0.0, 1.0, 0.0);
+}
+
+// Exposes the extension's per-light shadow request without claiming that a
+// backend's raster shadow atlas is a hardware RT result.
+uint ffog_light_extension_shadow_policy(uint light_record_index) {
+	if (ffog_light_extension_header.x != FFogLightExtensionABIVersion ||
+			light_record_index >= ffog_light_extension_header.y) {
+		return FFogShadowInheritNative;
+	}
+	return ffog_light_extension_records[light_record_index].mode_flags.z;
+}
+
+#endif // FENG_FOG_LIGHT_EXTENSION_GLSLINC
+

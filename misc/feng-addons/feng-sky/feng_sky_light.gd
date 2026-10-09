@@ -50,6 +50,11 @@ enum SourceMode { CAPTURED_SCENE, SPECIFIED_CUBEMAP, SPECIFIED_SKY }
 		radiance_energy = maxf(value if is_finite(value) else 0.0, 0.0)
 		_project_cached_panorama()
 		_refresh_provider()
+## Multiplier applied by volumetric media to the SkyLight contribution. This is
+## separate from radiance_energy and defaults to UE's SkyLight setting of 1.
+@export_range(0.0, 64.0, 0.01, "or_greater") var volumetric_scattering_intensity := 1.0:
+	set(value):
+		volumetric_scattering_intensity = maxf(value if is_finite(value) else 0.0, 0.0)
 @export var realtime_capture := true:
 	set(value):
 		if realtime_capture == value:
@@ -593,6 +598,24 @@ func _feng_sky_light_runtime_snapshot() -> Dictionary:
 		"energy": radiance_energy,
 		"rotation": _radiance_rotation(),
 		"radiance_sh": _radiance_sh,
+	}
+
+
+## Plain metadata for volumetric fog's render-thread frame handshake. This path
+## must never request the CPU SH snapshot or trigger an RD radiance readback.
+func _feng_sky_light_volumetric_metadata() -> Dictionary:
+	var is_ready := _provider_active and _native_radiance_ready \
+			and _external_radiance_enabled and _output_sky != null \
+			and _native_radiance_revision >= 0
+	return {
+		"ready": is_ready,
+		"provider_id": get_instance_id(),
+		"source_revision": _native_radiance_revision if is_ready else -1,
+		"radiance_energy": radiance_energy,
+		"volumetric_scattering_intensity": volumetric_scattering_intensity,
+		"captured_exposure": _native_radiance_exposure if is_ready else 1.0,
+		"rotation": _radiance_rotation(),
+		"source_mode": source_mode,
 	}
 
 

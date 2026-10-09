@@ -26,7 +26,7 @@ def main():
     else:
         project = Path(tempfile.mkdtemp(prefix="feng-height-fog-"))
     print("Scratch project:", project, flush=True)
-    selected = {"feng-render-pipeline", "feng-sky", "feng-fog"}
+    selected = {"feng-render-pipeline", "feng-sky", "feng-fog", "feng-cloud"}
     for addon in (ROOT / "misc/feng-addons").iterdir():
         if not addon.is_dir() or not (addon / "plugin.cfg").is_file():
             continue

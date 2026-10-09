@@ -1,0 +1,106 @@
+#ifndef FENG_FOG_CAPSULE_LIGHT_GLSLINC
+#define FENG_FOG_CAPSULE_LIGHT_GLSLINC
+
+#include "light_extensions/fog_light_extension.glslinc"
+
+const float FFogCapsuleMinDistanceBiasMeters = 0.01;
+const float FFogCapsuleEpsilonSquared = 1.0e-12;
+
+struct FFogCapsuleLightIntegral {
+	vec3 direction; // UE's unnormalized average endpoint direction for a line source.
+	float falloff;
+	uint valid;
+};
+
+float ffog_capsule_distance_bias_m(float cell_radius_m,
+		float inverse_squared_distance_bias_scale) {
+	return max(max(cell_radius_m, 0.0) * max(inverse_squared_distance_bias_scale, 0.0),
+			FFogCapsuleMinDistanceBiasMeters);
+}
+
+vec3 ffog_capsule_light_axis_view(FFogLightExtensionRecord record,
+		mat3 world_to_view) {
+	vec3 axis_world = ffog_light_capsule_axis_world(record);
+	vec3 axis_view = world_to_view * axis_world;
+	float axis_length_squared = dot(axis_view, axis_view);
+	return axis_length_squared > FFogCapsuleEpsilonSquared && !isnan(axis_length_squared)
+			&& !isinf(axis_length_squared)
+			? axis_view * inversesqrt(axis_length_squared) : vec3(0.0);
+}
+
+FFogCapsuleLightIntegral ffog_integrate_capsule_light(vec3 to_light,
+		vec3 capsule_axis, float source_length_m, float distance_bias_m,
+		bool inverse_squared) {
+	FFogCapsuleLightIntegral result;
+	result.direction = vec3(0.0);
+	result.falloff = 0.0;
+	result.valid = 0u;
+	float distance_squared = dot(to_light, to_light);
+	if (any(isnan(to_light)) || any(isinf(to_light)) || isnan(distance_squared)
+			|| isinf(distance_squared) || isnan(source_length_m) || isinf(source_length_m)
+			|| isnan(distance_bias_m) || isinf(distance_bias_m)
+			|| source_length_m < 0.0 || distance_bias_m < 0.0) {
+		return result;
+	}
+	if (source_length_m <= 0.0) {
+		result.direction = distance_squared > FFogCapsuleEpsilonSquared
+				? to_light * inversesqrt(distance_squared) : vec3(0.0);
+		result.falloff = inverse_squared
+				? 1.0 / max(distance_squared + distance_bias_m * distance_bias_m,
+						FFogCapsuleEpsilonSquared)
+				: 1.0;
+		result.valid = 1u;
+		return result;
+	}
+	float axis_length_squared = dot(capsule_axis, capsule_axis);
+	if (axis_length_squared <= FFogCapsuleEpsilonSquared || isnan(axis_length_squared)
+			|| isinf(axis_length_squared)) {
+		return result;
+	}
+	vec3 half_segment = capsule_axis * inversesqrt(axis_length_squared)
+			* (0.5 * source_length_m);
+	vec3 p0 = to_light - half_segment;
+	vec3 p1 = to_light + half_segment;
+	float len0_squared = dot(p0, p0);
+	float len1_squared = dot(p1, p1);
+	if (len0_squared <= FFogCapsuleEpsilonSquared || len1_squared <= FFogCapsuleEpsilonSquared
+			|| isnan(len0_squared) || isinf(len0_squared)
+			|| isnan(len1_squared) || isinf(len1_squared)) {
+		// Match the point-source limit while keeping the exact source-axis math finite.
+		result.direction = distance_squared > FFogCapsuleEpsilonSquared
+				? to_light * inversesqrt(distance_squared) : vec3(0.0);
+		result.falloff = inverse_squared
+				? 1.0 / max(distance_squared + distance_bias_m * distance_bias_m,
+						FFogCapsuleEpsilonSquared)
+				: 1.0;
+		result.valid = 1u;
+		return result;
+	}
+	float inverse_length0 = inversesqrt(len0_squared);
+	float inverse_length1 = inversesqrt(len1_squared);
+	float inverse_lengths = inverse_length0 * inverse_length1;
+	result.direction = 0.5 * (p0 * inverse_length0 + p1 * inverse_length1);
+	if (inverse_squared) {
+		float cosine_subtended = dot(p0, p1) * inverse_lengths;
+		float bias_squared = distance_bias_m * distance_bias_m;
+		float denominator = 0.5 * cosine_subtended + 0.5
+				+ bias_squared * inverse_lengths;
+		if (denominator <= FFogCapsuleEpsilonSquared || isnan(denominator)
+				|| isinf(denominator)) {
+			return result;
+		}
+		result.falloff = inverse_lengths / denominator;
+	} else {
+		result.falloff = 1.0;
+	}
+	if (any(isnan(result.direction)) || any(isinf(result.direction))
+			|| isnan(result.falloff) || isinf(result.falloff)) {
+		result.direction = vec3(0.0);
+		result.falloff = 0.0;
+		return result;
+	}
+	result.valid = 1u;
+	return result;
+}
+
+#endif // FENG_FOG_CAPSULE_LIGHT_GLSLINC

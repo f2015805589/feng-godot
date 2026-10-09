@@ -1,0 +1,27 @@
+#include "volumetric_fog_conservative_depth.glslinc"
+
+uint feng_volume_requested_sample_count(vec3 current_view_position, ivec3 cell,
+		ivec3 grid, int view_index, sampler2D current_conservative_depth,
+		sampler2D previous_conservative_depth, uint requested_samples) {
+	vec2 viewport_uv = (vec2(cell.xy) + vec2(0.5))
+			* max(fog_frame.history_control.w, 1.0)
+			/ max(fog_frame.history_frame_size.zw, vec2(1.0));
+	float conservative_slice = max(float(cell.z) - 0.5, 0.0);
+	vec3 conservative_position = feng_fog_view_position(viewport_uv,
+			feng_fog_depth_from_slice(conservative_slice));
+	if (feng_volume_current_cell_occluded(conservative_position, cell.xy, grid,
+			view_index, current_conservative_depth)) {
+		return 0u;
+	}
+	float previous_slice = 0.0;
+	float previous_view_depth = 0.0;
+	bool history_uv_valid = false;
+	vec2 previous_grid_uv = feng_volume_previous_grid_uv(current_view_position,
+			conservative_position, grid, view_index, previous_conservative_depth, previous_slice,
+			previous_view_depth, history_uv_valid);
+	if (history_uv_valid) {
+		return 1u;
+	}
+	return clamp(requested_samples, 1u,
+			uint(FENG_FOG_MAX_HISTORY_MISS_SUPERSAMPLE_COUNT));
+}

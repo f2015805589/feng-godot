@@ -44,6 +44,12 @@ These modes trade tracing and reconstruction work. The FRP shadow pass supplies 
 to their supported lighting consumers. Cloud rendering keeps radiance,
 transmittance, and depth data separate so opaque composition and eligible
 transparent surfaces can use the cloud depth.
+When the Fog renderer defers its scene composite, Cloud publishes a same-frame
+composition sidecar. Its `native_snapshot_source_signature` is the exact
+`FRPPassContext` snapshot identity used to verify the sidecar owner; the
+separate `gpu_source_signature` is only the Cloud renderer's cache/history key.
+The Fog consumer also checks frame generation, render-buffer identity, view
+count, dimensions, and borrowed texture validity before using the sidecar.
 The saturated self-shadow shortcut is limited to the built-in evaluator and
 the exact bundled UE 5.8 kernel; other custom kernels keep their full march.
 

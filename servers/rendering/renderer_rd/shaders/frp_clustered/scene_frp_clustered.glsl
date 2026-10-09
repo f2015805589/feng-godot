@@ -1206,6 +1206,53 @@ vec4 volumetric_fog_process(vec2 screen_uv, float z) {
 	return texture(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), fog_pos);
 }
 
+// Samples the addon-owned integrated volume output. The RGB is stored at the
+// packet's view-0 pre-exposure and converted back to scene-linear here; the
+// normal FRP output path applies this view's pre-exposure exactly once later.
+// Alpha is integrated transmittance, not extinction.
+vec4 frp_volume_fog_process(vec2 viewport_uv, float view_depth) {
+	if (implementation_data.frp_volume_output_enabled == 0u) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+
+	vec4 log_z_parameters = implementation_data.frp_volume_sampling_parameters[0];
+	vec4 grid_parameters = implementation_data.frp_volume_sampling_parameters[1];
+	vec4 atlas_parameters = implementation_data.frp_volume_sampling_parameters[2];
+	vec4 depth_exposure_parameters = implementation_data.frp_volume_sampling_parameters[3];
+	vec4 inverse_atlas_parameters = implementation_data.frp_volume_sampling_parameters[4];
+	if (inverse_atlas_parameters.w < 0.5 || grid_parameters.x < 1.0 || grid_parameters.y < 1.0 || grid_parameters.z < 1.0 ||
+			grid_parameters.w < 1.0 || float(ViewIndex) >= grid_parameters.w || atlas_parameters.w < grid_parameters.x ||
+			atlas_parameters.z < grid_parameters.z) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+
+	float start_distance = depth_exposure_parameters.x;
+	float far_distance = depth_exposure_parameters.y;
+	if (view_depth <= start_distance || far_distance <= start_distance) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	float sample_depth = clamp(view_depth, start_distance, far_distance);
+	float log_slice = log2(max(sample_depth * log_z_parameters.x + log_z_parameters.y, 1e-6)) * log_z_parameters.z;
+	if (log_slice < 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	float half_slice = 0.5 * inverse_atlas_parameters.z;
+	float atlas_z = clamp(log_slice * inverse_atlas_parameters.z, half_slice, 1.0 - half_slice);
+	vec2 viewport_pixel = viewport_uv / (scene_data_block.data.screen_pixel_size * log_z_parameters.w);
+	float atlas_x = (float(ViewIndex) * atlas_parameters.w + clamp(viewport_pixel.x, 0.5, grid_parameters.x - 0.5)) * inverse_atlas_parameters.x;
+	float atlas_y = clamp(viewport_pixel.y, 0.5, grid_parameters.y - 0.5) * inverse_atlas_parameters.y;
+	vec4 integrated = texture(sampler3D(frp_volume_output_texture, SAMPLER_LINEAR_CLAMP), vec3(atlas_x, atlas_y, atlas_z));
+	if (any(isnan(integrated)) || any(isinf(integrated)) || !(depth_exposure_parameters.w > 0.0) ||
+			isnan(depth_exposure_parameters.w) || isinf(depth_exposure_parameters.w)) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 scene_linear_radiance = integrated.rgb / depth_exposure_parameters.w;
+	if (any(isnan(scene_linear_radiance)) || any(isinf(scene_linear_radiance))) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	return vec4(scene_linear_radiance, clamp(integrated.a, 0.0, 1.0));
+}
+
 vec4 fog_process(vec3 vertex) {
 	vec3 fog_color = scene_data_block.data.fog_light_color;
 
@@ -1284,7 +1331,7 @@ float frp_height_fog_default_phase(vec3 ray_direction, vec3 sun_direction, float
 	return pow(clamp(dot(ray_direction, sun_direction), 0.0, 1.0), exponent) * 0.07957747154594767;
 }
 
-vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y) {
+vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y, float receiver_view_depth) {
 	// Packet vec4 0: density at ObserverY, falloff, ObserverY, StartDistance.
 	vec4 parameters1 = implementation_data.height_fog_parameters[0];
 	vec4 parameters2 = implementation_data.height_fog_parameters[1];
@@ -1300,7 +1347,20 @@ vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y) {
 	float distance_squared = dot(camera_to_receiver, camera_to_receiver);
 	float distance_inverse = inversesqrt(max(distance_squared, 1e-8));
 	float distance = distance_squared * distance_inverse;
-	if (distance <= parameters1.w) {
+	float exclude_distance = parameters1.w;
+	vec4 volume_depth_parameters = implementation_data.frp_volume_sampling_parameters[3];
+	float volume_valid = implementation_data.frp_volume_sampling_parameters[4].w;
+	if (volume_valid > 0.5 && volume_depth_parameters.y > volume_depth_parameters.x) {
+		float view_depth = max(receiver_view_depth, 0.0);
+		if (view_depth <= volume_depth_parameters.y) {
+			return vec4(0.0, 0.0, 0.0, 1.0);
+		}
+		if (view_depth > 1e-6) {
+			exclude_distance = max(exclude_distance,
+					volume_depth_parameters.y * distance / view_depth);
+		}
+	}
+	if (distance <= exclude_distance) {
 		return vec4(0.0, 0.0, 0.0, 1.0);
 	}
 	vec3 ray_direction = camera_to_receiver * distance_inverse;
@@ -1308,7 +1368,6 @@ vec4 frp_height_fog_process(vec3 camera_to_receiver, float camera_position_y) {
 	float ray_origin_terms_second = parameters2.z * exp2(clamp(-parameters2.y * (camera_position_y - parameters2.w), -125.0, 126.0));
 	float ray_length = distance;
 	float ray_direction_y = camera_to_receiver.y;
-	float exclude_distance = parameters1.w;
 	if (exclude_distance > 0.0) {
 		float exclude_time = exclude_distance * distance_inverse;
 		float exclusion_intersection_y = exclude_time * camera_to_receiver.y;
@@ -3095,6 +3154,12 @@ void fragment_shader(in SceneData scene_data) {
 		frp_atmo_aerial(mat3(inv_view_matrix) * (vertex - eye_offset), mat3(inv_view_matrix) * eye_offset,
 				frp_cloud_world_position(vec3(0.0), scene_data), atmosphere_radiance, atmosphere_transmission);
 	}
+	float fog_receiver_view_depth = -vertex.z;
+#ifdef USE_MULTIVIEW
+	// Forward fragments carry center-view positions; the eye translation is
+	// stored separately and must be removed before comparing receiver depth.
+	fog_receiver_view_depth = -(vertex.z - scene_data.eye_offset[ViewIndex].z);
+#endif
 	vec4 height_fog = vec4(0.0, 0.0, 0.0, 1.0);
 	if (implementation_data.height_fog_enabled != 0u) {
 		vec3 eye_offset_for_fog = vec3(0.0);
@@ -3104,7 +3169,7 @@ void fragment_shader(in SceneData scene_data) {
 		float camera_y_for_fog = implementation_data.height_fog_camera_position.y
 				+ (mat3(inv_view_matrix) * eye_offset_for_fog).y;
 		vec3 camera_to_receiver = mat3(inv_view_matrix) * (vertex - eye_offset_for_fog);
-		height_fog = frp_height_fog_process(camera_to_receiver, camera_y_for_fog);
+		height_fog = frp_height_fog_process(camera_to_receiver, camera_y_for_fog, fog_receiver_view_depth);
 	}
 
 #ifdef MODE_SEPARATE_SPECULAR
@@ -3148,6 +3213,9 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 	}
 #endif
+	vec4 integrated_volume_fog = frp_volume_fog_process(screen_uv, fog_receiver_view_depth);
+	diffuse_buffer.rgb = integrated_volume_fog.rgb + integrated_volume_fog.a * diffuse_buffer.rgb;
+	specular_buffer.rgb *= integrated_volume_fog.a;
 	diffuse_buffer.rgb *= implementation_data.pre_exposure;
 	specular_buffer.rgb *= implementation_data.pre_exposure;
 
@@ -3181,6 +3249,8 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 	}
 #endif
+	vec4 integrated_volume_fog = frp_volume_fog_process(screen_uv, fog_receiver_view_depth);
+	frag_color.rgb = integrated_volume_fog.rgb + integrated_volume_fog.a * frag_color.rgb;
 	frag_color.rgb *= implementation_data.pre_exposure;
 
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)

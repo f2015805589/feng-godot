@@ -1,0 +1,27 @@
+#[compute]
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D current_filtered_mip;
+layout(set = 0, binding = 1) uniform sampler2D coarser_filtered_mip;
+layout(rgba16f, set = 0, binding = 2) uniform image2D output_mip;
+layout(set = 0, binding = 3, std140) uniform UpsampleControl {
+	vec4 values; // UE blur control, use coarser mip, reserved, reserved.
+} upsample_control;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 extent = imageSize(output_mip);
+	if (any(greaterThanEqual(pixel, extent))) {
+		return;
+	}
+	vec4 current = texelFetch(current_filtered_mip, pixel, 0);
+	if (upsample_control.values.y > 0.5) {
+		vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+		vec4 coarser = textureLod(coarser_filtered_mip, uv, 0.0);
+		current.rgb = mix(current.rgb, coarser.rgb,
+				clamp(upsample_control.values.x, 0.0, 1.0));
+	}
+	imageStore(output_mip, pixel, current);
+}

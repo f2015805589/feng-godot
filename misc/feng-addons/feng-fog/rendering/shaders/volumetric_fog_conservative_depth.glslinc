@@ -1,0 +1,125 @@
+float feng_conservative_depth_fetch(sampler2D depth_texture, ivec2 cell,
+		int view_index, ivec2 grid) {
+	ivec2 local_cell = clamp(cell, ivec2(0), grid - ivec2(1));
+	return texelFetch(depth_texture,
+			ivec2(view_index * grid.x + local_cell.x, local_cell.y), 0).r;
+}
+
+bool feng_volume_current_cell_occluded(vec3 current_view_position, ivec2 cell,
+		ivec3 grid, int view_index, sampler2D current_conservative_depth) {
+	if (fog_frame.log_z_params.w <= 0.5) {
+		return false;
+	}
+	vec4 current_clip = fog_frame.current_depth_projection * vec4(current_view_position, 1.0);
+	if (!(current_clip.w > 1.0e-7) || isnan(current_clip.w) || isinf(current_clip.w)) {
+		return false;
+	}
+	float cell_device_z = current_clip.z / current_clip.w;
+	float conservative_device_z = feng_conservative_depth_fetch(current_conservative_depth,
+			cell, view_index, grid.xy);
+	return !isnan(conservative_device_z) && !isinf(conservative_device_z)
+			&& conservative_device_z > cell_device_z;
+}
+
+vec2 feng_fixup_history_uv(vec2 uv, float previous_cell_device_z, ivec2 grid,
+		int view_index, sampler2D previous_conservative_depth, out bool has_valid_history) {
+	has_valid_history = all(greaterThanEqual(uv, vec2(0.0)))
+			&& all(lessThan(uv, vec2(1.0)));
+	if (!has_valid_history) {
+		return uv;
+	}
+	if (fog_frame.previous_log_z_params.w <= 0.5) {
+		return uv;
+	}
+	vec2 full_res_uv = uv * vec2(grid);
+	vec2 screen_coord = floor(full_res_uv - vec2(0.5));
+	vec2 full_res_offset = full_res_uv - screen_coord;
+	ivec2 base = ivec2(screen_coord);
+	float depth_w = feng_conservative_depth_fetch(previous_conservative_depth,
+			base + ivec2(0, 0), view_index, grid);
+	float depth_z = feng_conservative_depth_fetch(previous_conservative_depth,
+			base + ivec2(1, 0), view_index, grid);
+	float depth_x = feng_conservative_depth_fetch(previous_conservative_depth,
+			base + ivec2(0, 1), view_index, grid);
+	float depth_y = feng_conservative_depth_fetch(previous_conservative_depth,
+			base + ivec2(1, 1), view_index, grid);
+	bvec4 valid = lessThan(vec4(depth_x, depth_y, depth_z, depth_w),
+			vec4(previous_cell_device_z));
+	if (all(valid)) {
+		return uv;
+	}
+	vec2 fixed_uv = uv;
+	if (valid.w && valid.z) {
+		fixed_uv = (screen_coord + vec2(full_res_offset.x, 0.5)) / vec2(grid);
+	} else if (valid.x && valid.y) {
+		fixed_uv = (screen_coord + vec2(full_res_offset.x, 1.5)) / vec2(grid);
+	} else if (valid.w && valid.x) {
+		fixed_uv = (screen_coord + vec2(0.5, full_res_offset.y)) / vec2(grid);
+	} else if (valid.z && valid.y) {
+		fixed_uv = (screen_coord + vec2(1.5, full_res_offset.y)) / vec2(grid);
+	} else if (valid.x) {
+		fixed_uv = (screen_coord + vec2(0.5, 1.5)) / vec2(grid);
+	} else if (valid.y) {
+		fixed_uv = (screen_coord + vec2(1.5, 1.5)) / vec2(grid);
+	} else if (valid.w) {
+		fixed_uv = (screen_coord + vec2(0.5, 0.5)) / vec2(grid);
+	} else if (valid.z) {
+		fixed_uv = (screen_coord + vec2(1.5, 0.5)) / vec2(grid);
+	} else {
+		has_valid_history = false;
+		return uv;
+	}
+	vec2 half_texel = vec2(0.5) / vec2(grid);
+	return clamp(fixed_uv, half_texel, vec2(1.0) - half_texel);
+}
+
+vec2 feng_volume_previous_grid_uv(vec3 current_view_position,
+		vec3 current_depth_view_position, ivec3 grid, int view_index,
+		sampler2D previous_conservative_depth,
+		out float previous_slice, out float previous_view_depth, out bool valid_history) {
+	vec3 world_position = (fog_frame.view_to_world * vec4(current_view_position, 1.0)).xyz;
+	vec3 previous_view_position = (fog_frame.previous_world_to_view
+			* vec4(world_position, 1.0)).xyz;
+	vec3 depth_world_position = (fog_frame.view_to_world
+			* vec4(current_depth_view_position, 1.0)).xyz;
+	vec3 previous_depth_view_position = (fog_frame.previous_world_to_view
+			* vec4(depth_world_position, 1.0)).xyz;
+	previous_view_depth = -previous_view_position.z;
+	previous_slice = 0.0;
+	valid_history = false;
+	if (fog_frame.history_control.y <= 0.5 || fog_frame.history_control.x <= 0.0) {
+		return vec2(0.0);
+	}
+	if (!(previous_view_depth > 0.0) || isnan(previous_view_depth) || isinf(previous_view_depth)) {
+		return vec2(0.0);
+	}
+	vec4 previous_clip = fog_frame.previous_projection * vec4(previous_view_position, 1.0);
+	if (!(previous_clip.w > 1.0e-6) || isnan(previous_clip.w) || isinf(previous_clip.w)) {
+		return vec2(0.0);
+	}
+	vec2 previous_screen_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
+	previous_slice = log2(max(previous_view_depth * fog_frame.previous_log_z_params.x
+			+ fog_frame.previous_log_z_params.y, 1.0e-12))
+			* fog_frame.previous_log_z_params.z;
+	vec4 previous_depth_clip = fog_frame.previous_projection
+			* vec4(previous_depth_view_position, 1.0);
+	if (any(lessThan(previous_screen_uv, vec2(0.0)))
+			|| any(greaterThanEqual(previous_screen_uv, vec2(1.0)))
+			|| !(previous_depth_clip.w > 1.0e-6)
+			|| isnan(previous_depth_clip.w) || isinf(previous_depth_clip.w)
+			|| isnan(previous_slice) || isinf(previous_slice)
+			|| previous_slice < 0.0 || previous_slice >= float(grid.z)) {
+		return vec2(0.0);
+	}
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 previous_grid_uv = previous_screen_uv * internal_size / pixel_size / vec2(grid.xy);
+	if (fog_frame.previous_log_z_params.w > 0.5) {
+		previous_grid_uv = feng_fixup_history_uv(previous_grid_uv,
+				previous_depth_clip.z / previous_depth_clip.w, grid.xy, view_index,
+				previous_conservative_depth, valid_history);
+	} else {
+		valid_history = true;
+	}
+	return previous_grid_uv;
+}

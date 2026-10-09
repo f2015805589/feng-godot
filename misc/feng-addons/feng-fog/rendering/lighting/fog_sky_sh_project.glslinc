@@ -1,0 +1,97 @@
+#[compute]
+#version 450
+
+// Deterministic equal-solid-angle SH projection of the explicit SkyRD octmap.
+// Each 8x8 workgroup reduces 64 samples into 9 RGB SH coefficients. The source
+// remains in sky-local coordinates; consumers rotate their world direction to
+// sky-local once before evaluating GetSkySHDiffuseSimple.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifndef FENG_FOG_SKY_ARRAY
+#define FENG_FOG_SKY_ARRAY 0
+#endif
+
+#if FENG_FOG_SKY_ARRAY
+layout(set = 0, binding = 0) uniform sampler2DArray sky_radiance;
+#else
+layout(set = 0, binding = 0) uniform sampler2D sky_radiance;
+#endif
+
+layout(set = 0, binding = 1, std430) writeonly buffer PartialSH {
+	vec4 partial_coefficients[];
+};
+
+layout(set = 0, binding = 2, std140) uniform ProjectionParameters {
+	vec4 border_and_padding; // x = octahedral UV border.
+} projection_parameters;
+
+const uint FENG_FOG_SAMPLE_WIDTH = 128u;
+const uint FENG_FOG_SAMPLE_HEIGHT = 64u;
+const uint FENG_FOG_GROUP_WIDTH = 8u;
+const uint FENG_FOG_GROUPS_X = FENG_FOG_SAMPLE_WIDTH / FENG_FOG_GROUP_WIDTH;
+const uint FENG_FOG_GROUPS_Y = FENG_FOG_SAMPLE_HEIGHT / FENG_FOG_GROUP_WIDTH;
+const uint FENG_FOG_GROUP_COUNT = FENG_FOG_GROUPS_X * FENG_FOG_GROUPS_Y;
+const float FENG_FOG_SH_SAMPLE_WEIGHT = 12.56637061435917295385 /
+	float(FENG_FOG_SAMPLE_WIDTH * FENG_FOG_SAMPLE_HEIGHT);
+
+shared vec4 shared_coefficients[9u * 64u];
+
+vec2 feng_fog_direction_to_oct(vec3 direction) {
+	vec3 n = direction / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-8);
+	if (n.z < 0.0) {
+		vec2 signs = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+		n.xy = (1.0 - abs(n.yx)) * signs;
+	}
+	return n.xy * 0.5 + 0.5;
+}
+
+vec3 feng_fog_sample_sky(vec2 uv) {
+	float border = clamp(projection_parameters.border_and_padding.x, 0.0, 0.49);
+	uv = uv * (1.0 - 2.0 * border) + border;
+#if FENG_FOG_SKY_ARRAY
+	return textureLod(sky_radiance, vec3(uv, 0.0), 0.0).rgb;
+#else
+	return textureLod(sky_radiance, uv, 0.0).rgb;
+#endif
+}
+
+void main() {
+	uvec2 sample_xy = gl_GlobalInvocationID.xy;
+	uint lane = gl_LocalInvocationIndex;
+	float u = (float(sample_xy.x) + 0.5) / float(FENG_FOG_SAMPLE_WIDTH);
+	float v = (float(sample_xy.y) + 0.5) / float(FENG_FOG_SAMPLE_HEIGHT);
+	float z = 1.0 - 2.0 * u;
+	float phi = 6.28318530717958647692 * v;
+	float radial = sqrt(max(1.0 - z * z, 0.0));
+	vec3 direction = vec3(radial * cos(phi), radial * sin(phi), z);
+	vec3 radiance = max(feng_fog_sample_sky(feng_fog_direction_to_oct(direction)), vec3(0.0));
+	vec3 d2 = direction * direction;
+	float basis[9];
+	basis[0] = 0.28209479177387814;
+	basis[1] = -0.4886025119029199 * direction.y;
+	basis[2] = 0.4886025119029199 * direction.z;
+	basis[3] = -0.4886025119029199 * direction.x;
+	basis[4] = 1.0925484305920792 * direction.x * direction.y;
+	basis[5] = -1.0925484305920792 * direction.y * direction.z;
+	basis[6] = 0.31539156525252005 * (3.0 * d2.z - 1.0);
+	basis[7] = -1.0925484305920792 * direction.x * direction.z;
+	basis[8] = 0.5462742152960396 * (d2.x - d2.y);
+	for (uint coefficient = 0u; coefficient < 9u; coefficient++) {
+		shared_coefficients[coefficient * 64u + lane] = vec4(radiance * (basis[coefficient] * FENG_FOG_SH_SAMPLE_WEIGHT), 0.0);
+	}
+	barrier();
+	for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+		if (lane < stride) {
+			for (uint coefficient = 0u; coefficient < 9u; coefficient++) {
+				shared_coefficients[coefficient * 64u + lane] += shared_coefficients[coefficient * 64u + lane + stride];
+			}
+		}
+		barrier();
+	}
+	if (lane == 0u) {
+		uint group_index = gl_WorkGroupID.y * FENG_FOG_GROUPS_X + gl_WorkGroupID.x;
+		for (uint coefficient = 0u; coefficient < 9u; coefficient++) {
+			partial_coefficients[group_index * 9u + coefficient] = shared_coefficients[coefficient * 64u];
+		}
+	}
+}

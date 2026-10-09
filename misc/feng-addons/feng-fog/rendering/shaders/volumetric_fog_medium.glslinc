@@ -1,0 +1,200 @@
+#[compute]
+#version 450
+
+#include "volumetric_fog_frame.glslinc"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(rgba16f, set = 0, binding = 1) uniform image3D medium_scattering_extinction;
+layout(rgba16f, set = 0, binding = 2) uniform image3D medium_emissive;
+struct LocalFogVolumeRecord {
+	vec4 world_to_local_x;
+	vec4 world_to_local_y;
+	vec4 world_to_local_z;
+	vec4 world_to_local_origin;
+	vec4 parameters; // density/m, height falloff/m, edge fade/m, shape id.
+	vec4 extents_noise; // half extents in local meters, optional texture slot.
+	vec4 albedo_extinction_scale;
+	vec4 emissive;
+};
+layout(set = 0, binding = 3, std430) readonly buffer LocalFogVolumes {
+	uvec4 header;
+	LocalFogVolumeRecord records[];
+} local_volumes;
+layout(set = 0, binding = 4) uniform sampler3D local_density_0;
+layout(set = 0, binding = 5) uniform sampler3D local_density_1;
+layout(set = 0, binding = 6) uniform sampler3D local_density_2;
+layout(set = 0, binding = 7) uniform sampler3D local_density_3;
+layout(set = 0, binding = 8) uniform sampler3D local_density_4;
+layout(set = 0, binding = 9) uniform sampler3D local_density_5;
+layout(set = 0, binding = 10) uniform sampler3D local_density_6;
+layout(set = 0, binding = 11) uniform sampler3D local_density_7;
+layout(set = 0, binding = 12) uniform sampler3D local_density_8;
+layout(set = 0, binding = 13) uniform sampler3D local_density_9;
+layout(set = 0, binding = 14) uniform sampler3D local_density_10;
+layout(set = 0, binding = 15) uniform sampler3D local_density_11;
+layout(set = 0, binding = 16) uniform sampler3D local_density_12;
+layout(set = 0, binding = 17) uniform sampler3D local_density_13;
+layout(set = 0, binding = 18) uniform sampler3D local_density_14;
+layout(set = 0, binding = 19) uniform sampler3D local_density_15;
+layout(set = 0, binding = 20) uniform sampler2D current_scene_depth;
+
+#include "volumetric_fog_depth_constraints.glslinc"
+
+#define FENG_FOG_HALF_MAX 65504.0
+
+float feng_fog_height_density(float base_density, float falloff, float world_y,
+		float layer_height, float maximum_density) {
+	if (isnan(base_density) || isinf(base_density) || base_density <= 0.0) {
+		return 0.0;
+	}
+	float log_density = log2(base_density) - falloff * (world_y - layer_height);
+	if (isnan(log_density)) {
+		return 0.0;
+	}
+	if (isinf(log_density)) {
+		return log_density > 0.0 ? maximum_density : 0.0;
+	}
+	return exp2(clamp(log_density, -126.0, log2(max(maximum_density, 1.0e-30))));
+}
+
+float feng_local_density_texture(int index, vec3 uvw) {
+	switch (index) {
+		case 0: return textureLod(local_density_0, uvw, 0.0).r;
+		case 1: return textureLod(local_density_1, uvw, 0.0).r;
+		case 2: return textureLod(local_density_2, uvw, 0.0).r;
+		case 3: return textureLod(local_density_3, uvw, 0.0).r;
+		case 4: return textureLod(local_density_4, uvw, 0.0).r;
+		case 5: return textureLod(local_density_5, uvw, 0.0).r;
+		case 6: return textureLod(local_density_6, uvw, 0.0).r;
+		case 7: return textureLod(local_density_7, uvw, 0.0).r;
+		case 8: return textureLod(local_density_8, uvw, 0.0).r;
+		case 9: return textureLod(local_density_9, uvw, 0.0).r;
+		case 10: return textureLod(local_density_10, uvw, 0.0).r;
+		case 11: return textureLod(local_density_11, uvw, 0.0).r;
+		case 12: return textureLod(local_density_12, uvw, 0.0).r;
+		case 13: return textureLod(local_density_13, uvw, 0.0).r;
+		case 14: return textureLod(local_density_14, uvw, 0.0).r;
+		case 15: return textureLod(local_density_15, uvw, 0.0).r;
+	}
+	return 1.0;
+}
+
+float feng_local_volume_weight(LocalFogVolumeRecord volume, vec3 world_position,
+		out vec3 local_position) {
+	local_position = volume.world_to_local_x.xyz * world_position.x
+			+ volume.world_to_local_y.xyz * world_position.y
+			+ volume.world_to_local_z.xyz * world_position.z
+			+ volume.world_to_local_origin.xyz;
+	int shape = int(volume.parameters.w + 0.5);
+	if (shape == 4) {
+		return 1.0;
+	}
+	vec3 extents = max(volume.extents_noise.xyz, vec3(1.0e-5));
+	float edge_distance = -1.0;
+	if (shape == 0) {
+		vec3 face_distance = extents - abs(local_position);
+		if (any(lessThan(face_distance, vec3(0.0)))) {
+			return 0.0;
+		}
+		edge_distance = min(face_distance.x, min(face_distance.y, face_distance.z));
+	} else if (shape == 1) {
+		float radial = length(local_position / extents);
+		if (radial >= 1.0) {
+			return 0.0;
+		}
+		edge_distance = (1.0 - radial) * min(extents.x, min(extents.y, extents.z));
+	} else if (shape == 2) {
+		float radial = length(local_position.xz / extents.xz);
+		float side_distance = (1.0 - radial) * min(extents.x, extents.z);
+		float cap_distance = extents.y - abs(local_position.y);
+		if (side_distance < 0.0 || cap_distance < 0.0) {
+			return 0.0;
+		}
+		edge_distance = min(side_distance, cap_distance);
+	} else {
+		float height01 = local_position.y / (2.0 * extents.y) + 0.5;
+		if (height01 < 0.0 || height01 > 1.0) {
+			return 0.0;
+		}
+		float radius = extents.x * (1.0 - height01);
+		float radial_distance = radius - length(local_position.xz);
+		if (radial_distance < 0.0) {
+			return 0.0;
+		}
+		edge_distance = min(radial_distance, min(extents.y - abs(local_position.y), extents.z));
+	}
+	float fade_distance = max(volume.parameters.z, 0.0);
+	return fade_distance > 1.0e-5 ? clamp(edge_distance / fade_distance, 0.0, 1.0) : 1.0;
+}
+
+void main() {
+	uvec3 cell = gl_GlobalInvocationID;
+	ivec3 grid = ivec3(fog_frame.grid_view.xyz);
+	if (any(greaterThanEqual(ivec3(cell), grid))) {
+		return;
+	}
+
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	vec3 sample_offset = vec3(0.5);
+	vec2 pixel_center = (vec2(cell.xy) + sample_offset.xy) * pixel_size;
+	// Froxels may overhang the lower/right viewport edges, as in UE's grid.
+	vec2 uv = pixel_center / internal_size;
+	float sample_slice = feng_fog_depth_constrained_slice(current_scene_depth,
+			vec3(cell), sample_offset, uv);
+	float view_depth = feng_fog_depth_from_slice(sample_slice);
+	vec3 world_position = feng_fog_world_position(uv, view_depth);
+	float extinction_scale = clamp(fog_frame.material.w, 0.0, FENG_FOG_HALF_MAX);
+	float maximum_density = FENG_FOG_HALF_MAX / max(extinction_scale, 1.0);
+	float density0 = feng_fog_height_density(fog_frame.fog_layer0.x,
+			fog_frame.fog_layer0.y, world_position.y, fog_frame.fog_layer0.z, maximum_density);
+	float density1 = feng_fog_height_density(fog_frame.fog_layer1.x,
+			fog_frame.fog_layer1.y, world_position.y, fog_frame.fog_layer1.z, maximum_density);
+	float matched_height_density = min((density0 + density1) * 0.5, maximum_density);
+	float extinction = matched_height_density * extinction_scale;
+	vec3 albedo = clamp(fog_frame.material.rgb, vec3(0.0), vec3(1.0));
+	vec3 scattering = albedo * extinction;
+	// UE's component emissive is a per-distance source term. The component
+	// codec already converts its authored cm coefficient into the meter world.
+	vec3 emissive = clamp(fog_frame.emissive_and_phase.rgb,
+			vec3(0.0), vec3(FENG_FOG_HALF_MAX));
+	if (local_volumes.header.y > 0u) {
+		ivec3 atlas_cell = ivec3(int(feng_fog_atlas_x(float(cell.x))), int(cell.y), int(cell.z));
+		vec4 previous_medium = imageLoad(medium_scattering_extinction, atlas_cell);
+		vec4 previous_emissive = imageLoad(medium_emissive, atlas_cell);
+		scattering = max(previous_medium.rgb, vec3(0.0));
+		extinction = feng_fog_finite_nonnegative(previous_medium.a);
+		emissive = max(previous_emissive.rgb, vec3(0.0));
+	}
+	for (uint index = 0u; index < min(local_volumes.header.x, 16u); index++) {
+		LocalFogVolumeRecord volume = local_volumes.records[index];
+		vec3 local_position;
+		float shape_weight = feng_local_volume_weight(volume, world_position, local_position);
+		if (shape_weight <= 0.0) {
+			continue;
+		}
+		float noise_weight = 1.0;
+		int noise_index = int(volume.extents_noise.w + 0.5);
+		if (noise_index >= 0 && noise_index < 16) {
+			vec3 noise_uv = clamp(local_position / (2.0 * max(volume.extents_noise.xyz,
+					vec3(1.0e-5))) + 0.5, vec3(0.0), vec3(1.0));
+			float sampled_noise = feng_local_density_texture(noise_index, noise_uv);
+			noise_weight = isnan(sampled_noise) || isinf(sampled_noise)
+					? 0.0 : clamp(sampled_noise, 0.0, 10.0);
+		}
+		float local_height = exp2(clamp(-volume.parameters.y * local_position.y, -126.0, 16.0));
+		float local_extinction = min(max(volume.parameters.x, 0.0) * local_height
+				* shape_weight * noise_weight * max(volume.albedo_extinction_scale.w, 0.0),
+				FENG_FOG_HALF_MAX);
+		extinction = min(extinction + local_extinction, FENG_FOG_HALF_MAX);
+		scattering = min(scattering + clamp(volume.albedo_extinction_scale.rgb,
+				vec3(0.0), vec3(1.0))
+				* local_extinction, vec3(FENG_FOG_HALF_MAX));
+		emissive = min(emissive + max(volume.emissive.rgb, vec3(0.0)) * shape_weight,
+				vec3(FENG_FOG_HALF_MAX));
+	}
+	ivec3 atlas_cell = ivec3(int(feng_fog_atlas_x(float(cell.x))), int(cell.y), int(cell.z));
+	imageStore(medium_scattering_extinction, atlas_cell, vec4(scattering, extinction));
+	imageStore(medium_emissive, atlas_cell, vec4(emissive, 0.0));
+}

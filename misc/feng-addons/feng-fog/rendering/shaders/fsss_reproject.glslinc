@@ -1,0 +1,205 @@
+#[compute]
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform FsssFrame {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	mat4 previous_projection;
+	mat4 previous_world_to_view;
+	vec4 exposure_history; // current scene-domain scale, previous scale, history weight, valid.
+	vec4 extent_depth; // width, height, relative depth reject, source mode (inline/late/cloud).
+} fsss_frame;
+layout(set = 0, binding = 1) uniform sampler2D current_scene_color;
+layout(set = 0, binding = 2) uniform sampler2D depth_buffer;
+layout(set = 0, binding = 3) uniform sampler2D previous_fsss_history;
+layout(rgba16f, set = 0, binding = 4) uniform image2D fsss_history_output;
+layout(set = 0, binding = 5, std140) uniform FsssAnalyticFog {
+	vec4 parameters[6];
+} fsss_analytic_parameters;
+layout(set = 0, binding = 6) uniform sampler2D previous_fsss_depth;
+layout(r32f, set = 0, binding = 7) uniform image2D fsss_depth_output;
+layout(set = 0, binding = 12) uniform sampler2DArray cloud_fog_radiance;
+layout(set = 0, binding = 13) uniform sampler2DArray cloud_fog_transmittance;
+layout(set = 0, binding = 14, std140) uniform FsssAtmosphere {
+	vec4 parameters[16];
+} fsss_atmosphere;
+layout(set = 0, binding = 15) uniform sampler2D fsss_atmosphere_optical_texture;
+layout(set = 0, binding = 16) uniform sampler2D fsss_atmosphere_multiple_texture;
+layout(set = 0, binding = 17, std140) uniform CloudVisibilityData {
+	vec4 projection[35];
+	vec4 sun_mapping;
+	vec4 flags;
+} cloud_visibility;
+layout(set = 0, binding = 18) uniform sampler2D cloud_shadow0_texture;
+layout(set = 0, binding = 19) uniform sampler2D cloud_shadow1_texture;
+layout(set = 0, binding = 20) uniform sampler2D cloud_raw_ao_texture;
+
+#include "../../../feng-render-pipeline/library/height-fog/volumetric_fog_sampling.glslinc"
+#include "../../../feng-render-pipeline/library/height-fog/height_fog_cloud_visibility.glslinc"
+#define FRP_ATMO_CLOUD_SHADOW_VISIBILITY(world_position_m, atmo_sun_slot) frp_height_fog_cloud_shadow_visibility(world_position_m, atmo_sun_slot)
+#define FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY(world_position_m) frp_height_fog_cloud_multiple_visibility(world_position_m)
+#define ATMO_PARAMS fsss_atmosphere.parameters
+#define ATMO_OPTICAL fsss_atmosphere_optical_texture
+#define ATMO_MULTIPLE fsss_atmosphere_multiple_texture
+#include "../../../feng-render-pipeline/library/height-fog/atmosphere_inc.glslinc"
+#undef FRP_ATMO_CLOUD_SHADOW_VISIBILITY
+#undef FRP_ATMO_CLOUD_MULTIPLE_VISIBILITY
+#undef ATMO_PARAMS
+#undef ATMO_OPTICAL
+#undef ATMO_MULTIPLE
+#include "../../../feng-render-pipeline/library/height-fog/exponential_height_fog.glslinc"
+
+vec3 fsss_view_position(vec2 uv, float depth) {
+	vec4 view_h = fsss_frame.inverse_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	return abs(view_h.w) > 1.0e-8 ? view_h.xyz / view_h.w : vec3(0.0);
+}
+
+void fsss_scene_ray(vec2 uv, float device_depth, out vec3 view_position,
+		out float view_depth_m, out float view_ray_cosine) {
+	if (device_depth > 0.0 && !isnan(device_depth) && !isinf(device_depth)) {
+		view_position = fsss_view_position(uv, device_depth);
+		view_depth_m = max(-view_position.z, 0.0);
+		view_ray_cosine = abs(view_position.z) / max(length(view_position), 1.0e-6);
+		return;
+	}
+	vec3 near_position = fsss_view_position(uv, 1.0);
+	vec3 middle_position = fsss_view_position(uv, 0.5);
+	vec3 ray_direction = normalize(middle_position - near_position);
+	view_position = ray_direction * 1000000.0;
+	view_depth_m = max(-view_position.z, 0.0);
+	view_ray_cosine = abs(ray_direction.z);
+}
+
+vec4 fsss_evaluate_analytic_fog(vec3 camera_to_receiver, float view_ray_cosine) {
+	vec4 fog = frp_evaluate_exponential_height_fog(camera_to_receiver,
+			view_ray_cosine, fsss_frame.view_to_world[3].xyz,
+			fsss_analytic_parameters.parameters[0], fsss_analytic_parameters.parameters[1],
+			fsss_analytic_parameters.parameters[2], fsss_analytic_parameters.parameters[3],
+			fsss_analytic_parameters.parameters[4], fsss_analytic_parameters.parameters[5],
+			fsss_analytic_parameters.parameters[2].z,
+			feng_volume_sampling.analytic_control.x,
+			feng_volume_sampling.analytic_control.y);
+	fog.rgb *= max(feng_volume_sampling.frame_control.y, 1.0e-8);
+	return fog;
+}
+
+vec3 fsss_apply_aerial_perspective(float device_depth, vec3 camera_to_receiver,
+		vec3 scene_rgb) {
+	if (device_depth <= 0.0 || fsss_atmosphere.parameters[12].z <= 0.5) {
+		return scene_rgb;
+	}
+	vec3 radiance;
+	vec3 transmission;
+	frp_atmo_aerial(camera_to_receiver, vec3(0.0),
+			fsss_frame.view_to_world[3].xyz, radiance, transmission);
+	return scene_rgb * transmission
+			+ radiance * max(feng_volume_sampling.frame_control.y, 1.0e-8);
+}
+
+vec4 fsss_generate_source(vec2 uv, ivec2 pixel, float device_depth, float view_depth_m,
+		float view_ray_cosine, vec3 camera_to_receiver, vec3 scene_rgb) {
+	if (fsss_frame.extent_depth.w < 0.5) {
+		// The inline height-fog path applies aerial perspective to surfaces
+		// before fog composition. Generate FSSS from the same scene-color domain.
+		scene_rgb = fsss_apply_aerial_perspective(device_depth,
+				camera_to_receiver, scene_rgb);
+	}
+	vec4 analytic = fsss_evaluate_analytic_fog(camera_to_receiver, view_ray_cosine);
+	vec4 volume = feng_sample_integrated_volume(uv, view_depth_m,
+			vec2(fsss_frame.extent_depth.xy));
+	float combined_transmittance = clamp(volume.a * analytic.a, 0.0, 1.0);
+	float amount = feng_fsss_scene_scattering_amount(combined_transmittance);
+	vec3 source;
+	if (fsss_frame.extent_depth.w < 0.5) {
+		// Inline path starts from the unfogged scene color C. This is the
+		// closed-form UE source L + T*A*C with L=Lv+Tv*Lh and T=Tv*Th.
+		vec3 combined_inscattering = volume.rgb + volume.a * analytic.rgb;
+		source = combined_inscattering
+				+ volume.a * amount * (analytic.a * scene_rgb);
+	} else if (fsss_frame.extent_depth.w < 1.5) {
+		// Late path sees S=Lh+Th*C, so subtract the known Lh directly; no
+		// transmittance division is needed at opaque or fully fogged pixels.
+		vec3 combined_inscattering = volume.rgb + volume.a * analytic.rgb;
+		source = combined_inscattering
+				+ volume.a * amount * (scene_rgb - analytic.rgb);
+	} else {
+		int view_index = int(max(feng_volume_sampling.frame_control.x, 0.0));
+		ivec3 cloud_coord = ivec3(pixel, view_index);
+		vec3 cloud_radiance = texelFetch(cloud_fog_radiance, cloud_coord, 0).rgb;
+		vec3 cloud_transmittance = clamp(texelFetch(
+				cloud_fog_transmittance, cloud_coord, 0).rgb, vec3(0.0), vec3(1.0));
+		vec3 fogged_cloud_and_height = cloud_radiance
+				+ cloud_transmittance * analytic.rgb;
+		vec3 scene_residual = scene_rgb - fogged_cloud_and_height;
+		source = cloud_radiance + cloud_transmittance
+				* (volume.rgb + volume.a * analytic.rgb)
+				+ volume.a * amount * scene_residual;
+	}
+	return vec4(clamp(source, vec3(-65504.0), vec3(65504.0)),
+			combined_transmittance * (1.0 - amount));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 extent = imageSize(fsss_history_output);
+	if (any(greaterThanEqual(pixel, extent))) {
+		return;
+	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+	float device_depth = texelFetch(depth_buffer, pixel, 0).r;
+	vec3 view_position;
+	float view_depth_m;
+	float view_ray_cosine;
+	fsss_scene_ray(uv, device_depth, view_position, view_depth_m, view_ray_cosine);
+	vec3 camera_to_receiver = mat3(fsss_frame.view_to_world) * view_position;
+	vec3 scene_rgb = texelFetch(current_scene_color, pixel, 0).rgb;
+	vec4 current = fsss_generate_source(uv, pixel, device_depth, view_depth_m,
+			view_ray_cosine, camera_to_receiver, scene_rgb);
+	float current_depth = device_depth > 0.0 && !isnan(device_depth) && !isinf(device_depth)
+			? max(-view_position.z, 0.0) : 0.0;
+	vec4 resolved = current;
+	if (fsss_frame.exposure_history.w > 0.5) {
+		vec2 previous_uv = vec2(-1.0);
+		float expected_previous_depth = 0.0;
+		bool valid = false;
+		if (current_depth > 0.0) {
+			vec3 world_position = (fsss_frame.view_to_world * vec4(view_position, 1.0)).xyz;
+			vec4 previous_clip = fsss_frame.previous_projection
+					* fsss_frame.previous_world_to_view * vec4(world_position, 1.0);
+			valid = previous_clip.w > 1.0e-6 && !isnan(previous_clip.w) && !isinf(previous_clip.w);
+			previous_uv = previous_clip.xy / max(previous_clip.w, 1.0e-6) * 0.5 + 0.5;
+			vec3 previous_view = (fsss_frame.previous_world_to_view * vec4(world_position, 1.0)).xyz;
+			expected_previous_depth = max(-previous_view.z, 0.0);
+		} else {
+			vec3 near_position = fsss_view_position(uv, 1.0);
+			vec3 far_position = fsss_view_position(uv, 0.5);
+			vec3 ray_world = normalize(mat3(fsss_frame.view_to_world)
+					* normalize(far_position - near_position));
+			vec3 previous_ray = mat3(fsss_frame.previous_world_to_view) * ray_world;
+			vec4 previous_clip = fsss_frame.previous_projection * vec4(previous_ray, 0.0);
+			valid = abs(previous_clip.w) > 1.0e-6 && !isnan(previous_clip.w) && !isinf(previous_clip.w);
+			previous_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
+		}
+		vec2 half_texel = 0.5 / vec2(extent);
+		valid = valid && all(greaterThanEqual(previous_uv, half_texel))
+				&& all(lessThanEqual(previous_uv, vec2(1.0) - half_texel));
+		if (valid) {
+			vec4 history = texture(previous_fsss_history, previous_uv);
+			float previous_depth = texture(previous_fsss_depth, previous_uv).r;
+			float depth_tolerance = max(0.05, expected_previous_depth * fsss_frame.extent_depth.z);
+			bool depth_match = current_depth <= 0.0 ? previous_depth <= 0.0
+					: abs(previous_depth - expected_previous_depth) <= depth_tolerance;
+			if (depth_match) {
+				float exposure_ratio = fsss_frame.exposure_history.x
+						/ max(fsss_frame.exposure_history.y, 1.0e-8);
+				vec3 history_rgb = clamp(history.rgb * exposure_ratio, vec3(0.0), vec3(65504.0));
+				resolved.rgb = mix(current.rgb, history_rgb,
+						clamp(fsss_frame.exposure_history.z, 0.0, 0.95));
+			}
+		}
+	}
+	imageStore(fsss_history_output, pixel, resolved);
+	imageStore(fsss_depth_output, pixel, vec4(current_depth));
+}

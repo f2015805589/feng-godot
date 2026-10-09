@@ -420,8 +420,11 @@ private:
 			float cloud_projection_parameters[35][4]; // addon-owned world-to-cloud projection packet.
 			float cloud_transparency_parameters[4]; // enabled, transparent cloud depth soft distance in km, padding.
 			float atmosphere_cloud_mapping[4]; // atmosphere sun 0/1 -> cloud slot, then map-valid flags (Sky-only included).
+			uint32_t frp_volume_output_enabled;
+			uint32_t frp_volume_output_pad[3];
+			float frp_volume_sampling_parameters[5][4]; // five vec4 lanes from FRPPassContext output ABI v1.
 		};
-		static_assert(sizeof(UBO) == 1232, "FRP implementation UBO must match the std140 scene and cloud data layout.");
+		static_assert(sizeof(UBO) == 1328, "FRP implementation UBO must match the std140 scene, cloud, and volume data layout.");
 
 		struct PushConstantUbershader {
 			SceneShaderFRPClustered::ShaderSpecialization specialization;
@@ -551,6 +554,7 @@ private:
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false, bool p_isolate_environment_ibl = false);
 	void _setup_height_fog(uint32_t p_uniform_buffer_index, const PackedFloat32Array &p_parameters);
+	void _setup_volume_sampling_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, bool p_enable_sampling);
 	void _setup_atmosphere(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data);
 	void _setup_cloud_lighting_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context);
 	void _setup_cloud_transparency_ubo(uint32_t p_uniform_buffer_index, const Ref<FRPPassContext> &p_context);
@@ -893,6 +897,7 @@ private:
 	/* Render Scene */
 	void _precompute_shadows(RenderDataRD *p_render_data);
 	void _prepare_lighting(RenderDataRD *p_render_data);
+	void _publish_volume_frame_inputs(const Ref<FRPPassContext> &p_context, const RenderDataRD *p_render_data, bool p_depth_prepass_enabled);
 	// Presents a texture to the viewport's render target: the pipeline texture named by
 	// p_texture, or the engine's tone mapped image when the name is empty.
 	void _present_frame(RenderDataRD *p_render_data, const StringName &p_texture);

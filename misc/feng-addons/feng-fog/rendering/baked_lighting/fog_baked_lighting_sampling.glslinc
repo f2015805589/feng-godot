@@ -1,0 +1,247 @@
+#ifndef FENG_FOG_BAKED_LIGHTING_SAMPLING_GLSLINC
+#define FENG_FOG_BAKED_LIGHTING_SAMPLING_GLSLINC
+
+// FFogBakedLightingProvider ABI v1. Set 2, bindings 0..4. These buffers are
+// provider-owned; the fog service binds and reads them but never frees them.
+layout(set = 2, binding = 0, std430) readonly buffer FFogBakedProbePositions {
+	vec4 ffog_baked_probe_positions[];
+};
+layout(set = 2, binding = 1, std430) readonly buffer FFogBakedProbeSH {
+	float ffog_baked_probe_sh[];
+};
+layout(set = 2, binding = 2, std430) readonly buffer FFogBakedTetrahedra {
+	int ffog_baked_tetrahedra[];
+};
+layout(set = 2, binding = 3, std430) readonly buffer FFogBakedBSPNodes {
+	int ffog_baked_bsp_nodes[];
+};
+layout(set = 2, binding = 4, std140) uniform FFogBakedProbeParams {
+	mat4 ffog_baked_world_to_capture;
+	mat4 ffog_baked_world_direction_to_capture;
+	vec4 ffog_baked_capture_min_baked_exposure;
+	vec4 ffog_baked_capture_size;
+	uvec4 ffog_baked_counts_flags;
+} ffog_baked_probe_params;
+
+const uint FFOG_BAKED_FLAG_INCLUDES_ENVIRONMENT_RADIANCE = 1u;
+const uint FFOG_BAKED_FLAG_CONTAINS_SURFACE_DIRECT_RADIANCE = 2u;
+const uint FFOG_BAKED_FLAG_SOURCE_INTERIOR = 4u;
+const uint FFOG_BAKED_FLAG_INCLUDES_PROBE_ORIGIN_DIRECT_LIGHTING = 8u;
+const int FFOG_BAKED_EMPTY_BSP_LEAF = (-2147483647 - 1);
+const uint FFOG_BAKED_PROBE_ABI_VERSION = 1u;
+const float FFOG_BAKED_PI = 3.14159265358979323846;
+
+bool ffog_baked_is_finite(float p_value) {
+	return !isnan(p_value) && !isinf(p_value);
+}
+
+bool ffog_baked_is_finite_vec3(vec3 p_value) {
+	return ffog_baked_is_finite(p_value.x) && ffog_baked_is_finite(p_value.y) &&
+		ffog_baked_is_finite(p_value.z);
+}
+
+struct FFogBakedLightingSample {
+	vec3 incident_radiance;
+	bool valid;
+	uint source_flags;
+};
+
+FFogBakedLightingSample ffog_baked_invalid_sample() {
+	return FFogBakedLightingSample(vec3(0.0), false, ffog_baked_probe_params.ffog_baked_counts_flags.w);
+}
+
+bool ffog_baked_position_in_bounds(vec3 p_capture) {
+	vec3 lower = ffog_baked_probe_params.ffog_baked_capture_min_baked_exposure.xyz;
+	vec3 upper = lower + ffog_baked_probe_params.ffog_baked_capture_size.xyz;
+	return all(greaterThanEqual(p_capture, lower)) && all(lessThanEqual(p_capture, upper));
+}
+
+bool ffog_baked_find_tetrahedron(vec3 p_capture, out uint r_tetrahedron_index) {
+	uint node_count = ffog_baked_probe_params.ffog_baked_counts_flags.z;
+	uint tetrahedron_count = ffog_baked_probe_params.ffog_baked_counts_flags.y;
+	if (node_count == 0u || tetrahedron_count == 0u) {
+		return false;
+	}
+	int node = 0;
+	int leaf = 0;
+	bool reached_leaf = false;
+	for (uint step = 0u; step < node_count; ++step) {
+		if (node < 0) {
+			leaf = node;
+			reached_leaf = true;
+			break;
+		}
+		if (uint(node) >= node_count) {
+			return false;
+		}
+		uint base = uint(node) * 6u;
+		vec3 normal = vec3(
+			intBitsToFloat(ffog_baked_bsp_nodes[base]),
+			intBitsToFloat(ffog_baked_bsp_nodes[base + 1u]),
+			intBitsToFloat(ffog_baked_bsp_nodes[base + 2u]));
+		float plane_d = intBitsToFloat(ffog_baked_bsp_nodes[base + 3u]);
+		int over_child = ffog_baked_bsp_nodes[base + 4u];
+		int under_child = ffog_baked_bsp_nodes[base + 5u];
+		node = dot(normal, p_capture) > plane_d ? over_child : under_child;
+	}
+	// The final allowed node can select a leaf after the loop's last visit.
+	if (!reached_leaf && node < 0) {
+		leaf = node;
+		reached_leaf = true;
+	}
+	if (!reached_leaf || leaf == FFOG_BAKED_EMPTY_BSP_LEAF) {
+		return false;
+	}
+	// A tetrahedron leaf is encoded as -index-1. Check before negating so the
+	// EMPTY_BSP_LEAF sentinel can never overflow signed integer arithmetic.
+	int tetrahedron_index = -leaf - 1;
+	if (tetrahedron_index < 0 || uint(tetrahedron_index) >= tetrahedron_count) {
+		return false;
+	}
+	r_tetrahedron_index = uint(tetrahedron_index);
+	return true;
+}
+
+bool ffog_baked_tetrahedron_weights(uint p_tetrahedron_index, vec3 p_capture,
+		out uvec4 r_probe_indices, out vec4 r_weights) {
+	uint probe_count = ffog_baked_probe_params.ffog_baked_counts_flags.x;
+	uint base = p_tetrahedron_index * 4u;
+	int i0 = ffog_baked_tetrahedra[base];
+	int i1 = ffog_baked_tetrahedra[base + 1u];
+	int i2 = ffog_baked_tetrahedra[base + 2u];
+	int i3 = ffog_baked_tetrahedra[base + 3u];
+	if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0 || uint(i0) >= probe_count ||
+			uint(i1) >= probe_count || uint(i2) >= probe_count || uint(i3) >= probe_count) {
+		return false;
+	}
+	r_probe_indices = uvec4(uint(i0), uint(i1), uint(i2), uint(i3));
+	vec3 a = ffog_baked_probe_positions[r_probe_indices.x].xyz;
+	vec3 b = ffog_baked_probe_positions[r_probe_indices.y].xyz;
+	vec3 c = ffog_baked_probe_positions[r_probe_indices.z].xyz;
+	vec3 d = ffog_baked_probe_positions[r_probe_indices.w].xyz;
+	vec3 vap = p_capture - a;
+	vec3 vbp = p_capture - b;
+	vec3 vab = b - a;
+	vec3 vac = c - a;
+	vec3 vad = d - a;
+	vec3 vbc = c - b;
+	vec3 vbd = d - b;
+	float determinant = dot(vab, cross(vac, vad));
+	if (isnan(determinant) || isinf(determinant) || abs(determinant) <= 1e-8) {
+		return false;
+	}
+	r_weights = vec4(
+		dot(vbp, cross(vbd, vbc)) / determinant,
+		dot(vap, cross(vac, vad)) / determinant,
+		dot(vap, cross(vad, vab)) / determinant,
+		dot(vap, cross(vab, vac)) / determinant);
+	return !any(isnan(r_weights)) && !any(isinf(r_weights));
+}
+
+vec3 ffog_baked_probe_sh_coefficient(uint p_probe_index, uint p_coefficient) {
+	uint base = p_probe_index * 27u + p_coefficient * 3u;
+	return vec3(ffog_baked_probe_sh[base], ffog_baked_probe_sh[base + 1u],
+		ffog_baked_probe_sh[base + 2u]);
+}
+
+vec3 ffog_baked_hg_sh9_bands(vec3 p_coefficients[9],
+		vec3 p_capture_scattering_direction, float p_g, uint p_max_band) {
+	vec3 direction = normalize(p_capture_scattering_direction);
+	float x = direction.x;
+	float y = direction.y;
+	float z = direction.z;
+	float basis[9] = float[9](
+		0.282095,
+		0.488603 * y,
+		0.488603 * z,
+		0.488603 * x,
+		1.092548 * x * y,
+		1.092548 * y * z,
+		0.315392 * (3.0 * z * z - 1.0),
+		1.092548 * x * z,
+		0.546274 * (x * x - y * y));
+	float g = clamp(p_g, -0.999, 0.999);
+	vec3 result = vec3(0.0);
+	for (uint coefficient = 0u; coefficient < 9u; ++coefficient) {
+		uint band = coefficient == 0u ? 0u : coefficient <= 3u ? 1u : 2u;
+		if (band > min(p_max_band, 2u)) {
+			continue;
+		}
+		float band_weight = band == 0u ? 1.0 : band == 1u ? g : g * g;
+		result += p_coefficients[coefficient] * (basis[coefficient] * band_weight);
+	}
+	// Godot's LightmapperRD capture coefficients are incident-radiance SH
+	// projected with 4/ray_count, i.e. physical radiance SH divided by PI.
+	// Restore that scale once; this is phase convolution, not surface cosine SH.
+	return result * FFOG_BAKED_PI;
+}
+
+// p_world_camera_vector points from the froxel toward the camera. Negating it
+// yields the camera-to-froxel view ray used by the LightmapGI phase-SH lookup;
+// rotate that view ray into capture space before evaluating the probe SH.
+FFogBakedLightingSample ffog_sample_baked_probe_volume_with_max_band(
+		vec3 p_world_position, vec3 p_world_camera_vector, float p_g, uint p_max_band) {
+	FFogBakedLightingSample invalid_sample = ffog_baked_invalid_sample();
+	uint probe_count = ffog_baked_probe_params.ffog_baked_counts_flags.x;
+	if (probe_count == 0u || !ffog_baked_is_finite_vec3(p_world_position) ||
+			!ffog_baked_is_finite_vec3(p_world_camera_vector) || dot(p_world_camera_vector, p_world_camera_vector) <= 1e-12) {
+		return invalid_sample;
+	}
+	vec3 p_capture = (ffog_baked_probe_params.ffog_baked_world_to_capture *
+		vec4(p_world_position, 1.0)).xyz;
+	if (!ffog_baked_is_finite_vec3(p_capture) || !ffog_baked_position_in_bounds(p_capture)) {
+		return invalid_sample;
+	}
+	uint tetrahedron_index = 0u;
+	if (!ffog_baked_find_tetrahedron(p_capture, tetrahedron_index)) {
+		return invalid_sample;
+	}
+	uvec4 probe_indices;
+	vec4 weights;
+	if (!ffog_baked_tetrahedron_weights(tetrahedron_index, p_capture, probe_indices, weights)) {
+		return invalid_sample;
+	}
+	vec3 interpolated_sh[9];
+	for (uint coefficient = 0u; coefficient < 9u; ++coefficient) {
+		vec3 value = vec3(0.0);
+		value += ffog_baked_probe_sh_coefficient(probe_indices.x, coefficient) * clamp(weights.x, 0.0, 1.0);
+		value += ffog_baked_probe_sh_coefficient(probe_indices.y, coefficient) * clamp(weights.y, 0.0, 1.0);
+		value += ffog_baked_probe_sh_coefficient(probe_indices.z, coefficient) * clamp(weights.z, 0.0, 1.0);
+		value += ffog_baked_probe_sh_coefficient(probe_indices.w, coefficient) * clamp(weights.w, 0.0, 1.0);
+		interpolated_sh[coefficient] = value;
+	}
+	vec3 world_scattering_direction = -normalize(p_world_camera_vector);
+	vec3 capture_scattering_direction = normalize((ffog_baked_probe_params.ffog_baked_world_direction_to_capture *
+		vec4(world_scattering_direction, 0.0)).xyz);
+	vec3 radiance = ffog_baked_hg_sh9_bands(interpolated_sh,
+			capture_scattering_direction, p_g, p_max_band);
+	if (!ffog_baked_is_finite_vec3(radiance)) {
+		return invalid_sample;
+	}
+	return FFogBakedLightingSample(radiance, true, ffog_baked_probe_params.ffog_baked_counts_flags.w);
+}
+
+// Generic API retains full SH9 phase convolution (L0/L1/L2).
+FFogBakedLightingSample ffog_sample_baked_probe_volume(vec3 p_world_position,
+		vec3 p_world_camera_vector, float p_g) {
+	return ffog_sample_baked_probe_volume_with_max_band(
+			p_world_position, p_world_camera_vector, p_g, 2u);
+}
+
+// UE 5.8 VolumetricFog uses GetVolumetricLightmapSH2/FTwoBandHG (L0/L1).
+FFogBakedLightingSample ffog_sample_baked_probe_volume_ue_two_band(
+		vec3 p_world_position, vec3 p_world_camera_vector, float p_g) {
+	return ffog_sample_baked_probe_volume_with_max_band(
+			p_world_position, p_world_camera_vector, p_g, 1u);
+}
+
+bool ffog_baked_sample_includes_environment(FFogBakedLightingSample p_sample) {
+	return p_sample.valid && (p_sample.source_flags & FFOG_BAKED_FLAG_INCLUDES_ENVIRONMENT_RADIANCE) != 0u;
+}
+
+bool ffog_baked_probe_replaces_live_sky(FFogBakedLightingSample p_sample,
+		float p_static_lighting_scattering_intensity) {
+	return ffog_baked_sample_includes_environment(p_sample) && p_static_lighting_scattering_intensity > 0.0;
+}
+
+#endif // FENG_FOG_BAKED_LIGHTING_SAMPLING_GLSLINC

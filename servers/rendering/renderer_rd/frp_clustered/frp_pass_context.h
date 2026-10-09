@@ -33,7 +33,11 @@
 #include "core/object/ref_counted.h"
 #include "core/math/basis.h"
 #include "core/os/mutex.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/vector.h"
+#include "core/variant/callable.h"
+#include "core/variant/type_info.h"
 #include "servers/rendering/frp_pipeline_spec.h"
 
 #include <functional>
@@ -55,7 +59,13 @@ class FRPPassContext : public RefCounted {
 
 	RenderDataRD *render_data = nullptr;
 	std::function<void(int)> operation_runner;
+	std::function<bool(int)> operation_is_scheduled;
 	std::function<void(int)> stage_runner;
+	// Callbacks are consumed immediately after their scheduled operation and all
+	// remaining entries are cleared at frame end; queues never cross frames.
+	HashMap<int, Vector<Callable>> after_operation_callbacks;
+	HashSet<int> dispatching_after_operation_callbacks;
+	HashSet<int> completed_operations;
 	// Presents a texture to the viewport's render target. Only the renderer can reach
 	// the render target, so the primitive goes through this callback.
 	std::function<void(const StringName &)> present_runner;
@@ -64,6 +74,18 @@ class FRPPassContext : public RefCounted {
 	std::function<void(RID)> eye_exposure_texture_writer;
 	// Resolved frame parameters, keyed by native pass id or custom pass name.
 	Dictionary pass_parameters;
+	// Immutable FRP volume inputs, published after clustered lighting has been
+	// prepared. camera transforms/origins and projections are view-specific; the
+	// transforms already include the Vector3 eye offset. The fixed two-view storage
+	// matches RenderSceneRender::MAX_RENDER_VIEWS.
+	Dictionary volume_frame_inputs[2];
+	int volume_frame_view_count = 0;
+	// The volume output belongs to the addon RenderSceneBuffers owner. These are
+	// borrowed handles only; FRPPassContext never frees them.
+	RID volume_output_texture;
+	PackedFloat32Array volume_sampling_parameters;
+	float volume_rgb_pre_exposure = 1.0f;
+	bool volume_deferred_composition = false;
 	// Render-local Feng Height Fog snapshot. It is written by the Sky-anchored
 	// HeightFog pass and consumed by the later forward fallback/transparent ops.
 	PackedFloat32Array height_fog_parameters;
@@ -116,6 +138,13 @@ protected:
 	static void _bind_methods();
 
 public:
+	enum Operation {
+		OP_GBUFFER = FRPPipelineSpec::OP_GBUFFER,
+		OP_LIGHTING_PREPARE = FRPPipelineSpec::OP_LIGHTING_PREPARE,
+		OP_PRE_LIGHTING_STAGE = FRPPipelineSpec::OP_PRE_LIGHTING_STAGE,
+		OP_SCREEN_AND_DEPTH_COPY = FRPPipelineSpec::OP_SCREEN_AND_DEPTH_COPY,
+	};
+
 	struct SkyLightingSource {
 		uint64_t owner_id = 0;
 		RID sky;
@@ -130,7 +159,7 @@ public:
 	static void clear_all_sky_lighting_sources();
 	static bool get_sky_lighting_source(RID p_render_target, SkyLightingSource &r_source);
 
-	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>(), float p_scene_exposure_normalization = 1.0f);
+	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>(), float p_scene_exposure_normalization = 1.0f, const std::function<bool(int)> &p_operation_is_scheduled = std::function<bool(int)>());
 
 	// Frame state.
 	RenderDataRD *get_render_data() const { return render_data; }
@@ -148,6 +177,25 @@ public:
 	void set_next_pre_exposure(int p_view, float p_exposure);
 	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
 	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }
+	// C++ frame publisher; scripts receive an isolated deep copy from the getter.
+	void set_volume_frame_input(int p_view, const Dictionary &p_inputs);
+	void clear_volume_frame_inputs();
+	Dictionary get_volume_frame_inputs(int p_view = 0) const;
+	// Borrowed addon output: one RGBA16F 3D X-tiled view atlas and the v1 20-float
+	// sampling packet. Its five vec4 slots are (B,O,S,froxel_pixel_size),
+	// (gridX,gridY,gridZ,viewCount), (atlasW,atlasH,atlasD,viewStrideX),
+	// (start,far,near,P0), and (1/atlasW,1/atlasH,1/atlasD,valid=1).
+	// XY maps internal viewport pixels to froxels by dividing by pixel_size;
+	// Z maps depth with log2(max(depth * B + O, epsilon)) * S / gridZ.
+	// RGB is stored at P0; alpha is integrated transmittance.
+	void set_volume_output(RID p_texture, const PackedFloat32Array &p_sample_parameters, float p_rgb_pre_exposure);
+	RID get_volume_texture() const { return volume_output_texture; }
+	PackedFloat32Array get_volume_sampling_parameters() const { return volume_sampling_parameters; }
+	float get_volume_rgb_pre_exposure() const { return volume_rgb_pre_exposure; }
+	bool has_volume_output() const { return volume_output_texture.is_valid() && volume_sampling_parameters.size() == 20; }
+	void clear_volume_output();
+	void set_volume_deferred_composition(bool p_deferred);
+	bool is_volume_deferred_composition() const { return volume_deferred_composition; }
 	void set_atmosphere_parameters(const PackedFloat32Array &p_parameters, RID p_light, RID p_secondary_light, RID p_optical_texture, RID p_multiple_texture);
 	PackedFloat32Array get_atmosphere_parameters() const { return atmosphere_parameters; }
 	// Requests the deferred opaque lighting pass to publish its global SkyLight diffuse contribution.
@@ -247,4 +295,20 @@ public:
 	void run_pass(int p_pass_id);
 	// Runs a CompositorEffect callback stage, exactly as the engine's own passes do.
 	void stage_compositor_effects(int p_callback_type);
+	// Queues a one-shot callback after an operation in this frame's execution plan.
+	// The callback receives this context as its only argument. Returns false when
+	// the operation is absent, the callback is invalid, that operation is already
+	// complete/dispatching, or a capture has no screen/depth copy or transparent
+	// draw at its late scene-color boundary.
+	bool enqueue_after_operation(int p_operation, const Callable &p_callback);
+	// Renderer entry point called immediately after a built-in operation returns.
+	void dispatch_after_operation_callbacks(int p_operation);
+	bool has_pending_after_operation_callbacks() const { return !after_operation_callbacks.is_empty(); }
+	// Ends this render frame's scheduling window, releasing any callbacks for
+	// operations skipped by an explicit pipeline and invalidating the plan query.
+	void clear_after_operation_callbacks();
+	// Reports whether the named operation has already executed in this frame.
+	bool is_operation_completed(int p_operation) const;
 };
+
+VARIANT_ENUM_CAST(FRPPassContext::Operation);

@@ -1,0 +1,610 @@
+#[compute]
+#version 450
+
+#include "volumetric_fog_frame.glslinc"
+#include "native_light_inputs.glslinc"
+#include "../lighting/light_extensions/fog_light_extension.glslinc"
+#include "../lighting/fog_rect_light.glslinc"
+#include "../lighting/fog_capsule_light.glslinc"
+#include "../lighting/environment_visibility/fog_volume_environment_visibility.glslinc"
+#include "../baked_lighting/fog_baked_lighting_sampling.glslinc"
+#include "../baked_lighting/volumetric_lightmap/fog_volumetric_lightmap_sampling.glslinc"
+#include "volumetric_fog_history.glslinc"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 1, std140) uniform VolumeLightParameters {
+	vec4 light_counts; // directional, omni, spot, area.
+	vec4 cluster_layout; // tile size, width, height, max elements by type.
+	vec4 cluster_words; // words per type, header words, Z bucket count, selected directional index.
+	vec4 exposure_control; // light buffer exposure normalization, camera exposure, luminance multiplier, storage P0.
+	vec4 sky_control; // ready/matched, source energy, captured exposure, scattering intensity.
+	vec4 sky_rotation_x;
+	vec4 sky_rotation_y;
+	vec4 sky_rotation_z;
+	vec4 fog_color_override_directional; // artist directional-inscattering rgb, enabled flag.
+	vec4 fog_color_override_sky; // artist fog-inscattering rgb, enabled flag.
+	vec4 sky_extra; // scene normalization, static scattering, baked scale, UE light-soft-fading CVar.
+	vec4 quality_control; // history-miss samples, Halton enabled, area source texture enabled, inverse-square bias scale.
+	vec4 rt_layout; // RT enabled, RT light-slot count, requested miss samples, RT work-mask valid.
+	vec4 baked_control; // source mode (0/1/2), exact Sun-key match, payload valid, reserved.
+} fog_lights;
+
+layout(set = 0, binding = 2, std140) uniform DirectionalLights {
+	FRPVolumeDirectionalLightData data[8];
+} directional_lights;
+layout(set = 0, binding = 3, std430) readonly buffer OmniLights {
+	FRPVolumeLightData data[];
+} omni_lights;
+layout(set = 0, binding = 4, std430) readonly buffer SpotLights {
+	FRPVolumeLightData data[];
+} spot_lights;
+layout(set = 0, binding = 5, std430) readonly buffer AreaLights {
+	FRPVolumeLightData data[];
+} area_lights;
+layout(set = 0, binding = 6, std430) readonly buffer ClusterBuffer {
+	uint data[];
+} cluster_buffer;
+layout(set = 0, binding = 7) uniform sampler2DShadow shadow_atlas;
+layout(set = 0, binding = 8) uniform sampler2DShadow directional_shadow_atlas;
+layout(set = 0, binding = 9) uniform sampler2D area_profile_atlas;
+layout(set = 0, binding = 10, std430) readonly buffer SkyDiffuseSH {
+	vec4 coefficients[];
+} sky_diffuse_sh;
+layout(set = 0, binding = 11, std430) readonly buffer RayVisibility {
+	uint visibility[];
+} ray_visibility;
+layout(set = 0, binding = 12, std430) readonly buffer RaySlotMap {
+	int slot_by_extension_record[];
+} ray_slot_map;
+layout(set = 0, binding = 13) uniform sampler3D medium_scattering_extinction;
+layout(set = 0, binding = 14) uniform sampler3D medium_emissive;
+layout(rgba16f, set = 0, binding = 15) uniform image3D injected_source_extinction;
+layout(set = 0, binding = 16) uniform sampler2D current_scene_depth;
+layout(set = 0, binding = 17, std430) readonly buffer HistoryWorkMask {
+	uint sample_count[];
+} history_work_mask;
+layout(set = 0, binding = 18) uniform sampler2D current_conservative_depth;
+layout(set = 0, binding = 19) uniform sampler2D previous_conservative_depth;
+
+// Extension records and current environment visibility use independently
+// owned addon descriptor sets, leaving native light buffers untouched.
+#include "volumetric_fog_depth_constraints.glslinc"
+
+float feng_volume_range_mask(float distance_m, float inverse_radius) {
+	float normalized_distance = distance_m * inverse_radius;
+	normalized_distance *= normalized_distance;
+	normalized_distance *= normalized_distance;
+	normalized_distance = max(1.0 - normalized_distance, 0.0);
+	normalized_distance *= normalized_distance;
+	return normalized_distance;
+}
+
+float feng_volume_omni_attenuation(float distance_m, float inverse_radius, float decay) {
+	float radius_mask = feng_volume_range_mask(distance_m, inverse_radius);
+	return radius_mask * pow(max(distance_m, 0.0001), -clamp(decay, 0.0, 16.0));
+}
+
+float feng_volume_point_shadow(FRPVolumeLightData light, vec3 view_position, bool omni) {
+	if (light.shadow_opacity <= 0.001 || light.atlas_rect.z <= 0.0 || light.atlas_rect.w <= 0.0) {
+		return 1.0;
+	}
+	if (omni) {
+		vec3 local_position = (light.shadow_matrix * vec4(view_position, 1.0)).xyz;
+		float shadow_length = length(local_position);
+		if (!(shadow_length > 1.0e-5)) {
+			return 1.0;
+		}
+		vec3 shadow_direction = local_position / shadow_length;
+		vec4 rect = light.atlas_rect;
+		if (shadow_direction.z >= 0.0) {
+			rect.xy += light.direction.xy;
+		}
+		shadow_direction.z = 1.0 + abs(shadow_direction.z);
+		vec2 paraboloid_uv = shadow_direction.xy / shadow_direction.z * 0.5 + 0.5;
+		vec2 uv = clamp(rect.xy + paraboloid_uv * rect.zw, rect.xy, rect.xy + rect.zw);
+		float reference_depth = 1.0 - (shadow_length - light.shadow_bias) * light.inv_radius;
+		float visibility = texture(shadow_atlas, vec3(uv, reference_depth));
+		return mix(1.0 - clamp(light.shadow_opacity, 0.0, 1.0), 1.0, visibility);
+	}
+	vec4 projected = light.shadow_matrix * vec4(view_position, 1.0);
+	if (abs(projected.w) <= 1.0e-6 || isnan(projected.w) || isinf(projected.w)) {
+		return 1.0;
+	}
+	vec3 ndc = projected.xyz / projected.w;
+	vec2 uv = light.atlas_rect.xy + ndc.xy * light.atlas_rect.zw;
+	if (any(lessThan(uv, light.atlas_rect.xy)) || any(greaterThan(uv, light.atlas_rect.xy + light.atlas_rect.zw))) {
+		return 1.0;
+	}
+	float reference_depth = ndc.z - light.shadow_bias;
+	float visibility = texture(shadow_atlas, vec3(uv, reference_depth));
+	return mix(1.0 - clamp(light.shadow_opacity, 0.0, 1.0), 1.0, visibility);
+}
+
+float feng_volume_area_shadow(FRPVolumeLightData light, vec3 view_position) {
+	if (light.shadow_opacity <= 0.001 || light.atlas_rect.z <= 0.0 || light.atlas_rect.w <= 0.0) {
+		return 1.0;
+	}
+	vec3 local_position = (light.shadow_matrix * vec4(view_position, 1.0)).xyz;
+	float shadow_length = length(local_position);
+	if (!(shadow_length > 1.0e-5)) {
+		return 1.0;
+	}
+	vec3 shadow_direction = local_position / shadow_length;
+	shadow_direction.z = 1.0 + abs(shadow_direction.z);
+	vec2 paraboloid_uv = shadow_direction.xy / shadow_direction.z * 0.5 + 0.5;
+	vec2 uv = clamp(light.atlas_rect.xy + paraboloid_uv * light.atlas_rect.zw,
+			light.atlas_rect.xy, light.atlas_rect.xy + light.atlas_rect.zw);
+	float reference_depth = 1.0 - (shadow_length - light.shadow_bias) * light.inv_radius;
+	float visibility = texture(shadow_atlas, vec3(uv, reference_depth));
+	return mix(1.0 - clamp(light.shadow_opacity, 0.0, 1.0), 1.0, visibility);
+}
+
+float feng_volume_directional_shadow(FRPVolumeDirectionalLightData light, vec3 view_position) {
+	if (light.shadow_opacity <= 0.001) {
+		return 1.0;
+	}
+	float view_depth = -view_position.z;
+	int split = view_depth < light.shadow_split_offsets.x ? 0
+			: view_depth < light.shadow_split_offsets.y ? 1
+			: view_depth < light.shadow_split_offsets.z ? 2 : 3;
+	vec4 projected = light.shadow_matrices[split] * vec4(view_position, 1.0);
+	if (abs(projected.w) <= 1.0e-6 || isnan(projected.w) || isinf(projected.w)) {
+		return 1.0;
+	}
+	vec3 coord = projected.xyz / projected.w;
+	float visibility = texture(directional_shadow_atlas, coord);
+	float fade = smoothstep(light.fade_from, light.fade_to, view_position.z);
+	visibility = mix(visibility, 1.0, fade);
+	return mix(1.0 - clamp(light.shadow_opacity, 0.0, 1.0), 1.0, visibility);
+}
+
+uint feng_cluster_range_clip_mask(uint word_index, uint z_min, uint z_max) {
+	uint local_min = uint(clamp(int(z_min) - int(word_index) * 32, 0, 31));
+	uint mask_width = uint(clamp(int(z_max) - int(z_min), 0, 32 - int(local_min)));
+	return mask_width == 32u ? 0xffffffffu : ((1u << mask_width) - 1u) << local_min;
+}
+
+void feng_cluster_item_range(uint offset, uint max_words, uint z_bucket,
+		out uint minimum, out uint maximum, out uint word_from, out uint word_to) {
+	uint packed_range = cluster_buffer.data[offset + max_words + z_bucket];
+	minimum = packed_range & 0xffffu;
+	maximum = packed_range >> 16u;
+	word_from = minimum >> 5u;
+	word_to = maximum == 0u ? 0u : ((maximum - 1u) >> 5u) + 1u;
+}
+
+vec3 feng_sky_radiance(vec3 world_direction) {
+	vec3 x_axis = fog_lights.sky_rotation_x.xyz;
+	vec3 y_axis = fog_lights.sky_rotation_y.xyz;
+	vec3 z_axis = fog_lights.sky_rotation_z.xyz;
+	vec3 local_direction = vec3(dot(world_direction, x_axis),
+			dot(world_direction, y_axis), dot(world_direction, z_axis));
+	vec4 sh_direction = vec4(local_direction, 1.0);
+	return max(vec3(dot(sky_diffuse_sh.coefficients[0], sh_direction),
+			dot(sky_diffuse_sh.coefficients[1], sh_direction),
+			dot(sky_diffuse_sh.coefficients[2], sh_direction)), vec3(0.0));
+}
+
+float feng_volume_cell_2d_radius(vec2 viewport_uv, vec3 view_position) {
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 neighbor_uv = viewport_uv + vec2(pixel_size) / internal_size;
+	vec3 neighbor_position = feng_fog_view_position(neighbor_uv, -view_position.z);
+	return length(neighbor_position - view_position);
+}
+
+float feng_volume_cell_3d_radius(vec2 viewport_uv, float view_depth, float slice) {
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 neighbor_uv = viewport_uv + pixel_size / internal_size;
+	float neighbor_depth = feng_fog_depth_from_slice(max(slice + 1.0, 0.0));
+	vec3 center_position = feng_fog_view_position(viewport_uv, view_depth);
+	vec3 neighbor_position = feng_fog_view_position(neighbor_uv, neighbor_depth);
+	return length(neighbor_position - center_position);
+}
+
+// UE DeferredLightingCommon::GetRectLightVolumetricSoftFading. The extension
+// stores the authored barn door angle/length; the center-camera light data
+// supplies the same rect axes and light-forward direction used by the fog ray.
+float feng_volume_rect_barn_door_fade(FRPVolumeLightData light,
+		FFogLightExtensionRecord extension_record, vec3 to_receiver,
+		float cell_2d_radius) {
+	float fade_distance = max(fog_lights.sky_extra.w, 0.0) * max(cell_2d_radius, 0.0);
+	if (extension_record.barn_door.z <= 0.5 || fade_distance <= 1.0e-6) {
+		return 1.0;
+	}
+	float inverse_fade_distance = 1.0 / fade_distance;
+	float distance_to_plane = dot(normalize(light.direction), to_receiver);
+	float final_fade = clamp(distance_to_plane * inverse_fade_distance, 0.0, 1.0);
+	float barn_length = max(extension_record.barn_door.y, 0.0);
+	float cos_theta = clamp(extension_record.barn_door.x, -1.0, 1.0);
+	float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+	float barn_length_ortho = barn_length * cos_theta;
+	const float FADE_FROXEL_COUNT = 4.0;
+	if (distance_to_plane < barn_length_ortho + FADE_FROXEL_COUNT * fade_distance) {
+		float barn_door_tip_fade = clamp((distance_to_plane - barn_length_ortho)
+				/ (FADE_FROXEL_COUNT * fade_distance), 0.0, 1.0);
+		barn_door_tip_fade = mix(barn_door_tip_fade, 1.0,
+				1.0 - clamp(barn_length * inverse_fade_distance, 0.0, 1.0));
+		vec3 local_to_light = vec3(dot(normalize(light.area_width), to_receiver),
+				dot(normalize(light.area_height), to_receiver), distance_to_plane);
+		vec2 extent = vec2(length(light.area_width), length(light.area_height)) * 0.5;
+		float barn_door_fade = 1.0;
+		vec3 plane_origin = vec3(extent.x, 0.0, 0.0);
+		vec3 plane_normal = vec3(-cos_theta, 0.0, sin_theta);
+		barn_door_fade *= clamp(dot(plane_normal, local_to_light - plane_origin)
+				* inverse_fade_distance, 0.0, 1.0);
+		plane_origin = vec3(-extent.x, 0.0, 0.0);
+		plane_normal = vec3(cos_theta, 0.0, sin_theta);
+		barn_door_fade *= clamp(dot(plane_normal, local_to_light - plane_origin)
+				* inverse_fade_distance, 0.0, 1.0);
+		plane_origin = vec3(0.0, extent.y, 0.0);
+		plane_normal = vec3(0.0, -cos_theta, sin_theta);
+		barn_door_fade *= clamp(dot(plane_normal, local_to_light - plane_origin)
+				* inverse_fade_distance, 0.0, 1.0);
+		plane_origin = vec3(0.0, -extent.y, 0.0);
+		plane_normal = vec3(0.0, cos_theta, sin_theta);
+		barn_door_fade *= clamp(dot(plane_normal, local_to_light - plane_origin)
+				* inverse_fade_distance, 0.0, 1.0);
+		final_fade *= mix(barn_door_fade, 1.0, barn_door_tip_fade);
+	}
+	return final_fade;
+}
+
+uint feng_volume_light_extension_index(uint native_kind, uint native_index) {
+	uvec4 type_counts = uvec4(uint(fog_lights.light_counts.y),
+			uint(fog_lights.light_counts.z), uint(fog_lights.light_counts.w),
+			uint(fog_lights.light_counts.x));
+	return ffog_light_extension_record_index(native_kind, native_index, type_counts);
+}
+
+float feng_volume_rt_visibility(uint light_slot, uint froxel_index, uint sample_index) {
+	if (fog_lights.rt_layout.x <= 0.5 || light_slot >= uint(fog_lights.rt_layout.y)) {
+		return 1.0;
+	}
+	uint froxel_count = uint(fog_frame.grid_view.x * fog_frame.grid_view.y * fog_frame.grid_view.z);
+	uint address = (sample_index * uint(fog_lights.rt_layout.y) + light_slot) * froxel_count + froxel_index;
+	return ray_visibility.visibility[address] != 0u ? 1.0 : 0.0;
+}
+
+vec3 feng_volume_light_source(vec3 view_position, vec2 viewport_uv,
+		vec3 scattering_coeff, ivec3 cell, int sample_index, vec3 sample_offset) {
+	vec3 incident = vec3(0.0);
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	vec3 view_ray = fog_frame.camera_position_orthographic.w > 0.5
+			? vec3(0.0, 0.0, -1.0) : normalize(view_position);
+	// LightStorage builds positions and shadow matrices from the center camera.
+	// Froxel reconstruction is per eye, so translate the receiver into that
+	// center-camera view before evaluating local lights and their shadows.
+	vec3 center_view_position = view_position + fog_frame.eye_offset_center_view.xyz;
+	float g = clamp(fog_frame.emissive_and_phase.w, -0.99, 0.99);
+	vec3 world_view_ray = normalize(mat3(fog_frame.view_to_world) * view_ray);
+	vec3 world_camera_vector_to_camera = -world_view_ray;
+	vec3 world_position = feng_fog_world_position(viewport_uv, -view_position.z);
+	int baked_mode = int(round(fog_lights.baked_control.x));
+	float static_scattering = max(fog_lights.sky_extra.y, 0.0);
+	FFogBakedLightingSample baked_sample = ffog_baked_invalid_sample();
+	if (baked_mode == 1 && static_scattering > 0.0) {
+		baked_sample = ffog_sample_baked_probe_volume_ue_two_band(
+				world_position, world_camera_vector_to_camera, g);
+	}
+	FFogVolumetricLightmapSample vlm_sample = ffog_vlm_invalid_sample();
+	if (baked_mode == 2 && fog_lights.baked_control.z > 0.5) {
+		vlm_sample = ffog_sample_volumetric_lightmap(world_position, world_view_ray, g);
+	}
+	bool baked_sun_direct = ffog_vlm_contains_static_direct_directional_lighting(vlm_sample);
+	float selected_index = fog_lights.cluster_words.w;
+	if (selected_index >= 0.0 && selected_index < fog_lights.light_counts.x && !baked_sun_direct) {
+		FRPVolumeDirectionalLightData light = directional_lights.data[int(selected_index)];
+		float shadow = feng_volume_directional_shadow(light, center_view_position);
+		uint extension_index = feng_volume_light_extension_index(3u, uint(selected_index));
+		bool extension_valid = extension_index < ffog_light_extension_header.y
+				&& ffog_light_extension_header.x == FFogLightExtensionABIVersion;
+		uint shadow_policy = extension_valid
+				? ffog_light_extension_shadow_policy(extension_index) : FFogShadowInheritNative;
+		vec3 color = light.color * ffog_volume_sun_ground_transmittance(int(selected_index));
+		if (fog_lights.fog_color_override_directional.w > 0.5) {
+			float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+			color = fog_lights.fog_color_override_directional.rgb * max(luminance, 0.0);
+		}
+		color *= ffog_light_function_color(extension_index, world_position);
+		bool directional_shadowing_enabled = light.shadow_opacity > 0.001
+				&& shadow_policy != FFogShadowDisabled;
+		if (shadow_policy == FFogShadowDisabled) {
+			shadow = 1.0;
+		} else if (fog_lights.rt_layout.x > 0.5
+				&& shadow_policy == FFogShadowHardwareRTOptIn && extension_valid) {
+			uint froxel_index = uint(cell.x + int(fog_frame.grid_view.x)
+					* (cell.y + int(fog_frame.grid_view.y) * cell.z));
+			int rt_slot = ray_slot_map.slot_by_extension_record[extension_index];
+			if (rt_slot >= 0) {
+				shadow = mix(1.0 - clamp(light.shadow_opacity, 0.0, 1.0), 1.0,
+						feng_volume_rt_visibility(uint(rt_slot), froxel_index, uint(sample_index)));
+			}
+		}
+		if (vlm_sample.valid && fog_lights.baked_control.y > 0.5
+				&& shadow_policy != FFogShadowDisabled && !baked_sun_direct) {
+			shadow *= vlm_sample.directional_shadow;
+		}
+		shadow *= ffog_volume_cloud_shadow_visibility(world_position,
+				int(selected_index), directional_shadowing_enabled);
+		float phase = feng_fog_henyey_greenstein(g, dot(normalize(light.direction), view_ray));
+		float light_buffer_normalization = max(fog_lights.exposure_control.x, 1.0e-8);
+		float scene_normalization = max(fog_lights.sky_extra.x, 1.0e-8);
+		incident += color * light.energy * (scene_normalization / light_buffer_normalization)
+				* max(light.volumetric_fog_energy, 0.0)
+				* phase * shadow;
+	}
+
+	if (baked_sample.valid && static_scattering > 0.0) {
+		incident += max(baked_sample.incident_radiance, vec3(0.0))
+				* max(fog_lights.sky_extra.z, 0.0) * static_scattering;
+	}
+	if (vlm_sample.valid && static_scattering > 0.0) {
+		incident += max(vlm_sample.irradiance_over_pi, vec3(0.0))
+				* max(fog_lights.sky_extra.z, 0.0) * static_scattering;
+	}
+	bool baked_replaces_sky = (baked_mode == 1
+			&& ffog_baked_probe_replaces_live_sky(baked_sample, static_scattering))
+			|| (baked_mode == 2 && static_scattering > 0.0
+			&& ffog_vlm_includes_environment_radiance(vlm_sample));
+	if (fog_lights.sky_control.w > 0.0 && !baked_replaces_sky) {
+		float scene_normalization = max(fog_lights.sky_extra.x, 1.0e-8);
+		float vlm_sky_visibility = vlm_sample.valid ? vlm_sample.sky_visibility : 1.0;
+		float sky_visibility = ffog_volume_sky_cloud_visibility(world_position) * vlm_sky_visibility;
+		if (fog_lights.fog_color_override_sky.w > 0.5) {
+			// UE's UseHeightFogColors path evaluates SHAmbientFunction() as
+			// 1/(2*sqrt(PI))*FogInscatteringColor. It bypasses captured sky color,
+			// captured exposure and SkyLight energy; SkyLight volumetric intensity
+			// and the shared scene/storage exposure domains are still applied.
+			const float SH_AMBIENT_FUNCTION = 0.28209479177387814;
+			incident += fog_lights.fog_color_override_sky.rgb * SH_AMBIENT_FUNCTION
+					* fog_lights.sky_control.w * scene_normalization * sky_visibility;
+		} else if (fog_lights.sky_control.x > 0.5 && fog_lights.sky_control.y > 0.0) {
+			vec3 sky_direction = world_view_ray * -g;
+			vec3 sky = feng_sky_radiance(sky_direction);
+			float sky_exposure = scene_normalization
+					/ max(fog_lights.sky_control.z, 1.0e-8);
+			incident += sky * fog_lights.sky_control.y * fog_lights.sky_control.w * sky_exposure
+					* sky_visibility;
+		}
+	}
+
+	int tile_size = max(int(fog_lights.cluster_layout.x), 1);
+	int cluster_width = int(fog_lights.cluster_layout.y);
+	int cluster_height = int(fog_lights.cluster_layout.z);
+	int max_elements = int(fog_lights.cluster_layout.w);
+	int z_buckets = max(int(fog_lights.cluster_words.z), 1);
+	int cluster_words_per_type = int(fog_lights.cluster_words.x);
+	if (cluster_width > 0 && cluster_height > 0 && max_elements > 0 && cluster_words_per_type > 0) {
+		ivec2 pixel = ivec2(floor(viewport_uv * internal_size));
+		ivec2 cluster_xy = clamp(pixel / tile_size, ivec2(0), ivec2(cluster_width - 1, cluster_height - 1));
+		uint cluster_position_offset = uint((cluster_xy.y * cluster_width + cluster_xy.x)
+				* (max_elements / 32 + int(fog_lights.cluster_words.y)));
+		uint z_bucket = uint(clamp(int((-center_view_position.z / max(fog_frame.fog_layer0.w, 1.0e-6))
+				* float(z_buckets)), 0, z_buckets - 1));
+		uint max_words = uint(max_elements / 32);
+		for (uint type_index = 0u; type_index < 3u; type_index++) {
+			uint type_base = uint(cluster_words_per_type) * type_index + cluster_position_offset;
+			uint item_min;
+			uint item_max;
+			uint word_from;
+			uint word_to;
+			feng_cluster_item_range(type_base, max_words, z_bucket, item_min, item_max, word_from, word_to);
+			for (uint word_index = word_from; word_index < word_to; word_index++) {
+				uint bit_mask = cluster_buffer.data[type_base + word_index]
+						& feng_cluster_range_clip_mask(word_index, item_min, item_max);
+				while (bit_mask != 0u) {
+					uint bit_index = uint(findMSB(bit_mask));
+					bit_mask &= ~(1u << bit_index);
+					uint light_index = 32u * word_index + bit_index;
+					vec3 to_light;
+					float attenuation = 0.0;
+					float shadow = 1.0;
+					vec3 light_color = vec3(0.0);
+					float light_volumetric_energy = 0.0;
+					float distance_m = 0.0;
+					float inverse_radius = 0.0;
+					float decay_exponent = 0.0;
+					float spot_mask = 1.0;
+					float light_shadow_opacity = 0.0;
+					bool point_or_spot = false;
+					float rect_cell_2d_radius = 0.0;
+					if (type_index == 0u && light_index < uint(fog_lights.light_counts.y)) {
+						FRPVolumeLightData light = omni_lights.data[light_index];
+						to_light = light.position - center_view_position;
+						distance_m = max(length(to_light), 1.0e-4);
+						inverse_radius = light.inv_radius;
+						decay_exponent = light.attenuation;
+						point_or_spot = true;
+						attenuation = feng_volume_omni_attenuation(distance_m, light.inv_radius, light.attenuation);
+						light_color = light.color;
+						light_volumetric_energy = light.volumetric_fog_energy;
+						light_shadow_opacity = light.shadow_opacity;
+						shadow = feng_volume_point_shadow(light, center_view_position, true);
+					} else if (type_index == 1u && light_index < uint(fog_lights.light_counts.z)) {
+						FRPVolumeLightData light = spot_lights.data[light_index];
+						to_light = light.position - center_view_position;
+						distance_m = max(length(to_light), 1.0e-4);
+						inverse_radius = light.inv_radius;
+						decay_exponent = light.attenuation;
+						point_or_spot = true;
+						vec3 from_light = -to_light / distance_m;
+						float cone_cosine = max(dot(from_light, normalize(light.direction)), light.cos_spot_angle);
+						float rim = max((1.0 - cone_cosine) / max(1.0 - light.cos_spot_angle, 1.0e-5), 0.0);
+						spot_mask = max(1.0 - pow(rim, max(light.inv_spot_attenuation, 0.0)), 0.0);
+						attenuation = feng_volume_omni_attenuation(distance_m, light.inv_radius, light.attenuation)
+								* spot_mask;
+						light_color = light.color;
+						light_volumetric_energy = light.volumetric_fog_energy;
+						light_shadow_opacity = light.shadow_opacity;
+						shadow = feng_volume_point_shadow(light, center_view_position, false);
+					} else if (type_index == 2u && light_index < uint(fog_lights.light_counts.w)) {
+						FRPVolumeLightData light = area_lights.data[light_index];
+						vec3 to_receiver = center_view_position - light.position;
+						to_light = -to_receiver;
+						float receiver_distance_squared = dot(to_receiver, to_receiver);
+						uint area_extension_index = feng_volume_light_extension_index(2u, light_index);
+						bool area_extension_valid = area_extension_index < ffog_light_extension_header.y
+								&& ffog_light_extension_header.x == FFogLightExtensionABIVersion;
+						float barn_cos_angle = 1.0;
+						float barn_length_m = 0.0;
+						bool barn_enabled = false;
+						FFogLightExtensionRecord area_extension;
+						if (area_extension_valid) {
+							area_extension = ffog_light_extension_records[area_extension_index];
+							barn_cos_angle = area_extension.barn_door.x;
+							barn_length_m = area_extension.barn_door.y;
+							barn_enabled = area_extension.barn_door.z > 0.5;
+						}
+						FFogRectVisibleRect visible_rect = ffog_rect_visible_rect(
+								to_light, light.area_width, light.area_height, light.direction,
+								barn_cos_angle, barn_length_m, barn_enabled);
+						FFogRectIntegral rect_integral;
+						rect_integral.falloff = 0.0;
+						rect_integral.integrated_direction = vec3(0.0);
+						rect_integral.valid = false;
+						if (visible_rect.valid) {
+							rect_integral = ffog_rect_integrate(visible_rect.to_light,
+									visible_rect.area_width, visible_rect.area_height);
+						}
+						rect_cell_2d_radius = feng_volume_cell_2d_radius(viewport_uv, view_position);
+						vec2 front_soft = ffog_rect_front_and_soft_fade(light.direction,
+								to_receiver, rect_cell_2d_radius,
+								max(fog_lights.sky_extra.w, 0.0), fog_lights.sky_extra.w > 0.0);
+						float rect_soft_fade = front_soft.x * front_soft.y;
+						if (area_extension_valid) {
+							if (area_extension.barn_door.z > 0.5 && fog_lights.sky_extra.w > 0.0) {
+								rect_soft_fade = feng_volume_rect_barn_door_fade(light,
+										area_extension, to_receiver, rect_cell_2d_radius);
+							}
+						}
+						attenuation = rect_integral.valid ? rect_integral.falloff
+								* ffog_rect_radius_mask(receiver_distance_squared, light.inv_radius)
+								* rect_soft_fade : 0.0;
+						vec3 center_light_direction = normalize(to_light);
+						vec2 atlas_size = vec2(textureSize(area_profile_atlas, 0));
+						vec3 source_uv_mip;
+						bool has_source = fog_lights.quality_control.z > 0.5
+								&& ffog_rect_source_texture_uv(center_light_direction,
+								to_light, light.area_width, light.area_height, light.direction,
+								light.projector_rect, atlas_size, light.cos_spot_angle, source_uv_mip);
+						light_color = light.color;
+						if (has_source) {
+							light_color *= ffog_rect_sample_source_texture(area_profile_atlas, source_uv_mip).rgb;
+						}
+						light_volumetric_energy = light.volumetric_fog_energy;
+						light_shadow_opacity = light.shadow_opacity;
+						shadow = feng_volume_area_shadow(light, center_view_position);
+					}
+					uint extension_index = feng_volume_light_extension_index(type_index, light_index);
+					bool extension_valid = extension_index < ffog_light_extension_header.y
+							&& ffog_light_extension_header.x == FFogLightExtensionABIVersion;
+					uint shadow_policy = extension_valid
+							? ffog_light_extension_shadow_policy(extension_index) : FFogShadowInheritNative;
+					if (extension_valid) {
+						FFogLightExtensionRecord extension_record = ffog_light_extension_records[extension_index];
+						light_color *= ffog_light_function_color(extension_index, world_position);
+						if (shadow_policy == FFogShadowDisabled) {
+							shadow = 1.0;
+						} else if (fog_lights.rt_layout.x > 0.5
+								&& shadow_policy == FFogShadowHardwareRTOptIn) {
+							int rt_slot = ray_slot_map.slot_by_extension_record[extension_index];
+							if (rt_slot >= 0) {
+								uint froxel_index = uint(cell.x + int(fog_frame.grid_view.x)
+										* (cell.y + int(fog_frame.grid_view.y) * cell.z));
+								shadow = mix(1.0 - clamp(light_shadow_opacity, 0.0, 1.0), 1.0,
+										feng_volume_rt_visibility(uint(rt_slot), froxel_index, uint(sample_index)));
+							}
+						}
+						if (point_or_spot) {
+							float source_length = ffog_light_capsule_source_length_m(extension_record);
+							bool inverse_squared = abs(decay_exponent - 2.0) <= 1.0e-4;
+							float cell_radius = feng_volume_cell_3d_radius(viewport_uv,
+									-view_position.z, float(cell.z) + sample_offset.z);
+							float distance_bias = ffog_capsule_distance_bias_m(cell_radius,
+									max(fog_lights.quality_control.w, 0.0));
+							if (inverse_squared || source_length > 0.0) {
+								vec3 capsule_axis = ffog_capsule_light_axis_view(extension_record,
+										transpose(mat3(fog_frame.view_to_world)));
+								FFogCapsuleLightIntegral capsule = ffog_integrate_capsule_light(
+										to_light, capsule_axis, source_length, distance_bias, inverse_squared);
+								if (capsule.valid != 0u && inverse_squared) {
+									attenuation = feng_volume_range_mask(distance_m, inverse_radius)
+											* spot_mask * capsule.falloff;
+								}
+							}
+						}
+					}
+					float light_buffer_normalization = max(fog_lights.exposure_control.x, 1.0e-8);
+					float scene_normalization = max(fog_lights.sky_extra.x, 1.0e-8);
+					float direct_light_scale = scene_normalization / light_buffer_normalization;
+					if (light_volumetric_energy > 0.0 && attenuation > 0.0) {
+						float phase = feng_fog_henyey_greenstein(g,
+								dot(normalize(to_light), view_ray));
+						incident += light_color * direct_light_scale * attenuation * shadow
+								* light_volumetric_energy * phase;
+					}
+			}
+		}
+	}
+	}
+	float storage_pre_exposure = max(fog_frame.distance_exposure.w, 1.0e-8);
+	return min(max(scattering_coeff, vec3(0.0)) * max(incident, vec3(0.0)) * storage_pre_exposure,
+			vec3(FENG_FOG_HALF_MAX));
+}
+
+void main() {
+	uvec3 cell = gl_GlobalInvocationID;
+	ivec3 grid = ivec3(fog_frame.grid_view.xyz);
+	if (any(greaterThanEqual(ivec3(cell), grid))) {
+		return;
+	}
+	int view_index = int(fog_frame.grid_view.w);
+	int atlas_x = view_index * grid.x + int(cell.x);
+	float pixel_size = max(fog_frame.history_control.w, 1.0);
+	vec2 internal_size = max(fog_frame.history_frame_size.zw, vec2(1.0));
+	ivec3 atlas_cell = ivec3(atlas_x, int(cell.y), int(cell.z));
+	vec4 medium = texelFetch(medium_scattering_extinction, atlas_cell, 0);
+	vec3 emissive = texelFetch(medium_emissive, atlas_cell, 0).rgb;
+	float center_depth = feng_fog_depth_from_slice(float(cell.z) + 0.5);
+	vec2 center_uv = (vec2(cell.xy) + vec2(0.5)) * pixel_size / internal_size;
+	vec3 center_view_position = feng_fog_view_position(center_uv, center_depth);
+	uint froxel_index = cell.x + uint(grid.x) * (cell.y + uint(grid.y) * cell.z);
+	uint requested_samples = uint(clamp(fog_lights.rt_layout.z, 1.0,
+			float(FENG_FOG_MAX_HISTORY_MISS_SUPERSAMPLE_COUNT)));
+	uint sample_count = feng_volume_requested_sample_count(center_view_position,
+			ivec3(cell), grid, view_index, current_conservative_depth,
+			previous_conservative_depth, requested_samples);
+	if (fog_lights.rt_layout.x > 0.5 && fog_lights.rt_layout.w > 0.5) {
+		sample_count = min(history_work_mask.sample_count[froxel_index],
+				uint(FENG_FOG_MAX_HISTORY_MISS_SUPERSAMPLE_COUNT));
+	}
+	if (sample_count == 0u) {
+		imageStore(injected_source_extinction, atlas_cell,
+				vec4(0.0, 0.0, 0.0, feng_fog_finite_nonnegative(medium.a)));
+		return;
+	}
+	vec3 accumulated_light = vec3(0.0);
+	float frame_number = fog_frame.history_frame_size.y;
+	for (int sample_index = 0; sample_index < sample_count; sample_index++) {
+		vec3 sample_offset = fog_lights.quality_control.y > 0.5
+				? feng_fog_frame_jitter(frame_number - float(sample_index))
+				: vec3(0.5);
+		vec2 pixel_center = (vec2(cell.xy) + sample_offset.xy) * pixel_size;
+		vec2 uv = pixel_center / internal_size;
+		float sample_slice = feng_fog_depth_constrained_slice(current_scene_depth,
+				vec3(cell), sample_offset, uv);
+		float depth = feng_fog_depth_from_slice(sample_slice);
+		vec3 view_position = feng_fog_view_position(uv, depth);
+		accumulated_light += feng_volume_light_source(view_position, uv, medium.rgb,
+				ivec3(cell), sample_index, sample_offset);
+	}
+	float scene_normalization = max(fog_lights.sky_extra.x, 1.0e-8);
+	vec3 source = accumulated_light / float(max(sample_count, 1))
+			+ max(emissive, vec3(0.0)) * scene_normalization
+			* max(fog_frame.distance_exposure.w, 1.0e-8);
+	imageStore(injected_source_extinction, atlas_cell,
+			vec4(min(source, vec3(FENG_FOG_HALF_MAX)), feng_fog_finite_nonnegative(medium.a)));
+}

@@ -1,0 +1,124 @@
+// FRP native volume-light ABI v1.
+//
+// These structures mirror RendererRD::LightStorage GPU buffers. Bind them as
+// std430 arrays (local lights) and a std140 array (directional lights). Buffer
+// RIDs, counts and byte strides are supplied by FRPPassContext's
+// get_volume_frame_inputs() snapshot. Keep the C++ static_asserts in
+// light_storage.h and these declarations in lockstep.
+#ifndef FRP_VOLUME_NATIVE_LIGHT_INPUTS_GLSLINC
+#define FRP_VOLUME_NATIVE_LIGHT_INPUTS_GLSLINC
+
+#define FRP_VOLUME_LIGHT_INPUTS_ABI_VERSION 1
+#define FRP_VOLUME_DIRECTIONAL_LIGHT_STRIDE_BYTES 464
+#define FRP_VOLUME_LOCAL_LIGHT_STRIDE_BYTES 224
+#define FRP_VOLUME_CLUSTER_LAYOUT_VERSION 1
+#define FRP_VOLUME_CLUSTER_TYPE_OMNI 0u
+#define FRP_VOLUME_CLUSTER_TYPE_SPOT 1u
+#define FRP_VOLUME_CLUSTER_TYPE_AREA 2u
+#define FRP_VOLUME_CLUSTER_TYPE_DECAL 3u
+#define FRP_VOLUME_CLUSTER_TYPE_REFLECTION_PROBE 4u
+#define FRP_VOLUME_CLUSTER_Z_BUCKET_COUNT 32u
+#define FRP_VOLUME_CLUSTER_RANGE_HEADER_WORDS 32u
+
+#define FRP_LIGHT_BAKE_DISABLED 0u
+#define FRP_LIGHT_BAKE_STATIC 1u
+#define FRP_LIGHT_BAKE_DYNAMIC 2u
+
+// LightStorage::LightData, shared by the omni, spot and area buffers.
+struct FRPVolumeLightData {
+	vec3 position;
+	float inv_radius;
+	vec3 direction;
+	float size;
+	vec3 color;
+	float attenuation;
+	vec3 area_width;
+	float inv_spot_attenuation;
+	vec3 area_height;
+	float cos_spot_angle;
+	float specular_amount;
+	float shadow_opacity;
+	float pad[2];
+	vec4 atlas_rect;
+	mat4 shadow_matrix;
+	float shadow_bias;
+	float shadow_normal_bias;
+	float transmittance_bias;
+	float soft_shadow_size;
+	float soft_shadow_scale;
+	uint mask;
+	float volumetric_fog_energy;
+	uint bake_mode;
+	vec4 projector_rect;
+};
+
+// LightStorage::DirectionalLightData. The descriptor is a uniform buffer;
+// unlike local-light positions/directions, this array is ordered by the
+// directional indices consumed by the existing clustered scene shaders.
+struct FRPVolumeDirectionalLightData {
+	vec3 direction;
+	float energy;
+	vec3 color;
+	float size;
+	float specular;
+	uint mask;
+	float softshadow_angle;
+	float soft_shadow_scale;
+	uint blend_splits;
+	float shadow_opacity;
+	float fade_from;
+	float fade_to;
+	uvec2 pad;
+	uint bake_mode;
+	float volumetric_fog_energy;
+	vec4 shadow_bias;
+	vec4 shadow_normal_bias;
+	vec4 shadow_transmittance_bias;
+	vec4 shadow_z_range;
+	vec4 shadow_range_begin;
+	vec4 shadow_split_offsets;
+	mat4 shadow_matrices[4];
+	vec2 uv_scale1;
+	vec2 uv_scale2;
+	vec2 uv_scale3;
+	vec2 uv_scale4;
+};
+
+// LightData.position/direction, DirectionalLightData.direction and shadow
+// matrices, and cluster coordinates use the native center-camera view basis.
+// `camera_transform`, `camera_origin`, and projection matrices in the frame
+// packet are already per-eye world/view values. For a per-eye view-space sample
+// evaluated against these center-view light/cluster/shadow values, add the
+// packet's Vector3 `eye_offset` to the sample position before use. Do not apply
+// the offset to the light payload itself. LightStorage's directional buffer is
+// a fixed-capacity UBO: use `directional_light_buffer_capacity` for its declared
+// array size and `directional_light_count` only for active entries. Local-light
+// buffers are storage buffers with the published active counts.
+//
+// Local-light color already contains the renderer's selected light-unit and
+// energy conversion; directional energy contains its directional light-unit
+// and energy conversion. If converting either direct buffer to scene-linear
+// radiance, divide by `light_buffer_exposure_normalization`; multiply
+// `volumetric_fog_energy` independently. Color values are linear.
+//
+// Local-light attenuation is the authored falloff exponent (2 for the FRP UE
+// physical-light path); inv_radius provides the range. Shadow atlas rectangles
+// and matrices are renderer-authored. Directional shadows use
+// `directional_shadow_atlas`; local spot/omni/area shadows use `shadow_atlas`.
+// Directional matrices select one of four PSSM split transforms. Spot shadows
+// use the perspective shadow_matrix and atlas_rect. Omni shadow matrices
+// transform the center-view sample into light-local coordinates; direction.xy
+// stores the second paraboloid tile's atlas offset, and local Z selects the
+// hemisphere tile. Area shadows use one paraboloid projection in their atlas
+// rectangle. Use `shadow_sampler` for depth-compare sampling; blocker searches
+// read the same atlas as regular float data. Area-light profile lookup uses
+// projector_rect/cos_spot_angle with area_profile_atlas and the published
+// linear+mip clamp area_profile_sampler.
+
+// Cluster buffer offsets are uint words. For each of five element types, each
+// XY tile owns `(cluster_max_elements / 32 + 32)` words: the first
+// `cluster_max_elements / 32` words contain 32-bit element masks and the final
+// 32 words contain packed [min_z,max_z) ranges for the 32 linear view-depth
+// buckets. `cluster_type_stride_words` advances from one type block to the next.
+
+#endif // FRP_VOLUME_NATIVE_LIGHT_INPUTS_GLSLINC

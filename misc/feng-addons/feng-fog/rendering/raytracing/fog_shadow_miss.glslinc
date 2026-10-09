@@ -1,0 +1,9 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(location = 0) rayPayloadInEXT uint visibility;
+
+void main() {
+	// A miss has no occluder, so explicitly preserve visible binary state.
+	visibility = 1u;
+}

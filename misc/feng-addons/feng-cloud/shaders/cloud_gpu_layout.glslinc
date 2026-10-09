@@ -13,6 +13,10 @@
 #define FENG_CLOUD_VRT_SECONDARY 0
 #endif
 
+#ifndef FENG_CLOUD_VOLUME_DEFERRED
+#define FENG_CLOUD_VOLUME_DEFERRED 0
+#endif
+
 #if FENG_CLOUD_UE58_LAYOUT_INPUTS
 // The injected material kernel is included through feng_cloud_common below,
 // so all optional material resources must be declared first.
@@ -167,6 +171,11 @@ struct FengCloudNativeShadowData {
 	layout(set = 0, binding = 39) uniform sampler2D cloud_blue_noise_texture
 #define FENG_CLOUD_DECLARE_SCENE_DEPTH \
 	layout(set = 0, binding = 13) uniform sampler2D cloud_scene_depth
+#define FENG_CLOUD_DECLARE_VOLUME_FOG \
+	layout(set = 0, binding = 40) uniform sampler3D cloud_integrated_volume_fog; \
+	layout(set = 0, binding = 41, std140) uniform FengCloudVolumeSamplingBlock { \
+		vec4 sample_packet[5]; vec4 frame_control; \
+	} cloud_volume_sampling
 #define FENG_CLOUD_DECLARE_MOTION \
 	layout(set = 0, binding = 14) uniform sampler2D cloud_motion_vectors
 #define FENG_CLOUD_DECLARE_HISTORY \
@@ -249,6 +258,13 @@ struct FengCloudNativeShadowData {
 #else
 #define FENG_CLOUD_DECLARE_SCENE_OUTPUT \
 	layout(rgba16f, set = 1, binding = 4) uniform image2D cloud_out_scene
+#endif
+#if FENG_CLOUD_VOLUME_DEFERRED
+#define FENG_CLOUD_DECLARE_VOLUME_COMPOSITION_OUTPUTS \
+	layout(rgba16f, set = 1, binding = 11) uniform image2DArray cloud_out_volume_radiance; \
+	layout(rgba16f, set = 1, binding = 12) uniform image2DArray cloud_out_volume_transmittance
+#else
+#define FENG_CLOUD_DECLARE_VOLUME_COMPOSITION_OUTPUTS
 #endif
 #define FENG_CLOUD_DECLARE_AO_OUTPUT \
 	layout(r16f, set = 1, binding = 5) uniform image2D cloud_out_ao

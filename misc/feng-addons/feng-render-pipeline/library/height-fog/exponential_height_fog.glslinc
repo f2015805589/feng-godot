@@ -1,0 +1,85 @@
+#ifndef FRP_EXPONENTIAL_HEIGHT_FOG_GLSLINC
+#define FRP_EXPONENTIAL_HEIGHT_FOG_GLSLINC
+
+const float FRP_HEIGHT_FOG_EPSILON2 = 0.01;
+const float FRP_HEIGHT_FOG_UNIFORM_PHASE = 0.07957747154594767;
+
+float frp_height_fog_line_integral_shared(float height_falloff,
+		float ray_delta_y, float origin_terms) {
+	float falloff = max(-127.0, height_falloff * ray_delta_y);
+	float integral = (1.0 - exp2(-falloff)) / falloff;
+	float taylor = log(2.0) - 0.5 * log(2.0) * log(2.0) * falloff;
+	return origin_terms * (abs(falloff) > FRP_HEIGHT_FOG_EPSILON2 ? integral : taylor);
+}
+
+float frp_height_fog_directional_phase(vec3 ray_direction,
+		vec3 sun_direction, float exponent) {
+	return pow(clamp(dot(ray_direction, sun_direction), 0.0, 1.0), exponent)
+			* FRP_HEIGHT_FOG_UNIFORM_PHASE;
+}
+
+// Shared analytic source/transmittance evaluation for the early height-fog
+// pass and late FSSS source generation. All authored colors remain scene-linear;
+// the caller applies its scene/pre-exposure factor once to RGB.
+vec4 frp_evaluate_exponential_height_fog(vec3 camera_to_receiver,
+		float view_ray_cosine, vec3 camera_position, vec4 fog0, vec4 fog1,
+		vec4 fog2, vec4 fog_color, vec4 sun_direction,
+		vec4 directional_inscattering_color, float fog_scale,
+		float volume_exclusion_enabled, float volume_far_distance) {
+	float min_fog_opacity = clamp(fog_color.a, 0.0, 1.0);
+	float observer_y = fog0.z;
+	camera_to_receiver.y += camera_position.y - observer_y;
+	float distance_squared = dot(camera_to_receiver, camera_to_receiver);
+	float ray_length = sqrt(max(distance_squared, 0.0));
+	if (!(ray_length > fog0.w) || isnan(ray_length) || isinf(ray_length)) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 ray_direction = camera_to_receiver / max(ray_length, 1.0e-8);
+	float full_length = ray_length;
+	float exclude_distance = max(fog0.w, 0.0);
+	if (volume_exclusion_enabled > 0.5) {
+		exclude_distance = max(exclude_distance,
+				max(volume_far_distance, 0.0) / max(abs(view_ray_cosine), 1.0e-4));
+	}
+	if (!(ray_length > exclude_distance)) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	float ray_delta_y = camera_to_receiver.y;
+	float origin_terms0 = fog0.x;
+	float origin_terms1 = fog1.x;
+	if (exclude_distance > 0.0) {
+		float exclusion_time = clamp(exclude_distance / ray_length, 0.0, 1.0);
+		float exclusion_y = exclusion_time * camera_to_receiver.y;
+		float exclusion_world_y = observer_y + exclusion_y;
+		ray_delta_y -= exclusion_y;
+		ray_length = (1.0 - exclusion_time) * ray_length;
+		origin_terms0 = fog2.x * exp2(-max(-127.0,
+				fog0.y * (exclusion_world_y - fog2.y)));
+		origin_terms1 = fog1.z * exp2(-max(-127.0,
+				fog1.y * (exclusion_world_y - fog1.w)));
+	}
+	float shared_extinction_rate = max(fog_scale, 0.0) * (
+			frp_height_fog_line_integral_shared(fog0.y, ray_delta_y, origin_terms0)
+			+ frp_height_fog_line_integral_shared(fog1.y, ray_delta_y, origin_terms1));
+	float optical_depth = shared_extinction_rate * ray_length;
+	vec3 directional_inscattering = vec3(0.0);
+	if (sun_direction.w >= 0.0) {
+		float source_length = max(ray_length - sun_direction.w, 0.0);
+		float directional_transmittance = clamp(exp2(-shared_extinction_rate * source_length), 0.0, 1.0);
+		vec3 source = directional_inscattering_color.rgb
+				* frp_height_fog_directional_phase(ray_direction,
+					sun_direction.xyz, directional_inscattering_color.w);
+		directional_inscattering = source * (1.0 - directional_transmittance);
+	}
+	float transmittance = max(clamp(exp2(-optical_depth), 0.0, 1.0), min_fog_opacity);
+	float cutoff_distance = max(fog2.w, 0.0);
+	if (cutoff_distance > 0.0 && full_length > cutoff_distance) {
+		transmittance = 1.0;
+		directional_inscattering = vec3(0.0);
+	}
+	vec3 inscattering = fog_color.rgb * (1.0 - transmittance) + directional_inscattering;
+	inscattering = mix(inscattering, vec3(0.0), isnan(inscattering));
+	return vec4(inscattering, transmittance);
+}
+
+#endif // FRP_EXPONENTIAL_HEIGHT_FOG_GLSLINC

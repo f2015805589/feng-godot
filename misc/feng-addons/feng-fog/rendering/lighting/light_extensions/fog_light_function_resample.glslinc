@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D source_texture;
+layout(rgba16f, set = 0, binding = 1) writeonly uniform image2DArray cookie_array;
+layout(std140, set = 0, binding = 2) uniform CopyParameters {
+	uvec4 source_and_layer; // source width, height, destination layer, destination edge
+	vec4 fit_scale; // aspect-preserving normalized content size
+} params;
+
+void main() {
+	uvec2 pixel = gl_GlobalInvocationID.xy;
+	uint edge = params.source_and_layer.w;
+	if (pixel.x >= edge || pixel.y >= edge) {
+		return;
+	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / float(edge);
+	vec2 local_uv = (uv - vec2(0.5)) / max(params.fit_scale.xy, vec2(1e-6)) + vec2(0.5);
+	vec4 value = vec4(1.0);
+	if (all(greaterThanEqual(local_uv, vec2(0.0))) &&
+			all(lessThanEqual(local_uv, vec2(1.0)))) {
+		value = textureLod(source_texture, local_uv, 0.0);
+	}
+	imageStore(cookie_array, ivec3(pixel, int(params.source_and_layer.z)), vec4(value.rgb, 1.0));
+}
+

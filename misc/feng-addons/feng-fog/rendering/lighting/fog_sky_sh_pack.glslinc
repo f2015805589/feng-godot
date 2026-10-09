@@ -1,0 +1,67 @@
+#[compute]
+#version 450
+
+// Converts projected orthonormal SH9 radiance into UE's seven float4 diffuse
+// coefficients (diffuse convolution divided by PI), one vector per RGB channel
+// for the L0/L1 simple lookup and four vectors for the remaining L2 terms.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer PartialSH {
+	vec4 partial_coefficients[];
+};
+layout(set = 0, binding = 1, std430) restrict writeonly buffer PackedSkySH {
+	vec4 sky_sh[];
+};
+
+const uint FENG_FOG_GROUP_COUNT = 128u;
+shared vec4 reduced_coefficients[9];
+
+void main() {
+	uint coefficient = gl_LocalInvocationIndex;
+	if (coefficient < 9u) {
+		vec4 sum = vec4(0.0);
+		for (uint group_index = 0u; group_index < FENG_FOG_GROUP_COUNT; group_index++) {
+			sum += partial_coefficients[group_index * 9u + coefficient];
+		}
+		reduced_coefficients[coefficient] = sum;
+	}
+	barrier();
+	if (coefficient != 0u) {
+		return;
+	}
+
+	const float coefficient0 = 0.28209479177387814;
+	const float coefficient1 = 0.32573500793527993;
+	const float coefficient2 = 0.343046698469648;
+	const float coefficient3 = 0.07884789131313001;
+	const float coefficient4 = 0.171523349234824;
+
+	// ReflectionEnvironment.cpp SetupSkyIrradianceEnvironmentMapConstants order.
+	for (uint channel = 0u; channel < 3u; channel++) {
+		uint base = channel * 3u;
+		float r0 = reduced_coefficients[0][channel];
+		float r1 = reduced_coefficients[1][channel];
+		float r2 = reduced_coefficients[2][channel];
+		float r3 = reduced_coefficients[3][channel];
+		float r4 = reduced_coefficients[4][channel];
+		float r5 = reduced_coefficients[5][channel];
+		float r6 = reduced_coefficients[6][channel];
+		float r7 = reduced_coefficients[7][channel];
+		float r8 = reduced_coefficients[8][channel];
+		vec4 packed_l0_l1;
+		packed_l0_l1.x = -coefficient1 * r3;
+		packed_l0_l1.y = -coefficient1 * r1;
+		packed_l0_l1.z = coefficient1 * r2;
+		packed_l0_l1.w = coefficient0 * r0 - coefficient3 * r6;
+		sky_sh[channel] = packed_l0_l1;
+
+		vec4 packed_l2;
+		packed_l2.x = coefficient2 * r4;
+		packed_l2.y = -coefficient2 * r5;
+		packed_l2.z = 3.0 * coefficient3 * r6;
+		packed_l2.w = -coefficient2 * r7;
+		sky_sh[3u + channel] = packed_l2;
+		sky_sh[6u][channel] = coefficient4 * r8;
+	}
+	sky_sh[6u].w = 1.0;
+}

@@ -8,7 +8,11 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 FENG_CLOUD_DECLARE_FRAME;
 FENG_CLOUD_DECLARE_CURRENT_RESULTS;
 FENG_CLOUD_DECLARE_SCENE_DEPTH;
+FENG_CLOUD_DECLARE_VOLUME_FOG;
 FENG_CLOUD_DECLARE_SCENE_OUTPUT;
+#if FENG_CLOUD_VOLUME_DEFERRED
+FENG_CLOUD_DECLARE_VOLUME_COMPOSITION_OUTPUTS;
+#endif
 #if FENG_CLOUD_VRT_SECONDARY
 FENG_CLOUD_DECLARE_SECONDARY_TRACE_INPUTS;
 #endif
@@ -33,6 +37,58 @@ FengCloudCompositeRay feng_cloud_composite_ray(vec2 uv) {
 		abs(far_h.w) > 1e-7 ? far_world - ray.origin_world_m : far_h.xyz,
 		vec3(0.0, 0.0, -1.0));
 	return ray;
+}
+
+vec4 feng_cloud_sample_integrated_volume(vec2 viewport_uv, float scene_depth_m,
+		vec2 viewport_size) {
+	if (cloud_volume_sampling.sample_packet[4].w <= 0.5
+			|| cloud_volume_sampling.frame_control.z <= 0.5
+			|| scene_depth_m <= cloud_volume_sampling.sample_packet[3].x) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec4 depth_params = cloud_volume_sampling.sample_packet[0];
+	vec3 grid = cloud_volume_sampling.sample_packet[1].xyz;
+	vec4 atlas = cloud_volume_sampling.sample_packet[2];
+	scene_depth_m = clamp(feng_cloud_finite_or_zero(scene_depth_m),
+			cloud_volume_sampling.sample_packet[3].x,
+			min(FENG_CLOUD_VRT_FAR_DEPTH_M, cloud_volume_sampling.sample_packet[3].y));
+	float depth_argument = max(scene_depth_m * depth_params.x + depth_params.y, 1.0e-12);
+	float log_slice = log2(depth_argument) * depth_params.z;
+	if (isnan(log_slice) || isinf(log_slice) || log_slice < 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	float pixel_size = max(depth_params.w, 1.0);
+	vec2 xy_cell = clamp(viewport_uv, vec2(0.0), vec2(1.0))
+			* max(viewport_size, vec2(1.0)) / pixel_size;
+	xy_cell = clamp(xy_cell, vec2(0.5), grid.xy - vec2(0.5));
+	float local_x = cloud_volume_sampling.frame_control.x * atlas.w + xy_cell.x;
+	vec3 uvw = vec3(local_x / max(atlas.x, 1.0), xy_cell.y / max(atlas.y, 1.0),
+			clamp(log_slice, 0.5, grid.z - 0.5) / max(atlas.z, 1.0));
+	vec4 integrated = textureLod(cloud_integrated_volume_fog, uvw, 0.0);
+	float stored_exposure = max(cloud_volume_sampling.sample_packet[3].w, 1.0e-8);
+	float exposure_ratio = max(cloud_volume_sampling.frame_control.y, 1.0e-8) / stored_exposure;
+	integrated.rgb = clamp(integrated.rgb * exposure_ratio, vec3(0.0), vec3(65504.0));
+	integrated.a = clamp(integrated.a, 0.0, 1.0);
+	return integrated;
+}
+
+vec3 feng_cloud_apply_volume_at_depth(vec3 cloud_radiance, vec3 cloud_transmittance,
+		float cloud_ray_distance_m, vec2 uv, vec2 viewport_size, bool holdout) {
+	if (holdout || cloud_volume_sampling.frame_control.z <= 0.5) {
+		return cloud_radiance;
+	}
+	// VRT's tAP channel is distance along the camera ray, while froxel Z is
+	// camera view depth. Reconstructing the representative world point handles
+	// off-axis perspective rays and the near-plane origin used by orthographic
+	// rays without treating either ray distance as view-Z.
+	FengCloudCompositeRay ray = feng_cloud_composite_ray(uv);
+	float ray_distance = max(feng_cloud_finite_or_zero(cloud_ray_distance_m), 0.0);
+	vec3 representative_world = ray.origin_world_m + ray.direction_world * ray_distance;
+	vec4 representative_view = cloud_frame.world_to_view * vec4(representative_world, 1.0);
+	float cloud_view_depth_m = abs(representative_view.w) > 1.0e-7
+			? max(-representative_view.z / representative_view.w, 0.0) : 0.0;
+	vec4 volume = feng_cloud_sample_integrated_volume(uv, cloud_view_depth_m, viewport_size);
+	return volume.rgb * (vec3(1.0) - cloud_transmittance) + volume.a * cloud_radiance;
 }
 
 float feng_cloud_composite_scene_distance_m(ivec2 pixel, ivec2 output_size, out bool has_geometry) {
@@ -65,6 +121,11 @@ void main() {
 			|| view_layer < 0 || view_layer >= textureSize(cloud_current_radiance, 0).z) {
 		return;
 	}
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(max(output_size, ivec2(1)));
+#if FENG_CLOUD_VOLUME_DEFERRED
+	// These images are cleared to the identity (Rc=0,Tc=1) once per frame.
+	// Pixels with no visible cloud keep that value; visible pixels overwrite it.
+#endif
 	ivec2 cloud_size = textureSize(cloud_current_radiance, 0).xy;
 	ivec2 full_size = ivec2(max(cloud_frame.viewport_size_xy_inv_xy.xy, vec2(1.0)));
 	uint vrt_mode = min(cloud_frame.view_index_frame_index_flags_vrt_mode.w, 3u);
@@ -215,6 +276,8 @@ void main() {
 				tap_radiance = feng_cloud_finite_or_zero3(sample_radiance.rgb);
 				tap_transmittance = clamp(feng_cloud_finite_or_zero3(sample_trans.rgb), vec3(0.0), vec3(1.0));
 				tap_holdout = feng_cloud_saturate_finite(sample_trans.a);
+				tap_radiance = feng_cloud_apply_volume_at_depth(tap_radiance,
+					tap_transmittance, sample_depth.y, uv, vec2(output_size), tap_holdout > 0.0);
 			}
 			radiance_sum += tap_radiance * weight;
 			transmittance_sum += tap_transmittance * weight;
@@ -246,7 +309,16 @@ void main() {
 		cloud_radiance = feng_cloud_finite_or_zero3(selected_cloud.rgb);
 		cloud_transmittance = clamp(feng_cloud_finite_or_zero3(selected_trans.rgb), vec3(0.0), vec3(1.0));
 		holdout_mask = feng_cloud_saturate_finite(selected_trans.a);
+		vec4 selected_depth = texelFetch(cloud_current_depth, selected_coord, 0);
+		cloud_radiance = feng_cloud_apply_volume_at_depth(cloud_radiance,
+				cloud_transmittance, selected_depth.y, uv, vec2(output_size), holdout_mask > 0.0);
 	}
+#if FENG_CLOUD_VOLUME_DEFERRED
+	imageStore(cloud_out_volume_radiance, ivec3(pixel, view_layer),
+		vec4(feng_cloud_finite_or_zero3(cloud_radiance), 1.0));
+	imageStore(cloud_out_volume_transmittance, ivec3(pixel, view_layer),
+		vec4(clamp(feng_cloud_finite_or_zero3(cloud_transmittance), vec3(0.0), vec3(1.0)), 1.0));
+#endif
 	vec4 opaque = imageLoad(cloud_out_scene, pixel);
 	vec3 composed = feng_cloud_finite_or_zero3(cloud_radiance)
 		+ cloud_transmittance * feng_cloud_finite_or_zero3(opaque.rgb);

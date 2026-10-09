@@ -33,6 +33,7 @@
 #include "core/io/marshalls.h"
 #include "core/object/class_db.h"
 #include "core/object/callable_mp.h"
+#include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
@@ -80,9 +81,10 @@ bool FRPPassContext::get_sky_lighting_source(RID p_render_target, SkyLightingSou
 	return true;
 }
 
-void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization) {
+void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization, const std::function<bool(int)> &p_operation_is_scheduled) {
 	render_data = p_render_data;
 	operation_runner = p_operation_runner;
+	operation_is_scheduled = p_operation_is_scheduled;
 	stage_runner = p_stage_runner;
 	present_runner = p_present_runner;
 	pre_exposure_reader = p_pre_exposure_reader;
@@ -90,6 +92,11 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
 	scene_exposure_normalization = Math::is_finite(p_scene_exposure_normalization) && p_scene_exposure_normalization > 0.0f ? p_scene_exposure_normalization : 1.0f;
 	pass_parameters = p_pass_parameters;
+	after_operation_callbacks.clear();
+	dispatching_after_operation_callbacks.clear();
+	completed_operations.clear();
+	clear_volume_frame_inputs();
+	clear_volume_output();
 	height_fog_parameters.clear();
 	atmosphere_parameters.clear();
 	atmosphere_light_rids[0] = RID();
@@ -107,6 +114,103 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 
 float FRPPassContext::get_pre_exposure(int p_view) const {
 	return pre_exposure_reader ? pre_exposure_reader(p_view) : 1.0f;
+}
+
+void FRPPassContext::set_volume_frame_input(int p_view, const Dictionary &p_inputs) {
+	ERR_FAIL_INDEX(p_view, RendererSceneRender::MAX_RENDER_VIEWS);
+	volume_frame_inputs[p_view] = p_inputs.duplicate(true);
+	volume_frame_view_count = MAX(volume_frame_view_count, p_view + 1);
+}
+
+void FRPPassContext::clear_volume_frame_inputs() {
+	for (int view = 0; view < RendererSceneRender::MAX_RENDER_VIEWS; view++) {
+		volume_frame_inputs[view] = Dictionary();
+	}
+	volume_frame_view_count = 0;
+}
+
+Dictionary FRPPassContext::get_volume_frame_inputs(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, RendererSceneRender::MAX_RENDER_VIEWS, Dictionary());
+	if (p_view >= volume_frame_view_count) {
+		return Dictionary();
+	}
+	return volume_frame_inputs[p_view].duplicate(true);
+}
+
+void FRPPassContext::clear_volume_output() {
+	volume_output_texture = RID();
+	volume_sampling_parameters.clear();
+	volume_rgb_pre_exposure = 1.0f;
+	volume_deferred_composition = false;
+}
+
+void FRPPassContext::set_volume_deferred_composition(bool p_deferred) {
+	ERR_FAIL_COND_MSG(p_deferred && !has_volume_output(), "Deferred volume composition requires a valid volume output texture and sampling packet.");
+	volume_deferred_composition = p_deferred;
+}
+
+void FRPPassContext::set_volume_output(RID p_texture, const PackedFloat32Array &p_sample_parameters, float p_rgb_pre_exposure) {
+	clear_volume_output();
+	if (!p_texture.is_valid() || p_sample_parameters.is_empty()) {
+		return;
+	}
+	ERR_FAIL_COND_MSG(p_sample_parameters.size() != 20, "Volume sampling parameters must contain 20 floats (five vec4 values).");
+	ERR_FAIL_COND_MSG(!Math::is_finite(p_rgb_pre_exposure) || p_rgb_pre_exposure <= 0.0f, "Volume RGB pre-exposure must be finite and positive.");
+	for (int i = 0; i < p_sample_parameters.size(); i++) {
+		ERR_FAIL_COND_MSG(!Math::is_finite(p_sample_parameters[i]), "Volume sampling parameters must be finite.");
+	}
+	const int integer_lanes[] = { 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+	for (int lane : integer_lanes) {
+		const float value = p_sample_parameters[lane];
+		ERR_FAIL_COND_MSG(value < 1.0f || value > 32768.0f || Math::abs(value - Math::round(value)) > 1e-4f, "Volume pixel size, grid/atlas dimensions, and view counts must be positive integers.");
+	}
+	const float log_z_b = p_sample_parameters[0];
+	const float log_z_s = p_sample_parameters[2];
+	const int pixel_size = int(Math::round(p_sample_parameters[3]));
+	const int grid_x = int(Math::round(p_sample_parameters[4]));
+	const int grid_y = int(Math::round(p_sample_parameters[5]));
+	const int grid_z = int(Math::round(p_sample_parameters[6]));
+	const int view_count = int(Math::round(p_sample_parameters[7]));
+	const int atlas_width = int(Math::round(p_sample_parameters[8]));
+	const int atlas_height = int(Math::round(p_sample_parameters[9]));
+	const int atlas_depth = int(Math::round(p_sample_parameters[10]));
+	const int view_stride_x = int(Math::round(p_sample_parameters[11]));
+	const float start_distance = p_sample_parameters[12];
+	const float far_distance = p_sample_parameters[13];
+	const float near_plane = p_sample_parameters[14];
+	const float packet_exposure = p_sample_parameters[15];
+	ERR_FAIL_COND_MSG(log_z_b <= 0.0f || log_z_s <= 0.0f, "Volume log-Z scale parameters must be positive.");
+	ERR_FAIL_COND_MSG(pixel_size < 1, "Volume froxel pixel size must be a positive integer.");
+	ERR_FAIL_COND_MSG(grid_x < 1 || grid_y < 1 || grid_z < 1 || view_count < 1 || view_count > RendererSceneRender::MAX_RENDER_VIEWS, "Volume grid and view counts are outside the supported range.");
+	ERR_FAIL_COND_MSG(atlas_width != grid_x * view_count || atlas_height != grid_y || atlas_depth != grid_z || view_stride_x != grid_x, "Volume atlas dimensions must match the X-tiled grid layout.");
+	ERR_FAIL_COND_MSG(start_distance < 0.0f || far_distance <= start_distance, "Volume start/far distances are invalid.");
+	ERR_FAIL_COND_MSG(near_plane <= 0.0f || near_plane > far_distance, "Volume near/far planes are invalid.");
+	ERR_FAIL_COND_MSG(packet_exposure <= 0.0f || Math::abs(p_sample_parameters[19] - 1.0f) > 1e-4f, "Volume output must have positive exposure and a valid frame flag equal to one.");
+	const float inverse_dimensions[] = { p_sample_parameters[16], p_sample_parameters[17], p_sample_parameters[18] };
+	const int atlas_dimensions[] = { atlas_width, atlas_height, atlas_depth };
+	for (int i = 0; i < 3; i++) {
+		const float expected_inverse = 1.0f / float(atlas_dimensions[i]);
+		ERR_FAIL_COND_MSG(inverse_dimensions[i] <= 0.0f || Math::abs(inverse_dimensions[i] - expected_inverse) > MAX(1e-7f, expected_inverse * 1e-4f), "Volume inverse atlas dimensions do not match the atlas size.");
+	}
+	if (render_data != nullptr && render_data->scene_data != nullptr) {
+		ERR_FAIL_COND_MSG(view_count != int(render_data->scene_data->view_count), "Volume output view count must match the current FRP view count.");
+		const Vector2i internal_size = get_internal_size();
+		ERR_FAIL_COND_MSG(internal_size.x <= 0 || internal_size.y <= 0, "Volume output requires a valid internal viewport size.");
+		const int expected_grid_x = (internal_size.x + pixel_size - 1) / pixel_size;
+		const int expected_grid_y = (internal_size.y + pixel_size - 1) / pixel_size;
+		ERR_FAIL_COND_MSG(grid_x != expected_grid_x || grid_y != expected_grid_y, "Volume XY grid must equal ceil(internal viewport size / froxel pixel size).");
+	}
+	const float exposure_tolerance = MAX(1e-6f, p_rgb_pre_exposure * 1e-4f);
+	ERR_FAIL_COND_MSG(packet_exposure <= 0.0f || Math::abs(packet_exposure - p_rgb_pre_exposure) > exposure_tolerance, "Volume output exposure must match sample_parameters[15].");
+	RD *rd = RD::get_singleton();
+	ERR_FAIL_NULL_MSG(rd, "RenderingDevice is not available for a volume output texture.");
+	ERR_FAIL_COND_MSG(!rd->texture_is_valid(p_texture), "Volume output RID is not a valid RenderingDevice texture.");
+	const RD::TextureFormat texture_format = rd->texture_get_format(p_texture);
+	ERR_FAIL_COND_MSG(texture_format.texture_type != RD::TEXTURE_TYPE_3D || texture_format.format != RD::DATA_FORMAT_R16G16B16A16_SFLOAT || !(texture_format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT), "Volume output must be a sampleable RGBA16F 3D texture.");
+	ERR_FAIL_COND_MSG(texture_format.width != uint32_t(atlas_width) || texture_format.height != uint32_t(atlas_height) || texture_format.depth != uint32_t(atlas_depth), "Volume output texture dimensions do not match sample_parameters.");
+	volume_output_texture = p_texture;
+	volume_sampling_parameters = p_sample_parameters;
+	volume_rgb_pre_exposure = p_rgb_pre_exposure;
 }
 
 bool FRPPassContext::supports_cloud_holdout() const {
@@ -536,7 +640,56 @@ void FRPPassContext::stage_compositor_effects(int p_callback_type) {
 	}
 }
 
+bool FRPPassContext::enqueue_after_operation(int p_operation, const Callable &p_callback) {
+	if (p_operation < 0 || p_operation >= FRPPipelineSpec::OP_MAX || !p_callback.is_valid() || !operation_is_scheduled || !operation_is_scheduled(p_operation) || completed_operations.has(p_operation)) {
+		return false;
+	}
+	if (dispatching_after_operation_callbacks.has(p_operation)) {
+		return false;
+	}
+	after_operation_callbacks[p_operation].push_back(p_callback);
+	return true;
+}
+
+void FRPPassContext::dispatch_after_operation_callbacks(int p_operation) {
+	if (p_operation < 0 || p_operation >= FRPPipelineSpec::OP_MAX || dispatching_after_operation_callbacks.has(p_operation)) {
+		return;
+	}
+	completed_operations.insert(p_operation);
+	if (!after_operation_callbacks.has(p_operation)) {
+		return;
+	}
+	// Remove before invoking callbacks so a callback cannot cause this batch to
+	// run twice by reentering an operation. Enqueueing for the same active
+	// operation is rejected; another operation in the schedule remains available.
+	Vector<Callable> callbacks = after_operation_callbacks[p_operation];
+	after_operation_callbacks.erase(p_operation);
+	dispatching_after_operation_callbacks.insert(p_operation);
+	const Ref<FRPPassContext> context(this);
+	for (int i = 0; i < callbacks.size(); i++) {
+		if (callbacks[i].is_valid()) {
+			callbacks[i].call(context);
+		}
+	}
+	dispatching_after_operation_callbacks.erase(p_operation);
+}
+
+void FRPPassContext::clear_after_operation_callbacks() {
+	after_operation_callbacks.clear();
+	dispatching_after_operation_callbacks.clear();
+	completed_operations.clear();
+	operation_is_scheduled = std::function<bool(int)>();
+}
+
+bool FRPPassContext::is_operation_completed(int p_operation) const {
+	return p_operation >= 0 && p_operation < FRPPipelineSpec::OP_MAX && completed_operations.has(p_operation);
+}
+
 void FRPPassContext::_bind_methods() {
+	BIND_ENUM_CONSTANT(OP_GBUFFER);
+	BIND_ENUM_CONSTANT(OP_LIGHTING_PREPARE);
+	BIND_ENUM_CONSTANT(OP_PRE_LIGHTING_STAGE);
+	BIND_ENUM_CONSTANT(OP_SCREEN_AND_DEPTH_COPY);
 	ClassDB::bind_method(D_METHOD("get_render_data"), &FRPPassContext::get_render_data);
 	ClassDB::bind_method(D_METHOD("get_render_scene_buffers"), &FRPPassContext::get_render_scene_buffers);
 	ClassDB::bind_method(D_METHOD("get_view_count"), &FRPPassContext::get_view_count);
@@ -546,9 +699,20 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
 	ClassDB::bind_method(D_METHOD("get_scene_exposure_normalization"), &FRPPassContext::get_scene_exposure_normalization);
+	ClassDB::bind_method(D_METHOD("get_volume_frame_inputs", "view"), &FRPPassContext::get_volume_frame_inputs, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_volume_output", "texture", "sample_parameters", "rgb_pre_exposure"), &FRPPassContext::set_volume_output);
+	ClassDB::bind_method(D_METHOD("get_volume_texture"), &FRPPassContext::get_volume_texture);
+	ClassDB::bind_method(D_METHOD("get_volume_sampling_parameters"), &FRPPassContext::get_volume_sampling_parameters);
+	ClassDB::bind_method(D_METHOD("get_volume_rgb_pre_exposure"), &FRPPassContext::get_volume_rgb_pre_exposure);
+	ClassDB::bind_method(D_METHOD("clear_volume_output"), &FRPPassContext::clear_volume_output);
+	ClassDB::bind_method(D_METHOD("set_volume_deferred_composition", "deferred"), &FRPPassContext::set_volume_deferred_composition);
+	ClassDB::bind_method(D_METHOD("is_volume_deferred_composition"), &FRPPassContext::is_volume_deferred_composition);
+	ClassDB::bind_method(D_METHOD("enqueue_after_operation", "operation", "callback"), &FRPPassContext::enqueue_after_operation);
+	ClassDB::bind_method(D_METHOD("is_operation_completed", "operation"), &FRPPassContext::is_operation_completed);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);
 	ClassDB::bind_method(D_METHOD("set_atmosphere_parameters", "parameters", "light", "secondary_light", "optical_texture", "multiple_texture"), &FRPPassContext::set_atmosphere_parameters);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_parameters"), &FRPPassContext::get_atmosphere_parameters);
+	ClassDB::bind_method(D_METHOD("get_atmosphere_light_rid", "slot"), &FRPPassContext::get_atmosphere_light_rid);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_optical_texture"), &FRPPassContext::get_atmosphere_optical_texture);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_multiple_texture"), &FRPPassContext::get_atmosphere_multiple_texture);
 	ClassDB::bind_method(D_METHOD("request_sky_light_diffuse"), &FRPPassContext::request_sky_light_diffuse);
