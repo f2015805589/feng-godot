@@ -219,6 +219,11 @@ func get_parameter_source() -> FengPass:
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray()
 
+## Optional diffuse-indirect provider classification. The plan resolver uses this
+## authored identity to select one owner before any pass callback runs.
+func get_indirect_gi_kind() -> StringName:
+	return &""
+
 ## Opt into sharing this pass's execution resource across camera views.
 ##
 ## Return true only when the pass and every pass it carries can run without retaining

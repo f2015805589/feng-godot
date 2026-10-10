@@ -1,0 +1,64 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct GIPathPayload {
+	vec3 radiance;
+	uint flags;
+};
+
+struct GIFrameData {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 size_exposure;
+	vec4 light_sky_parameters;
+	vec4 world_to_sky_columns[3];
+	uvec4 sun_view_generation_sky_array;
+	vec4 trace_parameters;
+	uvec4 generation_history_flags;
+};
+layout(set = 0, binding = 20, std140) uniform GIFrame {
+	GIFrameData data;
+} gi_frame;
+layout(set = 0, binding = 7, std140) uniform GIDirectionalLights {
+	vec4 light_data[8 * 29];
+} gi_lights;
+layout(set = 0, binding = 10, std430) readonly buffer GISurfaceRows {
+	uint words[];
+} gi_surfaces;
+layout(set = 0, binding = 11, std430) readonly buffer GIMaterialRows {
+	uint words[];
+} gi_materials;
+
+layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
+hitAttributeEXT vec2 gi_barycentrics;
+
+const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
+const uint GI_MATERIAL_TWO_SIDED = 2u;
+const uint GI_DIRECTIONAL_CAPACITY = 8u;
+const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
+
+void main() {
+	if (gi_payload.flags == GI_RAY_MODE_SUN_VISIBILITY) {
+		uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
+		if (sun_index >= GI_DIRECTIONAL_CAPACITY) {
+			ignoreIntersectionEXT;
+			return;
+		}
+		uint light_mask = floatBitsToUint(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 2u].y);
+		uint full_layer_mask = gi_surfaces.words[gl_InstanceCustomIndexEXT * 8u + 5u];
+		if ((full_layer_mask & light_mask) == 0u) {
+			ignoreIntersectionEXT;
+			return;
+		}
+		gi_payload.radiance = vec3(0.0);
+		terminateRayEXT;
+		return;
+	}
+
+	uint material_index = gi_surfaces.words[gl_InstanceCustomIndexEXT * 8u + 3u];
+	uint material_flags = gi_materials.words[material_index * 16u + 10u];
+	if ((material_flags & GI_MATERIAL_TWO_SIDED) == 0u
+			&& gl_HitKindEXT != gl_HitKindFrontFacingTriangleEXT) {
+		ignoreIntersectionEXT;
+	}
+}

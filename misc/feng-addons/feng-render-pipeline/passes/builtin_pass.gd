@@ -48,6 +48,9 @@ func get_parameter_key() -> Variant:
 func get_parameter_source() -> FengPass:
 	return implementation if implementation != null else self
 
+func get_indirect_gi_kind() -> StringName:
+	return implementation.get_indirect_gi_kind() if implementation != null else &""
+
 ## The resource contract of this entry belongs to the pass script that implements it
 ## (which may delegate further, to an overlay), because that is the object which reads
 ## and writes textures. Without one - or with one that is switched off - the entry is a

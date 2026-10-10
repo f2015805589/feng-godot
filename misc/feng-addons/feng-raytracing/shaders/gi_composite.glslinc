@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,rgba16f) uniform image2D scene_color;
+layout(set=0,binding=1) uniform sampler2D resolved_gi;
+layout(set=0,binding=2) uniform sampler2D sky_diffuse;
+layout(set=0,binding=3) uniform sampler2D depth;
+layout(set=0,binding=4) uniform sampler2D gi_depth;
+void main() {
+ ivec2 p=ivec2(gl_GlobalInvocationID.xy),size=imageSize(scene_color);
+ if(any(greaterThanEqual(p,size))) return;
+ float z=texelFetch(depth,p,0).r;
+ if(z<=0.0) return;
+ vec2 uv=(vec2(p)+0.5)/vec2(size), q=uv*vec2(textureSize(resolved_gi,0))-0.5;
+ ivec2 base=ivec2(floor(q)),small=textureSize(resolved_gi,0);
+ vec4 gi=vec4(0); float sum=0;
+ for(int y=0;y<2;y++) for(int x=0;x<2;x++) {
+  ivec2 tap=clamp(base+ivec2(x,y),ivec2(0),small-1);
+  float other=texelFetch(gi_depth,tap,0).r;
+  vec2 f=abs(q-vec2(base+ivec2(x,y)));
+  float w=(1.0-f.x)*(1.0-f.y)*exp(-abs(other-z)/max(z*0.01,1e-5));
+  gi+=texelFetch(resolved_gi,tap,0)*w; sum+=w;
+ }
+ if(sum<=1e-8) return;
+ gi/=sum;
+ vec4 scene=imageLoad(scene_color,p);
+ vec3 sky=texelFetch(sky_diffuse,p,0).rgb;
+ imageStore(scene_color,p,vec4(clamp(scene.rgb-sky*gi.a+gi.rgb,vec3(0),vec3(65504)),scene.a));
+}

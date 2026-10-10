@@ -1,0 +1,65 @@
+#ifndef FENG_GI_SKY_ARRAY
+#define FENG_GI_SKY_ARRAY 0
+#endif
+
+#if FENG_GI_SKY_ARRAY
+Texture2DArray<float4> gi_sky_radiance : register(t6, space0);
+#else
+Texture2D<float4> gi_sky_radiance : register(t6, space0);
+#endif
+SamplerState gi_sky_sampler : register(s6, space0);
+
+struct GIFrameData {
+	column_major float4x4 inverse_projection;
+	column_major float4x4 view_to_world;
+	float4 size_exposure;
+	float4 light_sky_parameters;
+	float4 world_to_sky_columns[3];
+	uint4 sun_view_generation_sky_array;
+	float4 trace_parameters;
+	uint4 generation_history_flags;
+};
+ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
+
+struct GIPathPayload {
+	float3 radiance;
+	uint flags;
+};
+
+float2 gi_vec3_to_oct(float3 direction) {
+	direction /= abs(direction.x) + abs(direction.y) + abs(direction.z);
+	float2 uv = direction.xy;
+	if (direction.z < 0.0f) {
+		float2 sign_value = float2(direction.x >= 0.0f ? 1.0f : -1.0f,
+				direction.y >= 0.0f ? 1.0f : -1.0f);
+		uv = (1.0f - abs(uv.yx)) * sign_value;
+	}
+	return uv * 0.5f + 0.5f;
+}
+
+float3 gi_sample_sky(float3 world_direction) {
+	float3 sky_direction = normalize(gi_frame.world_to_sky_columns[0].xyz * world_direction.x
+			+ gi_frame.world_to_sky_columns[1].xyz * world_direction.y
+			+ gi_frame.world_to_sky_columns[2].xyz * world_direction.z);
+	float border = clamp(gi_frame.light_sky_parameters.w, 0.0f, 0.49f);
+	float2 uv = gi_vec3_to_oct(sky_direction) * (1.0f - 2.0f * border) + border;
+#if FENG_GI_SKY_ARRAY
+	float3 sampled = gi_sky_radiance.SampleLevel(gi_sky_sampler,
+			float3(uv, 0.0f), 0.0f).rgb;
+#else
+	float3 sampled = gi_sky_radiance.SampleLevel(gi_sky_sampler, uv, 0.0f).rgb;
+#endif
+	float captured_exposure = gi_frame.light_sky_parameters.z;
+	if (!(captured_exposure > 0.0f) || !isfinite(captured_exposure)) {
+		return 0.0f;
+	}
+	float3 raw_radiance = max(sampled, 0.0f) * max(gi_frame.light_sky_parameters.y, 0.0f)
+			/ captured_exposure;
+	return all(isfinite(raw_radiance)) ? raw_radiance : 0.0f;
+}
+
+[shader("miss")]
+void FengGIPrimaryMiss(inout GIPathPayload payload) {
+	payload.radiance = gi_sample_sky(WorldRayDirection());
+	payload.flags = 0u;
+}

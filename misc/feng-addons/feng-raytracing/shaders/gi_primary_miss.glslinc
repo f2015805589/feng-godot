@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+#ifndef FENG_GI_SKY_ARRAY
+#define FENG_GI_SKY_ARRAY 0
+#endif
+
+struct GIPathPayload {
+	vec3 radiance;
+	uint flags;
+};
+
+#if FENG_GI_SKY_ARRAY
+layout(set = 0, binding = 6) uniform sampler2DArray gi_sky_radiance;
+#else
+layout(set = 0, binding = 6) uniform sampler2D gi_sky_radiance;
+#endif
+struct GIFrameData {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 size_exposure;
+	vec4 light_sky_parameters;
+	vec4 world_to_sky_columns[3];
+	uvec4 sun_view_generation_sky_array;
+	vec4 trace_parameters;
+	uvec4 generation_history_flags;
+};
+layout(set = 0, binding = 20, std140) uniform GIFrame {
+	GIFrameData data;
+} gi_frame;
+layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
+
+vec2 gi_vec3_to_oct(vec3 direction) {
+	direction /= abs(direction.x) + abs(direction.y) + abs(direction.z);
+	vec2 uv = direction.xy;
+	if (direction.z < 0.0) {
+		vec2 sign_value = mix(vec2(-1.0), vec2(1.0), greaterThanEqual(uv, vec2(0.0)));
+		uv = (1.0 - abs(uv.yx)) * sign_value;
+	}
+	return uv * 0.5 + 0.5;
+}
+
+vec3 gi_sample_sky(vec3 world_direction) {
+	vec3 sky_direction = normalize(gi_frame.data.world_to_sky_columns[0].xyz * world_direction.x
+			+ gi_frame.data.world_to_sky_columns[1].xyz * world_direction.y
+			+ gi_frame.data.world_to_sky_columns[2].xyz * world_direction.z);
+	float border = clamp(gi_frame.data.light_sky_parameters.w, 0.0, 0.49);
+	vec2 uv = gi_vec3_to_oct(sky_direction) * (1.0 - 2.0 * border) + border;
+#if FENG_GI_SKY_ARRAY
+	vec3 sampled = textureLod(gi_sky_radiance, vec3(uv, 0.0), 0.0).rgb;
+#else
+	vec3 sampled = textureLod(gi_sky_radiance, uv, 0.0).rgb;
+#endif
+	float captured_exposure = gi_frame.data.light_sky_parameters.z;
+	if (!(captured_exposure > 0.0) || isnan(captured_exposure) || isinf(captured_exposure)) {
+		return vec3(0.0);
+	}
+	vec3 raw_radiance = max(sampled, vec3(0.0)) * max(gi_frame.data.light_sky_parameters.y, 0.0)
+			/ captured_exposure;
+	return any(isnan(raw_radiance)) || any(isinf(raw_radiance)) ? vec3(0.0) : raw_radiance;
+}
+
+void main() {
+	gi_payload.radiance = gi_sample_sky(gl_WorldRayDirectionEXT);
+	gi_payload.flags = 0u;
+}

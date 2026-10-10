@@ -30,14 +30,37 @@
 
 #include "rendering_shader_container_d3d12.h"
 
+#include "core/crypto/crypto_core.h"
 #include "core/templates/sort_array.h"
 #include "drivers/d3d12/dxil_hash.h"
 
 #include <drivers/d3d12/godot_d3d12ma.h>
 #include <drivers/d3d12/godot_d3dx12.h>
 #include <drivers/d3d12/godot_nir.h>
+#include <thirdparty/spirv-reflect/spirv_reflect.h>
 #include <wrl/client.h>
 #include <zlib.h>
+
+static bool checked_add_u32(uint32_t p_base, uint64_t p_increment, uint32_t &r_result) {
+	if (p_increment > UINT32_MAX || p_base > UINT32_MAX - uint32_t(p_increment)) {
+		return false;
+	}
+	r_result = p_base + uint32_t(p_increment);
+	return true;
+}
+
+static bool align_up_u32(uint32_t p_value, uint32_t p_alignment, uint32_t &r_result) {
+	if (p_alignment == 0 || (p_alignment & (p_alignment - 1)) != 0) {
+		return false;
+	}
+	const uint32_t remainder = p_value & (p_alignment - 1);
+	const uint32_t padding = remainder == 0 ? 0 : p_alignment - remainder;
+	if (p_value > UINT32_MAX - padding) {
+		return false;
+	}
+	r_result = p_value + padding;
+	return true;
+}
 
 extern "C" {
 void dxil_reassign_driver_locations(nir_shader *s, nir_variable_mode modes,
@@ -255,8 +278,16 @@ uint32_t RenderingShaderContainerD3D12::_format_version() const {
 	return FORMAT_VERSION;
 }
 
+bool RenderingShaderContainerD3D12::_is_format_version_supported(uint32_t p_version) const {
+	return p_version == FORMAT_VERSION;
+}
+
 uint32_t RenderingShaderContainerD3D12::_from_bytes_reflection_extra_data(const uint8_t *p_bytes) {
 	reflection_data_d3d12 = *(const ReflectionDataD3D12 *)(p_bytes);
+	compiler_hash = String();
+	compile_fingerprint = String();
+	compiler_hash.append_utf8(reflection_data_d3d12.compiler_hash, sizeof(reflection_data_d3d12.compiler_hash));
+	compile_fingerprint.append_utf8(reflection_data_d3d12.compile_fingerprint, sizeof(reflection_data_d3d12.compile_fingerprint));
 	reflection_binding_set_data_d3d12.resize(reflection_data.set_count);
 	for (uint32_t i = 0; i < reflection_binding_set_data_d3d12.size(); i++) {
 		reflection_binding_set_data_d3d12.ptrw()[i] = *(const ReflectionBindingSetDataD3D12 *)(p_bytes + sizeof(ReflectionDataD3D12) + (i * sizeof(ReflectionBindingSetDataD3D12)));
@@ -285,11 +316,85 @@ uint32_t RenderingShaderContainerD3D12::_from_bytes_reflection_specialization_ex
 }
 
 uint32_t RenderingShaderContainerD3D12::_from_bytes_footer_extra_data(const uint8_t *p_bytes) {
+	native_hlsl_stage_info.clear();
+	root_signature_bytes.clear();
+	root_signature_crc = 0;
 	ContainerFooterD3D12 footer = *(const ContainerFooterD3D12 *)(p_bytes);
 	root_signature_crc = footer.root_signature_crc;
 	root_signature_bytes.resize(footer.root_signature_length);
-	memcpy(root_signature_bytes.ptrw(), p_bytes + sizeof(ContainerFooterD3D12), root_signature_bytes.size());
-	return sizeof(ContainerFooterD3D12) + footer.root_signature_length;
+	uint32_t offset = sizeof(ContainerFooterD3D12);
+	memcpy(root_signature_bytes.ptrw(), p_bytes + offset, root_signature_bytes.size());
+	offset += footer.root_signature_length;
+
+	ERR_FAIL_COND_V_MSG(footer.native_hlsl_stage_count > RenderingDeviceCommons::SHADER_STAGE_MAX, 0, "D3D12 container has too many native HLSL stages.");
+	native_hlsl_stage_info.resize(footer.native_hlsl_stage_count);
+	uint32_t seen_shader_indices = 0;
+	for (uint32_t i = 0; i < footer.native_hlsl_stage_count; i++) {
+		NativeHlslStageFooterD3D12 stage_footer = *(const NativeHlslStageFooterD3D12 *)(p_bytes + offset);
+		offset += sizeof(NativeHlslStageFooterD3D12);
+		ERR_FAIL_COND_V_MSG(stage_footer.shader_index >= shaders.size() || stage_footer.shader_index >= 32, 0, "D3D12 native HLSL stage references an invalid shader index.");
+		ERR_FAIL_COND_V_MSG(stage_footer.shader_stage < RenderingDeviceCommons::SHADER_STAGE_RAYGEN || stage_footer.shader_stage > RenderingDeviceCommons::SHADER_STAGE_INTERSECTION, 0, "D3D12 native HLSL metadata contains a non-RT stage.");
+		ERR_FAIL_COND_V_MSG(seen_shader_indices & (1U << stage_footer.shader_index), 0, "D3D12 native HLSL metadata references a shader stage more than once.");
+		seen_shader_indices |= 1U << stage_footer.shader_index;
+		ERR_FAIL_COND_V_MSG(shaders[stage_footer.shader_index].shader_stage != stage_footer.shader_stage, 0, "D3D12 native HLSL metadata stage does not match its bytecode entry.");
+		ERR_FAIL_COND_V_MSG(stage_footer.export_name_length == 0 || stage_footer.export_name_length > 4096, 0, "D3D12 native HLSL export name has an invalid length.");
+		ERR_FAIL_COND_V_MSG(stage_footer.active_binding_count > 4096, 0, "D3D12 native HLSL stage has too many active bindings.");
+		ERR_FAIL_COND_V_MSG((stage_footer.shader_model != 63 && stage_footer.shader_model != 65) ||
+				stage_footer.shader_model != reflection_data_d3d12.native_hlsl_shader_model || stage_footer.reserved != 0,
+				0, "D3D12 native HLSL stage has an invalid or inconsistent shader model declaration.");
+		NativeHlslStageInfoD3D12 &stage_info = native_hlsl_stage_info.write[i];
+		stage_info.shader_index = stage_footer.shader_index;
+		stage_info.stage = RenderingDeviceCommons::ShaderStage(stage_footer.shader_stage);
+		stage_info.shader_model = stage_footer.shader_model;
+		stage_info.required_feature_flags = stage_footer.required_feature_flags;
+		stage_info.export_name.append_utf8((const char *)(p_bytes + offset), stage_footer.export_name_length);
+		uint32_t export_end = 0;
+		ERR_FAIL_COND_V_MSG(!checked_add_u32(offset, stage_footer.export_name_length, export_end) || !align_up_u32(export_end, sizeof(uint32_t), offset),
+				0, "D3D12 native HLSL export name offset overflows the container.");
+		stage_info.active_bindings.resize(stage_footer.active_binding_count);
+		for (uint32_t j = 0; j < stage_footer.active_binding_count; j++) {
+			DxcCompilerD3D12::NativeBinding binding = *(const DxcCompilerD3D12::NativeBinding *)(p_bytes + offset);
+			offset += sizeof(DxcCompilerD3D12::NativeBinding);
+			ERR_FAIL_COND_V_MSG(binding.set >= RenderingDeviceCommons::MAX_UNIFORM_SETS || binding.count == 0 ||
+					binding.resource_class < DxcCompilerD3D12::NATIVE_RESOURCE_CBV || binding.resource_class > DxcCompilerD3D12::NATIVE_RESOURCE_SAMPLER ||
+					binding.resource_kind < DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER || binding.resource_kind > DxcCompilerD3D12::NATIVE_KIND_ACCELERATION_STRUCTURE ||
+					binding.resource_dimension > DxcCompilerD3D12::NATIVE_DIMENSION_ACCELERATION_STRUCTURE ||
+					((binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER) != (binding.constant_buffer_size_bytes > 0)) ||
+					(binding.resource_kind != DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER && binding.constant_buffer_size_bytes != 0),
+					0, "D3D12 native HLSL binding metadata is invalid.");
+			const bool class_kind_match =
+					(binding.resource_class == DxcCompilerD3D12::NATIVE_RESOURCE_CBV && binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER) ||
+					(binding.resource_class == DxcCompilerD3D12::NATIVE_RESOURCE_SAMPLER && binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_SAMPLER) ||
+					(binding.resource_class == DxcCompilerD3D12::NATIVE_RESOURCE_SRV &&
+							(binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_SAMPLED_TEXTURE || binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_RAW_BUFFER || binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_ACCELERATION_STRUCTURE)) ||
+					(binding.resource_class == DxcCompilerD3D12::NATIVE_RESOURCE_UAV &&
+							(binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_STORAGE_TEXTURE || binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_RAW_BUFFER));
+			ERR_FAIL_COND_V_MSG(!class_kind_match, 0, "D3D12 native HLSL resource class and resource kind disagree.");
+		const bool kind_dimension_match =
+					((binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER || binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_SAMPLER) && binding.resource_dimension == DxcCompilerD3D12::NATIVE_DIMENSION_NONE) ||
+					(binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_RAW_BUFFER && binding.resource_dimension == DxcCompilerD3D12::NATIVE_DIMENSION_BUFFER) ||
+					(binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_ACCELERATION_STRUCTURE && binding.resource_dimension == DxcCompilerD3D12::NATIVE_DIMENSION_ACCELERATION_STRUCTURE) ||
+					((binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_SAMPLED_TEXTURE || binding.resource_kind == DxcCompilerD3D12::NATIVE_KIND_STORAGE_TEXTURE) &&
+							binding.resource_dimension >= DxcCompilerD3D12::NATIVE_DIMENSION_TEXTURE_1D && binding.resource_dimension <= DxcCompilerD3D12::NATIVE_DIMENSION_TEXTURE_CUBE_ARRAY);
+		ERR_FAIL_COND_V_MSG(!kind_dimension_match, 0, "D3D12 native HLSL resource kind and dimension disagree.");
+			stage_info.active_bindings.write[j] = binding;
+		}
+	}
+
+	ERR_FAIL_COND_V_MSG((reflection_data_d3d12.uses_native_hlsl_rt != 0) != !native_hlsl_stage_info.is_empty(), 0, "D3D12 native HLSL metadata is inconsistent.");
+	if (reflection_data_d3d12.uses_native_hlsl_rt) {
+		ERR_FAIL_COND_V_MSG(reflection_data.pipeline_type != RenderingDeviceCommons::PIPELINE_TYPE_RAYTRACING || footer.native_hlsl_stage_count != reflection_data.stage_count,
+				0, "D3D12 native HLSL metadata does not cover the full ray-tracing pipeline.");
+		ERR_FAIL_COND_V_MSG(compiler_hash.length() != 64 || compile_fingerprint.length() != 64 ||
+				reflection_data_d3d12.max_attribute_size_bytes > 32 ||
+				(reflection_data_d3d12.native_hlsl_shader_model != 63 && reflection_data_d3d12.native_hlsl_shader_model != 65),
+				0, "D3D12 native HLSL metadata has invalid compiler fingerprints or size declarations.");
+	} else {
+		ERR_FAIL_COND_V_MSG(reflection_data_d3d12.native_hlsl_shader_model != 0 || reflection_data_d3d12.max_payload_size_bytes != 0 ||
+				reflection_data_d3d12.max_attribute_size_bytes != 0 || !compiler_hash.is_empty() || !compile_fingerprint.is_empty(),
+				0, "D3D12 non-native shader contains native HLSL metadata.");
+	}
+	return offset;
 }
 
 uint32_t RenderingShaderContainerD3D12::_to_bytes_reflection_extra_data(uint8_t *p_bytes) const {
@@ -324,10 +429,53 @@ uint32_t RenderingShaderContainerD3D12::_to_bytes_footer_extra_data(uint8_t *p_b
 		ContainerFooterD3D12 &footer = *(ContainerFooterD3D12 *)(p_bytes);
 		footer.root_signature_length = root_signature_bytes.size();
 		footer.root_signature_crc = root_signature_crc;
-		memcpy(p_bytes + sizeof(ContainerFooterD3D12), root_signature_bytes.ptr(), root_signature_bytes.size());
+		footer.native_hlsl_stage_count = native_hlsl_stage_info.size();
+		uint32_t offset = sizeof(ContainerFooterD3D12);
+		memcpy(p_bytes + offset, root_signature_bytes.ptr(), root_signature_bytes.size());
+		offset += root_signature_bytes.size();
+		for (const NativeHlslStageInfoD3D12 &stage_info : native_hlsl_stage_info) {
+			NativeHlslStageFooterD3D12 stage_footer;
+			stage_footer.shader_index = stage_info.shader_index;
+			stage_footer.shader_stage = stage_info.stage;
+			stage_footer.export_name_length = stage_info.export_name.utf8().length();
+			stage_footer.active_binding_count = stage_info.active_bindings.size();
+			stage_footer.shader_model = stage_info.shader_model;
+			stage_footer.required_feature_flags = stage_info.required_feature_flags;
+			*(NativeHlslStageFooterD3D12 *)(p_bytes + offset) = stage_footer;
+			offset += sizeof(NativeHlslStageFooterD3D12);
+			CharString export_name = stage_info.export_name.utf8();
+			ERR_FAIL_COND_V_MSG(export_name.length() > 4096, 0, "D3D12 native HLSL export name exceeds the container limit.");
+			memcpy(p_bytes + offset, export_name.ptr(), export_name.length());
+			uint32_t export_end = 0;
+			ERR_FAIL_COND_V_MSG(!checked_add_u32(offset, export_name.length(), export_end) || !align_up_u32(export_end, sizeof(uint32_t), offset),
+					0, "D3D12 native HLSL export name offset overflows the container.");
+			if (!stage_info.active_bindings.is_empty()) {
+				memcpy(p_bytes + offset, stage_info.active_bindings.ptr(), stage_info.active_bindings.size() * sizeof(DxcCompilerD3D12::NativeBinding));
+				uint32_t next_offset = 0;
+				ERR_FAIL_COND_V_MSG(!checked_add_u32(offset, uint64_t(stage_info.active_bindings.size()) * sizeof(DxcCompilerD3D12::NativeBinding), next_offset),
+						0, "D3D12 native HLSL binding metadata overflows the container.");
+				offset = next_offset;
+			}
+		}
+		return offset;
 	}
 
-	return sizeof(ContainerFooterD3D12) + root_signature_bytes.size();
+	uint32_t size = sizeof(ContainerFooterD3D12) + root_signature_bytes.size();
+	for (const NativeHlslStageInfoD3D12 &stage_info : native_hlsl_stage_info) {
+		uint32_t export_end = 0;
+		uint32_t aligned_export_end = 0;
+		uint32_t next_size = 0;
+		const uint64_t export_name_bytes = stage_info.export_name.utf8().length();
+		const uint64_t binding_bytes = uint64_t(stage_info.active_bindings.size()) * sizeof(DxcCompilerD3D12::NativeBinding);
+		ERR_FAIL_COND_V_MSG(export_name_bytes > 4096 ||
+				!checked_add_u32(size, sizeof(NativeHlslStageFooterD3D12), export_end) ||
+				!checked_add_u32(export_end, export_name_bytes, export_end) ||
+				!align_up_u32(export_end, sizeof(uint32_t), aligned_export_end) ||
+				!checked_add_u32(aligned_export_end, binding_bytes, next_size),
+				0, "D3D12 native HLSL footer size overflows the container.");
+		size = next_size;
+	}
+	return size;
 }
 
 #if NIR_ENABLED
@@ -523,7 +671,374 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_dxil(Span<ReflectShaderSta
 	return true;
 }
 
+static bool get_spirv_image_dimension(const SpvReflectImageTraits &p_image, uint32_t &r_dimension) {
+	using Kind = DxcCompilerD3D12;
+	switch (p_image.dim) {
+		case SpvDim1D:
+			if (p_image.ms) {
+				return false;
+			}
+		r_dimension = p_image.arrayed ? Kind::NATIVE_DIMENSION_TEXTURE_1D_ARRAY : Kind::NATIVE_DIMENSION_TEXTURE_1D;
+			return true;
+		case SpvDim2D:
+			if (p_image.ms) {
+				r_dimension = p_image.arrayed ? Kind::NATIVE_DIMENSION_TEXTURE_2D_MS_ARRAY : Kind::NATIVE_DIMENSION_TEXTURE_2D_MS;
+			} else {
+				r_dimension = p_image.arrayed ? Kind::NATIVE_DIMENSION_TEXTURE_2D_ARRAY : Kind::NATIVE_DIMENSION_TEXTURE_2D;
+			}
+			return true;
+		case SpvDim3D:
+			if (p_image.arrayed || p_image.ms) {
+				return false;
+			}
+			r_dimension = Kind::NATIVE_DIMENSION_TEXTURE_3D;
+			return true;
+		case SpvDimCube:
+			if (p_image.ms) {
+				return false;
+			}
+			r_dimension = p_image.arrayed ? Kind::NATIVE_DIMENSION_TEXTURE_CUBE_ARRAY : Kind::NATIVE_DIMENSION_TEXTURE_CUBE;
+			return true;
+		case SpvDimSubpassData:
+			if (p_image.arrayed || p_image.ms) {
+				return false;
+			}
+			r_dimension = Kind::NATIVE_DIMENSION_TEXTURE_2D;
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool RenderingShaderContainerD3D12::_add_expected_binding(Vector<DxcCompilerD3D12::NativeBinding> &r_bindings, uint32_t p_set, uint32_t p_binding, uint32_t p_class, uint32_t p_count, uint32_t p_kind, uint32_t p_dimension, uint32_t p_constant_buffer_size_bytes) {
+	if (p_count == 0) {
+		return false;
+	}
+	for (const DxcCompilerD3D12::NativeBinding &existing : r_bindings) {
+		if (existing.set == p_set && existing.binding == p_binding && existing.resource_class == p_class) {
+			return existing.count == p_count && existing.resource_kind == p_kind && existing.resource_dimension == p_dimension &&
+					existing.constant_buffer_size_bytes == p_constant_buffer_size_bytes;
+		}
+	}
+	DxcCompilerD3D12::NativeBinding expected;
+	expected.set = p_set;
+	expected.binding = p_binding;
+	expected.resource_class = p_class;
+	expected.count = p_count;
+	expected.resource_kind = p_kind;
+	expected.resource_dimension = p_dimension;
+	expected.constant_buffer_size_bytes = p_constant_buffer_size_bytes;
+	r_bindings.push_back(expected);
+	return true;
+}
+
+bool RenderingShaderContainerD3D12::_validate_native_hlsl_bindings(const ReflectShader &p_shader, NativeHlslStageInfoD3D12 &r_stage_info, const DxcCompilerD3D12::CompiledLibrary &p_library, String &r_error) {
+	using RDC = RenderingDeviceCommons;
+	Vector<DxcCompilerD3D12::NativeBinding> expected_bindings;
+
+	for (uint32_t set = 0; set < p_shader.uniform_sets.size(); set++) {
+		for (const ReflectUniform &uniform : p_shader.uniform_sets[set]) {
+			if (!uniform.has_spv_reflect(r_stage_info.stage)) {
+				continue;
+			}
+
+			const SpvReflectDescriptorBinding &spv_binding = uniform.get_spv_reflect(r_stage_info.stage);
+		uint32_t image_dimension = DxcCompilerD3D12::NATIVE_DIMENSION_NONE;
+		if ((uniform.type == RDC::UNIFORM_TYPE_TEXTURE || uniform.type == RDC::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE ||
+				uniform.type == RDC::UNIFORM_TYPE_IMAGE || uniform.type == RDC::UNIFORM_TYPE_INPUT_ATTACHMENT) &&
+				!get_spirv_image_dimension(spv_binding.image, image_dimension)) {
+			r_error = vformat("SPIR-V image at set %d, binding %d uses a dimension or array/MS combination unsupported by the D3D12 native ABI.", set, uniform.binding);
+			return false;
+		}
+			uint64_t reflected_descriptor_count = 1;
+			for (uint32_t array_dim = 0; array_dim < spv_binding.array.dims_count; array_dim++) {
+				if (spv_binding.array.dims[array_dim] == 0 || reflected_descriptor_count > UINT32_MAX / spv_binding.array.dims[array_dim]) {
+					r_error = vformat("SPIR-V descriptor at set %d, binding %d has an unsupported runtime or overflowing array.", set, uniform.binding);
+					return false;
+				}
+				reflected_descriptor_count *= spv_binding.array.dims[array_dim];
+			}
+			const uint32_t array_descriptor_count = uint32_t(reflected_descriptor_count);
+			bool supported = true;
+			switch (uniform.type) {
+				case RDC::UNIFORM_TYPE_SAMPLER:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_SAMPLER, array_descriptor_count,
+							DxcCompilerD3D12::NATIVE_KIND_SAMPLER);
+					break;
+				case RDC::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_SRV, array_descriptor_count,
+							DxcCompilerD3D12::NATIVE_KIND_SAMPLED_TEXTURE, image_dimension) &&
+							_add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_SAMPLER, array_descriptor_count,
+							DxcCompilerD3D12::NATIVE_KIND_SAMPLER);
+					break;
+				case RDC::UNIFORM_TYPE_TEXTURE:
+				case RDC::UNIFORM_TYPE_INPUT_ATTACHMENT:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_SRV, array_descriptor_count,
+							DxcCompilerD3D12::NATIVE_KIND_SAMPLED_TEXTURE, image_dimension);
+					break;
+				case RDC::UNIFORM_TYPE_IMAGE:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_UAV, array_descriptor_count,
+							DxcCompilerD3D12::NATIVE_KIND_STORAGE_TEXTURE, image_dimension);
+					break;
+				case RDC::UNIFORM_TYPE_UNIFORM_BUFFER:
+				case RDC::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_CBV, 1,
+							DxcCompilerD3D12::NATIVE_KIND_CONSTANT_BUFFER, DxcCompilerD3D12::NATIVE_DIMENSION_NONE, uniform.length);
+					break;
+				case RDC::UNIFORM_TYPE_STORAGE_BUFFER:
+				case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding,
+							uniform.writable ? DxcCompilerD3D12::NATIVE_RESOURCE_UAV : DxcCompilerD3D12::NATIVE_RESOURCE_SRV, 1,
+							DxcCompilerD3D12::NATIVE_KIND_RAW_BUFFER, DxcCompilerD3D12::NATIVE_DIMENSION_BUFFER);
+					break;
+				case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE:
+					supported = _add_expected_binding(expected_bindings, set, uniform.binding, DxcCompilerD3D12::NATIVE_RESOURCE_SRV, 1,
+							DxcCompilerD3D12::NATIVE_KIND_ACCELERATION_STRUCTURE, DxcCompilerD3D12::NATIVE_DIMENSION_ACCELERATION_STRUCTURE);
+					break;
+				case RDC::UNIFORM_TYPE_TEXTURE_BUFFER:
+				case RDC::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE_BUFFER:
+				case RDC::UNIFORM_TYPE_IMAGE_BUFFER:
+					r_error = "Native HLSL RT does not support texel-buffer descriptors in the current D3D12 container.";
+					return false;
+				default:
+					r_error = vformat("Native HLSL RT does not support reflected uniform type %d.", uint32_t(uniform.type));
+					return false;
+			}
+			if (!supported) {
+				r_error = vformat("SPIR-V has conflicting descriptor declarations at set %d, binding %d.", set, uniform.binding);
+				return false;
+			}
+		}
+	}
+
+	for (uint32_t i = 0; i < p_library.active_bindings.size(); i++) {
+		const DxcCompilerD3D12::NativeBinding &actual = p_library.active_bindings[i];
+		bool found = false;
+		for (const DxcCompilerD3D12::NativeBinding &expected : expected_bindings) {
+			if (actual.set == expected.set && actual.binding == expected.binding && actual.resource_class == expected.resource_class && actual.count == expected.count &&
+					actual.resource_kind == expected.resource_kind && actual.resource_dimension == expected.resource_dimension &&
+					actual.constant_buffer_size_bytes == expected.constant_buffer_size_bytes) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			r_error = vformat("Native HLSL export '%s' has an incompatible descriptor: set %d, binding %d, class %d, count %d, kind %d, dimension %d, CBV bytes %d.",
+					r_stage_info.export_name, actual.set, actual.binding, actual.resource_class, actual.count, actual.resource_kind, actual.resource_dimension, actual.constant_buffer_size_bytes);
+			for (const DxcCompilerD3D12::NativeBinding &expected : expected_bindings) {
+				if (expected.binding == actual.binding && expected.set == actual.set) {
+					r_error += vformat(" Expected class %d, count %d, kind %d, dimension %d, CBV bytes %d.", expected.resource_class, expected.count, expected.resource_kind, expected.resource_dimension, expected.constant_buffer_size_bytes);
+				}
+			}
+			return false;
+		}
+		for (uint32_t j = i + 1; j < p_library.active_bindings.size(); j++) {
+			const DxcCompilerD3D12::NativeBinding &other = p_library.active_bindings[j];
+			const uint64_t actual_end = uint64_t(actual.binding) + actual.count;
+			const uint64_t other_end = uint64_t(other.binding) + other.count;
+			const bool register_ranges_overlap = actual.binding < other_end && other.binding < actual_end;
+			if (actual.set == other.set && actual.resource_class == other.resource_class && register_ranges_overlap) {
+				r_error = vformat("Native HLSL export '%s' has overlapping register ranges in set %d, register class %d.", r_stage_info.export_name, actual.set, actual.resource_class);
+				return false;
+			}
+		}
+	}
+
+	r_stage_info.active_bindings = p_library.active_bindings;
+	return true;
+}
+
+bool RenderingShaderContainerD3D12::_set_native_hlsl_code_from_spirv(const ReflectShader &p_shader) {
+	ERR_FAIL_COND_V_MSG(p_shader.pipeline_type != RenderingDeviceCommons::PIPELINE_TYPE_RAYTRACING, false, "Native HLSL sidecars are only accepted for ray-tracing pipelines.");
+	ERR_FAIL_COND_V_MSG(!dxc_compiler || !dxc_compiler->is_available(), false,
+			dxc_compiler ? dxc_compiler->get_unavailable_reason() : "The D3D12 shader container has no DXC compiler instance.");
+	ERR_FAIL_COND_V_MSG(p_shader.push_constant_size != 0, false, "D3D12 native HLSL RT currently requires shader data in uniform descriptors; push constants are not supported by the canonical register ABI.");
+	ERR_FAIL_COND_V_MSG(!p_shader.specialization_constants.is_empty(), false, "D3D12 native HLSL RT does not support specialization constants yet.");
+	ERR_FAIL_COND_V_MSG(p_shader.shader_stages.is_empty(), false, "The native HLSL RT shader has no stages.");
+
+	const int32_t declared_payload_size = p_shader.shader_stages[0].native_hlsl_max_payload_size_bytes();
+	const int32_t declared_attribute_size = p_shader.shader_stages[0].native_hlsl_max_attribute_size_bytes();
+	const int32_t declared_shader_model = p_shader.shader_stages[0].native_hlsl_shader_model();
+	ERR_FAIL_COND_V_MSG(declared_payload_size < 0 || declared_attribute_size < 0 || declared_attribute_size > 32, false, "D3D12 native HLSL RT requires supported payload and hit-attribute size declarations.");
+	ERR_FAIL_COND_V_MSG(declared_shader_model != 63 && declared_shader_model != 65, false, vformat("D3D12 native HLSL RT shader model %d is unsupported; use 63 or 65.", declared_shader_model));
+	reflection_data_d3d12 = ReflectionDataD3D12();
+	reflection_data_d3d12.nir_runtime_data_root_param_idx = UINT32_MAX;
+	reflection_data_d3d12.uses_native_hlsl_rt = 1;
+	reflection_data_d3d12.max_payload_size_bytes = uint32_t(declared_payload_size);
+	reflection_data_d3d12.max_attribute_size_bytes = uint32_t(declared_attribute_size);
+	reflection_data_d3d12.native_hlsl_shader_model = uint32_t(declared_shader_model);
+	compiler_hash = dxc_compiler->get_compiler_hash();
+	ERR_FAIL_COND_V_MSG(compiler_hash.length() != 64, false, "DXC does not have a valid compiler SHA-256 identity.");
+	memcpy(reflection_data_d3d12.compiler_hash, compiler_hash.utf8().ptr(), sizeof(reflection_data_d3d12.compiler_hash));
+
+	String fingerprint_source = "DXC_NATIVE_RT\n" + compiler_hash + "\nlib_6_" + itos(declared_shader_model % 10) + "\n-HV 2021\n-Ges\n-O3\n-Zpc\n" +
+		itos(declared_payload_size) + ":" + itos(declared_attribute_size) + "\n";
+	Vector<DxcCompilerD3D12::CompiledLibrary> compiled_libraries;
+	compiled_libraries.resize(p_shader.shader_stages.size());
+	native_hlsl_stage_info.clear();
+	native_hlsl_stage_info.resize(p_shader.shader_stages.size());
+	BitField<RenderingDeviceCommons::ShaderStage> stages_processed = {};
+
+	for (int64_t i = 0; i < p_shader.shader_stages.size(); i++) {
+		const ReflectShaderStage &shader_stage = p_shader.shader_stages[i];
+		ERR_FAIL_COND_V_MSG(shader_stage.native_hlsl_source().strip_edges().is_empty() || shader_stage.native_hlsl_export().strip_edges().is_empty(), false,
+				vformat("D3D12 native RT stage '%s' requires a paired HLSL source and export.", RenderingDeviceCommons::SHADER_STAGE_NAMES[shader_stage.shader_stage]));
+		ERR_FAIL_COND_V_MSG(shader_stage.native_hlsl_max_payload_size_bytes() != declared_payload_size || shader_stage.native_hlsl_max_attribute_size_bytes() != declared_attribute_size, false,
+				"All D3D12 native HLSL RT stages must use matching payload and hit-attribute declarations.");
+		ERR_FAIL_COND_V_MSG(shader_stage.native_hlsl_shader_model() != declared_shader_model, false,
+				"All D3D12 native HLSL RT stages must use the same shader model profile.");
+
+		DxcCompilerD3D12::CompiledLibrary &compiled = compiled_libraries.write[i];
+		String error;
+		ERR_FAIL_COND_V_MSG(!dxc_compiler->compile_library(shader_stage.shader_stage, uint32_t(declared_shader_model), shader_stage.native_hlsl_source(), shader_stage.native_hlsl_export(), compiled, error), false,
+				vformat("Native HLSL compilation failed for '%s': %s", shader_stage.native_hlsl_export(), error));
+
+		NativeHlslStageInfoD3D12 &stage_info = native_hlsl_stage_info.write[i];
+		stage_info.shader_index = i;
+		stage_info.stage = shader_stage.shader_stage;
+		stage_info.shader_model = compiled.shader_model;
+		stage_info.required_feature_flags = compiled.required_feature_flags;
+		stage_info.export_name = compiled.export_name;
+		if (!_validate_native_hlsl_bindings(p_shader, stage_info, compiled, error)) {
+			const String failed_export_name = stage_info.export_name;
+			native_hlsl_stage_info.clear();
+			reflection_data_d3d12.uses_native_hlsl_rt = 0;
+			ERR_FAIL_V_MSG(false, vformat("Native HLSL binding validation failed for '%s': %s", failed_export_name, error));
+		}
+		const uint32_t stage_bit = 1U << shader_stage.shader_stage;
+		stages_processed.set_flag((RenderingDeviceCommons::ShaderStage)stage_bit);
+		uint32_t binding_start = 0;
+		for (uint32_t set = 0; set < p_shader.uniform_sets.size(); set++) {
+			for (const DxcCompilerD3D12::NativeBinding &binding : stage_info.active_bindings) {
+				if (binding.set != set) {
+					continue;
+				}
+				bool found_uniform = false;
+				for (uint32_t uniform_index = 0; uniform_index < p_shader.uniform_sets[set].size(); uniform_index++) {
+					const ReflectUniform &uniform = p_shader.uniform_sets[set][uniform_index];
+					if (uniform.binding != binding.binding) {
+						continue;
+					}
+					ReflectionBindingDataD3D12 &binding_data = reflection_binding_set_uniforms_data_d3d12.write[binding_start + uniform_index];
+					binding_data.dxil_stages |= stage_bit;
+					switch (binding.resource_class) {
+						case DxcCompilerD3D12::NATIVE_RESOURCE_CBV:
+							binding_data.resource_class = RES_CLASS_CBV;
+							break;
+						case DxcCompilerD3D12::NATIVE_RESOURCE_SRV:
+							binding_data.resource_class = RES_CLASS_SRV;
+							break;
+						case DxcCompilerD3D12::NATIVE_RESOURCE_UAV:
+							binding_data.resource_class = RES_CLASS_UAV;
+							break;
+						case DxcCompilerD3D12::NATIVE_RESOURCE_SAMPLER:
+							binding_data.has_sampler = 1;
+							break;
+						default:
+							ERR_FAIL_V_MSG(false, "DXC returned an invalid native resource class.");
+					}
+					found_uniform = true;
+					break;
+				}
+				ERR_FAIL_COND_V_MSG(!found_uniform, false, "Validated native HLSL binding was not found in the SPIR-V uniform sets.");
+			}
+			binding_start += p_shader.uniform_sets[set].size();
+		}
+
+		fingerprint_source += itos(shader_stage.shader_stage) + ":" + itos(compiled.shader_model) + "\n" +
+				shader_stage.native_hlsl_export() + "\n" + shader_stage.native_hlsl_source() + "\n";
+	}
+	compile_fingerprint = fingerprint_source.sha256_text();
+	ERR_FAIL_COND_V_MSG(compile_fingerprint.length() != 64, false, "Could not produce the native HLSL compile fingerprint.");
+	memcpy(reflection_data_d3d12.compile_fingerprint, compile_fingerprint.utf8().ptr(), sizeof(reflection_data_d3d12.compile_fingerprint));
+
+	shaders.resize(compiled_libraries.size());
+	for (int64_t i = 0; i < compiled_libraries.size(); i++) {
+		const DxcCompilerD3D12::CompiledLibrary &compiled = compiled_libraries[i];
+		RenderingShaderContainer::Shader &shader = shaders.write[i];
+		shader.shader_stage = compiled.stage;
+		shader.code_decompressed_size = compiled.dxil_library.size();
+		shader.code_compressed_bytes.resize(shader.code_decompressed_size);
+		uint32_t compressed_size = 0;
+		ERR_FAIL_COND_V_MSG(!compress_code(compiled.dxil_library.ptr(), shader.code_decompressed_size, shader.code_compressed_bytes.ptrw(), &compressed_size, &shader.code_compression_flags), false,
+				vformat("Failed to compress DXIL library for native RT stage '%s'.", compiled.export_name));
+		shader.code_compressed_bytes.resize(compressed_size);
+	}
+
+	return _generate_root_signature(stages_processed);
+}
+
 bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingDeviceCommons::ShaderStage> p_stages_processed) {
+	if (reflection_data_d3d12.uses_native_hlsl_rt) {
+		struct NativeRegisterRange {
+			uint32_t set = 0;
+			uint32_t binding = 0;
+			uint32_t count = 0;
+			uint32_t resource_class = 0;
+		};
+		Vector<NativeRegisterRange> register_ranges;
+		auto add_native_range = [&](uint32_t p_set, uint32_t p_binding, uint32_t p_count, uint32_t p_resource_class) {
+			if (p_count == 0 || p_binding > UINT32_MAX - (p_count - 1)) {
+				return false;
+			}
+			const uint64_t candidate_end = uint64_t(p_binding) + p_count;
+			for (const NativeRegisterRange &existing : register_ranges) {
+				const uint64_t existing_end = uint64_t(existing.binding) + existing.count;
+				if (existing.set == p_set && existing.resource_class == p_resource_class && p_binding < existing_end && existing.binding < candidate_end) {
+					return false;
+				}
+			}
+			NativeRegisterRange range;
+			range.set = p_set;
+			range.binding = p_binding;
+			range.count = p_count;
+			range.resource_class = p_resource_class;
+			register_ranges.push_back(range);
+			return true;
+		};
+
+		uint32_t native_binding_start = 0;
+		for (uint32_t set = 0; set < reflection_binding_set_uniforms_count.size(); set++) {
+			for (uint32_t i = 0; i < reflection_binding_set_uniforms_count[set]; i++) {
+				const ReflectionBindingData &uniform = reflection_binding_set_uniforms_data[native_binding_start + i];
+				const uint32_t descriptor_count = MAX(1u, uniform.length);
+				bool valid_ranges = true;
+				switch (uniform.type) {
+					case RDC::UNIFORM_TYPE_SAMPLER:
+						valid_ranges = add_native_range(set, uniform.binding, descriptor_count, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+						break;
+					case RDC::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE:
+						valid_ranges = add_native_range(set, uniform.binding, descriptor_count, D3D12_DESCRIPTOR_RANGE_TYPE_SRV) &&
+								add_native_range(set, uniform.binding, descriptor_count, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+						break;
+					case RDC::UNIFORM_TYPE_TEXTURE:
+					case RDC::UNIFORM_TYPE_INPUT_ATTACHMENT:
+						valid_ranges = add_native_range(set, uniform.binding, descriptor_count, D3D12_DESCRIPTOR_RANGE_TYPE_SRV);
+						break;
+					case RDC::UNIFORM_TYPE_IMAGE:
+						valid_ranges = add_native_range(set, uniform.binding, descriptor_count, D3D12_DESCRIPTOR_RANGE_TYPE_UAV);
+						break;
+					case RDC::UNIFORM_TYPE_UNIFORM_BUFFER:
+					case RDC::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
+						valid_ranges = add_native_range(set, uniform.binding, 1, D3D12_DESCRIPTOR_RANGE_TYPE_CBV);
+						break;
+					case RDC::UNIFORM_TYPE_STORAGE_BUFFER:
+					case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC:
+						valid_ranges = add_native_range(set, uniform.binding, 1, uniform.writable ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV);
+						break;
+					case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE:
+						valid_ranges = add_native_range(set, uniform.binding, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV);
+						break;
+					default:
+						ERR_FAIL_V_MSG(false, "Native HLSL RT cannot generate a register ABI for this uniform type.");
+				}
+				ERR_FAIL_COND_V_MSG(!valid_ranges, false,
+						vformat("Native D3D12 register ranges overlap or overflow at set %d, binding %d.", set, uniform.binding));
+			}
+			native_binding_start += reflection_binding_set_uniforms_count[set];
+		}
+	}
+
 	// Root (push) constants.
 	LocalVector<D3D12_ROOT_PARAMETER1> root_params;
 	if (reflection_data_d3d12.dxil_push_constant_stages) {
@@ -580,6 +1095,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 			auto insert_range = [i](D3D12_DESCRIPTOR_RANGE_TYPE p_range_type,
 										uint32_t p_num_descriptors,
 										uint32_t p_dxil_register,
+											uint32_t p_dxil_space,
 										uint32_t p_dxil_stages_mask,
 										uint32_t &r_descriptor_offset,
 										uint32_t &r_descriptor_count,
@@ -609,7 +1125,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 					flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
 				}
 
-				range.Init(p_range_type, p_num_descriptors, p_dxil_register, 0, flags, r_descriptor_offset);
+				range.Init(p_range_type, p_num_descriptors, p_dxil_register, p_dxil_space, flags, r_descriptor_offset);
 				r_descriptor_count += p_num_descriptors;
 				table.ranges.push_back(range);
 			};
@@ -657,6 +1173,9 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 				case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
 					range_type = uniform.writable ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 				} break;
+				case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+					range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+				} break;
 				case RDC::UNIFORM_TYPE_INPUT_ATTACHMENT: {
 					range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 				} break;
@@ -665,7 +1184,8 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 				}
 			}
 
-			uint32_t dxil_register = i * GODOT_NIR_DESCRIPTOR_SET_MULTIPLIER + uniform.binding * GODOT_NIR_BINDING_MULTIPLIER;
+			uint32_t dxil_register = reflection_data_d3d12.uses_native_hlsl_rt ? uniform.binding : i * GODOT_NIR_DESCRIPTOR_SET_MULTIPLIER + uniform.binding * GODOT_NIR_BINDING_MULTIPLIER;
+			uint32_t dxil_space = reflection_data_d3d12.uses_native_hlsl_rt ? i : 0;
 			if (range_type != (D3D12_DESCRIPTOR_RANGE_TYPE)UINT_MAX) {
 				// Dynamic buffers are converted to root descriptors to prevent copying descriptors during command recording.
 				// Out of bounds accesses are not a concern because that's already undefined behavior on Vulkan.
@@ -675,13 +1195,13 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 
 					switch (range_type) {
 						case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: {
-							root_param.InitAsConstantBufferView(dxil_register, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE, visibility);
+							root_param.InitAsConstantBufferView(dxil_register, dxil_space, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE, visibility);
 						} break;
 						case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: {
-							root_param.InitAsShaderResourceView(dxil_register, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, visibility);
+							root_param.InitAsShaderResourceView(dxil_register, dxil_space, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, visibility);
 						} break;
 						case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: {
-							root_param.InitAsUnorderedAccessView(dxil_register, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, visibility);
+							root_param.InitAsUnorderedAccessView(dxil_register, dxil_space, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, visibility);
 						} break;
 						default: {
 							DEV_ASSERT(false && "Unrecognized range type.");
@@ -695,6 +1215,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 							range_type,
 							num_descriptors,
 							dxil_register,
+							dxil_space,
 							uniform.stages,
 							uniform_d3d12.resource_descriptor_offset,
 							reflection_binding_set_data_d3d12.ptrw()[i].resource_descriptor_count,
@@ -708,6 +1229,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 						D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
 						num_descriptors,
 						dxil_register,
+					dxil_space,
 						uniform.stages,
 						uniform_d3d12.sampler_descriptor_offset,
 						reflection_binding_set_data_d3d12.ptrw()[i].sampler_descriptor_count,
@@ -901,6 +1423,13 @@ void RenderingShaderContainerD3D12::_set_from_shader_reflection_post(const Refle
 }
 
 bool RenderingShaderContainerD3D12::_set_code_from_spirv(const ReflectShader &p_shader) {
+	if (p_shader.pipeline_type == RenderingDeviceCommons::PIPELINE_TYPE_RAYTRACING) {
+		return _set_native_hlsl_code_from_spirv(p_shader);
+	}
+	for (const ReflectShaderStage &stage : p_shader.shader_stages) {
+		ERR_FAIL_COND_V_MSG(!stage.native_hlsl_source().strip_edges().is_empty() || !stage.native_hlsl_export().strip_edges().is_empty(), false,
+				"Native HLSL sidecars are not accepted for non-ray-tracing D3D12 pipelines.");
+	}
 #if NIR_ENABLED
 	const LocalVector<ReflectShaderStage> &p_spirv = p_shader.shader_stages;
 	reflection_data_d3d12.nir_runtime_data_root_param_idx = UINT32_MAX;
@@ -962,8 +1491,9 @@ RenderingShaderContainerD3D12::RenderingShaderContainerD3D12() {
 	// Default empty constructor.
 }
 
-RenderingShaderContainerD3D12::RenderingShaderContainerD3D12(void *p_lib_d3d12) {
+RenderingShaderContainerD3D12::RenderingShaderContainerD3D12(void *p_lib_d3d12, const DxcCompilerD3D12 *p_dxc_compiler) {
 	lib_d3d12 = p_lib_d3d12;
+	dxc_compiler = p_dxc_compiler;
 }
 
 RenderingShaderContainerD3D12::ShaderReflectionD3D12 RenderingShaderContainerD3D12::get_shader_reflection_d3d12() const {
@@ -971,6 +1501,12 @@ RenderingShaderContainerD3D12::ShaderReflectionD3D12 RenderingShaderContainerD3D
 	reflection.spirv_specialization_constants_ids_mask = reflection_data_d3d12.spirv_specialization_constants_ids_mask;
 	reflection.dxil_push_constant_stages = reflection_data_d3d12.dxil_push_constant_stages;
 	reflection.nir_runtime_data_root_param_idx = reflection_data_d3d12.nir_runtime_data_root_param_idx;
+	reflection.uses_native_hlsl_rt = reflection_data_d3d12.uses_native_hlsl_rt != 0;
+	reflection.max_payload_size_bytes = reflection_data_d3d12.max_payload_size_bytes;
+	reflection.max_attribute_size_bytes = reflection_data_d3d12.max_attribute_size_bytes;
+	reflection.native_hlsl_shader_model = reflection_data_d3d12.native_hlsl_shader_model;
+	reflection.compiler_hash = compiler_hash;
+	reflection.compile_fingerprint = compile_fingerprint;
 	reflection.reflection_binding_sets_d3d12 = reflection_binding_set_data_d3d12;
 	reflection.reflection_specialization_data_d3d12 = reflection_specialization_data_d3d12;
 	reflection.root_signature_bytes = root_signature_bytes;
@@ -988,6 +1524,25 @@ RenderingShaderContainerD3D12::ShaderReflectionD3D12 RenderingShaderContainerD3D
 		}
 	}
 
+	if (reflection.uses_native_hlsl_rt) {
+		reflection.native_hlsl_stages.resize(native_hlsl_stage_info.size());
+		for (int64_t i = 0; i < native_hlsl_stage_info.size(); i++) {
+			const NativeHlslStageInfoD3D12 &stage_info = native_hlsl_stage_info[i];
+			ERR_FAIL_COND_V_MSG(stage_info.shader_index >= shaders.size(), reflection, "Native HLSL reflection references an invalid shader index.");
+			const RenderingShaderContainer::Shader &shader = shaders[stage_info.shader_index];
+			ShaderReflectionD3D12::NativeHlslStage &native_stage = reflection.native_hlsl_stages.write[i];
+			native_stage.stage = stage_info.stage;
+			native_stage.shader_model = stage_info.shader_model;
+			native_stage.required_feature_flags = stage_info.required_feature_flags;
+			native_stage.export_name = stage_info.export_name;
+			native_stage.active_bindings = stage_info.active_bindings;
+			native_stage.dxil_library.resize(shader.code_decompressed_size);
+			ERR_FAIL_COND_V_MSG(!decompress_code(shader.code_compressed_bytes.ptr(), shader.code_compressed_bytes.size(), shader.code_compression_flags,
+					native_stage.dxil_library.ptrw(), native_stage.dxil_library.size()), reflection,
+				vformat("Failed to decompress native HLSL library for export '%s'.", stage_info.export_name));
+		}
+	}
+
 	return reflection;
 }
 
@@ -998,7 +1553,15 @@ void RenderingShaderContainerFormatD3D12::set_lib_d3d12(void *p_lib_d3d12) {
 }
 
 Ref<RenderingShaderContainer> RenderingShaderContainerFormatD3D12::create_container() const {
-	return memnew(RenderingShaderContainerD3D12(lib_d3d12));
+	return memnew(RenderingShaderContainerD3D12(lib_d3d12, &dxc_compiler));
+}
+
+bool RenderingShaderContainerFormatD3D12::supports_native_raytracing() const {
+	return dxc_compiler.is_available();
+}
+
+String RenderingShaderContainerFormatD3D12::get_native_raytracing_unavailable_reason() const {
+	return dxc_compiler.get_unavailable_reason();
 }
 
 RenderingDeviceCommons::ShaderLanguageVersion RenderingShaderContainerFormatD3D12::get_shader_language_version() const {

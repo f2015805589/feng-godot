@@ -512,3 +512,31 @@ static func targets_for(world: World3D) -> Array[RID]:
 			_targets_cache[world_id] = {"generation": generation, "targets": targets}
 		return targets
 	return []
+
+## Main-thread reverse lookup used by a pass that starts with its render target.
+## Object references returned here are not suitable for render-thread snapshots.
+static func world_for_target(target: RID) -> Dictionary:
+	if not target.is_valid():
+		return {}
+	prune()
+	var match_world: World3D
+	var match_viewport: Viewport
+	for viewport_id_variant in _viewports.keys():
+		var viewport_id := int(viewport_id_variant)
+		var viewport := _registered_viewport(viewport_id)
+		if viewport == null or not viewport.is_inside_tree():
+			continue
+		if RenderingServer.viewport_get_render_target(viewport.get_viewport_rid()) != target:
+			continue
+		var world := viewport.find_world_3d()
+		if world == null or _world_id(viewport) != world.get_instance_id():
+			continue
+		if match_world != null and match_world != world:
+			return {"valid": false, "reason": "render_target_has_multiple_worlds"}
+		match_world = world
+		match_viewport = viewport
+	if match_world == null:
+		return {}
+	return {"valid": true, "world": match_world, "viewport": match_viewport,
+		"world_id": match_world.get_instance_id(),
+		"generation": generation_for_world(match_world)}

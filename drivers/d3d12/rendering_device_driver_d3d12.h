@@ -113,6 +113,10 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	RenderingContextDriver::Device context_device;
 	Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
 	Microsoft::WRL::ComPtr<ID3D12Device> device;
+	Microsoft::WRL::ComPtr<ID3D12Device5> raytracing_device;
+	bool raytracing_device_supported = false;
+	bool raytracing_command_list_supported = false;
+	uint32_t raytracing_tier = 0;
 	DeviceLimits device_limits;
 	RDD::Capabilities device_capabilities;
 	uint32_t feature_level = 0; // Major * 10 + minor.
@@ -239,6 +243,7 @@ private:
 	};
 
 	struct CommandBufferInfo;
+	struct RaytracingPipelineInfo;
 
 	void _resource_transition_batch(CommandBufferInfo *p_command_buffer, ResourceInfo *p_resource, uint32_t p_subresource, uint32_t p_num_planes, D3D12_RESOURCE_STATES p_new_state);
 	void _resource_transitions_flush(CommandBufferInfo *p_command_buffer);
@@ -251,6 +256,7 @@ private:
 		D3D12_GPU_VIRTUAL_ADDRESS gpu_virtual_address = {};
 		DataFormat texel_format = DATA_FORMAT_MAX;
 		uint64_t size = 0;
+		bool raytracing_scratch_used = false;
 		struct {
 			bool is_dynamic : 1; // Only used for tracking (e.g. Vulkan needs these checks).
 		} flags = {};
@@ -266,6 +272,7 @@ private:
 		uint64_t last_frame_mapped = 0;
 #endif
 	};
+
 
 public:
 	virtual BufferID buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) override final;
@@ -485,11 +492,13 @@ private:
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> cmd_allocator;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> cmd_list_1;
+		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd_list_4;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList5> cmd_list_5;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> cmd_list_7;
 
 		ID3D12PipelineState *graphics_pso = nullptr;
 		ID3D12PipelineState *compute_pso = nullptr;
+		const RaytracingPipelineInfo *raytracing_pipeline = nullptr;
 
 		uint32_t nir_graphics_runtime_data_root_param_idx = UINT32_MAX;
 		uint32_t nir_compute_runtime_data_root_param_idx = UINT32_MAX;
@@ -608,6 +617,7 @@ private:
 
 		struct UniformBindingInfo {
 			uint32_t stages = 0; // Actual shader stages using the uniform (0 if totally optimized out).
+			uint32_t binding = UINT32_MAX;
 			ResourceClass res_class = RES_CLASS_INVALID;
 			UniformType type = UNIFORM_TYPE_MAX;
 			uint32_t length = UINT32_MAX;
@@ -635,6 +645,13 @@ private:
 
 		TightLocalVector<SpecializationConstant> specialization_constants;
 		uint32_t spirv_specialization_constants_ids_mask = 0;
+		bool uses_native_hlsl_rt = false;
+		uint32_t native_hlsl_shader_model = 0;
+		uint32_t max_payload_size_bytes = 0;
+		uint32_t max_attribute_size_bytes = 0;
+		String native_hlsl_compiler_hash;
+		String native_hlsl_compile_fingerprint;
+		Vector<RenderingShaderContainerD3D12::ShaderReflectionD3D12::NativeHlslStage> native_hlsl_stages;
 
 		HashMap<ShaderStage, Vector<uint8_t>> stages_bytecode;
 
@@ -680,6 +697,34 @@ private:
 
 		TightLocalVector<StateRequirement> resource_states;
 	};
+
+	struct AccelerationStructureInfo {
+		AccelerationStructureType type = ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+		BitField<AccelerationStructureFlagBits> flags = {};
+		Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+		Microsoft::WRL::ComPtr<D3D12MA::Allocation> allocation;
+		uint64_t result_size = 0;
+		uint64_t scratch_size = 0;
+		uint64_t update_scratch_size = 0;
+		uint32_t max_instance_count = 0;
+		bool built = false;
+		LocalVector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;
+		LocalVector<BufferInfo *> build_input_buffers;
+	};
+
+	struct RaytracingPipelineInfo {
+		Microsoft::WRL::ComPtr<ID3D12StateObject> state_object;
+		Microsoft::WRL::ComPtr<ID3D12StateObjectProperties> state_object_properties;
+		const ShaderInfo *layout_shader = nullptr;
+		uint32_t max_recursion_depth = 0;
+		uint32_t raygen_group_count = 0;
+		uint32_t miss_group_count = 0;
+		uint32_t hit_group_count = 0;
+		Vector<String> group_exports;
+	};
+
+	bool _command_prepare_raytracing_scratch(CommandBufferInfo *p_command_buffer, BufferInfo *p_scratch);
+	bool _command_barrier_built_acceleration_structure(CommandBufferInfo *p_command_buffer, AccelerationStructureInfo *p_acceleration_structure);
 
 public:
 	virtual UniformSetID uniform_set_create(VectorView<BoundUniform> p_uniforms, ShaderID p_shader, uint32_t p_set_index, int p_linear_pool_index) override final;
@@ -953,6 +998,8 @@ private:
 			FramebufferInfo,
 			ShaderInfo,
 			UniformSetInfo,
+			AccelerationStructureInfo,
+			RaytracingPipelineInfo,
 			RenderPassInfo,
 			TimestampQueryPoolInfo>;
 	PagedAllocator<VersatileResource, true> resources_allocator;

@@ -243,6 +243,11 @@ protected:
 class RDShaderSource : public RefCounted {
 	GDCLASS(RDShaderSource, RefCounted)
 	String source[RD::SHADER_STAGE_MAX];
+	String native_hlsl_source[RD::SHADER_STAGE_MAX];
+	String native_hlsl_export[RD::SHADER_STAGE_MAX];
+	int32_t native_hlsl_shader_model = 63;
+	int32_t native_hlsl_max_payload_size_bytes = -1;
+	int32_t native_hlsl_max_attribute_size_bytes = -1;
 	RD::ShaderLanguage language = RD::SHADER_LANGUAGE_GLSL;
 
 public:
@@ -254,6 +259,50 @@ public:
 	String get_stage_source(RD::ShaderStage p_stage) const {
 		ERR_FAIL_INDEX_V(p_stage, RD::SHADER_STAGE_MAX, String());
 		return source[p_stage];
+	}
+
+	void set_native_hlsl_stage_source(RD::ShaderStage p_stage, const String &p_source) {
+		ERR_FAIL_INDEX(p_stage, RD::SHADER_STAGE_MAX);
+		native_hlsl_source[p_stage] = p_source;
+	}
+
+	String get_native_hlsl_stage_source(RD::ShaderStage p_stage) const {
+		ERR_FAIL_INDEX_V(p_stage, RD::SHADER_STAGE_MAX, String());
+		return native_hlsl_source[p_stage];
+	}
+
+	void set_native_hlsl_stage_export(RD::ShaderStage p_stage, const String &p_export) {
+		ERR_FAIL_INDEX(p_stage, RD::SHADER_STAGE_MAX);
+		native_hlsl_export[p_stage] = p_export;
+	}
+
+	String get_native_hlsl_stage_export(RD::ShaderStage p_stage) const {
+		ERR_FAIL_INDEX_V(p_stage, RD::SHADER_STAGE_MAX, String());
+		return native_hlsl_export[p_stage];
+	}
+
+	void set_native_hlsl_shader_model(int32_t p_shader_model) {
+		native_hlsl_shader_model = p_shader_model;
+	}
+
+	int32_t get_native_hlsl_shader_model() const {
+		return native_hlsl_shader_model;
+	}
+
+	void set_native_hlsl_max_payload_size_bytes(int32_t p_size) {
+		native_hlsl_max_payload_size_bytes = p_size;
+	}
+
+	int32_t get_native_hlsl_max_payload_size_bytes() const {
+		return native_hlsl_max_payload_size_bytes;
+	}
+
+	void set_native_hlsl_max_attribute_size_bytes(int32_t p_size) {
+		native_hlsl_max_attribute_size_bytes = p_size;
+	}
+
+	int32_t get_native_hlsl_max_attribute_size_bytes() const {
+		return native_hlsl_max_attribute_size_bytes;
 	}
 
 	void set_language(RD::ShaderLanguage p_language) {
@@ -268,6 +317,16 @@ protected:
 	static void _bind_methods() {
 		ClassDB::bind_method(D_METHOD("set_stage_source", "stage", "source"), &RDShaderSource::set_stage_source);
 		ClassDB::bind_method(D_METHOD("get_stage_source", "stage"), &RDShaderSource::get_stage_source);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_stage_source", "stage", "source"), &RDShaderSource::set_native_hlsl_stage_source);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_stage_source", "stage"), &RDShaderSource::get_native_hlsl_stage_source);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_stage_export", "stage", "export_name"), &RDShaderSource::set_native_hlsl_stage_export);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_stage_export", "stage"), &RDShaderSource::get_native_hlsl_stage_export);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_shader_model", "shader_model"), &RDShaderSource::set_native_hlsl_shader_model);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_shader_model"), &RDShaderSource::get_native_hlsl_shader_model);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_max_payload_size_bytes", "size_bytes"), &RDShaderSource::set_native_hlsl_max_payload_size_bytes);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_max_payload_size_bytes"), &RDShaderSource::get_native_hlsl_max_payload_size_bytes);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_max_attribute_size_bytes", "size_bytes"), &RDShaderSource::set_native_hlsl_max_attribute_size_bytes);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_max_attribute_size_bytes"), &RDShaderSource::get_native_hlsl_max_attribute_size_bytes);
 
 		ClassDB::bind_method(D_METHOD("set_language", "language"), &RDShaderSource::set_language);
 		ClassDB::bind_method(D_METHOD("get_language"), &RDShaderSource::get_language);
@@ -283,6 +342,20 @@ protected:
 		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "source_closest_hit"), "set_stage_source", "get_stage_source", RD::SHADER_STAGE_CLOSEST_HIT);
 		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "source_miss"), "set_stage_source", "get_stage_source", RD::SHADER_STAGE_MISS);
 		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "source_intersection"), "set_stage_source", "get_stage_source", RD::SHADER_STAGE_INTERSECTION);
+		ADD_GROUP("Native HLSL Sidecar", "native_hlsl_");
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_raygen"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_RAYGEN);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_any_hit"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_ANY_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_closest_hit"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_CLOSEST_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_miss"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_MISS);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_intersection"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_INTERSECTION);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_raygen"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_RAYGEN);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_any_hit"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_ANY_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_closest_hit"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_CLOSEST_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_miss"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_MISS);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_intersection"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_INTERSECTION);
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_shader_model", PROPERTY_HINT_RANGE, "63,65,2"), "set_native_hlsl_shader_model", "get_native_hlsl_shader_model");
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_max_payload_size_bytes", PROPERTY_HINT_RANGE, "-1,2147483647,1"), "set_native_hlsl_max_payload_size_bytes", "get_native_hlsl_max_payload_size_bytes");
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_max_attribute_size_bytes", PROPERTY_HINT_RANGE, "-1,32,1"), "set_native_hlsl_max_attribute_size_bytes", "get_native_hlsl_max_attribute_size_bytes");
 		ADD_GROUP("Syntax", "source_");
 		ADD_PROPERTY(PropertyInfo(Variant::INT, "language", PROPERTY_HINT_RANGE, "GLSL,HLSL"), "set_language", "get_language");
 	}
@@ -292,6 +365,11 @@ class RDShaderSPIRV : public Resource {
 	GDCLASS(RDShaderSPIRV, Resource)
 
 	Vector<uint8_t> bytecode[RD::SHADER_STAGE_MAX];
+	String native_hlsl_source[RD::SHADER_STAGE_MAX];
+	String native_hlsl_export[RD::SHADER_STAGE_MAX];
+	int32_t native_hlsl_shader_model = 63;
+	int32_t native_hlsl_max_payload_size_bytes = -1;
+	int32_t native_hlsl_max_attribute_size_bytes = -1;
 	String compile_error[RD::SHADER_STAGE_MAX];
 
 public:
@@ -305,6 +383,50 @@ public:
 		return bytecode[p_stage];
 	}
 
+	void set_native_hlsl_stage_source(RD::ShaderStage p_stage, const String &p_source) {
+		ERR_FAIL_INDEX(p_stage, RD::SHADER_STAGE_MAX);
+		native_hlsl_source[p_stage] = p_source;
+	}
+
+	String get_native_hlsl_stage_source(RD::ShaderStage p_stage) const {
+		ERR_FAIL_INDEX_V(p_stage, RD::SHADER_STAGE_MAX, String());
+		return native_hlsl_source[p_stage];
+	}
+
+	void set_native_hlsl_stage_export(RD::ShaderStage p_stage, const String &p_export) {
+		ERR_FAIL_INDEX(p_stage, RD::SHADER_STAGE_MAX);
+		native_hlsl_export[p_stage] = p_export;
+	}
+
+	String get_native_hlsl_stage_export(RD::ShaderStage p_stage) const {
+		ERR_FAIL_INDEX_V(p_stage, RD::SHADER_STAGE_MAX, String());
+		return native_hlsl_export[p_stage];
+	}
+
+	void set_native_hlsl_shader_model(int32_t p_shader_model) {
+		native_hlsl_shader_model = p_shader_model;
+	}
+
+	int32_t get_native_hlsl_shader_model() const {
+		return native_hlsl_shader_model;
+	}
+
+	void set_native_hlsl_max_payload_size_bytes(int32_t p_size) {
+		native_hlsl_max_payload_size_bytes = p_size;
+	}
+
+	int32_t get_native_hlsl_max_payload_size_bytes() const {
+		return native_hlsl_max_payload_size_bytes;
+	}
+
+	void set_native_hlsl_max_attribute_size_bytes(int32_t p_size) {
+		native_hlsl_max_attribute_size_bytes = p_size;
+	}
+
+	int32_t get_native_hlsl_max_attribute_size_bytes() const {
+		return native_hlsl_max_attribute_size_bytes;
+	}
+
 	Vector<RD::ShaderStageSPIRVData> get_stages() const {
 		Vector<RD::ShaderStageSPIRVData> stages;
 		for (int i = 0; i < RD::SHADER_STAGE_MAX; i++) {
@@ -312,6 +434,13 @@ public:
 				RD::ShaderStageSPIRVData stage;
 				stage.shader_stage = RD::ShaderStage(i);
 				stage.spirv = bytecode[i];
+				stage.native_hlsl_source = native_hlsl_source[i];
+				stage.native_hlsl_export = native_hlsl_export[i];
+				if (!native_hlsl_source[i].is_empty()) {
+					stage.native_hlsl_shader_model = native_hlsl_shader_model;
+					stage.native_hlsl_max_payload_size_bytes = native_hlsl_max_payload_size_bytes;
+					stage.native_hlsl_max_attribute_size_bytes = native_hlsl_max_attribute_size_bytes;
+				}
 				stages.push_back(stage);
 			}
 		}
@@ -332,6 +461,16 @@ protected:
 	static void _bind_methods() {
 		ClassDB::bind_method(D_METHOD("set_stage_bytecode", "stage", "bytecode"), &RDShaderSPIRV::set_stage_bytecode);
 		ClassDB::bind_method(D_METHOD("get_stage_bytecode", "stage"), &RDShaderSPIRV::get_stage_bytecode);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_stage_source", "stage", "source"), &RDShaderSPIRV::set_native_hlsl_stage_source);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_stage_source", "stage"), &RDShaderSPIRV::get_native_hlsl_stage_source);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_stage_export", "stage", "export_name"), &RDShaderSPIRV::set_native_hlsl_stage_export);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_stage_export", "stage"), &RDShaderSPIRV::get_native_hlsl_stage_export);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_shader_model", "shader_model"), &RDShaderSPIRV::set_native_hlsl_shader_model);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_shader_model"), &RDShaderSPIRV::get_native_hlsl_shader_model);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_max_payload_size_bytes", "size_bytes"), &RDShaderSPIRV::set_native_hlsl_max_payload_size_bytes);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_max_payload_size_bytes"), &RDShaderSPIRV::get_native_hlsl_max_payload_size_bytes);
+		ClassDB::bind_method(D_METHOD("set_native_hlsl_max_attribute_size_bytes", "size_bytes"), &RDShaderSPIRV::set_native_hlsl_max_attribute_size_bytes);
+		ClassDB::bind_method(D_METHOD("get_native_hlsl_max_attribute_size_bytes"), &RDShaderSPIRV::get_native_hlsl_max_attribute_size_bytes);
 
 		ClassDB::bind_method(D_METHOD("set_stage_compile_error", "stage", "compile_error"), &RDShaderSPIRV::set_stage_compile_error);
 		ClassDB::bind_method(D_METHOD("get_stage_compile_error", "stage"), &RDShaderSPIRV::get_stage_compile_error);
@@ -347,6 +486,20 @@ protected:
 		ADD_PROPERTYI(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "bytecode_closest_hit"), "set_stage_bytecode", "get_stage_bytecode", RD::SHADER_STAGE_CLOSEST_HIT);
 		ADD_PROPERTYI(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "bytecode_miss"), "set_stage_bytecode", "get_stage_bytecode", RD::SHADER_STAGE_MISS);
 		ADD_PROPERTYI(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "bytecode_intersection"), "set_stage_bytecode", "get_stage_bytecode", RD::SHADER_STAGE_INTERSECTION);
+		ADD_GROUP("Native HLSL Sidecar", "native_hlsl_");
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_raygen"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_RAYGEN);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_any_hit"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_ANY_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_closest_hit"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_CLOSEST_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_miss"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_MISS);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_source_intersection"), "set_native_hlsl_stage_source", "get_native_hlsl_stage_source", RD::SHADER_STAGE_INTERSECTION);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_raygen"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_RAYGEN);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_any_hit"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_ANY_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_closest_hit"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_CLOSEST_HIT);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_miss"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_MISS);
+		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "native_hlsl_export_intersection"), "set_native_hlsl_stage_export", "get_native_hlsl_stage_export", RD::SHADER_STAGE_INTERSECTION);
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_shader_model", PROPERTY_HINT_RANGE, "63,65,2"), "set_native_hlsl_shader_model", "get_native_hlsl_shader_model");
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_max_payload_size_bytes", PROPERTY_HINT_RANGE, "-1,2147483647,1"), "set_native_hlsl_max_payload_size_bytes", "get_native_hlsl_max_payload_size_bytes");
+		ADD_PROPERTY(PropertyInfo(Variant::INT, "native_hlsl_max_attribute_size_bytes", PROPERTY_HINT_RANGE, "-1,32,1"), "set_native_hlsl_max_attribute_size_bytes", "get_native_hlsl_max_attribute_size_bytes");
 		ADD_GROUP("Compile Error", "compile_error_");
 		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "compile_error_vertex"), "set_stage_compile_error", "get_stage_compile_error", RD::SHADER_STAGE_VERTEX);
 		ADD_PROPERTYI(PropertyInfo(Variant::STRING, "compile_error_fragment"), "set_stage_compile_error", "get_stage_compile_error", RD::SHADER_STAGE_FRAGMENT);

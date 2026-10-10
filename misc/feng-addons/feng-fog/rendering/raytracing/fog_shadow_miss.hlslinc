@@ -1,0 +1,10 @@
+#define FENG_FOG_RAY_ABI __FENG_FOG_RAY_ABI__
+
+struct FogShadowPayload {
+	uint visibility;
+};
+
+[shader("miss")]
+void FengFogMiss(inout FogShadowPayload payload) {
+	payload.visibility = 1u;
+}

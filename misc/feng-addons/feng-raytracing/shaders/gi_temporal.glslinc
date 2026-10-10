@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D raw_gi;
+layout(set=0,binding=1) uniform sampler2D previous_gi;
+layout(set=0,binding=2) uniform sampler2D previous_moments;
+layout(set=0,binding=3) uniform sampler2D current_depth;
+layout(set=0,binding=4) uniform sampler2D current_normal;
+layout(set=0,binding=5) uniform sampler2D previous_depth;
+layout(set=0,binding=6) uniform sampler2D previous_normal;
+layout(set=0,binding=7,rgba16f) uniform writeonly image2D next_gi;
+layout(set=0,binding=8,rg16f) uniform writeonly image2D next_moments;
+layout(set=0,binding=9,r32f) uniform writeonly image2D next_depth;
+layout(set=0,binding=10,rgba16f) uniform writeonly image2D next_normal;
+layout(set=0,binding=11,std140) uniform Frame {
+ mat4 inverse_view_projection;
+ mat4 previous_view_projection;
+ vec4 size_weight_exposure;
+ vec4 rejection;
+ uvec4 identity;
+ mat4 view_to_world;
+} frame;
+void main() {
+ ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(next_gi);
+ if(any(greaterThanEqual(p,size))) return;
+ vec2 uv=(vec2(p)+0.5)/vec2(size);
+ float depth=textureLod(current_depth,uv,0).r;
+ vec3 n=normalize(mat3(frame.view_to_world)*(textureLod(current_normal,uv,0).xyz*2.0-1.0));
+ vec4 value=texelFetch(raw_gi,p,0);
+ float weight=0.0;
+ vec4 world=frame.inverse_view_projection*vec4(uv*2.0-1.0,depth,1.0);
+ vec4 previous=frame.previous_view_projection*vec4(world.xyz/max(abs(world.w),1e-8)*sign(world.w),1.0);
+ vec3 ndc=previous.xyz/max(previous.w,1e-8);
+ vec2 old_uv=ndc.xy*0.5+0.5;
+ if(frame.rejection.w>0.5 && value.a>0.0 && previous.w>0.0 && all(greaterThan(old_uv,vec2(0))) && all(lessThan(old_uv,vec2(1)))) {
+  float old_depth=textureLod(previous_depth,old_uv,0).r;
+  vec3 old_normal=textureLod(previous_normal,old_uv,0).xyz;
+  if(abs(old_depth-ndc.z)<max(frame.rejection.z,abs(ndc.z)*frame.rejection.y) && dot(n,old_normal)>frame.rejection.x) weight=frame.size_weight_exposure.z;
+ }
+ vec3 old=textureLod(previous_gi,old_uv,0).rgb*frame.size_weight_exposure.w;
+ // Accumulate accepted geometry history; a black stochastic sample is not a disocclusion.
+ vec3 spatial=vec3(0); float total=0;
+ for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+  ivec2 tap=clamp(p+ivec2(x,y),ivec2(0),size-1);
+  vec2 tap_uv=(vec2(tap)+0.5)/vec2(size);
+  float tap_depth=textureLod(current_depth,tap_uv,0).r;
+  vec3 tap_normal=normalize(mat3(frame.view_to_world)*(textureLod(current_normal,tap_uv,0).xyz*2.0-1.0));
+  float w=exp(-abs(tap_depth-depth)/max(depth*0.01,1e-5))*pow(max(dot(n,tap_normal),0.0),16.0);
+  spatial+=texelFetch(raw_gi,tap,0).rgb*w; total+=w;
+ }
+ value.rgb=spatial/max(total,1e-8);
+ vec3 result=mix(value.rgb,old,weight);
+ if(any(isnan(result))||any(isinf(result))) result=value.rgb;
+ imageStore(next_gi,p,vec4(clamp(result,vec3(0),vec3(65504)),value.a));
+ float lum=dot(result,vec3(0.2126,0.7152,0.0722));
+ imageStore(next_moments,p,vec4(min(lum,255.0),min(lum*lum,65504.0),0,0));
+ imageStore(next_depth,p,vec4(depth));
+ imageStore(next_normal,p,vec4(n,1));
+}

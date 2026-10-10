@@ -16,6 +16,7 @@ const LibraryManager = preload("pipeline/library_manager.gd")
 const NativeSpec = preload("pipeline/native_spec.gd")
 const ParameterResolver = preload("pipeline/parameter_resolver.gd")
 const ExecutionPlan = preload("pipeline/execution_plan.gd")
+const IndirectGISelection = preload("pipeline/indirect_gi_selection.gd")
 const CompositorBinding = preload("pipeline/compositor_binding.gd")
 const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 
@@ -474,6 +475,7 @@ func apply(compositor: Compositor) -> void:
 	var provided := PackedInt32Array()
 	var parameters: Dictionary = {}
 	var context: Dictionary = {}
+	var indirect_owner: Dictionary = {"kind": &"", "key": ""}
 	if candidate_warnings.is_empty():
 		schedule = _build_schedule()
 		for native_id in _provided_native_ids():
@@ -484,6 +486,8 @@ func apply(compositor: Compositor) -> void:
 		_volume_context_cache = {}
 		context = _initialized_volume_context()
 		parameters = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, context))
+		indirect_owner = IndirectGISelection.resolve(_passes, _is_entry_enabled)
+		parameters = IndirectGISelection.inject(parameters, _passes, indirect_owner)
 	var result := CompositorBinding.apply(
 		compositor,
 		_manager,
@@ -507,6 +511,7 @@ func apply(compositor: Compositor) -> void:
 			"tokens": schedule.tokens,
 			"names": schedule.names,
 			"provided": provided,
+			"indirect_gi_owner": indirect_owner.duplicate(true),
 		}
 
 ## Internal per-camera update. Runtime overrides do not edit author resources or
@@ -525,6 +530,9 @@ func apply_volume(compositor: Compositor, parameters: Dictionary, pass_states: D
 		if _volume_binding.parameters != _volume_parameters:
 			_volume_binding.parameters = _volume_parameters.duplicate(true)
 			_volume_binding.resolved = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, _volume_binding.context))
+			_volume_binding.resolved = IndirectGISelection.inject(
+				_volume_binding.resolved, _passes, _volume_binding.get("indirect_gi_owner", {})
+			)
 		# Crossing a boundary switches between authored and runtime effect RIDs.
 		# Restore the cached binding even though neither renderer's author changed.
 		if compositor.compositor_effects != _volume_binding.effects:
@@ -541,6 +549,7 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 			return cached.plan
 	_ensure_pipeline_initialized(false)
 	var enabled_fn := func(entry): return ExecutionPlan.is_entry_enabled(entry, states)
+	var indirect_owner := IndirectGISelection.resolve(_passes, enabled_fn)
 	var provided := ExecutionPlan.provided_native_ids(_passes, enabled_fn)
 	var declared := ExecutionPlan.declared_provided_ids(_passes, enabled_fn)
 	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn)
@@ -559,6 +568,7 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 	var plan := {
 		"warnings": warnings, "tokens": schedule.tokens, "names": schedule.names,
 		"sources": schedule.effects, "enabled": enabled, "provided": provided_ids,
+		"entries": _passes.duplicate(), "indirect_gi_owner": indirect_owner,
 		"context": _initialized_volume_context().duplicate(true),
 	}
 	if _view_plans.size() == 2:

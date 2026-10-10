@@ -50,6 +50,11 @@ const T &RenderingShaderContainer::ReflectSymbol<T>::get_spv_reflect(RDC::Shader
 	return *info;
 }
 
+// D3D12's native-HLSL ABI validator consumes the portable SPIR-V descriptor
+// metadata from its own translation unit. The template body lives here, so make
+// that concrete descriptor-binding specialization available to the backend.
+template const SpvReflectDescriptorBinding &RenderingShaderContainer::ReflectSymbol<SpvReflectDescriptorBinding>::get_spv_reflect(RenderingDeviceCommons::ShaderStage p_stage) const;
+
 template <class T>
 void RenderingShaderContainer::ReflectSymbol<T>::set_spv_reflect(RDC::ShaderStage p_stage, const T *p_spv) {
 	stages.set_flag(1 << p_stage);
@@ -73,6 +78,10 @@ const SpvReflectShaderModule &RenderingShaderContainer::ReflectShaderStage::modu
 
 const Span<uint32_t> RenderingShaderContainer::ReflectShaderStage::spirv() const {
 	return _spirv_data.span().reinterpret<uint32_t>();
+}
+
+bool RenderingShaderContainer::_is_format_version_supported(uint32_t p_version) const {
+	return p_version <= _format_version();
 }
 
 uint32_t RenderingShaderContainer::_from_bytes_header_extra_data(const uint8_t *p_bytes) {
@@ -235,6 +244,50 @@ static RenderingDeviceCommons::DataFormat spv_image_format_to_data_format(const 
 Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<RDC::ShaderStageSPIRVData> p_spirv, ReflectShader &r_shader) {
 	ReflectShader &reflection = r_shader;
 
+	bool has_native_hlsl_sidecar = false;
+	int32_t declared_native_hlsl_shader_model = -1;
+	int32_t declared_max_payload_size = -1;
+	int32_t declared_max_attribute_size = -1;
+	LocalVector<String> native_exports;
+	for (uint32_t i = 0; i < p_spirv.size(); i++) {
+		const RDC::ShaderStageSPIRVData &stage_data = p_spirv[i];
+		const bool has_source = !stage_data.native_hlsl_source.strip_edges().is_empty();
+		const bool has_export = !stage_data.native_hlsl_export.strip_edges().is_empty();
+		ERR_FAIL_COND_V_MSG(has_source != has_export, FAILED, "Native HLSL stages require both source text and an export name.");
+		if (!has_source) {
+			ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_max_payload_size_bytes != -1 || stage_data.native_hlsl_max_attribute_size_bytes != -1,
+					FAILED, "Native HLSL payload and attribute declarations require a paired HLSL sidecar.");
+			continue;
+		}
+
+		ERR_FAIL_COND_V_MSG(stage_data.spirv.is_empty(), FAILED, "A native HLSL sidecar must be paired with portable SPIR-V for the same stage.");
+		ERR_FAIL_COND_V_MSG(stage_data.shader_stage < RDC::SHADER_STAGE_RAYGEN || stage_data.shader_stage > RDC::SHADER_STAGE_INTERSECTION,
+				FAILED, "Native HLSL sidecars are only supported for ray tracing shader stages.");
+		ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_shader_model != 63 && stage_data.native_hlsl_shader_model != 65,
+				FAILED, "Native HLSL shader model must be 63 or 65.");
+		ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_max_payload_size_bytes < 0 || stage_data.native_hlsl_max_attribute_size_bytes < 0,
+				FAILED, "Native HLSL ray tracing stages require explicit non-negative payload and attribute size declarations.");
+		ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_max_attribute_size_bytes > 32, FAILED, "The declared DXR hit attribute size exceeds the D3D12 limit of 32 bytes.");
+		for (uint32_t export_index = 0; export_index < native_exports.size(); export_index++) {
+			ERR_FAIL_COND_V_MSG(native_exports[export_index] == stage_data.native_hlsl_export.strip_edges(), FAILED,
+					"Native HLSL export names must be unique within a shader container.");
+		}
+		native_exports.push_back(stage_data.native_hlsl_export.strip_edges());
+
+		if (!has_native_hlsl_sidecar) {
+			declared_native_hlsl_shader_model = stage_data.native_hlsl_shader_model;
+			declared_max_payload_size = stage_data.native_hlsl_max_payload_size_bytes;
+			declared_max_attribute_size = stage_data.native_hlsl_max_attribute_size_bytes;
+		} else {
+			ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_shader_model != declared_native_hlsl_shader_model,
+					FAILED, "All native HLSL stages in one shader container must use the same shader model.");
+			ERR_FAIL_COND_V_MSG(stage_data.native_hlsl_max_payload_size_bytes != declared_max_payload_size ||
+						stage_data.native_hlsl_max_attribute_size_bytes != declared_max_attribute_size,
+					FAILED, "All native HLSL stages in one shader container must use the same explicit ray payload and hit attribute declarations.");
+		}
+		has_native_hlsl_sidecar = true;
+	}
+
 	shader_name = p_shader_name.utf8();
 
 	const uint32_t spirv_size = p_spirv.size() + 0;
@@ -248,6 +301,11 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 		RDC::ShaderStage stage_flag = (RDC::ShaderStage)(1 << stage);
 		r_refl[i].shader_stage = stage;
 		r_refl[i]._spirv_data = p_spirv[i].spirv;
+		r_refl[i]._native_hlsl_source = p_spirv[i].native_hlsl_source;
+		r_refl[i]._native_hlsl_export = p_spirv[i].native_hlsl_export;
+		r_refl[i]._native_hlsl_shader_model = p_spirv[i].native_hlsl_shader_model;
+		r_refl[i]._native_hlsl_max_payload_size_bytes = p_spirv[i].native_hlsl_max_payload_size_bytes;
+		r_refl[i]._native_hlsl_max_attribute_size_bytes = p_spirv[i].native_hlsl_max_attribute_size_bytes;
 
 		RDC::PipelineType pipeline_type = {};
 		switch (stage) {
@@ -292,11 +350,11 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 		// This makes no practical difference in current graphics drivers, since Vulkan is the outlier.
 		BitField<RDC::ShaderStage> uniform_stage_flags;
 		if (pipeline_type == RDC::PIPELINE_TYPE_RAYTRACING) {
-			uniform_stage_flags = RDC::SHADER_STAGE_RAYGEN |
-					RDC::SHADER_STAGE_ANY_HIT |
-					RDC::SHADER_STAGE_CLOSEST_HIT |
-					RDC::SHADER_STAGE_MISS |
-					RDC::SHADER_STAGE_INTERSECTION;
+			uniform_stage_flags = RDC::SHADER_STAGE_RAYGEN_BIT |
+					RDC::SHADER_STAGE_ANY_HIT_BIT |
+					RDC::SHADER_STAGE_CLOSEST_HIT_BIT |
+					RDC::SHADER_STAGE_MISS_BIT |
+					RDC::SHADER_STAGE_INTERSECTION_BIT;
 		} else {
 			uniform_stage_flags = stage_flag;
 		}
@@ -465,7 +523,8 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 								ERR_FAIL_COND_V_MSG(reflection.uniform_sets[set][k].writable != uniform.writable, FAILED,
 										"On shader stage '" + String(RDC::SHADER_STAGE_NAMES[stage]) + "', uniform '" + binding.name + "' trying to reuse location for set=" + itos(set) + ", binding=" + itos(uniform.binding) + " with different writability.");
 
-								// Just append stage mask and return.
+								// Preserve each stage's descriptor reflection before merging visibility.
+								reflection.uniform_sets[set][k].set_spv_reflect(stage, &binding);
 								reflection.uniform_sets[set][k].stages.set_flag(uniform_stage_flags);
 								exists = true;
 								break;
@@ -779,7 +838,7 @@ bool RenderingShaderContainer::from_bytes(const PackedByteArray &p_bytes) {
 	ERR_FAIL_COND_V_MSG(container_header.magic_number != CONTAINER_MAGIC_NUMBER, false, "Incorrect magic number in shader container.");
 	ERR_FAIL_COND_V_MSG(container_header.version > CONTAINER_VERSION, false, "Unsupported version in shader container.");
 	ERR_FAIL_COND_V_MSG(container_header.format != _format(), false, "Incorrect format in shader container.");
-	ERR_FAIL_COND_V_MSG(container_header.format_version > _format_version(), false, "Unsupported format version in shader container.");
+	ERR_FAIL_COND_V_MSG(!_is_format_version_supported(container_header.format_version), false, "Unsupported container version in shader container.");
 
 	// Adjust shaders to the size indicated by the container header.
 	shaders.resize(container_header.shader_count);

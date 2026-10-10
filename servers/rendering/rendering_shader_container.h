@@ -104,6 +104,7 @@ protected:
 
 	virtual uint32_t _format() const = 0;
 	virtual uint32_t _format_version() const = 0;
+	virtual bool _is_format_version_supported(uint32_t p_version) const;
 
 	// These methods will always be called with a valid pointer.
 	virtual uint32_t _from_bytes_header_extra_data(const uint8_t *p_bytes);
@@ -126,25 +127,18 @@ protected:
 
 	template <class T>
 	struct ReflectSymbol {
-		static constexpr uint32_t STAGE_INDEX[RDC::SHADER_STAGE_MAX] = {
-			0, // SHADER_STAGE_VERTEX
-			1, // SHADER_STAGE_FRAGMENT
-			0, // SHADER_STAGE_TESSELATION_CONTROL
-			1, // SHADER_STAGE_TESSELATION_EVALUATION
-			0, // SHADER_STAGE_COMPUTE
-		};
-
 		BitField<RDC::ShaderStage> stages = {};
 
 	private:
-		const T *_spv_reflect[2] = { nullptr };
+		const T *_spv_reflect[RDC::SHADER_STAGE_MAX] = {};
 
 	public:
 		_FORCE_INLINE_ constexpr uint32_t get_index_for_stage(RDC::ShaderStage p_stage) const {
 			DEV_ASSERT(stages.has_flag((1 << p_stage)));
-			return STAGE_INDEX[p_stage];
+			return uint32_t(p_stage);
 		}
 
+		bool has_spv_reflect(RDC::ShaderStage p_stage) const { return _spv_reflect[p_stage] != nullptr; }
 		const T &get_spv_reflect(RDC::ShaderStage p_stage) const;
 
 		/*! Returns the first valid stage if multiple stages are set.
@@ -211,6 +205,11 @@ protected:
 		friend class RenderingShaderContainer;
 
 		Vector<uint8_t> _spirv_data;
+		String _native_hlsl_source;
+		String _native_hlsl_export;
+		int32_t _native_hlsl_shader_model = 63;
+		int32_t _native_hlsl_max_payload_size_bytes = -1;
+		int32_t _native_hlsl_max_attribute_size_bytes = -1;
 		SpvReflectShaderModule *_module = nullptr;
 
 	public:
@@ -218,6 +217,11 @@ protected:
 		const SpvReflectShaderModule &module() const;
 		const Span<uint32_t> spirv() const;
 		const Vector<uint8_t> spirv_data() const { return _spirv_data; }
+		const String &native_hlsl_source() const { return _native_hlsl_source; }
+		const String &native_hlsl_export() const { return _native_hlsl_export; }
+		int32_t native_hlsl_shader_model() const { return _native_hlsl_shader_model; }
+		int32_t native_hlsl_max_payload_size_bytes() const { return _native_hlsl_max_payload_size_bytes; }
+		int32_t native_hlsl_max_attribute_size_bytes() const { return _native_hlsl_max_attribute_size_bytes; }
 
 		ReflectShaderStage();
 		~ReflectShaderStage();

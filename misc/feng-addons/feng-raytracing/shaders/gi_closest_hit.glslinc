@@ -1,0 +1,268 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+#ifndef FENG_GI_SKY_ARRAY
+#define FENG_GI_SKY_ARRAY 0
+#endif
+
+struct GIPathPayload {
+	vec3 radiance;
+	uint flags;
+};
+
+struct GIFrameData {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 size_exposure;
+	vec4 light_sky_parameters;
+	vec4 world_to_sky_columns[3];
+	uvec4 sun_view_generation_sky_array;
+	vec4 trace_parameters;
+	uvec4 generation_history_flags;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT gi_scene_tlas;
+#if FENG_GI_SKY_ARRAY
+layout(set = 0, binding = 6) uniform sampler2DArray gi_sky_radiance;
+#else
+layout(set = 0, binding = 6) uniform sampler2D gi_sky_radiance;
+#endif
+layout(set = 0, binding = 7, std140) uniform GIDirectionalLights {
+	vec4 light_data[8 * 29];
+} gi_lights;
+layout(set = 0, binding = 8, std430) readonly buffer GIVertexData {
+	uint words[];
+} gi_vertices;
+layout(set = 0, binding = 9, std430) readonly buffer GIIndexData {
+	uint indices[];
+} gi_indices;
+layout(set = 0, binding = 10, std430) readonly buffer GISurfaceRows {
+	uint words[];
+} gi_surfaces;
+layout(set = 0, binding = 11, std430) readonly buffer GIMaterialRows {
+	uint words[];
+} gi_materials;
+layout(set = 0, binding = 20, std140) uniform GIFrame {
+	GIFrameData data;
+} gi_frame;
+
+layout(set = 0, binding = 12) uniform sampler2DArray gi_albedo_group_0;
+layout(set = 0, binding = 13) uniform sampler2DArray gi_albedo_group_1;
+layout(set = 0, binding = 14) uniform sampler2DArray gi_albedo_group_2;
+layout(set = 0, binding = 15) uniform sampler2DArray gi_albedo_group_3;
+layout(set = 0, binding = 16) uniform sampler2DArray gi_albedo_group_4;
+layout(set = 0, binding = 17) uniform sampler2DArray gi_albedo_group_5;
+layout(set = 0, binding = 18) uniform sampler2DArray gi_albedo_group_6;
+layout(set = 0, binding = 19) uniform sampler2DArray gi_albedo_group_7;
+
+layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
+layout(location = 1) rayPayloadEXT GIPathPayload shadow_payload;
+hitAttributeEXT vec2 gi_barycentrics;
+
+const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
+const uint GI_MATERIAL_HAS_ALBEDO_TEXTURE = 1u;
+const uint GI_MATERIAL_TWO_SIDED = 2u;
+const uint GI_DIRECTIONAL_CAPACITY = 8u;
+const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
+const uint GI_SKY_SAMPLE_COUNT = 8u;
+const float GI_INV_PI = 0.3183098861837907;
+
+uint gi_hash(uint p_value) {
+	p_value ^= p_value >> 16u;
+	p_value *= 0x7feb352du;
+	p_value ^= p_value >> 15u;
+	p_value *= 0x846ca68bu;
+	p_value ^= p_value >> 16u;
+	return p_value;
+}
+
+float gi_random(inout uint p_state) {
+	p_state = gi_hash(p_state);
+	return float(p_state) * (1.0 / 4294967296.0);
+}
+
+vec3 gi_finite_nonnegative(vec3 p_value) {
+	return vec3(
+			isnan(p_value.x) || isinf(p_value.x) ? 0.0 : max(p_value.x, 0.0),
+			isnan(p_value.y) || isinf(p_value.y) ? 0.0 : max(p_value.y, 0.0),
+			isnan(p_value.z) || isinf(p_value.z) ? 0.0 : max(p_value.z, 0.0));
+}
+
+vec3 gi_transform_world_to_sky(vec3 p_world_direction) {
+	return normalize(gi_frame.data.world_to_sky_columns[0].xyz * p_world_direction.x
+			+ gi_frame.data.world_to_sky_columns[1].xyz * p_world_direction.y
+			+ gi_frame.data.world_to_sky_columns[2].xyz * p_world_direction.z);
+}
+
+vec2 gi_direction_to_oct(vec3 p_direction) {
+	vec3 n = p_direction / max(abs(p_direction.x) + abs(p_direction.y) + abs(p_direction.z), 1e-8);
+	if (n.z < 0.0) {
+		vec2 signs = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+		n.xy = (1.0 - abs(n.yx)) * signs;
+	}
+	return n.xy * 0.5 + 0.5;
+}
+
+vec3 gi_sample_sky_raw(vec3 p_world_direction) {
+	float captured_exposure = gi_frame.data.light_sky_parameters.z;
+	if (!(captured_exposure > 0.0) || isnan(captured_exposure) || isinf(captured_exposure)) {
+		return vec3(0.0);
+	}
+	vec3 sky_direction = gi_transform_world_to_sky(normalize(p_world_direction));
+	float border = clamp(gi_frame.data.light_sky_parameters.w, 0.0, 0.49);
+	vec2 uv = gi_direction_to_oct(sky_direction) * (1.0 - 2.0 * border) + border;
+#if FENG_GI_SKY_ARRAY
+	vec3 sampled = textureLod(gi_sky_radiance, vec3(uv, 0.0), 0.0).rgb;
+#else
+	vec3 sampled = textureLod(gi_sky_radiance, uv, 0.0).rgb;
+#endif
+	vec3 raw_radiance = max(sampled, vec3(0.0)) * max(gi_frame.data.light_sky_parameters.y, 0.0)
+			/ captured_exposure;
+	return gi_finite_nonnegative(raw_radiance);
+}
+
+vec3 gi_cosine_direction(vec3 p_normal, float p_u, float p_v) {
+	float radius = sqrt(p_u);
+	float angle = 6.28318530718 * p_v;
+	vec3 local_direction = vec3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0, 1.0 - p_u)));
+	vec3 helper = abs(p_normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tangent = normalize(cross(helper, p_normal));
+	vec3 bitangent = cross(p_normal, tangent);
+	return normalize(tangent * local_direction.x + bitangent * local_direction.y + p_normal * local_direction.z);
+}
+
+vec3 gi_sample_sky_diffuse(vec3 p_normal, uint p_seed) {
+	vec3 irradiance_over_pi = vec3(0.0);
+	uint seed = gi_hash(p_seed);
+	float offset_u = gi_random(seed);
+	float offset_v = gi_random(seed);
+	for (uint sample_index = 0u; sample_index < GI_SKY_SAMPLE_COUNT; sample_index++) {
+		float u = fract((float(sample_index) + 0.5) / float(GI_SKY_SAMPLE_COUNT) + offset_u);
+		float v = fract(float(sample_index) * 0.61803398875 + offset_v);
+		irradiance_over_pi += gi_sample_sky_raw(gi_cosine_direction(p_normal, u, v));
+	}
+	return irradiance_over_pi / float(GI_SKY_SAMPLE_COUNT);
+}
+
+vec3 gi_load_vertex_position(uint p_address) {
+	return uintBitsToFloat(uvec3(gi_vertices.words[p_address / 4u], gi_vertices.words[p_address / 4u + 1u],
+			gi_vertices.words[p_address / 4u + 2u]));
+}
+
+vec3 gi_load_vertex_normal(uint p_address) {
+	return uintBitsToFloat(uvec3(gi_vertices.words[p_address / 4u + 3u], gi_vertices.words[p_address / 4u + 4u],
+			gi_vertices.words[p_address / 4u + 5u]));
+}
+
+vec2 gi_load_vertex_uv(uint p_address) {
+	return uintBitsToFloat(uvec2(gi_vertices.words[p_address / 4u + 6u], gi_vertices.words[p_address / 4u + 7u]));
+}
+
+vec3 gi_sample_albedo_group(uint p_group, uint p_layer, vec2 p_uv) {
+	switch (p_group) {
+		case 0u: return textureLod(gi_albedo_group_0, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 1u: return textureLod(gi_albedo_group_1, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 2u: return textureLod(gi_albedo_group_2, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 3u: return textureLod(gi_albedo_group_3, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 4u: return textureLod(gi_albedo_group_4, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 5u: return textureLod(gi_albedo_group_5, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 6u: return textureLod(gi_albedo_group_6, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		case 7u: return textureLod(gi_albedo_group_7, vec3(p_uv, float(p_layer)), 0.0).rgb;
+		default: return vec3(1.0);
+	}
+}
+
+void main() {
+	uint instance_index = gl_InstanceCustomIndexEXT;
+	uint row_word = instance_index * 8u;
+	uint vertex_base_byte = gi_surfaces.words[row_word + 0u];
+	uint index_base_byte = gi_surfaces.words[row_word + 1u];
+	uint index_count = gi_surfaces.words[row_word + 2u];
+	uint material_index = gi_surfaces.words[row_word + 3u];
+	if (uint(gl_PrimitiveID) > 0xffffffffu / 3u
+			|| uint(gl_PrimitiveID) * 3u + 2u >= index_count) {
+		gi_payload.radiance = vec3(0.0);
+		gi_payload.flags = 0u;
+		return;
+	}
+	uint first_index_word = index_base_byte / 4u + uint(gl_PrimitiveID) * 3u;
+	uint index0 = gi_indices.indices[first_index_word + 0u];
+	uint index1 = gi_indices.indices[first_index_word + 1u];
+	uint index2 = gi_indices.indices[first_index_word + 2u];
+	uint vertex0_byte = vertex_base_byte + index0 * 32u;
+	uint vertex1_byte = vertex_base_byte + index1 * 32u;
+	uint vertex2_byte = vertex_base_byte + index2 * 32u;
+	vec3 position0 = gi_load_vertex_position(vertex0_byte);
+	vec3 position1 = gi_load_vertex_position(vertex1_byte);
+	vec3 position2 = gi_load_vertex_position(vertex2_byte);
+	vec3 normal0 = gi_load_vertex_normal(vertex0_byte);
+	vec3 normal1 = gi_load_vertex_normal(vertex1_byte);
+	vec3 normal2 = gi_load_vertex_normal(vertex2_byte);
+	vec2 uv0 = gi_load_vertex_uv(vertex0_byte);
+	vec2 uv1 = gi_load_vertex_uv(vertex1_byte);
+	vec2 uv2 = gi_load_vertex_uv(vertex2_byte);
+	vec3 barycentric = vec3(1.0 - gi_barycentrics.x - gi_barycentrics.y,
+			gi_barycentrics.x, gi_barycentrics.y);
+	vec3 local_normal = normal0 * barycentric.x + normal1 * barycentric.y + normal2 * barycentric.z;
+	float local_normal_length = length(local_normal);
+	if (!(local_normal_length > 1e-6) || isnan(local_normal_length) || isinf(local_normal_length)) {
+		local_normal = cross(position1 - position0, position2 - position0);
+		local_normal_length = length(local_normal);
+	}
+	if (!(local_normal_length > 1e-6) || isnan(local_normal_length) || isinf(local_normal_length)) {
+		gi_payload.radiance = vec3(0.0);
+		gi_payload.flags = 0u;
+		return;
+	}
+	local_normal /= local_normal_length;
+	vec3 world_normal = normalize(transpose(mat3(gl_WorldToObjectEXT)) * local_normal);
+	if (dot(world_normal, gl_WorldRayDirectionEXT) > 0.0) {
+		world_normal = -world_normal;
+	}
+
+	uint material_word = material_index * 16u;
+	vec4 base_color = uintBitsToFloat(uvec4(gi_materials.words[material_word + 0u], gi_materials.words[material_word + 1u],
+			gi_materials.words[material_word + 2u], gi_materials.words[material_word + 3u]));
+	vec3 emission_color = uintBitsToFloat(uvec3(gi_materials.words[material_word + 4u], gi_materials.words[material_word + 5u],
+			gi_materials.words[material_word + 6u]));
+	float emission_energy = uintBitsToFloat(gi_materials.words[material_word + 7u]);
+	float metallic = clamp(uintBitsToFloat(gi_materials.words[material_word + 8u]), 0.0, 1.0);
+	uint material_flags = gi_materials.words[material_word + 10u];
+	uint texture_group = gi_materials.words[material_word + 11u];
+	uint texture_layer = gi_materials.words[material_word + 9u];
+	vec3 albedo = max(base_color.rgb, vec3(0.0));
+	if ((material_flags & GI_MATERIAL_HAS_ALBEDO_TEXTURE) != 0u && texture_group < 8u) {
+		albedo *= max(gi_sample_albedo_group(texture_group, texture_layer, (uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z) * uintBitsToFloat(uvec2(gi_materials.words[material_word + 12u], gi_materials.words[material_word + 13u])) + uintBitsToFloat(uvec2(gi_materials.words[material_word + 14u], gi_materials.words[material_word + 15u]))), vec3(0.0));
+	}
+	vec3 diffuse_reflectance = albedo * (1.0 - metallic);
+	vec3 outgoing_radiance = max(emission_color, vec3(0.0)) * max(emission_energy, 0.0);
+	uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
+	uint full_layer_mask = gi_surfaces.words[row_word + 5u];
+	if (sun_index < GI_DIRECTIONAL_CAPACITY) {
+		vec4 direction_energy = gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 0u];
+		vec3 sun_direction = normalize(mat3(gi_frame.data.view_to_world) * direction_energy.xyz);
+		float no_l = max(dot(world_normal, sun_direction), 0.0);
+		float light_buffer_normalization = gi_frame.data.light_sky_parameters.x;
+		uint sun_mask = floatBitsToUint(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 2u].y);
+		if (no_l > 0.0 && (full_layer_mask & sun_mask) != 0u
+				&& light_buffer_normalization > 0.0 && !isnan(light_buffer_normalization) && !isinf(light_buffer_normalization)) {
+			shadow_payload.radiance = vec3(0.0);
+			shadow_payload.flags = GI_RAY_MODE_SUN_VISIBILITY;
+			vec3 world_hit = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
+			traceRayEXT(gi_scene_tlas,
+					gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+					0x02u, 0u, 0u, 1u, world_hit + world_normal * 0.001,
+					0.001, sun_direction, max(gi_frame.data.trace_parameters.x, 0.001), 1);
+			float visibility = clamp(shadow_payload.radiance.x, 0.0, 1.0);
+			float energy = max(direction_energy.w / light_buffer_normalization, 0.0);
+			vec3 light_color = max(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 1u].rgb, vec3(0.0));
+			outgoing_radiance += diffuse_reflectance * light_color * energy * (no_l * GI_INV_PI) * visibility;
+		}
+	}
+
+	uint sky_seed = gi_hash(instance_index * 0x9e3779b9u ^ uint(gl_PrimitiveID) * 0x85ebca6bu
+			^ floatBitsToUint(gi_barycentrics.x) ^ floatBitsToUint(gi_barycentrics.y));
+	outgoing_radiance += diffuse_reflectance * gi_sample_sky_diffuse(world_normal, sky_seed);
+	gi_payload.radiance = gi_finite_nonnegative(outgoing_radiance);
+	gi_payload.flags = 0u;
+}

@@ -1,0 +1,55 @@
+struct GIDirectionalLight {
+	float3 direction;
+	float energy;
+	float3 color;
+	float size;
+	float specular;
+	uint mask;
+	uint2 reserved;
+	float4 padding[26];
+};
+cbuffer GIDirectionalLights : register(b7, space0) {
+	GIDirectionalLight gi_lights[8];
+};
+struct GIFrameData {
+	column_major float4x4 inverse_projection;
+	column_major float4x4 view_to_world;
+	float4 size_exposure;
+	float4 light_sky_parameters;
+	float4 world_to_sky_columns[3];
+	uint4 sun_view_generation_sky_array;
+	float4 trace_parameters;
+	uint4 generation_history_flags;
+};
+ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
+ByteAddressBuffer gi_surfaces : register(t10, space0);
+ByteAddressBuffer gi_materials : register(t11, space0);
+
+struct GIPathPayload {
+	float3 radiance;
+	uint flags;
+};
+
+static const uint GI_MATERIAL_TWO_SIDED = 2u;
+static const uint GI_HIT_KIND_FRONT_FACE = 0xfeu;
+
+[shader("anyhit")]
+void FengGIAnyHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
+	uint surface_byte = InstanceID() * 32u;
+	if (payload.flags == 1u) {
+		uint sun_index = gi_frame.sun_view_generation_sky_array.x;
+		if (sun_index >= 8u || (gi_surfaces.Load(surface_byte + 20u) & gi_lights[sun_index].mask) == 0u) {
+			IgnoreHit();
+			return;
+		}
+		payload.radiance = float3(0.0f, 0.0f, 0.0f);
+		AcceptHitAndEndSearch();
+		return;
+	}
+	uint material_index = gi_surfaces.Load(surface_byte + 12u);
+	uint material_flags = gi_materials.Load(material_index * 64u + 40u);
+	if ((material_flags & GI_MATERIAL_TWO_SIDED) == 0u && HitKind() != GI_HIT_KIND_FRONT_FACE) {
+		IgnoreHit();
+		return;
+	}
+}

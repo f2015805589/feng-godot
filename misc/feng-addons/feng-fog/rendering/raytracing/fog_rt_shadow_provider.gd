@@ -111,6 +111,16 @@ static func shader_source_for_abi(p_source: String, p_abi: int) -> String:
 	return "\n".join(lines)
 
 
+static func native_hlsl_source_for_abi(p_source: String, p_abi: int) -> String:
+	if p_source.is_empty() or p_abi not in [1, RAY_INPUT_ABI_VERSION]:
+		return ""
+	var marker := "__FENG_FOG_RAY_ABI__"
+	var marker_index := p_source.find(marker)
+	if marker_index < 0 or p_source.find(marker, marker_index + marker.length()) >= 0:
+		return ""
+	return p_source.replace(marker, str(p_abi))
+
+
 static func _object_id_is_valid(p_object_id: int) -> bool:
 	# RefCounted Resource instance IDs can be negative because their high bits
 	# carry an Object-type tag. Only zero is the invalid/sentinel ID.
@@ -348,6 +358,41 @@ func _ensure_pipeline(p_rd: RenderingDevice, p_abi: int) -> bool:
 			or source.source_closest_hit.is_empty() or source.source_any_hit.is_empty():
 		_last_error = "Ray-tracing shader source files are missing or empty."
 		return false
+	var native_hlsl_methods := [
+		"set_native_hlsl_stage_source",
+		"set_native_hlsl_stage_export",
+		"set_native_hlsl_shader_model",
+		"set_native_hlsl_max_payload_size_bytes",
+		"set_native_hlsl_max_attribute_size_bytes",
+	]
+	var available_native_hlsl_methods := 0
+	for method_name in native_hlsl_methods:
+		if source.has_method(method_name):
+			available_native_hlsl_methods += 1
+	if available_native_hlsl_methods != 0 and available_native_hlsl_methods != native_hlsl_methods.size():
+		_last_error = "The RenderingDevice exposes an incomplete native HLSL sidecar API."
+		return false
+	if available_native_hlsl_methods == native_hlsl_methods.size():
+		# GeometryIndex is required by the existing Fog hit shader, so its native
+		# DXIL sidecar explicitly targets shader model 6.5. Vulkan continues using
+		# the portable GLSL/SPIR-V stages above.
+		source.call("set_native_hlsl_shader_model", 65)
+		var native_stages := [
+			[RenderingDevice.SHADER_STAGE_RAYGEN, "fog_shadow_raygen.hlslinc", "FengFogRayGen"],
+			[RenderingDevice.SHADER_STAGE_MISS, "fog_shadow_miss.hlslinc", "FengFogMiss"],
+			[RenderingDevice.SHADER_STAGE_CLOSEST_HIT, "fog_shadow_closest_hit.hlslinc", "FengFogClosestHit"],
+			[RenderingDevice.SHADER_STAGE_ANY_HIT, "fog_shadow_any_hit.hlslinc", "FengFogAnyHit"],
+		]
+		for native_stage in native_stages:
+			var hlsl_source := FileAccess.get_file_as_string(SHADER_DIR.path_join(str(native_stage[1])))
+			hlsl_source = native_hlsl_source_for_abi(hlsl_source, p_abi)
+			if hlsl_source.is_empty():
+				_last_error = "Native HLSL sidecar is missing or has an invalid ABI marker: " + str(native_stage[1])
+				return false
+			source.call("set_native_hlsl_stage_source", int(native_stage[0]), hlsl_source)
+			source.call("set_native_hlsl_stage_export", int(native_stage[0]), str(native_stage[2]))
+		source.call("set_native_hlsl_max_payload_size_bytes", 4)
+		source.call("set_native_hlsl_max_attribute_size_bytes", 8)
 	var spirv: RDShaderSPIRV = p_rd.shader_compile_spirv_from_source(source)
 	if spirv == null:
 		_last_error = "The RD compiler returned no ray-tracing SPIR-V."

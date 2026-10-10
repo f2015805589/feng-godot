@@ -598,11 +598,11 @@ String ShaderRD::_version_get_sha1(Version *p_version) const {
 }
 
 static const char *shader_file_header = "GDSC";
-static const uint32_t cache_file_version = 4;
+static const uint32_t cache_file_version = 5;
 
 String ShaderRD::_get_cache_file_relative_path(Version *p_version, int p_group, const String &p_api_name) {
 	String sha1 = _version_get_sha1(p_version);
-	return name.path_join(group_sha256[p_group]).path_join(sha1) + "." + p_api_name + ".cache";
+	return name.path_join(group_sha256[p_group]).path_join(sha1) + "." + p_api_name + ".v" + itos(cache_file_version) + ".cache";
 }
 
 String ShaderRD::_get_cache_file_path(Version *p_version, int p_group, const String &p_api_name, bool p_user_dir) {

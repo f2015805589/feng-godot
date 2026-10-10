@@ -1,0 +1,10 @@
+#define FENG_FOG_RAY_ABI __FENG_FOG_RAY_ABI__
+
+struct FogShadowPayload {
+	uint visibility;
+};
+
+[shader("closesthit")]
+void FengFogClosestHit(inout FogShadowPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
+	payload.visibility = 0u;
+}

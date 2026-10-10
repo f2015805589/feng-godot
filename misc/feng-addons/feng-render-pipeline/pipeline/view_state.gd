@@ -7,6 +7,7 @@ const ViewPass = preload("view_pass.gd")
 const TextureManager = preload("../passes/texture_manager.gd")
 const Binding = preload("compositor_binding.gd")
 const Parameters = preload("parameter_resolver.gd")
+const IndirectGISelection = preload("indirect_gi_selection.gd")
 
 var _manager := TextureManager.new()
 var _bindings: Dictionary = {}
@@ -63,11 +64,15 @@ func apply(compositor: Compositor, renderer: FengRenderer, parameters: Dictionar
 		_manager.passes = scripted
 		_parameters = parameters.duplicate(true)
 		_resolved = renderer._with_eye_adaptation_state(Parameters.resolve_context([], parameters, candidate.context), states)
+		_resolved = IndirectGISelection.inject(_resolved, candidate.entries,
+				candidate.get("indirect_gi_owner", {}))
 		_valid = true
 		_revision = renderer.get_parameter_revision()
 	elif parameters != _parameters:
 		_parameters = parameters.duplicate(true)
 		_resolved = renderer._with_eye_adaptation_state(Parameters.resolve_context([], parameters, _plan.context), states)
+		_resolved = IndirectGISelection.inject(_resolved, _plan.entries,
+				_plan.get("indirect_gi_owner", {}))
 	if compositor.compositor_effects != _effects:
 		compositor.compositor_effects = _effects
 	Binding.upload(compositor, _plan.tokens, _plan.names, _plan.provided, _resolved)

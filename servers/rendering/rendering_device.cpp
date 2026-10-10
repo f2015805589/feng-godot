@@ -5180,6 +5180,9 @@ Error RenderingDevice::_raytracing_pipeline_create_sbt_buffer(RDD::RaytracingPip
 		ERR_FAIL_V(err);
 	}
 
+	r_sbt_buffer.draw_tracker = RDG::resource_tracker_create();
+	r_sbt_buffer.draw_tracker->buffer_driver_id = r_sbt_buffer.driver_id;
+
 	_THREAD_SAFE_LOCK_
 	buffer_memory += r_sbt_buffer.size;
 	_THREAD_SAFE_UNLOCK_
@@ -6580,6 +6583,8 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 
 	ERR_FAIL_COND(p_list != ID_TYPE_RAYTRACING_LIST);
 	ERR_FAIL_COND(!raytracing_list.active);
+	RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(raytracing_list.state.pipeline);
+	ERR_FAIL_NULL(pipeline);
 
 #ifdef DEBUG_ENABLED
 	ERR_FAIL_NULL_MSG(shader_owner.get_or_null(raytracing_list.state.layout_defining_shader), "No shader was set before attempting to trace rays.");
@@ -6676,6 +6681,10 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 	RDD::ShaderBindingTable rdd_hit_sbt;
 	Error err = _hit_sbt_buffer_update(hit_sbt, p_hit_sbt, rdd_hit_sbt);
 	ERR_FAIL_COND(err != OK);
+
+	if (pipeline->sbt_buffer.draw_tracker != nullptr) {
+		draw_graph.add_raytracing_list_usage(pipeline->sbt_buffer.draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
+	}
 
 	if (hit_sbt->draw_tracker != nullptr) {
 		draw_graph.add_raytracing_list_usage(hit_sbt->draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
@@ -7975,6 +7984,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 	while (frames[p_frame].raytracing_pipelines_to_dispose_of.front()) {
 		RaytracingPipeline *pipeline = &frames[p_frame].raytracing_pipelines_to_dispose_of.front()->get();
 
+		RDG::resource_tracker_free(pipeline->sbt_buffer.draw_tracker);
 		driver->buffer_free(pipeline->sbt_buffer.driver_id);
 		buffer_memory -= pipeline->sbt_buffer.size;
 
@@ -10063,11 +10073,76 @@ void RenderingDevice::_draw_list_bind_vertex_buffers_format(DrawListID p_list, V
 	draw_list_bind_vertex_buffers_format(p_list, p_vertex_format, p_vertex_count, buffers, offsets);
 }
 
+template <typename T, typename HasPortableStage>
+static bool _validate_native_hlsl_sidecars(const T &p_resource, HasPortableStage p_has_portable_stage, String &r_error) {
+	bool has_sidecar = false;
+	LocalVector<String> native_exports;
+	for (int i = 0; i < RD::SHADER_STAGE_MAX; i++) {
+		RD::ShaderStage stage = RD::ShaderStage(i);
+		String source = p_resource->get_native_hlsl_stage_source(stage);
+		String export_name = p_resource->get_native_hlsl_stage_export(stage).strip_edges();
+		if (source.is_empty() && export_name.is_empty()) {
+			continue;
+		}
+
+		if (source.strip_edges().is_empty() || export_name.strip_edges().is_empty()) {
+			r_error = "Native HLSL sidecars require both source text and a non-empty export name for each stage.";
+			return false;
+		}
+		if (stage < RD::SHADER_STAGE_RAYGEN || stage > RD::SHADER_STAGE_INTERSECTION) {
+			r_error = "Native HLSL sidecars are only supported for ray tracing shader stages.";
+			return false;
+		}
+		if (!p_has_portable_stage(p_resource, stage)) {
+			r_error = "Every native HLSL sidecar must be paired with portable SPIR-V for the same stage.";
+			return false;
+		}
+		for (uint32_t export_index = 0; export_index < native_exports.size(); export_index++) {
+			if (native_exports[export_index] == export_name) {
+				r_error = "Native HLSL export names must be unique within a shader source.";
+				return false;
+			}
+		}
+		native_exports.push_back(export_name);
+		has_sidecar = true;
+	}
+
+	int32_t max_payload_size = p_resource->get_native_hlsl_max_payload_size_bytes();
+	int32_t max_attribute_size = p_resource->get_native_hlsl_max_attribute_size_bytes();
+	int32_t shader_model = p_resource->get_native_hlsl_shader_model();
+	if (has_sidecar) {
+		if (shader_model != 63 && shader_model != 65) {
+			r_error = "Native HLSL shader model must be 63 or 65.";
+			return false;
+		}
+		if (max_payload_size < 0 || max_attribute_size < 0) {
+			r_error = "Native HLSL ray tracing sidecars require explicit non-negative payload and attribute size declarations.";
+			return false;
+		}
+		if (max_attribute_size > 32) {
+			r_error = "The declared DXR hit attribute size exceeds the D3D12 limit of 32 bytes.";
+			return false;
+		}
+	} else if (max_payload_size != -1 || max_attribute_size != -1) {
+		r_error = "Native HLSL payload and attribute size declarations require at least one native HLSL sidecar.";
+		return false;
+	}
+
+	return true;
+}
+
 Ref<RDShaderSPIRV> RenderingDevice::_shader_compile_spirv_from_source(const Ref<RDShaderSource> &p_source, bool p_allow_cache) {
 	ERR_FAIL_COND_V(p_source.is_null(), Ref<RDShaderSPIRV>());
+	String sidecar_error;
+	ERR_FAIL_COND_V_MSG(!_validate_native_hlsl_sidecars(p_source, [](const Ref<RDShaderSource> &p_shader, RD::ShaderStage p_stage) {
+		return !p_shader->get_stage_source(p_stage).is_empty();
+	}, sidecar_error), Ref<RDShaderSPIRV>(), "Invalid native HLSL sidecar contract: " + sidecar_error);
 
 	Ref<RDShaderSPIRV> bytecode;
 	bytecode.instantiate();
+	bytecode->set_native_hlsl_shader_model(p_source->get_native_hlsl_shader_model());
+	bytecode->set_native_hlsl_max_payload_size_bytes(p_source->get_native_hlsl_max_payload_size_bytes());
+	bytecode->set_native_hlsl_max_attribute_size_bytes(p_source->get_native_hlsl_max_attribute_size_bytes());
 	for (int i = 0; i < RD::SHADER_STAGE_MAX; i++) {
 		String error;
 
@@ -10078,6 +10153,10 @@ Ref<RDShaderSPIRV> RenderingDevice::_shader_compile_spirv_from_source(const Ref<
 			Vector<uint8_t> spirv = shader_compile_spirv_from_source(stage, source, p_source->get_language(), &error, p_allow_cache);
 			bytecode->set_stage_bytecode(stage, spirv);
 			bytecode->set_stage_compile_error(stage, error);
+			if (!p_source->get_native_hlsl_stage_source(stage).is_empty()) {
+				bytecode->set_native_hlsl_stage_source(stage, p_source->get_native_hlsl_stage_source(stage));
+				bytecode->set_native_hlsl_stage_export(stage, p_source->get_native_hlsl_stage_export(stage));
+			}
 		}
 	}
 	return bytecode;
@@ -10085,6 +10164,10 @@ Ref<RDShaderSPIRV> RenderingDevice::_shader_compile_spirv_from_source(const Ref<
 
 Vector<uint8_t> RenderingDevice::_shader_compile_binary_from_spirv(const Ref<RDShaderSPIRV> &p_spirv, const String &p_shader_name) {
 	ERR_FAIL_COND_V(p_spirv.is_null(), Vector<uint8_t>());
+	String sidecar_error;
+	ERR_FAIL_COND_V_MSG(!_validate_native_hlsl_sidecars(p_spirv, [](const Ref<RDShaderSPIRV> &p_shader, RD::ShaderStage p_stage) {
+		return !p_shader->get_stage_bytecode(p_stage).is_empty();
+	}, sidecar_error), Vector<uint8_t>(), "Invalid native HLSL sidecar contract: " + sidecar_error);
 
 	Vector<ShaderStageSPIRVData> stage_data;
 	for (int i = 0; i < RD::SHADER_STAGE_MAX; i++) {
@@ -10097,6 +10180,13 @@ Vector<uint8_t> RenderingDevice::_shader_compile_binary_from_spirv(const Ref<RDS
 		if (sd.spirv.is_empty()) {
 			continue;
 		}
+		sd.native_hlsl_source = p_spirv->get_native_hlsl_stage_source(stage);
+		if (!sd.native_hlsl_source.is_empty()) {
+			sd.native_hlsl_export = p_spirv->get_native_hlsl_stage_export(stage);
+			sd.native_hlsl_shader_model = p_spirv->get_native_hlsl_shader_model();
+			sd.native_hlsl_max_payload_size_bytes = p_spirv->get_native_hlsl_max_payload_size_bytes();
+			sd.native_hlsl_max_attribute_size_bytes = p_spirv->get_native_hlsl_max_attribute_size_bytes();
+		}
 		stage_data.push_back(sd);
 	}
 
@@ -10105,6 +10195,10 @@ Vector<uint8_t> RenderingDevice::_shader_compile_binary_from_spirv(const Ref<RDS
 
 RID RenderingDevice::_shader_create_from_spirv(const Ref<RDShaderSPIRV> &p_spirv, const String &p_shader_name) {
 	ERR_FAIL_COND_V(p_spirv.is_null(), RID());
+	String sidecar_error;
+	ERR_FAIL_COND_V_MSG(!_validate_native_hlsl_sidecars(p_spirv, [](const Ref<RDShaderSPIRV> &p_shader, RD::ShaderStage p_stage) {
+		return !p_shader->get_stage_bytecode(p_stage).is_empty();
+	}, sidecar_error), RID(), "Invalid native HLSL sidecar contract: " + sidecar_error);
 
 	Vector<ShaderStageSPIRVData> stage_data;
 	for (int i = 0; i < RD::SHADER_STAGE_MAX; i++) {
@@ -10116,6 +10210,13 @@ RID RenderingDevice::_shader_create_from_spirv(const Ref<RDShaderSPIRV> &p_spirv
 		sd.spirv = p_spirv->get_stage_bytecode(stage);
 		if (sd.spirv.is_empty()) {
 			continue;
+		}
+		sd.native_hlsl_source = p_spirv->get_native_hlsl_stage_source(stage);
+		if (!sd.native_hlsl_source.is_empty()) {
+			sd.native_hlsl_export = p_spirv->get_native_hlsl_stage_export(stage);
+			sd.native_hlsl_shader_model = p_spirv->get_native_hlsl_shader_model();
+			sd.native_hlsl_max_payload_size_bytes = p_spirv->get_native_hlsl_max_payload_size_bytes();
+			sd.native_hlsl_max_attribute_size_bytes = p_spirv->get_native_hlsl_max_attribute_size_bytes();
 		}
 		stage_data.push_back(sd);
 	}

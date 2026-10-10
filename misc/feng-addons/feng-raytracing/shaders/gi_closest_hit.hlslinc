@@ -1,0 +1,281 @@
+#ifndef FENG_GI_SKY_ARRAY
+#define FENG_GI_SKY_ARRAY 0
+#endif
+
+RaytracingAccelerationStructure gi_scene_tlas : register(t0, space0);
+#if FENG_GI_SKY_ARRAY
+Texture2DArray<float4> gi_sky_radiance : register(t6, space0);
+#else
+Texture2D<float4> gi_sky_radiance : register(t6, space0);
+#endif
+SamplerState gi_sky_sampler : register(s6, space0);
+
+struct GIDirectionalLight {
+	float3 direction;
+	float energy;
+	float3 color;
+	float size;
+	float specular;
+	uint mask;
+	float softshadow_angle;
+	float soft_shadow_scale;
+	uint blend_splits;
+	float shadow_opacity;
+	float fade_from;
+	float fade_to;
+	uint2 padding;
+	uint bake_mode;
+	float volumetric_fog_energy;
+	float4 shadow_bias;
+	float4 shadow_normal_bias;
+	float4 shadow_transmittance_bias;
+	float4 shadow_z_range;
+	float4 shadow_range_begin;
+	float4 shadow_split_offsets;
+	float4 shadow_matrices[16];
+	float4 uv_scales[2];
+};
+cbuffer GIDirectionalLights : register(b7, space0) {
+	GIDirectionalLight gi_lights[8];
+};
+ByteAddressBuffer gi_vertices : register(t8, space0);
+ByteAddressBuffer gi_indices : register(t9, space0);
+ByteAddressBuffer gi_surfaces : register(t10, space0);
+ByteAddressBuffer gi_materials : register(t11, space0);
+
+Texture2DArray<float4> gi_albedo_group_0 : register(t12, space0);
+Texture2DArray<float4> gi_albedo_group_1 : register(t13, space0);
+Texture2DArray<float4> gi_albedo_group_2 : register(t14, space0);
+Texture2DArray<float4> gi_albedo_group_3 : register(t15, space0);
+Texture2DArray<float4> gi_albedo_group_4 : register(t16, space0);
+Texture2DArray<float4> gi_albedo_group_5 : register(t17, space0);
+Texture2DArray<float4> gi_albedo_group_6 : register(t18, space0);
+Texture2DArray<float4> gi_albedo_group_7 : register(t19, space0);
+SamplerState gi_albedo_sampler_0 : register(s12, space0);
+SamplerState gi_albedo_sampler_1 : register(s13, space0);
+SamplerState gi_albedo_sampler_2 : register(s14, space0);
+SamplerState gi_albedo_sampler_3 : register(s15, space0);
+SamplerState gi_albedo_sampler_4 : register(s16, space0);
+SamplerState gi_albedo_sampler_5 : register(s17, space0);
+SamplerState gi_albedo_sampler_6 : register(s18, space0);
+SamplerState gi_albedo_sampler_7 : register(s19, space0);
+
+struct GIFrameData {
+	column_major float4x4 inverse_projection;
+	column_major float4x4 view_to_world;
+	float4 size_exposure;
+	float4 light_sky_parameters;
+	float4 world_to_sky_columns[3];
+	uint4 sun_view_generation_sky_array;
+	float4 trace_parameters;
+	uint4 generation_history_flags;
+};
+ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
+
+struct GIPathPayload {
+	float3 radiance;
+	uint flags;
+};
+
+static const uint GI_RAY_MODE_PRIMARY = 0u;
+static const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
+static const uint GI_MATERIAL_HAS_ALBEDO_TEXTURE = 1u;
+static const uint GI_DIRECTIONAL_CAPACITY = 8u;
+static const uint GI_SKY_SAMPLE_COUNT = 8u;
+static const float GI_INV_PI = 0.3183098861837907f;
+static const uint GI_HIT_KIND_FRONT_FACE = 0xfeu;
+
+uint gi_hash(uint value) {
+	value ^= value >> 16u;
+	value *= 0x7feb352du;
+	value ^= value >> 15u;
+	value *= 0x846ca68bu;
+	value ^= value >> 16u;
+	return value;
+}
+
+float gi_random(inout uint state) {
+	state = gi_hash(state);
+	return float(state) * (1.0f / 4294967296.0f);
+}
+
+float3 gi_finite_nonnegative(float3 value) {
+	return float3(
+			isfinite(value.x) ? max(value.x, 0.0f) : 0.0f,
+			isfinite(value.y) ? max(value.y, 0.0f) : 0.0f,
+			isfinite(value.z) ? max(value.z, 0.0f) : 0.0f);
+}
+
+float3 gi_transform_world_to_sky(float3 world_direction) {
+	return normalize(gi_frame.world_to_sky_columns[0].xyz * world_direction.x
+			+ gi_frame.world_to_sky_columns[1].xyz * world_direction.y
+			+ gi_frame.world_to_sky_columns[2].xyz * world_direction.z);
+}
+
+float2 gi_direction_to_oct(float3 direction) {
+	float3 n = direction / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-8f);
+	if (n.z < 0.0f) {
+		float2 signs = float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+		n.xy = (1.0f - abs(n.yx)) * signs;
+	}
+	return n.xy * 0.5f + 0.5f;
+}
+
+float3 gi_sample_sky_raw(float3 world_direction) {
+	float captured_exposure = gi_frame.light_sky_parameters.z;
+	if (!(captured_exposure > 0.0f) || !isfinite(captured_exposure)) {
+		return 0.0f;
+	}
+	float3 sky_direction = gi_transform_world_to_sky(normalize(world_direction));
+	float border = clamp(gi_frame.light_sky_parameters.w, 0.0f, 0.49f);
+	float2 uv = gi_direction_to_oct(sky_direction) * (1.0f - 2.0f * border) + border;
+#if FENG_GI_SKY_ARRAY
+	float3 sampled = gi_sky_radiance.SampleLevel(gi_sky_sampler, float3(uv, 0.0f), 0.0f).rgb;
+#else
+	float3 sampled = gi_sky_radiance.SampleLevel(gi_sky_sampler, uv, 0.0f).rgb;
+#endif
+	float3 raw_radiance = max(sampled, 0.0f) * max(gi_frame.light_sky_parameters.y, 0.0f)
+			/ captured_exposure;
+	return gi_finite_nonnegative(raw_radiance);
+}
+
+float3 gi_cosine_direction(float3 normal, float u, float v) {
+	float radius = sqrt(u);
+	float angle = 6.28318530718f * v;
+	float3 local_direction = float3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0f, 1.0f - u)));
+	float3 helper = abs(normal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+	float3 tangent = normalize(cross(helper, normal));
+	float3 bitangent = cross(normal, tangent);
+	return normalize(tangent * local_direction.x + bitangent * local_direction.y + normal * local_direction.z);
+}
+
+float3 gi_sample_sky_diffuse(float3 normal, uint seed) {
+	float3 irradiance_over_pi = 0.0f;
+	seed = gi_hash(seed);
+	float offset_u = gi_random(seed);
+	float offset_v = gi_random(seed);
+	for (uint sample_index = 0u; sample_index < GI_SKY_SAMPLE_COUNT; sample_index++) {
+		float u = frac((float(sample_index) + 0.5f) / float(GI_SKY_SAMPLE_COUNT) + offset_u);
+		float v = frac(float(sample_index) * 0.61803398875f + offset_v);
+		irradiance_over_pi += gi_sample_sky_raw(gi_cosine_direction(normal, u, v));
+	}
+	return irradiance_over_pi / float(GI_SKY_SAMPLE_COUNT);
+}
+
+float3 gi_sample_albedo_group(uint group, uint layer, float2 uv) {
+	switch (group) {
+		case 0u: return gi_albedo_group_0.SampleLevel(gi_albedo_sampler_0, float3(uv, float(layer)), 0.0f).rgb;
+		case 1u: return gi_albedo_group_1.SampleLevel(gi_albedo_sampler_1, float3(uv, float(layer)), 0.0f).rgb;
+		case 2u: return gi_albedo_group_2.SampleLevel(gi_albedo_sampler_2, float3(uv, float(layer)), 0.0f).rgb;
+		case 3u: return gi_albedo_group_3.SampleLevel(gi_albedo_sampler_3, float3(uv, float(layer)), 0.0f).rgb;
+		case 4u: return gi_albedo_group_4.SampleLevel(gi_albedo_sampler_4, float3(uv, float(layer)), 0.0f).rgb;
+		case 5u: return gi_albedo_group_5.SampleLevel(gi_albedo_sampler_5, float3(uv, float(layer)), 0.0f).rgb;
+		case 6u: return gi_albedo_group_6.SampleLevel(gi_albedo_sampler_6, float3(uv, float(layer)), 0.0f).rgb;
+		case 7u: return gi_albedo_group_7.SampleLevel(gi_albedo_sampler_7, float3(uv, float(layer)), 0.0f).rgb;
+		default: return 1.0f;
+	}
+}
+
+[shader("closesthit")]
+void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
+	if (payload.flags == GI_RAY_MODE_SUN_VISIBILITY) {
+		payload.radiance = 0.0f;
+		return;
+	}
+
+	uint row_byte = InstanceID() * 32u;
+	uint vertex_base_byte = gi_surfaces.Load(row_byte + 0u);
+	uint index_base_byte = gi_surfaces.Load(row_byte + 4u);
+	uint index_count = gi_surfaces.Load(row_byte + 8u);
+	uint material_index = gi_surfaces.Load(row_byte + 12u);
+	uint primitive = PrimitiveIndex();
+	if (index_count % 3u != 0u || primitive >= index_count / 3u) {
+		payload.radiance = 0.0f;
+		payload.flags = GI_RAY_MODE_PRIMARY;
+		return;
+	}
+	uint first_index_byte = index_base_byte + primitive * 12u;
+	uint index0 = gi_indices.Load(first_index_byte + 0u);
+	uint index1 = gi_indices.Load(first_index_byte + 4u);
+	uint index2 = gi_indices.Load(first_index_byte + 8u);
+	uint vertex0_byte = vertex_base_byte + index0 * 32u;
+	uint vertex1_byte = vertex_base_byte + index1 * 32u;
+	uint vertex2_byte = vertex_base_byte + index2 * 32u;
+	float3 position0 = asfloat(gi_vertices.Load3(vertex0_byte + 0u));
+	float3 position1 = asfloat(gi_vertices.Load3(vertex1_byte + 0u));
+	float3 position2 = asfloat(gi_vertices.Load3(vertex2_byte + 0u));
+	float3 normal0 = asfloat(gi_vertices.Load3(vertex0_byte + 12u));
+	float3 normal1 = asfloat(gi_vertices.Load3(vertex1_byte + 12u));
+	float3 normal2 = asfloat(gi_vertices.Load3(vertex2_byte + 12u));
+	float2 uv0 = asfloat(gi_vertices.Load2(vertex0_byte + 24u));
+	float2 uv1 = asfloat(gi_vertices.Load2(vertex1_byte + 24u));
+	float2 uv2 = asfloat(gi_vertices.Load2(vertex2_byte + 24u));
+	float3 barycentric = float3(1.0f - attributes.barycentrics.x - attributes.barycentrics.y,
+			attributes.barycentrics.x, attributes.barycentrics.y);
+	float3 local_normal = normal0 * barycentric.x + normal1 * barycentric.y + normal2 * barycentric.z;
+	float local_normal_length = length(local_normal);
+	if (!(local_normal_length > 1e-6f) || !isfinite(local_normal_length)) {
+		local_normal = cross(position1 - position0, position2 - position0);
+		local_normal_length = length(local_normal);
+	}
+	if (!(local_normal_length > 1e-6f) || !isfinite(local_normal_length)) {
+		payload.radiance = 0.0f;
+		payload.flags = GI_RAY_MODE_PRIMARY;
+		return;
+	}
+	local_normal /= local_normal_length;
+	float3x4 world_to_object = WorldToObject3x4();
+	float3 world_normal = normalize(mul(local_normal, (float3x3)world_to_object));
+	if (dot(world_normal, WorldRayDirection()) > 0.0f) {
+		world_normal = -world_normal;
+	}
+
+	uint material_byte = material_index * 64u;
+	float4 base_color = asfloat(gi_materials.Load4(material_byte + 0u));
+	float3 emission_color = asfloat(gi_materials.Load3(material_byte + 16u));
+	float emission_energy = asfloat(gi_materials.Load(material_byte + 28u));
+	float metallic = saturate(asfloat(gi_materials.Load(material_byte + 32u)));
+	uint material_flags = gi_materials.Load(material_byte + 40u);
+	uint texture_group = gi_materials.Load(material_byte + 44u);
+	uint texture_layer = gi_materials.Load(material_byte + 36u);
+	float3 albedo = max(base_color.rgb, 0.0f);
+	if ((material_flags & GI_MATERIAL_HAS_ALBEDO_TEXTURE) != 0u && texture_group < 8u) {
+		float2 uv = uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z;
+		uv = uv * asfloat(gi_materials.Load2(material_byte + 48u)) + asfloat(gi_materials.Load2(material_byte + 56u));
+		albedo *= max(gi_sample_albedo_group(texture_group, texture_layer, uv), 0.0f);
+	}
+	float3 diffuse_reflectance = albedo * (1.0f - metallic);
+	float3 outgoing_radiance = max(emission_color, 0.0f) * max(emission_energy, 0.0f);
+
+	uint sun_index = gi_frame.sun_view_generation_sky_array.x;
+	uint full_layer_mask = gi_surfaces.Load(row_byte + 20u);
+	if (sun_index < GI_DIRECTIONAL_CAPACITY) {
+		GIDirectionalLight sun = gi_lights[sun_index];
+		float3 sun_direction = normalize(mul((float3x3)gi_frame.view_to_world, sun.direction));
+		float no_l = max(dot(world_normal, sun_direction), 0.0f);
+		float light_buffer_normalization = gi_frame.light_sky_parameters.x;
+		if (no_l > 0.0f && (full_layer_mask & sun.mask) != 0u
+				&& light_buffer_normalization > 0.0f && isfinite(light_buffer_normalization)) {
+			GIPathPayload shadow_payload;
+			shadow_payload.radiance = 0.0f;
+			shadow_payload.flags = GI_RAY_MODE_SUN_VISIBILITY;
+			float3 world_hit = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+			RayDesc shadow_ray;
+			shadow_ray.Origin = world_hit + world_normal * 0.001f;
+			shadow_ray.TMin = 0.001f;
+			shadow_ray.Direction = sun_direction;
+			shadow_ray.TMax = max(gi_frame.trace_parameters.x, 0.001f);
+			TraceRay(gi_scene_tlas, RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+					0x02, 0, 0, 1, shadow_ray, shadow_payload);
+			float visibility = saturate(shadow_payload.radiance.x);
+			float energy = max(sun.energy / light_buffer_normalization, 0.0f);
+			outgoing_radiance += diffuse_reflectance * max(sun.color, 0.0f) * energy * (no_l * GI_INV_PI) * visibility;
+		}
+	}
+
+	uint sky_seed = gi_hash(InstanceID() * 0x9e3779b9u ^ primitive * 0x85ebca6bu
+			^ asuint(attributes.barycentrics.x) ^ asuint(attributes.barycentrics.y));
+	outgoing_radiance += diffuse_reflectance * gi_sample_sky_diffuse(world_normal, sky_seed);
+	payload.radiance = gi_finite_nonnegative(outgoing_radiance);
+	payload.flags = GI_RAY_MODE_PRIMARY;
+}

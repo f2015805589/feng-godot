@@ -1,0 +1,157 @@
+RaytracingAccelerationStructure gi_scene_tlas : register(t0, space0);
+Texture2D<float> gi_depth : register(t1, space0);
+Texture2D<float4> gi_normal_roughness : register(t2, space0);
+Texture2D<float4> gi_albedo : register(t3, space0);
+Texture2D<float4> gi_orm : register(t4, space0);
+
+struct GIFrameData {
+	column_major float4x4 inverse_projection;
+	column_major float4x4 view_to_world;
+	float4 size_exposure;
+	float4 light_sky_parameters;
+	float4 world_to_sky_columns[3];
+	uint4 sun_view_generation_sky_array;
+	float4 trace_parameters;
+	uint4 generation_history_flags;
+};
+ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
+RWTexture2D<float4> gi_output : register(u21, space0);
+
+struct GIPathPayload {
+	float3 radiance;
+	uint flags;
+};
+
+static const uint GI_RAY_MODE_PRIMARY = 0u;
+static const uint GI_MATERIAL_MODEL_MASK = 0x0fu;
+static const uint GI_UNLIT_MATERIAL_MODEL = 0u;
+static const float GI_HALF_MAX = 65504.0f;
+
+uint gi_hash(uint value) {
+	value ^= value >> 16u;
+	value *= 0x7feb352du;
+	value ^= value >> 15u;
+	value *= 0x846ca68bu;
+	value ^= value >> 16u;
+	return value;
+}
+
+float gi_random(inout uint state) {
+	state = gi_hash(state);
+	return float(state) * (1.0f / 4294967296.0f);
+}
+
+float3 gi_finite_nonnegative(float3 value) {
+	return float3(
+			isfinite(value.x) ? max(value.x, 0.0f) : 0.0f,
+			isfinite(value.y) ? max(value.y, 0.0f) : 0.0f,
+			isfinite(value.z) ? max(value.z, 0.0f) : 0.0f);
+}
+
+uint2 gi_uv_to_texel(float2 uv, uint2 size) {
+	return min((uint2)floor(uv * float2(size)), size - 1u);
+}
+
+[shader("raygeneration")]
+void FengGIRayGen() {
+	uint output_width;
+	uint output_height;
+	gi_output.GetDimensions(output_width, output_height);
+	uint2 pixel = DispatchRaysIndex().xy;
+	if (pixel.x >= output_width || pixel.y >= output_height) {
+		return;
+	}
+	uint depth_width;
+	uint depth_height;
+	uint normal_width;
+	uint normal_height;
+	uint albedo_width;
+	uint albedo_height;
+	uint orm_width;
+	uint orm_height;
+	gi_depth.GetDimensions(depth_width, depth_height);
+	gi_normal_roughness.GetDimensions(normal_width, normal_height);
+	gi_albedo.GetDimensions(albedo_width, albedo_height);
+	gi_orm.GetDimensions(orm_width, orm_height);
+	uint2 output_size = uint2(output_width, output_height);
+	float2 uv = (float2(pixel) + 0.5f) / float2(output_size);
+	uint2 depth_pixel = gi_uv_to_texel(uv, uint2(depth_width, depth_height));
+	uint2 normal_pixel = gi_uv_to_texel(uv, uint2(normal_width, normal_height));
+	uint2 albedo_pixel = gi_uv_to_texel(uv, uint2(albedo_width, albedo_height));
+	uint2 orm_pixel = gi_uv_to_texel(uv, uint2(orm_width, orm_height));
+
+	float depth = gi_depth.Load(int3(depth_pixel, 0));
+	if (!(depth > 0.0f) || !isfinite(depth)) {
+		gi_output[pixel] = 0.0f;
+		return;
+	}
+	float4 orm = gi_orm.Load(int3(orm_pixel, 0));
+	uint material_model = (uint)round(saturate(orm.a) * 255.0f) & GI_MATERIAL_MODEL_MASK;
+	if (material_model == GI_UNLIT_MATERIAL_MODEL) {
+		gi_output[pixel] = 0.0f;
+		return;
+	}
+
+	float4 view_h = mul(gi_frame.inverse_projection, float4(uv * 2.0f - 1.0f, depth, 1.0f));
+	if (abs(view_h.w) < 1e-8f || !isfinite(view_h.w)) {
+		gi_output[pixel] = 0.0f;
+		return;
+	}
+	float3 view_position = view_h.xyz / view_h.w;
+	float3 world_position = mul(gi_frame.view_to_world, float4(view_position, 1.0f)).xyz;
+	float3 normal_view_encoded = gi_normal_roughness.Load(int3(normal_pixel, 0)).xyz * 2.0f - 1.0f;
+	float normal_length = length(normal_view_encoded);
+	if (!(normal_length > 1e-6f) || !isfinite(normal_length)) {
+		gi_output[pixel] = 0.0f;
+		return;
+	}
+	float3 normal_view = normal_view_encoded / normal_length;
+	float3 normal_world = normalize(mul((float3x3)gi_frame.view_to_world, normal_view));
+	float4 albedo = gi_albedo.Load(int3(albedo_pixel, 0));
+	float3 diffuse_reflectance = max(albedo.rgb, 0.0f)
+			* (1.0f - saturate(orm.b)) * saturate(orm.r);
+
+	float strength = gi_frame.trace_parameters.y;
+	float p0 = gi_frame.size_exposure.z;
+	float scene_normalization = gi_frame.size_exposure.w;
+	if (!(strength > 0.0f) || !(p0 > 0.0f) || !(scene_normalization > 0.0f)
+			|| !isfinite(strength) || !isfinite(p0) || !isfinite(scene_normalization)) {
+		gi_output[pixel] = 0.0f;
+		return;
+	}
+
+	uint sample_count = (uint)clamp(round(gi_frame.trace_parameters.z), 1.0f, 4.0f);
+	if (sample_count != 1u && sample_count != 2u && sample_count != 4u) {
+		sample_count = 1u;
+	}
+	uint seed = gi_hash(pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu
+			^ gi_frame.sun_view_generation_sky_array.z);
+	float max_distance = max(gi_frame.trace_parameters.x, 0.001f);
+	float3 incoming_radiance = 0.0f;
+	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
+		float u = (float(sample_index) + gi_random(seed)) / float(sample_count);
+		float v = gi_random(seed);
+		float radius = sqrt(u);
+		float angle = 6.28318530718f * v;
+		float3 local_direction = float3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0f, 1.0f - u)));
+		float3 helper = abs(normal_world.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+		float3 tangent = normalize(cross(helper, normal_world));
+		float3 bitangent = cross(normal_world, tangent);
+		float3 direction = normalize(tangent * local_direction.x + bitangent * local_direction.y
+				+ normal_world * local_direction.z);
+		GIPathPayload payload;
+		payload.radiance = 0.0f;
+		payload.flags = GI_RAY_MODE_PRIMARY;
+		RayDesc ray;
+		ray.Origin = world_position + normal_world * 0.001f;
+		ray.TMin = 0.001f;
+		ray.Direction = direction;
+		ray.TMax = max_distance;
+		TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, ray, payload);
+		incoming_radiance += gi_finite_nonnegative(payload.radiance);
+	}
+
+	float3 result = diffuse_reflectance * (incoming_radiance / float(sample_count));
+	result = min(gi_finite_nonnegative(result) * p0 * scene_normalization * strength, GI_HALF_MAX);
+	gi_output[pixel] = float4(result, saturate(strength));
+}

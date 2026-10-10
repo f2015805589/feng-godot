@@ -637,6 +637,16 @@ public:
 	struct ShaderStageSPIRVData {
 		ShaderStage shader_stage = SHADER_STAGE_MAX;
 		Vector<uint8_t> spirv;
+		// Optional platform-native shader source paired with portable SPIR-V.
+		// Backends that do not require a native sidecar ignore these fields.
+		String native_hlsl_source;
+		String native_hlsl_export;
+		// DXC shader model requested by the native HLSL sidecar (for example 63 or 65).
+		// Portable SPIR-V backends ignore this native-only value.
+		int32_t native_hlsl_shader_model = 63;
+		// Explicit DXR program limits. These are declarations, not reflected sizes.
+		int32_t native_hlsl_max_payload_size_bytes = -1;
+		int32_t native_hlsl_max_attribute_size_bytes = -1;
 		Vector<uint64_t> dynamic_buffers;
 	};
 

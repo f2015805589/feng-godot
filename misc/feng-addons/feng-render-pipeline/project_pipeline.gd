@@ -24,6 +24,7 @@ extends Node
 ## tree is the editor plugin's job, so exactly one installer runs per tree.
 
 const CompositorScript = preload("compositor.gd")
+const SnapshotWorlds = preload("passes/snapshot_worlds.gd")
 
 ## Project setting that names the pipeline: a FengCompositor resource, or a bare
 ## FengRenderer, which is wrapped in a FengCompositor on the fly. It sits in the renderer
@@ -54,6 +55,7 @@ func _ready() -> void:
 	# modified from inside another node's tree notification.
 	get_tree().node_added.connect(_on_node_added)
 	get_tree().node_removed.connect(_on_node_removed)
+	SnapshotWorlds.scan(get_tree().root, self)
 	_sync()
 
 
@@ -65,16 +67,21 @@ func _exit_tree() -> void:
 			get_tree().node_added.disconnect(_on_node_added)
 		if get_tree().node_removed.is_connected(_on_node_removed):
 			get_tree().node_removed.disconnect(_on_node_removed)
+	SnapshotWorlds.unregister_owner(self)
 	clear(_installed)
 	_installed = null
 
 
 func _on_node_added(p_node) -> void:
+	if p_node is Viewport:
+		SnapshotWorlds.register_viewport(p_node, self)
 	if p_node is WorldEnvironment:
 		_sync.call_deferred()
 
 
 func _on_node_removed(p_node) -> void:
+	if is_instance_valid(p_node) and p_node is Viewport:
+		SnapshotWorlds.unregister_viewport(p_node, self)
 	if is_instance_valid(p_node) and p_node is WorldEnvironment:
 		_sync.call_deferred()
 

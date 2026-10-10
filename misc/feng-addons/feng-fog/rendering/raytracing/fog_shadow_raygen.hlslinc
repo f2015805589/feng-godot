@@ -1,0 +1,33 @@
+#define FENG_FOG_RAY_ABI __FENG_FOG_RAY_ABI__
+
+RaytracingAccelerationStructure fog_scene_tlas : register(t0, space0);
+ByteAddressBuffer fog_ray_inputs : register(t1, space0);
+RWByteAddressBuffer fog_visibility : register(u2, space0);
+
+struct FogShadowPayload {
+	uint visibility;
+};
+
+[shader("raygeneration")]
+void FengFogRayGen() {
+	uint ray_index = DispatchRaysIndex().x;
+	uint input_offset = ray_index * 48u;
+	float4 origin_min_t = asfloat(fog_ray_inputs.Load4(input_offset));
+	float4 direction_max_t = asfloat(fog_ray_inputs.Load4(input_offset + 16u));
+	uint4 cone_words = fog_ray_inputs.Load4(input_offset + 32u);
+	FogShadowPayload payload;
+	payload.visibility = 1u;
+#if FENG_FOG_RAY_ABI == 2
+	if (asfloat(cone_words.w) < 0.5f || cone_words.z == 0u) {
+		fog_visibility.Store(ray_index * 4u, 1u);
+		return;
+	}
+#endif
+	RayDesc ray;
+	ray.Origin = origin_min_t.xyz;
+	ray.TMin = origin_min_t.w;
+	ray.Direction = direction_max_t.xyz;
+	ray.TMax = direction_max_t.w;
+	TraceRay(fog_scene_tlas, 0u, 0xff, 0, 0, 0, ray, payload);
+	fog_visibility.Store(ray_index * 4u, payload.visibility);
+}

@@ -7,6 +7,7 @@ extends FengRuntimeSnapshotPass
 ## per-frame work only refreshes the camera and live-lighting uniform buffer.
 
 const MAGIC_GI_OUTPUT: StringName = &"magic_gi"
+const IndirectGISelection = preload("../pipeline/indirect_gi_selection.gd")
 const UBO_BINDING := 9
 const UBO_SIZE := 448 # Three mat4, two vec4, and separate secondary/sky SH vec4 arrays.
 const MAX_CACHED_BAKES := 8
@@ -23,7 +24,19 @@ var _replacement_request_prepared := false
 var _frame_replacement_enabled := false
 var _replacement_bridge_warning_shown := false
 
+func get_indirect_gi_kind() -> StringName:
+	return IndirectGISelection.KIND_MAGIC
+
 func _frp_execute(ctx: FRPPassContext) -> void:
+	if not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
+			IndirectGISelection.KIND_MAGIC, true):
+		# An active RTGI plan owns the diffuse-indirect slot, even if its scene or
+		# backend is unsupported this frame. Leave native SkyDiffuse untouched and
+		# clear this pass's old sidecar so no later consumer can reuse stale GI.
+		_replacement_request_prepared = false
+		_frame_replacement_enabled = false
+		_clear_magic_gi_output(ctx)
+		return
 	_frame_replacement_enabled = false
 	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
 	_scene_exposure_normalization = _get_scene_exposure_normalization(ctx)
@@ -45,7 +58,8 @@ func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 ## the exact SkyLight diffuse attachment only when a current v4 bake can replace it.
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	_replacement_request_prepared = false
-	if ctx == null:
+	if ctx == null or not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
+			IndirectGISelection.KIND_MAGIC, true):
 		return
 	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	var snapshot := _snapshot_for_target(buffers)
@@ -55,6 +69,21 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 		return
 	ctx.request_sky_light_diffuse()
 	_replacement_request_prepared = true
+
+func _clear_magic_gi_output(ctx: FRPPassContext) -> void:
+	if ctx == null:
+		return
+	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+	var rd := RenderingServer.get_rendering_device()
+	if buffers == null or rd == null or inputs.size() <= 5:
+		return
+	var declaration: TextureInput = inputs[5]
+	if declaration == null:
+		return
+	for view in buffers.get_view_count():
+		var output := declaration.get_texture(buffers, view)
+		if output.is_valid():
+			rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 
 func _replacement_requested(snapshot: Dictionary, pass_strength := 1.0) -> bool:
 	return bool(snapshot.get("replacement_enabled", false)) \

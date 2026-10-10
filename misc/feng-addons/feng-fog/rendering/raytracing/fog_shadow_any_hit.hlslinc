@@ -1,0 +1,149 @@
+#define FENG_FOG_RAY_ABI __FENG_FOG_RAY_ABI__
+
+ByteAddressBuffer fog_ray_inputs : register(t10, space0);
+ByteAddressBuffer fog_triangle_data : register(t3, space0);
+ByteAddressBuffer fog_surface_data : register(t4, space0);
+ByteAddressBuffer fog_instance_data : register(t5, space0);
+ByteAddressBuffer fog_material_ids : register(t6, space0);
+ByteAddressBuffer fog_material_params : register(t7, space0);
+ByteAddressBuffer fog_alpha_texture_meta : register(t8, space0);
+ByteAddressBuffer fog_alpha_texture_words : register(t9, space0);
+
+struct FogShadowPayload {
+	uint visibility;
+};
+
+float fog_shadow_hash_2d(float2 position) {
+	return frac(1.0e4f * sin(17.0f * position.x + 0.1f * position.y)
+			* (0.1f + abs(sin(13.0f * position.y + position.x))));
+}
+
+float fog_shadow_hash_3d(float3 position) {
+	return fog_shadow_hash_2d(float2(fog_shadow_hash_2d(position.xy), position.z));
+}
+
+float fog_shadow_alpha_hash_threshold(float3 object_position, float hash_scale, float footprint) {
+	float pixel_scale = 1.0f / (max(hash_scale, 1e-6f) * max(footprint, 1e-6f));
+	float log_pixel_scale = log2(max(pixel_scale, 1e-6f));
+	float2 pixel_scales = float2(exp2(floor(log_pixel_scale)), exp2(ceil(log_pixel_scale)));
+	float2 thresholds = float2(
+			fog_shadow_hash_3d(floor(pixel_scales.x * object_position)),
+			fog_shadow_hash_3d(floor(pixel_scales.y * object_position)));
+	float lerp_factor = frac(log_pixel_scale);
+	float interpolated = lerp(thresholds.x, thresholds.y, lerp_factor);
+	float minimum_lerp = min(lerp_factor, 1.0f - lerp_factor);
+	float safe_lerp = max(minimum_lerp, 1e-6f);
+	float safe_complement = max(1.0f - minimum_lerp, 1e-6f);
+	float3 cases = float3(
+			interpolated * interpolated / (2.0f * safe_lerp * safe_complement),
+			(interpolated - 0.5f * minimum_lerp) / safe_complement,
+			1.0f - ((1.0f - interpolated) * (1.0f - interpolated) / (2.0f * safe_lerp * safe_complement)));
+	float threshold = interpolated < (1.0f - minimum_lerp)
+			? (interpolated < minimum_lerp ? cases.x : cases.y)
+			: cases.z;
+	return clamp(threshold, 1e-5f, 1.0f);
+}
+
+int fog_shadow_wrap_index(int coordinate, int size, bool repeat) {
+	if (repeat) {
+		int wrapped = coordinate % size;
+		return wrapped < 0 ? wrapped + size : wrapped;
+	}
+	return clamp(coordinate, 0, size - 1);
+}
+
+float fog_shadow_fetch_alpha(uint texture_index, int2 coordinate, bool repeat) {
+	uint4 meta = fog_alpha_texture_meta.Load4(texture_index * 16u);
+	int width = int(meta.x);
+	int height = int(meta.y);
+	int x = fog_shadow_wrap_index(coordinate.x, width, repeat);
+	int y = fog_shadow_wrap_index(coordinate.y, height, repeat);
+	uint texel_index = uint(y * width + x);
+	uint word = fog_alpha_texture_words.Load((meta.z + texel_index / 4u) * 4u);
+	uint alpha = (word >> ((texel_index & 3u) * 8u)) & 255u;
+	return float(alpha) * (1.0f / 255.0f);
+}
+
+float fog_shadow_sample_alpha(uint texture_index, float2 uv, bool repeat, bool nearest) {
+	uint4 meta = fog_alpha_texture_meta.Load4(texture_index * 16u);
+	float2 pixel_position = uv * float2(meta.xy) - 0.5f;
+	int2 pixel_base = int2(floor(pixel_position));
+	if (nearest) {
+		return fog_shadow_fetch_alpha(texture_index, int2(floor(pixel_position + 0.5f)), repeat);
+	}
+	float2 weight = frac(pixel_position);
+	float a00 = fog_shadow_fetch_alpha(texture_index, pixel_base, repeat);
+	float a10 = fog_shadow_fetch_alpha(texture_index, pixel_base + int2(1, 0), repeat);
+	float a01 = fog_shadow_fetch_alpha(texture_index, pixel_base + int2(0, 1), repeat);
+	float a11 = fog_shadow_fetch_alpha(texture_index, pixel_base + int2(1, 1), repeat);
+	return lerp(lerp(a00, a10, weight.x), lerp(a01, a11, weight.x), weight.y);
+}
+
+[shader("anyhit")]
+void FengFogAnyHit(inout FogShadowPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
+	uint custom_index = InstanceID();
+	uint4 instance = fog_instance_data.Load4(custom_index * 16u);
+	uint ray_index = DispatchRaysIndex().x;
+	uint ray_offset = ray_index * 48u;
+	uint4 ray_cone_words = fog_ray_inputs.Load4(ray_offset + 32u);
+#if FENG_FOG_RAY_ABI == 2
+	uint light_mask = ray_cone_words.z;
+	if (light_mask == 0u || (instance.w & light_mask) == 0u) {
+		IgnoreHit();
+		return;
+	}
+#endif
+	uint geometry_index = GeometryIndex();
+	if (geometry_index >= instance.z) {
+		payload.visibility = 0u;
+		AcceptHitAndEndSearch();
+		return;
+	}
+	uint4 ids = fog_material_ids.Load4((instance.x + geometry_index) * 16u);
+	float4 params0 = asfloat(fog_material_params.Load4((instance.x + geometry_index) * 32u));
+	float4 params1 = asfloat(fog_material_params.Load4((instance.x + geometry_index) * 32u + 16u));
+	uint mode = ids.x;
+	if (mode == 0u) {
+		payload.visibility = 0u;
+		AcceptHitAndEndSearch();
+		return;
+	}
+	uint4 surface = fog_surface_data.Load4((instance.y + geometry_index) * 16u);
+	uint triangle_offset = surface.x + PrimitiveIndex() * 3u;
+	float3 barycentric = float3(1.0f - attributes.barycentrics.x - attributes.barycentrics.y,
+			attributes.barycentrics.x, attributes.barycentrics.y);
+	float4 vertex0 = asfloat(fog_triangle_data.Load4(triangle_offset * 16u));
+	float4 vertex1 = asfloat(fog_triangle_data.Load4((triangle_offset + 1u) * 16u));
+	float4 vertex2 = asfloat(fog_triangle_data.Load4((triangle_offset + 2u) * 16u));
+	float vertex_alpha = (ids.z & 1u) != 0u
+			? dot(float3(vertex0.z, vertex1.z, vertex2.z), barycentric) : 1.0f;
+	float alpha = params0.x * vertex_alpha;
+	if (ids.y > 0u) {
+		float2 uv = vertex0.xy * barycentric.x + vertex1.xy * barycentric.y + vertex2.xy * barycentric.z;
+		uv = uv * params1.xy + params1.zw;
+		int filter_mode = int(params0.w);
+		bool nearest = filter_mode == 0 || filter_mode == 2 || filter_mode == 4;
+		alpha *= fog_shadow_sample_alpha(ids.y - 1u, uv, ids.w != 0u, nearest);
+	}
+	float threshold = params0.y;
+	if (mode == 2u) {
+		float hit_distance = RayTCurrent();
+		float3 world_position = WorldRayOrigin() + hit_distance * WorldRayDirection();
+		float3x4 world_to_object = WorldToObject3x4();
+		float3 object_position = mul(world_to_object, float4(world_position, 1.0f));
+		float3 basis_x = float3(world_to_object[0][0], world_to_object[1][0], world_to_object[2][0]);
+		float3 basis_y = float3(world_to_object[0][1], world_to_object[1][1], world_to_object[2][1]);
+		float3 basis_z = float3(world_to_object[0][2], world_to_object[1][2], world_to_object[2][2]);
+		float inverse_scale = max(length(basis_x), max(length(basis_y), length(basis_z)));
+		float cone_radius = asfloat(ray_cone_words.x);
+		float cone_growth = asfloat(ray_cone_words.y);
+		float hit_footprint = max(2.0f * (cone_radius + hit_distance * cone_growth) * inverse_scale, 1e-6f);
+		threshold = fog_shadow_alpha_hash_threshold(object_position, params0.z, hit_footprint);
+	}
+	if (alpha < threshold) {
+		IgnoreHit();
+		return;
+	}
+	payload.visibility = 0u;
+	AcceptHitAndEndSearch();
+}
