@@ -69,7 +69,15 @@ func make_test_bake() -> Resource:
 	data.terrain_reflectance = _volume.terrain_reflectance
 	data.material_reflectance = _volume.fallback_material_reflectance
 	data.positions = _volume.probe_positions.duplicate()
+	data.surface_positions = _volume.probe_surface_positions.duplicate()
 	data.normals = _volume.probe_normals.duplicate()
+	data.visibility_moments.resize(data.positions.size() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
+	for probe in data.positions.size():
+		for texel in Data.VISIBILITY_TEXELS_PER_PROBE:
+			var moment_base: int = (probe * Data.VISIBILITY_TEXELS_PER_PROBE + texel) * Data.VISIBILITY_MOMENT_CHANNELS
+			data.visibility_moments[moment_base] = data.bake_distance
+			data.visibility_moments[moment_base + 1] = data.bake_distance * data.bake_distance
 	data.transfer.resize(data.positions.size() * 27)
 	data.transfer.fill(0.0)
 	data.primary_sky_visibility.resize(data.positions.size() * 9)
@@ -85,6 +93,14 @@ func make_test_bake() -> Resource:
 	if not data.build_cell_indices():
 		return null
 	return data
+
+func fill_visibility_moments(data: Resource, mean: float, second_moment: float) -> void:
+	for probe in data.probe_count():
+		for texel in Data.VISIBILITY_TEXELS_PER_PROBE:
+			var moment_base: int = (probe * Data.VISIBILITY_TEXELS_PER_PROBE + texel) \
+					* Data.VISIBILITY_MOMENT_CHANNELS
+			data.visibility_moments[moment_base] = mean
+			data.visibility_moments[moment_base + 1] = second_moment
 
 func frame_for(mode: int) -> Image:
 	_debug_pass.set("buffer", mode)
@@ -205,12 +221,12 @@ func run() -> void:
 		return
 
 	var data := make_test_bake()
-	if not check(data != null and data.is_valid(), "synthetic v4 surface transfer fixture failed validation"):
+	if not check(data != null and data.is_valid(), "synthetic v5 surface transfer fixture failed validation"):
 		return
 	_volume.bake_data = data
 	_volume.refresh_surface_points()
 	data.scene_signature = Baker.signature_for_geometry(_volume._current_scene_signature)
-	if not check(_volume.has_bake(), "volume rejected the v4 surface bake layout or scene signature"):
+	if not check(_volume.has_bake(), "volume rejected the v5 surface bake layout or scene signature"):
 		return
 	Runtime.publish(_volume)
 	await settle(16)
@@ -225,6 +241,24 @@ func run() -> void:
 	var gi_pixel := center(gi_on)
 	print("Synthetic PRT GI pixel: ", gi_pixel, " probes=", data.probe_count())
 	if not check(max_channel(gi_pixel) > 0.08, "GPU Magic GI pass produced no indirect contribution at the floor center"):
+		return
+	var unoccluded_moments: PackedFloat32Array = data.visibility_moments.duplicate()
+	fill_visibility_moments(data, 0.0, 0.0)
+	data.bake_version += 1
+	Runtime.publish(_volume)
+	await settle(8)
+	var fully_blocked_pixel := center(await image())
+	fill_visibility_moments(data, data.bake_distance, data.bake_distance * data.bake_distance)
+	data.visibility_moments = unoccluded_moments
+	data.bake_version += 1
+	Runtime.publish(_volume)
+	await settle(8)
+	var unoccluded_recovered_pixel := center(await image())
+	print("Directional visibility GPU check: open=", gi_pixel,
+		" all_blocked=", fully_blocked_pixel, " restored=", unoccluded_recovered_pixel)
+	if not check(max_channel(fully_blocked_pixel) < max_channel(gi_pixel) * 0.15
+			and color_delta(unoccluded_recovered_pixel, gi_pixel) < 0.01,
+			"fully blocked candidate mass stays dark and open-direction energy recovers without renormalization loss"):
 		return
 
 	# Changing a light colour updates the live SH coefficients without rebuilding or
@@ -241,17 +275,25 @@ func run() -> void:
 		return
 
 	# Without a ready FengSkyLight, WorldEnvironment Sky remains display/fog input
-	# only and must not silently become Magic GI illumination.
+	# only and must not silently become Magic GI illumination. Keep a separate
+	# directional light visible so this comparison has a non-black GI baseline.
 	_volume.sun = null
-	_light.visible = false
+	_light.visible = true
+	await settle(12)
 	var sky_blue := center(await image())
 	sky_material.sky_top_color = Color(1.0, 0.05, 0.02)
 	await settle(24)
 	var sky_red := center(await image())
 	print("No-provider Environment Sky GI pixel: ", sky_blue, " -> ", sky_red)
-	if not check(color_delta(sky_red, sky_blue) < 0.02,
+	if not check(max_channel(sky_blue) > 0.08 and max_channel(sky_red) > 0.08
+			and color_delta(sky_red, sky_blue) < 0.02,
 			"changing WorldEnvironment Sky implicitly changed Magic GI without a SkyLight provider"):
 		return
+	# Restore the explicit sun before checking camera stability and the live GI debug
+	# channel. The no-provider assertion above intentionally removed every GI source.
+	_volume.sun = _light
+	_light.visible = true
+	await settle(12)
 
 	# At the center the ray remains aimed at the same floor point while the camera
 	# translates and rotates. This catches a projection inverse being mistaken for a
@@ -262,7 +304,8 @@ func run() -> void:
 	await settle(10)
 	var camera_moved := center(await image())
 	print("Camera motion GI pixel: ", camera_reference, " -> ", camera_moved)
-	if not check(color_delta(camera_moved, camera_reference) < 0.12,
+	if not check(max_channel(camera_reference) > 0.08 and max_channel(camera_moved) > 0.08
+			and color_delta(camera_moved, camera_reference) < 0.12,
 			"moving/rotating the camera changed the center GI contribution or detached it from the world surface"):
 		return
 
@@ -284,6 +327,9 @@ func run() -> void:
 		return
 	if not check(debug_pixels[2].r > debug_pixels[3].r and debug_pixels[4].r > 0.02,
 			"AO, roughness and metallic debug channels are not independently readable"):
+		return
+	if not check(absf(debug_pixels[5].r - 0.5) < 0.01 and absf(debug_pixels[5].g - 0.5) < 0.01,
+			"stationary camera produced nonzero motion vectors"):
 		return
 	_debug_pass.set("buffer", 5)
 	await settle(10)
@@ -346,7 +392,7 @@ func run() -> void:
 		return
 
 	# Consume a bake produced by the CPU baker through the real D3D12 pass as well.
-	# This also exercises cache replacement (synthetic fixture -> persisted PRT v4)
+	# This also exercises cache replacement (synthetic fixture -> persisted PRT v5)
 	# before the process exits and releases the pass-owned GPU resources.
 	var red_wall := MeshInstance3D.new()
 	var wall_mesh := BoxMesh.new()
@@ -379,7 +425,7 @@ func run() -> void:
 	_volume.refresh_surface_points()
 	await settle(4)
 	var real_bake_succeeded: bool = await _volume.bake()
-	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v4 resource for the GPU pass"):
+	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v5 resource for the GPU pass"):
 		return
 	var actual_data: Resource = _volume.bake_data
 	var actual_transfer_energy := 0.0

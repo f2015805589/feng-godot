@@ -1,20 +1,24 @@
 @tool
 class_name FMagicGIData
 extends Resource
-## Immutable v4 surface PRT transport. Primary sky visibility stays separate
+## Immutable v5 surface PRT transport. Primary sky visibility stays separate
 ## from secondary transport so a current SkyLight can be replaced without
 ## baking its radiance into the geometry response.
 
-const FORMAT_VERSION := 4
+const FORMAT_VERSION := 5
+const PRIMARY_SKY_FORMAT_VERSION := 4
 const EMITTER_FORMAT_VERSION := 3
 const LEGACY_FORMAT_VERSION := 2
-const SAMPLER_REVISION := 2
+const SAMPLER_REVISION := 3
 const MAX_GRID_AXIS := 64
 const MAX_EMITTERS := 32
 const ATLAS_COLUMNS := 32
 const TRANSFER_TEXELS_PER_POINT := 7
 const PRIMARY_SKY_TEXELS_PER_POINT := 3
-const GEOMETRY_TEXELS_PER_POINT := 2
+const GEOMETRY_TEXELS_PER_POINT := 3
+const VISIBILITY_TILE_SIZE := 8
+const VISIBILITY_MOMENT_CHANNELS := 2
+const VISIBILITY_TEXELS_PER_PROBE := VISIBILITY_TILE_SIZE * VISIBILITY_TILE_SIZE
 const CELL_CAPACITY := 8
 const CELL_BOUNDARY_EPSILON := 0.00001
 const SH_Y00 := 0.2820947918
@@ -37,11 +41,15 @@ const RUNTIME_ATLAS_FILTER_EPSILON := 0.00001
 @export_storage var material_reflectance := 0.0
 @export_storage var scene_signature := 0
 @export_storage var positions := PackedVector3Array()
+## Exact world-space surface anchors; positions stores the actual sample centers.
+@export_storage var surface_positions := PackedVector3Array()
 @export_storage var normals := PackedVector3Array()
 @export_storage var transfer := PackedFloat32Array()
 ## Probe-major SH9 coefficients for the first-ray sky visibility/irradiance.
-## These are independent of radiance and are populated only in v4 bakes.
+## These are independent of radiance and have been present since v4 bakes.
 @export_storage var primary_sky_visibility := PackedFloat32Array()
+## Probe-major 8x8 octahedral first and second radial hit-distance moments.
+@export_storage var visibility_moments := PackedFloat32Array()
 ## Stable root-relative NodePath + surface-index bindings, in transport order.
 @export_storage var emitter_keys := PackedStringArray()
 ## Static texture/UV/geometry mapping fingerprints; live emission values are excluded.
@@ -93,6 +101,7 @@ func emitter_count() -> int:
 func supports_format() -> bool:
 	return format_version == LEGACY_FORMAT_VERSION \
 		or format_version == EMITTER_FORMAT_VERSION \
+		or format_version == PRIMARY_SKY_FORMAT_VERSION \
 		or format_version == FORMAT_VERSION
 
 ## Full validation is O(points + grid cells). Volumes cache the result by
@@ -122,7 +131,7 @@ func is_valid() -> bool:
 		for value in emitter_transport:
 			if not is_finite(value) or value < 0.0:
 				return false
-		if format_version == FORMAT_VERSION:
+		if format_version >= PRIMARY_SKY_FORMAT_VERSION:
 			if primary_sky_visibility.size() != probe_count() * 9:
 				return false
 			for value in primary_sky_visibility:
@@ -130,6 +139,27 @@ func is_valid() -> bool:
 					return false
 		elif not primary_sky_visibility.is_empty():
 			return false
+	if format_version == FORMAT_VERSION:
+		if surface_positions.size() != probe_count() \
+				or visibility_moments.size() != probe_count() * VISIBILITY_TEXELS_PER_PROBE * VISIBILITY_MOMENT_CHANNELS:
+			return false
+		for i in probe_count():
+			if not surface_positions[i].is_finite():
+				return false
+		for value in visibility_moments:
+			if not is_finite(value) or value < 0.0:
+				return false
+		for probe in probe_count():
+			for texel in VISIBILITY_TEXELS_PER_PROBE:
+				var base := (probe * VISIBILITY_TEXELS_PER_PROBE + texel) * VISIBILITY_MOMENT_CHANNELS
+				var mean := visibility_moments[base]
+				var second_moment := visibility_moments[base + 1]
+				if mean > bake_distance + 0.001 \
+						or second_moment > bake_distance * bake_distance + 0.01 \
+						or second_moment + maxf(0.0001, mean * mean * 0.0001) < mean * mean:
+					return false
+	elif not surface_positions.is_empty() or not visibility_moments.is_empty():
+		return false
 	if grid_dims.x <= 0 or grid_dims.y <= 0 or grid_dims.z <= 0:
 		return false
 	if grid_dims.x > MAX_GRID_AXIS or grid_dims.y > MAX_GRID_AXIS or grid_dims.z > MAX_GRID_AXIS:
@@ -185,7 +215,7 @@ func matches_layout(
 		distance: float,
 		terrain_albedo: float,
 		fallback_albedo: float) -> bool:
-	return supports_format() \
+	return format_version == FORMAT_VERSION \
 		and volume_size.is_equal_approx(size) \
 		and is_equal_approx(spacing, probe_spacing) \
 		and is_equal_approx(surface_offset, probe_offset) \
@@ -218,7 +248,8 @@ func build_cell_indices() -> bool:
 	cell_counts.resize(grid_dims.x * grid_dims.y * grid_dims.z)
 	cell_counts.fill(0)
 	for i in probe_count():
-		var surface := positions[i] - normals[i] * surface_offset
+		var surface := surface_positions[i] if format_version == FORMAT_VERSION \
+				else positions[i] - normals[i] * surface_offset
 		var grid := world_to_grid * surface
 		var cell_coord := cell_coordinates(grid, grid_dims)
 		if cell_coord.x < 0:
@@ -241,7 +272,7 @@ func evaluate(index: int, lighting: PackedFloat32Array,
 	for k in 9:
 		for channel in 3:
 			result[channel] += transfer[index * 27 + k * 3 + channel] * lighting[k * 3 + channel]
-	if format_version == FORMAT_VERSION and primary_sky_visibility.size() == probe_count() * 9 \
+	if format_version >= PRIMARY_SKY_FORMAT_VERSION and primary_sky_visibility.size() == probe_count() * 9 \
 			and sky_lighting.size() == 27:
 		for k in 9:
 			for channel in 3:
@@ -263,6 +294,88 @@ func transport_preview_color(index: int) -> Color:
 	var value := transport_response(index, Vector3.UP).max(Vector3.ZERO)
 	return Color(value.x, value.y, value.z, 1.0)
 
+static func octahedral_encode(direction: Vector3) -> Vector2:
+	var unit := direction.normalized()
+	var denominator := absf(unit.x) + absf(unit.y) + absf(unit.z)
+	if denominator <= 0.000001:
+		return Vector2(0.5, 0.5)
+	var p := Vector2(unit.x, unit.y) / denominator
+	if unit.z < 0.0:
+		p = Vector2((1.0 - absf(p.y)) * _sign_not_zero(p.x),
+				(1.0 - absf(p.x)) * _sign_not_zero(p.y))
+	return p * 0.5 + Vector2(0.5, 0.5)
+
+static func octahedral_decode(uv: Vector2) -> Vector3:
+	var p := uv * 2.0 - Vector2.ONE
+	var direction := Vector3(p.x, p.y, 1.0 - absf(p.x) - absf(p.y))
+	if direction.z < 0.0:
+		var original_x := direction.x
+		direction.x = (1.0 - absf(direction.y)) * _sign_not_zero(original_x)
+		direction.y = (1.0 - absf(original_x)) * _sign_not_zero(direction.y)
+	return direction.normalized()
+
+static func _sign_not_zero(value: float) -> float:
+	return -1.0 if value < 0.0 else 1.0
+
+static func fold_visibility_texel(texel: Vector2i) -> Vector2i:
+	var size := VISIBILITY_TILE_SIZE
+	var folded := texel
+	# Bilinear filtering can request only the immediate one-texel border. Mirror
+	# the integer octahedral edge and flip the orthogonal axis at each fold. This
+	# keeps the CPU sampler identical to the shader without decoding out-of-range
+	# oct coordinates, whose extension is not the defined octahedral map.
+	for _iteration in 4:
+		if folded.x < 0:
+			folded = Vector2i(-folded.x - 1, size - 1 - folded.y)
+		elif folded.x >= size:
+			folded = Vector2i(size * 2 - 1 - folded.x, size - 1 - folded.y)
+		if folded.y < 0:
+			folded = Vector2i(size - 1 - folded.x, -folded.y - 1)
+		elif folded.y >= size:
+			folded = Vector2i(size - 1 - folded.x, size * 2 - 1 - folded.y)
+		if folded.x >= 0 and folded.x < size and folded.y >= 0 and folded.y < size:
+			return folded
+	return folded.clamp(Vector2i.ZERO, Vector2i.ONE * (size - 1))
+
+func sample_visibility_moments(probe: int, direction: Vector3) -> Vector2:
+	if format_version != FORMAT_VERSION or probe < 0 or probe >= probe_count() \
+			or visibility_moments.size() != probe_count() * VISIBILITY_TEXELS_PER_PROBE * VISIBILITY_MOMENT_CHANNELS \
+			or direction.length_squared() < 0.000001:
+		return Vector2.ZERO
+	var texel_position := octahedral_encode(direction) * float(VISIBILITY_TILE_SIZE) - Vector2(0.5, 0.5)
+	var texel_base := Vector2i(floori(texel_position.x), floori(texel_position.y))
+	var fraction := texel_position - Vector2(texel_base)
+	var result := Vector2.ZERO
+	for dy in 2:
+		for dx in 2:
+			var weight := (fraction.x if dx == 1 else 1.0 - fraction.x) \
+					* (fraction.y if dy == 1 else 1.0 - fraction.y)
+			var folded := fold_visibility_texel(texel_base + Vector2i(dx, dy))
+			var base := (probe * VISIBILITY_TEXELS_PER_PROBE \
+					+ folded.y * VISIBILITY_TILE_SIZE + folded.x) * VISIBILITY_MOMENT_CHANNELS
+			result += Vector2(visibility_moments[base], visibility_moments[base + 1]) * weight
+	return result
+
+static func one_sided_chebyshev_bound(mean: float, second_moment: float, distance: float,
+		variance_floor: float) -> float:
+	if not is_finite(mean) or not is_finite(second_moment) or not is_finite(distance) \
+			or not is_finite(variance_floor) or mean < 0.0 or second_moment < 0.0 or distance < 0.0:
+		return 0.0
+	var safe_mean := maxf(mean, 0.0)
+	var delta := distance - safe_mean
+	if delta <= 0.0:
+		return 1.0
+	var variance := maxf(second_moment - safe_mean * safe_mean, maxf(variance_floor, 0.0))
+	var delta_squared := delta * delta
+	var denominator := variance + delta_squared
+	return clampf(variance / denominator, 0.0, 1.0) if denominator > 0.0 else 0.0
+
+## The runtime squares the one-sided bound to reduce the remaining light leak.
+static func chebyshev_visibility(mean: float, second_moment: float, distance: float,
+		variance_floor: float) -> float:
+	var bound := one_sided_chebyshev_bound(mean, second_moment, distance, variance_floor)
+	return bound * bound
+
 func make_atlas_image() -> Image:
 	return _make_atlas_image(false)
 
@@ -277,20 +390,23 @@ func make_runtime_atlas_image() -> Image:
 ## Validates a saved bake once and creates all immutable textures/bytes needed by
 ## the renderer. The public individual packers retain their own validation.
 func make_render_upload() -> Dictionary:
-	if not is_valid():
+	if format_version != FORMAT_VERSION or not is_valid():
 		return {}
 	var transfer_image := _pack_atlas_image(true)
 	var primary_sky_image := _pack_primary_sky_image()
 	var geometry_image := _pack_geometry_image()
+	var visibility_moment_image := _pack_visibility_moment_image()
 	var index_bytes := cell_indices.to_byte_array()
 	var emission_image := make_emission_atlas_image(PackedFloat32Array())
-	if transfer_image == null or primary_sky_image == null or geometry_image == null or index_bytes.is_empty() \
+	if transfer_image == null or primary_sky_image == null or geometry_image == null \
+			or visibility_moment_image == null or index_bytes.is_empty() \
 			or emission_image == null:
 		return {}
 	return {
 		"transfer_image": transfer_image,
 		"primary_sky_image": primary_sky_image,
 		"geometry_image": geometry_image,
+		"visibility_moment_image": visibility_moment_image,
 		"index_bytes": index_bytes,
 		"emission_image": emission_image
 	}
@@ -372,7 +488,7 @@ func _pack_atlas_image(regularize_transport: bool) -> Image:
 func _pack_primary_sky_image() -> Image:
 	var image := Image.create_empty(ATLAS_COLUMNS * PRIMARY_SKY_TEXELS_PER_POINT,
 			ceili(float(probe_count()) / ATLAS_COLUMNS), false, Image.FORMAT_RGBAF)
-	if format_version != FORMAT_VERSION:
+	if format_version < PRIMARY_SKY_FORMAT_VERSION:
 		return image
 	for probe in probe_count():
 		var x0 := (probe % ATLAS_COLUMNS) * PRIMARY_SKY_TEXELS_PER_POINT
@@ -412,7 +528,7 @@ func _runtime_high_band_scale(probe: int) -> Vector3:
 	return scale
 
 func make_geometry_image() -> Image:
-	if not is_valid():
+	if format_version != FORMAT_VERSION or not is_valid():
 		return null
 	return _pack_geometry_image()
 
@@ -422,10 +538,32 @@ func _pack_geometry_image() -> Image:
 	for p in probe_count():
 		var x := (p % ATLAS_COLUMNS) * GEOMETRY_TEXELS_PER_POINT
 		var y := p / ATLAS_COLUMNS
-		var surface := positions[p] - normals[p] * surface_offset
+		var surface := surface_positions[p]
+		var position := positions[p]
 		var normal := normals[p]
 		image.set_pixel(x, y, Color(surface.x, surface.y, surface.z, 1.0))
-		image.set_pixel(x + 1, y, Color(normal.x, normal.y, normal.z, 0.0))
+		image.set_pixel(x + 1, y, Color(position.x, position.y, position.z, 1.0))
+		image.set_pixel(x + 2, y, Color(normal.x, normal.y, normal.z, 0.0))
+	return image
+
+func make_visibility_moment_image() -> Image:
+	if format_version != FORMAT_VERSION or not is_valid():
+		return null
+	return _pack_visibility_moment_image()
+
+func _pack_visibility_moment_image() -> Image:
+	var rows := ceili(float(probe_count()) / ATLAS_COLUMNS)
+	var image := Image.create_empty(ATLAS_COLUMNS * VISIBILITY_TILE_SIZE,
+			rows * VISIBILITY_TILE_SIZE, false, Image.FORMAT_RGF)
+	for probe in probe_count():
+		var tile_x := (probe % ATLAS_COLUMNS) * VISIBILITY_TILE_SIZE
+		var tile_y := (probe / ATLAS_COLUMNS) * VISIBILITY_TILE_SIZE
+		for y in VISIBILITY_TILE_SIZE:
+			for x in VISIBILITY_TILE_SIZE:
+				var base := (probe * VISIBILITY_TEXELS_PER_PROBE
+						+ y * VISIBILITY_TILE_SIZE + x) * VISIBILITY_MOMENT_CHANNELS
+				image.set_pixel(tile_x + x, tile_y + y,
+						Color(visibility_moments[base], visibility_moments[base + 1], 0.0, 1.0))
 	return image
 
 func make_index_bytes() -> PackedByteArray:

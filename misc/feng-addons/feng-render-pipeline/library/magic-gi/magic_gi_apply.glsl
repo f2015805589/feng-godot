@@ -15,6 +15,7 @@ layout(set = 0, binding = 8) uniform isampler2D index_map;
 layout(set = 0, binding = 10) uniform sampler2D emission_atlas;
 layout(set = 0, binding = 11) uniform sampler2D primary_sky_atlas;
 layout(set = 0, binding = 12) uniform sampler2D sky_light_diffuse_buffer;
+layout(set = 0, binding = 13) uniform sampler2D visibility_moment_atlas;
 
 layout(set = 0, binding = 9, std140) uniform GIParams {
 	mat4 inverse_projection;
@@ -72,6 +73,78 @@ vec3 evaluate_probe(int probe) {
 	return max(value, vec3(0.0)) + max(emission, vec3(0.0));
 }
 
+float sign_not_zero(float value) {
+	return value < 0.0 ? -1.0 : 1.0;
+}
+
+vec2 octahedral_encode(vec3 direction) {
+	vec3 unit_direction = normalize(direction);
+	float denominator = abs(unit_direction.x) + abs(unit_direction.y) + abs(unit_direction.z);
+	vec2 p = unit_direction.xy / max(denominator, 1e-7);
+	if (unit_direction.z < 0.0) {
+		p = (1.0 - abs(p.yx)) * vec2(sign_not_zero(p.x), sign_not_zero(p.y));
+	}
+	return p * 0.5 + 0.5;
+}
+
+ivec2 fold_visibility_texel(ivec2 texel) {
+	const int tile_size = 8;
+	for (int iteration = 0; iteration < 4; iteration++) {
+		if (texel.x < 0) {
+			texel = ivec2(-texel.x - 1, tile_size - 1 - texel.y);
+		} else if (texel.x >= tile_size) {
+			texel = ivec2(tile_size * 2 - 1 - texel.x, tile_size - 1 - texel.y);
+		}
+		if (texel.y < 0) {
+			texel = ivec2(tile_size - 1 - texel.x, -texel.y - 1);
+		} else if (texel.y >= tile_size) {
+			texel = ivec2(tile_size - 1 - texel.x, tile_size * 2 - 1 - texel.y);
+		}
+		if (all(greaterThanEqual(texel, ivec2(0)))
+				&& all(lessThan(texel, ivec2(tile_size)))) {
+			return texel;
+		}
+	}
+	return clamp(texel, ivec2(0), ivec2(tile_size - 1));
+}
+
+vec2 fetch_visibility_moments(int probe, ivec2 tile_texel) {
+	ivec2 folded = fold_visibility_texel(tile_texel);
+	ivec2 tile_origin = ivec2((probe % 32) * 8, (probe / 32) * 8);
+	return texelFetch(visibility_moment_atlas, tile_origin + folded, 0).rg;
+}
+
+vec2 sample_visibility_moments(int probe, vec3 direction) {
+	vec2 texel_position = octahedral_encode(direction) * 8.0 - 0.5;
+	ivec2 base = ivec2(floor(texel_position));
+	vec2 fraction = texel_position - vec2(base);
+	vec2 moments = vec2(0.0);
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			float weight = (x == 1 ? fraction.x : 1.0 - fraction.x)
+					* (y == 1 ? fraction.y : 1.0 - fraction.y);
+			moments += fetch_visibility_moments(probe, base + ivec2(x, y)) * weight;
+		}
+	}
+	return moments;
+}
+
+float chebyshev_visibility(vec2 moments, float receiver_distance, float variance_floor) {
+	float mean_distance = max(moments.x, 0.0);
+	float delta = receiver_distance - mean_distance;
+	if (delta <= 0.0) {
+		return 1.0;
+	}
+	float variance = max(max(moments.y - mean_distance * mean_distance, 0.0), variance_floor);
+	float delta_squared = delta * delta;
+	float denominator = variance + delta_squared;
+	if (isnan(denominator) || isinf(denominator) || denominator <= 0.0) {
+		return 0.0;
+	}
+	float bound = clamp(variance / denominator, 0.0, 1.0);
+	return bound * bound;
+}
+
 ivec2 index_texel(ivec3 cell, int slot, ivec3 dimensions) {
 	return ivec2(cell.x * 8 + slot, cell.y + cell.z * dimensions.y);
 }
@@ -123,7 +196,10 @@ void main() {
 	ivec3 grid_dims = ivec3(dimensions);
 	ivec3 center = clamp(ivec3(floor(grid_position)), ivec3(0), grid_dims - 1);
 	vec3 indirect = vec3(0.0);
-	float interpolation_weight = 0.0;
+	float unoccluded_weight = 0.0;
+	float receiver_bias = max(0.001, spacing * 0.002);
+	vec3 biased_world = world + normal_world * receiver_bias;
+	float variance_floor = max(0.0001, spacing * spacing * 0.0001);
 	// Feather outer cells to zero at a query transition, so every in-window probe can
 	// contribute without a hard top-K membership cutoff.
 	vec3 grid_fraction = grid_position - vec3(center);
@@ -156,16 +232,16 @@ void main() {
 					if (float(probe) >= params.grid.w) {
 						continue;
 					}
-					ivec2 geometry_xy = ivec2((probe % 32) * 2, probe / 32);
-					vec3 sample_position = texelFetch(geometry_atlas, geometry_xy, 0).xyz;
-					vec3 sample_normal = normalize(texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz);
+					ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
+					vec3 sample_surface = texelFetch(geometry_atlas, geometry_xy, 0).xyz;
+					vec3 sample_position = texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz;
+					vec3 sample_normal = normalize(texelFetch(geometry_atlas, geometry_xy + ivec2(2, 0), 0).xyz);
 					float normal_match = dot(normal_world, sample_normal);
-					vec3 delta = world - sample_position;
-					float distance_squared = dot(delta, delta);
+					vec3 surface_delta = world - sample_surface;
 					// Curved same-surface samples have opposite signed planes that cancel;
 					// parallel samples behind the receiver keep negative same-sign distances.
-					float sample_plane_distance = dot(delta, sample_normal);
-					float receiver_signed_plane_distance = dot(delta, normal_world);
+					float sample_plane_distance = dot(surface_delta, sample_normal);
+					float receiver_signed_plane_distance = dot(surface_delta, normal_world);
 					float symmetric_plane_distance = 0.5 * (sample_plane_distance + receiver_signed_plane_distance);
 					float plane_residual = abs(sample_plane_distance + receiver_signed_plane_distance);
 					float gate = smoothstep(-back_tolerance, -back_tolerance * 0.3, symmetric_plane_distance)
@@ -175,23 +251,34 @@ void main() {
 						continue;
 					}
 					float normalized_residual = plane_residual / (0.25 * spacing);
+					vec3 visibility_delta = biased_world - sample_position;
+					float distance_squared = dot(visibility_delta, visibility_delta);
 					float score = distance_squared
 						+ symmetric_plane_distance * symmetric_plane_distance * 4.0
 						+ (1.0 - normal_match) * (1.0 - normal_match) * spacing * spacing
 						+ normalized_residual * normalized_residual * spacing * spacing;
 					float weight = gate * cell_window * inversesqrt(kernel_epsilon + score);
-					indirect += evaluate_probe(probe) * weight;
-					interpolation_weight += weight;
+					unoccluded_weight += weight;
+					float visibility_distance = length(visibility_delta);
+					float visibility = 1.0;
+					if (visibility_distance > 1e-6) {
+						vec2 moments = sample_visibility_moments(probe, visibility_delta / visibility_distance);
+						visibility = chebyshev_visibility(moments, visibility_distance, variance_floor);
+					}
+					if (visibility <= 0.0) {
+						continue;
+					}
+					indirect += evaluate_probe(probe) * weight * visibility;
 				}
 			}
 		}
 	}
-	if (interpolation_weight <= 0.0) {
+	if (unoccluded_weight <= 0.0) {
 		return;
 	}
 	float total_strength = max(params.control.x * pc.parameters.x, 0.0);
 	float ownership_weight = params.control.z > 0.5 ? clamp(total_strength, 0.0, 1.0) : 0.0;
-	vec3 contribution = indirect / interpolation_weight
+	vec3 contribution = indirect / unoccluded_weight
 			* albedo * (1.0 - metallic) * ao * total_strength * pc.parameters.y;
 	imageStore(gi_output, pixel, vec4(contribution, ownership_weight));
 	vec4 scene_color = imageLoad(color_image, pixel);
