@@ -86,6 +86,7 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 			_rebuild_probes()
 
 var probe_positions := PackedVector3Array()
+var probe_surface_positions := PackedVector3Array()
 var probe_normals := PackedVector3Array()
 var _viz: Node3D
 var _viz_queued := false
@@ -104,6 +105,7 @@ var _cached_data_valid := false
 var _cached_has_nonzero_indirect_transport := false
 var _scene_signature_checked := false
 var _last_emission_warning := ""
+var _placement_warning_message := ""
 
 func _enter_tree() -> void:
 	set_notify_transform(true)
@@ -171,6 +173,8 @@ func bake_staleness_reasons() -> PackedStringArray:
 	var reasons := PackedStringArray()
 	if bake_data == null:
 		return reasons
+	if bake_data.format_version < Data.FORMAT_VERSION:
+		reasons.append("format %d lacks explicit surface anchors and directional visibility moments; a v5 rebake is required" % bake_data.format_version)
 	if has_legacy_sampler_signature():
 		reasons.append("the saved format-2 bake uses the previous random sampler")
 	if bake_data.bake_samples != bake_samples:
@@ -239,12 +243,16 @@ func refresh_surface_points() -> void:
 	if not placement.collect(self, use_bake_bounds, false):
 		push_warning("FMagicGI: " + placement.error_message)
 		probe_positions.clear()
+		probe_surface_positions.clear()
 		probe_normals.clear()
+		_placement_warning_message = ""
 		_current_scene_signature = 0
 		_scene_signature_checked = true
 	else:
 		probe_positions = placement.positions
+		probe_surface_positions = placement.surface_positions
 		probe_normals = placement.normals
+		_placement_warning_message = placement.warning_message
 		_current_scene_signature = placement.scene_signature
 		_scene_signature_checked = true
 	_quick_scene_signature = SceneTracker.quick_signature(self)
@@ -284,14 +292,14 @@ func _get_configuration_warnings() -> PackedStringArray:
 	var dims := grid_dimensions()
 	if dims.x > Data.MAX_GRID_AXIS or dims.y > Data.MAX_GRID_AXIS or dims.z > Data.MAX_GRID_AXIS:
 		warnings.append("The lookup grid is limited to 64 cells per axis. Reduce the volume or increase Probe Spacing.")
+	if not _placement_warning_message.is_empty():
+		warnings.append(_placement_warning_message)
 	if bake_data != null and _scene_signature_checked:
 		if not has_usable_bake():
 			warnings.append("PRT bake data is invalid or incomplete. Re-bake to restore Magic GI.")
 		elif needs_rebake():
 			warnings.append("当前显示上次烘焙，仅供预览；场景或烘焙设置已变化，请重新 Bake。原因：%s" % "; ".join(bake_staleness_reasons()))
 		if has_usable_bake():
-			if bake_data.format_version < Data.FORMAT_VERSION:
-				warnings.append("此格式 2/3 Bake 保持旧的 additive SkyLight 行为。重新 Bake 为格式 4 后，Magic GI 才会在有效覆盖区域替换 SkyLight 漫反射。")
 			if not _cached_has_nonzero_indirect_transport:
 				warnings.append(ZERO_TRANSFER_DIAGNOSTIC)
 			var emission_warning := Runtime.emission_warning(self)

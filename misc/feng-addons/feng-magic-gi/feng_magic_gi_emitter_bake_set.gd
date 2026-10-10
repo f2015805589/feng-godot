@@ -84,7 +84,7 @@ func append_triangle(emitter_index: int, a: Vector3, b: Vector3, c: Vector3,
 ## Returns the geometric estimator weight and texture sample, but no live color.
 func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
 		u_triangle: float, u_barycentric: float, u_edge: float,
-		max_distance: float, surface_offset: float) -> Dictionary:
+		max_distance: float, receiver_offset: float) -> Dictionary:
 	if emitter_index < 0 or emitter_index >= groups.size():
 		return {}
 	var source: Dictionary = groups[emitter_index]
@@ -129,8 +129,7 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 	var uv1: Vector2 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
 	var uv2: Vector2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
 	var texture_rgb := _sample_texture(source, uv1, uv2)
-	var epsilon := maxf(0.001, surface_offset)
-	var ray_origin: Vector3 = receiver + receiver_normal.normalized() * epsilon
+	var ray_origin: Vector3 = receiver + receiver_normal.normalized() * maxf(receiver_offset, 0.0)
 	var shadow_delta := target - ray_origin
 	var shadow_distance := shadow_delta.length()
 	var endpoint_epsilon := maxf(0.0001, shadow_distance * 0.00001)

@@ -9,6 +9,7 @@ const Placement = preload("feng_magic_gi_placement.gd")
 const MAX_BAKE_PATHS := 20000000
 const SAMPLER_REVISION := Data.SAMPLER_REVISION
 const QMC_PRIME_BASES := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]
+const MIN_VISIBILITY_RAYS_PER_TEXEL := 4
 
 ## The persisted geometry signature also identifies the estimator that created it.
 ## This leaves the v2 transport layout intact while making older random bakes stale.
@@ -31,8 +32,11 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 		push_warning("FMagicGI: invalid bake sample, bounce, or distance settings.")
 		return null
 	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitter_groups.size())
-	if geometry.positions.size() * rays * work_per_probe_sample > MAX_BAKE_PATHS:
-		push_warning("FMagicGI: PRT and emissive-source shadow rays exceed the 20,000,000 work limit; increase Probe Spacing or reduce samples, bounces, or emitter count.")
+	var visibility_rays := maxi(rays,
+			Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL)
+	var total_work := geometry.positions.size() * (rays * work_per_probe_sample + visibility_rays)
+	if total_work > MAX_BAKE_PATHS:
+		push_warning("FMagicGI: PRT, directional visibility, and emissive-source shadow rays exceed the 20,000,000 work limit; increase Probe Spacing or reduce samples, bounces, or emitter count.")
 		return null
 	var data := Data.new()
 	data.format_version = Data.FORMAT_VERSION
@@ -50,13 +54,15 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	var geometry_signature: int = geometry.scene_signature
 	data.scene_signature = signature_for_geometry(geometry_signature)
 	data.positions = geometry.positions
+	data.surface_positions = geometry.surface_positions
 	data.normals = geometry.normals
 	data.transfer.resize(data.probe_count() * 27)
 	data.primary_sky_visibility.resize(data.probe_count() * 9)
+	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
 	data.emitter_keys = geometry.emitter_keys
 	data.emitter_static_signatures = geometry.emitter_static_signatures
 	data.emitter_transport.resize(data.probe_count() * geometry.emitter_groups.size() * 6)
-	var epsilon: float = maxf(0.001, volume.surface_offset)
 	var qmc_dimension_count := (bounces + 1) * 2
 	var qmc_base_coordinates: Array[PackedFloat64Array] = []
 	qmc_base_coordinates.resize(qmc_dimension_count)
@@ -67,6 +73,13 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 			coordinates[sample_index] = _qmc_base_coordinate(sample_index, rays, dimension)
 		qmc_base_coordinates[dimension] = coordinates
 	for p in data.probe_count():
+		var visibility_shift_rng := RandomNumberGenerator.new()
+		visibility_shift_rng.seed = int(hash([geometry_signature, SAMPLER_REVISION, p, "visibility-moments"]))
+		var visibility_shifts := Vector2(visibility_shift_rng.randf(), visibility_shift_rng.randf())
+		if not await _bake_visibility_moments(data, geometry, p,
+				visibility_shifts, visibility_rays, volume, generation):
+			push_warning("FMagicGI: directional visibility bake did not measure every octahedral moment bin; discarded the incomplete bake.")
+			return null
 		# A per-probe Cranley-Patterson shift randomizes the low-discrepancy
 		# sequence without correlating the same ray directions across probes.
 		var shift_rng := RandomNumberGenerator.new()
@@ -83,8 +96,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 			emitter_shifts[dimension] = emitter_shift_rng.randf()
 		for sample_index in rays:
 			var origin := data.positions[p]
-			var vertex_position := data.positions[p] - data.normals[p] * volume.surface_offset
+			var vertex_position := data.surface_positions[p]
 			var vertex_normal := data.normals[p]
+			var vertex_offset := vertex_position.distance_to(data.positions[p])
 			var direction := cosine_direction(data.normals[p],
 				fposmod(qmc_base_coordinates[0][sample_index] + shifts[0], 1.0),
 				fposmod(qmc_base_coordinates[1][sample_index] + shifts[1], 1.0))
@@ -97,7 +111,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 						fposmod(qmc_base_coordinates[0][sample_index] + emitter_shifts[shift_index], 1.0),
 						fposmod(qmc_base_coordinates[1][sample_index] + emitter_shifts[shift_index + 1], 1.0),
 						fposmod(qmc_base_coordinates[2][sample_index] + emitter_shifts[shift_index + 2], 1.0),
-						volume.bake_distance)
+						volume.bake_distance, vertex_offset)
 					if not source_sample.is_empty():
 						var blocked := geometry.trace(source_sample.ray_origin,
 							source_sample.direction, source_sample.ray_distance)
@@ -130,7 +144,10 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 				var hit_normal: Vector3 = hit.normal
 				vertex_position = hit.position
 				vertex_normal = hit_normal
-				origin = hit.position + hit_normal * epsilon
+				vertex_offset = geometry.safe_surface_offset(hit.position, hit_normal)
+				if vertex_offset <= 0.0:
+					break
+				origin = hit.position + hit_normal * vertex_offset
 				var dimension := (bounce + 1) * 2
 				direction = cosine_direction(hit_normal,
 					fposmod(qmc_base_coordinates[dimension][sample_index] + shifts[dimension], 1.0),
@@ -165,6 +182,80 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not data.has_nonzero_transfer():
 		push_warning("FMagicGI: " + volume.ZERO_TRANSFER_DIAGNOSTIC)
 	return data
+
+func _bake_visibility_moments(data: Data, geometry: Placement, probe: int,
+		shift: Vector2,
+		visibility_rays: int, volume: FMagicGIVolume, generation: int) -> bool:
+	var size := Data.VISIBILITY_TILE_SIZE
+	var texel_count := Data.VISIBILITY_TEXELS_PER_PROBE
+	var minimum_bin_rays := texel_count * MIN_VISIBILITY_RAYS_PER_TEXEL
+	var first_sums := PackedFloat64Array()
+	var second_sums := PackedFloat64Array()
+	var weights := PackedFloat64Array()
+	first_sums.resize(texel_count)
+	second_sums.resize(texel_count)
+	weights.resize(texel_count)
+	first_sums.fill(0.0)
+	second_sums.fill(0.0)
+	weights.fill(0.0)
+	for sample_index in visibility_rays:
+		var direction: Vector3
+		var texel := -1
+		if sample_index < minimum_bin_rays:
+			var bin_index := floori(float(sample_index) / float(MIN_VISIBILITY_RAYS_PER_TEXEL))
+			var stratum := sample_index % MIN_VISIBILITY_RAYS_PER_TEXEL
+			var jitter_x := fposmod(_qmc_base_coordinate(sample_index, minimum_bin_rays, 0) + shift.x, 1.0)
+			var jitter_y := fposmod(_qmc_base_coordinate(sample_index, minimum_bin_rays, 1) + shift.y, 1.0)
+			var sub_x := float(stratum % 2) * 0.5 + jitter_x * 0.5
+			var sub_y := float(stratum / 2) * 0.5 + jitter_y * 0.5
+			var bin_x := bin_index % size
+			var bin_y := floori(float(bin_index) / float(size))
+			var uv := Vector2((bin_x + sub_x) / float(size),
+					(bin_y + sub_y) / float(size))
+			direction = Data.octahedral_decode(uv)
+			texel = bin_index
+		else:
+			var extra_index := sample_index - minimum_bin_rays
+			var extra_count := visibility_rays - minimum_bin_rays
+			var u := fposmod(_qmc_base_coordinate(extra_index, extra_count, 0) + shift.x, 1.0)
+			var v := fposmod(_qmc_base_coordinate(extra_index, extra_count, 1) + shift.y, 1.0)
+			var y := 1.0 - 2.0 * u
+			var radius := sqrt(maxf(0.0, 1.0 - y * y))
+			var phi := TAU * v
+			direction = Vector3(radius * cos(phi), y, radius * sin(phi))
+		var hit := geometry.trace(data.positions[probe], direction, data.bake_distance)
+		var distance := data.bake_distance
+		if not hit.is_empty():
+			distance = clampf((hit.position - data.positions[probe]).dot(direction), 0.0, data.bake_distance)
+		if texel >= 0:
+			first_sums[texel] += distance
+			second_sums[texel] += distance * distance
+			weights[texel] += 1.0
+		else:
+			var texel_position := Data.octahedral_encode(direction) * float(size) - Vector2(0.5, 0.5)
+			var base := Vector2i(floori(texel_position.x), floori(texel_position.y))
+			var fraction := texel_position - Vector2(base)
+			for dy in 2:
+				for dx in 2:
+					var weight := (fraction.x if dx == 1 else 1.0 - fraction.x) \
+							* (fraction.y if dy == 1 else 1.0 - fraction.y)
+					var folded := Data.fold_visibility_texel(base + Vector2i(dx, dy))
+					var splat_texel := folded.y * size + folded.x
+					first_sums[splat_texel] += distance * weight
+					second_sums[splat_texel] += distance * distance * weight
+					weights[splat_texel] += weight
+		if sample_index % 1024 == 1023:
+			await volume.get_tree().process_frame
+			if not is_instance_valid(volume) or not volume.is_inside_tree() \
+					or not volume.is_bake_request_current(generation):
+				return false
+	for texel in texel_count:
+		var output_base := (probe * texel_count + texel) * Data.VISIBILITY_MOMENT_CHANNELS
+		if weights[texel] <= 0.0:
+			return false
+		data.visibility_moments[output_base] = first_sums[texel] / weights[texel]
+		data.visibility_moments[output_base + 1] = second_sums[texel] / weights[texel]
+	return true
 
 ## Randomized Hammersley sequence: the first coordinate is stratified over N
 ## samples and later coordinates use radical inverses in distinct prime bases.

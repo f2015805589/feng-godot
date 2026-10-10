@@ -70,9 +70,29 @@ func _run() -> void:
 	isolated_ground.mesh = _make_horizontal_plane(4.0, 1, white)
 	scene.add_child(isolated_ground)
 	await process_frame
+	var zero_bake_start_usec := Time.get_ticks_usec()
 	var zero_baked: bool = await zero_volume.bake()
+	var zero_bake_elapsed_ms := float(Time.get_ticks_usec() - zero_bake_start_usec) / 1000.0
 	_check(zero_baked and zero_volume.bake_data.is_valid(),
 			"an isolated plane produces a valid bake without secondary surface transport")
+	if zero_baked:
+		var center_probe := 0
+		var center_probe_distance := INF
+		for probe in zero_volume.bake_data.probe_count():
+			var distance_to_center: float = zero_volume.bake_data.surface_positions[probe].length_squared()
+			if distance_to_center < center_probe_distance:
+				center_probe_distance = distance_to_center
+				center_probe = probe
+		var clear_up_moments: Vector2 = zero_volume.bake_data.sample_visibility_moments(center_probe, Vector3.UP)
+		var ground_hit_moments: Vector2 = zero_volume.bake_data.sample_visibility_moments(center_probe, Vector3.DOWN)
+		_check(clear_up_moments.x > zero_volume.bake_distance * 0.95
+				and ground_hit_moments.x < zero_volume.bake_distance * 0.1,
+				"measured directional moments distinguish open sky from the receiver plane")
+		print("MAGIC_GI_CPU_BAKE probes=%d visibility_bytes=%d elapsed_ms=%.3f up_mean=%.4f down_mean=%.4f" % [
+			zero_volume.bake_data.probe_count(),
+			zero_volume.bake_data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS * 4,
+			zero_bake_elapsed_ms, clear_up_moments.x, ground_hit_moments.x])
 	var primary_visibility_l1 := 0.0
 	for coefficient in zero_volume.bake_data.primary_sky_visibility:
 		primary_visibility_l1 += absf(coefficient)
@@ -107,8 +127,8 @@ func _run() -> void:
 	_check(_surface_height_count(boundary_placement, boundary_volume, -1.0) > 0,
 			"inward-offset plane on the exact minimum volume face is retained")
 	_check(_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.UP) == 0
-			and boundary_placement.rejected_center_outside_count > 0,
-			"outward offset from the exact maximum face is rejected when its probe center leaves the volume")
+			and boundary_placement.rejected_occluded_count > 0,
+			"outward clearance from the exact maximum volume face is rejected before its center leaves the volume")
 	_check(_surface_height_count(boundary_placement, boundary_volume, 1.0, Vector3.DOWN) > 0,
 			"inward offset from the exact maximum face remains inside and is retained")
 	print("MAGIC_GI_BOUNDARY_LAYOUT min_inward=%d max_outward=%d max_inward=%d center_outside_rejected=%d" % [
@@ -138,6 +158,7 @@ func _run() -> void:
 	for direction in [Vector3.LEFT, Vector3.RIGHT, Vector3.UP, Vector3.DOWN, Vector3.FORWARD, Vector3.BACK]:
 		_check(_normal_count(box_placement, direction) > 0, "closed box retains face normal %s" % direction)
 	var box_data := Data.new()
+	box_data.format_version = Data.FORMAT_VERSION
 	box_data.grid_dims = box_volume.grid_dimensions()
 	box_data.volume_size = box_volume.size
 	box_data.spacing = box_volume.probe_spacing
@@ -145,6 +166,7 @@ func _run() -> void:
 	box_data.volume_transform = box_volume.global_transform
 	box_data.world_to_grid = box_volume.world_to_grid_transform()
 	box_data.positions = box_placement.positions
+	box_data.surface_positions = box_placement.surface_positions
 	box_data.normals = box_placement.normals
 	_check(box_data.build_cell_indices(), "closed box stays within the 8-slot cell capacity")
 	box_volume.queue_free()
@@ -196,6 +218,116 @@ func _run() -> void:
 	embedded_plane.queue_free()
 	transparent_box.queue_free()
 	transparent_receiver.queue_free()
+	await process_frame
+
+	var thin_wall_volume := Volume.new()
+	thin_wall_volume.size = Vector3.ONE * 2.2
+	thin_wall_volume.probe_spacing = 1.0
+	scene.add_child(thin_wall_volume)
+	var thin_wall_left := MeshInstance3D.new()
+	thin_wall_left.mesh = _make_horizontal_plane(1.5, 1, white)
+	thin_wall_left.rotation.z = -PI * 0.5
+	scene.add_child(thin_wall_left)
+	var thin_wall_right := MeshInstance3D.new()
+	thin_wall_right.mesh = _make_horizontal_plane(1.5, 1, white)
+	thin_wall_right.rotation.z = PI * 0.5
+	thin_wall_right.position.x = 0.01
+	scene.add_child(thin_wall_right)
+	var thin_wall_placement := Placement.new()
+	_check(thin_wall_placement.collect(thin_wall_volume, false),
+			"two thin opposing walls collect successfully")
+	var thin_left_count := 0
+	var thin_right_count := 0
+	var thin_centers_stay_between := true
+	for index in thin_wall_placement.positions.size():
+		var anchor: Vector3 = thin_wall_placement.surface_positions[index]
+		var center: Vector3 = thin_wall_placement.positions[index]
+		var normal: Vector3 = thin_wall_placement.normals[index]
+		if anchor.x < 0.001 and normal.dot(Vector3.RIGHT) > 0.95:
+			thin_left_count += 1
+			thin_centers_stay_between = thin_centers_stay_between and center.x > anchor.x \
+					and center.x < 0.0051
+		elif anchor.x > 0.009 and normal.dot(Vector3.LEFT) > 0.95:
+			thin_right_count += 1
+			thin_centers_stay_between = thin_centers_stay_between and center.x < anchor.x \
+					and center.x > 0.0049
+	_check(thin_left_count > 0 and thin_right_count > 0 and thin_centers_stay_between,
+			"adaptive probe clearance stays within the 1cm wall gap on both sides")
+	thin_wall_volume.bake_samples = 1
+	thin_wall_volume.bake_bounces = 1
+	thin_wall_volume.bake_distance = 2.0
+	var thin_wall_baked: bool = await thin_wall_volume.bake()
+	var thin_wall_first_hit_mean := INF
+	if thin_wall_baked:
+		for index in thin_wall_volume.bake_data.probe_count():
+			if thin_wall_volume.bake_data.normals[index].dot(Vector3.RIGHT) > 0.95 \
+					and thin_wall_volume.bake_data.surface_positions[index].x < 0.001:
+				var moments: Vector2 = thin_wall_volume.bake_data.sample_visibility_moments(
+					index, Vector3.LEFT)
+				thin_wall_first_hit_mean = minf(thin_wall_first_hit_mean, moments.x)
+	_check(thin_wall_baked and thin_wall_first_hit_mean < 0.1,
+			"a probe facing through a 1cm wall stores the near first hit, not an unoccluded distance")
+	print("MAGIC_GI_THIN_WALL_VISIBILITY baked=%s first_hit_mean=%.5f" % [
+		thin_wall_baked, thin_wall_first_hit_mean])
+	print("MAGIC_GI_THIN_WALL left=%d right=%d rejected_clearance=%d" % [
+		thin_left_count, thin_right_count, thin_wall_placement.rejected_occluded_count])
+	thin_wall_volume.queue_free()
+	thin_wall_left.queue_free()
+	thin_wall_right.queue_free()
+	await process_frame
+
+	var translated_root := Node3D.new()
+	translated_root.position = Vector3(16384.0, -8192.0, 32768.0)
+	translated_root.scale = Vector3(2.0, 0.5, 1.5)
+	scene.add_child(translated_root)
+	var translated_volume := Volume.new()
+	translated_volume.size = Vector3.ONE * 4.0
+	translated_volume.probe_spacing = 1.0
+	translated_volume.surface_offset = 0.001
+	translated_root.add_child(translated_volume)
+	var nested_mesh := MeshInstance3D.new()
+	nested_mesh.mesh = _make_nested_box_mesh(2.0, 1.2, white)
+	nested_mesh.scale = Vector3(-0.8, 1.0, 0.9)
+	nested_mesh.material_override = white
+	translated_root.add_child(nested_mesh)
+	var translated_placement := Placement.new()
+	_check(translated_placement.collect(translated_volume, false),
+			"translated nonuniformly-scaled nested closed mesh collects")
+	var nested_solid: Dictionary = translated_placement._occlusion_volumes[0] if not translated_placement._occlusion_volumes.is_empty() else {}
+	var inner_samples := 0
+	var inner_normals_point_into_cavity := true
+	var every_center_is_outside_solid := not nested_solid.is_empty()
+	for index in translated_placement.positions.size():
+		var local_anchor: Vector3 = nested_mesh.global_transform.affine_inverse() \
+				* translated_placement.surface_positions[index]
+		var local_normal: Vector3 = (nested_mesh.global_transform.basis.transposed() \
+				* translated_placement.normals[index]).normalized()
+		if _is_nested_inner_surface(local_anchor, 0.6):
+			inner_samples += 1
+			inner_normals_point_into_cavity = inner_normals_point_into_cavity \
+					and _nested_normal_matches_cavity(local_anchor, local_normal, 0.6)
+		if not nested_solid.is_empty() and nested_solid.world_aabb.grow(0.01).has_point(
+				translated_placement.positions[index]):
+			every_center_is_outside_solid = every_center_is_outside_solid \
+					and translated_placement._point_inside_closed_mesh_state(
+					translated_placement.positions[index], nested_solid.world_aabb,
+					nested_solid.bvh) == 0
+	_check(inner_samples > 0 and inner_normals_point_into_cavity,
+			"per-face containment orients reversed nested-shell probes toward the cavity")
+	_check(every_center_is_outside_solid
+			and nested_solid.world_aabb.position.x > 10000.0,
+			"translated, nonuniformly-scaled placement centers stay outside their source solid")
+	var minimum_adaptive_offset := INF
+	for index in translated_placement.positions.size():
+		minimum_adaptive_offset = minf(minimum_adaptive_offset,
+			translated_placement.positions[index].distance_to(
+				translated_placement.surface_positions[index]))
+	_check(is_finite(minimum_adaptive_offset) and minimum_adaptive_offset >= 0.022,
+			"placement retains spacing-relative clearance under translation and nonuniform scale")
+	print("MAGIC_GI_TRANSLATED_NESTED probes=%d inner=%d min_offset=%.5f" % [
+		translated_placement.positions.size(), inner_samples,
+		minimum_adaptive_offset if is_finite(minimum_adaptive_offset) else 0.0])
+	translated_root.queue_free()
 	await process_frame
 
 	var layered_volume := Volume.new()
@@ -485,6 +617,7 @@ func _test_pure_contracts() -> void:
 	_check(InspectorPlugin != null, "inspector plugin parses with the PRT diagnostic")
 	_test_runtime_atlas_positivity_filter()
 	_test_emission_data_contracts()
+	_test_directional_visibility_contracts()
 	_check(Volume.BAKE_QUALITY_SAMPLES == [256, 1024, 2048],
 			"Draft, Final, and High quality presets have explicit ray counts")
 	var default_volume := Volume.new()
@@ -504,6 +637,7 @@ func _test_pure_contracts() -> void:
 	var legacy := Data.new()
 	_check(not legacy.is_valid(), "default/unbaked data remains invalid for the current PRT format")
 	var image := Image.create(64, 32, false, Image.FORMAT_RGBAF)
+
 	image.fill(Color.BLACK)
 	image.set_pixel(12, 16, Color.WHITE)
 	var sky_sh: PackedFloat32Array = Lighting.project_panorama(image)
@@ -537,10 +671,33 @@ func _test_pure_contracts() -> void:
 			"Terrain3DData Object signals invalidate the lightweight scene fingerprint")
 	fake_data.free()
 
+func _test_directional_visibility_contracts() -> void:
+	_check(Data.fold_visibility_texel(Vector2i(-1, 3)) == Vector2i(0, 4)
+			and Data.fold_visibility_texel(Vector2i(8, 3)) == Vector2i(7, 4)
+			and Data.fold_visibility_texel(Vector2i(3, -1)) == Vector2i(4, 0)
+			and Data.fold_visibility_texel(Vector2i(3, 8)) == Vector2i(4, 7),
+			"octahedral texel borders fold with integer mirror-and-axis-flip addressing")
+	var data: Resource = _make_filter_test_data()
+	for y in Data.VISIBILITY_TILE_SIZE:
+		for x in Data.VISIBILITY_TILE_SIZE:
+			var uv := (Vector2(x, y) + Vector2(0.5, 0.5)) / float(Data.VISIBILITY_TILE_SIZE)
+			var direction := Data.octahedral_decode(uv)
+			var mean := 2.0 + direction.dot(Vector3(1.0, 0.5, -0.25).normalized()) * 0.4
+			var base := (y * Data.VISIBILITY_TILE_SIZE + x) * Data.VISIBILITY_MOMENT_CHANNELS
+			data.visibility_moments[base] = mean
+			data.visibility_moments[base + 1] = mean * mean + 0.01
+	var seam_positive: Vector2 = data.sample_visibility_moments(0, Vector3(-1.0, 0.00001, 0.0))
+	var seam_negative: Vector2 = data.sample_visibility_moments(0, Vector3(-1.0, -0.00001, 0.0))
+	_check(seam_positive.distance_to(seam_negative) < 0.0001,
+			"directional moments stay continuous while sampling across an octahedral tile seam")
+	_check(is_equal_approx(Data.one_sided_chebyshev_bound(2.0, 4.0, 1.0, 0.0001), 1.0)
+			and Data.chebyshev_visibility(2.0, 4.0, 3.0, 0.0001) < 0.000001,
+			"unblocked receiver distance preserves unit visibility and the shaped one-sided bound rejects blocked distance")
+
 func _test_emission_data_contracts() -> void:
 	var data: Resource = _make_emission_contract_data()
 	_check(data.is_valid() and data.format_version == Data.FORMAT_VERSION,
-			"synthetic v4 emitter bake validates with separate primary Sky visibility")
+			"synthetic v5 emitter bake validates with explicit anchors and visibility moments")
 	_test_render_upload_package(data)
 	for invalid in [NAN, INF]:
 		var bad_transform: Resource = data.duplicate(true)
@@ -551,7 +708,7 @@ func _test_emission_data_contracts() -> void:
 		_check(not bad_grid.is_valid() and not bad_grid.build_cell_indices() and bad_grid.cell_indices.is_empty(),
 				"non-finite lookup transforms fail validation and clear their index payload")
 	_check(data.emitter_count() == 1 and data.has_nonzero_transfer(),
-			"synthetic v4 data counts emitter transport as real indirect transport")
+		"synthetic v5 data counts emitter transport as real indirect transport")
 	var raw_transfer: PackedByteArray = data.transfer.to_byte_array()
 	var raw_emitter_transport: PackedByteArray = data.emitter_transport.to_byte_array()
 	var source_values := PackedFloat32Array([0.5, 0.25, 0.125, 1.0, 1.0, 1.0])
@@ -582,17 +739,32 @@ func _test_emission_data_contracts() -> void:
 	legacy_v2.emitter_static_signatures = PackedInt64Array()
 	legacy_v2.emitter_transport = PackedFloat32Array()
 	legacy_v2.primary_sky_visibility = PackedFloat32Array()
+	legacy_v2.surface_positions.clear()
+	legacy_v2.visibility_moments.clear()
 	_check(legacy_v2.is_valid() and legacy_v2.emitter_count() == 0,
 			"legacy v2 surface-transport bakes remain valid without emitter arrays")
 	var legacy_v3: Resource = data.duplicate(true)
 	legacy_v3.format_version = Data.EMITTER_FORMAT_VERSION
 	legacy_v3.primary_sky_visibility.clear()
+	legacy_v3.surface_positions.clear()
+	legacy_v3.visibility_moments.clear()
 	_check(legacy_v3.is_valid() and legacy_v3.emitter_count() == 1,
 			"legacy v3 emitter bakes remain valid without primary Sky visibility")
-	for legacy_data in [legacy_v2, legacy_v3]:
+	var legacy_v4: Resource = data.duplicate(true)
+	legacy_v4.format_version = Data.PRIMARY_SKY_FORMAT_VERSION
+	legacy_v4.surface_positions.clear()
+	legacy_v4.visibility_moments.clear()
+	_check(legacy_v4.is_valid() and not legacy_v4.matches_layout(
+			legacy_v4.volume_size, legacy_v4.spacing, legacy_v4.surface_offset,
+			legacy_v4.volume_transform, legacy_v4.bake_samples, legacy_v4.bake_bounces,
+			legacy_v4.bake_distance, legacy_v4.terrain_reflectance, legacy_v4.material_reflectance),
+			"legacy v4 data remains loadable but cannot satisfy the v5 runtime layout")
+	for legacy_data in [legacy_v2, legacy_v3, legacy_v4]:
 		var legacy_upload: Dictionary = legacy_data.make_render_upload()
-		_check(not legacy_upload.is_empty() and _packed_values_all_zero(legacy_upload.primary_sky_image.get_data().to_float32_array()),
-				"legacy upload keeps a correctly sized black primary-sky atlas")
+		_check(legacy_upload.is_empty(), "legacy v2-v4 upload requires an explicit v5 rebake")
+		_check(legacy_data.make_geometry_image() == null
+				and legacy_data.make_visibility_moment_image() == null,
+				"legacy v2-v4 data cannot enter a v5 geometry or visibility atlas packer")
 	var primary_only: Resource = data.duplicate(true)
 	primary_only.transfer.fill(0.0)
 	primary_only.emitter_keys.clear()
@@ -611,22 +783,22 @@ func _test_emission_data_contracts() -> void:
 	no_secondary_lighting.fill(0.0)
 	_check(primary_only.is_valid() and primary_only.has_nonzero_transfer()
 			and primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting) == Vector3(0.5, 0.75, 1.0),
-			"v4 primary Sky visibility remains valid transport and evaluates only against Sky-only SH")
+			"v5 primary Sky visibility remains valid transport and evaluates only against Sky-only SH")
 	var bad_shape: Resource = data.duplicate(true)
 	bad_shape.emitter_transport.resize(bad_shape.emitter_transport.size() - 1)
-	_check(not bad_shape.is_valid(), "v4 rejects an emitter payload with the wrong probe shape")
+	_check(not bad_shape.is_valid(), "v5 rejects an emitter payload with the wrong probe shape")
 	var bad_count: Resource = data.duplicate(true)
 	bad_count.emitter_static_signatures.clear()
-	_check(not bad_count.is_valid(), "v4 rejects mismatched emitter key/static-signature counts")
+	_check(not bad_count.is_valid(), "v5 rejects mismatched emitter key/static-signature counts")
 	var bad_negative: Resource = data.duplicate(true)
 	bad_negative.emitter_transport[0] = -0.001
-	_check(not bad_negative.is_valid(), "v4 rejects negative emitter transport")
+	_check(not bad_negative.is_valid(), "v5 rejects negative emitter transport")
 	var bad_nan: Resource = data.duplicate(true)
 	bad_nan.emitter_transport[0] = NAN
-	_check(not bad_nan.is_valid(), "v4 rejects non-finite emitter transport")
+	_check(not bad_nan.is_valid(), "v5 rejects non-finite emitter transport")
 	var bad_primary_shape: Resource = data.duplicate(true)
 	bad_primary_shape.primary_sky_visibility.resize(bad_primary_shape.primary_sky_visibility.size() - 1)
-	_check(not bad_primary_shape.is_valid(), "v4 rejects primary Sky visibility with the wrong probe shape")
+	_check(not bad_primary_shape.is_valid(), "v5 rejects primary Sky visibility with the wrong probe shape")
 	var unsupported: Resource = data.duplicate(true)
 	unsupported.format_version = Data.FORMAT_VERSION + 1
 	_check(not unsupported.is_valid(), "unsupported future PRT versions fail closed")
@@ -635,30 +807,36 @@ func _test_emission_data_contracts() -> void:
 
 func _test_render_upload_package(data: Resource) -> void:
 	var upload: Dictionary = data.make_render_upload()
-	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "index_bytes", "emission_image"]
+	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "visibility_moment_image", "index_bytes", "emission_image"]
 	var has_contract_fields := upload.size() == expected_keys.size()
 	for key in expected_keys:
 		has_contract_fields = has_contract_fields and upload.has(key)
-	_check(has_contract_fields, "render upload returns the atomic five-field package")
+	_check(has_contract_fields, "render upload returns the atomic six-field package")
 	if not has_contract_fields:
 		return
 	var transfer_image: Image = upload["transfer_image"]
 	var primary_sky_image: Image = upload["primary_sky_image"]
 	var geometry_image: Image = upload["geometry_image"]
+	var visibility_image: Image = upload["visibility_moment_image"]
 	var emission_image: Image = upload["emission_image"]
 	var index_bytes: PackedByteArray = upload["index_bytes"]
 	var expected_transfer: Image = data.make_runtime_atlas_image()
 	var expected_geometry: Image = data.make_geometry_image()
+	var expected_visibility: Image = data.make_visibility_moment_image()
 	var expected_emission: Image = data.make_emission_atlas_image(PackedFloat32Array())
 	_check(transfer_image != null and expected_transfer != null
 			and transfer_image.get_data() == expected_transfer.get_data(),
 			"atomic transfer image is byte-identical to the existing runtime packer")
 	_check(primary_sky_image != null and primary_sky_image.get_width() == Data.ATLAS_COLUMNS * Data.PRIMARY_SKY_TEXELS_PER_POINT
 			and is_equal_approx(primary_sky_image.get_pixel(0, 0).r, data.primary_sky_visibility[0]),
-			"atomic upload includes the v4 primary Sky visibility atlas")
+			"atomic upload includes the primary Sky visibility atlas")
 	_check(geometry_image != null and expected_geometry != null
 			and geometry_image.get_data() == expected_geometry.get_data(),
 			"atomic geometry image is byte-identical to the existing geometry packer")
+	_check(visibility_image != null and expected_visibility != null
+			and visibility_image.get_data() == expected_visibility.get_data()
+			and visibility_image.get_format() == Image.FORMAT_RGF,
+			"atomic upload includes the two-channel directional visibility moment atlas")
 	_check(index_bytes == data.make_index_bytes(),
 			"atomic index bytes are byte-identical to the existing index packer")
 	_check(emission_image != null and expected_emission != null
@@ -931,7 +1109,15 @@ func _make_emission_contract_data(data: Resource = null) -> Resource:
 	data.terrain_reflectance = 0.5
 	data.material_reflectance = 0.5
 	data.positions = PackedVector3Array([Vector3(0.5, 0.53, 0.5), Vector3(1.5, 0.53, 0.5)])
+	data.surface_positions = PackedVector3Array([Vector3(0.5, 0.5, 0.5), Vector3(1.5, 0.5, 0.5)])
 	data.normals = PackedVector3Array([Vector3.UP, Vector3.UP])
+	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
+	for probe in data.probe_count():
+		for texel in Data.VISIBILITY_TEXELS_PER_PROBE:
+			var moment_base: int = (probe * Data.VISIBILITY_TEXELS_PER_PROBE + texel) * Data.VISIBILITY_MOMENT_CHANNELS
+			data.visibility_moments[moment_base] = data.bake_distance
+			data.visibility_moments[moment_base + 1] = data.bake_distance * data.bake_distance
 	data.transfer.resize(data.probe_count() * 27)
 	data.transfer.fill(0.0)
 	data.primary_sky_visibility.resize(data.probe_count() * 9)
@@ -1042,7 +1228,13 @@ func _make_filter_test_data() -> Resource:
 	data.terrain_reflectance = 0.5
 	data.material_reflectance = 0.5
 	data.positions = PackedVector3Array([Vector3(0.5, 0.53, 0.5)])
+	data.surface_positions = PackedVector3Array([Vector3(0.5, 0.5, 0.5)])
 	data.normals = PackedVector3Array([Vector3.UP])
+	data.visibility_moments.resize(Data.VISIBILITY_TEXELS_PER_PROBE * Data.VISIBILITY_MOMENT_CHANNELS)
+	for texel in Data.VISIBILITY_TEXELS_PER_PROBE:
+		var moment_base := texel * Data.VISIBILITY_MOMENT_CHANNELS
+		data.visibility_moments[moment_base] = data.bake_distance
+		data.visibility_moments[moment_base + 1] = data.bake_distance * data.bake_distance
 	data.transfer.resize(27)
 	data.transfer.fill(0.0)
 	data.primary_sky_visibility.resize(9)
@@ -1146,6 +1338,52 @@ func _make_horizontal_plane(extent: float, subdivisions: int, material: Material
 	mesh.surface_set_material(0, material)
 	return mesh
 
+func _make_nested_box_mesh(outer_size: float, inner_size: float, material: Material) -> ArrayMesh:
+	var mesh := ArrayMesh.new()
+	_add_box_surface(mesh, outer_size, false, material)
+	_add_box_surface(mesh, inner_size, true, material)
+	return mesh
+
+func _add_box_surface(mesh: ArrayMesh, side: float, reverse_winding: bool,
+		material: Material) -> void:
+	var box := BoxMesh.new()
+	box.size = Vector3.ONE * side
+	var source_faces: PackedVector3Array = box.get_faces()
+	var faces := PackedVector3Array()
+	faces.resize(source_faces.size())
+	for face in range(0, source_faces.size(), 3):
+		faces[face] = source_faces[face]
+		faces[face + 1] = source_faces[face + (2 if reverse_winding else 1)]
+		faces[face + 2] = source_faces[face + (1 if reverse_winding else 2)]
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = faces
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mesh.surface_set_material(mesh.get_surface_count() - 1, material)
+
+func _is_nested_inner_surface(local_point: Vector3, half_extent: float) -> bool:
+	var tolerance := 0.001
+	var on_x := absf(absf(local_point.x) - half_extent) <= tolerance \
+			and absf(local_point.y) <= half_extent + tolerance \
+			and absf(local_point.z) <= half_extent + tolerance
+	var on_y := absf(absf(local_point.y) - half_extent) <= tolerance \
+			and absf(local_point.x) <= half_extent + tolerance \
+			and absf(local_point.z) <= half_extent + tolerance
+	var on_z := absf(absf(local_point.z) - half_extent) <= tolerance \
+			and absf(local_point.x) <= half_extent + tolerance \
+			and absf(local_point.y) <= half_extent + tolerance
+	return on_x or on_y or on_z
+
+func _nested_normal_matches_cavity(local_point: Vector3, local_normal: Vector3,
+		half_extent: float) -> bool:
+	var x_match := absf(absf(local_point.x) - half_extent) <= 0.001 \
+			and local_normal.dot(Vector3.RIGHT * (-1.0 if local_point.x > 0.0 else 1.0)) > 0.9
+	var y_match := absf(absf(local_point.y) - half_extent) <= 0.001 \
+			and local_normal.dot(Vector3.UP * (-1.0 if local_point.y > 0.0 else 1.0)) > 0.9
+	var z_match := absf(absf(local_point.z) - half_extent) <= 0.001 \
+			and local_normal.dot(Vector3.BACK * (-1.0 if local_point.z > 0.0 else 1.0)) > 0.9
+	return x_match or y_match or z_match
+
 func _make_array_mesh_from_faces(faces: PackedVector3Array, material: Material) -> ArrayMesh:
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
@@ -1204,7 +1442,7 @@ func _surface_height_count(placement: RefCounted, volume: Node3D, y: float,
 			continue
 		if placement.positions[index].x < x_min or placement.positions[index].x > x_max:
 			continue
-		var surface_y: float = placement.positions[index].y - placement.normals[index].y * volume.surface_offset
+		var surface_y: float = placement.surface_positions[index].y
 		if is_equal_approx(surface_y, y):
 			count += 1
 	return count

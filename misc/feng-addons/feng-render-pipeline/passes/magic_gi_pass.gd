@@ -55,7 +55,7 @@ func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 	return 1.0
 
 ## Prepare runs before the native lighting operation. It opts this frame into
-## the exact SkyLight diffuse attachment only when a current v4 bake can replace it.
+## the exact SkyLight diffuse attachment only when a current v5 bake can replace it.
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	_replacement_request_prepared = false
 	if ctx == null or not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
@@ -93,7 +93,7 @@ func _warn_missing_replacement_bridge() -> void:
 	if _replacement_bridge_warning_shown:
 		return
 	_replacement_bridge_warning_shown = true
-	push_warning("Magic GI v4 bake is using additive fallback because FRP did not provide the requested SkyLight diffuse attachment. Rebuild/update feng-godot to enable exact SkyLight replacement.")
+	push_warning("Magic GI v5 bake is using additive fallback because FRP did not provide the requested SkyLight diffuse attachment. Rebuild/update feng-godot to enable exact SkyLight replacement.")
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
@@ -202,6 +202,7 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 				and cached.get("transfer", RID()).is_valid() \
 				and cached.get("primary_sky", RID()).is_valid() \
 				and cached.get("geometry", RID()).is_valid() \
+				and cached.get("visibility_moments", RID()).is_valid() \
 				and cached.get("indices", RID()).is_valid() \
 				and cached.get("emission", RID()).is_valid():
 			return true
@@ -219,9 +220,11 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	var transfer_value: Variant = upload.get("transfer_image")
 	var primary_sky_value: Variant = upload.get("primary_sky_image")
 	var geometry_value: Variant = upload.get("geometry_image")
+	var visibility_value: Variant = upload.get("visibility_moment_image")
 	var index_value: Variant = upload.get("index_bytes")
 	var emission_value: Variant = upload.get("emission_image")
 	if not transfer_value is Image or not primary_sky_value is Image or not geometry_value is Image \
+			or not visibility_value is Image \
 			or not index_value is PackedByteArray \
 			or not emission_value is Image:
 		_report("The selected Magic GI bake could not create its complete PRT upload bundle.")
@@ -229,22 +232,26 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	var transfer_image: Image = transfer_value
 	var primary_sky_image: Image = primary_sky_value
 	var geometry_image: Image = geometry_value
+	var visibility_image: Image = visibility_value
 	var index_bytes: PackedByteArray = index_value
 	var emission_image: Image = emission_value
-	if transfer_image.is_empty() or primary_sky_image.is_empty() or geometry_image.is_empty() or index_bytes.is_empty() \
+	if transfer_image.is_empty() or primary_sky_image.is_empty() or geometry_image.is_empty() \
+			or visibility_image.is_empty() or index_bytes.is_empty() \
 			or emission_image.is_empty():
 		_report("The selected Magic GI bake returned an empty runtime upload payload.")
 		return false
 	var transfer_rid := _create_image_texture(rd, transfer_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
 	var primary_sky_rid := _create_image_texture(rd, primary_sky_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
 	var geometry_rid := _create_image_texture(rd, geometry_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
+	var visibility_rid := _create_image_texture(rd, visibility_image, RenderingDevice.DATA_FORMAT_R32G32_SFLOAT)
 	var dims: Vector3i = data.get("grid_dims")
 	var index_rid := _create_index_texture(rd, dims, index_bytes)
 	var emission_rid := _create_image_texture(rd, emission_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
 			RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT)
 	if not transfer_rid.is_valid() or not primary_sky_rid.is_valid() or not geometry_rid.is_valid() \
+			or not visibility_rid.is_valid() \
 			or not index_rid.is_valid() or not emission_rid.is_valid():
-		for rid in [transfer_rid, primary_sky_rid, geometry_rid, index_rid, emission_rid]:
+		for rid in [transfer_rid, primary_sky_rid, geometry_rid, visibility_rid, index_rid, emission_rid]:
 			if rid.is_valid():
 				rd.free_rid(rid)
 		_report("RenderingDevice could not upload the Magic GI PRT atlas, emission atlas, or index grid.")
@@ -255,6 +262,7 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 		"transfer": transfer_rid,
 		"primary_sky": primary_sky_rid,
 		"geometry": geometry_rid,
+		"visibility_moments": visibility_rid,
 		"indices": index_rid,
 		"emission": emission_rid,
 		"emission_identity": "",
@@ -341,7 +349,7 @@ func _take_bake_rids(cache_key: String) -> Array[RID]:
 		return rids
 	var cached: Dictionary = _bake_resources[cache_key]
 	_bake_resources.erase(cache_key)
-	for name in ["transfer", "primary_sky", "geometry", "indices", "emission"]:
+	for name in ["transfer", "primary_sky", "geometry", "visibility_moments", "indices", "emission"]:
 		var rid: RID = cached.get(name, RID())
 		if rid.is_valid():
 			rids.append(rid)
@@ -405,6 +413,7 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		{"binding": 10, "texture": cached["emission"]},
 		{"binding": 11, "texture": cached["primary_sky"]},
 		{"binding": 12, "texture": sky_diffuse},
+		{"binding": 13, "texture": cached["visibility_moments"]},
 	]:
 		var uniform := RDUniform.new()
 		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE

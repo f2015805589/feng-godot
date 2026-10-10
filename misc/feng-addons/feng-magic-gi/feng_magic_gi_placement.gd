@@ -15,6 +15,10 @@ const MAX_OCCLUSION_TRIANGLES := 250000
 const OCCLUSION_MAX_CROSSINGS := 256
 const OCCLUSION_WELD_EPSILON := 0.00001
 const DUPLICATE_PLANE_EPSILON := 0.001
+const MIN_PROBE_OFFSET_SPACING_RATIO := 0.002
+const BASE_PROBE_OFFSET_SPACING_RATIO := 0.025
+const MAX_PROBE_OFFSET_SPACING_RATIO := 0.08
+const OCCLUSION_GRID_AXIS := 8
 const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 
 var faces := PackedVector3Array()
@@ -27,14 +31,19 @@ var emitter_static_signatures := PackedInt64Array()
 var emitter_groups: Array[Dictionary] = []
 var bvh: TriangleMesh
 var positions := PackedVector3Array()
+var surface_positions := PackedVector3Array()
 var normals := PackedVector3Array()
 var scene_signature := 0
 var error_message := ""
+var warning_message := ""
 var bvh_ready := false
 
 var _spatial_hash: Dictionary = {}
 var _cell_counts: Dictionary = {}
 var _occlusion_volumes: Array[Dictionary] = []
+var _occlusion_cells: Dictionary = {}
+var _source_volume_indices: Dictionary = {}
+var _face_outward_signs: Dictionary = {}
 var _volume: Node3D
 var _world: World3D
 var _collect_emission := false
@@ -54,6 +63,7 @@ var _sample_surface_index := -1
 var rejected_occluded_count := 0
 var rejected_duplicate_count := 0
 var rejected_center_outside_count := 0
+var rejected_ambiguous_side_count := 0
 var _scene_root: Node
 var _emitter_set: EmitterBakeSet
 
@@ -64,13 +74,15 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_emitter_set = EmitterBakeSet.new()
 	_inverse = volume.global_transform.affine_inverse()
 	_dimensions = volume.grid_dimensions()
+	error_message = ""
+	warning_message = ""
 	_world_bounds = volume.global_transform * AABB(-volume.size * 0.5, volume.size)
 	# Preview must include geometry that can intersect the short surface-offset
 	# segment, even before a bake exists. Bake collection already has the wider
 	# ray-tracing bounds and therefore also contains this local occupancy region.
+	var max_probe_offset := _preferred_probe_offset(volume)
 	_bake_world_bounds = _world_bounds.grow(volume.bake_distance) if for_bake \
-			else _world_bounds.grow(volume.surface_offset + BROADPHASE_EPSILON)
-	error_message = ""
+			else _world_bounds.grow(max_probe_offset + BROADPHASE_EPSILON)
 	faces.clear()
 	reflectance.clear()
 	face_emitter_indices.clear()
@@ -80,10 +92,14 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	emitter_static_signatures.clear()
 	emitter_groups.clear()
 	positions.clear()
+	surface_positions.clear()
 	normals.clear()
 	_spatial_hash.clear()
 	_cell_counts.clear()
 	_occlusion_volumes.clear()
+	_occlusion_cells.clear()
+	_source_volume_indices.clear()
+	_face_outward_signs.clear()
 	_material_cache.clear()
 	_candidate_count = 0
 	_terrain_work = 0
@@ -95,6 +111,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	rejected_occluded_count = 0
 	rejected_duplicate_count = 0
 	rejected_center_outside_count = 0
+	rejected_ambiguous_side_count = 0
 	bvh = null
 	bvh_ready = false
 	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
@@ -115,8 +132,10 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 		if not bvh_ready:
 			error_message = "Godot could not create the static PRT triangle BVH."
 			return false
+	_build_occlusion_broadphase()
 	if not _sample_collected_geometry():
 		positions.clear()
+		surface_positions.clear()
 		normals.clear()
 		return false
 	if not build_bvh:
@@ -125,7 +144,10 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	emitter_keys = _emitter_set.keys
 	emitter_static_signatures = _emitter_set.static_signatures
 	emitter_groups = _emitter_set.groups
-	scene_signature = hash([faces, reflectance, positions, normals])
+	if rejected_ambiguous_side_count > 0 or rejected_occluded_count > 0:
+		warning_message = "Discarded %d probe candidates without safe clearance and skipped %d clipped triangles whose outward side could not be proven." % [
+			rejected_occluded_count, rejected_ambiguous_side_count]
+	scene_signature = hash([faces, reflectance, surface_positions, positions, normals])
 	return true
 
 func _sample_collected_geometry() -> bool:
@@ -153,6 +175,12 @@ func _sample_collected_geometry() -> bool:
 			var clipped_normal := (p2 - p0).cross(p1 - p0).normalized()
 			if clipped_normal.length_squared() < 0.5:
 				continue
+			var source_normal_sign := _source_face_outward_sign(
+					_sample_source_id, source_face_index, p0, p1, p2, clipped_normal)
+			if source_normal_sign == 0.0:
+				rejected_ambiguous_side_count += 1
+				continue
+			clipped_normal *= source_normal_sign
 			if not _sample_triangle(p0, p1, p2, clipped_normal):
 				return false
 	return true
@@ -202,7 +230,7 @@ func _collect_mesh(node: MeshInstance3D) -> void:
 
 func _register_occlusion_volume(node: MeshInstance3D, mesh: Mesh, mesh_world_box: AABB) -> void:
 	var instance_id := node.get_instance_id()
-	var placement_box := _world_bounds.grow(float(_volume.surface_offset) + BROADPHASE_EPSILON)
+	var placement_box := _world_bounds.grow(_preferred_probe_offset(_volume) + BROADPHASE_EPSILON)
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(placement_box):
 		return
 	if _mesh_has_transparent_surface(node, mesh):
@@ -220,11 +248,13 @@ func _register_occlusion_volume(node: MeshInstance3D, mesh: Mesh, mesh_world_box
 	var mesh_bvh := TriangleMesh.new()
 	if not mesh_bvh.create_from_faces(world_faces):
 		return
+	var solid_index := _occlusion_volumes.size()
 	_occlusion_volumes.append({
 		"instance_id": instance_id,
 		"world_aabb": mesh_world_box,
 		"bvh": mesh_bvh,
 	})
+	_source_volume_indices[instance_id] = solid_index
 
 func _mesh_has_transparent_surface(node: MeshInstance3D, mesh: Mesh) -> bool:
 	for surface in mesh.get_surface_count():
@@ -464,10 +494,11 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 					if _surfaces_are_duplicate(surface, normal, existing, min_separation):
 						rejected_duplicate_count += 1
 						return
-	if _probe_offset_is_occluded(surface, normal):
+	var actual_offset := _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
+	if actual_offset <= 0.0:
 		rejected_occluded_count += 1
 		return
-	var probe_center: Vector3 = surface + normal * float(_volume.surface_offset)
+	var probe_center: Vector3 = surface + normal * actual_offset
 	var center_local := _inverse * probe_center
 	if center_local.x < -_volume.size.x * 0.5 - epsilon \
 			or center_local.x > _volume.size.x * 0.5 + epsilon \
@@ -477,15 +508,15 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 			or center_local.z > _volume.size.z * 0.5 + epsilon:
 		rejected_center_outside_count += 1
 		return
-	if _probe_center_is_inside_other_solid(probe_center):
-		rejected_occluded_count += 1
-		return
 	var grid: Vector3 = (local + _volume.size * 0.5) / _volume.size * Vector3(_dimensions)
 	var cell := Data.cell_coordinates(grid, _dimensions)
 	if cell.x < 0:
 		error_message = "A sampled surface escaped the PRT lookup grid."
 		return
 	var cell_key := cell.x + cell.y * _dimensions.x + cell.z * _dimensions.x * _dimensions.y
+	if _probe_center_is_inside_solid(probe_center):
+		rejected_occluded_count += 1
+		return
 	var count := int(_cell_counts.get(cell_key, 0))
 	if count >= Data.CELL_CAPACITY:
 		error_message = "More than 8 surface samples occupy one lookup cell; increase Probe Spacing or reduce surface detail."
@@ -503,6 +534,7 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 	var bucket: Array = _spatial_hash.get(hash_cell, [])
 	bucket.append(point_entry)
 	_spatial_hash[hash_cell] = bucket
+	surface_positions.append(surface)
 	positions.append(probe_center)
 	normals.append(normal)
 
@@ -528,29 +560,126 @@ func _surfaces_are_duplicate(surface: Vector3, normal: Vector3,
 			absf((surface - existing.position).dot(existing_normal)))
 	return separation <= plane_tolerance
 
-func _probe_offset_is_occluded(surface: Vector3, normal: Vector3) -> bool:
-	if not bvh_ready or normal.length_squared() < 0.5:
-		return false
-	var offset := float(_volume.surface_offset)
-	var epsilon := minf(offset * 0.25, BROADPHASE_EPSILON)
-	var start := surface + normal * epsilon
-	var end := surface + normal * offset
-	return not bvh.intersect_segment(start, end).is_empty()
+static func _preferred_probe_offset(volume: Node3D) -> float:
+	var spacing := maxf(float(volume.get("probe_spacing")), 0.1)
+	var lower := spacing * MIN_PROBE_OFFSET_SPACING_RATIO
+	var upper := spacing * MAX_PROBE_OFFSET_SPACING_RATIO
+	return clampf(maxf(float(volume.get("surface_offset")),
+			spacing * BASE_PROBE_OFFSET_SPACING_RATIO), lower, upper)
 
-func _probe_center_is_inside_other_solid(point: Vector3) -> bool:
-	for solid in _occlusion_volumes:
-		# Do not treat the source mesh's own normal offset as an obstruction. The
-		# short BVH segment test above still rejects offsets that immediately cross
-		# the source surface; this skip only applies to whole-volume containment.
-		if int(solid.instance_id) == _sample_source_id:
+func _source_face_outward_sign(source_id: int, face_index: int,
+		a: Vector3, b: Vector3, c: Vector3, authored_normal: Vector3) -> float:
+	if _face_outward_signs.has(face_index):
+		return float(_face_outward_signs[face_index])
+	if not _source_volume_indices.has(source_id):
+		_face_outward_signs[face_index] = 1.0
+		return 1.0 # Open meshes retain their authored face direction.
+	var solid: Dictionary = _occlusion_volumes[int(_source_volume_indices[source_id])]
+	var bounds: AABB = solid.world_aabb
+	var scale := maxf(bounds.size.x, maxf(bounds.size.y, bounds.size.z))
+	var longest_edge := maxf(a.distance_to(b), maxf(b.distance_to(c), c.distance_to(a)))
+	var cross_length := (c - a).cross(b - a).length()
+	if longest_edge <= 0.00000001 or cross_length <= 0.00000001:
+		_face_outward_signs[face_index] = 0.0
+		return 0.0
+	var altitude := cross_length / longest_edge
+	var max_distance := minf(scale * 0.001, altitude * 0.1)
+	var test_distance := maxf(0.0000001, scale * 0.000001)
+	if max_distance < test_distance:
+		_face_outward_signs[face_index] = 0.0
+		return 0.0
+	var center := (a + b + c) / 3.0
+	var test_distances := [test_distance, minf(max_distance, test_distance * 4.0),
+			minf(max_distance, test_distance * 16.0), max_distance]
+	for distance in test_distances:
+		var offset := authored_normal * float(distance)
+		var positive_side := _point_inside_closed_mesh_state(center + offset, bounds, solid.bvh)
+		var negative_side := _point_inside_closed_mesh_state(center - offset, bounds, solid.bvh)
+		if positive_side == 0 and negative_side == 1:
+			_face_outward_signs[face_index] = 1.0
+			return 1.0
+		if positive_side == 1 and negative_side == 0:
+			_face_outward_signs[face_index] = -1.0
+			return -1.0
+	_face_outward_signs[face_index] = 0.0
+	return 0.0
+
+func _safe_probe_offset(surface: Vector3, normal: Vector3, preferred: float) -> float:
+	if normal.length_squared() < 0.5 or not is_finite(preferred) or preferred <= 0.0:
+		return 0.0
+	var safe_offset := preferred
+	var ray_epsilon := maxf(0.00001, minf(preferred * 0.1,
+			float(_volume.probe_spacing) * 0.0005))
+	if bvh_ready:
+		var hit := bvh.intersect_segment(surface + normal * ray_epsilon,
+				surface + normal * preferred)
+		if not hit.is_empty():
+			var hit_distance: float = (hit.position - surface).dot(normal)
+			safe_offset = minf(safe_offset, (hit_distance - ray_epsilon) * 0.45)
+	# Keep the center inside the oriented volume even when the surface lies on a
+	# boundary. The inverse-basis direction accounts for nonuniform volume scale.
+	var local_surface := _inverse * surface
+	var local_direction := _inverse.basis * normal
+	var half_size: Vector3 = _volume.size * 0.5
+	var local_boundary_epsilon := maxf(0.00001, float(_volume.probe_spacing) * 0.00001)
+	for axis in 3:
+		var direction_component := local_direction[axis]
+		if absf(direction_component) < 0.000001:
 			continue
+		var boundary := half_size[axis] if direction_component > 0.0 else -half_size[axis]
+		var distance_to_boundary := (boundary - local_surface[axis]) / direction_component
+		if distance_to_boundary >= 0.0:
+			safe_offset = minf(safe_offset,
+					distance_to_boundary - local_boundary_epsilon / absf(direction_component))
+	var minimum_clearance := maxf(ray_epsilon * 2.0,
+			float(_volume.probe_spacing) * MIN_PROBE_OFFSET_SPACING_RATIO)
+	return safe_offset if safe_offset >= minimum_clearance else 0.0
+
+func _build_occlusion_broadphase() -> void:
+	_occlusion_cells.clear()
+	if _occlusion_volumes.is_empty():
+		return
+	var grid_scale := Vector3(OCCLUSION_GRID_AXIS, OCCLUSION_GRID_AXIS, OCCLUSION_GRID_AXIS)
+	var local_volume := AABB(-_volume.size * 0.5, _volume.size)
+	for solid_index in _occlusion_volumes.size():
+		var solid: Dictionary = _occlusion_volumes[solid_index]
+		var world_box: AABB = solid.world_aabb
+		var local_box := AABB(_inverse * world_box.get_endpoint(0), Vector3.ZERO)
+		for corner_index in range(1, 8):
+			local_box = local_box.expand(_inverse * world_box.get_endpoint(corner_index))
+		local_box = local_box.grow(maxf(0.00001, _volume.probe_spacing * 0.00001))
+		if not local_box.intersects(local_volume):
+			continue
+		var clipped_min := local_box.position.max(local_volume.position)
+		var clipped_max := local_box.end.min(local_volume.end)
+		var cell_min := Vector3i(((clipped_min - local_volume.position) / _volume.size * grid_scale).floor()) \
+				.clamp(Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
+		var cell_max := Vector3i(((clipped_max - local_volume.position) / _volume.size * grid_scale).floor()) \
+				.clamp(Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
+		for z in range(cell_min.z, cell_max.z + 1):
+			for y in range(cell_min.y, cell_max.y + 1):
+				for x in range(cell_min.x, cell_max.x + 1):
+					var key := x + y * OCCLUSION_GRID_AXIS + z * OCCLUSION_GRID_AXIS * OCCLUSION_GRID_AXIS
+					var solids: Array = _occlusion_cells.get(key, [])
+					solids.append(solid_index)
+					_occlusion_cells[key] = solids
+
+func _probe_center_is_inside_solid(point: Vector3) -> bool:
+	var local := _inverse * point
+	var normalized: Vector3 = (local + _volume.size * 0.5) / _volume.size
+	var broad_cell := Vector3i((normalized * float(OCCLUSION_GRID_AXIS)).floor()).clamp(
+			Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
+	var key := broad_cell.x + broad_cell.y * OCCLUSION_GRID_AXIS \
+			+ broad_cell.z * OCCLUSION_GRID_AXIS * OCCLUSION_GRID_AXIS
+	for solid_index in _occlusion_cells.get(key, []):
+		var solid: Dictionary = _occlusion_volumes[solid_index]
 		var solid_box: AABB = solid.world_aabb
-		if solid_box.has_point(point) and _point_inside_closed_mesh(
-				point, solid_box, solid.bvh):
-			return true
+		if solid_box.grow(maxf(0.000001, solid_box.size.length() * 0.000001)).has_point(point):
+			if _point_inside_closed_mesh_state(point, solid_box, solid.bvh) != 0:
+				return true # Ambiguous containment is unsafe for probe placement.
 	return false
 
-func _point_inside_closed_mesh(point: Vector3, bounds: AABB, mesh_bvh: TriangleMesh) -> bool:
+func _point_inside_closed_mesh_state(point: Vector3, bounds: AABB, mesh_bvh: TriangleMesh) -> int:
 	var directions := [
 		Vector3(1.0, 0.371, 0.529).normalized(),
 		Vector3(-0.291, 1.0, 0.417).normalized(),
@@ -558,8 +687,9 @@ func _point_inside_closed_mesh(point: Vector3, bounds: AABB, mesh_bvh: TriangleM
 		Vector3(-1.0, 0.743, 0.263).normalized(),
 		Vector3(0.229, -1.0, 0.811).normalized(),
 	]
-	var ray_length := bounds.size.length() + 1.0
-	var ray_epsilon := maxf(0.00001, bounds.size.length() * 0.000001)
+	var scale := maxf(bounds.size.length(), 0.000001)
+	var ray_length := scale * 1.5 + 0.000001
+	var ray_epsilon := maxf(0.00000001, scale * 0.0000001)
 	var valid_rays := 0
 	var inside_votes := 0
 	for direction in directions:
@@ -570,7 +700,13 @@ func _point_inside_closed_mesh(point: Vector3, bounds: AABB, mesh_bvh: TriangleM
 		valid_rays += 1
 		if crossings % 2 == 1:
 			inside_votes += 1
-	return valid_rays >= 3 and inside_votes >= 3
+	if valid_rays < 3:
+		return -1
+	if inside_votes >= 3:
+		return 1
+	if valid_rays - inside_votes >= 3:
+		return 0
+	return -1
 
 func _ray_crossing_count(origin: Vector3, direction: Vector3, ray_length: float,
 		advance_epsilon: float, mesh_bvh: TriangleMesh) -> int:
@@ -623,11 +759,15 @@ func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictiona
 		hit["emitter_index"] = face_emitter_indices[face_index]
 	return hit
 
+func safe_surface_offset(surface: Vector3, normal: Vector3) -> float:
+	return _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
+
 ## Uniform-area next-event sample for one fixed emissive surface binding.
 ## Returns the geometric estimator weight and texture sample, but never source color.
 func sample_emitter_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
-		u_triangle: float, u_barycentric: float, u_edge: float, max_distance: float) -> Dictionary:
+		u_triangle: float, u_barycentric: float, u_edge: float,
+		max_distance: float, receiver_offset: float) -> Dictionary:
 	if _emitter_set == null:
 		return {}
 	return _emitter_set.sample_connection(emitter_index, receiver, receiver_normal,
-			u_triangle, u_barycentric, u_edge, max_distance, _volume.surface_offset)
+			u_triangle, u_barycentric, u_edge, max_distance, receiver_offset)
