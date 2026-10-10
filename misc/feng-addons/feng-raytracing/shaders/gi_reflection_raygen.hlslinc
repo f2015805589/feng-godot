@@ -136,9 +136,10 @@ void FengGIReflectionRayGen() {
 	float3 transformed_normal = mul((float3x3)gi_frame.view_to_world, normal_encoded / normal_length);
 	float transformed_normal_length = length(transformed_normal);
 	bool orthographic_camera = abs(gi_frame.inverse_projection[3][3] - 1.0f) < 1e-4f;
+	float3 camera_position = mul(gi_frame.view_to_world, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
 	float3 view_vector = orthographic_camera
 			? mul((float3x3)gi_frame.view_to_world, float3(0.0f, 0.0f, 1.0f))
-			: gi_frame.view_to_world[3].xyz - world_position;
+			: camera_position - world_position;
 	float view_length = length(view_vector);
 	if (!(transformed_normal_length > 1e-6f) || !isfinite(transformed_normal_length)
 			|| !(view_length > 1e-6f) || !isfinite(view_length) || !all(isfinite(view_vector))) {

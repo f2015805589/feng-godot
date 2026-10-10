@@ -357,6 +357,55 @@ func run() -> void:
 			and raw_mirror_offcenter.r + raw_mirror_offcenter.g + raw_mirror_offcenter.b > 0.001
 	print("RTGI_REFLECTION_CASE orthographic_offcenter_hit ", orthographic_offcenter_hit,
 			" pixel=", raw_mirror_offcenter)
+	var perspective_translated_camera_hit := false
+	var perspective_raw := Color(0.0, 0.0, 0.0, 0.0)
+	if reflection_enabled:
+		# This grazing perspective reflection exercises camera translation and rotation in HLSL.
+		# The center ray reflects from the horizontal mirror at the origin to the target at y=1.5,z=-3.
+		mirror.visible = false
+		wall.visible = false
+		var perspective_mirror := MeshInstance3D.new()
+		perspective_mirror.name = "PerspectiveTranslatedCameraMirror"
+		var perspective_mirror_mesh := PlaneMesh.new()
+		perspective_mirror_mesh.size = Vector2(2.4, 2.4)
+		perspective_mirror.mesh = perspective_mirror_mesh
+		perspective_mirror.material_override = mirror_material
+		root.add_child(perspective_mirror)
+		var perspective_target := MeshInstance3D.new()
+		perspective_target.name = "PerspectiveTranslatedCameraEmissiveTarget"
+		var perspective_target_mesh := QuadMesh.new()
+		perspective_target_mesh.size = Vector2(2.0, 2.0)
+		perspective_target.mesh = perspective_target_mesh
+		var perspective_target_material := StandardMaterial3D.new()
+		perspective_target_material.emission_enabled = true
+		perspective_target_material.emission = Color(1.0, 0.12, 0.03)
+		perspective_target_material.emission_energy_multiplier = 1.0
+		perspective_target_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		perspective_target.material_override = perspective_target_material
+		perspective_target.position = Vector3(0.0, 1.5, -3.0)
+		root.add_child(perspective_target)
+		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+		camera.position = Vector3(0.0, 3.0, 6.0)
+		camera.look_at(Vector3.ZERO, Vector3.UP)
+		for i in 45:
+			await process_frame
+		perspective_raw = await _read_raw_center()
+		perspective_translated_camera_hit = is_finite(perspective_raw.r) \
+				and is_finite(perspective_raw.g) and is_finite(perspective_raw.b) \
+				and is_finite(perspective_raw.a) and perspective_raw.a > 0.0 \
+				and perspective_raw.r + perspective_raw.g + perspective_raw.b > 0.001
+		perspective_mirror.queue_free()
+		perspective_target.queue_free()
+		mirror.visible = true
+		wall.visible = true
+		camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+		camera.size = 3.8
+		camera.position = Vector3(0.0, 0.0, 6.0)
+		camera.look_at(Vector3.ZERO, Vector3.UP)
+		for i in 45:
+			await process_frame
+	print("RTGI_REFLECTION_CASE perspective_translated_camera_hit ",
+			perspective_translated_camera_hit, " raw=", perspective_raw)
 
 	mirror_material.roughness = 0.65
 	for i in 45:
@@ -441,7 +490,8 @@ func run() -> void:
 
 	var warnings: Array = renderer._last_validation_warnings
 	print("RTGI_REFLECTION_WARNINGS ", warnings)
-	var success := sky_ready and geometry_hit and orthographic_offcenter_hit and roughness_changed and metallic_changed \
+	var success := sky_ready and geometry_hit and orthographic_offcenter_hit \
+			and perspective_translated_camera_hit and roughness_changed and metallic_changed \
 			and secondary_sky_specular_changed and runtime_switch and hdr_test_done and hdr_test_passed
 	Worlds.unregister_owner(self)
 	world_environment.compositor = null
