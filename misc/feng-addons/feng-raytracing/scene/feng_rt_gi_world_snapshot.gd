@@ -138,7 +138,7 @@ func _on_node_removed(node: Node) -> void:
 func _register_node(node: Node) -> void:
 	if not node is Node3D or not node.is_inside_tree() or node.get_world_3d() != _world:
 		return
-	if node is GeometryInstance3D:
+	if node is GeometryInstance3D or node is GridMap or node.is_class("Terrain3D"):
 		_node_refs[node.get_instance_id()] = weakref(node)
 		_revision += 1
 
