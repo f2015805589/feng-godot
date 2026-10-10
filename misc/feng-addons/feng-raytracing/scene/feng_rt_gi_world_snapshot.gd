@@ -238,7 +238,9 @@ func _capture_material(material: Material) -> Dictionary:
 		return {"supported": false, "reason": "rtgi_front_cull_material"}
 	if base.albedo_color.a < 0.9999:
 		return {"supported": false, "reason": "rtgi_material_alpha_is_not_opaque"}
-	if base.normal_enabled or base.emission_texture != null or base.metallic_texture != null or base.uv1_triplanar or base.vertex_color_use_as_albedo or base.next_pass != null or base.detail_enabled or base.heightmap_enabled:
+	if base.normal_enabled or base.emission_texture != null or base.metallic_texture != null \
+			or base.roughness_texture != null or base.uv1_triplanar or base.vertex_color_use_as_albedo \
+			or base.next_pass != null or base.detail_enabled or base.heightmap_enabled:
 		return {"supported": false, "reason": "rtgi_unsupported_material_features"}
 	var texture_data := {}
 	if base.albedo_texture != null:

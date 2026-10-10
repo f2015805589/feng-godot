@@ -59,6 +59,8 @@
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_SKY_LIGHT_DIFFUSE SNAME("sky_light_diffuse")
 #define RB_TEX_SKY_LIGHT_DIFFUSE_MSAA SNAME("sky_light_diffuse_msaa")
+#define RB_TEX_INDIRECT_SPECULAR SNAME("indirect_specular")
+#define RB_TEX_INDIRECT_SPECULAR_MSAA SNAME("indirect_specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
@@ -147,6 +149,11 @@ public:
 		RID get_sky_light_diffuse(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE, p_layer, 0); }
 		RID get_sky_light_diffuse_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_DIFFUSE_MSAA, p_layer, 0); }
 
+		void ensure_indirect_specular();
+		RID get_indirect_specular() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR); }
+		RID get_indirect_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR, p_layer, 0); }
+		RID get_indirect_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR_MSAA, p_layer, 0); }
+
 		void ensure_normal_roughness_texture();
 		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
 		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
@@ -190,6 +197,7 @@ public:
 		RID get_color_pass_fb(uint32_t p_color_pass_flags);
 		RID get_depth_fb(DepthFrameBufferType p_type = DEPTH_FB);
 		RID get_specular_only_fb();
+		RID get_specular_only_fb(uint32_t p_layer);
 		RID get_velocity_only_fb();
 
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override;
@@ -268,6 +276,14 @@ private:
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE,
 		FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE,
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE,
+		FRP_LIGHTING_MODE_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_MULTIVIEW_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
+		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
 		FRP_LIGHTING_MODE_MAX
 	};
 

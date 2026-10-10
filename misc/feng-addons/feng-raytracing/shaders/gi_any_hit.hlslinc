@@ -28,9 +28,11 @@ ByteAddressBuffer gi_materials : register(t11, space0);
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 static const uint GI_MATERIAL_TWO_SIDED = 2u;
+static const uint GI_MATERIAL_WORD_STRIDE = 20u;
 static const uint GI_HIT_KIND_FRONT_FACE = 0xfeu;
 
 [shader("anyhit")]
@@ -47,7 +49,7 @@ void FengGIAnyHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttrib
 		return;
 	}
 	uint material_index = gi_surfaces.Load(surface_byte + 12u);
-	uint material_flags = gi_materials.Load(material_index * 64u + 40u);
+	uint material_flags = gi_materials.Load(material_index * GI_MATERIAL_WORD_STRIDE * 4u + 40u);
 	if ((material_flags & GI_MATERIAL_TWO_SIDED) == 0u && HitKind() != GI_HIT_KIND_FRONT_FACE) {
 		IgnoreHit();
 		return;

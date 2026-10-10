@@ -36,6 +36,7 @@ const TEX_GBUFFER_NORMAL_ROUGHNESS: StringName = &"normal_roughness"
 const TEX_GBUFFER_ALBEDO: StringName = &"gbuffer_albedo"
 const TEX_GBUFFER_ORM: StringName = &"gbuffer_orm"
 const TEX_GBUFFER_EMISSION: StringName = &"gbuffer_emission"
+const TEX_INDIRECT_SPECULAR: StringName = &"indirect_specular"
 
 static var _spec: Dictionary = {}
 

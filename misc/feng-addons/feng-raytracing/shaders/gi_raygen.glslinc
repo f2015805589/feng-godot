@@ -4,6 +4,7 @@
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 struct GIFrameData {
@@ -142,6 +143,7 @@ void main() {
 				+ normal_world * local_direction.z);
 		gi_payload.radiance = vec3(0.0);
 		gi_payload.flags = GI_RAY_MODE_PRIMARY;
+		gi_payload.hit_distance = 0.0;
 		traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
 				world_position + normal_world * 0.001, 0.001, direction, max_distance, 0);
 		incoming_radiance += gi_finite_nonnegative(gi_payload.radiance);

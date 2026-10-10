@@ -129,8 +129,20 @@ layout(location = 1) out vec4 specular_color;
 #ifdef MODE_SKY_LIGHT_DIFFUSE
 #ifdef MODE_SEPARATE_SPECULAR
 layout(location = 2) out vec4 sky_light_diffuse_color;
+#ifdef MODE_INDIRECT_SPECULAR
+layout(location = 3) out vec4 indirect_specular_color;
+#endif
 #else
 layout(location = 1) out vec4 sky_light_diffuse_color;
+#ifdef MODE_INDIRECT_SPECULAR
+layout(location = 2) out vec4 indirect_specular_color;
+#endif
+#endif
+#elif defined(MODE_INDIRECT_SPECULAR)
+#ifdef MODE_SEPARATE_SPECULAR
+layout(location = 2) out vec4 indirect_specular_color;
+#else
+layout(location = 1) out vec4 indirect_specular_color;
 #endif
 #endif
 
@@ -710,5 +722,8 @@ void main() {
 
 #ifdef MODE_SKY_LIGHT_DIFFUSE
 	sky_light_diffuse_color = vec4(global_sky_light_diffuse, 0.0);
+#endif
+#ifdef MODE_INDIRECT_SPECULAR
+	indirect_specular_color = vec4(indirect_specular_light, 0.0);
 #endif
 }

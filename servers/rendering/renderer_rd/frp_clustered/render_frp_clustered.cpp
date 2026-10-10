@@ -150,6 +150,18 @@ void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_sky_light_diffuse(
 	}
 }
 
+void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_indirect_specular() {
+	ERR_FAIL_NULL(render_buffers);
+
+	if (!render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RenderSceneBuffersRD::get_color_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR_MSAA, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RenderSceneBuffersRD::get_color_usage_bits(false, true, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
+}
+
 void RenderFRPClustered::RenderBufferDataFRPClustered::ensure_normal_roughness_texture() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -398,6 +410,14 @@ RID RenderFRPClustered::RenderBufferDataFRPClustered::get_specular_only_fb() {
 	RID specular = render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR);
 
 	return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), specular);
+}
+
+RID RenderFRPClustered::RenderBufferDataFRPClustered::get_specular_only_fb(uint32_t p_layer) {
+	bool use_msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+	ERR_FAIL_COND_V(!use_msaa, RID());
+
+	RID specular = render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SPECULAR_MSAA, p_layer, 0);
+	return FramebufferCacheRD::get_singleton()->get_cache_multiview(1, specular);
 }
 
 RID RenderFRPClustered::RenderBufferDataFRPClustered::get_velocity_only_fb() {
@@ -1966,6 +1986,10 @@ void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> 
 	const uint64_t sky_revision = sky_source_valid ? sky.sky_get_external_radiance_revision(sky_source.sky) : 0;
 	const float sky_uv_border_size = sky_source_valid ? sky.sky_get_uv_border_size(sky_source.sky) : 0.0f;
 	const int sky_radiance_size = sky_source_valid ? MAX(1, sky.sky_get_radiance_size(sky_source.sky)) : 0;
+	int sky_max_roughness_lod = sky_source_valid ? MAX(0, get_roughness_layers() - 1) : 0;
+	if (sky_source_valid && sky_format.texture_type == RD::TEXTURE_TYPE_2D_ARRAY) {
+		sky_max_roughness_lod = MIN(sky_max_roughness_lod, MAX(0, int(sky_format.array_layers) - 1));
+	}
 	float camera_exposure_normalization = 1.0f;
 	if (p_render_data->camera_attributes.is_valid()) {
 		camera_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
@@ -1979,8 +2003,44 @@ void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> 
 
 	Array directional_light_base_rids;
 	directional_light_base_rids.resize(p_render_data->directional_light_count);
+	PackedByteArray directional_light_signature;
+	const bool indirect_specular_requested = p_context->is_indirect_specular_requested();
 	for (uint32_t i = 0; i < p_render_data->directional_light_count; i++) {
-		directional_light_base_rids[i] = light_storage->get_directional_light_base_rid(i);
+		const RID base_light = light_storage->get_directional_light_base_rid(i);
+		directional_light_base_rids[i] = base_light;
+		if (indirect_specular_requested) {
+			// RT reflection history consumes the selected directional light at secondary
+			// hits. The base RID/version alone misses color and energy changes in this
+			// renderer, so publish the actual CPU-side values that feed its light buffer.
+			Vector3 world_direction;
+			Vector3 raw_irradiance;
+			int32_t resolved_index = -1;
+			PackedFloat32Array unused_shadow_packet;
+			const bool has_runtime_data = light_storage->get_cloud_directional_light_data(
+					base_light, world_direction, raw_irradiance, resolved_index, unused_shadow_packet);
+			const Color color = base_light.is_valid() ? light_storage->light_get_color(base_light) : Color();
+			const float energy = base_light.is_valid() ? light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_ENERGY) : 0.0f;
+			const float specular = base_light.is_valid() ? light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_SPECULAR) : 0.0f;
+			const uint32_t cull_mask = base_light.is_valid() ? light_storage->light_get_cull_mask(base_light) : 0;
+			PackedInt64Array identity;
+			identity.push_back(int64_t(base_light.get_id()));
+			identity.push_back(int64_t(base_light.is_valid() ? light_storage->light_get_version(base_light) : 0));
+			identity.push_back(int64_t(cull_mask));
+			directional_light_signature.append_array(identity.to_byte_array());
+			PackedFloat32Array values;
+			values.push_back(has_runtime_data ? world_direction.x : 0.0f);
+			values.push_back(has_runtime_data ? world_direction.y : 0.0f);
+			values.push_back(has_runtime_data ? world_direction.z : 0.0f);
+			values.push_back(has_runtime_data ? raw_irradiance.x : 0.0f);
+			values.push_back(has_runtime_data ? raw_irradiance.y : 0.0f);
+			values.push_back(has_runtime_data ? raw_irradiance.z : 0.0f);
+			values.push_back(color.r);
+			values.push_back(color.g);
+			values.push_back(color.b);
+			values.push_back(energy);
+			values.push_back(specular);
+			directional_light_signature.append_array(values.to_byte_array());
+		}
 	}
 	Array omni_light_base_rids;
 	const uint32_t omni_light_count = light_storage->get_omni_light_count();
@@ -2082,6 +2142,7 @@ void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> 
 		// FRP eye adaptation is off. Keep that source-domain factor separate from
 		// scene_normalization (which also removes the luminance multiplier).
 		inputs["light_buffer_exposure_normalization"] = light_buffer_exposure_normalization;
+		inputs["dfg_texture"] = dfg_lut.texture;
 
 		inputs["directional_light_buffer"] = light_storage->get_directional_light_buffer();
 		inputs["directional_light_count"] = int(p_render_data->directional_light_count);
@@ -2089,6 +2150,9 @@ void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> 
 		inputs["directional_light_stride_bytes"] = 464;
 		inputs["directional_light_buffer_usage"] = String("uniform_buffer");
 		inputs["directional_light_base_rids"] = directional_light_base_rids;
+		if (indirect_specular_requested) {
+			inputs["directional_light_signature"] = directional_light_signature;
+		}
 		inputs["omni_light_buffer"] = light_storage->get_omni_light_buffer();
 		inputs["omni_light_count"] = int(omni_light_count);
 		inputs["omni_light_base_rids"] = omni_light_base_rids;
@@ -2144,6 +2208,7 @@ void RenderFRPClustered::_publish_volume_frame_inputs(const Ref<FRPPassContext> 
 		inputs["sky_radiance_is_array"] = sky_source_valid && sky_format.texture_type == RD::TEXTURE_TYPE_2D_ARRAY;
 		inputs["sky_uv_border_size"] = sky_uv_border_size;
 		inputs["sky_radiance_size"] = sky_radiance_size;
+		inputs["sky_max_roughness_lod"] = sky_max_roughness_lod;
 
 		p_context->set_volume_frame_input(view, inputs);
 	}
@@ -3279,6 +3344,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				opaque_pass_uniforms_ready = true;
 				const bool sky_light_diffuse_requested = !is_reflection_probe && rb_data.is_valid() && pass_context->is_sky_light_diffuse_requested();
 				const bool write_sky_light_diffuse = sky_light_diffuse_requested && scene_state.ubo.sky_lighting_enabled != 0;
+				const bool indirect_specular_requested = !is_reflection_probe && rb_data.is_valid() && pass_context->is_indirect_specular_requested();
 				if (sky_light_diffuse_requested) {
 					rb_data->ensure_sky_light_diffuse();
 					RID diffuse_target = rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SKY_LIGHT_DIFFUSE_MSAA : RB_TEX_SKY_LIGHT_DIFFUSE);
@@ -3287,6 +3353,16 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					diffuse_clear_color.push_back(Color(0, 0, 0, 0));
 					Rect2i full_diffuse_rect(Vector2i(), rb->get_internal_size());
 					RD::get_singleton()->draw_list_begin(diffuse_clear_framebuffer, RD::DRAW_CLEAR_COLOR_ALL, diffuse_clear_color, 0.0f, 0u, full_diffuse_rect);
+					RD::get_singleton()->draw_list_end();
+				}
+				if (indirect_specular_requested) {
+					rb_data->ensure_indirect_specular();
+					RID indirect_target = rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_INDIRECT_SPECULAR_MSAA : RB_TEX_INDIRECT_SPECULAR);
+					RID indirect_clear_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), indirect_target);
+					Vector<Color> indirect_clear_color;
+					indirect_clear_color.push_back(Color(0, 0, 0, 0));
+					Rect2i full_indirect_rect(Vector2i(), rb->get_internal_size());
+					RD::get_singleton()->draw_list_begin(indirect_clear_framebuffer, RD::DRAW_CLEAR_COLOR_ALL, indirect_clear_color, 0.0f, 0u, full_indirect_rect);
 					RD::get_singleton()->draw_list_end();
 				}
 
@@ -3323,19 +3399,32 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RID lighting_color = use_msaa ? rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA) : rb->get_internal_texture();
 					RID lighting_specular = (opaque_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SPECULAR_MSAA : RB_TEX_SPECULAR) : RID();
 					RID lighting_sky_light_diffuse = write_sky_light_diffuse ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_SKY_LIGHT_DIFFUSE_MSAA : RB_TEX_SKY_LIGHT_DIFFUSE) : RID();
+					RID lighting_indirect_specular = indirect_specular_requested ? rb->get_texture(RB_SCOPE_FRP_CLUSTERED, use_msaa ? RB_TEX_INDIRECT_SPECULAR_MSAA : RB_TEX_INDIRECT_SPECULAR) : RID();
 						// The full-screen lighting shader writes colour and, optionally,
 						// separate specular. The velocity texture must not be attached:
 						// it would give this framebuffer a colour output mask the shader
 						// does not declare, which fails pipeline creation. Motion vectors
 						// are produced by the Motion Vectors pass instead.
-					if (lighting_sky_light_diffuse.is_valid()) {
-						if (lighting_specular.is_valid()) {
-							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_sky_light_diffuse);
+					if (lighting_specular.is_valid()) {
+						if (lighting_sky_light_diffuse.is_valid()) {
+							if (lighting_indirect_specular.is_valid()) {
+								opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_sky_light_diffuse, lighting_indirect_specular);
+							} else {
+								opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_sky_light_diffuse);
+							}
+						} else if (lighting_indirect_specular.is_valid()) {
+							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular, lighting_indirect_specular);
+						} else {
+							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular);
+						}
+					} else if (lighting_sky_light_diffuse.is_valid()) {
+						if (lighting_indirect_specular.is_valid()) {
+							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_sky_light_diffuse, lighting_indirect_specular);
 						} else {
 							opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_sky_light_diffuse);
 						}
-					} else if (lighting_specular.is_valid()) {
-						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_specular);
+					} else if (lighting_indirect_specular.is_valid()) {
+						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color, lighting_indirect_specular);
 					} else {
 						opaque_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(rb->get_view_count(), lighting_color);
 					}
@@ -3350,6 +3439,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						}
 						if (write_sky_light_diffuse) {
 							lighting_mode |= 4;
+						}
+						if (indirect_specular_requested) {
+							lighting_mode |= 8;
 						}
 
 						SceneShaderFRPClustered::ShaderSpecialization lighting_specialization = base_specialization;
@@ -3398,6 +3490,14 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						if (sky_light_diffuse_requested && use_msaa) {
 							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 								RD::get_singleton()->texture_resolve_multisample(rb_data->get_sky_light_diffuse_msaa(v), rb_data->get_sky_light_diffuse(v));
+							}
+						}
+						if (indirect_specular_requested && use_msaa) {
+							for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+								RD::get_singleton()->texture_resolve_multisample(rb_data->get_indirect_specular_msaa(v), rb_data->get_indirect_specular(v));
+								if (lighting_specular.is_valid()) {
+									RD::get_singleton()->texture_resolve_multisample(rb_data->get_specular_msaa(v), rb_data->get_specular(v));
+								}
 							}
 						}
 					}
@@ -3845,6 +3945,20 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				}
 				return true;
 			});
+	pass_context->set_indirect_specular_target_provider([&](int p_view) {
+		if (!rb.is_valid() || !rb_data.is_valid() || p_view < 0 || p_view >= int(rb->get_view_count())) {
+			return RID();
+		}
+		const bool separate_specular_pending = using_separate_specular &&
+				!pass_context->is_operation_completed(FRPPipelineSpec::OP_SUBSURFACE_AND_SPECULAR);
+		if (separate_specular_pending) {
+			if (use_msaa) {
+				RD::get_singleton()->texture_resolve_multisample(rb_data->get_specular_msaa(p_view), rb_data->get_specular(p_view));
+			}
+			return rb_data->get_specular(p_view);
+		}
+		return rb->get_internal_texture(p_view);
+	});
 	// Publish immutable per-face metadata only for the explicitly configured
 	// FengSkyLight capture source. The native generation changes at each actual
 	// capture start, while all six faces in one batch share it.
@@ -3917,6 +4031,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			}
 			Callable callback = pipeline_storage->compositor_effect_get_callback(effect);
 			Object *callback_object = callback.get_object();
+			pass_context->begin_indirect_specular_callback();
 			if (callback_object != nullptr && callback_object->has_method("_frp_execute")) {
 				// A pass that knows the FRP Core drives the frame itself. Everything
 				// else keeps using the CompositorEffect callback contract.
@@ -3928,6 +4043,20 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				arguments.push_back(pipeline_storage->compositor_effect_get_callback_type(effect));
 				arguments.push_back(p_render_data);
 				callback.callv(arguments);
+			}
+			if (use_msaa && rb_data.is_valid() && pass_context->is_indirect_specular_requested()) {
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					if (!pass_context->is_indirect_specular_modified(v)) {
+						continue;
+					}
+					// Only a consumer that asked for a target and actually wrote the
+					// separate-specular view needs synchronization before a later resolve.
+					RID composite_target = pass_context->get_indirect_specular_composite_target(v);
+					if (composite_target == rb_data->get_specular(v)) {
+						copy_effects->copy_to_fb_rect(composite_target, rb_data->get_specular_only_fb(v), Rect2i(),
+								false, false, false, false, RID(), false);
+					}
+				}
 			}
 			if (use_msaa && pipeline_storage->compositor_effect_get_flag(effect, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_COLOR)) {
 				// Keep later geometry and resolves from overwriting custom color
@@ -6046,6 +6175,14 @@ RenderFRPClustered::RenderFRPClustered() {
 		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE
 		modes.push_back(defines + "\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE
 		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE
+		modes.push_back(defines + "\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define USE_MULTIVIEW\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_MULTIVIEW_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define MODE_SKY_LIGHT_DIFFUSE\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define MODE_SKY_LIGHT_DIFFUSE\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR
+		modes.push_back(defines + "\n#define MODE_SEPARATE_SPECULAR\n#define USE_MULTIVIEW\n#define MODE_SKY_LIGHT_DIFFUSE\n#define MODE_INDIRECT_SPECULAR\n"); // FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR
 
 		frp_lighting.shader.initialize(modes);
 		frp_lighting.shader_version = frp_lighting.shader.version_create();
@@ -6055,7 +6192,7 @@ RenderFRPClustered::RenderFRPClustered() {
 			ERR_FAIL_COND(shader.is_null());
 			for (FrpLighting::ViewVariant &variant : frp_lighting.view_variants) {
 				// Actual pipelines are created lazily for used view/framebuffer combinations.
-				variant.pipelines[i].setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(3));
+				variant.pipelines[i].setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(4));
 			}
 		}
 	}

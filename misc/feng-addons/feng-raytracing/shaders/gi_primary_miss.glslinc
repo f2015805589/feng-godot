@@ -8,6 +8,7 @@
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 #if FENG_GI_SKY_ARRAY
@@ -61,6 +62,8 @@ vec3 gi_sample_sky(vec3 world_direction) {
 }
 
 void main() {
+	uint path_mode = gi_payload.flags;
 	gi_payload.radiance = gi_sample_sky(gl_WorldRayDirectionEXT);
-	gi_payload.flags = 0u;
+	gi_payload.flags = path_mode == 2u ? 4u : 0u;
+	gi_payload.hit_distance = path_mode == 2u ? -max(gi_frame.data.trace_parameters.x, 0.001) : 0.0;
 }

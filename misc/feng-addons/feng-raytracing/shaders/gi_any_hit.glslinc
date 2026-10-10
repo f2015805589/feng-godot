@@ -4,6 +4,7 @@
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 struct GIFrameData {
@@ -35,6 +36,7 @@ hitAttributeEXT vec2 gi_barycentrics;
 const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
 const uint GI_MATERIAL_TWO_SIDED = 2u;
 const uint GI_DIRECTIONAL_CAPACITY = 8u;
+const uint GI_MATERIAL_WORD_STRIDE = 20u;
 const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
 
 void main() {
@@ -56,7 +58,7 @@ void main() {
 	}
 
 	uint material_index = gi_surfaces.words[gl_InstanceCustomIndexEXT * 8u + 3u];
-	uint material_flags = gi_materials.words[material_index * 16u + 10u];
+	uint material_flags = gi_materials.words[material_index * GI_MATERIAL_WORD_STRIDE + 10u];
 	if ((material_flags & GI_MATERIAL_TWO_SIDED) == 0u
 			&& gl_HitKindEXT != gl_HitKindFrontFacingTriangleEXT) {
 		ignoreIntersectionEXT;

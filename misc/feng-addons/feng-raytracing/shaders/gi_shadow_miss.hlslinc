@@ -1,10 +1,12 @@
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 [shader("miss")]
 void FengGIShadowMiss(inout GIPathPayload payload) {
 	payload.radiance = float3(1.0f, 0.0f, 0.0f);
 	payload.flags = 1u;
+	payload.hit_distance = 0.0f;
 }

@@ -8,6 +8,7 @@
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 struct GIFrameData {
@@ -45,6 +46,7 @@ layout(set = 0, binding = 11, std430) readonly buffer GIMaterialRows {
 layout(set = 0, binding = 20, std140) uniform GIFrame {
 	GIFrameData data;
 } gi_frame;
+layout(set = 0, binding = 23) uniform sampler2D gi_dfg_lut;
 
 layout(set = 0, binding = 12) uniform sampler2DArray gi_albedo_group_0;
 layout(set = 0, binding = 13) uniform sampler2DArray gi_albedo_group_1;
@@ -60,12 +62,33 @@ layout(location = 1) rayPayloadEXT GIPathPayload shadow_payload;
 hitAttributeEXT vec2 gi_barycentrics;
 
 const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
+const uint GI_RAY_MODE_REFLECTION = 2u;
 const uint GI_MATERIAL_HAS_ALBEDO_TEXTURE = 1u;
 const uint GI_MATERIAL_TWO_SIDED = 2u;
 const uint GI_DIRECTIONAL_CAPACITY = 8u;
 const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
+const uint GI_MATERIAL_WORD_STRIDE = 20u;
 const uint GI_SKY_SAMPLE_COUNT = 8u;
 const float GI_INV_PI = 0.3183098861837907;
+
+float gi_distribution_ggx(float p_no_h, float p_roughness) {
+	float alpha = max(p_roughness * p_roughness, 1e-4);
+	float alpha2 = alpha * alpha;
+	float term = p_no_h * p_no_h * (alpha2 - 1.0) + 1.0;
+	return alpha2 / max(3.14159265359 * term * term, 1e-7);
+}
+
+float gi_smith_g1(float p_no_x, float p_roughness) {
+	float alpha = max(p_roughness * p_roughness, 1e-4);
+	float alpha2 = alpha * alpha;
+	float no_x2 = p_no_x * p_no_x;
+	return 2.0 * p_no_x / max(p_no_x + sqrt(alpha2 + (1.0 - alpha2) * no_x2), 1e-6);
+}
+
+vec3 gi_fresnel_schlick(float p_vo_h, vec3 p_f0, float p_f90) {
+	float factor = pow(clamp(1.0 - p_vo_h, 0.0, 1.0), 5.0);
+	return p_f0 + (vec3(p_f90) - p_f0) * factor;
+}
 
 uint gi_hash(uint p_value) {
 	p_value ^= p_value >> 16u;
@@ -115,6 +138,29 @@ vec3 gi_sample_sky_raw(vec3 p_world_direction) {
 	vec3 sampled = textureLod(gi_sky_radiance, vec3(uv, 0.0), 0.0).rgb;
 #else
 	vec3 sampled = textureLod(gi_sky_radiance, uv, 0.0).rgb;
+#endif
+	vec3 raw_radiance = max(sampled, vec3(0.0)) * max(gi_frame.data.light_sky_parameters.y, 0.0)
+			/ captured_exposure;
+	return gi_finite_nonnegative(raw_radiance);
+}
+
+vec3 gi_sample_sky_specular(vec3 p_world_direction, float p_roughness) {
+	float captured_exposure = gi_frame.data.light_sky_parameters.z;
+	if (!(captured_exposure > 0.0) || isnan(captured_exposure) || isinf(captured_exposure)) {
+		return vec3(0.0);
+	}
+	vec3 sky_direction = gi_transform_world_to_sky(normalize(p_world_direction));
+	float border = clamp(gi_frame.data.light_sky_parameters.w, 0.0, 0.49);
+	vec2 uv = gi_direction_to_oct(sky_direction) * (1.0 - 2.0 * border) + border;
+	float roughness_lod = sqrt(clamp(p_roughness, 0.0, 1.0)) * float(gi_frame.data.generation_history_flags.z);
+#if FENG_GI_SKY_ARRAY
+	float lower_layer = floor(roughness_lod);
+	float upper_layer = min(lower_layer + 1.0, float(gi_frame.data.generation_history_flags.z));
+	vec3 lower_sample = textureLod(gi_sky_radiance, vec3(uv, lower_layer), 0.0).rgb;
+	vec3 upper_sample = textureLod(gi_sky_radiance, vec3(uv, upper_layer), 0.0).rgb;
+	vec3 sampled = mix(lower_sample, upper_sample, fract(roughness_lod));
+#else
+	vec3 sampled = textureLod(gi_sky_radiance, uv, roughness_lod).rgb;
 #endif
 	vec3 raw_radiance = max(sampled, vec3(0.0)) * max(gi_frame.data.light_sky_parameters.y, 0.0)
 			/ captured_exposure;
@@ -220,13 +266,15 @@ void main() {
 		world_normal = -world_normal;
 	}
 
-	uint material_word = material_index * 16u;
+	uint material_word = material_index * GI_MATERIAL_WORD_STRIDE;
 	vec4 base_color = uintBitsToFloat(uvec4(gi_materials.words[material_word + 0u], gi_materials.words[material_word + 1u],
 			gi_materials.words[material_word + 2u], gi_materials.words[material_word + 3u]));
 	vec3 emission_color = uintBitsToFloat(uvec3(gi_materials.words[material_word + 4u], gi_materials.words[material_word + 5u],
 			gi_materials.words[material_word + 6u]));
 	float emission_energy = uintBitsToFloat(gi_materials.words[material_word + 7u]);
 	float metallic = clamp(uintBitsToFloat(gi_materials.words[material_word + 8u]), 0.0, 1.0);
+	float roughness = clamp(uintBitsToFloat(gi_materials.words[material_word + 16u]), 0.0, 1.0);
+	float material_specular = clamp(uintBitsToFloat(gi_materials.words[material_word + 17u]), 0.0, 1.0);
 	uint material_flags = gi_materials.words[material_word + 10u];
 	uint texture_group = gi_materials.words[material_word + 11u];
 	uint texture_layer = gi_materials.words[material_word + 9u];
@@ -238,6 +286,60 @@ void main() {
 	vec3 outgoing_radiance = max(emission_color, vec3(0.0)) * max(emission_energy, 0.0);
 	uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
 	uint full_layer_mask = gi_surfaces.words[row_word + 5u];
+	if (gi_payload.flags == GI_RAY_MODE_REFLECTION) {
+		vec3 view_direction = normalize(-gl_WorldRayDirectionEXT);
+		float no_v = max(dot(world_normal, view_direction), 1e-4);
+		vec3 f0 = mix(vec3(0.16 * material_specular * material_specular), albedo, metallic);
+		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
+		vec2 env_brdf = textureLod(gi_dfg_lut, vec2(no_v, 1.0 - roughness), 0.0).rg;
+		vec3 energy_compensation = vec3(1.0);
+		if (env_brdf.y > 1e-4 && !isnan(env_brdf.y) && !isinf(env_brdf.y)) {
+			energy_compensation = 1.0 + f0 * (1.0 / env_brdf.y - 1.0);
+		}
+		if (sun_index < GI_DIRECTIONAL_CAPACITY) {
+			vec4 direction_energy = gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 0u];
+			vec3 sun_direction = normalize(mat3(gi_frame.data.view_to_world) * direction_energy.xyz);
+			float no_l = max(dot(world_normal, sun_direction), 0.0);
+			float light_buffer_normalization = gi_frame.data.light_sky_parameters.x;
+			uint sun_mask = floatBitsToUint(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 2u].y);
+			if (no_l > 0.0 && (full_layer_mask & sun_mask) != 0u
+					&& light_buffer_normalization > 0.0 && !isnan(light_buffer_normalization) && !isinf(light_buffer_normalization)) {
+				shadow_payload.radiance = vec3(0.0);
+				shadow_payload.flags = GI_RAY_MODE_SUN_VISIBILITY;
+				shadow_payload.hit_distance = 0.0;
+				vec3 world_hit = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
+				traceRayEXT(gi_scene_tlas,
+						gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+						0x02u, 0u, 0u, 1u, world_hit + world_normal * 0.001,
+						0.001, sun_direction, max(gi_frame.data.trace_parameters.x, 0.001), 1);
+				float visibility = clamp(shadow_payload.radiance.x, 0.0, 1.0);
+				float energy = max(direction_energy.w / light_buffer_normalization, 0.0);
+				vec3 light_color = max(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 1u].rgb, vec3(0.0));
+				float light_specular = max(gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 2u].x, 0.0);
+				vec3 half_vector = normalize(view_direction + sun_direction);
+				float no_h = max(dot(world_normal, half_vector), 0.0);
+				float vo_h = max(dot(view_direction, half_vector), 0.0);
+				vec3 fresnel = gi_fresnel_schlick(vo_h, f0, f90);
+				float distribution = gi_distribution_ggx(no_h, roughness);
+				float geometry = gi_smith_g1(no_l, roughness) * gi_smith_g1(no_v, roughness);
+				vec3 incident = light_color * (energy * visibility);
+				vec3 direct_diffuse = diffuse_reflectance * (vec3(1.0) - fresnel) * incident * (no_l * GI_INV_PI);
+				vec3 direct_specular = energy_compensation * fresnel * distribution * geometry
+						/ max(4.0 * no_l * no_v, 1e-5) * incident * (no_l * light_specular);
+				outgoing_radiance += direct_diffuse + direct_specular;
+			}
+		}
+		uint sky_seed = gi_hash(instance_index * 0x9e3779b9u ^ uint(gl_PrimitiveID) * 0x85ebca6bu
+				^ floatBitsToUint(gi_barycentrics.x) ^ floatBitsToUint(gi_barycentrics.y));
+		outgoing_radiance += diffuse_reflectance * gi_sample_sky_diffuse(world_normal, sky_seed);
+		vec3 sky_specular = gi_sample_sky_specular(reflect(-view_direction, world_normal), roughness);
+		outgoing_radiance += sky_specular * (vec3(f90) - f0) * env_brdf.x * energy_compensation
+				+ sky_specular * f0 * env_brdf.y * energy_compensation;
+		gi_payload.radiance = gi_finite_nonnegative(outgoing_radiance);
+		gi_payload.flags = 0u;
+		gi_payload.hit_distance = gl_HitTEXT;
+		return;
+	}
 	if (sun_index < GI_DIRECTIONAL_CAPACITY) {
 		vec4 direction_energy = gi_lights.light_data[sun_index * GI_DIRECTIONAL_STRIDE_VEC4 + 0u];
 		vec3 sun_direction = normalize(mat3(gi_frame.data.view_to_world) * direction_energy.xyz);
@@ -265,4 +367,5 @@ void main() {
 	outgoing_radiance += diffuse_reflectance * gi_sample_sky_diffuse(world_normal, sky_seed);
 	gi_payload.radiance = gi_finite_nonnegative(outgoing_radiance);
 	gi_payload.flags = 0u;
+	gi_payload.hit_distance = gl_HitTEXT;
 }

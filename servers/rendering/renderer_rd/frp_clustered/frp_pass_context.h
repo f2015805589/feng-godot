@@ -96,6 +96,11 @@ class FRPPassContext : public RefCounted {
 	RID atmosphere_multiple_texture;
 	// Optional per-frame capture of the global SkyLight diffuse term for GI passes.
 	bool sky_light_diffuse_requested = false;
+	bool indirect_specular_requested = false;
+	std::function<RID(int)> indirect_specular_target_provider;
+	RID indirect_specular_target_cache[2];
+	bool indirect_specular_target_cached[2] = { false, false };
+	bool indirect_specular_modified[2] = { false, false };
 	// Current scene exposure scale excluding pre-exposure, matching the FRP lighting UBO.
 	float scene_exposure_normalization = 1.0f;
 	// Immutable cloud inputs for this frame. The pass supplies only value packets and
@@ -204,6 +209,13 @@ public:
 	// Requests the deferred opaque lighting pass to publish its global SkyLight diffuse contribution.
 	void request_sky_light_diffuse();
 	bool is_sky_light_diffuse_requested() const { return sky_light_diffuse_requested; }
+	void request_indirect_specular();
+	bool is_indirect_specular_requested() const { return indirect_specular_requested; }
+	void set_indirect_specular_target_provider(const std::function<RID(int)> &p_provider) { indirect_specular_target_provider = p_provider; }
+	void begin_indirect_specular_callback();
+	RID get_indirect_specular_composite_target(int p_view = 0);
+	void mark_indirect_specular_modified(int p_view = 0);
+	bool is_indirect_specular_modified(int p_view) const;
 	void set_cloud_snapshot(const PackedFloat32Array &p_material_parameters, RID p_shape_texture, RID p_detail_texture, RID p_weather_texture, RID p_curl_texture, RID p_primary_sun, RID p_secondary_sun, int64_t p_source_signature = 0);
 	void clear_cloud_snapshot();
 	void set_cloud_layout_textures(RID p_pattern_texture, RID p_cloud_mask_texture, RID p_height_profile_texture);

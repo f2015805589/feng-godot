@@ -4,10 +4,12 @@
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
+	float hit_distance;
 };
 layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
 
 void main() {
 	gi_payload.radiance = vec3(1.0, 0.0, 0.0);
 	gi_payload.flags = 1u;
+	gi_payload.hit_distance = 0.0;
 }

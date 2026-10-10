@@ -20,6 +20,7 @@ RWTexture2D<float4> gi_output : register(u21, space0);
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
+	float hit_distance;
 };
 
 static const uint GI_RAY_MODE_PRIMARY = 0u;
@@ -142,6 +143,7 @@ void FengGIRayGen() {
 		GIPathPayload payload;
 		payload.radiance = 0.0f;
 		payload.flags = GI_RAY_MODE_PRIMARY;
+		payload.hit_distance = 0.0f;
 		RayDesc ray;
 		ray.Origin = world_position + normal_world * 0.001f;
 		ray.TMin = 0.001f;

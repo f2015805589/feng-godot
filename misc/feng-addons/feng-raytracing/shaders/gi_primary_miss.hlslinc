@@ -24,7 +24,11 @@ ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
+	float hit_distance;
 };
+
+static const uint GI_RAY_MODE_REFLECTION = 2u;
+static const uint GI_RAY_MODE_MISS = 4u;
 
 float2 gi_vec3_to_oct(float3 direction) {
 	direction /= abs(direction.x) + abs(direction.y) + abs(direction.z);
@@ -60,6 +64,9 @@ float3 gi_sample_sky(float3 world_direction) {
 
 [shader("miss")]
 void FengGIPrimaryMiss(inout GIPathPayload payload) {
+	uint path_mode = payload.flags;
 	payload.radiance = gi_sample_sky(WorldRayDirection());
-	payload.flags = 0u;
+	payload.flags = path_mode == GI_RAY_MODE_REFLECTION ? GI_RAY_MODE_MISS : 0u;
+	payload.hit_distance = path_mode == GI_RAY_MODE_REFLECTION
+			? -max(gi_frame.trace_parameters.x, 0.001f) : 0.0f;
 }

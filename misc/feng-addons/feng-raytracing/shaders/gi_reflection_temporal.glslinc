@@ -1,0 +1,103 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D raw_reflection;
+layout(set = 0, binding = 1) uniform sampler2D previous_radiance;
+layout(set = 0, binding = 2) uniform sampler2D previous_depth;
+layout(set = 0, binding = 3) uniform sampler2D previous_normal_roughness;
+layout(set = 0, binding = 4) uniform sampler2D previous_hit_data;
+layout(set = 0, binding = 5) uniform sampler2D current_depth;
+layout(set = 0, binding = 6) uniform sampler2D current_normal;
+layout(set = 0, binding = 7) uniform sampler2D current_orm;
+layout(set = 0, binding = 8) uniform sampler2D previous_material;
+layout(set = 0, binding = 9) uniform sampler2D current_emission;
+layout(set = 0, binding = 10) uniform sampler2D current_albedo;
+layout(set = 0, binding = 11) uniform sampler2D previous_albedo;
+layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D next_radiance;
+layout(set = 0, binding = 13, r32f) uniform writeonly image2D next_depth;
+layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D next_normal_roughness;
+layout(set = 0, binding = 15, r32f) uniform writeonly image2D next_hit_data;
+layout(set = 0, binding = 16, rg16f) uniform writeonly image2D next_material;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D next_albedo;
+layout(set = 0, binding = 18, std140) uniform ReflectionTemporal {
+	vec4 parameters; // history weight, exposure ratio, relative depth threshold, minimum normal dot.
+	vec4 thresholds; // roughness, hit-distance, metallic and specular rejection thresholds.
+	uvec4 state; // valid history, generation low, generation high, replacement-strength bits.
+} temporal;
+
+const float GI_HALF_MAX = 65504.0;
+
+vec3 finite_nonnegative_half(vec3 value) {
+	if (any(isnan(value)) || any(isinf(value))) {
+		return vec3(0.0);
+	}
+	return clamp(value, vec3(0.0), vec3(GI_HALF_MAX));
+}
+
+ivec2 nearest_texel(vec2 uv, ivec2 size) {
+	return clamp(ivec2(floor(uv * vec2(size))), ivec2(0), size - ivec2(1));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(next_radiance);
+	if (any(greaterThanEqual(pixel, size))) {
+		return;
+	}
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+	vec4 raw = texelFetch(raw_reflection, pixel, 0);
+	float depth = texelFetch(current_depth, nearest_texel(uv, textureSize(current_depth, 0)), 0).r;
+	vec3 normal = normalize(texelFetch(current_normal, nearest_texel(uv, textureSize(current_normal, 0)), 0).xyz * 2.0 - 1.0);
+	vec4 orm = texelFetch(current_orm, nearest_texel(uv, textureSize(current_orm, 0)), 0);
+	float roughness = clamp(orm.g, 0.0, 1.0);
+	float metallic = clamp(orm.b, 0.0, 1.0);
+	float specular = clamp(texelFetch(current_emission, nearest_texel(uv, textureSize(current_emission, 0)), 0).a, 0.0, 1.0);
+	vec3 albedo = max(texelFetch(current_albedo, nearest_texel(uv, textureSize(current_albedo, 0)), 0).rgb, vec3(0.0));
+	bool raw_rgb_valid = !any(isnan(raw.rgb)) && !any(isinf(raw.rgb));
+	bool current_valid = raw.a != 0.0 && !isnan(raw.a) && !isinf(raw.a) && raw_rgb_valid
+			&& depth > 0.0 && !isnan(depth) && !isinf(depth)
+			&& !any(isnan(normal)) && !any(isinf(normal)) && !isnan(roughness) && !isinf(roughness)
+			&& !isnan(metallic) && !isinf(metallic) && !isnan(specular) && !isinf(specular);
+	float exposure_ratio = temporal.parameters.y;
+	bool exposure_compatible = exposure_ratio >= 0.25 && exposure_ratio <= 4.0
+			&& !isnan(exposure_ratio) && !isinf(exposure_ratio);
+	bool use_history = temporal.state.x != 0u && current_valid && exposure_compatible;
+	ivec2 old_pixel = nearest_texel(uv, textureSize(previous_radiance, 0));
+	float old_depth = texelFetch(previous_depth, old_pixel, 0).r;
+	vec4 old_normal_roughness = texelFetch(previous_normal_roughness, old_pixel, 0);
+	float old_hit = texelFetch(previous_hit_data, old_pixel, 0).r;
+	vec2 old_material = texelFetch(previous_material, old_pixel, 0).rg;
+	vec3 old_albedo = texelFetch(previous_albedo, old_pixel, 0).rgb;
+	bool old_hit_surface = old_hit > 0.0;
+	bool current_hit_surface = raw.a > 0.0;
+	float hit_delta = abs(abs(raw.a) - abs(old_hit));
+	float hit_limit = max(abs(old_hit), 1.0) * temporal.thresholds.y;
+	use_history = use_history && old_depth > 0.0 && !isnan(old_depth) && !isinf(old_depth)
+			&& abs(depth - old_depth) <= max(abs(depth), 0.01) * temporal.parameters.z
+			&& dot(normal, normalize(old_normal_roughness.xyz)) >= temporal.parameters.w
+			&& abs(roughness - old_normal_roughness.w) <= temporal.thresholds.x
+			&& abs(metallic - old_material.x) <= temporal.thresholds.z
+			&& abs(specular - old_material.y) <= temporal.thresholds.w
+			&& (metallic <= 0.01 || length(albedo - old_albedo) <= 0.05)
+			&& old_hit_surface == current_hit_surface && hit_delta <= hit_limit;
+	vec3 current_radiance = raw_rgb_valid ? finite_nonnegative_half(raw.rgb) : vec3(0.0);
+	vec3 radiance = current_radiance;
+	if (use_history) {
+		vec3 stored_old_radiance = texelFetch(previous_radiance, old_pixel, 0).rgb;
+		bool old_radiance_valid = !any(isnan(stored_old_radiance)) && !any(isinf(stored_old_radiance))
+				&& all(greaterThanEqual(stored_old_radiance, vec3(0.0)));
+		vec3 old_radiance = old_radiance_valid
+				? finite_nonnegative_half(stored_old_radiance * exposure_ratio) : vec3(0.0);
+		use_history = use_history && old_radiance_valid;
+		if (use_history) {
+			radiance = mix(current_radiance, old_radiance, clamp(temporal.parameters.x, 0.0, 0.98));
+		}
+	}
+	radiance = finite_nonnegative_half(radiance);
+	imageStore(next_radiance, pixel, vec4(current_valid ? radiance : vec3(0.0), current_valid ? 1.0 : 0.0));
+	imageStore(next_depth, pixel, vec4(current_valid ? depth : 0.0));
+	imageStore(next_normal_roughness, pixel, vec4(current_valid ? normal : vec3(0.0), current_valid ? roughness : 0.0));
+	imageStore(next_hit_data, pixel, vec4(current_valid ? raw.a : 0.0));
+	imageStore(next_material, pixel, vec4(current_valid ? vec2(metallic, specular) : vec2(0.0), 0.0, 0.0));
+	imageStore(next_albedo, pixel, vec4(current_valid ? albedo : vec3(0.0), current_valid ? 1.0 : 0.0));
+}

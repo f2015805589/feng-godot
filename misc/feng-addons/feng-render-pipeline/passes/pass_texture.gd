@@ -21,6 +21,9 @@ enum Source {
 	# Reading it is what makes an "after tonemap" effect a post-process effect.
 	TONEMAPPED,
 	MOTION_VECTORS,
+	# Complete DFG- and pre-exposed indirect specular term captured by deferred lighting.
+	# Appended to preserve the serialized values of existing texture sources.
+	INDIRECT_SPECULAR,
 }
 
 const TONEMAPPER_SCOPE: StringName = NativeSpec.SCOPE_TONEMAPPER
@@ -42,6 +45,8 @@ static func required_native_pass(source: Source) -> int:
 			return NativeSpec.PASS_LIGHTING
 		Source.DEPTH, Source.NORMAL_ROUGHNESS, Source.ALBEDO, Source.ORM, Source.EMISSION, Source.MOTION_VECTORS:
 			return NativeSpec.PASS_GBUFFER
+		Source.INDIRECT_SPECULAR:
+			return NativeSpec.PASS_LIGHTING
 		Source.TONEMAPPED:
 			return NativeSpec.PASS_POST_PROCESS
 	return -1
@@ -96,6 +101,8 @@ func get_texture(buffers: RenderSceneBuffersRD, view: int) -> RID:
 			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_ORM, view)
 		Source.EMISSION:
 			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_GBUFFER_EMISSION, view)
+		Source.INDIRECT_SPECULAR:
+			return _get_named_texture(buffers, FRP_SCOPE, NativeSpec.TEX_INDIRECT_SPECULAR, view)
 		Source.PIPELINE:
 			return _get_named_texture(buffers, PIPELINE_SCOPE, custom_name, view)
 		Source.TONEMAPPED:

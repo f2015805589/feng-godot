@@ -109,6 +109,9 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	clear_cloud_outputs();
 	set_cloud_capture_context(false, 0, -1, 0, Vector3(), 1.0f);
 	sky_light_diffuse_requested = false;
+	indirect_specular_requested = false;
+	indirect_specular_target_provider = std::function<RID(int)>();
+	begin_indirect_specular_callback();
 	tonemap_mode_override = -1;
 }
 
@@ -495,6 +498,43 @@ void FRPPassContext::request_sky_light_diffuse() {
 	sky_light_diffuse_requested = true;
 }
 
+void FRPPassContext::request_indirect_specular() {
+	ERR_FAIL_NULL_MSG(render_data, "FRP pass context used outside of an FRP frame.");
+	indirect_specular_requested = true;
+}
+
+void FRPPassContext::begin_indirect_specular_callback() {
+	for (int view = 0; view < 2; view++) {
+		indirect_specular_target_cache[view] = RID();
+		indirect_specular_target_cached[view] = false;
+		indirect_specular_modified[view] = false;
+	}
+}
+
+RID FRPPassContext::get_indirect_specular_composite_target(int p_view) {
+	ERR_FAIL_INDEX_V(p_view, RendererSceneRender::MAX_RENDER_VIEWS, RID());
+	if (!indirect_specular_requested) {
+		return RID();
+	}
+	if (!indirect_specular_target_cached[p_view]) {
+		indirect_specular_target_cache[p_view] = indirect_specular_target_provider ? indirect_specular_target_provider(p_view) : RID();
+		indirect_specular_target_cached[p_view] = true;
+	}
+	return indirect_specular_target_cache[p_view];
+}
+
+void FRPPassContext::mark_indirect_specular_modified(int p_view) {
+	ERR_FAIL_INDEX(p_view, RendererSceneRender::MAX_RENDER_VIEWS);
+	if (indirect_specular_requested) {
+		indirect_specular_modified[p_view] = true;
+	}
+}
+
+bool FRPPassContext::is_indirect_specular_modified(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, RendererSceneRender::MAX_RENDER_VIEWS, false);
+	return indirect_specular_modified[p_view];
+}
+
 void FRPPassContext::_finish_pre_exposure_readback(const PackedByteArray &p_data, const Ref<FRPPassContext> &p_context, int p_view) {
 	if (p_data.size() < int(sizeof(float)) || p_context.is_null()) {
 		return;
@@ -694,6 +734,8 @@ void FRPPassContext::clear_after_operation_callbacks() {
 	dispatching_after_operation_callbacks.clear();
 	completed_operations.clear();
 	operation_is_scheduled = std::function<bool(int)>();
+	indirect_specular_target_provider = std::function<RID(int)>();
+	begin_indirect_specular_callback();
 }
 
 bool FRPPassContext::is_operation_completed(int p_operation) const {
@@ -732,6 +774,10 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_atmosphere_optical_texture"), &FRPPassContext::get_atmosphere_optical_texture);
 	ClassDB::bind_method(D_METHOD("get_atmosphere_multiple_texture"), &FRPPassContext::get_atmosphere_multiple_texture);
 	ClassDB::bind_method(D_METHOD("request_sky_light_diffuse"), &FRPPassContext::request_sky_light_diffuse);
+	ClassDB::bind_method(D_METHOD("request_indirect_specular"), &FRPPassContext::request_indirect_specular);
+	ClassDB::bind_method(D_METHOD("is_indirect_specular_requested"), &FRPPassContext::is_indirect_specular_requested);
+	ClassDB::bind_method(D_METHOD("get_indirect_specular_composite_target", "view"), &FRPPassContext::get_indirect_specular_composite_target, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("mark_indirect_specular_modified", "view"), &FRPPassContext::mark_indirect_specular_modified, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_cloud_snapshot", "material_parameters", "shape_texture", "detail_texture", "weather_texture", "curl_texture", "primary_sun", "secondary_sun", "source_signature"), &FRPPassContext::set_cloud_snapshot, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("clear_cloud_snapshot"), &FRPPassContext::clear_cloud_snapshot);
 	ClassDB::bind_method(D_METHOD("has_cloud_snapshot"), &FRPPassContext::has_cloud_snapshot);

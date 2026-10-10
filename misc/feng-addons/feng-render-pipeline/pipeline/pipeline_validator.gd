@@ -24,6 +24,7 @@ static func validate_schedule(
 	var native_positions := {}
 	var native_states := {}
 	var native_tokens := {}
+	var provider_positions := {}
 
 	for i in passes.size():
 		var pass_entry = passes[i]
@@ -33,6 +34,14 @@ static func validate_schedule(
 
 		var enabled: bool = is_entry_enabled_fn.call(pass_entry)
 		if enabled:
+			for provided_id in pass_entry.provides_native_ids:
+				provider_positions[int(provided_id)] = i
+			if pass_entry is BuiltinPass:
+				var provider_entry := pass_entry as BuiltinPass
+				if provider_entry.implementation != null:
+					provider_positions[provider_entry.native_id] = i
+					for provided_id in provider_entry.implementation.provides_native_ids:
+						provider_positions[int(provided_id)] = i
 			for warning in pass_entry.get_configuration_warnings():
 				warnings.append(warning)
 
@@ -90,6 +99,23 @@ static func validate_schedule(
 			continue
 		if native_positions[before_id] > native_positions[after_id]:
 			warnings.append("Native pass '%s' must precede '%s'; authored order was retained and the previous valid schedule remains active." % [NativeSpec.pass_name(before_id), NativeSpec.pass_name(after_id)])
+
+	# Pass implementations can declare the native operations they must run before.
+	# Resolve the scheduler parameter source so a BuiltinPass carrying a custom
+	# implementation receives the same ordering check as a top-level custom pass.
+	# This source is independent of authored enabled state: the resolved enable
+	# callback above already accounts for Volume overrides.
+	for i in passes.size():
+		var pass_entry = passes[i]
+		if pass_entry == null or not is_entry_enabled_fn.call(pass_entry):
+			continue
+		var parameter_source: FengPass = pass_entry.get_parameter_source()
+		if parameter_source == null:
+			continue
+		for required_id in parameter_source.get_required_before_native_ids():
+			var target_index := int(provider_positions.get(int(required_id), native_positions.get(int(required_id), -1)))
+			if target_index >= 0 and i > target_index:
+				warnings.append("Pass '%s' must precede native '%s'; authored order was retained and the previous valid schedule remains active." % [_pass_display_name(pass_entry), NativeSpec.pass_name(int(required_id))])
 
 	warnings.append_array(_validate_custom_contracts(passes, native_positions, native_states, declared_provided_ids, is_entry_enabled_fn))
 	warnings.append_array(_validate_cloud_fog_order(passes, is_entry_enabled_fn))

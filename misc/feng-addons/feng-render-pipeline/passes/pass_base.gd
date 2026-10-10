@@ -224,6 +224,11 @@ func get_volume_parameter_names() -> PackedStringArray:
 func get_indirect_gi_kind() -> StringName:
 	return &""
 
+## Native entries this custom pass must stay before. Pipeline validators use these
+## semantic bounds to reject schedules that would composite after a later transform.
+func get_required_before_native_ids() -> PackedInt32Array:
+	return PackedInt32Array()
+
 ## Opt into sharing this pass's execution resource across camera views.
 ##
 ## Return true only when the pass and every pass it carries can run without retaining
