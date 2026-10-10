@@ -45,7 +45,7 @@
       "ue_cooker_or_ddc_output": false,
       "description": "Pinned source-order float32 CPU reference of legacy TMGS_Blur1, from the 1024 source through the 256 size cap and full 256-to-1 mip chain; Godot save/reload preserves the uncompressed RGBAF mip payload. This is not platform-cooked UE texture output."
     },
-    "time_texture_size": "TextureProperty_1 defaults to TMTM_TextureSize; kernel uses textureSize(pattern,0).x for the Time divisor so the actual runtime texture extent drives the same graph input."
+    "time_texture_size": "TextureProperty_1 defaults to TMTM_TextureSize; Divide_2 divides the actual runtime Pattern width by Layout_CloudGlobalScale (256.0), and Multiply_26 multiplies that ratio by 1000.0 for the Time divisor."
   },
   "forced_mip_source": {
     "file": "Engine/Source/Runtime/Renderer/Private/VolumetricCloudRendering.cpp",
@@ -92,7 +92,7 @@
     "output_index_coercions": {
       "texture_sample": "0=RGB, 1=R, 2=G, 3=B, 4=A (MaterialExpressions.cpp:2570-2579)",
       "vector_parameter": "0=RGB, 1=R, 2=G, 3=B, 4=A (MaterialExpressions.cpp:8018-8024)",
-      "append_vector_1": "A receives WindControls.rgb * WindControls.a; B receives Time / (PatternTextureSize.x * 256 km * 1000), yielding RGB wind and A time before masks select them."
+      "append_vector_1": "A receives WindControls.rgb * WindControls.a; B receives fmod(Time,9999999) / ((PatternTextureSize.x / 256.0) * 1000.0), yielding RGB wind and A time before masks select them."
     }
   },
   "generic_material_parameters_not_consumed_by_this_graph": [

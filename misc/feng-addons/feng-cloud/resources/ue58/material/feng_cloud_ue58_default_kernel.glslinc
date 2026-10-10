@@ -59,7 +59,7 @@ FengCloudMaterialSample feng_cloud_custom_material_sample(
 	// UE Time period; Layout_WindControls.rgb * A is (.333333,.333333,.166667).
 	float pattern_runtime_width = float(max(textureSize(cloud_layout_pattern_texture, 0).x, 1));
 	float time_seconds = mod(max(feng_cloud_finite_or_zero(FENG_CLOUD_UE58_TIME_SECONDS), 0.0), 9999999.0);
-	float wind_time = time_seconds / max(pattern_runtime_width * 256.0 * 1000.0, 1.0);
+	float wind_time = time_seconds / max((pattern_runtime_width / 256.0) * 1000.0, 1.0);
 	vec3 layout_wind = vec3(1.0, 1.0, 0.5) * 0.33333298563957214;
 	vec3 animated_layout_wind = layout_wind * wind_time;
 
