@@ -93,6 +93,34 @@ func _run() -> void:
 			zero_volume.bake_data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
 			* Data.VISIBILITY_MOMENT_CHANNELS * 4,
 			zero_bake_elapsed_ms, clear_up_moments.x, ground_hit_moments.x])
+		var legacy_v5: Resource = zero_volume.bake_data.duplicate(true)
+		legacy_v5.format_version = Data.MOMENT_FORMAT_VERSION
+		legacy_v5.visibility_nodes.clear()
+		legacy_v5.visibility_triangles.clear()
+		zero_volume.bake_data = legacy_v5
+		var upgraded: Resource = Baker.new().upgrade_visibility_bake(zero_volume)
+		_check(upgraded != null and upgraded.is_valid()
+				and upgraded.transfer.to_byte_array() == legacy_v5.transfer.to_byte_array()
+				and upgraded.primary_sky_visibility.to_byte_array() == legacy_v5.primary_sky_visibility.to_byte_array()
+				and upgraded.emitter_transport.to_byte_array() == legacy_v5.emitter_transport.to_byte_array()
+				and upgraded.visibility_moments.to_byte_array() == legacy_v5.visibility_moments.to_byte_array()
+				and zero_volume.bake_data == legacy_v5,
+				"matching v5 upgrades static blockers without recomputing transport or mutating its volume")
+		legacy_v5.scene_signature += 1
+		_check(Baker.new().upgrade_visibility_bake(zero_volume) == null,
+				"v5 blocker upgrade refuses a mismatched geometry signature")
+		legacy_v5.scene_signature -= 1
+		zero_volume.bake_samples += 1
+		_check(Baker.new().upgrade_visibility_bake(zero_volume) == null,
+				"v5 blocker upgrade refuses changed bake settings")
+		zero_volume.bake_samples -= 1
+		zero_volume.refresh_surface_points()
+		_check(zero_volume.bake_data != legacy_v5
+				and zero_volume.bake_data.format_version == Data.FORMAT_VERSION
+				and zero_volume.has_bake()
+				and legacy_v5.format_version == Data.MOMENT_FORMAT_VERSION
+				and legacy_v5.visibility_nodes.is_empty(),
+				"scene refresh upgrades a matching v5 in memory while leaving its saved resource untouched")
 	var primary_visibility_l1 := 0.0
 	for coefficient in zero_volume.bake_data.primary_sky_visibility:
 		primary_visibility_l1 += absf(coefficient)
@@ -534,6 +562,12 @@ func _run() -> void:
 			and volume._scene_signature_checked
 			and volume._current_scene_signature == signature_before_quality_change,
 			"changing quality marks old data stale without rewriting its baked sample count")
+	Runtime.publish(volume)
+	var preview_owns_diffuse := false
+	for snapshot in Runtime.snapshots():
+		if snapshot.volume_id == volume.get_instance_id():
+			preview_owns_diffuse = bool(snapshot.replacement_enabled)
+	_check(preview_owns_diffuse, "stale v6 preview replaces SkyLight instead of adding unoccluded ambient light")
 	volume.bake_samples = 512
 	_check(volume.has_bake(), "restoring the matching quality accepts the existing bake again")
 	var receiver := _find_probe(data, Vector3(0.0, 0.0, 0.0), Vector3.UP)
@@ -697,7 +731,7 @@ func _test_directional_visibility_contracts() -> void:
 func _test_emission_data_contracts() -> void:
 	var data: Resource = _make_emission_contract_data()
 	_check(data.is_valid() and data.format_version == Data.FORMAT_VERSION,
-			"synthetic v5 emitter bake validates with explicit anchors and visibility moments")
+			"synthetic v6 emitter bake validates with explicit anchors and visibility moments")
 	_test_render_upload_package(data)
 	for invalid in [NAN, INF]:
 		var bad_transform: Resource = data.duplicate(true)
@@ -708,7 +742,7 @@ func _test_emission_data_contracts() -> void:
 		_check(not bad_grid.is_valid() and not bad_grid.build_cell_indices() and bad_grid.cell_indices.is_empty(),
 				"non-finite lookup transforms fail validation and clear their index payload")
 	_check(data.emitter_count() == 1 and data.has_nonzero_transfer(),
-		"synthetic v5 data counts emitter transport as real indirect transport")
+		"synthetic v6 data counts emitter transport as real indirect transport")
 	var raw_transfer: PackedByteArray = data.transfer.to_byte_array()
 	var raw_emitter_transport: PackedByteArray = data.emitter_transport.to_byte_array()
 	var source_values := PackedFloat32Array([0.5, 0.25, 0.125, 1.0, 1.0, 1.0])
@@ -741,6 +775,8 @@ func _test_emission_data_contracts() -> void:
 	legacy_v2.primary_sky_visibility = PackedFloat32Array()
 	legacy_v2.surface_positions.clear()
 	legacy_v2.visibility_moments.clear()
+	legacy_v2.visibility_nodes.clear()
+	legacy_v2.visibility_triangles.clear()
 	_check(legacy_v2.is_valid() and legacy_v2.emitter_count() == 0,
 			"legacy v2 surface-transport bakes remain valid without emitter arrays")
 	var legacy_v3: Resource = data.duplicate(true)
@@ -748,23 +784,37 @@ func _test_emission_data_contracts() -> void:
 	legacy_v3.primary_sky_visibility.clear()
 	legacy_v3.surface_positions.clear()
 	legacy_v3.visibility_moments.clear()
+	legacy_v3.visibility_nodes.clear()
+	legacy_v3.visibility_triangles.clear()
 	_check(legacy_v3.is_valid() and legacy_v3.emitter_count() == 1,
 			"legacy v3 emitter bakes remain valid without primary Sky visibility")
 	var legacy_v4: Resource = data.duplicate(true)
 	legacy_v4.format_version = Data.PRIMARY_SKY_FORMAT_VERSION
 	legacy_v4.surface_positions.clear()
 	legacy_v4.visibility_moments.clear()
+	legacy_v4.visibility_nodes.clear()
+	legacy_v4.visibility_triangles.clear()
 	_check(legacy_v4.is_valid() and not legacy_v4.matches_layout(
 			legacy_v4.volume_size, legacy_v4.spacing, legacy_v4.surface_offset,
 			legacy_v4.volume_transform, legacy_v4.bake_samples, legacy_v4.bake_bounces,
 			legacy_v4.bake_distance, legacy_v4.terrain_reflectance, legacy_v4.material_reflectance),
-			"legacy v4 data remains loadable but cannot satisfy the v5 runtime layout")
+			"legacy v4 data remains loadable but cannot satisfy the v6 runtime layout")
+	var legacy_v5: Resource = data.duplicate(true)
+	legacy_v5.format_version = Data.MOMENT_FORMAT_VERSION
+	legacy_v5.visibility_nodes.clear()
+	legacy_v5.visibility_triangles.clear()
+	_check(legacy_v5.is_valid(), "legacy v5 remains loadable with its original surface and moment payload")
+	var preview_upload: Dictionary = legacy_v5.make_render_upload()
+	_check(not preview_upload.is_empty() and preview_upload.visibility_node_bytes.size() == 32
+			and preview_upload.visibility_triangle_bytes.size() == 48
+			and legacy_v5.visibility_nodes.is_empty() and legacy_v5.visibility_triangles.is_empty(),
+			"stale v5 keeps its moment-based preview using upload-only empty traversal buffers")
 	for legacy_data in [legacy_v2, legacy_v3, legacy_v4]:
 		var legacy_upload: Dictionary = legacy_data.make_render_upload()
-		_check(legacy_upload.is_empty(), "legacy v2-v4 upload requires an explicit v5 rebake")
+		_check(legacy_upload.is_empty(), "legacy v2-v4 upload requires an explicit current-format rebake")
 		_check(legacy_data.make_geometry_image() == null
 				and legacy_data.make_visibility_moment_image() == null,
-				"legacy v2-v4 data cannot enter a v5 geometry or visibility atlas packer")
+				"legacy v2-v4 data cannot enter a current geometry or visibility atlas packer")
 	var primary_only: Resource = data.duplicate(true)
 	primary_only.transfer.fill(0.0)
 	primary_only.emitter_keys.clear()
@@ -782,23 +832,30 @@ func _test_emission_data_contracts() -> void:
 	no_secondary_lighting.resize(27)
 	no_secondary_lighting.fill(0.0)
 	_check(primary_only.is_valid() and primary_only.has_nonzero_transfer()
-			and primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting) == Vector3(0.5, 0.75, 1.0),
-			"v5 primary Sky visibility remains valid transport and evaluates only against Sky-only SH")
+			and primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting).is_equal_approx(Vector3(0.5, 0.75, 1.0) / PI),
+			"v6 primary Sky visibility remains valid transport and evaluates only against Sky-only SH")
+	# A unit-radiance white sky gives PI irradiance and unit outgoing radiance
+	# on a white Lambertian surface. This must match the cosine-sampled RT path.
+	primary_only.primary_sky_visibility[0] = PI * 0.2820947918
+	for channel in 3:
+		sky_only_lighting[channel] = 1.0 / 0.2820947918
+	_check(primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting).is_equal_approx(Vector3.ONE),
+			"constant white sky preserves unit diffuse radiance without a PI energy gain")
 	var bad_shape: Resource = data.duplicate(true)
 	bad_shape.emitter_transport.resize(bad_shape.emitter_transport.size() - 1)
-	_check(not bad_shape.is_valid(), "v5 rejects an emitter payload with the wrong probe shape")
+	_check(not bad_shape.is_valid(), "v6 rejects an emitter payload with the wrong probe shape")
 	var bad_count: Resource = data.duplicate(true)
 	bad_count.emitter_static_signatures.clear()
-	_check(not bad_count.is_valid(), "v5 rejects mismatched emitter key/static-signature counts")
+	_check(not bad_count.is_valid(), "v6 rejects mismatched emitter key/static-signature counts")
 	var bad_negative: Resource = data.duplicate(true)
 	bad_negative.emitter_transport[0] = -0.001
-	_check(not bad_negative.is_valid(), "v5 rejects negative emitter transport")
+	_check(not bad_negative.is_valid(), "v6 rejects negative emitter transport")
 	var bad_nan: Resource = data.duplicate(true)
 	bad_nan.emitter_transport[0] = NAN
-	_check(not bad_nan.is_valid(), "v5 rejects non-finite emitter transport")
+	_check(not bad_nan.is_valid(), "v6 rejects non-finite emitter transport")
 	var bad_primary_shape: Resource = data.duplicate(true)
 	bad_primary_shape.primary_sky_visibility.resize(bad_primary_shape.primary_sky_visibility.size() - 1)
-	_check(not bad_primary_shape.is_valid(), "v5 rejects primary Sky visibility with the wrong probe shape")
+	_check(not bad_primary_shape.is_valid(), "v6 rejects primary Sky visibility with the wrong probe shape")
 	var unsupported: Resource = data.duplicate(true)
 	unsupported.format_version = Data.FORMAT_VERSION + 1
 	_check(not unsupported.is_valid(), "unsupported future PRT versions fail closed")
@@ -807,11 +864,12 @@ func _test_emission_data_contracts() -> void:
 
 func _test_render_upload_package(data: Resource) -> void:
 	var upload: Dictionary = data.make_render_upload()
-	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "visibility_moment_image", "index_bytes", "emission_image"]
+	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "visibility_moment_image",
+			"visibility_node_bytes", "visibility_triangle_bytes", "index_bytes", "emission_image"]
 	var has_contract_fields := upload.size() == expected_keys.size()
 	for key in expected_keys:
 		has_contract_fields = has_contract_fields and upload.has(key)
-	_check(has_contract_fields, "render upload returns the atomic six-field package")
+	_check(has_contract_fields, "render upload returns the atomic eight-field package")
 	if not has_contract_fields:
 		return
 	var transfer_image: Image = upload["transfer_image"]
@@ -839,6 +897,9 @@ func _test_render_upload_package(data: Resource) -> void:
 			"atomic upload includes the two-channel directional visibility moment atlas")
 	_check(index_bytes == data.make_index_bytes(),
 			"atomic index bytes are byte-identical to the existing index packer")
+	_check(upload.visibility_node_bytes == data.visibility_nodes.to_byte_array()
+			and upload.visibility_triangle_bytes == data.visibility_triangles.to_byte_array(),
+			"atomic upload includes the exact immutable static blocker buffers")
 	_check(emission_image != null and expected_emission != null
 			and emission_image.get_data() == expected_emission.get_data(),
 			"atomic emission image matches the existing zero-emission atlas layout")
@@ -1111,6 +1172,8 @@ func _make_emission_contract_data(data: Resource = null) -> Resource:
 	data.positions = PackedVector3Array([Vector3(0.5, 0.53, 0.5), Vector3(1.5, 0.53, 0.5)])
 	data.surface_positions = PackedVector3Array([Vector3(0.5, 0.5, 0.5), Vector3(1.5, 0.5, 0.5)])
 	data.normals = PackedVector3Array([Vector3.UP, Vector3.UP])
+	Baker._build_visibility_geometry(data, PackedVector3Array([
+		Vector3.ZERO, Vector3(4, 0, 0), Vector3(0, 0, 4)]))
 	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
 			* Data.VISIBILITY_MOMENT_CHANNELS)
 	for probe in data.probe_count():
@@ -1230,6 +1293,8 @@ func _make_filter_test_data() -> Resource:
 	data.positions = PackedVector3Array([Vector3(0.5, 0.53, 0.5)])
 	data.surface_positions = PackedVector3Array([Vector3(0.5, 0.5, 0.5)])
 	data.normals = PackedVector3Array([Vector3.UP])
+	Baker._build_visibility_geometry(data, PackedVector3Array([
+		Vector3.ZERO, Vector3(4, 0, 0), Vector3(0, 0, 4)]))
 	data.visibility_moments.resize(Data.VISIBILITY_TEXELS_PER_PROBE * Data.VISIBILITY_MOMENT_CHANNELS)
 	for texel in Data.VISIBILITY_TEXELS_PER_PROBE:
 		var moment_base := texel * Data.VISIBILITY_MOMENT_CHANNELS

@@ -5,6 +5,7 @@ struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
 

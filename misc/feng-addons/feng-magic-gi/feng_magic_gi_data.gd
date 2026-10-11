@@ -1,11 +1,13 @@
 @tool
 class_name FMagicGIData
 extends Resource
-## Immutable v5 surface PRT transport. Primary sky visibility stays separate
+## Immutable v6 surface PRT transport. Primary sky visibility stays separate
 ## from secondary transport so a current SkyLight can be replaced without
 ## baking its radiance into the geometry response.
 
-const FORMAT_VERSION := 5
+const Visibility = preload("feng_magic_gi_visibility.gd")
+const FORMAT_VERSION := 6
+const MOMENT_FORMAT_VERSION := 5
 const PRIMARY_SKY_FORMAT_VERSION := 4
 const EMITTER_FORMAT_VERSION := 3
 const LEGACY_FORMAT_VERSION := 2
@@ -50,6 +52,9 @@ const RUNTIME_ATLAS_FILTER_EPSILON := 0.00001
 @export_storage var primary_sky_visibility := PackedFloat32Array()
 ## Probe-major 8x8 octahedral first and second radial hit-distance moments.
 @export_storage var visibility_moments := PackedFloat32Array()
+## Depth-first static geometry BVH: two vec4s per node, three per triangle.
+@export_storage var visibility_nodes := PackedFloat32Array()
+@export_storage var visibility_triangles := PackedFloat32Array()
 ## Stable root-relative NodePath + surface-index bindings, in transport order.
 @export_storage var emitter_keys := PackedStringArray()
 ## Static texture/UV/geometry mapping fingerprints; live emission values are excluded.
@@ -102,6 +107,7 @@ func supports_format() -> bool:
 	return format_version == LEGACY_FORMAT_VERSION \
 		or format_version == EMITTER_FORMAT_VERSION \
 		or format_version == PRIMARY_SKY_FORMAT_VERSION \
+		or format_version == MOMENT_FORMAT_VERSION \
 		or format_version == FORMAT_VERSION
 
 ## Full validation is O(points + grid cells). Volumes cache the result by
@@ -139,7 +145,7 @@ func is_valid() -> bool:
 					return false
 		elif not primary_sky_visibility.is_empty():
 			return false
-	if format_version == FORMAT_VERSION:
+	if format_version >= MOMENT_FORMAT_VERSION:
 		if surface_positions.size() != probe_count() \
 				or visibility_moments.size() != probe_count() * VISIBILITY_TEXELS_PER_PROBE * VISIBILITY_MOMENT_CHANNELS:
 			return false
@@ -159,6 +165,11 @@ func is_valid() -> bool:
 						or second_moment + maxf(0.0001, mean * mean * 0.0001) < mean * mean:
 					return false
 	elif not surface_positions.is_empty() or not visibility_moments.is_empty():
+		return false
+	if format_version == FORMAT_VERSION:
+		if not Visibility.validate(visibility_nodes, visibility_triangles):
+			return false
+	elif not visibility_nodes.is_empty() or not visibility_triangles.is_empty():
 		return false
 	if grid_dims.x <= 0 or grid_dims.y <= 0 or grid_dims.z <= 0:
 		return false
@@ -248,7 +259,7 @@ func build_cell_indices() -> bool:
 	cell_counts.resize(grid_dims.x * grid_dims.y * grid_dims.z)
 	cell_counts.fill(0)
 	for i in probe_count():
-		var surface := surface_positions[i] if format_version == FORMAT_VERSION \
+		var surface := surface_positions[i] if format_version >= MOMENT_FORMAT_VERSION \
 				else positions[i] - normals[i] * surface_offset
 		var grid := world_to_grid * surface
 		var cell_coord := cell_coordinates(grid, grid_dims)
@@ -276,7 +287,8 @@ func evaluate(index: int, lighting: PackedFloat32Array,
 			and sky_lighting.size() == 27:
 		for k in 9:
 			for channel in 3:
-				result[channel] += primary_sky_visibility[index * 9 + k] * sky_lighting[k * 3 + channel]
+				# Primary coefficients integrate irradiance, unlike secondary radiance transport.
+				result[channel] += primary_sky_visibility[index * 9 + k] * sky_lighting[k * 3 + channel] / PI
 	return result.max(Vector3.ZERO)
 
 ## Evaluates the baked geometry response to a unit directional source.
@@ -338,7 +350,7 @@ static func fold_visibility_texel(texel: Vector2i) -> Vector2i:
 	return folded.clamp(Vector2i.ZERO, Vector2i.ONE * (size - 1))
 
 func sample_visibility_moments(probe: int, direction: Vector3) -> Vector2:
-	if format_version != FORMAT_VERSION or probe < 0 or probe >= probe_count() \
+	if format_version < MOMENT_FORMAT_VERSION or probe < 0 or probe >= probe_count() \
 			or visibility_moments.size() != probe_count() * VISIBILITY_TEXELS_PER_PROBE * VISIBILITY_MOMENT_CHANNELS \
 			or direction.length_squared() < 0.000001:
 		return Vector2.ZERO
@@ -390,8 +402,15 @@ func make_runtime_atlas_image() -> Image:
 ## Validates a saved bake once and creates all immutable textures/bytes needed by
 ## the renderer. The public individual packers retain their own validation.
 func make_render_upload() -> Dictionary:
-	if format_version != FORMAT_VERSION or not is_valid():
+	if format_version < MOMENT_FORMAT_VERSION or not is_valid():
 		return {}
+	# A stale v5 remains a diagnostic preview with its original moment weighting.
+	# Matching v5 resources are upgraded before publication. These empty traversal
+	# buffers are upload-only and never pretend to be persisted v6 geometry.
+	var node_bytes := visibility_nodes.to_byte_array() if format_version == FORMAT_VERSION \
+			else PackedFloat32Array([0, 0, 0, 1, 0, 0, 0, 0]).to_byte_array()
+	var triangle_bytes := visibility_triangles.to_byte_array() if format_version == FORMAT_VERSION \
+			else PackedFloat32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to_byte_array()
 	var transfer_image := _pack_atlas_image(true)
 	var primary_sky_image := _pack_primary_sky_image()
 	var geometry_image := _pack_geometry_image()
@@ -407,6 +426,8 @@ func make_render_upload() -> Dictionary:
 		"primary_sky_image": primary_sky_image,
 		"geometry_image": geometry_image,
 		"visibility_moment_image": visibility_moment_image,
+		"visibility_node_bytes": node_bytes,
+		"visibility_triangle_bytes": triangle_bytes,
 		"index_bytes": index_bytes,
 		"emission_image": emission_image
 	}
@@ -528,7 +549,7 @@ func _runtime_high_band_scale(probe: int) -> Vector3:
 	return scale
 
 func make_geometry_image() -> Image:
-	if format_version != FORMAT_VERSION or not is_valid():
+	if format_version < MOMENT_FORMAT_VERSION or not is_valid():
 		return null
 	return _pack_geometry_image()
 
@@ -541,13 +562,15 @@ func _pack_geometry_image() -> Image:
 		var surface := surface_positions[p]
 		var position := positions[p]
 		var normal := normals[p]
-		image.set_pixel(x, y, Color(surface.x, surface.y, surface.z, 1.0))
+		var patch := Visibility.surface_patch(visibility_nodes, visibility_triangles, surface) \
+				if format_version >= FORMAT_VERSION else 0
+		image.set_pixel(x, y, Color(surface.x, surface.y, surface.z, float(patch)))
 		image.set_pixel(x + 1, y, Color(position.x, position.y, position.z, 1.0))
 		image.set_pixel(x + 2, y, Color(normal.x, normal.y, normal.z, 0.0))
 	return image
 
 func make_visibility_moment_image() -> Image:
-	if format_version != FORMAT_VERSION or not is_valid():
+	if format_version < MOMENT_FORMAT_VERSION or not is_valid():
 		return null
 	return _pack_visibility_moment_image()
 

@@ -167,8 +167,10 @@ static func _publish() -> void:
 		var bake_version: int = data.bake_version
 		var cache_key := "%d:%d" % [id, bake_version]
 		var lighting_sets: Dictionary = state.lighting.coefficient_sets(volume)
-		var replacement_enabled := data.format_version == Data.FORMAT_VERSION \
-				and volume.has_bake()
+		# A usable preview still owns indirect diffuse. Making a stale bake additive
+		# restores unoccluded SkyLight under it, brightening interiors and hiding shadows.
+		# Staleness remains reported by the volume; it does not change composition.
+		var replacement_enabled := data.format_version == Data.FORMAT_VERSION
 		if state.emission.update_snapshot(volume, data):
 			_emission_revision_sequence += 1
 			state.emission.revision = _emission_revision_sequence

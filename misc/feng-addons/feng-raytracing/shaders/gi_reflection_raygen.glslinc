@@ -5,6 +5,7 @@ struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 struct GIFrameData {
@@ -62,7 +63,7 @@ ivec2 gi_uv_to_texel(vec2 uv, ivec2 size) {
 	return clamp(ivec2(floor(uv * vec2(size))), ivec2(0), size - ivec2(1));
 }
 
-vec3 gi_sample_vndf(vec3 normal, vec3 view_direction, float roughness, inout uint seed) {
+vec3 gi_sample_vndf(vec3 normal, vec3 view_direction, float roughness, vec2 xi) {
 	vec3 helper = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
 	vec3 tangent = normalize(cross(helper, normal));
 	vec3 bitangent = cross(normal, tangent);
@@ -72,8 +73,8 @@ vec3 gi_sample_vndf(vec3 normal, vec3 view_direction, float roughness, inout uin
 	float lensq = stretched.x * stretched.x + stretched.y * stretched.y;
 	vec3 t1 = lensq > 1e-8 ? vec3(-stretched.y, stretched.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
 	vec3 t2 = cross(stretched, t1);
-	float radius = sqrt(gi_random(seed));
-	float phi = 2.0 * GI_PI * gi_random(seed);
+	float radius = sqrt(xi.x);
+	float phi = 2.0 * GI_PI * xi.y;
 	float p1 = radius * cos(phi);
 	float p2 = radius * sin(phi);
 	float blend = 0.5 * (1.0 + stretched.z);
@@ -173,13 +174,20 @@ void main() {
 		sample_count = 1u;
 	}
 	uint seed = gi_hash(uint(pixel.x) * 0x9e3779b9u ^ uint(pixel.y) * 0x85ebca6bu
-			^ gi_frame.data.sun_view_generation_sky_array.z);
+			^ gi_frame.data.sun_view_generation_sky_array.y ^ gi_frame.data.generation_history_flags.x);
+	// Fixed per-pixel scrambling with a low-discrepancy temporal sequence.
+	float rotation_x = gi_random(seed);
+	float rotation_y = gi_random(seed);
+	vec2 temporal_sample = fract(vec2(rotation_x, rotation_y)
+			+ float(gi_frame.data.sun_view_generation_sky_array.z & 4095u) * vec2(0.754877666, 0.569840296));
 	float max_distance = max(gi_frame.data.trace_parameters.x, 0.001);
 	vec3 result = vec3(0.0);
 	float hit_distance_sum = 0.0;
 	uint hit_count = 0u;
 	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
-		vec3 half_vector = roughness <= 0.001 ? normal : gi_sample_vndf(normal, view_direction, roughness, seed);
+		vec2 xi = vec2((float(sample_index) + temporal_sample.x) / float(sample_count),
+				fract(temporal_sample.y + float(sample_index) * 0.618033989));
+		vec3 half_vector = roughness <= 0.001 ? normal : gi_sample_vndf(normal, view_direction, roughness, xi);
 		float vo_h = max(dot(view_direction, half_vector), 0.0);
 		vec3 reflected = reflect(-view_direction, half_vector);
 		float direction_length = length(reflected);

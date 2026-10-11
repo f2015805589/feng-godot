@@ -9,6 +9,7 @@ struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 #if FENG_GI_SKY_ARRAY

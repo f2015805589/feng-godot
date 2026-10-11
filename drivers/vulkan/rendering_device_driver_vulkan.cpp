@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/marshalls.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
@@ -4451,7 +4452,14 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 
 		shader_info.original_stage_size.push_back(decoded_spirv.size());
 
-		if (use_respv) {
+		// re-spirv's inliner currently corrupts some DXC compute modules (for
+		// example NRD RELAX temporal accumulation). Preserve those optimized
+		// modules as supplied by DXC; glslang modules retain the usual path.
+		const bool compiled_with_dxc = decoded_spirv.size() >= 20 && (decode_uint32(decoded_spirv.ptr() + 8) >> 16) == 14;
+		if (use_respv && compiled_with_dxc && store_respv) {
+			shader_info.respv_stage_shaders.push_back(respv::Shader());
+		}
+		if (use_respv && !compiled_with_dxc) {
 			const bool inline_data = store_respv || (RESPV_ONLY_INLINE_SHADERS_WITH_SPEC_CONSTANTS == 0);
 			respv::Shader respv_shader(decoded_spirv.ptr(), decoded_spirv.size(), inline_data);
 			if (respv_shader.empty()) {

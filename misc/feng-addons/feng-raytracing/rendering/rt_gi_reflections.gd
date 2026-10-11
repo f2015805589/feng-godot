@@ -195,7 +195,7 @@ func create_state(size: Vector2i) -> Dictionary:
 			images.append(image)
 			resources.append(image)
 		histories.append(images)
-	var ubo := rd.uniform_buffer_create(64)
+	var ubo := rd.uniform_buffer_create(256)
 	resources.append(ubo)
 	for rid in resources:
 		if not rid.is_valid():
@@ -203,7 +203,7 @@ func create_state(size: Vector2i) -> Dictionary:
 			return {}
 	return {"size": size, "raw": raw, "history": histories, "resources": resources,
 			"ubo": ubo, "ping": 0, "valid": false, "generation": -1, "signature": [],
-			"exposure": 1.0, "camera": Transform3D.IDENTITY,
+			"exposure": 1.0, "camera": Transform3D.IDENTITY, "vp": Projection.IDENTITY,
 			"last_seen": Engine.get_frames_drawn()}
 
 func _free_resources(resources: Array[RID]) -> void:
@@ -222,6 +222,13 @@ func release_state(state: Dictionary) -> void:
 func _camera_matches(a: Transform3D, b: Transform3D) -> bool:
 	return a.origin.distance_to(b.origin) <= 0.0001 and a.basis.x.distance_to(b.basis.x) <= 0.00001 \
 			and a.basis.y.distance_to(b.basis.y) <= 0.00001 and a.basis.z.distance_to(b.basis.z) <= 0.00001
+
+func _matrix_bytes(matrix: Projection) -> PackedByteArray:
+	var values := PackedFloat32Array()
+	for column in 4:
+		for row in 4:
+			values.append(matrix[column][row])
+	return values.to_byte_array()
 
 func _dispatch(shader: RID, pipeline: RID, uniforms: Array[RDUniform], size: Vector2i) -> bool:
 	var uniform_set := rd.uniform_set_create(uniforms, shader, 0)
@@ -278,14 +285,22 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 		return false
 	var camera_cut := bool(frame.get("camera_cut", false))
 	var valid_history: bool = state.valid and state.generation + 1 == generation \
-			and state.signature == signature and not camera_cut and _camera_matches(state.camera, transform)
-	var weight := clampf(float(options.get("history_weight", 0.9)), 0.0, 0.98)
+			and state.signature == signature and not camera_cut
+	var inverse_projection: Projection = frame.get("inverse_projection", Projection.IDENTITY)
+	var inverse_vp := Projection(transform) * inverse_projection
+	var vp := inverse_vp.inverse()
+	var weight := clampf(float(options.get("history_weight", 0.97)), 0.0, 0.98)
 	var exposure_ratio := exposure / maxf(float(state.exposure), 1e-8)
 	var bytes := PackedFloat32Array([weight, exposure_ratio, 0.03, 0.95,
 			0.03, 0.15, 0.02, 0.02]).to_byte_array()
 	bytes.append_array(PackedInt32Array([int(valid_history), generation & 0xffffffff,
 			generation >> 32]).to_byte_array())
 	bytes.append_array(PackedFloat32Array([clampf(replacement_strength, 0.0, 1.0)]).to_byte_array())
+	bytes.append_array(PackedFloat32Array([float(not _camera_matches(state.camera, transform)),
+			0.0, 0.0, 0.0]).to_byte_array())
+	bytes.append_array(_matrix_bytes(inverse_vp))
+	bytes.append_array(_matrix_bytes(state.vp))
+	bytes.append_array(_matrix_bytes(Projection(transform)))
 	if rd.buffer_update(state.ubo, 0, bytes.size(), bytes) != OK:
 		state.valid = false
 		return false
@@ -309,6 +324,7 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 	state.signature = signature.duplicate(true)
 	state.exposure = exposure
 	state.camera = transform
+	state.vp = vp
 	state.last_seen = Engine.get_frames_drawn()
 	return true
 

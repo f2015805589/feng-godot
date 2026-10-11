@@ -106,6 +106,7 @@ var _cached_has_nonzero_indirect_transport := false
 var _scene_signature_checked := false
 var _last_emission_warning := ""
 var _placement_warning_message := ""
+var _visibility_upgrade_attempt := 0
 
 func _enter_tree() -> void:
 	set_notify_transform(true)
@@ -174,7 +175,7 @@ func bake_staleness_reasons() -> PackedStringArray:
 	if bake_data == null:
 		return reasons
 	if bake_data.format_version < Data.FORMAT_VERSION:
-		reasons.append("format %d lacks explicit surface anchors and directional visibility moments; a v5 rebake is required" % bake_data.format_version)
+		reasons.append("format %d lacks static segment blockers; upgrade a matching v5 bake or rebake to v6" % bake_data.format_version)
 	if has_legacy_sampler_signature():
 		reasons.append("the saved format-2 bake uses the previous random sampler")
 	if bake_data.bake_samples != bake_samples:
@@ -255,11 +256,31 @@ func refresh_surface_points() -> void:
 		_placement_warning_message = placement.warning_message
 		_current_scene_signature = placement.scene_signature
 		_scene_signature_checked = true
+		_upgrade_matching_visibility_bake(placement)
 	_quick_scene_signature = SceneTracker.quick_signature(self)
 	_refresh_viz()
 	Runtime.publish(self)
 	update_configuration_warnings()
 	bake_status_changed.emit()
+
+func _upgrade_matching_visibility_bake(placement: Placement) -> void:
+	if bake_data == null or bake_data.format_version != Data.MOMENT_FORMAT_VERSION:
+		return
+	var attempt := hash([bake_data.get_instance_id(), bake_data.bake_version,
+			placement.scene_signature, size, probe_spacing, surface_offset, global_transform,
+			bake_samples, bake_bounces, bake_distance, terrain_reflectance, fallback_material_reflectance])
+	if attempt == _visibility_upgrade_attempt:
+		return
+	_visibility_upgrade_attempt = attempt
+	# Reuse the geometry already collected for the scene signature. This runs on
+	# the main thread once per matching old resource; no lighting rays or disk writes.
+	var upgraded := Baker.new().upgrade_visibility_bake(self, placement)
+	if upgraded == null:
+		return
+	_bake_assigning_data = true
+	bake_data = upgraded
+	_bake_assigning_data = false
+	_scene_signature_checked = true # The setter invalidates this cached check.
 
 func _settings_changed(rebuild := true) -> void:
 	_bake_generation += 1

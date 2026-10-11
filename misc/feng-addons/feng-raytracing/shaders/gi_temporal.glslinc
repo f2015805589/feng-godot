@@ -1,58 +1,150 @@
 #version 450
-layout(local_size_x=8,local_size_y=8) in;
-layout(set=0,binding=0) uniform sampler2D raw_gi;
-layout(set=0,binding=1) uniform sampler2D previous_gi;
-layout(set=0,binding=2) uniform sampler2D previous_moments;
-layout(set=0,binding=3) uniform sampler2D current_depth;
-layout(set=0,binding=4) uniform sampler2D current_normal;
-layout(set=0,binding=5) uniform sampler2D previous_depth;
-layout(set=0,binding=6) uniform sampler2D previous_normal;
-layout(set=0,binding=7,rgba16f) uniform writeonly image2D next_gi;
-layout(set=0,binding=8,rg16f) uniform writeonly image2D next_moments;
-layout(set=0,binding=9,r32f) uniform writeonly image2D next_depth;
-layout(set=0,binding=10,rgba16f) uniform writeonly image2D next_normal;
-layout(set=0,binding=11,std140) uniform Frame {
- mat4 inverse_view_projection;
- mat4 previous_view_projection;
- vec4 size_weight_exposure;
- vec4 rejection;
- uvec4 identity;
- mat4 view_to_world;
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D raw_gi;
+layout(set = 0, binding = 1) uniform sampler2D previous_gi;
+layout(set = 0, binding = 2) uniform sampler2D previous_moments;
+layout(set = 0, binding = 3) uniform sampler2D current_depth;
+layout(set = 0, binding = 4) uniform sampler2D current_normal;
+layout(set = 0, binding = 5) uniform sampler2D previous_depth;
+layout(set = 0, binding = 6) uniform sampler2D previous_normal;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D next_gi;
+layout(set = 0, binding = 8, rg32f) uniform writeonly image2D next_moments;
+layout(set = 0, binding = 9, r32f) uniform writeonly image2D next_depth;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D next_normal;
+layout(set = 0, binding = 11, std140) uniform Frame {
+	mat4 inverse_view_projection;
+	mat4 previous_view_projection;
+	vec4 size_weight_exposure;
+	vec4 rejection;
+	uvec4 identity;
+	mat4 view_to_world;
 } frame;
+layout(set = 0, binding = 12) uniform sampler2D current_albedo;
+layout(set = 0, binding = 13) uniform sampler2D current_orm;
+layout(set = 0, binding = 14) uniform sampler2D previous_reflectance;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D next_reflectance;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+ivec2 surface_texel(ivec2 p, ivec2 size) {
+	return min(ivec2((vec2(p) + 0.5) / vec2(size) * vec2(textureSize(current_depth, 0))), textureSize(current_depth, 0) - 1);
+}
+
+vec3 world_normal(ivec2 p) {
+	vec3 n = texelFetch(current_normal, p, 0).xyz * 2.0 - 1.0;
+	return normalize(mat3(frame.view_to_world) * n);
+}
+
+vec3 reflectance(ivec2 p) {
+	vec4 orm = texelFetch(current_orm, p, 0);
+	return max(texelFetch(current_albedo, p, 0).rgb, vec3(0.0)) * clamp(orm.r, 0.0, 1.0) * (1.0 - clamp(orm.b, 0.0, 1.0));
+}
+
+bool finite_rgb(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
 void main() {
- ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(next_gi);
- if(any(greaterThanEqual(p,size))) return;
- vec2 uv=(vec2(p)+0.5)/vec2(size);
- float depth=textureLod(current_depth,uv,0).r;
- vec3 n=normalize(mat3(frame.view_to_world)*(textureLod(current_normal,uv,0).xyz*2.0-1.0));
- vec4 value=texelFetch(raw_gi,p,0);
- float weight=0.0;
- vec4 world=frame.inverse_view_projection*vec4(uv*2.0-1.0,depth,1.0);
- vec4 previous=frame.previous_view_projection*vec4(world.xyz/max(abs(world.w),1e-8)*sign(world.w),1.0);
- vec3 ndc=previous.xyz/max(previous.w,1e-8);
- vec2 old_uv=ndc.xy*0.5+0.5;
- if(frame.rejection.w>0.5 && value.a>0.0 && previous.w>0.0 && all(greaterThan(old_uv,vec2(0))) && all(lessThan(old_uv,vec2(1)))) {
-  float old_depth=textureLod(previous_depth,old_uv,0).r;
-  vec3 old_normal=textureLod(previous_normal,old_uv,0).xyz;
-  if(abs(old_depth-ndc.z)<max(frame.rejection.z,abs(ndc.z)*frame.rejection.y) && dot(n,old_normal)>frame.rejection.x) weight=frame.size_weight_exposure.z;
- }
- vec3 old=textureLod(previous_gi,old_uv,0).rgb*frame.size_weight_exposure.w;
- // Accumulate accepted geometry history; a black stochastic sample is not a disocclusion.
- vec3 spatial=vec3(0); float total=0;
- for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
-  ivec2 tap=clamp(p+ivec2(x,y),ivec2(0),size-1);
-  vec2 tap_uv=(vec2(tap)+0.5)/vec2(size);
-  float tap_depth=textureLod(current_depth,tap_uv,0).r;
-  vec3 tap_normal=normalize(mat3(frame.view_to_world)*(textureLod(current_normal,tap_uv,0).xyz*2.0-1.0));
-  float w=exp(-abs(tap_depth-depth)/max(depth*0.01,1e-5))*pow(max(dot(n,tap_normal),0.0),16.0);
-  spatial+=texelFetch(raw_gi,tap,0).rgb*w; total+=w;
- }
- value.rgb=spatial/max(total,1e-8);
- vec3 result=mix(value.rgb,old,weight);
- if(any(isnan(result))||any(isinf(result))) result=value.rgb;
- imageStore(next_gi,p,vec4(clamp(result,vec3(0),vec3(65504)),value.a));
- float lum=dot(result,vec3(0.2126,0.7152,0.0722));
- imageStore(next_moments,p,vec4(min(lum,255.0),min(lum*lum,65504.0),0,0));
- imageStore(next_depth,p,vec4(depth));
- imageStore(next_normal,p,vec4(n,1));
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = imageSize(next_gi);
+	if (any(greaterThanEqual(p, size))) return;
+	ivec2 surface = surface_texel(p, size);
+	float depth = texelFetch(current_depth, surface, 0).r;
+	vec3 normal = world_normal(surface);
+	vec3 material = reflectance(surface);
+	vec4 raw = texelFetch(raw_gi, p, 0);
+	if (depth <= 0.0 || raw.a <= 0.0 || !finite_rgb(normal) || !finite_rgb(material) || !finite_rgb(raw.rgb)) {
+		imageStore(next_gi, p, vec4(0.0));
+		imageStore(next_moments, p, vec4(0.0));
+		imageStore(next_depth, p, vec4(0.0));
+		imageStore(next_normal, p, vec4(0.0));
+		imageStore(next_reflectance, p, vec4(0.0));
+		return;
+	}
+
+	// Validate every history tap before interpolation; a bilinear depth/normal
+	// lookup can otherwise combine two surfaces and accept history through an edge.
+	vec2 uv = (vec2(surface) + 0.5) / vec2(textureSize(current_depth, 0));
+	vec4 world = frame.inverse_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	vec4 projected = frame.previous_view_projection * vec4(world.xyz / world.w, 1.0);
+	vec3 ndc = projected.xyz / max(projected.w, 1e-8);
+	vec2 old_uv = ndc.xy * 0.5 + 0.5;
+	ivec2 old_base = ivec2(floor(old_uv * vec2(size)));
+	// The sampled full-resolution texel is not necessarily at the half-resolution
+	// cell center. Choose both neighbors around its actual position as well.
+	vec2 base_uv = (vec2(surface_texel(old_base, size)) + 0.5) / vec2(textureSize(current_depth, 0));
+	old_base -= ivec2(greaterThan(base_uv, old_uv));
+	float exposure = frame.size_weight_exposure.w;
+	vec3 old_color = vec3(0.0);
+	vec2 old_moments = vec2(0.0);
+	float old_count = 0.0, history_sum = 0.0;
+	if (frame.rejection.w > 0.5 && projected.w > 0.0 && exposure >= 0.25 && exposure <= 4.0) {
+		for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+			ivec2 tap = old_base + ivec2(x, y);
+			if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, size))) continue;
+			float old_depth = texelFetch(previous_depth, tap, 0).r;
+			vec4 old_normal = texelFetch(previous_normal, tap, 0);
+			vec3 old_material = texelFetch(previous_reflectance, tap, 0).rgb;
+			vec3 color = texelFetch(previous_gi, tap, 0).rgb * exposure;
+			if (old_depth <= 0.0 || abs(old_depth - ndc.z) > max(frame.rejection.z, abs(ndc.z) * frame.rejection.y)
+					|| dot(normal, old_normal.xyz) < frame.rejection.x || length(material - old_material) > 0.08
+					|| !finite_rgb(color)) continue;
+			vec2 tap_uv = (vec2(surface_texel(tap, size)) + 0.5) / vec2(textureSize(current_depth, 0));
+			vec2 footprint = max(vec2(0.0), 1.0 - abs((ndc.xy * 0.5 + 0.5 - tap_uv) * vec2(size)));
+			float weight = footprint.x * footprint.y;
+			old_color += color * weight;
+			old_moments += texelFetch(previous_moments, tap, 0).rg * vec2(exposure, exposure * exposure) * weight;
+			old_count += old_normal.w * weight;
+			history_sum += weight;
+		}
+	}
+	if (history_sum > 0.05) {
+		old_color /= history_sum;
+		old_moments /= history_sum;
+		old_count /= history_sum;
+	} else {
+		old_count = 0.0;
+	}
+
+	// Filter Monte Carlo radiance only across compatible receiver surfaces.
+	// Reflectance matters here because raw_gi already contains albedo, metallic and AO.
+	const float kernel[5] = float[](1.0, 4.0, 6.0, 4.0, 1.0);
+	vec3 spatial = vec3(0.0);
+	vec2 moments = vec2(0.0);
+	float total = 0.0;
+	for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) {
+		ivec2 tap = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+		ivec2 tap_surface = surface_texel(tap, size);
+		vec4 sample_value = texelFetch(raw_gi, tap, 0);
+		if (sample_value.a <= 0.0 || !finite_rgb(sample_value.rgb)) continue;
+		float tap_depth = texelFetch(current_depth, tap_surface, 0).r;
+		vec3 tap_normal = world_normal(tap_surface);
+		if (tap_depth <= 0.0 || !finite_rgb(tap_normal)) continue;
+		float weight = kernel[x + 2] * kernel[y + 2]
+				* exp(-abs(tap_depth - depth) / max(depth * 0.01, 1e-5))
+				* pow(max(dot(normal, tap_normal), 0.0), 32.0)
+				* exp(-length(material - reflectance(tap_surface)) * 32.0);
+		spatial += sample_value.rgb * weight;
+		float luminance = dot(sample_value.rgb, LUMA);
+		moments += vec2(luminance, luminance * luminance) * weight;
+		total += weight;
+	}
+	spatial /= max(total, 1e-8);
+	moments /= max(total, 1e-8);
+	float count = min(old_count + 1.0, 64.0);
+	float weight = old_count > 0.0 ? min(frame.size_weight_exposure.z, old_count / count) : 0.0;
+	// Use raw-sample moments, not the squared denoised mean: rare emitter hits
+	// must retain their variance so a subsequent black sample does not erase them.
+	float variance = max(moments.y - moments.x * moments.x, old_moments.y - old_moments.x * old_moments.x);
+	float limit = 4.0 * sqrt(max(variance, 0.0)) + 0.001;
+	float old_luminance = dot(old_color, LUMA);
+	if (weight > 0.0 && old_luminance > moments.x + limit) {
+		old_color *= (moments.x + limit) / max(old_luminance, 1e-8);
+	}
+	vec3 result = mix(spatial, old_color, weight);
+	if (!finite_rgb(result)) result = spatial;
+	imageStore(next_gi, p, vec4(clamp(result, vec3(0.0), vec3(65504.0)), raw.a));
+	imageStore(next_moments, p, vec4(mix(moments, old_moments, weight), 0.0, 0.0));
+	imageStore(next_depth, p, vec4(depth));
+	imageStore(next_normal, p, vec4(normal, count));
+	imageStore(next_reflectance, p, vec4(material, 1.0));
 }

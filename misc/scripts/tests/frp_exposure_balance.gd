@@ -92,7 +92,17 @@ func make_test_bake() -> Resource:
 	data.terrain_reflectance = _volume.terrain_reflectance
 	data.material_reflectance = _volume.fallback_material_reflectance
 	data.positions = _volume.probe_positions.duplicate()
+	data.surface_positions = _volume.probe_surface_positions.duplicate()
 	data.normals = _volume.probe_normals.duplicate()
+	var faces := PackedVector3Array()
+	for vertex in _floor.mesh.get_faces():
+		faces.append(_floor.global_transform * vertex)
+	Baker._build_visibility_geometry(data, faces)
+	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
+	for texel in data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE:
+		data.visibility_moments[texel * 2] = data.bake_distance
+		data.visibility_moments[texel * 2 + 1] = data.bake_distance * data.bake_distance
 	data.transfer.resize(data.positions.size() * 27)
 	data.transfer.fill(0.0)
 	data.primary_sky_visibility.resize(data.positions.size() * 9)

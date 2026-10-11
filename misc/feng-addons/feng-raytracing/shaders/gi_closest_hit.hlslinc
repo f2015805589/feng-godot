@@ -74,10 +74,13 @@ struct GIFrameData {
 };
 ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
 
+ByteAddressBuffer gi_emitters : register(t25, space0);
+float4 gi_emitter_row(uint index) { return asfloat(gi_emitters.Load4(index * 16u)); }
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 static const uint GI_RAY_MODE_PRIMARY = 0u;
@@ -297,6 +300,14 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 	}
 	float3 diffuse_reflectance = albedo * (1.0f - metallic);
 	float3 outgoing_radiance = max(emission_color, 0.0f) * max(emission_energy, 0.0f);
+
+    if (payload.flags == 0u && gi_frame.generation_history_flags.y == 0u && gi_emitter_row(0).x > 0.0) {
+        float3 emitter_normal = normalize(mul(cross(position1 - position0, position2 - position0), (float3x3)WorldToObject3x4()));
+        float cosine = abs(dot(emitter_normal, -WorldRayDirection()));
+        float luminance = dot(outgoing_radiance, float3(0.2126, 0.7152, 0.0722));
+        float light_pdf = luminance / gi_emitter_row(0).x * RayTCurrent() * RayTCurrent() / max(cosine, 1e-8);
+        outgoing_radiance *= payload.ray_pdf / max(payload.ray_pdf + light_pdf, 1e-12);
+    }
 
 	uint sun_index = gi_frame.sun_view_generation_sky_array.x;
 	uint full_layer_mask = gi_surfaces.Load(row_byte + 20u);

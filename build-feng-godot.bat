@@ -3,7 +3,7 @@ setlocal EnableExtensions
 chcp 65001 >nul
 title Feng Godot - build engine and native addons
 
-rem Double-click to build the Windows x86_64 editor and both native debug addons.
+rem Double-click to build the Windows x86_64 editor and native addons.
 rem From a terminal, use --no-pause to return immediately with the build exit code.
 rem Set FENG_BUILD_JOBS to override the safe default of 8 parallel jobs.
 set "PAUSE_ON_EXIT=1"
@@ -37,7 +37,7 @@ call :setup_msvc || exit /b 1
 call :prepare_dependencies || exit /b 1
 
 echo.
-echo [1/3] Building Windows x86_64 editor with D3D12 and AccessKit...
+echo [1/4] Building Windows x86_64 editor with D3D12 and AccessKit...
 if defined AGILITY_ARG (
     call scons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%" "%AGILITY_ARG%"
 ) else (
@@ -50,7 +50,7 @@ if not exist "%REPO_ROOT%\bin\godot.windows.editor.x86_64.exe" (
 )
 
 echo.
-echo [2/3] Building Terrain3D native debug addon...
+echo [2/4] Building Terrain3D native debug addon...
 call scons -C "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idweight-terrain.windows.debug.x86_64.dll" (
@@ -59,13 +59,30 @@ if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idw
 )
 
 echo.
-echo [3/3] Building RenderDoc capture native debug addon...
+echo [3/4] Building RenderDoc capture native debug addon...
 call scons -C "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\bin\libfeng-renderdoc-capture.windows.debug.x86_64.dll" (
     echo [ERROR] RenderDoc DLL is missing after SCons completed.
     exit /b 1
 )
+
+echo.
+echo [4/4] Building NRD native addon...
+where cmake >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] CMake 3.30 or newer is required for NRD.
+    exit /b 1
+)
+set "GODOT_CPP=%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native\godot-cpp"
+set "NRD_NATIVE=%REPO_ROOT%\misc\feng-addons\feng-raytracing\native"
+call scons -C "%GODOT_CPP%" platform=windows target=template_release arch=x86_64 -j%JOBS%
+if errorlevel 1 exit /b 1
+cmake -S "%NRD_NATIVE%" -B "%NRD_NATIVE%\_build" "-DGODOT_CPP_ROOT=%GODOT_CPP%" "-DGODOT_CPP_LIBRARY=%GODOT_CPP%\bin\libgodot-cpp.windows.template_release.x86_64.lib"
+if errorlevel 1 exit /b 1
+cmake --build "%NRD_NATIVE%\_build" --config Release --parallel %JOBS%
+if errorlevel 1 exit /b 1
+if not exist "%NRD_NATIVE%\..\bin\feng_nrd.dll" exit /b 1
 
 echo.
 echo [DONE] Editor: %REPO_ROOT%\bin\godot.windows.editor.x86_64.exe

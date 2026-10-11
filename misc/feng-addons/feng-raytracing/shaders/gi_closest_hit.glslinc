@@ -5,10 +5,12 @@
 #define FENG_GI_SKY_ARRAY 0
 #endif
 
+layout(set=0,binding=25,std430) readonly buffer GIEmitters { vec4 rows[]; } gi_emitters;
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 struct GIFrameData {
@@ -284,6 +286,14 @@ void main() {
 	}
 	vec3 diffuse_reflectance = albedo * (1.0 - metallic);
 	vec3 outgoing_radiance = max(emission_color, vec3(0.0)) * max(emission_energy, 0.0);
+
+    if (gi_payload.flags == 0u && gi_frame.data.generation_history_flags.y == 0u && gi_emitters.rows[0].x > 0.0) {
+        vec3 emitter_normal = normalize(transpose(mat3(gl_WorldToObjectEXT)) * cross(position1 - position0, position2 - position0));
+        float cosine = abs(dot(emitter_normal, -gl_WorldRayDirectionEXT));
+        float luminance = dot(outgoing_radiance, vec3(0.2126, 0.7152, 0.0722));
+        float light_pdf = luminance / gi_emitters.rows[0].x * gl_HitTEXT * gl_HitTEXT / max(cosine, 1e-8);
+        outgoing_radiance *= gi_payload.ray_pdf / max(gi_payload.ray_pdf + light_pdf, 1e-12);
+    }
 	uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
 	uint full_layer_mask = gi_surfaces.words[row_word + 5u];
 	if (gi_payload.flags == GI_RAY_MODE_REFLECTION) {

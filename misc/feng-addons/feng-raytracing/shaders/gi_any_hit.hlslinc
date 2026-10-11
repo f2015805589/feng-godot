@@ -29,6 +29,7 @@ struct GIPathPayload {
 	float3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 static const uint GI_MATERIAL_TWO_SIDED = 2u;
@@ -37,6 +38,12 @@ static const uint GI_HIT_KIND_FRONT_FACE = 0xfeu;
 
 [shader("anyhit")]
 void FengGIAnyHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
+	if (payload.flags == 8u) {
+		payload.radiance = 0.0;
+		AcceptHitAndEndSearch();
+		return;
+	}
+
 	uint surface_byte = InstanceID() * 32u;
 	if (payload.flags == 1u) {
 		uint sun_index = gi_frame.sun_view_generation_sky_array.x;

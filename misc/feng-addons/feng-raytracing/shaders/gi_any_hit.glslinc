@@ -5,6 +5,7 @@ struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 struct GIFrameData {
@@ -40,6 +41,12 @@ const uint GI_MATERIAL_WORD_STRIDE = 20u;
 const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
 
 void main() {
+	if (gi_payload.flags == 8u) {
+		gi_payload.radiance = vec3(0.0);
+		terminateRayEXT;
+		return;
+	}
+
 	if (gi_payload.flags == GI_RAY_MODE_SUN_VISIBILITY) {
 		uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
 		if (sun_index >= GI_DIRECTIONAL_CAPACITY) {

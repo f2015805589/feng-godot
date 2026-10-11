@@ -6,6 +6,7 @@ const Runtime = preload("../scene/feng_rt_gi_runtime.gd")
 const GPU = preload("../rendering/rt_gi_gpu.gd")
 const SceneGPU = preload("../rendering/rt_gi_scene_gpu.gd")
 const ReflectionRenderer = preload("../rendering/rt_gi_reflections.gd")
+const NRDRenderer = preload("../rendering/rt_gi_nrd.gd")
 const U = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const Selection = preload("res://addons/feng-render-pipeline/pipeline/indirect_gi_selection.gd")
 const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
@@ -30,11 +31,19 @@ const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_sp
 	set(value):
 		samples_per_pixel = value
 		emit_changed()
+@export var importance_sampling := true:
+	set(value):
+		importance_sampling = value
+		emit_changed()
 @export var half_resolution := true:
 	set(value):
 		half_resolution = value
 		emit_changed()
-@export_range(0, 0.98, 0.01) var history_weight := 0.9:
+@export_enum("NRD RELAX", "Temporal") var denoiser := 0:
+	set(value):
+		denoiser = value
+		emit_changed()
+@export_range(0, 0.98, 0.01) var history_weight := 0.97:
 	set(value):
 		history_weight = value
 		emit_changed()
@@ -83,7 +92,7 @@ func get_indirect_gi_kind() -> StringName:
 
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["strength", "reflections_enabled", "reflection_strength", "max_distance",
-			"samples_per_pixel", "half_resolution", "history_weight"])
+			"samples_per_pixel", "half_resolution", "history_weight", "denoiser", "importance_sampling"])
 
 func get_required_before_native_ids() -> PackedInt32Array:
 	return PackedInt32Array([NativeSpec.PASS_TRANSPARENT, NativeSpec.PASS_TEMPORAL_AA,
@@ -226,18 +235,22 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 				_release_diffuse_state(rd, state.diffuse)
 				state.diffuse = _create_diffuse_state(rd, diffuse_size)
 			if not state.diffuse.is_empty():
+				trace_options["strength"] = diffuse_amount
 				var diffuse_frame := _pack_trace_frame(frame, diffuse_size, generation, view, diffuse_amount, trace_options)
-				if gpu.trace(textures.slice(0, 4), diffuse_frame, frame, state.diffuse.raw, dfg, diffuse_size):
+				if gpu.trace(textures.slice(0, 4), diffuse_frame, frame, state.diffuse.raw, dfg, diffuse_size, state.diffuse.hit_distance):
 					var diffuse_revision := hash([snapshot.get("registry_epoch", 0), snapshot.get("snapshot_generation", 0),
-							gpu.scene.transform_key, trace_options.get("max_distance"), diffuse_amount,
-							trace_options.get("samples_per_pixel")])
+							gpu.scene.geometry_key, gpu.scene.transform_key, trace_options.get("max_distance"), diffuse_amount,
+							trace_options.get("samples_per_pixel"), _lighting_signature(frame)])
 					if _resolve_diffuse(rd, state.scene.sampler, state.diffuse, frame, textures, generation,
 							diffuse_revision, trace_options):
 						var history: Array = state.diffuse.history[state.diffuse.ping]
 						_dispatch(rd, _diffuse_composite_shader, _diffuse_composite_pipeline,
-								[U.image(0, buffers.get_color_layer(view)), U.sampled(1, state.scene.sampler, history[0]),
+								[U.image(0, buffers.get_color_layer(view)), U.sampled(1, state.scene.sampler, state.diffuse.get("resolved", history[0])),
 								U.sampled(2, state.scene.sampler, sky_diffuse), U.sampled(3, state.scene.sampler, textures[0]),
-								U.sampled(4, state.scene.sampler, history[2])], full_size)
+								U.sampled(4, state.scene.sampler, history[2]),
+								U.sampled(5, state.scene.sampler, textures[1]), U.sampled(6, state.scene.sampler, history[3]),
+								U.sampled(7, state.scene.sampler, textures[2]), U.sampled(8, state.scene.sampler, textures[3]),
+								U.sampled(9, state.scene.sampler, history[4]), U.uniform_buffer(10, state.diffuse.ubo)], full_size)
 				else:
 					warn_once(gpu.error)
 					state.diffuse.valid = false
@@ -251,7 +264,7 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 				var reflection_frame := _pack_trace_frame(frame, full_size, generation, view, 1.0, trace_options)
 				if reflection_backend.trace(state.scene, textures.slice(0, 5), reflection_frame, frame,
 						reflection_state.raw, dfg, full_size):
-						var signature := _reflection_signature(snapshot, state.scene.transform_key,
+						var signature := _reflection_signature(snapshot, [state.scene.geometry_key, state.scene.transform_key],
 								frame, trace_options, reflection_amount, full_size)
 						if reflection_backend.resolve(reflection_state, state.scene.sampler, frame,
 								textures.slice(0, 5), generation, signature, trace_options, reflection_amount):
@@ -314,7 +327,9 @@ func _get_reflection_backend(rd: RenderingDevice, sky_array: bool) -> Variant:
 func _release_diffuse_state(rd: RenderingDevice, state: Dictionary) -> void:
 	if state.is_empty():
 		return
-	for rid: RID in state.resources:
+	var releasing: Array = state.resources.duplicate()
+	releasing.reverse()
+	for rid: RID in releasing:
 		if rid.is_valid():
 			rd.free_rid(rid)
 
@@ -357,17 +372,20 @@ func _finite_option(options: Dictionary, key: String, fallback: float, minimum: 
 func _valid_samples(value: int) -> int:
 	return value if value in [1, 2, 4] else 1
 
-func _reflection_signature(snapshot: Dictionary, transform_key: Array, frame: Dictionary,
-		options: Dictionary, replacement_strength: float, size: Vector2i) -> Array:
-	var sky_signature := [frame.get("sky_light_source_owner_id", 0),
-			frame.get("sky_light_source_revision", 0), frame.get("sky_light_revision", 0),
+func _lighting_signature(frame: Dictionary) -> Array:
+	# A realtime capture alternates radiance textures and publishes revisions in
+	# separate frames. Those are content updates, not a new lighting source: a hard
+	# reset here repeatedly throws away convergence while the camera stands still.
+	return [frame.get("sky_light_source_owner_id", 0),
+			frame.get("sky_light_source", RID()), frame.get("sky_light_source_valid", false),
 			frame.get("sky_light_energy", 0.0), frame.get("sky_light_rotation", Basis.IDENTITY),
-			frame.get("sky_captured_exposure", 1.0), frame.get("sky_radiance_texture", RID())]
-	var light_signature := frame.get("directional_light_signature",
-			[])
+			frame.get("directional_light_signature", []), frame.get("directional_light_count", 0),
+			frame.get("cloud_primary_sun_directional_index", -1)]
+
+func _reflection_signature(snapshot: Dictionary, scene_key: Array, frame: Dictionary,
+		options: Dictionary, replacement_strength: float, size: Vector2i) -> Array:
 	return [snapshot.get("world_id", 0), snapshot.get("registry_epoch", 0),
-		snapshot.get("snapshot_generation", 0), transform_key, sky_signature, light_signature,
-		frame.get("directional_light_count", 0), frame.get("cloud_primary_sun_directional_index", -1),
+		snapshot.get("snapshot_generation", 0), scene_key, _lighting_signature(frame),
 		frame.get("light_buffer_exposure_normalization", 1.0),
 		frame.get("inverse_projection_unjittered", frame.get("inverse_projection", Projection.IDENTITY)),
 		frame.get("camera_generation", 0), frame.get("dfg_texture", RID()), size,
@@ -403,7 +421,7 @@ func _pack_trace_frame(frame: Dictionary, size: Vector2i, generation: int, view:
 			options.get("samples_per_pixel", samples_per_pixel), options.get("history_weight", history_weight)]).to_byte_array())
 	var sky_size := int(frame.get("sky_radiance_size", 1))
 	var sky_max_roughness_lod := int(frame.get("sky_max_roughness_lod", 0))
-	bytes.append_array(PackedInt32Array([generation >> 32, 0, sky_max_roughness_lod, sky_size]).to_byte_array())
+	bytes.append_array(PackedInt32Array([generation >> 32, int(not bool(options.get("importance_sampling", importance_sampling))), sky_max_roughness_lod, sky_size]).to_byte_array())
 	return bytes
 
 func _texture(rd: RenderingDevice, size: Vector2i, format: int) -> RID:
@@ -425,11 +443,14 @@ func _create_diffuse_state(rd: RenderingDevice, size: Vector2i) -> Dictionary:
 	var resources: Array[RID] = []
 	var raw := _texture(rd, size, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT)
 	resources.append(raw)
+	var hit_distance := _texture(rd, size, RenderingDevice.DATA_FORMAT_R32_SFLOAT)
+	resources.append(hit_distance)
 	var histories: Array = []
 	for history_index in 2:
 		var images: Array[RID] = []
 		for format in [RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
-				RenderingDevice.DATA_FORMAT_R16G16_SFLOAT, RenderingDevice.DATA_FORMAT_R32_SFLOAT,
+				RenderingDevice.DATA_FORMAT_R32G32_SFLOAT, RenderingDevice.DATA_FORMAT_R32_SFLOAT,
+				RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
 				RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT]:
 			var image := _texture(rd, size, format)
 			images.append(image)
@@ -441,7 +462,7 @@ func _create_diffuse_state(rd: RenderingDevice, size: Vector2i) -> Dictionary:
 		if not rid.is_valid():
 			_release_diffuse_state(rd, {"resources": resources})
 			return {}
-	return {"size": size, "raw": raw, "history": histories, "resources": resources,
+	return {"size": size, "raw": raw, "hit_distance": hit_distance, "history": histories, "resources": resources,
 			"ubo": ubo, "ping": 0, "valid": false, "generation": -1, "revision": -1,
 			"exposure": 1.0, "vp": Projection.IDENTITY, "last_seen": Engine.get_frames_drawn()}
 
@@ -452,7 +473,10 @@ func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, fram
 	var vp := projection * Projection(transform.affine_inverse())
 	var exposure := float(frame.get("pre_exposure", 1.0)) * float(frame.get("scene_normalization", 1.0))
 	var camera_cut := bool(frame.get("camera_cut", false))
+	var requested_denoiser := int(options.get("denoiser", denoiser))
+	var active_denoiser := 1 if requested_denoiser == 0 and state.has("nrd_ready") and not state.nrd_ready else requested_denoiser
 	var valid: bool = state.valid and state.generation + 1 == generation \
+			and state.get("denoiser", active_denoiser) == active_denoiser \
 			and state.revision == revision and not camera_cut and state.get("camera", -1) == frame.get("camera_generation", 0)
 	var bytes := _matrix_bytes(vp.inverse())
 	bytes.append_array(_matrix_bytes(state.vp))
@@ -464,6 +488,37 @@ func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, fram
 	if rd.buffer_update(state.ubo, 0, bytes.size(), bytes) != OK:
 		state.valid = false
 		return false
+	if int(options.get("denoiser", denoiser)) == 0:
+		if not state.has("nrd"):
+			var nrd := NRDRenderer.new()
+			state.nrd = nrd
+			state.nrd_ready = nrd.initialize(rd, state.size)
+			state.nrd_count = 0
+			if not state.nrd_ready: warn_once(nrd.error)
+		var nrd: RefCounted = state.nrd
+		if state.nrd_ready:
+			var nrd_ok: bool = nrd.resolve(state, frame, textures, generation,
+					not valid or state.get("denoiser", -1) != 0, exposure,
+					float(options.get("strength", strength)))
+			state.resources.append_array(nrd.resources.slice(state.nrd_count))
+			state.nrd_count = nrd.resources.size()
+			if not nrd_ok:
+				warn_once("NRD resolve failed: " + nrd.error)
+				state.valid = false
+				return false
+			state.resolved = nrd.output
+			state.valid = true
+			state.generation = generation
+			state.revision = revision
+			state.exposure = exposure
+			state.vp = vp
+			state.camera = frame.get("camera_generation", 0)
+			state.denoiser = 0
+			state.last_seen = Engine.get_frames_drawn()
+			return true
+		# Retain ownership of partially initialized NRD resources on failure.
+		state.resources.append_array(nrd.resources.slice(state.nrd_count))
+		state.nrd_count = nrd.resources.size()
 	var previous: Array = state.history[state.ping]
 	var next_index: int = 1 - int(state.ping)
 	var next: Array = state.history[next_index]
@@ -474,10 +529,16 @@ func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, fram
 	for index in 4:
 		bindings.append(U.image(7 + index, next[index]))
 	bindings.append(U.uniform_buffer(11, state.ubo))
+	bindings.append(U.sampled(12, sampler, textures[2]))
+	bindings.append(U.sampled(13, sampler, textures[3]))
+	bindings.append(U.sampled(14, sampler, previous[4]))
+	bindings.append(U.image(15, next[4]))
 	if not _dispatch(rd, _diffuse_temporal_shader, _diffuse_temporal_pipeline, bindings, state.size):
 		state.valid = false
 		return false
 	state.ping = next_index
+	state.resolved = next[0]
+	state.denoiser = 1
 	state.valid = true
 	state.generation = generation
 	state.revision = revision

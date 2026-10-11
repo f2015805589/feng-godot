@@ -12,6 +12,7 @@ var pipeline := RID()
 var sbt := RID()
 var sbt_range := 0
 var frame_buffer := RID()
+var fallback_hit_distance := RID()
 var sky_array := false
 var error := ""
 
@@ -35,6 +36,7 @@ func release() -> void:
 	sbt = RID()
 	sbt_range = 0
 	frame_buffer = RID()
+	fallback_hit_distance = RID()
 
 func all_rids() -> Array[RID]:
 	return owned.duplicate()
@@ -80,7 +82,13 @@ func initialize(device: RenderingDevice, array_sky: bool) -> bool:
 	if sbt_range == 0 or rd.hit_sbt_range_update(sbt, sbt_range, 0, PackedInt32Array([0])) != OK:
 		return false
 	frame_buffer = keep(rd.uniform_buffer_create(256))
-	return frame_buffer.is_valid()
+	var format := RDTextureFormat.new()
+	format.width = 1
+	format.height = 1
+	format.format = RenderingDevice.DATA_FORMAT_R32_SFLOAT
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT
+	fallback_hit_distance = keep(rd.texture_create(format, RDTextureView.new()))
+	return frame_buffer.is_valid() and fallback_hit_distance.is_valid()
 
 func attach_stage(source: RDShaderSource, entry: Array) -> void:
 	var code := FileAccess.get_file_as_string(DIR + entry[1] + ".glslinc")
@@ -108,7 +116,7 @@ func sync_scene(snapshot: Dictionary) -> bool:
 	return scene != null and scene.sync_scene(snapshot, sbt_range)
 
 func trace(textures: Array[RID], frame: PackedByteArray, lighting: Dictionary, output: RID,
-		dfg_texture: RID, size: Vector2i) -> bool:
+		dfg_texture: RID, size: Vector2i, hit_distance: RID = RID()) -> bool:
 	if scene == null or not scene.tlas.is_valid():
 		error = "RTGI shared TLAS is unavailable"
 		return false
@@ -116,6 +124,7 @@ func trace(textures: Array[RID], frame: PackedByteArray, lighting: Dictionary, o
 		error = "RTGI frame data upload failed"
 		return false
 	var uniforms: Array[RDUniform] = scene.build_trace_uniforms(textures, lighting, frame_buffer, output, dfg_texture, false, sky_array)
+	uniforms.append(U.image(24, hit_distance if hit_distance.is_valid() else fallback_hit_distance))
 	var uniform_set := rd.uniform_set_create(uniforms, shader, 0)
 	if not uniform_set.is_valid():
 		error = "RTGI descriptor binding failed"

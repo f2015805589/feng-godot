@@ -16,6 +16,38 @@ const MIN_VISIBILITY_RAYS_PER_TEXEL := 4
 static func signature_for_geometry(geometry_signature: int) -> int:
 	return Data.signature_for_geometry(geometry_signature)
 
+## Explicit v5 upgrade: keep light transport byte-for-byte and only build static
+## blockers. Never assigns the volume or saves a scene; callers own that choice.
+func upgrade_visibility_bake(volume: FMagicGIVolume, collected_geometry: Placement = null) -> Data:
+	var previous: Data = volume.bake_data
+	if not volume.is_inside_tree() or previous == null \
+			or previous.format_version != Data.MOMENT_FORMAT_VERSION or not previous.is_valid():
+		return null
+	var geometry := collected_geometry
+	if geometry == null:
+		geometry = Placement.new()
+		if not geometry.collect(volume, true, true, true):
+			return null
+	if previous.scene_signature != signature_for_geometry(geometry.scene_signature):
+		return null
+	var upgraded: Data = previous.duplicate(true)
+	upgraded.format_version = Data.FORMAT_VERSION
+	if not upgraded.matches_layout(volume.size, volume.probe_spacing, volume.surface_offset,
+			volume.global_transform, volume.bake_samples, volume.bake_bounces,
+			volume.bake_distance, volume.terrain_reflectance, volume.fallback_material_reflectance) \
+			or not _build_visibility_geometry(upgraded, geometry.faces):
+		return null
+	upgraded.bake_version = maxi(previous.bake_version + 1, Time.get_ticks_usec())
+	return upgraded if upgraded.is_valid() else null
+
+static func _build_visibility_geometry(data: Data, faces: PackedVector3Array) -> bool:
+	var blockers := Data.Visibility.build(faces)
+	if blockers.is_empty():
+		return false
+	data.visibility_nodes = blockers.nodes
+	data.visibility_triangles = blockers.triangles
+	return true
+
 func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not volume.is_inside_tree():
 		return null
@@ -56,6 +88,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.positions = geometry.positions
 	data.surface_positions = geometry.surface_positions
 	data.normals = geometry.normals
+	if not _build_visibility_geometry(data, geometry.faces):
+		push_warning("FMagicGI: could not build static segment blockers; discarded the incomplete bake.")
+		return null
 	data.transfer.resize(data.probe_count() * 27)
 	data.primary_sky_visibility.resize(data.probe_count() * 9)
 	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE

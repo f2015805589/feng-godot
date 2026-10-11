@@ -16,11 +16,15 @@ struct GIFrameData {
 };
 ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
 RWTexture2D<float4> gi_output : register(u21, space0);
+RWTexture2D<float> gi_hit_distance : register(u24, space0);
 
+ByteAddressBuffer gi_emitters : register(t25, space0);
+float4 gi_emitter_row(uint index) { return asfloat(gi_emitters.Load4(index * 16u)); }
 struct GIPathPayload {
 	float3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 static const uint GI_RAY_MODE_PRIMARY = 0u;
@@ -93,7 +97,8 @@ void FengGIRayGen() {
 		return;
 	}
 
-	float4 view_h = mul(gi_frame.inverse_projection, float4(uv * 2.0f - 1.0f, depth, 1.0f));
+	float2 surface_uv = (float2(depth_pixel) + 0.5f) / float2(depth_width, depth_height);
+	float4 view_h = mul(gi_frame.inverse_projection, float4(surface_uv * 2.0f - 1.0f, depth, 1.0f));
 	if (abs(view_h.w) < 1e-8f || !isfinite(view_h.w)) {
 		gi_output[pixel] = 0.0f;
 		return;
@@ -126,12 +131,18 @@ void FengGIRayGen() {
 		sample_count = 1u;
 	}
 	uint seed = gi_hash(pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu
-			^ gi_frame.sun_view_generation_sky_array.z);
+			^ gi_frame.sun_view_generation_sky_array.y ^ gi_frame.generation_history_flags.x);
+	float rotation_x = gi_random(seed);
+	float rotation_y = gi_random(seed);
+	float2 rotation = float2(rotation_x, rotation_y);
+	float sequence = float(gi_frame.sun_view_generation_sky_array.z & 4095u);
+	float2 temporal_sample = frac(rotation + sequence * float2(0.754877666f, 0.569840296f));
 	float max_distance = max(gi_frame.trace_parameters.x, 0.001f);
 	float3 incoming_radiance = 0.0f;
+	float distance_sum = 0.0f;
 	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
-		float u = (float(sample_index) + gi_random(seed)) / float(sample_count);
-		float v = gi_random(seed);
+		float u = (float(sample_index) + temporal_sample.x) / float(sample_count);
+		float v = frac(temporal_sample.y + float(sample_index) * 0.618033989f);
 		float radius = sqrt(u);
 		float angle = 6.28318530718f * v;
 		float3 local_direction = float3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0f, 1.0f - u)));
@@ -143,6 +154,7 @@ void FengGIRayGen() {
 		GIPathPayload payload;
 		payload.radiance = 0.0f;
 		payload.flags = GI_RAY_MODE_PRIMARY;
+		payload.ray_pdf = local_direction.z * 0.31830988618;
 		payload.hit_distance = 0.0f;
 		RayDesc ray;
 		ray.Origin = world_position + normal_world * 0.001f;
@@ -151,9 +163,54 @@ void FengGIRayGen() {
 		ray.TMax = max_distance;
 		TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, ray, payload);
 		incoming_radiance += gi_finite_nonnegative(payload.radiance);
+		distance_sum += payload.hit_distance > 0.0f ? payload.hit_distance : max_distance;
+        // One area-light sample per cosine sample, balanced against the BSDF PDF.
+        float total_power = gi_emitter_row(0).x;
+        uint emitter_count = uint(gi_emitter_row(0).y);
+        if (gi_frame.generation_history_flags.y == 0u && emitter_count > 0u && total_power > 0.0) {
+            float target = frac(temporal_sample.x + float(sample_index) * 0.41421356237) * total_power;
+            uint lo = 0u, hi = emitter_count - 1u;
+            while (lo < hi) {
+                uint mid = (lo + hi) / 2u;
+                if (gi_emitter_row(1u + mid * 5u).w < target) lo = mid + 1u; else hi = mid;
+            }
+            uint base = 1u + lo * 5u;
+            float4 vertex = gi_emitter_row(base);
+            float4 edge1 = gi_emitter_row(base + 1u);
+            float4 edge2 = gi_emitter_row(base + 2u);
+            float3 emitted = gi_emitter_row(base + 3u).xyz;
+            float3 light_normal = gi_emitter_row(base + 4u).xyz;
+            float root_u = sqrt(frac(temporal_sample.y + float(sample_index) * 0.73205080757));
+            float bary_v = frac(rotation_x + sequence * 0.430159709 + float(sample_index) * 0.618033989);
+            float3 origin = world_position + normal_world * 0.001;
+            float3 delta = vertex.xyz + edge1.xyz * (root_u * (1.0 - bary_v)) + edge2.xyz * (root_u * bary_v) - origin;
+            float distance_squared = dot(delta, delta);
+            float light_distance = sqrt(distance_squared);
+            float3 light_direction = delta / max(light_distance, 1e-8);
+            float cos_light = dot(light_normal, -light_direction);
+            if (edge2.w > 0.5) cos_light = abs(cos_light);
+            float cosine = max(dot(normal_world, light_direction), 0.0);
+            if (cosine > 0.0 && cos_light > 1e-6 && light_distance > 0.003 && light_distance < max_distance) {
+                float light_pdf = edge1.w / total_power * distance_squared / cos_light;
+                float bsdf_pdf = cosine * 0.31830988618;
+                payload.radiance = 0.0;
+                payload.flags = 8u;
+                RayDesc shadow_ray;
+                shadow_ray.Origin = origin;
+                shadow_ray.Direction = light_direction;
+                shadow_ray.TMin = 0.001;
+                shadow_ray.TMax = light_distance - 0.001;
+                TraceRay(gi_scene_tlas, RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+                    0x01, 0, 0, 1, shadow_ray, payload);
+                incoming_radiance += emitted * (payload.radiance.x * bsdf_pdf / max(light_pdf + bsdf_pdf, 1e-12));
+            }
+        }
+
 	}
 
 	float3 result = diffuse_reflectance * (incoming_radiance / float(sample_count));
 	result = min(gi_finite_nonnegative(result) * p0 * scene_normalization * strength, GI_HALF_MAX);
 	gi_output[pixel] = float4(result, saturate(strength));
+	uint hw,hh; gi_hit_distance.GetDimensions(hw,hh);
+	if(all(pixel<uint2(hw,hh))) gi_hit_distance[pixel] = distance_sum / float(sample_count);
 }

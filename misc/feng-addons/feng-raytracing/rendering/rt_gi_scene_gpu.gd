@@ -4,6 +4,7 @@ extends RefCounted
 ## Owns the BLAS/TLAS and the material, geometry, texture-atlas and common sampling data.
 const DIR = "res://addons/feng-raytracing/shaders/"
 const U = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
+const Emitters = preload("res://addons/feng-raytracing/rendering/rt_gi_emitters.gd")
 const MATERIAL_ROW_BYTES := 80
 const MATERIAL_WORD_STRIDE := 20
 var rd: RenderingDevice
@@ -14,6 +15,7 @@ var vertices := RID()
 var indices := RID()
 var surfaces := RID()
 var materials := RID()
+var emitters := RID()
 var sampler := RID()
 var black_2d := RID()
 var black_array := RID()
@@ -72,6 +74,7 @@ func release_scene() -> void:
 	indices = RID()
 	surfaces = RID()
 	materials = RID()
+	emitters = RID()
 	geometry_key.clear()
 	transform_key.clear()
 	previous_hit_sbt_range = 0
@@ -132,6 +135,14 @@ func sync_scene(snapshot: Dictionary, hit_sbt_range: int) -> bool:
 	if not tlas.is_valid() or rd.tlas_build(tlas, native_instances) != OK:
 		error = "RTGI TLAS build failed"
 		return false
+	var emitter_data := Emitters.build(instances)
+	if emitters.is_valid():
+		scene_owned.erase(emitters)
+		rd.free_rid(emitters)
+	emitters = keep(rd.storage_buffer_create(emitter_data.size(), emitter_data), true)
+	if not emitters.is_valid():
+		error = "RTGI emitter distribution creation failed"
+		return false
 	transform_key = transforms
 	previous_hit_sbt_range = hit_sbt_range
 	return true
@@ -163,6 +174,7 @@ func build_trace_uniforms(textures: Array[RID], lighting: Dictionary, frame_buff
 	uniforms.append(U.image(21, output))
 	var dfg: RID = dfg_texture if dfg_texture.is_valid() else lighting.get("dfg_texture", RID())
 	uniforms.append(U.sampled(23, sampler, dfg if dfg.is_valid() else black_2d))
+	uniforms.append(U.storage_buffer(25, emitters))
 	return uniforms
 
 func build_scene(instances: Array) -> bool:
@@ -233,8 +245,17 @@ func build_scene(instances: Array) -> bool:
 	materials = keep(rd.storage_buffer_create(material_bytes.size(), material_bytes), true)
 	var flags := RenderingDevice.BUFFER_CREATION_DEVICE_ADDRESS_BIT | RenderingDevice.BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT
 	var build_vertices := keep(rd.vertex_buffer_create(vertex_bytes.size(), vertex_bytes, flags), true)
-	var build_indices := keep(rd.index_buffer_create(index_bytes.size() / 4, RenderingDevice.INDEX_BUFFER_FORMAT_UINT32, index_bytes, false, flags), true)
+	if not build_vertices.is_valid():
+		error = "RTGI vertex buffer creation failed"
+		return false
 	for row in scene_rows:
+		# BLAS validation uses the index buffer's maximum, so each surface needs
+		# its own local index range. The shader still reads the shared storage buffer.
+		var surface_indices := index_bytes.slice(row.index, row.index + row.index_count * 4)
+		var build_indices := keep(rd.index_buffer_create(row.index_count, RenderingDevice.INDEX_BUFFER_FORMAT_UINT32, surface_indices, false, flags), true)
+		if not build_indices.is_valid():
+			error = "RTGI index buffer creation failed"
+			return false
 		var geometry := RDAccelerationStructureGeometry.new()
 		geometry.vertex_buffer = build_vertices
 		geometry.vertex_offset = row.vertex
@@ -242,7 +263,7 @@ func build_scene(instances: Array) -> bool:
 		geometry.vertex_count = row.vertex_count
 		geometry.vertex_format = RenderingDevice.DATA_FORMAT_R32G32B32_SFLOAT
 		geometry.index_buffer = build_indices
-		geometry.index_offset = row.index
+		geometry.index_offset = 0
 		geometry.index_count = row.index_count
 		var blas := keep(rd.blas_create([geometry], RenderingDevice.ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT), true)
 		if not blas.is_valid() or rd.blas_build(blas) != OK:

@@ -5,19 +5,42 @@ layout(set=0,binding=1) uniform sampler2D resolved_gi;
 layout(set=0,binding=2) uniform sampler2D sky_diffuse;
 layout(set=0,binding=3) uniform sampler2D depth;
 layout(set=0,binding=4) uniform sampler2D gi_depth;
+layout(set=0,binding=5) uniform sampler2D current_normal;
+layout(set=0,binding=6) uniform sampler2D gi_normal;
+layout(set=0,binding=7) uniform sampler2D current_albedo;
+layout(set=0,binding=8) uniform sampler2D current_orm;
+layout(set=0,binding=9) uniform sampler2D gi_reflectance;
+layout(set=0,binding=10,std140) uniform Frame {
+ mat4 inverse_view_projection;
+ mat4 previous_view_projection;
+ vec4 size_weight_exposure;
+ vec4 rejection;
+ uvec4 identity;
+ mat4 view_to_world;
+} frame;
 void main() {
  ivec2 p=ivec2(gl_GlobalInvocationID.xy),size=imageSize(scene_color);
  if(any(greaterThanEqual(p,size))) return;
  float z=texelFetch(depth,p,0).r;
  if(z<=0.0) return;
- vec2 uv=(vec2(p)+0.5)/vec2(size), q=uv*vec2(textureSize(resolved_gi,0))-0.5;
- ivec2 base=ivec2(floor(q)),small=textureSize(resolved_gi,0);
+ vec3 normal=normalize(mat3(frame.view_to_world)*(texelFetch(current_normal,p,0).xyz*2.0-1.0));
+ vec4 orm=texelFetch(current_orm,p,0);
+ if((uint(round(clamp(orm.a,0.0,1.0)*255.0))&0x0Fu)==0u) return;
+ vec3 material=max(texelFetch(current_albedo,p,0).rgb,vec3(0))*clamp(orm.r,0.0,1.0)*(1.0-clamp(orm.b,0.0,1.0));
+ vec2 uv=(vec2(p)+0.5)/vec2(size);
+ ivec2 small=textureSize(resolved_gi,0),base=ivec2(floor(uv*vec2(small)));
+ ivec2 base_surface=min(ivec2((vec2(base)+0.5)/vec2(small)*vec2(size)),size-1);
+ base-=ivec2(greaterThan((vec2(base_surface)+0.5)/vec2(size),uv));
  vec4 gi=vec4(0); float sum=0;
  for(int y=0;y<2;y++) for(int x=0;x<2;x++) {
   ivec2 tap=clamp(base+ivec2(x,y),ivec2(0),small-1);
   float other=texelFetch(gi_depth,tap,0).r;
-  vec2 f=abs(q-vec2(base+ivec2(x,y)));
-  float w=(1.0-f.x)*(1.0-f.y)*exp(-abs(other-z)/max(z*0.01,1e-5));
+  ivec2 surface=min(ivec2((vec2(tap)+0.5)/vec2(small)*vec2(size)),size-1);
+  vec2 tap_uv=(vec2(surface)+0.5)/vec2(size);
+  vec2 f=max(vec2(0),1.0-abs((uv-tap_uv)*vec2(small)));
+  float w=f.x*f.y*exp(-abs(other-z)/max(z*0.01,1e-5))
+    *pow(max(dot(normal,texelFetch(gi_normal,tap,0).xyz),0.0),32.0)
+    *exp(-length(material-texelFetch(gi_reflectance,tap,0).rgb)*32.0);
   gi+=texelFetch(resolved_gi,tap,0)*w; sum+=w;
  }
  if(sum<=1e-8) return;

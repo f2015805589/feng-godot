@@ -87,6 +87,8 @@ def run(name, extra, marker=None):
 
 
 run("import", ["--editor", "--recovery-mode", "--import"])
+run("visibility", ["--script", "res://addons/feng-magic-gi/tests/test_visibility.gd"],
+    "MAGIC_GI_VISIBILITY_RESULT failures=0")
 run("prt", ["--script", str(ROOT / "misc/scripts/tests/magic_gi_prt.gd")],
     "MAGIC_GI_PRT_RESULT failures=0")
 run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_magic_gi.gd")],

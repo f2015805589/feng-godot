@@ -71,6 +71,10 @@ func make_test_bake() -> Resource:
 	data.positions = _volume.probe_positions.duplicate()
 	data.surface_positions = _volume.probe_surface_positions.duplicate()
 	data.normals = _volume.probe_normals.duplicate()
+	var blocker_faces := PackedVector3Array()
+	for vertex in _surface.mesh.get_faces():
+		blocker_faces.append(_surface.global_transform * vertex)
+	Baker._build_visibility_geometry(data, blocker_faces)
 	data.visibility_moments.resize(data.positions.size() * Data.VISIBILITY_TEXELS_PER_PROBE
 			* Data.VISIBILITY_MOMENT_CHANNELS)
 	for probe in data.positions.size():
@@ -221,12 +225,12 @@ func run() -> void:
 		return
 
 	var data := make_test_bake()
-	if not check(data != null and data.is_valid(), "synthetic v5 surface transfer fixture failed validation"):
+	if not check(data != null and data.is_valid(), "synthetic v6 surface transfer fixture failed validation"):
 		return
 	_volume.bake_data = data
 	_volume.refresh_surface_points()
 	data.scene_signature = Baker.signature_for_geometry(_volume._current_scene_signature)
-	if not check(_volume.has_bake(), "volume rejected the v5 surface bake layout or scene signature"):
+	if not check(_volume.has_bake(), "volume rejected the v6 surface bake layout or scene signature"):
 		return
 	Runtime.publish(_volume)
 	await settle(16)
@@ -254,12 +258,107 @@ func run() -> void:
 	Runtime.publish(_volume)
 	await settle(8)
 	var unoccluded_recovered_pixel := center(await image())
-	print("Directional visibility GPU check: open=", gi_pixel,
-		" all_blocked=", fully_blocked_pixel, " restored=", unoccluded_recovered_pixel)
-	if not check(max_channel(fully_blocked_pixel) < max_channel(gi_pixel) * 0.15
+	print("Geometry visibility GPU check: open=", gi_pixel,
+		" coarse_moments_blocked=", fully_blocked_pixel, " restored=", unoccluded_recovered_pixel)
+	if not check(color_delta(fully_blocked_pixel, gi_pixel) < 0.01
 			and color_delta(unoccluded_recovered_pixel, gi_pixel) < 0.01,
-			"fully blocked candidate mass stays dark and open-direction energy recovers without renormalization loss"):
+			"exactly visible receivers retain energy despite false occlusion in coarse directional moments"):
 		return
+	# Keep all moments open and both receiver/probe normals +Y. The wall crosses
+	# their connecting segment, while the camera still sees the floor beside it.
+	var wall_data: Resource = data.duplicate(true)
+	wall_data.positions = PackedVector3Array([Vector3(-0.5, 0.03, 0)])
+	wall_data.surface_positions = PackedVector3Array([Vector3(-0.5, 0, 0)])
+	wall_data.normals = PackedVector3Array([Vector3.UP])
+	wall_data.transfer = data.transfer.slice(0, 27)
+	wall_data.primary_sky_visibility = data.primary_sky_visibility.slice(0, 9)
+	wall_data.visibility_moments = data.visibility_moments.slice(0, 128)
+	wall_data.build_cell_indices()
+	wall_data.bake_version += 1
+	_volume.bake_data = wall_data
+	Runtime.publish(_volume)
+	await settle(8)
+	var isolated_open_pixel := center(await image())
+	var blocker_faces := PackedVector3Array()
+	for vertex in _surface.mesh.get_faces():
+		blocker_faces.append(_surface.global_transform * vertex)
+	blocker_faces.append_array(PackedVector3Array([
+		Vector3(-0.25, 0, -1), Vector3(-0.25, 0.2, -1), Vector3(-0.25, 0.2, 1),
+		Vector3(-0.25, 0, -1), Vector3(-0.25, 0.2, 1), Vector3(-0.25, 0, 1)]))
+	Baker._build_visibility_geometry(wall_data, blocker_faces)
+	wall_data.bake_version += 1
+	Runtime.publish(_volume)
+	await settle(8)
+	var thin_wall_pixel := center(await image())
+	data.bake_version += 1
+	_volume.bake_data = data
+	Runtime.publish(_volume)
+	await settle(8)
+	var open_surface_pixel := center(await image())
+	print("Exact segment GPU check: open=", isolated_open_pixel, " thin_wall=", thin_wall_pixel,
+		" restored=", open_surface_pixel)
+	if not check(max_channel(isolated_open_pixel) > 0.08
+			and max_channel(thin_wall_pixel) < max_channel(isolated_open_pixel) * 0.02
+			and color_delta(open_surface_pixel, gi_pixel) < 0.02,
+			"static segments reject a thin same-normal separator despite fully open moments and preserve open-plane energy"):
+		return
+	# A low separator still blocks a coplanar receiver. An outward endpoint must
+	# never route these candidates over the wall even when both detour legs clear.
+	var clearance_faces := blocker_faces.slice(0, blocker_faces.size() - 6)
+	clearance_faces.append_array(PackedVector3Array([
+		Vector3(-0.25, 0, -1), Vector3(-0.25, 0.08, -1), Vector3(-0.25, 0.08, 1),
+		Vector3(-0.25, 0, -1), Vector3(-0.25, 0.08, 1), Vector3(-0.25, 0, 1)]))
+	Baker._build_visibility_geometry(wall_data, clearance_faces)
+	wall_data.bake_version += 1
+	_volume.bake_data = wall_data
+	Runtime.publish(_volume)
+	await settle(8)
+	var clear_outward_pixel := center(await image())
+	# Exercise the curved-plane gate too: its direct segment must still reject a
+	# separate blocker patch, regardless of whether an outward route exists.
+	wall_data.surface_positions = PackedVector3Array([Vector3(-0.5, -0.1, 0)])
+	wall_data.normals = PackedVector3Array([Vector3(-0.4, sqrt(0.84), 0)])
+	var curved_faces := PackedVector3Array()
+	var strip := PackedVector2Array([Vector2(-1, -0.4), Vector2(-0.5, -0.1), Vector2(0, 0), Vector2(1, 0)])
+	for segment in strip.size() - 1:
+		var left := strip[segment]
+		var right := strip[segment + 1]
+		curved_faces.append_array(PackedVector3Array([
+			Vector3(left.x, left.y, -1), Vector3(right.x, right.y, -1), Vector3(right.x, right.y, 1),
+			Vector3(left.x, left.y, -1), Vector3(right.x, right.y, 1), Vector3(left.x, left.y, 1)]))
+	curved_faces.append_array(clearance_faces.slice(clearance_faces.size() - 6))
+	Baker._build_visibility_geometry(wall_data, curved_faces)
+	var source_patch: int = Data.Visibility.surface_patch(wall_data.visibility_nodes,
+		wall_data.visibility_triangles, wall_data.surface_positions[0])
+	var receiver_patch: int = Data.Visibility.surface_patch(wall_data.visibility_nodes,
+		wall_data.visibility_triangles, Vector3(0.01, 0, 0))
+	if not check(source_patch > 0 and source_patch == receiver_patch,
+			"curved divider fixture really exercises a shared smooth receiver/probe patch"):
+		return
+	wall_data.build_cell_indices()
+	wall_data.bake_version += 1
+	Runtime.publish(_volume)
+	await settle(8)
+	var curved_divider_pixel := center(await image())
+	curved_faces.append_array(PackedVector3Array([
+		Vector3(-0.1, 0.1, -0.1), Vector3(0.1, 0.1, -0.1), Vector3(0.1, 0.1, 0.1),
+		Vector3(-0.1, 0.1, -0.1), Vector3(0.1, 0.1, 0.1), Vector3(-0.1, 0.1, 0.1)]))
+	Baker._build_visibility_geometry(wall_data, curved_faces)
+	wall_data.bake_version += 1
+	Runtime.publish(_volume)
+	await settle(8)
+	var capped_outward_pixel := center(await image())
+	print("Safe endpoint GPU check: low_divider=", clear_outward_pixel,
+		" curved_divider=", curved_divider_pixel, " thin_roof=", capped_outward_pixel)
+	if not check(max_channel(clear_outward_pixel) < max_channel(isolated_open_pixel) * 0.02
+			and max_channel(curved_divider_pixel) < max_channel(isolated_open_pixel) * 0.02
+			and max_channel(capped_outward_pixel) < max_channel(isolated_open_pixel) * 0.02,
+			"coplanar and curved candidates cannot use an outward endpoint to route over a separate low wall"):
+		return
+	data.bake_version += 1
+	_volume.bake_data = data
+	Runtime.publish(_volume)
+	await settle(8)
 
 	# Changing a light colour updates the live SH coefficients without rebuilding or
 	# changing the geometry-only transfer payload.
@@ -392,7 +491,7 @@ func run() -> void:
 		return
 
 	# Consume a bake produced by the CPU baker through the real D3D12 pass as well.
-	# This also exercises cache replacement (synthetic fixture -> persisted PRT v5)
+	# This also exercises cache replacement (synthetic fixture -> persisted PRT v6)
 	# before the process exits and releases the pass-owned GPU resources.
 	var red_wall := MeshInstance3D.new()
 	var wall_mesh := BoxMesh.new()
@@ -425,7 +524,7 @@ func run() -> void:
 	_volume.refresh_surface_points()
 	await settle(4)
 	var real_bake_succeeded: bool = await _volume.bake()
-	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v5 resource for the GPU pass"):
+	if not check(real_bake_succeeded and _volume.has_bake(), "CPU baker did not produce a valid PRT v6 resource for the GPU pass"):
 		return
 	var actual_data: Resource = _volume.bake_data
 	var actual_transfer_energy := 0.0

@@ -32,6 +32,7 @@ func quad_arrays(center_x: float, half_extent: float) -> Array:
 func _initialize():
 	call_deferred("run")
 func run():
+	ProjectSettings.set_setting("rendering/lights_and_shadows/use_physical_light_units", false)
 	var mesh := MeshInstance3D.new()
 	var array_mesh := ArrayMesh.new()
 	array_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, quad_arrays(1000.0, 1.0))
@@ -48,14 +49,20 @@ func run():
 		else:
 			surface_material.albedo_color = Color(0.1 * (i + 1),0.2,0.3)
 		mesh.mesh.surface_set_material(i, surface_material)
-	root.add_child(mesh)
 	mesh.position.z = 2
+	# Mixed vertex counts must not make a smaller surface fail BLAS validation.
+	for primitive in [BoxMesh.new(), SphereMesh.new()]:
+		var distant_mesh := MeshInstance3D.new()
+		distant_mesh.mesh = primitive
+		root.add_child(distant_mesh)
+		distant_mesh.position = Vector3(10000, 10000, 0)
+	root.add_child(mesh)
 	var registry := Registry.new()
 	registry.attach(root.world_3d, root, 1)
 	var target := RenderingServer.viewport_get_render_target(root.get_viewport_rid())
 	snapshot = registry.snapshot(target, [target])
 	print("SNAPSHOT ",snapshot.get("valid")," ",snapshot.get("unsupported_reasons"))
-	var third_material_ready: bool = snapshot.get("instances", []).size() == 1 \
+	var third_material_ready: bool = snapshot.get("instances", []).size() == 3 \
 			and snapshot.instances[0].mesh.materials.size() == 3 \
 			and snapshot.instances[0].mesh.surfaces[2].material_index == 2
 	print("RTGI_CASE material_row_stride_3 ", third_material_ready)
@@ -90,6 +97,7 @@ func execute():
 		done = true
 		return
 	var pass_instance := Pass.new()
+	pass_instance.importance_sampling = false # Deterministic emission/ABI cases; MIS has a statistical test below.
 	var owned: Array[RID] = []
 	var inputs: Array[RID] = []
 	for color in [Color(0.5,0,0,0),Color(0.5,0.5,1,0),Color(1,1,1,1),Color(1,0.5,0,1.0/255.0)]:
@@ -131,6 +139,54 @@ func execute():
 		success = success and absf(value.r-case[4]) < 0.01 and absf(value.a-case[5]) < 0.01
 		passed = passed and success
 		print("RTGI_CASE ",case[0]," ",success," ",value)
+	# Small area emitter: compare unbiased means and estimator variance.
+	frame.pre_exposure = 1.0
+	frame.scene_normalization = 1.0
+	snapshot.instances[0].transform.basis = Basis.from_scale(Vector3.ONE * 0.01)
+	gpu.sync_scene(snapshot)
+	var expected := 0.0
+	for y in 100:
+		for x in 100:
+			var dx := (float(x) + 0.5) / 100.0 - 0.5
+			var dy := (float(y) + 0.5) / 100.0 - 0.5
+			var distance_squared := dx * dx + dy * dy + 1.499 * 1.499
+			expected += 2.0 * 1.499 * 1.499 / (PI * distance_squared * distance_squared * 10000.0)
+	var variances: Array[float] = []
+	for mis_enabled in [false, true]:
+		var sum := 0.0
+		var sum_squared := 0.0
+		for generation in range(1, 513):
+			var trace_frame := pass_instance._pack_trace_frame(frame, Vector2i.ONE, generation, 0, 1.0,
+					{"samples_per_pixel": 1, "importance_sampling": mis_enabled})
+			gpu.trace(inputs, trace_frame, {}, output, dfg, Vector2i.ONE)
+			var value := Image.create_from_data(1,1,false,Image.FORMAT_RGBAH,rd.texture_get_data(output,0)).get_pixel(0,0).r
+			sum += value
+			sum_squared += value * value
+		var mean := sum / 512.0
+		variances.append(maxf(sum_squared / 512.0 - mean * mean, 0))
+		var energy_ok := absf(mean - expected) < expected * (0.2 if not mis_enabled else 0.04)
+		passed = passed and energy_ok
+		print("RTGI_CASE area_emitter_energy mis=", mis_enabled, " ", energy_ok, " mean=", mean, " expected=", expected)
+	var variance_ok := variances[1] < variances[0] * 0.15
+	passed = passed and variance_ok
+	print("RTGI_CASE importance_variance ", variance_ok, " ", variances)
+	var blocker: Dictionary = snapshot.instances[0].duplicate(true)
+	blocker.instance_id = 987654321
+	blocker.transform = Transform3D(Basis.IDENTITY, Vector3(0, 0, 1))
+	blocker.mesh.materials[2].emission_enabled = false
+	snapshot.instances.append(blocker)
+	snapshot.snapshot_generation += 1
+	gpu.sync_scene(snapshot)
+	var blocked_frame := pass_instance._pack_trace_frame(frame, Vector2i.ONE, 513, 0, 1.0,
+			{"samples_per_pixel": 4, "importance_sampling": true})
+	gpu.trace(inputs, blocked_frame, {}, output, dfg, Vector2i.ONE)
+	var blocked_value := Image.create_from_data(1,1,false,Image.FORMAT_RGBAH,rd.texture_get_data(output,0)).get_pixel(0,0).r
+	passed = passed and blocked_value < 0.001
+	print("RTGI_CASE area_emitter_occluded ", blocked_value < 0.001, " ", blocked_value)
+	snapshot.instances.pop_back()
+	snapshot.snapshot_generation += 1
+	snapshot.instances[0].transform.basis = Basis.IDENTITY
+	gpu.sync_scene(snapshot)
 	var lights := PackedByteArray()
 	lights.resize(464*8)
 	lights.encode_float(8,-1.0)

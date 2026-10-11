@@ -20,12 +20,25 @@ layout(set = 0, binding = 15, r32f) uniform writeonly image2D next_hit_data;
 layout(set = 0, binding = 16, rg16f) uniform writeonly image2D next_material;
 layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D next_albedo;
 layout(set = 0, binding = 18, std140) uniform ReflectionTemporal {
-	vec4 parameters; // history weight, exposure ratio, relative depth threshold, minimum normal dot.
-	vec4 thresholds; // roughness, hit-distance, metallic and specular rejection thresholds.
-	uvec4 state; // valid history, generation low, generation high, replacement-strength bits.
+	vec4 parameters; // History weight, exposure ratio, relative depth threshold, minimum normal dot.
+	vec4 thresholds; // Roughness, hit-distance, metallic and specular rejection thresholds.
+	uvec4 state; // Valid history, generation low, generation high, replacement-strength bits.
+	vec4 motion; // Camera moved; remaining components reserved.
+	mat4 inverse_view_projection;
+	mat4 previous_view_projection;
+	mat4 view_to_world;
 } temporal;
 
 const float GI_HALF_MAX = 65504.0;
+
+bool finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool valid_radiance(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value)) && value.a != 0.0
+			&& all(greaterThanEqual(value.rgb, vec3(0.0)));
+}
 
 vec3 finite_nonnegative_half(vec3 value) {
 	if (any(isnan(value)) || any(isinf(value))) {
@@ -38,6 +51,32 @@ ivec2 nearest_texel(vec2 uv, ivec2 size) {
 	return clamp(ivec2(floor(uv * vec2(size))), ivec2(0), size - ivec2(1));
 }
 
+vec3 world_normal(vec2 uv) {
+	vec3 encoded = texelFetch(current_normal, nearest_texel(uv, textureSize(current_normal, 0)), 0).xyz;
+	return normalize(mat3(temporal.view_to_world) * (encoded * 2.0 - 1.0));
+}
+
+bool same_material(float roughness, vec2 material, vec3 albedo,
+		float other_roughness, vec2 other_material, vec3 other_albedo) {
+	return abs(roughness - other_roughness) <= temporal.thresholds.x
+			&& abs(material.x - other_material.x) <= temporal.thresholds.z
+			&& abs(material.y - other_material.y) <= temporal.thresholds.w
+			&& (material.x <= 0.01 || length(albedo - other_albedo) <= 0.05);
+}
+
+bool compatible_hit(float current_hit, float old_hit, float roughness) {
+	if (!finite_float(old_hit) || old_hit == 0.0) {
+		return false;
+	}
+	// Broad lobes legitimately alternate between sky and geometry and different
+	// hit distances. Rejecting those samples prevents the estimator converging.
+	if (roughness >= 0.3) {
+		return true;
+	}
+	float limit = max(abs(old_hit), 1.0) * mix(temporal.thresholds.y, 1.0, smoothstep(0.1, 0.3, roughness));
+	return (current_hit > 0.0) == (old_hit > 0.0) && abs(abs(current_hit) - abs(old_hit)) <= limit;
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	ivec2 size = imageSize(next_radiance);
@@ -47,57 +86,121 @@ void main() {
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 	vec4 raw = texelFetch(raw_reflection, pixel, 0);
 	float depth = texelFetch(current_depth, nearest_texel(uv, textureSize(current_depth, 0)), 0).r;
-	vec3 normal = normalize(texelFetch(current_normal, nearest_texel(uv, textureSize(current_normal, 0)), 0).xyz * 2.0 - 1.0);
+	vec3 normal = world_normal(uv);
 	vec4 orm = texelFetch(current_orm, nearest_texel(uv, textureSize(current_orm, 0)), 0);
 	float roughness = clamp(orm.g, 0.0, 1.0);
-	float metallic = clamp(orm.b, 0.0, 1.0);
-	float specular = clamp(texelFetch(current_emission, nearest_texel(uv, textureSize(current_emission, 0)), 0).a, 0.0, 1.0);
+	vec2 material = vec2(clamp(orm.b, 0.0, 1.0),
+			clamp(texelFetch(current_emission, nearest_texel(uv, textureSize(current_emission, 0)), 0).a, 0.0, 1.0));
 	vec3 albedo = max(texelFetch(current_albedo, nearest_texel(uv, textureSize(current_albedo, 0)), 0).rgb, vec3(0.0));
-	bool raw_rgb_valid = !any(isnan(raw.rgb)) && !any(isinf(raw.rgb));
-	bool current_valid = raw.a != 0.0 && !isnan(raw.a) && !isinf(raw.a) && raw_rgb_valid
-			&& depth > 0.0 && !isnan(depth) && !isinf(depth)
-			&& !any(isnan(normal)) && !any(isinf(normal)) && !isnan(roughness) && !isinf(roughness)
-			&& !isnan(metallic) && !isinf(metallic) && !isnan(specular) && !isinf(specular);
+	bool current_valid = valid_radiance(raw) && depth > 0.0 && finite_float(depth)
+			&& !any(isnan(normal)) && !any(isinf(normal)) && finite_float(roughness)
+			&& !any(isnan(material)) && !any(isinf(material))
+			&& !any(isnan(albedo)) && !any(isinf(albedo));
+	vec3 current_radiance = current_valid ? finite_nonnegative_half(raw.rgb) : vec3(0.0);
+	// The kernel fades out for polished materials, keeping sharp mirror features
+	// intact. Geometry/material guides prevent gathering across surface boundaries.
+	float spatial_blend = smoothstep(0.12, 0.35, roughness);
+	if (current_valid && spatial_blend > 0.0) {
+		vec3 spatial = current_radiance;
+		float total = 1.0;
+		float sigma = mix(0.65, 1.35, roughness);
+		for (int y = -2; y <= 2; y++) {
+			for (int x = -2; x <= 2; x++) {
+				ivec2 tap = pixel + ivec2(x, y);
+				if ((x == 0 && y == 0) || any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, size))) {
+					continue;
+				}
+				vec4 sample_value = texelFetch(raw_reflection, tap, 0);
+				if (!valid_radiance(sample_value) || !compatible_hit(raw.a, sample_value.a, roughness)) {
+					continue;
+				}
+				vec2 tap_uv = (vec2(tap) + 0.5) / vec2(size);
+				float tap_depth = texelFetch(current_depth, nearest_texel(tap_uv, textureSize(current_depth, 0)), 0).r;
+				vec3 tap_normal = world_normal(tap_uv);
+				vec4 tap_orm = texelFetch(current_orm, nearest_texel(tap_uv, textureSize(current_orm, 0)), 0);
+				vec2 tap_material = vec2(tap_orm.b,
+						texelFetch(current_emission, nearest_texel(tap_uv, textureSize(current_emission, 0)), 0).a);
+				vec3 tap_albedo = texelFetch(current_albedo, nearest_texel(tap_uv, textureSize(current_albedo, 0)), 0).rgb;
+				float normal_dot = dot(normal, tap_normal);
+				if (!(tap_depth > 0.0) || !finite_float(tap_depth) || !(normal_dot >= temporal.parameters.w)
+						|| !same_material(roughness, material, albedo, tap_orm.g, tap_material, tap_albedo)) {
+					continue;
+				}
+				float weight = spatial_blend * exp(-float(x * x + y * y) / (2.0 * sigma * sigma))
+						* exp(-abs(tap_depth - depth) / max(abs(depth) * 0.01, 1e-5))
+						* pow(max(normal_dot, 0.0), mix(256.0, 48.0, roughness));
+				spatial += finite_nonnegative_half(sample_value.rgb) * weight;
+				total += weight;
+			}
+		}
+		current_radiance = spatial / total;
+	}
+
 	float exposure_ratio = temporal.parameters.y;
-	bool exposure_compatible = exposure_ratio >= 0.25 && exposure_ratio <= 4.0
-			&& !isnan(exposure_ratio) && !isinf(exposure_ratio);
-	bool use_history = temporal.state.x != 0u && current_valid && exposure_compatible;
-	ivec2 old_pixel = nearest_texel(uv, textureSize(previous_radiance, 0));
-	float old_depth = texelFetch(previous_depth, old_pixel, 0).r;
-	vec4 old_normal_roughness = texelFetch(previous_normal_roughness, old_pixel, 0);
-	float old_hit = texelFetch(previous_hit_data, old_pixel, 0).r;
-	vec2 old_material = texelFetch(previous_material, old_pixel, 0).rg;
-	vec3 old_albedo = texelFetch(previous_albedo, old_pixel, 0).rgb;
-	bool old_hit_surface = old_hit > 0.0;
-	bool current_hit_surface = raw.a > 0.0;
-	float hit_delta = abs(abs(raw.a) - abs(old_hit));
-	float hit_limit = max(abs(old_hit), 1.0) * temporal.thresholds.y;
-	use_history = use_history && old_depth > 0.0 && !isnan(old_depth) && !isinf(old_depth)
-			&& abs(depth - old_depth) <= max(abs(depth), 0.01) * temporal.parameters.z
-			&& dot(normal, normalize(old_normal_roughness.xyz)) >= temporal.parameters.w
-			&& abs(roughness - old_normal_roughness.w) <= temporal.thresholds.x
-			&& abs(metallic - old_material.x) <= temporal.thresholds.z
-			&& abs(specular - old_material.y) <= temporal.thresholds.w
-			&& (metallic <= 0.01 || length(albedo - old_albedo) <= 0.05)
-			&& old_hit_surface == current_hit_surface && hit_delta <= hit_limit;
-	vec3 current_radiance = raw_rgb_valid ? finite_nonnegative_half(raw.rgb) : vec3(0.0);
+	bool use_history = temporal.state.x != 0u && current_valid && finite_float(exposure_ratio)
+			&& exposure_ratio >= 0.25 && exposure_ratio <= 4.0;
+	vec4 world_h = temporal.inverse_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	vec4 old_clip = temporal.previous_view_projection * vec4(world_h.xyz / world_h.w, 1.0);
+	vec3 old_ndc = old_clip.xyz / old_clip.w;
+	vec2 old_uv = old_ndc.xy * 0.5 + 0.5;
+	use_history = use_history && abs(world_h.w) > 1e-8 && old_clip.w > 1e-8
+			&& !any(isnan(old_ndc)) && !any(isinf(old_ndc))
+			&& all(greaterThanEqual(old_uv, vec2(0.0))) && all(lessThan(old_uv, vec2(1.0)));
+	// Surface reprojection is suitable for broad reflection lobes. A moving
+	// mirror requires reflected-hit reprojection; drop that history here.
+	float motion_weight = temporal.motion.x > 0.5 ? smoothstep(0.12, 0.45, roughness) * 0.9 : 1.0;
+	use_history = use_history && motion_weight > 0.0;
 	vec3 radiance = current_radiance;
+	float history_length = 1.0;
 	if (use_history) {
-		vec3 stored_old_radiance = texelFetch(previous_radiance, old_pixel, 0).rgb;
-		bool old_radiance_valid = !any(isnan(stored_old_radiance)) && !any(isinf(stored_old_radiance))
-				&& all(greaterThanEqual(stored_old_radiance, vec3(0.0)));
-		vec3 old_radiance = old_radiance_valid
-				? finite_nonnegative_half(stored_old_radiance * exposure_ratio) : vec3(0.0);
-		use_history = use_history && old_radiance_valid;
-		if (use_history) {
-			radiance = mix(current_radiance, old_radiance, clamp(temporal.parameters.x, 0.0, 0.98));
+		vec2 old_position = old_uv * vec2(size) - 0.5;
+		ivec2 old_base = ivec2(floor(old_position));
+		vec2 fraction = fract(old_position);
+		vec3 old_sum = vec3(0.0);
+		float old_count_sum = 0.0;
+		float old_weight_sum = 0.0;
+		// Validate every bilinear tap before interpolation, so invalid geometry
+		// cannot contaminate an otherwise valid reprojected sample.
+		for (int y = 0; y < 2; y++) {
+			for (int x = 0; x < 2; x++) {
+				ivec2 old_pixel = old_base + ivec2(x, y);
+				if (any(lessThan(old_pixel, ivec2(0))) || any(greaterThanEqual(old_pixel, size))) {
+					continue;
+				}
+				vec4 old_value = texelFetch(previous_radiance, old_pixel, 0);
+				float old_depth = texelFetch(previous_depth, old_pixel, 0).r;
+				vec4 old_normal_roughness = texelFetch(previous_normal_roughness, old_pixel, 0);
+				vec2 old_material = texelFetch(previous_material, old_pixel, 0).rg;
+				vec3 old_albedo = texelFetch(previous_albedo, old_pixel, 0).rgb;
+				float old_hit = texelFetch(previous_hit_data, old_pixel, 0).r;
+				if (!valid_radiance(old_value) || old_value.a < 1.0 || !(old_depth > 0.0)
+						|| !finite_float(old_depth)
+						|| abs(old_ndc.z - old_depth) > max(abs(old_ndc.z) * temporal.parameters.z, 1e-5)
+						|| !(dot(normal, normalize(old_normal_roughness.xyz)) >= temporal.parameters.w)
+						|| !same_material(roughness, material, albedo, old_normal_roughness.w, old_material, old_albedo)
+						|| !compatible_hit(raw.a, old_hit, roughness)) {
+					continue;
+				}
+				float tap_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (y == 0 ? 1.0 - fraction.y : fraction.y);
+				old_sum += finite_nonnegative_half(old_value.rgb * exposure_ratio) * tap_weight;
+				old_count_sum += clamp(old_value.a, 1.0, 64.0) * tap_weight;
+				old_weight_sum += tap_weight;
+			}
+		}
+		if (old_weight_sum > 1e-4) {
+			float old_count = old_count_sum / old_weight_sum;
+			float weight = min(clamp(temporal.parameters.x, 0.0, 0.98), old_count / (old_count + 1.0));
+			weight = min(weight, motion_weight);
+			radiance = mix(current_radiance, old_sum / old_weight_sum, weight);
+			history_length = min(old_count + 1.0, 64.0);
 		}
 	}
 	radiance = finite_nonnegative_half(radiance);
-	imageStore(next_radiance, pixel, vec4(current_valid ? radiance : vec3(0.0), current_valid ? 1.0 : 0.0));
+	imageStore(next_radiance, pixel, vec4(current_valid ? radiance : vec3(0.0), current_valid ? history_length : 0.0));
 	imageStore(next_depth, pixel, vec4(current_valid ? depth : 0.0));
 	imageStore(next_normal_roughness, pixel, vec4(current_valid ? normal : vec3(0.0), current_valid ? roughness : 0.0));
 	imageStore(next_hit_data, pixel, vec4(current_valid ? raw.a : 0.0));
-	imageStore(next_material, pixel, vec4(current_valid ? vec2(metallic, specular) : vec2(0.0), 0.0, 0.0));
+	imageStore(next_material, pixel, vec4(current_valid ? material : vec2(0.0), 0.0, 0.0));
 	imageStore(next_albedo, pixel, vec4(current_valid ? albedo : vec3(0.0), current_valid ? 1.0 : 0.0));
 }

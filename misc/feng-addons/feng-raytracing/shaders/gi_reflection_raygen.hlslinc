@@ -24,6 +24,7 @@ struct GIPathPayload {
 	float3 radiance;
 	uint flags;
 	float hit_distance;
+	float ray_pdf;
 };
 
 static const uint GI_RAY_MODE_REFLECTION = 2u;
@@ -57,7 +58,7 @@ uint2 gi_uv_to_texel(float2 uv, uint2 size) {
 	return min((uint2)floor(uv * float2(size)), size - 1u);
 }
 
-float3 gi_sample_vndf(float3 normal, float3 view_direction, float roughness, inout uint seed) {
+float3 gi_sample_vndf(float3 normal, float3 view_direction, float roughness, float2 xi) {
 	float3 helper = abs(normal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
 	float3 tangent = normalize(cross(helper, normal));
 	float3 bitangent = cross(normal, tangent);
@@ -67,8 +68,8 @@ float3 gi_sample_vndf(float3 normal, float3 view_direction, float roughness, ino
 	float lensq = stretched.x * stretched.x + stretched.y * stretched.y;
 	float3 t1 = lensq > 1e-8f ? float3(-stretched.y, stretched.x, 0.0f) * rsqrt(lensq) : float3(1.0f, 0.0f, 0.0f);
 	float3 t2 = cross(stretched, t1);
-	float radius = sqrt(gi_random(seed));
-	float phi = 2.0f * GI_PI * gi_random(seed);
+	float radius = sqrt(xi.x);
+	float phi = 2.0f * GI_PI * xi.y;
 	float p1 = radius * cos(phi);
 	float p2 = radius * sin(phi);
 	float blend = 0.5f * (1.0f + stretched.z);
@@ -169,13 +170,21 @@ void FengGIReflectionRayGen() {
 	}
 	uint sample_count = (uint)clamp(round(gi_frame.trace_parameters.z), 1.0f, 4.0f);
 	if (sample_count != 1u && sample_count != 2u && sample_count != 4u) sample_count = 1u;
-	uint seed = gi_hash(pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu ^ gi_frame.sun_view_generation_sky_array.z);
+	uint seed = gi_hash(pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu
+			^ gi_frame.sun_view_generation_sky_array.y ^ gi_frame.generation_history_flags.x);
+	// Fixed per-pixel scrambling with a low-discrepancy temporal sequence.
+	float rotation_x = gi_random(seed);
+	float rotation_y = gi_random(seed);
+	float2 temporal_sample = frac(float2(rotation_x, rotation_y)
+			+ float(gi_frame.sun_view_generation_sky_array.z & 4095u) * float2(0.754877666f, 0.569840296f));
 	float max_distance = max(gi_frame.trace_parameters.x, 0.001f);
 	float3 result = 0.0f;
 	float hit_distance_sum = 0.0f;
 	uint hit_count = 0u;
 	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
-		float3 half_vector = roughness <= 0.001f ? normal : gi_sample_vndf(normal, view_direction, roughness, seed);
+		float2 xi = float2((float(sample_index) + temporal_sample.x) / float(sample_count),
+				frac(temporal_sample.y + float(sample_index) * 0.618033989f));
+		float3 half_vector = roughness <= 0.001f ? normal : gi_sample_vndf(normal, view_direction, roughness, xi);
 		float vo_h = max(dot(view_direction, half_vector), 0.0f);
 		float3 reflected = reflect(-view_direction, half_vector);
 		float direction_length = length(reflected);
