@@ -1,0 +1,10 @@
+[gd_resource type="CompositorEffect" script_class="FengGTAOPass" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/gtao_pass.gd" id="1"]
+
+[resource]
+resource_name = "GTAO"
+script = ExtResource("1")
+stage = 6
+enabled = true
+stable_id = "library:gtao"

@@ -376,9 +376,16 @@ void main() {
 		}
 
 		// Finalize ambient.
-		ambient_light *= ao;
+		float frp_diffuse_ao = 1.0;
+#ifdef USE_MULTIVIEW
+		frp_diffuse_ao = textureLod(sampler2DArray(frp_diffuse_ambient_occlusion_texture, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).r;
+#else
+		frp_diffuse_ao = textureLod(sampler2D(frp_diffuse_ambient_occlusion_texture, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).r;
+#endif
+		frp_diffuse_ao = (isnan(frp_diffuse_ao) || isinf(frp_diffuse_ao)) ? 1.0 : clamp(frp_diffuse_ao, 0.0, 1.0);
+		ambient_light *= ao * frp_diffuse_ao;
 		ambient_light *= albedo.rgb;
-		global_sky_light_diffuse *= ao;
+		global_sky_light_diffuse *= ao * frp_diffuse_ao;
 		global_sky_light_diffuse *= albedo.rgb;
 
 		// Apply energy compensation and DFG to the indirect specular. The BxDF

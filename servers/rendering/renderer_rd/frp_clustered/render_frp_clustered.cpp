@@ -4897,11 +4897,36 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 		uniforms.push_back(u);
 	}
 
+	if (p_lighting_shader.is_valid()) {
+		// FRP binds only the current frame's explicitly published diffuse AO. The
+		// context borrows the addon-owned texture; absent, disabled, incompatible, or
+		// stale frame state resolves to neutral white.
+		RID diffuse_ao = p_cloud_context.is_valid() ? p_cloud_context->get_diffuse_ambient_occlusion_texture() : RID();
+		bool diffuse_ao_valid = false;
+		if (rb.is_valid() && diffuse_ao.is_valid() && RD::get_singleton()->texture_is_valid(diffuse_ao)) {
+			const RD::TextureFormat format = RD::get_singleton()->texture_get_format(diffuse_ao);
+			const Size2i internal_size = rb->get_internal_size();
+			const RD::TextureType expected_type = is_multiview ? RD::TEXTURE_TYPE_2D_ARRAY : RD::TEXTURE_TYPE_2D;
+			diffuse_ao_valid = format.texture_type == expected_type &&
+					format.format == RD::DATA_FORMAT_R16_SFLOAT &&
+					(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT) != 0 &&
+					format.width == uint32_t(internal_size.width) && format.height == uint32_t(internal_size.height) &&
+					(!is_multiview || format.array_layers >= uint32_t(rb->get_view_count()));
+		}
+		if (!diffuse_ao_valid) {
+			diffuse_ao = texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+		}
+		RD::Uniform u;
+		u.binding = 27;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(diffuse_ao);
+		uniforms.push_back(u);
+	}
+
 	{
-		// Binding 27 (ambient occlusion), 28/29 (GI ambient/reflection), 30/31 (SDFGI
-		// lightprobe/occlusion), 32 (VoxelGI instances), and 35/36 (SSIL/SSR) remain
-		// absent: FRP has no screen space effects or generic GI. Binding 34 is the
-		// addon-owned integrated volume sample for forward fallback/transparent draws.
+		// Bindings 28/29 (GI ambient/reflection), 30/31 (SDFGI lightprobe/occlusion),
+		// 32 (VoxelGI instances), and 35/36 (SSIL/SSR) remain absent. Binding 34 is
+		// the addon-owned integrated volume sample for forward fallback/transparent draws.
 	}
 
 	if (p_lighting_shader.is_null()) {

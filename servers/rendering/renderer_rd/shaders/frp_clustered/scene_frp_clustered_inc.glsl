@@ -497,10 +497,12 @@ layout(set = 1, binding = 34) uniform texture3D frp_volume_output_texture;
 layout(set = 1, binding = 37) uniform texture2DArray gbuffer_albedo_buffer;
 layout(set = 1, binding = 38) uniform texture2DArray gbuffer_orm_buffer;
 layout(set = 1, binding = 39) uniform texture2DArray gbuffer_emission_buffer;
+layout(set = 1, binding = 27) uniform texture2DArray frp_diffuse_ambient_occlusion_texture;
 #else
 layout(set = 1, binding = 37) uniform texture2D gbuffer_albedo_buffer;
 layout(set = 1, binding = 38) uniform texture2D gbuffer_orm_buffer;
 layout(set = 1, binding = 39) uniform texture2D gbuffer_emission_buffer;
+layout(set = 1, binding = 27) uniform texture2D frp_diffuse_ambient_occlusion_texture;
 #endif // USE_MULTIVIEW
 #endif // MODE_FRP_LIGHTING
 

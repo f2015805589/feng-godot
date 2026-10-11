@@ -7,7 +7,7 @@ const Renderer = preload("res://addons/feng-render-pipeline/renderer.gd")
 const Base = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
 const Library = preload("res://addons/feng-render-pipeline/pipeline/library_manager.gd")
 const MANAGED := [&"library:eye_adaptation", &"library:color_grade"]
-const FRESH_IDS := ["native:0", "native:1", "native:2", "library:cloud_shadow", "native:3", "library:magic_gi", "native:4", "library:volumetric_cloud", "library:height_fog", "library:cloud_trace", "native:5", "native:6", "library:eye_adaptation", "native:8", "library:color_grade", "native:7", "library:debug_buffers"]
+const FRESH_IDS := ["native:0", "native:1", "native:2", "library:cloud_shadow", "library:gtao", "native:3", "library:magic_gi", "native:4", "library:volumetric_cloud", "library:height_fog", "library:cloud_trace", "native:5", "native:6", "library:eye_adaptation", "native:8", "library:color_grade", "native:7", "library:debug_buffers"]
 var results: Array = []
 var failed := false
 
@@ -55,6 +55,28 @@ func run() -> void:
 	check(ids(fresh.passes) == FRESH_IDS, "fresh managed/native order changed")
 	for entry in fresh.passes:
 		check(entry.enabled == (entry.stable_id != &"library:debug_buffers"), "fresh enabled state changed")
+	var gtao = find_entry(fresh.passes, &"library:gtao")
+	check(gtao != null and gtao.enabled, "fresh renderer must seed enabled GTAO")
+	check(find_entry(fresh.passes, &"library:rt_gi") == null, "fresh renderer must leave hardware RTGI optional")
+	if gtao != null:
+		check(is_equal_approx(float(gtao.get("radius_m")), 2.0)
+				and is_equal_approx(float(gtao.get("falloff_start_ratio")), 0.5)
+				and is_equal_approx(float(gtao.get("thickness_blend")), 0.5)
+				and is_equal_approx(float(gtao.get("strength")), 1.0)
+				and is_equal_approx(float(gtao.get("history_weight")), 0.9),
+				"fresh GTAO quality defaults changed")
+		var moved_renderer := Renderer.new()
+		var moved_entries: Array[Base] = moved_renderer.passes.duplicate()
+		var moved_gtao = find_entry(moved_entries, &"library:gtao")
+		var moved_lighting = find_entry(moved_entries, &"native:3")
+		moved_entries.erase(moved_gtao)
+		moved_entries.insert(moved_entries.find(moved_lighting) + 1, moved_gtao)
+		moved_renderer.passes = moved_entries
+		var order_warning := false
+		for warning in moved_renderer.get_configuration_warnings():
+			if warning.contains("Pass 'GTAO' must precede native 'Lighting'"):
+				order_warning = true
+		check(order_warning, "moving GTAO after Lighting must report the diffuse-AO order constraint")
 	results.append(snapshot(fresh.passes))
 	var cases := 0
 	for missing_mask in range(4):

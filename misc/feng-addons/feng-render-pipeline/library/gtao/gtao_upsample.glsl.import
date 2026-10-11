@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://pyn2ev0jy3ci"
+path="res://.godot/imported/gtao_upsample.glsl-38ad2001d1f7f783ab03f29e35bb0d7e.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/gtao/gtao_upsample.glsl"
+dest_files=["res://.godot/imported/gtao_upsample.glsl-38ad2001d1f7f783ab03f29e35bb0d7e.res"]
+
+[params]
+

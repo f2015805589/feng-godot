@@ -13,6 +13,8 @@ const UBO_SIZE := 448 # Three mat4, two vec4, and separate secondary/sky SH vec4
 const MAX_CACHED_BAKES := 8
 const RUNTIME_SCRIPT_PATH := "res://addons/feng-magic-gi/feng_magic_gi_runtime.gd"
 const SKY_DIFFUSE_TEXTURE: StringName = &"sky_light_diffuse"
+const DIFFUSE_AO_BINDING := 16
+const DIFFUSE_AO_VIEW_CACHE_LIMIT := 32
 
 var _bake_resources: Dictionary = {}
 var _cache_clock := 0
@@ -23,11 +25,19 @@ var _zero_sky_diffuse := RID()
 var _replacement_request_prepared := false
 var _frame_replacement_enabled := false
 var _replacement_bridge_warning_shown := false
+var _frame_diffuse_ao_texture := RID()
+var _diffuse_ao_white := RID()
+var _diffuse_ao_view_cache: Dictionary = {}
+var _diffuse_ao_cache_clock := 0
 
 func get_indirect_gi_kind() -> StringName:
 	return IndirectGISelection.KIND_MAGIC
 
 func _frp_execute(ctx: FRPPassContext) -> void:
+	_frame_diffuse_ao_texture = RID()
+	var rd := RenderingServer.get_rendering_device()
+	if rd != null and not _diffuse_ao_view_cache.is_empty():
+		_prune_diffuse_ao_view_cache(rd)
 	if not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
 			IndirectGISelection.KIND_MAGIC, true):
 		# An active RTGI plan owns the diffuse-indirect slot, even if its scene or
@@ -37,6 +47,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		_frame_replacement_enabled = false
 		_clear_magic_gi_output(ctx)
 		return
+	_frame_diffuse_ao_texture = ctx.get_diffuse_ambient_occlusion_texture() if ctx != null else RID()
 	_frame_replacement_enabled = false
 	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
 	_scene_exposure_normalization = _get_scene_exposure_normalization(ctx)
@@ -45,6 +56,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_scene_exposure_normalization = 1.0
 	_replacement_request_prepared = false
 	_frame_replacement_enabled = false
+	_frame_diffuse_ao_texture = RID()
 
 func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 	if ctx == null:
@@ -192,7 +204,14 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	_cache_clock += 1
 	cached["last_used"] = _cache_clock
 	_bake_resources[cache_key] = cached
+	var shader_before := _shader
+	var compute_before := _compute_pipeline
+	var sampler_before := _sampler
+	var raster_count_before := _raster_pipelines.size()
 	super._render(buffers, view, rd)
+	if shader_before != _shader or compute_before != _compute_pipeline \
+			or sampler_before != _sampler or raster_count_before != _raster_pipelines.size():
+		_sync_owned_rid_snapshot()
 
 func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd: RenderingDevice) -> bool:
 	if _bake_resources.has(cache_key):
@@ -289,6 +308,7 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 		"last_used": _cache_clock,
 	}
 	_prune_bake_cache(rd)
+	_sync_owned_rid_snapshot()
 	return true
 
 func _make_emission_image(data: Resource, snapshot: Dictionary) -> Image:
@@ -358,6 +378,7 @@ func _prune_bake_cache(rd: RenderingDevice) -> void:
 
 func _release_bake_resources(cache_key: String, rd: RenderingDevice) -> void:
 	_free_rids(rd, _take_bake_rids(cache_key))
+	_sync_owned_rid_snapshot()
 
 func _take_bake_rids(cache_key: String) -> Array[RID]:
 	var rids: Array[RID] = []
@@ -406,6 +427,13 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	# after the matching, validated snapshot has made it all the way to the shader.
 	return _commit_frame_ubo(values, UBO_SIZE, rd)
 
+func _commit_frame_ubo(values: PackedFloat32Array, ubo_size: int, rd: RenderingDevice) -> bool:
+	var had_ubo := _ubo.is_valid()
+	var succeeded := super._commit_frame_ubo(values, ubo_size, rd)
+	if succeeded and not had_ubo:
+		_sync_owned_rid_snapshot()
+	return succeeded
+
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
 	var binding_data := super._collect_bindings(buffers, view, rd)
 	if _binding_error or _frame_snapshot.is_empty():
@@ -438,6 +466,19 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		uniform.add_id(_sampler)
 		uniform.add_id(spec["texture"])
 		uniforms.append(uniform)
+	var diffuse_ao := _get_diffuse_ao_view(buffers, view, rd)
+	if not diffuse_ao.is_valid():
+		diffuse_ao = _ensure_white_diffuse_ao(rd)
+	if not diffuse_ao.is_valid():
+		_binding_error = true
+		_report("Cannot create the neutral diffuse AO texture.")
+		return binding_data
+	var diffuse_ao_uniform := RDUniform.new()
+	diffuse_ao_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+	diffuse_ao_uniform.binding = DIFFUSE_AO_BINDING
+	diffuse_ao_uniform.add_id(_sampler)
+	diffuse_ao_uniform.add_id(diffuse_ao)
+	uniforms.append(diffuse_ao_uniform)
 	for spec in [
 		{"binding": 14, "buffer": cached["visibility_nodes"]},
 		{"binding": 15, "buffer": cached["visibility_triangles"]},
@@ -450,6 +491,85 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	uniforms.append(_ubo_uniform(UBO_BINDING))
 	binding_data["uniforms"] = uniforms
 	return binding_data
+
+func _get_diffuse_ao_view(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> RID:
+	var texture := _frame_diffuse_ao_texture
+	if buffers == null or not texture.is_valid() or not rd.texture_is_valid(texture):
+		return RID()
+	var format := rd.texture_get_format(texture)
+	var size := buffers.get_internal_size()
+	var multi := buffers.get_view_count() > 1
+	var expected_type := RenderingDevice.TEXTURE_TYPE_2D_ARRAY if multi else RenderingDevice.TEXTURE_TYPE_2D
+	if format.texture_type != expected_type or (format.usage_bits & RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT) == 0 \
+			or format.width != size.x or format.height != size.y \
+			or (multi and format.array_layers < buffers.get_view_count()):
+		return RID()
+	if not multi:
+		return texture
+	var cache_key := "%s:%d" % [str(texture.get_id()), view]
+	_diffuse_ao_cache_clock += 1
+	var cached: Dictionary = _diffuse_ao_view_cache.get(cache_key, {})
+	if not cached.is_empty() and cached.get("base", RID()) == texture and rd.texture_is_valid(cached.get("view", RID())):
+		cached["last_used"] = _diffuse_ao_cache_clock
+		_diffuse_ao_view_cache[cache_key] = cached
+		return cached["view"]
+	var texture_view := RDTextureView.new()
+	texture_view.format_override = format.format
+	var slice := rd.texture_create_shared_from_slice(texture_view, texture, view, 0, 1, RenderingDevice.TEXTURE_SLICE_2D)
+	if not slice.is_valid():
+		return RID()
+	_diffuse_ao_view_cache[cache_key] = {"base": texture, "view": slice, "last_used": _diffuse_ao_cache_clock}
+	_prune_diffuse_ao_view_cache(rd)
+	_sync_owned_rid_snapshot()
+	return slice
+
+func _prune_diffuse_ao_view_cache(rd: RenderingDevice) -> void:
+	var removed_invalid := false
+	for key in _diffuse_ao_view_cache.keys():
+		var cached: Dictionary = _diffuse_ao_view_cache[key]
+		var base: RID = cached.get("base", RID())
+		var view: RID = cached.get("view", RID())
+		if not base.is_valid() or not rd.texture_is_valid(base) or not view.is_valid() or not rd.texture_is_valid(view):
+			if view.is_valid() and rd.texture_is_valid(view):
+				rd.free_rid(view)
+			_diffuse_ao_view_cache.erase(key)
+			removed_invalid = true
+	while _diffuse_ao_view_cache.size() > DIFFUSE_AO_VIEW_CACHE_LIMIT:
+		var oldest_key := ""
+		var oldest := 0x7fffffff
+		for key in _diffuse_ao_view_cache:
+			var last_used := int(_diffuse_ao_view_cache[key].get("last_used", 0))
+			if last_used < oldest:
+				oldest = last_used
+				oldest_key = str(key)
+		if oldest_key.is_empty():
+			return
+		var cached: Dictionary = _diffuse_ao_view_cache[oldest_key]
+		var view: RID = cached.get("view", RID())
+		if view.is_valid():
+			rd.free_rid(view)
+		_diffuse_ao_view_cache.erase(oldest_key)
+		removed_invalid = true
+	if removed_invalid:
+		_sync_owned_rid_snapshot()
+
+func _ensure_white_diffuse_ao(rd: RenderingDevice) -> RID:
+	if _diffuse_ao_white.is_valid() and rd.texture_is_valid(_diffuse_ao_white):
+		return _diffuse_ao_white
+	var format := RDTextureFormat.new()
+	format.texture_type = RenderingDevice.TEXTURE_TYPE_2D
+	format.format = RenderingDevice.DATA_FORMAT_R16_SFLOAT
+	format.width = 1
+	format.height = 1
+	format.depth = 1
+	format.array_layers = 1
+	format.mipmaps = 1
+	format.samples = RenderingDevice.TEXTURE_SAMPLES_1
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	# IEEE 754 binary16 1.0, serialized little-endian for one R16F texel.
+	_diffuse_ao_white = rd.texture_create(format, RDTextureView.new(), [PackedByteArray([0x00, 0x3c])])
+	_sync_owned_rid_snapshot()
+	return _diffuse_ao_white
 
 func _ensure_zero_sky_diffuse(rd: RenderingDevice) -> RID:
 	if _zero_sky_diffuse.is_valid():
@@ -470,12 +590,40 @@ func _ensure_zero_sky_diffuse(rd: RenderingDevice) -> RID:
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	var layer_data: Array[PackedByteArray] = [image.get_data()]
 	_zero_sky_diffuse = rd.texture_create(format, RDTextureView.new(), layer_data)
+	_sync_owned_rid_snapshot()
 	return _zero_sky_diffuse
 
+func _current_owned_rids() -> Array[RID]:
+	var rids: Array[RID] = []
+	rids.append_array(_raster_pipelines.values())
+	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo])
+	rids.append_array([_zero_sky_diffuse, _diffuse_ao_white])
+	for cached in _bake_resources.values():
+		for name in ["transfer", "primary_sky", "geometry", "visibility_moments",
+				"visibility_nodes", "visibility_triangles", "indices", "emission"]:
+			var rid: RID = cached.get(name, RID())
+			if rid.is_valid():
+				rids.append(rid)
+	for cached in _diffuse_ao_view_cache.values():
+		var view: RID = cached.get("view", RID())
+		var rd := RenderingServer.get_rendering_device()
+		if view.is_valid() and rd != null and rd.texture_is_valid(view):
+			rids.append(view)
+	return rids
+
+func _sync_owned_rid_snapshot() -> void:
+	_replace_owned_rid_snapshot(_current_owned_rids())
+
 func _take_owned_rids() -> Array[RID]:
-	var rids := super._take_owned_rids()
-	for key in _bake_resources.keys():
-		rids.append_array(super.call("_take_bake_rids", str(key)))
-	rids.append(_zero_sky_diffuse)
+	# PREDELETE invalidates this script's live dispatch after the inherited
+	# shader pass transfers its RIDs. Capture the complete owned-only inventory
+	# and clear our fields first; only append the detached snapshot afterwards.
+	var owned_rids: Array[RID] = super.call("_current_owned_rids")
+	_bake_resources.clear()
 	_zero_sky_diffuse = RID()
+	_diffuse_ao_white = RID()
+	_frame_diffuse_ao_texture = RID()
+	_diffuse_ao_view_cache.clear()
+	var rids := super._take_owned_rids()
+	rids.append_array(owned_rids)
 	return rids

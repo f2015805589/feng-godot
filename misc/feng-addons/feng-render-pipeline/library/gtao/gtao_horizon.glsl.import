@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://sy7g8cecl4l0"
+path="res://.godot/imported/gtao_horizon.glsl-2863d209855c4d515be0de647a111e78.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/gtao/gtao_horizon.glsl"
+dest_files=["res://.godot/imported/gtao_horizon.glsl-2863d209855c4d515be0de647a111e78.res"]
+
+[params]
+

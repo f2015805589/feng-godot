@@ -48,8 +48,9 @@ const NATIVE_PASS_SCRIPTS := {
 const NativePass = preload("passes/native/native_pass.gd")
 
 ## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
-## Shadow Precompute, VT, GBuffer, Lighting, Magic GI, Sky, Height Fog, Transparent,
-## Temporal AA, Eye Adaptation, Bloom, Color Grade, Post Process, Debug Buffers.
+## Shadow Precompute, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, Sky,
+## Volumetric Cloud, Height Fog, Cloud Trace, Transparent, Temporal AA, Eye Adaptation,
+## Bloom, Color Grade, Post Process, Debug Buffers.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
 
 ## The library entries a fresh pipeline seeds.

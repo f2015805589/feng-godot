@@ -97,6 +97,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	completed_operations.clear();
 	clear_volume_frame_inputs();
 	clear_volume_output();
+	diffuse_ambient_occlusion_texture = RID();
 	height_fog_parameters.clear();
 	atmosphere_parameters.clear();
 	atmosphere_light_rids[0] = RID();
@@ -765,6 +766,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("clear_volume_output"), &FRPPassContext::clear_volume_output);
 	ClassDB::bind_method(D_METHOD("set_volume_deferred_composition", "deferred"), &FRPPassContext::set_volume_deferred_composition);
 	ClassDB::bind_method(D_METHOD("is_volume_deferred_composition"), &FRPPassContext::is_volume_deferred_composition);
+	ClassDB::bind_method(D_METHOD("set_diffuse_ambient_occlusion_texture", "texture"), &FRPPassContext::set_diffuse_ambient_occlusion_texture);
+	ClassDB::bind_method(D_METHOD("get_diffuse_ambient_occlusion_texture"), &FRPPassContext::get_diffuse_ambient_occlusion_texture);
 	ClassDB::bind_method(D_METHOD("enqueue_after_operation", "operation", "callback"), &FRPPassContext::enqueue_after_operation);
 	ClassDB::bind_method(D_METHOD("is_operation_completed", "operation"), &FRPPassContext::is_operation_completed);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);

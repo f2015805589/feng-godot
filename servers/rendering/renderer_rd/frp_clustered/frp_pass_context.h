@@ -86,6 +86,9 @@ class FRPPassContext : public RefCounted {
 	PackedFloat32Array volume_sampling_parameters;
 	float volume_rgb_pre_exposure = 1.0f;
 	bool volume_deferred_composition = false;
+	// Borrowed viewport-scoped FRP output for diffuse ambient occlusion. Cleared at
+	// frame setup; the context never takes ownership or releases this RID.
+	RID diffuse_ambient_occlusion_texture;
 	// Render-local Feng Height Fog snapshot. It is written by the Sky-anchored
 	// HeightFog pass and consumed by the later forward fallback/transparent ops.
 	PackedFloat32Array height_fog_parameters;
@@ -202,6 +205,8 @@ public:
 	float get_volume_rgb_pre_exposure() const { return volume_rgb_pre_exposure; }
 	bool has_volume_output() const { return volume_output_texture.is_valid() && volume_sampling_parameters.size() == 20; }
 	void clear_volume_output();
+	void set_diffuse_ambient_occlusion_texture(RID p_texture) { diffuse_ambient_occlusion_texture = p_texture; }
+	RID get_diffuse_ambient_occlusion_texture() const { return diffuse_ambient_occlusion_texture; }
 	void set_volume_deferred_composition(bool p_deferred);
 	bool is_volume_deferred_composition() const { return volume_deferred_composition; }
 	void set_atmosphere_parameters(const PackedFloat32Array &p_parameters, RID p_light, RID p_secondary_light, RID p_optical_texture, RID p_multiple_texture);

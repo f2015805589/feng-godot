@@ -675,16 +675,17 @@ func run() -> void:
 	require(manifest.has("color-grade/color_grade.tres") or manifest.has("library:color_grade"),
 		"renderer library manifest lost Color Grade: %s" % [manifest])
 	# Manifest metadata seeds Eye Adaptation before Bloom and Color Grade,
-	# enabled Magic GI after Lighting, enabled Height Fog after Sky, and disabled
-	# Debug Buffers after Post Process. Only Debug starts disabled.
+	# enabled GTAO after GBuffer, enabled Magic GI after Lighting, enabled Height Fog
+	# after Sky, and disabled Debug Buffers after Post Process. Only Debug starts disabled.
 	var library_entries := []
 	for value in unified_renderer.passes:
 		if _native_id(value) < 0 and not _library_key(value).is_empty():
 			library_entries.append(value)
-	require(library_entries.size() == 5, "the default pipeline must seed Color Grade, Magic GI, Height Fog, Eye Adaptation and Debug Buffers, got %d library entries" % library_entries.size())
-	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 5,
-		"the default pipeline must have nine native and five seeded library entries, got %d" % unified_renderer.passes.size())
+	require(library_entries.size() == 9, "the default pipeline must seed the nine enabled/disabled default library entries including GTAO, got %d" % library_entries.size())
+	require(unified_renderer.passes.size() == EXPECTED_NATIVE_COUNT + 9,
+		"the default pipeline must have nine native and nine seeded library entries, got %d" % unified_renderer.passes.size())
 	var seeded_magic_index := -1
+	var seeded_gtao_index := -1
 	var seeded_fog_index := -1
 	var seeded_eye_index := -1
 	var seeded_grade_index := -1
@@ -695,10 +696,13 @@ func run() -> void:
 	var seeded_temporal_index := -1
 	var seeded_bloom_index := -1
 	var seeded_post_index := -1
+	var seeded_gbuffer_index := -1
+	var seeded_rtgi_found := false
 	for i in unified_renderer.passes.size():
 		var entry = unified_renderer.passes[i]
 		require(entry.enabled == (entry.stable_id != &"library:debug_buffers"), "only Debug Buffers may start disabled: %s" % entry.stable_id)
 		if _native_id(entry) == 3: seeded_lighting_index = i
+		if _native_id(entry) == 2: seeded_gbuffer_index = i
 		if _native_id(entry) == 4: seeded_sky_index = i
 		if _native_id(entry) == 5: seeded_transparent_index = i
 		if _native_id(entry) == 6: seeded_temporal_index = i
@@ -707,6 +711,17 @@ func run() -> void:
 			seeded_bloom_index = i
 			require(entry.enabled, "native Bloom must be enabled in the fresh default pipeline")
 		if String(entry.stable_id) == "library:color_grade": seeded_grade_index = i
+		if String(entry.stable_id) == "library:gtao":
+			seeded_gtao_index = i
+			require(entry.enabled, "GTAO must be enabled in the fresh default pipeline")
+			require(is_equal_approx(float(entry.get("radius_m")), 2.0)
+					and is_equal_approx(float(entry.get("falloff_start_ratio")), 0.5)
+					and is_equal_approx(float(entry.get("thickness_blend")), 0.5)
+					and is_equal_approx(float(entry.get("strength")), 1.0)
+					and is_equal_approx(float(entry.get("history_weight")), 0.9),
+				"GTAO default quality parameters changed")
+		if String(entry.stable_id) == "library:rt_gi":
+			seeded_rtgi_found = true
 		if String(entry.stable_id) == "library:magic_gi":
 			seeded_magic_index = i
 			require(entry.enabled, "Magic GI must be enabled in the fresh default pipeline")
@@ -719,6 +734,9 @@ func run() -> void:
 		if String(entry.stable_id) == "library:debug_buffers":
 			seeded_debug_index = i
 			require(not entry.enabled, "Debug Buffers must be disabled in the fresh default pipeline")
+	require(not seeded_rtgi_found, "Hardware RTGI must remain optional and absent from the seeded default pipeline")
+	require(seeded_gbuffer_index < seeded_gtao_index and seeded_gtao_index < seeded_lighting_index,
+		"GTAO must be anchored after GBuffer and before Lighting")
 	require(seeded_lighting_index < seeded_magic_index and seeded_magic_index < seeded_sky_index,
 		"Magic GI must be anchored after Lighting and before Sky")
 	require(seeded_sky_index < seeded_fog_index and seeded_fog_index < seeded_transparent_index,

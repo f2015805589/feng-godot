@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://kdkojrxpu5cl"
+path="res://.godot/imported/gtao_spatial.glsl-b34eb8f58ea680cd3fcba5a6b133bb4f.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/gtao/gtao_spatial.glsl"
+dest_files=["res://.godot/imported/gtao_spatial.glsl-b34eb8f58ea680cd3fcba5a6b133bb4f.res"]
+
+[params]
+

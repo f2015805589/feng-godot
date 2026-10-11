@@ -26,6 +26,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_blur", "path": "bloom-lite/bloom_blur.tres", "name": "Bloom Blur"},
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
 	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade", "default_enabled": true},
+	{"id": "library:gtao", "path": "gtao/gtao.tres", "name": "GTAO", "default_enabled": true, "after_native": NativeSpec.PASS_GBUFFER, "missing_anchor_warning": "GTAO was not seeded because this pipeline has no native G-buffer entry."},
 	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
 	{"id": "library:rt_gi", "path": "rt-gi/rt_gi.tres", "name": "Hardware RTGI", "default_enabled": false, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Hardware RTGI was not inserted because this pipeline has no native Lighting entry."},
 	{"id": "library:cloud_shadow", "path": "cloud/cloud_shadow.tres", "name": "Cloud Shadows", "default_enabled": true, "after_native": NativeSpec.PASS_GBUFFER, "missing_anchor_warning": "Cloud Shadows was not seeded because this pipeline has no native G-buffer entry."},
@@ -40,6 +41,7 @@ const DEFAULT_LIBRARY_ENTRIES := [
 const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:eye_adaptation",
 	"library:color_grade",
+	"library:gtao",
 	"library:magic_gi",
 	"library:height_fog",
 	"library:volumetric_cloud",

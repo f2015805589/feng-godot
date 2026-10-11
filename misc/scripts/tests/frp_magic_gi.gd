@@ -9,6 +9,7 @@ const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
 var _renderer: FengRenderer
 var _compositor: FengCompositor
 var _magic_pass: FengPass
+var _gtao_pass: FengPass
 var _debug_pass: FengPass
 var _volume: Node3D
 var _camera: Camera3D
@@ -204,8 +205,11 @@ func run() -> void:
 	var compositor_script = load("res://addons/feng-render-pipeline/compositor.gd")
 	_renderer = renderer_script.new()
 	_magic_pass = find_pass("library:magic_gi")
+	_gtao_pass = find_pass("library:gtao")
 	_debug_pass = find_pass("library:debug_buffers")
 	if not check(_magic_pass != null and _magic_pass.enabled, "fresh renderer did not seed enabled Magic GI"):
+		return
+	if not check(_gtao_pass != null and _gtao_pass.enabled, "fresh renderer did not seed enabled GTAO"):
 		return
 	if not check(_debug_pass != null and not _debug_pass.enabled, "fresh renderer did not seed disabled Debug Buffers"):
 		return
@@ -246,6 +250,18 @@ func run() -> void:
 	print("Synthetic PRT GI pixel: ", gi_pixel, " probes=", data.probe_count())
 	if not check(max_channel(gi_pixel) > 0.08, "GPU Magic GI pass produced no indirect contribution at the floor center"):
 		return
+	# Disabling the AO producer must make Magic GI bind its neutral white fallback
+	# at shader binding 16, with no stale AO from the previous frame.
+	_gtao_pass.enabled = false
+	await settle(8)
+	var gi_without_gtao := center(await image())
+	if not check(max_channel(gi_without_gtao) > 0.08,
+			"Magic GI lost its diffuse contribution when GTAO was disabled: %s" % [gi_without_gtao]):
+		return
+	print("Magic GI AO on/off: ", gi_pixel, " / ", gi_without_gtao)
+	# The remaining tests target Magic GI's exact geometry visibility and expect a
+	# stable frame-to-frame sample. Keep GTAO off so its independent temporal filter
+	# does not add a second variable to those existing tolerances.
 	var unoccluded_moments: PackedFloat32Array = data.visibility_moments.duplicate()
 	fill_visibility_moments(data, 0.0, 0.0)
 	data.bake_version += 1
@@ -258,10 +274,10 @@ func run() -> void:
 	Runtime.publish(_volume)
 	await settle(8)
 	var unoccluded_recovered_pixel := center(await image())
-	print("Geometry visibility GPU check: open=", gi_pixel,
+	print("Geometry visibility GPU check: open=", gi_without_gtao,
 		" coarse_moments_blocked=", fully_blocked_pixel, " restored=", unoccluded_recovered_pixel)
-	if not check(color_delta(fully_blocked_pixel, gi_pixel) < 0.01
-			and color_delta(unoccluded_recovered_pixel, gi_pixel) < 0.01,
+	if not check(color_delta(fully_blocked_pixel, gi_without_gtao) < 0.01
+			and color_delta(unoccluded_recovered_pixel, gi_without_gtao) < 0.01,
 			"exactly visible receivers retain energy despite false occlusion in coarse directional moments"):
 		return
 	# Keep all moments open and both receiver/probe normals +Y. The wall crosses
@@ -299,7 +315,7 @@ func run() -> void:
 		" restored=", open_surface_pixel)
 	if not check(max_channel(isolated_open_pixel) > 0.08
 			and max_channel(thin_wall_pixel) < max_channel(isolated_open_pixel) * 0.02
-			and color_delta(open_surface_pixel, gi_pixel) < 0.02,
+			and color_delta(open_surface_pixel, gi_without_gtao) < 0.02,
 			"static segments reject a thin same-normal separator despite fully open moments and preserve open-plane energy"):
 		return
 	# A low separator still blocks a coplanar receiver. An outward endpoint must
@@ -367,7 +383,7 @@ func run() -> void:
 	await settle(12)
 	var blue_pixel := center(await image())
 	print("Live sun changed GI pixel: ", blue_pixel)
-	if not check(blue_pixel.r < gi_pixel.r * 0.6 and blue_pixel.b > gi_pixel.b * 1.5,
+	if not check(blue_pixel.r < gi_without_gtao.r * 0.6 and blue_pixel.b > gi_without_gtao.b * 1.5,
 			"changing the directional sun did not update the GI colour"):
 		return
 	if not check(data.bake_version == transfer_version, "dynamic lighting unexpectedly rebaked the PRT data"):

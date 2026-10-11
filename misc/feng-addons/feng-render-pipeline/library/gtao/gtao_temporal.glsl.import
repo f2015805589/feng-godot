@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c7vvnsdq3ioxu"
+path="res://.godot/imported/gtao_temporal.glsl-d66348389db00a2975714a1ccce15356.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/gtao/gtao_temporal.glsl"
+dest_files=["res://.godot/imported/gtao_temporal.glsl-d66348389db00a2975714a1ccce15356.res"]
+
+[params]
+

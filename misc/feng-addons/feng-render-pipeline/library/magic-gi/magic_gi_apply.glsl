@@ -22,6 +22,7 @@ layout(set = 0, binding = 14, std430) readonly buffer VisibilityNodes {
 layout(set = 0, binding = 15, std430) readonly buffer VisibilityTriangles {
 	vec4 triangles[]; // vertex, edge1, edge2; two-sided opaque blockers.
 } visibility_geometry;
+layout(set = 0, binding = 16) uniform sampler2D diffuse_ambient_occlusion_texture;
 
 layout(set = 0, binding = 9, std140) uniform GIParams {
 	mat4 inverse_projection;
@@ -473,8 +474,12 @@ void main() {
 	}
 	float total_strength = max(params.control.x * pc.parameters.x, 0.0);
 	float ownership_weight = params.control.z > 0.5 ? clamp(total_strength, 0.0, 1.0) : 0.0;
+	float diffuse_ao = texture(diffuse_ambient_occlusion_texture, (vec2(pixel) + 0.5) / vec2(extent)).r;
+	if (isnan(diffuse_ao) || isinf(diffuse_ao)) {
+		diffuse_ao = 1.0;
+	}
 	vec3 contribution = indirect / max(unoccluded_weight, 1e-7)
-			* albedo * (1.0 - metallic) * ao * total_strength * pc.parameters.y;
+			* albedo * (1.0 - metallic) * ao * clamp(diffuse_ao, 0.0, 1.0) * total_strength * pc.parameters.y;
 	imageStore(gi_output, pixel, vec4(contribution, ownership_weight));
 	vec4 scene_color = imageLoad(color_image, pixel);
 	if (ownership_weight > 0.0) {
