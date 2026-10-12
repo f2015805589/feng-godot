@@ -3,6 +3,8 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+const int LOOKUP_CELL_RADIUS = 2;
+
 layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
 layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness;
@@ -51,7 +53,7 @@ vec3 unpack_sh(vec4 blocks[7], int coefficient) {
 	);
 }
 
-vec3 evaluate_probe(int probe) {
+vec3 evaluate_probe_secondary_emission(int probe) {
 	vec4 transfer_blocks[7];
 	int atlas_x = (probe % 32) * 7;
 	int atlas_y = probe / 32;
@@ -63,23 +65,29 @@ vec3 evaluate_probe(int probe) {
 		value += unpack_sh(transfer_blocks, coefficient)
 				* unpack_sh(params.lighting_sh, coefficient);
 	}
-	if (params.control.z > 0.5) {
-		vec4 primary_blocks[3];
-		int primary_x = (probe % 32) * 3;
-		for (int texel = 0; texel < 3; texel++) {
-			primary_blocks[texel] = texelFetch(primary_sky_atlas, ivec2(primary_x + texel, atlas_y), 0);
-		}
-		for (int coefficient = 0; coefficient < 9; coefficient++) {
-			int block = coefficient / 4;
-			int lane = coefficient % 4;
-			// Primary transport stores irradiance; Lambert's BRDF is albedo / PI.
-			// Secondary transport already cancels that factor against its cosine PDF.
-			value += primary_blocks[block][lane] * 0.3183098861837907
-					* unpack_sh(params.sky_lighting_sh, coefficient);
-		}
-	}
 	vec3 emission = texelFetch(emission_atlas, ivec2(probe % 32, probe / 32), 0).rgb;
 	return max(value, vec3(0.0)) + max(emission, vec3(0.0));
+}
+
+vec3 evaluate_probe_primary_sky(int probe) {
+	if (params.control.z <= 0.5) {
+		return vec3(0.0);
+	}
+	vec4 primary_blocks[3];
+	int atlas_x = (probe % 32) * 3;
+	int atlas_y = probe / 32;
+	for (int texel = 0; texel < 3; texel++) {
+		primary_blocks[texel] = texelFetch(primary_sky_atlas, ivec2(atlas_x + texel, atlas_y), 0);
+	}
+	vec3 value = vec3(0.0);
+	for (int coefficient = 0; coefficient < 9; coefficient++) {
+		int block = coefficient / 4;
+		int lane = coefficient % 4;
+		// Primary transport stores irradiance; Lambert's BRDF is albedo / PI.
+		value += primary_blocks[block][lane] * 0.3183098861837907
+				* unpack_sh(params.sky_lighting_sh, coefficient);
+	}
+	return max(value, vec3(0.0));
 }
 
 float sign_not_zero(float value) {
@@ -353,6 +361,8 @@ void main() {
 	ivec3 center = clamp(ivec3(floor(grid_position)), ivec3(0), grid_dims - 1);
 	vec3 indirect = vec3(0.0);
 	float unoccluded_weight = 0.0;
+	vec3 primary_sky_indirect = vec3(0.0);
+	float primary_sky_weight = 0.0;
 	float candidate_weight = 0.0;
 	float receiver_bias = max(0.001, spacing * 0.002);
 	vec3 biased_world = world + normal_world * receiver_bias;
@@ -377,14 +387,16 @@ void main() {
 		}
 	}
 	float variance_floor = max(0.0001, spacing * spacing * 0.0001);
-	// Feather outer cells to zero at a query transition, so every in-window probe can
-	// contribute without a hard top-K membership cutoff.
+	// The global one-probe-per-world-cell layout is sparse relative to the Volume's
+	// lookup grid. Keep a wider fixed support, while feathering only its outer shell.
+	// Inner cells remain fully weighted so occupied nearby cells cannot disappear at
+	// a lookup-grid boundary.
 	vec3 grid_fraction = grid_position - vec3(center);
 	float back_tolerance = max(spacing * 0.12, 0.02);
 	float kernel_epsilon = max(spacing * spacing * 0.16, 0.0001);
-	for (int dz = -1; dz <= 1; dz++) {
-		for (int dy = -1; dy <= 1; dy++) {
-			for (int dx = -1; dx <= 1; dx++) {
+	for (int dz = -LOOKUP_CELL_RADIUS; dz <= LOOKUP_CELL_RADIUS; dz++) {
+		for (int dy = -LOOKUP_CELL_RADIUS; dy <= LOOKUP_CELL_RADIUS; dy++) {
+			for (int dx = -LOOKUP_CELL_RADIUS; dx <= LOOKUP_CELL_RADIUS; dx++) {
 				ivec3 cell = center + ivec3(dx, dy, dz);
 				if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, grid_dims))) {
 					continue;
@@ -392,10 +404,12 @@ void main() {
 				ivec3 cell_offset = cell - center;
 				float cell_window = 1.0;
 				for (int axis = 0; axis < 3; axis++) {
-					if (cell_offset[axis] < 0) {
-						cell_window *= 1.0 - smoothstep(0.0, 1.0, grid_fraction[axis]);
-					} else if (cell_offset[axis] > 0) {
-						cell_window *= smoothstep(0.0, 1.0, grid_fraction[axis]);
+					if (abs(cell_offset[axis]) == LOOKUP_CELL_RADIUS) {
+						if (cell_offset[axis] < 0) {
+							cell_window *= 1.0 - smoothstep(0.0, 1.0, grid_fraction[axis]);
+						} else {
+							cell_window *= smoothstep(0.0, 1.0, grid_fraction[axis]);
+						}
 					}
 				}
 				if (cell_window <= 0.0) {
@@ -463,8 +477,19 @@ void main() {
 					if (visibility <= 0.0001) {
 						continue;
 					}
-					vec3 probe_light = evaluate_probe(probe);
+					vec3 probe_light = evaluate_probe_secondary_emission(probe);
 					indirect += probe_light * weight * visibility;
+					if (params.control.z > 0.5) {
+						// Primary sky is more local than the secondary/emissive field.
+						// Keep the same geometry gates and visibility result, but use a
+						// narrower continuous kernel so an open-side probe has less sway
+						// across a doorway or window boundary.
+						float sky_weight = weight * kernel_epsilon
+								/ max(kernel_epsilon + score, 1e-7);
+						float visible_sky_weight = sky_weight * visibility;
+						primary_sky_indirect += evaluate_probe_primary_sky(probe) * visible_sky_weight;
+						primary_sky_weight += visible_sky_weight;
+					}
 				}
 			}
 		}
@@ -478,7 +503,9 @@ void main() {
 	if (isnan(diffuse_ao) || isinf(diffuse_ao)) {
 		diffuse_ao = 1.0;
 	}
-	vec3 contribution = indirect / max(unoccluded_weight, 1e-7)
+	vec3 secondary_emission = indirect / max(unoccluded_weight, 1e-7);
+	vec3 primary_sky = primary_sky_indirect / max(primary_sky_weight, 1e-7);
+	vec3 contribution = (secondary_emission + primary_sky)
 			* albedo * (1.0 - metallic) * ao * clamp(diffuse_ao, 0.0, 1.0) * total_strength * pc.parameters.y;
 	imageStore(gi_output, pixel, vec4(contribution, ownership_weight));
 	vec4 scene_color = imageLoad(color_image, pixel);

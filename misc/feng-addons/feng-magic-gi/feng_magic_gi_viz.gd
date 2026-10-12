@@ -11,9 +11,10 @@ extends RefCounted
 ##             weak positive response, and stronger response keeps its RGB tint.
 ##   _Transport - radial visualization of geometry transport response, not
 ##                stored or current light radiance. Capped at 256 samples.
+const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
 const MAX_SH_VIZ_PROBES := 256
 const SH_VIZ_SIDES := 12   # rings and sectors of the reconstruction mesh
-const PROBE_GIZMO_CELL_RATIO := 0.12
+const PROBE_GIZMO_CELL_RATIO := ProbeLayout.MARKER_RADIUS_CELL_RATIO
 const LOW_RESPONSE_THRESHOLD := 0.025
 const ZERO_RESPONSE_COLOR := Color(0.08, 0.55, 0.95)
 const LOW_RESPONSE_COLOR := Color(0.95, 0.42, 0.06)
@@ -67,7 +68,7 @@ static func _cell_extent(volume: FMagicGIVolume) -> float:
 static func _probe_gizmo_radius(volume: FMagicGIVolume) -> float:
 	# Keep the established scene-scaled editor marker. It can overlap nearby
 	# surfaces; all visualization meshes explicitly stay out of shadow maps.
-	return _cell_extent(volume) * PROBE_GIZMO_CELL_RATIO
+	return ProbeLayout.marker_radius(volume.cell_size())
 
 static func _baked_probe_color(data: FMagicGIData, index: int) -> Color:
 	var response := data.transport_response(index, Vector3.UP).max(Vector3.ZERO)
@@ -95,16 +96,16 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D) -> void:
 	mm.use_colors = true
 	mm.mesh = sphere
 	mm.instance_count = count
+	var inverse_volume_transform: Transform3D = volume.global_transform.affine_inverse()
 	var data := volume.bake_data if volume.has_bake() else null
 	for i in count:
 		# probe_positions is world space; the viz node is a volume child, so
 		# convert through the inverse transform.
-		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
+		var local: Vector3 = inverse_volume_transform * volume.probe_positions[i]
 		var color := Color(0.35, 0.35, 0.35)
 		if data != null:
 			color = _baked_probe_color(data, i)
-		var scale_basis := Basis.IDENTITY
-		mm.set_instance_transform(i, Transform3D(scale_basis, local))
+		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, local))
 		mm.set_instance_color(i, color)
 	var node := MultiMeshInstance3D.new()
 	node.name = "_Probes"

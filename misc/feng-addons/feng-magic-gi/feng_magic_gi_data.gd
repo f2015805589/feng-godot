@@ -277,17 +277,20 @@ func evaluate(index: int, lighting: PackedFloat32Array,
 		sky_lighting: PackedFloat32Array = PackedFloat32Array()) -> Vector3:
 	if index < 0 or index >= probe_count() or lighting.size() != 27:
 		return Vector3.ZERO
-	var result := Vector3.ZERO
+	var secondary := Vector3.ZERO
 	for k in 9:
 		for channel in 3:
-			result[channel] += transfer[index * 27 + k * 3 + channel] * lighting[k * 3 + channel]
+			secondary[channel] += transfer[index * 27 + k * 3 + channel] * lighting[k * 3 + channel]
+	var primary := Vector3.ZERO
 	if format_version >= PRIMARY_SKY_FORMAT_VERSION and primary_sky_visibility.size() == probe_count() * 9 \
 			and sky_lighting.size() == 27:
 		for k in 9:
 			for channel in 3:
 				# Primary coefficients integrate irradiance, unlike secondary radiance transport.
-				result[channel] += primary_sky_visibility[index * 9 + k] * sky_lighting[k * 3 + channel] / PI
-	return result.max(Vector3.ZERO)
+				primary[channel] += primary_sky_visibility[index * 9 + k] * sky_lighting[k * 3 + channel] / PI
+	# Clamp each transport family independently so a negative truncated-SH lobe
+	# in one family cannot cancel positive light from the other.
+	return secondary.max(Vector3.ZERO) + primary.max(Vector3.ZERO)
 
 ## Evaluates the baked geometry response to a unit directional source.
 func transport_response(index: int, dir: Vector3) -> Vector3:

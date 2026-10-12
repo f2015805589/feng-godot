@@ -126,9 +126,6 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 		cosine_source = absf(cosine_source)
 	if cosine_source <= 0.0:
 		return {}
-	var uv1: Vector2 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
-	var uv2: Vector2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
-	var texture_rgb := _sample_texture(source, uv1, uv2)
 	var ray_origin: Vector3 = receiver + receiver_normal.normalized() * maxf(receiver_offset, 0.0)
 	var shadow_delta := target - ray_origin
 	var shadow_distance := shadow_delta.length()
@@ -139,6 +136,9 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 	var estimator_weight := total_area * cosine_receiver * cosine_source / (PI * distance * distance)
 	if not is_finite(estimator_weight) or estimator_weight <= 0.0:
 		return {}
+	var uv1: Vector2 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
+	var uv2: Vector2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
+	var texture_rgb := _sample_texture(source, uv1, uv2)
 	return {
 		"direction": shadow_delta / shadow_distance,
 		"distance": distance,

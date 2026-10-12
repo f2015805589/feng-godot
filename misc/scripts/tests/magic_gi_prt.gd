@@ -7,6 +7,7 @@ const Emission = preload("res://addons/feng-magic-gi/feng_magic_gi_emission.gd")
 const Lighting = preload("res://addons/feng-magic-gi/feng_magic_gi_lighting.gd")
 const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
 const Viz = preload("res://addons/feng-magic-gi/feng_magic_gi_viz.gd")
+const ProbeLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_probe_layout.gd")
 const Volume = preload("res://addons/feng-magic-gi/feng_magic_gi_volume.gd")
 const SceneTracker = preload("res://addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd")
 const InspectorPlugin = preload("res://addons/feng-magic-gi/editor/magic_gi_inspector_plugin.gd")
@@ -31,6 +32,11 @@ func _initialize() -> void:
 func _run() -> void:
 	_test_pure_contracts()
 	_test_probe_viz_contracts()
+	await _test_small_triangle_centroid_sampling()
+	await _test_centered_seam_clearance()
+	_test_coplanar_crossing_topology()
+	await _test_corner_center_separation()
+	await _test_world_spacing_variants()
 	var scene := Node3D.new()
 	root.add_child(scene)
 	var density_volume := Volume.new()
@@ -45,6 +51,7 @@ func _run() -> void:
 	var placement := Placement.new()
 	_check(placement.collect(density_volume, false), "coarse plane placement collection succeeds")
 	var coarse_count := placement.positions.size()
+	var coarse_anchor_keys := _surface_anchor_keys(placement.surface_positions)
 	_check(coarse_count > 10, "plane creates many surface probes, not one overwritten slot")
 	var fine_mesh := _make_horizontal_plane(10.0, 20, white)
 	coarse.mesh = fine_mesh
@@ -53,9 +60,24 @@ func _run() -> void:
 	var fine_count := fine_placement.positions.size()
 	_check(absf(float(fine_count - coarse_count)) <= maxf(12.0, coarse_count * 0.3),
 			"probe count remains stable when plane tessellation changes (%d vs %d)" % [coarse_count, fine_count])
+	_check(_surface_anchor_keys(fine_placement.surface_positions) == coarse_anchor_keys,
+			"coplanar coarse and fine tessellations retain the same canonical world-grid anchors")
 	_check(_minimum_same_normal_spacing(fine_placement) >= 0.79,
 			"same-facing plane probes respect the spacing density")
+	_check(_world_spacing_violation_pair_count(fine_placement.positions, 1.0) == 0
+			and fine_placement.adjusted_center_count == 0,
+			"ordinary plane placement keeps its samples while enforcing world-meter spacing")
+	_check(_world_max_occupancy(fine_placement.positions, 1.0) == 1,
+			"one world-aligned Probe Spacing cell retains at most one actual probe")
 	_check(_normal_count(fine_placement, Vector3.UP) > 8, "plane probes face the visible surface")
+	var fine_candidate_total := fine_placement._canonical_candidate_count \
+			+ fine_placement._fallback_candidate_count
+	var fallback_ratio := float(fine_placement._fallback_candidate_count) \
+			/ maxf(1.0, float(fine_candidate_total))
+	print("MAGIC_GI_CANONICAL_PLANE coarse=%d fine=%d fine_canonical=%d fine_fallback=%d fallback_ratio=%.5f seam_rejections=%d" % [
+		coarse_count, fine_count, fine_placement._canonical_candidate_count,
+		fine_placement._fallback_candidate_count, fallback_ratio,
+		fine_placement.rejected_foreign_surface_center_count])
 	coarse.queue_free()
 	density_volume.queue_free()
 	await process_frame
@@ -182,7 +204,8 @@ func _run() -> void:
 	scene.add_child(box_instance)
 	var box_placement := Placement.new()
 	_check(box_placement.collect(box_volume, false), "volume fitted to closed BoxMesh collects surfaces")
-	_check(box_placement.positions.size() > 12, "closed box has multiple samples on each face")
+	_check(box_placement.positions.size() >= 6,
+			"closed box retains at least one world-spaced probe for every face")
 	for direction in [Vector3.LEFT, Vector3.RIGHT, Vector3.UP, Vector3.DOWN, Vector3.FORWARD, Vector3.BACK]:
 		_check(_normal_count(box_placement, direction) > 0, "closed box retains face normal %s" % direction)
 	var box_data := Data.new()
@@ -202,7 +225,7 @@ func _run() -> void:
 	await process_frame
 
 	var embedded_volume := Volume.new()
-	embedded_volume.size = Vector3.ONE * 4.0
+	embedded_volume.size = Vector3(6.0, 4.0, 4.0)
 	embedded_volume.probe_spacing = 1.0
 	scene.add_child(embedded_volume)
 	var solid_instance := MeshInstance3D.new()
@@ -220,18 +243,18 @@ func _run() -> void:
 	transparent_box_mesh.size = Vector3.ONE * 0.8
 	transparent_box_mesh.material = transparent_material
 	transparent_box.mesh = transparent_box_mesh
-	transparent_box.position.x = 1.4
+	transparent_box.position.x = 2.4
 	scene.add_child(transparent_box)
 	var transparent_receiver := MeshInstance3D.new()
 	transparent_receiver.mesh = _make_horizontal_plane(0.5, 1, white)
-	transparent_receiver.position.x = 1.4
+	transparent_receiver.position.x = 2.4
 	scene.add_child(transparent_receiver)
 	var embedded_placement := Placement.new()
 	_check(embedded_placement.collect(embedded_volume, false),
 			"closed-solid containment fixture collects successfully")
 	_check(embedded_placement._occlusion_volumes.size() == 1,
 			"watertight BoxMesh is registered for inside-volume rejection")
-	_check(_surface_height_count(embedded_placement, embedded_volume, 0.0, Vector3.UP, 1.1, 1.8) > 0,
+	_check(_surface_height_count(embedded_placement, embedded_volume, 0.0, Vector3.UP, 2.1, 2.7) > 0,
 			"a transparent closed BoxMesh does not reject probes on an overlapping open receiver")
 	_check(_surface_height_count(embedded_placement, embedded_volume, 0.0, Vector3.UP, -0.9, 0.9) == 0
 			and embedded_placement.rejected_occluded_count > 0,
@@ -253,34 +276,40 @@ func _run() -> void:
 	thin_wall_volume.probe_spacing = 1.0
 	scene.add_child(thin_wall_volume)
 	var thin_wall_left := MeshInstance3D.new()
-	thin_wall_left.mesh = _make_horizontal_plane(1.5, 1, white)
+	thin_wall_left.mesh = _make_horizontal_plane(4.0, 1, white)
 	thin_wall_left.rotation.z = -PI * 0.5
+	thin_wall_left.position.x = -0.03
 	scene.add_child(thin_wall_left)
 	var thin_wall_right := MeshInstance3D.new()
-	thin_wall_right.mesh = _make_horizontal_plane(1.5, 1, white)
+	thin_wall_right.mesh = _make_horizontal_plane(4.0, 1, white)
 	thin_wall_right.rotation.z = PI * 0.5
-	thin_wall_right.position.x = 0.01
+	thin_wall_right.position.x = 0.03
 	scene.add_child(thin_wall_right)
 	var thin_wall_placement := Placement.new()
 	_check(thin_wall_placement.collect(thin_wall_volume, false),
 			"two thin opposing walls collect successfully")
 	var thin_left_count := 0
 	var thin_right_count := 0
-	var thin_centers_stay_between := true
+	var thin_anchors_and_offsets_valid := true
 	for index in thin_wall_placement.positions.size():
 		var anchor: Vector3 = thin_wall_placement.surface_positions[index]
 		var center: Vector3 = thin_wall_placement.positions[index]
 		var normal: Vector3 = thin_wall_placement.normals[index]
-		if anchor.x < 0.001 and normal.dot(Vector3.RIGHT) > 0.95:
+		if anchor.x < -0.029 and normal.dot(Vector3.RIGHT) > 0.95:
 			thin_left_count += 1
-			thin_centers_stay_between = thin_centers_stay_between and center.x > anchor.x \
-					and center.x < 0.0051
-		elif anchor.x > 0.009 and normal.dot(Vector3.LEFT) > 0.95:
+			thin_anchors_and_offsets_valid = thin_anchors_and_offsets_valid \
+					and absf(anchor.x + 0.03) < 0.0001 and (center - anchor).dot(normal) > 0.0
+		elif anchor.x > 0.029 and normal.dot(Vector3.LEFT) > 0.95:
 			thin_right_count += 1
-			thin_centers_stay_between = thin_centers_stay_between and center.x < anchor.x \
-					and center.x > 0.0049
-	_check(thin_left_count > 0 and thin_right_count > 0 and thin_centers_stay_between,
-			"adaptive probe clearance stays within the 1cm wall gap on both sides")
+			thin_anchors_and_offsets_valid = thin_anchors_and_offsets_valid \
+					and absf(anchor.x - 0.03) < 0.0001 and (center - anchor).dot(normal) > 0.0
+	var thin_wall_spacing_violations := _world_spacing_violation_pair_count(
+			thin_wall_placement.positions, thin_wall_volume.probe_spacing)
+	_check(thin_left_count > 0 and thin_right_count > 0 and thin_anchors_and_offsets_valid
+			and thin_wall_spacing_violations == 0
+			and _world_max_occupancy(thin_wall_placement.positions,
+			thin_wall_volume.probe_spacing) == 1,
+			"opposing thin-wall faces retain safe coverage across available cells at world spacing")
 	thin_wall_volume.bake_samples = 1
 	thin_wall_volume.bake_bounces = 1
 	thin_wall_volume.bake_distance = 2.0
@@ -289,16 +318,20 @@ func _run() -> void:
 	if thin_wall_baked:
 		for index in thin_wall_volume.bake_data.probe_count():
 			if thin_wall_volume.bake_data.normals[index].dot(Vector3.RIGHT) > 0.95 \
-					and thin_wall_volume.bake_data.surface_positions[index].x < 0.001:
+					and thin_wall_volume.bake_data.surface_positions[index].x < -0.029:
 				var moments: Vector2 = thin_wall_volume.bake_data.sample_visibility_moments(
-					index, Vector3.LEFT)
+						index, Vector3.RIGHT)
 				thin_wall_first_hit_mean = minf(thin_wall_first_hit_mean, moments.x)
 	_check(thin_wall_baked and thin_wall_first_hit_mean < 0.1,
-			"a probe facing through a 1cm wall stores the near first hit, not an unoccluded distance")
+		"a probe facing through the 6cm opposing wall pair stores its near first hit")
 	print("MAGIC_GI_THIN_WALL_VISIBILITY baked=%s first_hit_mean=%.5f" % [
 		thin_wall_baked, thin_wall_first_hit_mean])
-	print("MAGIC_GI_THIN_WALL left=%d right=%d rejected_clearance=%d" % [
-		thin_left_count, thin_right_count, thin_wall_placement.rejected_occluded_count])
+	print("MAGIC_GI_THIN_WALL left=%d right=%d spacing_violations=%d adjusted=%d rejected_center_overlap=%d rejected_clearance=%d pruned=%d" % [
+		thin_left_count, thin_right_count, thin_wall_spacing_violations,
+		thin_wall_placement.adjusted_center_count,
+		thin_wall_placement.rejected_center_overlap_count,
+		thin_wall_placement.rejected_occluded_count,
+		thin_wall_placement._bounded_candidate_pruned_count])
 	thin_wall_volume.queue_free()
 	thin_wall_left.queue_free()
 	thin_wall_right.queue_free()
@@ -306,6 +339,7 @@ func _run() -> void:
 
 	var translated_root := Node3D.new()
 	translated_root.position = Vector3(16384.0, -8192.0, 32768.0)
+	translated_root.rotation = Vector3(0.23, -0.17, 0.31)
 	translated_root.scale = Vector3(2.0, 0.5, 1.5)
 	scene.add_child(translated_root)
 	var translated_volume := Volume.new()
@@ -314,7 +348,7 @@ func _run() -> void:
 	translated_volume.surface_offset = 0.001
 	translated_root.add_child(translated_volume)
 	var nested_mesh := MeshInstance3D.new()
-	nested_mesh.mesh = _make_nested_box_mesh(2.0, 1.2, white)
+	nested_mesh.mesh = _make_nested_box_mesh(3.8, 1.0, white)
 	nested_mesh.scale = Vector3(-0.8, 1.0, 0.9)
 	nested_mesh.material_override = white
 	translated_root.add_child(nested_mesh)
@@ -330,16 +364,34 @@ func _run() -> void:
 				* translated_placement.surface_positions[index]
 		var local_normal: Vector3 = (nested_mesh.global_transform.basis.transposed() \
 				* translated_placement.normals[index]).normalized()
-		if _is_nested_inner_surface(local_anchor, 0.6):
+		if _is_nested_inner_surface(local_anchor, 0.5):
 			inner_samples += 1
 			inner_normals_point_into_cavity = inner_normals_point_into_cavity \
-					and _nested_normal_matches_cavity(local_anchor, local_normal, 0.6)
+					and _nested_normal_matches_cavity(local_anchor, local_normal, 0.5)
 		if not nested_solid.is_empty() and nested_solid.world_aabb.grow(0.01).has_point(
 				translated_placement.positions[index]):
 			every_center_is_outside_solid = every_center_is_outside_solid \
 					and translated_placement._point_inside_closed_mesh_state(
 					translated_placement.positions[index], nested_solid.world_aabb,
-					nested_solid.bvh) == 0
+						nested_solid.bvh, nested_solid.faces) == 0
+	print("MAGIC_GI_NESTED_CLEARANCE probes=%d inner=%d canonical=%d fallback=%d staged=%d valid=%d foreign_rejections=%d owner_connection=%d owner_empty=%d owner_mismatch=%d raw_anchor_proof=%d center_clearance=%d no_offset=%d inside=%d outside=%d cell_competition=%d spacing_cells=%d warning=%s" % [
+		translated_placement.positions.size(), inner_samples,
+		translated_placement._canonical_candidate_count,
+		translated_placement._fallback_candidate_count,
+		translated_placement._staged_candidate_count,
+		translated_placement._valid_candidate_count,
+		translated_placement.rejected_foreign_surface_center_count,
+		translated_placement.rejected_owner_connection_count,
+		translated_placement.rejected_owner_connection_empty_count,
+		translated_placement.rejected_owner_connection_mismatch_count,
+		translated_placement.owner_connection_raw_anchor_count,
+		translated_placement.rejected_center_clearance_count,
+		translated_placement.rejected_no_safe_offset_count,
+		translated_placement.rejected_inside_or_indeterminate_center_count,
+		translated_placement.rejected_center_outside_count,
+		translated_placement.rejected_world_cell_competition_count,
+		translated_placement.rejected_center_overlap_count,
+		translated_placement.warning_message])
 	_check(inner_samples > 0 and inner_normals_point_into_cavity,
 			"per-face containment orients reversed nested-shell probes toward the cavity")
 	_check(every_center_is_outside_solid
@@ -352,6 +404,9 @@ func _run() -> void:
 				translated_placement.surface_positions[index]))
 	_check(is_finite(minimum_adaptive_offset) and minimum_adaptive_offset >= 0.022,
 			"placement retains spacing-relative clearance under translation and nonuniform scale")
+	_check(_world_spacing_violation_pair_count(translated_placement.positions,
+			translated_volume.probe_spacing) == 0,
+			"world-space center spacing is independent of the parent nonuniform scale")
 	print("MAGIC_GI_TRANSLATED_NESTED probes=%d inner=%d min_offset=%.5f" % [
 		translated_placement.positions.size(), inner_samples,
 		minimum_adaptive_offset if is_finite(minimum_adaptive_offset) else 0.0])
@@ -363,21 +418,27 @@ func _run() -> void:
 	layered_volume.probe_spacing = 1.0
 	scene.add_child(layered_volume)
 	var lower_plane := MeshInstance3D.new()
-	lower_plane.mesh = _make_horizontal_plane(0.8, 1, white, 0.0)
+	lower_plane.mesh = _make_horizontal_plane(2.2, 1, white, 0.0)
 	scene.add_child(lower_plane)
 	var upper_plane := MeshInstance3D.new()
-	upper_plane.mesh = _make_horizontal_plane(0.8, 1, white, 0.1)
+	upper_plane.mesh = _make_horizontal_plane(2.2, 1, white, 0.1)
 	scene.add_child(upper_plane)
 	var layered_placement := Placement.new()
 	_check(layered_placement.collect(layered_volume, false),
 			"thickness-separated parallel surfaces collect successfully")
 	_check(_surface_height_count(layered_placement, layered_volume, 0.0, Vector3.UP) > 0
 			and _surface_height_count(layered_placement, layered_volume, 0.1, Vector3.UP) > 0,
-			"parallel planes 10cm apart remain separate even when their gap is below Probe Spacing")
-	print("MAGIC_GI_PARALLEL_LAYOUT lower=%d upper=%d duplicates=%d" % [
+			"nearby parallel source domains both get coverage when separate world cells permit it")
+	var layered_spacing_violations := _world_spacing_violation_pair_count(
+			layered_placement.positions, layered_volume.probe_spacing)
+	_check(layered_spacing_violations == 0
+			and _world_max_occupancy(layered_placement.positions, layered_volume.probe_spacing) == 1,
+			"parallel surfaces share one global world-space density budget")
+	print("MAGIC_GI_PARALLEL_LAYOUT lower=%d upper=%d duplicates=%d adjusted=%d spacing_violations=%d" % [
 		_surface_height_count(layered_placement, layered_volume, 0.0, Vector3.UP),
 		_surface_height_count(layered_placement, layered_volume, 0.1, Vector3.UP),
-		layered_placement.rejected_duplicate_count])
+		layered_placement.rejected_duplicate_count,
+		layered_placement.adjusted_center_count, layered_spacing_violations])
 	layered_volume.queue_free()
 	lower_plane.queue_free()
 	upper_plane.queue_free()
@@ -396,9 +457,48 @@ func _run() -> void:
 	var coplanar_placement := Placement.new()
 	_check(coplanar_placement.collect(coplanar_volume, false),
 			"coincident source surfaces collect successfully")
-	_check(coplanar_placement.rejected_duplicate_count > 0
-			and _surface_height_count(coplanar_placement, coplanar_volume, 0.0, Vector3.UP) > 0,
-			"truly coplanar surfaces from separate nodes still share near-duplicate probes")
+	print("MAGIC_GI_COPLANAR_CLEARANCE probes=%d canonical=%d fallback=%d staged=%d valid=%d foreign_rejections=%d owner_connection=%d owner_empty=%d owner_mismatch=%d raw_anchor_proof=%d center_clearance=%d cell_competition=%d spacing_cells=%d warning=%s" % [
+		coplanar_placement.positions.size(),
+		coplanar_placement._canonical_candidate_count,
+		coplanar_placement._fallback_candidate_count,
+		coplanar_placement._staged_candidate_count,
+		coplanar_placement._valid_candidate_count,
+		coplanar_placement.rejected_foreign_surface_center_count,
+		coplanar_placement.rejected_owner_connection_count,
+		coplanar_placement.rejected_owner_connection_empty_count,
+		coplanar_placement.rejected_owner_connection_mismatch_count,
+		coplanar_placement.owner_connection_raw_anchor_count,
+		coplanar_placement.rejected_center_clearance_count,
+		coplanar_placement.rejected_world_cell_competition_count,
+		coplanar_placement.rejected_center_overlap_count,
+		coplanar_placement.warning_message])
+	for face_index in coplanar_placement.faces.size() / 3:
+		var face_start := face_index * 3
+		var face_a: Vector3 = coplanar_placement.faces[face_start]
+		var face_b: Vector3 = coplanar_placement.faces[face_start + 1]
+		var face_c: Vector3 = coplanar_placement.faces[face_start + 2]
+		var face_normal := (face_c - face_a).cross(face_b - face_a).normalized()
+		var face_surface := (face_a + face_b + face_c) / 3.0
+		var face_center := face_surface + face_normal * 0.03
+		var ray_epsilon := 0.003
+		var face_hit: Dictionary = coplanar_placement.bvh.intersect_segment(
+				face_center - face_normal * ray_epsilon,
+				face_surface - face_normal * ray_epsilon)
+		var hit_face := int(face_hit.get("face_index", -1))
+		print("MAGIC_GI_COPLANAR_FACE index=%d hit=%d same=%s clear=%s normal=%s" % [
+			face_index, hit_face,
+			str(coplanar_placement._face_is_same_coplanar_surface(
+				hit_face, face_index, face_surface, face_normal)),
+			str(coplanar_placement._center_has_foreign_surface_clearance(
+				face_surface, face_normal, face_center, face_index)), str(face_normal)])
+	_check(_surface_height_count(coplanar_placement, coplanar_volume, 0.0, Vector3.UP) > 0
+			and _world_max_occupancy(coplanar_placement.positions,
+			coplanar_volume.probe_spacing) == 1
+			and _world_spacing_violation_pair_count(coplanar_placement.positions,
+			coplanar_volume.probe_spacing) == 0
+			and coplanar_placement.rejected_world_cell_competition_count > 0
+			and coplanar_placement.warning_message.is_empty(),
+			"coplanar objects share one bounded world-space probe set without duplicate centers")
 	coplanar_volume.queue_free()
 	coplanar_a.queue_free()
 	coplanar_b.queue_free()
@@ -432,15 +532,22 @@ func _run() -> void:
 	scene.add_child(cone_instance)
 	var curved_placement := Placement.new()
 	var curved_collected: bool = curved_placement.collect(curved_volume, false)
+	var sphere_samples := 0
+	var cone_samples := 0
+	for anchor in curved_placement.surface_positions:
+		if anchor.x < 0.0:
+			sphere_samples += 1
+		else:
+			cone_samples += 1
 	print("CURVED_PLACEMENT collected=%s error=%s probes=%d duplicates=%d rejected=%d cells=%d" % [
 		curved_collected, curved_placement.error_message, curved_placement.positions.size(),
 		curved_placement.rejected_duplicate_count, curved_placement.rejected_occluded_count,
 		curved_placement._cell_counts.size()])
+	print("MAGIC_GI_CURVED_LAYOUT sphere=%d cone=%d" % [sphere_samples, cone_samples])
 	_check(curved_collected, "1m sphere and cone placement fits the 8-slot grid")
-	_check(curved_placement.positions.size() > 0 and _max_cell_load(curved_placement) <= Data.CELL_CAPACITY,
-			"curved surfaces remain represented without lookup-cell overflow")
-	_check(_normal_count(curved_placement, Vector3.UP) > 0,
-			"curved object fixture retains upward-facing surface samples")
+	_check(sphere_samples > 0 and cone_samples > 0
+			and _max_cell_load(curved_placement) <= Data.CELL_CAPACITY,
+			"the sphere and cone both retain samples under the shared world density")
 	# TriangleMesh.get_faces() snaps generated PrimitiveMesh vertices to 1e-4.
 	# A geometrically identical ArrayMesh made from those canonical faces must
 	# therefore produce the same persisted inputs and legacy scene signature.
@@ -477,18 +584,115 @@ func _run() -> void:
 		await process_frame
 		var cornell_volume: Node3D = cornell_scene.get_node("FMagicGIVolume")
 		var cornell_placement := Placement.new()
+		var cornell_collect_start_usec := Time.get_ticks_usec()
 		var cornell_collected: bool = cornell_placement.collect(cornell_volume, true, false)
-		_check(cornell_collected and cornell_placement.positions.size() >= 200,
-				"full Cornell room and props collect at 1m spacing without holes/overflow")
+		var cornell_collect_ms := float(Time.get_ticks_usec() - cornell_collect_start_usec) / 1000.0
+		var cornell_repeat_placement := Placement.new()
+		var cornell_repeat_collected: bool = cornell_repeat_placement.collect(
+				cornell_volume, true, false)
+		var cornell_repeat_positions_match := cornell_placement.positions.to_byte_array() \
+				== cornell_repeat_placement.positions.to_byte_array()
+		var cornell_repeat_anchors_match := cornell_placement.surface_positions.to_byte_array() \
+				== cornell_repeat_placement.surface_positions.to_byte_array()
+		var cornell_repeat_normals_match := cornell_placement.normals.to_byte_array() \
+				== cornell_repeat_placement.normals.to_byte_array()
+		print("MAGIC_GI_CORNELL_REPEAT count_a=%d count_b=%d positions=%s anchors=%s normals=%s signature=%s" % [
+			cornell_placement.positions.size(), cornell_repeat_placement.positions.size(),
+			str(cornell_repeat_positions_match), str(cornell_repeat_anchors_match),
+			str(cornell_repeat_normals_match),
+			str(cornell_placement.scene_signature == cornell_repeat_placement.scene_signature)])
+		_check(cornell_collected and cornell_repeat_collected
+				and cornell_placement.positions.size() == cornell_repeat_placement.positions.size()
+				and cornell_repeat_positions_match and cornell_repeat_anchors_match
+				and cornell_repeat_normals_match
+				and cornell_placement.scene_signature == cornell_repeat_placement.scene_signature,
+				"unchanged Cornell geometry collects the same ordered probe layout and signature")
+		var cornell_axis_counts := PackedInt32Array()
+		for direction in [Vector3.LEFT, Vector3.RIGHT, Vector3.UP, Vector3.DOWN,
+				Vector3.FORWARD, Vector3.BACK]:
+			cornell_axis_counts.append(_normal_count(cornell_placement, direction))
+		var all_cornell_axes_covered := true
+		for axis_count in cornell_axis_counts:
+			all_cornell_axes_covered = all_cornell_axes_covered and axis_count > 0
+		print("MAGIC_GI_CORNELL_AXES left=%d right=%d up=%d down=%d forward=%d back=%d" % [
+			cornell_axis_counts[0], cornell_axis_counts[1], cornell_axis_counts[2],
+			cornell_axis_counts[3], cornell_axis_counts[4], cornell_axis_counts[5]])
+		_check(cornell_collected and cornell_placement.positions.size() >= 100
+				and all_cornell_axes_covered,
+				"full Cornell room and props retain one-meter-spaced samples across all six axes")
 		_check(_max_cell_load(cornell_placement) <= Data.CELL_CAPACITY,
 				"Cornell room corner cells stay within eight lookup slots")
 		var cornell_data: Resource = cornell_volume.get("bake_data")
+		var old_probe_positions: PackedVector3Array = cornell_data.get("positions") \
+				if cornell_data != null else PackedVector3Array()
+		var old_probe_bytes := old_probe_positions.to_byte_array()
+		var old_surface_positions: PackedVector3Array = cornell_data.get("surface_positions") \
+				if cornell_data != null else PackedVector3Array()
+		var old_normal_values: PackedVector3Array = cornell_data.get("normals") \
+				if cornell_data != null else PackedVector3Array()
+		var old_data_signature := int(cornell_data.get("scene_signature")) \
+				if cornell_data != null else 0
+		var new_data_signature := Baker.signature_for_geometry(cornell_placement.scene_signature)
+		var center_layout_changed := old_probe_bytes != cornell_placement.positions.to_byte_array() \
+				or old_surface_positions.to_byte_array() != cornell_placement.surface_positions.to_byte_array() \
+				or old_normal_values.to_byte_array() != cornell_placement.normals.to_byte_array()
+		var old_world_occupancy := _world_max_occupancy(old_probe_positions,
+				cornell_volume.probe_spacing)
+		var new_world_occupancy := _world_max_occupancy(cornell_placement.positions,
+				cornell_volume.probe_spacing)
+		var new_spacing_violations := _world_spacing_violation_pair_count(
+				cornell_placement.positions, cornell_volume.probe_spacing)
+		print("MAGIC_GI_CORNELL_LAYOUT collect_ms=%.3f old_probes=%d old_max_world_cell=%d old_occupied_cells=%d new_probes=%d new_max_world_cell=%d min_spacing=%.6f spacing_violations=%d pruned_candidates=%d world_cell_competition=%d rejected_spacing_cells=%d rejected_clearance=%d rejected_inside=%d rejected_outside=%d rejected_lookup=%d ambiguous=%d" % [
+			cornell_collect_ms,
+			old_probe_positions.size(), old_world_occupancy,
+			_world_cell_counts(old_probe_positions, cornell_volume.probe_spacing).size(),
+			cornell_placement.positions.size(), new_world_occupancy,
+			_minimum_world_spacing(cornell_placement.positions), new_spacing_violations,
+			cornell_placement._bounded_candidate_pruned_count,
+			cornell_placement.rejected_world_cell_competition_count,
+			cornell_placement.rejected_center_overlap_count,
+			cornell_placement.rejected_no_safe_offset_count,
+			cornell_placement.rejected_inside_or_indeterminate_center_count,
+			cornell_placement.rejected_center_outside_count,
+			cornell_placement.rejected_lookup_capacity_count,
+			cornell_placement.rejected_ambiguous_side_count])
+		_check(new_world_occupancy <= 1 and new_spacing_violations == 0,
+				"collected Cornell layout enforces one probe per world cell and minimum world spacing")
+		var old_bake_is_stale := not bool(cornell_volume.call("has_bake"))
 		_check(cornell_data != null and cornell_data.call("is_valid")
-				and cornell_data.get("scene_signature") == Baker.signature_for_geometry(cornell_placement.scene_signature)
+				and old_probe_bytes == old_probe_positions.to_byte_array()
+				and ((center_layout_changed and old_bake_is_stale
+					and old_data_signature != new_data_signature)
+					or (not center_layout_changed and not old_bake_is_stale
+					and old_data_signature == new_data_signature)),
+				"saved Cornell data remains valid and unchanged; a changed center layout is recognized as stale")
+		var cornell_rebaked := false
+		var original_cornell_samples := int(cornell_volume.get("bake_samples"))
+		var protocol_cornell_samples := mini(original_cornell_samples, 64)
+		if cornell_collected:
+			cornell_volume.set("bake_samples", protocol_cornell_samples)
+			cornell_rebaked = await cornell_volume.call("bake")
+		var rebaked_cornell_data: Resource = cornell_volume.get("bake_data")
+		var rebaked_positions: PackedVector3Array = rebaked_cornell_data.get("positions") \
+				if rebaked_cornell_data != null else PackedVector3Array()
+		_check(cornell_rebaked and rebaked_cornell_data != null
+				and rebaked_cornell_data.call("is_valid")
+				and rebaked_cornell_data.get("bake_samples") == protocol_cornell_samples
+				and rebaked_cornell_data.get("scene_signature")
+				== new_data_signature
+				and rebaked_positions.to_byte_array() == cornell_placement.positions.to_byte_array()
 				and cornell_volume.call("has_bake"),
-				"saved Cornell scene references a current valid bake")
-		_check(cornell_data != null and cornell_data.call("has_nonzero_transfer"),
-				"saved Cornell bake contains real nonzero indirect transport")
+				"low-sample Temp Cornell rebake stores current centers under the matching signature")
+		_check(cornell_data != null and cornell_data.call("is_valid")
+				and old_probe_bytes == cornell_data.get("positions").to_byte_array()
+				and old_surface_positions.to_byte_array()
+				== cornell_data.get("surface_positions").to_byte_array()
+				and old_normal_values.to_byte_array() == cornell_data.get("normals").to_byte_array(),
+				"rebaking the Temp scene does not mutate the saved resource instance")
+		_check(rebaked_cornell_data != null and rebaked_cornell_data.call("has_nonzero_transfer"),
+				"rebaked Cornell bake contains real nonzero indirect transport")
+		if cornell_collected:
+			cornell_volume.set("bake_samples", original_cornell_samples)
 		cornell_scene.queue_free()
 		await process_frame
 
@@ -634,7 +838,15 @@ func _run() -> void:
 	scene_copy.add_child(clone_volume)
 	clone_volume.bake_data = loaded
 	await process_frame
-	_check(clone_volume.has_bake()
+	var clone_has_bake := clone_volume.has_bake()
+	var clone_placement := Placement.new()
+	var clone_collected: bool = clone_placement.collect(clone_volume, false, false)
+	_check(clone_collected
+			and clone_placement.positions.to_byte_array() == loaded.positions.to_byte_array()
+			and clone_placement.surface_positions.to_byte_array() == loaded.surface_positions.to_byte_array()
+			and clone_placement.normals == loaded.normals,
+			"equivalent re-instantiated geometry preserves the saved probe layout")
+	_check(clone_has_bake
 			and persistent_signature == Baker.signature_for_geometry(clone_volume._current_scene_signature),
 			"equivalent re-instantiated scene accepts saved bake without process IDs")
 	clone_wall_material.albedo_color = Color.BLUE
@@ -841,6 +1053,24 @@ func _test_emission_data_contracts() -> void:
 		sky_only_lighting[channel] = 1.0 / 0.2820947918
 	_check(primary_only.evaluate(0, no_secondary_lighting, sky_only_lighting).is_equal_approx(Vector3.ONE),
 			"constant white sky preserves unit diffuse radiance without a PI energy gain")
+	var independent_clamp: Resource = primary_only.duplicate(true)
+	independent_clamp.transfer.fill(0.0)
+	independent_clamp.primary_sky_visibility.fill(0.0)
+	independent_clamp.transfer[0] = -2.0
+	independent_clamp.transfer[1] = 2.0
+	independent_clamp.primary_sky_visibility[0] = PI * 3.0
+	var mixed_secondary := PackedFloat32Array()
+	mixed_secondary.resize(27)
+	mixed_secondary.fill(0.0)
+	mixed_secondary[0] = 1.0
+	mixed_secondary[1] = 1.0
+	var mixed_sky := PackedFloat32Array()
+	mixed_sky.resize(27)
+	mixed_sky.fill(0.0)
+	mixed_sky[0] = 1.0
+	mixed_sky[1] = -1.0
+	_check(independent_clamp.evaluate(0, mixed_secondary, mixed_sky).is_equal_approx(Vector3(3.0, 2.0, 0.0)),
+			"negative secondary and primary SH lobes do not cancel positive light from the other transport family")
 	var bad_shape: Resource = data.duplicate(true)
 	bad_shape.emitter_transport.resize(bad_shape.emitter_transport.size() - 1)
 	_check(not bad_shape.is_valid(), "v6 rejects an emitter payload with the wrong probe shape")
@@ -936,6 +1166,8 @@ func _run_emission_bake_contracts() -> void:
 	emitter_material.emission_enabled = true
 	emitter_material.emission = Color.GREEN
 	emitter_material.emission_energy_multiplier = 1.0
+	if bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)):
+		emitter_material.emission_intensity = 1.0
 	var emitter := MeshInstance3D.new()
 	emitter.name = "EmitterPanel"
 	emitter.mesh = _make_horizontal_plane(0.8, 1, emitter_material)
@@ -946,7 +1178,9 @@ func _run_emission_bake_contracts() -> void:
 	volume.name = "FMagicGIVolume"
 	volume.position = Vector3(0.0, 1.5, 0.0)
 	volume.size = Vector3(4.0, 3.6, 4.0)
-	volume.probe_spacing = 1.0
+	# This physics fixture needs representative floor receivers on both sides of
+	# its divider; use finer spacing than the one-meter layout contract fixture.
+	volume.probe_spacing = 0.5
 	volume.surface_offset = 0.03
 	volume.bake_samples = 64
 	volume.bake_bounces = 1
@@ -998,13 +1232,28 @@ func _run_emission_bake_contracts() -> void:
 	var source_l1 := 0.0
 	for coefficient in single_data.emitter_transport:
 		source_l1 += absf(coefficient)
+	var primary_sky_l1 := 0.0
+	for coefficient in single_data.primary_sky_visibility:
+		primary_sky_l1 += absf(coefficient)
 	_check(single_data.is_valid() and single_data.emitter_count() == 1,
 			"real bake persists one stable area-emitter binding")
 	_check(far_field_l1 == 0.0 and source_l1 > 0.0 and single_data.has_nonzero_transfer(),
-			"closed black room has exactly zero far-field SH but nonzero emissive transport (SH %.8f, emitter %.8f)" % [far_field_l1, source_l1])
-	var floor_probe := _find_probe(single_data, Vector3(-0.5, 0.0, 0.5), Vector3.UP)
-	var occluded_probe := _find_probe(single_data, Vector3(0.5, 0.0, 0.5), Vector3.UP)
-	var back_probe := _find_probe(single_data, Vector3(-0.75, 3.0, 0.4), Vector3.DOWN)
+			"black room has zero secondary transfer but positive emissive transport (SH %.8f, emitter %.8f)" % [far_field_l1, source_l1])
+	var floor_probe := _find_probe_in_surface_region(single_data,
+			Vector3(-0.5, 0.0, 0.5), Vector3.UP, 0.0, -INF, -0.1, -1.0, 1.0)
+	var occluded_probe := _find_probe_in_surface_region(single_data,
+			Vector3(0.5, 0.0, 0.5), Vector3.UP, 0.0, 0.1, INF, -1.0, 1.0)
+	var back_probe := _find_probe_in_surface_region(single_data,
+			Vector3(-0.75, 3.0, 0.4), Vector3.DOWN, 3.0, -INF, INF)
+	var floor_sky_l1 := _primary_sky_probe_l1(single_data, floor_probe)
+	var occluded_sky_l1 := _primary_sky_probe_l1(single_data, occluded_probe)
+	var back_sky_l1 := _primary_sky_probe_l1(single_data, back_probe)
+	print("MAGIC_GI_ROOM_SKY spacing=%.2f total_l1=%.8f floor_probe=%d floor_l1=%.8f occluded_probe=%d occluded_l1=%.8f back_probe=%d back_l1=%.8f" % [
+		single_data.spacing, primary_sky_l1, floor_probe, floor_sky_l1, occluded_probe,
+		occluded_sky_l1, back_probe, back_sky_l1])
+	_check(floor_probe >= 0 and occluded_probe >= 0 and back_probe >= 0
+			and floor_sky_l1 == 0.0 and occluded_sky_l1 == 0.0 and back_sky_l1 == 0.0,
+			"interior floor, occluded floor and back-side probes have no first-segment sky visibility")
 	var single_floor_weight := _emitter_transport_term0(single_data, floor_probe)
 	var single_occluded_weight := _emitter_transport_term0(single_data, occluded_probe)
 	var single_back_weight := _emitter_transport_term0(single_data, back_probe)
@@ -1082,15 +1331,15 @@ func _run_emission_bake_contracts() -> void:
 func _emit_architecture_bake_snapshot(volume: Node3D, data: Resource) -> void:
 	var placement := Placement.new()
 	var collected: bool = placement.collect(volume, true, true, true)
-	_check(collected, "compatibility Placement facade collects the rebaked scene for architecture comparison")
+	_check(collected, "Placement collector collects the rebaked scene for architecture comparison")
 	if not collected:
 		return
 	_check(placement.positions.to_byte_array() == data.positions.to_byte_array()
 			and placement.normals.to_byte_array() == data.normals.to_byte_array()
-			and placement.emitter_keys == data.emitter_keys
-			and placement.emitter_static_signatures == data.emitter_static_signatures
+			and placement.emitters.keys == data.emitter_keys
+			and placement.emitters.static_signatures == data.emitter_static_signatures
 			and data.scene_signature == Baker.signature_for_geometry(placement.scene_signature),
-			"bake payload retains the facade geometry and static-emitter binding order")
+			"bake payload retains the collected geometry and static-emitter binding order")
 	var summary := {
 		"geometry_signature": str(placement.scene_signature),
 		"bake_signature": str(data.scene_signature),
@@ -1403,6 +1652,16 @@ func _make_horizontal_plane(extent: float, subdivisions: int, material: Material
 	mesh.surface_set_material(0, material)
 	return mesh
 
+func _make_triangle_surface(a: Vector3, b: Vector3, c: Vector3,
+		material: Material) -> ArrayMesh:
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([a, b, c])
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mesh.surface_set_material(0, material)
+	return mesh
+
 func _make_nested_box_mesh(outer_size: float, inner_size: float, material: Material) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	_add_box_surface(mesh, outer_size, false, material)
@@ -1485,6 +1744,47 @@ func _minimum_same_normal_spacing(placement: RefCounted) -> float:
 				minimum = minf(minimum, placement.positions[i].distance_to(placement.positions[j]))
 	return minimum
 
+func _world_spacing_violation_pair_count(positions: PackedVector3Array,
+		spacing: float) -> int:
+	var minimum_distance := maxf(0.0, spacing - maxf(0.000001, spacing * 0.000001))
+	var minimum_distance_squared := minimum_distance * minimum_distance
+	var violations := 0
+	for i in positions.size():
+		for j in range(i + 1, positions.size()):
+			if positions[i].distance_squared_to(positions[j]) < minimum_distance_squared:
+				violations += 1
+	return violations
+
+func _minimum_world_spacing(positions: PackedVector3Array) -> float:
+	var minimum_distance := INF
+	for first in positions.size():
+		for second in range(first + 1, positions.size()):
+			minimum_distance = minf(minimum_distance,
+					positions[first].distance_to(positions[second]))
+	return minimum_distance
+
+func _surface_anchor_keys(anchors: PackedVector3Array) -> Array[String]:
+	var keys: Array[String] = []
+	for anchor in anchors:
+		keys.append("%d,%d,%d" % [
+			roundi(anchor.x * 100000.0), roundi(anchor.y * 100000.0),
+			roundi(anchor.z * 100000.0)])
+	keys.sort()
+	return keys
+
+func _world_cell_counts(positions: PackedVector3Array, spacing: float) -> Dictionary:
+	var counts: Dictionary = {}
+	for position in positions:
+		var cell := ProbeLayout.world_cell(position, spacing)
+		counts[cell] = int(counts.get(cell, 0)) + 1
+	return counts
+
+func _world_max_occupancy(positions: PackedVector3Array, spacing: float) -> int:
+	var maximum := 0
+	for count in _world_cell_counts(positions, spacing).values():
+		maximum = maxi(maximum, int(count))
+	return maximum
+
 func _normal_count(placement: RefCounted, direction: Vector3) -> int:
 	var count := 0
 	for normal in placement.normals:
@@ -1514,17 +1814,20 @@ func _surface_height_count(placement: RefCounted, volume: Node3D, y: float,
 
 func _test_probe_viz_contracts() -> void:
 	var volume := Volume.new()
+	volume.position = Vector3(3.0, -2.0, 1.0)
+	volume.rotation = Vector3(0.2, -0.35, 0.4)
+	volume.scale = Vector3(2.0, 1.0, 0.5)
 	root.add_child(volume)
 	volume.size = Vector3.ONE * 4.0
 	volume.probe_spacing = 2.0
 	volume.surface_offset = 0.03
-	var radius := Viz._probe_gizmo_radius(volume)
-	var expected_radius := Viz._cell_extent(volume) * Viz.PROBE_GIZMO_CELL_RATIO
-	_check(is_equal_approx(radius, expected_radius) and radius * 2.0 > volume.surface_offset * 4.0,
-			"probe gizmos keep the established visible cell-relative radius")
+	var volume_transform := volume.global_transform
+	var surface_normal := (volume_transform.basis.inverse().transposed() * Vector3.UP).normalized()
+	var single_surface := volume_transform * Vector3.ZERO
+	var single_center := volume_transform * Vector3(0.0, volume.surface_offset, 0.0)
 	var data := Data.new()
-	data.positions = PackedVector3Array([Vector3.ZERO])
-	data.normals = PackedVector3Array([Vector3.UP])
+	data.positions = PackedVector3Array([single_center])
+	data.normals = PackedVector3Array([surface_normal])
 	data.transfer.resize(27)
 	data.transfer.fill(0.0)
 	var zero_color: Color = Viz._baked_probe_color(data, 0)
@@ -1534,17 +1837,19 @@ func _test_probe_viz_contracts() -> void:
 	var low_color: Color = Viz._baked_probe_color(data, 0)
 	_check(low_color == Viz.LOW_RESPONSE_COLOR and low_color != zero_color,
 			"weak positive transport has a distinct low-response tint")
-	volume.probe_positions = PackedVector3Array([Vector3.ZERO])
-	volume.probe_normals = PackedVector3Array([Vector3.UP])
+	volume.probe_positions = PackedVector3Array([single_center])
+	volume.probe_surface_positions = PackedVector3Array([single_surface])
+	volume.probe_normals = PackedVector3Array([surface_normal])
 	volume.bake_data = data
-	var viz_root := Node3D.new()
-	Viz._build_box(volume, viz_root)
-	Viz._build_probes(volume, viz_root)
-	Viz._build_sh(volume, viz_root)
+	var single_viz_root := Node3D.new()
+	volume.add_child(single_viz_root)
+	Viz._build_box(volume, single_viz_root)
+	Viz._build_probes(volume, single_viz_root)
+	Viz._build_sh(volume, single_viz_root)
 	var off := GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	var box := viz_root.get_node("_Box") as MeshInstance3D
-	var probes := viz_root.get_node("_Probes") as MultiMeshInstance3D
-	var transport := viz_root.get_node("_Transport") as Node3D
+	var box := single_viz_root.get_node("_Box") as MeshInstance3D
+	var probes := single_viz_root.get_node("_Probes") as MultiMeshInstance3D
+	var transport := single_viz_root.get_node("_Transport") as Node3D
 	var transport_mesh := transport.get_child(0) as MeshInstance3D
 	var sphere := probes.multimesh.mesh as SphereMesh
 	var probe_material := sphere.material as StandardMaterial3D
@@ -1552,16 +1857,333 @@ func _test_probe_viz_contracts() -> void:
 			"volume box, MultiMesh probes, and transport meshes do not cast shadows")
 	_check(probes.visible and probes.multimesh.use_colors,
 			"probe spheres are visible and use per-instance diagnostic colors")
-	_check(is_equal_approx(sphere.radius, radius),
-			"probe sphere mesh keeps the established visible radius")
+	var expected_radius := ProbeLayout.marker_radius(volume.cell_size())
+	_check(is_equal_approx(sphere.radius, expected_radius)
+			and is_equal_approx(sphere.height, expected_radius * 2.0),
+			"probe markers retain the established cell-relative mesh size")
+	_check(volume.probe_positions.size() == 1 and probes.multimesh.instance_count == 1,
+			"each authored probe center produces exactly one visualization instance")
+	_check(probes.multimesh.transform_format == MultiMesh.TRANSFORM_3D,
+			"probe markers use 3D instance transforms; headless Dummy does not expose their values")
 	_check(probe_material != null
 			and probe_material.shading_mode == BaseMaterial3D.SHADING_MODE_UNSHADED
 			and probe_material.albedo_color == Color.WHITE
 			and probe_material.vertex_color_use_as_albedo,
 			"probe sphere material shows vertex colors without scene lighting")
-	viz_root.free()
+	single_viz_root.free()
 	data = null
 	volume.free()
+
+func _test_small_triangle_centroid_sampling() -> void:
+	var fixture := Node3D.new()
+	fixture.name = "SmallTriangleFixture"
+	root.add_child(fixture)
+	var volume := Volume.new()
+	volume.size = Vector3.ONE * 2.0
+	volume.probe_spacing = 1.0
+	volume.surface_offset = 0.03
+	fixture.add_child(volume)
+	var a := Vector3(1.0, 0.99, 0.95)
+	var b := Vector3(0.95, 1.0, 0.99)
+	var c := Vector3(0.99, 0.95, 1.0)
+	var triangle_mesh := ArrayMesh.new()
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([a, c, b])
+	triangle_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	_check(triangle_mesh.get_surface_count() == 1,
+			"small-triangle centroid fixture mesh is valid")
+	triangle_mesh.surface_set_material(0, _make_material(Color.WHITE))
+	var triangle_instance := MeshInstance3D.new()
+	triangle_instance.mesh = triangle_mesh
+	fixture.add_child(triangle_instance)
+	await process_frame
+	var placement := Placement.new()
+	var collected: bool = placement.collect(volume, false)
+	var centroid := (a + b + c) / 3.0
+	_check(collected, "small boundary triangle collects without a bake error")
+	_check(placement.positions.size() == 1 and placement.surface_positions.size() == 1
+			and placement.surface_positions[0].distance_to(centroid) < 0.00001
+			and placement.rejected_no_safe_offset_count == 3,
+			"a small triangle whose vertices lack clearance is represented by its safe centroid (probes %d, no-offset %d, inside %d, outside %d, centers %s, anchors %s)" % [
+				placement.positions.size(), placement.rejected_no_safe_offset_count,
+				placement.rejected_inside_or_indeterminate_center_count,
+				placement.rejected_center_outside_count,
+				str(placement.positions), str(placement.surface_positions)])
+	fixture.queue_free()
+	await process_frame
+
+func _test_centered_seam_clearance() -> void:
+	var fixture := Node3D.new()
+	fixture.name = "ProbeCenteredClearanceFixture"
+	root.add_child(fixture)
+	var volume := Volume.new()
+	volume.size = Vector3.ONE * 4.0
+	volume.probe_spacing = 1.0
+	fixture.add_child(volume)
+	var material := _make_material(Color.WHITE)
+	var floor := MeshInstance3D.new()
+	floor.mesh = _make_horizontal_plane(2.0, 1, material)
+	fixture.add_child(floor)
+	var foreign := MeshInstance3D.new()
+	foreign.mesh = _make_array_mesh_from_faces(PackedVector3Array([
+		Vector3(0.5, -1.0, -1.0), Vector3(0.5, 1.0, -1.0),
+		Vector3(0.5, 1.0, 1.0), Vector3(0.5, -1.0, -1.0),
+		Vector3(0.5, 1.0, 1.0), Vector3(0.5, -1.0, 1.0)]), material)
+	fixture.add_child(foreign)
+	await process_frame
+	var placement := Placement.new()
+	var collected: bool = placement.collect(volume, false)
+	var surface := Vector3(0.5, 0.0, -0.5)
+	var center := surface + Vector3.UP * Placement._preferred_probe_offset(volume)
+	var owner_ray_epsilon := Placement._preferred_probe_offset(volume) * 0.1
+	var owner_hit: Dictionary = {}
+	if collected and placement.bvh_ready:
+		owner_hit = placement.bvh.intersect_segment(
+				center - Vector3.UP * owner_ray_epsilon,
+				surface - Vector3.UP * owner_ray_epsilon)
+	var owner_connection_is_valid := not owner_hit.is_empty() \
+			and int(owner_hit.get("face_index", -1)) < 2
+	var centered_clearance_rejects := collected and placement.bvh_ready \
+			and not placement._center_has_foreign_surface_clearance(
+				surface, Vector3.UP, center, 0)
+	var near_minimum_center := surface + Vector3.UP * 0.002
+	var near_minimum_owner_hit: Dictionary = {}
+	if collected and placement.bvh_ready:
+		near_minimum_owner_hit = placement.bvh.intersect_segment(
+				near_minimum_center + Vector3.UP * 0.0002,
+				surface - Vector3.UP * 0.0002)
+	var near_minimum_owner_reached := not near_minimum_owner_hit.is_empty() \
+			and int(near_minimum_owner_hit.get("face_index", -1)) < 2
+	var near_minimum_clearance_rejects := collected and placement.bvh_ready \
+			and not placement._center_has_foreign_surface_clearance(
+				surface, Vector3.UP, near_minimum_center, 0)
+	var seam_anchor_was_rejected := true
+	for index in placement.surface_positions.size():
+		if placement.normals[index].dot(Vector3.UP) > 0.95 \
+				and placement.surface_positions[index].distance_to(surface) < 0.0001:
+			seam_anchor_was_rejected = false
+	_check(collected and owner_connection_is_valid and centered_clearance_rejects,
+			"six-axis centered BVH clearance rejects a perpendicular foreign face even when the owner ray reaches its source face")
+	_check(near_minimum_owner_reached and near_minimum_clearance_rejects,
+			"centered clearance rejects a seam face at the minimum permitted probe offset")
+	_check(seam_anchor_was_rejected and placement.rejected_foreign_surface_center_count > 0,
+			"the cross-seam canonical owner probe is not staged through a foreign face")
+	print("MAGIC_GI_SEAM_CLEARANCE collected=%s owner_ray_face=%d foreign_rejections=%d" % [
+		str(collected), int(owner_hit.get("face_index", -1)),
+		placement.rejected_foreign_surface_center_count])
+	fixture.queue_free()
+	await process_frame
+
+	var far_fixture := Node3D.new()
+	far_fixture.position = Vector3(16384.0, -8192.0, 32768.0)
+	far_fixture.rotation = Vector3(0.23, -0.17, 0.31)
+	far_fixture.scale = Vector3(2.0, 0.5, 1.5)
+	root.add_child(far_fixture)
+	var far_volume := Volume.new()
+	far_volume.size = Vector3.ONE * 4.0
+	far_volume.probe_spacing = 1.0
+	far_fixture.add_child(far_volume)
+	var far_open_plane := MeshInstance3D.new()
+	far_open_plane.mesh = _make_horizontal_plane(4.0, 1, material)
+	far_fixture.add_child(far_open_plane)
+	await process_frame
+	var far_placement := Placement.new()
+	var far_collected: bool = far_placement.collect(far_volume, false)
+	var far_owner_side_valid := far_placement.faces.size() >= 3 \
+			and far_placement.positions.size() > 0
+	if far_placement.faces.size() >= 3:
+		var raw_a: Vector3 = far_placement.faces[0]
+		var raw_b: Vector3 = far_placement.faces[1]
+		var raw_c: Vector3 = far_placement.faces[2]
+		var raw_normal := (raw_c - raw_a).cross(raw_b - raw_a).normalized()
+		for index in far_placement.positions.size():
+			var oriented_raw_normal := raw_normal
+			if oriented_raw_normal.dot(far_placement.normals[index]) < 0.0:
+				oriented_raw_normal = -oriented_raw_normal
+			far_owner_side_valid = far_owner_side_valid \
+					and (far_placement.positions[index] - raw_a).dot(
+					oriented_raw_normal) > 0.0
+	_check(far_collected and far_placement.positions.size() > 0
+			and far_owner_side_valid
+			and far_placement.rejected_owner_backside_center_count > 0,
+			"finite far open plane keeps accepted probes in the raw owner front half-space and rejects slipped backside centers")
+	print("MAGIC_GI_FAR_OPEN_OWNER_SIDE collected=%s probes=%d rejected_backside=%d valid=%s" % [
+		str(far_collected), far_placement.positions.size(),
+		far_placement.rejected_owner_backside_center_count, str(far_owner_side_valid)])
+	far_fixture.queue_free()
+	await process_frame
+
+func _test_coplanar_crossing_topology() -> void:
+	var placement := Placement.new()
+	placement._probe_spacing = 1.0
+	var large_x := 32768.0
+	var adjacent_plane := PackedVector3Array([
+		Vector3(large_x, 0.0, 0.0), Vector3(large_x + 2.0, 0.0, 0.0),
+		Vector3(large_x + 2.0, 0.0, 2.0),
+		Vector3(large_x, 0.0, 0.0), Vector3(large_x + 2.0, 0.0, 2.0),
+		Vector3(large_x, 0.0, 2.0)])
+	var parallel_gap := 0.002
+	var parallel_planes := PackedVector3Array([
+		Vector3(large_x, 0.0, 0.0), Vector3(large_x + 2.0, 0.0, 0.0),
+		Vector3(large_x + 2.0, 0.0, 2.0),
+		Vector3(large_x, parallel_gap, 0.0),
+		Vector3(large_x + 2.0, parallel_gap, 0.0),
+		Vector3(large_x + 2.0, parallel_gap, 2.0)])
+	var shared_edge_continuation := placement._mesh_faces_share_coplanar_crossing(
+			adjacent_plane, 0, 1, Vector3(large_x + 1.0, 0.0, 1.0))
+	var distinct_parallel_continuation := placement._mesh_faces_share_coplanar_crossing(
+			parallel_planes, 0, 1, Vector3(large_x + 0.75, 0.0, 0.5))
+	var parallel_bvh := TriangleMesh.new()
+	var parallel_bvh_created: bool = parallel_bvh.create_from_faces(parallel_planes)
+	var parallel_crossings := placement._ray_crossing_count(
+			Vector3(large_x + 0.75, -0.02, 0.5), Vector3.UP, 0.05,
+			0.0000001, 0.005, parallel_bvh, parallel_planes) if parallel_bvh_created else -2
+	_check(shared_edge_continuation,
+			"coplanar triangulated faces sharing a raw edge remain a valid crossing continuation")
+	_check(not distinct_parallel_continuation,
+			"nearby parallel faces without a shared raw edge are not coplanar continuations")
+	_check(parallel_bvh_created and parallel_crossings == -1,
+			"reverse crossing verification reports a 2 mm shell inside the large-coordinate ULP advance as ambiguous")
+	print("MAGIC_GI_COPLANAR_TOPOLOGY shared_edge=%s separated_parallel=%s gap=%.4f ray_crossings=%d bvh=%s" % [
+		str(shared_edge_continuation), str(distinct_parallel_continuation),
+		parallel_gap, parallel_crossings, str(parallel_bvh_created)])
+
+func _test_corner_center_separation() -> void:
+	var fixture := Node3D.new()
+	fixture.name = "ProbeCornerFixture"
+	root.add_child(fixture)
+	var volume := Volume.new()
+	volume.size = Vector3.ONE * 4.0
+	volume.probe_spacing = 1.0
+	fixture.add_child(volume)
+	var material := _make_material(Color.WHITE)
+	var floor := MeshInstance3D.new()
+	floor.mesh = _make_triangle_surface(Vector3.ZERO, Vector3(2.2, 0.0, 0.0),
+			Vector3(0.0, 0.0, 2.2), material)
+	fixture.add_child(floor)
+	var wall := MeshInstance3D.new()
+	wall.mesh = _make_triangle_surface(Vector3.ZERO, Vector3(0.0, 0.0, 2.2),
+			Vector3(0.0, 2.2, 0.0), material)
+	fixture.add_child(wall)
+	await process_frame
+	var placement := Placement.new()
+	var collected: bool = placement.collect(volume, false)
+	var floor_normal := (floor.global_transform.basis * Vector3.UP).normalized()
+	var wall_normal := Vector3.RIGHT
+	var floor_count := 0
+	var wall_count := 0
+	var anchors_remain_on_source_planes := true
+	for index in placement.positions.size():
+		var anchor: Vector3 = placement.surface_positions[index]
+		var center: Vector3 = placement.positions[index]
+		var normal: Vector3 = placement.normals[index]
+		if normal.dot(floor_normal) > 0.95:
+			floor_count += 1
+			anchors_remain_on_source_planes = anchors_remain_on_source_planes \
+					and absf(anchor.y) < 0.0001 and (center - anchor).dot(normal) > 0.0
+		elif normal.dot(wall_normal) > 0.95:
+			wall_count += 1
+			anchors_remain_on_source_planes = anchors_remain_on_source_planes \
+					and absf(anchor.x) < 0.0001 and (center - anchor).dot(normal) > 0.0
+	var spacing_violations := _world_spacing_violation_pair_count(
+			placement.positions, volume.probe_spacing)
+	_check(collected and floor_count > 0 and wall_count > 0,
+			"perpendicular corner surfaces get independent samples where separate world cells permit them")
+	_check(anchors_remain_on_source_planes and spacing_violations == 0
+			and _world_max_occupancy(placement.positions, volume.probe_spacing) == 1
+			and placement.adjusted_center_count == 0,
+			"corner arbitration preserves source anchors and enforces one world probe per spacing cell")
+	print("MAGIC_GI_CORNER_LAYOUT floor=%d wall=%d adjusted=%d rejected_spacing_cells=%d spacing_violations=%d" % [
+		floor_count, wall_count, placement.adjusted_center_count,
+		placement.rejected_center_overlap_count, spacing_violations])
+	fixture.queue_free()
+	await process_frame
+
+func _test_world_spacing_variants() -> void:
+	_check(ProbeLayout.world_cell(Vector3(-0.001, 0.0, -1.001), 1.0)
+			== Vector3i(-1, 0, -2),
+			"world-cell occupancy uses floor from the global zero origin for negative coordinates")
+	for spacing in [0.5, 1.0, 2.0]:
+		var fixture := Node3D.new()
+		fixture.name = "WorldSpacing_%.1f" % spacing
+		fixture.position = Vector3(-2.35, -0.2, 1.1)
+		fixture.rotation = Vector3(0.23, -0.17, 0.31)
+		fixture.scale = Vector3(1.8, 0.65, 1.2)
+		root.add_child(fixture)
+		var volume := Volume.new()
+		volume.size = Vector3(8.0, 6.0, 8.0)
+		volume.probe_spacing = spacing
+		fixture.add_child(volume)
+		var plane := MeshInstance3D.new()
+		plane.name = "SpacingPlane"
+		plane.mesh = _make_horizontal_plane(8.0, 2, _make_material(Color.WHITE))
+		fixture.add_child(plane)
+		await process_frame
+		var placement := Placement.new()
+		var collected: bool = placement.collect(volume, false)
+		var occupancy := _world_cell_counts(placement.positions, spacing)
+		var crosses_zero := false
+		var has_negative_cell := false
+		var has_positive_cell := false
+		for cell_value in occupancy:
+			var cell: Vector3i = cell_value
+			if cell.x < 0 or cell.z < 0:
+				has_negative_cell = true
+			if cell.x > 0 or cell.z > 0:
+				has_positive_cell = true
+			if (cell.x < 0 and cell.z > 0) or (cell.x > 0 and cell.z < 0):
+				crosses_zero = true
+		_check(collected and placement.positions.size() > 0
+				and _world_max_occupancy(placement.positions, spacing) == 1
+				and _world_spacing_violation_pair_count(placement.positions, spacing) == 0,
+				"spacing %.1fm stays global across rotated nonuniform parent scale" % spacing)
+		_check(has_negative_cell and has_positive_cell and crosses_zero,
+				"spacing %.1fm fixture exercises world cells on both sides of zero" % spacing)
+		print("MAGIC_GI_WORLD_SPACING spacing=%.2f probes=%d world_cells=%d max_cell=%.0f violations=%d" % [
+			spacing, placement.positions.size(), occupancy.size(),
+			float(_world_max_occupancy(placement.positions, spacing)),
+			_world_spacing_violation_pair_count(placement.positions, spacing)])
+		fixture.queue_free()
+		await process_frame
+	var stable_results: Array[PackedVector3Array] = []
+	var stable_normals: Array[PackedVector3Array] = []
+	for reverse_order in [false, true]:
+		var fixture := Node3D.new()
+		fixture.name = "TraversalOrderFixture"
+		root.add_child(fixture)
+		var volume := Volume.new()
+		volume.name = "Volume"
+		volume.size = Vector3(4.0, 2.0, 4.0)
+		volume.probe_spacing = 1.0
+		fixture.add_child(volume)
+		var first := MeshInstance3D.new()
+		first.name = "SurfaceA"
+		first.mesh = _make_horizontal_plane(3.0, 2, _make_material(Color.WHITE))
+		var second := MeshInstance3D.new()
+		second.name = "SurfaceB"
+		second.mesh = _make_horizontal_plane(3.0, 2, _make_material(Color.WHITE))
+		if reverse_order:
+			fixture.add_child(second)
+			fixture.add_child(first)
+		else:
+			fixture.add_child(first)
+			fixture.add_child(second)
+		await process_frame
+		var placement := Placement.new()
+		var collected: bool = placement.collect(volume, false)
+		_check(collected and placement.positions.size() > 0
+				and _world_max_occupancy(placement.positions, 1.0) == 1
+				and _world_spacing_violation_pair_count(placement.positions, 1.0) == 0,
+				"overlapping objects collect under the shared global spacing rule")
+		stable_results.append(placement.positions.duplicate())
+		stable_normals.append(placement.normals.duplicate())
+		fixture.queue_free()
+		await process_frame
+	_check(stable_results.size() == 2 and stable_normals.size() == 2
+			and stable_results[0] == stable_results[1]
+			and stable_normals[0] == stable_normals[1],
+			"Morton arbitration and geometric/path ties are independent of node traversal order")
 
 func _find_probe(data: Resource, target: Vector3, normal: Vector3) -> int:
 	var best := -1
@@ -1574,6 +2196,33 @@ func _find_probe(data: Resource, target: Vector3, normal: Vector3) -> int:
 			distance = sample_distance
 			best = i
 	return best
+
+func _find_probe_in_surface_region(data: Resource, target: Vector3, normal: Vector3,
+		surface_y: float, minimum_x: float, maximum_x: float,
+		minimum_z := -INF, maximum_z := INF) -> int:
+	var best := -1
+	var best_distance := INF
+	for index in data.probe_count():
+		if data.normals[index].dot(normal) < 0.95:
+			continue
+		var anchor: Vector3 = data.surface_positions[index]
+		if absf(anchor.y - surface_y) > 0.02 or anchor.x < minimum_x or anchor.x > maximum_x \
+				or anchor.z < minimum_z or anchor.z > maximum_z:
+			continue
+		var distance: float = data.positions[index].distance_squared_to(target)
+		if distance < best_distance:
+			best_distance = distance
+			best = index
+	return best
+
+func _primary_sky_probe_l1(data: Resource, probe: int) -> float:
+	if probe < 0 or probe >= data.probe_count() \
+			or data.primary_sky_visibility.size() != data.probe_count() * 9:
+		return INF
+	var total := 0.0
+	for coefficient in 9:
+		total += absf(data.primary_sky_visibility[probe * 9 + coefficient])
+	return total
 
 func _check(condition: bool, label: String) -> void:
 	if condition:

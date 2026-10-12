@@ -99,20 +99,18 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.emitter_static_signatures = geometry.emitters.static_signatures
 	data.emitter_transport.resize(data.probe_count() * geometry.emitters.groups.size() * 6)
 	var qmc_dimension_count := (bounces + 1) * 2
-	var qmc_base_coordinates: Array[PackedFloat64Array] = []
-	qmc_base_coordinates.resize(qmc_dimension_count)
-	for dimension in qmc_dimension_count:
-		var coordinates := PackedFloat64Array()
-		coordinates.resize(rays)
-		for sample_index in rays:
-			coordinates[sample_index] = _qmc_base_coordinate(sample_index, rays, dimension)
-		qmc_base_coordinates[dimension] = coordinates
+	var qmc_base_coordinates := _build_qmc_base_coordinates(rays, qmc_dimension_count)
+	var minimum_visibility_rays := Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL
+	var minimum_visibility_qmc_coordinates := _build_qmc_base_coordinates(minimum_visibility_rays, 2)
+	var extra_visibility_qmc_coordinates := _build_qmc_base_coordinates(
+			visibility_rays - minimum_visibility_rays, 2)
 	for p in data.probe_count():
 		var visibility_shift_rng := RandomNumberGenerator.new()
 		visibility_shift_rng.seed = int(hash([geometry_signature, SAMPLER_REVISION, p, "visibility-moments"]))
 		var visibility_shifts := Vector2(visibility_shift_rng.randf(), visibility_shift_rng.randf())
 		if not await _bake_visibility_moments(data, geometry, p,
-				visibility_shifts, visibility_rays, volume, generation):
+				visibility_shifts, visibility_rays, minimum_visibility_qmc_coordinates,
+				extra_visibility_qmc_coordinates, volume, generation):
 			push_warning("FMagicGI: directional visibility bake did not measure every octahedral moment bin; discarded the incomplete bake.")
 			return null
 		# A per-probe Cranley-Patterson shift randomizes the low-discrepancy
@@ -129,14 +127,20 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 		emitter_shift_rng.seed = int(hash([geometry_signature, SAMPLER_REVISION, p, "emission"]))
 		for dimension in emitter_shifts.size():
 			emitter_shifts[dimension] = emitter_shift_rng.randf()
+		var probe_origin: Vector3 = data.positions[p]
+		var probe_surface_position: Vector3 = data.surface_positions[p]
+		var probe_normal: Vector3 = data.normals[p]
+		var probe_surface_offset := probe_surface_position.distance_to(probe_origin)
+		var tangent := probe_normal.cross(Vector3.UP if absf(probe_normal.y) < 0.99 else Vector3.RIGHT).normalized()
+		var bitangent := probe_normal.cross(tangent)
 		for sample_index in rays:
-			var origin := data.positions[p]
-			var vertex_position := data.surface_positions[p]
-			var vertex_normal := data.normals[p]
-			var vertex_offset := vertex_position.distance_to(data.positions[p])
-			var direction := cosine_direction(data.normals[p],
+			var origin := probe_origin
+			var vertex_position := probe_surface_position
+			var vertex_normal := probe_normal
+			var vertex_offset := probe_surface_offset
+			var direction := _cosine_direction_with_frame(probe_normal,
 				fposmod(qmc_base_coordinates[0][sample_index] + shifts[0], 1.0),
-				fposmod(qmc_base_coordinates[1][sample_index] + shifts[1], 1.0))
+				fposmod(qmc_base_coordinates[1][sample_index] + shifts[1], 1.0), tangent, bitangent)
 			var throughput := Vector3.ONE
 			for bounce in bounces + 1:
 				for emitter in geometry.emitters.groups.size():
@@ -220,7 +224,10 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 
 func _bake_visibility_moments(data: Data, geometry: Placement, probe: int,
 		shift: Vector2,
-		visibility_rays: int, volume: FMagicGIVolume, generation: int) -> bool:
+		visibility_rays: int,
+		minimum_qmc_coordinates: Array[PackedFloat64Array],
+		extra_qmc_coordinates: Array[PackedFloat64Array],
+		volume: FMagicGIVolume, generation: int) -> bool:
 	var size := Data.VISIBILITY_TILE_SIZE
 	var texel_count := Data.VISIBILITY_TEXELS_PER_PROBE
 	var minimum_bin_rays := texel_count * MIN_VISIBILITY_RAYS_PER_TEXEL
@@ -239,8 +246,8 @@ func _bake_visibility_moments(data: Data, geometry: Placement, probe: int,
 		if sample_index < minimum_bin_rays:
 			var bin_index := floori(float(sample_index) / float(MIN_VISIBILITY_RAYS_PER_TEXEL))
 			var stratum := sample_index % MIN_VISIBILITY_RAYS_PER_TEXEL
-			var jitter_x := fposmod(_qmc_base_coordinate(sample_index, minimum_bin_rays, 0) + shift.x, 1.0)
-			var jitter_y := fposmod(_qmc_base_coordinate(sample_index, minimum_bin_rays, 1) + shift.y, 1.0)
+			var jitter_x := fposmod(minimum_qmc_coordinates[0][sample_index] + shift.x, 1.0)
+			var jitter_y := fposmod(minimum_qmc_coordinates[1][sample_index] + shift.y, 1.0)
 			var sub_x := float(stratum % 2) * 0.5 + jitter_x * 0.5
 			var sub_y := float(stratum / 2) * 0.5 + jitter_y * 0.5
 			var bin_x := bin_index % size
@@ -251,9 +258,8 @@ func _bake_visibility_moments(data: Data, geometry: Placement, probe: int,
 			texel = bin_index
 		else:
 			var extra_index := sample_index - minimum_bin_rays
-			var extra_count := visibility_rays - minimum_bin_rays
-			var u := fposmod(_qmc_base_coordinate(extra_index, extra_count, 0) + shift.x, 1.0)
-			var v := fposmod(_qmc_base_coordinate(extra_index, extra_count, 1) + shift.y, 1.0)
+			var u := fposmod(extra_qmc_coordinates[0][extra_index] + shift.x, 1.0)
+			var v := fposmod(extra_qmc_coordinates[1][extra_index] + shift.y, 1.0)
 			var y := 1.0 - 2.0 * u
 			var radius := sqrt(maxf(0.0, 1.0 - y * y))
 			var phi := TAU * v
@@ -306,6 +312,18 @@ static func _qmc_base_coordinate(sample_index: int, sample_count: int, dimension
 		return (float(sample_index) + 0.5) / float(sample_count)
 	return _radical_inverse(sample_index, QMC_PRIME_BASES[dimension - 1])
 
+static func _build_qmc_base_coordinates(sample_count: int,
+		dimension_count: int) -> Array[PackedFloat64Array]:
+	var coordinates: Array[PackedFloat64Array] = []
+	coordinates.resize(dimension_count)
+	for dimension in dimension_count:
+		var values := PackedFloat64Array()
+		values.resize(sample_count)
+		for sample_index in sample_count:
+			values[sample_index] = _qmc_base_coordinate(sample_index, sample_count, dimension)
+		coordinates[dimension] = values
+	return coordinates
+
 static func _radical_inverse(index: int, base: int) -> float:
 	var result := 0.0
 	var factor := 1.0 / float(base)
@@ -320,5 +338,10 @@ static func _radical_inverse(index: int, base: int) -> float:
 static func cosine_direction(normal: Vector3, u: float, v: float) -> Vector3:
 	var tangent := normal.cross(Vector3.UP if absf(normal.y) < 0.99 else Vector3.RIGHT).normalized()
 	var bitangent := normal.cross(tangent)
+	var radius := sqrt(u)
+	return (tangent * (radius * cos(TAU * v)) + bitangent * (radius * sin(TAU * v)) + normal * sqrt(1.0 - u)).normalized()
+
+static func _cosine_direction_with_frame(normal: Vector3, u: float, v: float,
+		tangent: Vector3, bitangent: Vector3) -> Vector3:
 	var radius := sqrt(u)
 	return (tangent * (radius * cos(TAU * v)) + bitangent * (radius * sin(TAU * v)) + normal * sqrt(1.0 - u)).normalized()
