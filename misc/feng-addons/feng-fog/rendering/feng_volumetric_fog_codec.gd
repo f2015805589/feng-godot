@@ -152,14 +152,7 @@ static func normalize_screen_space_scattering(value: Variant) -> Dictionary:
 
 
 static func normalize_history_miss_count(value: int) -> int:
-	if value <= 1:
-		return 1
-	if value <= 4:
-		return 4
-	if value <= 8:
-		return 8
-	return 16
-
+	return VolumeParameters.normalize_history_miss_count(value)
 
 static func normalize_frame_inputs(value: Variant, expected_view: int = -1) -> Dictionary:
 	if not value is Dictionary or int(value.get("abi_version", 0)) != FRAME_INPUT_ABI \
@@ -249,8 +242,7 @@ static func sample_offset(frame_number: int) -> Vector3:
 ## four samples when history is unavailable or outside its valid volume.
 static func history_miss_sample_count(history_valid: bool, previous_uvz: Vector3,
 		supersample_count: int = HISTORY_MISS_SUPERSAMPLE_COUNT) -> int:
-	var quality_count := 1 if supersample_count <= 1 else 4 if supersample_count <= 4 \
-			else 8 if supersample_count <= 8 else 16
+	var quality_count := normalize_history_miss_count(supersample_count)
 	if not history_valid or not previous_uvz.is_finite() \
 			or previous_uvz.x < 0.0 or previous_uvz.y < 0.0 or previous_uvz.z < 0.0 \
 			or previous_uvz.x >= 1.0 or previous_uvz.y >= 1.0 or previous_uvz.z >= 1.0:
@@ -340,8 +332,7 @@ static func conservative_history_sample_count(history_enabled: bool,
 static func history_miss_sample_offsets(frame_number: int,
 		supersample_count: int = HISTORY_MISS_SUPERSAMPLE_COUNT,
 		jitter_enabled: bool = true) -> Array[Vector3]:
-	var count := 1 if supersample_count <= 1 else 4 if supersample_count <= 4 \
-			else 8 if supersample_count <= 8 else 16
+	var count := normalize_history_miss_count(supersample_count)
 	var result: Array[Vector3] = []
 	for sample_index in count:
 		result.append(sample_offset(frame_number - sample_index) if jitter_enabled

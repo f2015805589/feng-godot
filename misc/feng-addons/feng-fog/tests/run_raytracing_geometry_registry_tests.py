@@ -23,6 +23,10 @@ def main() -> int:
     addon_dst = project / "addons/feng-fog"
     addon_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(addon_src, addon_dst)
+    rd_helpers = project / "addons/feng-render-pipeline/rd"
+    rd_helpers.mkdir(parents=True)
+    for name in ("owned_rids.gd", "uniforms.gd"):
+        shutil.copy2(ROOT / "misc/feng-addons/feng-render-pipeline/rd" / name, rd_helpers / name)
     (project / "project.godot").write_text(
         'config_version=5\n[application]\nconfig/name="Fog RT registry CPU contract"\n',
         encoding="utf-8",

@@ -1,8 +1,5 @@
 #pragma warning disable CS0109
 using System;
-using System.Diagnostics;
-using System.Linq;
-using System.Reflection;
 using Godot;
 using Godot.Collections;
 
@@ -17,8 +14,6 @@ public partial class Terrain3DCollision : GodotObject
 	[Obsolete("Wrapper types cannot be constructed with constructors (it only instantiate the underlying Terrain3DCollision object), please use the Instantiate() method instead.")]
 	protected Terrain3DCollision() { }
 
-	private static CSharpScript _wrapperScriptAsset;
-
 	/// <summary>
 	/// Try to cast the script on the supplied <paramref name="godotObject"/> to the <see cref="Terrain3DCollision"/> wrapper type,
 	/// if no script has attached to the type, or the script attached to the type does not inherit the <see cref="Terrain3DCollision"/> wrapper type,
@@ -27,32 +22,7 @@ public partial class Terrain3DCollision : GodotObject
 	/// <remarks>The developer should only supply the <paramref name="godotObject"/> that represents the correct underlying GDExtension type.</remarks>
 	/// <param name="godotObject">The <paramref name="godotObject"/> that represents the correct underlying GDExtension type.</param>
 	/// <returns>The existing or a new instance of the <see cref="Terrain3DCollision"/> wrapper script attached to the supplied <paramref name="godotObject"/>.</returns>
-	public new static Terrain3DCollision Bind(GodotObject godotObject)
-	{
-		if (!IsInstanceValid(godotObject))
-			return null;
-
-		if (godotObject is Terrain3DCollision wrapperScriptInstance)
-			return wrapperScriptInstance;
-
-#if DEBUG
-		var expectedType = typeof(Terrain3DCollision);
-		var currentObjectClassName = godotObject.GetClass();
-		if (!ClassDB.IsParentClass(currentObjectClassName, expectedType.Name))
-			throw new InvalidOperationException($"The supplied GodotObject ({currentObjectClassName}) is not the {expectedType.Name} type.");
-#endif
-
-		if (_wrapperScriptAsset is null)
-		{
-			var scriptPathAttribute = typeof(Terrain3DCollision).GetCustomAttributes<ScriptPathAttribute>().FirstOrDefault();
-			if (scriptPathAttribute is null) throw new UnreachableException();
-			_wrapperScriptAsset = ResourceLoader.Load<CSharpScript>(scriptPathAttribute.Path);
-		}
-
-		var instanceId = godotObject.GetInstanceId();
-		godotObject.SetScript(_wrapperScriptAsset);
-		return (Terrain3DCollision)InstanceFromId(instanceId);
-	}
+	public new static Terrain3DCollision Bind(GodotObject godotObject) => NativeWrapper<Terrain3DCollision>.Bind(godotObject);
 
 	/// <summary>
 	/// Creates an instance of the GDExtension <see cref="Terrain3DCollision"/> type, and attaches a wrapper script instance to it.

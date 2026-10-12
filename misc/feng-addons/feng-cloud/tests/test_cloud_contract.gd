@@ -52,6 +52,7 @@ func _initialize() -> void:
 
 
 func run() -> void:
+	test_capture_frame_lifetime()
 	test_registry_and_material()
 	test_atmosphere_sources()
 	test_cloud_fog_view_depth()
@@ -84,6 +85,24 @@ func run() -> void:
 		gpu_done.wait()
 	print("CLOUD CONTRACT PASS" if failures == 0 else "CLOUD CONTRACT FAIL")
 	quit(0 if failures == 0 else 1)
+
+
+func test_capture_frame_lifetime() -> void:
+	var shadow := FengCloudShadowPass.new()
+	var trace := FengCloudTracePass.new()
+	var previous := {"owner": "viewport"}
+	shadow._frame_snapshot = previous
+	shadow.prepare_capture(null, {"owner": "capture"})
+	require(shadow._frame_snapshot == previous,
+		"Capture preparation must restore the viewport snapshot")
+	for cloud_pass in [shadow, trace]:
+		cloud_pass.execute_capture(FRPPassContext.new(), {"owner": "capture"})
+		require(cloud_pass._active_context == null and cloud_pass._frame_snapshot.is_empty()
+			and cloud_pass._frame_scene_data == null, "Capture execution retained frame state")
+	require(trace._frame_vrt_mode == 3, "Capture tracing must use full resolution")
+	trace.vrt_mode = 1
+	trace._frp_execute(null)
+	require(trace._frame_vrt_mode == 1, "Viewport tracing retained the capture mode")
 
 
 func test_cloud_fog_view_depth() -> void:
@@ -215,6 +234,13 @@ func test_cloud_volume_composition_revision_domains() -> void:
 	context.set_cloud_snapshot(cloud_packet, RID(), RID(), RID(), RID(),
 			RID(), RID(), native_signature)
 	var gpu := CloudGPU.new()
+	var source := {"atmosphere_snapshot": {"sun_direction": Vector3.UP}}
+	var signature: Callable = gpu._source_signature.bind(PackedFloat32Array(), [] as Array[RID], [],
+		RID(), PackedFloat32Array(), PackedFloat32Array(), 0)
+	var original: int = signature.call(source)
+	require(original == signature.call(source.duplicate(true)), "Unchanged sky packets must preserve history")
+	source["atmosphere_snapshot"]["sun_direction"] = Vector3.RIGHT
+	require(original != signature.call(source), "Sky packet changes must invalidate cloud history")
 	var native_identity: Dictionary = gpu._read_native_cloud_snapshot_signature(context)
 	require(bool(native_identity.get("valid", false))
 		and int(native_identity.get("signature", 0)) == native_signature,

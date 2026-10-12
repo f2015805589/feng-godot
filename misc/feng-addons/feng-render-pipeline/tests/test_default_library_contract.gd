@@ -147,6 +147,39 @@ func run() -> void:
 	var restored_runtime: Array = renderer._runtime_entries(schedule_callable)
 	require(_reflection_source_count(restored_runtime, &"resolve") == 1,
 			"disabling capture mode must restore the ordinary internal Resolve schedule")
+	# Scheduling preserves authored/null slots and uses the same per-renderer hidden
+	# resources across capture transitions and repeated plan compilation.
+	require(restored_runtime.has(hidden_resolve), "capture exit must reuse the hidden resolver")
+	var reflected: Array[PassBase] = [null, hidden_resolve, passes[sky]]
+	var original_reflected := reflected.duplicate()
+	var policy = load("res://addons/feng-render-pipeline/pipeline/reflection_plan.gd").new()
+	var always_enabled := func(_entry): return true
+	var fallback_priority: Array[int] = []
+	var custom_runtime: Array = policy.build(reflected, always_enabled, fallback_priority, false)
+	require(reflected == original_reflected and custom_runtime[0] == null,
+			"reflection planning must preserve authored entries and empty slots")
+	require(_reflection_source_count(custom_runtime, &"resolve") == 1,
+			"an authored resolver must suppress the hidden resolver")
+	if FileAccess.file_exists(FENG_PROBE_PASS_PATH):
+		require(custom_runtime[1].get_reflection_source_kind() == &"feng_probe"
+				and custom_runtime[2] == hidden_resolve, "hidden probe must precede an authored resolver")
+	require(policy.build(reflected, always_enabled, fallback_priority, true) == [null, passes[sky]],
+			"capture filtering must preserve unrelated authored slots")
+	var without_sky: Array[PassBase] = [null]
+	var first_plan: Array = policy.build(without_sky, always_enabled, fallback_priority, false)
+	require(first_plan[-1].get_reflection_source_kind() == &"resolve"
+			and policy.build(without_sky, always_enabled, fallback_priority, false) == first_plan,
+			"without Sky the hidden resolver belongs last and repeated builds reuse resources")
+	var wrapped := FengBuiltinPass.new()
+	wrapped.implementation = hidden_resolve
+	var wrapped_entries: Array[PassBase] = [wrapped]
+	require(_reflection_source_count(policy.build(wrapped_entries, always_enabled, fallback_priority, false), &"resolve") == 1
+			and policy.build(wrapped_entries, always_enabled, fallback_priority, true).is_empty(),
+			"reflection roles must follow a Builtin implementation, including capture filtering")
+	var disabled := func(entry): return entry != wrapped
+	var disabled_plan: Array = policy.build(wrapped_entries, disabled, fallback_priority, false)
+	require(disabled_plan.has(wrapped) and disabled_plan[-1] == first_plan[-1],
+			"disabled authored resolver retains its slot while the hidden resolver supplies work")
 	var valid_warnings: PackedStringArray = PipelineValidator.validate_schedule(
 			passes, renderer._provided_native_ids(), renderer._declared_provided_ids(), schedule_callable)
 	var has_reflection_warning := false
@@ -185,6 +218,11 @@ func run() -> void:
 		var view_priority: Array[int] = FengReflectionSettingsScript.priority_for_render_target(RID(), 19)
 		require(view_priority == reverse_priority,
 				"isolated view execution must inherit its source Resolve fallback snapshot")
+		for invalid in [[], [0, 1, 1, 3], [-1, 1, 2, 3], [0, 1, 2, 4]]:
+			FengReflectionSettingsScript.publish_legacy_fallback_priority(20, invalid)
+			require(not FengReflectionSettingsScript.is_valid_priority(invalid)
+					and FengReflectionSettingsScript.priority_for_render_target(RID(), 20) == [0, 1, 2, 3],
+					"malformed priorities must be normalized before publication")
 		require(settings.has_method("_get_configuration_warnings"),
 				"settings warnings must use Node's configuration-warning hook")
 	settings.free()

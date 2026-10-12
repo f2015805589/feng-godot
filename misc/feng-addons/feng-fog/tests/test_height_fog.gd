@@ -856,7 +856,7 @@ func test_temporal_depth_contract() -> void:
 		"RT input and borrowed uint visibility results use the same sample-major work mask and persistent atlas")
 	require(service_source.contains("if rt_enabled:")
 		and depth_light_source.contains("feng_volume_requested_sample_count")
-		and service_source.contains("_storage_buffer(17, _history_work_mask_buffer(state))")
+		and service_source.contains("storage_buffer(17, _history_work_mask_buffer(state))")
 		and service_source.contains("return mask if mask.is_valid() else _fallback_local_buffer")
 		and not service_source.contains("if not rt_enabled and requested_samples > 1"),
 		"only RT dispatches a work mask; non-RT uses inline history and still binds a valid neutral mask buffer")

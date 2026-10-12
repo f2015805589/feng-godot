@@ -12,7 +12,6 @@ extends FengVolumetricCloudPass
 		vrt_mode = next_mode
 		emit_changed()
 
-var _active_context: FRPPassContext
 var _frame_vrt_mode := 0
 
 
@@ -34,19 +33,15 @@ func get_volume_parameter_names() -> PackedStringArray:
 
 
 func _frp_execute(ctx: FRPPassContext) -> void:
-	_active_context = ctx
 	_frame_vrt_mode = _resolved_vrt_mode(ctx)
 	super._frp_execute(ctx)
-	_active_context = null
 
 
 ## Capture faces always use a full-resolution trace and do not retain temporal
 ## history between faces or capture batches.
 func execute_capture(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
-	_active_context = ctx
 	_frame_vrt_mode = 3
 	_frp_execute_with_snapshot(ctx, frozen_snapshot)
-	_active_context = null
 
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:

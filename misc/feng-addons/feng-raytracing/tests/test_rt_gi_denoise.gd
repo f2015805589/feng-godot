@@ -45,6 +45,7 @@ func run() -> void:
 		done = true
 		return
 	var state := pass_instance._create_diffuse_state(rd, SIZE)
+	check(not state.has("last_seen"), "scene_owner_tracks_history_activity")
 	var depth_values := PackedFloat32Array()
 	depth_values.resize(SIZE.x * SIZE.y)
 	depth_values.fill(0.5)
@@ -100,6 +101,7 @@ func run() -> void:
 	mse /= SIZE.x * SIZE.y
 	print("RTGI_DENOISE stats mean=", mean, " rms=", sqrt(mse), " material_leak=", leak)
 	check(absf(mean - 1.0) < 0.05 and sqrt(mse) < 0.15, "noise_reduction_preserves_mean")
+	check(not state.has("last_seen"), "resolve_keeps_activity_in_scene_owner")
 	check(leak < 0.001, "material_boundary")
 	raw.fill(Color(0, 0, 0, 1))
 	rd.texture_update(state.raw, 0, raw.get_data())

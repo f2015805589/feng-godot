@@ -29,7 +29,7 @@ layout(set = 0, binding = 24, std140) uniform ReflectionTemporal {
 	vec4 parameters; // History weight, exposure ratio, relative depth threshold, minimum normal dot.
 	vec4 thresholds; // Roughness, hit-distance, metallic and specular rejection thresholds.
 	uvec4 state; // Valid history, generation low, generation high, replacement-strength bits.
-	vec4 motion; // Camera moved; remaining components reserved.
+	vec4 reserved; // Preserve the temporal matrix offsets in the shared UBO ABI.
 	mat4 inverse_view_projection;
 	mat4 previous_view_projection;
 	mat4 view_to_world;

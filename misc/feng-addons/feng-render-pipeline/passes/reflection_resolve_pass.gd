@@ -62,18 +62,6 @@ func ensure_frp_contract() -> bool:
 	inputs = _make_inputs()
 	return true
 
-func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for index in expected.size():
-		var left := actual[index]
-		var right := expected[index]
-		if left == null or left.binding != right.binding or left.source != right.source \
-				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
-				or left.custom_name != right.custom_name:
-			return false
-	return true
-
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	if ctx != null:
 		ctx.request_reflection_components()
@@ -130,9 +118,6 @@ func _setup(rd: RenderingDevice) -> void:
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	if _frame_context == null or not _frame_context.is_reflection_components_available():
 		return
-	if not _priority_is_valid(_frame_source_priority):
-		_warn_once("Reflection Priority must contain GI, SSR, FengReflectProbe and FengSkyLight exactly once; the native result was kept.")
-		return
 	if not _shader.is_valid() or not _pipeline.is_valid() or not _sampler.is_valid() or not _empty_candidate.is_valid():
 		return
 	var size := buffers.get_internal_size()
@@ -184,19 +169,9 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	rd.compute_list_end()
 	_frame_context.mark_indirect_specular_modified(view)
 
-func _priority_is_valid(priority: Array) -> bool:
-	if priority.size() != 4:
-		return false
-	var seen := {}
-	for source in priority:
-		if source < ReflectionSource.GI or source > ReflectionSource.SKY or seen.has(source):
-			return false
-		seen[source] = true
-	return true
-
 func get_configuration_warnings() -> PackedStringArray:
 	var warnings := super.get_configuration_warnings()
-	if not _priority_is_valid(source_priority):
+	if not ReflectionSettings.is_valid_priority(source_priority):
 		warnings.append("Legacy Reflection Priority must contain GI, SSR, FengReflectProbe and FengSkyLight exactly once.")
 	return warnings
 

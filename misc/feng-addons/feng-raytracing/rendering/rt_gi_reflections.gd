@@ -217,8 +217,7 @@ func create_state(size: Vector2i) -> Dictionary:
 			"raw_virtual_hit": raw_virtual_hit,
 			"history": histories, "resources": resources,
 			"ubo": ubo, "ping": 0, "valid": false, "generation": -1, "signature": [],
-			"exposure": 1.0, "camera": Transform3D.IDENTITY, "vp": Projection.IDENTITY,
-			"last_seen": Engine.get_frames_drawn()}
+			"exposure": 1.0, "vp": Projection.IDENTITY}
 
 func _free_resources(resources: Array[RID]) -> void:
 	if rd == null:
@@ -232,10 +231,6 @@ func release_state(state: Dictionary) -> void:
 		return
 	var resources: Array[RID] = state.get("resources", [])
 	_free_resources(resources)
-
-func _camera_matches(a: Transform3D, b: Transform3D) -> bool:
-	return a.origin.distance_to(b.origin) <= 0.0001 and a.basis.x.distance_to(b.basis.x) <= 0.00001 \
-			and a.basis.y.distance_to(b.basis.y) <= 0.00001 and a.basis.z.distance_to(b.basis.z) <= 0.00001
 
 func _matrix_bytes(matrix: Projection) -> PackedByteArray:
 	var values := PackedFloat32Array()
@@ -313,8 +308,8 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 	bytes.append_array(PackedInt32Array([int(valid_history), generation & 0xffffffff,
 			generation >> 32]).to_byte_array())
 	bytes.append_array(PackedFloat32Array([clampf(replacement_strength, 0.0, 1.0)]).to_byte_array())
-	bytes.append_array(PackedFloat32Array([float(not _camera_matches(state.camera, transform)),
-			0.0, 0.0, 0.0]).to_byte_array())
+	# Reserved padding keeps the temporal matrices at their existing UBO offsets.
+	bytes.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array())
 	bytes.append_array(_matrix_bytes(inverse_vp))
 	bytes.append_array(_matrix_bytes(state.vp))
 	bytes.append_array(_matrix_bytes(Projection(transform)))
@@ -341,9 +336,7 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 	state.generation = generation
 	state.signature = signature.duplicate(true)
 	state.exposure = exposure
-	state.camera = transform
 	state.vp = vp
-	state.last_seen = Engine.get_frames_drawn()
 	return true
 
 func publish_candidate(state: Dictionary, output_rgba16f: RID, full_size: Vector2i) -> bool:

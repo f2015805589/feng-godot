@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -22,11 +23,22 @@
 using real_t = float;
 namespace godot {
 struct RID { int id = 0; bool is_valid() const { return id != 0; } };
-struct Vector2 { float x = 0, y = 0; };
+struct Vector2 {
+	float x = 0, y = 0;
+	Vector2() = default;
+	Vector2(float a, float b) : x(a), y(b) {}
+	Vector2 operator+(Vector2 v) const { return {x + v.x, y + v.y}; }
+	Vector2 operator-(Vector2 v) const { return {x - v.x, y - v.y}; }
+	Vector2 operator/(float v) const { return {x / v, y / v}; }
+};
 struct Vector3 {};
-struct Vector2i { int x, y; Vector2i(int a, int b) : x(a), y(b) {} };
+struct Vector2i { int x = 0, y = 0; Vector2i() = default; Vector2i(int a, int b) : x(a), y(b) {} };
 struct Rect2 {
 	int identity = 0;
+	Vector2 position, size;
+	Rect2() = default;
+	Rect2(Vector2 p, Vector2 s) : position(p), size(s) {}
+	Rect2 abs() const { return {{position.x + MIN(size.x, 0.f), position.y + MIN(size.y, 0.f)}, {std::abs(size.x), std::abs(size.y)}}; }
 	bool operator==(Rect2 other) const { return identity == other.identity; }
 	bool operator!=(Rect2 other) const { return !(*this == other); }
 };
@@ -64,6 +76,7 @@ struct Time {
 };
 } // namespace godot
 using namespace godot;
+namespace Math { using std::ceil; using std::floor; }
 constexpr Image::Format IDWEIGHT_IMAGE_FORMAT = Image::Format(39);
 struct GeneratedTexture {
 	int layers = 0, writes = 0;
@@ -106,6 +119,28 @@ public:
 	}
 };
 #include "terrain_3d_vt_page_pool.cpp.inc"
+class Terrain3DClipmap {
+public:
+#include "clipmap_types.inc"
+	struct { int size = 4, channels = 3; } _config;
+	std::vector<Level> _levels{1};
+	std::vector<Job> _jobs{Job(0, 0, 0, 4, 4)};
+	std::vector<uint64_t> _content_serial{0};
+	uint64_t _state_stamp = 0, _invalidation_calls = 0, _invalidated_texels = 0, _produced_texels = 0;
+	bool _has_focus = true;
+	std::vector<float> source = std::vector<float>(48, 1.f);
+	Terrain3DClipmap() { _levels[0].world_size = 4.f; _levels[0].center = {2.f, 2.f}; _levels[0].texels.resize(48); }
+	bool is_configured() const { return _config.size > 0 && !_levels.empty(); }
+	int invalidate_rect(const Rect2 &);
+	bool _produce_rect(Job &, int &);
+	// Mutable source boundary: observe every channel-texel produced by the real cursor.
+	void _fill_row(const Job &job, int channel, int y, int x0, int x1) {
+		for (int x = x0; x < x1; ++x) {
+			const int i = (y * _config.size + x) * _config.channels + channel;
+			_levels[job.level].texels.at(i) = source.at(i);
+		}
+	}
+};
 #include "methods.inc"
 // No source threads: tests drive pending/running/ready transitions under a deterministic schedule.
 Terrain3DPagePipeline::Terrain3DPagePipeline(int) {}
@@ -164,10 +199,11 @@ static void queue_lifecycle() {
 		queue.prime(requests, {});
 		assert(queue.claimable_count() == 32 && queue._entries.size() == 32);
 		queue.prime(requests, {}); assert(queue.claimable_count() == 32);
-		// Stand in for two worker claims and one completion; production erasure must
-		// account only for pending work and preserve completed payloads across moves.
-		queue._entries[0].running = true; queue._entries[0].ready = true;
-		queue._entries[1].running = true; queue._claimable_count.fetch_sub(2);
+		// Claim through production code, then stand in for one completion.
+		Pipeline::Entry claimed;
+		assert(queue._claim(claimed) && claimed.request.key == requests[0].key);
+		assert(queue._claim(claimed) && claimed.request.key == requests[1].key);
+		queue._entries[0].ready = true;
 		queue._entries[0].result.payload = Image::create_from_data(2, 2, false, Image::FORMAT_RF, {});
 		std::weak_ptr<Image> payload = queue._entries[0].result.payload.value;
 		auto changed = requests[0]; changed.rect.identity = 10;
@@ -184,12 +220,26 @@ static void queue_lifecycle() {
 		retained[0].size++; retained[1].border++; retained.push_back(retained.back());
 		queue.retain(retained);
 		assert(queue._entries.size() == 6 && queue.claimable_count() == 6);
-		assert(queue.claimable_count() == queue._count_claimable());
 		queue.retain({}); assert(queue._entries.empty() && queue.claimable_count() == 0);
 		assert(!queue.poll(requests[0], {}, result) && queue.claimable_count() == 1);
 		queue.cancel(requests[0].key); assert(queue._entries.empty() && queue.claimable_count() == 0);
 		queue.reset();
 	}
+	// Canceling and replacing a key must not inherit its old FIFO position.
+	queue.prime({requests[0], requests[1], requests[2]}, {});
+	queue.cancel(requests[0].key);
+	queue.prime({requests[0]}, {});
+	Pipeline::Entry job;
+	for (int index : {1, 2, 0}) {
+		assert(queue._claim(job) && job.request.key == requests[index].key);
+	}
+	assert(!queue._claim(job) && queue.claimable_count() == 0);
+	queue.reset();
+	// Replacements stay bounded even when no worker gets to run.
+	for (int cycle = 0; cycle < 10000; ++cycle) {
+		queue.prime({requests[0]}, {}); queue.cancel(requests[0].key);
+	}
+	assert(queue._entries.empty() && !queue._claim(job));
 	queue.set_queue_limit(1000); queue.prime(requests, {});
 	assert(queue.get_queue_limit() == 256 && queue.claimable_count() == 64);
 	queue._entries[0].running = queue._entries[0].ready = true; queue._claimable_count.fetch_sub(1);
@@ -207,7 +257,45 @@ static void queue_lifecycle() {
 	queue._drain_released(); assert(queue._released.empty());
 }
 
+static bool clipmap_invalidation() {
+	bool passed = true;
+	for (const auto &[name, prefix] : std::array<std::pair<const char *, int>, 5>{{
+			{"untouched", 0}, {"column", 1}, {"channel", 4}, {"row", 12}, {"mixed", 17}}}) {
+		Terrain3DClipmap ring;
+		int budget = prefix;
+		assert(!ring._produce_rect(ring._jobs[0], budget) && budget == 0);
+		const auto cursor = ring._jobs[0];
+		assert(cursor.cursor_y == prefix / 12 && cursor.cursor_channel == prefix % 12 / 4 && cursor.cursor_x == prefix % 4);
+		for (int channel = 0; channel < 3; ++channel) { ring.source[channel] = 10.f + channel; }
+		const int queued = ring.invalidate_rect({{0.f, 0.f}, {1.f, 1.f}});
+		assert(ring._jobs[0].cursor_y == cursor.cursor_y && ring._jobs[0].cursor_channel == cursor.cursor_channel && ring._jobs[0].cursor_x == cursor.cursor_x);
+		for (auto &job : ring._jobs) {
+			bool finished = false;
+			while (!finished) {
+				budget = 5;
+				const auto before = ring._produced_texels;
+				finished = ring._produce_rect(job, budget);
+				assert(budget >= 0 && ring._produced_texels - before == uint64_t(5 - budget));
+			}
+		}
+		const bool fresh = ring._levels[0].texels == ring.source;
+		const bool ok = fresh && queued == (prefix > 0) && ring._produced_texels == uint64_t(48 + 3 * queued);
+		std::cout << (ok ? "PASS " : "FAIL ") << "clipmap edit during " << name << " fill (fresh=" << fresh << ")\n";
+		passed &= ok;
+	}
+	Terrain3DClipmap ring;
+	int budget = 1;
+	assert(!ring._produce_rect(ring._jobs[0], budget)); // Exercise clipping beyond the full-fill shortcut.
+	for (Vector2 position : {Vector2{-1, 0}, Vector2{4, 0}, Vector2{0, -1}, Vector2{0, 4}}) {
+		assert(ring.invalidate_rect({position, {1, 1}}) == 0);
+	}
+	assert(ring.invalidate_rect({{0, 0}, {0, 1}}) == 0);
+	assert(ring._jobs.size() == 1 && ring._state_stamp == 0 && ring._content_serial[0] == 0 && ring._invalidated_texels == 0);
+	return passed;
+}
+
 int main() {
 	pool_lifecycle(); queue_lifecycle();
 	std::cout << "PASS native pool ownership, allocation and queue lifecycle (20 churn cycles)\n";
+	return clipmap_invalidation() ? 0 : 1;
 }

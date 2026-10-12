@@ -1,4 +1,4 @@
-"""Compile production pool and queue code against small engine-boundary doubles.
+"""Compile production pool, queue and clipmap code against engine-boundary doubles.
 
 Headers and complete method bodies are read from --source, never copied algorithms.
 Queue tests drive worker transitions deterministically; real worker scheduling and
@@ -24,7 +24,7 @@ def main() -> None:
     args = parser.parse_args()
     queue = (args.source / "terrain_3d_page_pipeline.cpp").read_text()
     methods = []
-    for name in ("reset", "_index_of", "_count_claimable", "_erase_at", "cancel", "discard",
+    for name in ("reset", "_index_of", "_claim", "_erase_at", "cancel", "discard",
                  "retain", "prime", "ready_keys", "poll", "_drain_released", "defer_release",
                  "flush_releases", "_defer_result_release", "_lock_queue", "_stage_release"):
         match = re.search(r"^.*Terrain3DPagePipeline::" + name + r"\(", queue, re.M)
@@ -35,8 +35,13 @@ def main() -> None:
                             ("terrain_3d_virtual_texture.cpp", "void Terrain3DVirtualTexture::protect_page("),
                             ("terrain_3d_virtual_texture.cpp", "bool Terrain3DVirtualTexture::is_page_protected(")):
         methods.append(block((args.source / file).read_text(), signature))
+    clipmap = (args.source / "terrain_3d_clipmap.cpp").read_text()
+    for signature in ("int Terrain3DClipmap::invalidate_rect(", "bool Terrain3DClipmap::_produce_rect("):
+        methods.append(block(clipmap, signature))
     with tempfile.TemporaryDirectory(prefix="feng-native-state-") as temporary:
         root = Path(temporary)
+        header = (args.source / "terrain_3d_clipmap.h").read_text()
+        (root / "clipmap_types.inc").write_text("\n".join(block(header, "struct " + name + " {") + ";" for name in ("Job", "Level")))
         for name in ("terrain_3d_vt_page_pool.h", "terrain_3d_vt_page_pool.cpp", "terrain_3d_page_pipeline.h"):
             source = (args.source / name).read_text()
             # The boundary double replaces only engine dependencies. Keep STL includes.

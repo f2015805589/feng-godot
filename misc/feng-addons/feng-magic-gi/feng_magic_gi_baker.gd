@@ -63,7 +63,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if rays < 1 or rays > 65536 or bounces < 1 or bounces > 8 or volume.bake_distance <= 0.0:
 		push_warning("FMagicGI: invalid bake sample, bounce, or distance settings.")
 		return null
-	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitter_groups.size())
+	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitters.groups.size())
 	var visibility_rays := maxi(rays,
 			Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL)
 	var total_work := geometry.positions.size() * (rays * work_per_probe_sample + visibility_rays)
@@ -95,9 +95,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.primary_sky_visibility.resize(data.probe_count() * 9)
 	data.visibility_moments.resize(data.probe_count() * Data.VISIBILITY_TEXELS_PER_PROBE
 			* Data.VISIBILITY_MOMENT_CHANNELS)
-	data.emitter_keys = geometry.emitter_keys
-	data.emitter_static_signatures = geometry.emitter_static_signatures
-	data.emitter_transport.resize(data.probe_count() * geometry.emitter_groups.size() * 6)
+	data.emitter_keys = geometry.emitters.keys
+	data.emitter_static_signatures = geometry.emitters.static_signatures
+	data.emitter_transport.resize(data.probe_count() * geometry.emitters.groups.size() * 6)
 	var qmc_dimension_count := (bounces + 1) * 2
 	var qmc_base_coordinates: Array[PackedFloat64Array] = []
 	qmc_base_coordinates.resize(qmc_dimension_count)
@@ -124,7 +124,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 		for dimension in shifts.size():
 			shifts[dimension] = shift_rng.randf()
 		var emitter_shifts := PackedFloat32Array()
-		emitter_shifts.resize((bounces + 1) * geometry.emitter_groups.size() * 3)
+		emitter_shifts.resize((bounces + 1) * geometry.emitters.groups.size() * 3)
 		var emitter_shift_rng := RandomNumberGenerator.new()
 		emitter_shift_rng.seed = int(hash([geometry_signature, SAMPLER_REVISION, p, "emission"]))
 		for dimension in emitter_shifts.size():
@@ -139,9 +139,9 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 				fposmod(qmc_base_coordinates[1][sample_index] + shifts[1], 1.0))
 			var throughput := Vector3.ONE
 			for bounce in bounces + 1:
-				for emitter in geometry.emitter_groups.size():
-					var shift_index := (bounce * geometry.emitter_groups.size() + emitter) * 3
-					var source_sample := geometry.sample_emitter_connection(emitter,
+				for emitter in geometry.emitters.groups.size():
+					var shift_index := (bounce * geometry.emitters.groups.size() + emitter) * 3
+					var source_sample := geometry.emitters.sample_connection(emitter,
 						vertex_position, vertex_normal,
 						fposmod(qmc_base_coordinates[0][sample_index] + emitter_shifts[shift_index], 1.0),
 						fposmod(qmc_base_coordinates[1][sample_index] + emitter_shifts[shift_index + 1], 1.0),
@@ -196,8 +196,8 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	# result even if the volume transform did not change.
 	var verification := Placement.new()
 	if not verification.collect(volume, true, true, true) or verification.scene_signature != geometry_signature \
-			or verification.emitter_keys != geometry.emitter_keys \
-			or verification.emitter_static_signatures != geometry.emitter_static_signatures:
+			or verification.emitters.keys != geometry.emitters.keys \
+			or verification.emitters.static_signatures != geometry.emitters.static_signatures:
 		push_warning("FMagicGI: scene geometry changed during baking; discarded stale transfer.")
 		return null
 	if not is_instance_valid(volume) or not volume.is_bake_request_current(generation) \

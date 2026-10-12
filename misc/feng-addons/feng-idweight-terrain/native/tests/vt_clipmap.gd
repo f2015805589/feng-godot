@@ -416,6 +416,24 @@ func run_never_selected_block() -> void:
 			float(override_material_density[0]), float(override_material_density[override_material_density.size() - 1]),
 			int(height_override.get("size", 0)), override_height_density.size(),
 			float(override_height_density[0]), float(override_height_density[override_height_density.size() - 1])])
+	# Reconfiguration publishes the detail arm even when no production tick can run.
+	plain.set_physics_process(false)
+	plain.vt_clipmap_detail_tile_size = 32
+	plain.vt_clipmap_detail_budget_bytes = 16 << 20
+	plain.vt_delivery_near_material = CLIPMAP
+	var material_rid := plain.material.get_material_rid()
+	for bytes in [0, 16 << 20]:
+		plain.vt_clipmap_detail_budget_bytes = bytes
+		var detail := plain.get_vt_detail_settings()
+		require(bool(detail.get("enabled", false)) == (bytes > 0), "zero detail budget disables and a restored budget re-enables the cache")
+		require(int(RenderingServer.material_get_param(material_rid, "_detail_enabled")) == int(bytes > 0), "budget change publishes the shader arm immediately")
+		if bytes == 0:
+			require(not bool(detail.get("exists", true)), "zero budget uses the normal detail teardown")
+	# Positive budgets retain the manager's 16 MiB floor, but a large tile can still
+	# make that budget insufficient for the minimum eight-slot cache.
+	plain.vt_clipmap_detail_tile_size = 1024
+	require(not bool(plain.get_vt_detail_settings().get("enabled", true)), "insufficient positive budget disables detail")
+	require(int(RenderingServer.material_get_param(material_rid, "_detail_enabled")) == 0, "insufficient budget clears the previous enabled shader arm")
 	run_clipmap_shape_serialization_block()
 	print("VT_CLIPMAP_NEVER_SELECTED configured=%s levels=%s service=%s produced=%d" % [
 		str(entry.get("configured", "?")), str(entry.get("units", "none")),

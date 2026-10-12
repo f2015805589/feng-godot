@@ -345,6 +345,7 @@ func _ensure_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice,
 		return state
 	if not state.is_empty():
 		_free_state(state, rd)
+		_states.erase(key)
 	var textures: Array = [[], []]
 	var mip_views: Array = [[], []]
 	var depth_histories: Array = [[], []]
@@ -377,62 +378,22 @@ func _ensure_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice,
 		downsample_mip_views.append(downsample_chain.views)
 		blur_textures.append(blur_chain.texture)
 		blur_mip_views.append(blur_chain.views)
-	var ubos: Array[RID] = []
-	var analytic_ubos: Array[RID] = []
-	var atmosphere_ubos: Array[RID] = []
-	var cloud_visibility_ubos: Array[RID] = []
-	var upsample_ubos: Array[RID] = []
+	var uniform_buffers: Dictionary = {}
+	var uniform_sizes := {
+		"frame_ubos": FRAME_BYTES, "analytic_ubos": ANALYTIC_BYTES,
+		"atmosphere_ubos": ATMOSPHERE_BYTES,
+		"cloud_visibility_ubos": CLOUD_VISIBILITY_BYTES, "upsample_ubos": 16,
+	}
+	for name in uniform_sizes:
+		uniform_buffers[name] = []
 	for _view in view_count:
-		var ubo := rd.uniform_buffer_create(FRAME_BYTES)
-		if not ubo.is_valid():
-			_free_rids(allocated, rd)
-			_free_rids(ubos, rd)
-			_free_rids(analytic_ubos, rd)
-			_free_rids(atmosphere_ubos, rd)
-			_free_rids(cloud_visibility_ubos, rd)
-			_free_rids(upsample_ubos, rd)
-			return {}
-		ubos.append(ubo)
-		var analytic_ubo := rd.uniform_buffer_create(ANALYTIC_BYTES)
-		if not analytic_ubo.is_valid():
-			_free_rids(allocated, rd)
-			_free_rids(ubos, rd)
-			_free_rids(analytic_ubos, rd)
-			_free_rids(atmosphere_ubos, rd)
-			_free_rids(cloud_visibility_ubos, rd)
-			_free_rids(upsample_ubos, rd)
-			return {}
-		analytic_ubos.append(analytic_ubo)
-		var atmosphere_ubo := rd.uniform_buffer_create(ATMOSPHERE_BYTES)
-		if not atmosphere_ubo.is_valid():
-			_free_rids(allocated, rd)
-			_free_rids(ubos, rd)
-			_free_rids(analytic_ubos, rd)
-			_free_rids(atmosphere_ubos, rd)
-			_free_rids(cloud_visibility_ubos, rd)
-			_free_rids(upsample_ubos, rd)
-			return {}
-		atmosphere_ubos.append(atmosphere_ubo)
-		var cloud_visibility_ubo := rd.uniform_buffer_create(CLOUD_VISIBILITY_BYTES)
-		if not cloud_visibility_ubo.is_valid():
-			_free_rids(allocated, rd)
-			_free_rids(ubos, rd)
-			_free_rids(analytic_ubos, rd)
-			_free_rids(atmosphere_ubos, rd)
-			_free_rids(cloud_visibility_ubos, rd)
-			_free_rids(upsample_ubos, rd)
-			return {}
-		cloud_visibility_ubos.append(cloud_visibility_ubo)
-		var upsample_ubo := rd.uniform_buffer_create(16)
-		if not upsample_ubo.is_valid():
-			_free_rids(allocated, rd)
-			_free_rids(ubos, rd)
-			_free_rids(analytic_ubos, rd)
-			_free_rids(atmosphere_ubos, rd)
-			_free_rids(cloud_visibility_ubos, rd)
-			_free_rids(upsample_ubos, rd)
-			return {}
-		upsample_ubos.append(upsample_ubo)
+		for name in uniform_sizes:
+			var ubo := rd.uniform_buffer_create(uniform_sizes[name])
+			if not ubo.is_valid():
+				_free_rids(allocated, rd)
+				return {}
+			allocated.append(ubo)
+			uniform_buffers[name].append(ubo)
 	state = {
 		"weak_buffers": weakref(buffers), "size": size, "view_count": view_count,
 		"mip_count": mip_count, "textures": textures, "mip_views": mip_views,
@@ -440,15 +401,12 @@ func _ensure_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice,
 		"downsample_textures": downsample_textures,
 		"downsample_mip_views": downsample_mip_views,
 		"blur_textures": blur_textures, "blur_mip_views": blur_mip_views,
-		"frame_ubos": ubos, "analytic_ubos": analytic_ubos,
-		"atmosphere_ubos": atmosphere_ubos,
-		"cloud_visibility_ubos": cloud_visibility_ubos,
-		"upsample_ubos": upsample_ubos,
 		"history_index": 0, "history_valid": false,
 		"previous_exposures": PackedFloat32Array(), "last_frame_generation": -1,
 		"camera_generation": -1, "environment_id": -1, "render_target_id": -1,
 		"signature": "", "eye_offsets": [], "projection_unjittered": Projection.IDENTITY,
 	}
+	state.merge(uniform_buffers)
 	state.previous_exposures.resize(view_count)
 	for view in view_count:
 		state.previous_exposures[view] = 1.0

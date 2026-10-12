@@ -71,7 +71,7 @@ UE's optional experimental 2D FSSS controls are published separately under
 `screen_space_scattering`, with UE defaults (disabled, scale 1, power 1, spread
 0.1, blur 0.5). They stay separate from the 3D volume parameters.
 
-The FRP addon now consumes the separate 3D packet through an addon-owned
+The FRP addon consumes the separate 3D packet through an addon-owned
 froxel renderer and publishes an integrated volume texture for opaque, cloud,
 and transparent composition. `FengVolumetricFogVolume` contributes local
 declared media independently of `WorldEnvironment`. Each local-medium dispatch
@@ -122,21 +122,11 @@ static-direct Sun remains suppressed when static scattering intensity is zero;
 the baked static contribution is then zero instead of being reclassified as a
 movable source. Missing or mismatched keys keep the live Sun and use neutral
 shadow. The tetrahedral LightmapGI probe adapter and UE-brick source are never
-added together. A fixed D3D12 fixture has exercised the main Set 5 consumer
-through `FengHeightFog`: 16 numeric paths and the disabled-resource cleanup
-case passed. This verifies that fixture and its decoded payload, not every
-imported asset or full UE parity. The tetrahedral LightmapGI probe adapter has
-not had an end-to-end GPU run; its headless storage roundtrip is skipped.
+added together.
 
 Rect area lights use the renderer area-source atlas and an addon area-light
-integral. A fixed D3D12 advanced-light fixture completed 20 finite captures.
-Its Spot half-angle case used a 45-degree authored angle, a 35.60-degree
-receiver direction, and `tan_half_spot_angle = 1`; the corrected cookie UV was
-inside the projection, unlike the old half-angle UV. The measured gray-cookie
-response was approximately 0.498 of the no-cookie response. This bounded
-fixture used the complete raster shadow fallback because that D3D12 device did
-not expose the required ray-tracing pipeline and device-address features; it
-does not validate hardware RT.
+integral. See [lighting providers](rendering/lighting/README.md) for the source,
+coordinate, and exposure contracts; validation is summarized below.
 
 FSSS is a separate 2D GPU path with source-energy separation, temporal history,
 and mip filtering. It remains opt-in and is not part of the 3D medium packet.
@@ -150,7 +140,7 @@ and mip filtering. It remains opt-in and is not part of the 3D medium packet.
 | Local box, ellipsoid, cylinder, cone, world media, and density textures | Implemented with ordered 16-volume batches and linear albedo clamping | Core fixture exercised 17 media in two batches (16 + 1), including an independent emissive marker at zero density; output was finite |
 | Conservative current depth | Per-tile conservative depth and current-depth rejection | Core fixture covered fully occluded, moved-occluder/disocclusion, and zero-depth sky cases with finite output |
 | Screen-space FSSS | Independent opt-in 2D path with separated source energy and mip filtering | Core fixture read an unsaturated HDR source (max 3.0) and the zero-fog W=0 no-write case |
-| Rect, Spot, and other advanced light extensions | Rect irradiance, optional source atlas, barn doors, Spot mapping, cookies, and capsule extensions are implemented | Fixed D3D12 fixture completed 20 finite captures; the Spot half-angle/cookie case passed with the corrected 45-degree mapping. This run used raster fallback for shadows; it is not hardware RT evidence |
+| Rect, Spot, and other advanced light extensions | Rect irradiance, optional source atlas, barn doors, Spot mapping, cookies, and capsule extensions are implemented | Fixed D3D12 fixture completed 20 finite captures; the Spot half-angle/cookie case passed with the corrected 45-degree mapping. The 35.60-degree receiver fell inside the corrected Spot cookie projection (`tan_half_spot_angle = 1`); gray-cookie response was about 0.498 of the untextured response. This run used raster shadows, not hardware RT |
 | Sky SH and baked GI | Explicit FengSky source, tetrahedral LightmapGI probes, and a separate UE-style VLM brick Set 5 consumer are implemented | VLM main consumer passed 16 numeric paths plus disabled cleanup on a fixed D3D12 fixture; tetrahedral LightmapGI GPU path remains unverified |
 | Hardware ray-traced shadows | Optional Vulkan provider; see the [ray-tracing guide](rendering/raytracing/README.md) for device requirements, raster fallback, and caster limits | Provider and FRP integration coverage are recorded in that guide |
 | Cloud and transparent composition | Shared integrated volume sampling and delayed composition | Core D3D12 fixture used a real cloud sidecar plus transparent/refraction content; sidecar radiance/transmittance were non-neutral and reported closure error 1.1162 |
@@ -162,11 +152,11 @@ record is under `evidence\gpu_cloud_visible_20261009_01`; stdout SHA-256 is
 empty stderr. The VLM consumer run used source manifest
 `354daf180bf88c9929cdca4c425cd4cdd8d9d5306a8b182e4202051c76edd16d`.
 
-The LightmapGI probe adapter does not reproduce UE's native volumetric-lightmap
-bricks. The decoded-brick importer supports UE-style runtime sampling but does
-not read `.uasset` files or run a Lightmass/VLM bake. Stereo has CPU contracts
-only; no XR hardware run is recorded. Fixed fixtures describe their named
-sources and projects, not pixel identity across arbitrary projects.
+Validation applies to the named fixtures, not pixel identity across arbitrary
+projects. The LightmapGI probe adapter's end-to-end GPU path remains unverified
+and its headless storage roundtrip is skipped. Stereo has CPU contracts only;
+no XR hardware run is recorded. The decoded-brick importer does not run a
+Lightmass/VLM bake.
 
 Other unsupported height-fog features are fog cubemaps, nonzero EndDistance,
 SkyLight-capture contribution and dual-sun lobes.

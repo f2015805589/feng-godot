@@ -136,10 +136,7 @@ static func _validate_reflection_resolve_order(passes: Array, is_entry_enabled_f
 			sky_index = index
 		if not is_entry_enabled_fn.call(pass_entry):
 			continue
-		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-		if source_pass == null or not source_pass.has_method("get_reflection_source_kind"):
-			continue
-		var kind := StringName(source_pass.call("get_reflection_source_kind"))
+		var kind: StringName = pass_entry.get_parameter_source().get_reflection_source_kind()
 		if kind == &"resolve":
 			resolve_positions.append(index)
 		elif source_positions.has(kind):

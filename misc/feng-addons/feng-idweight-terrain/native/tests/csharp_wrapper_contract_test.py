@@ -21,13 +21,14 @@ def body(path: Path) -> str:
 
 class WrapperContractTests(unittest.TestCase):
     def test_bind_checks_actual_class_against_expected_parent(self):
+        binding = body(CSHARP / "NativeWrapper.cs")
+        self.assertIn("ClassDB.IsParentClass(currentObjectClassName, expectedType.Name)", binding)
+        self.assertNotIn("ClassDB.IsParentClass(expectedType.Name, currentObjectClassName)", binding)
         wrappers = list(CSHARP.glob("Terrain3D*.cs"))
         self.assertEqual(len(wrappers), 11)
         for wrapper in wrappers:
             with self.subTest(wrapper=wrapper.name):
-                source = body(wrapper)
-                self.assertIn("ClassDB.IsParentClass(currentObjectClassName, expectedType.Name)", source)
-                self.assertNotIn("ClassDB.IsParentClass(expectedType.Name, currentObjectClassName)", source)
+                self.assertIn(f"Bind(GodotObject godotObject) => NativeWrapper<{wrapper.stem}>.Bind(godotObject);", body(wrapper))
 
     def test_omitted_transform_preserves_native_identity(self):
         source = body(CSHARP / "Terrain3DInstancer.cs")

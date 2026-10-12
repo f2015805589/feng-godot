@@ -166,7 +166,7 @@ Terrain3DPagePipeline::Terrain3DPagePipeline(const int p_workers) {
 	for (int i = 0; i < workers; ++i) { _workers.emplace_back(&Terrain3DPagePipeline::run, this); }
 }
 Terrain3DPagePipeline::~Terrain3DPagePipeline() {
-	{ std::lock_guard<std::mutex> lock(_mutex); _stop = true; _entries.clear(); _claim_order.clear(); _claim_head = 0; _claimable_count.store(0, std::memory_order_relaxed); _task = {}; }
+	{ std::lock_guard<std::mutex> lock(_mutex); _stop = true; _entries.clear(); _claimable_count.store(0, std::memory_order_relaxed); _task = {}; }
 	_wake.notify_all(); _task_wake.notify_one();
 	for (std::thread &worker : _workers) { if (worker.joinable()) { worker.join(); } }
 	if (_planner.joinable()) { _planner.join(); }
@@ -177,8 +177,6 @@ void Terrain3DPagePipeline::reset() {
 	// prepared images go the same way rather than being destroyed inside the queue's lock.
 	for (Entry &entry : _entries) { _defer_result_release(entry.result); }
 	_entries.clear();
-	_claim_order.clear();
-	_claim_head = 0;
 	_claimable_count.store(0, std::memory_order_relaxed);
 	_task = {};
 }
@@ -228,12 +226,16 @@ int Terrain3DPagePipeline::_index_of(const Key &p_key) const {
 	}
 	return -1;
 }
-int Terrain3DPagePipeline::_count_claimable() const {
-	int count = 0;
-	for (const Entry &entry : _entries) {
-		if (!entry.running && !entry.ready) { ++count; }
+bool Terrain3DPagePipeline::_claim(Entry &r_job) {
+	Entry *oldest = nullptr;
+	for (Entry &entry : _entries) {
+		if (!entry.running && !entry.ready && (!oldest || entry.token < oldest->token)) { oldest = &entry; }
 	}
-	return count;
+	if (!oldest) { return false; }
+	oldest->running = true;
+	r_job = *oldest;
+	_claimable_count.fetch_sub(1, std::memory_order_relaxed);
+	return true;
 }
 void Terrain3DPagePipeline::_erase_at(int p_index) {
 	Entry &entry = _entries[size_t(p_index)];
@@ -305,7 +307,6 @@ void Terrain3DPagePipeline::prime(const std::vector<Request> &requests, std::sha
 			if (int(_entries.size()) >= _queue_limit.load(std::memory_order_relaxed)) { break; }
 			const uint64_t token = ++_token;
 			_entries.push_back(Entry{request, source, {}, token});
-			_claim_order.push_back(request.key);
 			++inserted;
 		}
 		if (inserted > 0) { _claimable_count.fetch_add(inserted, std::memory_order_relaxed); }
@@ -356,7 +357,6 @@ bool Terrain3DPagePipeline::poll(const Request &request, std::shared_ptr<const S
 	if (int(_entries.size()) < _queue_limit.load(std::memory_order_relaxed)) {
 		const uint64_t token = ++_token;
 		_entries.push_back(Entry{request, std::move(source), {}, token});
-		_claim_order.push_back(request.key);
 		_claimable_count.fetch_add(1, std::memory_order_relaxed);
 		if (_waiters > 0) { _pending_wakes.fetch_add(1, std::memory_order_relaxed); }
 	}
@@ -413,35 +413,16 @@ void Terrain3DPagePipeline::run() {
 	for (;;) {
 		_drain_released();
 		Entry job;
-		bool claimed = false;
 		{
 			std::unique_lock<std::mutex> lock(_mutex);
 			++_waiters;
 			_wake.wait(lock, [&]() { return _stop || _claimable_count.load(std::memory_order_relaxed) > 0; });
 			--_waiters;
 			if (_stop) { return; }
-			// Submission priority, independent of virtual address: the tokens ascend with
-			// insertion, so the unclaimed keys are in submission order. A key whose entry was
-			// erased before it was claimed, or whose entry a worker already has, is skipped. Once
-			// the finished prefix is long enough to be worth moving, it is dropped.
-			while (_claim_head < _claim_order.size()) {
-				const Key key = _claim_order[_claim_head++];
-				const int index = _index_of(key);
-				if (index < 0 || _entries[size_t(index)].running || _entries[size_t(index)].ready) { continue; }
-				_entries[size_t(index)].running = true;
-				job = _entries[size_t(index)];
-				_claimable_count.fetch_sub(1, std::memory_order_relaxed);
-				claimed = true;
-				break;
-			}
-			if (_claim_head >= 64) {
-				_claim_order.erase(_claim_order.begin(), _claim_order.begin() + int64_t(_claim_head));
-				_claim_head = 0;
-			}
-			if (!claimed) {
-				// Nothing was claimable after all: repair the count from the queue so the wait
-				// cannot spin on a number that does not match it.
-				_claimable_count.store(_count_claimable(), std::memory_order_relaxed);
+			// Tokens keep submission order despite swap-erasure and same-key replacement.
+			// Scan only live entries, so canceled history cannot grow a second queue.
+			if (!_claim(job)) {
+				_claimable_count.store(0, std::memory_order_relaxed);
 				continue;
 			}
 		}

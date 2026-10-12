@@ -115,34 +115,8 @@ int Terrain3DClipmapAtlas::get_cell_index(const int p_ring, const int p_gx, cons
 	return p_ring * 9 + (p_gy + 1) * 3 + (p_gx + 1);
 }
 
-// ---- Layout ------------------------------------------------------------------------------------
-//
-// Both schemes pack the same multiset of power-of-two squares: the rings' blocks, one spare a ring,
-// and the global block. They differ in how a block's size and its ring decide where it goes, and the
-// report publishes both with their bounding boxes so "the smallest area" is a comparison.
-//
-// The width is the one free variable, so each scheme searches it: the packer is run for every
-// candidate width from the largest block up to eight times it, and the run with the smallest
-// bounding area wins. That search *is* the "how do we place these to occupy the least area" answer.
-// ---- The quadtree arrangement -------------------------------------------------------------------
-//
-// A power-of-two root that is recursively subdivided, with each block placed by descending-size
-// insertion into the smallest free node that holds it. This is the arrangement the user asked for
-// ("the atlas should look like the quadtree"): same-sized blocks end up clustered in the same subtree,
-// a node that has been split is visible as the nested border its children sit in, and the picture is
-// one of nested squares rather than of shelf rows.
-//
-// It is also the arrangement the layer's own structure wants. A unit is a 3x3 arrangement of its own
-// blocks, so the whole atlas is a set of equal-sized squares: a recursive allocator places one unit's
-// nine blocks in one subtree and the next unit's in the next free node, which is the nesting the
-// *world* arrangement has. The shelf packer remains implemented because the task asks for the
-// comparison, and `get_layout_report()` publishes every scheme's bounding box and efficiency, so the
-// choice is a measurement rather than a preference.
-//
-// The root is a power-of-two *rectangle* rather than a square only because a square root would waste
-// more: a root that holds the content at 62% is better than the smallest square, which halves it.
-// Both sides are powers of two, so every split is exact and every rect is placed at a power-of-two
-// offset of its own size.
+// Pack power-of-two blocks into best-fit free rectangles, subdividing until each
+// block fits. Layout selection compares shelf, ring-band and quadtree bounds.
 bool Terrain3DClipmapAtlas::_pack_quadtree(const std::vector<PackedItem> &p_items, const int p_width,
 		const int p_height, std::vector<Rect2i> &r_rects) const {
 	struct Node {
@@ -867,9 +841,7 @@ int Terrain3DClipmapAtlas::_find_slot(const int p_ring, const int64_t p_block_x,
 	return -1;
 }
 
-// A slot of the right ring that no cell claims. The spares are the reason a replacement can be
-// started *before* the block it replaces is released - the arrangement the user asked for, and the
-// one that has no frame in which a cell holds nothing.
+// Reuse an unclaimed slot in this ring, preferring regular slots over spares.
 int Terrain3DClipmapAtlas::_take_free_slot(const int p_ring) {
 	for (size_t index = 0; index < _slots.size(); index++) {
 		Slot &slot = _slots[index];
@@ -903,10 +875,7 @@ void Terrain3DClipmapAtlas::_queue_block(const int p_cell, const int p_slot) {
 	cell.current = false;
 }
 
-// The relabelling of one ring. Every cell of the ring wants the block its neighbour inward held, so
-// a slot that already holds that coordinate is *reassigned* rather than re-produced; only the row
-// and column that entered at the edge have no predecessor, and those are the jobs. That is the
-// whole of "only the edge data reloads", and the counters below are its evidence.
+// Reassign matching resident blocks to the moved grid before queuing new edges.
 void Terrain3DClipmapAtlas::_relabel_ring(const int p_ring, const bool p_first) {
 	const Vector2 start = _ring_start(p_ring, _last_focus);
 	const real_t block_world = _block_world_of_ring(p_ring);

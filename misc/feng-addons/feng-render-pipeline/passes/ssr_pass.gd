@@ -106,29 +106,6 @@ func ensure_frp_contract() -> bool:
 	needs_motion_vectors = true
 	return changed
 
-func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.binding != right.binding or left.source != right.source \
-				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
-				or left.custom_name != right.custom_name:
-			return false
-	return true
-
-func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.name != right.name or left.data_format != right.data_format \
-				or left.usage != right.usage or left.scale != right.scale:
-			return false
-	return true
-
 func get_required_before_native_ids() -> PackedInt32Array:
 	return PackedInt32Array([NativeSpec.PASS_SKY, NativeSpec.PASS_TRANSPARENT,
 			NativeSpec.PASS_TEMPORAL_AA, NativeSpec.PASS_BLOOM, NativeSpec.PASS_POST_PROCESS])
@@ -171,19 +148,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	if rd == null or buffers == null:
 		_frame_enabled = false
 		return
-	if not ctx.has_method("is_reflection_components_available"):
-		_clear_outputs(rd, buffers)
-		_invalidate_buffer_history(buffers)
-		_report("SSR reflection resolver availability API is unavailable.")
-		_frame_enabled = false
-		return
-	if not ctx.has_method("publish_reflection_candidate"):
-		_clear_outputs(rd, buffers)
-		_invalidate_buffer_history(buffers)
-		_report("SSR reflection candidate publication API is unavailable.")
-		_frame_enabled = false
-		return
-	if not bool(ctx.call("is_reflection_components_available")):
+	if not ctx.is_reflection_components_available():
 		_clear_outputs(rd, buffers)
 		_invalidate_buffer_history(buffers)
 		_frame_enabled = false
@@ -413,7 +378,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	rd.compute_list_bind_uniform_set(list, upsample_set, 0)
 	rd.compute_list_dispatch(list, ceili(float(size.x) / WORKGROUP_SIZE), ceili(float(size.y) / WORKGROUP_SIZE), 1)
 	rd.compute_list_end()
-	_frame_context.call("publish_reflection_candidate", &"ssr", output_slice, view)
+	_frame_context.publish_reflection_candidate(&"ssr", output_slice, view)
 	state["read_index"] = write_index
 	state["valid"] = true
 	state["generation"] = generation

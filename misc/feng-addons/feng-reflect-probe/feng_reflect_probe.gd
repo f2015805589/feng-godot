@@ -76,7 +76,6 @@ const CUBE_UPS := [Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, -1),
 		update_mode = value
 		if value == UpdateMode.REALTIME:
 			_next_realtime_capture_msec = 0
-		_initial_capture_requested = false
 		_mark_gizmo_dirty()
 		if value != UpdateMode.MANUAL and is_inside_tree() and source_mode == SourceMode.SCENE_CAPTURE:
 			_request_automatic_scene_capture()
@@ -165,9 +164,6 @@ var _source_revision := 1
 var _world_id := 0
 var _capture_viewport: SubViewport
 var _capture_camera: Camera3D
-var _capture_compositor: Compositor
-var _capture_renderer: Resource
-var _capture_copy_pass: FengReflectProbeCapturePass
 var _capture_target := RID()
 var _registered_targets: Array[RID] = []
 var _capture_active := false
@@ -182,11 +178,9 @@ var _batch_capture_origin := Vector3.ZERO
 var _batch_capture_basis := Basis.IDENTITY
 var _batch_probe_snapshot: Dictionary = {}
 var _bake_requested := false
-var _initial_capture_requested := false
 var _next_realtime_capture_msec := 0
 var _published_external_revision := -1
 var _metadata_signature: Dictionary = {}
-var _last_status_error := ""
 var _connected_radiance: Cubemap
 
 func _init() -> void:
@@ -288,8 +282,6 @@ func request_update() -> void:
 	_batch_capture_basis = _batch_probe_snapshot.get("source_basis", global_transform.basis.orthonormalized())
 	_capture_active = true
 	_task_pending = false
-	_initial_capture_requested = true
-	_last_status_error = ""
 	Runtime.publish_capture_status(_owner_id, {"batch_id": _capture_batch,
 			"completed_step": -1, "complete": false, "error": ""})
 	_schedule_capture_step()
@@ -363,11 +355,7 @@ func _poll_capture_step() -> void:
 	if not _capture_active or not _task_pending:
 		return
 	if Time.get_ticks_msec() - _task_started_msec > 15000:
-		var message := "The private reflection capture pass did not complete its scheduled frame."
-		Runtime.complete_capture_step(_owner_id, _capture_batch, _capture_step, {"error": message})
-		_last_status_error = message
-		_finish_capture(false)
-		capture_failed.emit(message)
+		_fail_capture("The private reflection capture pass did not complete its scheduled frame.")
 		return
 	var status := Runtime.capture_status_for_owner(_owner_id)
 	if int(status.get("batch_id", -1)) != _capture_batch \
@@ -376,9 +364,7 @@ func _poll_capture_step() -> void:
 	_task_pending = false
 	var error := String(status.get("error", ""))
 	if not error.is_empty():
-		_last_status_error = error
-		_finish_capture(false)
-		capture_failed.emit(error)
+		_fail_capture(error)
 		return
 	if bool(status.get("complete", false)):
 		_finish_capture(true)
@@ -408,9 +394,8 @@ func _finish_capture(success: bool) -> void:
 			_next_realtime_capture_msec = Time.get_ticks_msec() + int(realtime_interval * 1000.0)
 
 func _fail_capture(message: String) -> void:
-	_last_status_error = message
-	Runtime.publish_capture_status(_owner_id, {"batch_id": _capture_batch,
-			"completed_step": _capture_step, "complete": false, "error": message})
+	Runtime.complete_capture_step(_owner_id, _capture_batch, _capture_step,
+			{"complete": false, "error": message})
 	_finish_capture(false)
 	capture_failed.emit(message)
 
@@ -518,9 +503,6 @@ func _ensure_capture_rig() -> bool:
 	camera.current = true
 	_capture_viewport = viewport
 	_capture_camera = camera
-	_capture_compositor = compositor
-	_capture_renderer = renderer
-	_capture_copy_pass = capture_pass
 	_capture_target = RenderingServer.viewport_get_render_target(viewport.get_viewport_rid())
 	SnapshotWorlds.register_viewport(viewport, self)
 	return _capture_target.is_valid()
@@ -646,15 +628,7 @@ func _make_probe_snapshot() -> Dictionary:
 func _refresh_probe_routes() -> void:
 	if _owner_id <= 0:
 		return
-	if not enabled:
-		Runtime.remove_probe_targets(_registered_targets, _owner_id)
-		Runtime.remove_external_source(_owner_id)
-		_published_external_revision = -1
-		_registered_targets.clear()
-		_metadata_signature.clear()
-		return
-	var world := get_world_3d()
-	if world == null:
+	if not enabled or get_world_3d() == null:
 		Runtime.remove_probe_targets(_registered_targets, _owner_id)
 		Runtime.remove_external_source(_owner_id)
 		_published_external_revision = -1
@@ -798,15 +772,10 @@ func _mark_gizmo_dirty() -> void:
 		update_configuration_warnings()
 
 func _cancel_capture() -> void:
-	_capture_active = false
-	_task_pending = false
 	_capture_batch += 1 # Invalidates any already queued RD work or async bake callback.
+	_finish_capture(false)
 	_bake_requested = false
 	_batch_probe_snapshot.clear()
-	if _capture_target.is_valid():
-		Runtime.remove_capture_target(_capture_target, _owner_id)
-	if _capture_viewport != null and is_instance_valid(_capture_viewport):
-		_capture_viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
 	if _owner_id > 0:
 		Runtime.remove_capture_owner(_owner_id)
 
@@ -821,7 +790,4 @@ func _remove_capture_rig() -> void:
 		_capture_viewport.queue_free()
 	_capture_viewport = null
 	_capture_camera = null
-	_capture_compositor = null
-	_capture_renderer = null
-	_capture_copy_pass = null
 	_capture_target = RID()

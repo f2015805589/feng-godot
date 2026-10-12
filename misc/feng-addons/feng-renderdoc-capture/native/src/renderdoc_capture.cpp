@@ -126,10 +126,6 @@ bool RenderDocCapture::trigger_capture() {
 	return true;
 }
 
-// Renders one frame here and captures exactly that frame. Waiting for "the next presented
-// frame" instead can land on a UI-only update: the editor stops rendering unchanged
-// viewports while idle, and such a capture holds a handful of commands and none of the
-// scene passes, which is useless for inspecting the render pipeline.
 String RenderDocCapture::capture_frame(int p_window_id) {
 	RENDERDOC_API_1_6_0 *api = acquire_api();
 	DisplayServer *display = DisplayServer::get_singleton();

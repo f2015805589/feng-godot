@@ -145,7 +145,6 @@ func _execute_hdr_exposure_history_test() -> void:
 		state.generation = 1
 		state.signature = ["hdr-exposure-test"]
 		state.exposure = 1.0
-		state.camera = Transform3D.IDENTITY
 		var frame := {"camera_transform": Transform3D.IDENTITY, "pre_exposure": 2.0,
 				"scene_normalization": 1.0, "camera_cut": false}
 		success = backend.resolve(state, sampler, frame, [depth, normal, albedo, orm, emission], 2,

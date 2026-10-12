@@ -17,13 +17,21 @@ light inputs can come from the atmosphere or be selected on the cloud
 component. Without an atmosphere source, the component uses its authored planet
 fallback. There is no `WorldEnvironment` fallback. Sky owns the normalized optics, sun
 transport and LUT leases in this snapshot; cloud adds its own light overrides
-and rendering controls. An explicit inactive source falls back to exact transport
+and rendering controls. Cache keys use that same atmosphere packet rather than
+keeping a second signature payload. An explicit inactive source falls back to exact transport
 when its shader tables no longer match its current settings. Only the FRP
 renderer runs the cloud passes.
 
 Cloud-shadow casting and Sky AO are opt-in and off by default. SkyLight scene
 captures trace at full resolution without temporal history. Their cloud, sky,
-and lighting inputs are frozen for each six-face capture batch.
+and lighting inputs are frozen for each six-face capture batch. The shared cloud
+pass owns frame-state setup and cleanup for both viewport and capture execution;
+preparing capture metadata leaves the viewport snapshot unchanged.
+Custom cloud passes should call the shared `_frp_execute_with_snapshot()` path
+instead of managing `_active_context` themselves. Override `_render()` for GPU
+work; the context and frozen snapshot are valid only during execution. For
+capture preparation, use `prepare_capture()` instead of the private
+`_frp_prepare_with_snapshot()` helper.
 
 For transparent surfaces that should receive cloud depth-aware transport, use a
 `BaseMaterial3D`, enable transparency, and turn on **Cloud Fogging**. This

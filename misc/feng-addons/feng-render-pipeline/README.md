@@ -42,7 +42,7 @@ RTGI，因此总数为 20（未安装时为 19）。RTGI 和 Debug Buffers 默�
 ```text
 Shadow → VT → GBuffer → Cloud Shadows → GTAO → Lighting → Magic GI → [RTGI if installed]
        → SSR → [internal Reflection Resolve] → Sky
-       → Volumetric Cloud Trace → Height Fog → Volumetric Cloud → Transparent
+       → Volumetric Cloud → Height Fog → Volumetric Cloud Trace → Transparent
        → Temporal AA → Eye Adaptation → Bloom → Color Grade → Post Process → Debug Buffers
 ```
 
@@ -103,9 +103,9 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 	原生 ReflectionProbe，也不会在缺少 FengReflectProbe 时隐式回退到它。目标由主线程按 world/viewport
 	注册路由并发布快照；渲染回调不读取场景树或设置节点。
 - **Cloud Shadows**：在 GBuffer 后准备云阴影与 Sky AO；组件上的两项功能默认关闭。
-- **Volumetric Cloud Trace**：在 Sky 后追踪云辐射、透射和深度；**Volumetric Cloud** 在
-  Height Fog 后合成，透明表面可通过材质的 Cloud Fogging 参与深度相关云传输。
-  三个阶段消费可选 feng-cloud 的同世界快照，缺少有效云源时跳过。
+- **Volumetric Cloud** 在 Sky 后准备云的帧数据；**Height Fog** 发布雾传输参数后，
+  **Volumetric Cloud Trace** 追踪并合成云辐射、透射和深度。透明表面通过材质的 Cloud Fogging
+  参与深度相关云传输。各阶段消费可选 feng-cloud 的同世界快照，缺少有效云源时跳过。
 - **Height Fog**：位于 Sky 后，消费匹配世界的雾与大气快照。大气的准备数据通过帧前钩子
   交给原生光照；天空后的 compute 处理 opaque 像素，前向材质使用自身片元位置合成。
 - **Eye Adaptation**：在 TAA 后、Bloom 前测量 HDR 场景色。支持 Histogram、Basic、Manual，
@@ -160,8 +160,8 @@ feng-reflect-probe 提供，再由内部 Reflection Resolve 按配置合成。Ma
 - 自有 RID 在 `_take_owned_rids()` 中追加到 `super` 的结果并清空原字段；基类负责显式
   `_cleanup(rd)` 和析构时的渲染线程释放。已有自定义 Pass 应将 `_cleanup` 中的 RID
   所有权列表迁入此方法；`_cleanup` 仍可在渲染线程显式调用，析构不再调用该扩展钩子。
-  收集方法读取字段并调用 `super`；调用本实例的辅助方法时使用 `super.call("方法名")`，
-  保持引用计数归零后仍可用的原生调用路径。
+  析构时可能无法读取派生脚本字段；需要此兜底的 Pass 在分配、释放后调用
+  `_replace_owned_rid_snapshot()` 发布仅含自有 RID 的快照。清理会合并并去重两份所有权清单。
 
 ```gdscript
 func _take_owned_rids() -> Array[RID]:

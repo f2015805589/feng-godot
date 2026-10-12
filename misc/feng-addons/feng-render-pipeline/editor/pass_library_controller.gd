@@ -157,19 +157,13 @@ func _single_instance_provider_already_present(manifest: Dictionary, template: P
 			return true
 	return false
 
-func _reflection_or_gi_kind(pass_entry: Variant) -> StringName:
-	var source_pass = pass_entry.get_parameter_source() if pass_entry != null and pass_entry.has_method("get_parameter_source") else pass_entry
-	if source_pass == null:
+func _reflection_or_gi_kind(pass_entry: PassBase) -> StringName:
+	if pass_entry == null:
 		return &""
-	if source_pass.has_method("get_indirect_gi_kind"):
-		var gi_kind := StringName(source_pass.call("get_indirect_gi_kind"))
-		if gi_kind == &"rt_gi":
-			return &"rt_gi"
-	if source_pass.has_method("get_reflection_source_kind"):
-		var reflection_kind := StringName(source_pass.call("get_reflection_source_kind"))
-		if reflection_kind == &"ssr":
-			return &"ssr"
-	return &""
+	var source := pass_entry.get_parameter_source()
+	if source.get_indirect_gi_kind() == &"rt_gi":
+		return &"rt_gi"
+	return &"ssr" if source.get_reflection_source_kind() == &"ssr" else &""
 
 
 func _make_unique_library_label(base: String, path: String) -> String:

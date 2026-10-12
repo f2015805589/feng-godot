@@ -86,12 +86,12 @@ func _target_viewport() -> Viewport:
 	return get_node_or_null(target_viewport_path) as Viewport
 
 func get_source_priority_snapshot() -> Array[int]:
-	return _validated_priority(source_priority, DEFAULT_PRIORITY)
+	return _validated_priority(source_priority)
 
 ## Called on the main thread by FengRenderer while building the runtime plan.
 ## This is the compatibility fallback for a migrated legacy Resolve priority.
 static func publish_legacy_fallback_priority(resolver_id: int, values: Array) -> void:
-	var valid := _validated_priority(values, DEFAULT_PRIORITY)
+	var valid := _validated_priority(values)
 	_priority_mutex.lock()
 	_legacy_priority_by_resolver[resolver_id] = PackedInt32Array(valid)
 	_priority_mutex.unlock()
@@ -187,37 +187,27 @@ static func _refresh_runtime_snapshots() -> void:
 	_runtime_priority_by_target = published
 	_priority_mutex.unlock()
 
-static func _validated_priority(values: Array, fallback: Array) -> Array[int]:
+static func is_valid_priority(values: Array) -> bool:
 	if values.size() != SOURCE_COUNT:
-		return _validated_default(fallback)
-	var result: Array[int] = []
+		return false
 	var seen := {}
 	for value in values:
 		var source := int(value)
 		if source < 0 or source >= SOURCE_COUNT or seen.has(source):
-			return _validated_default(fallback)
+			return false
 		seen[source] = true
-		result.append(source)
-	return result
+	return true
 
-static func _validated_default(values: Array) -> Array[int]:
-	if values.size() == SOURCE_COUNT:
-		var result: Array[int] = []
-		var seen := {}
-		for value in values:
-			var source := int(value)
-			if source < 0 or source >= SOURCE_COUNT or seen.has(source):
-				return DEFAULT_PRIORITY.duplicate()
-			seen[source] = true
-			result.append(source)
-		return result
-	return DEFAULT_PRIORITY.duplicate()
+static func _validated_priority(values: Array) -> Array[int]:
+	var result: Array[int] = []
+	result.assign(values if is_valid_priority(values) else DEFAULT_PRIORITY)
+	return result
 
 func _get_configuration_warnings() -> PackedStringArray:
 	var warnings := PackedStringArray()
 	if not target_viewport_path.is_empty() and _target_viewport() == null:
 		warnings.append("Target Viewport does not resolve to a Viewport node.")
-	if _validated_priority(source_priority, []) != source_priority:
+	if not is_valid_priority(source_priority):
 		warnings.append("Reflection Priority must contain GI, SSR, FengReflectProbe and FengSkyLight exactly once; FRP uses the default priority until corrected.")
 	if _duplicate_route_warning:
 		warnings.append("More than one FengReflectionSettings node targets this viewport or world render target; FRP uses the default priority until only one remains.")

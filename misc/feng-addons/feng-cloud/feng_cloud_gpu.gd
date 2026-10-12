@@ -274,7 +274,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		ambient_atmosphere[2] = 0.0
 	var ambient_signature := hash([
 		snapshot.get("provider_id", 0), snapshot.get("world_id", 0),
-		snapshot.get("sky_rendering_signature", []), snapshot.get("atmosphere_revision", -1),
+		snapshot.get("atmosphere_snapshot", {}), snapshot.get("atmosphere_revision", -1),
 		ctx.get_cloud_capture_batch_id() if capture else 0,
 		ambient_lighting, ambient_atmosphere, _rid_id(ctx.get_cloud_sky_octmap()),
 		float(snapshot.get("planet_radius_m", 0.0)), snapshot.get("planet_center_m", Vector3.ZERO)
@@ -1066,7 +1066,7 @@ func _update_ue58_time_ubo(ctx: FRPPassContext, snapshot: Dictionary,
 		var cache_key := [
 			int(snapshot.get("provider_id", 0)), int(snapshot.get("world_id", 0)),
 			int(snapshot.get("planet_source_id", 0)), int(snapshot.get("atmosphere_revision", -1)),
-			snapshot.get("sky_rendering_signature", []), int(material.get("revision", -1)),
+			snapshot.get("atmosphere_snapshot", {}), int(material.get("revision", -1)),
 			str(material.get("kernel_source", "")),
 			ctx.get_cloud_capture_batch_id(),
 		]
@@ -1349,7 +1349,7 @@ func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textu
 		snapshot.get("tracing_start_max_distance_m", 0.0),
 		snapshot.get("tracing_start_distance_from_camera_m", 0.0),
 		snapshot.get("shadow_tracing_distance_m", 0.0),
-		snapshot.get("sky_rendering_signature", []), snapshot.get("cloud_shadow", {}),
+		snapshot.get("atmosphere_snapshot", {}), snapshot.get("cloud_shadow", {}),
 		snapshot.get("sky_ao", {}), snapshot.get("sun_inputs", []),
 		lighting, history_atmosphere, appearance, ids, _rid_id(blue_noise), mode,
 		layout_ids, str(snapshot.get("material", {}).get("kernel_layout", snapshot.get("kernel_layout", "builtin"))),

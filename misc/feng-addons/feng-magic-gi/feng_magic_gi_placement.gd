@@ -23,12 +23,9 @@ const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 
 var faces := PackedVector3Array()
 var reflectance := PackedVector3Array()
-var face_emitter_indices := PackedInt32Array()
 var face_source_ids := PackedInt64Array()
 var face_surface_indices := PackedInt32Array()
-var emitter_keys := PackedStringArray()
-var emitter_static_signatures := PackedInt64Array()
-var emitter_groups: Array[Dictionary] = []
+var emitters := EmitterBakeSet.new()
 var bvh: TriangleMesh
 var positions := PackedVector3Array()
 var surface_positions := PackedVector3Array()
@@ -70,13 +67,12 @@ var rejected_duplicate_count := 0
 var rejected_center_outside_count := 0
 var rejected_ambiguous_side_count := 0
 var _scene_root: Node
-var _emitter_set: EmitterBakeSet
 
 func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emission := false) -> bool:
 	_volume = volume
 	_world = volume.get_world_3d()
 	_collect_emission = collect_emission
-	_emitter_set = EmitterBakeSet.new()
+	emitters = EmitterBakeSet.new()
 	_inverse = volume.global_transform.affine_inverse()
 	_dimensions = volume.grid_dimensions()
 	error_message = ""
@@ -90,12 +86,8 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			else _world_bounds.grow(max_probe_offset + BROADPHASE_EPSILON)
 	faces.clear()
 	reflectance.clear()
-	face_emitter_indices.clear()
 	face_source_ids.clear()
 	face_surface_indices.clear()
-	emitter_keys.clear()
-	emitter_static_signatures.clear()
-	emitter_groups.clear()
 	positions.clear()
 	surface_positions.clear()
 	normals.clear()
@@ -147,9 +139,6 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	if not build_bvh:
 		bvh = null
 		bvh_ready = false
-	emitter_keys = _emitter_set.keys
-	emitter_static_signatures = _emitter_set.static_signatures
-	emitter_groups = _emitter_set.groups
 	if rejected_no_safe_offset_count > 0 or rejected_inside_or_indeterminate_center_count > 0 \
 			or rejected_ambiguous_side_count > 0:
 		warning_message = "Placed %d probes; rejected %d candidates with no safe offset, %d centers inside or indeterminate, and %d centers outside the volume; skipped %d clipped triangles with unproven outward side." % [
@@ -369,10 +358,10 @@ func _prepare_surface(node: MeshInstance3D, surface: int,
 		return false # Transparent surfaces cannot be represented by this opaque PRT bake.
 	_triangle_reflectance = _material_reflectance(material)
 	if _collect_emission and material is BaseMaterial3D and material.emission_enabled:
-		_triangle_emitter_index = _emitter_set.register_surface(
+		_triangle_emitter_index = emitters.register_surface(
 				_scene_root, node, surface, material, uv1, uv2, vertex_count)
-		if not _emitter_set.error_message.is_empty():
-			error_message = _emitter_set.error_message
+		if not emitters.error_message.is_empty():
+			error_message = emitters.error_message
 			return false
 	return true
 
@@ -450,11 +439,10 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3,
 		return false
 	faces.append_array([a, b, c])
 	reflectance.append(_triangle_reflectance)
-	face_emitter_indices.append(_triangle_emitter_index)
 	face_source_ids.append(_triangle_source_id)
 	face_surface_indices.append(_triangle_surface_index)
 	if _triangle_emitter_index >= 0:
-		_emitter_set.append_triangle(_triangle_emitter_index, a, b, c, normal,
+		emitters.append_triangle(_triangle_emitter_index, a, b, c, normal,
 				uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c)
 	return true
 
@@ -765,18 +753,7 @@ func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictiona
 	if not hit.is_empty():
 		var face_index := int(hit["face_index"])
 		hit["albedo"] = reflectance[face_index]
-		hit["emitter_index"] = face_emitter_indices[face_index]
 	return hit
 
 func safe_surface_offset(surface: Vector3, normal: Vector3) -> float:
 	return _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
-
-## Uniform-area next-event sample for one fixed emissive surface binding.
-## Returns the geometric estimator weight and texture sample, but never source color.
-func sample_emitter_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
-		u_triangle: float, u_barycentric: float, u_edge: float,
-		max_distance: float, receiver_offset: float) -> Dictionary:
-	if _emitter_set == null:
-		return {}
-	return _emitter_set.sample_connection(emitter_index, receiver, receiver_normal,
-			u_triangle, u_barycentric, u_edge, max_distance, receiver_offset)

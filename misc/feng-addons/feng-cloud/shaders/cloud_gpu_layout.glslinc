@@ -65,57 +65,6 @@ struct FengCloudShellParameters {
 	float bottom_sky_ao;
 };
 
-struct FengCloudFrameBlockData {
-	mat4 inverse_view_projection;
-	mat4 previous_view_projection;
-	mat4 world_to_view;
-	vec4 camera_world_position_m;
-	vec4 previous_camera_world_position_m;
-	vec4 viewport_size_xy_inv_xy;
-	vec4 trace_phase_xy_trace_size_xy;
-	vec4 radiance_scales_current_previous_norm_P;
-	vec4 wind_delta_km_dt_time;
-	uvec4 view_index_frame_index_flags_vrt_mode;
-};
-
-struct FengCloudLightingBlockData {
-	mat4 sky_inverse_rotation;
-	vec4 sun0_direction_enabled;
-	vec4 sun0_top_irradiance_cast;
-	vec4 sun0_ground_illuminance_shadow_index;
-	vec4 sun1_direction_enabled;
-	vec4 sun1_top_irradiance_cast;
-	vec4 sun1_ground_illuminance_shadow_index;
-	vec4 sky_octmap_parameters;
-	vec4 sky_energy_captured_scale_max_mip_valid;
-};
-
-struct FengCloudProjectionControlData {
-	mat4 world_to_cloud_shadow_clip[2];
-	mat4 cloud_shadow_clip_to_world[2];
-	mat4 world_to_cloud_ao_clip;
-	mat4 cloud_ao_clip_to_world;
-	// x/y are the per-sun far distances in km; z/w are the matching map resolutions.
-	vec4 shadow_far_depth_km_sun0_sun1_resolution0_resolution1;
-	vec4 shadow_strength0_strength1_biasKm0_biasKm1;
-	vec4 surface_strength0_strength1_atmosphere_strength0_strength1;
-	vec4 shadow_enabled0_enabled1_aoEnabled_reserved;
-	vec4 shadow_sample_counts0_1_selfShadowUse0_1;
-	vec4 shadow_map_size0_xy_inv_xy;
-	vec4 shadow_map_size1_xy_inv_xy;
-	vec4 ao_far_depth_km_strength_aperture_samples;
-	vec4 ao_map_size_xy_inv_xy;
-	vec4 ao_trace_direction_xyz_extent_km;
-	vec4 projection_anchor_world_m_xyz_snap_km;
-};
-
-struct FengCloudNativeShadowData {
-	mat4 atlas_transform[4];
-	vec4 cascade_splits;
-	vec4 shadow_bias;
-	vec4 opacity_fade_start_end_valid;
-};
-
 #define FENG_CLOUD_DECLARE_FRAME \
 	layout(set = 0, binding = 0, std140) uniform FengCloudFrameBlock { \
 		mat4 inverse_view_projection; \

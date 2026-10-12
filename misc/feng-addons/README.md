@@ -14,6 +14,8 @@ rights or setup script.
 | Sky | Atmosphere optics, world snapshots and SkyLight capture | FRP; optional Fog/Cloud capture inputs |
 | Cloud | Cloud settings, materials, shadows, tracing and composition | FRP; Sky-owned atmosphere snapshots |
 | Fog | Height-fog settings, light selection and world routing | FRP consumer; optional Sky lighting |
+| Ray Tracing | Hardware RT scene snapshots, diffuse GI and reflection candidates | FRP; optional NRD backend |
+| Reflect Probe | Probe authoring, capture, cubemap filtering and world snapshots | FRP reflection candidates; optional Sky/Fog/Cloud capture |
 | Magic GI | Surface placement, PRT baking, emitter response and lighting snapshots | FRP consumer; optional SkyLight and terrain geometry |
 | IDWeight Terrain | Terrain data, VT residency/production and editor tools | Native terrain extension and engine VT hooks |
 | RenderDoc Capture | Editor frame capture and analyzer launch | Native capture integration |

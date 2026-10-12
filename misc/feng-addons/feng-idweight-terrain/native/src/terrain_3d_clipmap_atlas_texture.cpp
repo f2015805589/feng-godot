@@ -1,11 +1,6 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DClipmapAtlas, the texture half: the atlas's own `Texture2DArray`, the block-sized staging
-// textures a `texture_copy()` writes one block out of, and their lifetimes. The organisation these
-// exist for - one rect a block, written out of a block-sized source rather than out of the whole
-// atlas - is stated in terrain_3d_clipmap_atlas.h; what is left here is the allocation, which is the
-// half that needs a device.
-
+// Atlas textures, per-block staging textures and their allocation lifetimes.
 #include "terrain_3d_clipmap_atlas.h"
 
 #include <godot_cpp/classes/rd_texture_format.hpp>

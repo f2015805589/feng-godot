@@ -1,14 +1,7 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// Terrain3DMaterialClipmapDetail: the sparse, demand-resident fine material layer.
-//
-// The header states the design. This file is the mechanism: the integer addressing, the slot table
-// and its eviction, the screen-footprint level rule, the source pipeline's submit/poll, the
-// generation check that gates publication, and the two GPU halves (the source arrays a result is
-// uploaded into, and the baked arrays a producer writes). It contains no bake and no shading: the
-// producer is offered `BakeOffer`s and reports them back, and the shader reads the directory this
-// file publishes.
-
+// Detail-tile demand, residency, source upload and directory publication.
+// Surface baking consumes the generation-tagged offers produced here.
 #include "terrain_3d_material_clipmap_detail.h"
 #include "terrain_3d_baked_texture_arrays.h"
 
@@ -674,22 +667,9 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	const Vector2 forward = p_view.forward.length_squared() > 1e-8f ? p_view.forward.normalized()
 																	: Vector2(0.f, -1.f);
 	const real_t cos_limit = Math::cos(_config.forward_half_angle);
-	// The ground footprint of one screen pixel at distance d is `pixel_unit * d` metres, where
-	// `pixel_unit` is the viewport's angular pixel size. The density a pixel wants at distance d is
-	// `tpp / (pixel_unit * d)`, so the *requested* band of a level - the distances over which its
-	// density is the one a pixel wants - runs from where the next finer level's density stops being
-	// enough to where its own does, and the coarsest runs to the demand radius.
-	//
-	// That rule is a request, and at the shipped shape it asks for far more 2 MiB tiles than the slot
-	// table holds: the finest band alone needs hundreds. The walk below spends the table nearest
-	// first, so a table that cannot hold the whole request used to leave everything past the nearest
-	// tiles to the 1 texel/m ring while the tile under the focus - the one every density reading is
-	// taken at - answered 1024. That is the "numbers pass, picture is mush" state this fit exists to
-	// remove. The bands are therefore fitted to the table first: one factor `scale <= 1` shrinks every
-	// boundary except the coarsest (which always reaches `demand_radius`), chosen as the largest that
-	// keeps the demanded tile count inside the table. The near field is then covered *contiguously* -
-	// the finest level over its share, each coarser level over the next - so the whole `demand_radius`
-	// is detail, at the finest density the table can afford, instead of a fine patch under the camera.
+	// Pixel footprint is pixel_unit * distance. Fit the requested density bands
+	// to available slots by scaling their boundaries; the coarsest band retains
+	// demand_radius so budget pressure reduces density across the near field.
 	const real_t pixel_unit = 2.f * Math::tan(p_view.fov_y * 0.5f) / real_t(MAX(1, p_view.viewport_height));
 	const real_t tpp = p_view.texels_per_pixel > 0.f ? p_view.texels_per_pixel : _config.texels_per_pixel;
 	real_t desired[MAX_LEVELS];
@@ -978,18 +958,7 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 	_last_update.source_poll_upload_us = detail_elapsed_usec(source_poll_started);
 	_last_update.source_uploads = int64_t(_source_uploads - source_uploads_before);
 
-	// 7. Offers. A tile whose source landed and whose bake no producer has taken is offered here;
-	//    an offer that has gone unacknowledged for too long is offered again, because a producer
-	//    that could not dispatch (no material list, no device) leaves its queue holding work it
-	//    will not report back.
-	//
-	//    The walk's own order, nearest first: the producer bakes one tile a tick at the default
-	//    budget, so the order decides *which* tile a fragment waits for. Iterating the slot table
-	//    instead offered whatever slot happened to be free first, which put the tile under the
-	//    crosshair last behind a hundred tiles the view does not need yet - measured, the probe point
-	//    1.6 m ahead stayed unreadable for the whole acceptance window while ten tiles a mile away
-	//    were valid. Only a tile this walk wants is offered: a resident tile the view has left is
-	//    about to be evicted, and spending a dispatch on it is the same defect from the other side.
+	// Offer wanted tiles nearest first; retry unacknowledged offers after timeout.
 	const uint64_t bake_offers_before = _bake_offers;
 	const DetailUpdateClock::time_point offer_started = DetailUpdateClock::now();
 	for (const Demand &entry : demand) {
@@ -1027,13 +996,8 @@ int Terrain3DMaterialClipmapDetail::update(const DemandView &p_view,
 		_offers.push_back(offer);
 		_bake_offers++;
 	}
-	// The queue is re-ordered by the walk's own rank, nearest first, because the producer takes one
-	// tile a tick at the default budget while the source pipeline can deliver a dozen: without this
-	// the bake order was the order the *workers* happened to finish in, and the tile under the
-	// crosshair sat behind a hundred tiles further away - measured, the focus tile's offer was the
-	// 112th of 238 and the probe point read the coarse ring for the whole acceptance window. An
-	// offer whose tile the walk no longer wants sorts last; it is collected only if nothing nearer
-	// is left, which is the same priority the slot table's eviction already uses.
+	// Worker completion order is arbitrary. Bake in demand order, with unwanted
+	// tiles last.
 	std::stable_sort(_offers.begin(), _offers.end(), [this](const BakeOffer &p_a, const BakeOffer &p_b) {
 		auto rank_of = [this](const BakeOffer &p_offer) {
 			const auto found = _wanted.find(_slots[size_t(p_offer.slot)].key);
@@ -1148,16 +1112,8 @@ Dictionary Terrain3DMaterialClipmapDetail::get_shader_arm() const {
 }
 
 Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
-	wait_for_async_update();
-	Dictionary arm;
+	Dictionary arm = get_shader_arm();
 	arm["configured"] = is_configured();
-	arm["enabled"] = is_enabled();
-	arm["levels"] = _config.levels;
-	arm["tile_size"] = _config.tile_size;
-	arm["border"] = _config.border;
-	arm["stored_size"] = _stored_size;
-	arm["directory_size"] = _config.directory_size;
-	arm["slots"] = _slot_count;
 	arm["density"] = _config.density;
 	arm["demand_radius"] = _config.demand_radius;
 	arm["budget_bytes"] = get_budget_bytes();
@@ -1168,33 +1124,6 @@ Dictionary Terrain3DMaterialClipmapDetail::get_arm() const {
 	arm["starved"] = _starved;
 	arm["state_stamp"] = get_state_stamp();
 	arm["window_stamp"] = get_window_stamp();
-	arm["baked_albedo"] = get_baked_texture_rid(0);
-	arm["baked_normal"] = get_baked_texture_rid(1);
-	arm["baked_params"] = get_baked_texture_rid(2);
-	PackedFloat32Array texels_per_meter;
-	PackedFloat32Array tile_worlds;
-	PackedFloat32Array texel_worlds;
-	PackedVector2Array window_origins;
-	Array directories;
-	texels_per_meter.resize(MAX_LEVELS);
-	tile_worlds.resize(MAX_LEVELS);
-	texel_worlds.resize(MAX_LEVELS);
-	window_origins.resize(MAX_LEVELS);
-	for (int level = 0; level < MAX_LEVELS; level++) {
-		// Padded to the shader's declared length: Godot's uniform arrays are read at their declared
-		// size, so a shorter binding would leave the tail undefined. `levels` says how many entries
-		// are meaningful.
-		texels_per_meter[level] = get_level_texels_per_meter(level);
-		tile_worlds[level] = get_level_tile_world(level);
-		texel_worlds[level] = 1.f / get_level_texels_per_meter(level);
-		window_origins[level] = level < _config.levels ? _window_origin[level] : Vector2();
-		directories.push_back(level < _config.levels ? get_directory_rid(level) : RID());
-	}
-	arm["texels_per_meter"] = texels_per_meter;
-	arm["tile_world"] = tile_worlds;
-	arm["texel_world"] = texel_worlds;
-	arm["window_origin"] = window_origins;
-	arm["directory"] = directories;
 	Dictionary update_diagnostics;
 	update_diagnostics["total_us"] = int64_t(_last_update.total_us);
 	update_diagnostics["storage_us"] = int64_t(_last_update.storage_us);

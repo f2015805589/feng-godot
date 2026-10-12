@@ -115,17 +115,6 @@ func ensure_frp_contract() -> bool:
 		changed = true
 	return changed
 
-func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for index in expected.size():
-		var input := actual[index]
-		var required := expected[index]
-		if input == null or input.name != required.name or input.data_format != required.data_format \
-				or input.usage != required.usage or input.scale != required.scale:
-			return false
-	return true
-
 func _inputs_match(actual: Array[FengPassTexture], expected: Array[FengPassTexture]) -> bool:
 	if actual.size() != expected.size():
 		return false
@@ -356,8 +345,6 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 							warn_once("RTGI reflection candidate could not be published for the current frame/view.")
 					else:
 						reflection_state.valid = false
-		state.last_seen = Engine.get_frames_drawn()
-	refresh_owned()
 
 func _clear_reflection_outputs(rd: RenderingDevice, buffers: RenderSceneBuffersRD) -> void:
 	if not buffers.has_texture(PIPELINE_SCOPE, REFLECTION_OUTPUT):
@@ -549,7 +536,7 @@ func _create_diffuse_state(rd: RenderingDevice, size: Vector2i) -> Dictionary:
 			return {}
 	return {"size": size, "raw": raw, "hit_distance": hit_distance, "history": histories, "resources": resources,
 			"ubo": ubo, "ping": 0, "valid": false, "generation": -1, "revision": -1,
-			"exposure": 1.0, "vp": Projection.IDENTITY, "last_seen": Engine.get_frames_drawn()}
+			"exposure": 1.0, "vp": Projection.IDENTITY}
 
 func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, frame: Dictionary,
 		textures: Array[RID], generation: int, revision: int, options: Dictionary) -> bool:
@@ -599,7 +586,6 @@ func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, fram
 			state.vp = vp
 			state.camera = frame.get("camera_generation", 0)
 			state.denoiser = 0
-			state.last_seen = Engine.get_frames_drawn()
 			return true
 		# Retain ownership of partially initialized NRD resources on failure.
 		state.resources.append_array(nrd.resources.slice(state.nrd_count))
@@ -630,7 +616,6 @@ func _resolve_diffuse(rd: RenderingDevice, sampler: RID, state: Dictionary, fram
 	state.exposure = exposure
 	state.vp = vp
 	state.camera = frame.get("camera_generation", 0)
-	state.last_seen = Engine.get_frames_drawn()
 	return true
 
 func _dispatch(rd: RenderingDevice, shader: RID, pipeline: RID, bindings: Array[RDUniform], size: Vector2i) -> bool:

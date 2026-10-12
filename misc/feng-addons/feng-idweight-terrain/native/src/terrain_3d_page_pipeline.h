@@ -149,9 +149,6 @@ private:
 	// Bounded flat queue; tokens distinguish canceled work from a replacement using
 	// the same key. Claim order is submission order, independent of key sorting.
 	std::vector<Entry> _entries;
-	std::vector<Key> _claim_order;
-	// Consumed FIFO prefix; canceled keys are skipped and the prefix is compacted in batches.
-	size_t _claim_head = 0;
 	std::mutex _mutex;
 	std::condition_variable _wake, _task_wake;
 	// Only the demand thread writes staging; _release_mutex protects the published
@@ -186,8 +183,8 @@ private:
 	// Called under _mutex. Defer payload release, account for unclaimed work and
 	// replace the erased entry with the last one. Indices never escape this lock.
 	void _erase_at(int p_index);
-	// Called with `_mutex` held: how many entries are neither running nor finished.
-	int _count_claimable() const;
+	// Called under _mutex: claim the oldest live submission, independent of vector order.
+	bool _claim(Entry &r_job);
 	// Guards the per-job source caches below: every worker assembles its own page, so
 	// the decode caches are shared state now rather than a single thread's locals.
 	std::mutex _cache_mutex;

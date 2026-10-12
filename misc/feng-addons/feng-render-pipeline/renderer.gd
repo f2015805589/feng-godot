@@ -19,8 +19,7 @@ const ExecutionPlan = preload("pipeline/execution_plan.gd")
 const IndirectGISelection = preload("pipeline/indirect_gi_selection.gd")
 const CompositorBinding = preload("pipeline/compositor_binding.gd")
 const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
-const ReflectionResolvePass = preload("passes/reflection_resolve_pass.gd")
-const ReflectionSettings = preload("reflection_settings.gd")
+const ReflectionPlan = preload("pipeline/reflection_plan.gd")
 
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
@@ -35,8 +34,6 @@ const PIPELINE_SCHEMA_VERSION := 11
 const MAGIC_GI_SCRIPT_PATH := "res://addons/feng-render-pipeline/passes/magic_gi_pass.gd"
 const RT_GI_SCRIPT_PATH := "res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd"
 const LEGACY_RESOLVE_SCRIPT_PATH := "res://addons/feng-render-pipeline/passes/reflection_resolve_pass.gd"
-const LEGACY_RESOLVE_LIBRARY_PATH := "reflection-resolve/reflection_resolve.tres"
-const OPTIONAL_PROBE_PASS_PATH := "res://addons/feng-reflect-probe/passes/feng_reflect_probe_pass.gd"
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -120,9 +117,7 @@ var _parameter_revision := 0
 ## full validation because they can change texture availability and native ownership.
 var _volume_binding: Dictionary = {}
 var _view_plans: Array[Dictionary] = []
-var _runtime_reflection_resolve: FengPass
-var _runtime_probe_provider: FengPass
-var _probe_provider_checked := false
+var _reflection_plan := ReflectionPlan.new()
 ## Transient state used only by an isolated cubemap capture renderer clone.
 ## Capture policy does not serialize with the authored pipeline resource.
 var _reflection_capture_mode := false
@@ -522,139 +517,16 @@ func _is_exact_script(pass_entry: Variant, script_path: String) -> bool:
 	var script := pass_entry.get_script() as Script
 	return script != null and script.resource_path == script_path
 
-func _has_enabled_reflection_resolve(enabled_fn: Callable) -> bool:
-	for pass_entry in _passes:
-		if pass_entry == null or not enabled_fn.call(pass_entry):
-			continue
-		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
-				and StringName(source_pass.call("get_reflection_source_kind")) == &"resolve":
-			return true
-	return false
-
-func _get_runtime_probe_provider() -> FengPass:
-	if _probe_provider_checked:
-		return _runtime_probe_provider
-	_probe_provider_checked = true
-	if not FileAccess.file_exists(OPTIONAL_PROBE_PASS_PATH):
-		return null
-	var script := load(OPTIONAL_PROBE_PASS_PATH) as Script
-	if script == null or not script.can_instantiate():
-		push_warning("FengRenderer: optional FengReflectProbe pass could not be loaded or compiled; reflection falls back to GI/SSR/Sky.")
-		return null
-	var candidate = script.new()
-	if not candidate is PassBase or not candidate.has_method("get_reflection_source_kind") \
-			or StringName(candidate.call("get_reflection_source_kind")) != &"feng_probe":
-		push_warning("FengRenderer: optional FengReflectProbe script does not implement the feng_probe candidate contract.")
-		return null
-	candidate.resource_name = "Feng Reflect Probe"
-	candidate.stable_id = &"internal:feng_reflect_probe"
-	candidate.enabled = true
-	_runtime_probe_provider = candidate
-	return _runtime_probe_provider
-
 func _runtime_entries(enabled_fn: Callable) -> Array[PassBase]:
-	if _reflection_capture_mode:
-		var capture_entries: Array[PassBase] = []
-		for pass_entry in _passes:
-			if pass_entry == null:
-				capture_entries.append(pass_entry)
-				continue
-			var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-			if source_pass != null and source_pass.has_method("get_reflection_source_kind"):
-				var reflection_kind := StringName(source_pass.call("get_reflection_source_kind"))
-				if reflection_kind == &"resolve" or reflection_kind == &"feng_probe":
-					continue
-			capture_entries.append(pass_entry)
-		return capture_entries
-	_publish_reflection_priority_fallback(enabled_fn)
-	var entries: Array[PassBase] = _passes.duplicate()
-	var active_probe_provider := false
-	for pass_entry in _passes:
-		if pass_entry == null or not enabled_fn.call(pass_entry):
-			continue
-		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
-				and StringName(source_pass.call("get_reflection_source_kind")) == &"feng_probe":
-			active_probe_provider = true
-			break
-	var probe_provider: FengPass
-	if not active_probe_provider:
-		probe_provider = _get_runtime_probe_provider()
-	var has_authored_resolve := _has_enabled_reflection_resolve(enabled_fn)
-	var sky_index := _native_index_in(entries, NativeSpec.PASS_SKY)
-	var resolve_index := _enabled_resolve_index(entries, enabled_fn)
-	var insertion_index := sky_index if sky_index >= 0 else entries.size()
-	if resolve_index >= 0:
-		insertion_index = mini(insertion_index, resolve_index)
-	if probe_provider != null:
-		entries.insert(clampi(insertion_index, 0, entries.size()), probe_provider)
-	if not has_authored_resolve:
-		var resolver := _get_runtime_reflection_resolve()
-		var hidden_resolve_index := _native_index_in(entries, NativeSpec.PASS_SKY)
-		if hidden_resolve_index < 0:
-			hidden_resolve_index = entries.size()
-		entries.insert(hidden_resolve_index, resolver)
-	return entries
+	return _reflection_plan.build(_passes, enabled_fn, _legacy_reflection_source_priority, _reflection_capture_mode)
 
-## Enables the reduced runtime plan on a private capture clone. The capture owner
-## filters other incompatible authored passes and restores the mode after rendering.
+## Enables the reduced runtime plan on a private capture clone.
 func set_reflection_capture_mode(enabled: bool) -> void:
 	if _reflection_capture_mode == enabled:
 		return
 	_reflection_capture_mode = enabled
 	_view_plans.clear()
 	_volume_binding = {}
-
-func _get_runtime_reflection_resolve() -> FengPass:
-	if _runtime_reflection_resolve == null:
-		_runtime_reflection_resolve = ReflectionResolvePass.new() as FengPass
-		_runtime_reflection_resolve.resource_name = "Reflection Resolve (Internal)"
-		_runtime_reflection_resolve.stable_id = &"internal:reflection_resolve"
-		_runtime_reflection_resolve.enabled = true
-	return _runtime_reflection_resolve
-
-func _publish_reflection_priority_fallback(enabled_fn: Callable) -> void:
-	var priority := _legacy_priority_or_default()
-	var resolver_id := 0
-	for pass_entry in _passes:
-		if pass_entry == null or not enabled_fn.call(pass_entry):
-			continue
-		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-		if source_pass == null or not source_pass.has_method("get_reflection_source_kind") \
-				or StringName(source_pass.call("get_reflection_source_kind")) != &"resolve":
-			continue
-		var authored_priority: Variant = source_pass.get("source_priority")
-		if authored_priority is Array:
-			priority = authored_priority.duplicate()
-		resolver_id = source_pass.get_instance_id()
-		break
-	if resolver_id == 0:
-		resolver_id = _get_runtime_reflection_resolve().get_instance_id()
-	ReflectionSettings.publish_legacy_fallback_priority(resolver_id, priority)
-
-func _legacy_priority_or_default() -> Array[int]:
-	if _legacy_reflection_source_priority.size() != 4:
-		return [0, 1, 2, 3]
-	return _legacy_reflection_source_priority.duplicate()
-
-func _native_index_in(entries: Array, native_id: int) -> int:
-	for index in entries.size():
-		var pass_entry = entries[index]
-		if pass_entry is BuiltinPass and pass_entry.native_id == native_id:
-			return index
-	return -1
-
-func _enabled_resolve_index(entries: Array, enabled_fn: Callable) -> int:
-	for index in entries.size():
-		var pass_entry = entries[index]
-		if pass_entry == null or not enabled_fn.call(pass_entry):
-			continue
-		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
-		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
-				and StringName(source_pass.call("get_reflection_source_kind")) == &"resolve":
-			return index
-	return -1
 
 ## Records a library entry as already present in this pipeline, so synchronization
 ## neither adds it again nor reads its removal as an accident. The editor menu marks the

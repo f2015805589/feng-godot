@@ -1163,7 +1163,7 @@ bool Terrain3D::_setup_vt_material_detail() {
 	// must exist too, because it is the layer's fallback: a detail tile that cannot be baked is
 	// served by the ring's coarse level, and without the ring the fragment would have nothing
 	// between the tile and the region array.
-	const bool wanted = _vt.detail_enabled && _data != nullptr &&
+	const bool wanted = _vt.detail_enabled && _vt.detail_budget_bytes > 0 && _data != nullptr &&
 			_vt.delivery.group_uses(TerrainVT::ChannelGroup::Material, TerrainVT::Delivery::Clipmap);
 	if (!wanted) {
 		if (_vt.material_detail != nullptr) {
@@ -1213,7 +1213,7 @@ bool Terrain3D::_setup_vt_material_detail() {
 	}
 	config.levels = levels;
 	_vt.material_detail->configure(config);
-	_vt.material_detail_state = _vt.material_detail->get_state_stamp();
+	_update_vt_detail_arm();
 	const bool enabled = _vt.material_detail->is_enabled();
 	if (!enabled) {
 		// The budget could not afford a slot table. The message is the manager's; this is the
@@ -1522,10 +1522,8 @@ void Terrain3D::set_vt_detail_directory_size(const int p_texels) {
 }
 
 void Terrain3D::set_vt_detail_budget_bytes(const int p_bytes) {
-	// Not a shape: the layer keeps its content when the budget changes in the policy sense, but a
-	// derived slot table cannot be resized in place, so the manager rebuilds. Zero is a legal
-	// "spend nothing", which turns the layer off with a report rather than allocating a slot table
-	// it cannot afford.
+	// Zero tears down detail; positive budgets retain the manager's 16 MiB floor.
+	// A changed slot capacity rebuilds residency.
 	if (_vt.detail_budget_bytes != MAX(0, p_bytes)) {
 		_vt.detail_budget_bytes = MAX(0, p_bytes);
 	}

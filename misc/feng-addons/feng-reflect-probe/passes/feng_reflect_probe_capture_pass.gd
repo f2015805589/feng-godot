@@ -25,7 +25,6 @@ var _convert_ubo := RID()
 var _prefilter_ubo := RID()
 var _capture_state: Dictionary = {}
 var _retired_capture_states: Array[Dictionary] = []
-var _published_capture_rid := RID()
 var _frame_snapshot: Dictionary = {}
 var _frame_context: FRPPassContext
 
@@ -328,7 +327,6 @@ func _publish_complete_cube(capture_target: RID, owner_id: int, batch_id: int) -
 	if not Runtime.publish_capture_probe_targets(capture_target, targets, owner_id, batch_id, snapshot):
 		return false
 	_capture_state["published_slot"] = slot
-	_published_capture_rid = filtered[slot]
 	_capture_state["converted"] = false
 	for old_state in _retired_capture_states:
 		_free_capture_state(RenderingServer.get_rendering_device(), old_state)
@@ -422,7 +420,7 @@ func _take_owned_rids() -> Array[RID]:
 	retired_value.clear()
 	for name in ["_copy_pipeline", "_convert_pipeline", "_prefilter_pipeline",
 			"_copy_shader", "_convert_shader", "_prefilter_shader", "_sampler",
-			"_copy_ubo", "_convert_ubo", "_prefilter_ubo", "_published_capture_rid"]:
+			"_copy_ubo", "_convert_ubo", "_prefilter_ubo"]:
 		super.call("set", name, RID())
 	super.call("set", "_frame_snapshot", {})
 	super.call("set", "_frame_context", null)

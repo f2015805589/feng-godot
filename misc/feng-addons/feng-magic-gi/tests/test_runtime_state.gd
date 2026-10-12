@@ -51,6 +51,16 @@ func run() -> void:
 	data.emitter_static_signatures = PackedInt64Array([Binding.static_signature(emitter, 0, material)])
 	data.emitter_transport = PackedFloat32Array([1, 1, 1, 0, 0, 0])
 	data.bake_version = 1
+	var placement := FMagicGIPlacement.new()
+	require(placement.collect(volume, true, true, true), "emitter geometry must collect")
+	var emitters := placement.emitters
+	require(emitters.keys == data.emitter_keys and emitters.static_signatures == data.emitter_static_signatures,
+		"placement must expose the bake owner's bindings without a second copy")
+	material.emission_enabled = false
+	require(placement.collect(volume, true, true, true) and placement.emitters.keys.is_empty(),
+		"recollection must replace the emitter owner and discard removed sources")
+	require(emitters.keys.size() == 1, "recollection must not mutate a retained bake's emitter set")
+	material.emission_enabled = true
 	var checked := Volume.new()
 	var counted := CountingData.new()
 	checked.bake_data = counted

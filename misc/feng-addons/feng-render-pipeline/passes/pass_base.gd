@@ -111,6 +111,30 @@ func _frp_prepare(_ctx: FRPPassContext) -> void:
 func ensure_frp_contract() -> bool:
 	return false
 
+## Compare persisted texture declarations with a pass’s expected contract.
+func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for i in actual.size():
+		var left := actual[i]
+		var right := expected[i]
+		if left == null or left.binding != right.binding or left.source != right.source \
+				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
+				or left.custom_name != right.custom_name:
+			return false
+	return true
+
+func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for i in actual.size():
+		var left := actual[i]
+		var right := expected[i]
+		if left == null or left.name != right.name or left.data_format != right.data_format \
+				or left.usage != right.usage or left.scale != right.scale:
+			return false
+	return true
+
 func _setup(_rd: RenderingDevice) -> void:
 	pass
 
@@ -225,6 +249,10 @@ func get_volume_parameter_names() -> PackedStringArray:
 ## Optional diffuse-indirect provider classification. The plan resolver uses this
 ## authored identity to select one owner before any pass callback runs.
 func get_indirect_gi_kind() -> StringName:
+	return &""
+
+## Reflection role used by scheduling and capture filtering; empty for other passes.
+func get_reflection_source_kind() -> StringName:
 	return &""
 
 ## Native entries this custom pass must stay before. Pipeline validators use these

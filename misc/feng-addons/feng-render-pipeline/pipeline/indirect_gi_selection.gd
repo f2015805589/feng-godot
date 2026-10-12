@@ -18,13 +18,10 @@ static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 	for entry in passes:
 		if entry == null or not is_entry_enabled_fn.call(entry):
 			continue
-		if not entry.has_method("get_indirect_gi_kind"):
-			continue
-		var kind := StringName(entry.call("get_indirect_gi_kind"))
+		var kind: StringName = entry.get_indirect_gi_kind()
 		if kind not in [KIND_RT, KIND_MAGIC]:
 			continue
-		var source = entry.get_parameter_source() if entry.has_method("get_parameter_source") else entry
-		var key: Variant = source.get_parameter_key() if source.has_method("get_parameter_key") else null
+		var key: Variant = entry.get_parameter_source().get_parameter_key()
 		# An active provider that cannot be addressed is still an owner candidate:
 		# silently ignoring it could let MagicGI write while RTGI is active.
 		var candidate := {
@@ -55,10 +52,7 @@ static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 
 static func _single_or_blocked(kind: StringName, candidates: Array[Dictionary]) -> Dictionary:
 	if candidates.size() == 1:
-		var candidate: Dictionary = candidates[0]
-		if not bool(candidate.get("blocked", false)):
-			return candidate
-		return candidate
+		return candidates[0]
 	# A parameter dictionary is keyed by the pass's stable parameter key. Two
 	# active GI providers with the same key cannot be addressed independently, so
 	# fail closed instead of letting both overwrite one output or replace Sky.

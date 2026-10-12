@@ -4,6 +4,7 @@ extends "pass_base.gd"
 ## Screen-space diffuse ambient occlusion. One scheduler entry owns the complete
 ## horizon, spatial filter, temporal resolve, and depth-aware upsample sequence.
 
+const U = preload("../rd/uniforms.gd")
 const NativeSpec = preload("../pipeline/native_spec.gd")
 const IndirectGISelection = preload("../pipeline/indirect_gi_selection.gd")
 const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
@@ -84,29 +85,6 @@ func _make_outputs() -> Array[OutputDeclaration]:
 	ao.data_format = OUTPUT_FORMAT
 	ao.usage = OutputDeclaration.Usage.SAMPLED | OutputDeclaration.Usage.STORAGE
 	return [ao]
-
-func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.binding != right.binding or left.source != right.source \
-				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
-				or left.custom_name != right.custom_name:
-			return false
-	return true
-
-func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.name != right.name or left.data_format != right.data_format \
-				or left.usage != right.usage or left.scale != right.scale:
-			return false
-	return true
 
 func ensure_frp_contract() -> bool:
 	var expected_inputs := _make_inputs()
@@ -235,21 +213,21 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var previous: RID = history[read_index]
 	var next_history: RID = history[write_index]
 	var output_sets: Array[RID] = [
-		_uniform_set(_shaders[0], [
-			_sampled(0, depth, _nearest_sampler), _sampled(1, normal, _nearest_sampler),
-			_sampled(2, orm, _nearest_sampler), _image(3, raw), _ubo(4, state["ubo"]),
+		UniformSetCacheRD.get_cache(_shaders[0], 0, [
+			U.sampled(0, _nearest_sampler, depth), U.sampled(1, _nearest_sampler, normal),
+			U.sampled(2, _nearest_sampler, orm), U.image(3, raw), U.uniform_buffer(4, state["ubo"]),
 		]),
-		_uniform_set(_shaders[1], [
-			_sampled(0, raw, _nearest_sampler), _sampled(1, depth, _nearest_sampler),
-			_sampled(2, normal, _nearest_sampler), _image(3, spatial), _ubo(4, state["ubo"]),
+		UniformSetCacheRD.get_cache(_shaders[1], 0, [
+			U.sampled(0, _nearest_sampler, raw), U.sampled(1, _nearest_sampler, depth),
+			U.sampled(2, _nearest_sampler, normal), U.image(3, spatial), U.uniform_buffer(4, state["ubo"]),
 		]),
-		_uniform_set(_shaders[2], [
-			_sampled(0, spatial, _nearest_sampler), _sampled(1, velocity, _nearest_sampler),
-			_sampled(2, previous, _nearest_sampler), _image(3, next_history), _ubo(4, state["ubo"]),
+		UniformSetCacheRD.get_cache(_shaders[2], 0, [
+			U.sampled(0, _nearest_sampler, spatial), U.sampled(1, _nearest_sampler, velocity),
+			U.sampled(2, _nearest_sampler, previous), U.image(3, next_history), U.uniform_buffer(4, state["ubo"]),
 		]),
-		_uniform_set(_shaders[3], [
-			_sampled(0, depth, _nearest_sampler), _sampled(1, normal, _nearest_sampler),
-			_sampled(2, next_history, _nearest_sampler), _image(3, output), _ubo(4, state["ubo"]),
+		UniformSetCacheRD.get_cache(_shaders[3], 0, [
+			U.sampled(0, _nearest_sampler, depth), U.sampled(1, _nearest_sampler, normal),
+			U.sampled(2, _nearest_sampler, next_history), U.image(3, output), U.uniform_buffer(4, state["ubo"]),
 		]),
 	]
 	for uniform_set in output_sets:
@@ -510,31 +488,6 @@ func _ensure_zero_velocity(rd: RenderingDevice) -> RID:
 	zero_velocity.resize(8)
 	_zero_velocity_texture = rd.texture_create(format, RDTextureView.new(), [zero_velocity])
 	return _zero_velocity_texture
-
-func _uniform_set(shader: RID, uniforms: Array[RDUniform]) -> RID:
-	return UniformSetCacheRD.get_cache(shader, 0, uniforms)
-
-func _sampled(binding: int, texture: RID, sampler: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	uniform.binding = binding
-	uniform.add_id(sampler)
-	uniform.add_id(texture)
-	return uniform
-
-func _image(binding: int, texture: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	uniform.binding = binding
-	uniform.add_id(texture)
-	return uniform
-
-func _ubo(binding: int, buffer: RID) -> RDUniform:
-	var uniform := RDUniform.new()
-	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER
-	uniform.binding = binding
-	uniform.add_id(buffer)
-	return uniform
 
 func _current_owned_rids() -> Array[RID]:
 	var rids: Array[RID] = []

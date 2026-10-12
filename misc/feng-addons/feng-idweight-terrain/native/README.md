@@ -27,7 +27,8 @@ checks in [`tests/README.md`](tests/README.md).
   publication are synchronous. Content production happens separately
 - `Terrain3DPagePipeline` owns the bounded source queue and immutable snapshots.
   Only snapshot capture depends on `Terrain3DData`; workers do not access the scene.
-  Queue removal shares one path for accounting and deferred image destruction
+  Queue removal shares one path for accounting and deferred image destruction.
+  Workers claim the oldest live token; cancellation leaves no separate FIFO history
 - Clipmap layers keep their storage leases through queued renderer work. Teardown
   drains that work before releasing its resources
 

@@ -47,16 +47,10 @@ rebuilds the same files, since the profiler configuration changes back.
 
 ## Using it
 
-1. Build the engine as above and start the editor.
-2. Download the profiler GUI (`tracy-profiler.exe`) from the
-   [Tracy releases page](https://github.com/wolfpld/tracy/releases) - it is a
-   separate program and is not part of this repository.
-3. Use **Debug > Tracy Profiler**. The profiler ships in the addon's `bin`
-   folder and starts from there; a fresh checkout downloads it once.
-   Editor Settings > Tracy > Profiler > Executable Path overrides the lookup.
-4. In the profiler window press **Connect**, and pick the running editor. The
-   client listens on `127.0.0.1:8086` (override with the `TRACY_PORT`
-   environment variable), and a frame timeline appears as soon as it attaches.
+The [editor addon guide](../../misc/feng-addons/feng-godottracy/README.md)
+covers profiler installation, executable discovery and **Debug > Tracy Profiler**.
+Connect to the running editor; the client listens on `127.0.0.1:8086` unless
+`TRACY_PORT` overrides it.
 
 `TRACY_NO_EXIT=1` keeps the client alive until the profiler disconnects, which
 is useful when a short-lived tool exits before the GUI can attach.
@@ -142,18 +136,8 @@ messages and categories are emitted. Neither launches the profiler GUI.
   `profiler_record_on_demand=yes` the client discards events until a profiler
   attaches.
 
-## Engine fix this module depends on
+## Thread initialization
 
-The Tracy client starts its worker threads while its translation unit is being
-statically initialized. Godot handed out thread IDs from
-`core/os/thread.cpp`'s `Thread::id_counter`, a plain `SafeNumeric` that is
-initialized *dynamically*, so those early threads incremented a counter that was
-still zero and were given IDs starting at 1 - including `MAIN_ID`. The real main
-thread then got a low ID as well, `Thread::make_main_thread()` concluded it was
-already the main thread and left `is_main_thread_assigned` unset, and
-`Thread::release_main_thread()` aborted the process on shutdown.
-
-`Thread::id_counter` is now replaced by `Thread::next_id()` with a function-local
-counter, which is initialized on first use and therefore immune to the order of
-static initialization. Any library that starts a thread during static
-initialization would have hit the same problem.
+Tracy starts worker threads during static initialization. Godot's
+`Thread::next_id()` uses a function-local counter so those workers receive
+unique IDs regardless of translation-unit initialization order.

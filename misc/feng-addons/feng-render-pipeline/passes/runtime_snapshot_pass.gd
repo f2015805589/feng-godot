@@ -67,29 +67,6 @@ func _get_runtime_script() -> Script:
 				_runtime_script = loaded
 	return _runtime_script
 
-func _inputs_match(actual: Array[TextureInput], expected: Array[TextureInput]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.binding != right.binding or left.source != right.source \
-				or left.binding_type != right.binding_type or left.custom_scope != right.custom_scope \
-				or left.custom_name != right.custom_name:
-			return false
-	return true
-
-func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
-	if actual.size() != expected.size():
-		return false
-	for i in actual.size():
-		var left := actual[i]
-		var right := expected[i]
-		if left == null or left.name != right.name or left.data_format != right.data_format \
-				or left.usage != right.usage or left.scale != right.scale:
-			return false
-	return true
-
 ## Uploads the frame's uniform block. The UBO is created lazily so a pass that
 ## never gets a snapshot stays a true no-op with no GPU state.
 func _commit_frame_ubo(values: PackedFloat32Array, ubo_size: int, rd: RenderingDevice) -> bool:

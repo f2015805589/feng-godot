@@ -30,6 +30,7 @@ flowchart TD
 | `rd/owned_rids.gd`、`rd/shader_source.gd`、`rd/uniforms.gd` | 无状态低层值操作：有序 RID 去重、相对 shader include 展开、标准 RDUniform 构造；不依赖 Pass、Fog 或 Cloud |
 | `pipeline/library_manager.gd` | 库清单、默认开关、锚点、实例身份和删除记录 |
 | `pipeline/pipeline_migrator.gd` | 旧资源格式、原生 ID 及严格匹配的默认云/雾顺序迁移 |
+| `pipeline/reflection_plan.gd` | 拥有隐藏反射 Pass；一次扫描作者条目完成候选识别、Resolve 插入、旧优先级发布和捕获过滤 |
 | `pipeline/execution_plan.gd`、`pipeline_validator.gd` | 从已初始化条目构造 effects/token/provided，检查调度与纹理依赖 |
 | `pipeline/compositor_binding.gd` | 附件需求、效果绑定、RenderingServer 上传及无效计划保护 |
 | `pipeline/parameter_resolver.gd` | 作者参数、稳定键/别名和代码声明的 Volume 字段权限 |
@@ -45,7 +46,8 @@ flowchart TD
 | `editor_plugin.gd`、`project_pipeline.gd` | 编辑器服务、项目路径/UID 解析与默认世界安装 |
 | `world_compositor.gd` | 世界 compositor 选择规则，包括引擎 WorldEnvironment 分组约定 |
 
-ExecutionPlan、校验器和绑定直接消费 FengPass 的类型化契约（准备、契约来源、参数与开关）。
+ExecutionPlan、校验器和绑定直接消费 FengPass 的类型化契约（准备、契约来源、参数、反射角色与开关）。
+纹理声明的字段比较由 FengPass 统一提供；各效果声明期望输入/输出并决定何时修复旧资源。
 ExecutionPlan 和 VolumeResolver 根据输入生成结果，不改作者资源或调用 RenderingServer。
 VolumeEvaluator 只依赖位置、Volume 配置以及设置来源的 `get_instance_id()`、
 `get_parameter_revision()`、`get_volume_context()` 协议，可独立于相机和 compositor 测试。
@@ -81,7 +83,8 @@ Renderer 的 `get_volume_context()` 按参数版本缓存作者值、元数据�
 每个 FengCompositor 的 ViewState 持有独立参数、开关、效果 RID 和 TextureManager。
 纹理由各自 RenderSceneBuffers 持有。相机可共享 Renderer 作者资源，运行时结果保持独立。
 Pass 自有 RD 资源通过 `_take_owned_rids()` 逐层转移并清空，显式清理与析构共用同一份
-所有权声明；延迟释放只捕获 RID，不依赖已销毁的 Pass。Shader 热重载只转移依赖 shader
+所有权声明；需要析构兜底的 Pass 在存活时同步静态 RID 快照，基类清理时取出并去重。
+延迟释放只捕获 RID，不依赖已销毁的 Pass。Shader 热重载只转移依赖 shader
 的对象，保留 sampler；Cloud 的命名纹理 scope 仍由 FengCloudGPU 的清理包管理。
 借用的帧/producer RID 仍由原所有者释放。
 

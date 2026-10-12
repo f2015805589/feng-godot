@@ -4,6 +4,12 @@ extends SceneTree
 const RegistryScript = preload("res://addons/feng-fog/rendering/raytracing/fog_rt_geometry_registry.gd")
 const ShadowProviderScript = preload("res://addons/feng-fog/rendering/raytracing/fog_rt_shadow_provider.gd")
 
+class TerrainDataSignals extends RefCounted:
+	signal maps_edited(edited_area: AABB)
+	signal region_map_changed
+	signal height_maps_changed
+	signal control_maps_changed
+
 var _checks := 0
 var _failures := 0
 
@@ -20,6 +26,7 @@ func _require(p_condition: bool, p_message: String) -> void:
 
 
 func _run() -> void:
+	_test_terrain_data_signals()
 	_test_tlas_release_state()
 	var raw_stage_names := ["raygen", "miss", "closest_hit", "any_hit"]
 	for stage_name in raw_stage_names:
@@ -546,6 +553,38 @@ func _run() -> void:
 	else:
 		push_error("ray-tracing geometry registry failed: %d/%d" % [_failures, _checks])
 	quit(1 if _failures > 0 else 0)
+
+
+func _test_terrain_data_signals() -> void:
+	var registry = RegistryScript.new()
+	var data := TerrainDataSignals.new()
+	var terrain_id := 17
+	registry._terrain_mesh_cache[terrain_id] = {"dirty": false}
+	registry._terrain_mesh_cache[18] = {"dirty": false}
+	registry._watch_terrain_data(terrain_id, data)
+	registry._watch_terrain_data(terrain_id, data) # Repeated observation must not duplicate connections.
+	for signal_name in ["maps_edited", "region_map_changed", "height_maps_changed", "control_maps_changed"]:
+		_require(data.get_signal_connection_list(signal_name).size() == 1,
+				"terrain data connects %s exactly once" % signal_name)
+		registry._terrain_mesh_cache[terrain_id]["dirty"] = false
+		if signal_name == "maps_edited":
+			data.maps_edited.emit(AABB(Vector3.ONE, Vector3.ONE))
+		else:
+			data.emit_signal(signal_name)
+		_require(registry._terrain_mesh_cache[terrain_id]["dirty"]
+				and not registry._terrain_mesh_cache[18]["dirty"],
+				"%s invalidates only its bound terrain bake" % signal_name)
+	registry._unwatch_terrain_data(terrain_id)
+	registry._terrain_mesh_cache[terrain_id]["dirty"] = false
+	data.maps_edited.emit(AABB())
+	data.height_maps_changed.emit()
+	_require(not registry._terrain_mesh_cache[terrain_id]["dirty"],
+			"unwatch disconnects both payload and no-argument terrain signals")
+	registry._watch_terrain_data(terrain_id, data)
+	registry.detach()
+	for signal_name in ["maps_edited", "region_map_changed", "height_maps_changed", "control_maps_changed"]:
+		_require(data.get_signal_connection_list(signal_name).is_empty(),
+				"detach disconnects the exact %s callable" % signal_name)
 
 
 func _test_tlas_release_state() -> void:

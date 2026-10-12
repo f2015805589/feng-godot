@@ -4,33 +4,9 @@ extends FengVolumetricCloudPass
 ## Builds the optional cloud shadow maps and sky-occlusion texture before
 ## deferred lighting. The pass is inert when no cloud snapshot is routed.
 
-var _active_context: FRPPassContext
-
-
 func _init() -> void:
 	stage = EFFECT_CALLBACK_TYPE_PRE_LIGHTING
 	effect_callback_type = stage
-
-
-func _frp_execute(ctx: FRPPassContext) -> void:
-	_active_context = ctx
-	super._frp_execute(ctx)
-	_active_context = null
-
-
-## Capture adapters call this during their post-setup/pre-lighting phase so the
-## native lighting stage sees the same frozen cloud and shadow settings as the
-## later face trace.
-func prepare_capture(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
-	_capture_snapshot_for_prepare(ctx, frozen_snapshot)
-	_frp_prepare(ctx)
-
-
-## Runs the shadow work for one capture face after its G-buffer is available.
-func execute_capture(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
-	_active_context = ctx
-	_frp_execute_with_snapshot(ctx, frozen_snapshot)
-	_active_context = null
 
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
@@ -38,12 +14,3 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		return
 	_cloud_gpu.render_shadow(_active_context, _frame_snapshot, _frame_scene_data,
 		view, buffers, rd, get_instance_id())
-
-
-func _capture_snapshot_for_prepare(ctx: FRPPassContext, snapshot: Dictionary) -> void:
-	_frame_snapshot = snapshot.duplicate(true)
-	_frame_scene_data = null
-	if ctx != null:
-		var render_data := ctx.get_render_data()
-		if render_data != null:
-			_frame_scene_data = render_data.get_render_scene_data()

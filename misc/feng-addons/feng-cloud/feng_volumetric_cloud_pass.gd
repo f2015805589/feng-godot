@@ -17,6 +17,7 @@ const SHADER_CONFIGURATION_PROPERTIES := [
 
 
 var _cloud_gpu = FengCloudGPU.new()
+var _active_context: FRPPassContext
 
 
 func requires_shader_file() -> bool:
@@ -33,6 +34,17 @@ func runtime_script_path() -> String:
 	return RUNTIME_SCRIPT_PATH
 
 
+## Both viewport and capture routes share the same frame-state lifetime.
+func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> void:
+	_active_context = ctx
+	super._frp_execute_with_snapshot(ctx, snapshot)
+	_active_context = null
+
+
+func execute_capture(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
+	_frp_execute_with_snapshot(ctx, frozen_snapshot)
+
+
 func _render(_buffers: RenderSceneBuffersRD, _view: int, _rd: RenderingDevice) -> void:
 	# The base publishes metadata; subclasses dispatch GPU work.
 	return
@@ -40,7 +52,7 @@ func _render(_buffers: RenderSceneBuffersRD, _view: int, _rd: RenderingDevice) -
 
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	# Runtime target routing already gives this pass its private snapshot copy;
-	# capture routing owns the frozen copy installed by _frp_prepare_with_snapshot.
+	# capture routing owns the frozen copy installed by prepare_capture.
 	var snapshot: Dictionary = _frame_snapshot
 	if snapshot.is_empty() and ctx != null:
 		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
@@ -50,7 +62,7 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 
 ## Capture-only probes have no viewport target, so the caller supplies the
 ## immutable cloud snapshot frozen when the six-face batch was submitted.
-func _frp_prepare_with_snapshot(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
+func prepare_capture(ctx: FRPPassContext, frozen_snapshot: Dictionary) -> void:
 	var previous_snapshot := _frame_snapshot
 	_frame_snapshot = frozen_snapshot.duplicate(true)
 	_frp_prepare(ctx)
@@ -162,31 +174,24 @@ func _pack_material_snapshot(snapshot: Dictionary, material: Dictionary, texture
 	return values
 
 
-func _sun_rid(sun_inputs: Variant, index: int) -> RID:
+func _sun_input(sun_inputs: Variant, index: int) -> Dictionary:
 	if not sun_inputs is Array or index < 0 or index >= sun_inputs.size():
-		return RID()
-	var item: Variant = sun_inputs[index]
-	if not item is Dictionary:
-		return RID()
-	var rid: Variant = item.get("light_rid", RID())
+		return {}
+	return sun_inputs[index] if sun_inputs[index] is Dictionary else {}
+
+
+func _sun_rid(sun_inputs: Variant, index: int) -> RID:
+	var rid: Variant = _sun_input(sun_inputs, index).get("light_rid", RID())
 	return rid if rid is RID else RID()
 
 
 func _sun_ground_transmittance(sun_inputs: Variant, index: int) -> Vector3:
-	if not sun_inputs is Array or index < 0 or index >= sun_inputs.size():
-		return Vector3.ONE
-	var item: Variant = sun_inputs[index]
-	if not item is Dictionary:
-		return Vector3.ONE
-	var transmittance: Variant = item.get("ground_transmittance", Vector3.ONE)
+	var transmittance: Variant = _sun_input(sun_inputs, index).get("ground_transmittance", Vector3.ONE)
 	return transmittance.max(Vector3.ZERO).min(Vector3.ONE) if transmittance is Vector3 and transmittance.is_finite() else Vector3.ONE
 
 
 func _sun_cast_shadows_on_clouds(sun_inputs: Variant, index: int) -> bool:
-	if not sun_inputs is Array or index < 0 or index >= sun_inputs.size():
-		return false
-	var item: Variant = sun_inputs[index]
-	return bool(item.get("cast_shadows_on_clouds", false)) if item is Dictionary else false
+	return bool(_sun_input(sun_inputs, index).get("cast_shadows_on_clouds", false))
 
 
 func _texture_rid(resource: Variant) -> RID:

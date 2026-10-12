@@ -23,9 +23,6 @@ const LIGHT_BYTES := 224
 const BAKED_MODE_NONE := 0
 const BAKED_MODE_LIGHTMAP_GI_PROBES := 1
 const BAKED_MODE_UE_VOLUMETRIC_LIGHTMAP := 2
-const VLM_FLAG_STATIC_DIRECT_DIRECTIONAL := VolumetricLightmapProviderScript.FLAG_CONTAINS_STATIC_DIRECT_DIRECTIONAL_LIGHTING
-const VLM_FLAG_STATIC_LIGHT_KEY_MATCH := VolumetricLightmapProviderScript.FLAG_STATIC_LIGHT_KEY_MATCH
-const FRAME_INPUT_ABI := 1
 const DIRECTIONAL_STRIDE := 464
 const LOCAL_STRIDE := 224
 const MAX_DIRECTIONAL_LIGHTS := 8
@@ -44,7 +41,6 @@ var _sampler_nearest := RID()
 var _sampler_linear := RID()
 var _sampler_compare := RID()
 var _fallback_texture_2d := RID()
-var _fallback_texture_array := RID()
 var _fallback_density_3d := RID()
 var _fallback_depth_2d := RID()
 var _fallback_shadow := RID()
@@ -358,7 +354,7 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 		OwnedRids.append(rids, seen, entry.pipeline)
 		OwnedRids.append(rids, seen, entry.shader)
 	for rid in [_sampler_nearest, _sampler_linear, _sampler_compare,
-			_fallback_texture_2d, _fallback_texture_array, _fallback_shadow,
+			_fallback_texture_2d, _fallback_shadow,
 			_fallback_density_3d, _fallback_depth_2d, _fallback_directional_buffer,
 			_fallback_local_buffer, _fallback_cluster_buffer, _fallback_sky_sh_buffer]:
 		OwnedRids.append(rids, seen, rid)
@@ -391,7 +387,6 @@ func _collect_owned_rids(p_clear: bool) -> Array[RID]:
 		_sampler_linear = RID()
 		_sampler_compare = RID()
 		_fallback_texture_2d = RID()
-		_fallback_texture_array = RID()
 		_fallback_shadow = RID()
 		_fallback_density_3d = RID()
 		_fallback_depth_2d = RID()
@@ -1083,8 +1078,6 @@ func _ensure_fallbacks(rd: RenderingDevice) -> bool:
 		_sampler_compare = _make_sampler(rd, true, true)
 	if not _fallback_texture_2d.is_valid():
 		_fallback_texture_2d = _create_color_texture(rd, RenderingDevice.TEXTURE_TYPE_2D, 1, 1, 1)
-	if not _fallback_texture_array.is_valid():
-		_fallback_texture_array = _create_color_texture(rd, RenderingDevice.TEXTURE_TYPE_2D_ARRAY, 1, 1, 1)
 	if not _fallback_density_3d.is_valid():
 		_fallback_density_3d = _create_density_texture(rd)
 	if not _fallback_depth_2d.is_valid():
@@ -1110,7 +1103,7 @@ func _ensure_fallbacks(rd: RenderingDevice) -> bool:
 	var validity := {
 		"nearest sampler": _sampler_nearest.is_valid(), "linear sampler": _sampler_linear.is_valid(),
 		"compare sampler": _sampler_compare.is_valid(), "2D fallback texture": _fallback_texture_2d.is_valid(),
-		"array fallback texture": _fallback_texture_array.is_valid(), "3D density fallback": _fallback_density_3d.is_valid(),
+		"3D density fallback": _fallback_density_3d.is_valid(),
 		"2D depth fallback": _fallback_depth_2d.is_valid(),
 		"shadow fallback": _fallback_shadow.is_valid(), "directional buffer fallback": _fallback_directional_buffer.is_valid(),
 		"local buffer fallback": _fallback_local_buffer.is_valid(), "cluster buffer fallback": _fallback_cluster_buffer.is_valid(),
@@ -1255,26 +1248,10 @@ func _frame_sampler(value: Variant, fallback: RID) -> RID:
 	return value if value is RID and value.is_valid() else fallback
 
 
-func _sky_texture_for_type(frame: Dictionary, array_texture: bool, rd: RenderingDevice) -> RID:
-	var is_array := bool(frame.get("sky_radiance_is_array", false))
-	if is_array != array_texture:
-		return _fallback_texture_array if array_texture else _fallback_texture_2d
-	return _texture(frame.get("sky_radiance_texture", RID()),
-			_fallback_texture_array if array_texture else _fallback_texture_2d, rd)
-
-
 func _texture(value: Variant, fallback: RID, rd: RenderingDevice) -> RID:
 	if value is RID and value.is_valid() and rd.texture_is_valid(value):
 		return value
 	return fallback
-
-
-func _valid_texture(value: Variant) -> bool:
-	return value is RID and value.is_valid()
-
-
-func _valid_texture_rid(value: Variant) -> bool:
-	return value is RID and value.is_valid()
 
 
 func _valid_buffer_rid(value: Variant) -> bool:

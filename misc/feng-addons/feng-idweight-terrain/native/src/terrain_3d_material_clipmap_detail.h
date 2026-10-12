@@ -3,42 +3,11 @@
 #ifndef TERRAIN3D_MATERIAL_CLIPMAP_DETAIL_H
 #define TERRAIN3D_MATERIAL_CLIPMAP_DETAIL_H
 
-// The material group's *detail* layer: a sparse, demand-resident ring of small fine tiles that sits
-// between the camera and the ladder's coarser units, and the thing in the delivery matrix that holds
-// 1024 texels/m over the *near view* rather than inside one small square.
-//
-// **Why it is not a denser ladder.** The ladder is one dense unit per octave. Its finest unit is now a
-// real 1024 texels/m - 256 texels over 0.25 m since the 1024 -> 1 task - so a point 0.1 m from the
-// focus is served at 1024, but a point 1.6 m ahead falls to unit 4 or 5 and reads 64-128 texels/m: the
-// density falls off with distance by construction, and a single dense unit wide enough to cover the
-// near field at 1024 would be a 4096-texel square - hundreds of MiB. The detail layer exists to spend
-// the same density where a fragment actually reads it: a sparse set of tiles with a bounded pool.
-//
-// **What lives here, and what does not.** This class owns residency only: integer world tile keys
-// (`level + snapped tile X/Y`, so a world 10 km out addresses exactly like the origin), a fixed slot
-// table, a per-level directory the shader indexes (`key -> slot`, published only once a tile's bake
-// has landed *and* its generation still matches), the demand rule, the LRU, the byte budget and the
-// counters. It owns the GPU storage too - the two source arrays a pipeline result is uploaded into
-// and the three baked arrays a producer writes - because the shader and the producer have to sample
-// the same textures. It does **not** own the bake: `Terrain3DSurfaceBaker::queue_detail_tiles()`
-// takes the offers this class produces and dispatches them, exactly the way it bakes a ring rect.
-//
-// **The fallback chain it enables.** Shader-side: a valid detail tile -> the coarse ring's baked
-// layers -> the coarse ring's payload through `evaluate_idweight_material()` -> the region texture
-// array. A tile that is not resident, or resident but not yet baked, or baked against a generation
-// that has since been invalidated, is *absent* from the directory, so a fragment never reads stale
-// texels - the directory bit is the whole of the reader's gate, and the same bit is what makes a
-// moved camera safe: a slot is only published when the bake that filled it acknowledges the
-// generation the slot was handed out under.
-//
-// **Source preparation reuses the page pipeline.** A tile is one `Terrain3DPagePipeline::Request`
-// whose rect is the tile's *interior* rect and whose size is the tile's interior texel count. When
-// the output texel is finer than the source step - which is the whole case this layer exists for -
-// the pipeline answers with the id/weight and height images on the *source* corner grid, and returns
-// that grid in `Result::grid`. The bake job then carries the output texel size and the source grid
-// separately (`policy.w` against `page.xy` in the bake shader), so a 1024 texels/m output is filtered
-// from real source corners instead of reading the same low-density texel a thousand times.
-
+// Sparse near-field material tiles with bounded residency and GPU storage.
+// Integer world tile keys map to slots; generation-matched bake acknowledgements
+// publish those slots into per-level directories. Missing tiles use coarse fallback.
+// Terrain3DPagePipeline prepares source corner grids; Terrain3DSurfaceBaker owns
+// baking. Bake offers carry source-grid spacing separately from output density.
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>

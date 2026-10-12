@@ -104,6 +104,21 @@ func _release(state: Dictionary, guides: Array[RID]) -> void:
 	for texture in guides:
 		rd.free_rid(texture)
 
+func _state_layout() -> void:
+	var state: Dictionary = backend.create_state(SIZE)
+	var guides := _guides(0.7)
+	var camera := Transform3D(Basis.IDENTITY, Vector3(0.125, 0.0, 0.0))
+	_resolve(state, guides, "white", 1, camera)
+	var bytes := rd.buffer_get_data(state.ubo)
+	var layout_ok := bytes.size() == 256 \
+			and bytes.slice(48, 64) == PackedFloat32Array([0.0, 0.0, 0.0, 0.0]).to_byte_array() \
+			and bytes.decode_float(112) == camera.origin.x \
+			and bytes.decode_float(128) == 1.0 \
+			and bytes.decode_float(240) == camera.origin.x
+	_record("reserved_temporal_ubo_layout", state.valid and layout_ok, bytes.size())
+	_record("history_keeps_only_used_state", not state.has("camera") and not state.has("last_seen"), true)
+	_release(state, guides)
+
 func _solid_image(color: Color, format: int = Image.FORMAT_RGBAH) -> Image:
 	var image := Image.create(SIZE.x, SIZE.y, false, format)
 	for y in SIZE.y:
@@ -377,6 +392,7 @@ func execute() -> void:
 	sampler = rd.sampler_create(sampler_state)
 	# This compute-only fixture skips initialize(), which normally creates it.
 	backend.candidate_sampler = sampler
+	_state_layout()
 	_noise_and_mirror()
 	_boundaries()
 	_rough_history_convergence()

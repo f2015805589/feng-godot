@@ -59,8 +59,7 @@ func apply(compositor: Compositor, renderer: FengRenderer, parameters: Dictionar
 			var effect: ViewPass = _bindings[source]
 			if active and effect.execution == null:
 				effect.execution = source if renderer.is_view_shareable(source) else source.duplicate(true)
-				if effect.execution != source and source.has_method("get_reflection_source_kind") \
-						and StringName(source.call("get_reflection_source_kind")) == &"resolve":
+				if effect.execution != source and source.get_reflection_source_kind() == &"resolve":
 					ReflectionSettings.copy_legacy_fallback_priority(
 							source.get_instance_id(), effect.execution.get_instance_id())
 			effect.configure(source, effect.execution, active)

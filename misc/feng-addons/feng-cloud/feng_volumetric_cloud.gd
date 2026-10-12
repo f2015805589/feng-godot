@@ -345,7 +345,6 @@ func _build_snapshot(world: World3D) -> Dictionary:
 		"planet_radius_m": radius_km * 1000.0,
 		"planet_source_id": int(sky_snapshot.get("provider_id", 0)),
 		"atmosphere_revision": int(sky_snapshot.get("settings_revision", -1)),
-		"sky_rendering_signature": [sky_snapshot],
 		"atmosphere_snapshot": sky_snapshot,
 		"layer_bottom_m": layer_bottom_altitude_km * 1000.0,
 		"layer_height_m": layer_height_km * 1000.0,

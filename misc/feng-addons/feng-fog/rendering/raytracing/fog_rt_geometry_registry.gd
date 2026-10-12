@@ -452,6 +452,8 @@ func _watch_terrain_data(p_terrain_id: int, p_data: Object) -> void:
 		if not p_data.has_signal(signal_name):
 			continue
 		var callback := Callable(self, "_on_terrain_data_changed").bind(p_terrain_id)
+		if signal_name == "maps_edited":
+			callback = callback.unbind(1) # Discard the emitted AABB before applying the bound terrain ID.
 		if not p_data.is_connected(signal_name, callback):
 			p_data.connect(signal_name, callback)
 		callbacks.append({"signal": signal_name, "callback": callback})
@@ -471,7 +473,7 @@ func _unwatch_terrain_data(p_terrain_id: int) -> void:
 	_terrain_connections.erase(p_terrain_id)
 
 
-func _on_terrain_data_changed(p_terrain_id: int, _p_change: Variant = null) -> void:
+func _on_terrain_data_changed(p_terrain_id: int) -> void:
 	if _terrain_mesh_cache.has(p_terrain_id):
 		_terrain_mesh_cache[p_terrain_id]["dirty"] = true
 

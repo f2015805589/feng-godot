@@ -1,10 +1,6 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
-// The clipmap delivery's implementation. Read terrain_3d_clipmap.h first: it states the ring's
-// invariant and why the stored content never moves, the production budget, what the upload
-// accounting is for, and why the channel a level carries lives behind `Terrain3DClipmapSource`
-// rather than in this file.
-
+// Toroidal clipmap production and uploads; addressing contracts are in the header.
 #include "terrain_3d_clipmap.h"
 #include "terrain_3d_baked_texture_arrays.h"
 
@@ -39,26 +35,11 @@ uint64_t clipmap_clock_ns() {
 // budget the addon can produce under.
 static constexpr int CLIPMAP_MIN_SIZE = 8;
 static constexpr int CLIPMAP_MAX_SIZE = 4096;
-// The most scalars one texel may hold, and therefore the ceiling on what a source may declare
-// (`Terrain3DClipmapSource::get_channel_count()`). A level's CPU side is `size * size * channels`
-// floats and its GPU side is the same count in `format`, so this is a memory statement rather than
-// an arbitrary limit: at the shape the settings default to (256 texels an axis, 8 levels, four
-// bytes a value) one channel is 2 MB and this ceiling is 32 MB, while at the largest ring the
-// settings allow (4096 texels, 16 levels) one channel alone is 1 GB. A multi-component value is not
-// a channel at all: it is a *baked* channel, a whole layer a producer writes, so this ceiling never
-// sees the material group's three arrays.
+// Scalar source channels are bounded to limit CPU and texture-array allocation.
 static constexpr int CLIPMAP_MAX_CHANNELS = 16;
 
-// One value per texel per layer, so a *channel's* format is the value's format. A baked channel is
-// the exception and the reason the two are separate: its layer is a whole texel - albedo and height,
-// an octahedral normal and roughness, the parameters - so it carries four components and the shared
-// `TerrainClipmap::bytes_per_texel()` is where its bytes are counted.
-
-// The world rect a rect of *logical* texels covers. Logical index (0,0)'s texel *centre* is
-// `center - world_size / 2 + texel_world / 2`, so a logical rect `[x0, x1) x [y0, y1)` starts half a
-// texel before its first centre and is `(x1 - x0) x (y1 - y0)` texels wide. The ring is not applied
-// here: a rect of logical texels covers contiguous world either way, which is the whole point of the
-// logical/physical split.
+// Logical half-open texel bounds map directly to world bounds, independently of
+// the toroidal offset. Texel centres sit half a texel inside the rectangle.
 static Rect2 _clipmap_logical_rect_world(const Terrain3DClipmap::Level &p_level, const int p_x0,
 		const int p_y0, const int p_x1, const int p_y1) {
 	const Vector2 origin = p_level.center - Vector2(p_level.world_size, p_level.world_size) * 0.5f +
@@ -185,11 +166,7 @@ bool Terrain3DClipmap::covers(const Vector2 &p_world) const {
 	return _contains_level(int(_levels.size()) - 1, p_world);
 }
 
-// Whether a level's own texel range contains a point. Deliberately not `abs(point - centre) <= half`:
-// that includes the far edge, which is one texel *past* the last stored one (`floor()` of exactly
-// `size`), so a reader that clamps - the shader's `texelFetch`, and `sample()` below - would answer it
-// with the edge texel and therefore with the height of a world position one texel away. The range is
-// half-open on both ends, which is exactly the set of texels the level stores.
+// Half-open coverage excludes the far edge, whose index would equal size.
 bool Terrain3DClipmap::_contains_level(const int p_level, const Vector2 &p_world) const {
 	const Level &entry = _levels[size_t(p_level)];
 	const real_t half = entry.world_size * 0.5f;
@@ -237,19 +214,9 @@ Vector2i Terrain3DClipmap::physical_of_logical(const int p_level, const Vector2i
 	return Vector2i(_wrap(p_logical.x + ring.x), _wrap(p_logical.y + ring.y));
 }
 
-// The source changed under a world rect. The texels that cover it are queued per level against the
-// centre and ring the level has *right now*, and the levels that touch it stop being current at
-// once - which is what makes the reader's fallback correct without waiting for the re-production.
-//
-// Converting to logical indices here rather than at drain time is sound because the mapping a job
-// was converted against cannot move while the queue is not empty: `update()` re-derives the jobs of
-// a new focus only from an empty queue, so every level's centre stands still until this rect (and
-// whatever was queued before it) has drained. A world rect retained until then would have to be
-// re-converted on every rebuild and could not be re-converted while the level is mid-rect anyway.
-//
-// Two cases cost nothing: a level that is already being produced whole already covers the rect (the
-// values it has not written yet are read from the source after the edit), and a rect entirely
-// outside a level's own coverage names none of its texels.
+// Queue edits against the current logical mapping, which stays fixed while jobs
+// drain. Only an unstarted full fill already covers all changed source texels;
+// a partial fill must refresh its previously produced prefix too.
 int Terrain3DClipmap::invalidate_rect(const Rect2 &p_world) {
 	if (!is_configured()) {
 		return 0;
@@ -269,7 +236,8 @@ int Terrain3DClipmap::invalidate_rect(const Rect2 &p_world) {
 		Level &entry = _levels[size_t(level)];
 		bool filled = false;
 		for (const Job &job : _jobs) {
-			if (job.level == level && job.x0 == 0 && job.y0 == 0 && job.x1 == _config.size && job.y1 == _config.size) {
+			if (job.level == level && job.x0 == 0 && job.y0 == 0 && job.x1 == _config.size && job.y1 == _config.size &&
+					job.cursor_y == job.y0 && job.cursor_channel == 0 && job.cursor_x == job.x0) {
 				filled = true;
 				break;
 			}
@@ -496,16 +464,8 @@ void Terrain3DClipmap::_rebuild_jobs(const Vector2 &p_focus) {
 	}
 }
 
-// Produces as much of `p_job` as the budget allows and leaves `p_job`'s cursor naming what is left,
-// so a level that does not fit one call is continued exactly where it stopped. Production is
-// charged and resumed per *run of a row*, not per texel: the source is asked once for a run of a
-// row, which is where its own lookup cost is, and the run is cut at the budget so a call still
-// spends what it was given.
-//
-// The rect and the cursor are separate on purpose. A strip is a rect (a column, a row, or both
-// bands), and every row of it must be produced; only the *resume point* is a position inside the
-// rect, and reading `x0` as "the first row is partial" is the mistake that makes a one-texel move
-// produce the whole level one row short.
+// Resume within the half-open rectangle using a separate row/channel/column
+// cursor. Charge the budget per source value and preserve the cursor on exhaustion.
 bool Terrain3DClipmap::_produce_rect(Job &p_job, int &r_budget) {
 	for (int y = p_job.cursor_y; y < p_job.y1; y++) {
 		const bool first_row = y == p_job.cursor_y;
@@ -846,16 +806,8 @@ void Terrain3DClipmap::mark_baked_stale() {
 	}
 }
 
-// One produced rect joins its level's queue, translated into the level's *stored* frame.
-//
-// The produced rect is a rect of logical texels - the ones whose content the level's own movement
-// changed - and the baked layer is indexed the way the payload layer is, by the *stored* texel,
-// because the stored frame is the one that keeps naming the same world position as the level turns:
-// the centre moves and the ring offset turns with it, so a texel the movement did not touch still
-// describes the world position it described. That is what makes a strip's bake sufficient, and a layer
-// indexed in the level's own (moving) frame would leave the rest of the level describing world
-// positions it no longer covers. A rect that crosses the wrap is two rects, because a stored rect is
-// contiguous.
+// Convert produced logical bounds to physical storage bounds. Splitting at the
+// toroidal wrap preserves unchanged baked texels when coverage moves.
 void Terrain3DClipmap::_queue_bake_rect(const int p_level, const int p_x0, const int p_y0, const int p_x1,
 		const int p_y1) {
 	if (p_level < 0 || p_level >= int(_levels.size()) || p_x1 <= p_x0 || p_y1 <= p_y0) {
