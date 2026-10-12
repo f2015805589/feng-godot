@@ -6,6 +6,7 @@ extends Resource
 ## baking its radiance into the geometry response.
 
 const Visibility = preload("feng_magic_gi_visibility.gd")
+const SHFilter = preload("feng_magic_gi_sh_filter.gd")
 const FORMAT_VERSION := 6
 const MOMENT_FORMAT_VERSION := 5
 const PRIMARY_SKY_FORMAT_VERSION := 4
@@ -24,9 +25,6 @@ const VISIBILITY_TEXELS_PER_PROBE := VISIBILITY_TILE_SIZE * VISIBILITY_TILE_SIZE
 const CELL_CAPACITY := 8
 const CELL_BOUNDARY_EPSILON := 0.00001
 const SH_Y00 := 0.2820947918
-const SH_L1_ABSOLUTE_BOUND := 0.488602512
-const SH_L2_ABSOLUTE_BOUND := 0.630783131
-const RUNTIME_ATLAS_FILTER_EPSILON := 0.00001
 
 @export_storage var format_version := 0
 @export_storage var grid_dims := Vector3i.ZERO
@@ -524,29 +522,7 @@ func _pack_primary_sky_image() -> Image:
 	return image
 
 func _runtime_high_band_scale(probe: int) -> Vector3:
-	var scale := Vector3.ZERO
-	var base := probe * 27
-	for channel in 3:
-		var dc := SH_Y00 * transfer[base + channel]
-		var l1_squared := 0.0
-		for coefficient in range(1, 4):
-			var value := transfer[base + coefficient * 3 + channel]
-			l1_squared += value * value
-		var l2_squared := 0.0
-		for coefficient in range(4, 9):
-			var value := transfer[base + coefficient * 3 + channel]
-			l2_squared += value * value
-		# By the spherical-harmonic addition theorem, these constants bound
-		# |sum(l=1) T_k Y_k(n)| and |sum(l=2) T_k Y_k(n)| for every unit n.
-		# Scaling all higher bands by dc/(A1+A2) therefore keeps dc + higher >= 0.
-		var anisotropy_bound := SH_L1_ABSOLUTE_BOUND * sqrt(l1_squared) \
-				+ SH_L2_ABSOLUTE_BOUND * sqrt(l2_squared)
-		if dc > 0.0:
-			# A tiny relative margin absorbs f32 atlas rounding. If dc is zero,
-			# suppress higher bands too rather than inventing a constant floor.
-			scale[channel] = 1.0 if anisotropy_bound <= 0.0 else clampf(
-				dc * (1.0 - RUNTIME_ATLAS_FILTER_EPSILON) / anisotropy_bound, 0.0, 1.0)
-	return scale
+	return SHFilter.high_band_scale(transfer, probe * 27)
 
 func make_geometry_image() -> Image:
 	if format_version < MOMENT_FORMAT_VERSION or not is_valid():

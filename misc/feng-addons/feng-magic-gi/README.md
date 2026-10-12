@@ -49,6 +49,8 @@ PRT v3 及以上格式为不透明 `BaseMaterial3D` 发光表面保存独立传�
 
 `FMagicGIData` 保存 v6 世界空间表面锚点、实际探针中心/法线、布局、场景签名及查找索引。每个样本远场次级传输为 27 个 float，按系数优先、RGB 连续排列：`Y0`、`Y1-1(y)`、`Y10(z)`、`Y11(x)`、`Y2-2(xy)`、`Y2-1(yz)`、`Y20(3z²-1)`、`Y21(xz)`、`Y22(x²-y²)`。远场图集每样本 7 个 RGBA32F texel；primary SkyLight 可见性另存 9 个可能带正负号的标量系数，每样本用 3 个 RGBA32F texel 打包。几何图集每样本 3 个 texel；8×8×2 个距离矩通道共占 512 字节/探针；每网格单元含 8 个有符号 32 位样本索引。旧格式预览的每个候选双线性采样四个 moment texel。BVH 另用两个只读缓冲：每节点 32 字节、每三角形 48 字节，叶节点最多 4 个三角形，使用 8 桶、3 轴表面积代价划分，深度优先排列并带跳过子树索引，无需每像素遍历栈。三角形 w 通道存预计算面积、行列式阈值和平滑表面片 ID；探针锚点的表面片只在创建上传数据时定位，并写入几何图集的空闲 alpha。射线逆方向每次查询只计算一次。
 
+运行时远场图集在首次上传打包时对每个探针/颜色通道应用 SH9 非负窗口，只缩放 `l>=1` 并原样保留 DC 系数；持久化传输系数和 bake 格式不变。
+
 v3 及以上额外保存发光源稳定键、静态签名及每源每样本 6 个 float，顺序为 source、probe、常量 RGB 响应和纹理 RGB 响应。动态 SH 与发光参数独立于烘焙资源。组合函数始终返回每探针一个有限 RGB 值；非法输入或溢出返回零响应。
 
 当前可载入 v2–v6 格式。与当前场景签名、布局和烘焙设置完全匹配的 v5 在首次表面刷新时自动升级为内存中的 v6：复用已收集的几何构建 BVH，原有 transport、emission、primary sky 和 moments 逐字节保留，不重新积分、不自动保存。显式调用 `FMagicGIBaker.new().upgrade_visibility_bake(volume)` 也可获得新的资源；不匹配时返回 `null`，不会修改 Volume 或旧资源。失败尝试按资源、场景及设置缓存，不逐帧重试。过期 v5 仍按原有距离矩保留预览，并提示需要升级或重烘才能获得精确静态遮挡；不会将其伪装为 v6 数据。v2/v3/v4 以及已经过期的 v5 需重新 Bake。当前低差异采样器版本仍为 r3；调整质量只改变请求值，不改写旧烘焙的样本数。
@@ -65,6 +67,7 @@ python misc/scripts/test_feng_runtime_contracts.py --editor /path/to/godot
 
 ```sh
 /path/to/godot --headless --path /path/to/project --script res://addons/feng-magic-gi/tests/test_runtime_state.gd
+/path/to/godot --headless --path /path/to/project --script res://addons/feng-magic-gi/tests/test_sh_filter.gd
 ```
 
 完整 PRT 与 GPU 集成：

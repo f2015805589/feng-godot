@@ -84,8 +84,11 @@ static func detach_capture_output(probe: ReflectionProbe) -> bool:
 	if not probe_rid.is_valid():
 		return false
 	# An invalid output cancels queued capture work before the probe is removed or
-	# switched to another source. The output Sky keeps its last completed image.
+	# switched to another source. Clear the effect RID as well so no later capture
+	# can dispatch it after its owned pass resources have been released.
 	RenderingServer.call(&"reflection_probe_set_capture_output_sky", probe_rid, RID())
+	if RenderingServer.has_method(&"reflection_probe_set_capture_fog_effect"):
+		RenderingServer.call(&"reflection_probe_set_capture_fog_effect", probe_rid, RID())
 	return true
 
 

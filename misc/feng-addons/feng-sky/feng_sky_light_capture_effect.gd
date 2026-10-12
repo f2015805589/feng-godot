@@ -48,6 +48,24 @@ func clear_capture_snapshots() -> void:
 		_fog_pass.call("clear_capture_snapshots")
 
 
+## Called on the render thread after this effect has been detached from its
+## reflection probe. Keep child Resources alive while their owned RIDs are
+## explicitly released; PREDELETE is too late to dispatch derived cleanup.
+func _cleanup_capture_resources(rd: RenderingDevice) -> void:
+	_fog_snapshot.clear()
+	_atmosphere_snapshot.clear()
+	_cloud_snapshot.clear()
+	if _fog_pass != null and is_instance_valid(_fog_pass) \
+			and _fog_pass.has_method("clear_capture_snapshots"):
+		_fog_pass.call("clear_capture_snapshots")
+	for child in [_cloud_trace_pass, _cloud_shadow_pass, _fog_pass]:
+		if child != null and is_instance_valid(child) and child.has_method("_cleanup"):
+			child.call("_cleanup", rd)
+	_fog_pass = null
+	_cloud_shadow_pass = null
+	_cloud_trace_pass = null
+
+
 ## Called once per capture face after FRPPassContext.setup() and before lighting.
 ## Fog publishes atmospheric direct-light data first; cloud metadata then fills
 ## the native packet consumed by the one-time lighting preparation.

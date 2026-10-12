@@ -60,7 +60,12 @@ var _triangle_source_id := 0
 var _triangle_surface_index := -1
 var _sample_source_id := 0
 var _sample_surface_index := -1
-var rejected_occluded_count := 0
+var rejected_no_safe_offset_count := 0
+var rejected_inside_or_indeterminate_center_count := 0
+# Preserve the old aggregate diagnostic for the repository's existing harnesses.
+var rejected_occluded_count: int:
+	get:
+		return rejected_no_safe_offset_count + rejected_inside_or_indeterminate_center_count
 var rejected_duplicate_count := 0
 var rejected_center_outside_count := 0
 var rejected_ambiguous_side_count := 0
@@ -108,7 +113,8 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_triangle_surface_index = -1
 	_sample_source_id = 0
 	_sample_surface_index = -1
-	rejected_occluded_count = 0
+	rejected_no_safe_offset_count = 0
+	rejected_inside_or_indeterminate_center_count = 0
 	rejected_duplicate_count = 0
 	rejected_center_outside_count = 0
 	rejected_ambiguous_side_count = 0
@@ -144,9 +150,12 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	emitter_keys = _emitter_set.keys
 	emitter_static_signatures = _emitter_set.static_signatures
 	emitter_groups = _emitter_set.groups
-	if rejected_ambiguous_side_count > 0 or rejected_occluded_count > 0:
-		warning_message = "Discarded %d probe candidates without safe clearance and skipped %d clipped triangles whose outward side could not be proven." % [
-			rejected_occluded_count, rejected_ambiguous_side_count]
+	if rejected_no_safe_offset_count > 0 or rejected_inside_or_indeterminate_center_count > 0 \
+			or rejected_ambiguous_side_count > 0:
+		warning_message = "Placed %d probes; rejected %d candidates with no safe offset, %d centers inside or indeterminate, and %d centers outside the volume; skipped %d clipped triangles with unproven outward side." % [
+			positions.size(), rejected_no_safe_offset_count,
+			rejected_inside_or_indeterminate_center_count, rejected_center_outside_count,
+			rejected_ambiguous_side_count]
 	scene_signature = hash([faces, reflectance, surface_positions, positions, normals])
 	return true
 
@@ -496,7 +505,7 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 						return
 	var actual_offset := _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
 	if actual_offset <= 0.0:
-		rejected_occluded_count += 1
+		rejected_no_safe_offset_count += 1
 		return
 	var probe_center: Vector3 = surface + normal * actual_offset
 	var center_local := _inverse * probe_center
@@ -515,7 +524,7 @@ func _add_surface(surface: Vector3, normal: Vector3) -> void:
 		return
 	var cell_key := cell.x + cell.y * _dimensions.x + cell.z * _dimensions.x * _dimensions.y
 	if _probe_center_is_inside_solid(probe_center):
-		rejected_occluded_count += 1
+		rejected_inside_or_indeterminate_center_count += 1
 		return
 	var count := int(_cell_counts.get(cell_key, 0))
 	if count >= Data.CELL_CAPACITY:

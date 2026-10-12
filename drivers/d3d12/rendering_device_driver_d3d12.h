@@ -151,6 +151,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
+		String get_statistics_string() const;
 	};
 
 	// Some IHVs do not allow creating descriptor heaps beyond a certain limit, so they must be pooled.

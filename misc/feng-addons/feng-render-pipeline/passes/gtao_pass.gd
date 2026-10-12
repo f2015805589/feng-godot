@@ -19,7 +19,13 @@ const WORKGROUP_SIZE := 8
 const OUTPUT_FORMAT := RenderingDevice.DATA_FORMAT_R16_SFLOAT
 const PACKED_FORMAT := RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
 
+enum ResolutionMode { HALF_RESOLUTION, FULL_RESOLUTION }
+
 @export_group("GTAO")
+@export_enum("Half Resolution", "Full Resolution") var resolution_mode: int = ResolutionMode.HALF_RESOLUTION:
+	set(value):
+		resolution_mode = clampi(value, ResolutionMode.HALF_RESOLUTION, ResolutionMode.FULL_RESOLUTION)
+		emit_changed()
 @export_range(0.05, 20.0, 0.05, "or_greater", "suffix:m") var radius_m := 2.0:
 	set(value):
 		radius_m = maxf(value, 0.05)
@@ -122,7 +128,7 @@ func get_required_before_native_ids() -> PackedInt32Array:
 	return PackedInt32Array([NativeSpec.PASS_LIGHTING])
 
 func get_volume_parameter_names() -> PackedStringArray:
-	return PackedStringArray(["radius_m", "falloff_start_ratio", "thickness_blend", "strength", "history_weight"])
+	return PackedStringArray(["resolution_mode", "radius_m", "falloff_start_ratio", "thickness_blend", "strength", "history_weight"])
 
 func refresh_resource_flags() -> void:
 	needs_motion_vectors = true
@@ -197,7 +203,10 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	if size.x <= 0 or size.y <= 0:
 		return
 	var half_size := Vector2i(maxi(1, ceili(float(size.x) * 0.5)), maxi(1, ceili(float(size.y) * 0.5)))
-	var state := _ensure_view_state(buffers, view, half_size, rd)
+	var selected_resolution_mode := clampi(int(_frame_parameters.get("resolution_mode", resolution_mode)),
+			ResolutionMode.HALF_RESOLUTION, ResolutionMode.FULL_RESOLUTION)
+	var working_size := size if selected_resolution_mode == ResolutionMode.FULL_RESOLUTION else half_size
+	var state := _ensure_view_state(buffers, view, working_size, selected_resolution_mode, rd)
 	if state.is_empty():
 		return
 	var has_motion := velocity.is_valid()
@@ -251,7 +260,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	for stage_index in 4:
 		rd.compute_list_bind_compute_pipeline(list, _pipelines[stage_index])
 		rd.compute_list_bind_uniform_set(list, output_sets[stage_index], 0)
-		var dispatch_size := size if stage_index == 3 else half_size
+		var dispatch_size := size if stage_index == 3 else working_size
 		rd.compute_list_dispatch(list, ceili(float(dispatch_size.x) / WORKGROUP_SIZE), ceili(float(dispatch_size.y) / WORKGROUP_SIZE), 1)
 		if stage_index < 3:
 			rd.compute_list_add_barrier(list)
@@ -311,8 +320,8 @@ func _make_parameter_bytes(size: Vector2i, jitter_delta_uv: Vector2, inverse_pro
 	]))
 	return values.to_byte_array()
 
-func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, half_size: Vector2i,
-		rd: RenderingDevice) -> Dictionary:
+func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, working_size: Vector2i,
+		selected_resolution_mode: int, rd: RenderingDevice) -> Dictionary:
 	var key := buffers.get_instance_id()
 	var entry: Dictionary = _states.get(key, {})
 	if not entry.is_empty() and entry["wr"].get_ref() == null:
@@ -324,13 +333,14 @@ func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, half_size: Vec
 		entry = {"wr": weakref(buffers), "views": {}}
 		_states[key] = entry
 	var state: Dictionary = entry["views"].get(view, {})
-	if not state.is_empty() and state.get("half_size", Vector2i()) != half_size:
+	if not state.is_empty() and (state.get("working_size", Vector2i()) != working_size \
+			or int(state.get("resolution_mode", -1)) != selected_resolution_mode):
 		_free_view_state(rd, state)
 		entry["views"].erase(view)
 		_states[key] = entry
 		state = {}
 	if state.is_empty():
-		state = _create_view_state(half_size, rd)
+		state = _create_view_state(working_size, selected_resolution_mode, rd)
 		if state.is_empty():
 			_sync_owned_rid_snapshot()
 			return {}
@@ -340,14 +350,16 @@ func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, half_size: Vec
 		_sync_owned_rid_snapshot()
 	return state
 
-func _create_view_state(half_size: Vector2i, rd: RenderingDevice) -> Dictionary:
+func _create_view_state(working_size: Vector2i, selected_resolution_mode: int,
+		rd: RenderingDevice) -> Dictionary:
 	var state := {
-		"half_size": half_size,
-		"raw": _create_texture(rd, half_size, PACKED_FORMAT),
-		"spatial": _create_texture(rd, half_size, PACKED_FORMAT),
+		"working_size": working_size,
+		"resolution_mode": selected_resolution_mode,
+		"raw": _create_texture(rd, working_size, PACKED_FORMAT),
+		"spatial": _create_texture(rd, working_size, PACKED_FORMAT),
 		"history": [
-			_create_texture(rd, half_size, PACKED_FORMAT),
-			_create_texture(rd, half_size, PACKED_FORMAT),
+			_create_texture(rd, working_size, PACKED_FORMAT),
+			_create_texture(rd, working_size, PACKED_FORMAT),
 		],
 		"ubo": rd.uniform_buffer_create(UBO_SIZE),
 		"read_index": 0,

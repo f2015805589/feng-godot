@@ -8,24 +8,26 @@ static var _providers_by_world: Dictionary = {} # world id -> provider id -> {re
 static var _world_by_provider: Dictionary = {} # provider id -> world id
 static var _active_by_world: Dictionary = {} # world id -> WeakRef
 static var _registration_order := 0
-static var _capture_effect_release_queue: Array[CompositorEffect] = []
-static var _capture_effect_release_waiting := false
 
 
 static func retain_capture_effects_until_rendered(effects: Array[CompositorEffect]) -> void:
+	var retained: Array[CompositorEffect] = []
 	for effect in effects:
 		if effect != null and is_instance_valid(effect):
-			_capture_effect_release_queue.append(effect)
-	if _capture_effect_release_queue.is_empty() or _capture_effect_release_waiting:
+			retained.append(effect)
+	if retained.is_empty():
 		return
-	_capture_effect_release_waiting = true
-	_release_capture_effects_after_frame()
-
-
-static func _release_capture_effects_after_frame() -> void:
-	await RenderingServer.frame_post_draw
-	_capture_effect_release_queue.clear()
-	_capture_effect_release_waiting = false
+	# Detach/cancel is submitted before this callback by the caller. The render
+	# thread callback is the lifetime barrier: it holds each Resource through
+	# any already queued capture work, then explicitly frees its owned pass RIDs.
+	RenderingServer.call_on_render_thread(func():
+		var rd := RenderingServer.get_rendering_device()
+		if rd != null:
+			for effect in retained:
+				if is_instance_valid(effect) and effect.has_method("_cleanup_capture_resources"):
+					effect.call("_cleanup_capture_resources", rd)
+		retained.clear()
+	)
 
 
 static func refresh_provider(provider: Object) -> void:

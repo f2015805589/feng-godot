@@ -40,6 +40,7 @@
 #include <drivers/d3d12/godot_nir.h>
 #include <dxgi1_6.h>
 #include <d3d12shader.h>
+#include <memory>
 
 #if !defined(_MSC_VER)
 #include <thirdparty/directx_headers/include/dxguids/dxguids.h>
@@ -393,6 +394,18 @@ void RenderingDeviceDriverD3D12::DescriptorHeap::free(const Allocation &p_alloca
 	virtual_alloc.AllocHandle = p_allocation.virtual_alloc_handle;
 
 	virtual_block->FreeAllocation(virtual_alloc);
+}
+
+String RenderingDeviceDriverD3D12::DescriptorHeap::get_statistics_string() const {
+	D3D12MA::DetailedStatistics stats = {};
+	virtual_block->CalculateStatistics(&stats);
+
+	String result = "capacity=" + itos((int64_t)stats.Stats.BlockBytes) + " descriptors";
+	result += ", allocation_count=" + itos(stats.Stats.AllocationCount);
+	result += ", live=" + itos((int64_t)stats.Stats.AllocationBytes) + " descriptors";
+	result += ", free=" + itos((int64_t)(stats.Stats.BlockBytes - stats.Stats.AllocationBytes)) + " descriptors";
+	result += ", largest_free_range=" + itos((int64_t)stats.UnusedRangeSizeMax) + " descriptors";
+	return result;
 }
 
 void RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type) {
@@ -3434,6 +3447,28 @@ void RenderingDeviceDriverD3D12::shader_destroy_modules(ShaderID p_shader) {
 RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<BoundUniform> p_uniforms, ShaderID p_shader, uint32_t p_set_index, int p_linear_pool_index) {
 	// Pre-bookkeep.
 	UniformSetInfo *uniform_set_info = VersatileResource::allocate<UniformSetInfo>(resources_allocator);
+	bool resource_descriptor_allocated = false;
+	bool sampler_ref_acquired = false;
+	auto cleanup = [this, &resource_descriptor_allocated, &sampler_ref_acquired](UniformSetInfo *p_uniform_set_info) {
+		if (p_uniform_set_info == nullptr) {
+			return;
+		}
+
+		if (resource_descriptor_allocated) {
+			resource_descriptor_heap.free(p_uniform_set_info->resource_descriptor_heap_alloc);
+		}
+
+		if (sampler_ref_acquired && p_uniform_set_info->sampler_descriptor_heap_alloc != nullptr) {
+			SamplerDescriptorHeapAllocation *sampler_allocation = p_uniform_set_info->sampler_descriptor_heap_alloc;
+			if ((--sampler_allocation->use_count) == 0) {
+				sampler_descriptor_heap.free(*sampler_allocation);
+				sampler_descriptor_heap_allocations.erase(sampler_allocation->key);
+			}
+		}
+
+		VersatileResource::free(resources_allocator, p_uniform_set_info);
+	};
+	std::unique_ptr<UniformSetInfo, decltype(cleanup)> uniform_set_info_guard(uniform_set_info, cleanup);
 
 	const ShaderInfo *shader_info_in = (const ShaderInfo *)p_shader.id;
 	const ShaderInfo::UniformSet &uniform_set = shader_info_in->sets[p_set_index];
@@ -3447,13 +3482,13 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 	if (uniform_set.resource_descriptor_count > 0) {
 		Error err = resource_descriptor_heap.allocate(uniform_set.resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc);
 		if (unlikely(err != OK)) {
-			VersatileResource::free(resources_allocator, uniform_set_info);
-
 			ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, UniformSetID(), "Cannot create uniform set because there's not enough room in the RESOURCES descriptor heap.\n"
-																		  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.");
+																			  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.\n"
+																			  "Current RESOURCES heap stats (descriptor units): " + resource_descriptor_heap.get_statistics_string() + ".");
 
 			ERR_FAIL_V_MSG(UniformSetID(), "Failed to allocate resource descriptors.");
 		}
+		resource_descriptor_allocated = true;
 	}
 
 	// Allocate range for sampler descriptors. Since we do not have much space for samplers, and many uniform sets use identical ones, it's very beneficial to cache and reuse them.
@@ -3484,21 +3519,25 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		if (find_result != sampler_descriptor_heap_allocations.end()) {
 			uniform_set_info->sampler_descriptor_heap_alloc = &find_result->value;
 			++uniform_set_info->sampler_descriptor_heap_alloc->use_count;
+			sampler_ref_acquired = true;
 		} else {
 			uniform_set_info->sampler_descriptor_heap_alloc = &sampler_descriptor_heap_allocations.insert(sampler_key, SamplerDescriptorHeapAllocation())->get();
 			uniform_set_info->sampler_descriptor_heap_alloc->key = sampler_key;
 
 			Error err = sampler_descriptor_heap.allocate(uniform_set.sampler_descriptor_count, *uniform_set_info->sampler_descriptor_heap_alloc);
 			if (unlikely(err != OK)) {
-				resource_descriptor_heap.free(uniform_set_info->resource_descriptor_heap_alloc);
-				VersatileResource::free(resources_allocator, uniform_set_info);
+				// This new sampler key has no successful heap allocation or uniform-set owner yet.
+				sampler_descriptor_heap_allocations.erase(sampler_key);
+				uniform_set_info->sampler_descriptor_heap_alloc = nullptr;
 
 				ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, UniformSetID(), "Cannot create uniform set because there's not enough room in the SAMPLERS descriptors heap.\n"
-																			  "Please increase the value of the rendering/rendering_device/d3d12/max_sampler_descriptors project setting.");
+																					  "Please increase the value of the rendering/rendering_device/d3d12/max_sampler_descriptors project setting.\n"
+																					  "Current SAMPLERS heap stats (descriptor units): " + sampler_descriptor_heap.get_statistics_string() + ".");
 
 				ERR_FAIL_V_MSG(UniformSetID(), "Failed to allocate sampler descriptors.");
 			}
 
+			sampler_ref_acquired = true;
 			create_samplers = true;
 		}
 	}
@@ -3688,6 +3727,7 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		}
 	}
 
+	uniform_set_info_guard.release();
 	return UniformSetID(uniform_set_info);
 }
 
@@ -3886,7 +3926,8 @@ RenderingDeviceDriverD3D12::DescriptorHeap::Allocation RenderingDeviceDriverD3D1
 
 		Error err = resource_descriptor_heap.allocate(1, descriptor_allocation);
 		ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, DescriptorHeap::Allocation(), "Cannot allocate per frame descriptor because there's not enough room in the RESOURCES descriptor heap.\n"
-																					"Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.");
+																												"Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.\n"
+																												"Current RESOURCES heap stats (descriptor units): " + resource_descriptor_heap.get_statistics_string() + ".");
 
 		ERR_FAIL_COND_V_MSG(err != OK, DescriptorHeap::Allocation(), "Failed to allocate per frame descriptor.");
 
